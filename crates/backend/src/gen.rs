@@ -1,8 +1,8 @@
 //! Walk a typed compilation unit and emit JVM classfiles (major 50).
 
 use crate::classfile::{
-    ClassEmit, EmittedClass, Field, Method, Pool, ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE,
-    ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC,
+    encode_method_name, ClassEmit, EmittedClass, Field, Method, Pool, ACC_ABSTRACT, ACC_FINAL,
+    ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC,
 };
 use crate::code::Assembler;
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
@@ -140,7 +140,7 @@ impl ClassBuilder {
         self.pool = pool;
         self.methods.push(Method {
             access,
-            name: name.to_string(),
+            name: encode_method_name(name),
             desc: desc.to_string(),
             code: Some(code),
         });
@@ -149,7 +149,7 @@ impl ClassBuilder {
     fn add_abstract(&mut self, access: u16, name: &str, desc: &str) {
         self.methods.push(Method {
             access,
-            name: name.to_string(),
+            name: encode_method_name(name),
             desc: desc.to_string(),
             code: None,
         });
@@ -2169,9 +2169,7 @@ fn invoke_value_extension(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
 
 fn value_extension_desc(st: &SymbolTable, id: SymbolId) -> String {
     let owner = st.get(id).owner;
-    let under = st
-        .value_class_underlying(owner)
-        .unwrap_or(Type::Int);
+    let under = st.value_class_underlying(owner).unwrap_or(Type::Int);
     let inst = method_desc_from_sym(st, id);
     let rest = inst.strip_prefix('(').unwrap_or(&inst);
     format!("({}{}", jvm_desc(st, &under), rest)

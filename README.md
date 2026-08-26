@@ -166,7 +166,7 @@ scalac 2.13 は warning ですが、scala-rs はエラーです。ガード付�
 
 - `assert(cond)` / `require(cond)`（第 2 引数の by-name メッセージあり）。失敗はそれぞれ `AssertionError` / `IllegalArgumentException`
 - `???` は `scala.NotImplementedError`（`RuntimeException` のサブクラス。scala-library のそれではない）
-- `any2ArrowAssoc` による `1 -> "a"`。結果はランタイムの `scala.Tuple2`
+- `any2ArrowAssoc` による `1 -> "a"`。結果はランタイムの `scala.Tuple2`。JVM 上のメソッド名は `$minus$greater`（nsc の NameTransformer。`->` は `>` を含むので非合法）
 - `"x".length` は `java.lang.String#length`。`toInt` / `toLong` / `toDouble` は `Integer.parseInt` など。**`StringOps` クラスは出していません。** String にメソッドを載せたサブセットです
 
 ## 実装していないもの

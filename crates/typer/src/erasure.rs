@@ -379,9 +379,9 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 _ => return,
             };
             let under = match &tree.ty {
-                Type::Class { sym, .. } => st
-                    .value_class_underlying(*sym)
-                    .unwrap_or_else(|| Type::Any),
+                Type::Class { sym, .. } => {
+                    st.value_class_underlying(*sym).unwrap_or_else(|| Type::Any)
+                }
                 t => t.clone(),
             };
             erase_tree(&mut arg, st, Some(&erase_ty(&under, st)));

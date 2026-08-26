@@ -5,8 +5,8 @@
 
 use crate::classfile::EmittedClass;
 use crate::classfile::{
-    ClassEmit, Field, Method, Pool, ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE,
-    ACC_PUBLIC, ACC_STATIC, ACC_SUPER,
+    encode_method_name, ClassEmit, Field, Method, Pool, ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE,
+    ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER,
 };
 use crate::code::Assembler;
 
@@ -66,7 +66,7 @@ impl B {
         self.pool = pool;
         self.methods.push(Method {
             access,
-            name: name.to_string(),
+            name: encode_method_name(name),
             desc: desc.to_string(),
             code: Some(code),
         });
@@ -75,7 +75,7 @@ impl B {
     fn add_abstract(&mut self, access: u16, name: &str, desc: &str) {
         self.methods.push(Method {
             access,
-            name: name.to_string(),
+            name: encode_method_name(name),
             desc: desc.to_string(),
             code: None,
         });

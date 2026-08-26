@@ -330,7 +330,9 @@ object Main {
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("may not be exhaustive")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("may not be exhaustive")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -351,7 +353,7 @@ object Main {
   def main(args: Array[String]): Unit = {
     val x: Int = 10 match {
       case Even(half) => half
-      case _ => 0
+      case _ => -1
     }
   }
 }

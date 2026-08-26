@@ -304,7 +304,7 @@ impl<'a> Parser<'a> {
                 && !matches!(self.kind(), TokenKind::RBrace)
             {
                 // Adjacent template defs without separator — still ok if next is a keyword.
-                if !is_def_start(self.kind()) {
+                if !is_mod_or_def_start(self.kind()) {
                     self.error_here("expected newline or `;` after statement");
                     self.bump();
                 }
@@ -2055,7 +2055,33 @@ impl<'a> Parser<'a> {
                 TokenKind::Dot => {
                     self.bump();
                     self.skip_nl();
-                    if matches!(self.kind(), TokenKind::Underscore) {
+                    if matches!(self.kind(), TokenKind::This) {
+                        let sp = self.span();
+                        self.bump();
+                        t = self.alloc(
+                            t.span.merge(sp),
+                            TreeKind::This {
+                                qual: t.name().map(|s| s.to_string()),
+                            },
+                        );
+                    } else if matches!(self.kind(), TokenKind::Super) {
+                        self.bump();
+                        let mix = if matches!(self.kind(), TokenKind::LBracket) {
+                            self.bump();
+                            let n = self.expect_ident().0;
+                            self.expect("]", |k| matches!(k, TokenKind::RBracket));
+                            Some(n)
+                        } else {
+                            None
+                        };
+                        t = self.alloc(
+                            t.span.merge(self.prev_span()),
+                            TreeKind::Super {
+                                qual: t.name().map(|s| s.to_string()),
+                                mix,
+                            },
+                        );
+                    } else if matches!(self.kind(), TokenKind::Underscore) {
                         let sp = self.span();
                         self.bump();
                         t = self.alloc(

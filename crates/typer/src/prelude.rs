@@ -180,13 +180,7 @@ pub fn install_prelude(st: &mut SymbolTable) {
     let mems = st.get(some_cls).members.clone();
     st.get_mut(some_mod).members.extend(mems);
 
-    let tuple2 = class(
-        st,
-        st.scala_pkg,
-        "Tuple2",
-        "scala/Tuple2",
-        &[Type::AnyRef],
-    );
+    let tuple2 = class(st, st.scala_pkg, "Tuple2", "scala/Tuple2", &[Type::AnyRef]);
     let t2a = type_param(st, tuple2, "A");
     let t2b = type_param(st, tuple2, "B");
     st.get_mut(tuple2).tparams = vec![t2a, t2b];
@@ -206,13 +200,7 @@ pub fn install_prelude(st: &mut SymbolTable) {
         },
         Intrinsic::None,
     );
-    let _ = class(
-        st,
-        st.scala_pkg,
-        "Tuple3",
-        "scala/Tuple3",
-        &[Type::AnyRef],
-    );
+    let _ = class(st, st.scala_pkg, "Tuple3", "scala/Tuple3", &[Type::AnyRef]);
 
     let arrow = class(
         st,
@@ -862,7 +850,14 @@ fn add_predef_members(st: &mut SymbolTable, arrow: SymbolId) {
         Type::Unit,
         Intrinsic::Require,
     );
-    method(st, owner, "???", vec![], Type::Nothing, Intrinsic::NotImplemented);
+    method(
+        st,
+        owner,
+        "???",
+        vec![],
+        Type::Nothing,
+        Intrinsic::NotImplemented,
+    );
     let conv = method(
         st,
         owner,

@@ -342,8 +342,7 @@ impl SymbolTable {
             return false;
         }
         s.parents.iter().any(|p| {
-            matches!(p, Type::AnyVal)
-                || self.class_sym_of(p).is_some_and(|c| c == self.anyval_sym)
+            matches!(p, Type::AnyVal) || self.class_sym_of(p).is_some_and(|c| c == self.anyval_sym)
         })
     }
 

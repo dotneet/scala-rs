@@ -1430,14 +1430,9 @@ impl Typer {
             paramss: vec![],
             ret: Box::new(Type::NoType),
         };
-        if matches!(
-            &fun.kind,
-            TreeKind::Apply { .. } | TreeKind::TypeApply { .. }
-        ) {
-            self.type_expr(fun, &dummy_method);
-        } else {
-            self.type_expr(fun, &Type::NoType);
-        }
+        // Expected type Method so nullary methods (`unary_-`, `def f: Int` called as `f()`)
+        // are not auto-applied before this Apply is typed.
+        self.type_expr(fun, &dummy_method);
         self.reorder_named_args(args, fun);
 
         let recv_ty = match &fun.kind {
@@ -2222,10 +2217,7 @@ impl Typer {
                 } else {
                     self.error(
                         pat.span,
-                        format!(
-                            "not found: extractor {}",
-                            fun.name().unwrap_or("<pattern>")
-                        ),
+                        format!("not found: extractor {}", fun.name().unwrap_or("<pattern>")),
                     );
                     pat.ty = sel_ty.clone();
                 }
@@ -2381,12 +2373,7 @@ impl Typer {
             let found = self.st.lookup(n);
             found
                 .into_iter()
-                .find(|s| {
-                    matches!(
-                        self.st.get(*s).kind,
-                        SymKind::Module | SymKind::ModuleClass
-                    )
-                })
+                .find(|s| matches!(self.st.get(*s).kind, SymKind::Module | SymKind::ModuleClass))
                 .map(|m| self.st.module_class_of(m))
                 .unwrap_or(SymbolId::NONE)
         } else {
@@ -2461,13 +2448,7 @@ impl Typer {
                 .iter()
                 .any(|c| c.guard.is_empty() && self.pattern_covers(&c.pat, *leaf))
             {
-                missing.push(
-                    self.st
-                        .get(*leaf)
-                        .name
-                        .trim_end_matches('$')
-                        .to_string(),
-                );
+                missing.push(self.st.get(*leaf).name.trim_end_matches('$').to_string());
             }
         }
         if !missing.is_empty() {
@@ -2515,7 +2496,9 @@ impl Typer {
                 }
                 let s = self.st.get(pat.sym);
                 match s.kind {
-                    SymKind::Module | SymKind::ModuleClass => self.st.module_class_of(pat.sym) == leaf,
+                    SymKind::Module | SymKind::ModuleClass => {
+                        self.st.module_class_of(pat.sym) == leaf
+                    }
                     SymKind::Class => pat.sym == leaf,
                     _ => false,
                 }
