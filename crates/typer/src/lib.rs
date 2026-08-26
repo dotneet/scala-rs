@@ -1090,4 +1090,103 @@ object Main {
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn f_and_raw_interpolators_typecheck() {
+        ok(r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = 7
+    val a: String = f"$n%02d"
+    val b: String = raw"a\nb"
+    val c: String = s"hi $n"
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn f_interpolator_unsupported_format_is_error() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = 1
+    val s: String = f"$n%tY"
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("f interpolator")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn overload_int_string_and_arity() {
+        ok(r#"
+object Main {
+  def f(x: Int): String = "int"
+  def f(x: String): String = "str"
+  def g(x: Int): String = "1"
+  def g(x: Int, y: Int): String = "2"
+  def main(args: Array[String]): Unit = {
+    val a: String = f(1)
+    val b: String = f("a")
+    val c: String = g(1)
+    val d: String = g(1, 2)
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn overload_ambiguous_is_error() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def f(x: Int, y: Any): String = "a"
+  def f(x: Any, y: Int): String = "b"
+  def main(args: Array[String]): Unit = {
+    val s: String = f(1, 1)
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("ambiguous overload")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn overload_no_alternative_is_error() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def f(x: Int): String = "int"
+  def main(args: Array[String]): Unit = {
+    val s: String = f("no")
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("no matching overload")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
 }

@@ -2544,8 +2544,12 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
         } => {
             gen_try(asm, frame, ctx, block, catches, finalizer, &tree.ty);
         }
-        TreeKind::InterpolatedString { parts, args, .. } => {
-            gen_interpolated(asm, frame, ctx, parts, args);
+        TreeKind::InterpolatedString { prefix, parts, args } => {
+            if prefix == "f" {
+                gen_f_interpolated(asm, frame, ctx, parts, args);
+            } else {
+                gen_interpolated(asm, frame, ctx, parts, args);
+            }
         }
         TreeKind::ValDef { .. } => {
             gen_stat(asm, frame, ctx, tree);
@@ -5254,6 +5258,44 @@ fn gen_interpolated(
     );
 }
 
+fn gen_f_interpolated(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    parts: &[String],
+    args: &[Tree],
+) {
+    let format = match scala_rs_parser::finterp::assemble_f(parts, args.len()) {
+        Ok((fmt, _)) => fmt,
+        Err(_) => {
+            // Typer already diagnosed unsupported bits; keep the classfile
+            // well-formed rather than inventing a successful format.
+            asm.ldc_string("");
+            return;
+        }
+    };
+    asm.ldc_string(&format);
+    asm.iconst(args.len() as i32);
+    asm.anewarray("java/lang/Object");
+    for (i, a) in args.iter().enumerate() {
+        asm.dup();
+        asm.iconst(i as i32);
+        gen_expr(asm, frame, ctx, a);
+        if is_jvm_primitive(&a.ty) {
+            emit_box(asm, &a.ty);
+        } else if matches!(a.ty, Type::Unit | Type::NoType) {
+            // boxed already as null from emit_box
+            emit_box(asm, &a.ty);
+        }
+        asm.aastore();
+    }
+    asm.invokestatic(
+        "java/lang/String",
+        "format",
+        "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
+    );
+}
+
 fn sb_append_string(asm: &mut Assembler, s: &str) {
     if s.is_empty() {
         return;
@@ -6107,6 +6149,9 @@ object Main {
   def main(args: Array[String]): Unit = {
     val name = "world"
     println(s"hello $name")
+    val n: Int = 7
+    println(f"$n%02d")
+    println(raw"a\nb")
   }
 }
 "#,
@@ -6114,6 +6159,8 @@ object Main {
             return;
         };
         assert!(out.contains("hello world"), "stdout: {out:?}");
+        assert!(out.contains("07"), "stdout: {out:?}");
+        assert!(out.contains("a\\nb"), "stdout: {out:?}");
     }
 
     #[test]

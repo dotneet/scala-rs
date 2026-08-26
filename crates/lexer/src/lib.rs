@@ -32,6 +32,8 @@ struct InterpFrame {
     triple: bool,
     /// Brace depth at which the `${` hole started; -1 if currently in the string part.
     hole_brace: i32,
+    /// `raw"..."` does not interpret escape sequences (nsc `StringContext.raw`).
+    raw: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -500,6 +502,7 @@ impl<'a> Lexer<'a> {
             self.bump(); // "
         }
         if let Some(prefix) = interp_prefix {
+            let raw = prefix == "raw";
             self.emit(
                 TokenKind::InterpStart { prefix, triple },
                 lo,
@@ -508,6 +511,7 @@ impl<'a> Lexer<'a> {
             self.interp_stack.push(InterpFrame {
                 triple,
                 hole_brace: -1,
+                raw,
             });
             self.lex_interp_string();
             return;
@@ -646,7 +650,8 @@ impl<'a> Lexer<'a> {
                 buf.push(self.bump().unwrap());
                 continue;
             }
-            if !triple && self.peek() == Some('\\') {
+            let raw = self.interp_stack.last().map(|f| f.raw).unwrap_or(false);
+            if !triple && !raw && self.peek() == Some('\\') {
                 let elo = self.pos as u32;
                 self.bump();
                 match self.read_escape(elo) {
@@ -803,6 +808,38 @@ mod tests {
         assert!(matches!(&ks[1], TokenKind::StringPart(s) if s == "hi "));
         assert!(matches!(&ks[2], TokenKind::InterpId(s) if s == "name"));
         assert!(matches!(&ks[3], TokenKind::InterpEnd(s) if s.is_empty()));
+    }
+
+    #[test]
+    fn raw_interpolator_keeps_escapes() {
+        let sf = SourceFile::new("t.scala", r#"raw"a\nb""#);
+        let (toks, d) = tokenize(&sf, 0);
+        assert!(d.is_empty(), "{d:?}");
+        let ks: Vec<_> = toks
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|k| !matches!(k, TokenKind::Eof | TokenKind::Newline))
+            .collect();
+        assert!(
+            matches!(&ks[1], TokenKind::InterpEnd(s) if s == r"a\nb"),
+            "{ks:?}"
+        );
+    }
+
+    #[test]
+    fn s_interpolator_interprets_escapes() {
+        let sf = SourceFile::new("t.scala", r#"s"a\nb""#);
+        let (toks, d) = tokenize(&sf, 0);
+        assert!(d.is_empty(), "{d:?}");
+        let ks: Vec<_> = toks
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|k| !matches!(k, TokenKind::Eof | TokenKind::Newline))
+            .collect();
+        assert!(
+            matches!(&ks[1], TokenKind::InterpEnd(s) if s == "a\nb"),
+            "{ks:?}"
+        );
     }
 
     #[test]

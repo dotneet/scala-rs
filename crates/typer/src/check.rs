@@ -17,6 +17,12 @@ pub struct TypecheckOptions {
     pub classpath: Vec<ClasspathClass>,
 }
 
+enum OverloadPick {
+    Found(SymbolId, Vec<Type>, Type),
+    Ambiguous,
+    None,
+}
+
 /// A method recovered from a classfile (JVM descriptor).
 #[derive(Clone, Debug)]
 pub struct ClasspathMethod {
@@ -1806,14 +1812,41 @@ impl Typer {
                 parts,
                 args,
             } => {
-                if prefix != "s" && prefix != "raw" {
-                    self.error(
-                        tree.span,
-                        format!("unimplemented interpolator `{prefix}` (only s\"...\" / raw\"...\" in this pass)"),
-                    );
+                match prefix.as_str() {
+                    "s" | "raw" => {}
+                    "f" => match scala_rs_parser::finterp::assemble_f(parts, args.len()) {
+                        Ok((_, specs)) => {
+                            for (a, spec) in args.iter_mut().zip(specs.iter()) {
+                                self.type_expr(a, &Type::NoType);
+                                if !self.f_arg_ok(&a.ty, spec.kind()) {
+                                    self.error(
+                                        a.span,
+                                        format!(
+                                            "f interpolator: %{} requires {}, found: {}",
+                                            spec.conv,
+                                            f_kind_name(spec.kind()),
+                                            self.st.display_type(&a.ty)
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        Err(scala_rs_parser::finterp::FInterpError::Unsupported(msg))
+                        | Err(scala_rs_parser::finterp::FInterpError::Message(msg)) => {
+                            self.error(tree.span, msg);
+                        }
+                    },
+                    other => {
+                        self.error(
+                            tree.span,
+                            format!("unimplemented interpolator `{other}` (only s\"...\" / f\"...\" / raw\"...\")"),
+                        );
+                    }
                 }
-                for a in args.iter_mut() {
-                    self.type_expr(a, &Type::Any);
+                if prefix != "f" {
+                    for a in args.iter_mut() {
+                        self.type_expr(a, &Type::Any);
+                    }
                 }
                 let _ = parts;
                 tree.ty = Type::String;
@@ -2438,7 +2471,7 @@ impl Typer {
         let fun_ty = fun.ty.clone();
         let chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
         match chosen {
-            Some((sym, mut param_tys, mut ret)) => {
+            OverloadPick::Found(sym, mut param_tys, mut ret) => {
                 if !sym.is_none() {
                     fun.sym = sym;
                     tree.sym = sym;
@@ -2670,25 +2703,58 @@ impl Typer {
                 }
                 tree.ty = leftover.unwrap_or(ret);
             }
-            None => {
+            OverloadPick::Ambiguous => {
+                self.error(
+                    tree.span,
+                    format!(
+                        "ambiguous overload for {} with arguments ({})",
+                        fun_name,
+                        arg_tys
+                            .iter()
+                            .map(|t| self.st.display_type(t))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+                tree.ty = Type::Error;
+            }
+            OverloadPick::None => {
                 if self.rewrite_apply_extension(fun) {
                     let fun_ty = fun.ty.clone();
-                    if let Some((sym, param_tys, ret)) =
-                        self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt)
-                    {
-                        fun.sym = sym;
-                        tree.sym = sym;
-                        for (i, a) in args.iter_mut().enumerate() {
-                            let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
-                            if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type() {
-                                self.type_expr(a, &p);
+                    match self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt) {
+                        OverloadPick::Found(sym, param_tys, ret) => {
+                            fun.sym = sym;
+                            tree.sym = sym;
+                            for (i, a) in args.iter_mut().enumerate() {
+                                let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
+                                if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type()
+                                {
+                                    self.type_expr(a, &p);
+                                }
+                                if !p.is_no_type() {
+                                    self.adapt(a, &p);
+                                }
                             }
-                            if !p.is_no_type() {
-                                self.adapt(a, &p);
-                            }
+                            tree.ty = ret;
+                            return;
                         }
-                        tree.ty = ret;
-                        return;
+                        OverloadPick::Ambiguous => {
+                            self.error(
+                                tree.span,
+                                format!(
+                                    "ambiguous overload for {} with arguments ({})",
+                                    fun_name,
+                                    arg_tys
+                                        .iter()
+                                        .map(|t| self.st.display_type(t))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            );
+                            tree.ty = Type::Error;
+                            return;
+                        }
+                        OverloadPick::None => {}
                     }
                 }
                 self.error(
@@ -3185,7 +3251,7 @@ impl Typer {
         fun_sym: SymbolId,
         arg_tys: &[Type],
         _pt: &Type,
-    ) -> Option<(SymbolId, Vec<Type>, Type)> {
+    ) -> OverloadPick {
         let mut cands: Vec<(SymbolId, Vec<Type>, Type)> = Vec::new();
         match fun_ty {
             Type::Method { paramss, ret } => {
@@ -3205,7 +3271,6 @@ impl Typer {
                         ));
                     }
                 }
-                // recover real symbols from owner
                 if !fun_sym.is_none() {
                     let name = self.st.get(fun_sym).name.clone();
                     let owner = self.st.get(fun_sym).owner;
@@ -3219,7 +3284,6 @@ impl Typer {
                             ));
                         }
                     }
-                    // also same-scope overloads
                     if cands.is_empty() {
                         for m in self.st.lookup(&name) {
                             if let Type::Method { paramss, ret } = &self.st.get(m).ty {
@@ -3234,7 +3298,6 @@ impl Typer {
                 }
             }
             Type::Class { sym, .. } => {
-                // apply on companion or ctor
                 let apply = self.st.lookup_member(*sym, "apply");
                 for m in apply {
                     if let Type::Method { paramss, ret } = &self.st.get(m).ty {
@@ -3257,23 +3320,82 @@ impl Typer {
                     }
                 }
             }
-            _ => return None,
+            _ => return OverloadPick::None,
         }
-        // score
-        let mut best: Option<(i32, (SymbolId, Vec<Type>, Type))> = None;
-        for (sym, ps, ret) in cands {
-            if let Some(score) = self.compat_score(&ps, arg_tys) {
-                match &best {
-                    None => best = Some((score, (sym, ps, ret))),
-                    Some((b, _)) if score > *b => best = Some((score, (sym, ps, ret))),
-                    Some((b, _)) if score == *b => {
-                        // ambiguous — keep first (scalac would error; we pick more specific later)
+        let applicable: Vec<(SymbolId, Vec<Type>, Type)> = cands
+            .into_iter()
+            .filter(|(sym, ps, _)| self.is_applicable(*sym, ps, arg_tys))
+            .collect();
+        match applicable.len() {
+            0 => OverloadPick::None,
+            1 => {
+                let (s, p, r) = applicable.into_iter().next().unwrap();
+                OverloadPick::Found(s, p, r)
+            }
+            _ => {
+                let winners: Vec<(SymbolId, Vec<Type>, Type)> = applicable
+                    .iter()
+                    .filter(|a| {
+                        applicable.iter().all(|b| {
+                            a.0 == b.0 || self.is_as_specific_method(&a.1, &b.1)
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                match winners.len() {
+                    1 => {
+                        let (s, p, r) = winners.into_iter().next().unwrap();
+                        OverloadPick::Found(s, p, r)
                     }
-                    _ => {}
+                    _ => OverloadPick::Ambiguous,
                 }
             }
         }
-        best.map(|(_, v)| v)
+    }
+
+    /// nsc: `A` is as specific as `B` when `B` is applicable to `A`'s parameter types.
+    fn is_as_specific_method(&self, a_ps: &[Type], b_ps: &[Type]) -> bool {
+        self.is_applicable(SymbolId::NONE, b_ps, a_ps)
+    }
+
+    fn is_applicable(&self, sym: SymbolId, params: &[Type], args: &[Type]) -> bool {
+        let (fixed, repeated) = split_repeated(params);
+        if let Some(elem) = repeated {
+            if args.len() < fixed.len() {
+                return false;
+            }
+            return args.iter().zip(fixed).all(|(a, p)| self.arg_score(a, p).is_some())
+                && args[fixed.len()..]
+                    .iter()
+                    .all(|a| self.arg_score(a, elem).is_some());
+        }
+        if args.len() > params.len() {
+            return false;
+        }
+        if args.len() < params.len() && !self.trailing_defaults(sym, args.len(), params.len()) {
+            return false;
+        }
+        args.iter()
+            .zip(params)
+            .all(|(a, p)| self.arg_score(a, p).is_some())
+    }
+
+    fn trailing_defaults(&self, sym: SymbolId, given: usize, total: usize) -> bool {
+        if sym.is_none() || given >= total {
+            return false;
+        }
+        let s = self.st.get(sym);
+        let ids = if !s.params.is_empty() {
+            s.params.clone()
+        } else {
+            s.paramss.first().cloned().unwrap_or_default()
+        };
+        if ids.len() < total {
+            return false;
+        }
+        ids[given..total]
+            .iter()
+            .all(|p| self.st.get(*p).flags.contains(Flags::DEFAULTPARAM))
     }
 
     fn compat_score(&self, params: &[Type], args: &[Type]) -> Option<i32> {
@@ -3406,6 +3528,17 @@ impl Typer {
                 params: param_tys,
                 ret: Box::new(ret),
             }
+        }
+    }
+
+    fn f_arg_ok(&self, ty: &Type, kind: scala_rs_parser::finterp::FConvKind) -> bool {
+        use scala_rs_parser::finterp::FConvKind;
+        match kind {
+            FConvKind::General => true,
+            FConvKind::Integral => matches!(ty, Type::Int | Type::Long),
+            FConvKind::Floating => matches!(ty, Type::Float | Type::Double),
+            FConvKind::Character => matches!(ty, Type::Char | Type::Int),
+            FConvKind::Unsupported => false,
         }
     }
 
@@ -4683,6 +4816,17 @@ impl Typer {
             ),
         );
         tree.ty = Type::Error;
+    }
+}
+
+fn f_kind_name(kind: scala_rs_parser::finterp::FConvKind) -> &'static str {
+    use scala_rs_parser::finterp::FConvKind;
+    match kind {
+        FConvKind::Integral => "integral type",
+        FConvKind::Floating => "floating type",
+        FConvKind::Character => "character/integral type",
+        FConvKind::General => "Any",
+        FConvKind::Unsupported => "a supported conversion",
     }
 }
 

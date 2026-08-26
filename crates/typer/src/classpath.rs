@@ -341,11 +341,19 @@ fn resolve_type_name(st: &SymbolTable, name: &str) -> Type {
             ret: Box::new(Type::Any),
         },
         n => {
-            if let Some(id) = st
-                .lookup(n)
-                .into_iter()
-                .find(|s| st.get(*s).is_class_like() || st.get(*s).kind == SymKind::Module)
+            let found = st.lookup(n);
+            if let Some(id) = found
+                .iter()
+                .copied()
+                .find(|s| st.get(*s).kind == SymKind::Class)
             {
+                Type::Class {
+                    sym: id,
+                    args: vec![],
+                }
+            } else if let Some(id) = found.iter().copied().find(|s| {
+                st.get(*s).is_class_like() || st.get(*s).kind == SymKind::Module
+            }) {
                 match st.get(id).kind {
                     SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
                     _ => Type::Class {
