@@ -5358,35 +5358,57 @@ fn gen_synchronized(
     gen_receiver(asm, frame, ctx, fun);
     let lock = frame.alloc_tmp(JvmSort::Ref);
     store(asm, lock, JvmSort::Ref);
-    load(asm, lock, JvmSort::Ref);
-    asm.monitorenter();
-    let try_s = asm.fresh_label();
-    asm.mark(try_s);
-    if let Some(body) = args.first() {
-        if let TreeKind::Function { body: inner, .. } = &body.kind {
-            gen_expr(asm, frame, ctx, inner);
-        } else {
-            gen_expr(asm, frame, ctx, body);
-            if matches!(&body.ty, Type::Function { .. }) {
-                asm.invokeinterface("scala/Function0", "apply", "()Ljava/lang/Object;");
-                if is_unit_like(result_ty) {
-                    asm.pop();
-                } else if is_jvm_primitive(result_ty) {
-                    emit_unbox(asm, result_ty);
-                } else if matches!(result_ty, Type::String) {
-                    asm.checkcast("java/lang/String");
-                }
-            }
-        }
-    } else {
-        push_default(asm, result_ty);
-    }
     let sort = jvm_sort(result_ty);
     let result = if sort != JvmSort::Void {
         Some(frame.alloc_tmp(sort))
     } else {
         None
     };
+    // Initialize the result local before the try so the exception handler
+    // stack map does not claim a live integer that the body never stored.
+    if let Some(r) = result {
+        push_default(asm, result_ty);
+        store(asm, r, sort);
+    }
+    load(asm, lock, JvmSort::Ref);
+    asm.monitorenter();
+    let try_s = asm.fresh_label();
+    asm.mark(try_s);
+    if let Some(body) = args.first() {
+        let produced_ty = if let TreeKind::Function { body: inner, .. } = &body.kind {
+            gen_expr(asm, frame, ctx, inner);
+            inner.ty.clone()
+        } else {
+            gen_expr(asm, frame, ctx, body);
+            if matches!(&body.ty, Type::Function { .. }) {
+                asm.invokeinterface("scala/Function0", "apply", "()Ljava/lang/Object;");
+            }
+            body.ty.clone()
+        };
+        match sort {
+            JvmSort::Ref => {
+                if is_jvm_primitive(&produced_ty) && !matches!(produced_ty, Type::Unit | Type::NoType)
+                {
+                    emit_box(asm, &produced_ty);
+                } else if is_unit_like(&produced_ty) {
+                    // Unit body: nothing (or popped) — leave a boxed null.
+                    push_default(asm, result_ty);
+                } else if matches!(result_ty, Type::String) && !matches!(produced_ty, Type::String) {
+                    asm.checkcast("java/lang/String");
+                }
+            }
+            JvmSort::Void => {
+                pop_if_value(asm, &produced_ty);
+            }
+            _ => {
+                if matches!(&produced_ty, Type::Function { .. }) {
+                    emit_unbox(asm, result_ty);
+                }
+            }
+        }
+    } else {
+        push_default(asm, result_ty);
+    }
     if let Some(r) = result {
         store(asm, r, sort);
     }
