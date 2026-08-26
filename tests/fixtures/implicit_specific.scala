@@ -9,6 +9,6 @@ object Main {
   implicit val b: B = new B()
   def pick(implicit x: A): String = x.tag
   def main(args: Array[String]): Unit = {
-    println(pick)
+    println(pick())
   }
 }
