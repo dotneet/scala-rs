@@ -2584,13 +2584,21 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
     }
     match sym.kind {
         SymKind::Term => {
-            load_this(asm, ctx);
+            let owner = sym.owner;
+            if is_module_class(ctx.st, owner)
+                && module_class_id(ctx.st, owner) != module_class_id(ctx.st, ctx.class_sym)
+            {
+                let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
+                asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+            } else {
+                load_this(asm, ctx);
+            }
             if is_trait_owned_term(ctx.st, id) {
-                let owner = class_internal(ctx.st, sym.owner);
+                let owner = class_internal(ctx.st, owner);
                 let desc = format!("(){}", jvm_desc(ctx.st, &sym.ty));
                 asm.invokeinterface(&owner, &sym.name, &desc);
             } else {
-                let owner = class_internal(ctx.st, sym.owner);
+                let owner = class_internal(ctx.st, owner);
                 let desc = jvm_desc(ctx.st, &sym.ty);
                 asm.getfield(&owner, &sym.name, &desc);
             }
