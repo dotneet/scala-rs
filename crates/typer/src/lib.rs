@@ -373,6 +373,7 @@ object Main {
 "#,
             &TypecheckOptions {
                 fatal_warnings: true,
+                library_abi: false,
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -516,5 +517,32 @@ object Main {
   }
 }
 "#);
+    }
+
+    #[test]
+    fn library_abi_stringops_withfilter_iterator_typecheck() {
+        let src = r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = "42".toInt
+    val xs = 1 :: 2 :: Nil
+    val ys = for (x <- xs if x > 0) yield x
+    val it = xs.iterator
+    val b: Boolean = it.hasNext
+  }
+}
+"#;
+        let (_, _, diags) = typecheck_str_opts(
+            src,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+            },
+        );
+        assert!(
+            !has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 }

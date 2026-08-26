@@ -2133,8 +2133,15 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
     }
     let ic = ctx.st.get(id).intrinsic;
     if matches!(ic, Intrinsic::NotImplemented) {
-        throw_not_implemented(asm);
-        push_default(asm, &tree.ty);
+        if ctx.library_abi {
+            emit_predef_nyi(asm);
+            if is_unit_like(&tree.ty) || matches!(tree.ty, Type::Nothing) {
+                asm.pop();
+            }
+        } else {
+            throw_not_implemented(asm);
+            push_default(asm, &tree.ty);
+        }
         return;
     }
     if let Some((slot, sort)) = frame.get(id) {
@@ -2178,7 +2185,7 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
             } else {
                 load_this(asm, ctx);
             }
-            invoke_method(asm, ctx, id);
+            invoke_method(asm, ctx, id, Some(&tree.ty));
         }
         _ => {
             throw_runtime(asm, &format!("cannot load {}", sym.name));
@@ -2234,12 +2241,21 @@ fn gen_select(
                 } else if matches!(ic, Intrinsic::StringToDouble) {
                     asm.invokestatic("java/lang/Double", "parseDouble", "(Ljava/lang/String;)D");
                 } else if matches!(ic, Intrinsic::NotImplemented) {
-                    throw_not_implemented(asm);
-                    push_default(asm, &tree.ty);
+                    if ctx.library_abi {
+                        // Receiver was already pushed; Predef.??? is MODULE$.???().
+                        asm.pop();
+                        emit_predef_nyi(asm);
+                        if is_unit_like(&tree.ty) || matches!(tree.ty, Type::Nothing) {
+                            asm.pop();
+                        }
+                    } else {
+                        throw_not_implemented(asm);
+                        push_default(asm, &tree.ty);
+                    }
                 } else if ctx.st.is_value_class(ctx.st.get(tree.sym).owner) {
                     invoke_value_extension(asm, ctx, tree.sym);
                 } else {
-                    invoke_method(asm, ctx, tree.sym);
+                    invoke_method(asm, ctx, tree.sym, Some(&tree.ty));
                 }
                 return;
             }
@@ -2408,6 +2424,15 @@ fn gen_apply(
         Intrinsic::None
     };
 
+    if ctx.library_abi && (matches!(ic, Intrinsic::Println) || fun.name() == Some("println")) {
+        gen_predef_println(asm, frame, ctx, args, true);
+        return;
+    }
+    if ctx.library_abi && (matches!(ic, Intrinsic::Print) || fun.name() == Some("print")) {
+        gen_predef_println(asm, frame, ctx, args, false);
+        return;
+    }
+
     if matches!(ic, Intrinsic::Println) || fun.name() == Some("println") {
         gen_println(asm, frame, ctx, args, true);
         return;
@@ -2432,6 +2457,25 @@ fn gen_apply(
             emit_unbox(asm, &tree.ty);
         } else {
             push_default(asm, &tree.ty);
+        }
+        return;
+    }
+
+    if ctx.library_abi && matches!(ic, Intrinsic::Assert) {
+        gen_predef_assert_require(asm, frame, ctx, args, true);
+        return;
+    }
+    if ctx.library_abi && matches!(ic, Intrinsic::Require) {
+        gen_predef_assert_require(asm, frame, ctx, args, false);
+        return;
+    }
+    if ctx.library_abi && matches!(ic, Intrinsic::NotImplemented) {
+        emit_predef_nyi(asm);
+        // `Predef.???` is declared to return `Nothing$` but always throws.
+        // Drop the phantom slot so a Unit/`Nothing` statement (e.g. `try ???`)
+        // does not leave a value under the catch handler.
+        if is_unit_like(&tree.ty) || matches!(tree.ty, Type::Nothing) {
+            asm.pop();
         }
         return;
     }
@@ -2683,7 +2727,7 @@ fn gen_apply(
     } else if !fun.sym.is_none() && ctx.st.is_value_class(ctx.st.get(fun.sym).owner) {
         invoke_value_extension(asm, ctx, fun.sym);
     } else {
-        invoke_method(asm, ctx, fun.sym);
+        invoke_method(asm, ctx, fun.sym, Some(&tree.ty));
     }
 }
 
@@ -2758,18 +2802,40 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
     }
 }
 
-fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
+fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Option<&Type>) {
     let s = ctx.st.get(id);
     let owner_id = s.owner;
     let owner = class_internal(ctx.st, owner_id);
-    let mut name = s.name.as_str();
+    let name = s.name.as_str();
     let mut desc = method_desc_from_sym(ctx.st, id);
     if ctx.library_abi {
-        if name == "withFilter" && is_stdlib_option_or_list(&owner) {
-            // Library withFilter returns WithFilter; for-comprehensions only
-            // need a same-shape collection. `filter` matches Option/List ABI.
-            name = "filter";
-        } else if name == "tail" && is_stdlib_list(&owner) {
+        if name == "withFilter" && is_stdlib_list(&owner) {
+            asm.invokeinterface(
+                "scala/collection/IterableOps",
+                "withFilter",
+                "(Lscala/Function1;)Lscala/collection/WithFilter;",
+            );
+            return;
+        }
+        if name == "withFilter" && is_stdlib_option(&owner) {
+            asm.invokevirtual(
+                "scala/Option",
+                "withFilter",
+                "(Lscala/Function1;)Lscala/Option$WithFilter;",
+            );
+            return;
+        }
+        if owner == "scala/collection/WithFilter" && (name == "map" || name == "flatMap") {
+            asm.invokevirtual(&owner, name, "(Lscala/Function1;)Ljava/lang/Object;");
+            if let Some(ty) = result_ty {
+                let cls = jvm_desc(ctx.st, ty);
+                if let Some(inner) = cls.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+                    asm.checkcast(inner);
+                }
+            }
+            return;
+        }
+        if name == "tail" && is_stdlib_list(&owner) {
             if is_interface_sym(ctx.st, owner_id) {
                 asm.invokeinterface(&owner, "tail", "()Lscala/collection/LinearSeq;");
             } else {
@@ -2786,6 +2852,35 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     } else {
         asm.invokevirtual(&owner, name, &desc);
     }
+    maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
+}
+
+/// After a generic invoke that returns `Object`, unbox when the tree still has
+/// a primitive (e.g. `Iterator.next` / `Option.get` as `Int`).
+fn maybe_unbox_erased_result(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    desc: &str,
+    result_ty: Option<&Type>,
+) {
+    if !ctx.library_abi {
+        return;
+    }
+    let Some(ty) = result_ty else {
+        return;
+    };
+    if !desc_returns_object(desc) {
+        return;
+    }
+    if is_jvm_primitive(ty) && !is_unit_like(ty) {
+        emit_unbox(asm, ty);
+    }
+}
+
+fn desc_returns_object(desc: &str) -> bool {
+    desc.rsplit_once(')')
+        .map(|(_, ret)| ret == "Ljava/lang/Object;")
+        .unwrap_or(false)
 }
 
 fn is_stdlib_list(owner: &str) -> bool {
@@ -2801,12 +2896,75 @@ fn is_stdlib_option(owner: &str) -> bool {
     matches!(owner, "scala/Option" | "scala/Some" | "scala/None$")
 }
 
-fn is_stdlib_option_or_list(owner: &str) -> bool {
-    is_stdlib_option(owner) || is_stdlib_list(owner)
-}
-
 fn is_list_module_owner(owner: &str) -> bool {
     owner == "scala/collection/immutable/List$"
+}
+
+fn load_predef_module(asm: &mut Assembler) {
+    asm.getstatic("scala/Predef$", "MODULE$", "Lscala/Predef$;");
+}
+
+fn emit_predef_nyi(asm: &mut Assembler) {
+    load_predef_module(asm);
+    asm.invokevirtual("scala/Predef$", "???", "()Lscala/runtime/Nothing$;");
+}
+
+fn gen_predef_println(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    args: &[Tree],
+    newline: bool,
+) {
+    if args.is_empty() {
+        load_predef_module(asm);
+        if newline {
+            asm.invokevirtual("scala/Predef$", "println", "()V");
+        } else {
+            asm.aconst_null();
+            asm.invokevirtual("scala/Predef$", "print", "(Ljava/lang/Object;)V");
+        }
+        return;
+    }
+    // Evaluate the argument first so a comparison's branch target is not
+    // sitting under `MODULE$` (Java 6 inference verifier / later StackMap).
+    let a = &args[0];
+    gen_expr(asm, frame, ctx, a);
+    if is_unit_like(&a.ty) {
+        asm.ldc_string("()");
+    } else if is_jvm_primitive(&a.ty) {
+        emit_box(asm, &a.ty);
+    }
+    load_predef_module(asm);
+    asm.swap();
+    let name = if newline { "println" } else { "print" };
+    asm.invokevirtual("scala/Predef$", name, "(Ljava/lang/Object;)V");
+}
+
+fn gen_predef_assert_require(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    args: &[Tree],
+    is_assert: bool,
+) {
+    let Some(cond) = args.first() else {
+        return;
+    };
+    gen_expr(asm, frame, ctx, cond);
+    let name = if is_assert { "assert" } else { "require" };
+    if let Some(msg) = args.get(1) {
+        gen_expr(asm, frame, ctx, msg);
+        load_predef_module(asm);
+        // cond, msg, MODULE$ → MODULE$, cond, msg
+        asm.dup_x2();
+        asm.pop();
+        asm.invokevirtual("scala/Predef$", name, "(ZLscala/Function0;)V");
+    } else {
+        load_predef_module(asm);
+        asm.swap();
+        asm.invokevirtual("scala/Predef$", name, "(Z)V");
+    }
 }
 
 fn is_list_unapply_seq(st: &SymbolTable, uid: SymbolId) -> bool {
@@ -3686,7 +3844,7 @@ fn gen_unapply_pattern(
         throw_runtime(asm, "unresolved unapply");
         return;
     }
-    invoke_method(asm, ctx, uid);
+    invoke_method(asm, ctx, uid, None);
     if ret_bool {
         asm.ifeq(fail);
         return;
@@ -3987,7 +4145,7 @@ fn bind_subpattern(
 mod tests {
     use super::*;
     use crate::classfile::write_class_file;
-    use scala_rs_typer::{has_errors, typecheck_str};
+    use scala_rs_typer::{has_errors, typecheck_str, typecheck_str_opts};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4063,7 +4221,13 @@ mod tests {
     }
 
     fn compile_src_library(src: &str) -> Vec<EmittedClass> {
-        let (mut tree, mut st, diags) = typecheck_str(src);
+        let (mut tree, mut st, diags) = typecheck_str_opts(
+            src,
+            &scala_rs_typer::TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+            },
+        );
         assert!(
             !has_errors(&diags),
             "type errors: {:?}",

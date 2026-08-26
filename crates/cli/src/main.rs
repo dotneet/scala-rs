@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use scala_rs_driver::{compile_paths, run_main_with_cp, CompileOptions, CompileResult};
+use scala_rs_driver::{
+    compile_paths, find_scala_library, run_main_with_cp, CompileOptions, CompileResult,
+};
 use scala_rs_span::render_all;
 
 fn main() -> ExitCode {
@@ -68,9 +70,10 @@ COMMANDS:
 
 OPTIONS:
     -d <dir>   Output directory for class files (default: .)
-    --scala-library <jar>
+    --scala-library [<jar>]
                Link against scala-library 2.13 (do not emit private Option/List).
-               Also accepted as SCALA_LIBRARY_JAR. `run` adds the jar to java -cp.
+               Path optional: searches SCALA_LIBRARY_JAR, /tmp/scala-rs-lib, cwd.
+               `run` adds the jar to java -cp.
     --parse             Parse only and dump the AST (do not typecheck or emit)
     --typer             Dump the typed tree after namer/typer
     -Xfatal-warnings    Treat warnings as errors (non-exhaustive match, …)
@@ -158,17 +161,8 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             typer_dump = true;
         } else if a == "-Xfatal-warnings" {
             fatal_warnings = true;
-        } else if a == "--scala-library" {
-            i += 1;
-            let jar = args
-                .get(i)
-                .ok_or_else(|| "option --scala-library requires a jar path".to_string())?;
-            scala_library = Some(PathBuf::from(jar));
-        } else if let Some(jar) = a.strip_prefix("--scala-library=") {
-            if jar.is_empty() {
-                return Err("option --scala-library requires a jar path".into());
-            }
-            scala_library = Some(PathBuf::from(jar));
+        } else if a == "--scala-library" || a.starts_with("--scala-library=") {
+            scala_library = Some(take_scala_library_flag(args, &mut i)?);
         } else if a.starts_with('-') {
             return Err(format!("unknown option '{a}'"));
         } else {
@@ -176,6 +170,14 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
         }
         i += 1;
     }
+    let resolved = match &scala_library {
+        Some(p) if p.as_os_str().is_empty() => {
+            Some(find_scala_library().ok_or_else(|| {
+                "could not find scala-library 2.13 jar (pass --scala-library <jar> or set SCALA_LIBRARY_JAR)".to_string()
+            })?)
+        }
+        other => resolve_scala_library(other.clone()),
+    };
     Ok(CompileArgs {
         files,
         opts: CompileOptions {
@@ -183,16 +185,37 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             parse_only,
             typer_dump,
             fatal_warnings,
-            scala_library: resolve_scala_library(scala_library),
+            scala_library: resolved,
         },
     })
 }
 
-fn resolve_scala_library(explicit: Option<PathBuf>) -> Option<PathBuf> {
-    if explicit.is_some() {
-        return explicit;
+fn take_scala_library_flag(args: &[String], i: &mut usize) -> Result<PathBuf, String> {
+    let a = args[*i].as_str();
+    if let Some(jar) = a.strip_prefix("--scala-library=") {
+        if jar.is_empty() {
+            return Ok(PathBuf::new());
+        }
+        return Ok(PathBuf::from(jar));
     }
-    std::env::var_os("SCALA_LIBRARY_JAR").map(PathBuf::from)
+    let next = args.get(*i + 1).map(|s| s.as_str());
+    if let Some(n) = next {
+        if n.ends_with(".jar") || (std::path::Path::new(n).is_file() && !n.ends_with(".scala")) {
+            *i += 1;
+            return Ok(PathBuf::from(n));
+        }
+    }
+    Ok(PathBuf::new())
+}
+
+fn resolve_scala_library(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    match explicit {
+        Some(p) if p.as_os_str().is_empty() => find_scala_library(),
+        Some(p) => Some(p),
+        None => std::env::var_os("SCALA_LIBRARY_JAR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_file()),
+    }
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {
@@ -265,17 +288,8 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         if a == "--" {
             java_args.extend_from_slice(&args[i + 1..]);
             break;
-        } else if a == "--scala-library" {
-            i += 1;
-            let jar = args
-                .get(i)
-                .ok_or_else(|| "option --scala-library requires a jar path".to_string())?;
-            scala_library = Some(PathBuf::from(jar));
-        } else if let Some(jar) = a.strip_prefix("--scala-library=") {
-            if jar.is_empty() {
-                return Err("option --scala-library requires a jar path".into());
-            }
-            scala_library = Some(PathBuf::from(jar));
+        } else if a == "--scala-library" || a.starts_with("--scala-library=") {
+            scala_library = Some(take_scala_library_flag(args, &mut i)?);
         } else if file.is_none() {
             if a.starts_with('-') {
                 return Err(format!("unknown option '{a}'"));
@@ -287,6 +301,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         i += 1;
     }
     let file = file.ok_or_else(|| "run requires a source file".to_string())?;
+    let scala_library = match scala_library {
+        Some(p) if p.as_os_str().is_empty() => {
+            Some(find_scala_library().ok_or_else(|| {
+                "could not find scala-library 2.13 jar (pass --scala-library <jar> or set SCALA_LIBRARY_JAR)".to_string()
+            })?)
+        }
+        other => other,
+    };
     Ok(RunArgs {
         file,
         java_args,

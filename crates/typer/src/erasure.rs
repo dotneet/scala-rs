@@ -280,6 +280,33 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                     adapt_box_unbox(tree, expected);
                     return;
                 }
+                // Nullary methods (`it.next`, `opt.get`) stay as Select. If the
+                // erased JVM return is `Object` and the specialized type is a
+                // primitive, treat the Select as returning Object so the
+                // backend does not `valueOf` an already-boxed value.
+                if st.get(tree.sym).kind == crate::symbol::SymKind::Method {
+                    let orig = tree.ty.clone();
+                    let ret_erased = match &st.get(tree.sym).ty {
+                        Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
+                        t => erase_ty(t, st),
+                    };
+                    if is_primitive(&orig)
+                        && is_ref_erased(&ret_erased)
+                        && !matches!(orig, Type::Unit)
+                    {
+                        tree.ty = ret_erased;
+                        adapt_box_unbox(tree, expected);
+                        return;
+                    }
+                    if matches!(orig, Type::String)
+                        && is_ref_erased(&ret_erased)
+                        && !matches!(ret_erased, Type::String)
+                    {
+                        tree.ty = ret_erased;
+                        adapt_box_unbox(tree, expected);
+                        return;
+                    }
+                }
             }
         }
         TreeKind::UnApply { fun, args } => {

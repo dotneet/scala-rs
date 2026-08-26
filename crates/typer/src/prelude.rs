@@ -1,7 +1,7 @@
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};
 
-pub fn install_prelude(st: &mut SymbolTable) {
+pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     let root = st.root;
     st.scala_pkg = st.alloc("scala", root, SymKind::Package, Flags::PACKAGE, "scala");
     let java = st.alloc("java", root, SymKind::Package, Flags::PACKAGE, "java");
@@ -157,10 +157,22 @@ pub fn install_prelude(st: &mut SymbolTable) {
     add_long_members(st);
     add_double_members(st);
     add_bool_members(st);
-    add_string_members(st);
+    add_string_members(st, library_abi);
     add_array_members(st);
-    add_option_members(st);
-    add_list_members(st);
+    let with_filter = add_with_filter(st);
+    let option_wf = add_option_with_filter(st);
+    let iterator = if library_abi {
+        Some(add_iterator(st))
+    } else {
+        None
+    };
+    let string_ops = if library_abi {
+        Some(add_string_ops(st))
+    } else {
+        None
+    };
+    add_option_members(st, option_wf, library_abi);
+    add_list_members(st, with_filter, iterator, library_abi);
     add_function_types(st);
 
     // Some companion with apply
@@ -225,7 +237,7 @@ pub fn install_prelude(st: &mut SymbolTable) {
     );
 
     st.predef = module(st, st.scala_pkg, "Predef", "scala/Predef$");
-    add_predef_members(st, arrow);
+    add_predef_members(st, arrow, string_ops);
 
     st.push_scope();
     import_members(st, st.scala_pkg);
@@ -552,7 +564,7 @@ fn add_bool_members(st: &mut SymbolTable) {
     );
 }
 
-fn add_string_members(st: &mut SymbolTable) {
+fn add_string_members(st: &mut SymbolTable, library_abi: bool) {
     let c = st.string_sym;
     method(
         st,
@@ -589,16 +601,19 @@ fn add_string_members(st: &mut SymbolTable) {
         Intrinsic::None,
     );
     method(st, c, "toString", vec![], Type::String, Intrinsic::Identity);
-    method(st, c, "toInt", vec![], Type::Int, Intrinsic::StringToInt);
-    method(st, c, "toLong", vec![], Type::Long, Intrinsic::StringToLong);
-    method(
-        st,
-        c,
-        "toDouble",
-        vec![],
-        Type::Double,
-        Intrinsic::StringToDouble,
-    );
+    if !library_abi {
+        // Private runtime: parseInt on String. Library mode uses StringOps via augmentString.
+        method(st, c, "toInt", vec![], Type::Int, Intrinsic::StringToInt);
+        method(st, c, "toLong", vec![], Type::Long, Intrinsic::StringToLong);
+        method(
+            st,
+            c,
+            "toDouble",
+            vec![],
+            Type::Double,
+            Intrinsic::StringToDouble,
+        );
+    }
 }
 
 fn add_array_members(st: &mut SymbolTable) {
@@ -622,7 +637,174 @@ fn fn1(arg: Type, ret: Type) -> Type {
     }
 }
 
-fn add_option_members(st: &mut SymbolTable) {
+fn add_with_filter(st: &mut SymbolTable) -> SymbolId {
+    let wf = class(
+        st,
+        st.scala_pkg,
+        "WithFilter",
+        "scala/collection/WithFilter",
+        &[Type::AnyRef],
+    );
+    let a = type_param(st, wf, "A");
+    let cc = type_param(st, wf, "CC");
+    st.get_mut(wf).tparams = vec![a, cc];
+    let ta = Type::TypeParam(a);
+    let tcc = Type::TypeParam(cc);
+    method(
+        st,
+        wf,
+        "map",
+        vec![fn1(ta.clone(), Type::Any)],
+        tcc.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        wf,
+        "flatMap",
+        vec![fn1(ta.clone(), tcc.clone())],
+        tcc.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        wf,
+        "foreach",
+        vec![fn1(ta.clone(), Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        wf,
+        "withFilter",
+        vec![fn1(ta, Type::Boolean)],
+        Type::Class {
+            sym: wf,
+            args: vec![Type::TypeParam(a), Type::TypeParam(cc)],
+        },
+        Intrinsic::None,
+    );
+    wf
+}
+
+fn add_option_with_filter(st: &mut SymbolTable) -> SymbolId {
+    let wf = class(
+        st,
+        st.scala_pkg,
+        "Option$WithFilter",
+        "scala/Option$WithFilter",
+        &[Type::AnyRef],
+    );
+    let a = type_param(st, wf, "A");
+    st.get_mut(wf).tparams = vec![a];
+    let ta = Type::TypeParam(a);
+    let opt = Type::Class {
+        sym: st.option_sym,
+        args: vec![ta.clone()],
+    };
+    method(
+        st,
+        wf,
+        "map",
+        vec![fn1(ta.clone(), Type::Any)],
+        opt.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        wf,
+        "flatMap",
+        vec![fn1(ta.clone(), opt.clone())],
+        opt.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        wf,
+        "foreach",
+        vec![fn1(ta.clone(), Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        wf,
+        "withFilter",
+        vec![fn1(ta, Type::Boolean)],
+        Type::Class {
+            sym: wf,
+            args: vec![Type::TypeParam(a)],
+        },
+        Intrinsic::None,
+    );
+    wf
+}
+
+fn add_iterator(st: &mut SymbolTable) -> SymbolId {
+    let it = iface(st, st.scala_pkg, "Iterator", "scala/collection/Iterator");
+    let a = type_param(st, it, "A");
+    st.get_mut(it).tparams = vec![a];
+    let ta = Type::TypeParam(a);
+    let it_t = Type::Class {
+        sym: it,
+        args: vec![ta.clone()],
+    };
+    method(st, it, "hasNext", vec![], Type::Boolean, Intrinsic::None);
+    method(st, it, "next", vec![], ta.clone(), Intrinsic::None);
+    method(
+        st,
+        it,
+        "foreach",
+        vec![fn1(ta.clone(), Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        it,
+        "map",
+        vec![fn1(ta.clone(), Type::Any)],
+        it_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        it,
+        "filter",
+        vec![fn1(ta.clone(), Type::Boolean)],
+        it_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        it,
+        "withFilter",
+        vec![fn1(ta, Type::Boolean)],
+        it_t,
+        Intrinsic::None,
+    );
+    it
+}
+
+fn add_string_ops(st: &mut SymbolTable) -> SymbolId {
+    let so = class(
+        st,
+        st.scala_pkg,
+        "StringOps",
+        "scala/collection/StringOps",
+        &[Type::AnyVal],
+    );
+    let f = st.alloc("repr", so, SymKind::Term, Flags::PARAM, "");
+    st.get_mut(f).ty = Type::String;
+    st.get_mut(so).ctor_fields = vec![f];
+    method(st, so, "toInt", vec![], Type::Int, Intrinsic::None);
+    method(st, so, "toLong", vec![], Type::Long, Intrinsic::None);
+    method(st, so, "toDouble", vec![], Type::Double, Intrinsic::None);
+    so
+}
+
+fn add_option_members(st: &mut SymbolTable, option_wf: SymbolId, library_abi: bool) {
     let o = st.option_sym;
     let a = type_param(st, o, "A");
     st.get_mut(o).tparams = vec![a];
@@ -662,7 +844,14 @@ fn add_option_members(st: &mut SymbolTable) {
         o,
         "withFilter",
         vec![fn1(ta.clone(), Type::Boolean)],
-        opt,
+        if library_abi {
+            Type::Class {
+                sym: option_wf,
+                args: vec![ta],
+            }
+        } else {
+            opt
+        },
         Intrinsic::None,
     );
 
@@ -687,7 +876,12 @@ fn add_option_members(st: &mut SymbolTable) {
     };
 }
 
-fn add_list_members(st: &mut SymbolTable) {
+fn add_list_members(
+    st: &mut SymbolTable,
+    with_filter: SymbolId,
+    iterator: Option<SymbolId>,
+    library_abi: bool,
+) {
     let l = st.list_sym;
     let a = type_param(st, l, "A");
     st.get_mut(l).tparams = vec![a];
@@ -731,14 +925,35 @@ fn add_list_members(st: &mut SymbolTable) {
         list_t.clone(),
         Intrinsic::None,
     );
+    let wf_ret = if library_abi {
+        Type::Class {
+            sym: with_filter,
+            args: vec![ta.clone(), list_t.clone()],
+        }
+    } else {
+        list_t.clone()
+    };
     method(
         st,
         l,
         "withFilter",
-        vec![fn1(ta, Type::Boolean)],
-        list_t.clone(),
+        vec![fn1(ta.clone(), Type::Boolean)],
+        wf_ret,
         Intrinsic::None,
     );
+    if let Some(it) = iterator {
+        method(
+            st,
+            l,
+            "iterator",
+            vec![],
+            Type::Class {
+                sym: it,
+                args: vec![ta.clone()],
+            },
+            Intrinsic::None,
+        );
+    }
 
     let list_mod = module(st, st.scala_pkg, "List", "scala/collection/immutable/List$");
     let mcls = st.module_class_of(list_mod);
@@ -771,7 +986,7 @@ fn add_function_types(st: &mut SymbolTable) {
     }
 }
 
-fn add_predef_members(st: &mut SymbolTable, arrow: SymbolId) {
+fn add_predef_members(st: &mut SymbolTable, arrow: SymbolId, string_ops: Option<SymbolId>) {
     let p = st.predef;
     let cls = st.get(p).ty.clone();
     let owner = match cls {
@@ -966,6 +1181,20 @@ fn add_predef_members(st: &mut SymbolTable, arrow: SymbolId) {
         Intrinsic::WrapArrowAssoc,
     );
     st.get_mut(conv).flags = st.get(conv).flags.with(Flags::IMPLICIT);
+    if let Some(sops) = string_ops {
+        let aug = method(
+            st,
+            owner,
+            "augmentString",
+            vec![Type::String],
+            Type::Class {
+                sym: sops,
+                args: vec![],
+            },
+            Intrinsic::Identity,
+        );
+        st.get_mut(aug).flags = st.get(aug).flags.with(Flags::IMPLICIT);
+    }
     let mems = st.get(owner).members.clone();
     st.get_mut(p).members.extend(mems.iter().copied());
     for m in mems {
