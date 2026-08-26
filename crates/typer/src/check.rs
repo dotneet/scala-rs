@@ -1069,7 +1069,6 @@ impl Typer {
         } else {
             self.type_expr_inner(tree, pt);
         }
-        self.adapt_implicit_apply(tree, pt);
         if !pt.is_no_type() && !tree.ty.is_no_type() && !tree.ty.is_error() {
             self.adapt(tree, pt);
         }
