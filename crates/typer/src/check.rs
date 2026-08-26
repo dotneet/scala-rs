@@ -938,7 +938,9 @@ impl Typer {
             return;
         }
         self.st.push_scope();
+        let saved_owner = self.st.owner;
         if !tree.sym.is_none() {
+            self.st.owner = tree.sym;
             for tp in self.st.get(tree.sym).tparams.clone() {
                 let n = self.st.get(tp).name.clone();
                 self.st.enter_in_current(&n, tp);
@@ -963,6 +965,7 @@ impl Typer {
                 self.st.get_mut(tree.sym).ty = tree.ty.clone();
             }
         }
+        self.st.owner = saved_owner;
         self.st.pop_scope();
     }
 
@@ -1111,7 +1114,10 @@ impl Typer {
             TreeKind::Apply { .. } => self.type_apply(tree, pt),
             TreeKind::TypeApply { fun, args } => {
                 self.type_expr(fun, &Type::NoType);
-                let targs: Vec<Type> = args.iter().map(|a| self.tree_to_type(a)).collect();
+                let mut targs = Vec::new();
+                for a in args.iter() {
+                    targs.push(self.tree_to_type(a));
+                }
                 if !fun.sym.is_none() {
                     tree.sym = fun.sym;
                     tree.ty = self.st.subst_tparams(fun.sym, &targs, &fun.ty);
@@ -3003,9 +3009,10 @@ impl Typer {
         }
     }
 
-    fn tree_to_type(&self, tpt: &Tree) -> Type {
+    fn tree_to_type(&mut self, tpt: &Tree) -> Type {
         match &tpt.kind {
             TreeKind::Empty => Type::NoType,
+            TreeKind::Ident { name } if name == "_" => Type::Wildcard,
             TreeKind::Ident { name } => self.resolve_type_name(name, &[]),
             TreeKind::Select { name, qual: _ } => {
                 // java.lang.String etc.
@@ -3016,7 +3023,10 @@ impl Typer {
                 }
             }
             TreeKind::AppliedTypeTree { tpt, args } => {
-                let as_: Vec<Type> = args.iter().map(|a| self.tree_to_type(a)).collect();
+                let mut as_ = Vec::new();
+                for a in args {
+                    as_.push(self.tree_to_type(a));
+                }
                 match tpt.name() {
                     Some("Array") => {
                         Type::Array(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
@@ -3053,6 +3063,91 @@ impl Typer {
                 }
             }
             TreeKind::Literal { lit: Lit::Unit } => Type::Unit,
+            TreeKind::TypeDef {
+                name, tparams, lo, hi, rhs, ..
+            } => {
+                if name == "_" {
+                    if lo.is_some() || hi.is_some() {
+                        self.error(
+                            tpt.span,
+                            "unimplemented type: wildcard bounds (`_ <: T` / `_ >: T`)",
+                        );
+                        return Type::Error;
+                    }
+                    if !tparams.is_empty() {
+                        self.error(tpt.span, "unimplemented type: higher-kinded wildcard");
+                        return Type::Error;
+                    }
+                    Type::Wildcard
+                } else if !rhs.is_empty() {
+                    self.tree_to_type(rhs)
+                } else {
+                    Type::Named {
+                        name: name.clone(),
+                        args: vec![],
+                    }
+                }
+            }
+            TreeKind::ExistentialTypeTree { tpt: inner, clauses } => {
+                let mut quantified = Vec::new();
+                let mut ok = true;
+                for c in clauses {
+                    match &c.kind {
+                        TreeKind::TypeDef {
+                            name,
+                            tparams,
+                            lo,
+                            hi,
+                            rhs,
+                            ..
+                        } => {
+                            if !tparams.is_empty()
+                                || lo.is_some()
+                                || hi.is_some()
+                                || !rhs.is_empty()
+                            {
+                                self.error(
+                                    c.span,
+                                    "unimplemented type: bounded or higher-kinded existential",
+                                );
+                                ok = false;
+                            } else {
+                                quantified.push(name.clone());
+                            }
+                        }
+                        TreeKind::ValDef { .. } => {
+                            self.error(
+                                c.span,
+                                "unimplemented type: value existential (`forSome { val … }`)",
+                            );
+                            ok = false;
+                        }
+                        TreeKind::Unimplemented { what } => {
+                            self.error(
+                                c.span,
+                                format!("unimplemented type: {what}"),
+                            );
+                            ok = false;
+                        }
+                        _ => {
+                            self.error(
+                                c.span,
+                                "unimplemented type: existential clause",
+                            );
+                            ok = false;
+                        }
+                    }
+                }
+                let ty = self.tree_to_type(inner);
+                if !ok {
+                    return Type::Error;
+                }
+                subst_quantified(ty, &quantified)
+            }
+            TreeKind::Unimplemented { what } => {
+                self.error(tpt.span, format!("unimplemented type: {what}"));
+                Type::Error
+            }
             _ => Type::Named {
                 name: tpt.name().unwrap_or("?").to_string(),
                 args: vec![],
@@ -3259,6 +3354,8 @@ fn is_sub_type(a: &Type, b: &Type) -> bool {
             Type::AnyRef,
         ) => true,
         (Type::Class { sym: s1, .. }, Type::Class { sym: s2, .. }) if s1 == s2 => true,
+        (Type::Wildcard, Type::AnyRef | Type::AnyVal | Type::Wildcard) => true,
+        (_, Type::Wildcard) => true,
         (Type::Array(x), Type::Array(y)) => is_sub_type(x, y),
         (Type::ModuleRef(s), Type::Class { sym, .. }) if s == sym => true,
         _ => false,
@@ -3394,6 +3491,64 @@ pub fn find_mains(st: &SymbolTable, tree: &Tree) -> Vec<String> {
     }
     walk(st, tree, &mut out);
     out
+}
+
+/// Replace quantified existential names (`type X`) with unbounded wildcards.
+fn subst_quantified(ty: Type, names: &[String]) -> Type {
+    if names.is_empty() {
+        return ty;
+    }
+    match ty {
+        Type::Named { name, args } if args.is_empty() && names.iter().any(|n| n == &name) => {
+            Type::Wildcard
+        }
+        Type::Named { name, args } => Type::Named {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| subst_quantified(a, names))
+                .collect(),
+        },
+        Type::Class { sym, args } => Type::Class {
+            sym,
+            args: args
+                .into_iter()
+                .map(|a| subst_quantified(a, names))
+                .collect(),
+        },
+        Type::Array(t) => Type::Array(Box::new(subst_quantified(*t, names))),
+        Type::Function { params, ret } => Type::Function {
+            params: params
+                .into_iter()
+                .map(|p| subst_quantified(p, names))
+                .collect(),
+            ret: Box::new(subst_quantified(*ret, names)),
+        },
+        Type::Method { paramss, ret } => Type::Method {
+            paramss: paramss
+                .into_iter()
+                .map(|ps| {
+                    ps.into_iter()
+                        .map(|p| subst_quantified(p, names))
+                        .collect()
+                })
+                .collect(),
+            ret: Box::new(subst_quantified(*ret, names)),
+        },
+        Type::ByName(t) => Type::ByName(Box::new(subst_quantified(*t, names))),
+        Type::Repeated(t) => Type::Repeated(Box::new(subst_quantified(*t, names))),
+        Type::Tuple(ts) => Type::Tuple(
+            ts.into_iter()
+                .map(|t| subst_quantified(t, names))
+                .collect(),
+        ),
+        Type::Overload(alts) => Type::Overload(
+            alts.into_iter()
+                .map(|t| subst_quantified(t, names))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 pub fn has_errors(diags: &[Diagnostic]) -> bool {

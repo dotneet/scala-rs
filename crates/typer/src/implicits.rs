@@ -135,11 +135,8 @@ impl Typer {
             .into_iter()
             .filter(|id| self.implicit_provides(*id, pt))
             .collect();
-        if local.len() == 1 {
-            return ImplicitSearch::Found(local[0]);
-        }
-        if local.len() > 1 {
-            return ImplicitSearch::Ambiguous(local);
+        if !local.is_empty() {
+            return self.most_specific(local);
         }
         let mut comps: Vec<SymbolId> = self
             .companion_implicits(pt)
@@ -148,11 +145,7 @@ impl Typer {
             .collect();
         comps.sort_by_key(|id| id.0);
         comps.dedup();
-        match comps.len() {
-            0 => ImplicitSearch::None,
-            1 => ImplicitSearch::Found(comps[0]),
-            _ => ImplicitSearch::Ambiguous(comps),
-        }
+        self.most_specific(comps)
     }
 
     pub(crate) fn search_conversion(&self, from: &Type, to: &Type) -> ImplicitSearch {
@@ -161,11 +154,8 @@ impl Typer {
             .into_iter()
             .filter(|id| self.conversion_provides(*id, from, to))
             .collect();
-        if local.len() == 1 {
-            return ImplicitSearch::Found(local[0]);
-        }
-        if local.len() > 1 {
-            return ImplicitSearch::Ambiguous(local);
+        if !local.is_empty() {
+            return self.most_specific(local);
         }
         let mut comps: Vec<SymbolId> = self
             .companion_implicits(to)
@@ -175,10 +165,68 @@ impl Typer {
             .collect();
         comps.sort_by_key(|id| id.0);
         comps.dedup();
-        match comps.len() {
+        self.most_specific(comps)
+    }
+
+    /// nsc-style: `a` is as specific as `b` when `a`'s result type is a subtype
+    /// of `b`'s, and (for conversions) `a`'s argument type is a subtype of `b`'s.
+    fn is_as_specific(&self, a: SymbolId, b: SymbolId) -> bool {
+        let ra = self.implicit_result_ty(a);
+        let rb = self.implicit_result_ty(b);
+        if !self.st.is_sub_type(&ra, &rb) {
+            return false;
+        }
+        match (self.conversion_arg_ty(a), self.conversion_arg_ty(b)) {
+            (Some(aa), Some(ab)) => self.st.is_sub_type(&aa, &ab),
+            (Some(_), None) => false,
+            (None, Some(_)) => true,
+            (None, None) => true,
+        }
+    }
+
+    fn strictly_more_specific(&self, a: SymbolId, b: SymbolId) -> bool {
+        a != b && self.is_as_specific(a, b) && !self.is_as_specific(b, a)
+    }
+
+    fn most_specific(&self, cands: Vec<SymbolId>) -> ImplicitSearch {
+        match cands.len() {
             0 => ImplicitSearch::None,
-            1 => ImplicitSearch::Found(comps[0]),
-            _ => ImplicitSearch::Ambiguous(comps),
+            1 => ImplicitSearch::Found(cands[0]),
+            _ => {
+                let winners: Vec<SymbolId> = cands
+                    .iter()
+                    .copied()
+                    .filter(|&a| !cands.iter().any(|&b| self.strictly_more_specific(b, a)))
+                    .collect();
+                match winners.len() {
+                    0 => ImplicitSearch::Ambiguous(cands),
+                    1 => ImplicitSearch::Found(winners[0]),
+                    _ => ImplicitSearch::Ambiguous(winners),
+                }
+            }
+        }
+    }
+
+    fn implicit_result_ty(&self, id: SymbolId) -> Type {
+        match &self.st.get(id).ty {
+            Type::Method { ret, .. } => (**ret).clone(),
+            Type::Function { ret, .. } => (**ret).clone(),
+            t => t.clone(),
+        }
+    }
+
+    fn conversion_arg_ty(&self, id: SymbolId) -> Option<Type> {
+        match &self.st.get(id).ty {
+            Type::Method { paramss, .. } => {
+                let ps = paramss.first()?;
+                if ps.len() == 1 {
+                    Some(ps[0].clone())
+                } else {
+                    None
+                }
+            }
+            Type::Function { params, .. } if params.len() == 1 => Some(params[0].clone()),
+            _ => None,
         }
     }
 

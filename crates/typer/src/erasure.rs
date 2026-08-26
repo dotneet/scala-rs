@@ -65,6 +65,7 @@ pub fn erase_type(ty: &Type) -> Type {
         Type::Repeated(t) => Type::Repeated(Box::new(erase_type(t))),
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(erase_type).collect()),
         Type::Overload(alts) => Type::Overload(alts.iter().map(erase_type).collect()),
+        Type::Wildcard => Type::Any,
         other => other.clone(),
     }
 }
@@ -79,6 +80,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
             }
         }
         Type::TypeParam(_) => Type::Any,
+        Type::Wildcard => Type::Any,
         Type::Class { sym, .. } => Type::Class {
             sym: *sym,
             args: vec![],
@@ -138,6 +140,7 @@ fn is_ref_erased(ty: &Type) -> bool {
             | Type::Array(_)
             | Type::Function { .. }
             | Type::TypeParam(_)
+            | Type::Wildcard
             | Type::Named { .. }
     )
 }

@@ -81,9 +81,11 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - apply / select / infix（`:` 終わりの演算子は右結合で、レシーバは右オペランド。`1 :: Nil` → `Nil.::(1)`）
 - リテラル、タプル
 - 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）
+- 存在型のよくある形: `List[_]`、`T forSome { type X }`、`List[_]` を取るメソッド。ワイルドカードは Object 相当に erase する。境界付き `_ <: T` や `forSome { val … }` は診断する（黙って捨てない）
 - `s"..."` 文字列補間
 - `lazy val`
-- implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む
+- implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む。候補が複数あるときは nsc 風の **more-specific**（結果型の subtype）が勝つ。まだ曖昧なら `ambiguous implicit`
+- ネストした `def` の **lambda-lift**（ローカルを捕獲する合成メソッド。値として使う / ラムダから再帰呼び出しするケースが動く）
 - デフォルト引数、by-name パラメータ（`=> T`）
 - 名前付き引数（呼び出し側で並べ替え）
 - 具象メンバー付き trait の mixin（`T$class` 静的実装 + 線形化順のフォワーダ）
@@ -103,12 +105,14 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 パイプラインは次のとおりです。
 
 ```
-parse → namer → typer → uncurry → erasure → emit
+parse → namer → typer → uncurry → lambda-lift → erasure → emit
 ```
 
 uncurry は nsc と同様、typer と erasure のあいだの独立パスです。ネストしたパラメータリストを 1 リストにまとめ、ネストした `Apply` を 1 回の呼び出しにします。部分適用と eta-expansion（`foo _`、FunctionN 期待位置の未適用メソッド）は `FunctionN` クロージャになります。
 
-erasure は型引数を落とし、型パラメータを `Object` にし、プリミティブと `Object` の境に box / unbox を挿入します。by-name は `Function0` に下げます。バックエンドの ad-hoc な推測だけには頼っていません。
+lambda-lift は uncurry のあと、erasure の前です。メソッド本体のネストした `def` を囲みクラスの合成メソッドに上げ、捕獲したローカルを先頭パラメータとして渡します。ネスト def を値として eta したときや、ラムダから再帰呼び出しするときも、実際に classfile に出て実行されます。
+
+erasure は型引数を落とし、型パラメータと unbounded ワイルドカードを `Object` にし、プリミティブと `Object` の境に box / unbox を挿入します。by-name は `Function0` に下げます。バックエンドの ad-hoc な推測だけには頼っていません。
 
 ### Implicit 解決（第一カット）
 
@@ -126,6 +130,8 @@ nsc に寄せた探索順です。偽の「何でも変換」はありません�
 
 - `no implicit: could not find implicit value of type …`
 - `ambiguous implicit: …`
+
+同じ目標型に対して subtype 関係にある implicit が二つあるとき（`A` と `B extends A` を両方 `A` として探す）、より specific な `B` が勝ちます。同じ型が二つなら、これまでどおり曖昧です。
 
 ### Trait mixin
 
@@ -194,13 +200,13 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 
 言語:
 
-- existential types（`T forSome { type A }`、構造的 refinement としての `new { def x }` の型）
 - マクロ
-- implicit の優先度 / specificity（このパスの探索順はあるが、scalac の specific-is-better ではない）
 - Scala signatures / pickling（ScalaSig / TASTy は出さない）
 - StackMapTable（Java 6 ターゲットのまま）
 - コンパイラプラグイン
 - Scala 3 構文 / TASTy / view bounds / XML リテラル
+- 境界付き存在型（`_ <: T`、`forSome { type X <: Bound }`、`forSome { val x: T }`）。よくある unbounded `List[_]` / `T forSome { type X }` は実装済み
+- 構造的 refinement としての `T { def x }` の型（匿名クラスの合成 classfile は出す）
 
 ライブラリ:
 
@@ -218,7 +224,7 @@ Cargo workspace のクレート:
 | `scala-rs-span` | ソース位置と診断 |
 | `scala-rs-lexer` | 字句解析（セミコロン推論用の改行トークン、`s"..."` のモードスタック） |
 | `scala-rs-parser` | 再帰下降パーサ。AST は nsc の `Tree` に近い |
-| `scala-rs-typer` | namer + typer + uncurry + erasure。implicit 探索を含む |
+| `scala-rs-typer` | namer + typer + uncurry + lambda-lift + erasure。implicit 探索を含む |
 | `scala-rs-backend` | JVM classfile 出力（major 50）と scala-rs ランタイム |
 | `scala-rs-driver` | パイプライン駆動 |
 | `scala-rs-cli` | コマンドライン。バイナリ名 `scala-rs` |
@@ -228,14 +234,14 @@ Cargo workspace のクレート:
 正直な差分です。
 
 - **規模**: nsc のごく一部。言語仕様を満たしません。
-- **ライブラリ**: デフォルトの **`compile` / `run`** は jar が自動検出できればリンクし、同名の私有 classfile は出さない。見つからなければ私有ランタイム。`--scala-library`（パス省略時は `SCALA_LIBRARY_JAR` / `/tmp/scala-rs-lib` / cwd を探索）で明示できる。**`--no-scala-library` は私有を強制**する。jar に乗るもの: `Option` / `Some` / `None` / `List` / `Nil` / `::` / `Function0` / `Function1` / `Tuple2` / `NotImplementedError` / `Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）/ `any2stringadd` / `ArrowAssoc` の `->` / `intWrapper` / `RichInt`（`abs` / `max` / `min` / `to` / `until`）/ `longWrapper` / `RichLong`（`abs` / `max` / `min`）/ `doubleWrapper` / `RichDouble`（`abs` / `max` / `min`）/ `floatWrapper` / `RichFloat`（`abs` / `max` / `min`）/ `charWrapper` / `RichChar`（`isDigit` / `toInt` via `intValue$extension`）/ `StringOps`（`toInt$extension` / `size$extension` / `$times$extension` / `take$extension` / `drop$extension` / `isEmpty` via `augmentString` / `toUpperCase`/`toLowerCase` inlined to `String` / `stripPrefix$extension` / `split$extension`）/ `WithFilter` / `Iterator` / `Map` / `Vector` / `Set` / `Seq` / `LazyList`（`empty` / `foreach` / **varargs `apply`**）/ `Either`（`Left` / `Right` / `isLeft` / `getOrElse` / `map`）/ `Try`（`Try$` / `Success` / `Failure` の `apply` / `map` / `getOrElse`）。dual-run: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector` / `int_ops` / `string_ops` / `list_apply` / `set` / `long_ops` / `seq` / `either` / `float_ops` / `string_ops2` / `anonymous` / `eta` / `try_util`。**まだ intrinsic / 私有、または未リンク**: 完全な StringOps（`stripSuffix` / `lines` 等）、残りの numeric wrapper（`RichByte` 等）、`Queue` / `IndexedSeq` などのファクトリ。`List.unapplySeq` は library では `SeqOps` の identity。`List`/`Seq`/`LazyList` の varargs `apply` は **library のみ**。
+- **ライブラリ**: デフォルトの **`compile` / `run`** は jar が自動検出できればリンクし、同名の私有 classfile は出さない。見つからなければ私有ランタイム。`--scala-library`（パス省略時は `SCALA_LIBRARY_JAR` / `/tmp/scala-rs-lib` / cwd を探索）で明示できる。**`--no-scala-library` は私有を強制**する。jar に乗るもの: `Option` / `Some` / `None` / `List` / `Nil` / `::` / `Function0` / `Function1` / `Tuple2` / `NotImplementedError` / `Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）/ `any2stringadd` / `ArrowAssoc` の `->` / `intWrapper` / `RichInt`（`abs` / `max` / `min` / `to` / `until`）/ `longWrapper` / `RichLong`（`abs` / `max` / `min`）/ `doubleWrapper` / `RichDouble`（`abs` / `max` / `min`）/ `floatWrapper` / `RichFloat`（`abs` / `max` / `min`）/ `charWrapper` / `RichChar`（`isDigit` / `toInt` via `intValue$extension`）/ `StringOps`（`toInt$extension` / `size$extension` / `$times$extension` / `take$extension` / `drop$extension` / `isEmpty` via `augmentString` / `toUpperCase`/`toLowerCase` inlined to `String` / `stripPrefix$extension` / `split$extension`）/ `WithFilter` / `Iterator` / `Map` / `Vector` / `Set` / `Seq` / `LazyList`（`empty` / `foreach` / **varargs `apply`**）/ `Either`（`Left` / `Right` / `isLeft` / `getOrElse` / `map`）/ `Try`（`Try$` / `Success` / `Failure` の `apply` / `map` / `getOrElse`）。dual-run: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector` / `int_ops` / `string_ops` / `list_apply` / `set` / `long_ops` / `seq` / `either` / `float_ops` / `string_ops2` / `anonymous` / `eta` / `try_util` / `existentials` / `implicit_specific` / `lambda_lift`。**まだ intrinsic / 私有、または未リンク**: 完全な StringOps（`stripSuffix` / `lines` 等）、残りの numeric wrapper（`RichByte` 等）、`Queue` / `IndexedSeq` などのファクトリ。`List.unapplySeq` は library では `SeqOps` の identity。`List`/`Seq`/`LazyList` の varargs `apply` は **library のみ**。
 - **object**: scalac と同様、`Main$`（モジュール）と静的フォワーダ `Main` を出します。`java Main` が動くのはそのためです。
 - **プリミティブ**: `Int` の `+` などは `scala.Int` のボックスメソッドではなく、JVM 命令（`iadd` など）として出します。
 - **trait**: 抽象メンバーだけの trait は JVM interface です。具象メンバーは `T$class` 静的実装と、C3 線形化順のインスタンスフォワーダです。Java 8 default method は使いません（major 50）。`val` は getter/setter + `$init$` です。`abstract override` は `T$$super$m` です。
 - **名前付き引数**: 呼び出し側で `f(b = 2, a = 1)` を並べ替えます。巨大な rewrite フェーズはありません。extractor パターンでも case class なら並べ替えます。
 - **try**: Code 属性に例外テーブルを出します。StackMapTable はありません。
 - **ラムダ**: `FunctionN` を実装する合成クラス（`Main$$$anonfun$0` など）です。invokedynamic / LambdaMetaFactory は使いません（Java 6）。
-- **フェーズ**: nsc の mixin / lambdaLift などの独立パスはありません。**uncurry** と erasure、ラムダのクロージャ変換はあります。
+- **フェーズ**: nsc の mixin などの独立パスはありません。**uncurry**、**lambda-lift**（ネスト def）、erasure、ラムダのクロージャ変換はあります。
 - **sealed**: 非網羅 match は scalac と同様 warning です。`-Xfatal-warnings` でエラーになります。
 - **AnyVal**: scalac は値クラスのクラスファイルと拡張メソッドの両方を出します。scala-rs もクラスは出しますが、呼び出しは `$extension` 静的メソッドで、`new C(x)` は underlying に消えます。
 - **Predef / StringOps**: 私有では `assert` / `require` / `???` / `->`（`Tuple2` 直結）/ `identity` / `locally` / `implicitly` / `any2stringadd` と String の `length`/`toInt`/`isEmpty`。library では `Predef$.println/assert/require/???/identity/locally/implicitly`、`any2stringadd.$plus$extension`、`ArrowAssoc.$minus$greater$extension`、`intWrapper` → `RichInt.abs$extension` / `max$extension` / `to$extension`、`longWrapper` → `RichLong.abs$extension` / `max$extension`、`doubleWrapper` → `RichDouble.abs$extension` / `max$extension`、`floatWrapper` → `RichFloat.abs$extension` / `max$extension`、`charWrapper` → `RichChar.isDigit$extension` / `intValue$extension`（`.toInt`）、`augmentString` → `StringOps.toInt$extension` / `size$extension`（`.length`）/ `$times$extension` / `take$extension` / `drop$extension` / `stripPrefix$extension` / `split$extension`（`.isEmpty` / `.toUpperCase` / `.toLowerCase` は StringOps 経由で `String` にインライン）。**`StringOps` / `RichInt` / `RichLong` / `RichDouble` / `RichFloat` / `RichChar` classfile は出していません。**
@@ -251,7 +257,7 @@ cargo test
 
 実行時の期待値は `tests/fixtures/` にあります。各 `.scala` に対して `tests/fixtures/expected/` に同名の `.txt`（`println` と同じ末尾改行付きの stdout）を置いています。`java` がある環境では CLI の e2e が stdout を比較します。
 
-scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコンパイルし、`java -cp out:scala-library.jar Main` でも同じ stdout になることを見ます（私有の `scala/Option.class` / `scala/Predef$.class` 等が無いこと）: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector` / `int_ops` / `string_ops` / `list_apply` / `set` / `long_ops` / `seq` / `either` / `float_ops` / `string_ops2` / `anonymous` / `eta` / `try_util`。`iterator.scala` / `map.scala` / `vector.scala` / `int_ops.scala` / `string_ops.scala` / `list_apply.scala` / `set.scala` / `long_ops.scala` / `seq.scala` / `either.scala` / `float_ops.scala` / `string_ops2.scala` / `try_util.scala` は library リンク時のみ。フラグなしの `compile` は jar を自動検出してリンクし、`--no-scala-library` は私有ランタイムを出す。
+scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコンパイルし、`java -cp out:scala-library.jar Main` でも同じ stdout になることを見ます（私有の `scala/Option.class` / `scala/Predef$.class` 等が無いこと）: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector` / `int_ops` / `string_ops` / `list_apply` / `set` / `long_ops` / `seq` / `either` / `float_ops` / `string_ops2` / `anonymous` / `eta` / `try_util` / `existentials` / `implicit_specific` / `lambda_lift`。`iterator.scala` / `map.scala` / `vector.scala` / `int_ops.scala` / `string_ops.scala` / `list_apply.scala` / `set.scala` / `long_ops.scala` / `seq.scala` / `either.scala` / `float_ops.scala` / `string_ops2.scala` / `try_util.scala` は library リンク時のみ。フラグなしの `compile` は jar を自動検出してリンクし、`--no-scala-library` は私有ランタイムを出す。
 
 | フィクスチャ | 内容 | 期待 stdout |
 | --- | --- | --- |
@@ -276,6 +282,9 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `nested_class.scala` | `class Outer { class Inner }` | `inner` |
 | `anonymous.scala` | `new Trait { ... }` と `new { def msg }` の匿名クラス | `Hello, Scala` `anon` |
 | `eta.scala` | カリー化 `add(x)(y)`、`xs.map(inc)` / `inc _` | `3` `11` `12` `2` `3` `2` `3` |
+| `existentials.scala` | `List[_]` / `List[X] forSome { type X }` を取るメソッド | `1` `2` `a` `b` |
+| `implicit_specific.scala` | より specific な implicit（`B extends A`）が勝つ | `B` |
+| `lambda_lift.scala` | ローカル捕獲のネスト `def`、eta、ラムダからの再帰 | `11` `11` `12` `120` `3` |
 | `nested_object.scala` | `object Outer { object Inner }` | `nested` |
 | `super.scala` | クラス/`trait` の `super` と `Outer.this` | `base!` `T!` `outer` |
 | `sealed_match.scala` | sealed + case class/object の網羅 match | `3` `0` |
@@ -301,7 +310,7 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `predef_more.scala` | `any2stringadd` / `implicitly` / `identity` / `locally` | `1x` `41` `42` `here` |
 | `sealed_non_exhaustive.scala` | 非網羅 match（warning。実行は覆っている入力だけ） | `3` |
 
-implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストで見ています。コンパイルを成功扱いにしていません。
+implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` のコンパイル失敗で見ています。境界付き存在型は `existential_bounds.scala` で診断します。コンパイルを成功扱いにしていません。
 
 ## ライセンス
 

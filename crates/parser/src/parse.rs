@@ -1170,13 +1170,14 @@ impl<'a> Parser<'a> {
                     name: "Function0".into(),
                 },
             );
-            return self.alloc(
+            let fn0 = self.alloc(
                 lo.merge(rhs.span),
                 TreeKind::AppliedTypeTree {
                     tpt: Box::new(tpt),
                     args: vec![rhs],
                 },
             );
+            return self.parse_existential_suffix(fn0);
         }
         let t = self.parse_infix_type();
         self.skip_nl();
@@ -1200,15 +1201,83 @@ impl<'a> Parser<'a> {
                     name: format!("Function{n}"),
                 },
             );
-            return self.alloc(
+            let fn_ty = self.alloc(
                 t.span.merge(self.prev_span()),
                 TreeKind::AppliedTypeTree {
                     tpt: Box::new(tpt),
                     args,
                 },
             );
+            return self.parse_existential_suffix(fn_ty);
         }
-        t
+        self.parse_existential_suffix(t)
+    }
+
+    /// `T forSome { type X; ... }`. Unsupported clauses stay in the tree and
+    /// are diagnosed (not dropped).
+    fn parse_existential_suffix(&mut self, t: Tree) -> Tree {
+        self.skip_nl();
+        if !matches!(self.kind(), TokenKind::ForSome) {
+            return t;
+        }
+        let kw = self.span();
+        self.bump();
+        self.skip_nl();
+        self.expect("{", |k| matches!(k, TokenKind::LBrace));
+        let mut clauses = Vec::new();
+        loop {
+            self.skip_nl_semi();
+            match self.kind() {
+                TokenKind::RBrace | TokenKind::Eof => break,
+                TokenKind::TypeKw => clauses.push(self.parse_type_def(Modifiers::default())),
+                TokenKind::Val | TokenKind::Var => {
+                    clauses.push(self.parse_val_def(Modifiers::default()));
+                }
+                TokenKind::Def => {
+                    let sp = self.span();
+                    clauses.push(self.unimplemented(sp, "method existentials (`forSome { def … }`)"));
+                    self.skip_to_existential_sep();
+                }
+                _ => {
+                    let sp = self.span();
+                    clauses.push(self.unimplemented(
+                        sp,
+                        "existential clause (only unbounded `type X` is supported)",
+                    ));
+                    self.skip_to_existential_sep();
+                }
+            }
+        }
+        self.expect("}", |k| matches!(k, TokenKind::RBrace));
+        let _ = kw;
+        self.alloc(
+            t.span.merge(self.prev_span()),
+            TreeKind::ExistentialTypeTree {
+                tpt: Box::new(t),
+                clauses,
+            },
+        )
+    }
+
+    fn skip_to_existential_sep(&mut self) {
+        if !matches!(
+            self.kind(),
+            TokenKind::RBrace | TokenKind::Eof | TokenKind::Semi | TokenKind::Newline
+        ) {
+            self.bump();
+        }
+        loop {
+            match self.kind() {
+                TokenKind::RBrace | TokenKind::Eof | TokenKind::Semi | TokenKind::Newline => {
+                    return;
+                }
+                TokenKind::TypeKw | TokenKind::Val | TokenKind::Var | TokenKind::Def => return,
+                TokenKind::LBrace => self.skip_balanced_brace(),
+                _ => {
+                    self.bump();
+                }
+            }
+        }
     }
 
     fn parse_infix_type(&mut self) -> Tree {
