@@ -3156,10 +3156,25 @@ impl Typer {
                     .iter()
                     .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT));
             if all_impl && !matches!(pt, Type::Method { .. } | Type::Function { .. }) {
-                let rest_tys: Vec<Type> = rest_ids
-                    .iter()
-                    .map(|id| self.st.get(*id).ty.clone())
-                    .collect();
+                // Prefer the (possibly TypeApply-substituted) method type so
+                // `mk[Int](2)` searches `ClassTag[Int]`, not raw `ClassTag[T]`.
+                let rest_tys: Vec<Type> = match fun_ty {
+                    Type::Method { paramss, .. } if paramss.len() > 1 => {
+                        paramss[1..].iter().flatten().cloned().collect()
+                    }
+                    _ => rest_ids
+                        .iter()
+                        .map(|id| self.st.get(*id).ty.clone())
+                        .collect(),
+                };
+                let rest_tys = if rest_tys.len() == rest_ids.len() {
+                    rest_tys
+                } else {
+                    rest_ids
+                        .iter()
+                        .map(|id| self.st.get(*id).ty.clone())
+                        .collect()
+                };
                 let rest_tys = self.instantiate_from_call(sym, &first, args, rest_tys);
                 self.fill_implicit_params(span, args, &rest_tys, &rest_ids);
                 return None;
