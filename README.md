@@ -230,7 +230,7 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 対象外（診断する / パースしない）:
 
 - コンパイラプラグイン
-- Scala 3 構文 / TASTy / XML リテラル
+- Scala 3 構文 / TASTy。XML リテラルの属性・名前空間は診断する（elem / text / splice のサブセットは実装済み）
 - `forSome { val x: T }`、入れ子の packed existentials。よくある unbounded `List[_]` / `T forSome { type X }` と境界付き `List[_ <: AnyRef]` / `List[X] forSome { type X <: AnyRef }` は実装済み
 - クラス / 高階型パラメータの view bounds（メソッドの `T <% Ordered[T]` は実装済み）
 
