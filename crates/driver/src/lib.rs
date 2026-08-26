@@ -258,28 +258,39 @@ fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
     }
     load_classpath(paths)
         .into_iter()
-        .map(|c| ClasspathClass {
-            jvm_name: c.internal_name,
-            is_module: c.is_module,
-            methods: c
-                .methods
-                .into_iter()
-                .map(|m| ClasspathMethod {
-                    name: m.name,
-                    desc: m.desc,
-                })
-                .collect(),
-            pickle: c.pickle.map(|p| {
-                p.methods
+        .map(|c| {
+            let pickle_tparams = c
+                .pickle
+                .as_ref()
+                .map(|p| p.tparams.clone())
+                .unwrap_or_default();
+            ClasspathClass {
+                jvm_name: c.internal_name,
+                is_module: c.is_module,
+                methods: c
+                    .methods
                     .into_iter()
-                    .map(|m| ClasspathPickleMethod {
+                    .map(|m| ClasspathMethod {
                         name: m.name,
-                        param_names: m.param_names,
-                        param_types: m.param_types,
-                        ret: m.ret,
+                        desc: m.desc,
                     })
-                    .collect()
-            }),
+                    .collect(),
+                pickle: c.pickle.map(|p| {
+                    p.methods
+                        .into_iter()
+                        .map(|m| ClasspathPickleMethod {
+                            name: m.name,
+                            param_names: m.param_names,
+                            param_types: m.param_types,
+                            ret: m.ret,
+                            tparams: m.tparams,
+                            is_val: m.is_val,
+                            is_ctor: m.is_ctor,
+                        })
+                        .collect()
+                }),
+                pickle_tparams,
+            }
         })
         .collect()
 }

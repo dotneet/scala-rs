@@ -778,4 +778,79 @@ object Main {
         let found = st.symbols.iter().any(|s| s.name == "greet$default$2");
         assert!(found, "expected greet$default$2 in the symbol table");
     }
+
+    #[test]
+    fn implicit_inherited_from_parent() {
+        ok(r#"
+class Base {
+  implicit val n: Int = 10
+}
+object Main extends Base {
+  def add(x: Int)(implicit y: Int): Int = x + y
+  def main(args: Array[String]): Unit = {
+    val z: Int = add(5)
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn class_ctor_infers_tparams() {
+        ok(r#"
+class Box[A](val value: A)
+object Main {
+  def main(args: Array[String]): Unit = {
+    val b = new Box(1)
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn implicit_nested_companion_and_type_ctor() {
+        ok(r#"
+trait Tag[A]
+class Box[A](val value: A)
+object Box {
+  implicit val boxTag: Tag[Box[Int]] = new Tag[Box[Int]] {}
+}
+object Outer {
+  class Inner
+  object Inner {
+    implicit val innerTag: Tag[Inner] = new Tag[Inner] {}
+  }
+}
+object Main {
+  def use[A](x: A)(implicit t: Tag[A]): Int = 1
+  def main(args: Array[String]): Unit = {
+    val a: Int = use(new Outer.Inner())
+    val b: Int = use(new Box(1))
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn implicit_inherited_still_ambiguous() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait A { implicit val x: Int = 1 }
+trait B { implicit val y: Int = 2 }
+object Main extends A with B {
+  def add(n: Int)(implicit z: Int): Int = n + z
+  def main(args: Array[String]): Unit = {
+    val n: Int = add(0)
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("ambiguous implicit")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
 }

@@ -1,4 +1,4 @@
-//! Walk a typed compilation unit and emit JVM classfiles (major 50).
+//! Walk a typed compilation unit and emit JVM classfiles (major 52).
 
 use crate::classfile::{
     encode_method_name, ClassEmit, EmittedClass, Field, Method, Pool, ACC_ABSTRACT, ACC_BRIDGE,
@@ -188,6 +188,7 @@ impl ClassBuilder {
         gen: impl FnOnce(&mut Assembler),
     ) {
         let mut asm = Assembler::with_pool(std::mem::take(&mut self.pool), max_locals.max(1));
+        asm.init_method(access, name, desc, &self.this_name);
         gen(&mut asm);
         let (code, pool) = asm.finish();
         self.pool = pool;
@@ -2015,6 +2016,9 @@ impl<'a> Gen<'a> {
 
         let mut b = ClassBuilder::new(this_name.clone(), self.source_name);
         b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
+        let (super_name, interfaces) = split_parents(self.st, &impl_.parents);
+        b.super_name = super_name;
+        b.interfaces = interfaces;
         b.fields.push(Field {
             access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
             name: "MODULE$".into(),
@@ -2144,10 +2148,11 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let super_name = b.super_name.clone();
         b.add_code(ACC_PRIVATE, "<init>", "()V", 1, |asm| {
             let mut frame = Frame::instance();
             asm.aload(0);
-            asm.invokespecial("java/lang/Object", "<init>", "()V");
+            asm.invokespecial(&super_name, "<init>", "()V");
             asm.aload(0);
             asm.putstatic(&class_name, "MODULE$", &format!("L{class_name};"));
             let ctx = emit_ctx(
@@ -2579,13 +2584,21 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
     }
     match sym.kind {
         SymKind::Term => {
-            load_this(asm, ctx);
+            let owner = sym.owner;
+            if is_module_class(ctx.st, owner)
+                && module_class_id(ctx.st, owner) != module_class_id(ctx.st, ctx.class_sym)
+            {
+                let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
+                asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+            } else {
+                load_this(asm, ctx);
+            }
             if is_trait_owned_term(ctx.st, id) {
-                let owner = class_internal(ctx.st, sym.owner);
+                let owner = class_internal(ctx.st, owner);
                 let desc = format!("(){}", jvm_desc(ctx.st, &sym.ty));
                 asm.invokeinterface(&owner, &sym.name, &desc);
             } else {
-                let owner = class_internal(ctx.st, sym.owner);
+                let owner = class_internal(ctx.st, owner);
                 let desc = jvm_desc(ctx.st, &sym.ty);
                 asm.getfield(&owner, &sym.name, &desc);
             }
@@ -4994,9 +5007,6 @@ fn gen_match(
         asm.mark(fail);
     }
     throw_runtime(asm, "match error");
-    if !is_unit_like(result_ty) {
-        push_default(asm, result_ty);
-    }
     asm.mark(end);
 }
 

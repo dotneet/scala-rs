@@ -1,9 +1,9 @@
 //! nsc PickleFormat subset (major 5, minor 2) plus SID-10 ByteCodecs.
 //!
 //! This is enough for scala-rs to round-trip compiled classes/objects through
-//! `ScalaSignature` and for `javap -v` to show the annotation. It is **not**
-//! a full nsc pickle (no POLY types, existentials, annotation args, or the
-//! complete Flags long).
+//! `ScalaSignature` and for a second compilation unit to see vals, defs with
+//! parameters, and type parameters. It is **not** a full nsc pickle (no
+//! existentials, annotation args, or the complete Flags long).
 
 use scala_rs_parser::{Flags, SymbolId, Type};
 use scala_rs_typer::{SymKind, SymbolTable};
@@ -14,6 +14,7 @@ pub const MINOR: u32 = 2;
 pub const TERMNAME: u8 = 1;
 pub const TYPENAME: u8 = 2;
 pub const NONESYM: u8 = 3;
+pub const TYPESYM: u8 = 4;
 pub const CLASSSYM: u8 = 6;
 pub const MODULESYM: u8 = 7;
 pub const VALSYM: u8 = 8;
@@ -24,14 +25,18 @@ pub const THISTPE: u8 = 13;
 pub const TYPEREFTPE: u8 = 16;
 pub const CLASSINFOTPE: u8 = 19;
 pub const METHODTPE: u8 = 20;
+pub const POLYTPE: u8 = 21;
 
-/// Pickled method recovered by the subset unpickler.
+/// Pickled method, constructor, or val recovered by the subset unpickler.
 #[derive(Clone, Debug)]
 pub struct PickledMethod {
     pub name: String,
     pub param_names: Vec<String>,
     pub param_types: Vec<String>,
     pub ret: String,
+    pub tparams: Vec<String>,
+    pub is_val: bool,
+    pub is_ctor: bool,
 }
 
 /// Pickled class or module class.
@@ -39,6 +44,7 @@ pub struct PickledMethod {
 pub struct PickledClass {
     pub name: String,
     pub is_module: bool,
+    pub tparams: Vec<String>,
     pub methods: Vec<PickledMethod>,
 }
 
@@ -374,8 +380,16 @@ impl<'a> Pickler<'a> {
             Type::Double => self.type_ref_named("Double"),
             Type::Char => self.type_ref_named("Char"),
             Type::String => self.type_ref_named("String"),
-            Type::Any | Type::TypeParam(_) | Type::Wildcard | Type::AnyRef | Type::AnyVal => {
+            Type::Any | Type::Wildcard | Type::AnyRef | Type::AnyVal => {
                 self.type_ref_named("Object")
+            }
+            Type::TypeParam(id) => {
+                let pref = self.notpe;
+                let sym = self.pickle_typesym(*id);
+                let mut body = Vec::new();
+                write_nat_to(&mut body, pref);
+                write_nat_to(&mut body, sym);
+                self.add(TYPEREFTPE, body)
             }
             Type::Class { sym, .. } => {
                 let n = self.st.get(*sym).name.clone();
@@ -444,15 +458,42 @@ impl<'a> Pickler<'a> {
         let info = self.add(CLASSINFOTPE, info_body);
 
         let members: Vec<SymbolId> = s.members.clone();
+        let tparams: Vec<SymbolId> = s.tparams.clone();
+        let ctor_fields: Vec<SymbolId> = s.ctor_fields.clone();
+        let mut tparam_refs = Vec::new();
+        for tp in tparams {
+            tparam_refs.push(self.pickle_typesym(tp));
+        }
         for m in members {
-            let ms = self.st.get(m);
-            if ms.kind != SymKind::Method {
-                continue;
+            let kind = self.st.get(m).kind;
+            let name = self.st.get(m).name.clone();
+            match kind {
+                SymKind::TypeParam => {
+                    let _ = self.pickle_typesym(m);
+                }
+                SymKind::Term => {
+                    if ctor_fields.contains(&m) || !self.st.get(m).flags.contains(Flags::PARAM) {
+                        self.pickle_val(m, idx);
+                    }
+                }
+                SymKind::Method => {
+                    if name == "<clinit>" {
+                        continue;
+                    }
+                    self.pickle_method(m, idx, this_tpe);
+                }
+                _ => {}
             }
-            if ms.name == "<init>" || ms.name == "<clinit>" {
-                continue;
+        }
+
+        let mut info = info;
+        if !tparam_refs.is_empty() {
+            let mut body = Vec::new();
+            for r in tparam_refs {
+                write_nat_to(&mut body, r);
             }
-            self.pickle_method(m, idx, this_tpe);
+            write_nat_to(&mut body, info);
+            info = self.add(POLYTPE, body);
         }
 
         let body = self.symbol_info(name_ref, self.none, 0, info);
@@ -513,10 +554,51 @@ impl<'a> Pickler<'a> {
         for p in param_refs {
             write_nat_to(&mut mt, p);
         }
-        let info = self.add(METHODTPE, mt);
+        let mut info = self.add(METHODTPE, mt);
+        let tparams: Vec<SymbolId> = s.tparams.clone();
+        if !tparams.is_empty() {
+            let mut tpref = Vec::new();
+            for tp in tparams {
+                write_nat_to(&mut tpref, self.pickle_typesym(tp));
+            }
+            write_nat_to(&mut tpref, info);
+            info = self.add(POLYTPE, tpref);
+        }
         let body = self.symbol_info(name_ref, owner_ref, 0, info);
         self.entries[meth_idx as usize] = (VALSYM, body);
         meth_idx
+    }
+
+    fn pickle_typesym(&mut self, id: SymbolId) -> u32 {
+        if let Some(i) = self.sym_index.get(&id.0) {
+            return *i;
+        }
+        let s = self.st.get(id);
+        let name_ref = self.type_name(&s.name);
+        let idx = self.add(TYPESYM, vec![]);
+        self.sym_index.insert(id.0, idx);
+        let owner_ref = self
+            .sym_index
+            .get(&s.owner.0)
+            .copied()
+            .unwrap_or(self.none);
+        let body = self.symbol_info(name_ref, owner_ref, 0, self.notpe);
+        self.entries[idx as usize] = (TYPESYM, body);
+        idx
+    }
+
+    fn pickle_val(&mut self, val_id: SymbolId, owner_ref: u32) -> u32 {
+        if let Some(i) = self.sym_index.get(&val_id.0) {
+            return *i;
+        }
+        let s = self.st.get(val_id);
+        let name_ref = self.term_name(&s.name);
+        let idx = self.add(VALSYM, vec![]);
+        self.sym_index.insert(val_id.0, idx);
+        let info = self.pickle_type(&s.ty);
+        let body = self.symbol_info(name_ref, owner_ref, 0, info);
+        self.entries[idx as usize] = (VALSYM, body);
+        idx
     }
 
     fn finish(self) -> Vec<u8> {
@@ -622,6 +704,11 @@ enum Entry {
     TermName(String),
     TypeName(String),
     NoneSym,
+    TypeSym {
+        name: u32,
+        owner: u32,
+        info: u32,
+    },
     ClassSym {
         name: u32,
         owner: u32,
@@ -648,6 +735,10 @@ enum Entry {
     MethodTpe {
         ret: u32,
         params: Vec<u32>,
+    },
+    PolyTpe {
+        tparams: Vec<u32>,
+        rest: u32,
     },
     Other,
 }
@@ -698,6 +789,11 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             NONESYM => {
                 r.pos = end;
                 Entry::NoneSym
+            }
+            TYPESYM => {
+                let (name, owner, info) = read_symbol_info(&mut r, end)?;
+                r.pos = end;
+                Entry::TypeSym { name, owner, info }
             }
             CLASSSYM => {
                 let (name, owner, info) = read_symbol_info(&mut r, end)?;
@@ -752,6 +848,22 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 r.pos = end;
                 Entry::MethodTpe { ret, params }
             }
+            POLYTPE => {
+                let mut refs = Vec::new();
+                while r.pos < end {
+                    if let Some(p) = r.read_nat() {
+                        refs.push(p);
+                    } else {
+                        break;
+                    }
+                }
+                r.pos = end;
+                let rest = refs.pop().unwrap_or(0);
+                Entry::PolyTpe {
+                    tparams: refs,
+                    rest,
+                }
+            }
             _ => {
                 r.pos = end;
                 Entry::Other
@@ -764,6 +876,7 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
         match entries.get(i as usize) {
             Some(Entry::TermName(s) | Entry::TypeName(s)) => s.clone(),
             Some(Entry::ExtRef(n)) => name_of(entries, *n),
+            Some(Entry::TypeSym { name, .. }) => name_of(entries, *name),
             _ => String::new(),
         }
     }
@@ -809,6 +922,22 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
         return None;
     }
 
+    fn peel_info(entries: &[Entry], info: u32) -> (Vec<String>, u32) {
+        match entries.get(info as usize) {
+            Some(Entry::PolyTpe { tparams, rest }) => {
+                let names = tparams.iter().map(|t| name_of(entries, *t)).collect();
+                (names, *rest)
+            }
+            _ => (Vec::new(), info),
+        }
+    }
+
+    let class_info = match &entries[ci] {
+        Entry::ModuleSym { info, .. } | Entry::ClassSym { info, .. } => *info,
+        _ => 0,
+    };
+    let (class_tparams, _) = peel_info(&entries, class_info);
+
     let mut methods = Vec::new();
     for e in &entries {
         let Entry::ValSym { name, owner, info } = e else {
@@ -821,34 +950,48 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
         if mname.is_empty() {
             continue;
         }
-        let Some(Entry::MethodTpe { ret, params }) = entries.get(*info as usize) else {
-            continue;
-        };
-        let mut param_names = Vec::new();
-        let mut param_types = Vec::new();
-        for p in params {
-            if let Some(Entry::ValSym {
-                name: pn, info: pt, ..
-            }) = entries.get(*p as usize)
-            {
-                param_names.push(name_of(&entries, *pn));
-                param_types.push(type_name_of(&entries, *pt));
-            } else {
-                param_types.push(type_name_of(&entries, *p));
-                param_names.push(format!("x${}", param_names.len()));
+        let (tparams, rest) = peel_info(&entries, *info);
+        if let Some(Entry::MethodTpe { ret, params }) = entries.get(rest as usize) {
+            let mut param_names = Vec::new();
+            let mut param_types = Vec::new();
+            for p in params {
+                if let Some(Entry::ValSym {
+                    name: pn, info: pt, ..
+                }) = entries.get(*p as usize)
+                {
+                    param_names.push(name_of(&entries, *pn));
+                    param_types.push(type_name_of(&entries, *pt));
+                } else {
+                    param_types.push(type_name_of(&entries, *p));
+                    param_names.push(format!("x${}", param_names.len()));
+                }
             }
+                methods.push(PickledMethod {
+                    name: mname.clone(),
+                    param_names,
+                    param_types,
+                    ret: type_name_of(&entries, *ret),
+                    tparams,
+                    is_val: false,
+                    is_ctor: mname == "<init>",
+                });
+        } else {
+            methods.push(PickledMethod {
+                name: mname,
+                param_names: Vec::new(),
+                param_types: Vec::new(),
+                ret: type_name_of(&entries, rest),
+                tparams,
+                is_val: true,
+                is_ctor: false,
+            });
         }
-        methods.push(PickledMethod {
-            name: mname,
-            param_names,
-            param_types,
-            ret: type_name_of(&entries, *ret),
-        });
     }
 
     Some(PickledClass {
         name: class_name,
         is_module,
+        tparams: class_tparams,
         methods,
     })
 }
@@ -915,5 +1058,77 @@ object Lib {
             names.iter().any(|n| *n == "greet$default$2"),
             "expected greet$default$2 in pickle, got {names:?}"
         );
+    }
+
+    #[test]
+    fn pickle_vals_params_and_tparams() {
+        let src = r#"
+object Lib {
+  val magic: Int = 7
+  def greet(name: String, punct: String = "!"): String = name + punct
+  def id[T](x: T): T = x
+}
+class Box[A](val value: A) {
+  def get: A = value
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let lib = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Lib" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("Lib module");
+        let cls = st.module_class_of(lib);
+        let p = unpickle(&pickle_class(&st, cls)).expect("unpickle Lib");
+        assert!(p.is_module);
+        let magic = p
+            .methods
+            .iter()
+            .find(|m| m.name == "magic")
+            .expect("val magic");
+        assert!(magic.is_val, "magic should be a val, got {magic:?}");
+        assert_eq!(magic.ret, "Int");
+        let greet = p
+            .methods
+            .iter()
+            .find(|m| m.name == "greet")
+            .expect("greet");
+        assert_eq!(greet.param_names.len(), 2);
+        assert_eq!(greet.param_types, vec!["String".to_string(), "String".to_string()]);
+        let id = p.methods.iter().find(|m| m.name == "id").expect("id");
+        assert_eq!(id.tparams, vec!["T".to_string()]);
+        assert_eq!(id.param_types, vec!["T".to_string()]);
+        assert_eq!(id.ret, "T");
+
+        let box_id = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Box" && s.kind == scala_rs_typer::SymKind::Class)
+            .map(|s| s.id)
+            .expect("Box class");
+        let b = unpickle(&pickle_class(&st, box_id)).expect("unpickle Box");
+        assert!(!b.is_module);
+        assert_eq!(b.tparams, vec!["A".to_string()]);
+        let value = b
+            .methods
+            .iter()
+            .find(|m| m.name == "value")
+            .expect("val value");
+        assert!(value.is_val);
+        assert_eq!(value.ret, "A");
+        let get = b.methods.iter().find(|m| m.name == "get").expect("get");
+        assert_eq!(get.ret, "A");
+        let init = b
+            .methods
+            .iter()
+            .find(|m| m.is_ctor)
+            .expect("<init>");
+        assert_eq!(init.param_types, vec!["A".to_string()]);
     }
 }

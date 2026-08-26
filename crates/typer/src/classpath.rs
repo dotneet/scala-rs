@@ -67,9 +67,18 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
 
     for (i, owner) in installed {
         let c = &classes[i];
+        install_tparams(st, owner, &c.pickle_tparams);
         if let Some(p) = &c.pickle {
             for m in p {
-                if has_method(st, owner, &m.name) {
+                if has_member(st, owner, &m.name) {
+                    continue;
+                }
+                if m.is_val {
+                    add_term(st, owner, &m.name, resolve_type_in(st, owner, &m.ret, &[]));
+                    continue;
+                }
+                if m.is_ctor {
+                    install_ctor(st, owner, m);
                     continue;
                 }
                 add_method(
@@ -77,30 +86,156 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
                     owner,
                     &m.name,
                     m.param_names.clone(),
-                    m.param_types
-                        .iter()
-                        .map(|n| resolve_type_name(st, n))
-                        .collect(),
-                    resolve_type_name(st, &m.ret),
+                    m.param_types.clone(),
+                    m.ret.clone(),
+                    m.tparams.clone(),
                 );
             }
         }
         for m in &c.methods {
-            if has_method(st, owner, &m.name) {
+            if has_member(st, owner, &m.name) {
+                continue;
+            }
+            if m.name == "<init>" && !st.get(owner).ctor_fields.is_empty() {
                 continue;
             }
             let (params, ret) = parse_method_desc(st, &m.desc);
             let names: Vec<String> = (0..params.len()).map(|i| format!("x${i}")).collect();
-            add_method(st, owner, &m.name, names, params, ret);
+            add_method_erased(st, owner, &m.name, names, params, ret);
         }
         mark_defaults_from_getters(st, owner);
     }
 }
 
-fn has_method(st: &SymbolTable, owner: SymbolId, name: &str) -> bool {
-    st.lookup_member(owner, name)
+fn has_member(st: &SymbolTable, owner: SymbolId, name: &str) -> bool {
+    st.lookup_member(owner, name).iter().any(|&id| {
+        matches!(st.get(id).kind, SymKind::Method | SymKind::Term)
+    })
+}
+
+fn install_tparams(st: &mut SymbolTable, owner: SymbolId, names: &[String]) {
+    if names.is_empty() || !st.get(owner).tparams.is_empty() {
+        return;
+    }
+    let mut ids = Vec::new();
+    for n in names {
+        let id = st.alloc(n, owner, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(id).ty = Type::TypeParam(id);
+        ids.push(id);
+    }
+    st.get_mut(owner).tparams = ids;
+}
+
+fn add_term(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) -> SymbolId {
+    let id = st.alloc(name, owner, SymKind::Term, Flags::EMPTY, "");
+    st.get_mut(id).ty = ty;
+    id
+}
+
+fn install_ctor(st: &mut SymbolTable, owner: SymbolId, m: &crate::check::ClasspathPickleMethod) {
+    let mut fields = Vec::new();
+    for (i, (n, tn)) in m.param_names.iter().zip(m.param_types.iter()).enumerate() {
+        let pname = if n.is_empty() {
+            format!("x${i}")
+        } else {
+            n.clone()
+        };
+        let ty = resolve_type_in(st, owner, tn, &[]);
+        let existing = st
+            .lookup_member(owner, &pname)
+            .into_iter()
+            .find(|&id| st.get(id).kind == SymKind::Term);
+        let fid = if let Some(id) = existing {
+            st.get_mut(id).ty = ty;
+            id
+        } else {
+            add_term(st, owner, &pname, ty)
+        };
+        fields.push(fid);
+    }
+    st.get_mut(owner).ctor_fields = fields.clone();
+    add_method(
+        st,
+        owner,
+        "<init>",
+        m.param_names.clone(),
+        m.param_types.clone(),
+        "Unit".into(),
+        Vec::new(),
+    );
+}
+
+fn resolve_type_in(st: &SymbolTable, owner: SymbolId, name: &str, method_tps: &[SymbolId]) -> Type {
+    for id in method_tps.iter().chain(st.get(owner).tparams.iter()) {
+        if st.get(*id).name == name {
+            return Type::TypeParam(*id);
+        }
+    }
+    resolve_type_name(st, name)
+}
+
+fn add_method(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    name: &str,
+    param_names: Vec<String>,
+    param_type_names: Vec<String>,
+    ret_name: String,
+    tparams: Vec<String>,
+) -> SymbolId {
+    let flags = if name.contains("$default$") {
+        Flags::SYNTHETIC
+    } else if name == "<init>" {
+        Flags::CONSTRUCTOR
+    } else {
+        Flags::EMPTY
+    };
+    let id = st.alloc(name, owner, SymKind::Method, flags, "");
+    let mut tp_ids = Vec::new();
+    for n in &tparams {
+        let t = st.alloc(n, id, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(t).ty = Type::TypeParam(t);
+        tp_ids.push(t);
+    }
+    st.get_mut(id).tparams = tp_ids.clone();
+    let params: Vec<Type> = param_type_names
         .iter()
-        .any(|&id| st.get(id).kind == SymKind::Method)
+        .map(|n| resolve_type_in(st, owner, n, &tp_ids))
+        .collect();
+    let ret = resolve_type_in(st, owner, &ret_name, &tp_ids);
+    let mut pids = Vec::new();
+    for (i, (n, ty)) in param_names.iter().zip(params.iter()).enumerate() {
+        let pname = if n.is_empty() {
+            format!("x${i}")
+        } else {
+            n.clone()
+        };
+        let pid = st.alloc(&pname, id, SymKind::Term, Flags::PARAM, "");
+        st.get_mut(pid).ty = ty.clone();
+        pids.push(pid);
+    }
+    st.get_mut(id).params = pids.clone();
+    st.get_mut(id).paramss = if pids.is_empty() { vec![] } else { vec![pids] };
+    st.get_mut(id).ty = Type::Method {
+        paramss: if params.is_empty() {
+            vec![]
+        } else {
+            vec![params]
+        },
+        ret: Box::new(ret),
+    };
+    id
+}
+
+fn add_method_erased(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    name: &str,
+    param_names: Vec<String>,
+    params: Vec<Type>,
+    ret: Type,
+) -> SymbolId {
+    add_method_types(st, owner, name, param_names, params, ret)
 }
 
 fn is_forwarder_of_module(classes: &[ClasspathClass], c: &ClasspathClass) -> bool {
@@ -118,7 +253,7 @@ fn simple_name(jvm: &str) -> String {
     last.trim_end_matches('$').to_string()
 }
 
-fn add_method(
+fn add_method_types(
     st: &mut SymbolTable,
     owner: SymbolId,
     name: &str,
@@ -144,9 +279,13 @@ fn add_method(
         pids.push(pid);
     }
     st.get_mut(id).params = pids.clone();
-    st.get_mut(id).paramss = vec![pids];
+    st.get_mut(id).paramss = if pids.is_empty() { vec![] } else { vec![pids] };
     st.get_mut(id).ty = Type::Method {
-        paramss: vec![params],
+        paramss: if params.is_empty() {
+            vec![]
+        } else {
+            vec![params]
+        },
         ret: Box::new(ret),
     };
     id

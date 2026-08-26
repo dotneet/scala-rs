@@ -469,6 +469,29 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
 }
 
 fn method_param_types(st: &SymbolTable, fun: &Tree) -> Vec<Type> {
+    if matches!(&fun.kind, TreeKind::New { .. }) {
+        let cid = if fun.sym.is_none() {
+            st.class_sym_of(&fun.ty)
+        } else {
+            Some(fun.sym)
+        }
+        .or_else(|| st.class_sym_of(&fun.ty));
+        if let Some(c) = cid {
+            for m in &st.get(c).members {
+                if st.get(*m).name == "<init>" {
+                    if let Type::Method { paramss, .. } = &st.get(*m).ty {
+                        return paramss.iter().flatten().cloned().collect();
+                    }
+                }
+            }
+            return st
+                .get(c)
+                .ctor_fields
+                .iter()
+                .map(|f| erase_ty(&st.get(*f).ty, st))
+                .collect();
+        }
+    }
     if !fun.sym.is_none() {
         match &st.get(fun.sym).ty {
             Type::Method { paramss, .. } => {
