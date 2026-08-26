@@ -133,6 +133,18 @@ pub fn erase_type(ty: &Type) -> Type {
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(erase_type).collect()),
         Type::Overload(alts) => Type::Overload(alts.iter().map(erase_type).collect()),
         Type::Wildcard => Type::Any,
+        Type::Refined { parents, decls } => {
+            if crate::symbol::SymbolTable::refined_has_term_members(decls) {
+                Type::Refined {
+                    parents: parents.iter().map(erase_type).collect(),
+                    decls: decls.clone(),
+                }
+            } else if let Some(p) = parents.first() {
+                erase_type(p)
+            } else {
+                Type::AnyRef
+            }
+        }
         other => other.clone(),
     }
 }
@@ -148,6 +160,18 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         }
         Type::TypeParam(_) | Type::TypeMember(_) => Type::Any,
         Type::Wildcard => Type::Any,
+        Type::Refined { parents, decls } => {
+            if crate::symbol::SymbolTable::refined_has_term_members(decls) {
+                Type::Refined {
+                    parents: parents.iter().map(|p| erase_ty(p, st)).collect(),
+                    decls: decls.clone(),
+                }
+            } else if let Some(p) = parents.first() {
+                erase_ty(p, st)
+            } else {
+                Type::AnyRef
+            }
+        }
         Type::Class { sym, .. } => Type::Class {
             sym: *sym,
             args: vec![],
@@ -210,6 +234,7 @@ fn is_ref_erased(ty: &Type) -> bool {
             | Type::TypeMember(_)
             | Type::Wildcard
             | Type::Named { .. }
+            | Type::Refined { .. }
     )
 }
 

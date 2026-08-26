@@ -285,6 +285,7 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::ByName(_) => "Lscala/Function0;".into(),
         Type::Repeated(_) => "Lscala/collection/immutable/Seq;".into(),
         Type::TypeParam(_) | Type::TypeMember(_) | Type::Wildcard => "Ljava/lang/Object;".into(),
+        Type::Refined { .. } => "Ljava/lang/Object;".into(),
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
             format!("[{}", jvm_desc(st, &args[0]))
         }
@@ -2673,6 +2674,84 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
     }
 }
 
+fn gen_structural_call(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    recv: &Tree,
+    name: &str,
+    args: &[Tree],
+    result: &Type,
+) {
+    // Scala 2.13 reflective call: getClass.getMethod(name, Class[]).invoke(recv, Object[])
+    gen_expr(asm, frame, ctx, recv);
+    asm.dup();
+    asm.invokevirtual("java/lang/Object", "getClass", "()Ljava/lang/Class;");
+    asm.ldc_string(name);
+    asm.iconst(args.len() as i32);
+    asm.anewarray("java/lang/Class");
+    for (i, a) in args.iter().enumerate() {
+        asm.dup();
+        asm.iconst(i as i32);
+        gen_java_class_of(asm, ctx, &a.ty);
+        asm.aastore();
+    }
+    asm.invokevirtual(
+        "java/lang/Class",
+        "getMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+    );
+    asm.swap();
+    asm.iconst(args.len() as i32);
+    asm.anewarray("java/lang/Object");
+    for (i, a) in args.iter().enumerate() {
+        asm.dup();
+        asm.iconst(i as i32);
+        gen_expr(asm, frame, ctx, a);
+        emit_box(asm, &a.ty);
+        asm.aastore();
+    }
+    asm.invokevirtual(
+        "java/lang/reflect/Method",
+        "invoke",
+        "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+    );
+    match result {
+        Type::Int | Type::Boolean | Type::Long | Type::Double | Type::Char | Type::Float => {
+            emit_unbox(asm, result);
+        }
+        Type::Unit | Type::NoType => {
+            asm.pop();
+        }
+        Type::String => {
+            asm.checkcast("java/lang/String");
+        }
+        _ => {
+            if let Some(cn) = checkcast_internal(ctx.st, result) {
+                asm.checkcast(&cn);
+            }
+        }
+    }
+}
+
+fn gen_java_class_of(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
+    match ty {
+        Type::Int => asm.getstatic("java/lang/Integer", "TYPE", "Ljava/lang/Class;"),
+        Type::Boolean => asm.getstatic("java/lang/Boolean", "TYPE", "Ljava/lang/Class;"),
+        Type::Long => asm.getstatic("java/lang/Long", "TYPE", "Ljava/lang/Class;"),
+        Type::Double => asm.getstatic("java/lang/Double", "TYPE", "Ljava/lang/Class;"),
+        Type::Float => asm.getstatic("java/lang/Float", "TYPE", "Ljava/lang/Class;"),
+        Type::Char => asm.getstatic("java/lang/Character", "TYPE", "Ljava/lang/Class;"),
+        Type::Unit | Type::NoType => asm.getstatic("java/lang/Void", "TYPE", "Ljava/lang/Class;"),
+        Type::String => asm.ldc_class("java/lang/String"),
+        Type::Class { sym, .. } | Type::ModuleRef(sym) => {
+            asm.ldc_class(&class_internal(ctx.st, *sym));
+        }
+        Type::Named { name, .. } => asm.ldc_class(&name.replace('.', "/")),
+        _ => asm.ldc_class("java/lang/Object"),
+    }
+}
+
 fn gen_select(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -2684,6 +2763,10 @@ fn gen_select(
     if name == "length" && matches!(qual.ty, Type::Array(_)) {
         gen_expr(asm, frame, ctx, qual);
         asm.arraylength();
+        return;
+    }
+    if matches!(qual.ty, Type::Refined { .. }) && tree.sym.is_none() {
+        gen_structural_call(asm, frame, ctx, qual, name, &[], &tree.ty);
         return;
     }
     if !tree.sym.is_none() {
@@ -2887,6 +2970,13 @@ fn gen_apply(
     let fun0 = peel_fun(fun);
     let (fun, owned_args) = flatten_apply_owned(fun0, args);
     let args: &[Tree] = &owned_args;
+
+    if let TreeKind::Select { qual, name } = &fun.kind {
+        if matches!(qual.ty, Type::Refined { .. }) && fun.sym.is_none() {
+            gen_structural_call(asm, frame, ctx, qual, name, args, &tree.ty);
+            return;
+        }
+    }
 
     if matches!(&fun.kind, TreeKind::New { .. }) {
         let tpt = match &fun.kind {
