@@ -30,6 +30,7 @@ pub struct Typer {
     /// Counter for synthetic names.
     gensym: u32,
     fatal_warnings: bool,
+    library_abi: bool,
 }
 
 pub fn typecheck(tree: &mut Tree, file_index: usize) -> (SymbolTable, Vec<Diagnostic>) {
@@ -59,6 +60,7 @@ impl Typer {
             file_index,
             gensym: 0,
             fatal_warnings: opts.fatal_warnings,
+            library_abi: opts.library_abi,
         }
     }
 
@@ -1476,6 +1478,34 @@ impl Typer {
         }
     }
 
+    /// When a member exists on the receiver (e.g. `Int.+`) but the argument
+    /// types do not match, try an implicit conversion that *does* have the
+    /// method (`any2stringadd` for `1 + "x"`).
+    fn rewrite_apply_extension(&mut self, fun: &mut Tree) -> bool {
+        let TreeKind::Select { qual, name } = &mut fun.kind else {
+            return false;
+        };
+        let Some((conv, member, to)) = self.search_extension(&qual.ty, name) else {
+            return false;
+        };
+        let span = qual.span;
+        let old = std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty));
+        let conv_fun = self.ref_implicit(conv, span);
+        **qual = Tree {
+            id: old.id,
+            span,
+            kind: TreeKind::Apply {
+                fun: Box::new(conv_fun),
+                args: vec![old],
+            },
+            ty: to,
+            sym: conv,
+        };
+        fun.sym = member;
+        fun.ty = self.st.get(member).ty.clone();
+        true
+    }
+
     fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
         let (fun, args) = match &mut tree.kind {
             TreeKind::Apply { fun, args } => (fun, args),
@@ -1544,14 +1574,16 @@ impl Typer {
             }
         }
 
-        if let TreeKind::Select { name, qual } = &fun.kind {
-            if name == "+"
-                && (matches!(qual.ty, Type::String)
-                    || arg_tys.first().is_some_and(|t| matches!(t, Type::String)))
-            {
-                tree.ty = Type::String;
-                fun.sym = SymbolId::NONE;
-                return;
+        if !self.library_abi {
+            if let TreeKind::Select { name, qual } = &fun.kind {
+                if name == "+"
+                    && (matches!(qual.ty, Type::String)
+                        || arg_tys.first().is_some_and(|t| matches!(t, Type::String)))
+                {
+                    tree.ty = Type::String;
+                    fun.sym = SymbolId::NONE;
+                    return;
+                }
             }
         }
 
@@ -1662,10 +1694,56 @@ impl Typer {
                             ret = r;
                         }
                     }
+                } else if method_name == "updated" {
+                    if let Some(cls) = recv_ty.as_ref().and_then(|t| self.st.class_sym_of(t)) {
+                        let n = self.st.get(cls).name.as_str();
+                        if n == "Map" && args.len() >= 2 {
+                            ret = Type::Class {
+                                sym: cls,
+                                args: vec![args[0].ty.clone(), args[1].ty.clone()],
+                            };
+                        } else if n == "Vector" && args.len() >= 2 {
+                            ret = Type::Class {
+                                sym: cls,
+                                args: vec![args[1].ty.clone()],
+                            };
+                        }
+                    }
+                } else if method_name == ":+" {
+                    if let Some(cls) = recv_ty.as_ref().and_then(|t| self.st.class_sym_of(t)) {
+                        if self.st.get(cls).name == "Vector" {
+                            if let Some(a0) = args.first() {
+                                ret = Type::Class {
+                                    sym: cls,
+                                    args: vec![a0.ty.clone()],
+                                };
+                            }
+                        }
+                    }
                 }
                 tree.ty = leftover.unwrap_or(ret);
             }
             None => {
+                if self.rewrite_apply_extension(fun) {
+                    let fun_ty = fun.ty.clone();
+                    if let Some((sym, param_tys, ret)) =
+                        self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt)
+                    {
+                        fun.sym = sym;
+                        tree.sym = sym;
+                        for (i, a) in args.iter_mut().enumerate() {
+                            let p = param_tys.get(i).cloned().unwrap_or(Type::NoType);
+                            if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type() {
+                                self.type_expr(a, &p);
+                            }
+                            if !p.is_no_type() {
+                                self.adapt(a, &p);
+                            }
+                        }
+                        tree.ty = ret;
+                        return;
+                    }
+                }
                 self.error(
                     tree.span,
                     format!(
@@ -1707,6 +1785,12 @@ impl Typer {
 
     fn elem_type(&self, ty: &Type) -> Option<Type> {
         match ty {
+            Type::Class { sym, args } if args.len() == 2 && self.st.get(*sym).name == "Map" => {
+                Some(Type::Class {
+                    sym: self.tuple2_sym(),
+                    args: args.clone(),
+                })
+            }
             Type::Class { args, .. } if !args.is_empty() => Some(args[0].clone()),
             Type::ModuleRef(id) => {
                 let name = self.st.get(*id).name.as_str();
@@ -1718,6 +1802,14 @@ impl Typer {
             }
             _ => None,
         }
+    }
+
+    fn tuple2_sym(&self) -> SymbolId {
+        self.st
+            .lookup("Tuple2")
+            .into_iter()
+            .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)
+            .unwrap_or(SymbolId::NONE)
     }
 
     fn infer_method_tparams(

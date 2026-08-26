@@ -2493,6 +2493,28 @@ fn gen_apply(
         push_default(asm, &tree.ty);
         return;
     }
+    if ctx.library_abi
+        && (fun.name() == Some("identity")
+            || fun.name() == Some("locally")
+            || fun.name() == Some("implicitly")
+            || matches!(
+                ic,
+                Intrinsic::Identity | Intrinsic::Locally | Intrinsic::Implicitly
+            ) && fun
+                .name()
+                .is_some_and(|n| n == "identity" || n == "locally" || n == "implicitly"))
+    {
+        gen_predef_poly(
+            asm,
+            frame,
+            ctx,
+            args,
+            &tree.ty,
+            fun.name().unwrap_or("identity"),
+        );
+        return;
+    }
+
     if matches!(ic, Intrinsic::Identity) {
         if let Some(a) = args.first() {
             gen_expr(asm, frame, ctx, a);
@@ -2572,7 +2594,7 @@ fn gen_apply(
         return;
     }
 
-    if is_arrow_assoc_arrow(ctx, fun) {
+    if !ctx.library_abi && is_arrow_assoc_arrow(ctx, fun) {
         gen_tuple2_arrow(asm, frame, ctx, fun, args);
         return;
     }
@@ -2684,7 +2706,7 @@ fn gen_apply(
             _ => {}
         }
 
-        if name == "+" && matches!(tree.ty, Type::String) {
+        if !ctx.library_abi && name == "+" && matches!(tree.ty, Type::String) {
             if let Some(r) = args.first() {
                 gen_string_concat(asm, frame, ctx, qual, r);
                 return;
@@ -2719,12 +2741,37 @@ fn gen_apply(
     }
 
     gen_receiver(asm, frame, ctx, fun);
-    for a in args {
+    let value_owner = if !fun.sym.is_none() && ctx.st.is_value_class(ctx.st.get(fun.sym).owner) {
+        Some(ctx.st.get(fun.sym).owner)
+    } else {
+        None
+    };
+    if let Some(owner) = value_owner {
+        if let TreeKind::Select { qual, .. } = &fun.kind {
+            box_value_class_receiver(asm, ctx, owner, qual);
+        }
+    }
+    let param_tys: Vec<Type> = if !fun.sym.is_none() {
+        match &ctx.st.get(fun.sym).ty {
+            Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+            Type::Function { params, .. } => params.clone(),
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    for (i, a) in args.iter().enumerate() {
         gen_expr(asm, frame, ctx, a);
+        if value_owner.is_some() {
+            let pty = param_tys.get(i).unwrap_or(&a.ty);
+            if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
+                emit_box(asm, &a.ty);
+            }
+        }
     }
     if fun_is_super(fun) {
         invoke_super(asm, ctx, fun.sym);
-    } else if !fun.sym.is_none() && ctx.st.is_value_class(ctx.st.get(fun.sym).owner) {
+    } else if value_owner.is_some() {
         invoke_value_extension(asm, ctx, fun.sym);
     } else {
         invoke_method(asm, ctx, fun.sym, Some(&tree.ty));
@@ -2761,8 +2808,92 @@ fn invoke_value_extension(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     let s = ctx.st.get(id);
     let owner_id = s.owner;
     let owner = class_internal(ctx.st, owner_id);
+    if owner == "scala/collection/StringOps" && s.name == "length" {
+        // 2.13 StringOps inlines `length` to `String#length`; the jar exposes
+        // `size$extension` which is the same call against the underlying String.
+        asm.invokestatic(
+            "scala/collection/StringOps",
+            "size$extension",
+            "(Ljava/lang/String;)I",
+        );
+        return;
+    }
     let desc = value_extension_desc(ctx.st, id);
+    if owner.contains('$') {
+        // Nested Predef AnyVal: `$extension` is an instance method on the
+        // companion `MODULE$`, not a static on the value class.
+        let ext_owner = format!("{owner}$");
+        let n_args = count_value_ext_args(&desc);
+        asm.getstatic(&ext_owner, "MODULE$", &format!("L{ext_owner};"));
+        if n_args == 0 {
+            asm.swap();
+        } else {
+            asm.dup_x2();
+            asm.pop();
+        }
+        asm.invokevirtual(&ext_owner, &format!("{}$extension", s.name), &desc);
+        return;
+    }
     asm.invokestatic(&owner, &format!("{}$extension", s.name), &desc);
+}
+
+fn count_value_ext_args(desc: &str) -> usize {
+    // Descriptor includes the extension receiver as the first argument.
+    let inner = desc
+        .split_once(')')
+        .map(|(a, _)| a.trim_start_matches('('))
+        .unwrap_or("");
+    let mut n: usize = 0;
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        n += 1;
+        match c {
+            'L' => while chars.next().is_some_and(|ch| ch != ';') {},
+            '[' => {
+                while chars.peek() == Some(&'[') {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'L') {
+                    chars.next();
+                    while chars.next().is_some_and(|ch| ch != ';') {}
+                } else {
+                    chars.next();
+                }
+            }
+            _ => {}
+        }
+    }
+    n.saturating_sub(1)
+}
+
+fn box_value_class_receiver(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId, qual: &Tree) {
+    let under = ctx.st.value_class_underlying(owner).unwrap_or(Type::Any);
+    if is_jvm_primitive(&under) {
+        return;
+    }
+    let src = peel_identity_arg(ctx, qual);
+    if is_jvm_primitive(&src.ty) {
+        emit_box(asm, &src.ty);
+    }
+}
+
+fn peel_identity_arg<'a>(ctx: &EmitCtx, tree: &'a Tree) -> &'a Tree {
+    if let TreeKind::Apply { fun, args } = &tree.kind {
+        let ic = if !fun.sym.is_none() {
+            ctx.st.get(fun.sym).intrinsic
+        } else {
+            Intrinsic::None
+        };
+        if matches!(
+            ic,
+            Intrinsic::Identity | Intrinsic::Any2StringAdd | Intrinsic::WrapArrowAssoc
+        ) {
+            if let Some(a) = args.first() {
+                return a;
+            }
+        }
+    }
+    tree
 }
 
 fn value_extension_desc(st: &SymbolTable, id: SymbolId) -> String {
@@ -2846,6 +2977,131 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
         } else if name == "unapplySeq" && is_list_module_owner(&owner) {
             desc = "(Lscala/collection/SeqOps;)Lscala/collection/SeqOps;".into();
         }
+        if is_stdlib_map(&owner) {
+            match name {
+                "updated" => {
+                    asm.invokeinterface(
+                        "scala/collection/immutable/MapOps",
+                        "updated",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Lscala/collection/immutable/MapOps;",
+                    );
+                    asm.checkcast("scala/collection/immutable/Map");
+                    return;
+                }
+                "apply" => {
+                    asm.invokeinterface(
+                        "scala/collection/MapOps",
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if !is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            let cls = jvm_desc(ctx.st, ty);
+                            if let Some(inner) =
+                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                            {
+                                if inner != "java/lang/Object" {
+                                    asm.checkcast(inner);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                "get" => {
+                    asm.invokeinterface(
+                        "scala/collection/MapOps",
+                        "get",
+                        "(Ljava/lang/Object;)Lscala/Option;",
+                    );
+                    return;
+                }
+                "+" => {
+                    asm.invokeinterface(
+                        "scala/collection/immutable/MapOps",
+                        "$plus",
+                        "(Lscala/Tuple2;)Lscala/collection/immutable/MapOps;",
+                    );
+                    asm.checkcast("scala/collection/immutable/Map");
+                    return;
+                }
+                "foreach" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Map$",
+                        "empty",
+                        "()Lscala/collection/immutable/Map;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_vector(&owner) {
+            match name {
+                "apply" => {
+                    asm.invokeinterface(
+                        "scala/collection/SeqOps",
+                        "apply",
+                        "(I)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if !is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            let cls = jvm_desc(ctx.st, ty);
+                            if let Some(inner) =
+                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                            {
+                                if inner != "java/lang/Object" {
+                                    asm.checkcast(inner);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                ":+" => {
+                    asm.invokeinterface(
+                        "scala/collection/SeqOps",
+                        "$colon$plus",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/immutable/Vector");
+                    return;
+                }
+                "updated" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Vector",
+                        "updated",
+                        "(ILjava/lang/Object;)Lscala/collection/immutable/Vector;",
+                    );
+                    return;
+                }
+                "foreach" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Vector",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Vector$",
+                        "empty",
+                        "()Lscala/collection/immutable/Vector;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
     if is_interface_sym(ctx.st, owner_id) {
         asm.invokeinterface(&owner, name, &desc);
@@ -2900,6 +3156,28 @@ fn is_list_module_owner(owner: &str) -> bool {
     owner == "scala/collection/immutable/List$"
 }
 
+fn is_stdlib_map(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/collection/immutable/Map"
+            | "scala/collection/immutable/Map$"
+            | "scala/collection/immutable/Map$EmptyMap$"
+            | "scala/collection/immutable/HashMap"
+    )
+}
+
+fn is_stdlib_vector(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/collection/immutable/Vector"
+            | "scala/collection/immutable/Vector$"
+            | "scala/collection/immutable/Vector0$"
+            | "scala/collection/immutable/Vector1"
+            | "scala/collection/immutable/Vector2"
+            | "scala/collection/immutable/Vector3"
+    )
+}
+
 fn load_predef_module(asm: &mut Assembler) {
     asm.getstatic("scala/Predef$", "MODULE$", "Lscala/Predef$;");
 }
@@ -2939,6 +3217,45 @@ fn gen_predef_println(
     asm.swap();
     let name = if newline { "println" } else { "print" };
     asm.invokevirtual("scala/Predef$", name, "(Ljava/lang/Object;)V");
+}
+
+fn gen_predef_poly(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    args: &[Tree],
+    result_ty: &Type,
+    name: &str,
+) {
+    let Some(a) = args.first() else {
+        load_predef_module(asm);
+        asm.aconst_null();
+        asm.invokevirtual(
+            "scala/Predef$",
+            name,
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        );
+        if is_unit_like(result_ty) {
+            asm.pop();
+        }
+        return;
+    };
+    gen_expr(asm, frame, ctx, a);
+    if is_unit_like(&a.ty) {
+        asm.aconst_null();
+    } else if is_jvm_primitive(&a.ty) {
+        emit_box(asm, &a.ty);
+    }
+    load_predef_module(asm);
+    asm.swap();
+    asm.invokevirtual(
+        "scala/Predef$",
+        name,
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    );
+    if is_unit_like(result_ty) {
+        asm.pop();
+    }
 }
 
 fn gen_predef_assert_require(
@@ -3391,7 +3708,18 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
         for (i, p) in vparams.iter().enumerate() {
             let obj_slot = 1 + i as u16;
             a.aload(obj_slot);
-            emit_unbox(a, &p.ty);
+            if is_jvm_primitive(&p.ty) || matches!(p.ty, Type::String) {
+                emit_unbox(a, &p.ty);
+            } else if let Type::Class { sym, .. } = &p.ty {
+                let n = class_internal(st, *sym);
+                if !n.is_empty() && n != "java/lang/Object" {
+                    a.checkcast(&n);
+                }
+            } else if matches!(p.ty, Type::Tuple(_)) {
+                a.checkcast("scala/Tuple2");
+            } else {
+                emit_unbox(a, &p.ty);
+            }
             let sort = jvm_sort(&p.ty);
             let slot = fr.alloc(p.sym, sort);
             store(a, slot, sort);

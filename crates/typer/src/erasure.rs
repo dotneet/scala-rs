@@ -451,11 +451,13 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
     };
     tree.ty = erase_ty(&orig, st);
     if is_primitive(&orig) && is_ref_erased(&ret_erased) && !matches!(orig, Type::Unit) {
+        tree.ty = ret_erased;
         wrap_unbox(tree, orig);
     } else if matches!(orig, Type::String)
         && is_ref_erased(&ret_erased)
         && !matches!(ret_erased, Type::String)
     {
+        tree.ty = ret_erased;
         wrap_unbox(tree, orig);
     }
     adapt_box_unbox(tree, expected);

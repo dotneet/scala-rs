@@ -174,6 +174,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     add_option_members(st, option_wf, library_abi);
     add_list_members(st, with_filter, iterator, library_abi);
     add_function_types(st);
+    if library_abi {
+        add_map_and_vector(st);
+    }
 
     // Some companion with apply
     let some_mod = module(st, st.scala_pkg, "Some", "scala/Some$");
@@ -214,30 +217,56 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     );
     let _ = class(st, st.scala_pkg, "Tuple3", "scala/Tuple3", &[Type::AnyRef]);
 
-    let arrow = class(
-        st,
-        st.scala_pkg,
-        "ArrowAssoc",
-        "scala/runtime/ArrowAssoc",
-        &[Type::AnyRef],
-    );
-    let af = st.alloc("self", arrow, SymKind::Term, Flags::PARAM, "");
-    st.get_mut(af).ty = Type::Any;
-    st.get_mut(arrow).ctor_fields = vec![af];
-    method(
-        st,
-        arrow,
-        "->",
-        vec![Type::Any],
-        Type::Class {
-            sym: tuple2,
-            args: vec![Type::Any, Type::Any],
-        },
-        Intrinsic::None,
-    );
+    let arrow = if library_abi {
+        let a = class(
+            st,
+            st.scala_pkg,
+            "ArrowAssoc",
+            "scala/Predef$ArrowAssoc",
+            &[Type::AnyVal],
+        );
+        let af = st.alloc("self", a, SymKind::Term, Flags::PARAM, "");
+        st.get_mut(af).ty = Type::Any;
+        st.get_mut(a).ctor_fields = vec![af];
+        method(
+            st,
+            a,
+            "->",
+            vec![Type::Any],
+            Type::Class {
+                sym: tuple2,
+                args: vec![Type::Any, Type::Any],
+            },
+            Intrinsic::None,
+        );
+        a
+    } else {
+        let a = class(
+            st,
+            st.scala_pkg,
+            "ArrowAssoc",
+            "scala/runtime/ArrowAssoc",
+            &[Type::AnyRef],
+        );
+        let af = st.alloc("self", a, SymKind::Term, Flags::PARAM, "");
+        st.get_mut(af).ty = Type::Any;
+        st.get_mut(a).ctor_fields = vec![af];
+        method(
+            st,
+            a,
+            "->",
+            vec![Type::Any],
+            Type::Class {
+                sym: tuple2,
+                args: vec![Type::Any, Type::Any],
+            },
+            Intrinsic::None,
+        );
+        a
+    };
 
     st.predef = module(st, st.scala_pkg, "Predef", "scala/Predef$");
-    add_predef_members(st, arrow, string_ops);
+    add_predef_members(st, arrow, string_ops, library_abi);
 
     st.push_scope();
     import_members(st, st.scala_pkg);
@@ -574,7 +603,6 @@ fn add_string_members(st: &mut SymbolTable, library_abi: bool) {
         Type::String,
         Intrinsic::StringConcat,
     );
-    method(st, c, "length", vec![], Type::Int, Intrinsic::None);
     method(
         st,
         c,
@@ -602,6 +630,7 @@ fn add_string_members(st: &mut SymbolTable, library_abi: bool) {
     );
     method(st, c, "toString", vec![], Type::String, Intrinsic::Identity);
     if !library_abi {
+        method(st, c, "length", vec![], Type::Int, Intrinsic::None);
         // Private runtime: parseInt on String. Library mode uses StringOps via augmentString.
         method(st, c, "toInt", vec![], Type::Int, Intrinsic::StringToInt);
         method(st, c, "toLong", vec![], Type::Long, Intrinsic::StringToLong);
@@ -801,6 +830,8 @@ fn add_string_ops(st: &mut SymbolTable) -> SymbolId {
     method(st, so, "toInt", vec![], Type::Int, Intrinsic::None);
     method(st, so, "toLong", vec![], Type::Long, Intrinsic::None);
     method(st, so, "toDouble", vec![], Type::Double, Intrinsic::None);
+    method(st, so, "length", vec![], Type::Int, Intrinsic::None);
+    method(st, so, "size", vec![], Type::Int, Intrinsic::None);
     so
 }
 
@@ -986,7 +1017,163 @@ fn add_function_types(st: &mut SymbolTable) {
     }
 }
 
-fn add_predef_members(st: &mut SymbolTable, arrow: SymbolId, string_ops: Option<SymbolId>) {
+fn add_map_and_vector(st: &mut SymbolTable) {
+    let tuple2 = st
+        .get(st.scala_pkg)
+        .members
+        .iter()
+        .copied()
+        .find(|id| st.get(*id).name == "Tuple2")
+        .unwrap_or(SymbolId::NONE);
+
+    let map = iface(st, st.scala_pkg, "Map", "scala/collection/immutable/Map");
+    let mk = type_param(st, map, "K");
+    let mv = type_param(st, map, "V");
+    st.get_mut(map).tparams = vec![mk, mv];
+    let tk = Type::TypeParam(mk);
+    let tv = Type::TypeParam(mv);
+    let map_t = Type::Class {
+        sym: map,
+        args: vec![tk.clone(), tv.clone()],
+    };
+    let pair = Type::Class {
+        sym: tuple2,
+        args: vec![tk.clone(), tv.clone()],
+    };
+    method(
+        st,
+        map,
+        "apply",
+        vec![Type::Any],
+        tv.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        map,
+        "get",
+        vec![Type::Any],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![tv.clone()],
+        },
+        Intrinsic::None,
+    );
+    method(
+        st,
+        map,
+        "updated",
+        vec![Type::Any, Type::Any],
+        map_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        map,
+        "+",
+        vec![pair.clone()],
+        map_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        map,
+        "foreach",
+        vec![fn1(pair, Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let map_mod = module(st, st.scala_pkg, "Map", "scala/collection/immutable/Map$");
+    let map_cls = st.module_class_of(map_mod);
+    method(
+        st,
+        map_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: map,
+            args: vec![Type::Any, Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let mems = st.get(map_cls).members.clone();
+    st.get_mut(map_mod).members.extend(mems);
+
+    let vec = class(
+        st,
+        st.scala_pkg,
+        "Vector",
+        "scala/collection/immutable/Vector",
+        &[Type::AnyRef],
+    );
+    let va = type_param(st, vec, "A");
+    st.get_mut(vec).tparams = vec![va];
+    let ta = Type::TypeParam(va);
+    let vec_t = Type::Class {
+        sym: vec,
+        args: vec![ta.clone()],
+    };
+    method(
+        st,
+        vec,
+        "apply",
+        vec![Type::Int],
+        ta.clone(),
+        Intrinsic::None,
+    );
+    method(st, vec, "length", vec![], Type::Int, Intrinsic::None);
+    method(
+        st,
+        vec,
+        "updated",
+        vec![Type::Int, Type::Any],
+        vec_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        vec,
+        ":+",
+        vec![Type::Any],
+        vec_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        vec,
+        "foreach",
+        vec![fn1(ta, Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let vec_mod = module(
+        st,
+        st.scala_pkg,
+        "Vector",
+        "scala/collection/immutable/Vector$",
+    );
+    let vec_cls = st.module_class_of(vec_mod);
+    method(
+        st,
+        vec_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: vec,
+            args: vec![Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let mems = st.get(vec_cls).members.clone();
+    st.get_mut(vec_mod).members.extend(mems);
+}
+
+fn add_predef_members(
+    st: &mut SymbolTable,
+    arrow: SymbolId,
+    string_ops: Option<SymbolId>,
+    library_abi: bool,
+) {
     let p = st.predef;
     let cls = st.get(p).ty.clone();
     let owner = match cls {
@@ -1108,14 +1295,14 @@ fn add_predef_members(st: &mut SymbolTable, arrow: SymbolId, string_ops: Option<
         st,
         owner,
         "locally",
-        vec![Type::ByName(Box::new(Type::Any))],
+        vec![Type::Any],
         Type::Any,
         Intrinsic::Locally,
     );
     let lt = type_param(st, loc, "A");
     st.get_mut(loc).tparams = vec![lt];
     st.get_mut(loc).ty = Type::Method {
-        paramss: vec![vec![Type::ByName(Box::new(Type::TypeParam(lt)))]],
+        paramss: vec![vec![Type::TypeParam(lt)]],
         ret: Box::new(Type::TypeParam(lt)),
     };
     let implm = method(
@@ -1142,21 +1329,44 @@ fn add_predef_members(st: &mut SymbolTable, arrow: SymbolId, string_ops: Option<
         paramss: vec![vec![Type::TypeParam(it)]],
         ret: Box::new(Type::TypeParam(it)),
     };
-    let sadd = class(
-        st,
-        st.scala_pkg,
-        "any2stringadd",
-        "scala/runtime/StringAdd",
-        &[Type::AnyRef],
-    );
-    method(
-        st,
-        sadd,
-        "+",
-        vec![Type::String],
-        Type::String,
-        Intrinsic::StringConcat,
-    );
+    let sadd = if library_abi {
+        let s = class(
+            st,
+            st.scala_pkg,
+            "any2stringadd",
+            "scala/Predef$any2stringadd",
+            &[Type::AnyVal],
+        );
+        let f = st.alloc("self", s, SymKind::Term, Flags::PARAM, "");
+        st.get_mut(f).ty = Type::Any;
+        st.get_mut(s).ctor_fields = vec![f];
+        method(
+            st,
+            s,
+            "+",
+            vec![Type::String],
+            Type::String,
+            Intrinsic::None,
+        );
+        s
+    } else {
+        let s = class(
+            st,
+            st.scala_pkg,
+            "any2stringadd",
+            "scala/runtime/StringAdd",
+            &[Type::AnyRef],
+        );
+        method(
+            st,
+            s,
+            "+",
+            vec![Type::String],
+            Type::String,
+            Intrinsic::StringConcat,
+        );
+        s
+    };
     let conv_s = method(
         st,
         owner,
@@ -1166,7 +1376,11 @@ fn add_predef_members(st: &mut SymbolTable, arrow: SymbolId, string_ops: Option<
             sym: sadd,
             args: vec![],
         },
-        Intrinsic::Any2StringAdd,
+        if library_abi {
+            Intrinsic::Identity
+        } else {
+            Intrinsic::Any2StringAdd
+        },
     );
     st.get_mut(conv_s).flags = st.get(conv_s).flags.with(Flags::IMPLICIT);
     let conv = method(
