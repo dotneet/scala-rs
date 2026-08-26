@@ -1,5 +1,7 @@
-//! In-scope implicit vals/defs, companions of the target (and source for
-//! conversions), imported implicits, and package objects of the enclosing package.
+//! In-scope implicit vals/defs (including those inherited from parent
+//! class/trait), companions of the parts of the target type (type constructor,
+//! type arguments, nested prefixes), imported implicits, and package objects
+//! of the enclosing package.
 //! `no implicit` / `ambiguous implicit` are hard errors.
 
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
@@ -29,9 +31,23 @@ impl Typer {
             }
         }
         if !self.st.this_class.is_none() {
-            for m in self.st.get(self.st.this_class).members.clone() {
-                if self.st.get(m).flags.contains(Flags::IMPLICIT) && seen.insert(m.0) {
-                    out.push(m);
+            // Instance implicits on this class/module, walking parents (nsc
+            // linearization is not reproduced; inheritance is).
+            let mut work = vec![self.st.this_class];
+            let mut walked = std::collections::HashSet::new();
+            while let Some(id) = work.pop() {
+                if id.is_none() || !walked.insert(id.0) {
+                    continue;
+                }
+                for m in self.st.get(id).members.clone() {
+                    if self.st.get(m).flags.contains(Flags::IMPLICIT) && seen.insert(m.0) {
+                        out.push(m);
+                    }
+                }
+                for p in self.st.get(id).parents.clone() {
+                    if let Some(ps) = self.st.class_sym_of(&p) {
+                        work.push(ps);
+                    }
                 }
             }
             // Package object of the enclosing package (members copied onto the
@@ -63,32 +79,117 @@ impl Typer {
         out
     }
 
-    fn companion_implicits(&self, ty: &Type) -> Vec<SymbolId> {
+    /// Implicit members of the companion module of `class_id` (or the module
+    /// class itself when `class_id` is already a module / module class).
+    fn companion_implicits_of_class(&self, class_id: SymbolId) -> Vec<SymbolId> {
         let mut out = Vec::new();
-        let Some(cls) = self.st.class_sym_of(ty) else {
+        if class_id.is_none() {
             return out;
+        }
+        let mcls = match self.st.get(class_id).kind {
+            SymKind::Module => self.st.module_class_of(class_id),
+            SymKind::ModuleClass => class_id,
+            _ => {
+                let Some(module) = self.st.companion_module(class_id) else {
+                    return out;
+                };
+                self.st.module_class_of(module)
+            }
         };
-        // Prefer the class (not the module class) when `ty` is a ModuleRef.
-        let class_id = if self.st.get(cls).kind == SymKind::ModuleClass {
-            let name = self.st.get(cls).name.trim_end_matches('$').to_string();
-            let owner = self.st.get(cls).owner;
-            self.st
-                .get(owner)
-                .members
-                .iter()
-                .copied()
-                .find(|&m| self.st.get(m).kind == SymKind::Class && self.st.get(m).name == name)
-                .unwrap_or(cls)
-        } else {
-            cls
-        };
-        let Some(module) = self.st.companion_module(class_id) else {
-            return out;
-        };
-        let mcls = self.st.module_class_of(module);
         for mem in &self.st.get(mcls).members {
             if self.st.get(*mem).flags.contains(Flags::IMPLICIT) {
                 out.push(*mem);
+            }
+        }
+        out
+    }
+
+    /// nsc-style parts of a type: the type constructor, type arguments, and
+    /// enclosing class/module prefixes of nested types.
+    fn collect_type_parts(
+        &self,
+        ty: &Type,
+        out: &mut Vec<SymbolId>,
+        seen: &mut std::collections::HashSet<u32>,
+    ) {
+        match ty {
+            Type::Class { sym, args } => {
+                self.collect_class_and_enclosing(*sym, out, seen);
+                for a in args {
+                    self.collect_type_parts(a, out, seen);
+                }
+            }
+            Type::Named { args, .. } => {
+                if let Some(id) = self.st.class_sym_of(ty) {
+                    self.collect_class_and_enclosing(id, out, seen);
+                }
+                for a in args {
+                    self.collect_type_parts(a, out, seen);
+                }
+            }
+            Type::ModuleRef(s) => self.collect_class_and_enclosing(*s, out, seen),
+            Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => {
+                self.collect_type_parts(t, out, seen);
+            }
+            Type::Function { params, ret } => {
+                for p in params {
+                    self.collect_type_parts(p, out, seen);
+                }
+                self.collect_type_parts(ret, out, seen);
+            }
+            Type::Tuple(ts) => {
+                for t in ts {
+                    self.collect_type_parts(t, out, seen);
+                }
+            }
+            Type::Method { paramss, ret } => {
+                for c in paramss {
+                    for p in c {
+                        self.collect_type_parts(p, out, seen);
+                    }
+                }
+                self.collect_type_parts(ret, out, seen);
+            }
+            _ => {
+                if let Some(id) = self.st.class_sym_of(ty) {
+                    self.collect_class_and_enclosing(id, out, seen);
+                }
+            }
+        }
+    }
+
+    fn collect_class_and_enclosing(
+        &self,
+        id: SymbolId,
+        out: &mut Vec<SymbolId>,
+        seen: &mut std::collections::HashSet<u32>,
+    ) {
+        if id.is_none() || !seen.insert(id.0) {
+            return;
+        }
+        out.push(id);
+        let owner = self.st.get(id).owner;
+        if owner.is_none() {
+            return;
+        }
+        match self.st.get(owner).kind {
+            SymKind::Class | SymKind::ModuleClass | SymKind::Module => {
+                self.collect_class_and_enclosing(owner, out, seen);
+            }
+            _ => {}
+        }
+    }
+
+    fn companion_implicits(&self, ty: &Type) -> Vec<SymbolId> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut parts = Vec::new();
+        self.collect_type_parts(ty, &mut parts, &mut std::collections::HashSet::new());
+        for cls in parts {
+            for mem in self.companion_implicits_of_class(cls) {
+                if seen.insert(mem.0) {
+                    out.push(mem);
+                }
             }
         }
         out

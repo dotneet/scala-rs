@@ -1,4 +1,4 @@
-//! Minimal scala-rs runtime classfiles (Java 6 / major 50).
+//! Minimal scala-rs runtime classfiles (Java 8 / major 52).
 //!
 //! These are **not** scala-library. They exist so Option / List / FunctionN
 //! from the prelude have JVM types that `scala-rs run` can load.
@@ -64,6 +64,7 @@ impl B {
         gen: impl FnOnce(&mut Assembler),
     ) {
         let mut asm = Assembler::with_pool(std::mem::take(&mut self.pool), max_locals.max(1));
+        asm.init_method(access, name, desc, &self.this_name);
         gen(&mut asm);
         let (code, pool) = asm.finish();
         self.pool = pool;

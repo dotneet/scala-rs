@@ -31,6 +31,9 @@ pub struct ClasspathPickleMethod {
     pub param_names: Vec<String>,
     pub param_types: Vec<String>,
     pub ret: String,
+    pub tparams: Vec<String>,
+    pub is_val: bool,
+    pub is_ctor: bool,
 }
 
 /// Binary class/object visible to namer/typer via `-cp`.
@@ -40,6 +43,8 @@ pub struct ClasspathClass {
     pub is_module: bool,
     pub methods: Vec<ClasspathMethod>,
     pub pickle: Option<Vec<ClasspathPickleMethod>>,
+    /// Class type parameter names recovered from the pickle, in order.
+    pub pickle_tparams: Vec<String>,
 }
 
 impl Default for TypecheckOptions {
@@ -1763,11 +1768,39 @@ impl Typer {
             for (i, a) in args.iter_mut().enumerate() {
                 let p = ctor_params.get(i).cloned().unwrap_or(Type::NoType);
                 self.type_expr(a, &p);
+            }
+            let mut inferred_args: Vec<Type> = Vec::new();
+            if let Some(c) = class_id {
+                let tps = self.st.get(c).tparams.clone();
+                if !tps.is_empty() {
+                    let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+                    for tp in &tps {
+                        inferred_args.push(
+                            unify_tparam(*tp, &ctor_params, &arg_tys).unwrap_or(Type::Any),
+                        );
+                    }
+                    tree.ty = Type::Class {
+                        sym: c,
+                        args: inferred_args.clone(),
+                    };
+                    fun.ty = tree.ty.clone();
+                } else {
+                    tree.ty = fun.ty.clone();
+                }
+            } else {
+                tree.ty = fun.ty.clone();
+            }
+            for (i, a) in args.iter_mut().enumerate() {
+                let mut p = ctor_params.get(i).cloned().unwrap_or(Type::NoType);
+                if let Some(c) = class_id {
+                    if !inferred_args.is_empty() {
+                        p = self.st.subst_tparams(c, &inferred_args, &p);
+                    }
+                }
                 if !p.is_no_type() {
                     self.adapt(a, &p);
                 }
             }
-            tree.ty = fun.ty.clone();
             tree.sym = class_id.unwrap_or(SymbolId::NONE);
             return;
         }

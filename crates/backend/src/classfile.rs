@@ -1,4 +1,4 @@
-//! JVM class file writer (major version 50 / Java 6, no StackMapTable).
+//! JVM class file writer (major version 52 / Java 8, with StackMapTable).
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -318,6 +318,7 @@ pub struct Code {
     pub max_locals: u16,
     pub bytes: Vec<u8>,
     pub exceptions: Vec<ExceptionEntry>,
+    pub stack_map: Option<Vec<u8>>,
 }
 
 pub struct ClassEmit {
@@ -342,6 +343,7 @@ impl ClassEmit {
             field_idxs.push((f.access, pool.utf8(&f.name), pool.utf8(&f.desc)));
         }
         let code_attr = pool.utf8("Code");
+        let stack_map_attr = pool.utf8("StackMapTable");
         let src_attr = pool.utf8("SourceFile");
         let src_name = pool.utf8(&self.source);
         let rva_attr = if self.scala_signature.is_some() {
@@ -372,7 +374,7 @@ impl ClassEmit {
         let mut out = Vec::new();
         out.extend_from_slice(&0xCAFEBABEu32.to_be_bytes());
         out.extend_from_slice(&0u16.to_be_bytes());
-        out.extend_from_slice(&50u16.to_be_bytes());
+        out.extend_from_slice(&52u16.to_be_bytes());
         pool.write_header(&mut out);
         out.extend_from_slice(&self.access.to_be_bytes());
         out.extend_from_slice(&this_i.to_be_bytes());
@@ -408,7 +410,13 @@ impl ClassEmit {
                     body.extend_from_slice(&e.handler_pc.to_be_bytes());
                     body.extend_from_slice(&e.catch_type.to_be_bytes());
                 }
-                body.extend_from_slice(&0u16.to_be_bytes());
+                let n_code_attrs = if c.stack_map.is_some() { 1u16 } else { 0 };
+                body.extend_from_slice(&n_code_attrs.to_be_bytes());
+                if let Some(sm) = &c.stack_map {
+                    body.extend_from_slice(&stack_map_attr.to_be_bytes());
+                    body.extend_from_slice(&(sm.len() as u32).to_be_bytes());
+                    body.extend_from_slice(sm);
+                }
                 out.extend_from_slice(&(body.len() as u32).to_be_bytes());
                 out.extend_from_slice(&body);
             } else {

@@ -9,7 +9,7 @@ scalac のソースを移植したものではありません。オリジナル�
 scala-rs は、Scala 2.13 の構文と意味論のごく一部を、Rust から JVM バイトコードへ落とす実験的コンパイラです。
 
 - フロントエンドは nsc の `Tree` に近い AST を持ちます。
-- ターゲットは Java 6 相当の classfile（major version 50）です。StackMapTable は出しません。
+- ターゲットは Java 8 相当の classfile（major version 52）です。Code 属性に StackMapTable（full_frame）を出します。
 - デフォルトでは scala-library を同梱しません。Option / List / FunctionN は **scala-rs 独自のランタイム classfile**（`scala/Option` など）です。
 - `--scala-library [<jar>]`（または `SCALA_LIBRARY_JAR`）を付けると、Option / List / FunctionN / Tuple2 に加え、`Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）、`any2stringadd`（`1 + "x"`）、`ArrowAssoc` の `->`、`intWrapper` / `RichInt`（`1.abs` / `1.max` / `1.to`）、`longWrapper` / `doubleWrapper` / `charWrapper`（`(-3L).abs` / `1.0.max` / `'9'.isDigit`）、`StringOps`（`augmentString` 経由の `toInt` / `length` / `*` / `take` / `drop` / `isEmpty`）、`WithFilter` / `Iterator`、`Map` / `Vector` / `List` / `Set`（varargs `apply` を含む）は **scala-library 2.13.16 の ABI** にリンクし、衝突する私有 classfile は出しません。jar パスを省略すると `SCALA_LIBRARY_JAR`、`/tmp/scala-rs-lib`、cwd を探します。**`scala-rs compile` と `scala-rs run` は、jar が自動検出できればそれを既定で使い**、見つからなければ私有ランタイムに落ちます。**`--no-scala-library` は私有ランタイムを強制**します。jar リンク時はさらに `Either` と `scala.util.Try` / `Success` / `Failure` も乗ります。
 
@@ -62,7 +62,7 @@ java -cp out:scala-library-2.13.16.jar Main
 - `--typer` — namer / typer 後の木のダンプ
 - `-Xfatal-warnings` — warning をエラーにする（非網羅 match など）
 - `--scala-library <jar>` — scala-library 2.13 にリンク（私有 Option/List を出さない）。環境変数 `SCALA_LIBRARY_JAR` でも可。パス省略時は自動検出。**`compile` / `run` の既定は自動検出できた jar。見つからなければ私有。`--no-scala-library` で私有を強制**
-- `-cp` / `--class-path` — 先にコンパイルした classfile を読む（`ScalaSignature` pickle subset と JVM メソッド。`$default$n` ゲッターを含む）
+- `-cp` / `--class-path` — 先にコンパイルした classfile を読む（`ScalaSignature` pickle subset と JVM メソッド。vals / パラメータ付き defs / 型パラメータ / `$default$n` ゲッターを含む）
 
 フィクスチャはデフォルトパッケージ（`package` 句なし）なので、`-cp out` の `Main` でそのまま動く想定です。
 
@@ -205,9 +205,8 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 言語:
 
 - マクロ
-- StackMapTable（Java 6 ターゲットのまま）
-- implicit search completeness（companion / パッケージオブジェクト以外の完全な nsc 探索、`Predef.$conforms` の多相インスタンス化など）
-- full pickle（nsc の Flags / POLY / existential / アノテーション引数までの完全な ScalaSig。出しているのは TERMname / TYPEname / CLASSsym / MODULEsym / VALsym / EXTref / METHODtpe / TYPEREFtpe / CLASSINFOtpe のサブセット。ByteCodecs は SID-10）
+- full nsc pickle（existentials / アノテーション引数 / 完全な Flags。出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / MODULEsym / VALsym / EXTref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe のサブセット。ByteCodecs は SID-10。vals・パラメータ付き defs・型パラメータは round-trip する）
+- implicit priority vs inheritance の端（親から inherited した implicit と、より specific なローカル / companion の優先順位を nsc と完全一致させてはいない。inherited / nested companion / 型コンストラクタ companion は探索する。`no implicit` / `ambiguous implicit` は hard error）
 - コンパイラプラグイン
 - Scala 3 構文 / TASTy / XML リテラル
 - 境界付き存在型（`_ <: T`、`forSome { type X <: Bound }`、`forSome { val x: T }`）。よくある unbounded `List[_]` / `T forSome { type X }` は実装済み
@@ -231,7 +230,7 @@ Cargo workspace のクレート:
 | `scala-rs-lexer` | 字句解析（セミコロン推論用の改行トークン、`s"..."` のモードスタック） |
 | `scala-rs-parser` | 再帰下降パーサ。AST は nsc の `Tree` に近い |
 | `scala-rs-typer` | namer + typer + uncurry + lambda-lift + erasure。implicit 探索を含む |
-| `scala-rs-backend` | JVM classfile 出力（major 50）と scala-rs ランタイム |
+| `scala-rs-backend` | JVM classfile 出力（major 52 / StackMapTable）と scala-rs ランタイム |
 | `scala-rs-driver` | パイプライン駆動 |
 | `scala-rs-cli` | コマンドライン。バイナリ名 `scala-rs` |
 
@@ -243,10 +242,10 @@ Cargo workspace のクレート:
 - **ライブラリ**: デフォルトの **`compile` / `run`** は jar が自動検出できればリンクし、同名の私有 classfile は出さない。見つからなければ私有ランタイム。`--scala-library`（パス省略時は `SCALA_LIBRARY_JAR` / `/tmp/scala-rs-lib` / cwd を探索）で明示できる。**`--no-scala-library` は私有を強制**する。jar に乗るもの: `Option` / `Some` / `None` / `List` / `Nil` / `::` / `Function0` / `Function1` / `Tuple2` / `NotImplementedError` / `Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）/ `any2stringadd` / `ArrowAssoc` の `->` / `intWrapper` / `RichInt`（`abs` / `max` / `min` / `to` / `until`）/ `longWrapper` / `RichLong`（`abs` / `max` / `min`）/ `doubleWrapper` / `RichDouble`（`abs` / `max` / `min`）/ `floatWrapper` / `RichFloat`（`abs` / `max` / `min`）/ `charWrapper` / `RichChar`（`isDigit` / `toInt` via `intValue$extension`）/ `StringOps`（`toInt$extension` / `size$extension` / `$times$extension` / `take$extension` / `drop$extension` / `isEmpty` via `augmentString` / `toUpperCase`/`toLowerCase` inlined to `String` / `stripPrefix$extension` / `split$extension`）/ `WithFilter` / `Iterator` / `Map` / `Vector` / `Set` / `Seq` / `LazyList`（`empty` / `foreach` / **varargs `apply`**）/ `Either`（`Left` / `Right` / `isLeft` / `getOrElse` / `map`）/ `Try`（`Try$` / `Success` / `Failure` の `apply` / `map` / `getOrElse`）。dual-run: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector` / `int_ops` / `string_ops` / `list_apply` / `set` / `long_ops` / `seq` / `either` / `float_ops` / `string_ops2` / `anonymous` / `eta` / `try_util` / `existentials` / `implicit_specific` / `lambda_lift`。**まだ intrinsic / 私有、または未リンク**: 完全な StringOps（`stripSuffix` / `lines` 等）、残りの numeric wrapper（`RichByte` 等）、`Queue` / `IndexedSeq` などのファクトリ。`List.unapplySeq` は library では `SeqOps` の identity。`List`/`Seq`/`LazyList` の varargs `apply` は **library のみ**。
 - **object**: scalac と同様、`Main$`（モジュール）と静的フォワーダ `Main` を出します。`java Main` が動くのはそのためです。
 - **プリミティブ**: `Int` の `+` などは `scala.Int` のボックスメソッドではなく、JVM 命令（`iadd` など）として出します。
-- **trait**: 抽象メンバーだけの trait は JVM interface です。具象メンバーは `T$class` 静的実装と、C3 線形化順のインスタンスフォワーダです。Java 8 default method は使いません（major 50）。`val` は getter/setter + `$init$` です。`abstract override` は `T$$super$m` です。
+- **trait**: 抽象メンバーだけの trait は JVM interface です。具象メンバーは `T$class` 静的実装と、C3 線形化順のインスタンスフォワーダです。Java 8 default method は使いません。`val` は getter/setter + `$init$` です。`abstract override` は `T$$super$m` です。
 - **名前付き引数**: 呼び出し側で `f(b = 2, a = 1)` を並べ替えます。巨大な rewrite フェーズはありません。extractor パターンでも case class なら並べ替えます。
-- **try**: Code 属性に例外テーブルを出します。StackMapTable はありません。
-- **ラムダ**: `FunctionN` を実装する合成クラス（`Main$$$anonfun$0` など）です。invokedynamic / LambdaMetaFactory は使いません（Java 6）。
+- **try**: Code 属性に例外テーブルと StackMapTable を出します。
+- **ラムダ**: `FunctionN` を実装する合成クラス（`Main$$$anonfun$0` など）です。invokedynamic / LambdaMetaFactory は使いません。
 - **フェーズ**: nsc の mixin などの独立パスはありません。**uncurry**、**lambda-lift**（ネスト def）、erasure、ラムダのクロージャ変換はあります。
 - **sealed**: 非網羅 match は scalac と同様 warning です。`-Xfatal-warnings` でエラーになります。
 - **AnyVal**: scalac は値クラスのクラスファイルと拡張メソッドの両方を出します。scala-rs もクラスは出しますが、呼び出しは `$extension` 静的メソッドで、`new C(x)` は underlying に消えます。
@@ -292,6 +291,8 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `implicit_specific.scala` | より specific な implicit（`B extends A`）が勝つ | `B` |
 | `lambda_lift.scala` | ローカル捕獲のネスト `def`、eta、ラムダからの再帰 | `11` `11` `12` `120` `3` |
 | `view_bounds.scala` | `T <% Ordered[T]` と `Box.compare` | `true` `false` |
+| `implicit_inherited.scala` | 親 class の implicit val が子 object で勝つ | `15` |
+| `implicit_nested.scala` | nested companion と型コンストラクタ companion の implicit | `ok` `ok` |
 | `nested_object.scala` | `object Outer { object Inner }` | `nested` |
 | `super.scala` | クラス/`trait` の `super` と `Outer.this` | `base!` `T!` `outer` |
 | `sealed_match.scala` | sealed + case class/object の網羅 match | `3` `0` |
@@ -317,7 +318,7 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `predef_more.scala` | `any2stringadd` / `implicitly` / `identity` / `locally` | `1x` `41` `42` `here` |
 | `sealed_non_exhaustive.scala` | 非網羅 match（warning。実行は覆っている入力だけ） | `3` |
 
-implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` のコンパイル失敗で見ています。境界付き存在型は `existential_bounds.scala` で診断します。クラス型パラメータの view bounds は `view_bounds_class.scala` で診断します。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします。コンパイルを成功扱いにしていません。
+implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` / `implicit_ambiguous_parents.scala` のコンパイル失敗で見ています。境界付き存在型は `existential_bounds.scala` で診断します。クラス型パラメータの view bounds は `view_bounds_class.scala` で診断します。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします（vals / パラメータ付き defs / 型パラメータを pickle から読む）。`scalac` が PATH にあれば、同じ classfile に対して 2.13 が tiny file を typecheck することを見ます。この環境には `scalac` は入っていません。コンパイルを成功扱いにしていません。
 
 ## ライセンス
 

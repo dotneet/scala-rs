@@ -268,6 +268,14 @@ fn fixtures_view_bounds() {
     check("view_bounds");
 }
 #[test]
+fn fixtures_implicit_inherited() {
+    check("implicit_inherited");
+}
+#[test]
+fn fixtures_implicit_nested() {
+    check("implicit_nested");
+}
+#[test]
 fn fixtures_defaults_still_run() {
     check("defaults");
 }
@@ -362,6 +370,11 @@ fn compile_fails(name: &str, needle: &str) {
 #[test]
 fn fixtures_implicit_ambiguous_is_error() {
     compile_fails("implicit_ambiguous", "ambiguous implicit");
+}
+
+#[test]
+fn fixtures_implicit_ambiguous_parents_is_error() {
+    compile_fails("implicit_ambiguous_parents", "ambiguous implicit");
 }
 
 #[test]
@@ -800,4 +813,126 @@ fn separate_compilation_against_classfiles() {
     );
     let _ = fs::remove_dir_all(&out_lib);
     let _ = fs::remove_dir_all(&out_main);
+}
+
+fn classfile_major(path: &Path) -> Option<u16> {
+    let b = fs::read(path).ok()?;
+    if b.len() < 8 || b[0..4] != [0xca, 0xfe, 0xba, 0xbe] {
+        return None;
+    }
+    Some(u16::from_be_bytes([b[6], b[7]]))
+}
+
+#[test]
+fn classfiles_are_java8_major_52() {
+    let out = compile_fixture("while_loop");
+    let main = out.join("Main$.class");
+    let major = classfile_major(&main).expect("read classfile major");
+    assert_eq!(major, 52, "expected Java 8 classfile major 52, got {major}");
+    if java_available() {
+        let output = Command::new("java")
+            .args(["-Xverify:all", "-cp", out.to_str().unwrap(), "Main"])
+            .output()
+            .expect("java -Xverify:all");
+        assert!(
+            output.status.success(),
+            "java -Xverify:all failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected_stdout("while_loop")
+        );
+    }
+    if javap_available() {
+        let output = Command::new("javap")
+            .args(["-v", "-p", main.to_str().unwrap()])
+            .output()
+            .expect("javap");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains("StackMapTable") || text.contains("stack_map"),
+            "expected StackMapTable in while_loop Main$, got {text}"
+        );
+    }
+    let _ = fs::remove_dir_all(&out);
+}
+
+fn find_scalac() -> Option<PathBuf> {
+    if let Ok(p) = Command::new("scalac").arg("-version").output() {
+        if p.status.success() || !p.stderr.is_empty() || !p.stdout.is_empty() {
+            return Some(PathBuf::from("scalac"));
+        }
+    }
+    let cached = PathBuf::from("/tmp/scala-2.13.16/bin/scalac");
+    if cached.is_file() {
+        return Some(cached);
+    }
+    None
+}
+
+/// scalac 2.13 against our classfiles, if `scalac` is on PATH.
+/// This environment does not ship scalac; see README.
+#[test]
+fn scalac_typechecks_against_our_classfiles_if_present() {
+    let Some(scalac) = find_scalac() else {
+        eprintln!(
+            "scalac not installed; skipping scalac-vs-our-classfiles (documented in README)"
+        );
+        return;
+    };
+    if !java_available() {
+        return;
+    }
+    let lib_src = fixtures_dir().join("separate_lib.scala");
+    let out_lib = tmp_dir("scalac-cp-lib");
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            "--no-scala-library",
+            lib_src.to_str().unwrap(),
+            "-d",
+            out_lib.to_str().unwrap(),
+        ])
+        .status()
+        .expect("compile Lib for scalac");
+    assert!(status.success());
+    let probe = tmp_dir("scalac-probe");
+    let src = probe.join("UseLib.scala");
+    fs::write(
+        &src,
+        r#"
+object UseLib {
+  def main(args: Array[String]): Unit = {
+    val s: String = Lib.greet("Scala")
+    val n: Int = Lib.magic
+    val x: Int = Lib.id(42)
+    val b: String = new Box("hi").get
+  }
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new(&scalac)
+        .args([
+            "-classpath",
+            out_lib.to_str().unwrap(),
+            "-d",
+            probe.to_str().unwrap(),
+            src.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        output.status.success(),
+        "scalac failed to typecheck against our classfiles: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let _ = fs::remove_dir_all(&out_lib);
+    let _ = fs::remove_dir_all(&probe);
 }

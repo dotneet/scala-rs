@@ -1,4 +1,4 @@
-//! Walk a typed compilation unit and emit JVM classfiles (major 50).
+//! Walk a typed compilation unit and emit JVM classfiles (major 52).
 
 use crate::classfile::{
     encode_method_name, ClassEmit, EmittedClass, Field, Method, Pool, ACC_ABSTRACT, ACC_BRIDGE,
@@ -188,6 +188,7 @@ impl ClassBuilder {
         gen: impl FnOnce(&mut Assembler),
     ) {
         let mut asm = Assembler::with_pool(std::mem::take(&mut self.pool), max_locals.max(1));
+        asm.init_method(access, name, desc, &self.this_name);
         gen(&mut asm);
         let (code, pool) = asm.finish();
         self.pool = pool;
