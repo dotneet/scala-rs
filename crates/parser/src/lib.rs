@@ -615,7 +615,7 @@ object Color {
 "#,
         );
         let dump = dump_tree(&t);
-        assert!(dump.contains("ValDef Red"), "{dump}");
-        assert!(dump.contains("ValDef Blue"), "{dump}");
+        assert!(dump.contains("ValDef val Red"), "{dump}");
+        assert!(dump.contains("ValDef val Blue"), "{dump}");
     }
 }
