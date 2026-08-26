@@ -338,8 +338,15 @@ impl Typer {
                     let mut flags = mods.flags.with(Flags::PARAM);
                     if is_case {
                         flags.set(Flags::PRIVATE, false);
-                    } else if !mods.flags.contains(Flags::MUTABLE) {
-                        flags = flags.with(Flags::PRIVATE);
+                        flags.set(Flags::LOCAL, false);
+                    } else if mods.flags.contains(Flags::ACCESSOR)
+                        || mods.flags.contains(Flags::MUTABLE)
+                    {
+                        // `val` / `var` ctor params are public unless the user
+                        // wrote `private` / `protected`.
+                    } else {
+                        // Bare ctor param: nsc `private[this]`.
+                        flags = flags.with(Flags::PRIVATE).with(Flags::LOCAL);
                     }
                     let fid = self.st.alloc(name, id, SymKind::Term, flags, "");
                     self.st.get_mut(fid).private_within = mods.private_within.clone();
