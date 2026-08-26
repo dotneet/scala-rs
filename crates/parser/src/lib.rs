@@ -253,6 +253,31 @@ object Main {
     }
 
     #[test]
+    fn context_bounds_and_repeated_parse() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def mk[T: ClassTag](n: Int): Array[T] = n
+  def q(args: Any*): String = "ok"
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("ctx"), "context bound should be kept on TypeDef: {dump}");
+        assert!(dump.contains("ClassTag"), "{dump}");
+        assert!(
+            dump.contains("<repeated>"),
+            "T* should wrap as <repeated>: {dump}"
+        );
+        let r = parse_str("object M { def f[T: Foo: Bar](x: T): T = x }\n");
+        assert!(
+            !has_errors(&r.diags),
+            "multiple context bounds should parse: {:?}",
+            r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn type_projection_and_variance_parse() {
         let t = parse_ok(
             r#"

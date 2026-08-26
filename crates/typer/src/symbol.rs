@@ -479,7 +479,17 @@ impl SymbolTable {
                 | Type::Refined { .. },
                 Type::AnyRef,
             ) => true,
-            (Type::Class { sym: s1, .. }, Type::Class { sym: s2, .. }) if s1 == s2 => true,
+            (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) if s1 == s2 => {
+                if a1.is_empty() || a2.is_empty() {
+                    true
+                } else if a1.len() == a2.len() {
+                    a1.iter()
+                        .zip(a2.iter())
+                        .all(|(x, y)| self.is_sub_type(x, y))
+                } else {
+                    false
+                }
+            }
             (a, Type::Refined { parents, decls }) => {
                 parents.iter().all(|p| self.is_sub_type(a, p))
                     && self.conforms_to_refinement(a, decls)

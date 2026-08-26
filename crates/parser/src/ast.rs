@@ -459,6 +459,8 @@ pub enum TreeKind {
         hi: Option<Box<Tree>>,
         /// View bounds `T <% Ordered[T]`. Empty when none. Multiple `<%` are allowed.
         views: Vec<Tree>,
+        /// Context bounds `T: ClassTag`. Empty when none. Multiple `: C` are allowed.
+        ctx_bounds: Vec<Tree>,
     },
     LabelDef {
         name: String,

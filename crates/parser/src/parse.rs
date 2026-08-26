@@ -720,6 +720,7 @@ impl<'a> Parser<'a> {
         let mut lo_b = None;
         let mut hi_b = None;
         let mut views = Vec::new();
+        let mut ctx_bounds = Vec::new();
         loop {
             self.skip_nl();
             match self.kind() {
@@ -737,8 +738,7 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::Colon => {
                     self.bump();
-                    let _ = self.parse_type();
-                    self.error_here("unimplemented syntax: context bounds (`: Manifest`)");
+                    ctx_bounds.push(self.parse_type());
                 }
                 _ => break,
             }
@@ -754,6 +754,7 @@ impl<'a> Parser<'a> {
                 lo: lo_b,
                 hi: hi_b,
                 views,
+                ctx_bounds,
             },
         )
     }
@@ -821,7 +822,7 @@ impl<'a> Parser<'a> {
         };
         self.skip_nl();
         let mut by_name = false;
-        let tpt = if matches!(self.kind(), TokenKind::Colon) {
+        let mut tpt = if matches!(self.kind(), TokenKind::Colon) {
             self.bump();
             self.skip_nl();
             if matches!(self.kind(), TokenKind::Arrow) {
@@ -837,10 +838,23 @@ impl<'a> Parser<'a> {
             mods.flags = mods.flags.with(Flags::BYNAME);
         }
         self.skip_nl();
-        // varargs T*
-        if matches!(self.kind(), TokenKind::Ident(s) if s == "*") {
+        // varargs `T*` → AppliedTypeTree `<repeated>[T]`
+        if matches!(self.kind(), TokenKind::Ident(s) if s == "*") && !tpt.is_empty() {
+            let sp = self.span();
             self.bump();
-            // encode as AppliedTypeTree <repeated>
+            let repeated = self.alloc(
+                sp,
+                TreeKind::Ident {
+                    name: "<repeated>".into(),
+                },
+            );
+            tpt = self.alloc(
+                tpt.span.merge(sp),
+                TreeKind::AppliedTypeTree {
+                    tpt: Box::new(repeated),
+                    args: vec![tpt],
+                },
+            );
         }
         let rhs = if matches!(self.kind(), TokenKind::Equals) {
             mods.flags = mods.flags.with(Flags::DEFAULTPARAM);
@@ -1174,6 +1188,7 @@ impl<'a> Parser<'a> {
                 lo: lo_b,
                 hi: hi_b,
                 views: vec![],
+                ctx_bounds: vec![],
             },
         )
     }
@@ -1556,6 +1571,7 @@ impl<'a> Parser<'a> {
                         lo,
                         hi,
                         views: vec![],
+                        ctx_bounds: vec![],
                     },
                 )
             }

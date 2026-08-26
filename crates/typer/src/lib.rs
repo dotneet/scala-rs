@@ -48,6 +48,23 @@ mod tests {
         t
     }
 
+    fn ok_lib(src: &str) -> Tree {
+        let (t, _, diags) = typecheck_str_opts(
+            src,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+            },
+        );
+        assert!(
+            !has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        t
+    }
+
     #[test]
     fn hello_typechecks() {
         let t = ok(r#"
@@ -1185,6 +1202,59 @@ object Main {
             diags
                 .iter()
                 .any(|d| d.message.contains("no matching overload")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn classtag_and_context_bound_typecheck() {
+        ok_lib(
+            r#"
+import scala.reflect.ClassTag
+object Main {
+  def mk[T: ClassTag](n: Int): Array[T] = new Array[T](n)
+  def main(args: Array[String]): Unit = {
+    val n: String = implicitly[ClassTag[Int]].runtimeClass.getName
+    val a: Array[Int] = mk[Int](2)
+    val k: Int = a.length
+  }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn custom_stringcontext_interpolator_typecheck() {
+        ok_lib(
+            r#"
+object Main {
+  implicit class Q(sc: StringContext) {
+    def q(args: Any*): String = "q:ok"
+  }
+  def main(args: Array[String]): Unit = {
+    val x = "X"
+    val s: String = q"a$x"
+  }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn custom_interpolator_without_library_is_error() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val s: String = q"a"
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("interpolator")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );

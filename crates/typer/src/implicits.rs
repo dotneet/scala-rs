@@ -429,7 +429,14 @@ impl Typer {
 
     pub(crate) fn ref_implicit(&self, id: SymbolId, span: Span) -> Tree {
         let s = self.st.get(id);
-        let ty = s.ty.clone();
+        let ty = match &s.ty {
+            Type::Method { paramss, ret }
+                if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
+            {
+                (**ret).clone()
+            }
+            t => t.clone(),
+        };
         Tree {
             id: scala_rs_parser::NodeId(0),
             span,
