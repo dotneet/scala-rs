@@ -132,6 +132,10 @@ fn fixtures_string_interp() {
     check("string_interp");
 }
 #[test]
+fn fixtures_overloading() {
+    check("overloading");
+}
+#[test]
 fn fixtures_list_for() {
     check("list_for");
 }
@@ -409,6 +413,21 @@ fn fixtures_protected_qual_bad_is_error() {
 }
 
 #[test]
+fn fixtures_overload_ambiguous_is_error() {
+    compile_fails("overload_ambiguous", "ambiguous overload");
+}
+
+#[test]
+fn fixtures_overload_none_is_error() {
+    compile_fails("overload_none", "no matching overload");
+}
+
+#[test]
+fn fixtures_f_interp_bad_is_error() {
+    compile_fails("f_interp_bad", "f interpolator");
+}
+
+#[test]
 fn fixtures_existential_bounds_is_error() {
     compile_fails("existential_bounds", "unimplemented");
 }
@@ -632,6 +651,16 @@ fn scala_library_dual_run_partial_function() {
 #[test]
 fn scala_library_dual_run_list_collect() {
     dual_run_fixture("list_collect");
+}
+
+#[test]
+fn scala_library_dual_run_string_interp() {
+    dual_run_fixture("string_interp");
+}
+
+#[test]
+fn scala_library_dual_run_overloading() {
+    dual_run_fixture("overloading");
 }
 
 const LIBRARY_COLLIDERS: &[&str] = &[
@@ -999,9 +1028,12 @@ fn find_scalac() -> Option<PathBuf> {
 }
 
 /// scalac 2.13 against our classfiles. Tries PATH, `/tmp/scala-2.13.16`, then a
-/// small official tarball download. Probes a `val`, a `def` with params, and
-/// `id[T]` — not only `greet`. If scalac cannot read a pickle shape, this test
-/// fails rather than claiming success.
+/// small official tarball download. Probes a `val`, a `def` with params,
+/// `id[T]`, a `case class` via `new Point` + field accessors, and an `object`
+/// method taking that case class. Companion apply `Point(3, 4)` is **not** in
+/// this pickle subset (nsc reports `not found: value Point`); do not claim it.
+/// If scalac cannot read a probed shape, this test fails rather than claiming
+/// success.
 #[test]
 fn scalac_typechecks_against_our_classfiles_if_present() {
     let Some(scalac) = find_scalac() else {
@@ -1037,6 +1069,9 @@ object UseLib {
     val n: Int = Lib.magic
     val x: Int = Lib.id(42)
     val b: String = new Box("hi").get
+    val p: Point = new Point(3, 4)
+    val q: Int = p.x + p.y
+    val sum: Int = Lib.add(new Point(1, 2))
   }
 }
 "#,
@@ -1054,7 +1089,7 @@ object UseLib {
         .expect("scalac");
     assert!(
         output.status.success(),
-        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get): {}\n{}",
+        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / case class Point / Lib.add): {}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );

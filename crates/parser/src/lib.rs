@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod finterp;
 pub mod parse;
 pub mod pretty;
 
@@ -126,12 +127,16 @@ object M {
 package foo.bar
 object M {
   def hello(name: String): String = s"hi $name"
+  def pad(n: Int): String = f"$n%02d"
+  def rawnl: String = raw"a\nb"
 }
 "#,
         );
         let dump = dump_tree(&t);
         assert!(dump.contains("PackageDef"), "{dump}");
         assert!(dump.contains("Interpolate s"), "{dump}");
+        assert!(dump.contains("Interpolate f"), "{dump}");
+        assert!(dump.contains("Interpolate raw"), "{dump}");
     }
 
     #[test]

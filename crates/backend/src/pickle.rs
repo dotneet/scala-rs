@@ -2,8 +2,11 @@
 //!
 //! This is enough for scala-rs to round-trip compiled classes/objects through
 //! `ScalaSignature` and for scalac 2.13.16 to typecheck a `val`, a `def` with
-//! parameters, and `id[T]` against our classfiles. It is **not** a full nsc
-//! pickle (no existentials, annotation args, or the complete Flags long).
+//! parameters, `id[T]`, a `case class` (`new Point` + ctor field accessors), and
+//! an `object` method against our classfiles. Companion apply `Point(x, y)` is
+//! **not** recovered by nsc from this subset (`not found: value Point`). It is
+//! **not** a full nsc pickle (no existentials, annotation args, or the complete
+//! Flags long).
 //!
 //! nsc-facing details in this subset (must match `PickleBuffer` / `UnPickler`):
 //! - pickle = major, minor, **nentries**, then `{ tag_Nat, len_Nat, body }`
@@ -455,6 +458,32 @@ impl<'a> Pickler<'a> {
         self.add(TYPEREFTPE, body)
     }
 
+    fn type_ref_local(&mut self, class_idx: u32, args: &[Type]) -> u32 {
+        let mut body = Vec::new();
+        write_nat_to(&mut body, self.noprefix);
+        write_nat_to(&mut body, class_idx);
+        for a in args {
+            let t = self.pickle_type(a);
+            write_nat_to(&mut body, t);
+        }
+        self.add(TYPEREFTPE, body)
+    }
+
+    /// Default-package user class, as nsc `EXTREF` owned by `<empty>`.
+    fn type_ref_user(&mut self, name: &str, args: &[Type]) -> u32 {
+        let empty = self.empty_package();
+        let pref = self.noprefix;
+        let sym = self.ext_ref_owned(name, empty);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, pref);
+        write_nat_to(&mut body, sym);
+        for a in args {
+            let t = self.pickle_type(a);
+            write_nat_to(&mut body, t);
+        }
+        self.add(TYPEREFTPE, body)
+    }
+
     fn ext_ref(&mut self, name: &str) -> u32 {
         if let Some(i) = self.ext_refs.get(name) {
             return *i;
@@ -516,10 +545,18 @@ impl<'a> Pickler<'a> {
                 write_nat_to(&mut body, sym);
                 self.add(TYPEREFTPE, body)
             }
-            Type::Class { sym, .. } => {
-                let n = self.st.get(*sym).name.clone();
-                let n = n.trim_end_matches('$').to_string();
-                self.type_ref_named(&n)
+            Type::Class { sym, args } => {
+                if let Some(&idx) = self.sym_index.get(&sym.0) {
+                    return self.type_ref_local(idx, args);
+                }
+                let n = self.st.get(*sym).name.trim_end_matches('$').to_string();
+                match n.as_str() {
+                    "Int" | "Long" | "Float" | "Double" | "Boolean" | "Char" | "Unit" | "Any"
+                    | "AnyRef" | "AnyVal" | "Nothing" | "Null" | "Array" | "Seq" | "String"
+                    | "Object" => self.type_ref_named(&n),
+                    n if n.starts_with("Function") => self.type_ref_named(n),
+                    n => self.type_ref_user(n, args),
+                }
             }
             Type::ModuleRef(s) => {
                 let n = self.st.get(*s).name.clone();
@@ -554,6 +591,7 @@ impl<'a> Pickler<'a> {
         let is_module = matches!(s.kind, SymKind::Module | SymKind::ModuleClass)
             || s.flags.contains(Flags::MODULE)
             || s.name.ends_with('$');
+        let is_case = s.flags.contains(Flags::CASE);
         let raw_name = s.name.trim_end_matches('$').to_string();
         // nsc module classes are CLASSsym + MODULE with a type name, not MODULEsym.
         let name_ref = self.type_name(&raw_name);
@@ -598,11 +636,14 @@ impl<'a> Pickler<'a> {
                 }
                 SymKind::Term => {
                     if ctor_fields.contains(&m) || !self.st.get(m).flags.contains(Flags::PARAM) {
-                        self.pickle_val(m, idx);
+                        self.pickle_val(m, idx, is_case && ctor_fields.contains(&m));
                     }
                 }
                 SymKind::Method => {
                     if name == "<clinit>" {
+                        continue;
+                    }
+                    if pickle_sig_incomplete(self.st, m) {
                         continue;
                     }
                     self.pickle_method(m, idx, this_tpe);
@@ -625,6 +666,9 @@ impl<'a> Pickler<'a> {
         let mut flags = 0u64;
         if is_module {
             flags |= raw_to_pickled(1 << 8); // MODULE
+        }
+        if is_case {
+            flags |= raw_to_pickled(1 << 11); // CASE
         }
         let owner = self.empty_package();
         let body = self.symbol_info(name_ref, owner, flags, info);
@@ -749,7 +793,7 @@ impl<'a> Pickler<'a> {
         idx
     }
 
-    fn pickle_val(&mut self, val_id: SymbolId, owner_ref: u32) -> u32 {
+    fn pickle_val(&mut self, val_id: SymbolId, owner_ref: u32, case_accessor: bool) -> u32 {
         if let Some(i) = self.sym_index.get(&val_id.0) {
             return *i;
         }
@@ -763,7 +807,11 @@ impl<'a> Pickler<'a> {
         write_nat_to(&mut pt, ret_ref);
         let info = self.add(POLYTPE, pt);
         // METHOD | STABLE | ACCESSOR, then nsc raw→pickled remap
-        let flags = raw_to_pickled((1u64 << 6) | (1u64 << 22) | (1u64 << 27));
+        let mut flags = raw_to_pickled((1u64 << 6) | (1u64 << 22) | (1u64 << 27));
+        if case_accessor {
+            flags |= 1 << 24; // CASEACCESSOR (not remapped)
+            flags |= 1 << 29; // PARAMACCESSOR (not remapped)
+        }
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
         self.entries[idx as usize] = (VALSYM, body);
         idx
@@ -799,6 +847,25 @@ fn write_long_nat_to(out: &mut Vec<u8>, x: u64) {
         prefix(out, y);
     }
     out.push((x & 0x7f) as u8);
+}
+
+fn pickle_sig_incomplete(st: &SymbolTable, id: SymbolId) -> bool {
+    fn ty_incomplete(t: &Type) -> bool {
+        match t {
+            Type::NoType | Type::Error => true,
+            Type::Method { paramss, ret } => {
+                ty_incomplete(ret) || paramss.iter().flatten().any(ty_incomplete)
+            }
+            Type::Function { params, ret } => {
+                ty_incomplete(ret) || params.iter().any(ty_incomplete)
+            }
+            Type::Class { args, .. } => args.iter().any(ty_incomplete),
+            Type::Tuple(ts) => ts.iter().any(ty_incomplete),
+            Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => ty_incomplete(t),
+            _ => false,
+        }
+    }
+    ty_incomplete(&st.get(id).ty)
 }
 
 /// nsc `Flags.rawToPickledFlags`: bits 0–11 differ between raw and pickled form.
@@ -1366,5 +1433,61 @@ class Box[A](val value: A) {
             .find(|m| m.is_ctor)
             .expect("<init>");
         assert_eq!(init.param_types, vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn pickle_case_class_and_object_def() {
+        let src = r#"
+case class Point(x: Int, y: Int)
+object Lib {
+  def add(p: Point): Int = p.x + p.y
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let point = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Point" && s.kind == scala_rs_typer::SymKind::Class)
+            .map(|s| s.id)
+            .expect("Point class");
+        let pc = unpickle(&pickle_class(&st, point)).expect("unpickle Point");
+        assert!(!pc.is_module);
+        let x = pc.methods.iter().find(|m| m.name == "x").expect("val x");
+        assert!(x.is_val);
+        assert_eq!(x.ret, "Int");
+        let init = pc
+            .methods
+            .iter()
+            .find(|m| m.is_ctor)
+            .expect("<init>");
+        assert_eq!(init.param_types, vec!["Int".to_string(), "Int".to_string()]);
+
+        let lib = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Lib" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("Lib module");
+        let l = unpickle(&pickle_class(&st, st.module_class_of(lib))).expect("unpickle Lib");
+        let add = l.methods.iter().find(|m| m.name == "add").expect("add");
+        assert_eq!(add.param_types, vec!["Point".to_string()]);
+        assert_eq!(add.ret, "Int");
+
+        let pmod = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Point" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("Point module");
+        let pm = unpickle(&pickle_class(&st, st.module_class_of(pmod))).expect("unpickle Point$");
+        assert!(pm.is_module);
+        let apply = pm.methods.iter().find(|m| m.name == "apply").expect("apply");
+        assert_eq!(apply.param_types, vec!["Int".to_string(), "Int".to_string()]);
+        assert_eq!(apply.ret, "Point");
     }
 }
