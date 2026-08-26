@@ -21,6 +21,18 @@ pub fn parse_source(source: &SourceFile, file_index: usize, tokens: Vec<Token>) 
     }
 }
 
+/// Language-level annotations nsc cares about in this subset.
+fn annotation_supported(path: &str) -> bool {
+    matches!(
+        path,
+        "tailrec"
+            | "annotation.tailrec"
+            | "scala.annotation.tailrec"
+            | "deprecated"
+            | "scala.deprecated"
+    )
+}
+
 struct Parser<'a> {
     source: &'a SourceFile,
     file_index: usize,
@@ -487,6 +499,7 @@ impl<'a> Parser<'a> {
     fn parse_modifiers(&mut self) -> Modifiers {
         let mut flags = Flags::EMPTY;
         let mut private_within = None;
+        let mut annotations = Vec::new();
         loop {
             self.skip_nl();
             match self.kind() {
@@ -533,8 +546,18 @@ impl<'a> Parser<'a> {
                 TokenKind::At => {
                     let sp = self.span();
                     self.bump();
-                    let _ = self.parse_simple_expr();
-                    self.error_span(sp, "unimplemented syntax: annotations (ignored for the rest of this definition)");
+                    let annot = self.parse_simple_expr();
+                    let path = annot.annotation_path();
+                    if annotation_supported(&path) {
+                        annotations.push(annot);
+                    } else {
+                        let shown = if path.is_empty() {
+                            "annotation".into()
+                        } else {
+                            format!("annotation {path}")
+                        };
+                        self.error_span(sp, format!("unimplemented syntax: {shown}"));
+                    }
                 }
                 _ => break,
             }
@@ -542,6 +565,7 @@ impl<'a> Parser<'a> {
         Modifiers {
             flags,
             private_within,
+            annotations,
         }
     }
 

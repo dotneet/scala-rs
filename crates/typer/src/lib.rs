@@ -1259,4 +1259,57 @@ object Main {
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn tailrec_non_tail_is_error() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  @tailrec
+  def fact(n: Int): Int = if (n <= 1) 1 else n * fact(n - 1)
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected @tailrec error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("tailrec")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tailrec_and_deprecated_typecheck() {
+        ok(
+            r#"
+object Main {
+  @tailrec
+  def sum(n: Int, acc: Int): Int = if (n <= 0) acc else sum(n - 1, acc + n)
+  @deprecated("old")
+  def f(): Int = 1
+  def main(args: Array[String]): Unit = {
+    val n: Int = sum(3, 0)
+    val k: Int = f()
+  }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn array_ops_typecheck_against_library() {
+        ok_lib(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val arr: Array[Int] = Array(1, 2, 3)
+    val x: Int = arr(0)
+    val n: Int = arr.length
+    arr.update(1, 9)
+    arr(2) = 8
+  }
+}
+"#,
+        );
+    }
 }

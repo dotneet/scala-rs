@@ -4,9 +4,9 @@
 //! `ScalaSignature` and for scalac 2.13.16 to typecheck a `val`, a `def` with
 //! parameters, `id[T]`, a `case class` (`new Point` + ctor field accessors +
 //! companion apply `Point(x, y)` / term `Point` via `MODULESYM` in the class
-//! pickle), and an `object` method against our classfiles. It is **not** a full
-//! nsc pickle (no existentials, annotation args, `unapply` pickle, or the
-//! complete Flags long).
+//! pickle + extractor `unapply` so `x match { case Point(a, b) => … }`), and an
+//! `object` method against our classfiles. It is **not** a full nsc pickle (no
+//! existentials, annotation args, or the complete Flags long).
 //!
 //! nsc-facing details in this subset (must match `PickleBuffer` / `UnPickler`):
 //! - pickle = major, minor, **nentries**, then `{ tag_Nat, len_Nat, body }`
@@ -469,6 +469,19 @@ impl<'a> Pickler<'a> {
         self.add(TYPEREFTPE, body)
     }
 
+    fn type_ref_in_args(&mut self, owner: u32, name: &str, args: &[Type]) -> u32 {
+        let pref = self.noprefix;
+        let sym = self.ext_ref_owned(name, owner);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, pref);
+        write_nat_to(&mut body, sym);
+        for a in args {
+            let t = self.pickle_type(a);
+            write_nat_to(&mut body, t);
+        }
+        self.add(TYPEREFTPE, body)
+    }
+
     /// Default-package user class, as nsc `EXTREF` owned by `<empty>`.
     fn type_ref_user(&mut self, name: &str, args: &[Type]) -> u32 {
         let empty = self.empty_package();
@@ -554,6 +567,14 @@ impl<'a> Pickler<'a> {
                     "Int" | "Long" | "Float" | "Double" | "Boolean" | "Char" | "Unit" | "Any"
                     | "AnyRef" | "AnyVal" | "Nothing" | "Null" | "Array" | "Seq" | "String"
                     | "Object" => self.type_ref_named(&n),
+                    "Option" | "Some" | "None" => {
+                        let sc = self.scala_module();
+                        self.type_ref_in_args(sc, n.as_str(), args)
+                    }
+                    n if n.starts_with("Tuple") => {
+                        let sc = self.scala_module();
+                        self.type_ref_in_args(sc, n, args)
+                    }
                     n if n.starts_with("Function") => self.type_ref_named(n),
                     n => self.type_ref_user(n, args),
                 }
@@ -565,6 +586,10 @@ impl<'a> Pickler<'a> {
             }
             Type::Function { params, .. } => {
                 self.type_ref_named(&format!("Function{}", params.len()))
+            }
+            Type::Tuple(ts) => {
+                let sc = self.scala_module();
+                self.type_ref_in_args(sc, &format!("Tuple{}", ts.len()), ts)
             }
             Type::Array(_) => self.type_ref_named("Array"),
             Type::ByName(t) => self.pickle_type(t),
@@ -1524,5 +1549,12 @@ object Lib {
         let apply = pm.methods.iter().find(|m| m.name == "apply").expect("apply");
         assert_eq!(apply.param_types, vec!["Int".to_string(), "Int".to_string()]);
         assert_eq!(apply.ret, "Point");
+        let unapply = pm
+            .methods
+            .iter()
+            .find(|m| m.name == "unapply")
+            .expect("unapply");
+        assert_eq!(unapply.param_types, vec!["Point".to_string()]);
+        assert_eq!(unapply.ret, "Option");
     }
 }
