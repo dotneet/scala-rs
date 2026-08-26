@@ -85,7 +85,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - コンパイラプラグイン
 - 完全な Scala 標準ライブラリ（`List` のランタイムなど）
 - Scala 3 構文
-- implicit（数値の widening 以外。widening 自体も TODO であり、偽の完全実装ではない）
+- implicit 解決（ユーザ定義の implicit conversion / implicit parameter は未実装。プリミティブの numeric widening だけを typer が特別扱いする。偽の完全実装ではない）
 - `lazy val` のコード生成
 - 内部クラス / 匿名クラス
 - XML リテラル

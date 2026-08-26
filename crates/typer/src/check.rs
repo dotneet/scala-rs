@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Namer + typer. Trees are mutated in place (`ty`, `sym`).
 
 use crate::prelude::install_prelude;
@@ -1417,7 +1418,7 @@ impl Typer {
         match &tpt.kind {
             TreeKind::Empty => Type::NoType,
             TreeKind::Ident { name } => self.resolve_type_name(name, &[]),
-            TreeKind::Select { name, qual } => {
+            TreeKind::Select { name, qual: _ } => {
                 // java.lang.String etc.
                 if name == "String" {
                     Type::String
