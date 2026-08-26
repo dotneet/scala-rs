@@ -10,7 +10,7 @@ scala-rs は、Scala 2.13 の構文と意味論のごく一部を、Rust から 
 
 - フロントエンドは nsc の `Tree` に近い AST を持ちます。
 - ターゲットは Java 6 相当の classfile（major version 50）です。StackMapTable は出しません。
-- 標準ライブラリ全体は載せていません。フィクスチャが使う `Int` / `String` / `Unit` / `Boolean` / `Array[String]` / `println` 程度が前提です。
+- scala-library は同梱しません。Option / List / FunctionN は **scala-rs 独自のランタイム classfile**（`scala/Option` など）です。scalac が出す `scala-library.jar` とはバイナリ互換ではありません。
 
 完成した Scala コンパイラではありません。仕様への完全準拠も主張しません。
 
@@ -44,7 +44,7 @@ scala-rs compile file.scala -d out/
 scala-rs run file.scala
 ```
 
-出力した classfile は、scalac と同様に `java` から起動できます。object はモジュールクラス `Main$` と、静的 `main` を持つフォワーダ `Main` を出します。
+出力した classfile は、scalac と同様に `java` から起動できます。object はモジュールクラス `Main$` と、静的 `main` を持つフォワーダ `Main` を出します。ランタイム（`scala/Option` など）も同じ `-d` ディレクトリに出ます。
 
 ```bash
 java -cp out Main
@@ -66,16 +66,49 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - packages / imports
 - objects / classes / traits / case classes
 - `val` / `var` / `def`（ネストした `def` はパースする）
-- パラメータ、ラムダ（型付き）、ブロック
+- パラメータ、ラムダ（型付き / 期待型から推論）、ブロック
 - `if` / `else`、`while`
 - `match`（コンストラクタパターン、リテラル、ワイルドカード）
-- for-comprehension（`map` / `foreach` へデシュガー。ランタイムの `List` は未実装）
-- apply / select / infix
+- for-comprehension（`map` / `flatMap` / `foreach` / `withFilter` へデシュガー。ランタイムの `List` / `Option` で実行できる）
+- apply / select / infix（`:` 終わりの演算子は右結合で、レシーバは右オペランド。`1 :: Nil` → `Nil.::(1)`）
 - リテラル、タプル
-- 名前付き型・ジェネリック型（`Array[String]` など）
+- 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）
 - `s"..."` 文字列補間
+- `lazy val`
+- implicit val / def（ローカルとコンパニオン）、implicit パラメータ、スコープ内の implicit conversion
+- デフォルト引数、by-name パラメータ（`=> T`）
 
-フィクスチャで実際に使う範囲はこれより狭いです。`Int`、`String`、`Unit`、`Boolean`、`Array[String]`、`println`、クラス、object、trait、case class、`match`、`if`/`else`、`while`、再帰、文字列 `+` です。
+フィクスチャで実際に動く範囲は README 末尾の表を見てください。
+
+### Erasure
+
+パイプラインは次のとおりです。
+
+```
+parse → namer → typer → erasure → emit
+```
+
+erasure は typer と backend のあいだの独立パスです。型引数を落とし、型パラメータを `Object` にし、プリミティブと `Object` の境に box / unbox を挿入します。by-name は `Function0` に下げます。バックエンドの ad-hoc な推測だけには頼っていません。
+
+### Implicit 解決（第一カット）
+
+nsc に寄せた探索順です。偽の「何でも変換」はありません。
+
+1. 現在のスコープと、囲んでいるクラス / object の `implicit` メンバー
+2. 目標型（変換なら元の型も）のコンパニオンオブジェクトの `implicit` メンバー
+
+パッケージオブジェクトはまだ探しません。
+
+数値の widening（`Int` → `Long` / `Double` など）は **implicit 探索の前** に特別扱いします。scalac の implicit ではなく、typer の組み込みです。
+
+失敗はスタブせず、診断を出します。
+
+- `no implicit: could not find implicit value of type …`
+- `ambiguous implicit: …`
+
+### lazy val
+
+フィールドに加えて `bitmap$0: Int` と、同期したアクセサを出します。初期化は最初の読み取りまで遅延します。
 
 ## 実装していないもの
 
@@ -83,16 +116,17 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 
 - マクロ
 - コンパイラプラグイン
-- 完全な Scala 標準ライブラリ（`List` のランタイムなど）
+- 完全な Scala 標準ライブラリ（ここにある Option / List は scala-rs ランタイムであり、scala-library ではない）
 - Scala 3 構文
-- implicit 解決（ユーザ定義の implicit conversion / implicit parameter は未実装。プリミティブの numeric widening だけを typer が特別扱いする。偽の完全実装ではない）
-- `lazy val` のコード生成
+- パッケージオブジェクトを含む完全な implicit scope
+- implicit の優先度 / `Predef` の全変換 / `scala.Int` コンパニオンの enrichment
+- 明示的な第二パラメータ節での implicit 渡し（`add(3)(ev)`）は未対応。探索で埋める側だけ
 - 内部クラス / 匿名クラス
 - XML リテラル
 - existential types
 - view bounds
-- 独立した erasure フェーズ（erasure は JVM emit に折り込む。nsc のような別パスではない）
 - TASTy
+- StackMapTable（Java 6 ターゲットのまま）
 
 パーサは未対応構文を黙って捨てず、診断と `Unimplemented` ノードを出します。
 
@@ -105,29 +139,22 @@ Cargo workspace のクレート:
 | `scala-rs-span` | ソース位置と診断 |
 | `scala-rs-lexer` | 字句解析（セミコロン推論用の改行トークン、`s"..."` のモードスタック） |
 | `scala-rs-parser` | 再帰下降パーサ。AST は nsc の `Tree` に近い |
-| `scala-rs-typer` | namer + typer（木を in-place で型付け） |
-| `scala-rs-backend` | JVM classfile 出力（major 50） |
+| `scala-rs-typer` | namer + typer + erasure。implicit 探索を含む |
+| `scala-rs-backend` | JVM classfile 出力（major 50）と scala-rs ランタイム |
 | `scala-rs-driver` | パイプライン駆動 |
 | `scala-rs-cli` | コマンドライン。バイナリ名 `scala-rs` |
-
-パイプライン:
-
-```
-parse → namer → typer → emit
-```
-
-後から uncurry / erasure を typer と backend の間に挟めるように、AST は書き換え前提です。現時点ではそのフェーズはありません。
 
 ## scalac 2.13 との比較
 
 正直な差分です。
 
 - **規模**: nsc のごく一部。言語仕様を満たしません。
-- **ライブラリ**: scala-library を同梱しません。`Predef.println` とプリミティブ演算など、コンパイラが知っているシンボルだけです。
+- **ライブラリ**: scala-library を同梱しません。`Predef.println`、プリミティブ演算、およびコンパイラが出す Option / List / FunctionN ランタイムだけです。`java -cp out:scala-library.jar` で混ぜる想定ではありません。
 - **object**: scalac と同様、`Main$`（モジュール）と静的フォワーダ `Main` を出します。`java Main` が動くのはそのためです。
 - **プリミティブ**: `Int` の `+` などは `scala.Int` のボックスメソッドではなく、JVM 命令（`iadd` など）として出します。
 - **trait**: 抽象メンバーだけの trait は JVM interface として出します。具象メンバー付き trait の完全な線形化・実装クラスは載せていません。
-- **フェーズ**: nsc の uncurry / erasure / mixin / lambdaLift などの独立パスはありません。
+- **ラムダ**: `FunctionN` を実装する合成クラス（`Main$$$anonfun$0` など）です。invokedynamic / LambdaMetaFactory は使いません（Java 6）。
+- **フェーズ**: nsc の uncurry / mixin / lambdaLift などの独立パスはありません。erasure とラムダのクロージャ変換はあります。
 
 scalac の代替ではありません。サブセットの再実装です。
 
@@ -137,7 +164,7 @@ scalac の代替ではありません。サブセットの再実装です。
 cargo test
 ```
 
-実行時の期待値は `tests/fixtures/` にあります。各 `.scala` に対して `tests/fixtures/expected/` に同名の `.txt`（`println` と同じ末尾改行付きの stdout）を置いています。
+実行時の期待値は `tests/fixtures/` にあります。各 `.scala` に対して `tests/fixtures/expected/` に同名の `.txt`（`println` と同じ末尾改行付きの stdout）を置いています。`java` がある環境では CLI の e2e が stdout を比較します。
 
 | フィクスチャ | 内容 | 期待 stdout |
 | --- | --- | --- |
@@ -149,6 +176,15 @@ cargo test
 | `trait_impl.scala` | trait 実装の `greet` | `Hello, Scala` |
 | `while_loop.scala` | `while (i < 3)` | `3` |
 | `string_interp.scala` | `s"hello $name"` | `hello world` |
+| `list_for.scala` | `1 :: 2 :: 3 :: Nil` の for-yield / guard | `2` `3` `4` `20` `30` |
+| `option_for.scala` | `Some` / `None` の for-comprehension | `4` `true` |
+| `lazy_val.scala` | `lazy val` の遅延と一度きりの初期化 | `0` `42` `42` `1` |
+| `implicits.scala` | implicit パラメータとコンパニオンの conversion | `15` `14` |
+| `generic_id.scala` | `def id[T](x: T): T` の erasure | `42` `hi` |
+| `defaults.scala` | デフォルト引数 | `hi Scala!` `hi Scala?` |
+| `byname.scala` | by-name パラメータが二度評価される | `6` `2` |
+
+implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストで見ています。コンパイルを成功扱いにしていません。
 
 ## ライセンス
 

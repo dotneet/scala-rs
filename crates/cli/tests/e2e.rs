@@ -125,6 +125,34 @@ fn fixtures_while_loop() {
 fn fixtures_string_interp() {
     check("string_interp");
 }
+#[test]
+fn fixtures_list_for() {
+    check("list_for");
+}
+#[test]
+fn fixtures_option_for() {
+    check("option_for");
+}
+#[test]
+fn fixtures_lazy_val() {
+    check("lazy_val");
+}
+#[test]
+fn fixtures_implicits() {
+    check("implicits");
+}
+#[test]
+fn fixtures_generic_id() {
+    check("generic_id");
+}
+#[test]
+fn fixtures_defaults() {
+    check("defaults");
+}
+#[test]
+fn fixtures_byname() {
+    check("byname");
+}
 
 #[test]
 fn cli_run_hello() {

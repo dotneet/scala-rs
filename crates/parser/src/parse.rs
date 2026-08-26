@@ -1804,20 +1804,39 @@ impl<'a> Parser<'a> {
             let right_assoc = op.ends_with(':');
             let next_min = if right_assoc { prec } else { prec + 1 };
             let right = self.parse_infix_expr(next_min);
-            let sel = self.alloc(
-                left.span.merge(op_span),
-                TreeKind::Select {
-                    qual: Box::new(left),
-                    name: op,
-                },
-            );
-            left = self.alloc(
-                sel.span.merge(right.span),
-                TreeKind::Apply {
-                    fun: Box::new(sel),
-                    args: vec![right],
-                },
-            );
+            // Operators ending in `:` are right-associative and the receiver is
+            // the right-hand operand (`1 :: Nil` → `Nil.::(1)`), matching nsc.
+            left = if right_assoc {
+                let sel = self.alloc(
+                    right.span.merge(op_span),
+                    TreeKind::Select {
+                        qual: Box::new(right),
+                        name: op,
+                    },
+                );
+                self.alloc(
+                    left.span.merge(sel.span),
+                    TreeKind::Apply {
+                        fun: Box::new(sel),
+                        args: vec![left],
+                    },
+                )
+            } else {
+                let sel = self.alloc(
+                    left.span.merge(op_span),
+                    TreeKind::Select {
+                        qual: Box::new(left),
+                        name: op,
+                    },
+                );
+                self.alloc(
+                    sel.span.merge(right.span),
+                    TreeKind::Apply {
+                        fun: Box::new(sel),
+                        args: vec![right],
+                    },
+                )
+            };
         }
         left
     }

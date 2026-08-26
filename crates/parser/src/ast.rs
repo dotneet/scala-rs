@@ -148,6 +148,8 @@ pub enum Type {
     Overload(Vec<Type>),
     /// Package or module as a prefix (for Select).
     ModuleRef(SymbolId),
+    /// A type parameter (`T` in `def id[T](x: T): T`).
+    TypeParam(SymbolId),
 }
 
 impl Type {
@@ -263,6 +265,7 @@ impl fmt::Display for Type {
                 write!(f, ">")
             }
             Type::ModuleRef(s) => write!(f, "module#{}", s.0),
+            Type::TypeParam(s) => write!(f, "tparam#{}", s.0),
         }
     }
 }

@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use scala_rs_backend::emit;
+use scala_rs_backend::{emit, emit_runtime};
 use scala_rs_parser::{dump_tree, parse_file, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
-use scala_rs_typer::{find_mains, typecheck, SymbolTable};
+use scala_rs_typer::{erase, find_mains, typecheck, SymbolTable};
 
 pub use scala_rs_backend::EmittedClass;
 
@@ -141,9 +141,12 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
 
     let mut mains = Vec::new();
     for u in &mut units {
-        let (st, tdiags) = typecheck(&mut u.tree, u.file_index);
+        let (mut st, tdiags) = typecheck(&mut u.tree, u.file_index);
         diags.extend(tdiags);
         mains.extend(find_mains(&st, &u.tree));
+        if !has_errors(&diags) {
+            erase(&mut u.tree, &mut st);
+        }
         u.st = Some(st);
     }
 
@@ -162,7 +165,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         };
     }
 
-    let mut emitted = Vec::new();
+    let mut emitted = emit_runtime();
     for u in &units {
         let st = u.st.as_ref().expect("unit is typed");
         let src_name = source_file_name(&sources[u.file_index]);

@@ -22,22 +22,62 @@ pub fn install_prelude(st: &mut SymbolTable) {
     let _ = (float, char_s);
 
     st.string_sym = class(st, java_lang, "String", "java/lang/String", &[Type::AnyRef]);
-    // alias in scala and Predef
     st.array_sym = class(st, st.scala_pkg, "Array", "[java/lang/Object", &[Type::AnyRef]);
     st.option_sym = class(st, st.scala_pkg, "Option", "scala/Option", &[Type::AnyRef]);
-    st.some_sym = class(st, st.scala_pkg, "Some", "scala/Some", &[Type::Class {
-        sym: st.option_sym,
-        args: vec![],
-    }]);
-    st.none_sym = module(st, st.scala_pkg, "None", "scala/None$");
-    st.list_sym = class(st, st.scala_pkg, "List", "scala/collection/immutable/List", &[Type::AnyRef]);
-    st.nil_sym = module(st, st.scala_pkg, "Nil", "scala/collection/immutable/Nil$");
-    st.cons_sym = class(st, st.scala_pkg, "$colon$colon", "scala/collection/immutable/$colon$colon", &[Type::Class {
-        sym: st.list_sym,
-        args: vec![],
-    }]);
-    // `::` is an alias users write
-    let cons_alias = st.alloc("::", st.scala_pkg, SymKind::Class, Flags::CASE, "scala/collection/immutable/$colon$colon");
+    st.some_sym = class(
+        st,
+        st.scala_pkg,
+        "Some",
+        "scala/Some",
+        &[Type::Class {
+            sym: st.option_sym,
+            args: vec![],
+        }],
+    );
+    st.none_sym = module_extending(
+        st,
+        st.scala_pkg,
+        "None",
+        "scala/None$",
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![],
+        },
+    );
+    st.list_sym = class(
+        st,
+        st.scala_pkg,
+        "List",
+        "scala/collection/immutable/List",
+        &[Type::AnyRef],
+    );
+    st.nil_sym = module_extending(
+        st,
+        st.scala_pkg,
+        "Nil",
+        "scala/collection/immutable/Nil$",
+        Type::Class {
+            sym: st.list_sym,
+            args: vec![],
+        },
+    );
+    st.cons_sym = class(
+        st,
+        st.scala_pkg,
+        "$colon$colon",
+        "scala/collection/immutable/$colon$colon",
+        &[Type::Class {
+            sym: st.list_sym,
+            args: vec![],
+        }],
+    );
+    let cons_alias = st.alloc(
+        "::",
+        st.scala_pkg,
+        SymKind::Class,
+        Flags::CASE,
+        "scala/collection/immutable/$colon$colon",
+    );
     st.get_mut(cons_alias).ty = Type::Class {
         sym: st.cons_sym,
         args: vec![],
@@ -52,21 +92,28 @@ pub fn install_prelude(st: &mut SymbolTable) {
     add_array_members(st);
     add_option_members(st);
     add_list_members(st);
+    add_function_types(st);
 
-    // Predef
+    // Some companion with apply
+    let some_mod = module(st, st.scala_pkg, "Some", "scala/Some$");
+    let some_cls = st.module_class_of(some_mod);
+    method(
+        st,
+        some_cls,
+        "apply",
+        vec![Type::Any],
+        Type::Class {
+            sym: st.some_sym,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+    let mems = st.get(some_cls).members.clone();
+    st.get_mut(some_mod).members.extend(mems);
+
     st.predef = module(st, st.scala_pkg, "Predef", "scala/Predef$");
     add_predef_members(st);
 
-    // FunctionN / TupleN names
-    for n in 0..=2 {
-        let _ = class(
-            st,
-            st.scala_pkg,
-            &format!("Function{n}"),
-            &format!("scala/Function{n}"),
-            &[Type::AnyRef],
-        );
-    }
     for n in 2..=3 {
         let _ = class(
             st,
@@ -77,12 +124,10 @@ pub fn install_prelude(st: &mut SymbolTable) {
         );
     }
 
-    // Auto-import into the outermost scope: scala._, java.lang._, Predef._
     st.push_scope();
     import_members(st, st.scala_pkg);
     import_members(st, java_lang);
     import_members(st, st.predef);
-    // String alias
     st.enter_in_current("String", st.string_sym);
     st.enter_in_current("Unit", st.unit_sym);
     st.enter_in_current("::", st.cons_sym);
@@ -91,6 +136,22 @@ pub fn install_prelude(st: &mut SymbolTable) {
 fn class(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str, parents: &[Type]) -> SymbolId {
     let id = st.alloc(name, owner, SymKind::Class, Flags::FINAL, jvm);
     st.get_mut(id).parents = parents.to_vec();
+    st.get_mut(id).ty = Type::Class {
+        sym: id,
+        args: vec![],
+    };
+    id
+}
+
+fn iface(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
+    let id = st.alloc(
+        name,
+        owner,
+        SymKind::Class,
+        Flags::INTERFACE.with(Flags::ABSTRACT).with(Flags::TRAIT),
+        jvm,
+    );
+    st.get_mut(id).parents = vec![Type::AnyRef];
     st.get_mut(id).ty = Type::Class {
         sym: id,
         args: vec![],
@@ -112,6 +173,19 @@ fn module(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> Symbo
     m
 }
 
+fn module_extending(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    name: &str,
+    jvm: &str,
+    parent: Type,
+) -> SymbolId {
+    let m = module(st, owner, name, jvm);
+    let cls = st.module_class_of(m);
+    st.get_mut(cls).parents = vec![parent];
+    m
+}
+
 fn method(
     st: &mut SymbolTable,
     owner: SymbolId,
@@ -121,11 +195,22 @@ fn method(
     intrinsic: Intrinsic,
 ) -> SymbolId {
     let id = st.alloc(name, owner, SymKind::Method, Flags::FINAL, "");
+    let paramss = if params.is_empty() {
+        Vec::new()
+    } else {
+        vec![params]
+    };
     st.get_mut(id).ty = Type::Method {
-        paramss: vec![params],
+        paramss,
         ret: Box::new(ret),
     };
     st.get_mut(id).intrinsic = intrinsic;
+    id
+}
+
+fn type_param(st: &mut SymbolTable, owner: SymbolId, name: &str) -> SymbolId {
+    let id = st.alloc(name, owner, SymKind::TypeParam, Flags::EMPTY, "");
+    st.get_mut(id).ty = Type::TypeParam(id);
     id
 }
 
@@ -183,7 +268,6 @@ fn add_int_members(st: &mut SymbolTable) {
     method(st, c, "toLong", vec![], Type::Long, Intrinsic::IntToLong);
     method(st, c, "toDouble", vec![], Type::Double, Intrinsic::IntToDouble);
     method(st, c, "toString", vec![], Type::String, Intrinsic::AnyToString);
-    // Long / Double overloads of + etc. for widening at the member
     method(st, c, "+", vec![Type::Long], Type::Long, Intrinsic::LongBin("+"));
     method(st, c, "+", vec![Type::Double], Type::Double, Intrinsic::DoubleBin("+"));
 }
@@ -251,55 +335,101 @@ fn add_array_members(st: &mut SymbolTable) {
     method(st, c, "update", vec![Type::Int, Type::Any], Type::Unit, Intrinsic::None);
 }
 
+fn fn1(arg: Type, ret: Type) -> Type {
+    Type::Function {
+        params: vec![arg],
+        ret: Box::new(ret),
+    }
+}
+
 fn add_option_members(st: &mut SymbolTable) {
     let o = st.option_sym;
+    let a = type_param(st, o, "A");
+    st.get_mut(o).tparams = vec![a];
+    let ta = Type::TypeParam(a);
+    let opt = Type::Class {
+        sym: o,
+        args: vec![ta.clone()],
+    };
     method(st, o, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
-    method(st, o, "get", vec![], Type::Any, Intrinsic::None);
+    method(st, o, "get", vec![], ta.clone(), Intrinsic::None);
+    method(st, o, "foreach", vec![fn1(ta.clone(), Type::Unit)], Type::Unit, Intrinsic::None);
+    method(st, o, "map", vec![fn1(ta.clone(), Type::Any)], opt.clone(), Intrinsic::None);
+    method(st, o, "flatMap", vec![fn1(ta.clone(), opt.clone())], opt.clone(), Intrinsic::None);
+    method(st, o, "withFilter", vec![fn1(ta.clone(), Type::Boolean)], opt, Intrinsic::None);
+
     let some = st.some_sym;
-    // apply
-    method(st, some, "<init>", vec![Type::Any], Type::Class { sym: some, args: vec![] }, Intrinsic::None);
+    let sa = type_param(st, some, "A");
+    st.get_mut(some).tparams = vec![sa];
+    method(
+        st,
+        some,
+        "<init>",
+        vec![Type::Any],
+        Type::Class {
+            sym: some,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+    st.get_mut(some).ctor_fields = {
+        let f = st.alloc("value", some, SymKind::Term, Flags::PARAM, "");
+        st.get_mut(f).ty = Type::Any;
+        vec![f]
+    };
 }
 
 fn add_list_members(st: &mut SymbolTable) {
     let l = st.list_sym;
+    let a = type_param(st, l, "A");
+    st.get_mut(l).tparams = vec![a];
+    let ta = Type::TypeParam(a);
     let list_t = Type::Class {
         sym: l,
-        args: vec![],
+        args: vec![ta.clone()],
     };
     method(st, l, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
-    method(st, l, "head", vec![], Type::Any, Intrinsic::None);
+    method(st, l, "head", vec![], ta.clone(), Intrinsic::None);
     method(st, l, "tail", vec![], list_t.clone(), Intrinsic::None);
+    method(st, l, "::", vec![Type::Any], list_t.clone(), Intrinsic::None);
     method(
         st,
         l,
         "foreach",
-        vec![Type::Function {
-            params: vec![Type::Any],
-            ret: Box::new(Type::Unit),
-        }],
+        vec![fn1(ta.clone(), Type::Unit)],
         Type::Unit,
+        Intrinsic::None,
+    );
+    method(st, l, "map", vec![fn1(ta.clone(), Type::Any)], list_t.clone(), Intrinsic::None);
+    method(
+        st,
+        l,
+        "flatMap",
+        vec![fn1(ta.clone(), list_t.clone())],
+        list_t.clone(),
         Intrinsic::None,
     );
     method(
         st,
         l,
-        "map",
-        vec![Type::Function {
-            params: vec![Type::Any],
-            ret: Box::new(Type::Any),
-        }],
+        "withFilter",
+        vec![fn1(ta, Type::Boolean)],
         list_t,
         Intrinsic::None,
     );
 }
 
+fn add_function_types(st: &mut SymbolTable) {
+    for n in 0..=2 {
+        let f = iface(st, st.scala_pkg, &format!("Function{n}"), &format!("scala/Function{n}"));
+        let params = vec![Type::Any; n];
+        method(st, f, "apply", params, Type::Any, Intrinsic::None);
+    }
+}
+
 fn add_predef_members(st: &mut SymbolTable) {
     let p = st.predef;
-    // Predef is a module; members go on its module class
-    let cls = st
-        .get(p)
-        .ty
-        .clone();
+    let cls = st.get(p).ty.clone();
     let owner = match cls {
         Type::ModuleRef(id) => id,
         _ => p,
@@ -312,8 +442,6 @@ fn add_predef_members(st: &mut SymbolTable) {
     method(st, owner, "println", vec![Type::String], Type::Unit, Intrinsic::Println);
     method(st, owner, "println", vec![Type::Any], Type::Unit, Intrinsic::Println);
     method(st, owner, "print", vec![Type::Any], Type::Unit, Intrinsic::Print);
-    // also enter on current scope via import_members of Predef module: members of module value
-    // Copy member ids onto the module symbol for lookup by Predef.println
     let mems = st.get(owner).members.clone();
     st.get_mut(p).members.extend(mems.iter().copied());
     for m in mems {

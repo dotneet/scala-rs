@@ -12,6 +12,12 @@ pub const ACC_INTERFACE: u16 = 0x0200;
 pub const ACC_ABSTRACT: u16 = 0x0400;
 pub const ACC_SYNTHETIC: u16 = 0x1000;
 
+pub struct EmittedClass {
+    /// e.g. `"Main"`, `"Main$"`, `"scala/Option"`
+    pub internal_name: String,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Default)]
 pub struct Pool {
     bytes: Vec<u8>,

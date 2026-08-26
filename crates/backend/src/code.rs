@@ -471,6 +471,16 @@ impl Assembler {
         self.stack = 0;
     }
 
+    pub fn monitorenter(&mut self) {
+        self.emit_op(0xc2);
+        self.bump(-1);
+    }
+
+    pub fn monitorexit(&mut self) {
+        self.emit_op(0xc3);
+        self.bump(-1);
+    }
+
     pub fn finish(mut self) -> (Code, Pool) {
         let copy = self.patches.clone();
         for (at, lab) in copy {

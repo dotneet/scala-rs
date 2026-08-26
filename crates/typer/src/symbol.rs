@@ -54,6 +54,8 @@ pub struct Symbol {
     pub ctor_fields: Vec<SymbolId>,
     pub parents: Vec<Type>,
     pub default_rhs: Option<scala_rs_parser::Tree>,
+    /// Class or method type parameters, in order.
+    pub tparams: Vec<SymbolId>,
 }
 
 impl Symbol {
@@ -127,6 +129,7 @@ impl SymbolTable {
                 ctor_fields: vec![],
                 parents: vec![],
                 default_rhs: None,
+                tparams: vec![],
             }],
             scopes: vec![Scope::default()],
             root: SymbolId(0),
@@ -181,6 +184,7 @@ impl SymbolTable {
             ctor_fields: vec![],
             parents: vec![],
             default_rhs: None,
+            tparams: vec![],
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {
@@ -260,8 +264,40 @@ impl SymbolTable {
                 .lookup(name)
                 .into_iter()
                 .find(|s| self.get(*s).is_class_like()),
+            Type::TypeParam(_) => None,
             _ => None,
         }
+    }
+
+    /// Companion module of a class (same name, `SymKind::Module`, same owner).
+    pub fn companion_module(&self, class_id: SymbolId) -> Option<SymbolId> {
+        let s = self.get(class_id);
+        if s.kind == SymKind::Module {
+            return Some(class_id);
+        }
+        let name = s.name.clone();
+        let owner = s.owner;
+        self.get(owner)
+            .members
+            .iter()
+            .copied()
+            .find(|&m| self.get(m).kind == SymKind::Module && self.get(m).name == name)
+    }
+
+    pub fn module_class_of(&self, id: SymbolId) -> SymbolId {
+        match self.get(id).ty {
+            Type::ModuleRef(c) => c,
+            _ => id,
+        }
+    }
+
+    /// Substitute class type arguments into a member type (`List[Int].head` → `Int`).
+    pub fn subst_tparams(&self, owner: SymbolId, args: &[Type], ty: &Type) -> Type {
+        let tps = self.get(owner).tparams.clone();
+        if tps.is_empty() || args.is_empty() {
+            return ty.clone();
+        }
+        subst_map(ty, &tps, args)
     }
 
     pub fn type_of_class(&self, id: SymbolId) -> Type {
@@ -304,6 +340,30 @@ impl SymbolTable {
                 .any(|p| self.is_sub_type(p, b)),
             (Type::Array(x), Type::Array(y)) => self.is_sub_type(x, y),
             (Type::ModuleRef(s), Type::Class { sym, .. }) if s == sym => true,
+            (Type::ModuleRef(s), b) => self
+                .get(*s)
+                .parents
+                .clone()
+                .iter()
+                .any(|p| self.is_sub_type(p, b)),
+            (Type::TypeParam(a), Type::TypeParam(b)) if a == b => true,
+            (Type::TypeParam(_), Type::AnyRef | Type::AnyVal) => true,
+            (
+                Type::Function {
+                    params: p1,
+                    ret: r1,
+                },
+                Type::Function {
+                    params: p2,
+                    ret: r2,
+                },
+            ) if p1.len() == p2.len() => {
+                p2.iter()
+                    .zip(p1.iter())
+                    .all(|(exp, act)| self.is_sub_type(exp, act))
+                    && self.is_sub_type(r1, r2)
+            }
+            (Type::ByName(a), Type::ByName(b)) => self.is_sub_type(a, b),
             _ => false,
         }
     }
@@ -326,6 +386,7 @@ impl SymbolTable {
                 s
             }
             Type::ModuleRef(id) => self.get(*id).name.clone(),
+            Type::TypeParam(id) => self.get(*id).name.clone(),
             Type::Array(t) => format!("Array[{}]", self.display_type(t)),
             Type::Method { paramss, ret } => {
                 let mut s = String::new();
@@ -376,4 +437,41 @@ impl Default for SymbolTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn subst_map(ty: &Type, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> Type {
+    match ty {
+        Type::TypeParam(id) => tps
+            .iter()
+            .position(|t| t == id)
+            .and_then(|i| args.get(i).cloned())
+            .unwrap_or_else(|| ty.clone()),
+        Type::Class { sym, args: as_ } => Type::Class {
+            sym: *sym,
+            args: as_.iter().map(|a| subst_map(a, tps, args)).collect(),
+        },
+        Type::Array(t) => Type::Array(Box::new(subst_map(t, tps, args))),
+        Type::Function { params, ret } => Type::Function {
+            params: params.iter().map(|p| subst_map(p, tps, args)).collect(),
+            ret: Box::new(subst_map(ret, tps, args)),
+        },
+        Type::Method { paramss, ret } => Type::Method {
+            paramss: paramss
+                .iter()
+                .map(|ps| ps.iter().map(|p| subst_map(p, tps, args)).collect())
+                .collect(),
+            ret: Box::new(subst_map(ret, tps, args)),
+        },
+        Type::ByName(t) => Type::ByName(Box::new(subst_map(t, tps, args))),
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| subst_map(t, tps, args)).collect()),
+        Type::Named { name, args: as_ } => Type::Named {
+            name: name.clone(),
+            args: as_.iter().map(|a| subst_map(a, tps, args)).collect(),
+        },
+        other => other.clone(),
+    }
+}
+
+pub(crate) fn subst_tparams_slice(tps: &[SymbolId], args: &[Type], ty: &Type) -> Type {
+    subst_map(ty, tps, args)
 }

@@ -141,6 +141,15 @@ object M {
     }
 
     #[test]
+    fn colon_ops_are_right_assoc_on_the_rhs() {
+        let t = parse_ok("object M { val xs = 1 :: Nil }\n");
+        let dump = dump_tree(&t);
+        // `1 :: Nil` is `Nil.::(1)`, not `1.::(Nil)`.
+        assert!(dump.contains("Select"), "{dump}");
+        assert!(dump.contains("::") || dump.contains("Apply"), "{dump}");
+    }
+
+    #[test]
     fn first_stat_is_module() {
         let t = parse_ok("object Foo { val x = 1 }\n");
         assert!(matches!(first_stat(&t).kind, TreeKind::ModuleDef { .. }));

@@ -3,6 +3,7 @@
 
 use crate::prelude::install_prelude;
 use crate::symbol::{SymbolTable, SymKind};
+use crate::implicits::ImplicitSearch;
 use scala_rs_parser::ast::*;
 use scala_rs_span::{Diagnostic, Span};
 
@@ -183,12 +184,13 @@ impl Typer {
         } else {
             tree.sym
         };
-        let (vparamss, body, parents, is_trait, is_case, name) = match &mut tree.kind {
+        let (vparamss, body, parents, is_trait, is_case, name, tparams) = match &mut tree.kind {
             TreeKind::ClassDef {
                 vparamss,
                 impl_,
                 mods,
                 name,
+                tparams,
                 ..
             } => (
                 vparamss,
@@ -197,6 +199,7 @@ impl Typer {
                 mods.flags.contains(Flags::TRAIT),
                 mods.flags.contains(Flags::CASE),
                 name.clone(),
+                tparams,
             ),
             _ => return,
         };
@@ -206,6 +209,8 @@ impl Typer {
         self.st.owner = id;
         self.st.this_class = id;
         self.st.push_scope();
+        let tp_ids = self.enter_tparams(tparams, id);
+        self.st.get_mut(id).tparams = tp_ids;
         // constructor params as fields
         let mut fields = Vec::new();
         for clause in vparamss.iter_mut() {
@@ -243,6 +248,26 @@ impl Typer {
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
         tree.sym = id;
+    }
+
+    fn enter_tparams(&mut self, tparams: &mut [Tree], owner: SymbolId) -> Vec<SymbolId> {
+        let mut ids = Vec::new();
+        for tp in tparams {
+            let name = tp.name().unwrap_or("_").to_string();
+            let id = if tp.sym.is_none() {
+                let id = self
+                    .st
+                    .alloc(&name, owner, SymKind::TypeParam, Flags::EMPTY, "");
+                tp.sym = id;
+                id
+            } else {
+                tp.sym
+            };
+            self.st.get_mut(id).ty = Type::TypeParam(id);
+            self.st.enter_in_current(&name, id);
+            ids.push(id);
+        }
+        ids
     }
 
     fn rough_parents(&self, parents: &[Tree], is_trait: bool) -> Vec<Type> {
@@ -579,6 +604,11 @@ impl Typer {
         } else {
             self.tree_to_type(&tpt)
         };
+        let ty = if flags.contains(Flags::BYNAME) && !matches!(ty, Type::ByName(_) | Type::NoType) {
+            Type::ByName(Box::new(ty))
+        } else {
+            ty
+        };
         tree.ty = ty.clone();
         if tree.sym.is_none() {
             let id = self.st.alloc(name.clone(), self.st.owner, SymKind::Term, flags, "");
@@ -586,7 +616,19 @@ impl Typer {
             self.st.enter_in_current(&name, id);
         }
         if !tree.sym.is_none() {
-            self.st.get_mut(tree.sym).ty = ty;
+            self.st.get_mut(tree.sym).ty = ty.clone();
+            if flags.contains(Flags::DEFAULTPARAM) {
+                let f = self.st.get(tree.sym).flags.with(Flags::DEFAULTPARAM);
+                self.st.get_mut(tree.sym).flags = f;
+            }
+            if flags.contains(Flags::IMPLICIT) {
+                let f = self.st.get(tree.sym).flags.with(Flags::IMPLICIT);
+                self.st.get_mut(tree.sym).flags = f;
+            }
+            if flags.contains(Flags::BYNAME) {
+                let f = self.st.get(tree.sym).flags.with(Flags::BYNAME);
+                self.st.get_mut(tree.sym).flags = f;
+            }
         }
         let _ = name;
     }
@@ -621,10 +663,14 @@ impl Typer {
     }
 
     fn type_def_sig(&mut self, tree: &mut Tree) {
-        let (vparamss, tpt, name) = match &mut tree.kind {
+        let (tparams, vparamss, tpt, name) = match &mut tree.kind {
             TreeKind::DefDef {
-                vparamss, tpt, name, ..
-            } => (vparamss, tpt.clone(), name.clone()),
+                tparams,
+                vparamss,
+                tpt,
+                name,
+                ..
+            } => (tparams, vparamss, tpt.clone(), name.clone()),
             _ => return,
         };
         if tree.sym.is_none() {
@@ -632,17 +678,23 @@ impl Typer {
             tree.sym = id;
             self.st.enter_in_current(&name, id);
         }
+        self.st.push_scope();
+        let tp_ids = self.enter_tparams(tparams, tree.sym);
+        self.st.get_mut(tree.sym).tparams = tp_ids;
+        let saved_owner = self.st.owner;
+        self.st.owner = tree.sym;
         let mut paramss_ty = Vec::new();
         let mut all_params = Vec::new();
+        let mut paramss_ids: Vec<Vec<SymbolId>> = Vec::new();
         for clause in vparamss.iter_mut() {
             let mut ct = Vec::new();
+            let mut ids = Vec::new();
             for p in clause.iter_mut() {
                 self.type_val_sig(p);
                 if p.ty.is_no_type() {
                     self.error(p.span, format!("missing parameter type for `{}`", p.name().unwrap_or("?")));
                     p.ty = Type::Error;
                 }
-                // enter param symbol if missing
                 if p.sym.is_none() {
                     if let TreeKind::ValDef { name, mods, .. } = &p.kind {
                         let n = name.clone();
@@ -653,17 +705,26 @@ impl Typer {
                 }
                 if !p.sym.is_none() {
                     self.st.get_mut(p.sym).ty = p.ty.clone();
+                    if let TreeKind::ValDef { mods, rhs, .. } = &p.kind {
+                        if mods.flags.contains(Flags::DEFAULTPARAM) && !rhs.is_empty() {
+                            self.st.get_mut(p.sym).default_rhs = Some((**rhs).clone());
+                        }
+                    }
                     all_params.push(p.sym);
+                    ids.push(p.sym);
                 }
                 ct.push(p.ty.clone());
             }
             paramss_ty.push(ct);
+            paramss_ids.push(ids);
         }
+        self.st.owner = saved_owner;
         let ret = if tpt.is_empty() {
             Type::NoType
         } else {
             self.tree_to_type(&tpt)
         };
+        self.st.pop_scope();
         let mty = Type::Method {
             paramss: paramss_ty,
             ret: Box::new(ret.clone()),
@@ -672,6 +733,7 @@ impl Typer {
         if !tree.sym.is_none() {
             self.st.get_mut(tree.sym).ty = mty;
             self.st.get_mut(tree.sym).params = all_params;
+            self.st.get_mut(tree.sym).paramss = paramss_ids;
         }
         let _ = name;
     }
@@ -691,6 +753,12 @@ impl Typer {
             return;
         }
         self.st.push_scope();
+        if !tree.sym.is_none() {
+            for tp in self.st.get(tree.sym).tparams.clone() {
+                let n = self.st.get(tp).name.clone();
+                self.st.enter_in_current(&n, tp);
+            }
+        }
         for clause in vparamss.iter() {
             for p in clause {
                 if !p.sym.is_none() {
@@ -781,8 +849,12 @@ impl Typer {
             TreeKind::TypeApply { fun, args } => {
                 self.type_expr(fun, &Type::NoType);
                 let targs: Vec<Type> = args.iter().map(|a| self.tree_to_type(a)).collect();
-                tree.ty = fun.ty.clone();
-                let _ = targs;
+                if !fun.sym.is_none() {
+                    tree.sym = fun.sym;
+                    tree.ty = self.st.subst_tparams(fun.sym, &targs, &fun.ty);
+                } else {
+                    tree.ty = fun.ty.clone();
+                }
             }
             TreeKind::Block { stats, expr } => {
                 self.st.push_scope();
@@ -820,19 +892,32 @@ impl Typer {
                         return;
                     }
                 }
-                self.type_expr(tpt, &Type::NoType);
-                tree.ty = tpt.ty.clone();
-                if let Type::Class { .. } = &tree.ty {
-                } else if let Some(id) = self.st.class_sym_of(&tpt.ty) {
-                    tree.ty = Type::Class {
-                        sym: id,
-                        args: vec![],
-                    };
-                    tree.sym = id;
+                if let TreeKind::Ident { name } = &tpt.kind {
+                    let n = name.clone();
+                    let found = self.st.lookup(&n);
+                    if let Some(id) = found.into_iter().find(|s| self.st.get(*s).kind == SymKind::Class)
+                    {
+                        tpt.sym = id;
+                        tpt.ty = Type::Class {
+                            sym: id,
+                            args: vec![],
+                        };
+                    } else {
+                        self.type_expr(tpt, &Type::NoType);
+                    }
                 } else {
-                    // tpt might be Ident of a class
-                    tree.ty = tpt.ty.clone();
-                    tree.sym = tpt.sym;
+                    self.type_expr(tpt, &Type::NoType);
+                }
+                tree.ty = tpt.ty.clone();
+                tree.sym = tpt.sym;
+                if tree.sym.is_none() {
+                    if let Some(id) = self.st.class_sym_of(&tpt.ty) {
+                        tree.ty = Type::Class {
+                            sym: id,
+                            args: vec![],
+                        };
+                        tree.sym = id;
+                    }
                 }
             }
             TreeKind::Typed { expr, tpt } => {
@@ -937,7 +1022,9 @@ impl Typer {
         self.bind_found(tree, found, pt);
     }
 
-    fn bind_found(&mut self, tree: &mut Tree, found: Vec<SymbolId>, pt: &Type) {
+    fn bind_found(&mut self, tree: &mut Tree, mut found: Vec<SymbolId>, pt: &Type) {
+        found.sort_by_key(|s| s.0);
+        found.dedup();
         if found.len() == 1 {
             let s = found[0];
             tree.sym = s;
@@ -952,14 +1039,19 @@ impl Typer {
     }
 
     fn maybe_auto_apply(&self, ty: Type, pt: &Type) -> Type {
-        // Only parameterless methods (`def foo: T`) are auto-applied. Empty
-        // parameter lists (`def foo(): T`) still require `foo()`.
         match &ty {
             Type::Method { paramss, ret } if paramss.is_empty() => {
                 if matches!(pt, Type::Function { .. } | Type::Method { .. }) {
                     ty
                 } else {
                     (**ret).clone()
+                }
+            }
+            Type::ByName(inner) => {
+                if matches!(pt, Type::Function { .. } | Type::ByName(_) | Type::Method { .. }) {
+                    ty
+                } else {
+                    (**inner).clone()
                 }
             }
             _ => ty,
@@ -1004,15 +1096,44 @@ impl Typer {
             tree.ty = Type::Error;
             return;
         }
+        let subst = |ty: Type| -> Type {
+            if let Type::Class { args, .. } = &qual.ty {
+                if !args.is_empty() {
+                    if let Some(owner) = found
+                        .first()
+                        .map(|s| self.st.get(*s).owner)
+                    {
+                        return self.st.subst_tparams(owner, args, &ty);
+                    }
+                }
+            }
+            ty
+        };
         if found.len() == 1 {
             let s = found[0];
             tree.sym = s;
-            tree.ty = self.maybe_auto_apply(self.st.get(s).ty.clone(), pt);
+            let ty = subst(self.st.get(s).ty.clone());
+            tree.ty = self.maybe_auto_apply(ty, pt);
         } else {
             tree.sym = found[0];
-            tree.ty = Type::Overload(found.iter().map(|s| self.st.get(*s).ty.clone()).collect());
-            // store remaining ids? backend uses tree.sym after apply resolves.
-            // We'll resolve in Apply.
+            let owner = self.st.get(found[0]).owner;
+            let args = match &qual.ty {
+                Type::Class { args, .. } => args.clone(),
+                _ => vec![],
+            };
+            tree.ty = Type::Overload(
+                found
+                    .iter()
+                    .map(|s| {
+                        let t = self.st.get(*s).ty.clone();
+                        if args.is_empty() {
+                            t
+                        } else {
+                            self.st.subst_tparams(owner, &args, &t)
+                        }
+                    })
+                    .collect(),
+            );
         }
     }
 
@@ -1050,21 +1171,33 @@ impl Typer {
 
         self.type_expr(fun, &Type::NoType);
 
-        // resolve overload using arg types: type args first with NoType, then pick, then adapt
+        let recv_ty = match &fun.kind {
+            TreeKind::Select { qual, .. } => Some(qual.ty.clone()),
+            _ => None,
+        };
+        let fun_name = fun.name().unwrap_or("").to_string();
+
+        // Type non-lambda args first so overload resolution has info; lambdas
+        // wait for an expected Function type (for-comprehension desugaring).
         let mut arg_tys = Vec::new();
         for a in args.iter_mut() {
-            self.type_expr(a, &Type::NoType);
-            arg_tys.push(a.ty.clone());
+            if matches!(a.kind, TreeKind::Function { .. }) {
+                arg_tys.push(Type::Function {
+                    params: vec![Type::NoType],
+                    ret: Box::new(Type::NoType),
+                });
+            } else {
+                self.type_expr(a, &Type::NoType);
+                arg_tys.push(a.ty.clone());
+            }
         }
 
-        // String + Any  / Any + String
         if let TreeKind::Select { name, qual } = &fun.kind {
             if name == "+"
                 && (matches!(qual.ty, Type::String) || arg_tys.first().is_some_and(|t| matches!(t, Type::String)))
             {
                 tree.ty = Type::String;
-                fun.sym = SymbolId::NONE; // marker: concat
-                // encode concat via a fake: keep apply, backend sees String result and + 
+                fun.sym = SymbolId::NONE;
                 return;
             }
         }
@@ -1072,40 +1205,107 @@ impl Typer {
         let fun_ty = fun.ty.clone();
         let chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
         match chosen {
-            Some((sym, param_tys, ret)) => {
+            Some((sym, mut param_tys, mut ret)) => {
                 if !sym.is_none() {
                     fun.sym = sym;
                     tree.sym = sym;
-                }
-                for (a, p) in args.iter_mut().zip(param_tys.iter()) {
-                    self.adapt(a, p);
-                }
-                if args.len() < param_tys.len() {
-                    // default params: check remaining have defaults
-                    let missing = &param_tys[args.len()..];
-                    let ok_defaults = !sym.is_none()
-                        && self.st.get(sym).params.get(args.len()..).is_some_and(|rest| {
-                            rest.iter().all(|p| self.st.get(*p).flags.contains(Flags::DEFAULTPARAM))
-                        });
-                    if !ok_defaults && !missing.is_empty() {
-                        self.error(
-                            tree.span,
-                            format!(
-                                "not enough arguments: expected {}, found {}",
-                                param_tys.len(),
-                                args.len()
-                            ),
-                        );
+                    if !self.st.get(sym).tparams.is_empty() {
+                        let inst = self.infer_method_tparams(sym, &param_tys, &arg_tys);
+                        if !inst.is_empty() {
+                            let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+                            let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+                            param_tys = param_tys
+                                .iter()
+                                .map(|p| crate::symbol::subst_tparams_slice(&tps, &args_t, p))
+                                .collect();
+                            ret = crate::symbol::subst_tparams_slice(&tps, &args_t, &ret);
+                        }
                     }
-                } else if args.len() > param_tys.len() {
+                }
+                if let Some(elem) = recv_ty.as_ref().and_then(|t| self.elem_type(t)) {
+                    if matches!(fun_name.as_str(), "map" | "flatMap" | "foreach" | "withFilter")
+                        && !param_tys.is_empty()
+                    {
+                        if let Type::Function { ret: fr, .. } = &param_tys[0] {
+                            param_tys[0] = Type::Function {
+                                params: vec![elem],
+                                ret: fr.clone(),
+                            };
+                        }
+                    }
+                }
+                for (i, a) in args.iter_mut().enumerate() {
+                    let p = param_tys.get(i).cloned().unwrap_or(Type::NoType);
+                    if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type() {
+                        self.type_expr(a, &p);
+                    }
+                    if !p.is_no_type() {
+                        self.adapt(a, &p);
+                    }
+                }
+                self.fill_defaults_and_implicits(tree.span, args, &param_tys, sym, pt);
+                let nparams = if sym.is_none() {
+                    param_tys.len()
+                } else {
+                    self.st.get(sym).params.len().max(param_tys.len())
+                };
+                if args.len() > nparams {
                     self.error(
                         tree.span,
                         format!(
                             "too many arguments: expected {}, found {}",
-                            param_tys.len(),
+                            nparams,
                             args.len()
                         ),
                     );
+                }
+                let method_name = if !sym.is_none() {
+                    self.st.get(sym).name.clone()
+                } else {
+                    fun_name.clone()
+                };
+                if method_name == "::" {
+                    if let Some(a0) = args.first() {
+                        ret = Type::Class {
+                            sym: self.st.list_sym,
+                            args: vec![a0.ty.clone()],
+                        };
+                    }
+                } else if method_name == "apply"
+                    && !sym.is_none()
+                    && self.st.get(self.st.get(sym).owner).name.starts_with("Some")
+                {
+                    if let Some(a0) = args.first() {
+                        ret = Type::Class {
+                            sym: self.st.some_sym,
+                            args: vec![a0.ty.clone()],
+                        };
+                    }
+                } else if method_name == "map" {
+                    if let Some(a0) = args.first() {
+                        if let Type::Function { ret: fr, .. } = &a0.ty {
+                            if let Some(cls) = recv_ty
+                                .as_ref()
+                                .and_then(|t| self.st.class_sym_of(t))
+                                .map(|c| self.collection_root(c))
+                            {
+                                ret = Type::Class {
+                                    sym: cls,
+                                    args: vec![(**fr).clone()],
+                                };
+                            }
+                        }
+                    }
+                } else if method_name == "flatMap" {
+                    if let Some(a0) = args.first() {
+                        if let Type::Function { ret: fr, .. } = &a0.ty {
+                            ret = (**fr).clone();
+                        }
+                    }
+                } else if method_name == "withFilter" {
+                    if let Some(r) = recv_ty {
+                        ret = r;
+                    }
                 }
                 tree.ty = ret;
             }
@@ -1125,6 +1325,124 @@ impl Typer {
                 tree.ty = Type::Error;
             }
         }
+    }
+
+    fn collection_root(&self, id: SymbolId) -> SymbolId {
+        let n = self.st.get(id).name.as_str();
+        if n == "Some" || n == "None$" || n == "None" {
+            self.st.option_sym
+        } else if n == "$colon$colon" || n == "Nil$" || n == "Nil" || n == "::" {
+            self.st.list_sym
+        } else {
+            id
+        }
+    }
+
+    fn elem_type(&self, ty: &Type) -> Option<Type> {
+        match ty {
+            Type::Class { args, .. } if !args.is_empty() => Some(args[0].clone()),
+            Type::ModuleRef(id) => {
+                let name = self.st.get(*id).name.as_str();
+                if name == "Nil$" || name == "None$" {
+                    Some(Type::Nothing)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn infer_method_tparams(
+        &self,
+        method: SymbolId,
+        param_tys: &[Type],
+        arg_tys: &[Type],
+    ) -> Vec<(SymbolId, Type)> {
+        let tps = self.st.get(method).tparams.clone();
+        let mut out = Vec::new();
+        for tp in tps {
+            if let Some(t) = unify_tparam(tp, param_tys, arg_tys) {
+                out.push((tp, t));
+            }
+        }
+        out
+    }
+
+    fn fill_defaults_and_implicits(
+        &mut self,
+        span: Span,
+        args: &mut Vec<Tree>,
+        param_tys: &[Type],
+        sym: SymbolId,
+        pt: &Type,
+    ) {
+        if sym.is_none() {
+            return;
+        }
+        let params = self.st.get(sym).params.clone();
+        if args.len() >= params.len() {
+            return;
+        }
+        let rest = if args.len() < params.len() {
+            params[args.len()..].to_vec()
+        } else {
+            return;
+        };
+        let all_implicit = rest.iter().all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT));
+        let all_default = rest
+            .iter()
+            .all(|p| self.st.get(*p).flags.contains(Flags::DEFAULTPARAM));
+        if all_implicit && !matches!(pt, Type::Method { .. } | Type::Function { .. }) {
+            for (i, pid) in rest.iter().enumerate() {
+                let pty = param_tys
+                    .get(args.len() + i)
+                    .cloned()
+                    .unwrap_or_else(|| self.st.get(*pid).ty.clone());
+                match self.search_implicit(&pty) {
+                    ImplicitSearch::Found(id) => {
+                        let mut r = self.ref_implicit(id, span);
+                        self.adapt(&mut r, &pty);
+                        args.push(r);
+                    }
+                    ImplicitSearch::None => {
+                        self.error(
+                            span,
+                            format!(
+                                "no implicit: could not find implicit value of type {}",
+                                self.st.display_type(&pty)
+                            ),
+                        );
+                    }
+                    ImplicitSearch::Ambiguous(ids) => {
+                        self.error(
+                            span,
+                            format!("ambiguous implicit: {}", self.describe_implicits(&ids)),
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        if all_default {
+            for pid in rest {
+                if let Some(mut rhs) = self.st.get(pid).default_rhs.clone() {
+                    let pty = self.st.get(pid).ty.clone();
+                    self.type_expr(&mut rhs, &pty);
+                    self.adapt(&mut rhs, &pty);
+                    args.push(rhs);
+                }
+            }
+            return;
+        }
+        self.error(
+            span,
+            format!(
+                "not enough arguments: expected {}, found {}",
+                param_tys.len(),
+                args.len()
+            ),
+        );
     }
 
     fn resolve_overload(
@@ -1228,8 +1546,17 @@ impl Typer {
     }
 
     fn arg_score(&self, arg: &Type, param: &Type) -> Option<i32> {
+        if let Type::ByName(inner) = param {
+            return self.arg_score(arg, inner);
+        }
         if self.st.is_sub_type(arg, param) {
             return Some(if arg == param { 10 } else { 5 });
+        }
+        if matches!(arg, Type::Function { .. }) && matches!(param, Type::Function { .. }) {
+            return Some(8);
+        }
+        if matches!(param, Type::TypeParam(_)) || matches!(arg, Type::TypeParam(_)) {
+            return Some(2);
         }
         if numeric_widen(arg, param).is_some() {
             return Some(3);
@@ -1490,11 +1817,12 @@ impl Typer {
                 if let Some(id) = found.into_iter().find(|s| {
                     matches!(
                         self.st.get(*s).kind,
-                        SymKind::Class | SymKind::ModuleClass | SymKind::Module
+                        SymKind::Class | SymKind::ModuleClass | SymKind::Module | SymKind::TypeParam
                     )
                 }) {
                     match self.st.get(id).kind {
                         SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
+                        SymKind::TypeParam => Type::TypeParam(id),
                         _ => Type::Class {
                             sym: id,
                             args: args.to_vec(),
@@ -1530,6 +1858,53 @@ impl Typer {
         }
         if matches!(pt, Type::Any | Type::AnyRef | Type::AnyVal) {
             return;
+        }
+        if let Type::ByName(inner) = pt {
+            if !matches!(&tree.kind, TreeKind::Function { .. }) {
+                let span = tree.span;
+                let inner_tree = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+                *tree = Tree {
+                    id: inner_tree.id,
+                    span,
+                    kind: TreeKind::Function {
+                        vparams: vec![],
+                        body: Box::new(inner_tree),
+                    },
+                    ty: Type::Function {
+                        params: vec![],
+                        ret: inner.clone(),
+                    },
+                    sym: SymbolId::NONE,
+                };
+            }
+            return;
+        }
+        match self.search_conversion(&tree.ty, pt) {
+            ImplicitSearch::Found(id) => {
+                let span = tree.span;
+                let arg = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+                let fun = self.ref_implicit(id, span);
+                *tree = Tree {
+                    id: arg.id,
+                    span,
+                    kind: TreeKind::Apply {
+                        fun: Box::new(fun),
+                        args: vec![arg],
+                    },
+                    ty: pt.clone(),
+                    sym: id,
+                };
+                return;
+            }
+            ImplicitSearch::Ambiguous(ids) => {
+                self.error(
+                    tree.span,
+                    format!("ambiguous implicit: {}", self.describe_implicits(&ids)),
+                );
+                tree.ty = Type::Error;
+                return;
+            }
+            ImplicitSearch::None => {}
         }
         self.error(
             tree.span,
@@ -1586,6 +1961,56 @@ fn lub(a: &Type, b: &Type) -> Type {
         return a.clone();
     }
     Type::Any
+}
+
+fn unify_tparam(tp: SymbolId, params: &[Type], args: &[Type]) -> Option<Type> {
+    for (p, a) in params.iter().zip(args) {
+        if let Some(t) = unify_one(tp, p, a) {
+            return Some(t);
+        }
+    }
+    None
+}
+
+fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
+    match pattern {
+        Type::TypeParam(id) if *id == tp => Some(actual.clone()),
+        Type::Class { args: pas, .. } => {
+            if let Type::Class { args: aas, .. } = actual {
+                for (p, a) in pas.iter().zip(aas) {
+                    if let Some(t) = unify_one(tp, p, a) {
+                        return Some(t);
+                    }
+                }
+            }
+            None
+        }
+        Type::Function { params, ret } => {
+            if let Type::Function {
+                params: aps,
+                ret: ar,
+            } = actual
+            {
+                for (p, a) in params.iter().zip(aps) {
+                    if let Some(t) = unify_one(tp, p, a) {
+                        return Some(t);
+                    }
+                }
+                unify_one(tp, ret, ar)
+            } else {
+                None
+            }
+        }
+        Type::Array(p) => match actual {
+            Type::Array(a) => unify_one(tp, p, a),
+            _ => None,
+        },
+        Type::ByName(p) => match actual {
+            Type::ByName(a) => unify_one(tp, p, a),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 impl Typer {

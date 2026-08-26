@@ -1,19 +1,14 @@
 //! Walk a typed compilation unit and emit JVM classfiles (major 50).
 
 use crate::classfile::{
-    ClassEmit, Field, Method, Pool, ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE,
-    ACC_PUBLIC, ACC_STATIC, ACC_SUPER,
+    ClassEmit, EmittedClass, Field, Method, Pool, ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE,
+    ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC,
 };
 use crate::code::Assembler;
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{Intrinsic, SymKind, SymbolTable};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-
-pub struct EmittedClass {
-    /// e.g. `"Main"`, `"Main$"`, `"Point"`
-    pub internal_name: String,
-    pub bytes: Vec<u8>,
-}
 
 /// Walk a typed compilation unit and emit classes.
 pub fn emit(tree: &Tree, st: &SymbolTable, source_name: &str) -> Vec<EmittedClass> {
@@ -21,8 +16,11 @@ pub fn emit(tree: &Tree, st: &SymbolTable, source_name: &str) -> Vec<EmittedClas
         st,
         source_name,
         out: Vec::new(),
+        extras: RefCell::new(Vec::new()),
+        lambda_n: Cell::new(0),
     };
     g.walk(tree);
+    g.out.append(&mut g.extras.borrow_mut());
     g.out
 }
 
@@ -30,6 +28,8 @@ struct Gen<'a> {
     st: &'a SymbolTable,
     source_name: &'a str,
     out: Vec<EmittedClass>,
+    extras: RefCell<Vec<EmittedClass>>,
+    lambda_n: Cell<u32>,
 }
 
 struct EmitCtx<'a> {
@@ -37,6 +37,11 @@ struct EmitCtx<'a> {
     class_sym: SymbolId,
     class_name: &'a str,
     ret_ty: Type,
+    extras: &'a RefCell<Vec<EmittedClass>>,
+    lambda_n: &'a Cell<u32>,
+    source: &'a str,
+    /// If generating inside a lambda, field on the lambda class holding the outer `this`.
+    outer: Option<(&'a str, &'a str, &'a str)>, // (lambda_class, field, outer_desc)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,7 +212,8 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::Function { params, .. } => format!("Lscala/Function{};", params.len()),
         Type::Tuple(ts) => format!("Lscala/Tuple{};", ts.len()),
         Type::Method { ret, .. } => jvm_desc(st, ret),
-        Type::ByName(t) => jvm_desc(st, t),
+        Type::ByName(_) => "Lscala/Function0;".into(),
+        Type::TypeParam(_) => "Ljava/lang/Object;".into(),
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
             format!("[{}", jvm_desc(st, &args[0]))
         }
@@ -510,10 +516,20 @@ impl<'a> Gen<'a> {
                 });
             }
         }
-
+        if impl_.body.iter().any(|s| match &s.kind {
+            TreeKind::ValDef { mods, .. } => mods.flags.contains(Flags::LAZY),
+            _ => false,
+        }) {
+            b.fields.push(Field {
+                access: ACC_PRIVATE,
+                name: "bitmap$0".into(),
+                desc: "I".into(),
+            });
+        }
         if !is_trait {
             self.emit_class_ctor(&mut b, class_id, vparamss, &impl_.body);
         }
+        self.emit_lazy_accessors(&mut b, class_id, &impl_.body);
         for stt in &impl_.body {
             if matches!(stt.kind, TreeKind::DefDef { .. }) {
                 self.emit_def(&mut b, class_id, stt);
@@ -566,6 +582,9 @@ impl<'a> Gen<'a> {
             .filter(|t| matches!(t.kind, TreeKind::ValDef { .. }))
             .collect();
         let max_locals = frame.next_slot;
+        let extras = &self.extras;
+        let lambda_n = &self.lambda_n;
+        let source = self.source_name;
         b.add_code(ACC_PUBLIC, "<init>", &desc, max_locals, |asm| {
             let mut frame = frame;
             asm.aload(0);
@@ -583,10 +602,14 @@ impl<'a> Gen<'a> {
                 class_sym: class_id,
                 class_name: &class_name,
                 ret_ty: Type::Unit,
+                extras,
+                lambda_n,
+                source,
+                outer: None,
             };
             for vd in &inits {
-                if let TreeKind::ValDef { name, rhs, .. } = &vd.kind {
-                    if rhs.is_empty() {
+                if let TreeKind::ValDef { name, mods, rhs, .. } = &vd.kind {
+                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
                         continue;
                     }
                     asm.aload(0);
@@ -639,6 +662,9 @@ impl<'a> Gen<'a> {
         let st = self.st;
         let max_locals = frame.next_slot;
         let ret_for_body = ret.clone();
+        let extras = &self.extras;
+        let lambda_n = &self.lambda_n;
+        let source = self.source_name;
         b.add_code(acc, name, &desc, max_locals, |asm| {
             let mut frame = frame;
             let ctx = EmitCtx {
@@ -646,6 +672,10 @@ impl<'a> Gen<'a> {
                 class_sym: class_id,
                 class_name: &class_name,
                 ret_ty: ret_for_body.clone(),
+                extras,
+                lambda_n,
+                source,
+                outer: None,
             };
             gen_expr(asm, &mut frame, &ctx, rhs);
             if is_unit_like(&ret_for_body) {
@@ -655,6 +685,77 @@ impl<'a> Gen<'a> {
                 emit_return(asm, &ret_for_body);
             }
         });
+    }
+
+    fn emit_lazy_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
+        let mut bit = 0i32;
+        for stt in body {
+            let TreeKind::ValDef { name, mods, rhs, .. } = &stt.kind else {
+                continue;
+            };
+            if !mods.flags.contains(Flags::LAZY) || rhs.is_empty() {
+                continue;
+            }
+            let ty = if stt.ty.is_no_type() && !stt.sym.is_none() {
+                self.st.get(stt.sym).ty.clone()
+            } else {
+                stt.ty.clone()
+            };
+            let desc = format!("(){}", jvm_desc(self.st, &ty));
+            let class_name = b.this_name.clone();
+            let fname = name.clone();
+            let fdesc = jvm_desc(self.st, &ty);
+            let st = self.st;
+            let extras = &self.extras;
+            let lambda_n = &self.lambda_n;
+            let source = self.source_name;
+            let rhs = rhs.clone();
+            let mask = 1i32 << bit;
+            bit += 1;
+            let ret_ty = ty.clone();
+            b.add_code(ACC_PUBLIC, &fname, &desc, 4, |asm| {
+                let mut frame = Frame::instance();
+                let lock = frame.alloc_tmp(JvmSort::Ref);
+                let result = frame.alloc_tmp(jvm_sort(&ret_ty));
+                asm.aload(0);
+                store(asm, lock, JvmSort::Ref);
+                load(asm, lock, JvmSort::Ref);
+                asm.monitorenter();
+                asm.aload(0);
+                asm.getfield(&class_name, "bitmap$0", "I");
+                asm.iconst(mask);
+                asm.iand();
+                let inited = asm.fresh_label();
+                asm.ifne(inited);
+                let ctx = EmitCtx {
+                    st,
+                    class_sym: class_id,
+                    class_name: &class_name,
+                    ret_ty: ret_ty.clone(),
+                    extras,
+                    lambda_n,
+                    source,
+                    outer: None,
+                };
+                asm.aload(0);
+                gen_expr(asm, &mut frame, &ctx, &rhs);
+                asm.putfield(&class_name, &fname, &fdesc);
+                asm.aload(0);
+                asm.aload(0);
+                asm.getfield(&class_name, "bitmap$0", "I");
+                asm.iconst(mask);
+                asm.ior();
+                asm.putfield(&class_name, "bitmap$0", "I");
+                asm.mark(inited);
+                asm.aload(0);
+                asm.getfield(&class_name, &fname, &fdesc);
+                store(asm, result, jvm_sort(&ret_ty));
+                load(asm, lock, JvmSort::Ref);
+                asm.monitorexit();
+                load(asm, result, jvm_sort(&ret_ty));
+                emit_return(asm, &ret_ty);
+            });
+        }
     }
 
     fn emit_module(&mut self, tree: &Tree, class_names: &HashSet<String>) {
@@ -695,9 +796,20 @@ impl<'a> Gen<'a> {
                 });
             }
         }
+        if impl_.body.iter().any(|s| match &s.kind {
+            TreeKind::ValDef { mods, .. } => mods.flags.contains(Flags::LAZY),
+            _ => false,
+        }) {
+            b.fields.push(Field {
+                access: ACC_PRIVATE,
+                name: "bitmap$0".into(),
+                desc: "I".into(),
+            });
+        }
 
         self.emit_module_init(&mut b, cls, &impl_.body);
         self.emit_module_clinit(&mut b);
+        self.emit_lazy_accessors(&mut b, cls, &impl_.body);
 
         let mut forwarded: Vec<(String, String, Type, Vec<Type>)> = Vec::new();
         for stt in &impl_.body {
@@ -751,6 +863,9 @@ impl<'a> Gen<'a> {
             .iter()
             .filter(|t| matches!(t.kind, TreeKind::ValDef { .. }))
             .collect();
+        let extras = &self.extras;
+        let lambda_n = &self.lambda_n;
+        let source = self.source_name;
         b.add_code(ACC_PRIVATE, "<init>", "()V", 1, |asm| {
             let mut frame = Frame::instance();
             asm.aload(0);
@@ -762,10 +877,14 @@ impl<'a> Gen<'a> {
                 class_sym: class_id,
                 class_name: &class_name,
                 ret_ty: Type::Unit,
+                extras,
+                lambda_n,
+                source,
+                outer: None,
             };
             for vd in &inits {
-                if let TreeKind::ValDef { name, rhs, .. } = &vd.kind {
-                    if rhs.is_empty() {
+                if let TreeKind::ValDef { name, mods, rhs, .. } = &vd.kind {
+                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
                         continue;
                     }
                     asm.aload(0);
@@ -995,11 +1114,12 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
     match &tree.kind {
         TreeKind::Empty => {}
         TreeKind::Literal { lit } => gen_literal(asm, lit),
-        TreeKind::This { .. } => asm.aload(0),
+        TreeKind::This { .. } => load_this(asm, ctx),
         TreeKind::Ident { .. } => gen_ident(asm, frame, ctx, tree),
         TreeKind::Select { qual, name } => gen_select(asm, frame, ctx, tree, qual, name),
         TreeKind::Apply { fun, args } => gen_apply(asm, frame, ctx, tree, fun, args),
         TreeKind::TypeApply { fun, .. } => gen_expr(asm, frame, ctx, fun),
+        TreeKind::Function { .. } => gen_function(asm, frame, ctx, tree),
         TreeKind::Typed { expr, .. } => {
             gen_expr(asm, frame, ctx, expr);
             // optional checkcast to a class type
@@ -1092,6 +1212,15 @@ fn gen_literal(asm: &mut Assembler, lit: &Lit) {
     }
 }
 
+fn load_this(asm: &mut Assembler, ctx: &EmitCtx) {
+    if let Some((lclass, field, desc)) = ctx.outer {
+        asm.aload(0);
+        asm.getfield(lclass, field, desc);
+    } else {
+        asm.aload(0);
+    }
+}
+
 fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
     let id = tree.sym;
     if id.is_none() {
@@ -1107,11 +1236,18 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
         return;
     }
     let sym = ctx.st.get(id);
+    if sym.flags.contains(Flags::LAZY) && sym.kind == SymKind::Term {
+        load_this(asm, ctx);
+        let owner = class_internal(ctx.st, sym.owner);
+        let desc = format!("(){}", jvm_desc(ctx.st, &sym.ty));
+        asm.invokevirtual(&owner, &sym.name, &desc);
+        return;
+    }
     match sym.kind {
         SymKind::Term => {
             let owner = class_internal(ctx.st, sym.owner);
             let desc = jvm_desc(ctx.st, &sym.ty);
-            asm.aload(0);
+            load_this(asm, ctx);
             asm.getfield(&owner, &sym.name, &desc);
         }
         SymKind::Module | SymKind::ModuleClass => {
@@ -1123,8 +1259,7 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
             asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
         }
         SymKind::Method => {
-            // parameterless / empty-clause call on this
-            asm.aload(0);
+            load_this(asm, ctx);
             invoke_method(asm, ctx, id);
         }
         _ => {
@@ -1149,6 +1284,13 @@ fn gen_select(
     }
     if !tree.sym.is_none() {
         let s = ctx.st.get(tree.sym);
+        if s.flags.contains(Flags::LAZY) && s.kind == SymKind::Term {
+            gen_expr(asm, frame, ctx, qual);
+            let owner = class_internal(ctx.st, s.owner);
+            let desc = format!("(){}", jvm_desc(ctx.st, &s.ty));
+            asm.invokevirtual(&owner, &s.name, &desc);
+            return;
+        }
         match s.kind {
             SymKind::Term => {
                 gen_expr(asm, frame, ctx, qual);
@@ -1169,7 +1311,6 @@ fn gen_select(
             _ => {}
         }
     }
-    // field by name on qualifier's class
     if let Some(cid) = ctx.st.class_sym_of(&qual.ty) {
         gen_expr(asm, frame, ctx, qual);
         let owner = class_internal(ctx.st, cid);
@@ -1192,7 +1333,7 @@ fn gen_assign(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, lhs: &Tree,
             }
             if !id.is_none() {
                 let s = ctx.st.get(id);
-                asm.aload(0);
+                load_this(asm, ctx);
                 gen_expr(asm, frame, ctx, rhs);
                 asm.putfield(
                     &class_internal(ctx.st, s.owner),
@@ -1319,6 +1460,32 @@ fn gen_apply(
     }
     if matches!(ic, Intrinsic::Print) || fun.name() == Some("print") {
         gen_println(asm, frame, ctx, args, false);
+        return;
+    }
+
+    if fun.name() == Some("$box") {
+        if let Some(a) = args.first() {
+            gen_expr(asm, frame, ctx, a);
+            emit_box(asm, &a.ty);
+        } else {
+            asm.aconst_null();
+        }
+        return;
+    }
+    if fun.name() == Some("$unbox") {
+        if let Some(a) = args.first() {
+            gen_expr(asm, frame, ctx, a);
+            emit_unbox(asm, &tree.ty);
+        } else {
+            push_default(asm, &tree.ty);
+        }
+        return;
+    }
+
+    if matches!(&fun.ty, Type::Function { .. })
+        || (fun.sym.is_none() && matches!(&tree.kind, TreeKind::Apply { .. }) && matches!(&fun.ty, Type::Function { .. }))
+    {
+        gen_function_apply(asm, frame, ctx, fun, args, &tree.ty);
         return;
     }
 
@@ -1450,6 +1617,12 @@ fn gen_apply(
         }
     }
 
+    // Function value apply (erased to FunctionN.apply)
+    if matches!(&fun.ty, Type::Function { .. }) {
+        gen_function_apply(asm, frame, ctx, fun, args, &tree.ty);
+        return;
+    }
+
     // regular method / apply
     if fun.sym.is_none() {
         throw_runtime(asm, "unresolved apply");
@@ -1471,18 +1644,17 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
         }
         _ => {
             if fun.sym.is_none() {
-                asm.aload(0);
+                load_this(asm, ctx);
                 return;
             }
             let owner = ctx.st.get(fun.sym).owner;
             if owner == ctx.class_sym || owner.is_none() {
-                asm.aload(0);
+                load_this(asm, ctx);
             } else if is_module_class(ctx.st, owner) {
                 let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
             } else {
-                // method on current instance (nested owner mismatch)
-                asm.aload(0);
+                load_this(asm, ctx);
             }
         }
     }
@@ -1498,6 +1670,359 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     } else {
         asm.invokevirtual(&owner, &s.name, &desc);
     }
+}
+
+fn emit_box(asm: &mut Assembler, ty: &Type) {
+    match ty {
+        Type::Int => {
+            asm.invokestatic("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;");
+        }
+        Type::Boolean => {
+            asm.invokestatic("java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;");
+        }
+        Type::Long => {
+            asm.invokestatic("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;");
+        }
+        Type::Double => {
+            asm.invokestatic("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;");
+        }
+        Type::Char => {
+            asm.invokestatic("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;");
+        }
+        Type::Float => {
+            asm.invokestatic("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;");
+        }
+        Type::Unit | Type::NoType => {
+            asm.aconst_null();
+        }
+        _ => {}
+    }
+}
+
+fn emit_unbox(asm: &mut Assembler, ty: &Type) {
+    match ty {
+        Type::Int => {
+            asm.checkcast("java/lang/Integer");
+            asm.invokevirtual("java/lang/Integer", "intValue", "()I");
+        }
+        Type::Boolean => {
+            asm.checkcast("java/lang/Boolean");
+            asm.invokevirtual("java/lang/Boolean", "booleanValue", "()Z");
+        }
+        Type::Long => {
+            asm.checkcast("java/lang/Long");
+            asm.invokevirtual("java/lang/Long", "longValue", "()J");
+        }
+        Type::Double => {
+            asm.checkcast("java/lang/Double");
+            asm.invokevirtual("java/lang/Double", "doubleValue", "()D");
+        }
+        Type::Char => {
+            asm.checkcast("java/lang/Character");
+            asm.invokevirtual("java/lang/Character", "charValue", "()C");
+        }
+        Type::Float => {
+            asm.checkcast("java/lang/Float");
+            asm.invokevirtual("java/lang/Float", "floatValue", "()F");
+        }
+        Type::String => {
+            asm.checkcast("java/lang/String");
+        }
+        Type::Class { .. } | Type::ModuleRef(_) => {
+            // leave as Object; checkcast when we have an internal name
+        }
+        Type::Unit | Type::NoType => {
+            asm.pop();
+        }
+        _ => {}
+    }
+}
+
+fn gen_function_apply(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    fun: &Tree,
+    args: &[Tree],
+    result_ty: &Type,
+) {
+    gen_expr(asm, frame, ctx, fun);
+    let n = match &fun.ty {
+        Type::Function { params, .. } => params.len(),
+        _ => args.len(),
+    };
+    let param_tys = match &fun.ty {
+        Type::Function { params, .. } => params.clone(),
+        _ => args.iter().map(|a| a.ty.clone()).collect(),
+    };
+    for (i, a) in args.iter().enumerate() {
+        gen_expr(asm, frame, ctx, a);
+        let pty = param_tys.get(i).unwrap_or(&a.ty);
+        if is_jvm_primitive(pty) || is_jvm_primitive(&a.ty) {
+            emit_box(asm, &a.ty);
+        }
+    }
+    let iface = format!("scala/Function{n}");
+    let mut desc = String::from("(");
+    for _ in 0..n {
+        desc.push_str("Ljava/lang/Object;");
+    }
+    desc.push_str(")Ljava/lang/Object;");
+    asm.invokeinterface(&iface, "apply", &desc);
+    if is_jvm_primitive(result_ty) {
+        emit_unbox(asm, result_ty);
+    } else if matches!(result_ty, Type::String) {
+        emit_unbox(asm, result_ty);
+    } else if let Type::Class { sym, .. } = result_ty {
+        let n = class_internal(ctx.st, *sym);
+        if !n.is_empty() {
+            asm.checkcast(&n);
+        }
+    }
+}
+
+fn is_jvm_primitive(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Int | Type::Long | Type::Double | Type::Boolean | Type::Char | Type::Float | Type::Unit
+    )
+}
+
+fn collect_free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>, st: &SymbolTable) {
+    match &tree.kind {
+        TreeKind::Ident { .. } => {
+            if !tree.sym.is_none() && !bound.contains(&tree.sym) {
+                let s = st.get(tree.sym);
+                if s.kind == SymKind::Term && !out.contains(&tree.sym) {
+                    out.push(tree.sym);
+                }
+            }
+        }
+        TreeKind::Function { vparams, body } => {
+            let mut b = bound.clone();
+            for p in vparams {
+                if !p.sym.is_none() {
+                    b.insert(p.sym);
+                }
+            }
+            collect_free(body, &b, out, st);
+        }
+        TreeKind::Select { qual, .. } => collect_free(qual, bound, out, st),
+        TreeKind::Apply { fun, args } => {
+            collect_free(fun, bound, out, st);
+            for a in args {
+                collect_free(a, bound, out, st);
+            }
+        }
+        TreeKind::Block { stats, expr } => {
+            let mut b = bound.clone();
+            for s in stats {
+                if let TreeKind::ValDef { .. } = &s.kind {
+                    if !s.sym.is_none() {
+                        b.insert(s.sym);
+                    }
+                }
+                collect_free(s, &b, out, st);
+            }
+            collect_free(expr, &b, out, st);
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            collect_free(cond, bound, out, st);
+            collect_free(thenp, bound, out, st);
+            collect_free(elsep, bound, out, st);
+        }
+        TreeKind::ValDef { rhs, .. } => collect_free(rhs, bound, out, st),
+        TreeKind::Assign { lhs, rhs } => {
+            collect_free(lhs, bound, out, st);
+            collect_free(rhs, bound, out, st);
+        }
+        TreeKind::Typed { expr, .. } | TreeKind::TypeApply { fun: expr, .. } => {
+            collect_free(expr, bound, out, st);
+        }
+        TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
+            collect_free(cond, bound, out, st);
+            collect_free(body, bound, out, st);
+        }
+        TreeKind::Match { selector, cases } => {
+            collect_free(selector, bound, out, st);
+            for c in cases {
+                collect_free(&c.pat, bound, out, st);
+                collect_free(&c.body, bound, out, st);
+                collect_free(&c.guard, bound, out, st);
+            }
+        }
+        TreeKind::InterpolatedString { args, .. } => {
+            for a in args {
+                collect_free(a, bound, out, st);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
+    let (vparams, body) = match &tree.kind {
+        TreeKind::Function { vparams, body } => (vparams, body),
+        _ => return,
+    };
+    let n = ctx.lambda_n.get();
+    ctx.lambda_n.set(n + 1);
+    let lam_name = format!("{}$$anonfun${}", ctx.class_name.replace('/', "$"), n);
+    let arity = vparams.len();
+    let iface = format!("scala/Function{arity}");
+
+    let mut bound = HashSet::new();
+    for p in vparams {
+        if !p.sym.is_none() {
+            bound.insert(p.sym);
+        }
+    }
+    let mut free = Vec::new();
+    collect_free(body, &bound, &mut free, ctx.st);
+
+    let mut local_caps = Vec::new();
+    let mut need_outer = false;
+    for id in &free {
+        if frame.get(*id).is_some() {
+            local_caps.push(*id);
+        } else {
+            need_outer = true;
+        }
+    }
+
+    // Create instance: new, dup, load captures, invokespecial
+    asm.new_obj(&lam_name);
+    asm.dup();
+    let mut ctor_desc = String::from("(");
+    if need_outer {
+        load_this(asm, ctx);
+        ctor_desc.push_str(&format!("L{};", ctx.class_name));
+    }
+    for id in &local_caps {
+        let (slot, sort) = frame.get(*id).unwrap();
+        load(asm, slot, sort);
+        let ty = ctx.st.get(*id).ty.clone();
+        // capture as Object
+        if is_jvm_primitive(&ty) {
+            emit_box(asm, &ty);
+        }
+        ctor_desc.push_str("Ljava/lang/Object;");
+    }
+    ctor_desc.push_str(")V");
+    asm.invokespecial(&lam_name, "<init>", &ctor_desc);
+
+    // Emit the lambda class
+    let mut b = ClassBuilder::new(lam_name.clone(), ctx.source);
+    b.access = ACC_PUBLIC | ACC_SUPER | ACC_SYNTHETIC | ACC_FINAL;
+    b.interfaces.push(iface);
+    if need_outer {
+        b.fields.push(Field {
+            access: ACC_PUBLIC,
+            name: "$outer".into(),
+            desc: format!("L{};", ctx.class_name),
+        });
+    }
+    for (i, _) in local_caps.iter().enumerate() {
+        b.fields.push(Field {
+            access: ACC_PUBLIC,
+            name: format!("$captured${i}"),
+            desc: "Ljava/lang/Object;".into(),
+        });
+    }
+    let cap_n = local_caps.len();
+    let class_name_owned = ctx.class_name.to_string();
+    let need_outer_c = need_outer;
+    b.add_code(ACC_PUBLIC, "<init>", &ctor_desc, 1 + 1 + cap_n as u16, |a| {
+        a.aload(0);
+        a.invokespecial("java/lang/Object", "<init>", "()V");
+        let mut slot = 1u16;
+        if need_outer_c {
+            a.aload(0);
+            a.aload(slot);
+            a.putfield(&lam_name, "$outer", &format!("L{class_name_owned};"));
+            slot += 1;
+        }
+        for i in 0..cap_n {
+            a.aload(0);
+            a.aload(slot);
+            a.putfield(&lam_name, &format!("$captured${i}"), "Ljava/lang/Object;");
+            slot += 1;
+        }
+        a.vreturn();
+    });
+
+    let mut apply_desc = String::from("(");
+    for _ in 0..arity {
+        apply_desc.push_str("Ljava/lang/Object;");
+    }
+    apply_desc.push_str(")Ljava/lang/Object;");
+
+    let st = ctx.st;
+    let extras = ctx.extras;
+    let lambda_n = ctx.lambda_n;
+    let source = ctx.source;
+    let class_sym = ctx.class_sym;
+    let orig_class = ctx.class_name.to_string();
+    let lam_name2 = lam_name.clone();
+    let outer_desc = format!("L{orig_class};");
+    let vparams = vparams.clone();
+    let body = body.clone();
+    let local_caps = local_caps.clone();
+    let ret_ty = match &tree.ty {
+        Type::Function { ret, .. } => (**ret).clone(),
+        t => t.clone(),
+    };
+
+    b.add_code(ACC_PUBLIC, "apply", &apply_desc, 8, |a| {
+        let mut fr = Frame::instance();
+        fr.next_slot = 1 + arity as u16;
+        // apply args occupy slots 1..arity as Object; remap param symbols after unbox
+        for (i, p) in vparams.iter().enumerate() {
+            let obj_slot = 1 + i as u16;
+            a.aload(obj_slot);
+            emit_unbox(a, &p.ty);
+            let sort = jvm_sort(&p.ty);
+            let slot = fr.alloc(p.sym, sort);
+            store(a, slot, sort);
+        }
+        for (i, id) in local_caps.iter().enumerate() {
+            let ty = st.get(*id).ty.clone();
+            a.aload(0);
+            a.getfield(&lam_name2, &format!("$captured${i}"), "Ljava/lang/Object;");
+            if is_jvm_primitive(&ty) {
+                emit_unbox(a, &ty);
+            }
+            let sort = jvm_sort(&ty);
+            let slot = fr.alloc(*id, sort);
+            store(a, slot, sort);
+        }
+        let outer_storage;
+        let outer_ref = if need_outer {
+            outer_storage = (lam_name2.as_str(), "$outer", outer_desc.as_str());
+            Some(outer_storage)
+        } else {
+            None
+        };
+        let inner_ctx = EmitCtx {
+            st,
+            class_sym,
+            class_name: &orig_class,
+            ret_ty: ret_ty.clone(),
+            extras,
+            lambda_n,
+            source,
+            outer: outer_ref,
+        };
+        gen_expr(a, &mut fr, &inner_ctx, &body);
+        if is_unit_like(&ret_ty) {
+            pop_if_value(a, &body.ty);
+            emit_box(a, &Type::Unit);
+        } else {
+            emit_box(a, &ret_ty);
+        }
+        a.areturn();
+    });
+    ctx.extras.borrow_mut().push(b.finish());
 }
 
 fn gen_println(

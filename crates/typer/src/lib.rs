@@ -1,8 +1,11 @@
 mod check;
+mod erasure;
+mod implicits;
 mod prelude;
 mod symbol;
 
 pub use check::{find_mains, has_errors, typecheck, Typer};
+pub use erasure::{erase, erase_type};
 pub use symbol::{Intrinsic, Symbol, SymbolTable, SymKind};
 
 use scala_rs_parser::{parse_str, Tree};
@@ -135,5 +138,114 @@ object Main {
         let (t, st, diags) = typecheck_str("object M { val x: Int = 1 + 2 }\n");
         assert!(!has_errors(&diags), "{:?}", diags);
         let _ = (t, st, Type::Int);
+    }
+
+    #[test]
+    fn generic_id_typechecks() {
+        ok(
+            r#"
+object Main {
+  def id[T](x: T): T = x
+  def main(args: Array[String]): Unit = {
+    val n: Int = id(42)
+    val s: String = id("hi")
+  }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn list_for_typechecks() {
+        ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val xs = 1 :: 2 :: Nil
+    val ys = for (x <- xs) yield x + 1
+  }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn implicit_param_and_conversion() {
+        ok(
+            r#"
+class RichInt(val n: Int) {
+  def doubled: Int = n * 2
+}
+object RichInt {
+  implicit def toRich(n: Int): RichInt = new RichInt(n)
+}
+object Main {
+  implicit val extra: Int = 10
+  def add(x: Int)(implicit y: Int): Int = x + y
+  def main(args: Array[String]): Unit = {
+    val n: Int = add(5)
+    val r: RichInt = 7
+  }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn no_implicit() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def add(x: Int)(implicit y: Int): Int = x + y
+  def main(args: Array[String]): Unit = {
+    val n: Int = add(5)
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("no implicit")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ambiguous_implicit() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  implicit val a: Int = 1
+  implicit val b: Int = 2
+  def add(x: Int)(implicit y: Int): Int = x + y
+  def main(args: Array[String]): Unit = {
+    val n: Int = add(5)
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("ambiguous implicit")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn defaults_and_byname_typecheck() {
+        ok(
+            r#"
+object Main {
+  def greet(name: String, punct: String = "!"): String = name + punct
+  def twice(x: => Int): Int = x + x
+  def main(args: Array[String]): Unit = {
+    val s: String = greet("A")
+    val n: Int = twice(1)
+  }
+}
+"#,
+        );
     }
 }
