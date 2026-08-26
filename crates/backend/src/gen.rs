@@ -1876,7 +1876,7 @@ fn load(asm: &mut Assembler, slot: u16, sort: JvmSort) {
         JvmSort::Int => asm.iload(slot),
         JvmSort::Long => asm.lload(slot),
         JvmSort::Double => asm.dload(slot),
-        JvmSort::Float => asm.iload(slot),
+        JvmSort::Float => asm.fload(slot),
         JvmSort::Ref => asm.aload(slot),
         JvmSort::Void => {}
     }
@@ -1887,7 +1887,7 @@ fn store(asm: &mut Assembler, slot: u16, sort: JvmSort) {
         JvmSort::Int => asm.istore(slot),
         JvmSort::Long => asm.lstore(slot),
         JvmSort::Double => asm.dstore(slot),
-        JvmSort::Float => asm.istore(slot),
+        JvmSort::Float => asm.fstore(slot),
         JvmSort::Ref => asm.astore(slot),
         JvmSort::Void => {}
     }
@@ -1907,7 +1907,7 @@ fn emit_return(asm: &mut Assembler, ty: &Type) {
         JvmSort::Int => asm.ireturn(),
         JvmSort::Long => asm.lreturn(),
         JvmSort::Double => asm.dreturn(),
-        JvmSort::Float => asm.ireturn(),
+        JvmSort::Float => asm.freturn(),
         JvmSort::Ref => asm.areturn(),
     }
 }
@@ -1937,7 +1937,7 @@ fn push_default(asm: &mut Assembler, ty: &Type) {
         JvmSort::Int => asm.iconst(0),
         JvmSort::Long => asm.lconst(0),
         JvmSort::Double => asm.dconst(0.0),
-        JvmSort::Float => asm.iconst(0),
+        JvmSort::Float => asm.fconst(0.0),
         JvmSort::Ref => asm.aconst_null(),
     }
 }
@@ -2086,7 +2086,7 @@ fn gen_literal(asm: &mut Assembler, lit: &Lit) {
         Lit::Boolean(b) => asm.iconst(if *b { 1 } else { 0 }),
         Lit::Int(n) => asm.iconst(*n),
         Lit::Long(n) => asm.lconst(*n),
-        Lit::Float(_) => asm.iconst(0),
+        Lit::Float(n) => asm.fconst(*n),
         Lit::Double(n) => asm.dconst(*n),
         Lit::Char(c) => asm.iconst(*c as i32),
         Lit::String(s) => asm.ldc_string(s),
@@ -2650,6 +2650,11 @@ fn gen_apply(
                 asm.dneg();
                 return;
             }
+            Intrinsic::FloatUn("-") => {
+                gen_expr(asm, frame, ctx, qual);
+                asm.fneg();
+                return;
+            }
             Intrinsic::BoolBin("&&") => {
                 gen_bool_and(asm, frame, ctx, qual, args.first());
                 return;
@@ -2778,6 +2783,15 @@ fn gen_apply(
             }
         }
     }
+    if let TreeKind::Select { qual, name } = &fun.kind {
+        if name == "apply" && matches!(qual.ty, Type::Array(_)) {
+            asm.aaload();
+            if matches!(tree.ty, Type::String) {
+                asm.checkcast("java/lang/String");
+            }
+            return;
+        }
+    }
     if fun_is_super(fun) {
         invoke_super(asm, ctx, fun.sym);
     } else if value_owner.is_some() {
@@ -2830,6 +2844,15 @@ fn invoke_value_extension(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     if owner == "scala/collection/StringOps" && s.name == "isEmpty" {
         // Same as scalac: StringOps.isEmpty is inlined to String#isEmpty.
         asm.invokevirtual("java/lang/String", "isEmpty", "()Z");
+        return;
+    }
+    if owner == "scala/collection/StringOps" && s.name == "toUpperCase" {
+        // 2.13 StringOps inlines toUpperCase/toLowerCase to String.
+        asm.invokevirtual("java/lang/String", "toUpperCase", "()Ljava/lang/String;");
+        return;
+    }
+    if owner == "scala/collection/StringOps" && s.name == "toLowerCase" {
+        asm.invokevirtual("java/lang/String", "toLowerCase", "()Ljava/lang/String;");
         return;
     }
     if owner == "scala/runtime/RichInt" && s.name == "to" {
@@ -3101,6 +3124,151 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_seq_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Seq$",
+                        "empty",
+                        "()Lscala/collection/SeqOps;",
+                    );
+                    asm.checkcast("scala/collection/immutable/Seq");
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Seq$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/immutable/Seq");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_lazylist_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/LazyList$",
+                        "empty",
+                        "()Lscala/collection/immutable/LazyList;",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/LazyList$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/immutable/LazyList");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_seq(&owner) {
+            match name {
+                "foreach" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokeinterface(
+                        "scala/collection/SeqOps",
+                        "apply",
+                        "(I)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if !is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            let cls = jvm_desc(ctx.st, ty);
+                            if let Some(inner) =
+                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                            {
+                                if inner != "java/lang/Object" {
+                                    asm.checkcast(inner);
+                                }
+                            }
+                        } else if is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            emit_unbox(asm, ty);
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_lazylist(&owner) {
+            match name {
+                "foreach" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/LazyList",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/LazyList",
+                        "apply",
+                        "(I)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            emit_unbox(asm, ty);
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_either(&owner) {
+            match name {
+                "isLeft" => {
+                    asm.invokevirtual("scala/util/Either", "isLeft", "()Z");
+                    return;
+                }
+                "getOrElse" => {
+                    asm.invokevirtual(
+                        "scala/util/Either",
+                        "getOrElse",
+                        "(Lscala/Function0;)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            emit_unbox(asm, ty);
+                        }
+                    }
+                    return;
+                }
+                "map" => {
+                    asm.invokevirtual(
+                        "scala/util/Either",
+                        "map",
+                        "(Lscala/Function1;)Lscala/util/Either;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_either_module(&owner) && name == "apply" {
+            let cls = if owner.ends_with("Left$") {
+                "scala/util/Left"
+            } else {
+                "scala/util/Right"
+            };
+            asm.invokevirtual(&owner, "apply", &format!("(Ljava/lang/Object;)L{cls};"));
+            return;
+        }
         if is_stdlib_map(&owner) {
             match name {
                 "updated" => {
@@ -3307,6 +3475,39 @@ fn is_stdlib_set(owner: &str) -> bool {
 
 fn is_stdlib_set_module(owner: &str) -> bool {
     owner == "scala/collection/immutable/Set$"
+}
+
+fn is_stdlib_seq(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/collection/immutable/Seq" | "scala/collection/Seq"
+    )
+}
+
+fn is_stdlib_seq_module(owner: &str) -> bool {
+    owner == "scala/collection/immutable/Seq$"
+}
+
+fn is_stdlib_lazylist(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/collection/immutable/LazyList" | "scala/collection/immutable/LazyList$Empty$"
+    )
+}
+
+fn is_stdlib_lazylist_module(owner: &str) -> bool {
+    owner == "scala/collection/immutable/LazyList$"
+}
+
+fn is_stdlib_either(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/util/Either" | "scala/util/Left" | "scala/util/Right"
+    )
+}
+
+fn is_stdlib_either_module(owner: &str) -> bool {
+    matches!(owner, "scala/util/Left$" | "scala/util/Right$")
 }
 
 fn gen_wrap_varargs(

@@ -66,6 +66,7 @@ pub struct Pool {
     nat: HashMap<(u16, u16), u16>,
     refs: HashMap<(u8, u16, u16), u16>,
     ints: HashMap<i32, u16>,
+    floats: HashMap<u32, u16>,
     longs: HashMap<i64, u16>,
     doubles: HashMap<u64, u16>,
 }
@@ -128,6 +129,20 @@ impl Pool {
         self.bytes.push(3);
         self.bytes.extend_from_slice(&v.to_be_bytes());
         self.ints.insert(v, i);
+        i
+    }
+
+    /// CONSTANT_Float (tag 4) occupies one pool slot.
+    pub fn float(&mut self, v: f32) -> u16 {
+        let bits = v.to_bits();
+        if let Some(i) = self.floats.get(&bits) {
+            return *i;
+        }
+        let i = self.count;
+        self.count += 1;
+        self.bytes.push(4);
+        self.bytes.extend_from_slice(&bits.to_be_bytes());
+        self.floats.insert(bits, i);
         i
     }
 

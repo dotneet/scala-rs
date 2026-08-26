@@ -393,6 +393,26 @@ fn scala_library_dual_run_long_ops() {
     dual_run_fixture("long_ops");
 }
 
+#[test]
+fn scala_library_dual_run_seq() {
+    dual_run_fixture("seq");
+}
+
+#[test]
+fn scala_library_dual_run_either() {
+    dual_run_fixture("either");
+}
+
+#[test]
+fn scala_library_dual_run_float_ops() {
+    dual_run_fixture("float_ops");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops2() {
+    dual_run_fixture("string_ops2");
+}
+
 const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Option.class",
     "scala/Some.class",
@@ -425,6 +445,16 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/immutable/Range.class",
     "scala/collection/immutable/Set.class",
     "scala/collection/immutable/Set$.class",
+    "scala/collection/immutable/Seq.class",
+    "scala/collection/immutable/Seq$.class",
+    "scala/collection/immutable/LazyList.class",
+    "scala/collection/immutable/LazyList$.class",
+    "scala/runtime/RichFloat.class",
+    "scala/util/Either.class",
+    "scala/util/Left.class",
+    "scala/util/Right.class",
+    "scala/util/Left$.class",
+    "scala/util/Right$.class",
 ];
 
 fn assert_no_private_stdlib(out: &Path) {
