@@ -464,7 +464,7 @@ fn add_any_members(st: &mut SymbolTable) {
         "==",
         vec![Type::Any],
         Type::Boolean,
-        Intrinsic::None,
+        Intrinsic::AnyEq,
     );
     method(
         st,
@@ -472,7 +472,7 @@ fn add_any_members(st: &mut SymbolTable) {
         "!=",
         vec![Type::Any],
         Type::Boolean,
-        Intrinsic::None,
+        Intrinsic::AnyNe,
     );
     method(
         st,

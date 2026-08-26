@@ -3438,6 +3438,10 @@ fn gen_apply(
         gen_eq_ne(asm, frame, ctx, fun, args, matches!(ic, Intrinsic::Eq));
         return;
     }
+    if matches!(ic, Intrinsic::AnyEq | Intrinsic::AnyNe) {
+        gen_any_eq(asm, frame, ctx, fun, args, matches!(ic, Intrinsic::AnyEq));
+        return;
+    }
     if matches!(ic, Intrinsic::Synchronized) {
         gen_synchronized(asm, frame, ctx, fun, args, &tree.ty);
         return;
@@ -4393,10 +4397,6 @@ fn maybe_unbox_erased_result(
     }
     if matches!(ty, Type::String) {
         asm.checkcast("java/lang/String");
-        return;
-    }
-    if let Some(cn) = checkcast_internal(ctx.st, ty) {
-        asm.checkcast(&cn);
         return;
     }
     if let Type::Array(elem) = ty {
@@ -5644,6 +5644,45 @@ fn gen_eq_ne(
         asm.aconst_null();
     }
     emit_ref_eq(asm, eq);
+}
+
+fn gen_any_eq(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    fun: &Tree,
+    args: &[Tree],
+    eq: bool,
+) {
+    let recv_ty = match &fun.kind {
+        TreeKind::Select { qual, .. } => qual.ty.clone(),
+        _ => Type::AnyRef,
+    };
+    gen_receiver(asm, frame, ctx, fun);
+    if is_jvm_primitive(&recv_ty) && !is_unit_like(&recv_ty) {
+        emit_box(asm, &recv_ty);
+    }
+    if let Some(arg) = args.first() {
+        gen_expr(asm, frame, ctx, arg);
+        if is_jvm_primitive(&arg.ty) && !is_unit_like(&arg.ty) {
+            emit_box(asm, &arg.ty);
+        }
+    } else {
+        asm.aconst_null();
+    }
+    if ctx.library_abi {
+        asm.invokestatic(
+            "scala/runtime/BoxesRunTime",
+            "equals",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+        );
+    } else {
+        asm.invokevirtual("java/lang/Object", "equals", "(Ljava/lang/Object;)Z");
+    }
+    if !eq {
+        asm.iconst(1);
+        asm.ixor();
+    }
 }
 
 fn gen_synchronized(

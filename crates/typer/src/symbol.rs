@@ -50,6 +50,10 @@ pub enum Intrinsic {
     Eq,
     /// AnyRef reference inequality (`ne`).
     Ne,
+    /// Universal equality (`Any.==`).
+    AnyEq,
+    /// Universal inequality (`Any.!=`).
+    AnyNe,
     /// `Any.synchronized` (monitor enter/exit around a by-name body).
     Synchronized,
 }
