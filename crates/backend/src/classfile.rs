@@ -66,6 +66,8 @@ pub struct Pool {
     nat: HashMap<(u16, u16), u16>,
     refs: HashMap<(u8, u16, u16), u16>,
     ints: HashMap<i32, u16>,
+    longs: HashMap<i64, u16>,
+    doubles: HashMap<u64, u16>,
 }
 
 impl Pool {
@@ -126,6 +128,33 @@ impl Pool {
         self.bytes.push(3);
         self.bytes.extend_from_slice(&v.to_be_bytes());
         self.ints.insert(v, i);
+        i
+    }
+
+    /// CONSTANT_Long occupies two pool slots (JVMS §4.4.5).
+    pub fn long(&mut self, v: i64) -> u16 {
+        if let Some(i) = self.longs.get(&v) {
+            return *i;
+        }
+        let i = self.count;
+        self.count = self.count.saturating_add(2);
+        self.bytes.push(5);
+        self.bytes.extend_from_slice(&v.to_be_bytes());
+        self.longs.insert(v, i);
+        i
+    }
+
+    /// CONSTANT_Double occupies two pool slots (JVMS §4.4.5).
+    pub fn double(&mut self, v: f64) -> u16 {
+        let bits = v.to_bits();
+        if let Some(i) = self.doubles.get(&bits) {
+            return *i;
+        }
+        let i = self.count;
+        self.count = self.count.saturating_add(2);
+        self.bytes.push(6);
+        self.bytes.extend_from_slice(&bits.to_be_bytes());
+        self.doubles.insert(bits, i);
         i
     }
 

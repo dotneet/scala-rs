@@ -155,29 +155,28 @@ impl Assembler {
             self.emit_op(0x09);
         } else if v == 1 {
             self.emit_op(0x0a);
-        } else {
-            // ldc2_w would need a Long CP entry; emit via i2l of iconst for small
-            if (i32::MIN as i64..=i32::MAX as i64).contains(&v) {
-                self.iconst(v as i32);
-                self.emit_op(0x85); // i2l
-                self.bump(1); // int->long extra slot; iconst already +1
-                return;
-            }
-            self.iconst(0);
-            self.emit_op(0x85);
+        } else if (i32::MIN as i64..=i32::MAX as i64).contains(&v) {
+            self.iconst(v as i32);
+            self.emit_op(0x85); // i2l
             self.bump(1);
+            return;
+        } else {
+            let i = self.pool.long(v);
+            self.emit_op(0x14); // ldc2_w
+            self.emit_u16(i);
         }
         self.bump(2);
     }
 
     pub fn dconst(&mut self, v: f64) {
-        if v == 0.0 {
+        if v.to_bits() == 0.0f64.to_bits() {
             self.emit_op(0x0e);
-        } else if v == 1.0 {
+        } else if v.to_bits() == 1.0f64.to_bits() {
             self.emit_op(0x0f);
         } else {
-            // approximate: not a full double CP; use 0.0 for unsupported
-            self.emit_op(0x0e);
+            let i = self.pool.double(v);
+            self.emit_op(0x14); // ldc2_w
+            self.emit_u16(i);
         }
         self.bump(2);
     }
