@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 //! Namer + typer. Trees are mutated in place (`ty`, `sym`).
 
-use crate::prelude::install_prelude;
-use crate::symbol::{SymbolTable, SymKind};
 use crate::implicits::ImplicitSearch;
+use crate::prelude::install_prelude;
+use crate::symbol::{SymKind, SymbolTable};
 use scala_rs_parser::ast::*;
 use scala_rs_span::{Diagnostic, Span};
 
@@ -76,7 +76,9 @@ impl Typer {
     fn enter_package_path(&mut self, pid: &Tree) -> SymbolId {
         fn parts(t: &Tree, acc: &mut Vec<String>) {
             match &t.kind {
-                TreeKind::Ident { name } if name != "<empty>" && name != "_root_" => acc.push(name.clone()),
+                TreeKind::Ident { name } if name != "<empty>" && name != "_root_" => {
+                    acc.push(name.clone())
+                }
                 TreeKind::Select { qual, name } => {
                     parts(qual, acc);
                     acc.push(name.clone());
@@ -93,13 +95,18 @@ impl Typer {
                 jvm.push('/');
             }
             jvm.push_str(&p);
-            let existing = self.st.get(cur).members.iter().copied().find(|&m| {
-                self.st.get(m).kind == SymKind::Package && self.st.get(m).name == p
-            });
+            let existing = self
+                .st
+                .get(cur)
+                .members
+                .iter()
+                .copied()
+                .find(|&m| self.st.get(m).kind == SymKind::Package && self.st.get(m).name == p);
             cur = if let Some(e) = existing {
                 e
             } else {
-                self.st.alloc(&p, cur, SymKind::Package, Flags::PACKAGE, &jvm)
+                self.st
+                    .alloc(&p, cur, SymKind::Package, Flags::PACKAGE, &jvm)
             };
         }
         cur
@@ -109,9 +116,15 @@ impl Typer {
         match &tree.kind {
             TreeKind::ClassDef { name, mods, .. } => {
                 let is_trait = mods.flags.contains(Flags::TRAIT);
-                let flags = mods.flags.with(if is_trait { Flags::ABSTRACT } else { Flags::EMPTY });
+                let flags = mods.flags.with(if is_trait {
+                    Flags::ABSTRACT
+                } else {
+                    Flags::EMPTY
+                });
                 let jvm = self.jvm_for_current(name);
-                let id = self.st.alloc(name, self.st.owner, SymKind::Class, flags, &jvm);
+                let id = self
+                    .st
+                    .alloc(name, self.st.owner, SymKind::Class, flags, &jvm);
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
                 if mods.flags.contains(Flags::CASE) {
@@ -127,7 +140,13 @@ impl Typer {
                     mods.flags.with(Flags::MODULE).with(Flags::FINAL),
                     &jvm,
                 );
-                let m = self.st.alloc(name, self.st.owner, SymKind::Module, mods.flags.with(Flags::MODULE), &jvm);
+                let m = self.st.alloc(
+                    name,
+                    self.st.owner,
+                    SymKind::Module,
+                    mods.flags.with(Flags::MODULE),
+                    &jvm,
+                );
                 self.st.get_mut(m).ty = Type::ModuleRef(cls);
                 self.st.get_mut(cls).ty = Type::ModuleRef(cls);
                 self.st.enter_in_current(name, m);
@@ -140,7 +159,11 @@ impl Typer {
 
     fn jvm_for_current(&self, name: &str) -> String {
         let ow = self.st.get(self.st.owner);
-        if ow.kind == SymKind::Package && ow.name != "<_root_>" && !ow.jvm_name.is_empty() && ow.jvm_name != "scala/runtime" {
+        if ow.kind == SymKind::Package
+            && ow.name != "<_root_>"
+            && !ow.jvm_name.is_empty()
+            && ow.jvm_name != "scala/runtime"
+        {
             format!("{}/{}", ow.jvm_name, name)
         } else if ow.kind == SymKind::Package {
             name.to_string()
@@ -155,7 +178,11 @@ impl Typer {
     }
 
     fn ensure_companion(&mut self, name: &str, class_id: SymbolId) -> SymbolId {
-        let existing = self.st.lookup(name).into_iter().find(|&s| self.st.get(s).kind == SymKind::Module);
+        let existing = self
+            .st
+            .lookup(name)
+            .into_iter()
+            .find(|&s| self.st.get(s).kind == SymKind::Module);
         if let Some(e) = existing {
             return e;
         }
@@ -164,7 +191,10 @@ impl Typer {
             &format!("{name}$"),
             self.st.owner,
             SymKind::ModuleClass,
-            Flags::MODULE.with(Flags::FINAL).with(Flags::SYNTHETIC).with(Flags::CASE),
+            Flags::MODULE
+                .with(Flags::FINAL)
+                .with(Flags::SYNTHETIC)
+                .with(Flags::CASE),
             &jvm,
         );
         let m = self.st.alloc(
@@ -236,13 +266,18 @@ impl Typer {
         }
         self.st.get_mut(id).ctor_fields = fields.clone();
         // ctor method
-        let ctor = self.st.alloc("<init>", id, SymKind::Method, Flags::CONSTRUCTOR, "");
+        let ctor = self
+            .st
+            .alloc("<init>", id, SymKind::Method, Flags::CONSTRUCTOR, "");
         self.st.get_mut(ctor).params = fields.clone();
         self.st.enter_in_current("<init>", ctor);
 
         for stt in body.iter_mut() {
             self.namer_member(stt);
-            if matches!(&stt.kind, TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }) {
+            if matches!(
+                &stt.kind,
+                TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+            ) {
                 self.namer(stt);
             }
         }
@@ -295,13 +330,21 @@ impl Typer {
             args: vec![],
         };
         // copy, productArity, toString, equals, hashCode as methods (backend will emit)
-        let copy = self.st.alloc("copy", class_id, SymKind::Method, Flags::SYNTHETIC, "");
+        let copy = self
+            .st
+            .alloc("copy", class_id, SymKind::Method, Flags::SYNTHETIC, "");
         let ptys: Vec<Type> = fields.iter().map(|_| Type::NoType).collect();
         self.st.get_mut(copy).ty = Type::Method {
             paramss: vec![ptys],
             ret: Box::new(class_ty.clone()),
         };
-        let _ = self.st.alloc("productArity", class_id, SymKind::Method, Flags::SYNTHETIC, "");
+        let _ = self.st.alloc(
+            "productArity",
+            class_id,
+            SymKind::Method,
+            Flags::SYNTHETIC,
+            "",
+        );
         // companion apply
         let companion = self
             .st
@@ -313,7 +356,13 @@ impl Typer {
                 Type::ModuleRef(c) => c,
                 _ => m,
             };
-            let apply = self.st.alloc("apply", cls, SymKind::Method, Flags::SYNTHETIC.with(Flags::CASE), "");
+            let apply = self.st.alloc(
+                "apply",
+                cls,
+                SymKind::Method,
+                Flags::SYNTHETIC.with(Flags::CASE),
+                "",
+            );
             self.st.get_mut(apply).params = fields.clone();
             self.st.get_mut(apply).ty = Type::Method {
                 paramss: vec![fields.iter().map(|_| Type::NoType).collect()],
@@ -322,7 +371,13 @@ impl Typer {
             self.st.enter_in_current("apply", apply);
             // also put apply on the module value for Point(1,2)
             self.st.get_mut(m).members.push(apply);
-            let unapply = self.st.alloc("unapply", cls, SymKind::Method, Flags::SYNTHETIC.with(Flags::CASE), "");
+            let unapply = self.st.alloc(
+                "unapply",
+                cls,
+                SymKind::Method,
+                Flags::SYNTHETIC.with(Flags::CASE),
+                "",
+            );
             self.st.get_mut(m).members.push(unapply);
         }
     }
@@ -347,7 +402,10 @@ impl Typer {
         self.st.push_scope();
         for stt in body.iter_mut() {
             self.namer_member(stt);
-            if matches!(&stt.kind, TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }) {
+            if matches!(
+                &stt.kind,
+                TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+            ) {
                 self.namer(stt);
             }
         }
@@ -370,17 +428,23 @@ impl Typer {
     fn namer_member(&mut self, tree: &mut Tree) {
         match &tree.kind {
             TreeKind::ValDef { name, mods, .. } => {
-                let id = self.st.alloc(name, self.st.owner, SymKind::Term, mods.flags, "");
+                let id = self
+                    .st
+                    .alloc(name, self.st.owner, SymKind::Term, mods.flags, "");
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
             TreeKind::DefDef { name, mods, .. } => {
-                let id = self.st.alloc(name, self.st.owner, SymKind::Method, mods.flags, "");
+                let id = self
+                    .st
+                    .alloc(name, self.st.owner, SymKind::Method, mods.flags, "");
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
             TreeKind::TypeDef { name, mods, .. } => {
-                let id = self.st.alloc(name, self.st.owner, SymKind::Class, mods.flags, "");
+                let id = self
+                    .st
+                    .alloc(name, self.st.owner, SymKind::Class, mods.flags, "");
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
@@ -613,7 +677,9 @@ impl Typer {
 
     fn type_val_sig(&mut self, tree: &mut Tree) {
         let (tpt, name, flags) = match &tree.kind {
-            TreeKind::ValDef { tpt, name, mods, .. } => (tpt.clone(), name.clone(), mods.flags),
+            TreeKind::ValDef {
+                tpt, name, mods, ..
+            } => (tpt.clone(), name.clone(), mods.flags),
             _ => return,
         };
         let ty = if tpt.is_empty() {
@@ -628,7 +694,9 @@ impl Typer {
         };
         tree.ty = ty.clone();
         if tree.sym.is_none() {
-            let id = self.st.alloc(name.clone(), self.st.owner, SymKind::Term, flags, "");
+            let id = self
+                .st
+                .alloc(name.clone(), self.st.owner, SymKind::Term, flags, "");
             tree.sym = id;
             self.st.enter_in_current(&name, id);
         }
@@ -691,7 +759,13 @@ impl Typer {
             _ => return,
         };
         if tree.sym.is_none() {
-            let id = self.st.alloc(name.clone(), self.st.owner, SymKind::Method, Flags::EMPTY, "");
+            let id = self.st.alloc(
+                name.clone(),
+                self.st.owner,
+                SymKind::Method,
+                Flags::EMPTY,
+                "",
+            );
             tree.sym = id;
             self.st.enter_in_current(&name, id);
         }
@@ -709,7 +783,10 @@ impl Typer {
             for p in clause.iter_mut() {
                 self.type_val_sig(p);
                 if p.ty.is_no_type() {
-                    self.error(p.span, format!("missing parameter type for `{}`", p.name().unwrap_or("?")));
+                    self.error(
+                        p.span,
+                        format!("missing parameter type for `{}`", p.name().unwrap_or("?")),
+                    );
                     p.ty = Type::Error;
                 }
                 if p.sym.is_none() {
@@ -967,7 +1044,10 @@ impl Typer {
             TreeKind::New { tpt } => {
                 if let TreeKind::ClassDef { name, .. } = &tpt.kind {
                     if name == "$anon" {
-                        self.error(tree.span, "unimplemented syntax: anonymous classes (`new T { ... }`)");
+                        self.error(
+                            tree.span,
+                            "unimplemented syntax: anonymous classes (`new T { ... }`)",
+                        );
                         tree.ty = Type::Error;
                         return;
                     }
@@ -975,7 +1055,9 @@ impl Typer {
                 if let TreeKind::Ident { name } = &tpt.kind {
                     let n = name.clone();
                     let found = self.st.lookup(&n);
-                    if let Some(id) = found.into_iter().find(|s| self.st.get(*s).kind == SymKind::Class)
+                    if let Some(id) = found
+                        .into_iter()
+                        .find(|s| self.st.get(*s).kind == SymKind::Class)
                     {
                         tpt.sym = id;
                         tpt.ty = Type::Class {
@@ -1028,7 +1110,11 @@ impl Typer {
                 }
                 tree.ty = block.ty.clone();
             }
-            TreeKind::InterpolatedString { prefix, parts, args } => {
+            TreeKind::InterpolatedString {
+                prefix,
+                parts,
+                args,
+            } => {
                 if prefix != "s" && prefix != "raw" {
                     self.error(
                         tree.span,
@@ -1042,7 +1128,10 @@ impl Typer {
                 tree.ty = Type::String;
             }
             TreeKind::Wildcard => {
-                self.error(tree.span, "unimplemented syntax: placeholder `_` in expressions");
+                self.error(
+                    tree.span,
+                    "unimplemented syntax: placeholder `_` in expressions",
+                );
                 tree.ty = Type::Error;
             }
             TreeKind::Unimplemented { what } => {
@@ -1058,7 +1147,10 @@ impl Typer {
             TreeKind::AppliedTypeTree { .. } => {
                 tree.ty = self.tree_to_type(tree);
             }
-            TreeKind::DefDef { .. } | TreeKind::ValDef { .. } | TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } => {
+            TreeKind::DefDef { .. }
+            | TreeKind::ValDef { .. }
+            | TreeKind::ClassDef { .. }
+            | TreeKind::ModuleDef { .. } => {
                 // Nested defs typed as statements; `type_stat` needs the whole tree so we
                 // set a marker and type after the match.
                 tree.ty = Type::NoType;
@@ -1069,7 +1161,10 @@ impl Typer {
         }
         if matches!(
             &tree.kind,
-            TreeKind::DefDef { .. } | TreeKind::ValDef { .. } | TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+            TreeKind::DefDef { .. }
+                | TreeKind::ValDef { .. }
+                | TreeKind::ClassDef { .. }
+                | TreeKind::ModuleDef { .. }
         ) {
             self.type_stat(tree);
         }
@@ -1128,7 +1223,10 @@ impl Typer {
                 }
             }
             Type::ByName(inner) => {
-                if matches!(pt, Type::Function { .. } | Type::ByName(_) | Type::Method { .. }) {
+                if matches!(
+                    pt,
+                    Type::Function { .. } | Type::ByName(_) | Type::Method { .. }
+                ) {
                     ty
                 } else {
                     (**inner).clone()
@@ -1145,7 +1243,10 @@ impl Typer {
         };
         self.type_expr(qual, &Type::NoType);
         if name == "_" {
-            self.error(tree.span, "unimplemented syntax: wildcard import/select in expression");
+            self.error(
+                tree.span,
+                "unimplemented syntax: wildcard import/select in expression",
+            );
             tree.ty = Type::Error;
             return;
         }
@@ -1179,10 +1280,7 @@ impl Typer {
         let subst = |ty: Type| -> Type {
             if let Type::Class { args, .. } = &qual.ty {
                 if !args.is_empty() {
-                    if let Some(owner) = found
-                        .first()
-                        .map(|s| self.st.get(*s).owner)
-                    {
+                    if let Some(owner) = found.first().map(|s| self.st.get(*s).owner) {
                         return self.st.subst_tparams(owner, args, &ty);
                     }
                 }
@@ -1225,7 +1323,13 @@ impl Typer {
         // new C(args)
         if matches!(&fun.kind, TreeKind::New { .. }) {
             self.type_expr(fun, &Type::NoType);
-            let class_id = fun.sym.is_none().then(|| self.st.class_sym_of(&fun.ty)).flatten().or(Some(fun.sym)).filter(|s| !s.is_none());
+            let class_id = fun
+                .sym
+                .is_none()
+                .then(|| self.st.class_sym_of(&fun.ty))
+                .flatten()
+                .or(Some(fun.sym))
+                .filter(|s| !s.is_none());
             let class_id = class_id.or_else(|| self.st.class_sym_of(&fun.ty));
             let ctor_params = class_id
                 .map(|c| {
@@ -1253,7 +1357,10 @@ impl Typer {
             paramss: vec![],
             ret: Box::new(Type::NoType),
         };
-        if matches!(&fun.kind, TreeKind::Apply { .. } | TreeKind::TypeApply { .. }) {
+        if matches!(
+            &fun.kind,
+            TreeKind::Apply { .. } | TreeKind::TypeApply { .. }
+        ) {
             self.type_expr(fun, &dummy_method);
         } else {
             self.type_expr(fun, &Type::NoType);
@@ -1283,7 +1390,8 @@ impl Typer {
 
         if let TreeKind::Select { name, qual } = &fun.kind {
             if name == "+"
-                && (matches!(qual.ty, Type::String) || arg_tys.first().is_some_and(|t| matches!(t, Type::String)))
+                && (matches!(qual.ty, Type::String)
+                    || arg_tys.first().is_some_and(|t| matches!(t, Type::String)))
             {
                 tree.ty = Type::String;
                 fun.sym = SymbolId::NONE;
@@ -1312,8 +1420,10 @@ impl Typer {
                     }
                 }
                 if let Some(elem) = recv_ty.as_ref().and_then(|t| self.elem_type(t)) {
-                    if matches!(fun_name.as_str(), "map" | "flatMap" | "foreach" | "withFilter")
-                        && !param_tys.is_empty()
+                    if matches!(
+                        fun_name.as_str(),
+                        "map" | "flatMap" | "foreach" | "withFilter"
+                    ) && !param_tys.is_empty()
                     {
                         if let Type::Function { ret: fr, .. } = &param_tys[0] {
                             param_tys[0] = Type::Function {
@@ -1343,14 +1453,8 @@ impl Typer {
                         ),
                     );
                 }
-                let leftover = self.fill_defaults_and_implicits(
-                    tree.span,
-                    args,
-                    &param_tys,
-                    sym,
-                    &fun.ty,
-                    pt,
-                );
+                let leftover =
+                    self.fill_defaults_and_implicits(tree.span, args, &param_tys, sym, &fun.ty, pt);
                 let method_name = if !sym.is_none() {
                     self.st.get(sym).name.clone()
                 } else {
@@ -1591,7 +1695,9 @@ impl Typer {
         let first = paramss_ids.first().cloned().unwrap_or_default();
         if args.len() < first.len() {
             let rest = first[args.len()..].to_vec();
-            let all_implicit = rest.iter().all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT));
+            let all_implicit = rest
+                .iter()
+                .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT));
             let all_default = rest
                 .iter()
                 .all(|p| self.st.get(*p).flags.contains(Flags::DEFAULTPARAM));
@@ -1625,13 +1731,21 @@ impl Typer {
                     .iter()
                     .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT));
             if all_impl && !matches!(pt, Type::Method { .. } | Type::Function { .. }) {
-                let rest_tys: Vec<Type> = rest_ids.iter().map(|id| self.st.get(*id).ty.clone()).collect();
+                let rest_tys: Vec<Type> = rest_ids
+                    .iter()
+                    .map(|id| self.st.get(*id).ty.clone())
+                    .collect();
                 self.fill_implicit_params(span, args, &rest_tys, &rest_ids);
                 return None;
             }
             let rest_tys: Vec<Vec<Type>> = paramss_ids[1..]
                 .iter()
-                .map(|clause| clause.iter().map(|id| self.st.get(*id).ty.clone()).collect())
+                .map(|clause| {
+                    clause
+                        .iter()
+                        .map(|id| self.st.get(*id).ty.clone())
+                        .collect()
+                })
                 .collect();
             let ret = match fun_ty {
                 Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
@@ -1704,7 +1818,11 @@ impl Typer {
             Type::Overload(alts) => {
                 for a in alts {
                     if let Type::Method { paramss, ret } = a {
-                        cands.push((fun_sym, paramss.first().cloned().unwrap_or_default(), (**ret).clone()));
+                        cands.push((
+                            fun_sym,
+                            paramss.first().cloned().unwrap_or_default(),
+                            (**ret).clone(),
+                        ));
                     }
                 }
                 // recover real symbols from owner
@@ -1714,14 +1832,22 @@ impl Typer {
                     cands.clear();
                     for m in self.st.lookup_member(owner, &name) {
                         if let Type::Method { paramss, ret } = &self.st.get(m).ty {
-                            cands.push((m, paramss.first().cloned().unwrap_or_default(), (**ret).clone()));
+                            cands.push((
+                                m,
+                                paramss.first().cloned().unwrap_or_default(),
+                                (**ret).clone(),
+                            ));
                         }
                     }
                     // also same-scope overloads
                     if cands.is_empty() {
                         for m in self.st.lookup(&name) {
                             if let Type::Method { paramss, ret } = &self.st.get(m).ty {
-                                cands.push((m, paramss.first().cloned().unwrap_or_default(), (**ret).clone()));
+                                cands.push((
+                                    m,
+                                    paramss.first().cloned().unwrap_or_default(),
+                                    (**ret).clone(),
+                                ));
                             }
                         }
                     }
@@ -1732,14 +1858,22 @@ impl Typer {
                 let apply = self.st.lookup_member(*sym, "apply");
                 for m in apply {
                     if let Type::Method { paramss, ret } = &self.st.get(m).ty {
-                        cands.push((m, paramss.first().cloned().unwrap_or_default(), (**ret).clone()));
+                        cands.push((
+                            m,
+                            paramss.first().cloned().unwrap_or_default(),
+                            (**ret).clone(),
+                        ));
                     }
                 }
             }
             Type::ModuleRef(id) => {
                 for m in self.st.lookup_member(*id, "apply") {
                     if let Type::Method { paramss, ret } = &self.st.get(m).ty {
-                        cands.push((m, paramss.first().cloned().unwrap_or_default(), (**ret).clone()));
+                        cands.push((
+                            m,
+                            paramss.first().cloned().unwrap_or_default(),
+                            (**ret).clone(),
+                        ));
                     }
                 }
             }
@@ -1835,7 +1969,9 @@ impl Typer {
                 if let TreeKind::ValDef { name, mods, .. } = &p.kind {
                     let n = name.clone();
                     let flags = mods.flags.with(Flags::PARAM);
-                    let id = self.st.alloc(n.clone(), self.st.owner, SymKind::Term, flags, "");
+                    let id = self
+                        .st
+                        .alloc(n.clone(), self.st.owner, SymKind::Term, flags, "");
                     p.sym = id;
                     let _ = n;
                 }
@@ -1921,7 +2057,9 @@ impl Typer {
                     pat.ty = self.st.get(found[0]).ty.clone();
                 } else {
                     let n = name.clone();
-                    let id = self.st.alloc(n.clone(), self.st.owner, SymKind::Term, Flags::PARAM, "");
+                    let id =
+                        self.st
+                            .alloc(n.clone(), self.st.owner, SymKind::Term, Flags::PARAM, "");
                     self.st.get_mut(id).ty = sel_ty.clone();
                     self.st.enter_in_current(&n, id);
                     pat.sym = id;
@@ -1931,7 +2069,9 @@ impl Typer {
             TreeKind::Bind { name, body } => {
                 self.type_pattern(body, sel_ty);
                 let n = name.clone();
-                let id = self.st.alloc(n.clone(), self.st.owner, SymKind::Term, Flags::PARAM, "");
+                let id = self
+                    .st
+                    .alloc(n.clone(), self.st.owner, SymKind::Term, Flags::PARAM, "");
                 self.st.get_mut(id).ty = body.ty.clone();
                 self.st.enter_in_current(&n, id);
                 pat.sym = id;
@@ -1996,7 +2136,9 @@ impl Typer {
             TreeKind::AppliedTypeTree { tpt, args } => {
                 let as_: Vec<Type> = args.iter().map(|a| self.tree_to_type(a)).collect();
                 match tpt.name() {
-                    Some("Array") => Type::Array(Box::new(as_.first().cloned().unwrap_or(Type::Any))),
+                    Some("Array") => {
+                        Type::Array(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
+                    }
                     Some("Option") => Type::Class {
                         sym: self.st.option_sym,
                         args: as_,
@@ -2057,7 +2199,10 @@ impl Typer {
                 if let Some(id) = found.into_iter().find(|s| {
                     matches!(
                         self.st.get(*s).kind,
-                        SymKind::Class | SymKind::ModuleClass | SymKind::Module | SymKind::TypeParam
+                        SymKind::Class
+                            | SymKind::ModuleClass
+                            | SymKind::Module
+                            | SymKind::TypeParam
                     )
                 }) {
                     match self.st.get(id).kind {
@@ -2169,9 +2314,28 @@ fn is_sub_type(a: &Type, b: &Type) -> bool {
         (Type::Error, _) | (_, Type::Error) => true,
         (Type::Nothing, _) => true,
         (_, Type::Any) => true,
-        (Type::Null, Type::AnyRef | Type::String | Type::Array(_) | Type::Class { .. } | Type::ModuleRef(_)) => true,
-        (Type::Int | Type::Long | Type::Double | Type::Boolean | Type::Unit | Type::Char | Type::Float, Type::AnyVal) => true,
-        (Type::String | Type::Array(_) | Type::Class { .. } | Type::ModuleRef(_) | Type::Function { .. }, Type::AnyRef) => true,
+        (
+            Type::Null,
+            Type::AnyRef | Type::String | Type::Array(_) | Type::Class { .. } | Type::ModuleRef(_),
+        ) => true,
+        (
+            Type::Int
+            | Type::Long
+            | Type::Double
+            | Type::Boolean
+            | Type::Unit
+            | Type::Char
+            | Type::Float,
+            Type::AnyVal,
+        ) => true,
+        (
+            Type::String
+            | Type::Array(_)
+            | Type::Class { .. }
+            | Type::ModuleRef(_)
+            | Type::Function { .. },
+            Type::AnyRef,
+        ) => true,
         (Type::Class { sym: s1, .. }, Type::Class { sym: s2, .. }) if s1 == s2 => true,
         (Type::Array(x), Type::Array(y)) => is_sub_type(x, y),
         (Type::ModuleRef(s), Type::Class { sym, .. }) if s == sym => true,

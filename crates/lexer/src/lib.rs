@@ -314,14 +314,20 @@ impl<'a> Lexer<'a> {
             self.bump();
             self.bump();
             let digits_start = self.pos;
-            while self.peek().is_some_and(|c| c.is_ascii_hexdigit() || c == '_') {
+            while self
+                .peek()
+                .is_some_and(|c| c.is_ascii_hexdigit() || c == '_')
+            {
                 self.bump();
             }
             if self.pos == digits_start {
                 self.error(lo, self.pos as u32, "invalid hex literal");
                 return;
             }
-            let raw: String = self.src[digits_start..self.pos].chars().filter(|c| *c != '_').collect();
+            let raw: String = self.src[digits_start..self.pos]
+                .chars()
+                .filter(|c| *c != '_')
+                .collect();
             let suffix = self.eat_num_suffix();
             self.emit_int_from_radix(&raw, 16, suffix, lo);
             return;
@@ -369,7 +375,12 @@ impl<'a> Lexer<'a> {
                 Ok(v) => self.emit(TokenKind::FloatLit(v), lo, self.pos as u32),
                 Err(_) => self.error(lo, self.pos as u32, "invalid float literal"),
             },
-            NumSuffix::DoubleForced | NumSuffix::None if body.contains('.') || body.contains('e') || body.contains('E') || matches!(suffix, NumSuffix::DoubleForced) => {
+            NumSuffix::DoubleForced | NumSuffix::None
+                if body.contains('.')
+                    || body.contains('e')
+                    || body.contains('E')
+                    || matches!(suffix, NumSuffix::DoubleForced) =>
+            {
                 match body.parse::<f64>() {
                     Ok(v) => self.emit(TokenKind::DoubleLit(v), lo, self.pos as u32),
                     Err(_) => self.error(lo, self.pos as u32, "invalid double literal"),
@@ -427,7 +438,7 @@ impl<'a> Lexer<'a> {
     fn lex_char_or_symbol(&mut self) {
         let lo = self.pos as u32;
         self.bump(); // '
-        // symbol: 'ident  (deprecated in 2.13 but still lexical)
+                     // symbol: 'ident  (deprecated in 2.13 but still lexical)
         if self.peek().is_some_and(is_id_start) {
             // Could still be 'a' char. If next-next is `'`, it's a char.
             let saved = self.pos;
@@ -490,10 +501,7 @@ impl<'a> Lexer<'a> {
         }
         if let Some(prefix) = interp_prefix {
             self.emit(
-                TokenKind::InterpStart {
-                    prefix,
-                    triple,
-                },
+                TokenKind::InterpStart { prefix, triple },
                 lo,
                 self.pos as u32,
             );
@@ -601,7 +609,11 @@ impl<'a> Lexer<'a> {
                     continue;
                 }
                 if self.starts_with("${") {
-                    self.emit(TokenKind::StringPart(std::mem::take(&mut buf)), lo, self.pos as u32);
+                    self.emit(
+                        TokenKind::StringPart(std::mem::take(&mut buf)),
+                        lo,
+                        self.pos as u32,
+                    );
                     self.bump(); // $
                     self.bump(); // {
                     let hole_at = self.brace_depth;
@@ -614,7 +626,11 @@ impl<'a> Lexer<'a> {
                 let rest = &self.src[after_dollar..];
                 if let Some(c) = rest.chars().next() {
                     if is_id_start(c) {
-                        self.emit(TokenKind::StringPart(std::mem::take(&mut buf)), lo, self.pos as u32);
+                        self.emit(
+                            TokenKind::StringPart(std::mem::take(&mut buf)),
+                            lo,
+                            self.pos as u32,
+                        );
                         self.bump(); // $
                         let id_lo = self.pos as u32;
                         self.bump();
@@ -704,17 +720,32 @@ pub fn is_id_part(c: char) -> bool {
 pub fn is_op_char(c: char) -> bool {
     matches!(
         c,
-        '!' | '#' | '%' | '&' | '*' | '+' | '-' | '/' | ':' | '<' | '=' | '>' | '?' | '@' | '\\' | '^' | '|' | '~'
+        '!' | '#'
+            | '%'
+            | '&'
+            | '*'
+            | '+'
+            | '-'
+            | '/'
+            | ':'
+            | '<'
+            | '='
+            | '>'
+            | '?'
+            | '@'
+            | '\\'
+            | '^'
+            | '|'
+            | '~'
     ) || (!c.is_ascii() && is_unicode_op(c))
 }
 
 fn is_unicode_op(c: char) -> bool {
-    matches!(c, '⇒' | '←' | '→')
-        || {
-            let u = c as u32;
-            // Sm, So — approximation of Scala's op chars
-            matches!(c, '∀'..='⋿') || (0x2200..=0x22FF).contains(&u)
-        }
+    matches!(c, '⇒' | '←' | '→') || {
+        let u = c as u32;
+        // Sm, So — approximation of Scala's op chars
+        matches!(c, '∀'..='⋿') || (0x2200..=0x22FF).contains(&u)
+    }
 }
 
 #[cfg(test)]
@@ -735,16 +766,20 @@ mod tests {
     #[test]
     fn keywords_and_idents() {
         use TokenKind::*;
+        assert_eq!(kinds("object Main"), vec![Object, Ident("Main".into())]);
         assert_eq!(
-            kinds("object Main"),
-            vec![Object, Ident("Main".into())]
+            kinds("try catch finally throw"),
+            vec![Try, Catch, Finally, Throw]
         );
     }
 
     #[test]
     fn integers() {
         use TokenKind::*;
-        assert_eq!(kinds("1 2L 0x10 1_000"), vec![IntLit(1), LongLit(2), IntLit(16), IntLit(1000)]);
+        assert_eq!(
+            kinds("1 2L 0x10 1_000"),
+            vec![IntLit(1), LongLit(2), IntLit(16), IntLit(1000)]
+        );
     }
 
     #[test]
@@ -759,7 +794,11 @@ mod tests {
         let sf = SourceFile::new("t.scala", r#"s"hi $name""#);
         let (toks, d) = tokenize(&sf, 0);
         assert!(d.is_empty());
-        let ks: Vec<_> = toks.into_iter().map(|t| t.kind).filter(|k| !matches!(k, TokenKind::Eof | TokenKind::Newline)).collect();
+        let ks: Vec<_> = toks
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|k| !matches!(k, TokenKind::Eof | TokenKind::Newline))
+            .collect();
         assert!(matches!(ks[0], TokenKind::InterpStart { .. }));
         assert!(matches!(&ks[1], TokenKind::StringPart(s) if s == "hi "));
         assert!(matches!(&ks[2], TokenKind::InterpId(s) if s == "name"));
@@ -768,7 +807,10 @@ mod tests {
 
     #[test]
     fn comments_nested() {
-        assert_eq!(kinds("1 /* /* x */ */ 2"), vec![TokenKind::IntLit(1), TokenKind::IntLit(2)]);
+        assert_eq!(
+            kinds("1 /* /* x */ */ 2"),
+            vec![TokenKind::IntLit(1), TokenKind::IntLit(2)]
+        );
     }
 
     #[test]

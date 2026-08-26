@@ -6,7 +6,7 @@ mod symbol;
 
 pub use check::{find_mains, has_errors, typecheck, Typer};
 pub use erasure::{erase, erase_type};
-pub use symbol::{Intrinsic, Symbol, SymbolTable, SymKind};
+pub use symbol::{Intrinsic, SymKind, Symbol, SymbolTable};
 
 use scala_rs_parser::{parse_str, Tree};
 
@@ -35,13 +35,11 @@ mod tests {
 
     #[test]
     fn hello_typechecks() {
-        let t = ok(
-            r#"
+        let t = ok(r#"
 object Main {
   def main(args: Array[String]): Unit = println(1 + 2)
 }
-"#,
-        );
+"#);
         assert!(!find_mains(&SymbolTable::new(), &t).is_empty() || true);
         let dump = scala_rs_parser::dump_tree(&t);
         assert!(dump.contains("DefDef main"), "{dump}");
@@ -63,8 +61,7 @@ object Main {
 
     #[test]
     fn class_and_new() {
-        ok(
-            r#"
+        ok(r#"
 class Counter(start: Int) {
   var n: Int = start
   def inc(): Unit = { n = n + 1 }
@@ -77,14 +74,12 @@ object Main {
     println(c.get())
   }
 }
-"#,
-        );
+"#);
     }
 
     #[test]
     fn case_class_apply() {
-        ok(
-            r#"
+        ok(r#"
 case class Point(x: Int, y: Int)
 object Main {
   def main(args: Array[String]): Unit = {
@@ -96,27 +91,23 @@ object Main {
     println(s)
   }
 }
-"#,
-        );
+"#);
     }
 
     #[test]
     fn factorial_and_if() {
-        ok(
-            r#"
+        ok(r#"
 object Main {
   def fact(n: Int): Int =
     if (n <= 1) 1 else n * fact(n - 1)
   def main(args: Array[String]): Unit = println(fact(5))
 }
-"#,
-        );
+"#);
     }
 
     #[test]
     fn trait_impl() {
-        ok(
-            r#"
+        ok(r#"
 trait Greeter {
   def greet(name: String): String
 }
@@ -129,8 +120,7 @@ object Main {
     println(g.greet("Scala"))
   }
 }
-"#,
-        );
+"#);
     }
 
     #[test]
@@ -142,8 +132,7 @@ object Main {
 
     #[test]
     fn generic_id_typechecks() {
-        ok(
-            r#"
+        ok(r#"
 object Main {
   def id[T](x: T): T = x
   def main(args: Array[String]): Unit = {
@@ -151,28 +140,24 @@ object Main {
     val s: String = id("hi")
   }
 }
-"#,
-        );
+"#);
     }
 
     #[test]
     fn list_for_typechecks() {
-        ok(
-            r#"
+        ok(r#"
 object Main {
   def main(args: Array[String]): Unit = {
     val xs = 1 :: 2 :: Nil
     val ys = for (x <- xs) yield x + 1
   }
 }
-"#,
-        );
+"#);
     }
 
     #[test]
     fn implicit_param_and_conversion() {
-        ok(
-            r#"
+        ok(r#"
 class RichInt(val n: Int) {
   def doubled: Int = n * 2
 }
@@ -187,8 +172,7 @@ object Main {
     val r: RichInt = 7
   }
 }
-"#,
-        );
+"#);
     }
 
     #[test]
@@ -227,7 +211,9 @@ object Main {
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("ambiguous implicit")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("ambiguous implicit")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -235,8 +221,7 @@ object Main {
 
     #[test]
     fn defaults_and_byname_typecheck() {
-        ok(
-            r#"
+        ok(r#"
 object Main {
   def greet(name: String, punct: String = "!"): String = name + punct
   def twice(x: => Int): Int = x + x
@@ -245,42 +230,36 @@ object Main {
     val n: Int = twice(1)
   }
 }
-"#,
-        );
+"#);
     }
 
     #[test]
     fn explicit_implicit_arg_list() {
-        ok(
-            r#"
+        ok(r#"
 object Main {
   def add(x: Int)(implicit y: Int): Int = x + y
   def main(args: Array[String]): Unit = {
     val n: Int = add(5)(3)
   }
 }
-"#,
-        );
+"#);
     }
 
     #[test]
     fn named_arguments_reorder() {
-        ok(
-            r#"
+        ok(r#"
 object Main {
   def pair(a: Int, b: Int): Int = a + b
   def main(args: Array[String]): Unit = {
     val n: Int = pair(b = 2, a = 1)
   }
 }
-"#,
-        );
+"#);
     }
 
     #[test]
     fn imported_implicits() {
-        ok(
-            r#"
+        ok(r#"
 object Inc {
   implicit val k: Int = 10
 }
@@ -291,7 +270,6 @@ object Main {
     val n: Int = show(1)
   }
 }
-"#,
-        );
+"#);
     }
 }

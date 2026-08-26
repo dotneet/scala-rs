@@ -3,12 +3,12 @@
 //! These are **not** scala-library. They exist so Option / List / FunctionN
 //! from the prelude have JVM types that `scala-rs run` can load.
 
+use crate::classfile::EmittedClass;
 use crate::classfile::{
     ClassEmit, Field, Method, Pool, ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE,
     ACC_PUBLIC, ACC_STATIC, ACC_SUPER,
 };
 use crate::code::Assembler;
-use crate::classfile::EmittedClass;
 
 const SRC: &str = "runtime.scala";
 
@@ -49,7 +49,14 @@ impl B {
         }
     }
 
-    fn add_code(&mut self, access: u16, name: &str, desc: &str, max_locals: u16, gen: impl FnOnce(&mut Assembler)) {
+    fn add_code(
+        &mut self,
+        access: u16,
+        name: &str,
+        desc: &str,
+        max_locals: u16,
+        gen: impl FnOnce(&mut Assembler),
+    ) {
         let mut asm = Assembler::with_pool(std::mem::take(&mut self.pool), max_locals.max(1));
         gen(&mut asm);
         let (code, pool) = asm.finish();
@@ -133,7 +140,11 @@ fn emit_option() -> EmittedClass {
             asm.aload(1);
             asm.aload(0);
             asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
-            asm.invokeinterface("scala/Function1", "apply", "(Ljava/lang/Object;)Ljava/lang/Object;");
+            asm.invokeinterface(
+                "scala/Function1",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            );
             asm.invokespecial("scala/Some", "<init>", "(Ljava/lang/Object;)V");
             asm.areturn();
         },
@@ -156,7 +167,11 @@ fn emit_option() -> EmittedClass {
             asm.aload(1);
             asm.aload(0);
             asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
-            asm.invokeinterface("scala/Function1", "apply", "(Ljava/lang/Object;)Ljava/lang/Object;");
+            asm.invokeinterface(
+                "scala/Function1",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            );
             asm.checkcast("scala/Option");
             asm.areturn();
         },
@@ -171,7 +186,11 @@ fn emit_option() -> EmittedClass {
         asm.aload(1);
         asm.aload(0);
         asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
-        asm.invokeinterface("scala/Function1", "apply", "(Ljava/lang/Object;)Ljava/lang/Object;");
+        asm.invokeinterface(
+            "scala/Function1",
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        );
         asm.pop();
         asm.mark(end);
         asm.vreturn();
@@ -194,7 +213,11 @@ fn emit_option() -> EmittedClass {
             asm.aload(1);
             asm.aload(0);
             asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
-            asm.invokeinterface("scala/Function1", "apply", "(Ljava/lang/Object;)Ljava/lang/Object;");
+            asm.invokeinterface(
+                "scala/Function1",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            );
             asm.checkcast("java/lang/Boolean");
             asm.invokevirtual("java/lang/Boolean", "booleanValue", "()Z");
             let keep = asm.fresh_label();
@@ -260,13 +283,19 @@ fn emit_some_module() -> EmittedClass {
         asm.pop();
         asm.vreturn();
     });
-    b.add_code(ACC_PUBLIC, "apply", "(Ljava/lang/Object;)Lscala/Some;", 2, |asm| {
-        asm.new_obj("scala/Some");
-        asm.dup();
-        asm.aload(1);
-        asm.invokespecial("scala/Some", "<init>", "(Ljava/lang/Object;)V");
-        asm.areturn();
-    });
+    b.add_code(
+        ACC_PUBLIC,
+        "apply",
+        "(Ljava/lang/Object;)Lscala/Some;",
+        2,
+        |asm| {
+            asm.new_obj("scala/Some");
+            asm.dup();
+            asm.aload(1);
+            asm.invokespecial("scala/Some", "<init>", "(Ljava/lang/Object;)V");
+            asm.areturn();
+        },
+    );
     b.finish()
 }
 
@@ -300,7 +329,11 @@ fn emit_none() -> EmittedClass {
         asm.new_obj("java/lang/RuntimeException");
         asm.dup();
         asm.ldc_string("None.get");
-        asm.invokespecial("java/lang/RuntimeException", "<init>", "(Ljava/lang/String;)V");
+        asm.invokespecial(
+            "java/lang/RuntimeException",
+            "<init>",
+            "(Ljava/lang/String;)V",
+        );
         asm.athrow();
     });
     b.finish()
@@ -358,7 +391,11 @@ fn emit_list() -> EmittedClass {
             asm.new_obj("scala/collection/immutable/$colon$colon");
             asm.dup();
             asm.aload(0);
-            asm.invokevirtual("scala/collection/immutable/List", "head", "()Ljava/lang/Object;");
+            asm.invokevirtual(
+                "scala/collection/immutable/List",
+                "head",
+                "()Ljava/lang/Object;",
+            );
             asm.aload(0);
             asm.invokevirtual(
                 "scala/collection/immutable/List",
@@ -401,8 +438,16 @@ fn emit_list() -> EmittedClass {
             asm.dup();
             asm.aload(1);
             asm.aload(0);
-            asm.invokevirtual("scala/collection/immutable/List", "head", "()Ljava/lang/Object;");
-            asm.invokeinterface("scala/Function1", "apply", "(Ljava/lang/Object;)Ljava/lang/Object;");
+            asm.invokevirtual(
+                "scala/collection/immutable/List",
+                "head",
+                "()Ljava/lang/Object;",
+            );
+            asm.invokeinterface(
+                "scala/Function1",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            );
             asm.aload(0);
             asm.invokevirtual(
                 "scala/collection/immutable/List",
@@ -443,8 +488,16 @@ fn emit_list() -> EmittedClass {
             asm.mark(nonempty);
             asm.aload(1);
             asm.aload(0);
-            asm.invokevirtual("scala/collection/immutable/List", "head", "()Ljava/lang/Object;");
-            asm.invokeinterface("scala/Function1", "apply", "(Ljava/lang/Object;)Ljava/lang/Object;");
+            asm.invokevirtual(
+                "scala/collection/immutable/List",
+                "head",
+                "()Ljava/lang/Object;",
+            );
+            asm.invokeinterface(
+                "scala/Function1",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            );
             asm.checkcast("scala/collection/immutable/List");
             asm.aload(0);
             asm.invokevirtual(
@@ -478,8 +531,16 @@ fn emit_list() -> EmittedClass {
         asm.ifne(end);
         asm.aload(1);
         asm.aload(2);
-        asm.invokevirtual("scala/collection/immutable/List", "head", "()Ljava/lang/Object;");
-        asm.invokeinterface("scala/Function1", "apply", "(Ljava/lang/Object;)Ljava/lang/Object;");
+        asm.invokevirtual(
+            "scala/collection/immutable/List",
+            "head",
+            "()Ljava/lang/Object;",
+        );
+        asm.invokeinterface(
+            "scala/Function1",
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        );
         asm.pop();
         asm.aload(2);
         asm.invokevirtual(
@@ -512,8 +573,16 @@ fn emit_list() -> EmittedClass {
             asm.mark(nonempty);
             asm.aload(1);
             asm.aload(0);
-            asm.invokevirtual("scala/collection/immutable/List", "head", "()Ljava/lang/Object;");
-            asm.invokeinterface("scala/Function1", "apply", "(Ljava/lang/Object;)Ljava/lang/Object;");
+            asm.invokevirtual(
+                "scala/collection/immutable/List",
+                "head",
+                "()Ljava/lang/Object;",
+            );
+            asm.invokeinterface(
+                "scala/Function1",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            );
             asm.checkcast("java/lang/Boolean");
             asm.invokevirtual("java/lang/Boolean", "booleanValue", "()Z");
             let keep = asm.fresh_label();
@@ -535,7 +604,11 @@ fn emit_list() -> EmittedClass {
             asm.new_obj("scala/collection/immutable/$colon$colon");
             asm.dup();
             asm.aload(0);
-            asm.invokevirtual("scala/collection/immutable/List", "head", "()Ljava/lang/Object;");
+            asm.invokevirtual(
+                "scala/collection/immutable/List",
+                "head",
+                "()Ljava/lang/Object;",
+            );
             asm.aload(0);
             asm.invokevirtual(
                 "scala/collection/immutable/List",
@@ -669,7 +742,11 @@ fn emit_nil() -> EmittedClass {
         asm.new_obj("java/lang/RuntimeException");
         asm.dup();
         asm.ldc_string("Nil.head");
-        asm.invokespecial("java/lang/RuntimeException", "<init>", "(Ljava/lang/String;)V");
+        asm.invokespecial(
+            "java/lang/RuntimeException",
+            "<init>",
+            "(Ljava/lang/String;)V",
+        );
         asm.athrow();
     });
     b.add_code(
@@ -681,7 +758,11 @@ fn emit_nil() -> EmittedClass {
             asm.new_obj("java/lang/RuntimeException");
             asm.dup();
             asm.ldc_string("Nil.tail");
-            asm.invokespecial("java/lang/RuntimeException", "<init>", "(Ljava/lang/String;)V");
+            asm.invokespecial(
+                "java/lang/RuntimeException",
+                "<init>",
+                "(Ljava/lang/String;)V",
+            );
             asm.athrow();
         },
     );

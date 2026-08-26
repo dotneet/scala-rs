@@ -153,6 +153,26 @@ fn fixtures_defaults() {
 fn fixtures_byname() {
     check("byname");
 }
+#[test]
+fn fixtures_trait_concrete() {
+    check("trait_concrete");
+}
+#[test]
+fn fixtures_trait_linearize() {
+    check("trait_linearize");
+}
+#[test]
+fn fixtures_try_catch() {
+    check("try_catch");
+}
+#[test]
+fn fixtures_nested_class() {
+    check("nested_class");
+}
+#[test]
+fn fixtures_nested_object() {
+    check("nested_object");
+}
 
 #[test]
 fn cli_run_hello() {

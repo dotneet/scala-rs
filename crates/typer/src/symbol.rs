@@ -155,7 +155,13 @@ impl SymbolTable {
             owner: SymbolId(0),
             this_class: SymbolId(0),
         };
-        st.root = st.alloc("<_root_>", SymbolId(0), SymKind::Package, Flags::PACKAGE, "scala/runtime");
+        st.root = st.alloc(
+            "<_root_>",
+            SymbolId(0),
+            SymKind::Package,
+            Flags::PACKAGE,
+            "scala/runtime",
+        );
         st.owner = st.root;
         st
     }
@@ -321,14 +327,28 @@ impl SymbolTable {
             (_, Type::Any) => true,
             (
                 Type::Null,
-                Type::AnyRef | Type::String | Type::Array(_) | Type::Class { .. } | Type::ModuleRef(_),
+                Type::AnyRef
+                | Type::String
+                | Type::Array(_)
+                | Type::Class { .. }
+                | Type::ModuleRef(_),
             ) => true,
             (
-                Type::Int | Type::Long | Type::Double | Type::Boolean | Type::Unit | Type::Char | Type::Float,
+                Type::Int
+                | Type::Long
+                | Type::Double
+                | Type::Boolean
+                | Type::Unit
+                | Type::Char
+                | Type::Float,
                 Type::AnyVal,
             ) => true,
             (
-                Type::String | Type::Array(_) | Type::Class { .. } | Type::ModuleRef(_) | Type::Function { .. },
+                Type::String
+                | Type::Array(_)
+                | Type::Class { .. }
+                | Type::ModuleRef(_)
+                | Type::Function { .. },
                 Type::AnyRef,
             ) => true,
             (Type::Class { sym: s1, .. }, Type::Class { sym: s2, .. }) if s1 == s2 => true,

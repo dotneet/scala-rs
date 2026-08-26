@@ -46,7 +46,8 @@ impl Pool {
         self.count += 1;
         self.bytes.push(1); // CONSTANT_Utf8
         let b = s.as_bytes();
-        self.bytes.extend_from_slice(&(b.len() as u16).to_be_bytes());
+        self.bytes
+            .extend_from_slice(&(b.len() as u16).to_be_bytes());
         self.bytes.extend_from_slice(b);
         self.utf8.insert(s.to_string(), i);
         i

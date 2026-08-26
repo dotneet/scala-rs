@@ -68,6 +68,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - `val` / `var` / `def`（ネストした `def` はパースする）
 - パラメータ、ラムダ（型付き / 期待型から推論）、ブロック
 - `if` / `else`、`while`
+- `try` / `catch` / `finally`（catch は `{ case ... }`。JVM 例外テーブルを出す）
 - `match`（コンストラクタパターン、リテラル、ワイルドカード）
 - for-comprehension（`map` / `flatMap` / `foreach` / `withFilter` へデシュガー。ランタイムの `List` / `Option` で実行できる）
 - apply / select / infix（`:` 終わりの演算子は右結合で、レシーバは右オペランド。`1 :: Nil` → `Nil.::(1)`）
@@ -78,6 +79,8 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む
 - デフォルト引数、by-name パラメータ（`=> T`）
 - 名前付き引数（呼び出し側で並べ替え）
+- 具象メンバー付き trait の mixin（`T$class` 静的実装 + 線形化順のフォワーダ）
+- 内部クラス（`$outer`）とネストした object
 
 フィクスチャで実際に動く範囲は README 末尾の表を見てください。
 
@@ -108,6 +111,24 @@ nsc に寄せた探索順です。偽の「何でも変換」はありません�
 - `no implicit: could not find implicit value of type …`
 - `ambiguous implicit: …`
 
+### Trait mixin
+
+Java 6 には default method がないので、具象メンバー付き trait は次のように出します。
+
+- trait 自体はすべてのメソッドが abstract な JVM interface
+- 具象本体は `T$class` の static メソッド（第一引数が `$this: T`）
+- 実装クラスは線形化（右の mixin がより具体的）で勝った定義へフォワーダを出す
+
+`class C extends A with B` で A と B が同じ `msg` を持つとき、実行時は B です。trait の `val` フィールドや `super` 呼び出しはまだありません。
+
+### try / catch / finally
+
+`try` 本体を例外テーブルで覆い、ハンドラで catch のパターン（`case _: RuntimeException` など）を `instanceof` します。マッチしなければ再 throw します。`finally` は成功パスと catch パスの両方で実行します（`jsr` は使いません。コードを複製します）。
+
+### ネストした型
+
+`class Outer { class Inner }` は `Outer$Inner` になり、非 static な内部クラスは `$outer` をコンストラクタで受け取ります。`object Outer { object Inner }` は `Outer$Inner$` と `MODULE$` です。
+
 ### lazy val
 
 フィールドに加えて `bitmap$0: Int` と、同期したアクセサを出します。初期化は最初の読み取りまで遅延します。
@@ -121,9 +142,7 @@ nsc に寄せた探索順です。偽の「何でも変換」はありません�
 - 完全な Scala 標準ライブラリ（ここにある Option / List は scala-rs ランタイムであり、scala-library ではない）
 - Scala 3 構文
 - implicit の優先度 / `Predef` の全変換 / `scala.Int` コンパニオンの enrichment
-- 具象メンバー付き trait の mixin / 線形化（`$class` 実装クラスとフォワーダ）。抽象メンバーだけの trait は JVM interface として動く
-- `try` / `catch` / `finally` の JVM 例外テーブル（パーサと typer はある。Code 属性のテーブル枠は出した。ハンドラ本体の生成は未了）
-- 内部クラス / ネストした object の実行（ネストした定義はパース・ネーミングする）
+- trait の `val` フィールド、`super`、スタック可能な trait 初期化
 - 匿名クラス
 - XML リテラル
 - existential types
@@ -155,8 +174,9 @@ Cargo workspace のクレート:
 - **ライブラリ**: scala-library を同梱しません。`Predef.println`、プリミティブ演算、およびコンパイラが出す Option / List / FunctionN ランタイムだけです。`java -cp out:scala-library.jar` で混ぜる想定ではありません。
 - **object**: scalac と同様、`Main$`（モジュール）と静的フォワーダ `Main` を出します。`java Main` が動くのはそのためです。
 - **プリミティブ**: `Int` の `+` などは `scala.Int` のボックスメソッドではなく、JVM 命令（`iadd` など）として出します。
-- **trait**: 抽象メンバーだけの trait は JVM interface として出します。具象メンバー付き trait の `$class` 実装クラスと線形化フォワーダはまだ出していません。
+- **trait**: 抽象メンバーだけの trait は JVM interface です。具象メンバーは `T$class` 静的実装と、線形化順のインスタンスフォワーダです。Java 8 default method は使いません（major 50）。
 - **名前付き引数**: 呼び出し側で `f(b = 2, a = 1)` を並べ替えます。巨大な rewrite フェーズはありません。
+- **try**: Code 属性に例外テーブルを出します。StackMapTable はありません。
 - **ラムダ**: `FunctionN` を実装する合成クラス（`Main$$$anonfun$0` など）です。invokedynamic / LambdaMetaFactory は使いません（Java 6）。
 - **フェーズ**: nsc の uncurry / mixin / lambdaLift などの独立パスはありません。erasure とラムダのクロージャ変換はあります。
 
@@ -187,6 +207,11 @@ cargo test
 | `generic_id.scala` | `def id[T](x: T): T` の erasure | `42` `hi` |
 | `defaults.scala` | デフォルト引数 | `hi Scala!` `hi Scala?` |
 | `byname.scala` | by-name パラメータが二度評価される | `6` `2` |
+| `trait_concrete.scala` | 具象メソッド付き trait を class が使う | `from trait` |
+| `trait_linearize.scala` | `extends A with B` の線形化（B が勝つ） | `B` |
+| `try_catch.scala` | throw / catch / finally | `before` `caught` `finally` |
+| `nested_class.scala` | `class Outer { class Inner }` | `inner` |
+| `nested_object.scala` | `object Outer { object Inner }` | `nested` |
 
 implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストで見ています。コンパイルを成功扱いにしていません。
 

@@ -74,7 +74,11 @@ fn dump_into(s: &mut String, t: &Tree, indent: usize) {
             Ok(())
         }
         TreeKind::ValDef {
-            name, tpt, rhs, mods, ..
+            name,
+            tpt,
+            rhs,
+            mods,
+            ..
         } => {
             let kw = if mods.flags.contains(Flags::MUTABLE) {
                 "var"

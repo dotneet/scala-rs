@@ -136,10 +136,19 @@ pub enum Type {
     Nothing,
     Array(Box<Type>),
     Tuple(Vec<Type>),
-    Function { params: Vec<Type>, ret: Box<Type> },
+    Function {
+        params: Vec<Type>,
+        ret: Box<Type>,
+    },
     /// Named type not yet bound to a symbol (`List[Int]`, user types in tpts).
-    Named { name: String, args: Vec<Type> },
-    Class { sym: SymbolId, args: Vec<Type> },
+    Named {
+        name: String,
+        args: Vec<Type>,
+    },
+    Class {
+        sym: SymbolId,
+        args: Vec<Type>,
+    },
     Method {
         paramss: Vec<Vec<Type>>,
         ret: Box<Type>,

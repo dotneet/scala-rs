@@ -553,9 +553,7 @@ fn count_params(desc: &str) -> usize {
     while let Some(c) = chars.next() {
         n += 1;
         match c {
-            'L' => {
-                while chars.next() != Some(';') {}
-            }
+            'L' => while chars.next() != Some(';') {},
             '[' => {
                 while chars.peek() == Some(&'[') {
                     chars.next();

@@ -53,7 +53,9 @@ impl<'a> Parser<'a> {
     }
 
     fn tok(&self) -> &Token {
-        self.tokens.get(self.pos).unwrap_or_else(|| self.tokens.last().unwrap())
+        self.tokens
+            .get(self.pos)
+            .unwrap_or_else(|| self.tokens.last().unwrap())
     }
 
     fn kind(&self) -> &TokenKind {
@@ -93,7 +95,10 @@ impl<'a> Parser<'a> {
         while i < self.tokens.len() && matches!(self.tokens[i].kind, TokenKind::Newline) {
             i += 1;
         }
-        self.tokens.get(i).map(|t| &t.kind).unwrap_or(&TokenKind::Eof)
+        self.tokens
+            .get(i)
+            .map(|t| &t.kind)
+            .unwrap_or(&TokenKind::Eof)
     }
 
     fn at(&self, pred: impl Fn(&TokenKind) -> bool) -> bool {
@@ -116,7 +121,10 @@ impl<'a> Parser<'a> {
             self.bump();
             sp
         } else {
-            self.error_here(format!("expected {what}, found {}", token_name(self.kind())));
+            self.error_here(format!(
+                "expected {what}, found {}",
+                token_name(self.kind())
+            ));
             sp
         }
     }
@@ -127,15 +135,13 @@ impl<'a> Parser<'a> {
     }
 
     fn error_span(&mut self, span: Span, msg: impl Into<String>) {
-        self.diags.push(Diagnostic::error(self.file_index, span, msg));
+        self.diags
+            .push(Diagnostic::error(self.file_index, span, msg));
     }
 
     fn unimplemented(&mut self, span: Span, what: impl Into<String>) -> Tree {
         let what = what.into();
-        self.error_span(
-            span,
-            format!("unimplemented syntax: {what}"),
-        );
+        self.error_span(span, format!("unimplemented syntax: {what}"));
         self.alloc(span, TreeKind::Unimplemented { what })
     }
 
@@ -184,7 +190,12 @@ impl<'a> Parser<'a> {
                 let rest = self.parse_top_stats();
                 let mut all = vec![pkg_obj];
                 all.extend(rest);
-                let pid = self.alloc(pkg_span, TreeKind::Ident { name: "_root_".into() });
+                let pid = self.alloc(
+                    pkg_span,
+                    TreeKind::Ident {
+                        name: "_root_".into(),
+                    },
+                );
                 return self.alloc(
                     lo.merge(self.prev_span()),
                     TreeKind::PackageDef {
@@ -215,7 +226,12 @@ impl<'a> Parser<'a> {
         }
         let stats = self.parse_top_stats();
         let pid = pid.unwrap_or_else(|| {
-            self.alloc(lo, TreeKind::Ident { name: "<empty>".into() })
+            self.alloc(
+                lo,
+                TreeKind::Ident {
+                    name: "<empty>".into(),
+                },
+            )
         });
         self.alloc(
             lo.merge(self.prev_span()),
@@ -434,7 +450,12 @@ impl<'a> Parser<'a> {
             if matches!(self.kind(), TokenKind::This) {
                 let sp = self.span();
                 self.bump();
-                t = self.alloc(t.span.merge(sp), TreeKind::This { qual: t.name().map(|s| s.to_string()) });
+                t = self.alloc(
+                    t.span.merge(sp),
+                    TreeKind::This {
+                        qual: t.name().map(|s| s.to_string()),
+                    },
+                );
             } else if matches!(self.kind(), TokenKind::Super) {
                 let sp = self.span();
                 self.bump();
@@ -1143,7 +1164,12 @@ impl<'a> Parser<'a> {
             let lo = self.span();
             self.bump();
             let rhs = self.parse_type();
-            let tpt = self.alloc(lo, TreeKind::Ident { name: "Function0".into() });
+            let tpt = self.alloc(
+                lo,
+                TreeKind::Ident {
+                    name: "Function0".into(),
+                },
+            );
             return self.alloc(
                 lo.merge(rhs.span),
                 TreeKind::AppliedTypeTree {
@@ -1158,9 +1184,7 @@ impl<'a> Parser<'a> {
             self.bump();
             let rhs = self.parse_type();
             let params = match &t.kind {
-                TreeKind::AppliedTypeTree { tpt, args }
-                    if matches!(&tpt.kind, TreeKind::Ident { name } if name.starts_with("Tuple") || name == "<tuple>") =>
-                {
+                TreeKind::AppliedTypeTree { tpt, args } if matches!(&tpt.kind, TreeKind::Ident { name } if name.starts_with("Tuple") || name == "<tuple>") => {
                     args.clone()
                 }
                 _ if is_unit_tuple(&t) => vec![],
@@ -1243,7 +1267,8 @@ impl<'a> Parser<'a> {
             let sp = self.span();
             // refinement — skip balanced braces and report
             self.skip_balanced_brace();
-            return self.unimplemented(sp.merge(self.prev_span()), "refinement types (`T { ... }`)");
+            return self
+                .unimplemented(sp.merge(self.prev_span()), "refinement types (`T { ... }`)");
         }
         if parents.len() == 1 {
             t
@@ -1299,7 +1324,12 @@ impl<'a> Parser<'a> {
                 if matches!(self.kind(), TokenKind::RParen) {
                     let sp = self.span();
                     self.bump();
-                    self.alloc(sp, TreeKind::Ident { name: "Unit".into() })
+                    self.alloc(
+                        sp,
+                        TreeKind::Ident {
+                            name: "Unit".into(),
+                        },
+                    )
                 } else {
                     let mut ts = vec![self.parse_type()];
                     while matches!(self.kind(), TokenKind::Comma) {
@@ -1370,9 +1400,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     t = self.alloc(
                         t.span.merge(sp),
-                        TreeKind::SingletonTypeTree {
-                            ref_: Box::new(t),
-                        },
+                        TreeKind::SingletonTypeTree { ref_: Box::new(t) },
                     );
                     continue;
                 }
@@ -1461,14 +1489,24 @@ impl<'a> Parser<'a> {
                 let lo = self.span();
                 self.bump();
                 let expr = if self.kind().can_start_stat()
-                    && !matches!(self.kind(), TokenKind::Newline | TokenKind::Semi | TokenKind::RBrace | TokenKind::Eof)
-                    && !matches!(self.kind(), TokenKind::Else | TokenKind::Catch | TokenKind::Finally)
-                {
+                    && !matches!(
+                        self.kind(),
+                        TokenKind::Newline | TokenKind::Semi | TokenKind::RBrace | TokenKind::Eof
+                    )
+                    && !matches!(
+                        self.kind(),
+                        TokenKind::Else | TokenKind::Catch | TokenKind::Finally
+                    ) {
                     self.parse_expr()
                 } else {
                     self.alloc(lo, TreeKind::Literal { lit: Lit::Unit })
                 };
-                self.alloc(lo.merge(expr.span), TreeKind::Return { expr: Box::new(expr) })
+                self.alloc(
+                    lo.merge(expr.span),
+                    TreeKind::Return {
+                        expr: Box::new(expr),
+                    },
+                )
             }
             TokenKind::Implicit => {
                 // implicit lambda: implicit x => e
@@ -1610,7 +1648,10 @@ impl<'a> Parser<'a> {
                 self.expect("}", |k| matches!(k, TokenKind::RBrace));
             } else {
                 let _ = self.parse_expr();
-                self.error_span(lo, "unimplemented syntax: `catch` of a non-block expression");
+                self.error_span(
+                    lo,
+                    "unimplemented syntax: `catch` of a non-block expression",
+                );
             }
         }
         self.skip_nl();
@@ -1910,7 +1951,10 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                self.alloc(sp.merge(self.prev_span()), TreeKind::Super { qual: None, mix })
+                self.alloc(
+                    sp.merge(self.prev_span()),
+                    TreeKind::Super { qual: None, mix },
+                )
             }
             TokenKind::Underscore => {
                 let sp = self.span();
@@ -1921,12 +1965,22 @@ impl<'a> Parser<'a> {
             TokenKind::True => {
                 let sp = self.span();
                 self.bump();
-                self.alloc(sp, TreeKind::Literal { lit: Lit::Boolean(true) })
+                self.alloc(
+                    sp,
+                    TreeKind::Literal {
+                        lit: Lit::Boolean(true),
+                    },
+                )
             }
             TokenKind::False => {
                 let sp = self.span();
                 self.bump();
-                self.alloc(sp, TreeKind::Literal { lit: Lit::Boolean(false) })
+                self.alloc(
+                    sp,
+                    TreeKind::Literal {
+                        lit: Lit::Boolean(false),
+                    },
+                )
             }
             TokenKind::Null => {
                 let sp = self.span();
@@ -1946,7 +2000,12 @@ impl<'a> Parser<'a> {
             TokenKind::DoubleLit(n) => {
                 let sp = self.span();
                 self.bump();
-                self.alloc(sp, TreeKind::Literal { lit: Lit::Double(n) })
+                self.alloc(
+                    sp,
+                    TreeKind::Literal {
+                        lit: Lit::Double(n),
+                    },
+                )
             }
             TokenKind::FloatLit(n) => {
                 let sp = self.span();
@@ -1961,12 +2020,22 @@ impl<'a> Parser<'a> {
             TokenKind::StringLit(s) => {
                 let sp = self.span();
                 self.bump();
-                self.alloc(sp, TreeKind::Literal { lit: Lit::String(s) })
+                self.alloc(
+                    sp,
+                    TreeKind::Literal {
+                        lit: Lit::String(s),
+                    },
+                )
             }
             TokenKind::SymbolLit(s) => {
                 let sp = self.span();
                 self.bump();
-                self.alloc(sp, TreeKind::Literal { lit: Lit::Symbol(s) })
+                self.alloc(
+                    sp,
+                    TreeKind::Literal {
+                        lit: Lit::Symbol(s),
+                    },
+                )
             }
             TokenKind::InterpStart { prefix, .. } => self.parse_interpolated(prefix),
             other => {
@@ -2090,7 +2159,10 @@ impl<'a> Parser<'a> {
         self.skip_nl();
         if matches!(self.kind(), TokenKind::RParen) {
             self.bump();
-            return self.alloc(lo.merge(self.prev_span()), TreeKind::Literal { lit: Lit::Unit });
+            return self.alloc(
+                lo.merge(self.prev_span()),
+                TreeKind::Literal { lit: Lit::Unit },
+            );
         }
         let mut es = vec![self.parse_expr()];
         while matches!(self.kind(), TokenKind::Comma) {
@@ -2127,7 +2199,12 @@ impl<'a> Parser<'a> {
             let cases = self.parse_cases();
             self.expect("}", |k| matches!(k, TokenKind::RBrace));
             // Partial function: (x => x match cases) encoded as Function with Match
-            let sel = self.alloc(lo, TreeKind::Ident { name: "x$pf".into() });
+            let sel = self.alloc(
+                lo,
+                TreeKind::Ident {
+                    name: "x$pf".into(),
+                },
+            );
             let mt = self.alloc(
                 lo.merge(self.prev_span()),
                 TreeKind::Match {
@@ -2315,7 +2392,9 @@ impl<'a> Parser<'a> {
         self.skip_nl();
         if matches!(self.kind(), TokenKind::Colon) {
             self.bump();
-            let tpt = self.parse_type();
+            // Do not parse `A => B` here: the following `=>` starts the case body.
+            // Function types in typed patterns need parentheses: `case _: (A => B) =>`.
+            let tpt = self.parse_infix_type();
             return self.alloc(
                 t.span.merge(tpt.span),
                 TreeKind::Typed {
@@ -2358,7 +2437,10 @@ impl<'a> Parser<'a> {
                 let t = self.alloc(sp, TreeKind::Wildcard);
                 if matches!(self.kind(), TokenKind::Ident(s) if s == "*") {
                     self.bump();
-                    return self.alloc(sp.merge(self.prev_span()), TreeKind::Star { elem: Box::new(t) });
+                    return self.alloc(
+                        sp.merge(self.prev_span()),
+                        TreeKind::Star { elem: Box::new(t) },
+                    );
                 }
                 t
             }
@@ -2382,7 +2464,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 if matches!(self.kind(), TokenKind::RParen) {
                     self.bump();
-                    return self.alloc(lo.merge(self.prev_span()), TreeKind::Literal { lit: Lit::Unit });
+                    return self.alloc(
+                        lo.merge(self.prev_span()),
+                        TreeKind::Literal { lit: Lit::Unit },
+                    );
                 }
                 let mut ps = vec![self.parse_pattern()];
                 while matches!(self.kind(), TokenKind::Comma) {
@@ -2533,9 +2618,7 @@ fn expr_to_params(t: Tree) -> Vec<Tree> {
         }
         TreeKind::Apply { args, .. } => {
             // tuple
-            args.into_iter()
-                .flat_map(expr_to_params)
-                .collect()
+            args.into_iter().flat_map(expr_to_params).collect()
         }
         TreeKind::Literal { lit: Lit::Unit } => vec![],
         _ => vec![Tree {

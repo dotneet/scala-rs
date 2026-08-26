@@ -137,7 +137,11 @@ object M {
     #[test]
     fn unimplemented_is_reported() {
         let r = parse_str("class C { type X = Int forSome { type X } }\n");
-        assert!(has_errors(&r.diags) || dump_tree(&r.tree).contains("Unimplemented") || !r.diags.is_empty());
+        assert!(
+            has_errors(&r.diags)
+                || dump_tree(&r.tree).contains("Unimplemented")
+                || !r.diags.is_empty()
+        );
     }
 
     #[test]
@@ -153,5 +157,26 @@ object M {
     fn first_stat_is_module() {
         let t = parse_ok("object Foo { val x = 1 }\n");
         assert!(matches!(first_stat(&t).kind, TreeKind::ModuleDef { .. }));
+    }
+
+    #[test]
+    fn try_catch_finally() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    try {
+      throw new RuntimeException()
+    } catch {
+      case _: RuntimeException => println("caught")
+    } finally {
+      println("finally")
+    }
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Try"), "{dump}");
     }
 }

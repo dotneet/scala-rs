@@ -4,7 +4,7 @@
 
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 
-use crate::symbol::{SymKind, SymbolTable};
+use crate::symbol::SymbolTable;
 
 /// Rewrite `tree` in place after typer, mutating symbol types to their JVM
 /// (erased) forms.
@@ -61,7 +61,13 @@ pub fn erase_type(ty: &Type) -> Type {
 fn is_primitive(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Int | Type::Long | Type::Double | Type::Boolean | Type::Char | Type::Float | Type::Unit
+        Type::Int
+            | Type::Long
+            | Type::Double
+            | Type::Boolean
+            | Type::Char
+            | Type::Float
+            | Type::Unit
     )
 }
 
@@ -88,7 +94,12 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 erase_tree(s, st, None);
             }
         }
-        TreeKind::ClassDef { tparams, vparamss, impl_, .. } => {
+        TreeKind::ClassDef {
+            tparams,
+            vparamss,
+            impl_,
+            ..
+        } => {
             for tp in tparams {
                 erase_tree(tp, st, None);
             }

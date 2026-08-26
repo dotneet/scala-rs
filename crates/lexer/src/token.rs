@@ -218,6 +218,7 @@ pub fn keyword_kind(text: &str) -> Option<TokenKind> {
         "throw" => TokenKind::Throw,
         "trait" => TokenKind::Trait,
         "true" => TokenKind::True,
+        "try" => TokenKind::Try,
         "type" => TokenKind::TypeKw,
         "val" => TokenKind::Val,
         "var" => TokenKind::Var,

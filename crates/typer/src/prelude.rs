@@ -1,4 +1,4 @@
-use crate::symbol::{Intrinsic, SymbolTable, SymKind};
+use crate::symbol::{Intrinsic, SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub fn install_prelude(st: &mut SymbolTable) {
@@ -12,13 +12,49 @@ pub fn install_prelude(st: &mut SymbolTable) {
     st.anyval_sym = class(st, st.scala_pkg, "AnyVal", "java/lang/Object", &[Type::Any]);
     st.object_sym = class(st, java_lang, "Object", "java/lang/Object", &[Type::AnyRef]);
 
-    st.unit_sym = class(st, st.scala_pkg, "Unit", "scala/runtime/BoxedUnit", &[Type::AnyVal]);
-    st.boolean_sym = class(st, st.scala_pkg, "Boolean", "java/lang/Boolean", &[Type::AnyVal]);
-    st.int_sym = class(st, st.scala_pkg, "Int", "java/lang/Integer", &[Type::AnyVal]);
+    st.unit_sym = class(
+        st,
+        st.scala_pkg,
+        "Unit",
+        "scala/runtime/BoxedUnit",
+        &[Type::AnyVal],
+    );
+    st.boolean_sym = class(
+        st,
+        st.scala_pkg,
+        "Boolean",
+        "java/lang/Boolean",
+        &[Type::AnyVal],
+    );
+    st.int_sym = class(
+        st,
+        st.scala_pkg,
+        "Int",
+        "java/lang/Integer",
+        &[Type::AnyVal],
+    );
     st.long_sym = class(st, st.scala_pkg, "Long", "java/lang/Long", &[Type::AnyVal]);
-    let float = class(st, st.scala_pkg, "Float", "java/lang/Float", &[Type::AnyVal]);
-    st.double_sym = class(st, st.scala_pkg, "Double", "java/lang/Double", &[Type::AnyVal]);
-    let char_s = class(st, st.scala_pkg, "Char", "java/lang/Character", &[Type::AnyVal]);
+    let float = class(
+        st,
+        st.scala_pkg,
+        "Float",
+        "java/lang/Float",
+        &[Type::AnyVal],
+    );
+    st.double_sym = class(
+        st,
+        st.scala_pkg,
+        "Double",
+        "java/lang/Double",
+        &[Type::AnyVal],
+    );
+    let char_s = class(
+        st,
+        st.scala_pkg,
+        "Char",
+        "java/lang/Character",
+        &[Type::AnyVal],
+    );
     let _ = (float, char_s);
 
     st.string_sym = class(st, java_lang, "String", "java/lang/String", &[Type::AnyRef]);
@@ -49,7 +85,13 @@ pub fn install_prelude(st: &mut SymbolTable) {
             args: vec![],
         }],
     );
-    st.array_sym = class(st, st.scala_pkg, "Array", "[java/lang/Object", &[Type::AnyRef]);
+    st.array_sym = class(
+        st,
+        st.scala_pkg,
+        "Array",
+        "[java/lang/Object",
+        &[Type::AnyRef],
+    );
     st.option_sym = class(st, st.scala_pkg, "Option", "scala/Option", &[Type::AnyRef]);
     st.some_sym = class(
         st,
@@ -160,7 +202,13 @@ pub fn install_prelude(st: &mut SymbolTable) {
     st.enter_in_current("::", st.cons_sym);
 }
 
-fn class(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str, parents: &[Type]) -> SymbolId {
+fn class(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    name: &str,
+    jvm: &str,
+    parents: &[Type],
+) -> SymbolId {
     let id = st.alloc(name, owner, SymKind::Class, Flags::FINAL, jvm);
     st.get_mut(id).parents = parents.to_vec();
     st.get_mut(id).ty = Type::Class {
@@ -254,13 +302,48 @@ fn import_members(st: &mut SymbolTable, owner: SymbolId) {
 
 fn add_any_members(st: &mut SymbolTable) {
     let any = st.any_sym;
-    method(st, any, "==", vec![Type::Any], Type::Boolean, Intrinsic::None);
-    method(st, any, "!=", vec![Type::Any], Type::Boolean, Intrinsic::None);
-    method(st, any, "equals", vec![Type::Any], Type::Boolean, Intrinsic::None);
+    method(
+        st,
+        any,
+        "==",
+        vec![Type::Any],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        any,
+        "!=",
+        vec![Type::Any],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        any,
+        "equals",
+        vec![Type::Any],
+        Type::Boolean,
+        Intrinsic::None,
+    );
     method(st, any, "hashCode", vec![], Type::Int, Intrinsic::None);
-    method(st, any, "toString", vec![], Type::String, Intrinsic::AnyToString);
+    method(
+        st,
+        any,
+        "toString",
+        vec![],
+        Type::String,
+        Intrinsic::AnyToString,
+    );
     method(st, any, "asInstanceOf", vec![], Type::Any, Intrinsic::None);
-    method(st, any, "isInstanceOf", vec![], Type::Boolean, Intrinsic::None);
+    method(
+        st,
+        any,
+        "isInstanceOf",
+        vec![],
+        Type::Boolean,
+        Intrinsic::None,
+    );
 }
 
 fn add_int_members(st: &mut SymbolTable) {
@@ -293,10 +376,38 @@ fn add_int_members(st: &mut SymbolTable) {
     method(st, c, "unary_-", vec![], Type::Int, Intrinsic::IntUn("-"));
     method(st, c, "unary_~", vec![], Type::Int, Intrinsic::IntUn("~"));
     method(st, c, "toLong", vec![], Type::Long, Intrinsic::IntToLong);
-    method(st, c, "toDouble", vec![], Type::Double, Intrinsic::IntToDouble);
-    method(st, c, "toString", vec![], Type::String, Intrinsic::AnyToString);
-    method(st, c, "+", vec![Type::Long], Type::Long, Intrinsic::LongBin("+"));
-    method(st, c, "+", vec![Type::Double], Type::Double, Intrinsic::DoubleBin("+"));
+    method(
+        st,
+        c,
+        "toDouble",
+        vec![],
+        Type::Double,
+        Intrinsic::IntToDouble,
+    );
+    method(
+        st,
+        c,
+        "toString",
+        vec![],
+        Type::String,
+        Intrinsic::AnyToString,
+    );
+    method(
+        st,
+        c,
+        "+",
+        vec![Type::Long],
+        Type::Long,
+        Intrinsic::LongBin("+"),
+    );
+    method(
+        st,
+        c,
+        "+",
+        vec![Type::Double],
+        Type::Double,
+        Intrinsic::DoubleBin("+"),
+    );
 }
 
 fn add_long_members(st: &mut SymbolTable) {
@@ -311,11 +422,25 @@ fn add_long_members(st: &mut SymbolTable) {
         method(st, c, op, vec![Type::Long], Type::Long, ic);
     }
     for op in ["==", "!=", "<", "<=", ">", ">="] {
-        method(st, c, op, vec![Type::Long], Type::Boolean, Intrinsic::LongBin(op));
+        method(
+            st,
+            c,
+            op,
+            vec![Type::Long],
+            Type::Boolean,
+            Intrinsic::LongBin(op),
+        );
     }
     method(st, c, "unary_-", vec![], Type::Long, Intrinsic::LongUn("-"));
     method(st, c, "toInt", vec![], Type::Int, Intrinsic::None);
-    method(st, c, "toDouble", vec![], Type::Double, Intrinsic::LongToDouble);
+    method(
+        st,
+        c,
+        "toDouble",
+        vec![],
+        Type::Double,
+        Intrinsic::LongToDouble,
+    );
 }
 
 fn add_double_members(st: &mut SymbolTable) {
@@ -330,28 +455,105 @@ fn add_double_members(st: &mut SymbolTable) {
         method(st, c, op, vec![Type::Double], Type::Double, ic);
     }
     for op in ["==", "!=", "<", "<=", ">", ">="] {
-        method(st, c, op, vec![Type::Double], Type::Boolean, Intrinsic::DoubleBin(op));
+        method(
+            st,
+            c,
+            op,
+            vec![Type::Double],
+            Type::Boolean,
+            Intrinsic::DoubleBin(op),
+        );
     }
-    method(st, c, "unary_-", vec![], Type::Double, Intrinsic::DoubleUn("-"));
+    method(
+        st,
+        c,
+        "unary_-",
+        vec![],
+        Type::Double,
+        Intrinsic::DoubleUn("-"),
+    );
 }
 
 fn add_bool_members(st: &mut SymbolTable) {
     let c = st.boolean_sym;
-    method(st, c, "&&", vec![Type::Boolean], Type::Boolean, Intrinsic::BoolBin("&&"));
-    method(st, c, "||", vec![Type::Boolean], Type::Boolean, Intrinsic::BoolBin("||"));
-    method(st, c, "unary_!", vec![], Type::Boolean, Intrinsic::BoolUn("!"));
-    method(st, c, "==", vec![Type::Boolean], Type::Boolean, Intrinsic::BoolBin("=="));
-    method(st, c, "!=", vec![Type::Boolean], Type::Boolean, Intrinsic::BoolBin("!="));
+    method(
+        st,
+        c,
+        "&&",
+        vec![Type::Boolean],
+        Type::Boolean,
+        Intrinsic::BoolBin("&&"),
+    );
+    method(
+        st,
+        c,
+        "||",
+        vec![Type::Boolean],
+        Type::Boolean,
+        Intrinsic::BoolBin("||"),
+    );
+    method(
+        st,
+        c,
+        "unary_!",
+        vec![],
+        Type::Boolean,
+        Intrinsic::BoolUn("!"),
+    );
+    method(
+        st,
+        c,
+        "==",
+        vec![Type::Boolean],
+        Type::Boolean,
+        Intrinsic::BoolBin("=="),
+    );
+    method(
+        st,
+        c,
+        "!=",
+        vec![Type::Boolean],
+        Type::Boolean,
+        Intrinsic::BoolBin("!="),
+    );
 }
 
 fn add_string_members(st: &mut SymbolTable) {
     let c = st.string_sym;
-    method(st, c, "+", vec![Type::Any], Type::String, Intrinsic::StringConcat);
+    method(
+        st,
+        c,
+        "+",
+        vec![Type::Any],
+        Type::String,
+        Intrinsic::StringConcat,
+    );
     method(st, c, "length", vec![], Type::Int, Intrinsic::None);
-    method(st, c, "charAt", vec![Type::Int], Type::Char, Intrinsic::None);
-    method(st, c, "concat", vec![Type::String], Type::String, Intrinsic::None);
+    method(
+        st,
+        c,
+        "charAt",
+        vec![Type::Int],
+        Type::Char,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        c,
+        "concat",
+        vec![Type::String],
+        Type::String,
+        Intrinsic::None,
+    );
     method(st, c, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
-    method(st, c, "equals", vec![Type::Any], Type::Boolean, Intrinsic::None);
+    method(
+        st,
+        c,
+        "equals",
+        vec![Type::Any],
+        Type::Boolean,
+        Intrinsic::None,
+    );
     method(st, c, "toString", vec![], Type::String, Intrinsic::Identity);
 }
 
@@ -359,7 +561,14 @@ fn add_array_members(st: &mut SymbolTable) {
     let c = st.array_sym;
     method(st, c, "length", vec![], Type::Int, Intrinsic::None);
     method(st, c, "apply", vec![Type::Int], Type::Any, Intrinsic::None);
-    method(st, c, "update", vec![Type::Int, Type::Any], Type::Unit, Intrinsic::None);
+    method(
+        st,
+        c,
+        "update",
+        vec![Type::Int, Type::Any],
+        Type::Unit,
+        Intrinsic::None,
+    );
 }
 
 fn fn1(arg: Type, ret: Type) -> Type {
@@ -380,10 +589,38 @@ fn add_option_members(st: &mut SymbolTable) {
     };
     method(st, o, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
     method(st, o, "get", vec![], ta.clone(), Intrinsic::None);
-    method(st, o, "foreach", vec![fn1(ta.clone(), Type::Unit)], Type::Unit, Intrinsic::None);
-    method(st, o, "map", vec![fn1(ta.clone(), Type::Any)], opt.clone(), Intrinsic::None);
-    method(st, o, "flatMap", vec![fn1(ta.clone(), opt.clone())], opt.clone(), Intrinsic::None);
-    method(st, o, "withFilter", vec![fn1(ta.clone(), Type::Boolean)], opt, Intrinsic::None);
+    method(
+        st,
+        o,
+        "foreach",
+        vec![fn1(ta.clone(), Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        o,
+        "map",
+        vec![fn1(ta.clone(), Type::Any)],
+        opt.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        o,
+        "flatMap",
+        vec![fn1(ta.clone(), opt.clone())],
+        opt.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        o,
+        "withFilter",
+        vec![fn1(ta.clone(), Type::Boolean)],
+        opt,
+        Intrinsic::None,
+    );
 
     let some = st.some_sym;
     let sa = type_param(st, some, "A");
@@ -418,7 +655,14 @@ fn add_list_members(st: &mut SymbolTable) {
     method(st, l, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
     method(st, l, "head", vec![], ta.clone(), Intrinsic::None);
     method(st, l, "tail", vec![], list_t.clone(), Intrinsic::None);
-    method(st, l, "::", vec![Type::Any], list_t.clone(), Intrinsic::None);
+    method(
+        st,
+        l,
+        "::",
+        vec![Type::Any],
+        list_t.clone(),
+        Intrinsic::None,
+    );
     method(
         st,
         l,
@@ -427,7 +671,14 @@ fn add_list_members(st: &mut SymbolTable) {
         Type::Unit,
         Intrinsic::None,
     );
-    method(st, l, "map", vec![fn1(ta.clone(), Type::Any)], list_t.clone(), Intrinsic::None);
+    method(
+        st,
+        l,
+        "map",
+        vec![fn1(ta.clone(), Type::Any)],
+        list_t.clone(),
+        Intrinsic::None,
+    );
     method(
         st,
         l,
@@ -448,7 +699,12 @@ fn add_list_members(st: &mut SymbolTable) {
 
 fn add_function_types(st: &mut SymbolTable) {
     for n in 0..=2 {
-        let f = iface(st, st.scala_pkg, &format!("Function{n}"), &format!("scala/Function{n}"));
+        let f = iface(
+            st,
+            st.scala_pkg,
+            &format!("Function{n}"),
+            &format!("scala/Function{n}"),
+        );
         let params = vec![Type::Any; n];
         method(st, f, "apply", params, Type::Any, Intrinsic::None);
     }
@@ -462,13 +718,62 @@ fn add_predef_members(st: &mut SymbolTable) {
         _ => p,
     };
     method(st, owner, "println", vec![], Type::Unit, Intrinsic::Println);
-    method(st, owner, "println", vec![Type::Int], Type::Unit, Intrinsic::Println);
-    method(st, owner, "println", vec![Type::Long], Type::Unit, Intrinsic::Println);
-    method(st, owner, "println", vec![Type::Double], Type::Unit, Intrinsic::Println);
-    method(st, owner, "println", vec![Type::Boolean], Type::Unit, Intrinsic::Println);
-    method(st, owner, "println", vec![Type::String], Type::Unit, Intrinsic::Println);
-    method(st, owner, "println", vec![Type::Any], Type::Unit, Intrinsic::Println);
-    method(st, owner, "print", vec![Type::Any], Type::Unit, Intrinsic::Print);
+    method(
+        st,
+        owner,
+        "println",
+        vec![Type::Int],
+        Type::Unit,
+        Intrinsic::Println,
+    );
+    method(
+        st,
+        owner,
+        "println",
+        vec![Type::Long],
+        Type::Unit,
+        Intrinsic::Println,
+    );
+    method(
+        st,
+        owner,
+        "println",
+        vec![Type::Double],
+        Type::Unit,
+        Intrinsic::Println,
+    );
+    method(
+        st,
+        owner,
+        "println",
+        vec![Type::Boolean],
+        Type::Unit,
+        Intrinsic::Println,
+    );
+    method(
+        st,
+        owner,
+        "println",
+        vec![Type::String],
+        Type::Unit,
+        Intrinsic::Println,
+    );
+    method(
+        st,
+        owner,
+        "println",
+        vec![Type::Any],
+        Type::Unit,
+        Intrinsic::Println,
+    );
+    method(
+        st,
+        owner,
+        "print",
+        vec![Type::Any],
+        Type::Unit,
+        Intrinsic::Print,
+    );
     let mems = st.get(owner).members.clone();
     st.get_mut(p).members.extend(mems.iter().copied());
     for m in mems {
