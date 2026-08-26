@@ -10,7 +10,7 @@ object Main {
     try {
       ???
     } catch {
-      case _: RuntimeException => println("nyi")
+      case _: Throwable => println("nyi")
     }
   }
 }

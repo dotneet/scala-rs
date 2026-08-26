@@ -10,7 +10,8 @@ scala-rs は、Scala 2.13 の構文と意味論のごく一部を、Rust から 
 
 - フロントエンドは nsc の `Tree` に近い AST を持ちます。
 - ターゲットは Java 6 相当の classfile（major version 50）です。StackMapTable は出しません。
-- scala-library は同梱しません。Option / List / FunctionN は **scala-rs 独自のランタイム classfile**（`scala/Option` など）です。scalac が出す `scala-library.jar` とはバイナリ互換ではありません。
+- デフォルトでは scala-library を同梱しません。Option / List / FunctionN は **scala-rs 独自のランタイム classfile**（`scala/Option` など）です。
+- `--scala-library <jar>`（または `SCALA_LIBRARY_JAR`）を付けると、Option / List / `Nil` / `::` / Some / None / FunctionN / Tuple2 / `NotImplementedError` は **scala-library 2.13.16 の ABI** にリンクし、衝突する私有 classfile は出しません。`java -cp out:scala-library-2.13.16.jar Main` で dual-run できます。
 
 完成した Scala コンパイラではありません。仕様への完全準拠も主張しません。
 
@@ -36,18 +37,21 @@ cargo run -p scala-rs-cli -- compile file.scala -d out/
 
 ```bash
 scala-rs compile file.scala -d out/
+scala-rs compile file.scala -d out/ --scala-library /path/to/scala-library-2.13.16.jar
 ```
 
-コンパイルしてエントリポイント（`object Main` の `main`）を実行します。
+コンパイルしてエントリポイント（`object Main` の `main`）を実行します。`--scala-library` 付きの `run` は jar を `java -cp` に足します。
 
 ```bash
 scala-rs run file.scala
+scala-rs run file.scala --scala-library /path/to/scala-library-2.13.16.jar
 ```
 
-出力した classfile は、scalac と同様に `java` から起動できます。object はモジュールクラス `Main$` と、静的 `main` を持つフォワーダ `Main` を出します。ランタイム（`scala/Option` など）も同じ `-d` ディレクトリに出ます。
+出力した classfile は、scalac と同様に `java` から起動できます。object はモジュールクラス `Main$` と、静的 `main` を持つフォワーダ `Main` を出します。デフォルトではランタイム（`scala/Option` など）も同じ `-d` ディレクトリに出ます。`--scala-library` 時は私有の Option/List/FunctionN は出さず、jar 側を使います。
 
 ```bash
 java -cp out Main
+java -cp out:scala-library-2.13.16.jar Main
 ```
 
 フロントエンドの中間結果を見るデバッグフラグ:
@@ -55,6 +59,7 @@ java -cp out Main
 - `--parse` — パーサの AST ダンプ
 - `--typer` — namer / typer 後の木のダンプ
 - `-Xfatal-warnings` — warning をエラーにする（非網羅 match など）
+- `--scala-library <jar>` — scala-library 2.13 にリンク（私有 Option/List を出さない）。環境変数 `SCALA_LIBRARY_JAR` でも可
 
 フィクスチャはデフォルトパッケージ（`package` 句なし）なので、`-cp out` の `Main` でそのまま動く想定です。
 
@@ -71,7 +76,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - `if` / `else`、`while`
 - `try` / `catch` / `finally`（catch は `{ case ... }`。JVM 例外テーブルを出す）
 - `match`（コンストラクタパターン、リテラル、ワイルドカード）
-- for-comprehension（`map` / `flatMap` / `foreach` / `withFilter` へデシュガー。ランタイムの `List` / `Option` で実行できる）
+- for-comprehension（`map` / `flatMap` / `foreach` / `withFilter` へデシュガー。私有ランタイムの `List` / `Option`、または `--scala-library` 時の jar で実行できる。library リンク時の `withFilter` は eager な `filter` として出す。`WithFilter` 型は未対応）
 - apply / select / infix（`:` 終わりの演算子は右結合で、レシーバは右オペランド。`1 :: Nil` → `Nil.::(1)`）
 - リテラル、タプル
 - 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）
@@ -173,8 +178,8 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 ### Predef（このスライス）
 
 - `assert(cond)` / `require(cond)`（第 2 引数の by-name メッセージあり）。失敗はそれぞれ `AssertionError` / `IllegalArgumentException`
-- `???` は `scala.NotImplementedError`（`RuntimeException` のサブクラス。scala-library のそれではない）
-- `any2ArrowAssoc` による `1 -> "a"`。結果はランタイムの `scala.Tuple2`。JVM 上のメソッド名は `$minus$greater`（nsc の NameTransformer。`->` は `>` を含むので非合法）
+- `???` は `scala.NotImplementedError` を `new` する。私有ランタイムでは `RuntimeException` のサブクラス。scala-library では `java.lang.Error` のサブクラス。dual-run フィクスチャは `Throwable` で捕捉する
+- `any2ArrowAssoc` による `1 -> "a"`。結果は `scala.Tuple2` を直接 `new` する（`Predef.ArrowAssoc` / 私有 `scala.runtime.ArrowAssoc` は呼ばない）。JVM 上のメソッド名 `->` は使わない
 - `identity` / `locally` / `implicitly`（implicit 探索で埋める）
 - `any2stringadd` 相当として `1 + "x"` の文字列連結。implicit 変換 `any2stringadd` も型検査に存在する
 - `"x".length` は `java.lang.String#length`。`toInt` / `toLong` / `toDouble` は `Integer.parseInt` など。**`StringOps` クラスは出していません。** String にメソッドを載せたサブセットです
@@ -185,7 +190,7 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 
 - マクロ
 - コンパイラプラグイン
-- 完全な Scala 標準ライブラリ（ここにある Option / List は scala-rs ランタイムであり、scala-library ではない）
+- 完全な Scala 標準ライブラリ。`--scala-library` なしでは Option / List / FunctionN / Tuple2 は私有ランタイム。**jar にリンクしても** Iterator / Map / Vector / `WithFilter` / `StringOps` クラス / `Predef$` のメソッド本体 / `Int` enrichment などは未対応で、私有ランタイムにも無い
 - Scala 3 構文
 - implicit の優先度 / `Predef` の残り（`augmentString` の完全な StringOps、`scala.Int` コンパニオンの enrichment など）
 - 匿名クラス
@@ -216,7 +221,7 @@ Cargo workspace のクレート:
 正直な差分です。
 
 - **規模**: nsc のごく一部。言語仕様を満たしません。
-- **ライブラリ**: コンパイルは引き続き scala-rs 独自ランタイム（`scala/Option` など）です。scala-library 2.13.16 の jar は Maven Central から取れます。`hello` は `java -cp out:scala-library-2.13.16.jar Main` で dual-run できます（このフィクスチャは Option/List を使いません）。**Option / List / Predef を scala-library の ABI でコンパイルしてはいません。** 名前が衝突するので、混ぜて Option を使う想定ではありません。
+- **ライブラリ**: デフォルトのコンパイルは scala-rs 独自ランタイム（`scala/Option` など）です。`--scala-library scala-library-2.13.16.jar` を付けると、次は jar の ABI にリンクし、同名の私有 classfile は出しません: `Option` / `Some` / `None` / `List` / `Nil` / `::` / `Function0` / `Function1` / `Tuple2` / `NotImplementedError`。`hello` / `option_for` / `list_for` / `predef` / `unapply` は `java -cp out:scala-library-2.13.16.jar Main` で dual-run します。**まだ私有ランタイム（または intrinsic）なもの**: `println` / `assert` / `require`（`System.out` と `AssertionError` / `IAE`）、`->`（`Tuple2` 直結）、String の `length`/`toInt`、その他の stdlib。`List.withFilter` は library の `WithFilter` ではなく `filter` です。`List.unapplySeq` は library では `SeqOps` の identity（`Option` ではない）。
 - **object**: scalac と同様、`Main$`（モジュール）と静的フォワーダ `Main` を出します。`java Main` が動くのはそのためです。
 - **プリミティブ**: `Int` の `+` などは `scala.Int` のボックスメソッドではなく、JVM 命令（`iadd` など）として出します。
 - **trait**: 抽象メンバーだけの trait は JVM interface です。具象メンバーは `T$class` 静的実装と、C3 線形化順のインスタンスフォワーダです。Java 8 default method は使いません（major 50）。`val` は getter/setter + `$init$` です。`abstract override` は `T$$super$m` です。
@@ -226,8 +231,8 @@ Cargo workspace のクレート:
 - **フェーズ**: nsc の uncurry / mixin / lambdaLift などの独立パスはありません。erasure とラムダのクロージャ変換はあります。
 - **sealed**: 非網羅 match は scalac と同様 warning です。`-Xfatal-warnings` でエラーになります。
 - **AnyVal**: scalac は値クラスのクラスファイルと拡張メソッドの両方を出します。scala-rs もクラスは出しますが、呼び出しは `$extension` 静的メソッドで、`new C(x)` は underlying に消えます。
-- **Predef / StringOps**: `assert` / `require` / `???` / `->` / `identity` / `locally` / `implicitly` / `any2stringadd` と String の `length`/`toInt` です。**`StringOps` 型は出していません。** String メソッドのサブセットです。
-- **unapplySeq**: `List` とユーザー定義 extractor、`_*`、名前付き case class パターン。Seq の他実装や `unapplySeq` の `Option[Seq]` 以外の戻りは未対応です。
+- **Predef / StringOps**: `assert` / `require` / `???` / `->` / `identity` / `locally` / `implicitly` / `any2stringadd` と String の `length`/`toInt` です。**`StringOps` 型は出していません。** String メソッドのサブセットです。`???` は library リンク時は jar の `NotImplementedError`（`Error`）、私有時は `RuntimeException` サブクラスです。
+- **unapplySeq**: `List` とユーザー定義 extractor、`_*`、名前付き case class パターン。library リンク時の `List.unapplySeq` は `SeqOps` 戻り。Seq の他実装は未対応です。
 
 scalac の代替ではありません。サブセットの再実装です。
 
@@ -238,6 +243,8 @@ cargo test
 ```
 
 実行時の期待値は `tests/fixtures/` にあります。各 `.scala` に対して `tests/fixtures/expected/` に同名の `.txt`（`println` と同じ末尾改行付きの stdout）を置いています。`java` がある環境では CLI の e2e が stdout を比較します。
+
+scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコンパイルし、`java -cp out:scala-library.jar Main` でも同じ stdout になることを見ます（出力に私有の `scala/Option.class` 等が無いこと）: `hello` / `option_for` / `list_for` / `predef` / `unapply`。`unapply_seq` は私有ランタイムでも動きますが、dual-run の必須セットには入れていません。
 
 | フィクスチャ | 内容 | 期待 stdout |
 | --- | --- | --- |

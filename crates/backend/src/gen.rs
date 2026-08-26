@@ -10,8 +10,29 @@ use scala_rs_typer::{Intrinsic, SymKind, SymbolTable};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
-/// Walk a typed compilation unit and emit classes.
+/// Options for [`emit_opts`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EmitOpts {
+    /// Emit invokes against scala-library 2.13 (Option/List/`::`/FunctionN/…).
+    ///
+    /// The private runtime classfiles are not part of this function; the driver
+    /// skips them when this flag is set. Call sites that would miss on the jar
+    /// (`List.withFilter`, `List.tail()List`, ArrowAssoc) are rewritten here.
+    pub library_abi: bool,
+}
+
+/// Walk a typed compilation unit and emit classes (private-runtime ABI).
 pub fn emit(tree: &Tree, st: &SymbolTable, source_name: &str) -> Vec<EmittedClass> {
+    emit_opts(tree, st, source_name, EmitOpts::default())
+}
+
+/// Walk a typed compilation unit and emit classes.
+pub fn emit_opts(
+    tree: &Tree,
+    st: &SymbolTable,
+    source_name: &str,
+    opts: EmitOpts,
+) -> Vec<EmittedClass> {
     let mut g = Gen {
         st,
         source_name,
@@ -20,6 +41,7 @@ pub fn emit(tree: &Tree, st: &SymbolTable, source_name: &str) -> Vec<EmittedClas
         lambda_n: Cell::new(0),
         trait_impls: HashMap::new(),
         trait_vals: HashMap::new(),
+        library_abi: opts.library_abi,
     };
     g.collect_trait_impls(tree);
     g.walk(tree);
@@ -37,6 +59,7 @@ struct Gen<'a> {
     trait_impls: HashMap<SymbolId, Vec<Tree>>,
     /// Trait `val` definitions with a right-hand side (`T$class.$init$`).
     trait_vals: HashMap<SymbolId, Vec<Tree>>,
+    library_abi: bool,
 }
 
 struct EmitCtx<'a> {
@@ -49,6 +72,30 @@ struct EmitCtx<'a> {
     source: &'a str,
     /// If generating inside a lambda, field on the lambda class holding the outer `this`.
     outer: Option<(&'a str, &'a str, &'a str)>, // (lambda_class, field, outer_desc)
+    library_abi: bool,
+}
+
+fn emit_ctx<'a>(
+    st: &'a SymbolTable,
+    class_sym: SymbolId,
+    class_name: &'a str,
+    ret_ty: Type,
+    extras: &'a RefCell<Vec<EmittedClass>>,
+    lambda_n: &'a Cell<u32>,
+    source: &'a str,
+    library_abi: bool,
+) -> EmitCtx<'a> {
+    EmitCtx {
+        st,
+        class_sym,
+        class_name,
+        ret_ty,
+        extras,
+        lambda_n,
+        source,
+        outer: None,
+        library_abi,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -891,6 +938,7 @@ impl<'a> Gen<'a> {
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
+        let library_abi = self.library_abi;
         let has_outer = outer.is_some();
         let outer_desc_c = outer_desc.clone();
         let mixin_inits: Vec<(String, String)> = if class_id.is_none() {
@@ -932,16 +980,16 @@ impl<'a> Gen<'a> {
                 asm.aload(0);
                 asm.invokestatic(impl_cls, "$init$", init_desc);
             }
-            let ctx = EmitCtx {
+            let ctx = emit_ctx(
                 st,
-                class_sym: class_id,
-                class_name: &class_name,
-                ret_ty: Type::Unit,
+                class_id,
+                &class_name,
+                Type::Unit,
                 extras,
                 lambda_n,
                 source,
-                outer: None,
-            };
+                library_abi,
+            );
             for vd in &inits {
                 if let TreeKind::ValDef {
                     name, mods, rhs, ..
@@ -1003,18 +1051,19 @@ impl<'a> Gen<'a> {
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
+        let library_abi = self.library_abi;
         b.add_code(acc, name, &desc, max_locals, |asm| {
             let mut frame = frame;
-            let ctx = EmitCtx {
+            let ctx = emit_ctx(
                 st,
-                class_sym: class_id,
-                class_name: &class_name,
-                ret_ty: ret_for_body.clone(),
+                class_id,
+                &class_name,
+                ret_for_body.clone(),
                 extras,
                 lambda_n,
                 source,
-                outer: None,
-            };
+                library_abi,
+            );
             gen_expr(asm, &mut frame, &ctx, rhs);
             if is_unit_like(&ret_for_body) {
                 pop_if_value(asm, &rhs.ty);
@@ -1071,6 +1120,7 @@ impl<'a> Gen<'a> {
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
+        let library_abi = self.library_abi;
         b.add_code(
             ACC_PUBLIC | ACC_STATIC,
             &ext_name,
@@ -1078,16 +1128,16 @@ impl<'a> Gen<'a> {
             max_locals,
             |asm| {
                 let mut frame = frame;
-                let ctx = EmitCtx {
+                let ctx = emit_ctx(
                     st,
-                    class_sym: class_id,
-                    class_name: &class_name,
-                    ret_ty: ret_for_body.clone(),
+                    class_id,
+                    &class_name,
+                    ret_for_body.clone(),
                     extras,
                     lambda_n,
                     source,
-                    outer: None,
-                };
+                    library_abi,
+                );
                 gen_expr(asm, &mut frame, &ctx, rhs);
                 if is_unit_like(&ret_for_body) {
                     pop_if_value(asm, &rhs.ty);
@@ -1131,19 +1181,20 @@ impl<'a> Gen<'a> {
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
+        let library_abi = self.library_abi;
         let vals = vals.to_vec();
         b.add_code(ACC_PUBLIC | ACC_STATIC, "$init$", &desc, 4, |asm| {
             let mut frame = Frame::instance();
-            let ctx = EmitCtx {
+            let ctx = emit_ctx(
                 st,
-                class_sym: trait_id,
-                class_name: &iface_owned,
-                ret_ty: Type::Unit,
+                trait_id,
+                &iface_owned,
+                Type::Unit,
                 extras,
                 lambda_n,
                 source,
-                outer: None,
-            };
+                library_abi,
+            );
             for vd in &vals {
                 if let TreeKind::ValDef {
                     name, mods, rhs, ..
@@ -1206,18 +1257,19 @@ impl<'a> Gen<'a> {
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
+        let library_abi = self.library_abi;
         b.add_code(ACC_PUBLIC | ACC_STATIC, name, &desc, max_locals, |asm| {
             let mut frame = frame;
-            let ctx = EmitCtx {
+            let ctx = emit_ctx(
                 st,
-                class_sym: trait_id,
-                class_name: &iface_owned,
-                ret_ty: ret_for_body.clone(),
+                trait_id,
+                &iface_owned,
+                ret_for_body.clone(),
                 extras,
                 lambda_n,
                 source,
-                outer: None,
-            };
+                library_abi,
+            );
             gen_expr(asm, &mut frame, &ctx, rhs);
             if is_unit_like(&ret_for_body) {
                 pop_if_value(asm, &rhs.ty);
@@ -1505,6 +1557,7 @@ impl<'a> Gen<'a> {
             let extras = &self.extras;
             let lambda_n = &self.lambda_n;
             let source = self.source_name;
+            let library_abi = self.library_abi;
             let rhs = rhs.clone();
             let mask = 1i32 << bit;
             bit += 1;
@@ -1523,16 +1576,16 @@ impl<'a> Gen<'a> {
                 asm.iand();
                 let inited = asm.fresh_label();
                 asm.ifne(inited);
-                let ctx = EmitCtx {
+                let ctx = emit_ctx(
                     st,
-                    class_sym: class_id,
-                    class_name: &class_name,
-                    ret_ty: ret_ty.clone(),
+                    class_id,
+                    &class_name,
+                    ret_ty.clone(),
                     extras,
                     lambda_n,
                     source,
-                    outer: None,
-                };
+                    library_abi,
+                );
                 asm.aload(0);
                 gen_expr(asm, &mut frame, &ctx, &rhs);
                 asm.putfield(&class_name, &fname, &fdesc);
@@ -1670,22 +1723,23 @@ impl<'a> Gen<'a> {
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
+        let library_abi = self.library_abi;
         b.add_code(ACC_PRIVATE, "<init>", "()V", 1, |asm| {
             let mut frame = Frame::instance();
             asm.aload(0);
             asm.invokespecial("java/lang/Object", "<init>", "()V");
             asm.aload(0);
             asm.putstatic(&class_name, "MODULE$", &format!("L{class_name};"));
-            let ctx = EmitCtx {
+            let ctx = emit_ctx(
                 st,
-                class_sym: class_id,
-                class_name: &class_name,
-                ret_ty: Type::Unit,
+                class_id,
+                &class_name,
+                Type::Unit,
                 extras,
                 lambda_n,
                 source,
-                outer: None,
-            };
+                library_abi,
+            );
             for vd in &inits {
                 if let TreeKind::ValDef {
                     name, mods, rhs, ..
@@ -2438,8 +2492,7 @@ fn gen_apply(
         return;
     }
     if matches!(ic, Intrinsic::WrapArrowAssoc) {
-        asm.new_obj("scala/runtime/ArrowAssoc");
-        asm.dup();
+        // Identity: `->` is lowered to `new Tuple2` so ArrowAssoc is never allocated.
         if let Some(a) = args.first() {
             gen_expr(asm, frame, ctx, a);
             if is_jvm_primitive(&a.ty) {
@@ -2448,11 +2501,6 @@ fn gen_apply(
         } else {
             asm.aconst_null();
         }
-        asm.invokespecial(
-            "scala/runtime/ArrowAssoc",
-            "<init>",
-            "(Ljava/lang/Object;)V",
-        );
         return;
     }
     if matches!(ic, Intrinsic::StringToInt) {
@@ -2477,6 +2525,11 @@ fn gen_apply(
             && matches!(&fun.ty, Type::Function { .. }))
     {
         gen_function_apply(asm, frame, ctx, fun, args, &tree.ty);
+        return;
+    }
+
+    if is_arrow_assoc_arrow(ctx, fun) {
+        gen_tuple2_arrow(asm, frame, ctx, fun, args);
         return;
     }
 
@@ -2709,12 +2762,91 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     let s = ctx.st.get(id);
     let owner_id = s.owner;
     let owner = class_internal(ctx.st, owner_id);
-    let desc = method_desc_from_sym(ctx.st, id);
-    if is_interface_sym(ctx.st, owner_id) {
-        asm.invokeinterface(&owner, &s.name, &desc);
-    } else {
-        asm.invokevirtual(&owner, &s.name, &desc);
+    let mut name = s.name.as_str();
+    let mut desc = method_desc_from_sym(ctx.st, id);
+    if ctx.library_abi {
+        if name == "withFilter" && is_stdlib_option_or_list(&owner) {
+            // Library withFilter returns WithFilter; for-comprehensions only
+            // need a same-shape collection. `filter` matches Option/List ABI.
+            name = "filter";
+        } else if name == "tail" && is_stdlib_list(&owner) {
+            if is_interface_sym(ctx.st, owner_id) {
+                asm.invokeinterface(&owner, "tail", "()Lscala/collection/LinearSeq;");
+            } else {
+                asm.invokevirtual(&owner, "tail", "()Lscala/collection/LinearSeq;");
+            }
+            asm.checkcast("scala/collection/immutable/List");
+            return;
+        } else if name == "unapplySeq" && is_list_module_owner(&owner) {
+            desc = "(Lscala/collection/SeqOps;)Lscala/collection/SeqOps;".into();
+        }
     }
+    if is_interface_sym(ctx.st, owner_id) {
+        asm.invokeinterface(&owner, name, &desc);
+    } else {
+        asm.invokevirtual(&owner, name, &desc);
+    }
+}
+
+fn is_stdlib_list(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/collection/immutable/List"
+            | "scala/collection/immutable/$colon$colon"
+            | "scala/collection/immutable/Nil$"
+    )
+}
+
+fn is_stdlib_option(owner: &str) -> bool {
+    matches!(owner, "scala/Option" | "scala/Some" | "scala/None$")
+}
+
+fn is_stdlib_option_or_list(owner: &str) -> bool {
+    is_stdlib_option(owner) || is_stdlib_list(owner)
+}
+
+fn is_list_module_owner(owner: &str) -> bool {
+    owner == "scala/collection/immutable/List$"
+}
+
+fn is_list_unapply_seq(st: &SymbolTable, uid: SymbolId) -> bool {
+    let s = st.get(uid);
+    s.name == "unapplySeq" && is_list_module_owner(&class_internal(st, s.owner))
+}
+
+fn is_arrow_assoc_arrow(ctx: &EmitCtx, fun: &Tree) -> bool {
+    if fun.name() != Some("->") {
+        return false;
+    }
+    if fun.sym.is_none() {
+        return true;
+    }
+    class_internal(ctx.st, ctx.st.get(fun.sym).owner).contains("ArrowAssoc")
+}
+
+fn gen_tuple2_arrow(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    fun: &Tree,
+    args: &[Tree],
+) {
+    asm.new_obj("scala/Tuple2");
+    asm.dup();
+    gen_receiver(asm, frame, ctx, fun);
+    if let Some(a) = args.first() {
+        gen_expr(asm, frame, ctx, a);
+        if is_jvm_primitive(&a.ty) {
+            emit_box(asm, &a.ty);
+        }
+    } else {
+        asm.aconst_null();
+    }
+    asm.invokespecial(
+        "scala/Tuple2",
+        "<init>",
+        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+    );
 }
 
 fn gen_assert_require(
@@ -3082,6 +3214,7 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
     let lambda_n = ctx.lambda_n;
     let source = ctx.source;
     let class_sym = ctx.class_sym;
+    let library_abi = ctx.library_abi;
     let orig_class = ctx.class_name.to_string();
     let lam_name2 = lam_name.clone();
     let outer_desc = format!("L{orig_class};");
@@ -3132,6 +3265,7 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             lambda_n,
             source,
             outer: outer_ref,
+            library_abi,
         };
         gen_expr(a, &mut fr, &inner_ctx, &body);
         if is_unit_like(&ret_ty) {
@@ -3557,6 +3691,12 @@ fn gen_unapply_pattern(
         asm.ifeq(fail);
         return;
     }
+    let is_seq = ctx.st.get(uid).name == "unapplySeq";
+    if is_seq && ctx.library_abi && is_list_unapply_seq(ctx.st, uid) {
+        // scala-library `List.unapplySeq` is identity on SeqOps, not Option.
+        gen_unapply_seq_bind(asm, frame, ctx, args, fail);
+        return;
+    }
     asm.dup();
     asm.invokevirtual("scala/Option", "isEmpty", "()Z");
     let nonempty = asm.fresh_label();
@@ -3618,11 +3758,7 @@ fn gen_unapply_seq_bind(
         asm.invokevirtual("scala/collection/immutable/List", "isEmpty", "()Z");
         asm.ifne(fail);
         load(asm, list_slot, JvmSort::Ref);
-        asm.invokevirtual(
-            "scala/collection/immutable/List",
-            "head",
-            "()Ljava/lang/Object;",
-        );
+        emit_list_head(asm, ctx);
         if is_jvm_primitive(&a.ty) {
             emit_unbox(asm, &a.ty);
         } else if matches!(a.ty, Type::String) {
@@ -3630,17 +3766,47 @@ fn gen_unapply_seq_bind(
         }
         bind_subpattern(asm, frame, ctx, a, fail);
         load(asm, list_slot, JvmSort::Ref);
-        asm.invokevirtual(
-            "scala/collection/immutable/List",
-            "tail",
-            "()Lscala/collection/immutable/List;",
-        );
+        emit_list_tail(asm, ctx);
         store(asm, list_slot, JvmSort::Ref);
     }
     if !saw_star {
         load(asm, list_slot, JvmSort::Ref);
         asm.invokevirtual("scala/collection/immutable/List", "isEmpty", "()Z");
         asm.ifeq(fail);
+    }
+}
+
+fn emit_list_head(asm: &mut Assembler, ctx: &EmitCtx) {
+    if ctx.library_abi {
+        // `head` is on LinearSeqOps; List itself has no `head()Object` method.
+        asm.invokeinterface(
+            "scala/collection/LinearSeqOps",
+            "head",
+            "()Ljava/lang/Object;",
+        );
+    } else {
+        asm.invokevirtual(
+            "scala/collection/immutable/List",
+            "head",
+            "()Ljava/lang/Object;",
+        );
+    }
+}
+
+fn emit_list_tail(asm: &mut Assembler, ctx: &EmitCtx) {
+    if ctx.library_abi {
+        asm.invokevirtual(
+            "scala/collection/immutable/List",
+            "tail",
+            "()Lscala/collection/LinearSeq;",
+        );
+        asm.checkcast("scala/collection/immutable/List");
+    } else {
+        asm.invokevirtual(
+            "scala/collection/immutable/List",
+            "tail",
+            "()Lscala/collection/immutable/List;",
+        );
     }
 }
 
@@ -3896,6 +4062,17 @@ mod tests {
         classes
     }
 
+    fn compile_src_library(src: &str) -> Vec<EmittedClass> {
+        let (mut tree, mut st, diags) = typecheck_str(src);
+        assert!(
+            !has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        scala_rs_typer::erase(&mut tree, &mut st);
+        emit_opts(&tree, &st, "Test.scala", EmitOpts { library_abi: true })
+    }
+
     fn run_main(src: &str) -> Option<String> {
         if !java_available() {
             return None;
@@ -3946,6 +4123,30 @@ object Main {
                 c.internal_name
             );
         }
+    }
+
+    #[test]
+    fn library_abi_does_not_emit_option_or_list() {
+        let classes = compile_src_library(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val xs = 1 :: 2 :: Nil
+    val o = Some(1)
+    println(xs)
+    println(o)
+  }
+}
+"#,
+        );
+        for c in &classes {
+            assert!(
+                !c.internal_name.starts_with("scala/"),
+                "library ABI must not emit {} (use scala-library.jar)",
+                c.internal_name
+            );
+        }
+        assert!(classes.iter().any(|c| c.internal_name == "Main$"));
     }
 
     #[test]
@@ -4339,7 +4540,7 @@ object Main {
     try {
       ???
     } catch {
-      case _: RuntimeException => println("nyi")
+      case _: Throwable => println("nyi")
     }
   }
 }

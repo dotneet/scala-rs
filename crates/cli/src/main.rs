@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use scala_rs_driver::{compile_paths, run_main, CompileOptions, CompileResult};
+use scala_rs_driver::{compile_paths, run_main_with_cp, CompileOptions, CompileResult};
 use scala_rs_span::render_all;
 
 fn main() -> ExitCode {
@@ -55,8 +55,8 @@ fn print_help() {
 scala-rs — a Scala 2.13 subset compiler (not Scala 3)
 
 USAGE:
-    scala-rs compile <files...> [-d <dir>] [--parse] [--typer] [-Xfatal-warnings]
-    scala-rs run <file> [--] [java-args...]
+    scala-rs compile <files...> [-d <dir>] [--scala-library <jar>] [--parse] [--typer] [-Xfatal-warnings]
+    scala-rs run <file> [--scala-library <jar>] [--] [java-args...]
     scala-rs --help
 
 This is an experimental reimplementation of a Scala 2.13 (nsc) subset.
@@ -68,6 +68,9 @@ COMMANDS:
 
 OPTIONS:
     -d <dir>   Output directory for class files (default: .)
+    --scala-library <jar>
+               Link against scala-library 2.13 (do not emit private Option/List).
+               Also accepted as SCALA_LIBRARY_JAR. `run` adds the jar to java -cp.
     --parse             Parse only and dump the AST (do not typecheck or emit)
     --typer             Dump the typed tree after namer/typer
     -Xfatal-warnings    Treat warnings as errors (non-exhaustive match, …)
@@ -75,6 +78,7 @@ OPTIONS:
 
 EXAMPLES:
     scala-rs compile Main.scala -d out
+    scala-rs compile Main.scala --scala-library scala-library-2.13.16.jar -d out
     scala-rs compile Main.scala --parse
     scala-rs run Main.scala
     scala-rs run Main.scala -- arg1 arg2
@@ -129,6 +133,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
     let mut parse_only = false;
     let mut typer_dump = false;
     let mut fatal_warnings = false;
+    let mut scala_library = None;
     let mut files = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -153,6 +158,17 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             typer_dump = true;
         } else if a == "-Xfatal-warnings" {
             fatal_warnings = true;
+        } else if a == "--scala-library" {
+            i += 1;
+            let jar = args
+                .get(i)
+                .ok_or_else(|| "option --scala-library requires a jar path".to_string())?;
+            scala_library = Some(PathBuf::from(jar));
+        } else if let Some(jar) = a.strip_prefix("--scala-library=") {
+            if jar.is_empty() {
+                return Err("option --scala-library requires a jar path".into());
+            }
+            scala_library = Some(PathBuf::from(jar));
         } else if a.starts_with('-') {
             return Err(format!("unknown option '{a}'"));
         } else {
@@ -167,12 +183,20 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             parse_only,
             typer_dump,
             fatal_warnings,
+            scala_library: resolve_scala_library(scala_library),
         },
     })
 }
 
+fn resolve_scala_library(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    std::env::var_os("SCALA_LIBRARY_JAR").map(PathBuf::from)
+}
+
 fn cmd_run(args: &[String]) -> ExitCode {
-    let (file, java_args) = match parse_run_args(args) {
+    let parsed = match parse_run_args(args) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -188,13 +212,15 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
     };
 
+    let scala_library = resolve_scala_library(parsed.scala_library);
     let opts = CompileOptions {
         out_dir: out_dir.clone(),
         parse_only: false,
         typer_dump: false,
         fatal_warnings: false,
+        scala_library: scala_library.clone(),
     };
-    let result = compile_paths(&[file], &opts);
+    let result = compile_paths(&[parsed.file], &opts);
     print_diags(&result);
     if !result.ok() {
         let _ = std::fs::remove_dir_all(&out_dir);
@@ -202,8 +228,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
 
     let main = result.mains.first().map(String::as_str).unwrap_or("Main");
+    let extra: Vec<PathBuf> = scala_library.into_iter().collect();
 
-    let output = match run_main(&out_dir, main, &java_args) {
+    let output = match run_main_with_cp(&out_dir, &extra, main, &parsed.java_args) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("error: failed to run java: {e}");
@@ -222,15 +249,33 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
 }
 
-fn parse_run_args(args: &[String]) -> Result<(PathBuf, Vec<String>), String> {
+struct RunArgs {
+    file: PathBuf,
+    java_args: Vec<String>,
+    scala_library: Option<PathBuf>,
+}
+
+fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut file: Option<PathBuf> = None;
     let mut java_args = Vec::new();
+    let mut scala_library = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
             java_args.extend_from_slice(&args[i + 1..]);
             break;
+        } else if a == "--scala-library" {
+            i += 1;
+            let jar = args
+                .get(i)
+                .ok_or_else(|| "option --scala-library requires a jar path".to_string())?;
+            scala_library = Some(PathBuf::from(jar));
+        } else if let Some(jar) = a.strip_prefix("--scala-library=") {
+            if jar.is_empty() {
+                return Err("option --scala-library requires a jar path".into());
+            }
+            scala_library = Some(PathBuf::from(jar));
         } else if file.is_none() {
             if a.starts_with('-') {
                 return Err(format!("unknown option '{a}'"));
@@ -242,7 +287,11 @@ fn parse_run_args(args: &[String]) -> Result<(PathBuf, Vec<String>), String> {
         i += 1;
     }
     let file = file.ok_or_else(|| "run requires a source file".to_string())?;
-    Ok((file, java_args))
+    Ok(RunArgs {
+        file,
+        java_args,
+        scala_library,
+    })
 }
 
 fn make_temp_out() -> std::io::Result<PathBuf> {
