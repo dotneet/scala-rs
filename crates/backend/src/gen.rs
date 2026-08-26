@@ -6,7 +6,7 @@ use crate::classfile::{
 };
 use crate::code::Assembler;
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
-use scala_rs_typer::{Intrinsic, SymbolTable, SymKind};
+use scala_rs_typer::{Intrinsic, SymKind, SymbolTable};
 use std::collections::{HashMap, HashSet};
 
 pub struct EmittedClass {
@@ -157,9 +157,7 @@ impl ClassBuilder {
             methods: self.methods,
             source: self.source,
         };
-        let bytes = class
-            .write_with_pool(self.pool)
-            .expect("classfile write");
+        let bytes = class.write_with_pool(self.pool).expect("classfile write");
         EmittedClass {
             internal_name: this_name,
             bytes,
@@ -268,10 +266,7 @@ fn method_desc_from_sym(st: &SymbolTable, id: SymbolId) -> String {
     match &s.ty {
         Type::Method { paramss, ret } => {
             let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
-            if params
-                .iter()
-                .any(|p| p.is_no_type() || p.is_error())
-            {
+            if params.iter().any(|p| p.is_no_type() || p.is_error()) {
                 let params: Vec<Type> = s.params.iter().map(|p| st.get(*p).ty.clone()).collect();
                 jvm_method_desc(st, &params, ret)
             } else {
@@ -309,9 +304,7 @@ fn is_interface_sym(st: &SymbolTable, id: SymbolId) -> bool {
 
 fn is_module_class(st: &SymbolTable, id: SymbolId) -> bool {
     let s = st.get(id);
-    s.kind == SymKind::ModuleClass
-        || s.kind == SymKind::Module
-        || s.flags.contains(Flags::MODULE)
+    s.kind == SymKind::ModuleClass || s.kind == SymKind::Module || s.flags.contains(Flags::MODULE)
 }
 
 fn module_class_id(st: &SymbolTable, id: SymbolId) -> SymbolId {
@@ -1269,7 +1262,11 @@ fn gen_new(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tpt: &Tree, ar
         .is_none()
         .then(|| ctx.st.class_sym_of(&tpt.ty))
         .flatten()
-        .or(if tpt.sym.is_none() { None } else { Some(tpt.sym) })
+        .or(if tpt.sym.is_none() {
+            None
+        } else {
+            Some(tpt.sym)
+        })
         .or_else(|| ctx.st.class_sym_of(&tpt.ty))
         .unwrap_or(tpt.sym);
     let internal = if class_id.is_none() {
@@ -1666,7 +1663,11 @@ fn gen_string_concat(
     asm.invokespecial("java/lang/StringBuilder", "<init>", "()V");
     gen_sb_append(asm, frame, ctx, left);
     gen_sb_append(asm, frame, ctx, right);
-    asm.invokevirtual("java/lang/StringBuilder", "toString", "()Ljava/lang/String;");
+    asm.invokevirtual(
+        "java/lang/StringBuilder",
+        "toString",
+        "()Ljava/lang/String;",
+    );
 }
 
 fn gen_interpolated(
@@ -1688,7 +1689,11 @@ fn gen_interpolated(
     if parts.len() > args.len() {
         sb_append_string(asm, &parts[args.len()]);
     }
-    asm.invokevirtual("java/lang/StringBuilder", "toString", "()Ljava/lang/String;");
+    asm.invokevirtual(
+        "java/lang/StringBuilder",
+        "toString",
+        "()Ljava/lang/String;",
+    );
 }
 
 fn sb_append_string(asm: &mut Assembler, s: &str) {
@@ -1991,7 +1996,11 @@ mod tests {
     fn write_classes(dir: &Path, classes: &[EmittedClass]) {
         for c in classes {
             let mut path = dir.to_path_buf();
-            let parts: Vec<&str> = c.internal_name.split('/').filter(|p| !p.is_empty()).collect();
+            let parts: Vec<&str> = c
+                .internal_name
+                .split('/')
+                .filter(|p| !p.is_empty())
+                .collect();
             match parts.split_last() {
                 Some((file, dirs)) => {
                     for d in dirs {
