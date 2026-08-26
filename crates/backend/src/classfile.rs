@@ -10,6 +10,7 @@ pub const ACC_FINAL: u16 = 0x0010;
 pub const ACC_SUPER: u16 = 0x0020;
 pub const ACC_INTERFACE: u16 = 0x0200;
 pub const ACC_ABSTRACT: u16 = 0x0400;
+pub const ACC_BRIDGE: u16 = 0x0040;
 pub const ACC_SYNTHETIC: u16 = 0x1000;
 
 /// Scala NameTransformer encoding so operator methods are legal JVM names.

@@ -168,7 +168,10 @@ pub fn regenerate_zero(src: &mut [u8]) -> usize {
 pub fn decode7to8(src: &mut [u8], srclen: usize) -> usize {
     let mut i = 0;
     let mut j = 0;
-    let dstlen = (srclen * 7 + 7) / 8;
+    // Inverse of encode8to7's `(srclen * 8 + 6) / 7`. The nsc formula
+    // `(srclen * 7 + 7) / 8` rounds up and leaves a padding 0 that would
+    // look like another pickle entry.
+    let dstlen = (srclen * 7) / 8;
     while i + 7 < srclen {
         let mut out = src[i] as i32;
         let mut inp = src[i + 1] as i32;
@@ -674,6 +677,9 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
     }
     let mut entries: Vec<Entry> = Vec::new();
     while r.remaining() {
+        if r.bytes[r.pos..].iter().all(|&b| b == 0) {
+            break;
+        }
         let len = r.read_nat()? as usize;
         let start = r.pos;
         let end = start.saturating_add(len).min(r.bytes.len());
@@ -888,9 +894,10 @@ object Lib {
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
         let lib = st
-            .lookup("Lib")
-            .into_iter()
-            .find(|&s| st.get(s).kind == scala_rs_typer::SymKind::Module)
+            .symbols
+            .iter()
+            .find(|s| s.name == "Lib" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
             .expect("Lib module");
         let cls = st.module_class_of(lib);
         let raw = pickle_class(&st, cls);
