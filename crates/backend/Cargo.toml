@@ -1,0 +1,11 @@
+[package]
+name = "scala-rs-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JVM classfile emitter for scala-rs"
+
+[dependencies]
+scala-rs-span.workspace = true
+scala-rs-parser.workspace = true
+scala-rs-typer.workspace = true

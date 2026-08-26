@@ -1,0 +1,10 @@
+[package]
+name = "scala-rs-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Scala 2.13 parser and AST"
+
+[dependencies]
+scala-rs-span.workspace = true
+scala-rs-lexer.workspace = true

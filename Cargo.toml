@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/span",
+    "crates/lexer",
+    "crates/parser",
+    "crates/typer",
+    "crates/backend",
+    "crates/driver",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A Scala 2.13 compiler written in Rust (nsc reimplementation)"
+repository = "https://github.com/scala-rs/scala-rs"
+
+[workspace.dependencies]
+scala-rs-span = { path = "crates/span" }
+scala-rs-lexer = { path = "crates/lexer" }
+scala-rs-parser = { path = "crates/parser" }
+scala-rs-typer = { path = "crates/typer" }
+scala-rs-backend = { path = "crates/backend" }
+scala-rs-driver = { path = "crates/driver" }

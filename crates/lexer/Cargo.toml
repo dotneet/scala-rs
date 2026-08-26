@@ -1,0 +1,9 @@
+[package]
+name = "scala-rs-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Scala 2.13 lexer"
+
+[dependencies]
+scala-rs-span.workspace = true

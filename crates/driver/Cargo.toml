@@ -1,0 +1,13 @@
+[package]
+name = "scala-rs-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compiler driver: parse, type, emit"
+
+[dependencies]
+scala-rs-span.workspace = true
+scala-rs-lexer.workspace = true
+scala-rs-parser.workspace = true
+scala-rs-typer.workspace = true
+scala-rs-backend.workspace = true

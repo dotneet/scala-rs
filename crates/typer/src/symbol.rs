@@ -1,0 +1,379 @@
+//! Symbols, scopes, and the compilation context.
+
+use scala_rs_parser::{Flags, SymbolId, Type};
+use std::collections::HashMap;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SymKind {
+    NoSymbol,
+    Package,
+    Class,
+    Module,
+    ModuleClass,
+    Method,
+    Term,
+    TypeParam,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intrinsic {
+    None,
+    Println,
+    Print,
+    IntBin(&'static str),
+    IntUn(&'static str),
+    LongBin(&'static str),
+    LongUn(&'static str),
+    DoubleBin(&'static str),
+    DoubleUn(&'static str),
+    BoolBin(&'static str),
+    BoolUn(&'static str),
+    StringConcat,
+    AnyToString,
+    Identity,
+    IntToLong,
+    IntToDouble,
+    LongToDouble,
+}
+
+#[derive(Clone, Debug)]
+pub struct Symbol {
+    pub id: SymbolId,
+    pub name: String,
+    pub owner: SymbolId,
+    pub kind: SymKind,
+    pub flags: Flags,
+    pub ty: Type,
+    pub members: Vec<SymbolId>,
+    pub jvm_name: String,
+    pub intrinsic: Intrinsic,
+    /// Constructor / method parameter symbols (flat, first clause).
+    pub params: Vec<SymbolId>,
+    pub paramss: Vec<Vec<SymbolId>>,
+    /// For case classes / classes: constructor parameter field names.
+    pub ctor_fields: Vec<SymbolId>,
+    pub parents: Vec<Type>,
+    pub default_rhs: Option<scala_rs_parser::Tree>,
+}
+
+impl Symbol {
+    pub fn is_class_like(&self) -> bool {
+        matches!(self.kind, SymKind::Class | SymKind::ModuleClass)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Scope {
+    map: HashMap<String, Vec<SymbolId>>,
+}
+
+impl Scope {
+    pub fn enter(&mut self, name: &str, id: SymbolId) {
+        self.map.entry(name.to_string()).or_default().push(id);
+    }
+
+    pub fn lookup(&self, name: &str) -> &[SymbolId] {
+        self.map.get(name).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        self.map.keys()
+    }
+}
+
+pub struct SymbolTable {
+    pub symbols: Vec<Symbol>,
+    pub scopes: Vec<Scope>,
+    pub root: SymbolId,
+    pub scala_pkg: SymbolId,
+    pub predef: SymbolId,
+    pub any_sym: SymbolId,
+    pub anyref_sym: SymbolId,
+    pub anyval_sym: SymbolId,
+    pub int_sym: SymbolId,
+    pub long_sym: SymbolId,
+    pub double_sym: SymbolId,
+    pub boolean_sym: SymbolId,
+    pub unit_sym: SymbolId,
+    pub string_sym: SymbolId,
+    pub array_sym: SymbolId,
+    pub option_sym: SymbolId,
+    pub some_sym: SymbolId,
+    pub none_sym: SymbolId,
+    pub list_sym: SymbolId,
+    pub nil_sym: SymbolId,
+    pub cons_sym: SymbolId,
+    pub object_sym: SymbolId,
+    /// Enclosing owner while naming/typing.
+    pub owner: SymbolId,
+    pub this_class: SymbolId,
+}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        let mut st = SymbolTable {
+            symbols: vec![Symbol {
+                id: SymbolId(0),
+                name: "<none>".into(),
+                owner: SymbolId(0),
+                kind: SymKind::NoSymbol,
+                flags: Flags::EMPTY,
+                ty: Type::NoType,
+                members: vec![],
+                jvm_name: String::new(),
+                intrinsic: Intrinsic::None,
+                params: vec![],
+                paramss: vec![],
+                ctor_fields: vec![],
+                parents: vec![],
+                default_rhs: None,
+            }],
+            scopes: vec![Scope::default()],
+            root: SymbolId(0),
+            scala_pkg: SymbolId(0),
+            predef: SymbolId(0),
+            any_sym: SymbolId(0),
+            anyref_sym: SymbolId(0),
+            anyval_sym: SymbolId(0),
+            int_sym: SymbolId(0),
+            long_sym: SymbolId(0),
+            double_sym: SymbolId(0),
+            boolean_sym: SymbolId(0),
+            unit_sym: SymbolId(0),
+            string_sym: SymbolId(0),
+            array_sym: SymbolId(0),
+            option_sym: SymbolId(0),
+            some_sym: SymbolId(0),
+            none_sym: SymbolId(0),
+            list_sym: SymbolId(0),
+            nil_sym: SymbolId(0),
+            cons_sym: SymbolId(0),
+            object_sym: SymbolId(0),
+            owner: SymbolId(0),
+            this_class: SymbolId(0),
+        };
+        st.root = st.alloc("<_root_>", SymbolId(0), SymKind::Package, Flags::PACKAGE, "scala/runtime");
+        st.owner = st.root;
+        st
+    }
+
+    pub fn alloc(
+        &mut self,
+        name: impl Into<String>,
+        owner: SymbolId,
+        kind: SymKind,
+        flags: Flags,
+        jvm_name: impl Into<String>,
+    ) -> SymbolId {
+        let id = SymbolId(self.symbols.len() as u32);
+        self.symbols.push(Symbol {
+            id,
+            name: name.into(),
+            owner,
+            kind,
+            flags,
+            ty: Type::NoType,
+            members: vec![],
+            jvm_name: jvm_name.into(),
+            intrinsic: Intrinsic::None,
+            params: vec![],
+            paramss: vec![],
+            ctor_fields: vec![],
+            parents: vec![],
+            default_rhs: None,
+        });
+        if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
+            if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {
+                ow.members.push(id);
+            }
+        }
+        id
+    }
+
+    pub fn get(&self, id: SymbolId) -> &Symbol {
+        &self.symbols[id.0 as usize]
+    }
+
+    pub fn get_mut(&mut self, id: SymbolId) -> &mut Symbol {
+        &mut self.symbols[id.0 as usize]
+    }
+
+    pub fn enter_in_current(&mut self, name: &str, id: SymbolId) {
+        self.scopes.last_mut().unwrap().enter(name, id);
+    }
+
+    pub fn push_scope(&mut self) {
+        self.scopes.push(Scope::default());
+    }
+
+    pub fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    pub fn lookup(&self, name: &str) -> Vec<SymbolId> {
+        for sc in self.scopes.iter().rev() {
+            let found = sc.lookup(name);
+            if !found.is_empty() {
+                return found.to_vec();
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn lookup_member(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut work = vec![owner];
+        while let Some(id) = work.pop() {
+            if !seen.insert(id.0) {
+                continue;
+            }
+            let sym = self.get(id);
+            for m in &sym.members {
+                if self.get(*m).name == name {
+                    out.push(*m);
+                }
+            }
+            for p in &sym.parents.clone() {
+                if let Some(ps) = self.class_sym_of(p) {
+                    work.push(ps);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn class_sym_of(&self, ty: &Type) -> Option<SymbolId> {
+        match ty {
+            Type::Class { sym, .. } | Type::ModuleRef(sym) => Some(*sym),
+            Type::Int => Some(self.int_sym),
+            Type::Long => Some(self.long_sym),
+            Type::Double => Some(self.double_sym),
+            Type::Boolean => Some(self.boolean_sym),
+            Type::Unit => Some(self.unit_sym),
+            Type::String => Some(self.string_sym),
+            Type::Any => Some(self.any_sym),
+            Type::AnyRef => Some(self.anyref_sym),
+            Type::AnyVal => Some(self.anyval_sym),
+            Type::Array(_) => Some(self.array_sym),
+            Type::Named { name, .. } => self
+                .lookup(name)
+                .into_iter()
+                .find(|s| self.get(*s).is_class_like()),
+            _ => None,
+        }
+    }
+
+    pub fn type_of_class(&self, id: SymbolId) -> Type {
+        let s = self.get(id);
+        match s.kind {
+            SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
+            _ => Type::Class {
+                sym: id,
+                args: vec![],
+            },
+        }
+    }
+
+    pub fn is_sub_type(&self, a: &Type, b: &Type) -> bool {
+        if a == b {
+            return true;
+        }
+        match (a, b) {
+            (Type::Error, _) | (_, Type::Error) => true,
+            (Type::Nothing, _) => true,
+            (_, Type::Any) => true,
+            (
+                Type::Null,
+                Type::AnyRef | Type::String | Type::Array(_) | Type::Class { .. } | Type::ModuleRef(_),
+            ) => true,
+            (
+                Type::Int | Type::Long | Type::Double | Type::Boolean | Type::Unit | Type::Char | Type::Float,
+                Type::AnyVal,
+            ) => true,
+            (
+                Type::String | Type::Array(_) | Type::Class { .. } | Type::ModuleRef(_) | Type::Function { .. },
+                Type::AnyRef,
+            ) => true,
+            (Type::Class { sym: s1, .. }, Type::Class { sym: s2, .. }) if s1 == s2 => true,
+            (Type::Class { sym: s1, .. }, b) => self
+                .get(*s1)
+                .parents
+                .clone()
+                .iter()
+                .any(|p| self.is_sub_type(p, b)),
+            (Type::Array(x), Type::Array(y)) => self.is_sub_type(x, y),
+            (Type::ModuleRef(s), Type::Class { sym, .. }) if s == sym => true,
+            _ => false,
+        }
+    }
+
+    pub fn display_type(&self, ty: &Type) -> String {
+        match ty {
+            Type::Class { sym, args } => {
+                let mut s = self.get(*sym).name.clone();
+                if !args.is_empty() {
+                    s.push('[');
+                    s.push_str(
+                        &args
+                            .iter()
+                            .map(|a| self.display_type(a))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                    s.push(']');
+                }
+                s
+            }
+            Type::ModuleRef(id) => self.get(*id).name.clone(),
+            Type::Array(t) => format!("Array[{}]", self.display_type(t)),
+            Type::Method { paramss, ret } => {
+                let mut s = String::new();
+                for ps in paramss {
+                    s.push('(');
+                    s.push_str(
+                        &ps.iter()
+                            .map(|p| self.display_type(p))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                    s.push(')');
+                }
+                s.push_str(&self.display_type(ret));
+                s
+            }
+            Type::Function { params, ret } => {
+                let p = params
+                    .iter()
+                    .map(|p| self.display_type(p))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({}) => {}", p, self.display_type(ret))
+            }
+            other => other.to_string(),
+        }
+    }
+
+    pub fn jvm_internal(&self, id: SymbolId) -> String {
+        let s = self.get(id);
+        if !s.jvm_name.is_empty() {
+            return s.jvm_name.clone();
+        }
+        // walk owners
+        let mut parts = vec![s.name.clone()];
+        let mut o = s.owner;
+        while !o.is_none() && self.get(o).kind == SymKind::Package && self.get(o).name != "<_root_>"
+        {
+            parts.push(self.get(o).name.clone());
+            o = self.get(o).owner;
+        }
+        parts.reverse();
+        parts.join("/")
+    }
+}
+
+impl Default for SymbolTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}

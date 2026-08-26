@@ -1,0 +1,8 @@
+[package]
+name = "scala-rs-span"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Source locations and diagnostics for scala-rs"
+
+[dependencies]

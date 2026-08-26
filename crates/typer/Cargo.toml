@@ -1,0 +1,10 @@
+[package]
+name = "scala-rs-typer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Namer and typer for scala-rs (Scala 2.13 subset)"
+
+[dependencies]
+scala-rs-span.workspace = true
+scala-rs-parser.workspace = true
