@@ -855,6 +855,121 @@ object Main extends A with B {
     }
 
     #[test]
+    fn implicit_inherited_more_specific_vs_local_less_is_ambiguous() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+class A { def tag: String = "A" }
+class B extends A { override def tag: String = "B" }
+class Parent { implicit val more: B = new B() }
+object Main extends Parent {
+  implicit val less: A = new A()
+  def pick(implicit x: A): String = x.tag
+  def main(args: Array[String]): Unit = {
+    val s: String = pick()
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("ambiguous implicit")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn implicit_local_more_specific_beats_inherited_less() {
+        ok(r#"
+class A { def tag: String = "A" }
+class B extends A { override def tag: String = "B" }
+class Parent { implicit val less: A = new A() }
+object Main extends Parent {
+  implicit val more: B = new B()
+  def pick(implicit x: A): String = x.tag
+  def main(args: Array[String]): Unit = {
+    val s: String = pick()
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn partial_function_typechecks() {
+        ok(r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val pf: PartialFunction[Int, Int] = { case 1 => 2; case 2 => 3 }
+    val a: Boolean = pf.isDefinedAt(1)
+    val b: Int = pf.apply(1)
+    val c: Int = pf.applyOrElse(3, (x: Int) => 0)
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn private_this_same_instance_ok() {
+        ok(r#"
+class C {
+  private[this] val n: Int = 1
+  def get: Int = n
+  def add: Int = this.n + 1
+}
+"#);
+    }
+
+    #[test]
+    fn private_this_other_instance_rejected() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+class C {
+  private[this] val n: Int = 1
+  def steal(other: C): Int = other.n
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("cannot be accessed")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn protected_qual_legal_and_illegal() {
+        ok(r#"
+class C {
+  protected[C] val n: Int = 1
+  def get: Int = n
+  def fromPeer(other: C): Int = other.n
+}
+class D extends C {
+  def mine: Int = this.n
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+class C {
+  protected[C] val n: Int = 1
+}
+object Main {
+  def peek(c: C): Int = c.n
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("cannot be accessed")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn type_member_and_projection() {
         ok(r#"
 trait Foo { type A; def x: A }

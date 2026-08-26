@@ -486,18 +486,19 @@ impl<'a> Parser<'a> {
 
     fn parse_modifiers(&mut self) -> Modifiers {
         let mut flags = Flags::EMPTY;
+        let mut private_within = None;
         loop {
             self.skip_nl();
             match self.kind() {
                 TokenKind::Private => {
                     flags = flags.with(Flags::PRIVATE);
                     self.bump();
-                    self.parse_access_qualifier();
+                    self.apply_access_qualifier(&mut flags, &mut private_within);
                 }
                 TokenKind::Protected => {
                     flags = flags.with(Flags::PROTECTED);
                     self.bump();
-                    self.parse_access_qualifier();
+                    self.apply_access_qualifier(&mut flags, &mut private_within);
                 }
                 TokenKind::Abstract => {
                     flags = flags.with(Flags::ABSTRACT);
@@ -538,19 +539,36 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
         }
-        Modifiers::new(flags)
+        Modifiers {
+            flags,
+            private_within,
+        }
     }
 
-    fn parse_access_qualifier(&mut self) {
+    fn apply_access_qualifier(&mut self, flags: &mut Flags, private_within: &mut Option<String>) {
+        if let Some(q) = self.parse_access_qualifier() {
+            if q == "this" {
+                *flags = flags.with(Flags::LOCAL);
+            } else {
+                *private_within = Some(q);
+            }
+        }
+    }
+
+    fn parse_access_qualifier(&mut self) -> Option<String> {
         if matches!(self.kind(), TokenKind::LBracket) {
             self.bump();
             self.skip_nl();
-            if matches!(self.kind(), TokenKind::This) {
+            let q = if matches!(self.kind(), TokenKind::This) {
                 self.bump();
+                "this".to_string()
             } else {
-                let _ = self.expect_ident();
-            }
+                self.expect_ident().0
+            };
             self.expect("]", |k| matches!(k, TokenKind::RBracket));
+            Some(q)
+        } else {
+            None
         }
     }
 

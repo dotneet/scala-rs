@@ -175,6 +175,10 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     add_option_members(st, option_wf, library_abi);
     add_list_members(st, with_filter, iterator, library_abi);
     add_function_types(st);
+    add_partial_function(st);
+    if library_abi {
+        add_list_collect(st);
+    }
     let ordered = add_ordered(st);
 
     // Some companion with apply
@@ -1134,6 +1138,77 @@ fn add_function_types(st: &mut SymbolTable) {
         let params = vec![Type::Any; n];
         method(st, f, "apply", params, Type::Any, Intrinsic::None);
     }
+}
+
+fn add_partial_function(st: &mut SymbolTable) {
+    let f1 = st
+        .get(st.scala_pkg)
+        .members
+        .iter()
+        .copied()
+        .find(|id| st.get(*id).name == "Function1")
+        .unwrap_or(SymbolId::NONE);
+    let pf = iface(
+        st,
+        st.scala_pkg,
+        "PartialFunction",
+        "scala/PartialFunction",
+    );
+    let a = type_param(st, pf, "A");
+    let b = type_param(st, pf, "B");
+    st.get_mut(pf).tparams = vec![a, b];
+    let ta = Type::TypeParam(a);
+    let tb = Type::TypeParam(b);
+    st.get_mut(pf).parents = vec![
+        Type::Class {
+            sym: f1,
+            args: vec![ta.clone(), tb.clone()],
+        },
+        Type::AnyRef,
+    ];
+    method(st, pf, "apply", vec![ta.clone()], tb.clone(), Intrinsic::None);
+    method(
+        st,
+        pf,
+        "isDefinedAt",
+        vec![ta.clone()],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        pf,
+        "applyOrElse",
+        vec![ta.clone(), fn1(ta, tb.clone())],
+        tb,
+        Intrinsic::None,
+    );
+}
+
+fn add_list_collect(st: &mut SymbolTable) {
+    let pf = st
+        .get(st.scala_pkg)
+        .members
+        .iter()
+        .copied()
+        .find(|id| st.get(*id).name == "PartialFunction")
+        .unwrap_or(SymbolId::NONE);
+    let l = st.list_sym;
+    let a = st.get(l).tparams.first().copied().unwrap_or(SymbolId::NONE);
+    let ta = if a.is_none() {
+        Type::Any
+    } else {
+        Type::TypeParam(a)
+    };
+    let list_t = Type::Class {
+        sym: l,
+        args: vec![ta.clone()],
+    };
+    let pf_ty = Type::Class {
+        sym: pf,
+        args: vec![ta, Type::Any],
+    };
+    method(st, l, "collect", vec![pf_ty], list_t, Intrinsic::None);
 }
 
 fn add_map_and_vector(st: &mut SymbolTable) {

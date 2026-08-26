@@ -276,6 +276,22 @@ fn fixtures_implicit_nested() {
     check("implicit_nested");
 }
 #[test]
+fn fixtures_implicit_inherit_local() {
+    check("implicit_inherit_local");
+}
+#[test]
+fn fixtures_partial_function() {
+    check("partial_function");
+}
+#[test]
+fn fixtures_private_this() {
+    check("private_this");
+}
+#[test]
+fn fixtures_protected_qual() {
+    check("protected_qual");
+}
+#[test]
 fn fixtures_defaults_still_run() {
     check("defaults");
 }
@@ -375,6 +391,21 @@ fn fixtures_implicit_ambiguous_is_error() {
 #[test]
 fn fixtures_implicit_ambiguous_parents_is_error() {
     compile_fails("implicit_ambiguous_parents", "ambiguous implicit");
+}
+
+#[test]
+fn fixtures_implicit_inherit_local_ambiguous_is_error() {
+    compile_fails("implicit_inherit_local_ambiguous", "ambiguous implicit");
+}
+
+#[test]
+fn fixtures_private_this_bad_is_error() {
+    compile_fails("private_this_bad", "cannot be accessed");
+}
+
+#[test]
+fn fixtures_protected_qual_bad_is_error() {
+    compile_fails("protected_qual_bad", "cannot be accessed");
 }
 
 #[test]
@@ -588,6 +619,21 @@ fn scala_library_dual_run_view_bounds() {
     dual_run_fixture("view_bounds");
 }
 
+#[test]
+fn scala_library_dual_run_implicit_inherit_local() {
+    dual_run_fixture("implicit_inherit_local");
+}
+
+#[test]
+fn scala_library_dual_run_partial_function() {
+    dual_run_fixture("partial_function");
+}
+
+#[test]
+fn scala_library_dual_run_list_collect() {
+    dual_run_fixture("list_collect");
+}
+
 const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Option.class",
     "scala/Some.class",
@@ -595,6 +641,7 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/None$.class",
     "scala/Function0.class",
     "scala/Function1.class",
+    "scala/PartialFunction.class",
     "scala/Tuple2.class",
     "scala/NotImplementedError.class",
     "scala/collection/immutable/List.class",

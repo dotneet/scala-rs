@@ -342,6 +342,7 @@ impl Typer {
                         flags = flags.with(Flags::PRIVATE);
                     }
                     let fid = self.st.alloc(name, id, SymKind::Term, flags, "");
+                    self.st.get_mut(fid).private_within = mods.private_within.clone();
                     self.st.enter_in_current(name, fid);
                     p.sym = fid;
                     fields.push(fid);
@@ -523,6 +524,7 @@ impl Typer {
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Term, mods.flags, "");
+                self.st.get_mut(id).private_within = mods.private_within.clone();
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
@@ -530,6 +532,7 @@ impl Typer {
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Method, mods.flags, "");
+                self.st.get_mut(id).private_within = mods.private_within.clone();
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
@@ -537,6 +540,7 @@ impl Typer {
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::TypeMember, mods.flags, "");
+                self.st.get_mut(id).private_within = mods.private_within.clone();
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
@@ -1131,10 +1135,15 @@ impl Typer {
     }
 
     fn type_val_sig(&mut self, tree: &mut Tree) {
-        let (tpt, name, flags) = match &tree.kind {
+        let (tpt, name, flags, within) = match &tree.kind {
             TreeKind::ValDef {
                 tpt, name, mods, ..
-            } => (tpt.clone(), name.clone(), mods.flags),
+            } => (
+                tpt.clone(),
+                name.clone(),
+                mods.flags,
+                mods.private_within.clone(),
+            ),
             _ => return,
         };
         let ty = if tpt.is_empty() {
@@ -1157,6 +1166,7 @@ impl Typer {
         }
         if !tree.sym.is_none() {
             self.st.get_mut(tree.sym).ty = ty.clone();
+            self.st.get_mut(tree.sym).private_within = within;
             if flags.contains(Flags::DEFAULTPARAM) {
                 let f = self.st.get(tree.sym).flags.with(Flags::DEFAULTPARAM);
                 self.st.get_mut(tree.sym).flags = f;
@@ -1167,6 +1177,18 @@ impl Typer {
             }
             if flags.contains(Flags::BYNAME) {
                 let f = self.st.get(tree.sym).flags.with(Flags::BYNAME);
+                self.st.get_mut(tree.sym).flags = f;
+            }
+            if flags.contains(Flags::LOCAL) {
+                let f = self.st.get(tree.sym).flags.with(Flags::LOCAL);
+                self.st.get_mut(tree.sym).flags = f;
+            }
+            if flags.contains(Flags::PRIVATE) {
+                let f = self.st.get(tree.sym).flags.with(Flags::PRIVATE);
+                self.st.get_mut(tree.sym).flags = f;
+            }
+            if flags.contains(Flags::PROTECTED) {
+                let f = self.st.get(tree.sym).flags.with(Flags::PROTECTED);
                 self.st.get_mut(tree.sym).flags = f;
             }
         }
@@ -1203,14 +1225,22 @@ impl Typer {
     }
 
     fn type_def_sig(&mut self, tree: &mut Tree) {
-        let (tparams, vparamss, tpt, name) = match &mut tree.kind {
+        let (tparams, vparamss, tpt, name, mods_within, mods_flags) = match &mut tree.kind {
             TreeKind::DefDef {
                 tparams,
                 vparamss,
                 tpt,
                 name,
+                mods,
                 ..
-            } => (tparams, vparamss, tpt.clone(), name.clone()),
+            } => (
+                tparams,
+                vparamss,
+                tpt.clone(),
+                name.clone(),
+                mods.private_within.clone(),
+                mods.flags,
+            ),
             _ => return,
         };
         if tree.sym.is_none() {
@@ -1366,6 +1396,19 @@ impl Typer {
             self.st.get_mut(tree.sym).ty = mty;
             self.st.get_mut(tree.sym).params = all_params;
             self.st.get_mut(tree.sym).paramss = paramss_ids;
+            self.st.get_mut(tree.sym).private_within = mods_within;
+            if mods_flags.contains(Flags::LOCAL) {
+                let f = self.st.get(tree.sym).flags.with(Flags::LOCAL);
+                self.st.get_mut(tree.sym).flags = f;
+            }
+            if mods_flags.contains(Flags::PRIVATE) {
+                let f = self.st.get(tree.sym).flags.with(Flags::PRIVATE);
+                self.st.get_mut(tree.sym).flags = f;
+            }
+            if mods_flags.contains(Flags::PROTECTED) {
+                let f = self.st.get(tree.sym).flags.with(Flags::PROTECTED);
+                self.st.get_mut(tree.sym).flags = f;
+            }
         }
         let _ = name;
     }
@@ -2037,6 +2080,19 @@ impl Typer {
             return;
         }
         found = self.drop_overridden(found);
+        found.retain(|s| self.accessible(*s, Some(qual.as_ref())));
+        if found.is_empty() {
+            self.error(
+                tree.span,
+                format!(
+                    "value {name} cannot be accessed as a member of {} from {}",
+                    self.st.display_type(&qual.ty),
+                    self.access_from_name()
+                ),
+            );
+            tree.ty = Type::Error;
+            return;
+        }
         let subst = |ty: Type| -> Type {
             if let Type::Class { args, .. } = &qual.ty {
                 if !args.is_empty() {
@@ -2107,6 +2163,123 @@ impl Typer {
                 })
             })
             .collect()
+    }
+
+    fn access_from_name(&self) -> String {
+        if self.st.this_class.is_none() {
+            "<none>".into()
+        } else {
+            self.st.get(self.st.this_class).name.clone()
+        }
+    }
+
+    /// nsc-style accessibility. `private[this]` requires a `this` prefix.
+    /// `protected[C]` is protected plus everything nested in `C`.
+    fn accessible(&self, sym: SymbolId, prefix: Option<&Tree>) -> bool {
+        if sym.is_none() {
+            return true;
+        }
+        let s = self.st.get(sym);
+        let flags = s.flags;
+        let restricted = flags.contains(Flags::PRIVATE)
+            || flags.contains(Flags::PROTECTED)
+            || s.private_within.is_some();
+        if !restricted {
+            return true;
+        }
+        let owner = s.owner;
+        let current = self.st.this_class;
+        if flags.contains(Flags::PRIVATE) && flags.contains(Flags::LOCAL) {
+            return self.prefix_is_this(prefix) && self.nested_in(current, owner);
+        }
+        if flags.contains(Flags::PRIVATE) {
+            if let Some(w) = &s.private_within {
+                return self.access_within(current, w);
+            }
+            return self.nested_in(current, owner);
+        }
+        if flags.contains(Flags::PROTECTED) {
+            let by_qual = s
+                .private_within
+                .as_ref()
+                .map(|w| self.access_within(current, w))
+                .unwrap_or(false);
+            let by_sub = self.protected_subclass_ok(current, owner, prefix);
+            return by_qual || by_sub;
+        }
+        if let Some(w) = &s.private_within {
+            return self.access_within(current, w);
+        }
+        true
+    }
+
+    fn prefix_is_this(&self, prefix: Option<&Tree>) -> bool {
+        match prefix {
+            None => true,
+            Some(t) => matches!(t.kind, TreeKind::This { .. } | TreeKind::Super { .. }),
+        }
+    }
+
+    fn nested_in(&self, current: SymbolId, owner: SymbolId) -> bool {
+        if owner.is_none() {
+            return true;
+        }
+        let mut c = current;
+        while !c.is_none() {
+            if c == owner {
+                return true;
+            }
+            c = self.st.get(c).owner;
+        }
+        false
+    }
+
+    fn access_within(&self, current: SymbolId, name: &str) -> bool {
+        let boundary = self.resolve_access_boundary(name);
+        if boundary.is_none() {
+            return false;
+        }
+        self.nested_in(current, boundary)
+            || self.st.get(current).name == name
+            || self.st.get(current).name.trim_end_matches('$') == name
+    }
+
+    fn resolve_access_boundary(&self, name: &str) -> SymbolId {
+        for id in self.st.lookup(name) {
+            if matches!(
+                self.st.get(id).kind,
+                SymKind::Class | SymKind::ModuleClass | SymKind::Module | SymKind::Package
+            ) {
+                return match self.st.get(id).kind {
+                    SymKind::Module => self.st.module_class_of(id),
+                    _ => id,
+                };
+            }
+        }
+        let mut c = self.st.this_class;
+        while !c.is_none() {
+            if self.st.get(c).name == name || self.st.get(c).name.trim_end_matches('$') == name {
+                return c;
+            }
+            c = self.st.get(c).owner;
+        }
+        SymbolId::NONE
+    }
+
+    fn protected_subclass_ok(&self, current: SymbolId, owner: SymbolId, prefix: Option<&Tree>) -> bool {
+        if current.is_none() || owner.is_none() {
+            return false;
+        }
+        let cur_ty = self.st.type_of_class(current);
+        let own_ty = self.st.type_of_class(owner);
+        if current != owner && !self.st.is_sub_type(&cur_ty, &own_ty) {
+            return false;
+        }
+        match prefix {
+            None => true,
+            Some(t) if matches!(t.kind, TreeKind::This { .. } | TreeKind::Super { .. }) => true,
+            Some(t) => self.st.is_sub_type(&t.ty, &cur_ty),
+        }
     }
 
     /// When a member exists on the receiver (e.g. `Int.+`) but the argument
@@ -2283,9 +2456,20 @@ impl Typer {
                     {
                         if let Type::Function { ret: fr, .. } = &param_tys[0] {
                             param_tys[0] = Type::Function {
-                                params: vec![elem],
+                                params: vec![elem.clone()],
                                 ret: fr.clone(),
                             };
+                        }
+                    }
+                    if fun_name == "collect" && !param_tys.is_empty() {
+                        if let Type::Class { sym, args } = &param_tys[0] {
+                            if is_partial_function_sym(&self.st, *sym) {
+                                let to = args.get(1).cloned().unwrap_or(Type::Any);
+                                param_tys[0] = Type::Class {
+                                    sym: *sym,
+                                    args: vec![elem, to],
+                                };
+                            }
                         }
                     }
                 }
@@ -2347,6 +2531,26 @@ impl Typer {
                                         args: vec![(**fr).clone()],
                                     };
                                 }
+                            }
+                        }
+                    }
+                } else if method_name == "collect" {
+                    if let Some(a0) = args.first() {
+                        let to = match &a0.ty {
+                            Type::Class { args, .. } if args.len() >= 2 => Some(args[1].clone()),
+                            Type::Function { ret, .. } => Some((**ret).clone()),
+                            _ => None,
+                        };
+                        if let Some(to) = to {
+                            if let Some(cls) = recv_ty
+                                .as_ref()
+                                .and_then(|t| self.st.class_sym_of(t))
+                                .map(|c| self.collection_root(c))
+                            {
+                                ret = Type::Class {
+                                    sym: cls,
+                                    args: vec![to],
+                                };
                             }
                         }
                     }
@@ -3135,17 +3339,22 @@ impl Typer {
     }
 
     fn type_function(&mut self, vparams: &mut Vec<Tree>, body: &mut Tree, pt: &Type) -> Type {
-        let (pts, ret_pt) = match pt {
-            Type::Function { params, ret } => (params.clone(), (**ret).clone()),
-            Type::Named { name, args } if name.starts_with("Function") => {
-                if args.is_empty() {
-                    (vec![Type::NoType; vparams.len()], Type::NoType)
-                } else {
-                    let ret = args.last().cloned().unwrap_or(Type::NoType);
-                    (args[..args.len() - 1].to_vec(), ret)
+        let pf_result = partial_function_type(&self.st, pt);
+        let (pts, ret_pt) = if let Some((from, to)) = &pf_result {
+            (vec![from.clone()], to.clone())
+        } else {
+            match pt {
+                Type::Function { params, ret } => (params.clone(), (**ret).clone()),
+                Type::Named { name, args } if name.starts_with("Function") => {
+                    if args.is_empty() {
+                        (vec![Type::NoType; vparams.len()], Type::NoType)
+                    } else {
+                        let ret = args.last().cloned().unwrap_or(Type::NoType);
+                        (args[..args.len() - 1].to_vec(), ret)
+                    }
                 }
+                _ => (vec![Type::NoType; vparams.len()], Type::NoType),
             }
-            _ => (vec![Type::NoType; vparams.len()], Type::NoType),
         };
         self.st.push_scope();
         let mut param_tys = Vec::new();
@@ -3183,9 +3392,13 @@ impl Typer {
             ret_pt
         };
         self.st.pop_scope();
-        Type::Function {
-            params: param_tys,
-            ret: Box::new(ret),
+        if pf_result.is_some() {
+            pt.clone()
+        } else {
+            Type::Function {
+                params: param_tys,
+                ret: Box::new(ret),
+            }
         }
     }
 
@@ -4469,8 +4682,37 @@ impl Typer {
 fn is_function_pt(pt: &Type) -> bool {
     match pt {
         Type::Function { .. } => true,
-        Type::Named { name, .. } if name.starts_with("Function") => true,
+        Type::Named { name, .. }
+            if name.starts_with("Function") || name == "PartialFunction" =>
+        {
+            true
+        }
         _ => false,
+    }
+}
+
+fn is_partial_function_sym(st: &SymbolTable, id: SymbolId) -> bool {
+    if id.is_none() {
+        return false;
+    }
+    let s = st.get(id);
+    s.name == "PartialFunction"
+        && (s.jvm_name == "scala/PartialFunction" || s.jvm_name.ends_with("PartialFunction"))
+}
+
+fn partial_function_type(st: &SymbolTable, pt: &Type) -> Option<(Type, Type)> {
+    match pt {
+        Type::Named { name, args } if name == "PartialFunction" && args.len() == 2 => {
+            Some((args[0].clone(), args[1].clone()))
+        }
+        Type::Class { sym, args } if is_partial_function_sym(st, *sym) => {
+            if args.len() >= 2 {
+                Some((args[0].clone(), args[1].clone()))
+            } else {
+                Some((Type::Any, Type::Any))
+            }
+        }
+        _ => None,
     }
 }
 

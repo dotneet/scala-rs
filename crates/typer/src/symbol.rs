@@ -72,6 +72,9 @@ pub struct Symbol {
     pub children: Vec<SymbolId>,
     /// Self type (`trait T { self: Foo => }`).
     pub self_type: Option<Type>,
+    /// Access qualifier `private[C]` / `protected[C]` (`C` is a class or package name).
+    /// `private[this]` is `PRIVATE|LOCAL` with this field empty.
+    pub private_within: Option<String>,
 }
 
 impl Symbol {
@@ -149,6 +152,7 @@ impl SymbolTable {
                 tparams: vec![],
                 children: vec![],
                 self_type: None,
+                private_within: None,
             }],
             scopes: vec![Scope::default()],
             root: SymbolId(0),
@@ -213,6 +217,7 @@ impl SymbolTable {
             tparams: vec![],
             children: vec![],
             self_type: None,
+            private_within: None,
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {
