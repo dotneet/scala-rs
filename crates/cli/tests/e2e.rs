@@ -276,6 +276,10 @@ fn fixtures_existentials() {
     check("existentials");
 }
 #[test]
+fn fixtures_existential_bounds() {
+    check("existential_bounds");
+}
+#[test]
 fn fixtures_implicit_specific() {
     check("implicit_specific");
 }
@@ -445,7 +449,7 @@ fn fixtures_f_interp_bad_is_error() {
 
 #[test]
 fn fixtures_existential_bounds_is_error() {
-    compile_fails("existential_bounds", "unimplemented");
+    compile_fails("existential_val", "unimplemented");
 }
 
 #[test]
@@ -474,6 +478,16 @@ fn fixtures_path_dependent() {
 }
 
 #[test]
+fn fixtures_this_type() {
+    check("this_type");
+}
+
+#[test]
+fn fixtures_compound() {
+    check("compound");
+}
+
+#[test]
 fn fixtures_structural() {
     check("structural");
 }
@@ -481,6 +495,16 @@ fn fixtures_structural() {
 #[test]
 fn fixtures_type_proj_bad_is_error() {
     compile_fails("type_proj_bad", "stable identifier");
+}
+
+#[test]
+fn fixtures_this_type_bad_is_error() {
+    compile_fails("this_type_bad", "stable identifier");
+}
+
+#[test]
+fn fixtures_compound_bad_is_error() {
+    compile_fails("compound_bad", "illegal inheritance");
 }
 
 #[test]
@@ -647,6 +671,11 @@ fn scala_library_dual_run_try_util() {
 #[test]
 fn scala_library_dual_run_existentials() {
     dual_run_fixture("existentials");
+}
+
+#[test]
+fn scala_library_dual_run_existential_bounds() {
+    dual_run_fixture("existential_bounds");
 }
 
 #[test]
@@ -1074,8 +1103,9 @@ fn find_scalac() -> Option<PathBuf> {
 /// `id[T]`, a `case class` via companion apply `Point(3, 4)` / term `Point`
 /// (`MODULE$`) plus field accessors, extractor `unapply` so `p match { case
 /// Point(a, b) => a + b }` typechecks, and an `object` method taking that case
-/// class. Remaining pickle holes (existentials, annotation args, complete Flags)
-/// are not claimed. If scalac cannot read a probed shape, this test fails rather
+/// class. Remaining pickle holes (TREE annotation args, Java annotations,
+/// nested packed existentials, refinement pickle, leftover Flags) are not
+/// claimed. If scalac cannot read a probed shape, this test fails rather
 /// than claiming success.
 #[test]
 fn scalac_typechecks_against_our_classfiles_if_present() {
@@ -1121,6 +1151,9 @@ object UseLib {
     val sum: Int = Lib.add(Point(1, 2))
     val z: Int = Lib.f(List(1, 2))
     val d: Int = Lib.g
+    val hn: Int = new Holder().me.n
+    val ar: Int = Lib.fAnyRef(List("a"))
+    val u: Int = Lib.h(1)
   }
 }
 "#,
@@ -1138,7 +1171,7 @@ object UseLib {
         .expect("scalac");
     assert!(
         output.status.success(),
-        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g): {}\n{}",
+        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked): {}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );

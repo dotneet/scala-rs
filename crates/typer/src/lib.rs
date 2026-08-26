@@ -1036,6 +1036,91 @@ object Main {
     }
 
     #[test]
+    fn this_type_and_stable_singleton() {
+        ok(r#"
+class C {
+  def me: this.type = this
+  def n: Int = 1
+}
+object Main {
+  val c = new C()
+  def id: c.type = c
+  def main(args: Array[String]): Unit = {
+    val x: Int = c.me.n
+    val y: Int = id.n
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn unstable_singleton_is_diagnosed() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+class C
+object Main {
+  var v: C = new C()
+  def bad: v.type = v
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("stable identifier")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compound_type_as_value_and_param() {
+        ok(r#"
+trait A { def a: Int }
+trait B { def b: Int }
+class C extends A with B { def a: Int = 1; def b: Int = 2 }
+object Main {
+  def use(x: A with B): Int = x.a + x.b
+  def main(args: Array[String]): Unit = {
+    val n: Int = use(new C())
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn illegal_compound_is_diagnosed() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+class A
+class B
+object Main {
+  def bad(x: A with B): Int = 0
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("illegal inheritance")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bounded_wildcard_and_annotated_type() {
+        ok(r#"
+object Main {
+  def f(xs: List[_ <: AnyRef]): Int = 0
+  def h(x: Int @unchecked): Int = x
+  def main(args: Array[String]): Unit = {
+    val n: Int = f("a" :: Nil)
+    val m: Int = h(1)
+  }
+}
+"#);
+    }
+
+    #[test]
     fn structural_type_ok() {
         ok(r#"
 class C { def foo: Int = 42 }

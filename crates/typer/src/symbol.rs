@@ -316,7 +316,17 @@ impl SymbolTable {
                 .find(|s| self.get(*s).is_class_like()),
             Type::TypeParam(_) => None,
             Type::TypeMember(_) => None,
-            Type::Wildcard => Some(self.any_sym),
+            Type::Wildcard | Type::BoundedWildcard { .. } => Some(self.any_sym),
+            Type::ThisType(sym) => Some(*sym),
+            Type::SingleType { prefix, sym } => {
+                let t = self.get(*sym).ty.clone();
+                if t.is_no_type() {
+                    self.class_sym_of(prefix)
+                } else {
+                    self.class_sym_of(&t)
+                }
+            }
+            Type::Annotated { tpe, .. } => self.class_sym_of(tpe),
             Type::Refined { parents, .. } => parents
                 .iter()
                 .find_map(|p| self.class_sym_of(p))
@@ -468,7 +478,10 @@ impl SymbolTable {
                 | Type::Array(_)
                 | Type::Class { .. }
                 | Type::ModuleRef(_)
-                | Type::Refined { .. },
+                | Type::Refined { .. }
+                | Type::ThisType(_)
+                | Type::SingleType { .. }
+                | Type::Annotated { .. },
             ) => true,
             (
                 Type::Int
@@ -486,7 +499,10 @@ impl SymbolTable {
                 | Type::Class { .. }
                 | Type::ModuleRef(_)
                 | Type::Function { .. }
-                | Type::Refined { .. },
+                | Type::Refined { .. }
+                | Type::ThisType(_)
+                | Type::SingleType { .. }
+                | Type::Annotated { .. },
                 Type::AnyRef,
             ) => true,
             (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) if s1 == s2 => {
@@ -524,6 +540,35 @@ impl SymbolTable {
             (Type::TypeMember(_), Type::AnyRef | Type::AnyVal) => true,
             (Type::Wildcard, Type::AnyRef | Type::AnyVal | Type::Wildcard) => true,
             (_, Type::Wildcard) => true,
+            (a, Type::BoundedWildcard { hi, .. }) => match hi {
+                Some(h) => self.is_sub_type(a, h),
+                None => true,
+            },
+            (Type::BoundedWildcard { hi, .. }, b) => match hi {
+                Some(h) => self.is_sub_type(h, b),
+                None => matches!(b, Type::Any | Type::AnyRef | Type::Wildcard),
+            },
+            (Type::ThisType(s), b) => {
+                if matches!(b, Type::ThisType(t) if t == s) {
+                    true
+                } else {
+                    self.is_sub_type(&self.type_of_class(*s), b)
+                }
+            }
+            (Type::SingleType { sym, prefix }, b) => {
+                if matches!(b, Type::SingleType { sym: s2, .. } if s2 == sym) {
+                    true
+                } else {
+                    let t = self.get(*sym).ty.clone();
+                    if t.is_no_type() {
+                        self.is_sub_type(prefix, b)
+                    } else {
+                        self.is_sub_type(&t, b)
+                    }
+                }
+            }
+            (a, Type::Annotated { tpe, .. }) => self.is_sub_type(a, tpe),
+            (Type::Annotated { tpe, .. }, b) => self.is_sub_type(tpe, b),
             (
                 Type::Function {
                     params: p1,
@@ -571,6 +616,23 @@ impl SymbolTable {
                 let s = self.get(*id);
                 format!("{}.{}", self.get(s.owner).name, s.name)
             }
+            Type::ThisType(id) => format!("{}.this.type", self.get(*id).name),
+            Type::SingleType { sym, .. } => format!("{}.type", self.get(*sym).name),
+            Type::Annotated { tpe, annot } => {
+                format!("{} @{}", self.display_type(tpe), annot)
+            }
+            Type::BoundedWildcard { lo, hi } => {
+                let mut s = String::from("_");
+                if let Some(t) = lo {
+                    s.push_str(" >: ");
+                    s.push_str(&self.display_type(t));
+                }
+                if let Some(t) = hi {
+                    s.push_str(" <: ");
+                    s.push_str(&self.display_type(t));
+                }
+                s
+            }
             Type::Refined { parents, decls } => {
                 let mut s = String::new();
                 if parents.is_empty() {
@@ -581,6 +643,9 @@ impl SymbolTable {
                             s.push_str(" with ");
                         }
                         s.push_str(&self.display_type(p));
+                    }
+                    if decls.is_empty() {
+                        return s;
                     }
                     s.push_str(" { ");
                 }
@@ -697,6 +762,22 @@ impl SymbolTable {
                     .map(|d| expand_refine_decl(self, from, d))
                     .collect(),
             },
+            Type::Annotated { tpe, annot } => Type::Annotated {
+                tpe: Box::new(self.expand_type_members(from, tpe)),
+                annot: annot.clone(),
+            },
+            Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
+                lo: lo
+                    .as_ref()
+                    .map(|t| Box::new(self.expand_type_members(from, t))),
+                hi: hi
+                    .as_ref()
+                    .map(|t| Box::new(self.expand_type_members(from, t))),
+            },
+            Type::SingleType { prefix, sym } => Type::SingleType {
+                prefix: Box::new(self.expand_type_members(from, prefix)),
+                sym: *sym,
+            },
             other => other.clone(),
         }
     }
@@ -712,6 +793,16 @@ impl SymbolTable {
                 t
             }
             Type::Class { sym, .. } | Type::ModuleRef(sym) => self.expand_type_members(*sym, ty),
+            Type::ThisType(sym) => self.expand_type_members(*sym, ty),
+            Type::Annotated { tpe, .. } => self.expand_in_type(tpe, ty),
+            Type::SingleType { prefix, sym } => {
+                let t = self.get(*sym).ty.clone();
+                if t.is_no_type() {
+                    self.expand_in_type(prefix, ty)
+                } else {
+                    self.expand_in_type(&t, ty)
+                }
+            }
             _ => {
                 if let Some(c) = self.class_sym_of(from) {
                     self.expand_type_members(c, ty)
@@ -891,6 +982,18 @@ fn subst_map(ty: &Type, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> Typ
                 .iter()
                 .map(|d| subst_refine_decl(d, tps, args))
                 .collect(),
+        },
+        Type::Annotated { tpe, annot } => Type::Annotated {
+            tpe: Box::new(subst_map(tpe, tps, args)),
+            annot: annot.clone(),
+        },
+        Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
+            lo: lo.as_ref().map(|t| Box::new(subst_map(t, tps, args))),
+            hi: hi.as_ref().map(|t| Box::new(subst_map(t, tps, args))),
+        },
+        Type::SingleType { prefix, sym } => Type::SingleType {
+            prefix: Box::new(subst_map(prefix, tps, args)),
+            sym: *sym,
         },
         other => other.clone(),
     }

@@ -1,4 +1,8 @@
 object Main {
-  def f(xs: List[_ <: Int]): Unit = ()
-  def main(args: Array[String]): Unit = ()
+  def show(xs: List[_ <: AnyRef]): Unit = {
+    xs.foreach((x: Any) => println(x))
+  }
+  def main(args: Array[String]): Unit = {
+    show("a" :: "b" :: Nil)
+  }
 }

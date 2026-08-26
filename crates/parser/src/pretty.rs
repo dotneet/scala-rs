@@ -294,6 +294,12 @@ fn dump_into(s: &mut String, t: &Tree, indent: usize) {
             dump_into(s, ref_, indent + 1);
             Ok(())
         }
+        TreeKind::AnnotatedTypeTree { tpt, annot } => {
+            writeln!(s, "{pad}AnnotatedType{ty}");
+            dump_into(s, tpt, indent + 1);
+            dump_into(s, annot, indent + 1);
+            Ok(())
+        }
         TreeKind::SelectFromTypeTree { qual, name, hash } => {
             let op = if *hash { "#" } else { "." };
             writeln!(s, "{pad}SelectFromType {op}{name}{ty}");

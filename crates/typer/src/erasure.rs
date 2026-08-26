@@ -144,7 +144,13 @@ pub fn erase_type(ty: &Type) -> Type {
         Type::Repeated(t) => Type::Repeated(Box::new(erase_type(t))),
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(erase_type).collect()),
         Type::Overload(alts) => Type::Overload(alts.iter().map(erase_type).collect()),
-        Type::Wildcard => Type::Any,
+        Type::Wildcard | Type::BoundedWildcard { .. } => Type::Any,
+        Type::ThisType(s) => Type::Class {
+            sym: *s,
+            args: vec![],
+        },
+        Type::SingleType { prefix, .. } => erase_type(prefix),
+        Type::Annotated { tpe, .. } => erase_type(tpe),
         Type::Refined { parents, decls } => {
             if crate::symbol::SymbolTable::refined_has_term_members(decls) {
                 Type::Refined {
@@ -171,7 +177,20 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
             }
         }
         Type::TypeParam(_) | Type::TypeMember(_) => Type::Any,
-        Type::Wildcard => Type::Any,
+        Type::Wildcard | Type::BoundedWildcard { .. } => Type::Any,
+        Type::ThisType(s) => Type::Class {
+            sym: *s,
+            args: vec![],
+        },
+        Type::SingleType { prefix, sym } => {
+            let t = st.get(*sym).ty.clone();
+            if t.is_no_type() {
+                erase_ty(prefix, st)
+            } else {
+                erase_ty(&t, st)
+            }
+        }
+        Type::Annotated { tpe, .. } => erase_ty(tpe, st),
         Type::Refined { parents, decls } => {
             if crate::symbol::SymbolTable::refined_has_term_members(decls) {
                 Type::Refined {
@@ -257,6 +276,10 @@ fn is_ref_erased(ty: &Type) -> bool {
             | Type::TypeParam(_)
             | Type::TypeMember(_)
             | Type::Wildcard
+            | Type::BoundedWildcard { .. }
+            | Type::ThisType(_)
+            | Type::SingleType { .. }
+            | Type::Annotated { .. }
             | Type::Named { .. }
             | Type::Refined { .. }
     )
