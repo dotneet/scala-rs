@@ -4,9 +4,11 @@
 //! `ScalaSignature` and for scalac 2.13.16 to typecheck a `val`, a `def` with
 //! parameters, `id[T]`, a `case class` (`new Point` + ctor field accessors +
 //! companion apply `Point(x, y)` / term `Point` via `MODULESYM` in the class
-//! pickle + extractor `unapply` so `x match { case Point(a, b) => … }`), and an
-//! `object` method against our classfiles. It is **not** a full nsc pickle (no
-//! existentials, annotation args, or the complete Flags long).
+//! pickle + extractor `unapply` so `x match { case Point(a, b) => … }`), an
+//! `object` method, a method taking `List[_]` (EXISTENTIALtpe), and
+//! `@deprecated("msg", "2.13.0")` (SYMANNOT + LITERALstring) against our
+//! classfiles. Flags are nsc raw longs run through `rawToPickledFlags`.
+//! It is **not** a full nsc pickle — leftover holes are documented in README.
 //!
 //! nsc-facing details in this subset (must match `PickleBuffer` / `UnPickler`):
 //! - pickle = major, minor, **nentries**, then `{ tag_Nat, len_Nat, body }`
@@ -16,8 +18,10 @@
 //! - objects pickle as `CLASSsym` + MODULE (type name), not `MODULEsym`
 //! - `POLYtpe` is restpe first, then tparams; empty tparams = NullaryMethodType
 //! - methods carry `METHOD`; vals are getters (`METHOD|STABLE|ACCESSOR` + `POLYtpe`)
+//! - `List[_]` is `EXISTENTIALtpe(TypeRef(immutable.List, _$n), TYPEsym _$n)`
+//! - annotation args that are string literals are `LITERALstring` + `SYMANNOT`
 
-use scala_rs_parser::{Flags, SymbolId, Type};
+use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{SymKind, SymbolTable};
 
 pub const MAJOR: u32 = 5;
@@ -40,6 +44,11 @@ pub const TYPEBOUNDSTPE: u8 = 17;
 pub const CLASSINFOTPE: u8 = 19;
 pub const METHODTPE: u8 = 20;
 pub const POLYTPE: u8 = 21;
+/// nsc `LITERALstring` (mixed case matches PickleFormat).
+#[allow(non_upper_case_globals)]
+pub const LITERALstring: u8 = 33;
+pub const SYMANNOT: u8 = 40;
+pub const EXISTENTIALTPE: u8 = 48;
 
 /// Pickled method, constructor, or val recovered by the subset unpickler.
 #[derive(Clone, Debug)]
@@ -310,6 +319,9 @@ struct Pickler<'a> {
     sym_index: std::collections::HashMap<u32, u32>,
     this_tpes: std::collections::HashMap<u32, u32>,
     class_tparams: std::collections::HashMap<u32, Vec<u32>>,
+    current_owner: u32,
+    exist_n: u32,
+    collection_immutable: Option<u32>,
 }
 
 impl<'a> Pickler<'a> {
@@ -329,6 +341,9 @@ impl<'a> Pickler<'a> {
             sym_index: std::collections::HashMap::new(),
             this_tpes: std::collections::HashMap::new(),
             class_tparams: std::collections::HashMap::new(),
+            current_owner: 0,
+            exist_n: 0,
+            collection_immutable: None,
         };
         p.none = p.add(NONESYM, vec![]);
         p.notpe = p.add(NOTPE, vec![]);
@@ -422,6 +437,17 @@ impl<'a> Pickler<'a> {
         i
     }
 
+    fn scala_collection_immutable(&mut self) -> u32 {
+        if let Some(i) = self.collection_immutable {
+            return i;
+        }
+        let sc = self.scala_module();
+        let col = self.ext_mod("collection", Some(sc));
+        let i = self.ext_mod("immutable", Some(col));
+        self.collection_immutable = Some(i);
+        i
+    }
+
     /// nsc constructor result: `TypeRef(ThisType(<empty>), C, tparams)`.
     fn ctor_result_type(&mut self, class_idx: u32) -> u32 {
         let empty = self.empty_package();
@@ -458,35 +484,9 @@ impl<'a> Pickler<'a> {
         self.add(TYPEREFTPE, body)
     }
 
-    fn type_ref_local(&mut self, class_idx: u32, args: &[Type]) -> u32 {
-        let mut body = Vec::new();
-        write_nat_to(&mut body, self.noprefix);
-        write_nat_to(&mut body, class_idx);
-        for a in args {
-            let t = self.pickle_type(a);
-            write_nat_to(&mut body, t);
-        }
-        self.add(TYPEREFTPE, body)
-    }
-
     fn type_ref_in_args(&mut self, owner: u32, name: &str, args: &[Type]) -> u32 {
         let pref = self.noprefix;
         let sym = self.ext_ref_owned(name, owner);
-        let mut body = Vec::new();
-        write_nat_to(&mut body, pref);
-        write_nat_to(&mut body, sym);
-        for a in args {
-            let t = self.pickle_type(a);
-            write_nat_to(&mut body, t);
-        }
-        self.add(TYPEREFTPE, body)
-    }
-
-    /// Default-package user class, as nsc `EXTREF` owned by `<empty>`.
-    fn type_ref_user(&mut self, name: &str, args: &[Type]) -> u32 {
-        let empty = self.empty_package();
-        let pref = self.noprefix;
-        let sym = self.ext_ref_owned(name, empty);
         let mut body = Vec::new();
         write_nat_to(&mut body, pref);
         write_nat_to(&mut body, sym);
@@ -535,6 +535,170 @@ impl<'a> Pickler<'a> {
         }
     }
 
+    fn type_ref_of_pickle_sym(&mut self, idx: u32) -> u32 {
+        let mut body = Vec::new();
+        write_nat_to(&mut body, self.noprefix);
+        write_nat_to(&mut body, idx);
+        self.add(TYPEREFTPE, body)
+    }
+
+    fn type_ref_local_refs(&mut self, class_idx: u32, arg_refs: &[u32]) -> u32 {
+        let mut body = Vec::new();
+        write_nat_to(&mut body, self.noprefix);
+        write_nat_to(&mut body, class_idx);
+        for t in arg_refs {
+            write_nat_to(&mut body, *t);
+        }
+        self.add(TYPEREFTPE, body)
+    }
+
+    fn type_ref_in_refs(&mut self, owner: u32, name: &str, arg_refs: &[u32]) -> u32 {
+        let pref = self.noprefix;
+        let sym = self.ext_ref_owned(name, owner);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, pref);
+        write_nat_to(&mut body, sym);
+        for t in arg_refs {
+            write_nat_to(&mut body, *t);
+        }
+        self.add(TYPEREFTPE, body)
+    }
+
+    fn type_ref_user_refs(&mut self, name: &str, arg_refs: &[u32]) -> u32 {
+        let empty = self.empty_package();
+        self.type_ref_in_refs(empty, name, arg_refs)
+    }
+
+    fn class_type_ref(&mut self, class_sym: SymbolId, arg_refs: &[u32]) -> u32 {
+        if let Some(&idx) = self.sym_index.get(&class_sym.0) {
+            return self.type_ref_local_refs(idx, arg_refs);
+        }
+        let n = self.st.get(class_sym).name.trim_end_matches('$').to_string();
+        match n.as_str() {
+            "Int" | "Long" | "Float" | "Double" | "Boolean" | "Char" | "Unit" | "Any"
+            | "AnyRef" | "AnyVal" | "Nothing" | "Null" | "Array" | "Seq" | "String"
+            | "Object" => {
+                if arg_refs.is_empty() {
+                    self.type_ref_named(&n)
+                } else {
+                    let owner = if n == "String" || n == "Object" {
+                        self.java_lang_module()
+                    } else {
+                        self.scala_module()
+                    };
+                    self.type_ref_in_refs(owner, &n, arg_refs)
+                }
+            }
+            "Option" | "Some" | "None" => {
+                let sc = self.scala_module();
+                self.type_ref_in_refs(sc, n.as_str(), arg_refs)
+            }
+            "List" | "Nil" => {
+                let imm = self.scala_collection_immutable();
+                self.type_ref_in_refs(imm, n.as_str(), arg_refs)
+            }
+            "::" | "$colon$colon" => {
+                let imm = self.scala_collection_immutable();
+                self.type_ref_in_refs(imm, "$colon$colon", arg_refs)
+            }
+            n if n.starts_with("Tuple") => {
+                let sc = self.scala_module();
+                self.type_ref_in_refs(sc, n, arg_refs)
+            }
+            n if n.starts_with("Function") => {
+                if arg_refs.is_empty() {
+                    self.type_ref_named(n)
+                } else {
+                    let sc = self.scala_module();
+                    self.type_ref_in_refs(sc, n, arg_refs)
+                }
+            }
+            n => self.type_ref_user_refs(n, arg_refs),
+        }
+    }
+
+    fn pickle_existential_param(&mut self) -> u32 {
+        self.exist_n += 1;
+        let name_ref = self.type_name(&format!("_${}", self.exist_n));
+        let idx = self.add(TYPESYM, vec![]);
+        let lo = self.type_ref_named("Nothing");
+        let hi = self.type_ref_named("Any");
+        let mut b = Vec::new();
+        write_nat_to(&mut b, lo);
+        write_nat_to(&mut b, hi);
+        let bounds = self.add(TYPEBOUNDSTPE, b);
+        // DEFERRED | PARAM | EXISTENTIAL. EXISTENTIAL (1<<35) is not remapped.
+        let flags = raw_to_pickled((1u64 << 4) | (1u64 << 13)) | (1u64 << 35);
+        let body = self.symbol_info(name_ref, self.current_owner, flags, bounds);
+        self.entries[idx as usize] = (TYPESYM, body);
+        idx
+    }
+
+    fn pickle_args_existentials(&mut self, args: &[Type]) -> (Vec<u32>, Vec<u32>) {
+        let mut arg_refs = Vec::new();
+        let mut quantified = Vec::new();
+        for a in args {
+            if matches!(a, Type::Wildcard) {
+                let q = self.pickle_existential_param();
+                quantified.push(q);
+                arg_refs.push(self.type_ref_of_pickle_sym(q));
+            } else {
+                arg_refs.push(self.pickle_type(a));
+            }
+        }
+        (arg_refs, quantified)
+    }
+
+    fn pickle_existential_tpe(&mut self, inner: u32, quantified: &[u32]) -> u32 {
+        if quantified.is_empty() {
+            return inner;
+        }
+        let mut body = Vec::new();
+        write_nat_to(&mut body, inner);
+        for q in quantified {
+            write_nat_to(&mut body, *q);
+        }
+        self.add(EXISTENTIALTPE, body)
+    }
+
+    fn pickle_literal_string(&mut self, s: &str) -> u32 {
+        let n = self.term_name(s);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, n);
+        self.add(LITERALstring, body)
+    }
+
+    fn pickle_symannot(&mut self, target: u32, annot: &Tree) {
+        let path = annot.annotation_path();
+        let simple = path.rsplit('.').next().unwrap_or(path.as_str());
+        let atp = if simple == "tailrec" {
+            let sc = self.scala_module();
+            let ann = self.ext_mod("annotation", Some(sc));
+            self.type_ref_in(ann, "tailrec")
+        } else if simple == "deprecated" {
+            let sc = self.scala_module();
+            self.type_ref_in(sc, "deprecated")
+        } else {
+            let sc = self.scala_module();
+            self.type_ref_in(sc, simple)
+        };
+        let mut body = Vec::new();
+        write_nat_to(&mut body, target);
+        write_nat_to(&mut body, atp);
+        for s in annot_string_args(annot) {
+            let r = self.pickle_literal_string(&s);
+            write_nat_to(&mut body, r);
+        }
+        self.add(SYMANNOT, body);
+    }
+
+    fn pickle_sym_annots(&mut self, id: SymbolId, pickle_idx: u32) {
+        let annots = self.st.get(id).annotations.clone();
+        for a in &annots {
+            self.pickle_symannot(pickle_idx, a);
+        }
+    }
+
     fn pickle_type(&mut self, ty: &Type) -> u32 {
         match ty {
             Type::Unit | Type::NoType => self.type_ref_named("Unit"),
@@ -559,25 +723,13 @@ impl<'a> Pickler<'a> {
                 self.add(TYPEREFTPE, body)
             }
             Type::Class { sym, args } => {
-                if let Some(&idx) = self.sym_index.get(&sym.0) {
-                    return self.type_ref_local(idx, args);
+                if args.iter().any(type_has_wildcard) {
+                    let (arg_refs, quantified) = self.pickle_args_existentials(args);
+                    let inner = self.class_type_ref(*sym, &arg_refs);
+                    return self.pickle_existential_tpe(inner, &quantified);
                 }
-                let n = self.st.get(*sym).name.trim_end_matches('$').to_string();
-                match n.as_str() {
-                    "Int" | "Long" | "Float" | "Double" | "Boolean" | "Char" | "Unit" | "Any"
-                    | "AnyRef" | "AnyVal" | "Nothing" | "Null" | "Array" | "Seq" | "String"
-                    | "Object" => self.type_ref_named(&n),
-                    "Option" | "Some" | "None" => {
-                        let sc = self.scala_module();
-                        self.type_ref_in_args(sc, n.as_str(), args)
-                    }
-                    n if n.starts_with("Tuple") => {
-                        let sc = self.scala_module();
-                        self.type_ref_in_args(sc, n, args)
-                    }
-                    n if n.starts_with("Function") => self.type_ref_named(n),
-                    n => self.type_ref_user(n, args),
-                }
+                let arg_refs: Vec<u32> = args.iter().map(|a| self.pickle_type(a)).collect();
+                self.class_type_ref(*sym, &arg_refs)
             }
             Type::ModuleRef(s) => {
                 let n = self.st.get(*s).name.clone();
@@ -588,6 +740,13 @@ impl<'a> Pickler<'a> {
                 self.type_ref_named(&format!("Function{}", params.len()))
             }
             Type::Tuple(ts) => {
+                if ts.iter().any(type_has_wildcard) {
+                    let (arg_refs, quantified) = self.pickle_args_existentials(ts);
+                    let sc = self.scala_module();
+                    let inner =
+                        self.type_ref_in_refs(sc, &format!("Tuple{}", ts.len()), &arg_refs);
+                    return self.pickle_existential_tpe(inner, &quantified);
+                }
                 let sc = self.scala_module();
                 self.type_ref_in_args(sc, &format!("Tuple{}", ts.len()), ts)
             }
@@ -617,6 +776,8 @@ impl<'a> Pickler<'a> {
             || s.flags.contains(Flags::MODULE)
             || s.name.ends_with('$');
         let is_case = s.flags.contains(Flags::CASE);
+        let class_flags = s.flags;
+        let class_kind = s.kind;
         let raw_name = s.name.trim_end_matches('$').to_string();
         // nsc module classes are CLASSsym + MODULE with a type name, not MODULEsym.
         let name_ref = self.type_name(&raw_name);
@@ -631,6 +792,8 @@ impl<'a> Pickler<'a> {
             self.add(THISTPE, body)
         };
         self.this_tpes.insert(class_id.0, this_tpe);
+        let saved_owner = self.current_owner;
+        self.current_owner = idx;
         let jl = self.java_lang_module();
         let obj = self.ext_ref_owned("Object", jl);
         let obj_tpe = {
@@ -693,16 +856,19 @@ impl<'a> Pickler<'a> {
             info = self.add(POLYTPE, body);
         }
 
-        let mut flags = 0u64;
+        let mut extra = 0u64;
         if is_module {
-            flags |= raw_to_pickled(1 << 8); // MODULE
+            extra |= 1 << 8; // MODULE
         }
         if is_case {
-            flags |= raw_to_pickled(1 << 11); // CASE
+            extra |= 1 << 11; // CASE
         }
+        let flags = pickled_from_our(class_flags, class_kind, extra);
         let owner = self.empty_package();
         let body = self.symbol_info(name_ref, owner, flags, info);
         self.entries[idx as usize] = (tag, body);
+        self.pickle_sym_annots(class_id, idx);
+        self.current_owner = saved_owner;
         if is_module {
             // nsc unpickler binds the term `Lib` from MODULEsym; CLASSsym+MODULE is the module class.
             let mut tr = Vec::new();
@@ -729,7 +895,10 @@ impl<'a> Pickler<'a> {
             return *i;
         }
         let s = self.st.get(method_id);
-        let name_ref = self.term_name(&s.name);
+        let meth_name = s.name.clone();
+        let meth_flags = s.flags;
+        let meth_kind = s.kind;
+        let meth_tparams = s.tparams.clone();
         let (paramss, ret) = match &s.ty {
             Type::Method { paramss, ret } => (paramss.clone(), (**ret).clone()),
             _ => (vec![], Type::Unit),
@@ -750,30 +919,31 @@ impl<'a> Pickler<'a> {
                 .map(|(i, t)| (format!("x${i}"), t.clone(), Flags::PARAM))
                 .collect()
         };
+        let name_ref = self.term_name(&meth_name);
 
         let meth_idx = self.add(VALSYM, vec![]);
         self.sym_index.insert(method_id.0, meth_idx);
+        let saved_owner = self.current_owner;
+        self.current_owner = meth_idx;
 
         let mut param_refs = Vec::new();
         for (pname, pty, pflags) in &params {
             let pn = self.term_name(pname);
             let pty_ref = self.pickle_type(pty);
-            let mut flags = raw_to_pickled(1u64 << 13); // PARAM
+            let mut extra = 1u64 << 13; // PARAM
             if pflags.contains(Flags::DEFAULTPARAM) {
-                flags |= 1 << 25; // DEFAULTPARAM (not remapped)
+                extra |= 1 << 25; // DEFAULTPARAM (not remapped)
             }
-            if pflags.contains(Flags::IMPLICIT) {
-                flags |= raw_to_pickled(1 << 9); // IMPLICIT
-            }
+            let flags = pickled_from_our(*pflags, SymKind::Term, extra);
             let body = self.symbol_info(pn, meth_idx, flags, pty_ref);
             param_refs.push(self.add(VALSYM, body));
         }
-        let ret_ref = if s.name == "<init>" {
+        let ret_ref = if meth_name == "<init>" {
             self.ctor_result_type(owner_ref)
         } else {
             self.pickle_type(&ret)
         };
-        let mut info = if params.is_empty() && s.name != "<init>" {
+        let mut info = if params.is_empty() && meth_name != "<init>" {
             // nsc NullaryMethodType = POLYtpe(restpe) with no tparams.
             let mut pt = Vec::new();
             write_nat_to(&mut pt, ret_ref);
@@ -786,22 +956,24 @@ impl<'a> Pickler<'a> {
             }
             self.add(METHODTPE, mt)
         };
-        let tparams: Vec<SymbolId> = s.tparams.clone();
-        if !tparams.is_empty() {
+        if !meth_tparams.is_empty() {
             let mut tpref = Vec::new();
             // nsc POLYtpe = restpe, {tparams}
             write_nat_to(&mut tpref, info);
-            for tp in tparams {
+            for tp in meth_tparams {
                 write_nat_to(&mut tpref, self.pickle_typesym(tp));
             }
             info = self.add(POLYTPE, tpref);
         }
-        let mut flags = raw_to_pickled(1u64 << 6); // METHOD
-        if s.flags.contains(Flags::SYNTHETIC) || s.name.contains("$default$") {
-            flags |= 1 << 21; // SYNTHETIC (not remapped)
+        let mut extra = 1u64 << 6; // METHOD
+        if meth_flags.contains(Flags::SYNTHETIC) || meth_name.contains("$default$") {
+            extra |= 1 << 21; // SYNTHETIC (not remapped)
         }
+        let flags = pickled_from_our(meth_flags, meth_kind, extra);
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
         self.entries[meth_idx as usize] = (VALSYM, body);
+        self.pickle_sym_annots(method_id, meth_idx);
+        self.current_owner = saved_owner;
         meth_idx
     }
 
@@ -810,14 +982,12 @@ impl<'a> Pickler<'a> {
             return *i;
         }
         let s = self.st.get(id);
-        let name_ref = self.type_name(&s.name);
+        let name = s.name.clone();
+        let owner_id = s.owner.0;
+        let name_ref = self.type_name(&name);
         let idx = self.add(TYPESYM, vec![]);
         self.sym_index.insert(id.0, idx);
-        let owner_ref = self
-            .sym_index
-            .get(&s.owner.0)
-            .copied()
-            .unwrap_or(self.none);
+        let owner_ref = self.sym_index.get(&owner_id).copied().unwrap_or(self.none);
         let lo = self.type_ref_named("Nothing");
         let hi = self.type_ref_named("Any");
         let mut b = Vec::new();
@@ -833,12 +1003,15 @@ impl<'a> Pickler<'a> {
     /// nsc case-class ctor field (not the getter): PARAMACCESSOR, not METHOD.
     fn pickle_param_field(&mut self, val_id: SymbolId, owner_ref: u32) {
         let s = self.st.get(val_id);
-        let name_ref = self.term_name(&s.name);
-        let ty_ref = self.pickle_type(&s.ty);
+        let name = s.name.clone();
+        let ty = s.ty.clone();
+        let flags_our = s.flags;
+        let kind = s.kind;
+        let name_ref = self.term_name(&name);
+        let ty_ref = self.pickle_type(&ty);
         // PRIVATE | LOCAL stay outside bits 0–11; PARAMACCESSOR is not remapped.
-        let mut flags = raw_to_pickled(1u64 << 2); // PRIVATE
-        flags |= 1 << 19; // LOCAL
-        flags |= 1 << 29; // PARAMACCESSOR
+        let extra = (1u64 << 2) | (1 << 19) | (1 << 29); // PRIVATE | LOCAL | PARAMACCESSOR
+        let flags = pickled_from_our(flags_our, kind, extra);
         let body = self.symbol_info(name_ref, owner_ref, flags, ty_ref);
         let _ = self.add(VALSYM, body);
     }
@@ -848,22 +1021,28 @@ impl<'a> Pickler<'a> {
             return *i;
         }
         let s = self.st.get(val_id);
-        let name_ref = self.term_name(&s.name);
+        let name = s.name.clone();
+        let ty = s.ty.clone();
+        let flags_our = s.flags;
+        let kind = s.kind;
+        let name_ref = self.term_name(&name);
         let idx = self.add(VALSYM, vec![]);
         self.sym_index.insert(val_id.0, idx);
-        let ret_ref = self.pickle_type(&s.ty);
+        let ret_ref = self.pickle_type(&ty);
         // nsc NullaryMethodType is POLYtpe(restpe) with no tparams.
         let mut pt = Vec::new();
         write_nat_to(&mut pt, ret_ref);
         let info = self.add(POLYTPE, pt);
         // METHOD | STABLE | ACCESSOR, then nsc raw→pickled remap
-        let mut flags = raw_to_pickled((1u64 << 6) | (1u64 << 22) | (1u64 << 27));
+        let mut extra = (1u64 << 6) | (1u64 << 22) | (1u64 << 27);
         if case_accessor {
-            flags |= 1 << 24; // CASEACCESSOR (not remapped)
-            flags |= 1 << 29; // PARAMACCESSOR (not remapped)
+            extra |= 1 << 24; // CASEACCESSOR (not remapped)
+            extra |= 1 << 29; // PARAMACCESSOR (not remapped)
         }
+        let flags = pickled_from_our(flags_our, kind, extra);
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
         self.entries[idx as usize] = (VALSYM, body);
+        self.pickle_sym_annots(val_id, idx);
         idx
     }
 
@@ -881,6 +1060,100 @@ impl<'a> Pickler<'a> {
 
 fn write_nat_to(out: &mut Vec<u8>, x: u32) {
     write_long_nat_to(out, x as u64);
+}
+
+fn type_has_wildcard(t: &Type) -> bool {
+    match t {
+        Type::Wildcard => true,
+        Type::Class { args, .. } => args.iter().any(type_has_wildcard),
+        Type::Tuple(ts) => ts.iter().any(type_has_wildcard),
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => type_has_wildcard(t),
+        Type::Function { params, ret } => {
+            params.iter().any(type_has_wildcard) || type_has_wildcard(ret)
+        }
+        Type::Method { paramss, ret } => {
+            paramss.iter().flatten().any(type_has_wildcard) || type_has_wildcard(ret)
+        }
+        _ => false,
+    }
+}
+
+fn annot_string_args(tree: &Tree) -> Vec<String> {
+    match &tree.kind {
+        TreeKind::Apply { args, .. } => args
+            .iter()
+            .filter_map(|a| match &a.kind {
+                TreeKind::Literal { lit: Lit::String(s) } => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Map scala-rs `Flags` onto nsc **raw** bits (before `rawToPickledFlags`).
+fn nsc_raw_from_our(f: Flags, kind: SymKind) -> u64 {
+    let mut n = 0u64;
+    if f.contains(Flags::PROTECTED) {
+        n |= 1 << 0;
+    }
+    if f.contains(Flags::OVERRIDE) {
+        n |= 1 << 1;
+    }
+    if f.contains(Flags::PRIVATE) {
+        n |= 1 << 2;
+    }
+    if f.contains(Flags::ABSTRACT) {
+        if kind == SymKind::Method {
+            n |= 1 << 4; // DEFERRED
+        } else {
+            n |= 1 << 3; // ABSTRACT
+        }
+    }
+    if f.contains(Flags::FINAL) {
+        n |= 1 << 5;
+    }
+    if f.contains(Flags::INTERFACE) {
+        n |= 1 << 7;
+    }
+    if f.contains(Flags::MODULE) {
+        n |= 1 << 8;
+    }
+    if f.contains(Flags::IMPLICIT) {
+        n |= 1 << 9;
+    }
+    if f.contains(Flags::SEALED) {
+        n |= 1 << 10;
+    }
+    if f.contains(Flags::CASE) {
+        n |= 1 << 11;
+    }
+    if f.contains(Flags::MUTABLE) {
+        n |= 1 << 12;
+    }
+    if f.contains(Flags::PARAM) {
+        n |= 1 << 13;
+    }
+    if f.contains(Flags::LOCAL) {
+        n |= 1 << 19;
+    }
+    if f.contains(Flags::SYNTHETIC) {
+        n |= 1 << 21;
+    }
+    if f.contains(Flags::TRAIT) || f.contains(Flags::DEFAULTPARAM) {
+        n |= 1 << 25;
+    }
+    if f.contains(Flags::ACCESSOR) {
+        n |= 1 << 27;
+    }
+    if f.contains(Flags::LAZY) {
+        n |= 1 << 31;
+    }
+    n
+}
+
+fn pickled_from_our(f: Flags, kind: SymKind, extra_raw: u64) -> u64 {
+    raw_to_pickled(nsc_raw_from_our(f, kind) | extra_raw)
 }
 
 /// nsc `PickleBuffer.writeLongNat`: big-endian base-128.
@@ -1067,6 +1340,7 @@ enum Entry {
         tparams: Vec<u32>,
         rest: u32,
     },
+    Existential(u32),
     Other,
 }
 
@@ -1207,6 +1481,11 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 };
                 Entry::PolyTpe { tparams, rest }
             }
+            EXISTENTIALTPE => {
+                let tpe = r.read_nat().unwrap_or(0);
+                r.pos = end;
+                Entry::Existential(tpe)
+            }
             _ => {
                 r.pos = end;
                 Entry::Other
@@ -1237,6 +1516,7 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             Some(Entry::ExtRef(n)) => name_of(entries, *n),
             Some(Entry::TermName(s) | Entry::TypeName(s)) => s.clone(),
             Some(Entry::NoTpe) => "Any".into(),
+            Some(Entry::Existential(t)) => type_name_of(entries, *t),
             _ => "Any".into(),
         }
     }
@@ -1580,5 +1860,109 @@ object Lib {
             .expect("unapply");
         assert_eq!(unapply.param_types, vec!["Point".to_string()]);
         assert_eq!(unapply.ret, "Option");
+    }
+
+    #[test]
+    fn pickle_existentials_annot_args_and_nsc_flags() {
+        let src = r#"
+object Lib {
+  final def f(xs: List[_]): Int = 0
+  @deprecated("msg", "2.13.0") def g: Int = 1
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let lib = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Lib" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("Lib module");
+        let cls = st.module_class_of(lib);
+        let raw = pickle_class(&st, cls);
+        let tags = pickle_tags(&raw);
+        assert!(
+            tags.contains(&EXISTENTIALTPE),
+            "expected EXISTENTIALtpe in pickle, tags={tags:?}"
+        );
+        assert!(
+            tags.contains(&SYMANNOT),
+            "expected SYMANNOT in pickle, tags={tags:?}"
+        );
+        assert!(
+            tags.contains(&LITERALstring),
+            "expected LITERALstring in pickle, tags={tags:?}"
+        );
+        let p = unpickle(&raw).expect("unpickle Lib");
+        let f = p.methods.iter().find(|m| m.name == "f").expect("f");
+        assert_eq!(f.param_types, vec!["List".to_string()]);
+        assert_eq!(f.ret, "Int");
+        let g = p.methods.iter().find(|m| m.name == "g").expect("g");
+        assert_eq!(g.ret, "Int");
+
+        // nsc raw FINAL (1<<5) pickles to (1<<1); METHOD (1<<6) pickles to (1<<9).
+        let mut r = Reader::new(&raw);
+        let _ = r.read_nat();
+        let _ = r.read_nat();
+        let n = r.read_nat().unwrap_or(0) as usize;
+        let mut saw_final_method = false;
+        for _ in 0..n {
+            let Some(tag) = r.read_byte() else {
+                break;
+            };
+            let len = r.read_nat().unwrap_or(0) as usize;
+            let end = r.pos.saturating_add(len).min(r.bytes.len());
+            if tag == VALSYM {
+                let (name, _owner, flags, _info) = read_symbol_info(&mut r, end).unwrap();
+                let nm = match pickle_tags_name(&raw, name) {
+                    Some(s) => s,
+                    None => {
+                        r.pos = end;
+                        continue;
+                    }
+                };
+                if nm == "f" {
+                    const METHOD_PKL: u64 = 1 << 9;
+                    const FINAL_PKL: u64 = 1 << 1;
+                    assert!(
+                        flags & METHOD_PKL != 0,
+                        "f should carry pickled METHOD, flags={flags:#x}"
+                    );
+                    assert!(
+                        flags & FINAL_PKL != 0,
+                        "f should carry pickled FINAL, flags={flags:#x}"
+                    );
+                    saw_final_method = true;
+                }
+            }
+            r.pos = end;
+        }
+        assert!(saw_final_method, "did not find pickled method f");
+    }
+
+    fn pickle_tags_name(bytes: &[u8], idx: u32) -> Option<String> {
+        let mut r = Reader::new(bytes);
+        let _ = r.read_nat();
+        let _ = r.read_nat();
+        let n = r.read_nat()? as usize;
+        let mut i = 0u32;
+        while i < n as u32 {
+            let tag = r.read_byte()?;
+            let len = r.read_nat()? as usize;
+            let end = r.pos.saturating_add(len).min(r.bytes.len());
+            if i == idx {
+                if tag == TERMNAME || tag == TYPENAME {
+                    return Some(String::from_utf8_lossy(&r.bytes[r.pos..end]).into_owned());
+                }
+                return None;
+            }
+            r.pos = end;
+            i += 1;
+        }
+        None
     }
 }

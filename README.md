@@ -62,7 +62,7 @@ java -cp out:scala-library-2.13.16.jar Main
 - `--typer` — namer / typer 後の木のダンプ
 - `-Xfatal-warnings` — warning をエラーにする（非網羅 match など）
 - `--scala-library <jar>` — scala-library 2.13 にリンク（私有 Option/List を出さない）。環境変数 `SCALA_LIBRARY_JAR` でも可。パス省略時は自動検出。**`compile` / `run` の既定は自動検出できた jar。見つからなければ私有。`--no-scala-library` で私有を強制**
-- `-cp` / `--class-path` — 先にコンパイルした classfile を読む（`ScalaSignature` pickle subset と JVM メソッド。vals / パラメータ付き defs / 型パラメータ / `$default$n` ゲッター / case class の ctor フィールドを含む。自前 `-cp` は companion `apply` も読む。nsc は companion apply `Point(...)` / term `Point` / extractor `unapply` も読む）
+- `-cp` / `--class-path` — 先にコンパイルした classfile を読む（`ScalaSignature` pickle subset と JVM メソッド。vals / パラメータ付き defs / 型パラメータ / `$default$n` ゲッター / case class の ctor フィールドを含む。自前 `-cp` は companion `apply` も読む。nsc は companion apply `Point(...)` / term `Point` / extractor `unapply` / `List[_]` の existentials / `@deprecated("msg", "2.13.0")` の annotation args も読む）
 
 フィクスチャはデフォルトパッケージ（`package` 句なし）なので、`-cp out` の `Main` でそのまま動く想定です。
 
@@ -76,7 +76,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - objects / classes / traits / case classes
 - `val` / `var` / `def`（ネストした `def` はパースする）
 - パラメータ、ラムダ（型付き / 期待型から推論）、ブロック
-- `if` / `else`、`while`
+- `if` / `else`、`while`、`do { ... } while (cond)`
 - `try` / `catch` / `finally`（catch は `{ case ... }`。JVM 例外テーブルを出す）
 - `match`（コンストラクタパターン、リテラル、ワイルドカード）
 - for-comprehension（`map` / `flatMap` / `foreach` / `withFilter` へデシュガー。私有ランタイムでは `List.withFilter` は eager な `List`。`--scala-library` 時は `scala.collection.WithFilter`。`Option.withFilter` は `Option$WithFilter`）
@@ -84,12 +84,13 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - リテラル、タプル
 - 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）
 - 存在型のよくある形: `List[_]`、`T forSome { type X }`、`List[_]` を取るメソッド。ワイルドカードは Object 相当に erase する。境界付き `_ <: T` や `forSome { val … }` は診断する（黙って捨てない）
-- compiled class/object に **ScalaSignature**（クラス属性 `ScalaSig` マーカー + `RuntimeVisibleAnnotations` の pickle subset）。`javap -v` で見える。自前 unpickler が読める範囲で `-cp` による別コンパイルができる。nsc 完全 pickle ではないが、ワイヤ形式は nsc と同じ（nentries、tag/len、ビッグエンディアン Nat、SID-10 は `0x7f→0`）。`val` / パラメータ付き `def` / 型パラメータ `id[T]` / `case class` の `new` と ctor フィールド / **companion apply `Point(3, 4)`（term `Point` / `MODULE$`）** / **extractor `unapply`（`p match { case Point(a, b) => … }`）** / object の `def` は scalac 2.13.16 が読める形（object は CLASSsym+MODULE + MODULESYM、クラス pickle にも companion の MODULESYM を載せる、`<empty>` / scala / java.lang の EXTMODCLASSref、POLYtpe は restpe 先行、val は NullaryMethodType ゲッター、case class は CASE / CASEACCESSOR、ユーザー型は `<empty>` 所有の EXTREF、`Option` / `TupleN` は scala モジュール所有の TypeRef + 型引数）。残る pickle の穴: existentials、annotation args、完全な Flags long。full pickle とは主張しない
+- compiled class/object に **ScalaSignature**（クラス属性 `ScalaSig` マーカー + `RuntimeVisibleAnnotations` の pickle subset）。`javap -v` で見える。自前 unpickler が読める範囲で `-cp` による別コンパイルができる。nsc 完全 pickle ではないが、ワイヤ形式は nsc と同じ（nentries、tag/len、ビッグエンディアン Nat、SID-10 は `0x7f→0`）。`val` / パラメータ付き `def` / 型パラメータ `id[T]` / `case class` の `new` と ctor フィールド / **companion apply `Point(3, 4)`（term `Point` / `MODULE$`）** / **extractor `unapply`（`p match { case Point(a, b) => … }`）** / object の `def` / **`List[_]`（EXISTENTIALtpe）** / **`@deprecated("msg", "2.13.0")`（SYMANNOT + LITERALstring）** は scalac 2.13.16 が読める形（object は CLASSsym+MODULE + MODULESYM、クラス pickle にも companion の MODULESYM を載せる、`<empty>` / scala / java.lang の EXTMODCLASSref、POLYtpe は restpe 先行、val は NullaryMethodType ゲッター、case class は CASE / CASEACCESSOR、ユーザー型は `<empty>` 所有の EXTREF、`Option` / `TupleN` / `List` は scala / `scala.collection.immutable` モジュール所有の TypeRef + 型引数、Flags は nsc raw long を `rawToPickledFlags` して出す）。full pickle とは主張しない。残る穴は README Remaining
 - `s"..."` / `f"..."` / `raw"..."` 文字列補間。`f"$n%02d"` は `String.format` に落とす。`raw` はエスケープを解釈しない。日付時刻（`%t`/`%T`）、引数インデックス、相対 `% <` は診断する。`--scala-library` 時はカスタム interpolator（`implicit class Q(sc: StringContext) { def q(args: Any*) }` の `q"a$x"`）を `StringContext.apply(parts*).q(args*)` へデシュガーして実行する。私有ランタイムでは `s`/`f`/`raw` 以外は診断する
 - コンテキストバウンド `T: ClassTag`（メソッド型パラメータ）。nsc と同様、implicit evidence `ClassTag[T]` へデシュガーする。クラス型パラメータの `: C` は診断する。`--scala-library` 時は `implicitly[ClassTag[Int]]` と `new Array[T]`（ClassTag が必要な生成）が jar の `scala.reflect.ClassTag` にリンクして動く
 - `lazy val`
 - implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む。候補が複数あるときは nsc 風の **more-specific**（結果型の subtype、または定義クラスが subclass である origin）。型と origin が食い違うと（親のより specific な implicit と、子に定義した less-specific な local）`ambiguous implicit`。同じ型が二つなら曖昧。目標型が `A => B` で `A <: B` のときは nsc と同様 identity view を合成する（view bound の呼び出し側）
-- `@tailrec`（末尾再帰でない `def` は nsc 風にエラー。object の末尾再帰は通して実行する。while 変換はしない）/ `@deprecated`（保存するだけでコンパイルは壊さない）。未対応アノテーションは診断する
+- `@tailrec`（末尾再帰でない `def` は nsc 風にエラー。object の末尾再帰は通して実行する。while 変換はしない）/ `@deprecated`（引数付きアノテーションを pickle の SYMANNOT に載せる。コンパイルは壊さない）。未対応アノテーションは診断する
+- `eq` / `ne`（AnyRef の参照等価）と `synchronized`（monitorenter / monitorexit。本体はロック中に評価）
 - `--scala-library` 時の `Array(1, 2, 3)` / `arr(0)` / `arr.length` / `arr.update`（jar の `scala.Array$` + `ClassTag`。私有ランタイムでは companion apply は無い）
 - オーバーロード: 同じ名前の `def` を引数型と arity で nsc 風に選ぶ（より specific なパラメータ型が勝つ）。曖昧なら `ambiguous overload`、該当なしなら `no matching overload`
 - `{ case … }` を `PartialFunction[A,B]` 期待位置で匿名クラスにする。`isDefinedAt` / `apply` / `applyOrElse` が動く。`--scala-library` 時は `List.collect`
@@ -216,7 +217,7 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 言語:
 
 - マクロ
-- full nsc pickle（existentials / アノテーション引数 / 完全な Flags。出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / MODULESYM / VALsym / EXTref / EXTMODCLASSref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe / TYPEBOUNDStpe / THIStpe / NOPREFIXtpe のサブセット。ByteCodecs は SID-10。ワイヤ形式は nsc と同じ nentries + ビッグエンディアン Nat。vals は METHOD|STABLE|ACCESSOR ゲッター + NullaryMethodType。case class は CASE + フィールド CASEACCESSOR。scalac 2.13.16 が `val` / パラメータ付き `def` / `id[T]` / `new Point` + `p.x` / companion apply `Point(...)` / term `Point` / extractor `unapply`（`p match { case Point(a, b) => … }`）/ object の `def` を typecheck できる範囲。existentials・アノテーション引数・完全な Flags はまだ。full pickle ではない）
+- full nsc pickle（出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / MODULESYM / VALsym / EXTref / EXTMODCLASSref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe / TYPEBOUNDStpe / THIStpe / NOPREFIXtpe / EXISTENTIALtpe / SYMANNOT / LITERALstring のサブセット。ByteCodecs は SID-10。ワイヤ形式は nsc と同じ nentries + ビッグエンディアン Nat。vals は METHOD|STABLE|ACCESSOR ゲッター + NullaryMethodType。case class は CASE + フィールド CASEACCESSOR。Flags は nsc raw long を `rawToPickledFlags`。scalac 2.13.16 が `val` / パラメータ付き `def` / `id[T]` / `new Point` + `p.x` / companion apply `Point(...)` / term `Point` / extractor `unapply` / object の `def` / `def f(xs: List[_]): Int` / `@deprecated("msg", "2.13.0") def g` を typecheck できる範囲。full pickle ではない。残る穴は Remaining）
 
 対象外（診断する / パースしない）:
 
@@ -285,6 +286,8 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `factorial.scala` | `fact(5)` 再帰 | `120` |
 | `trait_impl.scala` | trait 実装の `greet` | `Hello, Scala` |
 | `while_loop.scala` | `while (i < 3)` | `3` |
+| `do_while.scala` | `do { ... } while (cond)`（少なくとも一度実行） | `3` `6` |
+| `eq_sync.scala` | `eq` / `ne`（参照等価）と `synchronized`（monitor） | `true` `false` `true` `42` |
 | `string_interp.scala` | `s"..."` / `f"$n%02d"` / `raw"a\nb"` | `hello world` `07` `a\nb` |
 | `overloading.scala` | `f(Int)`/`f(String)` と arity-1/2 | `int` `str` `1` `2` |
 | `list_for.scala` | `1 :: 2 :: 3 :: Nil` の for-yield / guard | `2` `3` `4` `20` `30` |
@@ -346,12 +349,12 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `deprecated.scala` | `@deprecated` を付けた `def` が動く | `42` |
 | `array_ops.scala` | `Array(1,2,3)` / apply / length / update（library dual-run のみ） | `1` `3` `9` `8` |
 
-implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` / `implicit_ambiguous_parents.scala` / `implicit_inherit_local_ambiguous.scala` のコンパイル失敗で見ています。`private[this]` / `protected[C]` の違法アクセスは `private_this_bad.scala` / `protected_qual_bad.scala` です。オーバーロードの失敗は `overload_ambiguous.scala` / `overload_none.scala`。`f` interpolator の未対応フォーマットは `f_interp_bad.scala` です。境界付き存在型は `existential_bounds.scala` で診断します。クラス型パラメータの view bounds は `view_bounds_class.scala` で診断します。不安定なパス依存型は `type_proj_bad.scala`（`stable identifier required`）、構造的代入は `structural_bad.scala`、self type の不正 mixin は `self_type_bad.scala`、共変パラメータの `var` は `variance_bad.scala`、高階 / 境界付き型メンバーは `type_member_hk.scala` / `type_member_bounds.scala` で診断します。非末尾再帰の `@tailrec` は `tailrec_bad.scala`、未対応アノテーションは `annot_bad.scala`。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします（vals / パラメータ付き defs / 型パラメータ / case class `Point` を pickle から読む）。`scalac` 2.13 は PATH、`/tmp/scala-2.13.16`、または公式 tarball（約 20MB）で取れれば、同じ classfile に対して `Lib.greet` / `Lib.magic` / `Lib.id(42)` / `new Box("hi").get` / `Point(3, 4)` / `p.x` / `p match { case Point(a, b) => … }` / `Lib.add` を typecheck します。読めない pickle 形は成功扱いにしません。取れなければスキップします。
+implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` / `implicit_ambiguous_parents.scala` / `implicit_inherit_local_ambiguous.scala` のコンパイル失敗で見ています。`private[this]` / `protected[C]` の違法アクセスは `private_this_bad.scala` / `protected_qual_bad.scala` です。オーバーロードの失敗は `overload_ambiguous.scala` / `overload_none.scala`。`f` interpolator の未対応フォーマットは `f_interp_bad.scala` です。境界付き存在型は `existential_bounds.scala` で診断します。クラス型パラメータの view bounds は `view_bounds_class.scala` で診断します。不安定なパス依存型は `type_proj_bad.scala`（`stable identifier required`）、構造的代入は `structural_bad.scala`、self type の不正 mixin は `self_type_bad.scala`、共変パラメータの `var` は `variance_bad.scala`、高階 / 境界付き型メンバーは `type_member_hk.scala` / `type_member_bounds.scala` で診断します。非末尾再帰の `@tailrec` は `tailrec_bad.scala`、未対応アノテーションは `annot_bad.scala`。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします（vals / パラメータ付き defs / 型パラメータ / case class `Point` を pickle から読む）。`scalac` 2.13 は PATH、`/tmp/scala-2.13.16`、または公式 tarball（約 20MB）で取れれば、同じ classfile に対して `Lib.greet` / `Lib.magic` / `Lib.id(42)` / `new Box("hi").get` / `Point(3, 4)` / `p.x` / `p match { case Point(a, b) => … }` / `Lib.add` / `Lib.f(List(1, 2))`（`List[_]`） / `Lib.g`（`@deprecated("msg", "2.13.0")`）を typecheck します。読めない pickle 形は成功扱いにしません。取れなければスキップします。
 
 ### Remaining
 
 - **macros**（def マクロ。skip のまま）
-- **remaining pickle holes**: existentials、annotation args、完全な Flags long。companion apply / term `Point` / extractor `unapply` は載るが、nsc 完全 pickle ではない
+- **leftover pickle holes**（nsc 完全 pickle ではない）: 非リテラルのアノテーション引数（TREE）、ANNOTATEDtpe / Java アノテーション、入れ子の packed existentials、境界付き存在型（診断する）、refinement / this.type / singleton / 定数型、残る Flags ビット（JAVA / MACRO / BRIDGE / VARARGS / late・anti flags など）。existentials in signatures（`List[_]` → EXISTENTIALtpe）、string annotation args（SYMANNOT + LITERALstring）、nsc long Flags（raw→pickled）はこのスライスで載る
 
 ## ライセンス
 

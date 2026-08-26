@@ -3185,6 +3185,21 @@ fn gen_apply(
         asm.invokestatic("java/lang/Double", "parseDouble", "(Ljava/lang/String;)D");
         return;
     }
+    if matches!(ic, Intrinsic::Eq | Intrinsic::Ne) {
+        gen_eq_ne(
+            asm,
+            frame,
+            ctx,
+            fun,
+            args,
+            matches!(ic, Intrinsic::Eq),
+        );
+        return;
+    }
+    if matches!(ic, Intrinsic::Synchronized) {
+        gen_synchronized(asm, frame, ctx, fun, args, &tree.ty);
+        return;
+    }
 
     if matches!(&fun.ty, Type::Function { .. })
         || (fun.sym.is_none()
@@ -5295,6 +5310,106 @@ fn emit_int_cmp(asm: &mut Assembler, op: &str) {
     asm.mark(t);
     asm.iconst(1);
     asm.mark(e);
+}
+
+fn emit_ref_eq(asm: &mut Assembler, eq: bool) {
+    let t = asm.fresh_label();
+    let e = asm.fresh_label();
+    if eq {
+        asm.if_acmpeq(t);
+    } else {
+        asm.if_acmpne(t);
+    }
+    asm.iconst(0);
+    asm.goto(e);
+    asm.mark(t);
+    asm.iconst(1);
+    asm.mark(e);
+}
+
+fn gen_eq_ne(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    fun: &Tree,
+    args: &[Tree],
+    eq: bool,
+) {
+    gen_receiver(asm, frame, ctx, fun);
+    if let Some(arg) = args.first() {
+        gen_expr(asm, frame, ctx, arg);
+        if is_jvm_primitive(&arg.ty) && !matches!(arg.ty, Type::Unit | Type::NoType) {
+            emit_box(asm, &arg.ty);
+        }
+    } else {
+        asm.aconst_null();
+    }
+    emit_ref_eq(asm, eq);
+}
+
+fn gen_synchronized(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    fun: &Tree,
+    args: &[Tree],
+    result_ty: &Type,
+) {
+    gen_receiver(asm, frame, ctx, fun);
+    let lock = frame.alloc_tmp(JvmSort::Ref);
+    store(asm, lock, JvmSort::Ref);
+    load(asm, lock, JvmSort::Ref);
+    asm.monitorenter();
+    let try_s = asm.fresh_label();
+    asm.mark(try_s);
+    if let Some(body) = args.first() {
+        if let TreeKind::Function { body: inner, .. } = &body.kind {
+            gen_expr(asm, frame, ctx, inner);
+        } else {
+            gen_expr(asm, frame, ctx, body);
+            if matches!(&body.ty, Type::Function { .. }) {
+                asm.invokeinterface("scala/Function0", "apply", "()Ljava/lang/Object;");
+                if is_unit_like(result_ty) {
+                    asm.pop();
+                } else if is_jvm_primitive(result_ty) {
+                    emit_unbox(asm, result_ty);
+                } else if matches!(result_ty, Type::String) {
+                    asm.checkcast("java/lang/String");
+                }
+            }
+        }
+    } else {
+        push_default(asm, result_ty);
+    }
+    let sort = jvm_sort(result_ty);
+    let result = if sort != JvmSort::Void {
+        Some(frame.alloc_tmp(sort))
+    } else {
+        None
+    };
+    if let Some(r) = result {
+        store(asm, r, sort);
+    }
+    load(asm, lock, JvmSort::Ref);
+    asm.monitorexit();
+    let try_e = asm.fresh_label();
+    asm.mark(try_e);
+    let after = asm.fresh_label();
+    asm.goto(after);
+    let handler = asm.fresh_label();
+    asm.mark(handler);
+    asm.enter_handler();
+    let ex = frame.alloc_tmp(JvmSort::Ref);
+    asm.astore(ex);
+    load(asm, lock, JvmSort::Ref);
+    asm.monitorexit();
+    asm.aload(ex);
+    asm.athrow();
+    asm.exception(try_s, try_e, handler, None);
+    asm.mark(after);
+    if let Some(r) = result {
+        load(asm, r, sort);
+    }
 }
 
 fn emit_long_bin(asm: &mut Assembler, op: &str) {
