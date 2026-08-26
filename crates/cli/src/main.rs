@@ -15,7 +15,7 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    if wants_help(&args) {
         print_help();
         return ExitCode::SUCCESS;
     }
@@ -35,6 +35,18 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn wants_help(args: &[String]) -> bool {
+    for a in args {
+        if a == "--" {
+            return false;
+        }
+        if a == "--help" || a == "-h" {
+            return true;
+        }
+    }
+    false
 }
 
 fn print_help() {

@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use scala_rs_backend::{emit, EmittedClass};
+use scala_rs_backend::emit;
 use scala_rs_parser::{dump_tree, parse_file, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{find_mains, typecheck, SymbolTable};
@@ -32,7 +32,6 @@ impl Default for CompileOptions {
 }
 
 /// Result of compiling one or more source files.
-#[derive(Debug)]
 pub struct CompileResult {
     pub diags: Vec<Diagnostic>,
     pub sources: Vec<SourceFile>,
