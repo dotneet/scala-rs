@@ -3589,6 +3589,14 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
             );
             return;
         }
+        if name == "collect" && is_stdlib_list(&owner) {
+            asm.invokevirtual(
+                "scala/collection/immutable/List",
+                "collect",
+                "(Lscala/PartialFunction;)Lscala/collection/immutable/List;",
+            );
+            return;
+        }
         if name == "withFilter" && is_stdlib_option(&owner) {
             asm.invokevirtual(
                 "scala/Option",
@@ -4621,6 +4629,216 @@ fn collect_free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>,
     }
 }
 
+fn is_partial_function_ty(st: &SymbolTable, ty: &Type) -> bool {
+    match ty {
+        Type::Named { name, .. } if name == "PartialFunction" => true,
+        Type::Class { sym, .. } => {
+            let s = st.get(*sym);
+            s.name == "PartialFunction" && s.jvm_name.contains("PartialFunction")
+        }
+        _ => false,
+    }
+}
+
+fn pf_match_cases(body: &Tree) -> Option<&[scala_rs_parser::CaseDef]> {
+    match &body.kind {
+        TreeKind::Match { cases, .. } => Some(cases),
+        TreeKind::Block { expr, .. } => pf_match_cases(expr),
+        _ => None,
+    }
+}
+
+fn emit_partial_function_methods(
+    b: &mut ClassBuilder,
+    st: &SymbolTable,
+    extras: &RefCell<Vec<EmittedClass>>,
+    lambda_n: &Cell<u32>,
+    source: &str,
+    class_sym: SymbolId,
+    library_abi: bool,
+    orig_class: &str,
+    lam_name: &str,
+    outer_desc: &str,
+    need_outer: bool,
+    vparams: &[Tree],
+    body: &Tree,
+    local_caps: &[SymbolId],
+    ret_ty: &Type,
+) {
+    let cases: Vec<scala_rs_parser::CaseDef> = pf_match_cases(body)
+        .unwrap_or(&[])
+        .to_vec();
+    let sel_ty = match &body.kind {
+        TreeKind::Match { selector, .. } => selector.ty.clone(),
+        _ => vparams.first().map(|p| p.ty.clone()).unwrap_or(Type::Any),
+    };
+    let vparams = vparams.to_vec();
+    let local_caps = local_caps.to_vec();
+    let lam_name = lam_name.to_string();
+    let outer_desc = outer_desc.to_string();
+    let orig_class = orig_class.to_string();
+    let ret_ty = ret_ty.clone();
+
+    let cases1 = cases.clone();
+    let vparams1 = vparams.clone();
+    let caps1 = local_caps.clone();
+    let lam1 = lam_name.clone();
+    let outer1 = outer_desc.clone();
+    let orig1 = orig_class.clone();
+    let sel1 = sel_ty.clone();
+
+    b.add_code(ACC_PUBLIC, "isDefinedAt", "(Ljava/lang/Object;)Z", 8, |a| {
+        let mut fr = Frame::instance();
+        fr.next_slot = 2;
+        pf_bind_arg_and_captures(a, &mut fr, st, &lam1, &vparams1, &caps1);
+        let some = a.fresh_label();
+        let no = a.fresh_label();
+        let sel_sort = jvm_sort(&sel1);
+        if let Some(p) = vparams1.first() {
+            if let Some((slot, sort)) = fr.get(p.sym) {
+                load(a, slot, sort);
+                let tmp = fr.alloc_tmp(sel_sort);
+                store(a, tmp, sel_sort);
+                for c in &cases1 {
+                    let fail = a.fresh_label();
+                    let outer_storage = (lam1.as_str(), "$outer", outer1.as_str());
+                    let outer_ref = if need_outer {
+                        Some(outer_storage)
+                    } else {
+                        None
+                    };
+                    let inner_ctx = EmitCtx {
+                        st,
+                        class_sym,
+                        class_name: &orig1,
+                        ret_ty: Type::Boolean,
+                        extras,
+                        lambda_n,
+                        source,
+                        outer: outer_ref,
+                        library_abi,
+                    };
+                    gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
+                    if !c.guard.is_empty() {
+                        gen_expr(a, &mut fr, &inner_ctx, &c.guard);
+                        a.ifeq(fail);
+                    }
+                    a.goto(some);
+                    a.mark(fail);
+                }
+            }
+        }
+        a.goto(no);
+        a.mark(some);
+        a.iconst(1);
+        a.ireturn();
+        a.mark(no);
+        a.iconst(0);
+        a.ireturn();
+    });
+
+    b.add_code(
+        ACC_PUBLIC,
+        "applyOrElse",
+        "(Ljava/lang/Object;Lscala/Function1;)Ljava/lang/Object;",
+        8,
+        |a| {
+            let mut fr = Frame::instance();
+            fr.next_slot = 3;
+            pf_bind_arg_and_captures(a, &mut fr, st, &lam_name, &vparams, &local_caps);
+            let end = a.fresh_label();
+            let sel_sort = jvm_sort(&sel_ty);
+            if let Some(p) = vparams.first() {
+                if let Some((slot, sort)) = fr.get(p.sym) {
+                    load(a, slot, sort);
+                    let tmp = fr.alloc_tmp(sel_sort);
+                    store(a, tmp, sel_sort);
+                    for c in &cases {
+                        let fail = a.fresh_label();
+                        let outer_storage = (lam_name.as_str(), "$outer", outer_desc.as_str());
+                        let outer_ref = if need_outer {
+                            Some(outer_storage)
+                        } else {
+                            None
+                        };
+                        let inner_ctx = EmitCtx {
+                            st,
+                            class_sym,
+                            class_name: &orig_class,
+                            ret_ty: ret_ty.clone(),
+                            extras,
+                            lambda_n,
+                            source,
+                            outer: outer_ref,
+                            library_abi,
+                        };
+                        gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
+                        if !c.guard.is_empty() {
+                            gen_expr(a, &mut fr, &inner_ctx, &c.guard);
+                            a.ifeq(fail);
+                        }
+                        if is_unit_like(&ret_ty) {
+                            gen_stat(a, &mut fr, &inner_ctx, &c.body);
+                            emit_box(a, &Type::Unit);
+                        } else {
+                            gen_expr(a, &mut fr, &inner_ctx, &c.body);
+                            emit_box(a, &ret_ty);
+                        }
+                        a.goto(end);
+                        a.mark(fail);
+                    }
+                }
+            }
+            a.aload(2);
+            a.aload(1);
+            a.invokeinterface(
+                "scala/Function1",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            );
+            a.mark(end);
+            a.areturn();
+        },
+    );
+}
+
+fn pf_bind_arg_and_captures(
+    a: &mut Assembler,
+    fr: &mut Frame,
+    st: &SymbolTable,
+    lam_name: &str,
+    vparams: &[Tree],
+    local_caps: &[SymbolId],
+) {
+    if let Some(p) = vparams.first() {
+        a.aload(1);
+        if is_jvm_primitive(&p.ty) || matches!(p.ty, Type::String) {
+            emit_unbox(a, &p.ty);
+        } else if let Type::Class { sym, .. } = &p.ty {
+            let n = class_internal(st, *sym);
+            if !n.is_empty() && n != "java/lang/Object" {
+                a.checkcast(&n);
+            }
+        } else {
+            emit_unbox(a, &p.ty);
+        }
+        let sort = jvm_sort(&p.ty);
+        let slot = fr.alloc(p.sym, sort);
+        store(a, slot, sort);
+    }
+    for (i, id) in local_caps.iter().enumerate() {
+        let ty = st.get(*id).ty.clone();
+        a.aload(0);
+        a.getfield(lam_name, &format!("$captured${i}"), "Ljava/lang/Object;");
+        if is_jvm_primitive(&ty) {
+            emit_unbox(a, &ty);
+        }
+        let sort = jvm_sort(&ty);
+        let slot = fr.alloc(*id, sort);
+        store(a, slot, sort);
+    }
+}
+
 fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
     let (vparams, body) = match &tree.kind {
         TreeKind::Function { vparams, body } => (vparams, body),
@@ -4630,7 +4848,12 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
     ctx.lambda_n.set(n + 1);
     let lam_name = format!("{}$$anonfun${}", ctx.class_name.replace('/', "$"), n);
     let arity = vparams.len();
-    let iface = format!("scala/Function{arity}");
+    let is_pf = is_partial_function_ty(ctx.st, &tree.ty);
+    let iface = if is_pf {
+        "scala/PartialFunction".to_string()
+    } else {
+        format!("scala/Function{arity}")
+    };
 
     let mut bound = HashSet::new();
     for p in vparams {
@@ -4736,10 +4959,18 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
     let vparams = vparams.clone();
     let body = body.clone();
     let local_caps = local_caps.clone();
-    let ret_ty = match &tree.ty {
-        Type::Function { ret, .. } => (**ret).clone(),
-        t => t.clone(),
+    let vparams_pf = vparams.clone();
+    let body_pf = body.clone();
+    let local_caps_pf = local_caps.clone();
+    let ret_ty = if is_pf {
+        body.ty.clone()
+    } else {
+        match &tree.ty {
+            Type::Function { ret, .. } => (**ret).clone(),
+            t => t.clone(),
+        }
     };
+    let ret_ty_pf = ret_ty.clone();
 
     b.add_code(ACC_PUBLIC, "apply", &apply_desc, 8, |a| {
         let mut fr = Frame::instance();
@@ -4802,6 +5033,25 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
         }
         a.areturn();
     });
+    if is_pf {
+        emit_partial_function_methods(
+            &mut b,
+            st,
+            extras,
+            lambda_n,
+            source,
+            class_sym,
+            library_abi,
+            &orig_class,
+            &lam_name2,
+            &outer_desc,
+            need_outer,
+            &vparams_pf,
+            &body_pf,
+            &local_caps_pf,
+            &ret_ty_pf,
+        );
+    }
     ctx.extras.borrow_mut().push(b.finish());
 }
 

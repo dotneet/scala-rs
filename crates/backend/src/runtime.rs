@@ -16,6 +16,7 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
     vec![
         emit_function_n(0),
         emit_function_n(1),
+        emit_partial_function(),
         emit_ordered(),
         emit_ordered_class(),
         emit_option(),
@@ -116,6 +117,23 @@ fn emit_function_n(n: usize) -> EmittedClass {
     }
     desc.push_str(")Ljava/lang/Object;");
     b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, "apply", &desc);
+    b.finish()
+}
+
+fn emit_partial_function() -> EmittedClass {
+    let mut b = B::class("scala/PartialFunction", "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT;
+    b.interfaces = vec!["scala/Function1".into()];
+    b.add_abstract(
+        ACC_PUBLIC | ACC_ABSTRACT,
+        "isDefinedAt",
+        "(Ljava/lang/Object;)Z",
+    );
+    b.add_abstract(
+        ACC_PUBLIC | ACC_ABSTRACT,
+        "applyOrElse",
+        "(Ljava/lang/Object;Lscala/Function1;)Ljava/lang/Object;",
+    );
     b.finish()
 }
 

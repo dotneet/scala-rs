@@ -295,4 +295,67 @@ trait Add { self: Foo =>
         assert!(dump.contains("Trait Add"), "{dump}");
         assert!(dump.contains("DefDef plus"), "{dump}");
     }
+
+    fn find_val<'a>(t: &'a Tree, want: &str) -> Option<&'a Tree> {
+        match &t.kind {
+            TreeKind::PackageDef { stats, .. }
+            | TreeKind::Block { stats, .. } => {
+                for s in stats {
+                    if let Some(v) = find_val(s, want) {
+                        return Some(v);
+                    }
+                }
+                None
+            }
+            TreeKind::ClassDef { impl_, .. } | TreeKind::ModuleDef { impl_, .. } => {
+                for s in &impl_.body {
+                    if let Some(v) = find_val(s, want) {
+                        return Some(v);
+                    }
+                }
+                None
+            }
+            TreeKind::ValDef { name, .. } if name == want => Some(t),
+            TreeKind::DefDef { vparamss, rhs, .. } => {
+                for c in vparamss {
+                    for p in c {
+                        if let Some(v) = find_val(p, want) {
+                            return Some(v);
+                        }
+                    }
+                }
+                find_val(rhs, want)
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn private_this_and_protected_qual_parse() {
+        let t = parse_ok(
+            r#"
+class C {
+  private[this] val secret: Int = 1
+  protected[C] val vis: Int = 2
+}
+"#,
+        );
+        let secret = find_val(&t, "secret").expect("secret");
+        let vis = find_val(&t, "vis").expect("vis");
+        match &secret.kind {
+            TreeKind::ValDef { mods, .. } => {
+                assert!(mods.flags.contains(Flags::PRIVATE), "{mods:?}");
+                assert!(mods.flags.contains(Flags::LOCAL), "{mods:?}");
+                assert!(mods.private_within.is_none(), "{mods:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &vis.kind {
+            TreeKind::ValDef { mods, .. } => {
+                assert!(mods.flags.contains(Flags::PROTECTED), "{mods:?}");
+                assert_eq!(mods.private_within.as_deref(), Some("C"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }

@@ -46,6 +46,8 @@ impl Flags {
     pub const PACKAGE: Flags = Flags(1 << 19);
     pub const COVARIANT: Flags = Flags(1 << 20);
     pub const CONTRAVARIANT: Flags = Flags(1 << 21);
+    /// nsc `LOCAL`: `private[this]` / `protected[this]`.
+    pub const LOCAL: Flags = Flags(1 << 22);
 
     pub fn contains(self, f: Flags) -> bool {
         self.0 & f.0 != 0

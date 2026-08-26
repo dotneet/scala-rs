@@ -270,8 +270,15 @@ impl Typer {
     }
 
     /// nsc-style: `a` is as specific as `b` when `a`'s result type is a subtype
-    /// of `b`'s, and (for conversions) `a`'s argument type is a subtype of `b`'s.
+    /// of `b`'s, and (for conversions) `a`'s argument type is a subtype of `b`'s,
+    /// **or** `a`'s defining class is a subclass of `b`'s (origin).
+    /// Type and origin can disagree (inherited more-specific vs local less-specific)
+    /// and then `most_specific` reports ambiguous, matching nsc.
     fn is_as_specific(&self, a: SymbolId, b: SymbolId) -> bool {
+        self.is_as_specific_type(a, b) || self.is_as_specific_origin(a, b)
+    }
+
+    fn is_as_specific_type(&self, a: SymbolId, b: SymbolId) -> bool {
         let ra = self.implicit_result_ty(a);
         let rb = self.implicit_result_ty(b);
         if !self.st.is_sub_type(&ra, &rb) {
@@ -283,6 +290,30 @@ impl Typer {
             (None, Some(_)) => true,
             (None, None) => true,
         }
+    }
+
+    /// Direct owner must be class-like (nsc `owner.isSubClass`). A method-local
+    /// implicit's owner is the method, so it does not win on origin against an
+    /// inherited class member.
+    fn is_as_specific_origin(&self, a: SymbolId, b: SymbolId) -> bool {
+        let oa = self.st.get(a).owner;
+        let ob = self.st.get(b).owner;
+        if oa.is_none() || ob.is_none() || oa == ob {
+            return false;
+        }
+        if !self.st.get(oa).is_class_like() || !self.st.get(ob).is_class_like() {
+            return false;
+        }
+        self.st.is_sub_type(
+            &Type::Class {
+                sym: oa,
+                args: vec![],
+            },
+            &Type::Class {
+                sym: ob,
+                args: vec![],
+            },
+        )
     }
 
     fn strictly_more_specific(&self, a: SymbolId, b: SymbolId) -> bool {
