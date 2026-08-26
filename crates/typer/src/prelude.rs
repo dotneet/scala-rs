@@ -219,8 +219,14 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     } else {
         None
     };
+    let rich_ldc = if library_abi {
+        Some(add_rich_long_double_char(st))
+    } else {
+        None
+    };
     if library_abi {
         add_map_and_vector(st);
+        add_set(st);
     }
 
     let arrow = if library_abi {
@@ -272,7 +278,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     };
 
     st.predef = module(st, st.scala_pkg, "Predef", "scala/Predef$");
-    add_predef_members(st, arrow, string_ops, rich_int, library_abi);
+    add_predef_members(st, arrow, string_ops, rich_int, rich_ldc, library_abi);
 
     st.push_scope();
     import_members(st, st.scala_pkg);
@@ -1007,11 +1013,30 @@ fn add_list_members(
         vec![list_t.clone()],
         Type::Class {
             sym: st.option_sym,
-            args: vec![list_t],
+            args: vec![list_t.clone()],
         },
         Intrinsic::None,
     );
     let _ = seq;
+    if library_abi {
+        let list_apply = method(
+            st,
+            mcls,
+            "apply",
+            vec![Type::Repeated(Box::new(Type::Any))],
+            list_t.clone(),
+            Intrinsic::None,
+        );
+        let la = type_param(st, list_apply, "A");
+        st.get_mut(list_apply).tparams = vec![la];
+        st.get_mut(list_apply).ty = Type::Method {
+            paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(la)))]],
+            ret: Box::new(Type::Class {
+                sym: l,
+                args: vec![Type::TypeParam(la)],
+            }),
+        };
+    }
     let mems = st.get(mcls).members.clone();
     st.get_mut(list_mod).members.extend(mems);
 }
@@ -1219,6 +1244,65 @@ fn add_map_and_vector(st: &mut SymbolTable) {
     st.get_mut(vec_mod).members.extend(mems);
 }
 
+fn add_set(st: &mut SymbolTable) {
+    let set = iface(st, st.scala_pkg, "Set", "scala/collection/immutable/Set");
+    let sa = type_param(st, set, "A");
+    st.get_mut(set).tparams = vec![sa];
+    let ta = Type::TypeParam(sa);
+    let set_t = Type::Class {
+        sym: set,
+        args: vec![ta.clone()],
+    };
+    method(
+        st,
+        set,
+        "contains",
+        vec![Type::Any],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        set,
+        "foreach",
+        vec![fn1(ta.clone(), Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let set_mod = module(st, st.scala_pkg, "Set", "scala/collection/immutable/Set$");
+    let set_cls = st.module_class_of(set_mod);
+    method(
+        st,
+        set_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: set,
+            args: vec![Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let set_apply = method(
+        st,
+        set_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        set_t,
+        Intrinsic::None,
+    );
+    let saa = type_param(st, set_apply, "A");
+    st.get_mut(set_apply).tparams = vec![saa];
+    st.get_mut(set_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(saa)))]],
+        ret: Box::new(Type::Class {
+            sym: set,
+            args: vec![Type::TypeParam(saa)],
+        }),
+    };
+    let mems = st.get(set_cls).members.clone();
+    st.get_mut(set_mod).members.extend(mems);
+}
+
 fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
     let range = class(
         st,
@@ -1267,11 +1351,54 @@ fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
     ri
 }
 
+fn add_rich_value(
+    st: &mut SymbolTable,
+    name: &str,
+    jvm: &str,
+    under: Type,
+) -> SymbolId {
+    let c = class(st, st.scala_pkg, name, jvm, &[Type::AnyVal]);
+    let f = st.alloc("self", c, SymKind::Term, Flags::PARAM, "");
+    st.get_mut(f).ty = under.clone();
+    st.get_mut(c).ctor_fields = vec![f];
+    c
+}
+
+fn add_rich_long_double_char(st: &mut SymbolTable) -> (SymbolId, SymbolId, SymbolId) {
+    let rl = add_rich_value(st, "RichLong", "scala/runtime/RichLong", Type::Long);
+    method(st, rl, "abs", vec![], Type::Long, Intrinsic::None);
+    method(st, rl, "max", vec![Type::Long], Type::Long, Intrinsic::None);
+    method(st, rl, "min", vec![Type::Long], Type::Long, Intrinsic::None);
+    let rd = add_rich_value(st, "RichDouble", "scala/runtime/RichDouble", Type::Double);
+    method(st, rd, "abs", vec![], Type::Double, Intrinsic::None);
+    method(
+        st,
+        rd,
+        "max",
+        vec![Type::Double],
+        Type::Double,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        rd,
+        "min",
+        vec![Type::Double],
+        Type::Double,
+        Intrinsic::None,
+    );
+    let rc = add_rich_value(st, "RichChar", "scala/runtime/RichChar", Type::Char);
+    method(st, rc, "isDigit", vec![], Type::Boolean, Intrinsic::None);
+    method(st, rc, "toInt", vec![], Type::Int, Intrinsic::None);
+    (rl, rd, rc)
+}
+
 fn add_predef_members(
     st: &mut SymbolTable,
     arrow: SymbolId,
     string_ops: Option<SymbolId>,
     rich_int: Option<SymbolId>,
+    rich_ldc: Option<(SymbolId, SymbolId, SymbolId)>,
     library_abi: bool,
 ) {
     let p = st.predef;
@@ -1523,10 +1650,36 @@ fn add_predef_members(
         );
         st.get_mut(wrap).flags = st.get(wrap).flags.with(Flags::IMPLICIT);
     }
+    if let Some((rl, rd, rc)) = rich_ldc {
+        add_numeric_wrapper(st, owner, "longWrapper", Type::Long, rl);
+        add_numeric_wrapper(st, owner, "doubleWrapper", Type::Double, rd);
+        add_numeric_wrapper(st, owner, "charWrapper", Type::Char, rc);
+    }
     let mems = st.get(owner).members.clone();
     st.get_mut(p).members.extend(mems.iter().copied());
     for m in mems {
         let name = st.get(m).name.clone();
         st.enter_in_current(&name, m);
     }
+}
+
+fn add_numeric_wrapper(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    name: &str,
+    from: Type,
+    cls: SymbolId,
+) {
+    let wrap = method(
+        st,
+        owner,
+        name,
+        vec![from],
+        Type::Class {
+            sym: cls,
+            args: vec![],
+        },
+        Intrinsic::Identity,
+    );
+    st.get_mut(wrap).flags = st.get(wrap).flags.with(Flags::IMPLICIT);
 }

@@ -54,7 +54,8 @@ fn compile_fixture_with(name: &str, extra: &[&str]) -> PathBuf {
 }
 
 fn compile_fixture(name: &str) -> PathBuf {
-    compile_fixture_with(name, &[])
+    // Private-runtime fixtures must not auto-link a discovered scala-library jar.
+    compile_fixture_with(name, &["--no-scala-library"])
 }
 
 fn java_available() -> bool {
@@ -95,6 +96,7 @@ fn cli_help() {
     let s = String::from_utf8_lossy(&output.stdout);
     assert!(s.contains("compile"));
     assert!(s.contains("Scala 2.13"));
+    assert!(s.contains("--no-scala-library"));
 }
 
 #[test]
@@ -132,6 +134,70 @@ fn fixtures_string_interp() {
 #[test]
 fn fixtures_list_for() {
     check("list_for");
+}
+
+/// `compile` with no flags should auto-link a discovered scala-library jar
+/// (same as `run`), so the private runtime is not emitted.
+#[test]
+fn compile_auto_links_discovered_scala_library() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip compile autodetect: jar not obtainable");
+        return;
+    };
+    let src = fixtures_dir().join("hello.scala");
+    let out = tmp_dir("compile-autolink");
+    let status = Command::new(bin())
+        .args(["compile", src.to_str().unwrap(), "-d", out.to_str().unwrap()])
+        .status()
+        .expect("run scala-rs compile");
+    assert!(status.success(), "compile (auto-link) failed: {status}");
+    assert_no_private_stdlib(&out);
+    let cp = format!("{}:{}", out.display(), jar.display());
+    let output = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        output.status.success(),
+        "java -cp out:scala-library failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("hello")
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// `--no-scala-library` must still emit the private runtime even when a jar
+/// would otherwise be auto-found.
+#[test]
+fn compile_no_scala_library_emits_private_runtime() {
+    let src = fixtures_dir().join("hello.scala");
+    let out = tmp_dir("compile-private");
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            "--no-scala-library",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run scala-rs compile --no-scala-library");
+    assert!(
+        status.success(),
+        "compile --no-scala-library failed: {status}"
+    );
+    assert!(
+        out.join("scala/Option.class").is_file(),
+        "expected private scala/Option.class under {}",
+        out.display()
+    );
+    let _ = fs::remove_dir_all(&out);
 }
 #[test]
 fn fixtures_option_for() {
@@ -312,6 +378,21 @@ fn scala_library_dual_run_string_ops() {
     dual_run_fixture("string_ops");
 }
 
+#[test]
+fn scala_library_dual_run_list_apply() {
+    dual_run_fixture("list_apply");
+}
+
+#[test]
+fn scala_library_dual_run_set() {
+    dual_run_fixture("set");
+}
+
+#[test]
+fn scala_library_dual_run_long_ops() {
+    dual_run_fixture("long_ops");
+}
+
 const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Option.class",
     "scala/Some.class",
@@ -338,7 +419,12 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Predef$any2stringadd.class",
     "scala/Predef$ArrowAssoc.class",
     "scala/runtime/RichInt.class",
+    "scala/runtime/RichLong.class",
+    "scala/runtime/RichDouble.class",
+    "scala/runtime/RichChar.class",
     "scala/collection/immutable/Range.class",
+    "scala/collection/immutable/Set.class",
+    "scala/collection/immutable/Set$.class",
 ];
 
 fn assert_no_private_stdlib(out: &Path) {
@@ -447,6 +533,27 @@ fn cli_run_uses_auto_found_scala_library() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         expected_stdout("int_ops")
+    );
+}
+
+#[test]
+fn cli_run_no_scala_library_uses_private_runtime() {
+    if !java_available() {
+        return;
+    }
+    let src = fixtures_dir().join("hello.scala");
+    let output = Command::new(bin())
+        .args(["run", "--no-scala-library", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "run --no-scala-library failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("hello")
     );
 }
 
