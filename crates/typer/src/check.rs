@@ -1740,7 +1740,12 @@ impl Typer {
                                 }
                             }
                         }
-                    } else if owner_n == "Vector$" || owner_n == "List$" || owner_n == "Set$" {
+                    } else if owner_n == "Vector$"
+                        || owner_n == "List$"
+                        || owner_n == "Set$"
+                        || owner_n == "Seq$"
+                        || owner_n == "LazyList$"
+                    {
                         if let Some(a0) = args.first() {
                             if let Some(cls) = self
                                 .st

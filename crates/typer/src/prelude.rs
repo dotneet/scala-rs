@@ -34,7 +34,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         &[Type::AnyVal],
     );
     st.long_sym = class(st, st.scala_pkg, "Long", "java/lang/Long", &[Type::AnyVal]);
-    let float = class(
+    st.float_sym = class(
         st,
         st.scala_pkg,
         "Float",
@@ -55,7 +55,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         "java/lang/Character",
         &[Type::AnyVal],
     );
-    let _ = (float, char_s);
+    let _ = char_s;
 
     st.string_sym = class(st, java_lang, "String", "java/lang/String", &[Type::AnyRef]);
     let throwable = class(
@@ -156,6 +156,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     add_int_members(st);
     add_long_members(st);
     add_double_members(st);
+    add_float_members(st);
     add_bool_members(st);
     add_string_members(st, library_abi);
     add_array_members(st);
@@ -227,6 +228,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     if library_abi {
         add_map_and_vector(st);
         add_set(st);
+        add_seq_and_lazylist(st);
+        add_either(st);
     }
 
     let arrow = if library_abi {
@@ -561,6 +564,18 @@ fn add_double_members(st: &mut SymbolTable) {
     );
 }
 
+fn add_float_members(st: &mut SymbolTable) {
+    let c = st.float_sym;
+    method(
+        st,
+        c,
+        "unary_-",
+        vec![],
+        Type::Float,
+        Intrinsic::FloatUn("-"),
+    );
+}
+
 fn add_bool_members(st: &mut SymbolTable) {
     let c = st.boolean_sym;
     method(
@@ -850,6 +865,38 @@ fn add_string_ops(st: &mut SymbolTable) -> SymbolId {
     method(st, so, "*", vec![Type::Int], Type::String, Intrinsic::None);
     method(st, so, "take", vec![Type::Int], Type::String, Intrinsic::None);
     method(st, so, "drop", vec![Type::Int], Type::String, Intrinsic::None);
+    method(
+        st,
+        so,
+        "toUpperCase",
+        vec![],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "toLowerCase",
+        vec![],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "stripPrefix",
+        vec![Type::String],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "split",
+        vec![Type::Char],
+        Type::Array(Box::new(Type::String)),
+        Intrinsic::None,
+    );
     so
 }
 
@@ -1303,6 +1350,214 @@ fn add_set(st: &mut SymbolTable) {
     st.get_mut(set_mod).members.extend(mems);
 }
 
+fn add_seq_and_lazylist(st: &mut SymbolTable) {
+    let seq = iface(st, st.scala_pkg, "Seq", "scala/collection/immutable/Seq");
+    let sa = type_param(st, seq, "A");
+    st.get_mut(seq).tparams = vec![sa];
+    let ta = Type::TypeParam(sa);
+    let seq_t = Type::Class {
+        sym: seq,
+        args: vec![ta.clone()],
+    };
+    method(
+        st,
+        seq,
+        "foreach",
+        vec![fn1(ta.clone(), Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    method(st, seq, "apply", vec![Type::Int], ta.clone(), Intrinsic::None);
+    method(st, seq, "length", vec![], Type::Int, Intrinsic::None);
+    let seq_mod = module(st, st.scala_pkg, "Seq", "scala/collection/immutable/Seq$");
+    let seq_cls = st.module_class_of(seq_mod);
+    method(
+        st,
+        seq_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: seq,
+            args: vec![Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let seq_apply = method(
+        st,
+        seq_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        seq_t.clone(),
+        Intrinsic::None,
+    );
+    let saa = type_param(st, seq_apply, "A");
+    st.get_mut(seq_apply).tparams = vec![saa];
+    st.get_mut(seq_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(saa)))]],
+        ret: Box::new(Type::Class {
+            sym: seq,
+            args: vec![Type::TypeParam(saa)],
+        }),
+    };
+    let mems = st.get(seq_cls).members.clone();
+    st.get_mut(seq_mod).members.extend(mems);
+
+    let ll = class(
+        st,
+        st.scala_pkg,
+        "LazyList",
+        "scala/collection/immutable/LazyList",
+        &[Type::AnyRef],
+    );
+    let la = type_param(st, ll, "A");
+    st.get_mut(ll).tparams = vec![la];
+    let tll = Type::TypeParam(la);
+    let ll_t = Type::Class {
+        sym: ll,
+        args: vec![tll.clone()],
+    };
+    method(
+        st,
+        ll,
+        "foreach",
+        vec![fn1(tll.clone(), Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    method(st, ll, "apply", vec![Type::Int], tll, Intrinsic::None);
+    let ll_mod = module(
+        st,
+        st.scala_pkg,
+        "LazyList",
+        "scala/collection/immutable/LazyList$",
+    );
+    let ll_cls = st.module_class_of(ll_mod);
+    method(
+        st,
+        ll_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: ll,
+            args: vec![Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let ll_apply = method(
+        st,
+        ll_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        ll_t,
+        Intrinsic::None,
+    );
+    let lla = type_param(st, ll_apply, "A");
+    st.get_mut(ll_apply).tparams = vec![lla];
+    st.get_mut(ll_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(lla)))]],
+        ret: Box::new(Type::Class {
+            sym: ll,
+            args: vec![Type::TypeParam(lla)],
+        }),
+    };
+    let mems = st.get(ll_cls).members.clone();
+    st.get_mut(ll_mod).members.extend(mems);
+}
+
+fn add_either(st: &mut SymbolTable) {
+    let either = class(
+        st,
+        st.scala_pkg,
+        "Either",
+        "scala/util/Either",
+        &[Type::AnyRef],
+    );
+    let ea = type_param(st, either, "A");
+    let eb = type_param(st, either, "B");
+    st.get_mut(either).tparams = vec![ea, eb];
+    let tb = Type::TypeParam(eb);
+    let either_t = Type::Class {
+        sym: either,
+        args: vec![Type::TypeParam(ea), tb.clone()],
+    };
+    method(st, either, "isLeft", vec![], Type::Boolean, Intrinsic::None);
+    method(
+        st,
+        either,
+        "getOrElse",
+        vec![Type::ByName(Box::new(Type::Any))],
+        Type::Any,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        either,
+        "map",
+        vec![fn1(tb, Type::Any)],
+        either_t.clone(),
+        Intrinsic::None,
+    );
+
+    let left = class(
+        st,
+        st.scala_pkg,
+        "Left",
+        "scala/util/Left",
+        &[either_t.clone()],
+    );
+    let la = type_param(st, left, "A");
+    let lb = type_param(st, left, "B");
+    st.get_mut(left).tparams = vec![la, lb];
+    let lf = st.alloc("value", left, SymKind::Term, Flags::FINAL, "");
+    st.get_mut(lf).ty = Type::TypeParam(la);
+    st.get_mut(left).ctor_fields = vec![lf];
+    let left_mod = module(st, st.scala_pkg, "Left", "scala/util/Left$");
+    let left_cls = st.module_class_of(left_mod);
+    let left_apply = method(
+        st,
+        left_cls,
+        "apply",
+        vec![Type::Any],
+        Type::Class {
+            sym: left,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+    let _ = left_apply;
+    let mems = st.get(left_cls).members.clone();
+    st.get_mut(left_mod).members.extend(mems);
+
+    let right = class(
+        st,
+        st.scala_pkg,
+        "Right",
+        "scala/util/Right",
+        &[either_t],
+    );
+    let ra = type_param(st, right, "A");
+    let rb = type_param(st, right, "B");
+    st.get_mut(right).tparams = vec![ra, rb];
+    let rf = st.alloc("value", right, SymKind::Term, Flags::FINAL, "");
+    st.get_mut(rf).ty = Type::TypeParam(rb);
+    st.get_mut(right).ctor_fields = vec![rf];
+    let right_mod = module(st, st.scala_pkg, "Right", "scala/util/Right$");
+    let right_cls = st.module_class_of(right_mod);
+    method(
+        st,
+        right_cls,
+        "apply",
+        vec![Type::Any],
+        Type::Class {
+            sym: right,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+    let mems = st.get(right_cls).members.clone();
+    st.get_mut(right_mod).members.extend(mems);
+}
+
 fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
     let range = class(
         st,
@@ -1391,6 +1646,28 @@ fn add_rich_long_double_char(st: &mut SymbolTable) -> (SymbolId, SymbolId, Symbo
     method(st, rc, "isDigit", vec![], Type::Boolean, Intrinsic::None);
     method(st, rc, "toInt", vec![], Type::Int, Intrinsic::None);
     (rl, rd, rc)
+}
+
+fn add_rich_float(st: &mut SymbolTable) -> SymbolId {
+    let rf = add_rich_value(st, "RichFloat", "scala/runtime/RichFloat", Type::Float);
+    method(st, rf, "abs", vec![], Type::Float, Intrinsic::None);
+    method(
+        st,
+        rf,
+        "max",
+        vec![Type::Float],
+        Type::Float,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        rf,
+        "min",
+        vec![Type::Float],
+        Type::Float,
+        Intrinsic::None,
+    );
+    rf
 }
 
 fn add_predef_members(
@@ -1654,6 +1931,10 @@ fn add_predef_members(
         add_numeric_wrapper(st, owner, "longWrapper", Type::Long, rl);
         add_numeric_wrapper(st, owner, "doubleWrapper", Type::Double, rd);
         add_numeric_wrapper(st, owner, "charWrapper", Type::Char, rc);
+    }
+    if library_abi {
+        let rf = add_rich_float(st);
+        add_numeric_wrapper(st, owner, "floatWrapper", Type::Float, rf);
     }
     let mems = st.get(owner).members.clone();
     st.get_mut(p).members.extend(mems.iter().copied());

@@ -181,6 +181,26 @@ impl Assembler {
         self.bump(2);
     }
 
+    pub fn fconst(&mut self, v: f32) {
+        if v.to_bits() == 0.0f32.to_bits() {
+            self.emit_op(0x0b);
+        } else if v.to_bits() == 1.0f32.to_bits() {
+            self.emit_op(0x0c);
+        } else if v.to_bits() == 2.0f32.to_bits() {
+            self.emit_op(0x0d);
+        } else {
+            let i = self.pool.float(v);
+            if i <= 255 {
+                self.emit_op(0x12); // ldc
+                self.bytes.push(i as u8);
+            } else {
+                self.emit_op(0x13); // ldc_w
+                self.emit_u16(i);
+            }
+        }
+        self.bump(1);
+    }
+
     pub fn ldc_string(&mut self, s: &str) {
         let i = self.pool.string(s);
         if i <= 255 {
@@ -205,6 +225,10 @@ impl Assembler {
         self.load_store(0x26, 0x18, n, 2);
         self.ensure_local(n + 1);
     }
+    pub fn fload(&mut self, n: u16) {
+        self.load_store(0x22, 0x17, n, 1);
+        self.ensure_local(n);
+    }
     pub fn aload(&mut self, n: u16) {
         self.load_store(0x2a, 0x19, n, 1);
         self.ensure_local(n);
@@ -220,6 +244,10 @@ impl Assembler {
     pub fn dstore(&mut self, n: u16) {
         self.load_store(0x47, 0x39, n, -2);
         self.ensure_local(n + 1);
+    }
+    pub fn fstore(&mut self, n: u16) {
+        self.load_store(0x43, 0x38, n, -1);
+        self.ensure_local(n);
     }
     pub fn astore(&mut self, n: u16) {
         self.load_store(0x4b, 0x3a, n, -1);
@@ -333,6 +361,9 @@ impl Assembler {
     pub fn dneg(&mut self) {
         self.emit_op(0x77);
     }
+    pub fn fneg(&mut self) {
+        self.emit_op(0x76);
+    }
 
     pub fn i2l(&mut self) {
         self.emit_op(0x85);
@@ -405,6 +436,10 @@ impl Assembler {
     }
     pub fn dreturn(&mut self) {
         self.emit_op(0xaf);
+        self.stack = 0;
+    }
+    pub fn freturn(&mut self) {
+        self.emit_op(0xae);
         self.stack = 0;
     }
     pub fn areturn(&mut self) {
@@ -495,6 +530,11 @@ impl Assembler {
 
     pub fn arraylength(&mut self) {
         self.emit_op(0xbe);
+    }
+
+    pub fn aaload(&mut self) {
+        self.emit_op(0x32);
+        self.bump(-1);
     }
 
     /// `anewarray class` — count → array ref.

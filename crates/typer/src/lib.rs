@@ -550,6 +550,19 @@ object Main {
     val dm: Double = 1.0.max(2.5)
     val cd: Boolean = '9'.isDigit
     val ci: Int = 'A'.toInt
+    val seq1 = Seq(1, 2, 3)
+    val ll1 = LazyList(1, 2, 3)
+    val fa: Float = (-2.5f).abs
+    val fm: Float = 1.0f.max(2.5f)
+    val up: String = "hello".toUpperCase
+    val lo: String = "HELLO".toLowerCase
+    val sp: String = "foobar".stripPrefix("foo")
+    val parts = "a,b".split(',')
+    val plen: Int = parts.length
+    val ei = Right(1)
+    val el = Left("err")
+    val leftish: Boolean = el.isLeft
+    val or: Any = ei.getOrElse(0)
   }
 }
 "#;
