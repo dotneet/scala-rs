@@ -1130,6 +1130,77 @@ object Main {
     }
 
     #[test]
+    fn forsome_named_bound_typechecks() {
+        ok(r#"
+object Main {
+  def show(xs: List[X] forSome { type X <: AnyRef }): Unit = ()
+  def main(args: Array[String]): Unit = {
+    show("a" :: Nil)
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn nonlocal_return_typechecks() {
+        ok(r#"
+object Main {
+  def find(xs: List[Int]): Int = {
+    xs.foreach((x: Int) => { if (x > 0) return x })
+    0
+  }
+  def nested: Int = {
+    def inner: Int = { return 1 }
+    inner
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn return_from_class_ctor_is_diagnosed() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+class C { return 1 }
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("return outside method")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn java_override_ok_and_wrong_is_diagnosed() {
+        ok(r#"
+class A { def tag: String = "a" }
+class B extends A {
+  @Override
+  def tag: String = "b"
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+class A { def tag: String = "a" }
+class B extends A {
+  @Override
+  def other: String = "x"
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("overrides nothing")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn structural_type_ok() {
         ok(r#"
 class C { def foo: Int = 42 }

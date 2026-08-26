@@ -455,6 +455,54 @@ object M {
     }
 
     #[test]
+    fn java_override_and_deprecated_annotations_parse() {
+        let t = parse_ok(
+            r#"
+class A { def tag: String = "a" }
+class B extends A {
+  @Override
+  def tag: String = "b"
+  @Deprecated
+  def old(): Int = 1
+}
+"#,
+        );
+        fn find_class_def<'a>(t: &'a Tree, cls: &str, want: &str) -> Option<&'a Tree> {
+            match &t.kind {
+                TreeKind::PackageDef { stats, .. } => {
+                    stats.iter().find_map(|s| find_class_def(s, cls, want))
+                }
+                TreeKind::ClassDef { name, impl_, .. } if name == cls => {
+                    impl_.body.iter().find_map(|s| match &s.kind {
+                        TreeKind::DefDef { name, .. } if name == want => Some(s),
+                        _ => None,
+                    })
+                }
+                TreeKind::ClassDef { impl_, .. } | TreeKind::ModuleDef { impl_, .. } => {
+                    impl_.body.iter().find_map(|s| find_class_def(s, cls, want))
+                }
+                _ => None,
+            }
+        }
+        let tag = find_class_def(&t, "B", "tag").expect("B.tag");
+        match &tag.kind {
+            TreeKind::DefDef { mods, .. } => {
+                assert_eq!(mods.annotations.len(), 1, "{mods:?}");
+                assert_eq!(mods.annotations[0].annotation_path(), "Override");
+            }
+            other => panic!("{other:?}"),
+        }
+        let old = find_class_def(&t, "B", "old").expect("B.old");
+        match &old.kind {
+            TreeKind::DefDef { mods, .. } => {
+                assert_eq!(mods.annotations.len(), 1, "{mods:?}");
+                assert_eq!(mods.annotations[0].annotation_path(), "Deprecated");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn do_while_parses() {
         let t = parse_ok(
             r#"

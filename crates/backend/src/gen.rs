@@ -78,6 +78,8 @@ struct EmitCtx<'a> {
     /// If generating inside a lambda, field on the lambda class holding the outer `this`.
     outer: Option<(&'a str, &'a str, &'a str)>, // (lambda_class, field, outer_desc)
     library_abi: bool,
+    /// Named JVM method being emitted; `NONE` inside lambdas.
+    method_sym: SymbolId,
 }
 
 fn emit_ctx<'a>(
@@ -100,6 +102,7 @@ fn emit_ctx<'a>(
         source,
         outer: None,
         library_abi,
+        method_sym: SymbolId::NONE,
     }
 }
 
@@ -203,6 +206,7 @@ impl ClassBuilder {
             name: encode_method_name(name),
             desc: desc.to_string(),
             code: Some(code),
+            java_annots: Vec::new(),
         });
     }
 
@@ -212,7 +216,16 @@ impl ClassBuilder {
             name: encode_method_name(name),
             desc: desc.to_string(),
             code: None,
+            java_annots: Vec::new(),
         });
+    }
+
+    fn add_java_annot_to_last(&mut self, desc: &str) {
+        if let Some(m) = self.methods.last_mut() {
+            if !m.java_annots.iter().any(|a| a == desc) {
+                m.java_annots.push(desc.to_string());
+            }
+        }
     }
 
     fn finish(self) -> EmittedClass {
@@ -1306,6 +1319,9 @@ impl<'a> Gen<'a> {
         let acc = method_access_flags(mods.flags);
         if rhs.is_empty() {
             b.add_abstract(acc | ACC_ABSTRACT, name, &desc);
+            if let Some(d) = java_deprecated_desc(mods) {
+                b.add_java_annot_to_last(d);
+            }
             return;
         }
         let mut frame = Frame::instance();
@@ -1327,9 +1343,10 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let meth = def.sym;
         b.add_code(acc, name, &desc, max_locals, |asm| {
             let mut frame = frame;
-            let ctx = emit_ctx(
+            let mut ctx = emit_ctx(
                 st,
                 class_id,
                 &class_name,
@@ -1339,14 +1356,12 @@ impl<'a> Gen<'a> {
                 source,
                 library_abi,
             );
-            gen_expr(asm, &mut frame, &ctx, rhs);
-            if is_unit_like(&ret_for_body) {
-                pop_if_value(asm, &rhs.ty);
-                asm.vreturn();
-            } else {
-                emit_return(asm, &ret_for_body);
-            }
+            ctx.method_sym = meth;
+            finish_method_body(asm, &mut frame, &ctx, rhs, &ret_for_body);
         });
+        if let Some(d) = java_deprecated_desc(mods) {
+            b.add_java_annot_to_last(d);
+        }
     }
 
     fn emit_value_extension(&self, b: &mut ClassBuilder, class_id: SymbolId, def: &Tree) {
@@ -1533,9 +1548,10 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let meth = def.sym;
         b.add_code(ACC_PUBLIC | ACC_STATIC, name, &desc, max_locals, |asm| {
             let mut frame = frame;
-            let ctx = emit_ctx(
+            let mut ctx = emit_ctx(
                 st,
                 trait_id,
                 &iface_owned,
@@ -1545,13 +1561,8 @@ impl<'a> Gen<'a> {
                 source,
                 library_abi,
             );
-            gen_expr(asm, &mut frame, &ctx, rhs);
-            if is_unit_like(&ret_for_body) {
-                pop_if_value(asm, &rhs.ty);
-                asm.vreturn();
-            } else {
-                emit_return(asm, &ret_for_body);
-            }
+            ctx.method_sym = meth;
+            finish_method_body(asm, &mut frame, &ctx, rhs, &ret_for_body);
         });
     }
 
@@ -2430,6 +2441,199 @@ fn emit_return(asm: &mut Assembler, ty: &Type) {
     }
 }
 
+const NLRC: &str = "scala/runtime/NonLocalReturnControl";
+
+fn emit_nonlocal_return(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, expr: &Tree) {
+    asm.new_obj(NLRC);
+    asm.dup();
+    load_this(asm, ctx);
+    if !expr.is_empty() && !is_unit_like(&expr.ty) {
+        gen_expr(asm, frame, ctx, expr);
+        emit_box(asm, &expr.ty);
+    } else {
+        if !expr.is_empty() {
+            gen_expr(asm, frame, ctx, expr);
+            pop_if_value(asm, &expr.ty);
+        }
+        asm.aconst_null();
+    }
+    asm.invokespecial(NLRC, "<init>", "(Ljava/lang/Object;Ljava/lang/Object;)V");
+    asm.athrow();
+}
+
+fn finish_method_body(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    rhs: &Tree,
+    ret: &Type,
+) {
+    let wrap = !ctx.method_sym.is_none() && tree_has_nlr_to(rhs, ctx.method_sym);
+    if wrap {
+        asm.capture_try_locals();
+        let start = asm.fresh_label();
+        let end = asm.fresh_label();
+        let handler = asm.fresh_label();
+        asm.mark(start);
+        emit_body_return(asm, frame, ctx, rhs, ret);
+        asm.mark(end);
+        asm.mark(handler);
+        asm.enter_handler_captured_locals();
+        asm.checkcast(NLRC);
+        asm.dup();
+        asm.invokevirtual(NLRC, "key", "()Ljava/lang/Object;");
+        asm.aload(0);
+        let rethrow = asm.fresh_label();
+        asm.if_acmpne(rethrow);
+        asm.invokevirtual(NLRC, "value", "()Ljava/lang/Object;");
+        if is_unit_like(ret) {
+            asm.pop();
+            asm.vreturn();
+        } else {
+            emit_unbox(asm, ret);
+            emit_return(asm, ret);
+        }
+        asm.mark(rethrow);
+        asm.athrow();
+        asm.exception(start, end, handler, Some(NLRC));
+    } else {
+        emit_body_return(asm, frame, ctx, rhs, ret);
+    }
+}
+
+fn emit_body_return(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    rhs: &Tree,
+    ret: &Type,
+) {
+    gen_expr(asm, frame, ctx, rhs);
+    if is_unit_like(ret) {
+        pop_if_value(asm, &rhs.ty);
+        asm.vreturn();
+    } else {
+        emit_return(asm, ret);
+    }
+}
+
+fn tree_contains_return(tree: &Tree) -> bool {
+    match &tree.kind {
+        TreeKind::Return { .. } => true,
+        TreeKind::Select { qual, .. } => tree_contains_return(qual),
+        TreeKind::Apply { fun, args } | TreeKind::UnApply { fun, args } => {
+            tree_contains_return(fun) || args.iter().any(tree_contains_return)
+        }
+        TreeKind::TypeApply { fun, .. } | TreeKind::Typed { expr: fun, .. } => {
+            tree_contains_return(fun)
+        }
+        TreeKind::Block { stats, expr } => {
+            stats.iter().any(tree_contains_return) || tree_contains_return(expr)
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            tree_contains_return(cond)
+                || tree_contains_return(thenp)
+                || tree_contains_return(elsep)
+        }
+        TreeKind::Assign { lhs, rhs } => tree_contains_return(lhs) || tree_contains_return(rhs),
+        TreeKind::ValDef { rhs, .. } => tree_contains_return(rhs),
+        TreeKind::Function { body, vparams } => {
+            vparams.iter().any(tree_contains_return) || tree_contains_return(body)
+        }
+        TreeKind::Match { selector, cases } => {
+            tree_contains_return(selector)
+                || cases.iter().any(|c| {
+                    tree_contains_return(&c.pat)
+                        || tree_contains_return(&c.guard)
+                        || tree_contains_return(&c.body)
+                })
+        }
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            tree_contains_return(block)
+                || catches.iter().any(|c| tree_contains_return(&c.body))
+                || tree_contains_return(finalizer)
+        }
+        TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
+            tree_contains_return(cond) || tree_contains_return(body)
+        }
+        TreeKind::Throw { expr } => tree_contains_return(expr),
+        TreeKind::InterpolatedString { args, .. } => args.iter().any(tree_contains_return),
+        _ => false,
+    }
+}
+
+fn tree_has_nlr_to(tree: &Tree, meth: SymbolId) -> bool {
+    fn walk(t: &Tree, meth: SymbolId, in_fun: bool) -> bool {
+        match &t.kind {
+            TreeKind::Return { expr } => {
+                (in_fun && (t.sym == meth || t.sym.is_none())) || walk(expr, meth, in_fun)
+            }
+            TreeKind::Function { vparams, body } => {
+                vparams.iter().any(|p| walk(p, meth, in_fun)) || walk(body, meth, true)
+            }
+            TreeKind::DefDef { vparamss, rhs, .. } => {
+                vparamss.iter().flatten().any(|p| walk(p, meth, in_fun))
+                    || walk(rhs, meth, false)
+            }
+            TreeKind::Select { qual, .. } => walk(qual, meth, in_fun),
+            TreeKind::Apply { fun, args } | TreeKind::UnApply { fun, args } => {
+                walk(fun, meth, in_fun) || args.iter().any(|a| walk(a, meth, in_fun))
+            }
+            TreeKind::TypeApply { fun, .. } | TreeKind::Typed { expr: fun, .. } => {
+                walk(fun, meth, in_fun)
+            }
+            TreeKind::Block { stats, expr } => {
+                stats.iter().any(|s| walk(s, meth, in_fun)) || walk(expr, meth, in_fun)
+            }
+            TreeKind::If { cond, thenp, elsep } => {
+                walk(cond, meth, in_fun) || walk(thenp, meth, in_fun) || walk(elsep, meth, in_fun)
+            }
+            TreeKind::Assign { lhs, rhs } => walk(lhs, meth, in_fun) || walk(rhs, meth, in_fun),
+            TreeKind::ValDef { rhs, .. } => walk(rhs, meth, in_fun),
+            TreeKind::Match { selector, cases } => {
+                walk(selector, meth, in_fun)
+                    || cases.iter().any(|c| {
+                        walk(&c.pat, meth, in_fun)
+                            || walk(&c.guard, meth, in_fun)
+                            || walk(&c.body, meth, in_fun)
+                    })
+            }
+            TreeKind::Try {
+                block,
+                catches,
+                finalizer,
+            } => {
+                walk(block, meth, in_fun)
+                    || catches.iter().any(|c| walk(&c.body, meth, in_fun))
+                    || walk(finalizer, meth, in_fun)
+            }
+            TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
+                walk(cond, meth, in_fun) || walk(body, meth, in_fun)
+            }
+            TreeKind::Throw { expr } => walk(expr, meth, in_fun),
+            TreeKind::InterpolatedString { args, .. } => {
+                args.iter().any(|a| walk(a, meth, in_fun))
+            }
+            _ => false,
+        }
+    }
+    walk(tree, meth, false)
+}
+
+fn java_deprecated_desc(mods: &scala_rs_parser::Modifiers) -> Option<&'static str> {
+    for a in &mods.annotations {
+        let p = a.annotation_path();
+        if matches!(p.as_str(), "Deprecated" | "java.lang.Deprecated") {
+            return Some("Ljava/lang/Deprecated;");
+        }
+    }
+    None
+}
+
 fn throw_runtime(asm: &mut Assembler, msg: &str) {
     asm.new_obj("java/lang/RuntimeException");
     asm.dup();
@@ -2555,17 +2759,23 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
         }
         TreeKind::New { tpt } => gen_new(asm, frame, ctx, tpt, &[]),
         TreeKind::Return { expr } => {
-            if !expr.is_empty() && !is_unit_like(&expr.ty) && !is_unit_like(&ctx.ret_ty) {
-                gen_expr(asm, frame, ctx, expr);
-            } else if !expr.is_empty() && !is_unit_like(&ctx.ret_ty) {
-                gen_expr(asm, frame, ctx, expr);
-            } else if !expr.is_empty() {
-                gen_expr(asm, frame, ctx, expr);
-                pop_if_value(asm, &expr.ty);
+            if !ctx.method_sym.is_none() && (tree.sym == ctx.method_sym || tree.sym.is_none()) {
+                if !expr.is_empty() && !is_unit_like(&expr.ty) && !is_unit_like(&ctx.ret_ty) {
+                    gen_expr(asm, frame, ctx, expr);
+                } else if !expr.is_empty() && !is_unit_like(&ctx.ret_ty) {
+                    gen_expr(asm, frame, ctx, expr);
+                } else if !expr.is_empty() {
+                    gen_expr(asm, frame, ctx, expr);
+                    pop_if_value(asm, &expr.ty);
+                }
+                emit_return(asm, &ctx.ret_ty);
+                // Dead code after `return` still needs a dummy for the method
+                // epilogue (and for StackMapTable at the next instruction).
+                push_default(asm, &ctx.ret_ty);
+            } else {
+                emit_nonlocal_return(asm, frame, ctx, expr);
+                push_default(asm, &ctx.ret_ty);
             }
-            emit_return(asm, &ctx.ret_ty);
-            // keep stack consistent for later (dead) code
-            push_default(asm, &tree.ty);
         }
         TreeKind::Throw { expr } => {
             gen_expr(asm, frame, ctx, expr);
@@ -4828,6 +5038,9 @@ fn collect_free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>,
             }
             collect_free(finalizer, bound, out, st);
         }
+        TreeKind::Return { expr } | TreeKind::Throw { expr } => {
+            collect_free(expr, bound, out, st);
+        }
         _ => {}
     }
 }
@@ -4920,6 +5133,7 @@ fn emit_partial_function_methods(
                         source,
                         outer: outer_ref,
                         library_abi,
+                        method_sym: SymbolId::NONE,
                     };
                     gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
                     if !c.guard.is_empty() {
@@ -4972,15 +5186,16 @@ fn emit_partial_function_methods(
                             extras,
                             lambda_n,
                             source,
-                            outer: outer_ref,
-                            library_abi,
-                        };
-                        gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
-                        if !c.guard.is_empty() {
-                            gen_expr(a, &mut fr, &inner_ctx, &c.guard);
-                            a.ifeq(fail);
-                        }
-                        if is_unit_like(&ret_ty) {
+                        outer: outer_ref,
+                        library_abi,
+                        method_sym: SymbolId::NONE,
+                    };
+                    gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
+                    if !c.guard.is_empty() {
+                        gen_expr(a, &mut fr, &inner_ctx, &c.guard);
+                        a.ifeq(fail);
+                    }
+                    if is_unit_like(&ret_ty) {
                             gen_stat(a, &mut fr, &inner_ctx, &c.body);
                             emit_box(a, &Type::Unit);
                         } else {
@@ -5075,6 +5290,9 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
         } else {
             need_outer = true;
         }
+    }
+    if tree_contains_return(body) {
+        need_outer = true;
     }
 
     // Create instance: new, dup, load captures, invokespecial
@@ -5226,6 +5444,7 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             source,
             outer: outer_ref,
             library_abi,
+            method_sym: SymbolId::NONE,
         };
         gen_expr(a, &mut fr, &inner_ctx, &body);
         if is_unit_like(&ret_ty) {
@@ -6592,6 +6811,32 @@ object Main {
             return;
         };
         assert!(out.contains("nested"), "stdout: {out:?}");
+    }
+
+    #[test]
+    fn nonlocal_return_from_foreach_lambda() {
+        let Some(out) = run_main(
+            r#"
+object Main {
+  def find(xs: List[Int]): Int = {
+    xs.foreach((x: Int) => { if (x > 0) return x })
+    0
+  }
+  def nested: Int = {
+    def inner: Int = { return 1 }
+    inner
+  }
+  def main(args: Array[String]): Unit = {
+    println(find(1 :: 2 :: Nil))
+    println(find((-1) :: 3 :: Nil))
+    println(nested)
+  }
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "1\n3\n1\n", "stdout: {out:?}");
     }
 
     #[test]

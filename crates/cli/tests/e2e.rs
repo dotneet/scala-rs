@@ -488,6 +488,26 @@ fn fixtures_compound() {
 }
 
 #[test]
+fn fixtures_nlreturn() {
+    check("nlreturn");
+}
+
+#[test]
+fn fixtures_existential_forsome() {
+    check("existential_forsome");
+}
+
+#[test]
+fn fixtures_java_override() {
+    check("java_override");
+}
+
+#[test]
+fn fixtures_java_deprecated() {
+    check("java_deprecated");
+}
+
+#[test]
 fn fixtures_structural() {
     check("structural");
 }
@@ -505,6 +525,16 @@ fn fixtures_this_type_bad_is_error() {
 #[test]
 fn fixtures_compound_bad_is_error() {
     compile_fails("compound_bad", "illegal inheritance");
+}
+
+#[test]
+fn fixtures_return_ctor_is_error() {
+    compile_fails("return_ctor", "return outside method");
+}
+
+#[test]
+fn fixtures_override_bad_is_error() {
+    compile_fails("override_bad", "overrides nothing");
 }
 
 #[test]
@@ -679,6 +709,21 @@ fn scala_library_dual_run_existential_bounds() {
 }
 
 #[test]
+fn scala_library_dual_run_existential_forsome() {
+    dual_run_fixture("existential_forsome");
+}
+
+#[test]
+fn scala_library_dual_run_nlreturn() {
+    dual_run_fixture("nlreturn");
+}
+
+#[test]
+fn scala_library_dual_run_java_override() {
+    dual_run_fixture("java_override");
+}
+
+#[test]
 fn scala_library_dual_run_implicit_specific() {
     dual_run_fixture("implicit_specific");
 }
@@ -783,6 +828,7 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/util/Failure.class",
     "scala/util/Failure$.class",
     "scala/Array$.class",
+    "scala/runtime/NonLocalReturnControl.class",
 ];
 
 fn assert_no_private_stdlib(out: &Path) {
@@ -954,6 +1000,51 @@ fn scala_signature_on_compiled_object() {
     assert!(
         text.contains("ScalaSignature") && text.contains("bytes"),
         "expected ScalaSignature annotation in javap -v, got {text}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn java_deprecated_runtime_visible_on_method() {
+    let out = compile_fixture("java_deprecated");
+    if !javap_available() {
+        let _ = fs::remove_dir_all(&out);
+        return;
+    }
+    let output = Command::new("javap")
+        .args(["-v", "-p", out.join("Main$.class").to_str().unwrap()])
+        .output()
+        .expect("javap");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("Deprecated") && text.contains("Ljava/lang/Deprecated;"),
+        "expected Java @Deprecated RuntimeVisibleAnnotations on method, got {text}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn nlreturn_verifies() {
+    if !java_available() {
+        return;
+    }
+    let out = compile_fixture("nlreturn");
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", out.to_str().unwrap(), "Main"])
+        .output()
+        .expect("java -Xverify:all nlreturn");
+    assert!(
+        output.status.success(),
+        "java -Xverify:all nlreturn failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("nlreturn")
     );
     let _ = fs::remove_dir_all(&out);
 }

@@ -696,6 +696,13 @@ impl<'a> Pickler<'a> {
     fn pickle_symannot(&mut self, target: u32, annot: &Tree) {
         let path = annot.annotation_path();
         let simple = path.rsplit('.').next().unwrap_or(path.as_str());
+        if matches!(
+            simple,
+            "Override" | "Deprecated"
+        ) || path.starts_with("java.lang.")
+        {
+            return;
+        }
         let atp = if simple == "tailrec" {
             let sc = self.scala_module();
             let ann = self.ext_mod("annotation", Some(sc));

@@ -30,6 +30,10 @@ fn annotation_supported(path: &str) -> bool {
             | "scala.annotation.tailrec"
             | "deprecated"
             | "scala.deprecated"
+            | "Override"
+            | "java.lang.Override"
+            | "Deprecated"
+            | "java.lang.Deprecated"
     )
 }
 
