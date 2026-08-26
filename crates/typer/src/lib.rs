@@ -1616,7 +1616,7 @@ object Main {
 
     #[test]
     fn dynamic_update_and_named_apply_typecheck() {
-        ok(r#"
+        let src = r#"
 import scala.language.dynamics
 class D extends Dynamic {
   def selectDynamic(name: String): String = name
@@ -1630,7 +1630,9 @@ object Main {
     val a: String = d.bar(a = "x")
   }
 }
-"#);
+"#;
+        ok(src);
+        ok_lib(src);
     }
 
     #[test]

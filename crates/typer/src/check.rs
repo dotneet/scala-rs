@@ -2315,6 +2315,14 @@ impl Typer {
             tree.ty = Type::Error;
             return;
         }
+        if let Type::Tuple(ts) = &qual.ty {
+            if let Some(i) = tuple_elem_index(&name) {
+                if let Some(elem) = ts.get(i) {
+                    tree.ty = elem.clone();
+                    return;
+                }
+            }
+        }
         let refined_term = match &qual.ty {
             Type::Refined { decls, .. } => {
                 let from_term = decls.iter().any(|d| {
@@ -2896,18 +2904,19 @@ impl Typer {
                 lit: Lit::String(name),
             },
         );
-        let fun = Tree::new(
+        let tpt = Tree::new(
             NodeId(0),
             span,
             TreeKind::Ident {
                 name: "Tuple2".into(),
             },
         );
+        let neu = Tree::new(NodeId(0), span, TreeKind::New { tpt: Box::new(tpt) });
         Tree {
             id: NodeId(0),
             span,
             kind: TreeKind::Apply {
-                fun: Box::new(fun),
+                fun: Box::new(neu),
                 args: vec![name_lit, value],
             },
             ty: Type::NoType,
@@ -6362,6 +6371,11 @@ fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
                 matches!(p, Type::TypeParam(_)) || a == p || class_ctor_matches_typeparam_args(a, p)
             })
         }
+        (Type::Class { args: aa, .. }, Type::Tuple(pa)) if aa.len() == pa.len() => {
+            aa.iter().zip(pa.iter()).all(|(a, p)| {
+                matches!(p, Type::TypeParam(_)) || a == p || class_ctor_matches_typeparam_args(a, p)
+            })
+        }
         (_, Type::TypeParam(_)) => true,
         _ => false,
     }
@@ -6514,6 +6528,11 @@ fn is_implicit_conversion_shape(vparamss: &[Vec<Tree>]) -> bool {
         n_non_impl += clause.len();
     }
     n_non_impl == 1
+}
+
+fn tuple_elem_index(name: &str) -> Option<usize> {
+    let n: usize = name.strip_prefix('_')?.parse().ok()?;
+    n.checked_sub(1)
 }
 
 /// nsc: `T: C` means implicit evidence of type `C[T]`.

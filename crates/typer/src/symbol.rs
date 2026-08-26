@@ -519,6 +519,31 @@ impl SymbolTable {
                     false
                 }
             }
+            // Before the Class-parent walk: that arm matches every Class and
+            // would otherwise hide `Tuple2[A, B] <: (A, B)` / the reverse.
+            (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
+                a.iter().zip(b.iter()).all(|(x, y)| self.is_sub_type(x, y))
+            }
+            (Type::Tuple(ts), Type::Class { sym, args })
+                if self.is_tuple_arity(*sym, ts.len())
+                    && (args.is_empty() || args.len() == ts.len()) =>
+            {
+                args.is_empty()
+                    || ts
+                        .iter()
+                        .zip(args.iter())
+                        .all(|(x, y)| self.is_sub_type(x, y))
+            }
+            (Type::Class { sym, args }, Type::Tuple(ts))
+                if self.is_tuple_arity(*sym, ts.len())
+                    && (args.is_empty() || args.len() == ts.len()) =>
+            {
+                args.is_empty()
+                    || args
+                        .iter()
+                        .zip(ts.iter())
+                        .all(|(x, y)| self.is_sub_type(x, y))
+            }
             (a, Type::Refined { parents, decls }) => {
                 parents.iter().all(|p| self.is_sub_type(a, p))
                     && self.conforms_to_refinement(a, decls)
@@ -592,6 +617,20 @@ impl SymbolTable {
             (Type::Refined { parents, .. }, b) => parents.iter().any(|p| self.is_sub_type(p, b)),
             _ => false,
         }
+    }
+
+    fn is_tuple_arity(&self, sym: SymbolId, n: usize) -> bool {
+        let s = self.get(sym);
+        let name = s.name.trim_end_matches('$');
+        if name == format!("Tuple{n}") {
+            return true;
+        }
+        let jvm = if s.jvm_name.is_empty() {
+            String::new()
+        } else {
+            s.jvm_name.clone()
+        };
+        jvm == format!("scala/Tuple{n}")
     }
 
     pub fn display_type(&self, ty: &Type) -> String {
