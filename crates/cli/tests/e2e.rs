@@ -387,6 +387,46 @@ fn fixtures_view_bounds_class_is_error() {
     compile_fails("view_bounds_class", "view bound");
 }
 
+#[test]
+fn fixtures_type_member() {
+    check("type_member");
+}
+
+#[test]
+fn fixtures_self_type() {
+    check("self_type");
+}
+
+#[test]
+fn fixtures_variance() {
+    check("variance");
+}
+
+#[test]
+fn fixtures_type_proj_bad_is_error() {
+    compile_fails("type_proj_bad", "path-dependent");
+}
+
+#[test]
+fn fixtures_self_type_bad_is_error() {
+    compile_fails("self_type_bad", "illegal inheritance");
+}
+
+#[test]
+fn fixtures_variance_bad_is_error() {
+    compile_fails("variance_bad", "contravariant");
+}
+
+#[test]
+fn fixtures_type_member_hk_is_error() {
+    compile_fails("type_member_hk", "unimplemented");
+}
+
+#[test]
+fn fixtures_type_member_bounds_is_error() {
+    compile_fails("type_member_bounds", "unimplemented");
+}
+
 fn scala_library_jar() -> Option<PathBuf> {
     let cached = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
     if cached.is_file() {

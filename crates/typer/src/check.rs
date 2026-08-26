@@ -378,15 +378,20 @@ impl Typer {
         let mut ids = Vec::new();
         for tp in tparams {
             let name = tp.name().unwrap_or("_").to_string();
+            let flags = match &tp.kind {
+                TreeKind::TypeDef { mods, .. } => mods.flags,
+                _ => Flags::EMPTY,
+            };
             let id = if tp.sym.is_none() {
                 let id = self
                     .st
-                    .alloc(&name, owner, SymKind::TypeParam, Flags::EMPTY, "");
+                    .alloc(&name, owner, SymKind::TypeParam, flags, "");
                 tp.sym = id;
                 id
             } else {
                 tp.sym
             };
+            self.st.get_mut(id).flags = self.st.get(id).flags.with(flags);
             self.st.get_mut(id).ty = Type::TypeParam(id);
             self.st.enter_in_current(&name, id);
             ids.push(id);
@@ -531,7 +536,7 @@ impl Typer {
             TreeKind::TypeDef { name, mods, .. } => {
                 let id = self
                     .st
-                    .alloc(name, self.st.owner, SymKind::Class, mods.flags, "");
+                    .alloc(name, self.st.owner, SymKind::TypeMember, mods.flags, "");
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
@@ -657,6 +662,10 @@ impl Typer {
             let n = self.st.get(m).name.clone();
             self.st.enter_in_current(&n, m);
         }
+        let (self_name, self_tpt) = match &tree.kind {
+            TreeKind::ClassDef { impl_, .. } => (impl_.self_name.clone(), impl_.self_tpt.clone()),
+            _ => (None, None),
+        };
         let (vparamss, body, parents) = match &mut tree.kind {
             TreeKind::ClassDef {
                 vparamss, impl_, ..
@@ -672,6 +681,13 @@ impl Typer {
             self.st.get_mut(id).parents = pts;
         }
         self.register_sealed_child(id);
+        self.bind_self_type(id, self_name, self_tpt.as_deref());
+        // type aliases / abstract type members before other signatures
+        for stt in body.iter_mut() {
+            if matches!(stt.kind, TreeKind::TypeDef { .. }) {
+                self.type_type_member(stt);
+            }
+        }
         let mut ctor_param_tys = Vec::new();
         for clause in vparamss.iter_mut() {
             for p in clause.iter_mut() {
@@ -686,15 +702,17 @@ impl Typer {
             sym: id,
             args: vec![],
         };
-        // type member signatures then bodies
         for stt in body.iter_mut() {
-            self.type_member_sig(stt);
+            if !matches!(stt.kind, TreeKind::TypeDef { .. }) {
+                self.type_member_sig(stt);
+            }
         }
         for stt in body.iter_mut() {
             self.type_member_body(stt);
         }
-        // finish case apply types
         self.finish_case_apply(id, &ctor_param_tys);
+        self.check_self_conformance(id, tree.span);
+        self.check_class_variance(id, tree.span);
         self.st.pop_scope();
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
@@ -760,6 +778,10 @@ impl Typer {
             let n = self.st.get(mem).name.clone();
             self.st.enter_in_current(&n, mem);
         }
+        let (self_name, self_tpt) = match &tree.kind {
+            TreeKind::ModuleDef { impl_, .. } => (impl_.self_name.clone(), impl_.self_tpt.clone()),
+            _ => (None, None),
+        };
         let (body, parents) = match &mut tree.kind {
             TreeKind::ModuleDef { impl_, .. } => (&mut impl_.body, &mut impl_.parents),
             _ => return,
@@ -773,16 +795,296 @@ impl Typer {
             self.st.get_mut(cls).parents = pts;
         }
         self.register_sealed_child(cls);
+        self.bind_self_type(cls, self_name, self_tpt.as_deref());
         for stt in body.iter_mut() {
-            self.type_member_sig(stt);
+            if matches!(stt.kind, TreeKind::TypeDef { .. }) {
+                self.type_type_member(stt);
+            }
+        }
+        for stt in body.iter_mut() {
+            if !matches!(stt.kind, TreeKind::TypeDef { .. }) {
+                self.type_member_sig(stt);
+            }
         }
         for stt in body.iter_mut() {
             self.type_member_body(stt);
         }
+        self.check_self_conformance(cls, tree.span);
         self.st.pop_scope();
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
         tree.ty = Type::ModuleRef(cls);
+    }
+
+    fn type_type_member(&mut self, tree: &mut Tree) {
+        let (tparams, rhs, lo, hi, name) = match &tree.kind {
+            TreeKind::TypeDef {
+                tparams,
+                rhs,
+                lo,
+                hi,
+                name,
+                ..
+            } => (tparams, rhs, lo, hi, name.clone()),
+            _ => return,
+        };
+        if !tparams.is_empty() {
+            self.error(
+                tree.span,
+                "unimplemented type: higher-kinded type members",
+            );
+            tree.ty = Type::Error;
+            if !tree.sym.is_none() {
+                self.st.get_mut(tree.sym).ty = Type::Error;
+            }
+            return;
+        }
+        if lo.is_some() || hi.is_some() {
+            self.error(
+                tree.span,
+                "unimplemented type: bounded type members (`type A <: T` / `type A >: T`)",
+            );
+            tree.ty = Type::Error;
+            if !tree.sym.is_none() {
+                self.st.get_mut(tree.sym).ty = Type::Error;
+            }
+            return;
+        }
+        let ty = if rhs.is_empty() {
+            Type::TypeMember(tree.sym)
+        } else {
+            self.tree_to_type(rhs)
+        };
+        tree.ty = ty.clone();
+        if !tree.sym.is_none() {
+            self.st.get_mut(tree.sym).ty = ty;
+        }
+        let _ = name;
+    }
+
+    fn bind_self_type(&mut self, class_id: SymbolId, self_name: Option<String>, self_tpt: Option<&Tree>) {
+        let Some(tpt) = self_tpt else {
+            return;
+        };
+        let st = self.tree_to_type(tpt);
+        if st.is_error() {
+            return;
+        }
+        self.st.get_mut(class_id).self_type = Some(st.clone());
+        if let Some(cls) = self.st.class_sym_of(&st) {
+            for m in self.st.get(cls).members.clone() {
+                let n = self.st.get(m).name.clone();
+                if n.ends_with('$') || n == "<init>" {
+                    continue;
+                }
+                self.st.enter_in_current(&n, m);
+            }
+            // members of Foo's parents too (lookup_member walks them; Ident needs scope)
+            let mut work = self.st.get(cls).parents.clone();
+            let mut seen = std::collections::HashSet::new();
+            seen.insert(cls.0);
+            while let Some(p) = work.pop() {
+                let Some(pid) = self.st.class_sym_of(&p) else {
+                    continue;
+                };
+                if !seen.insert(pid.0) {
+                    continue;
+                }
+                for m in self.st.get(pid).members.clone() {
+                    let n = self.st.get(m).name.clone();
+                    if n.ends_with('$') || n == "<init>" {
+                        continue;
+                    }
+                    self.st.enter_in_current(&n, m);
+                }
+                work.extend(self.st.get(pid).parents.clone());
+            }
+        }
+        if let Some(name) = self_name {
+            if name != "this" {
+                let sid = self.st.alloc(
+                    &name,
+                    class_id,
+                    SymKind::Term,
+                    Flags::SYNTHETIC,
+                    "",
+                );
+                self.st.get_mut(sid).ty = st;
+                self.st.enter_in_current(&name, sid);
+            }
+        }
+    }
+
+    fn check_self_conformance(&mut self, class_id: SymbolId, span: Span) {
+        if class_id.is_none() {
+            return;
+        }
+        let is_trait = self.st.get(class_id).flags.contains(Flags::TRAIT);
+        if is_trait {
+            return;
+        }
+        let this_ty = Type::Class {
+            sym: class_id,
+            args: vec![],
+        };
+        let mut work = vec![class_id];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = work.pop() {
+            if !seen.insert(id.0) {
+                continue;
+            }
+            if let Some(st) = self.st.get(id).self_type.clone() {
+                if !self.st.is_sub_type(&this_ty, &st) {
+                    self.error(
+                        span,
+                        format!(
+                            "illegal inheritance: self-type {} does not conform to {}",
+                            self.st.display_type(&this_ty),
+                            self.st.display_type(&st)
+                        ),
+                    );
+                }
+            }
+            for p in self.st.get(id).parents.clone() {
+                if let Some(ps) = self.st.class_sym_of(&p) {
+                    work.push(ps);
+                }
+            }
+        }
+    }
+
+    fn check_class_variance(&mut self, class_id: SymbolId, span: Span) {
+        let tps = self.st.get(class_id).tparams.clone();
+        if tps.is_empty() {
+            return;
+        }
+        let mut vars: Vec<(SymbolId, i8, String)> = Vec::new();
+        for tp in &tps {
+            let f = self.st.get(*tp).flags;
+            let v = if f.contains(Flags::COVARIANT) {
+                1
+            } else if f.contains(Flags::CONTRAVARIANT) {
+                -1
+            } else {
+                0
+            };
+            vars.push((*tp, v, self.st.get(*tp).name.clone()));
+        }
+        if vars.iter().all(|(_, v, _)| *v == 0) {
+            return;
+        }
+        let class_is_case = self.st.get(class_id).flags.contains(Flags::CASE);
+        for f in self.st.get(class_id).ctor_fields.clone() {
+            let flags = self.st.get(f).flags;
+            let ty = self.st.get(f).ty.clone();
+            let name = self.st.get(f).name.clone();
+            if flags.contains(Flags::MUTABLE) {
+                self.check_variance_ty(&vars, &ty, -1, span, &format!("value {name}"));
+                self.check_variance_ty(&vars, &ty, 1, span, &format!("value {name}"));
+            } else if flags.contains(Flags::ACCESSOR) || class_is_case {
+                self.check_variance_ty(&vars, &ty, 1, span, &format!("value {name}"));
+            }
+        }
+        for m in self.st.get(class_id).members.clone() {
+            if self.st.get(m).kind != SymKind::Method {
+                continue;
+            }
+            let name = self.st.get(m).name.clone();
+            if name == "<init>" || name == "<clinit>" {
+                continue;
+            }
+            if let Type::Method { paramss, ret } = self.st.get(m).ty.clone() {
+                for (i, p) in paramss.iter().flatten().enumerate() {
+                    self.check_variance_ty(
+                        &vars,
+                        p,
+                        -1,
+                        span,
+                        &format!("parameter {i} of {name}"),
+                    );
+                }
+                self.check_variance_ty(&vars, &ret, 1, span, &format!("return type of {name}"));
+            }
+        }
+    }
+
+    fn check_variance_ty(
+        &mut self,
+        vars: &[(SymbolId, i8, String)],
+        ty: &Type,
+        pos: i8,
+        span: Span,
+        where_: &str,
+    ) {
+        match ty {
+            Type::TypeParam(id) => {
+                if let Some((_, vp, name)) = vars.iter().find(|(t, _, _)| t == id) {
+                    if *vp != 0 && pos != 0 && (*vp < 0 && pos > 0 || *vp > 0 && pos < 0) {
+                        let which = if *vp > 0 { "covariant" } else { "contravariant" };
+                        let place = if pos > 0 { "covariant" } else { "contravariant" };
+                        self.error(
+                            span,
+                            format!(
+                                "{which} type {name} occurs in {place} position in type {} of {where_}",
+                                self.st.display_type(ty)
+                            ),
+                        );
+                    }
+                    if *vp != 0 && pos == 0 {
+                        let which = if *vp > 0 { "covariant" } else { "contravariant" };
+                        self.error(
+                            span,
+                            format!(
+                                "{which} type {name} occurs in invariant position in type {} of {where_}",
+                                self.st.display_type(ty)
+                            ),
+                        );
+                    }
+                }
+            }
+            Type::Class { sym, args } => {
+                let tps = self.st.get(*sym).tparams.clone();
+                for (i, a) in args.iter().enumerate() {
+                    let vp = tps.get(i).map(|tp| {
+                        let f = self.st.get(*tp).flags;
+                        if f.contains(Flags::COVARIANT) {
+                            1
+                        } else if f.contains(Flags::CONTRAVARIANT) {
+                            -1
+                        } else {
+                            0
+                        }
+                    }).unwrap_or(0);
+                    self.check_variance_ty(vars, a, pos * vp, span, where_);
+                }
+            }
+            Type::Function { params, ret } => {
+                for p in params {
+                    self.check_variance_ty(vars, p, -pos, span, where_);
+                }
+                self.check_variance_ty(vars, ret, pos, span, where_);
+            }
+            Type::Method { paramss, ret } => {
+                for p in paramss.iter().flatten() {
+                    self.check_variance_ty(vars, p, -pos, span, where_);
+                }
+                self.check_variance_ty(vars, ret, pos, span, where_);
+            }
+            Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => {
+                self.check_variance_ty(vars, t, pos, span, where_);
+            }
+            Type::Tuple(ts) => {
+                for t in ts {
+                    self.check_variance_ty(vars, t, pos, span, where_);
+                }
+            }
+            Type::Named { args, .. } => {
+                for a in args {
+                    self.check_variance_ty(vars, a, 0, span, where_);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn type_member_sig(&mut self, tree: &mut Tree) {
@@ -791,9 +1093,7 @@ impl Typer {
             TreeKind::DefDef { .. } => self.type_def_sig(tree),
             TreeKind::ClassDef { .. } => self.type_class(tree),
             TreeKind::ModuleDef { .. } => self.type_module(tree),
-            TreeKind::TypeDef { .. } => {
-                tree.ty = Type::Any;
-            }
+            TreeKind::TypeDef { .. } => self.type_type_member(tree),
             _ => {}
         }
     }
@@ -802,7 +1102,7 @@ impl Typer {
         match &tree.kind {
             TreeKind::ValDef { .. } => self.type_val_body(tree),
             TreeKind::DefDef { .. } => self.type_def_body(tree),
-            TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } => {}
+            TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } | TreeKind::TypeDef { .. } => {}
             TreeKind::Import { .. } => self.type_import(tree),
             _ => {
                 self.type_stat(tree);
@@ -1539,6 +1839,9 @@ impl Typer {
             tree.sym = s;
             let mut ty = self.st.get(s).ty.clone();
             ty = self.maybe_auto_apply(ty, pt);
+            if !self.st.this_class.is_none() {
+                ty = self.st.expand_type_members(self.st.this_class, &ty);
+            }
             tree.ty = ty;
             return;
         }
@@ -1697,10 +2000,17 @@ impl Typer {
             }
             ty
         };
+        let expand = |ty: Type| -> Type {
+            if let Some(owner) = self.st.class_sym_of(&qual.ty) {
+                self.st.expand_type_members(owner, &ty)
+            } else {
+                ty
+            }
+        };
         if found.len() == 1 {
             let s = found[0];
             tree.sym = s;
-            let ty = subst(self.st.get(s).ty.clone());
+            let ty = expand(subst(self.st.get(s).ty.clone()));
             tree.ty = self.maybe_auto_apply(ty, pt);
         } else {
             tree.sym = found[0];
@@ -1714,11 +2024,12 @@ impl Typer {
                     .iter()
                     .map(|s| {
                         let t = self.st.get(*s).ty.clone();
-                        if args.is_empty() {
+                        let t = if args.is_empty() {
                             t
                         } else {
                             self.st.subst_tparams(owner, &args, &t)
-                        }
+                        };
+                        expand(t)
                     })
                     .collect(),
             );
@@ -3424,13 +3735,28 @@ impl Typer {
             TreeKind::Empty => Type::NoType,
             TreeKind::Ident { name } if name == "_" => Type::Wildcard,
             TreeKind::Ident { name } => self.resolve_type_name(name, &[]),
-            TreeKind::Select { name, qual: _ } => {
+            TreeKind::Select { name, qual } => {
                 // java.lang.String etc.
                 if name == "String" {
                     Type::String
+                } else if self.type_select_is_term_prefix(qual) {
+                    self.error(tpt.span, "unimplemented type: path-dependent types");
+                    Type::Error
                 } else {
                     self.resolve_type_name(name, &[])
                 }
+            }
+            TreeKind::SelectFromTypeTree { qual, name, hash } => {
+                if !*hash {
+                    self.error(tpt.span, "unimplemented type: path-dependent types");
+                    return Type::Error;
+                }
+                let prefix = self.tree_to_type(qual);
+                self.project_type_member(tpt.span, prefix, name)
+            }
+            TreeKind::SingletonTypeTree { .. } => {
+                self.error(tpt.span, "unimplemented type: singleton types");
+                Type::Error
             }
             TreeKind::AppliedTypeTree { tpt, args } => {
                 let mut as_ = Vec::new();
@@ -3565,6 +3891,90 @@ impl Typer {
         }
     }
 
+    /// `p.T` where `p` is a term is path-dependent; `java.lang.String` is not.
+    fn type_select_is_term_prefix(&self, t: &Tree) -> bool {
+        match &t.kind {
+            TreeKind::This { .. } | TreeKind::Super { .. } => true,
+            TreeKind::Ident { name } => {
+                let found = self.st.lookup(name);
+                let type_like = found.iter().any(|s| {
+                    matches!(
+                        self.st.get(*s).kind,
+                        SymKind::Class
+                            | SymKind::Module
+                            | SymKind::ModuleClass
+                            | SymKind::Package
+                            | SymKind::TypeParam
+                            | SymKind::TypeMember
+                    )
+                });
+                let term_like = found.iter().any(|s| {
+                    matches!(self.st.get(*s).kind, SymKind::Term | SymKind::Method)
+                });
+                term_like && !type_like
+            }
+            TreeKind::Select { qual, .. } => self.type_select_is_term_prefix(qual),
+            _ => false,
+        }
+    }
+
+    fn project_type_member(&mut self, span: Span, prefix: Type, name: &str) -> Type {
+        let cls = match &prefix {
+            Type::Class { sym, .. } | Type::ModuleRef(sym) => *sym,
+            Type::TypeMember(_) => {
+                self.error(span, "unimplemented type: nested type projections");
+                return Type::Error;
+            }
+            Type::Named { name: n, .. } => match self.resolve_type_name(n, &[]) {
+                Type::Class { sym, .. } | Type::ModuleRef(sym) => sym,
+                _ => {
+                    self.error(
+                        span,
+                        format!("cannot project #{name} from {n}"),
+                    );
+                    return Type::Error;
+                }
+            },
+            other => {
+                self.error(
+                    span,
+                    format!(
+                        "cannot project #{name} from {}",
+                        self.st.display_type(other)
+                    ),
+                );
+                return Type::Error;
+            }
+        };
+        let mut found = self.st.lookup_member(cls, name);
+        found.sort_by_key(|s| if self.st.get(*s).owner == cls { 0 } else { 1 });
+        for m in found {
+            let ty = match self.st.get(m).kind {
+                SymKind::TypeMember => {
+                    let rhs = self.st.get(m).ty.clone();
+                    match rhs {
+                        Type::NoType | Type::Error | Type::TypeMember(_) => Type::TypeMember(m),
+                        other => other,
+                    }
+                }
+                SymKind::Class | SymKind::ModuleClass => Type::Class {
+                    sym: m,
+                    args: vec![],
+                },
+                _ => continue,
+            };
+            return self.st.expand_type_members(cls, &ty);
+        }
+        self.error(
+            span,
+            format!(
+                "type {} has no member {name}",
+                self.st.display_type(&prefix)
+            ),
+        );
+        Type::Error
+    }
+
     fn resolve_type_name(&self, name: &str, args: &[Type]) -> Type {
         match name {
             "Int" => Type::Int,
@@ -3590,11 +4000,21 @@ impl Typer {
                             | SymKind::ModuleClass
                             | SymKind::Module
                             | SymKind::TypeParam
+                            | SymKind::TypeMember
                     )
                 }) {
                     match self.st.get(id).kind {
                         SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
                         SymKind::TypeParam => Type::TypeParam(id),
+                        SymKind::TypeMember => {
+                            let rhs = self.st.get(id).ty.clone();
+                            match rhs {
+                                Type::NoType | Type::Error | Type::TypeMember(_) => {
+                                    Type::TypeMember(id)
+                                }
+                                other => other,
+                            }
+                        }
                         _ => Type::Class {
                             sym: id,
                             args: args.to_vec(),

@@ -34,7 +34,7 @@ fn erase_symbols(st: &mut SymbolTable) {
 
 pub fn erase_type(ty: &Type) -> Type {
     match ty {
-        Type::TypeParam(_) => Type::Any,
+        Type::TypeParam(_) | Type::TypeMember(_) => Type::Any,
         Type::Class { sym, .. } => Type::Class {
             sym: *sym,
             args: vec![],
@@ -79,7 +79,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
                 Type::Any
             }
         }
-        Type::TypeParam(_) => Type::Any,
+        Type::TypeParam(_) | Type::TypeMember(_) => Type::Any,
         Type::Wildcard => Type::Any,
         Type::Class { sym, .. } => Type::Class {
             sym: *sym,
@@ -140,6 +140,7 @@ fn is_ref_erased(ty: &Type) -> bool {
             | Type::Array(_)
             | Type::Function { .. }
             | Type::TypeParam(_)
+            | Type::TypeMember(_)
             | Type::Wildcard
             | Type::Named { .. }
     )

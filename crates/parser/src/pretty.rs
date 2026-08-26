@@ -119,8 +119,15 @@ fn dump_into(s: &mut String, t: &Tree, indent: usize) {
             }
             Ok(())
         }
-        TreeKind::TypeDef { name, rhs, views, .. } => {
-            writeln!(s, "{pad}TypeDef {name}{ty}");
+        TreeKind::TypeDef { name, rhs, views, mods, .. } => {
+            let var = if mods.flags.contains(Flags::COVARIANT) {
+                "+"
+            } else if mods.flags.contains(Flags::CONTRAVARIANT) {
+                "-"
+            } else {
+                ""
+            };
+            writeln!(s, "{pad}TypeDef {var}{name}{ty}");
             if !rhs.is_empty() {
                 dump_into(s, rhs, indent + 1);
             }
@@ -283,8 +290,9 @@ fn dump_into(s: &mut String, t: &Tree, indent: usize) {
             dump_into(s, ref_, indent + 1);
             Ok(())
         }
-        TreeKind::SelectFromTypeTree { qual, name } => {
-            writeln!(s, "{pad}SelectFromType {name}{ty}");
+        TreeKind::SelectFromTypeTree { qual, name, hash } => {
+            let op = if *hash { "#" } else { "." };
+            writeln!(s, "{pad}SelectFromType {op}{name}{ty}");
             dump_into(s, qual, indent + 1);
             Ok(())
         }

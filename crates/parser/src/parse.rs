@@ -683,8 +683,12 @@ impl<'a> Parser<'a> {
 
     fn parse_type_param(&mut self) -> Tree {
         let lo = self.span();
-        // variance
-        if matches!(self.kind(), TokenKind::Ident(s) if s == "+" || s == "-") {
+        let mut mods = Modifiers::default();
+        if matches!(self.kind(), TokenKind::Ident(s) if s == "+") {
+            mods.flags = mods.flags.with(Flags::COVARIANT);
+            self.bump();
+        } else if matches!(self.kind(), TokenKind::Ident(s) if s == "-") {
+            mods.flags = mods.flags.with(Flags::CONTRAVARIANT);
             self.bump();
         }
         let (name, _) = if matches!(self.kind(), TokenKind::Underscore) {
@@ -725,7 +729,7 @@ impl<'a> Parser<'a> {
         self.alloc(
             lo.merge(self.prev_span()),
             TreeKind::TypeDef {
-                mods: Modifiers::default(),
+                mods,
                 name,
                 tparams: inner_tparams,
                 rhs: Box::new(rhs),
@@ -783,6 +787,7 @@ impl<'a> Parser<'a> {
         mods.flags = mods.flags.with(Flags::PARAM);
         self.skip_nl();
         if matches!(self.kind(), TokenKind::Val) {
+            mods.flags = mods.flags.with(Flags::ACCESSOR);
             self.bump();
         } else if matches!(self.kind(), TokenKind::Var) {
             mods.flags = mods.flags.with(Flags::MUTABLE);
@@ -1481,6 +1486,7 @@ impl<'a> Parser<'a> {
                     TreeKind::SelectFromTypeTree {
                         qual: Box::new(t),
                         name,
+                        hash: false,
                     },
                 );
                 continue;
@@ -1493,6 +1499,7 @@ impl<'a> Parser<'a> {
                     TreeKind::SelectFromTypeTree {
                         qual: Box::new(t),
                         name,
+                        hash: true,
                     },
                 );
                 continue;

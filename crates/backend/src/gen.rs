@@ -284,7 +284,7 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::Method { ret, .. } => jvm_desc(st, ret),
         Type::ByName(_) => "Lscala/Function0;".into(),
         Type::Repeated(_) => "Lscala/collection/immutable/Seq;".into(),
-        Type::TypeParam(_) | Type::Wildcard => "Ljava/lang/Object;".into(),
+        Type::TypeParam(_) | Type::TypeMember(_) | Type::Wildcard => "Ljava/lang/Object;".into(),
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
             format!("[{}", jvm_desc(st, &args[0]))
         }
@@ -593,6 +593,42 @@ fn type_jvm_name(st: &SymbolTable, ty: &Type) -> String {
 fn is_interface_sym(st: &SymbolTable, id: SymbolId) -> bool {
     let s = st.get(id);
     s.flags.contains(Flags::TRAIT) || s.flags.contains(Flags::INTERFACE)
+}
+
+/// True when `owner` is `current` or a parent in the extends/with graph.
+/// Self types are *not* walked: a trait `self: Foo =>` must checkcast `$this`.
+fn is_owner_compatible(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> bool {
+    if owner.is_none() || current == owner {
+        return true;
+    }
+    let mut work = vec![current];
+    let mut seen = HashSet::new();
+    while let Some(id) = work.pop() {
+        if !seen.insert(id.0) {
+            continue;
+        }
+        if id == owner {
+            return true;
+        }
+        for p in &st.get(id).parents {
+            if let Some(ps) = st.class_sym_of(p) {
+                work.push(ps);
+            }
+        }
+    }
+    false
+}
+
+fn maybe_checkcast_owner(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
+    if is_owner_compatible(ctx.st, ctx.class_sym, owner) {
+        return;
+    }
+    let kind = ctx.st.get(owner).kind;
+    if matches!(kind, SymKind::Class | SymKind::ModuleClass) || is_interface_sym(ctx.st, owner)
+    {
+        let jn = class_internal(ctx.st, owner);
+        asm.checkcast(&jn);
+    }
 }
 
 fn is_module_class(st: &SymbolTable, id: SymbolId) -> bool {
@@ -2585,6 +2621,13 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
     match sym.kind {
         SymKind::Term => {
             let owner = sym.owner;
+            if sym.flags.contains(Flags::SYNTHETIC) && !sym.flags.contains(Flags::PARAM) {
+                load_this(asm, ctx);
+                if let Some(cls) = ctx.st.class_sym_of(&sym.ty) {
+                    maybe_checkcast_owner(asm, ctx, cls);
+                }
+                return;
+            }
             if is_module_class(ctx.st, owner)
                 && module_class_id(ctx.st, owner) != module_class_id(ctx.st, ctx.class_sym)
             {
@@ -2592,6 +2635,7 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
             } else {
                 load_this(asm, ctx);
+                maybe_checkcast_owner(asm, ctx, owner);
             }
             if is_trait_owned_term(ctx.st, id) {
                 let owner = class_internal(ctx.st, owner);
@@ -2618,6 +2662,7 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
             } else {
                 load_this(asm, ctx);
+                maybe_checkcast_owner(asm, ctx, owner);
             }
             invoke_method(asm, ctx, id, Some(&tree.ty));
         }
@@ -3412,6 +3457,7 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
                 load_this(asm, ctx);
             } else {
                 load_this(asm, ctx);
+                maybe_checkcast_owner(asm, ctx, owner);
             }
         }
     }
