@@ -7,5 +7,7 @@ object Main {
     println(new Box("hi").get)
     println(Lib.add(Point(3, 4)))
     println(new Point(1, 2).x)
+    println(Lib.one)
+    println(Lib.lit(1))
   }
 }

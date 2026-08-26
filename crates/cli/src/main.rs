@@ -57,7 +57,7 @@ fn print_help() {
 scala-rs — a Scala 2.13 subset compiler (not Scala 3)
 
 USAGE:
-    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings]
+    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings] [-language:<feat>]
     scala-rs run <file> [--scala-library <jar>] [--no-scala-library] [--] [java-args...]
     scala-rs --help
 
@@ -82,6 +82,7 @@ OPTIONS:
     --parse             Parse only and dump the AST (do not typecheck or emit)
     --typer             Dump the typed tree after namer/typer
     -Xfatal-warnings    Treat warnings as errors (non-exhaustive match, …)
+    -language:<feat>    Enable a language feature (`postfixOps`, `implicitConversions`, `dynamics`)
     --help              Show this help
 
 EXAMPLES:
@@ -145,6 +146,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
     let mut scala_library = None;
     let mut no_scala_library = false;
     let mut class_path = Vec::new();
+    let mut language_features = Vec::new();
     let mut files = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -179,6 +181,27 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
                 .get(i)
                 .ok_or_else(|| "option -cp requires a classpath argument".to_string())?;
             class_path.extend(split_classpath(cp));
+        } else if let Some(rest) = a.strip_prefix("-language:") {
+            if rest.is_empty() {
+                return Err("option -language: requires a feature name".into());
+            }
+            for feat in rest.split(',') {
+                let f = feat.trim();
+                if !f.is_empty() {
+                    language_features.push(f.to_string());
+                }
+            }
+        } else if a == "-language" {
+            i += 1;
+            let feats = args
+                .get(i)
+                .ok_or_else(|| "option -language requires a feature argument".to_string())?;
+            for feat in feats.split(',') {
+                let f = feat.trim();
+                if !f.is_empty() {
+                    language_features.push(f.to_string());
+                }
+            }
         } else if a.starts_with('-') {
             return Err(format!("unknown option '{a}'"));
         } else {
@@ -208,6 +231,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             fatal_warnings,
             scala_library: resolved,
             class_path: class_path,
+            language_features,
         },
     })
 }
@@ -262,6 +286,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         fatal_warnings: false,
         scala_library: scala_library.clone(),
         class_path: Vec::new(),
+        language_features: Vec::new(),
     };
     let result = compile_paths(&[parsed.file], &opts);
     print_diags(&result);

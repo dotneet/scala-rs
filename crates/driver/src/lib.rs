@@ -30,6 +30,8 @@ pub struct CompileOptions {
     pub scala_library: Option<PathBuf>,
     /// Directories (or class files) searched for previously compiled classes.
     pub class_path: Vec<PathBuf>,
+    /// `-language:feat` flags (`postfixOps`, `implicitConversions`, `dynamics`).
+    pub language_features: Vec<String>,
 }
 
 impl Default for CompileOptions {
@@ -41,6 +43,7 @@ impl Default for CompileOptions {
             fatal_warnings: false,
             scala_library: None,
             class_path: Vec::new(),
+            language_features: Vec::new(),
         }
     }
 }
@@ -164,6 +167,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 fatal_warnings: opts.fatal_warnings,
                 library_abi: opts.scala_library.is_some(),
                 classpath: load_cp(&opts.class_path),
+                language_features: opts.language_features.clone(),
             },
         );
         diags.extend(tdiags);
@@ -476,6 +480,7 @@ object Main {
             fatal_warnings: false,
             scala_library: None,
             class_path: Vec::new(),
+            language_features: Vec::new(),
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());
@@ -518,6 +523,7 @@ object Main {
             fatal_warnings: false,
             scala_library: None,
             class_path: Vec::new(),
+            language_features: Vec::new(),
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "{}", result.render_diags());
@@ -537,6 +543,7 @@ object Main {
             fatal_warnings: false,
             scala_library: None,
             class_path: Vec::new(),
+            language_features: Vec::new(),
         };
         let result = compile_paths(&[src], &opts);
         assert!(!result.ok());
@@ -567,6 +574,7 @@ object Main {
             fatal_warnings: false,
             scala_library: Some(PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar")),
             class_path: Vec::new(),
+            language_features: Vec::new(),
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());

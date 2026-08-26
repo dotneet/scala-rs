@@ -15,6 +15,8 @@ pub struct TypecheckOptions {
     pub library_abi: bool,
     /// Classes loaded from `-cp` (previous compilation's classfiles).
     pub classpath: Vec<ClasspathClass>,
+    /// `-language:postfixOps` / `-language:implicitConversions` / `-language:dynamics`.
+    pub language_features: Vec<String>,
 }
 
 enum OverloadPick {
@@ -59,6 +61,7 @@ impl Default for TypecheckOptions {
             fatal_warnings: false,
             library_abi: false,
             classpath: Vec::new(),
+            language_features: Vec::new(),
         }
     }
 }
@@ -73,8 +76,12 @@ pub struct Typer {
     library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
     return_meth: Option<SymbolId>,
-    /// `import scala.language.dynamics` (or `language._`) has been seen.
+    /// `import scala.language.dynamics` / `-language:dynamics`.
     language_dynamics: bool,
+    /// `import scala.language.postfixOps` / `-language:postfixOps`.
+    language_postfix_ops: bool,
+    /// `import scala.language.implicitConversions` / `-language:implicitConversions`.
+    language_implicit_conversions: bool,
 }
 
 pub fn typecheck(tree: &mut Tree, file_index: usize) -> (SymbolTable, Vec<Diagnostic>) {
@@ -107,7 +114,12 @@ impl Typer {
             fatal_warnings: opts.fatal_warnings,
             library_abi: opts.library_abi,
             return_meth: None,
-            language_dynamics: false,
+            language_dynamics: language_flag_enabled(&opts.language_features, "dynamics"),
+            language_postfix_ops: language_flag_enabled(&opts.language_features, "postfixOps"),
+            language_implicit_conversions: language_flag_enabled(
+                &opts.language_features,
+                "implicitConversions",
+            ),
         }
     }
 
@@ -422,9 +434,7 @@ impl Typer {
                 _ => Flags::EMPTY,
             };
             let id = if tp.sym.is_none() {
-                let id = self
-                    .st
-                    .alloc(&name, owner, SymKind::TypeParam, flags, "");
+                let id = self.st.alloc(&name, owner, SymKind::TypeParam, flags, "");
                 tp.sym = id;
                 id
             } else {
@@ -706,7 +716,10 @@ impl Typer {
     fn type_class(&mut self, tree: &mut Tree) {
         let id = tree.sym;
         if let TreeKind::ClassDef {
-            mods, vparamss, ..
+            mods,
+            name,
+            vparamss,
+            ..
         } = &tree.kind
         {
             if mods.flags.contains(Flags::IMPLICIT) {
@@ -716,10 +729,7 @@ impl Typer {
                     self.st.get(self.st.owner).kind
                 };
                 if owner_kind == SymKind::Package {
-                    self.error(
-                        tree.span,
-                        "unimplemented: implicit class at package level",
-                    );
+                    self.error(tree.span, "unimplemented: implicit class at package level");
                 }
                 let nparams = vparamss.first().map(|c| c.len()).unwrap_or(0);
                 if nparams != 1 {
@@ -728,6 +738,9 @@ impl Typer {
                         "unimplemented: implicit class must have a single parameter",
                     );
                 }
+                let cname = name.clone();
+                let span = tree.span;
+                self.check_implicit_conversions_feature(span, &cname);
             }
         }
         let saved_owner = self.st.owner;
@@ -941,10 +954,7 @@ impl Typer {
             _ => return,
         };
         if !tparams.is_empty() {
-            self.error(
-                tree.span,
-                "unimplemented type: higher-kinded type members",
-            );
+            self.error(tree.span, "unimplemented type: higher-kinded type members");
             tree.ty = Type::Error;
             if !tree.sym.is_none() {
                 self.st.get_mut(tree.sym).ty = Type::Error;
@@ -974,7 +984,12 @@ impl Typer {
         let _ = name;
     }
 
-    fn bind_self_type(&mut self, class_id: SymbolId, self_name: Option<String>, self_tpt: Option<&Tree>) {
+    fn bind_self_type(
+        &mut self,
+        class_id: SymbolId,
+        self_name: Option<String>,
+        self_tpt: Option<&Tree>,
+    ) {
         let Some(tpt) = self_tpt else {
             return;
         };
@@ -1014,13 +1029,9 @@ impl Typer {
         }
         if let Some(name) = self_name {
             if name != "this" {
-                let sid = self.st.alloc(
-                    &name,
-                    class_id,
-                    SymKind::Term,
-                    Flags::SYNTHETIC,
-                    "",
-                );
+                let sid = self
+                    .st
+                    .alloc(&name, class_id, SymKind::Term, Flags::SYNTHETIC, "");
                 self.st.get_mut(sid).ty = st;
                 self.st.enter_in_current(&name, sid);
             }
@@ -1107,13 +1118,7 @@ impl Typer {
             }
             if let Type::Method { paramss, ret } = self.st.get(m).ty.clone() {
                 for (i, p) in paramss.iter().flatten().enumerate() {
-                    self.check_variance_ty(
-                        &vars,
-                        p,
-                        -1,
-                        span,
-                        &format!("parameter {i} of {name}"),
-                    );
+                    self.check_variance_ty(&vars, p, -1, span, &format!("parameter {i} of {name}"));
                 }
                 self.check_variance_ty(&vars, &ret, 1, span, &format!("return type of {name}"));
             }
@@ -1132,8 +1137,16 @@ impl Typer {
             Type::TypeParam(id) => {
                 if let Some((_, vp, name)) = vars.iter().find(|(t, _, _)| t == id) {
                     if *vp != 0 && pos != 0 && (*vp < 0 && pos > 0 || *vp > 0 && pos < 0) {
-                        let which = if *vp > 0 { "covariant" } else { "contravariant" };
-                        let place = if pos > 0 { "covariant" } else { "contravariant" };
+                        let which = if *vp > 0 {
+                            "covariant"
+                        } else {
+                            "contravariant"
+                        };
+                        let place = if pos > 0 {
+                            "covariant"
+                        } else {
+                            "contravariant"
+                        };
                         self.error(
                             span,
                             format!(
@@ -1143,7 +1156,11 @@ impl Typer {
                         );
                     }
                     if *vp != 0 && pos == 0 {
-                        let which = if *vp > 0 { "covariant" } else { "contravariant" };
+                        let which = if *vp > 0 {
+                            "covariant"
+                        } else {
+                            "contravariant"
+                        };
                         self.error(
                             span,
                             format!(
@@ -1157,16 +1174,19 @@ impl Typer {
             Type::Class { sym, args } => {
                 let tps = self.st.get(*sym).tparams.clone();
                 for (i, a) in args.iter().enumerate() {
-                    let vp = tps.get(i).map(|tp| {
-                        let f = self.st.get(*tp).flags;
-                        if f.contains(Flags::COVARIANT) {
-                            1
-                        } else if f.contains(Flags::CONTRAVARIANT) {
-                            -1
-                        } else {
-                            0
-                        }
-                    }).unwrap_or(0);
+                    let vp = tps
+                        .get(i)
+                        .map(|tp| {
+                            let f = self.st.get(*tp).flags;
+                            if f.contains(Flags::COVARIANT) {
+                                1
+                            } else if f.contains(Flags::CONTRAVARIANT) {
+                                -1
+                            } else {
+                                0
+                            }
+                        })
+                        .unwrap_or(0);
                     self.check_variance_ty(vars, a, pos * vp, span, where_);
                 }
             }
@@ -1336,7 +1356,9 @@ impl Typer {
     }
 
     fn type_def_sig(&mut self, tree: &mut Tree) {
-        let (tparams, vparamss, tpt, name, mods_within, mods_flags) = match &mut tree.kind {
+        let span = tree.span;
+        let (tparams, vparamss, tpt, name, mods_within, mods_flags, is_conv) = match &mut tree.kind
+        {
             TreeKind::DefDef {
                 tparams,
                 vparamss,
@@ -1344,16 +1366,25 @@ impl Typer {
                 name,
                 mods,
                 ..
-            } => (
-                tparams,
-                vparamss,
-                tpt.clone(),
-                name.clone(),
-                mods.private_within.clone(),
-                mods.flags,
-            ),
+            } => {
+                let is_conv = mods.flags.contains(Flags::IMPLICIT)
+                    && !mods.flags.contains(Flags::SYNTHETIC)
+                    && is_implicit_conversion_shape(vparamss);
+                (
+                    tparams,
+                    vparamss,
+                    tpt.clone(),
+                    name.clone(),
+                    mods.private_within.clone(),
+                    mods.flags,
+                    is_conv,
+                )
+            }
             _ => return,
         };
+        if is_conv {
+            self.check_implicit_conversions_feature(span, &name);
+        }
         if tree.sym.is_none() {
             let id = self.st.alloc(
                 name.clone(),
@@ -1539,13 +1570,7 @@ impl Typer {
             paramss_ids.push(ids);
             vparamss.push(evidence);
         }
-        self.synthesize_default_getters(
-            saved_owner,
-            tree.sym,
-            &name,
-            &tp_ids,
-            &paramss_ids,
-        );
+        self.synthesize_default_getters(saved_owner, tree.sym, &name, &tp_ids, &paramss_ids);
         self.st.owner = saved_owner;
         let ret = if tpt.is_empty() {
             Type::NoType
@@ -1611,9 +1636,13 @@ impl Typer {
                 .map(|id| self.st.get(*id).ty.clone())
                 .collect();
             let ret = self.st.get(*pid).ty.clone();
-            let gid = self
-                .st
-                .alloc(&gname, owner, crate::symbol::SymKind::Method, Flags::SYNTHETIC, "");
+            let gid = self.st.alloc(
+                &gname,
+                owner,
+                crate::symbol::SymKind::Method,
+                Flags::SYNTHETIC,
+                "",
+            );
             self.st.get_mut(gid).ty = Type::Method {
                 paramss: vec![preceding_tys],
                 ret: Box::new(ret.clone()),
@@ -1715,8 +1744,14 @@ impl Typer {
             TreeKind::Import { expr, .. } => expr,
             _ => return,
         };
-        if import_enables_dynamics(expr) {
+        if import_enables_feature(expr, "dynamics") {
             self.language_dynamics = true;
+        }
+        if import_enables_feature(expr, "postfixOps") {
+            self.language_postfix_ops = true;
+        }
+        if import_enables_feature(expr, "implicitConversions") {
+            self.language_implicit_conversions = true;
         }
         match &mut expr.kind {
             TreeKind::Select { qual, name } if name == "_" => {
@@ -1811,6 +1846,11 @@ impl Typer {
                 }
             }
         }
+        if matches!(&tree.kind, TreeKind::Assign { .. })
+            && self.try_rewrite_dynamic_update(tree, pt)
+        {
+            return;
+        }
         match &mut tree.kind {
             TreeKind::Literal { lit } => {
                 tree.ty = Type::Constant(lit.clone());
@@ -1894,6 +1934,7 @@ impl Typer {
                         },
                         ty: Type::NoType,
                         sym: SymbolId::NONE,
+                        postfix: false,
                     };
                     tree.kind = TreeKind::Apply {
                         fun: Box::new(update),
@@ -2244,10 +2285,23 @@ impl Typer {
             },
             ty: ret,
             sym,
+            postfix: false,
         };
     }
 
     fn type_select(&mut self, tree: &mut Tree, pt: &Type) {
+        if tree.postfix && !self.language_postfix_ops {
+            let name = match &tree.kind {
+                TreeKind::Select { name, .. } => name.clone(),
+                _ => String::new(),
+            };
+            self.warning(
+                tree.span,
+                format!(
+                    "postfix operator {name} should be enabled by making the implicit value scala.language.postfixOps visible"
+                ),
+            );
+        }
         let (qual, name) = match &mut tree.kind {
             TreeKind::Select { qual, name } => (qual, name.clone()),
             _ => return,
@@ -2325,6 +2379,7 @@ impl Typer {
                     },
                     ty: to,
                     sym: conv,
+                    postfix: false,
                 };
                 found = vec![member];
             }
@@ -2549,7 +2604,12 @@ impl Typer {
         SymbolId::NONE
     }
 
-    fn protected_subclass_ok(&self, current: SymbolId, owner: SymbolId, prefix: Option<&Tree>) -> bool {
+    fn protected_subclass_ok(
+        &self,
+        current: SymbolId,
+        owner: SymbolId,
+        prefix: Option<&Tree>,
+    ) -> bool {
         if current.is_none() || owner.is_none() {
             return false;
         }
@@ -2587,6 +2647,7 @@ impl Typer {
             },
             ty: to,
             sym: conv,
+            postfix: false,
         };
         fun.sym = member;
         fun.ty = self.st.get(member).ty.clone();
@@ -2665,6 +2726,18 @@ impl Typer {
         );
     }
 
+    fn check_implicit_conversions_feature(&mut self, span: Span, name: &str) {
+        if self.language_implicit_conversions {
+            return;
+        }
+        self.warning(
+            span,
+            format!(
+                "implicit conversion method {name} should be enabled by making the implicit value scala.language.implicitConversions visible"
+            ),
+        );
+    }
+
     fn rewrite_select_dynamic(&mut self, tree: &mut Tree, pt: &Type) {
         if !self.language_dynamics {
             self.dynamics_feature_error(tree.span, "selectDynamic");
@@ -2688,6 +2761,7 @@ impl Typer {
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         };
         let sel = Tree {
             id,
@@ -2698,6 +2772,7 @@ impl Typer {
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         };
         tree.kind = TreeKind::Apply {
             fun: Box::new(sel),
@@ -2712,7 +2787,7 @@ impl Typer {
                 TreeKind::Select { name, .. }
                     if !matches!(
                         name.as_str(),
-                        "applyDynamic" | "selectDynamic" | "updateDynamic"
+                        "applyDynamic" | "selectDynamic" | "updateDynamic" | "applyDynamicNamed"
                     ) =>
                 {
                     name.clone()
@@ -2737,13 +2812,19 @@ impl Typer {
             }
         }
         if !self.language_dynamics {
-            self.dynamics_feature_error(tree.span, "applyDynamic");
+            self.dynamics_feature_error(
+                tree.span,
+                if has_named_dynamic_args(tree) {
+                    "applyDynamicNamed"
+                } else {
+                    "applyDynamic"
+                },
+            );
             tree.ty = Type::Error;
             return true;
         }
         let span = tree.span;
-        let TreeKind::Apply { fun, args } =
-            std::mem::replace(&mut tree.kind, TreeKind::Empty)
+        let TreeKind::Apply { fun, args } = std::mem::replace(&mut tree.kind, TreeKind::Empty)
         else {
             return false;
         };
@@ -2751,24 +2832,36 @@ impl Typer {
             tree.kind = TreeKind::Apply { fun, args };
             return false;
         };
-        let name_lit = Tree {
-            id: NodeId(0),
+        let named = args.iter().any(|a| Self::named_arg_parts(a).is_some());
+        let method = if named {
+            "applyDynamicNamed"
+        } else {
+            "applyDynamic"
+        };
+        let args = if named {
+            args.into_iter()
+                .map(|a| self.named_dynamic_tuple(a))
+                .collect()
+        } else {
+            args
+        };
+        let name_lit = Tree::new(
+            NodeId(0),
             span,
-            kind: TreeKind::Literal {
+            TreeKind::Literal {
                 lit: Lit::String(dyn_name),
             },
-            ty: Type::NoType,
-            sym: SymbolId::NONE,
-        };
+        );
         let sel = Tree {
             id: fun.id,
             span: fun.span,
             kind: TreeKind::Select {
                 qual,
-                name: "applyDynamic".into(),
+                name: method.into(),
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         };
         let inner = Tree {
             id: fun.id,
@@ -2779,12 +2872,204 @@ impl Typer {
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         };
         tree.kind = TreeKind::Apply {
             fun: Box::new(inner),
             args,
         };
         self.type_apply(tree, pt);
+        true
+    }
+
+    fn named_dynamic_tuple(&self, arg: Tree) -> Tree {
+        let span = arg.span;
+        let (name, value) = if let Some((n, rhs)) = Self::named_arg_parts(&arg) {
+            (n, rhs)
+        } else {
+            (String::new(), arg)
+        };
+        let name_lit = Tree::new(
+            NodeId(0),
+            span,
+            TreeKind::Literal {
+                lit: Lit::String(name),
+            },
+        );
+        let fun = Tree::new(
+            NodeId(0),
+            span,
+            TreeKind::Ident {
+                name: "Tuple2".into(),
+            },
+        );
+        Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Apply {
+                fun: Box::new(fun),
+                args: vec![name_lit, value],
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+            postfix: false,
+        }
+    }
+
+    fn try_rewrite_dynamic_update(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        enum DynUpd {
+            Select(String),
+            Indexed(String),
+        }
+        let kind = {
+            let TreeKind::Assign { lhs, .. } = &mut tree.kind else {
+                return false;
+            };
+            match &mut lhs.kind {
+                TreeKind::Select { qual, name }
+                    if !matches!(
+                        name.as_str(),
+                        "updateDynamic" | "selectDynamic" | "applyDynamic" | "applyDynamicNamed"
+                    ) =>
+                {
+                    let dyn_name = name.clone();
+                    self.type_expr(qual, &Type::NoType);
+                    if !self.is_dynamic_receiver(&qual.ty)
+                        || self.receiver_has_term(&qual.ty, &dyn_name)
+                    {
+                        return false;
+                    }
+                    DynUpd::Select(dyn_name)
+                }
+                TreeKind::Apply { fun, .. } => match &mut fun.kind {
+                    TreeKind::Select { qual, name }
+                        if !matches!(
+                            name.as_str(),
+                            "update" | "apply" | "updateDynamic" | "selectDynamic"
+                        ) =>
+                    {
+                        let dyn_name = name.clone();
+                        self.type_expr(qual, &Type::NoType);
+                        if !self.is_dynamic_receiver(&qual.ty)
+                            || self.receiver_has_term(&qual.ty, &dyn_name)
+                        {
+                            return false;
+                        }
+                        DynUpd::Indexed(dyn_name)
+                    }
+                    _ => return false,
+                },
+                _ => return false,
+            }
+        };
+        if !self.language_dynamics {
+            let method = match &kind {
+                DynUpd::Select(_) => "updateDynamic",
+                DynUpd::Indexed(_) => "selectDynamic",
+            };
+            self.dynamics_feature_error(tree.span, method);
+            tree.ty = Type::Error;
+            return true;
+        }
+        let span = tree.span;
+        let TreeKind::Assign { lhs, rhs } = std::mem::replace(&mut tree.kind, TreeKind::Empty)
+        else {
+            return false;
+        };
+        match kind {
+            DynUpd::Select(dyn_name) => {
+                let TreeKind::Select { qual, .. } = lhs.kind else {
+                    return false;
+                };
+                let name_lit = Tree::new(
+                    NodeId(0),
+                    span,
+                    TreeKind::Literal {
+                        lit: Lit::String(dyn_name),
+                    },
+                );
+                let sel = Tree {
+                    id: lhs.id,
+                    span: lhs.span,
+                    kind: TreeKind::Select {
+                        qual,
+                        name: "updateDynamic".into(),
+                    },
+                    ty: Type::NoType,
+                    sym: SymbolId::NONE,
+                    postfix: false,
+                };
+                let inner = Tree {
+                    id: lhs.id,
+                    span: lhs.span,
+                    kind: TreeKind::Apply {
+                        fun: Box::new(sel),
+                        args: vec![name_lit],
+                    },
+                    ty: Type::NoType,
+                    sym: SymbolId::NONE,
+                    postfix: false,
+                };
+                tree.kind = TreeKind::Apply {
+                    fun: Box::new(inner),
+                    args: vec![*rhs],
+                };
+            }
+            DynUpd::Indexed(dyn_name) => {
+                let TreeKind::Apply { fun, mut args } = lhs.kind else {
+                    return false;
+                };
+                let TreeKind::Select { qual, .. } = fun.kind else {
+                    return false;
+                };
+                args.push(*rhs);
+                let name_lit = Tree::new(
+                    NodeId(0),
+                    span,
+                    TreeKind::Literal {
+                        lit: Lit::String(dyn_name),
+                    },
+                );
+                let sel = Tree {
+                    id: fun.id,
+                    span: fun.span,
+                    kind: TreeKind::Select {
+                        qual,
+                        name: "selectDynamic".into(),
+                    },
+                    ty: Type::NoType,
+                    sym: SymbolId::NONE,
+                    postfix: false,
+                };
+                let selected = Tree {
+                    id: fun.id,
+                    span: fun.span,
+                    kind: TreeKind::Apply {
+                        fun: Box::new(sel),
+                        args: vec![name_lit],
+                    },
+                    ty: Type::NoType,
+                    sym: SymbolId::NONE,
+                    postfix: false,
+                };
+                let update = Tree {
+                    id: fun.id,
+                    span: fun.span,
+                    kind: TreeKind::Select {
+                        qual: Box::new(selected),
+                        name: "update".into(),
+                    },
+                    ty: Type::NoType,
+                    sym: SymbolId::NONE,
+                    postfix: false,
+                };
+                tree.kind = TreeKind::Apply {
+                    fun: Box::new(update),
+                    args,
+                };
+            }
+        }
+        self.type_expr(tree, pt);
         true
     }
 
@@ -2849,9 +3134,8 @@ impl Typer {
                 if infer {
                     let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
                     for tp in &tps {
-                        inferred_args.push(
-                            unify_tparam(*tp, &ctor_params, &arg_tys).unwrap_or(Type::Any),
-                        );
+                        inferred_args
+                            .push(unify_tparam(*tp, &ctor_params, &arg_tys).unwrap_or(Type::Any));
                     }
                     tree.ty = Type::Class {
                         sym: c,
@@ -3067,7 +3351,10 @@ impl Typer {
                         if n == "Map" && args.len() >= 2 {
                             ret = Type::Class {
                                 sym: cls,
-                                args: vec![args[0].ty.widen_constant(), args[1].ty.widen_constant()],
+                                args: vec![
+                                    args[0].ty.widen_constant(),
+                                    args[1].ty.widen_constant(),
+                                ],
                             };
                         } else if n == "Vector" && args.len() >= 2 {
                             ret = Type::Class {
@@ -3093,11 +3380,10 @@ impl Typer {
                         if let Some(a0) = args.first() {
                             if let Type::Class { args: targs, .. } = &a0.ty {
                                 if targs.len() == 2 {
-                                    if let Some(map) = self
-                                        .st
-                                        .lookup("Map")
-                                        .into_iter()
-                                        .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)
+                                    if let Some(map) =
+                                        self.st.lookup("Map").into_iter().find(|id| {
+                                            self.st.get(*id).kind == crate::symbol::SymKind::Class
+                                        })
                                     {
                                         ret = Type::Class {
                                             sym: map,
@@ -3142,11 +3428,10 @@ impl Typer {
                                 _ => elem,
                             };
                             let cname = owner_n.trim_end_matches('$');
-                            if let Some(cls) = self
-                                .st
-                                .lookup(cname)
-                                .into_iter()
-                                .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)
+                            if let Some(cls) =
+                                self.st.lookup(cname).into_iter().find(|id| {
+                                    self.st.get(*id).kind == crate::symbol::SymKind::Class
+                                })
                             {
                                 ret = Type::Class {
                                     sym: cls,
@@ -3380,9 +3665,7 @@ impl Typer {
                     let flags = self.st.get(pid).flags;
                     let default_rhs = self.st.get(pid).default_rhs.clone();
                     if flags.contains(Flags::DEFAULTPARAM) {
-                        if let Some(filled) =
-                            self.default_getter_apply(fun, pid, i + 1, &out)
-                        {
+                        if let Some(filled) = self.default_getter_apply(fun, pid, i + 1, &out) {
                             out.push(filled);
                         } else if let Some(rhs) = default_rhs {
                             out.push(rhs);
@@ -3575,6 +3858,7 @@ impl Typer {
             },
             ty: self.st.get(gid).ty.clone(),
             sym: gid,
+            postfix: false,
         };
         self.type_expr(&mut gfun, &Type::NoType);
         let mut call = Tree {
@@ -3586,6 +3870,7 @@ impl Typer {
             },
             ty: self.st.get(param).ty.clone(),
             sym: gid,
+            postfix: false,
         };
         self.type_expr(&mut call, &self.st.get(param).ty.clone());
         Some(call)
@@ -3609,6 +3894,7 @@ impl Typer {
                     kind: TreeKind::This { qual: None },
                     ty: this_ty,
                     sym: self.st.this_class,
+                    postfix: false,
                 }
             }
         }
@@ -3681,9 +3967,12 @@ impl Typer {
         let ident = Tree {
             id: NodeId(0),
             span,
-            kind: TreeKind::Ident { name: pname.clone() },
+            kind: TreeKind::Ident {
+                name: pname.clone(),
+            },
             ty: from.clone(),
             sym: pid,
+            postfix: false,
         };
         let param = Tree {
             id: NodeId(0),
@@ -3696,6 +3985,7 @@ impl Typer {
             },
             ty: from.clone(),
             sym: pid,
+            postfix: false,
         };
         let mut lam = Tree {
             id: NodeId(0),
@@ -3709,6 +3999,7 @@ impl Typer {
                 ret: Box::new(to.clone()),
             },
             sym: SymbolId::NONE,
+            postfix: false,
         };
         self.type_expr(&mut lam, pt);
         self.adapt(&mut lam, pt);
@@ -3822,9 +4113,9 @@ impl Typer {
                 let winners: Vec<(SymbolId, Vec<Type>, Type)> = applicable
                     .iter()
                     .filter(|a| {
-                        applicable.iter().all(|b| {
-                            a.0 == b.0 || self.is_as_specific_method(&a.1, &b.1)
-                        })
+                        applicable
+                            .iter()
+                            .all(|b| a.0 == b.0 || self.is_as_specific_method(&a.1, &b.1))
                     })
                     .cloned()
                     .collect();
@@ -3844,7 +4135,13 @@ impl Typer {
         self.is_applicable(SymbolId::NONE, b_ps, a_ps, true)
     }
 
-    fn is_applicable(&self, sym: SymbolId, params: &[Type], args: &[Type], allow_widen: bool) -> bool {
+    fn is_applicable(
+        &self,
+        sym: SymbolId,
+        params: &[Type],
+        args: &[Type],
+        allow_widen: bool,
+    ) -> bool {
         let (fixed, repeated) = split_repeated(params);
         if let Some(elem) = repeated {
             if args.len() < fixed.len() {
@@ -4686,18 +4983,15 @@ impl Typer {
                 let prefix = self.tree_to_type(qual);
                 self.project_from_prefix(tpt.span, &prefix, name)
             }
-            TreeKind::CompoundTypeTree { parents, refinements } => {
-                self.compound_to_type(tpt.span, parents, refinements)
-            }
+            TreeKind::CompoundTypeTree {
+                parents,
+                refinements,
+            } => self.compound_to_type(tpt.span, parents, refinements),
             TreeKind::SingletonTypeTree { ref_ } => self.singleton_to_type(tpt.span, ref_),
             TreeKind::AnnotatedTypeTree { tpt: inner, annot } => {
                 let ty = self.tree_to_type(inner);
                 let path = annot.annotation_path();
-                let simple = path
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(path.as_str())
-                    .to_string();
+                let simple = path.rsplit('.').next().unwrap_or(path.as_str()).to_string();
                 Type::Annotated {
                     tpe: Box::new(ty),
                     annot: simple,
@@ -4748,7 +5042,12 @@ impl Typer {
             }
             TreeKind::Literal { lit } => Type::Constant(lit.clone()),
             TreeKind::TypeDef {
-                name, tparams, lo, hi, rhs, ..
+                name,
+                tparams,
+                lo,
+                hi,
+                rhs,
+                ..
             } => {
                 if name == "_" {
                     if !tparams.is_empty() {
@@ -4772,7 +5071,10 @@ impl Typer {
                     }
                 }
             }
-            TreeKind::ExistentialTypeTree { tpt: inner, clauses } => {
+            TreeKind::ExistentialTypeTree {
+                tpt: inner,
+                clauses,
+            } => {
                 let mut quantified = Vec::new();
                 let mut ok = true;
                 for c in clauses {
@@ -4809,17 +5111,11 @@ impl Typer {
                             ok = false;
                         }
                         TreeKind::Unimplemented { what } => {
-                            self.error(
-                                c.span,
-                                format!("unimplemented type: {what}"),
-                            );
+                            self.error(c.span, format!("unimplemented type: {what}"));
                             ok = false;
                         }
                         _ => {
-                            self.error(
-                                c.span,
-                                "unimplemented type: existential clause",
-                            );
+                            self.error(c.span, "unimplemented type: existential clause");
                             ok = false;
                         }
                     }
@@ -4858,9 +5154,9 @@ impl Typer {
                             | SymKind::TypeMember
                     )
                 });
-                let term_like = found.iter().any(|s| {
-                    matches!(self.st.get(*s).kind, SymKind::Term | SymKind::Method)
-                });
+                let term_like = found
+                    .iter()
+                    .any(|s| matches!(self.st.get(*s).kind, SymKind::Term | SymKind::Method));
                 term_like && !type_like
             }
             TreeKind::Select { qual, .. } => self.type_select_is_term_prefix(qual),
@@ -4879,10 +5175,7 @@ impl Typer {
             }
             self.error(
                 span,
-                format!(
-                    "type {} has no member {name}",
-                    self.st.display_type(prefix)
-                ),
+                format!("type {} has no member {name}", self.st.display_type(prefix)),
             );
             return Type::Error;
         }
@@ -4931,10 +5224,7 @@ impl Typer {
         }
         self.error(
             span,
-            format!(
-                "type {} has no member {name}",
-                self.st.display_type(prefix)
-            ),
+            format!("type {} has no member {name}", self.st.display_type(prefix)),
         );
         Type::Error
     }
@@ -5017,12 +5307,12 @@ impl Typer {
                     return Type::Error;
                 };
                 let owner = self.st.get(sym).owner;
-                let prefix = if owner.is_none() || matches!(self.st.get(owner).kind, SymKind::Method)
-                {
-                    Type::NoType
-                } else {
-                    Type::ThisType(owner)
-                };
+                let prefix =
+                    if owner.is_none() || matches!(self.st.get(owner).kind, SymKind::Method) {
+                        Type::NoType
+                    } else {
+                        Type::ThisType(owner)
+                    };
                 Type::SingleType {
                     prefix: Box::new(prefix),
                     sym,
@@ -5207,10 +5497,7 @@ impl Typer {
                         continue;
                     }
                     if !tparams.is_empty() {
-                        self.error(
-                            r.span,
-                            "unimplemented type: type parameters in refinement",
-                        );
+                        self.error(r.span, "unimplemented type: type parameters in refinement");
                         ok = false;
                         continue;
                     }
@@ -5271,10 +5558,7 @@ impl Typer {
             return Type::Error;
         }
         let _ = span;
-        Type::Refined {
-            parents: ps,
-            decls,
-        }
+        Type::Refined { parents: ps, decls }
     }
 
     fn is_non_trait_class_type(&self, ty: &Type) -> bool {
@@ -5340,19 +5624,21 @@ impl Typer {
             _ => {
                 let found = self.st.lookup(name);
                 // Prefer the class of a case-class/companion pair (`Point` vs `Point$`).
-                let id = found.iter().copied().find(|s| {
-                    matches!(self.st.get(*s).kind, SymKind::Class)
-                }).or_else(|| {
-                    found.into_iter().find(|s| {
-                        matches!(
-                            self.st.get(*s).kind,
-                            SymKind::ModuleClass
-                                | SymKind::Module
-                                | SymKind::TypeParam
-                                | SymKind::TypeMember
-                        )
-                    })
-                });
+                let id = found
+                    .iter()
+                    .copied()
+                    .find(|s| matches!(self.st.get(*s).kind, SymKind::Class))
+                    .or_else(|| {
+                        found.into_iter().find(|s| {
+                            matches!(
+                                self.st.get(*s).kind,
+                                SymKind::ModuleClass
+                                    | SymKind::Module
+                                    | SymKind::TypeParam
+                                    | SymKind::TypeMember
+                            )
+                        })
+                    });
                 if let Some(id) = id {
                     match self.st.get(id).kind {
                         SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
@@ -5429,6 +5715,7 @@ impl Typer {
                         ret: Box::new(ret),
                     },
                     sym: SymbolId::NONE,
+                    postfix: false,
                 };
             }
             return;
@@ -5457,6 +5744,7 @@ impl Typer {
                     },
                     ty: pt.clone(),
                     sym: id,
+                    postfix: false,
                 };
                 return;
             }
@@ -5538,6 +5826,7 @@ impl Typer {
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         };
         let apply = Tree {
             id: NodeId(0),
@@ -5548,6 +5837,7 @@ impl Typer {
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         };
         let part_lits: Vec<Tree> = parts
             .into_iter()
@@ -5559,6 +5849,7 @@ impl Typer {
                 },
                 ty: Type::String,
                 sym: SymbolId::NONE,
+                postfix: false,
             })
             .collect();
         let sc_apply = Tree {
@@ -5570,6 +5861,7 @@ impl Typer {
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         };
         let sel = Tree {
             id: NodeId(0),
@@ -5580,6 +5872,7 @@ impl Typer {
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         };
         *tree = Tree {
             id: tree.id,
@@ -5590,6 +5883,7 @@ impl Typer {
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         };
     }
 
@@ -5629,6 +5923,7 @@ impl Typer {
                     },
                     ty: Type::NoType,
                     sym: SymbolId::NONE,
+                    postfix: false,
                 };
                 *tree = Tree {
                     id: tree.id,
@@ -5639,6 +5934,7 @@ impl Typer {
                     },
                     ty: Type::NoType,
                     sym: SymbolId::NONE,
+                    postfix: false,
                 };
                 self.type_expr_inner(tree, &Type::NoType);
             }
@@ -5681,11 +5977,15 @@ impl Typer {
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         };
-        self.type_select(fun, &Type::Method {
-            paramss: vec![],
-            ret: Box::new(Type::NoType),
-        });
+        self.type_select(
+            fun,
+            &Type::Method {
+                paramss: vec![],
+                ret: Box::new(Type::NoType),
+            },
+        );
     }
 
     fn check_stored_annotations(&mut self, tree: &Tree) {
@@ -5775,9 +6075,10 @@ impl Typer {
                 if ps.len() != my_ps.len() {
                     continue;
                 }
-                let ok = my_ps.iter().zip(ps.iter()).all(|(a, b)| {
-                    a == b || self.st.is_sub_type(a, b) || self.st.is_sub_type(b, a)
-                });
+                let ok = my_ps
+                    .iter()
+                    .zip(ps.iter())
+                    .all(|(a, b)| a == b || self.st.is_sub_type(a, b) || self.st.is_sub_type(b, a));
                 if ok {
                     return true;
                 }
@@ -5888,7 +6189,13 @@ fn rec_fun_is_method(tree: &Tree, meth: SymbolId) -> bool {
     }
 }
 
-fn count_tailrec_calls(tree: &Tree, meth: SymbolId, tail: bool, n_tail: &mut u32, n_nontail: &mut u32) {
+fn count_tailrec_calls(
+    tree: &Tree,
+    meth: SymbolId,
+    tail: bool,
+    n_tail: &mut u32,
+    n_nontail: &mut u32,
+) {
     if is_rec_apply(tree, meth) {
         if tail {
             *n_tail += 1;
@@ -5990,9 +6297,7 @@ fn f_kind_name(kind: scala_rs_parser::finterp::FConvKind) -> &'static str {
 fn is_function_pt(pt: &Type) -> bool {
     match pt {
         Type::Function { .. } => true,
-        Type::Named { name, .. }
-            if name.starts_with("Function") || name == "PartialFunction" =>
-        {
+        Type::Named { name, .. } if name.starts_with("Function") || name == "PartialFunction" => {
             true
         }
         _ => false,
@@ -6045,25 +6350,16 @@ fn pattern_has_star(pat: &Tree) -> bool {
 /// are type parameters. Not used for implicit search (`is_sub_type`).
 fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
     match (arg, param) {
-        (
-            Type::Class {
-                sym: sa,
-                args: aa,
-            },
-            Type::Class {
-                sym: sp,
-                args: pa,
-            },
-        ) if sa == sp && aa.len() == pa.len() => aa.iter().zip(pa.iter()).all(|(a, p)| {
-            matches!(p, Type::TypeParam(_))
-                || a == p
-                || class_ctor_matches_typeparam_args(a, p)
-        }),
+        (Type::Class { sym: sa, args: aa }, Type::Class { sym: sp, args: pa })
+            if sa == sp && aa.len() == pa.len() =>
+        {
+            aa.iter().zip(pa.iter()).all(|(a, p)| {
+                matches!(p, Type::TypeParam(_)) || a == p || class_ctor_matches_typeparam_args(a, p)
+            })
+        }
         (Type::Tuple(aa), Type::Class { args: pa, .. }) if aa.len() == pa.len() => {
             aa.iter().zip(pa.iter()).all(|(a, p)| {
-                matches!(p, Type::TypeParam(_))
-                    || a == p
-                    || class_ctor_matches_typeparam_args(a, p)
+                matches!(p, Type::TypeParam(_)) || a == p || class_ctor_matches_typeparam_args(a, p)
             })
         }
         (_, Type::TypeParam(_)) => true,
@@ -6170,11 +6466,11 @@ fn import_path(t: &Tree) -> String {
     }
 }
 
-fn import_enables_dynamics(expr: &Tree) -> bool {
+fn import_enables_feature(expr: &Tree, feature: &str) -> bool {
     let p = import_path(expr);
-    if p == "scala.language.dynamics"
-        || p == "language.dynamics"
-        || p.ends_with(".language.dynamics")
+    if p == format!("scala.language.{feature}")
+        || p == format!("language.{feature}")
+        || p.ends_with(&format!(".language.{feature}"))
         || p == "scala.language._"
         || p == "language._"
         || p.ends_with(".language._")
@@ -6184,15 +6480,40 @@ fn import_enables_dynamics(expr: &Tree) -> bool {
     if let TreeKind::Select { qual, name } = &expr.kind {
         if name.starts_with('{') {
             let qp = import_path(qual);
-            let is_lang = qp == "scala.language"
-                || qp == "language"
-                || qp.ends_with(".language");
-            if is_lang && (name.contains("dynamics") || name.contains('_')) {
+            let is_lang = qp == "scala.language" || qp == "language" || qp.ends_with(".language");
+            if is_lang && (name.contains(feature) || name.contains('_')) {
                 return true;
             }
         }
     }
     false
+}
+
+fn language_flag_enabled(features: &[String], name: &str) -> bool {
+    features.iter().any(|f| f == name || f == "_")
+}
+
+fn has_named_dynamic_args(tree: &Tree) -> bool {
+    match &tree.kind {
+        TreeKind::Apply { args, .. } => args.iter().any(|a| Typer::named_arg_parts(a).is_some()),
+        _ => false,
+    }
+}
+
+fn is_implicit_conversion_shape(vparamss: &[Vec<Tree>]) -> bool {
+    let mut n_non_impl = 0usize;
+    for clause in vparamss {
+        let all_impl = !clause.is_empty()
+            && clause.iter().all(|p| match &p.kind {
+                TreeKind::ValDef { mods, .. } => mods.flags.contains(Flags::IMPLICIT),
+                _ => false,
+            });
+        if all_impl {
+            continue;
+        }
+        n_non_impl += clause.len();
+    }
+    n_non_impl == 1
 }
 
 /// nsc: `T: C` means implicit evidence of type `C[T]`.
@@ -6213,9 +6534,7 @@ fn apply_context_bound(bound: Type, tp: SymbolId) -> Type {
 fn array_elem_of(ty: &Type) -> Option<Type> {
     match ty {
         Type::Array(t) => Some((**t).clone()),
-        Type::Named { name, args } if name == "Array" && !args.is_empty() => {
-            Some(args[0].clone())
-        }
+        Type::Named { name, args } if name == "Array" && !args.is_empty() => Some(args[0].clone()),
         Type::Class { args, .. } if args.len() == 1 => {
             // only when the class is Array; callers pass New's type which is Array(_)
             None
@@ -6271,6 +6590,7 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
             kind: TreeKind::Ident { name: name.clone() },
             ty: Type::NoType,
             sym: stt.sym,
+            postfix: false,
         };
         let arg = Tree {
             id: NodeId(0),
@@ -6278,6 +6598,7 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
             kind: TreeKind::Ident { name: pname },
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         };
         let rhs = Tree {
             id: NodeId(0),
@@ -6291,11 +6612,13 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
                     },
                     ty: Type::NoType,
                     sym: stt.sym,
+                    postfix: false,
                 }),
                 args: vec![arg],
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         };
         let mut conv = Tree::dummy(TreeKind::DefDef {
             mods: Modifiers::new(Flags::IMPLICIT.with(Flags::SYNTHETIC)),
@@ -6308,6 +6631,7 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
                 kind: TreeKind::Ident { name: name.clone() },
                 ty: Type::NoType,
                 sym: stt.sym,
+                postfix: false,
             }),
             rhs: Box::new(rhs),
         });
@@ -6462,10 +6786,7 @@ fn subst_quantified(ty: Type, qs: &[ExistQuant]) -> Type {
         }
         Type::Class { sym, args } => Type::Class {
             sym,
-            args: args
-                .into_iter()
-                .map(|a| subst_quantified(a, qs))
-                .collect(),
+            args: args.into_iter().map(|a| subst_quantified(a, qs)).collect(),
         },
         Type::Array(t) => Type::Array(Box::new(subst_quantified(*t, qs))),
         Type::Function { params, ret } => Type::Function {
@@ -6478,11 +6799,7 @@ fn subst_quantified(ty: Type, qs: &[ExistQuant]) -> Type {
         Type::Method { paramss, ret } => Type::Method {
             paramss: paramss
                 .into_iter()
-                .map(|ps| {
-                    ps.into_iter()
-                        .map(|p| subst_quantified(p, qs))
-                        .collect()
-                })
+                .map(|ps| ps.into_iter().map(|p| subst_quantified(p, qs)).collect())
                 .collect(),
             ret: Box::new(subst_quantified(*ret, qs)),
         },

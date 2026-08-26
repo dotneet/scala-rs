@@ -313,9 +313,10 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::Method { ret, .. } => jvm_desc(st, ret),
         Type::ByName(_) => "Lscala/Function0;".into(),
         Type::Repeated(_) => "Lscala/collection/immutable/Seq;".into(),
-        Type::TypeParam(_) | Type::TypeMember(_) | Type::Wildcard | Type::BoundedWildcard { .. } => {
-            "Ljava/lang/Object;".into()
-        }
+        Type::TypeParam(_)
+        | Type::TypeMember(_)
+        | Type::Wildcard
+        | Type::BoundedWildcard { .. } => "Ljava/lang/Object;".into(),
         Type::ThisType(sym) => format!("L{};", class_internal(st, *sym)),
         Type::Constant(lit) => jvm_desc(st, &Type::lit_underlying(lit)),
         Type::SingleType { prefix, sym } => {
@@ -667,8 +668,7 @@ fn maybe_checkcast_owner(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
         return;
     }
     let kind = ctx.st.get(owner).kind;
-    if matches!(kind, SymKind::Class | SymKind::ModuleClass) || is_interface_sym(ctx.st, owner)
-    {
+    if matches!(kind, SymKind::Class | SymKind::ModuleClass) || is_interface_sym(ctx.st, owner) {
         let jn = class_internal(ctx.st, owner);
         asm.checkcast(&jn);
     }
@@ -1967,7 +1967,10 @@ impl<'a> Gen<'a> {
             };
             let name = s.name.clone();
             let pts: Vec<Type> = if !s.params.is_empty() {
-                s.params.iter().map(|p| self.st.get(*p).ty.clone()).collect()
+                s.params
+                    .iter()
+                    .map(|p| self.st.get(*p).ty.clone())
+                    .collect()
             } else {
                 match &s.ty {
                     Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
@@ -2180,7 +2183,10 @@ impl<'a> Gen<'a> {
                     continue;
                 }
                 let pts: Vec<Type> = if !s.params.is_empty() {
-                    s.params.iter().map(|p| self.st.get(*p).ty.clone()).collect()
+                    s.params
+                        .iter()
+                        .map(|p| self.st.get(*p).ty.clone())
+                        .collect()
                 } else {
                     match &s.ty {
                         Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
@@ -2503,13 +2509,7 @@ fn finish_method_body(
     }
 }
 
-fn emit_body_return(
-    asm: &mut Assembler,
-    frame: &mut Frame,
-    ctx: &EmitCtx,
-    rhs: &Tree,
-    ret: &Type,
-) {
+fn emit_body_return(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, rhs: &Tree, ret: &Type) {
     gen_expr(asm, frame, ctx, rhs);
     if is_unit_like(ret) {
         pop_if_value(asm, &rhs.ty);
@@ -2533,9 +2533,7 @@ fn tree_contains_return(tree: &Tree) -> bool {
             stats.iter().any(tree_contains_return) || tree_contains_return(expr)
         }
         TreeKind::If { cond, thenp, elsep } => {
-            tree_contains_return(cond)
-                || tree_contains_return(thenp)
-                || tree_contains_return(elsep)
+            tree_contains_return(cond) || tree_contains_return(thenp) || tree_contains_return(elsep)
         }
         TreeKind::Assign { lhs, rhs } => tree_contains_return(lhs) || tree_contains_return(rhs),
         TreeKind::ValDef { rhs, .. } => tree_contains_return(rhs),
@@ -2578,8 +2576,7 @@ fn tree_has_nlr_to(tree: &Tree, meth: SymbolId) -> bool {
                 vparams.iter().any(|p| walk(p, meth, in_fun)) || walk(body, meth, true)
             }
             TreeKind::DefDef { vparamss, rhs, .. } => {
-                vparamss.iter().flatten().any(|p| walk(p, meth, in_fun))
-                    || walk(rhs, meth, false)
+                vparamss.iter().flatten().any(|p| walk(p, meth, in_fun)) || walk(rhs, meth, false)
             }
             TreeKind::Select { qual, .. } => walk(qual, meth, in_fun),
             TreeKind::Apply { fun, args } | TreeKind::UnApply { fun, args } => {
@@ -2617,9 +2614,7 @@ fn tree_has_nlr_to(tree: &Tree, meth: SymbolId) -> bool {
                 walk(cond, meth, in_fun) || walk(body, meth, in_fun)
             }
             TreeKind::Throw { expr } => walk(expr, meth, in_fun),
-            TreeKind::InterpolatedString { args, .. } => {
-                args.iter().any(|a| walk(a, meth, in_fun))
-            }
+            TreeKind::InterpolatedString { args, .. } => args.iter().any(|a| walk(a, meth, in_fun)),
             _ => false,
         }
     }
@@ -2791,7 +2786,11 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
         } => {
             gen_try(asm, frame, ctx, block, catches, finalizer, &tree.ty);
         }
-        TreeKind::InterpolatedString { prefix, parts, args } => {
+        TreeKind::InterpolatedString {
+            prefix,
+            parts,
+            args,
+        } => {
             if prefix == "f" {
                 gen_f_interpolated(asm, frame, ctx, parts, args);
             } else {
@@ -3435,14 +3434,7 @@ fn gen_apply(
         return;
     }
     if matches!(ic, Intrinsic::Eq | Intrinsic::Ne) {
-        gen_eq_ne(
-            asm,
-            frame,
-            ctx,
-            fun,
-            args,
-            matches!(ic, Intrinsic::Eq),
-        );
+        gen_eq_ne(asm, frame, ctx, fun, args, matches!(ic, Intrinsic::Eq));
         return;
     }
     if matches!(ic, Intrinsic::Synchronized) {
@@ -4551,7 +4543,10 @@ fn gen_wrap_varargs(
     let n = args.len() as i32;
     let all_int = !args.is_empty()
         && args.iter().all(|a| matches!(a.ty, Type::Int))
-        && matches!(elem, Type::Int | Type::Any | Type::AnyRef | Type::TypeParam(_));
+        && matches!(
+            elem,
+            Type::Int | Type::Any | Type::AnyRef | Type::TypeParam(_)
+        );
     asm.getstatic(
         "scala/runtime/ScalaRunTime$",
         "MODULE$",
@@ -4598,7 +4593,9 @@ fn gen_call_args(
     param_tys: &[Type],
     box_prims: bool,
 ) {
-    let rep_idx = param_tys.iter().position(|p| matches!(p, Type::Repeated(_)));
+    let rep_idx = param_tys
+        .iter()
+        .position(|p| matches!(p, Type::Repeated(_)));
     let Some(ri) = rep_idx else {
         for (i, a) in args.iter().enumerate() {
             gen_expr(asm, frame, ctx, a);
@@ -4617,7 +4614,11 @@ fn gen_call_args(
         gen_expr(asm, frame, ctx, a);
     }
     let var_end = (ri + n_var).min(args.len());
-    let var_args = if ri <= var_end { &args[ri..var_end] } else { &[] };
+    let var_args = if ri <= var_end {
+        &args[ri..var_end]
+    } else {
+        &[]
+    };
     let elem = match &param_tys[ri] {
         Type::Repeated(t) => t.as_ref(),
         _ => &Type::Any,
@@ -5094,9 +5095,7 @@ fn emit_partial_function_methods(
     local_caps: &[SymbolId],
     ret_ty: &Type,
 ) {
-    let cases: Vec<scala_rs_parser::CaseDef> = pf_match_cases(body)
-        .unwrap_or(&[])
-        .to_vec();
+    let cases: Vec<scala_rs_parser::CaseDef> = pf_match_cases(body).unwrap_or(&[]).to_vec();
     let sel_ty = match &body.kind {
         TreeKind::Match { selector, .. } => selector.ty.clone(),
         _ => vparams.first().map(|p| p.ty.clone()).unwrap_or(Type::Any),
@@ -5199,16 +5198,16 @@ fn emit_partial_function_methods(
                             extras,
                             lambda_n,
                             source,
-                        outer: outer_ref,
-                        library_abi,
-                        method_sym: SymbolId::NONE,
-                    };
-                    gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
-                    if !c.guard.is_empty() {
-                        gen_expr(a, &mut fr, &inner_ctx, &c.guard);
-                        a.ifeq(fail);
-                    }
-                    if is_unit_like(&ret_ty) {
+                            outer: outer_ref,
+                            library_abi,
+                            method_sym: SymbolId::NONE,
+                        };
+                        gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
+                        if !c.guard.is_empty() {
+                            gen_expr(a, &mut fr, &inner_ctx, &c.guard);
+                            a.ifeq(fail);
+                        }
+                        if is_unit_like(&ret_ty) {
                             gen_stat(a, &mut fr, &inner_ctx, &c.body);
                             emit_box(a, &Type::Unit);
                         } else {
@@ -5659,13 +5658,15 @@ fn gen_synchronized(
         };
         match sort {
             JvmSort::Ref => {
-                if is_jvm_primitive(&produced_ty) && !matches!(produced_ty, Type::Unit | Type::NoType)
+                if is_jvm_primitive(&produced_ty)
+                    && !matches!(produced_ty, Type::Unit | Type::NoType)
                 {
                     emit_box(asm, &produced_ty);
                 } else if is_unit_like(&produced_ty) {
                     // Unit body: nothing (or popped) — leave a boxed null.
                     push_default(asm, result_ty);
-                } else if matches!(result_ty, Type::String) && !matches!(produced_ty, Type::String) {
+                } else if matches!(result_ty, Type::String) && !matches!(produced_ty, Type::String)
+                {
                     asm.checkcast("java/lang/String");
                 }
             }
@@ -6439,6 +6440,7 @@ mod tests {
                 fatal_warnings: false,
                 library_abi: true,
                 classpath: Vec::new(),
+                language_features: Vec::new(),
             },
         );
         assert!(

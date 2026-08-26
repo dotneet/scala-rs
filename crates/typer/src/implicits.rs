@@ -217,19 +217,13 @@ impl Typer {
     /// `newArray` would then allocate `Object[]`.
     fn implicit_result_conforms(&self, have: &Type, pt: &Type) -> bool {
         match (have, pt) {
-            (
-                Type::Class {
-                    sym: s1,
-                    args: a1,
-                },
-                Type::Class {
-                    sym: s2,
-                    args: a2,
-                },
-            ) if s1 == s2 && !a1.is_empty() && !a2.is_empty() && a1.len() == a2.len() => a1
-                .iter()
-                .zip(a2.iter())
-                .all(|(x, y)| x == y || (self.st.is_sub_type(x, y) && self.st.is_sub_type(y, x))),
+            (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 })
+                if s1 == s2 && !a1.is_empty() && !a2.is_empty() && a1.len() == a2.len() =>
+            {
+                a1.iter().zip(a2.iter()).all(|(x, y)| {
+                    x == y || (self.st.is_sub_type(x, y) && self.st.is_sub_type(y, x))
+                })
+            }
             _ => self.st.is_sub_type(have, pt),
         }
     }
@@ -469,6 +463,7 @@ impl Typer {
             },
             ty,
             sym: id,
+            postfix: false,
         }
     }
 

@@ -289,6 +289,7 @@ pub(crate) fn eta_expand(
         },
         ty: ret.clone(),
         sym: fun_sym,
+        postfix: false,
     };
     *tree = Tree {
         id: apply.id,
@@ -302,6 +303,7 @@ pub(crate) fn eta_expand(
             ret: Box::new(ret),
         },
         sym: SymbolId::NONE,
+        postfix: false,
     };
 }
 
@@ -341,6 +343,7 @@ fn flatten_apply(tree: &mut Tree) {
                     },
                     ty,
                     sym,
+                    postfix: false,
                 };
             }
             other => {
@@ -353,6 +356,7 @@ fn flatten_apply(tree: &mut Tree) {
                     },
                     ty,
                     sym,
+                    postfix: false,
                 };
                 return;
             }

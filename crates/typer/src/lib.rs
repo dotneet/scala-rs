@@ -55,6 +55,7 @@ mod tests {
                 fatal_warnings: false,
                 library_abi: true,
                 classpath: Vec::new(),
+                language_features: Vec::new(),
             },
         );
         assert!(
@@ -400,6 +401,7 @@ object Main {
                 fatal_warnings: true,
                 library_abi: false,
                 classpath: Vec::new(),
+                language_features: Vec::new(),
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -604,6 +606,7 @@ object Main {
                 fatal_warnings: false,
                 library_abi: true,
                 classpath: Vec::new(),
+                language_features: Vec::new(),
             },
         );
         assert!(
@@ -660,9 +663,8 @@ object M {
 
     #[test]
     fn value_existential_is_diagnosed() {
-        let (_, _, diags) = typecheck_str(
-            "object M { def f(x: T forSome { val x: Int }): Unit = () }\n",
-        );
+        let (_, _, diags) =
+            typecheck_str("object M { def f(x: T forSome { val x: Int }): Unit = () }\n");
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
             diags.iter().any(|d| d.message.contains("unimplemented")),
@@ -729,7 +731,10 @@ object Main {
             !dump.contains("paramss[1]"),
             "uncurry should flatten nested param lists: {dump}"
         );
-        assert!(dump.contains("Function"), "eta-expansion should yield Function: {dump}");
+        assert!(
+            dump.contains("Function"),
+            "eta-expansion should yield Function: {dump}"
+        );
     }
 
     #[test]
@@ -959,7 +964,9 @@ class C {
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("cannot be accessed")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("cannot be accessed")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -989,7 +996,9 @@ object Main {
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("cannot be accessed")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("cannot be accessed")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -1038,7 +1047,9 @@ object Main {
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("stable identifier")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("stable identifier")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -1075,7 +1086,9 @@ object Main {
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("stable identifier")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("stable identifier")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -1109,7 +1122,9 @@ object Main {
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("illegal inheritance")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("illegal inheritance")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -1194,7 +1209,9 @@ class B extends A {
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("overrides nothing")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("overrides nothing")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -1234,8 +1251,10 @@ class Bad extends Add
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("illegal inheritance")
-                || d.message.contains("self-type")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("illegal inheritance")
+                    || d.message.contains("self-type")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -1255,8 +1274,9 @@ object Main {
         let (_, _, diags) = typecheck_str("class Bad[+A](var x: A)\n");
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("covariant")
-                && d.message.contains("contravariant")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("covariant") && d.message.contains("contravariant")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -1301,9 +1321,7 @@ object Main {
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags
-                .iter()
-                .any(|d| d.message.contains("f interpolator")),
+            diags.iter().any(|d| d.message.contains("f interpolator")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -1435,7 +1453,11 @@ object Main {
 }
 "#,
         );
-        assert!(has_errors(&diags), "expected @tailrec error, got {:?}", diags);
+        assert!(
+            has_errors(&diags),
+            "expected @tailrec error, got {:?}",
+            diags
+        );
         assert!(
             diags.iter().any(|d| d.message.contains("tailrec")),
             "{:?}",
@@ -1445,8 +1467,7 @@ object Main {
 
     #[test]
     fn tailrec_and_deprecated_typecheck() {
-        ok(
-            r#"
+        ok(r#"
 object Main {
   @tailrec
   def sum(n: Int, acc: Int): Int = if (n <= 0) acc else sum(n - 1, acc + n)
@@ -1457,8 +1478,7 @@ object Main {
     val k: Int = f()
   }
 }
-"#,
-        );
+"#);
     }
 
     #[test]
@@ -1586,7 +1606,93 @@ object Main {
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("language.dynamics")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("language.dynamics")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dynamic_update_and_named_apply_typecheck() {
+        ok(r#"
+import scala.language.dynamics
+class D extends Dynamic {
+  def selectDynamic(name: String): String = name
+  def updateDynamic(name: String)(value: String): Unit = ()
+  def applyDynamicNamed(name: String)(arg: (String, String)): String = name + arg._1 + arg._2
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val d = new D()
+    d.foo = "ok"
+    val a: String = d.bar(a = "x")
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn postfix_ops_warns_without_import() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+import scala.language.implicitConversions
+object Main {
+  implicit class Bang(n: Int) { def bang: Int = n + 1 }
+  def main(args: Array[String]): Unit = {
+    val n: Int = 42 bang
+  }
+}
+"#,
+        );
+        assert!(
+            !has_errors(&diags),
+            "postfix without import is a warning: {:?}",
+            diags
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("postfixOps")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn postfix_ops_ok_with_import() {
+        ok(r#"
+import scala.language.implicitConversions
+import scala.language.postfixOps
+object Main {
+  implicit class Bang(n: Int) { def bang: Int = n + 1 }
+  def main(args: Array[String]): Unit = {
+    val n: Int = 42 bang
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn implicit_conversions_warns_without_import() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  implicit class Rich(n: Int) { def twice: Int = n * 2 }
+  def main(args: Array[String]): Unit = {
+    val n: Int = 2.twice
+  }
+}
+"#,
+        );
+        assert!(
+            !has_errors(&diags),
+            "implicitConversions is a warning: {:?}",
+            diags
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("implicitConversions")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );

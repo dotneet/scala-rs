@@ -1314,7 +1314,8 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::Def => {
                     let sp = self.span();
-                    clauses.push(self.unimplemented(sp, "method existentials (`forSome { def … }`)"));
+                    clauses
+                        .push(self.unimplemented(sp, "method existentials (`forSome { def … }`)"));
                     self.skip_to_existential_sep();
                 }
                 _ => {
@@ -1426,6 +1427,31 @@ impl<'a> Parser<'a> {
                 | TokenKind::False
                 | TokenKind::Null
         )
+    }
+
+    fn looks_like_prefix_start(&self) -> bool {
+        match self.kind() {
+            TokenKind::Ident(s) if matches!(s.as_str(), "+" | "-" | "!" | "~") => true,
+            TokenKind::New
+            | TokenKind::LBrace
+            | TokenKind::LParen
+            | TokenKind::This
+            | TokenKind::Super
+            | TokenKind::Underscore
+            | TokenKind::Ident(_)
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::Null
+            | TokenKind::IntLit(_)
+            | TokenKind::LongLit(_)
+            | TokenKind::FloatLit(_)
+            | TokenKind::DoubleLit(_)
+            | TokenKind::CharLit(_)
+            | TokenKind::StringLit(_)
+            | TokenKind::SymbolLit(_)
+            | TokenKind::InterpStart { .. } => true,
+            _ => false,
+        }
     }
 
     fn looks_like_type_start(&self) -> bool {
@@ -2135,13 +2161,20 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix_expr(&mut self) -> Tree {
         let mut t = self.parse_infix_expr(0);
-        // postfix op: expr ident  (on same line)
-        if matches!(self.kind(), TokenKind::Ident(s) if is_operator_name(s) || true) {
+        // nsc PostfixExpr ::= InfixExpr [id] on the same line.
+        if matches!(self.kind(), TokenKind::Ident(_)) {
             if let Some(name) = self.ident_text() {
-                // only if no whitespace newline and it's not starting a new stmt with letter ident
-                if is_operator_name(&name) && !matches!(self.kind(), TokenKind::Newline) {
-                    // postfix is rare; skip to avoid eating infix that failed min prec
-                }
+                let sp = self.span();
+                self.bump();
+                let mut sel = self.alloc(
+                    t.span.merge(sp),
+                    TreeKind::Select {
+                        qual: Box::new(t),
+                        name,
+                    },
+                );
+                sel.postfix = true;
+                t = sel;
             }
         }
         // Eta-expansion `foo _` (nsc: Typed(foo, Function([], EmptyTree))).
@@ -2190,8 +2223,18 @@ impl<'a> Parser<'a> {
                 self.pos = saved;
                 break;
             }
-            let op_span = self.span();
+            // If there is no right-hand prefix expr, this ident is postfix not infix
+            // (`xs toList`, `42 abs`).
+            let after_ident = self.pos;
             self.bump();
+            if is_operator_name(&op) && matches!(self.kind(), TokenKind::Newline) {
+                self.skip_nl();
+            }
+            if !self.looks_like_prefix_start() {
+                self.pos = saved;
+                break;
+            }
+            let op_span = self.tokens[after_ident].span;
             let right_assoc = op.ends_with(':');
             let next_min = if right_assoc { prec } else { prec + 1 };
             let right = self.parse_infix_expr(next_min);
@@ -3082,6 +3125,7 @@ fn desugar_for(
             id: pat.id,
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         }
     }
     fn lambda(p: &mut Parser, pat: Tree, body: Tree) -> Tree {
@@ -3176,5 +3220,6 @@ fn dummy_ident_from(pat: &Tree) -> Tree {
         kind: TreeKind::Ident { name },
         ty: Type::NoType,
         sym: SymbolId::NONE,
+        postfix: false,
     }
 }

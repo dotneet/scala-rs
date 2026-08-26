@@ -49,8 +49,10 @@ impl<'a> Lifter<'a> {
                     }
                 }
                 for s in &mut impl_.body {
-                    if matches!(s.kind, TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. })
-                    {
+                    if matches!(
+                        s.kind,
+                        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+                    ) {
                         continue;
                     }
                     self.extract_from(s, &mut nested);
@@ -58,8 +60,10 @@ impl<'a> Lifter<'a> {
             }
             TreeKind::ModuleDef { impl_, .. } => {
                 for s in &mut impl_.body {
-                    if matches!(s.kind, TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. })
-                    {
+                    if matches!(
+                        s.kind,
+                        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+                    ) {
                         continue;
                     }
                     self.extract_from(s, &mut nested);
@@ -120,8 +124,10 @@ impl<'a> Lifter<'a> {
                     self.lift_nested_classes(p);
                 }
                 for s in &mut impl_.body {
-                    if matches!(s.kind, TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. })
-                    {
+                    if matches!(
+                        s.kind,
+                        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+                    ) {
                         self.lift_template(s);
                     } else {
                         self.lift_nested_classes(s);
@@ -133,8 +139,10 @@ impl<'a> Lifter<'a> {
                     self.lift_nested_classes(p);
                 }
                 for s in &mut impl_.body {
-                    if matches!(s.kind, TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. })
-                    {
+                    if matches!(
+                        s.kind,
+                        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+                    ) {
                         self.lift_template(s);
                     } else {
                         self.lift_nested_classes(s);
@@ -459,9 +467,7 @@ fn collect_captures(
             }
             collect_captures(expr, &bound, out, st);
         }
-        TreeKind::DefDef {
-            vparamss, rhs, ..
-        } => {
+        TreeKind::DefDef { vparamss, rhs, .. } => {
             let mut bound = own.clone();
             for p in vparamss.iter().flatten() {
                 if !p.sym.is_none() {
@@ -525,7 +531,12 @@ fn collect_captures(
     }
 }
 
-fn consider_capture(id: SymbolId, own: &HashSet<SymbolId>, out: &mut Vec<SymbolId>, st: &SymbolTable) {
+fn consider_capture(
+    id: SymbolId,
+    own: &HashSet<SymbolId>,
+    out: &mut Vec<SymbolId>,
+    st: &SymbolTable,
+) {
     if id.is_none() || own.contains(&id) || out.contains(&id) {
         return;
     }
@@ -704,6 +715,7 @@ fn rewrite_auto_apply(tree: &mut Tree, caps: &HashMap<SymbolId, Vec<SymbolId>>, 
         },
         ty: result_ty,
         sym: sid,
+        postfix: false,
     };
 }
 
@@ -724,5 +736,6 @@ fn capture_ident(id: SymbolId, span: scala_rs_span::Span, st: &SymbolTable) -> T
         },
         ty: s.ty.clone(),
         sym: id,
+        postfix: false,
     }
 }

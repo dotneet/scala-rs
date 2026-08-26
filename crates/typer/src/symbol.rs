@@ -589,9 +589,7 @@ impl SymbolTable {
             }
             (Type::ByName(a), Type::ByName(b)) => self.is_sub_type(a, b),
             (Type::Repeated(a), Type::Repeated(b)) => self.is_sub_type(a, b),
-            (Type::Refined { parents, .. }, b) => {
-                parents.iter().any(|p| self.is_sub_type(p, b))
-            }
+            (Type::Refined { parents, .. }, b) => parents.iter().any(|p| self.is_sub_type(p, b)),
             _ => false,
         }
     }
@@ -890,7 +888,10 @@ impl SymbolTable {
     pub(crate) fn lookup_type_member_on(&self, ty: &Type, name: &str) -> Option<Type> {
         if let Type::Refined { parents, decls } = ty {
             if let Some(t) = Self::refine_member_type(decls, name) {
-                if decls.iter().any(|d| matches!(d, RefineDecl::Type { name: n, .. } if n == name)) {
+                if decls
+                    .iter()
+                    .any(|d| matches!(d, RefineDecl::Type { name: n, .. } if n == name))
+                {
                     return Some(t);
                 }
             }
@@ -1009,19 +1010,11 @@ fn expand_refine_decl(st: &SymbolTable, from: SymbolId, d: &RefineDecl) -> Refin
             name: name.clone(),
             rhs: rhs.as_ref().map(|t| st.expand_type_members(from, t)),
         },
-        RefineDecl::Def {
-            name,
-            paramss,
-            ret,
-        } => RefineDecl::Def {
+        RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
             name: name.clone(),
             paramss: paramss
                 .iter()
-                .map(|ps| {
-                    ps.iter()
-                        .map(|p| st.expand_type_members(from, p))
-                        .collect()
-                })
+                .map(|ps| ps.iter().map(|p| st.expand_type_members(from, p)).collect())
                 .collect(),
             ret: st.expand_type_members(from, ret),
         },
@@ -1032,17 +1025,17 @@ fn expand_refine_decl(st: &SymbolTable, from: SymbolId, d: &RefineDecl) -> Refin
     }
 }
 
-fn subst_refine_decl(d: &RefineDecl, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> RefineDecl {
+fn subst_refine_decl(
+    d: &RefineDecl,
+    tps: &[scala_rs_parser::SymbolId],
+    args: &[Type],
+) -> RefineDecl {
     match d {
         RefineDecl::Type { name, rhs } => RefineDecl::Type {
             name: name.clone(),
             rhs: rhs.as_ref().map(|t| subst_map(t, tps, args)),
         },
-        RefineDecl::Def {
-            name,
-            paramss,
-            ret,
-        } => RefineDecl::Def {
+        RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
             name: name.clone(),
             paramss: paramss
                 .iter()
