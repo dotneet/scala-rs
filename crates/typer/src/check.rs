@@ -9,12 +9,16 @@ use scala_rs_span::{Diagnostic, Span};
 
 pub struct TypecheckOptions {
     pub fatal_warnings: bool,
+    /// Type Option/List `withFilter` as the scala-library 2.13 shape, StringOps
+    /// via `augmentString`, and Iterator. The backend still needs `library_abi`.
+    pub library_abi: bool,
 }
 
 impl Default for TypecheckOptions {
     fn default() -> Self {
         TypecheckOptions {
             fatal_warnings: false,
+            library_abi: false,
         }
     }
 }
@@ -37,7 +41,7 @@ pub fn typecheck_opts(
     file_index: usize,
     opts: &TypecheckOptions,
 ) -> (SymbolTable, Vec<Diagnostic>) {
-    let mut t = Typer::new(file_index);
+    let mut t = Typer::new(file_index, opts);
     t.fatal_warnings = opts.fatal_warnings;
     t.namer(tree);
     t.register_sealed_from_namer(tree);
@@ -46,15 +50,15 @@ pub fn typecheck_opts(
 }
 
 impl Typer {
-    pub fn new(file_index: usize) -> Self {
+    pub fn new(file_index: usize, opts: &TypecheckOptions) -> Self {
         let mut st = SymbolTable::new();
-        install_prelude(&mut st);
+        install_prelude(&mut st, opts.library_abi);
         Typer {
             st,
             diags: Vec::new(),
             file_index,
             gensym: 0,
-            fatal_warnings: false,
+            fatal_warnings: opts.fatal_warnings,
         }
     }
 
@@ -1630,17 +1634,19 @@ impl Typer {
                         };
                     }
                 } else if method_name == "map" {
-                    if let Some(a0) = args.first() {
-                        if let Type::Function { ret: fr, .. } = &a0.ty {
-                            if let Some(cls) = recv_ty
-                                .as_ref()
-                                .and_then(|t| self.st.class_sym_of(t))
-                                .map(|c| self.collection_root(c))
-                            {
-                                ret = Type::Class {
-                                    sym: cls,
-                                    args: vec![(**fr).clone()],
-                                };
+                    if !self.is_with_filter_ty(recv_ty.as_ref()) {
+                        if let Some(a0) = args.first() {
+                            if let Type::Function { ret: fr, .. } = &a0.ty {
+                                if let Some(cls) = recv_ty
+                                    .as_ref()
+                                    .and_then(|t| self.st.class_sym_of(t))
+                                    .map(|c| self.collection_root(c))
+                                {
+                                    ret = Type::Class {
+                                        sym: cls,
+                                        args: vec![(**fr).clone()],
+                                    };
+                                }
                             }
                         }
                     }
@@ -1651,8 +1657,10 @@ impl Typer {
                         }
                     }
                 } else if method_name == "withFilter" {
-                    if let Some(r) = recv_ty {
-                        ret = r;
+                    if !self.is_with_filter_ty(Some(&ret)) {
+                        if let Some(r) = recv_ty {
+                            ret = r;
+                        }
                     }
                 }
                 tree.ty = leftover.unwrap_or(ret);
@@ -1684,6 +1692,17 @@ impl Typer {
         } else {
             id
         }
+    }
+
+    fn is_with_filter_ty(&self, ty: Option<&Type>) -> bool {
+        let Some(ty) = ty else {
+            return false;
+        };
+        let Some(id) = self.st.class_sym_of(ty) else {
+            return false;
+        };
+        let n = self.st.get(id).name.as_str();
+        n == "WithFilter" || n == "Option$WithFilter"
     }
 
     fn elem_type(&self, ty: &Type) -> Option<Type> {

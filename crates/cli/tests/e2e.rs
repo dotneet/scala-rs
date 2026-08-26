@@ -277,6 +277,16 @@ fn scala_library_dual_run_unapply() {
     dual_run_fixture("unapply");
 }
 
+#[test]
+fn scala_library_dual_run_unapply_seq() {
+    dual_run_fixture("unapply_seq");
+}
+
+#[test]
+fn scala_library_dual_run_iterator() {
+    dual_run_fixture("iterator");
+}
+
 const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Option.class",
     "scala/Some.class",
@@ -291,6 +301,11 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/immutable/Nil$.class",
     "scala/collection/immutable/List$.class",
     "scala/runtime/ArrowAssoc.class",
+    "scala/Predef$.class",
+    "scala/collection/StringOps.class",
+    "scala/collection/WithFilter.class",
+    "scala/collection/Iterator.class",
+    "scala/Option$WithFilter.class",
 ];
 
 fn assert_no_private_stdlib(out: &Path) {
@@ -330,6 +345,33 @@ fn dual_run_fixture(name: &str) {
         expected_stdout(name),
         "stdout mismatch for library dual-run {name}"
     );
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn scala_library_flag_without_path_uses_env() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip autodetect: jar not obtainable");
+        return;
+    };
+    let src = fixtures_dir().join("hello.scala");
+    let out = tmp_dir("autodetect");
+    let status = Command::new(bin())
+        .env("SCALA_LIBRARY_JAR", &jar)
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+        ])
+        .status()
+        .expect("compile --scala-library without path");
+    assert!(status.success(), "autodetect --scala-library failed");
+    assert_no_private_stdlib(&out);
     let _ = fs::remove_dir_all(&out);
 }
 

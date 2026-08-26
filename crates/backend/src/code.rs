@@ -103,6 +103,17 @@ impl Assembler {
         self.bump(1);
     }
 
+    /// `swap` (category-1 values only).
+    pub fn swap(&mut self) {
+        self.emit_op(0x5f);
+    }
+
+    /// `dup_x2` for three category-1 values: `a, b, c` → `c, a, b, c`.
+    pub fn dup_x2(&mut self) {
+        self.emit_op(0x5b);
+        self.bump(1);
+    }
+
     pub fn aconst_null(&mut self) {
         self.emit_op(0x01);
         self.bump(1);

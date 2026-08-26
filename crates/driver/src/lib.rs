@@ -154,6 +154,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
             u.file_index,
             &TypecheckOptions {
                 fatal_warnings: opts.fatal_warnings,
+                library_abi: opts.scala_library.is_some(),
             },
         );
         diags.extend(tdiags);
@@ -277,6 +278,37 @@ fn java_classpath(out_dir: &Path, extra_cp: &[PathBuf]) -> String {
         cp.push_str(&p.to_string_lossy());
     }
     cp
+}
+
+/// Locate a scala-library 2.13 jar: `SCALA_LIBRARY_JAR`, then well-known paths
+/// (`/tmp/scala-rs-lib/…`, cwd, `lib/`). Does not enable library ABI by itself.
+pub fn find_scala_library() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("SCALA_LIBRARY_JAR") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let mut cands = vec![
+        PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar"),
+        PathBuf::from("scala-library-2.13.16.jar"),
+        PathBuf::from("lib/scala-library-2.13.16.jar"),
+    ];
+    if let Ok(cwd) = std::env::current_dir() {
+        cands.push(cwd.join("scala-library-2.13.16.jar"));
+        cands.push(cwd.join("lib").join("scala-library-2.13.16.jar"));
+        if let Ok(rd) = std::fs::read_dir(&cwd) {
+            for e in rd.flatten() {
+                let s = e.file_name();
+                let s = s.to_string_lossy();
+                if s.starts_with("scala-library-2.13") && s.ends_with(".jar") && e.path().is_file()
+                {
+                    return Some(e.path());
+                }
+            }
+        }
+    }
+    cands.into_iter().find(|p| p.is_file())
 }
 
 #[cfg(test)]
