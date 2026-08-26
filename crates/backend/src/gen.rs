@@ -161,6 +161,7 @@ struct ClassBuilder {
     methods: Vec<Method>,
     pool: Pool,
     source: String,
+    scala_signature: Option<String>,
 }
 
 impl ClassBuilder {
@@ -174,6 +175,7 @@ impl ClassBuilder {
             methods: Vec::new(),
             pool: Pool::new(),
             source: source.to_string(),
+            scala_signature: None,
         }
     }
 
@@ -216,6 +218,7 @@ impl ClassBuilder {
             fields: self.fields,
             methods: self.methods,
             source: self.source,
+            scala_signature: self.scala_signature,
         };
         let bytes = class.write_with_pool(self.pool).expect("classfile write");
         EmittedClass {
@@ -223,6 +226,17 @@ impl ClassBuilder {
             bytes,
         }
     }
+}
+
+fn attach_scala_sig(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
+    if class_id.is_none() {
+        return;
+    }
+    let raw = crate::pickle::pickle_class(st, class_id);
+    if raw.is_empty() {
+        return;
+    }
+    b.scala_signature = Some(crate::pickle::encode_to_annotation_string(&raw));
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +955,7 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
+            attach_scala_sig(&mut b, self.st, class_id);
             self.out.push(b.finish());
             self.emit_trait_impl_class(tree, &this_name);
             return;
@@ -1016,9 +1031,11 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        self.emit_default_getters(&mut b, class_id);
         self.emit_trait_val_accessors(&mut b, class_id, &impl_.body);
         self.emit_super_accessors(&mut b, class_id);
         self.emit_mixin_forwarders(&mut b, class_id, &impl_.body);
+        attach_scala_sig(&mut b, self.st, class_id);
         self.out.push(b.finish());
     }
 
@@ -1666,6 +1683,113 @@ impl<'a> Gen<'a> {
                 emit_return(asm, &ret);
             });
         }
+        if !self.library_abi {
+            self.emit_ordered_forwarders(b, class_id, &defined);
+        }
+    }
+
+    fn emit_ordered_forwarders(
+        &self,
+        b: &mut ClassBuilder,
+        class_id: SymbolId,
+        defined: &HashSet<String>,
+    ) {
+        if class_id.is_none() {
+            return;
+        }
+        let lin = linearize(self.st, class_id);
+        let has_ordered = lin.iter().any(|&p| self.st.get(p).name == "Ordered");
+        if !has_ordered {
+            return;
+        }
+        for op in ["<", ">", "<=", ">="] {
+            let enc = encode_method_name(op);
+            if defined.contains(op) || defined.contains(&enc) {
+                continue;
+            }
+            let desc = "(Ljava/lang/Object;)Z";
+            let static_desc = "(Lscala/math/Ordered;Ljava/lang/Object;)Z";
+            let name = op.to_string();
+            b.add_code(ACC_PUBLIC, &name, desc, 2, |asm| {
+                asm.aload(0);
+                asm.aload(1);
+                asm.invokestatic("scala/math/Ordered$class", &name, static_desc);
+                asm.ireturn();
+            });
+        }
+    }
+
+    fn emit_default_getters(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        if class_id.is_none() {
+            return;
+        }
+        let existing: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
+        for mid in self.st.get(class_id).members.clone() {
+            let s = self.st.get(mid);
+            if s.kind != SymKind::Method || !s.name.contains("$default$") {
+                continue;
+            }
+            if existing.contains(&encode_method_name(&s.name)) {
+                continue;
+            }
+            let Some(rhs) = s.default_rhs.clone() else {
+                continue;
+            };
+            let name = s.name.clone();
+            let pts: Vec<Type> = if !s.params.is_empty() {
+                s.params.iter().map(|p| self.st.get(*p).ty.clone()).collect()
+            } else {
+                match &s.ty {
+                    Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+                    _ => vec![],
+                }
+            };
+            let ret = match &s.ty {
+                Type::Method { ret, .. } => (**ret).clone(),
+                _ => rhs.ty.clone(),
+            };
+            let desc = jvm_method_desc(self.st, &pts, &ret);
+            let mut frame = Frame::instance();
+            let pids = s.params.clone();
+            for (i, ty) in pts.iter().enumerate() {
+                let id = pids.get(i).copied().unwrap_or(SymbolId::NONE);
+                frame.alloc(id, jvm_sort(ty));
+            }
+            let class_name = b.this_name.clone();
+            let st = self.st;
+            let max_locals = frame.next_slot.max(1);
+            let extras = &self.extras;
+            let lambda_n = &self.lambda_n;
+            let source = self.source_name;
+            let library_abi = self.library_abi;
+            let ret_for_body = ret.clone();
+            b.add_code(
+                ACC_PUBLIC | ACC_SYNTHETIC,
+                &name,
+                &desc,
+                max_locals,
+                |asm| {
+                    let mut frame = frame;
+                    let ctx = emit_ctx(
+                        st,
+                        class_id,
+                        &class_name,
+                        ret_for_body.clone(),
+                        extras,
+                        lambda_n,
+                        source,
+                        library_abi,
+                    );
+                    gen_expr(asm, &mut frame, &ctx, &rhs);
+                    if is_unit_like(&ret_for_body) {
+                        pop_if_value(asm, &rhs.ty);
+                        asm.vreturn();
+                    } else {
+                        emit_return(asm, &ret_for_body);
+                    }
+                },
+            );
+        }
     }
 
     fn emit_lazy_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
@@ -1812,6 +1936,36 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        self.emit_default_getters(&mut b, cls);
+        if !cls.is_none() {
+            for mid in self.st.get(cls).members.clone() {
+                let s = self.st.get(mid);
+                if s.kind != SymKind::Method || !s.name.contains("$default$") {
+                    continue;
+                }
+                if forwarded.iter().any(|(n, _, _, _)| n == &s.name) {
+                    continue;
+                }
+                let pts: Vec<Type> = if !s.params.is_empty() {
+                    s.params.iter().map(|p| self.st.get(*p).ty.clone()).collect()
+                } else {
+                    match &s.ty {
+                        Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+                        _ => vec![],
+                    }
+                };
+                let ret = match &s.ty {
+                    Type::Method { ret, .. } => (**ret).clone(),
+                    _ => Type::Any,
+                };
+                forwarded.push((
+                    s.name.clone(),
+                    jvm_method_desc(self.st, &pts, &ret),
+                    ret,
+                    pts,
+                ));
+            }
+        }
 
         // case-class companion: synthetic apply
         if let Some(class_id) = self.find_class_named(name) {
@@ -1834,6 +1988,7 @@ impl<'a> Gen<'a> {
             }
         }
 
+        attach_scala_sig(&mut b, self.st, cls);
         self.out.push(b.finish());
 
         let top_level = if cls.is_none() {
@@ -1927,6 +2082,7 @@ impl<'a> Gen<'a> {
         self.emit_module_init(&mut b, class_id, &[]);
         self.emit_module_clinit(&mut b);
         emit_case_apply(&mut b, self.st, class_id);
+        attach_scala_sig(&mut b, self.st, class_id);
         self.out.push(b.finish());
     }
 
@@ -5141,6 +5297,7 @@ mod tests {
             &scala_rs_typer::TypecheckOptions {
                 fatal_warnings: false,
                 library_abi: true,
+                classpath: Vec::new(),
             },
         );
         assert!(

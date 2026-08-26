@@ -16,6 +16,8 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
     vec![
         emit_function_n(0),
         emit_function_n(1),
+        emit_ordered(),
+        emit_ordered_class(),
         emit_option(),
         emit_some(),
         emit_some_module(),
@@ -92,6 +94,7 @@ impl B {
             fields: self.fields,
             methods: self.methods,
             source: SRC.into(),
+            scala_signature: None,
         };
         let bytes = class.write_with_pool(self.pool).expect("runtime classfile");
         EmittedClass {
@@ -111,6 +114,49 @@ fn emit_function_n(n: usize) -> EmittedClass {
     }
     desc.push_str(")Ljava/lang/Object;");
     b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, "apply", &desc);
+    b.finish()
+}
+
+fn emit_ordered() -> EmittedClass {
+    let mut b = B::class("scala/math/Ordered", "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT;
+    b.interfaces.clear();
+    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, "compare", "(Ljava/lang/Object;)I");
+    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, "<", "(Ljava/lang/Object;)Z");
+    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, ">", "(Ljava/lang/Object;)Z");
+    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, "<=", "(Ljava/lang/Object;)Z");
+    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, ">=", "(Ljava/lang/Object;)Z");
+    b.finish()
+}
+
+fn emit_ordered_class() -> EmittedClass {
+    let mut b = B::class("scala/math/Ordered$class", "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_SUPER | ACC_FINAL;
+    let static_desc = "(Lscala/math/Ordered;Ljava/lang/Object;)Z";
+    fn cmp_op(b: &mut B, name: &str, jump_true: impl Fn(&mut Assembler, crate::code::Label)) {
+        let static_desc = "(Lscala/math/Ordered;Ljava/lang/Object;)Z";
+        b.add_code(ACC_PUBLIC | ACC_STATIC, name, static_desc, 2, |asm| {
+            asm.aload(0);
+            asm.aload(1);
+            asm.invokeinterface("scala/math/Ordered", "compare", "(Ljava/lang/Object;)I");
+            asm.iconst(0);
+            let t = asm.fresh_label();
+            let done = asm.fresh_label();
+            jump_true(asm, t);
+            asm.iconst(0);
+            asm.goto(done);
+            asm.mark(t);
+            asm.iconst(1);
+            asm.mark(done);
+            asm.ireturn();
+        });
+        let _ = static_desc;
+    }
+    cmp_op(&mut b, "<", |asm, t| asm.if_icmplt(t));
+    cmp_op(&mut b, ">", |asm, t| asm.if_icmpgt(t));
+    cmp_op(&mut b, "<=", |asm, t| asm.if_icmple(t));
+    cmp_op(&mut b, ">=", |asm, t| asm.if_icmpge(t));
+    let _ = static_desc;
     b.finish()
 }
 

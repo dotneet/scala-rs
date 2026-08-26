@@ -3,11 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use scala_rs_backend::{emit_opts, emit_runtime, EmitOpts};
+use scala_rs_backend::{emit_opts, emit_runtime, load_classpath, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
-    erase, find_mains, lambda_lift, typecheck_opts, uncurry, SymbolTable, TypecheckOptions,
+    erase, find_mains, lambda_lift, typecheck_opts, uncurry, ClasspathClass, ClasspathMethod,
+    ClasspathPickleMethod, SymbolTable, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -27,6 +28,8 @@ pub struct CompileOptions {
     /// private Option/List/FunctionN stand-ins). The path is also added to the
     /// `java -cp` of [`run_main`] callers that pass it through.
     pub scala_library: Option<PathBuf>,
+    /// Directories (or class files) searched for previously compiled classes.
+    pub class_path: Vec<PathBuf>,
 }
 
 impl Default for CompileOptions {
@@ -37,6 +40,7 @@ impl Default for CompileOptions {
             typer_dump: false,
             fatal_warnings: false,
             scala_library: None,
+            class_path: Vec::new(),
         }
     }
 }
@@ -157,6 +161,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
             &TypecheckOptions {
                 fatal_warnings: opts.fatal_warnings,
                 library_abi: opts.scala_library.is_some(),
+                classpath: load_cp(&opts.class_path),
             },
         );
         diags.extend(tdiags);
@@ -245,6 +250,38 @@ fn class_path(out_dir: &Path, internal_name: &str) -> PathBuf {
         None => dest.push(".class"),
     }
     dest
+}
+
+fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    load_classpath(paths)
+        .into_iter()
+        .map(|c| ClasspathClass {
+            jvm_name: c.internal_name,
+            is_module: c.is_module,
+            methods: c
+                .methods
+                .into_iter()
+                .map(|m| ClasspathMethod {
+                    name: m.name,
+                    desc: m.desc,
+                })
+                .collect(),
+            pickle: c.pickle.map(|p| {
+                p.methods
+                    .into_iter()
+                    .map(|m| ClasspathPickleMethod {
+                        name: m.name,
+                        param_names: m.param_names,
+                        param_types: m.param_types,
+                        ret: m.ret,
+                    })
+                    .collect()
+            }),
+        })
+        .collect()
 }
 
 /// Run `java -cp out_dir[:extra...] main_class args...`.
@@ -416,6 +453,7 @@ object Main {
             typer_dump: false,
             fatal_warnings: false,
             scala_library: None,
+            class_path: Vec::new(),
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());
@@ -457,6 +495,7 @@ object Main {
             typer_dump: false,
             fatal_warnings: false,
             scala_library: None,
+            class_path: Vec::new(),
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "{}", result.render_diags());
@@ -475,6 +514,7 @@ object Main {
             typer_dump: false,
             fatal_warnings: false,
             scala_library: None,
+            class_path: Vec::new(),
         };
         let result = compile_paths(&[src], &opts);
         assert!(!result.ok());
@@ -504,6 +544,7 @@ object Main {
             typer_dump: false,
             fatal_warnings: false,
             scala_library: Some(PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar")),
+            class_path: Vec::new(),
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());

@@ -373,6 +373,8 @@ pub enum TreeKind {
         rhs: Box<Tree>,
         lo: Option<Box<Tree>>,
         hi: Option<Box<Tree>>,
+        /// View bounds `T <% Ordered[T]`. Empty when none. Multiple `<%` are allowed.
+        views: Vec<Tree>,
     },
     LabelDef {
         name: String,

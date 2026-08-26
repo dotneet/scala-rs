@@ -50,6 +50,74 @@ pub fn encode_method_name(name: &str) -> String {
     out
 }
 
+/// Inverse of [`encode_method_name`] for names recovered from classfiles.
+pub fn decode_method_name(name: &str) -> String {
+    if !name.contains('$') {
+        return name.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = name;
+    while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix("$tilde") {
+            out.push('~');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$eq") {
+            out.push('=');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$less") {
+            out.push('<');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$greater") {
+            out.push('>');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$bang") {
+            out.push('!');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$hash") {
+            out.push('#');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$percent") {
+            out.push('%');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$up") {
+            out.push('^');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$amp") {
+            out.push('&');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$bar") {
+            out.push('|');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$times") {
+            out.push('*');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$div") {
+            out.push('/');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$plus") {
+            out.push('+');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$minus") {
+            out.push('-');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$colon") {
+            out.push(':');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$qmark") {
+            out.push('?');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("$at") {
+            out.push('@');
+            rest = r;
+        } else {
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
+}
+
 pub struct EmittedClass {
     /// e.g. `"Main"`, `"Main$"`, `"scala/Option"`
     pub internal_name: String,
@@ -259,6 +327,8 @@ pub struct ClassEmit {
     pub fields: Vec<Field>,
     pub methods: Vec<Method>,
     pub source: String,
+    /// `ScalaSignature.bytes` as a Java String (latin-1 chars), if any.
+    pub scala_signature: Option<String>,
 }
 
 impl ClassEmit {
@@ -273,6 +343,25 @@ impl ClassEmit {
         let code_attr = pool.utf8("Code");
         let src_attr = pool.utf8("SourceFile");
         let src_name = pool.utf8(&self.source);
+        let rva_attr = if self.scala_signature.is_some() {
+            Some(pool.utf8("RuntimeVisibleAnnotations"))
+        } else {
+            None
+        };
+        let sig_type = if self.scala_signature.is_some() {
+            Some(pool.utf8("Lscala/reflect/ScalaSignature;"))
+        } else {
+            None
+        };
+        let bytes_name = if self.scala_signature.is_some() {
+            Some(pool.utf8("bytes"))
+        } else {
+            None
+        };
+        let sig_utf8 = self
+            .scala_signature
+            .as_deref()
+            .map(|s| pool.utf8(s));
         let mut methods_data = Vec::new();
         for m in &self.methods {
             let n = pool.utf8(&m.name);
@@ -325,7 +414,23 @@ impl ClassEmit {
                 out.extend_from_slice(&0u16.to_be_bytes());
             }
         }
-        out.extend_from_slice(&1u16.to_be_bytes());
+        let n_class_attrs = 1u16 + if rva_attr.is_some() { 1 } else { 0 };
+        out.extend_from_slice(&n_class_attrs.to_be_bytes());
+        if let (Some(rva), Some(sig_ty), Some(bn), Some(su)) =
+            (rva_attr, sig_type, bytes_name, sig_utf8)
+        {
+            // RuntimeVisibleAnnotations { num=1, ScalaSignature { bytes = Utf8 } }
+            let mut body = Vec::new();
+            body.extend_from_slice(&1u16.to_be_bytes());
+            body.extend_from_slice(&sig_ty.to_be_bytes());
+            body.extend_from_slice(&1u16.to_be_bytes());
+            body.extend_from_slice(&bn.to_be_bytes());
+            body.push(b's');
+            body.extend_from_slice(&su.to_be_bytes());
+            out.extend_from_slice(&rva.to_be_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            out.extend_from_slice(&body);
+        }
         out.extend_from_slice(&src_attr.to_be_bytes());
         out.extend_from_slice(&2u32.to_be_bytes());
         out.extend_from_slice(&src_name.to_be_bytes());

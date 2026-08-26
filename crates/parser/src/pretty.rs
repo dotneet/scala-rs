@@ -119,10 +119,14 @@ fn dump_into(s: &mut String, t: &Tree, indent: usize) {
             }
             Ok(())
         }
-        TreeKind::TypeDef { name, rhs, .. } => {
+        TreeKind::TypeDef { name, rhs, views, .. } => {
             writeln!(s, "{pad}TypeDef {name}{ty}");
             if !rhs.is_empty() {
                 dump_into(s, rhs, indent + 1);
+            }
+            for v in views {
+                writeln!(s, "{pad}  view");
+                dump_into(s, v, indent + 1);
             }
             Ok(())
         }

@@ -175,6 +175,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     add_option_members(st, option_wf, library_abi);
     add_list_members(st, with_filter, iterator, library_abi);
     add_function_types(st);
+    let ordered = add_ordered(st);
 
     // Some companion with apply
     let some_mod = module(st, st.scala_pkg, "Some", "scala/Some$");
@@ -291,6 +292,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     st.enter_in_current("String", st.string_sym);
     st.enter_in_current("Unit", st.unit_sym);
     st.enter_in_current("::", st.cons_sym);
+    st.enter_in_current("Ordered", ordered);
 }
 
 fn class(
@@ -372,6 +374,38 @@ fn method(
     };
     st.get_mut(id).intrinsic = intrinsic;
     id
+}
+
+fn add_ordered(st: &mut SymbolTable) -> SymbolId {
+    let math = st.alloc(
+        "math",
+        st.scala_pkg,
+        SymKind::Package,
+        Flags::PACKAGE,
+        "scala/math",
+    );
+    let ordered = iface(st, math, "Ordered", "scala/math/Ordered");
+    let a = type_param(st, ordered, "A");
+    st.get_mut(ordered).tparams = vec![a];
+    let cmp = st.alloc(
+        "compare",
+        ordered,
+        SymKind::Method,
+        Flags::ABSTRACT,
+        "",
+    );
+    st.get_mut(cmp).ty = Type::Method {
+        paramss: vec![vec![Type::TypeParam(a)]],
+        ret: Box::new(Type::Int),
+    };
+    for op in ["<", ">", "<=", ">="] {
+        let id = st.alloc(op, ordered, SymKind::Method, Flags::EMPTY, "");
+        st.get_mut(id).ty = Type::Method {
+            paramss: vec![vec![Type::TypeParam(a)]],
+            ret: Box::new(Type::Boolean),
+        };
+    }
+    ordered
 }
 
 fn type_param(st: &mut SymbolTable, owner: SymbolId, name: &str) -> SymbolId {

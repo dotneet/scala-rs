@@ -264,6 +264,14 @@ fn fixtures_lambda_lift() {
     check("lambda_lift");
 }
 #[test]
+fn fixtures_view_bounds() {
+    check("view_bounds");
+}
+#[test]
+fn fixtures_defaults_still_run() {
+    check("defaults");
+}
+#[test]
 fn fixtures_super() {
     check("super");
 }
@@ -359,6 +367,11 @@ fn fixtures_implicit_ambiguous_is_error() {
 #[test]
 fn fixtures_existential_bounds_is_error() {
     compile_fails("existential_bounds", "unimplemented");
+}
+
+#[test]
+fn fixtures_view_bounds_class_is_error() {
+    compile_fails("view_bounds_class", "view bound");
 }
 
 fn scala_library_jar() -> Option<PathBuf> {
@@ -500,6 +513,11 @@ fn scala_library_dual_run_implicit_specific() {
 #[test]
 fn scala_library_dual_run_lambda_lift() {
     dual_run_fixture("lambda_lift");
+}
+
+#[test]
+fn scala_library_dual_run_view_bounds() {
+    dual_run_fixture("view_bounds");
 }
 
 const LIBRARY_COLLIDERS: &[&str] = &[
@@ -692,4 +710,94 @@ fn parse_dump_contains_module() {
     assert!(output.status.success());
     let s = String::from_utf8_lossy(&output.stdout);
     assert!(s.contains("Module Main"), "{s}");
+}
+
+fn javap_available() -> bool {
+    Command::new("javap")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success() || !o.stderr.is_empty() || !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+#[test]
+fn scala_signature_on_compiled_object() {
+    let out = compile_fixture("hello");
+    if !javap_available() {
+        let _ = fs::remove_dir_all(&out);
+        return;
+    }
+    let output = Command::new("javap")
+        .args(["-v", "-p", out.join("Main$.class").to_str().unwrap()])
+        .output()
+        .expect("javap");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("ScalaSignature") && text.contains("bytes"),
+        "expected ScalaSignature annotation in javap -v, got {text}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn separate_compilation_against_classfiles() {
+    if !java_available() {
+        return;
+    }
+    let lib_src = fixtures_dir().join("separate_lib.scala");
+    let main_src = fixtures_dir().join("separate_main.scala");
+    let out_lib = tmp_dir("separate-lib");
+    let out_main = tmp_dir("separate-main");
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            "--no-scala-library",
+            lib_src.to_str().unwrap(),
+            "-d",
+            out_lib.to_str().unwrap(),
+        ])
+        .status()
+        .expect("compile Lib");
+    assert!(status.success(), "compile separate_lib failed");
+    assert!(
+        out_lib.join("Lib$.class").is_file(),
+        "Lib$.class missing in {}",
+        out_lib.display()
+    );
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            "--no-scala-library",
+            main_src.to_str().unwrap(),
+            "-d",
+            out_main.to_str().unwrap(),
+            "-cp",
+            out_lib.to_str().unwrap(),
+        ])
+        .status()
+        .expect("compile Main against Lib classfiles");
+    assert!(
+        status.success(),
+        "compile separate_main against Lib classfiles failed"
+    );
+    let cp = format!("{}:{}", out_main.display(), out_lib.display());
+    let output = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        output.status.success(),
+        "java Main failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("separate")
+    );
+    let _ = fs::remove_dir_all(&out_lib);
+    let _ = fs::remove_dir_all(&out_main);
 }

@@ -57,7 +57,7 @@ fn print_help() {
 scala-rs — a Scala 2.13 subset compiler (not Scala 3)
 
 USAGE:
-    scala-rs compile <files...> [-d <dir>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings]
+    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings]
     scala-rs run <file> [--scala-library <jar>] [--no-scala-library] [--] [java-args...]
     scala-rs --help
 
@@ -70,6 +70,9 @@ COMMANDS:
 
 OPTIONS:
     -d <dir>   Output directory for class files (default: .)
+    -cp <path> Classpath of previously compiled class files (`:`-separated)
+    --class-path <path>
+               Same as -cp
     --scala-library [<jar>]
                Link against scala-library 2.13 (do not emit private Option/List).
                Path optional: searches SCALA_LIBRARY_JAR, /tmp/scala-rs-lib, cwd.
@@ -141,6 +144,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
     let mut fatal_warnings = false;
     let mut scala_library = None;
     let mut no_scala_library = false;
+    let mut class_path = Vec::new();
     let mut files = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -169,6 +173,12 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             no_scala_library = true;
         } else if a == "--scala-library" || a.starts_with("--scala-library=") {
             scala_library = Some(take_scala_library_flag(args, &mut i)?);
+        } else if a == "-cp" || a == "--class-path" || a == "-classpath" {
+            i += 1;
+            let cp = args
+                .get(i)
+                .ok_or_else(|| "option -cp requires a classpath argument".to_string())?;
+            class_path.extend(split_classpath(cp));
         } else if a.starts_with('-') {
             return Err(format!("unknown option '{a}'"));
         } else {
@@ -197,6 +207,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             typer_dump,
             fatal_warnings,
             scala_library: resolved,
+            class_path: class_path,
         },
     })
 }
@@ -217,6 +228,13 @@ fn take_scala_library_flag(args: &[String], i: &mut usize) -> Result<PathBuf, St
         }
     }
     Ok(PathBuf::new())
+}
+
+fn split_classpath(s: &str) -> Vec<PathBuf> {
+    s.split(':')
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {
@@ -243,6 +261,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         typer_dump: false,
         fatal_warnings: false,
         scala_library: scala_library.clone(),
+        class_path: Vec::new(),
     };
     let result = compile_paths(&[parsed.file], &opts);
     print_diags(&result);
