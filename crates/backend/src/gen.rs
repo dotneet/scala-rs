@@ -2016,6 +2016,9 @@ impl<'a> Gen<'a> {
 
         let mut b = ClassBuilder::new(this_name.clone(), self.source_name);
         b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
+        let (super_name, interfaces) = split_parents(self.st, &impl_.parents);
+        b.super_name = super_name;
+        b.interfaces = interfaces;
         b.fields.push(Field {
             access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
             name: "MODULE$".into(),
@@ -2145,10 +2148,11 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let super_name = b.super_name.clone();
         b.add_code(ACC_PRIVATE, "<init>", "()V", 1, |asm| {
             let mut frame = Frame::instance();
             asm.aload(0);
-            asm.invokespecial("java/lang/Object", "<init>", "()V");
+            asm.invokespecial(&super_name, "<init>", "()V");
             asm.aload(0);
             asm.putstatic(&class_name, "MODULE$", &format!("L{class_name};"));
             let ctx = emit_ctx(
@@ -4995,9 +4999,6 @@ fn gen_match(
         asm.mark(fail);
     }
     throw_runtime(asm, "match error");
-    if !is_unit_like(result_ty) {
-        push_default(asm, result_ty);
-    }
     asm.mark(end);
 }
 

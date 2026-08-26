@@ -1376,6 +1376,18 @@ impl Typer {
                 } else {
                     self.type_expr(tpt, &Type::NoType);
                 }
+                if let Type::Overload(alts) = &tpt.ty {
+                    if let Some(id) = alts.iter().find_map(|t| match t {
+                        Type::Class { sym, .. } => Some(*sym),
+                        _ => None,
+                    }) {
+                        tpt.sym = id;
+                        tpt.ty = Type::Class {
+                            sym: id,
+                            args: vec![],
+                        };
+                    }
+                }
                 tree.ty = tpt.ty.clone();
                 tree.sym = tpt.sym;
                 if tree.sym.is_none() {
@@ -1537,7 +1549,9 @@ impl Typer {
 
     fn maybe_auto_apply(&self, ty: Type, pt: &Type) -> Type {
         match &ty {
-            Type::Method { paramss, ret } if paramss.is_empty() => {
+            Type::Method { paramss, ret }
+                if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
+            {
                 if matches!(pt, Type::Function { .. } | Type::Method { .. }) {
                     ty
                 } else {
@@ -1765,14 +1779,23 @@ impl Typer {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            let tps = class_id
+                .map(|c| self.st.get(c).tparams.clone())
+                .unwrap_or_default();
+            // Do not adapt constructor arguments to raw type parameters
+            // (`A`) before those parameters are inferred from the arguments.
+            let infer = !tps.is_empty();
             for (i, a) in args.iter_mut().enumerate() {
-                let p = ctor_params.get(i).cloned().unwrap_or(Type::NoType);
+                let p = if infer {
+                    Type::NoType
+                } else {
+                    ctor_params.get(i).cloned().unwrap_or(Type::NoType)
+                };
                 self.type_expr(a, &p);
             }
             let mut inferred_args: Vec<Type> = Vec::new();
             if let Some(c) = class_id {
-                let tps = self.st.get(c).tparams.clone();
-                if !tps.is_empty() {
+                if infer {
                     let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
                     for tp in &tps {
                         inferred_args.push(

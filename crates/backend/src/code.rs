@@ -51,8 +51,10 @@ pub struct Assembler {
     label_locals: Vec<Option<Vec<VType>>>,
     frames: BTreeMap<u16, (Vec<VType>, Vec<VType>)>,
     dead: bool,
+    need_frame: bool,
     this_name: String,
     is_init: bool,
+    ret_object: Option<String>,
 }
 
 impl Assembler {
@@ -76,8 +78,10 @@ impl Assembler {
             label_locals: Vec::new(),
             frames: BTreeMap::new(),
             dead: false,
+            need_frame: false,
             this_name: String::new(),
             is_init: false,
+            ret_object: None,
         }
     }
 
@@ -112,6 +116,11 @@ impl Assembler {
             }
         }
         self.max_locals = self.max_locals.max(i as u16);
+        let ret = desc.split_once(')').map(|(_, r)| r).unwrap_or("V");
+        self.ret_object = match vtype_from_desc(ret) {
+            VType::Object(s) => Some(s),
+            _ => None,
+        };
     }
 
     fn set_local(&mut self, n: u16, t: VType) {
@@ -182,9 +191,18 @@ impl Assembler {
             if let Some(loc) = self.label_locals[l.0].clone() {
                 self.vlocals = loc;
             }
+        } else {
+            if let Some(st) = self.label_stack[l.0].clone() {
+                self.vstack = merge_stack(&self.vstack, &st, self.ret_object.as_deref());
+                self.stack = self.vstack.iter().map(|t| t.slots()).sum();
+            }
+            if let Some(loc) = self.label_locals[l.0].clone() {
+                self.vlocals = merge_locals(&self.vlocals, &loc);
+            }
         }
-        if self.label_stack[l.0].is_some() {
+        if self.label_stack[l.0].is_some() || self.need_frame {
             self.record_frame_at(off, self.vstack.clone(), self.vlocals.clone());
+            self.need_frame = false;
         }
     }
 
@@ -208,6 +226,11 @@ impl Assembler {
     }
 
     fn emit_op(&mut self, op: u8) {
+        if self.need_frame {
+            let off = self.bytes.len() as u16;
+            self.record_frame_at(off, self.vstack.clone(), self.vlocals.clone());
+            self.need_frame = false;
+        }
         self.bytes.push(op);
     }
 
@@ -221,15 +244,33 @@ impl Assembler {
         self.emit_op(op);
         self.patches.push((self.bytes.len(), l));
         self.emit_u16(0);
-        self.label_stack[l.0] = Some(self.vstack.clone());
-        self.label_locals[l.0] = Some(self.vlocals.clone());
+        self.save_label(l);
         if let Some(off) = self.labels[l.0] {
-            self.record_frame_at(off, self.vstack.clone(), self.vlocals.clone());
+            if let (Some(st), Some(loc)) = (
+                self.label_stack[l.0].clone(),
+                self.label_locals[l.0].clone(),
+            ) {
+                self.record_frame_at(off, st, loc);
+            }
         }
         if op == 0xa7 {
             self.dead = true;
+            self.need_frame = true;
         }
         let _ = stack_delta;
+    }
+
+    fn save_label(&mut self, l: Label) {
+        let stack = self.vstack.clone();
+        let locals = self.vlocals.clone();
+        self.label_stack[l.0] = Some(match self.label_stack[l.0].take() {
+            Some(old) => merge_stack(&old, &stack, self.ret_object.as_deref()),
+            None => stack,
+        });
+        self.label_locals[l.0] = Some(match self.label_locals[l.0].take() {
+            Some(old) => merge_locals(&old, &locals),
+            None => locals,
+        });
     }
 
     pub fn nop(&mut self) {
@@ -653,6 +694,7 @@ impl Assembler {
         self.vstack.clear();
         self.stack = 0;
         self.dead = true;
+        self.need_frame = true;
     }
 
     pub fn getstatic(&mut self, owner: &str, name: &str, desc: &str) {
@@ -1009,6 +1051,49 @@ fn param_descs(desc: &str) -> Vec<String> {
         out.push(inner[start..i].to_string());
     }
     out
+}
+
+fn merge_vtype(a: &VType, b: &VType, object_lub: Option<&str>) -> VType {
+    if a == b {
+        return a.clone();
+    }
+    match (a, b) {
+        (VType::Null, VType::Object(s)) | (VType::Object(s), VType::Null) => {
+            VType::Object(s.clone())
+        }
+        (VType::Object(_), VType::Object(_)) => {
+            if let Some(lub) = object_lub {
+                VType::Object(lub.to_string())
+            } else {
+                VType::Object("java/lang/Object".into())
+            }
+        }
+        _ => VType::Top,
+    }
+}
+
+fn merge_locals(a: &[VType], b: &[VType]) -> Vec<VType> {
+    let n = a.len().max(b.len());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let x = a.get(i).cloned().unwrap_or(VType::Top);
+        let y = b.get(i).cloned().unwrap_or(VType::Top);
+        out.push(merge_vtype(&x, &y, None));
+    }
+    out
+}
+
+fn merge_stack(a: &[VType], b: &[VType], object_lub: Option<&str>) -> Vec<VType> {
+    if a.len() != b.len() {
+        if a.len() < b.len() {
+            return a.to_vec();
+        }
+        return b.to_vec();
+    }
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| merge_vtype(x, y, object_lub))
+        .collect()
 }
 
 fn compact_locals(slots: &[VType]) -> Vec<VType> {

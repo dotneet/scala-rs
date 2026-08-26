@@ -215,9 +215,13 @@ fn add_method(
         pids.push(pid);
     }
     st.get_mut(id).params = pids.clone();
-    st.get_mut(id).paramss = vec![pids];
+    st.get_mut(id).paramss = if pids.is_empty() { vec![] } else { vec![pids] };
     st.get_mut(id).ty = Type::Method {
-        paramss: vec![params],
+        paramss: if params.is_empty() {
+            vec![]
+        } else {
+            vec![params]
+        },
         ret: Box::new(ret),
     };
     id
@@ -275,9 +279,13 @@ fn add_method_types(
         pids.push(pid);
     }
     st.get_mut(id).params = pids.clone();
-    st.get_mut(id).paramss = vec![pids];
+    st.get_mut(id).paramss = if pids.is_empty() { vec![] } else { vec![pids] };
     st.get_mut(id).ty = Type::Method {
-        paramss: vec![params],
+        paramss: if params.is_empty() {
+            vec![]
+        } else {
+            vec![params]
+        },
         ret: Box::new(ret),
     };
     id

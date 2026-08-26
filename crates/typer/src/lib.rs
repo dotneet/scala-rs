@@ -795,6 +795,18 @@ object Main extends Base {
     }
 
     #[test]
+    fn class_ctor_infers_tparams() {
+        ok(r#"
+class Box[A](val value: A)
+object Main {
+  def main(args: Array[String]): Unit = {
+    val b = new Box(1)
+  }
+}
+"#);
+    }
+
+    #[test]
     fn implicit_nested_companion_and_type_ctor() {
         ok(r#"
 trait Tag[A]

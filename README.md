@@ -122,9 +122,9 @@ erasure は型引数を落とし、型パラメータと unbounded ワイルド�
 
 nsc に寄せた探索順です。偽の「何でも変換」はありません。
 
-1. 現在のスコープと、囲んでいるクラス / object の `implicit` メンバー（`import Foo._` で入れたメンバーを含む）
+1. 現在のスコープと、囲んでいるクラス / object の `implicit` メンバー（親 class / trait から inherited したメンバーと、`import Foo._` で入れたメンバーを含む）
 2. 囲んでいるパッケージのパッケージオブジェクト（`package object p` の implicit メンバー）
-3. 目標型（変換なら元の型も）のコンパニオンオブジェクトの `implicit` メンバー
+3. 目標型の部分（型コンストラクタ・型引数・ネストした prefix）のコンパニオン（`Option[T]` なら `Option`、`Outer.Inner` なら `Inner`）。変換なら元の型の部分も見る
 
 呼び出し側で implicit パラメータ節を明示できます: `add(5)(3)` / `foo(x)(ev)`。探索で埋めるのは、その節が省略されたときだけです。
 
