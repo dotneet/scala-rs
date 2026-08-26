@@ -3060,6 +3060,7 @@ fn gen_select(
                 } else {
                     let owner = class_internal(ctx.st, s.owner);
                     asm.getfield(&owner, &s.name, &jvm_desc(ctx.st, &s.ty));
+                    maybe_cast_erased_load(asm, ctx, &s.ty, &tree.ty);
                 }
                 return;
             }
@@ -4350,6 +4351,25 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
     maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
 }
 
+/// After loading a generic field (`Object` / type param), cast or unbox to the
+/// tree's instantiated type so `name + arg._1` can `append(String)`.
+fn maybe_cast_erased_load(asm: &mut Assembler, ctx: &EmitCtx, from: &Type, want: &Type) {
+    if is_jvm_primitive(want) && !is_unit_like(want) && !is_jvm_primitive(from) {
+        emit_unbox(asm, want);
+        return;
+    }
+    if matches!(want, Type::String) && !matches!(from, Type::String) {
+        asm.checkcast("java/lang/String");
+        return;
+    }
+    if let Some(cn) = checkcast_internal(ctx.st, want) {
+        let from_desc = jvm_desc(ctx.st, from);
+        if from_desc == "Ljava/lang/Object;" {
+            asm.checkcast(&cn);
+        }
+    }
+}
+
 /// After a generic invoke that returns `Object`, unbox when the tree still has
 /// a primitive (e.g. `Iterator.next` / `Option.get` as `Int`).
 fn maybe_unbox_erased_result(
@@ -4369,6 +4389,14 @@ fn maybe_unbox_erased_result(
     }
     if is_jvm_primitive(ty) && !is_unit_like(ty) {
         emit_unbox(asm, ty);
+        return;
+    }
+    if matches!(ty, Type::String) {
+        asm.checkcast("java/lang/String");
+        return;
+    }
+    if let Some(cn) = checkcast_internal(ctx.st, ty) {
+        asm.checkcast(&cn);
         return;
     }
     if let Type::Array(elem) = ty {
