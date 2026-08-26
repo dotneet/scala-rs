@@ -2841,6 +2841,11 @@ fn invoke_value_extension(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
         );
         return;
     }
+    if owner == "scala/runtime/RichChar" && s.name == "toInt" {
+        // RichChar.toInt is inlined; the jar exposes intValue$extension.
+        asm.invokestatic("scala/runtime/RichChar", "intValue$extension", "(C)I");
+        return;
+    }
     let desc = value_extension_desc(ctx.st, id);
     if owner.contains('$') {
         // Nested Predef AnyVal: `$extension` is an instance method on the
@@ -3044,6 +3049,58 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_list_module_owner(&owner) && name == "apply" {
+            asm.invokevirtual(
+                "scala/collection/immutable/List$",
+                "apply",
+                "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+            );
+            asm.checkcast("scala/collection/immutable/List");
+            return;
+        }
+        if is_stdlib_set_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Set$",
+                        "empty",
+                        "()Lscala/collection/immutable/Set;",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Set$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/immutable/Set");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_set(&owner) {
+            match name {
+                "contains" => {
+                    asm.invokeinterface(
+                        "scala/collection/SetOps",
+                        "contains",
+                        "(Ljava/lang/Object;)Z",
+                    );
+                    return;
+                }
+                "foreach" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_stdlib_map(&owner) {
             match name {
                 "updated" => {
@@ -3233,6 +3290,23 @@ fn is_stdlib_vector(owner: &str) -> bool {
 
 fn is_stdlib_vector_module(owner: &str) -> bool {
     owner == "scala/collection/immutable/Vector$"
+}
+
+fn is_stdlib_set(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/collection/immutable/Set"
+            | "scala/collection/immutable/Set$EmptySet$"
+            | "scala/collection/immutable/Set$Set1"
+            | "scala/collection/immutable/Set$Set2"
+            | "scala/collection/immutable/Set$Set3"
+            | "scala/collection/immutable/Set$Set4"
+            | "scala/collection/immutable/HashSet"
+    )
+}
+
+fn is_stdlib_set_module(owner: &str) -> bool {
+    owner == "scala/collection/immutable/Set$"
 }
 
 fn gen_wrap_varargs(

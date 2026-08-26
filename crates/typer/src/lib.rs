@@ -541,6 +541,15 @@ object Main {
     val t: String = "hello".take(2)
     val d: String = "hello".drop(1)
     val e: Boolean = "".isEmpty
+    val xs2 = List(1, 2, 3)
+    val set1 = Set(1, 2, 3)
+    val has: Boolean = set1.contains(2)
+    val la: Long = (-3L).abs
+    val lm: Long = 1L.max(2L)
+    val da: Double = (-2.5).abs
+    val dm: Double = 1.0.max(2.5)
+    val cd: Boolean = '9'.isDigit
+    val ci: Int = 'A'.toInt
   }
 }
 "#;

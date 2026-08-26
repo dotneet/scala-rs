@@ -57,8 +57,8 @@ fn print_help() {
 scala-rs — a Scala 2.13 subset compiler (not Scala 3)
 
 USAGE:
-    scala-rs compile <files...> [-d <dir>] [--scala-library <jar>] [--parse] [--typer] [-Xfatal-warnings]
-    scala-rs run <file> [--scala-library <jar>] [--] [java-args...]
+    scala-rs compile <files...> [-d <dir>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings]
+    scala-rs run <file> [--scala-library <jar>] [--no-scala-library] [--] [java-args...]
     scala-rs --help
 
 This is an experimental reimplementation of a Scala 2.13 (nsc) subset.
@@ -73,10 +73,9 @@ OPTIONS:
     --scala-library [<jar>]
                Link against scala-library 2.13 (do not emit private Option/List).
                Path optional: searches SCALA_LIBRARY_JAR, /tmp/scala-rs-lib, cwd.
-               `compile` without this flag uses the private runtime even if a jar
-               is on disk. `run` uses an auto-found 2.13 jar by default (same
-               search) and adds it to java -cp; omit a jar and it falls back to
-               the private runtime.
+               `compile` and `run` auto-use a found 2.13 jar by default.
+    --no-scala-library
+               Force the private runtime even if a jar is auto-found.
     --parse             Parse only and dump the AST (do not typecheck or emit)
     --typer             Dump the typed tree after namer/typer
     -Xfatal-warnings    Treat warnings as errors (non-exhaustive match, …)
@@ -85,6 +84,7 @@ OPTIONS:
 EXAMPLES:
     scala-rs compile Main.scala -d out
     scala-rs compile Main.scala --scala-library scala-library-2.13.16.jar -d out
+    scala-rs compile Main.scala --no-scala-library -d out
     scala-rs compile Main.scala --parse
     scala-rs run Main.scala
     scala-rs run Main.scala -- arg1 arg2
@@ -140,6 +140,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
     let mut typer_dump = false;
     let mut fatal_warnings = false;
     let mut scala_library = None;
+    let mut no_scala_library = false;
     let mut files = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -164,6 +165,8 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             typer_dump = true;
         } else if a == "-Xfatal-warnings" {
             fatal_warnings = true;
+        } else if a == "--no-scala-library" {
+            no_scala_library = true;
         } else if a == "--scala-library" || a.starts_with("--scala-library=") {
             scala_library = Some(take_scala_library_flag(args, &mut i)?);
         } else if a.starts_with('-') {
@@ -173,13 +176,18 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
         }
         i += 1;
     }
-    let resolved = match &scala_library {
-        Some(p) if p.as_os_str().is_empty() => {
-            Some(find_scala_library().ok_or_else(|| {
-                "could not find scala-library 2.13 jar (pass --scala-library <jar> or set SCALA_LIBRARY_JAR)".to_string()
-            })?)
+    let resolved = if no_scala_library {
+        None
+    } else {
+        match &scala_library {
+            Some(p) if p.as_os_str().is_empty() => {
+                Some(find_scala_library().ok_or_else(|| {
+                    "could not find scala-library 2.13 jar (pass --scala-library <jar> or set SCALA_LIBRARY_JAR)".to_string()
+                })?)
+            }
+            Some(p) => Some(p.clone()),
+            None => find_scala_library(),
         }
-        other => resolve_scala_library(other.clone()),
     };
     Ok(CompileArgs {
         files,
@@ -211,16 +219,6 @@ fn take_scala_library_flag(args: &[String], i: &mut usize) -> Result<PathBuf, St
     Ok(PathBuf::new())
 }
 
-fn resolve_scala_library(explicit: Option<PathBuf>) -> Option<PathBuf> {
-    match explicit {
-        Some(p) if p.as_os_str().is_empty() => find_scala_library(),
-        Some(p) => Some(p),
-        None => std::env::var_os("SCALA_LIBRARY_JAR")
-            .map(PathBuf::from)
-            .filter(|p| p.is_file()),
-    }
-}
-
 fn cmd_run(args: &[String]) -> ExitCode {
     let parsed = match parse_run_args(args) {
         Ok(v) => v,
@@ -238,7 +236,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
     };
 
-    let scala_library = resolve_scala_library(parsed.scala_library);
+    let scala_library = parsed.scala_library;
     let opts = CompileOptions {
         out_dir: out_dir.clone(),
         parse_only: false,
@@ -285,12 +283,15 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut file: Option<PathBuf> = None;
     let mut java_args = Vec::new();
     let mut scala_library = None;
+    let mut no_scala_library = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
             java_args.extend_from_slice(&args[i + 1..]);
             break;
+        } else if a == "--no-scala-library" {
+            no_scala_library = true;
         } else if a == "--scala-library" || a.starts_with("--scala-library=") {
             scala_library = Some(take_scala_library_flag(args, &mut i)?);
         } else if file.is_none() {
@@ -304,16 +305,18 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         i += 1;
     }
     let file = file.ok_or_else(|| "run requires a source file".to_string())?;
-    let scala_library = match scala_library {
-        Some(p) if p.as_os_str().is_empty() => {
-            Some(find_scala_library().ok_or_else(|| {
-                "could not find scala-library 2.13 jar (pass --scala-library <jar> or set SCALA_LIBRARY_JAR)".to_string()
-            })?)
+    let scala_library = if no_scala_library {
+        None
+    } else {
+        match scala_library {
+            Some(p) if p.as_os_str().is_empty() => {
+                Some(find_scala_library().ok_or_else(|| {
+                    "could not find scala-library 2.13 jar (pass --scala-library <jar> or set SCALA_LIBRARY_JAR)".to_string()
+                })?)
+            }
+            Some(p) => Some(p),
+            None => find_scala_library(),
         }
-        Some(p) => Some(p),
-        // `run` uses an auto-found 2.13 jar when present so Map/Vector/StringOps
-        // work without a flag. `compile` still defaults to the private runtime.
-        None => find_scala_library(),
     };
     Ok(RunArgs {
         file,

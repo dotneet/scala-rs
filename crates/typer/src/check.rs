@@ -1740,16 +1740,16 @@ impl Typer {
                                 }
                             }
                         }
-                    } else if owner_n == "Vector$" {
+                    } else if owner_n == "Vector$" || owner_n == "List$" || owner_n == "Set$" {
                         if let Some(a0) = args.first() {
-                            if let Some(vec) = self
+                            if let Some(cls) = self
                                 .st
-                                .lookup("Vector")
+                                .lookup(owner_n.trim_end_matches('$'))
                                 .into_iter()
                                 .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)
                             {
                                 ret = Type::Class {
-                                    sym: vec,
+                                    sym: cls,
                                     args: vec![a0.ty.clone()],
                                 };
                             }
