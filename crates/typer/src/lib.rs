@@ -525,10 +525,15 @@ object Main {
 object Main {
   def main(args: Array[String]): Unit = {
     val n: Int = "42".toInt
+    val len: Int = "42".length
     val xs = 1 :: 2 :: Nil
     val ys = for (x <- xs if x > 0) yield x
     val it = xs.iterator
     val b: Boolean = it.hasNext
+    val s: String = 1 + "x"
+    val t = 1 -> "a"
+    val m = Map.empty.updated(1, "a")
+    val v = Vector.empty.:+(1)
   }
 }
 "#;

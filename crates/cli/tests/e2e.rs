@@ -287,6 +287,21 @@ fn scala_library_dual_run_iterator() {
     dual_run_fixture("iterator");
 }
 
+#[test]
+fn scala_library_dual_run_predef_more() {
+    dual_run_fixture("predef_more");
+}
+
+#[test]
+fn scala_library_dual_run_map() {
+    dual_run_fixture("map");
+}
+
+#[test]
+fn scala_library_dual_run_vector() {
+    dual_run_fixture("vector");
+}
+
 const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Option.class",
     "scala/Some.class",
@@ -306,6 +321,12 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/WithFilter.class",
     "scala/collection/Iterator.class",
     "scala/Option$WithFilter.class",
+    "scala/collection/immutable/Map.class",
+    "scala/collection/immutable/Map$.class",
+    "scala/collection/immutable/Vector.class",
+    "scala/collection/immutable/Vector$.class",
+    "scala/Predef$any2stringadd.class",
+    "scala/Predef$ArrowAssoc.class",
 ];
 
 fn assert_no_private_stdlib(out: &Path) {
