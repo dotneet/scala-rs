@@ -180,18 +180,52 @@ pub fn install_prelude(st: &mut SymbolTable) {
     let mems = st.get(some_cls).members.clone();
     st.get_mut(some_mod).members.extend(mems);
 
-    st.predef = module(st, st.scala_pkg, "Predef", "scala/Predef$");
-    add_predef_members(st);
+    let tuple2 = class(st, st.scala_pkg, "Tuple2", "scala/Tuple2", &[Type::AnyRef]);
+    let t2a = type_param(st, tuple2, "A");
+    let t2b = type_param(st, tuple2, "B");
+    st.get_mut(tuple2).tparams = vec![t2a, t2b];
+    let f1 = st.alloc("_1", tuple2, SymKind::Term, Flags::FINAL, "");
+    st.get_mut(f1).ty = Type::TypeParam(t2a);
+    let f2 = st.alloc("_2", tuple2, SymKind::Term, Flags::FINAL, "");
+    st.get_mut(f2).ty = Type::TypeParam(t2b);
+    st.get_mut(tuple2).ctor_fields = vec![f1, f2];
+    method(
+        st,
+        tuple2,
+        "<init>",
+        vec![Type::Any, Type::Any],
+        Type::Class {
+            sym: tuple2,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+    let _ = class(st, st.scala_pkg, "Tuple3", "scala/Tuple3", &[Type::AnyRef]);
 
-    for n in 2..=3 {
-        let _ = class(
-            st,
-            st.scala_pkg,
-            &format!("Tuple{n}"),
-            &format!("scala/Tuple{n}"),
-            &[Type::AnyRef],
-        );
-    }
+    let arrow = class(
+        st,
+        st.scala_pkg,
+        "ArrowAssoc",
+        "scala/runtime/ArrowAssoc",
+        &[Type::AnyRef],
+    );
+    let af = st.alloc("self", arrow, SymKind::Term, Flags::PARAM, "");
+    st.get_mut(af).ty = Type::Any;
+    st.get_mut(arrow).ctor_fields = vec![af];
+    method(
+        st,
+        arrow,
+        "->",
+        vec![Type::Any],
+        Type::Class {
+            sym: tuple2,
+            args: vec![Type::Any, Type::Any],
+        },
+        Intrinsic::None,
+    );
+
+    st.predef = module(st, st.scala_pkg, "Predef", "scala/Predef$");
+    add_predef_members(st, arrow);
 
     st.push_scope();
     import_members(st, st.scala_pkg);
@@ -555,6 +589,16 @@ fn add_string_members(st: &mut SymbolTable) {
         Intrinsic::None,
     );
     method(st, c, "toString", vec![], Type::String, Intrinsic::Identity);
+    method(st, c, "toInt", vec![], Type::Int, Intrinsic::StringToInt);
+    method(st, c, "toLong", vec![], Type::Long, Intrinsic::StringToLong);
+    method(
+        st,
+        c,
+        "toDouble",
+        vec![],
+        Type::Double,
+        Intrinsic::StringToDouble,
+    );
 }
 
 fn add_array_members(st: &mut SymbolTable) {
@@ -710,7 +754,7 @@ fn add_function_types(st: &mut SymbolTable) {
     }
 }
 
-fn add_predef_members(st: &mut SymbolTable) {
+fn add_predef_members(st: &mut SymbolTable, arrow: SymbolId) {
     let p = st.predef;
     let cls = st.get(p).ty.clone();
     let owner = match cls {
@@ -774,6 +818,58 @@ fn add_predef_members(st: &mut SymbolTable) {
         Type::Unit,
         Intrinsic::Print,
     );
+    method(
+        st,
+        owner,
+        "assert",
+        vec![Type::Boolean],
+        Type::Unit,
+        Intrinsic::Assert,
+    );
+    method(
+        st,
+        owner,
+        "assert",
+        vec![Type::Boolean, Type::ByName(Box::new(Type::Any))],
+        Type::Unit,
+        Intrinsic::Assert,
+    );
+    method(
+        st,
+        owner,
+        "require",
+        vec![Type::Boolean],
+        Type::Unit,
+        Intrinsic::Require,
+    );
+    method(
+        st,
+        owner,
+        "require",
+        vec![Type::Boolean, Type::ByName(Box::new(Type::Any))],
+        Type::Unit,
+        Intrinsic::Require,
+    );
+    method(
+        st,
+        owner,
+        "???",
+        vec![],
+        Type::Nothing,
+        Intrinsic::NotImplemented,
+    );
+    let conv = method(
+        st,
+        owner,
+        "any2ArrowAssoc",
+        vec![Type::Any],
+        Type::Class {
+            sym: arrow,
+            args: vec![],
+        },
+        Intrinsic::WrapArrowAssoc,
+    );
+    st.get_mut(conv).flags = st.get(conv).flags.with(Flags::IMPLICIT);
     let mems = st.get(owner).members.clone();
     st.get_mut(p).members.extend(mems.iter().copied());
     for m in mems {

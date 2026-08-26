@@ -1,8 +1,8 @@
 //! Walk a typed compilation unit and emit JVM classfiles (major 50).
 
 use crate::classfile::{
-    ClassEmit, EmittedClass, Field, Method, Pool, ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE,
-    ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC,
+    encode_method_name, ClassEmit, EmittedClass, Field, Method, Pool, ACC_ABSTRACT, ACC_FINAL,
+    ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC,
 };
 use crate::code::Assembler;
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
@@ -140,7 +140,7 @@ impl ClassBuilder {
         self.pool = pool;
         self.methods.push(Method {
             access,
-            name: name.to_string(),
+            name: encode_method_name(name),
             desc: desc.to_string(),
             code: Some(code),
         });
@@ -149,7 +149,7 @@ impl ClassBuilder {
     fn add_abstract(&mut self, access: u16, name: &str, desc: &str) {
         self.methods.push(Method {
             access,
-            name: name.to_string(),
+            name: encode_method_name(name),
             desc: desc.to_string(),
             code: None,
         });
@@ -661,6 +661,9 @@ impl<'a> Gen<'a> {
         for stt in &impl_.body {
             if matches!(stt.kind, TreeKind::DefDef { .. }) {
                 self.emit_def(&mut b, class_id, stt);
+                if self.st.is_value_class(class_id) {
+                    self.emit_value_extension(&mut b, class_id, stt);
+                }
             }
         }
         self.emit_mixin_forwarders(&mut b, class_id, &impl_.body);
@@ -831,6 +834,80 @@ impl<'a> Gen<'a> {
                 emit_return(asm, &ret_for_body);
             }
         });
+    }
+
+    fn emit_value_extension(&self, b: &mut ClassBuilder, class_id: SymbolId, def: &Tree) {
+        let (name, vparamss, rhs) = match &def.kind {
+            TreeKind::DefDef {
+                name,
+                vparamss,
+                rhs,
+                ..
+            } => (name, vparamss, rhs),
+            _ => return,
+        };
+        if rhs.is_empty() || name == "<init>" || name == "<clinit>" {
+            return;
+        }
+        let Some(under) = self.st.value_class_underlying(class_id) else {
+            return;
+        };
+        let field = self.st.get(class_id).ctor_fields.first().copied();
+        let ext_name = format!("{name}$extension");
+        let desc = value_extension_desc(self.st, def.sym);
+        let ret = method_ret_ty(def);
+        let mut frame = Frame {
+            locals: HashMap::new(),
+            next_slot: 0,
+        };
+        if let Some(fid) = field {
+            frame.alloc(fid, jvm_sort(&under));
+        } else {
+            frame.next_slot = 1;
+        }
+        for clause in vparamss {
+            for p in clause {
+                let ty = if p.ty.is_no_type() && !p.sym.is_none() {
+                    self.st.get(p.sym).ty.clone()
+                } else {
+                    p.ty.clone()
+                };
+                frame.alloc(p.sym, jvm_sort(&ty));
+            }
+        }
+        let class_name = b.this_name.clone();
+        let st = self.st;
+        let max_locals = frame.next_slot.max(1);
+        let ret_for_body = ret.clone();
+        let extras = &self.extras;
+        let lambda_n = &self.lambda_n;
+        let source = self.source_name;
+        b.add_code(
+            ACC_PUBLIC | ACC_STATIC,
+            &ext_name,
+            &desc,
+            max_locals,
+            |asm| {
+                let mut frame = frame;
+                let ctx = EmitCtx {
+                    st,
+                    class_sym: class_id,
+                    class_name: &class_name,
+                    ret_ty: ret_for_body.clone(),
+                    extras,
+                    lambda_n,
+                    source,
+                    outer: None,
+                };
+                gen_expr(asm, &mut frame, &ctx, rhs);
+                if is_unit_like(&ret_for_body) {
+                    pop_if_value(asm, &rhs.ty);
+                    asm.vreturn();
+                } else {
+                    emit_return(asm, &ret_for_body);
+                }
+            },
+        );
     }
 
     fn emit_trait_impl_class(&mut self, tree: &Tree, iface: &str) {
@@ -1358,6 +1435,13 @@ fn throw_runtime(asm: &mut Assembler, msg: &str) {
     asm.athrow();
 }
 
+fn throw_not_implemented(asm: &mut Assembler) {
+    asm.new_obj("scala/NotImplementedError");
+    asm.dup();
+    asm.invokespecial("scala/NotImplementedError", "<init>", "()V");
+    asm.athrow();
+}
+
 fn push_default(asm: &mut Assembler, ty: &Type) {
     match jvm_sort(ty) {
         JvmSort::Void => {}
@@ -1410,7 +1494,14 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
     match &tree.kind {
         TreeKind::Empty => {}
         TreeKind::Literal { lit } => gen_literal(asm, lit),
-        TreeKind::This { .. } => load_this(asm, ctx),
+        TreeKind::This { qual } => {
+            if let Some(name) = qual {
+                load_qualified_this(asm, ctx, name);
+            } else {
+                load_this(asm, ctx);
+            }
+        }
+        TreeKind::Super { .. } => load_this(asm, ctx),
         TreeKind::Ident { .. } => gen_ident(asm, frame, ctx, tree),
         TreeKind::Select { qual, name } => gen_select(asm, frame, ctx, tree, qual, name),
         TreeKind::Apply { fun, args } => gen_apply(asm, frame, ctx, tree, fun, args),
@@ -1524,6 +1615,24 @@ fn load_this(asm: &mut Assembler, ctx: &EmitCtx) {
     }
 }
 
+fn load_qualified_this(asm: &mut Assembler, ctx: &EmitCtx, name: &str) {
+    let target = ctx
+        .st
+        .enclosing_class_named(ctx.class_sym, name)
+        .unwrap_or(ctx.class_sym);
+    load_this(asm, ctx);
+    let mut cur = ctx.class_sym;
+    while !cur.is_none() && cur != target {
+        let Some(outer) = enclosing_instance(ctx.st, cur) else {
+            break;
+        };
+        let owner = class_internal(ctx.st, cur);
+        let od = format!("L{};", class_internal(ctx.st, outer));
+        asm.getfield(&owner, "$outer", &od);
+        cur = outer;
+    }
+}
+
 fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
     let id = tree.sym;
     if id.is_none() {
@@ -1531,6 +1640,12 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
             asm,
             &format!("unresolved ident {}", tree.name().unwrap_or("?")),
         );
+        push_default(asm, &tree.ty);
+        return;
+    }
+    let ic = ctx.st.get(id).intrinsic;
+    if matches!(ic, Intrinsic::NotImplemented) {
+        throw_not_implemented(asm);
         push_default(asm, &tree.ty);
         return;
     }
@@ -1562,7 +1677,13 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
             asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
         }
         SymKind::Method => {
-            load_this(asm, ctx);
+            let owner = ctx.st.get(id).owner;
+            if is_module_class(ctx.st, owner) {
+                let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
+                asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+            } else {
+                load_this(asm, ctx);
+            }
             invoke_method(asm, ctx, id);
         }
         _ => {
@@ -1602,8 +1723,24 @@ fn gen_select(
                 return;
             }
             SymKind::Method => {
+                let ic = s.intrinsic;
                 gen_expr(asm, frame, ctx, qual);
-                invoke_method(asm, ctx, tree.sym);
+                if matches!(qual.kind, TreeKind::Super { .. }) {
+                    invoke_super(asm, ctx, tree.sym);
+                } else if matches!(ic, Intrinsic::StringToInt) {
+                    asm.invokestatic("java/lang/Integer", "parseInt", "(Ljava/lang/String;)I");
+                } else if matches!(ic, Intrinsic::StringToLong) {
+                    asm.invokestatic("java/lang/Long", "parseLong", "(Ljava/lang/String;)J");
+                } else if matches!(ic, Intrinsic::StringToDouble) {
+                    asm.invokestatic("java/lang/Double", "parseDouble", "(Ljava/lang/String;)D");
+                } else if matches!(ic, Intrinsic::NotImplemented) {
+                    throw_not_implemented(asm);
+                    push_default(asm, &tree.ty);
+                } else if ctx.st.is_value_class(ctx.st.get(tree.sym).owner) {
+                    invoke_value_extension(asm, ctx, tree.sym);
+                } else {
+                    invoke_method(asm, ctx, tree.sym);
+                }
                 return;
             }
             SymKind::Module | SymKind::ModuleClass => {
@@ -1792,6 +1929,53 @@ fn gen_apply(
         return;
     }
 
+    if matches!(ic, Intrinsic::Assert) {
+        gen_assert_require(asm, frame, ctx, args, true);
+        return;
+    }
+    if matches!(ic, Intrinsic::Require) {
+        gen_assert_require(asm, frame, ctx, args, false);
+        return;
+    }
+    if matches!(ic, Intrinsic::NotImplemented) {
+        throw_not_implemented(asm);
+        push_default(asm, &tree.ty);
+        return;
+    }
+    if matches!(ic, Intrinsic::WrapArrowAssoc) {
+        asm.new_obj("scala/runtime/ArrowAssoc");
+        asm.dup();
+        if let Some(a) = args.first() {
+            gen_expr(asm, frame, ctx, a);
+            if is_jvm_primitive(&a.ty) {
+                emit_box(asm, &a.ty);
+            }
+        } else {
+            asm.aconst_null();
+        }
+        asm.invokespecial(
+            "scala/runtime/ArrowAssoc",
+            "<init>",
+            "(Ljava/lang/Object;)V",
+        );
+        return;
+    }
+    if matches!(ic, Intrinsic::StringToInt) {
+        gen_receiver(asm, frame, ctx, fun);
+        asm.invokestatic("java/lang/Integer", "parseInt", "(Ljava/lang/String;)I");
+        return;
+    }
+    if matches!(ic, Intrinsic::StringToLong) {
+        gen_receiver(asm, frame, ctx, fun);
+        asm.invokestatic("java/lang/Long", "parseLong", "(Ljava/lang/String;)J");
+        return;
+    }
+    if matches!(ic, Intrinsic::StringToDouble) {
+        gen_receiver(asm, frame, ctx, fun);
+        asm.invokestatic("java/lang/Double", "parseDouble", "(Ljava/lang/String;)D");
+        return;
+    }
+
     if matches!(&fun.ty, Type::Function { .. })
         || (fun.sym.is_none()
             && matches!(&tree.kind, TreeKind::Apply { .. })
@@ -1946,7 +2130,49 @@ fn gen_apply(
     for a in args {
         gen_expr(asm, frame, ctx, a);
     }
-    invoke_method(asm, ctx, fun.sym);
+    if fun_is_super(fun) {
+        invoke_super(asm, ctx, fun.sym);
+    } else if !fun.sym.is_none() && ctx.st.is_value_class(ctx.st.get(fun.sym).owner) {
+        invoke_value_extension(asm, ctx, fun.sym);
+    } else {
+        invoke_method(asm, ctx, fun.sym);
+    }
+}
+
+fn fun_is_super(fun: &Tree) -> bool {
+    match &peel_fun(fun).kind {
+        TreeKind::Select { qual, .. } => matches!(qual.kind, TreeKind::Super { .. }),
+        _ => false,
+    }
+}
+
+fn invoke_super(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
+    let s = ctx.st.get(id);
+    let owner_id = s.owner;
+    let owner = class_internal(ctx.st, owner_id);
+    let desc = method_desc_from_sym(ctx.st, id);
+    if is_interface_sym(ctx.st, owner_id) {
+        let static_desc = trait_static_desc(&owner, &desc);
+        asm.invokestatic(&format!("{}$class", owner), &s.name, &static_desc);
+    } else {
+        asm.invokespecial(&owner, &s.name, &desc);
+    }
+}
+
+fn invoke_value_extension(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
+    let s = ctx.st.get(id);
+    let owner_id = s.owner;
+    let owner = class_internal(ctx.st, owner_id);
+    let desc = value_extension_desc(ctx.st, id);
+    asm.invokestatic(&owner, &format!("{}$extension", s.name), &desc);
+}
+
+fn value_extension_desc(st: &SymbolTable, id: SymbolId) -> String {
+    let owner = st.get(id).owner;
+    let under = st.value_class_underlying(owner).unwrap_or(Type::Int);
+    let inst = method_desc_from_sym(st, id);
+    let rest = inst.strip_prefix('(').unwrap_or(&inst);
+    format!("({}{}", jvm_desc(st, &under), rest)
 }
 
 fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tree) {
@@ -1959,7 +2185,13 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
                 load_this(asm, ctx);
                 return;
             }
-            let owner = ctx.st.get(fun.sym).owner;
+            let s = ctx.st.get(fun.sym);
+            if matches!(s.kind, SymKind::Module | SymKind::ModuleClass) {
+                let jvm = class_internal(ctx.st, module_class_id(ctx.st, fun.sym));
+                asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+                return;
+            }
+            let owner = s.owner;
             if owner == ctx.class_sym || owner.is_none() {
                 load_this(asm, ctx);
             } else if is_module_class(ctx.st, owner) {
@@ -1982,6 +2214,49 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     } else {
         asm.invokevirtual(&owner, &s.name, &desc);
     }
+}
+
+fn gen_assert_require(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    args: &[Tree],
+    is_assert: bool,
+) {
+    let Some(cond) = args.first() else {
+        return;
+    };
+    gen_expr(asm, frame, ctx, cond);
+    let ok = asm.fresh_label();
+    asm.ifne(ok);
+    let cls = if is_assert {
+        "java/lang/AssertionError"
+    } else {
+        "java/lang/IllegalArgumentException"
+    };
+    asm.new_obj(cls);
+    asm.dup();
+    if let Some(msg) = args.get(1) {
+        gen_expr(asm, frame, ctx, msg);
+        if matches!(&msg.ty, Type::Function { .. }) {
+            asm.invokeinterface("scala/Function0", "apply", "()Ljava/lang/Object;");
+        } else if is_jvm_primitive(&msg.ty) {
+            emit_box(asm, &msg.ty);
+        }
+        asm.invokevirtual("java/lang/Object", "toString", "()Ljava/lang/String;");
+        if is_assert {
+            asm.invokespecial(cls, "<init>", "(Ljava/lang/Object;)V");
+        } else {
+            asm.invokespecial(cls, "<init>", "(Ljava/lang/String;)V");
+        }
+    } else if is_assert {
+        asm.invokespecial(cls, "<init>", "()V");
+    } else {
+        asm.ldc_string("requirement failed");
+        asm.invokespecial(cls, "<init>", "(Ljava/lang/String;)V");
+    }
+    asm.athrow();
+    asm.mark(ok);
 }
 
 fn emit_box(asm: &mut Assembler, ty: &Type) {
@@ -2125,7 +2400,14 @@ fn collect_free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>,
             }
             collect_free(body, &b, out, st);
         }
+        TreeKind::Super { .. } | TreeKind::This { .. } => {}
         TreeKind::Select { qual, .. } => collect_free(qual, bound, out, st),
+        TreeKind::UnApply { fun, args } => {
+            collect_free(fun, bound, out, st);
+            for a in args {
+                collect_free(a, bound, out, st);
+            }
+        }
         TreeKind::Apply { fun, args } => {
             collect_free(fun, bound, out, st);
             for a in args {
@@ -2727,6 +3009,87 @@ fn gen_match(
     asm.mark(end);
 }
 
+fn gen_unapply_pattern(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    pat: &Tree,
+    fun: &Tree,
+    args: &[Tree],
+    tmp: u16,
+    sel_sort: JvmSort,
+    fail: crate::code::Label,
+) {
+    let uid = if pat.sym.is_none() { fun.sym } else { pat.sym };
+    let ret_bool = !uid.is_none() && matches!(ctx.st.get(uid).ty.result(), Type::Boolean);
+    let param0 = if uid.is_none() {
+        None
+    } else {
+        match &ctx.st.get(uid).ty {
+            Type::Method { paramss, .. } => paramss.first().and_then(|ps| ps.first()).cloned(),
+            Type::Function { params, .. } => params.first().cloned(),
+            _ => None,
+        }
+    };
+    gen_receiver(asm, frame, ctx, fun);
+    load(asm, tmp, sel_sort);
+    if let Some(p) = &param0 {
+        if !is_jvm_primitive(p) && sel_sort != JvmSort::Ref && sel_sort != JvmSort::Void {
+            let pty = match sel_sort {
+                JvmSort::Int => Type::Int,
+                JvmSort::Long => Type::Long,
+                JvmSort::Double => Type::Double,
+                JvmSort::Float => Type::Float,
+                _ => Type::Any,
+            };
+            emit_box(asm, &pty);
+        }
+    }
+    if uid.is_none() {
+        asm.pop();
+        asm.pop();
+        throw_runtime(asm, "unresolved unapply");
+        return;
+    }
+    invoke_method(asm, ctx, uid);
+    if ret_bool {
+        asm.ifeq(fail);
+        return;
+    }
+    asm.dup();
+    asm.invokevirtual("scala/Option", "isEmpty", "()Z");
+    let nonempty = asm.fresh_label();
+    asm.ifeq(nonempty);
+    asm.pop();
+    asm.goto(fail);
+    asm.mark(nonempty);
+    asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
+    if args.len() <= 1 {
+        if let Some(a) = args.first() {
+            if is_jvm_primitive(&a.ty) {
+                emit_unbox(asm, &a.ty);
+            } else if matches!(a.ty, Type::String) {
+                asm.checkcast("java/lang/String");
+            }
+            bind_subpattern(asm, frame, ctx, a, fail);
+        } else {
+            asm.pop();
+        }
+    } else {
+        asm.checkcast("scala/Tuple2");
+        for (i, a) in args.iter().enumerate() {
+            let fname = if i == 0 { "_1" } else { "_2" };
+            asm.dup();
+            asm.getfield("scala/Tuple2", fname, "Ljava/lang/Object;");
+            if is_jvm_primitive(&a.ty) {
+                emit_unbox(asm, &a.ty);
+            }
+            bind_subpattern(asm, frame, ctx, a, fail);
+        }
+        asm.pop();
+    }
+}
+
 fn gen_pattern(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -2823,6 +3186,9 @@ fn gen_pattern(
                     throw_runtime(asm, "pattern arity");
                 }
             }
+        }
+        TreeKind::UnApply { fun, args } => {
+            gen_unapply_pattern(asm, frame, ctx, pat, fun, args, tmp, sel_sort, fail);
         }
         TreeKind::Bind { body, .. } => {
             load(asm, tmp, sel_sort);
@@ -2963,13 +3329,16 @@ mod tests {
     }
 
     fn compile_src(src: &str) -> Vec<EmittedClass> {
-        let (tree, st, diags) = typecheck_str(src);
+        let (mut tree, mut st, diags) = typecheck_str(src);
         assert!(
             !has_errors(&diags),
             "type errors: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
-        emit(&tree, &st, "Test.scala")
+        scala_rs_typer::erase(&mut tree, &mut st);
+        let mut classes = crate::runtime::emit_runtime();
+        classes.extend(emit(&tree, &st, "Test.scala"));
+        classes
     }
 
     fn run_main(src: &str) -> Option<String> {
@@ -3307,5 +3676,122 @@ object Main {
             return;
         };
         assert!(out.contains("nested"), "stdout: {out:?}");
+    }
+
+    #[test]
+    fn super_call_and_qualified_this() {
+        let Some(out) = run_main(
+            r#"
+class Base {
+  def greet(): String = "base"
+}
+trait T {
+  def greet(): String = "T"
+}
+class C extends Base {
+  def hi(): String = super.greet() + "!"
+}
+class D extends T {
+  def hi(): String = super.greet() + "!"
+}
+class Outer {
+  val name: String = "outer"
+  class Inner {
+    def who(): String = Outer.this.name
+  }
+  def inner(): String = new Inner().who()
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(new C().hi())
+    println(new D().hi())
+    println(new Outer().inner())
+  }
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "base!\nT!\nouter\n", "stdout: {out:?}");
+    }
+
+    #[test]
+    fn sealed_match_and_unapply() {
+        let Some(out) = run_main(
+            r#"
+sealed trait Color
+case class RGB(n: Int) extends Color
+case object Black extends Color
+object Even {
+  def unapply(n: Int): Option[Int] = if (n % 2 == 0) Some(n / 2) else None
+}
+object Main {
+  def show(c: Color): Int = c match {
+    case RGB(n) => n
+    case Black => 0
+  }
+  def main(args: Array[String]): Unit = {
+    println(show(RGB(3)))
+    println(show(Black))
+    val x = 10 match {
+      case Even(half) => half
+      case _ => 0
+    }
+    println(x)
+  }
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "3\n0\n5\n", "stdout: {out:?}");
+    }
+
+    #[test]
+    fn value_class_erases_to_underlying() {
+        let Some(out) = run_main(
+            r#"
+class Meter(val n: Int) extends AnyVal {
+  def doubled: Int = n * 2
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val m = new Meter(21)
+    println(m.doubled)
+    println(m.n)
+  }
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "42\n21\n", "stdout: {out:?}");
+    }
+
+    #[test]
+    fn predef_assert_arrow_stringops() {
+        let Some(out) = run_main(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    assert(true)
+    require(1 > 0)
+    println("42".length)
+    println("42".toInt)
+    val t = 1 -> "a"
+    println(t._1)
+    println(t._2)
+    try {
+      ???
+    } catch {
+      case _: RuntimeException => println("nyi")
+    }
+  }
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "2\n42\n1\na\nnyi\n", "stdout: {out:?}");
     }
 }

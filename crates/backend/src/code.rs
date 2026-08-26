@@ -1,6 +1,6 @@
 //! Bytecode assembler with stack-depth tracking and backpatching jumps.
 
-use crate::classfile::{Code, ExceptionEntry, Pool};
+use crate::classfile::{encode_method_name, Code, ExceptionEntry, Pool};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Label(pub usize);
@@ -432,25 +432,29 @@ impl Assembler {
     }
 
     pub fn invokevirtual(&mut self, owner: &str, name: &str, desc: &str) {
-        let i = self.pool.methodref(owner, name, desc);
+        let name = encode_method_name(name);
+        let i = self.pool.methodref(owner, &name, desc);
         self.emit_op(0xb6);
         self.emit_u16(i);
         self.bump(invoke_delta(desc, true));
     }
     pub fn invokespecial(&mut self, owner: &str, name: &str, desc: &str) {
-        let i = self.pool.methodref(owner, name, desc);
+        let name = encode_method_name(name);
+        let i = self.pool.methodref(owner, &name, desc);
         self.emit_op(0xb7);
         self.emit_u16(i);
         self.bump(invoke_delta(desc, true));
     }
     pub fn invokestatic(&mut self, owner: &str, name: &str, desc: &str) {
-        let i = self.pool.methodref(owner, name, desc);
+        let name = encode_method_name(name);
+        let i = self.pool.methodref(owner, &name, desc);
         self.emit_op(0xb8);
         self.emit_u16(i);
         self.bump(invoke_delta(desc, false));
     }
     pub fn invokeinterface(&mut self, owner: &str, name: &str, desc: &str) {
-        let i = self.pool.iface_ref(owner, name, desc);
+        let name = encode_method_name(name);
+        let i = self.pool.iface_ref(owner, &name, desc);
         self.emit_op(0xb9);
         self.emit_u16(i);
         let n_args = 1 + count_params(desc);
