@@ -774,6 +774,7 @@ impl Typer {
             self.st.get_mut(id).parents = pts;
         }
         self.register_sealed_child(id);
+        self.enter_inherited_members(id);
         self.bind_self_type(id, self_name, self_tpt.as_deref());
         for stt in body.iter_mut() {
             if matches!(stt.kind, TreeKind::Import { .. }) {
@@ -914,6 +915,7 @@ impl Typer {
             self.st.get_mut(cls).parents = pts;
         }
         self.register_sealed_child(cls);
+        self.enter_inherited_members(cls);
         self.bind_self_type(cls, self_name, self_tpt.as_deref());
         for stt in body.iter_mut() {
             if matches!(stt.kind, TreeKind::Import { .. }) {
@@ -1035,6 +1037,30 @@ impl Typer {
                 self.st.get_mut(sid).ty = st;
                 self.st.enter_in_current(&name, sid);
             }
+        }
+    }
+
+    /// Put inherited members in the template scope so `val Red = Value` inside
+    /// `object Color extends Enumeration` resolves `Value` like nsc.
+    fn enter_inherited_members(&mut self, cls: SymbolId) {
+        let mut work = self.st.get(cls).parents.clone();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(cls.0);
+        while let Some(p) = work.pop() {
+            let Some(pid) = self.st.class_sym_of(&p) else {
+                continue;
+            };
+            if !seen.insert(pid.0) {
+                continue;
+            }
+            for m in self.st.get(pid).members.clone() {
+                let n = self.st.get(m).name.clone();
+                if n.ends_with('$') || n == "<init>" {
+                    continue;
+                }
+                self.st.enter_in_current(&n, m);
+            }
+            work.extend(self.st.get(pid).parents.clone());
         }
     }
 

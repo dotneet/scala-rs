@@ -378,6 +378,35 @@ pub fn find_scala_library() -> Option<PathBuf> {
     cands.into_iter().find(|p| p.is_file())
 }
 
+/// Locate a scala-xml 2.13 jar: `SCALA_XML_JAR`, then `/tmp/scala-rs-lib`, cwd, `lib/`.
+pub fn find_scala_xml() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("SCALA_XML_JAR") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let mut cands = vec![
+        PathBuf::from("/tmp/scala-rs-lib/scala-xml_2.13-2.3.0.jar"),
+        PathBuf::from("scala-xml_2.13-2.3.0.jar"),
+        PathBuf::from("lib/scala-xml_2.13-2.3.0.jar"),
+    ];
+    if let Ok(cwd) = std::env::current_dir() {
+        cands.push(cwd.join("scala-xml_2.13-2.3.0.jar"));
+        cands.push(cwd.join("lib").join("scala-xml_2.13-2.3.0.jar"));
+        if let Ok(rd) = std::fs::read_dir(&cwd) {
+            for e in rd.flatten() {
+                let s = e.file_name();
+                let s = s.to_string_lossy();
+                if s.starts_with("scala-xml_2.13") && s.ends_with(".jar") && e.path().is_file() {
+                    return Some(e.path());
+                }
+            }
+        }
+    }
+    cands.into_iter().find(|p| p.is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

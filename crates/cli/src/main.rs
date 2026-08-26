@@ -6,7 +6,8 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use scala_rs_driver::{
-    compile_paths, find_scala_library, run_main_with_cp, CompileOptions, CompileResult,
+    compile_paths, find_scala_library, find_scala_xml, run_main_with_cp, CompileOptions,
+    CompileResult,
 };
 use scala_rs_span::render_all;
 
@@ -296,7 +297,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
 
     let main = result.mains.first().map(String::as_str).unwrap_or("Main");
-    let extra: Vec<PathBuf> = scala_library.into_iter().collect();
+    let mut extra: Vec<PathBuf> = scala_library.into_iter().collect();
+    if let Some(xml) = find_scala_xml() {
+        extra.push(xml);
+    }
 
     let output = match run_main_with_cp(&out_dir, &extra, main, &parsed.java_args) {
         Ok(o) => o,

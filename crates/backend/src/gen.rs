@@ -2100,6 +2100,37 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// nsc-style val getters (`def Red: Value`) so `scala.Enumeration` reflection
+    /// (`populateNameMap` / `isValDef`) can pair method `Red()` with field `Red`.
+    fn emit_val_getters(&self, b: &mut ClassBuilder, body: &[Tree]) {
+        let class_name = b.this_name.clone();
+        for stt in body {
+            let TreeKind::ValDef { name, mods, .. } = &stt.kind else {
+                continue;
+            };
+            if mods.flags.contains(Flags::LAZY) {
+                continue;
+            }
+            let ty = if stt.ty.is_no_type() && !stt.sym.is_none() {
+                self.st.get(stt.sym).ty.clone()
+            } else {
+                stt.ty.clone()
+            };
+            if ty.is_no_type() || ty.is_error() {
+                continue;
+            }
+            let desc = format!("(){}", jvm_desc(self.st, &ty));
+            let fname = name.clone();
+            let fdesc = jvm_desc(self.st, &ty);
+            let ret_ty = ty.clone();
+            b.add_code(ACC_PUBLIC, &fname, &desc, 1, |asm| {
+                asm.aload(0);
+                asm.getfield(&class_name, &fname, &fdesc);
+                emit_return(asm, &ret_ty);
+            });
+        }
+    }
+
     fn emit_module(&mut self, tree: &Tree, class_names: &HashSet<String>) {
         let (name, impl_) = match &tree.kind {
             TreeKind::ModuleDef { name, impl_, .. } => (name, impl_),
@@ -2155,6 +2186,7 @@ impl<'a> Gen<'a> {
         self.emit_module_init(&mut b, cls, &impl_.body);
         self.emit_module_clinit(&mut b);
         self.emit_lazy_accessors(&mut b, cls, &impl_.body);
+        self.emit_val_getters(&mut b, &impl_.body);
 
         let mut forwarded: Vec<(String, String, Type, Vec<Type>)> = Vec::new();
         for stt in &impl_.body {
@@ -3234,8 +3266,22 @@ fn gen_new(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tpt: &Tree, ar
             load_this(asm, ctx);
         }
     }
-    for a in args {
+    let field_tys: Vec<Type> = if class_id.is_none() {
+        args.iter().map(|a| a.ty.clone()).collect()
+    } else {
+        let fields = ctx.st.get(class_id).ctor_fields.clone();
+        if fields.is_empty() {
+            args.iter().map(|a| a.ty.clone()).collect()
+        } else {
+            fields.iter().map(|f| ctx.st.get(*f).ty.clone()).collect()
+        }
+    };
+    for (i, a) in args.iter().enumerate() {
         gen_expr(asm, frame, ctx, a);
+        let pty = field_tys.get(i).unwrap_or(&a.ty);
+        if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
+            emit_box(asm, &a.ty);
+        }
     }
     asm.invokespecial(&internal, "<init>", &desc);
 }

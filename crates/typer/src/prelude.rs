@@ -267,6 +267,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_seq_and_lazylist(st);
         add_either(st);
         add_try(st, throwable);
+        add_xml(st);
+        add_enumeration(st);
     }
 
     let arrow = if library_abi {
@@ -1640,6 +1642,12 @@ fn add_seq_and_lazylist(st: &mut SymbolTable) {
     };
     let mems = st.get(ll_cls).members.clone();
     st.get_mut(ll_mod).members.extend(mems);
+
+    // `List` is a `Seq` in 2.13; XML `Elem` takes `Seq[Node]`.
+    st.get_mut(st.list_sym).parents.push(Type::Class {
+        sym: seq,
+        args: vec![],
+    });
 }
 
 fn add_either(st: &mut SymbolTable) {
@@ -2366,4 +2374,129 @@ fn add_array_companion(st: &mut SymbolTable, ct: SymbolId) {
     };
     let mems = st.get(mc).members.clone();
     st.get_mut(am).members.extend(mems);
+}
+
+fn ctor_field(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) -> SymbolId {
+    let id = st.alloc(name, owner, SymKind::Term, Flags::PARAM, "");
+    st.get_mut(id).ty = ty;
+    id
+}
+
+fn abs_class(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    name: &str,
+    jvm: &str,
+    parents: &[Type],
+) -> SymbolId {
+    let id = st.alloc(name, owner, SymKind::Class, Flags::ABSTRACT, jvm);
+    st.get_mut(id).parents = parents.to_vec();
+    st.get_mut(id).ty = Type::Class {
+        sym: id,
+        args: vec![],
+    };
+    id
+}
+
+/// scala-xml 2.3 (`Elem(String, String, MetaData, NamespaceBinding, boolean, Seq[Node])`).
+fn add_xml(st: &mut SymbolTable) {
+    let xml = st.alloc(
+        "xml",
+        st.scala_pkg,
+        SymKind::Package,
+        Flags::PACKAGE,
+        "scala/xml",
+    );
+    let node = abs_class(st, xml, "Node", "scala/xml/Node", &[Type::AnyRef]);
+    let node_t = Type::Class {
+        sym: node,
+        args: vec![],
+    };
+    let metadata = abs_class(st, xml, "MetaData", "scala/xml/MetaData", &[Type::AnyRef]);
+    let nsb = abs_class(
+        st,
+        xml,
+        "NamespaceBinding",
+        "scala/xml/NamespaceBinding",
+        &[Type::AnyRef],
+    );
+    let _null = module_extending(
+        st,
+        xml,
+        "Null",
+        "scala/xml/Null$",
+        Type::Class {
+            sym: metadata,
+            args: vec![],
+        },
+    );
+    let _top = module_extending(
+        st,
+        xml,
+        "TopScope",
+        "scala/xml/TopScope$",
+        Type::Class {
+            sym: nsb,
+            args: vec![],
+        },
+    );
+    let seq = st
+        .get(st.scala_pkg)
+        .members
+        .iter()
+        .copied()
+        .find(|&m| st.get(m).name == "Seq" && st.get(m).kind == SymKind::Class)
+        .expect("Seq");
+    let seq_node = Type::Class {
+        sym: seq,
+        args: vec![node_t.clone()],
+    };
+    let elem = class(st, xml, "Elem", "scala/xml/Elem", &[node_t.clone()]);
+    let p_prefix = ctor_field(st, elem, "prefix", Type::String);
+    let p_label = ctor_field(st, elem, "label", Type::String);
+    let p_attr = ctor_field(
+        st,
+        elem,
+        "attributes",
+        Type::Class {
+            sym: metadata,
+            args: vec![],
+        },
+    );
+    let p_scope = ctor_field(
+        st,
+        elem,
+        "scope",
+        Type::Class {
+            sym: nsb,
+            args: vec![],
+        },
+    );
+    let p_min = ctor_field(st, elem, "minimizeEmpty", Type::Boolean);
+    let p_child = ctor_field(st, elem, "child", seq_node);
+    st.get_mut(elem).ctor_fields = vec![p_prefix, p_label, p_attr, p_scope, p_min, p_child];
+    let text = class(st, xml, "Text", "scala/xml/Text", &[node_t.clone()]);
+    let td = ctor_field(st, text, "data", Type::String);
+    st.get_mut(text).ctor_fields = vec![td];
+    let atom = class(st, xml, "Atom", "scala/xml/Atom", &[node_t]);
+    let ad = ctor_field(st, atom, "data", Type::Any);
+    st.get_mut(atom).ctor_fields = vec![ad];
+}
+
+/// `scala.Enumeration` plus inner `Value` (`Color.Red.toString` / `.id` against the jar).
+fn add_enumeration(st: &mut SymbolTable) {
+    let en = abs_class(
+        st,
+        st.scala_pkg,
+        "Enumeration",
+        "scala/Enumeration",
+        &[Type::AnyRef],
+    );
+    let val = abs_class(st, en, "Value", "scala/Enumeration$Value", &[Type::AnyRef]);
+    method(st, val, "id", vec![], Type::Int, Intrinsic::None);
+    let val_t = Type::Class {
+        sym: val,
+        args: vec![],
+    };
+    method(st, en, "Value", vec![], val_t, Intrinsic::None);
 }
