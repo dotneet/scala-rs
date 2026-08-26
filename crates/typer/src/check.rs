@@ -1622,7 +1622,7 @@ impl Typer {
                     }
                 }
                 for (i, a) in args.iter_mut().enumerate() {
-                    let p = param_tys.get(i).cloned().unwrap_or(Type::NoType);
+                    let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                     if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type() {
                         self.type_expr(a, &p);
                     }
@@ -1631,7 +1631,7 @@ impl Typer {
                     }
                 }
                 let nparams = param_tys.len();
-                if args.len() > nparams {
+                if args.len() > nparams && split_repeated(&param_tys).1.is_none() {
                     self.error(
                         tree.span,
                         format!(
@@ -1720,6 +1720,41 @@ impl Typer {
                             }
                         }
                     }
+                } else if method_name == "apply" && !sym.is_none() {
+                    let owner_n = self.st.get(self.st.get(sym).owner).name.clone();
+                    if owner_n == "Map$" {
+                        if let Some(a0) = args.first() {
+                            if let Type::Class { args: targs, .. } = &a0.ty {
+                                if targs.len() == 2 {
+                                    if let Some(map) = self
+                                        .st
+                                        .lookup("Map")
+                                        .into_iter()
+                                        .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)
+                                    {
+                                        ret = Type::Class {
+                                            sym: map,
+                                            args: targs.clone(),
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    } else if owner_n == "Vector$" {
+                        if let Some(a0) = args.first() {
+                            if let Some(vec) = self
+                                .st
+                                .lookup("Vector")
+                                .into_iter()
+                                .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)
+                            {
+                                ret = Type::Class {
+                                    sym: vec,
+                                    args: vec![a0.ty.clone()],
+                                };
+                            }
+                        }
+                    }
                 }
                 tree.ty = leftover.unwrap_or(ret);
             }
@@ -1732,7 +1767,7 @@ impl Typer {
                         fun.sym = sym;
                         tree.sym = sym;
                         for (i, a) in args.iter_mut().enumerate() {
-                            let p = param_tys.get(i).cloned().unwrap_or(Type::NoType);
+                            let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                             if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type() {
                                 self.type_expr(a, &p);
                             }
@@ -1791,6 +1826,7 @@ impl Typer {
                     args: args.clone(),
                 })
             }
+            Type::Class { sym, .. } if self.st.get(*sym).name == "Range" => Some(Type::Int),
             Type::Class { args, .. } if !args.is_empty() => Some(args[0].clone()),
             Type::ModuleRef(id) => {
                 let name = self.st.get(*id).name.as_str();
@@ -2160,6 +2196,20 @@ impl Typer {
     }
 
     fn compat_score(&self, params: &[Type], args: &[Type]) -> Option<i32> {
+        let (fixed, repeated) = split_repeated(params);
+        if let Some(elem) = repeated {
+            if args.len() < fixed.len() {
+                return None;
+            }
+            let mut s = 0;
+            for (a, p) in args.iter().zip(fixed) {
+                s += self.arg_score(a, p)?;
+            }
+            for a in &args[fixed.len()..] {
+                s += self.arg_score(a, elem)?;
+            }
+            return Some(s);
+        }
         if args.len() > params.len() {
             return None;
         }
@@ -2184,6 +2234,9 @@ impl Typer {
 
     fn arg_score(&self, arg: &Type, param: &Type) -> Option<i32> {
         if let Type::ByName(inner) = param {
+            return self.arg_score(arg, inner);
+        }
+        if let Type::Repeated(inner) = param {
             return self.arg_score(arg, inner);
         }
         if self.st.is_sub_type(arg, param) {
@@ -3131,6 +3184,22 @@ fn lub(a: &Type, b: &Type) -> Type {
     Type::Any
 }
 
+fn split_repeated(params: &[Type]) -> (&[Type], Option<&Type>) {
+    match params.last() {
+        Some(Type::Repeated(t)) => (&params[..params.len() - 1], Some(t.as_ref())),
+        _ => (params, None),
+    }
+}
+
+fn param_at(params: &[Type], i: usize) -> Option<&Type> {
+    let (fixed, repeated) = split_repeated(params);
+    if i < fixed.len() {
+        Some(&fixed[i])
+    } else {
+        repeated
+    }
+}
+
 fn unify_tparam(tp: SymbolId, params: &[Type], args: &[Type]) -> Option<Type> {
     for (p, a) in params.iter().zip(args) {
         if let Some(t) = unify_one(tp, p, a) {
@@ -3177,6 +3246,7 @@ fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
             Type::ByName(a) => unify_one(tp, p, a),
             _ => None,
         },
+        Type::Repeated(p) => unify_one(tp, p, actual),
         _ => None,
     }
 }

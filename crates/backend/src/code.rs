@@ -498,6 +498,29 @@ impl Assembler {
         self.emit_op(0xbe);
     }
 
+    /// `anewarray class` — count → array ref.
+    pub fn anewarray(&mut self, class: &str) {
+        let i = self.pool.class(class);
+        self.emit_op(0xbd);
+        self.emit_u16(i);
+    }
+
+    /// `newarray atype` — count → primitive array. `T_INT` is 10.
+    pub fn newarray(&mut self, atype: u8) {
+        self.emit_op(0xbc);
+        self.bytes.push(atype);
+    }
+
+    pub fn aastore(&mut self) {
+        self.emit_op(0x53);
+        self.bump(-3);
+    }
+
+    pub fn iastore(&mut self) {
+        self.emit_op(0x4f);
+        self.bump(-3);
+    }
+
     pub fn athrow(&mut self) {
         self.emit_op(0xbf);
         self.stack = 0;
