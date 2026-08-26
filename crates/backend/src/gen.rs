@@ -3234,8 +3234,22 @@ fn gen_new(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tpt: &Tree, ar
             load_this(asm, ctx);
         }
     }
-    for a in args {
+    let field_tys: Vec<Type> = if class_id.is_none() {
+        args.iter().map(|a| a.ty.clone()).collect()
+    } else {
+        let fields = ctx.st.get(class_id).ctor_fields.clone();
+        if fields.is_empty() {
+            args.iter().map(|a| a.ty.clone()).collect()
+        } else {
+            fields.iter().map(|f| ctx.st.get(*f).ty.clone()).collect()
+        }
+    };
+    for (i, a) in args.iter().enumerate() {
         gen_expr(asm, frame, ctx, a);
+        let pty = field_tys.get(i).unwrap_or(&a.ty);
+        if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
+            emit_box(asm, &a.ty);
+        }
     }
     asm.invokespecial(&internal, "<init>", &desc);
 }

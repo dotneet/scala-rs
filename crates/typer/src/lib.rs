@@ -1699,4 +1699,35 @@ object Main {
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn xml_literal_typechecks_with_library() {
+        ok_lib(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n = 1
+    val x = <a>t{n}</a>
+  }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn enumeration_value_typechecks_with_library() {
+        ok_lib(
+            r#"
+object Color extends Enumeration {
+  val Red, Blue = Value
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val s: String = Color.Red.toString
+    val n: Int = Color.Red.id
+  }
+}
+"#,
+        );
+    }
 }

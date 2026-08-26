@@ -6,7 +6,8 @@
 //! companion apply `Point(x, y)` / term `Point` via `MODULESYM` in the class
 //! pickle + extractor `unapply` so `x match { case Point(a, b) => … }`), an
 //! `object` method, a method taking `List[_]` (EXISTENTIALtpe), and
-//! `@deprecated("msg", "2.13.0")` (SYMANNOT + LITERALstring), `this.type`
+//! `@deprecated("msg", "2.13.0")` (SYMANNOT + LITERALstring), Java `@Deprecated`
+//! (SYMANNOT + TypeRef(java.lang, Deprecated)), `this.type`
 //! (THIStpe as a method result), `List[_ <: AnyRef]` (EXISTENTIALtpe with a
 //! bounded TYPEsym), `T @unchecked` (ANNOTATEDtpe), and SIP-23 literal types
 //! (`def f(x: 1)`, `val one: 1`) as `CONSTANTtpe` + `LITERALint` against our
@@ -27,6 +28,7 @@
 //! - `this.type` results are `THIStpe` of the enclosing class
 //! - type annotations `T @unchecked` are `ANNOTATEDtpe` + `ANNOTINFO`
 //! - annotation args that are string literals are `LITERALstring` + `SYMANNOT`
+//! - Java `@Deprecated` is `SYMANNOT` with `TypeRef` under `java.lang` (not skipped)
 //! - SIP-23 `1` in a signature is `CONSTANTtpe(LITERALint)` (nsc `writeLong` =
 //!   signed big-endian base 256)
 
@@ -764,7 +766,7 @@ impl<'a> Pickler<'a> {
     fn pickle_symannot(&mut self, target: u32, annot: &Tree) {
         let path = annot.annotation_path();
         let simple = path.rsplit('.').next().unwrap_or(path.as_str());
-        if matches!(simple, "Override" | "Deprecated") || path.starts_with("java.lang.") {
+        if simple == "Override" || path == "java.lang.Override" {
             return;
         }
         let atp = if simple == "tailrec" {
@@ -774,6 +776,12 @@ impl<'a> Pickler<'a> {
         } else if simple == "deprecated" {
             let sc = self.scala_module();
             self.type_ref_in(sc, "deprecated")
+        } else if simple == "Deprecated" || path.starts_with("java.lang.Deprecated") {
+            // Java `@Deprecated`: SYMANNOT + TypeRef(java.lang, Deprecated) so
+            // scalac 2.13.16 sees the annotation on our methods (classfile RVA
+            // is not enough; nsc reads pickle).
+            let jl = self.java_lang_module();
+            self.type_ref_in(jl, "Deprecated")
         } else {
             let sc = self.scala_module();
             self.type_ref_in(sc, simple)
@@ -2177,6 +2185,57 @@ object Lib {
             r.pos = end;
         }
         assert!(saw_final_method, "did not find pickled method f");
+    }
+
+    #[test]
+    fn pickle_java_deprecated_symannot() {
+        let src = r#"
+object Lib {
+  @Deprecated def gone: Int = 3
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let lib = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Lib" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("Lib module");
+        let cls = st.module_class_of(lib);
+        let raw = pickle_class(&st, cls);
+        let tags = pickle_tags(&raw);
+        assert!(
+            tags.contains(&SYMANNOT),
+            "expected SYMANNOT for Java @Deprecated, tags={tags:?}"
+        );
+        let mut saw_deprecated = false;
+        let mut r = Reader::new(&raw);
+        let _ = r.read_nat();
+        let _ = r.read_nat();
+        let n = r.read_nat().unwrap_or(0) as usize;
+        for _ in 0..n {
+            let Some(tag) = r.read_byte() else {
+                break;
+            };
+            let len = r.read_nat().unwrap_or(0) as usize;
+            let end = r.pos.saturating_add(len).min(r.bytes.len());
+            if tag == TYPENAME || tag == TERMNAME {
+                let name = String::from_utf8_lossy(&r.bytes[r.pos..end]).into_owned();
+                if name == "Deprecated" {
+                    saw_deprecated = true;
+                }
+            }
+            r.pos = end;
+        }
+        assert!(
+            saw_deprecated,
+            "expected pickled name Deprecated for Java annotation"
+        );
     }
 
     #[test]

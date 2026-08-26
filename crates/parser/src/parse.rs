@@ -314,7 +314,7 @@ impl<'a> Parser<'a> {
                 stats.push(self.parse_import());
                 continue;
             }
-            stats.push(self.parse_tmpl_or_def());
+            stats.extend(flatten_val_block(self.parse_tmpl_or_def()));
             if !self.accept_separator()
                 && !self.at_eof()
                 && !matches!(self.kind(), TokenKind::RBrace)
@@ -1047,7 +1047,7 @@ impl<'a> Parser<'a> {
             if self.at_eof() || matches!(self.kind(), TokenKind::RBrace) {
                 break;
             }
-            stats.push(self.parse_block_stat());
+            stats.extend(flatten_val_block(self.parse_block_stat()));
             if !self.accept_separator()
                 && !matches!(self.kind(), TokenKind::RBrace | TokenKind::Eof)
             {
@@ -1077,6 +1077,15 @@ impl<'a> Parser<'a> {
         self.skip_nl();
         // `val x: T = e` — do not use parse_pattern1, which would eat `: T` as a typed pattern.
         let pat = self.parse_pattern2();
+        // `val Red, Blue = Value` — nsc PatDef with multiple patterns; each gets its own rhs.
+        let mut extra_names: Vec<String> = Vec::new();
+        if matches!(&pat.kind, TreeKind::Ident { .. } | TreeKind::Wildcard) {
+            while matches!(self.kind(), TokenKind::Comma) {
+                self.bump();
+                self.skip_nl();
+                extra_names.push(self.expect_ident().0);
+            }
+        }
         self.skip_nl();
         let tpt = if matches!(self.kind(), TokenKind::Colon) {
             self.bump();
@@ -1102,20 +1111,48 @@ impl<'a> Parser<'a> {
                 "<pat>".into()
             }
         };
+        let span = lo.merge(self.prev_span());
         // If it's a true pattern (not a simple ident), wrap.
         if matches!(&pat.kind, TreeKind::Ident { .. } | TreeKind::Wildcard) {
-            self.alloc(
-                lo.merge(self.prev_span()),
+            let first = self.alloc(
+                span,
                 TreeKind::ValDef {
-                    mods,
+                    mods: mods.clone(),
                     name,
-                    tpt: Box::new(tpt),
-                    rhs: Box::new(rhs),
+                    tpt: Box::new(tpt.clone()),
+                    rhs: Box::new(rhs.clone()),
                 },
-            )
+            );
+            if extra_names.is_empty() {
+                first
+            } else {
+                let mut rest: Vec<Tree> = extra_names
+                    .into_iter()
+                    .map(|n| {
+                        self.alloc(
+                            span,
+                            TreeKind::ValDef {
+                                mods: mods.clone(),
+                                name: n,
+                                tpt: Box::new(tpt.clone()),
+                                rhs: Box::new(rhs.clone()),
+                            },
+                        )
+                    })
+                    .collect();
+                let expr = rest.pop().unwrap();
+                let mut stats = vec![first];
+                stats.append(&mut rest);
+                self.alloc(
+                    span,
+                    TreeKind::Block {
+                        stats,
+                        expr: Box::new(expr),
+                    },
+                )
+            }
         } else {
             // `val (a,b) = e` — emit ValDef with pattern name plus note
-            let span = lo.merge(self.prev_span());
             // Keep the pattern in the name field encoded; also emit nested vals
             // as a Block assigned from Match. Desugar:
             // val <tmp> = rhs; val a = <tmp>._1 ...  too heavy. Keep as ValDef
@@ -2303,6 +2340,10 @@ impl<'a> Parser<'a> {
 
     fn parse_simple_expr(&mut self) -> Tree {
         self.skip_nl();
+        if matches!(self.kind(), TokenKind::Ident(s) if s == "<") {
+            let t = self.parse_xml_literal();
+            return self.parse_simple_expr_rest(t);
+        }
         let mut t = match self.kind().clone() {
             TokenKind::New => self.parse_new(),
             TokenKind::LBrace => self.parse_block_expr(),
@@ -2973,6 +3014,258 @@ impl<'a> Parser<'a> {
             self.pos = saved;
         }
         self.parse_pattern()
+    }
+
+    /// Scala 2.13 XML literal subset: `<a/>`, `<a></a>`, `<a>t{e}</a>` (elem / text / splice).
+    /// Attributes, namespaces, entity refs, and CDATA are diagnosed, not dropped.
+    fn parse_xml_literal(&mut self) -> Tree {
+        let lo = self.span();
+        self.bump(); // `<`
+        self.parse_xml_elem(lo)
+    }
+
+    fn parse_xml_elem(&mut self, lo: Span) -> Tree {
+        let name = match self.kind().clone() {
+            TokenKind::Ident(n)
+                if n != ">"
+                    && n != "/>"
+                    && n != "</"
+                    && n != "<"
+                    && n != "/"
+                    && !is_operator_name(&n) =>
+            {
+                self.bump();
+                n
+            }
+            _ => {
+                return self
+                    .unimplemented(lo.merge(self.span()), "XML literal: expected element name");
+            }
+        };
+        self.skip_nl();
+        match self.kind().clone() {
+            TokenKind::Ident(n) if n == "/>" => {
+                self.bump();
+                return self.xml_elem(&name, Vec::new(), lo.merge(self.prev_span()));
+            }
+            TokenKind::Ident(n) if n == ">" => {
+                self.bump();
+            }
+            TokenKind::Ident(n) if n == "<" || n == "</" => {
+                return self
+                    .unimplemented(self.span(), "XML literal: expected `>` after element name");
+            }
+            _ => {
+                let bad = self.span();
+                let _ = self.unimplemented(bad, "XML attributes/namespaces");
+                loop {
+                    match self.kind() {
+                        TokenKind::Ident(n) if n == ">" || n == "/>" || n == "</" || n == "<" => {
+                            break;
+                        }
+                        TokenKind::Eof => break,
+                        _ => {
+                            self.bump();
+                        }
+                    }
+                }
+                match self.kind().clone() {
+                    TokenKind::Ident(n) if n == "/>" => {
+                        self.bump();
+                        return self.xml_elem(&name, Vec::new(), lo.merge(self.prev_span()));
+                    }
+                    TokenKind::Ident(n) if n == ">" => {
+                        self.bump();
+                    }
+                    _ => {
+                        return self
+                            .unimplemented(lo.merge(self.span()), "XML literal: unclosed element");
+                    }
+                }
+            }
+        }
+        let mut children = Vec::new();
+        loop {
+            self.skip_nl();
+            match self.kind().clone() {
+                TokenKind::Ident(n) if n == "</" => {
+                    self.bump();
+                    let close = match self.kind().clone() {
+                        TokenKind::Ident(c) => {
+                            self.bump();
+                            c
+                        }
+                        _ => {
+                            self.error_here("expected XML closing tag name");
+                            String::new()
+                        }
+                    };
+                    self.skip_nl();
+                    if matches!(self.kind(), TokenKind::Ident(s) if s == ">") {
+                        self.bump();
+                    } else {
+                        self.error_here("expected `>` after XML closing tag");
+                    }
+                    if close != name {
+                        self.error_span(
+                            lo.merge(self.prev_span()),
+                            format!("XML closing tag `</{close}>` does not match `<{name}>`"),
+                        );
+                    }
+                    break;
+                }
+                TokenKind::Ident(n) if n == "<" => {
+                    let nested = self.parse_xml_literal();
+                    children.push(nested);
+                }
+                TokenKind::LBrace => {
+                    let e = self.parse_block_expr();
+                    children.push(self.xml_atom(e));
+                }
+                TokenKind::Ident(n) if n == ">" || n == "/>" => {
+                    return self.unimplemented(self.span(), "XML literal: unexpected `>`");
+                }
+                TokenKind::Ident(n) => {
+                    self.bump();
+                    let mut text = n;
+                    while let TokenKind::Ident(more) = self.kind().clone() {
+                        if more == "<"
+                            || more == "</"
+                            || more == ">"
+                            || more == "/>"
+                            || is_operator_name(&more)
+                        {
+                            break;
+                        }
+                        text.push_str(&more);
+                        self.bump();
+                    }
+                    children.push(self.xml_text(&text, lo));
+                }
+                TokenKind::IntLit(i) => {
+                    self.bump();
+                    children.push(self.xml_text(&i.to_string(), lo));
+                }
+                TokenKind::StringLit(s) => {
+                    self.bump();
+                    children.push(self.xml_text(&s, lo));
+                }
+                TokenKind::Eof => {
+                    return self
+                        .unimplemented(lo.merge(self.span()), "XML literal: unclosed element");
+                }
+                _ => {
+                    return self.unimplemented(self.span(), "XML literal content");
+                }
+            }
+        }
+        self.xml_elem(&name, children, lo.merge(self.prev_span()))
+    }
+
+    fn xml_path(&mut self, names: &[&str], span: Span) -> Tree {
+        let mut t = self.alloc(
+            span,
+            TreeKind::Ident {
+                name: names[0].into(),
+            },
+        );
+        for n in &names[1..] {
+            t = self.alloc(
+                span,
+                TreeKind::Select {
+                    qual: Box::new(t),
+                    name: (*n).into(),
+                },
+            );
+        }
+        t
+    }
+
+    fn xml_new(&mut self, cls: Tree, args: Vec<Tree>, span: Span) -> Tree {
+        let nw = self.alloc(cls.span, TreeKind::New { tpt: Box::new(cls) });
+        self.alloc(
+            span,
+            TreeKind::Apply {
+                fun: Box::new(nw),
+                args,
+            },
+        )
+    }
+
+    fn xml_text(&mut self, s: &str, span: Span) -> Tree {
+        let cls = self.xml_path(&["scala", "xml", "Text"], span);
+        let lit = self.alloc(
+            span,
+            TreeKind::Literal {
+                lit: Lit::String(s.into()),
+            },
+        );
+        self.xml_new(cls, vec![lit], span)
+    }
+
+    fn xml_atom(&mut self, e: Tree) -> Tree {
+        let span = e.span;
+        let cls = self.xml_path(&["scala", "xml", "Atom"], span);
+        self.xml_new(cls, vec![e], span)
+    }
+
+    fn xml_cons(&mut self, head: Tree, tail: Tree, span: Span) -> Tree {
+        let sel = self.alloc(
+            span,
+            TreeKind::Select {
+                qual: Box::new(tail),
+                name: "::".into(),
+            },
+        );
+        self.alloc(
+            span,
+            TreeKind::Apply {
+                fun: Box::new(sel),
+                args: vec![head],
+            },
+        )
+    }
+
+    /// `new scala.xml.Elem(null, label, scala.xml.Null, scala.xml.TopScope, true, children)`
+    fn xml_elem(&mut self, label: &str, children: Vec<Tree>, span: Span) -> Tree {
+        let cls = self.xml_path(&["scala", "xml", "Elem"], span);
+        let prefix = self.alloc(span, TreeKind::Literal { lit: Lit::Null });
+        let lab = self.alloc(
+            span,
+            TreeKind::Literal {
+                lit: Lit::String(label.into()),
+            },
+        );
+        let attrs = self.xml_path(&["scala", "xml", "Null"], span);
+        let scope = self.xml_path(&["scala", "xml", "TopScope"], span);
+        let min = self.alloc(
+            span,
+            TreeKind::Literal {
+                lit: Lit::Boolean(true),
+            },
+        );
+        let mut acc = self.xml_path(&["Nil"], span);
+        for ch in children.into_iter().rev() {
+            acc = self.xml_cons(ch, acc, span);
+        }
+        self.xml_new(cls, vec![prefix, lab, attrs, scope, min, acc], span)
+    }
+}
+
+fn flatten_val_block(t: Tree) -> Vec<Tree> {
+    match t.kind {
+        TreeKind::Block { stats, expr }
+            if !stats.is_empty()
+                && stats
+                    .iter()
+                    .all(|s| matches!(s.kind, TreeKind::ValDef { .. }))
+                && matches!(expr.kind, TreeKind::ValDef { .. }) =>
+        {
+            let mut all = stats;
+            all.push(*expr);
+            all
+        }
+        kind => vec![Tree { kind, ..t }],
     }
 }
 

@@ -669,6 +669,11 @@ fn fixtures_annot_bad_is_error() {
     compile_fails("annot_bad", "annotation");
 }
 
+#[test]
+fn fixtures_xml_attr_bad_is_error() {
+    compile_fails("xml_attr_bad", "XML");
+}
+
 fn scala_library_jar() -> Option<PathBuf> {
     let cached = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
     if cached.is_file() {
@@ -676,6 +681,22 @@ fn scala_library_jar() -> Option<PathBuf> {
     }
     let _ = fs::create_dir_all("/tmp/scala-rs-lib");
     let url = "https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16.jar";
+    let status = Command::new("curl")
+        .args(["-fsSL", "-o", cached.to_str().unwrap(), url])
+        .status();
+    if status.map(|s| s.success()).unwrap_or(false) && cached.is_file() {
+        return Some(cached);
+    }
+    None
+}
+
+fn scala_xml_jar() -> Option<PathBuf> {
+    let cached = PathBuf::from("/tmp/scala-rs-lib/scala-xml_2.13-2.3.0.jar");
+    if cached.is_file() {
+        return Some(cached);
+    }
+    let _ = fs::create_dir_all("/tmp/scala-rs-lib");
+    let url = "https://repo1.maven.org/maven2/org/scala-lang/modules/scala-xml_2.13/2.3.0/scala-xml_2.13-2.3.0.jar";
     let status = Command::new("curl")
         .args(["-fsSL", "-o", cached.to_str().unwrap(), url])
         .status();
@@ -898,6 +919,16 @@ fn scala_library_dual_run_postfix_abs() {
     dual_run_fixture("postfix_abs");
 }
 
+#[test]
+fn scala_library_dual_run_enumeration() {
+    dual_run_fixture("enumeration");
+}
+
+#[test]
+fn scala_library_dual_run_xml_lit() {
+    dual_run_xml_fixture("xml_lit");
+}
+
 const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Option.class",
     "scala/Some.class",
@@ -973,7 +1004,11 @@ fn dual_run_fixture(name: &str) {
     let jar_s = jar.to_str().unwrap();
     let out = compile_fixture_with(name, &["--scala-library", jar_s]);
     assert_no_private_stdlib(&out);
-    let cp = format!("{}:{}", out.display(), jar.display());
+    let mut cp = format!("{}:{}", out.display(), jar.display());
+    if let Some(xml) = scala_xml_jar() {
+        cp.push(':');
+        cp.push_str(&xml.display().to_string());
+    }
     let output = Command::new("java")
         .args(["-cp", &cp, "Main"])
         .output()
@@ -987,6 +1022,40 @@ fn dual_run_fixture(name: &str) {
         String::from_utf8_lossy(&output.stdout),
         expected_stdout(name),
         "stdout mismatch for library dual-run {name}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+fn dual_run_xml_fixture(name: &str) {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip scala-library dual-run: jar not obtainable");
+        return;
+    };
+    let Some(xml) = scala_xml_jar() else {
+        panic!(
+            "scala-xml 2.13 jar not obtainable; XML literals must run against the jar (no silent skip)"
+        );
+    };
+    let jar_s = jar.to_str().unwrap();
+    let out = compile_fixture_with(name, &["--scala-library", jar_s]);
+    assert_no_private_stdlib(&out);
+    let cp = format!("{}:{}:{}", out.display(), jar.display(), xml.display());
+    let output = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        output.status.success(),
+        "java -cp out:scala-library:scala-xml failed for {name}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout(name),
+        "stdout mismatch for library+xml dual-run {name}"
     );
     let _ = fs::remove_dir_all(&out);
 }
@@ -1315,10 +1384,11 @@ fn find_scalac() -> Option<PathBuf> {
 /// (`MODULE$`) plus field accessors, extractor `unapply` so `p match { case
 /// Point(a, b) => a + b }` typechecks, an `object` method taking that case
 /// class, and SIP-23 literal types `val one: 1` / `def lit(x: 1)` (CONSTANTtpe).
-/// Remaining pickle holes (TREE annotation args, Java annotations,
-/// nested packed existentials, refinement pickle, leftover Flags) are not
-/// claimed. If scalac cannot read a probed shape, this test fails rather
-/// than claiming success.
+/// Remaining pickle holes (TREE annotation args, nested packed existentials,
+/// refinement pickle, leftover Flags such as MACRO / BRIDGE / VARARGS / JAVA on
+/// Java-defined members) are not claimed. Java `@Deprecated` on a Scala method
+/// is pickled as SYMANNOT so scalac `-deprecation` sees `Lib.gone`. If scalac
+/// cannot read a probed shape, this test fails rather than claiming success.
 #[test]
 fn scalac_typechecks_against_our_classfiles_if_present() {
     let Some(scalac) = find_scalac() else {
@@ -1368,6 +1438,7 @@ object UseLib {
     val u: Int = Lib.h(1)
     val one: 1 = Lib.one
     val lit: Int = Lib.lit(1)
+    val gone: Int = Lib.gone
   }
 }
 "#,
@@ -1375,6 +1446,7 @@ object UseLib {
     .unwrap();
     let output = Command::new(&scalac)
         .args([
+            "-deprecation",
             "-classpath",
             out_lib.to_str().unwrap(),
             "-d",
@@ -1385,9 +1457,18 @@ object UseLib {
         .expect("scalac");
     assert!(
         output.status.success(),
-        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1)): {}\n{}",
+        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1) / Java @Deprecated Lib.gone): {}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        err.to_lowercase().contains("gone") && err.to_lowercase().contains("deprecated"),
+        "scalac -deprecation should see Java @Deprecated on Lib.gone, got {err}"
     );
     let _ = fs::remove_dir_all(&out_lib);
     let _ = fs::remove_dir_all(&probe);

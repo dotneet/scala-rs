@@ -567,4 +567,55 @@ object M {
             "infix plus must not be postfix: {dump}"
         );
     }
+
+    #[test]
+    fn xml_literal_elem_text_splice_desugars() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n = 1
+    val x = <a>t{n}</a>
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Elem"), "expected Elem constructor: {dump}");
+        assert!(dump.contains("Text"), "expected Text node: {dump}");
+        assert!(dump.contains("Atom"), "expected Atom splice: {dump}");
+        assert!(dump.contains("Null"), "{dump}");
+        assert!(dump.contains("TopScope"), "{dump}");
+    }
+
+    #[test]
+    fn xml_self_closing_desugars() {
+        let t = parse_ok("object M { val x = <a/> }\n");
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Elem"), "{dump}");
+    }
+
+    #[test]
+    fn xml_attributes_are_unimplemented() {
+        let r = parse_str("object M { val x = <a href=\"x\">t</a> }\n");
+        assert!(
+            r.diags.iter().any(|d| d.message.contains("XML")),
+            "expected XML attributes diagnostic, got {:?}",
+            r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn multi_val_def_flattens() {
+        let t = parse_ok(
+            r#"
+object Color {
+  val Red, Blue = 1
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("ValDef Red"), "{dump}");
+        assert!(dump.contains("ValDef Blue"), "{dump}");
+    }
 }
