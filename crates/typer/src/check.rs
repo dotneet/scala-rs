@@ -1083,6 +1083,26 @@ impl Typer {
                     self.check_variance_ty(vars, a, 0, span, where_);
                 }
             }
+            Type::Refined { parents, decls } => {
+                for p in parents {
+                    self.check_variance_ty(vars, p, pos, span, where_);
+                }
+                for d in decls {
+                    match d {
+                        scala_rs_parser::RefineDecl::Type { rhs: Some(t), .. }
+                        | scala_rs_parser::RefineDecl::Val { ty: t, .. } => {
+                            self.check_variance_ty(vars, t, pos, span, where_);
+                        }
+                        scala_rs_parser::RefineDecl::Def { paramss, ret, .. } => {
+                            for p in paramss.iter().flatten() {
+                                self.check_variance_ty(vars, p, -pos, span, where_);
+                            }
+                            self.check_variance_ty(vars, ret, pos, span, where_);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1646,6 +1666,9 @@ impl Typer {
             }
             TreeKind::Assign { lhs, rhs } => {
                 self.type_expr(lhs, &Type::NoType);
+                if structural_select_lhs(lhs) {
+                    self.error(tree.span, "unimplemented: structural update");
+                }
                 self.type_expr(rhs, &lhs.ty);
                 self.adapt(rhs, &lhs.ty);
                 tree.ty = Type::Unit;
@@ -1945,6 +1968,29 @@ impl Typer {
             tree.ty = Type::Error;
             return;
         }
+        let refined_term = match &qual.ty {
+            Type::Refined { decls, .. } => {
+                let from_term = decls.iter().any(|d| {
+                    matches!(
+                        d,
+                        scala_rs_parser::RefineDecl::Def { name: n, .. }
+                            | scala_rs_parser::RefineDecl::Val { name: n, .. }
+                            if n == &name
+                    )
+                });
+                if from_term {
+                    SymbolTable::refine_member_type(decls, &name)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(mty) = refined_term {
+            let mty = self.st.expand_in_type(&qual.ty, &mty);
+            tree.ty = self.maybe_auto_apply(mty, pt);
+            return;
+        }
         // String concatenation via any2stringadd: handled at Apply of +
         let owner = self.st.class_sym_of(&qual.ty);
         let mut found = if let Some(o) = owner {
@@ -2001,13 +2047,7 @@ impl Typer {
             }
             ty
         };
-        let expand = |ty: Type| -> Type {
-            if let Some(owner) = self.st.class_sym_of(&qual.ty) {
-                self.st.expand_type_members(owner, &ty)
-            } else {
-                ty
-            }
-        };
+        let expand = |ty: Type| -> Type { self.st.expand_in_type(&qual.ty, &ty) };
         if found.len() == 1 {
             let s = found[0];
             tree.sym = s;
@@ -3769,23 +3809,27 @@ impl Typer {
             TreeKind::Ident { name } if name == "_" => Type::Wildcard,
             TreeKind::Ident { name } => self.resolve_type_name(name, &[]),
             TreeKind::Select { name, qual } => {
-                // java.lang.String etc.
-                if name == "String" {
+                if name == "String" && !self.type_select_is_term_prefix(qual) {
                     Type::String
                 } else if self.type_select_is_term_prefix(qual) {
-                    self.error(tpt.span, "unimplemented type: path-dependent types");
-                    Type::Error
+                    self.path_dependent_type(tpt.span, qual, name)
                 } else {
                     self.resolve_type_name(name, &[])
                 }
             }
             TreeKind::SelectFromTypeTree { qual, name, hash } => {
                 if !*hash {
-                    self.error(tpt.span, "unimplemented type: path-dependent types");
-                    return Type::Error;
+                    if self.type_select_is_term_prefix(qual)
+                        || matches!(&qual.kind, TreeKind::This { .. } | TreeKind::Super { .. })
+                    {
+                        return self.path_dependent_type(tpt.span, qual, name);
+                    }
                 }
                 let prefix = self.tree_to_type(qual);
-                self.project_type_member(tpt.span, prefix, name)
+                self.project_from_prefix(tpt.span, &prefix, name)
+            }
+            TreeKind::CompoundTypeTree { parents, refinements } => {
+                self.compound_to_type(tpt.span, parents, refinements)
             }
             TreeKind::SingletonTypeTree { .. } => {
                 self.error(tpt.span, "unimplemented type: singleton types");
@@ -3952,7 +3996,24 @@ impl Typer {
     }
 
     fn project_type_member(&mut self, span: Span, prefix: Type, name: &str) -> Type {
-        let cls = match &prefix {
+        self.project_from_prefix(span, &prefix, name)
+    }
+
+    fn project_from_prefix(&mut self, span: Span, prefix: &Type, name: &str) -> Type {
+        if let Type::Refined { .. } = prefix {
+            if let Some(t) = self.st.lookup_type_member_on(prefix, name) {
+                return t;
+            }
+            self.error(
+                span,
+                format!(
+                    "type {} has no member {name}",
+                    self.st.display_type(prefix)
+                ),
+            );
+            return Type::Error;
+        }
+        let cls = match prefix {
             Type::Class { sym, .. } | Type::ModuleRef(sym) => *sym,
             Type::TypeMember(_) => {
                 self.error(span, "unimplemented type: nested type projections");
@@ -3961,10 +4022,7 @@ impl Typer {
             Type::Named { name: n, .. } => match self.resolve_type_name(n, &[]) {
                 Type::Class { sym, .. } | Type::ModuleRef(sym) => sym,
                 _ => {
-                    self.error(
-                        span,
-                        format!("cannot project #{name} from {n}"),
-                    );
+                    self.error(span, format!("cannot project #{name} from {n}"));
                     return Type::Error;
                 }
             },
@@ -3996,16 +4054,263 @@ impl Typer {
                 },
                 _ => continue,
             };
-            return self.st.expand_type_members(cls, &ty);
+            return self.st.expand_in_type(prefix, &ty);
         }
         self.error(
             span,
             format!(
                 "type {} has no member {name}",
-                self.st.display_type(&prefix)
+                self.st.display_type(prefix)
             ),
         );
         Type::Error
+    }
+
+    fn path_dependent_type(&mut self, span: Span, prefix: &Tree, name: &str) -> Type {
+        if !self.is_stable_path(prefix) {
+            self.error(
+                span,
+                format!(
+                    "stable identifier required, but {} found",
+                    path_display(prefix)
+                ),
+            );
+            return Type::Error;
+        }
+        let Some(pty) = self.term_path_type(prefix) else {
+            self.error(
+                span,
+                format!(
+                    "stable identifier required, but {} found",
+                    path_display(prefix)
+                ),
+            );
+            return Type::Error;
+        };
+        self.project_from_prefix(span, &pty, name)
+    }
+
+    fn is_stable_path(&self, t: &Tree) -> bool {
+        match &t.kind {
+            TreeKind::This { .. } => true,
+            TreeKind::Ident { name } => self.ident_is_stable(name),
+            TreeKind::Select { qual, name } => {
+                self.is_stable_path(qual) && self.member_is_stable(qual, name)
+            }
+            TreeKind::SelectFromTypeTree { qual, hash, name } if !hash => {
+                self.is_stable_path(qual) && self.member_is_stable(qual, name)
+            }
+            TreeKind::Apply { .. } | TreeKind::New { .. } => false,
+            _ => false,
+        }
+    }
+
+    fn ident_is_stable(&self, name: &str) -> bool {
+        let found = self.st.lookup(name);
+        found.iter().any(|s| {
+            let sy = self.st.get(*s);
+            match sy.kind {
+                SymKind::Module | SymKind::ModuleClass | SymKind::Package => true,
+                SymKind::Term => !sy.flags.contains(Flags::MUTABLE),
+                SymKind::Method => false,
+                _ => false,
+            }
+        })
+    }
+
+    fn member_is_stable(&self, qual: &Tree, name: &str) -> bool {
+        let Some(pty) = self.term_path_type(qual) else {
+            return false;
+        };
+        if let Type::Refined { decls, .. } = &pty {
+            if decls.iter().any(|d| {
+                matches!(
+                    d,
+                    scala_rs_parser::RefineDecl::Val { name: n, .. } if n == name
+                )
+            }) {
+                return true;
+            }
+            if decls.iter().any(|d| {
+                matches!(
+                    d,
+                    scala_rs_parser::RefineDecl::Def { name: n, .. } if n == name
+                )
+            }) {
+                return false;
+            }
+        }
+        let Some(cls) = self.st.class_sym_of(&pty) else {
+            return false;
+        };
+        self.st.lookup_member(cls, name).iter().any(|s| {
+            let sy = self.st.get(*s);
+            match sy.kind {
+                SymKind::Module | SymKind::ModuleClass | SymKind::Package => true,
+                SymKind::Term => !sy.flags.contains(Flags::MUTABLE),
+                SymKind::Method => false,
+                _ => false,
+            }
+        })
+    }
+
+    fn term_path_type(&self, t: &Tree) -> Option<Type> {
+        match &t.kind {
+            TreeKind::This { .. } => {
+                if self.st.this_class.is_none() {
+                    None
+                } else {
+                    Some(self.st.type_of_class(self.st.this_class))
+                }
+            }
+            TreeKind::Ident { name } => {
+                let found = self.st.lookup(name);
+                found.into_iter().find_map(|s| {
+                    let sy = self.st.get(s);
+                    match sy.kind {
+                        SymKind::Term | SymKind::Method => Some(sy.ty.clone()),
+                        SymKind::Module | SymKind::ModuleClass => Some(self.st.type_of_class(s)),
+                        _ => None,
+                    }
+                })
+            }
+            TreeKind::Select { qual, name } | TreeKind::SelectFromTypeTree { qual, name, .. } => {
+                let qt = self.term_path_type(qual)?;
+                if let Type::Refined { decls, .. } = &qt {
+                    if let Some(t) = SymbolTable::refine_member_type(decls, name) {
+                        return Some(self.st.expand_in_type(&qt, &t));
+                    }
+                }
+                let cls = self.st.class_sym_of(&qt)?;
+                self.st.lookup_member(cls, name).into_iter().find_map(|s| {
+                    let sy = self.st.get(s);
+                    match sy.kind {
+                        SymKind::Term | SymKind::Method => {
+                            Some(self.st.expand_in_type(&qt, &sy.ty))
+                        }
+                        SymKind::Module | SymKind::ModuleClass => Some(self.st.type_of_class(s)),
+                        _ => None,
+                    }
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn compound_to_type(&mut self, span: Span, parents: &[Tree], refinements: &[Tree]) -> Type {
+        let ps: Vec<Type> = parents.iter().map(|p| self.tree_to_type(p)).collect();
+        let mut decls = Vec::new();
+        let mut ok = true;
+        for r in refinements {
+            match &r.kind {
+                TreeKind::TypeDef {
+                    name,
+                    tparams,
+                    rhs,
+                    lo,
+                    hi,
+                    ..
+                } => {
+                    if !tparams.is_empty() || lo.is_some() || hi.is_some() {
+                        self.error(
+                            r.span,
+                            "unimplemented type: bounded or higher-kinded refinement type member",
+                        );
+                        ok = false;
+                        continue;
+                    }
+                    let alias = if rhs.is_empty() {
+                        None
+                    } else {
+                        Some(self.tree_to_type(rhs))
+                    };
+                    decls.push(scala_rs_parser::RefineDecl::Type {
+                        name: name.clone(),
+                        rhs: alias,
+                    });
+                }
+                TreeKind::DefDef {
+                    name,
+                    tparams,
+                    vparamss,
+                    tpt,
+                    rhs,
+                    ..
+                } => {
+                    if !rhs.is_empty() {
+                        self.error(r.span, "illegal implementation in refinement");
+                        ok = false;
+                        continue;
+                    }
+                    if !tparams.is_empty() {
+                        self.error(
+                            r.span,
+                            "unimplemented type: type parameters in refinement",
+                        );
+                        ok = false;
+                        continue;
+                    }
+                    let mut paramss = Vec::new();
+                    for clause in vparamss {
+                        let mut ct = Vec::new();
+                        for p in clause {
+                            if let TreeKind::ValDef { tpt, .. } = &p.kind {
+                                ct.push(self.tree_to_type(tpt));
+                            } else if !p.ty.is_no_type() {
+                                ct.push(p.ty.clone());
+                            } else {
+                                ct.push(Type::Any);
+                            }
+                        }
+                        paramss.push(ct);
+                    }
+                    let ret = self.tree_to_type(tpt);
+                    decls.push(scala_rs_parser::RefineDecl::Def {
+                        name: name.clone(),
+                        paramss,
+                        ret,
+                    });
+                }
+                TreeKind::ValDef {
+                    name,
+                    tpt,
+                    rhs,
+                    mods,
+                    ..
+                } => {
+                    if mods.flags.contains(Flags::MUTABLE) {
+                        self.error(r.span, "unimplemented type: structural var members");
+                        ok = false;
+                        continue;
+                    }
+                    if !rhs.is_empty() {
+                        self.error(r.span, "illegal implementation in refinement");
+                        ok = false;
+                        continue;
+                    }
+                    decls.push(scala_rs_parser::RefineDecl::Val {
+                        name: name.clone(),
+                        ty: self.tree_to_type(tpt),
+                    });
+                }
+                TreeKind::Unimplemented { what } => {
+                    self.error(r.span, format!("unimplemented type: {what}"));
+                    ok = false;
+                }
+                _ => {
+                    self.error(r.span, "unimplemented: structural update");
+                    ok = false;
+                }
+            }
+        }
+        if !ok {
+            return Type::Error;
+        }
+        let _ = span;
+        Type::Refined {
+            parents: ps,
+            decls,
+        }
     }
 
     fn resolve_type_name(&self, name: &str, args: &[Type]) -> Type {
@@ -4411,6 +4716,33 @@ fn subst_quantified(ty: Type, names: &[String]) -> Type {
                 .collect(),
         ),
         other => other,
+    }
+}
+
+fn path_display(t: &Tree) -> String {
+    match &t.kind {
+        TreeKind::Ident { name } => name.clone(),
+        TreeKind::Select { qual, name } => format!("{}.{}", path_display(qual), name),
+        TreeKind::SelectFromTypeTree { qual, name, hash } => {
+            let op = if *hash { "#" } else { "." };
+            format!("{}{op}{name}", path_display(qual))
+        }
+        TreeKind::This { qual: None } => "this".into(),
+        TreeKind::This { qual: Some(q) } => format!("{q}.this"),
+        TreeKind::Super { .. } => "super".into(),
+        TreeKind::Apply { fun, .. } => format!("{}()", path_display(fun)),
+        TreeKind::New { tpt } => format!("new {}", tpt.name().unwrap_or("?")),
+        _ => t.name().unwrap_or("<expr>").to_string(),
+    }
+}
+
+fn structural_select_lhs(lhs: &Tree) -> bool {
+    match &lhs.kind {
+        TreeKind::Select { qual, .. } => match &qual.ty {
+            Type::Refined { decls, .. } => SymbolTable::refined_has_term_members(decls),
+            _ => false,
+        },
+        _ => false,
     }
 }
 

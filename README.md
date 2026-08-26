@@ -84,7 +84,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - リテラル、タプル
 - 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）
 - 存在型のよくある形: `List[_]`、`T forSome { type X }`、`List[_]` を取るメソッド。ワイルドカードは Object 相当に erase する。境界付き `_ <: T` や `forSome { val … }` は診断する（黙って捨てない）
-- compiled class/object に **ScalaSignature**（`RuntimeVisibleAnnotations` + pickle subset）。`javap -v` で見える。自前 unpickler が読める範囲で `-cp` による別コンパイルができる。nsc 完全 pickle ではない
+- compiled class/object に **ScalaSignature**（クラス属性 `ScalaSig` マーカー + `RuntimeVisibleAnnotations` の pickle subset）。`javap -v` で見える。自前 unpickler が読める範囲で `-cp` による別コンパイルができる。nsc 完全 pickle ではないが、ワイヤ形式は nsc と同じ（nentries、tag/len、ビッグエンディアン Nat、SID-10 は `0x7f→0`）。`val` / パラメータ付き `def` / 型パラメータ `id[T]` は scalac 2.13.16 が読める形（object は CLASSsym+MODULE、`<empty>` / scala / java.lang の EXTMODCLASSref、POLYtpe は restpe 先行、val は NullaryMethodType ゲッター）
 - `s"..."` 文字列補間
 - `lazy val`
 - implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む。候補が複数あるときは nsc 風の **more-specific**（結果型の subtype）が勝つ。まだ曖昧なら `ambiguous implicit`。目標型が `A => B` で `A <: B` のときは nsc と同様 identity view を合成する（view bound の呼び出し側）
@@ -101,7 +101,9 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - `AnyVal` 値クラス（1 引数。生成は underlying へ erase。メソッドは `name$extension`）
 - Predef の一部: `assert` / `require` / `???` / ArrowAssoc の `->` / `identity` / `locally` / `implicitly` / `any2stringadd`（`1 + "x"`）/ String の `length`・`toInt`（`toLong` / `toDouble` もある）。**`--scala-library`** 時はこれらを jar の `Predef$` / `StringOps` / `Predef$ArrowAssoc` / `Predef$any2stringadd` にリンクする。さらに `intWrapper` / `RichInt`（`abs` / `max` / `to` / `until`）、`longWrapper` / `RichLong`、`doubleWrapper` / `RichDouble`、`floatWrapper` / `RichFloat`、`charWrapper` / `RichChar`、`StringOps` の `*` / `take` / `drop` / `isEmpty` / `toUpperCase` / `toLowerCase` / `stripPrefix` / `split`、`Map` / `Vector` / `List` / `Set` / `Seq` / `LazyList` の varargs `apply`、`Either`（`Left` / `Right`）、`Try` / `Success` / `Failure`（`Try(1)` / `map` / `getOrElse`）も jar リンク時のみ
 - 具象 `val` 付き trait の初期化（`T$class.$init$`）と `abstract override` の super 連鎖
-- 抽象型メンバーと型射影: `trait Foo { type A; def x: A }`、`type A = Int`、メソッド署名の `Bar#A`。高階 / 境界付き型メンバーとパス依存型 `c.A` は診断する
+- 抽象型メンバーと型射影: `trait Foo { type A; def x: A }`、`type A = Int`、メソッド署名の `Bar#A`
+- パス依存型: 安定パス `c.A`（`c: Foo { type A = Int }` や object / `this` / `val`）。`var` や `def` など不安定パスは nsc と同じ `stable identifier required, but … found`
+- 構造的 refinement: `{ def foo: Int }` / `T { def foo: Int }`。実行時は **Java reflection**（`getClass` / `Class.getMethod` / `Method.invoke` + unbox）。2.13 の reflective call と同じ実行意味論のサブセット。`scala.language.reflectiveCalls` は要求しない。構造的代入 / refinement の `var` / 本体付き `def` は診断する
 - self type: `trait T { self: Foo => ... }` の typecheck と mixin。実装クラスが self type に適合しないと `illegal inheritance`
 - 変性: `class C[+A]` / `class Box[+A](val x: A)` は合法。`class Bad[+A](var x: A)` は nsc と同様 covariant-in-contravariant で拒否
 
@@ -208,9 +210,11 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 言語:
 
 - マクロ
-- full nsc pickle（existentials / アノテーション引数 / 完全な Flags。出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / MODULEsym / VALsym / EXTref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe のサブセット。ByteCodecs は SID-10。vals・パラメータ付き defs・型パラメータは round-trip する）
-- パス依存型（`p.T` / `this.A` / `T.type`）。型射影 `T#A` と抽象型メンバーは実装済み
-- 構造的 refinement としての `T { def x }` の型（匿名クラスの合成 classfile は出す）
+- full nsc pickle（existentials / アノテーション引数 / 完全な Flags。出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / VALsym / EXTref / EXTMODCLASSref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe / TYPEBOUNDStpe / THIStpe / NOPREFIXtpe のサブセット。ByteCodecs は SID-10。ワイヤ形式は nsc と同じ nentries + ビッグエンディアン Nat。vals は METHOD|STABLE|ACCESSOR ゲッター + NullaryMethodType。scalac 2.13.16 が `val` / パラメータ付き `def` / `id[T]` を typecheck できる範囲）
+- implicit の more-specific のエッジ（親同士の優先の細部、ネストした型コンストラクタ companion の残り）
+
+対象外（診断する / パースしない）:
+
 - コンパイラプラグイン
 - Scala 3 構文 / TASTy / XML リテラル
 - 境界付き存在型（`_ <: T`、`forSome { type X <: Bound }`、`forSome { val x: T }`）。よくある unbounded `List[_]` / `T forSome { type X }` は実装済み
@@ -323,8 +327,10 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `type_member.scala` | 抽象型メンバー `type A`、`type A = Int`、`Bar#A` | `41` `42` |
 | `self_type.scala` | `self: Foo =>` の mixin と self type メンバー | `15` |
 | `variance.scala` | `class Box[+A](val value: A)` | `42` |
+| `path_dependent.scala` | `c: Foo { type A = Int }` の `c.A` / `c.x` | `41` `42` |
+| `structural.scala` | `{ def foo: Int }` を Java reflection で呼ぶ | `42` |
 
-implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` / `implicit_ambiguous_parents.scala` のコンパイル失敗で見ています。境界付き存在型は `existential_bounds.scala` で診断します。クラス型パラメータの view bounds は `view_bounds_class.scala` で診断します。パス依存型は `type_proj_bad.scala`、self type の不正 mixin は `self_type_bad.scala`、共変パラメータの `var` は `variance_bad.scala`、高階 / 境界付き型メンバーは `type_member_hk.scala` / `type_member_bounds.scala` で診断します。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします（vals / パラメータ付き defs / 型パラメータを pickle から読む）。`scalac` 2.13 は PATH、`/tmp/scala-2.13.16`、または公式 tarball（約 20MB）で取れれば、同じ classfile に対して tiny file（`Lib.greet("Scala", "!")`）を typecheck します。full nsc pickle ではないので、scalac から見た defaults / vals / 型引数までは主張しません。取れなければスキップします。コンパイルを成功扱いにしていません。
+implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` / `implicit_ambiguous_parents.scala` のコンパイル失敗で見ています。境界付き存在型は `existential_bounds.scala` で診断します。クラス型パラメータの view bounds は `view_bounds_class.scala` で診断します。不安定なパス依存型は `type_proj_bad.scala`（`stable identifier required`）、構造的代入は `structural_bad.scala`、self type の不正 mixin は `self_type_bad.scala`、共変パラメータの `var` は `variance_bad.scala`、高階 / 境界付き型メンバーは `type_member_hk.scala` / `type_member_bounds.scala` で診断します。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします（vals / パラメータ付き defs / 型パラメータを pickle から読む）。`scalac` 2.13 は PATH、`/tmp/scala-2.13.16`、または公式 tarball（約 20MB）で取れれば、同じ classfile に対して `Lib.greet` / `Lib.magic` / `Lib.id(42)` / `new Box("hi").get` を typecheck します。読めない pickle 形は成功扱いにしません。取れなければスキップします。
 
 ## ライセンス
 

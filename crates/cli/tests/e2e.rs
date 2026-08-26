@@ -403,8 +403,23 @@ fn fixtures_variance() {
 }
 
 #[test]
+fn fixtures_path_dependent() {
+    check("path_dependent");
+}
+
+#[test]
+fn fixtures_structural() {
+    check("structural");
+}
+
+#[test]
 fn fixtures_type_proj_bad_is_error() {
-    compile_fails("type_proj_bad", "path-dependent");
+    compile_fails("type_proj_bad", "stable identifier");
+}
+
+#[test]
+fn fixtures_structural_bad_is_error() {
+    compile_fails("structural_bad", "structural");
 }
 
 #[test]
@@ -937,8 +952,9 @@ fn find_scalac() -> Option<PathBuf> {
 }
 
 /// scalac 2.13 against our classfiles. Tries PATH, `/tmp/scala-2.13.16`, then a
-/// small official tarball download. Full nsc pickle is remaining, so the probe
-/// is a tiny JVM-visible method call, not defaults / vals / type args.
+/// small official tarball download. Probes a `val`, a `def` with params, and
+/// `id[T]` — not only `greet`. If scalac cannot read a pickle shape, this test
+/// fails rather than claiming success.
 #[test]
 fn scalac_typechecks_against_our_classfiles_if_present() {
     let Some(scalac) = find_scalac() else {
@@ -971,6 +987,9 @@ fn scalac_typechecks_against_our_classfiles_if_present() {
 object UseLib {
   def main(args: Array[String]): Unit = {
     val s: String = Lib.greet("Scala", "!")
+    val n: Int = Lib.magic
+    val x: Int = Lib.id(42)
+    val b: String = new Box("hi").get
   }
 }
 "#,
@@ -988,7 +1007,7 @@ object UseLib {
         .expect("scalac");
     assert!(
         output.status.success(),
-        "scalac failed to typecheck against our classfiles: {}\n{}",
+        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get): {}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );

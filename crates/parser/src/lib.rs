@@ -266,6 +266,22 @@ object Main {
     }
 
     #[test]
+    fn path_dependent_and_refinement_parse() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def f(c: Foo { type A = Int }): c.A = c.x
+  def g(x: { def foo: Int }): Int = x.foo
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("CompoundType"), "{dump}");
+        assert!(dump.contains("TypeDef A"), "{dump}");
+        assert!(dump.contains("DefDef foo"), "{dump}");
+    }
+
+    #[test]
     fn self_type_parses() {
         let t = parse_ok(
             r#"

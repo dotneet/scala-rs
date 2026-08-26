@@ -167,6 +167,11 @@ pub enum Type {
     TypeMember(SymbolId),
     /// Unbounded wildcard existential `_` (as in `List[_]`).
     Wildcard,
+    /// Structural / refinement type (`{ def foo: Int }` or `T { type A = Int }`).
+    Refined {
+        parents: Vec<Type>,
+        decls: Vec<RefineDecl>,
+    },
 }
 
 impl Type {
@@ -286,6 +291,77 @@ impl fmt::Display for Type {
             Type::TypeParam(s) => write!(f, "tparam#{}", s.0),
             Type::TypeMember(s) => write!(f, "tmem#{}", s.0),
             Type::Wildcard => write!(f, "_"),
+            Type::Refined { parents, decls } => {
+                if parents.is_empty() {
+                    write!(f, "{{ ")?;
+                } else {
+                    for (i, p) in parents.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, " with ")?;
+                        }
+                        write!(f, "{p}")?;
+                    }
+                    write!(f, " {{ ")?;
+                }
+                for (i, d) in decls.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "; ")?;
+                    }
+                    write!(f, "{d}")?;
+                }
+                write!(f, " }}")
+            }
+        }
+    }
+}
+
+/// A member declared in a refinement (`T { def foo: Int; type A = Int }`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum RefineDecl {
+    Type {
+        name: String,
+        rhs: Option<Type>,
+    },
+    Def {
+        name: String,
+        paramss: Vec<Vec<Type>>,
+        ret: Type,
+    },
+    Val {
+        name: String,
+        ty: Type,
+    },
+}
+
+impl fmt::Display for RefineDecl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RefineDecl::Type { name, rhs } => {
+                write!(f, "type {name}")?;
+                if let Some(t) = rhs {
+                    write!(f, " = {t}")?;
+                }
+                Ok(())
+            }
+            RefineDecl::Def {
+                name,
+                paramss,
+                ret,
+            } => {
+                write!(f, "def {name}")?;
+                for ps in paramss {
+                    write!(f, "(")?;
+                    for (i, p) in ps.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{p}")?;
+                    }
+                    write!(f, ")")?;
+                }
+                write!(f, ": {ret}")
+            }
+            RefineDecl::Val { name, ty } => write!(f, "val {name}: {ty}"),
         }
     }
 }
@@ -489,6 +565,8 @@ pub enum TreeKind {
     },
     CompoundTypeTree {
         parents: Vec<Tree>,
+        /// Refinement decls (`def` / `val` / `type`) inside `{ ... }`.
+        refinements: Vec<Tree>,
     },
     ExistentialTypeTree {
         tpt: Box<Tree>,

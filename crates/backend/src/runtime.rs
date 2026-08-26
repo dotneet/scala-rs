@@ -96,6 +96,7 @@ impl B {
             methods: self.methods,
             source: SRC.into(),
             scala_signature: None,
+            scala_raw: false,
         };
         let bytes = class.write_with_pool(self.pool).expect("runtime classfile");
         EmittedClass {

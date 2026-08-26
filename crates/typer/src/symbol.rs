@@ -1,6 +1,6 @@
 //! Symbols, scopes, and the compilation context.
 
-use scala_rs_parser::{Flags, SymbolId, Type};
+use scala_rs_parser::{Flags, RefineDecl, SymbolId, Type};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,6 +302,10 @@ impl SymbolTable {
             Type::TypeParam(_) => None,
             Type::TypeMember(_) => None,
             Type::Wildcard => Some(self.any_sym),
+            Type::Refined { parents, .. } => parents
+                .iter()
+                .find_map(|p| self.class_sym_of(p))
+                .or(Some(self.anyref_sym)),
             _ => None,
         }
     }
@@ -448,7 +452,8 @@ impl SymbolTable {
                 | Type::String
                 | Type::Array(_)
                 | Type::Class { .. }
-                | Type::ModuleRef(_),
+                | Type::ModuleRef(_)
+                | Type::Refined { .. },
             ) => true,
             (
                 Type::Int
@@ -465,10 +470,15 @@ impl SymbolTable {
                 | Type::Array(_)
                 | Type::Class { .. }
                 | Type::ModuleRef(_)
-                | Type::Function { .. },
+                | Type::Function { .. }
+                | Type::Refined { .. },
                 Type::AnyRef,
             ) => true,
             (Type::Class { sym: s1, .. }, Type::Class { sym: s2, .. }) if s1 == s2 => true,
+            (a, Type::Refined { parents, decls }) => {
+                parents.iter().all(|p| self.is_sub_type(a, p))
+                    && self.conforms_to_refinement(a, decls)
+            }
             (Type::Class { sym: s1, .. }, b) => self
                 .get(*s1)
                 .parents
@@ -506,6 +516,9 @@ impl SymbolTable {
             }
             (Type::ByName(a), Type::ByName(b)) => self.is_sub_type(a, b),
             (Type::Repeated(a), Type::Repeated(b)) => self.is_sub_type(a, b),
+            (Type::Refined { parents, .. }, b) => {
+                parents.iter().any(|p| self.is_sub_type(p, b))
+            }
             _ => false,
         }
     }
@@ -532,7 +545,29 @@ impl SymbolTable {
             Type::TypeMember(id) => {
                 let s = self.get(*id);
                 format!("{}.{}", self.get(s.owner).name, s.name)
-            },
+            }
+            Type::Refined { parents, decls } => {
+                let mut s = String::new();
+                if parents.is_empty() {
+                    s.push_str("{ ");
+                } else {
+                    for (i, p) in parents.iter().enumerate() {
+                        if i > 0 {
+                            s.push_str(" with ");
+                        }
+                        s.push_str(&self.display_type(p));
+                    }
+                    s.push_str(" { ");
+                }
+                for (i, d) in decls.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str("; ");
+                    }
+                    s.push_str(&d.to_string());
+                }
+                s.push_str(" }");
+                s
+            }
             Type::Array(t) => format!("Array[{}]", self.display_type(t)),
             Type::Method { paramss, ret } => {
                 let mut s = String::new();
@@ -627,8 +662,164 @@ impl SymbolTable {
                     .map(|t| self.expand_type_members(from, t))
                     .collect(),
             ),
+            Type::Refined { parents, decls } => Type::Refined {
+                parents: parents
+                    .iter()
+                    .map(|p| self.expand_type_members(from, p))
+                    .collect(),
+                decls: decls
+                    .iter()
+                    .map(|d| expand_refine_decl(self, from, d))
+                    .collect(),
+            },
             other => other.clone(),
         }
+    }
+
+    /// Expand type members using aliases on a (possibly refined) prefix type.
+    pub fn expand_in_type(&self, from: &Type, ty: &Type) -> Type {
+        match from {
+            Type::Refined { parents, decls } => {
+                let mut t = subst_refine_aliases(self, decls, ty);
+                for p in parents {
+                    t = self.expand_in_type(p, &t);
+                }
+                t
+            }
+            Type::Class { sym, .. } | Type::ModuleRef(sym) => self.expand_type_members(*sym, ty),
+            _ => {
+                if let Some(c) = self.class_sym_of(from) {
+                    self.expand_type_members(c, ty)
+                } else {
+                    ty.clone()
+                }
+            }
+        }
+    }
+
+    pub fn refine_member_type(decls: &[RefineDecl], name: &str) -> Option<Type> {
+        for d in decls {
+            match d {
+                RefineDecl::Def {
+                    name: n,
+                    paramss,
+                    ret,
+                } if n == name => {
+                    return Some(Type::Method {
+                        paramss: paramss.clone(),
+                        ret: Box::new(ret.clone()),
+                    });
+                }
+                RefineDecl::Val { name: n, ty } if n == name => return Some(ty.clone()),
+                RefineDecl::Type { name: n, rhs } if n == name => {
+                    return Some(rhs.clone().unwrap_or(Type::Named {
+                        name: n.clone(),
+                        args: vec![],
+                    }));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    pub fn refined_has_term_members(decls: &[RefineDecl]) -> bool {
+        decls
+            .iter()
+            .any(|d| matches!(d, RefineDecl::Def { .. } | RefineDecl::Val { .. }))
+    }
+
+    fn conforms_to_refinement(&self, a: &Type, decls: &[RefineDecl]) -> bool {
+        for d in decls {
+            match d {
+                RefineDecl::Type { name, rhs } => {
+                    let Some(have) = self.lookup_type_member_on(a, name) else {
+                        return false;
+                    };
+                    if let Some(want) = rhs {
+                        if !self.types_same_enough(&have, want) {
+                            return false;
+                        }
+                    }
+                }
+                RefineDecl::Def { name, ret, .. } => {
+                    let Some(have) = self.lookup_term_member_on(a, name) else {
+                        return false;
+                    };
+                    if !self.is_sub_type(have.result(), ret) {
+                        return false;
+                    }
+                }
+                RefineDecl::Val { name, ty } => {
+                    let Some(have) = self.lookup_term_member_on(a, name) else {
+                        return false;
+                    };
+                    if !self.is_sub_type(have.result(), ty) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn types_same_enough(&self, a: &Type, b: &Type) -> bool {
+        a == b || (self.is_sub_type(a, b) && self.is_sub_type(b, a))
+    }
+
+    pub(crate) fn lookup_type_member_on(&self, ty: &Type, name: &str) -> Option<Type> {
+        if let Type::Refined { parents, decls } = ty {
+            if let Some(t) = Self::refine_member_type(decls, name) {
+                if decls.iter().any(|d| matches!(d, RefineDecl::Type { name: n, .. } if n == name)) {
+                    return Some(t);
+                }
+            }
+            for p in parents {
+                if let Some(t) = self.lookup_type_member_on(p, name) {
+                    return Some(t);
+                }
+            }
+        }
+        let cls = self.class_sym_of(ty)?;
+        let found = self.lookup_member(cls, name);
+        for m in found {
+            if self.get(m).kind == SymKind::TypeMember {
+                let rhs = self.get(m).ty.clone();
+                return Some(match rhs {
+                    Type::NoType | Type::Error | Type::TypeMember(_) => {
+                        self.expand_in_type(ty, &Type::TypeMember(m))
+                    }
+                    other => self.expand_in_type(ty, &other),
+                });
+            }
+        }
+        None
+    }
+
+    fn lookup_term_member_on(&self, ty: &Type, name: &str) -> Option<Type> {
+        if let Type::Refined { parents, decls } = ty {
+            if decls.iter().any(|d| {
+                matches!(
+                    d,
+                    RefineDecl::Def { name: n, .. } | RefineDecl::Val { name: n, .. } if n == name
+                )
+            }) {
+                return Self::refine_member_type(decls, name);
+            }
+            for p in parents {
+                if let Some(t) = self.lookup_term_member_on(p, name) {
+                    return Some(t);
+                }
+            }
+        }
+        let cls = self.class_sym_of(ty)?;
+        self.lookup_member(cls, name).into_iter().find_map(|m| {
+            let s = self.get(m);
+            match s.kind {
+                SymKind::Method | SymKind::Term => Some(self.expand_in_type(ty, &s.ty)),
+                _ => None,
+            }
+        })
     }
 }
 
@@ -669,6 +860,121 @@ fn subst_map(ty: &Type, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> Typ
             name: name.clone(),
             args: as_.iter().map(|a| subst_map(a, tps, args)).collect(),
         },
+        Type::Refined { parents, decls } => Type::Refined {
+            parents: parents.iter().map(|p| subst_map(p, tps, args)).collect(),
+            decls: decls
+                .iter()
+                .map(|d| subst_refine_decl(d, tps, args))
+                .collect(),
+        },
+        other => other.clone(),
+    }
+}
+
+fn expand_refine_decl(st: &SymbolTable, from: SymbolId, d: &RefineDecl) -> RefineDecl {
+    match d {
+        RefineDecl::Type { name, rhs } => RefineDecl::Type {
+            name: name.clone(),
+            rhs: rhs.as_ref().map(|t| st.expand_type_members(from, t)),
+        },
+        RefineDecl::Def {
+            name,
+            paramss,
+            ret,
+        } => RefineDecl::Def {
+            name: name.clone(),
+            paramss: paramss
+                .iter()
+                .map(|ps| {
+                    ps.iter()
+                        .map(|p| st.expand_type_members(from, p))
+                        .collect()
+                })
+                .collect(),
+            ret: st.expand_type_members(from, ret),
+        },
+        RefineDecl::Val { name, ty } => RefineDecl::Val {
+            name: name.clone(),
+            ty: st.expand_type_members(from, ty),
+        },
+    }
+}
+
+fn subst_refine_decl(d: &RefineDecl, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> RefineDecl {
+    match d {
+        RefineDecl::Type { name, rhs } => RefineDecl::Type {
+            name: name.clone(),
+            rhs: rhs.as_ref().map(|t| subst_map(t, tps, args)),
+        },
+        RefineDecl::Def {
+            name,
+            paramss,
+            ret,
+        } => RefineDecl::Def {
+            name: name.clone(),
+            paramss: paramss
+                .iter()
+                .map(|ps| ps.iter().map(|p| subst_map(p, tps, args)).collect())
+                .collect(),
+            ret: subst_map(ret, tps, args),
+        },
+        RefineDecl::Val { name, ty } => RefineDecl::Val {
+            name: name.clone(),
+            ty: subst_map(ty, tps, args),
+        },
+    }
+}
+
+fn subst_refine_aliases(st: &SymbolTable, decls: &[RefineDecl], ty: &Type) -> Type {
+    match ty {
+        Type::TypeMember(id) => {
+            let name = st.get(*id).name.clone();
+            for d in decls {
+                if let RefineDecl::Type {
+                    name: n,
+                    rhs: Some(rhs),
+                } = d
+                {
+                    if n == &name {
+                        return subst_refine_aliases(st, decls, rhs);
+                    }
+                }
+            }
+            ty.clone()
+        }
+        Type::Class { sym, args } => Type::Class {
+            sym: *sym,
+            args: args
+                .iter()
+                .map(|a| subst_refine_aliases(st, decls, a))
+                .collect(),
+        },
+        Type::Array(t) => Type::Array(Box::new(subst_refine_aliases(st, decls, t))),
+        Type::Function { params, ret } => Type::Function {
+            params: params
+                .iter()
+                .map(|p| subst_refine_aliases(st, decls, p))
+                .collect(),
+            ret: Box::new(subst_refine_aliases(st, decls, ret)),
+        },
+        Type::Method { paramss, ret } => Type::Method {
+            paramss: paramss
+                .iter()
+                .map(|ps| {
+                    ps.iter()
+                        .map(|p| subst_refine_aliases(st, decls, p))
+                        .collect()
+                })
+                .collect(),
+            ret: Box::new(subst_refine_aliases(st, decls, ret)),
+        },
+        Type::ByName(t) => Type::ByName(Box::new(subst_refine_aliases(st, decls, t))),
+        Type::Repeated(t) => Type::Repeated(Box::new(subst_refine_aliases(st, decls, t))),
+        Type::Tuple(ts) => Type::Tuple(
+            ts.iter()
+                .map(|t| subst_refine_aliases(st, decls, t))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }

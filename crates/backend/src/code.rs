@@ -420,6 +420,18 @@ impl Assembler {
         self.push_v(VType::Object("java/lang/String".into()));
     }
 
+    pub fn ldc_class(&mut self, internal: &str) {
+        let i = self.pool.class(internal);
+        if i <= 255 {
+            self.emit_op(0x12);
+            self.bytes.push(i as u8);
+        } else {
+            self.emit_op(0x13);
+            self.emit_u16(i);
+        }
+        self.push_v(VType::Object("java/lang/Class".into()));
+    }
+
     pub fn iload(&mut self, n: u16) {
         self.emit_load_store(0x1a, 0x15, n);
         self.push_v(VType::Integer);

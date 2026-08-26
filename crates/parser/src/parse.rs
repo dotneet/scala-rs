@@ -1321,6 +1321,7 @@ impl<'a> Parser<'a> {
             self.peek_non_nl(),
             TokenKind::Ident(_)
                 | TokenKind::LParen
+                | TokenKind::LBrace
                 | TokenKind::This
                 | TokenKind::Super
                 | TokenKind::Underscore
@@ -1328,6 +1329,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_compound_type(&mut self) -> Tree {
+        self.skip_nl();
+        if matches!(self.kind(), TokenKind::LBrace) {
+            let lo = self.span();
+            let refinements = self.parse_refinement();
+            return self.alloc(
+                lo.merge(self.prev_span()),
+                TreeKind::CompoundTypeTree {
+                    parents: vec![],
+                    refinements,
+                },
+            );
+        }
         let t = self.parse_annot_type();
         let mut parents = vec![t.clone()];
         loop {
@@ -1339,21 +1352,88 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        if matches!(self.kind(), TokenKind::LBrace) {
-            let sp = self.span();
-            // refinement — skip balanced braces and report
-            self.skip_balanced_brace();
-            return self
-                .unimplemented(sp.merge(self.prev_span()), "refinement types (`T { ... }`)");
-        }
-        if parents.len() == 1 {
+        self.skip_nl();
+        let refinements = if matches!(self.kind(), TokenKind::LBrace) {
+            self.parse_refinement()
+        } else {
+            vec![]
+        };
+        if parents.len() == 1 && refinements.is_empty() {
             t
         } else {
             self.alloc(
                 parents[0].span.merge(self.prev_span()),
-                TreeKind::CompoundTypeTree { parents },
+                TreeKind::CompoundTypeTree {
+                    parents,
+                    refinements,
+                },
             )
         }
+    }
+
+    fn parse_refinement(&mut self) -> Vec<Tree> {
+        self.bump(); // {
+        let mut decls = Vec::new();
+        loop {
+            self.skip_nl_semi();
+            match self.kind() {
+                TokenKind::RBrace | TokenKind::Eof => break,
+                TokenKind::TypeKw => decls.push(self.parse_type_def(Modifiers::default())),
+                TokenKind::Val => {
+                    let t = self.parse_val_def(Modifiers::default());
+                    if refinement_has_impl(&t) {
+                        self.error_span(t.span, "illegal implementation in refinement");
+                        decls.push(self.alloc(
+                            t.span,
+                            TreeKind::Unimplemented {
+                                what: "illegal implementation in refinement".into(),
+                            },
+                        ));
+                    } else {
+                        decls.push(t);
+                    }
+                }
+                TokenKind::Var => {
+                    let sp = self.span();
+                    let _ = self.parse_val_def(Modifiers::default());
+                    let span = sp.merge(self.prev_span());
+                    self.error_span(span, "unimplemented type: structural var members");
+                    decls.push(self.alloc(
+                        span,
+                        TreeKind::Unimplemented {
+                            what: "structural var members".into(),
+                        },
+                    ));
+                }
+                TokenKind::Def => {
+                    let t = self.parse_def_def(Modifiers::default());
+                    if refinement_has_impl(&t) {
+                        self.error_span(t.span, "illegal implementation in refinement");
+                        decls.push(self.alloc(
+                            t.span,
+                            TreeKind::Unimplemented {
+                                what: "illegal implementation in refinement".into(),
+                            },
+                        ));
+                    } else {
+                        decls.push(t);
+                    }
+                }
+                _ => {
+                    let sp = self.span();
+                    self.error_span(sp, "unimplemented: structural update");
+                    decls.push(self.alloc(
+                        sp,
+                        TreeKind::Unimplemented {
+                            what: "structural update".into(),
+                        },
+                    ));
+                    self.skip_to_existential_sep();
+                }
+            }
+        }
+        self.expect("}", |k| matches!(k, TokenKind::RBrace));
+        decls
     }
 
     fn skip_balanced_brace(&mut self) {
@@ -2795,6 +2875,13 @@ fn expr_to_params(t: Tree) -> Vec<Tree> {
             },
             ..t
         }],
+    }
+}
+
+fn refinement_has_impl(t: &Tree) -> bool {
+    match &t.kind {
+        TreeKind::ValDef { rhs, .. } | TreeKind::DefDef { rhs, .. } => !rhs.is_empty(),
+        _ => false,
     }
 }
 

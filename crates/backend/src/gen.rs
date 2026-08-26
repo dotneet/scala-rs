@@ -11,7 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 /// Options for [`emit_opts`].
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct EmitOpts {
     /// Emit invokes against scala-library 2.13 (Option/List/`::`/FunctionN/…).
     ///
@@ -19,6 +19,8 @@ pub struct EmitOpts {
     /// skips them when this flag is set. Call sites that would miss on the jar
     /// (`List.withFilter`, `List.tail()List`, ArrowAssoc) are rewritten here.
     pub library_abi: bool,
+    /// Pre-erasure ScalaSignature pickles, keyed by class symbol id.
+    pub pickles: HashMap<u32, Vec<u8>>,
 }
 
 /// Walk a typed compilation unit and emit classes (private-runtime ABI).
@@ -42,6 +44,7 @@ pub fn emit_opts(
         trait_impls: HashMap::new(),
         trait_vals: HashMap::new(),
         library_abi: opts.library_abi,
+        pickles: opts.pickles,
     };
     g.collect_trait_impls(tree);
     g.walk(tree);
@@ -61,6 +64,7 @@ struct Gen<'a> {
     /// Trait `val` definitions with a right-hand side (`T$class.$init$`).
     trait_vals: HashMap<SymbolId, Vec<Tree>>,
     library_abi: bool,
+    pickles: HashMap<u32, Vec<u8>>,
 }
 
 struct EmitCtx<'a> {
@@ -162,6 +166,7 @@ struct ClassBuilder {
     pool: Pool,
     source: String,
     scala_signature: Option<String>,
+    scala_raw: bool,
 }
 
 impl ClassBuilder {
@@ -176,6 +181,7 @@ impl ClassBuilder {
             pool: Pool::new(),
             source: source.to_string(),
             scala_signature: None,
+            scala_raw: false,
         }
     }
 
@@ -220,6 +226,7 @@ impl ClassBuilder {
             methods: self.methods,
             source: self.source,
             scala_signature: self.scala_signature,
+            scala_raw: self.scala_raw,
         };
         let bytes = class.write_with_pool(self.pool).expect("classfile write");
         EmittedClass {
@@ -229,11 +236,19 @@ impl ClassBuilder {
     }
 }
 
-fn attach_scala_sig(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
+fn attach_scala_sig(
+    b: &mut ClassBuilder,
+    st: &SymbolTable,
+    class_id: SymbolId,
+    pickles: &HashMap<u32, Vec<u8>>,
+) {
     if class_id.is_none() {
         return;
     }
-    let raw = crate::pickle::pickle_class(st, class_id);
+    let raw = pickles
+        .get(&class_id.0)
+        .cloned()
+        .unwrap_or_else(|| crate::pickle::pickle_class(st, class_id));
     if raw.is_empty() {
         return;
     }
@@ -285,6 +300,7 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::ByName(_) => "Lscala/Function0;".into(),
         Type::Repeated(_) => "Lscala/collection/immutable/Seq;".into(),
         Type::TypeParam(_) | Type::TypeMember(_) | Type::Wildcard => "Ljava/lang/Object;".into(),
+        Type::Refined { .. } => "Ljava/lang/Object;".into(),
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
             format!("[{}", jvm_desc(st, &args[0]))
         }
@@ -1025,7 +1041,7 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
-            attach_scala_sig(&mut b, self.st, class_id);
+            attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
             self.out.push(b.finish());
             self.emit_trait_impl_class(tree, &this_name);
             return;
@@ -1106,7 +1122,7 @@ impl<'a> Gen<'a> {
         self.emit_super_accessors(&mut b, class_id);
         self.emit_mixin_forwarders(&mut b, class_id, &impl_.body);
         self.emit_erasure_bridges(&mut b, class_id);
-        attach_scala_sig(&mut b, self.st, class_id);
+        attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out.push(b.finish());
     }
 
@@ -2157,7 +2173,7 @@ impl<'a> Gen<'a> {
             }
         }
 
-        attach_scala_sig(&mut b, self.st, cls);
+        attach_scala_sig(&mut b, self.st, cls, &self.pickles);
         self.out.push(b.finish());
 
         let top_level = if cls.is_none() {
@@ -2169,7 +2185,7 @@ impl<'a> Gen<'a> {
             )
         };
         if !class_names.contains(name) && top_level && name != "package" {
-            self.emit_forwarder(&this_name, &forwarded);
+            self.emit_forwarder(&this_name, &forwarded, cls);
         }
     }
 
@@ -2252,11 +2268,16 @@ impl<'a> Gen<'a> {
         self.emit_module_init(&mut b, class_id, &[]);
         self.emit_module_clinit(&mut b);
         emit_case_apply(&mut b, self.st, class_id);
-        attach_scala_sig(&mut b, self.st, class_id);
+        attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out.push(b.finish());
     }
 
-    fn emit_forwarder(&mut self, module_jvm: &str, methods: &[(String, String, Type, Vec<Type>)]) {
+    fn emit_forwarder(
+        &mut self,
+        module_jvm: &str,
+        methods: &[(String, String, Type, Vec<Type>)],
+        class_id: SymbolId,
+    ) {
         let fwd_name = strip_module_dollar(module_jvm);
         let mut b = ClassBuilder::new(fwd_name, self.source_name);
         b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
@@ -2284,6 +2305,7 @@ impl<'a> Gen<'a> {
                 emit_return(asm, &ret);
             });
         }
+        attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out.push(b.finish());
     }
 
@@ -2673,6 +2695,84 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
     }
 }
 
+fn gen_structural_call(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    recv: &Tree,
+    name: &str,
+    args: &[Tree],
+    result: &Type,
+) {
+    // Scala 2.13 reflective call: getClass.getMethod(name, Class[]).invoke(recv, Object[])
+    gen_expr(asm, frame, ctx, recv);
+    asm.dup();
+    asm.invokevirtual("java/lang/Object", "getClass", "()Ljava/lang/Class;");
+    asm.ldc_string(name);
+    asm.iconst(args.len() as i32);
+    asm.anewarray("java/lang/Class");
+    for (i, a) in args.iter().enumerate() {
+        asm.dup();
+        asm.iconst(i as i32);
+        gen_java_class_of(asm, ctx, &a.ty);
+        asm.aastore();
+    }
+    asm.invokevirtual(
+        "java/lang/Class",
+        "getMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+    );
+    asm.swap();
+    asm.iconst(args.len() as i32);
+    asm.anewarray("java/lang/Object");
+    for (i, a) in args.iter().enumerate() {
+        asm.dup();
+        asm.iconst(i as i32);
+        gen_expr(asm, frame, ctx, a);
+        emit_box(asm, &a.ty);
+        asm.aastore();
+    }
+    asm.invokevirtual(
+        "java/lang/reflect/Method",
+        "invoke",
+        "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+    );
+    match result {
+        Type::Int | Type::Boolean | Type::Long | Type::Double | Type::Char | Type::Float => {
+            emit_unbox(asm, result);
+        }
+        Type::Unit | Type::NoType => {
+            asm.pop();
+        }
+        Type::String => {
+            asm.checkcast("java/lang/String");
+        }
+        _ => {
+            if let Some(cn) = checkcast_internal(ctx.st, result) {
+                asm.checkcast(&cn);
+            }
+        }
+    }
+}
+
+fn gen_java_class_of(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
+    match ty {
+        Type::Int => asm.getstatic("java/lang/Integer", "TYPE", "Ljava/lang/Class;"),
+        Type::Boolean => asm.getstatic("java/lang/Boolean", "TYPE", "Ljava/lang/Class;"),
+        Type::Long => asm.getstatic("java/lang/Long", "TYPE", "Ljava/lang/Class;"),
+        Type::Double => asm.getstatic("java/lang/Double", "TYPE", "Ljava/lang/Class;"),
+        Type::Float => asm.getstatic("java/lang/Float", "TYPE", "Ljava/lang/Class;"),
+        Type::Char => asm.getstatic("java/lang/Character", "TYPE", "Ljava/lang/Class;"),
+        Type::Unit | Type::NoType => asm.getstatic("java/lang/Void", "TYPE", "Ljava/lang/Class;"),
+        Type::String => asm.ldc_class("java/lang/String"),
+        Type::Class { sym, .. } | Type::ModuleRef(sym) => {
+            asm.ldc_class(&class_internal(ctx.st, *sym));
+        }
+        Type::Named { name, .. } => asm.ldc_class(&name.replace('.', "/")),
+        _ => asm.ldc_class("java/lang/Object"),
+    }
+}
+
 fn gen_select(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -2684,6 +2784,10 @@ fn gen_select(
     if name == "length" && matches!(qual.ty, Type::Array(_)) {
         gen_expr(asm, frame, ctx, qual);
         asm.arraylength();
+        return;
+    }
+    if matches!(qual.ty, Type::Refined { .. }) && tree.sym.is_none() {
+        gen_structural_call(asm, frame, ctx, qual, name, &[], &tree.ty);
         return;
     }
     if !tree.sym.is_none() {
@@ -2887,6 +2991,13 @@ fn gen_apply(
     let fun0 = peel_fun(fun);
     let (fun, owned_args) = flatten_apply_owned(fun0, args);
     let args: &[Tree] = &owned_args;
+
+    if let TreeKind::Select { qual, name } = &fun.kind {
+        if matches!(qual.ty, Type::Refined { .. }) && fun.sym.is_none() {
+            gen_structural_call(asm, frame, ctx, qual, name, args, &tree.ty);
+            return;
+        }
+    }
 
     if matches!(&fun.kind, TreeKind::New { .. }) {
         let tpt = match &fun.kind {
@@ -5493,7 +5604,15 @@ mod tests {
         scala_rs_typer::uncurry(&mut tree, &mut st);
         scala_rs_typer::lambda_lift(&mut tree, &mut st);
         scala_rs_typer::erase(&mut tree, &mut st);
-        emit_opts(&tree, &st, "Test.scala", EmitOpts { library_abi: true })
+        emit_opts(
+            &tree,
+            &st,
+            "Test.scala",
+            EmitOpts {
+                library_abi: true,
+                ..Default::default()
+            },
+        )
     }
 
     fn run_main(src: &str) -> Option<String> {

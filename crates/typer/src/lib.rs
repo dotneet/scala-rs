@@ -870,22 +870,50 @@ object Main {
     }
 
     #[test]
-    fn path_dependent_type_is_diagnosed() {
+    fn path_dependent_type_ok() {
+        ok(r#"
+trait Foo { type A; def x: A }
+class Bar extends Foo { type A = Int; def x: A = 41 }
+object Main {
+  def fromPath(c: Foo { type A = Int }): c.A = c.x
+  def main(args: Array[String]): Unit = {
+    val n: Int = fromPath(new Bar())
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn path_dependent_unstable_is_diagnosed() {
         let (_, _, diags) = typecheck_str(
             r#"
 trait Foo { type A }
-class Bar extends Foo { type A = Int; def x: A = 1 }
+class Bar extends Foo { type A = Int }
 object Main {
-  def bad(c: Bar): c.A = c.x
+  var v: Bar = new Bar()
+  def bad: v.A = 1
 }
 "#,
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("path-dependent")),
+            diags.iter().any(|d| d.message.contains("stable identifier")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn structural_type_ok() {
+        ok(r#"
+class C { def foo: Int = 42 }
+object Main {
+  def use(x: { def foo: Int }): Int = x.foo
+  def main(args: Array[String]): Unit = {
+    val n: Int = use(new C())
+  }
+}
+"#);
     }
 
     #[test]

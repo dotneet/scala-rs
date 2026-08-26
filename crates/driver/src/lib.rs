@@ -70,6 +70,7 @@ struct Unit {
     file_index: usize,
     tree: Tree,
     st: Option<SymbolTable>,
+    pickles: std::collections::HashMap<u32, Vec<u8>>,
 }
 
 fn has_errors(diags: &[Diagnostic]) -> bool {
@@ -122,6 +123,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                     file_index,
                     tree: parsed.tree,
                     st: None,
+                    pickles: std::collections::HashMap::new(),
                 });
                 sources.push(sf);
             }
@@ -169,6 +171,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         if !has_errors(&diags) {
             uncurry(&mut u.tree, &mut st);
             lambda_lift(&mut u.tree, &mut st);
+            u.pickles = scala_rs_backend::pickle::pickle_all(&st);
             erase(&mut u.tree, &mut st);
         }
         u.st = Some(st);
@@ -198,7 +201,15 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
     for u in &units {
         let st = u.st.as_ref().expect("unit is typed");
         let src_name = source_file_name(&sources[u.file_index]);
-        emitted.extend(emit_opts(&u.tree, st, src_name, EmitOpts { library_abi }));
+        emitted.extend(emit_opts(
+            &u.tree,
+            st,
+            src_name,
+            EmitOpts {
+                library_abi,
+                pickles: u.pickles.clone(),
+            },
+        ));
     }
 
     if let Err(e) = write_emitted(&emitted, &opts.out_dir) {

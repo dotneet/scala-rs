@@ -296,10 +296,13 @@ fn dump_into(s: &mut String, t: &Tree, indent: usize) {
             dump_into(s, qual, indent + 1);
             Ok(())
         }
-        TreeKind::CompoundTypeTree { parents } => {
+        TreeKind::CompoundTypeTree { parents, refinements } => {
             writeln!(s, "{pad}CompoundType{ty}");
             for p in parents {
                 dump_into(s, p, indent + 1);
+            }
+            for d in refinements {
+                dump_into(s, d, indent + 1);
             }
             Ok(())
         }
