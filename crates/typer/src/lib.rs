@@ -649,14 +649,23 @@ object Main {
     }
 
     #[test]
-    fn unsupported_wildcard_bounds_are_diagnosed() {
+    fn bounded_wildcard_typechecks() {
+        ok(r#"
+object M {
+  def f(xs: List[_ <: AnyRef]): Unit = ()
+  def g(xs: List[_ <: Int]): Unit = ()
+}
+"#);
+    }
+
+    #[test]
+    fn value_existential_is_diagnosed() {
         let (_, _, diags) = typecheck_str(
-            "object M { def f(xs: List[_ <: Int]): Unit = () }\n",
+            "object M { def f(x: T forSome { val x: Int }): Unit = () }\n",
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("wildcard bounds")
-                || d.message.contains("unimplemented")),
+            diags.iter().any(|d| d.message.contains("unimplemented")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
