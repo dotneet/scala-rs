@@ -101,6 +101,9 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - `AnyVal` 値クラス（1 引数。生成は underlying へ erase。メソッドは `name$extension`）
 - Predef の一部: `assert` / `require` / `???` / ArrowAssoc の `->` / `identity` / `locally` / `implicitly` / `any2stringadd`（`1 + "x"`）/ String の `length`・`toInt`（`toLong` / `toDouble` もある）。**`--scala-library`** 時はこれらを jar の `Predef$` / `StringOps` / `Predef$ArrowAssoc` / `Predef$any2stringadd` にリンクする。さらに `intWrapper` / `RichInt`（`abs` / `max` / `to` / `until`）、`longWrapper` / `RichLong`、`doubleWrapper` / `RichDouble`、`floatWrapper` / `RichFloat`、`charWrapper` / `RichChar`、`StringOps` の `*` / `take` / `drop` / `isEmpty` / `toUpperCase` / `toLowerCase` / `stripPrefix` / `split`、`Map` / `Vector` / `List` / `Set` / `Seq` / `LazyList` の varargs `apply`、`Either`（`Left` / `Right`）、`Try` / `Success` / `Failure`（`Try(1)` / `map` / `getOrElse`）も jar リンク時のみ
 - 具象 `val` 付き trait の初期化（`T$class.$init$`）と `abstract override` の super 連鎖
+- 抽象型メンバーと型射影: `trait Foo { type A; def x: A }`、`type A = Int`、メソッド署名の `Bar#A`。高階 / 境界付き型メンバーとパス依存型 `c.A` は診断する
+- self type: `trait T { self: Foo => ... }` の typecheck と mixin。実装クラスが self type に適合しないと `illegal inheritance`
+- 変性: `class C[+A]` / `class Box[+A](val x: A)` は合法。`class Bad[+A](var x: A)` は nsc と同様 covariant-in-contravariant で拒否
 
 フィクスチャで実際に動く範囲は README 末尾の表を見てください。
 
@@ -206,11 +209,11 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 
 - マクロ
 - full nsc pickle（existentials / アノテーション引数 / 完全な Flags。出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / MODULEsym / VALsym / EXTref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe のサブセット。ByteCodecs は SID-10。vals・パラメータ付き defs・型パラメータは round-trip する）
-- implicit priority vs inheritance の端（親から inherited した implicit と、より specific なローカル / companion の優先順位を nsc と完全一致させてはいない。inherited / nested companion / 型コンストラクタ companion は探索する。`no implicit` / `ambiguous implicit` は hard error）
+- パス依存型（`p.T` / `this.A` / `T.type`）。型射影 `T#A` と抽象型メンバーは実装済み
+- 構造的 refinement としての `T { def x }` の型（匿名クラスの合成 classfile は出す）
 - コンパイラプラグイン
 - Scala 3 構文 / TASTy / XML リテラル
 - 境界付き存在型（`_ <: T`、`forSome { type X <: Bound }`、`forSome { val x: T }`）。よくある unbounded `List[_]` / `T forSome { type X }` は実装済み
-- 構造的 refinement としての `T { def x }` の型（匿名クラスの合成 classfile は出す）
 - クラス / 高階型パラメータの view bounds（メソッドの `T <% Ordered[T]` は実装済み）
 
 ライブラリ:
@@ -317,8 +320,11 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `abstract_override.scala` | `abstract override` の super 連鎖 | `B-A-base` |
 | `predef_more.scala` | `any2stringadd` / `implicitly` / `identity` / `locally` | `1x` `41` `42` `here` |
 | `sealed_non_exhaustive.scala` | 非網羅 match（warning。実行は覆っている入力だけ） | `3` |
+| `type_member.scala` | 抽象型メンバー `type A`、`type A = Int`、`Bar#A` | `41` `42` |
+| `self_type.scala` | `self: Foo =>` の mixin と self type メンバー | `15` |
+| `variance.scala` | `class Box[+A](val value: A)` | `42` |
 
-implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` / `implicit_ambiguous_parents.scala` のコンパイル失敗で見ています。境界付き存在型は `existential_bounds.scala` で診断します。クラス型パラメータの view bounds は `view_bounds_class.scala` で診断します。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします（vals / パラメータ付き defs / 型パラメータを pickle から読む）。`scalac` が PATH にあれば、同じ classfile に対して 2.13 が tiny file を typecheck することを見ます。この環境には `scalac` は入っていません。コンパイルを成功扱いにしていません。
+implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` / `implicit_ambiguous_parents.scala` のコンパイル失敗で見ています。境界付き存在型は `existential_bounds.scala` で診断します。クラス型パラメータの view bounds は `view_bounds_class.scala` で診断します。パス依存型は `type_proj_bad.scala`、self type の不正 mixin は `self_type_bad.scala`、共変パラメータの `var` は `variance_bad.scala`、高階 / 境界付き型メンバーは `type_member_hk.scala` / `type_member_bounds.scala` で診断します。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします（vals / パラメータ付き defs / 型パラメータを pickle から読む）。`scalac` 2.13 は PATH、`/tmp/scala-2.13.16`、または公式 tarball（約 20MB）で取れれば、同じ classfile に対して tiny file（`Lib.greet("Scala", "!")`）を typecheck します。full nsc pickle ではないので、scalac から見た defaults / vals / 型引数までは主張しません。取れなければスキップします。コンパイルを成功扱いにしていません。
 
 ## ライセンス
 

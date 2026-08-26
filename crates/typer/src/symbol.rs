@@ -13,6 +13,7 @@ pub enum SymKind {
     Method,
     Term,
     TypeParam,
+    TypeMember,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +70,8 @@ pub struct Symbol {
     pub tparams: Vec<SymbolId>,
     /// Direct subclasses / objects of a sealed parent (same compilation unit).
     pub children: Vec<SymbolId>,
+    /// Self type (`trait T { self: Foo => }`).
+    pub self_type: Option<Type>,
 }
 
 impl Symbol {
@@ -136,7 +139,6 @@ impl SymbolTable {
                 flags: Flags::EMPTY,
                 ty: Type::NoType,
                 members: vec![],
-                children: vec![],
                 jvm_name: String::new(),
                 intrinsic: Intrinsic::None,
                 params: vec![],
@@ -145,6 +147,8 @@ impl SymbolTable {
                 parents: vec![],
                 default_rhs: None,
                 tparams: vec![],
+                children: vec![],
+                self_type: None,
             }],
             scopes: vec![Scope::default()],
             root: SymbolId(0),
@@ -208,6 +212,7 @@ impl SymbolTable {
             default_rhs: None,
             tparams: vec![],
             children: vec![],
+            self_type: None,
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {
@@ -261,8 +266,13 @@ impl SymbolTable {
                     out.push(*m);
                 }
             }
-            for p in &sym.parents.clone() {
-                if let Some(ps) = self.class_sym_of(p) {
+            for m in &sym.parents.clone() {
+                if let Some(ps) = self.class_sym_of(m) {
+                    work.push(ps);
+                }
+            }
+            if let Some(st) = &sym.self_type {
+                if let Some(ps) = self.class_sym_of(st) {
                     work.push(ps);
                 }
             }
@@ -290,6 +300,7 @@ impl SymbolTable {
                 .into_iter()
                 .find(|s| self.get(*s).is_class_like()),
             Type::TypeParam(_) => None,
+            Type::TypeMember(_) => None,
             Type::Wildcard => Some(self.any_sym),
             _ => None,
         }
@@ -473,7 +484,9 @@ impl SymbolTable {
                 .iter()
                 .any(|p| self.is_sub_type(p, b)),
             (Type::TypeParam(a), Type::TypeParam(b)) if a == b => true,
+            (Type::TypeMember(a), Type::TypeMember(b)) if a == b => true,
             (Type::TypeParam(_), Type::AnyRef | Type::AnyVal) => true,
+            (Type::TypeMember(_), Type::AnyRef | Type::AnyVal) => true,
             (Type::Wildcard, Type::AnyRef | Type::AnyVal | Type::Wildcard) => true,
             (_, Type::Wildcard) => true,
             (
@@ -516,6 +529,10 @@ impl SymbolTable {
             }
             Type::ModuleRef(id) => self.get(*id).name.clone(),
             Type::TypeParam(id) => self.get(*id).name.clone(),
+            Type::TypeMember(id) => {
+                let s = self.get(*id);
+                format!("{}.{}", self.get(s.owner).name, s.name)
+            },
             Type::Array(t) => format!("Array[{}]", self.display_type(t)),
             Type::Method { paramss, ret } => {
                 let mut s = String::new();
@@ -560,6 +577,59 @@ impl SymbolTable {
         parts.reverse();
         parts.join("/")
     }
+
+    /// Replace abstract type members with aliases defined on `from` (and parents).
+    pub fn expand_type_members(&self, from: SymbolId, ty: &Type) -> Type {
+        match ty {
+            Type::TypeMember(id) => {
+                let name = self.get(*id).name.clone();
+                for m in self.lookup_member(from, &name) {
+                    if self.get(m).kind == SymKind::TypeMember {
+                        let t = self.get(m).ty.clone();
+                        if matches!(t, Type::TypeMember(_) | Type::NoType | Type::Error) {
+                            return Type::TypeMember(m);
+                        }
+                        return self.expand_type_members(from, &t);
+                    }
+                }
+                ty.clone()
+            }
+            Type::Class { sym, args } => Type::Class {
+                sym: *sym,
+                args: args
+                    .iter()
+                    .map(|a| self.expand_type_members(from, a))
+                    .collect(),
+            },
+            Type::Array(t) => Type::Array(Box::new(self.expand_type_members(from, t))),
+            Type::Function { params, ret } => Type::Function {
+                params: params
+                    .iter()
+                    .map(|p| self.expand_type_members(from, p))
+                    .collect(),
+                ret: Box::new(self.expand_type_members(from, ret)),
+            },
+            Type::Method { paramss, ret } => Type::Method {
+                paramss: paramss
+                    .iter()
+                    .map(|ps| {
+                        ps.iter()
+                            .map(|p| self.expand_type_members(from, p))
+                            .collect()
+                    })
+                    .collect(),
+                ret: Box::new(self.expand_type_members(from, ret)),
+            },
+            Type::ByName(t) => Type::ByName(Box::new(self.expand_type_members(from, t))),
+            Type::Repeated(t) => Type::Repeated(Box::new(self.expand_type_members(from, t))),
+            Type::Tuple(ts) => Type::Tuple(
+                ts.iter()
+                    .map(|t| self.expand_type_members(from, t))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
 }
 
 impl Default for SymbolTable {
@@ -575,6 +645,7 @@ fn subst_map(ty: &Type, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> Typ
             .position(|t| t == id)
             .and_then(|i| args.get(i).cloned())
             .unwrap_or_else(|| ty.clone()),
+        Type::TypeMember(_) => ty.clone(),
         Type::Class { sym, args: as_ } => Type::Class {
             sym: *sym,
             args: as_.iter().map(|a| subst_map(a, tps, args)).collect(),

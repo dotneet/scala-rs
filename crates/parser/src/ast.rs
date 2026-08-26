@@ -44,6 +44,8 @@ impl Flags {
     pub const ACCESSOR: Flags = Flags(1 << 17);
     pub const CONSTRUCTOR: Flags = Flags(1 << 18);
     pub const PACKAGE: Flags = Flags(1 << 19);
+    pub const COVARIANT: Flags = Flags(1 << 20);
+    pub const CONTRAVARIANT: Flags = Flags(1 << 21);
 
     pub fn contains(self, f: Flags) -> bool {
         self.0 & f.0 != 0
@@ -161,6 +163,8 @@ pub enum Type {
     ModuleRef(SymbolId),
     /// A type parameter (`T` in `def id[T](x: T): T`).
     TypeParam(SymbolId),
+    /// Abstract type member (`trait Foo { type A }`). Aliases expand away.
+    TypeMember(SymbolId),
     /// Unbounded wildcard existential `_` (as in `List[_]`).
     Wildcard,
 }
@@ -280,6 +284,7 @@ impl fmt::Display for Type {
             }
             Type::ModuleRef(s) => write!(f, "module#{}", s.0),
             Type::TypeParam(s) => write!(f, "tparam#{}", s.0),
+            Type::TypeMember(s) => write!(f, "tmem#{}", s.0),
             Type::Wildcard => write!(f, "_"),
         }
     }
@@ -323,6 +328,7 @@ impl Tree {
             TreeKind::DefDef { name, .. } => Some(name),
             TreeKind::TypeDef { name, .. } => Some(name),
             TreeKind::Bind { name, .. } => Some(name),
+            TreeKind::SelectFromTypeTree { name, .. } => Some(name),
             _ => None,
         }
     }
@@ -477,6 +483,9 @@ pub enum TreeKind {
     SelectFromTypeTree {
         qual: Box<Tree>,
         name: String,
+        /// `true` for `T#A` (type projection). `false` for `T.A` after a type
+        /// (path-dependent / nested select from a type).
+        hash: bool,
     },
     CompoundTypeTree {
         parents: Vec<Tree>,

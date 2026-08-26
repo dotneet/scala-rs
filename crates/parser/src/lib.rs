@@ -246,4 +246,37 @@ object Main {
             r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn type_projection_and_variance_parse() {
+        let t = parse_ok(
+            r#"
+trait Foo { type A }
+class C[+A](val x: A)
+class D[-A](x: A)
+object Main {
+  def f(n: Foo#A): Foo#A = n
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("SelectFromType #A"), "{dump}");
+        assert!(dump.contains("TypeDef +A"), "{dump}");
+        assert!(dump.contains("TypeDef -A"), "{dump}");
+    }
+
+    #[test]
+    fn self_type_parses() {
+        let t = parse_ok(
+            r#"
+trait Foo { def n: Int }
+trait Add { self: Foo =>
+  def plus(x: Int): Int = x + n
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Trait Add"), "{dump}");
+        assert!(dump.contains("DefDef plus"), "{dump}");
+    }
 }

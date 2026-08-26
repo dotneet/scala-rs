@@ -853,4 +853,98 @@ object Main extends A with B {
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn type_member_and_projection() {
+        ok(r#"
+trait Foo { type A; def x: A }
+class Bar extends Foo { type A = Int; def x: A = 41 }
+object Main {
+  def fromProj(n: Bar#A): Int = n + 1
+  def main(args: Array[String]): Unit = {
+    val n: Int = new Bar().x
+    val m: Int = fromProj(n)
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn path_dependent_type_is_diagnosed() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait Foo { type A }
+class Bar extends Foo { type A = Int; def x: A = 1 }
+object Main {
+  def bad(c: Bar): c.A = c.x
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("path-dependent")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn self_type_ok_and_illegal_inheritance() {
+        ok(r#"
+trait Foo { def n: Int = 10 }
+trait Add { self: Foo => def plus(x: Int): Int = x + n }
+class C extends Foo with Add
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = new C().plus(5)
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait Foo { def n: Int = 10 }
+trait Add { self: Foo => def plus(x: Int): Int = x + n }
+class Bad extends Add
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("illegal inheritance")
+                || d.message.contains("self-type")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn variance_ok_and_mutable_field_rejected() {
+        ok(r#"
+class Box[+A](val value: A) { def get: A = value }
+object Main {
+  def main(args: Array[String]): Unit = {
+    val b: Box[Int] = new Box(41)
+    val n: Int = b.get
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str("class Bad[+A](var x: A)\n");
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("covariant")
+                && d.message.contains("contravariant")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn higher_kinded_type_member_is_diagnosed() {
+        let (_, _, diags) = typecheck_str("trait T { type F[_] }\n");
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unimplemented")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
 }
