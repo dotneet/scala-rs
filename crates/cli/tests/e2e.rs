@@ -553,6 +553,11 @@ fn fixtures_implicit_class() {
 }
 
 #[test]
+fn fixtures_dynamic() {
+    check("dynamic");
+}
+
+#[test]
 fn fixtures_postfix_ops() {
     check("postfix_ops");
 }

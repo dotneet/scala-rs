@@ -332,6 +332,10 @@ impl SymbolTable {
                 .iter()
                 .find_map(|p| self.class_sym_of(p))
                 .or(Some(self.anyref_sym)),
+            Type::Tuple(ts) if !ts.is_empty() => self
+                .lookup(&format!("Tuple{}", ts.len()))
+                .into_iter()
+                .find(|s| self.get(*s).is_class_like()),
             _ => None,
         }
     }

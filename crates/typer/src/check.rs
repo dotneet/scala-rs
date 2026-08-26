@@ -2315,14 +2315,6 @@ impl Typer {
             tree.ty = Type::Error;
             return;
         }
-        if let Type::Tuple(ts) = &qual.ty {
-            if let Some(i) = tuple_elem_index(&name) {
-                if let Some(elem) = ts.get(i) {
-                    tree.ty = elem.clone();
-                    return;
-                }
-            }
-        }
         let refined_term = match &qual.ty {
             Type::Refined { decls, .. } => {
                 let from_term = decls.iter().any(|d| {
@@ -2426,12 +2418,15 @@ impl Typer {
             tree.ty = Type::Error;
             return;
         }
+        let subst_args: Vec<Type> = match &qual.ty {
+            Type::Class { args, .. } => args.clone(),
+            Type::Tuple(ts) => ts.clone(),
+            _ => Vec::new(),
+        };
         let subst = |ty: Type| -> Type {
-            if let Type::Class { args, .. } = &qual.ty {
-                if !args.is_empty() {
-                    if let Some(owner) = found.first().map(|s| self.st.get(*s).owner) {
-                        return self.st.subst_tparams(owner, args, &ty);
-                    }
+            if !subst_args.is_empty() {
+                if let Some(owner) = found.first().map(|s| self.st.get(*s).owner) {
+                    return self.st.subst_tparams(owner, &subst_args, &ty);
                 }
             }
             ty
@@ -2458,10 +2453,7 @@ impl Typer {
         } else {
             tree.sym = found[0];
             let owner = self.st.get(found[0]).owner;
-            let args = match &qual.ty {
-                Type::Class { args, .. } => args.clone(),
-                _ => vec![],
-            };
+            let args = subst_args.clone();
             tree.ty = Type::Overload(
                 found
                     .iter()
@@ -6528,11 +6520,6 @@ fn is_implicit_conversion_shape(vparamss: &[Vec<Tree>]) -> bool {
         n_non_impl += clause.len();
     }
     n_non_impl == 1
-}
-
-fn tuple_elem_index(name: &str) -> Option<usize> {
-    let n: usize = name.strip_prefix('_')?.parse().ok()?;
-    n.checked_sub(1)
 }
 
 /// nsc: `T: C` means implicit evidence of type `C[T]`.
