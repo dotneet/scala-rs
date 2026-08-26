@@ -6,5 +6,5 @@ pub mod gen;
 pub mod runtime;
 
 pub use classfile::EmittedClass;
-pub use gen::emit;
+pub use gen::{emit, emit_opts, EmitOpts};
 pub use runtime::emit_runtime;

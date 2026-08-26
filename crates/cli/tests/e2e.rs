@@ -27,19 +27,19 @@ fn expected_stdout(name: &str) -> String {
     fs::read_to_string(fixtures_dir().join("expected").join(format!("{name}.txt"))).unwrap()
 }
 
-fn compile_fixture(name: &str) -> PathBuf {
+fn compile_fixture_with(name: &str, extra: &[&str]) -> PathBuf {
     let src = fixtures_dir().join(format!("{name}.scala"));
     let out = tmp_dir(name);
-    let status = Command::new(bin())
-        .args([
-            "compile",
-            src.to_str().unwrap(),
-            "-d",
-            out.to_str().unwrap(),
-        ])
-        .status()
-        .expect("run scala-rs compile");
-    assert!(status.success(), "compile {name} failed");
+    let mut cmd = Command::new(bin());
+    cmd.args([
+        "compile",
+        src.to_str().unwrap(),
+        "-d",
+        out.to_str().unwrap(),
+    ]);
+    cmd.args(extra);
+    let status = cmd.status().expect("run scala-rs compile");
+    assert!(status.success(), "compile {name} failed extra={extra:?}");
     assert!(
         out.join("Main.class").is_file(),
         "Main.class missing in {}",
@@ -51,6 +51,10 @@ fn compile_fixture(name: &str) -> PathBuf {
         out.display()
     );
     out
+}
+
+fn compile_fixture(name: &str) -> PathBuf {
+    compile_fixture_with(name, &[])
 }
 
 fn java_available() -> bool {
@@ -250,6 +254,57 @@ fn scala_library_jar() -> Option<PathBuf> {
 
 #[test]
 fn scala_library_dual_run_hello() {
+    dual_run_fixture("hello");
+}
+
+#[test]
+fn scala_library_dual_run_option_for() {
+    dual_run_fixture("option_for");
+}
+
+#[test]
+fn scala_library_dual_run_list_for() {
+    dual_run_fixture("list_for");
+}
+
+#[test]
+fn scala_library_dual_run_predef() {
+    dual_run_fixture("predef");
+}
+
+#[test]
+fn scala_library_dual_run_unapply() {
+    dual_run_fixture("unapply");
+}
+
+const LIBRARY_COLLIDERS: &[&str] = &[
+    "scala/Option.class",
+    "scala/Some.class",
+    "scala/Some$.class",
+    "scala/None$.class",
+    "scala/Function0.class",
+    "scala/Function1.class",
+    "scala/Tuple2.class",
+    "scala/NotImplementedError.class",
+    "scala/collection/immutable/List.class",
+    "scala/collection/immutable/$colon$colon.class",
+    "scala/collection/immutable/Nil$.class",
+    "scala/collection/immutable/List$.class",
+    "scala/runtime/ArrowAssoc.class",
+];
+
+fn assert_no_private_stdlib(out: &Path) {
+    for rel in LIBRARY_COLLIDERS {
+        let p = out.join(rel);
+        assert!(
+            !p.is_file(),
+            "library ABI must not emit {} (would collide with scala-library.jar)",
+            p.display()
+        );
+    }
+}
+
+fn dual_run_fixture(name: &str) {
     if !java_available() {
         return;
     }
@@ -257,7 +312,9 @@ fn scala_library_dual_run_hello() {
         eprintln!("skip scala-library dual-run: jar not obtainable");
         return;
     };
-    let out = compile_fixture("hello");
+    let jar_s = jar.to_str().unwrap();
+    let out = compile_fixture_with(name, &["--scala-library", jar_s]);
+    assert_no_private_stdlib(&out);
     let cp = format!("{}:{}", out.display(), jar.display());
     let output = Command::new("java")
         .args(["-cp", &cp, "Main"])
@@ -265,12 +322,13 @@ fn scala_library_dual_run_hello() {
         .expect("java");
     assert!(
         output.status.success(),
-        "java -cp out:scala-library failed: {}",
+        "java -cp out:scala-library failed for {name}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        expected_stdout("hello")
+        expected_stdout(name),
+        "stdout mismatch for library dual-run {name}"
     );
     let _ = fs::remove_dir_all(&out);
 }

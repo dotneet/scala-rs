@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use scala_rs_backend::{emit, emit_runtime};
+use scala_rs_backend::{emit_opts, emit_runtime, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{erase, find_mains, typecheck_opts, SymbolTable, TypecheckOptions};
@@ -21,6 +21,10 @@ pub struct CompileOptions {
     pub typer_dump: bool,
     /// `-Xfatal-warnings`: promote warnings (e.g. non-exhaustive match) to errors.
     pub fatal_warnings: bool,
+    /// When set, bytecode targets scala-library 2.13 on this jar (do not emit
+    /// private Option/List/FunctionN stand-ins). The path is also added to the
+    /// `java -cp` of [`run_main`] callers that pass it through.
+    pub scala_library: Option<PathBuf>,
 }
 
 impl Default for CompileOptions {
@@ -30,6 +34,7 @@ impl Default for CompileOptions {
             parse_only: false,
             typer_dump: false,
             fatal_warnings: false,
+            scala_library: None,
         }
     }
 }
@@ -174,11 +179,16 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         };
     }
 
-    let mut emitted = emit_runtime();
+    let library_abi = opts.scala_library.is_some();
+    let mut emitted = if library_abi {
+        Vec::new()
+    } else {
+        emit_runtime()
+    };
     for u in &units {
         let st = u.st.as_ref().expect("unit is typed");
         let src_name = source_file_name(&sources[u.file_index]);
-        emitted.extend(emit(&u.tree, st, src_name));
+        emitted.extend(emit_opts(&u.tree, st, src_name, EmitOpts { library_abi }));
     }
 
     if let Err(e) = write_emitted(&emitted, &opts.out_dir) {
@@ -232,7 +242,7 @@ fn class_path(out_dir: &Path, internal_name: &str) -> PathBuf {
     dest
 }
 
-/// Run `java -cp out_dir main_class args...`.
+/// Run `java -cp out_dir[:extra...] main_class args...`.
 ///
 /// `main_class` may be an internal name (`foo/Bar`); slashes are converted to
 /// dots for the JVM (`foo.Bar`).
@@ -241,13 +251,32 @@ pub fn run_main(
     main_class: &str,
     args: &[String],
 ) -> std::io::Result<std::process::Output> {
+    run_main_with_cp(out_dir, &[], main_class, args)
+}
+
+/// Like [`run_main`], with extra classpath entries (e.g. scala-library.jar).
+pub fn run_main_with_cp(
+    out_dir: &Path,
+    extra_cp: &[PathBuf],
+    main_class: &str,
+    args: &[String],
+) -> std::io::Result<std::process::Output> {
     let dotted = main_class.replace('/', ".");
     Command::new("java")
         .arg("-cp")
-        .arg(out_dir)
+        .arg(java_classpath(out_dir, extra_cp))
         .arg(&dotted)
         .args(args)
         .output()
+}
+
+fn java_classpath(out_dir: &Path, extra_cp: &[PathBuf]) -> String {
+    let mut cp = out_dir.as_os_str().to_string_lossy().into_owned();
+    for p in extra_cp {
+        cp.push(':');
+        cp.push_str(&p.to_string_lossy());
+    }
+    cp
 }
 
 #[cfg(test)]
@@ -350,6 +379,7 @@ object Main {
             parse_only: false,
             typer_dump: false,
             fatal_warnings: false,
+            scala_library: None,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());
@@ -390,6 +420,7 @@ object Main {
             parse_only: true,
             typer_dump: false,
             fatal_warnings: false,
+            scala_library: None,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "{}", result.render_diags());
@@ -407,10 +438,51 @@ object Main {
             parse_only: false,
             typer_dump: false,
             fatal_warnings: false,
+            scala_library: None,
         };
         let result = compile_paths(&[src], &opts);
         assert!(!result.ok());
         assert!(result.emitted.is_empty());
         assert!(result.diags.iter().any(|d| d.message.contains("not found")));
+    }
+
+    #[test]
+    fn library_abi_skips_private_runtime() {
+        let tmp = fresh_dir();
+        let src = tmp.0.join("Lib.scala");
+        std::fs::write(
+            &src,
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val xs = 1 :: Nil
+    println(Some(xs).isEmpty)
+  }
+}
+"#,
+        )
+        .unwrap();
+        let opts = CompileOptions {
+            out_dir: tmp.0.join("out"),
+            parse_only: false,
+            typer_dump: false,
+            fatal_warnings: false,
+            scala_library: Some(PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar")),
+        };
+        let result = compile_paths(&[src], &opts);
+        assert!(result.ok(), "compile failed:\n{}", result.render_diags());
+        assert!(
+            result
+                .emitted
+                .iter()
+                .all(|c| !c.internal_name.starts_with("scala/")),
+            "emitted {:?}",
+            result
+                .emitted
+                .iter()
+                .map(|c| c.internal_name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(result.emitted.iter().any(|c| c.internal_name == "Main$"));
     }
 }
