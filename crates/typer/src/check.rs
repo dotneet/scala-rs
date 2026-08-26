@@ -795,14 +795,32 @@ impl Typer {
                 Type::ModuleRef(c) => c,
                 _ => m,
             };
+            let class_ty = Type::Class {
+                sym: class_id,
+                args: vec![],
+            };
+            let unapply_ret = match ctor_param_tys.len() {
+                0 => Type::Boolean,
+                1 => Type::Class {
+                    sym: self.st.option_sym,
+                    args: vec![ctor_param_tys[0].clone()],
+                },
+                _ => Type::Class {
+                    sym: self.st.option_sym,
+                    args: vec![Type::Tuple(ctor_param_tys.to_vec())],
+                },
+            };
             for mem in self.st.get(cls).members.clone() {
-                if self.st.get(mem).name == "apply" {
+                let n = self.st.get(mem).name.clone();
+                if n == "apply" {
                     self.st.get_mut(mem).ty = Type::Method {
                         paramss: vec![ctor_param_tys.to_vec()],
-                        ret: Box::new(Type::Class {
-                            sym: class_id,
-                            args: vec![],
-                        }),
+                        ret: Box::new(class_ty.clone()),
+                    };
+                } else if n == "unapply" {
+                    self.st.get_mut(mem).ty = Type::Method {
+                        paramss: vec![vec![class_ty.clone()]],
+                        ret: Box::new(unapply_ret.clone()),
                     };
                 }
             }
@@ -1188,7 +1206,9 @@ impl Typer {
         match &tree.kind {
             TreeKind::ValDef { .. } => self.type_val_body(tree),
             TreeKind::DefDef { .. } => self.type_def_body(tree),
-            TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } | TreeKind::TypeDef { .. } => {}
+            TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } | TreeKind::TypeDef { .. } => {
+                self.check_stored_annotations(tree);
+            }
             TreeKind::Import { .. } => self.type_import(tree),
             _ => {
                 self.type_stat(tree);
@@ -1284,6 +1304,7 @@ impl Typer {
             self.adapt(rhs, &declared);
             tree.ty = declared;
         }
+        self.check_stored_annotations(tree);
     }
 
     fn type_def_sig(&mut self, tree: &mut Tree) {
@@ -1637,6 +1658,7 @@ impl Typer {
         }
         self.st.owner = saved_owner;
         self.st.pop_scope();
+        self.check_stored_annotations(tree);
     }
 
     fn type_stat(&mut self, tree: &mut Tree) {
@@ -1834,6 +1856,31 @@ impl Typer {
                 tree.ty = Type::Unit;
             }
             TreeKind::Assign { lhs, rhs } => {
+                if matches!(lhs.kind, TreeKind::Apply { .. }) {
+                    let lhs = std::mem::replace(lhs.as_mut(), Tree::dummy(TreeKind::Empty));
+                    let rhs = std::mem::replace(rhs.as_mut(), Tree::dummy(TreeKind::Empty));
+                    let (fun, mut args) = match lhs.kind {
+                        TreeKind::Apply { fun, args } => (*fun, args),
+                        _ => unreachable!(),
+                    };
+                    args.push(rhs);
+                    let update = Tree {
+                        id: lhs.id,
+                        span: lhs.span,
+                        kind: TreeKind::Select {
+                            qual: Box::new(fun),
+                            name: "update".into(),
+                        },
+                        ty: Type::NoType,
+                        sym: SymbolId::NONE,
+                    };
+                    tree.kind = TreeKind::Apply {
+                        fun: Box::new(update),
+                        args,
+                    };
+                    self.type_expr(tree, pt);
+                    return;
+                }
                 self.type_expr(lhs, &Type::NoType);
                 if structural_select_lhs(lhs) {
                     self.error(tree.span, "unimplemented: structural update");
@@ -2274,6 +2321,19 @@ impl Typer {
             tree.sym = s;
             let ty = expand(subst(self.st.get(s).ty.clone()));
             tree.ty = self.maybe_auto_apply(ty, pt);
+            if let Type::Array(elem) = &qual.ty {
+                if name == "apply" {
+                    tree.ty = Type::Method {
+                        paramss: vec![vec![Type::Int]],
+                        ret: Box::new((**elem).clone()),
+                    };
+                } else if name == "update" {
+                    tree.ty = Type::Method {
+                        paramss: vec![vec![Type::Int, (**elem).clone()]],
+                        ret: Box::new(Type::Unit),
+                    };
+                }
+            }
         } else {
             tree.sym = found[0];
             let owner = self.st.get(found[0]).owner;
@@ -2570,6 +2630,7 @@ impl Typer {
         // Expected type Method so nullary methods (`unary_-`, `def f: Int` called as `f()`)
         // are not auto-applied before this Apply is typed.
         self.type_expr(fun, &dummy_method);
+        self.rewrite_ident_array_apply(fun);
         self.reorder_named_args(args, fun);
 
         let recv_ty = match &fun.kind {
@@ -3471,6 +3532,11 @@ impl Typer {
                             (**ret).clone(),
                         ));
                     }
+                }
+            }
+            Type::Array(elem) => {
+                for m in self.st.lookup_member(self.st.array_sym, "apply") {
+                    cands.push((m, vec![Type::Int], (**elem).clone()));
                 }
             }
             _ => return OverloadPick::None,
@@ -5151,6 +5217,228 @@ impl Typer {
                 tree.ty = Type::Error;
             }
         }
+    }
+
+    fn rewrite_ident_array_apply(&mut self, fun: &mut Tree) {
+        if matches!(&fun.kind, TreeKind::Select { .. }) {
+            return;
+        }
+        if !matches!(&fun.ty, Type::Array(_)) {
+            return;
+        }
+        let span = fun.span;
+        let id = fun.id;
+        let qual = std::mem::replace(fun, Tree::dummy(TreeKind::Empty));
+        *fun = Tree {
+            id,
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(qual),
+                name: "apply".into(),
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+        self.type_select(fun, &Type::Method {
+            paramss: vec![],
+            ret: Box::new(Type::NoType),
+        });
+    }
+
+    fn check_stored_annotations(&mut self, tree: &Tree) {
+        let mods = match &tree.kind {
+            TreeKind::DefDef { mods, .. }
+            | TreeKind::ValDef { mods, .. }
+            | TreeKind::ClassDef { mods, .. }
+            | TreeKind::ModuleDef { mods, .. }
+            | TreeKind::TypeDef { mods, .. } => mods,
+            _ => return,
+        };
+        for a in &mods.annotations {
+            let path = a.annotation_path();
+            if is_tailrec_annot(&path) {
+                if !matches!(&tree.kind, TreeKind::DefDef { .. }) {
+                    self.error(
+                        tree.span,
+                        "could not optimize @tailrec annotated method: not a method",
+                    );
+                } else {
+                    self.check_tailrec(tree);
+                }
+            }
+        }
+    }
+
+    fn check_tailrec(&mut self, tree: &Tree) {
+        let rhs = match &tree.kind {
+            TreeKind::DefDef { rhs, .. } => rhs.as_ref(),
+            _ => return,
+        };
+        if !self.tailrec_effectively_final(tree.sym) {
+            self.error(
+                tree.span,
+                "could not optimize @tailrec annotated method: it is neither private nor final so can be overridden",
+            );
+            return;
+        }
+        if rhs.is_empty() {
+            self.error(
+                tree.span,
+                "could not optimize @tailrec annotated method: it contains no recursive calls",
+            );
+            return;
+        }
+        let mut tail = 0;
+        let mut nontail = 0;
+        count_tailrec_calls(rhs, tree.sym, true, &mut tail, &mut nontail);
+        if nontail > 0 {
+            self.error(
+                tree.span,
+                "could not optimize @tailrec annotated method: it contains a recursive call not in tail position",
+            );
+        } else if tail == 0 {
+            self.error(
+                tree.span,
+                "could not optimize @tailrec annotated method: it contains no recursive calls",
+            );
+        }
+    }
+
+    fn tailrec_effectively_final(&self, meth: SymbolId) -> bool {
+        if meth.is_none() {
+            return true;
+        }
+        let s = self.st.get(meth);
+        if s.flags.contains(Flags::FINAL)
+            || s.flags.contains(Flags::PRIVATE)
+            || s.flags.contains(Flags::LOCAL)
+        {
+            return true;
+        }
+        let owner = s.owner;
+        if owner.is_none() {
+            return true;
+        }
+        let o = self.st.get(owner);
+        matches!(o.kind, SymKind::Module | SymKind::ModuleClass)
+            || o.flags.contains(Flags::MODULE)
+            || o.flags.contains(Flags::FINAL)
+    }
+}
+
+fn is_tailrec_annot(path: &str) -> bool {
+    matches!(
+        path,
+        "tailrec" | "annotation.tailrec" | "scala.annotation.tailrec"
+    )
+}
+
+fn is_rec_apply(tree: &Tree, meth: SymbolId) -> bool {
+    match &tree.kind {
+        TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } => {
+            rec_fun_is_method(fun, meth)
+        }
+        _ => false,
+    }
+}
+
+fn rec_fun_is_method(tree: &Tree, meth: SymbolId) -> bool {
+    if meth.is_none() {
+        return false;
+    }
+    match &tree.kind {
+        TreeKind::TypeApply { fun, .. } => rec_fun_is_method(fun, meth),
+        TreeKind::Ident { .. } => tree.sym == meth,
+        TreeKind::Select { .. } => tree.sym == meth,
+        _ => tree.sym == meth,
+    }
+}
+
+fn count_tailrec_calls(tree: &Tree, meth: SymbolId, tail: bool, n_tail: &mut u32, n_nontail: &mut u32) {
+    if is_rec_apply(tree, meth) {
+        if tail {
+            *n_tail += 1;
+        } else {
+            *n_nontail += 1;
+        }
+        match &tree.kind {
+            TreeKind::Apply { args, .. } => {
+                for a in args {
+                    count_tailrec_calls(a, meth, false, n_tail, n_nontail);
+                }
+            }
+            TreeKind::TypeApply { fun, .. } => {
+                if let TreeKind::Apply { args, .. } = &fun.kind {
+                    for a in args {
+                        count_tailrec_calls(a, meth, false, n_tail, n_nontail);
+                    }
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    match &tree.kind {
+        TreeKind::If { cond, thenp, elsep } => {
+            count_tailrec_calls(cond, meth, false, n_tail, n_nontail);
+            count_tailrec_calls(thenp, meth, tail, n_tail, n_nontail);
+            count_tailrec_calls(elsep, meth, tail, n_tail, n_nontail);
+        }
+        TreeKind::Block { stats, expr } => {
+            for s in stats {
+                count_tailrec_calls(s, meth, false, n_tail, n_nontail);
+            }
+            count_tailrec_calls(expr, meth, tail, n_tail, n_nontail);
+        }
+        TreeKind::Match { selector, cases } => {
+            count_tailrec_calls(selector, meth, false, n_tail, n_nontail);
+            for c in cases {
+                if !c.guard.is_empty() {
+                    count_tailrec_calls(&c.guard, meth, false, n_tail, n_nontail);
+                }
+                count_tailrec_calls(&c.body, meth, tail, n_tail, n_nontail);
+            }
+        }
+        TreeKind::Apply { fun, args } => {
+            count_tailrec_calls(fun, meth, false, n_tail, n_nontail);
+            for a in args {
+                count_tailrec_calls(a, meth, false, n_tail, n_nontail);
+            }
+        }
+        TreeKind::TypeApply { fun, args } => {
+            count_tailrec_calls(fun, meth, tail, n_tail, n_nontail);
+            let _ = args;
+        }
+        TreeKind::Select { qual, .. } => count_tailrec_calls(qual, meth, false, n_tail, n_nontail),
+        TreeKind::Typed { expr, .. } => count_tailrec_calls(expr, meth, tail, n_tail, n_nontail),
+        TreeKind::Assign { lhs, rhs } => {
+            count_tailrec_calls(lhs, meth, false, n_tail, n_nontail);
+            count_tailrec_calls(rhs, meth, false, n_tail, n_nontail);
+        }
+        TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
+            count_tailrec_calls(cond, meth, false, n_tail, n_nontail);
+            count_tailrec_calls(body, meth, false, n_tail, n_nontail);
+        }
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            count_tailrec_calls(block, meth, false, n_tail, n_nontail);
+            for c in catches {
+                count_tailrec_calls(&c.body, meth, false, n_tail, n_nontail);
+            }
+            if !finalizer.is_empty() {
+                count_tailrec_calls(finalizer, meth, false, n_tail, n_nontail);
+            }
+        }
+        TreeKind::Function { body, .. } => {
+            count_tailrec_calls(body, meth, false, n_tail, n_nontail);
+        }
+        TreeKind::Return { expr } | TreeKind::Throw { expr } => {
+            count_tailrec_calls(expr, meth, false, n_tail, n_nontail);
+        }
+        _ => {}
     }
 }
 

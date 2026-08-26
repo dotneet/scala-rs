@@ -3366,29 +3366,21 @@ fn gen_apply(
     } else {
         Vec::new()
     };
-    let repeated = param_tys.last().and_then(|p| match p {
-        Type::Repeated(t) => Some((**t).clone()),
-        _ => None,
-    });
-    if let Some(elem) = repeated {
-        gen_wrap_varargs(asm, frame, ctx, args, &elem);
-    } else {
-        for (i, a) in args.iter().enumerate() {
-            gen_expr(asm, frame, ctx, a);
-            if value_owner.is_some() {
-                let pty = param_tys.get(i).unwrap_or(&a.ty);
-                if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
-                    emit_box(asm, &a.ty);
-                }
-            }
-        }
-    }
+    gen_call_args(asm, frame, ctx, args, &param_tys, value_owner.is_some());
     if let TreeKind::Select { qual, name } = &fun.kind {
         if name == "apply" && matches!(qual.ty, Type::Array(_)) {
-            asm.aaload();
-            if matches!(tree.ty, Type::String) {
+            let elem = match &qual.ty {
+                Type::Array(e) => e.as_ref(),
+                _ => &tree.ty,
+            };
+            emit_array_load(asm, elem);
+            if matches!(elem, Type::String) {
                 asm.checkcast("java/lang/String");
             }
+            return;
+        }
+        if name == "update" && matches!(qual.ty, Type::Array(_)) {
+            emit_array_store(asm, &qual.ty);
             return;
         }
     }
@@ -3613,6 +3605,21 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
         }
         if name == "newArray" && owner == "scala/reflect/ClassTag" {
             asm.invokeinterface(&owner, "newArray", "(I)Ljava/lang/Object;");
+            if let Some(ty) = result_ty {
+                if let Type::Array(elem) = ty {
+                    if is_concrete_array_elem(elem) {
+                        asm.checkcast(&jvm_desc(ctx.st, ty));
+                    }
+                }
+            }
+            return;
+        }
+        if owner == "scala/Array$" && name == "apply" {
+            asm.invokevirtual(
+                "scala/Array$",
+                "apply",
+                "(Lscala/collection/immutable/Seq;Lscala/reflect/ClassTag;)Ljava/lang/Object;",
+            );
             if let Some(ty) = result_ty {
                 if let Type::Array(elem) = ty {
                     if is_concrete_array_elem(elem) {
@@ -4310,6 +4317,60 @@ fn gen_wrap_varargs(
             "wrapRefArray",
             "([Ljava/lang/Object;)Lscala/collection/immutable/ArraySeq;",
         );
+    }
+}
+
+fn gen_call_args(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    args: &[Tree],
+    param_tys: &[Type],
+    box_prims: bool,
+) {
+    let rep_idx = param_tys.iter().position(|p| matches!(p, Type::Repeated(_)));
+    let Some(ri) = rep_idx else {
+        for (i, a) in args.iter().enumerate() {
+            gen_expr(asm, frame, ctx, a);
+            if box_prims {
+                let pty = param_tys.get(i).unwrap_or(&a.ty);
+                if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
+                    emit_box(asm, &a.ty);
+                }
+            }
+        }
+        return;
+    };
+    let n_after = param_tys.len() - ri - 1;
+    let n_var = args.len().saturating_sub(ri + n_after);
+    for a in &args[..ri.min(args.len())] {
+        gen_expr(asm, frame, ctx, a);
+    }
+    let var_end = (ri + n_var).min(args.len());
+    let var_args = if ri <= var_end { &args[ri..var_end] } else { &[] };
+    let elem = match &param_tys[ri] {
+        Type::Repeated(t) => t.as_ref(),
+        _ => &Type::Any,
+    };
+    gen_wrap_varargs(asm, frame, ctx, var_args, elem);
+    for a in &args[var_end..] {
+        gen_expr(asm, frame, ctx, a);
+    }
+}
+
+fn emit_array_load(asm: &mut Assembler, elem: &Type) {
+    match elem {
+        Type::Int | Type::Boolean => asm.iaload(),
+        _ => asm.aaload(),
+    }
+}
+
+fn emit_array_store(asm: &mut Assembler, arr_ty: &Type) {
+    match arr_ty {
+        Type::Array(elem) if matches!(elem.as_ref(), Type::Int | Type::Boolean) => {
+            asm.iastore();
+        }
+        _ => asm.aastore(),
     }
 }
 

@@ -579,9 +579,23 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         t => erase_ty(t, st),
     };
     tree.ty = erase_ty(&orig, st);
+    let array_prim_load = match &tree.kind {
+        TreeKind::Apply { fun, .. } => match &fun.kind {
+            TreeKind::Select { qual, name } if name == "apply" => match &qual.ty {
+                Type::Array(elem) => is_primitive(elem),
+                _ => false,
+            },
+            _ => false,
+        },
+        _ => false,
+    };
     if is_primitive(&orig) && is_ref_erased(&ret_erased) && !matches!(orig, Type::Unit) {
-        tree.ty = ret_erased;
-        wrap_unbox(tree, orig);
+        if array_prim_load {
+            tree.ty = orig;
+        } else {
+            tree.ty = ret_erased;
+            wrap_unbox(tree, orig);
+        }
     } else if matches!(orig, Type::String)
         && is_ref_erased(&ret_erased)
         && !matches!(ret_erased, Type::String)
@@ -617,6 +631,22 @@ fn method_param_types(st: &SymbolTable, fun: &Tree) -> Vec<Type> {
         }
     }
     if !fun.sym.is_none() {
+        let owner = st.get(fun.sym).owner;
+        if owner == st.array_sym {
+            match &fun.ty {
+                Type::Method { paramss, .. } => {
+                    return paramss
+                        .iter()
+                        .flatten()
+                        .map(|p| erase_ty(p, st))
+                        .collect();
+                }
+                Type::Function { params, .. } => {
+                    return params.iter().map(|p| erase_ty(p, st)).collect();
+                }
+                _ => {}
+            }
+        }
         match &st.get(fun.sym).ty {
             Type::Method { paramss, .. } => {
                 return paramss.iter().flatten().cloned().collect();

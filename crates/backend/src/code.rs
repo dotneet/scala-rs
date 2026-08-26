@@ -853,6 +853,13 @@ impl Assembler {
         self.push_v(elem);
     }
 
+    pub fn iaload(&mut self) {
+        self.emit_op(0x2e);
+        let _ = self.pop_v();
+        let _ = self.pop_v();
+        self.push_v(VType::Integer);
+    }
+
     /// `anewarray class` — count → array ref.
     pub fn anewarray(&mut self, class: &str) {
         let i = self.pool.class(class);

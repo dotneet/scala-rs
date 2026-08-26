@@ -64,10 +64,12 @@ impl Flags {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Modifiers {
     pub flags: Flags,
     pub private_within: Option<String>,
+    /// `@tailrec` / `@deprecated` / others, as parsed annotation trees.
+    pub annotations: Vec<Tree>,
 }
 
 impl Default for Modifiers {
@@ -75,6 +77,7 @@ impl Default for Modifiers {
         Modifiers {
             flags: Flags::EMPTY,
             private_within: None,
+            annotations: Vec::new(),
         }
     }
 }
@@ -84,6 +87,7 @@ impl Modifiers {
         Modifiers {
             flags,
             private_within: None,
+            annotations: Vec::new(),
         }
     }
 }
@@ -408,6 +412,23 @@ impl Tree {
             TreeKind::Bind { name, .. } => Some(name),
             TreeKind::SelectFromTypeTree { name, .. } => Some(name),
             _ => None,
+        }
+    }
+
+    /// Dotted constructor path of an annotation tree (`scala.annotation.tailrec`).
+    pub fn annotation_path(&self) -> String {
+        match &self.kind {
+            TreeKind::Ident { name } => name.clone(),
+            TreeKind::Select { qual, name } => {
+                let p = qual.annotation_path();
+                if p.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{p}.{name}")
+                }
+            }
+            TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } => fun.annotation_path(),
+            _ => self.name().unwrap_or("").to_string(),
         }
     }
 }

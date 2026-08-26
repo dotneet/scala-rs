@@ -193,8 +193,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     add_partial_function(st);
     if library_abi {
         add_list_collect(st);
-        add_classtag(st, jclass);
+        let ct = add_classtag(st, jclass);
         add_string_context(st);
+        add_array_companion(st, ct);
     }
     let ordered = add_ordered(st);
 
@@ -2209,7 +2210,7 @@ fn implicit_getter(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) 
     id
 }
 
-fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) {
+fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
     let reflect = st.alloc(
         "reflect",
         st.scala_pkg,
@@ -2260,6 +2261,7 @@ fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) {
     implicit_getter(st, mc, "Null", tag(Type::Null));
     let mems = st.get(mc).members.clone();
     st.get_mut(ctm).members.extend(mems);
+    ct
 }
 
 fn add_string_context(st: &mut SymbolTable) {
@@ -2296,4 +2298,47 @@ fn add_string_context(st: &mut SymbolTable) {
     );
     let mems = st.get(mc).members.clone();
     st.get_mut(scm).members.extend(mems);
+}
+
+/// `scala.Array` companion from scala-library. Do not emit `Array$.class`.
+fn add_array_companion(st: &mut SymbolTable, ct: SymbolId) {
+    let am = module(st, st.scala_pkg, "Array", "scala/Array$");
+    let mc = st.module_class_of(am);
+    let apply = method(
+        st,
+        mc,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        Type::Array(Box::new(Type::Any)),
+        Intrinsic::None,
+    );
+    let t = type_param(st, apply, "T");
+    let xs = st.alloc("xs", apply, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(xs).ty = Type::Repeated(Box::new(Type::TypeParam(t)));
+    let ev = st.alloc(
+        "evidence$1",
+        apply,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(ev).ty = Type::Class {
+        sym: ct,
+        args: vec![Type::TypeParam(t)],
+    };
+    st.get_mut(apply).tparams = vec![t];
+    st.get_mut(apply).params = vec![xs, ev];
+    st.get_mut(apply).paramss = vec![vec![xs], vec![ev]];
+    st.get_mut(apply).ty = Type::Method {
+        paramss: vec![
+            vec![Type::Repeated(Box::new(Type::TypeParam(t)))],
+            vec![Type::Class {
+                sym: ct,
+                args: vec![Type::TypeParam(t)],
+            }],
+        ],
+        ret: Box::new(Type::Array(Box::new(Type::TypeParam(t)))),
+    };
+    let mems = st.get(mc).members.clone();
+    st.get_mut(am).members.extend(mems);
 }

@@ -120,6 +120,14 @@ fn fixtures_factorial() {
     check("factorial");
 }
 #[test]
+fn fixtures_tailrec() {
+    check("tailrec");
+}
+#[test]
+fn fixtures_deprecated() {
+    check("deprecated");
+}
+#[test]
 fn fixtures_trait_impl() {
     check("trait_impl");
 }
@@ -492,6 +500,16 @@ fn fixtures_type_member_bounds_is_error() {
     compile_fails("type_member_bounds", "unimplemented");
 }
 
+#[test]
+fn fixtures_tailrec_bad_is_error() {
+    compile_fails("tailrec_bad", "tailrec");
+}
+
+#[test]
+fn fixtures_annot_bad_is_error() {
+    compile_fails("annot_bad", "annotation");
+}
+
 fn scala_library_jar() -> Option<PathBuf> {
     let cached = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
     if cached.is_file() {
@@ -673,6 +691,11 @@ fn scala_library_dual_run_custom_interp() {
     dual_run_fixture("custom_interp");
 }
 
+#[test]
+fn scala_library_dual_run_array_ops() {
+    dual_run_fixture("array_ops");
+}
+
 const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Option.class",
     "scala/Some.class",
@@ -722,6 +745,7 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/util/Success$.class",
     "scala/util/Failure.class",
     "scala/util/Failure$.class",
+    "scala/Array$.class",
 ];
 
 fn assert_no_private_stdlib(out: &Path) {
@@ -1040,10 +1064,11 @@ fn find_scalac() -> Option<PathBuf> {
 /// scalac 2.13 against our classfiles. Tries PATH, `/tmp/scala-2.13.16`, then a
 /// small official tarball download. Probes a `val`, a `def` with params,
 /// `id[T]`, a `case class` via companion apply `Point(3, 4)` / term `Point`
-/// (`MODULE$`) plus field accessors, and an `object` method taking that case
-/// class. Remaining pickle holes (existentials, annotation args, `unapply`,
-/// complete Flags) are not claimed. If scalac cannot read a probed shape, this
-/// test fails rather than claiming success.
+/// (`MODULE$`) plus field accessors, extractor `unapply` so `p match { case
+/// Point(a, b) => a + b }` typechecks, and an `object` method taking that case
+/// class. Remaining pickle holes (existentials, annotation args, complete Flags)
+/// are not claimed. If scalac cannot read a probed shape, this test fails rather
+/// than claiming success.
 #[test]
 fn scalac_typechecks_against_our_classfiles_if_present() {
     let Some(scalac) = find_scalac() else {
@@ -1081,6 +1106,7 @@ object UseLib {
     val b: String = new Box("hi").get
     val p: Point = Point(3, 4)
     val q: Int = p.x + p.y
+    val m: Int = p match { case Point(a, b) => a + b }
     val sum: Int = Lib.add(Point(1, 2))
   }
 }

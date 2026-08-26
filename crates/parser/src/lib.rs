@@ -388,4 +388,46 @@ class C {
             other => panic!("{other:?}"),
         }
     }
+
+    #[test]
+    fn tailrec_and_deprecated_annotations_parse() {
+        let t = parse_ok(
+            r#"
+object M {
+  @tailrec
+  def sum(n: Int, acc: Int): Int = if (n <= 0) acc else sum(n - 1, acc + n)
+  @deprecated("old")
+  def f(): Int = 1
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("DefDef sum"), "{dump}");
+        fn find_def<'a>(t: &'a Tree, want: &str) -> Option<&'a Tree> {
+            match &t.kind {
+                TreeKind::PackageDef { stats, .. } => stats.iter().find_map(|s| find_def(s, want)),
+                TreeKind::ModuleDef { impl_, .. } | TreeKind::ClassDef { impl_, .. } => {
+                    impl_.body.iter().find_map(|s| find_def(s, want))
+                }
+                TreeKind::DefDef { name, .. } if name == want => Some(t),
+                _ => None,
+            }
+        }
+        let sum = find_def(&t, "sum").expect("sum");
+        match &sum.kind {
+            TreeKind::DefDef { mods, .. } => {
+                assert_eq!(mods.annotations.len(), 1, "{mods:?}");
+                assert_eq!(mods.annotations[0].annotation_path(), "tailrec");
+            }
+            other => panic!("{other:?}"),
+        }
+        let f = find_def(&t, "f").expect("f");
+        match &f.kind {
+            TreeKind::DefDef { mods, .. } => {
+                assert_eq!(mods.annotations.len(), 1, "{mods:?}");
+                assert_eq!(mods.annotations[0].annotation_path(), "deprecated");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }
