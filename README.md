@@ -84,7 +84,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - リテラル、タプル
 - 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）
 - 存在型のよくある形: `List[_]`、`T forSome { type X }`、`List[_]` を取るメソッド。ワイルドカードは Object 相当に erase する。境界付き `_ <: T` や `forSome { val … }` は診断する（黙って捨てない）
-- compiled class/object に **ScalaSignature**（`RuntimeVisibleAnnotations` + pickle subset）。`javap -v` で見える。自前 unpickler が読める範囲で `-cp` による別コンパイルができる。nsc 完全 pickle ではないが、`val` / パラメータ付き `def` / 型パラメータ `id[T]` は scalac 2.13.16 が読める形（NOPREFIXtpe、scala/java.lang ExtRef、POLYtpe は restpe 先行、val はゲッター）
+- compiled class/object に **ScalaSignature**（`RuntimeVisibleAnnotations` + pickle subset）。`javap -v` で見える。自前 unpickler が読める範囲で `-cp` による別コンパイルができる。nsc 完全 pickle ではないが、ワイヤ形式は nsc と同じ（nentries、tag/len、ビッグエンディアン Nat）。`val` / パラメータ付き `def` / 型パラメータ `id[T]` は scalac 2.13.16 が読める形（object は CLASSsym+MODULE、`<empty>` / scala / java.lang の EXTMODCLASSref、POLYtpe は restpe 先行、val は NullaryMethodType ゲッター）
 - `s"..."` 文字列補間
 - `lazy val`
 - implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む。候補が複数あるときは nsc 風の **more-specific**（結果型の subtype）が勝つ。まだ曖昧なら `ambiguous implicit`。目標型が `A => B` で `A <: B` のときは nsc と同様 identity view を合成する（view bound の呼び出し側）
@@ -210,7 +210,7 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 言語:
 
 - マクロ
-- full nsc pickle（existentials / アノテーション引数 / 完全な Flags。出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / MODULEsym / VALsym / EXTref / EXTMODCLASSref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe / NOPREFIXtpe のサブセット。ByteCodecs は SID-10。vals は nsc と同じ METHOD|STABLE|ACCESSOR ゲッター、POLYtpe は restpe 先行。scalac 2.13.16 が `val` / パラメータ付き `def` / `id[T]` を typecheck できる範囲）
+- full nsc pickle（existentials / アノテーション引数 / 完全な Flags。出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / VALsym / EXTref / EXTMODCLASSref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe / TYPEBOUNDStpe / THIStpe / NOPREFIXtpe のサブセット。ByteCodecs は SID-10。ワイヤ形式は nsc と同じ nentries + ビッグエンディアン Nat。vals は METHOD|STABLE|ACCESSOR ゲッター + NullaryMethodType。scalac 2.13.16 が `val` / パラメータ付き `def` / `id[T]` を typecheck できる範囲）
 - implicit の more-specific のエッジ（親同士の優先の細部、ネストした型コンストラクタ companion の残り）
 
 対象外（診断する / パースしない）:

@@ -475,6 +475,10 @@ impl SymbolTable {
                 Type::AnyRef,
             ) => true,
             (Type::Class { sym: s1, .. }, Type::Class { sym: s2, .. }) if s1 == s2 => true,
+            (a, Type::Refined { parents, decls }) => {
+                parents.iter().all(|p| self.is_sub_type(a, p))
+                    && self.conforms_to_refinement(a, decls)
+            }
             (Type::Class { sym: s1, .. }, b) => self
                 .get(*s1)
                 .parents
@@ -512,10 +516,6 @@ impl SymbolTable {
             }
             (Type::ByName(a), Type::ByName(b)) => self.is_sub_type(a, b),
             (Type::Repeated(a), Type::Repeated(b)) => self.is_sub_type(a, b),
-            (a, Type::Refined { parents, decls }) => {
-                parents.iter().all(|p| self.is_sub_type(a, p))
-                    && self.conforms_to_refinement(a, decls)
-            }
             (Type::Refined { parents, .. }, b) => {
                 parents.iter().any(|p| self.is_sub_type(p, b))
             }
