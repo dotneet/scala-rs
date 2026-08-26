@@ -2769,10 +2769,12 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
                     pop_if_value(asm, &expr.ty);
                 }
                 emit_return(asm, &ctx.ret_ty);
-                push_default(asm, &tree.ty);
+                // Dead code after `return` still needs a dummy for the method
+                // epilogue (and for StackMapTable at the next instruction).
+                push_default(asm, &ctx.ret_ty);
             } else {
                 emit_nonlocal_return(asm, frame, ctx, expr);
-                push_default(asm, &tree.ty);
+                push_default(asm, &ctx.ret_ty);
             }
         }
         TreeKind::Throw { expr } => {
