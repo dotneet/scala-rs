@@ -23,6 +23,9 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
         emit_list(),
         emit_cons(),
         emit_nil(),
+        emit_tuple2(),
+        emit_arrow_assoc(),
+        emit_not_implemented(),
     ]
 }
 
@@ -766,5 +769,102 @@ fn emit_nil() -> EmittedClass {
             asm.athrow();
         },
     );
+    b.finish()
+}
+
+fn emit_tuple2() -> EmittedClass {
+    let mut b = B::class("scala/Tuple2", "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_SUPER;
+    b.fields.push(Field {
+        access: ACC_PUBLIC | ACC_FINAL,
+        name: "_1".into(),
+        desc: "Ljava/lang/Object;".into(),
+    });
+    b.fields.push(Field {
+        access: ACC_PUBLIC | ACC_FINAL,
+        name: "_2".into(),
+        desc: "Ljava/lang/Object;".into(),
+    });
+    b.add_code(
+        ACC_PUBLIC,
+        "<init>",
+        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        3,
+        |asm| {
+            asm.aload(0);
+            asm.invokespecial("java/lang/Object", "<init>", "()V");
+            asm.aload(0);
+            asm.aload(1);
+            asm.putfield("scala/Tuple2", "_1", "Ljava/lang/Object;");
+            asm.aload(0);
+            asm.aload(2);
+            asm.putfield("scala/Tuple2", "_2", "Ljava/lang/Object;");
+            asm.vreturn();
+        },
+    );
+    b.finish()
+}
+
+fn emit_arrow_assoc() -> EmittedClass {
+    let mut b = B::class("scala/runtime/ArrowAssoc", "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_SUPER;
+    b.fields.push(Field {
+        access: ACC_PUBLIC | ACC_FINAL,
+        name: "self".into(),
+        desc: "Ljava/lang/Object;".into(),
+    });
+    b.add_code(ACC_PUBLIC, "<init>", "(Ljava/lang/Object;)V", 2, |asm| {
+        asm.aload(0);
+        asm.invokespecial("java/lang/Object", "<init>", "()V");
+        asm.aload(0);
+        asm.aload(1);
+        asm.putfield("scala/runtime/ArrowAssoc", "self", "Ljava/lang/Object;");
+        asm.vreturn();
+    });
+    b.add_code(
+        ACC_PUBLIC,
+        "->",
+        "(Ljava/lang/Object;)Lscala/Tuple2;",
+        2,
+        |asm| {
+            asm.new_obj("scala/Tuple2");
+            asm.dup();
+            asm.aload(0);
+            asm.getfield("scala/runtime/ArrowAssoc", "self", "Ljava/lang/Object;");
+            asm.aload(1);
+            asm.invokespecial(
+                "scala/Tuple2",
+                "<init>",
+                "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            );
+            asm.areturn();
+        },
+    );
+    b.finish()
+}
+
+fn emit_not_implemented() -> EmittedClass {
+    let mut b = B::class("scala/NotImplementedError", "java/lang/RuntimeException");
+    b.access = ACC_PUBLIC | ACC_SUPER;
+    b.add_code(ACC_PUBLIC, "<init>", "()V", 1, |asm| {
+        asm.aload(0);
+        asm.ldc_string("an implementation is missing");
+        asm.invokespecial(
+            "java/lang/RuntimeException",
+            "<init>",
+            "(Ljava/lang/String;)V",
+        );
+        asm.vreturn();
+    });
+    b.add_code(ACC_PUBLIC, "<init>", "(Ljava/lang/String;)V", 2, |asm| {
+        asm.aload(0);
+        asm.aload(1);
+        asm.invokespecial(
+            "java/lang/RuntimeException",
+            "<init>",
+            "(Ljava/lang/String;)V",
+        );
+        asm.vreturn();
+    });
     b.finish()
 }

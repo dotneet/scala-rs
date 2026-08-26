@@ -34,6 +34,13 @@ pub enum Intrinsic {
     IntToLong,
     IntToDouble,
     LongToDouble,
+    Assert,
+    Require,
+    NotImplemented,
+    StringToInt,
+    StringToLong,
+    StringToDouble,
+    WrapArrowAssoc,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +63,8 @@ pub struct Symbol {
     pub default_rhs: Option<scala_rs_parser::Tree>,
     /// Class or method type parameters, in order.
     pub tparams: Vec<SymbolId>,
+    /// Direct subclasses / objects of a sealed parent (same compilation unit).
+    pub children: Vec<SymbolId>,
 }
 
 impl Symbol {
@@ -122,6 +131,7 @@ impl SymbolTable {
                 flags: Flags::EMPTY,
                 ty: Type::NoType,
                 members: vec![],
+                children: vec![],
                 jvm_name: String::new(),
                 intrinsic: Intrinsic::None,
                 params: vec![],
@@ -191,6 +201,7 @@ impl SymbolTable {
             parents: vec![],
             default_rhs: None,
             tparams: vec![],
+            children: vec![],
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {
@@ -315,6 +326,93 @@ impl SymbolTable {
                 args: vec![],
             },
         }
+    }
+
+    /// `class C(val x: T) extends AnyVal` — one ctor param, parent AnyVal.
+    pub fn is_value_class(&self, id: SymbolId) -> bool {
+        if id.is_none() {
+            return false;
+        }
+        let s = self.get(id);
+        if s.kind != SymKind::Class
+            || s.flags.contains(Flags::TRAIT)
+            || s.flags.contains(Flags::INTERFACE)
+            || s.ctor_fields.len() != 1
+        {
+            return false;
+        }
+        s.parents.iter().any(|p| {
+            matches!(p, Type::AnyVal)
+                || self.class_sym_of(p).is_some_and(|c| c == self.anyval_sym)
+        })
+    }
+
+    pub fn value_class_underlying(&self, id: SymbolId) -> Option<Type> {
+        if !self.is_value_class(id) {
+            return None;
+        }
+        let f = self.get(id).ctor_fields[0];
+        Some(self.get(f).ty.clone())
+    }
+
+    pub fn is_sealed(&self, id: SymbolId) -> bool {
+        !id.is_none() && self.get(id).flags.contains(Flags::SEALED)
+    }
+
+    /// Concrete leaves of a sealed hierarchy (case classes, objects, non-sealed classes).
+    pub fn sealed_leaves(&self, id: SymbolId) -> Vec<SymbolId> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        fn rec(
+            st: &SymbolTable,
+            id: SymbolId,
+            out: &mut Vec<SymbolId>,
+            seen: &mut std::collections::HashSet<u32>,
+        ) {
+            if !seen.insert(id.0) {
+                return;
+            }
+            let children = st.get(id).children.clone();
+            if children.is_empty() {
+                let s = st.get(id);
+                if s.kind == SymKind::Class
+                    && (s.flags.contains(Flags::TRAIT) || s.flags.contains(Flags::ABSTRACT))
+                    && s.flags.contains(Flags::SEALED)
+                {
+                    return;
+                }
+                out.push(id);
+                return;
+            }
+            for c in children {
+                let cs = st.get(c);
+                if cs.flags.contains(Flags::SEALED)
+                    && (cs.flags.contains(Flags::TRAIT)
+                        || cs.flags.contains(Flags::ABSTRACT)
+                        || cs.kind == SymKind::Class)
+                    && !cs.children.is_empty()
+                {
+                    rec(st, c, out, seen);
+                } else {
+                    out.push(c);
+                }
+            }
+        }
+        rec(self, id, &mut out, &mut seen);
+        out
+    }
+
+    pub fn enclosing_class_named(&self, from: SymbolId, name: &str) -> Option<SymbolId> {
+        let mut cur = from;
+        while !cur.is_none() {
+            let s = self.get(cur);
+            let n = s.name.trim_end_matches('$');
+            if n == name && s.is_class_like() {
+                return Some(cur);
+            }
+            cur = s.owner;
+        }
+        None
     }
 
     pub fn is_sub_type(&self, a: &Type, b: &Type) -> bool {

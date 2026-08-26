@@ -17,8 +17,18 @@ fn erase_symbols(st: &mut SymbolTable) {
     let n = st.symbols.len();
     for i in 1..n {
         let id = SymbolId(i as u32);
+        let kind = st.get(id).kind;
+        if matches!(
+            kind,
+            crate::symbol::SymKind::Class
+                | crate::symbol::SymKind::Module
+                | crate::symbol::SymKind::ModuleClass
+                | crate::symbol::SymKind::Package
+        ) {
+            continue;
+        }
         let ty = st.get(id).ty.clone();
-        st.get_mut(id).ty = erase_type(&ty);
+        st.get_mut(id).ty = erase_ty(&ty, st);
     }
 }
 
@@ -54,6 +64,49 @@ pub fn erase_type(ty: &Type) -> Type {
         },
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(erase_type).collect()),
         Type::Overload(alts) => Type::Overload(alts.iter().map(erase_type).collect()),
+        other => other.clone(),
+    }
+}
+
+fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
+    match ty {
+        Type::Class { sym, .. } if st.is_value_class(*sym) => {
+            if let Some(u) = st.value_class_underlying(*sym) {
+                erase_ty(&u, st)
+            } else {
+                Type::Any
+            }
+        }
+        Type::TypeParam(_) => Type::Any,
+        Type::Class { sym, .. } => Type::Class {
+            sym: *sym,
+            args: vec![],
+        },
+        Type::Named { name, args } if name == "Array" && args.len() == 1 => {
+            Type::Array(Box::new(erase_ty(&args[0], st)))
+        }
+        Type::Named { name, .. } => Type::Named {
+            name: name.clone(),
+            args: vec![],
+        },
+        Type::Array(t) => Type::Array(Box::new(erase_ty(t, st))),
+        Type::Function { params, ret } => Type::Function {
+            params: params.iter().map(|p| erase_ty(p, st)).collect(),
+            ret: Box::new(erase_ty(ret, st)),
+        },
+        Type::Method { paramss, ret } => Type::Method {
+            paramss: paramss
+                .iter()
+                .map(|ps| ps.iter().map(|p| erase_ty(p, st)).collect())
+                .collect(),
+            ret: Box::new(erase_ty(ret, st)),
+        },
+        Type::ByName(t) => Type::Function {
+            params: vec![],
+            ret: Box::new(erase_ty(t, st)),
+        },
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| erase_ty(t, st)).collect()),
+        Type::Overload(alts) => Type::Overload(alts.iter().map(|t| erase_ty(t, st)).collect()),
         other => other.clone(),
     }
 }
@@ -128,7 +181,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             let pt = if tree.ty.is_no_type() {
                 None
             } else {
-                Some(erase_type(&tree.ty))
+                Some(erase_ty(&tree.ty, st))
             };
             erase_tree(rhs, st, pt.as_ref());
         }
@@ -149,7 +202,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             }
             erase_tree(tpt, st, None);
             let ret = match &tree.ty {
-                Type::Method { ret, .. } => Some(erase_type(ret)),
+                Type::Method { ret, .. } => Some(erase_ty(ret, st)),
                 _ => None,
             };
             erase_tree(rhs, st, ret.as_ref());
@@ -174,7 +227,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         }
         TreeKind::Assign { lhs, rhs } => {
             erase_tree(lhs, st, None);
-            let pt = erase_type(&lhs.ty);
+            let pt = erase_ty(&lhs.ty, st);
             erase_tree(rhs, st, Some(&pt));
         }
         TreeKind::Match { selector, cases } => {
@@ -192,7 +245,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 erase_tree(p, st, None);
             }
             let ret = match &tree.ty {
-                Type::Function { ret, .. } => Some(erase_type(ret)),
+                Type::Function { ret, .. } => Some(erase_ty(ret, st)),
                 _ => None,
             };
             erase_tree(body, st, ret.as_ref());
@@ -210,12 +263,32 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         }
         TreeKind::Typed { expr, tpt } => {
             erase_tree(tpt, st, None);
-            let pt = erase_type(&tree.ty);
+            let pt = erase_ty(&tree.ty, st);
             erase_tree(expr, st, Some(&pt));
         }
         TreeKind::Select { qual, .. } => {
             erase_tree(qual, st, None);
+            if !tree.sym.is_none() {
+                let owner = st.get(tree.sym).owner;
+                if st.is_value_class(owner)
+                    && st.get(owner).ctor_fields.first().copied() == Some(tree.sym)
+                {
+                    let q = std::mem::replace(qual, Box::new(Tree::dummy(TreeKind::Empty)));
+                    let mut inner = *q;
+                    inner.ty = erase_ty(&inner.ty, st);
+                    *tree = inner;
+                    adapt_box_unbox(tree, expected);
+                    return;
+                }
+            }
         }
+        TreeKind::UnApply { fun, args } => {
+            erase_tree(fun, st, None);
+            for a in args {
+                erase_tree(a, st, None);
+            }
+        }
+        TreeKind::Super { .. } | TreeKind::This { .. } => {}
         TreeKind::New { tpt } => {
             erase_tree(tpt, st, None);
         }
@@ -246,7 +319,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
     }
 
     let orig = tree.ty.clone();
-    tree.ty = erase_type(&orig);
+    tree.ty = erase_ty(&orig, st);
     adapt_box_unbox(tree, expected);
 }
 
@@ -259,9 +332,9 @@ fn erase_ident(tree: &mut Tree, st: &SymbolTable) {
         // `x` of type `=> T` becomes `x.apply()` after erasure to Function0.
         let span = tree.span;
         let inner_ty = match &tree.ty {
-            Type::ByName(t) => erase_type(t),
-            Type::Function { ret, .. } => erase_type(ret),
-            t => erase_type(t),
+            Type::ByName(t) => erase_ty(t, st),
+            Type::Function { ret, .. } => erase_ty(ret, st),
+            t => erase_ty(t, st),
         };
         let mut fun = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
         fun.ty = Type::Function {
@@ -282,6 +355,42 @@ fn erase_ident(tree: &mut Tree, st: &SymbolTable) {
 }
 
 fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
+    // `new Meter(x)` erases to `x` (the unique ctor arg) in the happy path.
+    {
+        let is_vc_new = match &tree.kind {
+            TreeKind::Apply { fun, args } if !args.is_empty() => {
+                if let TreeKind::New { .. } = &fun.kind {
+                    let cid = if fun.sym.is_none() {
+                        st.class_sym_of(&fun.ty)
+                    } else {
+                        Some(fun.sym)
+                    }
+                    .or_else(|| st.class_sym_of(&fun.ty));
+                    cid.is_some_and(|c| st.is_value_class(c))
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if is_vc_new {
+            let mut arg = match &mut tree.kind {
+                TreeKind::Apply { args, .. } => args.remove(0),
+                _ => return,
+            };
+            let under = match &tree.ty {
+                Type::Class { sym, .. } => st
+                    .value_class_underlying(*sym)
+                    .unwrap_or_else(|| Type::Any),
+                t => t.clone(),
+            };
+            erase_tree(&mut arg, st, Some(&erase_ty(&under, st)));
+            *tree = arg;
+            tree.ty = erase_ty(&under, st);
+            adapt_box_unbox(tree, expected);
+            return;
+        }
+    }
     let param_tys;
     let mut fun_ty;
     {
@@ -311,9 +420,9 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
     let orig = tree.ty.clone();
     let ret_erased = match &fun_ty {
         Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
-        t => erase_type(t),
+        t => erase_ty(t, st),
     };
-    tree.ty = erase_type(&orig);
+    tree.ty = erase_ty(&orig, st);
     if is_primitive(&orig) && is_ref_erased(&ret_erased) && !matches!(orig, Type::Unit) {
         wrap_unbox(tree, orig);
     } else if matches!(orig, Type::String)

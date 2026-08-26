@@ -272,4 +272,131 @@ object Main {
 }
 "#);
     }
+
+    #[test]
+    fn super_and_qualified_this_typecheck() {
+        ok(r#"
+class Base {
+  def greet(): String = "base"
+}
+class C extends Base {
+  def hi(): String = super.greet() + "!"
+}
+class Outer {
+  val name: String = "outer"
+  class Inner {
+    def who(): String = Outer.this.name
+  }
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val s: String = new C().hi()
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn sealed_match_exhaustive() {
+        ok(r#"
+sealed trait Color
+case class RGB(n: Int) extends Color
+case object Black extends Color
+object Main {
+  def show(c: Color): Int = c match {
+    case RGB(n) => n
+    case Black => 0
+  }
+  def main(args: Array[String]): Unit = {
+    val n: Int = show(Black)
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn sealed_match_non_exhaustive() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+sealed trait Color
+case class RGB(n: Int) extends Color
+case object Black extends Color
+object Main {
+  def show(c: Color): Int = c match {
+    case RGB(n) => n
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("may not be exhaustive")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("Black")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unapply_extractor_typechecks() {
+        ok(r#"
+object Even {
+  def unapply(n: Int): Option[Int] = if (n % 2 == 0) Some(n / 2) else None
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x: Int = 10 match {
+      case Even(half) => half
+      case _ => 0
+    }
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn missing_extractor_is_error() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = 1 match {
+      case Missing(n) => n
+      case _ => 0
+    }
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("extractor")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn value_class_and_predef_typecheck() {
+        ok(r#"
+class Meter(val n: Int) extends AnyVal {
+  def doubled: Int = n * 2
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val m = new Meter(21)
+    val d: Int = m.doubled
+    val len: Int = "42".length
+    val n: Int = "42".toInt
+    assert(true)
+    require(1 > 0)
+    val t = 1 -> "a"
+  }
+}
+"#);
+    }
 }

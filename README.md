@@ -81,6 +81,11 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - 名前付き引数（呼び出し側で並べ替え）
 - 具象メンバー付き trait の mixin（`T$class` 静的実装 + 線形化順のフォワーダ）
 - 内部クラス（`$outer`）とネストした object
+- `super` / 修飾付き `this`（`Outer.this`）。trait の `super` は `T$class` の static 実装へ
+- `sealed` 階層の match 網羅検査（不足はエラー。scalac 2.13 の warning より厳しい）
+- extractor の `unapply`（`Option` / `Boolean` / `Tuple2`。case class のコンストラクタパターンとは別経路）
+- `AnyVal` 値クラス（1 引数。生成は underlying へ erase。メソッドは `name$extension`）
+- Predef の一部: `assert` / `require` / `???` / ArrowAssoc の `->` / String の `length`・`toInt`（`toLong` / `toDouble` もある）
 
 フィクスチャで実際に動く範囲は README 末尾の表を見てください。
 
@@ -133,6 +138,37 @@ Java 6 には default method がないので、具象メンバー付き trait �
 
 フィールドに加えて `bitmap$0: Int` と、同期したアクセサを出します。初期化は最初の読み取りまで遅延します。
 
+### super / 修飾付き this
+
+`super.m(...)` はクラス親なら `invokespecial`、trait 親なら `T$class.m($this, ...)` です。線形化の「右端の親」を `super` の対象にします（`super[T]` の mixin 指定もパースして使います）。`Outer.this` は内部クラスの `$outer` を辿ります。
+
+スタック可能な trait の `super` 連鎖（`abstract override`）と、trait の `val` 初期化順は未実装です。
+
+### sealed と exhaustiveness
+
+同じコンパイル単位の `sealed` 子（case class / case object / class）を記録し、`match` が葉を覆っていないとエラーにします。
+
+```
+match may not be exhaustive. It would fail on the following input: …
+```
+
+scalac 2.13 は warning ですが、scala-rs はエラーです。ガード付き case は網羅に数えません。ワイルドカード / 小文字の変数は catch-all です。
+
+### unapply
+
+`Even(n)` のような extractor はコンパニオン（または object）の `unapply` を呼びます。戻りが `Option[T]` なら `isEmpty` / `get`、`Boolean` なら真偽、`Option[(A,B)]` なら `Tuple2` の `_1` / `_2` です。`unapply` が無いパターンは `not found: extractor` です。
+
+### AnyVal
+
+`class Meter(val n: Int) extends AnyVal` は、値の表現を underlying（ここでは `Int`）に erase します。`new Meter(x)` は `x` になり、`m.n` は `m` です。メソッドは `Meter.doubled$extension(n)` のような static です。Any として使うときの box（`Integer`）は、他のプリミティブと同じ erasure の box 挿入に従います。値クラスをラップする専用のヒープオブジェクトは、このパスでは出しません。
+
+### Predef（このスライス）
+
+- `assert(cond)` / `require(cond)`（第 2 引数の by-name メッセージあり）。失敗はそれぞれ `AssertionError` / `IllegalArgumentException`
+- `???` は `scala.NotImplementedError`（`RuntimeException` のサブクラス。scala-library のそれではない）
+- `any2ArrowAssoc` による `1 -> "a"`。結果はランタイムの `scala.Tuple2`
+- `"x".length` は `java.lang.String#length`。`toInt` / `toLong` / `toDouble` は `Integer.parseInt` など。**`StringOps` クラスは出していません。** String にメソッドを載せたサブセットです
+
 ## 実装していないもの
 
 次は実装していません。スタブで「動いたことにする」こともしていません。
@@ -141,8 +177,8 @@ Java 6 には default method がないので、具象メンバー付き trait �
 - コンパイラプラグイン
 - 完全な Scala 標準ライブラリ（ここにある Option / List は scala-rs ランタイムであり、scala-library ではない）
 - Scala 3 構文
-- implicit の優先度 / `Predef` の全変換 / `scala.Int` コンパニオンの enrichment
-- trait の `val` フィールド、`super`、スタック可能な trait 初期化
+- implicit の優先度 / `Predef` の全変換（`any2stringadd` など）/ `scala.Int` コンパニオンの enrichment
+- trait の `val` フィールド、スタック可能な trait 初期化、`abstract override`
 - 匿名クラス
 - XML リテラル
 - existential types
@@ -179,6 +215,10 @@ Cargo workspace のクレート:
 - **try**: Code 属性に例外テーブルを出します。StackMapTable はありません。
 - **ラムダ**: `FunctionN` を実装する合成クラス（`Main$$$anonfun$0` など）です。invokedynamic / LambdaMetaFactory は使いません（Java 6）。
 - **フェーズ**: nsc の uncurry / mixin / lambdaLift などの独立パスはありません。erasure とラムダのクロージャ変換はあります。
+- **sealed**: scalac は非網羅 match を warning にできます。scala-rs は hard error です。
+- **AnyVal**: scalac は値クラスのクラスファイルと拡張メソッドの両方を出します。scala-rs もクラスは出しますが、呼び出しは `$extension` 静的メソッドで、`new C(x)` は underlying に消えます。
+- **Predef / StringOps**: `assert` / `require` / `???` / `->` と String の `length`/`toInt` だけです。`StringOps` 型も `ArrowAssoc` のソース互換な標準ライブラリ実装もありません。
+- **unapplySeq / 可変長 extractor / 名前付き extractor パターン** はありません。
 
 scalac の代替ではありません。サブセットの再実装です。
 
@@ -212,6 +252,11 @@ cargo test
 | `try_catch.scala` | throw / catch / finally | `before` `caught` `finally` |
 | `nested_class.scala` | `class Outer { class Inner }` | `inner` |
 | `nested_object.scala` | `object Outer { object Inner }` | `nested` |
+| `super.scala` | クラス/`trait` の `super` と `Outer.this` | `base!` `T!` `outer` |
+| `sealed_match.scala` | sealed + case class/object の網羅 match | `3` `0` |
+| `unapply.scala` | `object Even { def unapply }` | `5` `-1` |
+| `value_class.scala` | `AnyVal` の `Meter` | `42` `21` |
+| `predef.scala` | `assert`/`require`/`toInt`/`->`/`???` | `2` `42` `1` `a` `nyi` |
 
 implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストで見ています。コンパイルを成功扱いにしていません。
 

@@ -18,6 +18,7 @@ pub struct Typer {
 pub fn typecheck(tree: &mut Tree, file_index: usize) -> (SymbolTable, Vec<Diagnostic>) {
     let mut t = Typer::new(file_index);
     t.namer(tree);
+    t.register_sealed_from_namer(tree);
     t.typer(tree);
     (t.st, t.diags)
 }
@@ -37,6 +38,11 @@ impl Typer {
     fn error(&mut self, span: Span, msg: impl Into<String>) {
         self.diags
             .push(Diagnostic::error(self.file_index, span, msg));
+    }
+
+    fn warning(&mut self, span: Span, msg: impl Into<String>) {
+        self.diags
+            .push(Diagnostic::warning(self.file_index, span, msg));
     }
 
     fn fresh(&mut self, prefix: &str) -> String {
@@ -391,6 +397,9 @@ impl Typer {
             Type::ModuleRef(c) => c,
             _ => m,
         };
+        if let TreeKind::ModuleDef { impl_, .. } = &tree.kind {
+            self.st.get_mut(cls).parents = self.rough_parents(&impl_.parents, false);
+        }
         let body = match &mut tree.kind {
             TreeKind::ModuleDef { impl_, .. } => &mut impl_.body,
             _ => return,
@@ -546,6 +555,7 @@ impl Typer {
         if !pts.is_empty() {
             self.st.get_mut(id).parents = pts;
         }
+        self.register_sealed_child(id);
         let mut ctor_param_tys = Vec::new();
         for clause in vparamss.iter_mut() {
             for p in clause.iter_mut() {
@@ -634,10 +644,19 @@ impl Typer {
             let n = self.st.get(mem).name.clone();
             self.st.enter_in_current(&n, mem);
         }
-        let body = match &mut tree.kind {
-            TreeKind::ModuleDef { impl_, .. } => &mut impl_.body,
+        let (body, parents) = match &mut tree.kind {
+            TreeKind::ModuleDef { impl_, .. } => (&mut impl_.body, &mut impl_.parents),
             _ => return,
         };
+        let mut pts = Vec::new();
+        for p in parents.iter_mut() {
+            self.type_expr(p, &Type::NoType);
+            pts.push(p.ty.clone());
+        }
+        if !pts.is_empty() {
+            self.st.get_mut(cls).parents = pts;
+        }
+        self.register_sealed_child(cls);
         for stt in body.iter_mut() {
             self.type_member_sig(stt);
         }
@@ -997,9 +1016,22 @@ impl Typer {
                     },
                 };
             }
-            TreeKind::This { .. } => {
-                tree.sym = self.st.this_class;
-                tree.ty = self.st.type_of_class(self.st.this_class);
+            TreeKind::This { qual } => {
+                let q = qual.clone();
+                let id = if let Some(name) = q {
+                    self.st
+                        .enclosing_class_named(self.st.this_class, &name)
+                        .unwrap_or(self.st.this_class)
+                } else {
+                    self.st.this_class
+                };
+                if id.is_none() {
+                    self.error(tree.span, "`this` is not allowed here");
+                    tree.ty = Type::Error;
+                } else {
+                    tree.sym = id;
+                    tree.ty = self.st.type_of_class(id);
+                }
             }
             TreeKind::Select { .. } => self.type_select(tree, pt),
             TreeKind::Apply { .. } => self.type_apply(tree, pt),
@@ -1027,7 +1059,14 @@ impl Typer {
                 self.adapt(cond, &Type::Boolean);
                 self.type_expr(thenp, pt);
                 self.type_expr(elsep, pt);
-                tree.ty = lub(&thenp.ty, &elsep.ty);
+                // `adapt` leaves the branch type as-is when it is a subtype of `pt`
+                // (`Some` stays `Some`, not `Option`). Structural lub cannot walk
+                // parents, so use the expected type when the typer has one.
+                tree.ty = if !pt.is_no_type() && !matches!(pt, Type::Nothing) {
+                    pt.clone()
+                } else {
+                    lub(&thenp.ty, &elsep.ty)
+                };
             }
             TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
                 self.type_expr(cond, &Type::Boolean);
@@ -1141,8 +1180,24 @@ impl Typer {
             TreeKind::Empty => {
                 tree.ty = Type::NoType;
             }
-            TreeKind::Super { .. } => {
-                tree.ty = Type::AnyRef;
+            TreeKind::Super { qual, mix } => {
+                let q = qual.clone();
+                let mix = mix.clone();
+                let this_id = if let Some(name) = q {
+                    self.st
+                        .enclosing_class_named(self.st.this_class, &name)
+                        .unwrap_or(self.st.this_class)
+                } else {
+                    self.st.this_class
+                };
+                let parent = self.super_target(this_id, mix.as_deref());
+                if parent.is_none() {
+                    self.error(tree.span, "`super` has no parent type");
+                    tree.ty = Type::AnyRef;
+                } else {
+                    tree.sym = parent;
+                    tree.ty = self.st.type_of_class(parent);
+                }
             }
             TreeKind::AppliedTypeTree { .. } => {
                 tree.ty = self.tree_to_type(tree);
@@ -1265,6 +1320,24 @@ impl Typer {
         }
         if found.is_empty() && name == "toString" {
             found = self.st.lookup_member(self.st.any_sym, "toString");
+        }
+        if found.is_empty() {
+            if let Some((conv, member, to)) = self.search_extension(&qual.ty, &name) {
+                let span = qual.span;
+                let old = std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty));
+                let fun = self.ref_implicit(conv, span);
+                **qual = Tree {
+                    id: old.id,
+                    span,
+                    kind: TreeKind::Apply {
+                        fun: Box::new(fun),
+                        args: vec![old],
+                    },
+                    ty: to,
+                    sym: conv,
+                };
+                found = vec![member];
+            }
         }
         if found.is_empty() {
             self.error(
@@ -2014,7 +2087,11 @@ impl Typer {
             res = lub(&res, &c.body.ty);
             self.st.pop_scope();
         }
+        let span = tree.span;
         tree.ty = if pt.is_no_type() { res } else { pt.clone() };
+        if let TreeKind::Match { cases, .. } = &tree.kind {
+            self.check_match_exhaustive(span, &sel_ty, cases);
+        }
     }
 
     fn type_case(&mut self, c: &mut CaseDef, pt: &Type) {
@@ -2085,24 +2162,92 @@ impl Typer {
                         .into_iter()
                         .find(|s| self.st.get(*s).kind == SymKind::Class)
                 });
-                let fields = class_id
-                    .map(|c| self.st.get(c).ctor_fields.clone())
-                    .unwrap_or_default();
-                let class_ty = class_id
-                    .map(|c| Type::Class {
+                let unapply = self.find_unapply(fun);
+                let use_ctor = class_id.is_some_and(|c| {
+                    let s = self.st.get(c);
+                    s.flags.contains(Flags::CASE) || !s.ctor_fields.is_empty()
+                });
+                if use_ctor {
+                    let class_id = class_id.unwrap();
+                    let fields = self.st.get(class_id).ctor_fields.clone();
+                    let class_ty = Type::Class {
+                        sym: class_id,
+                        args: vec![],
+                    };
+                    for (i, a) in args.iter_mut().enumerate() {
+                        let ft = fields
+                            .get(i)
+                            .map(|f| self.st.get(*f).ty.clone())
+                            .unwrap_or(Type::Any);
+                        self.type_pattern(a, &ft);
+                    }
+                    pat.ty = class_ty;
+                    pat.sym = class_id;
+                } else if let Some(u) = unapply {
+                    let extracted = self.unapply_extracted_types(u);
+                    if args.len() != extracted.len() && !extracted.is_empty() {
+                        self.error(
+                            pat.span,
+                            format!(
+                                "extractor {} expects {} argument(s), found {}",
+                                self.st.get(u).name,
+                                extracted.len(),
+                                args.len()
+                            ),
+                        );
+                    }
+                    for (i, a) in args.iter_mut().enumerate() {
+                        let ft = extracted.get(i).cloned().unwrap_or(Type::Any);
+                        self.type_pattern(a, &ft);
+                    }
+                    let fun = std::mem::replace(fun, Box::new(Tree::dummy(TreeKind::Empty)));
+                    let args = std::mem::take(args);
+                    pat.kind = TreeKind::UnApply { fun, args };
+                    pat.sym = u;
+                    pat.ty = sel_ty.clone();
+                } else if let Some(c) = class_id {
+                    let fields = self.st.get(c).ctor_fields.clone();
+                    for (i, a) in args.iter_mut().enumerate() {
+                        let ft = fields
+                            .get(i)
+                            .map(|f| self.st.get(*f).ty.clone())
+                            .unwrap_or(Type::Any);
+                        self.type_pattern(a, &ft);
+                    }
+                    pat.ty = Type::Class {
                         sym: c,
                         args: vec![],
-                    })
-                    .unwrap_or_else(|| sel_ty.clone());
+                    };
+                    pat.sym = c;
+                } else {
+                    self.error(
+                        pat.span,
+                        format!(
+                            "not found: extractor {}",
+                            fun.name().unwrap_or("<pattern>")
+                        ),
+                    );
+                    pat.ty = sel_ty.clone();
+                }
+            }
+            TreeKind::UnApply { fun, args } => {
+                self.type_expr(fun, &Type::NoType);
+                let u = if pat.sym.is_none() {
+                    self.find_unapply(fun).unwrap_or(SymbolId::NONE)
+                } else {
+                    pat.sym
+                };
+                let extracted = if u.is_none() {
+                    vec![Type::Any; args.len()]
+                } else {
+                    self.unapply_extracted_types(u)
+                };
                 for (i, a) in args.iter_mut().enumerate() {
-                    let ft = fields
-                        .get(i)
-                        .map(|f| self.st.get(*f).ty.clone())
-                        .unwrap_or(Type::Any);
+                    let ft = extracted.get(i).cloned().unwrap_or(Type::Any);
                     self.type_pattern(a, &ft);
                 }
-                pat.ty = class_ty;
-                pat.sym = class_id.unwrap_or(SymbolId::NONE);
+                pat.sym = u;
+                pat.ty = sel_ty.clone();
             }
             TreeKind::Typed { expr, tpt } => {
                 let ty = self.tree_to_type(tpt);
@@ -2118,6 +2263,281 @@ impl Typer {
             _ => {
                 pat.ty = sel_ty.clone();
             }
+        }
+    }
+
+    fn register_sealed_from_namer(&mut self, tree: &Tree) {
+        match &tree.kind {
+            TreeKind::PackageDef { stats, .. } => {
+                for s in stats {
+                    self.register_sealed_from_namer(s);
+                }
+            }
+            TreeKind::ClassDef { .. } => {
+                if !tree.sym.is_none() {
+                    self.register_sealed_child(tree.sym);
+                }
+                if let TreeKind::ClassDef { impl_, .. } = &tree.kind {
+                    for s in &impl_.body {
+                        self.register_sealed_from_namer(s);
+                    }
+                }
+            }
+            TreeKind::ModuleDef { .. } => {
+                if !tree.sym.is_none() {
+                    let cls = self.st.module_class_of(tree.sym);
+                    self.register_sealed_child(cls);
+                }
+                if let TreeKind::ModuleDef { impl_, .. } = &tree.kind {
+                    for s in &impl_.body {
+                        self.register_sealed_from_namer(s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn find_class_named(&self, child: SymbolId, name: &str) -> Option<SymbolId> {
+        let owner = self.st.get(child).owner;
+        if !owner.is_none() {
+            if let Some(id) = self.st.get(owner).members.iter().copied().find(|&m| {
+                let s = self.st.get(m);
+                s.name == name && s.is_class_like()
+            }) {
+                return Some(id);
+            }
+        }
+        self.st
+            .lookup(name)
+            .into_iter()
+            .find(|s| self.st.get(*s).is_class_like())
+            .or_else(|| {
+                self.st
+                    .symbols
+                    .iter()
+                    .find(|s| s.name == name && s.is_class_like())
+                    .map(|s| s.id)
+            })
+    }
+
+    fn register_sealed_child(&mut self, child: SymbolId) {
+        let parents = self.st.get(child).parents.clone();
+        for p in parents {
+            let pid = match &p {
+                Type::Named { name, .. } => self.find_class_named(child, name),
+                other => self.st.class_sym_of(other),
+            };
+            if let Some(pid) = pid {
+                if self.st.is_sealed(pid) && !self.st.get(pid).children.contains(&child) {
+                    self.st.get_mut(pid).children.push(child);
+                }
+            }
+        }
+    }
+
+    fn super_target(&self, this_id: SymbolId, mix: Option<&str>) -> SymbolId {
+        if this_id.is_none() {
+            return SymbolId::NONE;
+        }
+        let parents: Vec<SymbolId> = self
+            .st
+            .get(this_id)
+            .parents
+            .iter()
+            .filter_map(|p| self.st.class_sym_of(p))
+            .filter(|p| {
+                let n = self.st.get(*p).name.as_str();
+                n != "AnyRef" && n != "Any" && n != "AnyVal" && n != "Object"
+            })
+            .collect();
+        if let Some(name) = mix {
+            parents
+                .iter()
+                .copied()
+                .find(|p| {
+                    let n = self.st.get(*p).name.as_str();
+                    n == name || n.trim_end_matches('$') == name
+                })
+                .unwrap_or(SymbolId::NONE)
+        } else {
+            parents.last().copied().unwrap_or(SymbolId::NONE)
+        }
+    }
+
+    fn find_unapply(&self, fun: &Tree) -> Option<SymbolId> {
+        let owner = if !fun.sym.is_none() {
+            let s = self.st.get(fun.sym);
+            match s.kind {
+                SymKind::Module | SymKind::ModuleClass => self.st.module_class_of(fun.sym),
+                SymKind::Class => self
+                    .st
+                    .companion_module(fun.sym)
+                    .map(|m| self.st.module_class_of(m))
+                    .unwrap_or(SymbolId::NONE),
+                _ => SymbolId::NONE,
+            }
+        } else if let Some(n) = fun.name() {
+            let found = self.st.lookup(n);
+            found
+                .into_iter()
+                .find(|s| {
+                    matches!(
+                        self.st.get(*s).kind,
+                        SymKind::Module | SymKind::ModuleClass
+                    )
+                })
+                .map(|m| self.st.module_class_of(m))
+                .unwrap_or(SymbolId::NONE)
+        } else {
+            self.st.class_sym_of(&fun.ty).unwrap_or(SymbolId::NONE)
+        };
+        if owner.is_none() {
+            return None;
+        }
+        self.st
+            .lookup_member(owner, "unapply")
+            .into_iter()
+            .find(|m| self.st.get(*m).kind == SymKind::Method)
+    }
+
+    fn unapply_extracted_types(&self, unapply: SymbolId) -> Vec<Type> {
+        let ret = match &self.st.get(unapply).ty {
+            Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
+            t => t.clone(),
+        };
+        if matches!(ret, Type::Boolean) {
+            return vec![];
+        }
+        if let Type::Class { sym, args } = &ret {
+            let name = self.st.get(*sym).name.as_str();
+            if *sym == self.st.option_sym || name == "Option" || name == "Some" {
+                let inner = args.first().cloned().unwrap_or(Type::Any);
+                return self.flatten_extract(inner);
+            }
+        }
+        self.flatten_extract(ret)
+    }
+
+    fn flatten_extract(&self, inner: Type) -> Vec<Type> {
+        match inner {
+            Type::Tuple(ts) => ts,
+            Type::Class { sym, args } => {
+                let n = self.st.get(sym).name.as_str();
+                if n == "Tuple2" || n.starts_with("Tuple") {
+                    if args.is_empty() {
+                        vec![Type::Any, Type::Any]
+                    } else {
+                        args
+                    }
+                } else {
+                    vec![Type::Class { sym, args }]
+                }
+            }
+            other => vec![other],
+        }
+    }
+
+    fn check_match_exhaustive(&mut self, span: Span, sel_ty: &Type, cases: &[CaseDef]) {
+        let Some(cls) = self.st.class_sym_of(sel_ty) else {
+            return;
+        };
+        if !self.st.is_sealed(cls) {
+            return;
+        }
+        if cases
+            .iter()
+            .any(|c| c.guard.is_empty() && self.pattern_is_catchall(&c.pat))
+        {
+            return;
+        }
+        let leaves = self.st.sealed_leaves(cls);
+        if leaves.is_empty() {
+            return;
+        }
+        let mut missing = Vec::new();
+        for leaf in &leaves {
+            if !cases
+                .iter()
+                .any(|c| c.guard.is_empty() && self.pattern_covers(&c.pat, *leaf))
+            {
+                missing.push(
+                    self.st
+                        .get(*leaf)
+                        .name
+                        .trim_end_matches('$')
+                        .to_string(),
+                );
+            }
+        }
+        if !missing.is_empty() {
+            self.error(
+                span,
+                format!(
+                    "match may not be exhaustive. It would fail on the following input: {}",
+                    missing.join(", ")
+                ),
+            );
+        }
+    }
+
+    fn pattern_is_catchall(&self, pat: &Tree) -> bool {
+        match &pat.kind {
+            TreeKind::Wildcard | TreeKind::Empty => true,
+            TreeKind::Bind { body, .. } => self.pattern_is_catchall(body),
+            TreeKind::Ident { name } => {
+                let is_varid = name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_lowercase() || c == '_');
+                is_varid && (pat.sym.is_none() || self.st.get(pat.sym).kind == SymKind::Term)
+            }
+            TreeKind::Typed { expr, .. } => self.pattern_is_catchall(expr),
+            _ => false,
+        }
+    }
+
+    fn pattern_covers(&self, pat: &Tree, leaf: SymbolId) -> bool {
+        if self.pattern_is_catchall(pat) {
+            return true;
+        }
+        match &pat.kind {
+            TreeKind::Typed { .. } => {
+                if let Some(ps) = self.st.class_sym_of(&pat.ty) {
+                    ps == leaf || self.st.is_sub_type(&self.st.type_of_class(leaf), &pat.ty)
+                } else {
+                    false
+                }
+            }
+            TreeKind::Ident { .. } => {
+                if pat.sym.is_none() {
+                    return false;
+                }
+                let s = self.st.get(pat.sym);
+                match s.kind {
+                    SymKind::Module | SymKind::ModuleClass => self.st.module_class_of(pat.sym) == leaf,
+                    SymKind::Class => pat.sym == leaf,
+                    _ => false,
+                }
+            }
+            TreeKind::Apply { .. } | TreeKind::UnApply { .. } => {
+                if pat.sym.is_none() {
+                    return false;
+                }
+                let s = self.st.get(pat.sym);
+                if s.kind == SymKind::Class {
+                    pat.sym == leaf
+                } else if s.name == "unapply" {
+                    let owner = s.owner;
+                    let name = self.st.get(owner).name.trim_end_matches('$').to_string();
+                    self.st.get(leaf).name.trim_end_matches('$') == name
+                } else {
+                    false
+                }
+            }
+            TreeKind::Bind { body, .. } => self.pattern_covers(body, leaf),
+            TreeKind::Alternative { trees } => trees.iter().any(|t| self.pattern_covers(t, leaf)),
+            _ => false,
         }
     }
 

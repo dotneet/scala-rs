@@ -182,6 +182,71 @@ impl Typer {
         }
     }
 
+    /// Implicit conversion from `from` whose result type has member `name`.
+    pub(crate) fn search_extension(
+        &self,
+        from: &Type,
+        name: &str,
+    ) -> Option<(SymbolId, SymbolId, Type)> {
+        let mut hits: Vec<(SymbolId, SymbolId, Type)> = Vec::new();
+        let mut consider = |id: SymbolId| {
+            let Some(to) = self.conversion_result(id, from) else {
+                return;
+            };
+            let Some(cls) = self.st.class_sym_of(&to) else {
+                return;
+            };
+            let members = self.st.lookup_member(cls, name);
+            if let Some(m) = members.first() {
+                hits.push((id, *m, to));
+            }
+        };
+        for id in self.implicits_in_scope() {
+            consider(id);
+        }
+        for id in self
+            .companion_implicits(from)
+            .into_iter()
+            .chain(self.companion_implicits(&Type::Any))
+        {
+            consider(id);
+        }
+        hits.sort_by_key(|(c, m, _)| (c.0, m.0));
+        hits.dedup_by_key(|(c, m, _)| (c.0, m.0));
+        match hits.len() {
+            1 => Some(hits.pop().unwrap()),
+            _ => None,
+        }
+    }
+
+    fn conversion_result(&self, id: SymbolId, from: &Type) -> Option<Type> {
+        let s = self.st.get(id);
+        if !s.flags.contains(Flags::IMPLICIT) {
+            return None;
+        }
+        match &s.ty {
+            Type::Method { paramss, ret } => {
+                let ps = paramss.first().cloned().unwrap_or_default();
+                if ps.len() != 1 {
+                    return None;
+                }
+                if self.st.is_sub_type(from, &ps[0]) || matches!(ps[0], Type::Any) {
+                    Some((**ret).clone())
+                } else {
+                    None
+                }
+            }
+            Type::Function { params, ret } if params.len() == 1 => {
+                if self.st.is_sub_type(from, &params[0]) || matches!(params[0], Type::Any) {
+                    Some((**ret).clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn ref_implicit(&self, id: SymbolId, span: Span) -> Tree {
         let s = self.st.get(id);
         let ty = s.ty.clone();

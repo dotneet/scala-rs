@@ -173,6 +173,26 @@ fn fixtures_nested_class() {
 fn fixtures_nested_object() {
     check("nested_object");
 }
+#[test]
+fn fixtures_super() {
+    check("super");
+}
+#[test]
+fn fixtures_sealed_match() {
+    check("sealed_match");
+}
+#[test]
+fn fixtures_unapply() {
+    check("unapply");
+}
+#[test]
+fn fixtures_value_class() {
+    check("value_class");
+}
+#[test]
+fn fixtures_predef() {
+    check("predef");
+}
 
 #[test]
 fn cli_run_hello() {
