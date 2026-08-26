@@ -1324,7 +1324,7 @@ impl Typer {
         };
         self.type_expr(rhs, &pt);
         if declared.is_no_type() {
-            tree.ty = rhs.ty.clone();
+            tree.ty = rhs.ty.widen_constant();
             if !tree.sym.is_none() {
                 self.st.get_mut(tree.sym).ty = tree.ty.clone();
             }
@@ -1678,9 +1678,10 @@ impl Typer {
         if !ret_pt.is_no_type() {
             self.adapt(rhs, &ret_pt);
         } else {
-            // infer result type
+            // infer result type (SIP-23: do not infer singleton/constant types)
+            let inferred = rhs.ty.widen_constant();
             if let Type::Method { ret, .. } = &mut tree.ty {
-                *ret = Box::new(rhs.ty.clone());
+                *ret = Box::new(inferred.clone());
             }
             if !tree.sym.is_none() {
                 self.st.get_mut(tree.sym).ty = tree.ty.clone();
@@ -2998,7 +2999,7 @@ impl Typer {
                     if let Some(a0) = args.first() {
                         ret = Type::Class {
                             sym: self.st.list_sym,
-                            args: vec![a0.ty.clone()],
+                            args: vec![a0.ty.widen_constant()],
                         };
                     }
                 } else if method_name == "apply"
@@ -3008,7 +3009,7 @@ impl Typer {
                     if let Some(a0) = args.first() {
                         ret = Type::Class {
                             sym: self.st.some_sym,
-                            args: vec![a0.ty.clone()],
+                            args: vec![a0.ty.widen_constant()],
                         };
                     }
                 } else if method_name == "map" {
@@ -3022,7 +3023,7 @@ impl Typer {
                                 {
                                     ret = Type::Class {
                                         sym: cls,
-                                        args: vec![(**fr).clone()],
+                                        args: vec![fr.as_ref().widen_constant()],
                                     };
                                 }
                             }
@@ -3043,7 +3044,7 @@ impl Typer {
                             {
                                 ret = Type::Class {
                                     sym: cls,
-                                    args: vec![to],
+                                    args: vec![to.widen_constant()],
                                 };
                             }
                         }
@@ -3066,12 +3067,12 @@ impl Typer {
                         if n == "Map" && args.len() >= 2 {
                             ret = Type::Class {
                                 sym: cls,
-                                args: vec![args[0].ty.clone(), args[1].ty.clone()],
+                                args: vec![args[0].ty.widen_constant(), args[1].ty.widen_constant()],
                             };
                         } else if n == "Vector" && args.len() >= 2 {
                             ret = Type::Class {
                                 sym: cls,
-                                args: vec![args[1].ty.clone()],
+                                args: vec![args[1].ty.widen_constant()],
                             };
                         }
                     }
@@ -3081,7 +3082,7 @@ impl Typer {
                             if let Some(a0) = args.first() {
                                 ret = Type::Class {
                                     sym: cls,
-                                    args: vec![a0.ty.clone()],
+                                    args: vec![a0.ty.widen_constant()],
                                 };
                             }
                         }
@@ -3121,7 +3122,7 @@ impl Typer {
                             {
                                 ret = Type::Class {
                                     sym: cls,
-                                    args: vec![a0.ty.clone()],
+                                    args: vec![a0.ty.widen_constant()],
                                 };
                             }
                         }
@@ -3149,7 +3150,7 @@ impl Typer {
                             {
                                 ret = Type::Class {
                                     sym: cls,
-                                    args: vec![elem],
+                                    args: vec![elem.widen_constant()],
                                 };
                             }
                         }
@@ -6343,7 +6344,7 @@ fn unify_tparam(tp: SymbolId, params: &[Type], args: &[Type]) -> Option<Type> {
 
 fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
     match pattern {
-        Type::TypeParam(id) if *id == tp => Some(actual.clone()),
+        Type::TypeParam(id) if *id == tp => Some(actual.widen_constant()),
         Type::Class { args: pas, .. } => {
             if let Type::Class { args: aas, .. } = actual {
                 for (p, a) in pas.iter().zip(aas) {

@@ -252,16 +252,17 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
 }
 
 fn is_primitive(ty: &Type) -> bool {
-    matches!(
-        ty,
+    match ty {
         Type::Int
-            | Type::Long
-            | Type::Double
-            | Type::Boolean
-            | Type::Char
-            | Type::Float
-            | Type::Unit
-    )
+        | Type::Long
+        | Type::Double
+        | Type::Boolean
+        | Type::Char
+        | Type::Float
+        | Type::Unit => true,
+        Type::Constant(lit) => is_primitive(&Type::lit_underlying(lit)),
+        _ => false,
+    }
 }
 
 fn is_ref_erased(ty: &Type) -> bool {
@@ -600,11 +601,12 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         }
     }
     let orig = tree.ty.clone();
+    let orig_erased = erase_ty(&orig, st);
     let ret_erased = match &fun_ty {
         Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
         t => erase_ty(t, st),
     };
-    tree.ty = erase_ty(&orig, st);
+    tree.ty = orig_erased.clone();
     let array_prim_load = match &tree.kind {
         TreeKind::Apply { fun, .. } => match &fun.kind {
             TreeKind::Select { qual, name } if name == "apply" => match &qual.ty {
@@ -615,19 +617,20 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         },
         _ => false,
     };
-    if is_primitive(&orig) && is_ref_erased(&ret_erased) && !matches!(orig, Type::Unit) {
+    if is_primitive(&orig_erased) && is_ref_erased(&ret_erased) && !matches!(orig_erased, Type::Unit)
+    {
         if array_prim_load {
-            tree.ty = orig;
+            tree.ty = orig_erased;
         } else {
             tree.ty = ret_erased;
-            wrap_unbox(tree, orig);
+            wrap_unbox(tree, orig_erased);
         }
-    } else if matches!(orig, Type::String)
+    } else if matches!(orig_erased, Type::String)
         && is_ref_erased(&ret_erased)
         && !matches!(ret_erased, Type::String)
     {
         tree.ty = ret_erased;
-        wrap_unbox(tree, orig);
+        wrap_unbox(tree, orig_erased);
     }
     adapt_box_unbox(tree, expected);
 }
