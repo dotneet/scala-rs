@@ -2,9 +2,11 @@
 //!
 //! This is enough for scala-rs to round-trip compiled classes/objects through
 //! `ScalaSignature` and for scalac 2.13.16 to typecheck a `val`, a `def` with
-//! parameters, `id[T]`, a `case class` (`apply` + ctor fields), and an `object`
-//! method against our classfiles. It is **not** a full nsc pickle (no
-//! existentials, annotation args, or the complete Flags long).
+//! parameters, `id[T]`, a `case class` (`new Point` + ctor field accessors), and
+//! an `object` method against our classfiles. Companion apply `Point(x, y)` is
+//! **not** recovered by nsc from this subset (`not found: value Point`). It is
+//! **not** a full nsc pickle (no existentials, annotation args, or the complete
+//! Flags long).
 //!
 //! nsc-facing details in this subset (must match `PickleBuffer` / `UnPickler`):
 //! - pickle = major, minor, **nentries**, then `{ tag_Nat, len_Nat, body }`
@@ -1436,10 +1438,10 @@ class Box[A](val value: A) {
     #[test]
     fn pickle_case_class_and_object_def() {
         let src = r#"
+case class Point(x: Int, y: Int)
 object Lib {
   def add(p: Point): Int = p.x + p.y
 }
-case class Point(x: Int, y: Int)
 "#;
         let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
         assert!(

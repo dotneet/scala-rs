@@ -1,3 +1,4 @@
+case class Point(x: Int, y: Int)
 object Lib {
   val magic: Int = 7
   def greet(name: String, punct: String = "!"): String = "hi " + name + punct
@@ -7,5 +8,4 @@ object Lib {
 class Box[A](val value: A) {
   def get: A = value
 }
-case class Point(x: Int, y: Int)
 

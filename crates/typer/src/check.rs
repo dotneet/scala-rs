@@ -3322,10 +3322,21 @@ impl Typer {
             }
             _ => return OverloadPick::None,
         }
-        let applicable: Vec<(SymbolId, Vec<Type>, Type)> = cands
-            .into_iter()
-            .filter(|(sym, ps, _)| self.is_applicable(*sym, ps, arg_tys))
-            .collect();
+        let applicable: Vec<(SymbolId, Vec<Type>, Type)> = {
+            let no_view: Vec<_> = cands
+                .iter()
+                .filter(|(sym, ps, _)| self.is_applicable(*sym, ps, arg_tys, false))
+                .cloned()
+                .collect();
+            if !no_view.is_empty() {
+                no_view
+            } else {
+                cands
+                    .into_iter()
+                    .filter(|(sym, ps, _)| self.is_applicable(*sym, ps, arg_tys, true))
+                    .collect()
+            }
+        };
         match applicable.len() {
             0 => OverloadPick::None,
             1 => {
@@ -3355,32 +3366,43 @@ impl Typer {
 
     /// nsc: `A` is as specific as `B` when `B` is applicable to `A`'s parameter types.
     fn is_as_specific_method(&self, a_ps: &[Type], b_ps: &[Type]) -> bool {
-        self.is_applicable(SymbolId::NONE, b_ps, a_ps)
+        self.is_applicable(SymbolId::NONE, b_ps, a_ps, true)
     }
 
-    fn is_applicable(&self, sym: SymbolId, params: &[Type], args: &[Type]) -> bool {
+    fn is_applicable(&self, sym: SymbolId, params: &[Type], args: &[Type], allow_widen: bool) -> bool {
         let (fixed, repeated) = split_repeated(params);
         if let Some(elem) = repeated {
             if args.len() < fixed.len() {
                 return false;
             }
-            return args.iter().zip(fixed).all(|(a, p)| self.arg_score(a, p).is_some())
+            return args
+                .iter()
+                .zip(fixed)
+                .all(|(a, p)| self.arg_conforms(a, p, allow_widen))
                 && args[fixed.len()..]
                     .iter()
-                    .all(|a| self.arg_score(a, elem).is_some());
+                    .all(|a| self.arg_conforms(a, elem, allow_widen));
         }
         if args.len() > params.len() {
             return false;
         }
-        if args.len() < params.len() && !self.trailing_defaults(sym, args.len(), params.len()) {
+        if args.len() < params.len() && !self.trailing_omissible(sym, args.len(), params.len()) {
             return false;
         }
         args.iter()
             .zip(params)
-            .all(|(a, p)| self.arg_score(a, p).is_some())
+            .all(|(a, p)| self.arg_conforms(a, p, allow_widen))
     }
 
-    fn trailing_defaults(&self, sym: SymbolId, given: usize, total: usize) -> bool {
+    fn arg_conforms(&self, arg: &Type, param: &Type, allow_widen: bool) -> bool {
+        match self.arg_score(arg, param) {
+            Some(3) if !allow_widen => false, // numeric widen
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    fn trailing_omissible(&self, sym: SymbolId, given: usize, total: usize) -> bool {
         if sym.is_none() || given >= total {
             return false;
         }
@@ -3393,9 +3415,10 @@ impl Typer {
         if ids.len() < total {
             return false;
         }
-        ids[given..total]
-            .iter()
-            .all(|p| self.st.get(*p).flags.contains(Flags::DEFAULTPARAM))
+        ids[given..total].iter().all(|p| {
+            let f = self.st.get(*p).flags;
+            f.contains(Flags::DEFAULTPARAM) || f.contains(Flags::IMPLICIT)
+        })
     }
 
     fn compat_score(&self, params: &[Type], args: &[Type]) -> Option<i32> {
@@ -4684,16 +4707,21 @@ impl Typer {
             "Object" => Type::AnyRef,
             _ => {
                 let found = self.st.lookup(name);
-                if let Some(id) = found.into_iter().find(|s| {
-                    matches!(
-                        self.st.get(*s).kind,
-                        SymKind::Class
-                            | SymKind::ModuleClass
-                            | SymKind::Module
-                            | SymKind::TypeParam
-                            | SymKind::TypeMember
-                    )
-                }) {
+                // Prefer the class of a case-class/companion pair (`Point` vs `Point$`).
+                let id = found.iter().copied().find(|s| {
+                    matches!(self.st.get(*s).kind, SymKind::Class)
+                }).or_else(|| {
+                    found.into_iter().find(|s| {
+                        matches!(
+                            self.st.get(*s).kind,
+                            SymKind::ModuleClass
+                                | SymKind::Module
+                                | SymKind::TypeParam
+                                | SymKind::TypeMember
+                        )
+                    })
+                });
+                if let Some(id) = id {
                     match self.st.get(id).kind {
                         SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
                         SymKind::TypeParam => Type::TypeParam(id),

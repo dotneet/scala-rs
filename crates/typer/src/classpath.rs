@@ -242,6 +242,11 @@ fn is_forwarder_of_module(classes: &[ClasspathClass], c: &ClasspathClass) -> boo
     if c.is_module {
         return false;
     }
+    // A case class `Point.class` sits next to companion `Point$.class`. That is
+    // not a static forwarder: the pickle describes a real class (ctor / vals).
+    if c.pickle.as_ref().is_some_and(|p| p.iter().any(|m| m.is_ctor || m.is_val)) {
+        return false;
+    }
     let dollar = format!("{}$", c.jvm_name);
     classes
         .iter()
