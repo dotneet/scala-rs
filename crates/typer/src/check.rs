@@ -1884,11 +1884,19 @@ impl Typer {
                 tree.sym = tpt.sym;
                 if tree.sym.is_none() {
                     if let Some(id) = self.st.class_sym_of(&tpt.ty) {
-                        tree.ty = Type::Class {
-                            sym: id,
-                            args: vec![],
-                        };
                         tree.sym = id;
+                        // Keep `Array[T]` and applied class types so `new Array[T](n)`
+                        // can still see the element and rewrite through `ClassTag`.
+                        match &tree.ty {
+                            Type::Array(_) => {}
+                            Type::Class { args, .. } if !args.is_empty() => {}
+                            _ => {
+                                tree.ty = Type::Class {
+                                    sym: id,
+                                    args: vec![],
+                                };
+                            }
+                        }
                     }
                 }
             }
@@ -3611,6 +3619,12 @@ impl Typer {
         if matches!(param, Type::TypeParam(_)) || matches!(arg, Type::TypeParam(_)) {
             return Some(2);
         }
+        // Overload scoring only: `is_sub_type` compares class args so
+        // `ClassTag[Int]` does not inhabit `ClassTag[T]`. Constructors whose
+        // args are type parameters still match, the way nsc infers `Map.apply`.
+        if class_ctor_matches_typeparam_args(arg, param) {
+            return Some(2);
+        }
         if numeric_widen(arg, param).is_some() {
             return Some(3);
         }
@@ -5186,6 +5200,36 @@ fn pattern_has_star(pat: &Tree) -> bool {
         TreeKind::Star { .. } => true,
         TreeKind::Bind { body, .. } => pattern_has_star(body),
         TreeKind::Typed { expr, .. } => pattern_has_star(expr),
+        _ => false,
+    }
+}
+
+/// Overload applicability: `Tuple2[Any, Any]` matches `Tuple2[K, V]` when `K`/`V`
+/// are type parameters. Not used for implicit search (`is_sub_type`).
+fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
+    match (arg, param) {
+        (
+            Type::Class {
+                sym: sa,
+                args: aa,
+            },
+            Type::Class {
+                sym: sp,
+                args: pa,
+            },
+        ) if sa == sp && aa.len() == pa.len() => aa.iter().zip(pa.iter()).all(|(a, p)| {
+            matches!(p, Type::TypeParam(_))
+                || a == p
+                || class_ctor_matches_typeparam_args(a, p)
+        }),
+        (Type::Tuple(aa), Type::Class { args: pa, .. }) if aa.len() == pa.len() => {
+            aa.iter().zip(pa.iter()).all(|(a, p)| {
+                matches!(p, Type::TypeParam(_))
+                    || a == p
+                    || class_ctor_matches_typeparam_args(a, p)
+            })
+        }
+        (_, Type::TypeParam(_)) => true,
         _ => false,
     }
 }

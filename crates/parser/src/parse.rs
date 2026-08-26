@@ -1331,6 +1331,24 @@ impl<'a> Parser<'a> {
             // In types, `T Either U` is infix. If next is ident and then a type, take it.
             let saved = self.pos;
             let (name, nsp) = self.expect_ident();
+            self.skip_nl();
+            // postfix repeated `T*` — nsc does not parse this as infix `T * <error>`
+            if name == "*" && !self.at_type_start() {
+                let repeated = self.alloc(
+                    nsp,
+                    TreeKind::Ident {
+                        name: "<repeated>".into(),
+                    },
+                );
+                t = self.alloc(
+                    t.span.merge(nsp),
+                    TreeKind::AppliedTypeTree {
+                        tpt: Box::new(repeated),
+                        args: vec![t],
+                    },
+                );
+                continue;
+            }
             if is_operator_name(&name) || self.looks_like_type_start() {
                 let rhs = self.parse_compound_type();
                 let tpt = self.alloc(nsp, TreeKind::Ident { name });
@@ -1347,6 +1365,18 @@ impl<'a> Parser<'a> {
             }
         }
         t
+    }
+
+    fn at_type_start(&self) -> bool {
+        matches!(
+            self.kind(),
+            TokenKind::Ident(_)
+                | TokenKind::LParen
+                | TokenKind::LBrace
+                | TokenKind::This
+                | TokenKind::Super
+                | TokenKind::Underscore
+        )
     }
 
     fn looks_like_type_start(&self) -> bool {
