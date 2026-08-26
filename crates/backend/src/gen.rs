@@ -3369,8 +3369,12 @@ fn gen_apply(
     gen_call_args(asm, frame, ctx, args, &param_tys, value_owner.is_some());
     if let TreeKind::Select { qual, name } = &fun.kind {
         if name == "apply" && matches!(qual.ty, Type::Array(_)) {
-            emit_array_load(asm, &tree.ty);
-            if matches!(tree.ty, Type::String) {
+            let elem = match &qual.ty {
+                Type::Array(e) => e.as_ref(),
+                _ => &tree.ty,
+            };
+            emit_array_load(asm, elem);
+            if matches!(elem, Type::String) {
                 asm.checkcast("java/lang/String");
             }
             return;

@@ -661,6 +661,11 @@ impl<'a> Pickler<'a> {
                 }
                 SymKind::Term => {
                     if ctor_fields.contains(&m) || !self.st.get(m).flags.contains(Flags::PARAM) {
+                        if is_case && ctor_fields.contains(&m) {
+                            // nsc `caseFieldAccessors` pairs CASEACCESSOR getters
+                            // with non-method PARAMACCESSOR fields.
+                            self.pickle_param_field(m, idx);
+                        }
                         self.pickle_val(m, idx, is_case && ctor_fields.contains(&m));
                     }
                 }
@@ -823,6 +828,19 @@ impl<'a> Pickler<'a> {
         let body = self.symbol_info(name_ref, owner_ref, flags, bounds);
         self.entries[idx as usize] = (TYPESYM, body);
         idx
+    }
+
+    /// nsc case-class ctor field (not the getter): PARAMACCESSOR, not METHOD.
+    fn pickle_param_field(&mut self, val_id: SymbolId, owner_ref: u32) {
+        let s = self.st.get(val_id);
+        let name_ref = self.term_name(&s.name);
+        let ty_ref = self.pickle_type(&s.ty);
+        // PRIVATE | LOCAL stay outside bits 0–11; PARAMACCESSOR is not remapped.
+        let mut flags = raw_to_pickled(1u64 << 2); // PRIVATE
+        flags |= 1 << 19; // LOCAL
+        flags |= 1 << 29; // PARAMACCESSOR
+        let body = self.symbol_info(name_ref, owner_ref, flags, ty_ref);
+        let _ = self.add(VALSYM, body);
     }
 
     fn pickle_val(&mut self, val_id: SymbolId, owner_ref: u32, case_accessor: bool) -> u32 {
@@ -1279,6 +1297,12 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             continue;
         };
         if *owner != ci as u32 {
+            continue;
+        }
+        // Case-class ctor fields are PARAMACCESSOR without METHOD; skip them.
+        const METHOD_PKL: u64 = 1 << 9;
+        const PARAMACCESSOR: u64 = 1 << 29;
+        if (*flags & METHOD_PKL) == 0 && (*flags & PARAMACCESSOR) != 0 {
             continue;
         }
         let mname = name_of(&entries, *name);
