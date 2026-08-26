@@ -1,4 +1,4 @@
-//! Compiler driver: parse → namer/typer → emit → write class files.
+//! Compiler driver: parse → namer → typer → uncurry → erasure → emit → write class files.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -6,7 +6,7 @@ use std::process::Command;
 use scala_rs_backend::{emit_opts, emit_runtime, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
-use scala_rs_typer::{erase, find_mains, typecheck_opts, SymbolTable, TypecheckOptions};
+use scala_rs_typer::{erase, find_mains, typecheck_opts, uncurry, SymbolTable, TypecheckOptions};
 
 pub use scala_rs_backend::EmittedClass;
 
@@ -160,6 +160,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         diags.extend(tdiags);
         mains.extend(find_mains(&st, &u.tree));
         if !has_errors(&diags) {
+            uncurry(&mut u.tree, &mut st);
             erase(&mut u.tree, &mut st);
         }
         u.st = Some(st);

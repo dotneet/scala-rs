@@ -244,6 +244,14 @@ fn fixtures_nested_object() {
     check("nested_object");
 }
 #[test]
+fn fixtures_anonymous() {
+    check("anonymous");
+}
+#[test]
+fn fixtures_eta() {
+    check("eta");
+}
+#[test]
 fn fixtures_super() {
     check("super");
 }
@@ -413,6 +421,21 @@ fn scala_library_dual_run_string_ops2() {
     dual_run_fixture("string_ops2");
 }
 
+#[test]
+fn scala_library_dual_run_anonymous() {
+    dual_run_fixture("anonymous");
+}
+
+#[test]
+fn scala_library_dual_run_eta() {
+    dual_run_fixture("eta");
+}
+
+#[test]
+fn scala_library_dual_run_try_util() {
+    dual_run_fixture("try_util");
+}
+
 const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Option.class",
     "scala/Some.class",
@@ -455,6 +478,12 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/util/Right.class",
     "scala/util/Left$.class",
     "scala/util/Right$.class",
+    "scala/util/Try.class",
+    "scala/util/Try$.class",
+    "scala/util/Success.class",
+    "scala/util/Success$.class",
+    "scala/util/Failure.class",
+    "scala/util/Failure$.class",
 ];
 
 fn assert_no_private_stdlib(out: &Path) {

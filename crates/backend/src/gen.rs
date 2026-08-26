@@ -45,6 +45,7 @@ pub fn emit_opts(
     };
     g.collect_trait_impls(tree);
     g.walk(tree);
+    g.emit_anon_classes(tree);
     g.out.append(&mut g.extras.borrow_mut());
     g.out
 }
@@ -697,6 +698,140 @@ impl<'a> Gen<'a> {
                 for s in &impl_.body {
                     self.collect_trait_impls(s);
                 }
+            }
+            _ => {}
+        }
+    }
+
+    fn emit_anon_classes(&mut self, tree: &Tree) {
+        if let TreeKind::New { tpt } = &tree.kind {
+            if let TreeKind::ClassDef { name, impl_, .. } = &tpt.kind {
+                if name.starts_with("$anon") {
+                    self.emit_class(tpt, &HashSet::new());
+                    for s in &impl_.body {
+                        self.emit_anon_classes(s);
+                    }
+                    return;
+                }
+            }
+        }
+        match &tree.kind {
+            TreeKind::PackageDef { stats, .. } => {
+                for s in stats {
+                    self.emit_anon_classes(s);
+                }
+            }
+            TreeKind::ClassDef {
+                vparamss, impl_, ..
+            } => {
+                for clause in vparamss {
+                    for p in clause {
+                        self.emit_anon_classes(p);
+                    }
+                }
+                for p in &impl_.parents {
+                    self.emit_anon_classes(p);
+                }
+                for s in &impl_.body {
+                    self.emit_anon_classes(s);
+                }
+            }
+            TreeKind::ModuleDef { impl_, .. } => {
+                for p in &impl_.parents {
+                    self.emit_anon_classes(p);
+                }
+                for s in &impl_.body {
+                    self.emit_anon_classes(s);
+                }
+            }
+            TreeKind::ValDef { tpt, rhs, .. } => {
+                self.emit_anon_classes(tpt);
+                self.emit_anon_classes(rhs);
+            }
+            TreeKind::DefDef {
+                vparamss, tpt, rhs, ..
+            } => {
+                for clause in vparamss {
+                    for p in clause {
+                        self.emit_anon_classes(p);
+                    }
+                }
+                self.emit_anon_classes(tpt);
+                self.emit_anon_classes(rhs);
+            }
+            TreeKind::Block { stats, expr } => {
+                for s in stats {
+                    self.emit_anon_classes(s);
+                }
+                self.emit_anon_classes(expr);
+            }
+            TreeKind::If { cond, thenp, elsep } => {
+                self.emit_anon_classes(cond);
+                self.emit_anon_classes(thenp);
+                self.emit_anon_classes(elsep);
+            }
+            TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
+                self.emit_anon_classes(cond);
+                self.emit_anon_classes(body);
+            }
+            TreeKind::Assign { lhs, rhs } => {
+                self.emit_anon_classes(lhs);
+                self.emit_anon_classes(rhs);
+            }
+            TreeKind::Match { selector, cases } => {
+                self.emit_anon_classes(selector);
+                for c in cases {
+                    self.emit_anon_classes(&c.pat);
+                    self.emit_anon_classes(&c.guard);
+                    self.emit_anon_classes(&c.body);
+                }
+            }
+            TreeKind::Function { vparams, body } => {
+                for p in vparams {
+                    self.emit_anon_classes(p);
+                }
+                self.emit_anon_classes(body);
+            }
+            TreeKind::Apply { fun, args } | TreeKind::TypeApply { fun, args } => {
+                self.emit_anon_classes(fun);
+                for a in args {
+                    self.emit_anon_classes(a);
+                }
+            }
+            TreeKind::Typed { expr, tpt } => {
+                self.emit_anon_classes(expr);
+                self.emit_anon_classes(tpt);
+            }
+            TreeKind::Select { qual, .. } => self.emit_anon_classes(qual),
+            TreeKind::Return { expr } | TreeKind::Throw { expr } => self.emit_anon_classes(expr),
+            TreeKind::Try {
+                block,
+                catches,
+                finalizer,
+            } => {
+                self.emit_anon_classes(block);
+                for c in catches {
+                    self.emit_anon_classes(&c.pat);
+                    self.emit_anon_classes(&c.body);
+                }
+                self.emit_anon_classes(finalizer);
+            }
+            TreeKind::InterpolatedString { args, .. } => {
+                for a in args {
+                    self.emit_anon_classes(a);
+                }
+            }
+            TreeKind::UnApply { fun, args } => {
+                self.emit_anon_classes(fun);
+                for a in args {
+                    self.emit_anon_classes(a);
+                }
+            }
+            TreeKind::LabelDef { params, rhs, .. } => {
+                for p in params {
+                    self.emit_anon_classes(p);
+                }
+                self.emit_anon_classes(rhs);
             }
             _ => {}
         }
@@ -2972,11 +3107,11 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
                 return;
             }
             let owner = s.owner;
-            if owner == ctx.class_sym || owner.is_none() {
-                load_this(asm, ctx);
-            } else if is_module_class(ctx.st, owner) {
+            if is_module_class(ctx.st, owner) {
                 let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+            } else if owner == ctx.class_sym || owner.is_none() {
+                load_this(asm, ctx);
             } else {
                 load_this(asm, ctx);
             }
@@ -3269,6 +3404,61 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
             asm.invokevirtual(&owner, "apply", &format!("(Ljava/lang/Object;)L{cls};"));
             return;
         }
+        if is_stdlib_try(&owner) {
+            match name {
+                "getOrElse" => {
+                    asm.invokevirtual(
+                        "scala/util/Try",
+                        "getOrElse",
+                        "(Lscala/Function0;)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            emit_unbox(asm, ty);
+                        }
+                    }
+                    return;
+                }
+                "map" => {
+                    asm.invokevirtual(
+                        "scala/util/Try",
+                        "map",
+                        "(Lscala/Function1;)Lscala/util/Try;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_try_module(&owner) && name == "apply" {
+            match owner.as_str() {
+                "scala/util/Try$" => {
+                    asm.invokevirtual(
+                        "scala/util/Try$",
+                        "apply",
+                        "(Lscala/Function0;)Lscala/util/Try;",
+                    );
+                    return;
+                }
+                "scala/util/Success$" => {
+                    asm.invokevirtual(
+                        "scala/util/Success$",
+                        "apply",
+                        "(Ljava/lang/Object;)Lscala/util/Success;",
+                    );
+                    return;
+                }
+                "scala/util/Failure$" => {
+                    asm.invokevirtual(
+                        "scala/util/Failure$",
+                        "apply",
+                        "(Ljava/lang/Throwable;)Lscala/util/Failure;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_stdlib_map(&owner) {
             match name {
                 "updated" => {
@@ -3508,6 +3698,20 @@ fn is_stdlib_either(owner: &str) -> bool {
 
 fn is_stdlib_either_module(owner: &str) -> bool {
     matches!(owner, "scala/util/Left$" | "scala/util/Right$")
+}
+
+fn is_stdlib_try(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/util/Try" | "scala/util/Success" | "scala/util/Failure"
+    )
+}
+
+fn is_stdlib_try_module(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/util/Try$" | "scala/util/Success$" | "scala/util/Failure$"
+    )
 }
 
 fn gen_wrap_varargs(
@@ -4923,6 +5127,7 @@ mod tests {
             "type errors: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+        scala_rs_typer::uncurry(&mut tree, &mut st);
         scala_rs_typer::erase(&mut tree, &mut st);
         let mut classes = crate::runtime::emit_runtime();
         classes.extend(emit(&tree, &st, "Test.scala"));
@@ -4942,6 +5147,7 @@ mod tests {
             "type errors: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+        scala_rs_typer::uncurry(&mut tree, &mut st);
         scala_rs_typer::erase(&mut tree, &mut st);
         emit_opts(&tree, &st, "Test.scala", EmitOpts { library_abi: true })
     }

@@ -1825,7 +1825,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_postfix_expr(&mut self) -> Tree {
-        let t = self.parse_infix_expr(0);
+        let mut t = self.parse_infix_expr(0);
         // postfix op: expr ident  (on same line)
         if matches!(self.kind(), TokenKind::Ident(s) if is_operator_name(s) || true) {
             if let Some(name) = self.ident_text() {
@@ -1834,6 +1834,26 @@ impl<'a> Parser<'a> {
                     // postfix is rare; skip to avoid eating infix that failed min prec
                 }
             }
+        }
+        // Eta-expansion `foo _` (nsc: Typed(foo, Function([], EmptyTree))).
+        if matches!(self.kind(), TokenKind::Underscore) {
+            let sp = self.span();
+            self.bump();
+            let empty = self.empty(sp);
+            let fn_tpt = self.alloc(
+                sp,
+                TreeKind::Function {
+                    vparams: vec![],
+                    body: Box::new(empty),
+                },
+            );
+            t = self.alloc(
+                t.span.merge(sp),
+                TreeKind::Typed {
+                    expr: Box::new(t),
+                    tpt: Box::new(fn_tpt),
+                },
+            );
         }
         t
     }

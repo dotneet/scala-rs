@@ -4,6 +4,7 @@
 use crate::implicits::ImplicitSearch;
 use crate::prelude::install_prelude;
 use crate::symbol::{SymKind, SymbolTable};
+use crate::uncurry::{eta_expand, is_eta_marker};
 use scala_rs_parser::ast::*;
 use scala_rs_span::{Diagnostic, Span};
 
@@ -562,6 +563,44 @@ impl Typer {
         }
     }
 
+    fn type_anon_class(&mut self, tpt: &mut Tree) {
+        if let TreeKind::ClassDef { name, impl_, .. } = &mut tpt.kind {
+            if name == "$anon" {
+                self.gensym += 1;
+                *name = format!("$anon${}", self.gensym);
+            }
+            if impl_.parents.is_empty() {
+                let mut p = Tree::dummy(TreeKind::Ident {
+                    name: "AnyRef".into(),
+                });
+                p.span = tpt.span;
+                impl_.parents.push(p);
+            }
+        }
+        if tpt.sym.is_none() {
+            self.namer_class(tpt);
+        }
+        self.type_class(tpt);
+    }
+
+    fn type_eta(&mut self, tree: &mut Tree) {
+        let dummy_method = Type::Method {
+            paramss: vec![],
+            ret: Box::new(Type::NoType),
+        };
+        if let TreeKind::Typed { expr, .. } = &mut tree.kind {
+            self.type_expr(expr, &dummy_method);
+        }
+        if let TreeKind::Typed { expr, .. } = &mut tree.kind {
+            let inner = std::mem::replace(expr, Box::new(Tree::dummy(TreeKind::Empty)));
+            *tree = *inner;
+        }
+        if let Type::Method { paramss, ret } = tree.ty.clone() {
+            let params: Vec<Type> = paramss.into_iter().flatten().collect();
+            eta_expand(&mut self.st, &mut self.gensym, tree, params, *ret);
+        }
+    }
+
     fn type_class(&mut self, tree: &mut Tree) {
         let id = tree.sym;
         let saved_owner = self.st.owner;
@@ -1022,6 +1061,8 @@ impl Typer {
                 self.type_function(vparams, body, pt)
             };
             tree.ty = ty;
+        } else if matches!(&tree.kind, TreeKind::Typed { tpt, .. } if is_eta_marker(tpt)) {
+            self.type_eta(tree);
         } else {
             self.type_expr_inner(tree, pt);
         }
@@ -1115,15 +1156,11 @@ impl Typer {
             }
             TreeKind::Match { .. } => self.type_match(tree, pt),
             TreeKind::New { tpt } => {
-                if let TreeKind::ClassDef { name, .. } = &tpt.kind {
-                    if name == "$anon" {
-                        self.error(
-                            tree.span,
-                            "unimplemented syntax: anonymous classes (`new T { ... }`)",
-                        );
-                        tree.ty = Type::Error;
-                        return;
-                    }
+                if matches!(&tpt.kind, TreeKind::ClassDef { .. }) {
+                    self.type_anon_class(tpt);
+                    tree.ty = tpt.ty.clone();
+                    tree.sym = tpt.sym;
+                    return;
                 }
                 if let TreeKind::Ident { name } = &tpt.kind {
                     let n = name.clone();
@@ -1759,6 +1796,34 @@ impl Typer {
                                 };
                             }
                         }
+                    } else if owner_n == "Try$" || owner_n == "Success$" {
+                        if let Some(a0) = args.first() {
+                            let elem = unwrap_fn0_or_byname(&a0.ty);
+                            let elem = match &a0.kind {
+                                TreeKind::Function { body, .. }
+                                    if matches!(elem, Type::Any | Type::AnyRef) =>
+                                {
+                                    if body.ty.is_no_type() || body.ty.is_error() {
+                                        elem
+                                    } else {
+                                        body.ty.clone()
+                                    }
+                                }
+                                _ => elem,
+                            };
+                            let cname = owner_n.trim_end_matches('$');
+                            if let Some(cls) = self
+                                .st
+                                .lookup(cname)
+                                .into_iter()
+                                .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)
+                            {
+                                ret = Type::Class {
+                                    sym: cls,
+                                    args: vec![elem],
+                                };
+                            }
+                        }
                     }
                 }
                 tree.ty = leftover.unwrap_or(ret);
@@ -2243,6 +2308,13 @@ impl Typer {
         }
         if let Type::Repeated(inner) = param {
             return self.arg_score(arg, inner);
+        }
+        if let Type::Method { paramss, ret } = arg {
+            let f = Type::Function {
+                params: paramss.iter().flatten().cloned().collect(),
+                ret: ret.clone(),
+            };
+            return self.arg_score(&f, param);
         }
         if self.st.is_sub_type(arg, param) {
             return Some(if arg == param { 10 } else { 5 });
@@ -3061,6 +3133,11 @@ impl Typer {
             if !matches!(&tree.kind, TreeKind::Function { .. }) {
                 let span = tree.span;
                 let inner_tree = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+                let ret = if inner_tree.ty.is_no_type() || inner_tree.ty.is_error() {
+                    (**inner).clone()
+                } else {
+                    inner_tree.ty.clone()
+                };
                 *tree = Tree {
                     id: inner_tree.id,
                     span,
@@ -3070,12 +3147,22 @@ impl Typer {
                     },
                     ty: Type::Function {
                         params: vec![],
-                        ret: inner.clone(),
+                        ret: Box::new(ret),
                     },
                     sym: SymbolId::NONE,
                 };
             }
             return;
+        }
+        if let Type::Method { paramss, ret } = &tree.ty {
+            if is_function_pt(pt) {
+                let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+                let ret = (**ret).clone();
+                eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
+                if self.st.is_sub_type(&tree.ty, pt) {
+                    return;
+                }
+            }
         }
         match self.search_conversion(&tree.ty, pt) {
             ImplicitSearch::Found(id) => {
@@ -3113,6 +3200,22 @@ impl Typer {
             ),
         );
         tree.ty = Type::Error;
+    }
+}
+
+fn is_function_pt(pt: &Type) -> bool {
+    match pt {
+        Type::Function { .. } => true,
+        Type::Named { name, .. } if name.starts_with("Function") => true,
+        _ => false,
+    }
+}
+
+fn unwrap_fn0_or_byname(ty: &Type) -> Type {
+    match ty {
+        Type::ByName(t) => (**t).clone(),
+        Type::Function { params, ret } if params.is_empty() => (**ret).clone(),
+        other => other.clone(),
     }
 }
 

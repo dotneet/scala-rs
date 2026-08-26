@@ -230,6 +230,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_set(st);
         add_seq_and_lazylist(st);
         add_either(st);
+        add_try(st, throwable);
     }
 
     let arrow = if library_abi {
@@ -1556,6 +1557,112 @@ fn add_either(st: &mut SymbolTable) {
     );
     let mems = st.get(right_cls).members.clone();
     st.get_mut(right_mod).members.extend(mems);
+}
+
+fn add_try(st: &mut SymbolTable, throwable: SymbolId) {
+    let try_c = class(
+        st,
+        st.scala_pkg,
+        "Try",
+        "scala/util/Try",
+        &[Type::AnyRef],
+    );
+    let tt = type_param(st, try_c, "T");
+    st.get_mut(try_c).tparams = vec![tt];
+    let t_ty = Type::TypeParam(tt);
+    let try_t = Type::Class {
+        sym: try_c,
+        args: vec![t_ty.clone()],
+    };
+    method(
+        st,
+        try_c,
+        "getOrElse",
+        vec![Type::ByName(Box::new(Type::Any))],
+        Type::Any,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        try_c,
+        "map",
+        vec![fn1(t_ty, Type::Any)],
+        try_t.clone(),
+        Intrinsic::None,
+    );
+
+    let try_mod = module(st, st.scala_pkg, "Try", "scala/util/Try$");
+    let try_cls = st.module_class_of(try_mod);
+    method(
+        st,
+        try_cls,
+        "apply",
+        vec![Type::ByName(Box::new(Type::Any))],
+        try_t.clone(),
+        Intrinsic::None,
+    );
+    let mems = st.get(try_cls).members.clone();
+    st.get_mut(try_mod).members.extend(mems);
+
+    let success = class(
+        st,
+        st.scala_pkg,
+        "Success",
+        "scala/util/Success",
+        &[try_t.clone()],
+    );
+    let sa = type_param(st, success, "T");
+    st.get_mut(success).tparams = vec![sa];
+    let sf = st.alloc("value", success, SymKind::Term, Flags::FINAL, "");
+    st.get_mut(sf).ty = Type::TypeParam(sa);
+    st.get_mut(success).ctor_fields = vec![sf];
+    let success_mod = module(st, st.scala_pkg, "Success", "scala/util/Success$");
+    let success_cls = st.module_class_of(success_mod);
+    method(
+        st,
+        success_cls,
+        "apply",
+        vec![Type::Any],
+        Type::Class {
+            sym: success,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+    let mems = st.get(success_cls).members.clone();
+    st.get_mut(success_mod).members.extend(mems);
+
+    let throwable_ty = Type::Class {
+        sym: throwable,
+        args: vec![],
+    };
+    let failure = class(
+        st,
+        st.scala_pkg,
+        "Failure",
+        "scala/util/Failure",
+        &[try_t],
+    );
+    let fa = type_param(st, failure, "T");
+    st.get_mut(failure).tparams = vec![fa];
+    let ff = st.alloc("exception", failure, SymKind::Term, Flags::FINAL, "");
+    st.get_mut(ff).ty = throwable_ty.clone();
+    st.get_mut(failure).ctor_fields = vec![ff];
+    let failure_mod = module(st, st.scala_pkg, "Failure", "scala/util/Failure$");
+    let failure_cls = st.module_class_of(failure_mod);
+    method(
+        st,
+        failure_cls,
+        "apply",
+        vec![throwable_ty],
+        Type::Class {
+            sym: failure,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+    let mems = st.get(failure_cls).members.clone();
+    st.get_mut(failure_mod).members.extend(mems);
 }
 
 fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
