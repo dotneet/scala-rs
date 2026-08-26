@@ -85,21 +85,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
             args: vec![],
         }],
     );
-    let jclass = class(
-        st,
-        java_lang,
-        "Class",
-        "java/lang/Class",
-        &[Type::AnyRef],
-    );
-    method(
-        st,
-        jclass,
-        "getName",
-        vec![],
-        Type::String,
-        Intrinsic::None,
-    );
+    let jclass = class(st, java_lang, "Class", "java/lang/Class", &[Type::AnyRef]);
+    method(st, jclass, "getName", vec![], Type::String, Intrinsic::None);
     st.array_sym = class(
         st,
         st.scala_pkg,
@@ -252,6 +239,17 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     );
     st.get_mut(dynamics).ty = Type::Boolean;
     st.get_mut(language).members.push(dynamics);
+    for feat in ["postfixOps", "implicitConversions"] {
+        let id = st.alloc(
+            feat,
+            lang_cls,
+            SymKind::Term,
+            Flags::IMPLICIT.with(Flags::LAZY).with(Flags::FINAL),
+            "",
+        );
+        st.get_mut(id).ty = Type::Boolean;
+        st.get_mut(language).members.push(id);
+    }
 
     let rich_int = if library_abi {
         Some(add_rich_int_and_range(st))
@@ -426,13 +424,7 @@ fn add_ordered(st: &mut SymbolTable) -> SymbolId {
     let ordered = iface(st, math, "Ordered", "scala/math/Ordered");
     let a = type_param(st, ordered, "A");
     st.get_mut(ordered).tparams = vec![a];
-    let cmp = st.alloc(
-        "compare",
-        ordered,
-        SymKind::Method,
-        Flags::ABSTRACT,
-        "",
-    );
+    let cmp = st.alloc("compare", ordered, SymKind::Method, Flags::ABSTRACT, "");
     st.get_mut(cmp).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(a)]],
         ret: Box::new(Type::Int),
@@ -472,7 +464,7 @@ fn add_any_members(st: &mut SymbolTable) {
         "==",
         vec![Type::Any],
         Type::Boolean,
-        Intrinsic::None,
+        Intrinsic::AnyEq,
     );
     method(
         st,
@@ -480,7 +472,7 @@ fn add_any_members(st: &mut SymbolTable) {
         "!=",
         vec![Type::Any],
         Type::Boolean,
-        Intrinsic::None,
+        Intrinsic::AnyNe,
     );
     method(
         st,
@@ -969,24 +961,24 @@ fn add_string_ops(st: &mut SymbolTable) -> SymbolId {
     method(st, so, "size", vec![], Type::Int, Intrinsic::None);
     method(st, so, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
     method(st, so, "*", vec![Type::Int], Type::String, Intrinsic::None);
-    method(st, so, "take", vec![Type::Int], Type::String, Intrinsic::None);
-    method(st, so, "drop", vec![Type::Int], Type::String, Intrinsic::None);
     method(
         st,
         so,
-        "toUpperCase",
-        vec![],
+        "take",
+        vec![Type::Int],
         Type::String,
         Intrinsic::None,
     );
     method(
         st,
         so,
-        "toLowerCase",
-        vec![],
+        "drop",
+        vec![Type::Int],
         Type::String,
         Intrinsic::None,
     );
+    method(st, so, "toUpperCase", vec![], Type::String, Intrinsic::None);
+    method(st, so, "toLowerCase", vec![], Type::String, Intrinsic::None);
     method(
         st,
         so,
@@ -1215,12 +1207,7 @@ fn add_partial_function(st: &mut SymbolTable) {
         .copied()
         .find(|id| st.get(*id).name == "Function1")
         .unwrap_or(SymbolId::NONE);
-    let pf = iface(
-        st,
-        st.scala_pkg,
-        "PartialFunction",
-        "scala/PartialFunction",
-    );
+    let pf = iface(st, st.scala_pkg, "PartialFunction", "scala/PartialFunction");
     let a = type_param(st, pf, "A");
     let b = type_param(st, pf, "B");
     st.get_mut(pf).tparams = vec![a, b];
@@ -1233,7 +1220,14 @@ fn add_partial_function(st: &mut SymbolTable) {
         },
         Type::AnyRef,
     ];
-    method(st, pf, "apply", vec![ta.clone()], tb.clone(), Intrinsic::None);
+    method(
+        st,
+        pf,
+        "apply",
+        vec![ta.clone()],
+        tb.clone(),
+        Intrinsic::None,
+    );
     method(
         st,
         pf,
@@ -1544,7 +1538,14 @@ fn add_seq_and_lazylist(st: &mut SymbolTable) {
         Type::Unit,
         Intrinsic::None,
     );
-    method(st, seq, "apply", vec![Type::Int], ta.clone(), Intrinsic::None);
+    method(
+        st,
+        seq,
+        "apply",
+        vec![Type::Int],
+        ta.clone(),
+        Intrinsic::None,
+    );
     method(st, seq, "length", vec![], Type::Int, Intrinsic::None);
     let seq_mod = module(st, st.scala_pkg, "Seq", "scala/collection/immutable/Seq$");
     let seq_cls = st.module_class_of(seq_mod);
@@ -1705,13 +1706,7 @@ fn add_either(st: &mut SymbolTable) {
     let mems = st.get(left_cls).members.clone();
     st.get_mut(left_mod).members.extend(mems);
 
-    let right = class(
-        st,
-        st.scala_pkg,
-        "Right",
-        "scala/util/Right",
-        &[either_t],
-    );
+    let right = class(st, st.scala_pkg, "Right", "scala/util/Right", &[either_t]);
     let ra = type_param(st, right, "A");
     let rb = type_param(st, right, "B");
     st.get_mut(right).tparams = vec![ra, rb];
@@ -1736,13 +1731,7 @@ fn add_either(st: &mut SymbolTable) {
 }
 
 fn add_try(st: &mut SymbolTable, throwable: SymbolId) {
-    let try_c = class(
-        st,
-        st.scala_pkg,
-        "Try",
-        "scala/util/Try",
-        &[Type::AnyRef],
-    );
+    let try_c = class(st, st.scala_pkg, "Try", "scala/util/Try", &[Type::AnyRef]);
     let tt = type_param(st, try_c, "T");
     st.get_mut(try_c).tparams = vec![tt];
     let t_ty = Type::TypeParam(tt);
@@ -1812,13 +1801,7 @@ fn add_try(st: &mut SymbolTable, throwable: SymbolId) {
         sym: throwable,
         args: vec![],
     };
-    let failure = class(
-        st,
-        st.scala_pkg,
-        "Failure",
-        "scala/util/Failure",
-        &[try_t],
-    );
+    let failure = class(st, st.scala_pkg, "Failure", "scala/util/Failure", &[try_t]);
     let fa = type_param(st, failure, "T");
     st.get_mut(failure).tparams = vec![fa];
     let ff = st.alloc("exception", failure, SymKind::Term, Flags::FINAL, "");
@@ -1850,7 +1833,14 @@ fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
         &[Type::AnyRef],
     );
     method(st, range, "length", vec![], Type::Int, Intrinsic::None);
-    method(st, range, "apply", vec![Type::Int], Type::Int, Intrinsic::None);
+    method(
+        st,
+        range,
+        "apply",
+        vec![Type::Int],
+        Type::Int,
+        Intrinsic::None,
+    );
     method(
         st,
         range,
@@ -1877,24 +1867,19 @@ fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
         sym: range,
         args: vec![],
     };
-    method(st, ri, "to", vec![Type::Int], range_t.clone(), Intrinsic::None);
     method(
         st,
         ri,
-        "until",
+        "to",
         vec![Type::Int],
-        range_t,
+        range_t.clone(),
         Intrinsic::None,
     );
+    method(st, ri, "until", vec![Type::Int], range_t, Intrinsic::None);
     ri
 }
 
-fn add_rich_value(
-    st: &mut SymbolTable,
-    name: &str,
-    jvm: &str,
-    under: Type,
-) -> SymbolId {
+fn add_rich_value(st: &mut SymbolTable, name: &str, jvm: &str, under: Type) -> SymbolId {
     let c = class(st, st.scala_pkg, name, jvm, &[Type::AnyVal]);
     let f = st.alloc("self", c, SymKind::Term, Flags::PARAM, "");
     st.get_mut(f).ty = under.clone();
@@ -2272,14 +2257,7 @@ fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
         sym: jclass,
         args: vec![],
     };
-    method(
-        st,
-        ct,
-        "runtimeClass",
-        vec![],
-        class_ty,
-        Intrinsic::None,
-    );
+    method(st, ct, "runtimeClass", vec![], class_ty, Intrinsic::None);
     method(
         st,
         ct,

@@ -533,6 +533,7 @@ fn erase_ident(tree: &mut Tree, st: &SymbolTable) {
             },
             ty: inner_ty,
             sym: SymbolId::NONE,
+            postfix: false,
         };
     }
 }
@@ -617,7 +618,9 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         },
         _ => false,
     };
-    if is_primitive(&orig_erased) && is_ref_erased(&ret_erased) && !matches!(orig_erased, Type::Unit)
+    if is_primitive(&orig_erased)
+        && is_ref_erased(&ret_erased)
+        && !matches!(orig_erased, Type::Unit)
     {
         if array_prim_load {
             tree.ty = orig_erased;
@@ -664,11 +667,7 @@ fn method_param_types(st: &SymbolTable, fun: &Tree) -> Vec<Type> {
         if owner == st.array_sym {
             match &fun.ty {
                 Type::Method { paramss, .. } => {
-                    return paramss
-                        .iter()
-                        .flatten()
-                        .map(|p| erase_ty(p, st))
-                        .collect();
+                    return paramss.iter().flatten().map(|p| erase_ty(p, st)).collect();
                 }
                 Type::Function { params, .. } => {
                     return params.iter().map(|p| erase_ty(p, st)).collect();
@@ -720,6 +719,7 @@ fn wrap_box(tree: &mut Tree) {
             ret: Box::new(Type::Any),
         },
         sym: SymbolId::NONE,
+        postfix: false,
     };
     *tree = Tree {
         id: inner.id,
@@ -730,6 +730,7 @@ fn wrap_box(tree: &mut Tree) {
         },
         ty: Type::Any,
         sym: SymbolId::NONE,
+        postfix: false,
     };
 }
 
@@ -747,6 +748,7 @@ fn wrap_unbox(tree: &mut Tree, to: Type) {
             ret: Box::new(to.clone()),
         },
         sym: SymbolId::NONE,
+        postfix: false,
     };
     *tree = Tree {
         id: inner.id,
@@ -757,5 +759,6 @@ fn wrap_unbox(tree: &mut Tree, to: Type) {
         },
         ty: to,
         sym: SymbolId::NONE,
+        postfix: false,
     };
 }

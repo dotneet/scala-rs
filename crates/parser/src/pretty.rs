@@ -119,7 +119,14 @@ fn dump_into(s: &mut String, t: &Tree, indent: usize) {
             }
             Ok(())
         }
-        TreeKind::TypeDef { name, rhs, views, ctx_bounds, mods, .. } => {
+        TreeKind::TypeDef {
+            name,
+            rhs,
+            views,
+            ctx_bounds,
+            mods,
+            ..
+        } => {
             let var = if mods.flags.contains(Flags::COVARIANT) {
                 "+"
             } else if mods.flags.contains(Flags::CONTRAVARIANT) {
@@ -247,7 +254,11 @@ fn dump_into(s: &mut String, t: &Tree, indent: usize) {
             Ok(())
         }
         TreeKind::Select { qual, name } => {
-            writeln!(s, "{pad}Select {name}{ty}");
+            writeln!(
+                s,
+                "{pad}Select {name}{}{ty}",
+                if t.postfix { " postfix" } else { "" }
+            );
             dump_into(s, qual, indent + 1);
             Ok(())
         }
@@ -306,7 +317,10 @@ fn dump_into(s: &mut String, t: &Tree, indent: usize) {
             dump_into(s, qual, indent + 1);
             Ok(())
         }
-        TreeKind::CompoundTypeTree { parents, refinements } => {
+        TreeKind::CompoundTypeTree {
+            parents,
+            refinements,
+        } => {
             writeln!(s, "{pad}CompoundType{ty}");
             for p in parents {
                 dump_into(s, p, indent + 1);

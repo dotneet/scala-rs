@@ -50,6 +50,10 @@ pub enum Intrinsic {
     Eq,
     /// AnyRef reference inequality (`ne`).
     Ne,
+    /// Universal equality (`Any.==`).
+    AnyEq,
+    /// Universal inequality (`Any.!=`).
+    AnyNe,
     /// `Any.synchronized` (monitor enter/exit around a by-name body).
     Synchronized,
 }
@@ -332,6 +336,10 @@ impl SymbolTable {
                 .iter()
                 .find_map(|p| self.class_sym_of(p))
                 .or(Some(self.anyref_sym)),
+            Type::Tuple(ts) if !ts.is_empty() => self
+                .lookup(&format!("Tuple{}", ts.len()))
+                .into_iter()
+                .find(|s| self.get(*s).is_class_like()),
             _ => None,
         }
     }
@@ -519,6 +527,31 @@ impl SymbolTable {
                     false
                 }
             }
+            // Before the Class-parent walk: that arm matches every Class and
+            // would otherwise hide `Tuple2[A, B] <: (A, B)` / the reverse.
+            (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
+                a.iter().zip(b.iter()).all(|(x, y)| self.is_sub_type(x, y))
+            }
+            (Type::Tuple(ts), Type::Class { sym, args })
+                if self.is_tuple_arity(*sym, ts.len())
+                    && (args.is_empty() || args.len() == ts.len()) =>
+            {
+                args.is_empty()
+                    || ts
+                        .iter()
+                        .zip(args.iter())
+                        .all(|(x, y)| self.is_sub_type(x, y))
+            }
+            (Type::Class { sym, args }, Type::Tuple(ts))
+                if self.is_tuple_arity(*sym, ts.len())
+                    && (args.is_empty() || args.len() == ts.len()) =>
+            {
+                args.is_empty()
+                    || args
+                        .iter()
+                        .zip(ts.iter())
+                        .all(|(x, y)| self.is_sub_type(x, y))
+            }
             (a, Type::Refined { parents, decls }) => {
                 parents.iter().all(|p| self.is_sub_type(a, p))
                     && self.conforms_to_refinement(a, decls)
@@ -589,11 +622,23 @@ impl SymbolTable {
             }
             (Type::ByName(a), Type::ByName(b)) => self.is_sub_type(a, b),
             (Type::Repeated(a), Type::Repeated(b)) => self.is_sub_type(a, b),
-            (Type::Refined { parents, .. }, b) => {
-                parents.iter().any(|p| self.is_sub_type(p, b))
-            }
+            (Type::Refined { parents, .. }, b) => parents.iter().any(|p| self.is_sub_type(p, b)),
             _ => false,
         }
+    }
+
+    fn is_tuple_arity(&self, sym: SymbolId, n: usize) -> bool {
+        let s = self.get(sym);
+        let name = s.name.trim_end_matches('$');
+        if name == format!("Tuple{n}") {
+            return true;
+        }
+        let jvm = if s.jvm_name.is_empty() {
+            String::new()
+        } else {
+            s.jvm_name.clone()
+        };
+        jvm == format!("scala/Tuple{n}")
     }
 
     pub fn display_type(&self, ty: &Type) -> String {
@@ -890,7 +935,10 @@ impl SymbolTable {
     pub(crate) fn lookup_type_member_on(&self, ty: &Type, name: &str) -> Option<Type> {
         if let Type::Refined { parents, decls } = ty {
             if let Some(t) = Self::refine_member_type(decls, name) {
-                if decls.iter().any(|d| matches!(d, RefineDecl::Type { name: n, .. } if n == name)) {
+                if decls
+                    .iter()
+                    .any(|d| matches!(d, RefineDecl::Type { name: n, .. } if n == name))
+                {
                     return Some(t);
                 }
             }
@@ -1009,19 +1057,11 @@ fn expand_refine_decl(st: &SymbolTable, from: SymbolId, d: &RefineDecl) -> Refin
             name: name.clone(),
             rhs: rhs.as_ref().map(|t| st.expand_type_members(from, t)),
         },
-        RefineDecl::Def {
-            name,
-            paramss,
-            ret,
-        } => RefineDecl::Def {
+        RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
             name: name.clone(),
             paramss: paramss
                 .iter()
-                .map(|ps| {
-                    ps.iter()
-                        .map(|p| st.expand_type_members(from, p))
-                        .collect()
-                })
+                .map(|ps| ps.iter().map(|p| st.expand_type_members(from, p)).collect())
                 .collect(),
             ret: st.expand_type_members(from, ret),
         },
@@ -1032,17 +1072,17 @@ fn expand_refine_decl(st: &SymbolTable, from: SymbolId, d: &RefineDecl) -> Refin
     }
 }
 
-fn subst_refine_decl(d: &RefineDecl, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> RefineDecl {
+fn subst_refine_decl(
+    d: &RefineDecl,
+    tps: &[scala_rs_parser::SymbolId],
+    args: &[Type],
+) -> RefineDecl {
     match d {
         RefineDecl::Type { name, rhs } => RefineDecl::Type {
             name: name.clone(),
             rhs: rhs.as_ref().map(|t| subst_map(t, tps, args)),
         },
-        RefineDecl::Def {
-            name,
-            paramss,
-            ret,
-        } => RefineDecl::Def {
+        RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
             name: name.clone(),
             paramss: paramss
                 .iter()

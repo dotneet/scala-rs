@@ -8,7 +8,9 @@
 //! `object` method, a method taking `List[_]` (EXISTENTIALtpe), and
 //! `@deprecated("msg", "2.13.0")` (SYMANNOT + LITERALstring), `this.type`
 //! (THIStpe as a method result), `List[_ <: AnyRef]` (EXISTENTIALtpe with a
-//! bounded TYPEsym), and `T @unchecked` (ANNOTATEDtpe) against our classfiles.
+//! bounded TYPEsym), `T @unchecked` (ANNOTATEDtpe), and SIP-23 literal types
+//! (`def f(x: 1)`, `val one: 1`) as `CONSTANTtpe` + `LITERALint` against our
+//! classfiles.
 //! Flags are nsc raw longs run through `rawToPickledFlags`.
 //! It is **not** a full nsc pickle — leftover holes are documented in README.
 //!
@@ -25,6 +27,8 @@
 //! - `this.type` results are `THIStpe` of the enclosing class
 //! - type annotations `T @unchecked` are `ANNOTATEDtpe` + `ANNOTINFO`
 //! - annotation args that are string literals are `LITERALstring` + `SYMANNOT`
+//! - SIP-23 `1` in a signature is `CONSTANTtpe(LITERALint)` (nsc `writeLong` =
+//!   signed big-endian base 256)
 
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{SymKind, SymbolTable};
@@ -45,14 +49,34 @@ pub const NOTPE: u8 = 11;
 pub const NOPREFIXTPE: u8 = 12;
 pub const THISTPE: u8 = 13;
 pub const SINGLETPE: u8 = 14;
+/// nsc `CONSTANTtpe` (mixed case matches PickleFormat).
+#[allow(non_upper_case_globals)]
+pub const CONSTANTtpe: u8 = 15;
 pub const TYPEREFTPE: u8 = 16;
 pub const TYPEBOUNDSTPE: u8 = 17;
 pub const CLASSINFOTPE: u8 = 19;
 pub const METHODTPE: u8 = 20;
 pub const POLYTPE: u8 = 21;
+/// nsc literal tags (mixed case matches PickleFormat).
+#[allow(non_upper_case_globals)]
+pub const LITERALunit: u8 = 24;
+#[allow(non_upper_case_globals)]
+pub const LITERALboolean: u8 = 25;
+#[allow(non_upper_case_globals)]
+pub const LITERALchar: u8 = 28;
+#[allow(non_upper_case_globals)]
+pub const LITERALint: u8 = 29;
+#[allow(non_upper_case_globals)]
+pub const LITERALlong: u8 = 30;
+#[allow(non_upper_case_globals)]
+pub const LITERALfloat: u8 = 31;
+#[allow(non_upper_case_globals)]
+pub const LITERALdouble: u8 = 32;
 /// nsc `LITERALstring` (mixed case matches PickleFormat).
 #[allow(non_upper_case_globals)]
 pub const LITERALstring: u8 = 33;
+#[allow(non_upper_case_globals)]
+pub const LITERALnull: u8 = 34;
 pub const SYMANNOT: u8 = 40;
 pub const ANNOTATEDTPE: u8 = 42;
 pub const ANNOTINFO: u8 = 43;
@@ -173,7 +197,10 @@ pub fn encode_bytes(src: &[u8]) -> Vec<u8> {
 /// Encode pickle bytes as the Java String stored in `ScalaSignature.bytes`
 /// (latin-1 chars, later written as modified UTF-8 in the classfile).
 pub fn encode_to_annotation_string(src: &[u8]) -> String {
-    encode_bytes(src).into_iter().map(|b| char::from(b)).collect()
+    encode_bytes(src)
+        .into_iter()
+        .map(|b| char::from(b))
+        .collect()
 }
 
 pub fn regenerate_zero(src: &mut [u8]) -> usize {
@@ -581,11 +608,15 @@ impl<'a> Pickler<'a> {
         if let Some(&idx) = self.sym_index.get(&class_sym.0) {
             return self.type_ref_local_refs(idx, arg_refs);
         }
-        let n = self.st.get(class_sym).name.trim_end_matches('$').to_string();
+        let n = self
+            .st
+            .get(class_sym)
+            .name
+            .trim_end_matches('$')
+            .to_string();
         match n.as_str() {
             "Int" | "Long" | "Float" | "Double" | "Boolean" | "Char" | "Unit" | "Any"
-            | "AnyRef" | "AnyVal" | "Nothing" | "Null" | "Array" | "Seq" | "String"
-            | "Object" => {
+            | "AnyRef" | "AnyVal" | "Nothing" | "Null" | "Array" | "Seq" | "String" | "Object" => {
                 if arg_refs.is_empty() {
                     self.type_ref_named(&n)
                 } else {
@@ -659,10 +690,7 @@ impl<'a> Pickler<'a> {
                     arg_refs.push(self.type_ref_of_pickle_sym(q));
                 }
                 Type::BoundedWildcard { lo, hi } => {
-                    let q = self.pickle_existential_param(
-                        lo.as_deref(),
-                        hi.as_deref(),
-                    );
+                    let q = self.pickle_existential_param(lo.as_deref(), hi.as_deref());
                     quantified.push(q);
                     arg_refs.push(self.type_ref_of_pickle_sym(q));
                 }
@@ -693,14 +721,50 @@ impl<'a> Pickler<'a> {
         self.add(LITERALstring, body)
     }
 
+    /// nsc `PickleBuffer.writeLong`: signed big-endian base 256.
+    fn pickle_literal(&mut self, lit: &Lit) -> u32 {
+        match lit {
+            Lit::Unit => self.add(LITERALunit, vec![]),
+            Lit::Null => self.add(LITERALnull, vec![]),
+            Lit::Boolean(b) => {
+                let mut body = Vec::new();
+                write_long_signed_256(&mut body, if *b { 1 } else { 0 });
+                self.add(LITERALboolean, body)
+            }
+            Lit::Int(n) => {
+                let mut body = Vec::new();
+                write_long_signed_256(&mut body, *n as i64);
+                self.add(LITERALint, body)
+            }
+            Lit::Long(n) => {
+                let mut body = Vec::new();
+                write_long_signed_256(&mut body, *n);
+                self.add(LITERALlong, body)
+            }
+            Lit::Float(n) => {
+                let mut body = Vec::new();
+                write_long_signed_256(&mut body, n.to_bits() as i64);
+                self.add(LITERALfloat, body)
+            }
+            Lit::Double(n) => {
+                let mut body = Vec::new();
+                write_long_signed_256(&mut body, n.to_bits() as i64);
+                self.add(LITERALdouble, body)
+            }
+            Lit::Char(c) => {
+                let mut body = Vec::new();
+                write_long_signed_256(&mut body, *c as u32 as i64);
+                self.add(LITERALchar, body)
+            }
+            Lit::String(s) => self.pickle_literal_string(s),
+            Lit::Symbol(s) => self.pickle_literal_string(s),
+        }
+    }
+
     fn pickle_symannot(&mut self, target: u32, annot: &Tree) {
         let path = annot.annotation_path();
         let simple = path.rsplit('.').next().unwrap_or(path.as_str());
-        if matches!(
-            simple,
-            "Override" | "Deprecated"
-        ) || path.starts_with("java.lang.")
-        {
+        if matches!(simple, "Override" | "Deprecated") || path.starts_with("java.lang.") {
             return;
         }
         let atp = if simple == "tailrec" {
@@ -736,10 +800,7 @@ impl<'a> Pickler<'a> {
             return i;
         }
         let _ = self.pickle_class(cls);
-        self.this_tpes
-            .get(&cls.0)
-            .copied()
-            .unwrap_or(self.noprefix)
+        self.this_tpes.get(&cls.0).copied().unwrap_or(self.noprefix)
     }
 
     fn pickle_term_ref(&mut self, id: SymbolId) -> u32 {
@@ -836,8 +897,7 @@ impl<'a> Pickler<'a> {
                 if ts.iter().any(type_has_wildcard) {
                     let (arg_refs, quantified) = self.pickle_args_existentials(ts);
                     let sc = self.scala_module();
-                    let inner =
-                        self.type_ref_in_refs(sc, &format!("Tuple{}", ts.len()), &arg_refs);
+                    let inner = self.type_ref_in_refs(sc, &format!("Tuple{}", ts.len()), &arg_refs);
                     return self.pickle_existential_tpe(inner, &quantified);
                 }
                 let sc = self.scala_module();
@@ -847,7 +907,12 @@ impl<'a> Pickler<'a> {
             Type::ByName(t) => self.pickle_type(t),
             Type::Repeated(_) => self.type_ref_named("Seq"),
             Type::Method { ret, .. } => self.pickle_type(ret),
-            Type::Constant(lit) => self.pickle_type(&Type::lit_underlying(lit)),
+            Type::Constant(lit) => {
+                let c = self.pickle_literal(lit);
+                let mut body = Vec::new();
+                write_nat_to(&mut body, c);
+                self.add(CONSTANTtpe, body)
+            }
             _ => self.type_ref_named("Any"),
         }
     }
@@ -1178,7 +1243,9 @@ fn annot_string_args(tree: &Tree) -> Vec<String> {
         TreeKind::Apply { args, .. } => args
             .iter()
             .filter_map(|a| match &a.kind {
-                TreeKind::Literal { lit: Lit::String(s) } => Some(s.clone()),
+                TreeKind::Literal {
+                    lit: Lit::String(s),
+                } => Some(s.clone()),
                 _ => None,
             })
             .collect(),
@@ -1251,6 +1318,16 @@ fn pickled_from_our(f: Flags, kind: SymKind, extra_raw: u64) -> u64 {
     raw_to_pickled(nsc_raw_from_our(f, kind) | extra_raw)
 }
 
+/// nsc `PickleBuffer.writeLong`: signed big-endian base 256.
+fn write_long_signed_256(out: &mut Vec<u8>, x: i64) {
+    let y = x >> 8;
+    let z = x & 0xff;
+    if -y != (z >> 7) {
+        write_long_signed_256(out, y);
+    }
+    out.push(z as u8);
+}
+
 /// nsc `PickleBuffer.writeLongNat`: big-endian base-128.
 fn write_long_nat_to(out: &mut Vec<u8>, x: u64) {
     fn prefix(out: &mut Vec<u8>, x: u64) {
@@ -1289,18 +1366,18 @@ fn pickle_sig_incomplete(st: &SymbolTable, id: SymbolId) -> bool {
 /// nsc `Flags.rawToPickledFlags`: bits 0–11 differ between raw and pickled form.
 fn raw_to_pickled(flags: u64) -> u64 {
     const PAIRS: [(u64, u64); 12] = [
-        (1 << 6, 1 << 9),   // METHOD
-        (1 << 2, 1 << 2),   // PRIVATE
-        (1 << 5, 1 << 1),   // FINAL
-        (1 << 0, 1 << 3),   // PROTECTED
-        (1 << 11, 1 << 6),  // CASE
-        (1 << 4, 1 << 8),   // DEFERRED
-        (1 << 8, 1 << 10),  // MODULE
-        (1 << 1, 1 << 5),   // OVERRIDE
-        (1 << 7, 1 << 11),  // INTERFACE
-        (1 << 9, 1 << 0),   // IMPLICIT
-        (1 << 10, 1 << 4),  // SEALED
-        (1 << 3, 1 << 7),   // ABSTRACT
+        (1 << 6, 1 << 9),  // METHOD
+        (1 << 2, 1 << 2),  // PRIVATE
+        (1 << 5, 1 << 1),  // FINAL
+        (1 << 0, 1 << 3),  // PROTECTED
+        (1 << 11, 1 << 6), // CASE
+        (1 << 4, 1 << 8),  // DEFERRED
+        (1 << 8, 1 << 10), // MODULE
+        (1 << 1, 1 << 5),  // OVERRIDE
+        (1 << 7, 1 << 11), // INTERFACE
+        (1 << 9, 1 << 0),  // IMPLICIT
+        (1 << 10, 1 << 4), // SEALED
+        (1 << 3, 1 << 7),  // ABSTRACT
     ];
     let from_set = PAIRS.iter().fold(0u64, |a, (from, _)| a | from);
     let mut result = flags & !from_set;
@@ -1329,11 +1406,7 @@ pub fn pickle_class(st: &SymbolTable, class_id: SymbolId) -> Vec<u8> {
 pub fn pickle_all(st: &SymbolTable) -> std::collections::HashMap<u32, Vec<u8>> {
     let mut out = std::collections::HashMap::new();
     for s in &st.symbols {
-        if matches!(
-            s.kind,
-            SymKind::Class | SymKind::ModuleClass
-        ) && !s.id.is_none()
-        {
+        if matches!(s.kind, SymKind::Class | SymKind::ModuleClass) && !s.id.is_none() {
             let raw = pickle_class(st, s.id);
             if !raw.is_empty() {
                 out.insert(s.id.0, raw);
@@ -1426,6 +1499,8 @@ enum Entry {
         prefix: u32,
         sym: u32,
     },
+    ConstantTpe(u32),
+    LiteralTy(String),
     AnnotatedTpe(u32),
     TypeRef {
         prefix: u32,
@@ -1544,6 +1619,47 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 r.pos = end;
                 Entry::SingleTpe { prefix, sym }
             }
+            CONSTANTtpe => {
+                let c = r.read_nat().unwrap_or(0);
+                r.pos = end;
+                Entry::ConstantTpe(c)
+            }
+            LITERALunit => {
+                r.pos = end;
+                Entry::LiteralTy("Unit".into())
+            }
+            LITERALboolean => {
+                r.pos = end;
+                Entry::LiteralTy("Boolean".into())
+            }
+            LITERALchar => {
+                r.pos = end;
+                Entry::LiteralTy("Char".into())
+            }
+            LITERALint => {
+                r.pos = end;
+                Entry::LiteralTy("Int".into())
+            }
+            LITERALlong => {
+                r.pos = end;
+                Entry::LiteralTy("Long".into())
+            }
+            LITERALfloat => {
+                r.pos = end;
+                Entry::LiteralTy("Float".into())
+            }
+            LITERALdouble => {
+                r.pos = end;
+                Entry::LiteralTy("Double".into())
+            }
+            LITERALstring => {
+                r.pos = end;
+                Entry::LiteralTy("String".into())
+            }
+            LITERALnull => {
+                r.pos = end;
+                Entry::LiteralTy("Null".into())
+            }
             ANNOTATEDTPE => {
                 let tpe = r.read_nat().unwrap_or(0);
                 r.pos = end;
@@ -1636,6 +1752,8 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             },
             Some(Entry::AnnotatedTpe(t)) => type_name_of(entries, *t),
             Some(Entry::SingleTpe { prefix, .. }) => type_name_of(entries, *prefix),
+            Some(Entry::ConstantTpe(c)) => type_name_of(entries, *c),
+            Some(Entry::LiteralTy(s)) => s.clone(),
             _ => "Any".into(),
         }
     }
@@ -1726,14 +1844,14 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             }
             let is_accessor = (*flags & (1u64 << 27)) != 0; // ACCESSOR
             methods.push(PickledMethod {
-                    name: mname.clone(),
-                    param_names,
-                    param_types,
-                    ret: type_name_of(&entries, *ret),
-                    tparams,
-                    is_val: is_accessor,
-                    is_ctor: mname == "<init>",
-                });
+                name: mname.clone(),
+                param_names,
+                param_types,
+                ret: type_name_of(&entries, *ret),
+                tparams,
+                is_val: is_accessor,
+                is_ctor: mname == "<init>",
+            });
         } else {
             // NullaryMethodType (POLYtpe with no tparams) or a plain type.
             let is_accessor = (*flags & (1u64 << 27)) != 0;
@@ -1872,13 +1990,12 @@ class Box[A](val value: A) {
             .expect("val magic");
         assert!(magic.is_val, "magic should be a val, got {magic:?}");
         assert_eq!(magic.ret, "Int");
-        let greet = p
-            .methods
-            .iter()
-            .find(|m| m.name == "greet")
-            .expect("greet");
+        let greet = p.methods.iter().find(|m| m.name == "greet").expect("greet");
         assert_eq!(greet.param_names.len(), 2);
-        assert_eq!(greet.param_types, vec!["String".to_string(), "String".to_string()]);
+        assert_eq!(
+            greet.param_types,
+            vec!["String".to_string(), "String".to_string()]
+        );
         let id = p.methods.iter().find(|m| m.name == "id").expect("id");
         assert_eq!(id.tparams, vec!["T".to_string()]);
         assert_eq!(id.param_types, vec!["T".to_string()]);
@@ -1902,11 +2019,7 @@ class Box[A](val value: A) {
         assert_eq!(value.ret, "A");
         let get = b.methods.iter().find(|m| m.name == "get").expect("get");
         assert_eq!(get.ret, "A");
-        let init = b
-            .methods
-            .iter()
-            .find(|m| m.is_ctor)
-            .expect("<init>");
+        let init = b.methods.iter().find(|m| m.is_ctor).expect("<init>");
         assert_eq!(init.param_types, vec!["A".to_string()]);
     }
 
@@ -1943,11 +2056,7 @@ object Lib {
         let x = pc.methods.iter().find(|m| m.name == "x").expect("val x");
         assert!(x.is_val);
         assert_eq!(x.ret, "Int");
-        let init = pc
-            .methods
-            .iter()
-            .find(|m| m.is_ctor)
-            .expect("<init>");
+        let init = pc.methods.iter().find(|m| m.is_ctor).expect("<init>");
         assert_eq!(init.param_types, vec!["Int".to_string(), "Int".to_string()]);
 
         let lib = st
@@ -1969,8 +2078,15 @@ object Lib {
             .expect("Point module");
         let pm = unpickle(&pickle_class(&st, st.module_class_of(pmod))).expect("unpickle Point$");
         assert!(pm.is_module);
-        let apply = pm.methods.iter().find(|m| m.name == "apply").expect("apply");
-        assert_eq!(apply.param_types, vec!["Int".to_string(), "Int".to_string()]);
+        let apply = pm
+            .methods
+            .iter()
+            .find(|m| m.name == "apply")
+            .expect("apply");
+        assert_eq!(
+            apply.param_types,
+            vec!["Int".to_string(), "Int".to_string()]
+        );
         assert_eq!(apply.ret, "Point");
         let unapply = pm
             .methods
@@ -2122,6 +2238,45 @@ object Lib {
         assert_eq!(f.param_types, vec!["List".to_string()]);
         let h = p.methods.iter().find(|m| m.name == "h").expect("h");
         assert_eq!(h.param_types, vec!["Int".to_string()]);
+    }
+
+    #[test]
+    fn pickle_constant_tpe_for_literal_types() {
+        let src = r#"
+object Lib {
+  val one: 1 = 1
+  def lit(x: 1): Int = x
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let lib = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Lib" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("Lib module");
+        let raw = pickle_class(&st, st.module_class_of(lib));
+        let tags = pickle_tags(&raw);
+        assert!(
+            tags.contains(&CONSTANTtpe),
+            "expected CONSTANTtpe in pickle, tags={tags:?}"
+        );
+        assert!(
+            tags.contains(&LITERALint),
+            "expected LITERALint in pickle, tags={tags:?}"
+        );
+        let p = unpickle(&raw).expect("unpickle Lib");
+        let one = p.methods.iter().find(|m| m.name == "one").expect("one");
+        assert!(one.is_val);
+        assert_eq!(one.ret, "Int");
+        let lit = p.methods.iter().find(|m| m.name == "lit").expect("lit");
+        assert_eq!(lit.param_types, vec!["Int".to_string()]);
+        assert_eq!(lit.ret, "Int");
     }
 
     fn pickle_tags_name(bytes: &[u8], idx: u32) -> Option<String> {

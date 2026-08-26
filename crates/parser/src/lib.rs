@@ -177,8 +177,14 @@ object Main {
 "#,
         );
         let dump = dump_tree(&t);
-        assert!(dump.contains("TypeDef _") || dump.contains("Existential"), "{dump}");
-        assert!(dump.contains("Existential"), "forSome should parse as ExistentialTypeTree: {dump}");
+        assert!(
+            dump.contains("TypeDef _") || dump.contains("Existential"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("Existential"),
+            "forSome should parse as ExistentialTypeTree: {dump}"
+        );
     }
 
     #[test]
@@ -232,7 +238,10 @@ object Main {
 "#,
         );
         let dump = dump_tree(&t);
-        assert!(dump.contains("Typed"), "eta `inc _` should parse as Typed: {dump}");
+        assert!(
+            dump.contains("Typed"),
+            "eta `inc _` should parse as Typed: {dump}"
+        );
         assert!(dump.contains("Function"), "{dump}");
         assert!(dump.contains("$anon"), "anonymous class: {dump}");
     }
@@ -258,7 +267,10 @@ object Main {
 "#,
         );
         let dump = dump_tree(&t);
-        assert!(dump.contains("view"), "view bound should be kept on TypeDef: {dump}");
+        assert!(
+            dump.contains("view"),
+            "view bound should be kept on TypeDef: {dump}"
+        );
         assert!(dump.contains("Ordered"), "{dump}");
         let r = parse_str("object M { def f[T <% Ordered[T] <% Ordered[Int]](x: T): T = x }\n");
         assert!(
@@ -279,7 +291,10 @@ object Main {
 "#,
         );
         let dump = dump_tree(&t);
-        assert!(dump.contains("ctx"), "context bound should be kept on TypeDef: {dump}");
+        assert!(
+            dump.contains("ctx"),
+            "context bound should be kept on TypeDef: {dump}"
+        );
         assert!(dump.contains("ClassTag"), "{dump}");
         assert!(
             dump.contains("<repeated>"),
@@ -367,8 +382,7 @@ trait Add { self: Foo =>
 
     fn find_val<'a>(t: &'a Tree, want: &str) -> Option<&'a Tree> {
         match &t.kind {
-            TreeKind::PackageDef { stats, .. }
-            | TreeKind::Block { stats, .. } => {
+            TreeKind::PackageDef { stats, .. } | TreeKind::Block { stats, .. } => {
                 for s in stats {
                     if let Some(v) = find_val(s, want) {
                         return Some(v);
@@ -533,5 +547,24 @@ object M {
         );
         let dump = dump_tree(&t);
         assert!(dump.contains("DoWhile"), "{dump}");
+    }
+
+    #[test]
+    fn postfix_select_same_line() {
+        let t = parse_ok(
+            r#"
+object M {
+  def f(xs: List[Int]): Any = xs toList
+  def g(): Int = 42 bang
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Select toList postfix"), "{dump}");
+        assert!(dump.contains("Select bang postfix"), "{dump}");
+        assert!(
+            !dump.contains("Select + postfix"),
+            "infix plus must not be postfix: {dump}"
+        );
     }
 }

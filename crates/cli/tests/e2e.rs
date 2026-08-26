@@ -170,7 +170,12 @@ fn compile_auto_links_discovered_scala_library() {
     let src = fixtures_dir().join("hello.scala");
     let out = tmp_dir("compile-autolink");
     let status = Command::new(bin())
-        .args(["compile", src.to_str().unwrap(), "-d", out.to_str().unwrap()])
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+        ])
         .status()
         .expect("run scala-rs compile");
     assert!(status.success(), "compile (auto-link) failed: {status}");
@@ -407,6 +412,36 @@ fn compile_fails(name: &str, needle: &str) {
     let _ = fs::remove_dir_all(&out);
 }
 
+fn compile_warns(name: &str, needle: &str) {
+    let src = fixtures_dir().join(format!("{name}.scala"));
+    let out = tmp_dir(name);
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--no-scala-library",
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "expected compile of {name} to succeed with a warning, got {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        err.contains(needle),
+        "expected {needle:?} in diagnostics for {name}, got {err:?}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
 #[test]
 fn fixtures_implicit_ambiguous_is_error() {
     compile_fails("implicit_ambiguous", "ambiguous implicit");
@@ -518,6 +553,16 @@ fn fixtures_implicit_class() {
 }
 
 #[test]
+fn fixtures_dynamic() {
+    check("dynamic");
+}
+
+#[test]
+fn fixtures_postfix_ops() {
+    check("postfix_ops");
+}
+
+#[test]
 fn fixtures_structural() {
     check("structural");
 }
@@ -555,6 +600,38 @@ fn fixtures_const_types_bad_is_error() {
 #[test]
 fn fixtures_dynamic_bad_is_error() {
     compile_fails("dynamic_bad", "language.dynamics");
+}
+
+#[test]
+fn fixtures_postfix_ops_warns_without_import() {
+    compile_warns("postfix_ops_bad", "postfixOps");
+}
+
+#[test]
+fn fixtures_implicit_conv_warns_without_import() {
+    compile_warns("implicit_conv_bad", "implicitConversions");
+}
+
+#[test]
+fn fatal_warnings_makes_postfix_ops_fail() {
+    let src = fixtures_dir().join("postfix_ops_bad.scala");
+    let out = tmp_dir("fatal-postfix");
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--no-scala-library",
+            "-Xfatal-warnings",
+        ])
+        .status()
+        .expect("run scala-rs compile");
+    assert!(
+        !status.success(),
+        "expected -Xfatal-warnings to fail postfix without import"
+    );
+    let _ = fs::remove_dir_all(&out);
 }
 
 #[test]
@@ -811,6 +888,14 @@ fn scala_library_dual_run_implicit_class() {
 #[test]
 fn scala_library_dual_run_dynamic() {
     dual_run_fixture("dynamic");
+}
+#[test]
+fn scala_library_dual_run_postfix_ops() {
+    dual_run_fixture("postfix_ops");
+}
+#[test]
+fn scala_library_dual_run_postfix_abs() {
+    dual_run_fixture("postfix_abs");
 }
 
 const LIBRARY_COLLIDERS: &[&str] = &[
@@ -1228,8 +1313,9 @@ fn find_scalac() -> Option<PathBuf> {
 /// small official tarball download. Probes a `val`, a `def` with params,
 /// `id[T]`, a `case class` via companion apply `Point(3, 4)` / term `Point`
 /// (`MODULE$`) plus field accessors, extractor `unapply` so `p match { case
-/// Point(a, b) => a + b }` typechecks, and an `object` method taking that case
-/// class. Remaining pickle holes (TREE annotation args, Java annotations,
+/// Point(a, b) => a + b }` typechecks, an `object` method taking that case
+/// class, and SIP-23 literal types `val one: 1` / `def lit(x: 1)` (CONSTANTtpe).
+/// Remaining pickle holes (TREE annotation args, Java annotations,
 /// nested packed existentials, refinement pickle, leftover Flags) are not
 /// claimed. If scalac cannot read a probed shape, this test fails rather
 /// than claiming success.
@@ -1280,6 +1366,8 @@ object UseLib {
     val hn: Int = new Holder().me.n
     val ar: Int = Lib.fAnyRef(List("a"))
     val u: Int = Lib.h(1)
+    val one: 1 = Lib.one
+    val lit: Int = Lib.lit(1)
   }
 }
 "#,
@@ -1297,7 +1385,7 @@ object UseLib {
         .expect("scalac");
     assert!(
         output.status.success(),
-        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked): {}\n{}",
+        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1)): {}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );

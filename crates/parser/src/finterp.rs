@@ -77,7 +77,11 @@ pub fn assemble_f(parts: &[String], nargs: usize) -> Result<(String, Vec<FSpec>)
                 spec.conv
             )));
         }
-        if spec.precision.is_some() && matches!(spec.conv, 'd' | 'o' | 'x' | 'X' | 'c' | 'C' | 'b' | 'B' | 'h' | 'H')
+        if spec.precision.is_some()
+            && matches!(
+                spec.conv,
+                'd' | 'o' | 'x' | 'X' | 'c' | 'C' | 'b' | 'B' | 'h' | 'H'
+            )
         {
             return Err(FInterpError::Message(format!(
                 "f interpolator: precision not allowed for %{}",

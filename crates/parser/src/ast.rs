@@ -186,7 +186,7 @@ pub enum Type {
         sym: SymbolId,
     },
     /// SIP-23 literal / constant type (`1`, `true`, `"hi"`). Subtype of the
-    /// underlying type (`1 <: Int`); not pickled as CONSTANTINTtpe.
+    /// underlying type (`1 <: Int`). Pickled as nsc `CONSTANTtpe`.
     Constant(Lit),
     /// `T @annot` (type annotation; not a symbol annotation).
     Annotated {
@@ -413,11 +413,7 @@ impl fmt::Display for RefineDecl {
                 }
                 Ok(())
             }
-            RefineDecl::Def {
-                name,
-                paramss,
-                ret,
-            } => {
+            RefineDecl::Def { name, paramss, ret } => {
                 write!(f, "def {name}")?;
                 for ps in paramss {
                     write!(f, "(")?;
@@ -443,6 +439,8 @@ pub struct Tree {
     pub kind: TreeKind,
     pub ty: Type,
     pub sym: SymbolId,
+    /// nsc postfix select (`xs toList`, `42 abs`): same-line `expr ident`.
+    pub postfix: bool,
 }
 
 impl Tree {
@@ -453,6 +451,7 @@ impl Tree {
             kind,
             ty: Type::NoType,
             sym: SymbolId::NONE,
+            postfix: false,
         }
     }
 

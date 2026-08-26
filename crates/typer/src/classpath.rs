@@ -108,9 +108,9 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
 }
 
 fn has_member(st: &SymbolTable, owner: SymbolId, name: &str) -> bool {
-    st.lookup_member(owner, name).iter().any(|&id| {
-        matches!(st.get(id).kind, SymKind::Method | SymKind::Term)
-    })
+    st.lookup_member(owner, name)
+        .iter()
+        .any(|&id| matches!(st.get(id).kind, SymKind::Method | SymKind::Term))
 }
 
 fn install_tparams(st: &mut SymbolTable, owner: SymbolId, names: &[String]) {
@@ -244,7 +244,10 @@ fn is_forwarder_of_module(classes: &[ClasspathClass], c: &ClasspathClass) -> boo
     }
     // A case class `Point.class` sits next to companion `Point$.class`. That is
     // not a static forwarder: the pickle describes a real class (ctor / vals).
-    if c.pickle.as_ref().is_some_and(|p| p.iter().any(|m| m.is_ctor || m.is_val)) {
+    if c.pickle
+        .as_ref()
+        .is_some_and(|p| p.iter().any(|m| m.is_ctor || m.is_val))
+    {
         return false;
     }
     let dollar = format!("{}$", c.jvm_name);
@@ -356,9 +359,11 @@ fn resolve_type_name(st: &SymbolTable, name: &str) -> Type {
                     sym: id,
                     args: vec![],
                 }
-            } else if let Some(id) = found.iter().copied().find(|s| {
-                st.get(*s).is_class_like() || st.get(*s).kind == SymKind::Module
-            }) {
+            } else if let Some(id) = found
+                .iter()
+                .copied()
+                .find(|s| st.get(*s).is_class_like() || st.get(*s).kind == SymKind::Module)
+            {
                 match st.get(id).kind {
                     SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
                     _ => Type::Class {

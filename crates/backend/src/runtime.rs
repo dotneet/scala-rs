@@ -28,6 +28,7 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
         emit_nil(),
         emit_list_module(),
         emit_tuple2(),
+        emit_dynamic(),
         emit_arrow_assoc(),
         emit_not_implemented(),
         emit_non_local_return_control(),
@@ -144,7 +145,11 @@ fn emit_ordered() -> EmittedClass {
     let mut b = B::class("scala/math/Ordered", "java/lang/Object");
     b.access = ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT;
     b.interfaces.clear();
-    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, "compare", "(Ljava/lang/Object;)I");
+    b.add_abstract(
+        ACC_PUBLIC | ACC_ABSTRACT,
+        "compare",
+        "(Ljava/lang/Object;)I",
+    );
     b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, "<", "(Ljava/lang/Object;)Z");
     b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, ">", "(Ljava/lang/Object;)Z");
     b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, "<=", "(Ljava/lang/Object;)Z");
@@ -914,6 +919,14 @@ fn emit_tuple2() -> EmittedClass {
             asm.vreturn();
         },
     );
+    b.finish()
+}
+
+fn emit_dynamic() -> EmittedClass {
+    // Marker interface, same role as scala-library `scala.Dynamic`.
+    let mut b = B::class("scala/Dynamic", "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT;
+    b.interfaces.clear();
     b.finish()
 }
 
