@@ -478,6 +478,17 @@ impl<'a> Parser<'a> {
                         mix: None,
                     },
                 );
+            } else if matches!(self.kind(), TokenKind::TypeKw) {
+                // `p.type` — stop so the type parser's singleton loop can
+                // also attach `#` / `[T]` after we return. The Dot is already
+                // consumed; build the singleton here.
+                let sp = self.span();
+                self.bump();
+                t = self.alloc(
+                    t.span.merge(sp),
+                    TreeKind::SingletonTypeTree { ref_: Box::new(t) },
+                );
+                break;
             } else {
                 let (name, sp) = self.expect_ident();
                 t = self.alloc(
@@ -1549,11 +1560,15 @@ impl<'a> Parser<'a> {
     fn parse_annot_type(&mut self) -> Tree {
         let mut t = self.parse_simple_type();
         while matches!(self.kind(), TokenKind::At) {
-            let sp = self.span();
             self.bump();
-            let _ = self.parse_simple_expr();
-            self.error_span(sp, "unimplemented syntax: annotated types");
-            t = t; // ignore annotation
+            let annot = self.parse_simple_expr();
+            t = self.alloc(
+                t.span.merge(self.prev_span()),
+                TreeKind::AnnotatedTypeTree {
+                    tpt: Box::new(t),
+                    annot: Box::new(annot),
+                },
+            );
         }
         t
     }

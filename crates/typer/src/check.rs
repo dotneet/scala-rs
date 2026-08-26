@@ -2063,7 +2063,11 @@ impl Typer {
                     tree.ty = self.st.type_of_class(parent);
                 }
             }
-            TreeKind::AppliedTypeTree { .. } => {
+            TreeKind::AppliedTypeTree { .. }
+            | TreeKind::SingletonTypeTree { .. }
+            | TreeKind::CompoundTypeTree { .. }
+            | TreeKind::AnnotatedTypeTree { .. }
+            | TreeKind::ExistentialTypeTree { .. } => {
                 tree.ty = self.tree_to_type(tree);
             }
             TreeKind::DefDef { .. }
@@ -2254,12 +2258,19 @@ impl Typer {
             return;
         }
         // String concatenation via any2stringadd: handled at Apply of +
-        let owner = self.st.class_sym_of(&qual.ty);
-        let mut found = if let Some(o) = owner {
-            self.st.lookup_member(o, &name)
-        } else {
-            Vec::new()
-        };
+        let mut found = Vec::new();
+        if let Type::Refined { parents, .. } = &qual.ty {
+            for p in parents {
+                if let Some(o) = self.st.class_sym_of(p) {
+                    found.extend(self.st.lookup_member(o, &name));
+                }
+            }
+        }
+        if found.is_empty() {
+            if let Some(o) = self.st.class_sym_of(&qual.ty) {
+                found = self.st.lookup_member(o, &name);
+            }
+        }
         // Module: members of module class
         if found.is_empty() {
             if let Type::ModuleRef(id) = &qual.ty {
@@ -4443,9 +4454,19 @@ impl Typer {
             TreeKind::CompoundTypeTree { parents, refinements } => {
                 self.compound_to_type(tpt.span, parents, refinements)
             }
-            TreeKind::SingletonTypeTree { .. } => {
-                self.error(tpt.span, "unimplemented type: singleton types");
-                Type::Error
+            TreeKind::SingletonTypeTree { ref_ } => self.singleton_to_type(tpt.span, ref_),
+            TreeKind::AnnotatedTypeTree { tpt: inner, annot } => {
+                let ty = self.tree_to_type(inner);
+                let path = annot.annotation_path();
+                let simple = path
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(path.as_str())
+                    .to_string();
+                Type::Annotated {
+                    tpe: Box::new(ty),
+                    annot: simple,
+                }
             }
             TreeKind::AppliedTypeTree { tpt, args } => {
                 let mut as_ = Vec::new();
@@ -4495,18 +4516,18 @@ impl Typer {
                 name, tparams, lo, hi, rhs, ..
             } => {
                 if name == "_" {
-                    if lo.is_some() || hi.is_some() {
-                        self.error(
-                            tpt.span,
-                            "unimplemented type: wildcard bounds (`_ <: T` / `_ >: T`)",
-                        );
-                        return Type::Error;
-                    }
                     if !tparams.is_empty() {
                         self.error(tpt.span, "unimplemented type: higher-kinded wildcard");
                         return Type::Error;
                     }
-                    Type::Wildcard
+                    if lo.is_none() && hi.is_none() {
+                        Type::Wildcard
+                    } else {
+                        Type::BoundedWildcard {
+                            lo: lo.as_ref().map(|t| Box::new(self.tree_to_type(t))),
+                            hi: hi.as_ref().map(|t| Box::new(self.tree_to_type(t))),
+                        }
+                    }
                 } else if !rhs.is_empty() {
                     self.tree_to_type(rhs)
                 } else {
@@ -4720,6 +4741,91 @@ impl Typer {
         }
     }
 
+    fn singleton_to_type(&mut self, span: Span, ref_: &Tree) -> Type {
+        match &ref_.kind {
+            TreeKind::This { qual } => {
+                let id = if let Some(name) = qual {
+                    self.st
+                        .enclosing_class_named(self.st.this_class, name)
+                        .unwrap_or(self.st.this_class)
+                } else {
+                    self.st.this_class
+                };
+                if id.is_none() {
+                    self.error(span, "`this.type` is not allowed here");
+                    Type::Error
+                } else {
+                    Type::ThisType(id)
+                }
+            }
+            _ => {
+                if !self.is_stable_path(ref_) {
+                    self.error(
+                        span,
+                        format!(
+                            "stable identifier required, but {} found",
+                            path_display(ref_)
+                        ),
+                    );
+                    return Type::Error;
+                }
+                let Some(sym) = self.term_path_sym(ref_) else {
+                    self.error(
+                        span,
+                        format!(
+                            "stable identifier required, but {} found",
+                            path_display(ref_)
+                        ),
+                    );
+                    return Type::Error;
+                };
+                let owner = self.st.get(sym).owner;
+                let prefix = if owner.is_none() || matches!(self.st.get(owner).kind, SymKind::Method)
+                {
+                    Type::NoType
+                } else {
+                    Type::ThisType(owner)
+                };
+                Type::SingleType {
+                    prefix: Box::new(prefix),
+                    sym,
+                }
+            }
+        }
+    }
+
+    fn term_path_sym(&self, t: &Tree) -> Option<SymbolId> {
+        match &t.kind {
+            TreeKind::Ident { name } => self.st.lookup(name).into_iter().find(|s| {
+                matches!(
+                    self.st.get(*s).kind,
+                    SymKind::Term | SymKind::Module | SymKind::ModuleClass
+                )
+            }),
+            TreeKind::Select { qual, name } | TreeKind::SelectFromTypeTree { qual, name, .. } => {
+                let qt = self.term_path_type(qual)?;
+                if let Type::Refined { decls, .. } = &qt {
+                    if decls.iter().any(|d| {
+                        matches!(
+                            d,
+                            scala_rs_parser::RefineDecl::Val { name: n, .. } if n == name
+                        )
+                    }) {
+                        return None;
+                    }
+                }
+                let cls = self.st.class_sym_of(&qt)?;
+                self.st.lookup_member(cls, name).into_iter().find(|s| {
+                    matches!(
+                        self.st.get(*s).kind,
+                        SymKind::Term | SymKind::Module | SymKind::ModuleClass
+                    )
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn ident_is_stable(&self, name: &str) -> bool {
         let found = self.st.lookup(name);
         found.iter().any(|s| {
@@ -4814,6 +4920,12 @@ impl Typer {
 
     fn compound_to_type(&mut self, span: Span, parents: &[Tree], refinements: &[Tree]) -> Type {
         let ps: Vec<Type> = parents.iter().map(|p| self.tree_to_type(p)).collect();
+        if ps.iter().any(|p| p.is_error()) {
+            return Type::Error;
+        }
+        if !self.compound_parents_ok(span, &ps) {
+            return Type::Error;
+        }
         let mut decls = Vec::new();
         let mut ok = true;
         for r in refinements {
@@ -4928,6 +5040,50 @@ impl Typer {
         }
     }
 
+    fn is_non_trait_class_type(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Int
+            | Type::Long
+            | Type::Float
+            | Type::Double
+            | Type::Boolean
+            | Type::Unit
+            | Type::Char
+            | Type::String
+            | Type::AnyVal
+            | Type::AnyRef
+            | Type::Array(_)
+            | Type::ModuleRef(_) => true,
+            Type::Class { sym, .. } => {
+                let s = self.st.get(*sym);
+                !s.flags.contains(Flags::TRAIT) && !s.flags.contains(Flags::INTERFACE)
+            }
+            Type::Annotated { tpe, .. } => self.is_non_trait_class_type(tpe),
+            _ => false,
+        }
+    }
+
+    fn compound_parents_ok(&mut self, span: Span, ps: &[Type]) -> bool {
+        let classes: Vec<&Type> = ps
+            .iter()
+            .filter(|p| self.is_non_trait_class_type(p))
+            .collect();
+        if classes.len() <= 1 {
+            return true;
+        }
+        let has_most_specific = classes
+            .iter()
+            .any(|c| classes.iter().all(|d| self.st.is_sub_type(c, d)));
+        if has_most_specific {
+            return true;
+        }
+        self.error(
+            span,
+            "illegal inheritance: compound type has more than one class parent",
+        );
+        false
+    }
+
     fn resolve_type_name(&self, name: &str, args: &[Type]) -> Type {
         match name {
             "Int" => Type::Int,
@@ -4996,6 +5152,9 @@ impl Typer {
             return;
         }
         if self.st.is_sub_type(&tree.ty, pt) {
+            return;
+        }
+        if self.adapt_singleton(tree, pt) {
             return;
         }
         if let Some(w) = numeric_widen(&tree.ty, pt) {
@@ -5083,6 +5242,42 @@ impl Typer {
             ),
         );
         tree.ty = Type::Error;
+    }
+
+    fn adapt_singleton(&self, tree: &mut Tree, pt: &Type) -> bool {
+        match pt {
+            Type::ThisType(cls) => {
+                if !matches!(&tree.kind, TreeKind::This { .. }) {
+                    return false;
+                }
+                let ok = tree.sym == *cls
+                    || matches!(
+                        &tree.ty,
+                        Type::Class { sym, .. } | Type::ModuleRef(sym) if *sym == *cls
+                    );
+                if ok {
+                    tree.ty = pt.clone();
+                }
+                ok
+            }
+            Type::SingleType { sym, .. } => {
+                if tree.sym == *sym {
+                    tree.ty = pt.clone();
+                    true
+                } else {
+                    false
+                }
+            }
+            Type::Annotated { tpe, .. } => {
+                if self.st.is_sub_type(&tree.ty, tpe) || self.adapt_singleton(tree, tpe) {
+                    tree.ty = pt.clone();
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
     }
 
     fn desugar_custom_interpolator(&mut self, tree: &mut Tree) {

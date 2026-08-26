@@ -296,6 +296,29 @@ object Main {
     }
 
     #[test]
+    fn singleton_compound_and_annotated_types_parse() {
+        let t = parse_ok(
+            r#"
+class C {
+  def me: this.type = this
+}
+object Main {
+  val c = new C()
+  def id: c.type = c
+  def use(x: A with B): Int = 0
+  def h(x: Int @unchecked): Int = x
+  def f(xs: List[_ <: AnyRef]): Int = 0
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("SingletonType"), "{dump}");
+        assert!(dump.contains("CompoundType"), "{dump}");
+        assert!(dump.contains("AnnotatedType"), "{dump}");
+        assert!(dump.contains("TypeDef _"), "{dump}");
+    }
+
+    #[test]
     fn path_dependent_and_refinement_parse() {
         let t = parse_ok(
             r#"

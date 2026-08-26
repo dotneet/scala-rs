@@ -173,6 +173,23 @@ pub enum Type {
     TypeMember(SymbolId),
     /// Unbounded wildcard existential `_` (as in `List[_]`).
     Wildcard,
+    /// Bounded wildcard `_ <: Hi` / `_ >: Lo` (as in `List[_ <: AnyRef]`).
+    BoundedWildcard {
+        lo: Option<Box<Type>>,
+        hi: Option<Box<Type>>,
+    },
+    /// `this.type` of class `cls`.
+    ThisType(SymbolId),
+    /// Stable path singleton `p.type`. `sym` is the term (`val` / module).
+    SingleType {
+        prefix: Box<Type>,
+        sym: SymbolId,
+    },
+    /// `T @annot` (type annotation; not a symbol annotation).
+    Annotated {
+        tpe: Box<Type>,
+        annot: String,
+    },
     /// Structural / refinement type (`{ def foo: Int }` or `T { type A = Int }`).
     Refined {
         parents: Vec<Type>,
@@ -297,6 +314,19 @@ impl fmt::Display for Type {
             Type::TypeParam(s) => write!(f, "tparam#{}", s.0),
             Type::TypeMember(s) => write!(f, "tmem#{}", s.0),
             Type::Wildcard => write!(f, "_"),
+            Type::BoundedWildcard { lo, hi } => {
+                write!(f, "_")?;
+                if let Some(t) = lo {
+                    write!(f, " >: {t}")?;
+                }
+                if let Some(t) = hi {
+                    write!(f, " <: {t}")?;
+                }
+                Ok(())
+            }
+            Type::ThisType(s) => write!(f, "this.type(#{})", s.0),
+            Type::SingleType { sym, .. } => write!(f, "#{}.type", sym.0),
+            Type::Annotated { tpe, annot } => write!(f, "{tpe} @{annot}"),
             Type::Refined { parents, decls } => {
                 if parents.is_empty() {
                     write!(f, "{{ ")?;
@@ -306,6 +336,9 @@ impl fmt::Display for Type {
                             write!(f, " with ")?;
                         }
                         write!(f, "{p}")?;
+                    }
+                    if decls.is_empty() {
+                        return Ok(());
                     }
                     write!(f, " {{ ")?;
                 }
@@ -580,6 +613,11 @@ pub enum TreeKind {
     },
     SingletonTypeTree {
         ref_: Box<Tree>,
+    },
+    /// `T @annot` in type position.
+    AnnotatedTypeTree {
+        tpt: Box<Tree>,
+        annot: Box<Tree>,
     },
     SelectFromTypeTree {
         qual: Box<Tree>,

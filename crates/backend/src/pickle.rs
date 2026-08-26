@@ -6,8 +6,10 @@
 //! companion apply `Point(x, y)` / term `Point` via `MODULESYM` in the class
 //! pickle + extractor `unapply` so `x match { case Point(a, b) => … }`), an
 //! `object` method, a method taking `List[_]` (EXISTENTIALtpe), and
-//! `@deprecated("msg", "2.13.0")` (SYMANNOT + LITERALstring) against our
-//! classfiles. Flags are nsc raw longs run through `rawToPickledFlags`.
+//! `@deprecated("msg", "2.13.0")` (SYMANNOT + LITERALstring), `this.type`
+//! (THIStpe as a method result), `List[_ <: AnyRef]` (EXISTENTIALtpe with a
+//! bounded TYPEsym), and `T @unchecked` (ANNOTATEDtpe) against our classfiles.
+//! Flags are nsc raw longs run through `rawToPickledFlags`.
 //! It is **not** a full nsc pickle — leftover holes are documented in README.
 //!
 //! nsc-facing details in this subset (must match `PickleBuffer` / `UnPickler`):
@@ -19,6 +21,9 @@
 //! - `POLYtpe` is restpe first, then tparams; empty tparams = NullaryMethodType
 //! - methods carry `METHOD`; vals are getters (`METHOD|STABLE|ACCESSOR` + `POLYtpe`)
 //! - `List[_]` is `EXISTENTIALtpe(TypeRef(immutable.List, _$n), TYPEsym _$n)`
+//! - `List[_ <: AnyRef]` sets the quantified TYPEsym hi bound to `AnyRef`
+//! - `this.type` results are `THIStpe` of the enclosing class
+//! - type annotations `T @unchecked` are `ANNOTATEDtpe` + `ANNOTINFO`
 //! - annotation args that are string literals are `LITERALstring` + `SYMANNOT`
 
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
@@ -39,6 +44,7 @@ pub const EXTMODCLASSREF: u8 = 10;
 pub const NOTPE: u8 = 11;
 pub const NOPREFIXTPE: u8 = 12;
 pub const THISTPE: u8 = 13;
+pub const SINGLETPE: u8 = 14;
 pub const TYPEREFTPE: u8 = 16;
 pub const TYPEBOUNDSTPE: u8 = 17;
 pub const CLASSINFOTPE: u8 = 19;
@@ -48,6 +54,8 @@ pub const POLYTPE: u8 = 21;
 #[allow(non_upper_case_globals)]
 pub const LITERALstring: u8 = 33;
 pub const SYMANNOT: u8 = 40;
+pub const ANNOTATEDTPE: u8 = 42;
+pub const ANNOTINFO: u8 = 43;
 pub const EXISTENTIALTPE: u8 = 48;
 
 /// Pickled method, constructor, or val recovered by the subset unpickler.
@@ -617,12 +625,18 @@ impl<'a> Pickler<'a> {
         }
     }
 
-    fn pickle_existential_param(&mut self) -> u32 {
+    fn pickle_existential_param(&mut self, lo: Option<&Type>, hi: Option<&Type>) -> u32 {
         self.exist_n += 1;
         let name_ref = self.type_name(&format!("_${}", self.exist_n));
         let idx = self.add(TYPESYM, vec![]);
-        let lo = self.type_ref_named("Nothing");
-        let hi = self.type_ref_named("Any");
+        let lo = match lo {
+            Some(t) => self.pickle_type(t),
+            None => self.type_ref_named("Nothing"),
+        };
+        let hi = match hi {
+            Some(t) => self.pickle_type(t),
+            None => self.type_ref_named("Any"),
+        };
         let mut b = Vec::new();
         write_nat_to(&mut b, lo);
         write_nat_to(&mut b, hi);
@@ -638,12 +652,23 @@ impl<'a> Pickler<'a> {
         let mut arg_refs = Vec::new();
         let mut quantified = Vec::new();
         for a in args {
-            if matches!(a, Type::Wildcard) {
-                let q = self.pickle_existential_param();
-                quantified.push(q);
-                arg_refs.push(self.type_ref_of_pickle_sym(q));
-            } else {
-                arg_refs.push(self.pickle_type(a));
+            match a {
+                Type::Wildcard => {
+                    let q = self.pickle_existential_param(None, None);
+                    quantified.push(q);
+                    arg_refs.push(self.type_ref_of_pickle_sym(q));
+                }
+                Type::BoundedWildcard { lo, hi } => {
+                    let q = self.pickle_existential_param(
+                        lo.as_deref(),
+                        hi.as_deref(),
+                    );
+                    quantified.push(q);
+                    arg_refs.push(self.type_ref_of_pickle_sym(q));
+                }
+                _ => {
+                    arg_refs.push(self.pickle_type(a));
+                }
             }
         }
         (arg_refs, quantified)
@@ -699,6 +724,32 @@ impl<'a> Pickler<'a> {
         }
     }
 
+    fn pickle_this_tpe(&mut self, cls: SymbolId) -> u32 {
+        if let Some(&i) = self.this_tpes.get(&cls.0) {
+            return i;
+        }
+        let _ = self.pickle_class(cls);
+        self.this_tpes
+            .get(&cls.0)
+            .copied()
+            .unwrap_or(self.noprefix)
+    }
+
+    fn pickle_term_ref(&mut self, id: SymbolId) -> u32 {
+        if let Some(&i) = self.sym_index.get(&id.0) {
+            return i;
+        }
+        let owner_id = self.st.get(id).owner;
+        let owner_ref = if owner_id.is_none() {
+            self.current_owner
+        } else if let Some(&i) = self.sym_index.get(&owner_id.0) {
+            i
+        } else {
+            self.pickle_class(owner_id)
+        };
+        self.pickle_val(id, owner_ref, false)
+    }
+
     fn pickle_type(&mut self, ty: &Type) -> u32 {
         match ty {
             Type::Unit | Type::NoType => self.type_ref_named("Unit"),
@@ -711,6 +762,41 @@ impl<'a> Pickler<'a> {
             Type::String => self.type_ref_named("String"),
             Type::Any => self.type_ref_named("Any"),
             Type::Wildcard | Type::AnyRef => self.type_ref_named("AnyRef"),
+            Type::BoundedWildcard { hi, .. } => match hi {
+                Some(t) => self.pickle_type(t),
+                None => self.type_ref_named("Any"),
+            },
+            Type::ThisType(id) => self.pickle_this_tpe(*id),
+            Type::SingleType { prefix, sym } => {
+                let pre = if matches!(prefix.as_ref(), Type::NoType | Type::ThisType(_)) {
+                    if let Type::ThisType(c) = prefix.as_ref() {
+                        self.pickle_this_tpe(*c)
+                    } else {
+                        self.noprefix
+                    }
+                } else {
+                    self.pickle_type(prefix)
+                };
+                let sref = self.pickle_term_ref(*sym);
+                let mut body = Vec::new();
+                write_nat_to(&mut body, pre);
+                write_nat_to(&mut body, sref);
+                self.add(SINGLETPE, body)
+            }
+            Type::Annotated { tpe, annot } => {
+                let inner = self.pickle_type(tpe);
+                let atp = {
+                    let sc = self.scala_module();
+                    self.type_ref_in(sc, annot)
+                };
+                let mut ab = Vec::new();
+                write_nat_to(&mut ab, atp);
+                let info = self.add(ANNOTINFO, ab);
+                let mut body = Vec::new();
+                write_nat_to(&mut body, inner);
+                write_nat_to(&mut body, info);
+                self.add(ANNOTATEDTPE, body)
+            }
             Type::AnyVal => self.type_ref_named("AnyVal"),
             Type::TypeParam(id) => {
                 // nsc pickles class/method tparams as TypeRef(NoPrefix, T), not ThisType.
@@ -1064,7 +1150,8 @@ fn write_nat_to(out: &mut Vec<u8>, x: u32) {
 
 fn type_has_wildcard(t: &Type) -> bool {
     match t {
-        Type::Wildcard => true,
+        Type::Wildcard | Type::BoundedWildcard { .. } => true,
+        Type::Annotated { tpe, .. } => type_has_wildcard(tpe),
         Type::Class { args, .. } => args.iter().any(type_has_wildcard),
         Type::Tuple(ts) => ts.iter().any(type_has_wildcard),
         Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => type_has_wildcard(t),
@@ -1327,6 +1414,11 @@ enum Entry {
     ExtRef(u32),
     NoTpe,
     ThisTpe(u32),
+    SingleTpe {
+        prefix: u32,
+        sym: u32,
+    },
+    AnnotatedTpe(u32),
     TypeRef {
         prefix: u32,
         sym: u32,
@@ -1438,6 +1530,17 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 r.pos = end;
                 Entry::ThisTpe(s)
             }
+            SINGLETPE => {
+                let prefix = r.read_nat().unwrap_or(0);
+                let sym = r.read_nat().unwrap_or(0);
+                r.pos = end;
+                Entry::SingleTpe { prefix, sym }
+            }
+            ANNOTATEDTPE => {
+                let tpe = r.read_nat().unwrap_or(0);
+                r.pos = end;
+                Entry::AnnotatedTpe(tpe)
+            }
             TYPEREFTPE => {
                 let prefix = r.read_nat().unwrap_or(0);
                 let sym = r.read_nat().unwrap_or(0);
@@ -1517,6 +1620,14 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             Some(Entry::TermName(s) | Entry::TypeName(s)) => s.clone(),
             Some(Entry::NoTpe) => "Any".into(),
             Some(Entry::Existential(t)) => type_name_of(entries, *t),
+            Some(Entry::ThisTpe(s)) => match entries.get(*s as usize) {
+                Some(Entry::ClassSym { name, .. } | Entry::ModuleSym { name, .. }) => {
+                    name_of(entries, *name)
+                }
+                _ => "Any".into(),
+            },
+            Some(Entry::AnnotatedTpe(t)) => type_name_of(entries, *t),
+            Some(Entry::SingleTpe { prefix, .. }) => type_name_of(entries, *prefix),
             _ => "Any".into(),
         }
     }
@@ -1942,6 +2053,67 @@ object Lib {
             r.pos = end;
         }
         assert!(saw_final_method, "did not find pickled method f");
+    }
+
+    #[test]
+    fn pickle_this_type_annot_and_bounded_existential() {
+        let src = r#"
+class Holder {
+  def me: this.type = this
+  def n: Int = 1
+}
+object Lib {
+  def f(xs: List[_ <: AnyRef]): Int = 0
+  def h(x: Int @unchecked): Int = x
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let holder = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Holder" && s.kind == scala_rs_typer::SymKind::Class)
+            .map(|s| s.id)
+            .expect("Holder");
+        let hraw = pickle_class(&st, holder);
+        let htags = pickle_tags(&hraw);
+        assert!(
+            htags.contains(&THISTPE),
+            "expected THIStpe for this.type, tags={htags:?}"
+        );
+        let hp = unpickle(&hraw).expect("unpickle Holder");
+        let me = hp.methods.iter().find(|m| m.name == "me").expect("me");
+        assert_eq!(me.ret, "Holder");
+
+        let lib = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Lib" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("Lib module");
+        let raw = pickle_class(&st, st.module_class_of(lib));
+        let tags = pickle_tags(&raw);
+        assert!(
+            tags.contains(&EXISTENTIALTPE),
+            "expected EXISTENTIALtpe for List[_ <: AnyRef], tags={tags:?}"
+        );
+        assert!(
+            tags.contains(&ANNOTATEDTPE),
+            "expected ANNOTATEDtpe for Int @unchecked, tags={tags:?}"
+        );
+        assert!(
+            tags.contains(&ANNOTINFO),
+            "expected ANNOTINFO, tags={tags:?}"
+        );
+        let p = unpickle(&raw).expect("unpickle Lib");
+        let f = p.methods.iter().find(|m| m.name == "f").expect("f");
+        assert_eq!(f.param_types, vec!["List".to_string()]);
+        let h = p.methods.iter().find(|m| m.name == "h").expect("h");
+        assert_eq!(h.param_types, vec!["Int".to_string()]);
     }
 
     fn pickle_tags_name(bytes: &[u8], idx: u32) -> Option<String> {

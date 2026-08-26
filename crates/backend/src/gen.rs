@@ -299,7 +299,19 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::Method { ret, .. } => jvm_desc(st, ret),
         Type::ByName(_) => "Lscala/Function0;".into(),
         Type::Repeated(_) => "Lscala/collection/immutable/Seq;".into(),
-        Type::TypeParam(_) | Type::TypeMember(_) | Type::Wildcard => "Ljava/lang/Object;".into(),
+        Type::TypeParam(_) | Type::TypeMember(_) | Type::Wildcard | Type::BoundedWildcard { .. } => {
+            "Ljava/lang/Object;".into()
+        }
+        Type::ThisType(sym) => format!("L{};", class_internal(st, *sym)),
+        Type::SingleType { prefix, sym } => {
+            let inner = st.get(*sym).ty.clone();
+            if inner.is_no_type() {
+                jvm_desc(st, prefix)
+            } else {
+                jvm_desc(st, &inner)
+            }
+        }
+        Type::Annotated { tpe, .. } => jvm_desc(st, tpe),
         Type::Refined { .. } => "Ljava/lang/Object;".into(),
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
             format!("[{}", jvm_desc(st, &args[0]))
@@ -645,6 +657,29 @@ fn maybe_checkcast_owner(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
         let jn = class_internal(ctx.st, owner);
         asm.checkcast(&jn);
     }
+}
+
+fn checkcast_refined_receiver(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    qual_ty: &Type,
+    method_id: SymbolId,
+) {
+    if method_id.is_none() {
+        return;
+    }
+    if !matches!(qual_ty, Type::Refined { .. }) {
+        return;
+    }
+    let owner = ctx.st.get(method_id).owner;
+    if owner.is_none() {
+        return;
+    }
+    let jn = class_internal(ctx.st, owner);
+    if jn.is_empty() || jn == "java/lang/Object" {
+        return;
+    }
+    asm.checkcast(&jn);
 }
 
 fn is_module_class(st: &SymbolTable, id: SymbolId) -> bool {
@@ -2806,6 +2841,7 @@ fn gen_select(
         match s.kind {
             SymKind::Term => {
                 gen_expr(asm, frame, ctx, qual);
+                checkcast_refined_receiver(asm, ctx, &qual.ty, tree.sym);
                 if is_trait_owned_term(ctx.st, tree.sym) {
                     let owner = class_internal(ctx.st, s.owner);
                     let desc = format!("(){}", jvm_desc(ctx.st, &s.ty));
@@ -2819,6 +2855,7 @@ fn gen_select(
             SymKind::Method => {
                 let ic = s.intrinsic;
                 gen_expr(asm, frame, ctx, qual);
+                checkcast_refined_receiver(asm, ctx, &qual.ty, tree.sym);
                 if matches!(qual.kind, TreeKind::Super { .. }) {
                     invoke_super(asm, ctx, tree.sym);
                 } else if matches!(ic, Intrinsic::StringToInt) {
@@ -3362,6 +3399,9 @@ fn gen_apply(
     }
 
     gen_receiver(asm, frame, ctx, fun);
+    if let TreeKind::Select { qual, .. } = &fun.kind {
+        checkcast_refined_receiver(asm, ctx, &qual.ty, fun.sym);
+    }
     let value_owner = if !fun.sym.is_none() && ctx.st.is_value_class(ctx.st.get(fun.sym).owner) {
         Some(ctx.st.get(fun.sym).owner)
     } else {
