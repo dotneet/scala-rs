@@ -2483,6 +2483,21 @@ impl<'a> Parser<'a> {
                         },
                     );
                 }
+                // `_*` is Underscore+star in nsc, but this lexer emits Ident("_") then Ident("*")
+                // because `_` followed by an operator character starts an identifier.
+                if matches!(&t.kind, TreeKind::Ident { name } if name == "_")
+                    && matches!(self.kind(), TokenKind::Ident(s) if s == "*")
+                {
+                    let sp = t.span;
+                    self.bump();
+                    let wild = self.alloc(sp, TreeKind::Wildcard);
+                    return self.alloc(
+                        sp.merge(self.prev_span()),
+                        TreeKind::Star {
+                            elem: Box::new(wild),
+                        },
+                    );
+                }
                 t
             }
             TokenKind::LParen => {
@@ -2549,7 +2564,7 @@ impl<'a> Parser<'a> {
         self.skip_nl();
         if !matches!(self.kind(), TokenKind::RParen) {
             loop {
-                args.push(self.parse_pattern());
+                args.push(self.parse_pattern_arg());
                 self.skip_nl();
                 if matches!(self.kind(), TokenKind::Comma) {
                     self.bump();
@@ -2561,6 +2576,29 @@ impl<'a> Parser<'a> {
         }
         self.expect(")", |k| matches!(k, TokenKind::RParen));
         args
+    }
+
+    fn parse_pattern_arg(&mut self) -> Tree {
+        if matches!(self.kind(), TokenKind::Ident(_)) {
+            let saved = self.pos;
+            let (name, sp) = self.expect_ident();
+            self.skip_nl();
+            if matches!(self.kind(), TokenKind::Equals) {
+                self.bump();
+                self.skip_nl();
+                let rhs = self.parse_pattern();
+                let lhs = self.alloc(sp, TreeKind::Ident { name });
+                return self.alloc(
+                    sp.merge(rhs.span),
+                    TreeKind::Assign {
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    },
+                );
+            }
+            self.pos = saved;
+        }
+        self.parse_pattern()
     }
 }
 

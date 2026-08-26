@@ -55,7 +55,7 @@ fn print_help() {
 scala-rs — a Scala 2.13 subset compiler (not Scala 3)
 
 USAGE:
-    scala-rs compile <files...> [-d <dir>] [--parse] [--typer]
+    scala-rs compile <files...> [-d <dir>] [--parse] [--typer] [-Xfatal-warnings]
     scala-rs run <file> [--] [java-args...]
     scala-rs --help
 
@@ -68,9 +68,10 @@ COMMANDS:
 
 OPTIONS:
     -d <dir>   Output directory for class files (default: .)
-    --parse    Parse only and dump the AST (do not typecheck or emit)
-    --typer    Dump the typed tree after namer/typer
-    --help     Show this help
+    --parse             Parse only and dump the AST (do not typecheck or emit)
+    --typer             Dump the typed tree after namer/typer
+    -Xfatal-warnings    Treat warnings as errors (non-exhaustive match, …)
+    --help              Show this help
 
 EXAMPLES:
     scala-rs compile Main.scala -d out
@@ -127,6 +128,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
     let mut out_dir = PathBuf::from(".");
     let mut parse_only = false;
     let mut typer_dump = false;
+    let mut fatal_warnings = false;
     let mut files = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -149,6 +151,8 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             parse_only = true;
         } else if a == "--typer" {
             typer_dump = true;
+        } else if a == "-Xfatal-warnings" {
+            fatal_warnings = true;
         } else if a.starts_with('-') {
             return Err(format!("unknown option '{a}'"));
         } else {
@@ -162,6 +166,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             out_dir,
             parse_only,
             typer_dump,
+            fatal_warnings,
         },
     })
 }
@@ -187,6 +192,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         out_dir: out_dir.clone(),
         parse_only: false,
         typer_dump: false,
+        fatal_warnings: false,
     };
     let result = compile_paths(&[file], &opts);
     print_diags(&result);

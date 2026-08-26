@@ -23,6 +23,7 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
         emit_list(),
         emit_cons(),
         emit_nil(),
+        emit_list_module(),
         emit_tuple2(),
         emit_arrow_assoc(),
         emit_not_implemented(),
@@ -767,6 +768,48 @@ fn emit_nil() -> EmittedClass {
                 "(Ljava/lang/String;)V",
             );
             asm.athrow();
+        },
+    );
+    b.finish()
+}
+
+fn emit_list_module() -> EmittedClass {
+    let mut b = B::class("scala/collection/immutable/List$", "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
+    b.fields.push(Field {
+        access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
+        name: "MODULE$".into(),
+        desc: "Lscala/collection/immutable/List$;".into(),
+    });
+    b.add_code(ACC_PRIVATE, "<init>", "()V", 1, |asm| {
+        asm.aload(0);
+        asm.invokespecial("java/lang/Object", "<init>", "()V");
+        asm.aload(0);
+        asm.putstatic(
+            "scala/collection/immutable/List$",
+            "MODULE$",
+            "Lscala/collection/immutable/List$;",
+        );
+        asm.vreturn();
+    });
+    b.add_code(ACC_STATIC, "<clinit>", "()V", 1, |asm| {
+        asm.new_obj("scala/collection/immutable/List$");
+        asm.dup();
+        asm.invokespecial("scala/collection/immutable/List$", "<init>", "()V");
+        asm.pop();
+        asm.vreturn();
+    });
+    b.add_code(
+        ACC_PUBLIC,
+        "unapplySeq",
+        "(Lscala/collection/immutable/List;)Lscala/Option;",
+        2,
+        |asm| {
+            asm.new_obj("scala/Some");
+            asm.dup();
+            asm.aload(1);
+            asm.invokespecial("scala/Some", "<init>", "(Ljava/lang/Object;)V");
+            asm.areturn();
         },
     );
     b.finish()

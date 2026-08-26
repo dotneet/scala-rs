@@ -41,6 +41,9 @@ pub enum Intrinsic {
     StringToLong,
     StringToDouble,
     WrapArrowAssoc,
+    Locally,
+    Any2StringAdd,
+    Implicitly,
 }
 
 #[derive(Clone, Debug)]

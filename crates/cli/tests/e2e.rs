@@ -193,6 +193,87 @@ fn fixtures_value_class() {
 fn fixtures_predef() {
     check("predef");
 }
+#[test]
+fn fixtures_unapply_seq() {
+    check("unapply_seq");
+}
+#[test]
+fn fixtures_trait_val() {
+    check("trait_val");
+}
+#[test]
+fn fixtures_abstract_override() {
+    check("abstract_override");
+}
+#[test]
+fn fixtures_predef_more() {
+    check("predef_more");
+}
+#[test]
+fn fixtures_sealed_non_exhaustive_is_warning() {
+    check("sealed_non_exhaustive");
+}
+
+#[test]
+fn fatal_warnings_makes_non_exhaustive_fail() {
+    let src = fixtures_dir().join("sealed_non_exhaustive.scala");
+    let out = tmp_dir("fatal-warnings");
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "-Xfatal-warnings",
+        ])
+        .status()
+        .expect("run scala-rs compile");
+    assert!(!status.success(), "expected -Xfatal-warnings to fail");
+    let _ = fs::remove_dir_all(&out);
+}
+
+fn scala_library_jar() -> Option<PathBuf> {
+    let cached = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+    if cached.is_file() {
+        return Some(cached);
+    }
+    let _ = fs::create_dir_all("/tmp/scala-rs-lib");
+    let url = "https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16.jar";
+    let status = Command::new("curl")
+        .args(["-fsSL", "-o", cached.to_str().unwrap(), url])
+        .status();
+    if status.map(|s| s.success()).unwrap_or(false) && cached.is_file() {
+        return Some(cached);
+    }
+    None
+}
+
+#[test]
+fn scala_library_dual_run_hello() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip scala-library dual-run: jar not obtainable");
+        return;
+    };
+    let out = compile_fixture("hello");
+    let cp = format!("{}:{}", out.display(), jar.display());
+    let output = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        output.status.success(),
+        "java -cp out:scala-library failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("hello")
+    );
+    let _ = fs::remove_dir_all(&out);
+}
 
 #[test]
 fn cli_run_hello() {

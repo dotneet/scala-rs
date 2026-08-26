@@ -54,6 +54,7 @@ java -cp out Main
 
 - `--parse` — パーサの AST ダンプ
 - `--typer` — namer / typer 後の木のダンプ
+- `-Xfatal-warnings` — warning をエラーにする（非網羅 match など）
 
 フィクスチャはデフォルトパッケージ（`package` 句なし）なので、`-cp out` の `Main` でそのまま動く想定です。
 
@@ -81,11 +82,12 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - 名前付き引数（呼び出し側で並べ替え）
 - 具象メンバー付き trait の mixin（`T$class` 静的実装 + 線形化順のフォワーダ）
 - 内部クラス（`$outer`）とネストした object
-- `super` / 修飾付き `this`（`Outer.this`）。trait の `super` は `T$class` の static 実装へ
-- `sealed` 階層の match 網羅検査（不足はエラー。scalac 2.13 の warning より厳しい）
-- extractor の `unapply`（`Option` / `Boolean` / `Tuple2`。case class のコンストラクタパターンとは別経路）
+- `super` / 修飾付き `this`（`Outer.this`）。trait の `super` は、具象クラスなら `T$class`、スタック可能な `abstract override` なら `T$$super$m` 経由
+- `sealed` 階層の match 網羅検査（不足は **warning**。`-Xfatal-warnings` でエラー）
+- extractor の `unapply`（`Option` / `Boolean` / `Tuple2`）と `unapplySeq`（`List` と可変長 `_*`）。名前付き extractor 引数（`Point(y = b, x = a)`）
 - `AnyVal` 値クラス（1 引数。生成は underlying へ erase。メソッドは `name$extension`）
-- Predef の一部: `assert` / `require` / `???` / ArrowAssoc の `->` / String の `length`・`toInt`（`toLong` / `toDouble` もある）
+- Predef の一部: `assert` / `require` / `???` / ArrowAssoc の `->` / `identity` / `locally` / `implicitly` / `any2stringadd`（`1 + "x"`）/ String の `length`・`toInt`（`toLong` / `toDouble` もある）
+- 具象 `val` 付き trait の初期化（`T$class.$init$`）と `abstract override` の super 連鎖
 
 フィクスチャで実際に動く範囲は README 末尾の表を見てください。
 
@@ -124,7 +126,11 @@ Java 6 には default method がないので、具象メンバー付き trait �
 - 具象本体は `T$class` の static メソッド（第一引数が `$this: T`）
 - 実装クラスは線形化（右の mixin がより具体的）で勝った定義へフォワーダを出す
 
-`class C extends A with B` で A と B が同じ `msg` を持つとき、実行時は B です。trait の `val` フィールドや `super` 呼び出しはまだありません。
+`class C extends A with B` で A と B が同じ `msg` を持つとき、実行時は B です。線形化は Scala の C3 です（`C extends Base with A with B` → `C, B, A, Base`）。
+
+trait の `val` は interface 上の getter / `$init$set$` と、`T$class.$init$` で右辺を評価します。実装クラスがフィールドを持ち、コンストラクタが mixin `$init$` を（より一般的な親から）呼びます。
+
+スタック可能な trait の `abstract override` は、`T$class` 内の `super.m` を `T$$super$m`（実装クラスが線形化の次へフォワード）にします。`class C extends Base with A with B` で両方 `abstract override def msg` なら、実行時は `B-A-base` です。
 
 ### try / catch / finally
 
@@ -140,23 +146,25 @@ Java 6 には default method がないので、具象メンバー付き trait �
 
 ### super / 修飾付き this
 
-`super.m(...)` はクラス親なら `invokespecial`、trait 親なら `T$class.m($this, ...)` です。線形化の「右端の親」を `super` の対象にします（`super[T]` の mixin 指定もパースして使います）。`Outer.this` は内部クラスの `$outer` を辿ります。
+`super.m(...)` はクラス親なら `invokespecial`、具象 trait 親なら `T$class.m($this, ...)` です。線形化の「右端の親」を `super` の対象にします（`super[T]` の mixin 指定もパースして使います）。`Outer.this` は内部クラスの `$outer` を辿ります。
 
-スタック可能な trait の `super` 連鎖（`abstract override`）と、trait の `val` 初期化順は未実装です。
+trait 本体の `super`（`abstract override` を含む）は、ミックス先クラスが埋める `T$$super$m` です。trait の `val` 初期化は `$init$` です。
 
 ### sealed と exhaustiveness
 
-同じコンパイル単位の `sealed` 子（case class / case object / class）を記録し、`match` が葉を覆っていないとエラーにします。
+同じコンパイル単位の `sealed` 子（case class / case object / class）を記録し、`match` が葉を覆っていないと **warning** にします。
 
 ```
 match may not be exhaustive. It would fail on the following input: …
 ```
 
-scalac 2.13 は warning ですが、scala-rs はエラーです。ガード付き case は網羅に数えません。ワイルドカード / 小文字の変数は catch-all です。
+scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` を付けるとエラーになります。ガード付き case は網羅に数えません。ワイルドカード / 小文字の変数は catch-all です。
 
-### unapply
+### unapply / unapplySeq
 
 `Even(n)` のような extractor はコンパニオン（または object）の `unapply` を呼びます。戻りが `Option[T]` なら `isEmpty` / `get`、`Boolean` なら真偽、`Option[(A,B)]` なら `Tuple2` の `_1` / `_2` です。`unapply` が無いパターンは `not found: extractor` です。
+
+`unapplySeq` は `List` のコンパニオンと、ユーザー定義の可変長 extractor です。`List(a, b, c)`、`List(h, rest @ _*)`、`PairSeq(a, b)` が動きます。名前付き引数は case class のコンストラクタパターンで並べ替えます（`Point(y = b, x = a)`）。
 
 ### AnyVal
 
@@ -167,6 +175,8 @@ scalac 2.13 は warning ですが、scala-rs はエラーです。ガード付�
 - `assert(cond)` / `require(cond)`（第 2 引数の by-name メッセージあり）。失敗はそれぞれ `AssertionError` / `IllegalArgumentException`
 - `???` は `scala.NotImplementedError`（`RuntimeException` のサブクラス。scala-library のそれではない）
 - `any2ArrowAssoc` による `1 -> "a"`。結果はランタイムの `scala.Tuple2`。JVM 上のメソッド名は `$minus$greater`（nsc の NameTransformer。`->` は `>` を含むので非合法）
+- `identity` / `locally` / `implicitly`（implicit 探索で埋める）
+- `any2stringadd` 相当として `1 + "x"` の文字列連結。implicit 変換 `any2stringadd` も型検査に存在する
 - `"x".length` は `java.lang.String#length`。`toInt` / `toLong` / `toDouble` は `Integer.parseInt` など。**`StringOps` クラスは出していません。** String にメソッドを載せたサブセットです
 
 ## 実装していないもの
@@ -177,8 +187,7 @@ scalac 2.13 は warning ですが、scala-rs はエラーです。ガード付�
 - コンパイラプラグイン
 - 完全な Scala 標準ライブラリ（ここにある Option / List は scala-rs ランタイムであり、scala-library ではない）
 - Scala 3 構文
-- implicit の優先度 / `Predef` の全変換（`any2stringadd` など）/ `scala.Int` コンパニオンの enrichment
-- trait の `val` フィールド、スタック可能な trait 初期化、`abstract override`
+- implicit の優先度 / `Predef` の残り（`augmentString` の完全な StringOps、`scala.Int` コンパニオンの enrichment など）
 - 匿名クラス
 - XML リテラル
 - existential types
@@ -207,18 +216,18 @@ Cargo workspace のクレート:
 正直な差分です。
 
 - **規模**: nsc のごく一部。言語仕様を満たしません。
-- **ライブラリ**: scala-library を同梱しません。`Predef.println`、プリミティブ演算、およびコンパイラが出す Option / List / FunctionN ランタイムだけです。`java -cp out:scala-library.jar` で混ぜる想定ではありません。
+- **ライブラリ**: コンパイルは引き続き scala-rs 独自ランタイム（`scala/Option` など）です。scala-library 2.13.16 の jar は Maven Central から取れます。`hello` は `java -cp out:scala-library-2.13.16.jar Main` で dual-run できます（このフィクスチャは Option/List を使いません）。**Option / List / Predef を scala-library の ABI でコンパイルしてはいません。** 名前が衝突するので、混ぜて Option を使う想定ではありません。
 - **object**: scalac と同様、`Main$`（モジュール）と静的フォワーダ `Main` を出します。`java Main` が動くのはそのためです。
 - **プリミティブ**: `Int` の `+` などは `scala.Int` のボックスメソッドではなく、JVM 命令（`iadd` など）として出します。
-- **trait**: 抽象メンバーだけの trait は JVM interface です。具象メンバーは `T$class` 静的実装と、線形化順のインスタンスフォワーダです。Java 8 default method は使いません（major 50）。
-- **名前付き引数**: 呼び出し側で `f(b = 2, a = 1)` を並べ替えます。巨大な rewrite フェーズはありません。
+- **trait**: 抽象メンバーだけの trait は JVM interface です。具象メンバーは `T$class` 静的実装と、C3 線形化順のインスタンスフォワーダです。Java 8 default method は使いません（major 50）。`val` は getter/setter + `$init$` です。`abstract override` は `T$$super$m` です。
+- **名前付き引数**: 呼び出し側で `f(b = 2, a = 1)` を並べ替えます。巨大な rewrite フェーズはありません。extractor パターンでも case class なら並べ替えます。
 - **try**: Code 属性に例外テーブルを出します。StackMapTable はありません。
 - **ラムダ**: `FunctionN` を実装する合成クラス（`Main$$$anonfun$0` など）です。invokedynamic / LambdaMetaFactory は使いません（Java 6）。
 - **フェーズ**: nsc の uncurry / mixin / lambdaLift などの独立パスはありません。erasure とラムダのクロージャ変換はあります。
-- **sealed**: scalac は非網羅 match を warning にできます。scala-rs は hard error です。
+- **sealed**: 非網羅 match は scalac と同様 warning です。`-Xfatal-warnings` でエラーになります。
 - **AnyVal**: scalac は値クラスのクラスファイルと拡張メソッドの両方を出します。scala-rs もクラスは出しますが、呼び出しは `$extension` 静的メソッドで、`new C(x)` は underlying に消えます。
-- **Predef / StringOps**: `assert` / `require` / `???` / `->` と String の `length`/`toInt` だけです。`StringOps` 型も `ArrowAssoc` のソース互換な標準ライブラリ実装もありません。
-- **unapplySeq / 可変長 extractor / 名前付き extractor パターン** はありません。
+- **Predef / StringOps**: `assert` / `require` / `???` / `->` / `identity` / `locally` / `implicitly` / `any2stringadd` と String の `length`/`toInt` です。**`StringOps` 型は出していません。** String メソッドのサブセットです。
+- **unapplySeq**: `List` とユーザー定義 extractor、`_*`、名前付き case class パターン。Seq の他実装や `unapplySeq` の `Option[Seq]` 以外の戻りは未対応です。
 
 scalac の代替ではありません。サブセットの再実装です。
 
@@ -257,6 +266,11 @@ cargo test
 | `unapply.scala` | `object Even { def unapply }` | `5` `-1` |
 | `value_class.scala` | `AnyVal` の `Meter` | `42` `21` |
 | `predef.scala` | `assert`/`require`/`toInt`/`->`/`???` | `2` `42` `1` `a` `nyi` |
+| `unapply_seq.scala` | `unapplySeq` / `_*` / 名前付き extractor | `6` `21` `1` `7` |
+| `trait_val.scala` | trait `val` の初期化 | `from trait` |
+| `abstract_override.scala` | `abstract override` の super 連鎖 | `B-A-base` |
+| `predef_more.scala` | `any2stringadd` / `implicitly` / `identity` / `locally` | `1x` `41` `42` `here` |
+| `sealed_non_exhaustive.scala` | 非網羅 match（warning。実行は覆っている入力だけ） | `3` |
 
 implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストで見ています。コンパイルを成功扱いにしていません。
 
