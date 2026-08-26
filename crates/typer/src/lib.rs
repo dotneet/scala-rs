@@ -1312,4 +1312,32 @@ object Main {
 "#,
         );
     }
+
+    #[test]
+    fn eq_ne_synchronized_typecheck() {
+        ok(r#"
+class Box
+object Main {
+  def main(args: Array[String]): Unit = {
+    val a = new Box()
+    val b = new Box()
+    val same: Boolean = a.eq(a)
+    val diff: Boolean = a.ne(b)
+    val n: Int = a.synchronized { 41 }
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn do_while_typecheck() {
+        ok(r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    var i: Int = 0
+    do { i = i + 1 } while (i < 3)
+  }
+}
+"#);
+    }
 }

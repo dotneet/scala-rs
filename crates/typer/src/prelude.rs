@@ -493,6 +493,38 @@ fn add_any_members(st: &mut SymbolTable) {
         Type::Boolean,
         Intrinsic::None,
     );
+    // nsc `Any.synchronized[T0](body: => T0): T0`
+    let sync = method(
+        st,
+        any,
+        "synchronized",
+        vec![Type::ByName(Box::new(Type::Any))],
+        Type::Any,
+        Intrinsic::Synchronized,
+    );
+    let t0 = type_param(st, sync, "T0");
+    st.get_mut(sync).tparams = vec![t0];
+    st.get_mut(sync).ty = Type::Method {
+        paramss: vec![vec![Type::ByName(Box::new(Type::TypeParam(t0)))]],
+        ret: Box::new(Type::TypeParam(t0)),
+    };
+    let anyref = st.anyref_sym;
+    method(
+        st,
+        anyref,
+        "eq",
+        vec![Type::AnyRef],
+        Type::Boolean,
+        Intrinsic::Eq,
+    );
+    method(
+        st,
+        anyref,
+        "ne",
+        vec![Type::AnyRef],
+        Type::Boolean,
+        Intrinsic::Ne,
+    );
 }
 
 fn add_int_members(st: &mut SymbolTable) {

@@ -430,4 +430,21 @@ object M {
             other => panic!("{other:?}"),
         }
     }
+
+    #[test]
+    fn do_while_parses() {
+        let t = parse_ok(
+            r#"
+object M {
+  def f(): Int = {
+    var i: Int = 0
+    do { i = i + 1 } while (i < 3)
+    i
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("DoWhile"), "{dump}");
+    }
 }

@@ -201,10 +201,12 @@ impl Typer {
                 } else {
                     Flags::EMPTY
                 });
+                let annots = mods.annotations.clone();
                 let jvm = self.jvm_for_current(name);
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Class, flags, &jvm);
+                self.st.get_mut(id).annotations = annots;
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
                 if mods.flags.contains(Flags::CASE) {
@@ -212,6 +214,7 @@ impl Typer {
                 }
             }
             TreeKind::ModuleDef { name, mods, .. } => {
+                let annots = mods.annotations.clone();
                 let jvm = format!("{}$", self.jvm_for_current(name));
                 let cls = self.st.alloc(
                     &format!("{name}$"),
@@ -229,6 +232,8 @@ impl Typer {
                 );
                 self.st.get_mut(m).ty = Type::ModuleRef(cls);
                 self.st.get_mut(cls).ty = Type::ModuleRef(cls);
+                self.st.get_mut(m).annotations = annots.clone();
+                self.st.get_mut(cls).annotations = annots;
                 self.st.enter_in_current(name, m);
                 tree.sym = m;
             }
@@ -548,26 +553,32 @@ impl Typer {
     fn namer_member(&mut self, tree: &mut Tree) {
         match &tree.kind {
             TreeKind::ValDef { name, mods, .. } => {
+                let annots = mods.annotations.clone();
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Term, mods.flags, "");
                 self.st.get_mut(id).private_within = mods.private_within.clone();
+                self.st.get_mut(id).annotations = annots;
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
             TreeKind::DefDef { name, mods, .. } => {
+                let annots = mods.annotations.clone();
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Method, mods.flags, "");
                 self.st.get_mut(id).private_within = mods.private_within.clone();
+                self.st.get_mut(id).annotations = annots;
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
             TreeKind::TypeDef { name, mods, .. } => {
+                let annots = mods.annotations.clone();
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::TypeMember, mods.flags, "");
                 self.st.get_mut(id).private_within = mods.private_within.clone();
+                self.st.get_mut(id).annotations = annots;
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
@@ -5793,7 +5804,7 @@ fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
         },
         Type::ByName(p) => match actual {
             Type::ByName(a) => unify_one(tp, p, a),
-            _ => None,
+            _ => unify_one(tp, p, actual),
         },
         Type::Repeated(p) => unify_one(tp, p, actual),
         _ => None,

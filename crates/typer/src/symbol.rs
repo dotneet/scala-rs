@@ -46,6 +46,12 @@ pub enum Intrinsic {
     Locally,
     Any2StringAdd,
     Implicitly,
+    /// AnyRef reference equality (`eq`).
+    Eq,
+    /// AnyRef reference inequality (`ne`).
+    Ne,
+    /// `Any.synchronized` (monitor enter/exit around a by-name body).
+    Synchronized,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +81,8 @@ pub struct Symbol {
     /// Access qualifier `private[C]` / `protected[C]` (`C` is a class or package name).
     /// `private[this]` is `PRIVATE|LOCAL` with this field empty.
     pub private_within: Option<String>,
+    /// Language annotations (`@deprecated(...)`, `@tailrec`, …) copied from modifiers.
+    pub annotations: Vec<scala_rs_parser::Tree>,
 }
 
 impl Symbol {
@@ -153,6 +161,7 @@ impl SymbolTable {
                 children: vec![],
                 self_type: None,
                 private_within: None,
+                annotations: vec![],
             }],
             scopes: vec![Scope::default()],
             root: SymbolId(0),
@@ -218,6 +227,7 @@ impl SymbolTable {
             children: vec![],
             self_type: None,
             private_within: None,
+            annotations: vec![],
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {

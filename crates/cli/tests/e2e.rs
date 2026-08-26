@@ -136,6 +136,14 @@ fn fixtures_while_loop() {
     check("while_loop");
 }
 #[test]
+fn fixtures_do_while() {
+    check("do_while");
+}
+#[test]
+fn fixtures_eq_sync() {
+    check("eq_sync");
+}
+#[test]
 fn fixtures_string_interp() {
     check("string_interp");
 }
@@ -1082,16 +1090,19 @@ fn scalac_typechecks_against_our_classfiles_if_present() {
     }
     let lib_src = fixtures_dir().join("separate_lib.scala");
     let out_lib = tmp_dir("scalac-cp-lib");
-    let status = Command::new(bin())
-        .args([
-            "compile",
-            "--no-scala-library",
-            lib_src.to_str().unwrap(),
-            "-d",
-            out_lib.to_str().unwrap(),
-        ])
-        .status()
-        .expect("compile Lib for scalac");
+    let mut compile = Command::new(bin());
+    compile.args([
+        "compile",
+        lib_src.to_str().unwrap(),
+        "-d",
+        out_lib.to_str().unwrap(),
+    ]);
+    if let Some(jar) = scala_library_jar() {
+        compile.args(["--scala-library", jar.to_str().unwrap()]);
+    } else {
+        compile.arg("--no-scala-library");
+    }
+    let status = compile.status().expect("compile Lib for scalac");
     assert!(status.success());
     let probe = tmp_dir("scalac-probe");
     let src = probe.join("UseLib.scala");
@@ -1108,6 +1119,8 @@ object UseLib {
     val q: Int = p.x + p.y
     val m: Int = p match { case Point(a, b) => a + b }
     val sum: Int = Lib.add(Point(1, 2))
+    val z: Int = Lib.f(List(1, 2))
+    val d: Int = Lib.g
   }
 }
 "#,
@@ -1125,7 +1138,7 @@ object UseLib {
         .expect("scalac");
     assert!(
         output.status.success(),
-        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add): {}\n{}",
+        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g): {}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );

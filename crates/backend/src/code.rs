@@ -670,6 +670,12 @@ impl Assembler {
     pub fn if_icmple(&mut self, l: Label) {
         self.jump(0xa4, l, -2);
     }
+    pub fn if_acmpeq(&mut self, l: Label) {
+        self.jump(0xa5, l, -2);
+    }
+    pub fn if_acmpne(&mut self, l: Label) {
+        self.jump(0xa6, l, -2);
+    }
     pub fn ifnull(&mut self, l: Label) {
         self.jump(0xc6, l, -1);
     }
