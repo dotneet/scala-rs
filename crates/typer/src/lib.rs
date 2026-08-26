@@ -1,12 +1,14 @@
 mod check;
 mod erasure;
 mod implicits;
+mod lambda_lift;
 mod prelude;
 mod symbol;
 mod uncurry;
 
 pub use check::{find_mains, has_errors, typecheck, typecheck_opts, TypecheckOptions, Typer};
 pub use erasure::{erase, erase_type};
+pub use lambda_lift::lambda_lift;
 pub use symbol::{Intrinsic, SymKind, Symbol, SymbolTable};
 pub use uncurry::uncurry;
 
@@ -606,6 +608,69 @@ object Main {
     }
 
     #[test]
+    fn existentials_typecheck() {
+        ok(r#"
+object Main {
+  def show(xs: List[_]): Unit = {
+    xs.foreach((x: Any) => println(x))
+  }
+  def show2(xs: List[X] forSome { type X }): Unit = {
+    xs.foreach((x: Any) => println(x))
+  }
+  def main(args: Array[String]): Unit = {
+    show(1 :: 2 :: Nil)
+    show2("a" :: Nil)
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn unsupported_wildcard_bounds_are_diagnosed() {
+        let (_, _, diags) = typecheck_str(
+            "object M { def f(xs: List[_ <: Int]): Unit = () }\n",
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("wildcard bounds")
+                || d.message.contains("unimplemented")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn implicit_specificity_picks_subclass() {
+        ok(r#"
+class A { def tag: String = "A" }
+class B extends A { def tag: String = "B" }
+object Main {
+  implicit val a: A = new A()
+  implicit val b: B = new B()
+  def pick(implicit x: A): String = x.tag
+  def main(args: Array[String]): Unit = {
+    val s: String = pick()
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn nested_def_typechecks() {
+        ok(r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n = 10
+    def add(x: Int): Int = x + n
+    val m: Int = add(1)
+    def fact(x: Int): Int = if (x <= 1) 1 else x * fact(x - 1)
+    val f: Int = fact(5)
+  }
+}
+"#);
+    }
+
+    #[test]
     fn eta_and_uncurry_typecheck() {
         let src = r#"
 object Main {
@@ -633,5 +698,31 @@ object Main {
             "uncurry should flatten nested param lists: {dump}"
         );
         assert!(dump.contains("Function"), "eta-expansion should yield Function: {dump}");
+    }
+
+    #[test]
+    fn lambda_lift_hoists_nested_def() {
+        let src = r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n = 10
+    def add(x: Int): Int = x + n
+    val m: Int = add(1)
+  }
+}
+"#;
+        let (mut t, mut st, diags) = typecheck_str(src);
+        assert!(
+            !has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        crate::uncurry(&mut t, &mut st);
+        crate::lambda_lift(&mut t, &mut st);
+        let dump = scala_rs_parser::dump_tree(&t);
+        assert!(
+            dump.contains("DefDef add$") || dump.contains("add$1"),
+            "nested def should be lifted to a synthetic method: {dump}"
+        );
     }
 }

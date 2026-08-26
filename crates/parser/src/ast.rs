@@ -161,6 +161,8 @@ pub enum Type {
     ModuleRef(SymbolId),
     /// A type parameter (`T` in `def id[T](x: T): T`).
     TypeParam(SymbolId),
+    /// Unbounded wildcard existential `_` (as in `List[_]`).
+    Wildcard,
 }
 
 impl Type {
@@ -278,6 +280,7 @@ impl fmt::Display for Type {
             }
             Type::ModuleRef(s) => write!(f, "module#{}", s.0),
             Type::TypeParam(s) => write!(f, "tparam#{}", s.0),
+            Type::Wildcard => write!(f, "_"),
         }
     }
 }

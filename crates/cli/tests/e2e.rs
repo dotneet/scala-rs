@@ -252,6 +252,18 @@ fn fixtures_eta() {
     check("eta");
 }
 #[test]
+fn fixtures_existentials() {
+    check("existentials");
+}
+#[test]
+fn fixtures_implicit_specific() {
+    check("implicit_specific");
+}
+#[test]
+fn fixtures_lambda_lift() {
+    check("lambda_lift");
+}
+#[test]
 fn fixtures_super() {
     check("super");
 }
@@ -308,6 +320,45 @@ fn fatal_warnings_makes_non_exhaustive_fail() {
         .expect("run scala-rs compile");
     assert!(!status.success(), "expected -Xfatal-warnings to fail");
     let _ = fs::remove_dir_all(&out);
+}
+
+fn compile_fails(name: &str, needle: &str) {
+    let src = fixtures_dir().join(format!("{name}.scala"));
+    let out = tmp_dir(name);
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--no-scala-library",
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        !output.status.success(),
+        "expected compile of {name} to fail"
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        err.contains(needle),
+        "expected {needle:?} in diagnostics for {name}, got {err:?}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn fixtures_implicit_ambiguous_is_error() {
+    compile_fails("implicit_ambiguous", "ambiguous implicit");
+}
+
+#[test]
+fn fixtures_existential_bounds_is_error() {
+    compile_fails("existential_bounds", "unimplemented");
 }
 
 fn scala_library_jar() -> Option<PathBuf> {
@@ -434,6 +485,21 @@ fn scala_library_dual_run_eta() {
 #[test]
 fn scala_library_dual_run_try_util() {
     dual_run_fixture("try_util");
+}
+
+#[test]
+fn scala_library_dual_run_existentials() {
+    dual_run_fixture("existentials");
+}
+
+#[test]
+fn scala_library_dual_run_implicit_specific() {
+    dual_run_fixture("implicit_specific");
+}
+
+#[test]
+fn scala_library_dual_run_lambda_lift() {
+    dual_run_fixture("lambda_lift");
 }
 
 const LIBRARY_COLLIDERS: &[&str] = &[

@@ -269,7 +269,7 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::Method { ret, .. } => jvm_desc(st, ret),
         Type::ByName(_) => "Lscala/Function0;".into(),
         Type::Repeated(_) => "Lscala/collection/immutable/Seq;".into(),
-        Type::TypeParam(_) => "Ljava/lang/Object;".into(),
+        Type::TypeParam(_) | Type::Wildcard => "Ljava/lang/Object;".into(),
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
             format!("[{}", jvm_desc(st, &args[0]))
         }
@@ -5128,6 +5128,7 @@ mod tests {
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
         scala_rs_typer::uncurry(&mut tree, &mut st);
+        scala_rs_typer::lambda_lift(&mut tree, &mut st);
         scala_rs_typer::erase(&mut tree, &mut st);
         let mut classes = crate::runtime::emit_runtime();
         classes.extend(emit(&tree, &st, "Test.scala"));
@@ -5148,6 +5149,7 @@ mod tests {
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
         scala_rs_typer::uncurry(&mut tree, &mut st);
+        scala_rs_typer::lambda_lift(&mut tree, &mut st);
         scala_rs_typer::erase(&mut tree, &mut st);
         emit_opts(&tree, &st, "Test.scala", EmitOpts { library_abi: true })
     }

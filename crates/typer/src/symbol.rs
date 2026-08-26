@@ -290,6 +290,7 @@ impl SymbolTable {
                 .into_iter()
                 .find(|s| self.get(*s).is_class_like()),
             Type::TypeParam(_) => None,
+            Type::Wildcard => Some(self.any_sym),
             _ => None,
         }
     }
@@ -473,6 +474,8 @@ impl SymbolTable {
                 .any(|p| self.is_sub_type(p, b)),
             (Type::TypeParam(a), Type::TypeParam(b)) if a == b => true,
             (Type::TypeParam(_), Type::AnyRef | Type::AnyVal) => true,
+            (Type::Wildcard, Type::AnyRef | Type::AnyVal | Type::Wildcard) => true,
+            (_, Type::Wildcard) => true,
             (
                 Type::Function {
                     params: p1,

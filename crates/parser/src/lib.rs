@@ -136,12 +136,28 @@ object M {
 
     #[test]
     fn unimplemented_is_reported() {
-        let r = parse_str("class C { type X = Int forSome { type X } }\n");
+        let r = parse_str("object M { def f = macro impl }\n");
         assert!(
             has_errors(&r.diags)
                 || dump_tree(&r.tree).contains("Unimplemented")
                 || !r.diags.is_empty()
         );
+    }
+
+    #[test]
+    fn wildcard_and_forsome_types_parse() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def show(xs: List[_]): Unit = ()
+  def show2(xs: List[X] forSome { type X }): Unit = ()
+  type Vacuous = Int forSome { type X }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("TypeDef _") || dump.contains("Existential"), "{dump}");
+        assert!(dump.contains("Existential"), "forSome should parse as ExistentialTypeTree: {dump}");
     }
 
     #[test]
