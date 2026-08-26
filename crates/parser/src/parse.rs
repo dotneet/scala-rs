@@ -2386,12 +2386,14 @@ impl<'a> Parser<'a> {
             parents.push(self.parse_parent());
         }
         let mut body = vec![];
+        let mut has_braces = false;
         if matches!(self.peek_non_nl(), TokenKind::LBrace) {
             self.skip_nl();
             let (_, _, b) = self.parse_template_body();
             body = b;
+            has_braces = true;
         }
-        if body.is_empty() && parents.len() == 1 {
+        if !has_braces && parents.len() == 1 {
             // new C or new C(args) — parent may already be Apply
             match parents.pop().unwrap() {
                 t @ Tree {

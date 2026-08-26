@@ -217,6 +217,16 @@ object Main {
     }
 
     #[test]
+    fn empty_body_anonymous_new_is_still_anon() {
+        let t = parse_ok("object M { val t = new Tag[Int] {} }\n");
+        let dump = dump_tree(&t);
+        assert!(
+            dump.contains("$anon"),
+            "new T {{}} must be an anonymous class, not new T: {dump}"
+        );
+    }
+
+    #[test]
     fn view_bounds_parse() {
         let t = parse_ok(
             r#"
