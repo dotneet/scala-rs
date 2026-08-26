@@ -71,6 +71,8 @@ pub struct Typer {
     gensym: u32,
     fatal_warnings: bool,
     library_abi: bool,
+    /// Nearest enclosing named method; `None` in class/object constructors.
+    return_meth: Option<SymbolId>,
 }
 
 pub fn typecheck(tree: &mut Tree, file_index: usize) -> (SymbolTable, Vec<Diagnostic>) {
@@ -102,6 +104,7 @@ impl Typer {
             gensym: 0,
             fatal_warnings: opts.fatal_warnings,
             library_abi: opts.library_abi,
+            return_meth: None,
         }
     }
 
@@ -721,8 +724,10 @@ impl Typer {
         }
         let saved_owner = self.st.owner;
         let saved_this = self.st.this_class;
+        let saved_ret = self.return_meth;
         self.st.owner = id;
         self.st.this_class = id;
+        self.return_meth = None;
         self.st.push_scope();
         // re-enter members into local scope
         for m in self.st.get(id).members.clone() {
@@ -788,6 +793,7 @@ impl Typer {
         self.st.pop_scope();
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
+        self.return_meth = saved_ret;
         tree.ty = Type::Class {
             sym: id,
             args: vec![],
@@ -861,8 +867,10 @@ impl Typer {
         };
         let saved_owner = self.st.owner;
         let saved_this = self.st.this_class;
+        let saved_ret = self.return_meth;
         self.st.owner = cls;
         self.st.this_class = cls;
+        self.return_meth = None;
         self.st.push_scope();
         for mem in self.st.get(cls).members.clone() {
             let n = self.st.get(mem).name.clone();
@@ -908,6 +916,7 @@ impl Typer {
         self.st.pop_scope();
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
+        self.return_meth = saved_ret;
         tree.ty = Type::ModuleRef(cls);
     }
 
@@ -1641,7 +1650,9 @@ impl Typer {
         }
         self.st.push_scope();
         let saved_owner = self.st.owner;
+        let saved_ret = self.return_meth;
         if !tree.sym.is_none() {
+            self.return_meth = Some(tree.sym);
             self.st.owner = tree.sym;
             for tp in self.st.get(tree.sym).tparams.clone() {
                 let n = self.st.get(tp).name.clone();
@@ -1668,6 +1679,7 @@ impl Typer {
             }
         }
         self.st.owner = saved_owner;
+        self.return_meth = saved_ret;
         self.st.pop_scope();
         self.check_stored_annotations(tree);
     }
@@ -1965,7 +1977,24 @@ impl Typer {
                 tree.ty = ty;
             }
             TreeKind::Return { expr } => {
-                self.type_expr(expr, &Type::NoType);
+                let Some(meth) = self.return_meth else {
+                    self.error(tree.span, "return outside method definition");
+                    tree.ty = Type::Nothing;
+                    return;
+                };
+                let ret = match &self.st.get(meth).ty {
+                    Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
+                    t => t.clone(),
+                };
+                if ret.is_no_type() {
+                    self.type_expr(expr, &Type::NoType);
+                } else {
+                    self.type_expr(expr, &ret);
+                    if !expr.is_empty() {
+                        self.adapt(expr, &ret);
+                    }
+                }
+                tree.sym = meth;
                 tree.ty = Type::Nothing;
             }
             TreeKind::Throw { expr } => {
@@ -4550,18 +4579,20 @@ impl Typer {
                             rhs,
                             ..
                         } => {
-                            if !tparams.is_empty()
-                                || lo.is_some()
-                                || hi.is_some()
-                                || !rhs.is_empty()
-                            {
+                            if !tparams.is_empty() || !rhs.is_empty() {
                                 self.error(
                                     c.span,
                                     "unimplemented type: bounded or higher-kinded existential",
                                 );
                                 ok = false;
                             } else {
-                                quantified.push(name.clone());
+                                let lo_ty = lo.as_ref().map(|t| self.tree_to_type(t));
+                                let hi_ty = hi.as_ref().map(|t| self.tree_to_type(t));
+                                quantified.push(ExistQuant {
+                                    name: name.clone(),
+                                    lo: lo_ty,
+                                    hi: hi_ty,
+                                });
                             }
                         }
                         TreeKind::ValDef { .. } => {
@@ -5472,7 +5503,86 @@ impl Typer {
                     self.check_tailrec(tree);
                 }
             }
+            if is_override_annot(&path) {
+                if !matches!(&tree.kind, TreeKind::DefDef { .. }) {
+                    self.error(
+                        tree.span,
+                        format!(
+                            "method {} overrides nothing",
+                            tree.name().unwrap_or("<annot>")
+                        ),
+                    );
+                } else {
+                    self.check_java_override(tree);
+                }
+            }
         }
+    }
+
+    fn check_java_override(&mut self, tree: &Tree) {
+        let name = tree.name().unwrap_or("").to_string();
+        if name.is_empty() || name == "<init>" {
+            self.error(tree.span, "method <init> overrides nothing");
+            return;
+        }
+        if tree.sym.is_none() || !self.method_overrides_parent(tree.sym) {
+            self.error(tree.span, format!("method {name} overrides nothing"));
+        }
+    }
+
+    fn method_overrides_parent(&self, meth: SymbolId) -> bool {
+        if meth.is_none() {
+            return false;
+        }
+        let s = self.st.get(meth);
+        let name = s.name.clone();
+        let owner = s.owner;
+        if owner.is_none() {
+            return false;
+        }
+        let my_ps = method_value_params(&s.ty);
+        let mut seen = std::collections::HashSet::new();
+        let mut work: Vec<SymbolId> = Vec::new();
+        for p in &self.st.get(owner).parents {
+            if let Some(c) = self.st.class_sym_of(p) {
+                work.push(c);
+            }
+        }
+        work.push(self.st.anyref_sym);
+        work.push(self.st.any_sym);
+        while let Some(id) = work.pop() {
+            if id.is_none() || id == owner || !seen.insert(id.0) {
+                continue;
+            }
+            for m in self.st.get(id).members.clone() {
+                if m == meth {
+                    continue;
+                }
+                let cand = self.st.get(m);
+                if cand.name != name {
+                    continue;
+                }
+                if !matches!(cand.kind, SymKind::Method | SymKind::Term) {
+                    continue;
+                }
+                let ps = method_value_params(&cand.ty);
+                if ps.len() != my_ps.len() {
+                    continue;
+                }
+                let ok = my_ps.iter().zip(ps.iter()).all(|(a, b)| {
+                    a == b || self.st.is_sub_type(a, b) || self.st.is_sub_type(b, a)
+                });
+                if ok {
+                    return true;
+                }
+            }
+            for p in self.st.get(id).parents.clone() {
+                if let Some(c) = self.st.class_sym_of(&p) {
+                    work.push(c);
+                }
+            }
+        }
+        false
     }
 
     fn check_tailrec(&mut self, tree: &Tree) {
@@ -5537,6 +5647,18 @@ fn is_tailrec_annot(path: &str) -> bool {
         path,
         "tailrec" | "annotation.tailrec" | "scala.annotation.tailrec"
     )
+}
+
+fn is_override_annot(path: &str) -> bool {
+    matches!(path, "Override" | "java.lang.Override")
+}
+
+fn method_value_params(ty: &Type) -> Vec<Type> {
+    match ty {
+        Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+        Type::Function { params, .. } => params.clone(),
+        _ => Vec::new(),
+    }
 }
 
 fn is_rec_apply(tree: &Tree, meth: SymbolId) -> bool {
@@ -6043,60 +6165,85 @@ pub fn find_mains(st: &SymbolTable, tree: &Tree) -> Vec<String> {
     out
 }
 
-/// Replace quantified existential names (`type X`) with unbounded wildcards.
-fn subst_quantified(ty: Type, names: &[String]) -> Type {
-    if names.is_empty() {
+/// Replace quantified existential names (`type X` / `type X <: Bound`) with
+/// wildcards. Bounded forms become `BoundedWildcard` so pickle/erasure reuse
+/// the `List[_ <: AnyRef]` path.
+struct ExistQuant {
+    name: String,
+    lo: Option<Type>,
+    hi: Option<Type>,
+}
+
+fn subst_quantified(ty: Type, qs: &[ExistQuant]) -> Type {
+    if qs.is_empty() {
         return ty;
     }
-    match ty {
-        Type::Named { name, args } if args.is_empty() && names.iter().any(|n| n == &name) => {
-            Type::Wildcard
+    let replace = |name: &str, args: &[Type]| -> Option<Type> {
+        if !args.is_empty() {
+            return None;
         }
-        Type::Named { name, args } => Type::Named {
-            name,
-            args: args
-                .into_iter()
-                .map(|a| subst_quantified(a, names))
-                .collect(),
-        },
+        qs.iter().find(|q| q.name == name).map(|q| {
+            if q.lo.is_none() && q.hi.is_none() {
+                Type::Wildcard
+            } else {
+                Type::BoundedWildcard {
+                    lo: q.lo.clone().map(Box::new),
+                    hi: q.hi.clone().map(Box::new),
+                }
+            }
+        })
+    };
+    match ty {
+        Type::Named { name, args } => {
+            if let Some(w) = replace(&name, &args) {
+                w
+            } else {
+                Type::Named {
+                    name,
+                    args: args.into_iter().map(|a| subst_quantified(a, qs)).collect(),
+                }
+            }
+        }
         Type::Class { sym, args } => Type::Class {
             sym,
             args: args
                 .into_iter()
-                .map(|a| subst_quantified(a, names))
+                .map(|a| subst_quantified(a, qs))
                 .collect(),
         },
-        Type::Array(t) => Type::Array(Box::new(subst_quantified(*t, names))),
+        Type::Array(t) => Type::Array(Box::new(subst_quantified(*t, qs))),
         Type::Function { params, ret } => Type::Function {
             params: params
                 .into_iter()
-                .map(|p| subst_quantified(p, names))
+                .map(|p| subst_quantified(p, qs))
                 .collect(),
-            ret: Box::new(subst_quantified(*ret, names)),
+            ret: Box::new(subst_quantified(*ret, qs)),
         },
         Type::Method { paramss, ret } => Type::Method {
             paramss: paramss
                 .into_iter()
                 .map(|ps| {
                     ps.into_iter()
-                        .map(|p| subst_quantified(p, names))
+                        .map(|p| subst_quantified(p, qs))
                         .collect()
                 })
                 .collect(),
-            ret: Box::new(subst_quantified(*ret, names)),
+            ret: Box::new(subst_quantified(*ret, qs)),
         },
-        Type::ByName(t) => Type::ByName(Box::new(subst_quantified(*t, names))),
-        Type::Repeated(t) => Type::Repeated(Box::new(subst_quantified(*t, names))),
-        Type::Tuple(ts) => Type::Tuple(
-            ts.into_iter()
-                .map(|t| subst_quantified(t, names))
-                .collect(),
-        ),
-        Type::Overload(alts) => Type::Overload(
-            alts.into_iter()
-                .map(|t| subst_quantified(t, names))
-                .collect(),
-        ),
+        Type::ByName(t) => Type::ByName(Box::new(subst_quantified(*t, qs))),
+        Type::Repeated(t) => Type::Repeated(Box::new(subst_quantified(*t, qs))),
+        Type::Tuple(ts) => Type::Tuple(ts.into_iter().map(|t| subst_quantified(t, qs)).collect()),
+        Type::Overload(alts) => {
+            Type::Overload(alts.into_iter().map(|t| subst_quantified(t, qs)).collect())
+        }
+        Type::Annotated { tpe, annot } => Type::Annotated {
+            tpe: Box::new(subst_quantified(*tpe, qs)),
+            annot,
+        },
+        Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
+            lo: lo.map(|t| Box::new(subst_quantified(*t, qs))),
+            hi: hi.map(|t| Box::new(subst_quantified(*t, qs))),
+        },
         other => other,
     }
 }

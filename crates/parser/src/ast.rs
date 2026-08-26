@@ -68,7 +68,7 @@ impl Flags {
 pub struct Modifiers {
     pub flags: Flags,
     pub private_within: Option<String>,
-    /// `@tailrec` / `@deprecated` / others, as parsed annotation trees.
+    /// `@tailrec` / `@deprecated` / Java `@Override` / `@Deprecated` / others.
     pub annotations: Vec<Tree>,
 }
 

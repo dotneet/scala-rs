@@ -55,6 +55,9 @@ pub struct Assembler {
     this_name: String,
     is_init: bool,
     ret_object: Option<String>,
+    /// Locals at the start of a try, used so exception handlers do not claim
+    /// locals the try body initialized later.
+    try_locals: Option<Vec<VType>>,
 }
 
 impl Assembler {
@@ -82,6 +85,7 @@ impl Assembler {
             this_name: String::new(),
             is_init: false,
             ret_object: None,
+            try_locals: None,
         }
     }
 
@@ -213,6 +217,11 @@ impl Assembler {
             .push((start, end, handler, catch.map(str::to_string)));
     }
 
+    /// Snapshot locals for a following non-local-return exception handler.
+    pub fn capture_try_locals(&mut self) {
+        self.try_locals = Some(self.vlocals.clone());
+    }
+
     /// Handler entry: the JVM pushes the exception object. Reset tracked stack.
     pub fn enter_handler(&mut self) {
         self.dead = false;
@@ -220,6 +229,22 @@ impl Assembler {
         self.stack = 1;
         if self.stack > self.max_stack {
             self.max_stack = self.stack;
+        }
+        let off = self.bytes.len() as u16;
+        self.record_frame_at(off, self.vstack.clone(), self.vlocals.clone());
+    }
+
+    /// NLR catch: use locals from [`capture_try_locals`] so the handler frame
+    /// does not claim locals the try body initialized later.
+    pub fn enter_handler_captured_locals(&mut self) {
+        self.dead = false;
+        self.vstack = vec![VType::Object("java/lang/Throwable".into())];
+        self.stack = 1;
+        if self.stack > self.max_stack {
+            self.max_stack = self.stack;
+        }
+        if let Some(loc) = self.try_locals.take() {
+            self.vlocals = loc;
         }
         let off = self.bytes.len() as u16;
         self.record_frame_at(off, self.vstack.clone(), self.vlocals.clone());

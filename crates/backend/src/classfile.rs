@@ -323,6 +323,8 @@ pub struct Method {
     pub name: String,
     pub desc: String,
     pub code: Option<Code>,
+    /// RuntimeVisible Java annotations (`Ljava/lang/Deprecated;`, …).
+    pub java_annots: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -399,11 +401,17 @@ impl ClassEmit {
             .scala_signature
             .as_deref()
             .map(|s| pool.utf8(s));
+        let method_rva = if self.methods.iter().any(|m| !m.java_annots.is_empty()) {
+            Some(pool.utf8("RuntimeVisibleAnnotations"))
+        } else {
+            None
+        };
         let mut methods_data = Vec::new();
         for m in &self.methods {
             let n = pool.utf8(&m.name);
             let d = pool.utf8(&m.desc);
-            methods_data.push((m.access, n, d, m.code.clone()));
+            let annots: Vec<u16> = m.java_annots.iter().map(|a| pool.utf8(a)).collect();
+            methods_data.push((m.access, n, d, m.code.clone(), annots));
         }
         let mut out = Vec::new();
         out.extend_from_slice(&0xCAFEBABEu32.to_be_bytes());
@@ -425,12 +433,13 @@ impl ClassEmit {
             out.extend_from_slice(&0u16.to_be_bytes());
         }
         out.extend_from_slice(&(methods_data.len() as u16).to_be_bytes());
-        for (acc, n, d, code) in methods_data {
+        for (acc, n, d, code, annots) in methods_data {
             out.extend_from_slice(&acc.to_be_bytes());
             out.extend_from_slice(&n.to_be_bytes());
             out.extend_from_slice(&d.to_be_bytes());
+            let n_attrs = u16::from(code.is_some()) + u16::from(!annots.is_empty());
+            out.extend_from_slice(&n_attrs.to_be_bytes());
             if let Some(c) = code {
-                out.extend_from_slice(&1u16.to_be_bytes());
                 out.extend_from_slice(&code_attr.to_be_bytes());
                 let mut body = Vec::new();
                 body.extend_from_slice(&c.max_stack.to_be_bytes());
@@ -453,8 +462,18 @@ impl ClassEmit {
                 }
                 out.extend_from_slice(&(body.len() as u32).to_be_bytes());
                 out.extend_from_slice(&body);
-            } else {
-                out.extend_from_slice(&0u16.to_be_bytes());
+            }
+            if !annots.is_empty() {
+                let rva = method_rva.or(rva_attr).expect("RuntimeVisibleAnnotations utf8");
+                let mut body = Vec::new();
+                body.extend_from_slice(&(annots.len() as u16).to_be_bytes());
+                for ty in annots {
+                    body.extend_from_slice(&ty.to_be_bytes());
+                    body.extend_from_slice(&0u16.to_be_bytes());
+                }
+                out.extend_from_slice(&rva.to_be_bytes());
+                out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                out.extend_from_slice(&body);
             }
         }
         let n_class_attrs = 1u16

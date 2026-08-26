@@ -30,6 +30,7 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
         emit_tuple2(),
         emit_arrow_assoc(),
         emit_not_implemented(),
+        emit_non_local_return_control(),
     ]
 }
 
@@ -74,6 +75,7 @@ impl B {
             name: encode_method_name(name),
             desc: desc.to_string(),
             code: Some(code),
+            java_annots: Vec::new(),
         });
     }
 
@@ -83,6 +85,7 @@ impl B {
             name: encode_method_name(name),
             desc: desc.to_string(),
             code: None,
+            java_annots: Vec::new(),
         });
     }
 
@@ -974,6 +977,71 @@ fn emit_not_implemented() -> EmittedClass {
             "(Ljava/lang/String;)V",
         );
         asm.vreturn();
+    });
+    b.finish()
+}
+
+/// Private-runtime stand-in for `scala.runtime.NonLocalReturnControl`.
+/// Descriptor matches scala-library 2.13: `(Ljava/lang/Object;Ljava/lang/Object;)V`,
+/// `key()` / `value()`.
+fn emit_non_local_return_control() -> EmittedClass {
+    let mut b = B::class(
+        "scala/runtime/NonLocalReturnControl",
+        "java/lang/RuntimeException",
+    );
+    b.access = ACC_PUBLIC | ACC_SUPER;
+    b.fields.push(Field {
+        access: ACC_PUBLIC,
+        name: "key".into(),
+        desc: "Ljava/lang/Object;".into(),
+    });
+    b.fields.push(Field {
+        access: ACC_PUBLIC,
+        name: "value".into(),
+        desc: "Ljava/lang/Object;".into(),
+    });
+    b.add_code(
+        ACC_PUBLIC,
+        "<init>",
+        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        3,
+        |asm| {
+            asm.aload(0);
+            asm.invokespecial("java/lang/RuntimeException", "<init>", "()V");
+            asm.aload(0);
+            asm.aload(1);
+            asm.putfield(
+                "scala/runtime/NonLocalReturnControl",
+                "key",
+                "Ljava/lang/Object;",
+            );
+            asm.aload(0);
+            asm.aload(2);
+            asm.putfield(
+                "scala/runtime/NonLocalReturnControl",
+                "value",
+                "Ljava/lang/Object;",
+            );
+            asm.vreturn();
+        },
+    );
+    b.add_code(ACC_PUBLIC, "key", "()Ljava/lang/Object;", 1, |asm| {
+        asm.aload(0);
+        asm.getfield(
+            "scala/runtime/NonLocalReturnControl",
+            "key",
+            "Ljava/lang/Object;",
+        );
+        asm.areturn();
+    });
+    b.add_code(ACC_PUBLIC, "value", "()Ljava/lang/Object;", 1, |asm| {
+        asm.aload(0);
+        asm.getfield(
+            "scala/runtime/NonLocalReturnControl",
+            "value",
+            "Ljava/lang/Object;",
+        );
+        asm.areturn();
     });
     b.finish()
 }
