@@ -145,6 +145,7 @@ pub fn erase_type(ty: &Type) -> Type {
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(erase_type).collect()),
         Type::Overload(alts) => Type::Overload(alts.iter().map(erase_type).collect()),
         Type::Wildcard | Type::BoundedWildcard { .. } => Type::Any,
+        Type::Constant(lit) => Type::lit_underlying(lit),
         Type::ThisType(s) => Type::Class {
             sym: *s,
             args: vec![],
@@ -178,6 +179,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         }
         Type::TypeParam(_) | Type::TypeMember(_) => Type::Any,
         Type::Wildcard | Type::BoundedWildcard { .. } => Type::Any,
+        Type::Constant(lit) => Type::lit_underlying(lit),
         Type::ThisType(s) => Type::Class {
             sym: *s,
             args: vec![],
@@ -250,16 +252,17 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
 }
 
 fn is_primitive(ty: &Type) -> bool {
-    matches!(
-        ty,
+    match ty {
         Type::Int
-            | Type::Long
-            | Type::Double
-            | Type::Boolean
-            | Type::Char
-            | Type::Float
-            | Type::Unit
-    )
+        | Type::Long
+        | Type::Double
+        | Type::Boolean
+        | Type::Char
+        | Type::Float
+        | Type::Unit => true,
+        Type::Constant(lit) => is_primitive(&Type::lit_underlying(lit)),
+        _ => false,
+    }
 }
 
 fn is_ref_erased(ty: &Type) -> bool {
@@ -279,6 +282,7 @@ fn is_ref_erased(ty: &Type) -> bool {
             | Type::BoundedWildcard { .. }
             | Type::ThisType(_)
             | Type::SingleType { .. }
+            | Type::Constant(_)
             | Type::Annotated { .. }
             | Type::Named { .. }
             | Type::Refined { .. }
@@ -597,11 +601,12 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         }
     }
     let orig = tree.ty.clone();
+    let orig_erased = erase_ty(&orig, st);
     let ret_erased = match &fun_ty {
         Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
         t => erase_ty(t, st),
     };
-    tree.ty = erase_ty(&orig, st);
+    tree.ty = orig_erased.clone();
     let array_prim_load = match &tree.kind {
         TreeKind::Apply { fun, .. } => match &fun.kind {
             TreeKind::Select { qual, name } if name == "apply" => match &qual.ty {
@@ -612,19 +617,20 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         },
         _ => false,
     };
-    if is_primitive(&orig) && is_ref_erased(&ret_erased) && !matches!(orig, Type::Unit) {
+    if is_primitive(&orig_erased) && is_ref_erased(&ret_erased) && !matches!(orig_erased, Type::Unit)
+    {
         if array_prim_load {
-            tree.ty = orig;
+            tree.ty = orig_erased;
         } else {
             tree.ty = ret_erased;
-            wrap_unbox(tree, orig);
+            wrap_unbox(tree, orig_erased);
         }
-    } else if matches!(orig, Type::String)
+    } else if matches!(orig_erased, Type::String)
         && is_ref_erased(&ret_erased)
         && !matches!(ret_erased, Type::String)
     {
         tree.ty = ret_erased;
-        wrap_unbox(tree, orig);
+        wrap_unbox(tree, orig_erased);
     }
     adapt_box_unbox(tree, expected);
 }

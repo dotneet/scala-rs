@@ -318,6 +318,7 @@ impl SymbolTable {
             Type::TypeMember(_) => None,
             Type::Wildcard | Type::BoundedWildcard { .. } => Some(self.any_sym),
             Type::ThisType(sym) => Some(*sym),
+            Type::Constant(lit) => self.class_sym_of(&Type::lit_underlying(lit)),
             Type::SingleType { prefix, sym } => {
                 let t = self.get(*sym).ty.clone();
                 if t.is_no_type() {
@@ -471,6 +472,8 @@ impl SymbolTable {
             (Type::Error, _) | (_, Type::Error) => true,
             (Type::Nothing, _) => true,
             (_, Type::Any) => true,
+            (Type::Constant(a), Type::Constant(b)) => a == b,
+            (Type::Constant(a), b) => self.is_sub_type(&Type::lit_underlying(a), b),
             (
                 Type::Null,
                 Type::AnyRef
@@ -617,6 +620,7 @@ impl SymbolTable {
                 format!("{}.{}", self.get(s.owner).name, s.name)
             }
             Type::ThisType(id) => format!("{}.this.type", self.get(*id).name),
+            Type::Constant(lit) => format!("{lit}"),
             Type::SingleType { sym, .. } => format!("{}.type", self.get(*sym).name),
             Type::Annotated { tpe, annot } => {
                 format!("{} @{}", self.display_type(tpe), annot)

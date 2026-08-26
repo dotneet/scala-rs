@@ -508,6 +508,16 @@ fn fixtures_java_deprecated() {
 }
 
 #[test]
+fn fixtures_const_types() {
+    check("const_types");
+}
+
+#[test]
+fn fixtures_implicit_class() {
+    check("implicit_class");
+}
+
+#[test]
 fn fixtures_structural() {
     check("structural");
 }
@@ -535,6 +545,16 @@ fn fixtures_return_ctor_is_error() {
 #[test]
 fn fixtures_override_bad_is_error() {
     compile_fails("override_bad", "overrides nothing");
+}
+
+#[test]
+fn fixtures_const_types_bad_is_error() {
+    compile_fails("const_types_bad", "type mismatch");
+}
+
+#[test]
+fn fixtures_dynamic_bad_is_error() {
+    compile_fails("dynamic_bad", "language.dynamics");
 }
 
 #[test]
@@ -776,6 +796,21 @@ fn scala_library_dual_run_custom_interp() {
 #[test]
 fn scala_library_dual_run_array_ops() {
     dual_run_fixture("array_ops");
+}
+
+#[test]
+fn scala_library_dual_run_const_types() {
+    dual_run_fixture("const_types");
+}
+
+#[test]
+fn scala_library_dual_run_implicit_class() {
+    dual_run_fixture("implicit_class");
+}
+
+#[test]
+fn scala_library_dual_run_dynamic() {
+    dual_run_fixture("dynamic");
 }
 
 const LIBRARY_COLLIDERS: &[&str] = &[

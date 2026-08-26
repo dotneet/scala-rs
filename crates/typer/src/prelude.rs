@@ -238,6 +238,21 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     );
     let _ = class(st, st.scala_pkg, "Tuple3", "scala/Tuple3", &[Type::AnyRef]);
 
+    // Marker trait `scala.Dynamic`. JVM interface lives in scala-library.jar;
+    // we only need the symbol so `class D extends Dynamic` typechecks.
+    let _dynamic = iface(st, st.scala_pkg, "Dynamic", "scala/Dynamic");
+    let language = module(st, st.scala_pkg, "language", "scala/language$");
+    let lang_cls = st.module_class_of(language);
+    let dynamics = st.alloc(
+        "dynamics",
+        lang_cls,
+        SymKind::Term,
+        Flags::IMPLICIT.with(Flags::LAZY).with(Flags::FINAL),
+        "",
+    );
+    st.get_mut(dynamics).ty = Type::Boolean;
+    st.get_mut(language).members.push(dynamics);
+
     let rich_int = if library_abi {
         Some(add_rich_int_and_range(st))
     } else {

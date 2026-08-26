@@ -150,6 +150,22 @@ object M {
     }
 
     #[test]
+    fn constant_types_parse() {
+        let t = parse_ok(
+            r#"
+object Main {
+  val x: 1 = 1
+  def f(n: 1): Int = n
+  val b: true = true
+  val s: "hi" = "hi"
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Literal"), "type-position literals: {dump}");
+    }
+
+    #[test]
     fn wildcard_and_forsome_types_parse() {
         let t = parse_ok(
             r#"

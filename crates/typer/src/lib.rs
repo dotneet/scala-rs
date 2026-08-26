@@ -1505,4 +1505,90 @@ object Main {
 }
 "#);
     }
+
+    #[test]
+    fn constant_types_typecheck() {
+        ok(r#"
+object Main {
+  val x: 1 = 1
+  def f(n: 1): Int = n
+  def main(args: Array[String]): Unit = {
+    val n: Int = f(1)
+    val y: Int = x
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn constant_type_mismatch() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  val y: 1 = 2
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected mismatch, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("type mismatch")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn implicit_class_extension_typecheck() {
+        ok(r#"
+object Main {
+  implicit class Rich(n: Int) {
+    def twice: Int = n * 2
+  }
+  def main(args: Array[String]): Unit = {
+    val n: Int = 2.twice
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn dynamic_select_and_apply_typecheck() {
+        ok(r#"
+import scala.language.dynamics
+class D extends Dynamic {
+  def selectDynamic(name: String): String = name
+  def applyDynamic(name: String)(x: String): String = name + x
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val d = new D()
+    val a: String = d.foo
+    val b: String = d.bar("x")
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn dynamic_without_language_import_is_error() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+class D extends Dynamic {
+  def selectDynamic(name: String): String = name
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val d = new D()
+    val a: String = d.foo
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("language.dynamics")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
 }

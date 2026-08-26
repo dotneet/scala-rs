@@ -847,6 +847,7 @@ impl<'a> Pickler<'a> {
             Type::ByName(t) => self.pickle_type(t),
             Type::Repeated(_) => self.type_ref_named("Seq"),
             Type::Method { ret, .. } => self.pickle_type(ret),
+            Type::Constant(lit) => self.pickle_type(&Type::lit_underlying(lit)),
             _ => self.type_ref_named("Any"),
         }
     }

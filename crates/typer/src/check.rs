@@ -73,6 +73,8 @@ pub struct Typer {
     library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
     return_meth: Option<SymbolId>,
+    /// `import scala.language.dynamics` (or `language._`) has been seen.
+    language_dynamics: bool,
 }
 
 pub fn typecheck(tree: &mut Tree, file_index: usize) -> (SymbolTable, Vec<Diagnostic>) {
@@ -105,6 +107,7 @@ impl Typer {
             fatal_warnings: opts.fatal_warnings,
             library_abi: opts.library_abi,
             return_meth: None,
+            language_dynamics: false,
         }
     }
 
@@ -398,6 +401,11 @@ impl Typer {
         }
         if is_case {
             self.synthesize_case_members(id, &name);
+        }
+        let conversions = implicit_class_conversions(body);
+        for mut conv in conversions {
+            self.namer_member(&mut conv);
+            body.push(conv);
         }
         self.st.pop_scope();
         self.st.owner = saved_owner;
@@ -1316,7 +1324,7 @@ impl Typer {
         };
         self.type_expr(rhs, &pt);
         if declared.is_no_type() {
-            tree.ty = rhs.ty.clone();
+            tree.ty = rhs.ty.widen_constant();
             if !tree.sym.is_none() {
                 self.st.get_mut(tree.sym).ty = tree.ty.clone();
             }
@@ -1670,9 +1678,10 @@ impl Typer {
         if !ret_pt.is_no_type() {
             self.adapt(rhs, &ret_pt);
         } else {
-            // infer result type
+            // infer result type (SIP-23: do not infer singleton/constant types)
+            let inferred = rhs.ty.widen_constant();
             if let Type::Method { ret, .. } = &mut tree.ty {
-                *ret = Box::new(rhs.ty.clone());
+                *ret = Box::new(inferred.clone());
             }
             if !tree.sym.is_none() {
                 self.st.get_mut(tree.sym).ty = tree.ty.clone();
@@ -1706,6 +1715,9 @@ impl Typer {
             TreeKind::Import { expr, .. } => expr,
             _ => return,
         };
+        if import_enables_dynamics(expr) {
+            self.language_dynamics = true;
+        }
         match &mut expr.kind {
             TreeKind::Select { qual, name } if name == "_" => {
                 self.type_expr(qual, &Type::NoType);
@@ -1801,21 +1813,7 @@ impl Typer {
         }
         match &mut tree.kind {
             TreeKind::Literal { lit } => {
-                tree.ty = match lit {
-                    Lit::Unit => Type::Unit,
-                    Lit::Boolean(_) => Type::Boolean,
-                    Lit::Int(_) => Type::Int,
-                    Lit::Long(_) => Type::Long,
-                    Lit::Float(_) => Type::Float,
-                    Lit::Double(_) => Type::Double,
-                    Lit::Char(_) => Type::Char,
-                    Lit::String(_) => Type::String,
-                    Lit::Null => Type::Null,
-                    Lit::Symbol(_) => Type::Named {
-                        name: "Symbol".into(),
-                        args: vec![],
-                    },
-                };
+                tree.ty = Type::Constant(lit.clone());
             }
             TreeKind::This { qual } => {
                 let q = qual.clone();
@@ -2331,6 +2329,15 @@ impl Typer {
                 found = vec![member];
             }
         }
+        if found.is_empty() && self.is_dynamic_receiver(&qual.ty) {
+            if matches!(pt, Type::Method { .. }) {
+                // `d.foo(args)`: type_apply rewrites to applyDynamic.
+                tree.ty = Type::Error;
+                return;
+            }
+            self.rewrite_select_dynamic(tree, pt);
+            return;
+        }
         if found.is_empty() {
             self.error(
                 tree.span,
@@ -2586,7 +2593,205 @@ impl Typer {
         true
     }
 
+    fn is_dynamic_receiver(&self, ty: &Type) -> bool {
+        if let Type::Named { name, .. } = ty {
+            if name == "Dynamic" || name.ends_with(".Dynamic") {
+                return true;
+            }
+        }
+        let mut work = Vec::new();
+        if let Some(c) = self.st.class_sym_of(ty) {
+            work.push(c);
+        }
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = work.pop() {
+            if !seen.insert(id.0) {
+                continue;
+            }
+            let s = self.st.get(id);
+            if s.name == "Dynamic"
+                || s.jvm_name == "scala/Dynamic"
+                || s.jvm_name.ends_with("/Dynamic")
+            {
+                return true;
+            }
+            for p in s.parents.clone() {
+                if let Some(ps) = self.st.class_sym_of(&p) {
+                    work.push(ps);
+                } else if let Type::Named { name, .. } = &p {
+                    if name == "Dynamic" || name.ends_with(".Dynamic") {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn receiver_has_term(&self, ty: &Type, name: &str) -> bool {
+        match ty {
+            Type::Refined { decls, parents } => {
+                let in_decl = decls.iter().any(|d| {
+                    matches!(
+                        d,
+                        scala_rs_parser::RefineDecl::Def { name: n, .. }
+                            | scala_rs_parser::RefineDecl::Val { name: n, .. }
+                            if n == name
+                    )
+                });
+                if in_decl {
+                    return true;
+                }
+                parents.iter().any(|p| self.receiver_has_term(p, name))
+            }
+            Type::ModuleRef(id) => !self.st.lookup_member(*id, name).is_empty(),
+            _ => {
+                if let Some(o) = self.st.class_sym_of(ty) {
+                    if !self.st.lookup_member(o, name).is_empty() {
+                        return true;
+                    }
+                }
+                name == "toString"
+            }
+        }
+    }
+
+    fn dynamics_feature_error(&mut self, span: Span, method: &str) {
+        self.error(
+            span,
+            format!(
+                "Dynamic method {method} needs to be enabled by making the implicit value scala.language.dynamics visible"
+            ),
+        );
+    }
+
+    fn rewrite_select_dynamic(&mut self, tree: &mut Tree, pt: &Type) {
+        if !self.language_dynamics {
+            self.dynamics_feature_error(tree.span, "selectDynamic");
+            tree.ty = Type::Error;
+            return;
+        }
+        let span = tree.span;
+        let id = tree.id;
+        let (qual, dyn_name) = match &mut tree.kind {
+            TreeKind::Select { qual, name } => (
+                std::mem::replace(qual, Box::new(Tree::dummy(TreeKind::Empty))),
+                name.clone(),
+            ),
+            _ => return,
+        };
+        let name_lit = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Literal {
+                lit: Lit::String(dyn_name),
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+        let sel = Tree {
+            id,
+            span,
+            kind: TreeKind::Select {
+                qual,
+                name: "selectDynamic".into(),
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+        tree.kind = TreeKind::Apply {
+            fun: Box::new(sel),
+            args: vec![name_lit],
+        };
+        self.type_apply(tree, pt);
+    }
+
+    fn try_rewrite_dynamic_apply(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        let dyn_name = match &tree.kind {
+            TreeKind::Apply { fun, .. } => match &fun.kind {
+                TreeKind::Select { name, .. }
+                    if !matches!(
+                        name.as_str(),
+                        "applyDynamic" | "selectDynamic" | "updateDynamic"
+                    ) =>
+                {
+                    name.clone()
+                }
+                _ => return false,
+            },
+            _ => return false,
+        };
+        {
+            let TreeKind::Apply { fun, .. } = &mut tree.kind else {
+                return false;
+            };
+            let TreeKind::Select { qual, .. } = &mut fun.kind else {
+                return false;
+            };
+            self.type_expr(qual, &Type::NoType);
+            if !self.is_dynamic_receiver(&qual.ty) {
+                return false;
+            }
+            if self.receiver_has_term(&qual.ty, &dyn_name) {
+                return false;
+            }
+        }
+        if !self.language_dynamics {
+            self.dynamics_feature_error(tree.span, "applyDynamic");
+            tree.ty = Type::Error;
+            return true;
+        }
+        let span = tree.span;
+        let TreeKind::Apply { fun, args } =
+            std::mem::replace(&mut tree.kind, TreeKind::Empty)
+        else {
+            return false;
+        };
+        let TreeKind::Select { qual, .. } = fun.kind else {
+            tree.kind = TreeKind::Apply { fun, args };
+            return false;
+        };
+        let name_lit = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Literal {
+                lit: Lit::String(dyn_name),
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+        let sel = Tree {
+            id: fun.id,
+            span: fun.span,
+            kind: TreeKind::Select {
+                qual,
+                name: "applyDynamic".into(),
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+        let inner = Tree {
+            id: fun.id,
+            span: fun.span,
+            kind: TreeKind::Apply {
+                fun: Box::new(sel),
+                args: vec![name_lit],
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+        tree.kind = TreeKind::Apply {
+            fun: Box::new(inner),
+            args,
+        };
+        self.type_apply(tree, pt);
+        true
+    }
+
     fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
+        if self.try_rewrite_dynamic_apply(tree, pt) {
+            return;
+        }
         let (fun, args) = match &mut tree.kind {
             TreeKind::Apply { fun, args } => (fun, args),
             _ => return,
@@ -2794,7 +2999,7 @@ impl Typer {
                     if let Some(a0) = args.first() {
                         ret = Type::Class {
                             sym: self.st.list_sym,
-                            args: vec![a0.ty.clone()],
+                            args: vec![a0.ty.widen_constant()],
                         };
                     }
                 } else if method_name == "apply"
@@ -2804,7 +3009,7 @@ impl Typer {
                     if let Some(a0) = args.first() {
                         ret = Type::Class {
                             sym: self.st.some_sym,
-                            args: vec![a0.ty.clone()],
+                            args: vec![a0.ty.widen_constant()],
                         };
                     }
                 } else if method_name == "map" {
@@ -2818,7 +3023,7 @@ impl Typer {
                                 {
                                     ret = Type::Class {
                                         sym: cls,
-                                        args: vec![(**fr).clone()],
+                                        args: vec![fr.as_ref().widen_constant()],
                                     };
                                 }
                             }
@@ -2839,7 +3044,7 @@ impl Typer {
                             {
                                 ret = Type::Class {
                                     sym: cls,
-                                    args: vec![to],
+                                    args: vec![to.widen_constant()],
                                 };
                             }
                         }
@@ -2862,12 +3067,12 @@ impl Typer {
                         if n == "Map" && args.len() >= 2 {
                             ret = Type::Class {
                                 sym: cls,
-                                args: vec![args[0].ty.clone(), args[1].ty.clone()],
+                                args: vec![args[0].ty.widen_constant(), args[1].ty.widen_constant()],
                             };
                         } else if n == "Vector" && args.len() >= 2 {
                             ret = Type::Class {
                                 sym: cls,
-                                args: vec![args[1].ty.clone()],
+                                args: vec![args[1].ty.widen_constant()],
                             };
                         }
                     }
@@ -2877,7 +3082,7 @@ impl Typer {
                             if let Some(a0) = args.first() {
                                 ret = Type::Class {
                                     sym: cls,
-                                    args: vec![a0.ty.clone()],
+                                    args: vec![a0.ty.widen_constant()],
                                 };
                             }
                         }
@@ -2917,7 +3122,7 @@ impl Typer {
                             {
                                 ret = Type::Class {
                                     sym: cls,
-                                    args: vec![a0.ty.clone()],
+                                    args: vec![a0.ty.widen_constant()],
                                 };
                             }
                         }
@@ -2945,7 +3150,7 @@ impl Typer {
                             {
                                 ret = Type::Class {
                                     sym: cls,
-                                    args: vec![elem],
+                                    args: vec![elem.widen_constant()],
                                 };
                             }
                         }
@@ -3832,6 +4037,7 @@ impl Typer {
 
     fn f_arg_ok(&self, ty: &Type, kind: scala_rs_parser::finterp::FConvKind) -> bool {
         use scala_rs_parser::finterp::FConvKind;
+        let ty = ty.widen_constant();
         match kind {
             FConvKind::General => true,
             FConvKind::Integral => matches!(ty, Type::Int | Type::Long),
@@ -4540,7 +4746,7 @@ impl Typer {
                     None => Type::Error,
                 }
             }
-            TreeKind::Literal { lit: Lit::Unit } => Type::Unit,
+            TreeKind::Literal { lit } => Type::Constant(lit.clone()),
             TreeKind::TypeDef {
                 name, tparams, lo, hi, rhs, ..
             } => {
@@ -5913,7 +6119,9 @@ fn is_sub_type(a: &Type, b: &Type) -> bool {
 }
 
 fn numeric_widen(a: &Type, b: &Type) -> Option<Type> {
-    match (a, b) {
+    let a = a.widen_constant();
+    let b = b.widen_constant();
+    match (&a, &b) {
         (Type::Int, Type::Long) => Some(Type::Long),
         (Type::Int, Type::Double) => Some(Type::Double),
         (Type::Long, Type::Double) => Some(Type::Double),
@@ -5924,19 +6132,67 @@ fn numeric_widen(a: &Type, b: &Type) -> Option<Type> {
 }
 
 fn lub(a: &Type, b: &Type) -> Type {
-    if is_sub_type(a, b) {
-        return b.clone();
-    }
-    if is_sub_type(b, a) {
+    if a == b {
         return a.clone();
+    }
+    let a = a.widen_constant();
+    let b = b.widen_constant();
+    if a == b {
+        return a;
+    }
+    if is_sub_type(&a, &b) {
+        return b;
+    }
+    if is_sub_type(&b, &a) {
+        return a;
     }
     if matches!(a, Type::Nothing) {
-        return b.clone();
+        return b;
     }
     if matches!(b, Type::Nothing) {
-        return a.clone();
+        return a;
     }
     Type::Any
+}
+
+fn import_path(t: &Tree) -> String {
+    match &t.kind {
+        TreeKind::Ident { name } => name.clone(),
+        TreeKind::Select { qual, name } => {
+            let p = import_path(qual);
+            if p.is_empty() {
+                name.clone()
+            } else {
+                format!("{p}.{name}")
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn import_enables_dynamics(expr: &Tree) -> bool {
+    let p = import_path(expr);
+    if p == "scala.language.dynamics"
+        || p == "language.dynamics"
+        || p.ends_with(".language.dynamics")
+        || p == "scala.language._"
+        || p == "language._"
+        || p.ends_with(".language._")
+    {
+        return true;
+    }
+    if let TreeKind::Select { qual, name } = &expr.kind {
+        if name.starts_with('{') {
+            let qp = import_path(qual);
+            let is_lang = qp == "scala.language"
+                || qp == "language"
+                || qp.ends_with(".language");
+            if is_lang && (name.contains("dynamics") || name.contains('_')) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// nsc: `T: C` means implicit evidence of type `C[T]`.
@@ -6088,7 +6344,7 @@ fn unify_tparam(tp: SymbolId, params: &[Type], args: &[Type]) -> Option<Type> {
 
 fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
     match pattern {
-        Type::TypeParam(id) if *id == tp => Some(actual.clone()),
+        Type::TypeParam(id) if *id == tp => Some(actual.widen_constant()),
         Type::Class { args: pas, .. } => {
             if let Type::Class { args: aas, .. } = actual {
                 for (p, a) in pas.iter().zip(aas) {

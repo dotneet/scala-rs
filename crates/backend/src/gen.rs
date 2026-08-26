@@ -279,6 +279,7 @@ fn jvm_sort(ty: &Type) -> JvmSort {
         Type::Long => JvmSort::Long,
         Type::Float => JvmSort::Float,
         Type::Double => JvmSort::Double,
+        Type::Constant(lit) => jvm_sort(&Type::lit_underlying(lit)),
         _ => JvmSort::Ref,
     }
 }
@@ -316,6 +317,7 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
             "Ljava/lang/Object;".into()
         }
         Type::ThisType(sym) => format!("L{};", class_internal(st, *sym)),
+        Type::Constant(lit) => jvm_desc(st, &Type::lit_underlying(lit)),
         Type::SingleType { prefix, sym } => {
             let inner = st.get(*sym).ty.clone();
             if inner.is_no_type() {
@@ -3582,7 +3584,10 @@ fn gen_apply(
         }
 
         // name-based int ops if typer did not attach an intrinsic
-        if args.len() == 1 && matches!(qual.ty, Type::Int) && matches!(args[0].ty, Type::Int) {
+        if args.len() == 1
+            && matches!(qual.ty.widen_constant(), Type::Int)
+            && matches!(args[0].ty.widen_constant(), Type::Int)
+        {
             if matches!(
                 name.as_str(),
                 "+" | "-" | "*" | "/" | "%" | "==" | "!=" | "<" | "<=" | ">" | ">="
@@ -4829,6 +4834,10 @@ fn gen_assert_require(
 }
 
 fn emit_box(asm: &mut Assembler, ty: &Type) {
+    emit_box_inner(asm, &ty.widen_constant())
+}
+
+fn emit_box_inner(asm: &mut Assembler, ty: &Type) {
     match ty {
         Type::Int => {
             asm.invokestatic("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;");
@@ -4856,6 +4865,10 @@ fn emit_box(asm: &mut Assembler, ty: &Type) {
 }
 
 fn emit_unbox(asm: &mut Assembler, ty: &Type) {
+    emit_unbox_inner(asm, &ty.widen_constant())
+}
+
+fn emit_unbox_inner(asm: &mut Assembler, ty: &Type) {
     match ty {
         Type::Int => {
             asm.checkcast("java/lang/Integer");
@@ -4939,7 +4952,7 @@ fn gen_function_apply(
 
 fn is_jvm_primitive(ty: &Type) -> bool {
     matches!(
-        ty,
+        ty.widen_constant(),
         Type::Int
             | Type::Long
             | Type::Double
@@ -5491,7 +5504,7 @@ fn gen_println(
         return;
     }
     let arg = &args[0];
-    match &arg.ty {
+    match &arg.ty.widen_constant() {
         Type::Unit | Type::NoType => {
             gen_expr(asm, frame, ctx, arg);
             asm.invokevirtual("java/io/PrintStream", name, "()V");

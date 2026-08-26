@@ -1415,6 +1415,16 @@ impl<'a> Parser<'a> {
                 | TokenKind::This
                 | TokenKind::Super
                 | TokenKind::Underscore
+                | TokenKind::IntLit(_)
+                | TokenKind::LongLit(_)
+                | TokenKind::FloatLit(_)
+                | TokenKind::DoubleLit(_)
+                | TokenKind::CharLit(_)
+                | TokenKind::StringLit(_)
+                | TokenKind::SymbolLit(_)
+                | TokenKind::True
+                | TokenKind::False
+                | TokenKind::Null
         )
     }
 
@@ -1427,6 +1437,16 @@ impl<'a> Parser<'a> {
                 | TokenKind::This
                 | TokenKind::Super
                 | TokenKind::Underscore
+                | TokenKind::IntLit(_)
+                | TokenKind::LongLit(_)
+                | TokenKind::FloatLit(_)
+                | TokenKind::DoubleLit(_)
+                | TokenKind::CharLit(_)
+                | TokenKind::StringLit(_)
+                | TokenKind::SymbolLit(_)
+                | TokenKind::True
+                | TokenKind::False
+                | TokenKind::Null
         )
     }
 
@@ -1577,8 +1597,31 @@ impl<'a> Parser<'a> {
         t
     }
 
+    /// SIP-23 constant types in type position: `val x: 1 = 1`.
+    fn parse_constant_type_lit(&mut self) -> Option<Tree> {
+        let sp = self.span();
+        let lit = match self.kind().clone() {
+            TokenKind::IntLit(n) => Lit::Int(n),
+            TokenKind::LongLit(n) => Lit::Long(n),
+            TokenKind::FloatLit(n) => Lit::Float(n),
+            TokenKind::DoubleLit(n) => Lit::Double(n),
+            TokenKind::CharLit(c) => Lit::Char(c),
+            TokenKind::StringLit(s) => Lit::String(s),
+            TokenKind::SymbolLit(s) => Lit::Symbol(s),
+            TokenKind::True => Lit::Boolean(true),
+            TokenKind::False => Lit::Boolean(false),
+            TokenKind::Null => Lit::Null,
+            _ => return None,
+        };
+        self.bump();
+        Some(self.alloc(sp, TreeKind::Literal { lit }))
+    }
+
     fn parse_simple_type(&mut self) -> Tree {
         self.skip_nl();
+        if let Some(lit) = self.parse_constant_type_lit() {
+            return lit;
+        }
         let mut t = match self.kind().clone() {
             TokenKind::LParen => {
                 self.bump();
