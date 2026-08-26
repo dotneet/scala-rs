@@ -327,11 +327,20 @@ impl Typer {
         let tp_ids = self.enter_tparams(tparams, id);
         self.st.get_mut(id).tparams = tp_ids;
         for tp in tparams.iter() {
-            if let TreeKind::TypeDef { views, .. } = &tp.kind {
+            if let TreeKind::TypeDef {
+                views, ctx_bounds, ..
+            } = &tp.kind
+            {
                 if !views.is_empty() {
                     self.error(
                         tp.span,
                         "unimplemented syntax: view bounds on class/trait type parameters",
+                    );
+                }
+                if !ctx_bounds.is_empty() {
+                    self.error(
+                        tp.span,
+                        "unimplemented syntax: context bounds on class/trait type parameters",
                     );
                 }
             }
@@ -515,6 +524,11 @@ impl Typer {
                 self.namer(stt);
             }
         }
+        let conversions = implicit_class_conversions(body);
+        for mut conv in conversions {
+            self.namer_member(&mut conv);
+            body.push(conv);
+        }
         self.st.pop_scope();
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
@@ -669,6 +683,31 @@ impl Typer {
 
     fn type_class(&mut self, tree: &mut Tree) {
         let id = tree.sym;
+        if let TreeKind::ClassDef {
+            mods, vparamss, ..
+        } = &tree.kind
+        {
+            if mods.flags.contains(Flags::IMPLICIT) {
+                let owner_kind = if !id.is_none() {
+                    self.st.get(self.st.get(id).owner).kind
+                } else {
+                    self.st.get(self.st.owner).kind
+                };
+                if owner_kind == SymKind::Package {
+                    self.error(
+                        tree.span,
+                        "unimplemented: implicit class at package level",
+                    );
+                }
+                let nparams = vparamss.first().map(|c| c.len()).unwrap_or(0);
+                if nparams != 1 {
+                    self.error(
+                        tree.span,
+                        "unimplemented: implicit class must have a single parameter",
+                    );
+                }
+            }
+        }
         let saved_owner = self.st.owner;
         let saved_this = self.st.this_class;
         self.st.owner = id;
@@ -699,6 +738,11 @@ impl Typer {
         }
         self.register_sealed_child(id);
         self.bind_self_type(id, self_name, self_tpt.as_deref());
+        for stt in body.iter_mut() {
+            if matches!(stt.kind, TreeKind::Import { .. }) {
+                self.type_import(stt);
+            }
+        }
         // type aliases / abstract type members before other signatures
         for stt in body.iter_mut() {
             if matches!(stt.kind, TreeKind::TypeDef { .. }) {
@@ -813,6 +857,11 @@ impl Typer {
         }
         self.register_sealed_child(cls);
         self.bind_self_type(cls, self_name, self_tpt.as_deref());
+        for stt in body.iter_mut() {
+            if matches!(stt.kind, TreeKind::Import { .. }) {
+                self.type_import(stt);
+            }
+        }
         for stt in body.iter_mut() {
             if matches!(stt.kind, TreeKind::TypeDef { .. }) {
                 self.type_type_member(stt);
@@ -1271,16 +1320,21 @@ impl Typer {
         let tp_ids = self.enter_tparams(tparams, tree.sym);
         self.st.get_mut(tree.sym).tparams = tp_ids.clone();
         let mut view_work: Vec<(SymbolId, Vec<Tree>, Span, bool)> = Vec::new();
+        let mut ctx_work: Vec<(SymbolId, Vec<Tree>, Span, bool)> = Vec::new();
         for (i, tp) in tparams.iter().enumerate() {
             if let TreeKind::TypeDef {
                 views,
+                ctx_bounds,
                 tparams: inner,
                 ..
             } = &tp.kind
             {
+                let hk = !inner.is_empty();
                 if !views.is_empty() {
-                    let hk = !inner.is_empty();
                     view_work.push((tp_ids[i], views.clone(), tp.span, hk));
+                }
+                if !ctx_bounds.is_empty() {
+                    ctx_work.push((tp_ids[i], ctx_bounds.clone(), tp.span, hk));
                 }
             }
         }
@@ -1357,6 +1411,56 @@ impl Typer {
                     params: vec![Type::TypeParam(tp_id)],
                     ret: Box::new(view_ty),
                 };
+                let ev_id = self.st.alloc(
+                    &ev_name,
+                    tree.sym,
+                    crate::symbol::SymKind::Term,
+                    Flags::IMPLICIT.with(Flags::PARAM),
+                    "",
+                );
+                self.st.get_mut(ev_id).ty = ev_ty.clone();
+                self.st.enter_in_current(&ev_name, ev_id);
+                let mut ev = Tree::dummy(TreeKind::ValDef {
+                    mods: Modifiers::new(Flags::IMPLICIT.with(Flags::PARAM)),
+                    name: ev_name,
+                    tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+                    rhs: Box::new(Tree::dummy(TreeKind::Empty)),
+                });
+                ev.span = span;
+                ev.sym = ev_id;
+                ev.ty = ev_ty.clone();
+                evidence.push(ev);
+                all_params.push(ev_id);
+            }
+        }
+        for (tp_id, bounds, span, hk) in ctx_work {
+            if hk {
+                self.error(
+                    span,
+                    "unimplemented syntax: context bounds on higher-kinded type parameters",
+                );
+                continue;
+            }
+            for bound in bounds {
+                if matches!(
+                    bound.kind,
+                    TreeKind::ExistentialTypeTree { .. }
+                        | TreeKind::CompoundTypeTree { .. }
+                        | TreeKind::Unimplemented { .. }
+                ) {
+                    self.error(
+                        bound.span,
+                        "unimplemented syntax: context bound shape (existential/refinement)",
+                    );
+                    continue;
+                }
+                let bound_ty = self.tree_to_type(&bound);
+                if bound_ty.is_error() {
+                    continue;
+                }
+                let ev_ty = apply_context_bound(bound_ty, tp_id);
+                self.gensym += 1;
+                let ev_name = format!("evidence${}", self.gensym);
                 let ev_id = self.st.alloc(
                     &ev_name,
                     tree.sym,
@@ -1641,6 +1745,15 @@ impl Typer {
     }
 
     fn type_expr_inner(&mut self, tree: &mut Tree, pt: &Type) {
+        if let TreeKind::InterpolatedString { prefix, .. } = &tree.kind {
+            if !matches!(prefix.as_str(), "s" | "f" | "raw") {
+                if self.library_abi && !self.st.lookup("StringContext").is_empty() {
+                    self.desugar_custom_interpolator(tree);
+                    self.type_expr_inner(tree, pt);
+                    return;
+                }
+            }
+        }
         match &mut tree.kind {
             TreeKind::Literal { lit } => {
                 tree.ty = match lit {
@@ -1771,11 +1884,19 @@ impl Typer {
                 tree.sym = tpt.sym;
                 if tree.sym.is_none() {
                     if let Some(id) = self.st.class_sym_of(&tpt.ty) {
-                        tree.ty = Type::Class {
-                            sym: id,
-                            args: vec![],
-                        };
                         tree.sym = id;
+                        // Keep `Array[T]` and applied class types so `new Array[T](n)`
+                        // can still see the element and rewrite through `ClassTag`.
+                        match &tree.ty {
+                            Type::Array(_) => {}
+                            Type::Class { args, .. } if !args.is_empty() => {}
+                            _ => {
+                                tree.ty = Type::Class {
+                                    sym: id,
+                                    args: vec![],
+                                };
+                            }
+                        }
                     }
                 }
             }
@@ -2087,6 +2208,10 @@ impl Typer {
                 found = self.st.lookup_member(*id, &name);
             }
         }
+        // Package / term prefix: `scala.reflect.ClassTag`
+        if found.is_empty() && !qual.sym.is_none() {
+            found = self.st.lookup_member(qual.sym, &name);
+        }
         if found.is_empty() && name == "toString" {
             found = self.st.lookup_member(self.st.any_sym, "toString");
         }
@@ -2358,6 +2483,19 @@ impl Typer {
         // new C(args)
         if matches!(&fun.kind, TreeKind::New { .. }) {
             self.type_expr(fun, &Type::NoType);
+            if let Some(elem) = array_elem_of(&fun.ty) {
+                if needs_classtag_elem(&elem) {
+                    self.rewrite_generic_array_new(tree, elem);
+                    return;
+                }
+                for a in args.iter_mut() {
+                    self.type_expr(a, &Type::Int);
+                    self.adapt(a, &Type::Int);
+                }
+                tree.ty = Type::Array(Box::new(elem));
+                tree.sym = fun.sym;
+                return;
+            }
             let class_id = fun
                 .sym
                 .is_none()
@@ -3018,10 +3156,25 @@ impl Typer {
                     .iter()
                     .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT));
             if all_impl && !matches!(pt, Type::Method { .. } | Type::Function { .. }) {
-                let rest_tys: Vec<Type> = rest_ids
-                    .iter()
-                    .map(|id| self.st.get(*id).ty.clone())
-                    .collect();
+                // Prefer the (possibly TypeApply-substituted) method type so
+                // `mk[Int](2)` searches `ClassTag[Int]`, not raw `ClassTag[T]`.
+                let rest_tys: Vec<Type> = match fun_ty {
+                    Type::Method { paramss, .. } if paramss.len() > 1 => {
+                        paramss[1..].iter().flatten().cloned().collect()
+                    }
+                    _ => rest_ids
+                        .iter()
+                        .map(|id| self.st.get(*id).ty.clone())
+                        .collect(),
+                };
+                let rest_tys = if rest_tys.len() == rest_ids.len() {
+                    rest_tys
+                } else {
+                    rest_ids
+                        .iter()
+                        .map(|id| self.st.get(*id).ty.clone())
+                        .collect()
+                };
                 let rest_tys = self.instantiate_from_call(sym, &first, args, rest_tys);
                 self.fill_implicit_params(span, args, &rest_tys, &rest_ids);
                 return None;
@@ -3479,6 +3632,12 @@ impl Typer {
             return Some(8);
         }
         if matches!(param, Type::TypeParam(_)) || matches!(arg, Type::TypeParam(_)) {
+            return Some(2);
+        }
+        // Overload scoring only: `is_sub_type` compares class args so
+        // `ClassTag[Int]` does not inhabit `ClassTag[T]`. Constructors whose
+        // args are type parameters still match, the way nsc infers `Map.apply`.
+        if class_ctor_matches_typeparam_args(arg, param) {
             return Some(2);
         }
         if numeric_widen(arg, param).is_some() {
@@ -4220,6 +4379,9 @@ impl Typer {
                     Some("Array") => {
                         Type::Array(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
                     }
+                    Some("<repeated>") => {
+                        Type::Repeated(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
+                    }
                     Some("Option") => Type::Class {
                         sym: self.st.option_sym,
                         args: as_,
@@ -4845,6 +5007,151 @@ impl Typer {
         );
         tree.ty = Type::Error;
     }
+
+    fn desugar_custom_interpolator(&mut self, tree: &mut Tree) {
+        let TreeKind::InterpolatedString {
+            prefix,
+            parts,
+            args,
+        } = &tree.kind
+        else {
+            return;
+        };
+        let span = tree.span;
+        let prefix = prefix.clone();
+        let parts = parts.clone();
+        let args = args.clone();
+        let sc = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Ident {
+                name: "StringContext".into(),
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+        let apply = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(sc),
+                name: "apply".into(),
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+        let part_lits: Vec<Tree> = parts
+            .into_iter()
+            .map(|p| Tree {
+                id: NodeId(0),
+                span,
+                kind: TreeKind::Literal {
+                    lit: Lit::String(p),
+                },
+                ty: Type::String,
+                sym: SymbolId::NONE,
+            })
+            .collect();
+        let sc_apply = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Apply {
+                fun: Box::new(apply),
+                args: part_lits,
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+        let sel = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(sc_apply),
+                name: prefix,
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+        *tree = Tree {
+            id: tree.id,
+            span,
+            kind: TreeKind::Apply {
+                fun: Box::new(sel),
+                args,
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+    }
+
+    fn rewrite_generic_array_new(&mut self, tree: &mut Tree, elem: Type) {
+        let span = tree.span;
+        let args = match &mut tree.kind {
+            TreeKind::Apply { args, .. } => std::mem::take(args),
+            _ => Vec::new(),
+        };
+        let Some(ct_cls) = self
+            .st
+            .lookup("ClassTag")
+            .into_iter()
+            .find(|s| self.st.get(*s).kind == SymKind::Class)
+        else {
+            self.error(
+                span,
+                "unimplemented: generic Array construction without ClassTag",
+            );
+            tree.ty = Type::Error;
+            return;
+        };
+        let ct_ty = Type::Class {
+            sym: ct_cls,
+            args: vec![elem.clone()],
+        };
+        match self.search_implicit(&ct_ty) {
+            ImplicitSearch::Found(id) => {
+                let mut recv = self.ref_implicit(id, span);
+                self.adapt(&mut recv, &ct_ty);
+                let sel = Tree {
+                    id: NodeId(0),
+                    span,
+                    kind: TreeKind::Select {
+                        qual: Box::new(recv),
+                        name: "newArray".into(),
+                    },
+                    ty: Type::NoType,
+                    sym: SymbolId::NONE,
+                };
+                *tree = Tree {
+                    id: tree.id,
+                    span,
+                    kind: TreeKind::Apply {
+                        fun: Box::new(sel),
+                        args,
+                    },
+                    ty: Type::NoType,
+                    sym: SymbolId::NONE,
+                };
+                self.type_expr_inner(tree, &Type::NoType);
+            }
+            ImplicitSearch::None => {
+                self.error(
+                    span,
+                    format!(
+                        "no implicit: could not find implicit value of type {}",
+                        self.st.display_type(&ct_ty)
+                    ),
+                );
+                tree.ty = Type::Error;
+            }
+            ImplicitSearch::Ambiguous(ids) => {
+                self.error(
+                    span,
+                    format!("ambiguous implicit: {}", self.describe_implicits(&ids)),
+                );
+                tree.ty = Type::Error;
+            }
+        }
+    }
 }
 
 fn f_kind_name(kind: scala_rs_parser::finterp::FConvKind) -> &'static str {
@@ -4912,6 +5219,36 @@ fn pattern_has_star(pat: &Tree) -> bool {
     }
 }
 
+/// Overload applicability: `Tuple2[Any, Any]` matches `Tuple2[K, V]` when `K`/`V`
+/// are type parameters. Not used for implicit search (`is_sub_type`).
+fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
+    match (arg, param) {
+        (
+            Type::Class {
+                sym: sa,
+                args: aa,
+            },
+            Type::Class {
+                sym: sp,
+                args: pa,
+            },
+        ) if sa == sp && aa.len() == pa.len() => aa.iter().zip(pa.iter()).all(|(a, p)| {
+            matches!(p, Type::TypeParam(_))
+                || a == p
+                || class_ctor_matches_typeparam_args(a, p)
+        }),
+        (Type::Tuple(aa), Type::Class { args: pa, .. }) if aa.len() == pa.len() => {
+            aa.iter().zip(pa.iter()).all(|(a, p)| {
+                matches!(p, Type::TypeParam(_))
+                    || a == p
+                    || class_ctor_matches_typeparam_args(a, p)
+            })
+        }
+        (_, Type::TypeParam(_)) => true,
+        _ => false,
+    }
+}
+
 fn is_sub_type(a: &Type, b: &Type) -> bool {
     if a == b {
         return true;
@@ -4942,7 +5279,15 @@ fn is_sub_type(a: &Type, b: &Type) -> bool {
             | Type::Function { .. },
             Type::AnyRef,
         ) => true,
-        (Type::Class { sym: s1, .. }, Type::Class { sym: s2, .. }) if s1 == s2 => true,
+        (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) if s1 == s2 => {
+            if a1.is_empty() || a2.is_empty() {
+                true
+            } else if a1.len() == a2.len() {
+                a1.iter().zip(a2.iter()).all(|(x, y)| is_sub_type(x, y))
+            } else {
+                false
+            }
+        }
         (Type::Wildcard, Type::AnyRef | Type::AnyVal | Type::Wildcard) => true,
         (_, Type::Wildcard) => true,
         (Type::Array(x), Type::Array(y)) => is_sub_type(x, y),
@@ -4976,6 +5321,128 @@ fn lub(a: &Type, b: &Type) -> Type {
         return a.clone();
     }
     Type::Any
+}
+
+/// nsc: `T: C` means implicit evidence of type `C[T]`.
+fn apply_context_bound(bound: Type, tp: SymbolId) -> Type {
+    match bound {
+        Type::Class { sym, args } if args.is_empty() => Type::Class {
+            sym,
+            args: vec![Type::TypeParam(tp)],
+        },
+        Type::Named { name, args } if args.is_empty() => Type::Named {
+            name,
+            args: vec![Type::TypeParam(tp)],
+        },
+        other => other,
+    }
+}
+
+fn array_elem_of(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Array(t) => Some((**t).clone()),
+        Type::Named { name, args } if name == "Array" && !args.is_empty() => {
+            Some(args[0].clone())
+        }
+        Type::Class { args, .. } if args.len() == 1 => {
+            // only when the class is Array; callers pass New's type which is Array(_)
+            None
+        }
+        _ => None,
+    }
+}
+
+fn needs_classtag_elem(elem: &Type) -> bool {
+    matches!(
+        elem,
+        Type::TypeParam(_) | Type::TypeMember(_) | Type::Wildcard
+    )
+}
+
+fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
+    let mut out = Vec::new();
+    for stt in body {
+        let TreeKind::ClassDef {
+            mods,
+            name,
+            vparamss,
+            ..
+        } = &stt.kind
+        else {
+            continue;
+        };
+        if !mods.flags.contains(Flags::IMPLICIT) {
+            continue;
+        }
+        let Some(params) = vparamss.first() else {
+            continue;
+        };
+        if params.len() != 1 {
+            continue;
+        }
+        let p = &params[0];
+        let pname = p.name().unwrap_or("x$0").to_string();
+        let tpt = match &p.kind {
+            TreeKind::ValDef { tpt, .. } => (**tpt).clone(),
+            _ => continue,
+        };
+        let mut param = Tree::dummy(TreeKind::ValDef {
+            mods: Modifiers::new(Flags::PARAM.with(Flags::SYNTHETIC)),
+            name: pname.clone(),
+            tpt: Box::new(tpt),
+            rhs: Box::new(Tree::dummy(TreeKind::Empty)),
+        });
+        param.span = p.span;
+        let cls_tpt = Tree {
+            id: NodeId(0),
+            span: stt.span,
+            kind: TreeKind::Ident { name: name.clone() },
+            ty: Type::NoType,
+            sym: stt.sym,
+        };
+        let arg = Tree {
+            id: NodeId(0),
+            span: p.span,
+            kind: TreeKind::Ident { name: pname },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+        let rhs = Tree {
+            id: NodeId(0),
+            span: stt.span,
+            kind: TreeKind::Apply {
+                fun: Box::new(Tree {
+                    id: NodeId(0),
+                    span: stt.span,
+                    kind: TreeKind::New {
+                        tpt: Box::new(cls_tpt),
+                    },
+                    ty: Type::NoType,
+                    sym: stt.sym,
+                }),
+                args: vec![arg],
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+        };
+        let mut conv = Tree::dummy(TreeKind::DefDef {
+            mods: Modifiers::new(Flags::IMPLICIT.with(Flags::SYNTHETIC)),
+            name: name.clone(),
+            tparams: vec![],
+            vparamss: vec![vec![param]],
+            tpt: Box::new(Tree {
+                id: NodeId(0),
+                span: stt.span,
+                kind: TreeKind::Ident { name: name.clone() },
+                ty: Type::NoType,
+                sym: stt.sym,
+            }),
+            rhs: Box::new(rhs),
+        });
+        conv.span = stt.span;
+        out.push(conv);
+    }
+    out
 }
 
 fn split_repeated(params: &[Type]) -> (&[Type], Option<&Type>) {

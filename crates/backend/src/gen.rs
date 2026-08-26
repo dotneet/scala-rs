@@ -2948,6 +2948,13 @@ fn gen_if(
 }
 
 fn gen_new(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tpt: &Tree, args: &[Tree]) {
+    if let Some(elem) = array_elem_ty(&tpt.ty) {
+        if let Some(len) = args.first() {
+            gen_expr(asm, frame, ctx, len);
+            emit_newarray(asm, ctx, &elem);
+            return;
+        }
+    }
     let class_id = tpt
         .sym
         .is_none()
@@ -3585,6 +3592,36 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
     let name = s.name.as_str();
     let mut desc = method_desc_from_sym(ctx.st, id);
     if ctx.library_abi {
+        if owner == "scala/reflect/ClassTag$" {
+            let desc = match name {
+                "Byte" => "()Lscala/reflect/ManifestFactory$ByteManifest;",
+                "Short" => "()Lscala/reflect/ManifestFactory$ShortManifest;",
+                "Char" => "()Lscala/reflect/ManifestFactory$CharManifest;",
+                "Int" => "()Lscala/reflect/ManifestFactory$IntManifest;",
+                "Long" => "()Lscala/reflect/ManifestFactory$LongManifest;",
+                "Float" => "()Lscala/reflect/ManifestFactory$FloatManifest;",
+                "Double" => "()Lscala/reflect/ManifestFactory$DoubleManifest;",
+                "Boolean" => "()Lscala/reflect/ManifestFactory$BooleanManifest;",
+                "Unit" => "()Lscala/reflect/ManifestFactory$UnitManifest;",
+                "Any" | "AnyRef" | "AnyVal" | "Object" | "Nothing" | "Null" => {
+                    "()Lscala/reflect/ClassTag;"
+                }
+                _ => desc.as_str(),
+            };
+            asm.invokevirtual(&owner, name, desc);
+            return;
+        }
+        if name == "newArray" && owner == "scala/reflect/ClassTag" {
+            asm.invokeinterface(&owner, "newArray", "(I)Ljava/lang/Object;");
+            if let Some(ty) = result_ty {
+                if let Type::Array(elem) = ty {
+                    if is_concrete_array_elem(elem) {
+                        asm.checkcast(&jvm_desc(ctx.st, ty));
+                    }
+                }
+            }
+            return;
+        }
         if name == "withFilter" && is_stdlib_list(&owner) {
             asm.invokeinterface(
                 "scala/collection/IterableOps",
@@ -4063,6 +4100,13 @@ fn maybe_unbox_erased_result(
     }
     if is_jvm_primitive(ty) && !is_unit_like(ty) {
         emit_unbox(asm, ty);
+        return;
+    }
+    if let Type::Array(elem) = ty {
+        if is_concrete_array_elem(elem) {
+            let d = jvm_desc(ctx.st, ty);
+            asm.checkcast(&d);
+        }
     }
 }
 
@@ -4070,6 +4114,45 @@ fn desc_returns_object(desc: &str) -> bool {
     desc.rsplit_once(')')
         .map(|(_, ret)| ret == "Ljava/lang/Object;")
         .unwrap_or(false)
+}
+
+fn array_elem_ty(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Array(t) => Some((**t).clone()),
+        Type::Named { name, args } if name == "Array" && args.len() == 1 => Some(args[0].clone()),
+        _ => None,
+    }
+}
+
+fn is_concrete_array_elem(elem: &Type) -> bool {
+    matches!(
+        elem,
+        Type::Boolean
+            | Type::Int
+            | Type::Long
+            | Type::Double
+            | Type::Float
+            | Type::Char
+            | Type::String
+            | Type::Class { .. }
+            | Type::ModuleRef(_)
+    )
+}
+
+fn emit_newarray(asm: &mut Assembler, ctx: &EmitCtx, elem: &Type) {
+    match elem {
+        Type::Boolean => asm.newarray(4),
+        Type::Char => asm.newarray(5),
+        Type::Float => asm.newarray(6),
+        Type::Double => asm.newarray(7),
+        Type::Int => asm.newarray(10),
+        Type::Long => asm.newarray(11),
+        Type::String => asm.anewarray("java/lang/String"),
+        Type::Class { sym, .. } | Type::ModuleRef(sym) => {
+            asm.anewarray(&class_internal(ctx.st, *sym));
+        }
+        _ => asm.anewarray("java/lang/Object"),
+    }
 }
 
 fn is_stdlib_list(owner: &str) -> bool {

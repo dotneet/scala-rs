@@ -203,10 +203,34 @@ impl Typer {
         match &s.ty {
             Type::Method { paramss, ret } => {
                 let empty = paramss.iter().all(|c| c.is_empty());
-                empty && self.st.is_sub_type(ret, pt)
+                empty && self.implicit_result_conforms(ret, pt)
             }
-            Type::Function { params, ret } if params.is_empty() => self.st.is_sub_type(ret, pt),
-            t => self.st.is_sub_type(t, pt),
+            Type::Function { params, ret } if params.is_empty() => {
+                self.implicit_result_conforms(ret, pt)
+            }
+            t => self.implicit_result_conforms(t, pt),
+        }
+    }
+
+    /// ClassTag is invariant. Covariant `is_sub_type` would let
+    /// `ClassTag[Nothing]` inhabit `ClassTag[Int]` (`Nothing <: Int`) and
+    /// `newArray` would then allocate `Object[]`.
+    fn implicit_result_conforms(&self, have: &Type, pt: &Type) -> bool {
+        match (have, pt) {
+            (
+                Type::Class {
+                    sym: s1,
+                    args: a1,
+                },
+                Type::Class {
+                    sym: s2,
+                    args: a2,
+                },
+            ) if s1 == s2 && !a1.is_empty() && !a2.is_empty() && a1.len() == a2.len() => a1
+                .iter()
+                .zip(a2.iter())
+                .all(|(x, y)| x == y || (self.st.is_sub_type(x, y) && self.st.is_sub_type(y, x))),
+            _ => self.st.is_sub_type(have, pt),
         }
     }
 
@@ -429,7 +453,14 @@ impl Typer {
 
     pub(crate) fn ref_implicit(&self, id: SymbolId, span: Span) -> Tree {
         let s = self.st.get(id);
-        let ty = s.ty.clone();
+        let ty = match &s.ty {
+            Type::Method { paramss, ret }
+                if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
+            {
+                (**ret).clone()
+            }
+            t => t.clone(),
+        };
         Tree {
             id: scala_rs_parser::NodeId(0),
             span,

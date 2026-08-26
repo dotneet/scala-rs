@@ -663,6 +663,16 @@ fn scala_library_dual_run_overloading() {
     dual_run_fixture("overloading");
 }
 
+#[test]
+fn scala_library_dual_run_classtag() {
+    dual_run_fixture("classtag");
+}
+
+#[test]
+fn scala_library_dual_run_custom_interp() {
+    dual_run_fixture("custom_interp");
+}
+
 const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Option.class",
     "scala/Some.class",
@@ -1029,11 +1039,11 @@ fn find_scalac() -> Option<PathBuf> {
 
 /// scalac 2.13 against our classfiles. Tries PATH, `/tmp/scala-2.13.16`, then a
 /// small official tarball download. Probes a `val`, a `def` with params,
-/// `id[T]`, a `case class` via `new Point` + field accessors, and an `object`
-/// method taking that case class. Companion apply `Point(3, 4)` is **not** in
-/// this pickle subset (nsc reports `not found: value Point`); do not claim it.
-/// If scalac cannot read a probed shape, this test fails rather than claiming
-/// success.
+/// `id[T]`, a `case class` via companion apply `Point(3, 4)` / term `Point`
+/// (`MODULE$`) plus field accessors, and an `object` method taking that case
+/// class. Remaining pickle holes (existentials, annotation args, `unapply`,
+/// complete Flags) are not claimed. If scalac cannot read a probed shape, this
+/// test fails rather than claiming success.
 #[test]
 fn scalac_typechecks_against_our_classfiles_if_present() {
     let Some(scalac) = find_scalac() else {
@@ -1069,9 +1079,9 @@ object UseLib {
     val n: Int = Lib.magic
     val x: Int = Lib.id(42)
     val b: String = new Box("hi").get
-    val p: Point = new Point(3, 4)
+    val p: Point = Point(3, 4)
     val q: Int = p.x + p.y
-    val sum: Int = Lib.add(new Point(1, 2))
+    val sum: Int = Lib.add(Point(1, 2))
   }
 }
 "#,
@@ -1089,7 +1099,7 @@ object UseLib {
         .expect("scalac");
     assert!(
         output.status.success(),
-        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / case class Point / Lib.add): {}\n{}",
+        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add): {}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );

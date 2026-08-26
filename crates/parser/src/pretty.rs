@@ -119,7 +119,7 @@ fn dump_into(s: &mut String, t: &Tree, indent: usize) {
             }
             Ok(())
         }
-        TreeKind::TypeDef { name, rhs, views, mods, .. } => {
+        TreeKind::TypeDef { name, rhs, views, ctx_bounds, mods, .. } => {
             let var = if mods.flags.contains(Flags::COVARIANT) {
                 "+"
             } else if mods.flags.contains(Flags::CONTRAVARIANT) {
@@ -134,6 +134,10 @@ fn dump_into(s: &mut String, t: &Tree, indent: usize) {
             for v in views {
                 writeln!(s, "{pad}  view");
                 dump_into(s, v, indent + 1);
+            }
+            for c in ctx_bounds {
+                writeln!(s, "{pad}  ctx");
+                dump_into(s, c, indent + 1);
             }
             Ok(())
         }

@@ -85,6 +85,21 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
             args: vec![],
         }],
     );
+    let jclass = class(
+        st,
+        java_lang,
+        "Class",
+        "java/lang/Class",
+        &[Type::AnyRef],
+    );
+    method(
+        st,
+        jclass,
+        "getName",
+        vec![],
+        Type::String,
+        Intrinsic::None,
+    );
     st.array_sym = class(
         st,
         st.scala_pkg,
@@ -178,6 +193,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     add_partial_function(st);
     if library_abi {
         add_list_collect(st);
+        add_classtag(st, jclass);
+        add_string_context(st);
     }
     let ordered = add_ordered(st);
 
@@ -290,6 +307,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     add_predef_members(st, arrow, string_ops, rich_int, rich_ldc, library_abi);
 
     st.push_scope();
+    st.enter_in_current("scala", st.scala_pkg);
+    st.enter_in_current("java", java);
     import_members(st, st.scala_pkg);
     import_members(st, java_lang);
     import_members(st, st.predef);
@@ -2179,4 +2198,102 @@ fn add_numeric_wrapper(
         Intrinsic::Identity,
     );
     st.get_mut(wrap).flags = st.get(wrap).flags.with(Flags::IMPLICIT);
+}
+
+fn implicit_getter(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) -> SymbolId {
+    let id = st.alloc(name, owner, SymKind::Method, Flags::IMPLICIT, "");
+    st.get_mut(id).ty = Type::Method {
+        paramss: vec![],
+        ret: Box::new(ty),
+    };
+    id
+}
+
+fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) {
+    let reflect = st.alloc(
+        "reflect",
+        st.scala_pkg,
+        SymKind::Package,
+        Flags::PACKAGE,
+        "scala/reflect",
+    );
+    let ct = iface(st, reflect, "ClassTag", "scala/reflect/ClassTag");
+    let t = type_param(st, ct, "T");
+    st.get_mut(ct).tparams = vec![t];
+    let class_ty = Type::Class {
+        sym: jclass,
+        args: vec![],
+    };
+    method(
+        st,
+        ct,
+        "runtimeClass",
+        vec![],
+        class_ty,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        ct,
+        "newArray",
+        vec![Type::Int],
+        Type::Array(Box::new(Type::TypeParam(t))),
+        Intrinsic::None,
+    );
+    let ctm = module(st, reflect, "ClassTag", "scala/reflect/ClassTag$");
+    let mc = st.module_class_of(ctm);
+    let tag = |elem: Type| Type::Class {
+        sym: ct,
+        args: vec![elem],
+    };
+    implicit_getter(st, mc, "Int", tag(Type::Int));
+    implicit_getter(st, mc, "Long", tag(Type::Long));
+    implicit_getter(st, mc, "Double", tag(Type::Double));
+    implicit_getter(st, mc, "Float", tag(Type::Float));
+    implicit_getter(st, mc, "Boolean", tag(Type::Boolean));
+    implicit_getter(st, mc, "Char", tag(Type::Char));
+    implicit_getter(st, mc, "Unit", tag(Type::Unit));
+    implicit_getter(st, mc, "Any", tag(Type::Any));
+    implicit_getter(st, mc, "AnyRef", tag(Type::AnyRef));
+    implicit_getter(st, mc, "Object", tag(Type::AnyRef));
+    implicit_getter(st, mc, "Nothing", tag(Type::Nothing));
+    implicit_getter(st, mc, "Null", tag(Type::Null));
+    let mems = st.get(mc).members.clone();
+    st.get_mut(ctm).members.extend(mems);
+}
+
+fn add_string_context(st: &mut SymbolTable) {
+    let sc = class(
+        st,
+        st.scala_pkg,
+        "StringContext",
+        "scala/StringContext",
+        &[Type::AnyRef],
+    );
+    let parts = st.alloc("parts", sc, SymKind::Term, Flags::PARAM, "");
+    st.get_mut(parts).ty = Type::Repeated(Box::new(Type::String));
+    st.get_mut(sc).ctor_fields = vec![parts];
+    method(
+        st,
+        sc,
+        "s",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        Type::String,
+        Intrinsic::None,
+    );
+    let scm = module(st, st.scala_pkg, "StringContext", "scala/StringContext$");
+    let mc = st.module_class_of(scm);
+    method(
+        st,
+        mc,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::String))],
+        Type::Class {
+            sym: sc,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+    let mems = st.get(mc).members.clone();
+    st.get_mut(scm).members.extend(mems);
 }

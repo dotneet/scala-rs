@@ -107,13 +107,25 @@ pub fn erase_type(ty: &Type) -> Type {
             args: vec![],
         },
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
-            Type::Array(Box::new(erase_type(&args[0])))
+            let e = erase_type(&args[0]);
+            if matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) {
+                Type::Any
+            } else {
+                Type::Array(Box::new(e))
+            }
         }
         Type::Named { name, .. } => Type::Named {
             name: name.clone(),
             args: vec![],
         },
-        Type::Array(t) => Type::Array(Box::new(erase_type(t))),
+        Type::Array(t) => {
+            let e = erase_type(t);
+            if matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) {
+                Type::Any
+            } else {
+                Type::Array(Box::new(e))
+            }
+        }
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(erase_type).collect(),
             ret: Box::new(erase_type(ret)),
@@ -177,13 +189,25 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
             args: vec![],
         },
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
-            Type::Array(Box::new(erase_ty(&args[0], st)))
+            let e = erase_ty(&args[0], st);
+            if matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) {
+                Type::Any
+            } else {
+                Type::Array(Box::new(e))
+            }
         }
         Type::Named { name, .. } => Type::Named {
             name: name.clone(),
             args: vec![],
         },
-        Type::Array(t) => Type::Array(Box::new(erase_ty(t, st))),
+        Type::Array(t) => {
+            let e = erase_ty(t, st);
+            if matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) {
+                Type::Any
+            } else {
+                Type::Array(Box::new(e))
+            }
+        }
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(|p| erase_ty(p, st)).collect(),
             ret: Box::new(erase_ty(ret, st)),

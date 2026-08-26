@@ -2,11 +2,11 @@
 //!
 //! This is enough for scala-rs to round-trip compiled classes/objects through
 //! `ScalaSignature` and for scalac 2.13.16 to typecheck a `val`, a `def` with
-//! parameters, `id[T]`, a `case class` (`new Point` + ctor field accessors), and
-//! an `object` method against our classfiles. Companion apply `Point(x, y)` is
-//! **not** recovered by nsc from this subset (`not found: value Point`). It is
-//! **not** a full nsc pickle (no existentials, annotation args, or the complete
-//! Flags long).
+//! parameters, `id[T]`, a `case class` (`new Point` + ctor field accessors +
+//! companion apply `Point(x, y)` / term `Point` via `MODULESYM` in the class
+//! pickle), and an `object` method against our classfiles. It is **not** a full
+//! nsc pickle (no existentials, annotation args, `unapply` pickle, or the
+//! complete Flags long).
 //!
 //! nsc-facing details in this subset (must match `PickleBuffer` / `UnPickler`):
 //! - pickle = major, minor, **nentries**, then `{ tag_Nat, len_Nat, body }`
@@ -683,6 +683,13 @@ impl<'a> Pickler<'a> {
             let mn = self.term_name(&raw_name);
             let mbody = self.symbol_info(mn, owner, mflags, mtpe);
             self.add(MODULESYM, mbody);
+        } else if let Some(mod_id) = self.st.companion_module(class_id) {
+            // nsc `enterClassAndModule` completes term `Point` from MODULESYM
+            // in `Point.class`, not from `Point$.class`.
+            let mc = self.st.module_class_of(mod_id);
+            if mc != class_id && !mc.is_none() {
+                let _ = self.pickle_class(mc);
+            }
         }
         idx
     }
@@ -943,6 +950,11 @@ impl<'a> Reader<'a> {
         self.pos < self.bytes.len()
     }
 
+    #[allow(dead_code)]
+    fn skip(&mut self, n: usize) {
+        self.pos = self.pos.saturating_add(n).min(self.bytes.len());
+    }
+
     fn read_byte(&mut self) -> Option<u8> {
         if self.pos >= self.bytes.len() {
             return None;
@@ -1191,18 +1203,16 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
     const MODULE_PKL: u64 = 1 << 10;
     for (i, e) in entries.iter().enumerate() {
         match e {
-            Entry::ClassSym { flags, .. } if (*flags & MODULE_PKL) != 0 => {
+            Entry::ClassSym { flags, .. } => {
+                let mod_flag = (*flags & MODULE_PKL) != 0;
+                if class_idx.is_none() {
+                    class_idx = Some(i);
+                    is_module = mod_flag;
+                }
+            }
+            Entry::ModuleSym { .. } if class_idx.is_none() => {
                 class_idx = Some(i);
                 is_module = true;
-                break;
-            }
-            Entry::ModuleSym { .. } => {
-                class_idx = Some(i);
-                is_module = true;
-                break;
-            }
-            Entry::ClassSym { .. } if class_idx.is_none() => {
-                class_idx = Some(i);
             }
             _ => {}
         }
@@ -1302,6 +1312,23 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pickle_tags(bytes: &[u8]) -> Vec<u8> {
+        let mut r = Reader::new(bytes);
+        let _ = r.read_nat();
+        let _ = r.read_nat();
+        let n = r.read_nat().unwrap_or(0) as usize;
+        let mut tags = Vec::new();
+        for _ in 0..n {
+            let Some(tag) = r.read_byte() else {
+                break;
+            };
+            let len = r.read_nat().unwrap_or(0) as usize;
+            r.skip(len);
+            tags.push(tag);
+        }
+        tags
+    }
 
     #[test]
     fn bytecodecs_roundtrip() {
@@ -1455,8 +1482,16 @@ object Lib {
             .find(|s| s.name == "Point" && s.kind == scala_rs_typer::SymKind::Class)
             .map(|s| s.id)
             .expect("Point class");
-        let pc = unpickle(&pickle_class(&st, point)).expect("unpickle Point");
-        assert!(!pc.is_module);
+        let point_raw = pickle_class(&st, point);
+        let pc = unpickle(&point_raw).expect("unpickle Point");
+        assert!(
+            !pc.is_module,
+            "Point.class pickle must stay a class, not the companion module"
+        );
+        assert!(
+            pickle_tags(&point_raw).contains(&MODULESYM),
+            "Point.class pickle must include MODULESYM so nsc can bind term Point"
+        );
         let x = pc.methods.iter().find(|m| m.name == "x").expect("val x");
         assert!(x.is_val);
         assert_eq!(x.ret, "Int");
