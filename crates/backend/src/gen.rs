@@ -1,8 +1,8 @@
 //! Walk a typed compilation unit and emit JVM classfiles (major 50).
 
 use crate::classfile::{
-    encode_method_name, ClassEmit, EmittedClass, Field, Method, Pool, ACC_ABSTRACT, ACC_FINAL,
-    ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC,
+    encode_method_name, ClassEmit, EmittedClass, Field, Method, Pool, ACC_ABSTRACT, ACC_BRIDGE,
+    ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC,
 };
 use crate::code::Assembler;
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
@@ -161,6 +161,7 @@ struct ClassBuilder {
     methods: Vec<Method>,
     pool: Pool,
     source: String,
+    scala_signature: Option<String>,
 }
 
 impl ClassBuilder {
@@ -174,6 +175,7 @@ impl ClassBuilder {
             methods: Vec::new(),
             pool: Pool::new(),
             source: source.to_string(),
+            scala_signature: None,
         }
     }
 
@@ -216,6 +218,7 @@ impl ClassBuilder {
             fields: self.fields,
             methods: self.methods,
             source: self.source,
+            scala_signature: self.scala_signature,
         };
         let bytes = class.write_with_pool(self.pool).expect("classfile write");
         EmittedClass {
@@ -223,6 +226,17 @@ impl ClassBuilder {
             bytes,
         }
     }
+}
+
+fn attach_scala_sig(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
+    if class_id.is_none() {
+        return;
+    }
+    let raw = crate::pickle::pickle_class(st, class_id);
+    if raw.is_empty() {
+        return;
+    }
+    b.scala_signature = Some(crate::pickle::encode_to_annotation_string(&raw));
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +335,39 @@ fn def_param_types(st: &SymbolTable, def: &Tree) -> Vec<Type> {
 
 fn def_method_desc(st: &SymbolTable, def: &Tree) -> String {
     jvm_method_desc(st, &def_param_types(st, def), &method_ret_ty(def))
+}
+
+fn method_params_from_sym(st: &SymbolTable, id: SymbolId) -> Vec<Type> {
+    let s = st.get(id);
+    match &s.ty {
+        Type::Method { paramss, .. } => {
+            let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+            if params.iter().any(|p| p.is_no_type() || p.is_error()) {
+                s.params.iter().map(|p| st.get(*p).ty.clone()).collect()
+            } else {
+                params
+            }
+        }
+        Type::Function { params, .. } => params.clone(),
+        _ => s.params.iter().map(|p| st.get(*p).ty.clone()).collect(),
+    }
+}
+
+fn method_ret_from_sym(st: &SymbolTable, id: SymbolId) -> Type {
+    match &st.get(id).ty {
+        Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
+        t => t.clone(),
+    }
+}
+
+fn checkcast_internal(st: &SymbolTable, ty: &Type) -> Option<String> {
+    match ty {
+        Type::Class { sym, .. } | Type::ModuleRef(sym) => Some(class_internal(st, *sym)),
+        Type::String => Some("java/lang/String".into()),
+        Type::Function { params, .. } => Some(format!("scala/Function{}", params.len())),
+        Type::Named { name, .. } => Some(name.replace('.', "/")),
+        _ => None,
+    }
 }
 
 fn method_desc_from_sym(st: &SymbolTable, id: SymbolId) -> String {
@@ -941,6 +988,7 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
+            attach_scala_sig(&mut b, self.st, class_id);
             self.out.push(b.finish());
             self.emit_trait_impl_class(tree, &this_name);
             return;
@@ -1016,9 +1064,12 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        self.emit_default_getters(&mut b, class_id);
         self.emit_trait_val_accessors(&mut b, class_id, &impl_.body);
         self.emit_super_accessors(&mut b, class_id);
         self.emit_mixin_forwarders(&mut b, class_id, &impl_.body);
+        self.emit_erasure_bridges(&mut b, class_id);
+        attach_scala_sig(&mut b, self.st, class_id);
         self.out.push(b.finish());
     }
 
@@ -1666,6 +1717,208 @@ impl<'a> Gen<'a> {
                 emit_return(asm, &ret);
             });
         }
+        if !self.library_abi {
+            self.emit_ordered_forwarders(b, class_id, &defined);
+        }
+    }
+
+    /// nsc-style erasure bridges: `compare(that: Box)` does not satisfy
+    /// `Ordered.compare(Object)`. Emit a public bridge that checkcasts.
+    fn emit_erasure_bridges(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        if class_id.is_none() {
+            return;
+        }
+        let class_name = b.this_name.clone();
+        let existing: HashSet<(String, String)> = b
+            .methods
+            .iter()
+            .map(|m| (m.name.clone(), m.desc.clone()))
+            .collect();
+        let own: Vec<(String, SymbolId)> = self
+            .st
+            .get(class_id)
+            .members
+            .iter()
+            .copied()
+            .filter(|&id| self.st.get(id).kind == SymKind::Method)
+            .map(|id| (self.st.get(id).name.clone(), id))
+            .collect();
+        let lin = linearize(self.st, class_id);
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        for parent in lin.into_iter().skip(1) {
+            for pmid in self.st.get(parent).members.clone() {
+                let ps = self.st.get(pmid);
+                if ps.kind != SymKind::Method {
+                    continue;
+                }
+                if ps.name == "<init>" || ps.name == "<clinit>" {
+                    continue;
+                }
+                let Some((_, cid)) = own.iter().find(|(n, _)| n == &ps.name) else {
+                    continue;
+                };
+                if *cid == pmid {
+                    continue;
+                }
+                let pdesc = method_desc_from_sym(self.st, pmid);
+                let cdesc = method_desc_from_sym(self.st, *cid);
+                if pdesc == cdesc {
+                    continue;
+                }
+                let enc = encode_method_name(&ps.name);
+                if existing.contains(&(enc.clone(), pdesc.clone())) {
+                    continue;
+                }
+                if !seen.insert((enc.clone(), pdesc.clone())) {
+                    continue;
+                }
+                let parent_params = method_params_from_sym(self.st, pmid);
+                let child_params = method_params_from_sym(self.st, *cid);
+                if parent_params.len() != child_params.len() {
+                    continue;
+                }
+                let ret = method_ret_from_sym(self.st, pmid);
+                let mut locals = 1u16;
+                let mut loads = Vec::new();
+                let mut casts = Vec::new();
+                for (pty, cty) in parent_params.iter().zip(child_params.iter()) {
+                    let sort = jvm_sort(pty);
+                    loads.push((locals, sort));
+                    let cast = if jvm_desc(self.st, pty) != jvm_desc(self.st, cty) {
+                        checkcast_internal(self.st, cty)
+                    } else {
+                        None
+                    };
+                    casts.push(cast);
+                    locals += sort.slots();
+                }
+                let name = ps.name.clone();
+                let pdesc_c = pdesc.clone();
+                let cdesc_c = cdesc.clone();
+                let class_c = class_name.clone();
+                b.add_code(
+                    ACC_PUBLIC | ACC_SYNTHETIC | ACC_BRIDGE,
+                    &name,
+                    &pdesc_c,
+                    locals.max(1),
+                    |asm| {
+                        asm.aload(0);
+                        for (i, (slot, sort)) in loads.iter().enumerate() {
+                            load(asm, *slot, *sort);
+                            if let Some(cn) = casts.get(i).and_then(|c| c.as_deref()) {
+                                asm.checkcast(cn);
+                            }
+                        }
+                        asm.invokevirtual(&class_c, &name, &cdesc_c);
+                        emit_return(asm, &ret);
+                    },
+                );
+            }
+        }
+    }
+
+    fn emit_ordered_forwarders(
+        &self,
+        b: &mut ClassBuilder,
+        class_id: SymbolId,
+        defined: &HashSet<String>,
+    ) {
+        if class_id.is_none() {
+            return;
+        }
+        let lin = linearize(self.st, class_id);
+        let has_ordered = lin.iter().any(|&p| self.st.get(p).name == "Ordered");
+        if !has_ordered {
+            return;
+        }
+        for op in ["<", ">", "<=", ">="] {
+            let enc = encode_method_name(op);
+            if defined.contains(op) || defined.contains(&enc) {
+                continue;
+            }
+            let desc = "(Ljava/lang/Object;)Z";
+            let static_desc = "(Lscala/math/Ordered;Ljava/lang/Object;)Z";
+            let name = op.to_string();
+            b.add_code(ACC_PUBLIC, &name, desc, 2, |asm| {
+                asm.aload(0);
+                asm.aload(1);
+                asm.invokestatic("scala/math/Ordered$class", &name, static_desc);
+                asm.ireturn();
+            });
+        }
+    }
+
+    fn emit_default_getters(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        if class_id.is_none() {
+            return;
+        }
+        let existing: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
+        for mid in self.st.get(class_id).members.clone() {
+            let s = self.st.get(mid);
+            if s.kind != SymKind::Method || !s.name.contains("$default$") {
+                continue;
+            }
+            if existing.contains(&encode_method_name(&s.name)) {
+                continue;
+            }
+            let Some(rhs) = s.default_rhs.clone() else {
+                continue;
+            };
+            let name = s.name.clone();
+            let pts: Vec<Type> = if !s.params.is_empty() {
+                s.params.iter().map(|p| self.st.get(*p).ty.clone()).collect()
+            } else {
+                match &s.ty {
+                    Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+                    _ => vec![],
+                }
+            };
+            let ret = match &s.ty {
+                Type::Method { ret, .. } => (**ret).clone(),
+                _ => rhs.ty.clone(),
+            };
+            let desc = jvm_method_desc(self.st, &pts, &ret);
+            let mut frame = Frame::instance();
+            let pids = s.params.clone();
+            for (i, ty) in pts.iter().enumerate() {
+                let id = pids.get(i).copied().unwrap_or(SymbolId::NONE);
+                frame.alloc(id, jvm_sort(ty));
+            }
+            let class_name = b.this_name.clone();
+            let st = self.st;
+            let max_locals = frame.next_slot.max(1);
+            let extras = &self.extras;
+            let lambda_n = &self.lambda_n;
+            let source = self.source_name;
+            let library_abi = self.library_abi;
+            let ret_for_body = ret.clone();
+            b.add_code(
+                ACC_PUBLIC | ACC_SYNTHETIC,
+                &name,
+                &desc,
+                max_locals,
+                |asm| {
+                    let mut frame = frame;
+                    let ctx = emit_ctx(
+                        st,
+                        class_id,
+                        &class_name,
+                        ret_for_body.clone(),
+                        extras,
+                        lambda_n,
+                        source,
+                        library_abi,
+                    );
+                    gen_expr(asm, &mut frame, &ctx, &rhs);
+                    if is_unit_like(&ret_for_body) {
+                        pop_if_value(asm, &rhs.ty);
+                        asm.vreturn();
+                    } else {
+                        emit_return(asm, &ret_for_body);
+                    }
+                },
+            );
+        }
     }
 
     fn emit_lazy_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
@@ -1812,6 +2065,36 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        self.emit_default_getters(&mut b, cls);
+        if !cls.is_none() {
+            for mid in self.st.get(cls).members.clone() {
+                let s = self.st.get(mid);
+                if s.kind != SymKind::Method || !s.name.contains("$default$") {
+                    continue;
+                }
+                if forwarded.iter().any(|(n, _, _, _)| n == &s.name) {
+                    continue;
+                }
+                let pts: Vec<Type> = if !s.params.is_empty() {
+                    s.params.iter().map(|p| self.st.get(*p).ty.clone()).collect()
+                } else {
+                    match &s.ty {
+                        Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+                        _ => vec![],
+                    }
+                };
+                let ret = match &s.ty {
+                    Type::Method { ret, .. } => (**ret).clone(),
+                    _ => Type::Any,
+                };
+                forwarded.push((
+                    s.name.clone(),
+                    jvm_method_desc(self.st, &pts, &ret),
+                    ret,
+                    pts,
+                ));
+            }
+        }
 
         // case-class companion: synthetic apply
         if let Some(class_id) = self.find_class_named(name) {
@@ -1834,6 +2117,7 @@ impl<'a> Gen<'a> {
             }
         }
 
+        attach_scala_sig(&mut b, self.st, cls);
         self.out.push(b.finish());
 
         let top_level = if cls.is_none() {
@@ -1927,6 +2211,7 @@ impl<'a> Gen<'a> {
         self.emit_module_init(&mut b, class_id, &[]);
         self.emit_module_clinit(&mut b);
         emit_case_apply(&mut b, self.st, class_id);
+        attach_scala_sig(&mut b, self.st, class_id);
         self.out.push(b.finish());
     }
 
@@ -5141,6 +5426,7 @@ mod tests {
             &scala_rs_typer::TypecheckOptions {
                 fatal_warnings: false,
                 library_abi: true,
+                classpath: Vec::new(),
             },
         );
         assert!(

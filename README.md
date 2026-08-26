@@ -39,6 +39,7 @@ cargo run -p scala-rs-cli -- compile file.scala -d out/
 scala-rs compile file.scala -d out/
 scala-rs compile file.scala -d out/ --scala-library /path/to/scala-library-2.13.16.jar
 scala-rs compile file.scala -d out/ --no-scala-library
+scala-rs compile B.scala -d outB -cp outA --no-scala-library
 ```
 
 コンパイルしてエントリポイント（`object Main` の `main`）を実行します。`--scala-library` 付きの `run` は jar を `java -cp` に足します。**jar が自動検出できるときは `compile` / `run` が既定でそれを使い**、見つからなければ私有ランタイムです。`--no-scala-library` で私有に戻せます。
@@ -61,6 +62,7 @@ java -cp out:scala-library-2.13.16.jar Main
 - `--typer` — namer / typer 後の木のダンプ
 - `-Xfatal-warnings` — warning をエラーにする（非網羅 match など）
 - `--scala-library <jar>` — scala-library 2.13 にリンク（私有 Option/List を出さない）。環境変数 `SCALA_LIBRARY_JAR` でも可。パス省略時は自動検出。**`compile` / `run` の既定は自動検出できた jar。見つからなければ私有。`--no-scala-library` で私有を強制**
+- `-cp` / `--class-path` — 先にコンパイルした classfile を読む（`ScalaSignature` pickle subset と JVM メソッド。`$default$n` ゲッターを含む）
 
 フィクスチャはデフォルトパッケージ（`package` 句なし）なので、`-cp out` の `Main` でそのまま動く想定です。
 
@@ -82,11 +84,13 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - リテラル、タプル
 - 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）
 - 存在型のよくある形: `List[_]`、`T forSome { type X }`、`List[_]` を取るメソッド。ワイルドカードは Object 相当に erase する。境界付き `_ <: T` や `forSome { val … }` は診断する（黙って捨てない）
+- compiled class/object に **ScalaSignature**（`RuntimeVisibleAnnotations` + pickle subset）。`javap -v` で見える。自前 unpickler が読める範囲で `-cp` による別コンパイルができる。nsc 完全 pickle ではない
 - `s"..."` 文字列補間
 - `lazy val`
-- implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む。候補が複数あるときは nsc 風の **more-specific**（結果型の subtype）が勝つ。まだ曖昧なら `ambiguous implicit`
+- implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む。候補が複数あるときは nsc 風の **more-specific**（結果型の subtype）が勝つ。まだ曖昧なら `ambiguous implicit`。目標型が `A => B` で `A <: B` のときは nsc と同様 identity view を合成する（view bound の呼び出し側）
 - ネストした `def` の **lambda-lift**（ローカルを捕獲する合成メソッド。値として使う / ラムダから再帰呼び出しするケースが動く）
-- デフォルト引数、by-name パラメータ（`=> T`）
+- デフォルト引数、by-name パラメータ（`=> T`）。デフォルトは scalac と同じ `{method}$default$n` ゲッター（1 始まり、先行パラメータを取る）として classfile に出る。呼び出し側は AST をインラインせずそのゲッターを呼ぶので、別コンパイルしたコードからも使える
+- view bounds `T <% Ordered[T]` / `T <% Ordered[Int]`（メソッド型パラメータ）。nsc と同様、implicit evidence `T => V` へデシュガーする。クラス型パラメータや高階型パラメータの `<%` は診断する
 - 名前付き引数（呼び出し側で並べ替え）
 - 具象メンバー付き trait の mixin（`T$class` 静的実装 + 線形化順のフォワーダ）
 - 内部クラス（`$outer`）とネストした object。匿名クラス `new Trait { def f = ... }` と `new { def x = 1 }`（合成 classfile。型は refinement ではなく `$anon$N`）
@@ -201,12 +205,14 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 言語:
 
 - マクロ
-- Scala signatures / pickling（ScalaSig / TASTy は出さない）
 - StackMapTable（Java 6 ターゲットのまま）
+- implicit search completeness（companion / パッケージオブジェクト以外の完全な nsc 探索、`Predef.$conforms` の多相インスタンス化など）
+- full pickle（nsc の Flags / POLY / existential / アノテーション引数までの完全な ScalaSig。出しているのは TERMname / TYPEname / CLASSsym / MODULEsym / VALsym / EXTref / METHODtpe / TYPEREFtpe / CLASSINFOtpe のサブセット。ByteCodecs は SID-10）
 - コンパイラプラグイン
-- Scala 3 構文 / TASTy / view bounds / XML リテラル
+- Scala 3 構文 / TASTy / XML リテラル
 - 境界付き存在型（`_ <: T`、`forSome { type X <: Bound }`、`forSome { val x: T }`）。よくある unbounded `List[_]` / `T forSome { type X }` は実装済み
 - 構造的 refinement としての `T { def x }` の型（匿名クラスの合成 classfile は出す）
+- クラス / 高階型パラメータの view bounds（メソッドの `T <% Ordered[T]` は実装済み）
 
 ライブラリ:
 
@@ -257,7 +263,7 @@ cargo test
 
 実行時の期待値は `tests/fixtures/` にあります。各 `.scala` に対して `tests/fixtures/expected/` に同名の `.txt`（`println` と同じ末尾改行付きの stdout）を置いています。`java` がある環境では CLI の e2e が stdout を比較します。
 
-scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコンパイルし、`java -cp out:scala-library.jar Main` でも同じ stdout になることを見ます（私有の `scala/Option.class` / `scala/Predef$.class` 等が無いこと）: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector` / `int_ops` / `string_ops` / `list_apply` / `set` / `long_ops` / `seq` / `either` / `float_ops` / `string_ops2` / `anonymous` / `eta` / `try_util` / `existentials` / `implicit_specific` / `lambda_lift`。`iterator.scala` / `map.scala` / `vector.scala` / `int_ops.scala` / `string_ops.scala` / `list_apply.scala` / `set.scala` / `long_ops.scala` / `seq.scala` / `either.scala` / `float_ops.scala` / `string_ops2.scala` / `try_util.scala` は library リンク時のみ。フラグなしの `compile` は jar を自動検出してリンクし、`--no-scala-library` は私有ランタイムを出す。
+scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコンパイルし、`java -cp out:scala-library.jar Main` でも同じ stdout になることを見ます（私有の `scala/Option.class` / `scala/Predef$.class` 等が無いこと）: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector` / `int_ops` / `string_ops` / `list_apply` / `set` / `long_ops` / `seq` / `either` / `float_ops` / `string_ops2` / `anonymous` / `eta` / `try_util` / `existentials` / `implicit_specific` / `lambda_lift` / `view_bounds`。`iterator.scala` / `map.scala` / `vector.scala` / `int_ops.scala` / `string_ops.scala` / `list_apply.scala` / `set.scala` / `long_ops.scala` / `seq.scala` / `either.scala` / `float_ops.scala` / `string_ops2.scala` / `try_util.scala` は library リンク時のみ。フラグなしの `compile` は jar を自動検出してリンクし、`--no-scala-library` は私有ランタイムを出す。
 
 | フィクスチャ | 内容 | 期待 stdout |
 | --- | --- | --- |
@@ -274,7 +280,7 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `lazy_val.scala` | `lazy val` の遅延と一度きりの初期化 | `0` `42` `42` `1` |
 | `implicits.scala` | implicit パラメータとコンパニオンの conversion | `15` `14` |
 | `generic_id.scala` | `def id[T](x: T): T` の erasure | `42` `hi` |
-| `defaults.scala` | デフォルト引数 | `hi Scala!` `hi Scala?` |
+| `defaults.scala` | デフォルト引数（`$default$n` ゲッター経由） | `hi Scala!` `hi Scala?` |
 | `byname.scala` | by-name パラメータが二度評価される | `6` `2` |
 | `trait_concrete.scala` | 具象メソッド付き trait を class が使う | `from trait` |
 | `trait_linearize.scala` | `extends A with B` の線形化（B が勝つ） | `B` |
@@ -285,6 +291,7 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `existentials.scala` | `List[_]` / `List[X] forSome { type X }` を取るメソッド | `1` `2` `a` `b` |
 | `implicit_specific.scala` | より specific な implicit（`B extends A`）が勝つ | `B` |
 | `lambda_lift.scala` | ローカル捕獲のネスト `def`、eta、ラムダからの再帰 | `11` `11` `12` `120` `3` |
+| `view_bounds.scala` | `T <% Ordered[T]` と `Box.compare` | `true` `false` |
 | `nested_object.scala` | `object Outer { object Inner }` | `nested` |
 | `super.scala` | クラス/`trait` の `super` と `Outer.this` | `base!` `T!` `outer` |
 | `sealed_match.scala` | sealed + case class/object の網羅 match | `3` `0` |
@@ -310,7 +317,7 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `predef_more.scala` | `any2stringadd` / `implicitly` / `identity` / `locally` | `1x` `41` `42` `here` |
 | `sealed_non_exhaustive.scala` | 非網羅 match（warning。実行は覆っている入力だけ） | `3` |
 
-implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` のコンパイル失敗で見ています。境界付き存在型は `existential_bounds.scala` で診断します。コンパイルを成功扱いにしていません。
+implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` のコンパイル失敗で見ています。境界付き存在型は `existential_bounds.scala` で診断します。クラス型パラメータの view bounds は `view_bounds_class.scala` で診断します。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします。コンパイルを成功扱いにしていません。
 
 ## ライセンス
 

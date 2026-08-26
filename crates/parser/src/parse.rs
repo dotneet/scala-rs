@@ -697,6 +697,7 @@ impl<'a> Parser<'a> {
         let inner_tparams = self.parse_type_param_clause();
         let mut lo_b = None;
         let mut hi_b = None;
+        let mut views = Vec::new();
         loop {
             self.skip_nl();
             match self.kind() {
@@ -709,10 +710,8 @@ impl<'a> Parser<'a> {
                     lo_b = Some(Box::new(self.parse_type()));
                 }
                 TokenKind::ViewBound => {
-                    let sp = self.span();
                     self.bump();
-                    let _ = self.parse_type();
-                    self.error_span(sp, "unimplemented syntax: view bounds (`<%`)");
+                    views.push(self.parse_type());
                 }
                 TokenKind::Colon => {
                     self.bump();
@@ -732,6 +731,7 @@ impl<'a> Parser<'a> {
                 rhs: Box::new(rhs),
                 lo: lo_b,
                 hi: hi_b,
+                views,
             },
         )
     }
@@ -1149,6 +1149,7 @@ impl<'a> Parser<'a> {
                 rhs: Box::new(rhs),
                 lo: lo_b,
                 hi: hi_b,
+                views: vec![],
             },
         )
     }
@@ -1450,6 +1451,7 @@ impl<'a> Parser<'a> {
                         rhs: Box::new(rhs),
                         lo,
                         hi,
+                        views: vec![],
                     },
                 )
             }

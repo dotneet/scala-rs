@@ -1,4 +1,5 @@
 mod check;
+mod classpath;
 mod erasure;
 mod implicits;
 mod lambda_lift;
@@ -6,7 +7,10 @@ mod prelude;
 mod symbol;
 mod uncurry;
 
-pub use check::{find_mains, has_errors, typecheck, typecheck_opts, TypecheckOptions, Typer};
+pub use check::{
+    find_mains, has_errors, typecheck, typecheck_opts, ClasspathClass, ClasspathMethod,
+    ClasspathPickleMethod, TypecheckOptions, Typer,
+};
 pub use erasure::{erase, erase_type};
 pub use lambda_lift::lambda_lift;
 pub use symbol::{Intrinsic, SymKind, Symbol, SymbolTable};
@@ -378,6 +382,7 @@ object Main {
             &TypecheckOptions {
                 fatal_warnings: true,
                 library_abi: false,
+                classpath: Vec::new(),
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -581,6 +586,7 @@ object Main {
             &TypecheckOptions {
                 fatal_warnings: false,
                 library_abi: true,
+                classpath: Vec::new(),
             },
         );
         assert!(
@@ -724,5 +730,52 @@ object Main {
             dump.contains("DefDef add$") || dump.contains("add$1"),
             "nested def should be lifted to a synthetic method: {dump}"
         );
+    }
+
+    #[test]
+    fn view_bounds_desugar_and_ordered_int() {
+        ok(r#"
+class Box(val n: Int) extends Ordered[Box] {
+  def compare(that: Box): Int = n - that.n
+}
+object Main {
+  def lt[T <% Ordered[T]](a: T, b: T): Boolean = a < b
+  def asInt[T <% Ordered[Int]](x: T, y: Int): Boolean = true
+  def main(args: Array[String]): Unit = {
+    val b: Boolean = lt(new Box(1), new Box(2))
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn class_view_bounds_are_diagnosed() {
+        let (_, _, diags) = typecheck_str("class C[T <% Ordered[T]](x: T)\n");
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("view bound")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn default_getter_symbol_is_synthesized() {
+        let src = r#"
+object Main {
+  def greet(name: String, punct: String = "!"): String = name + punct
+  def main(args: Array[String]): Unit = {
+    val s: String = greet("A")
+  }
+}
+"#;
+        let (_, st, diags) = typecheck_str(src);
+        assert!(
+            !has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let found = st.symbols.iter().any(|s| s.name == "greet$default$2");
+        assert!(found, "expected greet$default$2 in the symbol table");
     }
 }

@@ -215,4 +215,25 @@ object Main {
         assert!(dump.contains("Function"), "{dump}");
         assert!(dump.contains("$anon"), "anonymous class: {dump}");
     }
+
+    #[test]
+    fn view_bounds_parse() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def lt[T <% Ordered[T]](a: T, b: T): Boolean = a < b
+  def asInt[T <% Ordered[Int]](x: T): T = x
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("view"), "view bound should be kept on TypeDef: {dump}");
+        assert!(dump.contains("Ordered"), "{dump}");
+        let r = parse_str("object M { def f[T <% Ordered[T] <% Ordered[Int]](x: T): T = x }\n");
+        assert!(
+            !has_errors(&r.diags),
+            "multiple view bounds should parse: {:?}",
+            r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
 }

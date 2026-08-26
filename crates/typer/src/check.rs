@@ -13,6 +13,33 @@ pub struct TypecheckOptions {
     /// Type Option/List `withFilter` as the scala-library 2.13 shape, StringOps
     /// via `augmentString`, and Iterator. The backend still needs `library_abi`.
     pub library_abi: bool,
+    /// Classes loaded from `-cp` (previous compilation's classfiles).
+    pub classpath: Vec<ClasspathClass>,
+}
+
+/// A method recovered from a classfile (JVM descriptor).
+#[derive(Clone, Debug)]
+pub struct ClasspathMethod {
+    pub name: String,
+    pub desc: String,
+}
+
+/// A method recovered from our ScalaSignature pickle subset.
+#[derive(Clone, Debug)]
+pub struct ClasspathPickleMethod {
+    pub name: String,
+    pub param_names: Vec<String>,
+    pub param_types: Vec<String>,
+    pub ret: String,
+}
+
+/// Binary class/object visible to namer/typer via `-cp`.
+#[derive(Clone, Debug)]
+pub struct ClasspathClass {
+    pub jvm_name: String,
+    pub is_module: bool,
+    pub methods: Vec<ClasspathMethod>,
+    pub pickle: Option<Vec<ClasspathPickleMethod>>,
 }
 
 impl Default for TypecheckOptions {
@@ -20,6 +47,7 @@ impl Default for TypecheckOptions {
         TypecheckOptions {
             fatal_warnings: false,
             library_abi: false,
+            classpath: Vec::new(),
         }
     }
 }
@@ -45,6 +73,7 @@ pub fn typecheck_opts(
 ) -> (SymbolTable, Vec<Diagnostic>) {
     let mut t = Typer::new(file_index, opts);
     t.fatal_warnings = opts.fatal_warnings;
+    crate::classpath::install_classpath(&mut t.st, &opts.classpath);
     t.namer(tree);
     t.register_sealed_from_namer(tree);
     t.typer(tree);
@@ -286,6 +315,16 @@ impl Typer {
         self.st.push_scope();
         let tp_ids = self.enter_tparams(tparams, id);
         self.st.get_mut(id).tparams = tp_ids;
+        for tp in tparams.iter() {
+            if let TreeKind::TypeDef { views, .. } = &tp.kind {
+                if !views.is_empty() {
+                    self.error(
+                        tp.span,
+                        "unimplemented syntax: view bounds on class/trait type parameters",
+                    );
+                }
+            }
+        }
         // constructor params as fields
         let mut fields = Vec::new();
         for clause in vparamss.iter_mut() {
@@ -862,7 +901,21 @@ impl Typer {
         }
         self.st.push_scope();
         let tp_ids = self.enter_tparams(tparams, tree.sym);
-        self.st.get_mut(tree.sym).tparams = tp_ids;
+        self.st.get_mut(tree.sym).tparams = tp_ids.clone();
+        let mut view_work: Vec<(SymbolId, Vec<Tree>, Span, bool)> = Vec::new();
+        for (i, tp) in tparams.iter().enumerate() {
+            if let TreeKind::TypeDef {
+                views,
+                tparams: inner,
+                ..
+            } = &tp.kind
+            {
+                if !views.is_empty() {
+                    let hk = !inner.is_empty();
+                    view_work.push((tp_ids[i], views.clone(), tp.span, hk));
+                }
+            }
+        }
         let saved_owner = self.st.owner;
         self.st.owner = tree.sym;
         let mut paramss_ty = Vec::new();
@@ -903,6 +956,75 @@ impl Typer {
             paramss_ty.push(ct);
             paramss_ids.push(ids);
         }
+        // nsc: `T <% V` becomes an extra implicit clause `(implicit evidence$n: T => V)`.
+        let mut evidence = Vec::new();
+        for (tp_id, views, span, hk) in view_work {
+            if hk {
+                self.error(
+                    span,
+                    "unimplemented syntax: view bounds on higher-kinded type parameters",
+                );
+                continue;
+            }
+            for view in views {
+                if matches!(
+                    view.kind,
+                    TreeKind::ExistentialTypeTree { .. }
+                        | TreeKind::CompoundTypeTree { .. }
+                        | TreeKind::Unimplemented { .. }
+                ) {
+                    self.error(
+                        view.span,
+                        "unimplemented syntax: view bound shape (existential/refinement)",
+                    );
+                    continue;
+                }
+                let view_ty = self.tree_to_type(&view);
+                if view_ty.is_error() {
+                    continue;
+                }
+                self.gensym += 1;
+                let ev_name = format!("evidence${}", self.gensym);
+                let ev_ty = Type::Function {
+                    params: vec![Type::TypeParam(tp_id)],
+                    ret: Box::new(view_ty),
+                };
+                let ev_id = self.st.alloc(
+                    &ev_name,
+                    tree.sym,
+                    crate::symbol::SymKind::Term,
+                    Flags::IMPLICIT.with(Flags::PARAM),
+                    "",
+                );
+                self.st.get_mut(ev_id).ty = ev_ty.clone();
+                self.st.enter_in_current(&ev_name, ev_id);
+                let mut ev = Tree::dummy(TreeKind::ValDef {
+                    mods: Modifiers::new(Flags::IMPLICIT.with(Flags::PARAM)),
+                    name: ev_name,
+                    tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+                    rhs: Box::new(Tree::dummy(TreeKind::Empty)),
+                });
+                ev.span = span;
+                ev.sym = ev_id;
+                ev.ty = ev_ty.clone();
+                evidence.push(ev);
+                all_params.push(ev_id);
+            }
+        }
+        if !evidence.is_empty() {
+            let tys: Vec<Type> = evidence.iter().map(|e| e.ty.clone()).collect();
+            let ids: Vec<SymbolId> = evidence.iter().map(|e| e.sym).collect();
+            paramss_ty.push(tys);
+            paramss_ids.push(ids);
+            vparamss.push(evidence);
+        }
+        self.synthesize_default_getters(
+            saved_owner,
+            tree.sym,
+            &name,
+            &tp_ids,
+            &paramss_ids,
+        );
         self.st.owner = saved_owner;
         let ret = if tpt.is_empty() {
             Type::NoType
@@ -921,6 +1043,69 @@ impl Typer {
             self.st.get_mut(tree.sym).paramss = paramss_ids;
         }
         let _ = name;
+    }
+
+    fn synthesize_default_getters(
+        &mut self,
+        owner: SymbolId,
+        _meth: SymbolId,
+        name: &str,
+        tp_ids: &[SymbolId],
+        paramss_ids: &[Vec<SymbolId>],
+    ) {
+        if owner.is_none() || name.contains("$default$") {
+            return;
+        }
+        let flat: Vec<SymbolId> = paramss_ids.iter().flatten().copied().collect();
+        for (i, pid) in flat.iter().enumerate() {
+            if !self.st.get(*pid).flags.contains(Flags::DEFAULTPARAM) {
+                continue;
+            }
+            let n = i + 1;
+            let gname = format!("{name}$default${n}");
+            if self
+                .st
+                .lookup_member(owner, &gname)
+                .iter()
+                .any(|&id| self.st.get(id).name == gname)
+            {
+                continue;
+            }
+            let preceding: Vec<SymbolId> = flat[..i].to_vec();
+            let preceding_tys: Vec<Type> = preceding
+                .iter()
+                .map(|id| self.st.get(*id).ty.clone())
+                .collect();
+            let ret = self.st.get(*pid).ty.clone();
+            let gid = self
+                .st
+                .alloc(&gname, owner, crate::symbol::SymKind::Method, Flags::SYNTHETIC, "");
+            self.st.get_mut(gid).ty = Type::Method {
+                paramss: vec![preceding_tys],
+                ret: Box::new(ret.clone()),
+            };
+            self.st.get_mut(gid).params = preceding.clone();
+            self.st.get_mut(gid).paramss = vec![preceding.clone()];
+            self.st.get_mut(gid).tparams = tp_ids.to_vec();
+            if let Some(mut rhs) = self.st.get(*pid).default_rhs.clone() {
+                self.st.push_scope();
+                for tp in tp_ids {
+                    let n = self.st.get(*tp).name.clone();
+                    self.st.enter_in_current(&n, *tp);
+                }
+                for p in &preceding {
+                    let n = self.st.get(*p).name.clone();
+                    self.st.enter_in_current(&n, *p);
+                }
+                self.type_expr(&mut rhs, &ret);
+                if !ret.is_no_type() {
+                    self.adapt(&mut rhs, &ret);
+                }
+                self.st.pop_scope();
+                self.st.get_mut(*pid).default_rhs = Some(rhs.clone());
+                self.st.get_mut(gid).default_rhs = Some(rhs);
+            }
+        }
     }
 
     fn type_def_body(&mut self, tree: &mut Tree) {
@@ -1685,7 +1870,7 @@ impl Typer {
                     );
                 }
                 let leftover =
-                    self.fill_defaults_and_implicits(tree.span, args, &param_tys, sym, &fun.ty, pt);
+                    self.fill_defaults_and_implicits(tree.span, args, &param_tys, fun, pt);
                 let method_name = if !sym.is_none() {
                     self.st.get(sym).name.clone()
                 } else {
@@ -2020,12 +2205,17 @@ impl Typer {
                 Some(t) => out.push(t),
                 None => {
                     let pid = ids[i];
-                    let ps = self.st.get(pid);
-                    if ps.flags.contains(Flags::DEFAULTPARAM) {
-                        if let Some(rhs) = ps.default_rhs.clone() {
+                    let flags = self.st.get(pid).flags;
+                    let default_rhs = self.st.get(pid).default_rhs.clone();
+                    if flags.contains(Flags::DEFAULTPARAM) {
+                        if let Some(filled) =
+                            self.default_getter_apply(fun, pid, i + 1, &out)
+                        {
+                            out.push(filled);
+                        } else if let Some(rhs) = default_rhs {
                             out.push(rhs);
                         }
-                    } else if ps.flags.contains(Flags::IMPLICIT) {
+                    } else if flags.contains(Flags::IMPLICIT) {
                         // leave a hole; fill_defaults will search
                         break;
                     } else {
@@ -2045,13 +2235,14 @@ impl Typer {
         span: Span,
         args: &mut Vec<Tree>,
         param_tys: &[Type],
-        sym: SymbolId,
-        fun_ty: &Type,
+        fun: &Tree,
         pt: &Type,
     ) -> Option<Type> {
+        let sym = fun.sym;
         if sym.is_none() {
             return None;
         }
+        let fun_ty = &fun.ty;
         let s_paramss = self.st.get(sym).paramss.clone();
         let s_params = self.st.get(sym).params.clone();
         let paramss_ids: Vec<Vec<SymbolId>> = if !s_paramss.is_empty() {
@@ -2080,9 +2271,13 @@ impl Typer {
                 let off = args.len().min(param_tys.len());
                 self.fill_implicit_params(span, args, &param_tys[off..], &rest);
             } else if all_default {
-                for pid in rest {
-                    if let Some(mut rhs) = self.st.get(pid).default_rhs.clone() {
-                        let pty = self.st.get(pid).ty.clone();
+                let start = args.len();
+                for (k, pid) in rest.iter().enumerate() {
+                    let idx = start + k + 1;
+                    if let Some(filled) = self.default_getter_apply(fun, *pid, idx, args) {
+                        args.push(filled);
+                    } else if let Some(mut rhs) = self.st.get(*pid).default_rhs.clone() {
+                        let pty = self.st.get(*pid).ty.clone();
                         self.type_expr(&mut rhs, &pty);
                         self.adapt(&mut rhs, &pty);
                         args.push(rhs);
@@ -2110,6 +2305,7 @@ impl Typer {
                     .iter()
                     .map(|id| self.st.get(*id).ty.clone())
                     .collect();
+                let rest_tys = self.instantiate_from_call(sym, &first, args, rest_tys);
                 self.fill_implicit_params(span, args, &rest_tys, &rest_ids);
                 return None;
             }
@@ -2137,6 +2333,100 @@ impl Typer {
         None
     }
 
+    /// Instantiate remaining clause types with method type arguments inferred
+    /// from the already-typed first clause (`T <% Ordered[T]` → `Box => Ordered[Box]`).
+    fn instantiate_from_call(
+        &self,
+        sym: SymbolId,
+        first: &[SymbolId],
+        args: &[Tree],
+        tys: Vec<Type>,
+    ) -> Vec<Type> {
+        if self.st.get(sym).tparams.is_empty() || tys.is_empty() {
+            return tys;
+        }
+        let orig_first: Vec<Type> = first.iter().map(|id| self.st.get(*id).ty.clone()).collect();
+        let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+        let inst = self.infer_method_tparams(sym, &orig_first, &arg_tys);
+        if inst.is_empty() {
+            return tys;
+        }
+        let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+        let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+        tys.iter()
+            .map(|t| crate::symbol::subst_tparams_slice(&tps, &args_t, t))
+            .collect()
+    }
+
+    fn default_getter_apply(
+        &mut self,
+        fun: &Tree,
+        param: SymbolId,
+        index_1based: usize,
+        preceding: &[Tree],
+    ) -> Option<Tree> {
+        let meth = fun.sym;
+        if meth.is_none() {
+            return None;
+        }
+        let mname = self.st.get(meth).name.clone();
+        let gname = format!("{mname}$default${index_1based}");
+        let owner = self.st.get(meth).owner;
+        let gid = self
+            .st
+            .lookup_member(owner, &gname)
+            .into_iter()
+            .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)?;
+        let span = fun.span;
+        let recv = self.method_receiver(fun);
+        let mut gfun = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(recv),
+                name: gname,
+            },
+            ty: self.st.get(gid).ty.clone(),
+            sym: gid,
+        };
+        self.type_expr(&mut gfun, &Type::NoType);
+        let mut call = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Apply {
+                fun: Box::new(gfun),
+                args: preceding.to_vec(),
+            },
+            ty: self.st.get(param).ty.clone(),
+            sym: gid,
+        };
+        self.type_expr(&mut call, &self.st.get(param).ty.clone());
+        Some(call)
+    }
+
+    fn method_receiver(&self, fun: &Tree) -> Tree {
+        match &fun.kind {
+            TreeKind::TypeApply { fun, .. } | TreeKind::Typed { expr: fun, .. } => {
+                self.method_receiver(fun)
+            }
+            TreeKind::Select { qual, .. } => (**qual).clone(),
+            _ => {
+                let this_ty = if self.st.this_class.is_none() {
+                    Type::NoType
+                } else {
+                    Type::ModuleRef(self.st.this_class)
+                };
+                Tree {
+                    id: NodeId(0),
+                    span: fun.span,
+                    kind: TreeKind::This { qual: None },
+                    ty: this_ty,
+                    sym: self.st.this_class,
+                }
+            }
+        }
+    }
+
     fn fill_implicit_params(
         &mut self,
         span: Span,
@@ -2156,13 +2446,17 @@ impl Typer {
                     args.push(r);
                 }
                 ImplicitSearch::None => {
-                    self.error(
-                        span,
-                        format!(
-                            "no implicit: could not find implicit value of type {}",
-                            self.st.display_type(&pty)
-                        ),
-                    );
+                    if let Some(lam) = self.identity_view(&pty, span) {
+                        args.push(lam);
+                    } else {
+                        self.error(
+                            span,
+                            format!(
+                                "no implicit: could not find implicit value of type {}",
+                                self.st.display_type(&pty)
+                            ),
+                        );
+                    }
                 }
                 ImplicitSearch::Ambiguous(ids) => {
                     self.error(
@@ -2172,6 +2466,66 @@ impl Typer {
                 }
             }
         }
+    }
+
+    /// nsc: `A <: B` is a view `A => B` (identity / asInstanceOf).
+    fn identity_view(&mut self, pt: &Type, span: Span) -> Option<Tree> {
+        let Type::Function { params, ret } = pt else {
+            return None;
+        };
+        if params.len() != 1 {
+            return None;
+        }
+        if !self.st.is_sub_type(&params[0], ret) {
+            return None;
+        }
+        let from = params[0].clone();
+        let to = (**ret).clone();
+        self.gensym += 1;
+        let pname = format!("x${}", self.gensym);
+        let pid = self.st.alloc(
+            &pname,
+            self.st.owner,
+            crate::symbol::SymKind::Term,
+            Flags::PARAM.with(Flags::SYNTHETIC),
+            "",
+        );
+        self.st.get_mut(pid).ty = from.clone();
+        let ident = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Ident { name: pname.clone() },
+            ty: from.clone(),
+            sym: pid,
+        };
+        let param = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::ValDef {
+                mods: Modifiers::new(Flags::PARAM),
+                name: pname,
+                tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+                rhs: Box::new(Tree::dummy(TreeKind::Empty)),
+            },
+            ty: from.clone(),
+            sym: pid,
+        };
+        let mut lam = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Function {
+                vparams: vec![param],
+                body: Box::new(ident),
+            },
+            ty: Type::Function {
+                params: vec![from],
+                ret: Box::new(to.clone()),
+            },
+            sym: SymbolId::NONE,
+        };
+        self.type_expr(&mut lam, pt);
+        self.adapt(&mut lam, pt);
+        Some(lam)
     }
 
     fn resolve_overload(
