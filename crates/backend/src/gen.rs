@@ -19,6 +19,7 @@ pub fn emit(tree: &Tree, st: &SymbolTable, source_name: &str) -> Vec<EmittedClas
         extras: RefCell::new(Vec::new()),
         lambda_n: Cell::new(0),
         trait_impls: HashMap::new(),
+        trait_vals: HashMap::new(),
     };
     g.collect_trait_impls(tree);
     g.walk(tree);
@@ -34,6 +35,8 @@ struct Gen<'a> {
     lambda_n: Cell<u32>,
     /// Concrete trait methods, for `$class` static impls and mixin forwarders.
     trait_impls: HashMap<SymbolId, Vec<Tree>>,
+    /// Trait `val` definitions with a right-hand side (`T$class.$init$`).
+    trait_vals: HashMap<SymbolId, Vec<Tree>>,
 }
 
 struct EmitCtx<'a> {
@@ -331,24 +334,149 @@ fn enclosing_instance(st: &SymbolTable, class_id: SymbolId) -> Option<SymbolId> 
 }
 
 fn linearize(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
-    fn rec(st: &SymbolTable, cls: SymbolId, acc: &mut Vec<SymbolId>) {
-        if acc.contains(&cls) {
-            return;
-        }
-        acc.push(cls);
-        let parents: Vec<SymbolId> = st
-            .get(cls)
+    fn skip_parent(st: &SymbolTable, p: SymbolId) -> bool {
+        let n = st.get(p).name.as_str();
+        n == "Any" || n == "AnyRef" || n == "AnyVal" || n == "Object"
+    }
+    fn parents_of(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
+        st.get(cls)
             .parents
             .iter()
             .filter_map(|p| st.class_sym_of(p))
-            .collect();
-        for p in parents.iter().rev() {
-            rec(st, *p, acc);
-        }
+            .filter(|p| !skip_parent(st, *p))
+            .collect()
     }
-    let mut acc = Vec::new();
-    rec(st, cls, &mut acc);
-    acc
+    fn lin(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
+        let parents = parents_of(st, cls);
+        let mut lists: Vec<Vec<SymbolId>> = parents.iter().rev().map(|p| lin(st, *p)).collect();
+        lists.push(parents.iter().rev().copied().collect());
+        let mut out = vec![cls];
+        out.extend(c3_merge(lists));
+        out
+    }
+    fn c3_merge(mut lists: Vec<Vec<SymbolId>>) -> Vec<SymbolId> {
+        let mut out = Vec::new();
+        loop {
+            lists.retain(|l| !l.is_empty());
+            if lists.is_empty() {
+                break;
+            }
+            let mut chosen = None;
+            for l in &lists {
+                let h = l[0];
+                let in_tail = lists.iter().any(|o| o.iter().skip(1).any(|&x| x == h));
+                if !in_tail {
+                    chosen = Some(h);
+                    break;
+                }
+            }
+            let h = match chosen {
+                Some(h) => h,
+                None => lists[0][0],
+            };
+            out.push(h);
+            for l in &mut lists {
+                if l.first() == Some(&h) {
+                    l.remove(0);
+                }
+            }
+        }
+        out
+    }
+    lin(st, cls)
+}
+
+fn super_accessor_name(st: &SymbolTable, trait_id: SymbolId, method: &str) -> String {
+    format!("{}$$super${}", st.get(trait_id).name, method)
+}
+
+fn setter_name(field: &str) -> String {
+    format!("$init$set${field}")
+}
+
+fn tree_contains_super(tree: &Tree) -> bool {
+    match &tree.kind {
+        TreeKind::Super { .. } => true,
+        TreeKind::Select { qual, .. } => tree_contains_super(qual),
+        TreeKind::Apply { fun, args } | TreeKind::UnApply { fun, args } => {
+            tree_contains_super(fun) || args.iter().any(tree_contains_super)
+        }
+        TreeKind::TypeApply { fun, .. } | TreeKind::Typed { expr: fun, .. } => {
+            tree_contains_super(fun)
+        }
+        TreeKind::Block { stats, expr } => {
+            stats.iter().any(tree_contains_super) || tree_contains_super(expr)
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            tree_contains_super(cond) || tree_contains_super(thenp) || tree_contains_super(elsep)
+        }
+        TreeKind::Assign { lhs, rhs } => tree_contains_super(lhs) || tree_contains_super(rhs),
+        TreeKind::ValDef { rhs, .. } => tree_contains_super(rhs),
+        TreeKind::Function { body, .. } => tree_contains_super(body),
+        TreeKind::Match { selector, cases } => {
+            tree_contains_super(selector)
+                || cases.iter().any(|c| {
+                    tree_contains_super(&c.pat)
+                        || tree_contains_super(&c.guard)
+                        || tree_contains_super(&c.body)
+                })
+        }
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            tree_contains_super(block)
+                || catches.iter().any(|c| tree_contains_super(&c.body))
+                || tree_contains_super(finalizer)
+        }
+        _ => false,
+    }
+}
+
+fn needs_super_accessor(def: &Tree) -> bool {
+    match &def.kind {
+        TreeKind::DefDef {
+            name, mods, rhs, ..
+        } => {
+            name != "<init>"
+                && name != "<clinit>"
+                && !rhs.is_empty()
+                && (mods.flags.contains(Flags::OVERRIDE) || tree_contains_super(rhs))
+        }
+        _ => false,
+    }
+}
+
+fn is_star_pat(pat: &Tree) -> bool {
+    match &pat.kind {
+        TreeKind::Star { .. } => true,
+        TreeKind::Bind { body, .. } => is_star_pat(body),
+        TreeKind::Typed { expr, .. } => is_star_pat(expr),
+        _ => false,
+    }
+}
+
+fn val_tree_ty(st: &SymbolTable, vd: &Tree) -> Type {
+    if !vd.ty.is_no_type() {
+        vd.ty.clone()
+    } else if !vd.sym.is_none() {
+        st.get(vd.sym).ty.clone()
+    } else {
+        Type::Any
+    }
+}
+
+fn is_trait_owned_term(st: &SymbolTable, id: SymbolId) -> bool {
+    if id.is_none() {
+        return false;
+    }
+    let s = st.get(id);
+    if s.kind != SymKind::Term || s.flags.contains(Flags::PARAM) {
+        return false;
+    }
+    let o = s.owner;
+    !o.is_none() && is_interface_sym(st, o) && !is_module_class(st, o)
 }
 
 fn trait_static_desc(iface: &str, inst_desc: &str) -> String {
@@ -498,6 +626,20 @@ impl<'a> Gen<'a> {
                     if !methods.is_empty() && !tree.sym.is_none() {
                         self.trait_impls.insert(tree.sym, methods);
                     }
+                    let vals: Vec<Tree> = impl_
+                        .body
+                        .iter()
+                        .filter(|s| match &s.kind {
+                            TreeKind::ValDef { rhs, mods, .. } => {
+                                !rhs.is_empty() && !mods.flags.contains(Flags::LAZY)
+                            }
+                            _ => false,
+                        })
+                        .cloned()
+                        .collect();
+                    if !vals.is_empty() && !tree.sym.is_none() {
+                        self.trait_vals.insert(tree.sym, vals);
+                    }
                 }
                 for s in &impl_.body {
                     self.collect_trait_impls(s);
@@ -594,12 +736,30 @@ impl<'a> Gen<'a> {
                     }
                     let acc = method_access_flags(mods.flags) | ACC_ABSTRACT;
                     b.add_abstract(acc, name, &def_method_desc(self.st, stt));
+                    if needs_super_accessor(stt) {
+                        let acc_name = super_accessor_name(self.st, class_id, name);
+                        b.add_abstract(
+                            ACC_PUBLIC | ACC_ABSTRACT,
+                            &acc_name,
+                            &def_method_desc(self.st, stt),
+                        );
+                    }
+                }
+                if let TreeKind::ValDef {
+                    name, mods, rhs, ..
+                } = &stt.kind
+                {
+                    let ty = val_tree_ty(self.st, stt);
+                    let gdesc = format!("(){}", jvm_desc(self.st, &ty));
+                    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, name, &gdesc);
+                    if !rhs.is_empty() && !mods.flags.contains(Flags::LAZY) {
+                        let sdesc = format!("({})V", jvm_desc(self.st, &ty));
+                        b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, &setter_name(name), &sdesc);
+                    }
                 }
             }
             self.out.push(b.finish());
-            if self.trait_impls.contains_key(&class_id) {
-                self.emit_trait_impl_class(tree, &this_name);
-            }
+            self.emit_trait_impl_class(tree, &this_name);
             return;
         }
 
@@ -646,6 +806,13 @@ impl<'a> Gen<'a> {
                 });
             }
         }
+        for (name, ty) in self.mixin_val_fields(class_id, vparamss, &impl_.body) {
+            b.fields.push(Field {
+                access: ACC_PUBLIC,
+                name,
+                desc: jvm_desc(self.st, &ty),
+            });
+        }
         if impl_.body.iter().any(|s| match &s.kind {
             TreeKind::ValDef { mods, .. } => mods.flags.contains(Flags::LAZY),
             _ => false,
@@ -666,6 +833,8 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        self.emit_trait_val_accessors(&mut b, class_id, &impl_.body);
+        self.emit_super_accessors(&mut b, class_id);
         self.emit_mixin_forwarders(&mut b, class_id, &impl_.body);
         self.out.push(b.finish());
     }
@@ -724,6 +893,22 @@ impl<'a> Gen<'a> {
         let source = self.source_name;
         let has_outer = outer.is_some();
         let outer_desc_c = outer_desc.clone();
+        let mixin_inits: Vec<(String, String)> = if class_id.is_none() {
+            Vec::new()
+        } else {
+            linearize(st, class_id)
+                .into_iter()
+                .skip(1)
+                .rev()
+                .filter_map(|p| {
+                    if !self.trait_vals.contains_key(&p) || !is_interface_sym(st, p) {
+                        return None;
+                    }
+                    let iface = class_internal(st, p);
+                    Some((format!("{}$class", iface), format!("(L{iface};)V")))
+                })
+                .collect()
+        };
         b.add_code(ACC_PUBLIC, "<init>", &desc, max_locals, |asm| {
             let mut frame = frame;
             asm.aload(0);
@@ -742,6 +927,10 @@ impl<'a> Gen<'a> {
                 asm.aload(0);
                 load(asm, *slot, *sort);
                 asm.putfield(&class_name, fname, fdesc);
+            }
+            for (impl_cls, init_desc) in &mixin_inits {
+                asm.aload(0);
+                asm.invokestatic(impl_cls, "$init$", init_desc);
             }
             let ctx = EmitCtx {
                 st,
@@ -912,16 +1101,69 @@ impl<'a> Gen<'a> {
 
     fn emit_trait_impl_class(&mut self, tree: &Tree, iface: &str) {
         let class_id = tree.sym;
-        let Some(methods) = self.trait_impls.get(&class_id).cloned() else {
+        let methods = self.trait_impls.get(&class_id).cloned().unwrap_or_default();
+        let vals = self.trait_vals.get(&class_id).cloned().unwrap_or_default();
+        if methods.is_empty() && vals.is_empty() {
             return;
-        };
+        }
         let impl_name = format!("{}$class", iface);
         let mut b = ClassBuilder::new(impl_name, self.source_name);
         b.access = ACC_PUBLIC | ACC_SUPER | ACC_FINAL;
         for def in &methods {
             self.emit_trait_impl_method(&mut b, class_id, iface, def);
         }
+        if !vals.is_empty() {
+            self.emit_trait_init(&mut b, class_id, iface, &vals);
+        }
         self.out.push(b.finish());
+    }
+
+    fn emit_trait_init(
+        &self,
+        b: &mut ClassBuilder,
+        trait_id: SymbolId,
+        iface: &str,
+        vals: &[Tree],
+    ) {
+        let desc = format!("(L{iface};)V");
+        let iface_owned = iface.to_string();
+        let st = self.st;
+        let extras = &self.extras;
+        let lambda_n = &self.lambda_n;
+        let source = self.source_name;
+        let vals = vals.to_vec();
+        b.add_code(ACC_PUBLIC | ACC_STATIC, "$init$", &desc, 4, |asm| {
+            let mut frame = Frame::instance();
+            let ctx = EmitCtx {
+                st,
+                class_sym: trait_id,
+                class_name: &iface_owned,
+                ret_ty: Type::Unit,
+                extras,
+                lambda_n,
+                source,
+                outer: None,
+            };
+            for vd in &vals {
+                if let TreeKind::ValDef {
+                    name, mods, rhs, ..
+                } = &vd.kind
+                {
+                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                        continue;
+                    }
+                    asm.aload(0);
+                    gen_expr(asm, &mut frame, &ctx, rhs);
+                    let ty = val_tree_ty(st, vd);
+                    asm.invokeinterface(
+                        &iface_owned,
+                        &setter_name(name),
+                        &format!("({})V", jvm_desc(st, &ty)),
+                    );
+                }
+            }
+            asm.vreturn();
+        });
     }
 
     fn emit_trait_impl_method(
@@ -986,6 +1228,195 @@ impl<'a> Gen<'a> {
         });
     }
 
+    fn mixin_val_fields(
+        &self,
+        class_id: SymbolId,
+        vparamss: &[Vec<Tree>],
+        body: &[Tree],
+    ) -> Vec<(String, Type)> {
+        let mut have = HashSet::new();
+        for clause in vparamss {
+            for p in clause {
+                if let Some(n) = p.name() {
+                    have.insert(n.to_string());
+                }
+            }
+        }
+        for stt in body {
+            if let TreeKind::ValDef { name, .. } = &stt.kind {
+                have.insert(name.clone());
+            }
+        }
+        let mut out = Vec::new();
+        if class_id.is_none() {
+            return out;
+        }
+        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+            let Some(vals) = self.trait_vals.get(&parent) else {
+                continue;
+            };
+            for v in vals {
+                let name = v.name().unwrap_or("").to_string();
+                if name.is_empty() || !have.insert(name.clone()) {
+                    continue;
+                }
+                out.push((name, val_tree_ty(self.st, v)));
+            }
+        }
+        out
+    }
+
+    fn emit_trait_val_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
+        if class_id.is_none() {
+            return;
+        }
+        let mut skip = HashSet::new();
+        for stt in body {
+            if let TreeKind::DefDef { name, .. } = &stt.kind {
+                skip.insert(name.clone());
+            }
+        }
+        for m in &b.methods {
+            skip.insert(m.name.clone());
+        }
+        let mut needed: Vec<(String, Type)> = Vec::new();
+        let mut seen = HashSet::new();
+        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+            let Some(vals) = self.trait_vals.get(&parent) else {
+                continue;
+            };
+            for v in vals {
+                let name = v.name().unwrap_or("").to_string();
+                if name.is_empty() || !seen.insert(name.clone()) {
+                    continue;
+                }
+                needed.push((name, val_tree_ty(self.st, v)));
+            }
+        }
+        let class_name = b.this_name.clone();
+        for (name, ty) in needed {
+            if skip.contains(&name) {
+                continue;
+            }
+            let fdesc = jvm_desc(self.st, &ty);
+            let gdesc = format!("(){fdesc}");
+            let sdesc = format!("({fdesc})V");
+            let fname = name.clone();
+            let class_c = class_name.clone();
+            let fdesc_c = fdesc.clone();
+            let sort = jvm_sort(&ty);
+            b.add_code(ACC_PUBLIC, &name, &gdesc, 1, |asm| {
+                asm.aload(0);
+                asm.getfield(&class_c, &fname, &fdesc_c);
+                emit_return(asm, &ty);
+            });
+            let fname = name.clone();
+            let class_c = class_name.clone();
+            let fdesc_c = fdesc.clone();
+            b.add_code(
+                ACC_PUBLIC,
+                &setter_name(&name),
+                &sdesc,
+                1 + sort.slots(),
+                |asm| {
+                    asm.aload(0);
+                    load(asm, 1, sort);
+                    asm.putfield(&class_c, &fname, &fdesc_c);
+                    asm.vreturn();
+                },
+            );
+        }
+    }
+
+    fn emit_super_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        if class_id.is_none() {
+            return;
+        }
+        let lin = linearize(self.st, class_id);
+        for (idx, parent) in lin.iter().enumerate() {
+            if idx == 0 || !is_interface_sym(self.st, *parent) {
+                continue;
+            }
+            let Some(methods) = self.trait_impls.get(parent) else {
+                continue;
+            };
+            for m in methods {
+                if !needs_super_accessor(m) {
+                    continue;
+                }
+                let name = m.name().unwrap_or("").to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let acc = super_accessor_name(self.st, *parent, &name);
+                let inst_desc = def_method_desc(self.st, m);
+                let ret = method_ret_ty(m);
+                let pts = def_param_types(self.st, m);
+                let mut locals = 1u16;
+                let mut loads = Vec::new();
+                for p in &pts {
+                    let sort = jvm_sort(p);
+                    loads.push((locals, sort));
+                    locals += sort.slots();
+                }
+                let target = self.next_lin_impl(&lin, idx, &name);
+                let acc_c = acc.clone();
+                let inst_c = inst_desc.clone();
+                b.add_code(ACC_PUBLIC, &acc_c, &inst_c, locals.max(1), |asm| {
+                    asm.aload(0);
+                    for (slot, sort) in &loads {
+                        load(asm, *slot, *sort);
+                    }
+                    match target {
+                        Some((next, true)) => {
+                            let iface = class_internal(self.st, next);
+                            let static_desc = trait_static_desc(&iface, &inst_c);
+                            asm.invokestatic(&format!("{}$class", iface), &name, &static_desc);
+                        }
+                        Some((next, false)) => {
+                            let owner = class_internal(self.st, next);
+                            asm.invokespecial(&owner, &name, &inst_c);
+                        }
+                        None => {
+                            throw_runtime(asm, &format!("no super implementation for {name}"));
+                            if !is_unit_like(&ret) {
+                                push_default(asm, &ret);
+                            }
+                        }
+                    }
+                    emit_return(asm, &ret);
+                });
+            }
+        }
+    }
+
+    fn next_lin_impl(
+        &self,
+        lin: &[SymbolId],
+        after_idx: usize,
+        method: &str,
+    ) -> Option<(SymbolId, bool)> {
+        for &s in lin.iter().skip(after_idx + 1) {
+            if let Some(ms) = self.trait_impls.get(&s) {
+                if ms.iter().any(|m| m.name() == Some(method)) {
+                    return Some((s, true));
+                }
+            }
+            if !is_interface_sym(self.st, s) {
+                let has = self.st.get(s).members.iter().any(|&mid| {
+                    let mem = self.st.get(mid);
+                    mem.name == method
+                        && mem.kind == SymKind::Method
+                        && !mem.flags.contains(Flags::ABSTRACT)
+                });
+                if has {
+                    return Some((s, false));
+                }
+            }
+        }
+        None
+    }
+
     fn emit_mixin_forwarders(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
         if class_id.is_none() {
             return;
@@ -995,6 +1426,9 @@ impl<'a> Gen<'a> {
             if let TreeKind::DefDef { name, .. } = &stt.kind {
                 defined.insert(name.clone());
             }
+        }
+        for m in &b.methods {
+            defined.insert(m.name.clone());
         }
         let lin = linearize(self.st, class_id);
         let mut chosen: Vec<(String, String, Tree)> = Vec::new();
@@ -1663,10 +2097,16 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
     }
     match sym.kind {
         SymKind::Term => {
-            let owner = class_internal(ctx.st, sym.owner);
-            let desc = jvm_desc(ctx.st, &sym.ty);
             load_this(asm, ctx);
-            asm.getfield(&owner, &sym.name, &desc);
+            if is_trait_owned_term(ctx.st, id) {
+                let owner = class_internal(ctx.st, sym.owner);
+                let desc = format!("(){}", jvm_desc(ctx.st, &sym.ty));
+                asm.invokeinterface(&owner, &sym.name, &desc);
+            } else {
+                let owner = class_internal(ctx.st, sym.owner);
+                let desc = jvm_desc(ctx.st, &sym.ty);
+                asm.getfield(&owner, &sym.name, &desc);
+            }
         }
         SymKind::Module | SymKind::ModuleClass => {
             let jvm = class_internal(ctx.st, module_class_id(ctx.st, id));
@@ -1718,8 +2158,14 @@ fn gen_select(
         match s.kind {
             SymKind::Term => {
                 gen_expr(asm, frame, ctx, qual);
-                let owner = class_internal(ctx.st, s.owner);
-                asm.getfield(&owner, &s.name, &jvm_desc(ctx.st, &s.ty));
+                if is_trait_owned_term(ctx.st, tree.sym) {
+                    let owner = class_internal(ctx.st, s.owner);
+                    let desc = format!("(){}", jvm_desc(ctx.st, &s.ty));
+                    asm.invokeinterface(&owner, &s.name, &desc);
+                } else {
+                    let owner = class_internal(ctx.st, s.owner);
+                    asm.getfield(&owner, &s.name, &jvm_desc(ctx.st, &s.ty));
+                }
                 return;
             }
             SymKind::Method => {
@@ -1788,6 +2234,13 @@ fn gen_assign(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, lhs: &Tree,
         TreeKind::Select { qual, name } => {
             gen_expr(asm, frame, ctx, qual);
             gen_expr(asm, frame, ctx, rhs);
+            if !lhs.sym.is_none() && is_trait_owned_term(ctx.st, lhs.sym) {
+                let s = ctx.st.get(lhs.sym);
+                let owner = class_internal(ctx.st, s.owner);
+                let desc = format!("({})V", jvm_desc(ctx.st, &s.ty));
+                asm.invokeinterface(&owner, &setter_name(&s.name), &desc);
+                return;
+            }
             let owner = if !lhs.sym.is_none() {
                 class_internal(ctx.st, ctx.st.get(lhs.sym).owner)
             } else if let Some(cid) = ctx.st.class_sym_of(&qual.ty) {
@@ -1940,6 +2393,48 @@ fn gen_apply(
     if matches!(ic, Intrinsic::NotImplemented) {
         throw_not_implemented(asm);
         push_default(asm, &tree.ty);
+        return;
+    }
+    if matches!(ic, Intrinsic::Identity) {
+        if let Some(a) = args.first() {
+            gen_expr(asm, frame, ctx, a);
+        } else {
+            gen_receiver(asm, frame, ctx, fun);
+        }
+        return;
+    }
+    if matches!(ic, Intrinsic::Implicitly) {
+        if let Some(a) = args.first() {
+            gen_expr(asm, frame, ctx, a);
+        } else {
+            push_default(asm, &tree.ty);
+        }
+        return;
+    }
+    if matches!(ic, Intrinsic::Locally) {
+        if let Some(a) = args.first() {
+            gen_expr(asm, frame, ctx, a);
+            if matches!(&a.ty, Type::Function { .. }) {
+                asm.invokeinterface("scala/Function0", "apply", "()Ljava/lang/Object;");
+                if is_unit_like(&tree.ty) {
+                    asm.pop();
+                } else if is_jvm_primitive(&tree.ty) {
+                    emit_unbox(asm, &tree.ty);
+                } else if matches!(tree.ty, Type::String) {
+                    asm.checkcast("java/lang/String");
+                }
+            }
+        } else {
+            push_default(asm, &tree.ty);
+        }
+        return;
+    }
+    if matches!(ic, Intrinsic::Any2StringAdd) {
+        if let Some(a) = args.first() {
+            gen_expr(asm, frame, ctx, a);
+        } else {
+            push_default(asm, &tree.ty);
+        }
         return;
     }
     if matches!(ic, Intrinsic::WrapArrowAssoc) {
@@ -2148,9 +2643,15 @@ fn fun_is_super(fun: &Tree) -> bool {
 
 fn invoke_super(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     let s = ctx.st.get(id);
+    let desc = method_desc_from_sym(ctx.st, id);
+    if is_interface_sym(ctx.st, ctx.class_sym) {
+        let acc = super_accessor_name(ctx.st, ctx.class_sym, &s.name);
+        let iface = class_internal(ctx.st, ctx.class_sym);
+        asm.invokeinterface(&iface, &acc, &desc);
+        return;
+    }
     let owner_id = s.owner;
     let owner = class_internal(ctx.st, owner_id);
-    let desc = method_desc_from_sym(ctx.st, id);
     if is_interface_sym(ctx.st, owner_id) {
         let static_desc = trait_static_desc(&owner, &desc);
         asm.invokestatic(&format!("{}$class", owner), &s.name, &static_desc);
@@ -3064,6 +3565,11 @@ fn gen_unapply_pattern(
     asm.goto(fail);
     asm.mark(nonempty);
     asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
+    let is_seq = ctx.st.get(uid).name == "unapplySeq";
+    if is_seq {
+        gen_unapply_seq_bind(asm, frame, ctx, args, fail);
+        return;
+    }
     if args.len() <= 1 {
         if let Some(a) = args.first() {
             if is_jvm_primitive(&a.ty) {
@@ -3087,6 +3593,54 @@ fn gen_unapply_pattern(
             bind_subpattern(asm, frame, ctx, a, fail);
         }
         asm.pop();
+    }
+}
+
+fn gen_unapply_seq_bind(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    args: &[Tree],
+    fail: crate::code::Label,
+) {
+    asm.checkcast("scala/collection/immutable/List");
+    let list_slot = frame.alloc_tmp(JvmSort::Ref);
+    store(asm, list_slot, JvmSort::Ref);
+    let mut saw_star = false;
+    for a in args {
+        if is_star_pat(a) {
+            load(asm, list_slot, JvmSort::Ref);
+            bind_subpattern(asm, frame, ctx, a, fail);
+            saw_star = true;
+            break;
+        }
+        load(asm, list_slot, JvmSort::Ref);
+        asm.invokevirtual("scala/collection/immutable/List", "isEmpty", "()Z");
+        asm.ifne(fail);
+        load(asm, list_slot, JvmSort::Ref);
+        asm.invokevirtual(
+            "scala/collection/immutable/List",
+            "head",
+            "()Ljava/lang/Object;",
+        );
+        if is_jvm_primitive(&a.ty) {
+            emit_unbox(asm, &a.ty);
+        } else if matches!(a.ty, Type::String) {
+            asm.checkcast("java/lang/String");
+        }
+        bind_subpattern(asm, frame, ctx, a, fail);
+        load(asm, list_slot, JvmSort::Ref);
+        asm.invokevirtual(
+            "scala/collection/immutable/List",
+            "tail",
+            "()Lscala/collection/immutable/List;",
+        );
+        store(asm, list_slot, JvmSort::Ref);
+    }
+    if !saw_star {
+        load(asm, list_slot, JvmSort::Ref);
+        asm.invokevirtual("scala/collection/immutable/List", "isEmpty", "()Z");
+        asm.ifeq(fail);
     }
 }
 
@@ -3252,6 +3806,7 @@ fn bind_subpattern(
             }
         }
         TreeKind::Typed { expr, .. } => bind_subpattern(asm, frame, ctx, expr, fail),
+        TreeKind::Star { elem } => bind_subpattern(asm, frame, ctx, elem, fail),
         _ => {
             pop_if_value(asm, &pat.ty);
         }
@@ -3793,5 +4348,113 @@ object Main {
             return;
         };
         assert_eq!(out, "2\n42\n1\na\nnyi\n", "stdout: {out:?}");
+    }
+
+    #[test]
+    fn unapply_seq_list_and_named() {
+        let Some(out) = run_main(
+            r#"
+object PairSeq {
+  def unapplySeq(n: Int): Option[List[Int]] = Some(n :: (n + 1) :: Nil)
+}
+case class Point(x: Int, y: Int)
+object Main {
+  def main(args: Array[String]): Unit = {
+    val xs = 1 :: 2 :: 3 :: Nil
+    val s = xs match {
+      case List(a, b, c) => a + b + c
+      case _ => 0
+    }
+    println(s)
+    val t = 10 match {
+      case PairSeq(a, b) => a + b
+      case _ => -1
+    }
+    println(t)
+    val h = xs match {
+      case List(a, rest @ _*) => a
+      case _ => 0
+    }
+    println(h)
+    val p = Point(3, 4) match {
+      case Point(y = b, x = a) => a + b
+      case _ => 0
+    }
+    println(p)
+  }
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "6\n21\n1\n7\n", "stdout: {out:?}");
+    }
+
+    #[test]
+    fn trait_val_init() {
+        let Some(out) = run_main(
+            r#"
+trait T {
+  val msg: String = "from trait"
+}
+class C extends T
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(new C().msg)
+  }
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out.trim(), "from trait", "stdout: {out:?}");
+    }
+
+    #[test]
+    fn abstract_override_super_chain() {
+        let Some(out) = run_main(
+            r#"
+trait Base {
+  def msg: String = "base"
+}
+trait A extends Base {
+  abstract override def msg: String = "A-" + super.msg
+}
+trait B extends Base {
+  abstract override def msg: String = "B-" + super.msg
+}
+class C extends Base with A with B
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(new C().msg)
+  }
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out.trim(), "B-A-base", "stdout: {out:?}");
+    }
+
+    #[test]
+    fn predef_identity_locally_implicitly_stringadd() {
+        let Some(out) = run_main(
+            r#"
+object Main {
+  implicit val n: Int = 41
+  def main(args: Array[String]): Unit = {
+    println(1 + "x")
+    println(implicitly[Int])
+    println(identity(42))
+    locally {
+      println("here")
+    }
+  }
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "1x\n41\n42\nhere\n", "stdout: {out:?}");
     }
 }

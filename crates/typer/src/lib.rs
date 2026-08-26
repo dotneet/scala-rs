@@ -4,15 +4,22 @@ mod implicits;
 mod prelude;
 mod symbol;
 
-pub use check::{find_mains, has_errors, typecheck, Typer};
+pub use check::{find_mains, has_errors, typecheck, typecheck_opts, TypecheckOptions, Typer};
 pub use erasure::{erase, erase_type};
 pub use symbol::{Intrinsic, SymKind, Symbol, SymbolTable};
 
 use scala_rs_parser::{parse_str, Tree};
 
 pub fn typecheck_str(src: &str) -> (Tree, SymbolTable, Vec<scala_rs_span::Diagnostic>) {
+    typecheck_str_opts(src, &TypecheckOptions::default())
+}
+
+pub fn typecheck_str_opts(
+    src: &str,
+    opts: &TypecheckOptions,
+) -> (Tree, SymbolTable, Vec<scala_rs_span::Diagnostic>) {
     let mut r = parse_str(src);
-    let (st, mut tdiags) = typecheck(&mut r.tree, 0);
+    let (st, mut tdiags) = typecheck_opts(&mut r.tree, 0, opts);
     let mut diags = r.diags;
     diags.append(&mut tdiags);
     (r.tree, st, diags)
@@ -328,6 +335,46 @@ object Main {
 }
 "#,
         );
+        assert!(
+            !has_errors(&diags),
+            "non-exhaustive match is a warning, got {:?}",
+            diags
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("may not be exhaustive")
+                    && d.level == scala_rs_span::Level::Warning),
+            "{:?}",
+            diags
+                .iter()
+                .map(|d| format!("{:?} {}", d.level, d.message))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("Black")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sealed_match_non_exhaustive_fatal_warnings() {
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+sealed trait Color
+case class RGB(n: Int) extends Color
+case object Black extends Color
+object Main {
+  def show(c: Color): Int = c match {
+    case RGB(n) => n
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: true,
+            },
+        );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
             diags
@@ -336,11 +383,37 @@ object Main {
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
-        assert!(
-            diags.iter().any(|d| d.message.contains("Black")),
-            "{:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
+    }
+
+    #[test]
+    fn unapply_seq_and_named_extractor_typecheck() {
+        ok(r#"
+object PairSeq {
+  def unapplySeq(n: Int): Option[List[Int]] = Some(n :: (n + 1) :: Nil)
+}
+case class Point(x: Int, y: Int)
+object Main {
+  def main(args: Array[String]): Unit = {
+    val xs = 1 :: 2 :: 3 :: Nil
+    val a = xs match {
+      case List(x, y, z) => x + y + z
+      case _ => 0
+    }
+    val b = 10 match {
+      case PairSeq(p, q) => p + q
+      case _ => 0
+    }
+    val c = xs match {
+      case List(h, rest @ _*) => h
+      case _ => 0
+    }
+    val d = Point(1, 2) match {
+      case Point(y = b, x = a) => a + b
+      case _ => 0
+    }
+  }
+}
+"#);
     }
 
     #[test]
@@ -396,7 +469,50 @@ object Main {
     val n: Int = "42".toInt
     assert(true)
     require(1 > 0)
-    val t = 1 -> "a"
+        val t = 1 -> "a"
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn predef_more_and_trait_val_typecheck() {
+        ok(r#"
+trait T {
+  val msg: String = "from trait"
+}
+class C extends T
+object Main {
+  implicit val n: Int = 41
+  def main(args: Array[String]): Unit = {
+    println(identity(42))
+    locally {
+      println("here")
+    }
+    println(implicitly[Int])
+    println(1 + "x")
+    println(new C().msg)
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn abstract_override_typecheck() {
+        ok(r#"
+trait Base {
+  def msg: String = "base"
+}
+trait A extends Base {
+  abstract override def msg: String = "A-" + super.msg
+}
+trait B extends Base {
+  abstract override def msg: String = "B-" + super.msg
+}
+class C extends Base with A with B
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(new C().msg)
   }
 }
 "#);

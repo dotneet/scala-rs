@@ -736,9 +736,26 @@ fn add_list_members(st: &mut SymbolTable) {
         l,
         "withFilter",
         vec![fn1(ta, Type::Boolean)],
-        list_t,
+        list_t.clone(),
         Intrinsic::None,
     );
+
+    let list_mod = module(st, st.scala_pkg, "List", "scala/collection/immutable/List$");
+    let mcls = st.module_class_of(list_mod);
+    let seq = method(
+        st,
+        mcls,
+        "unapplySeq",
+        vec![list_t.clone()],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![list_t],
+        },
+        Intrinsic::None,
+    );
+    let _ = seq;
+    let mems = st.get(mcls).members.clone();
+    st.get_mut(list_mod).members.extend(mems);
 }
 
 fn add_function_types(st: &mut SymbolTable) {
@@ -858,6 +875,85 @@ fn add_predef_members(st: &mut SymbolTable, arrow: SymbolId) {
         Type::Nothing,
         Intrinsic::NotImplemented,
     );
+    let ident = method(
+        st,
+        owner,
+        "identity",
+        vec![Type::Any],
+        Type::Any,
+        Intrinsic::Identity,
+    );
+    let ia = type_param(st, ident, "A");
+    st.get_mut(ident).tparams = vec![ia];
+    st.get_mut(ident).ty = Type::Method {
+        paramss: vec![vec![Type::TypeParam(ia)]],
+        ret: Box::new(Type::TypeParam(ia)),
+    };
+    let loc = method(
+        st,
+        owner,
+        "locally",
+        vec![Type::ByName(Box::new(Type::Any))],
+        Type::Any,
+        Intrinsic::Locally,
+    );
+    let lt = type_param(st, loc, "A");
+    st.get_mut(loc).tparams = vec![lt];
+    st.get_mut(loc).ty = Type::Method {
+        paramss: vec![vec![Type::ByName(Box::new(Type::TypeParam(lt)))]],
+        ret: Box::new(Type::TypeParam(lt)),
+    };
+    let implm = method(
+        st,
+        owner,
+        "implicitly",
+        vec![Type::Any],
+        Type::Any,
+        Intrinsic::Implicitly,
+    );
+    let it = type_param(st, implm, "T");
+    let ip = st.alloc(
+        "e",
+        implm,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(ip).ty = Type::TypeParam(it);
+    st.get_mut(implm).tparams = vec![it];
+    st.get_mut(implm).params = vec![ip];
+    st.get_mut(implm).paramss = vec![vec![ip]];
+    st.get_mut(implm).ty = Type::Method {
+        paramss: vec![vec![Type::TypeParam(it)]],
+        ret: Box::new(Type::TypeParam(it)),
+    };
+    let sadd = class(
+        st,
+        st.scala_pkg,
+        "any2stringadd",
+        "scala/runtime/StringAdd",
+        &[Type::AnyRef],
+    );
+    method(
+        st,
+        sadd,
+        "+",
+        vec![Type::String],
+        Type::String,
+        Intrinsic::StringConcat,
+    );
+    let conv_s = method(
+        st,
+        owner,
+        "any2stringadd",
+        vec![Type::Any],
+        Type::Class {
+            sym: sadd,
+            args: vec![],
+        },
+        Intrinsic::Any2StringAdd,
+    );
+    st.get_mut(conv_s).flags = st.get(conv_s).flags.with(Flags::IMPLICIT);
     let conv = method(
         st,
         owner,

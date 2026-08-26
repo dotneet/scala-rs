@@ -6,7 +6,7 @@ use std::process::Command;
 use scala_rs_backend::{emit, emit_runtime};
 use scala_rs_parser::{dump_tree, parse_file, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
-use scala_rs_typer::{erase, find_mains, typecheck, SymbolTable};
+use scala_rs_typer::{erase, find_mains, typecheck_opts, SymbolTable, TypecheckOptions};
 
 pub use scala_rs_backend::EmittedClass;
 
@@ -19,6 +19,8 @@ pub struct CompileOptions {
     pub parse_only: bool,
     /// `--typer`: dump the typed tree after typechecking.
     pub typer_dump: bool,
+    /// `-Xfatal-warnings`: promote warnings (e.g. non-exhaustive match) to errors.
+    pub fatal_warnings: bool,
 }
 
 impl Default for CompileOptions {
@@ -27,6 +29,7 @@ impl Default for CompileOptions {
             out_dir: PathBuf::from("."),
             parse_only: false,
             typer_dump: false,
+            fatal_warnings: false,
         }
     }
 }
@@ -141,7 +144,13 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
 
     let mut mains = Vec::new();
     for u in &mut units {
-        let (mut st, tdiags) = typecheck(&mut u.tree, u.file_index);
+        let (mut st, tdiags) = typecheck_opts(
+            &mut u.tree,
+            u.file_index,
+            &TypecheckOptions {
+                fatal_warnings: opts.fatal_warnings,
+            },
+        );
         diags.extend(tdiags);
         mains.extend(find_mains(&st, &u.tree));
         if !has_errors(&diags) {
@@ -340,6 +349,7 @@ object Main {
             out_dir: tmp.0.clone(),
             parse_only: false,
             typer_dump: false,
+            fatal_warnings: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());
@@ -379,6 +389,7 @@ object Main {
             out_dir: tmp.0.join("out"),
             parse_only: true,
             typer_dump: false,
+            fatal_warnings: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "{}", result.render_diags());
@@ -395,6 +406,7 @@ object Main {
             out_dir: tmp.0.join("out"),
             parse_only: false,
             typer_dump: false,
+            fatal_warnings: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(!result.ok());
