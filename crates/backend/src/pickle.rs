@@ -137,18 +137,13 @@ pub fn encode8to7(src: &[u8]) -> Vec<u8> {
     dst
 }
 
+/// nsc `ScalaSigBytes.mapToNextModSevenBits`: 0x7f → 0, else +1.
+/// Zero bytes are stored as modified UTF-8 `C0 80` in the classfile Utf8,
+/// which `ByteCodecs.decode` / [`regenerate_zero`] map back to 0x7f.
 pub fn avoid_zero(src: &[u8]) -> Vec<u8> {
-    let extra = src.iter().filter(|&&b| b == 0x7f).count();
-    let mut dst = Vec::with_capacity(src.len() + extra);
-    for &inp in src {
-        if inp == 0x7f {
-            dst.push(0xc0);
-            dst.push(0x80);
-        } else {
-            dst.push(inp.wrapping_add(1));
-        }
-    }
-    dst
+    src.iter()
+        .map(|&inp| if inp == 0x7f { 0 } else { inp.wrapping_add(1) })
+        .collect()
 }
 
 pub fn encode_bytes(src: &[u8]) -> Vec<u8> {
@@ -311,6 +306,7 @@ struct Pickler<'a> {
     empty_pkg: Option<u32>,
     sym_index: std::collections::HashMap<u32, u32>,
     this_tpes: std::collections::HashMap<u32, u32>,
+    class_tparams: std::collections::HashMap<u32, Vec<u32>>,
 }
 
 impl<'a> Pickler<'a> {
@@ -329,6 +325,7 @@ impl<'a> Pickler<'a> {
             empty_pkg: None,
             sym_index: std::collections::HashMap::new(),
             this_tpes: std::collections::HashMap::new(),
+            class_tparams: std::collections::HashMap::new(),
         };
         p.none = p.add(NONESYM, vec![]);
         p.notpe = p.add(NOTPE, vec![]);
@@ -422,6 +419,33 @@ impl<'a> Pickler<'a> {
         i
     }
 
+    /// nsc constructor result: `TypeRef(ThisType(<empty>), C, tparams)`.
+    fn ctor_result_type(&mut self, class_idx: u32) -> u32 {
+        let empty = self.empty_package();
+        let mut th = Vec::new();
+        write_nat_to(&mut th, empty);
+        let pref = self.add(THISTPE, th);
+        let tparams = self
+            .class_tparams
+            .get(&class_idx)
+            .cloned()
+            .unwrap_or_default();
+        let mut targs = Vec::new();
+        for tp in tparams {
+            let mut tr = Vec::new();
+            write_nat_to(&mut tr, self.noprefix);
+            write_nat_to(&mut tr, tp);
+            targs.push(self.add(TYPEREFTPE, tr));
+        }
+        let mut body = Vec::new();
+        write_nat_to(&mut body, pref);
+        write_nat_to(&mut body, class_idx);
+        for t in targs {
+            write_nat_to(&mut body, t);
+        }
+        self.add(TYPEREFTPE, body)
+    }
+
     fn type_ref_in(&mut self, owner: u32, name: &str) -> u32 {
         let pref = self.noprefix;
         let sym = self.ext_ref_owned(name, owner);
@@ -483,12 +507,9 @@ impl<'a> Pickler<'a> {
             Type::Wildcard | Type::AnyRef => self.type_ref_named("AnyRef"),
             Type::AnyVal => self.type_ref_named("AnyVal"),
             Type::TypeParam(id) => {
-                let owner = self.st.get(*id).owner;
-                let pref = self
-                    .this_tpes
-                    .get(&owner.0)
-                    .copied()
-                    .unwrap_or(self.noprefix);
+                // nsc pickles class/method tparams as TypeRef(NoPrefix, T), not ThisType.
+                // ThisType(C).A is path-dependent and does not asSeenFrom-substitute.
+                let pref = self.noprefix;
                 let sym = self.pickle_typesym(*id);
                 let mut body = Vec::new();
                 write_nat_to(&mut body, pref);
@@ -567,6 +588,7 @@ impl<'a> Pickler<'a> {
         for tp in tparams {
             tparam_refs.push(self.pickle_typesym(tp));
         }
+        self.class_tparams.insert(idx, tparam_refs.clone());
         for m in members {
             let kind = self.st.get(m).kind;
             let name = self.st.get(m).name.clone();
@@ -607,6 +629,17 @@ impl<'a> Pickler<'a> {
         let owner = self.empty_package();
         let body = self.symbol_info(name_ref, owner, flags, info);
         self.entries[idx as usize] = (tag, body);
+        if is_module {
+            // nsc unpickler binds the term `Lib` from MODULEsym; CLASSsym+MODULE is the module class.
+            let mut tr = Vec::new();
+            write_nat_to(&mut tr, self.noprefix);
+            write_nat_to(&mut tr, idx);
+            let mtpe = self.add(TYPEREFTPE, tr);
+            let mflags = raw_to_pickled(1 << 8);
+            let mn = self.term_name(&raw_name);
+            let mbody = self.symbol_info(mn, owner, mflags, mtpe);
+            self.add(MODULESYM, mbody);
+        }
         idx
     }
 
@@ -654,7 +687,11 @@ impl<'a> Pickler<'a> {
             let body = self.symbol_info(pn, meth_idx, flags, pty_ref);
             param_refs.push(self.add(VALSYM, body));
         }
-        let ret_ref = self.pickle_type(&ret);
+        let ret_ref = if s.name == "<init>" {
+            self.ctor_result_type(owner_ref)
+        } else {
+            self.pickle_type(&ret)
+        };
         let mut info = if params.is_empty() && s.name != "<init>" {
             // nsc NullaryMethodType = POLYtpe(restpe) with no tparams.
             let mut pt = Vec::new();
@@ -800,6 +837,25 @@ pub fn pickle_class(st: &SymbolTable, class_id: SymbolId) -> Vec<u8> {
     let mut p = Pickler::new(st);
     p.pickle_class(class_id);
     p.finish()
+}
+
+/// Snapshot pickles before erasure. nsc pickles pre-erasure signatures so
+/// `id[T]` / `Box[A]#get` stay type parameters, not `Object`.
+pub fn pickle_all(st: &SymbolTable) -> std::collections::HashMap<u32, Vec<u8>> {
+    let mut out = std::collections::HashMap::new();
+    for s in &st.symbols {
+        if matches!(
+            s.kind,
+            SymKind::Class | SymKind::ModuleClass
+        ) && !s.id.is_none()
+        {
+            let raw = pickle_class(st, s.id);
+            if !raw.is_empty() {
+                out.insert(s.id.0, raw);
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

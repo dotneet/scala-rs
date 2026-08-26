@@ -84,7 +84,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - リテラル、タプル
 - 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）
 - 存在型のよくある形: `List[_]`、`T forSome { type X }`、`List[_]` を取るメソッド。ワイルドカードは Object 相当に erase する。境界付き `_ <: T` や `forSome { val … }` は診断する（黙って捨てない）
-- compiled class/object に **ScalaSignature**（`RuntimeVisibleAnnotations` + pickle subset）。`javap -v` で見える。自前 unpickler が読める範囲で `-cp` による別コンパイルができる。nsc 完全 pickle ではないが、ワイヤ形式は nsc と同じ（nentries、tag/len、ビッグエンディアン Nat）。`val` / パラメータ付き `def` / 型パラメータ `id[T]` は scalac 2.13.16 が読める形（object は CLASSsym+MODULE、`<empty>` / scala / java.lang の EXTMODCLASSref、POLYtpe は restpe 先行、val は NullaryMethodType ゲッター）
+- compiled class/object に **ScalaSignature**（クラス属性 `ScalaSig` マーカー + `RuntimeVisibleAnnotations` の pickle subset）。`javap -v` で見える。自前 unpickler が読める範囲で `-cp` による別コンパイルができる。nsc 完全 pickle ではないが、ワイヤ形式は nsc と同じ（nentries、tag/len、ビッグエンディアン Nat、SID-10 は `0x7f→0`）。`val` / パラメータ付き `def` / 型パラメータ `id[T]` は scalac 2.13.16 が読める形（object は CLASSsym+MODULE、`<empty>` / scala / java.lang の EXTMODCLASSref、POLYtpe は restpe 先行、val は NullaryMethodType ゲッター）
 - `s"..."` 文字列補間
 - `lazy val`
 - implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む。候補が複数あるときは nsc 風の **more-specific**（結果型の subtype）が勝つ。まだ曖昧なら `ambiguous implicit`。目標型が `A => B` で `A <: B` のときは nsc と同様 identity view を合成する（view bound の呼び出し側）

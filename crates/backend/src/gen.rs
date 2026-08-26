@@ -11,7 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 /// Options for [`emit_opts`].
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct EmitOpts {
     /// Emit invokes against scala-library 2.13 (Option/List/`::`/FunctionN/…).
     ///
@@ -19,6 +19,8 @@ pub struct EmitOpts {
     /// skips them when this flag is set. Call sites that would miss on the jar
     /// (`List.withFilter`, `List.tail()List`, ArrowAssoc) are rewritten here.
     pub library_abi: bool,
+    /// Pre-erasure ScalaSignature pickles, keyed by class symbol id.
+    pub pickles: HashMap<u32, Vec<u8>>,
 }
 
 /// Walk a typed compilation unit and emit classes (private-runtime ABI).
@@ -42,6 +44,7 @@ pub fn emit_opts(
         trait_impls: HashMap::new(),
         trait_vals: HashMap::new(),
         library_abi: opts.library_abi,
+        pickles: opts.pickles,
     };
     g.collect_trait_impls(tree);
     g.walk(tree);
@@ -61,6 +64,7 @@ struct Gen<'a> {
     /// Trait `val` definitions with a right-hand side (`T$class.$init$`).
     trait_vals: HashMap<SymbolId, Vec<Tree>>,
     library_abi: bool,
+    pickles: HashMap<u32, Vec<u8>>,
 }
 
 struct EmitCtx<'a> {
@@ -162,6 +166,7 @@ struct ClassBuilder {
     pool: Pool,
     source: String,
     scala_signature: Option<String>,
+    scala_raw: bool,
 }
 
 impl ClassBuilder {
@@ -176,6 +181,7 @@ impl ClassBuilder {
             pool: Pool::new(),
             source: source.to_string(),
             scala_signature: None,
+            scala_raw: false,
         }
     }
 
@@ -220,6 +226,7 @@ impl ClassBuilder {
             methods: self.methods,
             source: self.source,
             scala_signature: self.scala_signature,
+            scala_raw: self.scala_raw,
         };
         let bytes = class.write_with_pool(self.pool).expect("classfile write");
         EmittedClass {
@@ -229,11 +236,19 @@ impl ClassBuilder {
     }
 }
 
-fn attach_scala_sig(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
+fn attach_scala_sig(
+    b: &mut ClassBuilder,
+    st: &SymbolTable,
+    class_id: SymbolId,
+    pickles: &HashMap<u32, Vec<u8>>,
+) {
     if class_id.is_none() {
         return;
     }
-    let raw = crate::pickle::pickle_class(st, class_id);
+    let raw = pickles
+        .get(&class_id.0)
+        .cloned()
+        .unwrap_or_else(|| crate::pickle::pickle_class(st, class_id));
     if raw.is_empty() {
         return;
     }
@@ -1026,7 +1041,7 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
-            attach_scala_sig(&mut b, self.st, class_id);
+            attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
             self.out.push(b.finish());
             self.emit_trait_impl_class(tree, &this_name);
             return;
@@ -1107,7 +1122,7 @@ impl<'a> Gen<'a> {
         self.emit_super_accessors(&mut b, class_id);
         self.emit_mixin_forwarders(&mut b, class_id, &impl_.body);
         self.emit_erasure_bridges(&mut b, class_id);
-        attach_scala_sig(&mut b, self.st, class_id);
+        attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out.push(b.finish());
     }
 
@@ -2158,7 +2173,7 @@ impl<'a> Gen<'a> {
             }
         }
 
-        attach_scala_sig(&mut b, self.st, cls);
+        attach_scala_sig(&mut b, self.st, cls, &self.pickles);
         self.out.push(b.finish());
 
         let top_level = if cls.is_none() {
@@ -2170,7 +2185,7 @@ impl<'a> Gen<'a> {
             )
         };
         if !class_names.contains(name) && top_level && name != "package" {
-            self.emit_forwarder(&this_name, &forwarded);
+            self.emit_forwarder(&this_name, &forwarded, cls);
         }
     }
 
@@ -2253,11 +2268,16 @@ impl<'a> Gen<'a> {
         self.emit_module_init(&mut b, class_id, &[]);
         self.emit_module_clinit(&mut b);
         emit_case_apply(&mut b, self.st, class_id);
-        attach_scala_sig(&mut b, self.st, class_id);
+        attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out.push(b.finish());
     }
 
-    fn emit_forwarder(&mut self, module_jvm: &str, methods: &[(String, String, Type, Vec<Type>)]) {
+    fn emit_forwarder(
+        &mut self,
+        module_jvm: &str,
+        methods: &[(String, String, Type, Vec<Type>)],
+        class_id: SymbolId,
+    ) {
         let fwd_name = strip_module_dollar(module_jvm);
         let mut b = ClassBuilder::new(fwd_name, self.source_name);
         b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
@@ -2285,6 +2305,7 @@ impl<'a> Gen<'a> {
                 emit_return(asm, &ret);
             });
         }
+        attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out.push(b.finish());
     }
 
@@ -5583,7 +5604,15 @@ mod tests {
         scala_rs_typer::uncurry(&mut tree, &mut st);
         scala_rs_typer::lambda_lift(&mut tree, &mut st);
         scala_rs_typer::erase(&mut tree, &mut st);
-        emit_opts(&tree, &st, "Test.scala", EmitOpts { library_abi: true })
+        emit_opts(
+            &tree,
+            &st,
+            "Test.scala",
+            EmitOpts {
+                library_abi: true,
+                ..Default::default()
+            },
+        )
     }
 
     fn run_main(src: &str) -> Option<String> {

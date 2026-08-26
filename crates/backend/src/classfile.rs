@@ -125,6 +125,28 @@ pub struct EmittedClass {
     pub bytes: Vec<u8>,
 }
 
+/// JVMS §4.4.7 modified UTF-8 (U+0000 as `C0 80`).
+fn modified_utf8_bytes(s: &str) -> Vec<u8> {
+    let mut b = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        let u = c as u32;
+        if u == 0 {
+            b.push(0xc0);
+            b.push(0x80);
+        } else if u < 0x80 {
+            b.push(u as u8);
+        } else if u < 0x800 {
+            b.push((0xc0 | (u >> 6)) as u8);
+            b.push((0x80 | (u & 0x3f)) as u8);
+        } else {
+            b.push((0xe0 | (u >> 12)) as u8);
+            b.push((0x80 | ((u >> 6) & 0x3f)) as u8);
+            b.push((0x80 | (u & 0x3f)) as u8);
+        }
+    }
+    b
+}
+
 #[derive(Default)]
 pub struct Pool {
     bytes: Vec<u8>,
@@ -152,13 +174,13 @@ impl Pool {
         if let Some(i) = self.utf8.get(s) {
             return *i;
         }
+        let encoded = modified_utf8_bytes(s);
         let i = self.count;
         self.count += 1;
         self.bytes.push(1); // CONSTANT_Utf8
-        let b = s.as_bytes();
         self.bytes
-            .extend_from_slice(&(b.len() as u16).to_be_bytes());
-        self.bytes.extend_from_slice(b);
+            .extend_from_slice(&(encoded.len() as u16).to_be_bytes());
+        self.bytes.extend_from_slice(&encoded);
         self.utf8.insert(s.to_string(), i);
         i
     }
@@ -331,6 +353,8 @@ pub struct ClassEmit {
     pub source: String,
     /// `ScalaSignature.bytes` as a Java String (latin-1 chars), if any.
     pub scala_signature: Option<String>,
+    /// nsc `Scala` attribute: pickle lives on the companion / mirror class.
+    pub scala_raw: bool,
 }
 
 impl ClassEmit {
@@ -346,6 +370,16 @@ impl ClassEmit {
         let stack_map_attr = pool.utf8("StackMapTable");
         let src_attr = pool.utf8("SourceFile");
         let src_name = pool.utf8(&self.source);
+        let scala_raw_attr = if self.scala_raw {
+            Some(pool.utf8("Scala"))
+        } else {
+            None
+        };
+        let scala_sig_attr = if self.scala_signature.is_some() && !self.scala_raw {
+            Some(pool.utf8("ScalaSig"))
+        } else {
+            None
+        };
         let rva_attr = if self.scala_signature.is_some() {
             Some(pool.utf8("RuntimeVisibleAnnotations"))
         } else {
@@ -423,8 +457,24 @@ impl ClassEmit {
                 out.extend_from_slice(&0u16.to_be_bytes());
             }
         }
-        let n_class_attrs = 1u16 + if rva_attr.is_some() { 1 } else { 0 };
+        let n_class_attrs = 1u16
+            + if rva_attr.is_some() { 1 } else { 0 }
+            + if scala_sig_attr.is_some() { 1 } else { 0 }
+            + if scala_raw_attr.is_some() { 1 } else { 0 };
         out.extend_from_slice(&n_class_attrs.to_be_bytes());
+        if let Some(raw) = scala_raw_attr {
+            // nsc pickleMarkerForeign: pickle is on the companion / mirror.
+            out.extend_from_slice(&raw.to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+        }
+        if let Some(ss) = scala_sig_attr {
+            // nsc pickleMarkerLocal: `ScalaSig` attribute with version pickle
+            // (major, minor, nentries=0). Tells nsc this class carries a pickle.
+            let marker = [5u8, 2, 0];
+            out.extend_from_slice(&ss.to_be_bytes());
+            out.extend_from_slice(&(marker.len() as u32).to_be_bytes());
+            out.extend_from_slice(&marker);
+        }
         if let (Some(rva), Some(sig_ty), Some(bn), Some(su)) =
             (rva_attr, sig_type, bytes_name, sig_utf8)
         {
