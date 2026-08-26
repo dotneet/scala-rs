@@ -145,6 +145,7 @@ pub fn erase_type(ty: &Type) -> Type {
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(erase_type).collect()),
         Type::Overload(alts) => Type::Overload(alts.iter().map(erase_type).collect()),
         Type::Wildcard | Type::BoundedWildcard { .. } => Type::Any,
+        Type::Constant(lit) => Type::lit_underlying(lit),
         Type::ThisType(s) => Type::Class {
             sym: *s,
             args: vec![],
@@ -178,6 +179,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         }
         Type::TypeParam(_) | Type::TypeMember(_) => Type::Any,
         Type::Wildcard | Type::BoundedWildcard { .. } => Type::Any,
+        Type::Constant(lit) => Type::lit_underlying(lit),
         Type::ThisType(s) => Type::Class {
             sym: *s,
             args: vec![],
@@ -279,6 +281,7 @@ fn is_ref_erased(ty: &Type) -> bool {
             | Type::BoundedWildcard { .. }
             | Type::ThisType(_)
             | Type::SingleType { .. }
+            | Type::Constant(_)
             | Type::Annotated { .. }
             | Type::Named { .. }
             | Type::Refined { .. }

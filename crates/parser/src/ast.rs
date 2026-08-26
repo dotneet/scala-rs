@@ -185,6 +185,9 @@ pub enum Type {
         prefix: Box<Type>,
         sym: SymbolId,
     },
+    /// SIP-23 literal / constant type (`1`, `true`, `"hi"`). Subtype of the
+    /// underlying type (`1 <: Int`); not pickled as CONSTANTINTtpe.
+    Constant(Lit),
     /// `T @annot` (type annotation; not a symbol annotation).
     Annotated {
         tpe: Box<Type>,
@@ -210,6 +213,33 @@ impl Type {
             Type::Method { ret, .. } => ret,
             Type::Function { ret, .. } => ret,
             t => t,
+        }
+    }
+
+    /// Underlying type of a SIP-23 constant (`1` → `Int`).
+    pub fn lit_underlying(lit: &Lit) -> Type {
+        match lit {
+            Lit::Unit => Type::Unit,
+            Lit::Boolean(_) => Type::Boolean,
+            Lit::Int(_) => Type::Int,
+            Lit::Long(_) => Type::Long,
+            Lit::Float(_) => Type::Float,
+            Lit::Double(_) => Type::Double,
+            Lit::Char(_) => Type::Char,
+            Lit::String(_) => Type::String,
+            Lit::Null => Type::Null,
+            Lit::Symbol(_) => Type::Named {
+                name: "Symbol".into(),
+                args: vec![],
+            },
+        }
+    }
+
+    /// Widen a constant type to its underlying type; other types are cloned.
+    pub fn widen_constant(&self) -> Type {
+        match self {
+            Type::Constant(lit) => Type::lit_underlying(lit),
+            t => t.clone(),
         }
     }
 }
@@ -326,6 +356,7 @@ impl fmt::Display for Type {
             }
             Type::ThisType(s) => write!(f, "this.type(#{})", s.0),
             Type::SingleType { sym, .. } => write!(f, "#{}.type", sym.0),
+            Type::Constant(lit) => write!(f, "{lit}"),
             Type::Annotated { tpe, annot } => write!(f, "{tpe} @{annot}"),
             Type::Refined { parents, decls } => {
                 if parents.is_empty() {

@@ -279,6 +279,7 @@ fn jvm_sort(ty: &Type) -> JvmSort {
         Type::Long => JvmSort::Long,
         Type::Float => JvmSort::Float,
         Type::Double => JvmSort::Double,
+        Type::Constant(lit) => jvm_sort(&Type::lit_underlying(lit)),
         _ => JvmSort::Ref,
     }
 }
@@ -316,6 +317,7 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
             "Ljava/lang/Object;".into()
         }
         Type::ThisType(sym) => format!("L{};", class_internal(st, *sym)),
+        Type::Constant(lit) => jvm_desc(st, &Type::lit_underlying(lit)),
         Type::SingleType { prefix, sym } => {
             let inner = st.get(*sym).ty.clone();
             if inner.is_no_type() {
