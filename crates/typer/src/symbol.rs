@@ -484,6 +484,7 @@ impl SymbolTable {
                     && self.is_sub_type(r1, r2)
             }
             (Type::ByName(a), Type::ByName(b)) => self.is_sub_type(a, b),
+            (Type::Repeated(a), Type::Repeated(b)) => self.is_sub_type(a, b),
             _ => false,
         }
     }
@@ -583,6 +584,7 @@ fn subst_map(ty: &Type, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> Typ
             ret: Box::new(subst_map(ret, tps, args)),
         },
         Type::ByName(t) => Type::ByName(Box::new(subst_map(t, tps, args))),
+        Type::Repeated(t) => Type::Repeated(Box::new(subst_map(t, tps, args))),
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| subst_map(t, tps, args)).collect()),
         Type::Named { name, args: as_ } => Type::Named {
             name: name.clone(),

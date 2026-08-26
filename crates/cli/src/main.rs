@@ -73,7 +73,10 @@ OPTIONS:
     --scala-library [<jar>]
                Link against scala-library 2.13 (do not emit private Option/List).
                Path optional: searches SCALA_LIBRARY_JAR, /tmp/scala-rs-lib, cwd.
-               `run` adds the jar to java -cp.
+               `compile` without this flag uses the private runtime even if a jar
+               is on disk. `run` uses an auto-found 2.13 jar by default (same
+               search) and adds it to java -cp; omit a jar and it falls back to
+               the private runtime.
     --parse             Parse only and dump the AST (do not typecheck or emit)
     --typer             Dump the typed tree after namer/typer
     -Xfatal-warnings    Treat warnings as errors (non-exhaustive match, …)
@@ -307,7 +310,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 "could not find scala-library 2.13 jar (pass --scala-library <jar> or set SCALA_LIBRARY_JAR)".to_string()
             })?)
         }
-        other => other,
+        Some(p) => Some(p),
+        // `run` uses an auto-found 2.13 jar when present so Map/Vector/StringOps
+        // work without a flag. `compile` still defaults to the private runtime.
+        None => find_scala_library(),
     };
     Ok(RunArgs {
         file,

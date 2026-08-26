@@ -154,6 +154,8 @@ pub enum Type {
         ret: Box<Type>,
     },
     ByName(Box<Type>),
+    /// Repeated parameter `T*` (erasure: `Seq[T]`).
+    Repeated(Box<Type>),
     Overload(Vec<Type>),
     /// Package or module as a prefix (for Select).
     ModuleRef(SymbolId),
@@ -263,6 +265,7 @@ impl fmt::Display for Type {
                 write!(f, "{ret}")
             }
             Type::ByName(t) => write!(f, "=> {t}"),
+            Type::Repeated(t) => write!(f, "{t}*"),
             Type::Overload(alts) => {
                 write!(f, "<overload ")?;
                 for (i, a) in alts.iter().enumerate() {

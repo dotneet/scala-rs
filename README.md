@@ -11,7 +11,7 @@ scala-rs は、Scala 2.13 の構文と意味論のごく一部を、Rust から 
 - フロントエンドは nsc の `Tree` に近い AST を持ちます。
 - ターゲットは Java 6 相当の classfile（major version 50）です。StackMapTable は出しません。
 - デフォルトでは scala-library を同梱しません。Option / List / FunctionN は **scala-rs 独自のランタイム classfile**（`scala/Option` など）です。
-- `--scala-library [<jar>]`（または `SCALA_LIBRARY_JAR`）を付けると、Option / List / FunctionN / Tuple2 に加え、`Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）、`any2stringadd`（`1 + "x"`）、`ArrowAssoc` の `->`、`StringOps`（`augmentString` 経由の `toInt` / `length`）、`WithFilter` / `Iterator`、`Map` / `Vector` は **scala-library 2.13.16 の ABI** にリンクし、衝突する私有 classfile は出しません。jar パスを省略すると `SCALA_LIBRARY_JAR`、`/tmp/scala-rs-lib`、cwd を探します。フラグも環境変数も無いときは私有ランタイムのままです。
+- `--scala-library [<jar>]`（または `SCALA_LIBRARY_JAR`）を付けると、Option / List / FunctionN / Tuple2 に加え、`Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）、`any2stringadd`（`1 + "x"`）、`ArrowAssoc` の `->`、`intWrapper` / `RichInt`（`1.abs` / `1.max` / `1.to`）、`StringOps`（`augmentString` 経由の `toInt` / `length` / `*` / `take` / `drop` / `isEmpty`）、`WithFilter` / `Iterator`、`Map` / `Vector`（varargs `apply` を含む）は **scala-library 2.13.16 の ABI** にリンクし、衝突する私有 classfile は出しません。jar パスを省略すると `SCALA_LIBRARY_JAR`、`/tmp/scala-rs-lib`、cwd を探します。**`compile` はフラグも環境変数も無いときは私有ランタイムのまま**です。**`scala-rs run` は jar が自動検出できればそれを既定で使い**、見つからなければ私有ランタイムに落ちます。
 
 完成した Scala コンパイラではありません。仕様への完全準拠も主張しません。
 
@@ -40,7 +40,7 @@ scala-rs compile file.scala -d out/
 scala-rs compile file.scala -d out/ --scala-library /path/to/scala-library-2.13.16.jar
 ```
 
-コンパイルしてエントリポイント（`object Main` の `main`）を実行します。`--scala-library` 付きの `run` は jar を `java -cp` に足します。
+コンパイルしてエントリポイント（`object Main` の `main`）を実行します。`--scala-library` 付きの `run` は jar を `java -cp` に足します。**jar が自動検出できるときは `run` が既定でそれを使い**、`compile` は明示しない限り私有ランタイムのままです。
 
 ```bash
 scala-rs run file.scala
@@ -59,7 +59,7 @@ java -cp out:scala-library-2.13.16.jar Main
 - `--parse` — パーサの AST ダンプ
 - `--typer` — namer / typer 後の木のダンプ
 - `-Xfatal-warnings` — warning をエラーにする（非網羅 match など）
-- `--scala-library <jar>` — scala-library 2.13 にリンク（私有 Option/List を出さない）。環境変数 `SCALA_LIBRARY_JAR` でも可
+- `--scala-library <jar>` — scala-library 2.13 にリンク（私有 Option/List を出さない）。環境変数 `SCALA_LIBRARY_JAR` でも可。パス省略時は自動検出。**`compile` の既定は私有ランタイム。`run` の既定は自動検出できた jar**
 
 フィクスチャはデフォルトパッケージ（`package` 句なし）なので、`-cp out` の `Main` でそのまま動く想定です。
 
@@ -91,7 +91,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - `sealed` 階層の match 網羅検査（不足は **warning**。`-Xfatal-warnings` でエラー）
 - extractor の `unapply`（`Option` / `Boolean` / `Tuple2`）と `unapplySeq`（`List` と可変長 `_*`）。名前付き extractor 引数（`Point(y = b, x = a)`）
 - `AnyVal` 値クラス（1 引数。生成は underlying へ erase。メソッドは `name$extension`）
-- Predef の一部: `assert` / `require` / `???` / ArrowAssoc の `->` / `identity` / `locally` / `implicitly` / `any2stringadd`（`1 + "x"`）/ String の `length`・`toInt`（`toLong` / `toDouble` もある）。**`--scala-library`** 時はこれらを jar の `Predef$` / `StringOps` / `Predef$ArrowAssoc` / `Predef$any2stringadd` にリンクする。`Map` / `Vector` は jar リンク時のみ（`empty` / `updated` / `apply` / `get` / `:+` / `foreach`）
+- Predef の一部: `assert` / `require` / `???` / ArrowAssoc の `->` / `identity` / `locally` / `implicitly` / `any2stringadd`（`1 + "x"`）/ String の `length`・`toInt`（`toLong` / `toDouble` もある）。**`--scala-library`** 時はこれらを jar の `Predef$` / `StringOps` / `Predef$ArrowAssoc` / `Predef$any2stringadd` にリンクする。さらに `intWrapper` / `RichInt`（`abs` / `max` / `to` / `until`）、`StringOps` の `*` / `take` / `drop` / `isEmpty`、`Map` / `Vector` の varargs `apply`（`Map(1 -> "a")` / `Vector(1,2,3)`）も jar リンク時のみ
 - 具象 `val` 付き trait の初期化（`T$class.$init$`）と `abstract override` の super 連鎖
 
 フィクスチャで実際に動く範囲は README 末尾の表を見てください。
@@ -190,7 +190,7 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 
 - マクロ
 - コンパイラプラグイン
-- 完全な Scala 標準ライブラリ。`--scala-library` なしでは Option / List / FunctionN / Tuple2 は私有ランタイム。**jar にリンクしても** 完全な StringOps / `Int` enrichment / Map の varargs `apply` / Vector の varargs `apply` などは未対応
+- 完全な Scala 標準ライブラリ。`--scala-library` なしでは Option / List / FunctionN / Tuple2 は私有ランタイム。**jar にリンクしても** 完全な StringOps / 全 numeric enrichment / 任意の `Seq` ファクトリなどは未対応
 - Scala 3 構文
 - implicit の優先度 / `scala.Int` コンパニオンの enrichment
 - 匿名クラス
@@ -221,7 +221,7 @@ Cargo workspace のクレート:
 正直な差分です。
 
 - **規模**: nsc のごく一部。言語仕様を満たしません。
-- **ライブラリ**: デフォルトは私有ランタイム。`--scala-library`（パス省略時は `SCALA_LIBRARY_JAR` / `/tmp/scala-rs-lib` / cwd を探索）で jar にリンクし、同名の私有 classfile は出さない。jar に乗るもの: `Option` / `Some` / `None` / `List` / `Nil` / `::` / `Function0` / `Function1` / `Tuple2` / `NotImplementedError` / `Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）/ `any2stringadd` / `ArrowAssoc` の `->` / `StringOps`（`toInt$extension` / `size$extension` via `augmentString`）/ `WithFilter` / `Iterator` / `Map` / `Vector`。dual-run: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector`。**まだ intrinsic / 私有**: 完全な StringOps、`Int` enrichment、Map/Vector の varargs `apply`。`List.unapplySeq` は library では `SeqOps` の identity。フラグなしは私有ランタイム。
+- **ライブラリ**: デフォルトの **`compile`** は私有ランタイム。`--scala-library`（パス省略時は `SCALA_LIBRARY_JAR` / `/tmp/scala-rs-lib` / cwd を探索）で jar にリンクし、同名の私有 classfile は出さない。**`scala-rs run` は同じ探索で jar が見つかれば既定でリンクする**（見つからなければ私有）。jar に乗るもの: `Option` / `Some` / `None` / `List` / `Nil` / `::` / `Function0` / `Function1` / `Tuple2` / `NotImplementedError` / `Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）/ `any2stringadd` / `ArrowAssoc` の `->` / `intWrapper` / `RichInt`（`abs` / `max` / `min` / `to` / `until`）/ `StringOps`（`toInt$extension` / `size$extension` / `$times$extension` / `take$extension` / `drop$extension` / `isEmpty` via `augmentString`）/ `WithFilter` / `Iterator` / `Map` / `Vector`（`empty` / `updated` / lookup / `:+` / `foreach` / **varargs `apply`**）。dual-run: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector` / `int_ops` / `string_ops`。**まだ intrinsic / 私有**: 完全な StringOps、他の numeric wrapper、`List` の varargs `apply`。`List.unapplySeq` は library では `SeqOps` の identity。`compile` のフラグなしは私有ランタイム。
 - **object**: scalac と同様、`Main$`（モジュール）と静的フォワーダ `Main` を出します。`java Main` が動くのはそのためです。
 - **プリミティブ**: `Int` の `+` などは `scala.Int` のボックスメソッドではなく、JVM 命令（`iadd` など）として出します。
 - **trait**: 抽象メンバーだけの trait は JVM interface です。具象メンバーは `T$class` 静的実装と、C3 線形化順のインスタンスフォワーダです。Java 8 default method は使いません（major 50）。`val` は getter/setter + `$init$` です。`abstract override` は `T$$super$m` です。
@@ -231,7 +231,7 @@ Cargo workspace のクレート:
 - **フェーズ**: nsc の uncurry / mixin / lambdaLift などの独立パスはありません。erasure とラムダのクロージャ変換はあります。
 - **sealed**: 非網羅 match は scalac と同様 warning です。`-Xfatal-warnings` でエラーになります。
 - **AnyVal**: scalac は値クラスのクラスファイルと拡張メソッドの両方を出します。scala-rs もクラスは出しますが、呼び出しは `$extension` 静的メソッドで、`new C(x)` は underlying に消えます。
-- **Predef / StringOps**: 私有では `assert` / `require` / `???` / `->`（`Tuple2` 直結）/ `identity` / `locally` / `implicitly` / `any2stringadd` と String の `length`/`toInt`。library では `Predef$.println/assert/require/???/identity/locally/implicitly`、`any2stringadd.$plus$extension`、`ArrowAssoc.$minus$greater$extension`、`augmentString` → `StringOps.toInt$extension` / `size$extension`（`.length`）。**`StringOps` classfile は出していません。**
+- **Predef / StringOps**: 私有では `assert` / `require` / `???` / `->`（`Tuple2` 直結）/ `identity` / `locally` / `implicitly` / `any2stringadd` と String の `length`/`toInt`/`isEmpty`。library では `Predef$.println/assert/require/???/identity/locally/implicitly`、`any2stringadd.$plus$extension`、`ArrowAssoc.$minus$greater$extension`、`intWrapper` → `RichInt.abs$extension` / `max$extension` / `to$extension`、`augmentString` → `StringOps.toInt$extension` / `size$extension`（`.length`）/ `$times$extension` / `take$extension` / `drop$extension`（`.isEmpty` は StringOps 経由で `String#isEmpty` にインライン）。**`StringOps` / `RichInt` classfile は出していません。**
 - **unapplySeq**: `List` とユーザー定義 extractor、`_*`、名前付き case class パターン。library リンク時の `List.unapplySeq` は `SeqOps` 戻り。
 
 scalac の代替ではありません。サブセットの再実装です。
@@ -244,7 +244,7 @@ cargo test
 
 実行時の期待値は `tests/fixtures/` にあります。各 `.scala` に対して `tests/fixtures/expected/` に同名の `.txt`（`println` と同じ末尾改行付きの stdout）を置いています。`java` がある環境では CLI の e2e が stdout を比較します。
 
-scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコンパイルし、`java -cp out:scala-library.jar Main` でも同じ stdout になることを見ます（私有の `scala/Option.class` / `scala/Predef$.class` 等が無いこと）: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector`。`iterator.scala` / `map.scala` / `vector.scala` は library リンク時のみ（私有ランタイムに `iterator` / `Map` / `Vector` は無い）。
+scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコンパイルし、`java -cp out:scala-library.jar Main` でも同じ stdout になることを見ます（私有の `scala/Option.class` / `scala/Predef$.class` 等が無いこと）: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector` / `int_ops` / `string_ops`。`iterator.scala` / `map.scala` / `vector.scala` / `int_ops.scala` / `string_ops.scala` は library リンク時のみ（私有ランタイムに `iterator` / `Map` / `Vector` / `RichInt` / 拡張 StringOps は無い）。
 
 | フィクスチャ | 内容 | 期待 stdout |
 | --- | --- | --- |
@@ -275,8 +275,10 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `predef.scala` | `assert`/`require`/`toInt`/`->`/`???` | `2` `42` `1` `a` `nyi` |
 | `unapply_seq.scala` | `unapplySeq` / `_*` / 名前付き extractor | `6` `21` `1` `7` |
 | `iterator.scala` | `List.iterator`（library dual-run のみ） | `true` `1` `2` `false` |
-| `map.scala` | `Map.empty` / `updated` / `apply` / `get` / `foreach`（library dual-run のみ） | `a` `a` `a` `b` |
-| `vector.scala` | `Vector.empty` / `:+` / `apply` / `length` / `foreach`（library dual-run のみ） | `1` `2` `2` `1` `2` |
+| `map.scala` | `Map(1 -> "a", 2 -> "b")` の apply / get / foreach（library dual-run のみ） | `a` `b` `a` `a` `b` |
+| `vector.scala` | `Vector(1, 2, 3)` の apply / length / foreach（library dual-run のみ） | `1` `2` `3` `3` `1` `2` `3` |
+| `int_ops.scala` | `intWrapper` / `RichInt` の `abs` / `max` / `to`（library dual-run のみ） | `3` `1` `2` `Range 1 to 3` `1` `2` `3` |
+| `string_ops.scala` | `augmentString` 経由の `*` / `take` / `drop` / `isEmpty`（library dual-run のみ） | `ababab` `he` `llo` `true` `false` |
 | `trait_val.scala` | trait `val` の初期化 | `from trait` |
 | `abstract_override.scala` | `abstract override` の super 連鎖 | `B-A-base` |
 | `predef_more.scala` | `any2stringadd` / `implicitly` / `identity` / `locally` | `1x` `41` `42` `here` |

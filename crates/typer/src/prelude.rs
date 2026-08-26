@@ -174,9 +174,6 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     add_option_members(st, option_wf, library_abi);
     add_list_members(st, with_filter, iterator, library_abi);
     add_function_types(st);
-    if library_abi {
-        add_map_and_vector(st);
-    }
 
     // Some companion with apply
     let some_mod = module(st, st.scala_pkg, "Some", "scala/Some$");
@@ -216,6 +213,15 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         Intrinsic::None,
     );
     let _ = class(st, st.scala_pkg, "Tuple3", "scala/Tuple3", &[Type::AnyRef]);
+
+    let rich_int = if library_abi {
+        Some(add_rich_int_and_range(st))
+    } else {
+        None
+    };
+    if library_abi {
+        add_map_and_vector(st);
+    }
 
     let arrow = if library_abi {
         let a = class(
@@ -266,7 +272,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     };
 
     st.predef = module(st, st.scala_pkg, "Predef", "scala/Predef$");
-    add_predef_members(st, arrow, string_ops, library_abi);
+    add_predef_members(st, arrow, string_ops, rich_int, library_abi);
 
     st.push_scope();
     import_members(st, st.scala_pkg);
@@ -619,7 +625,9 @@ fn add_string_members(st: &mut SymbolTable, library_abi: bool) {
         Type::String,
         Intrinsic::None,
     );
-    method(st, c, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
+    if !library_abi {
+        method(st, c, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
+    }
     method(
         st,
         c,
@@ -832,6 +840,10 @@ fn add_string_ops(st: &mut SymbolTable) -> SymbolId {
     method(st, so, "toDouble", vec![], Type::Double, Intrinsic::None);
     method(st, so, "length", vec![], Type::Int, Intrinsic::None);
     method(st, so, "size", vec![], Type::Int, Intrinsic::None);
+    method(st, so, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
+    method(st, so, "*", vec![Type::Int], Type::String, Intrinsic::None);
+    method(st, so, "take", vec![Type::Int], Type::String, Intrinsic::None);
+    method(st, so, "drop", vec![Type::Int], Type::String, Intrinsic::None);
     so
 }
 
@@ -1079,7 +1091,7 @@ fn add_map_and_vector(st: &mut SymbolTable) {
         st,
         map,
         "foreach",
-        vec![fn1(pair, Type::Unit)],
+        vec![fn1(pair.clone(), Type::Unit)],
         Type::Unit,
         Intrinsic::None,
     );
@@ -1096,6 +1108,28 @@ fn add_map_and_vector(st: &mut SymbolTable) {
         },
         Intrinsic::None,
     );
+    let map_apply = method(
+        st,
+        map_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(pair.clone()))],
+        map_t.clone(),
+        Intrinsic::None,
+    );
+    let mak = type_param(st, map_apply, "K");
+    let mav = type_param(st, map_apply, "V");
+    st.get_mut(map_apply).tparams = vec![mak, mav];
+    let map_pair = Type::Class {
+        sym: tuple2,
+        args: vec![Type::TypeParam(mak), Type::TypeParam(mav)],
+    };
+    st.get_mut(map_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(map_pair))]],
+        ret: Box::new(Type::Class {
+            sym: map,
+            args: vec![Type::TypeParam(mak), Type::TypeParam(mav)],
+        }),
+    };
     let mems = st.get(map_cls).members.clone();
     st.get_mut(map_mod).members.extend(mems);
 
@@ -1164,14 +1198,80 @@ fn add_map_and_vector(st: &mut SymbolTable) {
         },
         Intrinsic::None,
     );
+    let vec_apply = method(
+        st,
+        vec_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        vec_t.clone(),
+        Intrinsic::None,
+    );
+    let vaa = type_param(st, vec_apply, "A");
+    st.get_mut(vec_apply).tparams = vec![vaa];
+    st.get_mut(vec_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(vaa)))]],
+        ret: Box::new(Type::Class {
+            sym: vec,
+            args: vec![Type::TypeParam(vaa)],
+        }),
+    };
     let mems = st.get(vec_cls).members.clone();
     st.get_mut(vec_mod).members.extend(mems);
+}
+
+fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
+    let range = class(
+        st,
+        st.scala_pkg,
+        "Range",
+        "scala/collection/immutable/Range",
+        &[Type::AnyRef],
+    );
+    method(st, range, "length", vec![], Type::Int, Intrinsic::None);
+    method(st, range, "apply", vec![Type::Int], Type::Int, Intrinsic::None);
+    method(
+        st,
+        range,
+        "foreach",
+        vec![fn1(Type::Int, Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    method(st, range, "toString", vec![], Type::String, Intrinsic::None);
+    let ri = class(
+        st,
+        st.scala_pkg,
+        "RichInt",
+        "scala/runtime/RichInt",
+        &[Type::AnyVal],
+    );
+    let f = st.alloc("self", ri, SymKind::Term, Flags::PARAM, "");
+    st.get_mut(f).ty = Type::Int;
+    st.get_mut(ri).ctor_fields = vec![f];
+    method(st, ri, "abs", vec![], Type::Int, Intrinsic::None);
+    method(st, ri, "max", vec![Type::Int], Type::Int, Intrinsic::None);
+    method(st, ri, "min", vec![Type::Int], Type::Int, Intrinsic::None);
+    let range_t = Type::Class {
+        sym: range,
+        args: vec![],
+    };
+    method(st, ri, "to", vec![Type::Int], range_t.clone(), Intrinsic::None);
+    method(
+        st,
+        ri,
+        "until",
+        vec![Type::Int],
+        range_t,
+        Intrinsic::None,
+    );
+    ri
 }
 
 fn add_predef_members(
     st: &mut SymbolTable,
     arrow: SymbolId,
     string_ops: Option<SymbolId>,
+    rich_int: Option<SymbolId>,
     library_abi: bool,
 ) {
     let p = st.predef;
@@ -1408,6 +1508,20 @@ fn add_predef_members(
             Intrinsic::Identity,
         );
         st.get_mut(aug).flags = st.get(aug).flags.with(Flags::IMPLICIT);
+    }
+    if let Some(ri) = rich_int {
+        let wrap = method(
+            st,
+            owner,
+            "intWrapper",
+            vec![Type::Int],
+            Type::Class {
+                sym: ri,
+                args: vec![],
+            },
+            Intrinsic::Identity,
+        );
+        st.get_mut(wrap).flags = st.get(wrap).flags.with(Flags::IMPLICIT);
     }
     let mems = st.get(owner).members.clone();
     st.get_mut(p).members.extend(mems.iter().copied());

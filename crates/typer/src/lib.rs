@@ -532,8 +532,15 @@ object Main {
     val b: Boolean = it.hasNext
     val s: String = 1 + "x"
     val t = 1 -> "a"
-    val m = Map.empty.updated(1, "a")
-    val v = Vector.empty.:+(1)
+    val m = Map(1 -> "a", 2 -> "b")
+    val v = Vector(1, 2, 3)
+    val a: Int = 1.abs
+    val mx: Int = 1.max(2)
+    val r = 1.to(3)
+    val s: String = "ab" * 2
+    val t: String = "hello".take(2)
+    val d: String = "hello".drop(1)
+    val e: Boolean = "".isEmpty
   }
 }
 "#;

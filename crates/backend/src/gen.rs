@@ -267,6 +267,7 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::Tuple(ts) => format!("Lscala/Tuple{};", ts.len()),
         Type::Method { ret, .. } => jvm_desc(st, ret),
         Type::ByName(_) => "Lscala/Function0;".into(),
+        Type::Repeated(_) => "Lscala/collection/immutable/Seq;".into(),
         Type::TypeParam(_) => "Ljava/lang/Object;".into(),
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
             format!("[{}", jvm_desc(st, &args[0]))
@@ -2760,12 +2761,20 @@ fn gen_apply(
     } else {
         Vec::new()
     };
-    for (i, a) in args.iter().enumerate() {
-        gen_expr(asm, frame, ctx, a);
-        if value_owner.is_some() {
-            let pty = param_tys.get(i).unwrap_or(&a.ty);
-            if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
-                emit_box(asm, &a.ty);
+    let repeated = param_tys.last().and_then(|p| match p {
+        Type::Repeated(t) => Some((**t).clone()),
+        _ => None,
+    });
+    if let Some(elem) = repeated {
+        gen_wrap_varargs(asm, frame, ctx, args, &elem);
+    } else {
+        for (i, a) in args.iter().enumerate() {
+            gen_expr(asm, frame, ctx, a);
+            if value_owner.is_some() {
+                let pty = param_tys.get(i).unwrap_or(&a.ty);
+                if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
+                    emit_box(asm, &a.ty);
+                }
             }
         }
     }
@@ -2815,6 +2824,20 @@ fn invoke_value_extension(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
             "scala/collection/StringOps",
             "size$extension",
             "(Ljava/lang/String;)I",
+        );
+        return;
+    }
+    if owner == "scala/collection/StringOps" && s.name == "isEmpty" {
+        // Same as scalac: StringOps.isEmpty is inlined to String#isEmpty.
+        asm.invokevirtual("java/lang/String", "isEmpty", "()Z");
+        return;
+    }
+    if owner == "scala/runtime/RichInt" && s.name == "to" {
+        // 2.13 `to` returns Range$Inclusive, not the abstract Range.
+        asm.invokestatic(
+            "scala/runtime/RichInt",
+            "to$extension",
+            "(II)Lscala/collection/immutable/Range$Inclusive;",
         );
         return;
     }
@@ -2977,6 +3000,50 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
         } else if name == "unapplySeq" && is_list_module_owner(&owner) {
             desc = "(Lscala/collection/SeqOps;)Lscala/collection/SeqOps;".into();
         }
+        if is_stdlib_map_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Map$",
+                        "empty",
+                        "()Lscala/collection/immutable/Map;",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Map$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/immutable/Map");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_vector_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Vector$",
+                        "empty",
+                        "()Lscala/collection/immutable/Vector;",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Vector$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/immutable/Vector");
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_stdlib_map(&owner) {
             match name {
                 "updated" => {
@@ -3033,14 +3100,6 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                     );
                     return;
                 }
-                "empty" => {
-                    asm.invokevirtual(
-                        "scala/collection/immutable/Map$",
-                        "empty",
-                        "()Lscala/collection/immutable/Map;",
-                    );
-                    return;
-                }
                 _ => {}
             }
         }
@@ -3088,14 +3147,6 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "scala/collection/immutable/Vector",
                         "foreach",
                         "(Lscala/Function1;)V",
-                    );
-                    return;
-                }
-                "empty" => {
-                    asm.invokevirtual(
-                        "scala/collection/immutable/Vector$",
-                        "empty",
-                        "()Lscala/collection/immutable/Vector;",
                     );
                     return;
                 }
@@ -3160,22 +3211,77 @@ fn is_stdlib_map(owner: &str) -> bool {
     matches!(
         owner,
         "scala/collection/immutable/Map"
-            | "scala/collection/immutable/Map$"
             | "scala/collection/immutable/Map$EmptyMap$"
             | "scala/collection/immutable/HashMap"
     )
+}
+
+fn is_stdlib_map_module(owner: &str) -> bool {
+    owner == "scala/collection/immutable/Map$"
 }
 
 fn is_stdlib_vector(owner: &str) -> bool {
     matches!(
         owner,
         "scala/collection/immutable/Vector"
-            | "scala/collection/immutable/Vector$"
             | "scala/collection/immutable/Vector0$"
             | "scala/collection/immutable/Vector1"
             | "scala/collection/immutable/Vector2"
             | "scala/collection/immutable/Vector3"
     )
+}
+
+fn is_stdlib_vector_module(owner: &str) -> bool {
+    owner == "scala/collection/immutable/Vector$"
+}
+
+fn gen_wrap_varargs(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    args: &[Tree],
+    elem: &Type,
+) {
+    let n = args.len() as i32;
+    let all_int = !args.is_empty()
+        && args.iter().all(|a| matches!(a.ty, Type::Int))
+        && matches!(elem, Type::Int | Type::Any | Type::AnyRef | Type::TypeParam(_));
+    asm.getstatic(
+        "scala/runtime/ScalaRunTime$",
+        "MODULE$",
+        "Lscala/runtime/ScalaRunTime$;",
+    );
+    asm.iconst(n);
+    if all_int {
+        asm.newarray(10); // T_INT
+        for (i, a) in args.iter().enumerate() {
+            asm.dup();
+            asm.iconst(i as i32);
+            gen_expr(asm, frame, ctx, a);
+            asm.iastore();
+        }
+        asm.invokevirtual(
+            "scala/runtime/ScalaRunTime$",
+            "wrapIntArray",
+            "([I)Lscala/collection/immutable/ArraySeq;",
+        );
+    } else {
+        asm.anewarray("java/lang/Object");
+        for (i, a) in args.iter().enumerate() {
+            asm.dup();
+            asm.iconst(i as i32);
+            gen_expr(asm, frame, ctx, a);
+            if is_jvm_primitive(&a.ty) {
+                emit_box(asm, &a.ty);
+            }
+            asm.aastore();
+        }
+        asm.invokevirtual(
+            "scala/runtime/ScalaRunTime$",
+            "wrapRefArray",
+            "([Ljava/lang/Object;)Lscala/collection/immutable/ArraySeq;",
+        );
+    }
 }
 
 fn load_predef_module(asm: &mut Assembler) {

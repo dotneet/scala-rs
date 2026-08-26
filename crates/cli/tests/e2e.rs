@@ -302,6 +302,16 @@ fn scala_library_dual_run_vector() {
     dual_run_fixture("vector");
 }
 
+#[test]
+fn scala_library_dual_run_int_ops() {
+    dual_run_fixture("int_ops");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops() {
+    dual_run_fixture("string_ops");
+}
+
 const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Option.class",
     "scala/Some.class",
@@ -327,6 +337,8 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/immutable/Vector$.class",
     "scala/Predef$any2stringadd.class",
     "scala/Predef$ArrowAssoc.class",
+    "scala/runtime/RichInt.class",
+    "scala/collection/immutable/Range.class",
 ];
 
 fn assert_no_private_stdlib(out: &Path) {
@@ -410,6 +422,31 @@ fn cli_run_hello() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         expected_stdout("hello")
+    );
+}
+
+#[test]
+fn cli_run_uses_auto_found_scala_library() {
+    if !java_available() {
+        return;
+    }
+    let Some(_) = scala_library_jar() else {
+        eprintln!("skip run autodetect: jar not obtainable");
+        return;
+    };
+    let src = fixtures_dir().join("int_ops.scala");
+    let output = Command::new(bin())
+        .args(["run", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "run without --scala-library should use auto-found jar: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("int_ops")
     );
 }
 
