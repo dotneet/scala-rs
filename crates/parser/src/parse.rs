@@ -179,13 +179,10 @@ impl<'a> Parser<'a> {
             self.bump();
             self.skip_nl();
             if matches!(self.kind(), TokenKind::Object) {
-                // package object — treat as module under package later; for now
-                // parse as ModuleDef named `package`.
-                let obj = self.parse_object_rest(Modifiers::new(Flags::PACKAGE), pkg_span, true);
-                let stats = vec![obj];
+                let pkg_obj = self.parse_package_object(pkg_span);
                 self.skip_nl_semi();
                 let rest = self.parse_top_stats();
-                let mut all = stats;
+                let mut all = vec![pkg_obj];
                 all.extend(rest);
                 let pid = self.alloc(pkg_span, TreeKind::Ident { name: "_root_".into() });
                 return self.alloc(
@@ -260,7 +257,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.skip_nl();
                 if matches!(self.kind(), TokenKind::Object) {
-                    stats.push(self.parse_object_rest(Modifiers::new(Flags::PACKAGE), lo, true));
+                    stats.push(self.parse_package_object(lo));
                 } else {
                     let pid = self.parse_path();
                     self.skip_nl();
@@ -546,6 +543,7 @@ impl<'a> Parser<'a> {
             TokenKind::Val | TokenKind::Var => self.parse_val_def(mods),
             TokenKind::Def => self.parse_def_def(mods),
             TokenKind::TypeKw => self.parse_type_def(mods),
+            TokenKind::Import => self.parse_import(),
             TokenKind::Macro => self.unimplemented(self.span(), "macros"),
             TokenKind::Case => {
                 // leftover `case` that is a match case at top level — error
@@ -609,6 +607,29 @@ impl<'a> Parser<'a> {
         self.alloc(
             lo.merge(self.prev_span()),
             TreeKind::ModuleDef { mods, name, impl_ },
+        )
+    }
+
+    /// `package object p { ... }` → `package p { object package { ... } }`.
+    fn parse_package_object(&mut self, lo: Span) -> Tree {
+        self.bump(); // object
+        let (pkg_name, _) = self.expect_ident();
+        let impl_ = self.parse_template_opt(false);
+        let pid = self.alloc(lo, TreeKind::Ident { name: pkg_name });
+        let module = self.alloc(
+            lo.merge(self.prev_span()),
+            TreeKind::ModuleDef {
+                mods: Modifiers::new(Flags::PACKAGE.with(Flags::MODULE)),
+                name: "package".into(),
+                impl_,
+            },
+        );
+        self.alloc(
+            lo.merge(self.prev_span()),
+            TreeKind::PackageDef {
+                pid: Box::new(pid),
+                stats: vec![module],
+            },
         )
     }
 

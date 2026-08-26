@@ -152,10 +152,20 @@ pub struct Method {
 }
 
 #[derive(Clone, Debug)]
+pub struct ExceptionEntry {
+    pub start_pc: u16,
+    pub end_pc: u16,
+    pub handler_pc: u16,
+    /// Constant-pool Class index, or `0` for catch-all / finally.
+    pub catch_type: u16,
+}
+
+#[derive(Clone, Debug)]
 pub struct Code {
     pub max_stack: u16,
     pub max_locals: u16,
     pub bytes: Vec<u8>,
+    pub exceptions: Vec<ExceptionEntry>,
 }
 
 pub struct ClassEmit {
@@ -218,7 +228,13 @@ impl ClassEmit {
                 body.extend_from_slice(&c.max_locals.to_be_bytes());
                 body.extend_from_slice(&(c.bytes.len() as u32).to_be_bytes());
                 body.extend_from_slice(&c.bytes);
-                body.extend_from_slice(&0u16.to_be_bytes());
+                body.extend_from_slice(&(c.exceptions.len() as u16).to_be_bytes());
+                for e in &c.exceptions {
+                    body.extend_from_slice(&e.start_pc.to_be_bytes());
+                    body.extend_from_slice(&e.end_pc.to_be_bytes());
+                    body.extend_from_slice(&e.handler_pc.to_be_bytes());
+                    body.extend_from_slice(&e.catch_type.to_be_bytes());
+                }
                 body.extend_from_slice(&0u16.to_be_bytes());
                 out.extend_from_slice(&(body.len() as u32).to_be_bytes());
                 out.extend_from_slice(&body);

@@ -75,8 +75,9 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）
 - `s"..."` 文字列補間
 - `lazy val`
-- implicit val / def（ローカルとコンパニオン）、implicit パラメータ、スコープ内の implicit conversion
+- implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む
 - デフォルト引数、by-name パラメータ（`=> T`）
+- 名前付き引数（呼び出し側で並べ替え）
 
 フィクスチャで実際に動く範囲は README 末尾の表を見てください。
 
@@ -94,10 +95,11 @@ erasure は typer と backend のあいだの独立パスです。型引数を�
 
 nsc に寄せた探索順です。偽の「何でも変換」はありません。
 
-1. 現在のスコープと、囲んでいるクラス / object の `implicit` メンバー
-2. 目標型（変換なら元の型も）のコンパニオンオブジェクトの `implicit` メンバー
+1. 現在のスコープと、囲んでいるクラス / object の `implicit` メンバー（`import Foo._` で入れたメンバーを含む）
+2. 囲んでいるパッケージのパッケージオブジェクト（`package object p` の implicit メンバー）
+3. 目標型（変換なら元の型も）のコンパニオンオブジェクトの `implicit` メンバー
 
-パッケージオブジェクトはまだ探しません。
+呼び出し側で implicit パラメータ節を明示できます: `add(5)(3)` / `foo(x)(ev)`。探索で埋めるのは、その節が省略されたときだけです。
 
 数値の widening（`Int` → `Long` / `Double` など）は **implicit 探索の前** に特別扱いします。scalac の implicit ではなく、typer の組み込みです。
 
@@ -118,10 +120,11 @@ nsc に寄せた探索順です。偽の「何でも変換」はありません�
 - コンパイラプラグイン
 - 完全な Scala 標準ライブラリ（ここにある Option / List は scala-rs ランタイムであり、scala-library ではない）
 - Scala 3 構文
-- パッケージオブジェクトを含む完全な implicit scope
 - implicit の優先度 / `Predef` の全変換 / `scala.Int` コンパニオンの enrichment
-- 明示的な第二パラメータ節での implicit 渡し（`add(3)(ev)`）は未対応。探索で埋める側だけ
-- 内部クラス / 匿名クラス
+- 具象メンバー付き trait の mixin / 線形化（`$class` 実装クラスとフォワーダ）。抽象メンバーだけの trait は JVM interface として動く
+- `try` / `catch` / `finally` の JVM 例外テーブル（パーサと typer はある。Code 属性のテーブル枠は出した。ハンドラ本体の生成は未了）
+- 内部クラス / ネストした object の実行（ネストした定義はパース・ネーミングする）
+- 匿名クラス
 - XML リテラル
 - existential types
 - view bounds
@@ -152,7 +155,8 @@ Cargo workspace のクレート:
 - **ライブラリ**: scala-library を同梱しません。`Predef.println`、プリミティブ演算、およびコンパイラが出す Option / List / FunctionN ランタイムだけです。`java -cp out:scala-library.jar` で混ぜる想定ではありません。
 - **object**: scalac と同様、`Main$`（モジュール）と静的フォワーダ `Main` を出します。`java Main` が動くのはそのためです。
 - **プリミティブ**: `Int` の `+` などは `scala.Int` のボックスメソッドではなく、JVM 命令（`iadd` など）として出します。
-- **trait**: 抽象メンバーだけの trait は JVM interface として出します。具象メンバー付き trait の完全な線形化・実装クラスは載せていません。
+- **trait**: 抽象メンバーだけの trait は JVM interface として出します。具象メンバー付き trait の `$class` 実装クラスと線形化フォワーダはまだ出していません。
+- **名前付き引数**: 呼び出し側で `f(b = 2, a = 1)` を並べ替えます。巨大な rewrite フェーズはありません。
 - **ラムダ**: `FunctionN` を実装する合成クラス（`Main$$$anonfun$0` など）です。invokedynamic / LambdaMetaFactory は使いません（Java 6）。
 - **フェーズ**: nsc の uncurry / mixin / lambdaLift などの独立パスはありません。erasure とラムダのクロージャ変換はあります。
 

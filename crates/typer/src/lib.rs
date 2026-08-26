@@ -248,4 +248,50 @@ object Main {
 "#,
         );
     }
+
+    #[test]
+    fn explicit_implicit_arg_list() {
+        ok(
+            r#"
+object Main {
+  def add(x: Int)(implicit y: Int): Int = x + y
+  def main(args: Array[String]): Unit = {
+    val n: Int = add(5)(3)
+  }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn named_arguments_reorder() {
+        ok(
+            r#"
+object Main {
+  def pair(a: Int, b: Int): Int = a + b
+  def main(args: Array[String]): Unit = {
+    val n: Int = pair(b = 2, a = 1)
+  }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn imported_implicits() {
+        ok(
+            r#"
+object Inc {
+  implicit val k: Int = 10
+}
+object Main {
+  import Inc._
+  def show(x: Int)(implicit n: Int): Int = x + n
+  def main(args: Array[String]): Unit = {
+    val n: Int = show(1)
+  }
+}
+"#,
+        );
+    }
 }

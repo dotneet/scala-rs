@@ -1,6 +1,6 @@
 //! Bytecode assembler with stack-depth tracking and backpatching jumps.
 
-use crate::classfile::{Code, Pool};
+use crate::classfile::{Code, ExceptionEntry, Pool};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Label(pub usize);
@@ -13,6 +13,7 @@ pub struct Assembler {
     pub max_locals: u16,
     patches: Vec<(usize, Label)>, // offset of u16 jump, label
     labels: Vec<Option<u16>>,
+    exceptions: Vec<(Label, Label, Label, Option<String>)>,
 }
 
 impl Assembler {
@@ -29,6 +30,7 @@ impl Assembler {
             max_locals,
             patches: Vec::new(),
             labels: Vec::new(),
+            exceptions: Vec::new(),
         }
     }
 
@@ -50,6 +52,21 @@ impl Assembler {
 
     pub fn mark(&mut self, l: Label) {
         self.labels[l.0] = Some(self.bytes.len() as u16);
+    }
+
+    /// Record a JVM exception-table entry. `end` is exclusive. `catch` is an
+    /// internal class name, or `None` for catch-all (finally / any).
+    pub fn exception(&mut self, start: Label, end: Label, handler: Label, catch: Option<&str>) {
+        self.exceptions
+            .push((start, end, handler, catch.map(str::to_string)));
+    }
+
+    /// Handler entry: the JVM pushes the exception object. Reset tracked stack.
+    pub fn enter_handler(&mut self) {
+        self.stack = 1;
+        if self.stack > self.max_stack {
+            self.max_stack = self.stack;
+        }
     }
 
     fn emit_op(&mut self, op: u8) {
@@ -491,10 +508,28 @@ impl Assembler {
             self.bytes[at] = b[0];
             self.bytes[at + 1] = b[1];
         }
+        let mut exceptions = Vec::new();
+        let pending = self.exceptions.clone();
+        for (start, end, handler, catch) in pending {
+            let start_pc = self.labels[start.0].unwrap_or(0);
+            let end_pc = self.labels[end.0].unwrap_or(0);
+            let handler_pc = self.labels[handler.0].unwrap_or(0);
+            let catch_type = match catch {
+                Some(c) => self.pool.class(&c),
+                None => 0,
+            };
+            exceptions.push(ExceptionEntry {
+                start_pc,
+                end_pc,
+                handler_pc,
+                catch_type,
+            });
+        }
         let code = Code {
             max_stack: self.max_stack.max(1) as u16,
             max_locals: self.max_locals.max(1),
             bytes: self.bytes,
+            exceptions,
         };
         (code, self.pool)
     }

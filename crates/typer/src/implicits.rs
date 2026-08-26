@@ -1,6 +1,6 @@
-//! First-cut implicit resolution, modeled after nsc's implicit scope:
-//! in-scope implicit vals/defs, then companions of the target (and, for
-//! conversions, of the source type). Package objects are not searched yet.
+//! In-scope implicit vals/defs, companions of the target (and source for
+//! conversions), imported implicits, and package objects of the enclosing package.
+//! `no implicit` / `ambiguous implicit` are hard errors.
 
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_span::Span;
@@ -33,6 +33,31 @@ impl Typer {
                 if self.st.get(m).flags.contains(Flags::IMPLICIT) && seen.insert(m.0) {
                     out.push(m);
                 }
+            }
+            // Package object of the enclosing package (members copied onto the
+            // package symbol, plus the `package` module itself).
+            let mut owner = self.st.get(self.st.this_class).owner;
+            while !owner.is_none() {
+                let o = self.st.get(owner);
+                if o.kind == crate::symbol::SymKind::Package {
+                    for m in o.members.clone() {
+                        if self.st.get(m).flags.contains(Flags::IMPLICIT) && seen.insert(m.0) {
+                            out.push(m);
+                        }
+                        if self.st.get(m).name == "package" {
+                            let mcls = self.st.module_class_of(m);
+                            for mem in self.st.get(mcls).members.clone() {
+                                if self.st.get(mem).flags.contains(Flags::IMPLICIT)
+                                    && seen.insert(mem.0)
+                                {
+                                    out.push(mem);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                owner = o.owner;
             }
         }
         out

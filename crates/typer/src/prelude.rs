@@ -22,6 +22,33 @@ pub fn install_prelude(st: &mut SymbolTable) {
     let _ = (float, char_s);
 
     st.string_sym = class(st, java_lang, "String", "java/lang/String", &[Type::AnyRef]);
+    let throwable = class(
+        st,
+        java_lang,
+        "Throwable",
+        "java/lang/Throwable",
+        &[Type::AnyRef],
+    );
+    let exception = class(
+        st,
+        java_lang,
+        "Exception",
+        "java/lang/Exception",
+        &[Type::Class {
+            sym: throwable,
+            args: vec![],
+        }],
+    );
+    let _runtime_ex = class(
+        st,
+        java_lang,
+        "RuntimeException",
+        "java/lang/RuntimeException",
+        &[Type::Class {
+            sym: exception,
+            args: vec![],
+        }],
+    );
     st.array_sym = class(st, st.scala_pkg, "Array", "[java/lang/Object", &[Type::AnyRef]);
     st.option_sym = class(st, st.scala_pkg, "Option", "scala/Option", &[Type::AnyRef]);
     st.some_sym = class(
