@@ -1990,6 +1990,7 @@ impl Typer {
             tree.ty = Type::Error;
             return;
         }
+        found = self.drop_overridden(found);
         let subst = |ty: Type| -> Type {
             if let Type::Class { args, .. } = &qual.ty {
                 if !args.is_empty() {
@@ -2034,6 +2035,38 @@ impl Typer {
                     .collect(),
             );
         }
+    }
+
+    /// Prefer a definition on a subclass over the inherited member it overrides.
+    fn drop_overridden(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
+        if found.len() <= 1 {
+            return found;
+        }
+        found
+            .iter()
+            .copied()
+            .filter(|&s| {
+                let owner = self.st.get(s).owner;
+                !found.iter().any(|&other| {
+                    if other == s {
+                        return false;
+                    }
+                    let oo = self.st.get(other).owner;
+                    if oo == owner {
+                        return false;
+                    }
+                    let child = Type::Class {
+                        sym: oo,
+                        args: vec![],
+                    };
+                    let parent = Type::Class {
+                        sym: owner,
+                        args: vec![],
+                    };
+                    self.st.is_sub_type(&child, &parent)
+                })
+            })
+            .collect()
     }
 
     /// When a member exists on the receiver (e.g. `Int.+`) but the argument

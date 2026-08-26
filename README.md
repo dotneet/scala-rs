@@ -324,7 +324,7 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `self_type.scala` | `self: Foo =>` の mixin と self type メンバー | `15` |
 | `variance.scala` | `class Box[+A](val value: A)` | `42` |
 
-implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` / `implicit_ambiguous_parents.scala` のコンパイル失敗で見ています。境界付き存在型は `existential_bounds.scala` で診断します。クラス型パラメータの view bounds は `view_bounds_class.scala` で診断します。パス依存型は `type_proj_bad.scala`、self type の不正 mixin は `self_type_bad.scala`、共変パラメータの `var` は `variance_bad.scala`、高階 / 境界付き型メンバーは `type_member_hk.scala` / `type_member_bounds.scala` で診断します。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします（vals / パラメータ付き defs / 型パラメータを pickle から読む）。`scalac` が PATH にあれば、同じ classfile に対して 2.13 が tiny file を typecheck することを見ます。この環境には `scalac` は入っていません（巨大なセットアップなしで取れなければスキップ）。コンパイルを成功扱いにしていません。
+implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` / `implicit_ambiguous_parents.scala` のコンパイル失敗で見ています。境界付き存在型は `existential_bounds.scala` で診断します。クラス型パラメータの view bounds は `view_bounds_class.scala` で診断します。パス依存型は `type_proj_bad.scala`、self type の不正 mixin は `self_type_bad.scala`、共変パラメータの `var` は `variance_bad.scala`、高階 / 境界付き型メンバーは `type_member_hk.scala` / `type_member_bounds.scala` で診断します。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします（vals / パラメータ付き defs / 型パラメータを pickle から読む）。`scalac` 2.13 は PATH、`/tmp/scala-2.13.16`、または公式 tarball（約 20MB）で取れれば、同じ classfile に対して tiny file（`Lib.greet("Scala", "!")`）を typecheck します。full nsc pickle ではないので、scalac から見た defaults / vals / 型引数までは主張しません。取れなければスキップします。コンパイルを成功扱いにしていません。
 
 ## ライセンス
 

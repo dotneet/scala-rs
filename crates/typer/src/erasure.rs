@@ -3,6 +3,7 @@
 //! backend does not have to guess at call sites.
 
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
+use std::collections::HashSet;
 
 use crate::symbol::SymbolTable;
 
@@ -28,8 +29,74 @@ fn erase_symbols(st: &mut SymbolTable) {
             continue;
         }
         let ty = st.get(id).ty.clone();
-        st.get_mut(id).ty = erase_ty(&ty, st);
+        let erased = if kind == crate::symbol::SymKind::Method {
+            erase_overriding_method(st, id, &ty)
+        } else {
+            erase_ty(&ty, st)
+        };
+        st.get_mut(id).ty = erased;
     }
+}
+
+fn erase_overriding_method(st: &SymbolTable, id: SymbolId, ty: &Type) -> Type {
+    let erased = erase_ty(ty, st);
+    let Some(ov) = find_overridden_method(st, id) else {
+        return erased;
+    };
+    let ov_ret = match &st.get(ov).ty {
+        Type::Method { ret, .. } | Type::Function { ret, .. } => erase_ty(ret, st),
+        t => erase_ty(t, st),
+    };
+    let our_ret = match &erased {
+        Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
+        t => t.clone(),
+    };
+    if is_ref_erased(&ov_ret) && is_primitive(&our_ret) {
+        match erased {
+            Type::Method { paramss, .. } => Type::Method {
+                paramss,
+                ret: Box::new(ov_ret),
+            },
+            Type::Function { params, .. } => Type::Function {
+                params,
+                ret: Box::new(ov_ret),
+            },
+            other => other,
+        }
+    } else {
+        erased
+    }
+}
+
+fn find_overridden_method(st: &SymbolTable, id: SymbolId) -> Option<SymbolId> {
+    let s = st.get(id);
+    if s.kind != crate::symbol::SymKind::Method {
+        return None;
+    }
+    let name = s.name.clone();
+    let owner = s.owner;
+    if owner.is_none() {
+        return None;
+    }
+    let mut work = st.get(owner).parents.clone();
+    let mut seen = HashSet::new();
+    seen.insert(owner.0);
+    while let Some(p) = work.pop() {
+        let Some(pid) = st.class_sym_of(&p) else {
+            continue;
+        };
+        if !seen.insert(pid.0) {
+            continue;
+        }
+        for m in &st.get(pid).members {
+            let mem = st.get(*m);
+            if mem.kind == crate::symbol::SymKind::Method && mem.name == name && *m != id {
+                return Some(*m);
+            }
+        }
+        work.extend(st.get(pid).parents.clone());
+    }
+    None
 }
 
 pub fn erase_type(ty: &Type) -> Type {
@@ -207,6 +274,12 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 }
             }
             erase_tree(tpt, st, None);
+            if !tree.sym.is_none() {
+                let sty = st.get(tree.sym).ty.clone();
+                if !matches!(sty, Type::NoType | Type::Error) {
+                    tree.ty = sty;
+                }
+            }
             let ret = match &tree.ty {
                 Type::Method { ret, .. } => Some(erase_ty(ret, st)),
                 _ => None,
@@ -301,6 +374,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                         && !matches!(orig, Type::Unit)
                     {
                         tree.ty = ret_erased;
+                        wrap_unbox(tree, orig);
                         adapt_box_unbox(tree, expected);
                         return;
                     }

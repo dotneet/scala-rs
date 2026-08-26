@@ -916,7 +916,8 @@ impl<'a> Parser<'a> {
             self.skip_nl();
             if matches!(self.kind(), TokenKind::Colon) {
                 self.bump();
-                self_tpt = Some(Box::new(self.parse_type()));
+                // Infix/compound type only: `self: Foo =>` must not parse `=>` as `Function1`.
+                self_tpt = Some(Box::new(self.parse_infix_type()));
             }
             self.skip_nl();
             self.expect("=>", |k| matches!(k, TokenKind::Arrow));
