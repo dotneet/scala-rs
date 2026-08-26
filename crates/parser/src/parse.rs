@@ -478,6 +478,17 @@ impl<'a> Parser<'a> {
                         mix: None,
                     },
                 );
+            } else if matches!(self.kind(), TokenKind::TypeKw) {
+                // `p.type` — stop so the type parser's singleton loop can
+                // also attach `#` / `[T]` after we return. The Dot is already
+                // consumed; build the singleton here.
+                let sp = self.span();
+                self.bump();
+                t = self.alloc(
+                    t.span.merge(sp),
+                    TreeKind::SingletonTypeTree { ref_: Box::new(t) },
+                );
+                break;
             } else {
                 let (name, sp) = self.expect_ident();
                 t = self.alloc(
