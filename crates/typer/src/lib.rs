@@ -3,10 +3,12 @@ mod erasure;
 mod implicits;
 mod prelude;
 mod symbol;
+mod uncurry;
 
 pub use check::{find_mains, has_errors, typecheck, typecheck_opts, TypecheckOptions, Typer};
 pub use erasure::{erase, erase_type};
 pub use symbol::{Intrinsic, SymKind, Symbol, SymbolTable};
+pub use uncurry::uncurry;
 
 use scala_rs_parser::{parse_str, Tree};
 
@@ -563,6 +565,12 @@ object Main {
     val el = Left("err")
     val leftish: Boolean = el.isLeft
     val or: Any = ei.getOrElse(0)
+    val tr = Try(1)
+    val tm = tr.map((x: Int) => x + 1)
+    val tg: Any = tm.getOrElse(0)
+    val su = Success(2)
+    val fail = Failure(new RuntimeException())
+    val fo: Any = fail.getOrElse(0)
   }
 }
 "#;
@@ -578,5 +586,52 @@ object Main {
             "type errors: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn anonymous_class_typechecks() {
+        ok(r#"
+trait Greeter {
+  def greet(name: String): String
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val g: Greeter = new Greeter { def greet(name: String): String = "Hello, " + name }
+    println(g.greet("Scala"))
+    val a = new { def msg: String = "anon" }
+    println(a.msg)
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn eta_and_uncurry_typecheck() {
+        let src = r#"
+object Main {
+  def inc(x: Int): Int = x + 1
+  def add(x: Int)(y: Int): Int = x + y
+  def main(args: Array[String]): Unit = {
+    val xs = 1 :: 2 :: Nil
+    val a = xs.map(inc)
+    val b = xs.map(inc _)
+    val c = xs.map(add(10))
+    val n: Int = add(1)(2)
+  }
+}
+"#;
+        let (mut t, mut st, diags) = typecheck_str(src);
+        assert!(
+            !has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        crate::uncurry(&mut t, &mut st);
+        let dump = scala_rs_parser::dump_tree(&t);
+        assert!(
+            !dump.contains("paramss[1]"),
+            "uncurry should flatten nested param lists: {dump}"
+        );
+        assert!(dump.contains("Function"), "eta-expansion should yield Function: {dump}");
     }
 }

@@ -179,4 +179,24 @@ object Main {
         let dump = dump_tree(&t);
         assert!(dump.contains("Try"), "{dump}");
     }
+
+    #[test]
+    fn eta_expansion_and_anonymous_new() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def inc(x: Int): Int = x + 1
+  def main(args: Array[String]): Unit = {
+    val f = inc _
+    val g = new Greeter { def greet(name: String): String = name }
+    val a = new { def x: Int = 1 }
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Typed"), "eta `inc _` should parse as Typed: {dump}");
+        assert!(dump.contains("Function"), "{dump}");
+        assert!(dump.contains("$anon"), "anonymous class: {dump}");
+    }
 }
