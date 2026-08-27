@@ -772,6 +772,12 @@ fn java_method_flags(m: &crate::javaclass::JavaMethod) -> Flags {
     if m.name == "<init>" {
         flags = flags.with(Flags::CONSTRUCTOR);
     }
+    // scala.jdk.CollectionConverters implicit classes compile to 1-arg
+    // `ListHasAsScala` / `SeqHasAsJava` methods. Mark them so extension
+    // search can apply the real jar converters (no fake Buffer/List).
+    if m.name.contains("HasAsScala") || m.name.contains("HasAsJava") {
+        flags = flags.with(Flags::IMPLICIT);
+    }
     flags
 }
 
