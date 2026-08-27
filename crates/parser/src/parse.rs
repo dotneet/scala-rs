@@ -27,7 +27,7 @@ fn annotation_compiler_unsupported(path: &str) -> bool {
     let simple = path.rsplit('.').next().unwrap_or(path);
     matches!(
         simple,
-        "inline" | "specialized" | "unspecialized" | "elidable" | "switch" | "strictfp" | "native"
+        "inline" | "specialized" | "unspecialized" | "elidable" | "strictfp" | "native"
     )
 }
 
@@ -1649,6 +1649,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `x: @switch` — annotation ascription with no underlying type tree.
+    fn parse_annot_ascription(&mut self) -> Tree {
+        let mut t = self.empty(self.span());
+        while matches!(self.kind(), TokenKind::At) {
+            self.bump();
+            let annot = self.parse_simple_expr();
+            t = self.alloc(
+                t.span.merge(self.prev_span()),
+                TreeKind::AnnotatedTypeTree {
+                    tpt: Box::new(t),
+                    annot: Box::new(annot),
+                },
+            );
+        }
+        t
+    }
+
     fn parse_annot_type(&mut self) -> Tree {
         let mut t = self.parse_simple_type();
         while matches!(self.kind(), TokenKind::At) {
@@ -1939,14 +1956,25 @@ impl<'a> Parser<'a> {
                 }
                 if matches!(self.kind(), TokenKind::Colon) {
                     self.bump();
-                    let tpt = self.parse_type();
-                    return self.alloc(
+                    // nsc Ascription ::= COLON InfixType | COLON Annotation {Annotation}
+                    // so `(n: @switch) match` / `n: @switch match` typecheck.
+                    let tpt = if matches!(self.kind(), TokenKind::At) {
+                        self.parse_annot_ascription()
+                    } else {
+                        self.parse_type()
+                    };
+                    let typed = self.alloc(
                         t.span.merge(tpt.span),
                         TreeKind::Typed {
                             expr: Box::new(t),
                             tpt: Box::new(tpt),
                         },
                     );
+                    self.skip_nl();
+                    if matches!(self.kind(), TokenKind::Match) {
+                        return self.parse_match_rest(typed);
+                    }
+                    return typed;
                 }
                 t
             }

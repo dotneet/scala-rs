@@ -327,6 +327,24 @@ object Main {
     }
 
     #[test]
+    fn switch_ascription_parses() {
+        let t = parse_ok(
+            r#"
+import scala.annotation.switch
+object Main {
+  def f(n: Int): Int = (n: @switch) match {
+    case 0 => 1
+    case 1 => 2
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("AnnotatedType"), "expected @switch ascription: {dump}");
+        assert!(dump.contains("Match"), "{dump}");
+    }
+
+    #[test]
     fn new_type_args_then_select_is_term() {
         // nsc: `new Q[Int].enqueue(1)` is `(new Q[Int]).enqueue(1)`, not a
         // type projection `Q[Int].enqueue`.

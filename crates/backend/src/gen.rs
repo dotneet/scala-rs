@@ -6106,6 +6106,9 @@ fn gen_match(
     let sel_sort = jvm_sort(&selector.ty);
     let tmp = frame.alloc_tmp(sel_sort);
     store(asm, tmp, sel_sort);
+    if gen_int_switch(asm, frame, ctx, selector, cases, result_ty, tmp, sel_sort) {
+        return;
+    }
     let end = asm.fresh_label();
     for c in cases {
         let fail = asm.fresh_label();
@@ -6124,6 +6127,135 @@ fn gen_match(
     }
     throw_runtime(asm, "match error");
     asm.mark(end);
+}
+
+enum SwitchPat {
+    Key(i32),
+    Default,
+}
+
+fn switch_pat_key(pat: &Tree) -> Option<SwitchPat> {
+    match &pat.kind {
+        TreeKind::Literal { lit: Lit::Int(n) } => Some(SwitchPat::Key(*n)),
+        TreeKind::Literal { lit: Lit::Char(c) } => Some(SwitchPat::Key(*c as i32)),
+        TreeKind::Wildcard | TreeKind::Empty => Some(SwitchPat::Default),
+        TreeKind::Ident { name } => {
+            let is_varid = name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_lowercase() || c == '_');
+            if is_varid {
+                Some(SwitchPat::Default)
+            } else {
+                None
+            }
+        }
+        TreeKind::Bind { body, .. } => switch_pat_key(body),
+        TreeKind::Typed { expr, .. } => switch_pat_key(expr),
+        _ => None,
+    }
+}
+
+fn peel_type_annot<'a>(ty: &'a Type) -> &'a Type {
+    match ty {
+        Type::Annotated { tpe, .. } => peel_type_annot(tpe),
+        t => t,
+    }
+}
+
+fn gen_int_switch(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    selector: &Tree,
+    cases: &[scala_rs_parser::CaseDef],
+    result_ty: &Type,
+    tmp: u16,
+    sel_sort: JvmSort,
+) -> bool {
+    if sel_sort != JvmSort::Int {
+        return false;
+    }
+    let core = peel_type_annot(&selector.ty);
+    if !matches!(core, Type::Int | Type::Char) {
+        return false;
+    }
+    let mut keys: Vec<(i32, usize)> = Vec::new();
+    let mut default_idx: Option<usize> = None;
+    for (i, c) in cases.iter().enumerate() {
+        if !c.guard.is_empty() {
+            return false;
+        }
+        match switch_pat_key(&c.pat) {
+            Some(SwitchPat::Key(k)) => {
+                if keys.iter().any(|(ek, _)| *ek == k) {
+                    return false;
+                }
+                keys.push((k, i));
+            }
+            Some(SwitchPat::Default) => {
+                if default_idx.is_some() {
+                    return false;
+                }
+                default_idx = Some(i);
+            }
+            None => return false,
+        }
+    }
+    if keys.is_empty() {
+        return false;
+    }
+    let mut case_labs: Vec<crate::code::Label> = Vec::new();
+    for _ in cases {
+        case_labs.push(asm.fresh_label());
+    }
+    let miss = asm.fresh_label();
+    let end = asm.fresh_label();
+    let def_lab = default_idx.map(|i| case_labs[i]).unwrap_or(miss);
+    load(asm, tmp, sel_sort);
+    let lo = keys.iter().map(|(k, _)| *k).min().unwrap();
+    let hi = keys.iter().map(|(k, _)| *k).max().unwrap();
+    let n = keys.len() as i64;
+    let space = hi as i64 - lo as i64 + 1;
+    if space <= n * 2 && space <= 4096 {
+        let mut table: Vec<crate::code::Label> = Vec::new();
+        for k in lo..=hi {
+            let lab = keys
+                .iter()
+                .find(|(ek, _)| *ek == k)
+                .map(|(_, i)| case_labs[*i])
+                .unwrap_or(def_lab);
+            table.push(lab);
+        }
+        asm.tableswitch(def_lab, lo, hi, &table);
+    } else {
+        let mut pairs: Vec<(i32, crate::code::Label)> = keys
+            .iter()
+            .map(|(k, i)| (*k, case_labs[*i]))
+            .collect();
+        pairs.sort_by_key(|(k, _)| *k);
+        asm.lookupswitch(def_lab, &pairs);
+    }
+    for (i, c) in cases.iter().enumerate() {
+        asm.mark(case_labs[i]);
+        if let TreeKind::Ident { .. } | TreeKind::Bind { .. } = &c.pat.kind {
+            if matches!(switch_pat_key(&c.pat), Some(SwitchPat::Default)) {
+                gen_pattern(asm, frame, ctx, &c.pat, tmp, sel_sort, miss);
+            }
+        }
+        if is_unit_like(result_ty) {
+            gen_stat(asm, frame, ctx, &c.body);
+        } else {
+            gen_expr(asm, frame, ctx, &c.body);
+        }
+        asm.goto(end);
+    }
+    if default_idx.is_none() {
+        asm.mark(miss);
+        throw_runtime(asm, "match error");
+    }
+    asm.mark(end);
+    true
 }
 
 fn gen_unapply_pattern(
@@ -6625,6 +6757,45 @@ object Main {
                 c.internal_name
             );
         }
+    }
+
+    #[test]
+    fn dense_int_match_emits_tableswitch() {
+        let classes = compile_src(
+            r#"
+import scala.annotation.switch
+object Main {
+  def dense(n: Int): Int = (n: @switch) match {
+    case 0 => 10
+    case 1 => 11
+    case 2 => 12
+    case 3 => 13
+    case 4 => 14
+  }
+  def sparse(n: Int): Int = (n: @switch) match {
+    case 0 => 1
+    case 100 => 2
+    case 200 => 3
+  }
+  def main(args: Array[String]): Unit = {
+    println(dense(2))
+    println(sparse(100))
+  }
+}
+"#,
+        );
+        let main = classes
+            .iter()
+            .find(|c| c.internal_name == "Main$")
+            .expect("Main$");
+        assert!(
+            main.bytes.contains(&0xaa),
+            "dense Int match should emit tableswitch (0xaa)"
+        );
+        assert!(
+            main.bytes.contains(&0xab),
+            "sparse Int match should emit lookupswitch (0xab)"
+        );
     }
 
     #[test]

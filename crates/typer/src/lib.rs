@@ -229,6 +229,62 @@ object Main {
     }
 
     #[test]
+    fn implicit_not_found_custom_message() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+import scala.annotation.implicitNotFound
+@implicitNotFound("no show for ${A}")
+trait Show[A]
+object Main {
+  def show[A](implicit s: Show[A]): Int = 1
+  def main(args: Array[String]): Unit = {
+    val n: Int = show[Int]
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("no show for Int")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn switch_match_ok_and_cannot_warns() {
+        ok(r#"
+import scala.annotation.switch
+object Main {
+  def f(n: Int): Int = (n: @switch) match {
+    case 0 => 10
+    case 1 => 11
+    case 2 => 12
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+import scala.annotation.switch
+object Main {
+  def f(n: Any): Int = (n: @switch) match {
+    case 0 => 1
+    case "x" => 2
+    case _ => 3
+  }
+}
+"#,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("could not emit switch")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn ambiguous_implicit() {
         let (_, _, diags) = typecheck_str(
             r#"

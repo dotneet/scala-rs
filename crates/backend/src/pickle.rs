@@ -33,7 +33,8 @@
 //! - annotation args that are string/int/boolean literals are Constants;
 //!   `classOf[T]` is `LITERALclass`; simple `Ident` / `Select` / `this` / `Apply`
 //!   args are `TREE` so scalac 2.13.16 can typecheck `@Ann(foo)` / `@Ann(this)` /
-//!   `@Ann(foo(1))` / `@Ann(classOf[Int])` / `@Ann(foo = 1)` on a method
+//!   `@Ann(foo(1))` / `@Ann(classOf[Int])` / `@Ann(foo = 1)` / `@Ann(foo = this.x)`
+//!   on a method (named args are pickled as positional, matching nsc typer)
 //! - Java `@Deprecated` is `SYMANNOT` with `TypeRef` under `java.lang` (not skipped)
 //! - SIP-23 `1` in a signature is `CONSTANTtpe(LITERALint)` (nsc `writeLong` =
 //!   signed big-endian base 256)
@@ -928,8 +929,8 @@ impl<'a> Pickler<'a> {
     }
 
     /// Constant (literal / classOf) or TREE Ident/Select/This/Super/Apply.
-    /// Named `@Ann(foo = 1)` is pickled as the rhs Constant — nsc typer
-    /// rewrites it to positional `@Ann(1)` before pickling.
+    /// Named `@Ann(foo = 1)` / `@Ann(foo = this.x)` pickle the rhs (Constant or
+    /// TREE) — nsc typer rewrites named args to positional before pickling.
     fn pickle_annot_arg(&mut self, arg: &Tree, owner: SymbolId) -> Option<u32> {
         match &arg.kind {
             TreeKind::Literal { lit } => Some(self.pickle_literal(lit)),
@@ -3203,6 +3204,47 @@ object Lib {
         assert!(
             tags.contains(&SYMANNOT),
             "expected SYMANNOT for @Ann(foo = 1), tags={tags:?}"
+        );
+    }
+
+    #[test]
+    fn pickle_named_annot_tree_rhs() {
+        // nsc typer rewrites `@Ann(foo = this.x)` / `@Ann(foo = bar)` to
+        // positional TREE (Select / Ident), same as `@Ann(this.x)` / `@Ann(bar)`.
+        let src = r#"
+class Ann(x: Any) extends annotation.StaticAnnotation
+class Holder { val x = 1; @Ann(foo = this.x) def markedNamedTree: Int = 11 }
+object Lib { val bar = 1; @Ann(foo = bar) def markedNamedIdent: Int = 12 }
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let holder = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Holder" && s.kind == scala_rs_typer::SymKind::Class)
+            .map(|s| s.id)
+            .expect("Holder");
+        let hraw = pickle_class(&st, holder);
+        let hsubs = tree_subtags(&hraw);
+        assert!(
+            hsubs.contains(&(SELECTtree as u32)) && hsubs.contains(&(THIStree as u32)),
+            "expected positional TREE Select(This) for @Ann(foo = this.x), got {hsubs:?}"
+        );
+        let lib = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Lib" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("Lib");
+        let lraw = pickle_class(&st, st.module_class_of(lib));
+        let lsubs = tree_subtags(&lraw);
+        assert!(
+            lsubs.contains(&(IDENTtree as u32)),
+            "expected positional TREE Ident for @Ann(foo = bar), got {lsubs:?}"
         );
     }
 
