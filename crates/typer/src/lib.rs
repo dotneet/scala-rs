@@ -3027,6 +3027,54 @@ object Main {
     }
 
     #[test]
+    fn string_ops4_numeric_range_listbuffer_typecheck_with_library() {
+        ok_lib(
+            r##"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val a: String = "|hello\n|world".stripMargin
+    val b: String = "#hello\n#world".stripMargin('#')
+    val c: String = "a\nb".lines.next()
+    val r = 1 to 3
+    val u = 1 until 3
+    val s: String = r.mkString(",")
+    val nr = 1.toByte to 3.toByte
+    val nu = 1.toByte until 3.toByte
+    val ns: String = nr.mkString(",")
+    val buf = scala.collection.mutable.ListBuffer(1, 2)
+    buf += 3
+    val n: Int = buf(0)
+  }
+}
+"##,
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = "hi".noSuchMargin
+    val y = (1 to 3).noSuchMk
+    val z = scala.collection.mutable.ListBuffer(1).noSuch
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics

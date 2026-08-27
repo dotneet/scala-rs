@@ -4575,6 +4575,19 @@ fn invoke_value_extension(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
         );
         return;
     }
+    if owner == "scala/runtime/RichInt" && s.name == "until" {
+        asm.invokestatic(
+            "scala/runtime/RichInt",
+            "until$extension",
+            "(II)Lscala/collection/immutable/Range;",
+        );
+        return;
+    }
+    if owner == "scala/runtime/RichByte" && (s.name == "to" || s.name == "until") {
+        // RichByte has no to$extension; IntegralProxy default builds a real NumericRange.
+        emit_rich_byte_numeric_range(asm, s.name == "to");
+        return;
+    }
     if owner == "scala/runtime/RichChar" && s.name == "toInt" {
         // RichChar.toInt is inlined; the jar exposes intValue$extension.
         asm.invokestatic("scala/runtime/RichChar", "intValue$extension", "(C)I");
@@ -4927,6 +4940,28 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
                     );
                     asm.checkcast("scala/collection/mutable/ArrayBuffer");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_listbuffer_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ListBuffer$",
+                        "empty",
+                        "()Lscala/collection/mutable/ListBuffer;",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ListBuffer$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/mutable/ListBuffer");
                     return;
                 }
                 _ => {}
@@ -5394,6 +5429,51 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_listbuffer(&owner) {
+            match name {
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ListBuffer",
+                        "apply",
+                        "(I)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            emit_unbox(asm, ty);
+                        } else if !is_unit_like(ty) {
+                            let cls = jvm_desc(ctx.st, ty);
+                            if let Some(inner) =
+                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                            {
+                                if inner != "java/lang/Object" {
+                                    asm.checkcast(inner);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                "+=" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ListBuffer",
+                        "+=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Growable;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_range(&owner) || is_stdlib_numeric_range(&owner) {
+            if name == "mkString" {
+                asm.invokeinterface(
+                    "scala/collection/IterableOnceOps",
+                    "mkString",
+                    "(Ljava/lang/String;)Ljava/lang/String;",
+                );
+                return;
+            }
+        }
     }
     if is_interface_sym(ctx.st, owner_id) {
         asm.invokeinterface(&owner, name, &desc);
@@ -5582,6 +5662,68 @@ fn is_stdlib_arraybuffer(owner: &str) -> bool {
 
 fn is_stdlib_arraybuffer_module(owner: &str) -> bool {
     owner == "scala/collection/mutable/ArrayBuffer$"
+}
+
+fn is_stdlib_listbuffer(owner: &str) -> bool {
+    owner == "scala/collection/mutable/ListBuffer"
+}
+
+fn is_stdlib_listbuffer_module(owner: &str) -> bool {
+    owner == "scala/collection/mutable/ListBuffer$"
+}
+
+fn is_stdlib_range(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/collection/immutable/Range" | "scala/collection/immutable/Range$Inclusive"
+    )
+}
+
+fn is_stdlib_numeric_range(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/collection/immutable/NumericRange"
+            | "scala/collection/immutable/NumericRange$Inclusive"
+            | "scala/collection/immutable/NumericRange$Exclusive"
+    )
+}
+
+fn emit_rich_byte_numeric_range(asm: &mut Assembler, inclusive: bool) {
+    // stack: start (byte as int), end (byte as int)
+    asm.swap();
+    asm.i2b();
+    emit_box(asm, &Type::Byte);
+    asm.swap();
+    asm.i2b();
+    emit_box(asm, &Type::Byte);
+    asm.getstatic(
+        "scala/collection/immutable/NumericRange$",
+        "MODULE$",
+        "Lscala/collection/immutable/NumericRange$;",
+    );
+    asm.dup_x2();
+    asm.pop();
+    asm.iconst(1);
+    asm.i2b();
+    emit_box(asm, &Type::Byte);
+    asm.getstatic(
+        "scala/math/Numeric$ByteIsIntegral$",
+        "MODULE$",
+        "Lscala/math/Numeric$ByteIsIntegral$;",
+    );
+    if inclusive {
+        asm.invokevirtual(
+            "scala/collection/immutable/NumericRange$",
+            "inclusive",
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Lscala/math/Integral;)Lscala/collection/immutable/NumericRange$Inclusive;",
+        );
+    } else {
+        asm.invokevirtual(
+            "scala/collection/immutable/NumericRange$",
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Lscala/math/Integral;)Lscala/collection/immutable/NumericRange$Exclusive;",
+        );
+    }
 }
 
 fn is_stdlib_set(owner: &str) -> bool {

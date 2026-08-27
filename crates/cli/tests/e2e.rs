@@ -756,6 +756,21 @@ fn fixtures_arraybuffer_bad_is_error() {
 }
 
 #[test]
+fn fixtures_string_ops4_bad_is_error() {
+    compile_fails_lib("string_ops4_bad", "noSuchMargin is not a member");
+}
+
+#[test]
+fn fixtures_numeric_range_bad_is_error() {
+    compile_fails_lib("numeric_range_bad", "noSuchMk is not a member");
+}
+
+#[test]
+fn fixtures_listbuffer_bad_is_error() {
+    compile_fails_lib("listbuffer_bad", "noSuch is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1369,6 +1384,21 @@ fn scala_library_dual_run_arraybuffer() {
 }
 
 #[test]
+fn scala_library_dual_run_string_ops4() {
+    dual_run_fixture("string_ops4");
+}
+
+#[test]
+fn scala_library_dual_run_numeric_range() {
+    dual_run_fixture("numeric_range");
+}
+
+#[test]
+fn scala_library_dual_run_listbuffer() {
+    dual_run_fixture("listbuffer");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -1643,6 +1673,12 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/runtime/RichBoolean.class",
     "scala/collection/mutable/ArrayBuffer.class",
     "scala/collection/mutable/ArrayBuffer$.class",
+    "scala/collection/mutable/ListBuffer.class",
+    "scala/collection/mutable/ListBuffer$.class",
+    "scala/collection/immutable/NumericRange.class",
+    "scala/collection/immutable/NumericRange$.class",
+    "scala/collection/immutable/NumericRange$Inclusive.class",
+    "scala/collection/immutable/NumericRange$Exclusive.class",
     "scala/util/Either.class",
     "scala/util/Left.class",
     "scala/util/Right.class",

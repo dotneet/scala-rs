@@ -278,6 +278,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_seq_and_lazylist(st);
         add_indexedseq_and_queue(st);
         add_array_buffer(st);
+        add_list_buffer(st);
         add_either(st);
         add_try(st, throwable);
         add_xml(st);
@@ -1178,6 +1179,26 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
         },
         Intrinsic::None,
     );
+    method(st, so, "stripMargin", vec![], Type::String, Intrinsic::None);
+    method(
+        st,
+        so,
+        "stripMargin",
+        vec![Type::Char],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "lines",
+        vec![],
+        Type::Class {
+            sym: iterator,
+            args: vec![Type::String],
+        },
+        Intrinsic::None,
+    );
     so
 }
 
@@ -2059,6 +2080,77 @@ fn add_array_buffer(st: &mut SymbolTable) {
     st.get_mut(buf_mod).members.extend(mems);
 }
 
+fn add_list_buffer(st: &mut SymbolTable) {
+    let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
+    let buf = class(
+        st,
+        mutp,
+        "ListBuffer",
+        "scala/collection/mutable/ListBuffer",
+        &[Type::AnyRef],
+    );
+    let ba = type_param(st, buf, "A");
+    st.get_mut(buf).tparams = vec![ba];
+    let ta = Type::TypeParam(ba);
+    let buf_t = Type::Class {
+        sym: buf,
+        args: vec![ta.clone()],
+    };
+    method(
+        st,
+        buf,
+        "apply",
+        vec![Type::Int],
+        ta.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        buf,
+        "+=",
+        vec![Type::Any],
+        buf_t.clone(),
+        Intrinsic::None,
+    );
+    let buf_mod = module(
+        st,
+        mutp,
+        "ListBuffer",
+        "scala/collection/mutable/ListBuffer$",
+    );
+    let buf_cls = st.module_class_of(buf_mod);
+    method(
+        st,
+        buf_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: buf,
+            args: vec![Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let buf_apply = method(
+        st,
+        buf_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        buf_t.clone(),
+        Intrinsic::None,
+    );
+    let baa = type_param(st, buf_apply, "A");
+    st.get_mut(buf_apply).tparams = vec![baa];
+    st.get_mut(buf_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(baa)))]],
+        ret: Box::new(Type::Class {
+            sym: buf,
+            args: vec![Type::TypeParam(baa)],
+        }),
+    };
+    let mems = st.get(buf_cls).members.clone();
+    st.get_mut(buf_mod).members.extend(mems);
+}
+
 fn add_either(st: &mut SymbolTable) {
     let either = class(
         st,
@@ -2278,6 +2370,15 @@ fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
         Intrinsic::None,
     );
     method(st, range, "toString", vec![], Type::String, Intrinsic::None);
+    method(
+        st,
+        range,
+        "mkString",
+        vec![Type::String],
+        Type::String,
+        Intrinsic::None,
+    );
+    add_numeric_range(st);
     let ri = class(
         st,
         st.scala_pkg,
@@ -2366,11 +2467,63 @@ fn add_rich_float(st: &mut SymbolTable) -> SymbolId {
     rf
 }
 
+fn add_numeric_range(st: &mut SymbolTable) -> SymbolId {
+    let nr = class(
+        st,
+        st.scala_pkg,
+        "NumericRange",
+        "scala/collection/immutable/NumericRange",
+        &[Type::AnyRef],
+    );
+    let ta = type_param(st, nr, "T");
+    st.get_mut(nr).tparams = vec![ta];
+    let tt = Type::TypeParam(ta);
+    method(
+        st,
+        nr,
+        "foreach",
+        vec![fn1(tt.clone(), Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    method(st, nr, "toString", vec![], Type::String, Intrinsic::None);
+    method(
+        st,
+        nr,
+        "mkString",
+        vec![Type::String],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(st, nr, "apply", vec![Type::Int], tt, Intrinsic::None);
+    nr
+}
+
 fn add_rich_byte_short_boolean(st: &mut SymbolTable) -> (SymbolId, SymbolId, SymbolId) {
     let rb = add_rich_value(st, "RichByte", "scala/runtime/RichByte", Type::Byte);
     method(st, rb, "abs", vec![], Type::Byte, Intrinsic::None);
     method(st, rb, "max", vec![Type::Byte], Type::Byte, Intrinsic::None);
     method(st, rb, "min", vec![Type::Byte], Type::Byte, Intrinsic::None);
+    let nr = st
+        .get(st.scala_pkg)
+        .members
+        .iter()
+        .copied()
+        .find(|&id| st.get(id).name == "NumericRange")
+        .expect("NumericRange");
+    let nr_t = Type::Class {
+        sym: nr,
+        args: vec![Type::Byte],
+    };
+    method(
+        st,
+        rb,
+        "to",
+        vec![Type::Byte],
+        nr_t.clone(),
+        Intrinsic::None,
+    );
+    method(st, rb, "until", vec![Type::Byte], nr_t, Intrinsic::None);
     let rs = add_rich_value(st, "RichShort", "scala/runtime/RichShort", Type::Short);
     method(st, rs, "abs", vec![], Type::Short, Intrinsic::None);
     method(

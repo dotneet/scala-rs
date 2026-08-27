@@ -3162,8 +3162,18 @@ impl Typer {
             return;
         }
         // Keep overloads intact so `println(1)` can still pick a 1-arg alternative.
-        tree.ty = Type::Overload(found.iter().map(|s| self.st.get(*s).ty.clone()).collect());
-        tree.sym = found[0];
+        // Nullary alternatives still auto-apply in value position (`"x".stripMargin`).
+        let ov = Type::Overload(found.iter().map(|s| self.st.get(*s).ty.clone()).collect());
+        tree.ty = self.maybe_auto_apply(ov, pt);
+        tree.sym = if matches!(tree.ty, Type::Overload(_)) {
+            found[0]
+        } else {
+            found
+                .iter()
+                .copied()
+                .find(|&s| self.is_nullary_method_sym(s))
+                .unwrap_or(found[0])
+        };
     }
 
     fn maybe_auto_apply(&self, ty: Type, pt: &Type) -> Type {
@@ -3177,6 +3187,25 @@ impl Typer {
                     (**ret).clone()
                 }
             }
+            Type::Overload(alts) => {
+                if matches!(pt, Type::Function { .. } | Type::Method { .. }) {
+                    return ty;
+                }
+                let nullary: Vec<&Type> = alts
+                    .iter()
+                    .filter(|a| match a {
+                        Type::Method { paramss, .. } => {
+                            paramss.is_empty() || paramss.iter().all(|c| c.is_empty())
+                        }
+                        _ => false,
+                    })
+                    .collect();
+                if let [Type::Method { ret, .. }] = nullary.as_slice() {
+                    (**ret).clone()
+                } else {
+                    ty
+                }
+            }
             Type::ByName(inner) => {
                 if matches!(
                     pt,
@@ -3188,6 +3217,15 @@ impl Typer {
                 }
             }
             _ => ty,
+        }
+    }
+
+    fn is_nullary_method_sym(&self, id: SymbolId) -> bool {
+        match &self.st.get(id).ty {
+            Type::Method { paramss, .. } => {
+                paramss.is_empty() || paramss.iter().all(|c| c.is_empty())
+            }
+            _ => false,
         }
     }
 
@@ -3345,11 +3383,15 @@ impl Typer {
                         fun: Box::new(fun),
                         args: vec![old],
                     },
-                    ty: to,
+                    ty: to.clone(),
                     sym: conv,
                     postfix: false,
                 };
-                found = vec![member];
+                found = if let Some(cls) = self.st.class_sym_of(&to) {
+                    self.st.lookup_member(cls, &name)
+                } else {
+                    vec![member]
+                };
             }
         }
         if found.is_empty() && self.is_dynamic_receiver(&qual.ty) {
@@ -3438,7 +3480,7 @@ impl Typer {
             tree.sym = found[0];
             let owner = self.st.get(found[0]).owner;
             let args = subst_args.clone();
-            tree.ty = Type::Overload(
+            let ov = Type::Overload(
                 found
                     .iter()
                     .map(|s| {
@@ -3452,6 +3494,16 @@ impl Typer {
                     })
                     .collect(),
             );
+            tree.ty = self.maybe_auto_apply(ov, pt);
+            if !matches!(tree.ty, Type::Overload(_)) {
+                if let Some(id) = found
+                    .iter()
+                    .copied()
+                    .find(|&s| self.is_nullary_method_sym(s))
+                {
+                    tree.sym = id;
+                }
+            }
         }
     }
 
