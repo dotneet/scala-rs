@@ -2209,7 +2209,9 @@ trait Box { type A; def x: A }
 class StrBox extends Box { type A = String; def x: A = "hi" }
 object Main {
   def get(b: Box { type A <: Int }): Int = b.x
-  def main(args: Array[String]): Unit = { get(new StrBox) }
+  def main(args: Array[String]): Unit = {
+    val b: Box { type A <: Int } = new StrBox
+  }
 }
 "#,
         );
@@ -2259,6 +2261,7 @@ class Outer {
     type X = Int
     def n: X = 41
   }
+  def inner: Inner = new Inner
 }
 trait A { type T }
 class AI extends A { type T = Int }
@@ -2267,9 +2270,7 @@ object Main {
   def fromClass(x: Outer#Inner#X): Int = x
   def fromAlias(x: Holder#Inner#T): Int = x
   def main(args: Array[String]): Unit = {
-    val o = new Outer
-    val i = new o.Inner
-    val a: Int = fromClass(i.n)
+    val a: Int = fromClass(new Outer().inner.n)
     val b: Int = fromAlias(2)
   }
 }

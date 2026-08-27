@@ -961,6 +961,12 @@ impl SymbolTable {
     pub fn expand_type_members(&self, from: SymbolId, ty: &Type) -> Type {
         match ty {
             Type::TypeMember(id) => {
+                // Refinement placeholders are allocated with no owner. Do not
+                // replace them with the parent's abstract member of the same name
+                // (`{ type A <: Int }` must keep `A`'s bound).
+                if self.get(*id).owner.is_none() {
+                    return ty.clone();
+                }
                 let name = self.get(*id).name.clone();
                 for m in self.lookup_member(from, &name) {
                     if self.get(m).kind == SymKind::TypeMember {
@@ -1495,7 +1501,13 @@ fn subst_refine_aliases(st: &SymbolTable, decls: &[RefineDecl], ty: &Type) -> Ty
                 } = d
                 {
                     if n == &name {
-                        return subst_refine_aliases(st, decls, rhs);
+                        // Placeholder `TypeMember` rhs is the refinement's own
+                        // member (`{ type F[X] = Id[X] }` stores `TypeMember(id)`).
+                        // Recursing would match the same decl forever.
+                        return match rhs {
+                            Type::TypeMember(_) => rhs.clone(),
+                            _ => subst_refine_aliases(st, decls, rhs),
+                        };
                     }
                 }
             }
