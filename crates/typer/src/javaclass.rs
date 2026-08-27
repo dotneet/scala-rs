@@ -152,16 +152,15 @@ fn zip_payload(data: &[u8]) -> &[u8] {
 fn zip_read_named(data: &[u8], name: &str) -> Result<Option<Vec<u8>>, String> {
     let mut z = ZipArchive::new(Cursor::new(zip_payload(data)))
         .map_err(|e| format!("unsupported classfile archive: {e}"))?;
-    match z.by_name(name) {
-        Ok(mut f) => {
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf)
-                .map_err(|e| format!("unsupported classfile archive: {e}"))?;
-            Ok(Some(buf))
-        }
-        Err(zip::result::ZipError::FileNotFound) => Ok(None),
-        Err(e) => Err(format!("unsupported classfile archive: {e}")),
-    }
+    let mut f = match z.by_name(name) {
+        Ok(f) => f,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(format!("unsupported classfile archive: {e}")),
+    };
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)
+        .map_err(|e| format!("unsupported classfile archive: {e}"))?;
+    Ok(Some(buf))
 }
 
 fn discover_jdk_jmods() -> Vec<PathBuf> {
