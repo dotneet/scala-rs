@@ -14,6 +14,10 @@
 //! (`def f(x: 1)`, `val one: 1`) as `CONSTANTtpe` + `LITERALint` against our
 //! classfiles.
 //! Flags are nsc raw longs run through `rawToPickledFlags`.
+//! MACRO / late / anti are **not** pickled: scalac 2.13.16 typechecks the
+//! classfiles we already emit (`scalac_typechecks_against_our_classfiles_if_present`)
+//! without them. Def macros are out of scope. JAVA is not placed on EXTREF
+//! (no flags field on that pickle form).
 //! It is **not** a full nsc pickle — leftover holes are documented in README.
 //!
 //! nsc-facing details in this subset (must match `PickleBuffer` / `UnPickler`):
@@ -940,9 +944,7 @@ impl<'a> Pickler<'a> {
             TreeKind::Super { qual, mix } => {
                 Some(self.pickle_super_tree(qual.as_deref(), mix.as_deref(), owner))
             }
-            TreeKind::Assign { lhs, rhs }
-                if matches!(&lhs.kind, TreeKind::Ident { .. }) =>
-            {
+            TreeKind::Assign { lhs, rhs } if matches!(&lhs.kind, TreeKind::Ident { .. }) => {
                 self.pickle_annot_arg(rhs, owner)
             }
             TreeKind::TypeApply { fun, args } if is_classof_fun(fun) => {
@@ -1922,6 +1924,8 @@ fn annot_string_args(tree: &Tree) -> Vec<String> {
 }
 
 /// Map scala-rs `Flags` onto nsc **raw** bits (before `rawToPickledFlags`).
+/// MACRO / late / anti are omitted: scalac 2.13.16 typechecks our existing
+/// pickles without them (see `scalac_typechecks_against_our_classfiles_if_present`).
 fn nsc_raw_from_our(f: Flags, kind: SymKind) -> u64 {
     let mut n = 0u64;
     if f.contains(Flags::PROTECTED) {

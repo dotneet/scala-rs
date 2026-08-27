@@ -2,11 +2,14 @@
 //! Namer + typer. Trees are mutated in place (`ty`, `sym`).
 
 use crate::implicits::ImplicitSearch;
+use crate::javaclass::BinaryIndex;
 use crate::prelude::install_prelude;
 use crate::symbol::{SymKind, SymbolTable};
 use crate::uncurry::{eta_expand, is_eta_marker};
 use scala_rs_parser::ast::*;
 use scala_rs_span::{Diagnostic, Span};
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 pub struct TypecheckOptions {
     pub fatal_warnings: bool,
@@ -15,6 +18,8 @@ pub struct TypecheckOptions {
     pub library_abi: bool,
     /// Classes loaded from `-cp` (previous compilation's classfiles).
     pub classpath: Vec<ClasspathClass>,
+    /// Directories and jars/jmods searched for Java `.class` files (plus the JDK).
+    pub binary_path: Vec<PathBuf>,
     /// `-language:postfixOps` / `-language:implicitConversions` / `-language:dynamics`.
     pub language_features: Vec<String>,
 }
@@ -61,6 +66,7 @@ impl Default for TypecheckOptions {
             fatal_warnings: false,
             library_abi: false,
             classpath: Vec::new(),
+            binary_path: Vec::new(),
             language_features: Vec::new(),
         }
     }
@@ -82,6 +88,8 @@ pub struct Typer {
     language_postfix_ops: bool,
     /// `import scala.language.implicitConversions` / `-language:implicitConversions`.
     language_implicit_conversions: bool,
+    binary: BinaryIndex,
+    completed_java: HashSet<String>,
 }
 
 pub fn typecheck(tree: &mut Tree, file_index: usize) -> (SymbolTable, Vec<Diagnostic>) {
@@ -120,6 +128,8 @@ impl Typer {
                 &opts.language_features,
                 "implicitConversions",
             ),
+            binary: BinaryIndex::from_user_paths(opts.binary_path.clone()),
+            completed_java: HashSet::new(),
         }
     }
 
@@ -583,9 +593,11 @@ impl Typer {
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
-            TreeKind::DefDef { name, mods, rhs, .. } => {
+            TreeKind::DefDef {
+                name, mods, rhs, ..
+            } => {
                 let annots = mods.annotations.clone();
-                let flags = if rhs.is_empty() {
+                let flags = if rhs.is_empty() && !mods.flags.contains(Flags::NATIVE) {
                     mods.flags.with(Flags::ABSTRACT)
                 } else {
                     mods.flags
@@ -1730,6 +1742,7 @@ impl Typer {
             _ => return,
         };
         if rhs.is_empty() {
+            self.check_stored_annotations(tree);
             return;
         }
         self.st.push_scope();
@@ -2246,6 +2259,13 @@ impl Typer {
         }
         let found = self.st.lookup(&name);
         if found.is_empty() {
+            self.complete_binary_member(self.st.root, &name, tree.span);
+        }
+        let mut found = self.st.lookup(&name);
+        if found.is_empty() {
+            found = self.st.lookup_member(self.st.root, &name);
+        }
+        if found.is_empty() {
             self.error(tree.span, format!("not found: value {name}"));
             tree.ty = Type::Error;
             return;
@@ -2435,8 +2455,9 @@ impl Typer {
                 found = self.st.lookup_member(*id, &name);
             }
         }
-        // Package / term prefix: `scala.reflect.ClassTag`
+        // Package / term prefix: `scala.reflect.ClassTag` and Java `java.lang.Math`.
         if found.is_empty() && !qual.sym.is_none() {
+            self.complete_binary_member(qual.sym, &name, tree.span);
             found = self.st.lookup_member(qual.sym, &name);
         }
         if found.is_empty() && name == "toString" {
@@ -3512,8 +3533,7 @@ impl Typer {
                             }
                         }
                     } else if owner_n == "Left$" || owner_n == "Right$" {
-                        if let Some(inst) = self.instantiate_either_ctor_apply(&owner_n, args, pt)
-                        {
+                        if let Some(inst) = self.instantiate_either_ctor_apply(&owner_n, args, pt) {
                             ret = inst;
                         }
                     } else if owner_n == "Try$" || owner_n == "Success$" {
@@ -4419,7 +4439,9 @@ impl Typer {
         } else {
             match pt {
                 Type::Function { params, ret } => (params.clone(), (**ret).clone()),
-                Type::Named { name, args } if name.starts_with("Function") && name != "Function" => {
+                Type::Named { name, args }
+                    if name.starts_with("Function") && name != "Function" =>
+                {
                     if args.is_empty() {
                         (vec![Type::NoType; vparams.len()], Type::NoType)
                     } else {
@@ -5830,8 +5852,9 @@ impl Typer {
         false
     }
 
-    fn lookup_qualified_type(&self, prefix: &Tree, name: &str) -> Option<SymbolId> {
+    fn lookup_qualified_type(&mut self, prefix: &Tree, name: &str) -> Option<SymbolId> {
         let owner = self.qualified_type_owner(prefix)?;
+        self.complete_binary_member(owner, name, prefix.span);
         self.st.lookup_member(owner, name).into_iter().find(|s| {
             matches!(
                 self.st.get(*s).kind,
@@ -5845,7 +5868,7 @@ impl Typer {
         })
     }
 
-    fn qualified_type_owner(&self, t: &Tree) -> Option<SymbolId> {
+    fn qualified_type_owner(&mut self, t: &Tree) -> Option<SymbolId> {
         match &t.kind {
             TreeKind::Ident { name } => self.st.lookup(name).into_iter().find(|id| {
                 matches!(
@@ -5855,6 +5878,7 @@ impl Typer {
             }),
             TreeKind::Select { qual, name } => {
                 let owner = self.qualified_type_owner(qual)?;
+                self.complete_binary_member(owner, name, t.span);
                 self.st.lookup_member(owner, name).into_iter().find(|id| {
                     matches!(
                         self.st.get(*id).kind,
@@ -5863,6 +5887,62 @@ impl Typer {
                 })
             }
             _ => None,
+        }
+    }
+
+    fn complete_binary_member(&mut self, owner: SymbolId, name: &str, span: Span) {
+        if owner.is_none() || name.is_empty() {
+            return;
+        }
+        if self.st.lookup_member(owner, name).iter().any(|&id| {
+            matches!(
+                self.st.get(id).kind,
+                SymKind::Class | SymKind::Package | SymKind::Module | SymKind::ModuleClass
+            )
+        }) {
+            return;
+        }
+        let pkg_jvm = if owner == self.st.root {
+            String::new()
+        } else {
+            self.st.get(owner).jvm_name.clone()
+        };
+        let internal = if pkg_jvm.is_empty() {
+            name.to_string()
+        } else if self.st.get(owner).kind == SymKind::Class {
+            format!("{pkg_jvm}${name}")
+        } else {
+            format!("{pkg_jvm}/{name}")
+        };
+        if !self.completed_java.insert(internal.clone()) {
+            return;
+        }
+        match self.binary.find_class(&internal) {
+            Ok(Some(bytes)) => match crate::javaclass::parse_java_classfile(&bytes) {
+                Ok(jc) => {
+                    crate::classpath::install_java_class(&mut self.st, &jc);
+                }
+                Err(e) => {
+                    self.error(
+                        span,
+                        format!("unsupported classfile {}: {e}", internal.replace('/', ".")),
+                    );
+                }
+            },
+            Ok(None) => {
+                if self.st.get(owner).kind == SymKind::Package {
+                    let prefix = format!("{internal}/");
+                    if self.binary.has_package_prefix(&prefix) {
+                        let _ = crate::classpath::ensure_package(&mut self.st, &internal);
+                    }
+                }
+            }
+            Err(e) => {
+                self.error(
+                    span,
+                    format!("unsupported classfile {}: {e}", internal.replace('/', ".")),
+                );
+            }
         }
     }
 
@@ -6308,14 +6388,23 @@ impl Typer {
             if is_inline_annot(&path) || is_noinline_annot(&path) {
                 if !matches!(&tree.kind, TreeKind::DefDef { .. }) {
                     let simple = path.rsplit('.').next().unwrap_or(path.as_str());
-                    self.error(
-                        tree.span,
-                        format!("@{simple} is only supported on methods"),
-                    );
+                    self.error(tree.span, format!("@{simple} is only supported on methods"));
+                }
+            }
+            if is_native_annot(&path) {
+                if !matches!(&tree.kind, TreeKind::DefDef { .. }) {
+                    self.error(tree.span, "@native is only supported on methods");
+                } else if let TreeKind::DefDef { rhs, .. } = &tree.kind {
+                    if !rhs.is_empty() {
+                        self.error(tree.span, "native method cannot have a body");
+                    }
                 }
             }
         }
-        let has_inline = mods.annotations.iter().any(|a| is_inline_annot(&a.annotation_path()));
+        let has_inline = mods
+            .annotations
+            .iter()
+            .any(|a| is_inline_annot(&a.annotation_path()));
         let has_noinline = mods
             .annotations
             .iter()
@@ -6514,6 +6603,10 @@ fn is_noinline_annot(path: &str) -> bool {
     matches!(path, "noinline" | "scala.noinline")
 }
 
+fn is_native_annot(path: &str) -> bool {
+    matches!(path, "native" | "scala.native")
+}
+
 fn is_override_annot(path: &str) -> bool {
     matches!(path, "Override" | "java.lang.Override")
 }
@@ -6570,7 +6663,10 @@ fn match_can_switch(sel_ty: &Type, cases: &[scala_rs_parser::CaseDef]) -> bool {
     switch_case_keys(sel_ty, cases).is_some()
 }
 
-fn switch_case_keys(sel_ty: &Type, cases: &[scala_rs_parser::CaseDef]) -> Option<Vec<(i32, usize)>> {
+fn switch_case_keys(
+    sel_ty: &Type,
+    cases: &[scala_rs_parser::CaseDef],
+) -> Option<Vec<(i32, usize)>> {
     let core = peel_type_annot(sel_ty);
     if !matches!(core, Type::Int | Type::Char) {
         return None;
@@ -6781,7 +6877,8 @@ fn is_function_pt(pt: &Type) -> bool {
     match pt {
         Type::Function { .. } => true,
         Type::Named { name, .. }
-            if (name.starts_with("Function") && name != "Function") || name == "PartialFunction" =>
+            if (name.starts_with("Function") && name != "Function")
+                || name == "PartialFunction" =>
         {
             true
         }

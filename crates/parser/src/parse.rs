@@ -27,7 +27,7 @@ fn annotation_compiler_unsupported(path: &str) -> bool {
     let simple = path.rsplit('.').next().unwrap_or(path);
     matches!(
         simple,
-        "specialized" | "unspecialized" | "elidable" | "strictfp" | "native"
+        "specialized" | "unspecialized" | "elidable" | "strictfp"
     )
 }
 
@@ -574,6 +574,8 @@ impl<'a> Parser<'a> {
                             flags = flags.with(Flags::VOLATILE);
                         } else if simple == "transient" {
                             flags = flags.with(Flags::TRANSIENT);
+                        } else if simple == "native" {
+                            flags = flags.with(Flags::NATIVE);
                         }
                         annotations.push(annot);
                     } else {

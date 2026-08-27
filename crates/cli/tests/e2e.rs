@@ -729,6 +729,92 @@ fn fixtures_inline_bad_is_error() {
 }
 
 #[test]
+fn fixtures_java_cp() {
+    check("java_cp");
+}
+
+#[test]
+fn fixtures_native() {
+    check("native");
+}
+
+#[test]
+fn fixtures_native_bad_is_error() {
+    compile_fails("native_bad", "cannot have a body");
+}
+
+#[test]
+fn native_acc_flag_in_javap() {
+    let out = compile_fixture("native");
+    if !javap_available() {
+        let _ = fs::remove_dir_all(&out);
+        return;
+    }
+    let output = Command::new("javap")
+        .args(["-v", "-p", out.join("Main$.class").to_str().unwrap()])
+        .output()
+        .expect("javap");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("ACC_NATIVE") && text.contains("native"),
+        "expected ACC_NATIVE on @native method, got {text}"
+    );
+    assert!(
+        text.contains("nscNativePing"),
+        "expected nscNativePing in javap, got {text}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn unsupported_java_classfile_on_cp_is_error() {
+    let cp = tmp_dir("bad-java-cp");
+    fs::write(
+        cp.join("Broken.class"),
+        [0xCAu8, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52, 0, 2, 99],
+    )
+    .unwrap();
+    let src_path = cp.join("use_broken.scala");
+    fs::write(
+        &src_path,
+        "object Main {\n  def main(args: Array[String]): Unit = { new Broken() }\n}\n",
+    )
+    .unwrap();
+    let out = tmp_dir("bad-java-cp-out");
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            src_path.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "-cp",
+            cp.to_str().unwrap(),
+            "--no-scala-library",
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        !output.status.success(),
+        "expected compile against a broken .class to fail"
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        err.contains("unsupported classfile"),
+        "expected unsupported classfile diagnostic, got {err:?}"
+    );
+    let _ = fs::remove_dir_all(&out);
+    let _ = fs::remove_dir_all(&cp);
+}
+
+#[test]
 fn fixtures_xml_attr_bad_is_error() {
     compile_fails("xml_attr_bad", "XML");
 }

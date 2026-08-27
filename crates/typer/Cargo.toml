@@ -8,3 +8,4 @@ description = "Namer and typer for scala-rs (Scala 2.13 subset)"
 [dependencies]
 scala-rs-span.workspace = true
 scala-rs-parser.workspace = true
+zip = { version = "0.6", default-features = false, features = ["deflate"] }

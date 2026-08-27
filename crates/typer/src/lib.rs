@@ -2,6 +2,7 @@ mod check;
 mod classpath;
 mod erasure;
 mod implicits;
+mod javaclass;
 mod lambda_lift;
 mod prelude;
 mod symbol;
@@ -55,6 +56,7 @@ mod tests {
                 fatal_warnings: false,
                 library_abi: true,
                 classpath: Vec::new(),
+                binary_path: Vec::new(),
                 language_features: Vec::new(),
             },
         );
@@ -328,7 +330,8 @@ object Main {
   def f(p: Int Pair String): Int = 1
 }
 "#);
-        ok_lib(r#"
+        ok_lib(
+            r#"
 object Main {
   def f(e: Int Either String): Int Either String = e
   def main(args: Array[String]): Unit = {
@@ -338,7 +341,8 @@ object Main {
     val b: Boolean = r.isLeft
   }
 }
-"#);
+"#,
+        );
         let (_, _, diags) = typecheck_str_opts(
             r#"
 object Main {
@@ -349,6 +353,7 @@ object Main {
                 fatal_warnings: false,
                 library_abi: true,
                 classpath: Vec::new(),
+                binary_path: Vec::new(),
                 language_features: Vec::new(),
             },
         );
@@ -385,8 +390,7 @@ object Main { val x: NotSam = () => () }
 "#,
         );
         assert!(
-            has_errors(&diags)
-                && diags.iter().any(|d| d.message.contains("type mismatch")),
+            has_errors(&diags) && diags.iter().any(|d| d.message.contains("type mismatch")),
             "missing SAM must diagnose, got {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -397,8 +401,7 @@ object Main { val y: TwoAbs = () => () }
 "#,
         );
         assert!(
-            has_errors(&diags)
-                && diags.iter().any(|d| d.message.contains("type mismatch")),
+            has_errors(&diags) && diags.iter().any(|d| d.message.contains("type mismatch")),
             "two abstract methods must not SAM-wrap, got {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -411,8 +414,7 @@ object Main {
 "#,
         );
         assert!(
-            has_errors(&diags)
-                && diags.iter().any(|d| d.message.contains("type mismatch")),
+            has_errors(&diags) && diags.iter().any(|d| d.message.contains("type mismatch")),
             "nullary method must auto-apply, not eta to Runnable: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -451,6 +453,103 @@ object Main {
                     .iter()
                     .any(|d| d.message.contains("cannot be used together")),
             "expected @inline/@noinline conflict, got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn java_classpath_math_and_arraylist_typecheck() {
+        ok(r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = java.lang.Math.abs(-3)
+    val b: Int = java.lang.Byte.MAX_VALUE
+    val xs = new java.util.ArrayList[String]()
+    val added: Boolean = xs.add("x")
+    val sz: Int = xs.size()
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn unsupported_java_classfile_diagnosed() {
+        let dir = std::env::temp_dir().join(format!(
+            "scala-rs-badclass-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Broken.class"),
+            [0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52, 0, 2, 99],
+        )
+        .unwrap();
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    new Broken()
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: false,
+                classpath: Vec::new(),
+                binary_path: vec![dir.clone()],
+                language_features: Vec::new(),
+            },
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            has_errors(&diags)
+                && diags
+                    .iter()
+                    .any(|d| d.message.contains("unsupported classfile")),
+            "expected unsupported classfile diagnostic, got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn native_method_ok_body_diagnosed() {
+        ok(r#"
+object Main {
+  @native def foo(): Int
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  @native def foo(): Int = 1
+}
+"#,
+        );
+        assert!(
+            has_errors(&diags)
+                && diags
+                    .iter()
+                    .any(|d| d.message.contains("cannot have a body")),
+            "expected native-with-body error, got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  @native val x: Int = 1
+}
+"#,
+        );
+        assert!(
+            has_errors(&diags)
+                && diags
+                    .iter()
+                    .any(|d| d.message.contains("only supported on methods")),
+            "expected @native-on-val error, got {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
@@ -628,6 +727,7 @@ object Main {
                 fatal_warnings: true,
                 library_abi: false,
                 classpath: Vec::new(),
+                binary_path: Vec::new(),
                 language_features: Vec::new(),
             },
         );
@@ -833,6 +933,7 @@ object Main {
                 fatal_warnings: false,
                 library_abi: true,
                 classpath: Vec::new(),
+                binary_path: Vec::new(),
                 language_features: Vec::new(),
             },
         );

@@ -167,6 +167,13 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 fatal_warnings: opts.fatal_warnings,
                 library_abi: opts.scala_library.is_some(),
                 classpath: load_cp(&opts.class_path),
+                binary_path: {
+                    let mut p = opts.class_path.clone();
+                    if let Some(j) = &opts.scala_library {
+                        p.push(j.clone());
+                    }
+                    p
+                },
                 language_features: opts.language_features.clone(),
             },
         );
