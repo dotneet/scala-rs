@@ -1247,13 +1247,39 @@ impl Typer {
             _ => return,
         };
         if has_bounds && !has_tparams {
-            self.error(
-                span,
-                "unimplemented type: bounded type members (`type A <: T` / `type A >: T`)",
-            );
-            tree.ty = Type::Error;
+            let ty = if let TreeKind::TypeDef { rhs, lo, hi, .. } = &mut tree.kind {
+                let lo_ty = lo.as_ref().map(|t| self.tree_to_type(t));
+                let hi_ty = hi.as_ref().map(|t| self.tree_to_type(t));
+                if let Some(t) = &lo_ty {
+                    self.check_proper_type(t, span);
+                }
+                if let Some(t) = &hi_ty {
+                    self.check_proper_type(t, span);
+                }
+                if !type_member_id.is_none() {
+                    self.st.get_mut(type_member_id).bound_lo = lo_ty.clone();
+                    self.st.get_mut(type_member_id).bound_hi = hi_ty.clone();
+                }
+                if rhs.is_empty() {
+                    Type::TypeMember(type_member_id)
+                } else {
+                    let rhs_ty = self.tree_to_type(rhs);
+                    self.check_proper_type(&rhs_ty, span);
+                    self.check_alias_against_bounds(
+                        span,
+                        &name,
+                        &rhs_ty,
+                        lo_ty.as_ref(),
+                        hi_ty.as_ref(),
+                    );
+                    rhs_ty
+                }
+            } else {
+                return;
+            };
+            tree.ty = ty.clone();
             if !type_member_id.is_none() {
-                self.st.get_mut(type_member_id).ty = Type::Error;
+                self.st.get_mut(type_member_id).ty = ty;
             }
             return;
         }
@@ -1364,30 +1390,93 @@ impl Typer {
                                 "illegal inheritance: type member {name} has incompatible kinds (child takes {child_arity} type parameters, parent takes {parent_arity})"
                             ),
                         );
-                    } else if let Some(phi) = self.st.get(m).bound_hi.clone() {
+                    } else {
+                        let parent_hi = self.st.get(m).bound_hi.clone();
+                        let parent_lo = self.st.get(m).bound_lo.clone();
                         let child_ty = self.st.get(mid).ty.clone();
                         let child_hi = self.st.get(mid).bound_hi.clone();
-                        let ok = if matches!(&child_ty, Type::TypeMember(id) if *id == mid) {
-                            child_hi
-                                .as_ref()
-                                .map(|h| self.st.is_sub_type(h, &phi))
-                                .unwrap_or(false)
-                        } else {
-                            self.st.is_sub_type(&child_ty, &phi)
-                        };
-                        if !ok && !child_ty.is_error() && !phi.is_error() {
-                            self.error(
-                                span,
-                                format!(
-                                    "incompatible type in overriding type {name}: {} does not conform to {}",
-                                    self.st.display_type(&child_ty),
-                                    self.st.display_type(&phi)
-                                ),
-                            );
+                        let child_lo = self.st.get(mid).bound_lo.clone();
+                        let child_abs = matches!(&child_ty, Type::TypeMember(id) if *id == mid);
+                        if let Some(phi) = parent_hi {
+                            let ok = if child_abs {
+                                child_hi
+                                    .as_ref()
+                                    .map(|h| self.st.is_sub_type(h, &phi))
+                                    .unwrap_or(false)
+                            } else {
+                                self.st.is_sub_type(&child_ty, &phi)
+                            };
+                            if !ok && !child_ty.is_error() && !phi.is_error() {
+                                self.error(
+                                    span,
+                                    format!(
+                                        "incompatible type in overriding type {name}: {} does not conform to <: {}",
+                                        self.st.display_type(&child_ty),
+                                        self.st.display_type(&phi)
+                                    ),
+                                );
+                            }
+                        }
+                        if let Some(plo) = parent_lo {
+                            let ok = if child_abs {
+                                child_lo
+                                    .as_ref()
+                                    .map(|l| self.st.is_sub_type(&plo, l))
+                                    .unwrap_or(false)
+                            } else {
+                                self.st.is_sub_type(&plo, &child_ty)
+                            };
+                            if !ok && !child_ty.is_error() && !plo.is_error() {
+                                self.error(
+                                    span,
+                                    format!(
+                                        "incompatible type in overriding type {name}: {} does not conform to >: {}",
+                                        self.st.display_type(&child_ty),
+                                        self.st.display_type(&plo)
+                                    ),
+                                );
+                            }
                         }
                     }
                     break;
                 }
+            }
+        }
+    }
+
+    fn check_alias_against_bounds(
+        &mut self,
+        span: Span,
+        name: &str,
+        rhs: &Type,
+        lo: Option<&Type>,
+        hi: Option<&Type>,
+    ) {
+        if rhs.is_error() {
+            return;
+        }
+        if let Some(h) = hi {
+            if !h.is_error() && !self.st.is_sub_type(rhs, h) {
+                self.error(
+                    span,
+                    format!(
+                        "incompatible type in overriding type {name}: {} does not conform to <: {}",
+                        self.st.display_type(rhs),
+                        self.st.display_type(h)
+                    ),
+                );
+            }
+        }
+        if let Some(l) = lo {
+            if !l.is_error() && !self.st.is_sub_type(l, rhs) {
+                self.error(
+                    span,
+                    format!(
+                        "incompatible type in overriding type {name}: {} does not conform to >: {}",
+                        self.st.display_type(rhs),
+                        self.st.display_type(l)
+                    ),
+                );
             }
         }
     }
@@ -3216,7 +3305,7 @@ impl Typer {
             found = self.st.lookup_member(self.st.any_sym, "toString");
         }
         if found.is_empty() {
-            if let Some((conv, member, to)) = self.search_extension(&qual.ty, &name) {
+            if let Some((conv, member, to)) = self.search_extension(&qual.ty, &name, tree.span) {
                 let span = qual.span;
                 let old = std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty));
                 let fun = self.ref_implicit(conv, span);
@@ -3503,7 +3592,7 @@ impl Typer {
         let TreeKind::Select { qual, name } = &mut fun.kind else {
             return false;
         };
-        let Some((conv, member, to)) = self.search_extension(&qual.ty, name) else {
+        let Some((conv, member, to)) = self.search_extension(&qual.ty, name, fun.span) else {
             return false;
         };
         let span = qual.span;
@@ -3650,6 +3739,89 @@ impl Typer {
             args: vec![name_lit],
         };
         self.type_apply(tree, pt);
+    }
+
+    /// nsc `convertToAssignment`: `x += 1` becomes `x = x.+(1)` when `+=` is
+    /// not a member and the receiver is assignable. A real `def +=` wins.
+    fn try_rewrite_assignment_op(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        let name = match &tree.kind {
+            TreeKind::Apply { fun, .. } => match &fun.kind {
+                TreeKind::Select { name, .. } if is_assignment_op(name) => name.clone(),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        let span = tree.span;
+        let id = tree.id;
+        let TreeKind::Apply { fun, args } = &mut tree.kind else {
+            return false;
+        };
+        let fun_id = fun.id;
+        let fun_span = fun.span;
+        let TreeKind::Select { qual, .. } = &mut fun.kind else {
+            return false;
+        };
+        self.type_expr(qual, &Type::NoType);
+        let qual_ty = qual.ty.clone();
+        if self.receiver_has_term(&qual_ty, &name)
+            || self.search_extension(&qual_ty, &name, span).is_some()
+        {
+            return false;
+        }
+        if self.is_assignable_lhs(qual) {
+            let op = name[..name.len() - 1].to_string();
+            let lhs = (**qual).clone();
+            let rhs_args = args.clone();
+            let plus = Tree {
+                id: fun_id,
+                span: fun_span,
+                kind: TreeKind::Select {
+                    qual: Box::new(lhs.clone()),
+                    name: op,
+                },
+                ty: Type::NoType,
+                sym: SymbolId::NONE,
+                postfix: false,
+            };
+            let rhs = Tree {
+                id,
+                span,
+                kind: TreeKind::Apply {
+                    fun: Box::new(plus),
+                    args: rhs_args,
+                },
+                ty: Type::NoType,
+                sym: SymbolId::NONE,
+                postfix: false,
+            };
+            tree.kind = TreeKind::Assign {
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+            self.type_expr(tree, pt);
+            return true;
+        }
+        self.error(
+            span,
+            format!(
+                "value {name} is not a member of {}",
+                self.st.display_type(&qual_ty)
+            ),
+        );
+        self.error(
+            span,
+            "Expression does not convert to assignment because receiver is not assignable.",
+        );
+        tree.ty = Type::Error;
+        true
+    }
+
+    fn is_assignable_lhs(&self, tree: &Tree) -> bool {
+        if tree.sym.is_none() {
+            return false;
+        }
+        let s = self.st.get(tree.sym);
+        s.kind == SymKind::Term && s.flags.contains(Flags::MUTABLE)
     }
 
     fn try_rewrite_dynamic_apply(&mut self, tree: &mut Tree, pt: &Type) -> bool {
@@ -3946,6 +4118,9 @@ impl Typer {
     }
 
     fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
+        if self.try_rewrite_assignment_op(tree, pt) {
+            return;
+        }
         if self.try_rewrite_dynamic_apply(tree, pt) {
             return;
         }
@@ -7152,7 +7327,7 @@ impl Typer {
         }
     }
 
-    fn ensure_java_loaded(&mut self, class_id: SymbolId, span: Span) {
+    pub(crate) fn ensure_java_loaded(&mut self, class_id: SymbolId, span: Span) {
         if class_id.is_none() {
             return;
         }
@@ -8376,6 +8551,11 @@ fn has_named_dynamic_args(tree: &Tree) -> bool {
         TreeKind::Apply { args, .. } => args.iter().any(|a| Typer::named_arg_parts(a).is_some()),
         _ => false,
     }
+}
+
+/// nsc `isAssignmentOp`: ends with `=`, length > 1, not `==` / `!=` / `<=` / `>=`.
+fn is_assignment_op(name: &str) -> bool {
+    name.len() > 1 && name.ends_with('=') && !matches!(name, "==" | "!=" | "<=" | ">=")
 }
 
 fn is_implicit_conversion_shape(vparamss: &[Vec<Tree>]) -> bool {

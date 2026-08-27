@@ -702,8 +702,28 @@ fn fixtures_type_member_hk_bad_is_error() {
 }
 
 #[test]
-fn fixtures_type_member_bounds_is_error() {
-    compile_fails("type_member_bounds", "unimplemented");
+fn fixtures_type_member_bounds() {
+    check("type_member_bounds");
+}
+
+#[test]
+fn fixtures_type_member_bounds_bad_is_error() {
+    compile_fails("type_member_bounds_bad", "incompatible");
+}
+
+#[test]
+fn fixtures_assign_op() {
+    check("assign_op");
+}
+
+#[test]
+fn fixtures_assign_op_bad_is_error() {
+    compile_fails("assign_op_bad", "not a member");
+}
+
+#[test]
+fn fixtures_collection_converters_bad_is_error() {
+    compile_fails("collection_converters_bad", "asScala is not a member");
 }
 
 #[test]
@@ -1387,6 +1407,21 @@ fn scala_library_dual_run_refine_bound() {
 #[test]
 fn scala_library_dual_run_nested_proj() {
     dual_run_fixture("nested_proj");
+}
+
+#[test]
+fn scala_library_dual_run_type_member_bounds() {
+    dual_run_fixture("type_member_bounds");
+}
+
+#[test]
+fn scala_library_dual_run_assign_op() {
+    dual_run_fixture("assign_op");
+}
+
+#[test]
+fn scala_library_dual_run_collection_converters() {
+    dual_run_fixture("collection_converters");
 }
 
 #[test]

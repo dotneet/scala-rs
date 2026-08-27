@@ -2297,6 +2297,152 @@ object Main { def f(x: B#U#T): Int = 1 }
     }
 
     #[test]
+    fn nullary_bounded_type_members() {
+        ok(r#"
+trait Bound { def n: Int }
+class BI extends Bound { def n: Int = 41 }
+trait T { type A <: Bound; def x: A }
+class C extends T { type A = BI; def x: A = new BI }
+abstract class D { type A <: Int; def x: A }
+class E extends D { type A = Int; def x: A = 41 }
+abstract class Lo { type A >: Null; def y: A }
+class LoOk extends Lo { type A = String; def y: A = "ok" }
+object Main {
+  def fromC(c: C): Int = c.x.n
+  def fromE(e: E): Int = e.x
+  def asBound(t: T): Bound = t.x
+  def asInt(d: D): Int = d.x
+  def main(args: Array[String]): Unit = {
+    val a: Int = fromC(new C)
+    val b: Int = fromE(new E)
+    val c: Bound = asBound(new C)
+    val d: Int = asInt(new E)
+    val s: String = new LoOk().y
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait Bound
+class C { type A <: Bound }
+class D extends C { type A = Int }
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("incompatible")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+class C { type A >: String }
+class D extends C { type A = Int }
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("incompatible")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>
+        );
+    }
+
+    #[test]
+    fn assignment_operators() {
+        ok(r#"
+class Acc(var n: Int) {
+  def +=(k: Int): Acc = { n += k; this }
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    var x = 40
+    x += 1
+    val a = new Acc(1)
+    a += 1
+    val n: Int = x + a.n
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = 1
+    x += 1
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("not assignable")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn collection_converters_typecheck_with_library() {
+        let jar = std::path::PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+        if !jar.is_file() {
+            return;
+        }
+        let (t, _, diags) = typecheck_str_opts(
+            r#"
+import scala.jdk.CollectionConverters._
+object Main {
+  def main(args: Array[String]): Unit = {
+    val jl = new java.util.ArrayList[Int]()
+    jl.add(41)
+    val buf = jl.asScala
+    println(buf.head)
+    val xs = List(1, 2)
+    val jlist = xs.asJava
+    println(jlist.get(1))
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: vec![jar],
+                language_features: Vec::new(),
+            },
+        );
+        let _ = t;
+        assert!(
+            !has_errors(&diags),
+            "CollectionConverters must typecheck against scala-library: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val jl = new java.util.ArrayList[Int]()
+    val buf = jl.asScala
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("asScala is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn f_and_raw_interpolators_typecheck() {
         ok(r#"
 object Main {

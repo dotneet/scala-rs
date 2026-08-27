@@ -388,39 +388,82 @@ impl Typer {
 
     /// Implicit conversion from `from` whose result type has member `name`.
     pub(crate) fn search_extension(
-        &self,
+        &mut self,
         from: &Type,
         name: &str,
+        span: Span,
     ) -> Option<(SymbolId, SymbolId, Type)> {
         let mut hits: Vec<(SymbolId, SymbolId, Type)> = Vec::new();
-        let mut consider = |id: SymbolId| {
+        let mut ids = self.implicits_in_scope();
+        ids.extend(
+            self.companion_implicits(from)
+                .into_iter()
+                .chain(self.companion_implicits(&Type::Any)),
+        );
+        ids.sort_by_key(|id| id.0);
+        ids.dedup();
+        for id in ids {
+            let Some(param) = self.conversion_arg_ty(id) else {
+                continue;
+            };
+            if let Some(pcls) = self.st.class_sym_of(&param) {
+                self.ensure_java_loaded(pcls, span);
+            }
             let Some(to) = self.conversion_result(id, from) else {
-                return;
+                continue;
             };
             let Some(cls) = self.st.class_sym_of(&to) else {
-                return;
+                continue;
             };
+            self.ensure_java_loaded(cls, span);
             let members = self.st.lookup_member(cls, name);
             if let Some(m) = members.first() {
                 hits.push((id, *m, to));
             }
-        };
-        for id in self.implicits_in_scope() {
-            consider(id);
-        }
-        for id in self
-            .companion_implicits(from)
-            .into_iter()
-            .chain(self.companion_implicits(&Type::Any))
-        {
-            consider(id);
         }
         hits.sort_by_key(|(c, m, _)| (c.0, m.0));
         hits.dedup_by_key(|(c, m, _)| (c.0, m.0));
         match hits.len() {
             1 => Some(hits.pop().unwrap()),
-            _ => None,
+            0 => None,
+            _ => {
+                let convs: Vec<SymbolId> = hits.iter().map(|(c, _, _)| *c).collect();
+                let winners: Vec<SymbolId> = convs
+                    .iter()
+                    .copied()
+                    .filter(|&a| {
+                        !convs
+                            .iter()
+                            .any(|&b| self.conv_arg_strictly_more_specific(b, a))
+                    })
+                    .collect();
+                if winners.len() != 1 {
+                    return None;
+                }
+                hits.into_iter().find(|(c, _, _)| *c == winners[0])
+            }
         }
+    }
+
+    fn conv_arg_strictly_more_specific(&self, a: SymbolId, b: SymbolId) -> bool {
+        a != b
+            && match (self.conversion_arg_ty(a), self.conversion_arg_ty(b)) {
+                (Some(aa), Some(ab)) => {
+                    let aa = self.erase_method_tparams(a, &aa);
+                    let ab = self.erase_method_tparams(b, &ab);
+                    self.st.is_sub_type(&aa, &ab) && !self.st.is_sub_type(&ab, &aa)
+                }
+                _ => false,
+            }
+    }
+
+    fn erase_method_tparams(&self, id: SymbolId, ty: &Type) -> Type {
+        let tps = self.st.get(id).tparams.clone();
+        if tps.is_empty() {
+            return ty.clone();
+        }
+        let wilds = vec![Type::Wildcard; tps.len()];
+        crate::symbol::subst_tparams_slice(&tps, &wilds, ty)
     }
 
     fn conversion_result(&self, id: SymbolId, from: &Type) -> Option<Type> {
@@ -434,14 +477,14 @@ impl Typer {
                 if ps.len() != 1 {
                     return None;
                 }
-                if self.st.is_sub_type(from, &ps[0]) || matches!(ps[0], Type::Any) {
+                if self.conv_param_matches(id, from, &ps[0]) {
                     Some((**ret).clone())
                 } else {
                     None
                 }
             }
             Type::Function { params, ret } if params.len() == 1 => {
-                if self.st.is_sub_type(from, &params[0]) || matches!(params[0], Type::Any) {
+                if self.conv_param_matches(id, from, &params[0]) {
                     Some((**ret).clone())
                 } else {
                     None
@@ -449,6 +492,11 @@ impl Typer {
             }
             _ => None,
         }
+    }
+
+    fn conv_param_matches(&self, id: SymbolId, from: &Type, param: &Type) -> bool {
+        let param = self.erase_method_tparams(id, param);
+        self.st.is_sub_type(from, &param) || matches!(param, Type::Any | Type::Wildcard)
     }
 
     pub(crate) fn ref_implicit(&self, id: SymbolId, span: Span) -> Tree {
