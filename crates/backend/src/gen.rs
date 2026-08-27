@@ -4107,7 +4107,19 @@ fn gen_apply(
     if fun.name() == Some("$box") {
         if let Some(a) = args.first() {
             gen_expr(asm, frame, ctx, a);
-            emit_box(asm, &a.ty);
+            if is_unit_like(&a.ty) {
+                // nsc boxes Unit as BoxedUnit.UNIT. ArrayOps.head already left
+                // that ref (or null) on the stack; a Unit literal left nothing.
+                if ctx.library_abi {
+                    if !unit_leaves_boxed_ref(a, ctx.st) {
+                        emit_boxed_unit(asm);
+                    }
+                } else {
+                    emit_box(asm, &a.ty);
+                }
+            } else {
+                emit_box(asm, &a.ty);
+            }
         } else {
             asm.aconst_null();
         }
@@ -6338,10 +6350,7 @@ fn gen_wrap_varargs(
             elem,
             Type::Int | Type::Any | Type::AnyRef | Type::TypeParam(_)
         );
-    let all_unit = !args.is_empty()
-        && args
-            .iter()
-            .all(|a| matches!(a.ty.widen_constant(), Type::Unit | Type::NoType));
+    let all_unit = !args.is_empty() && args.iter().all(is_unit_varargs_elem);
     asm.getstatic(
         "scala/runtime/ScalaRunTime$",
         "MODULE$",
@@ -6361,20 +6370,14 @@ fn gen_wrap_varargs(
             "wrapIntArray",
             "([I)Lscala/collection/immutable/ArraySeq;",
         );
-    } else if all_unit {
+    } else if all_unit && ctx.library_abi {
         // nsc `Array((), ())` uses wrapUnitArray of BoxedUnit.UNIT, not null.
+        // Erasure may wrap some elems in `$box`, so treat those as Unit too.
         asm.anewarray("scala/runtime/BoxedUnit");
         for (i, a) in args.iter().enumerate() {
             asm.dup();
             asm.iconst(i as i32);
-            gen_expr(asm, frame, ctx, a);
-            if !unit_leaves_boxed_ref(a, ctx.st) {
-                asm.getstatic(
-                    "scala/runtime/BoxedUnit",
-                    "UNIT",
-                    "Lscala/runtime/BoxedUnit;",
-                );
-            }
+            gen_varargs_elem(asm, frame, ctx, a);
             asm.aastore();
         }
         asm.invokevirtual(
@@ -6387,10 +6390,7 @@ fn gen_wrap_varargs(
         for (i, a) in args.iter().enumerate() {
             asm.dup();
             asm.iconst(i as i32);
-            gen_expr(asm, frame, ctx, a);
-            if is_jvm_primitive(&a.ty) {
-                emit_box(asm, &a.ty);
-            }
+            gen_varargs_elem(asm, frame, ctx, a);
             asm.aastore();
         }
         asm.invokevirtual(
@@ -6470,15 +6470,57 @@ fn load_predef_module(asm: &mut Assembler) {
     asm.getstatic("scala/Predef$", "MODULE$", "Lscala/Predef$;");
 }
 
+fn emit_boxed_unit(asm: &mut Assembler) {
+    asm.getstatic(
+        "scala/runtime/BoxedUnit",
+        "UNIT",
+        "Lscala/runtime/BoxedUnit;",
+    );
+}
+
+/// Unit literals, and `$box(unit)` inserted by erasure (whose result type is
+/// Object). Used so `Array((), ())` still takes the wrapUnitArray path.
+fn is_unit_varargs_elem(tree: &Tree) -> bool {
+    if matches!(tree.ty.widen_constant(), Type::Unit | Type::NoType) {
+        return true;
+    }
+    match &tree.kind {
+        TreeKind::Typed { expr, .. } | TreeKind::Block { expr, .. } => is_unit_varargs_elem(expr),
+        TreeKind::TypeApply { fun, .. } => is_unit_varargs_elem(fun),
+        TreeKind::Apply { fun, args } => {
+            peel_fun(fun).name() == Some("$box") && args.first().is_some_and(is_unit_varargs_elem)
+        }
+        _ => false,
+    }
+}
+
+fn gen_varargs_elem(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, a: &Tree) {
+    if ctx.library_abi && is_unit_varargs_elem(a) {
+        if unit_leaves_boxed_ref(a, ctx.st) {
+            gen_expr(asm, frame, ctx, a);
+        } else {
+            gen_expr(asm, frame, ctx, a);
+            emit_boxed_unit(asm);
+        }
+    } else {
+        gen_expr(asm, frame, ctx, a);
+        if is_jvm_primitive(&a.ty) {
+            emit_box(asm, &a.ty);
+        }
+    }
+}
+
 /// True when a Unit-typed expression already left a boxed ref (`BoxedUnit` or
-/// `null`) on the stack — ArrayOps / generic `T` erased to Object. Unit
-/// literals leave nothing and need `BoxedUnit.UNIT`.
+/// `null`) on the stack — ArrayOps / generic `T` erased to Object / `$box`.
+/// Unit literals leave nothing and need `BoxedUnit.UNIT`.
 fn unit_leaves_boxed_ref(tree: &Tree, st: &SymbolTable) -> bool {
     match &tree.kind {
         TreeKind::Typed { expr, .. } => unit_leaves_boxed_ref(expr, st),
         TreeKind::TypeApply { fun, .. } => unit_leaves_boxed_ref(fun, st),
         TreeKind::Block { expr, .. } => unit_leaves_boxed_ref(expr, st),
-        TreeKind::Apply { fun, .. } => method_erases_unit_to_ref(fun, st),
+        TreeKind::Apply { fun, .. } => {
+            peel_fun(fun).name() == Some("$box") || method_erases_unit_to_ref(fun, st)
+        }
         TreeKind::Select { .. } | TreeKind::Ident { .. } => method_erases_unit_to_ref(tree, st),
         _ => false,
     }
@@ -6536,11 +6578,7 @@ fn gen_predef_println(
     if is_unit_like(&a.ty) {
         // nsc Predef.println(x: Any) prints BoxedUnit / null, not a fake "()".
         if !unit_leaves_boxed_ref(a, ctx.st) {
-            asm.getstatic(
-                "scala/runtime/BoxedUnit",
-                "UNIT",
-                "Lscala/runtime/BoxedUnit;",
-            );
+            emit_boxed_unit(asm);
         }
     } else if is_jvm_primitive(&a.ty) {
         emit_box(asm, &a.ty);
@@ -6730,11 +6768,7 @@ fn emit_box_inner(asm: &mut Assembler, ty: &Type) {
             asm.invokestatic("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;");
         }
         Type::Unit | Type::NoType => {
-            asm.getstatic(
-                "scala/runtime/BoxedUnit",
-                "UNIT",
-                "Lscala/runtime/BoxedUnit;",
-            );
+            asm.aconst_null();
         }
         _ => {}
     }
@@ -7424,14 +7458,7 @@ fn gen_println(
     match &arg.ty.widen_constant() {
         Type::Unit | Type::NoType => {
             gen_expr(asm, frame, ctx, arg);
-            if !unit_leaves_boxed_ref(arg, ctx.st) {
-                asm.getstatic(
-                    "scala/runtime/BoxedUnit",
-                    "UNIT",
-                    "Lscala/runtime/BoxedUnit;",
-                );
-            }
-            asm.invokevirtual("java/io/PrintStream", name, "(Ljava/lang/Object;)V");
+            asm.invokevirtual("java/io/PrintStream", name, "()V");
         }
         Type::Int | Type::Byte | Type::Short => {
             gen_expr(asm, frame, ctx, arg);
