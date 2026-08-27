@@ -4587,6 +4587,20 @@ fn invoke_value_extension(
         asm.invokevirtual("java/lang/String", "toLowerCase", "()Ljava/lang/String;");
         return;
     }
+    if owner == "scala/collection/StringOps" && s.name == "toArray" {
+        asm.invokestatic(
+            "scala/collection/StringOps",
+            "toArray$extension",
+            "(Ljava/lang/String;Lscala/reflect/ClassTag;)Ljava/lang/Object;",
+        );
+        maybe_unbox_erased_result(
+            asm,
+            ctx,
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            result_ty,
+        );
+        return;
+    }
     if owner == "scala/runtime/RichInt" && s.name == "to" {
         // 2.13 `to` returns Range$Inclusive, not the abstract Range.
         asm.invokestatic(
@@ -4640,6 +4654,48 @@ fn invoke_value_extension(
             asm.invokestatic(
                 "scala/collection/ArrayOps",
                 "map$extension",
+                "(Ljava/lang/Object;Lscala/Function1;Lscala/reflect/ClassTag;)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
+        if s.name == "filter" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "filter$extension",
+                "(Ljava/lang/Object;Lscala/Function1;)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
+        if s.name == "slice" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "slice$extension",
+                "(Ljava/lang/Object;II)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
+        if s.name == "flatMap" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "flatMap$extension",
                 "(Ljava/lang/Object;Lscala/Function1;Lscala/reflect/ClassTag;)Ljava/lang/Object;",
             );
             maybe_unbox_erased_result(
@@ -5178,6 +5234,28 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 return;
             }
         }
+        if is_stdlib_sortedmap_module(&owner) {
+            if name == "apply" {
+                asm.invokevirtual(
+                    "scala/collection/immutable/SortedMap$",
+                    "apply",
+                    "(Lscala/collection/immutable/Seq;Lscala/math/Ordering;)Ljava/lang/Object;",
+                );
+                asm.checkcast("scala/collection/immutable/SortedMap");
+                return;
+            }
+        }
+        if is_stdlib_treemap_module(&owner) {
+            if name == "apply" {
+                asm.invokevirtual(
+                    "scala/collection/immutable/TreeMap$",
+                    "apply",
+                    "(Lscala/collection/immutable/Seq;Lscala/math/Ordering;)Ljava/lang/Object;",
+                );
+                asm.checkcast("scala/collection/immutable/TreeMap");
+                return;
+            }
+        }
         if is_stdlib_set_module(&owner) {
             match name {
                 "empty" => {
@@ -5415,6 +5493,88 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "scala/util/Failure$",
                         "apply",
                         "(Ljava/lang/Throwable;)Lscala/util/Failure;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_sortedmap(&owner) {
+            match name {
+                "apply" => {
+                    asm.invokeinterface(
+                        "scala/collection/immutable/SortedMap",
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if !is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            let cls = jvm_desc(ctx.st, ty);
+                            if let Some(inner) =
+                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                            {
+                                if inner != "java/lang/Object" {
+                                    asm.checkcast(inner);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                "get" => {
+                    asm.invokeinterface(
+                        "scala/collection/immutable/SortedMap",
+                        "get",
+                        "(Ljava/lang/Object;)Lscala/Option;",
+                    );
+                    return;
+                }
+                "foreach" => {
+                    asm.invokeinterface(
+                        "scala/collection/immutable/SortedMap",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_treemap(&owner) {
+            match name {
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/TreeMap",
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if !is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            let cls = jvm_desc(ctx.st, ty);
+                            if let Some(inner) =
+                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                            {
+                                if inner != "java/lang/Object" {
+                                    asm.checkcast(inner);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                "get" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/TreeMap",
+                        "get",
+                        "(Ljava/lang/Object;)Lscala/Option;",
+                    );
+                    return;
+                }
+                "foreach" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/TreeMap",
+                        "foreach",
+                        "(Lscala/Function1;)V",
                     );
                     return;
                 }
@@ -6260,6 +6420,22 @@ fn is_stdlib_sortedset_module(owner: &str) -> bool {
 
 fn is_stdlib_treeset_module(owner: &str) -> bool {
     owner == "scala/collection/immutable/TreeSet$"
+}
+
+fn is_stdlib_sortedmap(owner: &str) -> bool {
+    owner == "scala/collection/immutable/SortedMap"
+}
+
+fn is_stdlib_sortedmap_module(owner: &str) -> bool {
+    owner == "scala/collection/immutable/SortedMap$"
+}
+
+fn is_stdlib_treemap(owner: &str) -> bool {
+    owner == "scala/collection/immutable/TreeMap"
+}
+
+fn is_stdlib_treemap_module(owner: &str) -> bool {
+    owner == "scala/collection/immutable/TreeMap$"
 }
 
 fn is_stdlib_seq(owner: &str) -> bool {

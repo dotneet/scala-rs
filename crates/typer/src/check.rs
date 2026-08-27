@@ -4608,7 +4608,18 @@ impl Typer {
                         }
                     }
                 } else if method_name == "flatMap" {
-                    if let Some(a0) = args.first() {
+                    if self.is_array_ops_ty(recv_ty.as_ref()) {
+                        if let Some(a0) = args.first() {
+                            if let Type::Function { ret: fr, .. } = &a0.ty {
+                                let elem = match fr.as_ref() {
+                                    Type::Class { args, .. } if !args.is_empty() => args[0].clone(),
+                                    Type::Array(e) => e.as_ref().clone(),
+                                    other => other.clone(),
+                                };
+                                ret = Type::Array(Box::new(elem.widen_constant()));
+                            }
+                        }
+                    } else if let Some(a0) = args.first() {
                         if let Type::Function { ret: fr, .. } = &a0.ty {
                             ret = (**fr).clone();
                         }
