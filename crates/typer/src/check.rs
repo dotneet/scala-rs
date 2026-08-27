@@ -5624,7 +5624,7 @@ impl Typer {
         let ty = ty.widen_constant();
         match kind {
             FConvKind::General => true,
-            FConvKind::Integral => matches!(ty, Type::Int | Type::Long),
+            FConvKind::Integral => matches!(ty, Type::Int | Type::Long | Type::Byte | Type::Short),
             FConvKind::Floating => matches!(ty, Type::Float | Type::Double),
             FConvKind::Character => matches!(ty, Type::Char | Type::Int),
             FConvKind::Unsupported => false,
@@ -7045,6 +7045,8 @@ impl Typer {
             | Type::Float
             | Type::Double
             | Type::Boolean
+            | Type::Byte
+            | Type::Short
             | Type::Unit
             | Type::Char
             | Type::String
@@ -7427,6 +7429,8 @@ impl Typer {
             "Double" => Type::Double,
             "Float" => Type::Float,
             "Boolean" => Type::Boolean,
+            "Byte" => Type::Byte,
+            "Short" => Type::Short,
             "Unit" => Type::Unit,
             "Char" => Type::Char,
             "String" => Type::String,
@@ -7494,6 +7498,8 @@ impl Typer {
                         | Type::Float
                         | Type::Double
                         | Type::Boolean
+                        | Type::Byte
+                        | Type::Short
                         | Type::Char
                         | Type::Unit
                 )
@@ -8490,6 +8496,8 @@ fn is_sub_type(a: &Type, b: &Type) -> bool {
             | Type::Long
             | Type::Double
             | Type::Boolean
+            | Type::Byte
+            | Type::Short
             | Type::Unit
             | Type::Char
             | Type::Float,
@@ -8710,6 +8718,8 @@ fn scala_module_evidence_type(outer: SymbolId, simple: &str) -> Option<Type> {
         "Double" => Type::Double,
         "Float" => Type::Float,
         "Boolean" => Type::Boolean,
+        "Byte" => Type::Byte,
+        "Short" => Type::Short,
         "Char" => Type::Char,
         "Unit" => Type::Unit,
         "String" => Type::String,

@@ -276,7 +276,7 @@ fn attach_scala_sig(
 fn jvm_sort(ty: &Type) -> JvmSort {
     match ty {
         Type::Unit | Type::NoType | Type::Nothing => JvmSort::Void,
-        Type::Boolean | Type::Int | Type::Char => JvmSort::Int,
+        Type::Boolean | Type::Int | Type::Char | Type::Byte | Type::Short => JvmSort::Int,
         Type::Long => JvmSort::Long,
         Type::Float => JvmSort::Float,
         Type::Double => JvmSort::Double,
@@ -297,6 +297,8 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
     match ty {
         Type::Unit | Type::NoType | Type::Nothing => "V".into(),
         Type::Boolean => "Z".into(),
+        Type::Byte => "B".into(),
+        Type::Short => "S".into(),
         Type::Int => "I".into(),
         Type::Long => "J".into(),
         Type::Float => "F".into(),
@@ -3706,7 +3708,14 @@ fn gen_structural_call(
         "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
     );
     match result {
-        Type::Int | Type::Boolean | Type::Long | Type::Double | Type::Char | Type::Float => {
+        Type::Int
+        | Type::Boolean
+        | Type::Long
+        | Type::Double
+        | Type::Char
+        | Type::Float
+        | Type::Byte
+        | Type::Short => {
             emit_unbox(asm, result);
         }
         Type::Unit | Type::NoType => {
@@ -3731,6 +3740,8 @@ fn gen_java_class_of(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
         Type::Double => asm.getstatic("java/lang/Double", "TYPE", "Ljava/lang/Class;"),
         Type::Float => asm.getstatic("java/lang/Float", "TYPE", "Ljava/lang/Class;"),
         Type::Char => asm.getstatic("java/lang/Character", "TYPE", "Ljava/lang/Class;"),
+        Type::Byte => asm.getstatic("java/lang/Byte", "TYPE", "Ljava/lang/Class;"),
+        Type::Short => asm.getstatic("java/lang/Short", "TYPE", "Ljava/lang/Class;"),
         Type::Unit | Type::NoType => asm.getstatic("java/lang/Void", "TYPE", "Ljava/lang/Class;"),
         Type::String => asm.ldc_class("java/lang/String"),
         Type::Class { sym, .. } | Type::ModuleRef(sym) => {
@@ -3827,6 +3838,14 @@ fn gen_select(
                     asm.invokestatic("java/lang/Long", "parseLong", "(Ljava/lang/String;)J");
                 } else if matches!(ic, Intrinsic::StringToDouble) {
                     asm.invokestatic("java/lang/Double", "parseDouble", "(Ljava/lang/String;)D");
+                } else if matches!(ic, Intrinsic::IntToLong) {
+                    asm.i2l();
+                } else if matches!(ic, Intrinsic::IntToDouble) {
+                    asm.i2d();
+                } else if matches!(ic, Intrinsic::IntToByte) {
+                    asm.i2b();
+                } else if matches!(ic, Intrinsic::IntToShort) {
+                    asm.i2s();
                 } else if matches!(ic, Intrinsic::NotImplemented) {
                     if ctx.library_abi {
                         // Receiver was already pushed; Predef.??? is MODULE$.???().
@@ -4344,6 +4363,16 @@ fn gen_apply(
                 gen_expr(asm, frame, ctx, qual);
                 return;
             }
+            Intrinsic::IntToByte => {
+                gen_expr(asm, frame, ctx, qual);
+                asm.i2b();
+                return;
+            }
+            Intrinsic::IntToShort => {
+                gen_expr(asm, frame, ctx, qual);
+                asm.i2s();
+                return;
+            }
             Intrinsic::IntToLong => {
                 gen_expr(asm, frame, ctx, qual);
                 asm.i2l();
@@ -4426,13 +4455,18 @@ fn gen_apply(
         let f = ctx.st.get(fun.sym).flags;
         f.contains(Flags::JAVA) && f.contains(Flags::VARARGS)
     };
+    let array_elem_op = matches!(
+        &fun.kind,
+        TreeKind::Select { qual, name }
+            if (name == "update" || name == "apply") && matches!(qual.ty, Type::Array(_))
+    );
     gen_call_args(
         asm,
         frame,
         ctx,
         args,
         &param_tys,
-        value_owner.is_some(),
+        value_owner.is_some() || (ctx.library_abi && !array_elem_op),
         java_varargs,
     );
     if let TreeKind::Select { qual, name } = &fun.kind {
@@ -4491,6 +4525,23 @@ fn invoke_value_extension(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     let s = ctx.st.get(id);
     let owner_id = s.owner;
     let owner = class_internal(ctx.st, owner_id);
+    if owner == "scala/runtime/RichBoolean" && s.name == "compare" {
+        // No compare$extension; nsc allocates RichBoolean and calls compare(Object).
+        // stack: recv_z, arg_z
+        asm.swap();
+        asm.new_obj("scala/runtime/RichBoolean");
+        asm.dup_x1();
+        asm.swap();
+        asm.invokespecial("scala/runtime/RichBoolean", "<init>", "(Z)V");
+        asm.swap();
+        asm.invokestatic("java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;");
+        asm.invokevirtual(
+            "scala/runtime/RichBoolean",
+            "compare",
+            "(Ljava/lang/Object;)I",
+        );
+        return;
+    }
     if owner == "scala/collection/StringOps" && s.name == "length" {
         // 2.13 StringOps inlines `length` to `String#length`; the jar exposes
         // `size$extension` which is the same call against the underlying String.
@@ -4854,6 +4905,28 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
                     );
                     asm.checkcast("scala/collection/immutable/Queue");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_arraybuffer_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ArrayBuffer$",
+                        "empty",
+                        "()Lscala/collection/mutable/ArrayBuffer;",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ArrayBuffer$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/mutable/ArrayBuffer");
                     return;
                 }
                 _ => {}
@@ -5278,6 +5351,49 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_arraybuffer(&owner) {
+            match name {
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ArrayBuffer",
+                        "apply",
+                        "(I)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            emit_unbox(asm, ty);
+                        } else if !is_unit_like(ty) {
+                            let cls = jvm_desc(ctx.st, ty);
+                            if let Some(inner) =
+                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                            {
+                                if inner != "java/lang/Object" {
+                                    asm.checkcast(inner);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                "update" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ArrayBuffer",
+                        "update",
+                        "(ILjava/lang/Object;)V",
+                    );
+                    return;
+                }
+                "+=" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ArrayBuffer",
+                        "+=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Growable;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
     if is_interface_sym(ctx.st, owner_id) {
         asm.invokeinterface(&owner, name, &desc);
@@ -5367,6 +5483,8 @@ fn is_concrete_array_elem(elem: &Type) -> bool {
             | Type::Double
             | Type::Float
             | Type::Char
+            | Type::Byte
+            | Type::Short
             | Type::String
             | Type::Class { .. }
             | Type::ModuleRef(_)
@@ -5379,6 +5497,8 @@ fn emit_newarray(asm: &mut Assembler, ctx: &EmitCtx, elem: &Type) {
         Type::Char => asm.newarray(5),
         Type::Float => asm.newarray(6),
         Type::Double => asm.newarray(7),
+        Type::Byte => asm.newarray(8),
+        Type::Short => asm.newarray(9),
         Type::Int => asm.newarray(10),
         Type::Long => asm.newarray(11),
         Type::String => asm.anewarray("java/lang/String"),
@@ -5454,6 +5574,14 @@ fn is_stdlib_queue(owner: &str) -> bool {
 
 fn is_stdlib_queue_module(owner: &str) -> bool {
     owner == "scala/collection/immutable/Queue$"
+}
+
+fn is_stdlib_arraybuffer(owner: &str) -> bool {
+    owner == "scala/collection/mutable/ArrayBuffer"
+}
+
+fn is_stdlib_arraybuffer_module(owner: &str) -> bool {
+    owner == "scala/collection/mutable/ArrayBuffer$"
 }
 
 fn is_stdlib_set(owner: &str) -> bool {
@@ -5616,7 +5744,7 @@ fn gen_call_args(
             gen_expr(asm, frame, ctx, a);
             if box_prims {
                 let pty = param_tys.get(i).unwrap_or(&a.ty);
-                if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
+                if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
                     emit_box(asm, &a.ty);
                 }
             }
@@ -5865,6 +5993,12 @@ fn emit_box_inner(asm: &mut Assembler, ty: &Type) {
         Type::Boolean => {
             asm.invokestatic("java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;");
         }
+        Type::Byte => {
+            asm.invokestatic("java/lang/Byte", "valueOf", "(B)Ljava/lang/Byte;");
+        }
+        Type::Short => {
+            asm.invokestatic("java/lang/Short", "valueOf", "(S)Ljava/lang/Short;");
+        }
         Type::Long => {
             asm.invokestatic("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;");
         }
@@ -5897,6 +6031,14 @@ fn emit_unbox_inner(asm: &mut Assembler, ty: &Type) {
         Type::Boolean => {
             asm.checkcast("java/lang/Boolean");
             asm.invokevirtual("java/lang/Boolean", "booleanValue", "()Z");
+        }
+        Type::Byte => {
+            asm.checkcast("java/lang/Byte");
+            asm.invokevirtual("java/lang/Byte", "byteValue", "()B");
+        }
+        Type::Short => {
+            asm.checkcast("java/lang/Short");
+            asm.invokevirtual("java/lang/Short", "shortValue", "()S");
         }
         Type::Long => {
             asm.checkcast("java/lang/Long");
@@ -5979,6 +6121,8 @@ fn is_jvm_primitive(ty: &Type) -> bool {
             | Type::Boolean
             | Type::Char
             | Type::Float
+            | Type::Byte
+            | Type::Short
             | Type::Unit
     )
 }
@@ -6560,7 +6704,7 @@ fn gen_println(
             gen_expr(asm, frame, ctx, arg);
             asm.invokevirtual("java/io/PrintStream", name, "()V");
         }
-        Type::Int => {
+        Type::Int | Type::Byte | Type::Short => {
             gen_expr(asm, frame, ctx, arg);
             asm.invokevirtual("java/io/PrintStream", name, "(I)V");
         }
@@ -6959,7 +7103,7 @@ fn gen_sb_append(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, value: &
             asm.ldc_string("()");
             "(Ljava/lang/String;)Ljava/lang/StringBuilder;"
         }
-        Type::Int => {
+        Type::Int | Type::Byte | Type::Short => {
             gen_expr(asm, frame, ctx, value);
             "(I)Ljava/lang/StringBuilder;"
         }

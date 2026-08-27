@@ -35,6 +35,8 @@ pub enum Intrinsic {
     Identity,
     IntToLong,
     IntToDouble,
+    IntToByte,
+    IntToShort,
     LongToDouble,
     Assert,
     Require,
@@ -311,6 +313,8 @@ impl SymbolTable {
         match ty {
             Type::Class { sym, .. } | Type::ModuleRef(sym) => Some(*sym),
             Type::Int => Some(self.int_sym),
+            Type::Byte => self.lookup("Byte").into_iter().next(),
+            Type::Short => self.lookup("Short").into_iter().next(),
             Type::Long => Some(self.long_sym),
             Type::Float => Some(self.float_sym),
             Type::Double => Some(self.double_sym),
@@ -647,6 +651,8 @@ impl SymbolTable {
                 | Type::Long
                 | Type::Double
                 | Type::Boolean
+                | Type::Byte
+                | Type::Short
                 | Type::Unit
                 | Type::Char
                 | Type::Float,

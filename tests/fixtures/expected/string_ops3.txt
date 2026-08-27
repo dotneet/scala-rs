@@ -1,0 +1,5 @@
+foo
+abxxx
+a
+Some(12)
+None

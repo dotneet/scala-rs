@@ -658,6 +658,21 @@ impl Assembler {
     pub fn i2b(&mut self) {
         self.emit_op(0x91);
     }
+    pub fn i2s(&mut self) {
+        self.emit_op(0x93);
+    }
+
+    /// `dup_x1`: `…, v2, v1` → `…, v1, v2, v1` (category-1).
+    pub fn dup_x1(&mut self) {
+        self.emit_op(0x5a);
+        if self.vstack.len() >= 2 {
+            let v1 = self.vstack[self.vstack.len() - 1].clone();
+            self.vstack.insert(self.vstack.len() - 2, v1);
+            self.bump(1);
+        } else {
+            self.bump(1);
+        }
+    }
 
     pub fn goto(&mut self, l: Label) {
         self.jump(0xa7, l, 0);

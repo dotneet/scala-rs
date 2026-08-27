@@ -1355,6 +1355,8 @@ impl<'a> Pickler<'a> {
         match ty {
             Type::Unit | Type::NoType => self.type_ref_named("Unit"),
             Type::Boolean => self.type_ref_named("Boolean"),
+            Type::Byte => self.type_ref_named("Byte"),
+            Type::Short => self.type_ref_named("Short"),
             Type::Int => self.type_ref_named("Int"),
             Type::Long => self.type_ref_named("Long"),
             Type::Float => self.type_ref_named("Float"),
@@ -2014,7 +2016,7 @@ fn bridge_erased(t: &Type) -> String {
         Type::Class { sym, .. } => format!("L#{}", sym.0),
         Type::ModuleRef(s) => format!("L#{}", s.0),
         Type::String => "Ljava/lang/String;".into(),
-        Type::Int | Type::Boolean | Type::Char => "I".into(),
+        Type::Int | Type::Boolean | Type::Char | Type::Byte | Type::Short => "I".into(),
         Type::Long => "J".into(),
         Type::Float => "F".into(),
         Type::Double => "D".into(),
