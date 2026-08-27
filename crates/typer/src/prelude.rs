@@ -305,6 +305,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         if let Some(so) = string_ops {
             add_string_ops_fold_left(st, so);
             add_string_ops_fold_right_and_grouped(st, so);
+            add_string_ops_map_and_appended(st, so);
         }
     }
 
@@ -2100,9 +2101,29 @@ fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         aops,
         "slice",
         vec![Type::Int, Type::Int],
+        Type::Array(Box::new(ta.clone())),
+        Intrinsic::None,
+    );
+    method(st, aops, "last", vec![], ta.clone(), Intrinsic::None);
+    method(
+        st,
+        aops,
+        "init",
+        vec![],
+        Type::Array(Box::new(ta.clone())),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "reverse",
+        vec![],
         Type::Array(Box::new(ta)),
         Intrinsic::None,
     );
+    method(st, aops, "size", vec![], Type::Int, Intrinsic::None);
+    method(st, aops, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
+    method(st, aops, "nonEmpty", vec![], Type::Boolean, Intrinsic::None);
     aops
 }
 
@@ -2517,6 +2538,37 @@ fn add_string_ops_fold_right_and_grouped(st: &mut SymbolTable, so: SymbolId) {
             sym: it,
             args: vec![Type::String],
         },
+        Intrinsic::None,
+    );
+}
+
+/// StringOps.map(Char => Char): String, `:+` / `+:` against 2.13.16.
+///
+/// JVM: `map$extension(String, Function1)String`,
+/// `$colon$plus$extension(String, C)String`, `$plus$colon$extension(String, C)String`.
+fn add_string_ops_map_and_appended(st: &mut SymbolTable, so: SymbolId) {
+    method(
+        st,
+        so,
+        "map",
+        vec![fn1(Type::Char, Type::Char)],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        ":+",
+        vec![Type::Char],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "+:",
+        vec![Type::Char],
+        Type::String,
         Intrinsic::None,
     );
 }
