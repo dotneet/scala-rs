@@ -4453,6 +4453,9 @@ impl Typer {
             }
         }
 
+        if fun_name == "flatMap" && self.is_array_ops_ty(recv_ty.as_ref()) {
+            self.bind_array_ops_flat_map(fun, args, recv_ty.as_ref(), &mut arg_tys);
+        }
         let fun_ty = fun.ty.clone();
         let chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
         match chosen {
@@ -4515,7 +4518,7 @@ impl Typer {
                 }
                 for (i, a) in args.iter_mut().enumerate() {
                     let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
-                    if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type() {
+                    if a.ty.is_no_type() {
                         self.type_expr(a, &p);
                     }
                     if !p.is_no_type() {
@@ -4563,6 +4566,15 @@ impl Typer {
                             let tps = self.st.get(sym).tparams.clone();
                             if tps.len() == 1 && !elem.is_no_type() && !elem.is_error() {
                                 let inst = vec![elem];
+                                param_tys = param_tys
+                                    .iter()
+                                    .map(|t| crate::symbol::subst_tparams_slice(&tps, &inst, t))
+                                    .collect();
+                                fun.ty = crate::symbol::subst_tparams_slice(&tps, &inst, &fun.ty);
+                                ret = crate::symbol::subst_tparams_slice(&tps, &inst, &ret);
+                            } else if tps.len() == 2 && !elem.is_no_type() && !elem.is_error() {
+                                let bs = fr.as_ref().clone();
+                                let inst = vec![bs, elem];
                                 param_tys = param_tys
                                     .iter()
                                     .map(|t| crate::symbol::subst_tparams_slice(&tps, &inst, t))
@@ -4918,6 +4930,7 @@ impl Typer {
                 })
             }
             Type::Class { sym, .. } if self.st.get(*sym).name == "Range" => Some(Type::Int),
+            Type::Class { sym, .. } if self.st.get(*sym).name == "BitSet" => Some(Type::Int),
             Type::Class { args, .. } if !args.is_empty() => Some(args[0].clone()),
             Type::ModuleRef(id) => {
                 let name = self.st.get(*id).name.as_str();
@@ -5347,6 +5360,8 @@ impl Typer {
                         args.push(ct);
                     } else if let Some(lam) = self.identity_view(&pty, span) {
                         args.push(lam);
+                    } else if let Some(lam) = self.array_wrap_view(&pty, span) {
+                        args.push(lam);
                     } else {
                         self.error(span, self.missing_implicit_message(&pty));
                     }
@@ -5474,6 +5489,170 @@ impl Typer {
             kind: TreeKind::Function {
                 vparams: vec![param],
                 body: Box::new(ident),
+            },
+            ty: Type::Function {
+                params: vec![from],
+                ret: Box::new(to.clone()),
+            },
+            sym: SymbolId::NONE,
+            postfix: false,
+        };
+        self.type_expr(&mut lam, pt);
+        self.adapt(&mut lam, pt);
+        Some(lam)
+    }
+
+    /// Prefer 4-arg `flatMap[BS, B]` when the lambda returns `Array`, else 3-arg.
+    fn bind_array_ops_flat_map(
+        &mut self,
+        fun: &mut Tree,
+        args: &mut [Tree],
+        recv_ty: Option<&Type>,
+        arg_tys: &mut [Type],
+    ) {
+        let Some(a0) = args.first_mut() else {
+            return;
+        };
+        if matches!(a0.kind, TreeKind::Function { .. }) && a0.ty.is_no_type() {
+            let elem = recv_ty.and_then(|t| self.elem_type(t)).unwrap_or(Type::Any);
+            let pt = Type::Function {
+                params: vec![elem.clone()],
+                ret: Box::new(Type::Any),
+            };
+            self.type_expr(a0, &pt);
+            if let TreeKind::Function { body, .. } = &a0.kind {
+                let body_ty = body.ty.widen_constant();
+                if !body_ty.is_no_type() && !body_ty.is_error() {
+                    a0.ty = Type::Function {
+                        params: vec![elem],
+                        ret: Box::new(body_ty),
+                    };
+                }
+            }
+            if let Some(slot) = arg_tys.first_mut() {
+                *slot = a0.ty.clone();
+            }
+        }
+        let lambda_ret = match arg_tys.first() {
+            Some(Type::Function { ret, .. }) => ret.as_ref(),
+            _ => return,
+        };
+        let want_four = matches!(lambda_ret, Type::Array(_));
+        let Some(owner) = recv_ty.and_then(|t| self.st.class_sym_of(t)) else {
+            return;
+        };
+        let methods = self.st.lookup_member(owner, "flatMap");
+        let Some(picked) = methods.into_iter().find(|m| {
+            let n = self.st.get(*m).tparams.len();
+            if want_four {
+                n >= 2
+            } else {
+                n == 1
+            }
+        }) else {
+            return;
+        };
+        fun.sym = picked;
+        let mut ty = self.st.get(picked).ty.clone();
+        if let Some(Type::Class { args, .. }) = recv_ty {
+            if !args.is_empty() {
+                ty = self.st.subst_tparams(owner, args, &ty);
+            }
+        }
+        fun.ty = ty;
+    }
+
+    /// nsc `implicit asIterable: Array[Int] => Iterable[Int]` is `Predef.wrapIntArray`.
+    fn array_wrap_view(&mut self, pt: &Type, span: Span) -> Option<Tree> {
+        let Type::Function { params, ret } = pt else {
+            return None;
+        };
+        if params.len() != 1 {
+            return None;
+        }
+        let Type::Array(elem) = &params[0] else {
+            return None;
+        };
+        if !matches!(elem.as_ref(), Type::Int) {
+            return None;
+        }
+        let wrap = {
+            let from_scope = self.st.lookup("wrapIntArray");
+            if let Some(id) = from_scope.into_iter().next() {
+                id
+            } else {
+                let cls = match &self.st.get(self.st.predef).ty {
+                    Type::ModuleRef(id) => *id,
+                    _ => return None,
+                };
+                self.st
+                    .lookup_member(cls, "wrapIntArray")
+                    .into_iter()
+                    .next()?
+            }
+        };
+        let from = params[0].clone();
+        let to = (**ret).clone();
+        self.gensym += 1;
+        let pname = format!("x${}", self.gensym);
+        let pid = self.st.alloc(
+            &pname,
+            self.st.owner,
+            crate::symbol::SymKind::Term,
+            Flags::PARAM.with(Flags::SYNTHETIC),
+            "",
+        );
+        self.st.get_mut(pid).ty = from.clone();
+        let ident = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Ident {
+                name: pname.clone(),
+            },
+            ty: from.clone(),
+            sym: pid,
+            postfix: false,
+        };
+        let param = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::ValDef {
+                mods: Modifiers::new(Flags::PARAM),
+                name: pname,
+                tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+                rhs: Box::new(Tree::dummy(TreeKind::Empty)),
+            },
+            ty: from.clone(),
+            sym: pid,
+            postfix: false,
+        };
+        let wrap_fun = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Ident {
+                name: "wrapIntArray".into(),
+            },
+            ty: self.st.get(wrap).ty.clone(),
+            sym: wrap,
+            postfix: false,
+        };
+        let body = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Apply {
+                fun: Box::new(wrap_fun),
+                args: vec![ident],
+            },
+            ty: to.clone(),
+            sym: wrap,
+            postfix: false,
+        };
+        let mut lam = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Function {
+                vparams: vec![param],
+                body: Box::new(body),
             },
             ty: Type::Function {
                 params: vec![from],

@@ -3680,6 +3680,49 @@ object Main {
     }
 
     #[test]
+    fn arrayops_flatmap4_stringops_bitset_typecheck_with_library() {
+        ok_lib(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val a = Array(1, 2).flatMap(i => List(i, i))
+    val b = Array(1, 2).flatMap(i => Array(i, i))
+    val ix = "abc".indices
+    val re = "a+".r
+    val m: Boolean = re.matches("aa")
+    val s = scala.collection.immutable.BitSet(3, 1, 2)
+    val c: Boolean = s.contains(1)
+  }
+}
+"#,
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = Array(1).noSuchFlatMap
+    val y = "abc".noSuchIndices
+    val z = scala.collection.immutable.BitSet(1).noSuch
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics

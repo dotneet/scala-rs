@@ -223,6 +223,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         if let Some(aops) = array_ops {
             add_array_ops_map(st, aops, ct);
             add_array_ops_flat_map(st, aops, ct);
+            add_array_ops_flat_map_from_array(st, aops, ct);
         }
         if let Some(so) = string_ops {
             add_string_ops_to_array(st, so, ct);
@@ -337,8 +338,10 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         let ordering = add_ordering(st);
         add_sorted_set(st, ordering);
         add_sorted_map(st, ordering);
+        add_bit_set(st);
         if let Some(so) = string_ops {
             add_string_ops_sorted(st, so, ordering);
+            add_string_ops_indices_and_r(st, so);
         }
         add_seq_and_lazylist(st);
         add_indexedseq_and_queue(st);
@@ -1936,7 +1939,8 @@ fn add_array_ops_map(st: &mut SymbolTable, aops: SymbolId, ct: SymbolId) {
 }
 
 /// `ArrayOps.flatMap[B](f: A => Any)(implicit ClassTag[B]): Array[B]`.
-/// Dual-run uses `List` (IterableOnce); the Array→Iterable overload is a later hole.
+/// Dual-run uses `List` (IterableOnce); the Array→Iterable 4-arg overload is
+/// `add_array_ops_flat_map_from_array`.
 fn add_array_ops_flat_map(st: &mut SymbolTable, aops: SymbolId, ct: SymbolId) {
     let a = st.get(aops).tparams[0];
     let ta = Type::TypeParam(a);
@@ -1968,6 +1972,182 @@ fn add_array_ops_flat_map(st: &mut SymbolTable, aops: SymbolId, ct: SymbolId) {
         ],
         ret: Box::new(Type::Array(Box::new(Type::TypeParam(b)))),
     };
+}
+
+/// `ArrayOps.flatMap[BS, B](f: A => BS)(implicit asIterable: BS => Iterable[B], m: ClassTag[B])`.
+/// nsc 2.13.16 4-arg JVM: `flatMap$extension(Object, Function1, Function1, ClassTag)Object`.
+fn add_array_ops_flat_map_from_array(st: &mut SymbolTable, aops: SymbolId, ct: SymbolId) {
+    let coll = crate::classpath::ensure_package(st, "scala/collection");
+    let iterable = iface(st, coll, "Iterable", "scala/collection/Iterable");
+    if st.get(iterable).tparams.is_empty() {
+        let ia = type_param(st, iterable, "A");
+        st.get_mut(iterable).tparams = vec![ia];
+    }
+    let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
+    let _of_int = class(
+        st,
+        mutp,
+        "ArraySeq$ofInt",
+        "scala/collection/mutable/ArraySeq$ofInt",
+        &[Type::Class {
+            sym: iterable,
+            args: vec![Type::Int],
+        }],
+    );
+    let a = st.get(aops).tparams[0];
+    let ta = Type::TypeParam(a);
+    let m = method(st, aops, "flatMap", vec![], Type::Unit, Intrinsic::None);
+    let bs = type_param(st, m, "BS");
+    let b = type_param(st, m, "B");
+    let f = st.alloc("f", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(f).ty = fn1(ta.clone(), Type::TypeParam(bs));
+    let as_it = st.alloc(
+        "asIterable",
+        m,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(as_it).ty = fn1(
+        Type::TypeParam(bs),
+        Type::Class {
+            sym: iterable,
+            args: vec![Type::TypeParam(b)],
+        },
+    );
+    let ev = st.alloc(
+        "evidence$1",
+        m,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(ev).ty = Type::Class {
+        sym: ct,
+        args: vec![Type::TypeParam(b)],
+    };
+    st.get_mut(m).tparams = vec![bs, b];
+    st.get_mut(m).params = vec![f, as_it, ev];
+    st.get_mut(m).paramss = vec![vec![f], vec![as_it, ev]];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![
+            vec![fn1(ta, Type::TypeParam(bs))],
+            vec![
+                fn1(
+                    Type::TypeParam(bs),
+                    Type::Class {
+                        sym: iterable,
+                        args: vec![Type::TypeParam(b)],
+                    },
+                ),
+                Type::Class {
+                    sym: ct,
+                    args: vec![Type::TypeParam(b)],
+                },
+            ],
+        ],
+        ret: Box::new(Type::Array(Box::new(Type::TypeParam(b)))),
+    };
+}
+
+fn add_string_ops_indices_and_r(st: &mut SymbolTable, so: SymbolId) {
+    let range = st
+        .lookup_member(st.scala_pkg, "Range")
+        .into_iter()
+        .find(|&id| st.get(id).kind == crate::symbol::SymKind::Class)
+        .unwrap_or(SymbolId::NONE);
+    method(
+        st,
+        so,
+        "indices",
+        vec![],
+        Type::Class {
+            sym: range,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+    let matching = crate::classpath::ensure_package(st, "scala/util/matching");
+    let regex = class(
+        st,
+        matching,
+        "Regex",
+        "scala/util/matching/Regex",
+        &[Type::AnyRef],
+    );
+    method(
+        st,
+        regex,
+        "findFirstIn",
+        vec![Type::String],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![Type::String],
+        },
+        Intrinsic::None,
+    );
+    method(
+        st,
+        regex,
+        "matches",
+        vec![Type::String],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "r",
+        vec![],
+        Type::Class {
+            sym: regex,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+}
+
+fn add_bit_set(st: &mut SymbolTable) {
+    let immp = crate::classpath::ensure_package(st, "scala/collection/immutable");
+    let bs = class(
+        st,
+        immp,
+        "BitSet",
+        "scala/collection/immutable/BitSet",
+        &[Type::AnyRef],
+    );
+    method(
+        st,
+        bs,
+        "contains",
+        vec![Type::Int],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        bs,
+        "foreach",
+        vec![fn1(Type::Int, Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let bs_t = Type::Class {
+        sym: bs,
+        args: vec![],
+    };
+    let bs_mod = module(st, immp, "BitSet", "scala/collection/immutable/BitSet$");
+    let bs_cls = st.module_class_of(bs_mod);
+    method(
+        st,
+        bs_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Int))],
+        bs_t,
+        Intrinsic::None,
+    );
+    let mems = st.get(bs_cls).members.clone();
+    st.get_mut(bs_mod).members.extend(mems);
 }
 
 /// `StringOps.toArray` with `ClassTag[Char]` — nsc `toArray[B >: Char : ClassTag]`.
@@ -4360,6 +4540,26 @@ fn add_predef_members(
         add_numeric_wrapper(st, owner, "byteWrapper", Type::Byte, rb);
         add_numeric_wrapper(st, owner, "shortWrapper", Type::Short, rs);
         add_numeric_wrapper(st, owner, "booleanWrapper", Type::Boolean, rbool);
+        let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
+        if let Some(of_int) = st
+            .lookup_member(mutp, "ArraySeq$ofInt")
+            .into_iter()
+            .find(|&id| st.get(id).kind == crate::symbol::SymKind::Class)
+        {
+            // nsc LowPriorityImplicits.wrapIntArray — not IMPLICIT here so it
+            // does not compete with intArrayOps for Array members.
+            method(
+                st,
+                owner,
+                "wrapIntArray",
+                vec![Type::Array(Box::new(Type::Int))],
+                Type::Class {
+                    sym: of_int,
+                    args: vec![],
+                },
+                Intrinsic::None,
+            );
+        }
     }
     let mems = st.get(owner).members.clone();
     st.get_mut(p).members.extend(mems.iter().copied());
