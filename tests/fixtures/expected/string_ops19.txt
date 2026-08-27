@@ -1,0 +1,8 @@
+cba
+Some(12)
+None
+Some(12)
+Some(1.5)
+ab
+cd
+ef

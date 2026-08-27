@@ -4824,6 +4824,28 @@ fn invoke_value_extension(
             maybe_unbox_erased_result(asm, ctx, desc, result_ty);
             return;
         }
+        if s.name == "count" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "count$extension",
+                "(Ljava/lang/Object;Lscala/Function1;)I",
+            );
+            return;
+        }
+        if s.name == "forall" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "forall$extension",
+                "(Ljava/lang/Object;Lscala/Function1;)Z",
+            );
+            return;
+        }
+        if s.name == "scanLeft" {
+            let desc = "(Ljava/lang/Object;Ljava/lang/Object;Lscala/Function2;Lscala/reflect/ClassTag;)Ljava/lang/Object;";
+            asm.invokestatic("scala/collection/ArrayOps", "scanLeft$extension", desc);
+            maybe_unbox_erased_result(asm, ctx, desc, result_ty);
+            return;
+        }
         asm.invokestatic(
             "scala/collection/ArrayOps",
             &format!("{}$extension", s.name),
@@ -4854,6 +4876,7 @@ fn invoke_value_extension(
         return;
     }
     asm.invokestatic(&owner, &format!("{}$extension", s.name), &desc);
+    maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
 }
 
 fn count_value_ext_args(desc: &str) -> usize {
