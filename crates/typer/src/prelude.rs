@@ -11,6 +11,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     st.anyref_sym = class(st, st.scala_pkg, "AnyRef", "java/lang/Object", &[Type::Any]);
     st.anyval_sym = class(st, st.scala_pkg, "AnyVal", "java/lang/Object", &[Type::Any]);
     st.object_sym = class(st, java_lang, "Object", "java/lang/Object", &[Type::AnyRef]);
+    mark_java(st, st.object_sym);
 
     st.unit_sym = class(
         st,
@@ -58,6 +59,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     let _ = char_s;
 
     st.string_sym = class(st, java_lang, "String", "java/lang/String", &[Type::AnyRef]);
+    mark_java(st, st.string_sym);
     let throwable = class(
         st,
         java_lang,
@@ -65,6 +67,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         "java/lang/Throwable",
         &[Type::AnyRef],
     );
+    mark_java(st, throwable);
     let exception = class(
         st,
         java_lang,
@@ -75,6 +78,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
             args: vec![],
         }],
     );
+    mark_java(st, exception);
     let _runtime_ex = class(
         st,
         java_lang,
@@ -85,7 +89,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
             args: vec![],
         }],
     );
+    mark_java(st, _runtime_ex);
     let jclass = class(st, java_lang, "Class", "java/lang/Class", &[Type::AnyRef]);
+    mark_java(st, jclass);
     method(st, jclass, "getName", vec![], Type::String, Intrinsic::None);
     st.array_sym = class(
         st,
@@ -270,6 +276,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_xml(st);
         add_enumeration(st);
     }
+    add_annotation_pkg(st);
 
     let arrow = if library_abi {
         let a = class(
@@ -332,6 +339,38 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     st.enter_in_current("Unit", st.unit_sym);
     st.enter_in_current("::", st.cons_sym);
     st.enter_in_current("Ordered", ordered);
+}
+
+fn mark_java(st: &mut SymbolTable, id: SymbolId) {
+    let f = st.get(id).flags.with(Flags::JAVA);
+    st.get_mut(id).flags = f;
+}
+
+fn add_annotation_pkg(st: &mut SymbolTable) {
+    let pkg = st.alloc(
+        "annotation",
+        st.scala_pkg,
+        SymKind::Package,
+        Flags::PACKAGE,
+        "scala/annotation",
+    );
+    let annotation = abs_class(
+        st,
+        pkg,
+        "Annotation",
+        "scala/annotation/Annotation",
+        &[Type::AnyRef],
+    );
+    let _ = abs_class(
+        st,
+        pkg,
+        "StaticAnnotation",
+        "scala/annotation/StaticAnnotation",
+        &[Type::Class {
+            sym: annotation,
+            args: vec![],
+        }],
+    );
 }
 
 fn class(
@@ -2494,8 +2533,28 @@ fn add_xml(st: &mut SymbolTable) {
     );
     let uk = ctor_field(st, upa, "key", Type::String);
     let uv = ctor_field(st, upa, "value", Type::String);
-    let un = ctor_field(st, upa, "next", meta_t);
+    let un = ctor_field(st, upa, "next", meta_t.clone());
     st.get_mut(upa).ctor_fields = vec![uk, uv, un];
+    let nsb_t = Type::Class {
+        sym: nsb,
+        args: vec![],
+    };
+    let np = ctor_field(st, nsb, "prefix", Type::String);
+    let nu = ctor_field(st, nsb, "uri", Type::String);
+    let npar = ctor_field(st, nsb, "parent", nsb_t);
+    st.get_mut(nsb).ctor_fields = vec![np, nu, npar];
+    let pa = class(
+        st,
+        xml,
+        "PrefixedAttribute",
+        "scala/xml/PrefixedAttribute",
+        &[meta_t.clone()],
+    );
+    let pp = ctor_field(st, pa, "pre", Type::String);
+    let pk = ctor_field(st, pa, "key", Type::String);
+    let pv = ctor_field(st, pa, "value", Type::String);
+    let pn = ctor_field(st, pa, "next", meta_t);
+    st.get_mut(pa).ctor_fields = vec![pp, pk, pv, pn];
 }
 
 /// `scala.Enumeration` plus inner `Value` (`Color.Red.toString` / `.id` against the jar).

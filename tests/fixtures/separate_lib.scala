@@ -3,6 +3,11 @@ class Holder {
   def me: this.type = this
   def n: Int = 1
 }
+class Ann(x: Any) extends annotation.StaticAnnotation
+class C { val x = 1 }
+class OrdBox(val n: Int) extends Ordered[OrdBox] {
+  def compare(that: OrdBox): Int = n - that.n
+}
 object Lib {
   val magic: Int = 7
   def greet(name: String, punct: String = "!"): String = "hi " + name + punct
@@ -17,6 +22,12 @@ object Lib {
   def lit(x: 1): Int = x
   def nest(xs: List[_ <: List[_]]): Int = 0
   def idRef(x: MixA with MixB { def f: Int }): MixA with MixB { def f: Int } = x
+  val foo = 1
+  val c = new C
+  @Ann(foo) def marked: Int = 1
+  @Ann(c.x) def markedSel: Int = 2
+  @Ann(3) def markedLit: Int = 3
+  def join(xs: String*): Int = 0
 }
 trait MixA { def a: Int }
 trait MixB { def b: Int }
