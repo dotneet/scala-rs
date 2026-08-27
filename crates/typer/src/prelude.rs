@@ -279,6 +279,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_indexedseq_and_queue(st);
         add_array_buffer(st);
         add_list_buffer(st);
+        add_string_builder(st);
         add_either(st);
         add_try(st, throwable);
         add_xml(st);
@@ -1197,6 +1198,16 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
             sym: iterator,
             args: vec![Type::String],
         },
+        Intrinsic::None,
+    );
+    method(st, so, "capitalize", vec![], Type::String, Intrinsic::None);
+    method(st, so, "reverse", vec![], Type::String, Intrinsic::None);
+    method(
+        st,
+        so,
+        "slice",
+        vec![Type::Int, Type::Int],
+        Type::String,
         Intrinsic::None,
     );
     so
@@ -2151,6 +2162,23 @@ fn add_list_buffer(st: &mut SymbolTable) {
     st.get_mut(buf_mod).members.extend(mems);
 }
 
+fn add_string_builder(st: &mut SymbolTable) {
+    let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
+    let sb = class(
+        st,
+        mutp,
+        "StringBuilder",
+        "scala/collection/mutable/StringBuilder",
+        &[Type::AnyRef],
+    );
+    let sb_t = Type::Class {
+        sym: sb,
+        args: vec![],
+    };
+    method(st, sb, "+=", vec![Type::Any], sb_t.clone(), Intrinsic::None);
+    method(st, sb, "append", vec![Type::String], sb_t, Intrinsic::None);
+}
+
 fn add_either(st: &mut SymbolTable) {
     let either = class(
         st,
@@ -2542,6 +2570,19 @@ fn add_rich_byte_short_boolean(st: &mut SymbolTable) -> (SymbolId, SymbolId, Sym
         Type::Short,
         Intrinsic::None,
     );
+    let nr_s = Type::Class {
+        sym: nr,
+        args: vec![Type::Short],
+    };
+    method(
+        st,
+        rs,
+        "to",
+        vec![Type::Short],
+        nr_s.clone(),
+        Intrinsic::None,
+    );
+    method(st, rs, "until", vec![Type::Short], nr_s, Intrinsic::None);
     let rbool = add_rich_value(
         st,
         "RichBoolean",

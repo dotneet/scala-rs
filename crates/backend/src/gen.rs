@@ -4585,7 +4585,11 @@ fn invoke_value_extension(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     }
     if owner == "scala/runtime/RichByte" && (s.name == "to" || s.name == "until") {
         // RichByte has no to$extension; IntegralProxy default builds a real NumericRange.
-        emit_rich_byte_numeric_range(asm, s.name == "to");
+        emit_integral_numeric_range(asm, &Type::Byte, s.name == "to");
+        return;
+    }
+    if owner == "scala/runtime/RichShort" && (s.name == "to" || s.name == "until") {
+        emit_integral_numeric_range(asm, &Type::Short, s.name == "to");
         return;
     }
     if owner == "scala/runtime/RichChar" && s.name == "toInt" {
@@ -5464,6 +5468,27 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_stringbuilder(&owner) {
+            match name {
+                "+=" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/StringBuilder",
+                        "+=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Growable;",
+                    );
+                    return;
+                }
+                "append" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/StringBuilder",
+                        "append",
+                        "(Ljava/lang/String;)Lscala/collection/mutable/StringBuilder;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_stdlib_range(&owner) || is_stdlib_numeric_range(&owner) {
             if name == "mkString" {
                 asm.invokeinterface(
@@ -5672,6 +5697,55 @@ fn is_stdlib_listbuffer_module(owner: &str) -> bool {
     owner == "scala/collection/mutable/ListBuffer$"
 }
 
+fn is_stdlib_stringbuilder(owner: &str) -> bool {
+    owner == "scala/collection/mutable/StringBuilder"
+}
+
+fn emit_integral_numeric_range(asm: &mut Assembler, elem: &Type, inclusive: bool) {
+    // stack: start, end (integral as int)
+    let integral = match elem {
+        Type::Short => "scala/math/Numeric$ShortIsIntegral$",
+        _ => "scala/math/Numeric$ByteIsIntegral$",
+    };
+    asm.swap();
+    narrow_integral(asm, elem);
+    emit_box(asm, elem);
+    asm.swap();
+    narrow_integral(asm, elem);
+    emit_box(asm, elem);
+    asm.getstatic(
+        "scala/collection/immutable/NumericRange$",
+        "MODULE$",
+        "Lscala/collection/immutable/NumericRange$;",
+    );
+    asm.dup_x2();
+    asm.pop();
+    asm.iconst(1);
+    narrow_integral(asm, elem);
+    emit_box(asm, elem);
+    asm.getstatic(integral, "MODULE$", &format!("L{integral};"));
+    if inclusive {
+        asm.invokevirtual(
+            "scala/collection/immutable/NumericRange$",
+            "inclusive",
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Lscala/math/Integral;)Lscala/collection/immutable/NumericRange$Inclusive;",
+        );
+    } else {
+        asm.invokevirtual(
+            "scala/collection/immutable/NumericRange$",
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Lscala/math/Integral;)Lscala/collection/immutable/NumericRange$Exclusive;",
+        );
+    }
+}
+
+fn narrow_integral(asm: &mut Assembler, elem: &Type) {
+    match elem {
+        Type::Short => asm.i2s(),
+        _ => asm.i2b(),
+    }
+}
+
 fn is_stdlib_range(owner: &str) -> bool {
     matches!(
         owner,
@@ -5686,44 +5760,6 @@ fn is_stdlib_numeric_range(owner: &str) -> bool {
             | "scala/collection/immutable/NumericRange$Inclusive"
             | "scala/collection/immutable/NumericRange$Exclusive"
     )
-}
-
-fn emit_rich_byte_numeric_range(asm: &mut Assembler, inclusive: bool) {
-    // stack: start (byte as int), end (byte as int)
-    asm.swap();
-    asm.i2b();
-    emit_box(asm, &Type::Byte);
-    asm.swap();
-    asm.i2b();
-    emit_box(asm, &Type::Byte);
-    asm.getstatic(
-        "scala/collection/immutable/NumericRange$",
-        "MODULE$",
-        "Lscala/collection/immutable/NumericRange$;",
-    );
-    asm.dup_x2();
-    asm.pop();
-    asm.iconst(1);
-    asm.i2b();
-    emit_box(asm, &Type::Byte);
-    asm.getstatic(
-        "scala/math/Numeric$ByteIsIntegral$",
-        "MODULE$",
-        "Lscala/math/Numeric$ByteIsIntegral$;",
-    );
-    if inclusive {
-        asm.invokevirtual(
-            "scala/collection/immutable/NumericRange$",
-            "inclusive",
-            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Lscala/math/Integral;)Lscala/collection/immutable/NumericRange$Inclusive;",
-        );
-    } else {
-        asm.invokevirtual(
-            "scala/collection/immutable/NumericRange$",
-            "apply",
-            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Lscala/math/Integral;)Lscala/collection/immutable/NumericRange$Exclusive;",
-        );
-    }
 }
 
 fn is_stdlib_set(owner: &str) -> bool {

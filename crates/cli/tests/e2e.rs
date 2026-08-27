@@ -771,6 +771,21 @@ fn fixtures_listbuffer_bad_is_error() {
 }
 
 #[test]
+fn fixtures_string_ops5_bad_is_error() {
+    compile_fails_lib("string_ops5_bad", "noSuchCap is not a member");
+}
+
+#[test]
+fn fixtures_short_range_bad_is_error() {
+    compile_fails_lib("short_range_bad", "noSuchMk is not a member");
+}
+
+#[test]
+fn fixtures_stringbuilder_bad_is_error() {
+    compile_fails_lib("stringbuilder_bad", "noSuch is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1399,6 +1414,21 @@ fn scala_library_dual_run_listbuffer() {
 }
 
 #[test]
+fn scala_library_dual_run_string_ops5() {
+    dual_run_fixture("string_ops5");
+}
+
+#[test]
+fn scala_library_dual_run_short_range() {
+    dual_run_fixture("short_range");
+}
+
+#[test]
+fn scala_library_dual_run_stringbuilder() {
+    dual_run_fixture("stringbuilder");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -1675,6 +1705,8 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/mutable/ArrayBuffer$.class",
     "scala/collection/mutable/ListBuffer.class",
     "scala/collection/mutable/ListBuffer$.class",
+    "scala/collection/mutable/StringBuilder.class",
+    "scala/collection/mutable/StringBuilder$.class",
     "scala/collection/immutable/NumericRange.class",
     "scala/collection/immutable/NumericRange$.class",
     "scala/collection/immutable/NumericRange$Inclusive.class",
