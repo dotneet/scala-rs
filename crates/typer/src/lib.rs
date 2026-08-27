@@ -2772,6 +2772,123 @@ object Main {
         );
     }
 
+    fn pkg_implicit_classpath(nested_first: bool) -> Vec<ClasspathClass> {
+        let pkg = ClasspathClass {
+            jvm_name: "enrich/package$".into(),
+            is_module: true,
+            methods: vec![ClasspathMethod {
+                name: "Rich".into(),
+                desc: "(I)Lenrich/package$Rich;".into(),
+            }],
+            pickle: Some(vec![ClasspathPickleMethod {
+                name: "Rich".into(),
+                param_names: vec!["n".into()],
+                param_types: vec!["Int".into()],
+                ret: "Rich".into(),
+                tparams: vec![],
+                is_val: false,
+                is_ctor: false,
+                is_implicit: true,
+            }]),
+            pickle_tparams: vec![],
+        };
+        let nested = ClasspathClass {
+            jvm_name: "enrich/package$Rich".into(),
+            is_module: false,
+            methods: vec![ClasspathMethod {
+                name: "twice".into(),
+                desc: "()I".into(),
+            }],
+            pickle: Some(vec![
+                ClasspathPickleMethod {
+                    name: "<init>".into(),
+                    param_names: vec!["n".into()],
+                    param_types: vec!["Int".into()],
+                    ret: "Unit".into(),
+                    tparams: vec![],
+                    is_val: false,
+                    is_ctor: true,
+                    is_implicit: false,
+                },
+                ClasspathPickleMethod {
+                    name: "twice".into(),
+                    param_names: vec![],
+                    param_types: vec![],
+                    ret: "Int".into(),
+                    tparams: vec![],
+                    is_val: false,
+                    is_ctor: false,
+                    is_implicit: false,
+                },
+            ]),
+            pickle_tparams: vec![],
+        };
+        if nested_first {
+            vec![nested, pkg]
+        } else {
+            vec![pkg, nested]
+        }
+    }
+
+    fn assert_pkg_implicit_cp(cp: Vec<ClasspathClass>) {
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+import enrich._
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = 2.twice
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: false,
+                classpath: cp.clone(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(
+            !has_errors(&diags),
+            "classpath package-object implicit class must typecheck: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = 2.twice
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: false,
+                classpath: cp,
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(
+            has_errors(&diags),
+            "expected missing import, got {:?}",
+            diags
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("twice") && d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn classpath_package_object_implicit_class() {
+        assert_pkg_implicit_cp(pkg_implicit_classpath(false));
+        assert_pkg_implicit_cp(pkg_implicit_classpath(true));
+    }
+
     #[test]
     fn structural_update_typecheck() {
         ok(r#"

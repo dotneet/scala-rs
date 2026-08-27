@@ -3851,6 +3851,11 @@ fn gen_select(
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
                 return;
             }
+            SymKind::Package => {
+                // Package prefixes of `scala.collection.immutable.Queue` have
+                // no runtime value; the module Select loads MODULE$.
+                return;
+            }
             _ => {}
         }
     }
@@ -4616,6 +4621,22 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
     }
     match &fun.kind {
         TreeKind::Select { qual, .. } => {
+            if !fun.sym.is_none() {
+                let s = ctx.st.get(fun.sym);
+                if matches!(s.kind, SymKind::Module | SymKind::ModuleClass) {
+                    let jvm = class_internal(ctx.st, module_class_id(ctx.st, fun.sym));
+                    asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+                    return;
+                }
+                if s.kind == SymKind::Method && is_module_class(ctx.st, s.owner) {
+                    let jvm = class_internal(ctx.st, module_class_id(ctx.st, s.owner));
+                    asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+                    return;
+                }
+                if s.kind == SymKind::Package {
+                    return;
+                }
+            }
             gen_expr(asm, frame, ctx, qual);
         }
         _ => {

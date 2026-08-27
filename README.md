@@ -238,9 +238,9 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 
 対象外から外した（このスライスで実装）:
 
-- クラス / トレイトの nullary 境界付き型メンバー `type A <: T` / `type A >: T`（refinement の `{ type A <: T }` と HK `type F[_] <: Bound` は前スライス）
-- 代入演算子 `x += 1`（nsc どおり `x = x.+(1)`、または `def +=` があるときのメンバー呼び出し）
-- `scala.jdk.CollectionConverters` の `asScala` / `asJava`（scala-library 2.13.16 の本物。偽コレクションは出さない）
+- **package object の `implicit class`**（同じパッケージの他 compilation unit / `import pkg._`。pickle の IMPLICIT。ネスト classfile `package$Rich` は outer のメンバー `Rich` として `-cp` に載せる。トップレベル `implicit class` は nsc どおり `` `implicit` modifier cannot be used for top-level objects ``。import 無しでは enrichment が見えない。ローカル implicit class の合成は触っていない）
+- **構造的代入** `x.foo = v`（`{ var foo: T }` または getter + `foo_=`）と構造的 `x(i) = v`（`update`）。nsc 2.13 どおり reflective `foo_=` / `update`。違法な `{ def foo: Int }; x.foo = 1` は `foo_= is not a member`
+- scala-library 2.13.16 の **`IndexedSeq` / `immutable.Queue`**（本物の jar。`IndexedSeq(1,2)(1)` と `enqueue` / `dequeue`。無いメンバーは診断。偽 classfile は出さない）
 
 ライブラリ:
 

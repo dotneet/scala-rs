@@ -7,12 +7,14 @@ use crate::symbol::{SymKind, SymbolTable};
 
 pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
     let mut installed: Vec<(usize, SymbolId)> = Vec::new();
-    for (i, c) in classes.iter().enumerate() {
+    // Nested classfiles (`enrich/package$Rich`) must see their outer module
+    // (`enrich/package$`) first, otherwise they land as `package$Rich` on the
+    // package and `import enrich._` cannot convert via `Rich`.
+    let mut order: Vec<usize> = (0..classes.len()).collect();
+    order.sort_by_key(|&i| nest_depth(&classes[i].jvm_name));
+    for i in order {
+        let c = &classes[i];
         if c.jvm_name.contains("$anon") || c.jvm_name.ends_with("$class") {
-            continue;
-        }
-        let simple = simple_name(&c.jvm_name);
-        if simple.is_empty() {
             continue;
         }
         if is_forwarder_of_module(classes, c) {
@@ -25,7 +27,10 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
         if c.pickle.is_none() {
             continue;
         }
-        let owner = classpath_owner(st, &c.jvm_name);
+        let (owner, simple) = classpath_symbol_owner(st, &c.jvm_name);
+        if simple.is_empty() {
+            continue;
+        }
         if c.is_module {
             let jvm = if c.jvm_name.ends_with('$') {
                 c.jvm_name.clone()
@@ -224,6 +229,24 @@ fn resolve_type_in(st: &SymbolTable, owner: SymbolId, name: &str, method_tps: &[
             return Type::TypeParam(*id);
         }
     }
+    let mut cur = owner;
+    let mut seen = std::collections::HashSet::new();
+    while !cur.is_none() && seen.insert(cur.0) {
+        if let Some(id) = st
+            .lookup_member(cur, name)
+            .into_iter()
+            .find(|&s| st.get(s).is_class_like())
+        {
+            return match st.get(id).kind {
+                SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
+                _ => Type::Class {
+                    sym: id,
+                    args: vec![],
+                },
+            };
+        }
+        cur = st.get(cur).owner;
+    }
     resolve_type_name(st, name)
 }
 
@@ -312,6 +335,44 @@ fn is_forwarder_of_module(classes: &[ClasspathClass], c: &ClasspathClass) -> boo
 fn simple_name(jvm: &str) -> String {
     let last = jvm.rsplit('/').next().unwrap_or(jvm);
     last.trim_end_matches('$').to_string()
+}
+
+fn nest_depth(jvm: &str) -> usize {
+    let last = jvm.rsplit('/').next().unwrap_or(jvm);
+    last.trim_end_matches('$')
+        .bytes()
+        .filter(|&b| b == b'$')
+        .count()
+}
+
+fn classpath_nested_parent(st: &SymbolTable, jvm: &str) -> Option<SymbolId> {
+    let last = jvm.rsplit('/').next().unwrap_or(jvm);
+    let last_trim = last.trim_end_matches('$');
+    let idx = last_trim.rfind('$')?;
+    let outer_simple = &last_trim[..idx];
+    let pkg = jvm.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    let module_jvm = if pkg.is_empty() {
+        format!("{outer_simple}$")
+    } else {
+        format!("{pkg}/{outer_simple}$")
+    };
+    let class_jvm = if pkg.is_empty() {
+        outer_simple.to_string()
+    } else {
+        format!("{pkg}/{outer_simple}")
+    };
+    find_by_jvm(st, &module_jvm).or_else(|| find_by_jvm(st, &class_jvm))
+}
+
+fn classpath_symbol_owner(st: &mut SymbolTable, jvm_name: &str) -> (SymbolId, String) {
+    if nest_depth(jvm_name) > 0 {
+        let simple = java_simple_name(jvm_name);
+        if let Some(parent) = classpath_nested_parent(st, jvm_name) {
+            return (parent, simple);
+        }
+        return (classpath_owner(st, jvm_name), simple);
+    }
+    (classpath_owner(st, jvm_name), simple_name(jvm_name))
 }
 
 fn classpath_owner(st: &mut SymbolTable, jvm_name: &str) -> SymbolId {

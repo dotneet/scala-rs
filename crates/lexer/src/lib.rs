@@ -257,8 +257,16 @@ impl<'a> Lexer<'a> {
         while self.peek().is_some_and(is_id_part) {
             self.bump();
         }
-        // `foo_+` style: ident can continue with op chars after underscore? Scala
-        // allows sequential id chars only. Operator names are separate.
+        // nsc mixed identifier: `foo_=` / `foo_+=` (`idrest` = … `_` op).
+        if self
+            .src
+            .get(start..self.pos)
+            .is_some_and(|t| t.ends_with('_'))
+        {
+            while self.peek().is_some_and(is_op_char) {
+                self.bump();
+            }
+        }
         let text = &self.src[start..self.pos];
         // Interpolator: identifier immediately followed by " or """
         if self.peek() == Some('"') {
@@ -871,6 +879,7 @@ mod tests {
         use TokenKind::*;
         assert_eq!(kinds("=> <- <:"), vec![Arrow, LeftArrow, Subtype]);
         assert_eq!(kinds("+ ++"), vec![Ident("+".into()), Ident("++".into())]);
+        assert_eq!(kinds("foo_="), vec![Ident("foo_=".into())]);
     }
 
     #[test]
