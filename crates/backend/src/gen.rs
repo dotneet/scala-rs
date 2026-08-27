@@ -4814,6 +4814,16 @@ fn invoke_value_extension(
             );
             return;
         }
+        if s.name == "foldLeft" || s.name == "fold" || s.name == "foldRight" {
+            let desc = "(Ljava/lang/Object;Ljava/lang/Object;Lscala/Function2;)Ljava/lang/Object;";
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                &format!("{}$extension", s.name),
+                desc,
+            );
+            maybe_unbox_erased_result(asm, ctx, desc, result_ty);
+            return;
+        }
         asm.invokestatic(
             "scala/collection/ArrayOps",
             &format!("{}$extension", s.name),

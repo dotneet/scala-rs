@@ -984,6 +984,21 @@ fn fixtures_breaks2_bad_is_error() {
 }
 
 #[test]
+fn fixtures_array_ops14_bad_is_error() {
+    compile_fails_lib("array_ops14_bad", "noSuchFoldLeft is not a member");
+}
+
+#[test]
+fn fixtures_string_ops18_bad_is_error() {
+    compile_fails_lib("string_ops18_bad", "noSuchToByte is not a member");
+}
+
+#[test]
+fn fixtures_bigint_bad_is_error() {
+    compile_fails_lib("bigint_bad", "noSuch is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1822,6 +1837,21 @@ fn scala_library_dual_run_breaks2() {
 }
 
 #[test]
+fn scala_library_dual_run_array_ops14() {
+    dual_run_fixture("array_ops14");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops18() {
+    dual_run_fixture("string_ops18");
+}
+
+#[test]
+fn scala_library_dual_run_bigint() {
+    dual_run_fixture("bigint");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -2143,6 +2173,10 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/util/control/Breaks$.class",
     "scala/util/control/Breaks$TryBlock.class",
     "scala/util/control/Breaks$$anon$1.class",
+    "scala/math/BigInt.class",
+    "scala/math/BigInt$.class",
+    "scala/math/BigDecimal.class",
+    "scala/math/BigDecimal$.class",
     "scala/util/matching/Regex.class",
     "scala/Array$.class",
     "scala/runtime/NonLocalReturnControl.class",

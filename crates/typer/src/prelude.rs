@@ -299,6 +299,10 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     if library_abi {
         if let Some(aops) = array_ops {
             add_array_ops_zip(st, aops, tuple2);
+            add_array_ops_folds(st, aops);
+        }
+        if let Some(so) = string_ops {
+            add_string_ops_fold_left(st, so);
         }
     }
 
@@ -362,6 +366,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_either(st);
         add_try(st, throwable);
         add_breaks(st);
+        add_big_int(st);
+        add_big_decimal(st);
         add_xml(st);
         add_enumeration(st);
     }
@@ -1428,6 +1434,13 @@ fn fn1(arg: Type, ret: Type) -> Type {
     }
 }
 
+fn fn2(a: Type, b: Type, ret: Type) -> Type {
+    Type::Function {
+        params: vec![a, b],
+        ret: Box::new(ret),
+    }
+}
+
 fn add_with_filter(st: &mut SymbolTable) -> SymbolId {
     let wf = class(
         st,
@@ -1931,6 +1944,31 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
         },
         Intrinsic::None,
     );
+    method(st, so, "toByte", vec![], Type::Byte, Intrinsic::None);
+    method(st, so, "toShort", vec![], Type::Short, Intrinsic::None);
+    method(st, so, "toFloat", vec![], Type::Float, Intrinsic::None);
+    method(
+        st,
+        so,
+        "toLongOption",
+        vec![],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![Type::Long],
+        },
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "toDoubleOption",
+        vec![],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![Type::Double],
+        },
+        Intrinsic::None,
+    );
     so
 }
 
@@ -2254,6 +2292,89 @@ fn add_array_ops_zip(st: &mut SymbolTable, aops: SymbolId, tuple2: SymbolId) {
             sym: tuple2,
             args: vec![ta, Type::TypeParam(b)],
         }))),
+    };
+}
+
+/// ArrayOps.foldLeft / fold / foldRight.
+///
+/// nsc 2.13.16 JVM: `foldLeft$extension(Object, Object, Function2)Object` 系。
+/// `reduce` は ArrayOps に無いので載せない。
+fn add_array_ops_folds(st: &mut SymbolTable, aops: SymbolId) {
+    let a = st.get(aops).tparams[0];
+    let ta = Type::TypeParam(a);
+
+    let m = method(st, aops, "foldLeft", vec![], Type::Unit, Intrinsic::None);
+    let b = type_param(st, m, "B");
+    let tb = Type::TypeParam(b);
+    let z = st.alloc("z", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(z).ty = tb.clone();
+    let op = st.alloc("op", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(op).ty = fn2(tb.clone(), ta.clone(), tb.clone());
+    st.get_mut(m).tparams = vec![b];
+    st.get_mut(m).params = vec![z, op];
+    st.get_mut(m).paramss = vec![vec![z], vec![op]];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![
+            vec![tb.clone()],
+            vec![fn2(tb.clone(), ta.clone(), tb.clone())],
+        ],
+        ret: Box::new(tb),
+    };
+
+    let m = method(st, aops, "fold", vec![], Type::Unit, Intrinsic::None);
+    let a1 = type_param(st, m, "A1");
+    let ta1 = Type::TypeParam(a1);
+    let z = st.alloc("z", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(z).ty = ta1.clone();
+    let op = st.alloc("op", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(op).ty = fn2(ta1.clone(), ta1.clone(), ta1.clone());
+    st.get_mut(m).tparams = vec![a1];
+    st.get_mut(m).params = vec![z, op];
+    st.get_mut(m).paramss = vec![vec![z], vec![op]];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![
+            vec![ta1.clone()],
+            vec![fn2(ta1.clone(), ta1.clone(), ta1.clone())],
+        ],
+        ret: Box::new(ta1),
+    };
+
+    let m = method(st, aops, "foldRight", vec![], Type::Unit, Intrinsic::None);
+    let b = type_param(st, m, "B");
+    let tb = Type::TypeParam(b);
+    let z = st.alloc("z", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(z).ty = tb.clone();
+    let op = st.alloc("op", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(op).ty = fn2(ta.clone(), tb.clone(), tb.clone());
+    st.get_mut(m).tparams = vec![b];
+    st.get_mut(m).params = vec![z, op];
+    st.get_mut(m).paramss = vec![vec![z], vec![op]];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![vec![tb.clone()], vec![fn2(ta, tb.clone(), tb.clone())]],
+        ret: Box::new(tb),
+    };
+}
+
+/// StringOps.foldLeft[B](z: B)(op: (B, Char) => B): B
+///
+/// nsc 2.13.16 JVM: `foldLeft$extension(String, Object, Function2)Object`.
+fn add_string_ops_fold_left(st: &mut SymbolTable, so: SymbolId) {
+    let m = method(st, so, "foldLeft", vec![], Type::Unit, Intrinsic::None);
+    let b = type_param(st, m, "B");
+    let tb = Type::TypeParam(b);
+    let z = st.alloc("z", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(z).ty = tb.clone();
+    let op = st.alloc("op", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(op).ty = fn2(tb.clone(), Type::Char, tb.clone());
+    st.get_mut(m).tparams = vec![b];
+    st.get_mut(m).params = vec![z, op];
+    st.get_mut(m).paramss = vec![vec![z], vec![op]];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![
+            vec![tb.clone()],
+            vec![fn2(tb.clone(), Type::Char, tb.clone())],
+        ],
+        ret: Box::new(tb),
     };
 }
 
@@ -4128,6 +4249,116 @@ fn add_breaks_members(st: &mut SymbolTable, owner: SymbolId, try_block: SymbolId
         }),
     };
     st.get_mut(tb).jvm_name = "(Lscala/Function0;)Lscala/util/control/Breaks$TryBlock;".into();
+}
+
+/// `scala.math.BigInt` + companion `BigInt$` against scala-library 2.13.16.
+///
+/// JVM: `BigInt$.apply(I)` / `apply(Ljava/lang/String;)` /
+/// `int2bigInt(I)`（IMPLICIT） / instance `$plus` / `$times`.
+fn add_big_int(st: &mut SymbolTable) {
+    let math = crate::classpath::ensure_package(st, "scala/math");
+    let cls = class(st, math, "BigInt", "scala/math/BigInt", &[Type::AnyRef]);
+    let this_t = Type::Class {
+        sym: cls,
+        args: vec![],
+    };
+    method(
+        st,
+        cls,
+        "+",
+        vec![this_t.clone()],
+        this_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        cls,
+        "*",
+        vec![this_t.clone()],
+        this_t.clone(),
+        Intrinsic::None,
+    );
+    let big_mod = module(st, math, "BigInt", "scala/math/BigInt$");
+    let mcls = st.module_class_of(big_mod);
+    method(
+        st,
+        mcls,
+        "apply",
+        vec![Type::Int],
+        this_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        mcls,
+        "apply",
+        vec![Type::String],
+        this_t.clone(),
+        Intrinsic::None,
+    );
+    let conv = method(
+        st,
+        mcls,
+        "int2bigInt",
+        vec![Type::Int],
+        this_t,
+        Intrinsic::None,
+    );
+    st.get_mut(conv).flags = st.get(conv).flags.with(Flags::IMPLICIT);
+    let mems = st.get(mcls).members.clone();
+    st.get_mut(big_mod).members.extend(mems);
+}
+
+/// `scala.math.BigDecimal` + companion。small extra。
+fn add_big_decimal(st: &mut SymbolTable) {
+    let math = crate::classpath::ensure_package(st, "scala/math");
+    let cls = class(
+        st,
+        math,
+        "BigDecimal",
+        "scala/math/BigDecimal",
+        &[Type::AnyRef],
+    );
+    let this_t = Type::Class {
+        sym: cls,
+        args: vec![],
+    };
+    method(
+        st,
+        cls,
+        "+",
+        vec![this_t.clone()],
+        this_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        cls,
+        "*",
+        vec![this_t.clone()],
+        this_t.clone(),
+        Intrinsic::None,
+    );
+    let big_mod = module(st, math, "BigDecimal", "scala/math/BigDecimal$");
+    let mcls = st.module_class_of(big_mod);
+    method(
+        st,
+        mcls,
+        "apply",
+        vec![Type::Int],
+        this_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        mcls,
+        "apply",
+        vec![Type::String],
+        this_t.clone(),
+        Intrinsic::None,
+    );
+    let mems = st.get(mcls).members.clone();
+    st.get_mut(big_mod).members.extend(mems);
 }
 
 fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
