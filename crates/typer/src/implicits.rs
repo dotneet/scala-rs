@@ -221,13 +221,29 @@ impl Typer {
     /// ClassTag is invariant. Covariant `is_sub_type` would let
     /// `ClassTag[Nothing]` inhabit `ClassTag[Int]` (`Nothing <: Int`) and
     /// `newArray` would then allocate `Object[]`.
+    /// `Releasable[-R]` is contravariant: `Releasable[AutoCloseable]` inhabits
+    /// `Releasable[Box]` when `Box <: AutoCloseable` (nsc `Using.resource`).
     fn implicit_result_conforms(&self, have: &Type, pt: &Type) -> bool {
         match (have, pt) {
             (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 })
                 if s1 == s2 && !a1.is_empty() && !a2.is_empty() && a1.len() == a2.len() =>
             {
-                a1.iter().zip(a2.iter()).all(|(x, y)| {
-                    x == y || (self.st.is_sub_type(x, y) && self.st.is_sub_type(y, x))
+                let tparams = self.st.get(*s1).tparams.clone();
+                a1.iter().zip(a2.iter()).enumerate().all(|(i, (x, y))| {
+                    if x == y {
+                        return true;
+                    }
+                    let flags = tparams
+                        .get(i)
+                        .map(|&tp| self.st.get(tp).flags)
+                        .unwrap_or(Flags::EMPTY);
+                    if flags.contains(Flags::CONTRAVARIANT) {
+                        self.st.is_sub_type(y, x)
+                    } else if flags.contains(Flags::COVARIANT) {
+                        self.st.is_sub_type(x, y)
+                    } else {
+                        self.st.is_sub_type(x, y) && self.st.is_sub_type(y, x)
+                    }
                 })
             }
             _ => self.st.is_sub_type(have, pt),
