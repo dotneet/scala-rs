@@ -1,10 +1,14 @@
 case class Point(x: Int, y: Int)
 class Ann(x: Any) extends annotation.StaticAnnotation
-class Holder {
+class Base { val foo = 1 }
+class Holder extends Base {
   def me: this.type = this
   def n: Int = 1
+  val x = 1
   @Ann(this) def markedThis: Int = 4
   @Ann(classOf[Int]) def markedClass: Int = 5
+  @Ann(this.x) def markedThisSel: Int = 7
+  @Ann(super.foo) def markedSuper: Int = 8
 }
 class C { val x = 1 }
 class OrdBox(val n: Int) extends Ordered[OrdBox] {
@@ -31,6 +35,7 @@ object Lib {
   @Ann(3) def markedLit: Int = 3
   def ident(n: Int): Int = n
   @Ann(ident(1)) def markedApply: Int = 6
+  @Ann(ident(ident(1))) def markedNest: Int = 9
   def join(xs: String*): Int = 0
 }
 trait MixA { def a: Int }

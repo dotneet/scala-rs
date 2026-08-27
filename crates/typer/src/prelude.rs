@@ -2517,6 +2517,22 @@ fn add_xml(st: &mut SymbolTable) {
     let text = class(st, xml, "Text", "scala/xml/Text", &[node_t.clone()]);
     let td = ctor_field(st, text, "data", Type::String);
     st.get_mut(text).ctor_fields = vec![td];
+    let comment = class(st, xml, "Comment", "scala/xml/Comment", &[node_t.clone()]);
+    let ct = ctor_field(st, comment, "commentText", Type::String);
+    st.get_mut(comment).ctor_fields = vec![ct];
+    let pcdata = class(st, xml, "PCData", "scala/xml/PCData", &[node_t.clone()]);
+    let pd = ctor_field(st, pcdata, "data", Type::String);
+    st.get_mut(pcdata).ctor_fields = vec![pd];
+    let pi = class(
+        st,
+        xml,
+        "ProcInstr",
+        "scala/xml/ProcInstr",
+        &[node_t.clone()],
+    );
+    let pit = ctor_field(st, pi, "target", Type::String);
+    let pip = ctor_field(st, pi, "proctext", Type::String);
+    st.get_mut(pi).ctor_fields = vec![pit, pip];
     let atom = class(st, xml, "Atom", "scala/xml/Atom", &[node_t]);
     let ad = ctor_field(st, atom, "data", Type::Any);
     st.get_mut(atom).ctor_fields = vec![ad];

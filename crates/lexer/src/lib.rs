@@ -292,7 +292,22 @@ impl<'a> Lexer<'a> {
     fn lex_operator(&mut self) {
         let lo = self.pos as u32;
         let start = self.pos;
+        // XML comment/CDATA/PI start with `<!` / `<?`. Do not glue those into
+        // Scala operators (`<=`, `<<`, `<-` stay intact: next char is not `!`/`?`).
+        if self.peek() == Some('<') {
+            let next = self.src[self.pos + 1..].chars().next();
+            if matches!(next, Some('!' | '?')) {
+                self.bump();
+                self.emit(TokenKind::Ident("<".into()), lo, self.pos as u32);
+                return;
+            }
+        }
         while self.peek().is_some_and(is_op_char) {
+            let sofar = &self.src[start..self.pos];
+            // XML closers must not glue to the next tag: `><!--`, `--></`, `?></`.
+            if sofar.ends_with('>') && self.peek() == Some('<') {
+                break;
+            }
             self.bump();
         }
         let text = &self.src[start..self.pos];
@@ -855,5 +870,29 @@ mod tests {
         use TokenKind::*;
         assert_eq!(kinds("=> <- <:"), vec![Arrow, LeftArrow, Subtype]);
         assert_eq!(kinds("+ ++"), vec![Ident("+".into()), Ident("++".into())]);
+    }
+
+    #[test]
+    fn xml_markup_is_not_glued_to_gt() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("><!--"),
+            vec![Ident(">".into()), Ident("<".into()), Ident("!--".into())]
+        );
+        assert_eq!(kinds("<!--"), vec![Ident("<".into()), Ident("!--".into())]);
+        assert_eq!(kinds("<?"), vec![Ident("<".into()), Ident("?".into())]);
+        assert_eq!(kinds("</"), vec![Ident("</".into())]);
+        assert_eq!(kinds("/>"), vec![Ident("/>".into())]);
+        assert_eq!(
+            kinds("--></"),
+            vec![Ident("-->".into()), Ident("</".into())]
+        );
+        assert_eq!(
+            kinds("?></"),
+            vec![Ident("?>".into()), Ident("</".into())]
+        );
+        assert_eq!(kinds("<="), vec![Ident("<=".into())]);
+        assert_eq!(kinds("<<"), vec![Ident("<<".into())]);
+        assert_eq!(kinds("<-"), vec![LeftArrow]);
     }
 }

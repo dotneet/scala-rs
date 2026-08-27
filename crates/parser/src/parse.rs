@@ -27,13 +27,7 @@ fn annotation_compiler_unsupported(path: &str) -> bool {
     let simple = path.rsplit('.').next().unwrap_or(path);
     matches!(
         simple,
-        "inline"
-            | "specialized"
-            | "unspecialized"
-            | "elidable"
-            | "switch"
-            | "strictfp"
-            | "native"
+        "inline" | "specialized" | "unspecialized" | "elidable" | "switch" | "strictfp" | "native"
     )
 }
 
@@ -3028,23 +3022,164 @@ impl<'a> Parser<'a> {
     }
 
     /// Scala 2.13 XML literal subset: `<a/>`, `<a></a>`, `<a>t{e}</a>`,
-    /// `<a b={e} c="t"/>`, `<p:a xmlns:p="u"/>` (elem / text / splice /
-    /// unprefixed and prefixed attributes / prefixed element names).
-    /// Entity refs, comments, and CDATA are diagnosed, not dropped.
+    /// `<a b={e} c="t"/>`, `<p:a xmlns:p="u"/>`, comments, CDATA, PI
+    /// (elem / text / splice / attributes / namespaces / prefixed names).
+    /// Entity refs are diagnosed, not dropped.
     fn parse_xml_literal(&mut self) -> Tree {
         let lo = self.span();
         self.bump(); // `<`
         self.skip_nl();
         match self.kind().clone() {
-            TokenKind::Ident(n) if n.starts_with('!') || n == "!" => {
-                return self.unimplemented(lo.merge(self.span()), "XML comments/CDATA");
+            TokenKind::Ident(n) if n.starts_with("!--") || n == "!" || n.starts_with('!') => {
+                return self.parse_xml_comment_or_cdata(lo);
             }
             TokenKind::Ident(n) if n.starts_with('?') || n == "?" => {
-                return self.unimplemented(lo.merge(self.span()), "XML processing instructions");
+                return self.parse_xml_pi(lo);
             }
             _ => {}
         }
         self.parse_xml_elem(lo)
+    }
+
+    fn parse_xml_comment_or_cdata(&mut self, lo: Span) -> Tree {
+        match self.kind().clone() {
+            TokenKind::Ident(n) if n.starts_with("!--") => self.parse_xml_comment(lo, &n),
+            TokenKind::Ident(n) if n == "!" => {
+                self.bump();
+                if matches!(self.kind(), TokenKind::LBracket) {
+                    self.parse_xml_cdata(lo)
+                } else {
+                    self.unimplemented(lo.merge(self.span()), "XML comments/CDATA")
+                }
+            }
+            _ => self.unimplemented(lo.merge(self.span()), "XML comments/CDATA"),
+        }
+    }
+
+    fn parse_xml_comment(&mut self, lo: Span, tok: &str) -> Tree {
+        let text_lo = if tok == "!--" {
+            self.span().hi.0
+        } else {
+            self.span().lo.0 + 3
+        };
+        self.bump();
+        loop {
+            if self.at_eof() {
+                return self.unimplemented(lo.merge(self.span()), "XML comments/CDATA");
+            }
+            if let TokenKind::Ident(n) = self.kind().clone() {
+                if n == "-->" || n.ends_with("-->") {
+                    let text_hi = if n == "-->" {
+                        self.span().lo.0
+                    } else {
+                        self.span().hi.0.saturating_sub(3)
+                    };
+                    let text = self.source_slice(text_lo, text_hi);
+                    let end = self.span();
+                    self.bump();
+                    return self.xml_comment(&text, lo.merge(end));
+                }
+            }
+            self.bump();
+        }
+    }
+
+    fn parse_xml_cdata(&mut self, lo: Span) -> Tree {
+        if !matches!(self.kind(), TokenKind::LBracket) {
+            return self.unimplemented(lo.merge(self.span()), "XML comments/CDATA");
+        }
+        self.bump();
+        match self.kind().clone() {
+            TokenKind::Ident(n) if n == "CDATA" => {
+                self.bump();
+            }
+            _ => {
+                return self.unimplemented(lo.merge(self.span()), "XML comments/CDATA");
+            }
+        }
+        if !matches!(self.kind(), TokenKind::LBracket) {
+            return self.unimplemented(lo.merge(self.span()), "XML comments/CDATA");
+        }
+        let text_lo = self.span().hi.0;
+        self.bump();
+        loop {
+            if self.at_eof() {
+                return self.unimplemented(lo.merge(self.span()), "XML comments/CDATA");
+            }
+            if matches!(self.kind(), TokenKind::RBracket) {
+                let first = self.span();
+                self.bump();
+                if matches!(self.kind(), TokenKind::RBracket) {
+                    self.bump();
+                    if matches!(self.kind(), TokenKind::Ident(s) if s == ">") {
+                        let text = self.source_slice(text_lo, first.lo.0);
+                        let end = self.span();
+                        self.bump();
+                        return self.xml_cdata(&text, lo.merge(end));
+                    }
+                }
+                continue;
+            }
+            self.bump();
+        }
+    }
+
+    fn parse_xml_pi(&mut self, lo: Span) -> Tree {
+        let n = match self.kind().clone() {
+            TokenKind::Ident(n) => n,
+            _ => {
+                return self.unimplemented(lo.merge(self.span()), "XML processing instructions");
+            }
+        };
+        let (target, text_lo) = if n == "?" {
+            self.bump();
+            match self.kind().clone() {
+                TokenKind::Ident(t) if !is_operator_name(&t) && t != ">" && t != "?>" => {
+                    let hi = self.span().hi.0;
+                    self.bump();
+                    (t, hi)
+                }
+                _ => {
+                    return self
+                        .unimplemented(lo.merge(self.span()), "XML processing instructions");
+                }
+            }
+        } else if let Some(rest) = n.strip_prefix('?') {
+            if rest.is_empty() || is_operator_name(rest) {
+                return self.unimplemented(lo.merge(self.span()), "XML processing instructions");
+            }
+            let hi = self.span().hi.0;
+            self.bump();
+            (rest.to_string(), hi)
+        } else {
+            return self.unimplemented(lo.merge(self.span()), "XML processing instructions");
+        };
+        loop {
+            if self.at_eof() {
+                return self.unimplemented(lo.merge(self.span()), "XML processing instructions");
+            }
+            if let TokenKind::Ident(n) = self.kind().clone() {
+                if n == "?>" || n.ends_with("?>") {
+                    let text_hi = if n == "?>" {
+                        self.span().lo.0
+                    } else {
+                        self.span().hi.0.saturating_sub(2)
+                    };
+                    let text = self.source_slice(text_lo, text_hi).trim().to_string();
+                    let end = self.span();
+                    self.bump();
+                    return self.xml_pi(&target, &text, lo.merge(end));
+                }
+            }
+            self.bump();
+        }
+    }
+
+    fn source_slice(&self, lo: u32, hi: u32) -> String {
+        let s = &self.source.src;
+        let lo = (lo as usize).min(s.len());
+        let hi = (hi as usize).min(s.len()).max(lo);
+        s[lo..hi].to_string()
     }
 
     fn parse_xml_elem(&mut self, lo: Span) -> Tree {
@@ -3083,10 +3218,7 @@ impl<'a> Parser<'a> {
                     Some(pre)
                 }
                 _ => {
-                    return self.unimplemented(
-                        lo.merge(self.span()),
-                        "XML prefixed element names",
-                    );
+                    return self.unimplemented(lo.merge(self.span()), "XML prefixed element names");
                 }
             }
         } else {
@@ -3162,6 +3294,9 @@ impl<'a> Parser<'a> {
                     if let Some(what) = xml_unsupported_markup(&n) {
                         return self.unimplemented(self.span(), what);
                     }
+                    if n == "&" || n.starts_with('&') {
+                        return self.unimplemented(self.span(), "XML entity references");
+                    }
                     self.bump();
                     let mut text = n;
                     while let TokenKind::Ident(more) = self.kind().clone() {
@@ -3208,9 +3343,7 @@ impl<'a> Parser<'a> {
 
     fn parse_xml_close_name(&mut self) -> (Option<String>, String) {
         let first = match self.kind().clone() {
-            TokenKind::Ident(c)
-                if c != ">" && c != "</" && c != "<" && !is_operator_name(&c) =>
-            {
+            TokenKind::Ident(c) if c != ">" && c != "</" && c != "<" && !is_operator_name(&c) => {
                 self.bump();
                 c
             }
@@ -3260,8 +3393,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Unprefixed `b={e}` / `c="t"`, prefixed `p:b=…`, and `xmlns:p="uri"` /
-    /// default `xmlns="uri"`. Comments, CDATA, and processing instructions
-    /// stay diagnosed.
+    /// default `xmlns="uri"`. Entity refs stay diagnosed.
     fn parse_xml_attrs(&mut self) -> (Vec<XmlAttr>, Vec<(Option<String>, Tree)>) {
         let mut attrs = Vec::new();
         let mut xmlns = Vec::new();
@@ -3313,10 +3445,8 @@ impl<'a> Parser<'a> {
                         };
                         self.skip_nl();
                         if !matches!(self.kind(), TokenKind::Equals) {
-                            let _ = self.unimplemented(
-                                lo.merge(self.span()),
-                                "XML namespace binding",
-                            );
+                            let _ =
+                                self.unimplemented(lo.merge(self.span()), "XML namespace binding");
                             self.skip_xml_attr_tail();
                             continue;
                         }
@@ -3336,10 +3466,8 @@ impl<'a> Parser<'a> {
                                 Some((n.clone(), key))
                             }
                             _ => {
-                                let _ = self.unimplemented(
-                                    lo.merge(self.span()),
-                                    "XML prefixed attribute",
-                                );
+                                let _ = self
+                                    .unimplemented(lo.merge(self.span()), "XML prefixed attribute");
                                 self.skip_xml_attr_tail();
                                 continue;
                             }
@@ -3461,6 +3589,45 @@ impl<'a> Parser<'a> {
         self.xml_new(cls, vec![lit], span)
     }
 
+    fn xml_comment(&mut self, s: &str, span: Span) -> Tree {
+        let cls = self.xml_path(&["scala", "xml", "Comment"], span);
+        let lit = self.alloc(
+            span,
+            TreeKind::Literal {
+                lit: Lit::String(s.into()),
+            },
+        );
+        self.xml_new(cls, vec![lit], span)
+    }
+
+    fn xml_cdata(&mut self, s: &str, span: Span) -> Tree {
+        let cls = self.xml_path(&["scala", "xml", "PCData"], span);
+        let lit = self.alloc(
+            span,
+            TreeKind::Literal {
+                lit: Lit::String(s.into()),
+            },
+        );
+        self.xml_new(cls, vec![lit], span)
+    }
+
+    fn xml_pi(&mut self, target: &str, text: &str, span: Span) -> Tree {
+        let cls = self.xml_path(&["scala", "xml", "ProcInstr"], span);
+        let t = self.alloc(
+            span,
+            TreeKind::Literal {
+                lit: Lit::String(target.into()),
+            },
+        );
+        let b = self.alloc(
+            span,
+            TreeKind::Literal {
+                lit: Lit::String(text.into()),
+            },
+        );
+        self.xml_new(cls, vec![t, b], span)
+    }
+
     fn xml_atom(&mut self, e: Tree) -> Tree {
         let span = e.span;
         let cls = self.xml_path(&["scala", "xml", "Atom"], span);
@@ -3573,8 +3740,8 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Lexer glues `><!--` / `><?` as one operator Ident. Diagnose instead of
-/// treating comments, CDATA, or PIs as attributes or element text.
+/// Leftover glued markup (`><!--` as one Ident) and entity refs. Comments /
+/// CDATA / PI go through `parse_xml_literal` after the lexer splits `><!--`.
 fn xml_unsupported_markup(n: &str) -> Option<&'static str> {
     if n.contains("<!--")
         || n.contains("<![")
@@ -3585,6 +3752,8 @@ fn xml_unsupported_markup(n: &str) -> Option<&'static str> {
         Some("XML comments/CDATA")
     } else if n.contains("<?") {
         Some("XML processing instructions")
+    } else if n == "&" || n.starts_with('&') {
+        Some("XML entity references")
     } else {
         None
     }
