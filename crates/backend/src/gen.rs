@@ -6797,6 +6797,9 @@ object Main {
             "sparse Int match should emit lookupswitch (0xab)"
         );
     }
+
+    #[test]
+    fn library_abi_does_not_emit_option_or_list() {
         let classes = compile_src_library(
             r#"
 object Main {

@@ -283,6 +283,9 @@ object Main {
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn ambiguous_implicit() {
         let (_, _, diags) = typecheck_str(
             r#"
 object Main {
