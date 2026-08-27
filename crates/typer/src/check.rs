@@ -4538,7 +4538,13 @@ impl Typer {
                         };
                     }
                 } else if method_name == "map" {
-                    if !self.is_with_filter_ty(recv_ty.as_ref()) {
+                    if self.is_array_ops_ty(recv_ty.as_ref()) {
+                        if let Some(a0) = args.first() {
+                            if let Type::Function { ret: fr, .. } = &a0.ty {
+                                ret = Type::Array(Box::new(fr.as_ref().widen_constant()));
+                            }
+                        }
+                    } else if !self.is_with_filter_ty(recv_ty.as_ref()) {
                         if let Some(a0) = args.first() {
                             if let Type::Function { ret: fr, .. } = &a0.ty {
                                 if let Some(cls) = recv_ty
@@ -4799,6 +4805,11 @@ impl Typer {
         };
         let n = self.st.get(id).name.as_str();
         n == "WithFilter" || n == "Option$WithFilter"
+    }
+
+    fn is_array_ops_ty(&self, ty: Option<&Type>) -> bool {
+        ty.and_then(|t| self.st.class_sym_of(t))
+            .is_some_and(|id| self.st.get(id).name == "ArrayOps")
     }
 
     fn elem_type(&self, ty: &Type) -> Option<Type> {
@@ -5237,7 +5248,9 @@ impl Typer {
                     args.push(r);
                 }
                 ImplicitSearch::None => {
-                    if let Some(lam) = self.identity_view(&pty, span) {
+                    if let Some(ct) = self.classtag_apply_fallback(&pty, span) {
+                        args.push(ct);
+                    } else if let Some(lam) = self.identity_view(&pty, span) {
                         args.push(lam);
                     } else {
                         self.error(span, self.missing_implicit_message(&pty));
@@ -5251,6 +5264,75 @@ impl Typer {
                 }
             }
         }
+    }
+
+    /// nsc fills `ClassTag[String]` via `ClassTag.apply(classOf[String])` when
+    /// there is no primitive getter (`ClassTag.Int`, …).
+    fn classtag_apply_fallback(&self, pt: &Type, span: Span) -> Option<Tree> {
+        let Type::Class { sym, args } = pt else {
+            return None;
+        };
+        if self.st.get(*sym).name != "ClassTag" || args.is_empty() {
+            return None;
+        }
+        let elem = args[0].clone();
+        let module = self.st.companion_module(*sym)?;
+        let mcls = self.st.module_class_of(module);
+        let apply = self
+            .st
+            .lookup_member(mcls, "apply")
+            .into_iter()
+            .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)?;
+        let jclass = self
+            .st
+            .lookup("Class")
+            .into_iter()
+            .find(|id| self.st.get(*id).jvm_name == "java/lang/Class")?;
+        let class_arg = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Ident {
+                name: "$classOf".into(),
+            },
+            ty: Type::Class {
+                sym: jclass,
+                args: vec![elem],
+            },
+            sym: SymbolId::NONE,
+            postfix: false,
+        };
+        let recv = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Ident {
+                name: "ClassTag".into(),
+            },
+            ty: Type::ModuleRef(module),
+            sym: module,
+            postfix: false,
+        };
+        let fun = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(recv),
+                name: "apply".into(),
+            },
+            ty: self.st.get(apply).ty.clone(),
+            sym: apply,
+            postfix: false,
+        };
+        Some(Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Apply {
+                fun: Box::new(fun),
+                args: vec![class_arg],
+            },
+            ty: pt.clone(),
+            sym: apply,
+            postfix: false,
+        })
     }
 
     /// nsc: `A <: B` is a view `A => B` (identity / asInstanceOf).

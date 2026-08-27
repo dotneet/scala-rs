@@ -476,20 +476,32 @@ impl Typer {
                     return None;
                 }
                 if self.conv_param_matches(id, from, &ps[0]) {
-                    Some((**ret).clone())
+                    Some(self.instantiate_conv_type(id, from, &ps[0], (**ret).clone()))
                 } else {
                     None
                 }
             }
             Type::Function { params, ret } if params.len() == 1 => {
                 if self.conv_param_matches(id, from, &params[0]) {
-                    Some((**ret).clone())
+                    Some(self.instantiate_conv_type(id, from, &params[0], (**ret).clone()))
                 } else {
                     None
                 }
             }
             _ => None,
         }
+    }
+
+    fn instantiate_conv_type(&self, id: SymbolId, from: &Type, param: &Type, ty: Type) -> Type {
+        let tps = self.st.get(id).tparams.clone();
+        if tps.is_empty() {
+            return ty;
+        }
+        let args_t: Vec<Type> = tps
+            .iter()
+            .map(|tp| unify_conv_tparam(*tp, param, from).unwrap_or(Type::AnyRef))
+            .collect();
+        crate::symbol::subst_tparams_slice(&tps, &args_t, &ty)
     }
 
     fn conv_param_matches(&self, id: SymbolId, from: &Type, param: &Type) -> bool {
@@ -524,5 +536,17 @@ impl Typer {
             .map(|id| self.st.get(*id).name.clone())
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+fn unify_conv_tparam(tp: SymbolId, param: &Type, from: &Type) -> Option<Type> {
+    match (param, from) {
+        (Type::TypeParam(id), actual) if *id == tp => Some(actual.widen_constant()),
+        (Type::Array(p), Type::Array(a)) => unify_conv_tparam(tp, p, a),
+        (Type::Class { args: pa, .. }, Type::Class { args: fa, .. }) => pa
+            .iter()
+            .zip(fa.iter())
+            .find_map(|(p, f)| unify_conv_tparam(tp, p, f)),
+        _ => None,
     }
 }
