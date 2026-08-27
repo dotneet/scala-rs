@@ -670,6 +670,9 @@ impl Assembler {
     pub fn i2b(&mut self) {
         self.emit_op(0x91);
     }
+    pub fn i2c(&mut self) {
+        self.emit_op(0x92);
+    }
     pub fn i2s(&mut self) {
         self.emit_op(0x93);
     }

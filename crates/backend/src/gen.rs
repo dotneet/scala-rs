@@ -4596,6 +4596,10 @@ fn invoke_value_extension(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
         emit_long_numeric_range(asm, s.name == "to");
         return;
     }
+    if owner == "scala/runtime/RichChar" && (s.name == "to" || s.name == "until") {
+        emit_integral_numeric_range(asm, &Type::Char, s.name == "to");
+        return;
+    }
     if owner == "scala/runtime/RichChar" && s.name == "toInt" {
         // RichChar.toInt is inlined; the jar exposes intValue$extension.
         asm.invokestatic("scala/runtime/RichChar", "intValue$extension", "(C)I");
@@ -4992,6 +4996,28 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
                     );
                     asm.checkcast("scala/collection/mutable/HashMap");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_hashset_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/HashSet$",
+                        "empty",
+                        "()Lscala/collection/mutable/HashSet;",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/HashSet$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/mutable/HashSet");
                     return;
                 }
                 _ => {}
@@ -5545,6 +5571,27 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_hashset(&owner) {
+            match name {
+                "contains" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/HashSet",
+                        "contains",
+                        "(Ljava/lang/Object;)Z",
+                    );
+                    return;
+                }
+                "+=" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/HashSet",
+                        "+=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Growable;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_stdlib_stringbuilder(&owner) {
             match name {
                 "+=" => {
@@ -5786,6 +5833,14 @@ fn is_stdlib_hashmap_module(owner: &str) -> bool {
     owner == "scala/collection/mutable/HashMap$"
 }
 
+fn is_stdlib_hashset(owner: &str) -> bool {
+    owner == "scala/collection/mutable/HashSet"
+}
+
+fn is_stdlib_hashset_module(owner: &str) -> bool {
+    owner == "scala/collection/mutable/HashSet$"
+}
+
 fn emit_long_numeric_range(asm: &mut Assembler, inclusive: bool) {
     // stack: start (J), end (J). RichLong has no to$extension; IntegralProxy
     // default builds a real NumericRange[Long] via Numeric$LongIsIntegral$.
@@ -5828,6 +5883,7 @@ fn emit_integral_numeric_range(asm: &mut Assembler, elem: &Type, inclusive: bool
     // stack: start, end (integral as int)
     let integral = match elem {
         Type::Short => "scala/math/Numeric$ShortIsIntegral$",
+        Type::Char => "scala/math/Numeric$CharIsIntegral$",
         _ => "scala/math/Numeric$ByteIsIntegral$",
     };
     asm.swap();
@@ -5865,6 +5921,7 @@ fn emit_integral_numeric_range(asm: &mut Assembler, elem: &Type, inclusive: bool
 fn narrow_integral(asm: &mut Assembler, elem: &Type) {
     match elem {
         Type::Short => asm.i2s(),
+        Type::Char => asm.i2c(),
         _ => asm.i2b(),
     }
 }

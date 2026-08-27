@@ -281,6 +281,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_list_buffer(st);
         add_string_builder(st);
         add_hash_map(st);
+        add_hash_set(st);
         add_either(st);
         add_try(st, throwable);
         add_xml(st);
@@ -904,6 +905,31 @@ fn add_string_members(st: &mut SymbolTable, library_abi: bool) {
         Intrinsic::None,
     );
     method(st, c, "toString", vec![], Type::String, Intrinsic::Identity);
+    // nsc calls java.lang.String for these; StringOps has no $extension.
+    method(
+        st,
+        c,
+        "startsWith",
+        vec![Type::String],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        c,
+        "endsWith",
+        vec![Type::String],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        c,
+        "indexOf",
+        vec![Type::String],
+        Type::Int,
+        Intrinsic::None,
+    );
     if !library_abi {
         method(st, c, "length", vec![], Type::Int, Intrinsic::None);
         // Private runtime: parseInt on String. Library mode uses StringOps via augmentString.
@@ -2293,6 +2319,74 @@ fn add_hash_map(st: &mut SymbolTable) {
     st.get_mut(hm_mod).members.extend(mems);
 }
 
+fn add_hash_set(st: &mut SymbolTable) {
+    let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
+    let hs = class(
+        st,
+        mutp,
+        "HashSet",
+        "scala/collection/mutable/HashSet",
+        &[Type::AnyRef],
+    );
+    let sa = type_param(st, hs, "A");
+    st.get_mut(hs).tparams = vec![sa];
+    let ta = Type::TypeParam(sa);
+    let hs_t = Type::Class {
+        sym: hs,
+        args: vec![ta.clone()],
+    };
+    method(
+        st,
+        hs,
+        "contains",
+        vec![Type::Any],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(st, hs, "+=", vec![Type::Any], hs_t.clone(), Intrinsic::None);
+    let hs_mod = module(st, mutp, "HashSet", "scala/collection/mutable/HashSet$");
+    let hs_cls = st.module_class_of(hs_mod);
+    let hs_empty = method(
+        st,
+        hs_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: hs,
+            args: vec![Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let ea = type_param(st, hs_empty, "A");
+    st.get_mut(hs_empty).tparams = vec![ea];
+    st.get_mut(hs_empty).ty = Type::Method {
+        paramss: vec![vec![]],
+        ret: Box::new(Type::Class {
+            sym: hs,
+            args: vec![Type::TypeParam(ea)],
+        }),
+    };
+    let hs_apply = method(
+        st,
+        hs_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        hs_t.clone(),
+        Intrinsic::None,
+    );
+    let haa = type_param(st, hs_apply, "A");
+    st.get_mut(hs_apply).tparams = vec![haa];
+    st.get_mut(hs_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(haa)))]],
+        ret: Box::new(Type::Class {
+            sym: hs,
+            args: vec![Type::TypeParam(haa)],
+        }),
+    };
+    let mems = st.get(hs_cls).members.clone();
+    st.get_mut(hs_mod).members.extend(mems);
+}
+
 fn add_string_builder(st: &mut SymbolTable) {
     let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
     let sb = class(
@@ -2621,6 +2715,19 @@ fn add_rich_long_double_char(st: &mut SymbolTable) -> (SymbolId, SymbolId, Symbo
     let rc = add_rich_value(st, "RichChar", "scala/runtime/RichChar", Type::Char);
     method(st, rc, "isDigit", vec![], Type::Boolean, Intrinsic::None);
     method(st, rc, "toInt", vec![], Type::Int, Intrinsic::None);
+    let nr_c = Type::Class {
+        sym: nr,
+        args: vec![Type::Char],
+    };
+    method(
+        st,
+        rc,
+        "to",
+        vec![Type::Char],
+        nr_c.clone(),
+        Intrinsic::None,
+    );
+    method(st, rc, "until", vec![Type::Char], nr_c, Intrinsic::None);
     (rl, rd, rc)
 }
 
