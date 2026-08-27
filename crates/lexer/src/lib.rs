@@ -257,11 +257,12 @@ impl<'a> Lexer<'a> {
         while self.peek().is_some_and(is_id_part) {
             self.bump();
         }
-        // nsc mixed identifier: `foo_=` / `foo_+=` (`idrest` = … `_` op).
+        // nsc mixed identifier: `foo_=` / `foo_+=` (`idrest` = letters `_` op).
+        // A lone `_` must not swallow `:` / `*` / `=>` (`case _: T =>`, `_*`).
         if self
             .src
             .get(start..self.pos)
-            .is_some_and(|t| t.ends_with('_'))
+            .is_some_and(|t| t.len() > 1 && t.ends_with('_'))
         {
             while self.peek().is_some_and(is_op_char) {
                 self.bump();
@@ -880,6 +881,11 @@ mod tests {
         assert_eq!(kinds("=> <- <:"), vec![Arrow, LeftArrow, Subtype]);
         assert_eq!(kinds("+ ++"), vec![Ident("+".into()), Ident("++".into())]);
         assert_eq!(kinds("foo_="), vec![Ident("foo_=".into())]);
+        assert_eq!(
+            kinds("_: T =>"),
+            vec![Ident("_".into()), Colon, Ident("T".into()), Arrow]
+        );
+        assert_eq!(kinds("_*"), vec![Ident("_".into()), Ident("*".into())]);
     }
 
     #[test]
