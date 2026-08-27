@@ -4528,7 +4528,18 @@ impl Typer {
                     }
                 }
                 for (i, a) in args.iter_mut().enumerate() {
-                    let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
+                    let mut p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
+                    // `Using.resource(r)(x => 10)`: A only appears in a later
+                    // clause. Type the lambda against `R => Any` so the body
+                    // is not checked against a raw type parameter.
+                    if let Type::Function { params, ret } = &p {
+                        if matches!(ret.as_ref(), Type::TypeParam(_)) {
+                            p = Type::Function {
+                                params: params.clone(),
+                                ret: Box::new(Type::Any),
+                            };
+                        }
+                    }
                     if a.ty.is_no_type() {
                         self.type_expr(a, &p);
                     }
@@ -4538,7 +4549,7 @@ impl Typer {
                     if let TreeKind::Function { body, .. } = &a.kind {
                         let body_ty = body.ty.widen_constant();
                         if let Type::Function { params, ret } = &a.ty {
-                            if matches!(ret.as_ref(), Type::Any | Type::NoType)
+                            if matches!(ret.as_ref(), Type::Any | Type::NoType | Type::TypeParam(_))
                                 && !body_ty.is_no_type()
                                 && !body_ty.is_error()
                             {
@@ -4549,6 +4560,31 @@ impl Typer {
                                 };
                             }
                         }
+                    }
+                }
+                if !sym.is_none() && !self.st.get(sym).tparams.is_empty() {
+                    let now_args: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+                    let orig_params: Vec<Type> = match &fun.ty {
+                        Type::Method { paramss, .. } if !paramss.is_empty() => paramss[0].clone(),
+                        _ => param_tys.clone(),
+                    };
+                    let inst = self.infer_method_tparams(sym, &orig_params, &now_args);
+                    let inst: Vec<(SymbolId, Type)> = inst
+                        .into_iter()
+                        .filter(|(_, t)| {
+                            !matches!(t, Type::Nothing | Type::NoType)
+                                && !matches!(t, Type::TypeParam(_))
+                        })
+                        .collect();
+                    if !inst.is_empty() {
+                        let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+                        let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+                        param_tys = param_tys
+                            .iter()
+                            .map(|p| crate::symbol::subst_tparams_slice(&tps, &args_t, p))
+                            .collect();
+                        ret = crate::symbol::subst_tparams_slice(&tps, &args_t, &ret);
+                        fun.ty = crate::symbol::subst_tparams_slice(&tps, &args_t, &fun.ty);
                     }
                 }
                 let nparams = param_tys.len();

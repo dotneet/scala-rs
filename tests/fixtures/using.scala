@@ -11,7 +11,10 @@ object Main {
     println(b.n)
     val c = new Box(0)
     try {
-      Using.resource(c)((x: Box) => { throw new RuntimeException("boom"); 0 })
+      Using.resource(c)((x: Box) => {
+        throw new RuntimeException("boom")
+        ()
+      })
     } catch {
       case _: RuntimeException => println("caught")
     }

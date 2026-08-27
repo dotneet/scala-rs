@@ -6618,6 +6618,11 @@ fn maybe_unbox_erased_result(
     if !desc_returns_object(desc) {
         return;
     }
+    if is_unit_like(ty) {
+        // Generic `A` erased to Object; a Unit instantiation left BoxedUnit.
+        asm.pop();
+        return;
+    }
     if is_jvm_primitive(ty) && !is_unit_like(ty) {
         // Private-runtime Option/Iterator already emit unboxed shapes; the
         // library ABI erases those to Object.
@@ -8841,6 +8846,12 @@ fn gen_try(
     } else {
         Some(frame.alloc_tmp(sel_sort))
     };
+    // Initialize the result local before the try so the exception handler
+    // stack map does not claim a live value that the body never stored.
+    if let Some(slot) = result_slot {
+        push_default(asm, result_ty);
+        store(asm, slot, sel_sort);
+    }
     let exn_slot = frame.alloc_tmp(JvmSort::Ref);
 
     asm.mark(start);
