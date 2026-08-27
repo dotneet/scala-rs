@@ -3512,6 +3512,80 @@ object Main {
     }
 
     #[test]
+    fn typed_placeholder_strops_doublebool_arrayops_typecheck_with_library() {
+        ok_lib(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val f: Int => Int = (_: Int) + 1
+    val n: Int = f(10)
+    val g = (_: Int) + (_: Int)
+    val s: Int = g(1, 2)
+    val h: Int => Int = (_: Int).abs
+    val ys = Array(1, 2, 3).map((_: Int) + 1)
+    val nest: Array[Int] => Array[Int] = _.map((_: Int) + 1)
+    val p = "hello".partition(_ != 'l')
+    val e: Boolean = "hello".exists(_ == 'h')
+    val a: Boolean = "hello".forall(_ != 'z')
+    val sa = "hello".splitAt(2)
+    val dh: Double = Array(1.0, 2.0).head
+    val dm = Array(1.0, 2.0).map(_ + 1.0)
+    val bh: Boolean = Array(true, false).head
+    val bm = Array(true, false).map(!_)
+  }
+}
+"#,
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = (_: Int)
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("unbound placeholder parameter")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags2) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = "hi".noSuchPartition
+    val y = Array(1.0).noSuchHead
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags2), "expected error, got {:?}", diags2);
+        assert!(
+            diags2.iter().any(|d| d.message.contains("is not a member")),
+            "{:?}",
+            diags2.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics

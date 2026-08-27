@@ -978,4 +978,48 @@ object Main {
             "Function2 `_ + _` plus nested `_.map(_ + 1)` need three Function nodes, got {n}: {dump}"
         );
     }
+
+    #[test]
+    fn typed_placeholder_parses_as_function() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val f: Int => Int = (_: Int) + 1
+    val g = (_: Int) + (_: Int)
+    val h: Int => Int = (_: Int).abs
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        let n = dump
+            .lines()
+            .filter(|l| l.trim_start().starts_with("Function"))
+            .count();
+        assert!(
+            n >= 3,
+            "typed `_ : Int` sections should wrap as Function, got {n}: {dump}"
+        );
+        assert!(
+            dump.contains("Ident x$") || dump.contains("ValDef val x$"),
+            "placeholder params should be synthetic x$n, not Ident `_`: {dump}"
+        );
+        let r = parse_str(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = (_: Int)
+  }
+}
+"#,
+        );
+        assert!(
+            r.diags
+                .iter()
+                .any(|d| d.message.contains("unbound placeholder parameter")),
+            "expected unbound typed placeholder, got {:?}",
+            r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
 }

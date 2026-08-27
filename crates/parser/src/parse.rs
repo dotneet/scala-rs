@@ -112,7 +112,7 @@ impl<'a> Parser<'a> {
 
     fn fresh_placeholder(&mut self) -> Tree {
         let sp = self.span();
-        self.bump();
+        self.bump(); // Underscore, or Ident("_") before `:` / `*`
         self.placeholder_id += 1;
         let name = format!("x${}", self.placeholder_id);
         let id = self.alloc(sp, TreeKind::Ident { name: name.clone() });
@@ -2571,6 +2571,9 @@ impl<'a> Parser<'a> {
                 )
             }
             TokenKind::Underscore => self.fresh_placeholder(),
+            // Lexer emits Ident("_") before `:` / `*` (`case _: T`, `_*`).
+            // In expr position that token is nsc placeholder `_`, e.g. `(_: Int) + 1`.
+            TokenKind::Ident(s) if s == "_" => self.fresh_placeholder(),
             TokenKind::Ident(_) => self.parse_ident_tree(),
             TokenKind::True => {
                 let sp = self.span();
