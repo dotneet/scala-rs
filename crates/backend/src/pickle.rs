@@ -662,52 +662,6 @@ impl<'a> Pickler<'a> {
         }
     }
 
-    fn pickle_existential_param(&mut self, lo: Option<&Type>, hi: Option<&Type>) -> u32 {
-        self.exist_n += 1;
-        let name_ref = self.type_name(&format!("_${}", self.exist_n));
-        let idx = self.add(TYPESYM, vec![]);
-        let lo = match lo {
-            Some(t) => self.pickle_type(t),
-            None => self.type_ref_named("Nothing"),
-        };
-        let hi = match hi {
-            Some(t) => self.pickle_type(t),
-            None => self.type_ref_named("Any"),
-        };
-        let mut b = Vec::new();
-        write_nat_to(&mut b, lo);
-        write_nat_to(&mut b, hi);
-        let bounds = self.add(TYPEBOUNDSTPE, b);
-        // DEFERRED | PARAM | EXISTENTIAL. EXISTENTIAL (1<<35) is not remapped.
-        let flags = raw_to_pickled((1u64 << 4) | (1u64 << 13)) | (1u64 << 35);
-        let body = self.symbol_info(name_ref, self.current_owner, flags, bounds);
-        self.entries[idx as usize] = (TYPESYM, body);
-        idx
-    }
-
-    fn pickle_args_existentials(&mut self, args: &[Type]) -> (Vec<u32>, Vec<u32>) {
-        let mut arg_refs = Vec::new();
-        let mut quantified = Vec::new();
-        for a in args {
-            match a {
-                Type::Wildcard => {
-                    let q = self.pickle_existential_param(None, None);
-                    quantified.push(q);
-                    arg_refs.push(self.type_ref_of_pickle_sym(q));
-                }
-                Type::BoundedWildcard { lo, hi } => {
-                    let q = self.pickle_existential_param(lo.as_deref(), hi.as_deref());
-                    quantified.push(q);
-                    arg_refs.push(self.type_ref_of_pickle_sym(q));
-                }
-                _ => {
-                    arg_refs.push(self.pickle_type(a));
-                }
-            }
-        }
-        (arg_refs, quantified)
-    }
-
     fn pickle_existential_tpe(&mut self, inner: u32, quantified: &[u32]) -> u32 {
         if quantified.is_empty() {
             return inner;
