@@ -2318,6 +2318,34 @@ object Main {
     fn context_bounds_ordering_and_classtag_path() {
         ok_lib(
             r#"
+object Main {
+  def g[T: scala.reflect.ClassTag](xs: Array[T]): Int = xs.length
+  def main(args: Array[String]): Unit = {
+    val b: Int = g(new Array[Int](3))
+  }
+}
+"#,
+        );
+        ok(r#"
+trait Ord[T] {
+  def compare(x: T, y: T): Int
+}
+object Ord {
+  implicit val oi: Ord[Int] = new Ord[Int] {
+    def compare(x: Int, y: Int): Int = x - y
+  }
+}
+object Main {
+  def cmp[T: Ord](x: T, y: T): Int = implicitly[Ord[T]].compare(x, y)
+  def main(args: Array[String]): Unit = {
+    val a: Int = cmp(3, 1)
+  }
+}
+"#);
+        let jar = std::path::PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+        if jar.is_file() {
+            let (t, _, diags) = typecheck_str_opts(
+                r#"
 import scala.math.Ordering
 object Main {
   def cmp[T: Ordering](x: T, y: T): Int = implicitly[Ordering[T]].compare(x, y)
@@ -2328,7 +2356,21 @@ object Main {
   }
 }
 "#,
-        );
+                &TypecheckOptions {
+                    fatal_warnings: false,
+                    library_abi: true,
+                    classpath: Vec::new(),
+                    binary_path: vec![jar],
+                    language_features: Vec::new(),
+                },
+            );
+            let _ = t;
+            assert!(
+                !has_errors(&diags),
+                "Ordering[Int] from scala-library must typecheck: {:?}",
+                diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

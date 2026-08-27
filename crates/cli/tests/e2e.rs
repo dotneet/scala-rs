@@ -1387,12 +1387,12 @@ fn dual_run_fixture(name: &str) {
         cp.push_str(&xml.display().to_string());
     }
     let output = Command::new("java")
-        .args(["-cp", &cp, "Main"])
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
         .output()
         .expect("java");
     assert!(
         output.status.success(),
-        "java -cp out:scala-library failed for {name}: {}",
+        "java -Xverify:all -cp out:scala-library failed for {name}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(

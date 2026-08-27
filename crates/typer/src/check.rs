@@ -2171,6 +2171,7 @@ impl Typer {
                 if owner.is_none() {
                     return;
                 }
+                self.complete_binary_member(owner, &n, tree.span);
                 for m in self.st.lookup_member(owner, &n) {
                     self.st.enter_in_current(&n, m);
                 }
@@ -6361,49 +6362,182 @@ impl Typer {
             }
             return;
         }
-        let pkg_jvm = if owner == self.st.root {
+        for internal in self.binary_member_candidates(owner, name) {
+            if self.load_binary_into(&internal, owner, span, true) {
+                return;
+            }
+        }
+        if self.st.get(owner).kind == SymKind::Package {
+            let pkg_jvm = self.st.get(owner).jvm_name.clone();
+            let internal = if pkg_jvm.is_empty() {
+                name.to_string()
+            } else {
+                format!("{pkg_jvm}/{name}")
+            };
+            let prefix = format!("{internal}/");
+            if self.binary.has_package_prefix(&prefix) {
+                let _ = crate::classpath::ensure_package(&mut self.st, &internal);
+            }
+        }
+    }
+
+    fn binary_member_candidates(&self, owner: SymbolId, name: &str) -> Vec<String> {
+        let owner_bin = if owner == self.st.root {
             String::new()
         } else {
             self.st.get(owner).jvm_name.clone()
         };
-        let internal = if pkg_jvm.is_empty() {
-            name.to_string()
-        } else if self.st.get(owner).kind == SymKind::Class {
-            format!("{pkg_jvm}${name}")
-        } else {
-            format!("{pkg_jvm}/{name}")
+        let kind = self.st.get(owner).kind;
+        let mut out = Vec::new();
+        let push = |out: &mut Vec<String>, s: String| {
+            if !s.is_empty() && !out.contains(&s) {
+                out.push(s);
+            }
         };
-        if !self.completed_java.insert(internal.clone()) {
-            return;
+        match kind {
+            SymKind::Package | SymKind::NoSymbol => {
+                let base = if owner_bin.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{owner_bin}/{name}")
+                };
+                push(&mut out, base.clone());
+                push(&mut out, format!("{base}$"));
+            }
+            _ => {
+                let base = owner_bin.trim_end_matches('$').to_string();
+                push(&mut out, format!("{base}${name}"));
+                push(&mut out, format!("{base}${name}$"));
+                if !owner_bin.is_empty() && owner_bin != base {
+                    push(&mut out, format!("{owner_bin}${name}"));
+                    push(&mut out, format!("{owner_bin}${name}$"));
+                }
+            }
         }
-        match self.binary.find_class(&internal) {
+        out
+    }
+
+    fn load_binary_into(
+        &mut self,
+        internal: &str,
+        owner: SymbolId,
+        span: Span,
+        with_nested: bool,
+    ) -> bool {
+        if internal.is_empty() {
+            return false;
+        }
+        if !self.completed_java.insert(internal.to_string()) {
+            return crate::classpath::find_by_jvm(&self.st, internal).is_some();
+        }
+        match self.binary.find_class(internal) {
             Ok(Some(bytes)) => match crate::javaclass::parse_java_classfile(&bytes) {
                 Ok(jc) => {
-                    let id = crate::classpath::install_java_class(&mut self.st, &jc);
+                    let id = crate::classpath::install_java_class_in(&mut self.st, &jc, owner);
                     self.complete_java_parents(id, span);
+                    if with_nested {
+                        self.complete_scala_nested(id, &jc, span);
+                    }
+                    true
                 }
                 Err(e) => {
                     self.error(
                         span,
                         format!("unsupported classfile {}: {e}", internal.replace('/', ".")),
                     );
+                    false
                 }
             },
-            Ok(None) => {
-                if self.st.get(owner).kind == SymKind::Package {
-                    let prefix = format!("{internal}/");
-                    if self.binary.has_package_prefix(&prefix) {
-                        let _ = crate::classpath::ensure_package(&mut self.st, &internal);
-                    }
-                }
-            }
+            Ok(None) => false,
             Err(e) => {
                 self.error(
                     span,
                     format!("unsupported classfile {}: {e}", internal.replace('/', ".")),
                 );
+                false
             }
         }
+    }
+
+    fn complete_scala_nested(
+        &mut self,
+        class_id: SymbolId,
+        jc: &crate::javaclass::JavaClass,
+        span: Span,
+    ) {
+        if !jc.is_scala {
+            return;
+        }
+        let jvm = jc.internal_name.clone();
+        if jvm.trim_end_matches('$').contains('$') {
+            return;
+        }
+        let pkg_owner = self.st.get(class_id).owner;
+        let companion = self.ensure_scala_companion(class_id, pkg_owner, span);
+        let nest_owner = if companion.is_none() {
+            class_id
+        } else {
+            self.st.module_class_of(companion)
+        };
+        let outer_trait = if matches!(
+            self.st.get(class_id).kind,
+            SymKind::Module | SymKind::ModuleClass
+        ) {
+            let stripped = jvm.trim_end_matches('$').to_string();
+            crate::classpath::find_by_jvm(&self.st, &stripped).unwrap_or(class_id)
+        } else {
+            class_id
+        };
+        for inner in &jc.inner_classes {
+            if !inner.inner_jvm.ends_with('$') || inner.inner_jvm.contains("$anon") {
+                continue;
+            }
+            let simple = crate::classpath::java_simple_name(&inner.inner_jvm);
+            if simple.is_empty() {
+                continue;
+            }
+            if !self.st.lookup_member(nest_owner, &simple).is_empty() {
+                continue;
+            }
+            if !self.load_binary_into(&inner.inner_jvm, nest_owner, span, false) {
+                continue;
+            }
+            if let Some(ev) = scala_module_evidence_type(outer_trait, &simple) {
+                mark_nested_module_implicit(&mut self.st, nest_owner, &simple, ev);
+            }
+        }
+    }
+
+    fn ensure_scala_companion(
+        &mut self,
+        class_id: SymbolId,
+        pkg_owner: SymbolId,
+        span: Span,
+    ) -> SymbolId {
+        match self.st.get(class_id).kind {
+            SymKind::Module => return class_id,
+            SymKind::ModuleClass => {
+                let want = self.st.get(class_id).name.trim_end_matches('$').to_string();
+                let members = self.st.get(pkg_owner).members.clone();
+                return members
+                    .into_iter()
+                    .find(|&m| {
+                        self.st.get(m).kind == SymKind::Module && self.st.get(m).name == want
+                    })
+                    .unwrap_or(class_id);
+            }
+            _ => {}
+        }
+        if let Some(m) = self.st.companion_module(class_id) {
+            return m;
+        }
+        let jvm = self.st.get(class_id).jvm_name.clone();
+        if jvm.is_empty() || jvm.ends_with('$') {
+            return SymbolId::NONE;
+        }
+        let comp = format!("{jvm}$");
+        self.load_binary_into(&comp, pkg_owner, span, false);
+        self.st.companion_module(class_id).unwrap_or(SymbolId::NONE)
     }
 
     fn complete_java_type(&mut self, ty: &Type, span: Span) {
@@ -7740,6 +7874,41 @@ fn first_ctor_delegation(rhs: &Tree) -> CtorDelegation {
             }
         },
     }
+}
+
+fn scala_module_evidence_type(outer: SymbolId, simple: &str) -> Option<Type> {
+    if outer.is_none() {
+        return None;
+    }
+    let arg = match simple {
+        "Int" => Type::Int,
+        "Long" => Type::Long,
+        "Double" => Type::Double,
+        "Float" => Type::Float,
+        "Boolean" => Type::Boolean,
+        "Char" => Type::Char,
+        "Unit" => Type::Unit,
+        "String" => Type::String,
+        _ => return None,
+    };
+    Some(Type::Class {
+        sym: outer,
+        args: vec![arg],
+    })
+}
+
+fn mark_nested_module_implicit(st: &mut SymbolTable, owner: SymbolId, simple: &str, ev: Type) {
+    let Some(m) = st
+        .lookup_member(owner, simple)
+        .into_iter()
+        .find(|&s| st.get(s).kind == SymKind::Module)
+    else {
+        return;
+    };
+    let f = st.get(m).flags.with(Flags::IMPLICIT);
+    st.get_mut(m).flags = f;
+    let cls = st.module_class_of(m);
+    st.get_mut(cls).parents = vec![ev];
 }
 
 fn apply_context_bound(bound: Type, tp: SymbolId) -> Type {

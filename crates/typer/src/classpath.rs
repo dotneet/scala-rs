@@ -506,12 +506,26 @@ pub fn ensure_package(st: &mut SymbolTable, jvm: &str) -> SymbolId {
 }
 
 pub fn install_java_class(st: &mut SymbolTable, c: &crate::javaclass::JavaClass) -> SymbolId {
-    let simple = java_simple_name(&c.internal_name);
     let owner = java_class_owner(st, &c.internal_name);
+    install_java_class_in(st, c, owner)
+}
+
+pub fn install_java_class_in(
+    st: &mut SymbolTable,
+    c: &crate::javaclass::JavaClass,
+    owner: SymbolId,
+) -> SymbolId {
+    let simple = java_simple_name(&c.internal_name);
+    if simple.is_empty() {
+        return find_or_stub_java_class(st, &c.internal_name);
+    }
+    if is_scala_module(c) {
+        return install_java_module(st, c, owner);
+    }
     if let Some(id) = st
         .lookup_member(owner, &simple)
         .into_iter()
-        .find(|&s| st.get(s).is_class_like())
+        .find(|&s| st.get(s).kind == SymKind::Class)
     {
         apply_java_class_meta(st, id, c);
         fill_java_members(st, id, c);
@@ -522,16 +536,7 @@ pub fn install_java_class(st: &mut SymbolTable, c: &crate::javaclass::JavaClass)
         fill_java_members(st, id, c);
         return id;
     }
-    let mut flags = Flags::JAVA;
-    if crate::javaclass::is_java_interface(c.access) {
-        flags = flags.with(Flags::INTERFACE).with(Flags::ABSTRACT);
-    }
-    if crate::javaclass::is_java_enum(c.access) {
-        flags = flags.with(Flags::ENUM);
-    }
-    if c.nested_static {
-        flags = flags.with(Flags::STATIC);
-    }
+    let flags = java_class_flags(c);
     let id = st.alloc(&simple, owner, SymKind::Class, flags, &c.internal_name);
     st.get_mut(id).ty = Type::Class {
         sym: id,
@@ -545,22 +550,91 @@ pub fn install_java_class(st: &mut SymbolTable, c: &crate::javaclass::JavaClass)
     id
 }
 
-fn java_simple_name(internal: &str) -> String {
-    internal
-        .rsplit('/')
-        .next()
-        .unwrap_or(internal)
-        .rsplit('$')
-        .next()
-        .unwrap_or(internal)
-        .to_string()
+fn java_class_flags(c: &crate::javaclass::JavaClass) -> Flags {
+    let mut flags = if c.is_scala {
+        Flags::EMPTY
+    } else {
+        Flags::JAVA
+    };
+    if crate::javaclass::is_java_interface(c.access) {
+        flags = flags.with(Flags::INTERFACE).with(Flags::ABSTRACT);
+    }
+    if crate::javaclass::is_java_enum(c.access) {
+        flags = flags.with(Flags::ENUM);
+    }
+    if c.nested_static {
+        flags = flags.with(Flags::STATIC);
+    }
+    flags
+}
+
+fn is_scala_module(c: &crate::javaclass::JavaClass) -> bool {
+    c.internal_name.ends_with('$') && (c.has_module_field || c.is_scala)
+}
+
+fn install_java_module(
+    st: &mut SymbolTable,
+    c: &crate::javaclass::JavaClass,
+    owner: SymbolId,
+) -> SymbolId {
+    let simple = java_simple_name(&c.internal_name);
+    if let Some(m) = st
+        .lookup_member(owner, &simple)
+        .into_iter()
+        .find(|&s| st.get(s).kind == SymKind::Module)
+    {
+        let cls = st.module_class_of(m);
+        apply_java_class_meta(st, cls, c);
+        fill_java_members(st, cls, c);
+        return cls;
+    }
+    if let Some(id) = find_by_jvm(st, &c.internal_name) {
+        apply_java_class_meta(st, id, c);
+        fill_java_members(st, id, c);
+        return id;
+    }
+    let flags = Flags::MODULE.with(Flags::FINAL);
+    let cls = st.alloc(
+        &format!("{simple}$"),
+        owner,
+        SymKind::ModuleClass,
+        flags,
+        &c.internal_name,
+    );
+    let m = st.alloc(
+        &simple,
+        owner,
+        SymKind::Module,
+        Flags::MODULE,
+        &c.internal_name,
+    );
+    st.get_mut(m).ty = Type::ModuleRef(cls);
+    st.get_mut(cls).ty = Type::ModuleRef(cls);
+    if owner == st.root {
+        st.enter_in_current(&simple, m);
+    }
+    apply_java_class_meta(st, cls, c);
+    fill_java_members(st, cls, c);
+    cls
+}
+
+pub fn java_simple_name(internal: &str) -> String {
+    let mut simple = internal.rsplit('/').next().unwrap_or(internal);
+    if simple.ends_with('$') && simple.len() > 1 {
+        simple = &simple[..simple.len() - 1];
+    }
+    if let Some(idx) = simple.rfind('$') {
+        simple = &simple[idx + 1..];
+    }
+    simple.to_string()
 }
 
 fn java_class_owner(st: &mut SymbolTable, internal: &str) -> SymbolId {
-    if let Some((outer, _)) = internal.rsplit_once('$') {
+    let trimmed = internal.trim_end_matches('$');
+    if let Some((outer, _)) = trimmed.rsplit_once('$') {
         return find_or_stub_java_class(st, outer);
     }
-    let pkg = internal.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    let pkg = trimmed.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
     ensure_package(st, pkg)
 }
 
@@ -600,15 +674,9 @@ pub fn find_or_stub_java_class(st: &mut SymbolTable, internal: &str) -> SymbolId
 }
 
 fn apply_java_class_meta(st: &mut SymbolTable, id: SymbolId, c: &crate::javaclass::JavaClass) {
-    let mut flags = st.get(id).flags.with(Flags::JAVA);
-    if crate::javaclass::is_java_interface(c.access) {
-        flags = flags.with(Flags::INTERFACE).with(Flags::ABSTRACT);
-    }
-    if crate::javaclass::is_java_enum(c.access) {
-        flags = flags.with(Flags::ENUM);
-    }
-    if c.nested_static {
-        flags = flags.with(Flags::STATIC);
+    let mut flags = st.get(id).flags.with(java_class_flags(c));
+    if st.get(id).kind == SymKind::ModuleClass {
+        flags = flags.with(Flags::MODULE).with(Flags::FINAL);
     }
     st.get_mut(id).flags = flags;
     st.get_mut(id).jvm_name = c.internal_name.clone();
@@ -791,6 +859,9 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         }
     }
     for f in &c.fields {
+        if f.name == "MODULE$" {
+            continue;
+        }
         if st
             .lookup_member(owner, &f.name)
             .iter()

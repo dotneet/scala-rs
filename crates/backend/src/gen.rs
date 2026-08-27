@@ -3243,6 +3243,26 @@ fn gen_select(
         asm.arraylength();
         return;
     }
+    if name == "length" && !tree.sym.is_none() && ctx.st.get(tree.sym).owner == ctx.st.array_sym {
+        // Generic `Array[T]` erases to Object; nsc uses ScalaRunTime.array_length.
+        if ctx.library_abi {
+            asm.getstatic(
+                "scala/runtime/ScalaRunTime$",
+                "MODULE$",
+                "Lscala/runtime/ScalaRunTime$;",
+            );
+            gen_expr(asm, frame, ctx, qual);
+            asm.invokevirtual(
+                "scala/runtime/ScalaRunTime$",
+                "array_length",
+                "(Ljava/lang/Object;)I",
+            );
+        } else {
+            gen_expr(asm, frame, ctx, qual);
+            asm.arraylength();
+        }
+        return;
+    }
     if matches!(qual.ty, Type::Refined { .. }) && tree.sym.is_none() {
         gen_structural_call(asm, frame, ctx, qual, name, &[], &tree.ty);
         return;
