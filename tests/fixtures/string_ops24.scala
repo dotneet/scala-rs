@@ -3,6 +3,6 @@ object Main {
     println("ab" ++ "cd")
     println("abc".lengthIs)
     println("abc".sizeIs)
-    println("ab".flatMap((c: Char) => c.toString + c.toString))
+    println("ab".flatMap((c: Char) => "xy"))
   }
 }
