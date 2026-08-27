@@ -339,6 +339,24 @@ object Main {
   }
 }
 "#);
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  val l: Int Either String = Left("nope")
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(
+            has_errors(&diags),
+            "Left[String, String] must not conform to Either[Int, String]: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

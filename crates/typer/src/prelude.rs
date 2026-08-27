@@ -1763,6 +1763,7 @@ fn add_either(st: &mut SymbolTable) {
         Intrinsic::None,
     );
 
+    // nsc: `class Left[+A, +B](value: A) extends Either[A, B]`
     let left = class(
         st,
         st.scala_pkg,
@@ -1773,6 +1774,10 @@ fn add_either(st: &mut SymbolTable) {
     let la = type_param(st, left, "A");
     let lb = type_param(st, left, "B");
     st.get_mut(left).tparams = vec![la, lb];
+    st.get_mut(left).parents = vec![Type::Class {
+        sym: either,
+        args: vec![Type::TypeParam(la), Type::TypeParam(lb)],
+    }];
     let lf = st.alloc("value", left, SymKind::Term, Flags::FINAL, "");
     st.get_mut(lf).ty = Type::TypeParam(la);
     st.get_mut(left).ctor_fields = vec![lf];
@@ -1785,34 +1790,40 @@ fn add_either(st: &mut SymbolTable) {
         vec![Type::Any],
         Type::Class {
             sym: left,
-            args: vec![],
+            args: vec![Type::TypeParam(la), Type::TypeParam(lb)],
         },
         Intrinsic::None,
     );
-    let _ = left_apply;
+    st.get_mut(left_apply).tparams = vec![la, lb];
     let mems = st.get(left_cls).members.clone();
     st.get_mut(left_mod).members.extend(mems);
 
+    // nsc: `class Right[+A, +B](value: B) extends Either[A, B]`
     let right = class(st, st.scala_pkg, "Right", "scala/util/Right", &[either_t]);
     let ra = type_param(st, right, "A");
     let rb = type_param(st, right, "B");
     st.get_mut(right).tparams = vec![ra, rb];
+    st.get_mut(right).parents = vec![Type::Class {
+        sym: either,
+        args: vec![Type::TypeParam(ra), Type::TypeParam(rb)],
+    }];
     let rf = st.alloc("value", right, SymKind::Term, Flags::FINAL, "");
     st.get_mut(rf).ty = Type::TypeParam(rb);
     st.get_mut(right).ctor_fields = vec![rf];
     let right_mod = module(st, st.scala_pkg, "Right", "scala/util/Right$");
     let right_cls = st.module_class_of(right_mod);
-    method(
+    let right_apply = method(
         st,
         right_cls,
         "apply",
         vec![Type::Any],
         Type::Class {
             sym: right,
-            args: vec![],
+            args: vec![Type::TypeParam(ra), Type::TypeParam(rb)],
         },
         Intrinsic::None,
     );
+    st.get_mut(right_apply).tparams = vec![ra, rb];
     let mems = st.get(right_cls).members.clone();
     st.get_mut(right_mod).members.extend(mems);
 }

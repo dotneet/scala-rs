@@ -3506,6 +3506,11 @@ impl Typer {
                                 };
                             }
                         }
+                    } else if owner_n == "Left$" || owner_n == "Right$" {
+                        if let Some(inst) = self.instantiate_either_ctor_apply(&owner_n, args, pt)
+                        {
+                            ret = inst;
+                        }
                     } else if owner_n == "Try$" || owner_n == "Success$" {
                         if let Some(a0) = args.first() {
                             let elem = unwrap_fn0_or_byname(&a0.ty);
@@ -3674,6 +3679,45 @@ impl Typer {
             }
         }
         out
+    }
+
+    /// `Left.apply` / `Right.apply` → `Left[A, B]` / `Right[A, B]`.
+    /// The value argument fills `A` (Left) or `B` (Right); the other param
+    /// comes from an expected `Either[A, B]` (or `Nothing` if none).
+    fn instantiate_either_ctor_apply(
+        &self,
+        owner_n: &str,
+        args: &[Tree],
+        pt: &Type,
+    ) -> Option<Type> {
+        let (cname, value_idx) = match owner_n {
+            "Left$" => ("Left", 0usize),
+            "Right$" => ("Right", 1usize),
+            _ => return None,
+        };
+        let cls = self
+            .st
+            .lookup(cname)
+            .into_iter()
+            .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)?;
+        let val_ty = args.first()?.ty.widen_constant();
+        let n = self.st.get(cls).tparams.len();
+        let pt_args: &[Type] = match pt {
+            Type::Class { args, .. } if args.len() == n => args,
+            _ => &[],
+        };
+        let mut inferred = Vec::with_capacity(n);
+        for i in 0..n {
+            if i == value_idx {
+                inferred.push(val_ty.clone());
+            } else {
+                inferred.push(pt_args.get(i).cloned().unwrap_or(Type::Nothing));
+            }
+        }
+        Some(Type::Class {
+            sym: cls,
+            args: inferred,
+        })
     }
 
     fn first_clause_ids(&self, fun: &Tree) -> Vec<SymbolId> {
