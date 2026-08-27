@@ -4463,6 +4463,11 @@ impl Typer {
                 if !sym.is_none() {
                     fun.sym = sym;
                     tree.sym = sym;
+                    // Remaining clauses (`Using.resources(a, b)(f)`) read `fun.ty`.
+                    // Leave a Method type, not the Overload that selected this alt.
+                    if matches!(&fun.ty, Type::Overload(_)) {
+                        fun.ty = self.st.get(sym).ty.clone();
+                    }
                     if let Some(Type::Class { args, .. }) = recv_ty.as_ref() {
                         if !args.is_empty() {
                             let owner = self.st.get(sym).owner;
@@ -4568,7 +4573,9 @@ impl Typer {
                     let name = s.name.clone();
                     let owner_jvm = self.st.get(s.owner).jvm_name.clone();
                     n_tps > 0
-                        && (name == "resource" || (name == "apply" && owner_jvm.contains("Using")))
+                        && (name == "resource"
+                            || name == "resources"
+                            || (name == "apply" && owner_jvm.contains("Using")))
                 } else {
                     false
                 };
@@ -5401,8 +5408,27 @@ impl Typer {
             return tys;
         }
         let orig_first: Vec<Type> = first.iter().map(|id| self.st.get(*id).ty.clone()).collect();
-        let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
-        let inst = self.infer_method_tparams(sym, &orig_first, &arg_tys);
+        // By-name params are adapted to `() => T`. Infer `T`, not Function0,
+        // so later clauses see `R2` rather than `() => R2`.
+        let orig_for_infer: Vec<Type> = orig_first
+            .iter()
+            .map(|p| match p {
+                Type::ByName(inner) => (**inner).clone(),
+                other => other.clone(),
+            })
+            .collect();
+        let arg_tys: Vec<Type> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                if matches!(orig_first.get(i), Some(Type::ByName(_))) {
+                    unwrap_fn0_or_byname(&a.ty)
+                } else {
+                    a.ty.clone()
+                }
+            })
+            .collect();
+        let inst = self.infer_method_tparams(sym, &orig_for_infer, &arg_tys);
         if inst.is_empty() {
             return tys;
         }

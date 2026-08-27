@@ -1054,6 +1054,21 @@ fn fixtures_using2_bad_is_error() {
 }
 
 #[test]
+fn fixtures_array_ops19_bad_is_error() {
+    compile_fails_lib("array_ops19_bad", "noSuchZipWithIndex is not a member");
+}
+
+#[test]
+fn fixtures_string_ops23_bad_is_error() {
+    compile_fails_lib("string_ops23_bad", "noSuchIterator is not a member");
+}
+
+#[test]
+fn fixtures_using3_bad_is_error() {
+    compile_fails_lib("using3_bad", "noSuchResources is not a member");
+}
+
+#[test]
 fn fixtures_capture_var_bad_is_error() {
     compile_fails_lib("capture_var_bad", "not assignable");
 }
@@ -1969,6 +1984,21 @@ fn scala_library_dual_run_string_ops22() {
 #[test]
 fn scala_library_dual_run_using2() {
     dual_run_fixture("using2");
+}
+
+#[test]
+fn scala_library_dual_run_array_ops19() {
+    dual_run_fixture("array_ops19");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops23() {
+    dual_run_fixture("string_ops23");
+}
+
+#[test]
+fn scala_library_dual_run_using3() {
+    dual_run_fixture("using3");
 }
 
 #[test]

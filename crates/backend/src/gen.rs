@@ -5168,6 +5168,30 @@ fn invoke_value_extension(
             );
             return;
         }
+        if s.name == "zipWithIndex" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "zipWithIndex$extension",
+                "(Ljava/lang/Object;)[Lscala/Tuple2;",
+            );
+            return;
+        }
+        if s.name == "knownSize" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "knownSize$extension",
+                "(Ljava/lang/Object;)I",
+            );
+            return;
+        }
+        if s.name == "sizeCompare" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "sizeCompare$extension",
+                "(Ljava/lang/Object;I)I",
+            );
+            return;
+        }
         asm.invokestatic(
             "scala/collection/ArrayOps",
             &format!("{}$extension", s.name),
@@ -6042,6 +6066,20 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 "apply",
                 "(Lscala/Function0;Lscala/Function1;Lscala/util/Using$Releasable;)Lscala/util/Try;",
             );
+            return;
+        }
+        if owner == "scala/util/Using$" && name == "resources" {
+            let desc = if s.jvm_name.starts_with('(') {
+                s.jvm_name.clone()
+            } else {
+                "(Ljava/lang/Object;Lscala/Function0;Lscala/Function2;Lscala/util/Using$Releasable;Lscala/util/Using$Releasable;)Ljava/lang/Object;".into()
+            };
+            asm.invokevirtual("scala/util/Using$", "resources", &desc);
+            if result_ty.is_some_and(is_unit_like) {
+                asm.pop();
+            } else {
+                maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
+            }
             return;
         }
         if owner == "scala/util/Using$Manager$" && name == "apply" {
@@ -8964,6 +9002,15 @@ fn gen_try(
         asm.mark(catch_start);
         if unit {
             gen_stat(asm, frame, ctx, &c.body);
+        } else if is_unit_like(&c.body.ty) {
+            // `try { resources(...) /* Int */ } catch { println }` — nsc LUBs
+            // to Any in statement position. We keep the try's type and fill
+            // a default so the catch does not istore from an empty stack.
+            gen_stat(asm, frame, ctx, &c.body);
+            push_default(asm, result_ty);
+            if let Some(slot) = result_slot {
+                store(asm, slot, sel_sort);
+            }
         } else {
             gen_expr(asm, frame, ctx, &c.body);
             if let Some(slot) = result_slot {
