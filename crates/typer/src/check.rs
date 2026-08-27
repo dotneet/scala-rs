@@ -4568,7 +4568,9 @@ impl Typer {
                     let name = s.name.clone();
                     let owner_jvm = self.st.get(s.owner).jvm_name.clone();
                     n_tps > 0
-                        && (name == "resource" || (name == "apply" && owner_jvm.contains("Using")))
+                        && (name == "resource"
+                            || name == "resources"
+                            || (name == "apply" && owner_jvm.contains("Using")))
                 } else {
                     false
                 };

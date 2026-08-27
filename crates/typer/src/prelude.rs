@@ -356,10 +356,14 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
             add_string_ops_sorted(st, so, ordering);
             add_string_ops_indices_and_r(st, so);
             add_string_ops_compare_patch_length(st, so);
+            if let Some(it) = iterator {
+                add_string_ops_iterator_size_appended(st, so, it);
+            }
         }
         if let Some(aops) = array_ops {
             add_array_ops_remaining(st, aops);
             add_array_ops_filter_not_opts_part(st, aops, tuple2);
+            add_array_ops_zip_index_size(st, aops, tuple2);
         }
         add_seq_and_lazylist(st);
         add_indexedseq_and_queue(st);
@@ -1447,6 +1451,13 @@ fn fn1(arg: Type, ret: Type) -> Type {
 fn fn2(a: Type, b: Type, ret: Type) -> Type {
     Type::Function {
         params: vec![a, b],
+        ret: Box::new(ret),
+    }
+}
+
+fn fn_n(params: Vec<Type>, ret: Type) -> Type {
+    Type::Function {
+        params,
         ret: Box::new(ret),
     }
 }
@@ -2707,6 +2718,35 @@ fn add_array_ops_filter_not_opts_part(st: &mut SymbolTable, aops: SymbolId, tupl
     );
 }
 
+/// ArrayOps.zipWithIndex / knownSize / sizeCompare against 2.13.16.
+///
+/// JVM: `zipWithIndex$extension(Object)[Lscala/Tuple2;`,
+/// `knownSize$extension(Object)I`, `sizeCompare$extension(Object, I)I`.
+fn add_array_ops_zip_index_size(st: &mut SymbolTable, aops: SymbolId, tuple2: SymbolId) {
+    let a = st.get(aops).tparams[0];
+    let ta = Type::TypeParam(a);
+    method(
+        st,
+        aops,
+        "zipWithIndex",
+        vec![],
+        Type::Array(Box::new(Type::Class {
+            sym: tuple2,
+            args: vec![ta, Type::Int],
+        })),
+        Intrinsic::None,
+    );
+    method(st, aops, "knownSize", vec![], Type::Int, Intrinsic::None);
+    method(
+        st,
+        aops,
+        "sizeCompare",
+        vec![Type::Int],
+        Type::Int,
+        Intrinsic::None,
+    );
+}
+
 /// StringOps.map(Char => Char): String, `:+` / `+:` against 2.13.16.
 ///
 /// JVM: `map$extension(String, Function1)String`,
@@ -2780,6 +2820,51 @@ fn add_string_ops_compare_patch_length(st: &mut SymbolTable, so: SymbolId) {
             Intrinsic::None,
         );
     }
+}
+
+/// StringOps.iterator / sizeCompare / knownSize / appendedAll / prependedAll
+/// against 2.13.16.
+///
+/// JVM: `iterator$extension(String)Iterator`, `sizeCompare$extension(String, I)I`,
+/// `knownSize$extension(String)I`, `appendedAll$extension` /
+/// `prependedAll$extension(String, String)String`.
+fn add_string_ops_iterator_size_appended(st: &mut SymbolTable, so: SymbolId, iterator: SymbolId) {
+    method(
+        st,
+        so,
+        "iterator",
+        vec![],
+        Type::Class {
+            sym: iterator,
+            args: vec![Type::Char],
+        },
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "sizeCompare",
+        vec![Type::Int],
+        Type::Int,
+        Intrinsic::None,
+    );
+    method(st, so, "knownSize", vec![], Type::Int, Intrinsic::None);
+    method(
+        st,
+        so,
+        "appendedAll",
+        vec![Type::String],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "prependedAll",
+        vec![Type::String],
+        Type::String,
+        Intrinsic::None,
+    );
 }
 
 fn add_string_ops_indices_and_r(st: &mut SymbolTable, so: SymbolId) {
@@ -3128,7 +3213,8 @@ fn add_list_members(
 }
 
 fn add_function_types(st: &mut SymbolTable) {
-    for n in 0..=2 {
+    // Function3/4 are needed for `Using.resources` 3–4 resource overloads.
+    for n in 0..=4 {
         let f = iface(
             st,
             st.scala_pkg,
@@ -4837,14 +4923,15 @@ fn add_chaining(st: &mut SymbolTable) {
     st.get_mut(chaining).members.extend(mems);
 }
 
-/// `scala.util.Using.resource` / `Using.apply` / `Using.Manager` + `Releasable[-R]`
-/// against scala-library 2.13.16.
+/// `scala.util.Using.resource` / `Using.apply` / `Using.Manager` / `Using.resources`
+/// + `Releasable[-R]` against scala-library 2.13.16.
 ///
 /// nsc 2.13.16 JVM:
 /// `Using$.resource(Object, Function1, Using$Releasable)Object`,
 /// `Using$.apply(Function0, Function1, Using$Releasable)Try`,
 /// `Using$Manager$.apply(Function1)Try`,
-/// `Using$Manager.apply/acquire(Object, Using$Releasable)`.
+/// `Using$Manager.apply/acquire(Object, Using$Releasable)`,
+/// `Using$.resources` 2–4 resource overloads (Function2/3/4).
 /// Implicit `Using$Releasable$AutoCloseableIsReleasable$.MODULE$`.
 fn add_using(st: &mut SymbolTable) {
     let util = crate::classpath::ensure_package(st, "scala/util");
@@ -5158,8 +5245,104 @@ fn add_using(st: &mut SymbolTable) {
     let mm_mems = st.get(manager_mcls).members.clone();
     st.get_mut(manager_mod).members.extend(mm_mems);
 
+    // nsc `Using.resources` 2–4 resource overloads. First resource is by-value,
+    // later ones by-name; result is `A` (throws, unlike `Using.apply`).
+    add_using_resources(st, using_cls, releasable, 2);
+    add_using_resources(st, using_cls, releasable, 3);
+    add_using_resources(st, using_cls, releasable, 4);
+
     let mems = st.get(using_cls).members.clone();
     st.get_mut(using_mod).members.extend(mems);
+}
+
+/// nsc `Using.resources[R1, …, Rn, A](r1, r2: => …)(f)(implicit Releasable*)`.
+///
+/// JVM 2-arg: `(Object, Function0, Function2, Releasable, Releasable)Object`
+/// and similarly Function3/Function4 for n=3/4.
+fn add_using_resources(st: &mut SymbolTable, using_cls: SymbolId, releasable: SymbolId, n: usize) {
+    let m = method(
+        st,
+        using_cls,
+        "resources",
+        vec![],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let mut rs = Vec::new();
+    for i in 1..=n {
+        rs.push(type_param(st, m, &format!("R{i}")));
+    }
+    let a = type_param(st, m, "A");
+    let mut tps = rs.clone();
+    tps.push(a);
+    st.get_mut(m).tparams = tps;
+
+    let mut p_ids = Vec::new();
+    let mut p_tys = Vec::new();
+    for (i, r) in rs.iter().enumerate() {
+        let base = Type::TypeParam(*r);
+        let ty = if i == 0 {
+            base
+        } else {
+            Type::ByName(Box::new(base))
+        };
+        let p = st.alloc(
+            &format!("resource{}", i + 1),
+            m,
+            crate::symbol::SymKind::Term,
+            Flags::PARAM,
+            "",
+        );
+        st.get_mut(p).ty = ty.clone();
+        p_ids.push(p);
+        p_tys.push(ty);
+    }
+
+    let fn_ty = fn_n(
+        rs.iter().map(|r| Type::TypeParam(*r)).collect(),
+        Type::TypeParam(a),
+    );
+    let f = st.alloc("f", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(f).ty = fn_ty.clone();
+
+    let mut ev_ids = Vec::new();
+    let mut ev_tys = Vec::new();
+    for (i, r) in rs.iter().enumerate() {
+        let ev = st.alloc(
+            &format!("evidence${}", i + 1),
+            m,
+            crate::symbol::SymKind::Term,
+            Flags::PARAM.with(Flags::IMPLICIT),
+            "",
+        );
+        let et = Type::Class {
+            sym: releasable,
+            args: vec![Type::TypeParam(*r)],
+        };
+        st.get_mut(ev).ty = et.clone();
+        ev_ids.push(ev);
+        ev_tys.push(et);
+    }
+
+    let mut all_params = p_ids.clone();
+    all_params.push(f);
+    all_params.extend(ev_ids.iter().copied());
+    st.get_mut(m).params = all_params;
+    st.get_mut(m).paramss = vec![p_ids, vec![f], ev_ids];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![p_tys, vec![fn_ty], ev_tys],
+        ret: Box::new(Type::TypeParam(a)),
+    };
+    let mut desc = String::from("(Ljava/lang/Object;");
+    for _ in 1..n {
+        desc.push_str("Lscala/Function0;");
+    }
+    desc.push_str(&format!("Lscala/Function{n};"));
+    for _ in 0..n {
+        desc.push_str("Lscala/util/Using$Releasable;");
+    }
+    desc.push_str(")Ljava/lang/Object;");
+    st.get_mut(m).jvm_name = desc;
 }
 
 fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
