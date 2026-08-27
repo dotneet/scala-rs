@@ -3345,11 +3345,15 @@ impl Typer {
                         fun: Box::new(fun),
                         args: vec![old],
                     },
-                    ty: to,
+                    ty: to.clone(),
                     sym: conv,
                     postfix: false,
                 };
-                found = vec![member];
+                found = if let Some(cls) = self.st.class_sym_of(&to) {
+                    self.st.lookup_member(cls, &name)
+                } else {
+                    vec![member]
+                };
             }
         }
         if found.is_empty() && self.is_dynamic_receiver(&qual.ty) {
