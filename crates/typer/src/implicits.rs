@@ -403,18 +403,16 @@ impl Typer {
         ids.sort_by_key(|id| id.0);
         ids.dedup();
         for id in ids {
-            let Some(param) = self.conversion_arg_ty(id) else {
-                continue;
-            };
-            if let Some(pcls) = self.st.class_sym_of(&param) {
-                self.ensure_java_loaded(pcls, span);
-            }
             let Some(to) = self.conversion_result(id, from) else {
                 continue;
             };
             let Some(cls) = self.st.class_sym_of(&to) else {
                 continue;
             };
+            // Load the conversion *result* (e.g. ListHasAsScala) so `asScala`
+            // is visible. Do not complete the *argument* type: that would
+            // install `java.lang.String#toUpperCase(Locale)` onto Predef
+            // String and shadow StringOps.
             self.ensure_java_loaded(cls, span);
             let members = self.st.lookup_member(cls, name);
             if let Some(m) = members.first() {

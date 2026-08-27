@@ -1785,6 +1785,12 @@ fn add_seq_and_lazylist(st: &mut SymbolTable) {
         sym: seq,
         args: vec![],
     });
+    // `SeqHasAsJava` takes `scala.collection.Seq`, not `immutable.Seq`.
+    let coll_seq = crate::classpath::find_or_stub_java_class(st, "scala/collection/Seq");
+    st.get_mut(st.list_sym).parents.push(Type::Class {
+        sym: coll_seq,
+        args: vec![],
+    });
 }
 
 fn add_either(st: &mut SymbolTable) {
