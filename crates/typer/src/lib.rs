@@ -3270,6 +3270,58 @@ object Main {
     }
 
     #[test]
+    fn string_ops9_arrayops_linkedhashset_typecheck_with_library() {
+        ok_lib(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val t: String = "hello".tail
+    val i: String = "hello".init
+    val d: String = "abca".distinct
+    val m0: String = "abc".mkString
+    val m1: String = "abc".mkString(",")
+    val xs = Array(1, 2, 3)
+    xs.foreach(x => println(x))
+    val ys = Array(10L, 20L, 30L)
+    val yh: Long = ys.head
+    ys.foreach(x => println(x))
+    val s = scala.collection.mutable.LinkedHashSet.empty[Int]
+    s += 1
+    val c: Boolean = s.contains(1)
+    s.foreach(x => println(x))
+    val u = scala.collection.mutable.LinkedHashSet(3, 4)
+    u.foreach(x => println(x))
+  }
+}
+"#,
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = "hi".noSuchTail
+    val y = Array(1, 2, 3).noSuchForeach
+    val z = scala.collection.mutable.LinkedHashSet.empty[Int].noSuch
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics

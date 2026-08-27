@@ -4611,7 +4611,15 @@ fn invoke_value_extension(
         return;
     }
     if owner == "scala/collection/ArrayOps" {
-        // 2.13 ArrayOps is AnyVal over erased Array; $extension takes/returns Object.
+        // 2.13 ArrayOps is AnyVal over erased Array.
+        if s.name == "foreach" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "foreach$extension",
+                "(Ljava/lang/Object;Lscala/Function1;)V",
+            );
+            return;
+        }
         asm.invokestatic(
             "scala/collection/ArrayOps",
             &format!("{}$extension", s.name),
@@ -5060,6 +5068,28 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
                     );
                     asm.checkcast("scala/collection/mutable/HashSet");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_linkedhashset_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/LinkedHashSet$",
+                        "empty",
+                        "()Lscala/collection/mutable/LinkedHashSet;",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/LinkedHashSet$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/mutable/LinkedHashSet");
                     return;
                 }
                 _ => {}
@@ -5685,6 +5715,35 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_linkedhashset(&owner) {
+            match name {
+                "contains" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/LinkedHashSet",
+                        "contains",
+                        "(Ljava/lang/Object;)Z",
+                    );
+                    return;
+                }
+                "+=" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/LinkedHashSet",
+                        "+=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Growable;",
+                    );
+                    return;
+                }
+                "foreach" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/LinkedHashSet",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_stdlib_stringbuilder(&owner) {
             match name {
                 "+=" => {
@@ -5940,6 +5999,14 @@ fn is_stdlib_linkedhashmap(owner: &str) -> bool {
 
 fn is_stdlib_linkedhashmap_module(owner: &str) -> bool {
     owner == "scala/collection/mutable/LinkedHashMap$"
+}
+
+fn is_stdlib_linkedhashset(owner: &str) -> bool {
+    owner == "scala/collection/mutable/LinkedHashSet"
+}
+
+fn is_stdlib_linkedhashset_module(owner: &str) -> bool {
+    owner == "scala/collection/mutable/LinkedHashSet$"
 }
 
 fn emit_long_numeric_range(asm: &mut Assembler, inclusive: bool) {

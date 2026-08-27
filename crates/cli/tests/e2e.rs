@@ -831,6 +831,21 @@ fn fixtures_linkedhashmap_bad_is_error() {
 }
 
 #[test]
+fn fixtures_string_ops9_bad_is_error() {
+    compile_fails_lib("string_ops9_bad", "noSuchTail is not a member");
+}
+
+#[test]
+fn fixtures_array_ops3_bad_is_error() {
+    compile_fails_lib("array_ops3_bad", "noSuchForeach is not a member");
+}
+
+#[test]
+fn fixtures_linkedhashset_bad_is_error() {
+    compile_fails_lib("linkedhashset_bad", "noSuch is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1519,6 +1534,21 @@ fn scala_library_dual_run_linkedhashmap() {
 }
 
 #[test]
+fn scala_library_dual_run_string_ops9() {
+    dual_run_fixture("string_ops9");
+}
+
+#[test]
+fn scala_library_dual_run_array_ops3() {
+    dual_run_fixture("array_ops3");
+}
+
+#[test]
+fn scala_library_dual_run_linkedhashset() {
+    dual_run_fixture("linkedhashset");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -1805,6 +1835,8 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/mutable/HashSet$.class",
     "scala/collection/mutable/LinkedHashMap.class",
     "scala/collection/mutable/LinkedHashMap$.class",
+    "scala/collection/mutable/LinkedHashSet.class",
+    "scala/collection/mutable/LinkedHashSet$.class",
     "scala/collection/immutable/NumericRange.class",
     "scala/collection/immutable/NumericRange$.class",
     "scala/collection/immutable/NumericRange$Inclusive.class",
