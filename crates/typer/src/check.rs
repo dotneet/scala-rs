@@ -4500,7 +4500,7 @@ impl Typer {
                 if let Some(elem) = recv_ty.as_ref().and_then(|t| self.elem_type(t)) {
                     if matches!(
                         fun_name.as_str(),
-                        "map" | "flatMap" | "foreach" | "withFilter"
+                        "map" | "flatMap" | "foreach" | "withFilter" | "pipe" | "tap"
                     ) && !param_tys.is_empty()
                     {
                         if let Type::Function { ret: fr, .. } = &param_tys[0] {
@@ -4707,6 +4707,15 @@ impl Typer {
                                         args: vec![fr.as_ref().widen_constant()],
                                     };
                                 }
+                            }
+                        }
+                    }
+                } else if method_name == "pipe" {
+                    if let Some(a0) = args.first() {
+                        if let Type::Function { ret: fr, .. } = &a0.ty {
+                            let t = fr.as_ref().widen_constant();
+                            if !t.is_no_type() && !t.is_error() {
+                                ret = t;
                             }
                         }
                     }

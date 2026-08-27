@@ -999,6 +999,21 @@ fn fixtures_bigint_bad_is_error() {
 }
 
 #[test]
+fn fixtures_array_ops15_bad_is_error() {
+    compile_fails_lib("array_ops15_bad", "noSuchScanLeft is not a member");
+}
+
+#[test]
+fn fixtures_string_ops19_bad_is_error() {
+    compile_fails_lib("string_ops19_bad", "noSuchGrouped is not a member");
+}
+
+#[test]
+fn fixtures_chaining_bad_is_error() {
+    compile_fails_lib("chaining_bad", "noSuchPipe is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1852,6 +1867,21 @@ fn scala_library_dual_run_bigint() {
 }
 
 #[test]
+fn scala_library_dual_run_array_ops15() {
+    dual_run_fixture("array_ops15");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops19() {
+    dual_run_fixture("string_ops19");
+}
+
+#[test]
+fn scala_library_dual_run_chaining() {
+    dual_run_fixture("chaining");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -2177,6 +2207,10 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/math/BigInt$.class",
     "scala/math/BigDecimal.class",
     "scala/math/BigDecimal$.class",
+    "scala/util/ChainingOps.class",
+    "scala/util/ChainingOps$.class",
+    "scala/util/package$chaining$.class",
+    "scala/util/ChainingSyntax.class",
     "scala/util/matching/Regex.class",
     "scala/Array$.class",
     "scala/runtime/NonLocalReturnControl.class",

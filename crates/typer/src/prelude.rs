@@ -300,9 +300,11 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         if let Some(aops) = array_ops {
             add_array_ops_zip(st, aops, tuple2);
             add_array_ops_folds(st, aops);
+            add_array_ops_scan_left(st, aops);
         }
         if let Some(so) = string_ops {
             add_string_ops_fold_left(st, so);
+            add_string_ops_fold_right_and_grouped(st, so);
         }
     }
 
@@ -368,6 +370,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_breaks(st);
         add_big_int(st);
         add_big_decimal(st);
+        add_chaining(st);
         add_xml(st);
         add_enumeration(st);
     }
@@ -1950,6 +1953,39 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
     method(
         st,
         so,
+        "toByteOption",
+        vec![],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![Type::Byte],
+        },
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "toShortOption",
+        vec![],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![Type::Short],
+        },
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "toFloatOption",
+        vec![],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![Type::Float],
+        },
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
         "toLongOption",
         vec![],
         Type::Class {
@@ -2039,6 +2075,22 @@ fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         st,
         aops,
         "exists",
+        vec![fn1(ta.clone(), Type::Boolean)],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "count",
+        vec![fn1(ta.clone(), Type::Boolean)],
+        Type::Int,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "forall",
         vec![fn1(ta.clone(), Type::Boolean)],
         Type::Boolean,
         Intrinsic::None,
@@ -2355,6 +2407,52 @@ fn add_array_ops_folds(st: &mut SymbolTable, aops: SymbolId) {
     };
 }
 
+/// ArrayOps.scanLeft[B: ClassTag](z: B)(op: (B, A) => B): Array[B]
+///
+/// nsc 2.13.16 JVM: `scanLeft$extension(Object, Object, Function2, ClassTag)Object`.
+fn add_array_ops_scan_left(st: &mut SymbolTable, aops: SymbolId) {
+    let reflect = crate::classpath::ensure_package(st, "scala/reflect");
+    let ct = st
+        .lookup_member(reflect, "ClassTag")
+        .into_iter()
+        .find(|&id| st.get(id).kind == crate::symbol::SymKind::Class)
+        .unwrap_or(SymbolId::NONE);
+    let a = st.get(aops).tparams[0];
+    let ta = Type::TypeParam(a);
+    let m = method(st, aops, "scanLeft", vec![], Type::Unit, Intrinsic::None);
+    let b = type_param(st, m, "B");
+    let tb = Type::TypeParam(b);
+    let z = st.alloc("z", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(z).ty = tb.clone();
+    let op = st.alloc("op", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(op).ty = fn2(tb.clone(), ta.clone(), tb.clone());
+    let ev = st.alloc(
+        "evidence$1",
+        m,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(ev).ty = Type::Class {
+        sym: ct,
+        args: vec![tb.clone()],
+    };
+    st.get_mut(m).tparams = vec![b];
+    st.get_mut(m).params = vec![z, op, ev];
+    st.get_mut(m).paramss = vec![vec![z], vec![op], vec![ev]];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![
+            vec![tb.clone()],
+            vec![fn2(tb.clone(), ta, tb.clone())],
+            vec![Type::Class {
+                sym: ct,
+                args: vec![tb.clone()],
+            }],
+        ],
+        ret: Box::new(Type::Array(Box::new(tb))),
+    };
+}
+
 /// StringOps.foldLeft[B](z: B)(op: (B, Char) => B): B
 ///
 /// nsc 2.13.16 JVM: `foldLeft$extension(String, Object, Function2)Object`.
@@ -2376,6 +2474,51 @@ fn add_string_ops_fold_left(st: &mut SymbolTable, so: SymbolId) {
         ],
         ret: Box::new(tb),
     };
+}
+
+/// StringOps.foldRight[B](z: B)(op: (Char, B) => B): B and grouped(n): Iterator[String].
+///
+/// nsc 2.13.16 JVM: `foldRight$extension(String, Object, Function2)Object` /
+/// `grouped$extension(String, I)Iterator`.
+fn add_string_ops_fold_right_and_grouped(st: &mut SymbolTable, so: SymbolId) {
+    let m = method(st, so, "foldRight", vec![], Type::Unit, Intrinsic::None);
+    let b = type_param(st, m, "B");
+    let tb = Type::TypeParam(b);
+    let z = st.alloc("z", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(z).ty = tb.clone();
+    let op = st.alloc("op", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(op).ty = fn2(Type::Char, tb.clone(), tb.clone());
+    st.get_mut(m).tparams = vec![b];
+    st.get_mut(m).params = vec![z, op];
+    st.get_mut(m).paramss = vec![vec![z], vec![op]];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![
+            vec![tb.clone()],
+            vec![fn2(Type::Char, tb.clone(), tb.clone())],
+        ],
+        ret: Box::new(tb),
+    };
+    let it = st
+        .lookup_member(st.scala_pkg, "Iterator")
+        .into_iter()
+        .find(|&id| {
+            matches!(
+                st.get(id).kind,
+                crate::symbol::SymKind::Class | crate::symbol::SymKind::ModuleClass
+            )
+        })
+        .unwrap_or(SymbolId::NONE);
+    method(
+        st,
+        so,
+        "grouped",
+        vec![Type::Int],
+        Type::Class {
+            sym: it,
+            args: vec![Type::String],
+        },
+        Intrinsic::None,
+    );
 }
 
 fn add_string_ops_indices_and_r(st: &mut SymbolTable, so: SymbolId) {
@@ -4359,6 +4502,78 @@ fn add_big_decimal(st: &mut SymbolTable) {
     );
     let mems = st.get(mcls).members.clone();
     st.get_mut(big_mod).members.extend(mems);
+}
+
+/// `scala.util.chaining` (`package$chaining$`) + `ChainingOps` against 2.13.16.
+///
+/// `import scala.util.chaining._` brings IMPLICIT `scalaUtilChainingOps`.
+/// JVM: `pipe$extension` / `tap$extension(Object, Function1)Object`.
+fn add_chaining(st: &mut SymbolTable) {
+    let util = crate::classpath::ensure_package(st, "scala/util");
+    let ops = class(
+        st,
+        util,
+        "ChainingOps",
+        "scala/util/ChainingOps",
+        &[Type::AnyVal],
+    );
+    let a = type_param(st, ops, "A");
+    st.get_mut(ops).tparams = vec![a];
+    let ta = Type::TypeParam(a);
+    let self_f = st.alloc("self", ops, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(self_f).ty = ta.clone();
+    st.get_mut(ops).ctor_fields = vec![self_f];
+
+    let pipe = method(st, ops, "pipe", vec![], Type::Unit, Intrinsic::None);
+    let b = type_param(st, pipe, "B");
+    let f = st.alloc("f", pipe, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(f).ty = fn1(ta.clone(), Type::TypeParam(b));
+    st.get_mut(pipe).tparams = vec![b];
+    st.get_mut(pipe).params = vec![f];
+    st.get_mut(pipe).paramss = vec![vec![f]];
+    st.get_mut(pipe).ty = Type::Method {
+        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(b))]],
+        ret: Box::new(Type::TypeParam(b)),
+    };
+
+    let tap = method(st, ops, "tap", vec![], Type::Unit, Intrinsic::None);
+    let u = type_param(st, tap, "U");
+    let g = st.alloc("f", tap, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(g).ty = fn1(ta.clone(), Type::TypeParam(u));
+    st.get_mut(tap).tparams = vec![u];
+    st.get_mut(tap).params = vec![g];
+    st.get_mut(tap).paramss = vec![vec![g]];
+    st.get_mut(tap).ty = Type::Method {
+        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(u))]],
+        ret: Box::new(ta.clone()),
+    };
+
+    let chaining = module(st, util, "chaining", "scala/util/package$chaining$");
+    let mcls = st.module_class_of(chaining);
+    let conv = method(
+        st,
+        mcls,
+        "scalaUtilChainingOps",
+        vec![Type::Any],
+        Type::Class {
+            sym: ops,
+            args: vec![],
+        },
+        Intrinsic::Identity,
+    );
+    let ca = type_param(st, conv, "A");
+    let cta = Type::TypeParam(ca);
+    st.get_mut(conv).tparams = vec![ca];
+    st.get_mut(conv).ty = Type::Method {
+        paramss: vec![vec![cta.clone()]],
+        ret: Box::new(Type::Class {
+            sym: ops,
+            args: vec![cta],
+        }),
+    };
+    st.get_mut(conv).flags = st.get(conv).flags.with(Flags::IMPLICIT);
+    let mems = st.get(mcls).members.clone();
+    st.get_mut(chaining).members.extend(mems);
 }
 
 fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
