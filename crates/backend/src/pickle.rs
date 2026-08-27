@@ -1135,11 +1135,12 @@ impl<'a> Pickler<'a> {
     }
 
     /// TREE { APPLYtree, type_Ref, fun_tree, {arg_tree} } — no symbol (nsc).
+    /// Nested args are TREEs (LITERALtree for literals), not bare Constants.
     fn pickle_apply_tree(&mut self, fun: &Tree, args: &[Tree], owner: SymbolId) -> Option<u32> {
-        let fun_ref = self.pickle_annot_arg(fun, owner)?;
+        let fun_ref = self.pickle_nested_tree(fun, owner)?;
         let mut arg_refs = Vec::new();
         for a in args {
-            arg_refs.push(self.pickle_annot_arg(a, owner)?);
+            arg_refs.push(self.pickle_nested_tree(a, owner)?);
         }
         let found = match &fun.kind {
             TreeKind::Ident { name } => self.lookup_member_named(owner, name),
@@ -1155,6 +1156,42 @@ impl<'a> Pickler<'a> {
             write_nat_to(&mut body, a);
         }
         Some(self.add(TREE, body))
+    }
+
+    fn pickle_nested_tree(&mut self, arg: &Tree, owner: SymbolId) -> Option<u32> {
+        match &arg.kind {
+            TreeKind::Literal { lit } => Some(self.pickle_literal_tree(lit)),
+            TreeKind::Ident { name } => Some(self.pickle_ident_tree(name, owner)),
+            TreeKind::Select { qual, name } => self.pickle_select_tree(qual, name, owner),
+            TreeKind::This { qual } => Some(self.pickle_this_tree(qual.as_deref(), owner)),
+            TreeKind::Apply { fun, args }
+                if matches!(&fun.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) =>
+            {
+                self.pickle_apply_tree(fun, args, owner)
+            }
+            _ => None,
+        }
+    }
+
+    /// TREE { LITERALtree, type_Ref, constant_Ref } — UnPickler reads no symbol.
+    fn pickle_literal_tree(&mut self, lit: &Lit) -> u32 {
+        let c = self.pickle_literal(lit);
+        let tpe = match lit {
+            Lit::Int(_) => self.type_ref_named("Int"),
+            Lit::Long(_) => self.type_ref_named("Long"),
+            Lit::Float(_) => self.type_ref_named("Float"),
+            Lit::Double(_) => self.type_ref_named("Double"),
+            Lit::Boolean(_) => self.type_ref_named("Boolean"),
+            Lit::Char(_) => self.type_ref_named("Char"),
+            Lit::String(_) | Lit::Symbol(_) => self.type_ref_named("String"),
+            Lit::Unit => self.type_ref_named("Unit"),
+            Lit::Null => self.type_ref_named("Null"),
+        };
+        let mut body = Vec::new();
+        write_nat_to(&mut body, LITERALtree as u32);
+        write_nat_to(&mut body, tpe);
+        write_nat_to(&mut body, c);
+        self.add(TREE, body)
     }
 
     fn pickle_literal_class(&mut self, tpe: u32) -> u32 {
@@ -2985,6 +3022,10 @@ object Lib {
         assert!(
             subs.contains(&(IDENTtree as u32)),
             "expected IDENTtree for ident, got {subs:?}"
+        );
+        assert!(
+            subs.contains(&(LITERALtree as u32)),
+            "expected LITERALtree for ident(1) arg, got {subs:?}"
         );
 
         // PickleFormat EXTref = name_Ref [owner_Ref]. There is no flags field;
