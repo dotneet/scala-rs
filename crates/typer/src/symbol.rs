@@ -681,9 +681,18 @@ impl SymbolTable {
                 if a1.is_empty() || a2.is_empty() {
                     true
                 } else if a1.len() == a2.len() {
-                    a1.iter()
-                        .zip(a2.iter())
-                        .all(|(x, y)| self.is_sub_type(x, y))
+                    let tparams = self.get(*s1).tparams.clone();
+                    a1.iter().zip(a2.iter()).enumerate().all(|(i, (x, y))| {
+                        let flags = tparams
+                            .get(i)
+                            .map(|&tp| self.get(tp).flags)
+                            .unwrap_or(Flags::EMPTY);
+                        if flags.contains(Flags::CONTRAVARIANT) {
+                            self.is_sub_type(y, x)
+                        } else {
+                            self.is_sub_type(x, y)
+                        }
+                    })
                 } else {
                     false
                 }

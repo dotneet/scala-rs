@@ -1024,6 +1024,21 @@ fn fixtures_string_ops20_bad_is_error() {
 }
 
 #[test]
+fn fixtures_array_ops17_bad_is_error() {
+    compile_fails_lib("array_ops17_bad", "noSuchFind is not a member");
+}
+
+#[test]
+fn fixtures_string_ops21_bad_is_error() {
+    compile_fails_lib("string_ops21_bad", "noSuchCompare is not a member");
+}
+
+#[test]
+fn fixtures_using_bad_is_error() {
+    compile_fails_lib("using_bad", "noSuchResource is not a member");
+}
+
+#[test]
 fn fixtures_capture_var_bad_is_error() {
     compile_fails_lib("capture_var_bad", "not assignable");
 }
@@ -1912,6 +1927,21 @@ fn scala_library_dual_run_string_ops20() {
 }
 
 #[test]
+fn scala_library_dual_run_array_ops17() {
+    dual_run_fixture("array_ops17");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops21() {
+    dual_run_fixture("string_ops21");
+}
+
+#[test]
+fn scala_library_dual_run_using() {
+    dual_run_fixture("using");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -2240,6 +2270,11 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/util/ChainingOps.class",
     "scala/util/ChainingOps$.class",
     "scala/util/package$chaining$.class",
+    "scala/util/Using.class",
+    "scala/util/Using$.class",
+    "scala/util/Using$Releasable.class",
+    "scala/util/Using$Releasable$.class",
+    "scala/util/Using$Releasable$AutoCloseableIsReleasable$.class",
     "scala/util/ChainingSyntax.class",
     "scala/runtime/IntRef.class",
     "scala/runtime/ObjectRef.class",

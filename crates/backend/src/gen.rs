@@ -5070,6 +5070,66 @@ fn invoke_value_extension(
             );
             return;
         }
+        if s.name == "find" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "find$extension",
+                "(Ljava/lang/Object;Lscala/Function1;)Lscala/Option;",
+            );
+            return;
+        }
+        if s.name == "contains" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "contains$extension",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+            );
+            return;
+        }
+        if s.name == "takeRight" || s.name == "dropRight" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                &format!("{}$extension", s.name),
+                "(Ljava/lang/Object;I)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;I)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
+        if s.name == "takeWhile" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "takeWhile$extension",
+                "(Ljava/lang/Object;Lscala/Function1;)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;Lscala/Function1;)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
+        if s.name == "indices" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "indices$extension",
+                "(Ljava/lang/Object;)Lscala/collection/immutable/Range;",
+            );
+            return;
+        }
+        if s.name == "lengthCompare" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "lengthCompare$extension",
+                "(Ljava/lang/Object;I)I",
+            );
+            return;
+        }
         asm.invokestatic(
             "scala/collection/ArrayOps",
             &format!("{}$extension", s.name),
@@ -5925,6 +5985,16 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         result_ty,
                     );
                 }
+            }
+            return;
+        }
+        if owner == "scala/util/Using$" && name == "resource" {
+            let desc = "(Ljava/lang/Object;Lscala/Function1;Lscala/util/Using$Releasable;)Ljava/lang/Object;";
+            asm.invokevirtual("scala/util/Using$", "resource", desc);
+            if result_ty.is_some_and(is_unit_like) {
+                asm.pop();
+            } else {
+                maybe_unbox_erased_result(asm, ctx, desc, result_ty);
             }
             return;
         }
@@ -8775,6 +8845,12 @@ fn gen_try(
     } else {
         Some(frame.alloc_tmp(sel_sort))
     };
+    // Initialize the result local before the try so the exception handler
+    // stack map does not claim a live value that the body never stored.
+    if let Some(slot) = result_slot {
+        push_default(asm, result_ty);
+        store(asm, slot, sel_sort);
+    }
     let exn_slot = frame.alloc_tmp(JvmSort::Ref);
 
     asm.mark(start);

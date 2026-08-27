@@ -355,6 +355,10 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         if let Some(so) = string_ops {
             add_string_ops_sorted(st, so, ordering);
             add_string_ops_indices_and_r(st, so);
+            add_string_ops_compare_patch_length(st, so);
+        }
+        if let Some(aops) = array_ops {
+            add_array_ops_remaining(st, aops);
         }
         add_seq_and_lazylist(st);
         add_indexedseq_and_queue(st);
@@ -372,6 +376,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_big_int(st);
         add_big_decimal(st);
         add_chaining(st);
+        add_using(st);
         add_xml(st);
         add_enumeration(st);
     }
@@ -2542,6 +2547,94 @@ fn add_string_ops_fold_right_and_grouped(st: &mut SymbolTable, so: SymbolId) {
     );
 }
 
+/// ArrayOps.find / contains / distinct / takeRight / dropRight / takeWhile /
+/// indices / lengthCompare against 2.13.16.
+///
+/// JVM: `find$extension(Object, Function1)Option`,
+/// `contains$extension(Object, Object)Z`, `distinct$extension(Object)Object`,
+/// `takeRight$extension` / `dropRight$extension` `(Object, I)Object`,
+/// `takeWhile$extension(Object, Function1)Object`,
+/// `indices$extension(Object)Range`, `lengthCompare$extension(Object, I)I`.
+fn add_array_ops_remaining(st: &mut SymbolTable, aops: SymbolId) {
+    let a = st.get(aops).tparams[0];
+    let ta = Type::TypeParam(a);
+    method(
+        st,
+        aops,
+        "find",
+        vec![fn1(ta.clone(), Type::Boolean)],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![ta.clone()],
+        },
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "contains",
+        vec![ta.clone()],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "distinct",
+        vec![],
+        Type::Array(Box::new(ta.clone())),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "takeRight",
+        vec![Type::Int],
+        Type::Array(Box::new(ta.clone())),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "dropRight",
+        vec![Type::Int],
+        Type::Array(Box::new(ta.clone())),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "takeWhile",
+        vec![fn1(ta.clone(), Type::Boolean)],
+        Type::Array(Box::new(ta.clone())),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "lengthCompare",
+        vec![Type::Int],
+        Type::Int,
+        Intrinsic::None,
+    );
+    let range = st
+        .lookup_member(st.scala_pkg, "Range")
+        .into_iter()
+        .find(|&id| st.get(id).kind == crate::symbol::SymKind::Class)
+        .unwrap_or(SymbolId::NONE);
+    method(
+        st,
+        aops,
+        "indices",
+        vec![],
+        Type::Class {
+            sym: range,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+}
+
 /// StringOps.map(Char => Char): String, `:+` / `+:` against 2.13.16.
 ///
 /// JVM: `map$extension(String, Function1)String`,
@@ -2569,6 +2662,45 @@ fn add_string_ops_map_and_appended(st: &mut SymbolTable, so: SymbolId) {
         "+:",
         vec![Type::Char],
         Type::String,
+        Intrinsic::None,
+    );
+}
+
+/// StringOps.compare / lengthCompare / patch(Int, String, Int) / `<` against 2.13.16.
+///
+/// JVM: `compare$extension(String, String)I`, `lengthCompare$extension(String, I)I`,
+/// `patch$extension(String, I, String, I)String`, `$less$extension(String, String)Z`.
+fn add_string_ops_compare_patch_length(st: &mut SymbolTable, so: SymbolId) {
+    method(
+        st,
+        so,
+        "compare",
+        vec![Type::String],
+        Type::Int,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "lengthCompare",
+        vec![Type::Int],
+        Type::Int,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "patch",
+        vec![Type::Int, Type::String, Type::Int],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "<",
+        vec![Type::String],
+        Type::Boolean,
         Intrinsic::None,
     );
 }
@@ -4626,6 +4758,119 @@ fn add_chaining(st: &mut SymbolTable) {
     st.get_mut(conv).flags = st.get(conv).flags.with(Flags::IMPLICIT);
     let mems = st.get(mcls).members.clone();
     st.get_mut(chaining).members.extend(mems);
+}
+
+/// `scala.util.Using.resource` + `Releasable[-R]` against scala-library 2.13.16.
+///
+/// nsc 2.13.16 JVM: `Using$.resource(Object, Function1, Using$Releasable)Object`
+/// with implicit `Using$Releasable$AutoCloseableIsReleasable$.MODULE$`.
+fn add_using(st: &mut SymbolTable) {
+    let util = crate::classpath::ensure_package(st, "scala/util");
+    let java_lang = crate::classpath::ensure_package(st, "java/lang");
+    let auto_closeable = st
+        .lookup_member(java_lang, "AutoCloseable")
+        .into_iter()
+        .find(|&id| st.get(id).is_class_like())
+        .unwrap_or_else(|| {
+            let ac = iface(st, java_lang, "AutoCloseable", "java/lang/AutoCloseable");
+            mark_java(st, ac);
+            let close = st.alloc(
+                "close",
+                ac,
+                crate::symbol::SymKind::Method,
+                Flags::ABSTRACT,
+                "",
+            );
+            st.get_mut(close).ty = Type::Method {
+                paramss: Vec::new(),
+                ret: Box::new(Type::Unit),
+            };
+            ac
+        });
+
+    let releasable = iface(st, util, "Releasable", "scala/util/Using$Releasable");
+    let r = type_param(st, releasable, "R");
+    st.get_mut(r).flags = st.get(r).flags.with(Flags::CONTRAVARIANT);
+    st.get_mut(releasable).tparams = vec![r];
+    let release = st.alloc(
+        "release",
+        releasable,
+        crate::symbol::SymKind::Method,
+        Flags::ABSTRACT,
+        "",
+    );
+    st.get_mut(release).ty = Type::Method {
+        paramss: vec![vec![Type::TypeParam(r)]],
+        ret: Box::new(Type::Unit),
+    };
+
+    let rel_mod = module(st, util, "Releasable", "scala/util/Using$Releasable$");
+    let rel_cls = st.module_class_of(rel_mod);
+    add_ordering_instance(
+        st,
+        rel_cls,
+        releasable,
+        "AutoCloseableIsReleasable",
+        "scala/util/Using$Releasable$AutoCloseableIsReleasable$",
+        Type::Class {
+            sym: auto_closeable,
+            args: vec![],
+        },
+    );
+    let mems = st.get(rel_cls).members.clone();
+    st.get_mut(rel_mod).members.extend(mems);
+
+    let using_mod = module(st, util, "Using", "scala/util/Using$");
+    let using_cls = st.module_class_of(using_mod);
+    let res = method(
+        st,
+        using_cls,
+        "resource",
+        vec![],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let rr = type_param(st, res, "R");
+    let aa = type_param(st, res, "A");
+    st.get_mut(res).tparams = vec![rr, aa];
+    let r_t = Type::TypeParam(rr);
+    let a_t = Type::TypeParam(aa);
+    let resource = st.alloc(
+        "resource",
+        res,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM,
+        "",
+    );
+    st.get_mut(resource).ty = r_t.clone();
+    let f = st.alloc("f", res, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(f).ty = fn1(r_t.clone(), a_t.clone());
+    let ev = st.alloc(
+        "releasable",
+        res,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(ev).ty = Type::Class {
+        sym: releasable,
+        args: vec![r_t.clone()],
+    };
+    st.get_mut(res).params = vec![resource, f, ev];
+    st.get_mut(res).paramss = vec![vec![resource], vec![f], vec![ev]];
+    st.get_mut(res).ty = Type::Method {
+        paramss: vec![
+            vec![r_t.clone()],
+            vec![fn1(r_t.clone(), a_t.clone())],
+            vec![Type::Class {
+                sym: releasable,
+                args: vec![r_t],
+            }],
+        ],
+        ret: Box::new(a_t),
+    };
+    let mems = st.get(using_cls).members.clone();
+    st.get_mut(using_mod).members.extend(mems);
 }
 
 fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
