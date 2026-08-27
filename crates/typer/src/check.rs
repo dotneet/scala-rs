@@ -1358,6 +1358,10 @@ impl Typer {
     }
 
     fn type_val_body(&mut self, tree: &mut Tree) {
+        let presuper = matches!(
+            &tree.kind,
+            TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::PRESUPER)
+        );
         let (rhs, declared) = match &mut tree.kind {
             TreeKind::ValDef { rhs, .. } => (rhs, tree.ty.clone()),
             _ => return,
@@ -1375,6 +1379,12 @@ impl Typer {
             declared.clone()
         };
         self.type_expr(rhs, &pt);
+        if presuper && tree_contains_this(rhs) {
+            self.error(
+                tree.span,
+                "this can be used only in a class, object, or template",
+            );
+        }
         if declared.is_no_type() {
             tree.ty = rhs.ty.widen_constant();
             if !tree.sym.is_none() {
@@ -3496,6 +3506,11 @@ impl Typer {
                                 };
                             }
                         }
+                    } else if owner_n == "Left$" || owner_n == "Right$" {
+                        if let Some(inst) = self.instantiate_either_ctor_apply(&owner_n, args, pt)
+                        {
+                            ret = inst;
+                        }
                     } else if owner_n == "Try$" || owner_n == "Success$" {
                         if let Some(a0) = args.first() {
                             let elem = unwrap_fn0_or_byname(&a0.ty);
@@ -3664,6 +3679,45 @@ impl Typer {
             }
         }
         out
+    }
+
+    /// `Left.apply` / `Right.apply` → `Left[A, B]` / `Right[A, B]`.
+    /// The value argument fills `A` (Left) or `B` (Right); the other param
+    /// comes from an expected `Either[A, B]` (or `Nothing` if none).
+    fn instantiate_either_ctor_apply(
+        &self,
+        owner_n: &str,
+        args: &[Tree],
+        pt: &Type,
+    ) -> Option<Type> {
+        let (cname, value_idx) = match owner_n {
+            "Left$" => ("Left", 0usize),
+            "Right$" => ("Right", 1usize),
+            _ => return None,
+        };
+        let cls = self
+            .st
+            .lookup(cname)
+            .into_iter()
+            .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)?;
+        let val_ty = args.first()?.ty.widen_constant();
+        let n = self.st.get(cls).tparams.len();
+        let pt_args: &[Type] = match pt {
+            Type::Class { args, .. } if args.len() == n => args,
+            _ => &[],
+        };
+        let mut inferred = Vec::with_capacity(n);
+        for i in 0..n {
+            if i == value_idx {
+                inferred.push(val_ty.clone());
+            } else {
+                inferred.push(pt_args.get(i).cloned().unwrap_or(Type::Nothing));
+            }
+        }
+        Some(Type::Class {
+            sym: cls,
+            args: inferred,
+        })
     }
 
     fn first_clause_ids(&self, fun: &Tree) -> Vec<SymbolId> {
@@ -6651,6 +6705,27 @@ fn pattern_has_star(pat: &Tree) -> bool {
         TreeKind::Star { .. } => true,
         TreeKind::Bind { body, .. } => pattern_has_star(body),
         TreeKind::Typed { expr, .. } => pattern_has_star(expr),
+        _ => false,
+    }
+}
+
+fn tree_contains_this(tree: &Tree) -> bool {
+    match &tree.kind {
+        TreeKind::This { .. } => true,
+        TreeKind::Select { qual, .. } | TreeKind::Typed { expr: qual, .. } => {
+            tree_contains_this(qual)
+        }
+        TreeKind::Apply { fun, args } | TreeKind::TypeApply { fun, args } => {
+            tree_contains_this(fun) || args.iter().any(tree_contains_this)
+        }
+        TreeKind::Block { stats, expr } => {
+            stats.iter().any(tree_contains_this) || tree_contains_this(expr)
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            tree_contains_this(cond) || tree_contains_this(thenp) || tree_contains_this(elsep)
+        }
+        TreeKind::Assign { lhs, rhs } => tree_contains_this(lhs) || tree_contains_this(rhs),
+        TreeKind::New { tpt } => tree_contains_this(tpt),
         _ => false,
     }
 }

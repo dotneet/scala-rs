@@ -1,5 +1,6 @@
 case class Point(x: Int, y: Int)
 class Ann(x: Any) extends annotation.StaticAnnotation
+class Ann2(a: String, b: Int) extends annotation.StaticAnnotation
 class Base { val foo = 1 }
 class Holder extends Base {
   def me: this.type = this
@@ -40,6 +41,7 @@ object Lib {
   @Ann(ident(ident(1))) def markedNest: Int = 9
   @Ann(foo = 1) def markedNamed: Int = 10
   @Ann(foo = bar) def markedNamedIdent: Int = 12
+  @Ann2(b = 2, a = "ok") def markedReorder: Int = 13
   def join(xs: String*): Int = 0
 }
 trait MixA { def a: Int }

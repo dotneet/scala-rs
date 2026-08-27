@@ -556,12 +556,15 @@ impl SymbolTable {
                 parents.iter().all(|p| self.is_sub_type(a, p))
                     && self.conforms_to_refinement(a, decls)
             }
-            (Type::Class { sym: s1, .. }, b) => self
-                .get(*s1)
-                .parents
-                .clone()
-                .iter()
-                .any(|p| self.is_sub_type(p, b)),
+            (Type::Class { sym: s1, args: a1 }, b) => {
+                let child = self.get(*s1);
+                let tps = child.tparams.clone();
+                let parents = child.parents.clone();
+                parents.iter().any(|p| {
+                    let p = subst_tparams_slice(&tps, a1, p);
+                    self.is_sub_type(&p, b)
+                })
+            }
             (Type::Array(x), Type::Array(y)) => self.is_sub_type(x, y),
             (Type::ModuleRef(s), Type::Class { sym, .. }) if s == sym => true,
             (Type::ModuleRef(s), b) => self

@@ -285,6 +285,81 @@ object Main {
     }
 
     #[test]
+    fn early_defs_and_illegal_this() {
+        ok(r#"
+trait T { val x: Int; val y: Int = x + 10 }
+class C extends { val x = 1 } with T
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait T { val x: Int }
+class Bad extends { def f = 1 } with T { val x = 1 }
+"#,
+        );
+        assert!(
+            has_errors(&diags)
+                && diags
+                    .iter()
+                    .any(|d| d.message.contains("only concrete field definitions")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait T { val x: Int }
+class BadThis extends { val x = this.toString.length } with T
+"#,
+        );
+        assert!(
+            has_errors(&diags)
+                && diags
+                    .iter()
+                    .any(|d| d.message.contains("this can be used only in a class")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn infix_either_type_typechecks() {
+        ok(r#"
+class Pair[A, B](val a: A, val b: B)
+object Main {
+  def f(p: Int Pair String): Int = 1
+}
+"#);
+        ok_lib(r#"
+object Main {
+  def f(e: Int Either String): Int Either String = e
+  def main(args: Array[String]): Unit = {
+    val l: Int Either String = Left(7)
+    val r: Int Either String = Right("ok")
+    val a: Boolean = f(l).isLeft
+    val b: Boolean = r.isLeft
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  val l: Int Either String = Left("nope")
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(
+            has_errors(&diags),
+            "Left[String, String] must not conform to Either[Int, String]: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn ambiguous_implicit() {
         let (_, _, diags) = typecheck_str(
             r#"
