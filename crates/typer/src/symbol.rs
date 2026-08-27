@@ -992,6 +992,107 @@ impl SymbolTable {
             }
         })
     }
+
+    /// SIP-21: exactly one abstract method (not an Object method / FunctionN).
+    pub fn sam_sig(&self, ty: &Type) -> Option<SamSig> {
+        let cls = self.class_sym_of(ty)?;
+        let jvm = self.get(cls).jvm_name.clone();
+        if jvm.starts_with("scala/Function") || jvm.ends_with("PartialFunction") {
+            return None;
+        }
+        let abstracts = self.abstract_sam_methods(cls);
+        if abstracts.len() != 1 {
+            return None;
+        }
+        let method = abstracts[0];
+        let targs: Vec<Type> = match ty {
+            Type::Class { args, .. } => args.clone(),
+            _ => Vec::new(),
+        };
+        let tps = self.get(cls).tparams.clone();
+        let subst = |t: &Type| subst_tparams_slice(&tps, &targs, t);
+        let (raw_params, raw_ret) = match &self.get(method).ty {
+            Type::Method { paramss, ret } => (
+                paramss.iter().flatten().cloned().collect::<Vec<_>>(),
+                (**ret).clone(),
+            ),
+            _ => return None,
+        };
+        Some(SamSig {
+            class: cls,
+            method,
+            name: self.get(method).name.clone(),
+            param_tys: raw_params.iter().map(subst).collect(),
+            ret_ty: subst(&raw_ret),
+            raw_param_tys: raw_params,
+            raw_ret_ty: raw_ret,
+        })
+    }
+
+    fn abstract_sam_methods(&self, cls: SymbolId) -> Vec<SymbolId> {
+        let mut by_name: HashMap<String, SymbolId> = HashMap::new();
+        let mut work = vec![cls];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = work.pop() {
+            if !seen.insert(id.0) {
+                continue;
+            }
+            for m in &self.get(id).members {
+                let s = self.get(*m);
+                if s.kind != SymKind::Method || sam_excluded_name(&s.name) {
+                    continue;
+                }
+                by_name.entry(s.name.clone()).or_insert(*m);
+            }
+            for p in self.get(id).parents.clone() {
+                if let Some(c) = self.class_sym_of(&p) {
+                    work.push(c);
+                }
+            }
+        }
+        by_name
+            .into_values()
+            .filter(|m| self.get(*m).flags.contains(Flags::ABSTRACT))
+            .collect()
+    }
+}
+
+/// SAM conversion target (class + single abstract method).
+#[derive(Clone, Debug)]
+pub struct SamSig {
+    pub class: SymbolId,
+    pub method: SymbolId,
+    pub name: String,
+    pub param_tys: Vec<Type>,
+    pub ret_ty: Type,
+    pub raw_param_tys: Vec<Type>,
+    pub raw_ret_ty: Type,
+}
+
+fn sam_excluded_name(name: &str) -> bool {
+    matches!(
+        name,
+        "<init>"
+            | "<clinit>"
+            | "$init$"
+            | "equals"
+            | "hashCode"
+            | "toString"
+            | "clone"
+            | "finalize"
+            | "wait"
+            | "notify"
+            | "notifyAll"
+            | "getClass"
+            | "asInstanceOf"
+            | "isInstanceOf"
+            | "=="
+            | "!="
+            | "eq"
+            | "ne"
+            | "##"
+            | "synchronized"
+    )
 }
 
 impl Default for SymbolTable {

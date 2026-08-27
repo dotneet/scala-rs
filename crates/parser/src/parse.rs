@@ -27,7 +27,7 @@ fn annotation_compiler_unsupported(path: &str) -> bool {
     let simple = path.rsplit('.').next().unwrap_or(path);
     matches!(
         simple,
-        "inline" | "specialized" | "unspecialized" | "elidable" | "strictfp" | "native"
+        "specialized" | "unspecialized" | "elidable" | "strictfp" | "native"
     )
 }
 
@@ -569,6 +569,12 @@ impl<'a> Parser<'a> {
                     let annot = self.parse_simple_expr();
                     let path = annot.annotation_path();
                     if annotation_supported(&path) {
+                        let simple = path.rsplit('.').next().unwrap_or(path.as_str());
+                        if simple == "volatile" {
+                            flags = flags.with(Flags::VOLATILE);
+                        } else if simple == "transient" {
+                            flags = flags.with(Flags::TRANSIENT);
+                        }
                         annotations.push(annot);
                     } else {
                         let shown = if path.is_empty() {
@@ -1020,9 +1026,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_parent(&mut self) -> Tree {
-        // AnnotType [ArgumentExprs]
+        // AnnotType [ArgumentExprs]. Constructor argument lists stay on the
+        // same line (`new Foo(1)`). A newline after the class name is a
+        // statement separator (`val b = new Box` / `b.x = 3`), matching nsc.
         let tpt = self.parse_annot_type();
-        self.skip_nl();
         if matches!(self.kind(), TokenKind::LParen) {
             let args = self.parse_arg_exprs();
             self.alloc(

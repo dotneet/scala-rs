@@ -704,6 +704,31 @@ fn fixtures_early_defs_bad_is_error() {
 }
 
 #[test]
+fn fixtures_sam() {
+    check("sam");
+}
+
+#[test]
+fn fixtures_sam_bad_is_error() {
+    compile_fails("sam_bad", "type mismatch");
+}
+
+#[test]
+fn fixtures_volatile() {
+    check("volatile");
+}
+
+#[test]
+fn fixtures_inline() {
+    check("inline");
+}
+
+#[test]
+fn fixtures_inline_bad_is_error() {
+    compile_fails("inline_bad", "only supported on methods");
+}
+
+#[test]
 fn fixtures_xml_attr_bad_is_error() {
     compile_fails("xml_attr_bad", "XML");
 }
@@ -1276,6 +1301,33 @@ fn java_deprecated_runtime_visible_on_method() {
     assert!(
         text.contains("Deprecated") && text.contains("Ljava/lang/Deprecated;"),
         "expected Java @Deprecated RuntimeVisibleAnnotations on method, got {text}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn volatile_transient_flags_in_javap() {
+    let out = compile_fixture("volatile");
+    if !javap_available() {
+        let _ = fs::remove_dir_all(&out);
+        return;
+    }
+    let output = Command::new("javap")
+        .args(["-v", "-p", out.join("Box.class").to_str().unwrap()])
+        .output()
+        .expect("javap");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("ACC_VOLATILE") && text.contains("volatile"),
+        "expected volatile field in javap, got {text}"
+    );
+    assert!(
+        text.contains("ACC_TRANSIENT") && text.contains("transient"),
+        "expected transient field in javap, got {text}"
     );
     let _ = fs::remove_dir_all(&out);
 }
