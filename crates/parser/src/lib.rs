@@ -669,31 +669,33 @@ object Main {
     }
 
     #[test]
-    fn xml_comments_and_cdata_are_unimplemented() {
-        let r = parse_str("object M { val x = <a><!--c--></a> }\n");
+    fn xml_comments_cdata_pi_desugar() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val a = <a><!--c--></a>
+    val b = <a><![CDATA[x]]></a>
+    val c = <a><?pi t?></a>
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Comment"), "expected Comment: {dump}");
+        assert!(dump.contains("PCData"), "expected PCData: {dump}");
+        assert!(dump.contains("ProcInstr"), "expected ProcInstr: {dump}");
+    }
+
+    #[test]
+    fn xml_entity_ref_is_unimplemented() {
+        let r = parse_str("object M { val x = <a>&amp;</a> }\n");
         assert!(
             r.diags
                 .iter()
-                .any(|d| d.message.contains("XML comments/CDATA")),
-            "expected XML comments/CDATA diagnostic, got {:?}",
+                .any(|d| d.message.contains("XML entity") || d.message.contains("XML")),
+            "expected XML entity diagnostic, got {:?}",
             r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-        let cdata = parse_str("object M { val x = <a><![CDATA[x]]></a> }\n");
-        assert!(
-            cdata
-                .diags
-                .iter()
-                .any(|d| d.message.contains("XML comments/CDATA")),
-            "expected XML CDATA diagnostic, got {:?}",
-            cdata.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-        let pi = parse_str("object M { val x = <a><?pi?></a> }\n");
-        assert!(
-            pi.diags
-                .iter()
-                .any(|d| d.message.contains("XML processing instructions")),
-            "expected XML PI diagnostic, got {:?}",
-            pi.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 

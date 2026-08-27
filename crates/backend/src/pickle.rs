@@ -102,6 +102,8 @@ pub const TYPEAPPLYtree: u8 = 30;
 #[allow(non_upper_case_globals)]
 pub const APPLYtree: u8 = 31;
 #[allow(non_upper_case_globals)]
+pub const SUPERtree: u8 = 33;
+#[allow(non_upper_case_globals)]
 pub const THIStree: u8 = 34;
 #[allow(non_upper_case_globals)]
 pub const SELECTtree: u8 = 35;
@@ -768,11 +770,9 @@ impl<'a> Pickler<'a> {
         self.current_owner = idx;
         for d in decls {
             match d {
-                RefineDecl::Def {
-                    name,
-                    paramss,
-                    ret,
-                } => self.pickle_refined_def(idx, name, paramss, ret),
+                RefineDecl::Def { name, paramss, ret } => {
+                    self.pickle_refined_def(idx, name, paramss, ret)
+                }
                 RefineDecl::Val { name, ty } => {
                     self.pickle_refined_def(idx, name, &[], ty);
                 }
@@ -930,14 +930,17 @@ impl<'a> Pickler<'a> {
         self.add(SYMANNOT, body);
     }
 
-    /// Constant (literal / classOf) or TREE Ident/Select/This/Apply.
-    /// Super / nested Apply / named args stay holes.
+    /// Constant (literal / classOf) or TREE Ident/Select/This/Super/Apply.
+    /// Named annot args stay a hole.
     fn pickle_annot_arg(&mut self, arg: &Tree, owner: SymbolId) -> Option<u32> {
         match &arg.kind {
             TreeKind::Literal { lit } => Some(self.pickle_literal(lit)),
             TreeKind::Ident { name } => Some(self.pickle_ident_tree(name, owner)),
             TreeKind::Select { qual, name } => self.pickle_select_tree(qual, name, owner),
             TreeKind::This { qual } => Some(self.pickle_this_tree(qual.as_deref(), owner)),
+            TreeKind::Super { qual, mix } => {
+                Some(self.pickle_super_tree(qual.as_deref(), mix.as_deref(), owner))
+            }
             TreeKind::TypeApply { fun, args } if is_classof_fun(fun) => {
                 // nsc pickles annotation `classOf[T]` as LITERALclass Constant,
                 // not TYPEAPPLYtree. scalac 2.13.16 reads that Constant.
@@ -948,7 +951,10 @@ impl<'a> Pickler<'a> {
                 Some(self.pickle_literal_class(tpe))
             }
             TreeKind::Apply { fun, args }
-                if matches!(&fun.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) =>
+                if matches!(
+                    &fun.kind,
+                    TreeKind::Ident { .. } | TreeKind::Select { .. } | TreeKind::Apply { .. }
+                ) =>
             {
                 self.pickle_apply_tree(fun, args, owner)
             }
@@ -996,12 +1002,7 @@ impl<'a> Pickler<'a> {
         let owner_ref = if let Some(&i) = self.sym_index.get(&owner_id.0) {
             i
         } else {
-            let oname = self
-                .st
-                .get(owner_id)
-                .name
-                .trim_end_matches('$')
-                .to_string();
+            let oname = self.st.get(owner_id).name.trim_end_matches('$').to_string();
             let empty = self.empty_package();
             self.ext_ref_owned(&oname, empty)
         };
@@ -1052,12 +1053,50 @@ impl<'a> Pickler<'a> {
     }
 
     fn pickle_select_tree(&mut self, qual: &Tree, name: &str, owner: SymbolId) -> Option<u32> {
-        let TreeKind::Ident { name: qname } = &qual.kind else {
-            return None;
+        let (qtree, xowner) = match &qual.kind {
+            TreeKind::Ident { name: qname } => {
+                let qfound = self.lookup_member_named(owner, qname);
+                let qtree = self.pickle_ident_tree(qname, owner);
+                let xowner = qfound.and_then(|id| self.select_owner_of(id));
+                (qtree, xowner)
+            }
+            TreeKind::This { qual: tq } => {
+                let cls = self.enclosing_class_sym(owner);
+                let qtree = self.pickle_this_tree(tq.as_deref(), owner);
+                (qtree, Some(cls).filter(|c| !c.is_none()))
+            }
+            TreeKind::Super { qual: sq, mix } => {
+                let cls = self.enclosing_class_sym(owner);
+                let qtree = self.pickle_super_tree(sq.as_deref(), mix.as_deref(), owner);
+                (qtree, Some(cls).filter(|c| !c.is_none()))
+            }
+            TreeKind::Select {
+                qual: inner,
+                name: iname,
+            } => {
+                let qtree = self.pickle_select_tree(inner, iname, owner)?;
+                (qtree, None)
+            }
+            _ => return None,
         };
-        let qfound = self.lookup_member_named(owner, qname);
-        let qtree = self.pickle_ident_tree(qname, owner);
-        let xowner = qfound.and_then(|id| match &self.st.get(id).ty {
+        let xfound = xowner.and_then(|o| self.lookup_member_named(o, name));
+        let tpe = self.member_tree_tpe(xfound);
+        let sym = match xfound {
+            Some(id) => self.pickle_member_sym(id),
+            None => self.none,
+        };
+        let n = self.term_name(name);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, SELECTtree as u32);
+        write_nat_to(&mut body, tpe);
+        write_nat_to(&mut body, sym);
+        write_nat_to(&mut body, qtree);
+        write_nat_to(&mut body, n);
+        Some(self.add(TREE, body))
+    }
+
+    fn select_owner_of(&self, id: SymbolId) -> Option<SymbolId> {
+        match &self.st.get(id).ty {
             Type::Class { sym, .. } => Some(*sym),
             Type::ModuleRef(s) => Some(self.st.module_class_of(*s)).filter(|c| !c.is_none()),
             Type::ThisType(s) => Some(*s),
@@ -1074,21 +1113,7 @@ impl<'a> Pickler<'a> {
                     None
                 }
             }
-        });
-        let xfound = xowner.and_then(|o| self.lookup_member_named(o, name));
-        let tpe = self.member_tree_tpe(xfound);
-        let sym = match xfound {
-            Some(id) => self.pickle_member_sym(id),
-            None => self.none,
-        };
-        let n = self.term_name(name);
-        let mut body = Vec::new();
-        write_nat_to(&mut body, SELECTtree as u32);
-        write_nat_to(&mut body, tpe);
-        write_nat_to(&mut body, sym);
-        write_nat_to(&mut body, qtree);
-        write_nat_to(&mut body, n);
-        Some(self.add(TREE, body))
+        }
     }
 
     /// TREE { THIStree, type_Ref, sym_Ref, name_Ref } — UnPickler reads a symbol.
@@ -1113,6 +1138,31 @@ impl<'a> Pickler<'a> {
         write_nat_to(&mut body, tpe);
         write_nat_to(&mut body, sym);
         write_nat_to(&mut body, n);
+        self.add(TREE, body)
+    }
+
+    /// TREE { SUPERtree, type_Ref, sym_Ref, qual_tree, mix_name } — UnPickler
+    /// reads a symbol, then Super(qual, mix).
+    fn pickle_super_tree(&mut self, qual: Option<&str>, mix: Option<&str>, owner: SymbolId) -> u32 {
+        let cls = self.enclosing_class_sym(owner);
+        let tpe = if cls.is_none() {
+            self.notpe
+        } else {
+            self.pickle_this_tpe(cls)
+        };
+        let sym = if cls.is_none() {
+            self.none
+        } else {
+            self.pickle_class(cls)
+        };
+        let qtree = self.pickle_this_tree(qual, owner);
+        let mix_n = self.type_name(mix.unwrap_or(""));
+        let mut body = Vec::new();
+        write_nat_to(&mut body, SUPERtree as u32);
+        write_nat_to(&mut body, tpe);
+        write_nat_to(&mut body, sym);
+        write_nat_to(&mut body, qtree);
+        write_nat_to(&mut body, mix_n);
         self.add(TREE, body)
     }
 
@@ -1164,8 +1214,14 @@ impl<'a> Pickler<'a> {
             TreeKind::Ident { name } => Some(self.pickle_ident_tree(name, owner)),
             TreeKind::Select { qual, name } => self.pickle_select_tree(qual, name, owner),
             TreeKind::This { qual } => Some(self.pickle_this_tree(qual.as_deref(), owner)),
+            TreeKind::Super { qual, mix } => {
+                Some(self.pickle_super_tree(qual.as_deref(), mix.as_deref(), owner))
+            }
             TreeKind::Apply { fun, args }
-                if matches!(&fun.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) =>
+                if matches!(
+                    &fun.kind,
+                    TreeKind::Ident { .. } | TreeKind::Select { .. } | TreeKind::Apply { .. }
+                ) =>
             {
                 self.pickle_apply_tree(fun, args, owner)
             }
@@ -1449,8 +1505,7 @@ impl<'a> Pickler<'a> {
         if is_case {
             extra |= 1 << 11; // CASE
         }
-        if class_flags.contains(Flags::JAVA)
-            || self.st.get(class_id).jvm_name.starts_with("java/")
+        if class_flags.contains(Flags::JAVA) || self.st.get(class_id).jvm_name.starts_with("java/")
         {
             extra |= 1 << 20; // JAVA (not remapped)
         }
@@ -1553,13 +1608,7 @@ impl<'a> Pickler<'a> {
         }
     }
 
-    fn pickle_bridge_method(
-        &mut self,
-        name: &str,
-        owner_ref: u32,
-        params: &[Type],
-        ret: &Type,
-    ) {
+    fn pickle_bridge_method(&mut self, name: &str, owner_ref: u32, params: &[Type], ret: &Type) {
         let name_ref = self.term_name(name);
         let meth_idx = self.add(VALSYM, vec![]);
         let saved = self.current_owner;
@@ -1673,7 +1722,9 @@ impl<'a> Pickler<'a> {
         if meth_flags.contains(Flags::BRIDGE) {
             extra |= 1 << 26; // BRIDGE (not remapped)
         }
-        if params.iter().any(|(_, t, _)| matches!(t, Type::Repeated(_)))
+        if params
+            .iter()
+            .any(|(_, t, _)| matches!(t, Type::Repeated(_)))
             || meth_flags.contains(Flags::VARARGS)
         {
             extra |= 1u64 << 43; // VARARGS (not remapped)
@@ -2964,13 +3015,18 @@ object Lib {
     fn pickle_tree_this_classof_apply_and_extref_has_no_flags() {
         let src = r#"
 class Ann(x: Any) extends annotation.StaticAnnotation
-class Holder {
+class Base { val foo = 1 }
+class Holder extends Base {
+  val x = 1
   @Ann(this) def markedThis: Int = 4
   @Ann(classOf[Int]) def markedClass: Int = 5
+  @Ann(this.x) def markedThisSel: Int = 7
+  @Ann(super.foo) def markedSuper: Int = 8
 }
 object Lib {
   def ident(n: Int): Int = n
   @Ann(ident(1)) def markedApply: Int = 6
+  @Ann(ident(ident(1))) def markedNest: Int = 9
 }
 "#;
         let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
@@ -3000,6 +3056,14 @@ object Lib {
             hsubs.contains(&(THIStree as u32)),
             "expected THIStree subtag, got {hsubs:?}"
         );
+        assert!(
+            hsubs.contains(&(SELECTtree as u32)),
+            "expected SELECTtree for this.x / super.foo, got {hsubs:?}"
+        );
+        assert!(
+            hsubs.contains(&(SUPERtree as u32)),
+            "expected SUPERtree for super.foo, got {hsubs:?}"
+        );
 
         let lib = st
             .symbols
@@ -3018,6 +3082,11 @@ object Lib {
         assert!(
             subs.contains(&(APPLYtree as u32)),
             "expected APPLYtree subtag, got {subs:?}"
+        );
+        let apply_n = subs.iter().filter(|t| **t == APPLYtree as u32).count();
+        assert!(
+            apply_n >= 2,
+            "expected nested APPLYtree for ident(ident(1)), got {subs:?}"
         );
         assert!(
             subs.contains(&(IDENTtree as u32)),
