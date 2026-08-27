@@ -364,8 +364,15 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
             add_array_ops_remaining(st, aops);
             add_array_ops_filter_not_opts_part(st, aops, tuple2);
             add_array_ops_zip_index_size(st, aops, tuple2);
+            if let Some(it) = iterator {
+                add_array_ops_length_index_copy(st, aops, it);
+            }
+        }
+        if let Some(so) = string_ops {
+            add_string_ops_concat_length_flat(st, so);
         }
         add_seq_and_lazylist(st);
+        add_view(st);
         add_indexedseq_and_queue(st);
         add_array_buffer(st);
         add_list_buffer(st);
@@ -2747,6 +2754,46 @@ fn add_array_ops_zip_index_size(st: &mut SymbolTable, aops: SymbolId, tuple2: Sy
     );
 }
 
+/// ArrayOps.lengthIs / sizeIs / indexOf / copyToArray / iterator against 2.13.16.
+///
+/// JVM: `lengthIs$extension` / `sizeIs$extension(Object)I`,
+/// `indexOf$extension(Object, Object, I)I`,
+/// `copyToArray$extension(Object, Object)I`,
+/// `iterator$extension(Object)Iterator`.
+fn add_array_ops_length_index_copy(st: &mut SymbolTable, aops: SymbolId, iterator: SymbolId) {
+    let a = st.get(aops).tparams[0];
+    let ta = Type::TypeParam(a);
+    method(st, aops, "lengthIs", vec![], Type::Int, Intrinsic::None);
+    method(st, aops, "sizeIs", vec![], Type::Int, Intrinsic::None);
+    method(
+        st,
+        aops,
+        "indexOf",
+        vec![ta.clone(), Type::Int],
+        Type::Int,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "copyToArray",
+        vec![Type::Array(Box::new(ta.clone()))],
+        Type::Int,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "iterator",
+        vec![],
+        Type::Class {
+            sym: iterator,
+            args: vec![ta],
+        },
+        Intrinsic::None,
+    );
+}
+
 /// StringOps.map(Char => Char): String, `:+` / `+:` against 2.13.16.
 ///
 /// JVM: `map$extension(String, Function1)String`,
@@ -2862,6 +2909,32 @@ fn add_string_ops_iterator_size_appended(st: &mut SymbolTable, so: SymbolId, ite
         so,
         "prependedAll",
         vec![Type::String],
+        Type::String,
+        Intrinsic::None,
+    );
+}
+
+/// StringOps.`++` / lengthIs / sizeIs / flatMap(Char => String) against 2.13.16.
+///
+/// JVM: `$plus$plus$extension(String, String)String`,
+/// `lengthIs$extension` / `sizeIs$extension(String)I`,
+/// `flatMap$extension(String, Function1)String`.
+fn add_string_ops_concat_length_flat(st: &mut SymbolTable, so: SymbolId) {
+    method(
+        st,
+        so,
+        "++",
+        vec![Type::String],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(st, so, "lengthIs", vec![], Type::Int, Intrinsic::None);
+    method(st, so, "sizeIs", vec![], Type::Int, Intrinsic::None);
+    method(
+        st,
+        so,
+        "flatMap",
+        vec![fn1(Type::Char, Type::String)],
         Type::String,
         Intrinsic::None,
     );
@@ -3679,6 +3752,152 @@ fn add_seq_and_lazylist(st: &mut SymbolTable) {
         sym: coll_seq,
         args: vec![],
     });
+}
+
+/// `scala.collection.View` / `SeqView` against 2.13.16.
+///
+/// JVM: `SeqOps.view:()SeqView`, `SeqView.map:(Function1)SeqView`,
+/// `View`/`SeqView.toList:()List`, `View$.fill(I, Function0)Object`,
+/// `View$.iterate(Object, I, Function1)Object`. No private View classfile.
+fn add_view(st: &mut SymbolTable) {
+    let coll = crate::classpath::ensure_package(st, "scala/collection");
+    let view = iface(st, coll, "View", "scala/collection/View");
+    let va = type_param(st, view, "A");
+    st.get_mut(view).tparams = vec![va];
+    let vta = Type::TypeParam(va);
+    let list_sym = st.list_sym;
+    let view_t = |a: Type| Type::Class {
+        sym: view,
+        args: vec![a],
+    };
+    let list_t = |a: Type| Type::Class {
+        sym: list_sym,
+        args: vec![a],
+    };
+    method(
+        st,
+        view,
+        "toList",
+        vec![],
+        list_t(vta.clone()),
+        Intrinsic::None,
+    );
+    let vmap = method(st, view, "map", vec![], Type::Unit, Intrinsic::None);
+    let vb = type_param(st, vmap, "B");
+    let vf = st.alloc("f", vmap, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(vf).ty = fn1(vta.clone(), Type::TypeParam(vb));
+    st.get_mut(vmap).tparams = vec![vb];
+    st.get_mut(vmap).params = vec![vf];
+    st.get_mut(vmap).paramss = vec![vec![vf]];
+    st.get_mut(vmap).ty = Type::Method {
+        paramss: vec![vec![fn1(vta.clone(), Type::TypeParam(vb))]],
+        ret: Box::new(view_t(Type::TypeParam(vb))),
+    };
+
+    let seq_view = iface(st, coll, "SeqView", "scala/collection/SeqView");
+    let sa = type_param(st, seq_view, "A");
+    st.get_mut(seq_view).tparams = vec![sa];
+    let sta = Type::TypeParam(sa);
+    st.get_mut(seq_view).parents = vec![
+        Type::AnyRef,
+        Type::Class {
+            sym: view,
+            args: vec![sta.clone()],
+        },
+    ];
+    method(
+        st,
+        seq_view,
+        "toList",
+        vec![],
+        list_t(sta.clone()),
+        Intrinsic::None,
+    );
+    let smap = method(st, seq_view, "map", vec![], Type::Unit, Intrinsic::None);
+    let sb = type_param(st, smap, "B");
+    let sf = st.alloc("f", smap, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(sf).ty = fn1(sta.clone(), Type::TypeParam(sb));
+    st.get_mut(smap).tparams = vec![sb];
+    st.get_mut(smap).params = vec![sf];
+    st.get_mut(smap).paramss = vec![vec![sf]];
+    st.get_mut(smap).ty = Type::Method {
+        paramss: vec![vec![fn1(sta.clone(), Type::TypeParam(sb))]],
+        ret: Box::new(Type::Class {
+            sym: seq_view,
+            args: vec![Type::TypeParam(sb)],
+        }),
+    };
+
+    if let Some(la) = st.get(st.list_sym).tparams.first().copied() {
+        method(
+            st,
+            st.list_sym,
+            "view",
+            vec![],
+            Type::Class {
+                sym: seq_view,
+                args: vec![Type::TypeParam(la)],
+            },
+            Intrinsic::None,
+        );
+    }
+
+    let view_mod = module(st, coll, "View", "scala/collection/View$");
+    let view_cls = st.module_class_of(view_mod);
+
+    let fill = method(st, view_cls, "fill", vec![], Type::Unit, Intrinsic::None);
+    let fa = type_param(st, fill, "A");
+    let n = st.alloc("n", fill, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(n).ty = Type::Int;
+    let elem = st.alloc("elem", fill, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(elem).ty = Type::ByName(Box::new(Type::TypeParam(fa)));
+    st.get_mut(fill).tparams = vec![fa];
+    st.get_mut(fill).params = vec![n, elem];
+    st.get_mut(fill).paramss = vec![vec![n], vec![elem]];
+    st.get_mut(fill).ty = Type::Method {
+        paramss: vec![
+            vec![Type::Int],
+            vec![Type::ByName(Box::new(Type::TypeParam(fa)))],
+        ],
+        ret: Box::new(view_t(Type::TypeParam(fa))),
+    };
+    st.get_mut(fill).jvm_name = "(ILscala/Function0;)Ljava/lang/Object;".into();
+
+    let iterate = method(st, view_cls, "iterate", vec![], Type::Unit, Intrinsic::None);
+    let ia = type_param(st, iterate, "A");
+    let start = st.alloc(
+        "start",
+        iterate,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM,
+        "",
+    );
+    st.get_mut(start).ty = Type::TypeParam(ia);
+    let len = st.alloc(
+        "len",
+        iterate,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM,
+        "",
+    );
+    st.get_mut(len).ty = Type::Int;
+    let f = st.alloc("f", iterate, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(f).ty = fn1(Type::TypeParam(ia), Type::TypeParam(ia));
+    st.get_mut(iterate).tparams = vec![ia];
+    st.get_mut(iterate).params = vec![start, len, f];
+    st.get_mut(iterate).paramss = vec![vec![start, len], vec![f]];
+    st.get_mut(iterate).ty = Type::Method {
+        paramss: vec![
+            vec![Type::TypeParam(ia), Type::Int],
+            vec![fn1(Type::TypeParam(ia), Type::TypeParam(ia))],
+        ],
+        ret: Box::new(view_t(Type::TypeParam(ia))),
+    };
+    st.get_mut(iterate).jvm_name =
+        "(Ljava/lang/Object;ILscala/Function1;)Ljava/lang/Object;".into();
+
+    let mems = st.get(view_cls).members.clone();
+    st.get_mut(view_mod).members.extend(mems);
 }
 
 fn add_indexedseq_and_queue(st: &mut SymbolTable) {

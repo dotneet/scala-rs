@@ -1069,6 +1069,21 @@ fn fixtures_using3_bad_is_error() {
 }
 
 #[test]
+fn fixtures_array_ops20_bad_is_error() {
+    compile_fails_lib("array_ops20_bad", "noSuchLengthIs is not a member");
+}
+
+#[test]
+fn fixtures_string_ops24_bad_is_error() {
+    compile_fails_lib("string_ops24_bad", "noSuchFlatMap is not a member");
+}
+
+#[test]
+fn fixtures_view_bad_is_error() {
+    compile_fails_lib("view_bad", "noSuchFill is not a member");
+}
+
+#[test]
 fn fixtures_capture_var_bad_is_error() {
     compile_fails_lib("capture_var_bad", "not assignable");
 }
@@ -2002,6 +2017,21 @@ fn scala_library_dual_run_using3() {
 }
 
 #[test]
+fn scala_library_dual_run_array_ops20() {
+    dual_run_fixture("array_ops20");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops24() {
+    dual_run_fixture("string_ops24");
+}
+
+#[test]
+fn scala_library_dual_run_view() {
+    dual_run_fixture("view");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -2330,6 +2360,9 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/util/ChainingOps.class",
     "scala/util/ChainingOps$.class",
     "scala/util/package$chaining$.class",
+    "scala/collection/View.class",
+    "scala/collection/View$.class",
+    "scala/collection/SeqView.class",
     "scala/util/Using.class",
     "scala/util/Using$.class",
     "scala/util/Using$Manager.class",

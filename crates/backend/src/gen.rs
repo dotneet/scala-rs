@@ -5192,6 +5192,38 @@ fn invoke_value_extension(
             );
             return;
         }
+        if s.name == "lengthIs" || s.name == "sizeIs" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                &format!("{}$extension", s.name),
+                "(Ljava/lang/Object;)I",
+            );
+            return;
+        }
+        if s.name == "indexOf" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "indexOf$extension",
+                "(Ljava/lang/Object;Ljava/lang/Object;I)I",
+            );
+            return;
+        }
+        if s.name == "copyToArray" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "copyToArray$extension",
+                "(Ljava/lang/Object;Ljava/lang/Object;)I",
+            );
+            return;
+        }
+        if s.name == "iterator" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "iterator$extension",
+                "(Ljava/lang/Object;)Lscala/collection/Iterator;",
+            );
+            return;
+        }
         asm.invokestatic(
             "scala/collection/ArrayOps",
             &format!("{}$extension", s.name),
@@ -5439,6 +5471,14 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 }
                 _ => {}
             }
+        }
+        if name == "view" && is_stdlib_list(&owner) {
+            asm.invokeinterface(
+                "scala/collection/SeqOps",
+                "view",
+                "()Lscala/collection/SeqView;",
+            );
+            return;
         }
         if name == "withFilter" && is_stdlib_list(&owner) {
             asm.invokeinterface(
