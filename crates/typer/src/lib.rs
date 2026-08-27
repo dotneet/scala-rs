@@ -506,6 +506,138 @@ object Main {
     }
 
     #[test]
+    fn java_wildcard_and_tparam_bounds_typecheck() {
+        ok(r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val c: Class[_] = java.lang.Class.forName("java.lang.String")
+    val n: String = c.getName
+    val xs = new java.util.ArrayList[java.lang.Byte]()
+    val added: Boolean = xs.add(java.lang.Byte.valueOf("1"))
+    val ys: java.util.Collection[_ <: java.lang.Number] = java.util.Collections.unmodifiableList(xs)
+    val sz: Int = ys.size()
+    val m: java.lang.Byte = java.util.Collections.max(xs)
+    val i: Int = m.intValue()
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn java_checked_exception_does_not_need_catch() {
+        ok(r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    java.lang.Thread.sleep(0L)
+  }
+}
+"#);
+    }
+
+    fn javac_available() -> bool {
+        std::process::Command::new("javac")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success() || !o.stderr.is_empty() || !o.stdout.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn compile_jprot_base() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "scala-rs-jprot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("Base.java");
+        std::fs::write(
+            &src,
+            "package jprot;\npublic class Base {\n  protected int secret() { return 7; }\n  protected static int secretStatic() { return 11; }\n}\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new("javac")
+            .args(["-d", dir.to_str().unwrap(), src.to_str().unwrap()])
+            .status()
+            .expect("javac");
+        assert!(status.success(), "javac jprot.Base failed");
+        dir
+    }
+
+    #[test]
+    fn java_protected_same_package_and_subclass() {
+        if !javac_available() {
+            return;
+        }
+        let cp = compile_jprot_base();
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+package jprot
+class Peer {
+  def fromPeer(b: Base): Int = b.secret()
+}
+class Sub extends Base {
+  def mine: Int = this.secret()
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val a: Int = new Peer().fromPeer(new Base())
+    val b: Int = new Sub().mine
+    val c: Int = Base.secretStatic()
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: false,
+                classpath: Vec::new(),
+                binary_path: vec![cp.clone()],
+                language_features: Vec::new(),
+            },
+        );
+        let _ = std::fs::remove_dir_all(&cp);
+        assert!(
+            !has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn java_protected_illegal_access_diagnosed() {
+        if !javac_available() {
+            return;
+        }
+        let cp = compile_jprot_base();
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+package other
+class Unrelated {
+  def bad(b: jprot.Base): Int = b.secret()
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: false,
+                classpath: Vec::new(),
+                binary_path: vec![cp.clone()],
+                language_features: Vec::new(),
+            },
+        );
+        let _ = std::fs::remove_dir_all(&cp);
+        assert!(
+            has_errors(&diags)
+                && diags
+                    .iter()
+                    .any(|d| d.message.contains("cannot be accessed")),
+            "expected illegal protected access, got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn unsupported_java_classfile_diagnosed() {
         let dir = std::env::temp_dir().join(format!(
             "scala-rs-badclass-{}-{}",

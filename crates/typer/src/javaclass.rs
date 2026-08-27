@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
 const ACC_PUBLIC: u16 = 0x0001;
+const ACC_PROTECTED: u16 = 0x0004;
 const ACC_STATIC: u16 = 0x0008;
 const ACC_VARARGS: u16 = 0x0080;
 const ACC_INTERFACE: u16 = 0x0200;
@@ -297,7 +298,7 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         let _ = attrs;
         let name = cp.utf8(name_i).ok_or("unsupported classfile field name")?;
         let desc = cp.utf8(desc_i).ok_or("unsupported classfile field desc")?;
-        if acc & ACC_PUBLIC != 0 && acc & ACC_SYNTHETIC == 0 {
+        if acc & ACC_SYNTHETIC == 0 && java_member_visible(acc) {
             fields.push(JavaField {
                 name,
                 desc,
@@ -317,7 +318,10 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         if name == "<clinit>" {
             continue;
         }
-        if acc & ACC_PUBLIC == 0 || acc & ACC_SYNTHETIC != 0 || acc & ACC_BRIDGE != 0 {
+        if acc & ACC_SYNTHETIC != 0 || acc & ACC_BRIDGE != 0 {
+            continue;
+        }
+        if !java_member_visible(acc) {
             continue;
         }
         methods.push(JavaMethod {
@@ -356,6 +360,14 @@ pub fn is_java_abstract(access: u16) -> bool {
 
 pub fn is_java_varargs(access: u16) -> bool {
     access & ACC_VARARGS != 0
+}
+
+pub fn is_java_protected(access: u16) -> bool {
+    access & ACC_PROTECTED != 0
+}
+
+fn java_member_visible(access: u16) -> bool {
+    access & ACC_PUBLIC != 0 || access & ACC_PROTECTED != 0
 }
 
 struct Cp {
@@ -613,6 +625,57 @@ mod tests {
             fmt.access
         );
         assert!(is_java_static(fmt.access));
+    }
+
+    #[test]
+    fn parses_jdk_class_forname_wildcard_if_present() {
+        let mut idx = BinaryIndex::from_user_paths(Vec::new());
+        let Some(bytes) = idx.find_class("java/lang/Class").unwrap() else {
+            panic!("JDK java.lang.Class.class must be readable from jmods/rt");
+        };
+        let c = parse_java_classfile(&bytes).expect("parse Class");
+        let fnm = c
+            .methods
+            .iter()
+            .find(|m| m.name == "forName" && m.desc == "(Ljava/lang/String;)Ljava/lang/Class;")
+            .expect("Class.forName(String)");
+        assert_eq!(
+            fnm.signature.as_deref(),
+            Some("(Ljava/lang/String;)Ljava/lang/Class<*>;")
+        );
+    }
+
+    #[test]
+    fn parses_jdk_collections_max_bounds_if_present() {
+        let mut idx = BinaryIndex::from_user_paths(Vec::new());
+        let Some(bytes) = idx.find_class("java/util/Collections").unwrap() else {
+            panic!("JDK java.util.Collections.class must be readable from jmods/rt");
+        };
+        let c = parse_java_classfile(&bytes).expect("parse Collections");
+        let max = c
+            .methods
+            .iter()
+            .find(|m| m.name == "max" && m.desc == "(Ljava/util/Collection;)Ljava/lang/Object;")
+            .expect("Collections.max(Collection)");
+        assert_eq!(
+            max.signature.as_deref(),
+            Some("<T:Ljava/lang/Object;:Ljava/lang/Comparable<-TT;>;>(Ljava/util/Collection<+TT;>;)TT;")
+        );
+    }
+
+    #[test]
+    fn parses_jdk_thread_sleep_if_present() {
+        let mut idx = BinaryIndex::from_user_paths(Vec::new());
+        let Some(bytes) = idx.find_class("java/lang/Thread").unwrap() else {
+            panic!("JDK java.lang.Thread.class must be readable from jmods/rt");
+        };
+        let c = parse_java_classfile(&bytes).expect("parse Thread");
+        assert!(
+            c.methods
+                .iter()
+                .any(|m| m.name == "sleep" && m.desc == "(J)V" && is_java_static(m.access)),
+            "Thread.sleep(long) missing"
+        );
     }
 
     #[test]

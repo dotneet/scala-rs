@@ -739,6 +739,119 @@ fn fixtures_java_sig() {
 }
 
 #[test]
+fn fixtures_java_wild() {
+    check("java_wild");
+}
+
+#[test]
+fn fixtures_java_throws() {
+    check("java_throws");
+}
+
+fn javac_available() -> bool {
+    Command::new("javac")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success() || !o.stderr.is_empty() || !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+fn compile_jprot_base() -> PathBuf {
+    let src = fixtures_dir().join("java/jprot/Base.java");
+    let out = tmp_dir("jprot-java");
+    let status = Command::new("javac")
+        .args(["-d", out.to_str().unwrap(), src.to_str().unwrap()])
+        .status()
+        .expect("javac");
+    assert!(status.success(), "javac jprot.Base failed");
+    assert!(
+        out.join("jprot/Base.class").is_file(),
+        "jprot/Base.class missing"
+    );
+    out
+}
+
+#[test]
+fn fixtures_java_prot() {
+    if !javac_available() {
+        return;
+    }
+    let java_cp = compile_jprot_base();
+    let src = fixtures_dir().join("java_prot.scala");
+    let out = tmp_dir("java_prot");
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "-cp",
+            java_cp.to_str().unwrap(),
+            "--no-scala-library",
+        ])
+        .status()
+        .expect("compile java_prot");
+    assert!(status.success(), "compile java_prot failed");
+    assert!(
+        out.join("jprot/Main.class").is_file(),
+        "jprot/Main.class missing"
+    );
+    if java_available() {
+        let cp = format!("{}:{}", out.display(), java_cp.display());
+        let output = Command::new("java")
+            .args(["-cp", &cp, "jprot.Main"])
+            .output()
+            .expect("java jprot.Main");
+        assert!(
+            output.status.success(),
+            "java jprot.Main failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let got = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert_eq!(got, expected_stdout("java_prot"));
+    }
+    let _ = fs::remove_dir_all(&out);
+    let _ = fs::remove_dir_all(&java_cp);
+}
+
+#[test]
+fn fixtures_java_prot_bad_is_error() {
+    if !javac_available() {
+        return;
+    }
+    let java_cp = compile_jprot_base();
+    let src = fixtures_dir().join("java_prot_bad.scala");
+    let out = tmp_dir("java_prot_bad");
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "-cp",
+            java_cp.to_str().unwrap(),
+            "--no-scala-library",
+        ])
+        .output()
+        .expect("compile java_prot_bad");
+    assert!(
+        !output.status.success(),
+        "expected compile of java_prot_bad to fail"
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        err.contains("cannot be accessed"),
+        "expected cannot be accessed in diagnostics, got {err:?}"
+    );
+    let _ = fs::remove_dir_all(&out);
+    let _ = fs::remove_dir_all(&java_cp);
+}
+
+#[test]
 fn fixtures_native() {
     check("native");
 }

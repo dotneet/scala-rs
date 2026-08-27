@@ -126,6 +126,25 @@ fn install_tparams(st: &mut SymbolTable, owner: SymbolId, names: &[String]) {
     st.get_mut(owner).tparams = ids;
 }
 
+fn install_java_tparams(st: &mut SymbolTable, owner: SymbolId, params: &[crate::javasign::JParam]) {
+    if params.is_empty() || !st.get(owner).tparams.is_empty() {
+        return;
+    }
+    let names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+    install_tparams(st, owner, &names);
+    let env = tparam_env(st, owner);
+    let ids = st.get(owner).tparams.clone();
+    for (p, id) in params.iter().zip(ids) {
+        let bounds: Vec<Type> = p
+            .bounds
+            .iter()
+            .map(|b| jtype_to_type(st, b, &env))
+            .filter(|t| !matches!(t, Type::Any | Type::AnyRef))
+            .collect();
+        st.get_mut(id).parents = bounds;
+    }
+}
+
 fn add_term(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) -> SymbolId {
     let id = st.alloc(name, owner, SymKind::Term, Flags::EMPTY, "");
     st.get_mut(id).ty = ty;
@@ -583,7 +602,7 @@ fn apply_java_class_meta(st: &mut SymbolTable, id: SymbolId, c: &crate::javaclas
     if st.get(id).tparams.is_empty() {
         if let Some(sig) = &c.signature {
             if let Some(cs) = crate::javasign::parse_class_sig(sig) {
-                install_tparams(st, id, &cs.tparams);
+                install_java_tparams(st, id, &cs.tparams);
             }
         }
     }
@@ -660,6 +679,9 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         if has_method_desc(st, owner, &m.name, &m.desc) {
             continue;
         }
+        if has_prelude_method(st, owner, &m.name, desc_param_count(&m.desc)) {
+            continue;
+        }
         let mut env = tparam_env(st, owner);
         let parsed = m
             .signature
@@ -667,11 +689,20 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
             .and_then(crate::javasign::parse_method_sig);
         let (params, ret, mtparams) = if let Some(ms) = parsed {
             let mut tp_ids = Vec::new();
-            for n in &ms.tparams {
-                let tid = st.alloc(n, owner, SymKind::TypeParam, Flags::EMPTY, "");
+            for p in &ms.tparams {
+                let tid = st.alloc(&p.name, owner, SymKind::TypeParam, Flags::EMPTY, "");
                 st.get_mut(tid).ty = Type::TypeParam(tid);
-                env.insert(n.clone(), tid);
+                env.insert(p.name.clone(), tid);
                 tp_ids.push(tid);
+            }
+            for (p, tid) in ms.tparams.iter().zip(&tp_ids) {
+                let bounds: Vec<Type> = p
+                    .bounds
+                    .iter()
+                    .map(|b| jtype_to_type(st, b, &env))
+                    .filter(|t| !matches!(t, Type::Any | Type::AnyRef))
+                    .collect();
+                st.get_mut(*tid).parents = bounds;
             }
             let params: Vec<Type> = ms
                 .params
@@ -703,6 +734,9 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         if crate::javaclass::is_java_varargs(m.access) {
             flags = flags.with(Flags::VARARGS);
         }
+        if crate::javaclass::is_java_protected(m.access) {
+            flags = flags.with(Flags::PROTECTED);
+        }
         if m.name == "<init>" {
             flags = flags.with(Flags::CONSTRUCTOR);
         }
@@ -729,6 +763,9 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         if crate::javaclass::is_java_static(f.access) {
             flags = flags.with(Flags::STATIC);
         }
+        if crate::javaclass::is_java_protected(f.access) {
+            flags = flags.with(Flags::PROTECTED);
+        }
         let id = add_term(st, owner, &f.name, ty);
         st.get_mut(id).flags = flags;
         st.get_mut(id).jvm_name = f.desc.clone();
@@ -750,6 +787,14 @@ fn jtype_to_type(
         JType::Float => Type::Float,
         JType::Double => Type::Double,
         JType::Star => Type::Wildcard,
+        JType::Extends(t) => Type::BoundedWildcard {
+            lo: None,
+            hi: Some(Box::new(jtype_to_type(st, t, env))),
+        },
+        JType::Super(t) => Type::BoundedWildcard {
+            lo: Some(Box::new(jtype_to_type(st, t, env))),
+            hi: None,
+        },
         JType::Var(n) => env
             .get(n)
             .copied()
@@ -835,4 +880,52 @@ fn has_method_desc(st: &SymbolTable, owner: SymbolId, name: &str, desc: &str) ->
     st.lookup_member(owner, name)
         .iter()
         .any(|&id| st.get(id).kind == SymKind::Method && st.get(id).jvm_name == desc)
+}
+
+fn has_prelude_method(st: &SymbolTable, owner: SymbolId, name: &str, arity: usize) -> bool {
+    st.lookup_member(owner, name).iter().any(|&id| {
+        let s = st.get(id);
+        s.kind == SymKind::Method
+            && s.jvm_name.is_empty()
+            && s.paramss.iter().flatten().count() == arity
+    })
+}
+
+fn desc_param_count(desc: &str) -> usize {
+    let rest = desc.strip_prefix('(').unwrap_or(desc);
+    let params = rest.split_once(')').map(|(p, _)| p).unwrap_or("");
+    let b = params.as_bytes();
+    let mut n = 0;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' => {
+                n += 1;
+                i += 1;
+            }
+            b'[' => {
+                while i < b.len() && b[i] == b'[' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+                n += 1;
+            }
+            b'L' => {
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+                n += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    n
 }

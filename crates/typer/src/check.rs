@@ -2031,6 +2031,7 @@ impl Typer {
                     }
                 } else if let TreeKind::Ident { name } = &tpt.kind {
                     let n = name.clone();
+                    self.expose_unqualified(&n, tpt.span);
                     let found = self.st.lookup(&n);
                     if let Some(id) = found
                         .into_iter()
@@ -2251,16 +2252,36 @@ impl Typer {
         }
     }
 
+    /// Load a same-package (or default-package) Java class for an unqualified name.
+    fn expose_unqualified(&mut self, name: &str, span: Span) {
+        if name.is_empty() || !self.st.lookup(name).is_empty() {
+            return;
+        }
+        let from = if !self.st.this_class.is_none() {
+            self.st.this_class
+        } else {
+            self.st.owner
+        };
+        let pkg = self.enclosing_package(from);
+        self.complete_binary_member(pkg, name, span);
+        for id in self.st.lookup_member(pkg, name) {
+            self.st.enter_in_current(name, id);
+        }
+        if self.st.lookup(name).is_empty() && pkg != self.st.root {
+            self.complete_binary_member(self.st.root, name, span);
+            for id in self.st.lookup_member(self.st.root, name) {
+                self.st.enter_in_current(name, id);
+            }
+        }
+    }
+
     fn type_ident(&mut self, tree: &mut Tree, name: String, pt: &Type) {
         if name == "_" {
             tree.kind = TreeKind::Wildcard;
             tree.ty = Type::Error;
             return;
         }
-        let found = self.st.lookup(&name);
-        if found.is_empty() {
-            self.complete_binary_member(self.st.root, &name, tree.span);
-        }
+        self.expose_unqualified(&name, tree.span);
         let mut found = self.st.lookup(&name);
         if found.is_empty() {
             found = self.st.lookup_member(self.st.root, &name);
@@ -2643,6 +2664,10 @@ impl Typer {
             return self.nested_in(current, owner);
         }
         if flags.contains(Flags::PROTECTED) {
+            // Java `protected` is also package-private (JLS / nsc Java interop).
+            if flags.contains(Flags::JAVA) && self.java_same_package(current, owner) {
+                return true;
+            }
             let by_qual = s
                 .private_within
                 .as_ref()
@@ -2729,6 +2754,22 @@ impl Typer {
             Some(t) if matches!(t.kind, TreeKind::This { .. } | TreeKind::Super { .. }) => true,
             Some(t) => self.st.is_sub_type(&t.ty, &cur_ty),
         }
+    }
+
+    fn java_same_package(&self, current: SymbolId, member_owner: SymbolId) -> bool {
+        let a = self.enclosing_package(current);
+        let b = self.enclosing_package(member_owner);
+        !a.is_none() && a == b
+    }
+
+    fn enclosing_package(&self, mut id: SymbolId) -> SymbolId {
+        while !id.is_none() {
+            if self.st.get(id).kind == SymKind::Package {
+                return id;
+            }
+            id = self.st.get(id).owner;
+        }
+        self.st.root
     }
 
     /// When a member exists on the receiver (e.g. `Int.+`) but the argument
@@ -5154,7 +5195,10 @@ impl Typer {
         match &tpt.kind {
             TreeKind::Empty => Type::NoType,
             TreeKind::Ident { name } if name == "_" => Type::Wildcard,
-            TreeKind::Ident { name } => self.resolve_type_name(name, &[]),
+            TreeKind::Ident { name } => {
+                self.expose_unqualified(name, tpt.span);
+                self.resolve_type_name(name, &[])
+            }
             TreeKind::Select { name, qual } => {
                 if name == "String" && !self.type_select_is_term_prefix(qual) {
                     Type::String
@@ -5969,6 +6013,32 @@ impl Typer {
         }
     }
 
+    fn complete_java_type(&mut self, ty: &Type, span: Span) {
+        match ty {
+            Type::Class { sym, args } => {
+                self.ensure_java_loaded(*sym, span);
+                for a in args {
+                    self.complete_java_type(a, span);
+                }
+            }
+            Type::BoundedWildcard { lo, hi } => {
+                if let Some(t) = lo {
+                    self.complete_java_type(t, span);
+                }
+                if let Some(t) = hi {
+                    self.complete_java_type(t, span);
+                }
+            }
+            Type::Array(t)
+            | Type::Repeated(t)
+            | Type::ByName(t)
+            | Type::Annotated { tpe: t, .. } => {
+                self.complete_java_type(t, span);
+            }
+            _ => {}
+        }
+    }
+
     fn ensure_java_loaded(&mut self, class_id: SymbolId, span: Span) {
         if class_id.is_none() {
             return;
@@ -5990,6 +6060,12 @@ impl Typer {
             Ok(Some(bytes)) => match crate::javaclass::parse_java_classfile(&bytes) {
                 Ok(jc) => {
                     crate::classpath::install_java_class(&mut self.st, &jc);
+                    let parents = self.st.get(class_id).parents.clone();
+                    for p in &parents {
+                        if let Some(s) = self.st.class_sym_of(p) {
+                            self.ensure_java_loaded(s, span);
+                        }
+                    }
                 }
                 Err(e) => {
                     self.error(
@@ -6077,6 +6153,8 @@ impl Typer {
         if pt.is_no_type() || tree.ty.is_error() || pt.is_error() {
             return;
         }
+        self.complete_java_type(&tree.ty, tree.span);
+        self.complete_java_type(pt, tree.span);
         if self.st.is_sub_type(&tree.ty, pt) {
             return;
         }
@@ -7015,12 +7093,28 @@ fn tree_contains_this(tree: &Tree) -> bool {
 /// are type parameters. Not used for implicit search (`is_sub_type`).
 fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
     match (arg, param) {
+        (_, Type::TypeParam(_)) | (_, Type::Wildcard) => true,
+        (a, Type::BoundedWildcard { hi: Some(h), .. }) => class_ctor_matches_typeparam_args(a, h),
+        (
+            a,
+            Type::BoundedWildcard {
+                lo: Some(l),
+                hi: None,
+            },
+        ) => class_ctor_matches_typeparam_args(a, l),
         (Type::Class { sym: sa, args: aa }, Type::Class { sym: sp, args: pa })
             if sa == sp && aa.len() == pa.len() =>
         {
             aa.iter().zip(pa.iter()).all(|(a, p)| {
                 matches!(p, Type::TypeParam(_)) || a == p || class_ctor_matches_typeparam_args(a, p)
             })
+        }
+        (Type::Class { args: aa, .. }, Type::Class { args: pa, .. })
+            if aa.len() == pa.len() && pa.iter().any(contains_inferrable_targ) =>
+        {
+            aa.iter()
+                .zip(pa.iter())
+                .all(|(a, p)| class_ctor_matches_typeparam_args(a, p))
         }
         (Type::Tuple(aa), Type::Class { args: pa, .. }) if aa.len() == pa.len() => {
             aa.iter().zip(pa.iter()).all(|(a, p)| {
@@ -7032,7 +7126,21 @@ fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
                 matches!(p, Type::TypeParam(_)) || a == p || class_ctor_matches_typeparam_args(a, p)
             })
         }
-        (_, Type::TypeParam(_)) => true,
+        _ => false,
+    }
+}
+
+fn contains_inferrable_targ(ty: &Type) -> bool {
+    match ty {
+        Type::TypeParam(_) | Type::Wildcard => true,
+        Type::BoundedWildcard { lo, hi } => {
+            lo.as_ref().is_some_and(|t| contains_inferrable_targ(t))
+                || hi.as_ref().is_some_and(|t| contains_inferrable_targ(t))
+        }
+        Type::Class { args, .. } => args.iter().any(contains_inferrable_targ),
+        Type::Array(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            contains_inferrable_targ(t)
+        }
         _ => false,
     }
 }
@@ -7359,6 +7467,10 @@ fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
     match pattern {
         Type::Annotated { tpe, .. } => unify_one(tp, tpe, actual),
         Type::TypeParam(id) if *id == tp => Some(actual.widen_constant()),
+        Type::BoundedWildcard { hi: Some(h), .. } | Type::BoundedWildcard { lo: Some(h), .. } => {
+            unify_one(tp, h, actual)
+        }
+        Type::Wildcard => None,
         Type::Class { args: pas, .. } => {
             if let Type::Class { args: aas, .. } = actual {
                 for (p, a) in pas.iter().zip(aas) {
