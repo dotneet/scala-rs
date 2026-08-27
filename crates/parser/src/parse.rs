@@ -1766,8 +1766,15 @@ impl<'a> Parser<'a> {
             }
             _ => self.parse_path(),
         };
+        // nsc SimpleType: dots belong to StableId *before* TypeArgs. After
+        // `C[T]`, `.enqueue` is term selection (`new C[T].enqueue`), not a
+        // type path. Type projection after args is `#`, not `.`.
+        let mut seen_type_args = false;
         loop {
             if matches!(self.kind(), TokenKind::Dot) {
+                if seen_type_args {
+                    break;
+                }
                 self.bump();
                 self.skip_nl();
                 if matches!(self.kind(), TokenKind::TypeKw) {
@@ -1812,6 +1819,7 @@ impl<'a> Parser<'a> {
                         args,
                     },
                 );
+                seen_type_args = true;
                 continue;
             }
             break;

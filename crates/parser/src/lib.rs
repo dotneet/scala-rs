@@ -327,6 +327,31 @@ object Main {
     }
 
     #[test]
+    fn new_type_args_then_select_is_term() {
+        // nsc: `new Q[Int].enqueue(1)` is `(new Q[Int]).enqueue(1)`, not a
+        // type projection `Q[Int].enqueue`.
+        let t = parse_ok(
+            r#"
+class Q[+A] { def enqueue(x: A): Int = 1 }
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n = new Q[Int].enqueue(1)
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(
+            dump.contains("Select enqueue") && dump.contains("AppliedType"),
+            "expected term Select on new Q[Int], got {dump}"
+        );
+        assert!(
+            !dump.contains("SelectFromType .enqueue"),
+            "`.enqueue` after type args must not be a type path: {dump}"
+        );
+    }
+
+    #[test]
     fn singleton_compound_and_annotated_types_parse() {
         let t = parse_ok(
             r#"

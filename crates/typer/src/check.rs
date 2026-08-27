@@ -2058,8 +2058,11 @@ impl Typer {
                             sym: pt_sym,
                         } = pt
                         {
-                            if *sym == *pt_sym && !pt_args.is_empty() {
-                                tree.ty = pt.clone();
+                            if *sym == *pt_sym {
+                                let tps = self.st.get(*sym).tparams.clone();
+                                if type_args_are_instantiated(pt_args, &tps) {
+                                    tree.ty = pt.clone();
+                                }
                             }
                         }
                     }
@@ -3178,20 +3181,19 @@ impl Typer {
             // Keep explicit `new C[T](…)` args; otherwise infer. Do not adapt
             // constructor arguments to raw type parameters (`A`) first.
             let explicit: Vec<Type> = match &fun.ty {
-                Type::Class { args, .. }
-                    if !args.is_empty() && (tps.is_empty() || args.len() == tps.len()) =>
-                {
-                    args.clone()
-                }
+                Type::Class { args, .. } if type_args_are_instantiated(args, &tps) => args.clone(),
                 _ => Vec::new(),
             };
             let infer = !tps.is_empty() && explicit.is_empty();
             for (i, a) in args.iter_mut().enumerate() {
-                let p = if infer {
-                    Type::NoType
-                } else {
-                    ctor_params.get(i).cloned().unwrap_or(Type::NoType)
-                };
+                let mut p = ctor_params.get(i).cloned().unwrap_or(Type::NoType);
+                if infer {
+                    p = Type::NoType;
+                } else if !explicit.is_empty() {
+                    if let Some(c) = class_id {
+                        p = self.st.subst_tparams(c, &explicit, &p);
+                    }
+                }
                 self.type_expr(a, &p);
             }
             let mut inferred_args: Vec<Type> = Vec::new();
@@ -6804,6 +6806,22 @@ fn unify_tparam(tp: SymbolId, params: &[Type], args: &[Type]) -> Option<Type> {
         }
     }
     None
+}
+
+/// True when `args` instantiate `tps` rather than still mentioning them
+/// (`Inv[A @uncheckedVariance]` is not an instantiation of `Inv`).
+fn type_args_are_instantiated(args: &[Type], tps: &[SymbolId]) -> bool {
+    !args.is_empty()
+        && (tps.is_empty() || args.len() == tps.len())
+        && args.iter().all(|a| !still_raw_tparam(a, tps))
+}
+
+fn still_raw_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
+    match ty {
+        Type::TypeParam(id) => tps.contains(id),
+        Type::Annotated { tpe, .. } => still_raw_tparam(tpe, tps),
+        _ => false,
+    }
 }
 
 fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
