@@ -4778,6 +4778,42 @@ fn invoke_value_extension(
             );
             return;
         }
+        if s.name == "drop" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "drop$extension",
+                "(Ljava/lang/Object;I)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
+        if s.name == "dropWhile" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "dropWhile$extension",
+                "(Ljava/lang/Object;Lscala/Function1;)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
+        if s.name == "exists" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "exists$extension",
+                "(Ljava/lang/Object;Lscala/Function1;)Z",
+            );
+            return;
+        }
         asm.invokestatic(
             "scala/collection/ArrayOps",
             &format!("{}$extension", s.name),
@@ -5603,8 +5639,37 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                     asm.athrow();
                     return;
                 }
+                "tryBreakable" => {
+                    asm.invokevirtual(
+                        &owner,
+                        "tryBreakable",
+                        "(Lscala/Function0;)Lscala/util/control/Breaks$TryBlock;",
+                    );
+                    return;
+                }
                 _ => {}
             }
+        }
+        if owner == "scala/util/control/Breaks$TryBlock" && name == "catchBreak" {
+            asm.invokeinterface(
+                "scala/util/control/Breaks$TryBlock",
+                "catchBreak",
+                "(Lscala/Function0;)Ljava/lang/Object;",
+            );
+            if let Some(ty) = result_ty {
+                if is_unit_like(ty) {
+                    // JVM returns boxed Unit; a statement must pop it.
+                    asm.pop();
+                } else {
+                    maybe_unbox_erased_result(
+                        asm,
+                        ctx,
+                        "(Lscala/Function0;)Ljava/lang/Object;",
+                        result_ty,
+                    );
+                }
+            }
+            return;
         }
         if is_stdlib_try_module(&owner) && name == "apply" {
             match owner.as_str() {
@@ -7727,7 +7792,10 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             method_sym: SymbolId::NONE,
         };
         gen_expr(a, &mut fr, &inner_ctx, &body);
-        if let Some(raw_ret) = &sam_ret {
+        if matches!(body.ty, Type::Nothing) {
+            // `throw` already emits athrow. A following areturn would be an
+            // empty-stack stackmap target (`tryBreakable { throw e }`).
+        } else if let Some(raw_ret) = &sam_ret {
             if is_unit_like(raw_ret) {
                 pop_if_value(a, &body.ty);
                 a.vreturn();

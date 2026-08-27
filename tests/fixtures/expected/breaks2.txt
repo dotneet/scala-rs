@@ -1,0 +1,13 @@
+0
+1
+2
+caught
+after-break
+0
+1
+2
+after-full
+1
+2
+new-caught
+java.lang.RuntimeException: boom

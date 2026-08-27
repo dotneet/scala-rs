@@ -1895,7 +1895,42 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
         opt_char.clone(),
         Intrinsic::None,
     );
-    method(st, so, "lastOption", vec![], opt_char, Intrinsic::None);
+    method(
+        st,
+        so,
+        "lastOption",
+        vec![],
+        opt_char.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "find",
+        vec![fn1(Type::Char, Type::Boolean)],
+        opt_char,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "foreach",
+        vec![fn1(Type::Char, Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    method(st, so, "toBoolean", vec![], Type::Boolean, Intrinsic::None);
+    method(
+        st,
+        so,
+        "toBooleanOption",
+        vec![],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![Type::Boolean],
+        },
+        Intrinsic::None,
+    );
     so
 }
 
@@ -1944,6 +1979,30 @@ fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         "take",
         vec![Type::Int],
         Type::Array(Box::new(ta.clone())),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "drop",
+        vec![Type::Int],
+        Type::Array(Box::new(ta.clone())),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "dropWhile",
+        vec![fn1(ta.clone(), Type::Boolean)],
+        Type::Array(Box::new(ta.clone())),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "exists",
+        vec![fn1(ta.clone(), Type::Boolean)],
+        Type::Boolean,
         Intrinsic::None,
     );
     method(
@@ -3995,7 +4054,19 @@ fn add_breaks(st: &mut SymbolTable) {
         sym: breaks,
         args: vec![],
     };
-    add_breaks_members(st, breaks);
+    let try_block = iface(st, breaks, "TryBlock", "scala/util/control/Breaks$TryBlock");
+    let tt = type_param(st, try_block, "T");
+    st.get_mut(try_block).tparams = vec![tt];
+    let cb = method(
+        st,
+        try_block,
+        "catchBreak",
+        vec![Type::ByName(Box::new(Type::TypeParam(tt)))],
+        Type::TypeParam(tt),
+        Intrinsic::None,
+    );
+    st.get_mut(cb).jvm_name = "(Lscala/Function0;)Ljava/lang/Object;".into();
+    add_breaks_members(st, breaks, try_block);
     method(
         st,
         breaks,
@@ -4018,12 +4089,12 @@ fn add_breaks(st: &mut SymbolTable) {
         },
     );
     let mcls = st.module_class_of(breaks_mod);
-    add_breaks_members(st, mcls);
+    add_breaks_members(st, mcls, try_block);
     let mems = st.get(mcls).members.clone();
     st.get_mut(breaks_mod).members.extend(mems);
 }
 
-fn add_breaks_members(st: &mut SymbolTable, owner: SymbolId) {
+fn add_breaks_members(st: &mut SymbolTable, owner: SymbolId, try_block: SymbolId) {
     method(
         st,
         owner,
@@ -4034,6 +4105,29 @@ fn add_breaks_members(st: &mut SymbolTable, owner: SymbolId) {
     );
     let br = method(st, owner, "break", vec![], Type::Nothing, Intrinsic::None);
     st.get_mut(br).jvm_name = "()Lscala/runtime/Nothing$;".into();
+    // nsc 2.13.16: `def tryBreakable[T](op: => T): Breaks.TryBlock[T]`
+    let tb = method(
+        st,
+        owner,
+        "tryBreakable",
+        vec![],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let t = type_param(st, tb, "T");
+    let op = st.alloc("op", tb, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(op).ty = Type::ByName(Box::new(Type::TypeParam(t)));
+    st.get_mut(tb).tparams = vec![t];
+    st.get_mut(tb).params = vec![op];
+    st.get_mut(tb).paramss = vec![vec![op]];
+    st.get_mut(tb).ty = Type::Method {
+        paramss: vec![vec![Type::ByName(Box::new(Type::TypeParam(t)))]],
+        ret: Box::new(Type::Class {
+            sym: try_block,
+            args: vec![Type::TypeParam(t)],
+        }),
+    };
+    st.get_mut(tb).jvm_name = "(Lscala/Function0;)Lscala/util/control/Breaks$TryBlock;".into();
 }
 
 fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
