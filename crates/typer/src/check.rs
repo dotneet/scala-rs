@@ -367,11 +367,14 @@ impl Typer {
         let tp_ids = self.enter_tparams(tparams, id);
         self.st.get_mut(id).tparams = tp_ids;
         for tp in tparams.iter() {
-            if let TreeKind::TypeDef { ctx_bounds, .. } = &tp.kind {
-                if !ctx_bounds.is_empty() {
+            if let TreeKind::TypeDef {
+                ctx_bounds, views, ..
+            } = &tp.kind
+            {
+                if is_trait && (!ctx_bounds.is_empty() || !views.is_empty()) {
                     self.error(
                         tp.span,
-                        "unimplemented syntax: context bounds on class/trait type parameters",
+                        "traits cannot have type parameters with context bounds ': ...' nor view bounds '<% ...'",
                     );
                 }
             }
@@ -527,7 +530,8 @@ impl Typer {
                 return Type::Error;
             }
         }
-        crate::symbol::apply_type_ctor(ctor, args)
+        let applied = crate::symbol::apply_type_ctor(ctor, args);
+        self.st.expand_applied_hk_alias(applied)
     }
 
     fn check_proper_type(&mut self, ty: &Type, span: Span) {
@@ -543,25 +547,26 @@ impl Typer {
     }
 
     /// nsc: `class C[A <% V](x: A)` → extra implicit ctor clause `(implicit evidence$n: A => V)`.
-    fn class_view_bound_evidence(&mut self, class_id: SymbolId, tparams: &[Tree]) -> Vec<Tree> {
+    /// nsc: `class C[T: Ordering](x: T)` → extra implicit ctor clause `(implicit evidence$n: Ordering[T])`.
+    /// Higher-kinded `F[_] <% V` / `F[_]: C` is illegal in scalac 2.13 (`type F takes type parameters`).
+    fn class_bound_evidence(&mut self, class_id: SymbolId, tparams: &[Tree]) -> Vec<Tree> {
         let mut evidence = Vec::new();
         for tp in tparams {
             let TreeKind::TypeDef {
                 views,
+                ctx_bounds,
                 tparams: inner,
+                name,
                 ..
             } = &tp.kind
             else {
                 continue;
             };
-            if views.is_empty() {
+            if views.is_empty() && ctx_bounds.is_empty() {
                 continue;
             }
             if !inner.is_empty() {
-                self.error(
-                    tp.span,
-                    "unimplemented syntax: view bounds on higher-kinded type parameters",
-                );
+                self.error(tp.span, format!("type {name} takes type parameters"));
                 continue;
             }
             let tp_id = tp.sym;
@@ -591,6 +596,44 @@ impl Typer {
                     params: vec![Type::TypeParam(tp_id)],
                     ret: Box::new(view_ty),
                 };
+                let flags = Flags::IMPLICIT
+                    .with(Flags::PARAM)
+                    .with(Flags::PRIVATE)
+                    .with(Flags::LOCAL);
+                let ev_id = self.st.alloc(&ev_name, class_id, SymKind::Term, flags, "");
+                self.st.get_mut(ev_id).ty = ev_ty.clone();
+                self.st.enter_in_current(&ev_name, ev_id);
+                let mut ev = Tree::dummy(TreeKind::ValDef {
+                    mods: Modifiers::new(flags),
+                    name: ev_name,
+                    tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+                    rhs: Box::new(Tree::dummy(TreeKind::Empty)),
+                });
+                ev.span = tp.span;
+                ev.sym = ev_id;
+                ev.ty = ev_ty;
+                evidence.push(ev);
+            }
+            for bound in ctx_bounds {
+                if matches!(
+                    bound.kind,
+                    TreeKind::ExistentialTypeTree { .. }
+                        | TreeKind::CompoundTypeTree { .. }
+                        | TreeKind::Unimplemented { .. }
+                ) {
+                    self.error(
+                        bound.span,
+                        "unimplemented syntax: context bound shape (existential/refinement)",
+                    );
+                    continue;
+                }
+                let bound_ty = self.tree_to_type(bound);
+                if bound_ty.is_error() {
+                    continue;
+                }
+                let ev_ty = apply_context_bound(bound_ty, tp_id);
+                self.gensym += 1;
+                let ev_name = format!("evidence${}", self.gensym);
                 let flags = Flags::IMPLICIT
                     .with(Flags::PARAM)
                     .with(Flags::PRIVATE)
@@ -768,15 +811,31 @@ impl Typer {
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
-            TreeKind::TypeDef { name, mods, .. } => {
-                let annots = mods.annotations.clone();
+            TreeKind::TypeDef { .. } => {
+                let (name, flags, annots, within) = match &tree.kind {
+                    TreeKind::TypeDef { name, mods, .. } => (
+                        name.clone(),
+                        mods.flags,
+                        mods.annotations.clone(),
+                        mods.private_within.clone(),
+                    ),
+                    _ => return,
+                };
                 let id = self
                     .st
-                    .alloc(name, self.st.owner, SymKind::TypeMember, mods.flags, "");
-                self.st.get_mut(id).private_within = mods.private_within.clone();
+                    .alloc(&name, self.st.owner, SymKind::TypeMember, flags, "");
+                self.st.get_mut(id).private_within = within;
                 self.st.get_mut(id).annotations = annots;
-                self.st.enter_in_current(name, id);
+                self.st.enter_in_current(&name, id);
                 tree.sym = id;
+                if let TreeKind::TypeDef { tparams, .. } = &mut tree.kind {
+                    if !tparams.is_empty() {
+                        self.st.push_scope();
+                        let tp_ids = self.enter_tparams(tparams, id);
+                        self.st.get_mut(id).tparams = tp_ids;
+                        self.st.pop_scope();
+                    }
+                }
             }
             TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } => {
                 self.namer_enter_tmpl(tree);
@@ -930,9 +989,13 @@ impl Typer {
             let n = self.st.get(m).name.clone();
             self.st.enter_in_current(&n, m);
         }
-        let (self_name, self_tpt) = match &tree.kind {
-            TreeKind::ClassDef { impl_, .. } => (impl_.self_name.clone(), impl_.self_tpt.clone()),
-            _ => (None, None),
+        let (self_name, self_tpt, is_trait) = match &tree.kind {
+            TreeKind::ClassDef { impl_, mods, .. } => (
+                impl_.self_name.clone(),
+                impl_.self_tpt.clone(),
+                mods.flags.contains(Flags::TRAIT),
+            ),
+            _ => (None, None, false),
         };
         let (vparamss, body, parents, tparams) = match &mut tree.kind {
             TreeKind::ClassDef {
@@ -948,7 +1011,11 @@ impl Typer {
             ),
             _ => return,
         };
-        let evidence = self.class_view_bound_evidence(id, &tparams);
+        let evidence = if is_trait {
+            Vec::new()
+        } else {
+            self.class_bound_evidence(id, &tparams)
+        };
         if !evidence.is_empty() {
             vparamss.push(evidence);
         }
@@ -1024,6 +1091,7 @@ impl Typer {
             self.type_member_body(stt);
         }
         self.finish_case_apply(id, &ctor_param_tys);
+        self.check_type_member_kind_override(id, tree.span);
         self.check_self_conformance(id, tree.span);
         self.check_class_variance(id, tree.span);
         self.st.pop_scope();
@@ -1153,6 +1221,7 @@ impl Typer {
             self.type_member_body(stt);
         }
         self.check_self_conformance(cls, tree.span);
+        self.check_type_member_kind_override(cls, tree.span);
         self.st.pop_scope();
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
@@ -1161,46 +1230,114 @@ impl Typer {
     }
 
     fn type_type_member(&mut self, tree: &mut Tree) {
-        let (tparams, rhs, lo, hi, name) = match &tree.kind {
+        let span = tree.span;
+        let type_member_id = tree.sym;
+        let (has_tparams, has_bounds, name) = match &tree.kind {
             TreeKind::TypeDef {
                 tparams,
-                rhs,
                 lo,
                 hi,
                 name,
                 ..
-            } => (tparams, rhs, lo, hi, name.clone()),
+            } => (
+                !tparams.is_empty(),
+                lo.is_some() || hi.is_some(),
+                name.clone(),
+            ),
             _ => return,
         };
-        if !tparams.is_empty() {
-            self.error(tree.span, "unimplemented type: higher-kinded type members");
-            tree.ty = Type::Error;
-            if !tree.sym.is_none() {
-                self.st.get_mut(tree.sym).ty = Type::Error;
-            }
-            return;
-        }
-        if lo.is_some() || hi.is_some() {
+        if has_bounds {
             self.error(
-                tree.span,
+                span,
                 "unimplemented type: bounded type members (`type A <: T` / `type A >: T`)",
             );
             tree.ty = Type::Error;
-            if !tree.sym.is_none() {
-                self.st.get_mut(tree.sym).ty = Type::Error;
+            if !type_member_id.is_none() {
+                self.st.get_mut(type_member_id).ty = Type::Error;
             }
             return;
         }
-        let ty = if rhs.is_empty() {
-            Type::TypeMember(tree.sym)
-        } else {
+        if has_tparams {
+            let ty = if let TreeKind::TypeDef { tparams, rhs, .. } = &mut tree.kind {
+                self.st.push_scope();
+                let tp_ids = self.enter_tparams(tparams, type_member_id);
+                if !type_member_id.is_none() {
+                    self.st.get_mut(type_member_id).tparams = tp_ids;
+                }
+                let ty = if rhs.is_empty() {
+                    Type::TypeMember(type_member_id)
+                } else {
+                    let rhs_ty = self.tree_to_type(rhs);
+                    self.check_proper_type(&rhs_ty, span);
+                    rhs_ty
+                };
+                self.st.pop_scope();
+                ty
+            } else {
+                return;
+            };
+            tree.ty = ty.clone();
+            if !type_member_id.is_none() {
+                self.st.get_mut(type_member_id).ty = ty;
+            }
+            let _ = name;
+            return;
+        }
+        let rhs_empty = match &tree.kind {
+            TreeKind::TypeDef { rhs, .. } => rhs.is_empty(),
+            _ => return,
+        };
+        let ty = if rhs_empty {
+            Type::TypeMember(type_member_id)
+        } else if let TreeKind::TypeDef { rhs, .. } = &tree.kind {
             self.tree_to_type(rhs)
+        } else {
+            return;
         };
         tree.ty = ty.clone();
-        if !tree.sym.is_none() {
-            self.st.get_mut(tree.sym).ty = ty;
+        if !type_member_id.is_none() {
+            self.st.get_mut(type_member_id).ty = ty;
         }
         let _ = name;
+    }
+
+    /// nsc: overriding `type F[_]` with `type F` (or the reverse) is a kind mismatch.
+    fn check_type_member_kind_override(&mut self, class_id: SymbolId, span: Span) {
+        if class_id.is_none() {
+            return;
+        }
+        let members = self.st.get(class_id).members.clone();
+        let parents = self.st.get(class_id).parents.clone();
+        for mid in members {
+            if self.st.get(mid).kind != SymKind::TypeMember || self.st.get(mid).owner != class_id {
+                continue;
+            }
+            let name = self.st.get(mid).name.clone();
+            let child_arity = self.st.get(mid).tparams.len();
+            for p in &parents {
+                let Some(pcls) = self.st.class_sym_of(p) else {
+                    continue;
+                };
+                for m in self.st.lookup_member(pcls, &name) {
+                    if self.st.get(m).kind != SymKind::TypeMember {
+                        continue;
+                    }
+                    if self.st.get(m).owner == class_id {
+                        continue;
+                    }
+                    let parent_arity = self.st.get(m).tparams.len();
+                    if child_arity != parent_arity {
+                        self.error(
+                            span,
+                            format!(
+                                "illegal inheritance: type member {name} has incompatible kinds (child takes {child_arity} type parameters, parent takes {parent_arity})"
+                            ),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     /// Expand `type T = U` chains and diagnose `illegal cyclic reference`.
@@ -1771,10 +1908,8 @@ impl Typer {
         let mut evidence = Vec::new();
         for (tp_id, views, span, hk) in view_work {
             if hk {
-                self.error(
-                    span,
-                    "unimplemented syntax: view bounds on higher-kinded type parameters",
-                );
+                let tp_name = self.st.get(tp_id).name.clone();
+                self.error(span, format!("type {tp_name} takes type parameters"));
                 continue;
             }
             for view in views {
@@ -1824,10 +1959,8 @@ impl Typer {
         }
         for (tp_id, bounds, span, hk) in ctx_work {
             if hk {
-                self.error(
-                    span,
-                    "unimplemented syntax: context bounds on higher-kinded type parameters",
-                );
+                let tp_name = self.st.get(tp_id).name.clone();
+                self.error(span, format!("type {tp_name} takes type parameters"));
                 continue;
             }
             for bound in bounds {
@@ -6186,13 +6319,7 @@ impl Typer {
         found.sort_by_key(|s| if self.st.get(*s).owner == cls { 0 } else { 1 });
         for m in found {
             let ty = match self.st.get(m).kind {
-                SymKind::TypeMember => {
-                    let rhs = self.st.get(m).ty.clone();
-                    match rhs {
-                        Type::NoType | Type::Error | Type::TypeMember(_) => Type::TypeMember(m),
-                        other => other,
-                    }
-                }
+                SymKind::TypeMember => self.st.type_member_as_seen(m),
                 SymKind::Class | SymKind::ModuleClass => Type::Class {
                     sym: m,
                     args: vec![],
@@ -6960,14 +7087,7 @@ impl Typer {
                     match self.st.get(id).kind {
                         SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
                         SymKind::TypeParam => Type::TypeParam(id),
-                        SymKind::TypeMember => {
-                            let rhs = self.st.get(id).ty.clone();
-                            match rhs {
-                                Type::NoType | Type::Error => Type::TypeMember(id),
-                                Type::TypeMember(other) if other == id => Type::TypeMember(id),
-                                other => other,
-                            }
-                        }
+                        SymKind::TypeMember => self.st.type_member_as_seen(id),
                         _ => Type::Class {
                             sym: id,
                             args: args.to_vec(),
@@ -8259,6 +8379,9 @@ fn expand_alias_type(
 ) -> Result<Type, SymbolId> {
     match ty {
         Type::TypeMember(id) => {
+            if !st.get(*id).tparams.is_empty() {
+                return Ok(Type::TypeMember(*id));
+            }
             let rhs = st.get(*id).ty.clone();
             match &rhs {
                 Type::NoType | Type::Error => Ok(Type::TypeMember(*id)),
@@ -8296,7 +8419,7 @@ fn expand_alias_type(
                 .iter()
                 .map(|a| expand_alias_type(st, a, alias_ids, seen))
                 .collect();
-            Ok(crate::symbol::apply_type_ctor(ctor, args?))
+            Ok(st.expand_applied_hk_alias(crate::symbol::apply_type_ctor(ctor, args?)))
         }
         Type::Array(t) => Ok(Type::Array(Box::new(expand_alias_type(
             st, t, alias_ids, seen,
