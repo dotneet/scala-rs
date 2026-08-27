@@ -3593,6 +3593,16 @@ impl Typer {
                 self.type_expr(a, &Type::NoType);
             }
             let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+            let field_tys: Vec<Type> = class_id
+                .map(|c| {
+                    self.st
+                        .get(c)
+                        .ctor_fields
+                        .iter()
+                        .map(|f| self.st.get(*f).ty.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             let (ctor_sym, ctor_params) = if let Some(c) = class_id {
                 match self.pick_ctor(c, &arg_tys, None) {
                     OverloadPick::Found(sym, ps, _) => (Some(sym), ps),
@@ -3601,14 +3611,7 @@ impl Typer {
                         (None, Vec::new())
                     }
                     OverloadPick::None => {
-                        let fallback = self
-                            .st
-                            .get(c)
-                            .ctor_fields
-                            .iter()
-                            .map(|f| self.st.get(*f).ty.clone())
-                            .collect::<Vec<_>>();
-                        if fallback.len() != arg_tys.len() {
+                        if field_tys.len() != arg_tys.len() {
                             self.error(
                                 tree.span,
                                 format!(
@@ -3622,11 +3625,19 @@ impl Typer {
                                 ),
                             );
                         }
-                        (None, fallback)
+                        (None, field_tys.clone())
                     }
                 }
             } else {
                 (None, Vec::new())
+            };
+            // Generic inference must use ctor *fields* (`Tuple2._1: A`) even when
+            // the picked `<init>` is erased to `(Any, Any)` in the prelude.
+            let nargs = args.len();
+            let unify_params = if infer && field_tys.len() == nargs && !field_tys.is_empty() {
+                field_tys.clone()
+            } else {
+                ctor_params.clone()
             };
             let mut inferred_args: Vec<Type> = Vec::new();
             if let Some(c) = class_id {
@@ -3639,13 +3650,19 @@ impl Typer {
                     fun.ty = tree.ty.clone();
                 } else if infer {
                     let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
-                    let pt_args: &[Type] = match pt {
-                        Type::Class { args: a, sym } if *sym == c => a.as_slice(),
-                        _ => &[],
+                    let pt_args: Vec<Type> = match pt {
+                        Type::Class { args: a, sym } if *sym == c => a.clone(),
+                        Type::Tuple(ts)
+                            if self.st.get(c).name.starts_with("Tuple")
+                                && ts.len() == tps.len() =>
+                        {
+                            ts.clone()
+                        }
+                        _ => Vec::new(),
                     };
                     for (i, tp) in tps.iter().enumerate() {
                         inferred_args.push(
-                            unify_tparam(*tp, &ctor_params, &arg_tys)
+                            unify_tparam(*tp, &unify_params, &arg_tys)
                                 .or_else(|| pt_args.get(i).cloned())
                                 .unwrap_or(Type::Any),
                         );
@@ -3662,7 +3679,11 @@ impl Typer {
                 tree.ty = fun.ty.clone();
             }
             for (i, a) in args.iter_mut().enumerate() {
-                let mut p = ctor_params.get(i).cloned().unwrap_or(Type::NoType);
+                let mut p = if infer && field_tys.len() == nargs && !field_tys.is_empty() {
+                    field_tys.get(i).cloned().unwrap_or(Type::NoType)
+                } else {
+                    ctor_params.get(i).cloned().unwrap_or(Type::NoType)
+                };
                 if let Some(c) = class_id {
                     if !inferred_args.is_empty() {
                         p = self.st.subst_tparams(c, &inferred_args, &p);
@@ -6368,7 +6389,14 @@ impl Typer {
             }
         }
         if self.st.get(owner).kind == SymKind::Package {
-            let pkg_jvm = self.st.get(owner).jvm_name.clone();
+            // `<root>` is allocated with jvm_name `scala/runtime` (prelude). A
+            // top-level Java package like `jprot` lives at `jprot/`, not
+            // `scala/runtime/jprot/`.
+            let pkg_jvm = if owner == self.st.root {
+                String::new()
+            } else {
+                self.st.get(owner).jvm_name.clone()
+            };
             let internal = if pkg_jvm.is_empty() {
                 name.to_string()
             } else {

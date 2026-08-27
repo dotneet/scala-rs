@@ -418,6 +418,24 @@ fn checkcast_internal(st: &SymbolTable, ty: &Type) -> Option<String> {
 
 fn method_desc_from_sym(st: &SymbolTable, id: SymbolId) -> String {
     let s = st.get(id);
+    if s.name == "<init>" {
+        if s.jvm_name.starts_with('(') && s.jvm_name.ends_with(")V") {
+            return s.jvm_name.clone();
+        }
+        let params = match &s.ty {
+            Type::Method { paramss, .. } => {
+                let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+                if params.iter().any(|p| p.is_no_type() || p.is_error()) {
+                    s.params.iter().map(|p| st.get(*p).ty.clone()).collect()
+                } else {
+                    params
+                }
+            }
+            Type::Function { params, .. } => params.clone(),
+            _ => s.params.iter().map(|p| st.get(*p).ty.clone()).collect(),
+        };
+        return jvm_method_desc(st, &params, &Type::Unit);
+    }
     if s.jvm_name.starts_with('(') {
         return s.jvm_name.clone();
     }
