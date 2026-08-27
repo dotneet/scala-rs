@@ -2024,6 +2024,7 @@ impl Typer {
                     TreeKind::AppliedTypeTree { .. }
                         | TreeKind::TypeApply { .. }
                         | TreeKind::AnnotatedTypeTree { .. }
+                        | TreeKind::Select { .. }
                 ) {
                     tpt.ty = self.tree_to_type(tpt);
                     if let Some(id) = self.st.class_sym_of(&tpt.ty) {
@@ -2031,6 +2032,7 @@ impl Typer {
                     }
                 } else if let TreeKind::Ident { name } = &tpt.kind {
                     let n = name.clone();
+                    self.expose_unqualified(&n, tpt.span);
                     let found = self.st.lookup(&n);
                     if let Some(id) = found
                         .into_iter()
@@ -2251,16 +2253,36 @@ impl Typer {
         }
     }
 
+    /// Load a same-package (or default-package) Java class for an unqualified name.
+    fn expose_unqualified(&mut self, name: &str, span: Span) {
+        if name.is_empty() || !self.st.lookup(name).is_empty() {
+            return;
+        }
+        let from = if !self.st.this_class.is_none() {
+            self.st.this_class
+        } else {
+            self.st.owner
+        };
+        let pkg = self.enclosing_package(from);
+        self.complete_binary_member(pkg, name, span);
+        for id in self.st.lookup_member(pkg, name) {
+            self.st.enter_in_current(name, id);
+        }
+        if self.st.lookup(name).is_empty() && pkg != self.st.root {
+            self.complete_binary_member(self.st.root, name, span);
+            for id in self.st.lookup_member(self.st.root, name) {
+                self.st.enter_in_current(name, id);
+            }
+        }
+    }
+
     fn type_ident(&mut self, tree: &mut Tree, name: String, pt: &Type) {
         if name == "_" {
             tree.kind = TreeKind::Wildcard;
             tree.ty = Type::Error;
             return;
         }
-        let found = self.st.lookup(&name);
-        if found.is_empty() {
-            self.complete_binary_member(self.st.root, &name, tree.span);
-        }
+        self.expose_unqualified(&name, tree.span);
         let mut found = self.st.lookup(&name);
         if found.is_empty() {
             found = self.st.lookup_member(self.st.root, &name);
@@ -2643,6 +2665,10 @@ impl Typer {
             return self.nested_in(current, owner);
         }
         if flags.contains(Flags::PROTECTED) {
+            // Java `protected` is also package-private (JLS / nsc Java interop).
+            if flags.contains(Flags::JAVA) && self.java_same_package(current, owner) {
+                return true;
+            }
             let by_qual = s
                 .private_within
                 .as_ref()
@@ -2729,6 +2755,22 @@ impl Typer {
             Some(t) if matches!(t.kind, TreeKind::This { .. } | TreeKind::Super { .. }) => true,
             Some(t) => self.st.is_sub_type(&t.ty, &cur_ty),
         }
+    }
+
+    fn java_same_package(&self, current: SymbolId, member_owner: SymbolId) -> bool {
+        let a = self.enclosing_package(current);
+        let b = self.enclosing_package(member_owner);
+        !a.is_none() && a == b
+    }
+
+    fn enclosing_package(&self, mut id: SymbolId) -> SymbolId {
+        while !id.is_none() {
+            if self.st.get(id).kind == SymKind::Package {
+                return id;
+            }
+            id = self.st.get(id).owner;
+        }
+        self.st.root
     }
 
     /// When a member exists on the receiver (e.g. `Int.+`) but the argument
@@ -4211,7 +4253,8 @@ impl Typer {
                     let name = self.st.get(fun_sym).name.clone();
                     let owner = self.st.get(fun_sym).owner;
                     cands.clear();
-                    for m in self.st.lookup_member(owner, &name) {
+                    let methods = self.drop_overridden(self.st.lookup_member(owner, &name));
+                    for m in methods {
                         if let Type::Method { paramss, ret } = &self.st.get(m).ty {
                             cands.push((
                                 m,
@@ -4317,6 +4360,23 @@ impl Typer {
         args: &[Type],
         allow_widen: bool,
     ) -> bool {
+        let instantiated;
+        let params = if !sym.is_none() && !self.st.get(sym).tparams.is_empty() {
+            let inst = self.infer_method_tparams(sym, params, args);
+            if inst.is_empty() {
+                params
+            } else {
+                let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+                let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+                instantiated = params
+                    .iter()
+                    .map(|p| crate::symbol::subst_tparams_slice(&tps, &args_t, p))
+                    .collect::<Vec<_>>();
+                instantiated.as_slice()
+            }
+        } else {
+            params
+        };
         let (fixed, repeated) = split_repeated(params);
         if let Some(elem) = repeated {
             if args.len() < fixed.len() {
@@ -5154,8 +5214,15 @@ impl Typer {
         match &tpt.kind {
             TreeKind::Empty => Type::NoType,
             TreeKind::Ident { name } if name == "_" => Type::Wildcard,
-            TreeKind::Ident { name } => self.resolve_type_name(name, &[]),
+            TreeKind::Ident { name } => {
+                self.expose_unqualified(name, tpt.span);
+                self.resolve_type_name(name, &[])
+            }
             TreeKind::Select { name, qual } => {
+                if let TreeKind::Ident { name: q } = &qual.kind {
+                    let q = q.clone();
+                    self.expose_unqualified(&q, tpt.span);
+                }
                 if name == "String" && !self.type_select_is_term_prefix(qual) {
                     Type::String
                 } else if self.type_select_is_term_prefix(qual) {
@@ -5873,36 +5940,55 @@ impl Typer {
     fn lookup_qualified_type(&mut self, prefix: &Tree, name: &str) -> Option<SymbolId> {
         let owner = self.qualified_type_owner(prefix)?;
         self.complete_binary_member(owner, name, prefix.span);
-        self.st.lookup_member(owner, name).into_iter().find(|s| {
-            matches!(
-                self.st.get(*s).kind,
-                SymKind::Class
-                    | SymKind::Package
-                    | SymKind::Module
-                    | SymKind::ModuleClass
-                    | SymKind::TypeMember
-                    | SymKind::TypeParam
-            )
-        })
+        self.prefer_class_member(owner, name)
+    }
+
+    /// Nested classes live on the module class (`object Outer { class Inner }`).
+    fn as_type_owner(&self, id: SymbolId) -> SymbolId {
+        match self.st.get(id).kind {
+            SymKind::Module => self.st.module_class_of(id),
+            _ => id,
+        }
+    }
+
+    /// `new Outer.Inner()` must bind the class, not `object Inner`.
+    fn prefer_class_member(&self, owner: SymbolId, name: &str) -> Option<SymbolId> {
+        let found = self.st.lookup_member(owner, name);
+        found
+            .iter()
+            .copied()
+            .find(|&s| self.st.get(s).kind == SymKind::Class)
+            .or_else(|| {
+                found.into_iter().find(|&s| {
+                    matches!(
+                        self.st.get(s).kind,
+                        SymKind::Package
+                            | SymKind::Module
+                            | SymKind::ModuleClass
+                            | SymKind::TypeMember
+                            | SymKind::TypeParam
+                    )
+                })
+            })
     }
 
     fn qualified_type_owner(&mut self, t: &Tree) -> Option<SymbolId> {
         match &t.kind {
-            TreeKind::Ident { name } => self.st.lookup(name).into_iter().find(|id| {
-                matches!(
-                    self.st.get(*id).kind,
-                    SymKind::Package | SymKind::Class | SymKind::Module | SymKind::ModuleClass
-                )
-            }),
-            TreeKind::Select { qual, name } => {
-                let owner = self.qualified_type_owner(qual)?;
-                self.complete_binary_member(owner, name, t.span);
-                self.st.lookup_member(owner, name).into_iter().find(|id| {
+            TreeKind::Ident { name } => {
+                self.expose_unqualified(name, t.span);
+                let id = self.st.lookup(name).into_iter().find(|id| {
                     matches!(
                         self.st.get(*id).kind,
                         SymKind::Package | SymKind::Class | SymKind::Module | SymKind::ModuleClass
                     )
-                })
+                })?;
+                Some(self.as_type_owner(id))
+            }
+            TreeKind::Select { qual, name } => {
+                let owner = self.qualified_type_owner(qual)?;
+                self.complete_binary_member(owner, name, t.span);
+                self.prefer_class_member(owner, name)
+                    .map(|id| self.as_type_owner(id))
             }
             _ => None,
         }
@@ -5912,17 +5998,21 @@ impl Typer {
         if owner.is_none() || name.is_empty() {
             return;
         }
+        let owner = self.as_type_owner(owner);
         if self.st.get(owner).kind == SymKind::Class {
             self.ensure_java_loaded(owner, span);
             if !self.st.lookup_member(owner, name).is_empty() {
                 return;
             }
-        } else if self.st.lookup_member(owner, name).iter().any(|&id| {
+        } else if let Some(id) = self.st.lookup_member(owner, name).into_iter().find(|&id| {
             matches!(
                 self.st.get(id).kind,
                 SymKind::Class | SymKind::Package | SymKind::Module | SymKind::ModuleClass
             )
         }) {
+            if self.st.get(id).kind == SymKind::Class {
+                self.ensure_java_loaded(id, span);
+            }
             return;
         }
         let pkg_jvm = if owner == self.st.root {
@@ -5943,7 +6033,8 @@ impl Typer {
         match self.binary.find_class(&internal) {
             Ok(Some(bytes)) => match crate::javaclass::parse_java_classfile(&bytes) {
                 Ok(jc) => {
-                    crate::classpath::install_java_class(&mut self.st, &jc);
+                    let id = crate::classpath::install_java_class(&mut self.st, &jc);
+                    self.complete_java_parents(id, span);
                 }
                 Err(e) => {
                     self.error(
@@ -5969,6 +6060,41 @@ impl Typer {
         }
     }
 
+    fn complete_java_type(&mut self, ty: &Type, span: Span) {
+        match ty {
+            Type::Class { sym, args } => {
+                self.ensure_java_loaded(*sym, span);
+                for a in args {
+                    self.complete_java_type(a, span);
+                }
+            }
+            Type::BoundedWildcard { lo, hi } => {
+                if let Some(t) = lo {
+                    self.complete_java_type(t, span);
+                }
+                if let Some(t) = hi {
+                    self.complete_java_type(t, span);
+                }
+            }
+            Type::Array(t)
+            | Type::Repeated(t)
+            | Type::ByName(t)
+            | Type::Annotated { tpe: t, .. } => {
+                self.complete_java_type(t, span);
+            }
+            _ => {}
+        }
+    }
+
+    fn complete_java_parents(&mut self, class_id: SymbolId, span: Span) {
+        let parents = self.st.get(class_id).parents.clone();
+        for p in &parents {
+            if let Some(s) = self.st.class_sym_of(p) {
+                self.ensure_java_loaded(s, span);
+            }
+        }
+    }
+
     fn ensure_java_loaded(&mut self, class_id: SymbolId, span: Span) {
         if class_id.is_none() {
             return;
@@ -5990,6 +6116,7 @@ impl Typer {
             Ok(Some(bytes)) => match crate::javaclass::parse_java_classfile(&bytes) {
                 Ok(jc) => {
                     crate::classpath::install_java_class(&mut self.st, &jc);
+                    self.complete_java_parents(class_id, span);
                 }
                 Err(e) => {
                     self.error(
@@ -6077,6 +6204,8 @@ impl Typer {
         if pt.is_no_type() || tree.ty.is_error() || pt.is_error() {
             return;
         }
+        self.complete_java_type(&tree.ty, tree.span);
+        self.complete_java_type(pt, tree.span);
         if self.st.is_sub_type(&tree.ty, pt) {
             return;
         }
@@ -7033,6 +7162,14 @@ fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
             })
         }
         (_, Type::TypeParam(_)) => true,
+        (a, Type::BoundedWildcard { hi: Some(h), .. }) => class_ctor_matches_typeparam_args(a, h),
+        (
+            a,
+            Type::BoundedWildcard {
+                lo: Some(l),
+                hi: None,
+            },
+        ) => class_ctor_matches_typeparam_args(a, l),
         _ => false,
     }
 }
@@ -7359,6 +7496,10 @@ fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
     match pattern {
         Type::Annotated { tpe, .. } => unify_one(tp, tpe, actual),
         Type::TypeParam(id) if *id == tp => Some(actual.widen_constant()),
+        Type::BoundedWildcard { hi: Some(h), .. } | Type::BoundedWildcard { lo: Some(h), .. } => {
+            unify_one(tp, h, actual)
+        }
+        Type::Wildcard => None,
         Type::Class { args: pas, .. } => {
             if let Type::Class { args: aas, .. } = actual {
                 for (p, a) in pas.iter().zip(aas) {

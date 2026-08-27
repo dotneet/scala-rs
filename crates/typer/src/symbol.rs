@@ -556,6 +556,19 @@ impl SymbolTable {
                 parents.iter().all(|p| self.is_sub_type(a, p))
                     && self.conforms_to_refinement(a, decls)
             }
+            // Wildcards before the Class-parent walk: that arm matches every Class
+            // and would otherwise treat `Byte <: List[_ <: Byte]` as "walk Byte's
+            // parents" instead of the bound.
+            (_, Type::Wildcard) => true,
+            (Type::Wildcard, Type::AnyRef | Type::AnyVal) => true,
+            (a, Type::BoundedWildcard { hi, .. }) => match hi {
+                Some(h) => self.is_sub_type(a, h),
+                None => true,
+            },
+            (Type::BoundedWildcard { hi, .. }, b) => match hi {
+                Some(h) => self.is_sub_type(h, b),
+                None => matches!(b, Type::Any | Type::AnyRef | Type::Wildcard),
+            },
             (Type::Class { sym: s1, args: a1 }, b) => {
                 let child = self.get(*s1);
                 let tps = child.tparams.clone();
@@ -577,16 +590,6 @@ impl SymbolTable {
             (Type::TypeMember(a), Type::TypeMember(b)) if a == b => true,
             (Type::TypeParam(_), Type::AnyRef | Type::AnyVal) => true,
             (Type::TypeMember(_), Type::AnyRef | Type::AnyVal) => true,
-            (Type::Wildcard, Type::AnyRef | Type::AnyVal | Type::Wildcard) => true,
-            (_, Type::Wildcard) => true,
-            (a, Type::BoundedWildcard { hi, .. }) => match hi {
-                Some(h) => self.is_sub_type(a, h),
-                None => true,
-            },
-            (Type::BoundedWildcard { hi, .. }, b) => match hi {
-                Some(h) => self.is_sub_type(h, b),
-                None => matches!(b, Type::Any | Type::AnyRef | Type::Wildcard),
-            },
             (Type::ThisType(s), b) => {
                 if matches!(b, Type::ThisType(t) if t == s) {
                     true

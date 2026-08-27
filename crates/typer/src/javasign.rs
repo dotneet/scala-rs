@@ -12,17 +12,31 @@ pub enum JType {
     Double,
     Var(String),
     Array(Box<JType>),
-    Class { jvm: String, args: Vec<JType> },
+    Class {
+        jvm: String,
+        args: Vec<JType>,
+    },
+    /// Unbounded wildcard `*`.
     Star,
+    /// `+T` (`? extends T`).
+    Extends(Box<JType>),
+    /// `-T` (`? super T`).
+    Super(Box<JType>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JParam {
+    pub name: String,
+    pub bounds: Vec<JType>,
 }
 
 pub struct ClassSig {
-    pub tparams: Vec<String>,
+    pub tparams: Vec<JParam>,
     pub supers: Vec<JType>,
 }
 
 pub struct MethodSig {
-    pub tparams: Vec<String>,
+    pub tparams: Vec<JParam>,
     pub params: Vec<JType>,
     pub ret: JType,
 }
@@ -66,23 +80,24 @@ impl<'a> P<'a> {
         }
         Some(String::from_utf8_lossy(&self.s[start..self.i]).into_owned())
     }
-    fn parse_tparams(&mut self) -> Option<Vec<String>> {
+    fn parse_tparams(&mut self) -> Option<Vec<JParam>> {
         if !self.eat(b'<') {
             return Some(Vec::new());
         }
         let mut names = Vec::new();
         while self.peek() != Some(b'>') {
             let n = self.ident()?;
-            names.push(n);
             if !self.eat(b':') {
                 return None;
             }
+            let mut bounds = Vec::new();
             if matches!(self.peek(), Some(b'L' | b'T' | b'[')) {
-                let _ = self.parse_ref()?;
+                bounds.push(self.parse_ref()?);
             }
             while self.eat(b':') {
-                let _ = self.parse_ref()?;
+                bounds.push(self.parse_ref()?);
             }
+            names.push(JParam { name: n, bounds });
         }
         if !self.eat(b'>') {
             return None;
@@ -149,9 +164,13 @@ impl<'a> P<'a> {
                 self.bump();
                 Some(JType::Star)
             }
-            b'+' | b'-' => {
+            b'+' => {
                 self.bump();
-                self.parse_ref()
+                Some(JType::Extends(Box::new(self.parse_ref()?)))
+            }
+            b'-' => {
+                self.bump();
+                Some(JType::Super(Box::new(self.parse_ref()?)))
             }
             _ => None,
         }
@@ -215,9 +234,13 @@ impl<'a> P<'a> {
                 self.bump();
                 Some(JType::Star)
             }
-            b'+' | b'-' => {
+            b'+' => {
                 self.bump();
-                self.parse_ref()
+                Some(JType::Extends(Box::new(self.parse_ref()?)))
+            }
+            b'-' => {
+                self.bump();
+                Some(JType::Super(Box::new(self.parse_ref()?)))
             }
             _ => self.parse_ref(),
         }
@@ -259,13 +282,17 @@ pub fn parse_method_sig(s: &str) -> Option<MethodSig> {
 mod tests {
     use super::*;
 
+    fn tparam_names(ps: &[JParam]) -> Vec<&str> {
+        ps.iter().map(|p| p.name.as_str()).collect()
+    }
+
     #[test]
     fn class_sig_arraylist() {
         let s = parse_class_sig(
             "<E:Ljava/lang/Object;>Ljava/util/AbstractList<TE;>;Ljava/util/List<TE;>;Ljava/util/RandomAccess;Ljava/lang/Cloneable;Ljava/io/Serializable;",
         )
         .unwrap();
-        assert_eq!(s.tparams, vec!["E"]);
+        assert_eq!(tparam_names(&s.tparams), vec!["E"]);
         assert!(s.supers.iter().any(|t| matches!(
             t,
             JType::Class { jvm, args } if jvm == "java/util/List" && args.len() == 1
@@ -285,7 +312,7 @@ mod tests {
     #[test]
     fn method_sig_aslist() {
         let m = parse_method_sig("<T:Ljava/lang/Object;>([TT;)Ljava/util/List<TT;>;").unwrap();
-        assert_eq!(m.tparams, vec!["T"]);
+        assert_eq!(tparam_names(&m.tparams), vec!["T"]);
         assert!(matches!(m.params[0], JType::Array(_)));
         assert!(matches!(
             m.ret,
@@ -297,7 +324,7 @@ mod tests {
     fn class_sig_map_entry() {
         let s = parse_class_sig("<K:Ljava/lang/Object;V:Ljava/lang/Object;>Ljava/lang/Object;")
             .unwrap();
-        assert_eq!(s.tparams, vec!["K", "V"]);
+        assert_eq!(tparam_names(&s.tparams), vec!["K", "V"]);
     }
 
     #[test]
@@ -306,10 +333,43 @@ mod tests {
             "<K:Ljava/lang/Object;V:Ljava/lang/Object;>Ljava/lang/Object;Ljava/util/Map$Entry<TK;TV;>;Ljava/io/Serializable;",
         )
         .unwrap();
-        assert_eq!(s.tparams, vec!["K", "V"]);
+        assert_eq!(tparam_names(&s.tparams), vec!["K", "V"]);
         assert!(s.supers.iter().any(|t| matches!(
             t,
             JType::Class { jvm, args } if jvm == "java/util/Map$Entry" && args.len() == 2
         )));
+    }
+
+    #[test]
+    fn method_sig_class_forname_wildcard() {
+        let m = parse_method_sig("(Ljava/lang/String;)Ljava/lang/Class<*>;").unwrap();
+        assert!(matches!(
+            m.ret,
+            JType::Class { ref jvm, ref args }
+                if jvm == "java/lang/Class" && matches!(args.as_slice(), [JType::Star])
+        ));
+    }
+
+    #[test]
+    fn method_sig_collections_max_bounds_and_wildcard() {
+        let m = parse_method_sig(
+            "<T:Ljava/lang/Object;:Ljava/lang/Comparable<-TT;>;>(Ljava/util/Collection<+TT;>;)TT;",
+        )
+        .unwrap();
+        assert_eq!(tparam_names(&m.tparams), vec!["T"]);
+        assert_eq!(m.tparams[0].bounds.len(), 2);
+        assert!(matches!(
+            &m.tparams[0].bounds[1],
+            JType::Class { jvm, args }
+                if jvm == "java/lang/Comparable"
+                    && matches!(args.as_slice(), [JType::Super(_)])
+        ));
+        assert!(matches!(
+            &m.params[0],
+            JType::Class { jvm, args }
+                if jvm == "java/util/Collection"
+                    && matches!(args.as_slice(), [JType::Extends(_)])
+        ));
+        assert!(matches!(m.ret, JType::Var(ref n) if n == "T"));
     }
 }

@@ -18,6 +18,13 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
         if is_forwarder_of_module(classes, c) {
             continue;
         }
+        // Pure Java classfiles have no ScalaSignature. Installing them here
+        // (root owner, no JAVA/PROTECTED/STATIC) shadows on-demand completion
+        // via `install_java_class` and drops JLS flags. The Java loader on
+        // `binary_path` completes them instead.
+        if c.pickle.is_none() {
+            continue;
+        }
         let owner = st.root;
         if c.is_module {
             let jvm = if c.jvm_name.ends_with('$') {
@@ -124,6 +131,25 @@ fn install_tparams(st: &mut SymbolTable, owner: SymbolId, names: &[String]) {
         ids.push(id);
     }
     st.get_mut(owner).tparams = ids;
+}
+
+fn install_java_tparams(st: &mut SymbolTable, owner: SymbolId, params: &[crate::javasign::JParam]) {
+    if params.is_empty() || !st.get(owner).tparams.is_empty() {
+        return;
+    }
+    let names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+    install_tparams(st, owner, &names);
+    let env = tparam_env(st, owner);
+    let ids = st.get(owner).tparams.clone();
+    for (p, id) in params.iter().zip(ids) {
+        let bounds: Vec<Type> = p
+            .bounds
+            .iter()
+            .map(|b| jtype_to_type(st, b, &env))
+            .filter(|t| !matches!(t, Type::Any | Type::AnyRef))
+            .collect();
+        st.get_mut(id).parents = bounds;
+    }
 }
 
 fn add_term(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) -> SymbolId {
@@ -583,7 +609,7 @@ fn apply_java_class_meta(st: &mut SymbolTable, id: SymbolId, c: &crate::javaclas
     if st.get(id).tparams.is_empty() {
         if let Some(sig) = &c.signature {
             if let Some(cs) = crate::javasign::parse_class_sig(sig) {
-                install_tparams(st, id, &cs.tparams);
+                install_java_tparams(st, id, &cs.tparams);
             }
         }
     }
@@ -655,9 +681,54 @@ fn tparam_env(st: &SymbolTable, owner: SymbolId) -> std::collections::HashMap<St
     env
 }
 
+fn java_method_flags(m: &crate::javaclass::JavaMethod) -> Flags {
+    let mut flags = Flags::JAVA;
+    if crate::javaclass::is_java_static(m.access) {
+        flags = flags.with(Flags::STATIC);
+    }
+    if crate::javaclass::is_java_abstract(m.access) {
+        flags = flags.with(Flags::ABSTRACT);
+    }
+    if crate::javaclass::is_java_varargs(m.access) {
+        flags = flags.with(Flags::VARARGS);
+    }
+    if crate::javaclass::is_java_protected(m.access) {
+        flags = flags.with(Flags::PROTECTED);
+    }
+    if m.name == "<init>" {
+        flags = flags.with(Flags::CONSTRUCTOR);
+    }
+    flags
+}
+
+fn existing_java_method(
+    st: &SymbolTable,
+    owner: SymbolId,
+    m: &crate::javaclass::JavaMethod,
+) -> Option<SymbolId> {
+    if let Some(id) = st.lookup_member(owner, &m.name).into_iter().find(|&id| {
+        let s = st.get(id);
+        s.kind == SymKind::Method && s.owner == owner && s.jvm_name == m.desc
+    }) {
+        return Some(id);
+    }
+    let arity = desc_param_count(&m.desc);
+    st.lookup_member(owner, &m.name).into_iter().find(|&id| {
+        let s = st.get(id);
+        s.kind == SymKind::Method
+            && s.owner == owner
+            && s.jvm_name.is_empty()
+            && method_arity(s) == arity
+    })
+}
+
 fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass::JavaClass) {
     for m in &c.methods {
-        if has_method_desc(st, owner, &m.name, &m.desc) {
+        if let Some(id) = existing_java_method(st, owner, m) {
+            st.get_mut(id).flags = java_method_flags(m);
+            if st.get(id).jvm_name.is_empty() {
+                st.get_mut(id).jvm_name = m.desc.clone();
+            }
             continue;
         }
         let mut env = tparam_env(st, owner);
@@ -667,11 +738,20 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
             .and_then(crate::javasign::parse_method_sig);
         let (params, ret, mtparams) = if let Some(ms) = parsed {
             let mut tp_ids = Vec::new();
-            for n in &ms.tparams {
-                let tid = st.alloc(n, owner, SymKind::TypeParam, Flags::EMPTY, "");
+            for p in &ms.tparams {
+                let tid = st.alloc(&p.name, owner, SymKind::TypeParam, Flags::EMPTY, "");
                 st.get_mut(tid).ty = Type::TypeParam(tid);
-                env.insert(n.clone(), tid);
+                env.insert(p.name.clone(), tid);
                 tp_ids.push(tid);
+            }
+            for (p, tid) in ms.tparams.iter().zip(&tp_ids) {
+                let bounds: Vec<Type> = p
+                    .bounds
+                    .iter()
+                    .map(|b| jtype_to_type(st, b, &env))
+                    .filter(|t| !matches!(t, Type::Any | Type::AnyRef))
+                    .collect();
+                st.get_mut(*tid).parents = bounds;
             }
             let params: Vec<Type> = ms
                 .params
@@ -693,19 +773,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
             }
         }
         let names: Vec<String> = (0..params.len()).map(|i| format!("x${i}")).collect();
-        let mut flags = Flags::JAVA;
-        if crate::javaclass::is_java_static(m.access) {
-            flags = flags.with(Flags::STATIC);
-        }
-        if crate::javaclass::is_java_abstract(m.access) {
-            flags = flags.with(Flags::ABSTRACT);
-        }
-        if crate::javaclass::is_java_varargs(m.access) {
-            flags = flags.with(Flags::VARARGS);
-        }
-        if m.name == "<init>" {
-            flags = flags.with(Flags::CONSTRUCTOR);
-        }
+        let flags = java_method_flags(m);
         let id = add_method_types(st, owner, &m.name, names, params, ret);
         st.get_mut(id).flags = flags;
         st.get_mut(id).jvm_name = m.desc.clone();
@@ -729,6 +797,9 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         if crate::javaclass::is_java_static(f.access) {
             flags = flags.with(Flags::STATIC);
         }
+        if crate::javaclass::is_java_protected(f.access) {
+            flags = flags.with(Flags::PROTECTED);
+        }
         let id = add_term(st, owner, &f.name, ty);
         st.get_mut(id).flags = flags;
         st.get_mut(id).jvm_name = f.desc.clone();
@@ -750,6 +821,14 @@ fn jtype_to_type(
         JType::Float => Type::Float,
         JType::Double => Type::Double,
         JType::Star => Type::Wildcard,
+        JType::Extends(t) => Type::BoundedWildcard {
+            lo: None,
+            hi: Some(Box::new(jtype_to_type(st, t, env))),
+        },
+        JType::Super(t) => Type::BoundedWildcard {
+            lo: Some(Box::new(jtype_to_type(st, t, env))),
+            hi: None,
+        },
         JType::Var(n) => env
             .get(n)
             .copied()
@@ -831,8 +910,53 @@ fn parse_field_ty_java(st: &mut SymbolTable, s: &str) -> (Type, usize) {
     }
 }
 
-fn has_method_desc(st: &SymbolTable, owner: SymbolId, name: &str, desc: &str) -> bool {
-    st.lookup_member(owner, name)
-        .iter()
-        .any(|&id| st.get(id).kind == SymKind::Method && st.get(id).jvm_name == desc)
+fn method_arity(s: &crate::symbol::Symbol) -> usize {
+    let n = s.paramss.iter().flatten().count();
+    if n > 0 {
+        return n;
+    }
+    match &s.ty {
+        Type::Method { paramss, .. } => paramss.iter().flatten().count(),
+        Type::Function { params, .. } => params.len(),
+        _ => 0,
+    }
+}
+
+fn desc_param_count(desc: &str) -> usize {
+    let rest = desc.strip_prefix('(').unwrap_or(desc);
+    let params = rest.split_once(')').map(|(p, _)| p).unwrap_or("");
+    let b = params.as_bytes();
+    let mut n = 0;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' => {
+                n += 1;
+                i += 1;
+            }
+            b'[' => {
+                while i < b.len() && b[i] == b'[' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+                n += 1;
+            }
+            b'L' => {
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+                n += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    n
 }

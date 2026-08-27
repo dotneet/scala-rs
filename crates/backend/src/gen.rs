@@ -3047,6 +3047,11 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
             asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
         }
         SymKind::Class => {
+            // Java classes have no companion MODULE$. Scala `Foo.bar` still
+            // loads `Foo$` when a companion exists.
+            if ctx.st.get(id).flags.contains(Flags::JAVA) || ctx.st.companion_module(id).is_none() {
+                return;
+            }
             let jvm = format!("{}$", class_internal(ctx.st, id));
             asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
         }
@@ -3200,8 +3205,10 @@ fn gen_select(
             }
             SymKind::Method => {
                 let ic = s.intrinsic;
-                gen_expr(asm, frame, ctx, qual);
-                checkcast_refined_receiver(asm, ctx, &qual.ty, tree.sym);
+                if !s.flags.contains(Flags::STATIC) {
+                    gen_expr(asm, frame, ctx, qual);
+                    checkcast_refined_receiver(asm, ctx, &qual.ty, tree.sym);
+                }
                 if matches!(qual.kind, TreeKind::Super { .. }) {
                     invoke_super(asm, ctx, tree.sym);
                 } else if matches!(ic, Intrinsic::StringToInt) {
