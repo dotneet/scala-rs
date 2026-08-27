@@ -60,6 +60,10 @@ impl Flags {
     pub const VOLATILE: Flags = Flags(1 << 27);
     /// JVM `ACC_TRANSIENT` (`@transient` fields).
     pub const TRANSIENT: Flags = Flags(1 << 28);
+    /// JVM `ACC_STATIC` (Java static methods/fields recovered from classfiles).
+    pub const STATIC: Flags = Flags(1 << 29);
+    /// JVM `ACC_NATIVE` (`@native` methods).
+    pub const NATIVE: Flags = Flags(1 << 30);
 
     pub fn contains(self, f: Flags) -> bool {
         self.0 & f.0 != 0

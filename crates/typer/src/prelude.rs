@@ -462,6 +462,7 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
         ("noinline", "scala/noinline"),
         ("volatile", "scala/volatile"),
         ("transient", "scala/transient"),
+        ("native", "scala/native"),
     ] {
         let _ = abs_class(st, st.scala_pkg, name, jvm, &[static_t.clone()]);
     }

@@ -2,8 +2,8 @@
 
 use crate::classfile::{
     encode_method_name, ClassEmit, EmittedClass, Field, Method, Pool, ACC_ABSTRACT, ACC_BRIDGE,
-    ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC,
-    ACC_TRANSIENT, ACC_VOLATILE,
+    ACC_FINAL, ACC_INTERFACE, ACC_NATIVE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER,
+    ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
 };
 use crate::code::Assembler;
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
@@ -418,6 +418,9 @@ fn checkcast_internal(st: &SymbolTable, ty: &Type) -> Option<String> {
 
 fn method_desc_from_sym(st: &SymbolTable, id: SymbolId) -> String {
     let s = st.get(id);
+    if s.jvm_name.starts_with('(') {
+        return s.jvm_name.clone();
+    }
     match &s.ty {
         Type::Method { paramss, ret } => {
             let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
@@ -770,11 +773,18 @@ fn field_access_flags(mods: Flags) -> u16 {
 }
 
 fn method_access_flags(mods: Flags) -> u16 {
-    if mods.contains(Flags::PRIVATE) {
+    let mut acc = if mods.contains(Flags::PRIVATE) {
         ACC_PRIVATE
     } else {
         ACC_PUBLIC
+    };
+    if mods.contains(Flags::NATIVE) {
+        acc |= ACC_NATIVE;
     }
+    if mods.contains(Flags::STATIC) {
+        acc |= ACC_STATIC;
+    }
+    acc
 }
 
 fn peel_fun(tree: &Tree) -> &Tree {
@@ -1370,6 +1380,13 @@ impl<'a> Gen<'a> {
         let desc = def_method_desc(self.st, def);
         let ret = method_ret_ty(def);
         let acc = method_access_flags(mods.flags);
+        if mods.flags.contains(Flags::NATIVE) {
+            b.add_abstract(acc, name, &desc);
+            if let Some(d) = java_deprecated_desc(mods) {
+                b.add_java_annot_to_last(d);
+            }
+            return;
+        }
         if rhs.is_empty() {
             b.add_abstract(acc | ACC_ABSTRACT, name, &desc);
             if let Some(d) = java_deprecated_desc(mods) {
@@ -2244,7 +2261,7 @@ impl<'a> Gen<'a> {
             if matches!(stt.kind, TreeKind::DefDef { .. }) {
                 self.emit_def(&mut b, cls, stt);
                 if let TreeKind::DefDef { name, mods, .. } = &stt.kind {
-                    if !mods.flags.contains(Flags::PRIVATE) {
+                    if !mods.flags.contains(Flags::PRIVATE) && !mods.flags.contains(Flags::NATIVE) {
                         forwarded.push((
                             name.clone(),
                             def_method_desc(self.st, stt),
@@ -3134,6 +3151,17 @@ fn gen_select(
         }
         match s.kind {
             SymKind::Term => {
+                if s.flags.contains(Flags::STATIC) {
+                    let owner = class_internal(ctx.st, s.owner);
+                    let desc = if !s.jvm_name.is_empty() && !s.jvm_name.starts_with('(') {
+                        s.jvm_name.clone()
+                    } else {
+                        jvm_desc(ctx.st, &s.ty)
+                    };
+                    asm.getstatic(&owner, &s.name, &desc);
+                    maybe_cast_erased_load(asm, ctx, &s.ty, &tree.ty);
+                    return;
+                }
                 gen_expr(asm, frame, ctx, qual);
                 checkcast_refined_receiver(asm, ctx, &qual.ty, tree.sym);
                 if is_trait_owned_term(ctx.st, tree.sym) {
@@ -3912,6 +3940,9 @@ fn value_extension_desc(st: &SymbolTable, id: SymbolId) -> String {
 }
 
 fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tree) {
+    if !fun.sym.is_none() && ctx.st.get(fun.sym).flags.contains(Flags::STATIC) {
+        return;
+    }
     match &fun.kind {
         TreeKind::Select { qual, .. } => {
             gen_expr(asm, frame, ctx, qual);
@@ -3947,6 +3978,11 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
     let owner = class_internal(ctx.st, owner_id);
     let name = s.name.as_str();
     let mut desc = method_desc_from_sym(ctx.st, id);
+    if s.flags.contains(Flags::STATIC) {
+        asm.invokestatic(&owner, name, &desc);
+        maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
+        return;
+    }
     if ctx.library_abi {
         if owner == "scala/reflect/ClassTag$" {
             let desc = match name {
@@ -6313,10 +6349,8 @@ fn gen_int_switch(
         }
         asm.tableswitch(def_lab, lo, hi, &table);
     } else {
-        let mut pairs: Vec<(i32, crate::code::Label)> = keys
-            .iter()
-            .map(|(k, i)| (*k, case_labs[*i]))
-            .collect();
+        let mut pairs: Vec<(i32, crate::code::Label)> =
+            keys.iter().map(|(k, i)| (*k, case_labs[*i])).collect();
         pairs.sort_by_key(|(k, _)| *k);
         asm.lookupswitch(def_lab, &pairs);
     }
@@ -6769,6 +6803,7 @@ mod tests {
                 fatal_warnings: false,
                 library_abi: true,
                 classpath: Vec::new(),
+                binary_path: Vec::new(),
                 language_features: Vec::new(),
             },
         );

@@ -340,7 +340,10 @@ object Main {
 "#,
         );
         let dump = dump_tree(&t);
-        assert!(dump.contains("AnnotatedType"), "expected @switch ascription: {dump}");
+        assert!(
+            dump.contains("AnnotatedType"),
+            "expected @switch ascription: {dump}"
+        );
         assert!(dump.contains("Match"), "{dump}");
     }
 
@@ -360,10 +363,15 @@ object Main {
         assert!(dump.contains("ValDef val x"), "early val x: {dump}");
         assert!(dump.contains("Ident T"), "parent T: {dump}");
         assert!(
-            dump.contains("Ident Either") && dump.contains("Ident Int") && dump.contains("Ident String"),
+            dump.contains("Ident Either")
+                && dump.contains("Ident Int")
+                && dump.contains("Ident String"),
             "infix Either: {dump}"
         );
-        assert!(dump.contains("Ident Map"), "Map[K, V] stays applied: {dump}");
+        assert!(
+            dump.contains("Ident Map"),
+            "Map[K, V] stays applied: {dump}"
+        );
         let r = parse_str(
             r#"
 trait T { val x: Int }
@@ -372,7 +380,9 @@ class Bad extends { def f = 1 } with T { val x = 1 }
         );
         assert!(
             has_errors(&r.diags)
-                && r.diags.iter().any(|d| d.message.contains("only concrete field definitions")),
+                && r.diags
+                    .iter()
+                    .any(|d| d.message.contains("only concrete field definitions")),
             "illegal early def: {:?}",
             r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
@@ -570,6 +580,7 @@ object M {
   @noinline def g(): Int = 2
   @volatile var x: Int = 0
   @transient var y: Int = 1
+  @native def n(): Int
 }
 "#,
         );
@@ -606,6 +617,13 @@ object M {
         match &find_member(&t, "y").expect("y").kind {
             TreeKind::ValDef { mods, .. } => {
                 assert!(mods.flags.contains(Flags::TRANSIENT), "{mods:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &find_member(&t, "n").expect("n").kind {
+            TreeKind::DefDef { mods, .. } => {
+                assert!(mods.flags.contains(Flags::NATIVE), "{mods:?}");
+                assert_eq!(mods.annotations[0].annotation_path(), "native");
             }
             other => panic!("{other:?}"),
         }

@@ -440,3 +440,128 @@ fn parse_field_ty(st: &SymbolTable, s: &str) -> (Type, usize) {
         _ => (Type::Any, 1),
     }
 }
+
+pub fn ensure_package(st: &mut SymbolTable, jvm: &str) -> SymbolId {
+    if jvm.is_empty() {
+        return st.root;
+    }
+    let mut cur = st.root;
+    let mut sofar = String::new();
+    for part in jvm.split('/') {
+        if !sofar.is_empty() {
+            sofar.push('/');
+        }
+        sofar.push_str(part);
+        if let Some(id) = st
+            .lookup_member(cur, part)
+            .into_iter()
+            .find(|&s| st.get(s).kind == SymKind::Package)
+        {
+            cur = id;
+            continue;
+        }
+        if cur == st.root {
+            if let Some(id) = st
+                .lookup(part)
+                .into_iter()
+                .find(|&s| st.get(s).kind == SymKind::Package)
+            {
+                cur = id;
+                continue;
+            }
+        }
+        let id = st.alloc(part, cur, SymKind::Package, Flags::PACKAGE, &sofar);
+        if cur == st.root {
+            st.enter_in_current(part, id);
+        }
+        cur = id;
+    }
+    cur
+}
+
+pub fn install_java_class(st: &mut SymbolTable, c: &crate::javaclass::JavaClass) -> SymbolId {
+    let simple = c
+        .internal_name
+        .rsplit('/')
+        .next()
+        .unwrap_or(&c.internal_name)
+        .rsplit('$')
+        .next()
+        .unwrap_or(&c.internal_name)
+        .to_string();
+    let pkg = c
+        .internal_name
+        .rsplit_once('/')
+        .map(|(p, _)| p)
+        .unwrap_or("");
+    let owner = ensure_package(st, pkg);
+    if let Some(id) = st
+        .lookup_member(owner, &simple)
+        .into_iter()
+        .find(|&s| st.get(s).is_class_like())
+    {
+        fill_java_members(st, id, c);
+        return id;
+    }
+    let mut flags = Flags::JAVA;
+    if crate::javaclass::is_java_interface(c.access) {
+        flags = flags.with(Flags::INTERFACE).with(Flags::ABSTRACT);
+    }
+    let id = st.alloc(&simple, owner, SymKind::Class, flags, &c.internal_name);
+    st.get_mut(id).ty = Type::Class {
+        sym: id,
+        args: vec![],
+    };
+    st.get_mut(id).parents = vec![Type::AnyRef];
+    if owner == st.root {
+        st.enter_in_current(&simple, id);
+    }
+    fill_java_members(st, id, c);
+    id
+}
+
+fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass::JavaClass) {
+    for m in &c.methods {
+        if has_method_desc(st, owner, &m.name, &m.desc) {
+            continue;
+        }
+        let (params, ret) = parse_method_desc(st, &m.desc);
+        let names: Vec<String> = (0..params.len()).map(|i| format!("x${i}")).collect();
+        let mut flags = Flags::JAVA;
+        if crate::javaclass::is_java_static(m.access) {
+            flags = flags.with(Flags::STATIC);
+        }
+        if crate::javaclass::is_java_abstract(m.access) {
+            flags = flags.with(Flags::ABSTRACT);
+        }
+        if m.name == "<init>" {
+            flags = flags.with(Flags::CONSTRUCTOR);
+        }
+        let id = add_method_types(st, owner, &m.name, names, params, ret);
+        st.get_mut(id).flags = flags;
+        st.get_mut(id).jvm_name = m.desc.clone();
+    }
+    for f in &c.fields {
+        if st
+            .lookup_member(owner, &f.name)
+            .iter()
+            .any(|&id| st.get(id).kind == SymKind::Term)
+        {
+            continue;
+        }
+        let ty = parse_field_ty(st, &f.desc).0;
+        let mut flags = Flags::JAVA;
+        if crate::javaclass::is_java_static(f.access) {
+            flags = flags.with(Flags::STATIC);
+        }
+        let id = add_term(st, owner, &f.name, ty);
+        st.get_mut(id).flags = flags;
+        st.get_mut(id).jvm_name = f.desc.clone();
+    }
+}
+
+fn has_method_desc(st: &SymbolTable, owner: SymbolId, name: &str, desc: &str) -> bool {
+    st.lookup_member(owner, name)
+        .iter()
+        .any(|&id| st.get(id).kind == SymKind::Method && st.get(id).jvm_name == desc)
+}

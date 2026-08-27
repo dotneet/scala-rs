@@ -9,6 +9,7 @@ pub const ACC_STATIC: u16 = 0x0008;
 pub const ACC_FINAL: u16 = 0x0010;
 pub const ACC_SUPER: u16 = 0x0020;
 pub const ACC_INTERFACE: u16 = 0x0200;
+pub const ACC_NATIVE: u16 = 0x0100;
 pub const ACC_ABSTRACT: u16 = 0x0400;
 pub const ACC_BRIDGE: u16 = 0x0040;
 /// Field flag (same bit as [`ACC_BRIDGE`] on methods).
@@ -400,10 +401,7 @@ impl ClassEmit {
         } else {
             None
         };
-        let sig_utf8 = self
-            .scala_signature
-            .as_deref()
-            .map(|s| pool.utf8(s));
+        let sig_utf8 = self.scala_signature.as_deref().map(|s| pool.utf8(s));
         let method_rva = if self.methods.iter().any(|m| !m.java_annots.is_empty()) {
             Some(pool.utf8("RuntimeVisibleAnnotations"))
         } else {
@@ -467,7 +465,9 @@ impl ClassEmit {
                 out.extend_from_slice(&body);
             }
             if !annots.is_empty() {
-                let rva = method_rva.or(rva_attr).expect("RuntimeVisibleAnnotations utf8");
+                let rva = method_rva
+                    .or(rva_attr)
+                    .expect("RuntimeVisibleAnnotations utf8");
                 let mut body = Vec::new();
                 body.extend_from_slice(&(annots.len() as u16).to_be_bytes());
                 for ty in annots {
