@@ -9002,6 +9002,15 @@ fn gen_try(
         asm.mark(catch_start);
         if unit {
             gen_stat(asm, frame, ctx, &c.body);
+        } else if is_unit_like(&c.body.ty) {
+            // `try { resources(...) /* Int */ } catch { println }` — nsc LUBs
+            // to Any in statement position. We keep the try's type and fill
+            // a default so the catch does not istore from an empty stack.
+            gen_stat(asm, frame, ctx, &c.body);
+            push_default(asm, result_ty);
+            if let Some(slot) = result_slot {
+                store(asm, slot, sel_sort);
+            }
         } else {
             gen_expr(asm, frame, ctx, &c.body);
             if let Some(slot) = result_slot {
