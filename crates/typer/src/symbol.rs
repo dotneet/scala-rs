@@ -376,6 +376,38 @@ impl SymbolTable {
         subst_map(ty, &tps, args)
     }
 
+    /// Use-site view of a type member: keep higher-kinded aliases as constructors
+    /// (`type F[X] = Id[X]` stays `TypeMember` until applied as `F[Int]`).
+    pub fn type_member_as_seen(&self, id: SymbolId) -> Type {
+        if !self.get(id).tparams.is_empty() {
+            Type::TypeMember(id)
+        } else {
+            match self.get(id).ty.clone() {
+                Type::NoType | Type::Error | Type::TypeMember(_) => Type::TypeMember(id),
+                other => other,
+            }
+        }
+    }
+
+    /// `F[Int]` where `type F[X] = Id[X]` → `Id[Int]`. Abstract `type F[_]` stays applied.
+    pub fn expand_applied_hk_alias(&self, ty: Type) -> Type {
+        match &ty {
+            Type::Applied { ctor, args } => {
+                if let Type::TypeMember(id) = ctor.as_ref() {
+                    let info = self.get(*id);
+                    if !info.tparams.is_empty()
+                        && info.tparams.len() == args.len()
+                        && !matches!(&info.ty, Type::NoType | Type::Error | Type::TypeMember(_))
+                    {
+                        return self.subst_tparams(*id, args, &info.ty);
+                    }
+                }
+                ty
+            }
+            _ => ty,
+        }
+    }
+
     /// Remaining kind arity: 0 is a proper type (`*`), 1 is `* -> *`, etc.
     pub fn kind_arity(&self, ty: &Type) -> usize {
         match ty {
@@ -897,6 +929,9 @@ impl SymbolTable {
                 let name = self.get(*id).name.clone();
                 for m in self.lookup_member(from, &name) {
                     if self.get(m).kind == SymKind::TypeMember {
+                        if !self.get(m).tparams.is_empty() {
+                            return Type::TypeMember(m);
+                        }
                         let t = self.get(m).ty.clone();
                         if matches!(t, Type::TypeMember(_) | Type::NoType | Type::Error) {
                             return Type::TypeMember(m);
@@ -913,12 +948,15 @@ impl SymbolTable {
                     .map(|a| self.expand_type_members(from, a))
                     .collect(),
             },
-            Type::Applied { ctor, args } => apply_type_ctor(
-                self.expand_type_members(from, ctor),
-                args.iter()
-                    .map(|a| self.expand_type_members(from, a))
-                    .collect(),
-            ),
+            Type::Applied { ctor, args } => {
+                let applied = apply_type_ctor(
+                    self.expand_type_members(from, ctor),
+                    args.iter()
+                        .map(|a| self.expand_type_members(from, a))
+                        .collect(),
+                );
+                self.expand_applied_hk_alias(applied)
+            }
             Type::Array(t) => Type::Array(Box::new(self.expand_type_members(from, t))),
             Type::Function { params, ret } => Type::Function {
                 params: params
@@ -1096,6 +1134,9 @@ impl SymbolTable {
         let found = self.lookup_member(cls, name);
         for m in found {
             if self.get(m).kind == SymKind::TypeMember {
+                if !self.get(m).tparams.is_empty() {
+                    return Some(self.expand_in_type(ty, &Type::TypeMember(m)));
+                }
                 let rhs = self.get(m).ty.clone();
                 return Some(match rhs {
                     Type::NoType | Type::Error | Type::TypeMember(_) => {
@@ -1370,12 +1411,15 @@ fn subst_refine_aliases(st: &SymbolTable, decls: &[RefineDecl], ty: &Type) -> Ty
                 .map(|a| subst_refine_aliases(st, decls, a))
                 .collect(),
         },
-        Type::Applied { ctor, args } => apply_type_ctor(
-            subst_refine_aliases(st, decls, ctor),
-            args.iter()
-                .map(|a| subst_refine_aliases(st, decls, a))
-                .collect(),
-        ),
+        Type::Applied { ctor, args } => {
+            let applied = apply_type_ctor(
+                subst_refine_aliases(st, decls, ctor),
+                args.iter()
+                    .map(|a| subst_refine_aliases(st, decls, a))
+                    .collect(),
+            );
+            st.expand_applied_hk_alias(applied)
+        }
         Type::Array(t) => Type::Array(Box::new(subst_refine_aliases(st, decls, t))),
         Type::Function { params, ret } => Type::Function {
             params: params

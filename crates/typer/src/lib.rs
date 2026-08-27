@@ -1998,11 +1998,152 @@ object Main {
     }
 
     #[test]
-    fn higher_kinded_type_member_is_diagnosed() {
-        let (_, _, diags) = typecheck_str("trait T { type F[_] }\n");
+    fn higher_kinded_type_member_and_path_dependent_app() {
+        ok(r#"
+class Id[A](val value: A)
+trait M { type F[_] }
+class C extends M {
+  type F[X] = Id[X]
+  def wrap(x: Int): F[Int] = new Id(x)
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val c = new C
+    val x: c.F[Int] = c.wrap(41)
+    val n: Int = x.value
+    val y: c.F[Int] = new Id(2)
+    val m: Int = y.value
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn higher_kinded_type_member_kind_mismatch() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait M { type F[_] }
+class C extends M { type F = Int }
+object Main {
+  def asProper(m: M)(x: m.F): Unit = ()
+  def main(args: Array[String]): Unit = ()
+}
+"#,
+        );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("unimplemented")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("type parameters") || d.message.contains("kind")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn class_context_bounds_desugar() {
+        ok(r#"
+trait Ord[T] {
+  def compare(x: T, y: T): Int
+}
+object Ord {
+  implicit val oi: Ord[Int] = new Ord[Int] {
+    def compare(x: Int, y: Int): Int = x - y
+  }
+}
+class C[T: Ord](val x: T)
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = new C(2).x
+  }
+}
+"#);
+        let jar = std::path::PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+        if jar.is_file() {
+            let (t, _, diags) = typecheck_str_opts(
+                r#"
+import scala.math.Ordering
+class C[T: Ordering](val x: T)
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = new C(2).x
+  }
+}
+"#,
+                &TypecheckOptions {
+                    fatal_warnings: false,
+                    library_abi: true,
+                    classpath: Vec::new(),
+                    binary_path: vec![jar],
+                    language_features: Vec::new(),
+                },
+            );
+            let _ = t;
+            assert!(
+                !has_errors(&diags),
+                "class C[T: Ordering] must typecheck against scala-library: {:?}",
+                diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn class_context_bounds_missing_evidence() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait Show[T]
+class C[T: Show](val x: T)
+object Main {
+  def main(args: Array[String]): Unit = {
+    val c = new C(1)
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("no implicit")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trait_context_bounds_are_error() {
+        let (_, _, diags) = typecheck_str("trait T[A: Ordering]\n");
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d
+                .message
+                .contains("traits cannot have type parameters with context bounds")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hk_view_bounds_are_diagnosed() {
+        let (_, _, diags) = typecheck_str("class D[F[_] <% Ordered[_]]\n");
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("takes type parameters")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def f[F[_] <% Ordered[_]](x: Int): Int = x
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("takes type parameters")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );

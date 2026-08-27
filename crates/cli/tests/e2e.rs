@@ -692,8 +692,13 @@ fn fixtures_variance_bad_is_error() {
 }
 
 #[test]
-fn fixtures_type_member_hk_is_error() {
-    compile_fails("type_member_hk", "unimplemented");
+fn fixtures_type_member_hk() {
+    check("type_member_hk");
+}
+
+#[test]
+fn fixtures_type_member_hk_bad_is_error() {
+    compile_fails("type_member_hk_bad", "type parameters");
 }
 
 #[test]
@@ -981,6 +986,24 @@ fn aux_ctor_verifies() {
 #[test]
 fn fixtures_context_bounds_bad_is_error() {
     compile_fails("context_bounds_bad", "no implicit");
+}
+
+#[test]
+fn fixtures_context_bounds_class_bad_is_error() {
+    compile_fails("context_bounds_class_bad", "no implicit");
+}
+
+#[test]
+fn fixtures_trait_context_bounds_is_error() {
+    compile_fails(
+        "trait_context_bounds",
+        "traits cannot have type parameters with context bounds",
+    );
+}
+
+#[test]
+fn fixtures_hk_view_bounds_is_error() {
+    compile_fails("hk_view_bounds", "takes type parameters");
 }
 
 #[test]
@@ -1299,6 +1322,16 @@ fn scala_library_dual_run_classtag() {
 #[test]
 fn scala_library_dual_run_context_bounds() {
     dual_run_fixture("context_bounds");
+}
+
+#[test]
+fn scala_library_dual_run_context_bounds_class() {
+    dual_run_fixture("context_bounds_class");
+}
+
+#[test]
+fn scala_library_dual_run_type_member_hk() {
+    dual_run_fixture("type_member_hk");
 }
 
 #[test]
