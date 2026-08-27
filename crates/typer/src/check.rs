@@ -1246,7 +1246,7 @@ impl Typer {
             ),
             _ => return,
         };
-        if has_bounds {
+        if has_bounds && !has_tparams {
             self.error(
                 span,
                 "unimplemented type: bounded type members (`type A <: T` / `type A >: T`)",
@@ -1258,17 +1258,48 @@ impl Typer {
             return;
         }
         if has_tparams {
-            let ty = if let TreeKind::TypeDef { tparams, rhs, .. } = &mut tree.kind {
+            let ty = if let TreeKind::TypeDef {
+                tparams,
+                rhs,
+                lo,
+                hi,
+                ..
+            } = &mut tree.kind
+            {
                 self.st.push_scope();
                 let tp_ids = self.enter_tparams(tparams, type_member_id);
                 if !type_member_id.is_none() {
                     self.st.get_mut(type_member_id).tparams = tp_ids;
+                }
+                let lo_ty = lo.as_ref().map(|t| self.tree_to_type(t));
+                let hi_ty = hi.as_ref().map(|t| self.tree_to_type(t));
+                if let Some(t) = &lo_ty {
+                    self.check_proper_type(t, span);
+                }
+                if let Some(t) = &hi_ty {
+                    self.check_proper_type(t, span);
+                }
+                if !type_member_id.is_none() {
+                    self.st.get_mut(type_member_id).bound_lo = lo_ty;
+                    self.st.get_mut(type_member_id).bound_hi = hi_ty.clone();
                 }
                 let ty = if rhs.is_empty() {
                     Type::TypeMember(type_member_id)
                 } else {
                     let rhs_ty = self.tree_to_type(rhs);
                     self.check_proper_type(&rhs_ty, span);
+                    if let Some(h) = &hi_ty {
+                        if !rhs_ty.is_error() && !self.st.is_sub_type(&rhs_ty, h) {
+                            self.error(
+                                span,
+                                format!(
+                                    "incompatible type in overriding: {} does not conform to {}",
+                                    self.st.display_type(&rhs_ty),
+                                    self.st.display_type(h)
+                                ),
+                            );
+                        }
+                    }
                     rhs_ty
                 };
                 self.st.pop_scope();
@@ -1333,6 +1364,27 @@ impl Typer {
                                 "illegal inheritance: type member {name} has incompatible kinds (child takes {child_arity} type parameters, parent takes {parent_arity})"
                             ),
                         );
+                    } else if let Some(phi) = self.st.get(m).bound_hi.clone() {
+                        let child_ty = self.st.get(mid).ty.clone();
+                        let child_hi = self.st.get(mid).bound_hi.clone();
+                        let ok = if matches!(&child_ty, Type::TypeMember(id) if *id == mid) {
+                            child_hi
+                                .as_ref()
+                                .map(|h| self.st.is_sub_type(h, &phi))
+                                .unwrap_or(false)
+                        } else {
+                            self.st.is_sub_type(&child_ty, &phi)
+                        };
+                        if !ok && !child_ty.is_error() && !phi.is_error() {
+                            self.error(
+                                span,
+                                format!(
+                                    "incompatible type in overriding type {name}: {} does not conform to {}",
+                                    self.st.display_type(&child_ty),
+                                    self.st.display_type(&phi)
+                                ),
+                            );
+                        }
                     }
                     break;
                 }
@@ -6287,33 +6339,49 @@ impl Typer {
             }
             self.error(
                 span,
-                format!("type {} has no member {name}", self.st.display_type(prefix)),
+                format!(
+                    "type {name} is not a member of {}",
+                    self.st.display_type(prefix)
+                ),
             );
             return Type::Error;
         }
         let cls = match prefix {
-            Type::Class { sym, .. } | Type::ModuleRef(sym) => *sym,
-            Type::TypeMember(_) => {
-                self.error(span, "unimplemented type: nested type projections");
-                return Type::Error;
-            }
-            Type::Named { name: n, .. } => match self.resolve_type_name(n, &[]) {
-                Type::Class { sym, .. } | Type::ModuleRef(sym) => sym,
-                _ => {
-                    self.error(span, format!("cannot project #{name} from {n}"));
+            Type::TypeMember(id) => {
+                if !self.st.get(*id).tparams.is_empty() {
+                    let n = self.st.get(*id).name.clone();
+                    self.error(span, format!("type {n} takes type parameters"));
                     return Type::Error;
                 }
-            },
-            other => {
+                let seen = self.st.type_member_as_seen(*id);
+                if !matches!(seen, Type::TypeMember(_)) {
+                    return self.project_from_prefix(span, &seen, name);
+                }
+                if let Some(hi) = self.st.get(*id).bound_hi.clone() {
+                    return self.project_from_prefix(span, &hi, name);
+                }
                 self.error(
                     span,
                     format!(
-                        "cannot project #{name} from {}",
-                        self.st.display_type(other)
+                        "type {name} is not a member of {}",
+                        self.st.display_type(prefix)
                     ),
                 );
                 return Type::Error;
             }
+            other => match self.st.class_sym_of(other) {
+                Some(sym) => sym,
+                None => {
+                    self.error(
+                        span,
+                        format!(
+                            "type {name} is not a member of {}",
+                            self.st.display_type(other)
+                        ),
+                    );
+                    return Type::Error;
+                }
+            },
         };
         let mut found = self.st.lookup_member(cls, name);
         found.sort_by_key(|s| if self.st.get(*s).owner == cls { 0 } else { 1 });
@@ -6330,7 +6398,10 @@ impl Typer {
         }
         self.error(
             span,
-            format!("type {} has no member {name}", self.st.display_type(prefix)),
+            format!(
+                "type {name} is not a member of {}",
+                self.st.display_type(prefix)
+            ),
         );
         Type::Error
     }
@@ -6561,34 +6632,18 @@ impl Typer {
         }
         let mut decls = Vec::new();
         let mut ok = true;
+        self.st.push_scope();
+        for r in refinements {
+            if let TreeKind::TypeDef { .. } = &r.kind {
+                match self.refinement_type_member(r) {
+                    Some(d) => decls.push(d),
+                    None => ok = false,
+                }
+            }
+        }
         for r in refinements {
             match &r.kind {
-                TreeKind::TypeDef {
-                    name,
-                    tparams,
-                    rhs,
-                    lo,
-                    hi,
-                    ..
-                } => {
-                    if !tparams.is_empty() || lo.is_some() || hi.is_some() {
-                        self.error(
-                            r.span,
-                            "unimplemented type: bounded or higher-kinded refinement type member",
-                        );
-                        ok = false;
-                        continue;
-                    }
-                    let alias = if rhs.is_empty() {
-                        None
-                    } else {
-                        Some(self.tree_to_type(rhs))
-                    };
-                    decls.push(scala_rs_parser::RefineDecl::Type {
-                        name: name.clone(),
-                        rhs: alias,
-                    });
-                }
+                TreeKind::TypeDef { .. } => {}
                 TreeKind::DefDef {
                     name,
                     tparams,
@@ -6660,11 +6715,99 @@ impl Typer {
                 }
             }
         }
+        self.st.pop_scope();
         if !ok {
             return Type::Error;
         }
         let _ = span;
         Type::Refined { parents: ps, decls }
+    }
+
+    /// Type a refinement `type` member, including HK `type F[_]` / `type F[X] = Id[X]`
+    /// and bounded `type A <: T`. Nullary class/trait `type A <: T` stays unimplemented.
+    fn refinement_type_member(&mut self, r: &Tree) -> Option<scala_rs_parser::RefineDecl> {
+        let TreeKind::TypeDef {
+            name,
+            tparams,
+            rhs,
+            lo,
+            hi,
+            ..
+        } = &r.kind
+        else {
+            return None;
+        };
+        let hk = !tparams.is_empty();
+        let bounded = lo.is_some() || hi.is_some();
+        if !hk && !bounded {
+            let alias = if rhs.is_empty() {
+                None
+            } else {
+                Some(self.tree_to_type(rhs))
+            };
+            let id = self
+                .st
+                .alloc(name, SymbolId::NONE, SymKind::TypeMember, Flags::EMPTY, "");
+            if let Some(t) = &alias {
+                self.st.get_mut(id).ty = t.clone();
+            } else {
+                self.st.get_mut(id).ty = Type::TypeMember(id);
+            }
+            self.st.enter_in_current(name, id);
+            return Some(scala_rs_parser::RefineDecl::Type {
+                name: name.clone(),
+                rhs: alias,
+                tparams: 0,
+                lo: None,
+                hi: None,
+            });
+        }
+        let id = self
+            .st
+            .alloc(name, SymbolId::NONE, SymKind::TypeMember, Flags::EMPTY, "");
+        self.st.enter_in_current(name, id);
+        self.st.push_scope();
+        let mut tps = tparams.clone();
+        let tp_ids = self.enter_tparams(&mut tps, id);
+        self.st.get_mut(id).tparams = tp_ids;
+        let lo_ty = lo.as_ref().map(|t| self.tree_to_type(t));
+        let hi_ty = hi.as_ref().map(|t| self.tree_to_type(t));
+        if let Some(t) = &lo_ty {
+            self.check_proper_type(t, r.span);
+        }
+        if let Some(t) = &hi_ty {
+            self.check_proper_type(t, r.span);
+        }
+        self.st.get_mut(id).bound_lo = lo_ty.clone();
+        self.st.get_mut(id).bound_hi = hi_ty.clone();
+        let rhs_ty = if rhs.is_empty() {
+            Type::TypeMember(id)
+        } else {
+            let t = self.tree_to_type(rhs);
+            self.check_proper_type(&t, r.span);
+            if let Some(h) = &hi_ty {
+                if !t.is_error() && !self.st.is_sub_type(&t, h) {
+                    self.error(
+                        r.span,
+                        format!(
+                            "incompatible type: {} does not conform to {}",
+                            self.st.display_type(&t),
+                            self.st.display_type(h)
+                        ),
+                    );
+                }
+            }
+            t
+        };
+        self.st.get_mut(id).ty = rhs_ty;
+        self.st.pop_scope();
+        Some(scala_rs_parser::RefineDecl::Type {
+            name: name.clone(),
+            rhs: Some(Type::TypeMember(id)),
+            tparams: tparams.len(),
+            lo: lo_ty,
+            hi: hi_ty,
+        })
     }
 
     fn is_non_trait_class_type(&self, ty: &Type) -> bool {
@@ -7113,6 +7256,22 @@ impl Typer {
         self.complete_java_type(&tree.ty, tree.span);
         self.complete_java_type(pt, tree.span);
         if self.st.is_sub_type(&tree.ty, pt) {
+            // `b.x` with `{ type A <: Int }` stays a TypeMember; pin it to the
+            // expected primitive so erasure inserts the same unbox as `Bar#A`.
+            if matches!(&tree.ty, Type::TypeMember(_))
+                && matches!(
+                    pt,
+                    Type::Int
+                        | Type::Long
+                        | Type::Float
+                        | Type::Double
+                        | Type::Boolean
+                        | Type::Char
+                        | Type::Unit
+                )
+            {
+                tree.ty = pt.clone();
+            }
             return;
         }
         if self.adapt_singleton(tree, pt) {

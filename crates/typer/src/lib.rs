@@ -2150,6 +2150,153 @@ object Main {
     }
 
     #[test]
+    fn higher_kinded_refinement_type_member() {
+        ok(r#"
+class Id[A](val value: A)
+trait M { type F[_]; def wrap(x: Int): F[Int] }
+class C extends M {
+  type F[X] = Id[X]
+  def wrap(x: Int): F[Int] = new Id(x)
+}
+object Main {
+  def use(m: M { type F[X] = Id[X] }): Int = m.wrap(41).value
+  def main(args: Array[String]): Unit = {
+    val n: Int = use(new C)
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait M { type F[_] }
+object Main {
+  def asProper(m: M { type F[_] })(x: m.F): Unit = ()
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("takes type parameters")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bounded_refinement_and_hk_bounded_member() {
+        ok(r#"
+trait Bound
+class Id[A](val value: A) extends Bound
+trait Box { type A; def x: A }
+class IntBox extends Box { type A = Int; def x: A = 41 }
+trait M { type F[_] <: Bound; def wrap(x: Int): F[Int] }
+class C extends M {
+  type F[X] = Id[X]
+  def wrap(x: Int): F[Int] = new Id(x)
+}
+object Main {
+  def get(b: Box { type A <: Int }): Int = b.x
+  def main(args: Array[String]): Unit = {
+    val n: Int = get(new IntBox)
+    val m: Int = new C().wrap(2).value
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait Box { type A; def x: A }
+class StrBox extends Box { type A = String; def x: A = "hi" }
+object Main {
+  def get(b: Box { type A <: Int }): Int = b.x
+  def main(args: Array[String]): Unit = {
+    val b: Box { type A <: Int } = new StrBox
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("type mismatch")
+                    || d.message.contains("does not conform")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait Bound
+trait M { type F[_] <: Bound }
+class C extends M { type F[X] = Int }
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("incompatible")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait M { type F[_] <: List }
+object Main { def main(args: Array[String]): Unit = () }
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("takes type parameters")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn nested_type_projections() {
+        ok(r#"
+class Outer {
+  class Inner {
+    type X = Int
+    def n: X = 41
+  }
+  def inner: Inner = new Inner
+}
+trait A { type T }
+class AI extends A { type T = Int }
+class Holder { type Inner = AI }
+object Main {
+  def fromClass(x: Outer#Inner#X): Int = x
+  def fromAlias(x: Holder#Inner#T): Int = x
+  def main(args: Array[String]): Unit = {
+    val a: Int = fromClass(new Outer().inner.n)
+    val b: Int = fromAlias(2)
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str("object Main { def bad: Int#X = 1 }\n");
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait B { type U }
+object Main { def f(x: B#U#T): Int = 1 }
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn f_and_raw_interpolators_typecheck() {
         ok(r#"
 object Main {
