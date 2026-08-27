@@ -87,6 +87,10 @@ pub struct Symbol {
     pub private_within: Option<String>,
     /// Language annotations (`@deprecated(...)`, `@tailrec`, …) copied from modifiers.
     pub annotations: Vec<scala_rs_parser::Tree>,
+    /// Lower bound of an abstract/HK type member (`type F[_] >: Lo`).
+    pub bound_lo: Option<Type>,
+    /// Upper bound of an abstract/HK type member (`type F[_] <: Hi`).
+    pub bound_hi: Option<Type>,
 }
 
 impl Symbol {
@@ -166,6 +170,8 @@ impl SymbolTable {
                 self_type: None,
                 private_within: None,
                 annotations: vec![],
+                bound_lo: None,
+                bound_hi: None,
             }],
             scopes: vec![Scope::default()],
             root: SymbolId(0),
@@ -232,6 +238,8 @@ impl SymbolTable {
             self_type: None,
             private_within: None,
             annotations: vec![],
+            bound_lo: None,
+            bound_hi: None,
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {
@@ -320,7 +328,22 @@ impl SymbolTable {
                 .find(|s| self.get(*s).is_class_like()),
             Type::TypeParam(_) => None,
             Type::Applied { ctor, .. } => self.class_sym_of(ctor),
-            Type::TypeMember(_) => None,
+            Type::TypeMember(id) => {
+                if !self.get(*id).tparams.is_empty() {
+                    None
+                } else {
+                    let seen = self.type_member_as_seen(*id);
+                    if matches!(&seen, Type::TypeMember(x) if *x == *id) {
+                        self.get(*id)
+                            .bound_hi
+                            .clone()
+                            .as_ref()
+                            .and_then(|h| self.class_sym_of(h))
+                    } else {
+                        self.class_sym_of(&seen)
+                    }
+                }
+            }
             Type::Wildcard | Type::BoundedWildcard { .. } => Some(self.any_sym),
             Type::ThisType(sym) => Some(*sym),
             Type::Constant(lit) => self.class_sym_of(&Type::lit_underlying(lit)),
@@ -664,7 +687,12 @@ impl SymbolTable {
             }
             (Type::Applied { ctor, args }, other) => {
                 let folded = apply_type_ctor((**ctor).clone(), args.clone());
-                if matches!(folded, Type::Applied { .. }) {
+                if let Type::Applied { ctor, .. } = &folded {
+                    if let Type::TypeMember(id) = ctor.as_ref() {
+                        if let Some(hi) = self.get(*id).bound_hi.clone() {
+                            return self.is_sub_type(&hi, other);
+                        }
+                    }
                     false
                 } else {
                     self.is_sub_type(&folded, other)
@@ -739,8 +767,15 @@ impl SymbolTable {
                 .any(|p| self.is_sub_type(p, b)),
             (Type::TypeParam(a), Type::TypeParam(b)) if a == b => true,
             (Type::TypeMember(a), Type::TypeMember(b)) if a == b => true,
+            (Type::TypeMember(id), b) => {
+                if let Some(hi) = self.get(*id).bound_hi.clone() {
+                    if self.is_sub_type(&hi, b) {
+                        return true;
+                    }
+                }
+                matches!(b, Type::AnyRef | Type::AnyVal | Type::Any)
+            }
             (Type::TypeParam(_), Type::AnyRef | Type::AnyVal) => true,
-            (Type::TypeMember(_), Type::AnyRef | Type::AnyVal) => true,
             (Type::ThisType(s), b) => {
                 if matches!(b, Type::ThisType(t) if t == s) {
                     true
@@ -1058,7 +1093,7 @@ impl SymbolTable {
                     });
                 }
                 RefineDecl::Val { name: n, ty } if n == name => return Some(ty.clone()),
-                RefineDecl::Type { name: n, rhs } if n == name => {
+                RefineDecl::Type { name: n, rhs, .. } if n == name => {
                     return Some(rhs.clone().unwrap_or(Type::Named {
                         name: n.clone(),
                         args: vec![],
@@ -1079,12 +1114,55 @@ impl SymbolTable {
     fn conforms_to_refinement(&self, a: &Type, decls: &[RefineDecl]) -> bool {
         for d in decls {
             match d {
-                RefineDecl::Type { name, rhs } => {
+                RefineDecl::Type {
+                    name,
+                    rhs,
+                    tparams,
+                    hi,
+                    ..
+                } => {
                     let Some(have) = self.lookup_type_member_on(a, name) else {
                         return false;
                     };
+                    if *tparams > 0 && self.kind_arity(&have) != *tparams {
+                        return false;
+                    }
                     if let Some(want) = rhs {
-                        if !self.types_same_enough(&have, want) {
+                        // Abstract `{ type A <: T }` / `{ type F[_] }` store a
+                        // TypeMember placeholder; only aliases constrain equality.
+                        let abstract_placeholder = match want {
+                            Type::TypeMember(id) => matches!(
+                                &self.get(*id).ty,
+                                Type::TypeMember(_) | Type::NoType | Type::Error
+                            ),
+                            _ => false,
+                        };
+                        if !abstract_placeholder {
+                            if *tparams > 0 {
+                                let args: Vec<Type> = (0..*tparams).map(|_| Type::Int).collect();
+                                let have_app = self.expand_applied_hk_alias(apply_type_ctor(
+                                    have.clone(),
+                                    args.clone(),
+                                ));
+                                let want_app = self
+                                    .expand_applied_hk_alias(apply_type_ctor(want.clone(), args));
+                                if !self.types_same_enough(&have_app, &want_app) {
+                                    return false;
+                                }
+                            } else if !self.types_same_enough(&have, want) {
+                                return false;
+                            }
+                        }
+                    }
+                    if let Some(h) = hi {
+                        if *tparams > 0 {
+                            let args: Vec<Type> = (0..*tparams).map(|_| Type::Int).collect();
+                            let have_app =
+                                self.expand_applied_hk_alias(apply_type_ctor(have.clone(), args));
+                            if !self.is_sub_type(&have_app, h) {
+                                return false;
+                            }
+                        } else if !self.is_sub_type(&have, h) {
                             return false;
                         }
                     }
@@ -1343,9 +1421,18 @@ fn subst_map(ty: &Type, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> Typ
 
 fn expand_refine_decl(st: &SymbolTable, from: SymbolId, d: &RefineDecl) -> RefineDecl {
     match d {
-        RefineDecl::Type { name, rhs } => RefineDecl::Type {
+        RefineDecl::Type {
+            name,
+            rhs,
+            tparams,
+            lo,
+            hi,
+        } => RefineDecl::Type {
             name: name.clone(),
             rhs: rhs.as_ref().map(|t| st.expand_type_members(from, t)),
+            tparams: *tparams,
+            lo: lo.as_ref().map(|t| st.expand_type_members(from, t)),
+            hi: hi.as_ref().map(|t| st.expand_type_members(from, t)),
         },
         RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
             name: name.clone(),
@@ -1368,9 +1455,18 @@ fn subst_refine_decl(
     args: &[Type],
 ) -> RefineDecl {
     match d {
-        RefineDecl::Type { name, rhs } => RefineDecl::Type {
+        RefineDecl::Type {
+            name,
+            rhs,
+            tparams,
+            lo,
+            hi,
+        } => RefineDecl::Type {
             name: name.clone(),
             rhs: rhs.as_ref().map(|t| subst_map(t, tps, args)),
+            tparams: *tparams,
+            lo: lo.as_ref().map(|t| subst_map(t, tps, args)),
+            hi: hi.as_ref().map(|t| subst_map(t, tps, args)),
         },
         RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
             name: name.clone(),
@@ -1395,6 +1491,7 @@ fn subst_refine_aliases(st: &SymbolTable, decls: &[RefineDecl], ty: &Type) -> Ty
                 if let RefineDecl::Type {
                     name: n,
                     rhs: Some(rhs),
+                    ..
                 } = d
                 {
                     if n == &name {

@@ -707,6 +707,46 @@ fn fixtures_type_member_bounds_is_error() {
 }
 
 #[test]
+fn fixtures_refine_hk() {
+    check("refine_hk");
+}
+
+#[test]
+fn fixtures_refine_hk_bad_is_error() {
+    compile_fails("refine_hk_bad", "takes type parameters");
+}
+
+#[test]
+fn fixtures_refine_bound() {
+    check("refine_bound");
+}
+
+#[test]
+fn fixtures_refine_bound_bad_is_error() {
+    compile_fails("refine_bound_bad", "type mismatch");
+}
+
+#[test]
+fn fixtures_hk_bounded_bad_is_error() {
+    compile_fails("hk_bounded_bad", "incompatible");
+}
+
+#[test]
+fn fixtures_nested_proj() {
+    check("nested_proj");
+}
+
+#[test]
+fn fixtures_nested_proj_bad_is_error() {
+    compile_fails("nested_proj_bad", "is not a member");
+}
+
+#[test]
+fn fixtures_nested_proj_abs_bad_is_error() {
+    compile_fails("nested_proj_abs_bad", "is not a member");
+}
+
+#[test]
 fn fixtures_type_alias_cyclic_is_error() {
     compile_fails("type_alias_bad", "illegal cyclic reference");
 }
@@ -1332,6 +1372,21 @@ fn scala_library_dual_run_context_bounds_class() {
 #[test]
 fn scala_library_dual_run_type_member_hk() {
     dual_run_fixture("type_member_hk");
+}
+
+#[test]
+fn scala_library_dual_run_refine_hk() {
+    dual_run_fixture("refine_hk");
+}
+
+#[test]
+fn scala_library_dual_run_refine_bound() {
+    dual_run_fixture("refine_bound");
+}
+
+#[test]
+fn scala_library_dual_run_nested_proj() {
+    dual_run_fixture("nested_proj");
 }
 
 #[test]

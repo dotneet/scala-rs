@@ -426,6 +426,10 @@ pub enum RefineDecl {
     Type {
         name: String,
         rhs: Option<Type>,
+        /// Kind arity (`type F[_]` → 1). Zero for a proper type member.
+        tparams: usize,
+        lo: Option<Type>,
+        hi: Option<Type>,
     },
     Def {
         name: String,
@@ -441,8 +445,30 @@ pub enum RefineDecl {
 impl fmt::Display for RefineDecl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RefineDecl::Type { name, rhs } => {
+            RefineDecl::Type {
+                name,
+                rhs,
+                tparams,
+                lo,
+                hi,
+            } => {
                 write!(f, "type {name}")?;
+                if *tparams > 0 {
+                    write!(f, "[")?;
+                    for i in 0..*tparams {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "_")?;
+                    }
+                    write!(f, "]")?;
+                }
+                if let Some(t) = lo {
+                    write!(f, " >: {t}")?;
+                }
+                if let Some(t) = hi {
+                    write!(f, " <: {t}")?;
+                }
                 if let Some(t) = rhs {
                     write!(f, " = {t}")?;
                 }
