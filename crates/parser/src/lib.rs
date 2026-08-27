@@ -327,6 +327,31 @@ object Main {
     }
 
     #[test]
+    fn new_type_args_then_select_is_term() {
+        // nsc: `new Q[Int].enqueue(1)` is `(new Q[Int]).enqueue(1)`, not a
+        // type projection `Q[Int].enqueue`.
+        let t = parse_ok(
+            r#"
+class Q[+A] { def enqueue(x: A): Int = 1 }
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n = new Q[Int].enqueue(1)
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(
+            dump.contains("Select enqueue") && dump.contains("AppliedType"),
+            "expected term Select on new Q[Int], got {dump}"
+        );
+        assert!(
+            !dump.contains("SelectFromType .enqueue"),
+            "`.enqueue` after type args must not be a type path: {dump}"
+        );
+    }
+
+    #[test]
     fn singleton_compound_and_annotated_types_parse() {
         let t = parse_ok(
             r#"
@@ -688,13 +713,31 @@ object Main {
     }
 
     #[test]
-    fn xml_entity_ref_is_unimplemented() {
-        let r = parse_str("object M { val x = <a>&amp;</a> }\n");
+    fn xml_entities_desugar() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val a = <a>&amp;</a>
+    val b = <a>&#65;</a>
+    val c = <a>&#x42;</a>
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("EntityRef"), "expected EntityRef: {dump}");
+        assert!(dump.contains("amp"), "expected entity name amp: {dump}");
+    }
+
+    #[test]
+    fn xml_unknown_entity_is_unimplemented() {
+        let r = parse_str("object M { val x = <a>&notanentity;</a> }\n");
         assert!(
             r.diags
                 .iter()
-                .any(|d| d.message.contains("XML entity") || d.message.contains("XML")),
-            "expected XML entity diagnostic, got {:?}",
+                .any(|d| d.message.contains("XML entity") || d.message.contains("unknown")),
+            "expected unknown XML entity diagnostic, got {:?}",
             r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

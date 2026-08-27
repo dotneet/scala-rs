@@ -29,11 +29,11 @@
 //! - nested `List[_ <: List[_]]` pickles the inner wildcard as its own EXISTENTIALtpe hi bound (nsc `List[_ <: List[_]]`)
 //! - `A with B { def f: Int }` is `REFINEDtpe` + `<refinement>` CLASSsym (deferred members)
 //! - `this.type` results are `THIStpe` of the enclosing class
-//! - type annotations `T @unchecked` are `ANNOTATEDtpe` + `ANNOTINFO`
+//! - type annotations `T @unchecked` / `T @uncheckedVariance` are `ANNOTATEDtpe` + `ANNOTINFO`
 //! - annotation args that are string/int/boolean literals are Constants;
 //!   `classOf[T]` is `LITERALclass`; simple `Ident` / `Select` / `this` / `Apply`
 //!   args are `TREE` so scalac 2.13.16 can typecheck `@Ann(foo)` / `@Ann(this)` /
-//!   `@Ann(foo(1))` / `@Ann(classOf[Int])` on a method
+//!   `@Ann(foo(1))` / `@Ann(classOf[Int])` / `@Ann(foo = 1)` on a method
 //! - Java `@Deprecated` is `SYMANNOT` with `TypeRef` under `java.lang` (not skipped)
 //! - SIP-23 `1` in a signature is `CONSTANTtpe(LITERALint)` (nsc `writeLong` =
 //!   signed big-endian base 256)
@@ -730,10 +730,7 @@ impl<'a> Pickler<'a> {
             }
             Type::Annotated { tpe, annot } => {
                 let inner = self.pickle_type_pack(tpe, quantified);
-                let atp = {
-                    let sc = self.scala_module();
-                    self.type_ref_in(sc, annot)
-                };
+                let atp = self.pickle_type_annot_ref(annot);
                 let mut ab = Vec::new();
                 write_nat_to(&mut ab, atp);
                 let info = self.add(ANNOTINFO, ab);
@@ -931,7 +928,8 @@ impl<'a> Pickler<'a> {
     }
 
     /// Constant (literal / classOf) or TREE Ident/Select/This/Super/Apply.
-    /// Named annot args stay a hole.
+    /// Named `@Ann(foo = 1)` is pickled as the rhs Constant — nsc typer
+    /// rewrites it to positional `@Ann(1)` before pickling.
     fn pickle_annot_arg(&mut self, arg: &Tree, owner: SymbolId) -> Option<u32> {
         match &arg.kind {
             TreeKind::Literal { lit } => Some(self.pickle_literal(lit)),
@@ -940,6 +938,11 @@ impl<'a> Pickler<'a> {
             TreeKind::This { qual } => Some(self.pickle_this_tree(qual.as_deref(), owner)),
             TreeKind::Super { qual, mix } => {
                 Some(self.pickle_super_tree(qual.as_deref(), mix.as_deref(), owner))
+            }
+            TreeKind::Assign { lhs, rhs }
+                if matches!(&lhs.kind, TreeKind::Ident { .. }) =>
+            {
+                self.pickle_annot_arg(rhs, owner)
             }
             TreeKind::TypeApply { fun, args } if is_classof_fun(fun) => {
                 // nsc pickles annotation `classOf[T]` as LITERALclass Constant,
@@ -1281,6 +1284,21 @@ impl<'a> Pickler<'a> {
         self.this_tpes.get(&cls.0).copied().unwrap_or(self.noprefix)
     }
 
+    /// `T @unchecked` is `scala.unchecked`; `T @uncheckedVariance` is
+    /// `scala.annotation.unchecked.uncheckedVariance`.
+    fn pickle_type_annot_ref(&mut self, annot: &str) -> u32 {
+        let simple = annot.rsplit('.').next().unwrap_or(annot);
+        if simple == "uncheckedVariance" {
+            let sc = self.scala_module();
+            let ann = self.ext_mod("annotation", Some(sc));
+            let unc = self.ext_mod("unchecked", Some(ann));
+            self.type_ref_in(unc, "uncheckedVariance")
+        } else {
+            let sc = self.scala_module();
+            self.type_ref_in(sc, simple)
+        }
+    }
+
     fn pickle_term_ref(&mut self, id: SymbolId) -> u32 {
         if let Some(&i) = self.sym_index.get(&id.0) {
             return i;
@@ -1331,10 +1349,7 @@ impl<'a> Pickler<'a> {
             }
             Type::Annotated { tpe, annot } => {
                 let inner = self.pickle_type(tpe);
-                let atp = {
-                    let sc = self.scala_module();
-                    self.type_ref_in(sc, annot)
-                };
+                let atp = self.pickle_type_annot_ref(annot);
                 let mut ab = Vec::new();
                 write_nat_to(&mut ab, atp);
                 let info = self.add(ANNOTINFO, ab);
@@ -3154,6 +3169,40 @@ object Lib {
         assert!(
             saw_object_extref,
             "expected java.lang.Object as EXTREF (no flags field)"
+        );
+    }
+
+    #[test]
+    fn pickle_named_annot_arg_as_constant() {
+        // nsc typer rewrites `@Ann(foo = 1)` to positional `@Ann(1)` (LITERALint).
+        let src = r#"
+class Ann(x: Any) extends annotation.StaticAnnotation
+object Lib {
+  @Ann(foo = 1) def markedNamed: Int = 10
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let lib = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Lib" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("Lib module");
+        let cls = st.module_class_of(lib);
+        let raw = pickle_class(&st, cls);
+        let tags = pickle_tags(&raw);
+        assert!(
+            tags.contains(&LITERALint),
+            "expected LITERALint for @Ann(foo = 1) (nsc positional Constant), tags={tags:?}"
+        );
+        assert!(
+            tags.contains(&SYMANNOT),
+            "expected SYMANNOT for @Ann(foo = 1), tags={tags:?}"
         );
     }
 

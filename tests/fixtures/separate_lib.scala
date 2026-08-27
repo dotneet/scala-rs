@@ -36,6 +36,7 @@ object Lib {
   def ident(n: Int): Int = n
   @Ann(ident(1)) def markedApply: Int = 6
   @Ann(ident(ident(1))) def markedNest: Int = 9
+  @Ann(foo = 1) def markedNamed: Int = 10
   def join(xs: String*): Int = 0
 }
 trait MixA { def a: Int }

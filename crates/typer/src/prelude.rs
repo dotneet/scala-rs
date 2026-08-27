@@ -361,13 +361,30 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
         "scala/annotation/Annotation",
         &[Type::AnyRef],
     );
-    let _ = abs_class(
+    let static_annot = abs_class(
         st,
         pkg,
         "StaticAnnotation",
         "scala/annotation/StaticAnnotation",
         &[Type::Class {
             sym: annotation,
+            args: vec![],
+        }],
+    );
+    let unc_pkg = st.alloc(
+        "unchecked",
+        pkg,
+        SymKind::Package,
+        Flags::PACKAGE,
+        "scala/annotation/unchecked",
+    );
+    let _ = abs_class(
+        st,
+        unc_pkg,
+        "uncheckedVariance",
+        "scala/annotation/unchecked/uncheckedVariance",
+        &[Type::Class {
+            sym: static_annot,
             args: vec![],
         }],
     );
@@ -2517,6 +2534,15 @@ fn add_xml(st: &mut SymbolTable) {
     let text = class(st, xml, "Text", "scala/xml/Text", &[node_t.clone()]);
     let td = ctor_field(st, text, "data", Type::String);
     st.get_mut(text).ctor_fields = vec![td];
+    let eref = class(
+        st,
+        xml,
+        "EntityRef",
+        "scala/xml/EntityRef",
+        &[node_t.clone()],
+    );
+    let en = ctor_field(st, eref, "entityName", Type::String);
+    st.get_mut(eref).ctor_fields = vec![en];
     let comment = class(st, xml, "Comment", "scala/xml/Comment", &[node_t.clone()]);
     let ct = ctor_field(st, comment, "commentText", Type::String);
     st.get_mut(comment).ctor_fields = vec![ct];

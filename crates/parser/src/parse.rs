@@ -1766,8 +1766,15 @@ impl<'a> Parser<'a> {
             }
             _ => self.parse_path(),
         };
+        // nsc SimpleType: dots belong to StableId *before* TypeArgs. After
+        // `C[T]`, `.enqueue` is term selection (`new C[T].enqueue`), not a
+        // type path. Type projection after args is `#`, not `.`.
+        let mut seen_type_args = false;
         loop {
             if matches!(self.kind(), TokenKind::Dot) {
+                if seen_type_args {
+                    break;
+                }
                 self.bump();
                 self.skip_nl();
                 if matches!(self.kind(), TokenKind::TypeKw) {
@@ -1812,6 +1819,7 @@ impl<'a> Parser<'a> {
                         args,
                     },
                 );
+                seen_type_args = true;
                 continue;
             }
             break;
@@ -3290,12 +3298,12 @@ impl<'a> Parser<'a> {
                 TokenKind::Ident(n) if n == ">" || n == "/>" => {
                     return self.unimplemented(self.span(), "XML literal: unexpected `>`");
                 }
+                TokenKind::Ident(n) if n == "&" || n == "&#" || n.starts_with('&') => {
+                    children.push(self.parse_xml_entity());
+                }
                 TokenKind::Ident(n) => {
                     if let Some(what) = xml_unsupported_markup(&n) {
                         return self.unimplemented(self.span(), what);
-                    }
-                    if n == "&" || n.starts_with('&') {
-                        return self.unimplemented(self.span(), "XML entity references");
                     }
                     self.bump();
                     let mut text = n;
@@ -3401,6 +3409,7 @@ impl<'a> Parser<'a> {
             self.skip_nl();
             match self.kind().clone() {
                 TokenKind::Ident(n) if n == ">" || n == "/>" || n == "</" || n == "<" => break,
+                TokenKind::Ident(n) if n == "&" || n == "&#" || n.starts_with('&') => break,
                 TokenKind::Eof => break,
                 TokenKind::Ident(n) if xml_unsupported_markup(&n).is_some() => {
                     let what = xml_unsupported_markup(&n).unwrap();
@@ -3589,6 +3598,112 @@ impl<'a> Parser<'a> {
         self.xml_new(cls, vec![lit], span)
     }
 
+    fn xml_entity_ref(&mut self, name: &str, span: Span) -> Tree {
+        let cls = self.xml_path(&["scala", "xml", "EntityRef"], span);
+        let lit = self.alloc(
+            span,
+            TreeKind::Literal {
+                lit: Lit::String(name.into()),
+            },
+        );
+        self.xml_new(cls, vec![lit], span)
+    }
+
+    /// nsc `content_AMP`: named refs become `EntityRef(name)`; `&#N;` / `&#xN;`
+    /// become `Text` of the decoded character. Unknown names diagnose.
+    fn parse_xml_entity(&mut self) -> Tree {
+        let lo = self.span();
+        let tok = match self.kind().clone() {
+            TokenKind::Ident(n) => n,
+            _ => {
+                return self.unimplemented(lo, "XML entity references");
+            }
+        };
+        self.bump();
+        if tok == "&#" || tok.starts_with("&#") {
+            return self.parse_xml_char_ref(lo, &tok);
+        }
+        let name = if tok == "&" {
+            match self.kind().clone() {
+                TokenKind::Ident(n)
+                    if n != ";" && n != "<" && n != ">" && !is_operator_name(&n) =>
+                {
+                    self.bump();
+                    n
+                }
+                _ => {
+                    return self.unimplemented(lo.merge(self.span()), "XML entity references");
+                }
+            }
+        } else if let Some(rest) = tok.strip_prefix('&') {
+            rest.to_string()
+        } else {
+            return self.unimplemented(lo, "XML entity references");
+        };
+        if !matches!(self.kind(), TokenKind::Semi) {
+            return self.unimplemented(lo.merge(self.span()), "XML entity references");
+        }
+        let end = self.span();
+        self.bump();
+        if xml_predefined_entity(&name) {
+            self.xml_entity_ref(&name, lo.merge(end))
+        } else {
+            self.unimplemented(
+                lo.merge(end),
+                format!("XML entity references: unknown `&{name};`"),
+            )
+        }
+    }
+
+    fn parse_xml_char_ref(&mut self, lo: Span, tok: &str) -> Tree {
+        let (hex, rest) = if tok == "&#" {
+            (false, String::new())
+        } else if let Some(r) = tok.strip_prefix("&#") {
+            if r.starts_with('x') || r.starts_with('X') {
+                (true, r[1..].to_string())
+            } else {
+                (false, r.to_string())
+            }
+        } else {
+            return self.unimplemented(lo, "XML entity references");
+        };
+        let mut hex = hex;
+        let mut digits = rest;
+        if digits.is_empty() {
+            match self.kind().clone() {
+                TokenKind::IntLit(n) if !hex => {
+                    digits = n.to_string();
+                    self.bump();
+                }
+                TokenKind::Ident(n) if !hex && (n.starts_with('x') || n.starts_with('X')) => {
+                    hex = true;
+                    digits = n[1..].to_string();
+                    self.bump();
+                }
+                TokenKind::Ident(n) if hex => {
+                    digits = n;
+                    self.bump();
+                }
+                _ => {
+                    return self.unimplemented(lo.merge(self.span()), "XML entity references");
+                }
+            }
+        }
+        if !matches!(self.kind(), TokenKind::Semi) {
+            return self.unimplemented(lo.merge(self.span()), "XML entity references");
+        }
+        let end = self.span();
+        self.bump();
+        let radix = if hex { 16 } else { 10 };
+        match u32::from_str_radix(&digits, radix)
+            .ok()
+            .and_then(char::from_u32)
+        {
+            Some(ch) => self.xml_text(&ch.to_string(), lo.merge(end)),
+            None => self.unimplemented(lo.merge(end), "XML entity references"),
+        }
+    }
+
     fn xml_comment(&mut self, s: &str, span: Span) -> Tree {
         let cls = self.xml_path(&["scala", "xml", "Comment"], span);
         let lit = self.alloc(
@@ -3740,8 +3855,12 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Leftover glued markup (`><!--` as one Ident) and entity refs. Comments /
-/// CDATA / PI go through `parse_xml_literal` after the lexer splits `><!--`.
+fn xml_predefined_entity(name: &str) -> bool {
+    matches!(name, "amp" | "lt" | "gt" | "quot" | "apos")
+}
+
+/// Leftover glued markup (`><!--` as one Ident). Named/numeric entities in
+/// element content go through `parse_xml_entity`.
 fn xml_unsupported_markup(n: &str) -> Option<&'static str> {
     if n.contains("<!--")
         || n.contains("<![")
