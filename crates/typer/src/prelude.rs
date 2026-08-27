@@ -59,6 +59,23 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     let _ = char_s;
     st.byte_sym = class(st, st.scala_pkg, "Byte", "scala/Byte", &[Type::AnyVal]);
     st.short_sym = class(st, st.scala_pkg, "Short", "scala/Short", &[Type::AnyVal]);
+    // nsc `Byte.+` / `Short.+` return Int; used by `Array[Byte].map(_ + 1)`.
+    method(
+        st,
+        st.byte_sym,
+        "+",
+        vec![Type::Int],
+        Type::Int,
+        Intrinsic::IntBin("+"),
+    );
+    method(
+        st,
+        st.short_sym,
+        "+",
+        vec![Type::Int],
+        Type::Int,
+        Intrinsic::IntBin("+"),
+    );
 
     st.string_sym = class(st, java_lang, "String", "java/lang/String", &[Type::AnyRef]);
     mark_java(st, st.string_sym);
@@ -3688,25 +3705,6 @@ fn add_predef_members(
         add_numeric_wrapper(st, owner, "byteWrapper", Type::Byte, rb);
         add_numeric_wrapper(st, owner, "shortWrapper", Type::Short, rs);
         add_numeric_wrapper(st, owner, "booleanWrapper", Type::Boolean, rbool);
-        // nsc Predef.byte2int / short2int: `Array[Byte].map(_ + 1)` widens to Int.
-        let b2i = method(
-            st,
-            owner,
-            "byte2int",
-            vec![Type::Byte],
-            Type::Int,
-            Intrinsic::Identity,
-        );
-        st.get_mut(b2i).flags = st.get(b2i).flags.with(Flags::IMPLICIT);
-        let s2i = method(
-            st,
-            owner,
-            "short2int",
-            vec![Type::Short],
-            Type::Int,
-            Intrinsic::Identity,
-        );
-        st.get_mut(s2i).flags = st.get(s2i).flags.with(Flags::IMPLICIT);
     }
     let mems = st.get(owner).members.clone();
     st.get_mut(p).members.extend(mems.iter().copied());
