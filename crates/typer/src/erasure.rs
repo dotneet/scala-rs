@@ -259,6 +259,8 @@ fn is_primitive(ty: &Type) -> bool {
         | Type::Long
         | Type::Double
         | Type::Boolean
+        | Type::Byte
+        | Type::Short
         | Type::Char
         | Type::Float
         | Type::Unit => true,

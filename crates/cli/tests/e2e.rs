@@ -741,6 +741,21 @@ fn fixtures_indexedseq_queue_bad_is_error() {
 }
 
 #[test]
+fn fixtures_string_ops3_bad_is_error() {
+    compile_fails_lib("string_ops3_bad", "noSuchStrip is not a member");
+}
+
+#[test]
+fn fixtures_byte_ops_bad_is_error() {
+    compile_fails_lib("byte_ops_bad", "noSuchMax is not a member");
+}
+
+#[test]
+fn fixtures_arraybuffer_bad_is_error() {
+    compile_fails_lib("arraybuffer_bad", "noSuch is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1339,6 +1354,21 @@ fn scala_library_dual_run_string_ops2() {
 }
 
 #[test]
+fn scala_library_dual_run_string_ops3() {
+    dual_run_fixture("string_ops3");
+}
+
+#[test]
+fn scala_library_dual_run_byte_ops() {
+    dual_run_fixture("byte_ops");
+}
+
+#[test]
+fn scala_library_dual_run_arraybuffer() {
+    dual_run_fixture("arraybuffer");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -1608,6 +1638,11 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/immutable/LazyList.class",
     "scala/collection/immutable/LazyList$.class",
     "scala/runtime/RichFloat.class",
+    "scala/runtime/RichByte.class",
+    "scala/runtime/RichShort.class",
+    "scala/runtime/RichBoolean.class",
+    "scala/collection/mutable/ArrayBuffer.class",
+    "scala/collection/mutable/ArrayBuffer$.class",
     "scala/util/Either.class",
     "scala/util/Left.class",
     "scala/util/Right.class",

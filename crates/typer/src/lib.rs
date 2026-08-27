@@ -2980,6 +2980,53 @@ object Main {
     }
 
     #[test]
+    fn string_ops3_richbyte_arraybuffer_typecheck_with_library() {
+        ok_lib(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val a: String = "foobar".stripSuffix("bar")
+    val b: String = "ab".padTo(5, 'x')
+    val c: String = "a\nb".linesIterator.next()
+    val d = "12".toIntOption
+    val e: Byte = 1.toByte.max(2.toByte)
+    val f: Short = 1.toShort.max(3.toShort)
+    val g: Int = true.compare(false)
+    val buf = scala.collection.mutable.ArrayBuffer(1, 2)
+    buf += 3
+    buf(1) = 9
+    val n: Int = buf(0)
+  }
+}
+"#,
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = "hi".noSuchStrip
+    val y = 1.toByte.noSuchMax
+    val z = scala.collection.mutable.ArrayBuffer(1).noSuch
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics
