@@ -939,6 +939,21 @@ fn fixtures_sortedmap_bad_is_error() {
 }
 
 #[test]
+fn fixtures_array_ops11_bad_is_error() {
+    compile_fails_lib("array_ops11_bad", "noSuchFlatMap is not a member");
+}
+
+#[test]
+fn fixtures_string_ops15_bad_is_error() {
+    compile_fails_lib("string_ops15_bad", "noSuchIndices is not a member");
+}
+
+#[test]
+fn fixtures_bitset_bad_is_error() {
+    compile_fails_lib("bitset_bad", "noSuch is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1732,6 +1747,21 @@ fn scala_library_dual_run_sortedmap() {
 }
 
 #[test]
+fn scala_library_dual_run_array_ops11() {
+    dual_run_fixture("array_ops11");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops15() {
+    dual_run_fixture("string_ops15");
+}
+
+#[test]
+fn scala_library_dual_run_bitset() {
+    dual_run_fixture("bitset");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -2006,6 +2036,8 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/immutable/SortedMap$.class",
     "scala/collection/immutable/TreeMap.class",
     "scala/collection/immutable/TreeMap$.class",
+    "scala/collection/immutable/BitSet.class",
+    "scala/collection/immutable/BitSet$.class",
     "scala/collection/immutable/Seq.class",
     "scala/collection/immutable/Seq$.class",
     "scala/collection/immutable/LazyList.class",
@@ -2047,6 +2079,7 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/util/Success$.class",
     "scala/util/Failure.class",
     "scala/util/Failure$.class",
+    "scala/util/matching/Regex.class",
     "scala/Array$.class",
     "scala/runtime/NonLocalReturnControl.class",
 ];

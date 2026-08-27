@@ -4693,11 +4693,16 @@ fn invoke_value_extension(
             return;
         }
         if s.name == "flatMap" {
-            asm.invokestatic(
-                "scala/collection/ArrayOps",
-                "flatMap$extension",
-                "(Ljava/lang/Object;Lscala/Function1;Lscala/reflect/ClassTag;)Ljava/lang/Object;",
-            );
+            let n = match &s.ty {
+                Type::Method { paramss, .. } => paramss.iter().flatten().count(),
+                _ => s.params.len(),
+            };
+            let desc = if n >= 3 {
+                "(Ljava/lang/Object;Lscala/Function1;Lscala/Function1;Lscala/reflect/ClassTag;)Ljava/lang/Object;"
+            } else {
+                "(Ljava/lang/Object;Lscala/Function1;Lscala/reflect/ClassTag;)Ljava/lang/Object;"
+            };
+            asm.invokestatic("scala/collection/ArrayOps", "flatMap$extension", desc);
             maybe_unbox_erased_result(
                 asm,
                 ctx,
@@ -4914,6 +4919,44 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 }
             }
             return;
+        }
+        if owner == "scala/util/matching/Regex" {
+            match name {
+                "findFirstIn" => {
+                    asm.invokevirtual(
+                        "scala/util/matching/Regex",
+                        "findFirstIn",
+                        "(Ljava/lang/CharSequence;)Lscala/Option;",
+                    );
+                    return;
+                }
+                "matches" => {
+                    asm.invokevirtual(
+                        "scala/util/matching/Regex",
+                        "matches",
+                        "(Ljava/lang/CharSequence;)Z",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_bitset(&owner) {
+            match name {
+                "contains" => {
+                    asm.invokevirtual("scala/collection/immutable/BitSet", "contains", "(I)Z");
+                    return;
+                }
+                "foreach" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/BitSet",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                _ => {}
+            }
         }
         if name == "withFilter" && is_stdlib_list(&owner) {
             asm.invokeinterface(
@@ -5253,6 +5296,17 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                     "(Lscala/collection/immutable/Seq;Lscala/math/Ordering;)Ljava/lang/Object;",
                 );
                 asm.checkcast("scala/collection/immutable/TreeMap");
+                return;
+            }
+        }
+        if is_stdlib_bitset_module(&owner) {
+            if name == "apply" {
+                asm.invokevirtual(
+                    "scala/collection/immutable/BitSet$",
+                    "apply",
+                    "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                );
+                asm.checkcast("scala/collection/immutable/BitSet");
                 return;
             }
         }
@@ -6438,6 +6492,14 @@ fn is_stdlib_treemap_module(owner: &str) -> bool {
     owner == "scala/collection/immutable/TreeMap$"
 }
 
+fn is_stdlib_bitset(owner: &str) -> bool {
+    owner == "scala/collection/immutable/BitSet"
+}
+
+fn is_stdlib_bitset_module(owner: &str) -> bool {
+    owner == "scala/collection/immutable/BitSet$"
+}
+
 fn is_stdlib_seq(owner: &str) -> bool {
     matches!(
         owner,
@@ -6596,6 +6658,8 @@ fn gen_call_args(
                 let pty = param_tys.get(i).unwrap_or(&a.ty);
                 if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
                     emit_box(asm, &a.ty);
+                } else if matches!(pty, Type::Array(_)) {
+                    asm.checkcast(&jvm_desc(ctx.st, pty));
                 }
             }
         }
