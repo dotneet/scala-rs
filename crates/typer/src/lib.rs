@@ -2722,6 +2722,147 @@ object Main {
     }
 
     #[test]
+    fn package_object_implicit_class_typecheck() {
+        ok(r#"
+package object enrich {
+  implicit class Rich(n: Int) { def twice: Int = n * 2 }
+}
+object Main {
+  import enrich._
+  def main(args: Array[String]): Unit = {
+    val n: Int = 2.twice
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+package object enrich {
+  implicit class Rich(n: Int) { def twice: Int = n * 2 }
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = 2.twice
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("twice") && d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+implicit class Rich(n: Int) { def twice: Int = n * 2 }
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = 2.twice
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("top-level")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn structural_update_typecheck() {
+        ok(r#"
+class Cell {
+  private var n: Int = 0
+  def foo: Int = n
+  def foo_=(k: Int): Unit = { n = k }
+}
+class Buf {
+  private var n: Int = 0
+  def apply(i: Int): Int = n
+  def update(i: Int, v: Int): Unit = { n = v }
+}
+object Main {
+  def set(x: { var foo: Int }): Unit = { x.foo = 41 }
+  def get(x: { var foo: Int }): Int = x.foo
+  def setDef(x: { def foo: Int; def foo_=(k: Int): Unit }): Unit = { x.foo = 7 }
+  def upd(x: { def apply(i: Int): Int; def update(i: Int, v: Int): Unit }): Unit = {
+    x(0) = 9
+  }
+  def main(args: Array[String]): Unit = {
+    val c = new Cell()
+    set(c)
+    val n: Int = get(c)
+    setDef(c)
+    val b = new Buf()
+    upd(b)
+    val k: Int = b.apply(0)
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def use(x: { def foo: Int }): Unit = {
+    x.foo = 1
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("foo_=") && d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn indexedseq_queue_typecheck_with_library() {
+        ok_lib(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = IndexedSeq(1, 2)(1)
+    val q = scala.collection.immutable.Queue(1, 2).enqueue(3)
+    val d = q.dequeue
+    val h: Int = d._1
+  }
+}
+"#,
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n = IndexedSeq(1, 2).noSuch
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("noSuch") && d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics

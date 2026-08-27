@@ -274,6 +274,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_map_and_vector(st);
         add_set(st);
         add_seq_and_lazylist(st);
+        add_indexedseq_and_queue(st);
         add_either(st);
         add_try(st, throwable);
         add_xml(st);
@@ -1791,6 +1792,149 @@ fn add_seq_and_lazylist(st: &mut SymbolTable) {
         sym: coll_seq,
         args: vec![],
     });
+}
+
+fn add_indexedseq_and_queue(st: &mut SymbolTable) {
+    let idx = iface(
+        st,
+        st.scala_pkg,
+        "IndexedSeq",
+        "scala/collection/immutable/IndexedSeq",
+    );
+    let ia = type_param(st, idx, "A");
+    st.get_mut(idx).tparams = vec![ia];
+    let ta = Type::TypeParam(ia);
+    let idx_t = Type::Class {
+        sym: idx,
+        args: vec![ta.clone()],
+    };
+    method(
+        st,
+        idx,
+        "apply",
+        vec![Type::Int],
+        ta.clone(),
+        Intrinsic::None,
+    );
+    let idx_mod = module(
+        st,
+        st.scala_pkg,
+        "IndexedSeq",
+        "scala/collection/immutable/IndexedSeq$",
+    );
+    let idx_cls = st.module_class_of(idx_mod);
+    method(
+        st,
+        idx_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: idx,
+            args: vec![Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let idx_apply = method(
+        st,
+        idx_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        idx_t.clone(),
+        Intrinsic::None,
+    );
+    let iaa = type_param(st, idx_apply, "A");
+    st.get_mut(idx_apply).tparams = vec![iaa];
+    st.get_mut(idx_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(iaa)))]],
+        ret: Box::new(Type::Class {
+            sym: idx,
+            args: vec![Type::TypeParam(iaa)],
+        }),
+    };
+    let mems = st.get(idx_cls).members.clone();
+    st.get_mut(idx_mod).members.extend(mems);
+
+    let tuple2 = st
+        .get(st.scala_pkg)
+        .members
+        .iter()
+        .copied()
+        .find(|id| st.get(*id).name == "Tuple2")
+        .unwrap_or(SymbolId::NONE);
+    let imm = crate::classpath::ensure_package(st, "scala/collection/immutable");
+    let queue = class(
+        st,
+        imm,
+        "Queue",
+        "scala/collection/immutable/Queue",
+        &[Type::AnyRef],
+    );
+    let qa = type_param(st, queue, "A");
+    st.get_mut(queue).tparams = vec![qa];
+    let tq = Type::TypeParam(qa);
+    let queue_t = Type::Class {
+        sym: queue,
+        args: vec![tq.clone()],
+    };
+    method(
+        st,
+        queue,
+        "enqueue",
+        vec![Type::Any],
+        queue_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        queue,
+        "dequeue",
+        vec![],
+        Type::Class {
+            sym: tuple2,
+            args: vec![tq.clone(), queue_t.clone()],
+        },
+        Intrinsic::None,
+    );
+    method(
+        st,
+        queue,
+        "apply",
+        vec![Type::Int],
+        tq.clone(),
+        Intrinsic::None,
+    );
+    let queue_mod = module(st, imm, "Queue", "scala/collection/immutable/Queue$");
+    let queue_cls = st.module_class_of(queue_mod);
+    method(
+        st,
+        queue_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: queue,
+            args: vec![Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let q_apply = method(
+        st,
+        queue_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        queue_t.clone(),
+        Intrinsic::None,
+    );
+    let qaa = type_param(st, q_apply, "A");
+    st.get_mut(q_apply).tparams = vec![qaa];
+    st.get_mut(q_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(qaa)))]],
+        ret: Box::new(Type::Class {
+            sym: queue,
+            args: vec![Type::TypeParam(qaa)],
+        }),
+    };
+    let mems = st.get(queue_cls).members.clone();
+    st.get_mut(queue_mod).members.extend(mems);
 }
 
 fn add_either(st: &mut SymbolTable) {

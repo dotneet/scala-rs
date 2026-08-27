@@ -3676,7 +3676,7 @@ fn gen_structural_call(
     gen_expr(asm, frame, ctx, recv);
     asm.dup();
     asm.invokevirtual("java/lang/Object", "getClass", "()Ljava/lang/Class;");
-    asm.ldc_string(name);
+    asm.ldc_string(&encode_method_name(name));
     asm.iconst(args.len() as i32);
     asm.anewarray("java/lang/Class");
     for (i, a) in args.iter().enumerate() {
@@ -4793,6 +4793,51 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_indexedseq_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/IndexedSeq$",
+                        "empty",
+                        "()Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/immutable/IndexedSeq");
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/IndexedSeq$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/immutable/IndexedSeq");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_queue_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Queue$",
+                        "empty",
+                        "()Lscala/collection/immutable/Queue;",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Queue$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/immutable/Queue");
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_list_module_owner(&owner) && name == "apply" {
             asm.invokevirtual(
                 "scala/collection/immutable/List$",
@@ -5154,6 +5199,64 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_indexedseq(&owner) {
+            if name == "apply" {
+                asm.invokeinterface("scala/collection/SeqOps", "apply", "(I)Ljava/lang/Object;");
+                if let Some(ty) = result_ty {
+                    if !is_jvm_primitive(ty) && !is_unit_like(ty) {
+                        let cls = jvm_desc(ctx.st, ty);
+                        if let Some(inner) = cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                        {
+                            if inner != "java/lang/Object" {
+                                asm.checkcast(inner);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        if is_stdlib_queue(&owner) {
+            match name {
+                "enqueue" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Queue",
+                        "enqueue",
+                        "(Ljava/lang/Object;)Lscala/collection/immutable/Queue;",
+                    );
+                    return;
+                }
+                "dequeue" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Queue",
+                        "dequeue",
+                        "()Lscala/Tuple2;",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Queue",
+                        "apply",
+                        "(I)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if !is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            let cls = jvm_desc(ctx.st, ty);
+                            if let Some(inner) =
+                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                            {
+                                if inner != "java/lang/Object" {
+                                    asm.checkcast(inner);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
     if is_interface_sym(ctx.st, owner_id) {
         asm.invokeinterface(&owner, name, &desc);
@@ -5308,6 +5411,28 @@ fn is_stdlib_vector(owner: &str) -> bool {
 
 fn is_stdlib_vector_module(owner: &str) -> bool {
     owner == "scala/collection/immutable/Vector$"
+}
+
+fn is_stdlib_indexedseq(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/collection/immutable/IndexedSeq" | "scala/collection/IndexedSeq"
+    )
+}
+
+fn is_stdlib_indexedseq_module(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/collection/immutable/IndexedSeq$" | "scala/collection/IndexedSeq$"
+    )
+}
+
+fn is_stdlib_queue(owner: &str) -> bool {
+    owner == "scala/collection/immutable/Queue"
+}
+
+fn is_stdlib_queue_module(owner: &str) -> bool {
+    owner == "scala/collection/immutable/Queue$"
 }
 
 fn is_stdlib_set(owner: &str) -> bool {

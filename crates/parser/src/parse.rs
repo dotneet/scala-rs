@@ -1654,16 +1654,18 @@ impl<'a> Parser<'a> {
                     }
                 }
                 TokenKind::Var => {
-                    let sp = self.span();
-                    let _ = self.parse_val_def(Modifiers::default());
-                    let span = sp.merge(self.prev_span());
-                    self.error_span(span, "unimplemented type: structural var members");
-                    decls.push(self.alloc(
-                        span,
-                        TreeKind::Unimplemented {
-                            what: "structural var members".into(),
-                        },
-                    ));
+                    let t = self.parse_val_def(Modifiers::default());
+                    if refinement_has_impl(&t) {
+                        self.error_span(t.span, "illegal implementation in refinement");
+                        decls.push(self.alloc(
+                            t.span,
+                            TreeKind::Unimplemented {
+                                what: "illegal implementation in refinement".into(),
+                            },
+                        ));
+                    } else {
+                        decls.push(t);
+                    }
                 }
                 TokenKind::Def => {
                     let t = self.parse_def_def(Modifiers::default());
