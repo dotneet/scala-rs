@@ -43,6 +43,8 @@ object Lib {
   @Ann(foo = bar) def markedNamedIdent: Int = 12
   @Ann2(b = 2, a = "ok") def markedReorder: Int = 13
   def join(xs: String*): Int = 0
+  type T = Int
+  def usesAlias(x: T): T = x
 }
 trait MixA { def a: Int }
 trait MixB { def b: Int }

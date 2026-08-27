@@ -6416,6 +6416,11 @@ fn gen_try(
     asm.mark(handler);
     asm.enter_handler();
     store(asm, exn_slot, JvmSort::Ref);
+    let catch_rethrow = if has_finally && !catches.is_empty() {
+        Some(asm.fresh_label())
+    } else {
+        None
+    };
     for c in catches {
         let fail = asm.fresh_label();
         gen_pattern(asm, frame, ctx, &c.pat, exn_slot, JvmSort::Ref, fail);
@@ -6423,6 +6428,9 @@ fn gen_try(
             gen_expr(asm, frame, ctx, &c.guard);
             asm.ifeq(fail);
         }
+        let catch_start = asm.fresh_label();
+        let catch_end = asm.fresh_label();
+        asm.mark(catch_start);
         if unit {
             gen_stat(asm, frame, ctx, &c.body);
         } else {
@@ -6431,10 +6439,14 @@ fn gen_try(
                 store(asm, slot, sel_sort);
             }
         }
+        asm.mark(catch_end);
         if has_finally {
             gen_stat(asm, frame, ctx, finalizer);
         }
         asm.goto(after);
+        if let Some(rethrow) = catch_rethrow {
+            asm.exception(catch_start, catch_end, rethrow, Some("java/lang/Throwable"));
+        }
         asm.mark(fail);
     }
     if has_finally {
@@ -6442,6 +6454,15 @@ fn gen_try(
     }
     load(asm, exn_slot, JvmSort::Ref);
     asm.athrow();
+
+    if let Some(rethrow) = catch_rethrow {
+        asm.mark(rethrow);
+        asm.enter_handler();
+        store(asm, exn_slot, JvmSort::Ref);
+        gen_stat(asm, frame, ctx, finalizer);
+        load(asm, exn_slot, JvmSort::Ref);
+        asm.athrow();
+    }
 
     asm.mark(after);
     if let Some(slot) = result_slot {
@@ -7438,6 +7459,81 @@ object Main {
             return;
         };
         assert_eq!(out, "before\ncaught\nfinally\n", "stdout: {out:?}");
+    }
+
+    #[test]
+    fn try_finally_success_and_throw() {
+        let Some(out) = run_main(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    try {
+      println("ok")
+    } finally {
+      println("fin-ok")
+    }
+    try {
+      try {
+        println("before-throw")
+        throw new RuntimeException()
+      } finally {
+        println("fin-throw")
+      }
+    } catch {
+      case _: RuntimeException => println("outer")
+    }
+    try {
+      try {
+        throw new RuntimeException()
+      } catch {
+        case _: RuntimeException =>
+          println("caught")
+          throw new RuntimeException()
+      } finally {
+        println("fin-catch")
+      }
+    } catch {
+      case _: RuntimeException => println("outer2")
+    }
+  }
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            out, "ok\nfin-ok\nbefore-throw\nfin-throw\nouter\ncaught\nfin-catch\nouter2\n",
+            "stdout: {out:?}"
+        );
+    }
+
+    #[test]
+    fn update_assignment_array_and_user_def() {
+        let Some(out) = run_main(
+            r#"
+class Cell {
+  var n: Int = 0
+  def update(i: Int, v: Int): Unit = { n = v + i }
+  def apply(i: Int): Int = n + i
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val arr = new Array[Int](2)
+    arr(0) = 1
+    arr(1) = 2
+    println(arr(0))
+    arr(1) = 9
+    println(arr(1))
+    val c = new Cell()
+    c(1) = 10
+    println(c.n)
+  }
+}
+"#,
+        ) else {
+            return;
+        };
+        assert_eq!(out, "1\n9\n11\n", "stdout: {out:?}");
     }
 
     #[test]

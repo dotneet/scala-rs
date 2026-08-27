@@ -1534,6 +1534,88 @@ object Main {
     }
 
     #[test]
+    fn type_alias_expands_in_vals_and_defs() {
+        ok(r#"
+trait M { type A = String }
+class C extends M { def id(x: A): A = x }
+object Main {
+  type T = List[Int]
+  def headOf(xs: T): Int = xs.head
+  def main(args: Array[String]): Unit = {
+    val xs: T = 1 :: Nil
+    val n: Int = headOf(xs)
+    val s: String = new C().id("ok")
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn cyclic_type_alias_is_diagnosed() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  type A = B
+  type B = A
+  def main(args: Array[String]): Unit = {
+    val x: A = 1
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("illegal cyclic reference")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn apply_without_member_is_not_update() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+class Cell { var n: Int = 0 }
+object Main {
+  def main(args: Array[String]): Unit = {
+    val c = new Cell()
+    val x: Int = c(1)
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("value apply is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn update_assignment_desugars() {
+        ok(r#"
+class Cell {
+  var n: Int = 0
+  def update(i: Int, v: Int): Unit = { n = v }
+  def apply(i: Int): Int = n
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val arr = new Array[Int](1)
+    arr(0) = 1
+    val c = new Cell()
+    c(0) = 2
+  }
+}
+"#);
+    }
+
+    #[test]
     fn path_dependent_type_ok() {
         ok(r#"
 trait Foo { type A; def x: A }

@@ -1,0 +1,8 @@
+ok
+fin-ok
+before-throw
+fin-throw
+outer
+caught
+fin-catch
+outer2
