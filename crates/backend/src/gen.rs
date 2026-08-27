@@ -6353,6 +6353,33 @@ fn maybe_unbox_erased_result(
     }
 }
 
+/// Lambda captures (and similar) are stored as `Object`. Restore the JVM type
+/// before the body uses the local (`iastore` needs `[I`, not `Object`).
+fn emit_from_erased_object(asm: &mut Assembler, st: &SymbolTable, ty: &Type) {
+    if is_jvm_primitive(ty) {
+        emit_unbox(asm, ty);
+        return;
+    }
+    if matches!(ty, Type::String) {
+        asm.checkcast("java/lang/String");
+        return;
+    }
+    if matches!(ty, Type::Array(_)) {
+        asm.checkcast(&jvm_desc(st, ty));
+        return;
+    }
+    if let Type::Class { sym, .. } = ty {
+        let n = class_internal(st, *sym);
+        if !n.is_empty() && n != "java/lang/Object" {
+            asm.checkcast(&n);
+        }
+        return;
+    }
+    if matches!(ty, Type::Tuple(_)) {
+        asm.checkcast("scala/Tuple2");
+    }
+}
+
 fn desc_returns_object(desc: &str) -> bool {
     desc.rsplit_once(')')
         .map(|(_, ret)| ret == "Ljava/lang/Object;")
@@ -7607,9 +7634,7 @@ fn pf_bind_arg_and_captures(
         let ty = st.get(*id).ty.clone();
         a.aload(0);
         a.getfield(lam_name, &format!("$captured${i}"), "Ljava/lang/Object;");
-        if is_jvm_primitive(&ty) {
-            emit_unbox(a, &ty);
-        }
+        emit_from_erased_object(a, st, &ty);
         let sort = jvm_sort(&ty);
         let slot = fr.alloc(*id, sort);
         store(a, slot, sort);
@@ -7799,9 +7824,7 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             let ty = st.get(*id).ty.clone();
             a.aload(0);
             a.getfield(&lam_name2, &format!("$captured${i}"), "Ljava/lang/Object;");
-            if is_jvm_primitive(&ty) {
-                emit_unbox(a, &ty);
-            }
+            emit_from_erased_object(a, st, &ty);
             let sort = jvm_sort(&ty);
             let slot = fr.alloc(*id, sort);
             store(a, slot, sort);
