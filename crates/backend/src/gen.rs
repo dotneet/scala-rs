@@ -832,6 +832,36 @@ fn checkcast_refined_receiver(
     asm.checkcast(&jn);
 }
 
+/// Captured locals are stored as `Object`. Erasure must checkcast before
+/// `invokevirtual` / `invokeinterface` against a more specific owner
+/// (`new Breaks` captured into `breakable { b.break() }`).
+fn checkcast_erased_method_receiver(asm: &mut Assembler, ctx: &EmitCtx, fun: &Tree) {
+    if fun.sym.is_none() {
+        return;
+    }
+    let s = ctx.st.get(fun.sym);
+    if s.kind != SymKind::Method || s.flags.contains(Flags::STATIC) {
+        return;
+    }
+    if s.name == "<init>" {
+        return;
+    }
+    if is_module_class(ctx.st, s.owner) {
+        return;
+    }
+    if ctx.st.is_value_class(s.owner) {
+        return;
+    }
+    if fun_is_super(fun) {
+        return;
+    }
+    let jn = class_internal(ctx.st, s.owner);
+    if jn.is_empty() || jn == "java/lang/Object" || jn.starts_with('[') {
+        return;
+    }
+    asm.checkcast(&jn);
+}
+
 fn is_module_class(st: &SymbolTable, id: SymbolId) -> bool {
     let s = st.get(id);
     s.kind == SymKind::ModuleClass || s.kind == SymKind::Module || s.flags.contains(Flags::MODULE)
@@ -4448,6 +4478,7 @@ fn gen_apply(
     if let TreeKind::Select { qual, .. } = &fun.kind {
         checkcast_refined_receiver(asm, ctx, &qual.ty, fun.sym);
     }
+    checkcast_erased_method_receiver(asm, ctx, fun);
     let value_owner = if !fun.sym.is_none() && ctx.st.is_value_class(ctx.st.get(fun.sym).owner) {
         Some(ctx.st.get(fun.sym).owner)
     } else {
@@ -4708,6 +4739,42 @@ fn invoke_value_extension(
                 ctx,
                 "(Ljava/lang/Object;)Ljava/lang/Object;",
                 result_ty,
+            );
+            return;
+        }
+        if s.name == "take" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "take$extension",
+                "(Ljava/lang/Object;I)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
+        if s.name == "collect" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "collect$extension",
+                "(Ljava/lang/Object;Lscala/PartialFunction;Lscala/reflect/ClassTag;)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
+        if s.name == "zip" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "zip$extension",
+                "(Ljava/lang/Object;Lscala/collection/IterableOnce;)[Lscala/Tuple2;",
             );
             return;
         }
@@ -5519,6 +5586,21 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "map",
                         "(Lscala/Function1;)Lscala/util/Try;",
                     );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_breaks(&owner) {
+            match name {
+                "breakable" => {
+                    asm.invokevirtual(&owner, "breakable", "(Lscala/Function0;)V");
+                    return;
+                }
+                "break" => {
+                    asm.invokevirtual(&owner, "break", "()Lscala/runtime/Nothing$;");
+                    // nsc 2.13.16: `break()` returns Nothing$ and is followed by athrow.
+                    asm.athrow();
                     return;
                 }
                 _ => {}
@@ -6531,6 +6613,13 @@ fn is_stdlib_either(owner: &str) -> bool {
 
 fn is_stdlib_either_module(owner: &str) -> bool {
     matches!(owner, "scala/util/Left$" | "scala/util/Right$")
+}
+
+fn is_stdlib_breaks(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/util/control/Breaks" | "scala/util/control/Breaks$"
+    )
 }
 
 fn is_stdlib_try(owner: &str) -> bool {
