@@ -5991,7 +5991,11 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
         if owner == "scala/util/Using$" && name == "resource" {
             let desc = "(Ljava/lang/Object;Lscala/Function1;Lscala/util/Using$Releasable;)Ljava/lang/Object;";
             asm.invokevirtual("scala/util/Using$", "resource", desc);
-            maybe_unbox_erased_result(asm, ctx, desc, result_ty);
+            if result_ty.is_some_and(is_unit_like) {
+                asm.pop();
+            } else {
+                maybe_unbox_erased_result(asm, ctx, desc, result_ty);
+            }
             return;
         }
         if is_stdlib_try_module(&owner) && name == "apply" {
@@ -6616,11 +6620,6 @@ fn maybe_unbox_erased_result(
         return;
     };
     if !desc_returns_object(desc) {
-        return;
-    }
-    if is_unit_like(ty) {
-        // Generic `A` erased to Object; a Unit instantiation left BoxedUnit.
-        asm.pop();
         return;
     }
     if is_jvm_primitive(ty) && !is_unit_like(ty) {

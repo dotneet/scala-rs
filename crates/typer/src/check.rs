@@ -4533,7 +4533,7 @@ impl Typer {
                     // clause. Type the lambda against `R => Any` so the body
                     // is not checked against a raw type parameter.
                     if let Type::Function { params, ret } = &p {
-                        if matches!(ret.as_ref(), Type::TypeParam(_)) {
+                        if !params.is_empty() && matches!(ret.as_ref(), Type::TypeParam(_)) {
                             p = Type::Function {
                                 params: params.clone(),
                                 ret: Box::new(Type::Any),
@@ -4562,7 +4562,10 @@ impl Typer {
                         }
                     }
                 }
-                if !sym.is_none() && !self.st.get(sym).tparams.is_empty() {
+                if !sym.is_none()
+                    && self.st.get(sym).name == "resource"
+                    && !self.st.get(sym).tparams.is_empty()
+                {
                     let now_args: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
                     let orig_params: Vec<Type> = match &fun.ty {
                         Type::Method { paramss, .. } if !paramss.is_empty() => paramss[0].clone(),
