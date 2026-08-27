@@ -3121,6 +3121,56 @@ object Main {
     }
 
     #[test]
+    fn string_ops6_richlong_hashmap_typecheck_with_library() {
+        ok_lib(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val a: String = "abcdef".takeRight(3)
+    val b: String = "abcdef".dropRight(2)
+    val c: Boolean = "hello".contains('e')
+    val nr = 1L to 3L
+    val nu = 1L until 3L
+    val ns: String = nr.mkString(",")
+    val m = scala.collection.mutable.HashMap.empty[Int, String]
+    m.update(1, "a")
+    m(2) = "b"
+    m += (3 -> "c")
+    val v: String = m(1)
+    val o = m.get(2)
+    val n = scala.collection.mutable.HashMap(1 -> "x")
+    val w = n(1)
+  }
+}
+"#,
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = "hi".noSuchRight
+    val y = (1L to 3L).noSuchMk
+    val z = scala.collection.mutable.HashMap.empty[Int, String].noSuch
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics

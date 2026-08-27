@@ -786,6 +786,21 @@ fn fixtures_stringbuilder_bad_is_error() {
 }
 
 #[test]
+fn fixtures_string_ops6_bad_is_error() {
+    compile_fails_lib("string_ops6_bad", "noSuchRight is not a member");
+}
+
+#[test]
+fn fixtures_long_range_bad_is_error() {
+    compile_fails_lib("long_range_bad", "noSuchMk is not a member");
+}
+
+#[test]
+fn fixtures_hashmap_bad_is_error() {
+    compile_fails_lib("hashmap_bad", "noSuch is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1429,6 +1444,21 @@ fn scala_library_dual_run_stringbuilder() {
 }
 
 #[test]
+fn scala_library_dual_run_string_ops6() {
+    dual_run_fixture("string_ops6");
+}
+
+#[test]
+fn scala_library_dual_run_long_range() {
+    dual_run_fixture("long_range");
+}
+
+#[test]
+fn scala_library_dual_run_hashmap() {
+    dual_run_fixture("hashmap");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -1707,6 +1737,8 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/mutable/ListBuffer$.class",
     "scala/collection/mutable/StringBuilder.class",
     "scala/collection/mutable/StringBuilder$.class",
+    "scala/collection/mutable/HashMap.class",
+    "scala/collection/mutable/HashMap$.class",
     "scala/collection/immutable/NumericRange.class",
     "scala/collection/immutable/NumericRange$.class",
     "scala/collection/immutable/NumericRange$Inclusive.class",

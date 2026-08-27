@@ -336,12 +336,24 @@ impl Assembler {
         }
     }
 
-    /// `dup_x2` for three category-1 values: `a, b, c` → `c, a, b, c`.
+    /// `dup_x2`: three category-1 values `a, b, c` → `c, a, b, c`, or
+    /// category-2 then category-1 `w, c` → `c, w, c`.
     pub fn dup_x2(&mut self) {
         self.emit_op(0x5b);
-        if self.vstack.len() >= 3 {
-            let c = self.vstack[self.vstack.len() - 1].clone();
-            self.vstack.insert(self.vstack.len() - 3, c);
+        let n = self.vstack.len();
+        if n >= 2 {
+            let top_wide = self.vstack[n - 1].is_wide();
+            let next_wide = self.vstack[n - 2].is_wide();
+            if !top_wide && next_wide {
+                let c = self.vstack[n - 1].clone();
+                self.vstack.insert(n - 2, c);
+                self.bump(1);
+                return;
+            }
+        }
+        if n >= 3 {
+            let c = self.vstack[n - 1].clone();
+            self.vstack.insert(n - 3, c);
             self.bump(1);
         } else {
             self.bump(1);
