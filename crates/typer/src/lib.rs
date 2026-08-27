@@ -3,6 +3,7 @@ mod classpath;
 mod erasure;
 mod implicits;
 mod javaclass;
+mod javasign;
 mod lambda_lift;
 mod prelude;
 mod symbol;
@@ -467,6 +468,38 @@ object Main {
     val xs = new java.util.ArrayList[String]()
     val added: Boolean = xs.add("x")
     val sz: Int = xs.size()
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn java_signature_get_is_not_raw_object() {
+        ok(r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val xs = new java.util.ArrayList[String]()
+    xs.add("hi")
+    val s: String = xs.get(0)
+    val n: Int = s.length
+    val n2: Int = xs.get(0).length
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn java_inner_map_entry_and_varargs_typecheck() {
+        ok(r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val e = new java.util.AbstractMap.SimpleEntry[String, String]("k", "v")
+    val k: String = e.getKey
+    val v: String = e.getValue
+    val asEntry: java.util.Map.Entry[String, String] = e
+    val k2: String = asEntry.getKey
+    val f: String = java.lang.String.format("%s-%d", "x", 3)
+    val n: Int = java.util.Arrays.asList("a", "b").size()
   }
 }
 "#);

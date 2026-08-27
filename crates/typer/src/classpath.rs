@@ -480,26 +480,19 @@ pub fn ensure_package(st: &mut SymbolTable, jvm: &str) -> SymbolId {
 }
 
 pub fn install_java_class(st: &mut SymbolTable, c: &crate::javaclass::JavaClass) -> SymbolId {
-    let simple = c
-        .internal_name
-        .rsplit('/')
-        .next()
-        .unwrap_or(&c.internal_name)
-        .rsplit('$')
-        .next()
-        .unwrap_or(&c.internal_name)
-        .to_string();
-    let pkg = c
-        .internal_name
-        .rsplit_once('/')
-        .map(|(p, _)| p)
-        .unwrap_or("");
-    let owner = ensure_package(st, pkg);
+    let simple = java_simple_name(&c.internal_name);
+    let owner = java_class_owner(st, &c.internal_name);
     if let Some(id) = st
         .lookup_member(owner, &simple)
         .into_iter()
         .find(|&s| st.get(s).is_class_like())
     {
+        apply_java_class_meta(st, id, c);
+        fill_java_members(st, id, c);
+        return id;
+    }
+    if let Some(id) = find_by_jvm(st, &c.internal_name) {
+        apply_java_class_meta(st, id, c);
         fill_java_members(st, id, c);
         return id;
     }
@@ -507,7 +500,65 @@ pub fn install_java_class(st: &mut SymbolTable, c: &crate::javaclass::JavaClass)
     if crate::javaclass::is_java_interface(c.access) {
         flags = flags.with(Flags::INTERFACE).with(Flags::ABSTRACT);
     }
+    if c.nested_static {
+        flags = flags.with(Flags::STATIC);
+    }
     let id = st.alloc(&simple, owner, SymKind::Class, flags, &c.internal_name);
+    st.get_mut(id).ty = Type::Class {
+        sym: id,
+        args: vec![],
+    };
+    if owner == st.root {
+        st.enter_in_current(&simple, id);
+    }
+    apply_java_class_meta(st, id, c);
+    fill_java_members(st, id, c);
+    id
+}
+
+fn java_simple_name(internal: &str) -> String {
+    internal
+        .rsplit('/')
+        .next()
+        .unwrap_or(internal)
+        .rsplit('$')
+        .next()
+        .unwrap_or(internal)
+        .to_string()
+}
+
+fn java_class_owner(st: &mut SymbolTable, internal: &str) -> SymbolId {
+    if let Some((outer, _)) = internal.rsplit_once('$') {
+        return find_or_stub_java_class(st, outer);
+    }
+    let pkg = internal.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    ensure_package(st, pkg)
+}
+
+pub fn find_by_jvm(st: &SymbolTable, jvm: &str) -> Option<SymbolId> {
+    st.symbols.iter().find_map(|s| {
+        if s.jvm_name == jvm && s.is_class_like() {
+            Some(s.id)
+        } else {
+            None
+        }
+    })
+}
+
+pub fn find_or_stub_java_class(st: &mut SymbolTable, internal: &str) -> SymbolId {
+    if let Some(id) = find_by_jvm(st, internal) {
+        return id;
+    }
+    let simple = java_simple_name(internal);
+    let owner = java_class_owner(st, internal);
+    if let Some(id) = st
+        .lookup_member(owner, &simple)
+        .into_iter()
+        .find(|&s| st.get(s).is_class_like())
+    {
+        return id;
+    }
+    let id = st.alloc(&simple, owner, SymKind::Class, Flags::JAVA, internal);
     st.get_mut(id).ty = Type::Class {
         sym: id,
         args: vec![],
@@ -516,8 +567,92 @@ pub fn install_java_class(st: &mut SymbolTable, c: &crate::javaclass::JavaClass)
     if owner == st.root {
         st.enter_in_current(&simple, id);
     }
-    fill_java_members(st, id, c);
     id
+}
+
+fn apply_java_class_meta(st: &mut SymbolTable, id: SymbolId, c: &crate::javaclass::JavaClass) {
+    let mut flags = st.get(id).flags.with(Flags::JAVA);
+    if crate::javaclass::is_java_interface(c.access) {
+        flags = flags.with(Flags::INTERFACE).with(Flags::ABSTRACT);
+    }
+    if c.nested_static {
+        flags = flags.with(Flags::STATIC);
+    }
+    st.get_mut(id).flags = flags;
+    st.get_mut(id).jvm_name = c.internal_name.clone();
+    if st.get(id).tparams.is_empty() {
+        if let Some(sig) = &c.signature {
+            if let Some(cs) = crate::javasign::parse_class_sig(sig) {
+                install_tparams(st, id, &cs.tparams);
+            }
+        }
+    }
+    st.get_mut(id).parents = java_parents(st, id, c);
+}
+
+fn java_parents(
+    st: &mut SymbolTable,
+    class_id: SymbolId,
+    c: &crate::javaclass::JavaClass,
+) -> Vec<Type> {
+    let env = tparam_env(st, class_id);
+    if let Some(sig) = &c.signature {
+        if let Some(cs) = crate::javasign::parse_class_sig(sig) {
+            let mut ps = vec![Type::AnyRef];
+            for sup in &cs.supers {
+                let ty = jtype_to_type(st, sup, &env);
+                if matches!(&ty, Type::Any | Type::AnyRef) {
+                    continue;
+                }
+                if let Type::Class { sym, .. } = &ty {
+                    if *sym == st.object_sym {
+                        continue;
+                    }
+                }
+                if !ps.iter().any(|p| same_class(p, &ty)) {
+                    ps.push(ty);
+                }
+            }
+            return ps;
+        }
+    }
+    let mut ps = vec![Type::AnyRef];
+    if let Some(sup) = &c.super_name {
+        if sup != "java/lang/Object" {
+            let ty = Type::Class {
+                sym: find_or_stub_java_class(st, sup),
+                args: vec![],
+            };
+            if !ps.iter().any(|p| same_class(p, &ty)) {
+                ps.push(ty);
+            }
+        }
+    }
+    for iface in &c.interfaces {
+        let ty = Type::Class {
+            sym: find_or_stub_java_class(st, iface),
+            args: vec![],
+        };
+        if !ps.iter().any(|p| same_class(p, &ty)) {
+            ps.push(ty);
+        }
+    }
+    ps
+}
+
+fn same_class(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::Class { sym: x, .. }, Type::Class { sym: y, .. }) => x == y,
+        _ => false,
+    }
+}
+
+fn tparam_env(st: &SymbolTable, owner: SymbolId) -> std::collections::HashMap<String, SymbolId> {
+    let mut env = std::collections::HashMap::new();
+    for id in &st.get(owner).tparams {
+        env.insert(st.get(*id).name.clone(), *id);
+    }
+    env
 }
 
 fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass::JavaClass) {
@@ -525,7 +660,38 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         if has_method_desc(st, owner, &m.name, &m.desc) {
             continue;
         }
-        let (params, ret) = parse_method_desc(st, &m.desc);
+        let mut env = tparam_env(st, owner);
+        let parsed = m
+            .signature
+            .as_deref()
+            .and_then(crate::javasign::parse_method_sig);
+        let (params, ret, mtparams) = if let Some(ms) = parsed {
+            let mut tp_ids = Vec::new();
+            for n in &ms.tparams {
+                let tid = st.alloc(n, owner, SymKind::TypeParam, Flags::EMPTY, "");
+                st.get_mut(tid).ty = Type::TypeParam(tid);
+                env.insert(n.clone(), tid);
+                tp_ids.push(tid);
+            }
+            let params: Vec<Type> = ms
+                .params
+                .iter()
+                .map(|t| jtype_to_type(st, t, &env))
+                .collect();
+            let ret = jtype_to_type(st, &ms.ret, &env);
+            (params, ret, tp_ids)
+        } else {
+            let (p, r) = parse_method_desc_java(st, &m.desc);
+            (p, r, Vec::new())
+        };
+        let mut params = params;
+        if crate::javaclass::is_java_varargs(m.access) {
+            if let Some(last) = params.last_mut() {
+                if let Type::Array(elem) = last {
+                    *last = Type::Repeated(elem.clone());
+                }
+            }
+        }
         let names: Vec<String> = (0..params.len()).map(|i| format!("x${i}")).collect();
         let mut flags = Flags::JAVA;
         if crate::javaclass::is_java_static(m.access) {
@@ -534,12 +700,21 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         if crate::javaclass::is_java_abstract(m.access) {
             flags = flags.with(Flags::ABSTRACT);
         }
+        if crate::javaclass::is_java_varargs(m.access) {
+            flags = flags.with(Flags::VARARGS);
+        }
         if m.name == "<init>" {
             flags = flags.with(Flags::CONSTRUCTOR);
         }
         let id = add_method_types(st, owner, &m.name, names, params, ret);
         st.get_mut(id).flags = flags;
         st.get_mut(id).jvm_name = m.desc.clone();
+        if !mtparams.is_empty() {
+            for tid in &mtparams {
+                st.get_mut(*tid).owner = id;
+            }
+            st.get_mut(id).tparams = mtparams;
+        }
     }
     for f in &c.fields {
         if st
@@ -549,7 +724,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         {
             continue;
         }
-        let ty = parse_field_ty(st, &f.desc).0;
+        let ty = parse_field_ty_java(st, &f.desc).0;
         let mut flags = Flags::JAVA;
         if crate::javaclass::is_java_static(f.access) {
             flags = flags.with(Flags::STATIC);
@@ -557,6 +732,102 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         let id = add_term(st, owner, &f.name, ty);
         st.get_mut(id).flags = flags;
         st.get_mut(id).jvm_name = f.desc.clone();
+    }
+}
+
+fn jtype_to_type(
+    st: &mut SymbolTable,
+    t: &crate::javasign::JType,
+    env: &std::collections::HashMap<String, SymbolId>,
+) -> Type {
+    use crate::javasign::JType;
+    match t {
+        JType::Void => Type::Unit,
+        JType::Boolean => Type::Boolean,
+        JType::Byte | JType::Int => Type::Int,
+        JType::Char => Type::Char,
+        JType::Long => Type::Long,
+        JType::Float => Type::Float,
+        JType::Double => Type::Double,
+        JType::Star => Type::Wildcard,
+        JType::Var(n) => env
+            .get(n)
+            .copied()
+            .map(Type::TypeParam)
+            .unwrap_or(Type::Any),
+        JType::Array(e) => Type::Array(Box::new(jtype_to_type(st, e, env))),
+        JType::Class { jvm, args } => {
+            if jvm == "java/lang/Object" {
+                return Type::Any;
+            }
+            if jvm == "java/lang/String" {
+                if args.is_empty() {
+                    return Type::String;
+                }
+            }
+            let sym = find_or_stub_java_class(st, jvm);
+            let as_ = args.iter().map(|a| jtype_to_type(st, a, env)).collect();
+            Type::Class { sym, args: as_ }
+        }
+    }
+}
+
+fn parse_method_desc_java(st: &mut SymbolTable, desc: &str) -> (Vec<Type>, Type) {
+    let rest = desc.strip_prefix('(').unwrap_or(desc);
+    let (params_s, ret_s) = match rest.find(')') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => ("", rest),
+    };
+    let mut params = Vec::new();
+    let mut s = params_s;
+    while !s.is_empty() {
+        let (t, n) = parse_field_ty_java(st, s);
+        params.push(t);
+        s = &s[n..];
+        if n == 0 {
+            break;
+        }
+    }
+    let (ret, _) = parse_field_ty_java(st, ret_s);
+    (params, ret)
+}
+
+fn parse_field_ty_java(st: &mut SymbolTable, s: &str) -> (Type, usize) {
+    if s.is_empty() {
+        return (Type::Any, 0);
+    }
+    match s.as_bytes()[0] {
+        b'V' => (Type::Unit, 1),
+        b'Z' => (Type::Boolean, 1),
+        b'I' => (Type::Int, 1),
+        b'J' => (Type::Long, 1),
+        b'F' => (Type::Float, 1),
+        b'D' => (Type::Double, 1),
+        b'C' => (Type::Char, 1),
+        b'B' | b'S' => (Type::Int, 1),
+        b'[' => {
+            let (inner, n) = parse_field_ty_java(st, &s[1..]);
+            (Type::Array(Box::new(inner)), n + 1)
+        }
+        b'L' => {
+            let end = s.find(';').unwrap_or(s.len());
+            let inner = &s[1..end];
+            let consumed = if end < s.len() { end + 1 } else { end };
+            let ty = if inner == "java/lang/String" {
+                Type::String
+            } else if inner == "java/lang/Object" {
+                Type::Any
+            } else if inner.starts_with("java/") || inner.starts_with("javax/") {
+                Type::Class {
+                    sym: find_or_stub_java_class(st, inner),
+                    args: vec![],
+                }
+            } else {
+                parse_field_ty(st, s).0
+            };
+            (ty, consumed)
+        }
+        _ => (Type::Any, 1),
     }
 }
 

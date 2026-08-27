@@ -8,6 +8,7 @@ use zip::ZipArchive;
 
 const ACC_PUBLIC: u16 = 0x0001;
 const ACC_STATIC: u16 = 0x0008;
+const ACC_VARARGS: u16 = 0x0080;
 const ACC_INTERFACE: u16 = 0x0200;
 const ACC_ABSTRACT: u16 = 0x0400;
 const ACC_BRIDGE: u16 = 0x0040;
@@ -19,6 +20,7 @@ pub struct JavaMethod {
     pub name: String,
     pub desc: String,
     pub access: u16,
+    pub signature: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -32,10 +34,13 @@ pub struct JavaField {
 pub struct JavaClass {
     pub internal_name: String,
     pub access: u16,
-    #[allow(dead_code)]
     pub super_name: Option<String>,
+    pub interfaces: Vec<String>,
     pub methods: Vec<JavaMethod>,
     pub fields: Vec<JavaField>,
+    pub signature: Option<String>,
+    /// Nested type is `static` (`InnerClasses` / `$` in the name).
+    pub nested_static: bool,
 }
 
 pub struct BinaryIndex {
@@ -275,8 +280,12 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         cp.class_name(super_i)
     };
     let niface = c.u2().ok_or("truncated classfile")? as usize;
+    let mut interfaces = Vec::new();
     for _ in 0..niface {
-        let _ = c.u2().ok_or("truncated classfile")?;
+        let i = c.u2().ok_or("truncated classfile")?;
+        if let Some(n) = cp.class_name(i) {
+            interfaces.push(n);
+        }
     }
     let nfields = c.u2().ok_or("truncated classfile")? as usize;
     let mut fields = Vec::new();
@@ -284,7 +293,8 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         let acc = c.u2().ok_or("truncated field")?;
         let name_i = c.u2().ok_or("truncated field")?;
         let desc_i = c.u2().ok_or("truncated field")?;
-        skip_attrs(&mut c).ok_or("truncated field attributes")?;
+        let attrs = read_attrs(&mut c, &cp).ok_or("truncated field attributes")?;
+        let _ = attrs;
         let name = cp.utf8(name_i).ok_or("unsupported classfile field name")?;
         let desc = cp.utf8(desc_i).ok_or("unsupported classfile field desc")?;
         if acc & ACC_PUBLIC != 0 && acc & ACC_SYNTHETIC == 0 {
@@ -301,7 +311,7 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         let acc = c.u2().ok_or("truncated method")?;
         let name_i = c.u2().ok_or("truncated method")?;
         let desc_i = c.u2().ok_or("truncated method")?;
-        skip_attrs(&mut c).ok_or("truncated method attributes")?;
+        let attrs = read_attrs(&mut c, &cp).ok_or("truncated method attributes")?;
         let name = cp.utf8(name_i).ok_or("unsupported classfile method name")?;
         let desc = cp.utf8(desc_i).ok_or("unsupported classfile method desc")?;
         if name == "<clinit>" {
@@ -314,14 +324,21 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
             name,
             desc,
             access: acc,
+            signature: attr_utf8(&attrs, "Signature", &cp),
         });
     }
+    let class_attrs = read_attrs(&mut c, &cp).unwrap_or_default();
+    let signature = attr_utf8(&class_attrs, "Signature", &cp);
+    let nested_static = nested_is_static(&internal_name, &class_attrs, &cp);
     Ok(JavaClass {
         internal_name,
         access,
         super_name,
+        interfaces,
         methods,
         fields,
+        signature,
+        nested_static,
     })
 }
 
@@ -335,6 +352,10 @@ pub fn is_java_static(access: u16) -> bool {
 
 pub fn is_java_abstract(access: u16) -> bool {
     access & ACC_ABSTRACT != 0
+}
+
+pub fn is_java_varargs(access: u16) -> bool {
+    access & ACC_VARARGS != 0
 }
 
 struct Cp {
@@ -435,14 +456,50 @@ impl<'a> CursorJ<'a> {
     }
 }
 
-fn skip_attrs(c: &mut CursorJ) -> Option<()> {
+fn read_attrs(c: &mut CursorJ, cp: &Cp) -> Option<Vec<(String, Vec<u8>)>> {
     let n = c.u2()? as usize;
+    let mut out = Vec::new();
     for _ in 0..n {
-        let _ = c.u2()?;
+        let name_i = c.u2()?;
         let len = c.u4()? as usize;
-        let _ = c.bytes(len)?;
+        let body = c.bytes(len)?.to_vec();
+        if let Some(name) = cp.utf8(name_i) {
+            out.push((name, body));
+        }
     }
-    Some(())
+    Some(out)
+}
+
+fn attr_utf8(attrs: &[(String, Vec<u8>)], name: &str, cp: &Cp) -> Option<String> {
+    let body = attrs.iter().find(|(n, _)| n == name)?.1.as_slice();
+    if body.len() < 2 {
+        return None;
+    }
+    let i = u16::from_be_bytes([body[0], body[1]]);
+    cp.utf8(i)
+}
+
+fn nested_is_static(this: &str, attrs: &[(String, Vec<u8>)], cp: &Cp) -> bool {
+    let Some((_, body)) = attrs.iter().find(|(n, _)| n == "InnerClasses") else {
+        return this.contains('$');
+    };
+    if body.len() < 2 {
+        return this.contains('$');
+    }
+    let n = u16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut i = 2usize;
+    for _ in 0..n {
+        if i + 8 > body.len() {
+            break;
+        }
+        let inner_i = u16::from_be_bytes([body[i], body[i + 1]]);
+        let flags = u16::from_be_bytes([body[i + 6], body[i + 7]]);
+        i += 8;
+        if cp.class_name(inner_i).as_deref() == Some(this) {
+            return flags & ACC_STATIC != 0;
+        }
+    }
+    this.contains('$')
 }
 
 #[cfg(test)]
@@ -483,6 +540,17 @@ mod tests {
         };
         let c = parse_java_classfile(&bytes).expect("parse ArrayList");
         assert!(
+            c.signature.as_deref().is_some_and(|s| s.starts_with("<E:")),
+            "ArrayList class Signature missing: {:?}",
+            c.signature
+        );
+        let get = c
+            .methods
+            .iter()
+            .find(|m| m.name == "get" && m.desc == "(I)Ljava/lang/Object;")
+            .expect("ArrayList.get(int)");
+        assert_eq!(get.signature.as_deref(), Some("(I)TE;"));
+        assert!(
             c.methods
                 .iter()
                 .any(|m| m.name == "add" && m.desc == "(Ljava/lang/Object;)Z"),
@@ -494,6 +562,57 @@ mod tests {
                 .any(|m| m.name == "size" && m.desc == "()I"),
             "ArrayList.size() missing"
         );
+    }
+
+    #[test]
+    fn parses_jdk_map_entry_inner_if_present() {
+        let mut idx = BinaryIndex::from_user_paths(Vec::new());
+        let Some(bytes) = idx.find_class("java/util/Map$Entry").unwrap() else {
+            panic!("JDK java.util.Map$Entry.class must be readable from jmods/rt");
+        };
+        let c = parse_java_classfile(&bytes).expect("parse Map$Entry");
+        assert!(is_java_interface(c.access));
+        assert!(
+            c.nested_static,
+            "Map.Entry should be a static nested type: {:?}",
+            c
+        );
+        assert!(
+            c.signature
+                .as_deref()
+                .is_some_and(|s| s.starts_with("<K:") && s.contains("V:")),
+            "Map.Entry class Signature missing: {:?}",
+            c.signature
+        );
+        let get_key = c
+            .methods
+            .iter()
+            .find(|m| m.name == "getKey" && m.desc == "()Ljava/lang/Object;")
+            .expect("Map.Entry.getKey");
+        assert_eq!(get_key.signature.as_deref(), Some("()TK;"));
+    }
+
+    #[test]
+    fn parses_jdk_string_format_varargs_if_present() {
+        let mut idx = BinaryIndex::from_user_paths(Vec::new());
+        let Some(bytes) = idx.find_class("java/lang/String").unwrap() else {
+            panic!("JDK java.lang.String.class must be readable from jmods/rt");
+        };
+        let c = parse_java_classfile(&bytes).expect("parse String");
+        let fmt = c
+            .methods
+            .iter()
+            .find(|m| {
+                m.name == "format"
+                    && m.desc == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
+            })
+            .expect("String.format(String, Object...)");
+        assert!(
+            is_java_varargs(fmt.access),
+            "String.format missing ACC_VARARGS: {:#x}",
+            fmt.access
+        );
+        assert!(is_java_static(fmt.access));
     }
 
     #[test]

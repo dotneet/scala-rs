@@ -2447,6 +2447,14 @@ impl Typer {
         if found.is_empty() {
             if let Some(o) = self.st.class_sym_of(&qual.ty) {
                 found = self.st.lookup_member(o, &name);
+                if found.is_empty() && matches!(&qual.ty, Type::Class { .. } | Type::ModuleRef(_)) {
+                    // `asList(...).size()`: the receiver type is a Java stub until
+                    // the classfile is completed. `qual.sym` is the method, not List.
+                    // Skip `Type::String` / primitives so StringOps / RichChar views
+                    // are not shadowed by `java.lang.String` / `Character` overloads.
+                    self.ensure_java_loaded(o, tree.span);
+                    found = self.st.lookup_member(o, &name);
+                }
             }
         }
         // Module: members of module class
@@ -3334,6 +3342,16 @@ impl Typer {
                 if !sym.is_none() {
                     fun.sym = sym;
                     tree.sym = sym;
+                    if let Some(Type::Class { args, .. }) = recv_ty.as_ref() {
+                        if !args.is_empty() {
+                            let owner = self.st.get(sym).owner;
+                            param_tys = param_tys
+                                .iter()
+                                .map(|p| self.st.subst_tparams(owner, args, p))
+                                .collect();
+                            ret = self.st.subst_tparams(owner, args, &ret);
+                        }
+                    }
                     if !self.st.get(sym).tparams.is_empty() {
                         let inst = self.infer_method_tparams(sym, &param_tys, &arg_tys);
                         if !inst.is_empty() {
@@ -5894,7 +5912,12 @@ impl Typer {
         if owner.is_none() || name.is_empty() {
             return;
         }
-        if self.st.lookup_member(owner, name).iter().any(|&id| {
+        if self.st.get(owner).kind == SymKind::Class {
+            self.ensure_java_loaded(owner, span);
+            if !self.st.lookup_member(owner, name).is_empty() {
+                return;
+            }
+        } else if self.st.lookup_member(owner, name).iter().any(|&id| {
             matches!(
                 self.st.get(id).kind,
                 SymKind::Class | SymKind::Package | SymKind::Module | SymKind::ModuleClass
@@ -5941,6 +5964,45 @@ impl Typer {
                 self.error(
                     span,
                     format!("unsupported classfile {}: {e}", internal.replace('/', ".")),
+                );
+            }
+        }
+    }
+
+    fn ensure_java_loaded(&mut self, class_id: SymbolId, span: Span) {
+        if class_id.is_none() {
+            return;
+        }
+        let jvm = self.st.get(class_id).jvm_name.clone();
+        if jvm.is_empty() || jvm.starts_with('[') {
+            return;
+        }
+        let javaish = self.st.get(class_id).flags.contains(Flags::JAVA)
+            || jvm.starts_with("java/")
+            || jvm.starts_with("javax/");
+        if !javaish {
+            return;
+        }
+        if !self.completed_java.insert(jvm.clone()) {
+            return;
+        }
+        match self.binary.find_class(&jvm) {
+            Ok(Some(bytes)) => match crate::javaclass::parse_java_classfile(&bytes) {
+                Ok(jc) => {
+                    crate::classpath::install_java_class(&mut self.st, &jc);
+                }
+                Err(e) => {
+                    self.error(
+                        span,
+                        format!("unsupported classfile {}: {e}", jvm.replace('/', ".")),
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                self.error(
+                    span,
+                    format!("unsupported classfile {}: {e}", jvm.replace('/', ".")),
                 );
             }
         }
