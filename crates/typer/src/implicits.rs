@@ -448,6 +448,9 @@ impl Typer {
                     })
                     .collect();
                 if winners.len() != 1 {
+                    if let Some(hit) = self.pick_array_ops_conv(from, &pool) {
+                        return Some(hit);
+                    }
                     return None;
                 }
                 pool.into_iter().find(|(c, _, _)| *c == winners[0])
@@ -460,6 +463,61 @@ impl Typer {
             return false;
         };
         self.st.get(cls).members.contains(&member)
+    }
+
+    /// nsc: primitive `intArrayOps` wins over `genericArrayOps`; `refArrayOps`
+    /// wins for `Array[AnyRef]` / `Array[String]`; unconstrained `Array[T]` uses
+    /// `genericArrayOps`. After erasing method tparams both generic and ref look
+    /// like `Array[_]`, so pick by the source element.
+    fn pick_array_ops_conv(
+        &self,
+        from: &Type,
+        hits: &[(SymbolId, SymbolId, Type)],
+    ) -> Option<(SymbolId, SymbolId, Type)> {
+        if hits.is_empty() {
+            return None;
+        }
+        if !hits.iter().all(|(_, _, to)| {
+            self.st
+                .class_sym_of(to)
+                .is_some_and(|c| self.st.get(c).name == "ArrayOps")
+        }) {
+            return None;
+        }
+        let elem = match from {
+            Type::Array(e) => e.as_ref(),
+            _ => return None,
+        };
+        let prefer = match elem {
+            Type::Int => "intArrayOps",
+            Type::Long => "longArrayOps",
+            Type::Byte => "byteArrayOps",
+            Type::Short => "shortArrayOps",
+            Type::Char => "charArrayOps",
+            Type::Float => "floatArrayOps",
+            Type::Double => "doubleArrayOps",
+            Type::Boolean => "booleanArrayOps",
+            Type::Unit | Type::NoType => "unitArrayOps",
+            Type::TypeParam(_) | Type::Any | Type::AnyVal => "genericArrayOps",
+            _ => "refArrayOps",
+        };
+        let named: Vec<_> = hits
+            .iter()
+            .filter(|(c, _, _)| self.st.get(*c).name == prefer)
+            .cloned()
+            .collect();
+        if named.len() == 1 {
+            return named.into_iter().next();
+        }
+        let gen: Vec<_> = hits
+            .iter()
+            .filter(|(c, _, _)| self.st.get(*c).name == "genericArrayOps")
+            .cloned()
+            .collect();
+        if gen.len() == 1 {
+            return gen.into_iter().next();
+        }
+        None
     }
 
     fn conv_arg_strictly_more_specific(&self, a: SymbolId, b: SymbolId) -> bool {

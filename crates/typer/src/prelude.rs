@@ -330,6 +330,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     if library_abi {
         add_map_and_vector(st);
         add_set(st);
+        let ordering = add_ordering(st);
+        add_sorted_set(st, ordering);
         add_seq_and_lazylist(st);
         add_indexedseq_and_queue(st);
         add_array_buffer(st);
@@ -650,6 +652,167 @@ fn add_ordered(st: &mut SymbolTable) -> SymbolId {
         };
     }
     ordered
+}
+
+/// `scala.math.Ordering` + companion `implicit object Int` (`Ordering$Int$.MODULE$`).
+fn add_ordering(st: &mut SymbolTable) -> SymbolId {
+    let math = crate::classpath::ensure_package(st, "scala/math");
+    let ordering = iface(st, math, "Ordering", "scala/math/Ordering");
+    let t = type_param(st, ordering, "T");
+    st.get_mut(ordering).tparams = vec![t];
+    method(
+        st,
+        ordering,
+        "compare",
+        vec![Type::Any, Type::Any],
+        Type::Int,
+        Intrinsic::None,
+    );
+    let ord_mod = module(st, math, "Ordering", "scala/math/Ordering$");
+    let ord_cls = st.module_class_of(ord_mod);
+    let int_mod = module(st, ord_cls, "Int", "scala/math/Ordering$Int$");
+    st.get_mut(int_mod).flags = st.get(int_mod).flags.with(Flags::IMPLICIT);
+    st.get_mut(int_mod).ty = Type::Class {
+        sym: ordering,
+        args: vec![Type::Int],
+    };
+    let int_cls = st.module_class_of(int_mod);
+    st.get_mut(int_cls).parents = vec![Type::Class {
+        sym: ordering,
+        args: vec![Type::Int],
+    }];
+    let mems = st.get(ord_cls).members.clone();
+    st.get_mut(ord_mod).members.extend(mems);
+    ordering
+}
+
+fn add_sorted_factory(st: &mut SymbolTable, owner: SymbolId, cls: SymbolId, ordering: SymbolId) {
+    let cls_t = Type::Class {
+        sym: cls,
+        args: vec![Type::Any],
+    };
+    let apply = method(
+        st,
+        owner,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        cls_t,
+        Intrinsic::None,
+    );
+    let aa = type_param(st, apply, "A");
+    let xs = st.alloc(
+        "elems",
+        apply,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM,
+        "",
+    );
+    st.get_mut(xs).ty = Type::Repeated(Box::new(Type::TypeParam(aa)));
+    let ev = st.alloc(
+        "evidence$1",
+        apply,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(ev).ty = Type::Class {
+        sym: ordering,
+        args: vec![Type::TypeParam(aa)],
+    };
+    st.get_mut(apply).tparams = vec![aa];
+    st.get_mut(apply).params = vec![xs, ev];
+    st.get_mut(apply).paramss = vec![vec![xs], vec![ev]];
+    st.get_mut(apply).ty = Type::Method {
+        paramss: vec![
+            vec![Type::Repeated(Box::new(Type::TypeParam(aa)))],
+            vec![Type::Class {
+                sym: ordering,
+                args: vec![Type::TypeParam(aa)],
+            }],
+        ],
+        ret: Box::new(Type::Class {
+            sym: cls,
+            args: vec![Type::TypeParam(aa)],
+        }),
+    };
+}
+
+fn add_sorted_set(st: &mut SymbolTable, ordering: SymbolId) {
+    let immp = crate::classpath::ensure_package(st, "scala/collection/immutable");
+    let ss = iface(
+        st,
+        immp,
+        "SortedSet",
+        "scala/collection/immutable/SortedSet",
+    );
+    let sa = type_param(st, ss, "A");
+    st.get_mut(ss).tparams = vec![sa];
+    let ta = Type::TypeParam(sa);
+    method(
+        st,
+        ss,
+        "contains",
+        vec![Type::Any],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        ss,
+        "foreach",
+        vec![fn1(ta.clone(), Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let ss_mod = module(
+        st,
+        immp,
+        "SortedSet",
+        "scala/collection/immutable/SortedSet$",
+    );
+    let ss_cls = st.module_class_of(ss_mod);
+    add_sorted_factory(st, ss_cls, ss, ordering);
+    let mems = st.get(ss_cls).members.clone();
+    st.get_mut(ss_mod).members.extend(mems);
+
+    let ts = class(
+        st,
+        immp,
+        "TreeSet",
+        "scala/collection/immutable/TreeSet",
+        &[Type::Class {
+            sym: ss,
+            args: vec![],
+        }],
+    );
+    let tsa = type_param(st, ts, "A");
+    st.get_mut(ts).tparams = vec![tsa];
+    let tta = Type::TypeParam(tsa);
+    st.get_mut(ts).parents = vec![Type::Class {
+        sym: ss,
+        args: vec![tta.clone()],
+    }];
+    method(
+        st,
+        ts,
+        "contains",
+        vec![Type::Any],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        ts,
+        "foreach",
+        vec![fn1(tta, Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let ts_mod = module(st, immp, "TreeSet", "scala/collection/immutable/TreeSet$");
+    let ts_cls = st.module_class_of(ts_mod);
+    add_sorted_factory(st, ts_cls, ts, ordering);
+    let tmems = st.get(ts_cls).members.clone();
+    st.get_mut(ts_mod).members.extend(tmems);
 }
 
 fn type_param(st: &mut SymbolTable, owner: SymbolId, name: &str) -> SymbolId {
@@ -3800,6 +3963,30 @@ fn add_predef_members(
             }),
         };
         st.get_mut(wrap_ref).flags = st.get(wrap_ref).flags.with(Flags::IMPLICIT);
+        // nsc Predef.genericArrayOps[T](xs: Array[T]): ArrayOps[T] — the only
+        // conversion that applies to an unconstrained type parameter `Array[T]`
+        // (refArrayOps requires T <: AnyRef; primitive wrappers need Array[Int] etc.).
+        let wrap_g = method(
+            st,
+            owner,
+            "genericArrayOps",
+            vec![Type::Array(Box::new(Type::Any))],
+            Type::Class {
+                sym: aops,
+                args: vec![Type::Any],
+            },
+            Intrinsic::Identity,
+        );
+        let gt = type_param(st, wrap_g, "T");
+        st.get_mut(wrap_g).tparams = vec![gt];
+        st.get_mut(wrap_g).ty = Type::Method {
+            paramss: vec![vec![Type::Array(Box::new(Type::TypeParam(gt)))]],
+            ret: Box::new(Type::Class {
+                sym: aops,
+                args: vec![Type::TypeParam(gt)],
+            }),
+        };
+        st.get_mut(wrap_g).flags = st.get(wrap_g).flags.with(Flags::IMPLICIT);
     }
     if let Some(ri) = rich_int {
         let wrap = method(

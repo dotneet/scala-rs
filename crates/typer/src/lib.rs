@@ -3586,6 +3586,53 @@ object Main {
     }
 
     #[test]
+    fn generic_arrayops_unit_sortedset_typecheck_with_library() {
+        ok_lib(
+            r#"
+object Main {
+  def first[T](a: Array[T]) = a.head
+  def firstMap[T: scala.reflect.ClassTag](a: Array[T]) = a.map(x => x)
+  def main(args: Array[String]): Unit = {
+    val n: Int = first(Array(1, 2, 3))
+    val s: String = first(Array("a", "b"))
+    val ar: Array[AnyRef] = Array("x", "y")
+    val r: AnyRef = ar.head
+    val ys = firstMap(Array(10, 20))
+    val uh = Array((), ()).head
+    val um = Array((), ()).map(_ => 1)
+    val set = scala.collection.immutable.SortedSet(3, 1, 2)
+    val c: Boolean = set.contains(1)
+    val t = scala.collection.immutable.TreeSet(5, 4, 6)
+  }
+}
+"#,
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = Array("a").noSuchHead
+    val y = scala.collection.immutable.SortedSet(1).noSuch
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics

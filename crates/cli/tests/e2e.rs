@@ -909,6 +909,21 @@ fn fixtures_string_ops13_bad_is_error() {
 }
 
 #[test]
+fn fixtures_array_ops8_bad_is_error() {
+    compile_fails_lib("array_ops8_bad", "noSuchHead is not a member");
+}
+
+#[test]
+fn fixtures_array_ops9_bad_is_error() {
+    compile_fails_lib("array_ops9_bad", "noSuchHead is not a member");
+}
+
+#[test]
+fn fixtures_sortedset_bad_is_error() {
+    compile_fails_lib("sortedset_bad", "noSuch is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1672,6 +1687,21 @@ fn scala_library_dual_run_string_ops13() {
 }
 
 #[test]
+fn scala_library_dual_run_array_ops8() {
+    dual_run_fixture("array_ops8");
+}
+
+#[test]
+fn scala_library_dual_run_array_ops9() {
+    dual_run_fixture("array_ops9");
+}
+
+#[test]
+fn scala_library_dual_run_sortedset() {
+    dual_run_fixture("sortedset");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -1938,6 +1968,10 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/immutable/Range.class",
     "scala/collection/immutable/Set.class",
     "scala/collection/immutable/Set$.class",
+    "scala/collection/immutable/SortedSet.class",
+    "scala/collection/immutable/SortedSet$.class",
+    "scala/collection/immutable/TreeSet.class",
+    "scala/collection/immutable/TreeSet$.class",
     "scala/collection/immutable/Seq.class",
     "scala/collection/immutable/Seq$.class",
     "scala/collection/immutable/LazyList.class",
