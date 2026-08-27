@@ -304,8 +304,8 @@ impl<'a> Lexer<'a> {
         }
         while self.peek().is_some_and(is_op_char) {
             let sofar = &self.src[start..self.pos];
-            // `><!--` must be `>` then `<`, not one operator.
-            if (sofar == ">" || sofar == "/>") && self.peek() == Some('<') {
+            // XML closers must not glue to the next tag: `><!--`, `--></`, `?></`.
+            if sofar.ends_with('>') && self.peek() == Some('<') {
                 break;
             }
             self.bump();
@@ -883,6 +883,14 @@ mod tests {
         assert_eq!(kinds("<?"), vec![Ident("<".into()), Ident("?".into())]);
         assert_eq!(kinds("</"), vec![Ident("</".into())]);
         assert_eq!(kinds("/>"), vec![Ident("/>".into())]);
+        assert_eq!(
+            kinds("--></"),
+            vec![Ident("-->".into()), Ident("</".into())]
+        );
+        assert_eq!(
+            kinds("?></"),
+            vec![Ident("?>".into()), Ident("</".into())]
+        );
         assert_eq!(kinds("<="), vec![Ident("<=".into())]);
         assert_eq!(kinds("<<"), vec![Ident("<<".into())]);
         assert_eq!(kinds("<-"), vec![LeftArrow]);
