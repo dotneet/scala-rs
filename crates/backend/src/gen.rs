@@ -316,6 +316,7 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::Repeated(_) => "Lscala/collection/immutable/Seq;".into(),
         Type::TypeParam(_)
         | Type::TypeMember(_)
+        | Type::Applied { .. }
         | Type::Wildcard
         | Type::BoundedWildcard { .. } => "Ljava/lang/Object;".into(),
         Type::ThisType(sym) => format!("L{};", class_internal(st, *sym)),
@@ -882,6 +883,52 @@ fn split_parents(st: &SymbolTable, parents: &[Tree]) -> (String, Vec<String>) {
     (super_name, ifaces)
 }
 
+fn class_extends_named(st: &SymbolTable, id: SymbolId, name: &str) -> bool {
+    if id.is_none() {
+        return false;
+    }
+    if st.get(id).name == name {
+        return true;
+    }
+    let mut work = st.get(id).parents.clone();
+    let mut seen = HashSet::new();
+    seen.insert(id.0);
+    while let Some(p) = work.pop() {
+        let Some(pid) = st.class_sym_of(&p) else {
+            continue;
+        };
+        if !seen.insert(pid.0) {
+            continue;
+        }
+        if st.get(pid).name == name {
+            return true;
+        }
+        work.extend(st.get(pid).parents.clone());
+    }
+    false
+}
+
+fn extends_delayed_init(st: &SymbolTable, id: SymbolId) -> bool {
+    class_extends_named(st, id, "DelayedInit") || class_extends_named(st, id, "App")
+}
+
+fn extends_app(st: &SymbolTable, id: SymbolId) -> bool {
+    class_extends_named(st, id, "App")
+}
+
+fn is_delayed_ctor_stat(t: &Tree) -> bool {
+    match &t.kind {
+        TreeKind::DefDef { .. }
+        | TreeKind::TypeDef { .. }
+        | TreeKind::ClassDef { .. }
+        | TreeKind::ModuleDef { .. }
+        | TreeKind::Import { .. }
+        | TreeKind::Empty => false,
+        TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::LAZY) => false,
+        _ => true,
+    }
+}
+
 fn field_access_flags(mods: Flags) -> u16 {
     let mut acc = if mods.contains(Flags::PRIVATE) {
         ACC_PRIVATE
@@ -1324,9 +1371,398 @@ impl<'a> Gen<'a> {
         self.emit_trait_val_accessors(&mut b, class_id, &impl_.body);
         self.emit_super_accessors(&mut b, class_id);
         self.emit_mixin_forwarders(&mut b, class_id, &impl_.body);
+        self.emit_delayed_init_support(&mut b, class_id, &impl_.body, false);
         self.emit_erasure_bridges(&mut b, class_id);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out.push(b.finish());
+    }
+
+    fn delayed_body_class(class_name: &str) -> String {
+        format!("{}$delayedInit$body", class_name.replace('/', "$"))
+    }
+
+    fn emit_delayed_init_support(
+        &self,
+        b: &mut ClassBuilder,
+        class_id: SymbolId,
+        body: &[Tree],
+        is_module: bool,
+    ) {
+        if class_id.is_none() || !extends_delayed_init(self.st, class_id) {
+            return;
+        }
+        let class_name = b.this_name.clone();
+        let is_app = extends_app(self.st, class_id);
+        if is_app {
+            if self.library_abi {
+                self.emit_app_library_members(b, &class_name, is_module);
+            } else {
+                self.emit_app_private_members(b, &class_name);
+            }
+        }
+        self.emit_delayed_endpoint(b, class_id, body);
+        self.emit_delayed_init_lambda(&class_name);
+    }
+
+    fn emit_app_private_members(&self, b: &mut ClassBuilder, class_name: &str) {
+        let already = b.methods.iter().any(|m| m.name == "delayedInit");
+        b.fields.push(Field {
+            access: ACC_PRIVATE,
+            name: "scala$App$$delayed".into(),
+            desc: "Lscala/Function0;".into(),
+        });
+        if !already {
+            let cn = class_name.to_string();
+            b.add_code(
+                ACC_PUBLIC,
+                "delayedInit",
+                "(Lscala/Function0;)V",
+                2,
+                |asm| {
+                    asm.aload(0);
+                    asm.aload(1);
+                    asm.putfield(&cn, "scala$App$$delayed", "Lscala/Function0;");
+                    asm.vreturn();
+                },
+            );
+        }
+        if !b.methods.iter().any(|m| m.name == "main") {
+            let cn = class_name.to_string();
+            b.add_code(ACC_PUBLIC, "main", "([Ljava/lang/String;)V", 2, |asm| {
+                asm.aload(0);
+                asm.getfield(&cn, "scala$App$$delayed", "Lscala/Function0;");
+                let done = asm.fresh_label();
+                asm.ifnull(done);
+                asm.aload(0);
+                asm.getfield(&cn, "scala$App$$delayed", "Lscala/Function0;");
+                asm.invokeinterface("scala/Function0", "apply", "()Ljava/lang/Object;");
+                asm.pop();
+                asm.mark(done);
+                asm.vreturn();
+            });
+        }
+    }
+
+    fn emit_app_library_members(&self, b: &mut ClassBuilder, class_name: &str, is_module: bool) {
+        let acc_f = if is_module {
+            ACC_PRIVATE | ACC_STATIC
+        } else {
+            ACC_PRIVATE
+        };
+        b.fields.push(Field {
+            access: acc_f,
+            name: "executionStart".into(),
+            desc: "J".into(),
+        });
+        b.fields.push(Field {
+            access: acc_f,
+            name: "scala$App$$_args".into(),
+            desc: "[Ljava/lang/String;".into(),
+        });
+        b.fields.push(Field {
+            access: acc_f,
+            name: "scala$App$$initCode".into(),
+            desc: "Lscala/collection/mutable/ListBuffer;".into(),
+        });
+        let cn = class_name.to_string();
+        if is_module {
+            b.add_code(ACC_PUBLIC, "executionStart", "()J", 1, {
+                let cn = cn.clone();
+                move |asm| {
+                    asm.getstatic(&cn, "executionStart", "J");
+                    asm.lreturn();
+                }
+            });
+            b.add_code(
+                ACC_PUBLIC,
+                "scala$App$_setter_$executionStart_$eq",
+                "(J)V",
+                3,
+                {
+                    let cn = cn.clone();
+                    move |asm| {
+                        asm.lload(1);
+                        asm.putstatic(&cn, "executionStart", "J");
+                        asm.vreturn();
+                    }
+                },
+            );
+            b.add_code(
+                ACC_PUBLIC,
+                "scala$App$$_args",
+                "()[Ljava/lang/String;",
+                1,
+                {
+                    let cn = cn.clone();
+                    move |asm| {
+                        asm.getstatic(&cn, "scala$App$$_args", "[Ljava/lang/String;");
+                        asm.areturn();
+                    }
+                },
+            );
+            b.add_code(
+                ACC_PUBLIC,
+                "scala$App$$_args_$eq",
+                "([Ljava/lang/String;)V",
+                2,
+                {
+                    let cn = cn.clone();
+                    move |asm| {
+                        asm.aload(1);
+                        asm.putstatic(&cn, "scala$App$$_args", "[Ljava/lang/String;");
+                        asm.vreturn();
+                    }
+                },
+            );
+            b.add_code(
+                ACC_PUBLIC,
+                "scala$App$$initCode",
+                "()Lscala/collection/mutable/ListBuffer;",
+                1,
+                {
+                    let cn = cn.clone();
+                    move |asm| {
+                        asm.getstatic(
+                            &cn,
+                            "scala$App$$initCode",
+                            "Lscala/collection/mutable/ListBuffer;",
+                        );
+                        asm.areturn();
+                    }
+                },
+            );
+            b.add_code(
+                ACC_PUBLIC,
+                "scala$App$_setter_$scala$App$$initCode_$eq",
+                "(Lscala/collection/mutable/ListBuffer;)V",
+                2,
+                {
+                    let cn = cn.clone();
+                    move |asm| {
+                        asm.aload(1);
+                        asm.putstatic(
+                            &cn,
+                            "scala$App$$initCode",
+                            "Lscala/collection/mutable/ListBuffer;",
+                        );
+                        asm.vreturn();
+                    }
+                },
+            );
+        } else {
+            b.add_code(ACC_PUBLIC, "executionStart", "()J", 1, {
+                let cn = cn.clone();
+                move |asm| {
+                    asm.aload(0);
+                    asm.getfield(&cn, "executionStart", "J");
+                    asm.lreturn();
+                }
+            });
+            b.add_code(
+                ACC_PUBLIC,
+                "scala$App$_setter_$executionStart_$eq",
+                "(J)V",
+                3,
+                {
+                    let cn = cn.clone();
+                    move |asm| {
+                        asm.aload(0);
+                        asm.lload(1);
+                        asm.putfield(&cn, "executionStart", "J");
+                        asm.vreturn();
+                    }
+                },
+            );
+            b.add_code(
+                ACC_PUBLIC,
+                "scala$App$$_args",
+                "()[Ljava/lang/String;",
+                1,
+                {
+                    let cn = cn.clone();
+                    move |asm| {
+                        asm.aload(0);
+                        asm.getfield(&cn, "scala$App$$_args", "[Ljava/lang/String;");
+                        asm.areturn();
+                    }
+                },
+            );
+            b.add_code(
+                ACC_PUBLIC,
+                "scala$App$$_args_$eq",
+                "([Ljava/lang/String;)V",
+                2,
+                {
+                    let cn = cn.clone();
+                    move |asm| {
+                        asm.aload(0);
+                        asm.aload(1);
+                        asm.putfield(&cn, "scala$App$$_args", "[Ljava/lang/String;");
+                        asm.vreturn();
+                    }
+                },
+            );
+            b.add_code(
+                ACC_PUBLIC,
+                "scala$App$$initCode",
+                "()Lscala/collection/mutable/ListBuffer;",
+                1,
+                {
+                    let cn = cn.clone();
+                    move |asm| {
+                        asm.aload(0);
+                        asm.getfield(
+                            &cn,
+                            "scala$App$$initCode",
+                            "Lscala/collection/mutable/ListBuffer;",
+                        );
+                        asm.areturn();
+                    }
+                },
+            );
+            b.add_code(
+                ACC_PUBLIC,
+                "scala$App$_setter_$scala$App$$initCode_$eq",
+                "(Lscala/collection/mutable/ListBuffer;)V",
+                2,
+                {
+                    let cn = cn.clone();
+                    move |asm| {
+                        asm.aload(0);
+                        asm.aload(1);
+                        asm.putfield(
+                            &cn,
+                            "scala$App$$initCode",
+                            "Lscala/collection/mutable/ListBuffer;",
+                        );
+                        asm.vreturn();
+                    }
+                },
+            );
+        }
+        if !b.methods.iter().any(|m| m.name == "delayedInit") {
+            b.add_code(
+                ACC_PUBLIC,
+                "delayedInit",
+                "(Lscala/Function0;)V",
+                2,
+                |asm| {
+                    asm.aload(0);
+                    asm.aload(1);
+                    asm.invokestatic(
+                        "scala/App",
+                        "delayedInit$",
+                        "(Lscala/App;Lscala/Function0;)V",
+                    );
+                    asm.vreturn();
+                },
+            );
+        }
+        if !b.methods.iter().any(|m| m.name == "main") {
+            b.add_code(ACC_PUBLIC, "main", "([Ljava/lang/String;)V", 2, |asm| {
+                asm.aload(0);
+                asm.aload(1);
+                asm.invokestatic("scala/App", "main$", "(Lscala/App;[Ljava/lang/String;)V");
+                asm.vreturn();
+            });
+        }
+        if !b.methods.iter().any(|m| m.name == "args") {
+            b.add_code(ACC_PUBLIC, "args", "()[Ljava/lang/String;", 1, |asm| {
+                asm.aload(0);
+                asm.invokestatic("scala/App", "args$", "(Lscala/App;)[Ljava/lang/String;");
+                asm.areturn();
+            });
+        }
+    }
+
+    fn emit_delayed_endpoint(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
+        let class_name = b.this_name.clone();
+        let st = self.st;
+        let extras = &self.extras;
+        let lambda_n = &self.lambda_n;
+        let source = self.source_name;
+        let library_abi = self.library_abi;
+        let stats: Vec<Tree> = body
+            .iter()
+            .filter(|t| is_delayed_ctor_stat(t) && !is_presuper_val(t))
+            .cloned()
+            .collect();
+        b.add_code(ACC_PUBLIC, "delayedEndpoint$body", "()V", 4, |asm| {
+            let mut frame = Frame::instance();
+            let ctx = emit_ctx(
+                st,
+                class_id,
+                &class_name,
+                Type::Unit,
+                extras,
+                lambda_n,
+                source,
+                library_abi,
+            );
+            for stt in &stats {
+                if let TreeKind::ValDef {
+                    name, mods, rhs, ..
+                } = &stt.kind
+                {
+                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                        continue;
+                    }
+                    asm.aload(0);
+                    gen_expr(asm, &mut frame, &ctx, rhs);
+                    let ty = if stt.ty.is_no_type() && !stt.sym.is_none() {
+                        st.get(stt.sym).ty.clone()
+                    } else {
+                        stt.ty.clone()
+                    };
+                    asm.putfield(&class_name, name, &jvm_desc(st, &ty));
+                } else {
+                    gen_expr(asm, &mut frame, &ctx, stt);
+                    pop_if_value(asm, &stt.ty);
+                }
+            }
+            asm.vreturn();
+        });
+    }
+
+    fn emit_delayed_init_lambda(&self, class_name: &str) {
+        let lam = Self::delayed_body_class(class_name);
+        let mut b = ClassBuilder::new(lam.clone(), self.source_name);
+        b.access = ACC_PUBLIC | ACC_SUPER | ACC_SYNTHETIC | ACC_FINAL;
+        b.interfaces.push("scala/Function0".into());
+        b.fields.push(Field {
+            access: ACC_PUBLIC,
+            name: "$outer".into(),
+            desc: format!("L{class_name};"),
+        });
+        let outer_d = format!("L{class_name};");
+        let lam_c = lam.clone();
+        let cn = class_name.to_string();
+        b.add_code(ACC_PUBLIC, "<init>", &format!("({outer_d})V"), 2, |asm| {
+            asm.aload(0);
+            asm.invokespecial("java/lang/Object", "<init>", "()V");
+            asm.aload(0);
+            asm.aload(1);
+            asm.putfield(&lam_c, "$outer", &outer_d);
+            asm.vreturn();
+        });
+        b.add_code(ACC_PUBLIC, "apply", "()Ljava/lang/Object;", 1, |asm| {
+            asm.aload(0);
+            asm.getfield(&lam, "$outer", &format!("L{cn};"));
+            asm.invokevirtual(&cn, "delayedEndpoint$body", "()V");
+            asm.aconst_null();
+            asm.areturn();
+        });
+        self.extras.borrow_mut().push(b.finish());
+    }
+
+    fn emit_delayed_init_call(asm: &mut crate::code::Assembler, class_name: &str) {
+        let lam = Self::delayed_body_class(class_name);
+        asm.aload(0);
+        asm.new_obj(&lam);
+        asm.dup();
+        asm.aload(0);
+        asm.invokespecial(&lam, "<init>", &format!("(L{class_name};)V"));
+        asm.invokevirtual(class_name, "delayedInit", "(Lscala/Function0;)V");
     }
 
     fn emit_class_ctor(
@@ -1385,6 +1821,8 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let delayed = extends_delayed_init(st, class_id);
+        let is_app = extends_app(st, class_id);
         let has_outer = outer.is_some();
         let outer_desc_c = outer_desc.clone();
         let mixin_inits: Vec<(String, String)> = if class_id.is_none() {
@@ -1472,25 +1910,33 @@ impl<'a> Gen<'a> {
                 source,
                 library_abi,
             );
-            for vd in &inits {
-                if is_presuper_val(vd) {
-                    continue;
+            if delayed {
+                if library_abi && is_app {
+                    asm.aload(0);
+                    asm.invokestatic("scala/App", "$init$", "(Lscala/App;)V");
                 }
-                if let TreeKind::ValDef {
-                    name, mods, rhs, ..
-                } = &vd.kind
-                {
-                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                Gen::emit_delayed_init_call(asm, &class_name);
+            } else {
+                for vd in &inits {
+                    if is_presuper_val(vd) {
                         continue;
                     }
-                    asm.aload(0);
-                    gen_expr(asm, &mut frame, &ctx, rhs);
-                    let ty = if vd.ty.is_no_type() && !vd.sym.is_none() {
-                        st.get(vd.sym).ty.clone()
-                    } else {
-                        vd.ty.clone()
-                    };
-                    asm.putfield(&class_name, name, &jvm_desc(st, &ty));
+                    if let TreeKind::ValDef {
+                        name, mods, rhs, ..
+                    } = &vd.kind
+                    {
+                        if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                            continue;
+                        }
+                        asm.aload(0);
+                        gen_expr(asm, &mut frame, &ctx, rhs);
+                        let ty = if vd.ty.is_no_type() && !vd.sym.is_none() {
+                            st.get(vd.sym).ty.clone()
+                        } else {
+                            vd.ty.clone()
+                        };
+                        asm.putfield(&class_name, name, &jvm_desc(st, &ty));
+                    }
                 }
             }
             asm.vreturn();
@@ -2409,6 +2855,18 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        self.emit_delayed_init_support(&mut b, cls, &impl_.body, true);
+        if !cls.is_none()
+            && extends_app(self.st, cls)
+            && !forwarded.iter().any(|(n, _, _, _)| n == "main")
+        {
+            forwarded.push((
+                "main".into(),
+                "([Ljava/lang/String;)V".into(),
+                Type::Unit,
+                vec![Type::Array(Box::new(Type::String))],
+            ));
+        }
         self.emit_default_getters(&mut b, cls);
         if !cls.is_none() {
             for mid in self.st.get(cls).members.clone() {
@@ -2491,8 +2949,10 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let delayed = extends_delayed_init(st, class_id);
+        let is_app = extends_app(st, class_id);
         let super_name = b.super_name.clone();
-        b.add_code(ACC_PRIVATE, "<init>", "()V", 1, |asm| {
+        b.add_code(ACC_PRIVATE, "<init>", "()V", 4, |asm| {
             let mut frame = Frame::instance();
             asm.aload(0);
             asm.invokespecial(&super_name, "<init>", "()V");
@@ -2508,22 +2968,30 @@ impl<'a> Gen<'a> {
                 source,
                 library_abi,
             );
-            for vd in &inits {
-                if let TreeKind::ValDef {
-                    name, mods, rhs, ..
-                } = &vd.kind
-                {
-                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
-                        continue;
-                    }
+            if delayed {
+                if library_abi && is_app {
                     asm.aload(0);
-                    gen_expr(asm, &mut frame, &ctx, rhs);
-                    let ty = if vd.ty.is_no_type() && !vd.sym.is_none() {
-                        st.get(vd.sym).ty.clone()
-                    } else {
-                        vd.ty.clone()
-                    };
-                    asm.putfield(&class_name, name, &jvm_desc(st, &ty));
+                    asm.invokestatic("scala/App", "$init$", "(Lscala/App;)V");
+                }
+                Gen::emit_delayed_init_call(asm, &class_name);
+            } else {
+                for vd in &inits {
+                    if let TreeKind::ValDef {
+                        name, mods, rhs, ..
+                    } = &vd.kind
+                    {
+                        if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                            continue;
+                        }
+                        asm.aload(0);
+                        gen_expr(asm, &mut frame, &ctx, rhs);
+                        let ty = if vd.ty.is_no_type() && !vd.sym.is_none() {
+                            st.get(vd.sym).ty.clone()
+                        } else {
+                            vd.ty.clone()
+                        };
+                        asm.putfield(&class_name, name, &jvm_desc(st, &ty));
+                    }
                 }
             }
             asm.vreturn();

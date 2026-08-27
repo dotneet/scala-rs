@@ -367,16 +367,7 @@ impl Typer {
         let tp_ids = self.enter_tparams(tparams, id);
         self.st.get_mut(id).tparams = tp_ids;
         for tp in tparams.iter() {
-            if let TreeKind::TypeDef {
-                views, ctx_bounds, ..
-            } = &tp.kind
-            {
-                if !views.is_empty() {
-                    self.error(
-                        tp.span,
-                        "unimplemented syntax: view bounds on class/trait type parameters",
-                    );
-                }
+            if let TreeKind::TypeDef { ctx_bounds, .. } = &tp.kind {
                 if !ctx_bounds.is_empty() {
                     self.error(
                         tp.span,
@@ -459,10 +450,167 @@ impl Typer {
             };
             self.st.get_mut(id).flags = self.st.get(id).flags.with(flags);
             self.st.get_mut(id).ty = Type::TypeParam(id);
-            self.st.enter_in_current(&name, id);
+            if name != "_" {
+                self.st.enter_in_current(&name, id);
+            }
             ids.push(id);
+            if let TreeKind::TypeDef { tparams: inner, .. } = &mut tp.kind {
+                if !inner.is_empty() {
+                    let inner_ids = self.enter_tparams(inner, id);
+                    self.st.get_mut(id).tparams = inner_ids;
+                }
+            }
         }
         ids
+    }
+
+    /// Apply `args` to a type constructor, diagnosing kind mismatches.
+    fn apply_types(&mut self, ctor: Type, args: Vec<Type>, span: Span) -> Type {
+        if args.is_empty() {
+            return ctor;
+        }
+        if ctor.is_error() || args.iter().any(|a| a.is_error()) {
+            return Type::Error;
+        }
+        let ctor_arity = self.st.kind_arity(&ctor);
+        if ctor_arity < args.len() {
+            if ctor_arity == 0 {
+                self.error(
+                    span,
+                    format!(
+                        "{} does not take type parameters",
+                        self.st.display_type(&ctor)
+                    ),
+                );
+            } else {
+                self.error(
+                    span,
+                    format!(
+                        "too many type arguments for {}: expected {}, found {}",
+                        self.st.display_type(&ctor),
+                        ctor_arity,
+                        args.len()
+                    ),
+                );
+            }
+            return Type::Error;
+        }
+        let expected = self.st.tparam_arities(&ctor);
+        for (i, a) in args.iter().enumerate() {
+            let exp = expected.get(i).copied().unwrap_or(0);
+            let got = self.st.kind_arity(a);
+            if got != exp {
+                let ctor_s = self.st.display_type(&ctor);
+                let arg_s = self.st.display_type(a);
+                if exp > 0 && got == 0 {
+                    self.error(
+                        span,
+                        format!(
+                            "kinds of the type arguments ({arg_s}) do not conform to the expected kinds of the type parameters of {ctor_s}. type constructor takes type parameters, but {arg_s} does not"
+                        ),
+                    );
+                } else if exp == 0 && got > 0 {
+                    self.error(
+                        span,
+                        format!(
+                            "kinds of the type arguments ({arg_s}) do not conform to the expected kinds of the type parameters of {ctor_s}. {arg_s} takes type parameters"
+                        ),
+                    );
+                } else {
+                    self.error(
+                        span,
+                        format!(
+                            "kinds of the type arguments ({arg_s}) do not conform to the expected kinds of the type parameters of {ctor_s}"
+                        ),
+                    );
+                }
+                return Type::Error;
+            }
+        }
+        crate::symbol::apply_type_ctor(ctor, args)
+    }
+
+    fn check_proper_type(&mut self, ty: &Type, span: Span) {
+        if ty.is_error() || ty.is_no_type() {
+            return;
+        }
+        if self.st.kind_arity(ty) > 0 {
+            self.error(
+                span,
+                format!("{} takes type parameters", self.st.display_type(ty)),
+            );
+        }
+    }
+
+    /// nsc: `class C[A <% V](x: A)` → extra implicit ctor clause `(implicit evidence$n: A => V)`.
+    fn class_view_bound_evidence(&mut self, class_id: SymbolId, tparams: &[Tree]) -> Vec<Tree> {
+        let mut evidence = Vec::new();
+        for tp in tparams {
+            let TreeKind::TypeDef {
+                views,
+                tparams: inner,
+                ..
+            } = &tp.kind
+            else {
+                continue;
+            };
+            if views.is_empty() {
+                continue;
+            }
+            if !inner.is_empty() {
+                self.error(
+                    tp.span,
+                    "unimplemented syntax: view bounds on higher-kinded type parameters",
+                );
+                continue;
+            }
+            let tp_id = tp.sym;
+            if tp_id.is_none() {
+                continue;
+            }
+            for view in views {
+                if matches!(
+                    view.kind,
+                    TreeKind::ExistentialTypeTree { .. }
+                        | TreeKind::CompoundTypeTree { .. }
+                        | TreeKind::Unimplemented { .. }
+                ) {
+                    self.error(
+                        view.span,
+                        "unimplemented syntax: view bound shape (existential/refinement)",
+                    );
+                    continue;
+                }
+                let view_ty = self.tree_to_type(view);
+                if view_ty.is_error() {
+                    continue;
+                }
+                self.gensym += 1;
+                let ev_name = format!("evidence${}", self.gensym);
+                let ev_ty = Type::Function {
+                    params: vec![Type::TypeParam(tp_id)],
+                    ret: Box::new(view_ty),
+                };
+                let flags = Flags::IMPLICIT
+                    .with(Flags::PARAM)
+                    .with(Flags::PRIVATE)
+                    .with(Flags::LOCAL);
+                let ev_id = self.st.alloc(&ev_name, class_id, SymKind::Term, flags, "");
+                self.st.get_mut(ev_id).ty = ev_ty.clone();
+                self.st.enter_in_current(&ev_name, ev_id);
+                let mut ev = Tree::dummy(TreeKind::ValDef {
+                    mods: Modifiers::new(flags),
+                    name: ev_name,
+                    tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+                    rhs: Box::new(Tree::dummy(TreeKind::Empty)),
+                });
+                ev.span = tp.span;
+                ev.sym = ev_id;
+                ev.ty = ev_ty;
+                evidence.push(ev);
+            }
+        }
+        evidence
     }
 
     fn rough_parents(&self, parents: &[Tree], is_trait: bool) -> Vec<Type> {
@@ -786,38 +934,55 @@ impl Typer {
             TreeKind::ClassDef { impl_, .. } => (impl_.self_name.clone(), impl_.self_tpt.clone()),
             _ => (None, None),
         };
-        let (vparamss, body, parents) = match &mut tree.kind {
+        let (vparamss, body, parents, tparams) = match &mut tree.kind {
             TreeKind::ClassDef {
-                vparamss, impl_, ..
-            } => (vparamss, &mut impl_.body, &mut impl_.parents),
+                vparamss,
+                impl_,
+                tparams,
+                ..
+            } => (
+                vparamss,
+                &mut impl_.body,
+                &mut impl_.parents,
+                tparams.clone(),
+            ),
             _ => return,
         };
+        let evidence = self.class_view_bound_evidence(id, &tparams);
+        if !evidence.is_empty() {
+            vparamss.push(evidence);
+        }
         // Ctor params must be typed before `extends C(z)` so the argument `z`
         // is a known term, not a NoType ident.
-        let mut ctor_param_tys = Vec::new();
+        let mut paramss_ty: Vec<Vec<Type>> = Vec::new();
+        let mut paramss_ids: Vec<Vec<SymbolId>> = Vec::new();
+        let mut all_ctor_params = Vec::new();
         for clause in vparamss.iter_mut() {
+            let mut ct = Vec::new();
+            let mut ids = Vec::new();
             for p in clause.iter_mut() {
                 self.type_val_sig(p);
-                ctor_param_tys.push(p.ty.clone());
+                ct.push(p.ty.clone());
                 if !p.sym.is_none() {
                     self.st.get_mut(p.sym).ty = p.ty.clone();
+                    ids.push(p.sym);
+                    all_ctor_params.push(p.sym);
                 }
             }
+            paramss_ty.push(ct);
+            paramss_ids.push(ids);
         }
+        let ctor_param_tys = paramss_ty.first().cloned().unwrap_or_default();
         // Primary `<init>` type must be visible before auxiliary `this(...)` bodies.
-        let ctor_fields = if id.is_none() {
-            Vec::new()
-        } else {
-            self.st.get(id).ctor_fields.clone()
-        };
         if !id.is_none() {
             for mem in self.st.get(id).members.clone() {
                 if self.st.get(mem).name == "<init>"
-                    && self.st.get(mem).ty.is_no_type()
-                    && self.st.get(mem).params == ctor_fields
+                    && self.st.get(mem).params == self.st.get(id).ctor_fields.clone()
                 {
+                    self.st.get_mut(mem).params = all_ctor_params.clone();
+                    self.st.get_mut(mem).paramss = paramss_ids.clone();
                     self.st.get_mut(mem).ty = Type::Method {
-                        paramss: vec![ctor_param_tys.clone()],
+                        paramss: paramss_ty.clone(),
                         ret: Box::new(Type::Unit),
                     };
                 }
@@ -1306,6 +1471,12 @@ impl Typer {
                     self.check_variance_ty(vars, a, pos * vp, span, where_);
                 }
             }
+            Type::Applied { ctor, args } => {
+                self.check_variance_ty(vars, ctor, pos, span, where_);
+                for a in args {
+                    self.check_variance_ty(vars, a, 0, span, where_);
+                }
+            }
             Type::Function { params, ret } => {
                 for p in params {
                     self.check_variance_ty(vars, p, -pos, span, where_);
@@ -1401,7 +1572,9 @@ impl Typer {
         let ty = if tpt.is_empty() {
             Type::NoType
         } else {
-            self.tree_to_type(&tpt)
+            let ty = self.tree_to_type(&tpt);
+            self.check_proper_type(&ty, tree.span);
+            ty
         };
         let ty = if flags.contains(Flags::BYNAME) && !matches!(ty, Type::ByName(_) | Type::NoType) {
             Type::ByName(Box::new(ty))
@@ -1709,7 +1882,9 @@ impl Typer {
         } else if tpt.is_empty() {
             Type::NoType
         } else {
-            self.tree_to_type(&tpt)
+            let ret = self.tree_to_type(&tpt);
+            self.check_proper_type(&ret, span);
+            ret
         };
         if name == "<init>" && !tree.sym.is_none() {
             let f = self.st.get(tree.sym).flags.with(Flags::CONSTRUCTOR);
@@ -1882,6 +2057,7 @@ impl Typer {
             return;
         }
         tree.ty = self.tree_to_type(tree);
+        self.check_proper_type(&tree.ty, tree.span);
         if let Some(id) = self.st.class_sym_of(&tree.ty) {
             tree.sym = id;
             if !self.st.get(id).flags.contains(Flags::TRAIT)
@@ -2909,6 +3085,7 @@ impl Typer {
             _ => Vec::new(),
         };
         let subst = |ty: Type| -> Type {
+            let ty = self.st.subst_as_seen_from(&qual.ty, &ty);
             if !subst_args.is_empty() {
                 if let Some(owner) = found.first().map(|s| self.st.get(*s).owner) {
                     return self.st.subst_tparams(owner, &subst_args, &ty);
@@ -3734,6 +3911,26 @@ impl Typer {
                 }
             }
             tree.sym = ctor_sym.or(class_id).unwrap_or(SymbolId::NONE);
+            if let Some(csym) = ctor_sym {
+                let mut ctor_ty = self.st.get(csym).ty.clone();
+                if let Some(c) = class_id {
+                    if !inferred_args.is_empty() {
+                        ctor_ty = self.st.subst_tparams(c, &inferred_args, &ctor_ty);
+                    }
+                }
+                let ctor_fun = Tree {
+                    id: fun.id,
+                    span: fun.span,
+                    kind: TreeKind::Ident {
+                        name: "<init>".into(),
+                    },
+                    ty: ctor_ty,
+                    sym: csym,
+                    postfix: false,
+                };
+                let _ =
+                    self.fill_defaults_and_implicits(tree.span, args, &ctor_params, &ctor_fun, pt);
+            }
             return;
         }
 
@@ -5695,6 +5892,7 @@ impl Typer {
                 }
             }
             TreeKind::AppliedTypeTree { tpt, args } => {
+                let span = tpt.span;
                 let mut as_ = Vec::new();
                 for a in args {
                     as_.push(self.tree_to_type(a));
@@ -5733,14 +5931,16 @@ impl Typer {
                         }
                     }
                     Some("Function") => match self.tree_to_type(tpt) {
-                        Type::Class { sym, .. } => Type::Class { sym, args: as_ },
-                        _ => self.resolve_type_name("Function", &as_),
+                        Type::Class { sym, .. } => {
+                            self.apply_types(Type::Class { sym, args: vec![] }, as_, span)
+                        }
+                        ctor => self.apply_types(ctor, as_, span),
                     },
                     Some(n) if n.starts_with("Tuple") => Type::Tuple(as_),
-                    Some(n) => match self.tree_to_type(tpt) {
-                        Type::Class { sym, .. } => Type::Class { sym, args: as_ },
-                        _ => self.resolve_type_name(n, &as_),
-                    },
+                    Some(_) => {
+                        let ctor = self.tree_to_type(tpt);
+                        self.apply_types(ctor, as_, span)
+                    }
                     None => Type::Error,
                 }
             }
@@ -5754,7 +5954,10 @@ impl Typer {
                     Some("Array") => {
                         Type::Array(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
                     }
-                    Some(n) => self.resolve_type_name(n, &as_),
+                    Some(n) => {
+                        let ctor = self.resolve_type_name(n, &[]);
+                        self.apply_types(ctor, as_, fun.span)
+                    }
                     None => Type::Error,
                 }
             }
@@ -8071,6 +8274,14 @@ fn expand_alias_type(
                 args: args?,
             })
         }
+        Type::Applied { ctor, args } => {
+            let ctor = expand_alias_type(st, ctor, alias_ids, seen)?;
+            let args: Result<Vec<_>, _> = args
+                .iter()
+                .map(|a| expand_alias_type(st, a, alias_ids, seen))
+                .collect();
+            Ok(crate::symbol::apply_type_ctor(ctor, args?))
+        }
         Type::Array(t) => Ok(Type::Array(Box::new(expand_alias_type(
             st, t, alias_ids, seen,
         )?))),
@@ -8253,6 +8464,9 @@ fn type_args_are_instantiated(args: &[Type], tps: &[SymbolId]) -> bool {
 fn still_raw_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
     match ty {
         Type::TypeParam(id) => tps.contains(id),
+        Type::Applied { ctor, args } => {
+            still_raw_tparam(ctor, tps) || args.iter().any(|a| still_raw_tparam(a, tps))
+        }
         Type::Annotated { tpe, .. } => still_raw_tparam(tpe, tps),
         _ => false,
     }
@@ -8279,6 +8493,38 @@ fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
             }
             None
         }
+        Type::Applied { ctor, args: pas } => match actual {
+            Type::Applied {
+                ctor: ac,
+                args: aas,
+            } => {
+                if let Some(t) = unify_one(tp, ctor, ac) {
+                    return Some(t);
+                }
+                for (p, a) in pas.iter().zip(aas) {
+                    if let Some(t) = unify_one(tp, p, a) {
+                        return Some(t);
+                    }
+                }
+                None
+            }
+            Type::Class { sym, args: aas } => {
+                let unapplied = Type::Class {
+                    sym: *sym,
+                    args: vec![],
+                };
+                if let Some(t) = unify_one(tp, ctor, &unapplied) {
+                    return Some(t);
+                }
+                for (p, a) in pas.iter().zip(aas) {
+                    if let Some(t) = unify_one(tp, p, a) {
+                        return Some(t);
+                    }
+                }
+                None
+            }
+            _ => None,
+        },
         Type::Function { params, ret } => {
             if let Type::Function {
                 params: aps,
@@ -8325,12 +8571,19 @@ pub fn find_mains(st: &SymbolTable, tree: &Tree) -> Vec<String> {
                 }
             }
             TreeKind::ModuleDef { name, impl_, .. } => {
+                let mut has_main = false;
                 for b in &impl_.body {
                     if let TreeKind::DefDef { name: mn, .. } = &b.kind {
                         if mn == "main" {
-                            out.push(name.clone());
+                            has_main = true;
                         }
                     }
+                }
+                if !has_main {
+                    has_main = impl_.parents.iter().any(|p| parent_is_app(st, p));
+                }
+                if has_main {
+                    out.push(name.clone());
                 }
             }
             TreeKind::ClassDef { impl_, .. } => {
@@ -8343,6 +8596,38 @@ pub fn find_mains(st: &SymbolTable, tree: &Tree) -> Vec<String> {
     }
     walk(st, tree, &mut out);
     out
+}
+
+fn parent_is_app(st: &SymbolTable, p: &Tree) -> bool {
+    let id = st
+        .class_sym_of(&p.ty)
+        .or_else(|| if p.sym.is_none() { None } else { Some(p.sym) });
+    let Some(id) = id else {
+        return p.name() == Some("App");
+    };
+    class_extends_named(st, id, "App")
+}
+
+fn class_extends_named(st: &SymbolTable, id: SymbolId, name: &str) -> bool {
+    if st.get(id).name == name {
+        return true;
+    }
+    let mut work = st.get(id).parents.clone();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(id.0);
+    while let Some(p) = work.pop() {
+        let Some(pid) = st.class_sym_of(&p) else {
+            continue;
+        };
+        if !seen.insert(pid.0) {
+            continue;
+        }
+        if st.get(pid).name == name {
+            return true;
+        }
+        work.extend(st.get(pid).parents.clone());
+    }
+    false
 }
 
 /// Replace quantified existential names (`type X` / `type X <: Bound`) with
@@ -8386,6 +8671,10 @@ fn subst_quantified(ty: Type, qs: &[ExistQuant]) -> Type {
         }
         Type::Class { sym, args } => Type::Class {
             sym,
+            args: args.into_iter().map(|a| subst_quantified(a, qs)).collect(),
+        },
+        Type::Applied { ctor, args } => Type::Applied {
+            ctor: Box::new(subst_quantified(*ctor, qs)),
             args: args.into_iter().map(|a| subst_quantified(a, qs)).collect(),
         },
         Type::Array(t) => Type::Array(Box::new(subst_quantified(*t, qs))),

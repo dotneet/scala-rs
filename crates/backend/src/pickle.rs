@@ -730,6 +730,34 @@ impl<'a> Pickler<'a> {
                     .collect();
                 self.class_type_ref(*sym, &arg_refs)
             }
+            Type::Applied { ctor, args } => match ctor.as_ref() {
+                Type::TypeParam(id) => {
+                    let pref = self.noprefix;
+                    let sym = self.pickle_typesym(*id);
+                    let mut body = Vec::new();
+                    write_nat_to(&mut body, pref);
+                    write_nat_to(&mut body, sym);
+                    for a in args {
+                        write_nat_to(&mut body, self.pickle_type_pack(a, quantified));
+                    }
+                    self.add(TYPEREFTPE, body)
+                }
+                Type::Class {
+                    sym,
+                    args: existing,
+                } => {
+                    let mut all = existing.clone();
+                    all.extend(args.iter().cloned());
+                    self.pickle_type_pack(
+                        &Type::Class {
+                            sym: *sym,
+                            args: all,
+                        },
+                        quantified,
+                    )
+                }
+                _ => self.pickle_type(ctor),
+            },
             Type::Tuple(ts) => {
                 let arg_refs: Vec<u32> = ts
                     .iter()
@@ -1377,6 +1405,38 @@ impl<'a> Pickler<'a> {
                 write_nat_to(&mut body, sym);
                 self.add(TYPEREFTPE, body)
             }
+            Type::Applied { ctor, args } => {
+                if args.iter().any(type_has_wildcard) {
+                    let mut quantified = Vec::new();
+                    let inner = self.pickle_type_pack(ty, &mut quantified);
+                    return self.pickle_existential_tpe(inner, &quantified);
+                }
+                match ctor.as_ref() {
+                    Type::TypeParam(id) => {
+                        let pref = self.noprefix;
+                        let sym = self.pickle_typesym(*id);
+                        let mut body = Vec::new();
+                        write_nat_to(&mut body, pref);
+                        write_nat_to(&mut body, sym);
+                        for a in args {
+                            write_nat_to(&mut body, self.pickle_type(a));
+                        }
+                        self.add(TYPEREFTPE, body)
+                    }
+                    Type::Class {
+                        sym,
+                        args: existing,
+                    } => {
+                        let mut all = existing.clone();
+                        all.extend(args.iter().cloned());
+                        self.pickle_type(&Type::Class {
+                            sym: *sym,
+                            args: all,
+                        })
+                    }
+                    _ => self.pickle_type(ctor),
+                }
+            }
             Type::TypeMember(id) => {
                 let owner = self.st.get(*id).owner.0;
                 let pref = self.this_tpes.get(&owner).copied().unwrap_or(self.noprefix);
@@ -1901,6 +1961,9 @@ fn type_has_wildcard(t: &Type) -> bool {
         Type::Wildcard | Type::BoundedWildcard { .. } => true,
         Type::Annotated { tpe, .. } => type_has_wildcard(tpe),
         Type::Class { args, .. } => args.iter().any(type_has_wildcard),
+        Type::Applied { ctor, args } => {
+            type_has_wildcard(ctor) || args.iter().any(type_has_wildcard)
+        }
         Type::Tuple(ts) => ts.iter().any(type_has_wildcard),
         Type::Refined { parents, .. } => parents.iter().any(type_has_wildcard),
         Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => type_has_wildcard(t),

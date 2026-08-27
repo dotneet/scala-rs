@@ -187,6 +187,12 @@ pub enum Type {
     ModuleRef(SymbolId),
     /// A type parameter (`T` in `def id[T](x: T): T`).
     TypeParam(SymbolId),
+    /// Application of a higher-kinded type constructor that is not a class
+    /// (`F[A]` where `F` is `F[_]`). Class applications stay `Class { args }`.
+    Applied {
+        ctor: Box<Type>,
+        args: Vec<Type>,
+    },
     /// Abstract type member (`trait Foo { type A }`). Aliases expand away.
     TypeMember(SymbolId),
     /// Unbounded wildcard existential `_` (as in `List[_]`).
@@ -360,6 +366,17 @@ impl fmt::Display for Type {
             }
             Type::ModuleRef(s) => write!(f, "module#{}", s.0),
             Type::TypeParam(s) => write!(f, "tparam#{}", s.0),
+            Type::Applied { ctor, args } => {
+                write!(f, "{ctor}")?;
+                write!(f, "[")?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{a}")?;
+                }
+                write!(f, "]")
+            }
             Type::TypeMember(s) => write!(f, "tmem#{}", s.0),
             Type::Wildcard => write!(f, "_"),
             Type::BoundedWildcard { lo, hi } => {

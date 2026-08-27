@@ -319,6 +319,7 @@ impl SymbolTable {
                 .into_iter()
                 .find(|s| self.get(*s).is_class_like()),
             Type::TypeParam(_) => None,
+            Type::Applied { ctor, .. } => self.class_sym_of(ctor),
             Type::TypeMember(_) => None,
             Type::Wildcard | Type::BoundedWildcard { .. } => Some(self.any_sym),
             Type::ThisType(sym) => Some(*sym),
@@ -373,6 +374,98 @@ impl SymbolTable {
             return ty.clone();
         }
         subst_map(ty, &tps, args)
+    }
+
+    /// Remaining kind arity: 0 is a proper type (`*`), 1 is `* -> *`, etc.
+    pub fn kind_arity(&self, ty: &Type) -> usize {
+        match ty {
+            Type::TypeParam(id) | Type::TypeMember(id) => self.get(*id).tparams.len(),
+            Type::Class { sym, args } => self.get(*sym).tparams.len().saturating_sub(args.len()),
+            Type::Applied { ctor, args } => self.kind_arity(ctor).saturating_sub(args.len()),
+            Type::Named { args, .. } => {
+                if args.is_empty() {
+                    self.class_sym_of(ty)
+                        .map(|c| self.get(c).tparams.len())
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            Type::Annotated { tpe, .. } => self.kind_arity(tpe),
+            _ => 0,
+        }
+    }
+
+    /// Kinds of the next type parameters of a type constructor (`F[_]` → `[0]`).
+    pub fn tparam_arities(&self, ty: &Type) -> Vec<usize> {
+        match ty {
+            Type::Class { sym, args } => self
+                .get(*sym)
+                .tparams
+                .iter()
+                .skip(args.len())
+                .map(|tp| self.get(*tp).tparams.len())
+                .collect(),
+            Type::TypeParam(id) | Type::TypeMember(id) => self
+                .get(*id)
+                .tparams
+                .iter()
+                .map(|tp| self.get(*tp).tparams.len())
+                .collect(),
+            Type::Applied { ctor, args } => {
+                let mut rest = self.tparam_arities(ctor);
+                let n = args.len().min(rest.len());
+                rest.drain(0..n);
+                rest
+            }
+            Type::Annotated { tpe, .. } => self.tparam_arities(tpe),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Substitute inherited member types using applied parents (`Functor[Id].map`).
+    pub fn subst_as_seen_from(&self, recv: &Type, ty: &Type) -> Type {
+        fn walk(
+            st: &SymbolTable,
+            recv: &Type,
+            ty: Type,
+            seen: &mut std::collections::HashSet<u32>,
+        ) -> Type {
+            match recv {
+                Type::Class { sym, args } => {
+                    if !seen.insert(sym.0) {
+                        return ty;
+                    }
+                    let mut t = if args.is_empty() {
+                        ty
+                    } else {
+                        st.subst_tparams(*sym, args, &ty)
+                    };
+                    for p in st.get(*sym).parents.clone() {
+                        t = walk(st, &p, t, seen);
+                    }
+                    t
+                }
+                Type::ModuleRef(sym) => {
+                    if !seen.insert(sym.0) {
+                        return ty;
+                    }
+                    let mut t = ty;
+                    for p in st.get(*sym).parents.clone() {
+                        t = walk(st, &p, t, seen);
+                    }
+                    t
+                }
+                Type::Annotated { tpe, .. } => walk(st, tpe, ty, seen),
+                Type::Applied { ctor, args } => {
+                    let t = apply_type_ctor((**ctor).clone(), args.clone());
+                    walk(st, &t, ty, seen)
+                }
+                _ => ty,
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        walk(self, recv, ty.clone(), &mut seen)
     }
 
     pub fn type_of_class(&self, id: SymbolId) -> Type {
@@ -513,7 +606,8 @@ impl SymbolTable {
                 | Type::Refined { .. }
                 | Type::ThisType(_)
                 | Type::SingleType { .. }
-                | Type::Annotated { .. },
+                | Type::Annotated { .. }
+                | Type::Applied { .. },
                 Type::AnyRef,
             ) => true,
             (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) if s1 == s2 => {
@@ -525,6 +619,31 @@ impl SymbolTable {
                         .all(|(x, y)| self.is_sub_type(x, y))
                 } else {
                     false
+                }
+            }
+            (Type::Applied { ctor: c1, args: a1 }, Type::Applied { ctor: c2, args: a2 })
+                if a1.len() == a2.len() =>
+            {
+                self.is_sub_type(c1, c2)
+                    && a1
+                        .iter()
+                        .zip(a2.iter())
+                        .all(|(x, y)| self.is_sub_type(x, y))
+            }
+            (Type::Applied { ctor, args }, other) => {
+                let folded = apply_type_ctor((**ctor).clone(), args.clone());
+                if matches!(folded, Type::Applied { .. }) {
+                    false
+                } else {
+                    self.is_sub_type(&folded, other)
+                }
+            }
+            (other, Type::Applied { ctor, args }) => {
+                let folded = apply_type_ctor((**ctor).clone(), args.clone());
+                if matches!(folded, Type::Applied { .. }) {
+                    false
+                } else {
+                    self.is_sub_type(other, &folded)
                 }
             }
             // Before the Class-parent walk: that arm matches every Class and
@@ -666,6 +785,19 @@ impl SymbolTable {
             }
             Type::ModuleRef(id) => self.get(*id).name.clone(),
             Type::TypeParam(id) => self.get(*id).name.clone(),
+            Type::Applied { ctor, args } => {
+                let mut s = self.display_type(ctor);
+                s.push('[');
+                s.push_str(
+                    &args
+                        .iter()
+                        .map(|a| self.display_type(a))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                s.push(']');
+                s
+            }
             Type::TypeMember(id) => {
                 let s = self.get(*id);
                 format!("{}.{}", self.get(s.owner).name, s.name)
@@ -781,6 +913,12 @@ impl SymbolTable {
                     .map(|a| self.expand_type_members(from, a))
                     .collect(),
             },
+            Type::Applied { ctor, args } => apply_type_ctor(
+                self.expand_type_members(from, ctor),
+                args.iter()
+                    .map(|a| self.expand_type_members(from, a))
+                    .collect(),
+            ),
             Type::Array(t) => Type::Array(Box::new(self.expand_type_members(from, t))),
             Type::Function { params, ret } => Type::Function {
                 params: params
@@ -1116,6 +1254,10 @@ fn subst_map(ty: &Type, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> Typ
             sym: *sym,
             args: as_.iter().map(|a| subst_map(a, tps, args)).collect(),
         },
+        Type::Applied { ctor, args: as_ } => apply_type_ctor(
+            subst_map(ctor, tps, args),
+            as_.iter().map(|a| subst_map(a, tps, args)).collect(),
+        ),
         Type::Array(t) => Type::Array(Box::new(subst_map(t, tps, args))),
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(|p| subst_map(p, tps, args)).collect(),
@@ -1228,6 +1370,12 @@ fn subst_refine_aliases(st: &SymbolTable, decls: &[RefineDecl], ty: &Type) -> Ty
                 .map(|a| subst_refine_aliases(st, decls, a))
                 .collect(),
         },
+        Type::Applied { ctor, args } => apply_type_ctor(
+            subst_refine_aliases(st, decls, ctor),
+            args.iter()
+                .map(|a| subst_refine_aliases(st, decls, a))
+                .collect(),
+        ),
         Type::Array(t) => Type::Array(Box::new(subst_refine_aliases(st, decls, t))),
         Type::Function { params, ret } => Type::Function {
             params: params
@@ -1260,4 +1408,45 @@ fn subst_refine_aliases(st: &SymbolTable, decls: &[RefineDecl], ty: &Type) -> Ty
 
 pub(crate) fn subst_tparams_slice(tps: &[SymbolId], args: &[Type], ty: &Type) -> Type {
     subst_map(ty, tps, args)
+}
+
+/// Apply type arguments to a constructor (`Id` + `[A]` → `Id[A]`).
+pub fn apply_type_ctor(ctor: Type, args: Vec<Type>) -> Type {
+    if args.is_empty() {
+        return ctor;
+    }
+    match ctor {
+        Type::Class {
+            sym,
+            args: existing,
+        } => {
+            let mut all = existing;
+            all.extend(args);
+            Type::Class { sym, args: all }
+        }
+        Type::Named {
+            name,
+            args: existing,
+        } => {
+            let mut all = existing;
+            all.extend(args);
+            Type::Named { name, args: all }
+        }
+        Type::Applied {
+            ctor,
+            args: existing,
+        } => {
+            let mut all = existing;
+            all.extend(args);
+            apply_type_ctor(*ctor, all)
+        }
+        Type::Annotated { tpe, annot } => Type::Annotated {
+            tpe: Box::new(apply_type_ctor(*tpe, args)),
+            annot,
+        },
+        other => Type::Applied {
+            ctor: Box::new(other),
+            args,
+        },
+    }
 }

@@ -313,6 +313,22 @@ fn fixtures_view_bounds() {
     check("view_bounds");
 }
 #[test]
+fn fixtures_view_bounds_class() {
+    check("view_bounds_class");
+}
+#[test]
+fn fixtures_hk_types() {
+    check("hk_types");
+}
+#[test]
+fn fixtures_app() {
+    check("app");
+}
+#[test]
+fn fixtures_delayed_init() {
+    check("delayed_init");
+}
+#[test]
 fn fixtures_implicit_inherited() {
     check("implicit_inherited");
 }
@@ -504,8 +520,13 @@ fn fixtures_existential_bounds_is_error() {
 }
 
 #[test]
-fn fixtures_view_bounds_class_is_error() {
-    compile_fails("view_bounds_class", "view bound");
+fn fixtures_view_bounds_class_bad_is_error() {
+    compile_fails("view_bounds_class_bad", "no implicit");
+}
+
+#[test]
+fn fixtures_hk_bad_is_error() {
+    compile_fails("hk_bad", "type parameters");
 }
 
 #[test]
@@ -1226,6 +1247,26 @@ fn scala_library_dual_run_view_bounds() {
 }
 
 #[test]
+fn scala_library_dual_run_view_bounds_class() {
+    dual_run_fixture("view_bounds_class");
+}
+
+#[test]
+fn scala_library_dual_run_hk_types() {
+    dual_run_fixture("hk_types");
+}
+
+#[test]
+fn scala_library_dual_run_app() {
+    dual_run_fixture("app");
+}
+
+#[test]
+fn scala_library_dual_run_delayed_init() {
+    dual_run_fixture("delayed_init");
+}
+
+#[test]
 fn scala_library_dual_run_implicit_inherit_local() {
     dual_run_fixture("implicit_inherit_local");
 }
@@ -1369,6 +1410,8 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/util/Either.class",
     "scala/util/Left.class",
     "scala/util/Right.class",
+    "scala/App.class",
+    "scala/DelayedInit.class",
     "scala/util/Left$.class",
     "scala/util/Right$.class",
     "scala/util/Try.class",

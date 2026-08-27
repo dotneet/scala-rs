@@ -191,6 +191,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_array_companion(st, ct);
     }
     let ordered = add_ordered(st);
+    add_delayed_init_app(st);
 
     // Some companion with apply
     let some_mod = module(st, st.scala_pkg, "Some", "scala/Some$");
@@ -2704,4 +2705,47 @@ fn add_enumeration(st: &mut SymbolTable) {
         args: vec![],
     };
     method(st, en, "Value", vec![], val_t, Intrinsic::None);
+}
+
+/// `scala.DelayedInit` / `scala.App` (nsc delayed constructor body).
+fn add_delayed_init_app(st: &mut SymbolTable) {
+    let di = iface(st, st.scala_pkg, "DelayedInit", "scala/DelayedInit");
+    let d = st.alloc("delayedInit", di, SymKind::Method, Flags::ABSTRACT, "");
+    st.get_mut(d).ty = Type::Method {
+        paramss: vec![vec![Type::ByName(Box::new(Type::Unit))]],
+        ret: Box::new(Type::Unit),
+    };
+    let p = st.alloc("x", d, SymKind::Term, Flags::PARAM.with(Flags::BYNAME), "");
+    st.get_mut(p).ty = Type::ByName(Box::new(Type::Unit));
+    st.get_mut(d).params = vec![p];
+    st.get_mut(d).paramss = vec![vec![p]];
+
+    let app = iface(st, st.scala_pkg, "App", "scala/App");
+    st.get_mut(app).parents = vec![
+        Type::Class {
+            sym: di,
+            args: vec![],
+        },
+        Type::AnyRef,
+    ];
+    let d2 = st.alloc("delayedInit", app, SymKind::Method, Flags::EMPTY, "");
+    st.get_mut(d2).ty = Type::Method {
+        paramss: vec![vec![Type::ByName(Box::new(Type::Unit))]],
+        ret: Box::new(Type::Unit),
+    };
+    let p2 = st.alloc("x", d2, SymKind::Term, Flags::PARAM.with(Flags::BYNAME), "");
+    st.get_mut(p2).ty = Type::ByName(Box::new(Type::Unit));
+    st.get_mut(d2).params = vec![p2];
+    st.get_mut(d2).paramss = vec![vec![p2]];
+
+    let main = st.alloc("main", app, SymKind::Method, Flags::EMPTY, "");
+    let args_ty = Type::Array(Box::new(Type::String));
+    st.get_mut(main).ty = Type::Method {
+        paramss: vec![vec![args_ty.clone()]],
+        ret: Box::new(Type::Unit),
+    };
+    let ap = st.alloc("args", main, SymKind::Term, Flags::PARAM, "");
+    st.get_mut(ap).ty = args_ty;
+    st.get_mut(main).params = vec![ap];
+    st.get_mut(main).paramss = vec![vec![ap]];
 }

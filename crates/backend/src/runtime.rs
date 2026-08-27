@@ -32,6 +32,8 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
         emit_arrow_assoc(),
         emit_not_implemented(),
         emit_non_local_return_control(),
+        emit_delayed_init(),
+        emit_app(),
     ]
 }
 
@@ -1056,5 +1058,30 @@ fn emit_non_local_return_control() -> EmittedClass {
         );
         asm.areturn();
     });
+    b.finish()
+}
+
+fn emit_delayed_init() -> EmittedClass {
+    let mut b = B::class("scala/DelayedInit", "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT;
+    b.interfaces.clear();
+    b.add_abstract(
+        ACC_PUBLIC | ACC_ABSTRACT,
+        "delayedInit",
+        "(Lscala/Function0;)V",
+    );
+    b.finish()
+}
+
+fn emit_app() -> EmittedClass {
+    let mut b = B::class("scala/App", "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT;
+    b.interfaces = vec!["scala/DelayedInit".into()];
+    b.add_abstract(
+        ACC_PUBLIC | ACC_ABSTRACT,
+        "delayedInit",
+        "(Lscala/Function0;)V",
+    );
+    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, "main", "([Ljava/lang/String;)V");
     b.finish()
 }
