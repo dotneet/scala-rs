@@ -3016,8 +3016,9 @@ impl<'a> Parser<'a> {
         self.parse_pattern()
     }
 
-    /// Scala 2.13 XML literal subset: `<a/>`, `<a></a>`, `<a>t{e}</a>` (elem / text / splice).
-    /// Attributes, namespaces, entity refs, and CDATA are diagnosed, not dropped.
+    /// Scala 2.13 XML literal subset: `<a/>`, `<a></a>`, `<a>t{e}</a>`,
+    /// `<a b={e} c="t"/>` (elem / text / splice / unprefixed attributes).
+    /// Namespaces, entity refs, and CDATA are diagnosed, not dropped.
     fn parse_xml_literal(&mut self) -> Tree {
         let lo = self.span();
         self.bump(); // `<`
@@ -3043,45 +3044,20 @@ impl<'a> Parser<'a> {
             }
         };
         self.skip_nl();
+        let attrs = self.parse_xml_attrs();
         match self.kind().clone() {
             TokenKind::Ident(n) if n == "/>" => {
                 self.bump();
-                return self.xml_elem(&name, Vec::new(), lo.merge(self.prev_span()));
+                return self.xml_elem(&name, attrs, Vec::new(), lo.merge(self.prev_span()));
             }
             TokenKind::Ident(n) if n == ">" => {
                 self.bump();
             }
-            TokenKind::Ident(n) if n == "<" || n == "</" => {
-                return self
-                    .unimplemented(self.span(), "XML literal: expected `>` after element name");
-            }
             _ => {
-                let bad = self.span();
-                let _ = self.unimplemented(bad, "XML attributes/namespaces");
-                loop {
-                    match self.kind() {
-                        TokenKind::Ident(n) if n == ">" || n == "/>" || n == "</" || n == "<" => {
-                            break;
-                        }
-                        TokenKind::Eof => break,
-                        _ => {
-                            self.bump();
-                        }
-                    }
-                }
-                match self.kind().clone() {
-                    TokenKind::Ident(n) if n == "/>" => {
-                        self.bump();
-                        return self.xml_elem(&name, Vec::new(), lo.merge(self.prev_span()));
-                    }
-                    TokenKind::Ident(n) if n == ">" => {
-                        self.bump();
-                    }
-                    _ => {
-                        return self
-                            .unimplemented(lo.merge(self.span()), "XML literal: unclosed element");
-                    }
-                }
+                return self.unimplemented(
+                    lo.merge(self.span()),
+                    "XML literal: expected `>` after element name",
+                );
             }
         }
         let mut children = Vec::new();
@@ -3159,7 +3135,99 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.xml_elem(&name, children, lo.merge(self.prev_span()))
+        self.xml_elem(&name, attrs, children, lo.merge(self.prev_span()))
+    }
+
+    /// Unprefixed `b={e}` / `c="t"`. Prefixed names and `xmlns` are diagnosed.
+    fn parse_xml_attrs(&mut self) -> Vec<(String, Tree)> {
+        let mut attrs = Vec::new();
+        loop {
+            self.skip_nl();
+            match self.kind().clone() {
+                TokenKind::Ident(n) if n == ">" || n == "/>" || n == "</" || n == "<" => break,
+                TokenKind::Eof => break,
+                TokenKind::Ident(n) if !is_operator_name(&n) => {
+                    let lo = self.span();
+                    self.bump();
+                    self.skip_nl();
+                    if matches!(self.kind(), TokenKind::Colon) || n == "xmlns" {
+                        let _ = self.unimplemented(lo.merge(self.span()), "XML namespaces");
+                        self.skip_xml_attr_tail();
+                        continue;
+                    }
+                    if !matches!(self.kind(), TokenKind::Equals) {
+                        let _ =
+                            self.unimplemented(lo.merge(self.span()), "XML attributes/namespaces");
+                        self.skip_xml_attr_tail();
+                        continue;
+                    }
+                    self.bump();
+                    self.skip_nl();
+                    let value = match self.kind().clone() {
+                        TokenKind::LBrace => self.parse_block_expr(),
+                        TokenKind::StringLit(s) => {
+                            let sp = self.span();
+                            self.bump();
+                            self.alloc(
+                                sp,
+                                TreeKind::Literal {
+                                    lit: Lit::String(s),
+                                },
+                            )
+                        }
+                        _ => {
+                            let _ = self.unimplemented(self.span(), "XML attribute value");
+                            self.skip_xml_attr_tail();
+                            continue;
+                        }
+                    };
+                    attrs.push((n, value));
+                }
+                _ => {
+                    let _ = self.unimplemented(self.span(), "XML attributes/namespaces");
+                    loop {
+                        match self.kind() {
+                            TokenKind::Ident(n)
+                                if n == ">" || n == "/>" || n == "</" || n == "<" =>
+                            {
+                                break;
+                            }
+                            TokenKind::Eof => break,
+                            _ => {
+                                self.bump();
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        attrs
+    }
+
+    fn skip_xml_attr_tail(&mut self) {
+        self.skip_nl();
+        if matches!(self.kind(), TokenKind::Colon) {
+            self.bump();
+            self.skip_nl();
+            if matches!(self.kind(), TokenKind::Ident(_)) {
+                self.bump();
+            }
+        }
+        self.skip_nl();
+        if matches!(self.kind(), TokenKind::Equals) {
+            self.bump();
+            self.skip_nl();
+            match self.kind().clone() {
+                TokenKind::LBrace => {
+                    let _ = self.parse_block_expr();
+                }
+                TokenKind::StringLit(_) | TokenKind::Ident(_) | TokenKind::IntLit(_) => {
+                    self.bump();
+                }
+                _ => {}
+            }
+        }
     }
 
     fn xml_path(&mut self, names: &[&str], span: Span) -> Tree {
@@ -3226,8 +3294,30 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// `new scala.xml.Elem(null, label, scala.xml.Null, scala.xml.TopScope, true, children)`
-    fn xml_elem(&mut self, label: &str, children: Vec<Tree>, span: Span) -> Tree {
+    /// Nested `UnprefixedAttribute` chain ending at `scala.xml.Null` (nsc `$md`).
+    fn xml_attr_chain(&mut self, attrs: Vec<(String, Tree)>, span: Span) -> Tree {
+        let mut acc = self.xml_path(&["scala", "xml", "Null"], span);
+        for (key, value) in attrs.into_iter().rev() {
+            let cls = self.xml_path(&["scala", "xml", "UnprefixedAttribute"], span);
+            let k = self.alloc(
+                span,
+                TreeKind::Literal {
+                    lit: Lit::String(key),
+                },
+            );
+            acc = self.xml_new(cls, vec![k, value, acc], span);
+        }
+        acc
+    }
+
+    /// `new scala.xml.Elem(null, label, attrs, scala.xml.TopScope, true, children)`
+    fn xml_elem(
+        &mut self,
+        label: &str,
+        attrs: Vec<(String, Tree)>,
+        children: Vec<Tree>,
+        span: Span,
+    ) -> Tree {
         let cls = self.xml_path(&["scala", "xml", "Elem"], span);
         let prefix = self.alloc(span, TreeKind::Literal { lit: Lit::Null });
         let lab = self.alloc(
@@ -3236,7 +3326,7 @@ impl<'a> Parser<'a> {
                 lit: Lit::String(label.into()),
             },
         );
-        let attrs = self.xml_path(&["scala", "xml", "Null"], span);
+        let attrs = self.xml_attr_chain(attrs, span);
         let scope = self.xml_path(&["scala", "xml", "TopScope"], span);
         let min = self.alloc(
             span,

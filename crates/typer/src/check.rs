@@ -5103,6 +5103,7 @@ impl Typer {
                 clauses,
             } => {
                 let mut quantified = Vec::new();
+                let mut val_clauses: Vec<(String, Tree, Span)> = Vec::new();
                 let mut ok = true;
                 for c in clauses {
                     match &c.kind {
@@ -5130,12 +5131,8 @@ impl Typer {
                                 });
                             }
                         }
-                        TreeKind::ValDef { .. } => {
-                            self.error(
-                                c.span,
-                                "unimplemented type: value existential (`forSome { val … }`)",
-                            );
-                            ok = false;
+                        TreeKind::ValDef { name, tpt, .. } => {
+                            val_clauses.push((name.clone(), (**tpt).clone(), c.span));
                         }
                         TreeKind::Unimplemented { what } => {
                             self.error(c.span, format!("unimplemented type: {what}"));
@@ -5146,6 +5143,20 @@ impl Typer {
                             ok = false;
                         }
                     }
+                }
+                if !val_clauses.is_empty() {
+                    if quantified.is_empty() {
+                        if let Some(packed) = self.pack_value_existential(inner, &val_clauses) {
+                            return packed;
+                        }
+                    }
+                    for (_, _, sp) in &val_clauses {
+                        self.error(
+                            *sp,
+                            "unimplemented type: value existential (`forSome { val … }`)",
+                        );
+                    }
+                    return Type::Error;
                 }
                 let ty = self.tree_to_type(inner);
                 if !ok {
@@ -5162,6 +5173,37 @@ impl Typer {
                 args: vec![],
             },
         }
+    }
+
+    /// `p.Inner forSome { val p: Outer }` packs to `Outer#Inner` (tiny legal case).
+    fn pack_value_existential(
+        &mut self,
+        inner: &Tree,
+        vals: &[(String, Tree, Span)],
+    ) -> Option<Type> {
+        if vals.len() != 1 {
+            return None;
+        }
+        let (vname, tpt, _) = &vals[0];
+        let (pname, tname) = match &inner.kind {
+            TreeKind::Select { qual, name } => match &qual.kind {
+                TreeKind::Ident { name: q } => (q.as_str(), name.as_str()),
+                _ => return None,
+            },
+            TreeKind::SelectFromTypeTree { qual, name, hash } if !*hash => match &qual.kind {
+                TreeKind::Ident { name: q } => (q.as_str(), name.as_str()),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if pname != vname {
+            return None;
+        }
+        let prefix = self.tree_to_type(tpt);
+        if prefix.is_error() {
+            return None;
+        }
+        Some(self.project_from_prefix(inner.span, &prefix, tname))
     }
 
     /// `p.T` where `p` is a term is path-dependent; `java.lang.String` is not.
