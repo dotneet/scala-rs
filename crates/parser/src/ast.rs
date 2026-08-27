@@ -64,6 +64,8 @@ impl Flags {
     pub const STATIC: Flags = Flags(1 << 29);
     /// JVM `ACC_NATIVE` (`@native` methods).
     pub const NATIVE: Flags = Flags(1 << 30);
+    /// JVM `ACC_ENUM` (Java enum class / enum constant).
+    pub const ENUM: Flags = Flags(1u32 << 31);
 
     pub fn contains(self, f: Flags) -> bool {
         self.0 & f.0 != 0

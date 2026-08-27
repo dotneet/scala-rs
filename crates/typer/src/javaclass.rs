@@ -14,6 +14,7 @@ const ACC_INTERFACE: u16 = 0x0200;
 const ACC_ABSTRACT: u16 = 0x0400;
 const ACC_BRIDGE: u16 = 0x0040;
 const ACC_SYNTHETIC: u16 = 0x1000;
+const ACC_ENUM: u16 = 0x4000;
 const ACC_MODULE: u16 = 0x8000;
 
 #[derive(Clone, Debug)]
@@ -32,6 +33,12 @@ pub struct JavaField {
 }
 
 #[derive(Clone, Debug)]
+pub struct JavaInnerClass {
+    pub inner_jvm: String,
+    pub access: u16,
+}
+
+#[derive(Clone, Debug)]
 pub struct JavaClass {
     pub internal_name: String,
     pub access: u16,
@@ -42,6 +49,11 @@ pub struct JavaClass {
     pub signature: Option<String>,
     /// Nested type is `static` (`InnerClasses` / `$` in the name).
     pub nested_static: bool,
+    /// Scala classfile (`ScalaSig` / `Scala` / `ScalaSignature`).
+    pub is_scala: bool,
+    /// Has a `MODULE$` static field (Scala module class).
+    pub has_module_field: bool,
+    pub inner_classes: Vec<JavaInnerClass>,
 }
 
 pub struct BinaryIndex {
@@ -333,7 +345,12 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
     }
     let class_attrs = read_attrs(&mut c, &cp).unwrap_or_default();
     let signature = attr_utf8(&class_attrs, "Signature", &cp);
-    let nested_static = nested_is_static(&internal_name, &class_attrs, &cp);
+    let inner_classes = parse_inner_classes(&class_attrs, &cp);
+    let nested_static = nested_is_static(&internal_name, &inner_classes);
+    let is_scala = class_attrs.iter().any(|(n, _)| {
+        n == "ScalaSig" || n == "Scala" || n == "ScalaSignature" || n == "ScalaLongSignature"
+    });
+    let has_module_field = fields.iter().any(|f| f.name == "MODULE$");
     Ok(JavaClass {
         internal_name,
         access,
@@ -343,6 +360,9 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         fields,
         signature,
         nested_static,
+        is_scala,
+        has_module_field,
+        inner_classes,
     })
 }
 
@@ -364,6 +384,10 @@ pub fn is_java_varargs(access: u16) -> bool {
 
 pub fn is_java_protected(access: u16) -> bool {
     access & ACC_PROTECTED != 0
+}
+
+pub fn is_java_enum(access: u16) -> bool {
+    access & ACC_ENUM != 0
 }
 
 fn java_member_visible(access: u16) -> bool {
@@ -491,15 +515,16 @@ fn attr_utf8(attrs: &[(String, Vec<u8>)], name: &str, cp: &Cp) -> Option<String>
     cp.utf8(i)
 }
 
-fn nested_is_static(this: &str, attrs: &[(String, Vec<u8>)], cp: &Cp) -> bool {
+fn parse_inner_classes(attrs: &[(String, Vec<u8>)], cp: &Cp) -> Vec<JavaInnerClass> {
     let Some((_, body)) = attrs.iter().find(|(n, _)| n == "InnerClasses") else {
-        return this.contains('$');
+        return Vec::new();
     };
     if body.len() < 2 {
-        return this.contains('$');
+        return Vec::new();
     }
     let n = u16::from_be_bytes([body[0], body[1]]) as usize;
     let mut i = 2usize;
+    let mut out = Vec::new();
     for _ in 0..n {
         if i + 8 > body.len() {
             break;
@@ -507,9 +532,20 @@ fn nested_is_static(this: &str, attrs: &[(String, Vec<u8>)], cp: &Cp) -> bool {
         let inner_i = u16::from_be_bytes([body[i], body[i + 1]]);
         let flags = u16::from_be_bytes([body[i + 6], body[i + 7]]);
         i += 8;
-        if cp.class_name(inner_i).as_deref() == Some(this) {
-            return flags & ACC_STATIC != 0;
-        }
+        let Some(inner_jvm) = cp.class_name(inner_i) else {
+            continue;
+        };
+        out.push(JavaInnerClass {
+            inner_jvm,
+            access: flags,
+        });
+    }
+    out
+}
+
+fn nested_is_static(this: &str, inners: &[JavaInnerClass]) -> bool {
+    if let Some(ic) = inners.iter().find(|ic| ic.inner_jvm == this) {
+        return ic.access & ACC_STATIC != 0;
     }
     this.contains('$')
 }
@@ -679,6 +715,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_jdk_thread_state_enum_if_present() {
+        let mut idx = BinaryIndex::from_user_paths(Vec::new());
+        let Some(bytes) = idx.find_class("java/lang/Thread$State").unwrap() else {
+            panic!("JDK java.lang.Thread$State.class must be readable from jmods/rt");
+        };
+        let c = parse_java_classfile(&bytes).expect("parse Thread.State");
+        assert!(
+            is_java_enum(c.access),
+            "Thread.State must have ACC_ENUM: access={:#x}",
+            c.access
+        );
+        assert_eq!(c.super_name.as_deref(), Some("java/lang/Enum"));
+        assert!(
+            c.fields
+                .iter()
+                .any(|f| f.name == "NEW" && is_java_enum(f.access) && is_java_static(f.access)),
+            "enum constant NEW missing: {:?}",
+            c.fields
+        );
+        assert!(
+            c.methods.iter().any(|m| m.name == "values"
+                && m.desc == "()[Ljava/lang/Thread$State;"
+                && is_java_static(m.access)),
+            "values() missing: {:?}",
+            c.methods
+                .iter()
+                .filter(|m| m.name == "values")
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            c.methods.iter().any(|m| m.name == "valueOf"
+                && m.desc == "(Ljava/lang/String;)Ljava/lang/Thread$State;"
+                && is_java_static(m.access)),
+            "valueOf(String) missing"
+        );
+    }
+
+    #[test]
     fn unknown_cp_tag_is_unsupported() {
         let mut b = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52, 0, 2, 99];
         let err = parse_java_classfile(&b).unwrap_err();
@@ -689,5 +763,53 @@ mod tests {
         b[0] = 0x00;
         let err = parse_java_classfile(&b).unwrap_err();
         assert!(err.contains("not a classfile"), "{err}");
+    }
+
+    #[test]
+    fn parses_scala_library_ordering_enum_inners_if_present() {
+        let jar = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+        if !jar.is_file() {
+            return;
+        }
+        let mut idx = BinaryIndex::from_user_paths(vec![jar]);
+        let Some(bytes) = idx.find_class("scala/math/Ordering").unwrap() else {
+            panic!("scala-library Ordering.class must be readable");
+        };
+        let c = parse_java_classfile(&bytes).expect("parse Ordering");
+        assert!(c.is_scala, "Ordering must carry ScalaSig: {c:?}");
+        assert!(
+            c.inner_classes
+                .iter()
+                .any(|ic| ic.inner_jvm == "scala/math/Ordering$Int$"),
+            "InnerClasses must list Ordering$Int$: {:?}",
+            c.inner_classes
+                .iter()
+                .map(|ic| &ic.inner_jvm)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            c.methods.iter().any(|m| m.name == "compare"),
+            "Ordering.compare missing: {:?}",
+            c.methods.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+        let Some(ibytes) = idx.find_class("scala/math/Ordering$Int$").unwrap() else {
+            panic!("scala-library Ordering$Int$.class must be readable");
+        };
+        let ic = parse_java_classfile(&ibytes).expect("parse Ordering$Int$");
+        assert!(
+            ic.has_module_field,
+            "Ordering$Int$ must have MODULE$: {:?}",
+            ic.fields
+        );
+        assert!(
+            ic.methods
+                .iter()
+                .any(|m| m.name == "compare" && m.desc == "(II)I"),
+            "Ordering$Int$.compare(int,int) missing: {:?}",
+            ic.methods
+                .iter()
+                .filter(|m| m.name == "compare")
+                .collect::<Vec<_>>()
+        );
     }
 }

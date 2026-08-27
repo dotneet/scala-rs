@@ -862,6 +862,85 @@ fn fixtures_native_bad_is_error() {
 }
 
 #[test]
+fn fixtures_java_enum() {
+    check("java_enum");
+}
+
+#[test]
+fn fixtures_java_enum_bad_is_error() {
+    compile_fails("java_enum_bad", "values");
+}
+
+#[test]
+fn java_enum_verifies() {
+    if !java_available() {
+        return;
+    }
+    let out = compile_fixture("java_enum");
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", out.to_str().unwrap(), "Main"])
+        .output()
+        .expect("java -Xverify:all java_enum");
+    assert!(
+        output.status.success(),
+        "java -Xverify:all java_enum failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("java_enum")
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn fixtures_aux_ctor() {
+    check("aux_ctor");
+}
+
+#[test]
+fn fixtures_aux_ctor_bad_is_error() {
+    compile_fails("aux_ctor_bad", "this(...)");
+}
+
+#[test]
+fn fixtures_aux_ctor_stmt_bad_is_error() {
+    compile_fails("aux_ctor_stmt_bad", "first statement");
+}
+
+#[test]
+fn fixtures_aux_ctor_super_bad_is_error() {
+    compile_fails("aux_ctor_super_bad", "super");
+}
+
+#[test]
+fn aux_ctor_verifies() {
+    if !java_available() {
+        return;
+    }
+    let out = compile_fixture("aux_ctor");
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", out.to_str().unwrap(), "Main"])
+        .output()
+        .expect("java -Xverify:all aux_ctor");
+    assert!(
+        output.status.success(),
+        "java -Xverify:all aux_ctor failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("aux_ctor")
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn fixtures_context_bounds_bad_is_error() {
+    compile_fails("context_bounds_bad", "no implicit");
+}
+
+#[test]
 fn native_acc_flag_in_javap() {
     let out = compile_fixture("native");
     if !javap_available() {
@@ -1155,6 +1234,11 @@ fn scala_library_dual_run_classtag() {
 }
 
 #[test]
+fn scala_library_dual_run_context_bounds() {
+    dual_run_fixture("context_bounds");
+}
+
+#[test]
 fn scala_library_dual_run_custom_interp() {
     dual_run_fixture("custom_interp");
 }
@@ -1303,12 +1387,12 @@ fn dual_run_fixture(name: &str) {
         cp.push_str(&xml.display().to_string());
     }
     let output = Command::new("java")
-        .args(["-cp", &cp, "Main"])
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
         .output()
         .expect("java");
     assert!(
         output.status.success(),
-        "java -cp out:scala-library failed for {name}: {}",
+        "java -Xverify:all -cp out:scala-library failed for {name}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(

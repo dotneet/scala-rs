@@ -418,6 +418,24 @@ fn checkcast_internal(st: &SymbolTable, ty: &Type) -> Option<String> {
 
 fn method_desc_from_sym(st: &SymbolTable, id: SymbolId) -> String {
     let s = st.get(id);
+    if s.name == "<init>" {
+        if s.jvm_name.starts_with('(') && s.jvm_name.ends_with(")V") {
+            return s.jvm_name.clone();
+        }
+        let params = match &s.ty {
+            Type::Method { paramss, .. } => {
+                let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+                if params.iter().any(|p| p.is_no_type() || p.is_error()) {
+                    s.params.iter().map(|p| st.get(*p).ty.clone()).collect()
+                } else {
+                    params
+                }
+            }
+            Type::Function { params, .. } => params.clone(),
+            _ => s.params.iter().map(|p| st.get(*p).ty.clone()).collect(),
+        };
+        return jvm_method_desc(st, &params, &Type::Unit);
+    }
     if s.jvm_name.starts_with('(') {
         return s.jvm_name.clone();
     }
@@ -439,16 +457,36 @@ fn method_desc_from_sym(st: &SymbolTable, id: SymbolId) -> String {
     }
 }
 
+/// Scala inner classes take a hidden `$outer` as the first `<init>` argument.
+/// Constructor symbols list only the source parameters, so descriptors from
+/// `method_desc_from_sym` must be adjusted at emit time.
+fn with_enclosing_outer_param(st: &SymbolTable, class_id: SymbolId, desc: &str) -> String {
+    let Some(outer) = enclosing_instance(st, class_id) else {
+        return desc.to_string();
+    };
+    let outer_ty = format!("L{};", class_internal(st, outer));
+    let Some(rest) = desc.strip_prefix('(') else {
+        return desc.to_string();
+    };
+    if rest.starts_with(&outer_ty) {
+        return desc.to_string();
+    }
+    format!("({outer_ty}{rest}")
+}
+
 fn ctor_desc(st: &SymbolTable, class_id: SymbolId, args: &[Tree]) -> String {
     if let Some(d) = java_ctor_desc(st, class_id, args.len()) {
         return d;
+    }
+    if let Some(id) = pick_init_sym(st, class_id, args) {
+        return with_enclosing_outer_param(st, class_id, &method_desc_from_sym(st, id));
     }
     let mut d = String::from("(");
     if let Some(outer) = enclosing_instance(st, class_id) {
         d.push_str(&format!("L{};", class_internal(st, outer)));
     }
     let fields = &st.get(class_id).ctor_fields;
-    if !fields.is_empty() {
+    if !fields.is_empty() && fields.len() == args.len() {
         for f in fields {
             d.push_str(&jvm_desc(st, &st.get(*f).ty));
         }
@@ -459,6 +497,73 @@ fn ctor_desc(st: &SymbolTable, class_id: SymbolId, args: &[Tree]) -> String {
     }
     d.push_str(")V");
     d
+}
+
+fn pick_init_sym(st: &SymbolTable, class_id: SymbolId, args: &[Tree]) -> Option<SymbolId> {
+    if class_id.is_none() {
+        return None;
+    }
+    let nargs = args.len();
+    let inits: Vec<SymbolId> = st
+        .lookup_member(class_id, "<init>")
+        .into_iter()
+        .filter(|&id| st.get(id).kind == SymKind::Method)
+        .collect();
+    let arity_ok = |id: SymbolId| {
+        let s = st.get(id);
+        match &s.ty {
+            Type::Method { paramss, .. } => paramss.first().map(|p| p.len()).unwrap_or(0) == nargs,
+            _ => s.params.len() == nargs,
+        }
+    };
+    let typed: Vec<SymbolId> = inits.iter().copied().filter(|&id| arity_ok(id)).collect();
+    if typed.len() == 1 {
+        return typed.first().copied();
+    }
+    typed.into_iter().find(|&id| {
+        let ps = match &st.get(id).ty {
+            Type::Method { paramss, .. } => paramss.first().cloned().unwrap_or_default(),
+            _ => st
+                .get(id)
+                .params
+                .iter()
+                .map(|p| st.get(*p).ty.clone())
+                .collect(),
+        };
+        ps.iter().zip(args.iter()).all(|(p, a)| {
+            p.is_no_type()
+                || a.ty.is_no_type()
+                || st.is_sub_type(&a.ty, p)
+                || jvm_desc(st, p) == jvm_desc(st, &a.ty)
+        })
+    })
+}
+
+fn parent_super_ctor(
+    st: &SymbolTable,
+    parents: &[Tree],
+    super_name: &str,
+) -> (String, String, Vec<Tree>) {
+    for p in parents {
+        if let TreeKind::Apply { args, .. } = &p.kind {
+            if !p.sym.is_none() && st.get(p.sym).name == "<init>" {
+                let owner = class_internal(st, st.get(p.sym).owner);
+                return (owner, method_desc_from_sym(st, p.sym), args.clone());
+            }
+            if let Some(cls) = st.class_sym_of(&p.ty) {
+                let owner = class_internal(st, cls);
+                if owner == super_name || super_name == "java/lang/Object" {
+                    let desc = ctor_desc(st, cls, args);
+                    return (owner, desc, args.clone());
+                }
+            }
+        }
+        if !p.sym.is_none() && st.get(p.sym).name == "<init>" {
+            let owner = class_internal(st, st.get(p.sym).owner);
+            return (owner, method_desc_from_sym(st, p.sym), Vec::new());
+        }
+    }
+    (super_name.to_string(), "()V".into(), Vec::new())
 }
 
 /// Java `<init>` descriptors come from the classfile (`(Ljava/lang/Object;…)V`),
@@ -1204,7 +1309,7 @@ impl<'a> Gen<'a> {
                 desc: "I".into(),
             });
         }
-        self.emit_class_ctor(&mut b, class_id, vparamss, &impl_.body);
+        self.emit_class_ctor(&mut b, class_id, vparamss, &impl_.body, &impl_.parents);
         self.emit_lazy_accessors(&mut b, class_id, &impl_.body);
         self.emit_val_getters(&mut b, &impl_.body);
         for stt in &impl_.body {
@@ -1230,6 +1335,7 @@ impl<'a> Gen<'a> {
         class_id: SymbolId,
         vparamss: &[Vec<Tree>],
         body: &[Tree],
+        parents: &[Tree],
     ) {
         let params: Vec<&Tree> = vparamss.iter().flatten().collect();
         let mut frame = Frame::instance();
@@ -1266,6 +1372,8 @@ impl<'a> Gen<'a> {
         }
         let desc = jvm_method_desc(self.st, &types, &Type::Unit);
         let super_name = b.super_name.clone();
+        let (super_owner, super_desc, super_args) =
+            parent_super_ctor(self.st, parents, &super_name);
         let class_name = b.this_name.clone();
         let st = self.st;
         let inits: Vec<&Tree> = body
@@ -1331,7 +1439,10 @@ impl<'a> Gen<'a> {
                 }
             }
             asm.aload(0);
-            asm.invokespecial(&super_name, "<init>", "()V");
+            for a in &super_args {
+                gen_expr(asm, &mut frame, &ctx_early, a);
+            }
+            asm.invokespecial(&super_owner, "<init>", &super_desc);
             if has_outer {
                 if let Some(od) = &outer_desc_c {
                     asm.aload(0);
@@ -1397,7 +1508,10 @@ impl<'a> Gen<'a> {
             } => (name, mods, vparamss, rhs),
             _ => return,
         };
-        if name == "<init>" || name == "<clinit>" {
+        if name == "<clinit>" {
+            return;
+        }
+        if name == "<init>" && rhs.is_empty() {
             return;
         }
         let desc = def_method_desc(self.st, def);
@@ -2877,7 +2991,7 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
         TreeKind::Match { selector, cases } => {
             gen_match(asm, frame, ctx, selector, cases, &tree.ty);
         }
-        TreeKind::New { tpt } => gen_new(asm, frame, ctx, tpt, &[]),
+        TreeKind::New { tpt } => gen_new(asm, frame, ctx, tpt, &[], SymbolId::NONE),
         TreeKind::Return { expr } => {
             if !ctx.method_sym.is_none() && (tree.sym == ctx.method_sym || tree.sym.is_none()) {
                 if !expr.is_empty() && !is_unit_like(&expr.ty) && !is_unit_like(&ctx.ret_ty) {
@@ -3164,6 +3278,26 @@ fn gen_select(
         asm.arraylength();
         return;
     }
+    if name == "length" && !tree.sym.is_none() && ctx.st.get(tree.sym).owner == ctx.st.array_sym {
+        // Generic `Array[T]` erases to Object; nsc uses ScalaRunTime.array_length.
+        if ctx.library_abi {
+            asm.getstatic(
+                "scala/runtime/ScalaRunTime$",
+                "MODULE$",
+                "Lscala/runtime/ScalaRunTime$;",
+            );
+            gen_expr(asm, frame, ctx, qual);
+            asm.invokevirtual(
+                "scala/runtime/ScalaRunTime$",
+                "array_length",
+                "(Ljava/lang/Object;)I",
+            );
+        } else {
+            gen_expr(asm, frame, ctx, qual);
+            asm.arraylength();
+        }
+        return;
+    }
     if matches!(qual.ty, Type::Refined { .. }) && tree.sym.is_none() {
         gen_structural_call(asm, frame, ctx, qual, name, &[], &tree.ty);
         return;
@@ -3337,7 +3471,14 @@ fn gen_if(
     asm.mark(end_l);
 }
 
-fn gen_new(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tpt: &Tree, args: &[Tree]) {
+fn gen_new(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    tpt: &Tree,
+    args: &[Tree],
+    ctor_sym: SymbolId,
+) {
     if let Some(elem) = array_elem_ty(&tpt.ty) {
         if let Some(len) = args.first() {
             gen_expr(asm, frame, ctx, len);
@@ -3362,11 +3503,33 @@ fn gen_new(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tpt: &Tree, ar
     } else {
         class_internal(ctx.st, class_id)
     };
-    let desc = if class_id.is_none() {
+    let desc = if !ctor_sym.is_none() && ctx.st.get(ctor_sym).name == "<init>" {
+        method_desc_from_sym(ctx.st, ctor_sym)
+    } else if class_id.is_none() {
         let pts: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
         jvm_method_desc(ctx.st, &pts, &Type::Unit)
     } else {
         ctor_desc(ctx.st, class_id, args)
+    };
+    let desc = if class_id.is_none() {
+        desc
+    } else {
+        with_enclosing_outer_param(ctx.st, class_id, &desc)
+    };
+    let field_tys: Vec<Type> = if !ctor_sym.is_none() && ctx.st.get(ctor_sym).name == "<init>" {
+        match &ctx.st.get(ctor_sym).ty {
+            Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+            _ => args.iter().map(|a| a.ty.clone()).collect(),
+        }
+    } else if class_id.is_none() {
+        args.iter().map(|a| a.ty.clone()).collect()
+    } else {
+        let fields = ctx.st.get(class_id).ctor_fields.clone();
+        if fields.is_empty() || fields.len() != args.len() {
+            args.iter().map(|a| a.ty.clone()).collect()
+        } else {
+            fields.iter().map(|f| ctx.st.get(*f).ty.clone()).collect()
+        }
     };
     asm.new_obj(&internal);
     asm.dup();
@@ -3375,16 +3538,6 @@ fn gen_new(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tpt: &Tree, ar
             load_this(asm, ctx);
         }
     }
-    let field_tys: Vec<Type> = if class_id.is_none() {
-        args.iter().map(|a| a.ty.clone()).collect()
-    } else {
-        let fields = ctx.st.get(class_id).ctor_fields.clone();
-        if fields.is_empty() {
-            args.iter().map(|a| a.ty.clone()).collect()
-        } else {
-            fields.iter().map(|f| ctx.st.get(*f).ty.clone()).collect()
-        }
-    };
     for (i, a) in args.iter().enumerate() {
         gen_expr(asm, frame, ctx, a);
         let pty = field_tys.get(i).unwrap_or(&a.ty);
@@ -3419,7 +3572,7 @@ fn gen_apply(
             TreeKind::New { tpt } => tpt,
             _ => unreachable!(),
         };
-        gen_new(asm, frame, ctx, tpt, args);
+        gen_new(asm, frame, ctx, tpt, args, tree.sym);
         return;
     }
 
@@ -4020,6 +4173,10 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
     let owner = class_internal(ctx.st, owner_id);
     let name = s.name.as_str();
     let mut desc = method_desc_from_sym(ctx.st, id);
+    if name == "<init>" {
+        asm.invokespecial(&owner, "<init>", &desc);
+        return;
+    }
     if s.flags.contains(Flags::STATIC) {
         asm.invokestatic(&owner, name, &desc);
         maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
@@ -6681,6 +6838,22 @@ fn gen_pattern(
                 _ => {
                     asm.pop();
                     asm.pop();
+                }
+            }
+        }
+        TreeKind::Select { .. } => {
+            load(asm, tmp, sel_sort);
+            gen_expr(asm, frame, ctx, pat);
+            match sel_sort {
+                JvmSort::Ref => {
+                    asm.invokevirtual("java/lang/Object", "equals", "(Ljava/lang/Object;)Z");
+                    asm.ifeq(fail);
+                }
+                JvmSort::Int => asm.if_icmpne(fail),
+                _ => {
+                    pop_if_value(asm, &pat.ty);
+                    pop_if_value(asm, &pat.ty);
+                    asm.goto(fail);
                 }
             }
         }
