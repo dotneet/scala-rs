@@ -672,17 +672,26 @@ object Main {
     fn xml_comments_and_cdata_are_unimplemented() {
         let r = parse_str("object M { val x = <a><!--c--></a> }\n");
         assert!(
-            r.diags.iter().any(|d| d.message.contains("XML comments/CDATA")
-                || d.message.contains("XML")),
+            r.diags
+                .iter()
+                .any(|d| d.message.contains("XML comments/CDATA")),
             "expected XML comments/CDATA diagnostic, got {:?}",
             r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
-        let pi = parse_str("object M { val x = <?pi?><a/> }\n");
+        let cdata = parse_str("object M { val x = <a><![CDATA[x]]></a> }\n");
+        assert!(
+            cdata
+                .diags
+                .iter()
+                .any(|d| d.message.contains("XML comments/CDATA")),
+            "expected XML CDATA diagnostic, got {:?}",
+            cdata.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let pi = parse_str("object M { val x = <a><?pi?></a> }\n");
         assert!(
             pi.diags
                 .iter()
-                .any(|d| d.message.contains("XML processing instructions")
-                    || d.message.contains("XML")),
+                .any(|d| d.message.contains("XML processing instructions")),
             "expected XML PI diagnostic, got {:?}",
             pi.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );

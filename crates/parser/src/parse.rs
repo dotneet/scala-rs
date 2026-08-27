@@ -3108,6 +3108,9 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(n) if n == ">" => {
                 self.bump();
             }
+            TokenKind::Ident(n) if n == "</" => {
+                // `><!--` was one token; attrs already diagnosed comments/CDATA/PI.
+            }
             _ => {
                 return self.unimplemented(
                     lo.merge(self.span()),
@@ -3156,6 +3159,9 @@ impl<'a> Parser<'a> {
                     return self.unimplemented(self.span(), "XML literal: unexpected `>`");
                 }
                 TokenKind::Ident(n) => {
+                    if let Some(what) = xml_unsupported_markup(&n) {
+                        return self.unimplemented(self.span(), what);
+                    }
                     self.bump();
                     let mut text = n;
                     while let TokenKind::Ident(more) = self.kind().clone() {
@@ -3164,6 +3170,7 @@ impl<'a> Parser<'a> {
                             || more == ">"
                             || more == "/>"
                             || is_operator_name(&more)
+                            || xml_unsupported_markup(&more).is_some()
                         {
                             break;
                         }
@@ -3263,6 +3270,22 @@ impl<'a> Parser<'a> {
             match self.kind().clone() {
                 TokenKind::Ident(n) if n == ">" || n == "/>" || n == "</" || n == "<" => break,
                 TokenKind::Eof => break,
+                TokenKind::Ident(n) if xml_unsupported_markup(&n).is_some() => {
+                    let what = xml_unsupported_markup(&n).unwrap();
+                    let sp = self.span();
+                    self.bump();
+                    let _ = self.unimplemented(sp, what);
+                    loop {
+                        match self.kind().clone() {
+                            TokenKind::Ident(t) if t == "</" || t == ">" || t == "/>" => break,
+                            TokenKind::Eof => break,
+                            _ => {
+                                self.bump();
+                            }
+                        }
+                    }
+                    break;
+                }
                 TokenKind::Ident(n) if !is_operator_name(&n) => {
                     let lo = self.span();
                     self.bump();
@@ -3547,6 +3570,23 @@ impl<'a> Parser<'a> {
             acc = self.xml_cons(ch, acc, span);
         }
         self.xml_new(cls, vec![prefix, lab, attrs, scope, min, acc], span)
+    }
+}
+
+/// Lexer glues `><!--` / `><?` as one operator Ident. Diagnose instead of
+/// treating comments, CDATA, or PIs as attributes or element text.
+fn xml_unsupported_markup(n: &str) -> Option<&'static str> {
+    if n.contains("<!--")
+        || n.contains("<![")
+        || n.contains("<!")
+        || n.starts_with("!--")
+        || n.contains("![CDATA")
+    {
+        Some("XML comments/CDATA")
+    } else if n.contains("<?") {
+        Some("XML processing instructions")
+    } else {
+        None
     }
 }
 
