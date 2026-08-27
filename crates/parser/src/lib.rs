@@ -919,4 +919,40 @@ object Color {
         assert!(dump.contains("ValDef val Red"), "{dump}");
         assert!(dump.contains("ValDef val Blue"), "{dump}");
     }
+
+    #[test]
+    fn placeholder_lambda_parses_as_function() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val f: Int => Int = _ + 1
+    val g: Int => Int = _.abs
+    val h: Int => Int = add1(_)
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(
+            dump.contains("Function"),
+            "placeholder `_ + 1` should wrap as Function: {dump}"
+        );
+        let r = parse_str(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = _
+  }
+}
+"#,
+        );
+        assert!(
+            r.diags
+                .iter()
+                .any(|d| d.message.contains("unbound placeholder parameter")),
+            "expected unbound placeholder, got {:?}",
+            r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
 }

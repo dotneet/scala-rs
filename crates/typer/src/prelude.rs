@@ -57,8 +57,25 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         &[Type::AnyVal],
     );
     let _ = char_s;
-    let _ = class(st, st.scala_pkg, "Byte", "scala/Byte", &[Type::AnyVal]);
-    let _ = class(st, st.scala_pkg, "Short", "scala/Short", &[Type::AnyVal]);
+    st.byte_sym = class(st, st.scala_pkg, "Byte", "scala/Byte", &[Type::AnyVal]);
+    st.short_sym = class(st, st.scala_pkg, "Short", "scala/Short", &[Type::AnyVal]);
+    // nsc `Byte.+` / `Short.+` return Int; used by `Array[Byte].map(_ + 1)`.
+    method(
+        st,
+        st.byte_sym,
+        "+",
+        vec![Type::Int],
+        Type::Int,
+        Intrinsic::IntBin("+"),
+    );
+    method(
+        st,
+        st.short_sym,
+        "+",
+        vec![Type::Int],
+        Type::Int,
+        Intrinsic::IntBin("+"),
+    );
 
     st.string_sym = class(st, java_lang, "String", "java/lang/String", &[Type::AnyRef]);
     mark_java(st, st.string_sym);
@@ -949,6 +966,14 @@ fn add_string_members(st: &mut SymbolTable, library_abi: bool) {
         Type::Int,
         Intrinsic::None,
     );
+    method(
+        st,
+        c,
+        "split",
+        vec![Type::String],
+        Type::Array(Box::new(Type::String)),
+        Intrinsic::None,
+    );
     if !library_abi {
         method(st, c, "length", vec![], Type::Int, Intrinsic::None);
         // Private runtime: parseInt on String. Library mode uses StringOps via augmentString.
@@ -1335,6 +1360,29 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
             sym: iterator,
             args: vec![Type::Char],
         },
+        Intrinsic::None,
+    );
+    let seq = crate::classpath::find_or_stub_java_class(st, "scala/collection/Seq");
+    method(
+        st,
+        so,
+        "diff",
+        vec![Type::Class {
+            sym: seq,
+            args: vec![],
+        }],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "intersect",
+        vec![Type::Class {
+            sym: seq,
+            args: vec![],
+        }],
+        Type::String,
         Intrinsic::None,
     );
     so
@@ -3536,6 +3584,29 @@ fn add_predef_members(
             Intrinsic::Identity,
         );
         st.get_mut(aug).flags = st.get(aug).flags.with(Flags::IMPLICIT);
+        let seq = crate::classpath::find_or_stub_java_class(st, "scala/collection/Seq");
+        let ws = class(
+            st,
+            st.scala_pkg,
+            "WrappedString",
+            "scala/collection/immutable/WrappedString",
+            &[Type::Class {
+                sym: seq,
+                args: vec![],
+            }],
+        );
+        let wrap_str = method(
+            st,
+            owner,
+            "wrapString",
+            vec![Type::String],
+            Type::Class {
+                sym: ws,
+                args: vec![],
+            },
+            Intrinsic::None,
+        );
+        st.get_mut(wrap_str).flags = st.get(wrap_str).flags.with(Flags::IMPLICIT);
     }
     if let Some(aops) = array_ops {
         let wrap = method(
@@ -3562,6 +3633,30 @@ fn add_predef_members(
             Intrinsic::Identity,
         );
         st.get_mut(wrap_l).flags = st.get(wrap_l).flags.with(Flags::IMPLICIT);
+        let wrap_b = method(
+            st,
+            owner,
+            "byteArrayOps",
+            vec![Type::Array(Box::new(Type::Byte))],
+            Type::Class {
+                sym: aops,
+                args: vec![Type::Byte],
+            },
+            Intrinsic::Identity,
+        );
+        st.get_mut(wrap_b).flags = st.get(wrap_b).flags.with(Flags::IMPLICIT);
+        let wrap_s = method(
+            st,
+            owner,
+            "shortArrayOps",
+            vec![Type::Array(Box::new(Type::Short))],
+            Type::Class {
+                sym: aops,
+                args: vec![Type::Short],
+            },
+            Intrinsic::Identity,
+        );
+        st.get_mut(wrap_s).flags = st.get(wrap_s).flags.with(Flags::IMPLICIT);
         let wrap_ref = method(
             st,
             owner,
