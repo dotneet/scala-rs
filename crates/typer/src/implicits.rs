@@ -425,7 +425,19 @@ impl Typer {
             1 => Some(hits.pop().unwrap()),
             0 => None,
             _ => {
-                let convs: Vec<SymbolId> = hits.iter().map(|(c, _, _)| *c).collect();
+                // nsc Predef: `augmentString` (StringOps) wins over `wrapString`
+                // (WrappedString / Seq) because wrapString is lower priority.
+                // Prefer the conversion whose result *declares* the member.
+                let declared: Vec<(SymbolId, SymbolId, Type)> = hits
+                    .iter()
+                    .filter(|(_, m, to)| self.conversion_declares_member(to, *m))
+                    .cloned()
+                    .collect();
+                if declared.len() == 1 {
+                    return Some(declared.into_iter().next().unwrap());
+                }
+                let pool = if declared.is_empty() { hits } else { declared };
+                let convs: Vec<SymbolId> = pool.iter().map(|(c, _, _)| *c).collect();
                 let winners: Vec<SymbolId> = convs
                     .iter()
                     .copied()
@@ -438,9 +450,16 @@ impl Typer {
                 if winners.len() != 1 {
                     return None;
                 }
-                hits.into_iter().find(|(c, _, _)| *c == winners[0])
+                pool.into_iter().find(|(c, _, _)| *c == winners[0])
             }
         }
+    }
+
+    fn conversion_declares_member(&self, to: &Type, member: SymbolId) -> bool {
+        let Some(cls) = self.st.class_sym_of(to) else {
+            return false;
+        };
+        self.st.get(cls).members.contains(&member)
     }
 
     fn conv_arg_strictly_more_specific(&self, a: SymbolId, b: SymbolId) -> bool {

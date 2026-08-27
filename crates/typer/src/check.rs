@@ -5601,6 +5601,10 @@ impl Typer {
         match self.arg_score(arg, param) {
             Some(3) if !allow_widen => false, // numeric widen
             Some(_) => true,
+            None if allow_widen => {
+                // nsc view: `wrapString` makes String applicable to Seq.
+                !matches!(self.search_conversion(arg, param), ImplicitSearch::None)
+            }
             None => false,
         }
     }
