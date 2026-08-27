@@ -3633,6 +3633,53 @@ object Main {
     }
 
     #[test]
+    fn arrayops_sortedmap_stringops_typecheck_with_library() {
+        ok_lib(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val fs = Array(1, 2, 3).filter(_ > 1)
+    val sl = Array(1, 2, 3, 4).slice(1, 3)
+    val fm = Array(1, 2).flatMap(x => List(x, x + 10))
+    val s: String = "cba".sorted
+    val cs: Array[Char] = "ab".toArray
+    val buf = new Array[Char](2)
+    val n: Int = "xy".copyToArray(buf)
+    val m = scala.collection.immutable.SortedMap(3 -> "c", 1 -> "a")
+    val a: String = m.apply(1)
+    val g = m.get(1)
+    val t = scala.collection.immutable.TreeMap(5 -> "e", 4 -> "d")
+  }
+}
+"#,
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = Array(1).noSuchFilter
+    val y = "cba".noSuchSorted
+    val z = scala.collection.immutable.SortedMap(1 -> "a").noSuch
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics

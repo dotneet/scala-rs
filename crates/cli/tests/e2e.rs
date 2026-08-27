@@ -924,6 +924,21 @@ fn fixtures_sortedset_bad_is_error() {
 }
 
 #[test]
+fn fixtures_array_ops10_bad_is_error() {
+    compile_fails_lib("array_ops10_bad", "noSuchFilter is not a member");
+}
+
+#[test]
+fn fixtures_string_ops14_bad_is_error() {
+    compile_fails_lib("string_ops14_bad", "noSuchSorted is not a member");
+}
+
+#[test]
+fn fixtures_sortedmap_bad_is_error() {
+    compile_fails_lib("sortedmap_bad", "noSuch is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1702,6 +1717,21 @@ fn scala_library_dual_run_sortedset() {
 }
 
 #[test]
+fn scala_library_dual_run_array_ops10() {
+    dual_run_fixture("array_ops10");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops14() {
+    dual_run_fixture("string_ops14");
+}
+
+#[test]
+fn scala_library_dual_run_sortedmap() {
+    dual_run_fixture("sortedmap");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -1972,6 +2002,10 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/immutable/SortedSet$.class",
     "scala/collection/immutable/TreeSet.class",
     "scala/collection/immutable/TreeSet$.class",
+    "scala/collection/immutable/SortedMap.class",
+    "scala/collection/immutable/SortedMap$.class",
+    "scala/collection/immutable/TreeMap.class",
+    "scala/collection/immutable/TreeMap$.class",
     "scala/collection/immutable/Seq.class",
     "scala/collection/immutable/Seq$.class",
     "scala/collection/immutable/LazyList.class",
