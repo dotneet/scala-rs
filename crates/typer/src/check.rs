@@ -4475,6 +4475,17 @@ impl Typer {
                     }
                     if !self.st.get(sym).tparams.is_empty() {
                         let inst = self.infer_method_tparams(sym, &param_tys, &arg_tys);
+                        // nsc leaves `tryBreakable { throw … }`'s T undetermined
+                        // (Nothing is bottom). `catchBreak { println }` then
+                        // instantiates T from the handler, not from Nothing.
+                        let inst: Vec<(SymbolId, Type)> = if self.st.get(sym).name == "tryBreakable"
+                        {
+                            inst.into_iter()
+                                .filter(|(_, t)| !matches!(t, Type::Nothing))
+                                .collect()
+                        } else {
+                            inst
+                        };
                         if !inst.is_empty() {
                             let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
                             let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
@@ -4605,6 +4616,26 @@ impl Typer {
                                 fun.ty = crate::symbol::subst_tparams_slice(&tps, &inst, &fun.ty);
                                 ret = crate::symbol::subst_tparams_slice(&tps, &inst, &ret);
                             }
+                        }
+                    }
+                }
+                if !sym.is_none()
+                    && self.st.get(sym).name == "catchBreak"
+                    && self.is_try_block_ty(recv_ty.as_ref())
+                {
+                    if let Some(a0) = args.first() {
+                        // `tryBreakable`'s T and `TryBlock`'s T are different
+                        // symbols. If the op was `Nothing`, ret is still a
+                        // method type param; fill it from the handler body.
+                        let t = match &a0.kind {
+                            TreeKind::Function { body, .. } => body.ty.widen_constant(),
+                            _ => unwrap_fn0_or_byname(&a0.ty).widen_constant(),
+                        };
+                        if !t.is_no_type()
+                            && !t.is_error()
+                            && matches!(ret, Type::TypeParam(_) | Type::Nothing)
+                        {
+                            ret = t;
                         }
                     }
                 }
@@ -4960,6 +4991,13 @@ impl Typer {
     fn is_array_ops_ty(&self, ty: Option<&Type>) -> bool {
         ty.and_then(|t| self.st.class_sym_of(t))
             .is_some_and(|id| self.st.get(id).name == "ArrayOps")
+    }
+
+    fn is_try_block_ty(&self, ty: Option<&Type>) -> bool {
+        ty.and_then(|t| self.st.class_sym_of(t)).is_some_and(|id| {
+            self.st.get(id).name == "TryBlock"
+                && self.st.jvm_internal(id) == "scala/util/control/Breaks$TryBlock"
+        })
     }
 
     fn elem_type(&self, ty: &Type) -> Option<Type> {
@@ -7955,6 +7993,35 @@ impl Typer {
         }
         self.complete_java_type(&tree.ty, tree.span);
         self.complete_java_type(pt, tree.span);
+        // By-name wrap must run before `Nothing <: pt` (Nothing inhabits every
+        // type, including `=> T`). Otherwise `tryBreakable { throw e }` would
+        // skip Function0 and throw in the caller.
+        if let Type::ByName(inner) = pt {
+            if !matches!(&tree.kind, TreeKind::Function { .. }) {
+                let span = tree.span;
+                let inner_tree = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+                let ret = if inner_tree.ty.is_no_type() || inner_tree.ty.is_error() {
+                    (**inner).clone()
+                } else {
+                    inner_tree.ty.clone()
+                };
+                *tree = Tree {
+                    id: inner_tree.id,
+                    span,
+                    kind: TreeKind::Function {
+                        vparams: vec![],
+                        body: Box::new(inner_tree),
+                    },
+                    ty: Type::Function {
+                        params: vec![],
+                        ret: Box::new(ret),
+                    },
+                    sym: SymbolId::NONE,
+                    postfix: false,
+                };
+            }
+            return;
+        }
         if self.st.is_sub_type(&tree.ty, pt) {
             // `b.x` with `{ type A <: Int }` stays a TypeMember; pin it to the
             // expected primitive so erasure inserts the same unbox as `Bar#A`.
@@ -7991,32 +8058,6 @@ impl Typer {
             // allow via toString in concat contexts only — not general
         }
         if matches!(pt, Type::Any | Type::AnyRef | Type::AnyVal) {
-            return;
-        }
-        if let Type::ByName(inner) = pt {
-            if !matches!(&tree.kind, TreeKind::Function { .. }) {
-                let span = tree.span;
-                let inner_tree = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
-                let ret = if inner_tree.ty.is_no_type() || inner_tree.ty.is_error() {
-                    (**inner).clone()
-                } else {
-                    inner_tree.ty.clone()
-                };
-                *tree = Tree {
-                    id: inner_tree.id,
-                    span,
-                    kind: TreeKind::Function {
-                        vparams: vec![],
-                        body: Box::new(inner_tree),
-                    },
-                    ty: Type::Function {
-                        params: vec![],
-                        ret: Box::new(ret),
-                    },
-                    sym: SymbolId::NONE,
-                    postfix: false,
-                };
-            }
             return;
         }
         if let Type::Method { paramss, ret } = &tree.ty {

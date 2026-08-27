@@ -7792,7 +7792,10 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             method_sym: SymbolId::NONE,
         };
         gen_expr(a, &mut fr, &inner_ctx, &body);
-        if let Some(raw_ret) = &sam_ret {
+        if matches!(body.ty, Type::Nothing) {
+            // `throw` already emits athrow. A following areturn would be an
+            // empty-stack stackmap target (`tryBreakable { throw e }`).
+        } else if let Some(raw_ret) = &sam_ret {
             if is_unit_like(raw_ret) {
                 pop_if_value(a, &body.ty);
                 a.vreturn();
