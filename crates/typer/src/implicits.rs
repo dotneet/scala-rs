@@ -119,6 +119,12 @@ impl Typer {
                     self.collect_type_parts(a, out, seen);
                 }
             }
+            Type::Applied { ctor, args } => {
+                self.collect_type_parts(ctor, out, seen);
+                for a in args {
+                    self.collect_type_parts(a, out, seen);
+                }
+            }
             Type::Named { args, .. } => {
                 if let Some(id) = self.st.class_sym_of(ty) {
                     self.collect_class_and_enclosing(id, out, seen);

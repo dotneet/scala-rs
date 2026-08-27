@@ -102,6 +102,7 @@ fn find_overridden_method(st: &SymbolTable, id: SymbolId) -> Option<SymbolId> {
 pub fn erase_type(ty: &Type) -> Type {
     match ty {
         Type::TypeParam(_) | Type::TypeMember(_) => Type::Any,
+        Type::Applied { .. } => Type::Any,
         Type::Class { sym, .. } => Type::Class {
             sym: *sym,
             args: vec![],
@@ -178,6 +179,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
             }
         }
         Type::TypeParam(_) | Type::TypeMember(_) => Type::Any,
+        Type::Applied { ctor, .. } => erase_ty(ctor, st),
         Type::Wildcard | Type::BoundedWildcard { .. } => Type::Any,
         Type::Constant(lit) => Type::lit_underlying(lit),
         Type::ThisType(s) => Type::Class {
@@ -277,6 +279,7 @@ fn is_ref_erased(ty: &Type) -> bool {
             | Type::Array(_)
             | Type::Function { .. }
             | Type::TypeParam(_)
+            | Type::Applied { .. }
             | Type::TypeMember(_)
             | Type::Wildcard
             | Type::BoundedWildcard { .. }

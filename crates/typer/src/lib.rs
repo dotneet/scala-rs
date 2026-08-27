@@ -1294,14 +1294,100 @@ object Main {
     }
 
     #[test]
-    fn class_view_bounds_are_diagnosed() {
-        let (_, _, diags) = typecheck_str("class C[T <% Ordered[T]](x: T)\n");
+    fn class_view_bounds_desugar() {
+        ok(r#"
+class Box(val n: Int) extends Ordered[Box] {
+  def compare(that: Box): Int = n - that.n
+}
+class C[T <% Ordered[T]](val x: T)
+object Main {
+  def main(args: Array[String]): Unit = {
+    val c = new C(new Box(1))
+    val n: Int = c.x.n
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn class_view_bounds_missing_evidence() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+class NoOrd(val n: Int)
+class C[T <% Ordered[T]](x: T)
+object Main {
+  def main(args: Array[String]): Unit = {
+    val c = new C(new NoOrd(1))
+  }
+}
+"#,
+        );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
         assert!(
-            diags.iter().any(|d| d.message.contains("view bound")),
+            diags.iter().any(|d| d.message.contains("no implicit")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn higher_kinded_functor_and_box() {
+        ok(r#"
+class Id[A](val value: A)
+class Box[F[_], A](val fa: F[A])
+trait Functor[F[_]] {
+  def map[A, B](fa: F[A])(f: A => B): F[B]
+}
+object IdFunctor extends Functor[Id] {
+  def map[A, B](fa: Id[A])(f: A => B): Id[B] = new Id(f(fa.value))
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val b = new Box[Id, Int](new Id(41))
+    val n: Int = b.fa.value
+    val m: Id[Int] = IdFunctor.map[Int, Int](new Id(1))((x: Int) => x + 1)
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn higher_kinded_kind_mismatch() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait Functor[F[_]] { def dummy: Int }
+object Main {
+  def asProper[F[_]](x: F): Unit = ()
+  def useFunctor(x: Functor[Int]): Unit = ()
+  def notCtor[A](x: Int[A]): Unit = ()
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("type parameters")
+                || d.message.contains("kinds of the type arguments")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn extends_app_and_delayed_init() {
+        ok(r#"
+object Main extends App {
+  println(1)
+}
+"#);
+        ok(r#"
+class C extends DelayedInit {
+  def delayedInit(x: => Unit): Unit = x
+  println(1)
+}
+object Main {
+  def main(args: Array[String]): Unit = { new C }
+}
+"#);
     }
 
     #[test]

@@ -837,8 +837,18 @@ impl Assembler {
         self.apply_invoke(desc, true, is_init, owner);
     }
     pub fn invokestatic(&mut self, owner: &str, name: &str, desc: &str) {
+        self.invokestatic_ref(owner, name, desc, false);
+    }
+    pub fn invokestatic_interface(&mut self, owner: &str, name: &str, desc: &str) {
+        self.invokestatic_ref(owner, name, desc, true);
+    }
+    fn invokestatic_ref(&mut self, owner: &str, name: &str, desc: &str, iface: bool) {
         let name = encode_method_name(name);
-        let i = self.pool.methodref(owner, &name, desc);
+        let i = if iface {
+            self.pool.iface_ref(owner, &name, desc)
+        } else {
+            self.pool.methodref(owner, &name, desc)
+        };
         self.emit_op(0xb8);
         self.emit_u16(i);
         self.apply_invoke(desc, false, false, owner);
