@@ -4552,6 +4552,29 @@ impl Typer {
                     );
                 }
                 if !sym.is_none()
+                    && self.st.get(sym).name == "collect"
+                    && self.is_array_ops_ty(recv_ty.as_ref())
+                {
+                    if let Some(a0) = args.first() {
+                        let to = match &a0.ty {
+                            Type::Class { args, .. } if args.len() >= 2 => args[1].clone(),
+                            Type::Function { ret, .. } => (**ret).clone(),
+                            _ => Type::NoType,
+                        };
+                        let to = to.widen_constant();
+                        let tps = self.st.get(sym).tparams.clone();
+                        if tps.len() == 1 && !to.is_no_type() && !to.is_error() {
+                            let inst = vec![to];
+                            param_tys = param_tys
+                                .iter()
+                                .map(|t| crate::symbol::subst_tparams_slice(&tps, &inst, t))
+                                .collect();
+                            fun.ty = crate::symbol::subst_tparams_slice(&tps, &inst, &fun.ty);
+                            ret = crate::symbol::subst_tparams_slice(&tps, &inst, &ret);
+                        }
+                    }
+                }
+                if !sym.is_none()
                     && self.st.get(sym).name == "flatMap"
                     && self.is_array_ops_ty(recv_ty.as_ref())
                 {
@@ -4664,7 +4687,9 @@ impl Typer {
                             _ => None,
                         };
                         if let Some(to) = to {
-                            if let Some(cls) = recv_ty
+                            if self.is_array_ops_ty(recv_ty.as_ref()) {
+                                ret = Type::Array(Box::new(to.widen_constant()));
+                            } else if let Some(cls) = recv_ty
                                 .as_ref()
                                 .and_then(|t| self.st.class_sym_of(t))
                                 .map(|c| self.collection_root(c))
@@ -4673,6 +4698,24 @@ impl Typer {
                                     sym: cls,
                                     args: vec![to.widen_constant()],
                                 };
+                            }
+                        }
+                    }
+                } else if method_name == "zip" {
+                    if self.is_array_ops_ty(recv_ty.as_ref()) {
+                        if let Some(a0) = args.first() {
+                            if let Some(b) = self.elem_type(&a0.ty) {
+                                let a = recv_ty
+                                    .as_ref()
+                                    .and_then(|t| self.elem_type(t))
+                                    .unwrap_or(Type::Any);
+                                let t2 = self.tuple2_sym();
+                                if !t2.is_none() {
+                                    ret = Type::Array(Box::new(Type::Class {
+                                        sym: t2,
+                                        args: vec![a, b.widen_constant()],
+                                    }));
+                                }
                             }
                         }
                     }

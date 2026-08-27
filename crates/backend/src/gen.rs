@@ -4711,6 +4711,42 @@ fn invoke_value_extension(
             );
             return;
         }
+        if s.name == "take" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "take$extension",
+                "(Ljava/lang/Object;I)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
+        if s.name == "collect" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "collect$extension",
+                "(Ljava/lang/Object;Lscala/PartialFunction;Lscala/reflect/ClassTag;)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
+        if s.name == "zip" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "zip$extension",
+                "(Ljava/lang/Object;Lscala/collection/IterableOnce;)[Lscala/Tuple2;",
+            );
+            return;
+        }
         asm.invokestatic(
             "scala/collection/ArrayOps",
             &format!("{}$extension", s.name),
@@ -5519,6 +5555,21 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "map",
                         "(Lscala/Function1;)Lscala/util/Try;",
                     );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_breaks(&owner) {
+            match name {
+                "breakable" => {
+                    asm.invokevirtual(&owner, "breakable", "(Lscala/Function0;)V");
+                    return;
+                }
+                "break" => {
+                    asm.invokevirtual(&owner, "break", "()Lscala/runtime/Nothing$;");
+                    // nsc 2.13.16: `break()` returns Nothing$ and is followed by athrow.
+                    asm.athrow();
                     return;
                 }
                 _ => {}
@@ -6531,6 +6582,13 @@ fn is_stdlib_either(owner: &str) -> bool {
 
 fn is_stdlib_either_module(owner: &str) -> bool {
     matches!(owner, "scala/util/Left$" | "scala/util/Right$")
+}
+
+fn is_stdlib_breaks(owner: &str) -> bool {
+    matches!(
+        owner,
+        "scala/util/control/Breaks" | "scala/util/control/Breaks$"
+    )
 }
 
 fn is_stdlib_try(owner: &str) -> bool {

@@ -224,6 +224,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
             add_array_ops_map(st, aops, ct);
             add_array_ops_flat_map(st, aops, ct);
             add_array_ops_flat_map_from_array(st, aops, ct);
+            add_array_ops_collect(st, aops, ct);
         }
         if let Some(so) = string_ops {
             add_string_ops_to_array(st, so, ct);
@@ -295,6 +296,11 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         );
         method(st, so, "splitAt", vec![Type::Int], pair, Intrinsic::None);
     }
+    if library_abi {
+        if let Some(aops) = array_ops {
+            add_array_ops_zip(st, aops, tuple2);
+        }
+    }
 
     // Marker trait `scala.Dynamic`. JVM interface lives in scala-library.jar;
     // we only need the symbol so `class D extends Dynamic` typechecks.
@@ -355,6 +361,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_linked_hash_set(st);
         add_either(st);
         add_try(st, throwable);
+        add_breaks(st);
         add_xml(st);
         add_enumeration(st);
     }
@@ -1851,6 +1858,44 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
         Type::Int,
         Intrinsic::None,
     );
+    method(st, so, "nonEmpty", vec![], Type::Boolean, Intrinsic::None);
+    method(
+        st,
+        so,
+        "takeWhile",
+        vec![fn1(Type::Char, Type::Boolean)],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "dropWhile",
+        vec![fn1(Type::Char, Type::Boolean)],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "filterNot",
+        vec![fn1(Type::Char, Type::Boolean)],
+        Type::String,
+        Intrinsic::None,
+    );
+    let opt_char = Type::Class {
+        sym: st.option_sym,
+        args: vec![Type::Char],
+    };
+    method(
+        st,
+        so,
+        "headOption",
+        vec![],
+        opt_char.clone(),
+        Intrinsic::None,
+    );
+    method(st, so, "lastOption", vec![], opt_char, Intrinsic::None);
     so
 }
 
@@ -1890,6 +1935,14 @@ fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         aops,
         "filter",
         vec![fn1(ta.clone(), Type::Boolean)],
+        Type::Array(Box::new(ta.clone())),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "take",
+        vec![Type::Int],
         Type::Array(Box::new(ta.clone())),
         Intrinsic::None,
     );
@@ -2047,6 +2100,101 @@ fn add_array_ops_flat_map_from_array(st: &mut SymbolTable, aops: SymbolId, ct: S
             ],
         ],
         ret: Box::new(Type::Array(Box::new(Type::TypeParam(b)))),
+    };
+}
+
+/// `ArrayOps.collect[B](pf: PartialFunction[A, B])(implicit ClassTag[B]): Array[B]`.
+/// nsc 2.13.16 JVM: `collect$extension(Object, PartialFunction, ClassTag)Object`.
+fn add_array_ops_collect(st: &mut SymbolTable, aops: SymbolId, ct: SymbolId) {
+    let pf = st
+        .get(st.scala_pkg)
+        .members
+        .iter()
+        .copied()
+        .find(|id| st.get(*id).name == "PartialFunction")
+        .unwrap_or(SymbolId::NONE);
+    let a = st.get(aops).tparams[0];
+    let ta = Type::TypeParam(a);
+    let m = method(st, aops, "collect", vec![], Type::Unit, Intrinsic::None);
+    let b = type_param(st, m, "B");
+    let f = st.alloc("pf", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(f).ty = Type::Class {
+        sym: pf,
+        args: vec![ta.clone(), Type::TypeParam(b)],
+    };
+    let ev = st.alloc(
+        "evidence$1",
+        m,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(ev).ty = Type::Class {
+        sym: ct,
+        args: vec![Type::TypeParam(b)],
+    };
+    st.get_mut(m).tparams = vec![b];
+    st.get_mut(m).params = vec![f, ev];
+    st.get_mut(m).paramss = vec![vec![f], vec![ev]];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![
+            vec![Type::Class {
+                sym: pf,
+                args: vec![ta, Type::TypeParam(b)],
+            }],
+            vec![Type::Class {
+                sym: ct,
+                args: vec![Type::TypeParam(b)],
+            }],
+        ],
+        ret: Box::new(Type::Array(Box::new(Type::TypeParam(b)))),
+    };
+}
+
+/// `ArrayOps.zip[B](that: IterableOnce[B]): Array[(A, B)]`.
+/// nsc 2.13.16 JVM: `zip$extension(Object, IterableOnce)Tuple2[]`.
+fn add_array_ops_zip(st: &mut SymbolTable, aops: SymbolId, tuple2: SymbolId) {
+    let coll = crate::classpath::ensure_package(st, "scala/collection");
+    let ioc = iface(st, coll, "IterableOnce", "scala/collection/IterableOnce");
+    if st.get(ioc).tparams.is_empty() {
+        let ia = type_param(st, ioc, "A");
+        st.get_mut(ioc).tparams = vec![ia];
+    }
+    if let Some(la) = st.get(st.list_sym).tparams.first().copied() {
+        let parent = Type::Class {
+            sym: ioc,
+            args: vec![Type::TypeParam(la)],
+        };
+        if !st
+            .get(st.list_sym)
+            .parents
+            .iter()
+            .any(|p| matches!(p, Type::Class { sym, .. } if *sym == ioc))
+        {
+            st.get_mut(st.list_sym).parents.push(parent);
+        }
+    }
+    let a = st.get(aops).tparams[0];
+    let ta = Type::TypeParam(a);
+    let m = method(st, aops, "zip", vec![], Type::Unit, Intrinsic::None);
+    let b = type_param(st, m, "B");
+    let that = st.alloc("that", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(that).ty = Type::Class {
+        sym: ioc,
+        args: vec![Type::TypeParam(b)],
+    };
+    st.get_mut(m).tparams = vec![b];
+    st.get_mut(m).params = vec![that];
+    st.get_mut(m).paramss = vec![vec![that]];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![vec![Type::Class {
+            sym: ioc,
+            args: vec![Type::TypeParam(b)],
+        }]],
+        ret: Box::new(Type::Array(Box::new(Type::Class {
+            sym: tuple2,
+            args: vec![ta, Type::TypeParam(b)],
+        }))),
     };
 }
 
@@ -3829,6 +3977,63 @@ fn add_try(st: &mut SymbolTable, throwable: SymbolId) {
     );
     let mems = st.get(failure_cls).members.clone();
     st.get_mut(failure_mod).members.extend(mems);
+}
+
+/// `scala.util.control.Breaks` / `Breaks$` against scala-library 2.13.16.
+/// nsc accepts `import Breaks._`, `Breaks.breakable { ... }`, and `new Breaks`.
+fn add_breaks(st: &mut SymbolTable) {
+    let control = crate::classpath::ensure_package(st, "scala/util/control");
+    let breaks = st.alloc(
+        "Breaks",
+        control,
+        crate::symbol::SymKind::Class,
+        Flags::EMPTY,
+        "scala/util/control/Breaks",
+    );
+    st.get_mut(breaks).parents = vec![Type::AnyRef];
+    st.get_mut(breaks).ty = Type::Class {
+        sym: breaks,
+        args: vec![],
+    };
+    add_breaks_members(st, breaks);
+    method(
+        st,
+        breaks,
+        "<init>",
+        vec![],
+        Type::Class {
+            sym: breaks,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+    let breaks_mod = module_extending(
+        st,
+        control,
+        "Breaks",
+        "scala/util/control/Breaks$",
+        Type::Class {
+            sym: breaks,
+            args: vec![],
+        },
+    );
+    let mcls = st.module_class_of(breaks_mod);
+    add_breaks_members(st, mcls);
+    let mems = st.get(mcls).members.clone();
+    st.get_mut(breaks_mod).members.extend(mems);
+}
+
+fn add_breaks_members(st: &mut SymbolTable, owner: SymbolId) {
+    method(
+        st,
+        owner,
+        "breakable",
+        vec![Type::ByName(Box::new(Type::Unit))],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let br = method(st, owner, "break", vec![], Type::Nothing, Intrinsic::None);
+    st.get_mut(br).jvm_name = "()Lscala/runtime/Nothing$;".into();
 }
 
 fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {

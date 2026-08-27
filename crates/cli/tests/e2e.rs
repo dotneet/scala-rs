@@ -954,6 +954,21 @@ fn fixtures_bitset_bad_is_error() {
 }
 
 #[test]
+fn fixtures_array_ops12_bad_is_error() {
+    compile_fails_lib("array_ops12_bad", "noSuchTake is not a member");
+}
+
+#[test]
+fn fixtures_string_ops16_bad_is_error() {
+    compile_fails_lib("string_ops16_bad", "noSuchDropWhile is not a member");
+}
+
+#[test]
+fn fixtures_breaks_bad_is_error() {
+    compile_fails_lib("breaks_bad", "noSuchBreakable is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1762,6 +1777,21 @@ fn scala_library_dual_run_bitset() {
 }
 
 #[test]
+fn scala_library_dual_run_array_ops12() {
+    dual_run_fixture("array_ops12");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops16() {
+    dual_run_fixture("string_ops16");
+}
+
+#[test]
+fn scala_library_dual_run_breaks() {
+    dual_run_fixture("breaks");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -2079,6 +2109,8 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/util/Success$.class",
     "scala/util/Failure.class",
     "scala/util/Failure$.class",
+    "scala/util/control/Breaks.class",
+    "scala/util/control/Breaks$.class",
     "scala/util/matching/Regex.class",
     "scala/Array$.class",
     "scala/runtime/NonLocalReturnControl.class",

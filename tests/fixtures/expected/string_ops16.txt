@@ -1,0 +1,8 @@
+llo
+he
+true
+false
+Some(a)
+None
+Some(b)
+heo
