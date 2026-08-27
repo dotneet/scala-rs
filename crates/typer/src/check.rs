@@ -4803,7 +4803,9 @@ impl Typer {
 
     fn elem_type(&self, ty: &Type) -> Option<Type> {
         match ty {
-            Type::Class { sym, args } if args.len() == 2 && self.st.get(*sym).name == "Map" => {
+            Type::Class { sym, args }
+                if args.len() == 2 && is_tuple2_elem_map(&self.st.get(*sym).name) =>
+            {
                 Some(Type::Class {
                     sym: self.tuple2_sym(),
                     args: args.clone(),
@@ -8134,6 +8136,10 @@ impl Typer {
         }
         None
     }
+}
+
+fn is_tuple2_elem_map(name: &str) -> bool {
+    matches!(name, "Map" | "HashMap" | "LinkedHashMap")
 }
 
 fn is_tailrec_annot(path: &str) -> bool {
