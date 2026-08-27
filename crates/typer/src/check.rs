@@ -3244,6 +3244,13 @@ impl Typer {
         if tree.sym.is_none() {
             return;
         }
+        // Wait for TypeApply when the method still has unsubstituted tparams.
+        // Otherwise `implicitly[Int]` types the Ident first and searches for `T`.
+        if !self.st.get(tree.sym).tparams.is_empty()
+            && !matches!(tree.kind, TreeKind::TypeApply { .. })
+        {
+            return;
+        }
         let paramss = self.st.get(tree.sym).paramss.clone();
         let first = paramss.first().cloned().unwrap_or_default();
         if first.is_empty() {
