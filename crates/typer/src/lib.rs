@@ -3442,6 +3442,76 @@ object Main {
     }
 
     #[test]
+    fn placeholder_fn2_strops_charfloat_arrayops_typecheck_with_library() {
+        ok_lib(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val add: (Int, Int) => Int = _ + _
+    val n: Int = add(1, 2)
+    val nest: Array[Int] => Array[Int] = _.map(_ + 1)
+    val ys = nest(Array(1, 2, 3))
+    val u: String = "hello".updated(1, 'a')
+    val c: Int = "hello".count(_ == 'l')
+    val sp = "hello".span(_ != 'l')
+    val ch: Char = Array('a', 'b').head
+    val mapped = Array('a', 'b').map(_ + 1)
+    val fh: Float = Array(1.0f, 2.0f).head
+    val fa = Array(-1.0f, 2.0f).map(_.abs)
+  }
+}
+"#,
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val f: Int => Int = _ + _
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d
+                .message
+                .contains("missing parameter type for expanded function")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags2) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = "hi".noSuchUpdated
+    val y = Array('a').noSuchHead
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags2), "expected error, got {:?}", diags2);
+        assert!(
+            diags2.iter().any(|d| d.message.contains("is not a member")),
+            "{:?}",
+            diags2.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics
