@@ -196,6 +196,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     if library_abi {
         add_list_collect(st);
         let ct = add_classtag(st, jclass);
+        if let Some(aops) = array_ops {
+            add_array_ops_map(st, aops, ct);
+        }
         add_string_context(st);
         add_array_companion(st, ct);
     }
@@ -284,6 +287,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_indexedseq_and_queue(st);
         add_array_buffer(st);
         add_list_buffer(st);
+        add_array_deque(st);
         add_string_builder(st);
         add_hash_map(st);
         add_hash_set(st);
@@ -1314,6 +1318,25 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
         Type::String,
         Intrinsic::None,
     );
+    method(
+        st,
+        so,
+        "filter",
+        vec![fn1(Type::Char, Type::Boolean)],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "reverseIterator",
+        vec![],
+        Type::Class {
+            sym: iterator,
+            args: vec![Type::Char],
+        },
+        Intrinsic::None,
+    );
     so
 }
 
@@ -1349,6 +1372,40 @@ fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         Intrinsic::None,
     );
     aops
+}
+
+/// `ArrayOps.map[B](f: A => B)(implicit ClassTag[B]): Array[B]` (scala-library 2.13).
+fn add_array_ops_map(st: &mut SymbolTable, aops: SymbolId, ct: SymbolId) {
+    let a = st.get(aops).tparams[0];
+    let ta = Type::TypeParam(a);
+    let m = method(st, aops, "map", vec![], Type::Unit, Intrinsic::None);
+    let b = type_param(st, m, "B");
+    let f = st.alloc("f", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(f).ty = fn1(ta.clone(), Type::TypeParam(b));
+    let ev = st.alloc(
+        "evidence$1",
+        m,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(ev).ty = Type::Class {
+        sym: ct,
+        args: vec![Type::TypeParam(b)],
+    };
+    st.get_mut(m).tparams = vec![b];
+    st.get_mut(m).params = vec![f, ev];
+    st.get_mut(m).paramss = vec![vec![f], vec![ev]];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![
+            vec![fn1(ta, Type::TypeParam(b))],
+            vec![Type::Class {
+                sym: ct,
+                args: vec![Type::TypeParam(b)],
+            }],
+        ],
+        ret: Box::new(Type::Array(Box::new(Type::TypeParam(b)))),
+    };
 }
 
 fn add_option_members(st: &mut SymbolTable, option_wf: SymbolId, library_abi: bool) {
@@ -2298,6 +2355,94 @@ fn add_list_buffer(st: &mut SymbolTable) {
     };
     let mems = st.get(buf_cls).members.clone();
     st.get_mut(buf_mod).members.extend(mems);
+}
+
+fn add_array_deque(st: &mut SymbolTable) {
+    let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
+    let deq = class(
+        st,
+        mutp,
+        "ArrayDeque",
+        "scala/collection/mutable/ArrayDeque",
+        &[Type::AnyRef],
+    );
+    let da = type_param(st, deq, "A");
+    st.get_mut(deq).tparams = vec![da];
+    let ta = Type::TypeParam(da);
+    let deq_t = Type::Class {
+        sym: deq,
+        args: vec![ta.clone()],
+    };
+    method(
+        st,
+        deq,
+        "apply",
+        vec![Type::Int],
+        ta.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        deq,
+        "+=",
+        vec![Type::Any],
+        deq_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        deq,
+        "prepend",
+        vec![Type::Any],
+        deq_t.clone(),
+        Intrinsic::None,
+    );
+    let deq_mod = module(
+        st,
+        mutp,
+        "ArrayDeque",
+        "scala/collection/mutable/ArrayDeque$",
+    );
+    let deq_cls = st.module_class_of(deq_mod);
+    let deq_empty = method(
+        st,
+        deq_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: deq,
+            args: vec![Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let ea = type_param(st, deq_empty, "A");
+    st.get_mut(deq_empty).tparams = vec![ea];
+    st.get_mut(deq_empty).ty = Type::Method {
+        paramss: vec![vec![]],
+        ret: Box::new(Type::Class {
+            sym: deq,
+            args: vec![Type::TypeParam(ea)],
+        }),
+    };
+    let deq_apply = method(
+        st,
+        deq_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        deq_t.clone(),
+        Intrinsic::None,
+    );
+    let daa = type_param(st, deq_apply, "A");
+    st.get_mut(deq_apply).tparams = vec![daa];
+    st.get_mut(deq_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(daa)))]],
+        ret: Box::new(Type::Class {
+            sym: deq,
+            args: vec![Type::TypeParam(daa)],
+        }),
+    };
+    let mems = st.get(deq_cls).members.clone();
+    st.get_mut(deq_mod).members.extend(mems);
 }
 
 fn add_hash_map(st: &mut SymbolTable) {
@@ -3417,6 +3562,27 @@ fn add_predef_members(
             Intrinsic::Identity,
         );
         st.get_mut(wrap_l).flags = st.get(wrap_l).flags.with(Flags::IMPLICIT);
+        let wrap_ref = method(
+            st,
+            owner,
+            "refArrayOps",
+            vec![Type::Array(Box::new(Type::AnyRef))],
+            Type::Class {
+                sym: aops,
+                args: vec![Type::AnyRef],
+            },
+            Intrinsic::Identity,
+        );
+        let rt = type_param(st, wrap_ref, "T");
+        st.get_mut(wrap_ref).tparams = vec![rt];
+        st.get_mut(wrap_ref).ty = Type::Method {
+            paramss: vec![vec![Type::Array(Box::new(Type::TypeParam(rt)))]],
+            ret: Box::new(Type::Class {
+                sym: aops,
+                args: vec![Type::TypeParam(rt)],
+            }),
+        };
+        st.get_mut(wrap_ref).flags = st.get(wrap_ref).flags.with(Flags::IMPLICIT);
     }
     if let Some(ri) = rich_int {
         let wrap = method(
@@ -3498,7 +3664,14 @@ fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
         sym: jclass,
         args: vec![],
     };
-    method(st, ct, "runtimeClass", vec![], class_ty, Intrinsic::None);
+    method(
+        st,
+        ct,
+        "runtimeClass",
+        vec![],
+        class_ty.clone(),
+        Intrinsic::None,
+    );
     method(
         st,
         ct,
@@ -3527,6 +3700,20 @@ fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
     implicit_getter(st, mc, "Object", tag(Type::AnyRef));
     implicit_getter(st, mc, "Nothing", tag(Type::Nothing));
     implicit_getter(st, mc, "Null", tag(Type::Null));
+    let apply = method(
+        st,
+        mc,
+        "apply",
+        vec![class_ty.clone()],
+        tag(Type::Any),
+        Intrinsic::None,
+    );
+    let at = type_param(st, apply, "T");
+    st.get_mut(apply).tparams = vec![at];
+    st.get_mut(apply).ty = Type::Method {
+        paramss: vec![vec![class_ty]],
+        ret: Box::new(tag(Type::TypeParam(at))),
+    };
     let mems = st.get(mc).members.clone();
     st.get_mut(ctm).members.extend(mems);
     ct

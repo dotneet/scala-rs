@@ -3322,6 +3322,55 @@ object Main {
     }
 
     #[test]
+    fn string_ops10_arrayops_map_arraydeque_typecheck_with_library() {
+        ok_lib(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val f: String = "hello".filter(c => c != 'l')
+    "hello".reverseIterator.foreach(c => println(c))
+    val ys = Array(1, 2, 3).map(x => x + 1)
+    ys.foreach(x => println(x))
+    val zs = Array("a", "b").map(s => s + "x")
+    zs.foreach(s => println(s))
+    val d = scala.collection.mutable.ArrayDeque.empty[Int]
+    d += 1
+    d.prepend(0)
+    val n: Int = d(0)
+    val e = scala.collection.mutable.ArrayDeque(3, 4)
+    e += 5
+    val m: Int = e(1)
+  }
+}
+"#,
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = "hi".noSuchFilter
+    val y = Array(1, 2, 3).noSuchMap
+    val z = scala.collection.mutable.ArrayDeque.empty[Int].noSuch
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics

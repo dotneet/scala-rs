@@ -3571,6 +3571,10 @@ fn load_qualified_this(asm: &mut Assembler, ctx: &EmitCtx, name: &str) {
 }
 
 fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
+    if matches!(&tree.kind, TreeKind::Ident { name } if name == "$classOf") {
+        gen_java_class_of(asm, ctx, &tree.ty);
+        return;
+    }
     let id = tree.sym;
     if id.is_none() {
         throw_runtime(
@@ -4620,6 +4624,20 @@ fn invoke_value_extension(
             );
             return;
         }
+        if s.name == "map" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "map$extension",
+                "(Ljava/lang/Object;Lscala/Function1;Lscala/reflect/ClassTag;)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
         asm.invokestatic(
             "scala/collection/ArrayOps",
             &format!("{}$extension", s.name),
@@ -4980,6 +4998,28 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
                     );
                     asm.checkcast("scala/collection/mutable/ArrayBuffer");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_arraydeque_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ArrayDeque$",
+                        "empty",
+                        "()Lscala/collection/mutable/ArrayDeque;",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ArrayDeque$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/mutable/ArrayDeque");
                     return;
                 }
                 _ => {}
@@ -5557,6 +5597,49 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_arraydeque(&owner) {
+            match name {
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ArrayDeque",
+                        "apply",
+                        "(I)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            emit_unbox(asm, ty);
+                        } else if !is_unit_like(ty) {
+                            let cls = jvm_desc(ctx.st, ty);
+                            if let Some(inner) =
+                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                            {
+                                if inner != "java/lang/Object" {
+                                    asm.checkcast(inner);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                "+=" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ArrayDeque",
+                        "+=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Growable;",
+                    );
+                    return;
+                }
+                "prepend" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ArrayDeque",
+                        "prepend",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/ArrayDeque;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_stdlib_listbuffer(&owner) {
             match name {
                 "apply" => {
@@ -5963,6 +6046,14 @@ fn is_stdlib_arraybuffer(owner: &str) -> bool {
 
 fn is_stdlib_arraybuffer_module(owner: &str) -> bool {
     owner == "scala/collection/mutable/ArrayBuffer$"
+}
+
+fn is_stdlib_arraydeque(owner: &str) -> bool {
+    owner == "scala/collection/mutable/ArrayDeque"
+}
+
+fn is_stdlib_arraydeque_module(owner: &str) -> bool {
+    owner == "scala/collection/mutable/ArrayDeque$"
 }
 
 fn is_stdlib_listbuffer(owner: &str) -> bool {

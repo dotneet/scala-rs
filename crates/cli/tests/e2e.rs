@@ -846,6 +846,21 @@ fn fixtures_linkedhashset_bad_is_error() {
 }
 
 #[test]
+fn fixtures_string_ops10_bad_is_error() {
+    compile_fails_lib("string_ops10_bad", "noSuchFilter is not a member");
+}
+
+#[test]
+fn fixtures_array_ops4_bad_is_error() {
+    compile_fails_lib("array_ops4_bad", "noSuchMap is not a member");
+}
+
+#[test]
+fn fixtures_arraydeque_bad_is_error() {
+    compile_fails_lib("arraydeque_bad", "noSuch is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1549,6 +1564,21 @@ fn scala_library_dual_run_linkedhashset() {
 }
 
 #[test]
+fn scala_library_dual_run_string_ops10() {
+    dual_run_fixture("string_ops10");
+}
+
+#[test]
+fn scala_library_dual_run_array_ops4() {
+    dual_run_fixture("array_ops4");
+}
+
+#[test]
+fn scala_library_dual_run_arraydeque() {
+    dual_run_fixture("arraydeque");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -1827,6 +1857,8 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/mutable/ArrayBuffer$.class",
     "scala/collection/mutable/ListBuffer.class",
     "scala/collection/mutable/ListBuffer$.class",
+    "scala/collection/mutable/ArrayDeque.class",
+    "scala/collection/mutable/ArrayDeque$.class",
     "scala/collection/mutable/StringBuilder.class",
     "scala/collection/mutable/StringBuilder$.class",
     "scala/collection/mutable/HashMap.class",

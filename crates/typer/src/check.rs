@@ -3303,7 +3303,9 @@ impl Typer {
             TreeKind::Select { qual, name } => (qual, name.clone()),
             _ => return,
         };
-        self.type_expr(qual, &Type::NoType);
+        if qual.ty.is_no_type() {
+            self.type_expr(qual, &Type::NoType);
+        }
         if name == "_" {
             self.error(
                 tree.span,
@@ -4475,9 +4477,14 @@ impl Typer {
                     ) && !param_tys.is_empty()
                     {
                         if let Type::Function { ret: fr, .. } = &param_tys[0] {
+                            let fret = if matches!(fr.as_ref(), Type::TypeParam(_)) {
+                                Box::new(Type::Any)
+                            } else {
+                                fr.clone()
+                            };
                             param_tys[0] = Type::Function {
                                 params: vec![elem.clone()],
-                                ret: fr.clone(),
+                                ret: fret,
                             };
                         }
                     }
@@ -4500,6 +4507,21 @@ impl Typer {
                     }
                     if !p.is_no_type() {
                         self.adapt(a, &p);
+                    }
+                    if let TreeKind::Function { body, .. } = &a.kind {
+                        let body_ty = body.ty.widen_constant();
+                        if let Type::Function { params, ret } = &a.ty {
+                            if matches!(ret.as_ref(), Type::Any | Type::NoType)
+                                && !body_ty.is_no_type()
+                                && !body_ty.is_error()
+                            {
+                                let params = params.clone();
+                                a.ty = Type::Function {
+                                    params,
+                                    ret: Box::new(body_ty),
+                                };
+                            }
+                        }
                     }
                 }
                 let nparams = param_tys.len();
@@ -4538,7 +4560,13 @@ impl Typer {
                         };
                     }
                 } else if method_name == "map" {
-                    if !self.is_with_filter_ty(recv_ty.as_ref()) {
+                    if self.is_array_ops_ty(recv_ty.as_ref()) {
+                        if let Some(a0) = args.first() {
+                            if let Type::Function { ret: fr, .. } = &a0.ty {
+                                ret = Type::Array(Box::new(fr.as_ref().widen_constant()));
+                            }
+                        }
+                    } else if !self.is_with_filter_ty(recv_ty.as_ref()) {
                         if let Some(a0) = args.first() {
                             if let Type::Function { ret: fr, .. } = &a0.ty {
                                 if let Some(cls) = recv_ty
@@ -4799,6 +4827,11 @@ impl Typer {
         };
         let n = self.st.get(id).name.as_str();
         n == "WithFilter" || n == "Option$WithFilter"
+    }
+
+    fn is_array_ops_ty(&self, ty: Option<&Type>) -> bool {
+        ty.and_then(|t| self.st.class_sym_of(t))
+            .is_some_and(|id| self.st.get(id).name == "ArrayOps")
     }
 
     fn elem_type(&self, ty: &Type) -> Option<Type> {
@@ -5237,7 +5270,9 @@ impl Typer {
                     args.push(r);
                 }
                 ImplicitSearch::None => {
-                    if let Some(lam) = self.identity_view(&pty, span) {
+                    if let Some(ct) = self.classtag_apply_fallback(&pty, span) {
+                        args.push(ct);
+                    } else if let Some(lam) = self.identity_view(&pty, span) {
                         args.push(lam);
                     } else {
                         self.error(span, self.missing_implicit_message(&pty));
@@ -5251,6 +5286,67 @@ impl Typer {
                 }
             }
         }
+    }
+
+    /// nsc fills `ClassTag[String]` via `ClassTag.apply(classOf[String])` when
+    /// there is no primitive getter (`ClassTag.Int`, …).
+    fn classtag_apply_fallback(&self, pt: &Type, span: Span) -> Option<Tree> {
+        let Type::Class { sym, args } = pt else {
+            return None;
+        };
+        if self.st.get(*sym).name != "ClassTag" || args.is_empty() {
+            return None;
+        }
+        let elem = args[0].clone();
+        let module = self.st.companion_module(*sym)?;
+        let mcls = self.st.module_class_of(module);
+        let apply = self
+            .st
+            .lookup_member(mcls, "apply")
+            .into_iter()
+            .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)?;
+        let class_arg = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Ident {
+                name: "$classOf".into(),
+            },
+            ty: elem,
+            sym: SymbolId::NONE,
+            postfix: false,
+        };
+        let recv = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Ident {
+                name: "ClassTag".into(),
+            },
+            ty: Type::ModuleRef(module),
+            sym: module,
+            postfix: false,
+        };
+        let fun = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(recv),
+                name: "apply".into(),
+            },
+            ty: self.st.get(apply).ty.clone(),
+            sym: apply,
+            postfix: false,
+        };
+        Some(Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Apply {
+                fun: Box::new(fun),
+                args: vec![class_arg],
+            },
+            ty: pt.clone(),
+            sym: apply,
+            postfix: false,
+        })
     }
 
     /// nsc: `A <: B` is a view `A => B` (identity / asInstanceOf).
