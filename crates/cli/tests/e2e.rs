@@ -694,6 +694,16 @@ fn fixtures_switch_bad_warns() {
 }
 
 #[test]
+fn fixtures_early_defs() {
+    check("early_defs");
+}
+
+#[test]
+fn fixtures_early_defs_bad_is_error() {
+    compile_fails("early_defs_bad", "only concrete field definitions");
+}
+
+#[test]
 fn fixtures_xml_attr_bad_is_error() {
     compile_fails("xml_attr_bad", "XML");
 }
@@ -813,6 +823,11 @@ fn scala_library_dual_run_seq() {
 #[test]
 fn scala_library_dual_run_either() {
     dual_run_fixture("either");
+}
+
+#[test]
+fn scala_library_dual_run_infix_either() {
+    dual_run_fixture("infix_either");
 }
 
 #[test]
@@ -1433,10 +1448,10 @@ fn find_scalac() -> Option<PathBuf> {
 /// (`MODULE$`) plus field accessors, extractor `unapply` so `p match { case
 /// Point(a, b) => a + b }` typechecks, an `object` method taking that case
 /// class, and SIP-23 literal types `val one: 1` / `def lit(x: 1)` (CONSTANTtpe).
-/// Remaining pickle holes (ctor-order reorder of named annot args,
-/// leftover Flags such as MACRO / late・anti, JAVA on EXTREF — PickleFormat
-/// EXTREF is name_Ref [owner_Ref] with no flags field) are not
-/// claimed. Nested `List[_ <: List[_]]` and refinement
+/// Remaining pickle holes (MACRO / late・anti flags, JAVA on EXTREF — PickleFormat
+/// EXTREF is name_Ref [owner_Ref] with no flags field) are not claimed.
+/// Named annot ctor-arg reorder is **not** required: scalac 2.13.16 typechecks
+/// `@Ann2(b = 2, a = "ok")` pickled as positional RHS in source order. Nested `List[_ <: List[_]]` and refinement
 /// `A with B { def f: Int }` are pickled so scalac 2.13.16 can typecheck
 /// `Lib.nest` / `Lib.idRef`. Java `@Deprecated` on a Scala method is pickled
 /// as SYMANNOT so scalac `-deprecation` sees `Lib.gone`. TREE Ident/Select/literal
@@ -1512,6 +1527,7 @@ object UseLib {
     val mna: Int = Lib.markedNamed
     val mnt: Int = new Holder().markedNamedTree
     val mni: Int = Lib.markedNamedIdent
+    val mro: Int = Lib.markedReorder
     val j: Int = Lib.join("a", "b")
     val cmp: Int = new OrdBox(1).compare(new OrdBox(2))
   }
@@ -1532,7 +1548,7 @@ object UseLib {
         .expect("scalac");
     assert!(
         output.status.success(),
-        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1) / Java @Deprecated Lib.gone / List[_ <: List[_]] nest / MixA with MixB {{ def f: Int }} idRef / @Ann(foo) marked / @Ann(c.x) markedSel / @Ann(3) markedLit / @Ann(this) markedThis / @Ann(classOf[Int]) markedClass / @Ann(ident(1)) markedApply / @Ann(this.x) markedThisSel / @Ann(super.foo) markedSuper / @Ann(ident(ident(1))) markedNest / @Ann(foo = 1) markedNamed / @Ann(foo = this.x) markedNamedTree / @Ann(foo = bar) markedNamedIdent / Lib.join varargs / OrdBox.compare bridge): {}\n{}",
+        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1) / Java @Deprecated Lib.gone / List[_ <: List[_]] nest / MixA with MixB {{ def f: Int }} idRef / @Ann(foo) marked / @Ann(c.x) markedSel / @Ann(3) markedLit / @Ann(this) markedThis / @Ann(classOf[Int]) markedClass / @Ann(ident(1)) markedApply / @Ann(this.x) markedThisSel / @Ann(super.foo) markedSuper / @Ann(ident(ident(1))) markedNest / @Ann(foo = 1) markedNamed / @Ann(foo = this.x) markedNamedTree / @Ann(foo = bar) markedNamedIdent / @Ann2(b = 2, a = \"ok\") markedReorder (positional source-order pickle; ctor reorder not required) / Lib.join varargs / OrdBox.compare bridge): {}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );

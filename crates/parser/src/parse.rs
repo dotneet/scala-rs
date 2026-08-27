@@ -926,35 +926,96 @@ impl<'a> Parser<'a> {
         self.skip_nl();
         let lo = self.span();
         let mut parents = Vec::new();
+        let mut self_name = None;
+        let mut self_tpt = None;
+        let mut body = Vec::new();
         if matches!(self.kind(), TokenKind::Extends) {
             self.bump();
             self.skip_nl();
-            parents.push(self.parse_parent());
-            loop {
+            if matches!(self.kind(), TokenKind::LBrace) {
+                let (sn, st, mut stats) = self.parse_template_body();
                 self.skip_nl();
                 if matches!(self.kind(), TokenKind::With) {
+                    // nsc EarlyDefs: `extends { val x = 1 } with T`
+                    self.mark_early_defs(&mut stats);
+                    body = stats;
                     self.bump();
                     self.skip_nl();
                     parents.push(self.parse_parent());
+                    self.parse_with_parents(&mut parents);
+                    if matches!(self.peek_non_nl(), TokenKind::LBrace) {
+                        self.skip_nl();
+                        let (sn2, st2, rest) = self.parse_template_body();
+                        self_name = sn2;
+                        self_tpt = st2;
+                        body.extend(rest);
+                    }
+                    let _ = (sn, st);
                 } else {
-                    break;
+                    // `extends { ... }` without `with` is a regular template body.
+                    self_name = sn;
+                    self_tpt = st;
+                    body = stats;
+                }
+            } else {
+                parents.push(self.parse_parent());
+                self.parse_with_parents(&mut parents);
+                if matches!(self.peek_non_nl(), TokenKind::LBrace) {
+                    self.skip_nl();
+                    let (sn, st, rest) = self.parse_template_body();
+                    self_name = sn;
+                    self_tpt = st;
+                    body = rest;
                 }
             }
         } else if is_trait && !matches!(self.kind(), TokenKind::LBrace) {
             // trait T  (no body)
-        }
-        let (self_name, self_tpt, body) = if matches!(self.peek_non_nl(), TokenKind::LBrace) {
+        } else if matches!(self.peek_non_nl(), TokenKind::LBrace) {
             self.skip_nl();
-            self.parse_template_body()
-        } else {
-            (None, None, vec![])
-        };
+            let (sn, st, rest) = self.parse_template_body();
+            self_name = sn;
+            self_tpt = st;
+            body = rest;
+        }
         Template {
             parents,
             self_name,
             self_tpt,
             body,
             span: lo.merge(self.prev_span()),
+        }
+    }
+
+    fn parse_with_parents(&mut self, parents: &mut Vec<Tree>) {
+        loop {
+            self.skip_nl();
+            if matches!(self.kind(), TokenKind::With) {
+                self.bump();
+                self.skip_nl();
+                parents.push(self.parse_parent());
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// nsc: only concrete field definitions are allowed in the early section.
+    fn mark_early_defs(&mut self, stats: &mut [Tree]) {
+        for s in stats {
+            match &mut s.kind {
+                TreeKind::ValDef { mods, rhs, .. }
+                    if !rhs.is_empty() && !mods.flags.contains(Flags::LAZY) =>
+                {
+                    mods.flags = mods.flags.with(Flags::PRESUPER);
+                }
+                TreeKind::TypeDef { .. } => {}
+                _ => {
+                    self.error_span(
+                        s.span,
+                        "only concrete field definitions allowed in early object initialization section",
+                    );
+                }
+            }
         }
     }
 

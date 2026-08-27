@@ -345,6 +345,40 @@ object Main {
     }
 
     #[test]
+    fn early_defs_and_infix_type_parse() {
+        let t = parse_ok(
+            r#"
+trait T { val x: Int }
+class C extends { val x = 1 } with T
+object Main {
+  def f(e: Int Either String): Int Either String = e
+  def g(m: Map[Int, String]): Map[Int, String] = m
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("ValDef val x"), "early val x: {dump}");
+        assert!(dump.contains("Ident T"), "parent T: {dump}");
+        assert!(
+            dump.contains("Ident Either") && dump.contains("Ident Int") && dump.contains("Ident String"),
+            "infix Either: {dump}"
+        );
+        assert!(dump.contains("Ident Map"), "Map[K, V] stays applied: {dump}");
+        let r = parse_str(
+            r#"
+trait T { val x: Int }
+class Bad extends { def f = 1 } with T { val x = 1 }
+"#,
+        );
+        assert!(
+            has_errors(&r.diags)
+                && r.diags.iter().any(|d| d.message.contains("only concrete field definitions")),
+            "illegal early def: {:?}",
+            r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn new_type_args_then_select_is_term() {
         // nsc: `new Q[Int].enqueue(1)` is `(new Q[Int]).enqueue(1)`, not a
         // type projection `Q[Int].enqueue`.

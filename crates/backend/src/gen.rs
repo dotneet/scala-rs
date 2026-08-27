@@ -777,6 +777,13 @@ fn peel_fun(tree: &Tree) -> &Tree {
     }
 }
 
+fn is_presuper_val(tree: &Tree) -> bool {
+    matches!(
+        &tree.kind,
+        TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::PRESUPER)
+    )
+}
+
 fn flatten_apply_owned<'a>(fun: &'a Tree, args: &'a [Tree]) -> (&'a Tree, Vec<Tree>) {
     let mut all = args.to_vec();
     let mut f = fun;
@@ -1159,6 +1166,7 @@ impl<'a> Gen<'a> {
         }
         self.emit_class_ctor(&mut b, class_id, vparamss, &impl_.body);
         self.emit_lazy_accessors(&mut b, class_id, &impl_.body);
+        self.emit_val_getters(&mut b, &impl_.body);
         for stt in &impl_.body {
             if matches!(stt.kind, TreeKind::DefDef { .. }) {
                 self.emit_def(&mut b, class_id, stt);
@@ -1224,7 +1232,7 @@ impl<'a> Gen<'a> {
             .iter()
             .filter(|t| matches!(t.kind, TreeKind::ValDef { .. }))
             .collect();
-        let max_locals = frame.next_slot;
+        let max_locals = frame.next_slot.max(4);
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
@@ -1249,6 +1257,39 @@ impl<'a> Gen<'a> {
         };
         b.add_code(ACC_PUBLIC, "<init>", &desc, max_locals, |asm| {
             let mut frame = frame;
+            let ctx_early = emit_ctx(
+                st,
+                class_id,
+                &class_name,
+                Type::Unit,
+                extras,
+                lambda_n,
+                source,
+                library_abi,
+            );
+            // nsc: early vals are stored to fields before the superclass ctor so
+            // parent / trait `$init$` bodies see the values.
+            for vd in &inits {
+                if !is_presuper_val(vd) {
+                    continue;
+                }
+                if let TreeKind::ValDef {
+                    name, mods, rhs, ..
+                } = &vd.kind
+                {
+                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                        continue;
+                    }
+                    asm.aload(0);
+                    gen_expr(asm, &mut frame, &ctx_early, rhs);
+                    let ty = if vd.ty.is_no_type() && !vd.sym.is_none() {
+                        st.get(vd.sym).ty.clone()
+                    } else {
+                        vd.ty.clone()
+                    };
+                    asm.putfield(&class_name, name, &jvm_desc(st, &ty));
+                }
+            }
             asm.aload(0);
             asm.invokespecial(&super_name, "<init>", "()V");
             if has_outer {
@@ -1281,6 +1322,9 @@ impl<'a> Gen<'a> {
                 library_abi,
             );
             for vd in &inits {
+                if is_presuper_val(vd) {
+                    continue;
+                }
                 if let TreeKind::ValDef {
                     name, mods, rhs, ..
                 } = &vd.kind

@@ -1358,6 +1358,10 @@ impl Typer {
     }
 
     fn type_val_body(&mut self, tree: &mut Tree) {
+        let presuper = matches!(
+            &tree.kind,
+            TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::PRESUPER)
+        );
         let (rhs, declared) = match &mut tree.kind {
             TreeKind::ValDef { rhs, .. } => (rhs, tree.ty.clone()),
             _ => return,
@@ -1375,6 +1379,12 @@ impl Typer {
             declared.clone()
         };
         self.type_expr(rhs, &pt);
+        if presuper && tree_contains_this(rhs) {
+            self.error(
+                tree.span,
+                "this can be used only in a class, object, or template",
+            );
+        }
         if declared.is_no_type() {
             tree.ty = rhs.ty.widen_constant();
             if !tree.sym.is_none() {
@@ -6651,6 +6661,27 @@ fn pattern_has_star(pat: &Tree) -> bool {
         TreeKind::Star { .. } => true,
         TreeKind::Bind { body, .. } => pattern_has_star(body),
         TreeKind::Typed { expr, .. } => pattern_has_star(expr),
+        _ => false,
+    }
+}
+
+fn tree_contains_this(tree: &Tree) -> bool {
+    match &tree.kind {
+        TreeKind::This { .. } => true,
+        TreeKind::Select { qual, .. } | TreeKind::Typed { expr: qual, .. } => {
+            tree_contains_this(qual)
+        }
+        TreeKind::Apply { fun, args } | TreeKind::TypeApply { fun, args } => {
+            tree_contains_this(fun) || args.iter().any(tree_contains_this)
+        }
+        TreeKind::Block { stats, expr } => {
+            stats.iter().any(tree_contains_this) || tree_contains_this(expr)
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            tree_contains_this(cond) || tree_contains_this(thenp) || tree_contains_this(elsep)
+        }
+        TreeKind::Assign { lhs, rhs } => tree_contains_this(lhs) || tree_contains_this(rhs),
+        TreeKind::New { tpt } => tree_contains_this(tpt),
         _ => false,
     }
 }

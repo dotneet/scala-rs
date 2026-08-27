@@ -54,6 +54,8 @@ impl Flags {
     pub const BRIDGE: Flags = Flags(1 << 24);
     /// nsc `VARARGS` (raw `1L << 43`): Scala `T*` / Java `T...` method.
     pub const VARARGS: Flags = Flags(1 << 25);
+    /// nsc `PRESUPER`: early field defs (`class C extends { val x = 1 } with T`).
+    pub const PRESUPER: Flags = Flags(1 << 26);
 
     pub fn contains(self, f: Flags) -> bool {
         self.0 & f.0 != 0
