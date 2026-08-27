@@ -444,6 +444,40 @@ fn compile_fails(name: &str, needle: &str) {
     let _ = fs::remove_dir_all(&out);
 }
 
+fn compile_fails_lib(name: &str, needle: &str) {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip compile_fails_lib {name}: jar not obtainable");
+        return;
+    };
+    let src = fixtures_dir().join(format!("{name}.scala"));
+    let out = tmp_dir(name);
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        !output.status.success(),
+        "expected compile of {name} to fail"
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        err.contains(needle),
+        "expected {needle:?} in diagnostics for {name}, got {err:?}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
 fn compile_warns(name: &str, needle: &str) {
     let src = fixtures_dir().join(format!("{name}.scala"));
     let out = tmp_dir(name);
@@ -595,6 +629,11 @@ fn fixtures_implicit_class() {
 }
 
 #[test]
+fn fixtures_pkg_implicit_class() {
+    check("pkg_implicit_class");
+}
+
+#[test]
 fn fixtures_dynamic() {
     check("dynamic");
 }
@@ -607,6 +646,11 @@ fn fixtures_postfix_ops() {
 #[test]
 fn fixtures_structural() {
     check("structural");
+}
+
+#[test]
+fn fixtures_structural_update() {
+    check("structural_update");
 }
 
 #[test]
@@ -678,7 +722,22 @@ fn fatal_warnings_makes_postfix_ops_fail() {
 
 #[test]
 fn fixtures_structural_bad_is_error() {
-    compile_fails("structural_bad", "structural");
+    compile_fails("structural_bad", "foo_=");
+}
+
+#[test]
+fn fixtures_pkg_implicit_class_bad_is_error() {
+    compile_fails("pkg_implicit_class_bad", "twice is not a member");
+}
+
+#[test]
+fn fixtures_pkg_implicit_toplevel_bad_is_error() {
+    compile_fails("pkg_implicit_toplevel_bad", "top-level");
+}
+
+#[test]
+fn fixtures_indexedseq_queue_bad_is_error() {
+    compile_fails_lib("indexedseq_queue_bad", "noSuch is not a member");
 }
 
 #[test]
@@ -1225,6 +1284,11 @@ fn scala_library_dual_run_vector() {
 }
 
 #[test]
+fn scala_library_dual_run_indexedseq_queue() {
+    dual_run_fixture("indexedseq_queue");
+}
+
+#[test]
 fn scala_library_dual_run_int_ops() {
     dual_run_fixture("int_ops");
 }
@@ -1445,6 +1509,16 @@ fn scala_library_dual_run_implicit_class() {
 }
 
 #[test]
+fn scala_library_dual_run_pkg_implicit_class() {
+    dual_run_fixture("pkg_implicit_class");
+}
+
+#[test]
+fn scala_library_dual_run_structural_update() {
+    dual_run_fixture("structural_update");
+}
+
+#[test]
 fn scala_library_dual_run_dynamic() {
     dual_run_fixture("dynamic");
 }
@@ -1516,6 +1590,10 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/immutable/Map$.class",
     "scala/collection/immutable/Vector.class",
     "scala/collection/immutable/Vector$.class",
+    "scala/collection/immutable/IndexedSeq.class",
+    "scala/collection/immutable/IndexedSeq$.class",
+    "scala/collection/immutable/Queue.class",
+    "scala/collection/immutable/Queue$.class",
     "scala/Predef$any2stringadd.class",
     "scala/Predef$ArrowAssoc.class",
     "scala/runtime/RichInt.class",
@@ -1928,6 +2006,65 @@ fn separate_compilation_against_classfiles() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         expected_stdout("separate")
+    );
+    let _ = fs::remove_dir_all(&out_lib);
+    let _ = fs::remove_dir_all(&out_main);
+}
+
+#[test]
+fn separate_compilation_package_object_implicit_class() {
+    if !java_available() {
+        return;
+    }
+    let lib_src = fixtures_dir().join("pkg_implicit_lib.scala");
+    let main_src = fixtures_dir().join("pkg_implicit_main.scala");
+    let out_lib = tmp_dir("pkg-implicit-lib");
+    let out_main = tmp_dir("pkg-implicit-main");
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            "--no-scala-library",
+            lib_src.to_str().unwrap(),
+            "-d",
+            out_lib.to_str().unwrap(),
+        ])
+        .status()
+        .expect("compile pkg_implicit_lib");
+    assert!(status.success(), "compile pkg_implicit_lib failed");
+    assert!(
+        out_lib.join("enrich/package$.class").is_file(),
+        "enrich/package$.class missing in {}",
+        out_lib.display()
+    );
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            "--no-scala-library",
+            main_src.to_str().unwrap(),
+            "-d",
+            out_main.to_str().unwrap(),
+            "-cp",
+            out_lib.to_str().unwrap(),
+        ])
+        .status()
+        .expect("compile Main against package object classfiles");
+    assert!(
+        status.success(),
+        "compile pkg_implicit_main against package object classfiles failed"
+    );
+    let cp = format!("{}:{}", out_main.display(), out_lib.display());
+    let output = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        output.status.success(),
+        "java Main failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("pkg_implicit_main")
     );
     let _ = fs::remove_dir_all(&out_lib);
     let _ = fs::remove_dir_all(&out_main);

@@ -2722,6 +2722,264 @@ object Main {
     }
 
     #[test]
+    fn package_object_implicit_class_typecheck() {
+        ok(r#"
+package object enrich {
+  implicit class Rich(n: Int) { def twice: Int = n * 2 }
+}
+object Main {
+  import enrich._
+  def main(args: Array[String]): Unit = {
+    val n: Int = 2.twice
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+package object enrich {
+  implicit class Rich(n: Int) { def twice: Int = n * 2 }
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = 2.twice
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("twice") && d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+implicit class Rich(n: Int) { def twice: Int = n * 2 }
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = 2.twice
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("top-level")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    fn pkg_implicit_classpath(nested_first: bool) -> Vec<ClasspathClass> {
+        let pkg = ClasspathClass {
+            jvm_name: "enrich/package$".into(),
+            is_module: true,
+            methods: vec![ClasspathMethod {
+                name: "Rich".into(),
+                desc: "(I)Lenrich/package$Rich;".into(),
+            }],
+            pickle: Some(vec![ClasspathPickleMethod {
+                name: "Rich".into(),
+                param_names: vec!["n".into()],
+                param_types: vec!["Int".into()],
+                ret: "Rich".into(),
+                tparams: vec![],
+                is_val: false,
+                is_ctor: false,
+                is_implicit: true,
+            }]),
+            pickle_tparams: vec![],
+        };
+        let nested = ClasspathClass {
+            jvm_name: "enrich/package$Rich".into(),
+            is_module: false,
+            methods: vec![ClasspathMethod {
+                name: "twice".into(),
+                desc: "()I".into(),
+            }],
+            pickle: Some(vec![
+                ClasspathPickleMethod {
+                    name: "<init>".into(),
+                    param_names: vec!["n".into()],
+                    param_types: vec!["Int".into()],
+                    ret: "Unit".into(),
+                    tparams: vec![],
+                    is_val: false,
+                    is_ctor: true,
+                    is_implicit: false,
+                },
+                ClasspathPickleMethod {
+                    name: "twice".into(),
+                    param_names: vec![],
+                    param_types: vec![],
+                    ret: "Int".into(),
+                    tparams: vec![],
+                    is_val: false,
+                    is_ctor: false,
+                    is_implicit: false,
+                },
+            ]),
+            pickle_tparams: vec![],
+        };
+        if nested_first {
+            vec![nested, pkg]
+        } else {
+            vec![pkg, nested]
+        }
+    }
+
+    fn assert_pkg_implicit_cp(cp: Vec<ClasspathClass>) {
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+import enrich._
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = 2.twice
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: false,
+                classpath: cp.clone(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(
+            !has_errors(&diags),
+            "classpath package-object implicit class must typecheck: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = 2.twice
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: false,
+                classpath: cp,
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(
+            has_errors(&diags),
+            "expected missing import, got {:?}",
+            diags
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("twice") && d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn classpath_package_object_implicit_class() {
+        assert_pkg_implicit_cp(pkg_implicit_classpath(false));
+        assert_pkg_implicit_cp(pkg_implicit_classpath(true));
+    }
+
+    #[test]
+    fn structural_update_typecheck() {
+        ok(r#"
+class Cell {
+  private var n: Int = 0
+  def foo: Int = n
+  def foo_=(k: Int): Unit = { n = k }
+}
+class Buf {
+  private var n: Int = 0
+  def apply(i: Int): Int = n
+  def update(i: Int, v: Int): Unit = { n = v }
+}
+object Main {
+  def set(x: { var foo: Int }): Unit = { x.foo = 41 }
+  def get(x: { var foo: Int }): Int = x.foo
+  def setDef(x: { def foo: Int; def foo_=(k: Int): Unit }): Unit = { x.foo = 7 }
+  def upd(x: { def apply(i: Int): Int; def update(i: Int, v: Int): Unit }): Unit = {
+    x(0) = 9
+  }
+  def main(args: Array[String]): Unit = {
+    val c = new Cell()
+    set(c)
+    val n: Int = get(c)
+    setDef(c)
+    val b = new Buf()
+    upd(b)
+    val k: Int = b.apply(0)
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def use(x: { def foo: Int }): Unit = {
+    x.foo = 1
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("foo_=") && d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn indexedseq_queue_typecheck_with_library() {
+        ok_lib(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n: Int = IndexedSeq(1, 2)(1)
+    val q = scala.collection.immutable.Queue(1, 2).enqueue(3)
+    val d = q.dequeue
+    val h: Int = d._1
+  }
+}
+"#,
+        );
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val n = IndexedSeq(1, 2).noSuch
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("noSuch") && d.message.contains("is not a member")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics

@@ -132,6 +132,7 @@ pub struct PickledMethod {
     pub tparams: Vec<String>,
     pub is_val: bool,
     pub is_ctor: bool,
+    pub is_implicit: bool,
 }
 
 /// Pickled class or module class.
@@ -2639,6 +2640,8 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 }
             }
             let is_accessor = (*flags & (1u64 << 27)) != 0; // ACCESSOR
+            const IMPLICIT_PKL: u64 = 1 << 0;
+            let is_implicit = (*flags & IMPLICIT_PKL) != 0;
             methods.push(PickledMethod {
                 name: mname.clone(),
                 param_names,
@@ -2647,10 +2650,13 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 tparams,
                 is_val: is_accessor,
                 is_ctor: mname == "<init>",
+                is_implicit,
             });
         } else {
             // NullaryMethodType (POLYtpe with no tparams) or a plain type.
             let is_accessor = (*flags & (1u64 << 27)) != 0;
+            const IMPLICIT_PKL: u64 = 1 << 0;
+            let is_implicit = (*flags & IMPLICIT_PKL) != 0;
             methods.push(PickledMethod {
                 name: mname,
                 param_names: Vec::new(),
@@ -2659,6 +2665,7 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 tparams,
                 is_val: is_accessor,
                 is_ctor: false,
+                is_implicit,
             });
         }
     }
@@ -2817,6 +2824,39 @@ class Box[A](val value: A) {
         assert_eq!(get.ret, "A");
         let init = b.methods.iter().find(|m| m.is_ctor).expect("<init>");
         assert_eq!(init.param_types, vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn pickle_package_object_implicit_class_conversion() {
+        let src = r#"
+package object enrich {
+  implicit class Rich(n: Int) { def twice: Int = n * 2 }
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let pkg = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "package" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("package object module");
+        let cls = st.module_class_of(pkg);
+        let p = unpickle(&pickle_class(&st, cls)).expect("unpickle package$");
+        let conv = p
+            .methods
+            .iter()
+            .find(|m| m.name == "Rich" && !m.is_val)
+            .expect("implicit conversion Rich");
+        assert!(
+            conv.is_implicit,
+            "package object implicit class conversion must pickle IMPLICIT, got {conv:?}"
+        );
+        assert_eq!(conv.param_types, vec!["Int".to_string()]);
     }
 
     #[test]

@@ -54,6 +54,7 @@ pub struct ClasspathPickleMethod {
     pub tparams: Vec<String>,
     pub is_val: bool,
     pub is_ctor: bool,
+    pub is_implicit: bool,
 }
 
 /// Binary class/object visible to namer/typer via `-cp`.
@@ -963,7 +964,12 @@ impl Typer {
                     self.st.get(self.st.owner).kind
                 };
                 if owner_kind == SymKind::Package {
-                    self.error(tree.span, "unimplemented: implicit class at package level");
+                    // nsc: top-level `implicit class` is illegal. Package objects
+                    // own the class (ModuleClass), so they do not take this path.
+                    self.error(
+                        tree.span,
+                        "`implicit` modifier cannot be used for top-level objects",
+                    );
                 }
                 let nparams = vparamss.first().map(|c| c.len()).unwrap_or(0);
                 if nparams != 1 {
@@ -2816,7 +2822,30 @@ impl Typer {
                 }
                 self.type_expr(lhs, &Type::NoType);
                 if structural_select_lhs(lhs) {
-                    self.error(tree.span, "unimplemented: structural update");
+                    // nsc: `x.foo = v` on a refinement is `x.foo_=(v)` (reflective).
+                    let lhs = std::mem::replace(lhs.as_mut(), Tree::dummy(TreeKind::Empty));
+                    let rhs = std::mem::replace(rhs.as_mut(), Tree::dummy(TreeKind::Empty));
+                    let (qual, name) = match lhs.kind {
+                        TreeKind::Select { qual, name } => (*qual, name),
+                        _ => unreachable!(),
+                    };
+                    let setter = Tree {
+                        id: lhs.id,
+                        span: lhs.span,
+                        kind: TreeKind::Select {
+                            qual: Box::new(qual),
+                            name: format!("{name}_="),
+                        },
+                        ty: Type::NoType,
+                        sym: SymbolId::NONE,
+                        postfix: false,
+                    };
+                    tree.kind = TreeKind::Apply {
+                        fun: Box::new(setter),
+                        args: vec![rhs],
+                    };
+                    self.type_expr(tree, pt);
+                    return;
                 }
                 self.type_expr(rhs, &lhs.ty);
                 self.adapt(rhs, &lhs.ty);
@@ -3356,6 +3385,21 @@ impl Typer {
             );
             tree.ty = Type::Error;
             return;
+        }
+        // Term position prefers the companion module (and methods/vals) over
+        // the class of the same name, matching `type_ident`.
+        let terms: Vec<SymbolId> = found
+            .iter()
+            .copied()
+            .filter(|s| {
+                matches!(
+                    self.st.get(*s).kind,
+                    SymKind::Module | SymKind::Method | SymKind::Term
+                )
+            })
+            .collect();
+        if !terms.is_empty() {
+            found = terms;
         }
         let subst_args: Vec<Type> = match &qual.ty {
             Type::Class { args, .. } => args.clone(),
@@ -6865,20 +6909,29 @@ impl Typer {
                     mods,
                     ..
                 } => {
-                    if mods.flags.contains(Flags::MUTABLE) {
-                        self.error(r.span, "unimplemented type: structural var members");
-                        ok = false;
-                        continue;
-                    }
                     if !rhs.is_empty() {
                         self.error(r.span, "illegal implementation in refinement");
                         ok = false;
                         continue;
                     }
-                    decls.push(scala_rs_parser::RefineDecl::Val {
-                        name: name.clone(),
-                        ty: self.tree_to_type(tpt),
-                    });
+                    let ty = self.tree_to_type(tpt);
+                    if mods.flags.contains(Flags::MUTABLE) {
+                        // nsc `{ var foo: T }` ≡ getter `foo` + setter `foo_=`.
+                        decls.push(scala_rs_parser::RefineDecl::Val {
+                            name: name.clone(),
+                            ty: ty.clone(),
+                        });
+                        decls.push(scala_rs_parser::RefineDecl::Def {
+                            name: format!("{name}_="),
+                            paramss: vec![vec![ty]],
+                            ret: Type::Unit,
+                        });
+                    } else {
+                        decls.push(scala_rs_parser::RefineDecl::Val {
+                            name: name.clone(),
+                            ty,
+                        });
+                    }
                 }
                 TreeKind::Unimplemented { what } => {
                     self.error(r.span, format!("unimplemented type: {what}"));
