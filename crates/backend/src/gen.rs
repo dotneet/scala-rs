@@ -832,6 +832,36 @@ fn checkcast_refined_receiver(
     asm.checkcast(&jn);
 }
 
+/// Captured locals are stored as `Object`. Erasure must checkcast before
+/// `invokevirtual` / `invokeinterface` against a more specific owner
+/// (`new Breaks` captured into `breakable { b.break() }`).
+fn checkcast_erased_method_receiver(asm: &mut Assembler, ctx: &EmitCtx, fun: &Tree) {
+    if fun.sym.is_none() {
+        return;
+    }
+    let s = ctx.st.get(fun.sym);
+    if s.kind != SymKind::Method || s.flags.contains(Flags::STATIC) {
+        return;
+    }
+    if s.name == "<init>" {
+        return;
+    }
+    if is_module_class(ctx.st, s.owner) {
+        return;
+    }
+    if ctx.st.is_value_class(s.owner) {
+        return;
+    }
+    if fun_is_super(fun) {
+        return;
+    }
+    let jn = class_internal(ctx.st, s.owner);
+    if jn.is_empty() || jn == "java/lang/Object" || jn.starts_with('[') {
+        return;
+    }
+    asm.checkcast(&jn);
+}
+
 fn is_module_class(st: &SymbolTable, id: SymbolId) -> bool {
     let s = st.get(id);
     s.kind == SymKind::ModuleClass || s.kind == SymKind::Module || s.flags.contains(Flags::MODULE)
@@ -4448,6 +4478,7 @@ fn gen_apply(
     if let TreeKind::Select { qual, .. } = &fun.kind {
         checkcast_refined_receiver(asm, ctx, &qual.ty, fun.sym);
     }
+    checkcast_erased_method_receiver(asm, ctx, fun);
     let value_owner = if !fun.sym.is_none() && ctx.st.is_value_class(ctx.st.get(fun.sym).owner) {
         Some(ctx.st.get(fun.sym).owner)
     } else {

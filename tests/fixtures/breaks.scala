@@ -32,7 +32,7 @@ object Main {
       break()
       println("after")
     } catch {
-      case t: Throwable => println(t.getClass.getName)
+      case t: Throwable => println(t)
     }
   }
 }
