@@ -5130,6 +5130,44 @@ fn invoke_value_extension(
             );
             return;
         }
+        if s.name == "filterNot" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "filterNot$extension",
+                "(Ljava/lang/Object;Lscala/Function1;)Ljava/lang/Object;",
+            );
+            maybe_unbox_erased_result(
+                asm,
+                ctx,
+                "(Ljava/lang/Object;Lscala/Function1;)Ljava/lang/Object;",
+                result_ty,
+            );
+            return;
+        }
+        if s.name == "headOption" || s.name == "lastOption" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                &format!("{}$extension", s.name),
+                "(Ljava/lang/Object;)Lscala/Option;",
+            );
+            return;
+        }
+        if s.name == "partition" || s.name == "span" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                &format!("{}$extension", s.name),
+                "(Ljava/lang/Object;Lscala/Function1;)Lscala/Tuple2;",
+            );
+            return;
+        }
+        if s.name == "splitAt" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "splitAt$extension",
+                "(Ljava/lang/Object;I)Lscala/Tuple2;",
+            );
+            return;
+        }
         asm.invokestatic(
             "scala/collection/ArrayOps",
             &format!("{}$extension", s.name),
@@ -5997,6 +6035,46 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 maybe_unbox_erased_result(asm, ctx, desc, result_ty);
             }
             return;
+        }
+        if owner == "scala/util/Using$" && name == "apply" {
+            asm.invokevirtual(
+                "scala/util/Using$",
+                "apply",
+                "(Lscala/Function0;Lscala/Function1;Lscala/util/Using$Releasable;)Lscala/util/Try;",
+            );
+            return;
+        }
+        if owner == "scala/util/Using$Manager$" && name == "apply" {
+            asm.invokevirtual(
+                "scala/util/Using$Manager$",
+                "apply",
+                "(Lscala/Function1;)Lscala/util/Try;",
+            );
+            return;
+        }
+        if owner == "scala/util/Using$Manager" {
+            match name {
+                "apply" => {
+                    let desc =
+                        "(Ljava/lang/Object;Lscala/util/Using$Releasable;)Ljava/lang/Object;";
+                    asm.invokevirtual("scala/util/Using$Manager", "apply", desc);
+                    if result_ty.is_some_and(is_unit_like) {
+                        asm.pop();
+                    } else {
+                        maybe_unbox_erased_result(asm, ctx, desc, result_ty);
+                    }
+                    return;
+                }
+                "acquire" => {
+                    asm.invokevirtual(
+                        "scala/util/Using$Manager",
+                        "acquire",
+                        "(Ljava/lang/Object;Lscala/util/Using$Releasable;)V",
+                    );
+                    return;
+                }
+                _ => {}
+            }
         }
         if is_stdlib_try_module(&owner) && name == "apply" {
             match owner.as_str() {

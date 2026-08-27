@@ -359,6 +359,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         }
         if let Some(aops) = array_ops {
             add_array_ops_remaining(st, aops);
+            add_array_ops_filter_not_opts_part(st, aops, tuple2);
         }
         add_seq_and_lazylist(st);
         add_indexedseq_and_queue(st);
@@ -2635,6 +2636,77 @@ fn add_array_ops_remaining(st: &mut SymbolTable, aops: SymbolId) {
     );
 }
 
+/// ArrayOps.filterNot / headOption / lastOption / partition / splitAt / span
+/// against 2.13.16.
+///
+/// JVM: `filterNot$extension(Object, Function1)Object`,
+/// `headOption$extension` / `lastOption$extension(Object)Option`,
+/// `partition$extension` / `span$extension(Object, Function1)Tuple2`,
+/// `splitAt$extension(Object, I)Tuple2`.
+fn add_array_ops_filter_not_opts_part(st: &mut SymbolTable, aops: SymbolId, tuple2: SymbolId) {
+    let a = st.get(aops).tparams[0];
+    let ta = Type::TypeParam(a);
+    let arr = Type::Array(Box::new(ta.clone()));
+    method(
+        st,
+        aops,
+        "filterNot",
+        vec![fn1(ta.clone(), Type::Boolean)],
+        arr.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "headOption",
+        vec![],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![ta.clone()],
+        },
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "lastOption",
+        vec![],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![ta.clone()],
+        },
+        Intrinsic::None,
+    );
+    let pair = Type::Class {
+        sym: tuple2,
+        args: vec![arr.clone(), arr],
+    };
+    method(
+        st,
+        aops,
+        "partition",
+        vec![fn1(ta.clone(), Type::Boolean)],
+        pair.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "splitAt",
+        vec![Type::Int],
+        pair.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "span",
+        vec![fn1(ta, Type::Boolean)],
+        pair,
+        Intrinsic::None,
+    );
+}
+
 /// StringOps.map(Char => Char): String, `:+` / `+:` against 2.13.16.
 ///
 /// JVM: `map$extension(String, Function1)String`,
@@ -2666,10 +2738,13 @@ fn add_string_ops_map_and_appended(st: &mut SymbolTable, so: SymbolId) {
     );
 }
 
-/// StringOps.compare / lengthCompare / patch(Int, String, Int) / `<` against 2.13.16.
+/// StringOps.compare / lengthCompare / patch(Int, String, Int) / `<` / `>` /
+/// `>=` / `<=` against 2.13.16.
 ///
 /// JVM: `compare$extension(String, String)I`, `lengthCompare$extension(String, I)I`,
-/// `patch$extension(String, I, String, I)String`, `$less$extension(String, String)Z`.
+/// `patch$extension(String, I, String, I)String`, `$less$extension` /
+/// `$greater$extension` / `$greater$eq$extension` / `$less$eq$extension`
+/// `(String, String)Z`.
 fn add_string_ops_compare_patch_length(st: &mut SymbolTable, so: SymbolId) {
     method(
         st,
@@ -2695,14 +2770,16 @@ fn add_string_ops_compare_patch_length(st: &mut SymbolTable, so: SymbolId) {
         Type::String,
         Intrinsic::None,
     );
-    method(
-        st,
-        so,
-        "<",
-        vec![Type::String],
-        Type::Boolean,
-        Intrinsic::None,
-    );
+    for op in ["<", ">", ">=", "<="] {
+        method(
+            st,
+            so,
+            op,
+            vec![Type::String],
+            Type::Boolean,
+            Intrinsic::None,
+        );
+    }
 }
 
 fn add_string_ops_indices_and_r(st: &mut SymbolTable, so: SymbolId) {
@@ -4760,10 +4837,15 @@ fn add_chaining(st: &mut SymbolTable) {
     st.get_mut(chaining).members.extend(mems);
 }
 
-/// `scala.util.Using.resource` + `Releasable[-R]` against scala-library 2.13.16.
+/// `scala.util.Using.resource` / `Using.apply` / `Using.Manager` + `Releasable[-R]`
+/// against scala-library 2.13.16.
 ///
-/// nsc 2.13.16 JVM: `Using$.resource(Object, Function1, Using$Releasable)Object`
-/// with implicit `Using$Releasable$AutoCloseableIsReleasable$.MODULE$`.
+/// nsc 2.13.16 JVM:
+/// `Using$.resource(Object, Function1, Using$Releasable)Object`,
+/// `Using$.apply(Function0, Function1, Using$Releasable)Try`,
+/// `Using$Manager$.apply(Function1)Try`,
+/// `Using$Manager.apply/acquire(Object, Using$Releasable)`.
+/// Implicit `Using$Releasable$AutoCloseableIsReleasable$.MODULE$`.
 fn add_using(st: &mut SymbolTable) {
     let util = crate::classpath::ensure_package(st, "scala/util");
     let java_lang = crate::classpath::ensure_package(st, "java/lang");
@@ -4869,6 +4951,213 @@ fn add_using(st: &mut SymbolTable) {
         ],
         ret: Box::new(a_t),
     };
+
+    let try_c = st
+        .lookup_member(st.scala_pkg, "Try")
+        .into_iter()
+        .find(|&id| st.get(id).kind == crate::symbol::SymKind::Class)
+        .expect("Try");
+
+    // nsc `Using.apply[R, A](resource: => R)(f: R => A)(implicit Releasable[R]): Try[A]`
+    // JVM: `Using$.apply(Function0, Function1, Using$Releasable)Try`
+    let app = method(st, using_cls, "apply", vec![], Type::Unit, Intrinsic::None);
+    let ar = type_param(st, app, "R");
+    let aa2 = type_param(st, app, "A");
+    st.get_mut(app).tparams = vec![ar, aa2];
+    let ar_t = Type::TypeParam(ar);
+    let aa2_t = Type::TypeParam(aa2);
+    let app_res = st.alloc(
+        "resource",
+        app,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM,
+        "",
+    );
+    st.get_mut(app_res).ty = Type::ByName(Box::new(ar_t.clone()));
+    let app_f = st.alloc("f", app, crate::symbol::SymKind::Term, Flags::PARAM, "");
+    st.get_mut(app_f).ty = fn1(ar_t.clone(), aa2_t.clone());
+    let app_ev = st.alloc(
+        "releasable",
+        app,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(app_ev).ty = Type::Class {
+        sym: releasable,
+        args: vec![ar_t.clone()],
+    };
+    st.get_mut(app).params = vec![app_res, app_f, app_ev];
+    st.get_mut(app).paramss = vec![vec![app_res], vec![app_f], vec![app_ev]];
+    st.get_mut(app).ty = Type::Method {
+        paramss: vec![
+            vec![Type::ByName(Box::new(ar_t.clone()))],
+            vec![fn1(ar_t.clone(), aa2_t.clone())],
+            vec![Type::Class {
+                sym: releasable,
+                args: vec![ar_t],
+            }],
+        ],
+        ret: Box::new(Type::Class {
+            sym: try_c,
+            args: vec![aa2_t],
+        }),
+    };
+    st.get_mut(app).jvm_name =
+        "(Lscala/Function0;Lscala/Function1;Lscala/util/Using$Releasable;)Lscala/util/Try;".into();
+
+    let manager_cls = class(
+        st,
+        using_cls,
+        "Manager",
+        "scala/util/Using$Manager",
+        &[Type::AnyRef],
+    );
+    method(
+        st,
+        manager_cls,
+        "<init>",
+        vec![],
+        Type::Class {
+            sym: manager_cls,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+    let mgr_t = Type::Class {
+        sym: manager_cls,
+        args: vec![],
+    };
+
+    let mgr_app = method(
+        st,
+        manager_cls,
+        "apply",
+        vec![],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let mr = type_param(st, mgr_app, "R");
+    st.get_mut(mgr_app).tparams = vec![mr];
+    let mr_t = Type::TypeParam(mr);
+    let mgr_res = st.alloc(
+        "resource",
+        mgr_app,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM,
+        "",
+    );
+    st.get_mut(mgr_res).ty = mr_t.clone();
+    let mgr_ev = st.alloc(
+        "releasable",
+        mgr_app,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(mgr_ev).ty = Type::Class {
+        sym: releasable,
+        args: vec![mr_t.clone()],
+    };
+    st.get_mut(mgr_app).params = vec![mgr_res, mgr_ev];
+    st.get_mut(mgr_app).paramss = vec![vec![mgr_res], vec![mgr_ev]];
+    st.get_mut(mgr_app).ty = Type::Method {
+        paramss: vec![
+            vec![mr_t.clone()],
+            vec![Type::Class {
+                sym: releasable,
+                args: vec![mr_t.clone()],
+            }],
+        ],
+        ret: Box::new(mr_t),
+    };
+    st.get_mut(mgr_app).jvm_name =
+        "(Ljava/lang/Object;Lscala/util/Using$Releasable;)Ljava/lang/Object;".into();
+
+    let mgr_acq = method(
+        st,
+        manager_cls,
+        "acquire",
+        vec![],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let acr = type_param(st, mgr_acq, "R");
+    st.get_mut(mgr_acq).tparams = vec![acr];
+    let acr_t = Type::TypeParam(acr);
+    let acq_res = st.alloc(
+        "resource",
+        mgr_acq,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM,
+        "",
+    );
+    st.get_mut(acq_res).ty = acr_t.clone();
+    let acq_ev = st.alloc(
+        "releasable",
+        mgr_acq,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(acq_ev).ty = Type::Class {
+        sym: releasable,
+        args: vec![acr_t.clone()],
+    };
+    st.get_mut(mgr_acq).params = vec![acq_res, acq_ev];
+    st.get_mut(mgr_acq).paramss = vec![vec![acq_res], vec![acq_ev]];
+    st.get_mut(mgr_acq).ty = Type::Method {
+        paramss: vec![
+            vec![acr_t.clone()],
+            vec![Type::Class {
+                sym: releasable,
+                args: vec![acr_t],
+            }],
+        ],
+        ret: Box::new(Type::Unit),
+    };
+    st.get_mut(mgr_acq).jvm_name = "(Ljava/lang/Object;Lscala/util/Using$Releasable;)V".into();
+
+    let manager_mod = module(st, using_cls, "Manager", "scala/util/Using$Manager$");
+    let manager_mcls = st.module_class_of(manager_mod);
+    let mobj_app = method(
+        st,
+        manager_mcls,
+        "apply",
+        vec![],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let ma = type_param(st, mobj_app, "A");
+    st.get_mut(mobj_app).tparams = vec![ma];
+    let ma_t = Type::TypeParam(ma);
+    let op = st.alloc(
+        "op",
+        mobj_app,
+        crate::symbol::SymKind::Term,
+        Flags::PARAM,
+        "",
+    );
+    st.get_mut(op).ty = fn1(mgr_t, ma_t.clone());
+    st.get_mut(mobj_app).params = vec![op];
+    st.get_mut(mobj_app).paramss = vec![vec![op]];
+    st.get_mut(mobj_app).ty = Type::Method {
+        paramss: vec![vec![fn1(
+            Type::Class {
+                sym: manager_cls,
+                args: vec![],
+            },
+            ma_t.clone(),
+        )]],
+        ret: Box::new(Type::Class {
+            sym: try_c,
+            args: vec![ma_t],
+        }),
+    };
+    st.get_mut(mobj_app).jvm_name = "(Lscala/Function1;)Lscala/util/Try;".into();
+    let mm_mems = st.get(manager_mcls).members.clone();
+    st.get_mut(manager_mod).members.extend(mm_mems);
+
     let mems = st.get(using_cls).members.clone();
     st.get_mut(using_mod).members.extend(mems);
 }
