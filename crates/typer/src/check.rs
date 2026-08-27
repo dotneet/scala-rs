@@ -2447,9 +2447,7 @@ impl Typer {
         if found.is_empty() {
             if let Some(o) = self.st.class_sym_of(&qual.ty) {
                 found = self.st.lookup_member(o, &name);
-                if found.is_empty()
-                    && matches!(&qual.ty, Type::Class { .. } | Type::ModuleRef(_))
-                {
+                if found.is_empty() && matches!(&qual.ty, Type::Class { .. } | Type::ModuleRef(_)) {
                     // `asList(...).size()`: the receiver type is a Java stub until
                     // the classfile is completed. `qual.sym` is the method, not List.
                     // Skip `Type::String` / primitives so StringOps / RichChar views

@@ -295,10 +295,8 @@ mod tests {
 
     #[test]
     fn class_sig_map_entry() {
-        let s = parse_class_sig(
-            "<K:Ljava/lang/Object;V:Ljava/lang/Object;>Ljava/lang/Object;",
-        )
-        .unwrap();
+        let s = parse_class_sig("<K:Ljava/lang/Object;V:Ljava/lang/Object;>Ljava/lang/Object;")
+            .unwrap();
         assert_eq!(s.tparams, vec!["K", "V"]);
     }
 

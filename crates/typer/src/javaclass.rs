@@ -540,9 +540,7 @@ mod tests {
         };
         let c = parse_java_classfile(&bytes).expect("parse ArrayList");
         assert!(
-            c.signature
-                .as_deref()
-                .is_some_and(|s| s.starts_with("<E:")),
+            c.signature.as_deref().is_some_and(|s| s.starts_with("<E:")),
             "ArrayList class Signature missing: {:?}",
             c.signature
         );
