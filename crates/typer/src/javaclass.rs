@@ -32,6 +32,7 @@ pub struct JavaField {
 pub struct JavaClass {
     pub internal_name: String,
     pub access: u16,
+    #[allow(dead_code)]
     pub super_name: Option<String>,
     pub methods: Vec<JavaMethod>,
     pub fields: Vec<JavaField>,
