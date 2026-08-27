@@ -10,6 +10,6 @@ object Main {
   def main(args: Array[String]): Unit = {
     val b = new Box[Id, Int](new Id(41))
     println(b.fa.value)
-    println(IdFunctor.map(new Id(1))((x: Int) => x + 1).value)
+    println(IdFunctor.map[Int, Int](new Id(1))((x: Int) => x + 1).value)
   }
 }

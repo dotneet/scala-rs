@@ -1345,7 +1345,7 @@ object Main {
   def main(args: Array[String]): Unit = {
     val b = new Box[Id, Int](new Id(41))
     val n: Int = b.fa.value
-    val m: Id[Int] = IdFunctor.map(new Id(1))((x: Int) => x + 1)
+    val m: Id[Int] = IdFunctor.map[Int, Int](new Id(1))((x: Int) => x + 1)
   }
 }
 "#);

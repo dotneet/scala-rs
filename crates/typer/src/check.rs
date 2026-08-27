@@ -1570,7 +1570,11 @@ impl Typer {
             _ => return,
         };
         let ty = if tpt.is_empty() {
-            Type::NoType
+            if !tree.ty.is_no_type() {
+                tree.ty.clone()
+            } else {
+                Type::NoType
+            }
         } else {
             let ty = self.tree_to_type(&tpt);
             self.check_proper_type(&ty, tree.span);
@@ -4623,14 +4627,21 @@ impl Typer {
                 self.fill_implicit_params(span, args, &rest_tys, &rest_ids);
                 return None;
             }
-            let rest_tys: Vec<Vec<Type>> = paramss_ids[1..]
-                .iter()
-                .map(|clause| {
-                    clause
-                        .iter()
-                        .map(|id| self.st.get(*id).ty.clone())
-                        .collect()
-                })
+            let rest_tys: Vec<Vec<Type>> = match fun_ty {
+                Type::Method { paramss, .. } if paramss.len() > 1 => paramss[1..].to_vec(),
+                _ => paramss_ids[1..]
+                    .iter()
+                    .map(|clause| {
+                        clause
+                            .iter()
+                            .map(|id| self.st.get(*id).ty.clone())
+                            .collect()
+                    })
+                    .collect(),
+            };
+            let rest_tys: Vec<Vec<Type>> = rest_tys
+                .into_iter()
+                .map(|tys| self.instantiate_from_call(sym, &first, args, tys))
                 .collect();
             let ret = match fun_ty {
                 Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
@@ -4639,6 +4650,11 @@ impl Typer {
                     _ => Type::NoType,
                 },
             };
+            let ret = self
+                .instantiate_from_call(sym, &first, args, vec![ret])
+                .into_iter()
+                .next()
+                .unwrap_or(Type::NoType);
             return Some(Type::Method {
                 paramss: rest_tys,
                 ret: Box::new(ret),
@@ -8478,7 +8494,13 @@ fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
     }
     match pattern {
         Type::Annotated { tpe, .. } => unify_one(tp, tpe, actual),
-        Type::TypeParam(id) if *id == tp => Some(actual.widen_constant()),
+        Type::TypeParam(id) if *id == tp => {
+            if actual.is_no_type() || actual.is_error() {
+                None
+            } else {
+                Some(actual.widen_constant())
+            }
+        }
         Type::BoundedWildcard { hi: Some(h), .. } | Type::BoundedWildcard { lo: Some(h), .. } => {
             unify_one(tp, h, actual)
         }

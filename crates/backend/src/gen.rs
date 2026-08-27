@@ -1649,7 +1649,7 @@ impl<'a> Gen<'a> {
                 |asm| {
                     asm.aload(0);
                     asm.aload(1);
-                    asm.invokestatic(
+                    asm.invokestatic_interface(
                         "scala/App",
                         "delayedInit$",
                         "(Lscala/App;Lscala/Function0;)V",
@@ -1662,14 +1662,22 @@ impl<'a> Gen<'a> {
             b.add_code(ACC_PUBLIC, "main", "([Ljava/lang/String;)V", 2, |asm| {
                 asm.aload(0);
                 asm.aload(1);
-                asm.invokestatic("scala/App", "main$", "(Lscala/App;[Ljava/lang/String;)V");
+                asm.invokestatic_interface(
+                    "scala/App",
+                    "main$",
+                    "(Lscala/App;[Ljava/lang/String;)V",
+                );
                 asm.vreturn();
             });
         }
         if !b.methods.iter().any(|m| m.name == "args") {
             b.add_code(ACC_PUBLIC, "args", "()[Ljava/lang/String;", 1, |asm| {
                 asm.aload(0);
-                asm.invokestatic("scala/App", "args$", "(Lscala/App;)[Ljava/lang/String;");
+                asm.invokestatic_interface(
+                    "scala/App",
+                    "args$",
+                    "(Lscala/App;)[Ljava/lang/String;",
+                );
                 asm.areturn();
             });
         }
@@ -1913,7 +1921,7 @@ impl<'a> Gen<'a> {
             if delayed {
                 if library_abi && is_app {
                     asm.aload(0);
-                    asm.invokestatic("scala/App", "$init$", "(Lscala/App;)V");
+                    asm.invokestatic_interface("scala/App", "$init$", "(Lscala/App;)V");
                 }
                 Gen::emit_delayed_init_call(asm, &class_name);
             } else {
@@ -2971,7 +2979,7 @@ impl<'a> Gen<'a> {
             if delayed {
                 if library_abi && is_app {
                     asm.aload(0);
-                    asm.invokestatic("scala/App", "$init$", "(Lscala/App;)V");
+                    asm.invokestatic_interface("scala/App", "$init$", "(Lscala/App;)V");
                 }
                 Gen::emit_delayed_init_call(asm, &class_name);
             } else {

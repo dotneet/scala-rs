@@ -92,6 +92,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     mark_java(st, _runtime_ex);
     let jclass = class(st, java_lang, "Class", "java/lang/Class", &[Type::AnyRef]);
     mark_java(st, jclass);
+    let class_t = type_param(st, jclass, "T");
+    st.get_mut(jclass).tparams = vec![class_t];
     method(st, jclass, "getName", vec![], Type::String, Intrinsic::None);
     st.array_sym = class(
         st,
