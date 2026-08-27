@@ -3028,16 +3028,27 @@ impl<'a> Parser<'a> {
     }
 
     /// Scala 2.13 XML literal subset: `<a/>`, `<a></a>`, `<a>t{e}</a>`,
-    /// `<a b={e} c="t"/>` (elem / text / splice / unprefixed attributes).
-    /// Namespaces, entity refs, and CDATA are diagnosed, not dropped.
+    /// `<a b={e} c="t"/>`, `<p:a xmlns:p="u"/>` (elem / text / splice /
+    /// unprefixed and prefixed attributes / prefixed element names).
+    /// Entity refs, comments, and CDATA are diagnosed, not dropped.
     fn parse_xml_literal(&mut self) -> Tree {
         let lo = self.span();
         self.bump(); // `<`
+        self.skip_nl();
+        match self.kind().clone() {
+            TokenKind::Ident(n) if n.starts_with('!') || n == "!" => {
+                return self.unimplemented(lo.merge(self.span()), "XML comments/CDATA");
+            }
+            TokenKind::Ident(n) if n.starts_with('?') || n == "?" => {
+                return self.unimplemented(lo.merge(self.span()), "XML processing instructions");
+            }
+            _ => {}
+        }
         self.parse_xml_elem(lo)
     }
 
     fn parse_xml_elem(&mut self, lo: Span) -> Tree {
-        let name = match self.kind().clone() {
+        let mut name = match self.kind().clone() {
             TokenKind::Ident(n)
                 if n != ">"
                     && n != "/>"
@@ -3055,17 +3066,38 @@ impl<'a> Parser<'a> {
             }
         };
         self.skip_nl();
-        if matches!(self.kind(), TokenKind::Colon) {
-            return self.unimplemented(
-                lo.merge(self.span()),
-                "XML prefixed element names",
-            );
-        }
+        let prefix = if matches!(self.kind(), TokenKind::Colon) {
+            self.bump();
+            self.skip_nl();
+            match self.kind().clone() {
+                TokenKind::Ident(local)
+                    if local != ">"
+                        && local != "/>"
+                        && local != "</"
+                        && local != "<"
+                        && !is_operator_name(&local) =>
+                {
+                    self.bump();
+                    let pre = name;
+                    name = local;
+                    Some(pre)
+                }
+                _ => {
+                    return self.unimplemented(
+                        lo.merge(self.span()),
+                        "XML prefixed element names",
+                    );
+                }
+            }
+        } else {
+            None
+        };
         let (attrs, xmlns) = self.parse_xml_attrs();
         match self.kind().clone() {
             TokenKind::Ident(n) if n == "/>" => {
                 self.bump();
                 return self.xml_elem(
+                    prefix.as_deref(),
                     &name,
                     attrs,
                     xmlns,
@@ -3089,26 +3121,25 @@ impl<'a> Parser<'a> {
             match self.kind().clone() {
                 TokenKind::Ident(n) if n == "</" => {
                     self.bump();
-                    let close = match self.kind().clone() {
-                        TokenKind::Ident(c) => {
-                            self.bump();
-                            c
-                        }
-                        _ => {
-                            self.error_here("expected XML closing tag name");
-                            String::new()
-                        }
-                    };
+                    let (cpre, close) = self.parse_xml_close_name();
                     self.skip_nl();
                     if matches!(self.kind(), TokenKind::Ident(s) if s == ">") {
                         self.bump();
                     } else {
                         self.error_here("expected `>` after XML closing tag");
                     }
-                    if close != name {
+                    let open = match &prefix {
+                        Some(p) => format!("{p}:{name}"),
+                        None => name.clone(),
+                    };
+                    let closed = match &cpre {
+                        Some(p) => format!("{p}:{close}"),
+                        None => close,
+                    };
+                    if closed != open {
                         self.error_span(
                             lo.merge(self.prev_span()),
-                            format!("XML closing tag `</{close}>` does not match `<{name}>`"),
+                            format!("XML closing tag `</{closed}>` does not match `<{open}>`"),
                         );
                     }
                     break;
@@ -3158,7 +3189,46 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.xml_elem(&name, attrs, xmlns, children, lo.merge(self.prev_span()))
+        self.xml_elem(
+            prefix.as_deref(),
+            &name,
+            attrs,
+            xmlns,
+            children,
+            lo.merge(self.prev_span()),
+        )
+    }
+
+    fn parse_xml_close_name(&mut self) -> (Option<String>, String) {
+        let first = match self.kind().clone() {
+            TokenKind::Ident(c)
+                if c != ">" && c != "</" && c != "<" && !is_operator_name(&c) =>
+            {
+                self.bump();
+                c
+            }
+            _ => {
+                self.error_here("expected XML closing tag name");
+                return (None, String::new());
+            }
+        };
+        self.skip_nl();
+        if matches!(self.kind(), TokenKind::Colon) {
+            self.bump();
+            self.skip_nl();
+            match self.kind().clone() {
+                TokenKind::Ident(local) if local != ">" && !is_operator_name(&local) => {
+                    self.bump();
+                    (Some(first), local)
+                }
+                _ => {
+                    self.error_here("expected XML closing tag local name");
+                    (Some(first), String::new())
+                }
+            }
+        } else {
+            (None, first)
+        }
     }
 
     fn parse_xml_attr_value(&mut self) -> Option<Tree> {
@@ -3183,8 +3253,8 @@ impl<'a> Parser<'a> {
     }
 
     /// Unprefixed `b={e}` / `c="t"`, prefixed `p:b=…`, and `xmlns:p="uri"` /
-    /// default `xmlns="uri"`. Other XML (prefixed element names, CDATA, …)
-    /// stays diagnosed.
+    /// default `xmlns="uri"`. Comments, CDATA, and processing instructions
+    /// stay diagnosed.
     fn parse_xml_attrs(&mut self) -> (Vec<XmlAttr>, Vec<(Option<String>, Tree)>) {
         let mut attrs = Vec::new();
         let mut xmlns = Vec::new();
@@ -3438,9 +3508,10 @@ impl<'a> Parser<'a> {
         acc
     }
 
-    /// `new scala.xml.Elem(null, label, attrs, scope, true, children)`
+    /// `new scala.xml.Elem(prefix|null, label, attrs, scope, true, children)`
     fn xml_elem(
         &mut self,
+        prefix: Option<&str>,
         label: &str,
         attrs: Vec<XmlAttr>,
         xmlns: Vec<(Option<String>, Tree)>,
@@ -3448,7 +3519,15 @@ impl<'a> Parser<'a> {
         span: Span,
     ) -> Tree {
         let cls = self.xml_path(&["scala", "xml", "Elem"], span);
-        let prefix = self.alloc(span, TreeKind::Literal { lit: Lit::Null });
+        let prefix = match prefix {
+            Some(p) => self.alloc(
+                span,
+                TreeKind::Literal {
+                    lit: Lit::String(p.into()),
+                },
+            ),
+            None => self.alloc(span, TreeKind::Literal { lit: Lit::Null }),
+        };
         let lab = self.alloc(
             span,
             TreeKind::Literal {

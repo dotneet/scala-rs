@@ -31,8 +31,9 @@
 //! - `this.type` results are `THIStpe` of the enclosing class
 //! - type annotations `T @unchecked` are `ANNOTATEDtpe` + `ANNOTINFO`
 //! - annotation args that are string/int/boolean literals are Constants;
-//!   simple `Ident` / `Select` args are `TREE` (`IDENTtree` / `SELECTtree`)
-//!   so scalac 2.13.16 can typecheck `@Ann(foo)` / `@Ann(c.x)` on a method
+//!   `classOf[T]` is `LITERALclass`; simple `Ident` / `Select` / `this` / `Apply`
+//!   args are `TREE` so scalac 2.13.16 can typecheck `@Ann(foo)` / `@Ann(this)` /
+//!   `@Ann(foo(1))` / `@Ann(classOf[Int])` on a method
 //! - Java `@Deprecated` is `SYMANNOT` with `TypeRef` under `java.lang` (not skipped)
 //! - SIP-23 `1` in a signature is `CONSTANTtpe(LITERALint)` (nsc `writeLong` =
 //!   signed big-endian base 256)
@@ -86,6 +87,9 @@ pub const LITERALdouble: u8 = 32;
 pub const LITERALstring: u8 = 33;
 #[allow(non_upper_case_globals)]
 pub const LITERALnull: u8 = 34;
+/// nsc `LITERALclass` — `classOf[T]` annotation args (Constant, not TREE).
+#[allow(non_upper_case_globals)]
+pub const LITERALclass: u8 = 35;
 pub const SYMANNOT: u8 = 40;
 pub const ANNOTATEDTPE: u8 = 42;
 pub const ANNOTINFO: u8 = 43;
@@ -93,6 +97,12 @@ pub const REFINEDTPE: u8 = 18;
 pub const EXISTENTIALTPE: u8 = 48;
 /// nsc `TREE` — annotation arguments that are not Constants.
 pub const TREE: u8 = 49;
+#[allow(non_upper_case_globals)]
+pub const TYPEAPPLYtree: u8 = 30;
+#[allow(non_upper_case_globals)]
+pub const APPLYtree: u8 = 31;
+#[allow(non_upper_case_globals)]
+pub const THIStree: u8 = 34;
 #[allow(non_upper_case_globals)]
 pub const SELECTtree: u8 = 35;
 #[allow(non_upper_case_globals)]
@@ -920,12 +930,28 @@ impl<'a> Pickler<'a> {
         self.add(SYMANNOT, body);
     }
 
-    /// Constant (literal) or TREE Ident/Select. Apply / this / classOf stay holes.
+    /// Constant (literal / classOf) or TREE Ident/Select/This/Apply.
+    /// Super / nested Apply / named args stay holes.
     fn pickle_annot_arg(&mut self, arg: &Tree, owner: SymbolId) -> Option<u32> {
         match &arg.kind {
             TreeKind::Literal { lit } => Some(self.pickle_literal(lit)),
             TreeKind::Ident { name } => Some(self.pickle_ident_tree(name, owner)),
             TreeKind::Select { qual, name } => self.pickle_select_tree(qual, name, owner),
+            TreeKind::This { qual } => Some(self.pickle_this_tree(qual.as_deref(), owner)),
+            TreeKind::TypeApply { fun, args } if is_classof_fun(fun) => {
+                // nsc pickles annotation `classOf[T]` as LITERALclass Constant,
+                // not TYPEAPPLYtree. scalac 2.13.16 reads that Constant.
+                let tpe = args
+                    .first()
+                    .map(|t| self.pickle_type_from_tree(t))
+                    .unwrap_or_else(|| self.type_ref_named("Any"));
+                Some(self.pickle_literal_class(tpe))
+            }
+            TreeKind::Apply { fun, args }
+                if matches!(&fun.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) =>
+            {
+                self.pickle_apply_tree(fun, args, owner)
+            }
             _ => None,
         }
     }
@@ -1063,6 +1089,87 @@ impl<'a> Pickler<'a> {
         write_nat_to(&mut body, qtree);
         write_nat_to(&mut body, n);
         Some(self.add(TREE, body))
+    }
+
+    /// TREE { THIStree, type_Ref, sym_Ref, name_Ref } — UnPickler reads a symbol.
+    fn pickle_this_tree(&mut self, qual: Option<&str>, owner: SymbolId) -> u32 {
+        let cls = self.enclosing_class_sym(owner);
+        let tpe = if cls.is_none() {
+            self.notpe
+        } else {
+            self.pickle_this_tpe(cls)
+        };
+        let sym = if cls.is_none() {
+            self.none
+        } else {
+            self.pickle_class(cls)
+        };
+        let n = match qual {
+            Some(q) if !q.is_empty() => self.type_name(q),
+            _ => self.type_name(""),
+        };
+        let mut body = Vec::new();
+        write_nat_to(&mut body, THIStree as u32);
+        write_nat_to(&mut body, tpe);
+        write_nat_to(&mut body, sym);
+        write_nat_to(&mut body, n);
+        self.add(TREE, body)
+    }
+
+    fn enclosing_class_sym(&self, owner: SymbolId) -> SymbolId {
+        let mut id = owner;
+        for _ in 0..8 {
+            if id.is_none() {
+                return id;
+            }
+            match self.st.get(id).kind {
+                SymKind::Class | SymKind::ModuleClass => return id,
+                SymKind::Module => {
+                    let mc = self.st.module_class_of(id);
+                    return if mc.is_none() { id } else { mc };
+                }
+                _ => id = self.st.get(id).owner,
+            }
+        }
+        owner
+    }
+
+    /// TREE { APPLYtree, type_Ref, fun_tree, {arg_tree} } — no symbol (nsc).
+    fn pickle_apply_tree(&mut self, fun: &Tree, args: &[Tree], owner: SymbolId) -> Option<u32> {
+        let fun_ref = self.pickle_annot_arg(fun, owner)?;
+        let mut arg_refs = Vec::new();
+        for a in args {
+            arg_refs.push(self.pickle_annot_arg(a, owner)?);
+        }
+        let found = match &fun.kind {
+            TreeKind::Ident { name } => self.lookup_member_named(owner, name),
+            TreeKind::Select { name, .. } => self.lookup_member_named(owner, name),
+            _ => None,
+        };
+        let tpe = self.member_tree_tpe(found);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, APPLYtree as u32);
+        write_nat_to(&mut body, tpe);
+        write_nat_to(&mut body, fun_ref);
+        for a in arg_refs {
+            write_nat_to(&mut body, a);
+        }
+        Some(self.add(TREE, body))
+    }
+
+    fn pickle_literal_class(&mut self, tpe: u32) -> u32 {
+        let mut body = Vec::new();
+        write_nat_to(&mut body, tpe);
+        self.add(LITERALclass, body)
+    }
+
+    fn pickle_type_from_tree(&mut self, tpt: &Tree) -> u32 {
+        match &tpt.kind {
+            TreeKind::Ident { name } => self.type_ref_named(name),
+            TreeKind::Select { name, .. } => self.type_ref_named(name),
+            TreeKind::AppliedTypeTree { tpt, .. } => self.pickle_type_from_tree(tpt),
+            _ => self.type_ref_named("Any"),
+        }
     }
 
     fn pickle_sym_annots(&mut self, id: SymbolId, pickle_idx: u32) {
@@ -1653,6 +1760,13 @@ fn annot_args(tree: &Tree) -> Vec<&Tree> {
     match &tree.kind {
         TreeKind::Apply { args, .. } => args.iter().collect(),
         _ => Vec::new(),
+    }
+}
+
+fn is_classof_fun(fun: &Tree) -> bool {
+    match &fun.kind {
+        TreeKind::Ident { name } | TreeKind::Select { name, .. } => name == "classOf",
+        _ => false,
     }
 }
 
@@ -2807,6 +2921,154 @@ object Lib {
             join_has_varargs,
             "expected VARARGS on pickled join(String*)"
         );
+    }
+
+    #[test]
+    fn pickle_tree_this_classof_apply_and_extref_has_no_flags() {
+        let src = r#"
+class Ann(x: Any) extends annotation.StaticAnnotation
+class Holder {
+  @Ann(this) def markedThis: Int = 4
+  @Ann(classOf[Int]) def markedClass: Int = 5
+}
+object Lib {
+  def ident(n: Int): Int = n
+  @Ann(ident(1)) def markedApply: Int = 6
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let holder = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Holder" && s.kind == scala_rs_typer::SymKind::Class)
+            .map(|s| s.id)
+            .expect("Holder");
+        let hraw = pickle_class(&st, holder);
+        let htags = pickle_tags(&hraw);
+        assert!(
+            htags.contains(&TREE),
+            "expected TREE for @Ann(this), tags={htags:?}"
+        );
+        assert!(
+            htags.contains(&LITERALclass),
+            "expected LITERALclass for @Ann(classOf[Int]), tags={htags:?}"
+        );
+        let hsubs = tree_subtags(&hraw);
+        assert!(
+            hsubs.contains(&(THIStree as u32)),
+            "expected THIStree subtag, got {hsubs:?}"
+        );
+
+        let lib = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Lib" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("Lib module");
+        let cls = st.module_class_of(lib);
+        let raw = pickle_class(&st, cls);
+        let tags = pickle_tags(&raw);
+        assert!(
+            tags.contains(&TREE),
+            "expected TREE for @Ann(ident(1)), tags={tags:?}"
+        );
+        let subs = tree_subtags(&raw);
+        assert!(
+            subs.contains(&(APPLYtree as u32)),
+            "expected APPLYtree subtag, got {subs:?}"
+        );
+        assert!(
+            subs.contains(&(IDENTtree as u32)),
+            "expected IDENTtree for ident, got {subs:?}"
+        );
+
+        // PickleFormat EXTref = name_Ref [owner_Ref]. There is no flags field;
+        // stuffing a Nat there would be read as owner. JAVA on java.lang.Object
+        // comes from the JDK classfile scalac completes, not from our pickle.
+        let mut r = Reader::new(&raw);
+        let _ = r.read_nat();
+        let _ = r.read_nat();
+        let n = r.read_nat().unwrap_or(0) as usize;
+        let mut object_name = None;
+        let mut i = 0u32;
+        let mut entries: Vec<(u8, usize, usize)> = Vec::new();
+        while i < n as u32 {
+            let Some(tag) = r.read_byte() else {
+                break;
+            };
+            let len = r.read_nat().unwrap_or(0) as usize;
+            let start = r.pos;
+            let end = r.pos.saturating_add(len).min(r.bytes.len());
+            if tag == TYPENAME || tag == TERMNAME {
+                let name = String::from_utf8_lossy(&r.bytes[start..end]).into_owned();
+                if name == "Object" {
+                    object_name = Some(i);
+                }
+            }
+            entries.push((tag, start, end));
+            r.pos = end;
+            i += 1;
+        }
+        let object_name = object_name.expect("pickled name Object");
+        let mut saw_object_extref = false;
+        for (tag, start, end) in entries {
+            if tag != EXTREF {
+                continue;
+            }
+            let mut r2 = Reader::new(&raw);
+            r2.pos = start;
+            let Some(name_ref) = r2.read_nat() else {
+                continue;
+            };
+            if name_ref != object_name {
+                continue;
+            }
+            saw_object_extref = true;
+            let mut nats = 0u32;
+            while r2.pos < end {
+                if r2.read_nat().is_none() {
+                    break;
+                }
+                nats += 1;
+            }
+            assert_eq!(
+                nats, 1,
+                "EXTREF Object is name_Ref + owner_Ref (no flags Nat)"
+            );
+        }
+        assert!(
+            saw_object_extref,
+            "expected java.lang.Object as EXTREF (no flags field)"
+        );
+    }
+
+    fn tree_subtags(bytes: &[u8]) -> Vec<u32> {
+        let mut r = Reader::new(bytes);
+        let _ = r.read_nat();
+        let _ = r.read_nat();
+        let n = r.read_nat().unwrap_or(0) as usize;
+        let mut tags = Vec::new();
+        for _ in 0..n {
+            let Some(tag) = r.read_byte() else {
+                break;
+            };
+            let len = r.read_nat().unwrap_or(0) as usize;
+            let end = r.pos.saturating_add(len).min(r.bytes.len());
+            if tag == TREE {
+                let saved = r.pos;
+                if let Some(sub) = r.read_nat() {
+                    tags.push(sub);
+                }
+                r.pos = saved;
+            }
+            r.pos = end;
+        }
+        tags
     }
 
     #[test]

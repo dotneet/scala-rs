@@ -1,5 +1,5 @@
 object Main {
   def main(args: Array[String]): Unit = {
-    val x = <p:a/>
+    val x = <a><!--c--></a>
   }
 }
