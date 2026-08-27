@@ -9,6 +9,7 @@ class Holder extends Base {
   @Ann(classOf[Int]) def markedClass: Int = 5
   @Ann(this.x) def markedThisSel: Int = 7
   @Ann(super.foo) def markedSuper: Int = 8
+  @Ann(foo = this.x) def markedNamedTree: Int = 11
 }
 class C { val x = 1 }
 class OrdBox(val n: Int) extends Ordered[OrdBox] {
@@ -29,6 +30,7 @@ object Lib {
   def nest(xs: List[_ <: List[_]]): Int = 0
   def idRef(x: MixA with MixB { def f: Int }): MixA with MixB { def f: Int } = x
   val foo = 1
+  val bar = 1
   val c = new C
   @Ann(foo) def marked: Int = 1
   @Ann(c.x) def markedSel: Int = 2
@@ -37,6 +39,7 @@ object Lib {
   @Ann(ident(1)) def markedApply: Int = 6
   @Ann(ident(ident(1))) def markedNest: Int = 9
   @Ann(foo = 1) def markedNamed: Int = 10
+  @Ann(foo = bar) def markedNamedIdent: Int = 12
   def join(xs: String*): Int = 0
 }
 trait MixA { def a: Int }

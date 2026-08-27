@@ -679,6 +679,21 @@ fn fixtures_annot_bad_is_error() {
 }
 
 #[test]
+fn fixtures_implicit_not_found_is_error() {
+    compile_fails("implicit_not_found", "no show for Int");
+}
+
+#[test]
+fn fixtures_switch() {
+    check("switch");
+}
+
+#[test]
+fn fixtures_switch_bad_warns() {
+    compile_warns("switch_bad", "could not emit switch");
+}
+
+#[test]
 fn fixtures_xml_attr_bad_is_error() {
     compile_fails("xml_attr_bad", "XML");
 }
@@ -1418,7 +1433,7 @@ fn find_scalac() -> Option<PathBuf> {
 /// (`MODULE$`) plus field accessors, extractor `unapply` so `p match { case
 /// Point(a, b) => a + b }` typechecks, an `object` method taking that case
 /// class, and SIP-23 literal types `val one: 1` / `def lit(x: 1)` (CONSTANTtpe).
-/// Remaining pickle holes (named TREE annot args / ctor-order reorder,
+/// Remaining pickle holes (ctor-order reorder of named annot args,
 /// leftover Flags such as MACRO / late・anti, JAVA on EXTREF — PickleFormat
 /// EXTREF is name_Ref [owner_Ref] with no flags field) are not
 /// claimed. Nested `List[_ <: List[_]]` and refinement
@@ -1428,7 +1443,8 @@ fn find_scalac() -> Option<PathBuf> {
 /// annot args (`@Ann(foo)` / `@Ann(c.x)` / `@Ann(3)`), THIStree (`@Ann(this)`),
 /// LITERALclass (`@Ann(classOf[Int])`), APPLYtree (`@Ann(ident(1))` / nested
 /// `ident(ident(1))`), `this.x` / `super.foo` Select, named `@Ann(foo = 1)`
-/// (nsc positional Constant), VARARGS on `String*`,
+/// (nsc positional Constant), named TREE `@Ann(foo = this.x)` / `@Ann(foo = bar)`
+/// (nsc positional TREE), VARARGS on `String*`,
 /// and BRIDGE on an Ordered erasure bridge are probed. If scalac
 /// cannot read a probed shape, this test fails rather than claiming success.
 #[test]
@@ -1494,6 +1510,8 @@ object UseLib {
     val ma: Int = Lib.markedApply
     val mn: Int = Lib.markedNest
     val mna: Int = Lib.markedNamed
+    val mnt: Int = new Holder().markedNamedTree
+    val mni: Int = Lib.markedNamedIdent
     val j: Int = Lib.join("a", "b")
     val cmp: Int = new OrdBox(1).compare(new OrdBox(2))
   }
@@ -1514,7 +1532,7 @@ object UseLib {
         .expect("scalac");
     assert!(
         output.status.success(),
-        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1) / Java @Deprecated Lib.gone / List[_ <: List[_]] nest / MixA with MixB {{ def f: Int }} idRef / @Ann(foo) marked / @Ann(c.x) markedSel / @Ann(3) markedLit / @Ann(this) markedThis / @Ann(classOf[Int]) markedClass / @Ann(ident(1)) markedApply / @Ann(this.x) markedThisSel / @Ann(super.foo) markedSuper / @Ann(ident(ident(1))) markedNest / @Ann(foo = 1) markedNamed / Lib.join varargs / OrdBox.compare bridge): {}\n{}",
+        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1) / Java @Deprecated Lib.gone / List[_ <: List[_]] nest / MixA with MixB {{ def f: Int }} idRef / @Ann(foo) marked / @Ann(c.x) markedSel / @Ann(3) markedLit / @Ann(this) markedThis / @Ann(classOf[Int]) markedClass / @Ann(ident(1)) markedApply / @Ann(this.x) markedThisSel / @Ann(super.foo) markedSuper / @Ann(ident(ident(1))) markedNest / @Ann(foo = 1) markedNamed / @Ann(foo = this.x) markedNamedTree / @Ann(foo = bar) markedNamedIdent / Lib.join varargs / OrdBox.compare bridge): {}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );

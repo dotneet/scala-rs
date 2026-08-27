@@ -371,6 +371,29 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
             args: vec![],
         }],
     );
+    let _ = abs_class(
+        st,
+        pkg,
+        "switch",
+        "scala/annotation/switch",
+        &[Type::Class {
+            sym: static_annot,
+            args: vec![],
+        }],
+    );
+    let inf = class(
+        st,
+        pkg,
+        "implicitNotFound",
+        "scala/annotation/implicitNotFound",
+        &[Type::Class {
+            sym: static_annot,
+            args: vec![],
+        }],
+    );
+    let inf_msg = st.alloc("msg", inf, SymKind::Term, Flags::PARAM, "");
+    st.get_mut(inf_msg).ty = Type::String;
+    st.get_mut(inf).ctor_fields = vec![inf_msg];
     let unc_pkg = st.alloc(
         "unchecked",
         pkg,

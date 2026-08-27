@@ -2069,10 +2069,13 @@ impl Typer {
                 }
             }
             TreeKind::Typed { expr, tpt } => {
-                let ty = self.tree_to_type(tpt);
-                self.type_expr(expr, &ty);
-                self.adapt(expr, &ty);
-                tree.ty = ty;
+                let ascr = self.tree_to_type(tpt);
+                let pt_inner = peel_empty_annot(&ascr);
+                self.type_expr(expr, &pt_inner);
+                if !pt_inner.is_no_type() {
+                    self.adapt(expr, &pt_inner);
+                }
+                tree.ty = fill_empty_annot(ascr, &expr.ty);
             }
             TreeKind::Return { expr } => {
                 let Some(meth) = self.return_meth else {
@@ -4003,13 +4006,7 @@ impl Typer {
                     if let Some(lam) = self.identity_view(&pty, span) {
                         args.push(lam);
                     } else {
-                        self.error(
-                            span,
-                            format!(
-                                "no implicit: could not find implicit value of type {}",
-                                self.st.display_type(&pty)
-                            ),
-                        );
+                        self.error(span, self.missing_implicit_message(&pty));
                     }
                 }
                 ImplicitSearch::Ambiguous(ids) => {
@@ -4445,8 +4442,14 @@ impl Typer {
         }
         let span = tree.span;
         tree.ty = if pt.is_no_type() { res } else { pt.clone() };
-        if let TreeKind::Match { cases, .. } = &tree.kind {
+        if let TreeKind::Match { selector, cases } = &tree.kind {
             self.check_match_exhaustive(span, &sel_ty, cases);
+            if tree_has_switch(selector) && !match_can_switch(&sel_ty, cases) {
+                self.warning(
+                    selector.span,
+                    "could not emit switch for @switch annotated match",
+                );
+            }
         }
     }
 
@@ -6076,13 +6079,7 @@ impl Typer {
                 self.type_expr_inner(tree, &Type::NoType);
             }
             ImplicitSearch::None => {
-                self.error(
-                    span,
-                    format!(
-                        "no implicit: could not find implicit value of type {}",
-                        self.st.display_type(&ct_ty)
-                    ),
-                );
+                self.error(span, self.missing_implicit_message(&ct_ty));
                 tree.ty = Type::Error;
             }
             ImplicitSearch::Ambiguous(ids) => {
@@ -6284,6 +6281,56 @@ impl Typer {
             || o.flags.contains(Flags::MODULE)
             || o.flags.contains(Flags::FINAL)
     }
+
+    fn missing_implicit_message(&self, ty: &Type) -> String {
+        if let Some(msg) = self.implicit_not_found_msg(ty) {
+            return msg;
+        }
+        format!(
+            "no implicit: could not find implicit value of type {}",
+            self.st.display_type(ty)
+        )
+    }
+
+    fn implicit_not_found_msg(&self, ty: &Type) -> Option<String> {
+        match ty {
+            Type::Annotated { tpe, .. } => self.implicit_not_found_msg(tpe),
+            Type::Class { sym, args } => self.implicit_not_found_on(*sym, args),
+            Type::Named { name, args } => {
+                let id = self.st.lookup(name).into_iter().find(|s| {
+                    matches!(
+                        self.st.get(*s).kind,
+                        crate::symbol::SymKind::Class | crate::symbol::SymKind::TypeMember
+                    )
+                })?;
+                self.implicit_not_found_on(id, args)
+            }
+            _ => None,
+        }
+    }
+
+    fn implicit_not_found_on(&self, sym: SymbolId, args: &[Type]) -> Option<String> {
+        let annots = self.st.get(sym).annotations.clone();
+        let tps = self.st.get(sym).tparams.clone();
+        for a in &annots {
+            let path = a.annotation_path();
+            let simple = path.rsplit('.').next().unwrap_or(path.as_str());
+            if simple != "implicitNotFound" {
+                continue;
+            }
+            let mut msg = annot_first_string(a)?;
+            for (i, tp) in tps.iter().enumerate() {
+                let n = self.st.get(*tp).name.clone();
+                let shown = args
+                    .get(i)
+                    .map(|t| self.st.display_type(t))
+                    .unwrap_or_else(|| n.clone());
+                msg = msg.replace(&format!("${{{n}}}"), &shown);
+            }
+            return Some(msg);
+        }
+        None
+    }
 }
 
 fn is_tailrec_annot(path: &str) -> bool {
@@ -6295,6 +6342,131 @@ fn is_tailrec_annot(path: &str) -> bool {
 
 fn is_override_annot(path: &str) -> bool {
     matches!(path, "Override" | "java.lang.Override")
+}
+
+fn peel_empty_annot(ty: &Type) -> Type {
+    match ty {
+        Type::Annotated { tpe, .. } if tpe.is_no_type() => Type::NoType,
+        Type::Annotated { tpe, .. } => peel_empty_annot(tpe),
+        other => other.clone(),
+    }
+}
+
+fn fill_empty_annot(ascr: Type, found: &Type) -> Type {
+    match ascr {
+        Type::Annotated { tpe, annot } if tpe.is_no_type() => Type::Annotated {
+            tpe: Box::new(found.clone()),
+            annot,
+        },
+        Type::Annotated { tpe, annot } => Type::Annotated {
+            tpe: Box::new(fill_empty_annot(*tpe, found)),
+            annot,
+        },
+        other => other,
+    }
+}
+
+fn tree_has_switch(t: &Tree) -> bool {
+    fn ty_has_switch(ty: &Type) -> bool {
+        match ty {
+            Type::Annotated { annot, tpe } => {
+                annot.rsplit('.').next() == Some("switch") || ty_has_switch(tpe)
+            }
+            _ => false,
+        }
+    }
+    match &t.kind {
+        TreeKind::Typed { tpt, expr } => annot_tree_is_switch(tpt) || tree_has_switch(expr),
+        _ => ty_has_switch(&t.ty),
+    }
+}
+
+fn annot_tree_is_switch(tpt: &Tree) -> bool {
+    match &tpt.kind {
+        TreeKind::AnnotatedTypeTree { annot, tpt } => {
+            let path = annot.annotation_path();
+            let simple = path.rsplit('.').next().unwrap_or(path.as_str());
+            simple == "switch" || annot_tree_is_switch(tpt)
+        }
+        _ => false,
+    }
+}
+
+fn match_can_switch(sel_ty: &Type, cases: &[scala_rs_parser::CaseDef]) -> bool {
+    switch_case_keys(sel_ty, cases).is_some()
+}
+
+fn switch_case_keys(sel_ty: &Type, cases: &[scala_rs_parser::CaseDef]) -> Option<Vec<(i32, usize)>> {
+    let core = peel_type_annot(sel_ty);
+    if !matches!(core, Type::Int | Type::Char) {
+        return None;
+    }
+    let mut keys = Vec::new();
+    let mut default = false;
+    for (i, c) in cases.iter().enumerate() {
+        if !c.guard.is_empty() {
+            return None;
+        }
+        match switch_pat_key(&c.pat) {
+            Some(SwitchPat::Key(k)) => keys.push((k, i)),
+            Some(SwitchPat::Default) => {
+                if default {
+                    return None;
+                }
+                default = true;
+            }
+            None => return None,
+        }
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    Some(keys)
+}
+
+fn peel_type_annot(ty: &Type) -> &Type {
+    match ty {
+        Type::Annotated { tpe, .. } => peel_type_annot(tpe),
+        t => t,
+    }
+}
+
+enum SwitchPat {
+    Key(i32),
+    Default,
+}
+
+fn switch_pat_key(pat: &Tree) -> Option<SwitchPat> {
+    match &pat.kind {
+        TreeKind::Literal { lit: Lit::Int(n) } => Some(SwitchPat::Key(*n)),
+        TreeKind::Literal { lit: Lit::Char(c) } => Some(SwitchPat::Key(*c as i32)),
+        TreeKind::Wildcard | TreeKind::Empty => Some(SwitchPat::Default),
+        TreeKind::Ident { name } => {
+            let is_varid = name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_lowercase() || c == '_');
+            if is_varid {
+                Some(SwitchPat::Default)
+            } else {
+                None
+            }
+        }
+        TreeKind::Bind { body, .. } => switch_pat_key(body),
+        TreeKind::Typed { expr, .. } => switch_pat_key(expr),
+        _ => None,
+    }
+}
+
+fn annot_first_string(tree: &Tree) -> Option<String> {
+    match &tree.kind {
+        TreeKind::Apply { args, .. } => args.iter().find_map(annot_first_string),
+        TreeKind::Assign { rhs, .. } => annot_first_string(rhs),
+        TreeKind::Literal {
+            lit: Lit::String(s),
+        } => Some(s.clone()),
+        _ => None,
+    }
 }
 
 fn method_value_params(ty: &Type) -> Vec<Type> {

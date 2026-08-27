@@ -43,6 +43,8 @@ pub struct Assembler {
     pub max_stack: i32,
     pub max_locals: u16,
     patches: Vec<(usize, Label)>, // offset of u16 jump, label
+    /// i32 jump offsets (tableswitch / lookupswitch). (field_offset, label, opcode_pc)
+    patches_i32: Vec<(usize, Label, usize)>,
     labels: Vec<Option<u16>>,
     exceptions: Vec<(Label, Label, Label, Option<String>)>,
     vstack: Vec<VType>,
@@ -73,6 +75,7 @@ impl Assembler {
             max_stack: 0,
             max_locals,
             patches: Vec::new(),
+            patches_i32: Vec::new(),
             labels: Vec::new(),
             exceptions: Vec::new(),
             vstack: Vec::new(),
@@ -659,6 +662,57 @@ impl Assembler {
     pub fn goto(&mut self, l: Label) {
         self.jump(0xa7, l, 0);
     }
+
+    /// `tableswitch`. `cases[i]` is the target for key `low + i`. Pops the int.
+    pub fn tableswitch(&mut self, default: Label, low: i32, high: i32, cases: &[Label]) {
+        let op_pc = self.bytes.len();
+        self.emit_op(0xaa);
+        let _ = self.pop_v();
+        while self.bytes.len() % 4 != 0 {
+            self.bytes.push(0);
+        }
+        self.emit_switch_offset(default, op_pc);
+        self.emit_i32(low);
+        self.emit_i32(high);
+        for l in cases {
+            self.emit_switch_offset(*l, op_pc);
+        }
+        self.save_label(default);
+        for l in cases {
+            self.save_label(*l);
+        }
+        self.kill();
+    }
+
+    /// `lookupswitch`. `pairs` must be sorted by match key. Pops the int.
+    pub fn lookupswitch(&mut self, default: Label, pairs: &[(i32, Label)]) {
+        let op_pc = self.bytes.len();
+        self.emit_op(0xab);
+        let _ = self.pop_v();
+        while self.bytes.len() % 4 != 0 {
+            self.bytes.push(0);
+        }
+        self.emit_switch_offset(default, op_pc);
+        self.emit_i32(pairs.len() as i32);
+        for (k, l) in pairs {
+            self.emit_i32(*k);
+            self.emit_switch_offset(*l, op_pc);
+        }
+        self.save_label(default);
+        for (_, l) in pairs {
+            self.save_label(*l);
+        }
+        self.kill();
+    }
+
+    fn emit_i32(&mut self, v: i32) {
+        self.bytes.extend_from_slice(&v.to_be_bytes());
+    }
+
+    fn emit_switch_offset(&mut self, l: Label, op_pc: usize) {
+        self.patches_i32.push((self.bytes.len(), l, op_pc));
+        self.emit_i32(0);
+    }
     pub fn ifeq(&mut self, l: Label) {
         self.jump(0x99, l, -1);
     }
@@ -957,6 +1011,16 @@ impl Assembler {
             let b = (rel as i16).to_be_bytes();
             self.bytes[at] = b[0];
             self.bytes[at + 1] = b[1];
+        }
+        let copy32 = self.patches_i32.clone();
+        for (at, lab, op_pc) in copy32 {
+            let target = self.labels[lab.0].unwrap_or(0) as i32;
+            let rel = target - op_pc as i32;
+            let b = rel.to_be_bytes();
+            self.bytes[at] = b[0];
+            self.bytes[at + 1] = b[1];
+            self.bytes[at + 2] = b[2];
+            self.bytes[at + 3] = b[3];
         }
         let mut exceptions = Vec::new();
         let pending = self.exceptions.clone();
