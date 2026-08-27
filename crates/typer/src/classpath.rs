@@ -526,6 +526,9 @@ pub fn install_java_class(st: &mut SymbolTable, c: &crate::javaclass::JavaClass)
     if crate::javaclass::is_java_interface(c.access) {
         flags = flags.with(Flags::INTERFACE).with(Flags::ABSTRACT);
     }
+    if crate::javaclass::is_java_enum(c.access) {
+        flags = flags.with(Flags::ENUM);
+    }
     if c.nested_static {
         flags = flags.with(Flags::STATIC);
     }
@@ -600,6 +603,9 @@ fn apply_java_class_meta(st: &mut SymbolTable, id: SymbolId, c: &crate::javaclas
     let mut flags = st.get(id).flags.with(Flags::JAVA);
     if crate::javaclass::is_java_interface(c.access) {
         flags = flags.with(Flags::INTERFACE).with(Flags::ABSTRACT);
+    }
+    if crate::javaclass::is_java_enum(c.access) {
+        flags = flags.with(Flags::ENUM);
     }
     if c.nested_static {
         flags = flags.with(Flags::STATIC);
@@ -799,6 +805,9 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         }
         if crate::javaclass::is_java_protected(f.access) {
             flags = flags.with(Flags::PROTECTED);
+        }
+        if crate::javaclass::is_java_enum(f.access) {
+            flags = flags.with(Flags::ENUM);
         }
         let id = add_term(st, owner, &f.name, ty);
         st.get_mut(id).flags = flags;

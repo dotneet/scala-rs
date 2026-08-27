@@ -2277,4 +2277,156 @@ object Main {
 "#,
         );
     }
+
+    #[test]
+    fn java_enum_thread_state_typecheck() {
+        ok(r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val s: java.lang.Thread.State = java.lang.Thread.State.NEW
+    val t: java.lang.Thread.State = java.lang.Thread.State.valueOf("RUNNABLE")
+    val n: Int = java.lang.Thread.State.values().length
+    val k: Int = s match {
+      case java.lang.Thread.State.NEW => 1
+      case _ => 0
+    }
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn java_non_enum_values_is_error() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val xs = java.lang.String.values()
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("values")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn context_bounds_ordering_and_classtag_path() {
+        ok_lib(
+            r#"
+import scala.math.Ordering
+object Main {
+  def cmp[T: Ordering](x: T, y: T): Int = implicitly[Ordering[T]].compare(x, y)
+  def g[T: scala.reflect.ClassTag](xs: Array[T]): Int = xs.length
+  def main(args: Array[String]): Unit = {
+    val a: Int = cmp(3, 1)
+    val b: Int = g(new Array[Int](3))
+  }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn context_bound_missing_evidence_is_error() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait Show[T]
+object Main {
+  def show[T: Show](x: T): T = x
+  def main(args: Array[String]): Unit = {
+    show(1)
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("no implicit")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn auxiliary_constructor_and_subclass_super_args() {
+        ok(r#"
+class C(val x: Int, val y: Int) {
+  def this(x: Int) = this(x, 0)
+  def sum: Int = x + y
+}
+class D extends C(1)
+class E(z: Int) extends C(z)
+object Main {
+  def main(args: Array[String]): Unit = {
+    val a: Int = new C(3, 4).sum
+    val b: Int = new C(5).sum
+    val c: Int = new D().sum
+    val d: Int = new E(9).sum
+  }
+}
+"#);
+    }
+
+    #[test]
+    fn auxiliary_constructor_must_call_this() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+class C(val x: Int, val y: Int) {
+  def this(x: Int) = x
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("this(...)")
+                    || d.message.contains("auxiliary constructor")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn auxiliary_constructor_this_must_be_first() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+class C(val x: Int, val y: Int) {
+  def this(x: Int) = {
+    val z = 1
+    this(x, 0)
+  }
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("first statement")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn auxiliary_constructor_cannot_call_super() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+class Base(n: Int)
+class C(val x: Int, val y: Int) extends Base(0) {
+  def this(x: Int) = super(x)
+}
+"#,
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d.message.contains("super")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
 }

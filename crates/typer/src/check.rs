@@ -30,6 +30,13 @@ enum OverloadPick {
     None,
 }
 
+enum CtorDelegation {
+    This,
+    Super,
+    AfterStats,
+    Missing,
+}
+
 /// A method recovered from a classfile (JVM descriptor).
 #[derive(Clone, Debug)]
 pub struct ClasspathMethod {
@@ -597,11 +604,14 @@ impl Typer {
                 name, mods, rhs, ..
             } => {
                 let annots = mods.annotations.clone();
-                let flags = if rhs.is_empty() && !mods.flags.contains(Flags::NATIVE) {
+                let mut flags = if rhs.is_empty() && !mods.flags.contains(Flags::NATIVE) {
                     mods.flags.with(Flags::ABSTRACT)
                 } else {
                     mods.flags
                 };
+                if name == "<init>" {
+                    flags = flags.with(Flags::CONSTRUCTOR);
+                }
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Method, flags, "");
@@ -782,9 +792,40 @@ impl Typer {
             } => (vparamss, &mut impl_.body, &mut impl_.parents),
             _ => return,
         };
+        // Ctor params must be typed before `extends C(z)` so the argument `z`
+        // is a known term, not a NoType ident.
+        let mut ctor_param_tys = Vec::new();
+        for clause in vparamss.iter_mut() {
+            for p in clause.iter_mut() {
+                self.type_val_sig(p);
+                ctor_param_tys.push(p.ty.clone());
+                if !p.sym.is_none() {
+                    self.st.get_mut(p.sym).ty = p.ty.clone();
+                }
+            }
+        }
+        // Primary `<init>` type must be visible before auxiliary `this(...)` bodies.
+        let ctor_fields = if id.is_none() {
+            Vec::new()
+        } else {
+            self.st.get(id).ctor_fields.clone()
+        };
+        if !id.is_none() {
+            for mem in self.st.get(id).members.clone() {
+                if self.st.get(mem).name == "<init>"
+                    && self.st.get(mem).ty.is_no_type()
+                    && self.st.get(mem).params == ctor_fields
+                {
+                    self.st.get_mut(mem).ty = Type::Method {
+                        paramss: vec![ctor_param_tys.clone()],
+                        ret: Box::new(Type::Unit),
+                    };
+                }
+            }
+        }
         let mut pts = Vec::new();
         for p in parents.iter_mut() {
-            self.type_expr(p, &Type::NoType);
+            self.type_parent(p);
             pts.push(p.ty.clone());
         }
         if !pts.is_empty() {
@@ -802,16 +843,6 @@ impl Typer {
         for stt in body.iter_mut() {
             if matches!(stt.kind, TreeKind::TypeDef { .. }) {
                 self.type_type_member(stt);
-            }
-        }
-        let mut ctor_param_tys = Vec::new();
-        for clause in vparamss.iter_mut() {
-            for p in clause.iter_mut() {
-                self.type_val_sig(p);
-                ctor_param_tys.push(p.ty.clone());
-                if !p.sym.is_none() {
-                    self.st.get_mut(p.sym).ty = p.ty.clone();
-                }
             }
         }
         self.st.get_mut(id).ty = Type::Class {
@@ -887,9 +918,11 @@ impl Typer {
                 let _ = f;
             }
         }
-        // set ctor type
+        // Primary constructor only. Auxiliary `def this` already has a Method
+        // type from `type_def_sig`; overwriting it with the primary arity would
+        // make `new C(1)` and `extends C(1)` miss the aux overload.
         for mem in self.st.get(class_id).members.clone() {
-            if self.st.get(mem).name == "<init>" {
+            if self.st.get(mem).name == "<init>" && self.st.get(mem).ty.is_no_type() {
                 self.st.get_mut(mem).ty = Type::Method {
                     paramss: vec![ctor_param_tys.to_vec()],
                     ret: Box::new(Type::Unit),
@@ -1631,11 +1664,17 @@ impl Typer {
         }
         self.synthesize_default_getters(saved_owner, tree.sym, &name, &tp_ids, &paramss_ids);
         self.st.owner = saved_owner;
-        let ret = if tpt.is_empty() {
+        let ret = if name == "<init>" {
+            Type::Unit
+        } else if tpt.is_empty() {
             Type::NoType
         } else {
             self.tree_to_type(&tpt)
         };
+        if name == "<init>" && !tree.sym.is_none() {
+            let f = self.st.get(tree.sym).flags.with(Flags::CONSTRUCTOR);
+            self.st.get_mut(tree.sym).flags = f;
+        }
         self.st.pop_scope();
         let mty = Type::Method {
             paramss: paramss_ty,
@@ -1731,55 +1770,332 @@ impl Typer {
     }
 
     fn type_def_body(&mut self, tree: &mut Tree) {
-        let (vparamss, rhs, ret_pt) = match &mut tree.kind {
-            TreeKind::DefDef { vparamss, rhs, .. } => {
-                let ret = match &tree.ty {
-                    Type::Method { ret, .. } => (**ret).clone(),
-                    _ => Type::NoType,
-                };
-                (vparamss, rhs, ret)
-            }
+        let is_ctor = match &tree.kind {
+            TreeKind::DefDef { name, .. } => name == "<init>",
             _ => return,
         };
-        if rhs.is_empty() {
-            self.check_stored_annotations(tree);
+        {
+            let (vparamss, rhs, ret_pt) = match &mut tree.kind {
+                TreeKind::DefDef { vparamss, rhs, .. } => {
+                    let ret = match &tree.ty {
+                        Type::Method { ret, .. } => (**ret).clone(),
+                        _ => Type::NoType,
+                    };
+                    (vparamss, rhs, ret)
+                }
+                _ => return,
+            };
+            if rhs.is_empty() {
+                self.check_stored_annotations(tree);
+                return;
+            }
+            self.st.push_scope();
+            let saved_owner = self.st.owner;
+            let saved_ret = self.return_meth;
+            if !tree.sym.is_none() {
+                self.return_meth = Some(tree.sym);
+                self.st.owner = tree.sym;
+                for tp in self.st.get(tree.sym).tparams.clone() {
+                    let n = self.st.get(tp).name.clone();
+                    self.st.enter_in_current(&n, tp);
+                }
+            }
+            for clause in vparamss.iter() {
+                for p in clause {
+                    if !p.sym.is_none() {
+                        self.st.enter_in_current(p.name().unwrap_or("?"), p.sym);
+                    }
+                }
+            }
+            self.type_expr(rhs, &ret_pt);
+            if !ret_pt.is_no_type() {
+                self.adapt(rhs, &ret_pt);
+            } else if !is_ctor {
+                // infer result type (SIP-23: do not infer singleton/constant types)
+                let inferred = rhs.ty.widen_constant();
+                if let Type::Method { ret, .. } = &mut tree.ty {
+                    *ret = Box::new(inferred.clone());
+                }
+                if !tree.sym.is_none() {
+                    self.st.get_mut(tree.sym).ty = tree.ty.clone();
+                }
+            }
+            self.st.owner = saved_owner;
+            self.return_meth = saved_ret;
+            self.st.pop_scope();
+        }
+        if is_ctor {
+            self.check_aux_ctor(tree);
+        }
+        self.check_stored_annotations(tree);
+    }
+
+    fn in_aux_ctor(&self) -> bool {
+        self.return_meth
+            .map(|id| self.st.get(id).name == "<init>")
+            .unwrap_or(false)
+    }
+
+    fn type_parent(&mut self, tree: &mut Tree) {
+        if matches!(&tree.kind, TreeKind::Apply { .. }) {
+            self.type_parent_ctor_app(tree);
             return;
         }
-        self.st.push_scope();
-        let saved_owner = self.st.owner;
-        let saved_ret = self.return_meth;
-        if !tree.sym.is_none() {
-            self.return_meth = Some(tree.sym);
-            self.st.owner = tree.sym;
-            for tp in self.st.get(tree.sym).tparams.clone() {
-                let n = self.st.get(tp).name.clone();
-                self.st.enter_in_current(&n, tp);
-            }
-        }
-        for clause in vparamss.iter() {
-            for p in clause {
-                if !p.sym.is_none() {
-                    self.st.enter_in_current(p.name().unwrap_or("?"), p.sym);
+        tree.ty = self.tree_to_type(tree);
+        if let Some(id) = self.st.class_sym_of(&tree.ty) {
+            tree.sym = id;
+            if !self.st.get(id).flags.contains(Flags::TRAIT)
+                && !self.st.get(id).flags.contains(Flags::INTERFACE)
+            {
+                match self.pick_ctor(id, &[], None) {
+                    OverloadPick::Found(sym, _, _) => {
+                        tree.sym = id;
+                        let _ = sym;
+                    }
+                    OverloadPick::None => {
+                        let has_init = self
+                            .st
+                            .lookup_member(id, "<init>")
+                            .iter()
+                            .any(|&m| !self.st.get(m).params.is_empty());
+                        if has_init {
+                            self.error(
+                                tree.span,
+                                format!(
+                                    "no matching overload for constructor {}",
+                                    self.st.get(id).name
+                                ),
+                            );
+                        }
+                    }
+                    OverloadPick::Ambiguous => {}
                 }
             }
         }
-        self.type_expr(rhs, &ret_pt);
-        if !ret_pt.is_no_type() {
-            self.adapt(rhs, &ret_pt);
-        } else {
-            // infer result type (SIP-23: do not infer singleton/constant types)
-            let inferred = rhs.ty.widen_constant();
-            if let Type::Method { ret, .. } = &mut tree.ty {
-                *ret = Box::new(inferred.clone());
+    }
+
+    fn type_parent_ctor_app(&mut self, tree: &mut Tree) {
+        let (fun, args) = match &mut tree.kind {
+            TreeKind::Apply { fun, args } => (fun, args),
+            _ => return,
+        };
+        let class_ty = self.tree_to_type(fun);
+        fun.ty = class_ty.clone();
+        let class_id = self.st.class_sym_of(&class_ty).unwrap_or(SymbolId::NONE);
+        if !class_id.is_none() {
+            fun.sym = class_id;
+        }
+        for a in args.iter_mut() {
+            self.type_expr(a, &Type::NoType);
+        }
+        let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+        tree.ty = class_ty.clone();
+        if class_id.is_none() {
+            return;
+        }
+        match self.pick_ctor(class_id, &arg_tys, None) {
+            OverloadPick::Found(sym, param_tys, _) => {
+                for (i, a) in args.iter_mut().enumerate() {
+                    if let Some(p) = param_tys.get(i) {
+                        if !p.is_no_type() {
+                            self.adapt(a, p);
+                        }
+                    }
+                }
+                tree.sym = sym;
             }
-            if !tree.sym.is_none() {
-                self.st.get_mut(tree.sym).ty = tree.ty.clone();
+            OverloadPick::Ambiguous => {
+                self.error(tree.span, "ambiguous overload for constructor");
+            }
+            OverloadPick::None => {
+                self.error(
+                    tree.span,
+                    format!(
+                        "no matching overload for constructor {} with arguments ({})",
+                        self.st.get(class_id).name,
+                        arg_tys
+                            .iter()
+                            .map(|t| self.st.display_type(t))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
             }
         }
-        self.st.owner = saved_owner;
-        self.return_meth = saved_ret;
-        self.st.pop_scope();
-        self.check_stored_annotations(tree);
+    }
+
+    fn pick_ctor(
+        &self,
+        class_id: SymbolId,
+        arg_tys: &[Type],
+        skip: Option<SymbolId>,
+    ) -> OverloadPick {
+        if class_id.is_none() {
+            return OverloadPick::None;
+        }
+        let alts: Vec<SymbolId> = self
+            .st
+            .lookup_member(class_id, "<init>")
+            .into_iter()
+            .filter(|&id| Some(id) != skip)
+            .filter(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)
+            .collect();
+        if alts.is_empty() {
+            return OverloadPick::None;
+        }
+        let fun_sym = alts[0];
+        let fun_ty = if alts.len() == 1 {
+            let ty = self.st.get(fun_sym).ty.clone();
+            if ty.is_no_type() {
+                Type::Method {
+                    paramss: vec![self
+                        .st
+                        .get(fun_sym)
+                        .params
+                        .iter()
+                        .map(|p| self.st.get(*p).ty.clone())
+                        .collect()],
+                    ret: Box::new(Type::Unit),
+                }
+            } else {
+                ty
+            }
+        } else {
+            Type::Overload(
+                alts.iter()
+                    .map(|id| {
+                        let ty = self.st.get(*id).ty.clone();
+                        if ty.is_no_type() {
+                            Type::Method {
+                                paramss: vec![self
+                                    .st
+                                    .get(*id)
+                                    .params
+                                    .iter()
+                                    .map(|p| self.st.get(*p).ty.clone())
+                                    .collect()],
+                                ret: Box::new(Type::Unit),
+                            }
+                        } else {
+                            ty
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        match self.resolve_overload(&fun_ty, fun_sym, arg_tys, &Type::NoType) {
+            OverloadPick::Found(sym, _, _) if Some(sym) == skip => OverloadPick::None,
+            other => other,
+        }
+    }
+
+    fn type_ctor_delegation(&mut self, tree: &mut Tree) {
+        let (fun, args) = match &mut tree.kind {
+            TreeKind::Apply { fun, args } => (fun, args),
+            _ => return,
+        };
+        let is_super = matches!(&fun.kind, TreeKind::Super { .. })
+            || matches!(&fun.kind, TreeKind::Ident { name } if name == "super");
+        self.type_expr(fun, &Type::NoType);
+        if is_super {
+            self.error(
+                tree.span,
+                "auxiliary constructor cannot call super(...); the first action must be this(...)",
+            );
+            for a in args.iter_mut() {
+                self.type_expr(a, &Type::NoType);
+            }
+            tree.ty = Type::Unit;
+            return;
+        }
+        let class_id = self.st.this_class;
+        for a in args.iter_mut() {
+            self.type_expr(a, &Type::NoType);
+        }
+        let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+        let skip = self.return_meth;
+        match self.pick_ctor(class_id, &arg_tys, skip) {
+            OverloadPick::Found(sym, param_tys, _) => {
+                if let Some(cur) = skip {
+                    if !self.ctor_precedes(sym, cur) {
+                        self.error(
+                            tree.span,
+                            "called constructor's definition must precede calling constructor's definition",
+                        );
+                    }
+                }
+                for (i, a) in args.iter_mut().enumerate() {
+                    if let Some(p) = param_tys.get(i) {
+                        if !p.is_no_type() {
+                            self.adapt(a, p);
+                        }
+                    }
+                }
+                fun.sym = sym;
+                tree.sym = sym;
+                tree.ty = Type::Unit;
+            }
+            OverloadPick::Ambiguous => {
+                self.error(tree.span, "ambiguous overload for constructor");
+                tree.ty = Type::Unit;
+            }
+            OverloadPick::None => {
+                self.error(
+                    tree.span,
+                    format!(
+                        "no matching overload for constructor {} with arguments ({})",
+                        self.st.get(class_id).name,
+                        arg_tys
+                            .iter()
+                            .map(|t| self.st.display_type(t))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+                tree.ty = Type::Unit;
+            }
+        }
+    }
+
+    fn ctor_precedes(&self, called: SymbolId, caller: SymbolId) -> bool {
+        if called == caller {
+            return false;
+        }
+        let owner = self.st.get(caller).owner;
+        let members = &self.st.get(owner).members;
+        let pos = |id: SymbolId| members.iter().position(|&m| m == id);
+        match (pos(called), pos(caller)) {
+            (Some(a), Some(b)) => a < b,
+            _ => true,
+        }
+    }
+
+    fn check_aux_ctor(&mut self, tree: &Tree) {
+        let rhs = match &tree.kind {
+            TreeKind::DefDef { rhs, name, .. } if name == "<init>" => rhs,
+            _ => return,
+        };
+        match first_ctor_delegation(rhs) {
+            CtorDelegation::This => {}
+            CtorDelegation::Super => {
+                self.error(
+                    rhs.span,
+                    "auxiliary constructor cannot call super(...); the first action must be this(...)",
+                );
+            }
+            CtorDelegation::AfterStats => {
+                self.error(
+                    rhs.span,
+                    "constructor invocation must be the first statement in an auxiliary constructor",
+                );
+            }
+            CtorDelegation::Missing => {
+                self.error(
+                    rhs.span,
+                    "auxiliary constructor must start with a call to this(...)",
+                );
+            }
+        }
     }
 
     fn type_stat(&mut self, tree: &mut Tree) {
@@ -3226,6 +3542,14 @@ impl Typer {
         if self.try_rewrite_dynamic_apply(tree, pt) {
             return;
         }
+        let ctor_del = match &tree.kind {
+            TreeKind::Apply { fun, .. } => self.in_aux_ctor() && is_this_or_super_callee(fun),
+            _ => false,
+        };
+        if ctor_del {
+            self.type_ctor_delegation(tree);
+            return;
+        }
         let (fun, args) = match &mut tree.kind {
             TreeKind::Apply { fun, args } => (fun, args),
             _ => return,
@@ -3254,16 +3578,6 @@ impl Typer {
                 .or(Some(fun.sym))
                 .filter(|s| !s.is_none());
             let class_id = class_id.or_else(|| self.st.class_sym_of(&fun.ty));
-            let ctor_params = class_id
-                .map(|c| {
-                    self.st
-                        .get(c)
-                        .ctor_fields
-                        .iter()
-                        .map(|f| self.st.get(*f).ty.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
             let tps = class_id
                 .map(|c| self.st.get(c).tparams.clone())
                 .unwrap_or_default();
@@ -3274,17 +3588,45 @@ impl Typer {
                 _ => Vec::new(),
             };
             let infer = !tps.is_empty() && explicit.is_empty();
-            for (i, a) in args.iter_mut().enumerate() {
-                let mut p = ctor_params.get(i).cloned().unwrap_or(Type::NoType);
-                if infer {
-                    p = Type::NoType;
-                } else if !explicit.is_empty() {
-                    if let Some(c) = class_id {
-                        p = self.st.subst_tparams(c, &explicit, &p);
+            for a in args.iter_mut() {
+                self.type_expr(a, &Type::NoType);
+            }
+            let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+            let (ctor_sym, ctor_params) = if let Some(c) = class_id {
+                match self.pick_ctor(c, &arg_tys, None) {
+                    OverloadPick::Found(sym, ps, _) => (Some(sym), ps),
+                    OverloadPick::Ambiguous => {
+                        self.error(tree.span, "ambiguous overload for constructor");
+                        (None, Vec::new())
+                    }
+                    OverloadPick::None => {
+                        let fallback = self
+                            .st
+                            .get(c)
+                            .ctor_fields
+                            .iter()
+                            .map(|f| self.st.get(*f).ty.clone())
+                            .collect::<Vec<_>>();
+                        if fallback.len() != arg_tys.len() {
+                            self.error(
+                                tree.span,
+                                format!(
+                                    "no matching overload for constructor {} with arguments ({})",
+                                    self.st.get(c).name,
+                                    arg_tys
+                                        .iter()
+                                        .map(|t| self.st.display_type(t))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            );
+                        }
+                        (None, fallback)
                     }
                 }
-                self.type_expr(a, &p);
-            }
+            } else {
+                (None, Vec::new())
+            };
             let mut inferred_args: Vec<Type> = Vec::new();
             if let Some(c) = class_id {
                 if !explicit.is_empty() {
@@ -3329,7 +3671,7 @@ impl Typer {
                     self.adapt(a, &p);
                 }
             }
-            tree.sym = class_id.unwrap_or(SymbolId::NONE);
+            tree.sym = ctor_sym.or(class_id).unwrap_or(SymbolId::NONE);
             return;
         }
 
@@ -4669,6 +5011,10 @@ impl Typer {
                     pat.sym = id;
                     pat.ty = sel_ty.clone();
                 }
+            }
+            TreeKind::Select { .. } => {
+                // Stable identifier pattern (`Color.RED`, `java.lang.Thread.State.NEW`).
+                self.type_expr(pat, sel_ty);
             }
             TreeKind::Bind { name, body } => {
                 self.type_pattern(body, sel_ty);
@@ -7324,6 +7670,78 @@ fn is_implicit_conversion_shape(vparamss: &[Vec<Tree>]) -> bool {
 }
 
 /// nsc: `T: C` means implicit evidence of type `C[T]`.
+fn is_this_or_super_callee(fun: &Tree) -> bool {
+    match &fun.kind {
+        TreeKind::This { .. } | TreeKind::Super { .. } => true,
+        TreeKind::Ident { name } if name == "this" || name == "super" => true,
+        _ => false,
+    }
+}
+
+fn is_ctor_delegation_apply(t: &Tree) -> Option<bool> {
+    match &t.kind {
+        TreeKind::Apply { fun, .. } => {
+            if matches!(&fun.kind, TreeKind::Super { .. })
+                || matches!(&fun.kind, TreeKind::Ident { name } if name == "super")
+            {
+                Some(true)
+            } else if matches!(&fun.kind, TreeKind::This { .. })
+                || matches!(&fun.kind, TreeKind::Ident { name } if name == "this")
+            {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        TreeKind::Typed { expr, .. } => is_ctor_delegation_apply(expr),
+        _ => None,
+    }
+}
+
+fn tree_has_ctor_delegation(t: &Tree) -> bool {
+    if is_ctor_delegation_apply(t).is_some() {
+        return true;
+    }
+    match &t.kind {
+        TreeKind::Block { stats, expr } => {
+            stats.iter().any(tree_has_ctor_delegation) || tree_has_ctor_delegation(expr)
+        }
+        TreeKind::Typed { expr, .. } => tree_has_ctor_delegation(expr),
+        _ => false,
+    }
+}
+
+fn first_ctor_delegation(rhs: &Tree) -> CtorDelegation {
+    match &rhs.kind {
+        TreeKind::Typed { expr, .. } => first_ctor_delegation(expr),
+        TreeKind::Block { stats, expr } => {
+            let first = stats.first().unwrap_or(expr);
+            match is_ctor_delegation_apply(first) {
+                Some(true) => CtorDelegation::Super,
+                Some(false) => CtorDelegation::This,
+                None => {
+                    if tree_has_ctor_delegation(rhs) {
+                        CtorDelegation::AfterStats
+                    } else {
+                        CtorDelegation::Missing
+                    }
+                }
+            }
+        }
+        _ => match is_ctor_delegation_apply(rhs) {
+            Some(true) => CtorDelegation::Super,
+            Some(false) => CtorDelegation::This,
+            None => {
+                if tree_has_ctor_delegation(rhs) {
+                    CtorDelegation::AfterStats
+                } else {
+                    CtorDelegation::Missing
+                }
+            }
+        },
+    }
+}
+
 fn apply_context_bound(bound: Type, tp: SymbolId) -> Type {
     match bound {
         Type::Class { sym, args } if args.is_empty() => Type::Class {

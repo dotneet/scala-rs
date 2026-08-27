@@ -14,6 +14,7 @@ const ACC_INTERFACE: u16 = 0x0200;
 const ACC_ABSTRACT: u16 = 0x0400;
 const ACC_BRIDGE: u16 = 0x0040;
 const ACC_SYNTHETIC: u16 = 0x1000;
+const ACC_ENUM: u16 = 0x4000;
 const ACC_MODULE: u16 = 0x8000;
 
 #[derive(Clone, Debug)]
@@ -366,6 +367,10 @@ pub fn is_java_protected(access: u16) -> bool {
     access & ACC_PROTECTED != 0
 }
 
+pub fn is_java_enum(access: u16) -> bool {
+    access & ACC_ENUM != 0
+}
+
 fn java_member_visible(access: u16) -> bool {
     access & ACC_PUBLIC != 0 || access & ACC_PROTECTED != 0
 }
@@ -675,6 +680,45 @@ mod tests {
                 .iter()
                 .any(|m| m.name == "sleep" && m.desc == "(J)V" && is_java_static(m.access)),
             "Thread.sleep(long) missing"
+        );
+    }
+
+    #[test]
+    #[test]
+    fn parses_jdk_thread_state_enum_if_present() {
+        let mut idx = BinaryIndex::from_user_paths(Vec::new());
+        let Some(bytes) = idx.find_class("java/lang/Thread$State").unwrap() else {
+            panic!("JDK java.lang.Thread$State.class must be readable from jmods/rt");
+        };
+        let c = parse_java_classfile(&bytes).expect("parse Thread.State");
+        assert!(
+            is_java_enum(c.access),
+            "Thread.State must have ACC_ENUM: access={:#x}",
+            c.access
+        );
+        assert_eq!(c.super_name.as_deref(), Some("java/lang/Enum"));
+        assert!(
+            c.fields
+                .iter()
+                .any(|f| f.name == "NEW" && is_java_enum(f.access) && is_java_static(f.access)),
+            "enum constant NEW missing: {:?}",
+            c.fields
+        );
+        assert!(
+            c.methods.iter().any(|m| m.name == "values"
+                && m.desc == "()[Ljava/lang/Thread$State;"
+                && is_java_static(m.access)),
+            "values() missing: {:?}",
+            c.methods
+                .iter()
+                .filter(|m| m.name == "values")
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            c.methods.iter().any(|m| m.name == "valueOf"
+                && m.desc == "(Ljava/lang/String;)Ljava/lang/Thread$State;"
+                && is_java_static(m.access)),
+            "valueOf(String) missing"
         );
     }
 
