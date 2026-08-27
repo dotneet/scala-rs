@@ -857,11 +857,7 @@ impl Assembler {
     fn apply_invoke(&mut self, desc: &str, has_this: bool, is_init: bool, owner: &str) {
         let n_params = count_params(desc);
         self.pop_n_v(n_params);
-        let recv = if has_this {
-            Some(self.pop_v())
-        } else {
-            None
-        };
+        let recv = if has_this { Some(self.pop_v()) } else { None };
         if is_init {
             if let Some(recv) = recv {
                 self.initialize(recv, owner);
@@ -1115,9 +1111,7 @@ fn vtype_from_desc(desc: &str) -> VType {
         Some('V') => VType::Top,
         Some('[') => VType::Object(desc.to_string()),
         Some('L') => {
-            let inner = desc
-                .trim_start_matches('L')
-                .trim_end_matches(';');
+            let inner = desc.trim_start_matches('L').trim_end_matches(';');
             VType::Object(inner.to_string())
         }
         _ => VType::Object("java/lang/Object".into()),

@@ -3047,7 +3047,9 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
             asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
         }
         SymKind::Class => {
-            if ctx.st.get(id).flags.contains(Flags::JAVA) {
+            // Java classes have no companion MODULE$. Scala `Foo.bar` still
+            // loads `Foo$` when a companion exists.
+            if ctx.st.get(id).flags.contains(Flags::JAVA) || ctx.st.companion_module(id).is_none() {
                 return;
             }
             let jvm = format!("{}$", class_internal(ctx.st, id));

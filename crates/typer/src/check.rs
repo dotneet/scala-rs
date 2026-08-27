@@ -5940,39 +5940,55 @@ impl Typer {
     fn lookup_qualified_type(&mut self, prefix: &Tree, name: &str) -> Option<SymbolId> {
         let owner = self.qualified_type_owner(prefix)?;
         self.complete_binary_member(owner, name, prefix.span);
-        self.st.lookup_member(owner, name).into_iter().find(|s| {
-            matches!(
-                self.st.get(*s).kind,
-                SymKind::Class
-                    | SymKind::Package
-                    | SymKind::Module
-                    | SymKind::ModuleClass
-                    | SymKind::TypeMember
-                    | SymKind::TypeParam
-            )
-        })
+        self.prefer_class_member(owner, name)
+    }
+
+    /// Nested classes live on the module class (`object Outer { class Inner }`).
+    fn as_type_owner(&self, id: SymbolId) -> SymbolId {
+        match self.st.get(id).kind {
+            SymKind::Module => self.st.module_class_of(id),
+            _ => id,
+        }
+    }
+
+    /// `new Outer.Inner()` must bind the class, not `object Inner`.
+    fn prefer_class_member(&self, owner: SymbolId, name: &str) -> Option<SymbolId> {
+        let found = self.st.lookup_member(owner, name);
+        found
+            .iter()
+            .copied()
+            .find(|&s| self.st.get(s).kind == SymKind::Class)
+            .or_else(|| {
+                found.into_iter().find(|&s| {
+                    matches!(
+                        self.st.get(s).kind,
+                        SymKind::Package
+                            | SymKind::Module
+                            | SymKind::ModuleClass
+                            | SymKind::TypeMember
+                            | SymKind::TypeParam
+                    )
+                })
+            })
     }
 
     fn qualified_type_owner(&mut self, t: &Tree) -> Option<SymbolId> {
         match &t.kind {
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, t.span);
-                self.st.lookup(name).into_iter().find(|id| {
+                let id = self.st.lookup(name).into_iter().find(|id| {
                     matches!(
                         self.st.get(*id).kind,
                         SymKind::Package | SymKind::Class | SymKind::Module | SymKind::ModuleClass
                     )
-                })
+                })?;
+                Some(self.as_type_owner(id))
             }
             TreeKind::Select { qual, name } => {
                 let owner = self.qualified_type_owner(qual)?;
                 self.complete_binary_member(owner, name, t.span);
-                self.st.lookup_member(owner, name).into_iter().find(|id| {
-                    matches!(
-                        self.st.get(*id).kind,
-                        SymKind::Package | SymKind::Class | SymKind::Module | SymKind::ModuleClass
-                    )
-                })
+                self.prefer_class_member(owner, name)
+                    .map(|id| self.as_type_owner(id))
             }
             _ => None,
         }
@@ -5982,6 +5998,7 @@ impl Typer {
         if owner.is_none() || name.is_empty() {
             return;
         }
+        let owner = self.as_type_owner(owner);
         if self.st.get(owner).kind == SymKind::Class {
             self.ensure_java_loaded(owner, span);
             if !self.st.lookup_member(owner, name).is_empty() {
