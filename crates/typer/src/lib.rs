@@ -2344,7 +2344,7 @@ class D extends C { type A = Int }
         assert!(
             diags.iter().any(|d| d.message.contains("incompatible")),
             "{:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 
