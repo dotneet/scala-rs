@@ -1014,6 +1014,21 @@ fn fixtures_chaining_bad_is_error() {
 }
 
 #[test]
+fn fixtures_array_ops16_bad_is_error() {
+    compile_fails_lib("array_ops16_bad", "noSuchLast is not a member");
+}
+
+#[test]
+fn fixtures_string_ops20_bad_is_error() {
+    compile_fails_lib("string_ops20_bad", "noSuchAppended is not a member");
+}
+
+#[test]
+fn fixtures_capture_var_bad_is_error() {
+    compile_fails_lib("capture_var_bad", "not assignable");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1882,6 +1897,21 @@ fn scala_library_dual_run_chaining() {
 }
 
 #[test]
+fn scala_library_dual_run_capture_var() {
+    dual_run_fixture("capture_var");
+}
+
+#[test]
+fn scala_library_dual_run_array_ops16() {
+    dual_run_fixture("array_ops16");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops20() {
+    dual_run_fixture("string_ops20");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -2211,6 +2241,10 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/util/ChainingOps$.class",
     "scala/util/package$chaining$.class",
     "scala/util/ChainingSyntax.class",
+    "scala/runtime/IntRef.class",
+    "scala/runtime/ObjectRef.class",
+    "scala/runtime/LongRef.class",
+    "scala/runtime/BooleanRef.class",
     "scala/util/matching/Regex.class",
     "scala/Array$.class",
     "scala/runtime/NonLocalReturnControl.class",

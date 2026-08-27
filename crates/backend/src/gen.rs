@@ -46,6 +46,11 @@ pub fn emit_opts(
         trait_vals: HashMap::new(),
         library_abi: opts.library_abi,
         pickles: opts.pickles,
+        boxed_vars: if opts.library_abi {
+            collect_boxed_vars(tree, st)
+        } else {
+            HashSet::new()
+        },
     };
     g.collect_trait_impls(tree);
     g.walk(tree);
@@ -66,6 +71,8 @@ struct Gen<'a> {
     trait_vals: HashMap<SymbolId, Vec<Tree>>,
     library_abi: bool,
     pickles: HashMap<u32, Vec<u8>>,
+    /// Locals boxed into `scala.runtime.IntRef` / `ObjectRef` (library ABI).
+    boxed_vars: HashSet<SymbolId>,
 }
 
 struct EmitCtx<'a> {
@@ -81,6 +88,8 @@ struct EmitCtx<'a> {
     library_abi: bool,
     /// Named JVM method being emitted; `NONE` inside lambdas.
     method_sym: SymbolId,
+    /// Captured `var`s lowered to `scala.runtime.*Ref`.
+    boxed_vars: &'a HashSet<SymbolId>,
 }
 
 fn emit_ctx<'a>(
@@ -92,6 +101,7 @@ fn emit_ctx<'a>(
     lambda_n: &'a Cell<u32>,
     source: &'a str,
     library_abi: bool,
+    boxed_vars: &'a HashSet<SymbolId>,
 ) -> EmitCtx<'a> {
     EmitCtx {
         st,
@@ -104,7 +114,142 @@ fn emit_ctx<'a>(
         outer: None,
         library_abi,
         method_sym: SymbolId::NONE,
+        boxed_vars,
     }
+}
+
+fn runtime_ref_class(ty: &Type) -> &'static str {
+    match ty.widen_constant() {
+        Type::Int => "scala/runtime/IntRef",
+        Type::Long => "scala/runtime/LongRef",
+        Type::Double => "scala/runtime/DoubleRef",
+        Type::Float => "scala/runtime/FloatRef",
+        Type::Boolean => "scala/runtime/BooleanRef",
+        Type::Byte => "scala/runtime/ByteRef",
+        Type::Short => "scala/runtime/ShortRef",
+        Type::Char => "scala/runtime/CharRef",
+        _ => "scala/runtime/ObjectRef",
+    }
+}
+
+fn runtime_ref_elem_desc(ty: &Type) -> &'static str {
+    match ty.widen_constant() {
+        Type::Int => "I",
+        Type::Long => "J",
+        Type::Double => "D",
+        Type::Float => "F",
+        Type::Boolean => "Z",
+        Type::Byte => "B",
+        Type::Short => "S",
+        Type::Char => "C",
+        _ => "Ljava/lang/Object;",
+    }
+}
+
+fn runtime_ref_create_desc(ty: &Type) -> String {
+    format!("({})L{};", runtime_ref_elem_desc(ty), runtime_ref_class(ty))
+}
+
+fn is_boxed_var(ctx: &EmitCtx, id: SymbolId) -> bool {
+    !id.is_none() && ctx.boxed_vars.contains(&id)
+}
+
+fn emit_runtime_ref_create(asm: &mut Assembler, ty: &Type) {
+    let cls = runtime_ref_class(ty);
+    asm.invokestatic(cls, "create", &runtime_ref_create_desc(ty));
+}
+
+fn load_runtime_ref_elem(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
+    let cls = runtime_ref_class(ty);
+    let elem = runtime_ref_elem_desc(ty);
+    asm.getfield(cls, "elem", elem);
+    if elem == "Ljava/lang/Object;" {
+        if matches!(ty, Type::String) {
+            asm.checkcast("java/lang/String");
+        } else if let Some(cn) = checkcast_internal(ctx.st, ty) {
+            if cn != "java/lang/Object" {
+                asm.checkcast(&cn);
+            }
+        }
+    }
+}
+
+fn store_runtime_ref_elem(asm: &mut Assembler, ty: &Type) {
+    let cls = runtime_ref_class(ty);
+    let elem = runtime_ref_elem_desc(ty);
+    if elem == "Ljava/lang/Object;" && is_jvm_primitive(ty) && !is_unit_like(ty) {
+        emit_box(asm, ty);
+    }
+    asm.putfield(cls, "elem", elem);
+}
+
+fn jvm_desc_maybe_boxed(
+    st: &SymbolTable,
+    ty: &Type,
+    id: SymbolId,
+    boxed: &HashSet<SymbolId>,
+) -> String {
+    if !id.is_none() && boxed.contains(&id) {
+        format!("L{};", runtime_ref_class(ty))
+    } else {
+        jvm_desc(st, ty)
+    }
+}
+
+fn def_is_synthetic(st: &SymbolTable, def: &Tree) -> bool {
+    if !def.sym.is_none() && st.get(def.sym).flags.contains(Flags::SYNTHETIC) {
+        return true;
+    }
+    if let TreeKind::DefDef { mods, .. } = &def.kind {
+        return mods.flags.contains(Flags::SYNTHETIC);
+    }
+    false
+}
+
+fn def_method_desc_boxed(st: &SymbolTable, def: &Tree, boxed: &HashSet<SymbolId>) -> String {
+    let synthetic = def_is_synthetic(st, def);
+    let mut s = String::from("(");
+    if let TreeKind::DefDef { vparamss, .. } = &def.kind {
+        for p in vparamss.iter().flatten() {
+            let ty = if !p.ty.is_no_type() && !p.ty.is_error() {
+                p.ty.clone()
+            } else if !p.sym.is_none() {
+                st.get(p.sym).ty.clone()
+            } else {
+                Type::Any
+            };
+            if synthetic {
+                s.push_str(&jvm_desc_maybe_boxed(st, &ty, p.sym, boxed));
+            } else {
+                s.push_str(&jvm_desc(st, &ty));
+            }
+        }
+    }
+    s.push(')');
+    s.push_str(&jvm_desc(st, &method_ret_ty(def)));
+    s
+}
+
+fn method_desc_boxed(st: &SymbolTable, id: SymbolId, boxed: &HashSet<SymbolId>) -> String {
+    let s = st.get(id);
+    if s.name == "<init>" || s.jvm_name.starts_with('(') {
+        return method_desc_from_sym(st, id);
+    }
+    let synthetic = s.flags.contains(Flags::SYNTHETIC);
+    let params: Vec<Type> = method_params_from_sym(st, id);
+    let ret = method_ret_from_sym(st, id);
+    let mut d = String::from("(");
+    for (i, p) in params.iter().enumerate() {
+        let pid = s.params.get(i).copied().unwrap_or(SymbolId::NONE);
+        if synthetic {
+            d.push_str(&jvm_desc_maybe_boxed(st, p, pid, boxed));
+        } else {
+            d.push_str(&jvm_desc(st, p));
+        }
+    }
+    d.push(')');
+    d.push_str(&jvm_desc(st, &ret));
+    d
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1722,6 +1867,7 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let boxed_vars = &self.boxed_vars;
         let stats: Vec<Tree> = body
             .iter()
             .filter(|t| is_delayed_ctor_stat(t) && !is_presuper_val(t))
@@ -1738,6 +1884,7 @@ impl<'a> Gen<'a> {
                 lambda_n,
                 source,
                 library_abi,
+                boxed_vars,
             );
             for stt in &stats {
                 if let TreeKind::ValDef {
@@ -1861,6 +2008,7 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let boxed_vars = &self.boxed_vars;
         let delayed = extends_delayed_init(st, class_id);
         let is_app = extends_app(st, class_id);
         let has_outer = outer.is_some();
@@ -1892,6 +2040,7 @@ impl<'a> Gen<'a> {
                 lambda_n,
                 source,
                 library_abi,
+                boxed_vars,
             );
             // nsc: early vals are stored to fields before the superclass ctor so
             // parent / trait `$init$` bodies see the values.
@@ -1949,6 +2098,7 @@ impl<'a> Gen<'a> {
                 lambda_n,
                 source,
                 library_abi,
+                boxed_vars,
             );
             if delayed {
                 if library_abi && is_app {
@@ -2000,7 +2150,7 @@ impl<'a> Gen<'a> {
         if name == "<init>" && rhs.is_empty() {
             return;
         }
-        let desc = def_method_desc(self.st, def);
+        let desc = def_method_desc_boxed(self.st, def, &self.boxed_vars);
         let ret = method_ret_ty(def);
         let acc = method_access_flags(mods.flags);
         if mods.flags.contains(Flags::NATIVE) {
@@ -2025,7 +2175,15 @@ impl<'a> Gen<'a> {
                 } else {
                     p.ty.clone()
                 };
-                frame.alloc(p.sym, jvm_sort(&ty));
+                let sort = if def_is_synthetic(self.st, def)
+                    && !p.sym.is_none()
+                    && self.boxed_vars.contains(&p.sym)
+                {
+                    JvmSort::Ref
+                } else {
+                    jvm_sort(&ty)
+                };
+                frame.alloc(p.sym, sort);
             }
         }
         let class_name = b.this_name.clone();
@@ -2036,6 +2194,7 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let boxed_vars = &self.boxed_vars;
         let meth = def.sym;
         b.add_code(acc, name, &desc, max_locals, |asm| {
             let mut frame = frame;
@@ -2048,6 +2207,7 @@ impl<'a> Gen<'a> {
                 lambda_n,
                 source,
                 library_abi,
+                boxed_vars,
             );
             ctx.method_sym = meth;
             finish_method_body(asm, &mut frame, &ctx, rhs, &ret_for_body);
@@ -2104,6 +2264,7 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let boxed_vars = &self.boxed_vars;
         b.add_code(
             ACC_PUBLIC | ACC_STATIC,
             &ext_name,
@@ -2120,6 +2281,7 @@ impl<'a> Gen<'a> {
                     lambda_n,
                     source,
                     library_abi,
+                    boxed_vars,
                 );
                 gen_expr(asm, &mut frame, &ctx, rhs);
                 if is_unit_like(&ret_for_body) {
@@ -2165,6 +2327,7 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let boxed_vars = &self.boxed_vars;
         let vals = vals.to_vec();
         b.add_code(ACC_PUBLIC | ACC_STATIC, "$init$", &desc, 4, |asm| {
             let mut frame = Frame::instance();
@@ -2177,6 +2340,7 @@ impl<'a> Gen<'a> {
                 lambda_n,
                 source,
                 library_abi,
+                boxed_vars,
             );
             for vd in &vals {
                 if let TreeKind::ValDef {
@@ -2241,6 +2405,7 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let boxed_vars = &self.boxed_vars;
         let meth = def.sym;
         b.add_code(ACC_PUBLIC | ACC_STATIC, name, &desc, max_locals, |asm| {
             let mut frame = frame;
@@ -2253,6 +2418,7 @@ impl<'a> Gen<'a> {
                 lambda_n,
                 source,
                 library_abi,
+                boxed_vars,
             );
             ctx.method_sym = meth;
             finish_method_body(asm, &mut frame, &ctx, rhs, &ret_for_body);
@@ -2686,6 +2852,7 @@ impl<'a> Gen<'a> {
             let lambda_n = &self.lambda_n;
             let source = self.source_name;
             let library_abi = self.library_abi;
+            let boxed_vars = &self.boxed_vars;
             let ret_for_body = ret.clone();
             b.add_code(
                 ACC_PUBLIC | ACC_SYNTHETIC,
@@ -2703,6 +2870,7 @@ impl<'a> Gen<'a> {
                         lambda_n,
                         source,
                         library_abi,
+                        boxed_vars,
                     );
                     gen_expr(asm, &mut frame, &ctx, &rhs);
                     if is_unit_like(&ret_for_body) {
@@ -2742,6 +2910,7 @@ impl<'a> Gen<'a> {
             let lambda_n = &self.lambda_n;
             let source = self.source_name;
             let library_abi = self.library_abi;
+            let boxed_vars = &self.boxed_vars;
             let rhs = rhs.clone();
             let mask = 1i32 << bit;
             bit += 1;
@@ -2769,6 +2938,7 @@ impl<'a> Gen<'a> {
                     lambda_n,
                     source,
                     library_abi,
+                    boxed_vars,
                 );
                 asm.aload(0);
                 gen_expr(asm, &mut frame, &ctx, &rhs);
@@ -2989,6 +3159,7 @@ impl<'a> Gen<'a> {
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
         let library_abi = self.library_abi;
+        let boxed_vars = &self.boxed_vars;
         let delayed = extends_delayed_init(st, class_id);
         let is_app = extends_app(st, class_id);
         let super_name = b.super_name.clone();
@@ -3007,6 +3178,7 @@ impl<'a> Gen<'a> {
                 lambda_n,
                 source,
                 library_abi,
+                boxed_vars,
             );
             if delayed {
                 if library_abi && is_app {
@@ -3420,6 +3592,13 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
             };
             let sort = jvm_sort(&ty);
             if rhs.is_empty() {
+                if is_boxed_var(ctx, tree.sym) {
+                    push_default(asm, &ty);
+                    emit_runtime_ref_create(asm, &ty);
+                    let slot = frame.alloc(tree.sym, JvmSort::Ref);
+                    store(asm, slot, JvmSort::Ref);
+                    return;
+                }
                 frame.alloc(tree.sym, sort);
                 return;
             }
@@ -3429,6 +3608,12 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
                 return;
             }
             gen_expr(asm, frame, ctx, rhs);
+            if is_boxed_var(ctx, tree.sym) {
+                emit_runtime_ref_create(asm, &ty);
+                let slot = frame.alloc(tree.sym, JvmSort::Ref);
+                store(asm, slot, JvmSort::Ref);
+                return;
+            }
             let slot = frame.alloc(tree.sym, sort);
             store(asm, slot, sort);
         }
@@ -3629,6 +3814,11 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
         return;
     }
     if let Some((slot, sort)) = frame.get(id) {
+        if is_boxed_var(ctx, id) {
+            load(asm, slot, JvmSort::Ref);
+            load_runtime_ref_elem(asm, ctx, &ctx.st.get(id).ty);
+            return;
+        }
         load(asm, slot, sort);
         return;
     }
@@ -3928,6 +4118,14 @@ fn gen_assign(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, lhs: &Tree,
     match &lhs.kind {
         TreeKind::Ident { .. } => {
             let id = lhs.sym;
+            if is_boxed_var(ctx, id) {
+                if let Some((slot, _)) = frame.get(id) {
+                    load(asm, slot, JvmSort::Ref);
+                    gen_expr(asm, frame, ctx, rhs);
+                    store_runtime_ref_elem(asm, &ctx.st.get(id).ty);
+                    return;
+                }
+            }
             if let Some((slot, sort)) = frame.get(id) {
                 gen_expr(asm, frame, ctx, rhs);
                 store(asm, slot, sort);
@@ -4516,6 +4714,7 @@ fn gen_apply(
         &param_tys,
         value_owner.is_some() || (ctx.library_abi && !array_elem_op),
         java_varargs,
+        fun.sym,
     );
     if let TreeKind::Select { qual, name } = &fun.kind {
         if name == "apply" && matches!(qual.ty, Type::Array(_)) {
@@ -4847,6 +5046,30 @@ fn invoke_value_extension(
             maybe_unbox_erased_result(asm, ctx, desc, result_ty);
             return;
         }
+        if s.name == "size" || s.name == "length" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "size$extension",
+                "(Ljava/lang/Object;)I",
+            );
+            return;
+        }
+        if s.name == "isEmpty" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "isEmpty$extension",
+                "(Ljava/lang/Object;)Z",
+            );
+            return;
+        }
+        if s.name == "nonEmpty" {
+            asm.invokestatic(
+                "scala/collection/ArrayOps",
+                "nonEmpty$extension",
+                "(Ljava/lang/Object;)Z",
+            );
+            return;
+        }
         asm.invokestatic(
             "scala/collection/ArrayOps",
             &format!("{}$extension", s.name),
@@ -5001,7 +5224,7 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
     let owner_id = s.owner;
     let owner = class_internal(ctx.st, owner_id);
     let name = s.name.as_str();
-    let mut desc = method_desc_from_sym(ctx.st, id);
+    let mut desc = method_desc_boxed(ctx.st, id, ctx.boxed_vars);
     if name == "<init>" {
         asm.invokespecial(&owner, "<init>", &desc);
         return;
@@ -6862,21 +7085,43 @@ fn gen_call_args(
     param_tys: &[Type],
     box_prims: bool,
     java_varargs: bool,
+    method: SymbolId,
 ) {
+    let param_ids: Vec<SymbolId> = if method.is_none() {
+        Vec::new()
+    } else {
+        ctx.st.get(method).params.clone()
+    };
+    let load_arg = |asm: &mut Assembler, frame: &mut Frame, i: usize, a: &Tree| {
+        let callee_synthetic =
+            !method.is_none() && ctx.st.get(method).flags.contains(Flags::SYNTHETIC);
+        if callee_synthetic && param_ids.get(i).is_some_and(|p| ctx.boxed_vars.contains(p)) {
+            let id = match &a.kind {
+                TreeKind::Ident { .. } => a.sym,
+                TreeKind::Typed { expr, .. } => expr.sym,
+                _ => SymbolId::NONE,
+            };
+            if let Some((slot, _)) = frame.get(id) {
+                load(asm, slot, JvmSort::Ref);
+                return;
+            }
+        }
+        gen_expr(asm, frame, ctx, a);
+        if box_prims {
+            let pty = param_tys.get(i).unwrap_or(&a.ty);
+            if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
+                emit_box(asm, &a.ty);
+            } else if matches!(pty, Type::Array(_)) {
+                asm.checkcast(&jvm_desc(ctx.st, pty));
+            }
+        }
+    };
     let rep_idx = param_tys
         .iter()
         .position(|p| matches!(p, Type::Repeated(_)));
     let Some(ri) = rep_idx else {
         for (i, a) in args.iter().enumerate() {
-            gen_expr(asm, frame, ctx, a);
-            if box_prims {
-                let pty = param_tys.get(i).unwrap_or(&a.ty);
-                if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
-                    emit_box(asm, &a.ty);
-                } else if matches!(pty, Type::Array(_)) {
-                    asm.checkcast(&jvm_desc(ctx.st, pty));
-                }
-            }
+            load_arg(asm, frame, i, a);
         }
         return;
     };
@@ -7338,6 +7583,139 @@ fn is_jvm_primitive(ty: &Type) -> bool {
     )
 }
 
+fn collect_boxed_vars(tree: &Tree, st: &SymbolTable) -> HashSet<SymbolId> {
+    let mut out = HashSet::new();
+    walk_boxed_vars(tree, st, &mut out);
+    out
+}
+
+fn walk_boxed_vars(tree: &Tree, st: &SymbolTable, out: &mut HashSet<SymbolId>) {
+    match &tree.kind {
+        TreeKind::PackageDef { stats, .. } => {
+            for s in stats {
+                walk_boxed_vars(s, st, out);
+            }
+        }
+        TreeKind::ClassDef {
+            vparamss, impl_, ..
+        } => {
+            for p in vparamss.iter().flatten() {
+                walk_boxed_vars(p, st, out);
+            }
+            for p in &impl_.parents {
+                walk_boxed_vars(p, st, out);
+            }
+            for s in &impl_.body {
+                walk_boxed_vars(s, st, out);
+            }
+        }
+        TreeKind::ModuleDef { impl_, .. } => {
+            for p in &impl_.parents {
+                walk_boxed_vars(p, st, out);
+            }
+            for s in &impl_.body {
+                walk_boxed_vars(s, st, out);
+            }
+        }
+        TreeKind::DefDef {
+            vparamss, tpt, rhs, ..
+        } => {
+            let synthetic = def_is_synthetic(st, tree);
+            for p in vparamss.iter().flatten() {
+                if synthetic && !p.sym.is_none() && st.get(p.sym).flags.contains(Flags::MUTABLE) {
+                    out.insert(p.sym);
+                }
+                walk_boxed_vars(p, st, out);
+            }
+            walk_boxed_vars(tpt, st, out);
+            walk_boxed_vars(rhs, st, out);
+        }
+        TreeKind::Function { vparams, body } => {
+            let mut bound = HashSet::new();
+            for p in vparams {
+                if !p.sym.is_none() {
+                    bound.insert(p.sym);
+                }
+                walk_boxed_vars(p, st, out);
+            }
+            let mut free = Vec::new();
+            collect_free(body, &bound, &mut free, st);
+            for id in free {
+                let s = st.get(id);
+                if s.flags.contains(Flags::MUTABLE)
+                    && matches!(st.get(s.owner).kind, SymKind::Method)
+                {
+                    out.insert(id);
+                }
+            }
+            walk_boxed_vars(body, st, out);
+        }
+        TreeKind::ValDef { tpt, rhs, .. } => {
+            walk_boxed_vars(tpt, st, out);
+            walk_boxed_vars(rhs, st, out);
+        }
+        TreeKind::Block { stats, expr } => {
+            for s in stats {
+                walk_boxed_vars(s, st, out);
+            }
+            walk_boxed_vars(expr, st, out);
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            walk_boxed_vars(cond, st, out);
+            walk_boxed_vars(thenp, st, out);
+            walk_boxed_vars(elsep, st, out);
+        }
+        TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
+            walk_boxed_vars(cond, st, out);
+            walk_boxed_vars(body, st, out);
+        }
+        TreeKind::Apply { fun, args } | TreeKind::TypeApply { fun, args } => {
+            walk_boxed_vars(fun, st, out);
+            for a in args {
+                walk_boxed_vars(a, st, out);
+            }
+        }
+        TreeKind::Typed { expr, tpt } => {
+            walk_boxed_vars(expr, st, out);
+            walk_boxed_vars(tpt, st, out);
+        }
+        TreeKind::Select { qual, .. } => walk_boxed_vars(qual, st, out),
+        TreeKind::Assign { lhs, rhs } => {
+            walk_boxed_vars(lhs, st, out);
+            walk_boxed_vars(rhs, st, out);
+        }
+        TreeKind::Match { selector, cases } => {
+            walk_boxed_vars(selector, st, out);
+            for c in cases {
+                walk_boxed_vars(&c.pat, st, out);
+                walk_boxed_vars(&c.guard, st, out);
+                walk_boxed_vars(&c.body, st, out);
+            }
+        }
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            walk_boxed_vars(block, st, out);
+            for c in catches {
+                walk_boxed_vars(&c.pat, st, out);
+                walk_boxed_vars(&c.body, st, out);
+            }
+            walk_boxed_vars(finalizer, st, out);
+        }
+        TreeKind::Return { expr } | TreeKind::Throw { expr } | TreeKind::New { tpt: expr } => {
+            walk_boxed_vars(expr, st, out);
+        }
+        TreeKind::InterpolatedString { args, .. } => {
+            for a in args {
+                walk_boxed_vars(a, st, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>, st: &SymbolTable) {
     match &tree.kind {
         TreeKind::Ident { .. } => {
@@ -7468,6 +7846,7 @@ fn emit_partial_function_methods(
     body: &Tree,
     local_caps: &[SymbolId],
     ret_ty: &Type,
+    boxed_vars: &HashSet<SymbolId>,
 ) {
     let cases: Vec<scala_rs_parser::CaseDef> = pf_match_cases(body).unwrap_or(&[]).to_vec();
     let sel_ty = match &body.kind {
@@ -7492,7 +7871,7 @@ fn emit_partial_function_methods(
     b.add_code(ACC_PUBLIC, "isDefinedAt", "(Ljava/lang/Object;)Z", 8, |a| {
         let mut fr = Frame::instance();
         fr.next_slot = 2;
-        pf_bind_arg_and_captures(a, &mut fr, st, &lam1, &vparams1, &caps1);
+        pf_bind_arg_and_captures(a, &mut fr, st, &lam1, &vparams1, &caps1, boxed_vars);
         let some = a.fresh_label();
         let no = a.fresh_label();
         let sel_sort = jvm_sort(&sel1);
@@ -7520,6 +7899,7 @@ fn emit_partial_function_methods(
                         outer: outer_ref,
                         library_abi,
                         method_sym: SymbolId::NONE,
+                        boxed_vars,
                     };
                     gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
                     if !c.guard.is_empty() {
@@ -7548,7 +7928,7 @@ fn emit_partial_function_methods(
         |a| {
             let mut fr = Frame::instance();
             fr.next_slot = 3;
-            pf_bind_arg_and_captures(a, &mut fr, st, &lam_name, &vparams, &local_caps);
+            pf_bind_arg_and_captures(a, &mut fr, st, &lam_name, &vparams, &local_caps, boxed_vars);
             let end = a.fresh_label();
             let sel_sort = jvm_sort(&sel_ty);
             if let Some(p) = vparams.first() {
@@ -7575,6 +7955,7 @@ fn emit_partial_function_methods(
                             outer: outer_ref,
                             library_abi,
                             method_sym: SymbolId::NONE,
+                            boxed_vars,
                         };
                         gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
                         if !c.guard.is_empty() {
@@ -7613,6 +7994,7 @@ fn pf_bind_arg_and_captures(
     lam_name: &str,
     vparams: &[Tree],
     local_caps: &[SymbolId],
+    boxed: &HashSet<SymbolId>,
 ) {
     if let Some(p) = vparams.first() {
         a.aload(1);
@@ -7634,10 +8016,16 @@ fn pf_bind_arg_and_captures(
         let ty = st.get(*id).ty.clone();
         a.aload(0);
         a.getfield(lam_name, &format!("$captured${i}"), "Ljava/lang/Object;");
-        emit_from_erased_object(a, st, &ty);
-        let sort = jvm_sort(&ty);
-        let slot = fr.alloc(*id, sort);
-        store(a, slot, sort);
+        if boxed.contains(id) {
+            a.checkcast(runtime_ref_class(&ty));
+            let slot = fr.alloc(*id, JvmSort::Ref);
+            store(a, slot, JvmSort::Ref);
+        } else {
+            emit_from_erased_object(a, st, &ty);
+            let sort = jvm_sort(&ty);
+            let slot = fr.alloc(*id, sort);
+            store(a, slot, sort);
+        }
     }
 }
 
@@ -7692,11 +8080,15 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
     }
     for id in &local_caps {
         let (slot, sort) = frame.get(*id).unwrap();
-        load(asm, slot, sort);
         let ty = ctx.st.get(*id).ty.clone();
-        // capture as Object
-        if is_jvm_primitive(&ty) {
-            emit_box(asm, &ty);
+        if is_boxed_var(ctx, *id) {
+            // Capture the IntRef/ObjectRef itself, not the elem.
+            load(asm, slot, JvmSort::Ref);
+        } else {
+            load(asm, slot, sort);
+            if is_jvm_primitive(&ty) {
+                emit_box(asm, &ty);
+            }
         }
         ctor_desc.push_str("Ljava/lang/Object;");
     }
@@ -7773,6 +8165,7 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
     let source = ctx.source;
     let class_sym = ctx.class_sym;
     let library_abi = ctx.library_abi;
+    let boxed = ctx.boxed_vars;
     let orig_class = ctx.class_name.to_string();
     let lam_name2 = lam_name.clone();
     let outer_desc = format!("L{orig_class};");
@@ -7824,10 +8217,16 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             let ty = st.get(*id).ty.clone();
             a.aload(0);
             a.getfield(&lam_name2, &format!("$captured${i}"), "Ljava/lang/Object;");
-            emit_from_erased_object(a, st, &ty);
-            let sort = jvm_sort(&ty);
-            let slot = fr.alloc(*id, sort);
-            store(a, slot, sort);
+            if boxed.contains(id) {
+                a.checkcast(runtime_ref_class(&ty));
+                let slot = fr.alloc(*id, JvmSort::Ref);
+                store(a, slot, JvmSort::Ref);
+            } else {
+                emit_from_erased_object(a, st, &ty);
+                let sort = jvm_sort(&ty);
+                let slot = fr.alloc(*id, sort);
+                store(a, slot, sort);
+            }
         }
         let outer_storage;
         let outer_ref = if need_outer {
@@ -7847,6 +8246,7 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             outer: outer_ref,
             library_abi,
             method_sym: SymbolId::NONE,
+            boxed_vars: boxed,
         };
         gen_expr(a, &mut fr, &inner_ctx, &body);
         if matches!(body.ty, Type::Nothing) {
@@ -7890,6 +8290,7 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             &body_pf,
             &local_caps_pf,
             &ret_ty_pf,
+            ctx.boxed_vars,
         );
     }
     ctx.extras.borrow_mut().push(b.finish());
