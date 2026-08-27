@@ -2177,7 +2177,6 @@ fn add_string_builder(st: &mut SymbolTable) {
     };
     method(st, sb, "+=", vec![Type::Any], sb_t.clone(), Intrinsic::None);
     method(st, sb, "append", vec![Type::String], sb_t, Intrinsic::None);
-    method(st, sb, "toString", vec![], Type::String, Intrinsic::None);
 }
 
 fn add_either(st: &mut SymbolTable) {

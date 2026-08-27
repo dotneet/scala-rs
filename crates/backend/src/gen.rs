@@ -5486,14 +5486,6 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                     );
                     return;
                 }
-                "toString" => {
-                    asm.invokevirtual(
-                        "scala/collection/mutable/StringBuilder",
-                        "toString",
-                        "()Ljava/lang/String;",
-                    );
-                    return;
-                }
                 _ => {}
             }
         }

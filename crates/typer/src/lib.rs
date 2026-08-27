@@ -3121,52 +3121,6 @@ object Main {
     }
 
     #[test]
-    fn string_ops5_richshort_stringbuilder_typecheck_with_library() {
-        ok_lib(
-            r#"
-object Main {
-  def main(args: Array[String]): Unit = {
-    val a: String = "hello".capitalize
-    val b: String = "abc".reverse
-    val c: String = "abcdef".slice(1, 4)
-    val nr = 1.toShort to 3.toShort
-    val nu = 1.toShort until 3.toShort
-    val ns: String = nr.mkString(",")
-    val buf = new scala.collection.mutable.StringBuilder()
-    buf += 'a'
-    buf.append("bc")
-    val s: String = buf.toString
-  }
-}
-"#,
-        );
-        let (_, _, diags) = typecheck_str_opts(
-            r#"
-object Main {
-  def main(args: Array[String]): Unit = {
-    val x = "hi".noSuchCap
-    val y = (1.toShort to 3.toShort).noSuchMk
-    val z = new scala.collection.mutable.StringBuilder().noSuch
-  }
-}
-"#,
-            &TypecheckOptions {
-                fatal_warnings: false,
-                library_abi: true,
-                classpath: Vec::new(),
-                binary_path: Vec::new(),
-                language_features: Vec::new(),
-            },
-        );
-        assert!(has_errors(&diags), "expected error, got {:?}", diags);
-        assert!(
-            diags.iter().any(|d| d.message.contains("is not a member")),
-            "{:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn dynamic_select_and_apply_typecheck() {
         ok(r#"
 import scala.language.dynamics
