@@ -73,7 +73,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 パースできる（またはデシュガーする）構文:
 
 - packages / imports
-- objects / classes / traits / case classes。**補助コンストラクタ** `def this(...) = this(...)`（連鎖の先頭は `this(...)`。`super(...)` や文のあとの `this` は診断）。サブクラスの `extends C(1)` は primary が親 ctor を呼ぶ
+- objects / classes / traits / case classes。**補助コンストラクタ** `def this(...) = this(...)`（連鎖の先頭は `this(...)`。`super(...)` や文のあとの `this` は診断）。サブクラスの `extends C(1)` は primary が親 ctor を呼ぶ。内部クラスの `new Inner` は ctor overload 選択後も `$outer` を `<init>` の第一引数に残す
 - `val` / `var` / `def`（ネストした `def` はパースする）
 - パラメータ、ラムダ（型付き / 期待型から推論）、ブロック
 - `if` / `else`、`while`、`do { ... } while (cond)`
@@ -178,7 +178,7 @@ trait の `val` は interface 上の getter / `$init$set$` と、`T$class.$init$
 
 ### ネストした型
 
-`class Outer { class Inner }` は `Outer$Inner` になり、非 static な内部クラスは `$outer` をコンストラクタで受け取ります。`object Outer { object Inner }` は `Outer$Inner$` と `MODULE$` です。
+`class Outer { class Inner }` は `Outer$Inner` になり、非 static な内部クラスは `$outer` をコンストラクタで受け取ります。primary / 補助コンストラクタの overload 選択はソース引数だけを見ますが、呼び出す `<init>` 記述子には `$outer` を前置します。`object Outer { object Inner }` は `Outer$Inner$` と `MODULE$` です。
 
 ### lazy val
 

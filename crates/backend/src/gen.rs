@@ -439,12 +439,29 @@ fn method_desc_from_sym(st: &SymbolTable, id: SymbolId) -> String {
     }
 }
 
+/// Scala inner classes take a hidden `$outer` as the first `<init>` argument.
+/// Constructor symbols list only the source parameters, so descriptors from
+/// `method_desc_from_sym` must be adjusted at emit time.
+fn with_enclosing_outer_param(st: &SymbolTable, class_id: SymbolId, desc: &str) -> String {
+    let Some(outer) = enclosing_instance(st, class_id) else {
+        return desc.to_string();
+    };
+    let outer_ty = format!("L{};", class_internal(st, outer));
+    let Some(rest) = desc.strip_prefix('(') else {
+        return desc.to_string();
+    };
+    if rest.starts_with(&outer_ty) {
+        return desc.to_string();
+    }
+    format!("({outer_ty}{rest}")
+}
+
 fn ctor_desc(st: &SymbolTable, class_id: SymbolId, args: &[Tree]) -> String {
     if let Some(d) = java_ctor_desc(st, class_id, args.len()) {
         return d;
     }
     if let Some(id) = pick_init_sym(st, class_id, args) {
-        return method_desc_from_sym(st, id);
+        return with_enclosing_outer_param(st, class_id, &method_desc_from_sym(st, id));
     }
     let mut d = String::from("(");
     if let Some(outer) = enclosing_instance(st, class_id) {
@@ -3475,6 +3492,11 @@ fn gen_new(
         jvm_method_desc(ctx.st, &pts, &Type::Unit)
     } else {
         ctor_desc(ctx.st, class_id, args)
+    };
+    let desc = if class_id.is_none() {
+        desc
+    } else {
+        with_enclosing_outer_param(ctx.st, class_id, &desc)
     };
     let field_tys: Vec<Type> = if !ctor_sym.is_none() && ctx.st.get(ctor_sym).name == "<init>" {
         match &ctx.st.get(ctor_sym).ty {
