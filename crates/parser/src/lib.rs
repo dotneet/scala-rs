@@ -644,12 +644,56 @@ object Main {
     }
 
     #[test]
-    fn xml_prefixed_element_is_unimplemented() {
-        let r = parse_str("object M { val x = <p:a/> }\n");
+    fn xml_prefixed_element_desugars() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val x = <p:a xmlns:p="u"/>
+    val y = <p:b xmlns:p="u">t</p:b>
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Elem"), "{dump}");
         assert!(
-            r.diags.iter().any(|d| d.message.contains("XML")),
-            "expected XML prefixed-element diagnostic, got {:?}",
+            dump.contains("NamespaceBinding"),
+            "expected NamespaceBinding: {dump}"
+        );
+        // prefix argument is Lit.String("p"), not null.
+        assert!(
+            dump.contains("Literal \"p\""),
+            "expected prefixed Elem prefix \"p\": {dump}"
+        );
+    }
+
+    #[test]
+    fn xml_comments_and_cdata_are_unimplemented() {
+        let r = parse_str("object M { val x = <a><!--c--></a> }\n");
+        assert!(
+            r.diags
+                .iter()
+                .any(|d| d.message.contains("XML comments/CDATA")),
+            "expected XML comments/CDATA diagnostic, got {:?}",
             r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let cdata = parse_str("object M { val x = <a><![CDATA[x]]></a> }\n");
+        assert!(
+            cdata
+                .diags
+                .iter()
+                .any(|d| d.message.contains("XML comments/CDATA")),
+            "expected XML CDATA diagnostic, got {:?}",
+            cdata.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let pi = parse_str("object M { val x = <a><?pi?></a> }\n");
+        assert!(
+            pi.diags
+                .iter()
+                .any(|d| d.message.contains("XML processing instructions")),
+            "expected XML PI diagnostic, got {:?}",
+            pi.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 
