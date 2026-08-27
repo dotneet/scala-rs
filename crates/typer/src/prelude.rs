@@ -280,6 +280,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_array_buffer(st);
         add_list_buffer(st);
         add_string_builder(st);
+        add_hash_map(st);
         add_either(st);
         add_try(st, throwable);
         add_xml(st);
@@ -1208,6 +1209,30 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
         "slice",
         vec![Type::Int, Type::Int],
         Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "takeRight",
+        vec![Type::Int],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "dropRight",
+        vec![Type::Int],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "contains",
+        vec![Type::Char],
+        Type::Boolean,
         Intrinsic::None,
     );
     so
@@ -2162,6 +2187,119 @@ fn add_list_buffer(st: &mut SymbolTable) {
     st.get_mut(buf_mod).members.extend(mems);
 }
 
+fn add_hash_map(st: &mut SymbolTable) {
+    let tuple2 = st
+        .get(st.scala_pkg)
+        .members
+        .iter()
+        .copied()
+        .find(|id| st.get(*id).name == "Tuple2")
+        .unwrap_or(SymbolId::NONE);
+    let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
+    let hm = class(
+        st,
+        mutp,
+        "HashMap",
+        "scala/collection/mutable/HashMap",
+        &[Type::AnyRef],
+    );
+    let mk = type_param(st, hm, "K");
+    let mv = type_param(st, hm, "V");
+    st.get_mut(hm).tparams = vec![mk, mv];
+    let tk = Type::TypeParam(mk);
+    let tv = Type::TypeParam(mv);
+    let hm_t = Type::Class {
+        sym: hm,
+        args: vec![tk.clone(), tv.clone()],
+    };
+    let pair = Type::Class {
+        sym: tuple2,
+        args: vec![tk, tv.clone()],
+    };
+    method(
+        st,
+        hm,
+        "apply",
+        vec![Type::Any],
+        tv.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        hm,
+        "get",
+        vec![Type::Any],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![tv.clone()],
+        },
+        Intrinsic::None,
+    );
+    method(
+        st,
+        hm,
+        "update",
+        vec![Type::Any, Type::Any],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        hm,
+        "+=",
+        vec![pair.clone()],
+        hm_t.clone(),
+        Intrinsic::None,
+    );
+    let hm_mod = module(st, mutp, "HashMap", "scala/collection/mutable/HashMap$");
+    let hm_cls = st.module_class_of(hm_mod);
+    let hm_empty = method(
+        st,
+        hm_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: hm,
+            args: vec![Type::Any, Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let ek = type_param(st, hm_empty, "K");
+    let ev = type_param(st, hm_empty, "V");
+    st.get_mut(hm_empty).tparams = vec![ek, ev];
+    st.get_mut(hm_empty).ty = Type::Method {
+        paramss: vec![vec![]],
+        ret: Box::new(Type::Class {
+            sym: hm,
+            args: vec![Type::TypeParam(ek), Type::TypeParam(ev)],
+        }),
+    };
+    let hm_apply = method(
+        st,
+        hm_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(pair.clone()))],
+        hm_t.clone(),
+        Intrinsic::None,
+    );
+    let hak = type_param(st, hm_apply, "K");
+    let hav = type_param(st, hm_apply, "V");
+    st.get_mut(hm_apply).tparams = vec![hak, hav];
+    let hm_pair = Type::Class {
+        sym: tuple2,
+        args: vec![Type::TypeParam(hak), Type::TypeParam(hav)],
+    };
+    st.get_mut(hm_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(hm_pair))]],
+        ret: Box::new(Type::Class {
+            sym: hm,
+            args: vec![Type::TypeParam(hak), Type::TypeParam(hav)],
+        }),
+    };
+    let mems = st.get(hm_cls).members.clone();
+    st.get_mut(hm_mod).members.extend(mems);
+}
+
 fn add_string_builder(st: &mut SymbolTable) {
     let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
     let sb = class(
@@ -2449,6 +2587,26 @@ fn add_rich_long_double_char(st: &mut SymbolTable) -> (SymbolId, SymbolId, Symbo
     method(st, rl, "abs", vec![], Type::Long, Intrinsic::None);
     method(st, rl, "max", vec![Type::Long], Type::Long, Intrinsic::None);
     method(st, rl, "min", vec![Type::Long], Type::Long, Intrinsic::None);
+    let nr = st
+        .get(st.scala_pkg)
+        .members
+        .iter()
+        .copied()
+        .find(|&id| st.get(id).name == "NumericRange")
+        .expect("NumericRange");
+    let nr_l = Type::Class {
+        sym: nr,
+        args: vec![Type::Long],
+    };
+    method(
+        st,
+        rl,
+        "to",
+        vec![Type::Long],
+        nr_l.clone(),
+        Intrinsic::None,
+    );
+    method(st, rl, "until", vec![Type::Long], nr_l, Intrinsic::None);
     let rd = add_rich_value(st, "RichDouble", "scala/runtime/RichDouble", Type::Double);
     method(st, rd, "abs", vec![], Type::Double, Intrinsic::None);
     method(
