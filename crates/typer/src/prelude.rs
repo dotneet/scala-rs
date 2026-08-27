@@ -2243,14 +2243,7 @@ fn add_hash_map(st: &mut SymbolTable) {
         Type::Unit,
         Intrinsic::None,
     );
-    method(
-        st,
-        hm,
-        "+=",
-        vec![pair.clone()],
-        hm_t.clone(),
-        Intrinsic::None,
-    );
+    method(st, hm, "+=", vec![Type::Any], hm_t.clone(), Intrinsic::None);
     let hm_mod = module(st, mutp, "HashMap", "scala/collection/mutable/HashMap$");
     let hm_cls = st.module_class_of(hm_mod);
     let hm_empty = method(

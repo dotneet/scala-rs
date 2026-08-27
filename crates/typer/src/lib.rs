@@ -3139,7 +3139,7 @@ object Main {
     val v: String = m(1)
     val o = m.get(2)
     val n = scala.collection.mutable.HashMap(1 -> "x")
-    val w: String = n(1)
+    val w = n(1)
   }
 }
 "#,
