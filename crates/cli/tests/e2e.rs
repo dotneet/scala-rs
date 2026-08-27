@@ -734,6 +734,11 @@ fn fixtures_java_cp() {
 }
 
 #[test]
+fn fixtures_java_sig() {
+    check("java_sig");
+}
+
+#[test]
 fn fixtures_native() {
     check("native");
 }

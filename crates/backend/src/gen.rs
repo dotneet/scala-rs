@@ -440,6 +440,9 @@ fn method_desc_from_sym(st: &SymbolTable, id: SymbolId) -> String {
 }
 
 fn ctor_desc(st: &SymbolTable, class_id: SymbolId, args: &[Tree]) -> String {
+    if let Some(d) = java_ctor_desc(st, class_id, args.len()) {
+        return d;
+    }
     let mut d = String::from("(");
     if let Some(outer) = enclosing_instance(st, class_id) {
         d.push_str(&format!("L{};", class_internal(st, outer)));
@@ -458,8 +461,28 @@ fn ctor_desc(st: &SymbolTable, class_id: SymbolId, args: &[Tree]) -> String {
     d
 }
 
+/// Java `<init>` descriptors come from the classfile (`(Ljava/lang/Object;…)V`),
+/// not from the Scala argument types (`String` would emit the wrong desc).
+fn java_ctor_desc(st: &SymbolTable, class_id: SymbolId, nargs: usize) -> Option<String> {
+    if class_id.is_none() || !st.get(class_id).flags.contains(Flags::JAVA) {
+        return None;
+    }
+    st.lookup_member(class_id, "<init>")
+        .into_iter()
+        .find(|&id| {
+            let s = st.get(id);
+            s.kind == SymKind::Method && s.params.len() == nargs && s.jvm_name.starts_with('(')
+        })
+        .map(|id| st.get(id).jvm_name.clone())
+}
+
 fn enclosing_instance(st: &SymbolTable, class_id: SymbolId) -> Option<SymbolId> {
     if class_id.is_none() {
+        return None;
+    }
+    // Static nested Java types (`Map$Entry`, `AbstractMap$SimpleEntry`) must
+    // not get an enclosing `this` argument.
+    if st.get(class_id).flags.contains(Flags::JAVA) {
         return None;
     }
     let owner = st.get(class_id).owner;
@@ -3758,7 +3781,19 @@ fn gen_apply(
     } else {
         Vec::new()
     };
-    gen_call_args(asm, frame, ctx, args, &param_tys, value_owner.is_some());
+    let java_varargs = !fun.sym.is_none() && {
+        let f = ctx.st.get(fun.sym).flags;
+        f.contains(Flags::JAVA) && f.contains(Flags::VARARGS)
+    };
+    gen_call_args(
+        asm,
+        frame,
+        ctx,
+        args,
+        &param_tys,
+        value_owner.is_some(),
+        java_varargs,
+    );
     if let TreeKind::Select { qual, name } = &fun.kind {
         if name == "apply" && matches!(qual.ty, Type::Array(_)) {
             let elem = match &qual.ty {
@@ -4515,9 +4550,6 @@ fn maybe_unbox_erased_result(
     desc: &str,
     result_ty: Option<&Type>,
 ) {
-    if !ctx.library_abi {
-        return;
-    }
     let Some(ty) = result_ty else {
         return;
     };
@@ -4525,7 +4557,11 @@ fn maybe_unbox_erased_result(
         return;
     }
     if is_jvm_primitive(ty) && !is_unit_like(ty) {
-        emit_unbox(asm, ty);
+        // Private-runtime Option/Iterator already emit unboxed shapes; the
+        // library ABI erases those to Object.
+        if ctx.library_abi {
+            emit_unbox(asm, ty);
+        }
         return;
     }
     if matches!(ty, Type::String) {
@@ -4537,6 +4573,10 @@ fn maybe_unbox_erased_result(
             let d = jvm_desc(ctx.st, ty);
             asm.checkcast(&d);
         }
+        return;
+    }
+    if let Some(cn) = checkcast_internal(ctx.st, ty) {
+        asm.checkcast(&cn);
     }
 }
 
@@ -4694,6 +4734,33 @@ fn is_stdlib_try_module(owner: &str) -> bool {
     )
 }
 
+fn gen_java_varargs_array(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    args: &[Tree],
+    elem: &Type,
+) {
+    let n = args.len() as i32;
+    asm.iconst(n);
+    match elem {
+        Type::String => asm.anewarray("java/lang/String"),
+        Type::Class { sym, .. } | Type::ModuleRef(sym) => {
+            asm.anewarray(&class_internal(ctx.st, *sym));
+        }
+        _ => asm.anewarray("java/lang/Object"),
+    }
+    for (i, a) in args.iter().enumerate() {
+        asm.dup();
+        asm.iconst(i as i32);
+        gen_expr(asm, frame, ctx, a);
+        if is_jvm_primitive(&a.ty) {
+            emit_box(asm, &a.ty);
+        }
+        asm.aastore();
+    }
+}
+
 fn gen_wrap_varargs(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -4753,6 +4820,7 @@ fn gen_call_args(
     args: &[Tree],
     param_tys: &[Type],
     box_prims: bool,
+    java_varargs: bool,
 ) {
     let rep_idx = param_tys
         .iter()
@@ -4784,7 +4852,11 @@ fn gen_call_args(
         Type::Repeated(t) => t.as_ref(),
         _ => &Type::Any,
     };
-    gen_wrap_varargs(asm, frame, ctx, var_args, elem);
+    if java_varargs {
+        gen_java_varargs_array(asm, frame, ctx, var_args, elem);
+    } else {
+        gen_wrap_varargs(asm, frame, ctx, var_args, elem);
+    }
     for a in &args[var_end..] {
         gen_expr(asm, frame, ctx, a);
     }
