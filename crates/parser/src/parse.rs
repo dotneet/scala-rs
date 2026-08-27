@@ -3401,6 +3401,7 @@ impl<'a> Parser<'a> {
             self.skip_nl();
             match self.kind().clone() {
                 TokenKind::Ident(n) if n == ">" || n == "/>" || n == "</" || n == "<" => break,
+                TokenKind::Ident(n) if n == "&" || n == "&#" || n.starts_with('&') => break,
                 TokenKind::Eof => break,
                 TokenKind::Ident(n) if xml_unsupported_markup(&n).is_some() => {
                     let what = xml_unsupported_markup(&n).unwrap();

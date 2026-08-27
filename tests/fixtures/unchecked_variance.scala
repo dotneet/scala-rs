@@ -13,6 +13,7 @@ class Box[+A](val inner: Inv[A @uncheckedVariance]) {
 object Main {
   def main(args: Array[String]): Unit = {
     println(new Q[Int].enqueue(1))
-    println(new Box(new Inv(41)).get)
+    val b: Box[Int] = new Box(new Inv(41))
+    println(b.get)
   }
 }

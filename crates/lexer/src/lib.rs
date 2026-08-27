@@ -304,8 +304,9 @@ impl<'a> Lexer<'a> {
         }
         while self.peek().is_some_and(is_op_char) {
             let sofar = &self.src[start..self.pos];
-            // XML closers must not glue to the next tag: `><!--`, `--></`, `?></`.
-            if sofar.ends_with('>') && self.peek() == Some('<') {
+            // XML closers must not glue to the next tag or entity: `><!--`,
+            // `--></`, `?></`, `>&amp;`.
+            if sofar.ends_with('>') && matches!(self.peek(), Some('<' | '&')) {
                 break;
             }
             self.bump();
@@ -895,6 +896,15 @@ mod tests {
         assert_eq!(
             kinds("&amp;"),
             vec![Ident("&".into()), Ident("amp".into()), Semi]
+        );
+        assert_eq!(
+            kinds(">&amp;"),
+            vec![
+                Ident(">".into()),
+                Ident("&".into()),
+                Ident("amp".into()),
+                Semi
+            ]
         );
     }
 }

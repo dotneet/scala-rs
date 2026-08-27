@@ -1991,7 +1991,17 @@ impl Typer {
                     tree.sym = tpt.sym;
                     return;
                 }
-                if let TreeKind::Ident { name } = &tpt.kind {
+                if matches!(
+                    &tpt.kind,
+                    TreeKind::AppliedTypeTree { .. }
+                        | TreeKind::TypeApply { .. }
+                        | TreeKind::AnnotatedTypeTree { .. }
+                ) {
+                    tpt.ty = self.tree_to_type(tpt);
+                    if let Some(id) = self.st.class_sym_of(&tpt.ty) {
+                        tpt.sym = id;
+                    }
+                } else if let TreeKind::Ident { name } = &tpt.kind {
                     let n = name.clone();
                     let found = self.st.lookup(&n);
                     if let Some(id) = found
@@ -2036,6 +2046,20 @@ impl Typer {
                                     sym: id,
                                     args: vec![],
                                 };
+                            }
+                        }
+                    }
+                }
+                // nsc infers `new Q` as `Q[Int]` when the expected type is `Q[Int]`.
+                if let Type::Class { args, sym } = &tree.ty {
+                    if args.is_empty() {
+                        if let Type::Class {
+                            args: pt_args,
+                            sym: pt_sym,
+                        } = pt
+                        {
+                            if *sym == *pt_sym && !pt_args.is_empty() {
+                                tree.ty = pt.clone();
                             }
                         }
                     }
@@ -3116,7 +3140,7 @@ impl Typer {
         };
         // new C(args)
         if matches!(&fun.kind, TreeKind::New { .. }) {
-            self.type_expr(fun, &Type::NoType);
+            self.type_expr(fun, pt);
             if let Some(elem) = array_elem_of(&fun.ty) {
                 if needs_classtag_elem(&elem) {
                     self.rewrite_generic_array_new(tree, elem);
@@ -3151,9 +3175,17 @@ impl Typer {
             let tps = class_id
                 .map(|c| self.st.get(c).tparams.clone())
                 .unwrap_or_default();
-            // Do not adapt constructor arguments to raw type parameters
-            // (`A`) before those parameters are inferred from the arguments.
-            let infer = !tps.is_empty();
+            // Keep explicit `new C[T](…)` args; otherwise infer. Do not adapt
+            // constructor arguments to raw type parameters (`A`) first.
+            let explicit: Vec<Type> = match &fun.ty {
+                Type::Class { args, .. }
+                    if !args.is_empty() && (tps.is_empty() || args.len() == tps.len()) =>
+                {
+                    args.clone()
+                }
+                _ => Vec::new(),
+            };
+            let infer = !tps.is_empty() && explicit.is_empty();
             for (i, a) in args.iter_mut().enumerate() {
                 let p = if infer {
                     Type::NoType
@@ -3164,11 +3196,25 @@ impl Typer {
             }
             let mut inferred_args: Vec<Type> = Vec::new();
             if let Some(c) = class_id {
-                if infer {
+                if !explicit.is_empty() {
+                    inferred_args = explicit;
+                    tree.ty = Type::Class {
+                        sym: c,
+                        args: inferred_args.clone(),
+                    };
+                    fun.ty = tree.ty.clone();
+                } else if infer {
                     let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
-                    for tp in &tps {
-                        inferred_args
-                            .push(unify_tparam(*tp, &ctor_params, &arg_tys).unwrap_or(Type::Any));
+                    let pt_args: &[Type] = match pt {
+                        Type::Class { args: a, sym } if *sym == c => a.as_slice(),
+                        _ => &[],
+                    };
+                    for (i, tp) in tps.iter().enumerate() {
+                        inferred_args.push(
+                            unify_tparam(*tp, &ctor_params, &arg_tys)
+                                .or_else(|| pt_args.get(i).cloned())
+                                .unwrap_or(Type::Any),
+                        );
                     }
                     tree.ty = Type::Class {
                         sym: c,
@@ -5073,6 +5119,20 @@ impl Typer {
                     None => Type::Error,
                 }
             }
+            TreeKind::TypeApply { fun, args } => {
+                // `new C[T]` in term position may be TypeApply; treat it as a type.
+                let mut as_ = Vec::new();
+                for a in args {
+                    as_.push(self.tree_to_type(a));
+                }
+                match fun.name() {
+                    Some("Array") => {
+                        Type::Array(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
+                    }
+                    Some(n) => self.resolve_type_name(n, &as_),
+                    None => Type::Error,
+                }
+            }
             TreeKind::Literal { lit } => Type::Constant(lit.clone()),
             TreeKind::TypeDef {
                 name,
@@ -6747,7 +6807,11 @@ fn unify_tparam(tp: SymbolId, params: &[Type], args: &[Type]) -> Option<Type> {
 }
 
 fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
+    if let Type::Annotated { tpe, .. } = actual {
+        return unify_one(tp, pattern, tpe);
+    }
     match pattern {
+        Type::Annotated { tpe, .. } => unify_one(tp, tpe, actual),
         Type::TypeParam(id) if *id == tp => Some(actual.widen_constant()),
         Type::Class { args: pas, .. } => {
             if let Type::Class { args: aas, .. } = actual {
