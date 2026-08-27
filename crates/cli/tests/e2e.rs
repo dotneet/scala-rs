@@ -894,6 +894,21 @@ fn fixtures_string_ops12_bad_is_error() {
 }
 
 #[test]
+fn fixtures_placeholder3_bad_is_error() {
+    compile_fails("placeholder3_bad", "unbound placeholder parameter");
+}
+
+#[test]
+fn fixtures_array_ops7_bad_is_error() {
+    compile_fails_lib("array_ops7_bad", "noSuchHead is not a member");
+}
+
+#[test]
+fn fixtures_string_ops13_bad_is_error() {
+    compile_fails_lib("string_ops13_bad", "noSuchPartition is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1639,6 +1654,21 @@ fn scala_library_dual_run_array_ops6() {
 #[test]
 fn scala_library_dual_run_string_ops12() {
     dual_run_fixture("string_ops12");
+}
+
+#[test]
+fn scala_library_dual_run_placeholder3() {
+    dual_run_fixture("placeholder3");
+}
+
+#[test]
+fn scala_library_dual_run_array_ops7() {
+    dual_run_fixture("array_ops7");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops13() {
+    dual_run_fixture("string_ops13");
 }
 
 #[test]

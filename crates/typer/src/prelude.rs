@@ -268,17 +268,27 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     );
     let _ = class(st, st.scala_pkg, "Tuple3", "scala/Tuple3", &[Type::AnyRef]);
     if let Some(so) = string_ops {
+        let pair = Type::Class {
+            sym: tuple2,
+            args: vec![Type::String, Type::String],
+        };
         method(
             st,
             so,
             "span",
             vec![fn1(Type::Char, Type::Boolean)],
-            Type::Class {
-                sym: tuple2,
-                args: vec![Type::String, Type::String],
-            },
+            pair.clone(),
             Intrinsic::None,
         );
+        method(
+            st,
+            so,
+            "partition",
+            vec![fn1(Type::Char, Type::Boolean)],
+            pair.clone(),
+            Intrinsic::None,
+        );
+        method(st, so, "splitAt", vec![Type::Int], pair, Intrinsic::None);
     }
 
     // Marker trait `scala.Dynamic`. JVM interface lives in scala-library.jar;
@@ -1419,6 +1429,22 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
         "count",
         vec![fn1(Type::Char, Type::Boolean)],
         Type::Int,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "exists",
+        vec![fn1(Type::Char, Type::Boolean)],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "forall",
+        vec![fn1(Type::Char, Type::Boolean)],
+        Type::Boolean,
         Intrinsic::None,
     );
     so
@@ -3717,6 +3743,42 @@ fn add_predef_members(
             Intrinsic::Identity,
         );
         st.get_mut(wrap_f).flags = st.get(wrap_f).flags.with(Flags::IMPLICIT);
+        let wrap_d = method(
+            st,
+            owner,
+            "doubleArrayOps",
+            vec![Type::Array(Box::new(Type::Double))],
+            Type::Class {
+                sym: aops,
+                args: vec![Type::Double],
+            },
+            Intrinsic::Identity,
+        );
+        st.get_mut(wrap_d).flags = st.get(wrap_d).flags.with(Flags::IMPLICIT);
+        let wrap_bool = method(
+            st,
+            owner,
+            "booleanArrayOps",
+            vec![Type::Array(Box::new(Type::Boolean))],
+            Type::Class {
+                sym: aops,
+                args: vec![Type::Boolean],
+            },
+            Intrinsic::Identity,
+        );
+        st.get_mut(wrap_bool).flags = st.get(wrap_bool).flags.with(Flags::IMPLICIT);
+        let wrap_u = method(
+            st,
+            owner,
+            "unitArrayOps",
+            vec![Type::Array(Box::new(Type::Unit))],
+            Type::Class {
+                sym: aops,
+                args: vec![Type::Unit],
+            },
+            Intrinsic::Identity,
+        );
+        st.get_mut(wrap_u).flags = st.get(wrap_u).flags.with(Flags::IMPLICIT);
         let wrap_ref = method(
             st,
             owner,
