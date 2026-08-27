@@ -49,17 +49,16 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         "java/lang/Double",
         &[Type::AnyVal],
     );
-    let char_s = class(
+    st.char_sym = class(
         st,
         st.scala_pkg,
         "Char",
         "java/lang/Character",
         &[Type::AnyVal],
     );
-    let _ = char_s;
     st.byte_sym = class(st, st.scala_pkg, "Byte", "scala/Byte", &[Type::AnyVal]);
     st.short_sym = class(st, st.scala_pkg, "Short", "scala/Short", &[Type::AnyVal]);
-    // nsc `Byte.+` / `Short.+` return Int; used by `Array[Byte].map(_ + 1)`.
+    // nsc `Byte.+` / `Short.+` / `Char.+` return Int; used by ArrayOps.map(_ + 1).
     method(
         st,
         st.byte_sym,
@@ -71,6 +70,14 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     method(
         st,
         st.short_sym,
+        "+",
+        vec![Type::Int],
+        Type::Int,
+        Intrinsic::IntBin("+"),
+    );
+    method(
+        st,
+        st.char_sym,
         "+",
         vec![Type::Int],
         Type::Int,
@@ -260,6 +267,19 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         Intrinsic::None,
     );
     let _ = class(st, st.scala_pkg, "Tuple3", "scala/Tuple3", &[Type::AnyRef]);
+    if let Some(so) = string_ops {
+        method(
+            st,
+            so,
+            "span",
+            vec![fn1(Type::Char, Type::Boolean)],
+            Type::Class {
+                sym: tuple2,
+                args: vec![Type::String, Type::String],
+            },
+            Intrinsic::None,
+        );
+    }
 
     // Marker trait `scala.Dynamic`. JVM interface lives in scala-library.jar;
     // we only need the symbol so `class D extends Dynamic` typechecks.
@@ -1383,6 +1403,22 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
             args: vec![],
         }],
         Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "updated",
+        vec![Type::Int, Type::Char],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "count",
+        vec![fn1(Type::Char, Type::Boolean)],
+        Type::Int,
         Intrinsic::None,
     );
     so
@@ -3657,6 +3693,30 @@ fn add_predef_members(
             Intrinsic::Identity,
         );
         st.get_mut(wrap_s).flags = st.get(wrap_s).flags.with(Flags::IMPLICIT);
+        let wrap_c = method(
+            st,
+            owner,
+            "charArrayOps",
+            vec![Type::Array(Box::new(Type::Char))],
+            Type::Class {
+                sym: aops,
+                args: vec![Type::Char],
+            },
+            Intrinsic::Identity,
+        );
+        st.get_mut(wrap_c).flags = st.get(wrap_c).flags.with(Flags::IMPLICIT);
+        let wrap_f = method(
+            st,
+            owner,
+            "floatArrayOps",
+            vec![Type::Array(Box::new(Type::Float))],
+            Type::Class {
+                sym: aops,
+                args: vec![Type::Float],
+            },
+            Intrinsic::Identity,
+        );
+        st.get_mut(wrap_f).flags = st.get(wrap_f).flags.with(Flags::IMPLICIT);
         let wrap_ref = method(
             st,
             owner,

@@ -876,6 +876,24 @@ fn fixtures_string_ops11_bad_is_error() {
 }
 
 #[test]
+fn fixtures_placeholder2_bad_is_error() {
+    compile_fails(
+        "placeholder2_bad",
+        "missing parameter type for expanded function",
+    );
+}
+
+#[test]
+fn fixtures_array_ops6_bad_is_error() {
+    compile_fails_lib("array_ops6_bad", "noSuchHead is not a member");
+}
+
+#[test]
+fn fixtures_string_ops12_bad_is_error() {
+    compile_fails_lib("string_ops12_bad", "noSuchUpdated is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1606,6 +1624,21 @@ fn scala_library_dual_run_array_ops5() {
 #[test]
 fn scala_library_dual_run_string_ops11() {
     dual_run_fixture("string_ops11");
+}
+
+#[test]
+fn scala_library_dual_run_placeholder2() {
+    dual_run_fixture("placeholder2");
+}
+
+#[test]
+fn scala_library_dual_run_array_ops6() {
+    dual_run_fixture("array_ops6");
+}
+
+#[test]
+fn scala_library_dual_run_string_ops12() {
+    dual_run_fixture("string_ops12");
 }
 
 #[test]

@@ -955,4 +955,27 @@ object Main {
             r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn placeholder_function2_and_nested_sections_parse() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val add: (Int, Int) => Int = _ + _
+    val nest: Array[Int] => Array[Int] = _.map(_ + 1)
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        let n = dump
+            .lines()
+            .filter(|l| l.trim_start().starts_with("Function"))
+            .count();
+        assert!(
+            n >= 3,
+            "Function2 `_ + _` plus nested `_.map(_ + 1)` need three Function nodes, got {n}: {dump}"
+        );
+    }
 }

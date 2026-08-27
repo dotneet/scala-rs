@@ -4421,9 +4421,9 @@ impl Typer {
         // wait for an expected Function type (for-comprehension desugaring).
         let mut arg_tys = Vec::new();
         for a in args.iter_mut() {
-            if matches!(a.kind, TreeKind::Function { .. }) {
+            if let TreeKind::Function { vparams, .. } = &a.kind {
                 arg_tys.push(Type::Function {
-                    params: vec![Type::NoType],
+                    params: vec![Type::NoType; vparams.len()],
                     ret: Box::new(Type::NoType),
                 });
             } else {
@@ -5729,6 +5729,15 @@ impl Typer {
                 }
                 _ => (vec![Type::NoType; vparams.len()], Type::NoType),
             }
+        };
+        // nsc: expected FunctionN / SAM param types apply only when the
+        // expanded section's arity matches. `_ + _` against `Int => Int`
+        // (or `_ + 1` against `(Int, Int) => Int`) leaves every param unknown
+        // (`missing parameter type for expanded function`) and then mismatches.
+        let (pts, ret_pt) = if pts.len() == vparams.len() {
+            (pts, ret_pt)
+        } else {
+            (vec![Type::NoType; vparams.len()], Type::NoType)
         };
         self.st.push_scope();
         let mut param_tys = Vec::new();
