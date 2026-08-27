@@ -583,11 +583,16 @@ impl Typer {
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
-            TreeKind::DefDef { name, mods, .. } => {
+            TreeKind::DefDef { name, mods, rhs, .. } => {
                 let annots = mods.annotations.clone();
+                let flags = if rhs.is_empty() {
+                    mods.flags.with(Flags::ABSTRACT)
+                } else {
+                    mods.flags
+                };
                 let id = self
                     .st
-                    .alloc(name, self.st.owner, SymKind::Method, mods.flags, "");
+                    .alloc(name, self.st.owner, SymKind::Method, flags, "");
                 self.st.get_mut(id).private_within = mods.private_within.clone();
                 self.st.get_mut(id).annotations = annots;
                 self.st.enter_in_current(name, id);
@@ -4402,12 +4407,19 @@ impl Typer {
 
     fn type_function(&mut self, vparams: &mut Vec<Tree>, body: &mut Tree, pt: &Type) -> Type {
         let pf_result = partial_function_type(&self.st, pt);
+        let sam = if pf_result.is_none() {
+            self.st.sam_sig(pt)
+        } else {
+            None
+        };
         let (pts, ret_pt) = if let Some((from, to)) = &pf_result {
             (vec![from.clone()], to.clone())
+        } else if let Some(sam) = &sam {
+            (sam.param_tys.clone(), sam.ret_ty.clone())
         } else {
             match pt {
                 Type::Function { params, ret } => (params.clone(), (**ret).clone()),
-                Type::Named { name, args } if name.starts_with("Function") => {
+                Type::Named { name, args } if name.starts_with("Function") && name != "Function" => {
                     if args.is_empty() {
                         (vec![Type::NoType; vparams.len()], Type::NoType)
                     } else {
@@ -4455,6 +4467,8 @@ impl Typer {
         };
         self.st.pop_scope();
         if pf_result.is_some() {
+            pt.clone()
+        } else if sam.is_some() && param_tys.len() == pts.len() {
             pt.clone()
         } else {
             Type::Function {
@@ -5106,6 +5120,16 @@ impl Typer {
                     Type::String
                 } else if self.type_select_is_term_prefix(qual) {
                     self.path_dependent_type(tpt.span, qual, name)
+                } else if let Some(id) = self.lookup_qualified_type(qual, name) {
+                    match self.st.get(id).kind {
+                        SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
+                        SymKind::TypeParam => Type::TypeParam(id),
+                        SymKind::TypeMember => Type::TypeMember(id),
+                        _ => Type::Class {
+                            sym: id,
+                            args: vec![],
+                        },
+                    }
                 } else {
                     self.resolve_type_name(name, &[])
                 }
@@ -5159,7 +5183,7 @@ impl Typer {
                         sym: self.st.some_sym,
                         args: as_,
                     },
-                    Some(n) if n.starts_with("Function") => {
+                    Some(n) if n.starts_with("Function") && n != "Function" => {
                         if as_.is_empty() {
                             Type::Function {
                                 params: vec![],
@@ -5173,8 +5197,15 @@ impl Typer {
                             }
                         }
                     }
+                    Some("Function") => match self.tree_to_type(tpt) {
+                        Type::Class { sym, .. } => Type::Class { sym, args: as_ },
+                        _ => self.resolve_type_name("Function", &as_),
+                    },
                     Some(n) if n.starts_with("Tuple") => Type::Tuple(as_),
-                    Some(n) => self.resolve_type_name(n, &as_),
+                    Some(n) => match self.tree_to_type(tpt) {
+                        Type::Class { sym, .. } => Type::Class { sym, args: as_ },
+                        _ => self.resolve_type_name(n, &as_),
+                    },
                     None => Type::Error,
                 }
             }
@@ -5799,6 +5830,42 @@ impl Typer {
         false
     }
 
+    fn lookup_qualified_type(&self, prefix: &Tree, name: &str) -> Option<SymbolId> {
+        let owner = self.qualified_type_owner(prefix)?;
+        self.st.lookup_member(owner, name).into_iter().find(|s| {
+            matches!(
+                self.st.get(*s).kind,
+                SymKind::Class
+                    | SymKind::Package
+                    | SymKind::Module
+                    | SymKind::ModuleClass
+                    | SymKind::TypeMember
+                    | SymKind::TypeParam
+            )
+        })
+    }
+
+    fn qualified_type_owner(&self, t: &Tree) -> Option<SymbolId> {
+        match &t.kind {
+            TreeKind::Ident { name } => self.st.lookup(name).into_iter().find(|id| {
+                matches!(
+                    self.st.get(*id).kind,
+                    SymKind::Package | SymKind::Class | SymKind::Module | SymKind::ModuleClass
+                )
+            }),
+            TreeKind::Select { qual, name } => {
+                let owner = self.qualified_type_owner(qual)?;
+                self.st.lookup_member(owner, name).into_iter().find(|id| {
+                    matches!(
+                        self.st.get(*id).kind,
+                        SymKind::Package | SymKind::Class | SymKind::Module | SymKind::ModuleClass
+                    )
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn resolve_type_name(&self, name: &str, args: &[Type]) -> Type {
         match name {
             "Int" => Type::Int,
@@ -5915,7 +5982,7 @@ impl Typer {
             return;
         }
         if let Type::Method { paramss, ret } = &tree.ty {
-            if is_function_pt(pt) {
+            if is_function_pt(pt) || self.st.sam_sig(pt).is_some() {
                 let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
                 let ret = (**ret).clone();
                 eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
@@ -5923,6 +5990,9 @@ impl Typer {
                     return;
                 }
             }
+        }
+        if self.adapt_to_sam(tree, pt) {
+            return;
         }
         match self.search_conversion(&tree.ty, pt) {
             ImplicitSearch::Found(id) => {
@@ -5961,6 +6031,31 @@ impl Typer {
             ),
         );
         tree.ty = Type::Error;
+    }
+
+    fn adapt_to_sam(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        let Some(sam) = self.st.sam_sig(pt) else {
+            return false;
+        };
+        let Type::Function { params, ret } = &tree.ty else {
+            return false;
+        };
+        if params.len() != sam.param_tys.len() {
+            return false;
+        }
+        if !ret.is_no_type() && !self.st.is_sub_type(ret, &sam.ret_ty) {
+            return false;
+        }
+        for (have, want) in params.iter().zip(sam.param_tys.iter()) {
+            if have.is_no_type() {
+                continue;
+            }
+            if !self.st.is_sub_type(want, have) && !self.st.is_sub_type(have, want) {
+                return false;
+            }
+        }
+        tree.ty = pt.clone();
+        true
     }
 
     fn adapt_singleton(&self, tree: &mut Tree, pt: &Type) -> bool {
@@ -6210,6 +6305,23 @@ impl Typer {
                     self.check_java_override(tree);
                 }
             }
+            if is_inline_annot(&path) || is_noinline_annot(&path) {
+                if !matches!(&tree.kind, TreeKind::DefDef { .. }) {
+                    let simple = path.rsplit('.').next().unwrap_or(path.as_str());
+                    self.error(
+                        tree.span,
+                        format!("@{simple} is only supported on methods"),
+                    );
+                }
+            }
+        }
+        let has_inline = mods.annotations.iter().any(|a| is_inline_annot(&a.annotation_path()));
+        let has_noinline = mods
+            .annotations
+            .iter()
+            .any(|a| is_noinline_annot(&a.annotation_path()));
+        if has_inline && has_noinline {
+            self.error(tree.span, "@inline and @noinline cannot be used together");
         }
     }
 
@@ -6392,6 +6504,14 @@ fn is_tailrec_annot(path: &str) -> bool {
         path,
         "tailrec" | "annotation.tailrec" | "scala.annotation.tailrec"
     )
+}
+
+fn is_inline_annot(path: &str) -> bool {
+    matches!(path, "inline" | "scala.inline")
+}
+
+fn is_noinline_annot(path: &str) -> bool {
+    matches!(path, "noinline" | "scala.noinline")
 }
 
 fn is_override_annot(path: &str) -> bool {
@@ -6660,7 +6780,9 @@ fn f_kind_name(kind: scala_rs_parser::finterp::FConvKind) -> &'static str {
 fn is_function_pt(pt: &Type) -> bool {
     match pt {
         Type::Function { .. } => true,
-        Type::Named { name, .. } if name.starts_with("Function") || name == "PartialFunction" => {
+        Type::Named { name, .. }
+            if (name.starts_with("Function") && name != "Function") || name == "PartialFunction" =>
+        {
             true
         }
         _ => false,

@@ -277,6 +277,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_enumeration(st);
     }
     add_annotation_pkg(st);
+    add_java_sam(st, java, java_lang);
 
     let arrow = if library_abi {
         let a = class(
@@ -346,6 +347,46 @@ fn mark_java(st: &mut SymbolTable, id: SymbolId) {
     st.get_mut(id).flags = f;
 }
 
+/// SIP-21 Java SAM types: `Runnable`, `Comparator[T]`, `java.util.function.Function`.
+fn add_java_sam(st: &mut SymbolTable, java: SymbolId, java_lang: SymbolId) {
+    let runnable = iface(st, java_lang, "Runnable", "java/lang/Runnable");
+    mark_java(st, runnable);
+    let run = st.alloc("run", runnable, SymKind::Method, Flags::ABSTRACT, "");
+    st.get_mut(run).ty = Type::Method {
+        paramss: Vec::new(),
+        ret: Box::new(Type::Unit),
+    };
+
+    let util = st.alloc("util", java, SymKind::Package, Flags::PACKAGE, "java/util");
+    let comparator = iface(st, util, "Comparator", "java/util/Comparator");
+    mark_java(st, comparator);
+    let ct = type_param(st, comparator, "T");
+    st.get_mut(comparator).tparams = vec![ct];
+    let cmp = st.alloc("compare", comparator, SymKind::Method, Flags::ABSTRACT, "");
+    st.get_mut(cmp).ty = Type::Method {
+        paramss: vec![vec![Type::TypeParam(ct), Type::TypeParam(ct)]],
+        ret: Box::new(Type::Int),
+    };
+
+    let fn_pkg = st.alloc(
+        "function",
+        util,
+        SymKind::Package,
+        Flags::PACKAGE,
+        "java/util/function",
+    );
+    let jfun = iface(st, fn_pkg, "Function", "java/util/function/Function");
+    mark_java(st, jfun);
+    let ft = type_param(st, jfun, "T");
+    let fr = type_param(st, jfun, "R");
+    st.get_mut(jfun).tparams = vec![ft, fr];
+    let apply = st.alloc("apply", jfun, SymKind::Method, Flags::ABSTRACT, "");
+    st.get_mut(apply).ty = Type::Method {
+        paramss: vec![vec![Type::TypeParam(ft)]],
+        ret: Box::new(Type::TypeParam(fr)),
+    };
+}
+
 fn add_annotation_pkg(st: &mut SymbolTable) {
     let pkg = st.alloc(
         "annotation",
@@ -411,6 +452,19 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
             args: vec![],
         }],
     );
+    let static_t = Type::Class {
+        sym: static_annot,
+        args: vec![],
+    };
+    // nsc: `scala.inline` / `scala.noinline` / `scala.volatile` / `scala.transient`
+    for (name, jvm) in [
+        ("inline", "scala/inline"),
+        ("noinline", "scala/noinline"),
+        ("volatile", "scala/volatile"),
+        ("transient", "scala/transient"),
+    ] {
+        let _ = abs_class(st, st.scala_pkg, name, jvm, &[static_t.clone()]);
+    }
 }
 
 fn class(

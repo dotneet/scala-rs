@@ -562,6 +562,76 @@ object M {
     }
 
     #[test]
+    fn inline_volatile_transient_parse() {
+        let t = parse_ok(
+            r#"
+object M {
+  @inline def f(): Int = 1
+  @noinline def g(): Int = 2
+  @volatile var x: Int = 0
+  @transient var y: Int = 1
+}
+"#,
+        );
+        fn find_member<'a>(t: &'a Tree, want: &str) -> Option<&'a Tree> {
+            match &t.kind {
+                TreeKind::PackageDef { stats, .. } => {
+                    stats.iter().find_map(|s| find_member(s, want))
+                }
+                TreeKind::ModuleDef { impl_, .. } | TreeKind::ClassDef { impl_, .. } => {
+                    impl_.body.iter().find_map(|s| match &s.kind {
+                        TreeKind::DefDef { name, .. } | TreeKind::ValDef { name, .. }
+                            if name == want =>
+                        {
+                            Some(s)
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            }
+        }
+        match &find_member(&t, "f").expect("f").kind {
+            TreeKind::DefDef { mods, .. } => {
+                assert_eq!(mods.annotations[0].annotation_path(), "inline");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &find_member(&t, "x").expect("x").kind {
+            TreeKind::ValDef { mods, .. } => {
+                assert!(mods.flags.contains(Flags::VOLATILE), "{mods:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &find_member(&t, "y").expect("y").kind {
+            TreeKind::ValDef { mods, .. } => {
+                assert!(mods.flags.contains(Flags::TRANSIENT), "{mods:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_then_select_assign_is_two_stats() {
+        let t = parse_ok(
+            r#"
+class Box { var x: Int = 0 }
+object Main {
+  def main(args: Array[String]): Unit = {
+    val b = new Box
+    b.x = 3
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(
+            dump.contains("Assign") && dump.contains("Select x"),
+            "expected `b.x = 3` after `new Box`, got {dump}"
+        );
+    }
+
+    #[test]
     fn java_override_and_deprecated_annotations_parse() {
         let t = parse_ok(
             r#"

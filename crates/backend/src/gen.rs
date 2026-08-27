@@ -3,6 +3,7 @@
 use crate::classfile::{
     encode_method_name, ClassEmit, EmittedClass, Field, Method, Pool, ACC_ABSTRACT, ACC_BRIDGE,
     ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC,
+    ACC_TRANSIENT, ACC_VOLATILE,
 };
 use crate::code::Assembler;
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
@@ -758,6 +759,12 @@ fn field_access_flags(mods: Flags) -> u16 {
     };
     if !mods.contains(Flags::MUTABLE) {
         acc |= ACC_FINAL;
+    }
+    if mods.contains(Flags::VOLATILE) {
+        acc |= ACC_VOLATILE;
+    }
+    if mods.contains(Flags::TRANSIENT) {
+        acc |= ACC_TRANSIENT;
     }
     acc
 }
@@ -5397,8 +5404,11 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
     let lam_name = format!("{}$$anonfun${}", ctx.class_name.replace('/', "$"), n);
     let arity = vparams.len();
     let is_pf = is_partial_function_ty(ctx.st, &tree.ty);
+    let sam = ctx.st.sam_sig(&tree.ty);
     let iface = if is_pf {
         "scala/PartialFunction".to_string()
+    } else if let Some(sam) = &sam {
+        class_internal(ctx.st, sam.class)
     } else {
         format!("scala/Function{arity}")
     };
@@ -5497,6 +5507,18 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
         apply_desc.push_str("Ljava/lang/Object;");
     }
     apply_desc.push_str(")Ljava/lang/Object;");
+    let sam_emit = sam.as_ref().map(|s| {
+        (
+            s.name.clone(),
+            jvm_method_desc(ctx.st, &s.raw_param_tys, &s.raw_ret_ty),
+            s.raw_ret_ty.clone(),
+        )
+    });
+    let (meth_name, meth_desc) = if let Some((n, d, _)) = &sam_emit {
+        (n.as_str(), d.as_str())
+    } else {
+        ("apply", apply_desc.as_str())
+    };
 
     let st = ctx.st;
     let extras = ctx.extras;
@@ -5515,6 +5537,8 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
     let local_caps_pf = local_caps.clone();
     let ret_ty = if is_pf {
         body.ty.clone()
+    } else if let Some(sam) = &sam {
+        sam.ret_ty.clone()
     } else {
         match &tree.ty {
             Type::Function { ret, .. } => (**ret).clone(),
@@ -5522,8 +5546,11 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
         }
     };
     let ret_ty_pf = ret_ty.clone();
+    let sam_ret = sam_emit.as_ref().map(|(_, _, r)| r.clone());
+    let meth_name_owned = meth_name.to_string();
+    let meth_desc_owned = meth_desc.to_string();
 
-    b.add_code(ACC_PUBLIC, "apply", &apply_desc, 8, |a| {
+    b.add_code(ACC_PUBLIC, &meth_name_owned, &meth_desc_owned, 8, |a| {
         let mut fr = Frame::instance();
         fr.next_slot = 1 + arity as u16;
         // apply args occupy slots 1..arity as Object; remap param symbols after unbox
@@ -5577,13 +5604,26 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             method_sym: SymbolId::NONE,
         };
         gen_expr(a, &mut fr, &inner_ctx, &body);
-        if is_unit_like(&ret_ty) {
+        if let Some(raw_ret) = &sam_ret {
+            if is_unit_like(raw_ret) {
+                pop_if_value(a, &body.ty);
+                a.vreturn();
+            } else if is_jvm_primitive(raw_ret) {
+                emit_return(a, raw_ret);
+            } else {
+                if is_jvm_primitive(&ret_ty) && !is_unit_like(&ret_ty) {
+                    emit_box(a, &ret_ty);
+                }
+                a.areturn();
+            }
+        } else if is_unit_like(&ret_ty) {
             pop_if_value(a, &body.ty);
             emit_box(a, &Type::Unit);
+            a.areturn();
         } else {
             emit_box(a, &ret_ty);
+            a.areturn();
         }
-        a.areturn();
     });
     if is_pf {
         emit_partial_function_methods(

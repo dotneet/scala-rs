@@ -56,6 +56,10 @@ impl Flags {
     pub const VARARGS: Flags = Flags(1 << 25);
     /// nsc `PRESUPER`: early field defs (`class C extends { val x = 1 } with T`).
     pub const PRESUPER: Flags = Flags(1 << 26);
+    /// JVM `ACC_VOLATILE` (`@volatile` fields).
+    pub const VOLATILE: Flags = Flags(1 << 27);
+    /// JVM `ACC_TRANSIENT` (`@transient` fields).
+    pub const TRANSIENT: Flags = Flags(1 << 28);
 
     pub fn contains(self, f: Flags) -> bool {
         self.0 & f.0 != 0

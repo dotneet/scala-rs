@@ -13,7 +13,7 @@ pub use check::{
 };
 pub use erasure::{erase, erase_type};
 pub use lambda_lift::lambda_lift;
-pub use symbol::{Intrinsic, SymKind, Symbol, SymbolTable};
+pub use symbol::{Intrinsic, SamSig, SymKind, Symbol, SymbolTable};
 pub use uncurry::uncurry;
 
 use scala_rs_parser::{parse_str, Tree};
@@ -355,6 +355,102 @@ object Main {
         assert!(
             has_errors(&diags),
             "Left[String, String] must not conform to Either[Int, String]: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sam_runnable_and_comparator_typecheck() {
+        ok(r#"
+object Main {
+  def go(): Unit = ()
+  def cmp(a: Int, b: Int): Int = a - b
+  def main(args: Array[String]): Unit = {
+    val r: Runnable = () => ()
+    val r2: Runnable = go _
+    val c: java.util.Comparator[Int] = (a, b) => a - b
+    val c2: java.util.Comparator[Int] = cmp
+    val f: java.util.function.Function[Int, Int] = (x) => x + 1
+    r.run()
+    r2.run()
+    val n: Int = c.compare(1, 2)
+    val m: Int = f.apply(1)
+  }
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+class NotSam { def a(): Unit = (); def b(): Unit = () }
+object Main { val x: NotSam = () => () }
+"#,
+        );
+        assert!(
+            has_errors(&diags)
+                && diags.iter().any(|d| d.message.contains("type mismatch")),
+            "missing SAM must diagnose, got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait TwoAbs { def a(): Unit; def b(): Unit }
+object Main { val y: TwoAbs = () => () }
+"#,
+        );
+        assert!(
+            has_errors(&diags)
+                && diags.iter().any(|d| d.message.contains("type mismatch")),
+            "two abstract methods must not SAM-wrap, got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  def go(): Unit = ()
+  val z: Runnable = go
+}
+"#,
+        );
+        assert!(
+            has_errors(&diags)
+                && diags.iter().any(|d| d.message.contains("type mismatch")),
+            "nullary method must auto-apply, not eta to Runnable: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn inline_on_method_ok_on_val_diagnosed() {
+        ok(r#"
+object Main {
+  @inline def f(): Int = 1
+  @noinline def g(): Int = 2
+}
+"#);
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  @inline val x: Int = 1
+}
+"#,
+        );
+        assert!(
+            has_errors(&diags) && diags.iter().any(|d| d.message.contains("only supported")),
+            "expected @inline-on-val error, got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) = typecheck_str(
+            r#"
+object Main {
+  @inline @noinline def f(): Int = 1
+}
+"#,
+        );
+        assert!(
+            has_errors(&diags)
+                && diags
+                    .iter()
+                    .any(|d| d.message.contains("cannot be used together")),
+            "expected @inline/@noinline conflict, got {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

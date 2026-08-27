@@ -401,6 +401,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             }
             let ret = match &tree.ty {
                 Type::Function { ret, .. } => Some(erase_ty(ret, st)),
+                Type::Class { .. } => st.sam_sig(&tree.ty).map(|s| erase_ty(&s.ret_ty, st)),
                 _ => None,
             };
             erase_tree(body, st, ret.as_ref());
