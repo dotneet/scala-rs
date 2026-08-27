@@ -2024,6 +2024,7 @@ impl Typer {
                     TreeKind::AppliedTypeTree { .. }
                         | TreeKind::TypeApply { .. }
                         | TreeKind::AnnotatedTypeTree { .. }
+                        | TreeKind::Select { .. }
                 ) {
                     tpt.ty = self.tree_to_type(tpt);
                     if let Some(id) = self.st.class_sym_of(&tpt.ty) {
@@ -4252,7 +4253,8 @@ impl Typer {
                     let name = self.st.get(fun_sym).name.clone();
                     let owner = self.st.get(fun_sym).owner;
                     cands.clear();
-                    for m in self.st.lookup_member(owner, &name) {
+                    let methods = self.drop_overridden(self.st.lookup_member(owner, &name));
+                    for m in methods {
                         if let Type::Method { paramss, ret } = &self.st.get(m).ty {
                             cands.push((
                                 m,
@@ -4358,6 +4360,23 @@ impl Typer {
         args: &[Type],
         allow_widen: bool,
     ) -> bool {
+        let instantiated;
+        let params = if !sym.is_none() && !self.st.get(sym).tparams.is_empty() {
+            let inst = self.infer_method_tparams(sym, params, args);
+            if inst.is_empty() {
+                params
+            } else {
+                let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+                let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+                instantiated = params
+                    .iter()
+                    .map(|p| crate::symbol::subst_tparams_slice(&tps, &args_t, p))
+                    .collect::<Vec<_>>();
+                instantiated.as_slice()
+            }
+        } else {
+            params
+        };
         let (fixed, repeated) = split_repeated(params);
         if let Some(elem) = repeated {
             if args.len() < fixed.len() {
@@ -5200,6 +5219,10 @@ impl Typer {
                 self.resolve_type_name(name, &[])
             }
             TreeKind::Select { name, qual } => {
+                if let TreeKind::Ident { name: q } = &qual.kind {
+                    let q = q.clone();
+                    self.expose_unqualified(&q, tpt.span);
+                }
                 if name == "String" && !self.type_select_is_term_prefix(qual) {
                     Type::String
                 } else if self.type_select_is_term_prefix(qual) {
@@ -5932,12 +5955,15 @@ impl Typer {
 
     fn qualified_type_owner(&mut self, t: &Tree) -> Option<SymbolId> {
         match &t.kind {
-            TreeKind::Ident { name } => self.st.lookup(name).into_iter().find(|id| {
-                matches!(
-                    self.st.get(*id).kind,
-                    SymKind::Package | SymKind::Class | SymKind::Module | SymKind::ModuleClass
-                )
-            }),
+            TreeKind::Ident { name } => {
+                self.expose_unqualified(name, t.span);
+                self.st.lookup(name).into_iter().find(|id| {
+                    matches!(
+                        self.st.get(*id).kind,
+                        SymKind::Package | SymKind::Class | SymKind::Module | SymKind::ModuleClass
+                    )
+                })
+            }
             TreeKind::Select { qual, name } => {
                 let owner = self.qualified_type_owner(qual)?;
                 self.complete_binary_member(owner, name, t.span);
@@ -5961,12 +5987,15 @@ impl Typer {
             if !self.st.lookup_member(owner, name).is_empty() {
                 return;
             }
-        } else if self.st.lookup_member(owner, name).iter().any(|&id| {
+        } else if let Some(id) = self.st.lookup_member(owner, name).into_iter().find(|&id| {
             matches!(
                 self.st.get(id).kind,
                 SymKind::Class | SymKind::Package | SymKind::Module | SymKind::ModuleClass
             )
         }) {
+            if self.st.get(id).kind == SymKind::Class {
+                self.ensure_java_loaded(id, span);
+            }
             return;
         }
         let pkg_jvm = if owner == self.st.root {
@@ -5987,7 +6016,8 @@ impl Typer {
         match self.binary.find_class(&internal) {
             Ok(Some(bytes)) => match crate::javaclass::parse_java_classfile(&bytes) {
                 Ok(jc) => {
-                    crate::classpath::install_java_class(&mut self.st, &jc);
+                    let id = crate::classpath::install_java_class(&mut self.st, &jc);
+                    self.complete_java_parents(id, span);
                 }
                 Err(e) => {
                     self.error(
@@ -6039,6 +6069,15 @@ impl Typer {
         }
     }
 
+    fn complete_java_parents(&mut self, class_id: SymbolId, span: Span) {
+        let parents = self.st.get(class_id).parents.clone();
+        for p in &parents {
+            if let Some(s) = self.st.class_sym_of(p) {
+                self.ensure_java_loaded(s, span);
+            }
+        }
+    }
+
     fn ensure_java_loaded(&mut self, class_id: SymbolId, span: Span) {
         if class_id.is_none() {
             return;
@@ -6060,12 +6099,7 @@ impl Typer {
             Ok(Some(bytes)) => match crate::javaclass::parse_java_classfile(&bytes) {
                 Ok(jc) => {
                     crate::classpath::install_java_class(&mut self.st, &jc);
-                    let parents = self.st.get(class_id).parents.clone();
-                    for p in &parents {
-                        if let Some(s) = self.st.class_sym_of(p) {
-                            self.ensure_java_loaded(s, span);
-                        }
-                    }
+                    self.complete_java_parents(class_id, span);
                 }
                 Err(e) => {
                     self.error(
@@ -7093,28 +7127,12 @@ fn tree_contains_this(tree: &Tree) -> bool {
 /// are type parameters. Not used for implicit search (`is_sub_type`).
 fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
     match (arg, param) {
-        (_, Type::TypeParam(_)) | (_, Type::Wildcard) => true,
-        (a, Type::BoundedWildcard { hi: Some(h), .. }) => class_ctor_matches_typeparam_args(a, h),
-        (
-            a,
-            Type::BoundedWildcard {
-                lo: Some(l),
-                hi: None,
-            },
-        ) => class_ctor_matches_typeparam_args(a, l),
         (Type::Class { sym: sa, args: aa }, Type::Class { sym: sp, args: pa })
             if sa == sp && aa.len() == pa.len() =>
         {
             aa.iter().zip(pa.iter()).all(|(a, p)| {
                 matches!(p, Type::TypeParam(_)) || a == p || class_ctor_matches_typeparam_args(a, p)
             })
-        }
-        (Type::Class { args: aa, .. }, Type::Class { args: pa, .. })
-            if aa.len() == pa.len() && pa.iter().any(contains_inferrable_targ) =>
-        {
-            aa.iter()
-                .zip(pa.iter())
-                .all(|(a, p)| class_ctor_matches_typeparam_args(a, p))
         }
         (Type::Tuple(aa), Type::Class { args: pa, .. }) if aa.len() == pa.len() => {
             aa.iter().zip(pa.iter()).all(|(a, p)| {
@@ -7126,21 +7144,15 @@ fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
                 matches!(p, Type::TypeParam(_)) || a == p || class_ctor_matches_typeparam_args(a, p)
             })
         }
-        _ => false,
-    }
-}
-
-fn contains_inferrable_targ(ty: &Type) -> bool {
-    match ty {
-        Type::TypeParam(_) | Type::Wildcard => true,
-        Type::BoundedWildcard { lo, hi } => {
-            lo.as_ref().is_some_and(|t| contains_inferrable_targ(t))
-                || hi.as_ref().is_some_and(|t| contains_inferrable_targ(t))
-        }
-        Type::Class { args, .. } => args.iter().any(contains_inferrable_targ),
-        Type::Array(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
-            contains_inferrable_targ(t)
-        }
+        (_, Type::TypeParam(_)) => true,
+        (a, Type::BoundedWildcard { hi: Some(h), .. }) => class_ctor_matches_typeparam_args(a, h),
+        (
+            a,
+            Type::BoundedWildcard {
+                lo: Some(l),
+                hi: None,
+            },
+        ) => class_ctor_matches_typeparam_args(a, l),
         _ => false,
     }
 }
