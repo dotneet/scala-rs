@@ -616,11 +616,39 @@ object Main {
     }
 
     #[test]
-    fn xml_namespaces_are_unimplemented() {
-        let r = parse_str("object M { val x = <a p:b=\"t\"/> }\n");
+    fn xml_namespaces_desugar() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val e = "1"
+    val x = <a xmlns:p="u" p:b={e} c="t"/>
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(
+            dump.contains("PrefixedAttribute"),
+            "expected PrefixedAttribute: {dump}"
+        );
+        assert!(
+            dump.contains("NamespaceBinding"),
+            "expected NamespaceBinding: {dump}"
+        );
+        assert!(
+            dump.contains("UnprefixedAttribute"),
+            "expected UnprefixedAttribute: {dump}"
+        );
+        assert!(dump.contains("Elem"), "{dump}");
+    }
+
+    #[test]
+    fn xml_prefixed_element_is_unimplemented() {
+        let r = parse_str("object M { val x = <p:a/> }\n");
         assert!(
             r.diags.iter().any(|d| d.message.contains("XML")),
-            "expected XML namespaces diagnostic, got {:?}",
+            "expected XML prefixed-element diagnostic, got {:?}",
             r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

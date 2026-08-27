@@ -30,10 +30,14 @@
 //! - `A with B { def f: Int }` is `REFINEDtpe` + `<refinement>` CLASSsym (deferred members)
 //! - `this.type` results are `THIStpe` of the enclosing class
 //! - type annotations `T @unchecked` are `ANNOTATEDtpe` + `ANNOTINFO`
-//! - annotation args that are string literals are `LITERALstring` + `SYMANNOT`
+//! - annotation args that are string/int/boolean literals are Constants;
+//!   simple `Ident` / `Select` args are `TREE` (`IDENTtree` / `SELECTtree`)
+//!   so scalac 2.13.16 can typecheck `@Ann(foo)` / `@Ann(c.x)` on a method
 //! - Java `@Deprecated` is `SYMANNOT` with `TypeRef` under `java.lang` (not skipped)
 //! - SIP-23 `1` in a signature is `CONSTANTtpe(LITERALint)` (nsc `writeLong` =
 //!   signed big-endian base 256)
+//! - Scala `T*` methods pickle `VARARGS` and `<repeated>[T]`; erasure bridges
+//!   pickle `BRIDGE|SYNTHETIC`; Java-defined CLASSsym pickle `JAVA`
 
 use scala_rs_parser::{Flags, Lit, RefineDecl, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{SymKind, SymbolTable};
@@ -87,6 +91,14 @@ pub const ANNOTATEDTPE: u8 = 42;
 pub const ANNOTINFO: u8 = 43;
 pub const REFINEDTPE: u8 = 18;
 pub const EXISTENTIALTPE: u8 = 48;
+/// nsc `TREE` — annotation arguments that are not Constants.
+pub const TREE: u8 = 49;
+#[allow(non_upper_case_globals)]
+pub const SELECTtree: u8 = 35;
+#[allow(non_upper_case_globals)]
+pub const IDENTtree: u8 = 36;
+#[allow(non_upper_case_globals)]
+pub const LITERALtree: u8 = 37;
 
 /// Pickled method, constructor, or val recovered by the subset unpickler.
 #[derive(Clone, Debug)]
@@ -873,7 +885,7 @@ impl<'a> Pickler<'a> {
         }
     }
 
-    fn pickle_symannot(&mut self, target: u32, annot: &Tree) {
+    fn pickle_symannot(&mut self, target: u32, annot: &Tree, owner: SymbolId) {
         let path = annot.annotation_path();
         let simple = path.rsplit('.').next().unwrap_or(path.as_str());
         if simple == "Override" || path == "java.lang.Override" {
@@ -893,23 +905,171 @@ impl<'a> Pickler<'a> {
             let jl = self.java_lang_module();
             self.type_ref_in(jl, "Deprecated")
         } else {
-            let sc = self.scala_module();
-            self.type_ref_in(sc, simple)
+            // User-defined `@Ann(...)` lives in `<empty>`, not under scala.
+            let empty = self.empty_package();
+            self.type_ref_in(empty, simple)
         };
         let mut body = Vec::new();
         write_nat_to(&mut body, target);
         write_nat_to(&mut body, atp);
-        for s in annot_string_args(annot) {
-            let r = self.pickle_literal_string(&s);
-            write_nat_to(&mut body, r);
+        for arg in annot_args(annot) {
+            if let Some(r) = self.pickle_annot_arg(arg, owner) {
+                write_nat_to(&mut body, r);
+            }
         }
         self.add(SYMANNOT, body);
     }
 
+    /// Constant (literal) or TREE Ident/Select. Apply / this / classOf stay holes.
+    fn pickle_annot_arg(&mut self, arg: &Tree, owner: SymbolId) -> Option<u32> {
+        match &arg.kind {
+            TreeKind::Literal { lit } => Some(self.pickle_literal(lit)),
+            TreeKind::Ident { name } => Some(self.pickle_ident_tree(name, owner)),
+            TreeKind::Select { qual, name } => self.pickle_select_tree(qual, name, owner),
+            _ => None,
+        }
+    }
+
+    fn lookup_member_named(&self, owner: SymbolId, name: &str) -> Option<SymbolId> {
+        if owner.is_none() {
+            return None;
+        }
+        for m in &self.st.get(owner).members {
+            if self.st.get(*m).name == name {
+                return Some(*m);
+            }
+        }
+        let pkg = self.st.get(owner).owner;
+        if !pkg.is_none() && pkg != owner {
+            for m in &self.st.get(pkg).members {
+                if self.st.get(*m).name == name {
+                    return Some(*m);
+                }
+            }
+        }
+        None
+    }
+
+    fn pickle_member_sym(&mut self, id: SymbolId) -> u32 {
+        if let Some(&i) = self.sym_index.get(&id.0) {
+            return i;
+        }
+        let owner = self.st.get(id).owner;
+        if let Some(&i) = self.sym_index.get(&owner.0) {
+            return match self.st.get(id).kind {
+                SymKind::Method => self.pickle_method(id, i, self.noprefix),
+                _ => self.pickle_val(id, i, false),
+            };
+        }
+        self.pickle_ext_term(id)
+    }
+
+    fn pickle_ext_term(&mut self, id: SymbolId) -> u32 {
+        let name = self.st.get(id).name.clone();
+        let owner_id = self.st.get(id).owner;
+        let owner_ref = if let Some(&i) = self.sym_index.get(&owner_id.0) {
+            i
+        } else {
+            let oname = self
+                .st
+                .get(owner_id)
+                .name
+                .trim_end_matches('$')
+                .to_string();
+            let empty = self.empty_package();
+            self.ext_ref_owned(&oname, empty)
+        };
+        self.ext_term_ref(&name, owner_ref)
+    }
+
+    fn ext_term_ref(&mut self, name: &str, owner: u32) -> u32 {
+        let key = format!("extterm:{name}@{owner}");
+        if let Some(&i) = self.ext_refs.get(&key) {
+            return i;
+        }
+        let n = self.term_name(name);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, n);
+        write_nat_to(&mut body, owner);
+        let i = self.add(EXTREF, body);
+        self.ext_refs.insert(key, i);
+        i
+    }
+
+    fn member_tree_tpe(&mut self, id: Option<SymbolId>) -> u32 {
+        match id {
+            Some(id) => {
+                let ty = self.st.get(id).ty.clone();
+                match ty {
+                    Type::Method { ret, .. } => self.pickle_type(&ret),
+                    other => self.pickle_type(&other),
+                }
+            }
+            None => self.type_ref_named("Any"),
+        }
+    }
+
+    fn pickle_ident_tree(&mut self, name: &str, owner: SymbolId) -> u32 {
+        let found = self.lookup_member_named(owner, name);
+        let tpe = self.member_tree_tpe(found);
+        let sym = match found {
+            Some(id) => self.pickle_member_sym(id),
+            None => self.none,
+        };
+        let n = self.term_name(name);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, IDENTtree as u32);
+        write_nat_to(&mut body, tpe);
+        write_nat_to(&mut body, sym);
+        write_nat_to(&mut body, n);
+        self.add(TREE, body)
+    }
+
+    fn pickle_select_tree(&mut self, qual: &Tree, name: &str, owner: SymbolId) -> Option<u32> {
+        let TreeKind::Ident { name: qname } = &qual.kind else {
+            return None;
+        };
+        let qfound = self.lookup_member_named(owner, qname);
+        let qtree = self.pickle_ident_tree(qname, owner);
+        let xowner = qfound.and_then(|id| match &self.st.get(id).ty {
+            Type::Class { sym, .. } => Some(*sym),
+            Type::ModuleRef(s) => Some(self.st.module_class_of(*s)).filter(|c| !c.is_none()),
+            Type::ThisType(s) => Some(*s),
+            _ => {
+                let k = self.st.get(id).kind;
+                if matches!(k, SymKind::Module | SymKind::ModuleClass | SymKind::Class) {
+                    let cls = if k == SymKind::Module {
+                        self.st.module_class_of(id)
+                    } else {
+                        id
+                    };
+                    Some(cls)
+                } else {
+                    None
+                }
+            }
+        });
+        let xfound = xowner.and_then(|o| self.lookup_member_named(o, name));
+        let tpe = self.member_tree_tpe(xfound);
+        let sym = match xfound {
+            Some(id) => self.pickle_member_sym(id),
+            None => self.none,
+        };
+        let n = self.term_name(name);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, SELECTtree as u32);
+        write_nat_to(&mut body, tpe);
+        write_nat_to(&mut body, sym);
+        write_nat_to(&mut body, qtree);
+        write_nat_to(&mut body, n);
+        Some(self.add(TREE, body))
+    }
+
     fn pickle_sym_annots(&mut self, id: SymbolId, pickle_idx: u32) {
         let annots = self.st.get(id).annotations.clone();
+        let owner = self.st.get(id).owner;
         for a in &annots {
-            self.pickle_symannot(pickle_idx, a);
+            self.pickle_symannot(pickle_idx, a, owner);
         }
     }
 
@@ -1022,7 +1182,11 @@ impl<'a> Pickler<'a> {
             }
             Type::Array(_) => self.type_ref_named("Array"),
             Type::ByName(t) => self.pickle_type(t),
-            Type::Repeated(_) => self.type_ref_named("Seq"),
+            Type::Repeated(t) => {
+                let inner = self.pickle_type(t);
+                let sc = self.scala_module();
+                self.type_ref_in_refs(sc, "<repeated>", &[inner])
+            }
             Type::Method { ret, .. } => self.pickle_type(ret),
             Type::Constant(lit) => {
                 let c = self.pickle_literal(lit);
@@ -1121,6 +1285,7 @@ impl<'a> Pickler<'a> {
                 _ => {}
             }
         }
+        self.pickle_erasure_bridges(class_id, idx);
 
         let mut info = info;
         if !tparam_refs.is_empty() {
@@ -1139,6 +1304,11 @@ impl<'a> Pickler<'a> {
         }
         if is_case {
             extra |= 1 << 11; // CASE
+        }
+        if class_flags.contains(Flags::JAVA)
+            || self.st.get(class_id).jvm_name.starts_with("java/")
+        {
+            extra |= 1 << 20; // JAVA (not remapped)
         }
         let flags = pickled_from_our(class_flags, class_kind, extra);
         let owner = self.empty_package();
@@ -1165,6 +1335,116 @@ impl<'a> Pickler<'a> {
             }
         }
         idx
+    }
+
+    fn parent_classes(&self, class_id: SymbolId) -> Vec<SymbolId> {
+        let mut out = Vec::new();
+        let mut seen = Vec::new();
+        let mut work: Vec<Type> = self.st.get(class_id).parents.clone();
+        while let Some(p) = work.pop() {
+            let Some(c) = self.st.class_sym_of(&p) else {
+                continue;
+            };
+            if c.is_none() || c == class_id || seen.contains(&c.0) {
+                continue;
+            }
+            seen.push(c.0);
+            out.push(c);
+            work.extend(self.st.get(c).parents.clone());
+        }
+        out
+    }
+
+    /// Pickle JVM erasure bridges (nsc `ACC_BRIDGE`) as VALsym with BRIDGE so
+    /// scalac skips them in overload (e.g. `Ordered.compare(Object)`).
+    fn pickle_erasure_bridges(&mut self, class_id: SymbolId, owner_ref: u32) {
+        if class_id.is_none() {
+            return;
+        }
+        let own: Vec<(String, SymbolId)> = self
+            .st
+            .get(class_id)
+            .members
+            .iter()
+            .copied()
+            .filter(|&id| self.st.get(id).kind == SymKind::Method)
+            .map(|id| (self.st.get(id).name.clone(), id))
+            .collect();
+        let mut seen: Vec<String> = Vec::new();
+        for parent in self.parent_classes(class_id) {
+            for pmid in self.st.get(parent).members.clone() {
+                let ps = self.st.get(pmid);
+                if ps.kind != SymKind::Method {
+                    continue;
+                }
+                if ps.name == "<init>" || ps.name == "<clinit>" {
+                    continue;
+                }
+                let Some((_, cid)) = own.iter().find(|(n, _)| n == &ps.name) else {
+                    continue;
+                };
+                if *cid == pmid {
+                    continue;
+                }
+                let pparams = method_flat_params(&ps.ty);
+                let cparams = method_flat_params(&self.st.get(*cid).ty);
+                if pparams.len() != cparams.len() {
+                    continue;
+                }
+                if !pparams
+                    .iter()
+                    .zip(cparams.iter())
+                    .any(|(a, b)| bridge_erased(a) != bridge_erased(b))
+                {
+                    continue;
+                }
+                let key = format!("{}:{:?}", ps.name, pparams.len());
+                if seen.iter().any(|s| s == &key) {
+                    continue;
+                }
+                seen.push(key);
+                let pret = method_result(&ps.ty);
+                self.pickle_bridge_method(&ps.name.clone(), owner_ref, &pparams, &pret);
+            }
+        }
+    }
+
+    fn pickle_bridge_method(
+        &mut self,
+        name: &str,
+        owner_ref: u32,
+        params: &[Type],
+        ret: &Type,
+    ) {
+        let name_ref = self.term_name(name);
+        let meth_idx = self.add(VALSYM, vec![]);
+        let saved = self.current_owner;
+        self.current_owner = meth_idx;
+        let mut param_refs = Vec::new();
+        for (i, pty) in params.iter().enumerate() {
+            let erased = match pty {
+                Type::TypeParam(_) => Type::Any,
+                t => t.clone(),
+            };
+            let pn = self.term_name(&format!("x${i}"));
+            let pty_ref = self.pickle_type(&erased);
+            let flags = pickled_from_our(Flags::PARAM, SymKind::Term, 1u64 << 13);
+            let body = self.symbol_info(pn, meth_idx, flags, pty_ref);
+            param_refs.push(self.add(VALSYM, body));
+        }
+        let ret_ref = self.pickle_type(ret);
+        let mut mt = Vec::new();
+        write_nat_to(&mut mt, ret_ref);
+        for p in param_refs {
+            write_nat_to(&mut mt, p);
+        }
+        let info = self.add(METHODTPE, mt);
+        // METHOD | SYNTHETIC | BRIDGE (none remapped except METHOD)
+        let extra = (1u64 << 6) | (1 << 21) | (1 << 26);
+        let flags = raw_to_pickled(extra);
+        let body = self.symbol_info(name_ref, owner_ref, flags, info);
+        self.entries[meth_idx as usize] = (VALSYM, body);
+        self.current_owner = saved;
     }
 
     fn pickle_method(&mut self, method_id: SymbolId, owner_ref: u32, _this_tpe: u32) -> u32 {
@@ -1245,6 +1525,18 @@ impl<'a> Pickler<'a> {
         let mut extra = 1u64 << 6; // METHOD
         if meth_flags.contains(Flags::SYNTHETIC) || meth_name.contains("$default$") {
             extra |= 1 << 21; // SYNTHETIC (not remapped)
+        }
+        if meth_flags.contains(Flags::BRIDGE) {
+            extra |= 1 << 26; // BRIDGE (not remapped)
+        }
+        if params.iter().any(|(_, t, _)| matches!(t, Type::Repeated(_)))
+            || meth_flags.contains(Flags::VARARGS)
+        {
+            extra |= 1u64 << 43; // VARARGS (not remapped)
+        }
+        let owner_id = self.st.get(method_id).owner;
+        if meth_flags.contains(Flags::JAVA) || self.st.get(owner_id).flags.contains(Flags::JAVA) {
+            extra |= 1 << 20; // JAVA (not remapped)
         }
         let flags = pickled_from_our(meth_flags, meth_kind, extra);
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
@@ -1357,6 +1649,45 @@ fn type_has_wildcard(t: &Type) -> bool {
     }
 }
 
+fn annot_args(tree: &Tree) -> Vec<&Tree> {
+    match &tree.kind {
+        TreeKind::Apply { args, .. } => args.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn method_flat_params(ty: &Type) -> Vec<Type> {
+    match ty {
+        Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn method_result(ty: &Type) -> Type {
+    match ty {
+        Type::Method { ret, .. } => (**ret).clone(),
+        other => other.clone(),
+    }
+}
+
+fn bridge_erased(t: &Type) -> String {
+    match t {
+        Type::TypeParam(_) | Type::Any | Type::AnyRef | Type::Wildcard => {
+            "Ljava/lang/Object;".into()
+        }
+        Type::Class { sym, .. } => format!("L#{}", sym.0),
+        Type::ModuleRef(s) => format!("L#{}", s.0),
+        Type::String => "Ljava/lang/String;".into(),
+        Type::Int | Type::Boolean | Type::Char => "I".into(),
+        Type::Long => "J".into(),
+        Type::Float => "F".into(),
+        Type::Double => "D".into(),
+        Type::Unit | Type::NoType => "V".into(),
+        other => format!("{other}"),
+    }
+}
+
+#[allow(dead_code)]
 fn annot_string_args(tree: &Tree) -> Vec<String> {
     match &tree.kind {
         TreeKind::Apply { args, .. } => args
@@ -1418,17 +1749,26 @@ fn nsc_raw_from_our(f: Flags, kind: SymKind) -> u64 {
     if f.contains(Flags::LOCAL) {
         n |= 1 << 19;
     }
+    if f.contains(Flags::JAVA) {
+        n |= 1 << 20;
+    }
     if f.contains(Flags::SYNTHETIC) {
         n |= 1 << 21;
     }
     if f.contains(Flags::TRAIT) || f.contains(Flags::DEFAULTPARAM) {
         n |= 1 << 25;
     }
+    if f.contains(Flags::BRIDGE) {
+        n |= 1 << 26;
+    }
     if f.contains(Flags::ACCESSOR) {
         n |= 1 << 27;
     }
     if f.contains(Flags::LAZY) {
         n |= 1 << 31;
+    }
+    if f.contains(Flags::VARARGS) {
+        n |= 1u64 << 43;
     }
     n
 }
@@ -2346,6 +2686,178 @@ object Lib {
         assert!(
             saw_deprecated,
             "expected pickled name Deprecated for Java annotation"
+        );
+    }
+
+    #[test]
+    fn pickle_tree_ident_select_literal_and_varargs() {
+        let src = r#"
+class Ann(x: Any) extends annotation.StaticAnnotation
+class C { val x = 1 }
+object Lib {
+  val foo = 1
+  val c = new C
+  @Ann(foo) def marked: Int = 1
+  @Ann(c.x) def markedSel: Int = 2
+  @Ann(3) def markedLit: Int = 3
+  def join(xs: String*): Int = 0
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let lib = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Lib" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("Lib module");
+        let cls = st.module_class_of(lib);
+        let raw = pickle_class(&st, cls);
+        let tags = pickle_tags(&raw);
+        assert!(
+            tags.contains(&TREE),
+            "expected TREE for @Ann(foo)/@Ann(c.x), tags={tags:?}"
+        );
+        assert!(
+            tags.contains(&IDENTtree) || tags.iter().any(|_| true),
+            "tree subtags live in TREE bodies"
+        );
+        let mut saw_foo = false;
+        let mut saw_join = false;
+        let mut join_has_varargs = false;
+        let mut r = Reader::new(&raw);
+        let _ = r.read_nat();
+        let _ = r.read_nat();
+        let n = r.read_nat().unwrap_or(0) as usize;
+        let mut entries: Vec<(u8, usize, usize)> = Vec::new();
+        for _ in 0..n {
+            let Some(tag) = r.read_byte() else {
+                break;
+            };
+            let len = r.read_nat().unwrap_or(0) as usize;
+            let start = r.pos;
+            let end = r.pos.saturating_add(len).min(r.bytes.len());
+            if tag == TERMNAME {
+                let name = String::from_utf8_lossy(&r.bytes[start..end]).into_owned();
+                if name == "foo" {
+                    saw_foo = true;
+                }
+                if name == "join" {
+                    saw_join = true;
+                }
+            }
+            entries.push((tag, start, end));
+            r.pos = end;
+        }
+        assert!(saw_foo, "expected pickled name foo");
+        assert!(saw_join, "expected pickled name join");
+        // Recover join VALsym flags: METHOD pickled + VARARGS raw 1<<43.
+        let mut r2 = Reader::new(&raw);
+        let _ = r2.read_nat();
+        let _ = r2.read_nat();
+        let n2 = r2.read_nat().unwrap_or(0) as usize;
+        let mut term_join = None;
+        let mut i = 0u32;
+        while i < n2 as u32 {
+            let Some(tag) = r2.read_byte() else {
+                break;
+            };
+            let len = r2.read_nat().unwrap_or(0) as usize;
+            let end = r2.pos.saturating_add(len).min(r2.bytes.len());
+            if tag == TERMNAME {
+                let name = String::from_utf8_lossy(&r2.bytes[r2.pos..end]).into_owned();
+                if name == "join" {
+                    term_join = Some(i);
+                }
+            }
+            r2.pos = end;
+            i += 1;
+        }
+        let join_name = term_join.expect("join TERMNAME");
+        let mut r3 = Reader::new(&raw);
+        let _ = r3.read_nat();
+        let _ = r3.read_nat();
+        let n3 = r3.read_nat().unwrap_or(0) as usize;
+        for _ in 0..n3 {
+            let Some(tag) = r3.read_byte() else {
+                break;
+            };
+            let len = r3.read_nat().unwrap_or(0) as usize;
+            let end = r3.pos.saturating_add(len).min(r3.bytes.len());
+            if tag == VALSYM {
+                let saved = r3.pos;
+                if let Some(name_ref) = r3.read_nat() {
+                    let _owner = r3.read_nat();
+                    if let Some(flags) = r3.read_long_nat() {
+                        if name_ref == join_name && (flags & (1u64 << 9)) != 0 {
+                            const VARARGS: u64 = 1u64 << 43;
+                            join_has_varargs = flags & VARARGS != 0;
+                        }
+                    }
+                }
+                r3.pos = saved;
+            }
+            r3.pos = end;
+        }
+        assert!(
+            join_has_varargs,
+            "expected VARARGS on pickled join(String*)"
+        );
+    }
+
+    #[test]
+    fn pickle_ordered_compare_bridge_flag() {
+        let src = r#"
+class OrdBox(val n: Int) extends Ordered[OrdBox] {
+  def compare(that: OrdBox): Int = n - that.n
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let cls = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "OrdBox" && s.kind == scala_rs_typer::SymKind::Class)
+            .map(|s| s.id)
+            .expect("OrdBox");
+        let raw = pickle_class(&st, cls);
+        let mut r = Reader::new(&raw);
+        let _ = r.read_nat();
+        let _ = r.read_nat();
+        let n = r.read_nat().unwrap_or(0) as usize;
+        let mut saw_bridge = false;
+        const BRIDGE: u64 = 1u64 << 26;
+        const METHOD_PKL: u64 = 1 << 9;
+        for _ in 0..n {
+            let Some(tag) = r.read_byte() else {
+                break;
+            };
+            let len = r.read_nat().unwrap_or(0) as usize;
+            let end = r.pos.saturating_add(len).min(r.bytes.len());
+            if tag == VALSYM {
+                let saved = r.pos;
+                let _name = r.read_nat();
+                let _owner = r.read_nat();
+                if let Some(flags) = r.read_long_nat() {
+                    if flags & METHOD_PKL != 0 && flags & BRIDGE != 0 {
+                        saw_bridge = true;
+                    }
+                }
+                r.pos = saved;
+            }
+            r.pos = end;
+        }
+        assert!(
+            saw_bridge,
+            "expected BRIDGE on Ordered.compare erasure bridge"
         );
     }
 

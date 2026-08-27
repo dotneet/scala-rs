@@ -938,6 +938,11 @@ fn scala_library_dual_run_xml_attr() {
     dual_run_xml_fixture("xml_attr");
 }
 
+#[test]
+fn scala_library_dual_run_xml_ns() {
+    dual_run_xml_fixture("xml_ns");
+}
+
 const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Option.class",
     "scala/Some.class",
@@ -1393,12 +1398,14 @@ fn find_scalac() -> Option<PathBuf> {
 /// (`MODULE$`) plus field accessors, extractor `unapply` so `p match { case
 /// Point(a, b) => a + b }` typechecks, an `object` method taking that case
 /// class, and SIP-23 literal types `val one: 1` / `def lit(x: 1)` (CONSTANTtpe).
-/// Remaining pickle holes (non-literal TREE annotation args, leftover Flags
-/// such as MACRO / BRIDGE / VARARGS / JAVA on Java-defined members) are not
+/// Remaining pickle holes (Apply / this / classOf TREE args, leftover Flags
+/// such as MACRO / late・anti, JAVA on members we only EXTREF) are not
 /// claimed. Nested `List[_ <: List[_]]` and refinement
 /// `A with B { def f: Int }` are pickled so scalac 2.13.16 can typecheck
 /// `Lib.nest` / `Lib.idRef`. Java `@Deprecated` on a Scala method is pickled
-/// as SYMANNOT so scalac `-deprecation` sees `Lib.gone`. If scalac
+/// as SYMANNOT so scalac `-deprecation` sees `Lib.gone`. TREE Ident/Select/literal
+/// annot args (`@Ann(foo)` / `@Ann(c.x)` / `@Ann(3)`), VARARGS on `String*`,
+/// and BRIDGE on an Ordered erasure bridge are probed. If scalac
 /// cannot read a probed shape, this test fails rather than claiming success.
 #[test]
 fn scalac_typechecks_against_our_classfiles_if_present() {
@@ -1453,6 +1460,11 @@ object UseLib {
     val nest: Int = Lib.nest(List(List(1)))
     val y = Lib.idRef(new MixA with MixB { override def a: Int = 1; override def b: Int = 2; def f: Int = 3 })
     val mix: Int = y.a + y.b + y.f
+    val mk: Int = Lib.marked
+    val ms: Int = Lib.markedSel
+    val ml: Int = Lib.markedLit
+    val j: Int = Lib.join("a", "b")
+    val cmp: Int = new OrdBox(1).compare(new OrdBox(2))
   }
 }
 "#,
@@ -1471,7 +1483,7 @@ object UseLib {
         .expect("scalac");
     assert!(
         output.status.success(),
-        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1) / Java @Deprecated Lib.gone / List[_ <: List[_]] nest / MixA with MixB {{ def f: Int }} idRef): {}\n{}",
+        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1) / Java @Deprecated Lib.gone / List[_ <: List[_]] nest / MixA with MixB {{ def f: Int }} idRef / @Ann(foo) marked / @Ann(c.x) markedSel / @Ann(3) markedLit / Lib.join varargs / OrdBox.compare bridge): {}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );

@@ -48,6 +48,12 @@ impl Flags {
     pub const CONTRAVARIANT: Flags = Flags(1 << 21);
     /// nsc `LOCAL`: `private[this]` / `protected[this]`.
     pub const LOCAL: Flags = Flags(1 << 22);
+    /// nsc `JAVA` (raw `1L << 20`): Java-defined class/member when we pickle one.
+    pub const JAVA: Flags = Flags(1 << 23);
+    /// nsc `BRIDGE` (raw `1L << 26`): erasure/mixin bridge method.
+    pub const BRIDGE: Flags = Flags(1 << 24);
+    /// nsc `VARARGS` (raw `1L << 43`): Scala `T*` / Java `T...` method.
+    pub const VARARGS: Flags = Flags(1 << 25);
 
     pub fn contains(self, f: Flags) -> bool {
         self.0 & f.0 != 0
