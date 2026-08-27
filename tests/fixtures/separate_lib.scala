@@ -20,11 +20,6 @@ object Lib {
 }
 trait MixA { def a: Int }
 trait MixB { def b: Int }
-class MixD extends MixA with MixB {
-  def a: Int = 1
-  def b: Int = 2
-  def f: Int = 3
-}
 class Box[A](val value: A) {
   def get: A = value
 }

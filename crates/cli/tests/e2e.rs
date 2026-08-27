@@ -1395,7 +1395,7 @@ fn find_scalac() -> Option<PathBuf> {
 /// class, and SIP-23 literal types `val one: 1` / `def lit(x: 1)` (CONSTANTtpe).
 /// Remaining pickle holes (non-literal TREE annotation args, leftover Flags
 /// such as MACRO / BRIDGE / VARARGS / JAVA on Java-defined members) are not
-/// claimed. Packed nested `List[_ <: List[_]]` and refinement
+/// claimed. Nested `List[_ <: List[_]]` and refinement
 /// `A with B { def f: Int }` are pickled so scalac 2.13.16 can typecheck
 /// `Lib.nest` / `Lib.idRef`. Java `@Deprecated` on a Scala method is pickled
 /// as SYMANNOT so scalac `-deprecation` sees `Lib.gone`. If scalac
@@ -1451,7 +1451,7 @@ object UseLib {
     val lit: Int = Lib.lit(1)
     val gone: Int = Lib.gone
     val nest: Int = Lib.nest(List(List(1)))
-    val y = Lib.idRef(new MixD())
+    val y = Lib.idRef(new MixA with MixB { override def a: Int = 1; override def b: Int = 2; def f: Int = 3 })
     val mix: Int = y.a + y.b + y.f
   }
 }

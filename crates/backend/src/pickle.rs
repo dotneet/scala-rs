@@ -9,7 +9,7 @@
 //! `@deprecated("msg", "2.13.0")` (SYMANNOT + LITERALstring), Java `@Deprecated`
 //! (SYMANNOT + TypeRef(java.lang, Deprecated)), `this.type`
 //! (THIStpe as a method result), `List[_ <: AnyRef]` (EXISTENTIALtpe with a
-//! bounded TYPEsym), packed nested `List[_ <: List[_]]`, refinement types
+//! bounded TYPEsym), nested `List[_ <: List[_]]`, refinement types
 //! (`A with B { def f: Int }` as REFINEDtpe), `T @unchecked` (ANNOTATEDtpe), and SIP-23 literal types
 //! (`def f(x: 1)`, `val one: 1`) as `CONSTANTtpe` + `LITERALint` against our
 //! classfiles.
@@ -26,7 +26,7 @@
 //! - methods carry `METHOD`; vals are getters (`METHOD|STABLE|ACCESSOR` + `POLYtpe`)
 //! - `List[_]` is `EXISTENTIALtpe(TypeRef(immutable.List, _$n), TYPEsym _$n)`
 //! - `List[_ <: AnyRef]` sets the quantified TYPEsym hi bound to `AnyRef`
-//! - nested `List[_ <: List[_]]` is one EXISTENTIALtpe with packed quantified params
+//! - nested `List[_ <: List[_]]` pickles the inner wildcard as its own EXISTENTIALtpe hi bound (nsc `List[_ <: List[_]]`)
 //! - `A with B { def f: Int }` is `REFINEDtpe` + `<refinement>` CLASSsym (deferred members)
 //! - `this.type` results are `THIStpe` of the enclosing class
 //! - type annotations `T @unchecked` are `ANNOTATEDtpe` + `ANNOTINFO`
@@ -683,8 +683,8 @@ impl<'a> Pickler<'a> {
                 self.type_ref_of_pickle_sym(q)
             }
             Type::BoundedWildcard { lo, hi } => {
-                let lo_r = lo.as_deref().map(|t| self.pickle_type_pack(t, quantified));
-                let hi_r = hi.as_deref().map(|t| self.pickle_type_pack(t, quantified));
+                let lo_r = lo.as_deref().map(|t| self.pickle_type(t));
+                let hi_r = hi.as_deref().map(|t| self.pickle_type(t));
                 let q = self.pickle_existential_param_refs(lo_r, hi_r);
                 quantified.push(q);
                 self.type_ref_of_pickle_sym(q)
@@ -2475,7 +2475,7 @@ object Lib {
         let tags = pickle_tags(&raw);
         assert!(
             tags.contains(&EXISTENTIALTPE),
-            "expected packed EXISTENTIALtpe for List[_ <: List[_]], tags={tags:?}"
+            "expected EXISTENTIALtpe for List[_ <: List[_]], tags={tags:?}"
         );
         assert!(
             tags.contains(&REFINEDTPE),
