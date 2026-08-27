@@ -4455,13 +4455,18 @@ fn gen_apply(
         let f = ctx.st.get(fun.sym).flags;
         f.contains(Flags::JAVA) && f.contains(Flags::VARARGS)
     };
+    let array_elem_op = matches!(
+        &fun.kind,
+        TreeKind::Select { qual, name }
+            if (name == "update" || name == "apply") && matches!(qual.ty, Type::Array(_))
+    );
     gen_call_args(
         asm,
         frame,
         ctx,
         args,
         &param_tys,
-        value_owner.is_some(),
+        value_owner.is_some() || (ctx.library_abi && !array_elem_op),
         java_varargs,
     );
     if let TreeKind::Select { qual, name } = &fun.kind {
@@ -5731,16 +5736,17 @@ fn gen_call_args(
     box_prims: bool,
     java_varargs: bool,
 ) {
-    let _ = box_prims;
     let rep_idx = param_tys
         .iter()
         .position(|p| matches!(p, Type::Repeated(_)));
     let Some(ri) = rep_idx else {
         for (i, a) in args.iter().enumerate() {
             gen_expr(asm, frame, ctx, a);
-            let pty = param_tys.get(i).unwrap_or(&a.ty);
-            if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
-                emit_box(asm, &a.ty);
+            if box_prims {
+                let pty = param_tys.get(i).unwrap_or(&a.ty);
+                if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
+                    emit_box(asm, &a.ty);
+                }
             }
         }
         return;

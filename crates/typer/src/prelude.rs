@@ -57,14 +57,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         &[Type::AnyVal],
     );
     let _ = char_s;
-    let _ = class(st, st.scala_pkg, "Byte", "java/lang/Byte", &[Type::AnyVal]);
-    let _ = class(
-        st,
-        st.scala_pkg,
-        "Short",
-        "java/lang/Short",
-        &[Type::AnyVal],
-    );
+    let _ = class(st, st.scala_pkg, "Byte", "scala/Byte", &[Type::AnyVal]);
+    let _ = class(st, st.scala_pkg, "Short", "scala/Short", &[Type::AnyVal]);
 
     st.string_sym = class(st, java_lang, "String", "java/lang/String", &[Type::AnyRef]);
     mark_java(st, st.string_sym);
