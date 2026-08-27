@@ -4562,13 +4562,32 @@ impl Typer {
                         }
                     }
                 }
-                if !sym.is_none()
-                    && self.st.get(sym).name == "resource"
-                    && !self.st.get(sym).tparams.is_empty()
-                {
-                    let now_args: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+                let using_infer = if !sym.is_none() {
+                    let s = self.st.get(sym);
+                    let n_tps = s.tparams.len();
+                    let name = s.name.clone();
+                    let owner_jvm = self.st.get(s.owner).jvm_name.clone();
+                    n_tps > 0
+                        && (name == "resource" || (name == "apply" && owner_jvm.contains("Using")))
+                } else {
+                    false
+                };
+                if using_infer {
+                    let now_args: Vec<Type> = args
+                        .iter()
+                        .map(|a| match &a.ty {
+                            Type::Function { params, ret } if params.is_empty() => (**ret).clone(),
+                            t => t.clone(),
+                        })
+                        .collect();
                     let orig_params: Vec<Type> = match &fun.ty {
-                        Type::Method { paramss, .. } if !paramss.is_empty() => paramss[0].clone(),
+                        Type::Method { paramss, .. } if !paramss.is_empty() => paramss[0]
+                            .iter()
+                            .map(|p| match p {
+                                Type::ByName(inner) => (**inner).clone(),
+                                other => other.clone(),
+                            })
+                            .collect(),
                         _ => param_tys.clone(),
                     };
                     let inst = self.infer_method_tparams(sym, &orig_params, &now_args);
