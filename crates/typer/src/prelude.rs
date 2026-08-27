@@ -288,6 +288,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_hash_map(st);
         add_hash_set(st);
         add_linked_hash_map(st);
+        add_linked_hash_set(st);
         add_either(st);
         add_try(st, throwable);
         add_xml(st);
@@ -1293,6 +1294,26 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
         Type::String,
         Intrinsic::None,
     );
+    method(st, so, "tail", vec![], Type::String, Intrinsic::None);
+    method(st, so, "init", vec![], Type::String, Intrinsic::None);
+    method(st, so, "distinct", vec![], Type::String, Intrinsic::None);
+    method(st, so, "mkString", vec![], Type::String, Intrinsic::None);
+    method(
+        st,
+        so,
+        "mkString",
+        vec![Type::String],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "mkString",
+        vec![Type::String, Type::String, Type::String],
+        Type::String,
+        Intrinsic::None,
+    );
     so
 }
 
@@ -1316,7 +1337,15 @@ fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         aops,
         "tail",
         vec![],
-        Type::Array(Box::new(ta)),
+        Type::Array(Box::new(ta.clone())),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        aops,
+        "foreach",
+        vec![fn1(ta, Type::Unit)],
+        Type::Unit,
         Intrinsic::None,
     );
     aops
@@ -2560,6 +2589,94 @@ fn add_linked_hash_map(st: &mut SymbolTable) {
     st.get_mut(lhm_mod).members.extend(mems);
 }
 
+fn add_linked_hash_set(st: &mut SymbolTable) {
+    let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
+    let lhs = class(
+        st,
+        mutp,
+        "LinkedHashSet",
+        "scala/collection/mutable/LinkedHashSet",
+        &[Type::AnyRef],
+    );
+    let sa = type_param(st, lhs, "A");
+    st.get_mut(lhs).tparams = vec![sa];
+    let ta = Type::TypeParam(sa);
+    let lhs_t = Type::Class {
+        sym: lhs,
+        args: vec![ta.clone()],
+    };
+    method(
+        st,
+        lhs,
+        "contains",
+        vec![Type::Any],
+        Type::Boolean,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        lhs,
+        "+=",
+        vec![Type::Any],
+        lhs_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        lhs,
+        "foreach",
+        vec![fn1(ta, Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let lhs_mod = module(
+        st,
+        mutp,
+        "LinkedHashSet",
+        "scala/collection/mutable/LinkedHashSet$",
+    );
+    let lhs_cls = st.module_class_of(lhs_mod);
+    let lhs_empty = method(
+        st,
+        lhs_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: lhs,
+            args: vec![Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let ea = type_param(st, lhs_empty, "A");
+    st.get_mut(lhs_empty).tparams = vec![ea];
+    st.get_mut(lhs_empty).ty = Type::Method {
+        paramss: vec![vec![]],
+        ret: Box::new(Type::Class {
+            sym: lhs,
+            args: vec![Type::TypeParam(ea)],
+        }),
+    };
+    let lhs_apply = method(
+        st,
+        lhs_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(Type::Any))],
+        lhs_t.clone(),
+        Intrinsic::None,
+    );
+    let haa = type_param(st, lhs_apply, "A");
+    st.get_mut(lhs_apply).tparams = vec![haa];
+    st.get_mut(lhs_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(haa)))]],
+        ret: Box::new(Type::Class {
+            sym: lhs,
+            args: vec![Type::TypeParam(haa)],
+        }),
+    };
+    let mems = st.get(lhs_cls).members.clone();
+    st.get_mut(lhs_mod).members.extend(mems);
+}
+
 fn add_string_builder(st: &mut SymbolTable) {
     let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
     let sb = class(
@@ -3288,6 +3405,18 @@ fn add_predef_members(
             Intrinsic::Identity,
         );
         st.get_mut(wrap).flags = st.get(wrap).flags.with(Flags::IMPLICIT);
+        let wrap_l = method(
+            st,
+            owner,
+            "longArrayOps",
+            vec![Type::Array(Box::new(Type::Long))],
+            Type::Class {
+                sym: aops,
+                args: vec![Type::Long],
+            },
+            Intrinsic::Identity,
+        );
+        st.get_mut(wrap_l).flags = st.get(wrap_l).flags.with(Flags::IMPLICIT);
     }
     if let Some(ri) = rich_int {
         let wrap = method(
