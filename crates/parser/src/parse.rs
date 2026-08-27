@@ -49,6 +49,9 @@ struct Parser<'a> {
     pos: usize,
     diags: Vec<Diagnostic>,
     next_id: u32,
+    /// nsc `placeholderParams`: synthetic vals from expression `_`, newest last.
+    placeholder_params: Vec<Tree>,
+    placeholder_id: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -60,6 +63,8 @@ impl<'a> Parser<'a> {
             pos: 0,
             diags: Vec::new(),
             next_id: 1,
+            placeholder_params: Vec::new(),
+            placeholder_id: 0,
         }
     }
 
@@ -71,6 +76,78 @@ impl<'a> Parser<'a> {
 
     fn empty(&mut self, span: Span) -> Tree {
         self.alloc(span, TreeKind::Empty)
+    }
+
+    /// nsc `withPlaceholders`: wrap a non-bare `_` section as `Function`.
+    fn with_placeholders(&mut self, f: impl FnOnce(&mut Self) -> Tree) -> Tree {
+        let saved = std::mem::take(&mut self.placeholder_params);
+        let mut res = f(self);
+        if !self.placeholder_params.is_empty()
+            && !is_placeholder_wildcard(&res, &self.placeholder_params)
+        {
+            let params = std::mem::take(&mut self.placeholder_params);
+            let span = res.span;
+            res = self.alloc(
+                span,
+                TreeKind::Function {
+                    vparams: params,
+                    body: Box::new(res),
+                },
+            );
+        }
+        let mut leftover = std::mem::take(&mut self.placeholder_params);
+        leftover.extend(saved);
+        self.placeholder_params = leftover;
+        res
+    }
+
+    fn finish_no_escaping(&mut self, saved: Vec<Tree>) {
+        if let Some(p) = self.placeholder_params.first() {
+            let sp = p.span;
+            self.error_span(sp, "unbound placeholder parameter");
+            self.placeholder_params.clear();
+        }
+        self.placeholder_params = saved;
+    }
+
+    fn fresh_placeholder(&mut self) -> Tree {
+        let sp = self.span();
+        self.bump();
+        self.placeholder_id += 1;
+        let name = format!("x${}", self.placeholder_id);
+        let id = self.alloc(sp, TreeKind::Ident { name: name.clone() });
+        let empty_tpt = self.empty(sp);
+        let empty_rhs = self.empty(sp);
+        let param = self.alloc(
+            sp,
+            TreeKind::ValDef {
+                mods: Modifiers::new(Flags::PARAM.with(Flags::SYNTHETIC)),
+                name,
+                tpt: Box::new(empty_tpt),
+                rhs: Box::new(empty_rhs),
+            },
+        );
+        self.placeholder_params.push(param);
+        id
+    }
+
+    fn remove_placeholder_named(&mut self, name: &str) {
+        self.placeholder_params.retain(|p| p.name() != Some(name));
+    }
+
+    fn convert_to_params(&mut self, t: Tree) -> Vec<Tree> {
+        fn names_in(t: &Tree) -> Vec<String> {
+            match &t.kind {
+                TreeKind::Ident { name } => vec![name.clone()],
+                TreeKind::Typed { expr, .. } => names_in(expr),
+                TreeKind::Apply { args, .. } => args.iter().flat_map(names_in).collect(),
+                _ => vec![],
+            }
+        }
+        for n in names_in(&t) {
+            self.remove_placeholder_named(&n);
+        }
+        expr_to_params(t)
     }
 
     fn tok(&self) -> &Token {
@@ -283,6 +360,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_top_stats(&mut self) -> Vec<Tree> {
+        let saved = std::mem::take(&mut self.placeholder_params);
         let mut stats = Vec::new();
         loop {
             self.skip_nl_semi();
@@ -331,6 +409,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        self.finish_no_escaping(saved);
         stats
     }
 
@@ -1116,6 +1195,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stats_until_rbrace(&mut self) -> Vec<Tree> {
+        let saved = std::mem::take(&mut self.placeholder_params);
         let mut stats = Vec::new();
         loop {
             self.skip_nl_semi();
@@ -1131,6 +1211,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        self.finish_no_escaping(saved);
         stats
     }
 
@@ -1942,7 +2023,7 @@ impl<'a> Parser<'a> {
     // ------------------------------------------------------------------
 
     fn parse_expr(&mut self) -> Tree {
-        self.parse_expr1()
+        self.with_placeholders(|p| p.parse_expr1())
     }
 
     fn parse_expr1(&mut self) -> Tree {
@@ -2014,7 +2095,7 @@ impl<'a> Parser<'a> {
                 if matches!(self.kind(), TokenKind::Arrow) {
                     self.bump();
                     let body = self.parse_expr();
-                    let vparams = expr_to_params(t.clone());
+                    let vparams = self.convert_to_params(t.clone());
                     return self.alloc(
                         t.span.merge(body.span),
                         TreeKind::Function {
@@ -2035,6 +2116,13 @@ impl<'a> Parser<'a> {
                     } else {
                         self.parse_type()
                     };
+                    if is_placeholder_wildcard(&t, &self.placeholder_params) {
+                        if let Some(p) = self.placeholder_params.last_mut() {
+                            if let TreeKind::ValDef { tpt: pt, .. } = &mut p.kind {
+                                *pt = Box::new(tpt.clone());
+                            }
+                        }
+                    }
                     let typed = self.alloc(
                         t.span.merge(tpt.span),
                         TreeKind::Typed {
@@ -2482,11 +2570,7 @@ impl<'a> Parser<'a> {
                     TreeKind::Super { qual: None, mix },
                 )
             }
-            TokenKind::Underscore => {
-                let sp = self.span();
-                self.bump();
-                self.alloc(sp, TreeKind::Wildcard)
-            }
+            TokenKind::Underscore => self.fresh_placeholder(),
             TokenKind::Ident(_) => self.parse_ident_tree(),
             TokenKind::True => {
                 let sp = self.span();
@@ -4038,6 +4122,20 @@ fn token_name(k: &TokenKind) -> String {
         TokenKind::Ident(s) => format!("`{s}`"),
         TokenKind::Newline => "newline".into(),
         other => format!("{other:?}").to_lowercase(),
+    }
+}
+
+fn is_placeholder_wildcard(t: &Tree, params: &[Tree]) -> bool {
+    let Some(last) = params.last() else {
+        return false;
+    };
+    let Some(pname) = last.name() else {
+        return false;
+    };
+    match &t.kind {
+        TreeKind::Ident { name } => name == pname,
+        TreeKind::Typed { expr, .. } => is_placeholder_wildcard(expr, params),
+        _ => false,
     }
 }
 

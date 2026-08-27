@@ -3031,10 +3031,7 @@ impl Typer {
                 tree.ty = Type::String;
             }
             TreeKind::Wildcard => {
-                self.error(
-                    tree.span,
-                    "unimplemented syntax: placeholder `_` in expressions",
-                );
+                self.error(tree.span, "unbound placeholder parameter");
                 tree.ty = Type::Error;
             }
             TreeKind::Unimplemented { what } => {
@@ -3118,6 +3115,7 @@ impl Typer {
 
     fn type_ident(&mut self, tree: &mut Tree, name: String, pt: &Type) {
         if name == "_" {
+            self.error(tree.span, "unbound placeholder parameter");
             tree.kind = TreeKind::Wildcard;
             tree.ty = Type::Error;
             return;
@@ -3154,6 +3152,13 @@ impl Typer {
             let s = found[0];
             tree.sym = s;
             let mut ty = self.st.get(s).ty.clone();
+            if ty.is_no_type()
+                && self.st.get(s).flags.contains(Flags::PARAM)
+                && is_inferable_param_pt(pt)
+            {
+                self.st.get_mut(s).ty = pt.clone();
+                ty = pt.clone();
+            }
             ty = self.maybe_auto_apply(ty, pt);
             if !self.st.this_class.is_none() {
                 ty = self.st.expand_type_members(self.st.this_class, &ty);
@@ -5727,10 +5732,6 @@ impl Typer {
             self.type_val_sig(p);
             if p.ty.is_no_type() {
                 p.ty = pts.get(i).cloned().unwrap_or(Type::NoType);
-                if p.ty.is_no_type() {
-                    self.error(p.span, "missing parameter type for lambda (specify it or provide an expected function type)");
-                    p.ty = Type::Error;
-                }
             }
             if p.sym.is_none() {
                 if let TreeKind::ValDef { name, mods, .. } = &p.kind {
@@ -5750,6 +5751,20 @@ impl Typer {
             param_tys.push(p.ty.clone());
         }
         self.type_expr(body, &ret_pt);
+        param_tys.clear();
+        for p in vparams.iter_mut() {
+            if p.ty.is_no_type() && !p.sym.is_none() {
+                p.ty = self.st.get(p.sym).ty.clone();
+            }
+            if p.ty.is_no_type() {
+                self.error(p.span, "missing parameter type for expanded function");
+                p.ty = Type::Error;
+                if !p.sym.is_none() {
+                    self.st.get_mut(p.sym).ty = Type::Error;
+                }
+            }
+            param_tys.push(p.ty.clone());
+        }
         let ret = if ret_pt.is_no_type() {
             body.ty.clone()
         } else {
@@ -8521,6 +8536,13 @@ fn f_kind_name(kind: scala_rs_parser::finterp::FConvKind) -> &'static str {
         FConvKind::General => "Any",
         FConvKind::Unsupported => "a supported conversion",
     }
+}
+
+fn is_inferable_param_pt(pt: &Type) -> bool {
+    !matches!(
+        pt,
+        Type::NoType | Type::Error | Type::Any | Type::AnyRef | Type::AnyVal | Type::Overload(_)
+    )
 }
 
 fn is_function_pt(pt: &Type) -> bool {
