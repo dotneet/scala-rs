@@ -261,6 +261,18 @@ fn fixtures_try_catch() {
     check("try_catch");
 }
 #[test]
+fn fixtures_try_finally() {
+    check("try_finally");
+}
+#[test]
+fn fixtures_type_alias() {
+    check("type_alias");
+}
+#[test]
+fn fixtures_update_assign() {
+    check("update_assign");
+}
+#[test]
 fn fixtures_nested_class() {
     check("nested_class");
 }
@@ -666,6 +678,16 @@ fn fixtures_type_member_hk_is_error() {
 #[test]
 fn fixtures_type_member_bounds_is_error() {
     compile_fails("type_member_bounds", "unimplemented");
+}
+
+#[test]
+fn fixtures_type_alias_cyclic_is_error() {
+    compile_fails("type_alias_bad", "illegal cyclic reference");
+}
+
+#[test]
+fn fixtures_update_apply_without_apply_is_error() {
+    compile_fails("update_apply_bad", "value apply is not a member");
 }
 
 #[test]
@@ -1643,6 +1665,50 @@ fn nlreturn_verifies() {
 }
 
 #[test]
+fn try_finally_verifies() {
+    if !java_available() {
+        return;
+    }
+    let out = compile_fixture("try_finally");
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", out.to_str().unwrap(), "Main"])
+        .output()
+        .expect("java -Xverify:all try_finally");
+    assert!(
+        output.status.success(),
+        "java -Xverify:all try_finally failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("try_finally")
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn update_assign_verifies() {
+    if !java_available() {
+        return;
+    }
+    let out = compile_fixture("update_assign");
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", out.to_str().unwrap(), "Main"])
+        .output()
+        .expect("java -Xverify:all update_assign");
+    assert!(
+        output.status.success(),
+        "java -Xverify:all update_assign failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("update_assign")
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
 fn separate_compilation_against_classfiles() {
     if !java_available() {
         return;
@@ -1800,7 +1866,8 @@ fn find_scalac() -> Option<PathBuf> {
 /// `ident(ident(1))`), `this.x` / `super.foo` Select, named `@Ann(foo = 1)`
 /// (nsc positional Constant), named TREE `@Ann(foo = this.x)` / `@Ann(foo = bar)`
 /// (nsc positional TREE), VARARGS on `String*`,
-/// and BRIDGE on an Ordered erasure bridge are probed. If scalac
+/// and BRIDGE on an Ordered erasure bridge, plus `type T = Int` (`ALIASsym`)
+/// and `Lib.usesAlias` / `Lib.T` are probed. If scalac
 /// cannot read a probed shape, this test fails rather than claiming success.
 #[test]
 fn scalac_typechecks_against_our_classfiles_if_present() {
@@ -1870,6 +1937,8 @@ object UseLib {
     val mro: Int = Lib.markedReorder
     val j: Int = Lib.join("a", "b")
     val cmp: Int = new OrdBox(1).compare(new OrdBox(2))
+    val al: Int = Lib.usesAlias(1)
+    val at: Lib.T = 1
   }
 }
 "#,
@@ -1888,7 +1957,7 @@ object UseLib {
         .expect("scalac");
     assert!(
         output.status.success(),
-        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1) / Java @Deprecated Lib.gone / List[_ <: List[_]] nest / MixA with MixB {{ def f: Int }} idRef / @Ann(foo) marked / @Ann(c.x) markedSel / @Ann(3) markedLit / @Ann(this) markedThis / @Ann(classOf[Int]) markedClass / @Ann(ident(1)) markedApply / @Ann(this.x) markedThisSel / @Ann(super.foo) markedSuper / @Ann(ident(ident(1))) markedNest / @Ann(foo = 1) markedNamed / @Ann(foo = this.x) markedNamedTree / @Ann(foo = bar) markedNamedIdent / @Ann2(b = 2, a = \"ok\") markedReorder (positional source-order pickle; ctor reorder not required) / Lib.join varargs / OrdBox.compare bridge): {}\n{}",
+        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1) / Java @Deprecated Lib.gone / List[_ <: List[_]] nest / MixA with MixB {{ def f: Int }} idRef / @Ann(foo) marked / @Ann(c.x) markedSel / @Ann(3) markedLit / @Ann(this) markedThis / @Ann(classOf[Int]) markedClass / @Ann(ident(1)) markedApply / @Ann(this.x) markedThisSel / @Ann(super.foo) markedSuper / @Ann(ident(ident(1))) markedNest / @Ann(foo = 1) markedNamed / @Ann(foo = this.x) markedNamedTree / @Ann(foo = bar) markedNamedIdent / @Ann2(b = 2, a = \"ok\") markedReorder (positional source-order pickle; ctor reorder not required) / Lib.join varargs / OrdBox.compare bridge / Lib.usesAlias / Lib.T ALIASsym): {}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );

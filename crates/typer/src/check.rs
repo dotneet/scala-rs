@@ -845,6 +845,7 @@ impl Typer {
                 self.type_type_member(stt);
             }
         }
+        self.finish_type_aliases(body);
         self.st.get_mut(id).ty = Type::Class {
             sym: id,
             args: vec![],
@@ -977,6 +978,7 @@ impl Typer {
                 self.type_type_member(stt);
             }
         }
+        self.finish_type_aliases(body);
         for stt in body.iter_mut() {
             if !matches!(stt.kind, TreeKind::TypeDef { .. }) {
                 self.type_member_sig(stt);
@@ -1034,6 +1036,44 @@ impl Typer {
             self.st.get_mut(tree.sym).ty = ty;
         }
         let _ = name;
+    }
+
+    /// Expand `type T = U` chains and diagnose `illegal cyclic reference`.
+    /// Abstract `type A` (empty rhs) is left as `TypeMember`.
+    fn finish_type_aliases(&mut self, body: &mut [Tree]) {
+        let mut alias_ids = HashSet::new();
+        for stt in body.iter() {
+            if let TreeKind::TypeDef { rhs, .. } = &stt.kind {
+                if !rhs.is_empty() && !stt.sym.is_none() {
+                    alias_ids.insert(stt.sym.0);
+                }
+            }
+        }
+        for stt in body.iter_mut() {
+            let TreeKind::TypeDef { name, rhs, .. } = &stt.kind else {
+                continue;
+            };
+            if rhs.is_empty() || stt.sym.is_none() || stt.ty.is_error() {
+                continue;
+            }
+            let name = name.clone();
+            let span = stt.span;
+            let mut seen = Vec::new();
+            match expand_alias_type(&self.st, &stt.ty, &alias_ids, &mut seen) {
+                Ok(t) => {
+                    stt.ty = t.clone();
+                    self.st.get_mut(stt.sym).ty = t;
+                }
+                Err(_) => {
+                    self.error(
+                        span,
+                        format!("illegal cyclic reference involving type {name}"),
+                    );
+                    stt.ty = Type::Error;
+                    self.st.get_mut(stt.sym).ty = Type::Error;
+                }
+            }
+        }
     }
 
     fn bind_self_type(
@@ -3704,7 +3744,7 @@ impl Typer {
         // Expected type Method so nullary methods (`unary_-`, `def f: Int` called as `f()`)
         // are not auto-applied before this Apply is typed.
         self.type_expr(fun, &dummy_method);
-        self.rewrite_ident_array_apply(fun);
+        self.rewrite_receiver_apply(fun);
         self.reorder_named_args(args, fun);
 
         let recv_ty = match &fun.kind {
@@ -4045,18 +4085,38 @@ impl Typer {
                         OverloadPick::None => {}
                     }
                 }
-                self.error(
-                    tree.span,
-                    format!(
-                        "no matching overload for {} with arguments ({})",
-                        self.st.display_type(&fun_ty),
-                        arg_tys
-                            .iter()
-                            .map(|t| self.st.display_type(t))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                );
+                // nsc: `c(1)` looks up `apply`, never `update`. Assignment
+                // `c(i) = v` is the only path that rewrites to `update`.
+                let has_apply = match &fun_ty {
+                    Type::Method { .. } | Type::Overload(_) | Type::Function { .. } => true,
+                    Type::Array(_) => true,
+                    Type::Class { sym, .. } | Type::ModuleRef(sym) => {
+                        !self.st.lookup_member(*sym, "apply").is_empty()
+                    }
+                    _ => false,
+                };
+                if !has_apply {
+                    self.error(
+                        tree.span,
+                        format!(
+                            "value apply is not a member of {}",
+                            self.st.display_type(&fun_ty)
+                        ),
+                    );
+                } else {
+                    self.error(
+                        tree.span,
+                        format!(
+                            "no matching overload for {} with arguments ({})",
+                            self.st.display_type(&fun_ty),
+                            arg_tys
+                                .iter()
+                                .map(|t| self.st.display_type(t))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    );
+                }
                 tree.ty = Type::Error;
             }
         }
@@ -6684,9 +6744,8 @@ impl Typer {
                         SymKind::TypeMember => {
                             let rhs = self.st.get(id).ty.clone();
                             match rhs {
-                                Type::NoType | Type::Error | Type::TypeMember(_) => {
-                                    Type::TypeMember(id)
-                                }
+                                Type::NoType | Type::Error => Type::TypeMember(id),
+                                Type::TypeMember(other) if other == id => Type::TypeMember(id),
                                 other => other,
                             }
                         }
@@ -7020,11 +7079,17 @@ impl Typer {
         }
     }
 
-    fn rewrite_ident_array_apply(&mut self, fun: &mut Tree) {
-        if matches!(&fun.kind, TreeKind::Select { .. }) {
+    fn rewrite_receiver_apply(&mut self, fun: &mut Tree) {
+        if matches!(&fun.kind, TreeKind::Select { .. } | TreeKind::New { .. }) {
             return;
         }
-        if !matches!(&fun.ty, Type::Array(_)) {
+        // nsc inserts `.apply` for `c(1)` / `xs(i)` when `c` is a value, not a method.
+        // Leave method/overload idents alone (`f(1)`).
+        let insert = matches!(
+            &fun.ty,
+            Type::Array(_) | Type::Class { .. } | Type::ModuleRef(_)
+        );
+        if !insert {
             return;
         }
         let span = fun.span;
@@ -7962,6 +8027,95 @@ fn array_elem_of(ty: &Type) -> Option<Type> {
             None
         }
         _ => None,
+    }
+}
+
+/// Expand type aliases. `alias_ids` are `type T = …` (non-empty rhs).
+/// Hitting an alias already on `seen` is `illegal cyclic reference`.
+fn expand_alias_type(
+    st: &SymbolTable,
+    ty: &Type,
+    alias_ids: &HashSet<u32>,
+    seen: &mut Vec<u32>,
+) -> Result<Type, SymbolId> {
+    match ty {
+        Type::TypeMember(id) => {
+            let rhs = st.get(*id).ty.clone();
+            match &rhs {
+                Type::NoType | Type::Error => Ok(Type::TypeMember(*id)),
+                Type::TypeMember(x) if *x == *id => {
+                    if alias_ids.contains(&id.0) {
+                        Err(*id)
+                    } else {
+                        Ok(Type::TypeMember(*id))
+                    }
+                }
+                other => {
+                    if seen.contains(&id.0) {
+                        return Err(*id);
+                    }
+                    seen.push(id.0);
+                    let r = expand_alias_type(st, other, alias_ids, seen);
+                    seen.pop();
+                    r
+                }
+            }
+        }
+        Type::Class { sym, args } => {
+            let args: Result<Vec<_>, _> = args
+                .iter()
+                .map(|a| expand_alias_type(st, a, alias_ids, seen))
+                .collect();
+            Ok(Type::Class {
+                sym: *sym,
+                args: args?,
+            })
+        }
+        Type::Array(t) => Ok(Type::Array(Box::new(expand_alias_type(
+            st, t, alias_ids, seen,
+        )?))),
+        Type::Function { params, ret } => {
+            let params: Result<Vec<_>, _> = params
+                .iter()
+                .map(|p| expand_alias_type(st, p, alias_ids, seen))
+                .collect();
+            Ok(Type::Function {
+                params: params?,
+                ret: Box::new(expand_alias_type(st, ret, alias_ids, seen)?),
+            })
+        }
+        Type::Tuple(ts) => {
+            let ts: Result<Vec<_>, _> = ts
+                .iter()
+                .map(|t| expand_alias_type(st, t, alias_ids, seen))
+                .collect();
+            Ok(Type::Tuple(ts?))
+        }
+        Type::Named { name, args } => {
+            let args: Result<Vec<_>, _> = args
+                .iter()
+                .map(|a| expand_alias_type(st, a, alias_ids, seen))
+                .collect();
+            Ok(Type::Named {
+                name: name.clone(),
+                args: args?,
+            })
+        }
+        Type::Refined { parents, decls } => {
+            let parents: Result<Vec<_>, _> = parents
+                .iter()
+                .map(|p| expand_alias_type(st, p, alias_ids, seen))
+                .collect();
+            Ok(Type::Refined {
+                parents: parents?,
+                decls: decls.clone(),
+            })
+        }
+        Type::Annotated { tpe, annot } => Ok(Type::Annotated {
+            tpe: Box::new(expand_alias_type(st, tpe, alias_ids, seen)?),
+            annot: annot.clone(),
+        }),
+        other => Ok(other.clone()),
     }
 }
 

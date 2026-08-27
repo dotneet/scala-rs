@@ -221,6 +221,30 @@ object Main {
         );
         let dump = dump_tree(&t);
         assert!(dump.contains("Try"), "{dump}");
+        assert!(
+            dump.contains("finally") || dump.contains("Literal"),
+            "{dump}"
+        );
+    }
+
+    #[test]
+    fn try_finally_without_catch_is_not_dropped() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    try {
+      println("ok")
+    } finally {
+      println("fin")
+    }
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Try"), "{dump}");
+        assert!(dump.contains("fin"), "parser must keep finally, got {dump}");
     }
 
     #[test]

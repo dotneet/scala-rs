@@ -12,7 +12,7 @@
 //! bounded TYPEsym), nested `List[_ <: List[_]]`, refinement types
 //! (`A with B { def f: Int }` as REFINEDtpe), `T @unchecked` (ANNOTATEDtpe), and SIP-23 literal types
 //! (`def f(x: 1)`, `val one: 1`) as `CONSTANTtpe` + `LITERALint` against our
-//! classfiles.
+//! classfiles, and `type T = Int` as `ALIASsym` (nsc 2.13 has no `ALIAStpe` tag).
 //! Flags are nsc raw longs run through `rawToPickledFlags`.
 //! MACRO / late / anti are **not** pickled: scalac 2.13.16 typechecks the
 //! classfiles we already emit (`scalac_typechecks_against_our_classfiles_if_present`)
@@ -44,6 +44,8 @@
 //!   signed big-endian base 256)
 //! - Scala `T*` methods pickle `VARARGS` and `<repeated>[T]`; erasure bridges
 //!   pickle `BRIDGE|SYNTHETIC`; Java-defined CLASSsym pickle `JAVA`
+//! - `type T = Int` / `type A = String` is `ALIASsym` (tag 5) with the aliased
+//!   type as info (nsc 2.13 has no `ALIAStpe`; scalac 2.13.16 typechecks `Lib.T`)
 
 use scala_rs_parser::{Flags, Lit, RefineDecl, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{SymKind, SymbolTable};
@@ -55,6 +57,9 @@ pub const TERMNAME: u8 = 1;
 pub const TYPENAME: u8 = 2;
 pub const NONESYM: u8 = 3;
 pub const TYPESYM: u8 = 4;
+/// nsc `ALIASsym` — `type T = Int` (info is the aliased type, not TYPEBOUNDStpe).
+/// 2.13 PickleFormat has no `ALIAStpe` tag; aliases are this symbol form.
+pub const ALIASSYM: u8 = 5;
 pub const CLASSSYM: u8 = 6;
 pub const MODULESYM: u8 = 7;
 pub const VALSYM: u8 = 8;
@@ -1372,6 +1377,15 @@ impl<'a> Pickler<'a> {
                 write_nat_to(&mut body, sym);
                 self.add(TYPEREFTPE, body)
             }
+            Type::TypeMember(id) => {
+                let owner = self.st.get(*id).owner.0;
+                let pref = self.this_tpes.get(&owner).copied().unwrap_or(self.noprefix);
+                let sym = self.pickle_type_member(*id);
+                let mut body = Vec::new();
+                write_nat_to(&mut body, pref);
+                write_nat_to(&mut body, sym);
+                self.add(TYPEREFTPE, body)
+            }
             Type::Class { sym, args } => {
                 if args.iter().any(type_has_wildcard) {
                     let mut quantified = Vec::new();
@@ -1499,6 +1513,9 @@ impl<'a> Pickler<'a> {
                         continue;
                     }
                     self.pickle_method(m, idx, this_tpe);
+                }
+                SymKind::TypeMember => {
+                    let _ = self.pickle_type_member(m);
                 }
                 _ => {}
             }
@@ -1779,6 +1796,41 @@ impl<'a> Pickler<'a> {
         let flags = raw_to_pickled((1u64 << 13) | (1u64 << 4)); // PARAM | DEFERRED
         let body = self.symbol_info(name_ref, owner_ref, flags, bounds);
         self.entries[idx as usize] = (TYPESYM, body);
+        idx
+    }
+
+    /// Abstract `type A` is TYPEsym + TYPEBOUNDStpe + DEFERRED.
+    /// Alias `type T = Int` is nsc ALIASsym with the aliased type as info.
+    fn pickle_type_member(&mut self, id: SymbolId) -> u32 {
+        if let Some(i) = self.sym_index.get(&id.0) {
+            return *i;
+        }
+        let s = self.st.get(id);
+        let name = s.name.clone();
+        let owner_id = s.owner.0;
+        let rhs = s.ty.clone();
+        let flags_our = s.flags;
+        let kind = s.kind;
+        let is_alias = !matches!(rhs, Type::NoType | Type::Error | Type::TypeMember(_));
+        let tag = if is_alias { ALIASSYM } else { TYPESYM };
+        let name_ref = self.type_name(&name);
+        let idx = self.add(tag, vec![]);
+        self.sym_index.insert(id.0, idx);
+        let owner_ref = self.sym_index.get(&owner_id).copied().unwrap_or(self.none);
+        let info = if is_alias {
+            self.pickle_type(&rhs)
+        } else {
+            let lo = self.type_ref_named("Nothing");
+            let hi = self.type_ref_named("Any");
+            let mut b = Vec::new();
+            write_nat_to(&mut b, lo);
+            write_nat_to(&mut b, hi);
+            self.add(TYPEBOUNDSTPE, b)
+        };
+        let extra = if is_alias { 0 } else { 1u64 << 4 }; // DEFERRED for abstract
+        let flags = pickled_from_our(flags_our, kind, extra);
+        let body = self.symbol_info(name_ref, owner_ref, flags, info);
+        self.entries[idx as usize] = (tag, body);
         idx
     }
 
@@ -2250,7 +2302,7 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 r.pos = end;
                 Entry::NoneSym
             }
-            TYPESYM => {
+            TYPESYM | ALIASSYM => {
                 let (name, owner, _flags, info) = read_symbol_info(&mut r, end)?;
                 r.pos = end;
                 Entry::TypeSym { name, owner, info }
@@ -3469,6 +3521,42 @@ object Lib {
             p.methods.iter().any(|m| m.name == "idRef"),
             "expected idRef in pickle"
         );
+    }
+
+    #[test]
+    fn pickle_type_alias_aliassym() {
+        let src = r#"
+object Lib {
+  type T = Int
+  def usesAlias(x: T): T = x
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let lib = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Lib" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("Lib module");
+        let raw = pickle_class(&st, st.module_class_of(lib));
+        let tags = pickle_tags(&raw);
+        assert!(
+            tags.contains(&ALIASSYM),
+            "expected ALIASsym for type T = Int, tags={tags:?}"
+        );
+        let p = unpickle(&raw).expect("unpickle Lib");
+        let u = p
+            .methods
+            .iter()
+            .find(|m| m.name == "usesAlias")
+            .expect("usesAlias");
+        assert_eq!(u.param_types, vec!["Int".to_string()]);
+        assert_eq!(u.ret, "Int");
     }
 
     fn pickle_tags_name(bytes: &[u8], idx: u32) -> Option<String> {
