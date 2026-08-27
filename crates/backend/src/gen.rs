@@ -3572,11 +3572,7 @@ fn load_qualified_this(asm: &mut Assembler, ctx: &EmitCtx, name: &str) {
 
 fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
     if matches!(&tree.kind, TreeKind::Ident { name } if name == "$classOf") {
-        let elem = match &tree.ty {
-            Type::Class { args, .. } if !args.is_empty() => &args[0],
-            other => other,
-        };
-        gen_java_class_of(asm, ctx, elem);
+        gen_java_class_of(asm, ctx, &tree.ty);
         return;
     }
     let id = tree.sym;

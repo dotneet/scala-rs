@@ -1381,7 +1381,7 @@ fn add_array_ops_map(st: &mut SymbolTable, aops: SymbolId, ct: SymbolId) {
     let m = method(st, aops, "map", vec![], Type::Unit, Intrinsic::None);
     let b = type_param(st, m, "B");
     let f = st.alloc("f", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
-    st.get_mut(f).ty = fn1(ta, Type::TypeParam(b));
+    st.get_mut(f).ty = fn1(ta.clone(), Type::TypeParam(b));
     let ev = st.alloc(
         "evidence$1",
         m,

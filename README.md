@@ -418,7 +418,7 @@ scala-library 2.13.16 が取れる環境では、次を `--scala-library` でコ
 | `array_ops3.scala` | `intArrayOps` の `foreach` と `longArrayOps` の `head` / `foreach`（library dual-run のみ） | `1` `2` `3` `10` `10` `20` `30` |
 | `linkedhashset.scala` | `mutable.LinkedHashSet.empty` / varargs `apply` の `+=` / `contains` / 挿入順 `foreach`（library dual-run のみ） | `true` `false` `1` `2` `3` `4` |
 | `string_ops10.scala` | `augmentString` 経由の `filter` / `reverseIterator`（library dual-run のみ。既存 `tail` / `init` / `distinct` / `mkString` は触らない） | `heo` `o` `l` `l` `e` `h` |
-| `array_ops4.scala` | `intArrayOps` の `map[B: ClassTag]` と `refArrayOps` の参照配列 `map`（library dual-run のみ。`map$extension(Object, Function1, ClassTag)Object`） | `2` `3` `4` `ax` `bx` |
+| `array_ops4.scala` | `intArrayOps` の `map[B: ClassTag]`（`x => x + 1`。placeholder `_` は未実装で診断）と `refArrayOps` の参照配列 `map`（library dual-run のみ。`map$extension(Object, Function1, ClassTag)Object`） | `2` `3` `4` `ax` `bx` |
 | `arraydeque.scala` | `mutable.ArrayDeque.empty` / varargs `apply` の `+=` / `prepend` / `apply`（2.13 Stack 置換。library dual-run のみ。`ArrayBuffer` / `ListBuffer` は触らない） | `0` `1` `2` `3` `4` `5` |
 | `classtag.scala` | `implicitly[ClassTag[Int]]` と `new Array[T]`（library dual-run のみ） | `int` `2` |
 | `custom_interp.scala` | `implicit class` + `q"a$x"`（library dual-run のみ） | `q:ok` |

@@ -3303,7 +3303,9 @@ impl Typer {
             TreeKind::Select { qual, name } => (qual, name.clone()),
             _ => return,
         };
-        self.type_expr(qual, &Type::NoType);
+        if qual.ty.is_no_type() {
+            self.type_expr(qual, &Type::NoType);
+        }
         if name == "_" {
             self.error(
                 tree.span,
@@ -4475,9 +4477,14 @@ impl Typer {
                     ) && !param_tys.is_empty()
                     {
                         if let Type::Function { ret: fr, .. } = &param_tys[0] {
+                            let fret = if matches!(fr.as_ref(), Type::TypeParam(_)) {
+                                Box::new(Type::Any)
+                            } else {
+                                fr.clone()
+                            };
                             param_tys[0] = Type::Function {
                                 params: vec![elem.clone()],
-                                ret: fr.clone(),
+                                ret: fret,
                             };
                         }
                     }
@@ -4500,6 +4507,21 @@ impl Typer {
                     }
                     if !p.is_no_type() {
                         self.adapt(a, &p);
+                    }
+                    if let TreeKind::Function { body, .. } = &a.kind {
+                        let body_ty = body.ty.widen_constant();
+                        if let Type::Function { params, ret } = &a.ty {
+                            if matches!(ret.as_ref(), Type::Any | Type::NoType)
+                                && !body_ty.is_no_type()
+                                && !body_ty.is_error()
+                            {
+                                let params = params.clone();
+                                a.ty = Type::Function {
+                                    params,
+                                    ret: Box::new(body_ty),
+                                };
+                            }
+                        }
                     }
                 }
                 let nparams = param_tys.len();
@@ -5283,21 +5305,13 @@ impl Typer {
             .lookup_member(mcls, "apply")
             .into_iter()
             .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)?;
-        let jclass = self
-            .st
-            .lookup("Class")
-            .into_iter()
-            .find(|id| self.st.get(*id).jvm_name == "java/lang/Class")?;
         let class_arg = Tree {
             id: NodeId(0),
             span,
             kind: TreeKind::Ident {
                 name: "$classOf".into(),
             },
-            ty: Type::Class {
-                sym: jclass,
-                args: vec![elem],
-            },
+            ty: elem,
             sym: SymbolId::NONE,
             postfix: false,
         };

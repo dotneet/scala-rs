@@ -3329,7 +3329,7 @@ object Main {
   def main(args: Array[String]): Unit = {
     val f: String = "hello".filter(c => c != 'l')
     "hello".reverseIterator.foreach(c => println(c))
-    val ys = Array(1, 2, 3).map(_ + 1)
+    val ys = Array(1, 2, 3).map(x => x + 1)
     ys.foreach(x => println(x))
     val zs = Array("a", "b").map(s => s + "x")
     zs.foreach(s => println(s))
