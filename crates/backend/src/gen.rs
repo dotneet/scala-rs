@@ -7527,13 +7527,14 @@ object Main {
     val c = new Cell()
     c(1) = 10
     println(c.n)
+    println(c(2))
   }
 }
 "#,
         ) else {
             return;
         };
-        assert_eq!(out, "1\n9\n11\n", "stdout: {out:?}");
+        assert_eq!(out, "1\n9\n11\n13\n", "stdout: {out:?}");
     }
 
     #[test]

@@ -3744,7 +3744,7 @@ impl Typer {
         // Expected type Method so nullary methods (`unary_-`, `def f: Int` called as `f()`)
         // are not auto-applied before this Apply is typed.
         self.type_expr(fun, &dummy_method);
-        self.rewrite_ident_array_apply(fun);
+        self.rewrite_receiver_apply(fun);
         self.reorder_named_args(args, fun);
 
         let recv_ty = match &fun.kind {
@@ -7079,11 +7079,17 @@ impl Typer {
         }
     }
 
-    fn rewrite_ident_array_apply(&mut self, fun: &mut Tree) {
-        if matches!(&fun.kind, TreeKind::Select { .. }) {
+    fn rewrite_receiver_apply(&mut self, fun: &mut Tree) {
+        if matches!(&fun.kind, TreeKind::Select { .. } | TreeKind::New { .. }) {
             return;
         }
-        if !matches!(&fun.ty, Type::Array(_)) {
+        // nsc inserts `.apply` for `c(1)` / `xs(i)` when `c` is a value, not a method.
+        // Leave method/overload idents alone (`f(1)`).
+        let insert = matches!(
+            &fun.ty,
+            Type::Array(_) | Type::Class { .. } | Type::ModuleRef(_)
+        );
+        if !insert {
             return;
         }
         let span = fun.span;
