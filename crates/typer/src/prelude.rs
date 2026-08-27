@@ -1935,19 +1935,15 @@ fn add_array_ops_map(st: &mut SymbolTable, aops: SymbolId, ct: SymbolId) {
     };
 }
 
-/// `ArrayOps.flatMap[B](f: A => List[B])(implicit ClassTag[B]): Array[B]`.
+/// `ArrayOps.flatMap[B](f: A => Any)(implicit ClassTag[B]): Array[B]`.
 /// Dual-run uses `List` (IterableOnce); the Array→Iterable overload is a later hole.
 fn add_array_ops_flat_map(st: &mut SymbolTable, aops: SymbolId, ct: SymbolId) {
     let a = st.get(aops).tparams[0];
     let ta = Type::TypeParam(a);
     let m = method(st, aops, "flatMap", vec![], Type::Unit, Intrinsic::None);
     let b = type_param(st, m, "B");
-    let list_b = Type::Class {
-        sym: st.list_sym,
-        args: vec![Type::TypeParam(b)],
-    };
     let f = st.alloc("f", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
-    st.get_mut(f).ty = fn1(ta.clone(), list_b.clone());
+    st.get_mut(f).ty = fn1(ta.clone(), Type::Any);
     let ev = st.alloc(
         "evidence$1",
         m,
@@ -1964,7 +1960,7 @@ fn add_array_ops_flat_map(st: &mut SymbolTable, aops: SymbolId, ct: SymbolId) {
     st.get_mut(m).paramss = vec![vec![f], vec![ev]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![
-            vec![fn1(ta, list_b)],
+            vec![fn1(ta, Type::Any)],
             vec![Type::Class {
                 sym: ct,
                 args: vec![Type::TypeParam(b)],

@@ -2708,6 +2708,7 @@ impl Typer {
         } else {
             self.type_expr_inner(tree, pt);
         }
+        self.adapt_implicit_apply(tree, pt);
         if !pt.is_no_type() && !tree.ty.is_no_type() && !tree.ty.is_error() {
             self.adapt(tree, pt);
         }
@@ -4540,6 +4541,31 @@ impl Typer {
                         ),
                     );
                 }
+                if !sym.is_none()
+                    && self.st.get(sym).name == "flatMap"
+                    && self.is_array_ops_ty(recv_ty.as_ref())
+                {
+                    if let Some(a0) = args.first() {
+                        if let Type::Function { ret: fr, .. } = &a0.ty {
+                            let elem = match fr.as_ref() {
+                                Type::Class { args, .. } if !args.is_empty() => args[0].clone(),
+                                Type::Array(e) => e.as_ref().clone(),
+                                other => other.clone(),
+                            };
+                            let elem = elem.widen_constant();
+                            let tps = self.st.get(sym).tparams.clone();
+                            if tps.len() == 1 && !elem.is_no_type() && !elem.is_error() {
+                                let inst = vec![elem];
+                                param_tys = param_tys
+                                    .iter()
+                                    .map(|t| crate::symbol::subst_tparams_slice(&tps, &inst, t))
+                                    .collect();
+                                fun.ty = crate::symbol::subst_tparams_slice(&tps, &inst, &fun.ty);
+                                ret = crate::symbol::subst_tparams_slice(&tps, &inst, &ret);
+                            }
+                        }
+                    }
+                }
                 let leftover =
                     self.fill_defaults_and_implicits(tree.span, args, &param_tys, fun, pt);
                 let method_name = if !sym.is_none() {
@@ -4553,6 +4579,30 @@ impl Typer {
                             sym: self.st.list_sym,
                             args: vec![a0.ty.widen_constant()],
                         };
+                    }
+                } else if method_name == "->" {
+                    if let Some(a0) = args.first() {
+                        if let Some(t2) = self
+                            .st
+                            .lookup("Tuple2")
+                            .into_iter()
+                            .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)
+                        {
+                            let k = match &fun.kind {
+                                TreeKind::Select { qual, .. } => match &qual.kind {
+                                    TreeKind::Apply { args: wargs, .. } => wargs
+                                        .first()
+                                        .map(|a| a.ty.widen_constant())
+                                        .unwrap_or_else(|| qual.ty.widen_constant()),
+                                    _ => qual.ty.widen_constant(),
+                                },
+                                _ => Type::Any,
+                            };
+                            ret = Type::Class {
+                                sym: t2,
+                                args: vec![k, a0.ty.widen_constant()],
+                            };
+                        }
                     }
                 } else if method_name == "apply"
                     && !sym.is_none()
@@ -8274,7 +8324,10 @@ impl Typer {
 }
 
 fn is_tuple2_elem_map(name: &str) -> bool {
-    matches!(name, "Map" | "HashMap" | "LinkedHashMap")
+    matches!(
+        name,
+        "Map" | "HashMap" | "LinkedHashMap" | "SortedMap" | "TreeMap"
+    )
 }
 
 fn is_tailrec_annot(path: &str) -> bool {
