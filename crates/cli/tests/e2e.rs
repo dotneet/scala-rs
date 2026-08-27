@@ -816,6 +816,21 @@ fn fixtures_hashset_bad_is_error() {
 }
 
 #[test]
+fn fixtures_string_ops8_bad_is_error() {
+    compile_fails_lib("string_ops8_bad", "noSuchHead is not a member");
+}
+
+#[test]
+fn fixtures_array_ops2_bad_is_error() {
+    compile_fails_lib("array_ops2_bad", "noSuchHead is not a member");
+}
+
+#[test]
+fn fixtures_linkedhashmap_bad_is_error() {
+    compile_fails_lib("linkedhashmap_bad", "noSuch is not a member");
+}
+
+#[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
 }
@@ -1489,6 +1504,21 @@ fn scala_library_dual_run_hashset() {
 }
 
 #[test]
+fn scala_library_dual_run_string_ops8() {
+    dual_run_fixture("string_ops8");
+}
+
+#[test]
+fn scala_library_dual_run_array_ops2() {
+    dual_run_fixture("array_ops2");
+}
+
+#[test]
+fn scala_library_dual_run_linkedhashmap() {
+    dual_run_fixture("linkedhashmap");
+}
+
+#[test]
 fn scala_library_dual_run_anonymous() {
     dual_run_fixture("anonymous");
 }
@@ -1733,6 +1763,8 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/runtime/ArrowAssoc.class",
     "scala/Predef$.class",
     "scala/collection/StringOps.class",
+    "scala/collection/ArrayOps.class",
+    "scala/collection/ArrayOps$.class",
     "scala/collection/WithFilter.class",
     "scala/collection/Iterator.class",
     "scala/Option$WithFilter.class",
@@ -1771,6 +1803,8 @@ const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/collection/mutable/HashMap$.class",
     "scala/collection/mutable/HashSet.class",
     "scala/collection/mutable/HashSet$.class",
+    "scala/collection/mutable/LinkedHashMap.class",
+    "scala/collection/mutable/LinkedHashMap$.class",
     "scala/collection/immutable/NumericRange.class",
     "scala/collection/immutable/NumericRange$.class",
     "scala/collection/immutable/NumericRange$Inclusive.class",

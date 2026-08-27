@@ -3859,7 +3859,7 @@ fn gen_select(
                         push_default(asm, &tree.ty);
                     }
                 } else if ctx.st.is_value_class(ctx.st.get(tree.sym).owner) {
-                    invoke_value_extension(asm, ctx, tree.sym);
+                    invoke_value_extension(asm, ctx, tree.sym, Some(&tree.ty));
                 } else {
                     invoke_method(asm, ctx, tree.sym, Some(&tree.ty));
                 }
@@ -4489,7 +4489,7 @@ fn gen_apply(
     if fun_is_super(fun) {
         invoke_super(asm, ctx, fun.sym);
     } else if value_owner.is_some() {
-        invoke_value_extension(asm, ctx, fun.sym);
+        invoke_value_extension(asm, ctx, fun.sym, Some(&tree.ty));
     } else {
         invoke_method(asm, ctx, fun.sym, Some(&tree.ty));
     }
@@ -4521,7 +4521,12 @@ fn invoke_super(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     }
 }
 
-fn invoke_value_extension(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
+fn invoke_value_extension(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    id: SymbolId,
+    result_ty: Option<&Type>,
+) {
     let s = ctx.st.get(id);
     let owner_id = s.owner;
     let owner = class_internal(ctx.st, owner_id);
@@ -4603,6 +4608,21 @@ fn invoke_value_extension(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     if owner == "scala/runtime/RichChar" && s.name == "toInt" {
         // RichChar.toInt is inlined; the jar exposes intValue$extension.
         asm.invokestatic("scala/runtime/RichChar", "intValue$extension", "(C)I");
+        return;
+    }
+    if owner == "scala/collection/ArrayOps" {
+        // 2.13 ArrayOps is AnyVal over erased Array; $extension takes/returns Object.
+        asm.invokestatic(
+            "scala/collection/ArrayOps",
+            &format!("{}$extension", s.name),
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        );
+        maybe_unbox_erased_result(
+            asm,
+            ctx,
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            result_ty,
+        );
         return;
     }
     let desc = value_extension_desc(ctx.st, id);
@@ -4996,6 +5016,28 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
                     );
                     asm.checkcast("scala/collection/mutable/HashMap");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_linkedhashmap_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/LinkedHashMap$",
+                        "empty",
+                        "()Lscala/collection/mutable/LinkedHashMap;",
+                    );
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/LinkedHashMap$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/mutable/LinkedHashMap");
                     return;
                 }
                 _ => {}
@@ -5571,6 +5613,57 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_linkedhashmap(&owner) {
+            match name {
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/LinkedHashMap",
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    );
+                    if let Some(ty) = result_ty {
+                        if is_jvm_primitive(ty) && !is_unit_like(ty) {
+                            emit_unbox(asm, ty);
+                        } else if !is_unit_like(ty) {
+                            let cls = jvm_desc(ctx.st, ty);
+                            if let Some(inner) =
+                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+                            {
+                                if inner != "java/lang/Object" {
+                                    asm.checkcast(inner);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                "update" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/LinkedHashMap",
+                        "update",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                    );
+                    return;
+                }
+                "+=" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/LinkedHashMap",
+                        "+=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Growable;",
+                    );
+                    return;
+                }
+                "foreach" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/LinkedHashMap",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_stdlib_hashset(&owner) {
             match name {
                 "contains" => {
@@ -5839,6 +5932,14 @@ fn is_stdlib_hashset(owner: &str) -> bool {
 
 fn is_stdlib_hashset_module(owner: &str) -> bool {
     owner == "scala/collection/mutable/HashSet$"
+}
+
+fn is_stdlib_linkedhashmap(owner: &str) -> bool {
+    owner == "scala/collection/mutable/LinkedHashMap"
+}
+
+fn is_stdlib_linkedhashmap_module(owner: &str) -> bool {
+    owner == "scala/collection/mutable/LinkedHashMap$"
 }
 
 fn emit_long_numeric_range(asm: &mut Assembler, inclusive: bool) {

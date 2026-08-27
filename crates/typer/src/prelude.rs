@@ -184,6 +184,11 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     } else {
         None
     };
+    let array_ops = if library_abi {
+        Some(add_array_ops(st))
+    } else {
+        None
+    };
     add_option_members(st, option_wf, library_abi);
     add_list_members(st, with_filter, iterator, library_abi);
     add_function_types(st);
@@ -282,6 +287,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_string_builder(st);
         add_hash_map(st);
         add_hash_set(st);
+        add_linked_hash_map(st);
         add_either(st);
         add_try(st, throwable);
         add_xml(st);
@@ -339,7 +345,15 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     };
 
     st.predef = module(st, st.scala_pkg, "Predef", "scala/Predef$");
-    add_predef_members(st, arrow, string_ops, rich_int, rich_ldc, library_abi);
+    add_predef_members(
+        st,
+        arrow,
+        string_ops,
+        array_ops,
+        rich_int,
+        rich_ldc,
+        library_abi,
+    );
 
     st.push_scope();
     st.enter_in_current("scala", st.scala_pkg);
@@ -1261,7 +1275,51 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
         Type::Boolean,
         Intrinsic::None,
     );
+    method(st, so, "head", vec![], Type::Char, Intrinsic::None);
+    method(st, so, "last", vec![], Type::Char, Intrinsic::None);
+    method(
+        st,
+        so,
+        "stripLineEnd",
+        vec![],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        so,
+        "replaceAllLiterally",
+        vec![Type::String, Type::String],
+        Type::String,
+        Intrinsic::None,
+    );
     so
+}
+
+fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
+    let aops = class(
+        st,
+        st.scala_pkg,
+        "ArrayOps",
+        "scala/collection/ArrayOps",
+        &[Type::AnyVal],
+    );
+    let a = type_param(st, aops, "A");
+    st.get_mut(aops).tparams = vec![a];
+    let ta = Type::TypeParam(a);
+    let xs = st.alloc("xs", aops, SymKind::Term, Flags::PARAM, "");
+    st.get_mut(xs).ty = Type::Array(Box::new(ta.clone()));
+    st.get_mut(aops).ctor_fields = vec![xs];
+    method(st, aops, "head", vec![], ta.clone(), Intrinsic::None);
+    method(
+        st,
+        aops,
+        "tail",
+        vec![],
+        Type::Array(Box::new(ta)),
+        Intrinsic::None,
+    );
+    aops
 }
 
 fn add_option_members(st: &mut SymbolTable, option_wf: SymbolId, library_abi: bool) {
@@ -2387,6 +2445,121 @@ fn add_hash_set(st: &mut SymbolTable) {
     st.get_mut(hs_mod).members.extend(mems);
 }
 
+fn add_linked_hash_map(st: &mut SymbolTable) {
+    let tuple2 = st
+        .get(st.scala_pkg)
+        .members
+        .iter()
+        .copied()
+        .find(|id| st.get(*id).name == "Tuple2")
+        .unwrap_or(SymbolId::NONE);
+    let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
+    let lhm = class(
+        st,
+        mutp,
+        "LinkedHashMap",
+        "scala/collection/mutable/LinkedHashMap",
+        &[Type::AnyRef],
+    );
+    let mk = type_param(st, lhm, "K");
+    let mv = type_param(st, lhm, "V");
+    st.get_mut(lhm).tparams = vec![mk, mv];
+    let tk = Type::TypeParam(mk);
+    let tv = Type::TypeParam(mv);
+    let lhm_t = Type::Class {
+        sym: lhm,
+        args: vec![tk.clone(), tv.clone()],
+    };
+    let pair = Type::Class {
+        sym: tuple2,
+        args: vec![tk, tv.clone()],
+    };
+    method(
+        st,
+        lhm,
+        "apply",
+        vec![Type::Any],
+        tv.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        lhm,
+        "update",
+        vec![Type::Any, Type::Any],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        lhm,
+        "+=",
+        vec![Type::Any],
+        lhm_t.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        lhm,
+        "foreach",
+        vec![fn1(pair.clone(), Type::Unit)],
+        Type::Unit,
+        Intrinsic::None,
+    );
+    let lhm_mod = module(
+        st,
+        mutp,
+        "LinkedHashMap",
+        "scala/collection/mutable/LinkedHashMap$",
+    );
+    let lhm_cls = st.module_class_of(lhm_mod);
+    let lhm_empty = method(
+        st,
+        lhm_cls,
+        "empty",
+        vec![],
+        Type::Class {
+            sym: lhm,
+            args: vec![Type::Any, Type::Any],
+        },
+        Intrinsic::None,
+    );
+    let ek = type_param(st, lhm_empty, "K");
+    let ev = type_param(st, lhm_empty, "V");
+    st.get_mut(lhm_empty).tparams = vec![ek, ev];
+    st.get_mut(lhm_empty).ty = Type::Method {
+        paramss: vec![vec![]],
+        ret: Box::new(Type::Class {
+            sym: lhm,
+            args: vec![Type::TypeParam(ek), Type::TypeParam(ev)],
+        }),
+    };
+    let lhm_apply = method(
+        st,
+        lhm_cls,
+        "apply",
+        vec![Type::Repeated(Box::new(pair.clone()))],
+        lhm_t.clone(),
+        Intrinsic::None,
+    );
+    let lak = type_param(st, lhm_apply, "K");
+    let lav = type_param(st, lhm_apply, "V");
+    st.get_mut(lhm_apply).tparams = vec![lak, lav];
+    let lhm_pair = Type::Class {
+        sym: tuple2,
+        args: vec![Type::TypeParam(lak), Type::TypeParam(lav)],
+    };
+    st.get_mut(lhm_apply).ty = Type::Method {
+        paramss: vec![vec![Type::Repeated(Box::new(lhm_pair))]],
+        ret: Box::new(Type::Class {
+            sym: lhm,
+            args: vec![Type::TypeParam(lak), Type::TypeParam(lav)],
+        }),
+    };
+    let mems = st.get(lhm_cls).members.clone();
+    st.get_mut(lhm_mod).members.extend(mems);
+}
+
 fn add_string_builder(st: &mut SymbolTable) {
     let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
     let sb = class(
@@ -2862,6 +3035,7 @@ fn add_predef_members(
     st: &mut SymbolTable,
     arrow: SymbolId,
     string_ops: Option<SymbolId>,
+    array_ops: Option<SymbolId>,
     rich_int: Option<SymbolId>,
     rich_ldc: Option<(SymbolId, SymbolId, SymbolId)>,
     library_abi: bool,
@@ -3100,6 +3274,20 @@ fn add_predef_members(
             Intrinsic::Identity,
         );
         st.get_mut(aug).flags = st.get(aug).flags.with(Flags::IMPLICIT);
+    }
+    if let Some(aops) = array_ops {
+        let wrap = method(
+            st,
+            owner,
+            "intArrayOps",
+            vec![Type::Array(Box::new(Type::Int))],
+            Type::Class {
+                sym: aops,
+                args: vec![Type::Int],
+            },
+            Intrinsic::Identity,
+        );
+        st.get_mut(wrap).flags = st.get(wrap).flags.with(Flags::IMPLICIT);
     }
     if let Some(ri) = rich_int {
         let wrap = method(
