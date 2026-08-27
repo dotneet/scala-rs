@@ -3,7 +3,6 @@ class Box(var n: Int) extends AutoCloseable {
 }
 
 object Main {
-  def boom(): Box = throw new RuntimeException("acq2")
   def main(args: Array[String]): Unit = {
     import scala.util.Using
     val b = new Box(0)
@@ -41,7 +40,7 @@ object Main {
     val e = new Box(0)
     val t5 = Using.Manager((mgr) => {
       mgr(e)
-      mgr(boom())
+      throw new RuntimeException("acq2")
       0
     })
     println(t5.getOrElse(-1))
