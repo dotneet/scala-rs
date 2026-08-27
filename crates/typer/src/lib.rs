@@ -1296,6 +1296,32 @@ object Main {
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+        ok(r#"
+import scala.annotation.unchecked.uncheckedVariance
+class Inv[A](val value: A)
+class Q[+A] { def enqueue(x: A @uncheckedVariance): Int = 1 }
+class Box[+A](val inner: Inv[A @uncheckedVariance]) { def get: A = inner.value }
+"#);
+        let (_, _, diags) = typecheck_str("class Bad2[+A] { def enqueue(x: A): Int = 1 }\n");
+        assert!(
+            has_errors(&diags),
+            "expected error without @uncheckedVariance, got {:?}",
+            diags
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("covariant") && d.message.contains("contravariant")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let (_, _, diags) =
+            typecheck_str("class Inv[A](val value: A); class Bad3[+A](val inner: Inv[A])\n");
+        assert!(
+            has_errors(&diags),
+            "expected invariant-position error, got {:?}",
+            diags
+        );
     }
 
     #[test]

@@ -688,13 +688,31 @@ object Main {
     }
 
     #[test]
-    fn xml_entity_ref_is_unimplemented() {
-        let r = parse_str("object M { val x = <a>&amp;</a> }\n");
+    fn xml_entities_desugar() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val a = <a>&amp;</a>
+    val b = <a>&#65;</a>
+    val c = <a>&#x42;</a>
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("EntityRef"), "expected EntityRef: {dump}");
+        assert!(dump.contains("amp"), "expected entity name amp: {dump}");
+    }
+
+    #[test]
+    fn xml_unknown_entity_is_unimplemented() {
+        let r = parse_str("object M { val x = <a>&notanentity;</a> }\n");
         assert!(
             r.diags
                 .iter()
-                .any(|d| d.message.contains("XML entity") || d.message.contains("XML")),
-            "expected XML entity diagnostic, got {:?}",
+                .any(|d| d.message.contains("XML entity") || d.message.contains("unknown")),
+            "expected unknown XML entity diagnostic, got {:?}",
             r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

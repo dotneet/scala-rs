@@ -1261,6 +1261,12 @@ impl Typer {
                     }
                 }
             }
+            Type::Annotated { tpe, annot } => {
+                // nsc skips only `@uncheckedVariance`, not `@unchecked`.
+                if annot.rsplit('.').next().unwrap_or(annot.as_str()) != "uncheckedVariance" {
+                    self.check_variance_ty(vars, tpe, pos, span, where_);
+                }
+            }
             _ => {}
         }
     }

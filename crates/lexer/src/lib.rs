@@ -887,12 +887,14 @@ mod tests {
             kinds("--></"),
             vec![Ident("-->".into()), Ident("</".into())]
         );
-        assert_eq!(
-            kinds("?></"),
-            vec![Ident("?>".into()), Ident("</".into())]
-        );
+        assert_eq!(kinds("?></"), vec![Ident("?>".into()), Ident("</".into())]);
         assert_eq!(kinds("<="), vec![Ident("<=".into())]);
         assert_eq!(kinds("<<"), vec![Ident("<<".into())]);
         assert_eq!(kinds("<-"), vec![LeftArrow]);
+        assert_eq!(kinds("&#65;"), vec![Ident("&#".into()), IntLit(65), Semi]);
+        assert_eq!(
+            kinds("&amp;"),
+            vec![Ident("&".into()), Ident("amp".into()), Semi]
+        );
     }
 }

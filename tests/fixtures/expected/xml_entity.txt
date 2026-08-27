@@ -1,0 +1,7 @@
+<a>&amp;</a>
+<a>&lt;</a>
+<a>&gt;</a>
+<a>&quot;</a>
+<a>&apos;</a>
+<a>A</a>
+<a>B</a>
