@@ -3435,7 +3435,7 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
         TreeKind::DefDef { .. } | TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } => {
             // nested member: not lifted in this pass
         }
-        TreeKind::Empty => {}
+        TreeKind::Import { .. } | TreeKind::TypeDef { .. } | TreeKind::Empty => {}
         _ => {
             gen_expr(asm, frame, ctx, tree);
             pop_if_value(asm, &tree.ty);
@@ -3545,6 +3545,7 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
         TreeKind::ValDef { .. } => {
             gen_stat(asm, frame, ctx, tree);
         }
+        TreeKind::Import { .. } | TreeKind::TypeDef { .. } => {}
         _ => {
             throw_runtime(
                 asm,
