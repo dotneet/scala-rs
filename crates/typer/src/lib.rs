@@ -662,6 +662,22 @@ object M {
     }
 
     #[test]
+    fn value_existential_path_packs() {
+        ok(r#"
+class Outer {
+  class Inner { def n: Int = 1 }
+  def inner: Inner = new Inner()
+}
+object Main {
+  def take(x: p.Inner forSome { val p: Outer }): Int = x.n
+  def main(args: Array[String]): Unit = {
+    val n: Int = take(new Outer().inner)
+  }
+}
+"#);
+    }
+
+    #[test]
     fn value_existential_is_diagnosed() {
         let (_, _, diags) =
             typecheck_str("object M { def f(x: T forSome { val x: Int }): Unit = () }\n");

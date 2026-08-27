@@ -596,11 +596,31 @@ object Main {
     }
 
     #[test]
-    fn xml_attributes_are_unimplemented() {
-        let r = parse_str("object M { val x = <a href=\"x\">t</a> }\n");
+    fn xml_attributes_desugar() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val e = "1"
+    val x = <a b={e} c="t"/>
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(
+            dump.contains("UnprefixedAttribute"),
+            "expected UnprefixedAttribute: {dump}"
+        );
+        assert!(dump.contains("Elem"), "{dump}");
+    }
+
+    #[test]
+    fn xml_namespaces_are_unimplemented() {
+        let r = parse_str("object M { val x = <a p:b=\"t\"/> }\n");
         assert!(
             r.diags.iter().any(|d| d.message.contains("XML")),
-            "expected XML attributes diagnostic, got {:?}",
+            "expected XML namespaces diagnostic, got {:?}",
             r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

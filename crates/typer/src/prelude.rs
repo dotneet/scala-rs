@@ -2481,6 +2481,21 @@ fn add_xml(st: &mut SymbolTable) {
     let atom = class(st, xml, "Atom", "scala/xml/Atom", &[node_t]);
     let ad = ctor_field(st, atom, "data", Type::Any);
     st.get_mut(atom).ctor_fields = vec![ad];
+    let meta_t = Type::Class {
+        sym: metadata,
+        args: vec![],
+    };
+    let upa = class(
+        st,
+        xml,
+        "UnprefixedAttribute",
+        "scala/xml/UnprefixedAttribute",
+        &[meta_t.clone()],
+    );
+    let uk = ctor_field(st, upa, "key", Type::String);
+    let uv = ctor_field(st, upa, "value", Type::String);
+    let un = ctor_field(st, upa, "next", meta_t);
+    st.get_mut(upa).ctor_fields = vec![uk, uv, un];
 }
 
 /// `scala.Enumeration` plus inner `Value` (`Color.Red.toString` / `.id` against the jar).

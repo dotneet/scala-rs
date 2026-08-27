@@ -1,5 +1,6 @@
 object Main {
   def main(args: Array[String]): Unit = {
-    val x = <a p:b="t"/>
+    val e = "1"
+    println(<a b={e} c="t"/>)
   }
 }

@@ -15,7 +15,11 @@ object Lib {
   def h(x: Int @unchecked): Int = x
   val one: 1 = 1
   def lit(x: 1): Int = x
+  def nest(xs: List[_ <: List[_]]): Int = 0
+  def idRef(x: MixA with MixB { def f: Int }): MixA with MixB { def f: Int } = x
 }
+trait MixA { def a: Int }
+trait MixB { def b: Int }
 class Box[A](val value: A) {
   def get: A = value
 }

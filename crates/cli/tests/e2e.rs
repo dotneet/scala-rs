@@ -285,6 +285,10 @@ fn fixtures_existential_bounds() {
     check("existential_bounds");
 }
 #[test]
+fn fixtures_existential_val_ok() {
+    check("existential_val_ok");
+}
+#[test]
 fn fixtures_implicit_specific() {
     check("implicit_specific");
 }
@@ -929,6 +933,11 @@ fn scala_library_dual_run_xml_lit() {
     dual_run_xml_fixture("xml_lit");
 }
 
+#[test]
+fn scala_library_dual_run_xml_attr() {
+    dual_run_xml_fixture("xml_attr");
+}
+
 const LIBRARY_COLLIDERS: &[&str] = &[
     "scala/Option.class",
     "scala/Some.class",
@@ -1384,10 +1393,12 @@ fn find_scalac() -> Option<PathBuf> {
 /// (`MODULE$`) plus field accessors, extractor `unapply` so `p match { case
 /// Point(a, b) => a + b }` typechecks, an `object` method taking that case
 /// class, and SIP-23 literal types `val one: 1` / `def lit(x: 1)` (CONSTANTtpe).
-/// Remaining pickle holes (TREE annotation args, nested packed existentials,
-/// refinement pickle, leftover Flags such as MACRO / BRIDGE / VARARGS / JAVA on
-/// Java-defined members) are not claimed. Java `@Deprecated` on a Scala method
-/// is pickled as SYMANNOT so scalac `-deprecation` sees `Lib.gone`. If scalac
+/// Remaining pickle holes (non-literal TREE annotation args, leftover Flags
+/// such as MACRO / BRIDGE / VARARGS / JAVA on Java-defined members) are not
+/// claimed. Nested `List[_ <: List[_]]` and refinement
+/// `A with B { def f: Int }` are pickled so scalac 2.13.16 can typecheck
+/// `Lib.nest` / `Lib.idRef`. Java `@Deprecated` on a Scala method is pickled
+/// as SYMANNOT so scalac `-deprecation` sees `Lib.gone`. If scalac
 /// cannot read a probed shape, this test fails rather than claiming success.
 #[test]
 fn scalac_typechecks_against_our_classfiles_if_present() {
@@ -1439,6 +1450,9 @@ object UseLib {
     val one: 1 = Lib.one
     val lit: Int = Lib.lit(1)
     val gone: Int = Lib.gone
+    val nest: Int = Lib.nest(List(List(1)))
+    val y = Lib.idRef(new MixA with MixB { override def a: Int = 1; override def b: Int = 2; def f: Int = 3 })
+    val mix: Int = y.a + y.b + y.f
   }
 }
 "#,
@@ -1457,7 +1471,7 @@ object UseLib {
         .expect("scalac");
     assert!(
         output.status.success(),
-        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1) / Java @Deprecated Lib.gone): {}\n{}",
+        "scalac failed to typecheck against our classfiles (val / def params / id[T] / Box.get / Point(3, 4) companion apply / Lib.add / List[_] / @deprecated g / Holder.me this.type / List[_ <: AnyRef] / Int @unchecked / Lib.one : 1 / Lib.lit(1) / Java @Deprecated Lib.gone / List[_ <: List[_]] nest / MixA with MixB {{ def f: Int }} idRef): {}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );
