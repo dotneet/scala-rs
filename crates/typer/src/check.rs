@@ -5469,12 +5469,48 @@ impl Typer {
         out
     }
 
+    fn as_tuple_args(&self, ty: &Type) -> Option<Vec<Type>> {
+        match ty {
+            Type::Tuple(ts) => Some(ts.clone()),
+            Type::Class { sym, args } if !args.is_empty() => {
+                let n = self.st.get(*sym).name.clone();
+                (n.starts_with("Tuple") && n[5..].parse::<usize>() == Ok(args.len()))
+                    .then(|| args.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// `lub` cannot walk parents without the symbol table, so a common
     /// superclass of two case classes came out as `Any`.
     fn lub_ty(&self, a: &Type, b: &Type) -> Type {
         let simple = lub(a, b);
         if !matches!(simple, Type::Any) {
             return simple;
+        }
+        // `(String, JStr)` and `(String, JNum)` share `(String, Json)`. A
+        // tuple reaches here either as `Type::Tuple` or as `Class { TupleN }`.
+        if let (Some(xs), Some(ys)) = (self.as_tuple_args(a), self.as_tuple_args(b)) {
+            if xs.len() == ys.len() {
+                return Type::Tuple(xs.iter().zip(&ys).map(|(x, y)| self.lub_ty(x, y)).collect());
+            }
+        }
+        // `List[JStr]` and `List[JNum]` share `List[Json]` when the parameter
+        // is covariant; an invariant one has to fall through to the parents.
+        if let (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) = (a, b) {
+            if s1 == s2 && a1.len() == a2.len() && !a1.is_empty() {
+                let tps = self.st.get(*s1).tparams.clone();
+                let all_covariant = tps.len() == a1.len()
+                    && tps
+                        .iter()
+                        .all(|t| self.st.get(*t).flags.contains(Flags::COVARIANT));
+                if all_covariant {
+                    return Type::Class {
+                        sym: *s1,
+                        args: a1.iter().zip(a2).map(|(x, y)| self.lub_ty(x, y)).collect(),
+                    };
+                }
+            }
         }
         let mut work: std::collections::VecDeque<Type> = std::collections::VecDeque::new();
         work.push_back(a.clone());

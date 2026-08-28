@@ -313,3 +313,18 @@ fn scala_aliases_and_java_lang_are_in_scope() {
 fn ordering_members_are_checked() {
     compile_fails("implicit_scope_bad", "nosuchmember");
 }
+
+/// A whole small program: a sealed ADT, pattern matching, tuples in a list
+/// whose element type is a lub, and a mutable map.
+#[test]
+fn json_render_program_runs() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let out = compile_with("json_render", &["--scala-library", jar.to_str().unwrap()]);
+    assert_eq!(run_java(&out, Some(&jar)), expected_stdout("json_render"));
+    let _ = std::fs::remove_dir_all(&out);
+}

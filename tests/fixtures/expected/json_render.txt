@@ -1,0 +1,2 @@
+{"name":"scala-rs","version":1.0,"tags":["a","b"],"ok":true,"none":null}
+List((a,2), (b,1))
