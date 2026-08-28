@@ -128,5 +128,6 @@ conform!(
     strings,
     options,
     classes,
-    interp
+    interp,
+    chains
 );
