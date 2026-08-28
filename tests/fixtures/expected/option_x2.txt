@@ -1,0 +1,11 @@
+List(3)
+List()
+Right(3)
+Left(empty)
+Left(3)
+Right(empty)
+Some((3,4))
+None
+Some(three)
+None
+Some(5)

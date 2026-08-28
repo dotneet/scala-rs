@@ -3031,3 +3031,120 @@ object UseLib {
     let _ = fs::remove_dir_all(&out_lib);
     let _ = fs::remove_dir_all(&probe);
 }
+
+// --- Either / Try / Option members (agent/either-try) -----------------------
+
+#[test]
+fn scala_library_dual_run_either_ops() {
+    dual_run_fixture("either_ops");
+}
+
+#[test]
+fn scala_library_dual_run_either_left() {
+    dual_run_fixture("either_left");
+}
+
+#[test]
+fn scala_library_dual_run_either_for() {
+    dual_run_fixture("either_for");
+}
+
+#[test]
+fn fixtures_either_ops_bad_is_error() {
+    compile_fails_lib("either_ops_bad", "noSuchEitherMember is not a member");
+}
+
+/// `Either` only exists in the real library ABI; the private runtime must say
+/// so instead of silently accepting the program.
+#[test]
+fn fixtures_either_ops_needs_scala_library() {
+    compile_fails("either_ops", "Either");
+}
+
+/// `option_x1` only uses members the private runtime also implements, so it
+/// runs in both modes with identical output.
+#[test]
+fn fixtures_option_x1() {
+    check("option_x1");
+}
+
+#[test]
+fn scala_library_dual_run_option_x1() {
+    dual_run_fixture("option_x1");
+}
+
+#[test]
+fn scala_library_dual_run_option_x2() {
+    dual_run_fixture("option_x2");
+}
+
+#[test]
+fn fixtures_option_x1_bad_is_error() {
+    compile_fails("option_x1_bad", "noSuchOptionMember is not a member");
+}
+
+#[test]
+fn fixtures_option_x2_bad_is_error() {
+    compile_fails_lib("option_x2_bad", "noSuchEitherMember is not a member");
+}
+
+/// `Option.toRight` / `collect` / `flatten` need the real library ABI; the
+/// private runtime must reject them rather than emit a call that would not
+/// link.
+#[test]
+fn fixtures_option_x2_needs_scala_library() {
+    compile_fails("option_x2", "toList");
+}
+
+#[test]
+fn scala_library_dual_run_try_ops() {
+    dual_run_fixture("try_ops");
+}
+
+#[test]
+fn scala_library_dual_run_try_recover() {
+    dual_run_fixture("try_recover");
+}
+
+#[test]
+fn scala_library_dual_run_try_for() {
+    dual_run_fixture("try_for");
+}
+
+#[test]
+fn fixtures_try_ops_bad_is_error() {
+    compile_fails_lib("try_ops_bad", "noSuchTryMember is not a member");
+}
+
+/// `recover` takes a `PartialFunction`; a total function literal must not
+/// silently pass as one.
+#[test]
+fn fixtures_try_recover_bad_is_error() {
+    compile_fails_lib("try_recover_bad", "required: PartialFunction");
+}
+
+/// `scala.util.Try` is library-ABI only; the private runtime has no such class.
+#[test]
+fn fixtures_try_ops_needs_scala_library() {
+    compile_fails("try_ops", "Try");
+}
+
+/// `java.lang`'s common exceptions plus the `(String)` constructor and
+/// `getMessage` every `Throwable` has: the same source runs in both modes.
+#[test]
+fn fixtures_try_exceptions() {
+    check("try_exceptions");
+}
+
+#[test]
+fn scala_library_dual_run_try_exceptions() {
+    dual_run_fixture("try_exceptions");
+}
+
+#[test]
+fn fixtures_try_exceptions_bad_is_error() {
+    compile_fails(
+        "try_exceptions_bad",
+        "noSuchThrowableMember is not a member",
+    );
+}

@@ -1,0 +1,14 @@
+boom
+boom
+none
+Some(boom)
+None
+List(boom)
+Left(4)
+Right(7)
+Left(boom!)
+true
+false
+boom
+Left(boom)
+Some(Left(boom))

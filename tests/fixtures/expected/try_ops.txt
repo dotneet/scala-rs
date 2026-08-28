@@ -1,0 +1,23 @@
+true
+false
+false
+true
+5
+5
+-1
+Success(6)
+Failure(java.lang.ArithmeticException: / by zero)
+Success(10)
+Success(5)
+Some(5)
+None
+Right(5)
+Success(5)
+Success(7)
+5
+-1
+5
+true
+Success(15)
+2
+0

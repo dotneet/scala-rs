@@ -4732,6 +4732,31 @@ impl Typer {
                         }
                     }
                 }
+                // The first pass typed lambda arguments with no expected type,
+                // so a method type parameter that only shows up in a lambda's
+                // *result* (`Either.fold[C]`, `Try.fold[U]`, `Option.fold[B]`)
+                // is still uninstantiated. Now that the arguments carry their
+                // real types, infer it once more.
+                if !sym.is_none() {
+                    let tps = self.st.get(sym).tparams.clone();
+                    if matches!(&ret, Type::TypeParam(id) if tps.contains(id)) {
+                        let now: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+                        let inst: Vec<(SymbolId, Type)> = self
+                            .infer_method_tparams(sym, &param_tys, &now)
+                            .into_iter()
+                            .filter(|(_, t)| {
+                                !t.is_no_type()
+                                    && !t.is_error()
+                                    && !matches!(t, Type::Nothing | Type::TypeParam(_))
+                            })
+                            .collect();
+                        if !inst.is_empty() {
+                            let ids: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+                            let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+                            ret = crate::symbol::subst_tparams_slice(&ids, &args_t, &ret);
+                        }
+                    }
+                }
                 let leftover =
                     self.fill_defaults_and_implicits(tree.span, args, &param_tys, fun, pt);
                 let method_name = if !sym.is_none() {
@@ -4787,6 +4812,8 @@ impl Typer {
                                 ret = Type::Array(Box::new(fr.as_ref().widen_constant()));
                             }
                         }
+                    } else if let Some(t) = self.either_map_result(recv_ty.as_ref(), args) {
+                        ret = t;
                     } else if !self.is_with_filter_ty(recv_ty.as_ref()) {
                         if let Some(a0) = args.first() {
                             if let Type::Function { ret: fr, .. } = &a0.ty {
@@ -5074,9 +5101,56 @@ impl Typer {
             self.st.option_sym
         } else if n == "$colon$colon" || n == "Nil$" || n == "Nil" || n == "::" {
             self.st.list_sym
+        } else if n == "Left" || n == "Right" {
+            self.scala_class_named("Either").unwrap_or(id)
+        } else if n == "Success" || n == "Failure" || n == "Try$WithFilter" {
+            self.scala_class_named("Try").unwrap_or(id)
         } else {
             id
         }
+    }
+
+    /// `e.map(f)` on an `Either[A, B]` keeps the left type: `Either[A, C]`.
+    /// `e.left.map(f)` on a `LeftProjection[A, B]` keeps the right type.
+    /// Returns `None` for every other receiver so the generic single-parameter
+    /// collection rule still applies.
+    fn either_map_result(&self, recv_ty: Option<&Type>, args: &[Tree]) -> Option<Type> {
+        let Type::Function { ret: fr, .. } = &args.first()?.ty else {
+            return None;
+        };
+        let to = fr.as_ref().widen_constant();
+        let (sym, targs) = match recv_ty? {
+            Type::Class { sym, args } if args.len() == 2 => (*sym, args),
+            _ => return None,
+        };
+        let name = self.st.get(sym).name.as_str();
+        let either = self.scala_class_named("Either")?;
+        if is_right_biased_either(&self.st, sym) {
+            Some(Type::Class {
+                sym: either,
+                args: vec![targs[0].clone(), to],
+            })
+        } else if name == "LeftProjection" {
+            Some(Type::Class {
+                sym: either,
+                args: vec![to, targs[1].clone()],
+            })
+        } else {
+            None
+        }
+    }
+
+    /// A class symbol from the `scala` package by name (`Either`, `Try`, …).
+    fn scala_class_named(&self, name: &str) -> Option<SymbolId> {
+        self.st
+            .get(self.st.scala_pkg)
+            .members
+            .iter()
+            .copied()
+            .find(|id| {
+                self.st.get(*id).name == name
+                    && self.st.get(*id).kind == crate::symbol::SymKind::Class
+            })
     }
 
     fn is_with_filter_ty(&self, ty: Option<&Type>) -> bool {
@@ -5087,7 +5161,7 @@ impl Typer {
             return false;
         };
         let n = self.st.get(id).name.as_str();
-        n == "WithFilter" || n == "Option$WithFilter"
+        n == "WithFilter" || n == "Option$WithFilter" || n == "Try$WithFilter"
     }
 
     fn is_array_ops_ty(&self, ty: Option<&Type>) -> bool {
@@ -5111,6 +5185,13 @@ impl Typer {
                     sym: self.tuple2_sym(),
                     args: args.clone(),
                 })
+            }
+            // 2.13's `Either` is right-biased: `map` / `flatMap` / `foreach`
+            // see the `B` of `Either[A, B]`, not the `A`.
+            Type::Class { sym, args }
+                if args.len() == 2 && is_right_biased_either(&self.st, *sym) =>
+            {
+                Some(args[1].clone())
             }
             Type::Class { sym, .. } if self.st.get(*sym).name == "Range" => Some(Type::Int),
             Type::Class { sym, .. } if self.st.get(*sym).name == "BitSet" => Some(Type::Int),
@@ -6134,6 +6215,14 @@ impl Typer {
         if matches!(arg, Type::Function { .. }) && matches!(param, Type::Function { .. }) {
             return Some(8);
         }
+        // A `{ case … }` literal reaches overload resolution as a one-parameter
+        // function; it inhabits a `PartialFunction[A, B]` parameter
+        // (`Try.recover`, `Option.collect`, `List.collect`).
+        if matches!(arg, Type::Function { params, .. } if params.len() == 1)
+            && partial_function_type(&self.st, param).is_some()
+        {
+            return Some(7);
+        }
         if matches!(param, Type::TypeParam(_)) || matches!(arg, Type::TypeParam(_)) {
             return Some(2);
         }
@@ -6153,14 +6242,30 @@ impl Typer {
     }
 
     fn type_function(&mut self, vparams: &mut Vec<Tree>, body: &mut Tree, pt: &Type) -> Type {
-        let pf_result = partial_function_type(&self.st, pt);
+        // Only a `{ case … }` literal inhabits a `PartialFunction`; the parser
+        // encodes one as `x$pf => x$pf match { … }`. A total function literal
+        // must still be rejected, the way nsc rejects
+        // `t.recover((x: Int) => x + 1)`.
+        let pf_result = if is_case_block_literal(vparams, body) {
+            partial_function_type(&self.st, pt)
+        } else {
+            None
+        };
         let sam = if pf_result.is_none() {
             self.st.sam_sig(pt)
         } else {
             None
         };
         let (pts, ret_pt) = if let Some((from, to)) = &pf_result {
-            (vec![from.clone()], to.clone())
+            // The prelude spells the result of `collect` / `recover` as `Any`
+            // because the real signature is polymorphic. Leave it open so the
+            // case bodies supply it and `Option[String]` survives.
+            let to = if matches!(to, Type::Any) {
+                Type::NoType
+            } else {
+                to.clone()
+            };
+            (vec![from.clone()], to)
         } else if let Some(sam) = &sam {
             (sam.param_tys.clone(), sam.ret_ty.clone())
         } else {
@@ -6234,7 +6339,15 @@ impl Typer {
             ret_pt
         };
         self.st.pop_scope();
-        if pf_result.is_some() {
+        if let Some((from, to)) = pf_result {
+            if let (Type::Any, Type::Class { sym, .. }) = (&to, pt) {
+                if !ret.is_no_type() && !ret.is_error() {
+                    return Type::Class {
+                        sym: *sym,
+                        args: vec![from, ret.widen_constant()],
+                    };
+                }
+            }
             pt.clone()
         } else if sam.is_some() && param_tys.len() == pts.len() {
             pt.clone()
@@ -9107,6 +9220,29 @@ fn is_function_pt(pt: &Type) -> bool {
         _ => false,
     }
 }
+
+/// `scala.util.Either` and its two cases. 2.13 made them right-biased, so the
+/// "element" of an `Either[A, B]` is its `B`. Matched by JVM name so a user
+/// class that happens to be called `Either` keeps the ordinary rule.
+fn is_right_biased_either(st: &SymbolTable, id: SymbolId) -> bool {
+    if id.is_none() {
+        return false;
+    }
+    matches!(
+        st.get(id).jvm_name.as_str(),
+        "scala/util/Either" | "scala/util/Left" | "scala/util/Right"
+    )
+}
+
+/// The parser desugars `{ case … }` into `x$pf => x$pf match { case … }`.
+fn is_case_block_literal(vparams: &[Tree], body: &Tree) -> bool {
+    vparams.len() == 1
+        && vparams[0].name() == Some(PF_PARAM)
+        && matches!(&body.kind, TreeKind::Match { .. })
+}
+
+/// Name the parser gives the synthesized parameter of a `{ case … }` literal.
+const PF_PARAM: &str = "x$pf";
 
 fn is_partial_function_sym(st: &SymbolTable, id: SymbolId) -> bool {
     if id.is_none() {
