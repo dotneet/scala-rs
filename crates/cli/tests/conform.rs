@@ -199,5 +199,7 @@ conform!(
     case_companion,
     class_of,
     variance,
-    companion_private
+    companion_private,
+    numeric_ops,
+    extractor_bind
 );

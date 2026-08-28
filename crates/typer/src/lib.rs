@@ -15,6 +15,7 @@ mod prelude_either;
 mod prelude_lang;
 mod prelude_lowbound;
 mod prelude_numeric;
+mod prelude_numops;
 mod prelude_reflect;
 mod prelude_seq;
 mod prelude_text;

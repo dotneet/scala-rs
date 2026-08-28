@@ -587,6 +587,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     add_scala_aliases(st);
     st.enter_in_current("::", st.cons_sym);
     st.enter_in_current("Ordered", ordered);
+    crate::prelude_numops::install(st);
     crate::prelude_variance::install(st);
 }
 
@@ -1521,6 +1522,26 @@ fn add_double_members(st: &mut SymbolTable) {
 
 fn add_float_members(st: &mut SymbolTable) {
     let c = st.float_sym;
+    for op in ["+", "-", "*", "/", "%"] {
+        method(
+            st,
+            c,
+            op,
+            vec![Type::Float],
+            Type::Float,
+            Intrinsic::FloatBin(op),
+        );
+    }
+    for op in ["==", "!=", "<", "<=", ">", ">="] {
+        method(
+            st,
+            c,
+            op,
+            vec![Type::Float],
+            Type::Boolean,
+            Intrinsic::FloatBin(op),
+        );
+    }
     method(
         st,
         c,
@@ -6130,6 +6151,21 @@ fn add_predef_members(
                 args: vec![Type::TypeParam(t)],
             }),
         };
+    }
+    // `Any.getClass(): Class[_]`, inherited from `java.lang.Object`.
+    if let Some(jclass) = crate::classpath::find_by_jvm(st, "java/lang/Class") {
+        let any = st.any_sym;
+        method(
+            st,
+            any,
+            "getClass",
+            vec![],
+            Type::Class {
+                sym: jclass,
+                args: vec![Type::Any],
+            },
+            Intrinsic::GetClass,
+        );
     }
     method(st, owner, "println", vec![], Type::Unit, Intrinsic::Println);
     method(

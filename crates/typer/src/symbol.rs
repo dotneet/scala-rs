@@ -98,6 +98,7 @@ pub enum Intrinsic {
     LongUn(&'static str),
     DoubleBin(&'static str),
     DoubleUn(&'static str),
+    FloatBin(&'static str),
     FloatUn(&'static str),
     BoolBin(&'static str),
     BoolUn(&'static str),
@@ -139,6 +140,8 @@ pub enum Intrinsic {
     FloatToDouble,
     /// `classOf[T]`: a class constant for the erasure of `T`.
     ClassOf,
+    /// `Any.getClass`: `Object.getClass`, or the boxed `TYPE` for a primitive.
+    GetClass,
     /// `TupleN.apply` — nsc allocates the tuple directly, so no `TupleN$`
     /// module classfile is needed on the private runtime.
     NewTuple(usize),

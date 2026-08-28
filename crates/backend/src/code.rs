@@ -585,6 +585,12 @@ impl Assembler {
         let _ = self.pop_v();
         self.push_v(VType::Double);
     }
+    fn bin_float(&mut self, op: u8) {
+        self.emit_op(op);
+        let _ = self.pop_v();
+        let _ = self.pop_v();
+        self.push_v(VType::Float);
+    }
 
     pub fn iadd(&mut self) {
         self.bin_int(0x60);
@@ -635,6 +641,18 @@ impl Assembler {
     pub fn ldiv(&mut self) {
         self.bin_long(0x6d);
     }
+    pub fn lrem(&mut self) {
+        self.bin_long(0x71);
+    }
+    pub fn land(&mut self) {
+        self.bin_long(0x7f);
+    }
+    pub fn lor(&mut self) {
+        self.bin_long(0x81);
+    }
+    pub fn lxor(&mut self) {
+        self.bin_long(0x83);
+    }
     pub fn lneg(&mut self) {
         self.emit_op(0x75);
     }
@@ -651,8 +669,27 @@ impl Assembler {
     pub fn ddiv(&mut self) {
         self.bin_double(0x6f);
     }
+    pub fn drem(&mut self) {
+        self.bin_double(0x73);
+    }
     pub fn dneg(&mut self) {
         self.emit_op(0x77);
+    }
+
+    pub fn fadd(&mut self) {
+        self.bin_float(0x62);
+    }
+    pub fn fsub(&mut self) {
+        self.bin_float(0x66);
+    }
+    pub fn fmul(&mut self) {
+        self.bin_float(0x6a);
+    }
+    pub fn fdiv(&mut self) {
+        self.bin_float(0x6e);
+    }
+    pub fn frem(&mut self) {
+        self.bin_float(0x72);
     }
     pub fn fneg(&mut self) {
         self.emit_op(0x76);
@@ -688,6 +725,20 @@ impl Assembler {
     }
     pub fn dcmpl(&mut self) {
         self.emit_op(0x97);
+        let _ = self.pop_v();
+        let _ = self.pop_v();
+        self.push_v(VType::Integer);
+    }
+    /// `fcmpg` / `dcmpg`: like `fcmpl` / `dcmpl` but NaN pushes 1, which is
+    /// what `<` and `<=` need so that a NaN operand compares false.
+    pub fn fcmpg(&mut self) {
+        self.emit_op(0x96);
+        let _ = self.pop_v();
+        let _ = self.pop_v();
+        self.push_v(VType::Integer);
+    }
+    pub fn dcmpg(&mut self) {
+        self.emit_op(0x98);
         let _ = self.pop_v();
         let _ = self.pop_v();
         self.push_v(VType::Integer);

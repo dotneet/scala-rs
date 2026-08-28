@@ -5241,6 +5241,16 @@ fn gen_apply(
                 asm.dneg();
                 return;
             }
+            Intrinsic::FloatBin(op) => {
+                gen_expr(asm, frame, ctx, qual);
+                widen_numeric(asm, &qual.ty, &Type::Float);
+                if let Some(r) = args.first() {
+                    gen_expr(asm, frame, ctx, r);
+                    widen_numeric(asm, &r.ty, &Type::Float);
+                }
+                emit_float_bin(asm, op);
+                return;
+            }
             Intrinsic::FloatUn("-") => {
                 gen_expr(asm, frame, ctx, qual);
                 asm.fneg();
@@ -5282,6 +5292,22 @@ fn gen_apply(
                     emit_box(asm, &qual.ty);
                 }
                 asm.invokevirtual("java/lang/Object", "toString", "()Ljava/lang/String;");
+                return;
+            }
+            Intrinsic::GetClass => {
+                gen_expr(asm, frame, ctx, qual);
+                // `1.getClass` is `Integer.TYPE`, not `Integer.class`; the
+                // receiver is still evaluated for its effects.
+                if is_jvm_primitive(&qual.ty) {
+                    if matches!(qual.ty, Type::Long | Type::Double) {
+                        asm.pop2();
+                    } else {
+                        asm.pop();
+                    }
+                    emit_class_constant(asm, ctx, &qual.ty);
+                } else {
+                    asm.invokevirtual("java/lang/Object", "getClass", "()Ljava/lang/Class;");
+                }
                 return;
             }
             Intrinsic::Identity => {
@@ -11456,7 +11482,14 @@ fn emit_long_bin(asm: &mut Assembler, op: &str) {
         "-" => asm.lsub(),
         "*" => asm.lmul(),
         "/" => asm.ldiv(),
-        _ => {}
+        "%" => asm.lrem(),
+        "&" => asm.land(),
+        "|" => asm.lor(),
+        "^" => asm.lxor(),
+        _ => {
+            asm.lcmp();
+            emit_cmp_to_bool(asm, op);
+        }
     }
 }
 
@@ -11466,8 +11499,61 @@ fn emit_double_bin(asm: &mut Assembler, op: &str) {
         "-" => asm.dsub(),
         "*" => asm.dmul(),
         "/" => asm.ddiv(),
-        _ => {}
+        "%" => asm.drem(),
+        _ => {
+            // javac's choice: `<` and `<=` use the `g` form so a NaN operand
+            // makes the test false; everything else uses the `l` form.
+            if matches!(op, "<" | "<=") {
+                asm.dcmpg();
+            } else {
+                asm.dcmpl();
+            }
+            emit_cmp_to_bool(asm, op);
+        }
     }
+}
+
+fn emit_float_bin(asm: &mut Assembler, op: &str) {
+    match op {
+        "+" => asm.fadd(),
+        "-" => asm.fsub(),
+        "*" => asm.fmul(),
+        "/" => asm.fdiv(),
+        "%" => asm.frem(),
+        _ => {
+            if matches!(op, "<" | "<=") {
+                asm.fcmpg();
+            } else {
+                asm.fcmpl();
+            }
+            emit_cmp_to_bool(asm, op);
+        }
+    }
+}
+
+/// Turn the `-1 | 0 | 1` a `?cmp?` instruction leaves on the stack into the
+/// boolean the comparison operator returns.
+fn emit_cmp_to_bool(asm: &mut Assembler, op: &str) {
+    let yes = asm.fresh_label();
+    let end = asm.fresh_label();
+    match op {
+        "==" => asm.ifeq(yes),
+        "!=" => asm.ifne(yes),
+        "<" => asm.iflt(yes),
+        "<=" => asm.ifle(yes),
+        ">" => asm.ifgt(yes),
+        ">=" => asm.ifge(yes),
+        _ => {
+            asm.pop();
+            asm.iconst(0);
+            return;
+        }
+    }
+    asm.iconst(0);
+    asm.goto(end);
+    asm.mark(yes);
+    asm.iconst(1);
+    asm.mark(end);
 }
 
 fn gen_bool_and(
@@ -11998,8 +12084,8 @@ fn gen_unapply_pattern(
         if let Some(a) = args.first() {
             if is_jvm_primitive(&a.ty) {
                 emit_unbox(asm, &a.ty);
-            } else if matches!(a.ty, Type::String) {
-                asm.checkcast("java/lang/String");
+            } else {
+                emit_pattern_cast(asm, ctx, &a.ty);
             }
             bind_subpattern(asm, frame, ctx, a, fail);
         } else {
@@ -12013,11 +12099,30 @@ fn gen_unapply_pattern(
             asm.getfield("scala/Tuple2", fname, "Ljava/lang/Object;");
             if is_jvm_primitive(&a.ty) {
                 emit_unbox(asm, &a.ty);
+            } else {
+                emit_pattern_cast(asm, ctx, &a.ty);
             }
             bind_subpattern(asm, frame, ctx, a, fail);
         }
         asm.pop();
     }
+}
+
+/// `Option.get` yields `Object`; a bound pattern variable of a narrower
+/// reference type needs the cast the verifier expects.
+fn emit_pattern_cast(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
+    if is_jvm_primitive(ty) {
+        return;
+    }
+    let target = match ty {
+        Type::Array(_) => jvm_desc(ctx.st, ty),
+        Type::NoType | Type::Error | Type::Any | Type::AnyRef => return,
+        _ => type_jvm_name(ctx.st, ty),
+    };
+    if target.is_empty() || target == "java/lang/Object" {
+        return;
+    }
+    asm.checkcast(&target);
 }
 
 fn gen_unapply_seq_bind(
@@ -12045,8 +12150,8 @@ fn gen_unapply_seq_bind(
         emit_list_head(asm, ctx);
         if is_jvm_primitive(&a.ty) {
             emit_unbox(asm, &a.ty);
-        } else if matches!(a.ty, Type::String) {
-            asm.checkcast("java/lang/String");
+        } else {
+            emit_pattern_cast(asm, ctx, &a.ty);
         }
         bind_subpattern(asm, frame, ctx, a, fail);
         load(asm, list_slot, JvmSort::Ref);
