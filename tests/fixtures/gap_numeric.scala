@@ -1,0 +1,26 @@
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(Int.MaxValue)
+    println(Int.MinValue)
+    println(Long.MaxValue)
+    println(Long.MinValue)
+    println(Short.MaxValue)
+    println(Short.MinValue)
+    println(Byte.MaxValue)
+    println(Byte.MinValue)
+    println(Char.MaxValue.toInt)
+    println(Char.MinValue.toInt)
+    println(Double.MaxValue)
+    println(Double.MinValue)
+    println(Double.PositiveInfinity)
+    println(Double.NegativeInfinity)
+    println(Double.NaN)
+    println(Double.MinPositiveValue)
+    println(Float.MaxValue)
+    println(Float.MinValue)
+    println(Float.PositiveInfinity)
+    println(Float.NegativeInfinity)
+    println(Float.NaN)
+    println(Float.MinPositiveValue)
+  }
+}

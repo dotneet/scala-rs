@@ -58,6 +58,10 @@ pub enum Intrinsic {
     AnyNe,
     /// `Any.synchronized` (monitor enter/exit around a by-name body).
     Synchronized,
+    /// `Any.asInstanceOf[T]`: cast/unbox to the explicit type argument.
+    AsInstanceOf,
+    /// `Any.isInstanceOf[T]`: JVM `instanceof` against the explicit type argument.
+    IsInstanceOf,
 }
 
 #[derive(Clone, Debug)]
@@ -332,11 +336,20 @@ impl SymbolTable {
             Type::AnyRef => Some(self.anyref_sym),
             Type::AnyVal => Some(self.anyval_sym),
             Type::Array(_) => Some(self.array_sym),
+            // `Null` is a subtype of every reference type; its only members
+            // are those of `AnyRef` (`asInstanceOf`, `eq`, ... via `Any`).
+            Type::Null => Some(self.anyref_sym),
             Type::Named { name, .. } => self
                 .lookup(name)
                 .into_iter()
                 .find(|s| self.get(*s).is_class_like()),
-            Type::TypeParam(_) => None,
+            // An (unbounded) type parameter's members are `Any`'s (`asInstanceOf`,
+            // `==`, ...); a bounded one (`T <: Foo`) resolves through the bound,
+            // same as nsc.
+            Type::TypeParam(id) => match &self.get(*id).bound_hi {
+                Some(hi) => self.class_sym_of(hi),
+                None => Some(self.any_sym),
+            },
             Type::Applied { ctor, .. } => self.class_sym_of(ctor),
             Type::TypeMember(id) => {
                 if !self.get(*id).tparams.is_empty() {

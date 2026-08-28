@@ -1544,6 +1544,11 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        if self.st.get(class_id).flags.contains(Flags::CASE)
+            && !impl_.body.iter().any(|t| t.name() == Some("copy"))
+        {
+            emit_case_copy(&mut b, self.st, class_id);
+        }
         self.emit_default_getters(&mut b, class_id);
         self.emit_trait_val_accessors(&mut b, class_id, &impl_.body);
         self.emit_super_accessors(&mut b, class_id);
@@ -3321,6 +3326,51 @@ fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
     });
 }
 
+/// The case class's own `copy(f1, f2, ...): C = new C(f1, f2, ...)`, mirroring
+/// `emit_case_apply` on the companion. Uses the synthetic `copy` method's own
+/// parameter symbols (`crate::check::synthesize_case_members` /
+/// `type_class` in the typer) rather than `ctor_fields` directly, since those
+/// carry `copy`'s own resolved parameter types.
+fn emit_case_copy(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
+    let Some(copy_id) = st.get(class_id).members.iter().copied().find(|&m| {
+        st.get(m).kind == SymKind::Method
+            && st.get(m).name == "copy"
+            && st.get(m).flags.contains(Flags::SYNTHETIC)
+    }) else {
+        return;
+    };
+    let copy_params = st.get(copy_id).params.clone();
+    if copy_params.is_empty() {
+        return;
+    }
+    let class_jvm = class_internal(st, class_id);
+    let mut params = Vec::new();
+    let mut locals = 1u16;
+    let mut loads = Vec::new();
+    for f in &copy_params {
+        let ty = st.get(*f).ty.clone();
+        let sort = jvm_sort(&ty);
+        loads.push((locals, sort));
+        locals += sort.slots();
+        params.push(ty);
+    }
+    let ret = Type::Class {
+        sym: class_id,
+        args: vec![],
+    };
+    let desc = jvm_method_desc(st, &params, &ret);
+    let ctor_d = jvm_method_desc(st, &params, &Type::Unit);
+    b.add_code(ACC_PUBLIC, "copy", &desc, locals.max(1), |asm| {
+        asm.new_obj(&class_jvm);
+        asm.dup();
+        for (slot, sort) in &loads {
+            load(asm, *slot, *sort);
+        }
+        asm.invokespecial(&class_jvm, "<init>", &ctor_d);
+        asm.areturn();
+    });
+}
+
 // ---------------------------------------------------------------------------
 // bytecode helpers
 // ---------------------------------------------------------------------------
@@ -3643,7 +3693,30 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
         TreeKind::Ident { .. } => gen_ident(asm, frame, ctx, tree),
         TreeKind::Select { qual, name } => gen_select(asm, frame, ctx, tree, qual, name),
         TreeKind::Apply { fun, args } => gen_apply(asm, frame, ctx, tree, fun, args),
-        TreeKind::TypeApply { fun, .. } => gen_expr(asm, frame, ctx, fun),
+        TreeKind::TypeApply { fun, args } => {
+            // `fun` alone (a bare `Select`) still carries the *unsubstituted*
+            // type-parameter as its `.ty` (only the outer `TypeApply` node got
+            // the concrete type argument substituted in during typechecking),
+            // so `asInstanceOf`/`isInstanceOf` must be special-cased here where
+            // the resolved type is actually available.
+            if let TreeKind::Select { qual, .. } = &fun.kind {
+                if !fun.sym.is_none() {
+                    let ic = ctx.st.get(fun.sym).intrinsic;
+                    if matches!(ic, Intrinsic::AsInstanceOf) {
+                        gen_expr(asm, frame, ctx, qual);
+                        emit_as_instance_of(asm, ctx, &tree.ty);
+                        return;
+                    }
+                    if matches!(ic, Intrinsic::IsInstanceOf) {
+                        gen_expr(asm, frame, ctx, qual);
+                        let target = args.first().map(|a| &a.ty).unwrap_or(&Type::Any);
+                        emit_is_instance_of(asm, ctx, target);
+                        return;
+                    }
+                }
+            }
+            gen_expr(asm, frame, ctx, fun)
+        }
         TreeKind::Function { .. } => gen_function(asm, frame, ctx, tree),
         TreeKind::Typed { expr, .. } => {
             gen_expr(asm, frame, ctx, expr);
@@ -4071,6 +4144,14 @@ fn gen_select(
                     asm.i2b();
                 } else if matches!(ic, Intrinsic::IntToShort) {
                     asm.i2s();
+                } else if matches!(ic, Intrinsic::AsInstanceOf) {
+                    // Reached without going through the `TypeApply` special case
+                    // in `gen_expr` (e.g. a bare `.asInstanceOf` reference); the
+                    // best available type here is `tree.ty`, which may still be
+                    // the unsubstituted type parameter for a degenerate caller.
+                    emit_as_instance_of(asm, ctx, &tree.ty);
+                } else if matches!(ic, Intrinsic::IsInstanceOf) {
+                    emit_is_instance_of(asm, ctx, &tree.ty);
                 } else if matches!(ic, Intrinsic::NotImplemented) {
                     if ctx.library_abi {
                         // Receiver was already pushed; Predef.??? is MODULE$.???().
@@ -7749,6 +7830,67 @@ fn emit_unbox_inner(asm: &mut Assembler, ty: &Type) {
         }
         _ => {}
     }
+}
+
+/// Boxed wrapper class for a primitive (`Int` -> `java/lang/Integer`, ...),
+/// used by `asInstanceOf`/`isInstanceOf` against an `Any`-erased (`Object`)
+/// receiver that may hold a boxed primitive.
+fn boxed_internal_name(ty: &Type) -> Option<&'static str> {
+    match ty {
+        Type::Int => Some("java/lang/Integer"),
+        Type::Boolean => Some("java/lang/Boolean"),
+        Type::Byte => Some("java/lang/Byte"),
+        Type::Short => Some("java/lang/Short"),
+        Type::Long => Some("java/lang/Long"),
+        Type::Double => Some("java/lang/Double"),
+        Type::Char => Some("java/lang/Character"),
+        Type::Float => Some("java/lang/Float"),
+        _ => None,
+    }
+}
+
+/// `recv.asInstanceOf[target]`: the receiver is already on the stack (`Object`,
+/// since `Any` erases there). Primitives unbox from their boxed wrapper;
+/// `String`/class types `checkcast`; unbounded/erased targets (`Any`,
+/// `AnyRef`, a type parameter, ...) need no cast since they are already
+/// `Object`-compatible post-erasure — matching nsc, which likewise only
+/// emits `checkcast` against a type with real runtime class information.
+fn emit_as_instance_of(asm: &mut Assembler, ctx: &EmitCtx, target: &Type) {
+    if boxed_internal_name(target).is_some() {
+        emit_unbox(asm, target);
+        return;
+    }
+    match target {
+        Type::String => asm.checkcast("java/lang/String"),
+        Type::Unit | Type::NoType => {
+            // Rare in practice; the cast result is discarded by every real
+            // caller. Leave the (Object) receiver on the stack rather than
+            // guessing at a BoxedUnit representation here.
+        }
+        _ => {
+            if let Some(cn) = checkcast_internal(ctx.st, target) {
+                if cn != "java/lang/Object" {
+                    asm.checkcast(&cn);
+                }
+            }
+        }
+    }
+}
+
+/// `recv.isInstanceOf[target]`: the receiver is already on the stack.
+/// Primitives check against the boxed wrapper; erased/unbounded targets fall
+/// back to `java/lang/Object` (always true for a non-null receiver), which is
+/// also what nsc's own erasure does for an unchecked type parameter.
+fn emit_is_instance_of(asm: &mut Assembler, ctx: &EmitCtx, target: &Type) {
+    if let Some(bn) = boxed_internal_name(target) {
+        asm.instanceof(bn);
+        return;
+    }
+    let cn = match target {
+        Type::String => "java/lang/String".to_string(),
+        _ => checkcast_internal(ctx.st, target).unwrap_or_else(|| "java/lang/Object".to_string()),
+    };
+    asm.instanceof(&cn);
 }
 
 fn gen_function_apply(

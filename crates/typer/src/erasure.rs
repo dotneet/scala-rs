@@ -5,7 +5,7 @@
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use std::collections::HashSet;
 
-use crate::symbol::SymbolTable;
+use crate::symbol::{Intrinsic, SymbolTable};
 
 /// Rewrite `tree` in place after typer, mutating symbol types to their JVM
 /// (erased) forms.
@@ -416,11 +416,31 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             return;
         }
         TreeKind::TypeApply { fun, args } => {
+            // `x.asInstanceOf[T]` / `x.isInstanceOf[T]` are generic only in the
+            // typechecker's eyes: `fun`'s own type is the *unsubstituted* type
+            // parameter (only this outer node got `T` substituted in during
+            // typing, in `type_expr`'s `TypeApply` case). The general rule
+            // below — reuse `fun`'s erased type — would overwrite that
+            // resolved `T` with the erased type parameter (its `Any` bound),
+            // which is exactly the type backend codegen needs to know to cast
+            // to. Every other generic method already erases to the same
+            // `Object`-ish shape either way, so only these two need the
+            // exception.
+            let cast_ty = if fun.sym.is_none() {
+                None
+            } else {
+                match st.get(fun.sym).intrinsic {
+                    Intrinsic::AsInstanceOf | Intrinsic::IsInstanceOf => {
+                        Some(erase_ty(&tree.ty, st))
+                    }
+                    _ => None,
+                }
+            };
             for a in args {
                 erase_tree(a, st, None);
             }
             erase_tree(fun, st, None);
-            tree.ty = fun.ty.clone();
+            tree.ty = cast_ty.unwrap_or_else(|| fun.ty.clone());
         }
         TreeKind::Typed { expr, tpt } => {
             erase_tree(tpt, st, None);
