@@ -196,5 +196,6 @@ conform!(
     decl_forms,
     layout,
     companion_extends,
-    case_companion
+    case_companion,
+    class_of
 );

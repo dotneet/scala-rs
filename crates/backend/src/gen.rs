@@ -4222,6 +4222,12 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
             // the concrete type argument substituted in during typechecking),
             // so `asInstanceOf`/`isInstanceOf` must be special-cased here where
             // the resolved type is actually available.
+            // `classOf[T]` is a class constant, not a call.
+            if !fun.sym.is_none() && matches!(ctx.st.get(fun.sym).intrinsic, Intrinsic::ClassOf) {
+                let target = args.first().map(|a| a.ty.clone()).unwrap_or(Type::AnyRef);
+                emit_class_constant(asm, ctx, &target);
+                return;
+            }
             if let TreeKind::Select { qual, .. } = &fun.kind {
                 if !fun.sym.is_none() {
                     let ic = ctx.st.get(fun.sym).intrinsic;
@@ -13206,5 +13212,32 @@ fn append_desc(ty: &Type) -> &'static str {
         Type::Boolean => "(Z)Ljava/lang/StringBuilder;",
         Type::String => "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
         _ => "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
+    }
+}
+
+/// `classOf[T]`: `ldc` of the class constant, or the boxed type's `TYPE`
+/// field for a primitive, as nsc emits.
+fn emit_class_constant(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
+    let boxed = |asm: &mut Assembler, owner: &str| {
+        asm.getstatic(owner, "TYPE", "Ljava/lang/Class;");
+    };
+    match ty {
+        Type::Int => boxed(asm, "java/lang/Integer"),
+        Type::Long => boxed(asm, "java/lang/Long"),
+        Type::Double => boxed(asm, "java/lang/Double"),
+        Type::Float => boxed(asm, "java/lang/Float"),
+        Type::Short => boxed(asm, "java/lang/Short"),
+        Type::Byte => boxed(asm, "java/lang/Byte"),
+        Type::Char => boxed(asm, "java/lang/Character"),
+        Type::Boolean => boxed(asm, "java/lang/Boolean"),
+        Type::Unit => boxed(asm, "java/lang/Void"),
+        Type::Array(_) => {
+            let d = jvm_desc(ctx.st, ty);
+            asm.ldc_class(&d);
+        }
+        other => {
+            let n = type_jvm_name(ctx.st, other);
+            asm.ldc_class(&n);
+        }
     }
 }

@@ -137,6 +137,8 @@ pub enum Intrinsic {
     IntToFloat,
     LongToFloat,
     FloatToDouble,
+    /// `classOf[T]`: a class constant for the erasure of `T`.
+    ClassOf,
     /// `TupleN.apply` — nsc allocates the tuple directly, so no `TupleN$`
     /// module classfile is needed on the private runtime.
     NewTuple(usize),

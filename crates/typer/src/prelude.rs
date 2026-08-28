@@ -6116,6 +6116,19 @@ fn add_predef_members(
         Type::ModuleRef(id) => id,
         _ => p,
     };
+    // nsc `Predef.classOf[T]: Class[T]` — a class literal, not a real call.
+    if let Some(jclass) = crate::classpath::find_by_jvm(st, "java/lang/Class") {
+        let co = method(st, owner, "classOf", vec![], Type::Any, Intrinsic::ClassOf);
+        let t = type_param(st, co, "T");
+        st.get_mut(co).tparams = vec![t];
+        st.get_mut(co).ty = Type::Method {
+            paramss: Vec::new(),
+            ret: Box::new(Type::Class {
+                sym: jclass,
+                args: vec![Type::TypeParam(t)],
+            }),
+        };
+    }
     method(st, owner, "println", vec![], Type::Unit, Intrinsic::Println);
     method(
         st,
