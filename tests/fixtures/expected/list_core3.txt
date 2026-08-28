@@ -1,0 +1,16 @@
+314
+3-1-4
+[3, 1, 4]
+8
+12
+1
+4
+4
+1
+8
+4
+4.0
+pear/fig/apple
+apple
+pear
+apple

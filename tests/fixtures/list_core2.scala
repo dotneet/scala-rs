@@ -1,0 +1,26 @@
+object Main {
+  def main(args: Array[String]): Unit = {
+    val xs = List(3, 1, 4)
+    println(xs.size)
+    println(xs.length)
+    println(xs.isEmpty)
+    println(xs.nonEmpty)
+    println(xs.head)
+    println(xs.last)
+    println(xs.headOption)
+    println(xs.lastOption)
+    println(xs.contains(4))
+    println(xs.contains(9))
+    println(xs.exists(x => x > 3))
+    println(xs.forall(x => x > 0))
+    println(xs.count(x => x > 1))
+    println(xs.find(x => x > 1))
+    println(xs.indexOf(4))
+    println(xs.indexWhere(x => x > 3))
+    println(xs.indexWhere(x => x > 9))
+    println(xs(2))
+    val empty = List.apply[Int]()
+    println(empty.isEmpty)
+    println(empty.headOption)
+  }
+}

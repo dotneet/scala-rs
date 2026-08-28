@@ -1,0 +1,11 @@
+3
+7
+Vector(3, 1, 3)
+List(3, 1, 3)
+3,1,3
+true
+false
+ba
+Vector(b, a)
+3
+List(3, 1);List(3)

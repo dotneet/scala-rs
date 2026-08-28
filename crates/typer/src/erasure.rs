@@ -478,7 +478,12 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                         && is_ref_erased(&ret_erased)
                         && !matches!(ret_erased, Type::String)
                     {
+                        // `List[String].head` erases to `()Object`; without the
+                        // `$unbox` wrapper the checkcast to String is lost and
+                        // `ws.head.length` fails verification. `erase_apply`
+                        // already does this for the applied form.
                         tree.ty = ret_erased;
+                        wrap_unbox(tree, orig);
                         adapt_box_unbox(tree, expected);
                         return;
                     }

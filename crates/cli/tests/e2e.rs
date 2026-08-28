@@ -3148,3 +3148,80 @@ fn fixtures_try_exceptions_bad_is_error() {
         "noSuchThrowableMember is not a member",
     );
 }
+
+// ---------------------------------------------------------------------------
+// scala.collection.immutable.List のコアメンバ（`list_core*`）。
+//
+// prelude 側は `crates/typer/src/prelude_seq.rs`、invoke は
+// `crates/backend/src/gen.rs` の `emit_list_core_member`。
+// すべて scala-library 2.13.16 の実 descriptor に対して dual-run で検証する。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scala_library_dual_run_list_core1() {
+    dual_run_fixture("list_core1");
+}
+
+#[test]
+fn scala_library_dual_run_list_core2() {
+    dual_run_fixture("list_core2");
+}
+
+#[test]
+fn scala_library_dual_run_list_core3() {
+    dual_run_fixture("list_core3");
+}
+
+#[test]
+fn scala_library_dual_run_list_core4() {
+    dual_run_fixture("list_core4");
+}
+
+#[test]
+fn scala_library_dual_run_list_core5() {
+    dual_run_fixture("list_core5");
+}
+
+#[test]
+fn scala_library_dual_run_list_core6() {
+    dual_run_fixture("list_core6");
+}
+
+#[test]
+fn scala_library_dual_run_list_core7() {
+    dual_run_fixture("list_core7");
+}
+
+#[test]
+fn scala_library_dual_run_list_core8() {
+    dual_run_fixture("list_core8");
+}
+
+#[test]
+fn scala_library_dual_run_list_core9() {
+    dual_run_fixture("list_core9");
+}
+
+#[test]
+fn fixtures_list_core1_bad_is_error() {
+    compile_fails_lib("list_core1_bad", "noSuchFold is not a member");
+}
+
+/// 私有ランタイムの `List` classfile は `SeqOps` / `IterableOnceOps` の
+/// default メソッドを持たないので、`--no-scala-library` では診断を出す。
+#[test]
+fn fixtures_list_core2_bad_is_error() {
+    compile_fails("list_core2_bad", "sorted is not a member of List[Int]");
+}
+
+/// 私有ランタイムでも動くコアメンバ（`runtime.rs` の `add_list_core_runtime`）。
+#[test]
+fn fixtures_list_core10() {
+    check("list_core10");
+}
+
+/// 同じソースが本物の scala-library に対しても同じ出力になること。
+#[test]
+fn scala_library_dual_run_list_core10() {
+    dual_run_fixture("list_core10");
+}
