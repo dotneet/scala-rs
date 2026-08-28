@@ -142,6 +142,27 @@ pub enum Intrinsic {
     NewTuple(usize),
 }
 
+/// What a `def f = macro Impl.method` binds to.
+///
+/// nsc stores the equivalent as a pickled `@macroImpl(tree)` annotation on the
+/// macro def symbol so that a *separately compiled* macro def can still be
+/// expanded. We keep the same three facts, in the form the expander needs:
+/// the JVM class that holds the implementation, the method name on it, and
+/// whether the def was declared with a `blackbox` or `whitebox` context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MacroBinding {
+    /// JVM internal name of the class holding the implementation, e.g. `M$`.
+    /// nsc requires the implementation to be a method of an object, so this is
+    /// always a module class.
+    pub impl_class: String,
+    /// Method name on `impl_class`.
+    pub impl_method: String,
+    /// `false` for `scala.reflect.macros.whitebox.Context`. Blackbox macros keep
+    /// the declared result type; whitebox macros may refine it, which changes
+    /// how the call site re-typechecks the expansion.
+    pub blackbox: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Symbol {
     pub id: SymbolId,
@@ -179,6 +200,9 @@ pub struct Symbol {
     /// reads. Each becomes a private field plus a trailing constructor
     /// parameter (see `anon_capture`).
     pub captures: Vec<SymbolId>,
+    /// Set on `def f = macro Impl.method`. Such a symbol has no bytecode: every
+    /// call site must be replaced by the implementation's expansion.
+    pub macro_impl: Option<MacroBinding>,
 }
 
 impl Symbol {
@@ -264,6 +288,7 @@ impl SymbolTable {
                 bound_lo: None,
                 bound_hi: None,
                 captures: vec![],
+                macro_impl: None,
             }],
             scopes: vec![Scope::default()],
             root: SymbolId(0),
@@ -336,6 +361,7 @@ impl SymbolTable {
             bound_lo: None,
             bound_hi: None,
             captures: vec![],
+            macro_impl: None,
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {

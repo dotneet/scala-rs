@@ -156,6 +156,8 @@ pub fn typecheck_units(
     for (tree, file_index) in units.iter_mut() {
         t.file_index = *file_index;
         t.typer(tree);
+        t.report_macro_calls(tree);
+        t.strip_macro_defs(tree);
     }
     (t.st, t.diags)
 }
@@ -187,7 +189,7 @@ impl Typer {
         }
     }
 
-    fn error(&mut self, span: Span, msg: impl Into<String>) {
+    pub(crate) fn error(&mut self, span: Span, msg: impl Into<String>) {
         self.diags
             .push(Diagnostic::error(self.file_index, span, msg));
     }
@@ -2448,6 +2450,14 @@ impl Typer {
                 _ => return,
             };
             if rhs.is_empty() {
+                self.check_stored_annotations(tree);
+                return;
+            }
+            if matches!(rhs.kind, TreeKind::MacroRhs { .. }) {
+                // A macro def has no body to type. Record the binding to the
+                // implementation instead; the reference is resolved in the
+                // enclosing scope, so no parameter scope is pushed.
+                self.type_macro_def(tree);
                 self.check_stored_annotations(tree);
                 return;
             }

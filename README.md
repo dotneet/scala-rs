@@ -131,6 +131,12 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - self type: `trait T { self: Foo => ... }` の typecheck と mixin。実装クラスが self type に適合しないと `illegal inheritance`
 - 変性: `class C[+A]` / `class Box[+A](val x: A)` は合法。`class Bad[+A](var x: A)` は nsc と同様 covariant-in-contravariant で拒否。`A @uncheckedVariance`（メソッド引数や型引数位置）は nsc と同じくその出現の変性検査を外す
 
+- **def マクロの定義**: `def f: T = macro Impl.method[A]`。パースし、実装参照を解決して
+  `Impl$` / `method` のバインディングをシンボルに記録し、マクロ def のバイトコードは
+  nsc と同じく**出さない**（だから Java から呼べない）。戻り値型の省略 / object のメソッド
+  でない実装 / `Context` を第 1 引数に取らない実装 / 解決できない参照 / whitebox は診断する。
+  **展開は未実装**なので、呼び出し地点は診断して落とす。設計は [`docs/macros.md`](docs/macros.md)
+
 フィクスチャで実際に動く範囲は README 末尾の表を見てください。
 
 ### Uncurry / Erasure
@@ -291,7 +297,13 @@ bad simple pattern: use _* to match a sequence
 
 言語:
 
-- マクロ
+- **def マクロの展開**。定義側（`def f: T = macro Impl.method`）はパースし、実装への
+  バインディングをシンボルに記録しますが、**展開は未実装**です。呼び出し地点は
+  `macro expansion is not implemented: cannot expand f (implementation Impl$.method)` と
+  診断します（黙って通しません）。マクロ def は nsc と同じくバイトコードを持ちません。
+  実行モデルの設計・実証・段階的な計画は **[`docs/macros.md`](docs/macros.md)** にあります。
+  当面のゲート: whitebox マクロ / macro bundle / マクロバインディングの pickle /
+  `scala.reflect` API の prelude / quasiquote / `reify`
 - full nsc pickle（出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / MODULESYM / VALsym / EXTref / EXTMODCLASSref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe / TYPEBOUNDStpe / THIStpe / SINGLEtpe / NOPREFIXtpe / CONSTANTtpe / LITERALint / LITERALboolean / LITERALstring ほかリテラル / EXISTENTIALtpe / REFINEDtpe / SYMANNOT / ANNOTATEDtpe / ANNOTINFO / TREE（IDENTtree / SELECTtree / THIStree / SUPERtree / APPLYtree）のサブセット。ByteCodecs は SID-10。ワイヤ形式は nsc と同じ nentries + ビッグエンディアン Nat。vals は METHOD|STABLE|ACCESSOR ゲッター + NullaryMethodType。case class は CASE + フィールド CASEACCESSOR。Flags は nsc raw long を `rawToPickledFlags`（VARARGS / BRIDGE / JAVA を適用箇所で出す）。scalac 2.13.16 が `val` / パラメータ付き `def` / `id[T]` / `new Point` + `p.x` / companion apply `Point(...)` / term `Point` / extractor `unapply` / object の `def` / `def f(xs: List[_]): Int` / `@deprecated("msg", "2.13.0") def g` / `def me: this.type` / `def f(xs: List[_ <: AnyRef])` / `def h(x: Int @unchecked)` / `val one: 1` / `def lit(x: 1)` / `def nest(xs: List[_ <: List[_]])` / `def idRef(x: MixA with MixB { def f: Int })` / `@Ann(foo)` / `@Ann(c.x)` / `@Ann(this)` / `@Ann(classOf[Int])` / `@Ann(ident(1))` / `@Ann(this.x)` / `@Ann(super.foo)` / `@Ann(ident(ident(1)))` / `@Ann(foo = 1)` / `@Ann(foo = this.x)` / `@Ann(foo = bar)` / `Lib.join("a","b")` / `new OrdBox(1).compare(...)` を typecheck できる範囲。full pickle ではない。残る穴は Remaining）
 
 対象外（診断する / パースしない）:
@@ -858,9 +870,18 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 
 slick 由来の構文は `crates/cli/tests/slickparse.rs`（fixture 接頭辞 `slickparse`）の専用スイート（6 本）です。正常系はすべて **scalac 2.13.16 と scala-rs の両方でコンパイルして実行し、stdout を突き合わせる**差分テストで、`scalac` か jar が無ければスキップします。`slickparse_catch_expr.scala` は `try b catch <PartialFunction 値>`（ハンドラの遅延評価・1 回だけ・受け付けない例外の再送出・`finally` 併用・値位置の `try`・`catch { 値 }`）、`slickparse_pattern_star.scala` は `-Xsource:3` / `-Xsource:3-cross` での `case List(h, t*)`（`t @ _*` / `_*` / ユーザー extractor / 大文字名の束縛と併記）、`slickparse_super_type.scala` は型位置の `super.T`（戻り値型 / パラメータ型 / ローカル `val` / 型エイリアス / `extends` の親 / `C.super`）を回します。負例は `slickparse_pattern_star_bad.scala` で、フラグ無しと `-Xsource:2.13` の両方で nsc と同じ `bad simple pattern: use _* to match a sequence` になることを見ています。
 
+def マクロは `crates/cli/tests/macros.rs` にまとめています。呼ばれない macro def のコンパイルと、`Sugar$.class` にメソッドが出ていないことは `macro_def.scala`。マクロ呼び出しの診断は `macro_call_bad.scala`（`macro expansion is not implemented`）。戻り値型の無いマクロ def は `macro_no_result_type_bad.scala`。`Context` を第 1 引数に取らない実装は `macro_impl_shape_bad.scala`。解決できない実装参照は `macro_impl_missing_bad.scala`。whitebox は `macro_whitebox_bad.scala`。設計は [`docs/macros.md`](docs/macros.md)。
+
 ### Remaining
 
-- **macros**（def マクロ。`def f = macro …` はパース時点で診断。skip のまま）
+- **def マクロの展開**。`def f: T = macro Impl.method` は**パースして**バインディングを
+  シンボル（`Symbol.macro_impl`）に記録し、マクロ def のバイトコードは nsc と同じく出さない。
+  展開器はまだ無いので、呼び出し地点は `macro expansion is not implemented` で診断する。
+  残件は、実行モデルの実装（`docs/macros.md` §2 の JVM ブリッジ。設計は動く prototype で
+  実証済み）、マクロバインディングの pickle（nsc の `MACRO` フラグ + `@macroImpl`。§5）、
+  `scala.reflect` API の prelude と ABI コード生成（§6 フェーズ 3）、
+  quasiquote と `reify`（fast track マクロなので自前実装が要る。§6.2）、
+  whitebox と macro bundle。テストは `crates/cli/tests/macros.rs`
 - **leftover pickle holes**（nsc 完全 pickle ではない）: MACRO / late・anti flags は **scalac 2.13.16 が既存 emit（`separate_lib` pickle）を typecheck するのに不要**だったので実装しない。`type T = Int` は nsc **ALIASsym**（tag 5）として載せた。2.13 PickleFormat に **ALIAStpe タグは無い**。named annot args の ctor 順並べ替えは **不要**: scalac 2.13.16 は `#29`/`#30` と同じ位置 pickle（ソース上の RHS 順）で `@Ann2(b = 2, a = "ok")` を typecheck する。nsc 自身は named annot をブロックに変換すると warning を出す。`@Ann(foo = 1)` の Constant と `@Ann(foo = this.x)` / `@Ann(foo = bar)` の TREE は nsc と同じ位置引数として載せた。**JAVA を EXTREF に載せない理由**: PickleFormat の `EXTref` / `EXTMODCLASSref` は `name_Ref [owner_Ref]` だけで flags フィールドが無い。余分な Nat を足すと scalac が owner と取り違える。`java.lang.Object` / `String` などは classpath の Java classfile から complete され、そこで JAVA が付く。local CLASSsym（prelude で `mark_java` したクラスを自前 pickle する場合）には既に JAVA を出している。full pickle とは主張しない
 - 残りの **StringOps**（`++` / `lengthIs` / `sizeIs` / `flatMap` / `iterator` / `sizeCompare` / `knownSize` / `appendedAll` / `prependedAll` / `>` / `>=` / `<=` / `compare` / `lengthCompare` / `patch(Int, String, Int)` / `<` / `map`（`Char => Char`）/ `:+` / `+:` / `foldRight` / `toByteOption` / `toShortOption` / `toFloatOption` / `grouped` / `foldLeft` / `toByte` / `toShort` / `toFloat` / `toLongOption` / `toDoubleOption` / `find` / `foreach` / `toBoolean` / `toBooleanOption` / `dropWhile` / `takeWhile` / `nonEmpty` / `headOption` / `lastOption` / `filterNot` / `indices` / `r` / `sorted` / `toArray` / `copyToArray` / `partition` / `exists` / `forall` / `splitAt` / `updated` / `count` / `span` / `diff` / `intersect` / `split(String)` / `filter` / `reverseIterator` 以外）
 - 残りの **ArrayOps**（`lengthIs` / `sizeIs` / `indexOf` / `copyToArray` / `iterator` / `zipWithIndex` / `knownSize` / `sizeCompare` / `filterNot` / `headOption` / `lastOption` / `partition` / `splitAt` / `span` / `find` / `contains` / `distinct` / `takeRight` / `dropRight` / `takeWhile` / `indices` / `lengthCompare` / `last` / `init` / `reverse` / `size` / `isEmpty` / `nonEmpty` / `scanLeft` / `count` / `forall` / `foldLeft` / `fold` / `foldRight` / `drop` / `dropWhile` / `exists` / `take` / `collect` / `zip` / `filter` / `slice` / 3 引数 `flatMap` / 4 引数 Array→Iterable `flatMap` と primitive wrappers / `genericArrayOps` の `head`/`map`/`foreach`/`tail` は揃った。他メソッド。`reduce` は 2.13.16 ArrayOps に無い）

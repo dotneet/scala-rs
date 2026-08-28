@@ -599,6 +599,15 @@ pub enum TreeKind {
         tpt: Box<Tree>,
         rhs: Box<Tree>,
     },
+    /// Right-hand side of a def macro: `def f: T = macro Impl.method[A]`.
+    ///
+    /// `impl_ref` is the unresolved reference to the macro implementation
+    /// (`Ident`, `Select`, or `TypeApply` of either). It is never an ordinary
+    /// expression: nsc's parser also keeps it separate and the typer resolves
+    /// it against the *macro implementation* signature rules, not the def's.
+    MacroRhs {
+        impl_ref: Box<Tree>,
+    },
     TypeDef {
         mods: Modifiers,
         name: String,
