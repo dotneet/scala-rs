@@ -8934,6 +8934,7 @@ fn maybe_unbox_erased_result(
 /// Lambda captures (and similar) are stored as `Object`. Restore the JVM type
 /// before the body uses the local (`iastore` needs `[I`, not `Object`).
 fn emit_from_erased_object(asm: &mut Assembler, st: &SymbolTable, ty: &Type) {
+    let ty = &ty.widen_constant();
     if is_jvm_primitive(ty) {
         emit_unbox(asm, ty);
         return;
@@ -12387,6 +12388,21 @@ fn gen_pattern(
             asm.mark(ok);
         }
         _ => {}
+    }
+}
+
+/// An `Object` on the stack that the typer knows more precisely: unbox it for a
+/// primitive sub-pattern, cast it for a reference one, leave it alone when the
+/// sub-pattern is itself erased (a bare type parameter).
+fn adapt_erased_field(asm: &mut Assembler, ctx: &EmitCtx, want: &Type) {
+    let want = want.widen_constant();
+    if is_jvm_primitive(&want) {
+        emit_unbox(asm, &want);
+        return;
+    }
+    let jvm = type_jvm_name(ctx.st, &want);
+    if jvm != "java/lang/Object" && !jvm.is_empty() && !jvm.starts_with('[') {
+        asm.checkcast(&jvm);
     }
 }
 

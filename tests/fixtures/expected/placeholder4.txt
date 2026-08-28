@@ -1,0 +1,18 @@
+List(2, 3)
+List(n1, n2)
+List(1, 2)
+List(0, 6)
+List(6, 15)
+List(y2, y3)
+one/n4
+2
+3
+15
+12
+27
+List(List(2, 3), List(4))
+v9
+5
+7
+ok
+caught
