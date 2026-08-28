@@ -6,8 +6,9 @@
 //! rather than silently passing.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn bin() -> PathBuf {
@@ -18,13 +19,18 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
 }
 
+/// Unique per call: tests run concurrently and several of them compile the same
+/// fixture, so a shared output directory would let one test's cleanup delete
+/// another's classfiles.
 fn tmp_dir(tag: &str) -> PathBuf {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let p = std::env::temp_dir().join(format!(
-        "scala-rs-lowbound-{tag}-{}-{nanos}",
+        "scala-rs-lowbound-{tag}-{}-{nanos}-{seq}",
         std::process::id()
     ));
     fs::create_dir_all(&p).unwrap();
@@ -151,10 +157,6 @@ fn compile_fails_with(name: &str, needle: &str, extra: &[&str]) {
     let _ = fs::remove_dir_all(&out);
 }
 
-fn assert_main_class(out: &Path) {
-    assert!(out.join("Main.class").is_file());
-}
-
 /// `Circle(1) :: Rect(2, 3) :: Nil` must be a `List[Shape]` in both modes.
 #[test]
 fn fixtures_lowbound_private_runtime() {
@@ -208,12 +210,4 @@ fn fixtures_lowbound_bad3_is_error() {
         "type arguments [Circle] do not conform to method widen's type parameter bounds [B >: A]",
         &["--no-scala-library"],
     );
-}
-
-/// The bound checks must not fire on plain, well-bounded code.
-#[test]
-fn lowbound_compiles_clean() {
-    let out = compile_fixture_with("lowbound", &["--no-scala-library"]);
-    assert_main_class(&out);
-    let _ = fs::remove_dir_all(&out);
 }
