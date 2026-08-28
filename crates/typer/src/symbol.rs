@@ -100,6 +100,10 @@ pub struct Symbol {
     pub bound_lo: Option<Type>,
     /// Upper bound of an abstract/HK type member (`type F[_] <: Hi`).
     pub bound_hi: Option<Type>,
+    /// For classes defined inside a method: enclosing-method locals the class
+    /// reads. Each becomes a private field plus a trailing constructor
+    /// parameter (see `anon_capture`).
+    pub captures: Vec<SymbolId>,
 }
 
 impl Symbol {
@@ -184,6 +188,7 @@ impl SymbolTable {
                 annotations: vec![],
                 bound_lo: None,
                 bound_hi: None,
+                captures: vec![],
             }],
             scopes: vec![Scope::default()],
             root: SymbolId(0),
@@ -255,6 +260,7 @@ impl SymbolTable {
             annotations: vec![],
             bound_lo: None,
             bound_hi: None,
+            captures: vec![],
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {

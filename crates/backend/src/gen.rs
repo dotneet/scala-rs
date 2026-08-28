@@ -46,11 +46,9 @@ pub fn emit_opts(
         trait_vals: HashMap::new(),
         library_abi: opts.library_abi,
         pickles: opts.pickles,
-        boxed_vars: if opts.library_abi {
-            collect_boxed_vars(tree, st)
-        } else {
-            HashSet::new()
-        },
+        // `scala.runtime.*Ref` exists in both ABIs: on the jar, and as a
+        // private-runtime classfile (see `runtime::REF_BOXES`).
+        boxed_vars: collect_boxed_vars(tree, st),
     };
     g.collect_trait_impls(tree);
     g.walk(tree);
@@ -194,6 +192,116 @@ fn jvm_desc_maybe_boxed(
     } else {
         jvm_desc(st, ty)
     }
+}
+
+// ---------------------------------------------------------------------------
+// captured enclosing-method locals (`new T { … }`, local `class`)
+// ---------------------------------------------------------------------------
+
+/// Enclosing-method locals a class defined inside a method has to receive.
+/// Filled by the typer's `anon_capture` pass; empty for every other class.
+fn class_captures(st: &SymbolTable, class_id: SymbolId) -> &[SymbolId] {
+    if class_id.is_none() {
+        return &[];
+    }
+    &st.get(class_id).captures
+}
+
+/// Field / constructor-parameter name of the `idx`-th capture (nsc: `x$1`).
+fn capture_field_name(st: &SymbolTable, id: SymbolId, idx: usize) -> String {
+    format!("{}${}", st.get(id).name, idx + 1)
+}
+
+/// Descriptor of a captured value; a `scala.runtime.*Ref` for captured `var`s.
+fn capture_field_desc(st: &SymbolTable, boxed: &HashSet<SymbolId>, id: SymbolId) -> String {
+    jvm_desc_maybe_boxed(st, &st.get(id).ty, id, boxed)
+}
+
+fn capture_field_sort(boxed: &HashSet<SymbolId>, st: &SymbolTable, id: SymbolId) -> JvmSort {
+    if boxed.contains(&id) {
+        JvmSort::Ref
+    } else {
+        jvm_sort(&st.get(id).ty)
+    }
+}
+
+/// The capture constructor parameters of `class_id`, as descriptor text.
+fn capture_params_desc(st: &SymbolTable, boxed: &HashSet<SymbolId>, class_id: SymbolId) -> String {
+    class_captures(st, class_id)
+        .iter()
+        .map(|c| capture_field_desc(st, boxed, *c))
+        .collect()
+}
+
+/// Splice extra parameter descriptors in front of the `)` of `desc`.
+fn desc_with_extra_params(desc: &str, extra: &str) -> String {
+    if extra.is_empty() {
+        return desc.to_string();
+    }
+    match desc.rfind(')') {
+        Some(i) => format!("{}{}{}", &desc[..i], extra, &desc[i..]),
+        None => desc.to_string(),
+    }
+}
+
+/// `(symbol, field name, field descriptor, JVM sort)` per capture.
+type CaptureSlots = Vec<(SymbolId, String, String, JvmSort)>;
+
+fn capture_slots(st: &SymbolTable, boxed: &HashSet<SymbolId>, class_id: SymbolId) -> CaptureSlots {
+    class_captures(st, class_id)
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            (
+                *c,
+                capture_field_name(st, *c, i),
+                capture_field_desc(st, boxed, *c),
+                capture_field_sort(boxed, st, *c),
+            )
+        })
+        .collect()
+}
+
+/// Read the capture fields into fresh locals at method entry, so the ordinary
+/// `Ident` path keeps finding the enclosing-method symbols in the frame.
+fn emit_capture_prologue(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    class_name: &str,
+    caps: &CaptureSlots,
+) {
+    for (id, fname, fdesc, sort) in caps {
+        asm.aload(0);
+        asm.getfield(class_name, fname, fdesc);
+        let slot = frame.alloc(*id, *sort);
+        store(asm, slot, *sort);
+    }
+}
+
+/// Push the current value of a captured local for a `new` of a capturing class.
+fn load_capture_arg(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, id: SymbolId) {
+    if let Some((slot, sort)) = frame.get(id) {
+        if is_boxed_var(ctx, id) {
+            // Forward the IntRef/ObjectRef itself, not its `elem`.
+            load(asm, slot, JvmSort::Ref);
+        } else {
+            load(asm, slot, sort);
+        }
+        return;
+    }
+    // Not a local here: we are inside a class that captured it as well.
+    let own = class_captures(ctx.st, ctx.class_sym);
+    if let Some(i) = own.iter().position(|c| *c == id) {
+        load_this(asm, ctx);
+        asm.getfield(
+            &class_internal(ctx.st, ctx.class_sym),
+            &capture_field_name(ctx.st, id, i),
+            &capture_field_desc(ctx.st, ctx.boxed_vars, id),
+        );
+        return;
+    }
+    throw_runtime(asm, &format!("cannot capture {}", ctx.st.get(id).name));
+    asm.aconst_null();
 }
 
 fn def_is_synthetic(st: &SymbolTable, def: &Tree) -> bool {
@@ -554,6 +662,36 @@ fn method_ret_from_sym(st: &SymbolTable, id: SymbolId) -> Type {
     }
 }
 
+/// How an erasure bridge has to convert a value of type `from` to type `to`.
+enum Adapt {
+    None,
+    Cast(String),
+    Box(Type),
+    Unbox(Type),
+}
+
+fn param_adapt(st: &SymbolTable, from: &Type, to: &Type) -> Adapt {
+    if is_jvm_primitive(to) && !is_jvm_primitive(from) {
+        Adapt::Unbox(to.clone())
+    } else if is_jvm_primitive(from) && !is_jvm_primitive(to) {
+        Adapt::Box(from.clone())
+    } else {
+        match checkcast_internal(st, to) {
+            Some(cn) => Adapt::Cast(cn),
+            None => Adapt::None,
+        }
+    }
+}
+
+fn emit_adapt(asm: &mut Assembler, adapt: &Adapt) {
+    match adapt {
+        Adapt::None => {}
+        Adapt::Cast(cn) => asm.checkcast(cn),
+        Adapt::Box(ty) => emit_box(asm, ty),
+        Adapt::Unbox(ty) => emit_unbox(asm, ty),
+    }
+}
+
 fn checkcast_internal(st: &SymbolTable, ty: &Type) -> Option<String> {
     match ty {
         Type::Class { sym, .. } | Type::ModuleRef(sym) => Some(class_internal(st, *sym)),
@@ -738,20 +876,28 @@ fn enclosing_instance(st: &SymbolTable, class_id: SymbolId) -> Option<SymbolId> 
     if st.get(class_id).flags.contains(Flags::JAVA) {
         return None;
     }
-    let owner = st.get(class_id).owner;
+    // `new T { … }` and local classes are owned by the method (or the `val`)
+    // they appear in; the enclosing instance is the class around it.
+    let mut owner = st.get(class_id).owner;
+    let mut in_method = false;
+    while !owner.is_none() && matches!(st.get(owner).kind, SymKind::Method | SymKind::Term) {
+        in_method = true;
+        owner = st.get(owner).owner;
+    }
     if owner.is_none() {
         return None;
     }
     let o = st.get(owner);
-    if o.kind == SymKind::Class
-        && !o.flags.contains(Flags::TRAIT)
-        && !o.flags.contains(Flags::INTERFACE)
-        && !o.flags.contains(Flags::MODULE)
-    {
-        Some(owner)
-    } else {
-        None
+    if o.kind != SymKind::Class || o.flags.contains(Flags::MODULE) {
+        return None;
     }
+    // A class *member* of a trait has no enclosing instance (the trait is an
+    // interface), but a class written inside a trait *method* still needs the
+    // receiver to reach the trait's members.
+    if (o.flags.contains(Flags::TRAIT) || o.flags.contains(Flags::INTERFACE)) && !in_method {
+        return None;
+    }
+    Some(owner)
 }
 
 fn linearize(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
@@ -950,6 +1096,31 @@ fn is_owner_compatible(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> 
         }
     }
     false
+}
+
+/// Push the instance that owns `owner`'s members: `this`, or the `$outer`
+/// chain of the class being emitted when the member lives further out.
+fn load_owner_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
+    load_this(asm, ctx);
+    let mut cur = ctx.class_sym;
+    while !cur.is_none() && !owner.is_none() && !is_owner_compatible(ctx.st, cur, owner) {
+        let Some(o) = enclosing_instance(ctx.st, cur) else {
+            break;
+        };
+        asm.getfield(
+            &class_internal(ctx.st, cur),
+            "$outer",
+            &format!("L{};", class_internal(ctx.st, o)),
+        );
+        cur = o;
+    }
+    if !is_owner_compatible(ctx.st, cur, owner) {
+        let kind = ctx.st.get(owner).kind;
+        if matches!(kind, SymKind::Class | SymKind::ModuleClass) || is_interface_sym(ctx.st, owner)
+        {
+            asm.checkcast(&class_internal(ctx.st, owner));
+        }
+    }
 }
 
 fn maybe_checkcast_owner(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
@@ -1296,6 +1467,12 @@ impl<'a> Gen<'a> {
             }
             TreeKind::Block { stats, expr } => {
                 for s in stats {
+                    // Local `class` / `object` declared inside a method body.
+                    match &s.kind {
+                        TreeKind::ClassDef { .. } => self.emit_class(s, &HashSet::new()),
+                        TreeKind::ModuleDef { .. } => self.emit_module(s, &HashSet::new()),
+                        _ => {}
+                    }
                     self.emit_anon_classes(s);
                 }
                 self.emit_anon_classes(expr);
@@ -1509,6 +1686,15 @@ impl<'a> Gen<'a> {
                 access: ACC_PUBLIC | ACC_FINAL,
                 name: "$outer".into(),
                 desc: format!("L{};", class_internal(self.st, outer)),
+            });
+        }
+        // Enclosing-method locals read by the body of a class defined inside a
+        // method. Public so lambdas lifted out of this class can read them.
+        for (_, fname, fdesc, _) in capture_slots(self.st, &self.boxed_vars, class_id) {
+            b.fields.push(Field {
+                access: ACC_PUBLIC | ACC_FINAL,
+                name: fname,
+                desc: fdesc,
             });
         }
         for stt in &impl_.body {
@@ -2003,7 +2189,17 @@ impl<'a> Gen<'a> {
                 types.push(p.ty.clone());
             }
         }
-        let desc = jvm_method_desc(self.st, &types, &Type::Unit);
+        // Captures come last, after `$outer` and the source parameters.
+        let caps = capture_slots(self.st, &self.boxed_vars, class_id);
+        let mut cap_info = Vec::new();
+        for (id, fname, fdesc, sort) in &caps {
+            let slot = frame.alloc(*id, *sort);
+            cap_info.push((slot, *sort, fname.clone(), fdesc.clone()));
+        }
+        let desc = desc_with_extra_params(
+            &jvm_method_desc(self.st, &types, &Type::Unit),
+            &capture_params_desc(self.st, &self.boxed_vars, class_id),
+        );
         let super_name = b.super_name.clone();
         let (super_owner, super_desc, super_args) =
             parent_super_ctor(self.st, parents, &super_name);
@@ -2091,6 +2287,11 @@ impl<'a> Gen<'a> {
                 if fname.is_empty() {
                     continue;
                 }
+                asm.aload(0);
+                load(asm, *slot, *sort);
+                asm.putfield(&class_name, fname, fdesc);
+            }
+            for (slot, sort, fname, fdesc) in &cap_info {
                 asm.aload(0);
                 load(asm, *slot, *sort);
                 asm.putfield(&class_name, fname, fdesc);
@@ -2206,8 +2407,14 @@ impl<'a> Gen<'a> {
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
         let meth = def.sym;
+        let caps = if acc & ACC_STATIC == 0 {
+            capture_slots(self.st, &self.boxed_vars, class_id)
+        } else {
+            CaptureSlots::new()
+        };
         b.add_code(acc, name, &desc, max_locals, |asm| {
             let mut frame = frame;
+            emit_capture_prologue(asm, &mut frame, &class_name, &caps);
             let mut ctx = emit_ctx(
                 st,
                 class_id,
@@ -2887,30 +3094,29 @@ impl<'a> Gen<'a> {
                 if parent_params.len() != child_params.len() {
                     continue;
                 }
-                let parent_ret = method_ret_from_sym(self.st, pmid);
+                let ret = method_ret_from_sym(self.st, pmid);
                 let child_ret = method_ret_from_sym(self.st, *cid);
-                // `Show[Int]`'s `show(Object)` must unbox before calling
-                // `show(int)`, and box the result back when the parent's
-                // return erases to a reference.
-                let box_ret = is_jvm_primitive(&child_ret)
-                    && !is_unit_like(&child_ret)
-                    && !is_jvm_primitive(&parent_ret);
+                // The bridge takes the erased parent signature, so a parameter
+                // the subclass narrowed to a primitive arrives boxed.
+                let ret_adapt = if jvm_desc(self.st, &ret) == jvm_desc(self.st, &child_ret) {
+                    Adapt::None
+                } else {
+                    param_adapt(self.st, &child_ret, &ret)
+                };
                 let mut locals = 1u16;
                 let mut loads = Vec::new();
-                let mut adapts: Vec<Option<Type>> = Vec::new();
+                let mut casts: Vec<Adapt> = Vec::new();
                 for (pty, cty) in parent_params.iter().zip(child_params.iter()) {
                     let sort = jvm_sort(pty);
                     loads.push((locals, sort));
                     let adapt = if jvm_desc(self.st, pty) != jvm_desc(self.st, cty) {
-                        Some(cty.clone())
+                        param_adapt(self.st, pty, cty)
                     } else {
-                        None
+                        Adapt::None
                     };
-                    adapts.push(adapt);
+                    casts.push(adapt);
                     locals += sort.slots();
                 }
-                let ret = parent_ret;
-                let st = self.st;
                 let name = ps.name.clone();
                 let pdesc_c = pdesc.clone();
                 let cdesc_c = cdesc.clone();
@@ -2924,14 +3130,12 @@ impl<'a> Gen<'a> {
                         asm.aload(0);
                         for (i, (slot, sort)) in loads.iter().enumerate() {
                             load(asm, *slot, *sort);
-                            if let Some(cty) = adapts.get(i).and_then(|c| c.as_ref()) {
-                                emit_from_erased_object(asm, st, cty);
+                            if let Some(a) = casts.get(i) {
+                                emit_adapt(asm, a);
                             }
                         }
                         asm.invokevirtual(&class_c, &name, &cdesc_c);
-                        if box_ret {
-                            emit_box(asm, &child_ret);
-                        }
+                        emit_adapt(asm, &ret_adapt);
                         emit_return(asm, &ret);
                     },
                 );
@@ -3079,8 +3283,10 @@ impl<'a> Gen<'a> {
             let mask = 1i32 << bit;
             bit += 1;
             let ret_ty = ty.clone();
+            let caps = capture_slots(self.st, &self.boxed_vars, class_id);
             b.add_code(ACC_PUBLIC, &fname, &desc, 4, |asm| {
                 let mut frame = Frame::instance();
+                emit_capture_prologue(asm, &mut frame, &class_name, &caps);
                 let lock = frame.alloc_tmp(JvmSort::Ref);
                 let result = frame.alloc_tmp(jvm_sort(&ret_ty));
                 asm.aload(0);
@@ -3229,6 +3435,9 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        // An `object` mixing in a trait needs the same `T$class` forwarders a
+        // class gets, or its concrete trait methods stay abstract.
+        self.emit_mixin_forwarders(&mut b, cls, &impl_.body);
         self.emit_delayed_init_support(&mut b, cls, &impl_.body, true);
         if !cls.is_none()
             && extends_app(self.st, cls)
@@ -4010,8 +4219,7 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
                 let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
             } else {
-                load_this(asm, ctx);
-                maybe_checkcast_owner(asm, ctx, owner);
+                load_owner_instance(asm, ctx, owner);
             }
             if is_trait_owned_term(ctx.st, id) {
                 let owner = class_internal(ctx.st, owner);
@@ -4042,8 +4250,7 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
                 let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
             } else {
-                load_this(asm, ctx);
-                maybe_checkcast_owner(asm, ctx, owner);
+                load_owner_instance(asm, ctx, owner);
             }
             invoke_method(asm, ctx, id, Some(&tree.ty));
         }
@@ -4430,7 +4637,10 @@ fn gen_new(
     let desc = if class_id.is_none() {
         desc
     } else {
-        with_enclosing_outer_param(ctx.st, class_id, &desc)
+        desc_with_extra_params(
+            &with_enclosing_outer_param(ctx.st, class_id, &desc),
+            &capture_params_desc(ctx.st, ctx.boxed_vars, class_id),
+        )
     };
     let field_tys: Vec<Type> = if !ctor_sym.is_none() && ctx.st.get(ctor_sym).name == "<init>" {
         match &ctx.st.get(ctor_sym).ty {
@@ -4460,6 +4670,9 @@ fn gen_new(
         if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
             emit_box(asm, &a.ty);
         }
+    }
+    for id in class_captures(ctx.st, class_id).to_vec() {
+        load_capture_arg(asm, frame, ctx, id);
     }
     asm.invokespecial(&internal, "<init>", &desc);
 }
@@ -9531,6 +9744,15 @@ fn is_jvm_primitive(ty: &Type) -> bool {
 fn collect_boxed_vars(tree: &Tree, st: &SymbolTable) -> HashSet<SymbolId> {
     let mut out = HashSet::new();
     walk_boxed_vars(tree, st, &mut out);
+    // A `var` captured by a class defined inside a method is shared with the
+    // enclosing method, exactly like one captured by a lambda.
+    for s in &st.symbols {
+        for c in &s.captures {
+            if st.get(*c).flags.contains(Flags::MUTABLE) {
+                out.insert(*c);
+            }
+        }
+    }
     out
 }
 
@@ -9752,8 +9974,28 @@ fn collect_free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>,
         TreeKind::Return { expr } | TreeKind::Throw { expr } => {
             collect_free(expr, bound, out, st);
         }
+        TreeKind::New { tpt } => {
+            // Instantiating a class that captures enclosing-method locals reads
+            // those locals right here.
+            if let Some(cid) = new_class_sym(st, tpt) {
+                for c in &st.get(cid).captures {
+                    if !bound.contains(c) && !out.contains(c) {
+                        out.push(*c);
+                    }
+                }
+            }
+            collect_free(tpt, bound, out, st);
+        }
         _ => {}
     }
+}
+
+/// Class symbol instantiated by `new <tpt>`, if it is known.
+fn new_class_sym(st: &SymbolTable, tpt: &Tree) -> Option<SymbolId> {
+    if !tpt.sym.is_none() && st.get(tpt.sym).is_class_like() {
+        return Some(tpt.sym);
+    }
+    st.class_sym_of(&tpt.ty)
 }
 
 fn is_partial_function_ty(st: &SymbolTable, ty: &Type) -> bool {

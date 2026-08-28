@@ -1,3 +1,4 @@
+mod anon_capture;
 mod check;
 mod classpath;
 mod erasure;
@@ -15,6 +16,7 @@ mod prelude_tuple;
 mod symbol;
 mod uncurry;
 
+pub use anon_capture::mark_anon_captures;
 pub use check::{
     find_mains, has_errors, typecheck, typecheck_opts, ClasspathClass, ClasspathMethod,
     ClasspathPickleMethod, TypecheckOptions, Typer,

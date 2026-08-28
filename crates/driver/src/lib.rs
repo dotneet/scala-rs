@@ -7,8 +7,8 @@ use scala_rs_backend::{emit_opts, emit_runtime, load_classpath, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
-    erase, find_mains, lambda_lift, typecheck_opts, uncurry, ClasspathClass, ClasspathMethod,
-    ClasspathPickleMethod, SymbolTable, TypecheckOptions,
+    erase, find_mains, lambda_lift, mark_anon_captures, typecheck_opts, uncurry, ClasspathClass,
+    ClasspathMethod, ClasspathPickleMethod, SymbolTable, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -182,6 +182,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         if !has_errors(&diags) {
             uncurry(&mut u.tree, &mut st);
             lambda_lift(&mut u.tree, &mut st);
+            mark_anon_captures(&u.tree, &mut st);
             u.pickles = scala_rs_backend::pickle::pickle_all(&st);
             erase(&mut u.tree, &mut st);
         }
