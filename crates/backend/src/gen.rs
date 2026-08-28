@@ -1397,6 +1397,12 @@ impl<'a> Gen<'a> {
             }
             TreeKind::Block { stats, expr } => {
                 for s in stats {
+                    // Local `class` / `object` declared inside a method body.
+                    match &s.kind {
+                        TreeKind::ClassDef { .. } => self.emit_class(s, &HashSet::new()),
+                        TreeKind::ModuleDef { .. } => self.emit_module(s, &HashSet::new()),
+                        _ => {}
+                    }
                     self.emit_anon_classes(s);
                 }
                 self.emit_anon_classes(expr);

@@ -2609,6 +2609,20 @@ impl Typer {
                 self.type_def_body(tree);
             }
             TreeKind::Import { .. } => self.type_import(tree),
+            // Local `class` / `object` inside a block. `type_expr` routes these
+            // back here, so they must not fall through to it again.
+            TreeKind::ClassDef { .. } => {
+                if tree.sym.is_none() {
+                    self.namer_class(tree);
+                }
+                self.type_class(tree);
+            }
+            TreeKind::ModuleDef { .. } => {
+                if tree.sym.is_none() {
+                    self.namer_module(tree);
+                }
+                self.type_module(tree);
+            }
             _ => {
                 self.type_expr(tree, &Type::NoType);
             }
@@ -2768,6 +2782,17 @@ impl Typer {
             }
             TreeKind::Block { stats, expr } => {
                 self.st.push_scope();
+                // Local classes are visible to the whole block, including
+                // statements that precede their definition.
+                for s in stats.iter_mut() {
+                    if matches!(
+                        s.kind,
+                        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+                    ) && s.sym.is_none()
+                    {
+                        self.namer(s);
+                    }
+                }
                 for s in stats.iter_mut() {
                     self.type_stat(s);
                 }
