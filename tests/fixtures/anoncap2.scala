@@ -19,6 +19,7 @@ trait Maker {
 }
 
 class Impl extends Maker { def base: Int = 100 }
+object ImplObj extends Maker { def base: Int = 200 }
 
 object Main {
   // A lambda inside the anonymous class captures the same local again.
@@ -63,5 +64,6 @@ object Main {
     println(inLambda(5))
     println(inNestedDef(4))
     println(new Impl().make(5).add(1))
+    println(ImplObj.make(5).add(1))
   }
 }

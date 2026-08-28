@@ -3283,6 +3283,9 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        // An `object` mixing in a trait needs the same `T$class` forwarders a
+        // class gets, or its concrete trait methods stay abstract.
+        self.emit_mixin_forwarders(&mut b, cls, &impl_.body);
         self.emit_delayed_init_support(&mut b, cls, &impl_.body, true);
         if !cls.is_none()
             && extends_app(self.st, cls)
