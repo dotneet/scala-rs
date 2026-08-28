@@ -7,7 +7,7 @@ use scala_rs_backend::{emit_opts, emit_runtime, load_classpath, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
-    erase, find_mains, lambda_lift, mark_anon_captures, typecheck_opts, uncurry, ClasspathClass,
+    erase, find_mains, lambda_lift, mark_anon_captures, typecheck_units, uncurry, ClasspathClass,
     ClasspathMethod, ClasspathPickleMethod, SymbolTable, TypecheckOptions,
 };
 
@@ -169,10 +169,19 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
     }
 
     let mut mains = Vec::new();
-    for u in &mut units {
-        let (mut st, tdiags) = typecheck_opts(
-            &mut u.tree,
-            u.file_index,
+    let shared_st;
+    {
+        // One symbol table for the whole run: every unit is named before any
+        // is typed, so files can reference each other.
+        let mut refs: Vec<(&mut Tree, usize)> = units
+            .iter_mut()
+            .map(|u| {
+                let fi = u.file_index;
+                (&mut u.tree, fi)
+            })
+            .collect();
+        let (mut st, tdiags) = typecheck_units(
+            &mut refs,
             &TypecheckOptions {
                 fatal_warnings: opts.fatal_warnings,
                 library_abi: opts.scala_library.is_some(),
@@ -188,15 +197,22 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
             },
         );
         diags.extend(tdiags);
-        mains.extend(find_mains(&st, &u.tree));
-        if !has_errors(&diags) {
-            uncurry(&mut u.tree, &mut st);
-            lambda_lift(&mut u.tree, &mut st);
-            mark_anon_captures(&u.tree, &mut st);
-            u.pickles = scala_rs_backend::pickle::pickle_all(&st);
-            erase(&mut u.tree, &mut st);
+        for u in units.iter() {
+            mains.extend(find_mains(&st, &u.tree));
         }
-        u.st = Some(st);
+        if !has_errors(&diags) {
+            for u in units.iter_mut() {
+                uncurry(&mut u.tree, &mut st);
+                lambda_lift(&mut u.tree, &mut st);
+                mark_anon_captures(&u.tree, &mut st);
+            }
+            let pickles = scala_rs_backend::pickle::pickle_all(&st);
+            for u in units.iter_mut() {
+                u.pickles = pickles.clone();
+                erase(&mut u.tree, &mut st);
+            }
+        }
+        shared_st = Some(st);
     }
 
     if opts.typer_dump {
@@ -220,8 +236,8 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
     } else {
         emit_runtime()
     };
+    let st = shared_st.as_ref().expect("the run is typed");
     for u in &units {
-        let st = u.st.as_ref().expect("unit is typed");
         let src_name = source_file_name(&sources[u.file_index]);
         emitted.extend(emit_opts(
             &u.tree,

@@ -20,8 +20,8 @@ mod uncurry;
 
 pub use anon_capture::mark_anon_captures;
 pub use check::{
-    find_mains, has_errors, typecheck, typecheck_opts, ClasspathClass, ClasspathMethod,
-    ClasspathPickleMethod, TypecheckOptions, Typer,
+    find_mains, has_errors, typecheck, typecheck_opts, typecheck_units, ClasspathClass,
+    ClasspathMethod, ClasspathPickleMethod, TypecheckOptions, Typer,
 };
 pub use erasure::{erase, erase_type};
 pub use lambda_lift::lambda_lift;

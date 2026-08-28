@@ -88,6 +88,9 @@ pub struct Typer {
     gensym: u32,
     /// Enclosing package clauses; a nested one is relative to the last.
     pkg_nest: Vec<SymbolId>,
+    /// Signature pass: fill member types across the whole run before any body
+    /// is typed, so a unit can call into one that comes later.
+    sigs_only: bool,
     fatal_warnings: bool,
     library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
@@ -114,12 +117,42 @@ pub fn typecheck_opts(
     file_index: usize,
     opts: &TypecheckOptions,
 ) -> (SymbolTable, Vec<Diagnostic>) {
-    let mut t = Typer::new(file_index, opts);
+    let mut units = [(tree, file_index)];
+    typecheck_units(&mut units, opts)
+}
+
+/// Typecheck a whole run in one symbol table: every unit is named before any
+/// is typed, so a class can reference one defined in another file.
+pub fn typecheck_units(
+    units: &mut [(&mut Tree, usize)],
+    opts: &TypecheckOptions,
+) -> (SymbolTable, Vec<Diagnostic>) {
+    let first = units.first().map(|(_, i)| *i).unwrap_or(0);
+    let mut t = Typer::new(first, opts);
     t.fatal_warnings = opts.fatal_warnings;
     crate::classpath::install_classpath(&mut t.st, &opts.classpath);
-    t.namer(tree);
-    t.register_sealed_from_namer(tree);
-    t.typer(tree);
+    for (tree, file_index) in units.iter_mut() {
+        t.file_index = *file_index;
+        t.namer(tree);
+        t.register_sealed_from_namer(tree);
+    }
+    if units.len() > 1 {
+        // Member types first, across every unit: typing a body may call into a
+        // file that comes later on the command line.
+        t.sigs_only = true;
+        let saved = std::mem::take(&mut t.diags);
+        for (tree, file_index) in units.iter_mut() {
+            t.file_index = *file_index;
+            t.typer(tree);
+        }
+        // The signature pass reports the same diagnostics the full pass will.
+        t.diags = saved;
+        t.sigs_only = false;
+    }
+    for (tree, file_index) in units.iter_mut() {
+        t.file_index = *file_index;
+        t.typer(tree);
+    }
     (t.st, t.diags)
 }
 
@@ -133,6 +166,7 @@ impl Typer {
             file_index,
             gensym: 0,
             pkg_nest: Vec::new(),
+            sigs_only: false,
             fatal_warnings: opts.fatal_warnings,
             library_abi: opts.library_abi,
             return_meth: None,
@@ -1129,8 +1163,10 @@ impl Typer {
                 self.type_member_sig(stt);
             }
         }
-        for stt in body.iter_mut() {
-            self.type_member_body(stt);
+        if !self.sigs_only {
+            for stt in body.iter_mut() {
+                self.type_member_body(stt);
+            }
         }
         self.finish_case_apply(id, &ctor_param_tys);
         self.check_type_member_kind_override(id, tree.span);
@@ -1259,8 +1295,10 @@ impl Typer {
                 self.type_member_sig(stt);
             }
         }
-        for stt in body.iter_mut() {
-            self.type_member_body(stt);
+        if !self.sigs_only {
+            for stt in body.iter_mut() {
+                self.type_member_body(stt);
+            }
         }
         self.check_self_conformance(cls, tree.span);
         self.check_type_member_kind_override(cls, tree.span);
