@@ -522,6 +522,29 @@ fn collect_captures(
         }
         TreeKind::LabelDef { rhs, .. } => collect_captures(rhs, own, out, st),
         TreeKind::New { tpt } => collect_captures(tpt, own, out, st),
+        TreeKind::ClassDef {
+            vparamss, impl_, ..
+        } => {
+            // `new T { … x … }` inside a nested def reads `x` here, so the
+            // lifted method has to receive it too.
+            let mut bound = own.clone();
+            for p in vparamss.iter().flatten() {
+                if !p.sym.is_none() {
+                    bound.insert(p.sym);
+                }
+            }
+            for s in &impl_.body {
+                if !s.sym.is_none() {
+                    bound.insert(s.sym);
+                }
+            }
+            for p in &impl_.parents {
+                collect_captures(p, &bound, out, st);
+            }
+            for s in &impl_.body {
+                collect_captures(s, &bound, out, st);
+            }
+        }
         TreeKind::InterpolatedString { args, .. } => {
             for a in args {
                 collect_captures(a, own, out, st);

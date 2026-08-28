@@ -374,6 +374,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
             add_string_ops_concat_length_flat(st, so);
         }
         add_seq_and_lazylist(st);
+        fix_string_context_parts(st);
         add_view(st);
         add_indexedseq_and_queue(st);
         add_array_buffer(st);
@@ -461,6 +462,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         rich_ldc,
         library_abi,
     );
+
+    crate::prelude_lowbound::install(st);
 
     st.push_scope();
     st.enter_in_current("scala", st.scala_pkg);
@@ -1206,14 +1209,21 @@ fn add_any_members(st: &mut SymbolTable) {
         Type::String,
         Intrinsic::AnyToString,
     );
-    method(st, any, "asInstanceOf", vec![], Type::Any, Intrinsic::None);
+    method(
+        st,
+        any,
+        "asInstanceOf",
+        vec![],
+        Type::Any,
+        Intrinsic::AsInstanceOf,
+    );
     method(
         st,
         any,
         "isInstanceOf",
         vec![],
         Type::Boolean,
-        Intrinsic::None,
+        Intrinsic::IsInstanceOf,
     );
     // nsc `Any.synchronized[T0](body: => T0): T0`
     let sync = method(
@@ -6549,6 +6559,26 @@ fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
     ct
 }
 
+/// `StringContext.parts` is a `Seq[String]`; `Seq` only exists once
+/// `add_seq_and_lazylist` has run, so the type is filled in afterwards.
+fn fix_string_context_parts(st: &mut SymbolTable) {
+    let Some(seq) = crate::classpath::find_by_jvm(st, "scala/collection/immutable/Seq") else {
+        return;
+    };
+    let Some(sc) = crate::classpath::find_by_jvm(st, "scala/StringContext") else {
+        return;
+    };
+    let fields = st.get(sc).ctor_fields.clone();
+    for f in fields {
+        if st.get(f).name == "parts" {
+            st.get_mut(f).ty = Type::Class {
+                sym: seq,
+                args: vec![Type::String],
+            };
+        }
+    }
+}
+
 fn add_string_context(st: &mut SymbolTable) {
     let sc = class(
         st,
@@ -6557,8 +6587,17 @@ fn add_string_context(st: &mut SymbolTable) {
         "scala/StringContext",
         &[Type::AnyRef],
     );
-    let parts = st.alloc("parts", sc, SymKind::Term, Flags::PARAM, "");
-    st.get_mut(parts).ty = Type::Repeated(Box::new(Type::String));
+    // `new StringContext(parts: String*)` takes a repeated parameter, but the
+    // member `parts` is a `Seq[String]`.
+    let parts = st.alloc("parts", sc, SymKind::Term, Flags::PARAM, "parts");
+    let seq = crate::classpath::find_by_jvm(st, "scala/collection/immutable/Seq");
+    st.get_mut(parts).ty = match seq {
+        Some(seq) => Type::Class {
+            sym: seq,
+            args: vec![Type::String],
+        },
+        None => Type::Repeated(Box::new(Type::String)),
+    };
     st.get_mut(sc).ctor_fields = vec![parts];
     method(
         st,

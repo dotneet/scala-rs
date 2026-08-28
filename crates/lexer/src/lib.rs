@@ -13,7 +13,98 @@ use scala_rs_span::{Diagnostic, SourceFile, Span};
 pub fn tokenize(source: &SourceFile, file_index: usize) -> (Vec<Token>, Vec<Diagnostic>) {
     let mut lx = Lexer::new(source, file_index);
     lx.tokenize_all();
-    (lx.tokens, lx.diags)
+    let tokens = drop_non_separating_newlines(lx.tokens);
+    (tokens, lx.diags)
+}
+
+/// nsc `Scanners`: a line break separates statements only when the token before
+/// it can end one and the token after it can begin one. Without this a chain
+/// written as `xs\n  .map(f)` is read as two statements.
+fn drop_non_separating_newlines(tokens: Vec<Token>) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if !matches!(tokens[i].kind, TokenKind::Newline) {
+            out.push(tokens[i].clone());
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < tokens.len() && matches!(tokens[j].kind, TokenKind::Newline) {
+            j += 1;
+        }
+        let before = out
+            .iter()
+            .rev()
+            .find(|t| !matches!(t.kind, TokenKind::Newline));
+        let after = tokens.get(j);
+        let keep = before.is_some_and(|t| can_end_statement(&t.kind))
+            && after.is_some_and(|t| can_begin_statement(&t.kind));
+        if keep {
+            out.push(tokens[i].clone());
+        }
+        i = j;
+    }
+    out
+}
+
+/// nsc `inLastOfStat`.
+fn can_end_statement(k: &TokenKind) -> bool {
+    matches!(
+        k,
+        TokenKind::Ident(_)
+            | TokenKind::IntLit(_)
+            | TokenKind::LongLit(_)
+            | TokenKind::FloatLit(_)
+            | TokenKind::DoubleLit(_)
+            | TokenKind::CharLit(_)
+            | TokenKind::StringLit(_)
+            | TokenKind::InterpEnd(_)
+            | TokenKind::SymbolLit(_)
+            | TokenKind::This
+            | TokenKind::Null
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::Return
+            | TokenKind::Underscore
+            | TokenKind::TypeKw
+            | TokenKind::RParen
+            | TokenKind::RBracket
+            | TokenKind::RBrace
+    )
+}
+
+/// nsc `inFirstOfStat`: these cannot start a statement, so a line break before
+/// one of them is not a separator.
+fn can_begin_statement(k: &TokenKind) -> bool {
+    !matches!(
+        k,
+        TokenKind::Eof
+            | TokenKind::Catch
+            | TokenKind::Else
+            | TokenKind::Extends
+            | TokenKind::Finally
+            | TokenKind::ForSome
+            | TokenKind::Match
+            | TokenKind::With
+            | TokenKind::Yield
+            | TokenKind::Comma
+            | TokenKind::Semi
+            | TokenKind::Newline
+            | TokenKind::Dot
+            | TokenKind::Colon
+            | TokenKind::Equals
+            | TokenKind::Arrow
+            | TokenKind::LeftArrow
+            | TokenKind::Subtype
+            | TokenKind::Supertype
+            | TokenKind::ViewBound
+            | TokenKind::Hash
+            | TokenKind::RParen
+            | TokenKind::RBracket
+            | TokenKind::RBrace
+            | TokenKind::LBracket
+    )
 }
 
 struct Lexer<'a> {
@@ -527,7 +618,10 @@ impl<'a> Lexer<'a> {
             self.bump(); // "
         }
         if let Some(prefix) = interp_prefix {
-            let raw = prefix == "raw";
+            // Only `s` and `f` process escapes; every other interpolator —
+            // `raw` and any user-defined one — gets the parts verbatim, which
+            // is what `StringContext.parts` holds in scalac.
+            let raw = !matches!(prefix.as_str(), "s" | "f");
             self.emit(
                 TokenKind::InterpStart { prefix, triple },
                 lo,

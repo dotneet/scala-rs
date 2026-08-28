@@ -673,6 +673,25 @@ impl Assembler {
         let _ = self.pop_v();
         self.push_v(VType::Double);
     }
+    /// `lcmp` / `fcmpl` / `dcmpl`: pop two values, push the comparison int.
+    pub fn lcmp(&mut self) {
+        self.emit_op(0x94);
+        let _ = self.pop_v();
+        let _ = self.pop_v();
+        self.push_v(VType::Integer);
+    }
+    pub fn fcmpl(&mut self) {
+        self.emit_op(0x95);
+        let _ = self.pop_v();
+        let _ = self.pop_v();
+        self.push_v(VType::Integer);
+    }
+    pub fn dcmpl(&mut self) {
+        self.emit_op(0x97);
+        let _ = self.pop_v();
+        let _ = self.pop_v();
+        self.push_v(VType::Integer);
+    }
     pub fn i2f(&mut self) {
         self.emit_op(0x86);
         let _ = self.pop_v();

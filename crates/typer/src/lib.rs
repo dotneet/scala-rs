@@ -1,3 +1,4 @@
+mod anon_capture;
 mod check;
 mod classpath;
 mod erasure;
@@ -9,12 +10,14 @@ mod pickle_supply;
 mod prelude;
 mod prelude_coll;
 mod prelude_either;
+mod prelude_lowbound;
 mod prelude_seq;
 mod prelude_text;
 mod prelude_tuple;
 mod symbol;
 mod uncurry;
 
+pub use anon_capture::mark_anon_captures;
 pub use check::{
     find_mains, has_errors, typecheck, typecheck_opts, ClasspathClass, ClasspathMethod,
     ClasspathPickleMethod, TypecheckOptions, Typer,
@@ -3836,7 +3839,8 @@ object Main {
         let (_, _, diags) = typecheck_str(
             r#"
 object Main {
-  implicit class Rich(n: Int) { def twice: Int = n * 2 }
+  class Rich(n: Int) { def twice: Int = n * 2 }
+  implicit def toRich(n: Int): Rich = new Rich(n)
   def main(args: Array[String]): Unit = {
     val n: Int = 2.twice
   }
