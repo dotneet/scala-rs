@@ -219,11 +219,44 @@ impl Symbol {
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
     map: HashMap<String, Vec<SymbolId>>,
+    /// Owners brought in by a wildcard import (`import p._`) in this scope,
+    /// with the names that selector hid (`import p.{X => _, _}`).
+    /// A package read from a jar cannot be enumerated up front, so the names
+    /// it offers are resolved on demand: see `Checker::expose_unqualified`.
+    wildcards: Vec<WildcardImport>,
+}
+
+/// `import owner._`, minus the names hidden by `X => _` selectors.
+#[derive(Clone, Debug)]
+pub struct WildcardImport {
+    pub owner: SymbolId,
+    pub hidden: Vec<String>,
+}
+
+impl WildcardImport {
+    pub fn offers(&self, name: &str) -> bool {
+        !self.hidden.iter().any(|h| h == name)
+    }
 }
 
 impl Scope {
     pub fn enter(&mut self, name: &str, id: SymbolId) {
         self.map.entry(name.to_string()).or_default().push(id);
+    }
+
+    pub fn enter_wildcard(&mut self, owner: SymbolId, hidden: &[String]) {
+        if let Some(w) = self.wildcards.iter_mut().find(|w| w.owner == owner) {
+            w.hidden.retain(|h| hidden.iter().any(|n| n == h));
+            return;
+        }
+        self.wildcards.push(WildcardImport {
+            owner,
+            hidden: hidden.to_vec(),
+        });
+    }
+
+    pub fn wildcards(&self) -> &[WildcardImport] {
+        &self.wildcards
     }
 
     pub fn lookup(&self, name: &str) -> &[SymbolId] {
@@ -388,6 +421,27 @@ impl SymbolTable {
 
     pub fn enter_in_current(&mut self, name: &str, id: SymbolId) {
         self.scopes.last_mut().unwrap().enter(name, id);
+    }
+
+    /// Record `import owner._` in the innermost scope.
+    pub fn enter_wildcard_in_current(&mut self, owner: SymbolId, hidden: &[String]) {
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .enter_wildcard(owner, hidden);
+    }
+
+    /// Owners a wildcard import offers `name`, innermost scope first.
+    pub fn wildcard_owners_for(&self, name: &str) -> Vec<SymbolId> {
+        let mut out = Vec::new();
+        for sc in self.scopes.iter().rev() {
+            for w in sc.wildcards() {
+                if w.offers(name) && !out.contains(&w.owner) {
+                    out.push(w.owner);
+                }
+            }
+        }
+        out
     }
 
     pub fn push_scope(&mut self) {
@@ -772,6 +826,12 @@ impl SymbolTable {
                     ) =>
                 {
                     let t = apply_type_ctor((**ctor).clone(), args.clone());
+                    if matches!(t, Type::Applied { .. }) {
+                        // Still applied: the constructor is abstract (a type
+                        // member or parameter), so it names no class to walk
+                        // into. Recursing here would not terminate.
+                        return ty;
+                    }
                     walk(st, &t, ty, seen)
                 }
                 _ => ty,

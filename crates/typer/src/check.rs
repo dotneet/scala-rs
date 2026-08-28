@@ -1021,20 +1021,13 @@ impl Typer {
             }
             TreeKind::Select { name, .. } if name.starts_with('{') => {
                 // selectors encoded as `{A,B=>C}`
-                let inner = name.trim_matches(|c| c == '{' || c == '}');
-                for sel in inner.split(',') {
-                    if sel == "_" {
+                for (from, to) in decode_import_selectors(name) {
+                    if from == "_" || to == "_" {
                         continue;
                     }
-                    let mut it = sel.split("=>");
-                    let from = it.next().unwrap_or(sel).trim();
-                    let to = it.next().unwrap_or(from).trim();
-                    if to == "_" {
-                        continue;
-                    }
-                    let found = self.st.lookup(from);
+                    let found = self.st.lookup(&from);
                     for f in found {
-                        self.st.enter_in_current(to, f);
+                        self.st.enter_in_current(&to, f);
                     }
                 }
             }
@@ -3029,89 +3022,34 @@ impl Typer {
         if import_enables_feature(expr, "implicitConversions") {
             self.language_implicit_conversions = true;
         }
+        let span = tree.span;
         match &mut expr.kind {
             TreeKind::Select { qual, name } if name == "_" => {
-                self.type_expr(qual, &Type::NoType);
-                let owner = if !qual.sym.is_none() {
-                    let id = qual.sym;
-                    match self.st.get(id).kind {
-                        SymKind::Module | SymKind::ModuleClass => self.st.module_class_of(id),
-                        _ => id,
-                    }
-                } else {
-                    self.st
-                        .class_sym_of(&qual.ty)
-                        .map(|c| self.st.module_class_of(c))
-                        .unwrap_or(SymbolId::NONE)
-                };
-                if owner.is_none() {
-                    return;
-                }
-                let members = self.st.get(owner).members.clone();
-                for m in members {
-                    let n = self.st.get(m).name.clone();
-                    if n.ends_with('$') || n == "<init>" {
+                let owners = self.import_prefix(qual, span);
+                self.import_wildcard(&owners, &[], span);
+            }
+            TreeKind::Select { qual, name } if name.starts_with('{') => {
+                let sels = decode_import_selectors(name);
+                let owners = self.import_prefix(qual, span);
+                let hidden: Vec<String> = sels
+                    .iter()
+                    .filter(|(from, to)| from != "_" && to == "_")
+                    .map(|(from, _)| from.clone())
+                    .collect();
+                for (from, to) in &sels {
+                    if from == "_" || to == "_" {
                         continue;
                     }
-                    self.st.enter_in_current(&n, m);
+                    self.import_named(&owners, from, to, span);
+                }
+                if sels.iter().any(|(from, _)| from == "_") {
+                    self.import_wildcard(&owners, &hidden, span);
                 }
             }
             TreeKind::Select { qual, name } => {
                 let n = name.clone();
-                self.type_expr(qual, &Type::NoType);
-                let owner = if !qual.sym.is_none() {
-                    let id = qual.sym;
-                    match self.st.get(id).kind {
-                        SymKind::Module | SymKind::ModuleClass => self.st.module_class_of(id),
-                        _ => id,
-                    }
-                } else {
-                    self.st.class_sym_of(&qual.ty).unwrap_or(SymbolId::NONE)
-                };
-                if owner.is_none() {
-                    return;
-                }
-                // `import a.b.{C, D => E}`: the parser encodes the selectors in
-                // the name. The namer resolves what it can from scope; a name
-                // defined in another unit only resolves here.
-                if let Some(inner) = n.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-                    let mut wildcard = false;
-                    let sels: Vec<(String, String)> = inner
-                        .split(',')
-                        .filter_map(|sel| {
-                            let sel = sel.trim();
-                            if sel == "_" {
-                                wildcard = true;
-                                return None;
-                            }
-                            let mut it = sel.split("=>");
-                            let from = it.next().unwrap_or(sel).trim().to_string();
-                            let to = it.next().unwrap_or(&from).trim().to_string();
-                            (to != "_").then_some((from, to))
-                        })
-                        .collect();
-                    for (from, to) in &sels {
-                        self.complete_binary_member(owner, from, tree.span);
-                        for m in self.st.lookup_member(owner, from) {
-                            self.st.enter_in_current(to, m);
-                        }
-                    }
-                    if wildcard {
-                        let named: Vec<String> = sels.iter().map(|(f, _)| f.clone()).collect();
-                        for m in self.st.get(owner).members.clone() {
-                            let mn = self.st.get(m).name.clone();
-                            if mn.ends_with('$') || mn == "<init>" || named.contains(&mn) {
-                                continue;
-                            }
-                            self.st.enter_in_current(&mn, m);
-                        }
-                    }
-                    return;
-                }
-                self.complete_binary_member(owner, &n, tree.span);
-                for m in self.st.lookup_member(owner, &n) {
-                    self.st.enter_in_current(&n, m);
-                }
+                let owners = self.import_prefix(qual, span);
+                self.import_named(&owners, &n, &n, span);
             }
             TreeKind::Ident { name } => {
                 let n = name.clone();
@@ -3122,6 +3060,221 @@ impl Typer {
             _ => {}
         }
         tree.ty = Type::NoType;
+    }
+
+    /// The symbol whose members an import's selectors name.
+    ///
+    /// Packages, objects and package objects are resolved symbolically, one
+    /// path segment at a time, so a jar-only package such as `cats.syntax`
+    /// never has to be typed as an expression (it has no type). Only a real
+    /// term prefix (`import someVal.field._`) falls back to the typer.
+    fn import_prefix(&mut self, qual: &mut Tree, span: Span) -> Vec<SymbolId> {
+        let syms = self.import_path_syms(qual, span);
+        if !syms.is_empty() {
+            qual.sym = syms[0];
+            return syms.into_iter().map(|s| self.as_type_owner(s)).collect();
+        }
+        self.type_expr(qual, &Type::NoType);
+        if !qual.sym.is_none() {
+            let id = qual.sym;
+            return vec![match self.st.get(id).kind {
+                SymKind::Module | SymKind::ModuleClass => self.st.module_class_of(id),
+                _ => id,
+            }];
+        }
+        match self.st.class_sym_of(&qual.ty) {
+            Some(c) => vec![self.st.module_class_of(c)],
+            None => Vec::new(),
+        }
+    }
+
+    /// Resolve `a.b.c` to package / object / class symbols without typing it.
+    ///
+    /// More than one can answer to the same name: a `case class C` whose
+    /// `object C` is named later in the file gets a synthetic companion of its
+    /// own, so `import C.member` has to look in both.
+    fn import_path_syms(&mut self, t: &Tree, span: Span) -> Vec<SymbolId> {
+        match &t.kind {
+            TreeKind::Ident { name } if name == "_root_" => vec![self.st.root],
+            TreeKind::Ident { name } => {
+                self.expose_unqualified(name, span);
+                let mut found = self.st.lookup(name);
+                if found.is_empty() {
+                    found = self.st.lookup_member(self.st.root, name);
+                }
+                self.rank_import_prefixes(found)
+            }
+            TreeKind::Select { qual, name } => {
+                for owner in self.import_path_syms(qual, span) {
+                    let owner = self.as_type_owner(owner);
+                    self.complete_binary_member(owner, name, span);
+                    let found = self.st.lookup_member(owner, name);
+                    let ranked = self.rank_import_prefixes(found);
+                    if !ranked.is_empty() {
+                        return ranked;
+                    }
+                    let Some(po) = self.package_object_of(owner, span) else {
+                        continue;
+                    };
+                    self.complete_binary_member(po, name, span);
+                    let found = self.st.lookup_member(po, name);
+                    let ranked = self.rank_import_prefixes(found);
+                    if !ranked.is_empty() {
+                        return ranked;
+                    }
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// An import prefix is a stable identifier, so an object always wins over
+    /// a class of the same name (`import scala.util.control.Breaks._` names
+    /// the object, not the trait it also inherits from), and a written object
+    /// wins over the synthetic companion a `case class` was given.
+    fn rank_import_prefixes(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
+        let rank = |k: SymKind| match k {
+            SymKind::Package => Some(0),
+            SymKind::Module => Some(1),
+            SymKind::ModuleClass => Some(2),
+            SymKind::Class => Some(3),
+            _ => None,
+        };
+        let mut out: Vec<(u8, u8, SymbolId)> = found
+            .into_iter()
+            .filter_map(|s| {
+                let sym = self.st.get(s);
+                let synthetic = u8::from(sym.flags.contains(Flags::SYNTHETIC));
+                rank(sym.kind).map(|r| (r, synthetic, s))
+            })
+            .collect();
+        out.sort_by_key(|&(r, syn, s)| (r, syn, s.0));
+        out.dedup_by_key(|&mut (_, _, s)| s);
+        // Only the best kind answers: a trait and its companion share a name,
+        // and `import C._` names the object alone.
+        let best = out.first().map(|&(r, _, _)| r);
+        out.into_iter()
+            .filter(|&(r, _, _)| Some(r) == best)
+            .map(|(_, _, s)| s)
+            .collect()
+    }
+
+    /// `package p { ... }`'s package object, compiled to `p/package$`. Its
+    /// members are members of `p` itself. Same-run package objects are folded
+    /// into the package by the namer; this covers the ones read from a jar.
+    fn package_object_of(&mut self, owner: SymbolId, span: Span) -> Option<SymbolId> {
+        if self.st.get(owner).kind != SymKind::Package || owner == self.st.root {
+            return None;
+        }
+        let pkg_jvm = self.st.get(owner).jvm_name.clone();
+        if pkg_jvm.is_empty() {
+            return None;
+        }
+        if let Some(id) = self
+            .st
+            .lookup_member(owner, "package")
+            .into_iter()
+            .find(|&s| matches!(self.st.get(s).kind, SymKind::Module | SymKind::ModuleClass))
+        {
+            return Some(self.st.module_class_of(id));
+        }
+        if !self.load_binary_into(&format!("{pkg_jvm}/package$"), owner, span, true) {
+            return None;
+        }
+        let id = self
+            .st
+            .lookup_member(owner, "package")
+            .into_iter()
+            .find(|&s| matches!(self.st.get(s).kind, SymKind::Module | SymKind::ModuleClass))?;
+        let mcls = self.st.module_class_of(id);
+        // A package object's members are the package's members.
+        for mem in self.st.get(mcls).members.clone() {
+            if !self.st.get(owner).members.contains(&mem) {
+                self.st.get_mut(owner).members.push(mem);
+            }
+        }
+        Some(mcls)
+    }
+
+    /// `import p.n` / `import p.{n => alias}`.
+    fn import_named(&mut self, owners: &[SymbolId], from: &str, to: &str, span: Span) {
+        let mut entered = false;
+        for &owner in owners {
+            if owner.is_none() {
+                continue;
+            }
+            self.complete_binary_member(owner, from, span);
+            let mut found = self.st.lookup_member(owner, from);
+            if found.is_empty() {
+                if let Some(po) = self.package_object_of(owner, span) {
+                    self.complete_binary_member(po, from, span);
+                    found = self.st.lookup_member(po, from);
+                }
+            }
+            for m in found {
+                self.st.enter_in_current(to, m);
+                entered = true;
+            }
+        }
+        if entered {
+            return;
+        }
+        let Some(&owner) = owners.iter().find(|o| !o.is_none()) else {
+            // The prefix itself did not resolve; it reported its own error.
+            return;
+        };
+        // nsc: `import p.Nope` is an error at the selector, not only at the
+        // later use of the name.
+        self.error(
+            span,
+            format!("value {from} is not a member of {}", self.owner_desc(owner)),
+        );
+    }
+
+    /// `package p` / `object O` / `class C`, for a diagnostic.
+    fn owner_desc(&self, owner: SymbolId) -> String {
+        let s = self.st.get(owner);
+        let name = if s.jvm_name.is_empty() {
+            s.name.clone()
+        } else {
+            s.jvm_name.replace('/', ".")
+        };
+        match s.kind {
+            SymKind::Package => format!("package {name}"),
+            SymKind::Module | SymKind::ModuleClass => {
+                format!("object {}", name.trim_end_matches('$'))
+            }
+            _ => name,
+        }
+    }
+
+    /// `import p._` / `import p.*`. Members already known are entered eagerly;
+    /// the owner is also recorded so that a name only reachable by reading a
+    /// classfile is still found later (see `expose_unqualified`).
+    fn import_wildcard(&mut self, owners: &[SymbolId], hidden: &[String], span: Span) {
+        let mut all: Vec<SymbolId> = Vec::new();
+        for &owner in owners {
+            if owner.is_none() || all.contains(&owner) {
+                continue;
+            }
+            all.push(owner);
+            if let Some(po) = self.package_object_of(owner, span) {
+                if !all.contains(&po) {
+                    all.push(po);
+                }
+            }
+        }
+        for o in all {
+            for m in self.st.get(o).members.clone() {
+                let n = self.st.get(m).name.clone();
+                if n.ends_with('$') || n == "<init>" || hidden.iter().any(|h| h == &n) {
+                    continue;
+                }
+                self.st.enter_in_current(&n, m);
+            }
+            self.st.enter_wildcard_in_current(o, hidden);
+        }
     }
 
     fn type_expr(&mut self, tree: &mut Tree, pt: &Type) {
@@ -3663,6 +3816,21 @@ impl Typer {
             self.complete_binary_member(self.st.root, name, span);
             for id in self.st.lookup_member(self.st.root, name) {
                 self.st.enter_in_current(name, id);
+            }
+        }
+        if self.st.lookup(name).is_empty() {
+            // `import p._` where `p` is a jar package: its classes are read one
+            // at a time, so the name is only reachable now.
+            for owner in self.st.wildcard_owners_for(name) {
+                self.complete_binary_member(owner, name, span);
+                let found = self.st.lookup_member(owner, name);
+                if found.is_empty() {
+                    continue;
+                }
+                for id in found {
+                    self.st.enter_in_current(name, id);
+                }
+                break;
             }
         }
     }
@@ -10577,6 +10745,26 @@ fn lub(a: &Type, b: &Type) -> Type {
         return a;
     }
     Type::Any
+}
+
+/// Undo the parser's `{A,B=>C,_}` encoding of an import selector list.
+/// Each entry is `(name, alias)`; `("_", "_")` is the wildcard, and an alias
+/// of `_` hides the name.
+fn decode_import_selectors(encoded: &str) -> Vec<(String, String)> {
+    let inner = encoded.trim_matches(|c| c == '{' || c == '}');
+    let mut out = Vec::new();
+    for sel in inner.split(',') {
+        let sel = sel.trim();
+        if sel.is_empty() {
+            continue;
+        }
+        let (from, to) = match sel.split_once("=>") {
+            Some((f, t)) => (f.trim(), t.trim()),
+            None => (sel, sel),
+        };
+        out.push((from.to_string(), to.to_string()));
+    }
+    out
 }
 
 fn import_path(t: &Tree) -> String {
