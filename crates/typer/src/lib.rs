@@ -4075,4 +4075,59 @@ class C(val x: Int, val y: Int) extends Base(0) {
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
+
+    /// A pattern-matching anonymous function takes its scrutinee type from the
+    /// expected type and reports the lub of the case bodies as its result, so
+    /// `xs.map { case … }` no longer collapses to `List[Any]`. The same path
+    /// carries `xs.collect { case … }` (a `PartialFunction` literal) and a
+    /// placeholder section whose type only the callee's signature supplies.
+    #[test]
+    fn placeholder_case_lambda_result_type_with_library() {
+        ok_lib(
+            r#"
+case class Box[A](a: A)
+object Main {
+  def two(a: Int, b: Int): Int = a * 10 + b
+  def bump(xs: List[Int]): List[Int] = xs.map { case i => i + 1 }
+  def tag(xs: List[Int]): List[String] = xs.map { case i => "n" + i }
+  def branch(xs: List[Int]): List[Int] = xs.map { case i => if (i > 0) i else -i }
+  def unbox(xs: List[Box[Int]]): List[Int] = xs.map { case Box(v) => v * 3 }
+  def keep(xs: List[Int]): List[String] = xs.collect { case i if i > 1 => "y" + i }
+  val pf: PartialFunction[Int, String] = { case 1 => "one"; case n => "n" + n }
+  val section = two(_, 7)
+  val section2: (Int, Int) => Int = two(_, _)
+  def main(args: Array[String]): Unit = println(bump(List(1)))
+}
+"#,
+        );
+    }
+
+    /// nsc only fills a section's parameter type from the callee when the
+    /// callee is a single monomorphic method; `_ + 1` with no expected type
+    /// still has to fail.
+    #[test]
+    fn placeholder_missing_parameter_type_still_reported_with_library() {
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  val f = _ + 1
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {:?}", diags);
+        assert!(
+            diags.iter().any(|d| d
+                .message
+                .contains("missing parameter type for expanded function")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
 }

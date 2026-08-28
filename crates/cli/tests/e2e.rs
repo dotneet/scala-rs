@@ -3031,3 +3031,21 @@ object UseLib {
     let _ = fs::remove_dir_all(&out_lib);
     let _ = fs::remove_dir_all(&probe);
 }
+
+/// `{ case … }` and placeholder sections against the real scala-library:
+/// `xs.map { case … }` keeps the case bodies' type (never `List[Any]`),
+/// `xs.collect { case … }` typechecks as a `PartialFunction`, and
+/// `two(_, _)` expands with its placeholders in source order.
+#[test]
+fn scala_library_dual_run_placeholder4() {
+    dual_run_fixture("placeholder4");
+}
+
+/// nsc still rejects a section whose parameter type nothing determines.
+#[test]
+fn fixtures_placeholder_missing_bad_is_error() {
+    compile_fails(
+        "placeholder_missing_bad",
+        "missing parameter type for expanded function",
+    );
+}

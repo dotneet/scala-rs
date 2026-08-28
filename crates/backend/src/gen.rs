@@ -9524,6 +9524,12 @@ fn gen_pattern(
                     load(asm, tmp, JvmSort::Ref);
                     asm.checkcast(&jvm);
                     asm.getfield(&jvm, &fname, &fdesc);
+                    // A field declared at a type parameter erases to Object.
+                    // The scrutinee pins the sub-pattern to the instantiated
+                    // type (`Box[Int]` binds `Int`), so unbox / cast here.
+                    if fdesc == "Ljava/lang/Object;" {
+                        adapt_erased_field(asm, ctx, &a.ty);
+                    }
                     bind_subpattern(asm, frame, ctx, a, fail);
                 } else {
                     throw_runtime(asm, "pattern arity");
@@ -9554,6 +9560,21 @@ fn gen_pattern(
             gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
         }
         _ => {}
+    }
+}
+
+/// An `Object` on the stack that the typer knows more precisely: unbox it for a
+/// primitive sub-pattern, cast it for a reference one, leave it alone when the
+/// sub-pattern is itself erased (a bare type parameter).
+fn adapt_erased_field(asm: &mut Assembler, ctx: &EmitCtx, want: &Type) {
+    let want = want.widen_constant();
+    if is_jvm_primitive(&want) {
+        emit_unbox(asm, &want);
+        return;
+    }
+    let jvm = type_jvm_name(ctx.st, &want);
+    if jvm != "java/lang/Object" && !jvm.is_empty() && !jvm.starts_with('[') {
+        asm.checkcast(&jvm);
     }
 }
 

@@ -2783,11 +2783,7 @@ impl Typer {
                 // `adapt` leaves the branch type as-is when it is a subtype of `pt`
                 // (`Some` stays `Some`, not `Option`). Structural lub cannot walk
                 // parents, so use the expected type when the typer has one.
-                tree.ty = if !pt.is_no_type() && !matches!(pt, Type::Nothing) {
-                    pt.clone()
-                } else {
-                    lub(&thenp.ty, &elsep.ty)
-                };
+                tree.ty = pt_or_lub(pt, lub(&thenp.ty, &elsep.ty));
             }
             TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
                 self.type_expr(cond, &Type::Boolean);
@@ -6106,6 +6102,17 @@ impl Typer {
         if matches!(arg, Type::Function { .. }) && matches!(param, Type::Function { .. }) {
             return Some(8);
         }
+        // A not-yet-typed function literal (`{ case … }`, `_ + 1`, `x => x`)
+        // enters overload resolution as `(<notype>…) => <notype>`. It can still
+        // land on a `PartialFunction` parameter (`xs.collect { case … }`);
+        // `type_function` decides whether the literal really is a pattern match.
+        if let (Type::Function { params, ret }, Some((_, _))) =
+            (arg, partial_function_type(&self.st, param))
+        {
+            if params.len() == 1 && params[0].is_no_type() && ret.is_no_type() {
+                return Some(6);
+            }
+        }
         if matches!(param, Type::TypeParam(_)) || matches!(arg, Type::TypeParam(_)) {
             return Some(2);
         }
@@ -6122,6 +6129,73 @@ impl Typer {
             return Some(1);
         }
         None
+    }
+
+    /// Parameter types for an expanded placeholder section `f(_, x)`, read off
+    /// the callee's own signature. nsc only does this when every placeholder is
+    /// a bare argument of one application and the callee resolves to a single
+    /// monomorphic method: `poly(_, 3)` (undetermined type parameters) and
+    /// `"abc".substring(_)` (overloaded) keep the missing-parameter error.
+    /// Returns `NoType` per parameter when the section does not qualify.
+    fn section_param_types(&mut self, vparams: &[Tree], body: &Tree) -> Vec<Type> {
+        let none = vec![Type::NoType; vparams.len()];
+        let TreeKind::Apply { fun, args } = &body.kind else {
+            return none;
+        };
+        let names: Vec<&str> = vparams.iter().filter_map(|p| p.name()).collect();
+        if names.len() != vparams.len() || names.is_empty() {
+            return none;
+        }
+        // Every placeholder must be one of this application's arguments.
+        let mut at = vec![usize::MAX; vparams.len()];
+        for (ai, a) in args.iter().enumerate() {
+            if let TreeKind::Ident { name } = &a.kind {
+                if let Some(pi) = names.iter().position(|n| *n == name.as_str()) {
+                    at[pi] = ai;
+                }
+            }
+        }
+        if at.iter().any(|i| *i == usize::MAX) {
+            return none;
+        }
+        // Probe the callee without keeping any diagnostics it produces.
+        let mark = self.diags.len();
+        let mut probe = (**fun).clone();
+        let dummy_method = Type::Method {
+            paramss: vec![],
+            ret: Box::new(Type::NoType),
+        };
+        self.type_expr(&mut probe, &dummy_method);
+        self.diags.truncate(mark);
+        if probe.sym.is_none() || matches!(probe.ty, Type::Overload(_)) {
+            return none;
+        }
+        if !self.st.get(probe.sym).tparams.is_empty() {
+            return none;
+        }
+        let Type::Method { paramss, .. } = &probe.ty else {
+            return none;
+        };
+        let Some(params) = paramss.first() else {
+            return none;
+        };
+        if params.len() != args.len() {
+            return none;
+        }
+        let mut out = none;
+        for (pi, ai) in at.iter().enumerate() {
+            let t = match &params[*ai] {
+                Type::ByName(inner) => (**inner).clone(),
+                other => other.clone(),
+            };
+            if !t.is_no_type()
+                && !t.is_error()
+                && !matches!(t, Type::TypeParam(_) | Type::Repeated(_))
+            {
+                out[pi] = t;
+            }
+        }
+        out
     }
 
     fn type_function(&mut self, vparams: &mut Vec<Tree>, body: &mut Tree, pt: &Type) -> Type {
@@ -6160,12 +6234,31 @@ impl Typer {
         } else {
             (vec![Type::NoType; vparams.len()], Type::NoType)
         };
+        // `xs.collect { case … }` reaches here with `PartialFunction[Int, B]`,
+        // `B` still undetermined. Typing the body against a bare type parameter
+        // pins it to that parameter (and later to `Any`); let the body speak.
+        let ret_pt = if matches!(ret_pt, Type::TypeParam(_)) {
+            Type::NoType
+        } else {
+            ret_pt
+        };
+        // `f(_, x)`: the expected type says nothing, but `f`'s own signature
+        // does. nsc only takes this route for an unambiguous monomorphic
+        // callee — `poly(_, 3)` and `"abc".substring(_)` stay errors.
+        let from_section = if pts.iter().any(|t| t.is_no_type()) {
+            self.section_param_types(vparams, body)
+        } else {
+            vec![Type::NoType; vparams.len()]
+        };
         self.st.push_scope();
         let mut param_tys = Vec::new();
         for (i, p) in vparams.iter_mut().enumerate() {
             self.type_val_sig(p);
             if p.ty.is_no_type() {
                 p.ty = pts.get(i).cloned().unwrap_or(Type::NoType);
+            }
+            if p.ty.is_no_type() {
+                p.ty = from_section.get(i).cloned().unwrap_or(Type::NoType);
             }
             if p.sym.is_none() {
                 if let TreeKind::ValDef { name, mods, .. } = &p.kind {
@@ -6205,8 +6298,21 @@ impl Typer {
             self.adapt(body, &ret_pt);
             ret_pt
         };
+        let body_ty = body.ty.widen_constant();
         self.st.pop_scope();
-        if pf_result.is_some() {
+        if let Some((from, _to)) = &pf_result {
+            // Keep the expected `PartialFunction` shape, but fill in a result
+            // type the caller still has to infer (`xs.collect { case … }`'s `B`,
+            // which arrives here as a bare `Any`) from the case bodies. `B` is
+            // covariant, so a more precise result still conforms to `pt`.
+            if let Type::Class { sym, .. } = pt {
+                if !body_ty.is_no_type() && !body_ty.is_error() {
+                    return Type::Class {
+                        sym: *sym,
+                        args: vec![from.clone(), body_ty],
+                    };
+                }
+            }
             pt.clone()
         } else if sam.is_some() && param_tys.len() == pts.len() {
             pt.clone()
@@ -6249,7 +6355,7 @@ impl Typer {
             self.st.pop_scope();
         }
         let span = tree.span;
-        tree.ty = if pt.is_no_type() { res } else { pt.clone() };
+        tree.ty = pt_or_lub(pt, res);
         if let TreeKind::Match { selector, cases } = &tree.kind {
             self.check_match_exhaustive(span, &sel_ty, cases);
             if tree_has_switch(selector) && !match_can_switch(&sel_ty, cases) {
@@ -6359,21 +6465,28 @@ impl Typer {
                 if use_ctor {
                     let class_id = class_id.unwrap();
                     let fields = self.st.get(class_id).ctor_fields.clone();
+                    let targs = self.pattern_class_targs(class_id, sel_ty);
                     let class_ty = Type::Class {
                         sym: class_id,
-                        args: vec![],
+                        args: targs.clone(),
                     };
                     for (i, a) in args.iter_mut().enumerate() {
                         let ft = fields
                             .get(i)
                             .map(|f| self.st.get(*f).ty.clone())
                             .unwrap_or(Type::Any);
+                        let ft = if targs.is_empty() {
+                            ft
+                        } else {
+                            self.st.subst_tparams(class_id, &targs, &ft)
+                        };
                         self.type_pattern(a, &ft);
                     }
                     pat.ty = class_ty;
                     pat.sym = class_id;
                 } else if let Some(u) = unapply.filter(|_| !has_star) {
                     let extracted = self.unapply_extracted_types(u);
+                    let extracted = self.subst_unapply_tparams(u, sel_ty, extracted);
                     if args.len() != extracted.len() && !extracted.is_empty() {
                         self.error(
                             pat.span,
@@ -6424,16 +6537,22 @@ impl Typer {
                     pat.ty = sel_ty.clone();
                 } else if let Some(c) = class_id {
                     let fields = self.st.get(c).ctor_fields.clone();
+                    let targs = self.pattern_class_targs(c, sel_ty);
                     for (i, a) in args.iter_mut().enumerate() {
                         let ft = fields
                             .get(i)
                             .map(|f| self.st.get(*f).ty.clone())
                             .unwrap_or(Type::Any);
+                        let ft = if targs.is_empty() {
+                            ft
+                        } else {
+                            self.st.subst_tparams(c, &targs, &ft)
+                        };
                         self.type_pattern(a, &ft);
                     }
                     pat.ty = Type::Class {
                         sym: c,
-                        args: vec![],
+                        args: targs,
                     };
                     pat.sym = c;
                 } else {
@@ -6583,6 +6702,77 @@ impl Typer {
         }
     }
 
+    /// The instance of `target` among `ty`'s base classes: `Some[Int]` seen as
+    /// `Option` is `Option[Int]`. `None` when `target` is not a base class.
+    fn base_type_instance(&self, ty: &Type, target: SymbolId, depth: u32) -> Option<Type> {
+        if depth > 16 {
+            return None;
+        }
+        let Type::Class { sym, args } = ty else {
+            return None;
+        };
+        if *sym == target {
+            return Some(ty.clone());
+        }
+        for p in self.st.get(*sym).parents.clone() {
+            let p = if args.is_empty() {
+                p
+            } else {
+                self.st.subst_tparams(*sym, args, &p)
+            };
+            if let Some(found) = self.base_type_instance(&p, target, depth + 1) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Type arguments for a constructor pattern's class, read off the scrutinee:
+    /// matching `Option[Int]` with `case Some(v)` binds `v: Int`, because
+    /// `Some[A] <: Option[A]` forces `A = Int`. Empty when nothing constrains
+    /// them, which leaves the declared (unsubstituted) field types in place.
+    fn pattern_class_targs(&self, cls: SymbolId, sel_ty: &Type) -> Vec<Type> {
+        let tps = self.st.get(cls).tparams.clone();
+        if tps.is_empty() {
+            return Vec::new();
+        }
+        let (sel_sym, sel_args) = match sel_ty {
+            Type::Class { sym, args } => (*sym, args.clone()),
+            _ => return Vec::new(),
+        };
+        if sel_args.is_empty() {
+            return Vec::new();
+        }
+        if sel_sym == cls {
+            return if sel_args.len() == tps.len() {
+                sel_args
+            } else {
+                Vec::new()
+            };
+        }
+        let open = Type::Class {
+            sym: cls,
+            args: tps.iter().map(|t| Type::TypeParam(*t)).collect(),
+        };
+        let Some(base) = self.base_type_instance(&open, sel_sym, 0) else {
+            return Vec::new();
+        };
+        let Type::Class {
+            args: base_args, ..
+        } = &base
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(tps.len());
+        for tp in &tps {
+            match unify_tparam(*tp, base_args, &sel_args) {
+                Some(t) if !t.is_no_type() => out.push(t),
+                _ => return Vec::new(),
+            }
+        }
+        out
+    }
+
     fn find_unapply(&self, fun: &Tree) -> Option<SymbolId> {
         let owner = if !fun.sym.is_none() {
             let s = self.st.get(fun.sym);
@@ -6716,6 +6906,42 @@ impl Typer {
                 })
             })
             .collect();
+    }
+
+    /// `Some.unapply[A](x: Option[A]): Option[A]` extracts `A`; the scrutinee
+    /// says what `A` is. Without this the bound variable keeps the extractor's
+    /// own type parameter and degrades to `Any`.
+    fn subst_unapply_tparams(&self, unapply: SymbolId, sel_ty: &Type, out: Vec<Type>) -> Vec<Type> {
+        let tps = self.st.get(unapply).tparams.clone();
+        if tps.is_empty() || sel_ty.is_no_type() {
+            return out;
+        }
+        let param = match &self.st.get(unapply).ty {
+            Type::Method { paramss, .. } => paramss.first().and_then(|p| p.first()).cloned(),
+            Type::Function { params, .. } => params.first().cloned(),
+            _ => None,
+        };
+        let Some(param) = param else {
+            return out;
+        };
+        let params = [param];
+        let args = [sel_ty.clone()];
+        let mut ids = Vec::new();
+        let mut tys = Vec::new();
+        for tp in tps {
+            if let Some(t) = unify_tparam(tp, &params, &args) {
+                if !t.is_no_type() && !t.is_error() {
+                    ids.push(tp);
+                    tys.push(t);
+                }
+            }
+        }
+        if ids.is_empty() {
+            return out;
+        }
+        out.iter()
+            .map(|t| crate::symbol::subst_tparams_slice(&ids, &tys, t))
+            .collect()
     }
 
     fn unapply_extracted_types(&self, unapply: SymbolId) -> Vec<Type> {
@@ -9154,6 +9380,21 @@ fn numeric_widen(a: &Type, b: &Type) -> Option<Type> {
         (Type::Float, Type::Double) => Some(Type::Double),
         (Type::Int, Type::Float) => Some(Type::Float),
         _ => None,
+    }
+}
+
+/// Result type of an `if` / `match`: nsc uses the lub of the branches and then
+/// adapts to the expected type. We prefer `pt` because a structural lub cannot
+/// walk parents (`if (c) Some(1) else None` must stay `Option[Int]`), but only
+/// when `pt` really says something. A lambda body is typed against a *stand-in*
+/// `Any` whenever the method's result type parameter is still undetermined
+/// (`xs.map(f)`'s `B`); adopting it there would make every `if`/`match` bodied
+/// lambda infer `A => Any` and collapse `xs.map { case … }` to `List[Any]`.
+fn pt_or_lub(pt: &Type, branches: Type) -> Type {
+    if !pt.is_no_type() && !matches!(pt, Type::Nothing | Type::Any | Type::TypeParam(_)) {
+        pt.clone()
+    } else {
+        branches
     }
 }
 

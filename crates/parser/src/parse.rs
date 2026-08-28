@@ -95,9 +95,13 @@ impl<'a> Parser<'a> {
                 },
             );
         }
-        let mut leftover = std::mem::take(&mut self.placeholder_params);
-        leftover.extend(saved);
-        self.placeholder_params = leftover;
+        // `placeholder_params` is newest-*last*, so the outer section's params
+        // (parsed earlier) come first. Appending the other way round made
+        // `two(_, _)` expand to `(a, b) => two(b, a)`.
+        let leftover = std::mem::take(&mut self.placeholder_params);
+        let mut merged = saved;
+        merged.extend(leftover);
+        self.placeholder_params = merged;
         res
     }
 

@@ -1022,4 +1022,26 @@ object Main {
             r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
+
+    /// nsc expands `f(_, _)` to `(x$1, x$2) => f(x$1, x$2)`. The synthetic
+    /// parameters must stay in source order: the reversed list made
+    /// `two(_, _)(1, 2)` evaluate `two(2, 1)`.
+    #[test]
+    fn placeholder_section_params_keep_source_order() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def two(a: Int, b: Int): Int = a * 10 + b
+  val f: (Int, Int) => Int = two(_, _)
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        let first = dump.find("x$1").expect("x$1 in dump");
+        let second = dump.find("x$2").expect("x$2 in dump");
+        assert!(
+            first < second,
+            "placeholder params must be declared in source order, got {dump}"
+        );
+    }
 }

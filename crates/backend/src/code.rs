@@ -194,6 +194,15 @@ impl Assembler {
                 self.vstack = st;
                 self.stack = self.vstack.iter().map(|t| t.slots()).sum();
                 self.dead = false;
+            } else {
+                // No jump ever targeted this label, yet code follows it (the
+                // `applyOrElse` default branch after an irrefutable last case).
+                // The split verifier still checks that block from the frame we
+                // write here, so restart tracking with an empty stack instead
+                // of keeping the previous block's state.
+                self.vstack.clear();
+                self.stack = 0;
+                self.dead = false;
             }
             if let Some(loc) = self.label_locals[l.0].clone() {
                 self.vlocals = loc;
@@ -267,6 +276,13 @@ impl Assembler {
     }
 
     fn jump(&mut self, op: u8, l: Label, stack_delta: i32) {
+        if op == 0xa7 && self.dead {
+            // `if (c) throw e else v`: the branch's trailing `goto end` sits
+            // after the `athrow`, so it can never run. Emitting it anyway made
+            // `end` inherit the dead branch's empty stack and the verifier then
+            // rejected the live branch's value.
+            return;
+        }
         let n_pop = (-stack_delta).max(0) as usize;
         self.pop_n_v(n_pop);
         self.emit_op(op);
@@ -282,8 +298,12 @@ impl Assembler {
             }
         }
         if op == 0xa7 {
-            self.dead = true;
-            self.need_frame = true;
+            // Everything up to the next reachable label is dead. Drop the
+            // operand stack the way a return does: an irrefutable last case in
+            // a `PartialFunction` leaves the `applyOrElse` default branch
+            // unreachable, and a frame that still claimed the case body's
+            // value made the verifier reject the fall-through `areturn`.
+            self.kill();
         }
         let _ = stack_delta;
     }
