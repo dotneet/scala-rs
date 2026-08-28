@@ -3257,7 +3257,18 @@ impl Typer {
                 if !finalizer.is_empty() {
                     self.type_expr(finalizer, &Type::Unit);
                 }
-                tree.ty = block.ty.clone();
+                // nsc takes the lub of the body and the handlers. A body that
+                // always throws contributes `Nothing`, so `val n = try throw e
+                // catch h` has the handler's type, not `Nothing`.
+                tree.ty = if matches!(block.ty, Type::Nothing) {
+                    catches
+                        .iter()
+                        .map(|c| c.body.ty.clone())
+                        .reduce(|a, b| self.lub_ty(&a, &b))
+                        .unwrap_or_else(|| block.ty.clone())
+                } else {
+                    block.ty.clone()
+                };
             }
             TreeKind::InterpolatedString {
                 prefix,

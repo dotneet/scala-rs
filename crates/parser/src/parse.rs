@@ -74,6 +74,9 @@ struct Parser<'a> {
     /// Inside a typed pattern, `|` starts the next alternative, not an infix type.
     no_bar_infix_type: bool,
     placeholder_id: u32,
+    /// Counter behind the synthetic names `catch` of a non-block expression
+    /// introduces (nsc `freshTermName`).
+    catch_id: u32,
     opts: ParseOptions,
     /// nsc `Location.InBlock`: the next `parse_expr1` is a *block statement*,
     /// so a function literal there takes the rest of the block as its body
@@ -94,6 +97,7 @@ impl<'a> Parser<'a> {
             no_bar_infix_type: false,
             placeholder_params: Vec::new(),
             placeholder_id: 0,
+            catch_id: 0,
             opts: ParseOptions::default(),
             in_block: false,
         }
@@ -2429,6 +2433,115 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// At a `{` that opens a `catch` block: does it hold case clauses?
+    /// nsc reads `catch { case ... }` as clauses and `catch { }` as none;
+    /// any other braced expression is a `PartialFunction` value instead.
+    fn brace_starts_cases(&self) -> bool {
+        let mut i = self.pos + 1;
+        while i < self.tokens.len()
+            && matches!(self.tokens[i].kind, TokenKind::Newline | TokenKind::Semi)
+        {
+            i += 1;
+        }
+        matches!(
+            self.tokens.get(i).map(|t| &t.kind),
+            Some(TokenKind::Case) | Some(TokenKind::RBrace)
+        )
+    }
+
+    /// nsc `makeCatchFromExpr`: `try b catch h` where `h` is a
+    /// `PartialFunction[Throwable, U]` value rather than a block of clauses.
+    /// Becomes
+    /// `case catchArg$n: Throwable => { val catchExpr$n = h;
+    ///   if (catchExpr$n.isDefinedAt(catchArg$n)) catchExpr$n.apply(catchArg$n)
+    ///   else throw catchArg$n }`.
+    /// The handler is evaluated inside the clause, so it runs only when the
+    /// body actually threw, and at most once.
+    fn make_catch_from_expr(&mut self, handler: Tree) -> CaseDef {
+        let sp = handler.span;
+        self.catch_id += 1;
+        let arg = format!("catchArg${}", self.catch_id);
+        let fun = format!("catchExpr${}", self.catch_id);
+
+        let arg_id = self.alloc(sp, TreeKind::Ident { name: arg.clone() });
+        let throwable = self.alloc(
+            sp,
+            TreeKind::Ident {
+                name: "Throwable".into(),
+            },
+        );
+        let pat = self.alloc(
+            sp,
+            TreeKind::Typed {
+                expr: Box::new(arg_id),
+                tpt: Box::new(throwable),
+            },
+        );
+
+        let empty_tpt = self.empty(sp);
+        let val_def = self.alloc(
+            sp,
+            TreeKind::ValDef {
+                mods: Modifiers::new(Flags::SYNTHETIC),
+                name: fun.clone(),
+                tpt: Box::new(empty_tpt),
+                rhs: Box::new(handler),
+            },
+        );
+
+        let cond = self.synth_call(sp, &fun, "isDefinedAt", &arg);
+        let thenp = self.synth_call(sp, &fun, "apply", &arg);
+        let rethrow_arg = self.alloc(sp, TreeKind::Ident { name: arg.clone() });
+        let elsep = self.alloc(
+            sp,
+            TreeKind::Throw {
+                expr: Box::new(rethrow_arg),
+            },
+        );
+        let if_ = self.alloc(
+            sp,
+            TreeKind::If {
+                cond: Box::new(cond),
+                thenp: Box::new(thenp),
+                elsep: Box::new(elsep),
+            },
+        );
+        let body = self.alloc(
+            sp,
+            TreeKind::Block {
+                stats: vec![val_def],
+                expr: Box::new(if_),
+            },
+        );
+        let guard = self.empty(sp);
+        CaseDef {
+            span: sp,
+            pat,
+            guard,
+            body,
+        }
+    }
+
+    /// `<recv>.<name>(<arg>)` over two locals, for `make_catch_from_expr`.
+    fn synth_call(&mut self, sp: Span, recv: &str, name: &str, arg: &str) -> Tree {
+        let recv = self.alloc(sp, TreeKind::Ident { name: recv.into() });
+        let sel = self.alloc(
+            sp,
+            TreeKind::Select {
+                qual: Box::new(recv),
+                name: name.into(),
+            },
+        );
+        let arg = self.alloc(sp, TreeKind::Ident { name: arg.into() });
+        self.alloc(
+            sp,
+            TreeKind::Apply {
+                fun: Box::new(sel),
+                args: vec![arg],
+            },
+        )
+    }
+
     fn parse_try(&mut self) -> Tree {
         let lo = self.span();
         self.bump();
@@ -2438,17 +2551,16 @@ impl<'a> Parser<'a> {
         if matches!(self.kind(), TokenKind::Catch) {
             self.bump();
             self.skip_nl();
-            // catch { cases } or catch expr (partial fn)
-            if matches!(self.kind(), TokenKind::LBrace) {
+            // nsc `tryExpr`: `catch { case ... }` is a list of case clauses;
+            // anything else after `catch` — including a braced expression that
+            // does not start with `case` — is a `PartialFunction` value.
+            if matches!(self.kind(), TokenKind::LBrace) && self.brace_starts_cases() {
                 self.bump();
                 catches = self.parse_cases();
                 self.expect("}", |k| matches!(k, TokenKind::RBrace));
             } else {
-                let _ = self.parse_expr();
-                self.error_span(
-                    lo,
-                    "unimplemented syntax: `catch` of a non-block expression",
-                );
+                let handler = self.parse_expr();
+                catches = vec![self.make_catch_from_expr(handler)];
             }
         }
         self.skip_nl();
