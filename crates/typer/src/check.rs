@@ -2848,12 +2848,12 @@ impl Typer {
         let span = tree.span;
         match &mut expr.kind {
             TreeKind::Select { qual, name } if name == "_" => {
-                let owner = self.import_prefix(qual, span);
-                self.import_wildcard(owner, &[], span);
+                let owners = self.import_prefix(qual, span);
+                self.import_wildcard(&owners, &[], span);
             }
             TreeKind::Select { qual, name } if name.starts_with('{') => {
                 let sels = decode_import_selectors(name);
-                let owner = self.import_prefix(qual, span);
+                let owners = self.import_prefix(qual, span);
                 let hidden: Vec<String> = sels
                     .iter()
                     .filter(|(from, to)| from != "_" && to == "_")
@@ -2863,16 +2863,16 @@ impl Typer {
                     if from == "_" || to == "_" {
                         continue;
                     }
-                    self.import_named(owner, from, to, span);
+                    self.import_named(&owners, from, to, span);
                 }
                 if sels.iter().any(|(from, _)| from == "_") {
-                    self.import_wildcard(owner, &hidden, span);
+                    self.import_wildcard(&owners, &hidden, span);
                 }
             }
             TreeKind::Select { qual, name } => {
                 let n = name.clone();
-                let owner = self.import_prefix(qual, span);
-                self.import_named(owner, &n, &n, span);
+                let owners = self.import_prefix(qual, span);
+                self.import_named(&owners, &n, &n, span);
             }
             TreeKind::Ident { name } => {
                 let n = name.clone();
@@ -2891,58 +2891,72 @@ impl Typer {
     /// path segment at a time, so a jar-only package such as `cats.syntax`
     /// never has to be typed as an expression (it has no type). Only a real
     /// term prefix (`import someVal.field._`) falls back to the typer.
-    fn import_prefix(&mut self, qual: &mut Tree, span: Span) -> SymbolId {
-        if let Some(id) = self.import_path_sym(qual, span) {
-            qual.sym = id;
-            return self.as_type_owner(id);
+    fn import_prefix(&mut self, qual: &mut Tree, span: Span) -> Vec<SymbolId> {
+        let syms = self.import_path_syms(qual, span);
+        if !syms.is_empty() {
+            qual.sym = syms[0];
+            return syms.into_iter().map(|s| self.as_type_owner(s)).collect();
         }
         self.type_expr(qual, &Type::NoType);
         if !qual.sym.is_none() {
             let id = qual.sym;
-            return match self.st.get(id).kind {
+            return vec![match self.st.get(id).kind {
                 SymKind::Module | SymKind::ModuleClass => self.st.module_class_of(id),
                 _ => id,
-            };
+            }];
         }
-        self.st
-            .class_sym_of(&qual.ty)
-            .map(|c| self.st.module_class_of(c))
-            .unwrap_or(SymbolId::NONE)
+        match self.st.class_sym_of(&qual.ty) {
+            Some(c) => vec![self.st.module_class_of(c)],
+            None => Vec::new(),
+        }
     }
 
-    /// Resolve `a.b.c` to a package / object / class symbol without typing it.
-    fn import_path_sym(&mut self, t: &Tree, span: Span) -> Option<SymbolId> {
+    /// Resolve `a.b.c` to package / object / class symbols without typing it.
+    ///
+    /// More than one can answer to the same name: a `case class C` whose
+    /// `object C` is named later in the file gets a synthetic companion of its
+    /// own, so `import C.member` has to look in both.
+    fn import_path_syms(&mut self, t: &Tree, span: Span) -> Vec<SymbolId> {
         match &t.kind {
-            TreeKind::Ident { name } if name == "_root_" => Some(self.st.root),
+            TreeKind::Ident { name } if name == "_root_" => vec![self.st.root],
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, span);
                 let mut found = self.st.lookup(name);
                 if found.is_empty() {
                     found = self.st.lookup_member(self.st.root, name);
                 }
-                self.best_import_prefix(found)
+                self.rank_import_prefixes(found)
             }
             TreeKind::Select { qual, name } => {
-                let owner = self.import_path_sym(qual, span)?;
-                let owner = self.as_type_owner(owner);
-                self.complete_binary_member(owner, name, span);
-                let found = self.st.lookup_member(owner, name);
-                if let Some(id) = self.best_import_prefix(found) {
-                    return Some(id);
+                for owner in self.import_path_syms(qual, span) {
+                    let owner = self.as_type_owner(owner);
+                    self.complete_binary_member(owner, name, span);
+                    let found = self.st.lookup_member(owner, name);
+                    let ranked = self.rank_import_prefixes(found);
+                    if !ranked.is_empty() {
+                        return ranked;
+                    }
+                    let Some(po) = self.package_object_of(owner, span) else {
+                        continue;
+                    };
+                    self.complete_binary_member(po, name, span);
+                    let found = self.st.lookup_member(po, name);
+                    let ranked = self.rank_import_prefixes(found);
+                    if !ranked.is_empty() {
+                        return ranked;
+                    }
                 }
-                let po = self.package_object_of(owner, span)?;
-                self.complete_binary_member(po, name, span);
-                let found = self.st.lookup_member(po, name);
-                self.best_import_prefix(found)
+                Vec::new()
             }
-            _ => None,
+            _ => Vec::new(),
         }
     }
 
     /// An import prefix is a stable identifier, so an object always wins over
     /// a class of the same name (`import scala.util.control.Breaks._` names
-    /// the object, not the trait it also inherits from).
-    fn best_import_prefix(&self, found: Vec<SymbolId>) -> Option<SymbolId> {
+    /// the object, not the trait it also inherits from), and a written object
+    /// wins over the synthetic companion a `case class` was given.
+    fn rank_import_prefixes(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
         let rank = |k: SymKind| match k {
             SymKind::Package => Some(0),
             SymKind::Module => Some(1),
@@ -2950,11 +2964,23 @@ impl Typer {
             SymKind::Class => Some(3),
             _ => None,
         };
-        found
+        let mut out: Vec<(u8, u8, SymbolId)> = found
             .into_iter()
-            .filter_map(|s| rank(self.st.get(s).kind).map(|r| (r, s)))
-            .min_by_key(|&(r, s)| (r, s.0))
-            .map(|(_, s)| s)
+            .filter_map(|s| {
+                let sym = self.st.get(s);
+                let synthetic = u8::from(sym.flags.contains(Flags::SYNTHETIC));
+                rank(sym.kind).map(|r| (r, synthetic, s))
+            })
+            .collect();
+        out.sort_by_key(|&(r, syn, s)| (r, syn, s.0));
+        out.dedup_by_key(|&mut (_, _, s)| s);
+        // Only the best kind answers: a trait and its companion share a name,
+        // and `import C._` names the object alone.
+        let best = out.first().map(|&(r, _, _)| r);
+        out.into_iter()
+            .filter(|&(r, _, _)| Some(r) == best)
+            .map(|(_, _, s)| s)
+            .collect()
     }
 
     /// `package p { ... }`'s package object, compiled to `p/package$`. Its
@@ -2995,30 +3021,38 @@ impl Typer {
     }
 
     /// `import p.n` / `import p.{n => alias}`.
-    fn import_named(&mut self, owner: SymbolId, from: &str, to: &str, span: Span) {
-        if owner.is_none() {
-            return;
-        }
-        self.complete_binary_member(owner, from, span);
-        let mut found = self.st.lookup_member(owner, from);
-        if found.is_empty() {
-            if let Some(po) = self.package_object_of(owner, span) {
-                self.complete_binary_member(po, from, span);
-                found = self.st.lookup_member(po, from);
+    fn import_named(&mut self, owners: &[SymbolId], from: &str, to: &str, span: Span) {
+        let mut entered = false;
+        for &owner in owners {
+            if owner.is_none() {
+                continue;
+            }
+            self.complete_binary_member(owner, from, span);
+            let mut found = self.st.lookup_member(owner, from);
+            if found.is_empty() {
+                if let Some(po) = self.package_object_of(owner, span) {
+                    self.complete_binary_member(po, from, span);
+                    found = self.st.lookup_member(po, from);
+                }
+            }
+            for m in found {
+                self.st.enter_in_current(to, m);
+                entered = true;
             }
         }
-        if found.is_empty() {
-            // nsc: `import p.Nope` is an error at the selector, not only at
-            // the later use of the name.
-            self.error(
-                span,
-                format!("value {from} is not a member of {}", self.owner_desc(owner)),
-            );
+        if entered {
             return;
         }
-        for m in found {
-            self.st.enter_in_current(to, m);
-        }
+        let Some(&owner) = owners.iter().find(|o| !o.is_none()) else {
+            // The prefix itself did not resolve; it reported its own error.
+            return;
+        };
+        // nsc: `import p.Nope` is an error at the selector, not only at the
+        // later use of the name.
+        self.error(
+            span,
+            format!("value {from} is not a member of {}", self.owner_desc(owner)),
+        );
     }
 
     /// `package p` / `object O` / `class C`, for a diagnostic.
@@ -3041,15 +3075,20 @@ impl Typer {
     /// `import p._` / `import p.*`. Members already known are entered eagerly;
     /// the owner is also recorded so that a name only reachable by reading a
     /// classfile is still found later (see `expose_unqualified`).
-    fn import_wildcard(&mut self, owner: SymbolId, hidden: &[String], span: Span) {
-        if owner.is_none() {
-            return;
+    fn import_wildcard(&mut self, owners: &[SymbolId], hidden: &[String], span: Span) {
+        let mut all: Vec<SymbolId> = Vec::new();
+        for &owner in owners {
+            if owner.is_none() || all.contains(&owner) {
+                continue;
+            }
+            all.push(owner);
+            if let Some(po) = self.package_object_of(owner, span) {
+                if !all.contains(&po) {
+                    all.push(po);
+                }
+            }
         }
-        let mut owners = vec![owner];
-        if let Some(po) = self.package_object_of(owner, span) {
-            owners.push(po);
-        }
-        for o in owners {
+        for o in all {
             for m in self.st.get(o).members.clone() {
                 let n = self.st.get(m).name.clone();
                 if n.ends_with('$') || n == "<init>" || hidden.iter().any(|h| h == &n) {

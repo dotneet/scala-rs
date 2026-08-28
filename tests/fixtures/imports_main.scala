@@ -4,6 +4,7 @@ import p1.p2.*
 import p1.p2.p3.{D => DD, C3 => Third}
 import p1.p2.po.*
 import p1.p2.po.Inner.h
+import p1.p2.QP.op as qpOp
 
 object Main {
   def main(args: Array[String]): Unit = {
@@ -16,6 +17,7 @@ object Main {
     println(new Third().g)
     println(pof)
     println(h)
+    println(qpOp("abcd"))
   }
   class Helper extends T1 { def t: Int = 3 }
 }
