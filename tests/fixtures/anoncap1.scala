@@ -22,9 +22,16 @@ object Main {
     override def label: String = super.label + "/" + n
   }
 
+  // A capture read from the anonymous class' own constructor body.
+  def eager(n: Int): Adder = new Adder {
+    val doubled: Int = n * 2
+    def add(k: Int): Int = k + doubled
+  }
+
   def main(args: Array[String]): Unit = {
     mk(7).run()
     println(multi(3, "abc").add(1))
     println(withBase(9).label)
+    println(eager(6).add(1))
   }
 }

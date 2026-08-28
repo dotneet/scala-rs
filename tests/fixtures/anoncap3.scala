@@ -34,9 +34,34 @@ object Main {
     label + "=" + acc
   }
 
+  // The same instance keeps writing the captured `var` across loop turns.
+  def counterLoop(times: Int): Int = {
+    var total = 0
+    var i = 0
+    val r = new Runner {
+      def run(): Unit = { total = total + i }
+    }
+    while (i < times) {
+      r.run()
+      i = i + 1
+    }
+    total
+  }
+
+  // A by-name parameter captured by an anonymous class.
+  def byName(t: => Int): Int = {
+    val r = new Runner {
+      def run(): Unit = println("byName " + t)
+    }
+    r.run()
+    t
+  }
+
   def main(args: Array[String]): Unit = {
     println(counter())
     println(localClass(3))
     println(captureBoth(5))
+    println(counterLoop(4))
+    println(byName(6))
   }
 }
