@@ -109,6 +109,66 @@ fn same_as_scalac(name: &str) {
     let _ = fs::remove_dir_all(&ours);
 }
 
+fn conform_multi_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/conform_multi")
+}
+
+/// The same, for a whole directory of files compiled in one run.
+fn same_as_scalac_multi(name: &str) {
+    if !java_available() {
+        return;
+    }
+    let (Some(scalac), Some(jar)) = (scalac(), scala_library_jar()) else {
+        eprintln!("skip conform_multi {name}: scalac or scala-library not available");
+        return;
+    };
+    let dir = conform_multi_dir().join(name);
+    let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "scala"))
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "no sources in {}", dir.display());
+    let args: Vec<String> = files
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+
+    let ref_out = tmp_dir(&format!("{name}-scalac"));
+    let status = Command::new(&scalac)
+        .arg("-d")
+        .arg(&ref_out)
+        .args(&args)
+        .status()
+        .expect("run scalac");
+    assert!(status.success(), "scalac failed on {name}");
+    let expected = run_main(&format!("{}:{}", ref_out.display(), jar.display()))
+        .unwrap_or_else(|e| panic!("scalac-built {name} failed to run: {e}"));
+
+    let ours = tmp_dir(name);
+    let status = Command::new(bin())
+        .arg("compile")
+        .args(&args)
+        .arg("-d")
+        .arg(&ours)
+        .arg("--scala-library")
+        .arg(&jar)
+        .status()
+        .expect("run scala-rs");
+    assert!(status.success(), "scala-rs failed on {name}");
+    let actual = run_main(&format!("{}:{}", ours.display(), jar.display()))
+        .unwrap_or_else(|e| panic!("our {name} failed to run: {e}"));
+    assert_eq!(actual, expected, "stdout differs from scalac for {name}");
+    let _ = fs::remove_dir_all(&ref_out);
+    let _ = fs::remove_dir_all(&ours);
+}
+
+#[test]
+fn multi_file_app() {
+    same_as_scalac_multi("app");
+}
+
 macro_rules! conform {
     ($($name:ident),* $(,)?) => {
         $(

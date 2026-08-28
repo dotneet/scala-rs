@@ -237,6 +237,12 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         emit_runtime()
     };
     let st = shared_st.as_ref().expect("the run is typed");
+    // A class can mix in a trait defined in another file, so the concrete
+    // trait members of the whole run have to be known before emitting any.
+    let mut trait_members = scala_rs_backend::gen::TraitImpls::default();
+    for u in &units {
+        scala_rs_backend::gen::collect_trait_members(&u.tree, st, &mut trait_members);
+    }
     for u in &units {
         let src_name = source_file_name(&sources[u.file_index]);
         emitted.extend(emit_opts(
@@ -246,6 +252,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
             EmitOpts {
                 library_abi,
                 pickles: u.pickles.clone(),
+                trait_members: Some(trait_members.clone()),
             },
         ));
     }

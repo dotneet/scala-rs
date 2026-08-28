@@ -22,11 +22,41 @@ pub struct EmitOpts {
     pub library_abi: bool,
     /// Pre-erasure ScalaSignature pickles, keyed by class symbol id.
     pub pickles: HashMap<u32, Vec<u8>>,
+    /// Concrete trait members from every unit in the run; `None` means this
+    /// unit only.
+    pub trait_members: Option<TraitImpls>,
 }
 
 /// Walk a typed compilation unit and emit classes (private-runtime ABI).
 pub fn emit(tree: &Tree, st: &SymbolTable, source_name: &str) -> Vec<EmittedClass> {
     emit_opts(tree, st, source_name, EmitOpts::default())
+}
+
+/// Concrete trait members of a whole run, so a class can mix in a trait
+/// defined in another file.
+#[derive(Default, Clone, Debug)]
+pub struct TraitImpls {
+    impls: HashMap<SymbolId, Vec<Tree>>,
+    vals: HashMap<SymbolId, Vec<Tree>>,
+}
+
+/// Collect the concrete trait members of one unit into a shared map.
+pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpls) {
+    let mut g = Gen {
+        st,
+        source_name: "",
+        out: Vec::new(),
+        extras: RefCell::new(Vec::new()),
+        lambda_n: Cell::new(0),
+        trait_impls: HashMap::new(),
+        trait_vals: HashMap::new(),
+        library_abi: false,
+        pickles: HashMap::new(),
+        boxed_vars: HashSet::new(),
+    };
+    g.collect_trait_impls(tree);
+    into.impls.extend(g.trait_impls);
+    into.vals.extend(g.trait_vals);
 }
 
 /// Walk a typed compilation unit and emit classes.
@@ -36,14 +66,15 @@ pub fn emit_opts(
     source_name: &str,
     opts: EmitOpts,
 ) -> Vec<EmittedClass> {
+    let shared = opts.trait_members.clone().unwrap_or_default();
     let mut g = Gen {
         st,
         source_name,
         out: Vec::new(),
         extras: RefCell::new(Vec::new()),
         lambda_n: Cell::new(0),
-        trait_impls: HashMap::new(),
-        trait_vals: HashMap::new(),
+        trait_impls: shared.impls,
+        trait_vals: shared.vals,
         library_abi: opts.library_abi,
         pickles: opts.pickles,
         // `scala.runtime.*Ref` exists in both ABIs: on the jar, and as a

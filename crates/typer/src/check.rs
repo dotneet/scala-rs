@@ -2913,6 +2913,43 @@ impl Typer {
                 if owner.is_none() {
                     return;
                 }
+                // `import a.b.{C, D => E}`: the parser encodes the selectors in
+                // the name. The namer resolves what it can from scope; a name
+                // defined in another unit only resolves here.
+                if let Some(inner) = n.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                    let mut wildcard = false;
+                    let sels: Vec<(String, String)> = inner
+                        .split(',')
+                        .filter_map(|sel| {
+                            let sel = sel.trim();
+                            if sel == "_" {
+                                wildcard = true;
+                                return None;
+                            }
+                            let mut it = sel.split("=>");
+                            let from = it.next().unwrap_or(sel).trim().to_string();
+                            let to = it.next().unwrap_or(&from).trim().to_string();
+                            (to != "_").then_some((from, to))
+                        })
+                        .collect();
+                    for (from, to) in &sels {
+                        self.complete_binary_member(owner, from, tree.span);
+                        for m in self.st.lookup_member(owner, from) {
+                            self.st.enter_in_current(to, m);
+                        }
+                    }
+                    if wildcard {
+                        let named: Vec<String> = sels.iter().map(|(f, _)| f.clone()).collect();
+                        for m in self.st.get(owner).members.clone() {
+                            let mn = self.st.get(m).name.clone();
+                            if mn.ends_with('$') || mn == "<init>" || named.contains(&mn) {
+                                continue;
+                            }
+                            self.st.enter_in_current(&mn, m);
+                        }
+                    }
+                    return;
+                }
                 self.complete_binary_member(owner, &n, tree.span);
                 for m in self.st.lookup_member(owner, &n) {
                     self.st.enter_in_current(&n, m);
@@ -3517,6 +3554,25 @@ impl Typer {
             {
                 self.st.get_mut(s).ty = pt.clone();
                 ty = pt.clone();
+            }
+            // An inherited member is seen through this class: `find` declared
+            // on `Repo[A]` is `(User => Boolean) => Option[User]` inside
+            // `class UserStore extends Repo[User]`.
+            if !self.st.this_class.is_none() {
+                let owner = self.st.get(s).owner;
+                if owner != self.st.this_class && !owner.is_none() {
+                    let this_ty = Type::Class {
+                        sym: self.st.this_class,
+                        args: self
+                            .st
+                            .get(self.st.this_class)
+                            .tparams
+                            .iter()
+                            .map(|t| Type::TypeParam(*t))
+                            .collect(),
+                    };
+                    ty = self.st.subst_as_seen_from(&this_ty, &ty);
+                }
             }
             ty = self.maybe_auto_apply(ty, pt);
             if !self.st.this_class.is_none() {
