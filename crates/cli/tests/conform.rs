@@ -201,5 +201,6 @@ conform!(
     variance,
     companion_private,
     numeric_ops,
-    extractor_bind
+    extractor_bind,
+    package_object
 );

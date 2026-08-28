@@ -7280,6 +7280,11 @@ impl Typer {
                     })
                     .cloned()
                     .collect();
+                // The same method can reach us by two routes -- a package and
+                // its package object both carry `math.max`. Identical
+                // signatures are one alternative, not an ambiguity.
+                let mut winners = winners;
+                winners.dedup_by(|a, b| a.1 == b.1 && a.2 == b.2);
                 match winners.len() {
                     1 => {
                         let (s, p, r) = winners.into_iter().next().unwrap();
@@ -9261,6 +9266,12 @@ impl Typer {
             let prefix = format!("{internal}/");
             if self.binary.has_package_prefix(&prefix) {
                 let _ = crate::classpath::ensure_package(&mut self.st, &internal);
+                return;
+            }
+            // `math.Pi` is a member of the package object `scala/math/package$`,
+            // which the package itself only gains once that class is read.
+            if self.st.lookup_member(owner, name).is_empty() {
+                let _ = self.package_object_of(owner, span);
             }
         }
     }

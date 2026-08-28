@@ -4493,6 +4493,20 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
             }
             invoke_method(asm, ctx, id, Some(&tree.ty));
         }
+        SymKind::Package => {
+            // `math.Pi` reads the package object; the package itself has no
+            // runtime representation.
+            match package_object_module(ctx.st, id) {
+                Some(mcls) => {
+                    let jvm = class_internal(ctx.st, mcls);
+                    asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+                }
+                None => {
+                    throw_runtime(asm, &format!("cannot load {}", sym.name));
+                    push_default(asm, &tree.ty);
+                }
+            }
+        }
         _ => {
             throw_runtime(asm, &format!("cannot load {}", sym.name));
             push_default(asm, &tree.ty);
@@ -13353,4 +13367,22 @@ fn emit_class_constant(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
 /// Whether the typer widened this member's access for companion use.
 fn widened(st: &SymbolTable, sym: SymbolId) -> bool {
     !sym.is_none() && st.get(sym).access_widened
+}
+
+/// The module class of a package's package object, if it has one.
+fn package_object_module(st: &SymbolTable, pkg: SymbolId) -> Option<SymbolId> {
+    let m = st
+        .get(pkg)
+        .members
+        .iter()
+        .copied()
+        .find(|&m| st.get(m).name == "package" && is_module_like(st, m))?;
+    Some(module_class_id(st, m))
+}
+
+fn is_module_like(st: &SymbolTable, id: SymbolId) -> bool {
+    matches!(
+        st.get(id).kind,
+        scala_rs_typer::SymKind::Module | scala_rs_typer::SymKind::ModuleClass
+    )
 }
