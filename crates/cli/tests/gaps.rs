@@ -307,7 +307,7 @@ fn gap_copy_matches_real_scalac() {
 
 #[test]
 fn gap_copy_bad_is_error() {
-    compile_fails("gap_copy_bad", "no parameter named `z`");
+    compile_fails("gap_copy_bad", "unknown parameter name: z");
 }
 
 // ---------------------------------------------------------------------- 4.
