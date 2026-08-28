@@ -127,5 +127,6 @@ conform!(
     generics,
     strings,
     options,
-    classes
+    classes,
+    interp
 );

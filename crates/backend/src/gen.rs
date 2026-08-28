@@ -4257,7 +4257,14 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
             } else {
                 let owner = class_internal(ctx.st, owner);
                 let desc = jvm_desc(ctx.st, &sym.ty);
-                asm.getfield(&owner, &sym.name, &desc);
+                // A library constructor field is private; `jvm_name` holds the
+                // accessor to call instead (`StringContext.parts`).
+                if sym.jvm_name.is_empty() {
+                    asm.getfield(&owner, &sym.name, &desc);
+                } else {
+                    let acc = sym.jvm_name.clone();
+                    asm.invokevirtual(&owner, &acc, &format!("(){desc}"));
+                }
             }
         }
         SymKind::Module | SymKind::ModuleClass => {
@@ -4444,7 +4451,13 @@ fn gen_select(
                     asm.invokeinterface(&owner, &s.name, &desc);
                 } else {
                     let owner = class_internal(ctx.st, s.owner);
-                    asm.getfield(&owner, &s.name, &jvm_desc(ctx.st, &s.ty));
+                    let desc = jvm_desc(ctx.st, &s.ty);
+                    if s.jvm_name.is_empty() {
+                        asm.getfield(&owner, &s.name, &desc);
+                    } else {
+                        let acc = s.jvm_name.clone();
+                        asm.invokevirtual(&owner, &acc, &format!("(){desc}"));
+                    }
                     maybe_cast_erased_load(asm, ctx, &s.ty, &tree.ty);
                 }
                 return;

@@ -527,7 +527,10 @@ impl<'a> Lexer<'a> {
             self.bump(); // "
         }
         if let Some(prefix) = interp_prefix {
-            let raw = prefix == "raw";
+            // Only `s` and `f` process escapes; every other interpolator —
+            // `raw` and any user-defined one — gets the parts verbatim, which
+            // is what `StringContext.parts` holds in scalac.
+            let raw = !matches!(prefix.as_str(), "s" | "f");
             self.emit(
                 TokenKind::InterpStart { prefix, triple },
                 lo,
