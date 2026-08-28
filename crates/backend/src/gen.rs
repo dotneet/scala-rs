@@ -662,6 +662,36 @@ fn method_ret_from_sym(st: &SymbolTable, id: SymbolId) -> Type {
     }
 }
 
+/// How an erasure bridge has to convert a value of type `from` to type `to`.
+enum Adapt {
+    None,
+    Cast(String),
+    Box(Type),
+    Unbox(Type),
+}
+
+fn param_adapt(st: &SymbolTable, from: &Type, to: &Type) -> Adapt {
+    if is_jvm_primitive(to) && !is_jvm_primitive(from) {
+        Adapt::Unbox(to.clone())
+    } else if is_jvm_primitive(from) && !is_jvm_primitive(to) {
+        Adapt::Box(from.clone())
+    } else {
+        match checkcast_internal(st, to) {
+            Some(cn) => Adapt::Cast(cn),
+            None => Adapt::None,
+        }
+    }
+}
+
+fn emit_adapt(asm: &mut Assembler, adapt: &Adapt) {
+    match adapt {
+        Adapt::None => {}
+        Adapt::Cast(cn) => asm.checkcast(cn),
+        Adapt::Box(ty) => emit_box(asm, ty),
+        Adapt::Unbox(ty) => emit_unbox(asm, ty),
+    }
+}
+
 fn checkcast_internal(st: &SymbolTable, ty: &Type) -> Option<String> {
     match ty {
         Type::Class { sym, .. } | Type::ModuleRef(sym) => Some(class_internal(st, *sym)),
@@ -2910,18 +2940,26 @@ impl<'a> Gen<'a> {
                     continue;
                 }
                 let ret = method_ret_from_sym(self.st, pmid);
+                let child_ret = method_ret_from_sym(self.st, *cid);
+                // The bridge takes the erased parent signature, so a parameter
+                // the subclass narrowed to a primitive arrives boxed.
+                let ret_adapt = if jvm_desc(self.st, &ret) == jvm_desc(self.st, &child_ret) {
+                    Adapt::None
+                } else {
+                    param_adapt(self.st, &child_ret, &ret)
+                };
                 let mut locals = 1u16;
                 let mut loads = Vec::new();
                 let mut casts = Vec::new();
                 for (pty, cty) in parent_params.iter().zip(child_params.iter()) {
                     let sort = jvm_sort(pty);
                     loads.push((locals, sort));
-                    let cast = if jvm_desc(self.st, pty) != jvm_desc(self.st, cty) {
-                        checkcast_internal(self.st, cty)
+                    let adapt = if jvm_desc(self.st, pty) != jvm_desc(self.st, cty) {
+                        param_adapt(self.st, pty, cty)
                     } else {
-                        None
+                        Adapt::None
                     };
-                    casts.push(cast);
+                    casts.push(adapt);
                     locals += sort.slots();
                 }
                 let name = ps.name.clone();
@@ -2937,11 +2975,12 @@ impl<'a> Gen<'a> {
                         asm.aload(0);
                         for (i, (slot, sort)) in loads.iter().enumerate() {
                             load(asm, *slot, *sort);
-                            if let Some(cn) = casts.get(i).and_then(|c| c.as_deref()) {
-                                asm.checkcast(cn);
+                            if let Some(a) = casts.get(i) {
+                                emit_adapt(asm, a);
                             }
                         }
                         asm.invokevirtual(&class_c, &name, &cdesc_c);
+                        emit_adapt(asm, &ret_adapt);
                         emit_return(asm, &ret);
                     },
                 );
