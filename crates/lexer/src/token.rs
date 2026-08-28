@@ -4,6 +4,9 @@ use scala_rs_span::Span;
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
+    /// A line break preceded this token but did not separate statements.
+    /// SIP-27's trailing comma needs it (`f(a, b,\n)` is legal, `f(a, b,)` is not).
+    pub nl_before: bool,
 }
 
 impl Token {

@@ -22,11 +22,47 @@ pub fn tokenize(source: &SourceFile, file_index: usize) -> (Vec<Token>, Vec<Diag
 /// written as `xs\n  .map(f)` is read as two statements.
 fn drop_non_separating_newlines(tokens: Vec<Token>) -> Vec<Token> {
     let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut regions: Vec<char> = Vec::new();
     let mut i = 0usize;
     while i < tokens.len() {
+        match tokens[i].kind {
+            TokenKind::LParen => regions.push('('),
+            TokenKind::LBracket => regions.push('['),
+            TokenKind::LBrace => regions.push('{'),
+            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                regions.pop();
+            }
+            _ => {}
+        }
         if !matches!(tokens[i].kind, TokenKind::Newline) {
             out.push(tokens[i].clone());
             i += 1;
+            continue;
+        }
+        // nsc only inserts newlines in brace regions; inside `(` or `[` a line
+        // break never separates. Record it so SIP-27's trailing comma (which
+        // requires the newline) can still be told apart.
+        if matches!(regions.last(), Some('(') | Some('[')) {
+            let mut j = i;
+            while j < tokens.len() && matches!(tokens[j].kind, TokenKind::Newline) {
+                j += 1;
+            }
+            if let Some(t) = tokens.get(j) {
+                let mut t = t.clone();
+                t.nl_before = true;
+                // Push the following token here and skip it in the main loop.
+                match t.kind {
+                    TokenKind::LParen => regions.push('('),
+                    TokenKind::LBracket => regions.push('['),
+                    TokenKind::LBrace => regions.push('{'),
+                    TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                        regions.pop();
+                    }
+                    _ => {}
+                }
+                out.push(t);
+            }
+            i = j + 1;
             continue;
         }
         let mut j = i;
@@ -183,6 +219,7 @@ impl<'a> Lexer<'a> {
         self.tokens.push(Token {
             kind,
             span: Span::new(lo, hi),
+            nl_before: false,
         });
     }
 

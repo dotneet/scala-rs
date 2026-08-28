@@ -399,6 +399,15 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// True when a line break preceded the current token (dropped by the
+    /// lexer inside a paren region).
+    fn at_nl_before(&self) -> bool {
+        self.tokens
+            .get(self.pos)
+            .map(|t| t.nl_before)
+            .unwrap_or(false)
+    }
+
     fn accept_separator(&mut self) -> bool {
         if matches!(self.kind(), TokenKind::Semi | TokenKind::Newline) {
             while matches!(self.kind(), TokenKind::Semi | TokenKind::Newline) {
@@ -981,6 +990,9 @@ impl<'a> Parser<'a> {
                 if matches!(self.kind(), TokenKind::Comma) {
                     self.bump();
                     self.skip_nl();
+                    if matches!(self.kind(), TokenKind::RParen) && self.at_nl_before() {
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -3006,6 +3018,11 @@ impl<'a> Parser<'a> {
                 if matches!(self.kind(), TokenKind::Comma) {
                     self.bump();
                     self.skip_nl();
+                    // SIP-27: a trailing comma is allowed only when a line
+                    // break follows it.
+                    if matches!(self.kind(), TokenKind::RParen) && self.at_nl_before() {
+                        break;
+                    }
                 } else {
                     break;
                 }
