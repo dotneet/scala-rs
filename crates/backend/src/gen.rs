@@ -4438,6 +4438,22 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
     match sym.kind {
         SymKind::Term => {
             let owner = sym.owner;
+            // A template's self alias (`trait T { self: P => … }`) denotes the
+            // template's own `this`. Read from a class nested inside `T` that
+            // is the *outer* instance, not this one, so it has to be reached
+            // through `$outer` like any other enclosing-instance reference.
+            if ctx.st.get(owner).self_alias == Some(id) {
+                load_owner_instance(asm, ctx, owner);
+                if let Some(cls) = ctx.st.class_sym_of(&sym.ty) {
+                    if !is_owner_compatible(ctx.st, owner, cls)
+                        && (matches!(ctx.st.get(cls).kind, SymKind::Class | SymKind::ModuleClass)
+                            || is_interface_sym(ctx.st, cls))
+                    {
+                        asm.checkcast(&class_internal(ctx.st, cls));
+                    }
+                }
+                return;
+            }
             if sym.flags.contains(Flags::SYNTHETIC) && !sym.flags.contains(Flags::PARAM) {
                 load_this(asm, ctx);
                 if let Some(cls) = ctx.st.class_sym_of(&sym.ty) {

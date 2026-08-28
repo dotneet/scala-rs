@@ -117,3 +117,113 @@ fn enclosing_package_names_are_visible() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
     let _ = fs::remove_dir_all(&out);
 }
+
+/// slick's cake pattern: an inner class declared in a component trait, mixed
+/// into a profile through a self-type, and used from a leaf profile in a file
+/// that comes *earlier* on the command line. Compiling in either file order
+/// must give the same answer.
+#[test]
+fn cake_inner_classes_resolve_across_files() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library not present");
+        return;
+    };
+    if Command::new("java").arg("-version").output().is_err() {
+        return;
+    }
+    let dir = multi_dir();
+    let leaf = dir.join("cake_profile.scala");
+    let mid = dir.join("cake_relational.scala");
+    let base = dir.join("cake_component.scala");
+    let orders: [[&PathBuf; 3]; 2] = [[&leaf, &mid, &base], [&base, &mid, &leaf]];
+    for (i, order) in orders.iter().enumerate() {
+        let out = tmp_dir(&format!("cake{i}"));
+        let output = Command::new(bin())
+            .args([
+                "compile",
+                order[0].to_str().unwrap(),
+                order[1].to_str().unwrap(),
+                order[2].to_str().unwrap(),
+                "-d",
+                out.to_str().unwrap(),
+                "-Xsource:3",
+                "--scala-library",
+                jar.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run scala-rs");
+        assert!(
+            output.status.success(),
+            "cake compile failed (order {i}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let run = Command::new("java")
+            .args([
+                "-Xverify:all",
+                "-cp",
+                &format!("{}:{}", out.display(), jar.display()),
+                "cake.jdbc.Main",
+            ])
+            .output()
+            .expect("java");
+        assert!(
+            run.status.success(),
+            "run failed (order {i}): {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            "create table people\ncreate sequence ids\n100\ndb2:int\n",
+            "unexpected output (order {i})"
+        );
+        let _ = fs::remove_dir_all(&out);
+    }
+}
+
+/// The other half of the cake fix: a name that is *not* in the linearization
+/// stays an error, whichever file the parent chain lives in. `Present` is
+/// inherited, `Missing` exists nowhere, and `Detached` sits in a component
+/// the base never mixes in.
+#[test]
+fn cake_names_outside_the_linearization_are_errors() {
+    let dir = multi_dir();
+    let out = tmp_dir("cakebad");
+    let mut args = vec![
+        "compile".to_string(),
+        dir.join("cake_bad_leaf.scala")
+            .to_str()
+            .unwrap()
+            .to_string(),
+        dir.join("cake_bad_base.scala")
+            .to_str()
+            .unwrap()
+            .to_string(),
+        "-d".to_string(),
+        out.to_str().unwrap().to_string(),
+        "-Xsource:3".to_string(),
+    ];
+    if let Some(jar) = scala_library_jar() {
+        args.push("--scala-library".to_string());
+        args.push(jar.to_str().unwrap().to_string());
+    }
+    let output = Command::new(bin())
+        .args(&args)
+        .output()
+        .expect("run scala-rs");
+    assert!(!output.status.success(), "expected the bad cake to fail");
+    let err = String::from_utf8_lossy(&output.stderr).into_owned()
+        + &String::from_utf8_lossy(&output.stdout);
+    assert!(
+        err.contains("not found: type Missing"),
+        "missing diagnostic for `Missing`: {err}"
+    );
+    assert!(
+        err.contains("not found: type Detached"),
+        "missing diagnostic for `Detached`: {err}"
+    );
+    assert!(
+        !err.contains("not found: type Present"),
+        "`Present` is inherited and must resolve: {err}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}

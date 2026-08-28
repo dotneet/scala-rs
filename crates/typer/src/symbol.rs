@@ -192,6 +192,12 @@ pub struct Symbol {
     pub children: Vec<SymbolId>,
     /// Self type (`trait T { self: Foo => }`).
     pub self_type: Option<Type>,
+    /// The self *alias* a template introduces (`self` in `trait T { self: Foo => }`).
+    /// It is scoped to the template that writes it: unlike an ordinary member
+    /// it is not inherited, so every place that copies another template's
+    /// members into scope has to leave it out — otherwise two components of a
+    /// cake that both call their alias `self` collide into an overload.
+    pub self_alias: Option<SymbolId>,
     /// Access qualifier `private[C]` / `protected[C]` (`C` is a class or package name).
     /// `private[this]` is `PRIVATE|LOCAL` with this field empty.
     pub private_within: Option<String>,
@@ -244,7 +250,14 @@ impl WildcardImport {
 
 impl Scope {
     pub fn enter(&mut self, name: &str, id: SymbolId) {
-        self.map.entry(name.to_string()).or_default().push(id);
+        let slot = self.map.entry(name.to_string()).or_default();
+        // One symbol reachable by two routes is still one symbol, not an
+        // overload: a template's self alias, for instance, is entered both
+        // with the rest of the class's members and by `bind_self_type`.
+        if slot.contains(&id) {
+            return;
+        }
+        slot.push(id);
     }
 
     pub fn enter_wildcard(&mut self, owner: SymbolId, hidden: &[String]) {
@@ -324,6 +337,7 @@ impl SymbolTable {
                 tparams: vec![],
                 children: vec![],
                 self_type: None,
+                self_alias: None,
                 private_within: None,
                 access_widened: false,
                 annotations: vec![],
@@ -398,6 +412,7 @@ impl SymbolTable {
             tparams: vec![],
             children: vec![],
             self_type: None,
+            self_alias: None,
             private_within: None,
             access_widened: false,
             annotations: vec![],

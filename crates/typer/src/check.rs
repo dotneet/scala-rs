@@ -144,6 +144,11 @@ pub fn typecheck_opts(
     typecheck_units(&mut units, opts)
 }
 
+/// How many times the header pass may sweep the run. Each round can only
+/// turn rough (by-name) parents into resolved ones, so it converges; the cap
+/// just bounds the work for deeply nested templates.
+const MAX_HEADER_ROUNDS: usize = 3;
+
 /// Typecheck a whole run in one symbol table: every unit is named before any
 /// is typed, so a class can reference one defined in another file.
 pub fn typecheck_units(
@@ -158,6 +163,42 @@ pub fn typecheck_units(
         t.file_index = *file_index;
         t.namer(tree);
         t.register_sealed_from_namer(tree);
+    }
+    {
+        // Class headers before member types, across every unit: a class can
+        // inherit from one whose own superclass chain is declared in a file
+        // that comes later on the command line, and inherited names have to
+        // be visible while that class's members are typed.
+        let diag_mark = t.diags.len();
+        let saved_lang = (
+            t.language_dynamics,
+            t.language_postfix_ops,
+            t.language_implicit_conversions,
+        );
+        for _ in 0..MAX_HEADER_ROUNDS {
+            let mut changed = false;
+            for (tree, file_index) in units.iter_mut() {
+                t.file_index = *file_index;
+                changed |= t.parents_pass(tree, false);
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Once the parents are known, one more sweep types the constructor
+        // parameters, so `extends Parent(x)` in any file meets a complete
+        // primary constructor.
+        for (tree, file_index) in units.iter_mut() {
+            t.file_index = *file_index;
+            t.parents_pass(tree, true);
+        }
+        // The header pass exists only to resolve parents; it types imports
+        // and parent trees before signatures are known, so anything it
+        // complains about is reported for real by the passes below.
+        t.diags.truncate(diag_mark);
+        t.language_dynamics = saved_lang.0;
+        t.language_postfix_ops = saved_lang.1;
+        t.language_implicit_conversions = saved_lang.2;
     }
     {
         // Member types first, across every unit: typing a body may call a
@@ -1069,6 +1110,211 @@ impl Typer {
         }
     }
 
+    // ---------------------------------------------------------- header pass
+
+    /// Pin every template's parent list down to real symbols, before any
+    /// signature in the run is typed.
+    ///
+    /// The namer records parents by bare name (`rough_parents`), and
+    /// `class_sym_of` resolves such a name in whatever scope happens to be
+    /// current when it is asked. The signature pass walks the units in
+    /// command-line order, so a class whose superclass chain is defined in a
+    /// *later* file used to have its grandparents looked up in the wrong
+    /// scope: the chain broke there and every type inherited past that point
+    /// went missing (`not found: type Table` for slick's cake-pattern
+    /// profiles). Resolving the parents of every unit first, each in the
+    /// scope of its own definition, makes `enter_inherited_members` see the
+    /// whole linearization regardless of file order.
+    ///
+    /// Returns `true` when a parent was pinned down, so the caller can
+    /// iterate: an inner class may extend a name that its *outer* class
+    /// inherits, which only becomes visible once the outer parents are known.
+    fn parents_pass(&mut self, tree: &mut Tree, ctors: bool) -> bool {
+        match &mut tree.kind {
+            TreeKind::PackageDef { stats, .. } => {
+                self.st.push_scope();
+                if !tree.sym.is_none() {
+                    for m in self.st.get(tree.sym).members.clone() {
+                        let n = self.st.get(m).name.clone();
+                        if n.ends_with('$') {
+                            continue;
+                        }
+                        self.st.enter_in_current(&n, m);
+                    }
+                }
+                let mut changed = false;
+                for s in stats.iter_mut() {
+                    changed |= self.parents_pass(s, ctors);
+                }
+                self.st.pop_scope();
+                changed
+            }
+            // Parents are named through the imports of their own file.
+            TreeKind::Import { .. } => {
+                self.type_import(tree);
+                false
+            }
+            TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } => {
+                self.parents_pass_tmpl(tree, ctors)
+            }
+            _ => false,
+        }
+    }
+
+    fn parents_pass_tmpl(&mut self, tree: &mut Tree, ctors: bool) -> bool {
+        let id = match &tree.kind {
+            TreeKind::ClassDef { .. } => tree.sym,
+            TreeKind::ModuleDef { .. } => match self.st.get(tree.sym).ty {
+                Type::ModuleRef(c) => c,
+                _ => tree.sym,
+            },
+            _ => return false,
+        };
+        if id.is_none() {
+            return false;
+        }
+        let saved_owner = self.st.owner;
+        let saved_this = self.st.this_class;
+        self.st.owner = id;
+        self.st.this_class = id;
+        self.st.push_scope();
+        for m in self.st.get(id).members.clone() {
+            let n = self.st.get(m).name.clone();
+            self.st.enter_in_current(&n, m);
+        }
+        let parent_trees: Vec<Tree> = match &tree.kind {
+            TreeKind::ClassDef { impl_, .. } | TreeKind::ModuleDef { impl_, .. } => {
+                impl_.parents.clone()
+            }
+            _ => Vec::new(),
+        };
+        let mut changed = false;
+        let mut rough = self.st.get(id).parents.clone();
+        // `rough_parents` substitutes `AnyRef` for an empty `extends`; only a
+        // one-for-one list came from the source and can be matched up.
+        if rough.len() == parent_trees.len() {
+            for (slot, p) in rough.iter_mut().zip(parent_trees.iter()) {
+                if !matches!(slot, Type::Named { .. }) {
+                    continue;
+                }
+                if let Some(sym) = self.parent_head_sym(p) {
+                    if sym != id {
+                        *slot = Type::Class {
+                            sym,
+                            args: Vec::new(),
+                        };
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                self.st.get_mut(id).parents = rough;
+            }
+        }
+        // An inner template may extend a name inherited by this one.
+        self.enter_inherited_members(id);
+        if ctors {
+            self.header_ctor_sig(tree, id);
+        }
+        let body = match &mut tree.kind {
+            TreeKind::ClassDef { impl_, .. } | TreeKind::ModuleDef { impl_, .. } => &mut impl_.body,
+            _ => {
+                self.st.pop_scope();
+                self.st.owner = saved_owner;
+                self.st.this_class = saved_this;
+                return changed;
+            }
+        };
+        for stt in body.iter_mut() {
+            if matches!(
+                stt.kind,
+                TreeKind::Import { .. } | TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+            ) {
+                changed |= self.parents_pass(stt, ctors);
+            }
+        }
+        self.st.pop_scope();
+        self.st.owner = saved_owner;
+        self.st.this_class = saved_this;
+        changed
+    }
+
+    /// Give `id`'s primary constructor its real parameter types.
+    ///
+    /// `extends Table[Int](n)` is checked against the parent's `<init>`, and
+    /// the namer only knows that constructor's *arity*: its parameter types
+    /// arrive with the parent's own signature pass. A subclass in a file
+    /// listed before its parent therefore saw untyped parameters and reported
+    /// `no matching overload for constructor`. Running this for every unit
+    /// before any parent clause is checked removes the file-order dependency.
+    /// The signature pass redoes the work (and adds the evidence parameters
+    /// a context bound needs), so this only ever runs ahead of it.
+    fn header_ctor_sig(&mut self, tree: &mut Tree, id: SymbolId) {
+        let TreeKind::ClassDef { vparamss, .. } = &mut tree.kind else {
+            return;
+        };
+        let mut paramss_ty: Vec<Vec<Type>> = Vec::new();
+        let mut paramss_ids: Vec<Vec<SymbolId>> = Vec::new();
+        let mut all_ctor_params = Vec::new();
+        for clause in vparamss.iter_mut() {
+            let mut ct = Vec::new();
+            let mut ids = Vec::new();
+            for p in clause.iter_mut() {
+                self.type_val_sig(p);
+                ct.push(p.ty.clone());
+                if !p.sym.is_none() {
+                    self.st.get_mut(p.sym).ty = p.ty.clone();
+                    ids.push(p.sym);
+                    all_ctor_params.push(p.sym);
+                }
+            }
+            paramss_ty.push(ct);
+            paramss_ids.push(ids);
+        }
+        for mem in self.st.get(id).members.clone() {
+            if self.st.get(mem).name == "<init>"
+                && self.st.get(mem).params == self.st.get(id).ctor_fields.clone()
+            {
+                self.st.get_mut(mem).params = all_ctor_params.clone();
+                self.st.get_mut(mem).paramss = paramss_ids.clone();
+                self.st.get_mut(mem).ty = Type::Method {
+                    paramss: paramss_ty.clone(),
+                    ret: Box::new(Type::Unit),
+                };
+            }
+        }
+    }
+
+    /// The class symbol a parent clause names, or `None` when the name does
+    /// not resolve to a class yet. Deliberately narrow: an abstract type
+    /// member or type parameter is *not* accepted as a parent symbol here,
+    /// because `class_sym_of` would chase its bound and pin down a class the
+    /// source never named.
+    fn parent_head_sym(&mut self, p: &Tree) -> Option<SymbolId> {
+        let mut t = p;
+        loop {
+            match &t.kind {
+                TreeKind::Apply { fun, .. } => t = fun,
+                TreeKind::New { tpt } => t = tpt,
+                _ => break,
+            }
+        }
+        fn head(ty: &Type) -> Option<SymbolId> {
+            match ty {
+                Type::Class { sym, .. } | Type::ModuleRef(sym) => Some(*sym),
+                Type::Applied { ctor, .. } => head(ctor),
+                _ => None,
+            }
+        }
+        let ty = self.tree_to_type(t);
+        let sym = head(&ty)?;
+        if self.st.get(sym).is_class_like() {
+            Some(sym)
+        } else {
+            None
+        }
+    }
+
     // ------------------------------------------------------------------ typer
     fn typer(&mut self, tree: &mut Tree) {
         match &mut tree.kind {
@@ -1814,13 +2060,7 @@ impl Typer {
             },
         };
         if let Some(cls) = self.st.class_sym_of(&st) {
-            for m in self.st.get(cls).members.clone() {
-                let n = self.st.get(m).name.clone();
-                if n.ends_with('$') || n == "<init>" {
-                    continue;
-                }
-                self.st.enter_in_current(&n, m);
-            }
+            self.enter_members_of(cls);
             // members of Foo's parents too (lookup_member walks them; Ident needs scope)
             let mut work = self.st.get(cls).parents.clone();
             let mut seen = std::collections::HashSet::new();
@@ -1832,13 +2072,7 @@ impl Typer {
                 if !seen.insert(pid.0) {
                     continue;
                 }
-                for m in self.st.get(pid).members.clone() {
-                    let n = self.st.get(m).name.clone();
-                    if n.ends_with('$') || n == "<init>" {
-                        continue;
-                    }
-                    self.st.enter_in_current(&n, m);
-                }
+                self.enter_members_of(pid);
                 work.extend(self.st.get(pid).parents.clone());
             }
         }
@@ -1846,18 +2080,31 @@ impl Typer {
             if name != "this" {
                 // The signature pass and the body pass both bind the alias;
                 // allocating twice would make `self` look like an overload.
-                let existing = self.st.get(class_id).members.iter().copied().find(|&m| {
-                    self.st.get(m).name == name
-                        && self.st.get(m).kind == SymKind::Term
-                        && self.st.get(m).flags.contains(Flags::SYNTHETIC)
-                });
-                let sid = existing.unwrap_or_else(|| {
+                let sid = self.st.get(class_id).self_alias.unwrap_or_else(|| {
                     self.st
                         .alloc(&name, class_id, SymKind::Term, Flags::SYNTHETIC, "")
                 });
+                self.st.get_mut(class_id).self_alias = Some(sid);
                 self.st.get_mut(sid).ty = st;
                 self.st.enter_in_current(&name, sid);
             }
+        }
+    }
+
+    /// Bring `cls`'s members into the current scope, minus the ones another
+    /// template never inherits: its constructor, its compiler-made `$` names
+    /// and its self alias (see `Symbol::self_alias`).
+    fn enter_members_of(&mut self, cls: SymbolId) {
+        let alias = self.st.get(cls).self_alias;
+        for m in self.st.get(cls).members.clone() {
+            if Some(m) == alias {
+                continue;
+            }
+            let n = self.st.get(m).name.clone();
+            if n.ends_with('$') || n == "<init>" {
+                continue;
+            }
+            self.st.enter_in_current(&n, m);
         }
     }
 
@@ -1874,6 +2121,7 @@ impl Typer {
             if !seen.insert(pid.0) {
                 continue;
             }
+            let alias = self.st.get(pid).self_alias;
             for m in self.st.get(pid).members.clone() {
                 let n = self.st.get(m).name.clone();
                 if n.ends_with('$') || n == "<init>" {
@@ -1883,6 +2131,10 @@ impl Typer {
                 // them shadows an enclosing `A` of the same name
                 // (`def wrap[A](…) = new Show[A] { … }`).
                 if self.st.get(m).kind == SymKind::TypeParam {
+                    continue;
+                }
+                // Neither is a parent's self alias (see `Symbol::self_alias`).
+                if Some(m) == alias {
                     continue;
                 }
                 self.st.enter_in_current(&n, m);
@@ -9844,9 +10096,13 @@ impl Typer {
     }
 
     fn lookup_qualified_type(&mut self, prefix: &Tree, name: &str) -> Option<SymbolId> {
-        let owner = self.qualified_type_owner(prefix)?;
-        self.complete_binary_member(owner, name, prefix.span);
-        self.prefer_class_member(owner, name)
+        for owner in self.qualified_type_owners(prefix) {
+            self.complete_binary_member(owner, name, prefix.span);
+            if let Some(id) = self.prefer_class_member(owner, name) {
+                return Some(id);
+            }
+        }
+        None
     }
 
     /// Nested classes live on the module class (`object Outer { class Inner }`).
@@ -9859,45 +10115,73 @@ impl Typer {
 
     /// `new Outer.Inner()` must bind the class, not `object Inner`.
     fn prefer_class_member(&self, owner: SymbolId, name: &str) -> Option<SymbolId> {
-        let found = self.st.lookup_member(owner, name);
-        found
-            .iter()
-            .copied()
-            .find(|&s| self.st.get(s).kind == SymKind::Class)
-            .or_else(|| {
-                found.into_iter().find(|&s| {
-                    matches!(
-                        self.st.get(s).kind,
-                        SymKind::Package
-                            | SymKind::Module
-                            | SymKind::ModuleClass
-                            | SymKind::TypeMember
-                            | SymKind::TypeParam
-                    )
-                })
-            })
+        self.type_owner_members(owner, name).into_iter().next()
     }
 
-    fn qualified_type_owner(&mut self, t: &Tree) -> Option<SymbolId> {
+    /// Every member of `owner` called `name` that can carry a type, best
+    /// first (see `prefer_class_member`).
+    fn type_owner_members(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
+        let found = self.st.lookup_member(owner, name);
+        let mut out: Vec<SymbolId> = found
+            .iter()
+            .copied()
+            .filter(|&s| self.st.get(s).kind == SymKind::Class)
+            .collect();
+        for s in found {
+            let ok = matches!(
+                self.st.get(s).kind,
+                SymKind::Package
+                    | SymKind::Module
+                    | SymKind::ModuleClass
+                    | SymKind::TypeMember
+                    | SymKind::TypeParam
+            );
+            if ok && !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// The symbols a qualified type's prefix may name, best first.
+    ///
+    /// A companion pair shares one name, so `Rep.TypedRep` has two readings:
+    /// the trait `Rep` (which has no `TypedRep`) and `object Rep` (which
+    /// does). Scala's prefix is a term path, so the module has to be reachable
+    /// even when the trait is found first; the caller keeps trying until one
+    /// of these owners actually has the member.
+    fn qualified_type_owners(&mut self, t: &Tree) -> Vec<SymbolId> {
+        let mut out: Vec<SymbolId> = Vec::new();
+        let push = |v: &mut Vec<SymbolId>, id: SymbolId| {
+            if !v.contains(&id) {
+                v.push(id);
+            }
+        };
         match &t.kind {
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, t.span);
-                let id = self.st.lookup(name).into_iter().find(|id| {
-                    matches!(
-                        self.st.get(*id).kind,
+                for id in self.st.lookup(name) {
+                    if matches!(
+                        self.st.get(id).kind,
                         SymKind::Package | SymKind::Class | SymKind::Module | SymKind::ModuleClass
-                    )
-                })?;
-                Some(self.as_type_owner(id))
+                    ) {
+                        let o = self.as_type_owner(id);
+                        push(&mut out, o);
+                    }
+                }
             }
             TreeKind::Select { qual, name } => {
-                let owner = self.qualified_type_owner(qual)?;
-                self.complete_binary_member(owner, name, t.span);
-                self.prefer_class_member(owner, name)
-                    .map(|id| self.as_type_owner(id))
+                for owner in self.qualified_type_owners(qual) {
+                    self.complete_binary_member(owner, name, t.span);
+                    for id in self.type_owner_members(owner, name) {
+                        let o = self.as_type_owner(id);
+                        push(&mut out, o);
+                    }
+                }
             }
-            _ => None,
+            _ => {}
         }
+        out
     }
 
     fn complete_binary_member(&mut self, owner: SymbolId, name: &str, span: Span) {
