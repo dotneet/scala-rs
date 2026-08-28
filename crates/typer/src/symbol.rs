@@ -695,6 +695,12 @@ impl SymbolTable {
                 Type::Annotated { tpe, .. } => walk(st, tpe, ty, seen),
                 Type::Applied { ctor, args } => {
                     let t = apply_type_ctor((**ctor).clone(), args.clone());
+                    if matches!(t, Type::Applied { .. }) {
+                        // Still applied: the constructor is abstract (a type
+                        // member or parameter), so it names no class to walk
+                        // into. Recursing here would not terminate.
+                        return ty;
+                    }
                     walk(st, &t, ty, seen)
                 }
                 _ => ty,

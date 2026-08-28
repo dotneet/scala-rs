@@ -470,6 +470,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     );
 
     crate::prelude_lowbound::install(st);
+    crate::prelude_lang::install(st);
 
     st.push_scope();
     st.enter_in_current("scala", st.scala_pkg);

@@ -142,6 +142,13 @@ fn jar_packages_every_selector_shape() {
     check_runs("imports_jar", &["imports_jar"], &["-Xsource:3"]);
 }
 
+/// Every `scala.language` feature is an importable name, in every shape,
+/// including the nested `scala.language.experimental.macros`.
+#[test]
+fn language_feature_imports_resolve() {
+    check_runs("imports_lang", &["imports_lang"], &[]);
+}
+
 // ------------------------------------------------------- error handling
 
 /// `.*` is a Scala 3 spelling: without `-Xsource:3` nothing is imported, and
