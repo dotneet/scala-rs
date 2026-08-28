@@ -6,11 +6,13 @@
 //!
 //! - [`codec`]: SID-10 ByteCodecs, shared with the backend's pickle *writer*.
 //! - [`classfile`]: just enough classfile parsing to reach `ScalaSignature`.
+//! - [`names`]: Scala's `NameTransformer` (`++` <-> `$plus$plus`).
 //! - [`read`]: pickle bytes to an entry table.
 //! - [`sym`]: entry table to class signatures, with inheritance resolved.
 
 pub mod classfile;
 pub mod codec;
+pub mod names;
 pub mod read;
 pub mod sym;
 

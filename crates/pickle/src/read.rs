@@ -142,12 +142,17 @@ pub mod tags {
 /// Pickled flag bits, i.e. the bits as they appear in a symbol's `flags_LongNat`.
 ///
 /// nsc permutes the low 12 bits when pickling (`rawToPickledFlags`), so these
-/// are *not* the raw `Flags` positions. Only bits 0..=31 are listed: they are
-/// the ones scala-rs needs and the ones whose pickled position is pinned by
-/// `Flags.scala`'s `PKL_MASK` block plus the identity range above it. Bits 32
-/// and up (LAZY, VARARGS, ARTIFACT, ...) are carried through verbatim in
-/// [`SymInfo::flags`] but deliberately not named here, because getting one of
-/// them wrong would silently misclassify a symbol.
+/// are *not* the raw `Flags` positions. Above bit 11 the pickled and raw
+/// positions agree, and several of those bits are shared between a term
+/// meaning and a type meaning -- `COVARIANT`/`BYNAMEPARAM` are one bit, as are
+/// `TRAIT`/`DEFAULTPARAM` -- which is why both names appear at the same value.
+///
+/// Every position here is pinned by `flag_bits_match_the_library` against real
+/// symbols in scala-library 2.13.16 rather than from memory: getting one wrong
+/// silently misclassifies a symbol, and an earlier version of this table was
+/// off by one from bit 16 up.
+///
+/// Bits 30 and above are deliberately not named; nothing here needs them.
 #[allow(non_upper_case_globals)]
 pub mod pflags {
     pub const IMPLICIT: u64 = 1 << 0;
@@ -166,22 +171,27 @@ pub mod pflags {
     pub const PARAM: u64 = 1 << 13;
     pub const PACKAGE: u64 = 1 << 14;
     pub const MACRO: u64 = 1 << 15;
+    /// On a type parameter. The same bit is [`BYNAMEPARAM`] on a term.
     pub const COVARIANT: u64 = 1 << 16;
-    pub const BYNAMEPARAM: u64 = 1 << 17;
-    pub const CONTRAVARIANT: u64 = 1 << 18;
-    pub const ABSOVERRIDE: u64 = 1 << 19;
-    pub const LOCAL: u64 = 1 << 20;
-    pub const JAVA: u64 = 1 << 21;
-    pub const SYNTHETIC: u64 = 1 << 22;
-    pub const STABLE: u64 = 1 << 23;
-    pub const STATIC: u64 = 1 << 24;
-    pub const CASEACCESSOR: u64 = 1 << 25;
-    pub const DEFAULTPARAM: u64 = 1 << 26;
-    pub const TRAIT: u64 = 1 << 27;
-    pub const BRIDGE: u64 = 1 << 28;
-    pub const ACCESSOR: u64 = 1 << 29;
-    pub const SUPERACCESSOR: u64 = 1 << 30;
-    pub const PARAMACCESSOR: u64 = 1 << 31;
+    /// On a value parameter. The same bit is [`COVARIANT`] on a type.
+    pub const BYNAMEPARAM: u64 = 1 << 16;
+    pub const CONTRAVARIANT: u64 = 1 << 17;
+    pub const ABSOVERRIDE: u64 = 1 << 18;
+    pub const LOCAL: u64 = 1 << 19;
+    pub const JAVA: u64 = 1 << 20;
+    pub const SYNTHETIC: u64 = 1 << 21;
+    pub const STABLE: u64 = 1 << 22;
+    pub const STATIC: u64 = 1 << 23;
+    pub const CASEACCESSOR: u64 = 1 << 24;
+    /// On a class. The same bit is [`DEFAULTPARAM`] on a value parameter.
+    pub const TRAIT: u64 = 1 << 25;
+    /// On a value parameter: the caller may omit the argument. The same bit is
+    /// [`TRAIT`] on a class.
+    pub const DEFAULTPARAM: u64 = 1 << 25;
+    pub const BRIDGE: u64 = 1 << 26;
+    pub const ACCESSOR: u64 = 1 << 27;
+    pub const SUPERACCESSOR: u64 = 1 << 28;
+    pub const PARAMACCESSOR: u64 = 1 << 29;
 }
 
 // ---------------------------------------------------------------------------

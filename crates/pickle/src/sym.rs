@@ -11,7 +11,7 @@
 //! (`SigType` -> `scala_rs_parser::Type`) lives in
 //! `crates/typer/src/pickle_supply.rs`, which is where the symbol table is.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::read::{pflags, read_pickle, Constant, Entry, Idx, Pickle, ReadError};
@@ -76,6 +76,10 @@ pub struct Param {
     pub name: String,
     pub ty: SigType,
     pub by_name: bool,
+    /// Raw pickled flags; see [`crate::read::pflags`]. `DEFAULTPARAM` says the
+    /// caller may omit this argument, in which case the value comes from the
+    /// class's `<method>$default$<n>` getter.
+    pub flags: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -310,15 +314,19 @@ impl Builder<'_> {
             .and_then(|i| self.p.name(i.name))
             .unwrap_or("_")
             .to_string();
-        let (ty, by_name) = match info {
+        let (ty, by_name, flags) = match info {
             Some(i) => {
                 let t = self.ty(i.info, 0);
-                let by_name = i.has(pflags::BYNAMEPARAM);
-                (t, by_name)
+                (t, i.has(pflags::BYNAMEPARAM), i.flags)
             }
-            None => (SigType::None, false),
+            None => (SigType::None, false, 0),
         };
-        Param { name, ty, by_name }
+        Param {
+            name,
+            ty,
+            by_name,
+            flags,
+        }
     }
 
     /// Resolve a symbol reference to the name a `SigType::Ref` should carry.
@@ -544,16 +552,23 @@ impl SigCache {
         got
     }
 
-    /// Find every overload of `name` visible on `full_name`, searching the
-    /// class itself and then its parents breadth-first (nsc linearization is
-    /// finer-grained, but for "does this member exist and with what type" a
-    /// BFS over parents gives the same answer for non-overridden members).
+    /// Find every overload of `name` visible on `full_name`, in **linearization
+    /// order**: the most derived declaration first.
     ///
-    /// Each hop substitutes the parent's type parameters with the arguments
-    /// the child passed it, so what comes back is expressed in the queried
-    /// class's own type parameters.
+    /// The order is the one SLS 5.1.2 specifies and nsc implements,
+    /// `L(C) = C, L(Cn) +: ... +: L(C1)`, so a later parent wins over an
+    /// earlier one for the ancestors they share. That is what decides which
+    /// binding of an inherited type parameter a member comes back with:
+    /// `immutable.Set` mixes in `Iterable[A]` before `SetOps[A, Set, Set[A]]`,
+    /// so `IterableOps`'s `C` must resolve through `SetOps` (`Set[A]`) and not
+    /// through `Iterable` (`Iterable[A]`). A plain breadth-first walk gets that
+    /// backwards and hands back the weaker type.
     ///
-    /// Parents that could not be loaded are returned separately, so a caller
+    /// Each hop substitutes the parent's type parameters with the arguments the
+    /// child passed it, so what comes back is expressed in the queried class's
+    /// own type parameters.
+    ///
+    /// Classes that could not be loaded are returned separately, so a caller
     /// can tell "no such member" from "we could not look".
     pub fn lookup<S: ClassSource + ?Sized>(
         &mut self,
@@ -562,54 +577,129 @@ impl SigCache {
         module: bool,
         name: &str,
     ) -> (Vec<MemberHit>, Vec<LoadError>) {
-        let mut found = Vec::new();
         let mut errs = Vec::new();
-        let mut seen: Vec<String> = Vec::new();
-        let mut queue: VecDeque<(String, bool, HashMap<String, SigType>)> = VecDeque::new();
-        queue.push_back((full_name.to_string(), module, HashMap::new()));
-        while let Some((cur, cur_module, subst)) = queue.pop_front() {
-            if seen.contains(&cur) {
+        let lin = self.linearization(src, full_name, module, &mut errs);
+        let mut found = Vec::new();
+        for step in &lin {
+            let Ok(sig) = self.class_sig(src, &step.class_name, step.module) else {
                 continue;
-            }
-            seen.push(cur.clone());
-            let sig = match self.class_sig(src, &cur, cur_module) {
-                Ok(sig) => sig,
-                Err(e) => {
-                    errs.push(e);
-                    continue;
-                }
             };
             for m in sig.members_named(name) {
                 let mut m = m.clone();
-                m.ty = apply_subst(&m.ty, &subst);
+                m.ty = apply_subst(&m.ty, &step.subst);
                 found.push(MemberHit {
-                    owner: cur.clone(),
+                    owner: step.class_name.clone(),
                     member: m,
                 });
-            }
-            for p in &sig.parents {
-                let SigType::Ref { sym, args } = p else {
-                    continue;
-                };
-                if !sym.contains('.') {
-                    continue;
-                }
-                // The parent's arguments are written in `cur`'s vocabulary;
-                // lifting them through `subst` puts them in the queried
-                // class's, which is what the next hop must substitute with.
-                let lifted: Vec<SigType> = args.iter().map(|a| apply_subst(a, &subst)).collect();
-                let mut next = HashMap::new();
-                if let Ok(psig) = self.class_sig(src, sym, false) {
-                    for (tp, arg) in psig.tparams.iter().zip(lifted) {
-                        next.insert(tp.name.clone(), arg);
-                    }
-                }
-                queue.push_back((sym.clone(), false, next));
             }
         }
         (found, errs)
     }
+
+    /// The class linearization of `full_name`, each step carrying the
+    /// substitution that expresses it in `full_name`'s type parameters.
+    pub fn linearization<S: ClassSource + ?Sized>(
+        &mut self,
+        src: &mut S,
+        full_name: &str,
+        module: bool,
+        errs: &mut Vec<LoadError>,
+    ) -> Vec<LinStep> {
+        let mut walk = LinWalk {
+            budget: LIN_BUDGET,
+            depth: 0,
+            errs,
+        };
+        self.lin_of(src, full_name, module, HashMap::new(), &mut walk)
+    }
+
+    fn lin_of<S: ClassSource + ?Sized>(
+        &mut self,
+        src: &mut S,
+        class_name: &str,
+        module: bool,
+        subst: HashMap<String, SigType>,
+        walk: &mut LinWalk<'_>,
+    ) -> Vec<LinStep> {
+        let here = LinStep {
+            class_name: class_name.to_string(),
+            module,
+            subst: subst.clone(),
+        };
+        if walk.depth > LIN_MAX_DEPTH || walk.budget == 0 {
+            return vec![here];
+        }
+        walk.budget -= 1;
+        let sig = match self.class_sig(src, class_name, module) {
+            Ok(sig) => sig,
+            Err(e) => {
+                walk.errs.push(e);
+                return vec![here];
+            }
+        };
+        // acc = L(C1); then acc = L(Ci) ++ (acc minus L(Ci)) for i = 2..n,
+        // which is SLS's `L(Cn) +: ... +: L(C1)` written left to right.
+        let mut acc: Vec<LinStep> = Vec::new();
+        for p in &sig.parents {
+            let SigType::Ref { sym, args } = p else {
+                continue;
+            };
+            if !sym.contains('.') {
+                continue;
+            }
+            // The parent's arguments are written in `class_name`'s vocabulary;
+            // lifting them through `subst` puts them in the queried class's.
+            let lifted: Vec<SigType> = args.iter().map(|a| apply_subst(a, &subst)).collect();
+            let mut next = HashMap::new();
+            if let Ok(psig) = self.class_sig(src, sym, false) {
+                for (tp, arg) in psig.tparams.iter().zip(lifted) {
+                    next.insert(tp.name.clone(), arg);
+                }
+            }
+            walk.depth += 1;
+            let plin = self.lin_of(src, sym, false, next, walk);
+            walk.depth -= 1;
+            let names: Vec<&str> = plin.iter().map(|s| s.class_name.as_str()).collect();
+            let kept: Vec<LinStep> = acc
+                .into_iter()
+                .filter(|e| !names.contains(&e.class_name.as_str()))
+                .collect();
+            acc = plin;
+            acc.extend(kept);
+        }
+        let mut out = vec![here];
+        let mut seen: Vec<String> = vec![class_name.to_string()];
+        for e in acc {
+            if seen.contains(&e.class_name) {
+                continue;
+            }
+            seen.push(e.class_name.clone());
+            out.push(e);
+        }
+        out
+    }
 }
+
+/// One class in a linearization, with the substitution that expresses its type
+/// parameters in the queried class's vocabulary.
+#[derive(Clone, Debug)]
+pub struct LinStep {
+    pub class_name: String,
+    pub module: bool,
+    pub subst: HashMap<String, SigType>,
+}
+
+/// Bookkeeping for one linearization walk.
+struct LinWalk<'a> {
+    budget: u32,
+    depth: u32,
+    errs: &'a mut Vec<LoadError>,
+}
+
+/// The collection hierarchy is wide and repetitive; these bound the work when a
+/// pickle describes something pathological.
+const LIN_BUDGET: u32 = 4096;
+const LIN_MAX_DEPTH: u32 = 32;
 
 fn load<S: ClassSource + ?Sized>(
     src: &mut S,
@@ -787,6 +877,12 @@ impl<S: ClassSource> SigLoader<S> {
         name: &str,
     ) -> (Vec<MemberHit>, Vec<LoadError>) {
         self.cache.lookup(&mut self.src, full_name, module, name)
+    }
+
+    pub fn linearization(&mut self, full_name: &str, module: bool) -> Vec<LinStep> {
+        let mut errs = Vec::new();
+        self.cache
+            .linearization(&mut self.src, full_name, module, &mut errs)
     }
 }
 

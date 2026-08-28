@@ -6,7 +6,7 @@
 
 use scala_rs_pickle::read::{read_pickle, Entry};
 use scala_rs_pickle::scala_signature_bytes;
-use scala_rs_pickle::sym::{render, ClassSource, MemberKind, SigLoader};
+use scala_rs_pickle::sym::{render, ClassSource, MemberKind, SigLoader, SigType};
 use std::io::Read;
 
 fn jar_path() -> std::path::PathBuf {
@@ -316,4 +316,169 @@ fn resolves_module_class_members() {
         "List object has no empty/apply: {:?}",
         sig.members.iter().map(|m| &m.name).collect::<Vec<_>>()
     );
+}
+
+/// Linearization order, not breadth-first order, decides which binding of an
+/// inherited type parameter a member comes back with.
+///
+/// `immutable.Set[A]` mixes in `Iterable[A]` *before* `SetOps[A, Set, Set[A]]`,
+/// so SLS 5.1.2 says the later parent wins and `IterableOps`'s `C` is `Set[A]`.
+/// A breadth-first walk reaches `IterableOps` through `Iterable` first and
+/// hands back the weaker `Iterable[A]`.
+#[test]
+fn set_filter_binds_c_through_setops_not_iterable() {
+    let jar = jar_path();
+    if !jar.is_file() {
+        eprintln!("skipping: {} not found", jar.display());
+        return;
+    }
+    let mut loader = SigLoader::new(JarSource::open(&jar));
+    let (hits, _) = loader.lookup("scala.collection.immutable.Set", false, "filter");
+    let hit = hits
+        .iter()
+        .find(|h| h.member.is_public_api())
+        .expect("Set#filter");
+    let r = render(&hit.member.ty);
+    assert!(
+        r.ends_with(")scala.collection.immutable.Set[A]"),
+        "filter should return Set[A], got {r}"
+    );
+}
+
+/// The linearization itself: a later parent and everything it brings must come
+/// before an earlier one.
+#[test]
+fn linearization_puts_later_parents_first() {
+    let jar = jar_path();
+    if !jar.is_file() {
+        eprintln!("skipping: {} not found", jar.display());
+        return;
+    }
+    let mut loader = SigLoader::new(JarSource::open(&jar));
+    let lin = loader.linearization("scala.collection.immutable.Set", false);
+    let names: Vec<&str> = lin.iter().map(|s| s.class_name.as_str()).collect();
+    assert_eq!(
+        names[0], "scala.collection.immutable.Set",
+        "self comes first"
+    );
+    let pos = |n: &str| names.iter().position(|x| *x == n);
+    let setops = pos("scala.collection.SetOps").expect("SetOps in linearization");
+    let iterable = pos("scala.collection.immutable.Iterable").expect("Iterable in linearization");
+    assert!(
+        setops < iterable,
+        "SetOps is the later parent and must linearize first: {names:?}"
+    );
+    // Every class appears once.
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    let before = sorted.len();
+    sorted.dedup();
+    assert_eq!(
+        before,
+        sorted.len(),
+        "duplicate in linearization: {names:?}"
+    );
+}
+
+/// Pin the pickled flag bit positions against real symbols.
+///
+/// nsc only permutes the low 12 bits, but the positions above them are easy to
+/// mis-remember, and a wrong one silently misclassifies a symbol rather than
+/// failing. An earlier version of this table was off by one from bit 16 up,
+/// which made `is_public_api` test STABLE for SYNTHETIC and JAVA for LOCAL.
+#[test]
+fn flag_bits_match_the_library() {
+    use scala_rs_pickle::read::pflags;
+    let jar = jar_path();
+    if !jar.is_file() {
+        eprintln!("skipping: {} not found", jar.display());
+        return;
+    }
+    let mut loader = SigLoader::new(JarSource::open(&jar));
+
+    let iterable_ops = loader
+        .class_sig("scala.collection.IterableOps", false)
+        .expect("IterableOps");
+    assert!(
+        iterable_ops.flags & pflags::TRAIT != 0,
+        "IterableOps is a trait"
+    );
+    assert!(iterable_ops.flags & pflags::ABSTRACT != 0);
+
+    let list = loader
+        .class_sig("scala.collection.immutable.List", false)
+        .expect("List");
+    assert!(
+        list.flags & pflags::TRAIT == 0,
+        "List is a class, not a trait"
+    );
+    assert!(list.flags & pflags::SEALED != 0, "List is sealed");
+
+    let nil = loader
+        .class_sig("scala.collection.immutable.Nil", true)
+        .expect("Nil");
+    assert!(nil.flags & pflags::MODULE != 0 && nil.flags & pflags::CASE != 0);
+
+    let some = loader.class_sig("scala.Some", false).expect("Some");
+    assert!(some.flags & pflags::FINAL != 0 && some.flags & pflags::CASE != 0);
+
+    // `case class Some(value: A)` pickles the accessor and the private field.
+    let accessor = some
+        .members
+        .iter()
+        .find(|m| m.name == "value" && m.kind == MemberKind::Def)
+        .expect("Some#value accessor");
+    assert!(accessor.flags & pflags::METHOD != 0);
+    assert!(
+        accessor.flags & pflags::STABLE != 0,
+        "a val accessor is stable"
+    );
+    assert!(accessor.flags & pflags::ACCESSOR != 0);
+    assert!(accessor.flags & pflags::CASEACCESSOR != 0);
+    assert!(accessor.flags & pflags::PARAMACCESSOR != 0);
+    assert!(accessor.flags & pflags::SYNTHETIC == 0, "not synthetic");
+
+    let field = some
+        .members
+        .iter()
+        .find(|m| m.name.trim_end() == "value" && m.kind == MemberKind::Val)
+        .expect("Some#value field");
+    assert!(field.flags & pflags::PRIVATE != 0 && field.flags & pflags::LOCAL != 0);
+    assert!(
+        !field.is_public_api(),
+        "the backing field is not public API"
+    );
+
+    // The synthetic members of a case class's companion.
+    let some_obj = loader.class_sig("scala.Some", true).expect("Some$");
+    let to_string = some_obj
+        .members
+        .iter()
+        .find(|m| m.name == "toString")
+        .expect("Some$.toString");
+    assert!(to_string.flags & pflags::SYNTHETIC != 0);
+    assert!(to_string.flags & pflags::OVERRIDE != 0);
+
+    // A defaulted value parameter: `lastIndexOf(elem, end = length - 1)`.
+    let (hits, _) = loader.lookup("scala.collection.immutable.List", false, "lastIndexOf");
+    let mut saw_default = false;
+    for h in &hits {
+        if let SigType::Poly { result, .. } = &h.member.ty {
+            if let SigType::Method { params, .. } = &**result {
+                if params.len() == 2 {
+                    assert!(params[0].flags & pflags::PARAM != 0);
+                    assert!(
+                        params[1].flags & pflags::DEFAULTPARAM != 0,
+                        "`end` has a default"
+                    );
+                    assert!(
+                        params[0].flags & pflags::DEFAULTPARAM == 0,
+                        "`elem` does not"
+                    );
+                    saw_default = true;
+                }
+            }
+        }
+    }
+    assert!(saw_default, "lastIndexOf(elem, end) not found");
 }
