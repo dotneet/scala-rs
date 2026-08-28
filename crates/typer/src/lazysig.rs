@@ -43,12 +43,17 @@ pub(crate) struct PendingSig {
 }
 
 /// `val x = rhs` / `def f = rhs`: no type annotation, but a body to infer from.
+///
+/// `type T = rhs` is here too: an alias is only usable once its right-hand side
+/// has been resolved, and the units are typed in command-line order, so
+/// `A.scala` may name `B.T` before `B.scala`'s template has been walked.
 pub(crate) fn needs_lazy_sig(tree: &Tree) -> bool {
     match &tree.kind {
         TreeKind::ValDef { tpt, rhs, .. } => tpt.is_empty() && !rhs.is_empty(),
         TreeKind::DefDef { tpt, rhs, name, .. } => {
             name != "<init>" && tpt.is_empty() && !rhs.is_empty()
         }
+        TreeKind::TypeDef { rhs, .. } => !rhs.is_empty(),
         _ => false,
     }
 }
@@ -165,17 +170,21 @@ impl Typer {
 
         let mut t = p.tree;
         let is_val = matches!(t.kind, TreeKind::ValDef { .. });
-        if !p.sig_done {
-            if is_val {
-                self.type_val_sig(&mut t);
-            } else {
-                self.type_def_sig(&mut t);
-            }
-        }
-        if is_val {
-            self.type_val_body(&mut t);
+        if matches!(t.kind, TreeKind::TypeDef { .. }) {
+            self.complete_type_alias_tree(&mut t);
         } else {
-            self.type_def_body(&mut t);
+            if !p.sig_done {
+                if is_val {
+                    self.type_val_sig(&mut t);
+                } else {
+                    self.type_def_sig(&mut t);
+                }
+            }
+            if is_val {
+                self.type_val_body(&mut t);
+            } else {
+                self.type_def_body(&mut t);
+            }
         }
 
         self.swap_back_scopes(saved_scopes);
@@ -195,6 +204,8 @@ impl Typer {
             };
             let msg = if kind == SymKind::Method {
                 format!("recursive method {name} needs result type")
+            } else if kind == SymKind::TypeMember {
+                format!("illegal cyclic reference involving type {name}")
             } else {
                 format!("recursive value {name} needs type")
             };

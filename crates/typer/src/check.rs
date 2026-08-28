@@ -1033,7 +1033,7 @@ impl Typer {
         }
         if matches!(
             &tree.kind,
-            TreeKind::ValDef { .. } | TreeKind::DefDef { .. }
+            TreeKind::ValDef { .. } | TreeKind::DefDef { .. } | TreeKind::TypeDef { .. }
         ) {
             self.register_namer_sig(tree);
         }
@@ -1494,7 +1494,19 @@ impl Typer {
         tree.ty = Type::ModuleRef(cls);
     }
 
+    /// Resolve one `type T = rhs` on demand, right-hand side and all, the way
+    /// the enclosing template's own pass would have. Used by `complete_lazy_sig`
+    /// when a reference from another unit reaches the alias first.
+    pub(crate) fn complete_type_alias_tree(&mut self, tree: &mut Tree) {
+        self.type_type_member(tree);
+        self.finish_one_type_alias(tree);
+    }
+
     fn type_type_member(&mut self, tree: &mut Tree) {
+        if self.take_lazy_done(tree) {
+            return;
+        }
+        self.drop_lazy_sig(tree.sym);
         let span = tree.span;
         let type_member_id = tree.sym;
         let (has_tparams, has_bounds, name) = match &tree.kind {
@@ -1768,6 +1780,20 @@ impl Typer {
 
     /// Expand `type T = U` chains and diagnose `illegal cyclic reference`.
     /// Abstract `type A` (empty rhs) is left as `TypeMember`.
+    /// `finish_type_aliases` for a single definition, for the on-demand path.
+    fn finish_one_type_alias(&mut self, stt: &mut Tree) {
+        let mut alias_ids = HashSet::new();
+        if let TreeKind::TypeDef { rhs, .. } = &stt.kind {
+            if !rhs.is_empty() && !stt.sym.is_none() {
+                alias_ids.insert(stt.sym.0);
+            }
+        }
+        if alias_ids.is_empty() {
+            return;
+        }
+        self.expand_one_alias(stt, &alias_ids);
+    }
+
     fn finish_type_aliases(&mut self, body: &mut [Tree]) {
         let mut alias_ids = HashSet::new();
         for stt in body.iter() {
@@ -1778,28 +1804,32 @@ impl Typer {
             }
         }
         for stt in body.iter_mut() {
-            let TreeKind::TypeDef { name, rhs, .. } = &stt.kind else {
-                continue;
-            };
-            if rhs.is_empty() || stt.sym.is_none() || stt.ty.is_error() {
-                continue;
+            self.expand_one_alias(stt, &alias_ids);
+        }
+    }
+
+    fn expand_one_alias(&mut self, stt: &mut Tree, alias_ids: &HashSet<u32>) {
+        let TreeKind::TypeDef { name, rhs, .. } = &stt.kind else {
+            return;
+        };
+        if rhs.is_empty() || stt.sym.is_none() || stt.ty.is_error() {
+            return;
+        }
+        let name = name.clone();
+        let span = stt.span;
+        let mut seen = Vec::new();
+        match expand_alias_type(&self.st, &stt.ty, alias_ids, &mut seen) {
+            Ok(t) => {
+                stt.ty = t.clone();
+                self.st.get_mut(stt.sym).ty = t;
             }
-            let name = name.clone();
-            let span = stt.span;
-            let mut seen = Vec::new();
-            match expand_alias_type(&self.st, &stt.ty, &alias_ids, &mut seen) {
-                Ok(t) => {
-                    stt.ty = t.clone();
-                    self.st.get_mut(stt.sym).ty = t;
-                }
-                Err(_) => {
-                    self.error(
-                        span,
-                        format!("illegal cyclic reference involving type {name}"),
-                    );
-                    stt.ty = Type::Error;
-                    self.st.get_mut(stt.sym).ty = Type::Error;
-                }
+            Err(_) => {
+                self.error(
+                    span,
+                    format!("illegal cyclic reference involving type {name}"),
+                );
+                stt.ty = Type::Error;
+                self.st.get_mut(stt.sym).ty = Type::Error;
             }
         }
     }
@@ -4002,6 +4032,18 @@ impl Typer {
                 }
             }
             Type::Overload(alts) => {
+                // Alternatives that are the same type are one member, not an
+                // overload: a member reaches a class through every inheritance
+                // route it has, and a diamond yields it twice.
+                let mut distinct: Vec<&Type> = Vec::new();
+                for a in alts {
+                    if !distinct.contains(&a) {
+                        distinct.push(a);
+                    }
+                }
+                if let [only] = distinct.as_slice() {
+                    return self.maybe_auto_apply((*only).clone(), pt);
+                }
                 if matches!(pt, Type::Function { .. } | Type::Method { .. }) {
                     return ty;
                 }
@@ -6142,16 +6184,6 @@ impl Typer {
                         ),
                     );
                 } else if !arg_tys.iter().any(|t| t.is_error()) {
-                    if std::env::var("SCALA_RS_DEBUG_OVL").is_ok() {
-                        eprintln!(
-                            "DBG fun.sym={:?} name={:?} kind={:?} owner={:?} fun_ty={:?}",
-                            fun.sym,
-                            self.st.get(fun.sym).name,
-                            self.st.get(fun.sym).kind,
-                            self.st.get(self.st.get(fun.sym).owner).name,
-                            fun_ty,
-                        );
-                    }
                     self.error(
                         tree.span,
                         format!(
@@ -9059,7 +9091,8 @@ impl Typer {
             TreeKind::Ident { name } if name == "_" => Type::Wildcard,
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, tpt.span);
-                self.resolve_type_name(name, &[])
+                let name = name.clone();
+                self.resolve_type_name_completing(&name, &[], tpt.span)
             }
             TreeKind::Select { name, qual } => {
                 if let TreeKind::Ident { name: q } = &qual.kind {
@@ -9071,6 +9104,7 @@ impl Typer {
                 } else if self.type_select_is_term_prefix(qual) {
                     self.path_dependent_type(tpt.span, qual, name)
                 } else if let Some(id) = self.lookup_qualified_type(qual, name) {
+                    self.complete_lazy_sig(id, tpt.span);
                     match self.st.get(id).kind {
                         SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
                         SymKind::TypeParam => Type::TypeParam(id),
@@ -9349,11 +9383,39 @@ impl Typer {
         self.project_from_prefix(span, &prefix, name)
     }
 
+    /// Complete the alias(es) a projection prefix names, then re-read it. A
+    /// parameterized alias only folds into its right-hand side once that side
+    /// is known, so `DSL.arg[B1, P1]#to` needs `arg` completed first.
+    fn complete_prefix_aliases(&mut self, span: Span, prefix: &Type) -> Type {
+        match prefix {
+            Type::TypeMember(id) => {
+                self.complete_lazy_sig(*id, span);
+                prefix.clone()
+            }
+            Type::Applied { ctor, args } => {
+                if let Type::TypeMember(id) = ctor.as_ref() {
+                    self.complete_lazy_sig(*id, span);
+                    return self
+                        .st
+                        .expand_applied_hk_alias(crate::symbol::apply_type_ctor(
+                            (**ctor).clone(),
+                            args.clone(),
+                        ));
+                }
+                prefix.clone()
+            }
+            _ => prefix.clone(),
+        }
+    }
+
     fn project_from_prefix(&mut self, span: Span, prefix: &Type, name: &str) -> Type {
         // A projection out of a prefix that already failed reports nothing new.
         if prefix.is_error() {
             return Type::Error;
         }
+        // `o#arg[…]`: the prefix may be an alias whose right-hand side lives in
+        // a unit that has not been walked yet. Resolve it before projecting.
+        let prefix = &self.complete_prefix_aliases(span, prefix);
         if let Type::Refined { .. } = prefix {
             if let Some(t) = self.st.lookup_type_member_on(prefix, name) {
                 return t;
@@ -10307,6 +10369,17 @@ impl Typer {
                 );
             }
         }
+    }
+
+    /// `resolve_type_name`, after completing any alias the name binds to. A
+    /// reference from an earlier unit must not see the alias's `<notype>`.
+    fn resolve_type_name_completing(&mut self, name: &str, args: &[Type], span: Span) -> Type {
+        for id in self.st.lookup_type(name) {
+            if self.st.get(id).kind == SymKind::TypeMember {
+                self.complete_lazy_sig(id, span);
+            }
+        }
+        self.resolve_type_name(name, args)
     }
 
     fn resolve_type_name(&self, name: &str, args: &[Type]) -> Type {
