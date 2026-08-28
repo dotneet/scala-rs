@@ -3128,3 +3128,23 @@ fn fixtures_try_recover_bad_is_error() {
 fn fixtures_try_ops_needs_scala_library() {
     compile_fails("try_ops", "Try");
 }
+
+/// `java.lang`'s common exceptions plus the `(String)` constructor and
+/// `getMessage` every `Throwable` has: the same source runs in both modes.
+#[test]
+fn fixtures_try_exceptions() {
+    check("try_exceptions");
+}
+
+#[test]
+fn scala_library_dual_run_try_exceptions() {
+    dual_run_fixture("try_exceptions");
+}
+
+#[test]
+fn fixtures_try_exceptions_bad_is_error() {
+    compile_fails(
+        "try_exceptions_bad",
+        "noSuchThrowableMember is not a member",
+    );
+}
