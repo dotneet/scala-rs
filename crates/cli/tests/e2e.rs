@@ -3478,3 +3478,24 @@ fn scala_library_dual_run_conformty() {
 fn fixtures_conformty_bad_is_error() {
     compile_fails_lib("conformty_bad", "no implicit");
 }
+
+// --- lazysig: signatures completed on demand (nsc's lazy completers) -------
+
+/// A member without a type annotation must get its signature the moment a
+/// reference needs it, even from a template the typer reaches first.
+#[test]
+fn fixtures_lazysig() {
+    check("lazysig");
+}
+
+#[test]
+fn scala_library_dual_run_lazysig() {
+    dual_run_fixture("lazysig");
+}
+
+/// `object A { val x = y; val y = x }`: scalac reports
+/// `recursive value y needs type` on the `y` of `val x = y`.
+#[test]
+fn fixtures_lazysig_cyclic_bad_is_error() {
+    compile_fails("lazysig_cyclic_bad", "recursive value y needs type");
+}

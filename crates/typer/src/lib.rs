@@ -6,6 +6,7 @@ mod implicits;
 mod javaclass;
 mod javasign;
 mod lambda_lift;
+mod lazysig;
 mod macros;
 mod pickle_supply;
 mod prelude;
