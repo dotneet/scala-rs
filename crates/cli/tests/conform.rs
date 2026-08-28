@@ -120,4 +120,12 @@ macro_rules! conform {
     };
 }
 
-conform!(basics, patterns, collections, generics);
+conform!(
+    basics,
+    patterns,
+    collections,
+    generics,
+    strings,
+    options,
+    classes
+);

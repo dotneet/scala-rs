@@ -4016,7 +4016,36 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
         TreeKind::Ident { .. } => gen_ident(asm, frame, ctx, tree),
         TreeKind::Select { qual, name } => gen_select(asm, frame, ctx, tree, qual, name),
         TreeKind::Apply { fun, args } => gen_apply(asm, frame, ctx, tree, fun, args),
-        TreeKind::TypeApply { fun, .. } => gen_expr(asm, frame, ctx, fun),
+        TreeKind::TypeApply { fun, args } => {
+            // `x.isInstanceOf[T]` is `instanceof`; `x.asInstanceOf[T]` is a
+            // checkcast (or an unbox for a primitive target).
+            let ic = if fun.sym.is_none() {
+                Intrinsic::None
+            } else {
+                ctx.st.get(fun.sym).intrinsic
+            };
+            match (ic, &fun.kind) {
+                (Intrinsic::IsInstanceOf, TreeKind::Select { qual, .. }) => {
+                    gen_expr(asm, frame, ctx, qual);
+                    if is_jvm_primitive(&qual.ty) && !is_unit_like(&qual.ty) {
+                        emit_box(asm, &qual.ty);
+                    }
+                    let target = args.first().map(|a| a.ty.clone()).unwrap_or(Type::AnyRef);
+                    asm.instanceof(&type_jvm_name(ctx.st, &target));
+                }
+                (Intrinsic::AsInstanceOf, TreeKind::Select { qual, .. }) => {
+                    gen_expr(asm, frame, ctx, qual);
+                    let target = args.first().map(|a| a.ty.clone()).unwrap_or(Type::AnyRef);
+                    if is_jvm_primitive(&qual.ty) && !is_jvm_primitive(&target) {
+                        emit_box(asm, &qual.ty);
+                    }
+                    if !is_jvm_primitive(&qual.ty) {
+                        emit_from_erased_object(asm, ctx.st, &target);
+                    }
+                }
+                _ => gen_expr(asm, frame, ctx, fun),
+            }
+        }
         TreeKind::Function { .. } => gen_function(asm, frame, ctx, tree),
         TreeKind::Typed { expr, .. } => {
             gen_expr(asm, frame, ctx, expr);

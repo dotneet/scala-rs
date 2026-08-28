@@ -10,6 +10,7 @@ mod pickle_supply;
 mod prelude;
 mod prelude_coll;
 mod prelude_either;
+mod prelude_lowbound;
 mod prelude_seq;
 mod prelude_text;
 mod prelude_tuple;

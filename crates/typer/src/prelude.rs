@@ -462,6 +462,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         library_abi,
     );
 
+    crate::prelude_lowbound::install(st);
+
     st.push_scope();
     st.enter_in_current("scala", st.scala_pkg);
     st.enter_in_current("java", java);
@@ -1206,14 +1208,21 @@ fn add_any_members(st: &mut SymbolTable) {
         Type::String,
         Intrinsic::AnyToString,
     );
-    method(st, any, "asInstanceOf", vec![], Type::Any, Intrinsic::None);
+    method(
+        st,
+        any,
+        "asInstanceOf",
+        vec![],
+        Type::Any,
+        Intrinsic::AsInstanceOf,
+    );
     method(
         st,
         any,
         "isInstanceOf",
         vec![],
         Type::Boolean,
-        Intrinsic::None,
+        Intrinsic::IsInstanceOf,
     );
     // nsc `Any.synchronized[T0](body: => T0): T0`
     let sync = method(

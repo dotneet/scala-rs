@@ -2025,11 +2025,14 @@ impl Typer {
         self.st.get_mut(tree.sym).tparams = tp_ids.clone();
         let mut view_work: Vec<(SymbolId, Vec<Tree>, Span, bool)> = Vec::new();
         let mut ctx_work: Vec<(SymbolId, Vec<Tree>, Span, bool)> = Vec::new();
+        let mut bound_work: Vec<(SymbolId, Option<Tree>, Option<Tree>)> = Vec::new();
         for (i, tp) in tparams.iter().enumerate() {
             if let TreeKind::TypeDef {
                 views,
                 ctx_bounds,
                 tparams: inner,
+                lo,
+                hi,
                 ..
             } = &tp.kind
             {
@@ -2039,6 +2042,29 @@ impl Typer {
                 }
                 if !ctx_bounds.is_empty() {
                     ctx_work.push((tp_ids[i], ctx_bounds.clone(), tp.span, hk));
+                }
+                if lo.is_some() || hi.is_some() {
+                    bound_work.push((
+                        tp_ids[i],
+                        lo.as_ref().map(|t| (**t).clone()),
+                        hi.as_ref().map(|t| (**t).clone()),
+                    ));
+                }
+            }
+        }
+        // `[B >: A]` / `[A <: Named]`: remember the bounds on the type parameter
+        // symbol so inference can widen to the lower bound and check the upper one.
+        for (tp_id, lo, hi) in bound_work {
+            let lo_ty = lo.map(|t| self.tree_to_type(&t));
+            let hi_ty = hi.map(|t| self.tree_to_type(&t));
+            if let Some(t) = lo_ty {
+                if !t.is_error() {
+                    self.st.get_mut(tp_id).bound_lo = Some(t);
+                }
+            }
+            if let Some(t) = hi_ty {
+                if !t.is_error() {
+                    self.st.get_mut(tp_id).bound_hi = Some(t);
                 }
             }
         }
@@ -2808,8 +2834,12 @@ impl Typer {
             TreeKind::TypeApply { fun, args } => {
                 self.type_expr(fun, &Type::NoType);
                 let mut targs = Vec::new();
-                for a in args.iter() {
-                    targs.push(self.tree_to_type(a));
+                for a in args.iter_mut() {
+                    let t = self.tree_to_type(a);
+                    // The backend reads the argument's type for
+                    // `isInstanceOf` / `asInstanceOf`.
+                    a.ty = t.clone();
+                    targs.push(t);
                 }
                 if !fun.sym.is_none() {
                     let mut sym = fun.sym;
@@ -2845,6 +2875,18 @@ impl Typer {
                     if sym != fun.sym {
                         fun.sym = sym;
                         fun.ty = tree.ty.clone();
+                    }
+                    self.check_explicit_tparam_bounds(fun, &targs, tree.span);
+                    match self.st.get(fun.sym).intrinsic {
+                        crate::symbol::Intrinsic::AsInstanceOf => {
+                            tree.ty = targs.first().cloned().unwrap_or(Type::Any);
+                            return;
+                        }
+                        crate::symbol::Intrinsic::IsInstanceOf => {
+                            tree.ty = Type::Boolean;
+                            return;
+                        }
+                        _ => {}
                     }
                 } else {
                     tree.ty = fun.ty.clone();
@@ -4615,7 +4657,7 @@ impl Typer {
                     };
                     for (i, tp) in tps.iter().enumerate() {
                         inferred_args.push(
-                            unify_tparam(*tp, &unify_params, &arg_tys)
+                            self.unify_tparam_all(*tp, &unify_params, &arg_tys)
                                 .or_else(|| pt_args.get(i).cloned())
                                 .unwrap_or(Type::Any),
                         );
@@ -4740,7 +4782,12 @@ impl Typer {
                         }
                     }
                     if !self.st.get(sym).tparams.is_empty() {
-                        let inst = self.infer_method_tparams(sym, &param_tys, &arg_tys);
+                        let inst = self.infer_method_tparams_in(
+                            sym,
+                            &param_tys,
+                            &arg_tys,
+                            recv_ty.as_ref(),
+                        );
                         // nsc leaves `tryBreakable { throw … }`'s T undetermined
                         // (Nothing is bottom). `catchBreak { println }` then
                         // instantiates T from the handler, not from Nothing.
@@ -4752,6 +4799,7 @@ impl Typer {
                         } else {
                             inst
                         };
+                        self.check_tparam_bounds(sym, &inst, recv_ty.as_ref(), tree.span, true);
                         if !inst.is_empty() {
                             let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
                             let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
@@ -5003,14 +5051,9 @@ impl Typer {
                 } else {
                     fun_name.clone()
                 };
-                if method_name == "::" {
-                    if let Some(a0) = args.first() {
-                        ret = Type::Class {
-                            sym: self.st.list_sym,
-                            args: vec![a0.ty.widen_constant()],
-                        };
-                    }
-                } else if method_name == "->" {
+                // `::` is `[B >: A](elem: B): List[B]` (see prelude_lowbound);
+                // its result comes from ordinary lower-bounded inference.
+                if method_name == "->" {
                     if let Some(a0) = args.first() {
                         if let Some(t2) = self
                             .st
@@ -5204,7 +5247,13 @@ impl Typer {
                         || owner_n == "Seq$"
                         || owner_n == "LazyList$"
                     {
-                        if let Some(a0) = args.first() {
+                        // `List(Circle(1), Rect(2, 3))` is a `List[Shape]`:
+                        // the element type is the lub of every argument.
+                        if let Some(elem) = args
+                            .iter()
+                            .map(|a| a.ty.widen_constant())
+                            .reduce(|acc, t| self.lub_ty(&acc, &t))
+                        {
                             if let Some(cls) = self
                                 .st
                                 .lookup(owner_n.trim_end_matches('$'))
@@ -5213,10 +5262,6 @@ impl Typer {
                             {
                                 // `List(circle, rect)` is a `List[Shape]`, so the
                                 // element type is the lub of every argument.
-                                let elem =
-                                    args[1..].iter().fold(a0.ty.widen_constant(), |acc, a| {
-                                        self.lub_ty(&acc, &a.ty.widen_constant())
-                                    });
                                 ret = Type::Class {
                                     sym: cls,
                                     args: vec![elem],
@@ -5470,29 +5515,90 @@ impl Typer {
             .unwrap_or(SymbolId::NONE)
     }
 
+    /// Least upper bound, with the numeric widenings nsc applies before lubbing
+    /// (`lub(Int, Long) = Long`).
+    pub(crate) fn lub_ty(&self, a: &Type, b: &Type) -> Type {
+        if let Some(t) = numeric_widen(a, b).or_else(|| numeric_widen(b, a)) {
+            return t;
+        }
+        self.st.lub(a, b)
+    }
+
+    /// Unify `tp` against every argument, not just the first match, and join the
+    /// results. Needed for repeated parameters (`List(Circle(1), Rect(2, 3))`)
+    /// and for `def f[A](x: A, y: A)`.
+    fn unify_tparam_all(&self, tp: SymbolId, params: &[Type], args: &[Type]) -> Option<Type> {
+        let mut acc: Option<Type> = None;
+        for (i, a) in args.iter().enumerate() {
+            let Some(p) = param_at(params, i) else {
+                break;
+            };
+            if let Some(t) = unify_one(tp, p, a) {
+                acc = Some(match acc {
+                    None => t,
+                    Some(prev) => self.lub_ty(&prev, &t),
+                });
+            }
+        }
+        acc
+    }
+
+    /// The declared lower bound of `tp`, as seen from the receiver type
+    /// (`List[Rect].::[B >: A]` has `B >: Rect`). `None` when there is no bound
+    /// or when it is still expressed in terms of unresolved type parameters.
+    fn tparam_lower_bound(
+        &self,
+        method: SymbolId,
+        tp: SymbolId,
+        recv: Option<&Type>,
+    ) -> Option<Type> {
+        let lo = self.st.get(tp).bound_lo.clone()?;
+        let lo = match recv {
+            Some(Type::Class { args, .. }) if !args.is_empty() => {
+                let owner = self.st.get(method).owner;
+                self.st.subst_tparams(owner, args, &lo)
+            }
+            _ => lo,
+        };
+        if lo.is_no_type()
+            || lo.is_error()
+            || matches!(lo, Type::Nothing)
+            || mentions_any_tparam(&lo)
+        {
+            return None;
+        }
+        Some(lo)
+    }
+
     fn infer_method_tparams(
         &self,
         method: SymbolId,
         param_tys: &[Type],
         arg_tys: &[Type],
     ) -> Vec<(SymbolId, Type)> {
+        self.infer_method_tparams_in(method, param_tys, arg_tys, None)
+    }
+
+    /// Method type-parameter inference. `recv` is the receiver type, used to
+    /// read `[B >: A]` lower bounds as seen from the receiver.
+    fn infer_method_tparams_in(
+        &self,
+        method: SymbolId,
+        param_tys: &[Type],
+        arg_tys: &[Type],
+        recv: Option<&Type>,
+    ) -> Vec<(SymbolId, Type)> {
         let tps = self.st.get(method).tparams.clone();
-        let repeated_last = matches!(param_tys.last(), Some(Type::Repeated(_)));
         let mut out = Vec::new();
         for tp in tps {
-            let sols = unify_tparam_all(tp, param_tys, arg_tys);
-            let Some(first) = sols.first().cloned() else {
-                continue;
-            };
-            // `List(a, b)` with different element types infers their lub.
-            let t = if repeated_last && sols.len() > 1 {
-                sols[1..]
-                    .iter()
-                    .fold(first, |acc, next| self.lub_ty(&acc, next))
-            } else {
-                first
-            };
-            out.push((tp, t));
+            let inferred = self.unify_tparam_all(tp, param_tys, arg_tys);
+            let lo = self.tparam_lower_bound(method, tp, recv);
+            match (inferred, lo) {
+                (Some(t), Some(lo)) => out.push((tp, self.lub_ty(&t, &lo))),
+                (Some(t), None) => out.push((tp, t)),
+                (None, Some(lo)) => out.push((tp, lo)),
+                (None, None) => {}
+            }
         }
         out
     }
@@ -5509,56 +5615,110 @@ impl Typer {
         }
     }
 
-    /// `lub` cannot walk parents without the symbol table, so a common
-    /// superclass of two case classes came out as `Any`.
-    fn lub_ty(&self, a: &Type, b: &Type) -> Type {
-        let simple = lub(a, b);
-        if !matches!(simple, Type::Any) {
-            return simple;
+    /// nsc's "inferred type arguments … do not conform to … type parameter bounds".
+    fn check_tparam_bounds(
+        &mut self,
+        method: SymbolId,
+        inst: &[(SymbolId, Type)],
+        recv: Option<&Type>,
+        span: Span,
+        inferred: bool,
+    ) {
+        let tps = self.st.get(method).tparams.clone();
+        if tps.is_empty() || inst.is_empty() {
+            return;
         }
-        // `(String, JStr)` and `(String, JNum)` share `(String, Json)`. A
-        // tuple reaches here either as `Type::Tuple` or as `Class { TupleN }`.
-        if let (Some(xs), Some(ys)) = (self.as_tuple_args(a), self.as_tuple_args(b)) {
-            if xs.len() == ys.len() {
-                return Type::Tuple(xs.iter().zip(&ys).map(|(x, y)| self.lub_ty(x, y)).collect());
+        let owner = self.st.get(method).owner;
+        let recv_args: Vec<Type> = match recv {
+            Some(Type::Class { args, .. }) => args.clone(),
+            _ => Vec::new(),
+        };
+        let ids: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+        let vals: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+        let mut bad = false;
+        for (tp, actual) in inst {
+            if actual.is_error() || actual.is_no_type() {
+                continue;
             }
-        }
-        // `List[JStr]` and `List[JNum]` share `List[Json]` when the parameter
-        // is covariant; an invariant one has to fall through to the parents.
-        if let (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) = (a, b) {
-            if s1 == s2 && a1.len() == a2.len() && !a1.is_empty() {
-                let tps = self.st.get(*s1).tparams.clone();
-                let all_covariant = tps.len() == a1.len()
-                    && tps
-                        .iter()
-                        .all(|t| self.st.get(*t).flags.contains(Flags::COVARIANT));
-                if all_covariant {
-                    return Type::Class {
-                        sym: *s1,
-                        args: a1.iter().zip(a2).map(|(x, y)| self.lub_ty(x, y)).collect(),
-                    };
-                }
-            }
-        }
-        let mut work: std::collections::VecDeque<Type> = std::collections::VecDeque::new();
-        work.push_back(a.clone());
-        let mut seen = std::collections::HashSet::new();
-        while let Some(t) = work.pop_front() {
-            if let Some(sym) = self.st.class_sym_of(&t) {
-                if !seen.insert(sym.0) {
+            for (bound, upper) in [
+                (self.st.get(*tp).bound_hi.clone(), true),
+                (self.st.get(*tp).bound_lo.clone(), false),
+            ] {
+                let Some(bound) = bound else { continue };
+                let bound = if recv_args.is_empty() {
+                    bound
+                } else {
+                    self.st.subst_tparams(owner, &recv_args, &bound)
+                };
+                let bound = crate::symbol::subst_tparams_slice(&ids, &vals, &bound);
+                if bound.is_error() || bound.is_no_type() || mentions_any_tparam(&bound) {
                     continue;
                 }
-                if !matches!(t, Type::Any | Type::AnyRef | Type::AnyVal)
-                    && self.st.is_sub_type(b, &t)
-                {
-                    return t;
-                }
-                for p in self.st.get(sym).parents.clone() {
-                    work.push_back(self.st.subst_as_seen_from(&t, &p));
+                let ok = if upper {
+                    self.st.is_sub_type(actual, &bound)
+                } else {
+                    self.st.is_sub_type(&bound, actual)
+                };
+                if !ok {
+                    bad = true;
                 }
             }
         }
-        simple
+        if !bad {
+            return;
+        }
+        let args_s = inst
+            .iter()
+            .map(|(_, t)| self.st.display_type(t))
+            .collect::<Vec<_>>()
+            .join(",");
+        let bounds_s = tps
+            .iter()
+            .map(|tp| self.tparam_bounds_string(*tp))
+            .collect::<Vec<_>>()
+            .join(",");
+        let name = self.st.get(method).name.clone();
+        let what = if inferred {
+            "inferred type arguments"
+        } else {
+            "type arguments"
+        };
+        self.error(
+            span,
+            format!(
+                "{what} [{args_s}] do not conform to method {name}'s type parameter bounds [{bounds_s}]"
+            ),
+        );
+    }
+
+    /// `f[Int](…)` written out: check the explicit type arguments against the
+    /// method's declared bounds.
+    fn check_explicit_tparam_bounds(&mut self, fun: &Tree, targs: &[Type], span: Span) {
+        let sym = fun.sym;
+        if self.st.get(sym).kind != crate::symbol::SymKind::Method {
+            return;
+        }
+        let tps = self.st.get(sym).tparams.clone();
+        if tps.is_empty() || tps.len() != targs.len() {
+            return;
+        }
+        let recv = match &fun.kind {
+            TreeKind::Select { qual, .. } => Some(qual.ty.clone()),
+            _ => None,
+        };
+        let inst: Vec<(SymbolId, Type)> = tps.iter().copied().zip(targs.iter().cloned()).collect();
+        self.check_tparam_bounds(sym, &inst, recv.as_ref(), span, false);
+    }
+
+    fn tparam_bounds_string(&self, tp: SymbolId) -> String {
+        let mut s = self.st.get(tp).name.clone();
+        if let Some(lo) = self.st.get(tp).bound_lo.clone() {
+            s.push_str(&format!(" >: {}", self.st.display_type(&lo)));
+        }
+        if let Some(hi) = self.st.get(tp).bound_hi.clone() {
+            s.push_str(&format!(" <: {}", self.st.display_type(&hi)));
+        }
+        s
     }
 
     /// `Left.apply` / `Right.apply` → `Left[A, B]` / `Right[A, B]`.
@@ -10341,32 +10501,22 @@ fn param_at(params: &[Type], i: usize) -> Option<&Type> {
     }
 }
 
-fn unify_tparam(tp: SymbolId, params: &[Type], args: &[Type]) -> Option<Type> {
-    unify_tparam_all(tp, params, args).into_iter().next()
-}
-
-/// Every solution `tp` has across the argument list. A repeated parameter
-/// matches each remaining argument, so `List(a, b)` yields both element types
-/// and the caller takes their least upper bound.
-fn unify_tparam_all(tp: SymbolId, params: &[Type], args: &[Type]) -> Vec<Type> {
-    let repeated_last = matches!(params.last(), Some(Type::Repeated(_)));
-    let mut out = Vec::new();
-    for (i, a) in args.iter().enumerate() {
-        let p = if i < params.len() {
-            &params[i]
-        } else if repeated_last {
-            match params.last() {
-                Some(p) => p,
-                None => break,
-            }
-        } else {
-            break;
-        };
-        if let Some(t) = unify_one(tp, p, a) {
-            out.push(t);
+/// Whether `ty` still mentions a type parameter, i.e. is not a proper type yet.
+fn mentions_any_tparam(ty: &Type) -> bool {
+    match ty {
+        Type::TypeParam(_) => true,
+        Type::Class { args, .. } | Type::Tuple(args) => args.iter().any(mentions_any_tparam),
+        Type::Applied { ctor, args } => {
+            mentions_any_tparam(ctor) || args.iter().any(mentions_any_tparam)
         }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            mentions_any_tparam(t)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(mentions_any_tparam) || mentions_any_tparam(ret)
+        }
+        _ => false,
     }
-    out
 }
 
 /// True when `args` instantiate `tps` rather than still mentioning them
