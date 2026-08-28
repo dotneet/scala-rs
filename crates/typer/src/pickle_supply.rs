@@ -21,6 +21,7 @@
 use std::collections::{HashMap, HashSet};
 
 use scala_rs_parser::{Flags, SymbolId, Type};
+use scala_rs_pickle::read::pflags;
 use scala_rs_pickle::sym::{MemberKind, SigCache, SigType};
 use scala_rs_pickle::ClassSource;
 
@@ -57,6 +58,9 @@ pub struct PickleSupply {
     tried: HashSet<(u32, String)>,
     /// Parsed classfiles, for erased descriptors.
     classes: HashMap<String, Option<JavaClass>>,
+    /// Library classes stubbed into the symbol table by `ensure_class`, keyed
+    /// by JVM internal name, so a second mention reuses the same symbol.
+    stubs: HashMap<String, SymbolId>,
 }
 
 impl PickleSupply {
@@ -115,7 +119,7 @@ impl PickleSupply {
         }
 
         let mut installed = 0usize;
-        let mut seen_shapes: HashSet<String> = HashSet::new();
+        let mut seen_shapes: HashSet<usize> = HashSet::new();
         for hit in hits {
             let m = hit.member;
             if m.kind != MemberKind::Def || !m.is_public_api() {
@@ -134,9 +138,18 @@ impl PickleSupply {
                 ));
                 continue;
             };
-            // The same member is reachable through several parents; keep one.
-            let key = format!("{}/{}", shape.tparams.len(), shape.arity());
+            // Keep one declaration per arity, the first one linearization
+            // offers, i.e. the most derived. `Map#map` really is overloaded --
+            // `IterableOps.map[B]: Iterable[B]` and `MapOps.map[K2,V2]:
+            // Map[K2,V2]` -- and scalac picks between them by expected type,
+            // which the typer cannot do here. Supplying both makes every call
+            // ambiguous, so take the derived one and leave the other out.
+            let key = shape.arity();
             if !seen_shapes.insert(key) {
+                trace(format_args!(
+                    "{internal}#{name}/{key}: skipping an overload shadowed by a \
+                     more derived declaration"
+                ));
                 continue;
             }
             if self.install(st, bin, class_sym, &internal, name, &shape, &class_scope) {
@@ -184,10 +197,19 @@ impl PickleSupply {
             tparams.push(id);
         }
         // Bounds are resolved after every parameter is in scope (`A <: B`).
+        // The lower bound matters as much as the upper one: `[B >: A]` is what
+        // lets the typer solve `B` from the receiver for `xs.reduceOption`.
         for (tp, id) in shape.tparams.iter().zip(tparams.iter().copied()) {
             if let Some(hi) = &tp.hi {
                 if let Some(t) = self.conv(st, bin, &scope, hi) {
                     st.get_mut(id).bound_hi = Some(t);
+                }
+            }
+            if let Some(lo) = &tp.lo {
+                if !matches!(lo, SigType::Ref { sym, .. } if sym == "scala.Nothing") {
+                    if let Some(t) = self.conv(st, bin, &scope, lo) {
+                        st.get_mut(id).bound_lo = Some(t);
+                    }
                 }
             }
         }
@@ -239,6 +261,128 @@ impl PickleSupply {
         st.get_mut(m).owner = class_sym;
         st.get_mut(class_sym).members.push(m);
         true
+    }
+
+    /// The symbol for a library class named in a pickle, creating a stub from
+    /// the class's own signature if the symbol table does not have it.
+    ///
+    /// Without this, any member whose signature mentions a class the prelude
+    /// never declared (`scala.collection.IndexedSeq`, `scala.math.Numeric`)
+    /// is declined, which is most of the collection API. The stub carries the
+    /// real JVM name and the right number of type parameters, which is what
+    /// the typer needs to name the type and the backend needs to emit it.
+    ///
+    /// It deliberately does **not** carry the class's parents: giving a stub a
+    /// parent chain would change subtyping for everything, and the prelude's
+    /// own hierarchy is the one existing programs are checked against. The cost
+    /// is that a stubbed type is only usable as itself (see README).
+    fn ensure_class(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        full_name: &str,
+        module: bool,
+    ) -> Option<SymbolId> {
+        let internal = full_name.replace('.', "/");
+        let key = if module {
+            format!("{internal}$")
+        } else {
+            internal.clone()
+        };
+        if let Some(id) = self.stubs.get(&key) {
+            return Some(*id);
+        }
+        let existing = crate::classpath::find_by_jvm(st, &key);
+        if let Some(id) = existing {
+            // `scala/collection/Seq` is already in the table, but as a Java
+            // stub with no type parameters, so `Seq[B]` would not typecheck
+            // against it. Give an empty stub the parameters its own pickle
+            // declares rather than declining every member that mentions it.
+            if st.get(id).tparams.is_empty() && st.get(id).members.is_empty() {
+                if let Ok(sig) = {
+                    let mut src = BinSource(bin);
+                    self.sigs.class_sig(&mut src, full_name, module)
+                } {
+                    if !sig.tparams.is_empty() {
+                        let tparams: Vec<SymbolId> = sig
+                            .tparams
+                            .iter()
+                            .map(|tp| {
+                                let t =
+                                    st.alloc(&tp.name, id, SymKind::TypeParam, Flags::EMPTY, "");
+                                st.get_mut(t).ty = Type::TypeParam(t);
+                                t
+                            })
+                            .collect();
+                        trace(format_args!(
+                            "gave {full_name} the {} type parameter(s) its pickle declares",
+                            tparams.len()
+                        ));
+                        st.get_mut(id).tparams = tparams;
+                    }
+                }
+            }
+            self.stubs.insert(key, id);
+            return Some(id);
+        }
+        // Only classes the library really has: a stub for a name no pickle
+        // describes would be a type we invented.
+        if !full_name.starts_with("scala.") {
+            return None;
+        }
+        let sig = {
+            let mut src = BinSource(bin);
+            self.sigs.class_sig(&mut src, full_name, module).ok()?
+        };
+        let (pkg_jvm, simple) = match internal.rsplit_once('/') {
+            Some((p, n)) => (p.to_string(), n.to_string()),
+            None => (String::new(), internal.clone()),
+        };
+        if simple.is_empty() {
+            return None;
+        }
+        let owner = crate::classpath::ensure_package(st, &pkg_jvm);
+        let id = if module {
+            let cls = st.alloc(
+                format!("{simple}$"),
+                owner,
+                SymKind::ModuleClass,
+                Flags::MODULE.with(Flags::FINAL),
+                &key,
+            );
+            let m = st.alloc(&simple, owner, SymKind::Module, Flags::MODULE, &key);
+            st.get_mut(m).ty = Type::ModuleRef(cls);
+            st.get_mut(cls).ty = Type::ModuleRef(cls);
+            cls
+        } else {
+            let mut flags = Flags::EMPTY;
+            if sig.flags & pflags::TRAIT != 0 || sig.flags & pflags::INTERFACE != 0 {
+                flags = flags.with(Flags::INTERFACE).with(Flags::TRAIT);
+            }
+            if sig.flags & pflags::ABSTRACT != 0 {
+                flags = flags.with(Flags::ABSTRACT);
+            }
+            let id = st.alloc(&simple, owner, SymKind::Class, flags, &key);
+            let tparams: Vec<SymbolId> = sig
+                .tparams
+                .iter()
+                .map(|tp| {
+                    let t = st.alloc(&tp.name, id, SymKind::TypeParam, Flags::EMPTY, "");
+                    st.get_mut(t).ty = Type::TypeParam(t);
+                    t
+                })
+                .collect();
+            st.get_mut(id).tparams = tparams;
+            st.get_mut(id).parents = vec![Type::AnyRef];
+            st.get_mut(id).ty = Type::Class {
+                sym: id,
+                args: vec![],
+            };
+            id
+        };
+        trace(format_args!("stubbed class {full_name} (module={module})"));
+        self.stubs.insert(key, id);
+        Some(id)
     }
 
     /// The declared descriptor of `name` with `arity` value parameters,
@@ -513,7 +657,7 @@ fn walk(t: &SigType, out: &mut Vec<String>, depth: u32) {
 impl PickleSupply {
     fn conv(
         &mut self,
-        st: &SymbolTable,
+        st: &mut SymbolTable,
         bin: &mut BinaryIndex,
         scope: &HashMap<String, Type>,
         t: &SigType,
@@ -523,7 +667,7 @@ impl PickleSupply {
 
     fn conv_at(
         &mut self,
-        st: &SymbolTable,
+        st: &mut SymbolTable,
         bin: &mut BinaryIndex,
         scope: &HashMap<String, Type>,
         t: &SigType,
@@ -553,7 +697,7 @@ impl PickleSupply {
 
     fn conv_ref(
         &mut self,
-        st: &SymbolTable,
+        st: &mut SymbolTable,
         bin: &mut BinaryIndex,
         scope: &HashMap<String, Type>,
         sym: &str,
@@ -614,27 +758,32 @@ impl PickleSupply {
                 return Some(Type::Tuple(self.conv_all(st, bin, scope, args, d)?));
             }
         }
-        let internal = sym.replace('.', "/");
-        if let Some(cls) = crate::classpath::find_by_jvm(st, &internal) {
-            let a = self.conv_all(st, bin, scope, args, d)?;
-            if a.len() != st.get(cls).tparams.len() {
-                return None;
-            }
-            return Some(Type::Class { sym: cls, args: a });
-        }
         // `scala.package.List` and friends: package-object type aliases, which
         // pickles refer to by the alias, not the target. Expand through the
-        // owner's own pickle rather than hard-coding a table.
-        if let Some(expanded) = self.expand_alias(st, bin, scope, sym, args, d) {
-            return Some(expanded);
+        // owner's own pickle rather than hard-coding a table. Tried before
+        // `ensure_class` so an alias is not mistaken for a class of its own.
+        let internal = sym.replace('.', "/");
+        if crate::classpath::find_by_jvm(st, &internal).is_none() {
+            if let Some(expanded) = self.expand_alias(st, bin, scope, sym, args, d) {
+                return Some(expanded);
+            }
         }
-        // Anything else would mean inventing a type the backend cannot name.
-        None
+        let cls = self.ensure_class(st, bin, sym, false)?;
+        let a = self.conv_all(st, bin, scope, args, d)?;
+        if a.len() != st.get(cls).tparams.len() {
+            trace(format_args!(
+                "{sym}: applied to {} arguments but the symbol has {}",
+                a.len(),
+                st.get(cls).tparams.len()
+            ));
+            return None;
+        }
+        Some(Type::Class { sym: cls, args: a })
     }
 
     fn conv_all(
         &mut self,
-        st: &SymbolTable,
+        st: &mut SymbolTable,
         bin: &mut BinaryIndex,
         scope: &HashMap<String, Type>,
         args: &[SigType],
@@ -650,7 +799,7 @@ impl PickleSupply {
     /// substituting the alias's own type parameters.
     fn expand_alias(
         &mut self,
-        st: &SymbolTable,
+        st: &mut SymbolTable,
         bin: &mut BinaryIndex,
         scope: &HashMap<String, Type>,
         sym: &str,
