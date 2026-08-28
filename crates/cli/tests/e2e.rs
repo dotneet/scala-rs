@@ -3031,3 +3031,15 @@ object UseLib {
     let _ = fs::remove_dir_all(&out_lib);
     let _ = fs::remove_dir_all(&probe);
 }
+
+// scala.<:< / scala.=:= (type-constraint witnesses), Option.orNull, and
+// Iterable/IterableOnce.foreach. See crates/typer/src/prelude_conform.rs.
+#[test]
+fn scala_library_dual_run_conformty() {
+    dual_run_fixture("conformty");
+}
+
+#[test]
+fn fixtures_conformty_bad_is_error() {
+    compile_fails_lib("conformty_bad", "no implicit");
+}

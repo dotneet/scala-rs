@@ -464,6 +464,16 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     st.enter_in_current("Unit", st.unit_sym);
     st.enter_in_current("::", st.cons_sym);
     st.enter_in_current("Ordered", ordered);
+    // Must come after the block above: it enters `<:<`/`=:=`/`Iterable`/
+    // `IterableOnce` into this same base scope (the one that stays open for
+    // the whole compilation), the same way `Ordered` just did on the line
+    // above — those types own no package that the earlier `import_members`
+    // calls would have picked up, and without an explicit scope entry
+    // `expose_unqualified` (check.rs) can't resolve them unqualified from
+    // user source at all (it only probes for a *root-level* classfile by
+    // that literal name, which doesn't exist for anything under
+    // `scala/collection/`).
+    crate::prelude_conform::install(st, library_abi);
 }
 
 fn mark_java(st: &mut SymbolTable, id: SymbolId) {
