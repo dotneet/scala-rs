@@ -1556,14 +1556,21 @@ impl Typer {
         self_name: Option<String>,
         self_tpt: Option<&Tree>,
     ) {
-        let Some(tpt) = self_tpt else {
-            return;
+        let st = match self_tpt {
+            Some(tpt) => {
+                let t = self.tree_to_type(tpt);
+                if t.is_error() {
+                    return;
+                }
+                self.st.get_mut(class_id).self_type = Some(t.clone());
+                t
+            }
+            // `trait T { self => … }` names `this` without narrowing it.
+            None => match &self_name {
+                Some(_) => Type::ThisType(class_id),
+                None => return,
+            },
         };
-        let st = self.tree_to_type(tpt);
-        if st.is_error() {
-            return;
-        }
-        self.st.get_mut(class_id).self_type = Some(st.clone());
         if let Some(cls) = self.st.class_sym_of(&st) {
             for m in self.st.get(cls).members.clone() {
                 let n = self.st.get(m).name.clone();
