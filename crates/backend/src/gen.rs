@@ -4104,7 +4104,18 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
         TreeKind::Import { .. } | TreeKind::TypeDef { .. } | TreeKind::Empty => {}
         _ => {
             gen_expr(asm, frame, ctx, tree);
-            pop_if_value(asm, &tree.ty);
+            if is_unit_like(&tree.ty) {
+                // A polymorphic method instantiated at `Unit` still *returns* a
+                // reference on the JVM (`PartialFunction[Throwable, Unit].apply`
+                // is `(Object)Object`). In value position `unit_leaves_boxed_ref`
+                // lets the caller reuse that ref; discarded, it has to go, or a
+                // later `goto` merges two different stack heights.
+                if ctx.library_abi && unit_call_leaves_ref(tree, ctx.st) {
+                    asm.pop();
+                }
+            } else {
+                pop_if_value(asm, &tree.ty);
+            }
         }
     }
 }
@@ -9930,6 +9941,29 @@ fn method_erases_unit_to_ref(fun: &Tree, st: &SymbolTable) -> bool {
     }
 }
 
+/// True when the code just emitted for `tree` left a reference on the stack
+/// even though `tree`'s Scala type is `Unit`: `pf.apply(x)` for a
+/// `PartialFunction[A, Unit]` still invokes `(Object)Object`. Discarding such
+/// an expression has to `pop`, or a later `goto` merges two stack heights.
+///
+/// Deliberately narrow. Most `Unit` expressions leave nothing behind, and the
+/// intrinsics that do erase through `Object` (`Breaks.catchBreak`,
+/// `Using.resource`) already drop the value where they are emitted.
+fn unit_call_leaves_ref(tree: &Tree, st: &SymbolTable) -> bool {
+    match &tree.kind {
+        TreeKind::Typed { expr, .. } | TreeKind::Block { expr, .. } => {
+            unit_call_leaves_ref(expr, st)
+        }
+        TreeKind::Apply { fun, .. } => match &peel_fun(fun).kind {
+            TreeKind::Select { qual, name } => {
+                name == "apply" && is_partial_function_ty(st, &qual.ty)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn emit_predef_nyi(asm: &mut Assembler) {
     load_predef_module(asm);
     asm.invokevirtual("scala/Predef$", "???", "()Lscala/runtime/Nothing$;");
@@ -11498,6 +11532,12 @@ fn gen_try(
         gen_stat(asm, frame, ctx, block);
     } else {
         gen_expr(asm, frame, ctx, block);
+        if matches!(block.ty, Type::Nothing) {
+            // `val n = try throw e catch h`: the body always throws, so it
+            // leaves nothing behind. The store is unreachable, but the
+            // verifier still needs a value of the right sort under it.
+            push_default(asm, result_ty);
+        }
         store(asm, result_slot.unwrap(), sel_sort);
     }
     asm.mark(end_try);

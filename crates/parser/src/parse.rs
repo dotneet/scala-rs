@@ -74,6 +74,9 @@ struct Parser<'a> {
     /// Inside a typed pattern, `|` starts the next alternative, not an infix type.
     no_bar_infix_type: bool,
     placeholder_id: u32,
+    /// Counter behind the synthetic names `catch` of a non-block expression
+    /// introduces (nsc `freshTermName`).
+    catch_id: u32,
     opts: ParseOptions,
     /// nsc `Location.InBlock`: the next `parse_expr1` is a *block statement*,
     /// so a function literal there takes the rest of the block as its body
@@ -94,6 +97,7 @@ impl<'a> Parser<'a> {
             no_bar_infix_type: false,
             placeholder_params: Vec::new(),
             placeholder_id: 0,
+            catch_id: 0,
             opts: ParseOptions::default(),
             in_block: false,
         }
@@ -2080,6 +2084,22 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// `super` / `super[Mix]`, already positioned on the `super` token.
+    /// `qual` is the `C` of `C.super`, if there was one.
+    fn parse_super_ref(&mut self, qual: Option<String>) -> Tree {
+        let sp = self.span();
+        self.bump();
+        let mix = if matches!(self.kind(), TokenKind::LBracket) {
+            self.bump();
+            let n = self.expect_ident().0;
+            self.expect("]", |k| matches!(k, TokenKind::RBracket));
+            Some(n)
+        } else {
+            None
+        };
+        self.alloc(sp.merge(self.prev_span()), TreeKind::Super { qual, mix })
+    }
+
     fn parse_simple_type(&mut self) -> Tree {
         self.skip_nl();
         if let Some(lit) = self.parse_constant_type_lit() {
@@ -2135,6 +2155,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.alloc(sp, TreeKind::This { qual: None })
             }
+            // nsc `StableId`: `super.T` / `super[Mix].T` reach a type member of
+            // a parent (`override def createUpsertBuilder(…): super.InsertBuilder`).
+            // The `.T` is picked up by the `Dot` arm of the loop below.
+            TokenKind::Super => self.parse_super_ref(None),
             _ => self.parse_path(),
         };
         // nsc SimpleType: dots belong to StableId *before* TypeArgs. After
@@ -2155,6 +2179,11 @@ impl<'a> Parser<'a> {
                         t.span.merge(sp),
                         TreeKind::SingletonTypeTree { ref_: Box::new(t) },
                     );
+                    continue;
+                }
+                if matches!(self.kind(), TokenKind::Super) {
+                    let qual = t.name().map(|s| s.to_string());
+                    t = self.parse_super_ref(qual);
                     continue;
                 }
                 let (name, sp) = self.expect_ident();
@@ -2429,6 +2458,115 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// At a `{` that opens a `catch` block: does it hold case clauses?
+    /// nsc reads `catch { case ... }` as clauses and `catch { }` as none;
+    /// any other braced expression is a `PartialFunction` value instead.
+    fn brace_starts_cases(&self) -> bool {
+        let mut i = self.pos + 1;
+        while i < self.tokens.len()
+            && matches!(self.tokens[i].kind, TokenKind::Newline | TokenKind::Semi)
+        {
+            i += 1;
+        }
+        matches!(
+            self.tokens.get(i).map(|t| &t.kind),
+            Some(TokenKind::Case) | Some(TokenKind::RBrace)
+        )
+    }
+
+    /// nsc `makeCatchFromExpr`: `try b catch h` where `h` is a
+    /// `PartialFunction[Throwable, U]` value rather than a block of clauses.
+    /// Becomes
+    /// `case catchArg$n: Throwable => { val catchExpr$n = h;
+    ///   if (catchExpr$n.isDefinedAt(catchArg$n)) catchExpr$n.apply(catchArg$n)
+    ///   else throw catchArg$n }`.
+    /// The handler is evaluated inside the clause, so it runs only when the
+    /// body actually threw, and at most once.
+    fn make_catch_from_expr(&mut self, handler: Tree) -> CaseDef {
+        let sp = handler.span;
+        self.catch_id += 1;
+        let arg = format!("catchArg${}", self.catch_id);
+        let fun = format!("catchExpr${}", self.catch_id);
+
+        let arg_id = self.alloc(sp, TreeKind::Ident { name: arg.clone() });
+        let throwable = self.alloc(
+            sp,
+            TreeKind::Ident {
+                name: "Throwable".into(),
+            },
+        );
+        let pat = self.alloc(
+            sp,
+            TreeKind::Typed {
+                expr: Box::new(arg_id),
+                tpt: Box::new(throwable),
+            },
+        );
+
+        let empty_tpt = self.empty(sp);
+        let val_def = self.alloc(
+            sp,
+            TreeKind::ValDef {
+                mods: Modifiers::new(Flags::SYNTHETIC),
+                name: fun.clone(),
+                tpt: Box::new(empty_tpt),
+                rhs: Box::new(handler),
+            },
+        );
+
+        let cond = self.synth_call(sp, &fun, "isDefinedAt", &arg);
+        let thenp = self.synth_call(sp, &fun, "apply", &arg);
+        let rethrow_arg = self.alloc(sp, TreeKind::Ident { name: arg.clone() });
+        let elsep = self.alloc(
+            sp,
+            TreeKind::Throw {
+                expr: Box::new(rethrow_arg),
+            },
+        );
+        let if_ = self.alloc(
+            sp,
+            TreeKind::If {
+                cond: Box::new(cond),
+                thenp: Box::new(thenp),
+                elsep: Box::new(elsep),
+            },
+        );
+        let body = self.alloc(
+            sp,
+            TreeKind::Block {
+                stats: vec![val_def],
+                expr: Box::new(if_),
+            },
+        );
+        let guard = self.empty(sp);
+        CaseDef {
+            span: sp,
+            pat,
+            guard,
+            body,
+        }
+    }
+
+    /// `<recv>.<name>(<arg>)` over two locals, for `make_catch_from_expr`.
+    fn synth_call(&mut self, sp: Span, recv: &str, name: &str, arg: &str) -> Tree {
+        let recv = self.alloc(sp, TreeKind::Ident { name: recv.into() });
+        let sel = self.alloc(
+            sp,
+            TreeKind::Select {
+                qual: Box::new(recv),
+                name: name.into(),
+            },
+        );
+        let arg = self.alloc(sp, TreeKind::Ident { name: arg.into() });
+        self.alloc(
+            sp,
+            TreeKind::Apply {
+                fun: Box::new(sel),
+                args: vec![arg],
+            },
+        )
+    }
+
     fn parse_try(&mut self) -> Tree {
         let lo = self.span();
         self.bump();
@@ -2438,17 +2576,16 @@ impl<'a> Parser<'a> {
         if matches!(self.kind(), TokenKind::Catch) {
             self.bump();
             self.skip_nl();
-            // catch { cases } or catch expr (partial fn)
-            if matches!(self.kind(), TokenKind::LBrace) {
+            // nsc `tryExpr`: `catch { case ... }` is a list of case clauses;
+            // anything else after `catch` — including a braced expression that
+            // does not start with `case` — is a `PartialFunction` value.
+            if matches!(self.kind(), TokenKind::LBrace) && self.brace_starts_cases() {
                 self.bump();
                 catches = self.parse_cases();
                 self.expect("}", |k| matches!(k, TokenKind::RBrace));
             } else {
-                let _ = self.parse_expr();
-                self.error_span(
-                    lo,
-                    "unimplemented syntax: `catch` of a non-block expression",
-                );
+                let handler = self.parse_expr();
+                catches = vec![self.make_catch_from_expr(handler)];
             }
         }
         self.skip_nl();
@@ -3387,6 +3524,46 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// At `*` closing the last argument of an extractor pattern — `Cast(ch*)`,
+    /// the `-Xsource:3` spelling of `Cast(ch @ _*)`. A `*` with a pattern after
+    /// it is the infix extractor `p * q` instead, which nsc keeps accepting at
+    /// every source level, so only a `*` immediately before `)` counts.
+    fn at_trailing_pattern_star(&self) -> bool {
+        matches!(self.kind(), TokenKind::Ident(s) if s == "*")
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::RParen)
+            )
+    }
+
+    /// Consume that `*` and build `name @ _*`, which is what nsc rewrites
+    /// `name*` to. Off `-Xsource:3` the spelling is rejected with nsc's own
+    /// message rather than silently accepted.
+    fn finish_pattern_star(&mut self, name_span: Span, name: String) -> Tree {
+        let star_span = self.span();
+        self.bump();
+        if !self.opts.source3 {
+            self.error_span(
+                star_span,
+                "bad simple pattern: use _* to match a sequence".to_string(),
+            );
+        }
+        let wild = self.alloc(star_span, TreeKind::Wildcard);
+        let star = self.alloc(
+            star_span,
+            TreeKind::Star {
+                elem: Box::new(wild),
+            },
+        );
+        self.alloc(
+            name_span.merge(star_span),
+            TreeKind::Bind {
+                name,
+                body: Box::new(star),
+            },
+        )
+    }
+
     fn parse_simple_pattern(&mut self) -> Tree {
         self.skip_nl();
         match self.kind().clone() {
@@ -3430,6 +3607,12 @@ impl<'a> Parser<'a> {
                             elem: Box::new(wild),
                         },
                     );
+                }
+                if let TreeKind::Ident { name } = &t.kind {
+                    if self.at_trailing_pattern_star() {
+                        let name = name.clone();
+                        return self.finish_pattern_star(t.span, name);
+                    }
                 }
                 t
             }
