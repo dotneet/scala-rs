@@ -4749,14 +4749,9 @@ impl Typer {
                 } else {
                     fun_name.clone()
                 };
-                if method_name == "::" {
-                    if let Some(a0) = args.first() {
-                        ret = Type::Class {
-                            sym: self.st.list_sym,
-                            args: vec![a0.ty.widen_constant()],
-                        };
-                    }
-                } else if method_name == "->" {
+                // `::` is `[B >: A](elem: B): List[B]` (see prelude_lowbound);
+                // its result comes from ordinary lower-bounded inference.
+                if method_name == "->" {
                     if let Some(a0) = args.first() {
                         if let Some(t2) = self
                             .st

@@ -454,6 +454,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         library_abi,
     );
 
+    crate::prelude_lowbound::install(st);
+
     st.push_scope();
     st.enter_in_current("scala", st.scala_pkg);
     st.enter_in_current("java", java);
