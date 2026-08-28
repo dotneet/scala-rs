@@ -250,14 +250,15 @@ fn resolves_inherited_list_members_through_parents() {
         "filter", "sum", "mkString", "map", "flatMap", "head", "foldLeft",
     ] {
         let (found, errs) = loader.lookup(list, false, name);
-        let public: Vec<_> = found.iter().filter(|(_, m)| m.is_public_api()).collect();
+        let public: Vec<_> = found.iter().filter(|h| h.member.is_public_api()).collect();
         assert!(
             !public.is_empty(),
             "List#{name} not found via parents (load errors: {errs:?})"
         );
-        for (owner, m) in &public {
-            assert_eq!(m.kind, MemberKind::Def, "List#{name} on {owner}");
-            let r = render(&m.ty);
+        for h in &public {
+            let owner = &h.owner;
+            assert_eq!(h.member.kind, MemberKind::Def, "List#{name} on {owner}");
+            let r = render(&h.member.ty);
             assert!(!r.contains("<none>"), "List#{name} on {owner}: {r}");
         }
     }
@@ -266,23 +267,31 @@ fn resolves_inherited_list_members_through_parents() {
     // by hand today. `filter` is declared on `IterableOps` and re-declared on
     // `List` itself, so require that the search reaches the `IterableOps` one.
     let (filter, _) = loader.lookup(list, false, "filter");
-    let (owner, m) = filter
+    let hit = filter
         .iter()
-        .find(|(o, m)| o == "scala.collection.IterableOps" && m.is_public_api())
+        .find(|h| h.owner == "scala.collection.IterableOps" && h.member.is_public_api())
         .expect("IterableOps#filter reached through List's parents");
-    let r = render(&m.ty);
+    let owner = &hit.owner;
+    let r = render(&hit.member.ty);
     assert!(r.starts_with("(pred: "), "{r}");
     assert!(r.contains("scala.Function1"), "{r}");
     assert!(r.contains("scala.Boolean"), "{r}");
+    // Substituted into List's own vocabulary: `IterableOps` declares this
+    // returning its opaque `C`, which for `List` is `List[A]`.
+    assert!(
+        r.ends_with(")scala.collection.immutable.List[A]"),
+        "filter should return List[A], got {r}"
+    );
     eprintln!("List#filter (from {owner}): {r}");
 
     // `sum` is polymorphic with an implicit Numeric.
     let (sum, _) = loader.lookup(list, false, "sum");
-    let (sum_owner, sum_m) = sum
+    let sum_hit = sum
         .iter()
-        .find(|(_, m)| m.is_public_api())
+        .find(|h| h.member.is_public_api())
         .expect("public sum");
-    let sr = render(&sum_m.ty);
+    let sum_owner = &sum_hit.owner;
+    let sr = render(&sum_hit.member.ty);
     assert!(sr.starts_with("[B]"), "{sr}");
     assert!(sr.contains("implicit"), "{sr}");
     assert!(sr.contains("Numeric"), "{sr}");

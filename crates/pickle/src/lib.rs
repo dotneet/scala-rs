@@ -16,4 +16,4 @@ pub mod sym;
 
 pub use classfile::scala_signature_bytes;
 pub use read::{read_pickle, Pickle, ReadError};
-pub use sym::{class_sigs, ClassSig, ClassSource, Member, SigLoader, SigType};
+pub use sym::{class_sigs, ClassSig, ClassSource, Member, MemberHit, SigCache, SigLoader, SigType};
