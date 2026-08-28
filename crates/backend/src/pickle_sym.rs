@@ -141,8 +141,10 @@ pub struct ClassSig {
     pub parents: Vec<SigType>,
     /// Members declared directly on this class.
     pub members: Vec<Member>,
-    /// Full names of parents whose pickle we could not name (never silently
-    /// dropped, so a caller can report a real gap instead of a missing method).
+    /// References this class's types could not resolve: symbols with no
+    /// nameable owner chain, and entries a type pointed at that were not
+    /// types. Never silently dropped, so a caller can report a real gap
+    /// instead of quietly serving a wrong signature.
     pub unresolved: Vec<String>,
 }
 
@@ -326,6 +328,11 @@ impl Builder<'_> {
             // Type parameters and abstract types are only meaningful by their
             // simple name; qualifying them with the owner would be misleading.
             Some(Entry::TypeSym(i)) => self.p.name(i.name).unwrap_or("?").to_string(),
+            // `<root>` and `<empty>` terminate the owner chain, so their own
+            // full name is empty; they are resolved, not missing.
+            Some(_) if matches!(self.p.sym_name(sym), Some("<root>") | Some("<empty>")) => {
+                self.p.sym_name(sym).unwrap_or("?").to_string()
+            }
             _ => match self.p.sym_full_name(sym) {
                 Some(n) if !n.is_empty() => n,
                 _ => {
@@ -368,7 +375,11 @@ impl Builder<'_> {
             }
             Some(Entry::ConstantTpe(c)) => match self.p.entry(*c) {
                 Some(Entry::Literal(k)) => SigType::Constant(k.clone()),
-                _ => SigType::None,
+                _ => {
+                    self.unresolved
+                        .push(format!("CONSTANTtpe #{id} does not point at a literal"));
+                    SigType::None
+                }
             },
             Some(Entry::TypeRefTpe { sym, args, .. }) => {
                 let (sym, args) = (*sym, args.clone());
@@ -434,7 +445,13 @@ impl Builder<'_> {
                 let tpe = *tpe;
                 SigType::Annotated(Box::new(self.ty(tpe, d)))
             }
-            _ => SigType::None,
+            Some(other) => {
+                // A type reference pointing at something that is not a type
+                // means the pickle is not shaped the way we think it is.
+                self.unresolved
+                    .push(format!("entry #{id} is not a type: {other:?}"));
+                SigType::None
+            }
         }
     }
 }

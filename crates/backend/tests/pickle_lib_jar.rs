@@ -30,6 +30,7 @@ struct Stats {
     declared: usize,
     read: usize,
     entries: usize,
+    sigs: usize,
     /// Tags seen at least once, indexed by tag byte.
     tags: [usize; 256],
     /// `name: reason` for classes that declare a signature we could not read.
@@ -44,6 +45,7 @@ fn scan(path: &std::path::Path) -> Stats {
         declared: 0,
         read: 0,
         entries: 0,
+        sigs: 0,
         tags: [0usize; 256],
         failures: Vec::new(),
     };
@@ -71,6 +73,15 @@ fn scan(path: &std::path::Path) -> Stats {
                 st.entries += p.entries.len();
                 for &t in &p.entry_tags {
                     st.tags[t as usize] += 1;
+                }
+                // Every class signature must resolve; an unresolved reference
+                // is a hole that would otherwise surface as a wrong type.
+                for c in scala_rs_backend::pickle_sym::class_sigs(&p) {
+                    st.sigs += 1;
+                    for u in &c.unresolved {
+                        st.failures
+                            .push(format!("{name}: {}: unresolved {u}", c.full_name));
+                    }
                 }
             }
             Err(err) => st.failures.push(format!("{name}: {err}")),
@@ -145,8 +156,8 @@ fn reads_every_pickle_in_scala_library() {
         assert!(st.tags[tag as usize] > 0, "no {what} entry in the library");
     }
     eprintln!(
-        "read {} pickles ({} entries) from {} classfiles",
-        st.read, st.entries, st.classes
+        "read {} pickles ({} entries, {} class signatures) from {} classfiles",
+        st.read, st.entries, st.sigs, st.classes
     );
 }
 

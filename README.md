@@ -349,6 +349,8 @@ jar の**全 classfile**を走査して次を見ます。jar が無ければス�
   宣言している classfile（2.13.16 では 2891 個中 799 個）の pickle が**全て**読めること。
   「宣言しているか」は定数プールのディスクリプタのバイト検索という独立した判定で見るので、
   抽出漏れも失敗になる。合計 169275 エントリ。主要タグが実際に登場していることも確認する。
+  さらに全 pickle からクラスシグネチャを組み立て（2209 クラス）、
+  **未解決参照がゼロ**であること（`ClassSig::unresolved` が空）も見る。
 - `list_pickle_has_the_collection_members`: `List.class` の pickle から `List` と `map`。
 - `resolves_inherited_list_members_through_parents`: `List#filter` / `sum` / `mkString` /
   `map` / `flatMap` / `head` / `foldLeft` を**親クラスを辿って**解決できること。
