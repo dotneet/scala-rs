@@ -982,13 +982,7 @@ impl Typer {
 
     fn type_class(&mut self, tree: &mut Tree) {
         let id = tree.sym;
-        if let TreeKind::ClassDef {
-            mods,
-            name,
-            vparamss,
-            ..
-        } = &tree.kind
-        {
+        if let TreeKind::ClassDef { mods, vparamss, .. } = &tree.kind {
             if mods.flags.contains(Flags::IMPLICIT) {
                 let owner_kind = if !id.is_none() {
                     self.st.get(self.st.get(id).owner).kind
@@ -1010,9 +1004,8 @@ impl Typer {
                         "unimplemented: implicit class must have a single parameter",
                     );
                 }
-                let cname = name.clone();
-                let span = tree.span;
-                self.check_implicit_conversions_feature(span, &cname);
+                // scalac 2.13.16 does not warn for an `implicit class` even
+                // under `-feature`; only an implicit conversion method does.
             }
         }
         let saved_owner = self.st.owner;

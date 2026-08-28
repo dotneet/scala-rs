@@ -3836,7 +3836,8 @@ object Main {
         let (_, _, diags) = typecheck_str(
             r#"
 object Main {
-  implicit class Rich(n: Int) { def twice: Int = n * 2 }
+  class Rich(n: Int) { def twice: Int = n * 2 }
+  implicit def toRich(n: Int): Rich = new Rich(n)
   def main(args: Array[String]): Unit = {
     val n: Int = 2.twice
   }
