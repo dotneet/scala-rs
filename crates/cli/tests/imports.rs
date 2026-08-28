@@ -174,6 +174,30 @@ fn star_wildcard_needs_xsource3() {
     let _ = fs::remove_dir_all(&out);
 }
 
+/// `import p.{X => _, _}` hides `X` from the wildcard — including from the
+/// lazy classfile fallback, which must not smuggle it back in.
+#[test]
+fn hidden_selector_stays_hidden() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip imports hide: scala-library not available");
+        return;
+    };
+    let out = tmp_dir("hide");
+    let output = compile(
+        &["imports_pkgs", "imports_pkgs2", "imports_hide_bad"],
+        &jar,
+        &out,
+        &[],
+    );
+    assert!(!output.status.success(), "expected `B => _` to hide `B`");
+    let err = diagnostics(&output);
+    assert!(
+        err.contains("not found: value B"),
+        "expected the hidden name to stay unresolved, got {err}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
 /// An import that names nothing is an error, not a silent no-op.
 #[test]
 fn unknown_selector_is_reported() {

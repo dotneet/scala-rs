@@ -3057,7 +3057,7 @@ impl Typer {
                 }
                 self.st.enter_in_current(&n, m);
             }
-            self.st.enter_wildcard_in_current(o);
+            self.st.enter_wildcard_in_current(o, hidden);
         }
     }
 
@@ -3592,7 +3592,7 @@ impl Typer {
         if self.st.lookup(name).is_empty() {
             // `import p._` where `p` is a jar package: its classes are read one
             // at a time, so the name is only reachable now.
-            for owner in self.st.wildcard_owners() {
+            for owner in self.st.wildcard_owners_for(name) {
                 self.complete_binary_member(owner, name, span);
                 let found = self.st.lookup_member(owner, name);
                 if found.is_empty() {

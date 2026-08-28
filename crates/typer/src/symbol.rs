@@ -214,10 +214,24 @@ impl Symbol {
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
     map: HashMap<String, Vec<SymbolId>>,
-    /// Owners brought in by a wildcard import (`import p._`) in this scope.
+    /// Owners brought in by a wildcard import (`import p._`) in this scope,
+    /// with the names that selector hid (`import p.{X => _, _}`).
     /// A package read from a jar cannot be enumerated up front, so the names
     /// it offers are resolved on demand: see `Checker::expose_unqualified`.
-    wildcards: Vec<SymbolId>,
+    wildcards: Vec<WildcardImport>,
+}
+
+/// `import owner._`, minus the names hidden by `X => _` selectors.
+#[derive(Clone, Debug)]
+pub struct WildcardImport {
+    pub owner: SymbolId,
+    pub hidden: Vec<String>,
+}
+
+impl WildcardImport {
+    pub fn offers(&self, name: &str) -> bool {
+        !self.hidden.iter().any(|h| h == name)
+    }
 }
 
 impl Scope {
@@ -225,13 +239,18 @@ impl Scope {
         self.map.entry(name.to_string()).or_default().push(id);
     }
 
-    pub fn enter_wildcard(&mut self, owner: SymbolId) {
-        if !self.wildcards.contains(&owner) {
-            self.wildcards.push(owner);
+    pub fn enter_wildcard(&mut self, owner: SymbolId, hidden: &[String]) {
+        if let Some(w) = self.wildcards.iter_mut().find(|w| w.owner == owner) {
+            w.hidden.retain(|h| hidden.iter().any(|n| n == h));
+            return;
         }
+        self.wildcards.push(WildcardImport {
+            owner,
+            hidden: hidden.to_vec(),
+        });
     }
 
-    pub fn wildcards(&self) -> &[SymbolId] {
+    pub fn wildcards(&self) -> &[WildcardImport] {
         &self.wildcards
     }
 
@@ -398,17 +417,20 @@ impl SymbolTable {
     }
 
     /// Record `import owner._` in the innermost scope.
-    pub fn enter_wildcard_in_current(&mut self, owner: SymbolId) {
-        self.scopes.last_mut().unwrap().enter_wildcard(owner);
+    pub fn enter_wildcard_in_current(&mut self, owner: SymbolId, hidden: &[String]) {
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .enter_wildcard(owner, hidden);
     }
 
-    /// Wildcard-imported owners, innermost scope first.
-    pub fn wildcard_owners(&self) -> Vec<SymbolId> {
+    /// Owners a wildcard import offers `name`, innermost scope first.
+    pub fn wildcard_owners_for(&self, name: &str) -> Vec<SymbolId> {
         let mut out = Vec::new();
         for sc in self.scopes.iter().rev() {
-            for &w in sc.wildcards() {
-                if !out.contains(&w) {
-                    out.push(w);
+            for w in sc.wildcards() {
+                if w.offers(name) && !out.contains(&w.owner) {
+                    out.push(w.owner);
                 }
             }
         }
