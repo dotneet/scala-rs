@@ -1,0 +1,10 @@
+hi
+null
+2
+true
+false
+true
+43
+true
+true
+false

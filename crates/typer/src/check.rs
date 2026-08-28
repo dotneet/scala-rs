@@ -801,11 +801,49 @@ impl Typer {
         let copy = self
             .st
             .alloc("copy", class_id, SymKind::Method, Flags::SYNTHETIC, "");
-        let ptys: Vec<Type> = fields.iter().map(|_| Type::NoType).collect();
+        // `copy`'s own parameter symbols are distinct from `ctor_fields`: reusing
+        // the constructor's field symbols directly (as the companion `apply`
+        // does below) would mean giving them `DEFAULTPARAM` + a `this.field`
+        // default, which would then also apply to `apply`/`<init>` calls where
+        // there is no `this` to default from. Each param defaults to the
+        // matching field of the receiver, exactly like nsc's synthesized
+        // `copy$default$N` getters (built by `synthesize_default_getters` below,
+        // the same machinery a user-written `def f(x: Int = 5)` uses).
+        let copy_params: Vec<SymbolId> = fields
+            .iter()
+            .map(|f| {
+                let fname = self.st.get(*f).name.clone();
+                let fty = self.st.get(*f).ty.clone();
+                let pid = self.st.alloc(
+                    &fname,
+                    copy,
+                    SymKind::Term,
+                    Flags::PARAM.with(Flags::DEFAULTPARAM),
+                    "",
+                );
+                self.st.get_mut(pid).ty = fty;
+                let this_tree = Tree::dummy(TreeKind::This { qual: None });
+                let default_rhs = Tree::dummy(TreeKind::Select {
+                    qual: Box::new(this_tree),
+                    name: fname,
+                });
+                self.st.get_mut(pid).default_rhs = Some(default_rhs);
+                pid
+            })
+            .collect();
+        let ptys: Vec<Type> = copy_params
+            .iter()
+            .map(|p| self.st.get(*p).ty.clone())
+            .collect();
+        self.st.get_mut(copy).params = copy_params.clone();
+        self.st.get_mut(copy).paramss = vec![copy_params.clone()];
         self.st.get_mut(copy).ty = Type::Method {
             paramss: vec![ptys],
             ret: Box::new(class_ty.clone()),
         };
+        // Field types are not resolved yet at this point in the namer pass;
+        // `type_class` re-syncs `copy`'s param types from the real ctor
+        // signature and synthesizes `copy$default$N` there instead.
         let _ = self.st.alloc(
             "productArity",
             class_id,
@@ -1152,6 +1190,16 @@ impl Typer {
                 ct.push(p.ty.clone());
                 if !p.sym.is_none() {
                     self.st.get_mut(p.sym).ty = p.ty.clone();
+                    // `type_val_sig` sets the `DEFAULTPARAM` flag but (unlike
+                    // `type_def_sig` for ordinary methods) never captures the
+                    // default value tree itself — a ctor param default
+                    // (`class Foo(x: Int, y: Int = 5)`) would otherwise never
+                    // get filled in at a `new Foo(1)` call site.
+                    if let TreeKind::ValDef { mods, rhs, .. } = &p.kind {
+                        if mods.flags.contains(Flags::DEFAULTPARAM) && !rhs.is_empty() {
+                            self.st.get_mut(p.sym).default_rhs = Some((**rhs).clone());
+                        }
+                    }
                     ids.push(p.sym);
                     all_ctor_params.push(p.sym);
                 }
@@ -1172,6 +1220,48 @@ impl Typer {
                         paramss: paramss_ty.clone(),
                         ret: Box::new(Type::Unit),
                     };
+                    // Unlike an ordinary method's `name$default$N` getters, a
+                    // constructor default can't be an instance method on the
+                    // class being constructed (there is no receiver yet at
+                    // `new Foo(1)`; nsc emits these on the companion instead).
+                    // `default_getter_apply`'s receiver logic assumes an
+                    // existing instance, so it doesn't fit constructors —
+                    // deliberately not calling `synthesize_default_getters`
+                    // here. `fill_defaults_and_implicits` still fills the
+                    // omitted arg via the raw `default_rhs` fallback above,
+                    // typed directly at the call site; this covers simple
+                    // defaults (literals, `null`, ...) but not one referring
+                    // to an earlier ctor param, which would need real
+                    // companion-based getters (not implemented here).
+                }
+            }
+        }
+        // `copy`'s parameter symbols (allocated in `synthesize_case_members`,
+        // during the namer pass, before ctor param types are known) still hold
+        // `Type::NoType` until now. Re-sync them from the just-resolved field
+        // types, then (re)build `copy$default$N` — this is also the first time
+        // `synthesize_default_getters` runs for `copy`, since doing it any
+        // earlier would have baked in the same `NoType` placeholders.
+        if !id.is_none() && self.st.get(id).flags.contains(Flags::CASE) {
+            let all_ctor_param_tys: Vec<Type> = paramss_ty.iter().flatten().cloned().collect();
+            if let Some(copy_id) = self.st.get(id).members.iter().copied().find(|&m| {
+                self.st.get(m).kind == SymKind::Method
+                    && self.st.get(m).name == "copy"
+                    && self.st.get(m).flags.contains(Flags::SYNTHETIC)
+            }) {
+                let copy_params = self.st.get(copy_id).params.clone();
+                if copy_params.len() == all_ctor_param_tys.len() {
+                    for (pid, ty) in copy_params.iter().zip(all_ctor_param_tys.iter()) {
+                        self.st.get_mut(*pid).ty = ty.clone();
+                    }
+                    self.st.get_mut(copy_id).ty = Type::Method {
+                        paramss: vec![all_ctor_param_tys],
+                        ret: Box::new(Type::Class {
+                            sym: id,
+                            args: vec![],
+                        }),
+                    };
+                    self.synthesize_default_getters(id, copy_id, "copy", &[], &[copy_params]);
                 }
             }
         }

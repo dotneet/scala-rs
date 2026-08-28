@@ -94,28 +94,128 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         &[Type::AnyRef],
     );
     mark_java(st, throwable);
+    let throwable_ty = Type::Class {
+        sym: throwable,
+        args: vec![],
+    };
+    // `java.lang.Throwable`'s public constructors and the handful of methods
+    // slick code actually calls (`getMessage`, `getCause`, `printStackTrace`).
+    // Verified against `javap -p java.lang.Throwable`. `Exception` /
+    // `RuntimeException` get their own copies of the same four constructor
+    // shapes below — constructors are not inherited in Java/Scala, so relying
+    // on `lookup_member`'s parent walk here (correct for ordinary methods)
+    // would be wrong even though these three classes happen to share the
+    // same shapes. `getMessage` etc. *are* ordinary inherited methods, so
+    // they only need to exist once, on `Throwable`.
+    for params in [
+        vec![],
+        vec![Type::String],
+        vec![Type::String, throwable_ty.clone()],
+        vec![throwable_ty.clone()],
+    ] {
+        method(
+            st,
+            throwable,
+            "<init>",
+            params,
+            throwable_ty.clone(),
+            Intrinsic::None,
+        );
+    }
+    method(
+        st,
+        throwable,
+        "getMessage",
+        vec![],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        throwable,
+        "getLocalizedMessage",
+        vec![],
+        Type::String,
+        Intrinsic::None,
+    );
+    method(
+        st,
+        throwable,
+        "getCause",
+        vec![],
+        throwable_ty.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        throwable,
+        "initCause",
+        vec![throwable_ty.clone()],
+        throwable_ty.clone(),
+        Intrinsic::None,
+    );
+    method(
+        st,
+        throwable,
+        "printStackTrace",
+        vec![],
+        Type::Unit,
+        Intrinsic::None,
+    );
     let exception = class(
         st,
         java_lang,
         "Exception",
         "java/lang/Exception",
-        &[Type::Class {
-            sym: throwable,
-            args: vec![],
-        }],
+        &[throwable_ty.clone()],
     );
     mark_java(st, exception);
+    let exception_ty = Type::Class {
+        sym: exception,
+        args: vec![],
+    };
+    for params in [
+        vec![],
+        vec![Type::String],
+        vec![Type::String, throwable_ty.clone()],
+        vec![throwable_ty.clone()],
+    ] {
+        method(
+            st,
+            exception,
+            "<init>",
+            params,
+            exception_ty.clone(),
+            Intrinsic::None,
+        );
+    }
     let _runtime_ex = class(
         st,
         java_lang,
         "RuntimeException",
         "java/lang/RuntimeException",
-        &[Type::Class {
-            sym: exception,
-            args: vec![],
-        }],
+        &[exception_ty],
     );
     mark_java(st, _runtime_ex);
+    let runtime_ex_ty = Type::Class {
+        sym: _runtime_ex,
+        args: vec![],
+    };
+    for params in [
+        vec![],
+        vec![Type::String],
+        vec![Type::String, throwable_ty.clone()],
+        vec![throwable_ty],
+    ] {
+        method(
+            st,
+            _runtime_ex,
+            "<init>",
+            params,
+            runtime_ex_ty.clone(),
+            Intrinsic::None,
+        );
+    }
     let jclass = class(st, java_lang, "Class", "java/lang/Class", &[Type::AnyRef]);
     mark_java(st, jclass);
     let class_t = type_param(st, jclass, "T");
@@ -194,6 +294,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     add_double_members(st);
     add_float_members(st);
     add_bool_members(st);
+    crate::prelude_numeric::install(st, library_abi);
     add_string_members(st, library_abi);
     add_array_members(st);
     let with_filter = add_with_filter(st);
@@ -1216,7 +1317,10 @@ fn add_any_members(st: &mut SymbolTable) {
         Type::String,
         Intrinsic::AnyToString,
     );
-    method(
+    // nsc `Any.asInstanceOf[T0]: T0` / `Any.isInstanceOf[T0]: Boolean` are
+    // generic over the explicit type argument: `x.asInstanceOf[String]` must
+    // type as `String`, not `Any`.
+    let as_instance_of = method(
         st,
         any,
         "asInstanceOf",
@@ -1224,7 +1328,13 @@ fn add_any_members(st: &mut SymbolTable) {
         Type::Any,
         Intrinsic::AsInstanceOf,
     );
-    method(
+    let aio_t = type_param(st, as_instance_of, "T0");
+    st.get_mut(as_instance_of).tparams = vec![aio_t];
+    st.get_mut(as_instance_of).ty = Type::Method {
+        paramss: Vec::new(),
+        ret: Box::new(Type::TypeParam(aio_t)),
+    };
+    let is_instance_of = method(
         st,
         any,
         "isInstanceOf",
@@ -1232,6 +1342,8 @@ fn add_any_members(st: &mut SymbolTable) {
         Type::Boolean,
         Intrinsic::IsInstanceOf,
     );
+    let iio_t = type_param(st, is_instance_of, "T0");
+    st.get_mut(is_instance_of).tparams = vec![iio_t];
     // nsc `Any.synchronized[T0](body: => T0): T0`
     let sync = method(
         st,

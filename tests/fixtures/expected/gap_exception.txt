@@ -1,0 +1,5 @@
+boom
+true
+boom2
+cause
+thrown

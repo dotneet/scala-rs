@@ -13,6 +13,7 @@ mod prelude_arrconv;
 mod prelude_coll;
 mod prelude_either;
 mod prelude_lowbound;
+mod prelude_numeric;
 mod prelude_reflect;
 mod prelude_seq;
 mod prelude_text;

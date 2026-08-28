@@ -503,6 +503,9 @@ impl SymbolTable {
             Type::AnyRef => Some(self.anyref_sym),
             Type::AnyVal => Some(self.anyval_sym),
             Type::Array(_) => Some(self.array_sym),
+            // `Null` is a subtype of every reference type; its members are
+            // `AnyRef`'s.
+            Type::Null => Some(self.anyref_sym),
             // A trait and its companion share a name; in type position the
             // class wins, so `object B extends B` does not become its own
             // parent.
@@ -514,7 +517,12 @@ impl SymbolTable {
                     .find(|s| self.get(*s).kind == SymKind::Class)
                     .or_else(|| found.into_iter().find(|s| self.get(*s).is_class_like()))
             }
-            Type::TypeParam(_) => None,
+            // An unbounded type parameter's members are `Any`'s; a bounded one
+            // resolves through its bound, as in nsc.
+            Type::TypeParam(id) => match &self.get(*id).bound_hi {
+                Some(hi) => self.class_sym_of(hi),
+                None => Some(self.any_sym),
+            },
             Type::Applied { ctor, .. } => self.class_sym_of(ctor),
             Type::TypeMember(id) => {
                 if !self.get(*id).tparams.is_empty() {
