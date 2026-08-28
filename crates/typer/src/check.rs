@@ -103,6 +103,10 @@ pub struct Typer {
     language_implicit_conversions: bool,
     binary: BinaryIndex,
     completed_java: HashSet<String>,
+    /// While a template's parent list is being typed: `(the class, the class
+    /// that encloses it)`. nsc types parents in the *outer* context, so
+    /// `class B extends super.B` inside `trait Mid` means `Mid`'s `super`.
+    parent_ctx: Option<(SymbolId, SymbolId)>,
     /// Fills library members the hand-written prelude does not declare, from
     /// their `ScalaSignature` pickles. Only consulted when resolution failed.
     pickle: crate::pickle_supply::PickleSupply,
@@ -178,6 +182,7 @@ impl Typer {
             ),
             binary: BinaryIndex::from_user_paths(opts.binary_path.clone()),
             completed_java: HashSet::new(),
+            parent_ctx: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
         }
     }
@@ -1132,10 +1137,12 @@ impl Typer {
             }
         }
         let mut pts = Vec::new();
+        let saved_parent_ctx = self.parent_ctx.replace((id, saved_this));
         for p in parents.iter_mut() {
             self.type_parent(p);
             pts.push(p.ty.clone());
         }
+        self.parent_ctx = saved_parent_ctx;
         if !pts.is_empty() {
             self.st.get_mut(id).parents = pts;
         }
@@ -1269,10 +1276,12 @@ impl Typer {
             _ => return,
         };
         let mut pts = Vec::new();
+        let saved_parent_ctx = self.parent_ctx.replace((cls, saved_this));
         for p in parents.iter_mut() {
             self.type_expr(p, &Type::NoType);
             pts.push(p.ty.clone());
         }
+        self.parent_ctx = saved_parent_ctx;
         if !pts.is_empty() {
             self.st.get_mut(cls).parents = pts;
         }
@@ -7496,6 +7505,20 @@ impl Typer {
         }
     }
 
+    /// The class whose parents a bare `super` names. Normally the enclosing
+    /// class; inside a template's own parent list it is the class *around*
+    /// that template, since a class cannot name its own `super` there.
+    fn super_owner(&self, qual: Option<&str>) -> SymbolId {
+        let base = match self.parent_ctx {
+            Some((inner, outer)) if inner == self.st.this_class => outer,
+            _ => self.st.this_class,
+        };
+        match qual {
+            Some(name) => self.st.enclosing_class_named(base, name).unwrap_or(base),
+            None => base,
+        }
+    }
+
     fn super_target(&self, this_id: SymbolId, mix: Option<&str>) -> SymbolId {
         if this_id.is_none() {
             return SymbolId::NONE;
@@ -8192,7 +8215,7 @@ impl Typer {
 
     fn is_stable_path(&self, t: &Tree) -> bool {
         match &t.kind {
-            TreeKind::This { .. } => true,
+            TreeKind::This { .. } | TreeKind::Super { .. } => true,
             TreeKind::Ident { name } => self.ident_is_stable(name),
             TreeKind::Select { qual, name } => {
                 self.is_stable_path(qual) && self.member_is_stable(qual, name)
@@ -8347,6 +8370,12 @@ impl Typer {
                 } else {
                     Some(self.st.type_of_class(self.st.this_class))
                 }
+            }
+            // `super.T` in type position: the member is looked up in the
+            // parent `super` names, so the prefix is that parent's type.
+            TreeKind::Super { qual, mix } => {
+                let parent = self.super_target(self.super_owner(qual.as_deref()), mix.as_deref());
+                (!parent.is_none()).then(|| self.st.type_of_class(parent))
             }
             TreeKind::Ident { name } => {
                 let found = self.st.lookup(name);

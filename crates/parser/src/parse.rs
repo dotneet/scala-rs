@@ -2084,6 +2084,22 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// `super` / `super[Mix]`, already positioned on the `super` token.
+    /// `qual` is the `C` of `C.super`, if there was one.
+    fn parse_super_ref(&mut self, qual: Option<String>) -> Tree {
+        let sp = self.span();
+        self.bump();
+        let mix = if matches!(self.kind(), TokenKind::LBracket) {
+            self.bump();
+            let n = self.expect_ident().0;
+            self.expect("]", |k| matches!(k, TokenKind::RBracket));
+            Some(n)
+        } else {
+            None
+        };
+        self.alloc(sp.merge(self.prev_span()), TreeKind::Super { qual, mix })
+    }
+
     fn parse_simple_type(&mut self) -> Tree {
         self.skip_nl();
         if let Some(lit) = self.parse_constant_type_lit() {
@@ -2139,6 +2155,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.alloc(sp, TreeKind::This { qual: None })
             }
+            // nsc `StableId`: `super.T` / `super[Mix].T` reach a type member of
+            // a parent (`override def createUpsertBuilder(…): super.InsertBuilder`).
+            // The `.T` is picked up by the `Dot` arm of the loop below.
+            TokenKind::Super => self.parse_super_ref(None),
             _ => self.parse_path(),
         };
         // nsc SimpleType: dots belong to StableId *before* TypeArgs. After
@@ -2159,6 +2179,11 @@ impl<'a> Parser<'a> {
                         t.span.merge(sp),
                         TreeKind::SingletonTypeTree { ref_: Box::new(t) },
                     );
+                    continue;
+                }
+                if matches!(self.kind(), TokenKind::Super) {
+                    let qual = t.name().map(|s| s.to_string());
+                    t = self.parse_super_ref(qual);
                     continue;
                 }
                 let (name, sp) = self.expect_ident();

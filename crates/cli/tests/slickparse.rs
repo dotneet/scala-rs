@@ -188,6 +188,16 @@ fn pattern_star_needs_xsource3() {
     );
 }
 
+// ------------------------------------------------ `super.T` in type position
+
+/// `def createUpsertBuilder(node: Insert): super.InsertBuilder` — a path to a
+/// type member of a parent. Also `C.super.T`, and `super.T` as a parent in an
+/// `extends` clause, where the `super` is the *enclosing* class's.
+#[test]
+fn super_in_type_position() {
+    same_as_scalac("slickparse_super_type", &[]);
+}
+
 #[test]
 fn pattern_star_rejected_at_source_2_13() {
     fails_with(
