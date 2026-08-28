@@ -5097,7 +5097,7 @@ impl Typer {
         };
         let name = self.st.get(sym).name.as_str();
         let either = self.scala_class_named("Either")?;
-        if is_right_biased_either(name) {
+        if is_right_biased_either(&self.st, sym) {
             Some(Type::Class {
                 sym: either,
                 args: vec![targs[0].clone(), to],
@@ -5161,7 +5161,7 @@ impl Typer {
             // 2.13's `Either` is right-biased: `map` / `flatMap` / `foreach`
             // see the `B` of `Either[A, B]`, not the `A`.
             Type::Class { sym, args }
-                if args.len() == 2 && is_right_biased_either(&self.st.get(*sym).name) =>
+                if args.len() == 2 && is_right_biased_either(&self.st, *sym) =>
             {
                 Some(args[1].clone())
             }
@@ -9112,9 +9112,16 @@ fn is_function_pt(pt: &Type) -> bool {
 }
 
 /// `scala.util.Either` and its two cases. 2.13 made them right-biased, so the
-/// "element" of an `Either[A, B]` is its `B`.
-fn is_right_biased_either(name: &str) -> bool {
-    matches!(name, "Either" | "Left" | "Right")
+/// "element" of an `Either[A, B]` is its `B`. Matched by JVM name so a user
+/// class that happens to be called `Either` keeps the ordinary rule.
+fn is_right_biased_either(st: &SymbolTable, id: SymbolId) -> bool {
+    if id.is_none() {
+        return false;
+    }
+    matches!(
+        st.get(id).jvm_name.as_str(),
+        "scala/util/Either" | "scala/util/Left" | "scala/util/Right"
+    )
 }
 
 /// The parser desugars `{ case … }` into `x$pf => x$pf match { case … }`.
