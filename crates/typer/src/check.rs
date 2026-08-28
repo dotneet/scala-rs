@@ -1994,11 +1994,14 @@ impl Typer {
         self.st.get_mut(tree.sym).tparams = tp_ids.clone();
         let mut view_work: Vec<(SymbolId, Vec<Tree>, Span, bool)> = Vec::new();
         let mut ctx_work: Vec<(SymbolId, Vec<Tree>, Span, bool)> = Vec::new();
+        let mut bound_work: Vec<(SymbolId, Option<Tree>, Option<Tree>)> = Vec::new();
         for (i, tp) in tparams.iter().enumerate() {
             if let TreeKind::TypeDef {
                 views,
                 ctx_bounds,
                 tparams: inner,
+                lo,
+                hi,
                 ..
             } = &tp.kind
             {
@@ -2008,6 +2011,29 @@ impl Typer {
                 }
                 if !ctx_bounds.is_empty() {
                     ctx_work.push((tp_ids[i], ctx_bounds.clone(), tp.span, hk));
+                }
+                if lo.is_some() || hi.is_some() {
+                    bound_work.push((
+                        tp_ids[i],
+                        lo.as_ref().map(|t| (**t).clone()),
+                        hi.as_ref().map(|t| (**t).clone()),
+                    ));
+                }
+            }
+        }
+        // `[B >: A]` / `[A <: Named]`: remember the bounds on the type parameter
+        // symbol so inference can widen to the lower bound and check the upper one.
+        for (tp_id, lo, hi) in bound_work {
+            let lo_ty = lo.map(|t| self.tree_to_type(&t));
+            let hi_ty = hi.map(|t| self.tree_to_type(&t));
+            if let Some(t) = lo_ty {
+                if !t.is_error() {
+                    self.st.get_mut(tp_id).bound_lo = Some(t);
+                }
+            }
+            if let Some(t) = hi_ty {
+                if !t.is_error() {
+                    self.st.get_mut(tp_id).bound_hi = Some(t);
                 }
             }
         }
@@ -4354,7 +4380,7 @@ impl Typer {
                     };
                     for (i, tp) in tps.iter().enumerate() {
                         inferred_args.push(
-                            unify_tparam(*tp, &unify_params, &arg_tys)
+                            self.unify_tparam_all(*tp, &unify_params, &arg_tys)
                                 .or_else(|| pt_args.get(i).cloned())
                                 .unwrap_or(Type::Any),
                         );
@@ -4479,7 +4505,12 @@ impl Typer {
                         }
                     }
                     if !self.st.get(sym).tparams.is_empty() {
-                        let inst = self.infer_method_tparams(sym, &param_tys, &arg_tys);
+                        let inst = self.infer_method_tparams_in(
+                            sym,
+                            &param_tys,
+                            &arg_tys,
+                            recv_ty.as_ref(),
+                        );
                         // nsc leaves `tryBreakable { throw … }`'s T undetermined
                         // (Nothing is bottom). `catchBreak { println }` then
                         // instantiates T from the handler, not from Nothing.
@@ -4491,6 +4522,13 @@ impl Typer {
                         } else {
                             inst
                         };
+                        self.check_tparam_bounds(
+                            sym,
+                            &inst,
+                            recv_ty.as_ref(),
+                            tree.span,
+                            true,
+                        );
                         if !inst.is_empty() {
                             let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
                             let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
@@ -5107,20 +5145,175 @@ impl Typer {
             .unwrap_or(SymbolId::NONE)
     }
 
+    /// Least upper bound, with the numeric widenings nsc applies before lubbing
+    /// (`lub(Int, Long) = Long`).
+    pub(crate) fn lub_ty(&self, a: &Type, b: &Type) -> Type {
+        if let Some(t) = numeric_widen(a, b).or_else(|| numeric_widen(b, a)) {
+            return t;
+        }
+        self.st.lub(a, b)
+    }
+
+    /// Unify `tp` against every argument, not just the first match, and join the
+    /// results. Needed for repeated parameters (`List(Circle(1), Rect(2, 3))`)
+    /// and for `def f[A](x: A, y: A)`.
+    fn unify_tparam_all(&self, tp: SymbolId, params: &[Type], args: &[Type]) -> Option<Type> {
+        let mut acc: Option<Type> = None;
+        for (i, a) in args.iter().enumerate() {
+            let Some(p) = param_at(params, i) else {
+                break;
+            };
+            if let Some(t) = unify_one(tp, p, a) {
+                acc = Some(match acc {
+                    None => t,
+                    Some(prev) => self.lub_ty(&prev, &t),
+                });
+            }
+        }
+        acc
+    }
+
+    /// The declared lower bound of `tp`, as seen from the receiver type
+    /// (`List[Rect].::[B >: A]` has `B >: Rect`). `None` when there is no bound
+    /// or when it is still expressed in terms of unresolved type parameters.
+    fn tparam_lower_bound(
+        &self,
+        method: SymbolId,
+        tp: SymbolId,
+        recv: Option<&Type>,
+    ) -> Option<Type> {
+        let lo = self.st.get(tp).bound_lo.clone()?;
+        let lo = match recv {
+            Some(Type::Class { args, .. }) if !args.is_empty() => {
+                let owner = self.st.get(method).owner;
+                self.st.subst_tparams(owner, args, &lo)
+            }
+            _ => lo,
+        };
+        if lo.is_no_type() || lo.is_error() || matches!(lo, Type::Nothing) || mentions_tparam(&lo) {
+            return None;
+        }
+        Some(lo)
+    }
+
     fn infer_method_tparams(
         &self,
         method: SymbolId,
         param_tys: &[Type],
         arg_tys: &[Type],
     ) -> Vec<(SymbolId, Type)> {
+        self.infer_method_tparams_in(method, param_tys, arg_tys, None)
+    }
+
+    /// Method type-parameter inference. `recv` is the receiver type, used to
+    /// read `[B >: A]` lower bounds as seen from the receiver.
+    fn infer_method_tparams_in(
+        &self,
+        method: SymbolId,
+        param_tys: &[Type],
+        arg_tys: &[Type],
+        recv: Option<&Type>,
+    ) -> Vec<(SymbolId, Type)> {
         let tps = self.st.get(method).tparams.clone();
         let mut out = Vec::new();
         for tp in tps {
-            if let Some(t) = unify_tparam(tp, param_tys, arg_tys) {
-                out.push((tp, t));
+            let inferred = self.unify_tparam_all(tp, param_tys, arg_tys);
+            let lo = self.tparam_lower_bound(method, tp, recv);
+            match (inferred, lo) {
+                (Some(t), Some(lo)) => out.push((tp, self.lub_ty(&t, &lo))),
+                (Some(t), None) => out.push((tp, t)),
+                (None, Some(lo)) => out.push((tp, lo)),
+                (None, None) => {}
             }
         }
         out
+    }
+
+    /// nsc's "inferred type arguments … do not conform to … type parameter bounds".
+    fn check_tparam_bounds(
+        &mut self,
+        method: SymbolId,
+        inst: &[(SymbolId, Type)],
+        recv: Option<&Type>,
+        span: Span,
+        inferred: bool,
+    ) {
+        let tps = self.st.get(method).tparams.clone();
+        if tps.is_empty() || inst.is_empty() {
+            return;
+        }
+        let owner = self.st.get(method).owner;
+        let recv_args: Vec<Type> = match recv {
+            Some(Type::Class { args, .. }) => args.clone(),
+            _ => Vec::new(),
+        };
+        let ids: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+        let vals: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+        let mut bad = false;
+        for (tp, actual) in inst {
+            if actual.is_error() || actual.is_no_type() {
+                continue;
+            }
+            for (bound, upper) in [
+                (self.st.get(*tp).bound_hi.clone(), true),
+                (self.st.get(*tp).bound_lo.clone(), false),
+            ] {
+                let Some(bound) = bound else { continue };
+                let bound = if recv_args.is_empty() {
+                    bound
+                } else {
+                    self.st.subst_tparams(owner, &recv_args, &bound)
+                };
+                let bound = crate::symbol::subst_tparams_slice(&ids, &vals, &bound);
+                if bound.is_error() || bound.is_no_type() || mentions_tparam(&bound) {
+                    continue;
+                }
+                let ok = if upper {
+                    self.st.is_sub_type(actual, &bound)
+                } else {
+                    self.st.is_sub_type(&bound, actual)
+                };
+                if !ok {
+                    bad = true;
+                }
+            }
+        }
+        if !bad {
+            return;
+        }
+        let args_s = inst
+            .iter()
+            .map(|(_, t)| self.st.display_type(t))
+            .collect::<Vec<_>>()
+            .join(",");
+        let bounds_s = tps
+            .iter()
+            .map(|tp| self.tparam_bounds_string(*tp))
+            .collect::<Vec<_>>()
+            .join(",");
+        let name = self.st.get(method).name.clone();
+        let what = if inferred {
+            "inferred type arguments"
+        } else {
+            "type arguments"
+        };
+        self.error(
+            span,
+            format!(
+                "{what} [{args_s}] do not conform to method {name}'s type parameter bounds [{bounds_s}]"
+            ),
+        );
+    }
+
+    fn tparam_bounds_string(&self, tp: SymbolId) -> String {
+        let mut s = self.st.get(tp).name.clone();
+        if let Some(lo) = self.st.get(tp).bound_lo.clone() {
+            s.push_str(&format!(" >: {}", self.st.display_type(&lo)));
+        }
+        if let Some(hi) = self.st.get(tp).bound_hi.clone() {
+            s.push_str(&format!(" <: {}", self.st.display_type(&hi)));
+        }
+        s
     }
 
     /// `Left.apply` / `Right.apply` → `Left[A, B]` / `Right[A, B]`.
@@ -9601,13 +9794,22 @@ fn param_at(params: &[Type], i: usize) -> Option<&Type> {
     }
 }
 
-fn unify_tparam(tp: SymbolId, params: &[Type], args: &[Type]) -> Option<Type> {
-    for (p, a) in params.iter().zip(args) {
-        if let Some(t) = unify_one(tp, p, a) {
-            return Some(t);
+/// Whether `ty` still mentions a type parameter, i.e. is not a proper type yet.
+fn mentions_tparam(ty: &Type) -> bool {
+    match ty {
+        Type::TypeParam(_) => true,
+        Type::Class { args, .. } | Type::Tuple(args) => args.iter().any(mentions_tparam),
+        Type::Applied { ctor, args } => {
+            mentions_tparam(ctor) || args.iter().any(mentions_tparam)
         }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            mentions_tparam(t)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(mentions_tparam) || mentions_tparam(ret)
+        }
+        _ => false,
     }
-    None
 }
 
 /// True when `args` instantiate `tps` rather than still mentioning them

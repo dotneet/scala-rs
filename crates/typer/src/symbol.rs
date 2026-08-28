@@ -630,6 +630,96 @@ impl SymbolTable {
         None
     }
 
+    /// Base types of `t` (its parents, transitively), most specific first,
+    /// with the owning class's type parameters substituted away.
+    /// `t` itself is not included.
+    pub fn base_type_seq(&self, t: &Type) -> Vec<Type> {
+        let mut out: Vec<Type> = Vec::new();
+        let mut seen: Vec<Type> = vec![t.clone()];
+        let mut queue: std::collections::VecDeque<Type> = std::collections::VecDeque::new();
+        queue.push_back(t.clone());
+        let mut guard = 0usize;
+        while let Some(cur) = queue.pop_front() {
+            guard += 1;
+            if guard > 256 {
+                break;
+            }
+            let (sym, args) = match &cur {
+                Type::Class { sym, args } => (*sym, args.clone()),
+                Type::ModuleRef(s) | Type::ThisType(s) => (*s, Vec::new()),
+                _ => continue,
+            };
+            let s = self.get(sym);
+            let tps = s.tparams.clone();
+            for p in s.parents.clone() {
+                let p = subst_tparams_slice(&tps, &args, &p);
+                if seen.contains(&p) {
+                    continue;
+                }
+                seen.push(p.clone());
+                out.push(p.clone());
+                queue.push_back(p);
+            }
+        }
+        out
+    }
+
+    /// Least upper bound of two types, used for `[B >: A]` inference and for
+    /// varargs element types. Walks the parent chain, so
+    /// `lub(Circle, Rect) = Shape` for a sealed `Shape` hierarchy.
+    pub fn lub(&self, a: &Type, b: &Type) -> Type {
+        let a = a.widen_constant();
+        let b = b.widen_constant();
+        if a == b {
+            return a;
+        }
+        if a.is_error() || a.is_no_type() || matches!(a, Type::Nothing) {
+            return b;
+        }
+        if b.is_error() || b.is_no_type() || matches!(b, Type::Nothing) {
+            return a;
+        }
+        if self.is_sub_type(&a, &b) {
+            return b;
+        }
+        if self.is_sub_type(&b, &a) {
+            return a;
+        }
+        // Same class constructor, differing arguments: join the arguments.
+        if let (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) = (&a, &b) {
+            if s1 == s2 && !a1.is_empty() && a1.len() == a2.len() {
+                let tparams = self.get(*s1).tparams.clone();
+                let contra = a1.iter().enumerate().any(|(i, _)| {
+                    tparams
+                        .get(i)
+                        .map(|&tp| self.get(tp).flags.contains(Flags::CONTRAVARIANT))
+                        .unwrap_or(false)
+                });
+                if !contra {
+                    let joined: Vec<Type> =
+                        a1.iter().zip(a2.iter()).map(|(x, y)| self.lub(x, y)).collect();
+                    return Type::Class {
+                        sym: *s1,
+                        args: joined,
+                    };
+                }
+            }
+        }
+        for cand in self.base_type_seq(&a) {
+            if matches!(cand, Type::Any | Type::AnyRef | Type::AnyVal) {
+                continue;
+            }
+            if self.is_sub_type(&b, &cand) {
+                return cand;
+            }
+        }
+        if self.is_sub_type(&a, &Type::AnyRef) && self.is_sub_type(&b, &Type::AnyRef) {
+            Type::AnyRef
+        } else {
+            Type::Any
+        }
+    }
+
     pub fn is_sub_type(&self, a: &Type, b: &Type) -> bool {
         if a == b {
             return true;
