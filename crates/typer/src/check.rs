@@ -1597,6 +1597,12 @@ impl Typer {
                 if n.ends_with('$') || n == "<init>" {
                     continue;
                 }
+                // A parent's type parameters are not inherited names; entering
+                // them would shadow a same-named parameter of an enclosing
+                // method (`def wrap[A](…) = new Show[A] { … }`).
+                if self.st.get(m).kind == SymKind::TypeParam {
+                    continue;
+                }
                 self.st.enter_in_current(&n, m);
             }
             work.extend(self.st.get(pid).parents.clone());
