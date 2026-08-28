@@ -1095,7 +1095,10 @@ fn parse_field_ty_java(st: &mut SymbolTable, s: &str) -> (Type, usize) {
                 Type::String
             } else if inner == "java/lang/Object" {
                 Type::Any
-            } else if inner.starts_with("java/") || inner.starts_with("javax/") {
+            } else if inner.contains('/') && !inner.starts_with("scala/") {
+                // A descriptor names one exact class. Looking the simple name
+                // up in scope instead produced a second, unrelated symbol for
+                // `org/slf4j/Logger` whenever it was not already in scope.
                 Type::Class {
                     sym: find_or_stub_java_class(st, inner),
                     args: vec![],
