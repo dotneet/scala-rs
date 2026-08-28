@@ -262,3 +262,8 @@ fn missing_typeclass_instance_is_an_error() {
 fn primitive_to_string_runs() {
     run_both("prim_tostring");
 }
+
+#[test]
+fn numeric_widening_runs() {
+    run_both("num_widen");
+}

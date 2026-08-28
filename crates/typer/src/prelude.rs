@@ -1252,6 +1252,7 @@ fn add_int_members(st: &mut SymbolTable) {
     method(st, c, "unary_-", vec![], Type::Int, Intrinsic::IntUn("-"));
     method(st, c, "unary_~", vec![], Type::Int, Intrinsic::IntUn("~"));
     method(st, c, "toLong", vec![], Type::Long, Intrinsic::IntToLong);
+    method(st, c, "toFloat", vec![], Type::Float, Intrinsic::IntToFloat);
     method(
         st,
         c,
@@ -1319,6 +1320,14 @@ fn add_long_members(st: &mut SymbolTable) {
         Type::Double,
         Intrinsic::LongToDouble,
     );
+    method(
+        st,
+        c,
+        "toFloat",
+        vec![],
+        Type::Float,
+        Intrinsic::LongToFloat,
+    );
 }
 
 fn add_double_members(st: &mut SymbolTable) {
@@ -1354,6 +1363,14 @@ fn add_double_members(st: &mut SymbolTable) {
 
 fn add_float_members(st: &mut SymbolTable) {
     let c = st.float_sym;
+    method(
+        st,
+        c,
+        "toDouble",
+        vec![],
+        Type::Double,
+        Intrinsic::FloatToDouble,
+    );
     method(
         st,
         c,

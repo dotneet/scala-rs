@@ -58,6 +58,10 @@ pub enum Intrinsic {
     AnyNe,
     /// `Any.synchronized` (monitor enter/exit around a by-name body).
     Synchronized,
+    /// Numeric widening the JVM needs an instruction for.
+    IntToFloat,
+    LongToFloat,
+    FloatToDouble,
     /// `TupleN.apply` — nsc allocates the tuple directly, so no `TupleN$`
     /// module classfile is needed on the private runtime.
     NewTuple(usize),

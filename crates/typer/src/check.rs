@@ -8605,6 +8605,49 @@ impl Typer {
         }
     }
 
+    /// Wrap `tree` in the `toLong` / `toDouble` / `toFloat` conversion that
+    /// widens it to `to`, so the backend emits `i2l` / `i2d` / `i2f`.
+    fn wrap_numeric_widen(&mut self, tree: &mut Tree, to: &Type) {
+        let name = match to {
+            Type::Long => "toLong",
+            Type::Float => "toFloat",
+            Type::Double => "toDouble",
+            _ => {
+                tree.ty = to.clone();
+                return;
+            }
+        };
+        let from = tree.ty.widen_constant();
+        let conv = self
+            .st
+            .class_sym_of(&from)
+            .map(|cls| self.st.lookup_member(cls, name))
+            .unwrap_or_default()
+            .into_iter()
+            .find(|&s| {
+                self.st.get(s).kind == SymKind::Method
+                    && !matches!(self.st.get(s).intrinsic, crate::symbol::Intrinsic::None)
+            });
+        let Some(conv) = conv else {
+            tree.ty = to.clone();
+            return;
+        };
+        let span = tree.span;
+        let inner = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+        let id = inner.id;
+        *tree = Tree {
+            id,
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(inner),
+                name: name.to_string(),
+            },
+            ty: to.clone(),
+            sym: conv,
+            postfix: false,
+        };
+    }
+
     fn adapt(&mut self, tree: &mut Tree, pt: &Type) {
         if matches!(pt, Type::Method { .. }) {
             return;
@@ -8672,7 +8715,9 @@ impl Typer {
             return;
         }
         if let Some(w) = numeric_widen(&tree.ty, pt) {
-            tree.ty = w;
+            // The JVM needs the conversion instruction; setting the type alone
+            // left an `int` on the stack where a `double` was expected.
+            self.wrap_numeric_widen(tree, &w);
             return;
         }
         if matches!(pt, Type::Unit) {

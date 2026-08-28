@@ -4079,6 +4079,14 @@ fn gen_select(
                     asm.i2l();
                 } else if matches!(ic, Intrinsic::IntToDouble) {
                     asm.i2d();
+                } else if matches!(ic, Intrinsic::LongToDouble) {
+                    asm.l2d();
+                } else if matches!(ic, Intrinsic::IntToFloat) {
+                    asm.i2f();
+                } else if matches!(ic, Intrinsic::LongToFloat) {
+                    asm.l2f();
+                } else if matches!(ic, Intrinsic::FloatToDouble) {
+                    asm.f2d();
                 } else if matches!(ic, Intrinsic::IntToByte) {
                     asm.i2b();
                 } else if matches!(ic, Intrinsic::IntToShort) {
@@ -4579,8 +4587,12 @@ fn gen_apply(
             }
             Intrinsic::LongBin(op) => {
                 gen_expr(asm, frame, ctx, qual);
+                widen_numeric(asm, &qual.ty, &Type::Long);
                 if let Some(r) = args.first() {
                     gen_expr(asm, frame, ctx, r);
+                    if !matches!(op, "<<" | ">>" | ">>>") {
+                        widen_numeric(asm, &r.ty, &Type::Long);
+                    }
                 }
                 emit_long_bin(asm, op);
                 return;
@@ -4592,8 +4604,10 @@ fn gen_apply(
             }
             Intrinsic::DoubleBin(op) => {
                 gen_expr(asm, frame, ctx, qual);
+                widen_numeric(asm, &qual.ty, &Type::Double);
                 if let Some(r) = args.first() {
                     gen_expr(asm, frame, ctx, r);
+                    widen_numeric(asm, &r.ty, &Type::Double);
                 }
                 emit_double_bin(asm, op);
                 return;
@@ -4668,6 +4682,21 @@ fn gen_apply(
             Intrinsic::IntToDouble => {
                 gen_expr(asm, frame, ctx, qual);
                 asm.i2d();
+                return;
+            }
+            Intrinsic::IntToFloat => {
+                gen_expr(asm, frame, ctx, qual);
+                asm.i2f();
+                return;
+            }
+            Intrinsic::LongToFloat => {
+                gen_expr(asm, frame, ctx, qual);
+                asm.l2f();
+                return;
+            }
+            Intrinsic::FloatToDouble => {
+                gen_expr(asm, frame, ctx, qual);
+                asm.f2d();
                 return;
             }
             Intrinsic::LongToDouble => {
@@ -12011,4 +12040,22 @@ fn is_boxed_primitive(jvm: &str) -> bool {
             | "java/lang/Character"
             | "java/lang/Boolean"
     )
+}
+
+/// `1 + 2.5` reaches `Double.+` with an `int` receiver; the JVM needs the
+/// widening instruction before the arithmetic op.
+fn widen_numeric(asm: &mut Assembler, from: &Type, to: &Type) {
+    match (from.widen_constant(), to) {
+        (Type::Int, Type::Long) => asm.i2l(),
+        (Type::Char, Type::Long) => asm.i2l(),
+        (Type::Short, Type::Long) => asm.i2l(),
+        (Type::Byte, Type::Long) => asm.i2l(),
+        (Type::Int, Type::Double) => asm.i2d(),
+        (Type::Char, Type::Double) => asm.i2d(),
+        (Type::Short, Type::Double) => asm.i2d(),
+        (Type::Byte, Type::Double) => asm.i2d(),
+        (Type::Long, Type::Double) => asm.l2d(),
+        (Type::Float, Type::Double) => asm.f2d(),
+        _ => {}
+    }
 }

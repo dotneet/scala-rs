@@ -667,6 +667,21 @@ impl Assembler {
         let _ = self.pop_v();
         self.push_v(VType::Double);
     }
+    pub fn i2f(&mut self) {
+        self.emit_op(0x86);
+        let _ = self.pop_v();
+        self.push_v(VType::Float);
+    }
+    pub fn l2f(&mut self) {
+        self.emit_op(0x89);
+        let _ = self.pop_v();
+        self.push_v(VType::Float);
+    }
+    pub fn f2d(&mut self) {
+        self.emit_op(0x8d);
+        let _ = self.pop_v();
+        self.push_v(VType::Double);
+    }
     pub fn i2b(&mut self) {
         self.emit_op(0x91);
     }
