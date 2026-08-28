@@ -324,6 +324,32 @@ erase 済み descriptor は scalac の erasure を再実装するのではなく
 
 `SCALA_RS_PICKLE_DEBUG=1` で、どのメンバをなぜ供給した / しなかったかを追えます。
 
+#### 手書き prelude はどれだけ置き換えられるか（調査のみ・削除はしていない）
+
+補完は「解決が失敗したときだけ」動くので、prelude にあるメンバを pickle から
+作れるかどうかは通常わかりません。そこで一時的なフックで
+`PickleSupply::complete` を prelude 済みのメンバに直接当て、
+**pickle だけからどんなシグネチャが作れるか**を出させました。
+`List` / `Option` / `Vector` の手書きメンバ 39 個のうち **38 個**は作れます。
+
+| 受け手 | pickle から作れたもの |
+| --- | --- |
+| `List` | `map` `foreach` `head` `tail` `isEmpty` `length` `size` `nonEmpty` `reverse` `apply` `contains` `exists` `forall` `toList` `toString` `collect` `zip` `sum` `min` `max` `indexOf` `drop` `take` |
+| `Option` | `get` `isEmpty` `isDefined` `getOrElse` `map` `flatMap` `foreach` `filter` `toList` `orElse` |
+| `Vector` | `map` `apply` `length` `foreach` `head` |
+
+作れなかったのは `List#withFilter` だけです（戻り値の `WithFilter` は
+prelude が独自の形で持っているクラスで、pickle の形と噛み合いません）。
+
+**ただしこれは「シグネチャの形が取れた」だけで、そのまま消せる根拠ではありません。**
+実際 `List#zip` は `List[(tparam#289, tparam#2739)]`、`Option#orElse` は
+`(=> #29[tparam#2719])Option[B]` のように、型パラメータの束縛が表示上崩れています。
+置き換えるなら 1 つずつ、fixture の実行結果で確かめながら進める必要があります。
+今回は**一覧と根拠を残すだけで、prelude からは何も削っていません**。
+
+再現するには `PickleSupply::complete` を prelude 済みシンボルに直接呼ぶ
+一時テストを書きます（メンバごとにシンボル表を作り直すので、39 個で約 100 秒かかります）。
+
 #### codegen 側
 
 **`gen.rs` の変更は不要でした。** 既存の仕組みがそのまま噛み合っています。
