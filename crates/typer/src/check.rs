@@ -8703,7 +8703,9 @@ impl Typer {
                     .companion_module(fun.sym)
                     .map(|m| self.st.module_class_of(m))
                     .unwrap_or(SymbolId::NONE),
-                _ => SymbolId::NONE,
+                // `val SilentCast = new FunctionSymbol(…)` is an extractor
+                // too: the `unapply` lives on the value's own type.
+                _ => self.st.class_sym_of(&fun.ty).unwrap_or(SymbolId::NONE),
             }
         } else if let Some(n) = fun.name() {
             let found = self.st.lookup(n);
@@ -8734,7 +8736,9 @@ impl Typer {
                     .companion_module(fun.sym)
                     .map(|m| self.st.module_class_of(m))
                     .unwrap_or(SymbolId::NONE),
-                _ => SymbolId::NONE,
+                // `val SilentCast = new FunctionSymbol(…)` is an extractor
+                // too: the `unapply` lives on the value's own type.
+                _ => self.st.class_sym_of(&fun.ty).unwrap_or(SymbolId::NONE),
             }
         } else if let Some(n) = fun.name() {
             let found = self.st.lookup(n);

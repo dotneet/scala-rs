@@ -12051,7 +12051,18 @@ fn gen_unapply_pattern(
             _ => None,
         }
     };
-    gen_receiver(asm, frame, ctx, fun);
+    // An `unapply` on a plain class is an instance method: the extractor is
+    // the *value* `Lib.Cast`, not the object that holds it.
+    let owner = if uid.is_none() {
+        SymbolId::NONE
+    } else {
+        ctx.st.get(uid).owner
+    };
+    if !owner.is_none() && !is_module_class(ctx.st, owner) {
+        gen_expr(asm, frame, ctx, fun);
+    } else {
+        gen_receiver(asm, frame, ctx, fun);
+    }
     load(asm, tmp, sel_sort);
     if let Some(p) = &param0 {
         if !is_jvm_primitive(p) && sel_sort != JvmSort::Ref && sel_sort != JvmSort::Void {

@@ -202,5 +202,6 @@ conform!(
     companion_private,
     numeric_ops,
     extractor_bind,
-    package_object
+    package_object,
+    val_extractor
 );
