@@ -910,6 +910,15 @@ fn type_jvm_name(st: &SymbolTable, ty: &Type) -> String {
         Type::Class { sym, .. } | Type::ModuleRef(sym) => class_internal(st, *sym),
         Type::Named { name, .. } => name.replace('.', "/"),
         Type::String => "java/lang/String".into(),
+        // `case i: Int` tests the box: a boxed scrutinee is what it holds.
+        Type::Int => "java/lang/Integer".into(),
+        Type::Long => "java/lang/Long".into(),
+        Type::Double => "java/lang/Double".into(),
+        Type::Float => "java/lang/Float".into(),
+        Type::Short => "java/lang/Short".into(),
+        Type::Byte => "java/lang/Byte".into(),
+        Type::Char => "java/lang/Character".into(),
+        Type::Boolean => "java/lang/Boolean".into(),
         _ => "java/lang/Object".into(),
     }
 }
@@ -1549,6 +1558,7 @@ impl<'a> Gen<'a> {
         self.emit_super_accessors(&mut b, class_id);
         self.emit_mixin_forwarders(&mut b, class_id, &impl_.body);
         self.emit_delayed_init_support(&mut b, class_id, &impl_.body, false);
+        self.emit_case_object_methods(&mut b, class_id);
         self.emit_erasure_bridges(&mut b, class_id);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out.push(b.finish());
@@ -2682,6 +2692,148 @@ impl<'a> Gen<'a> {
 
     /// nsc-style erasure bridges: `compare(that: Box)` does not satisfy
     /// `Ordered.compare(Object)`. Emit a public bridge that checkcasts.
+    /// A case class's `toString` / `equals` / `hashCode` / `canEqual`. nsc
+    /// synthesizes these from the constructor fields; a hand-written one wins.
+    /// `hashCode` folds with 31 rather than nsc's MurmurHash3, so it agrees
+    /// with `equals` without depending on `scala.runtime`.
+    fn emit_case_object_methods(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        if class_id.is_none() || !self.st.get(class_id).flags.contains(Flags::CASE) {
+            return;
+        }
+        let fields = self.st.get(class_id).ctor_fields.clone();
+        let class_jvm = b.this_name.clone();
+        let simple = self.st.get(class_id).name.clone();
+        let defined: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
+        let field_info: Vec<(String, Type, String)> = fields
+            .iter()
+            .map(|f| {
+                let s = self.st.get(*f);
+                let ty = s.ty.clone();
+                let desc = jvm_desc(self.st, &ty);
+                (s.name.clone(), ty, desc)
+            })
+            .collect();
+
+        if !defined.contains("toString") {
+            let fi = field_info.clone();
+            let cj = class_jvm.clone();
+            let head = format!("{simple}(");
+            b.add_code(ACC_PUBLIC, "toString", "()Ljava/lang/String;", 1, |asm| {
+                asm.new_obj("java/lang/StringBuilder");
+                asm.dup();
+                asm.invokespecial("java/lang/StringBuilder", "<init>", "()V");
+                append_str(asm, &head);
+                for (i, (name, ty, desc)) in fi.iter().enumerate() {
+                    if i > 0 {
+                        append_str(asm, ",");
+                    }
+                    asm.aload(0);
+                    asm.getfield(&cj, name, desc);
+                    let ad = append_desc(ty);
+                    if ad == "(Ljava/lang/Object;)Ljava/lang/StringBuilder;" && is_jvm_primitive(ty)
+                    {
+                        emit_box(asm, ty);
+                    }
+                    asm.invokevirtual("java/lang/StringBuilder", "append", ad);
+                }
+                append_str(asm, ")");
+                asm.invokevirtual(
+                    "java/lang/StringBuilder",
+                    "toString",
+                    "()Ljava/lang/String;",
+                );
+                asm.areturn();
+            });
+        }
+
+        if !defined.contains("canEqual") {
+            let cj = class_jvm.clone();
+            b.add_code(ACC_PUBLIC, "canEqual", "(Ljava/lang/Object;)Z", 2, |asm| {
+                asm.aload(1);
+                asm.instanceof(&cj);
+                asm.ireturn();
+            });
+        }
+
+        if !defined.contains("equals") {
+            let fi = field_info.clone();
+            let cj = class_jvm.clone();
+            b.add_code(ACC_PUBLIC, "equals", "(Ljava/lang/Object;)Z", 3, |asm| {
+                let yes = asm.fresh_label();
+                let no = asm.fresh_label();
+                asm.aload(0);
+                asm.aload(1);
+                asm.if_acmpeq(yes);
+                asm.aload(1);
+                asm.instanceof(&cj);
+                asm.ifeq(no);
+                asm.aload(1);
+                asm.checkcast(&cj);
+                asm.astore(2);
+                for (name, ty, desc) in &fi {
+                    asm.aload(0);
+                    asm.getfield(&cj, name, desc);
+                    asm.aload(2);
+                    asm.getfield(&cj, name, desc);
+                    match ty {
+                        Type::Long => {
+                            asm.lcmp();
+                            asm.ifne(no);
+                        }
+                        Type::Double => {
+                            asm.dcmpl();
+                            asm.ifne(no);
+                        }
+                        Type::Float => {
+                            asm.fcmpl();
+                            asm.ifne(no);
+                        }
+                        t if is_jvm_primitive(t) => {
+                            let eq = asm.fresh_label();
+                            asm.if_icmpeq(eq);
+                            asm.goto(no);
+                            asm.mark(eq);
+                        }
+                        _ => {
+                            asm.invokestatic(
+                                "java/util/Objects",
+                                "equals",
+                                "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+                            );
+                            asm.ifeq(no);
+                        }
+                    }
+                }
+                asm.mark(yes);
+                asm.iconst(1);
+                asm.ireturn();
+                asm.mark(no);
+                asm.iconst(0);
+                asm.ireturn();
+            });
+        }
+
+        if !defined.contains("hashCode") {
+            let fi = field_info.clone();
+            let cj = class_jvm.clone();
+            b.add_code(ACC_PUBLIC, "hashCode", "()I", 2, |asm| {
+                asm.iconst(0);
+                for (name, ty, desc) in &fi {
+                    asm.iconst(31);
+                    asm.imul();
+                    asm.aload(0);
+                    asm.getfield(&cj, name, desc);
+                    if is_jvm_primitive(ty) {
+                        emit_box(asm, ty);
+                    }
+                    asm.invokestatic("java/util/Objects", "hashCode", "(Ljava/lang/Object;)I");
+                    asm.iadd();
+                }
+                asm.ireturn();
+            });
+        }
+    }
+
     fn emit_erasure_bridges(&self, b: &mut ClassBuilder, class_id: SymbolId) {
         if class_id.is_none() {
             return;
@@ -11130,7 +11282,18 @@ fn gen_pattern(
                 asm.instanceof(&jvm);
                 asm.ifeq(fail);
             }
-            gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
+            // `case i: Int` / `case s: String` narrows an `Object` scrutinee,
+            // so the bound value is unboxed or cast before it is stored.
+            let want = jvm_sort(&pat.ty);
+            if want != sel_sort || jvm != "java/lang/Object" {
+                load(asm, tmp, sel_sort);
+                emit_from_erased_object(asm, ctx.st, &pat.ty);
+                let narrowed = frame.alloc_tmp(want);
+                store(asm, narrowed, want);
+                gen_pattern(asm, frame, ctx, expr, narrowed, want, fail);
+            } else {
+                gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
+            }
         }
         _ => {}
     }
@@ -12057,5 +12220,28 @@ fn widen_numeric(asm: &mut Assembler, from: &Type, to: &Type) {
         (Type::Long, Type::Double) => asm.l2d(),
         (Type::Float, Type::Double) => asm.f2d(),
         _ => {}
+    }
+}
+
+fn append_str(asm: &mut Assembler, s: &str) {
+    asm.ldc_string(s);
+    asm.invokevirtual(
+        "java/lang/StringBuilder",
+        "append",
+        "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+    );
+}
+
+/// The `StringBuilder.append` overload for a field's erased type.
+fn append_desc(ty: &Type) -> &'static str {
+    match ty {
+        Type::Int | Type::Short | Type::Byte => "(I)Ljava/lang/StringBuilder;",
+        Type::Long => "(J)Ljava/lang/StringBuilder;",
+        Type::Double => "(D)Ljava/lang/StringBuilder;",
+        Type::Float => "(F)Ljava/lang/StringBuilder;",
+        Type::Char => "(C)Ljava/lang/StringBuilder;",
+        Type::Boolean => "(Z)Ljava/lang/StringBuilder;",
+        Type::String => "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+        _ => "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
     }
 }

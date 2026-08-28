@@ -5030,11 +5030,20 @@ impl Typer {
                     } else if !self.is_with_filter_ty(recv_ty.as_ref()) {
                         if let Some(a0) = args.first() {
                             if let Type::Function { ret: fr, .. } = &a0.ty {
-                                if let Some(cls) = recv_ty
-                                    .as_ref()
-                                    .and_then(|t| self.st.class_sym_of(t))
-                                    .map(|c| self.collection_root(c))
-                                {
+                                // The declared result wins when it names another
+                                // class: `Range.map` is an `IndexedSeq`, not a
+                                // `Range`.
+                                let declared = match &ret {
+                                    Type::Class { sym, args } if args.len() == 1 => Some(*sym),
+                                    _ => None,
+                                };
+                                let cls = declared.or_else(|| {
+                                    recv_ty
+                                        .as_ref()
+                                        .and_then(|t| self.st.class_sym_of(t))
+                                        .map(|c| self.collection_root(c))
+                                });
+                                if let Some(cls) = cls {
                                     ret = Type::Class {
                                         sym: cls,
                                         args: vec![fr.as_ref().widen_constant()],
