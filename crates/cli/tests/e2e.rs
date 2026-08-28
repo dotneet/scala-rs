@@ -3044,3 +3044,13 @@ fn fixtures_coll_arraybuffer1_bad_is_error() {
 fn scala_library_dual_run_coll_arraybuffer1() {
     dual_run_fixture("coll_arraybuffer1");
 }
+
+#[test]
+fn fixtures_coll_listbuffer1_bad_is_error() {
+    compile_fails_lib("coll_listbuffer1_bad", "noSuchMember is not a member");
+}
+
+#[test]
+fn scala_library_dual_run_coll_listbuffer1() {
+    dual_run_fixture("coll_listbuffer1");
+}

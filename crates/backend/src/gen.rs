@@ -6603,6 +6603,66 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                     );
                     return;
                 }
+                "map" | "filter" => {
+                    let desc = "(Lscala/Function1;)Ljava/lang/Object;";
+                    asm.invokevirtual("scala/collection/mutable/ListBuffer", name, desc);
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ListBuffer");
+                    return;
+                }
+                "reverse" => {
+                    asm.invokeinterface(
+                        "scala/collection/SeqOps",
+                        "reverse",
+                        "()Ljava/lang/Object;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ListBuffer");
+                    return;
+                }
+                "append" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Buffer",
+                        "append",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Buffer;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ListBuffer");
+                    return;
+                }
+                "++=" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Growable",
+                        "++=",
+                        "(Lscala/collection/IterableOnce;)Lscala/collection/mutable/Growable;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ListBuffer");
+                    return;
+                }
+                "-=" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Shrinkable",
+                        "-=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Shrinkable;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ListBuffer");
+                    return;
+                }
+                "sortBy" => {
+                    asm.invokeinterface(
+                        "scala/collection/SeqOps",
+                        "sortBy",
+                        "(Lscala/Function1;Lscala/math/Ordering;)Ljava/lang/Object;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ListBuffer");
+                    return;
+                }
+                "sorted" => {
+                    asm.invokeinterface(
+                        "scala/collection/SeqOps",
+                        "sorted",
+                        "(Lscala/math/Ordering;)Ljava/lang/Object;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ListBuffer");
+                    return;
+                }
                 _ => {}
             }
         }
