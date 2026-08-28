@@ -228,3 +228,22 @@ fn varargs_run() {
 fn varargs_parameter_is_a_seq() {
     compile_fails("varargs_bad", "nosuchmember");
 }
+
+/// `scala.util.Try` and friends are library-only.
+#[test]
+fn qualified_package_paths_run() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let out = compile_with("pkg_path", &["--scala-library", jar.to_str().unwrap()]);
+    assert_eq!(run_java(&out, Some(&jar)), expected_stdout("pkg_path"));
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn qualified_package_path_rejects_unknown_member() {
+    compile_fails("pkg_path_bad", "NoSuchThing");
+}

@@ -467,8 +467,48 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     st.enter_in_current("String", st.string_sym);
     st.enter_in_current("Unit", st.unit_sym);
     crate::prelude_tuple::add_tuples(st, library_abi);
+    add_package_paths(st);
     st.enter_in_current("::", st.cons_sym);
     st.enter_in_current("Ordered", ordered);
+}
+
+/// Prelude classes are owned by `scala` but carry their real JVM package
+/// (`scala/util/Try`), so `scala.util.Try` did not resolve. Register each one
+/// under the package its JVM name names, leaving its owner alone.
+fn add_package_paths(st: &mut SymbolTable) {
+    let ids: Vec<SymbolId> = (0..st.symbols.len())
+        .map(|i| SymbolId(i as u32))
+        .filter(|id| {
+            let s = st.get(*id);
+            matches!(s.kind, SymKind::Class | SymKind::Module)
+                && s.jvm_name.matches('/').count() >= 2
+                // A module's `Try$` is fine; a nested `Try$WithFilter` is not.
+                && !s.jvm_name.trim_end_matches('$').contains('$')
+        })
+        .collect();
+    for id in ids {
+        let jvm = st.get(id).jvm_name.clone();
+        let Some((pkg, _)) = jvm.rsplit_once('/') else {
+            continue;
+        };
+        if pkg == "scala" || pkg.is_empty() {
+            continue;
+        }
+        let name = st.get(id).name.clone();
+        let p = crate::classpath::ensure_package(st, pkg);
+        if p == st.root || st.get(p).members.contains(&id) {
+            continue;
+        }
+        // Both the class and its companion belong under the package; term
+        // position picks the module.
+        if !st
+            .lookup_member(p, &name)
+            .into_iter()
+            .any(|s| st.get(s).kind == st.get(id).kind)
+        {
+            st.get_mut(p).members.push(id);
+        }
+    }
 }
 
 fn mark_java(st: &mut SymbolTable, id: SymbolId) {
