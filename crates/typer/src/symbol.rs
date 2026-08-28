@@ -889,7 +889,15 @@ impl SymbolTable {
                 }
                 matches!(b, Type::AnyRef | Type::AnyVal | Type::Any)
             }
-            (Type::TypeParam(_), Type::AnyRef | Type::AnyVal) => true,
+            // `def f[A <: Named](x: A)` may use `x` where a `Named` is wanted.
+            (Type::TypeParam(id), b) => {
+                if let Some(hi) = self.get(*id).bound_hi.clone() {
+                    if !matches!(&hi, Type::TypeParam(x) if x == id) && self.is_sub_type(&hi, b) {
+                        return true;
+                    }
+                }
+                matches!(b, Type::AnyRef | Type::AnyVal)
+            }
             (Type::ThisType(s), b) => {
                 if matches!(b, Type::ThisType(t) if t == s) {
                     true
