@@ -80,3 +80,40 @@ fn cross_file_references_resolve() {
     );
     let _ = fs::remove_dir_all(&out);
 }
+
+/// A name in an enclosing package is visible without an import.
+#[test]
+fn enclosing_package_names_are_visible() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    if Command::new("java").arg("-version").output().is_err() {
+        return;
+    }
+    let dir = multi_dir();
+    let out = tmp_dir("pkg");
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            dir.join("pkg_inner.scala").to_str().unwrap(),
+            dir.join("pkg_outer.scala").to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run scala-rs");
+    assert!(status.success(), "compile failed");
+    let output = Command::new("java")
+        .args([
+            "-cp",
+            &format!("{}:{}", out.display(), jar.display()),
+            "top.inner.Main",
+        ])
+        .output()
+        .expect("java");
+    assert!(output.status.success(), "run failed");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
+    let _ = fs::remove_dir_all(&out);
+}

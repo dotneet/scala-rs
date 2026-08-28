@@ -3437,11 +3437,24 @@ impl Typer {
         } else {
             self.st.owner
         };
-        let pkg = self.enclosing_package(from);
-        self.complete_binary_member(pkg, name, span);
-        for id in self.st.lookup_member(pkg, name) {
-            self.st.enter_in_current(name, id);
+        // A name is visible from every enclosing package, not just the
+        // innermost: `slick.jdbc.meta` sees `slick.jdbc`'s members.
+        let mut pkg = self.enclosing_package(from);
+        loop {
+            self.complete_binary_member(pkg, name, span);
+            for id in self.st.lookup_member(pkg, name) {
+                self.st.enter_in_current(name, id);
+            }
+            if !self.st.lookup(name).is_empty() || pkg == self.st.root {
+                break;
+            }
+            let owner = self.st.get(pkg).owner;
+            if owner.is_none() || owner == pkg {
+                break;
+            }
+            pkg = owner;
         }
+        let pkg = self.enclosing_package(from);
         if self.st.lookup(name).is_empty() {
             // Every Scala source has an implicit `import java.lang._`.
             if let Some(jl) = self.java_lang_package() {
