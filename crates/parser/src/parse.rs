@@ -2948,9 +2948,115 @@ impl<'a> Parser<'a> {
                 },
             );
         }
+        // `{ x => stat; stat }` — nsc's `ResultExpr`: the lambda body is the
+        // rest of the block, not a single expression.
+        if let Some(vparams) = self.try_lambda_header() {
+            let stats = self.parse_stats_until_rbrace();
+            self.expect("}", |k| matches!(k, TokenKind::RBrace));
+            let span = lo.merge(self.prev_span());
+            let body = block_from_stats(self, span, stats);
+            return self.alloc(
+                span,
+                TreeKind::Function {
+                    vparams,
+                    body: Box::new(body),
+                },
+            );
+        }
         let stats = self.parse_stats_until_rbrace();
         self.expect("}", |k| matches!(k, TokenKind::RBrace));
         block_from_stats(self, lo.merge(self.prev_span()), stats)
+    }
+
+    /// A lambda header at the start of a brace block: `x =>`, `x: T =>`,
+    /// `(a, b) =>`, `implicit x =>`. Restores the position when there is none.
+    fn try_lambda_header(&mut self) -> Option<Vec<Tree>> {
+        let saved = self.pos;
+        let implicit = matches!(self.kind(), TokenKind::Implicit);
+        if implicit {
+            self.bump();
+        }
+        let flags = if implicit {
+            Flags::PARAM.with(Flags::IMPLICIT)
+        } else {
+            Flags::PARAM
+        };
+        let mut params = Vec::new();
+        if matches!(self.kind(), TokenKind::LParen) {
+            self.bump();
+            self.skip_nl();
+            if !matches!(self.kind(), TokenKind::RParen) {
+                loop {
+                    match self.lambda_param(flags) {
+                        Some(p) => params.push(p),
+                        None => {
+                            self.pos = saved;
+                            return None;
+                        }
+                    }
+                    self.skip_nl();
+                    if matches!(self.kind(), TokenKind::Comma) {
+                        self.bump();
+                        self.skip_nl();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            if !matches!(self.kind(), TokenKind::RParen) {
+                self.pos = saved;
+                return None;
+            }
+            self.bump();
+        } else {
+            match self.lambda_param(flags) {
+                Some(p) => params.push(p),
+                None => {
+                    self.pos = saved;
+                    return None;
+                }
+            }
+        }
+        self.skip_nl();
+        if !matches!(self.kind(), TokenKind::Arrow) {
+            self.pos = saved;
+            return None;
+        }
+        self.bump();
+        self.skip_nl_semi();
+        Some(params)
+    }
+
+    fn lambda_param(&mut self, flags: Flags) -> Option<Tree> {
+        let (name, sp) = match self.kind().clone() {
+            TokenKind::Ident(n) => {
+                let sp = self.span();
+                self.bump();
+                (n, sp)
+            }
+            TokenKind::Underscore => {
+                let sp = self.span();
+                self.bump();
+                ("_".to_string(), sp)
+            }
+            _ => return None,
+        };
+        let tpt = if matches!(self.kind(), TokenKind::Colon) {
+            self.bump();
+            self.parse_type()
+        } else {
+            self.empty(sp)
+        };
+        let rhs = self.empty(sp);
+        Some(self.alloc(
+            sp,
+            TreeKind::ValDef {
+                mods: Modifiers::new(flags),
+                name,
+                tpt: Box::new(tpt),
+                rhs: Box::new(rhs),
+            },
+        ))
     }
 
     fn parse_new(&mut self) -> Tree {

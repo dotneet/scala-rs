@@ -130,5 +130,6 @@ conform!(
     classes,
     interp,
     chains,
-    parse_forms
+    parse_forms,
+    lambdas
 );
