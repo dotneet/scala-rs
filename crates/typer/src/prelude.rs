@@ -472,6 +472,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     st.enter_in_current("Unit", st.unit_sym);
     crate::prelude_tuple::add_tuples(st, library_abi);
     add_package_paths(st);
+    add_scala_aliases(st);
     st.enter_in_current("::", st.cons_sym);
     st.enter_in_current("Ordered", ordered);
 }
@@ -511,6 +512,32 @@ fn add_package_paths(st: &mut SymbolTable) {
             .any(|s| st.get(s).kind == st.get(id).kind)
         {
             st.get_mut(p).members.push(id);
+        }
+    }
+}
+
+/// nsc: the `scala` package object aliases these, so `Ordering[Int]` resolves
+/// without an import. Entering the class makes the alias usable in type
+/// position; a companion of the same name stays reachable in term position.
+fn add_scala_aliases(st: &mut SymbolTable) {
+    for (name, jvm) in [
+        ("Ordering", "scala/math/Ordering"),
+        ("Numeric", "scala/math/Numeric"),
+        ("BigInt", "scala/math/BigInt"),
+        ("BigDecimal", "scala/math/BigDecimal"),
+        ("Equiv", "scala/math/Equiv"),
+        ("Fractional", "scala/math/Fractional"),
+        ("Integral", "scala/math/Integral"),
+    ] {
+        let Some(cls) = crate::classpath::find_by_jvm(st, jvm) else {
+            continue;
+        };
+        let already = st
+            .lookup(name)
+            .into_iter()
+            .any(|s| s == cls && st.get(s).kind == SymKind::Class);
+        if !already {
+            st.enter_in_current(name, cls);
         }
     }
 }

@@ -3181,6 +3181,18 @@ impl Typer {
     }
 
     /// Load a same-package (or default-package) Java class for an unqualified name.
+    fn java_lang_package(&self) -> Option<SymbolId> {
+        let java = self
+            .st
+            .lookup_member(self.st.root, "java")
+            .into_iter()
+            .find(|&s| self.st.get(s).kind == SymKind::Package)?;
+        self.st
+            .lookup_member(java, "lang")
+            .into_iter()
+            .find(|&s| self.st.get(s).kind == SymKind::Package)
+    }
+
     fn expose_unqualified(&mut self, name: &str, span: Span) {
         if name.is_empty() || !self.st.lookup(name).is_empty() {
             return;
@@ -3194,6 +3206,15 @@ impl Typer {
         self.complete_binary_member(pkg, name, span);
         for id in self.st.lookup_member(pkg, name) {
             self.st.enter_in_current(name, id);
+        }
+        if self.st.lookup(name).is_empty() {
+            // Every Scala source has an implicit `import java.lang._`.
+            if let Some(jl) = self.java_lang_package() {
+                self.complete_binary_member(jl, name, span);
+                for id in self.st.lookup_member(jl, name) {
+                    self.st.enter_in_current(name, id);
+                }
+            }
         }
         if self.st.lookup(name).is_empty() && pkg != self.st.root {
             self.complete_binary_member(self.st.root, name, span);

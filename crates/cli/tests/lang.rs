@@ -287,3 +287,29 @@ fn heterogeneous_elements_infer_their_lub() {
     assert_eq!(run_java(&out, Some(&jar)), expected_stdout("lub_varargs"));
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// `Ordering` without an import, a context bound's evidence, and `java.lang`
+/// names in scope. Library-only: `Ordering` instances come from the jar.
+#[test]
+fn scala_aliases_and_java_lang_are_in_scope() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let out = compile_with(
+        "implicit_scope",
+        &["--scala-library", jar.to_str().unwrap()],
+    );
+    assert_eq!(
+        run_java(&out, Some(&jar)),
+        expected_stdout("implicit_scope")
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn ordering_members_are_checked() {
+    compile_fails("implicit_scope_bad", "nosuchmember");
+}
