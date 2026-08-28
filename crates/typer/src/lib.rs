@@ -6,6 +6,7 @@ mod javaclass;
 mod javasign;
 mod lambda_lift;
 mod prelude;
+mod prelude_coll;
 mod prelude_either;
 mod prelude_seq;
 mod prelude_text;

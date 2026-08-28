@@ -382,6 +382,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_string_builder(st);
         add_hash_map(st);
         add_hash_set(st);
+        if let Some(it) = iterator {
+            crate::prelude_coll::add_collections_extra(st, tuple2, ordering, it);
+        }
         add_linked_hash_map(st);
         add_linked_hash_set(st);
         add_either(st);
@@ -684,7 +687,7 @@ pub(crate) fn module(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &st
     m
 }
 
-fn module_extending(
+pub(crate) fn module_extending(
     st: &mut SymbolTable,
     owner: SymbolId,
     name: &str,

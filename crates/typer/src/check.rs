@@ -2800,8 +2800,40 @@ impl Typer {
                     targs.push(self.tree_to_type(a));
                 }
                 if !fun.sym.is_none() {
-                    tree.sym = fun.sym;
-                    tree.ty = self.st.subst_tparams(fun.sym, &targs, &fun.ty);
+                    let mut sym = fun.sym;
+                    let mut base_ty = fun.ty.clone();
+                    // `Module[T1, T2]` with no explicit `.apply` written still
+                    // means the type args target the module's generic `apply`
+                    // factory (`HashMap[String, Int]()`, `List[Int]()`) — the
+                    // module symbol itself has no tparams, so naively
+                    // substituting against it is a no-op and the caller sees
+                    // an un-substituted `HashMap[K, V]`.
+                    if self.st.get(sym).tparams.is_empty()
+                        && self.st.get(sym).kind == SymKind::Module
+                    {
+                        let cls = self.st.module_class_of(sym);
+                        let candidates: Vec<SymbolId> = self
+                            .st
+                            .lookup_member(cls, "apply")
+                            .into_iter()
+                            .filter(|id| self.st.get(*id).tparams.len() == targs.len())
+                            .collect();
+                        if let [only] = candidates[..] {
+                            sym = only;
+                            base_ty = self.st.get(sym).ty.clone();
+                        }
+                    }
+                    tree.sym = sym;
+                    tree.ty = self.st.subst_tparams(sym, &targs, &base_ty);
+                    // Codegen's `peel_fun` walks straight through this
+                    // TypeApply to the underlying Select/Ident and uses
+                    // *that* node's `.sym`/`.ty` — propagate the redirect
+                    // (module → its `apply` method) down so it sees the
+                    // method, not the module itself.
+                    if sym != fun.sym {
+                        fun.sym = sym;
+                        fun.ty = tree.ty.clone();
+                    }
                 } else {
                     tree.ty = fun.ty.clone();
                 }
