@@ -206,7 +206,7 @@ fn case_class_copy_runs() {
 
 #[test]
 fn case_class_copy_rejects_unknown_parameter() {
-    compile_fails("case_copy_bad", "no parameter named");
+    compile_fails("case_copy_bad", "unknown parameter name: z");
 }
 
 /// A repeated parameter is a `Seq` in the body; the sequence types come from

@@ -3375,3 +3375,94 @@ fn fixtures_placeholder_missing_bad_is_error() {
         "missing parameter type for expanded function",
     );
 }
+
+// ------------------------------------------------------------------ named
+// arguments and default arguments. `f(b = 2, a = 1)` at method, `apply`,
+// `copy`, constructor and overloaded call sites, defaults in any clause, and
+// nsc's three diagnostics for a malformed argument list.
+
+/// The fixture's stdout must match what real scalac 2.13.16 produces for the
+/// same source, not just our recorded expectation.
+fn namedargs_scalac_dual_run(name: &str) {
+    if !java_available() {
+        return;
+    }
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip real-scalac diff {name}: scalac not obtainable");
+        return;
+    };
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip real-scalac diff {name}: scala-library jar not obtainable");
+        return;
+    };
+    let src = fixtures_dir().join(format!("{name}.scala"));
+    let ref_out = tmp_dir(&format!("{name}-scalac-ref"));
+    let status = Command::new(&scalac)
+        .args([src.to_str().unwrap(), "-d", ref_out.to_str().unwrap()])
+        .status()
+        .expect("scalac");
+    assert!(status.success(), "real scalac failed to compile {name}");
+    let ref_cp = format!("{}:{}", ref_out.display(), jar.display());
+    let reference = Command::new("java")
+        .args(["-cp", &ref_cp, "Main"])
+        .output()
+        .expect("java (real scalac build)");
+    assert!(
+        reference.status.success(),
+        "java Main (real-scalac build) failed for {name}: {}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    let reference = String::from_utf8_lossy(&reference.stdout).to_string();
+    assert_eq!(
+        reference,
+        expected_stdout(name),
+        "recorded expectation for {name} does not match real scalac"
+    );
+
+    let out = compile_fixture_with(name, &["--scala-library", jar.to_str().unwrap()]);
+    let cp = format!("{}:{}", out.display(), jar.display());
+    let ours = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("java (our build)");
+    assert!(
+        ours.status.success(),
+        "java -Xverify:all Main (our build) failed for {name}: {}",
+        String::from_utf8_lossy(&ours.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ours.stdout),
+        reference,
+        "stdout differs from real scalac for {name}"
+    );
+    let _ = fs::remove_dir_all(&out);
+    let _ = fs::remove_dir_all(&ref_out);
+}
+
+#[test]
+fn scala_library_dual_run_namedargs() {
+    dual_run_fixture("namedargs");
+}
+
+#[test]
+fn real_scalac_dual_run_namedargs() {
+    namedargs_scalac_dual_run("namedargs");
+}
+
+#[test]
+fn fixtures_namedargs_dup_bad_is_error() {
+    compile_fails_lib(
+        "namedargs_dup_bad",
+        "parameter 'c' is already specified at parameter position 2",
+    );
+}
+
+#[test]
+fn fixtures_namedargs_unknown_bad_is_error() {
+    compile_fails_lib("namedargs_unknown_bad", "unknown parameter name: q");
+}
+
+#[test]
+fn fixtures_namedargs_order_bad_is_error() {
+    compile_fails_lib("namedargs_order_bad", "positional after named argument.");
+}

@@ -5099,18 +5099,9 @@ impl Typer {
             .iter()
             .map(|f| self.st.get(*f).name.clone())
             .collect();
-        let mut slots: Vec<Option<Tree>> = names.iter().map(|_| None).collect();
-        let mut positional = 0usize;
-        for a in args {
-            if let Some((n, rhs)) = Self::named_arg_parts(&a) {
-                match names.iter().position(|p| p == &n) {
-                    Some(i) => slots[i] = Some(rhs),
-                    None => self.error(a.span, format!("no parameter named `{n}`")),
-                }
-            } else if positional < slots.len() {
-                slots[positional] = Some(a);
-                positional += 1;
-            } else {
+        let (slots, extra, ok) = self.named_arg_slots(args, &names);
+        if ok {
+            for a in extra {
                 self.error(a.span, "too many arguments");
             }
         }
@@ -5195,6 +5186,16 @@ impl Typer {
                 .or(Some(fun.sym))
                 .filter(|s| !s.is_none());
             let class_id = class_id.or_else(|| self.st.class_sym_of(&fun.ty));
+            // `new C(b = 2, a = 1)`: named arguments must be put in parameter
+            // order before the constructor overload is picked, since the pick
+            // is driven by the argument types.
+            if Self::has_named_arg(args) && !self.reorder_named_ctor_args(args, class_id, fun) {
+                for a in args.iter_mut() {
+                    self.type_expr(a, &Type::NoType);
+                }
+                tree.ty = Type::Error;
+                return;
+            }
             let tps = class_id
                 .map(|c| self.st.get(c).tparams.clone())
                 .unwrap_or_default();
@@ -5360,7 +5361,13 @@ impl Typer {
         // are not auto-applied before this Apply is typed.
         self.type_expr(fun, &dummy_method);
         self.rewrite_receiver_apply(fun);
-        self.reorder_named_args(args, fun);
+        if !self.reorder_named_args(args, fun) {
+            for a in args.iter_mut() {
+                self.type_expr(a, &Type::NoType);
+            }
+            tree.ty = Type::Error;
+            return;
+        }
 
         let recv_ty = match &fun.kind {
             TreeKind::Select { qual, .. } => Some(qual.ty.clone()),
@@ -6437,81 +6444,342 @@ impl Typer {
         None
     }
 
-    fn reorder_named_args(&mut self, args: &mut Vec<Tree>, fun: &Tree) {
-        if !args.iter().any(|a| Self::named_arg_parts(a).is_some()) {
-            return;
-        }
-        let ids = self.first_clause_ids(fun);
-        if ids.is_empty() {
-            self.error(
-                args.first().map(|a| a.span).unwrap_or(fun.span),
-                "unimplemented syntax: named arguments (method parameters not resolved)",
-            );
-            return;
-        }
-        let names: Vec<String> = ids.iter().map(|id| self.st.get(*id).name.clone()).collect();
+    fn has_named_arg(args: &[Tree]) -> bool {
+        args.iter().any(|a| Self::named_arg_parts(a).is_some())
+    }
+
+    /// nsc's `NamesDefaults.removeNames`: place `name = value` arguments at
+    /// their parameter positions.
+    ///
+    /// A named argument that already sits at its own position keeps later
+    /// positional arguments legal (`f(a = 1, 2)` compiles); one that moves an
+    /// argument makes every following positional argument an error. Returns one
+    /// slot per parameter plus the positional overflow, which only a repeated
+    /// final parameter can absorb.
+    fn named_arg_slots(
+        &mut self,
+        args: Vec<Tree>,
+        names: &[String],
+    ) -> (Vec<Option<Tree>>, Vec<Tree>, bool) {
         let mut slots: Vec<Option<Tree>> = names.iter().map(|_| None).collect();
-        let mut positional = 0usize;
-        let taken = std::mem::take(args);
-        for a in taken {
-            if let Some((n, rhs)) = Self::named_arg_parts(&a) {
-                match names.iter().position(|p| p == &n) {
-                    Some(i) => {
-                        if slots[i].is_some() {
-                            self.error(a.span, format!("parameter `{n}` is already specified"));
-                        }
-                        slots[i] = Some(rhs);
-                    }
-                    None => {
-                        self.error(a.span, format!("no parameter named `{n}`"));
-                    }
+        let mut arg_pos: Vec<Option<usize>> = args.iter().map(|_| None).collect();
+        let mut extra: Vec<Tree> = Vec::new();
+        let mut positional_allowed = true;
+        let mut ok = true;
+        for (arg_index, a) in args.into_iter().enumerate() {
+            let Some((n, rhs)) = Self::named_arg_parts(&a) else {
+                if !positional_allowed {
+                    self.error(a.span, "positional after named argument.");
+                    ok = false;
+                } else if arg_index < slots.len() {
+                    arg_pos[arg_index] = Some(arg_index);
+                    slots[arg_index] = Some(a);
+                } else {
+                    extra.push(a);
                 }
-            } else {
-                if positional >= slots.len() {
-                    self.error(a.span, "too many arguments");
-                    args.push(a);
-                    continue;
-                }
-                if slots[positional].is_some() {
+                continue;
+            };
+            let Some(pos) = names.iter().position(|p| p == &n) else {
+                self.error(a.span, format!("unknown parameter name: {n}"));
+                ok = false;
+                continue;
+            };
+            match arg_pos.iter().position(|p| *p == Some(pos)) {
+                Some(prev) => {
                     self.error(
                         a.span,
                         format!(
-                            "positional argument overlaps named parameter `{}`",
-                            names[positional]
+                            "parameter '{n}' is already specified at parameter position {}",
+                            prev + 1
                         ),
                     );
+                    ok = false;
                 }
-                slots[positional] = Some(a);
-                positional += 1;
+                None => {
+                    arg_pos[arg_index] = Some(pos);
+                    slots[pos] = Some(rhs);
+                }
+            }
+            if pos != arg_index {
+                positional_allowed = false;
             }
         }
+        (slots, extra, ok)
+    }
+
+    /// The 1-based index a `name$default$n` getter carries: nsc numbers
+    /// defaults across *all* parameter clauses, so `f(a, b = 1)(c, d = 2)`
+    /// gets `f$default$2` and `f$default$4`, not `$default$2` twice.
+    fn default_getter_index(&self, fun: &Tree, param: SymbolId) -> usize {
+        let sym = fun.sym;
+        if sym.is_none() {
+            return 1;
+        }
+        let s = self.st.get(sym);
+        let flat: Vec<SymbolId> = if s.paramss.is_empty() {
+            s.params.clone()
+        } else {
+            s.paramss.iter().flatten().copied().collect()
+        };
+        flat.iter().position(|&p| p == param).map_or(1, |i| i + 1)
+    }
+
+    /// Whether the callee is already erroneous, so named arguments cannot be
+    /// resolved and any diagnostic here would only be a cascade.
+    fn callee_is_erroneous(&self, fun: &Tree) -> bool {
+        matches!(fun.ty, Type::Error) || (fun.sym.is_none() && fun.ty.is_no_type())
+    }
+
+    /// Drop the `name =` wrapper without reordering, so an argument whose
+    /// parameter could not be resolved is not typed as an assignment to a
+    /// non-existent variable.
+    fn strip_named_args(args: &mut [Tree]) {
+        for a in args.iter_mut() {
+            if let Some((_, rhs)) = Self::named_arg_parts(a) {
+                *a = rhs;
+            }
+        }
+    }
+
+    /// The first parameter clause of `m`, and whether it ends in a repeated
+    /// parameter. A repeated parameter's *symbol* has type `Seq[T]` (its type
+    /// inside the body), so only the method type still says `Repeated`.
+    fn first_clause_of(&self, m: SymbolId) -> (Vec<SymbolId>, bool) {
+        let s = self.st.get(m);
+        let ids = if s.paramss.is_empty() {
+            s.params.clone()
+        } else {
+            s.paramss.first().cloned().unwrap_or_default()
+        };
+        let repeated = match &s.ty {
+            Type::Method { paramss, .. } => paramss
+                .first()
+                .and_then(|c| c.last())
+                .is_some_and(|t| matches!(t, Type::Repeated(_))),
+            _ => false,
+        };
+        (ids, repeated)
+    }
+
+    /// The types of the named arguments, typed speculatively: the diagnostics
+    /// are rolled back and the call site's own trees are untouched, so this
+    /// only serves to tell overloaded alternatives apart.
+    fn probe_named_arg_types(&mut self, args: &[Tree]) -> Vec<(String, Type)> {
+        let named: Vec<(String, Tree)> = args.iter().filter_map(Self::named_arg_parts).collect();
+        let mark = self.diags.len();
+        let mut out = Vec::with_capacity(named.len());
+        for (name, mut rhs) in named {
+            // A function literal needs an expected type to say anything useful.
+            if matches!(rhs.kind, TreeKind::Function { .. }) {
+                out.push((name, Type::NoType));
+                continue;
+            }
+            self.type_expr(&mut rhs, &Type::NoType);
+            out.push((name, rhs.ty.clone()));
+        }
+        self.diags.truncate(mark);
+        out
+    }
+
+    /// The alternative among `alts` that declares every name the call site used
+    /// — nsc narrows an overloaded callee by parameter name, then by argument
+    /// type. `h(s: String, n: Int)` and `h(n: Int, s: String)` both declare
+    /// `s` and `n`, so the types decide which one `h(n = 1, s = "x")` means.
+    fn alt_for_named_args(
+        &self,
+        alts: &[SymbolId],
+        named: &[(String, Type)],
+        nargs: usize,
+    ) -> Option<(Vec<SymbolId>, bool)> {
+        let cands: Vec<(Vec<SymbolId>, bool)> = alts
+            .iter()
+            .filter(|&&m| self.st.get(m).kind == SymKind::Method)
+            .map(|&m| self.first_clause_of(m))
+            .filter(|(ids, _)| !ids.is_empty())
+            .collect();
+        let covers = |ids: &[SymbolId]| {
+            named.iter().all(|(n, _)| {
+                ids.iter()
+                    .any(|i| self.st.get(*i).name.as_str() == n.as_str())
+            })
+        };
+        let conforms = |ids: &[SymbolId]| {
+            named.iter().all(|(n, t)| {
+                if t.is_no_type() || t.is_error() {
+                    return true;
+                }
+                match ids
+                    .iter()
+                    .find(|i| self.st.get(**i).name.as_str() == n.as_str())
+                {
+                    Some(&p) => self.arg_conforms(t, &self.st.get(p).ty, true),
+                    None => false,
+                }
+            })
+        };
+        let pick = |f: &dyn Fn(&[SymbolId]) -> bool| -> Option<&(Vec<SymbolId>, bool)> {
+            cands
+                .iter()
+                .find(|(ids, _)| ids.len() >= nargs && f(ids))
+                .or_else(|| cands.iter().find(|(ids, _)| f(ids)))
+        };
+        pick(&|ids| covers(ids) && conforms(ids))
+            .or_else(|| pick(&covers))
+            .or_else(|| cands.first())
+            .cloned()
+    }
+
+    /// Move each `name = value` into its parameter slot and fill the gaps left
+    /// by omitted defaults. Shared by the method, constructor and `apply`
+    /// paths; `defaults_inline` inlines a parameter's default expression
+    /// instead of calling its `name$default$n` getter, which is what a
+    /// constructor needs (there is no receiver yet at `new C(…)`).
+    fn place_named_args(
+        &mut self,
+        args: &mut Vec<Tree>,
+        fun: &Tree,
+        ids: &[SymbolId],
+        repeated_last: bool,
+        defaults_inline: bool,
+    ) -> bool {
+        let names: Vec<String> = ids.iter().map(|id| self.st.get(*id).name.clone()).collect();
+        let taken = std::mem::take(args);
+        let (slots, extra, ok) = self.named_arg_slots(taken, &names);
+        let last = slots.len().saturating_sub(1);
         let mut out = Vec::new();
         for (i, slot) in slots.into_iter().enumerate() {
-            match slot {
-                Some(t) => out.push(t),
-                None => {
-                    let pid = ids[i];
-                    let flags = self.st.get(pid).flags;
-                    let default_rhs = self.st.get(pid).default_rhs.clone();
-                    if flags.contains(Flags::DEFAULTPARAM) {
-                        if let Some(filled) = self.default_getter_apply(fun, pid, i + 1, &out) {
-                            out.push(filled);
-                        } else if let Some(rhs) = default_rhs {
-                            out.push(rhs);
-                        }
-                    } else if flags.contains(Flags::IMPLICIT) {
-                        // leave a hole; fill_defaults will search
-                        break;
-                    } else {
-                        self.error(
-                            fun.span,
-                            format!("missing argument for parameter `{}`", names[i]),
-                        );
-                    }
+            if let Some(t) = slot {
+                out.push(t);
+                continue;
+            }
+            let pid = ids[i];
+            let flags = self.st.get(pid).flags;
+            let default_rhs = self.st.get(pid).default_rhs.clone();
+            if defaults_inline {
+                if let Some(rhs) = default_rhs {
+                    out.push(rhs);
+                    continue;
                 }
+            } else if flags.contains(Flags::DEFAULTPARAM) {
+                let idx = self.default_getter_index(fun, pid);
+                if let Some(filled) = self.default_getter_apply(fun, pid, idx, &out) {
+                    out.push(filled);
+                } else if let Some(rhs) = default_rhs {
+                    out.push(rhs);
+                }
+                continue;
+            }
+            if flags.contains(Flags::IMPLICIT) {
+                // Leave a hole; `fill_defaults_and_implicits` searches for it.
+                break;
+            }
+            if repeated_last && i == last {
+                // `def f(a: Int, rest: Int*)` called as `f(a = 1)`.
+                break;
+            }
+            // nsc reports one error per bad application; the missing slot is a
+            // consequence of the name error already reported.
+            if ok {
+                self.error(
+                    fun.span,
+                    format!("missing argument for parameter `{}`", names[i]),
+                );
+            }
+        }
+        if repeated_last {
+            out.extend(extra);
+        } else if ok {
+            for a in extra {
+                self.error(a.span, "too many arguments");
             }
         }
         *args = out;
+        ok
+    }
+
+    /// `new C(b = 2, a = 1)`. Constructors are picked by argument type, so the
+    /// names have to be resolved first — and against the overload that
+    /// actually declares them.
+    fn reorder_named_ctor_args(
+        &mut self,
+        args: &mut Vec<Tree>,
+        class_id: Option<SymbolId>,
+        fun: &Tree,
+    ) -> bool {
+        let Some(class_id) = class_id else {
+            Self::strip_named_args(args);
+            return true;
+        };
+        let alts = self.st.lookup_member(class_id, "<init>");
+        let named = if alts.len() > 1 {
+            self.probe_named_arg_types(args)
+        } else {
+            args.iter()
+                .filter_map(|a| Self::named_arg_parts(a).map(|(n, _)| (n, Type::NoType)))
+                .collect()
+        };
+        let (ids, repeated_last) = self
+            .alt_for_named_args(&alts, &named, args.len())
+            .unwrap_or_else(|| (self.st.get(class_id).ctor_fields.clone(), false));
+        if ids.is_empty() {
+            Self::strip_named_args(args);
+            self.error(
+                args.first().map(|a| a.span).unwrap_or(fun.span),
+                "unimplemented syntax: named arguments (constructor parameters not resolved)",
+            );
+            return false;
+        }
+        self.place_named_args(args, fun, &ids, repeated_last, true)
+    }
+
+    /// The parameters to map named arguments onto, and whether the clause ends
+    /// in a repeated parameter.
+    fn named_arg_param_ids(&mut self, fun: &Tree, args: &[Tree]) -> (Vec<SymbolId>, bool) {
+        if matches!(fun.ty, Type::Overload(_)) && !fun.sym.is_none() {
+            let name = self.st.get(fun.sym).name.clone();
+            let owner = self.st.get(fun.sym).owner;
+            let mut alts = self.drop_overridden(self.st.lookup_member(owner, &name));
+            if alts.is_empty() {
+                alts = self.st.lookup(&name);
+            }
+            let named = self.probe_named_arg_types(args);
+            if let Some(found) = self.alt_for_named_args(&alts, &named, args.len()) {
+                return found;
+            }
+        }
+        let ids = self.first_clause_ids(fun);
+        // `fun.ty` may already have shed earlier clauses (`f(1)(b = 2)`), so
+        // match the clause by length rather than taking the first.
+        let repeated = match &fun.ty {
+            Type::Method { paramss, .. } => paramss
+                .iter()
+                .find(|c| c.len() == ids.len())
+                .and_then(|c| c.last())
+                .is_some_and(|t| matches!(t, Type::Repeated(_))),
+            _ => false,
+        };
+        (ids, repeated)
+    }
+
+    fn reorder_named_args(&mut self, args: &mut Vec<Tree>, fun: &Tree) -> bool {
+        if !Self::has_named_arg(args) {
+            return true;
+        }
+        let (ids, repeated_last) = self.named_arg_param_ids(fun, args);
+        if ids.is_empty() {
+            // Strip `name =` so the argument is not typed as an assignment to a
+            // non-existent variable, which would bury the real error under a
+            // "not found: value name" cascade.
+            Self::strip_named_args(args);
+            if !self.callee_is_erroneous(fun) {
+                self.error(
+                    args.first().map(|a| a.span).unwrap_or(fun.span),
+                    "unimplemented syntax: named arguments (method parameters not resolved)",
+                );
+            }
+            return false;
+        }
+        self.place_named_args(args, fun, &ids, repeated_last, false)
     }
 
     fn fill_defaults_and_implicits(
@@ -6563,9 +6831,8 @@ impl Typer {
                 let off = args.len().min(param_tys.len());
                 self.fill_implicit_params(span, args, &param_tys[off..], &rest);
             } else if all_default {
-                let start = args.len();
-                for (k, pid) in rest.iter().enumerate() {
-                    let idx = start + k + 1;
+                for pid in rest.iter() {
+                    let idx = self.default_getter_index(fun, *pid);
                     if let Some(filled) = self.default_getter_apply(fun, *pid, idx, args) {
                         args.push(filled);
                     } else if let Some(mut rhs) = self.st.get(*pid).default_rhs.clone() {
@@ -6711,7 +6978,7 @@ impl Typer {
         fun: &Tree,
         param: SymbolId,
         index_1based: usize,
-        preceding: &[Tree],
+        prior: &[Tree],
     ) -> Option<Tree> {
         let meth = fun.sym;
         if meth.is_none() {
@@ -6727,6 +6994,9 @@ impl Typer {
             .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)?;
         let span = fun.span;
         let recv = self.method_receiver(fun);
+        let mut preceding = Self::applied_clause_args(fun);
+        preceding.extend_from_slice(prior);
+        let preceding = &preceding[..];
         let mut gfun = Tree {
             id: NodeId(0),
             span,
@@ -6754,11 +7024,28 @@ impl Typer {
         Some(call)
     }
 
+    /// The arguments of the parameter clauses already applied to `fun`. A
+    /// `name$default$n` getter for a later clause takes all of them
+    /// (`def f(a: Int)(b: Int = a)` gives `f$default$2(a: Int)`).
+    fn applied_clause_args(fun: &Tree) -> Vec<Tree> {
+        match &fun.kind {
+            TreeKind::Apply { fun, args } => {
+                let mut v = Self::applied_clause_args(fun);
+                v.extend(args.iter().cloned());
+                v
+            }
+            TreeKind::TypeApply { fun, .. } | TreeKind::Typed { expr: fun, .. } => {
+                Self::applied_clause_args(fun)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn method_receiver(&self, fun: &Tree) -> Tree {
         match &fun.kind {
-            TreeKind::TypeApply { fun, .. } | TreeKind::Typed { expr: fun, .. } => {
-                self.method_receiver(fun)
-            }
+            TreeKind::Apply { fun, .. }
+            | TreeKind::TypeApply { fun, .. }
+            | TreeKind::Typed { expr: fun, .. } => self.method_receiver(fun),
             TreeKind::Select { qual, .. } => (**qual).clone(),
             _ => {
                 let this_ty = if self.st.this_class.is_none() {
@@ -7176,9 +7463,17 @@ impl Typer {
         _pt: &Type,
     ) -> OverloadPick {
         let mut cands: Vec<(SymbolId, Vec<Type>, Type)> = Vec::new();
+        // Which parameter clause these candidates come from: `f(a)(b = 1)`
+        // applied as `f(1)()` leaves a residual method type whose only clause
+        // is the *second* one, and that is where the defaults live.
+        let mut clause = 0usize;
         match fun_ty {
             Type::Method { paramss, ret } => {
                 let ps = paramss.first().cloned().unwrap_or_default();
+                if !fun_sym.is_none() {
+                    let all = self.st.get(fun_sym).paramss.len();
+                    clause = all.saturating_sub(paramss.len());
+                }
                 cands.push((fun_sym, ps, (**ret).clone()));
             }
             Type::Function { params, ret } => {
@@ -7254,7 +7549,7 @@ impl Typer {
         let applicable: Vec<(SymbolId, Vec<Type>, Type)> = {
             let no_view: Vec<_> = cands
                 .iter()
-                .filter(|(sym, ps, _)| self.is_applicable(*sym, ps, arg_tys, false))
+                .filter(|(sym, ps, _)| self.is_applicable(*sym, clause, ps, arg_tys, false))
                 .cloned()
                 .collect();
             if !no_view.is_empty() {
@@ -7262,7 +7557,7 @@ impl Typer {
             } else {
                 cands
                     .into_iter()
-                    .filter(|(sym, ps, _)| self.is_applicable(*sym, ps, arg_tys, true))
+                    .filter(|(sym, ps, _)| self.is_applicable(*sym, clause, ps, arg_tys, true))
                     .collect()
             }
         };
@@ -7300,12 +7595,13 @@ impl Typer {
 
     /// nsc: `A` is as specific as `B` when `B` is applicable to `A`'s parameter types.
     fn is_as_specific_method(&self, a_ps: &[Type], b_ps: &[Type]) -> bool {
-        self.is_applicable(SymbolId::NONE, b_ps, a_ps, true)
+        self.is_applicable(SymbolId::NONE, 0, b_ps, a_ps, true)
     }
 
     fn is_applicable(
         &self,
         sym: SymbolId,
+        clause: usize,
         params: &[Type],
         args: &[Type],
         allow_widen: bool,
@@ -7343,7 +7639,9 @@ impl Typer {
         if args.len() > params.len() {
             return false;
         }
-        if args.len() < params.len() && !self.trailing_omissible(sym, args.len(), params.len()) {
+        if args.len() < params.len()
+            && !self.trailing_omissible(sym, clause, args.len(), params.len())
+        {
             return false;
         }
         args.iter()
@@ -7363,16 +7661,28 @@ impl Typer {
         }
     }
 
-    fn trailing_omissible(&self, sym: SymbolId, given: usize, total: usize) -> bool {
+    fn trailing_omissible(&self, sym: SymbolId, clause: usize, given: usize, total: usize) -> bool {
         if sym.is_none() || given >= total {
             return false;
         }
         let s = self.st.get(sym);
-        let ids = if !s.params.is_empty() {
-            s.params.clone()
-        } else {
-            s.paramss.first().cloned().unwrap_or_default()
-        };
+        // `params` is every clause flattened, so a residual clause (`f(1)()`
+        // for `def f(a: Int)(b: Int = 2)`) has to be read out of `paramss` or
+        // the defaults of the wrong clause are consulted. `pick_ctor` flattens
+        // a multi-clause constructor into one clause, though, so fall back to
+        // the flat list whenever the clause does not have the expected arity.
+        let ids = s
+            .paramss
+            .get(clause)
+            .filter(|c| c.len() >= total)
+            .cloned()
+            .unwrap_or_else(|| {
+                if s.params.is_empty() {
+                    s.paramss.first().cloned().unwrap_or_default()
+                } else {
+                    s.params.clone()
+                }
+            });
         if ids.len() < total {
             return false;
         }
@@ -8342,12 +8652,12 @@ impl Typer {
                             if slots[i].is_some() {
                                 self.error(
                                     a.span,
-                                    format!("parameter `{name}` is already specified"),
+                                    format!("parameter '{name}' is already specified"),
                                 );
                             }
                             slots[i] = Some((**rhs).clone());
                         }
-                        None => self.error(a.span, format!("no parameter named `{name}`")),
+                        None => self.error(a.span, format!("unknown parameter name: {name}")),
                     }
                     continue;
                 }
