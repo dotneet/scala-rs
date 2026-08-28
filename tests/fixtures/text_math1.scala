@@ -1,0 +1,28 @@
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(5.toBinaryString)
+    println(255.toHexString)
+    println(255.toOctalString)
+    println((-3).sign)
+    println((-3L).sign)
+    println((-2.5).sign)
+    println(0.5.isNaN)
+    println((0.0 / 0.0).isNaN)
+    println(2.7.round)
+    println(2.7.floor)
+    println(2.7.ceil)
+    println('a'.isLetter)
+    println('1'.isDigit)
+    println('a'.toUpper)
+    println(true.compare(false))
+    println(scala.math.abs(-5))
+    println(scala.math.max(3, 7))
+    println(scala.math.min(3, 7))
+    println(scala.math.pow(2.0, 10.0))
+    println(scala.math.sqrt(16.0))
+    println(scala.math.floor(3.7))
+    println(scala.math.ceil(3.2))
+    println(scala.math.round(3.5))
+    println(scala.math.signum(-8))
+  }
+}

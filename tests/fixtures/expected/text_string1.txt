@@ -1,0 +1,15 @@
+Hello World
+cdef
+bc
+1
+4
+zbc
+hello there
+true
+false
+true
+true
+abcdef
+x
+ababab
+-1

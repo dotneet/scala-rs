@@ -1,0 +1,11 @@
+hello 42!
+9
+false
+>>hello 42!
+>hello 42!
+>he
+eh>
+true
+abc
+true
+b

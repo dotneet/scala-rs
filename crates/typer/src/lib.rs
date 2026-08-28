@@ -6,6 +6,7 @@ mod javaclass;
 mod javasign;
 mod lambda_lift;
 mod prelude;
+mod prelude_text;
 mod symbol;
 mod uncurry;
 
