@@ -278,6 +278,7 @@ Cargo workspace のクレート:
 | --- | --- |
 | `crates/pickle/src/codec.rs` | SID-10 ByteCodecs（ライタと共用） |
 | `crates/pickle/src/classfile.rs` | `ScalaSignature` に届くだけの classfile 解析。`ScalaLongSignature`（配列値）も扱う |
+| `crates/pickle/src/names.rs` | Scala `NameTransformer`（`++` ↔ `$plus$plus`）。backend と共用 |
 | `crates/pickle/src/read.rs` | pickle **リーダ**。バイト列 → エントリ表 |
 | `crates/pickle/src/sym.rs` | エントリ表 → クラスシグネチャ。親を辿り、型引数を代入して解決 |
 | `crates/typer/src/pickle_supply.rs` | `SigType` → `scala_rs_parser::Type`、`SymbolTable` への投入 |
@@ -335,21 +336,59 @@ erase 済み descriptor は scalac の erasure を再実装するのではなく
   継承メソッド・interface default method のどちらにも正しく解決される。
 - 戻り値が `Object` の場合の checkcast / unbox は `maybe_unbox_erased_result` が既に行う。
 
+#### 探索順は線形化（SLS 5.1.2）
+
+継承したメンバがどの型引数束縛で返るかは、**親をどの順で探すか**で決まります。
+`immutable.Set[A]` は `Iterable[A]` を混ぜたあとに `SetOps[A, Set, Set[A]]` を混ぜるので、
+SLS 5.1.2 の「後の親が勝つ」規則により `IterableOps` の不透明な `C` は
+`Set[A]` に解決されます。幅優先だと `Iterable` 経由で先に `IterableOps` に着き、
+弱い `Iterable[A]` を返してしまい、その型はシンボル表に無いのでメンバごと供給を諦めていました。
+
+`L(C) = C, L(Cn) +: … +: L(C1)` を `acc = L(Ci) ++ (acc − L(Ci))` として左から畳み込みます。
+コレクション階層は広いので、深さと総ステップ数に上限を置いています。
+
+#### 名前・オーバーロード・既定引数
+
+- **演算子名**: nsc は演算子名を**エンコードしたまま**持ちます。`SetOps` は `&` を
+  `$amp` として pickle し、classfile も `$amp` を宣言します。つまり pickle 検索も
+  descriptor 検索も**エンコード名**で行い、登録するシンボルはソース名のままにします。
+  `NameTransformer` は `crates/pickle/src/names.rs` に移して backend と共用しました
+  （アセンブラは元から出力名をエンコードしているので codegen 側の変更は不要）。
+- **オーバーロードの重複排除**は erase 後の引数リストで行います。同じに erase される宣言は
+  別の親から見た同一 JVM メソッドで、結果型だけが違う場合
+  （`IterableOps.map[B]: Iterable[B]` と `MapOps.map[K2,V2]: Map[K2,V2]`）は
+  scalac が期待型で選ぶところをこちらは選べないので、線形化順で先に来る派生側を採ります。
+  引数が違うもの（`Iterator.from(Int)` と `from(IterableOnce)`）は別物として両方残します。
+- ただし**関数を取るオーバーロードは 1 つだけ**にします。ラムダの引数型は
+  単一の期待型からしか推論できないので、2 つ目を足すと
+  `xs.segmentLength(_ < 3)` が解けないオーバーロード集合になります。
+- **既定引数**: パラメータに印を付け、クラスの `<method>$default$<n>` ゲッタも一緒に供給します
+  （ゲッタは synthetic なので、目的を持って取りに行くときだけフィルタを緩めます）。
+  ゲッタが供給できないメンバは**まるごと供給しません**。これが無いと
+  `xs.lastIndexOf(2)` が型検査を通り、2 引数の descriptor に 1 引数で呼び出す
+  バイトコードを出して VerifyError になります。
+
 #### 今できること
 
 `--scala-library <jar>` のとき、**prelude に 1 行も書かずに**次が型検査を通り、
-`java -Xverify:all -cp out:jar Main` で scalac 2.13.16 と同じ出力を出します。
+`java -Xverify:all -cp out:jar Main` で scalac 2.13.16 と**バイト単位で同じ**出力を出します。
 
 - `List`: `filter` `filterNot` `count` `exists` `forall` `take` `drop` `takeWhile`
-  `dropWhile` `reverse` `mkString`(1/3 引数) `contains` `indexOf` `init` `last`
+  `dropWhile` `reverse` `mkString`(0/1/3 引数) `contains` `indexOf` `init` `last`
   `distinct` `startsWith` `splitAt` `partition` `span` `slice` `headOption`
   `lastOption` `find` `sorted` `sortBy` `sortWith` `max` `min` `maxBy` `toVector`
-  `toSet` `toArray` `scanLeft` `zip` `padTo` `updated` `patch` `indexWhere`
-  `tails` `combinations` `permutations` `zipWithIndex` `grouped` `sliding`
+  `toSet` `toSeq` `toArray` `scanLeft` `zip` `padTo` `updated` `patch` `indexWhere`
+  `tails` `combinations` `permutations` `zipWithIndex` `grouped` `sliding`(1/2 引数)
+  `view` `iterator` `flatMap` `foldRight` `reduce` `reduceLeft` `copyToArray`
+  `sum` `product`
+- 演算子: `:+` `+:` `++` `++:`、`Set` の `&` `|` `&~` `++`、`Map` の `+` `-`
+- `Map`: `map` `filter` `keySet`。`Set`: `map` `filter`。`Vector`: `map` `filter` `mkString`
+- `Range` / `IndexedSeq`: `filter` `map`
 - `Option`: `exists` `forall` `contains` `filter` `toList`
-- `Vector`: `filter` `mkString`。`Map`: `keySet`。`Iterator`: `toList`
+- companion: `Iterator.from` `.continually` `.single`、`List.fill` `.tabulate`、
+  `Vector.fill` `.tabulate`、`Set.empty`
 
-型パラメータの扱いで 2 点、nsc と同じ判断を入れています。
+型パラメータの扱いで nsc と同じ判断を 2 つ入れています。
 
 - `scala.package.List` / `scala.package.Ordering` は package object の**型エイリアス**で、
   pickle はエイリアス名で参照します。表を持たず、`scala/package.class` の pickle から
@@ -362,19 +401,32 @@ erase 済み descriptor は scalac の erasure を再実装するのではなく
 
 #### まだできないこと
 
-- **`sum` / `product`**: `[B >: A](implicit num: Numeric[B])B`。
-  `scala.math.Numeric` がシンボル表に無いので供給しません。通すには
-  (a) 未知のライブラリクラスを pickle からスタブする、
-  (b) companion の implicit インスタンス（`Numeric.IntIsIntegral` など）も
-  pickle から供給する、の 2 つが要ります。`Ordering` は prelude にあるので `sorted` は通ります。
-- **`Set#filter` / `Map#filter`**: 親の探索が BFS で、宣言クラスへ最初に着いた経路の
-  代入を使います。受け手自身が宣言していれば override 意味論と一致しますが、
-  していない場合は `Set[A]` ではなく `Iterable[A]` のような**より弱い型**に着地しえます。
-  今はその型が表に無いので供給せず `is not a member` になります。正確には C3 線形化が要ります。
-- **デフォルト引数**（`lastIndexOf(elem, end = ...)`）と**演算子名**（`++` → `$plus$plus`）。
-  後者は JVM 名のマングリングを backend と共有していないため、英数字名だけに限定しています。
-- **implicit が見つからないとき**、typer が eta 展開して黙って通す既存挙動。
-  供給側では上の型パラメータ規則で塞いでいますが、根本の挙動は残っています。
+- **シンボル表にあるクラスの作り直し**。`scala/collection/Seq` は
+  `find_or_stub_java_class` が**型パラメータ無し**で入れているので `Seq[B]` が当たらず、
+  `diff` / `intersect` / `union` / `indexOfSlice` / `containsSlice` は供給できません。
+  一度は pickle の型パラメータを後付けして通しましたが、prelude が組んだシンボルを
+  作り替えると影響が広く、`Seq` を変えた途端に**手書きの** `segmentLength` /
+  `scanRight` が解決しなくなりました。動いているものを壊す方が悪いので表には触れません。
+  表に無いクラスを新規にスタブするのはそのまま有効です。
+- **スタブに親を付けない**（表に無いクラスを新規に作る場合）。親鎖を与えると
+  部分型関係が全体的に変わるので、`Type::AnyRef` だけにしています。
+  スタブ型は基本的にそれ自身としてしか使えません。
+  なお、補完したクラスには pickle が宣言する親を**足します**（`attach_parents`）。
+  これが無いと `Set#&`（引数が `collection.Set[A]`）は供給できても呼べません。
+- **既定引数のゲッタ規約の食い違い**。`default_getter_apply` は既定引数より前の実引数を
+  ゲッタに渡しますが、scalac は `SeqOps.lastIndexOf$default$2()` を引数無しで生成します。
+  食い違う形は供給しません（`lastIndexOf` は現状これで落ちます）。
+  直すには `check.rs` の既定引数経路に手を入れる必要があります。
+- **`String.format`**: `augmentString` → `StringOps` の**拡張メソッド**経路で、
+  補完フックはメンバ解決の失敗後にあります。受け手は `java/lang/String` なので
+  `scala/` スコープにも入りません。
+- **`scala.io.Source`**: pickle 経路ではなく Java classfile ローダ側で解決されています。
+- **`reduceOption`**: `[B >: A](op: (B, B) => B): Option[B]`。ラムダから `B` を解けず、
+  `bound_lo` を入れても届きません（推論側の話）。
+- **`collect { case … }`**: インラインの部分関数リテラルからの推論は
+  pickle 供給以前の typer の制約です（`list_collect.scala` は名前付き `PartialFunction` を渡しています）。
+
+`SCALA_RS_PICKLE_DEBUG=1` で、どのメンバをなぜ供給した / しなかったかを追えます。
 
 ### 2.13.16 の pickle で分かったこと
 
@@ -382,10 +434,14 @@ erase 済み descriptor は scalac の erasure を再実装するのではなく
   クラス側の classfile にしか置かれないので、module class は companion にフォールバックする。
 - 純 Java 由来のクラス（`BoxesRunTime` / `*Ref` / `ScalaNumber` / `scala.collection.concurrent` の
   ノード類）は `ScalaSignature` を持たない。
-- `pflags`（pickle 上の flag ビット）は bit 0..=31 だけ名前を付けている。
-  nsc は下位 12bit を `rawToPickledFlags` で並べ替えるため raw の Flags 位置とは違う。
-  32bit 以上（`LAZY` / `VARARGS` など）は値としては読めるが、
-  位置を取り違えるとシンボルを黙って誤分類するので名前を付けていない。
+- `pflags`（pickle 上の flag ビット）は nsc が下位 12bit を `rawToPickledFlags` で
+  並べ替えるため raw の Flags 位置とは違う。bit 12 以上は raw と同じで、
+  **term と type で意味を共有するビットがある**（`COVARIANT`/`BYNAMEPARAM` が同じ bit、
+  `TRAIT`/`DEFAULTPARAM` も同じ bit）。
+  最初この表は bit 16 以上が 1 つずれていて、`is_public_api` が SYNTHETIC のつもりで
+  STABLE を、LOCAL のつもりで JAVA を見ていた（過剰に弾く方向だったので結果は合っていた）。
+  今は実シンボルに対する `flag_bits_match_the_library` で全位置を固定している。
+  bit 30 以上は必要が無いので名前を付けていない。
 
 ## scalac 2.13 との比較
 
@@ -429,6 +485,10 @@ jar の**全 classfile**を走査して次を見ます。jar が無ければス�
 - `resolves_inherited_list_members_through_parents`: `List#filter` / `sum` / `mkString` /
   `map` / `flatMap` / `head` / `foldLeft` を**親クラスを辿って**解決できること。
 - `resolves_module_class_members`: module class（`object List`）の解決。
+- `set_filter_binds_c_through_setops_not_iterable` / `linearization_puts_later_parents_first`:
+  探索順が SLS 5.1.2 の線形化であること（`Set#filter` が `Iterable[A]` でなく `Set[A]` を返す）。
+- `flag_bits_match_the_library`: pickle 上の flag ビット位置を実シンボルで固定する
+  （trait / accessor / stable / synthetic / private+local / 既定引数）。
 
 自前ライタが書いた pickle を自前リーダで読み直すテストは
 `crates/backend/tests/pickle_roundtrip.rs` です。
@@ -436,10 +496,10 @@ jar の**全 classfile**を走査して次を見ます。jar が無ければス�
 型検査への接続は `crates/cli/tests/pickle_lib.rs`（fixture 接頭辞 `pickle_lib`）です。
 `e2e.rs` とは別ファイルにしています。
 
-- `inherited_list_members_come_from_the_pickle`（`pickle_lib1`）と
-  `ordering_and_alias_members_come_from_the_pickle`（`pickle_lib2`）:
+- `pickle_lib1`（継承したメンバ）/ `pickle_lib2`（Ordering・型エイリアス・カリー化）/
+  `pickle_lib3`（線形化とスタブしたクラス）/ `pickle_lib4`（演算子・companion・`sum`）:
   jar にリンクしてコンパイルし、`java -Xverify:all` で期待 stdout と比較する。
-  **この 2 つの期待値は本物の scalac 2.13.16 の出力とバイト単位で一致することを確認済み**
+  **4 つとも期待値は本物の scalac 2.13.16 の出力とバイト単位で一致することを確認済み**
   （自前コンパイラ同士の比較ではない）。
 - `a_member_in_no_pickle_is_still_an_error`（`pickle_lib1_bad`）:
   どの pickle にも無い名前は補完せず `is not a member` になる。
@@ -698,15 +758,17 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 - 残りの **StringOps**（`++` / `lengthIs` / `sizeIs` / `flatMap` / `iterator` / `sizeCompare` / `knownSize` / `appendedAll` / `prependedAll` / `>` / `>=` / `<=` / `compare` / `lengthCompare` / `patch(Int, String, Int)` / `<` / `map`（`Char => Char`）/ `:+` / `+:` / `foldRight` / `toByteOption` / `toShortOption` / `toFloatOption` / `grouped` / `foldLeft` / `toByte` / `toShort` / `toFloat` / `toLongOption` / `toDoubleOption` / `find` / `foreach` / `toBoolean` / `toBooleanOption` / `dropWhile` / `takeWhile` / `nonEmpty` / `headOption` / `lastOption` / `filterNot` / `indices` / `r` / `sorted` / `toArray` / `copyToArray` / `partition` / `exists` / `forall` / `splitAt` / `updated` / `count` / `span` / `diff` / `intersect` / `split(String)` / `filter` / `reverseIterator` 以外）
 - 残りの **ArrayOps**（`lengthIs` / `sizeIs` / `indexOf` / `copyToArray` / `iterator` / `zipWithIndex` / `knownSize` / `sizeCompare` / `filterNot` / `headOption` / `lastOption` / `partition` / `splitAt` / `span` / `find` / `contains` / `distinct` / `takeRight` / `dropRight` / `takeWhile` / `indices` / `lengthCompare` / `last` / `init` / `reverse` / `size` / `isEmpty` / `nonEmpty` / `scanLeft` / `count` / `forall` / `foldLeft` / `fold` / `foldRight` / `drop` / `dropWhile` / `exists` / `take` / `collect` / `zip` / `filter` / `slice` / 3 引数 `flatMap` / 4 引数 Array→Iterable `flatMap` と primitive wrappers / `genericArrayOps` の `head`/`map`/`foreach`/`tail` は揃った。他メソッド。`reduce` は 2.13.16 ArrayOps に無い）
 - 他の mutable（`ArrayDeque` / `LinkedHashMap` / `LinkedHashSet` / `HashMap` / `HashSet` / `ArrayBuffer` / `ListBuffer` 以外）と他の immutable（`BitSet` / `SortedMap` / `TreeMap` / `SortedSet` / `TreeSet` / `Set` / `Map` / `Vector` 以外）。`scala.collection.View` の `List.view` / `map` / `toList` と `View.fill` / `View.iterate` は乗った（他の View は未）。`scala.util.control.Breaks` の `breakable` / `break` / `tryBreakable`+`catchBreak` は乗った（他の control は未）。`scala.math.BigInt` / `BigDecimal` の `apply(Int)` / `apply(String)` / `+` / `*` / `int2bigInt` は乗った（他の math は未）。`scala.util.chaining` の `pipe` / `tap` は乗った。`scala.util.Using.resource` / `Using.apply` / `Using.Manager` / `Using.resources`（2–4 引数）は乗った（他の Using は未）
-- **pickle からのシンボル自動供給の残り**: リーダ・シグネチャ復元・継承解決・
-  型検査への接続は動いていて、`List` / `Option` / `Vector` / `Map` の 50 以上のメンバが
-  prelude 手書きなしで通り、実行結果は scalac 2.13.16 と一致する。残りは
-  (a) `Numeric` など**シンボル表に無いライブラリクラスのスタブ**と、
-  companion の implicit インスタンス供給（これが要るので `sum` / `product` は未対応）、
-  (b) **C3 線形化**（今は BFS で最初に着いた経路の型引数代入を使うため、
-  受け手自身が宣言していないメンバは `Set[A]` でなく `Iterable[A]` のような
-  弱い型に着地しえて、その場合は供給を諦める）、
-  (c) デフォルト引数、(d) 演算子名の JVM マングリング共有。
+- **pickle からのシンボル自動供給の残り**: リーダ・シグネチャ復元・線形化・
+  型検査への接続は動いていて、`List` / `Option` / `Map` / `Set` / `Vector` / `Range` /
+  `Iterator` の 60 以上のメンバ（演算子と companion メンバを含む）が prelude 手書きなしで通り、
+  実行結果は scalac 2.13.16 と一致する。残りは
+  (a) **シンボル表に既にあるクラスの作り直し**（`scala/collection/Seq` に型パラメータが無いため
+  `diff` / `intersect` / `union` / `indexOfSlice` / `containsSlice` が供給できない。
+  後付けは手書きメンバを壊したので採らない）、
+  (b) スタブに親鎖を与えないことによる部分型の弱さ、
+  (c) **既定引数のゲッタ規約**の食い違い（`check.rs` 側の修正が要る）、
+  (d) `String.format` のような拡張メソッド経路と `scala.io.Source` の Java ローダ経路、
+  (e) ラムダ由来の型推論（`reduceOption`、インライン `collect { case … }`）。
   詳細は「ScalaSignature からのシンボル自動供給」節
 - **`Either` / `Try` / `Option` の残り**: `Either` の `joinLeft` / `joinRight` / `flatten` / `toTry` / `cond`（`<:<` を要求するもの、および companion）、`LeftProjection` の `filter`、`Try` の `flatten`、`Option` の `orNull` / `unzip` / `unzip3` / `iterator` / `when` / `unless` / `empty` / `apply`（companion）。**2.13 の `Either` に `withFilter` は無い**ので `for` のガードは nsc どおりコンパイルエラーのまま（`filterOrElse` を使う）。私有ランタイムは `Either` / `Try` を持たないので、そのまま診断する
 - **`java.lang` の例外**は `ArithmeticException` / `ClassCastException` / `IllegalArgumentException` / `IllegalStateException` / `IndexOutOfBoundsException` / `NullPointerException` / `NumberFormatException` / `UnsupportedOperationException` と `Throwable` / `Exception` / `RuntimeException` の `()` / `(String)` コンストラクタ、`getMessage` まで。他の JDK 例外・メソッドは未
