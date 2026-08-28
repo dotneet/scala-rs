@@ -197,6 +197,15 @@ fn discover_jdk_jmods() -> Vec<PathBuf> {
             homes.push(home.to_path_buf());
         }
     }
+    // macOS: `/usr/bin/java` is a stub, not a symlink into a JDK. Ask java_home.
+    if let Ok(o) = std::process::Command::new("/usr/libexec/java_home").output() {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !s.is_empty() {
+                homes.push(PathBuf::from(s));
+            }
+        }
+    }
     homes.push(PathBuf::from("/usr/lib/jvm/default-java"));
     homes.push(PathBuf::from("/usr/lib/jvm/java-21-openjdk-amd64"));
     let mut seen = std::collections::HashSet::new();
