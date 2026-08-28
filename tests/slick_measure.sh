@@ -6,6 +6,11 @@ SP=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-92
 SRC=$SP/slick/slick/src/main
 COMPAT=$SP/slick/slick-compat-collections/src/main/scala-2.13+
 BIN=${SCALA_RS:-/Users/shinji/projects/scala-rs/target/release/scala-rs}
+# The release binary is not what `cargo test` builds; measuring a stale one
+# silently reports the previous commit's numbers.
+if [[ -z ${SCALA_RS:-} ]]; then
+  cargo build -q -p scala-rs-cli --release
+fi
 FILES=($(find $SRC/scala $SRC/scala-2 $COMPAT -name '*.scala' | sort))
 OUT=${SLICK_OUT:-$SP/measure-out}
 rm -rf $OUT; mkdir -p $OUT
