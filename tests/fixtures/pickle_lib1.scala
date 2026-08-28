@@ -22,7 +22,7 @@ object Main {
     println(xs.init)
     println(xs.last)
     println(xs.distinct)
-    println(xs.startsWith(List(1, 2), 0))
+    println(xs.startsWith(List(1, 2)))
     println(xs.splitAt(2))
     println(xs.partition(_ > 2))
     println(xs.span(_ < 3))

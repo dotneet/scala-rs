@@ -755,7 +755,7 @@ object Main {
   def main(args: Array[String]): Unit = {
     val xs = List(1, 2, 3)
     xs.map(x => x + 1)
-    xs.filter(x => x > 1)
+    xs.tails
   }
 }
 "#;
@@ -782,17 +782,17 @@ object Main {
             "prelude List#map was replaced by a pickle-supplied one"
         );
         // ...while a member the prelude does not have does come from the pickle.
-        let filters: Vec<_> = st
+        let tails: Vec<_> = st
             .get(list)
             .members
             .iter()
-            .filter(|&&m| st.get(m).name == "filter")
+            .filter(|&&m| st.get(m).name == "tails")
             .collect();
-        assert_eq!(filters.len(), 1, "expected exactly one supplied filter");
+        assert_eq!(tails.len(), 1, "expected exactly one supplied tails");
         assert!(
-            st.get(*filters[0]).jvm_name.starts_with('('),
-            "List#filter should carry an erased descriptor, got {:?}",
-            st.get(*filters[0]).jvm_name
+            st.get(*tails[0]).jvm_name.starts_with('('),
+            "List#tails should carry an erased descriptor, got {:?}",
+            st.get(*tails[0]).jvm_name
         );
     }
 
