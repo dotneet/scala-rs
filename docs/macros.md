@@ -230,9 +230,10 @@ nsc は `c.universe` に自分自身（`Global`）を差す。我々は代わり
 ### 2.3 prototype による検証（実施済み）
 
 「Java の `java.lang.reflect.Proxy` で `blackbox.Context` を作り、`universe()` に
-実行時ユニバースを返す」だけの約 120 行の probe を書き、scalac でコンパイルした
+実行時ユニバースを返す」だけの約 180 行の probe を書き、scalac でコンパイルした
 マクロ実装を実際に呼び出した。JDK 17 の `InvocationHandler.invokeDefault` により、
 トレイトのデフォルト実装（`weakTypeOf` など）は本物が走る。
+コードと再現手順は [`docs/macro-engine-prototype/`](macro-engine-prototype/) にある。
 
 検証したマクロ実装と結果：
 
@@ -561,5 +562,6 @@ blackbox だけを実装し、whitebox のマクロ def を見つけたら診断
 - `= macro <ref>` を**パースできる**。以前の `unimplemented syntax: macros` は出ない。
 - マクロ def のシンボルにバインディングを記録する。
 - **展開はまだできない**。呼び出し地点で診断を出す。黙って通すことはしない。
-- §2.3 の prototype は `docs/` 配下ではなくセッションのスクラッチにある。
-  フェーズ 2 で `crates/macro-engine/` として正式に取り込む。
+- §2.3 の prototype は [`docs/macro-engine-prototype/`](macro-engine-prototype/) にある。
+  CI では走らない（scalac と scala-reflect.jar が要る）。走らせ方と、製品版に足りないものは
+  そこの README に書いた。フェーズ 2 で `crates/macro-engine/` として正式に取り込む。
