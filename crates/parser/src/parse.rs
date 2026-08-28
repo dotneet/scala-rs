@@ -12,8 +12,28 @@ pub struct ParseResult {
     pub diags: Vec<Diagnostic>,
 }
 
+/// Source-level switches that change what the parser accepts.
+///
+/// `scalac -Xsource:3` turns on a handful of Scala 3 spellings inside an
+/// otherwise 2.13 parser. Only the ones this subset implements live here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParseOptions {
+    /// `-Xsource:3` / `-Xsource:3-cross`: accept `A & B` as a compound type.
+    pub source3: bool,
+}
+
 pub fn parse_source(source: &SourceFile, file_index: usize, tokens: Vec<Token>) -> ParseResult {
+    parse_source_opts(source, file_index, tokens, ParseOptions::default())
+}
+
+pub fn parse_source_opts(
+    source: &SourceFile,
+    file_index: usize,
+    tokens: Vec<Token>,
+    opts: ParseOptions,
+) -> ParseResult {
     let mut p = Parser::new(source, file_index, tokens);
+    p.opts = opts;
     let tree = p.parse_compilation_unit();
     ParseResult {
         tree,
@@ -52,6 +72,7 @@ struct Parser<'a> {
     /// nsc `placeholderParams`: synthetic vals from expression `_`, newest last.
     placeholder_params: Vec<Tree>,
     placeholder_id: u32,
+    opts: ParseOptions,
 }
 
 impl<'a> Parser<'a> {
@@ -65,7 +86,28 @@ impl<'a> Parser<'a> {
             next_id: 1,
             placeholder_params: Vec::new(),
             placeholder_id: 0,
+            opts: ParseOptions::default(),
         }
+    }
+
+    /// True when the identifier token at `sp` was written with backquotes.
+    /// nsc keeps this on the token; we recover it from the source text, which
+    /// is enough to tell ``` `?` ``` (a real type name) from `?` (a wildcard).
+    fn is_backquoted(&self, sp: Span) -> bool {
+        self.source.src.as_bytes().get(sp.lo.0 as usize) == Some(&b'`')
+    }
+
+    /// `?` in type position: a wildcard alias for `_` (scalac 2.13.6+, and in
+    /// Scala 3). Backquoted ``` `?` ``` is an ordinary type name.
+    fn at_question_wildcard(&self) -> bool {
+        matches!(self.kind(), TokenKind::Ident(s) if s == "?") && !self.is_backquoted(self.span())
+    }
+
+    /// `-Xsource:3` intersection type separator `A & B`, spelled `with` in 2.13.
+    fn at_amp_intersection(&self) -> bool {
+        self.opts.source3
+            && matches!(self.kind(), TokenKind::Ident(s) if s == "&")
+            && !self.is_backquoted(self.span())
     }
 
     fn alloc(&mut self, span: Span, kind: TreeKind) -> Tree {
@@ -1391,7 +1433,11 @@ impl<'a> Parser<'a> {
     fn parse_type_def(&mut self, mods: Modifiers) -> Tree {
         let lo = self.span();
         self.bump();
-        let (name, _) = self.expect_ident();
+        let question = self.at_question_wildcard();
+        let (name, nsp) = self.expect_ident();
+        if question {
+            self.error_span(nsp, "using `?` as a type name requires backticks");
+        }
         let tparams = self.parse_type_param_clause();
         self.skip_nl();
         let mut lo_b = None;
@@ -1563,7 +1609,13 @@ impl<'a> Parser<'a> {
             // Don't treat following ident as infix if it's a def start on a new "statement"
             // In types, `T Either U` is infix. If next is ident and then a type, take it.
             let saved = self.pos;
+            let question = self.at_question_wildcard();
             let (name, nsp) = self.expect_ident();
+            if question {
+                // nsc: `?` is reserved for the wildcard, so it cannot be used
+                // as an infix type constructor without backquotes.
+                self.error_span(nsp, "using `?` as a type name requires backticks");
+            }
             self.skip_nl();
             // postfix repeated `T*` — nsc does not parse this as infix `T * <error>`
             if name == "*" && !self.at_type_start() {
@@ -1686,7 +1738,8 @@ impl<'a> Parser<'a> {
         let mut parents = vec![t.clone()];
         loop {
             self.skip_nl();
-            if matches!(self.kind(), TokenKind::With) {
+            // `A with B`, and under `-Xsource:3` the Scala 3 spelling `A & B`.
+            if matches!(self.kind(), TokenKind::With) || self.at_amp_intersection() {
                 self.bump();
                 parents.push(self.parse_annot_type());
             } else {
@@ -1855,6 +1908,44 @@ impl<'a> Parser<'a> {
         Some(self.alloc(sp, TreeKind::Literal { lit }))
     }
 
+    /// Wildcard type `_` / `?`, with optional bounds (`_ <: T`, `? >: T`).
+    /// Both spellings produce the same anonymous `TypeDef` the typer already
+    /// understands, so `?` needs nothing downstream.
+    fn parse_wildcard_type(&mut self) -> Tree {
+        let sp = self.span();
+        self.bump();
+        // nsc writes bounds as `>: lo <: hi`; accept either order once each.
+        let mut hi = None;
+        let mut lo = None;
+        loop {
+            match self.kind() {
+                TokenKind::Supertype if lo.is_none() => {
+                    self.bump();
+                    lo = Some(Box::new(self.parse_type()));
+                }
+                TokenKind::Subtype if hi.is_none() => {
+                    self.bump();
+                    hi = Some(Box::new(self.parse_type()));
+                }
+                _ => break,
+            }
+        }
+        let rhs = self.empty(sp);
+        self.alloc(
+            sp.merge(self.prev_span()),
+            TreeKind::TypeDef {
+                mods: Modifiers::default(),
+                name: "_".into(),
+                tparams: vec![],
+                rhs: Box::new(rhs),
+                lo,
+                hi,
+                views: vec![],
+                ctx_bounds: vec![],
+            },
+        )
+    }
+
     fn parse_simple_type(&mut self) -> Tree {
         self.skip_nl();
         if let Some(lit) = self.parse_constant_type_lit() {
@@ -1900,34 +1991,10 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            TokenKind::Underscore => {
-                let sp = self.span();
-                self.bump();
-                // wildcard type `_` / `_ <: T`
-                let mut hi = None;
-                let mut lo = None;
-                if matches!(self.kind(), TokenKind::Subtype) {
-                    self.bump();
-                    hi = Some(Box::new(self.parse_type()));
-                }
-                if matches!(self.kind(), TokenKind::Supertype) {
-                    self.bump();
-                    lo = Some(Box::new(self.parse_type()));
-                }
-                let rhs = self.empty(sp);
-                self.alloc(
-                    sp.merge(self.prev_span()),
-                    TreeKind::TypeDef {
-                        mods: Modifiers::default(),
-                        name: "_".into(),
-                        tparams: vec![],
-                        rhs: Box::new(rhs),
-                        lo,
-                        hi,
-                        views: vec![],
-                        ctx_bounds: vec![],
-                    },
-                )
+            TokenKind::Underscore => self.parse_wildcard_type(),
+            // `?` is a wildcard alias for `_` in type position.
+            TokenKind::Ident(ref s) if s == "?" && !self.is_backquoted(self.span()) => {
+                self.parse_wildcard_type()
             }
             TokenKind::This => {
                 let sp = self.span();

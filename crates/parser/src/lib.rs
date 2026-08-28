@@ -4,15 +4,19 @@ pub mod parse;
 pub mod pretty;
 
 pub use ast::*;
-pub use parse::{parse_source, ParseResult};
+pub use parse::{parse_source, parse_source_opts, ParseOptions, ParseResult};
 pub use pretty::dump_tree;
 
 use scala_rs_lexer::tokenize;
 use scala_rs_span::{Diagnostic, SourceFile};
 
 pub fn parse_file(source: &SourceFile, file_index: usize) -> ParseResult {
+    parse_file_opts(source, file_index, ParseOptions::default())
+}
+
+pub fn parse_file_opts(source: &SourceFile, file_index: usize, opts: ParseOptions) -> ParseResult {
     let (tokens, lex_diags) = tokenize(source, file_index);
-    let mut result = parse_source(source, file_index, tokens);
+    let mut result = parse_source_opts(source, file_index, tokens, opts);
     let mut diags = lex_diags;
     diags.append(&mut result.diags);
     result.diags = diags;
@@ -1021,5 +1025,106 @@ object Main {
             "expected unbound typed placeholder, got {:?}",
             r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    fn parse_opts(src: &str, opts: ParseOptions) -> ParseResult {
+        let sf = SourceFile::new("test.scala", src);
+        parse_file_opts(&sf, 0, opts)
+    }
+
+    #[test]
+    fn question_wildcard_type_is_underscore() {
+        // `?` lowers to the same anonymous TypeDef as `_`, with no flag.
+        let q = dump_tree(&parse_ok("object M { def f(x: List[?]): Int = 1 }"));
+        let u = dump_tree(&parse_ok("object M { def f(x: List[_]): Int = 1 }"));
+        assert_eq!(q, u, "`?` and `_` must produce the same tree");
+    }
+
+    #[test]
+    fn question_wildcard_bounds() {
+        // Bounds must be *consumed*: before `>: lo <: hi` was supported the
+        // parser stopped at the second bound with "expected ], found subtype".
+        for src in [
+            "object M { def f(x: List[? >: Null <: AnyRef]): Int = 1 }",
+            "object M { def f(x: List[_ >: Null <: AnyRef]): Int = 1 }",
+            "object M { def f(x: List[? <: AnyRef]): Int = 1 }",
+            "object M { def f(x: List[? >: Null]): Int = 1 }",
+        ] {
+            parse_ok(src);
+        }
+        assert_eq!(
+            dump_tree(&parse_ok(
+                "object M { def f(x: List[? >: Null <: AnyRef]): Int = 1 }"
+            )),
+            dump_tree(&parse_ok(
+                "object M { def f(x: List[_ >: Null <: AnyRef]): Int = 1 }"
+            )),
+        );
+    }
+
+    #[test]
+    fn backquoted_question_is_a_type_name() {
+        let r = parse_opts(
+            "object M { type `?`[A] = List[A] }",
+            ParseOptions::default(),
+        );
+        assert!(
+            !has_errors(&r.diags),
+            "backquoted `?` is a legal type name: {:?}",
+            r.diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bare_question_type_name_is_diagnosed() {
+        let r = parse_opts(
+            "object M { type ?[A, B] = Map[A, B] }",
+            ParseOptions::default(),
+        );
+        assert!(r
+            .diags
+            .iter()
+            .any(|d| d.message.contains("requires backticks")));
+    }
+
+    #[test]
+    fn amp_needs_xsource3() {
+        // Without the flag `A & B` is an ordinary infix type application.
+        let plain = dump_tree(&parse_ok(
+            "object M { def f(x: Product & Serializable): Int = 1 }",
+        ));
+        assert!(
+            plain.contains("Ident &"),
+            "expected infix `&` type constructor: {plain}"
+        );
+        assert!(!plain.contains("CompoundTypeTree"), "{plain}");
+    }
+
+    #[test]
+    fn amp_is_a_compound_type_under_xsource3() {
+        let r = parse_opts(
+            "object M { def f(x: Product & Serializable): Int = 1 }",
+            ParseOptions { source3: true },
+        );
+        assert!(!has_errors(&r.diags), "{:?}", r.diags);
+        let amp = dump_tree(&r.tree);
+        let with_ = dump_tree(&parse_ok(
+            "object M { def f(x: Product with Serializable): Int = 1 }",
+        ));
+        assert_eq!(amp, with_, "`&` must lower exactly like `with`");
+    }
+
+    #[test]
+    fn amp_chain_and_refinement_under_xsource3() {
+        let r = parse_opts(
+            "object M { def f(x: A & B & C { def g: Int }): Int = 1 }",
+            ParseOptions { source3: true },
+        );
+        assert!(!has_errors(&r.diags), "{:?}", r.diags);
+        let amp = dump_tree(&r.tree);
+        let with_ = dump_tree(&parse_ok(
+            "object M { def f(x: A with B with C { def g: Int }): Int = 1 }",
+        ));
+        assert_eq!(amp, with_);
     }
 }
