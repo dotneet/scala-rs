@@ -129,5 +129,6 @@ conform!(
     options,
     classes,
     interp,
-    chains
+    chains,
+    parse_forms
 );

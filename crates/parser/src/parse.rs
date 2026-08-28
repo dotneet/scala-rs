@@ -51,6 +51,8 @@ struct Parser<'a> {
     next_id: u32,
     /// nsc `placeholderParams`: synthetic vals from expression `_`, newest last.
     placeholder_params: Vec<Tree>,
+    /// Inside a typed pattern, `|` starts the next alternative, not an infix type.
+    no_bar_infix_type: bool,
     placeholder_id: u32,
 }
 
@@ -63,6 +65,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             diags: Vec::new(),
             next_id: 1,
+            no_bar_infix_type: false,
             placeholder_params: Vec::new(),
             placeholder_id: 0,
         }
@@ -1110,19 +1113,20 @@ impl<'a> Parser<'a> {
         // AnnotType [ArgumentExprs]. Constructor argument lists stay on the
         // same line (`new Foo(1)`). A newline after the class name is a
         // statement separator (`val b = new Box` / `b.x = 3`), matching nsc.
-        let tpt = self.parse_annot_type();
-        if matches!(self.kind(), TokenKind::LParen) {
+        let mut out = self.parse_annot_type();
+        // `class B extends A(1)(2)`: a parent takes as many argument lists as
+        // the constructor has.
+        while matches!(self.kind(), TokenKind::LParen) {
             let args = self.parse_arg_exprs();
-            self.alloc(
-                tpt.span.merge(self.prev_span()),
+            out = self.alloc(
+                out.span.merge(self.prev_span()),
                 TreeKind::Apply {
-                    fun: Box::new(tpt),
+                    fun: Box::new(out),
                     args,
                 },
-            )
-        } else {
-            tpt
+            );
         }
+        out
     }
 
     fn parse_template_body(&mut self) -> (Option<String>, Option<Box<Tree>>, Vec<Tree>) {
@@ -1615,6 +1619,15 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The type in a typed pattern. Same as `parse_infix_type` except that `|`
+    /// ends it, because alternation binds looser than the ascription.
+    fn parse_pattern_type(&mut self) -> Tree {
+        let saved_no_bar = std::mem::replace(&mut self.no_bar_infix_type, true);
+        let t = self.parse_infix_type();
+        self.no_bar_infix_type = saved_no_bar;
+        t
+    }
+
     fn parse_infix_type(&mut self) -> Tree {
         let mut t = self.parse_compound_type();
         loop {
@@ -1624,6 +1637,9 @@ impl<'a> Parser<'a> {
             }
             // Don't treat following ident as infix if it's a def start on a new "statement"
             // In types, `T Either U` is infix. If next is ident and then a type, take it.
+            if self.no_bar_infix_type && matches!(self.kind(), TokenKind::Ident(n) if n == "|") {
+                break;
+            }
             let saved = self.pos;
             let (name, nsp) = self.expect_ident();
             self.skip_nl();
@@ -3097,7 +3113,9 @@ impl<'a> Parser<'a> {
             self.bump();
             // Do not parse `A => B` here: the following `=>` starts the case body.
             // Function types in typed patterns need parentheses: `case _: (A => B) =>`.
-            let tpt = self.parse_infix_type();
+            // `|` separates alternatives, so it must not read as an infix type
+            // (`case _: Int | _: String =>`).
+            let tpt = self.parse_pattern_type();
             return self.alloc(
                 t.span.merge(tpt.span),
                 TreeKind::Typed {
