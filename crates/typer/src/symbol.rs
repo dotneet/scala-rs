@@ -401,6 +401,45 @@ impl SymbolTable {
         Vec::new()
     }
 
+    /// Look a name up in the *type* namespace. Scala keeps terms and types in
+    /// separate namespaces, so `val F = asyncF` inside a class parameterized by
+    /// `F[_]` must not hide the type parameter from `val u: F[Unit]`. A scope
+    /// that binds the name only as a term is therefore skipped, and the search
+    /// continues outward.
+    ///
+    /// A module is only a *fallback*: nsc names the module class of `object X`
+    /// `X$`, so an inherited `object JdbcType` never shadows the top-level
+    /// `trait JdbcType[T]` in type position. `X` alone still resolves to the
+    /// module when nothing in the type namespace carries that name.
+    pub fn lookup_type(&self, name: &str) -> Vec<SymbolId> {
+        let mut module_fallback: Vec<SymbolId> = Vec::new();
+        for sc in self.scopes.iter().rev() {
+            let found = sc.lookup(name);
+            if found.is_empty() {
+                continue;
+            }
+            if found.iter().any(|&s| self.is_type_namespace(s)) {
+                return found.to_vec();
+            }
+            if module_fallback.is_empty() && found.iter().any(|&s| self.is_module_like(s)) {
+                module_fallback = found.to_vec();
+            }
+        }
+        module_fallback
+    }
+
+    /// Names that live in the type namespace under their own spelling.
+    fn is_type_namespace(&self, s: SymbolId) -> bool {
+        matches!(
+            self.get(s).kind,
+            SymKind::Class | SymKind::TypeParam | SymKind::TypeMember
+        )
+    }
+
+    fn is_module_like(&self, s: SymbolId) -> bool {
+        matches!(self.get(s).kind, SymKind::Module | SymKind::ModuleClass)
+    }
+
     pub fn lookup_member(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -468,7 +507,7 @@ impl SymbolTable {
             // class wins, so `object B extends B` does not become its own
             // parent.
             Type::Named { name, .. } => {
-                let found = self.lookup(name);
+                let found = self.lookup_type(name);
                 found
                     .iter()
                     .copied()
@@ -479,7 +518,14 @@ impl SymbolTable {
             Type::Applied { ctor, .. } => self.class_sym_of(ctor),
             Type::TypeMember(id) => {
                 if !self.get(*id).tparams.is_empty() {
-                    None
+                    // A parameterized abstract member is not a class by itself,
+                    // but `type C[T] <: TypedType[T]` still offers `TypedType`'s
+                    // members, so member lookup goes through the upper bound.
+                    // The chase is guarded: `type Self >: this.type <: Self`
+                    // and mutually bounded members would otherwise loop.
+                    let mut seen = std::collections::HashSet::new();
+                    seen.insert(id.0);
+                    self.bounded_member_class(*id, &mut seen)
                 } else {
                     let seen = self.type_member_as_seen(*id);
                     if matches!(&seen, Type::TypeMember(x) if *x == *id) {
@@ -559,6 +605,45 @@ impl SymbolTable {
                 other => other,
             }
         }
+    }
+
+    /// The class that supplies the members of a parameterized abstract type
+    /// member, found by following its upper bound. `type B[T] <: C[T]` and
+    /// `type C[T] <: TypedType[T]` together make `TypedType` the answer for `B`.
+    /// `seen` stops the walk on recursive or mutually bounded members.
+    fn bounded_member_class(
+        &self,
+        id: SymbolId,
+        seen: &mut std::collections::HashSet<u32>,
+    ) -> Option<SymbolId> {
+        fn head(
+            st: &SymbolTable,
+            ty: &Type,
+            seen: &mut std::collections::HashSet<u32>,
+        ) -> Option<SymbolId> {
+            match ty {
+                Type::Class { sym, .. } => Some(*sym),
+                Type::Applied { ctor, .. } => head(st, ctor, seen),
+                Type::Annotated { tpe, .. } => head(st, tpe, seen),
+                Type::Refined { parents, .. } => parents.iter().find_map(|p| head(st, p, seen)),
+                Type::TypeMember(inner) => {
+                    if !seen.insert(inner.0) {
+                        return None;
+                    }
+                    st.bounded_member_class(*inner, seen)
+                }
+                _ => None,
+            }
+        }
+        let info = self.get(id);
+        if !matches!(&info.ty, Type::NoType | Type::Error | Type::TypeMember(_)) {
+            let rhs = info.ty.clone();
+            if let Some(c) = head(self, &rhs, seen) {
+                return Some(c);
+            }
+        }
+        let hi = info.bound_hi.clone()?;
+        head(self, &hi, seen)
     }
 
     /// `F[Int]` where `type F[X] = Id[X]` → `Id[Int]`. Abstract `type F[_]` stays applied.
@@ -661,7 +746,16 @@ impl SymbolTable {
                     t
                 }
                 Type::Annotated { tpe, .. } => walk(st, tpe, ty, seen),
-                Type::Applied { ctor, args } => {
+                // Only heads that `apply_type_ctor` folds may be re-walked: an
+                // abstract type-member head (`ColumnType[U]`) folds to the very
+                // same `Applied`, so recursing on it would not terminate — and
+                // it carries no class parameters to substitute anyway.
+                Type::Applied { ctor, args }
+                    if matches!(
+                        ctor.as_ref(),
+                        Type::Class { .. } | Type::Named { .. } | Type::Applied { .. }
+                    ) =>
+                {
                     let t = apply_type_ctor((**ctor).clone(), args.clone());
                     walk(st, &t, ty, seen)
                 }
@@ -1233,6 +1327,26 @@ impl SymbolTable {
         parts.join("/")
     }
 
+    /// `from` and the class-like symbols lexically enclosing it, innermost first.
+    fn enclosing_classes(&self, from: SymbolId) -> Vec<SymbolId> {
+        let mut out = Vec::new();
+        let mut cur = from;
+        while !cur.is_none() {
+            if self.get(cur).is_class_like() || out.is_empty() {
+                out.push(cur);
+            }
+            if out.len() > 16 {
+                break;
+            }
+            let owner = self.get(cur).owner;
+            if owner == cur {
+                break;
+            }
+            cur = owner;
+        }
+        out
+    }
+
     /// Replace abstract type members with aliases defined on `from` (and parents).
     pub fn expand_type_members(&self, from: SymbolId, ty: &Type) -> Type {
         match ty {
@@ -1244,16 +1358,22 @@ impl SymbolTable {
                     return ty.clone();
                 }
                 let name = self.get(*id).name.clone();
-                for m in self.lookup_member(from, &name) {
-                    if self.get(m).kind == SymKind::TypeMember {
-                        if !self.get(m).tparams.is_empty() {
-                            return Type::TypeMember(m);
+                // `from` first, then its lexically enclosing classes: an inner
+                // class (`Main.factory: Main.Factory`) sees `Main`'s implementation
+                // of an abstract member declared beside `Factory`, which is what
+                // nsc reaches through the outer-instance prefix.
+                for owner in self.enclosing_classes(from) {
+                    for m in self.lookup_member(owner, &name) {
+                        if self.get(m).kind == SymKind::TypeMember {
+                            if !self.get(m).tparams.is_empty() {
+                                return Type::TypeMember(m);
+                            }
+                            let t = self.get(m).ty.clone();
+                            if matches!(t, Type::TypeMember(_) | Type::NoType | Type::Error) {
+                                return Type::TypeMember(m);
+                            }
+                            return self.expand_type_members(from, &t);
                         }
-                        let t = self.get(m).ty.clone();
-                        if matches!(t, Type::TypeMember(_) | Type::NoType | Type::Error) {
-                            return Type::TypeMember(m);
-                        }
-                        return self.expand_type_members(from, &t);
                     }
                 }
                 ty.clone()

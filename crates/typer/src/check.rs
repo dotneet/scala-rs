@@ -560,6 +560,14 @@ impl Typer {
         if ctor.is_error() || args.iter().any(|a| a.is_error()) {
             return Type::Error;
         }
+        // An unresolved name applied to type arguments is a missing type, not a
+        // kind error: nsc reports `not found: type X`.
+        if let Type::Named { name, args: pre } = &ctor {
+            if pre.is_empty() && self.st.class_sym_of(&ctor).is_none() {
+                self.error(span, format!("not found: type {name}"));
+                return Type::Error;
+            }
+        }
         let ctor_arity = self.st.kind_arity(&ctor);
         if ctor_arity < args.len() {
             if ctor_arity == 0 {
@@ -616,7 +624,15 @@ impl Typer {
             }
         }
         let applied = crate::symbol::apply_type_ctor(ctor, args);
-        self.st.expand_applied_hk_alias(applied)
+        let expanded = self.st.expand_applied_hk_alias(applied);
+        // An alias body may still name an abstract member (`type C[T] = self.C[T]`).
+        // The class being typed knows how it implements those, so re-read the
+        // result from there, as `bind_found` does for term types.
+        if self.st.this_class.is_none() {
+            expanded
+        } else {
+            self.st.expand_type_members(self.st.this_class, &expanded)
+        }
     }
 
     fn check_proper_type(&mut self, ty: &Type, span: Span) {
@@ -650,7 +666,9 @@ impl Typer {
             if views.is_empty() && ctx_bounds.is_empty() {
                 continue;
             }
-            if !inner.is_empty() {
+            // A view bound on a higher-kinded parameter is illegal; a context
+            // bound on one is not (`class C[F[_]: Async]` is accepted by nsc).
+            if !inner.is_empty() && !views.is_empty() {
                 self.error(tp.span, format!("type {name} takes type parameters"));
                 continue;
             }
@@ -1485,8 +1503,28 @@ impl Typer {
                             ),
                         );
                     } else {
-                        let parent_hi = self.st.get(m).bound_hi.clone();
-                        let parent_lo = self.st.get(m).bound_lo.clone();
+                        // nsc compares the two declarations after aligning the
+                        // parent's type parameters with the child's, so
+                        // `type C[T] <: TypedType[T]` overridden by
+                        // `type C[T] = JdbcType[T]` compares `JdbcType[T_child]`
+                        // against `TypedType[T_child]`, not `TypedType[T_parent]`.
+                        let align = |st: &crate::symbol::SymbolTable, t: Option<Type>| {
+                            let ptps = st.get(m).tparams.clone();
+                            let ctps = st.get(mid).tparams.clone();
+                            let t = if ptps.is_empty() || ptps.len() != ctps.len() {
+                                t
+                            } else {
+                                let args: Vec<Type> =
+                                    ctps.iter().map(|&c| Type::TypeParam(c)).collect();
+                                t.map(|t| crate::symbol::subst_tparams_slice(&ptps, &args, &t))
+                            };
+                            // The bound is stated in the parent's terms, so a
+                            // sibling member it mentions (`type B[T] <: C[T]`)
+                            // must be re-read as the child implements it.
+                            t.map(|t| st.expand_type_members(class_id, &t))
+                        };
+                        let parent_hi = align(&self.st, self.st.get(m).bound_hi.clone());
+                        let parent_lo = align(&self.st, self.st.get(m).bound_lo.clone());
                         let child_ty = self.st.get(mid).ty.clone();
                         let child_hi = self.st.get(mid).bound_hi.clone();
                         let child_lo = self.st.get(mid).bound_lo.clone();
@@ -2269,12 +2307,10 @@ impl Typer {
                 all_params.push(ev_id);
             }
         }
-        for (tp_id, bounds, span, hk) in ctx_work {
-            if hk {
-                let tp_name = self.st.get(tp_id).name.clone();
-                self.error(span, format!("type {tp_name} takes type parameters"));
-                continue;
-            }
+        for (tp_id, bounds, span, _hk) in ctx_work {
+            // nsc 2.13.16 accepts a context bound on a higher-kinded parameter
+            // (`def f[F[_]: Async]` desugars to `(implicit ev: Async[F])`); only
+            // *view* bounds on such a parameter are rejected.
             for bound in bounds {
                 if matches!(
                     bound.kind,
@@ -9040,7 +9076,7 @@ impl Typer {
             "Null" => Type::Null,
             "Object" => Type::AnyRef,
             _ => {
-                let found = self.st.lookup(name);
+                let found = self.st.lookup_type(name);
                 // Prefer the class of a case-class/companion pair (`Point` vs `Point$`).
                 let id = found
                     .iter()
@@ -10443,6 +10479,11 @@ fn apply_context_bound(bound: Type, tp: SymbolId) -> Type {
             name,
             args: vec![Type::TypeParam(tp)],
         },
+        // `U: BaseColumnType` where `BaseColumnType` is a *parameterized type
+        // member* (or another type parameter) still means `BaseColumnType[U]`.
+        bound @ (Type::TypeMember(_) | Type::TypeParam(_)) => {
+            crate::symbol::apply_type_ctor(bound, vec![Type::TypeParam(tp)])
+        }
         other => other,
     }
 }
