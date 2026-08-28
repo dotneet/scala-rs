@@ -1,0 +1,4 @@
+Right(10)
+Left(div0)
+Right(9)
+Right(32)

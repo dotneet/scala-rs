@@ -214,6 +214,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         None
     };
     add_option_members(st, option_wf, library_abi);
+    crate::prelude_either::install_option_core(st);
     add_list_members(st, with_filter, iterator, library_abi);
     add_function_types(st);
     add_partial_function(st);
@@ -384,6 +385,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_linked_hash_set(st);
         add_either(st);
         add_try(st, throwable);
+        crate::prelude_either::install_library_abi(st);
         add_breaks(st);
         add_big_int(st);
         add_big_decimal(st);

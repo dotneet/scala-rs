@@ -3031,3 +3031,32 @@ object UseLib {
     let _ = fs::remove_dir_all(&out_lib);
     let _ = fs::remove_dir_all(&probe);
 }
+
+// --- Either / Try / Option members (agent/either-try) -----------------------
+
+#[test]
+fn scala_library_dual_run_either_ops() {
+    dual_run_fixture("either_ops");
+}
+
+#[test]
+fn scala_library_dual_run_either_left() {
+    dual_run_fixture("either_left");
+}
+
+#[test]
+fn scala_library_dual_run_either_for() {
+    dual_run_fixture("either_for");
+}
+
+#[test]
+fn fixtures_either_ops_bad_is_error() {
+    compile_fails_lib("either_ops_bad", "noSuchEitherMember is not a member");
+}
+
+/// `Either` only exists in the real library ABI; the private runtime must say
+/// so instead of silently accepting the program.
+#[test]
+fn fixtures_either_ops_needs_scala_library() {
+    compile_fails("either_ops", "Either");
+}
