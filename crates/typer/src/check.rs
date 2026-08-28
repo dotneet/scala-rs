@@ -1270,9 +1270,12 @@ impl Typer {
         };
         let mut pts = Vec::new();
         for p in parents.iter_mut() {
-            self.type_expr(p, &Type::NoType);
+            // Parents are types: `object B extends B` extends the *trait* B,
+            // not itself. Typing them as expressions picks the module.
+            self.type_parent(p);
             pts.push(p.ty.clone());
         }
+        pts.retain(|t| !matches!(t, Type::ModuleRef(m) if *m == cls));
         if !pts.is_empty() {
             self.st.get_mut(cls).parents = pts;
         }

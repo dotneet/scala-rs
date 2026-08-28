@@ -134,5 +134,6 @@ conform!(
     lambdas,
     self_type,
     decl_forms,
-    layout
+    layout,
+    companion_extends
 );

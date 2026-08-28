@@ -12,6 +12,17 @@ use scala_rs_driver::{
 use scala_rs_span::render_all;
 
 fn main() -> ExitCode {
+    // Deeply nested types and long method chains recurse; the default 8 MB
+    // main-thread stack is not enough for a real project.
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(run)
+        .expect("spawn compiler thread")
+        .join()
+        .unwrap_or(ExitCode::from(2))
+}
+
+fn run() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         print_help();

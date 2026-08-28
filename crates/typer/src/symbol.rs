@@ -1,6 +1,77 @@
 //! Symbols, scopes, and the compilation context.
 
 use scala_rs_parser::{Flags, RefineDecl, SymbolId, Type};
+
+thread_local! {
+    /// Type parameters whose upper bound `is_sub_type` is already expanding.
+    /// An F-bound (`A <: Rep[A]`) would otherwise recurse forever.
+    static EXPANDING_BOUNDS: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct BoundGuard(bool);
+
+impl Drop for BoundGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            EXPANDING_BOUNDS.with(|b| {
+                b.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+/// Returns `None` once the parent walk is implausibly deep, which only
+/// happens when the hierarchy has a cycle.
+fn enter_depth() -> Option<BoundGuard> {
+    EXPANDING_BOUNDS.with(|b| {
+        let mut v = b.borrow_mut();
+        if v.len() > 200 {
+            return None;
+        }
+        v.push(u32::MAX);
+        Some(BoundGuard(true))
+    })
+}
+
+/// Returns `None` when this parameter's bound is already being expanded.
+fn enter_bound(id: SymbolId) -> Option<BoundGuard> {
+    EXPANDING_BOUNDS.with(|b| {
+        let mut v = b.borrow_mut();
+        if v.contains(&id.0) {
+            return None;
+        }
+        v.push(id.0);
+        Some(BoundGuard(true))
+    })
+}
+
+thread_local! {
+    static PROBE: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub struct ProbeGuard;
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        PROBE.with(|p| {
+            p.borrow_mut().pop();
+        });
+    }
+}
+
+/// Temporary: panics with the recursion path when a cycle runs away.
+pub fn probe(name: &'static str) -> ProbeGuard {
+    PROBE.with(|p| {
+        let mut v = p.borrow_mut();
+        v.push(name);
+        if v.len() > 400 {
+            let tail: Vec<&str> = v[v.len() - 20..].to_vec();
+            panic!("recursion probe overflow, tail: {tail:?}");
+        }
+    });
+    ProbeGuard
+}
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,10 +438,17 @@ impl SymbolTable {
             Type::AnyRef => Some(self.anyref_sym),
             Type::AnyVal => Some(self.anyval_sym),
             Type::Array(_) => Some(self.array_sym),
-            Type::Named { name, .. } => self
-                .lookup(name)
-                .into_iter()
-                .find(|s| self.get(*s).is_class_like()),
+            // A trait and its companion share a name; in type position the
+            // class wins, so `object B extends B` does not become its own
+            // parent.
+            Type::Named { name, .. } => {
+                let found = self.lookup(name);
+                found
+                    .iter()
+                    .copied()
+                    .find(|s| self.get(*s).kind == SymKind::Class)
+                    .or_else(|| found.into_iter().find(|s| self.get(*s).is_class_like()))
+            }
             Type::TypeParam(_) => None,
             Type::Applied { ctor, .. } => self.class_sym_of(ctor),
             Type::TypeMember(id) => {
@@ -898,6 +976,12 @@ impl SymbolTable {
                 None => matches!(b, Type::Any | Type::AnyRef | Type::Wildcard),
             },
             (Type::Class { sym: s1, args: a1 }, b) => {
+                // A malformed hierarchy (`object B extends B`) would otherwise
+                // walk its own parents forever. Depth, not identity: a legitimate
+                // walk revisits a class at a different type argument.
+                let Some(_g) = enter_depth() else {
+                    return false;
+                };
                 let child = self.get(*s1);
                 let tps = child.tparams.clone();
                 let parents = child.parents.clone();
@@ -908,18 +992,24 @@ impl SymbolTable {
             }
             (Type::Array(x), Type::Array(y)) => self.is_sub_type(x, y),
             (Type::ModuleRef(s), Type::Class { sym, .. }) if s == sym => true,
-            (Type::ModuleRef(s), b) => self
-                .get(*s)
-                .parents
-                .clone()
-                .iter()
-                .any(|p| self.is_sub_type(p, b)),
+            (Type::ModuleRef(s), b) => {
+                let Some(_g) = enter_depth() else {
+                    return false;
+                };
+                self.get(*s)
+                    .parents
+                    .clone()
+                    .iter()
+                    .any(|p| self.is_sub_type(p, b))
+            }
             (Type::TypeParam(a), Type::TypeParam(b)) if a == b => true,
             (Type::TypeMember(a), Type::TypeMember(b)) if a == b => true,
             (Type::TypeMember(id), b) => {
                 if let Some(hi) = self.get(*id).bound_hi.clone() {
-                    if self.is_sub_type(&hi, b) {
-                        return true;
+                    if let Some(_g) = enter_bound(*id) {
+                        if self.is_sub_type(&hi, b) {
+                            return true;
+                        }
                     }
                 }
                 matches!(b, Type::AnyRef | Type::AnyVal | Type::Any)
@@ -927,8 +1017,11 @@ impl SymbolTable {
             // `def f[A <: Named](x: A)` may use `x` where a `Named` is wanted.
             (Type::TypeParam(id), b) => {
                 if let Some(hi) = self.get(*id).bound_hi.clone() {
-                    if !matches!(&hi, Type::TypeParam(x) if x == id) && self.is_sub_type(&hi, b) {
-                        return true;
+                    // `A <: Rep[A]` must not expand its own bound again.
+                    if let Some(_g) = enter_bound(*id) {
+                        if self.is_sub_type(&hi, b) {
+                            return true;
+                        }
                     }
                 }
                 matches!(b, Type::AnyRef | Type::AnyVal)
