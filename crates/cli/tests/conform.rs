@@ -131,5 +131,6 @@ conform!(
     interp,
     chains,
     parse_forms,
-    lambdas
+    lambdas,
+    self_type
 );

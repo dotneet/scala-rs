@@ -1176,6 +1176,11 @@ impl<'a> Parser<'a> {
         while i < self.tokens.len() && matches!(self.tokens[i].kind, TokenKind::Newline) {
             i += 1;
         }
+        // `trait T { self => … }`: a bare name followed by `=>` is a self type
+        // without an ascription.
+        if i < self.tokens.len() && matches!(self.tokens[i].kind, TokenKind::Arrow) {
+            return true;
+        }
         if i < self.tokens.len() && matches!(self.tokens[i].kind, TokenKind::Colon) {
             // scan for => before ; or unbalanced
             let mut depth = 0;
