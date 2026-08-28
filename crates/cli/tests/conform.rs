@@ -132,5 +132,6 @@ conform!(
     chains,
     parse_forms,
     lambdas,
-    self_type
+    self_type,
+    decl_forms
 );

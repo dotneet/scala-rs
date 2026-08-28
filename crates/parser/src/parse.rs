@@ -439,7 +439,18 @@ impl<'a> Parser<'a> {
                             },
                         ));
                     } else {
-                        self.error_here("package clause inside a unit must be followed by { ... }");
+                        // `package a` with no braces: everything that follows
+                        // belongs to it, and clauses nest (`package a` then
+                        // `package b` is `a.b`).
+                        let inner = self.parse_top_stats();
+                        stats.push(self.alloc(
+                            lo.merge(self.prev_span()),
+                            TreeKind::PackageDef {
+                                pid: Box::new(pid),
+                                stats: inner,
+                            },
+                        ));
+                        break;
                     }
                 }
                 continue;
@@ -1313,7 +1324,25 @@ impl<'a> Parser<'a> {
         self.skip_nl();
         let rhs = if matches!(self.kind(), TokenKind::Equals) {
             self.bump();
-            self.parse_expr()
+            self.skip_nl();
+            // `var x: T = _` is the zero of `T`; `val f: Int => Int = _ + 1`
+            // is still a placeholder lambda, so the `_` must be the whole rhs.
+            let bare_underscore = !tpt.is_empty()
+                && matches!(self.kind(), TokenKind::Underscore)
+                && matches!(
+                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                    None | Some(TokenKind::Newline)
+                        | Some(TokenKind::Semi)
+                        | Some(TokenKind::RBrace)
+                        | Some(TokenKind::Eof)
+                );
+            if bare_underscore {
+                let sp = self.span();
+                self.bump();
+                self.alloc(sp, TreeKind::Wildcard)
+            } else {
+                self.parse_expr()
+            }
         } else {
             if !mods.flags.contains(Flags::ABSTRACT) && !mods.flags.contains(Flags::PARAM) {
                 // abstract val in trait is ok without rhs

@@ -86,6 +86,8 @@ pub struct Typer {
     file_index: usize,
     /// Counter for synthetic names.
     gensym: u32,
+    /// Enclosing package clauses; a nested one is relative to the last.
+    pkg_nest: Vec<SymbolId>,
     fatal_warnings: bool,
     library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
@@ -130,6 +132,7 @@ impl Typer {
             diags: Vec::new(),
             file_index,
             gensym: 0,
+            pkg_nest: Vec::new(),
             fatal_warnings: opts.fatal_warnings,
             library_abi: opts.library_abi,
             return_meth: None,
@@ -171,6 +174,7 @@ impl Typer {
                 let pkg = self.enter_package_path(pid);
                 let saved = self.st.owner;
                 self.st.owner = pkg;
+                self.pkg_nest.push(pkg);
                 self.st.push_scope();
                 // First pass: enter classes/modules so they can forward-ref.
                 for stt in stats.iter_mut() {
@@ -180,6 +184,7 @@ impl Typer {
                     self.namer(stt);
                 }
                 self.st.pop_scope();
+                self.pkg_nest.pop();
                 self.st.owner = saved;
                 tree.sym = pkg;
             }
@@ -208,8 +213,14 @@ impl Typer {
         }
         let mut ps = Vec::new();
         parts(pid, &mut ps);
-        let mut cur = self.st.root;
-        let mut jvm = String::new();
+        // A nested package clause is relative: `package p` then `package q`
+        // is `p.q`.
+        let mut cur = self.pkg_nest.last().copied().unwrap_or(self.st.root);
+        let mut jvm = if cur == self.st.root {
+            String::new()
+        } else {
+            self.st.get(cur).jvm_name.clone()
+        };
         for p in ps {
             if !jvm.is_empty() {
                 jvm.push('/');
@@ -1960,6 +1971,36 @@ impl Typer {
                 self.error(tree.span, "abstract value needs a type");
                 tree.ty = Type::Error;
             }
+            return;
+        }
+        // `var x: T = _` is the zero of `T` (nsc's default initializer).
+        if matches!(rhs.kind, TreeKind::Wildcard) {
+            if declared.is_no_type() {
+                self.error(tree.span, "unbound placeholder parameter");
+                tree.ty = Type::Error;
+                return;
+            }
+            let lit = match declared.widen_constant() {
+                Type::Int => Lit::Int(0),
+                Type::Long => Lit::Long(0),
+                Type::Double => Lit::Double(0.0),
+                Type::Float => Lit::Float(0.0),
+                Type::Short | Type::Byte | Type::Char => Lit::Int(0),
+                Type::Boolean => Lit::Boolean(false),
+                Type::Unit => Lit::Unit,
+                _ => Lit::Null,
+            };
+            let span = rhs.span;
+            **rhs = Tree {
+                id: rhs.id,
+                span,
+                kind: TreeKind::Literal { lit },
+                ty: declared.clone(),
+                sym: SymbolId::NONE,
+                postfix: false,
+            };
+            self.type_expr(rhs, &declared);
+            tree.ty = declared;
             return;
         }
         let pt = if declared.is_no_type() {

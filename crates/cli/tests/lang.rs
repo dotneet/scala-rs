@@ -328,3 +328,22 @@ fn json_render_program_runs() {
     assert_eq!(run_java(&out, Some(&jar)), expected_stdout("json_render"));
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// Chained package clauses nest: `package p` then `package q` is `p.q`.
+#[test]
+fn chained_package_clauses_nest() {
+    if !java_available() {
+        return;
+    }
+    let out = compile_with("pkg_chain", &["--no-scala-library"]);
+    let output = std::process::Command::new("java")
+        .args(["-cp", out.to_str().unwrap(), "p.q.Main"])
+        .output()
+        .expect("java");
+    assert!(output.status.success(), "p.q.Main failed to run");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("pkg_chain")
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
