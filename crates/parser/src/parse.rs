@@ -12,8 +12,28 @@ pub struct ParseResult {
     pub diags: Vec<Diagnostic>,
 }
 
+/// Source-level switches that change what the parser accepts.
+///
+/// `scalac -Xsource:3` turns on a handful of Scala 3 spellings inside an
+/// otherwise 2.13 parser. Only the ones this subset implements live here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParseOptions {
+    /// `-Xsource:3` / `-Xsource:3-cross`: accept `A & B` as a compound type.
+    pub source3: bool,
+}
+
 pub fn parse_source(source: &SourceFile, file_index: usize, tokens: Vec<Token>) -> ParseResult {
+    parse_source_opts(source, file_index, tokens, ParseOptions::default())
+}
+
+pub fn parse_source_opts(
+    source: &SourceFile,
+    file_index: usize,
+    tokens: Vec<Token>,
+    opts: ParseOptions,
+) -> ParseResult {
     let mut p = Parser::new(source, file_index, tokens);
+    p.opts = opts;
     let tree = p.parse_compilation_unit();
     ParseResult {
         tree,
@@ -54,6 +74,12 @@ struct Parser<'a> {
     /// Inside a typed pattern, `|` starts the next alternative, not an infix type.
     no_bar_infix_type: bool,
     placeholder_id: u32,
+    opts: ParseOptions,
+    /// nsc `Location.InBlock`: the next `parse_expr1` is a *block statement*,
+    /// so a function literal there takes the rest of the block as its body
+    /// (`{ x => val n = 1; n }`). Consumed by `parse_expr1`, so nested
+    /// sub-expressions are back to `Local`.
+    in_block: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -68,7 +94,29 @@ impl<'a> Parser<'a> {
             no_bar_infix_type: false,
             placeholder_params: Vec::new(),
             placeholder_id: 0,
+            opts: ParseOptions::default(),
+            in_block: false,
         }
+    }
+
+    /// True when the identifier token at `sp` was written with backquotes.
+    /// nsc keeps this on the token; we recover it from the source text, which
+    /// is enough to tell ``` `?` ``` (a real type name) from `?` (a wildcard).
+    fn is_backquoted(&self, sp: Span) -> bool {
+        self.source.src.as_bytes().get(sp.lo.0 as usize) == Some(&b'`')
+    }
+
+    /// `?` in type position: a wildcard alias for `_` (scalac 2.13.6+, and in
+    /// Scala 3). Backquoted ``` `?` ``` is an ordinary type name.
+    fn at_question_wildcard(&self) -> bool {
+        matches!(self.kind(), TokenKind::Ident(s) if s == "?") && !self.is_backquoted(self.span())
+    }
+
+    /// `-Xsource:3` intersection type separator `A & B`, spelled `with` in 2.13.
+    fn at_amp_intersection(&self) -> bool {
+        self.opts.source3
+            && matches!(self.kind(), TokenKind::Ident(s) if s == "&")
+            && !self.is_backquoted(self.span())
     }
 
     fn alloc(&mut self, span: Span, kind: TreeKind) -> Tree {
@@ -1229,7 +1277,11 @@ impl<'a> Parser<'a> {
         if is_mod_or_def_start(self.kind()) {
             return self.parse_tmpl_or_def();
         }
-        self.parse_expr()
+        // nsc: block statements are parsed as `expr(InBlock)`.
+        self.in_block = true;
+        let t = self.parse_expr();
+        self.in_block = false;
+        t
     }
 
     fn parse_val_def(&mut self, mut mods: Modifiers) -> Tree {
@@ -1462,7 +1514,11 @@ impl<'a> Parser<'a> {
     fn parse_type_def(&mut self, mods: Modifiers) -> Tree {
         let lo = self.span();
         self.bump();
-        let (name, _) = self.expect_ident();
+        let question = self.at_question_wildcard();
+        let (name, nsp) = self.expect_ident();
+        if question {
+            self.error_span(nsp, "using `?` as a type name requires backticks");
+        }
         let tparams = self.parse_type_param_clause();
         self.skip_nl();
         let mut lo_b = None;
@@ -1646,7 +1702,13 @@ impl<'a> Parser<'a> {
                 break;
             }
             let saved = self.pos;
+            let question = self.at_question_wildcard();
             let (name, nsp) = self.expect_ident();
+            if question {
+                // nsc: `?` is reserved for the wildcard, so it cannot be used
+                // as an infix type constructor without backquotes.
+                self.error_span(nsp, "using `?` as a type name requires backticks");
+            }
             self.skip_nl();
             // postfix repeated `T*` — nsc does not parse this as infix `T * <error>`
             if name == "*" && !self.at_type_start() {
@@ -1769,7 +1831,8 @@ impl<'a> Parser<'a> {
         let mut parents = vec![t.clone()];
         loop {
             self.skip_nl();
-            if matches!(self.kind(), TokenKind::With) {
+            // `A with B`, and under `-Xsource:3` the Scala 3 spelling `A & B`.
+            if matches!(self.kind(), TokenKind::With) || self.at_amp_intersection() {
                 self.bump();
                 parents.push(self.parse_annot_type());
             } else {
@@ -1938,6 +2001,44 @@ impl<'a> Parser<'a> {
         Some(self.alloc(sp, TreeKind::Literal { lit }))
     }
 
+    /// Wildcard type `_` / `?`, with optional bounds (`_ <: T`, `? >: T`).
+    /// Both spellings produce the same anonymous `TypeDef` the typer already
+    /// understands, so `?` needs nothing downstream.
+    fn parse_wildcard_type(&mut self) -> Tree {
+        let sp = self.span();
+        self.bump();
+        // nsc writes bounds as `>: lo <: hi`; accept either order once each.
+        let mut hi = None;
+        let mut lo = None;
+        loop {
+            match self.kind() {
+                TokenKind::Supertype if lo.is_none() => {
+                    self.bump();
+                    lo = Some(Box::new(self.parse_type()));
+                }
+                TokenKind::Subtype if hi.is_none() => {
+                    self.bump();
+                    hi = Some(Box::new(self.parse_type()));
+                }
+                _ => break,
+            }
+        }
+        let rhs = self.empty(sp);
+        self.alloc(
+            sp.merge(self.prev_span()),
+            TreeKind::TypeDef {
+                mods: Modifiers::default(),
+                name: "_".into(),
+                tparams: vec![],
+                rhs: Box::new(rhs),
+                lo,
+                hi,
+                views: vec![],
+                ctx_bounds: vec![],
+            },
+        )
+    }
+
     fn parse_simple_type(&mut self) -> Tree {
         self.skip_nl();
         if let Some(lit) = self.parse_constant_type_lit() {
@@ -1983,34 +2084,10 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            TokenKind::Underscore => {
-                let sp = self.span();
-                self.bump();
-                // wildcard type `_` / `_ <: T`
-                let mut hi = None;
-                let mut lo = None;
-                if matches!(self.kind(), TokenKind::Subtype) {
-                    self.bump();
-                    hi = Some(Box::new(self.parse_type()));
-                }
-                if matches!(self.kind(), TokenKind::Supertype) {
-                    self.bump();
-                    lo = Some(Box::new(self.parse_type()));
-                }
-                let rhs = self.empty(sp);
-                self.alloc(
-                    sp.merge(self.prev_span()),
-                    TreeKind::TypeDef {
-                        mods: Modifiers::default(),
-                        name: "_".into(),
-                        tparams: vec![],
-                        rhs: Box::new(rhs),
-                        lo,
-                        hi,
-                        views: vec![],
-                        ctx_bounds: vec![],
-                    },
-                )
+            TokenKind::Underscore => self.parse_wildcard_type(),
+            // `?` is a wildcard alias for `_` in type position.
+            TokenKind::Ident(ref s) if s == "?" && !self.is_backquoted(self.span()) => {
+                self.parse_wildcard_type()
             }
             TokenKind::This => {
                 let sp = self.span();
@@ -2110,6 +2187,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr1(&mut self) -> Tree {
+        // nsc `expr(location)`: only *this* expression is in block position;
+        // everything it nests is `Local`.
+        let in_block = std::mem::take(&mut self.in_block);
         self.skip_nl();
         match self.kind() {
             TokenKind::If => self.parse_if(),
@@ -2152,7 +2232,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let params = vec![self.parse_param(true)];
                 self.expect("=>", |k| matches!(k, TokenKind::Arrow));
-                let body = self.parse_expr();
+                let body = self.parse_function_body(in_block);
                 self.alloc(
                     lo.merge(body.span),
                     TreeKind::Function {
@@ -2175,27 +2255,20 @@ impl<'a> Parser<'a> {
                         },
                     );
                 }
-                if matches!(self.kind(), TokenKind::Arrow) {
-                    self.bump();
-                    let body = self.parse_expr();
-                    let vparams = self.convert_to_params(t.clone());
-                    return self.alloc(
-                        t.span.merge(body.span),
-                        TreeKind::Function {
-                            vparams,
-                            body: Box::new(body),
-                        },
-                    );
-                }
-                if matches!(self.kind(), TokenKind::Match) {
-                    return self.parse_match_rest(t);
-                }
+                // nsc parseOther: ascription first, then ARROW, so
+                // `{ x: Int => body }` is a lambda with a typed parameter and
+                // not an ascription to the function type `Int => body`.
                 if matches!(self.kind(), TokenKind::Colon) {
                     self.bump();
                     // nsc Ascription ::= COLON InfixType | COLON Annotation {Annotation}
                     // so `(n: @switch) match` / `n: @switch match` typecheck.
+                    // `typeOrInfixType(location)`: only a `Local` ascription may
+                    // swallow `=>` into a function *type*; in block position the
+                    // arrow belongs to the enclosing function literal.
                     let tpt = if matches!(self.kind(), TokenKind::At) {
                         self.parse_annot_ascription()
+                    } else if in_block {
+                        self.parse_infix_type()
                     } else {
                         self.parse_type()
                     };
@@ -2214,10 +2287,37 @@ impl<'a> Parser<'a> {
                         },
                     );
                     self.skip_nl();
+                    if matches!(self.kind(), TokenKind::Arrow) {
+                        self.bump();
+                        let body = self.parse_function_body(in_block);
+                        let vparams = self.convert_to_params(typed.clone());
+                        return self.alloc(
+                            typed.span.merge(body.span),
+                            TreeKind::Function {
+                                vparams,
+                                body: Box::new(body),
+                            },
+                        );
+                    }
                     if matches!(self.kind(), TokenKind::Match) {
                         return self.parse_match_rest(typed);
                     }
                     return typed;
+                }
+                if matches!(self.kind(), TokenKind::Arrow) {
+                    self.bump();
+                    let body = self.parse_function_body(in_block);
+                    let vparams = self.convert_to_params(t.clone());
+                    return self.alloc(
+                        t.span.merge(body.span),
+                        TreeKind::Function {
+                            vparams,
+                            body: Box::new(body),
+                        },
+                    );
+                }
+                if matches!(self.kind(), TokenKind::Match) {
+                    return self.parse_match_rest(t);
                 }
                 t
             }
@@ -2455,6 +2555,17 @@ impl<'a> Parser<'a> {
             pat,
             guard,
             body,
+        }
+    }
+
+    /// nsc: a function literal's body is `block()` in block position and
+    /// `expr()` otherwise. `{ x => val n = 1; n }` is a lambda whose body is
+    /// the whole remaining block, not `val` in expression position.
+    fn parse_function_body(&mut self, in_block: bool) -> Tree {
+        if in_block {
+            self.parse_case_body()
+        } else {
+            self.parse_expr()
         }
     }
 
@@ -2953,115 +3064,9 @@ impl<'a> Parser<'a> {
                 },
             );
         }
-        // `{ x => stat; stat }` — nsc's `ResultExpr`: the lambda body is the
-        // rest of the block, not a single expression.
-        if let Some(vparams) = self.try_lambda_header() {
-            let stats = self.parse_stats_until_rbrace();
-            self.expect("}", |k| matches!(k, TokenKind::RBrace));
-            let span = lo.merge(self.prev_span());
-            let body = block_from_stats(self, span, stats);
-            return self.alloc(
-                span,
-                TreeKind::Function {
-                    vparams,
-                    body: Box::new(body),
-                },
-            );
-        }
         let stats = self.parse_stats_until_rbrace();
         self.expect("}", |k| matches!(k, TokenKind::RBrace));
         block_from_stats(self, lo.merge(self.prev_span()), stats)
-    }
-
-    /// A lambda header at the start of a brace block: `x =>`, `x: T =>`,
-    /// `(a, b) =>`, `implicit x =>`. Restores the position when there is none.
-    fn try_lambda_header(&mut self) -> Option<Vec<Tree>> {
-        let saved = self.pos;
-        let implicit = matches!(self.kind(), TokenKind::Implicit);
-        if implicit {
-            self.bump();
-        }
-        let flags = if implicit {
-            Flags::PARAM.with(Flags::IMPLICIT)
-        } else {
-            Flags::PARAM
-        };
-        let mut params = Vec::new();
-        if matches!(self.kind(), TokenKind::LParen) {
-            self.bump();
-            self.skip_nl();
-            if !matches!(self.kind(), TokenKind::RParen) {
-                loop {
-                    match self.lambda_param(flags) {
-                        Some(p) => params.push(p),
-                        None => {
-                            self.pos = saved;
-                            return None;
-                        }
-                    }
-                    self.skip_nl();
-                    if matches!(self.kind(), TokenKind::Comma) {
-                        self.bump();
-                        self.skip_nl();
-                        continue;
-                    }
-                    break;
-                }
-            }
-            if !matches!(self.kind(), TokenKind::RParen) {
-                self.pos = saved;
-                return None;
-            }
-            self.bump();
-        } else {
-            match self.lambda_param(flags) {
-                Some(p) => params.push(p),
-                None => {
-                    self.pos = saved;
-                    return None;
-                }
-            }
-        }
-        self.skip_nl();
-        if !matches!(self.kind(), TokenKind::Arrow) {
-            self.pos = saved;
-            return None;
-        }
-        self.bump();
-        self.skip_nl_semi();
-        Some(params)
-    }
-
-    fn lambda_param(&mut self, flags: Flags) -> Option<Tree> {
-        let (name, sp) = match self.kind().clone() {
-            TokenKind::Ident(n) => {
-                let sp = self.span();
-                self.bump();
-                (n, sp)
-            }
-            TokenKind::Underscore => {
-                let sp = self.span();
-                self.bump();
-                ("_".to_string(), sp)
-            }
-            _ => return None,
-        };
-        let tpt = if matches!(self.kind(), TokenKind::Colon) {
-            self.bump();
-            self.parse_type()
-        } else {
-            self.empty(sp)
-        };
-        let rhs = self.empty(sp);
-        Some(self.alloc(
-            sp,
-            TreeKind::ValDef {
-                mods: Modifiers::new(flags),
-                name,
-                tpt: Box::new(tpt),
-                rhs: Box::new(rhs),
-            },
-        ))
     }
 
     fn parse_new(&mut self) -> Tree {

@@ -58,7 +58,7 @@ fn print_help() {
 scala-rs — a Scala 2.13 subset compiler (not Scala 3)
 
 USAGE:
-    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings] [-language:<feat>]
+    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings] [-language:<feat>] [-Xsource:3]
     scala-rs run <file> [--scala-library <jar>] [--no-scala-library] [--] [java-args...]
     scala-rs --help
 
@@ -84,6 +84,9 @@ OPTIONS:
     --typer             Dump the typed tree after namer/typer
     -Xfatal-warnings    Treat warnings as errors (non-exhaustive match, …)
     -language:<feat>    Enable a language feature (`postfixOps`, `implicitConversions`, `dynamics`)
+    -Xsource:<version>  Source level: `2.13` (default), `3`, or `3-cross`.
+                        `3`/`3-cross` accept the Scala 3 spellings this subset
+                        implements (`A & B` compound types).
     --help              Show this help
 
 EXAMPLES:
@@ -148,6 +151,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
     let mut no_scala_library = false;
     let mut class_path = Vec::new();
     let mut language_features = Vec::new();
+    let mut xsource3 = false;
     let mut files = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -192,6 +196,14 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
                     language_features.push(f.to_string());
                 }
             }
+        } else if let Some(rest) = a.strip_prefix("-Xsource:") {
+            xsource3 = parse_xsource_level(rest)?;
+        } else if a == "-Xsource" {
+            i += 1;
+            let ver = args
+                .get(i)
+                .ok_or_else(|| "option -Xsource requires a version argument".to_string())?;
+            xsource3 = parse_xsource_level(ver)?;
         } else if a == "-language" {
             i += 1;
             let feats = args
@@ -233,8 +245,22 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             scala_library: resolved,
             class_path: class_path,
             language_features,
+            xsource3,
         },
     })
+}
+
+/// `-Xsource:<version>`. Returns true when the level enables Scala 3 syntax.
+/// nsc refuses anything below the current major version.
+fn parse_xsource_level(ver: &str) -> Result<bool, String> {
+    match ver.trim() {
+        "" => Err("option -Xsource: requires a version".into()),
+        "3" | "3-cross" => Ok(true),
+        "2.13" | "2.13.0" => Ok(false),
+        other => Err(format!(
+            "-Xsource must be at least the current major version (2.13.0), got '{other}'"
+        )),
+    }
 }
 
 fn take_scala_library_flag(args: &[String], i: &mut usize) -> Result<PathBuf, String> {
@@ -288,6 +314,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         scala_library: scala_library.clone(),
         class_path: Vec::new(),
         language_features: Vec::new(),
+        xsource3: parsed.xsource3,
     };
     let result = compile_paths(&[parsed.file], &opts);
     print_diags(&result);
@@ -325,6 +352,7 @@ struct RunArgs {
     file: PathBuf,
     java_args: Vec<String>,
     scala_library: Option<PathBuf>,
+    xsource3: bool,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
@@ -332,12 +360,15 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut java_args = Vec::new();
     let mut scala_library = None;
     let mut no_scala_library = false;
+    let mut xsource3 = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
             java_args.extend_from_slice(&args[i + 1..]);
             break;
+        } else if let Some(rest) = a.strip_prefix("-Xsource:") {
+            xsource3 = parse_xsource_level(rest)?;
         } else if a == "--no-scala-library" {
             no_scala_library = true;
         } else if a == "--scala-library" || a.starts_with("--scala-library=") {
@@ -370,6 +401,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         file,
         java_args,
         scala_library,
+        xsource3,
     })
 }
 

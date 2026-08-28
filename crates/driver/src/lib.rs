@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use scala_rs_backend::{emit_opts, emit_runtime, load_classpath, EmitOpts};
-use scala_rs_parser::{dump_tree, parse_file, Tree};
+use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
     erase, find_mains, lambda_lift, mark_anon_captures, typecheck_opts, uncurry, ClasspathClass,
@@ -32,6 +32,9 @@ pub struct CompileOptions {
     pub class_path: Vec<PathBuf>,
     /// `-language:feat` flags (`postfixOps`, `implicitConversions`, `dynamics`).
     pub language_features: Vec<String>,
+    /// `-Xsource:3` / `-Xsource:3-cross`: accept the Scala 3 spellings this
+    /// subset implements (`A & B` compound types).
+    pub xsource3: bool,
 }
 
 impl Default for CompileOptions {
@@ -44,6 +47,7 @@ impl Default for CompileOptions {
             scala_library: None,
             class_path: Vec::new(),
             language_features: Vec::new(),
+            xsource3: false,
         }
     }
 }
@@ -120,7 +124,13 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         let file_index = sources.len();
         match SourceFile::load(path) {
             Ok(sf) => {
-                let parsed = parse_file(&sf, file_index);
+                let parsed = parse_file_opts(
+                    &sf,
+                    file_index,
+                    ParseOptions {
+                        source3: opts.xsource3,
+                    },
+                );
                 diags.extend(parsed.diags);
                 units.push(Unit {
                     file_index,
@@ -519,6 +529,7 @@ object Main {
             scala_library: None,
             class_path: Vec::new(),
             language_features: Vec::new(),
+            xsource3: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());
@@ -562,6 +573,7 @@ object Main {
             scala_library: None,
             class_path: Vec::new(),
             language_features: Vec::new(),
+            xsource3: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "{}", result.render_diags());
@@ -582,6 +594,7 @@ object Main {
             scala_library: None,
             class_path: Vec::new(),
             language_features: Vec::new(),
+            xsource3: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(!result.ok());
@@ -613,6 +626,7 @@ object Main {
             scala_library: Some(PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar")),
             class_path: Vec::new(),
             language_features: Vec::new(),
+            xsource3: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());
