@@ -6929,6 +6929,31 @@ fn emit_list_core_member(
     // (invokeinterface か, オーナー, JVM 名, descriptor, 後処理)
     let (iface, owner, jvm, desc, post): (bool, &str, &str, &str, ListPost) = match (name, nargs) {
         // --- List 自身の virtual（戻り値も List）
+        ("map", 1) | ("flatMap", 1) => (
+            false,
+            LIST_CLS,
+            name,
+            "(Lscala/Function1;)Lscala/collection/immutable/List;",
+            ListPost::None,
+        ),
+        ("::", 1) => (
+            false,
+            LIST_CLS,
+            "::",
+            "(Ljava/lang/Object;)Lscala/collection/immutable/List;",
+            ListPost::None,
+        ),
+        // `indexWhere(p)` は `indexWhere(p, 0)`（既定引数）。
+        ("indexWhere", 1) => {
+            asm.iconst(0);
+            (
+                false,
+                LIST_CLS,
+                "indexWhere",
+                "(Lscala/Function1;I)I",
+                ListPost::None,
+            )
+        }
         ("filter", 1) | ("filterNot", 1) | ("takeWhile", 1) => (
             false,
             LIST_CLS,

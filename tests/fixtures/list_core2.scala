@@ -16,6 +16,8 @@ object Main {
     println(xs.count(x => x > 1))
     println(xs.find(x => x > 1))
     println(xs.indexOf(4))
+    println(xs.indexWhere(x => x > 3))
+    println(xs.indexWhere(x => x > 9))
     println(xs(2))
     val empty = List.apply[Int]()
     println(empty.isEmpty)
