@@ -386,6 +386,12 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         if let Some(it) = iterator {
             crate::prelude_coll::add_collections_extra(st, tuple2, ordering, it);
         }
+        if let Some(aops) = array_ops {
+            // ArrayOps の変換・集約系 (toList/toSeq/groupBy/sum/...) と
+            // scala.collection.MapView。Buffer / Iterable / MapView を
+            // 作り直さないよう、コレクション本体のあとに走らせる。
+            crate::prelude_arrconv::install(st, aops, tuple2, ordering);
+        }
         add_linked_hash_map(st);
         add_linked_hash_set(st);
         add_either(st);

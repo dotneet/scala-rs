@@ -1001,27 +1001,31 @@ fn add_immutable_map_extra(
         args: vec![tk.clone(), tv.clone()],
     };
     method(st, map, "view", vec![], view_t.clone(), Intrinsic::None);
-    let mm = method(
-        st,
-        map_view,
-        "mapValues",
-        vec![],
-        Type::Unit,
-        Intrinsic::None,
-    );
-    let w = type_param(st, mm, "W");
-    let tw = Type::TypeParam(w);
-    let f = alloc_param(st, mm, "f", fn1(Type::TypeParam(vv), tw.clone()), false);
-    st.get_mut(mm).tparams = vec![w];
-    st.get_mut(mm).params = vec![f];
-    st.get_mut(mm).paramss = vec![vec![f]];
-    st.get_mut(mm).ty = Type::Method {
-        paramss: vec![vec![fn1(Type::TypeParam(vv), tw.clone())]],
-        ret: Box::new(Type::Class {
-            sym: map_view,
-            args: vec![Type::TypeParam(vk), tw],
-        }),
-    };
+    // `prelude_arrconv` may already declare `mapValues`; a second copy
+    // would make every call ambiguous.
+    if st.lookup_member(map_view, "mapValues").is_empty() {
+        let mm = method(
+            st,
+            map_view,
+            "mapValues",
+            vec![],
+            Type::Unit,
+            Intrinsic::None,
+        );
+        let w = type_param(st, mm, "W");
+        let tw = Type::TypeParam(w);
+        let f = alloc_param(st, mm, "f", fn1(Type::TypeParam(vv), tw.clone()), false);
+        st.get_mut(mm).tparams = vec![w];
+        st.get_mut(mm).params = vec![f];
+        st.get_mut(mm).paramss = vec![vec![f]];
+        st.get_mut(mm).ty = Type::Method {
+            paramss: vec![vec![fn1(Type::TypeParam(vv), tw.clone())]],
+            ret: Box::new(Type::Class {
+                sym: map_view,
+                args: vec![Type::TypeParam(vk), tw],
+            }),
+        };
+    }
     method(
         st,
         map_view,

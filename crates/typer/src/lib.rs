@@ -8,6 +8,7 @@ mod javasign;
 mod lambda_lift;
 mod pickle_supply;
 mod prelude;
+mod prelude_arrconv;
 mod prelude_coll;
 mod prelude_either;
 mod prelude_lowbound;
@@ -46,6 +47,46 @@ pub fn typecheck_str_opts(
 
 #[cfg(test)]
 mod tests {
+
+    /// Two class symbols with the same JVM name shadow each other: member
+    /// lookup then finds only one of the two halves.
+    #[test]
+    fn prelude_has_no_duplicate_jvm_classes() {
+        let jar = std::path::PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+        if !jar.is_file() {
+            return;
+        }
+        let opts = TypecheckOptions {
+            library_abi: true,
+            binary_path: vec![jar],
+            ..TypecheckOptions::default()
+        };
+        let (_, st, _) = typecheck_str_opts("object Main { def f = 1 }", &opts);
+        let mut seen: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for i in 0..st.symbols.len() {
+            let s = &st.symbols[i];
+            if s.jvm_name.is_empty() || !matches!(s.kind, SymKind::Class) {
+                continue;
+            }
+            seen.entry(s.jvm_name.clone())
+                .or_default()
+                .push(s.name.clone());
+        }
+        // `Any` / `AnyRef` / `AnyVal` / `Object` all erase to `java/lang/Object`,
+        // and `::` is entered under both spellings. Everything else sharing a
+        // JVM name is a bug: the second symbol shadows the first.
+        let allowed = [
+            "java/lang/Object",
+            "scala/collection/immutable/$colon$colon",
+        ];
+        let dups: Vec<_> = seen
+            .iter()
+            .filter(|(k, v)| v.len() > 1 && !allowed.contains(&k.as_str()))
+            .map(|(k, v)| format!("{k} x{}", v.len()))
+            .collect();
+        assert!(dups.is_empty(), "duplicate prelude classes: {dups:?}");
+    }
     use super::*;
     use scala_rs_parser::Type;
 
