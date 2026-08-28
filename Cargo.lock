@@ -116,6 +116,7 @@ name = "scala-rs-typer"
 version = "0.1.0"
 dependencies = [
  "scala-rs-parser",
+ "scala-rs-pickle",
  "scala-rs-span",
  "zip",
 ]

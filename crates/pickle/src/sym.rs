@@ -600,7 +600,7 @@ impl SigCache {
                 let lifted: Vec<SigType> = args.iter().map(|a| apply_subst(a, &subst)).collect();
                 let mut next = HashMap::new();
                 if let Ok(psig) = self.class_sig(src, sym, false) {
-                    for (tp, arg) in psig.tparams.iter().zip(lifted.into_iter()) {
+                    for (tp, arg) in psig.tparams.iter().zip(lifted) {
                         next.insert(tp.name.clone(), arg);
                     }
                 }
