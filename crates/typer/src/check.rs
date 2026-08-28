@@ -8689,7 +8689,7 @@ impl Typer {
 fn is_tuple2_elem_map(name: &str) -> bool {
     matches!(
         name,
-        "Map" | "HashMap" | "LinkedHashMap" | "SortedMap" | "TreeMap"
+        "Map" | "HashMap" | "LinkedHashMap" | "SortedMap" | "TreeMap" | "MapView"
     )
 }
 

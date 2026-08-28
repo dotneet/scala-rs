@@ -374,6 +374,11 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_seq_and_lazylist(st);
         add_view(st);
         add_indexedseq_and_queue(st);
+        if let Some(aops) = array_ops {
+            // ArrayOps の変換・集約系 (toList/toSeq/groupBy/sum/...) と
+            // scala.collection.MapView。マージ衝突を避けるため独立モジュール。
+            crate::prelude_arrconv::install(st, aops, tuple2, ordering);
+        }
         add_array_buffer(st);
         add_list_buffer(st);
         add_array_deque(st);
@@ -592,7 +597,7 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
     }
 }
 
-fn class(
+pub(crate) fn class(
     st: &mut SymbolTable,
     owner: SymbolId,
     name: &str,
@@ -608,7 +613,7 @@ fn class(
     id
 }
 
-fn iface(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
+pub(crate) fn iface(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
     let id = st.alloc(
         name,
         owner,
@@ -624,7 +629,7 @@ fn iface(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> Symbol
     id
 }
 
-fn module(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
+pub(crate) fn module(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
     let cls = st.alloc(
         &format!("{name}$"),
         owner,
@@ -651,7 +656,7 @@ fn module_extending(
     m
 }
 
-fn method(
+pub(crate) fn method(
     st: &mut SymbolTable,
     owner: SymbolId,
     name: &str,
@@ -1066,7 +1071,7 @@ fn add_sorted_map(st: &mut SymbolTable, ordering: SymbolId) {
     st.get_mut(tm_mod).members.extend(tmems);
 }
 
-fn type_param(st: &mut SymbolTable, owner: SymbolId, name: &str) -> SymbolId {
+pub(crate) fn type_param(st: &mut SymbolTable, owner: SymbolId, name: &str) -> SymbolId {
     let id = st.alloc(name, owner, SymKind::TypeParam, Flags::EMPTY, "");
     st.get_mut(id).ty = Type::TypeParam(id);
     id
@@ -1448,14 +1453,14 @@ fn add_array_members(st: &mut SymbolTable) {
     );
 }
 
-fn fn1(arg: Type, ret: Type) -> Type {
+pub(crate) fn fn1(arg: Type, ret: Type) -> Type {
     Type::Function {
         params: vec![arg],
         ret: Box::new(ret),
     }
 }
 
-fn fn2(a: Type, b: Type, ret: Type) -> Type {
+pub(crate) fn fn2(a: Type, b: Type, ret: Type) -> Type {
     Type::Function {
         params: vec![a, b],
         ret: Box::new(ret),
