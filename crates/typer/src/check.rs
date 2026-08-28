@@ -5162,9 +5162,15 @@ impl Typer {
                                 .into_iter()
                                 .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)
                             {
+                                // `List(circle, rect)` is a `List[Shape]`, so the
+                                // element type is the lub of every argument.
+                                let elem =
+                                    args[1..].iter().fold(a0.ty.widen_constant(), |acc, a| {
+                                        self.lub_ty(&acc, &a.ty.widen_constant())
+                                    });
                                 ret = Type::Class {
                                     sym: cls,
-                                    args: vec![a0.ty.widen_constant()],
+                                    args: vec![elem],
                                 };
                             }
                         }
@@ -5422,13 +5428,52 @@ impl Typer {
         arg_tys: &[Type],
     ) -> Vec<(SymbolId, Type)> {
         let tps = self.st.get(method).tparams.clone();
+        let repeated_last = matches!(param_tys.last(), Some(Type::Repeated(_)));
         let mut out = Vec::new();
         for tp in tps {
-            if let Some(t) = unify_tparam(tp, param_tys, arg_tys) {
-                out.push((tp, t));
-            }
+            let sols = unify_tparam_all(tp, param_tys, arg_tys);
+            let Some(first) = sols.first().cloned() else {
+                continue;
+            };
+            // `List(a, b)` with different element types infers their lub.
+            let t = if repeated_last && sols.len() > 1 {
+                sols[1..]
+                    .iter()
+                    .fold(first, |acc, next| self.lub_ty(&acc, next))
+            } else {
+                first
+            };
+            out.push((tp, t));
         }
         out
+    }
+
+    /// `lub` cannot walk parents without the symbol table, so a common
+    /// superclass of two case classes came out as `Any`.
+    fn lub_ty(&self, a: &Type, b: &Type) -> Type {
+        let simple = lub(a, b);
+        if !matches!(simple, Type::Any) {
+            return simple;
+        }
+        let mut work: std::collections::VecDeque<Type> = std::collections::VecDeque::new();
+        work.push_back(a.clone());
+        let mut seen = std::collections::HashSet::new();
+        while let Some(t) = work.pop_front() {
+            if let Some(sym) = self.st.class_sym_of(&t) {
+                if !seen.insert(sym.0) {
+                    continue;
+                }
+                if !matches!(t, Type::Any | Type::AnyRef | Type::AnyVal)
+                    && self.st.is_sub_type(b, &t)
+                {
+                    return t;
+                }
+                for p in self.st.get(sym).parents.clone() {
+                    work.push_back(self.st.subst_as_seen_from(&t, &p));
+                }
+            }
+        }
+        simple
     }
 
     /// `Left.apply` / `Right.apply` → `Left[A, B]` / `Right[A, B]`.
@@ -5723,7 +5768,17 @@ impl Typer {
         if self.st.get(sym).tparams.is_empty() || tys.is_empty() {
             return tys;
         }
-        let orig_first: Vec<Type> = first.iter().map(|id| self.st.get(*id).ty.clone()).collect();
+        // The method type keeps `Repeated`; the parameter symbols carry `Seq`
+        // (their type inside the body), which would not unify with an argument.
+        let sig_first: Vec<Type> = match &self.st.get(sym).ty {
+            Type::Method { paramss, .. } => paramss.first().cloned().unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let orig_first: Vec<Type> = if sig_first.len() == first.len() {
+            sig_first
+        } else {
+            first.iter().map(|id| self.st.get(*id).ty.clone()).collect()
+        };
         // By-name params are adapted to `() => T`. Infer `T`, not Function0,
         // so later clauses see `R2` rather than `() => R2`.
         let orig_for_infer: Vec<Type> = orig_first
@@ -10202,12 +10257,31 @@ fn param_at(params: &[Type], i: usize) -> Option<&Type> {
 }
 
 fn unify_tparam(tp: SymbolId, params: &[Type], args: &[Type]) -> Option<Type> {
-    for (p, a) in params.iter().zip(args) {
+    unify_tparam_all(tp, params, args).into_iter().next()
+}
+
+/// Every solution `tp` has across the argument list. A repeated parameter
+/// matches each remaining argument, so `List(a, b)` yields both element types
+/// and the caller takes their least upper bound.
+fn unify_tparam_all(tp: SymbolId, params: &[Type], args: &[Type]) -> Vec<Type> {
+    let repeated_last = matches!(params.last(), Some(Type::Repeated(_)));
+    let mut out = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        let p = if i < params.len() {
+            &params[i]
+        } else if repeated_last {
+            match params.last() {
+                Some(p) => p,
+                None => break,
+            }
+        } else {
+            break;
+        };
         if let Some(t) = unify_one(tp, p, a) {
-            return Some(t);
+            out.push(t);
         }
     }
-    None
+    out
 }
 
 /// True when `args` instantiate `tps` rather than still mentioning them

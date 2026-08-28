@@ -211,6 +211,12 @@ impl Assembler {
             self.record_frame_at(off, self.vstack.clone(), self.vlocals.clone());
             self.need_frame = false;
         }
+        // A later backward jump merges against this state; without it, a local
+        // first assigned inside the loop body would appear in the loop head's
+        // frame even though it is undefined on entry.
+        if !self.dead {
+            self.save_label(l);
+        }
     }
 
     /// Record a JVM exception-table entry. `end` is exclusive. `catch` is an

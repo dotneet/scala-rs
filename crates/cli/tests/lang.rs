@@ -267,3 +267,23 @@ fn primitive_to_string_runs() {
 fn numeric_widening_runs() {
     run_both("num_widen");
 }
+
+#[test]
+fn locals_declared_inside_a_loop_run() {
+    run_both("loop_local");
+}
+
+/// `List(...)` needs the library `foreach`; the private runtime's `::` cannot
+/// widen a heterogeneous chain yet.
+#[test]
+fn heterogeneous_elements_infer_their_lub() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let out = compile_with("lub_varargs", &["--scala-library", jar.to_str().unwrap()]);
+    assert_eq!(run_java(&out, Some(&jar)), expected_stdout("lub_varargs"));
+    let _ = std::fs::remove_dir_all(&out);
+}
