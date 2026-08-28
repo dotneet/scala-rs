@@ -2786,6 +2786,7 @@ impl Typer {
                 }
                 if !fun.sym.is_none() {
                     tree.sym = fun.sym;
+                    self.check_explicit_tparam_bounds(fun, &targs, tree.span);
                     tree.ty = self.st.subst_tparams(fun.sym, &targs, &fun.ty);
                 } else {
                     tree.ty = fun.ty.clone();
@@ -4522,13 +4523,7 @@ impl Typer {
                         } else {
                             inst
                         };
-                        self.check_tparam_bounds(
-                            sym,
-                            &inst,
-                            recv_ty.as_ref(),
-                            tree.span,
-                            true,
-                        );
+                        self.check_tparam_bounds(sym, &inst, recv_ty.as_ref(), tree.span, true);
                         if !inst.is_empty() {
                             let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
                             let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
@@ -4934,7 +4929,13 @@ impl Typer {
                         || owner_n == "Seq$"
                         || owner_n == "LazyList$"
                     {
-                        if let Some(a0) = args.first() {
+                        // `List(Circle(1), Rect(2, 3))` is a `List[Shape]`:
+                        // the element type is the lub of every argument.
+                        if let Some(elem) = args
+                            .iter()
+                            .map(|a| a.ty.widen_constant())
+                            .reduce(|acc, t| self.lub_ty(&acc, &t))
+                        {
                             if let Some(cls) = self
                                 .st
                                 .lookup(owner_n.trim_end_matches('$'))
@@ -4943,7 +4944,7 @@ impl Typer {
                             {
                                 ret = Type::Class {
                                     sym: cls,
-                                    args: vec![a0.ty.widen_constant()],
+                                    args: vec![elem],
                                 };
                             }
                         }
@@ -5298,6 +5299,25 @@ impl Typer {
                 "{what} [{args_s}] do not conform to method {name}'s type parameter bounds [{bounds_s}]"
             ),
         );
+    }
+
+    /// `f[Int](…)` written out: check the explicit type arguments against the
+    /// method's declared bounds.
+    fn check_explicit_tparam_bounds(&mut self, fun: &Tree, targs: &[Type], span: Span) {
+        let sym = fun.sym;
+        if self.st.get(sym).kind != crate::symbol::SymKind::Method {
+            return;
+        }
+        let tps = self.st.get(sym).tparams.clone();
+        if tps.is_empty() || tps.len() != targs.len() {
+            return;
+        }
+        let recv = match &fun.kind {
+            TreeKind::Select { qual, .. } => Some(qual.ty.clone()),
+            _ => None,
+        };
+        let inst: Vec<(SymbolId, Type)> = tps.iter().copied().zip(targs.iter().cloned()).collect();
+        self.check_tparam_bounds(sym, &inst, recv.as_ref(), span, false);
     }
 
     fn tparam_bounds_string(&self, tp: SymbolId) -> String {
@@ -9794,9 +9814,7 @@ fn mentions_tparam(ty: &Type) -> bool {
     match ty {
         Type::TypeParam(_) => true,
         Type::Class { args, .. } | Type::Tuple(args) => args.iter().any(mentions_tparam),
-        Type::Applied { ctor, args } => {
-            mentions_tparam(ctor) || args.iter().any(mentions_tparam)
-        }
+        Type::Applied { ctor, args } => mentions_tparam(ctor) || args.iter().any(mentions_tparam),
         Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
             mentions_tparam(t)
         }

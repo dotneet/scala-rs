@@ -696,8 +696,11 @@ impl SymbolTable {
                         .unwrap_or(false)
                 });
                 if !contra {
-                    let joined: Vec<Type> =
-                        a1.iter().zip(a2.iter()).map(|(x, y)| self.lub(x, y)).collect();
+                    let joined: Vec<Type> = a1
+                        .iter()
+                        .zip(a2.iter())
+                        .map(|(x, y)| self.lub(x, y))
+                        .collect();
                     return Type::Class {
                         sym: *s1,
                         args: joined,
