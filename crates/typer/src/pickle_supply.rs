@@ -61,6 +61,8 @@ pub struct PickleSupply {
     /// Library classes stubbed into the symbol table by `ensure_class`, keyed
     /// by JVM internal name, so a second mention reuses the same symbol.
     stubs: HashMap<String, SymbolId>,
+    /// Classes whose pickled parents have already been attached.
+    parented: HashSet<u32>,
 }
 
 impl PickleSupply {
@@ -83,10 +85,16 @@ impl PickleSupply {
         if !self.tried.insert((class_sym.0, name.to_string())) {
             return false;
         }
-        // Operator members are mangled on the JVM (`++` is `$plus$plus`); until
-        // that encoding is shared with the backend, only plain names are safe
-        // to resolve a descriptor for.
-        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        // nsc keeps operator names encoded all the way through: `SetOps`
+        // pickles `&` as `$amp`, and the classfile declares `$amp` too. So the
+        // encoded name is what both the pickle lookup and the descriptor
+        // search use, while the symbol we install keeps the source name.
+        let jvm_member = scala_rs_pickle::names::encode_method_name(name);
+        if !jvm_member
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        {
+            trace(format_args!("{name}: not encodable as a JVM method name"));
             return false;
         }
         let sym = st.get(class_sym);
@@ -102,9 +110,11 @@ impl PickleSupply {
         let is_module = sym.kind == SymKind::ModuleClass;
         let full = internal.trim_end_matches('$').replace('/', ".");
 
+        self.attach_parents(st, bin, class_sym, &full, is_module);
+
         let (hits, _errs) = {
             let mut src = BinSource(bin);
-            self.sigs.lookup(&mut src, &full, is_module, name)
+            self.sigs.lookup(&mut src, &full, is_module, &jvm_member)
         };
         if hits.is_empty() {
             trace(format_args!("{full}#{name}: not found in any pickle"));
@@ -152,7 +162,16 @@ impl PickleSupply {
                 ));
                 continue;
             }
-            if self.install(st, bin, class_sym, &internal, name, &shape, &class_scope) {
+            if self.install(
+                st,
+                bin,
+                class_sym,
+                &internal,
+                name,
+                &jvm_member,
+                &shape,
+                &class_scope,
+            ) {
                 installed += 1;
             }
         }
@@ -170,13 +189,14 @@ impl PickleSupply {
         class_sym: SymbolId,
         internal: &str,
         name: &str,
+        jvm_member: &str,
         shape: &Shape,
         class_scope: &HashMap<String, Type>,
     ) -> bool {
         // The erased descriptor comes from the classfile itself rather than
         // from re-deriving scalac's erasure: the bytes are the truth, and a
         // descriptor we merely guessed would fail to link.
-        let Some(desc) = self.erased_desc(bin, internal, name, shape.arity()) else {
+        let Some(desc) = self.erased_desc(bin, internal, jvm_member, shape.arity()) else {
             trace(format_args!(
                 "{internal}#{name}/{}: no unambiguous erased descriptor",
                 shape.arity()
@@ -261,6 +281,72 @@ impl PickleSupply {
         st.get_mut(m).owner = class_sym;
         st.get_mut(class_sym).members.push(m);
         true
+    }
+
+    /// Give a class the parents its own pickle declares, if it does not have
+    /// them already.
+    ///
+    /// The prelude declares `immutable.Set` without `collection.Set` above it,
+    /// so `Set#&`, whose parameter is `collection.Set[A]`, could be supplied
+    /// but never called. Attaching the pickled parents closes that gap, and it
+    /// is additive: an existing parent is never removed or replaced, and this
+    /// only runs on classes a lookup already failed on.
+    fn attach_parents(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        full: &str,
+        is_module: bool,
+    ) {
+        if !self.parented.insert(class_sym.0) {
+            return;
+        }
+        let Ok(sig) = ({
+            let mut src = BinSource(bin);
+            self.sigs.class_sig(&mut src, full, is_module)
+        }) else {
+            return;
+        };
+        let mut scope: HashMap<String, Type> = HashMap::new();
+        for tp in &st.get(class_sym).tparams {
+            scope.insert(st.get(*tp).name.clone(), Type::TypeParam(*tp));
+        }
+        for p in sig.parents.clone() {
+            let SigType::Ref { sym, .. } = &p else {
+                continue;
+            };
+            if !sym.starts_with("scala.") {
+                continue;
+            }
+            let Some(t) = self.conv(st, bin, &scope, &p) else {
+                continue;
+            };
+            let Type::Class { sym: psym, .. } = &t else {
+                continue;
+            };
+            if *psym == class_sym {
+                continue;
+            }
+            let already = st
+                .get(class_sym)
+                .parents
+                .iter()
+                .any(|q| matches!(q, Type::Class { sym: q, .. } if q == psym));
+            if already {
+                continue;
+            }
+            // A parent that already has this class above it would make the
+            // hierarchy cyclic; the prelude's own shape wins.
+            if inherits_from(st, *psym, class_sym) {
+                continue;
+            }
+            trace(format_args!(
+                "{full}: attaching pickled parent {}",
+                st.get(*psym).name
+            ));
+            st.get_mut(class_sym).parents.push(t);
+        }
     }
 
     /// The symbol for a library class named in a pickle, creating a stub from
@@ -837,6 +923,27 @@ impl PickleSupply {
         // vocabulary, so the caller's scope is what finishes the job.
         self.conv_at(st, bin, scope, &target, d)
     }
+}
+
+/// Whether `cls` already has `target` somewhere above it.
+fn inherits_from(st: &SymbolTable, cls: SymbolId, target: SymbolId) -> bool {
+    let mut seen: Vec<u32> = Vec::new();
+    let mut work = vec![cls];
+    while let Some(c) = work.pop() {
+        if c == target {
+            return true;
+        }
+        if seen.contains(&c.0) || seen.len() > 256 {
+            continue;
+        }
+        seen.push(c.0);
+        for p in &st.get(c).parents {
+            if let Some(ps) = st.class_sym_of(p) {
+                work.push(ps);
+            }
+        }
+    }
+    false
 }
 
 /// Number of parameters in a JVM method descriptor.
