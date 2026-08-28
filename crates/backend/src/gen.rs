@@ -4836,6 +4836,38 @@ fn invoke_value_extension(
         );
         return;
     }
+    // `sign`/`round`/`floor`/`ceil` have no `$extension` static counterpart
+    // on `RichInt`/`RichLong`/`RichDouble` (unlike `toBinaryString` etc.), so
+    // nsc would allocate a real instance and call the instance method. Both
+    // delegate to plain `java.lang`/`Math` statics under the hood, so call
+    // those directly instead -- same result, and avoids the category-1 vs.
+    // category-2 stack-shuffling that a `new`+dup-based call would need for
+    // `Long`/`Double` receivers.
+    if owner == "scala/runtime/RichInt" && s.name == "sign" {
+        asm.invokestatic("java/lang/Integer", "signum", "(I)I");
+        return;
+    }
+    if owner == "scala/runtime/RichLong" && s.name == "sign" {
+        asm.invokestatic("java/lang/Long", "signum", "(J)I");
+        asm.i2l();
+        return;
+    }
+    if owner == "scala/runtime/RichDouble" && s.name == "sign" {
+        asm.invokestatic("java/lang/Math", "signum", "(D)D");
+        return;
+    }
+    if owner == "scala/runtime/RichDouble" && s.name == "round" {
+        asm.invokestatic("java/lang/Math", "round", "(D)J");
+        return;
+    }
+    if owner == "scala/runtime/RichDouble" && s.name == "floor" {
+        asm.invokestatic("java/lang/Math", "floor", "(D)D");
+        return;
+    }
+    if owner == "scala/runtime/RichDouble" && s.name == "ceil" {
+        asm.invokestatic("java/lang/Math", "ceil", "(D)D");
+        return;
+    }
     if owner == "scala/collection/StringOps" && s.name == "length" {
         // 2.13 StringOps inlines `length` to `String#length`; the jar exposes
         // `size$extension` which is the same call against the underlying String.
@@ -5430,7 +5462,14 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
 fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Option<&Type>) {
     let s = ctx.st.get(id);
     let owner_id = s.owner;
-    let owner = class_internal(ctx.st, owner_id);
+    let mut owner = class_internal(ctx.st, owner_id);
+    if owner == "scala/math" {
+        // `scala.math.{abs,max,min,pow,...}` are methods directly attached to
+        // the `scala/math` *package* symbol (so `scala.math.abs` resolves at
+        // all -- packages otherwise have no runtime value). The real ABI
+        // lives on the static-forwarder class `scala.math.package`.
+        owner = "scala/math/package".to_string();
+    }
     let name = s.name.as_str();
     let mut desc = method_desc_boxed(ctx.st, id, ctx.boxed_vars);
     if name == "<init>" {
@@ -6790,20 +6829,43 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
         }
         if is_stdlib_stringbuilder(&owner) {
             match name {
+                // `+=(Char)` has no direct override on StringBuilder (only the
+                // erased `Growable.$plus$eq(Object): Growable`); `addOne(Char)`
+                // is a concrete, non-erased override with the same effect.
                 "+=" => {
                     asm.invokevirtual(
                         "scala/collection/mutable/StringBuilder",
-                        "+=",
-                        "(Ljava/lang/Object;)Lscala/collection/mutable/Growable;",
+                        "addOne",
+                        "(C)Lscala/collection/mutable/StringBuilder;",
                     );
                     return;
                 }
-                "append" => {
+                // `++=(String)` similarly has no direct override; `addAll(String)`
+                // is the concrete, non-erased equivalent.
+                "++=" => {
                     asm.invokevirtual(
                         "scala/collection/mutable/StringBuilder",
-                        "append",
+                        "addAll",
                         "(Ljava/lang/String;)Lscala/collection/mutable/StringBuilder;",
                     );
+                    return;
+                }
+                // `append` has a concrete overload per argument type; use the
+                // descriptor computed from the resolved (overloaded) symbol.
+                "append" | "insert" | "deleteCharAt" | "setLength" | "clear" | "isEmpty"
+                | "nonEmpty" | "length" | "toString" | "result" | "charAt" | "apply" => {
+                    asm.invokevirtual("scala/collection/mutable/StringBuilder", name, &desc);
+                    return;
+                }
+                // `reverse` is inherited from `IndexedSeqOps` and erased to
+                // `Object`; checkcast back to the declared `StringBuilder`.
+                "reverse" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/StringBuilder",
+                        "reverse",
+                        "()Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/mutable/StringBuilder");
                     return;
                 }
                 _ => {}
@@ -6817,6 +6879,108 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                     "(Ljava/lang/String;)Ljava/lang/String;",
                 );
                 return;
+            }
+        }
+        if is_stdlib_range(&owner) {
+            match name {
+                // `sum`/`min`/`max` take an implicit `Numeric`/`Ordering`
+                // instance; Range's own overrides return `int` directly
+                // (not the generic erased `Object`), so no checkcast/unbox
+                // is needed after pushing the `Int` singleton.
+                "sum" => {
+                    asm.getstatic(
+                        "scala/math/Numeric$IntIsIntegral$",
+                        "MODULE$",
+                        "Lscala/math/Numeric$IntIsIntegral$;",
+                    );
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Range",
+                        "sum",
+                        "(Lscala/math/Numeric;)I",
+                    );
+                    return;
+                }
+                // `product` has no `int`-returning override on `Range`
+                // itself (only the generic `IterableOnceOps` default),
+                // unlike `sum`/`min`/`max`.
+                "product" => {
+                    asm.getstatic(
+                        "scala/math/Numeric$IntIsIntegral$",
+                        "MODULE$",
+                        "Lscala/math/Numeric$IntIsIntegral$;",
+                    );
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "product",
+                        "(Lscala/math/Numeric;)Ljava/lang/Object;",
+                    );
+                    emit_unbox(asm, &Type::Int);
+                    return;
+                }
+                "min" | "max" => {
+                    asm.getstatic(
+                        "scala/math/Ordering$Int$",
+                        "MODULE$",
+                        "Lscala/math/Ordering$Int$;",
+                    );
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Range",
+                        name,
+                        "(Lscala/math/Ordering;)I",
+                    );
+                    return;
+                }
+                // `filter`/`filterNot`/`flatMap`/`zipWithIndex` only have the
+                // generic `Object`-erased override on `Range` (no specific
+                // `IndexedSeq`-returning bridge, unlike `map`/`take`/`drop`).
+                "filter" | "filterNot" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Range",
+                        name,
+                        "(Lscala/Function1;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/immutable/IndexedSeq");
+                    return;
+                }
+                "flatMap" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Range",
+                        "flatMap",
+                        "(Lscala/Function1;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/immutable/IndexedSeq");
+                    return;
+                }
+                "zipWithIndex" => {
+                    asm.invokevirtual(
+                        "scala/collection/immutable/Range",
+                        "zipWithIndex",
+                        "()Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/immutable/IndexedSeq");
+                    return;
+                }
+                // `toArray` is only the `IterableOnceOps` generic default.
+                "toArray" => {
+                    asm.getstatic(
+                        "scala/reflect/ClassTag$",
+                        "MODULE$",
+                        "Lscala/reflect/ClassTag$;",
+                    );
+                    asm.invokevirtual(
+                        "scala/reflect/ClassTag$",
+                        "Int",
+                        "()Lscala/reflect/ManifestFactory$IntManifest;",
+                    );
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "toArray",
+                        "(Lscala/reflect/ClassTag;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("[I");
+                    return;
+                }
+                _ => {}
             }
         }
     }

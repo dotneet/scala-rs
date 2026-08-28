@@ -3225,3 +3225,48 @@ fn fixtures_list_core10() {
 fn scala_library_dual_run_list_core10() {
     dual_run_fixture("list_core10");
 }
+
+// String / StringBuilder / Range / numeric enrichment (crates/typer/src/prelude_text.rs).
+
+#[test]
+fn fixtures_text_string1_bad_is_error() {
+    compile_fails_lib("text_string1_bad", "noSuchStringMethod is not a member");
+}
+
+#[test]
+fn fixtures_text_stringbuilder1_bad_is_error() {
+    compile_fails_lib(
+        "text_stringbuilder1_bad",
+        "noSuchBuilderMethod is not a member",
+    );
+}
+
+#[test]
+fn fixtures_text_range1_bad_is_error() {
+    compile_fails_lib("text_range1_bad", "noSuchRangeMethod is not a member");
+}
+
+#[test]
+fn fixtures_text_math1_bad_is_error() {
+    compile_fails_lib("text_math1_bad", "noSuchMathFunction is not a member");
+}
+
+#[test]
+fn scala_library_dual_run_text_string1() {
+    dual_run_fixture("text_string1");
+}
+
+#[test]
+fn scala_library_dual_run_text_stringbuilder1() {
+    dual_run_fixture("text_stringbuilder1");
+}
+
+#[test]
+fn scala_library_dual_run_text_range1() {
+    dual_run_fixture("text_range1");
+}
+
+#[test]
+fn scala_library_dual_run_text_math1() {
+    dual_run_fixture("text_math1");
+}

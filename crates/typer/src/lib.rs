@@ -8,6 +8,7 @@ mod lambda_lift;
 mod prelude;
 mod prelude_either;
 mod prelude_seq;
+mod prelude_text;
 mod prelude_tuple;
 mod symbol;
 mod uncurry;

@@ -1,0 +1,37 @@
+object Main {
+  def main(args: Array[String]): Unit = {
+    val r = 1 to 5
+    for (x <- r if x > 2) println(x)
+    val ys = for (x <- r if x % 2 == 0) yield x * 10
+    println(ys)
+    println(r.foldLeft(0)(_ + _))
+    println(r.foldRight(0)(_ + _))
+    println(r.sum)
+    println(r.product)
+    println(r.max)
+    println(r.min)
+    println(r.toList)
+    println(r.toVector)
+    println(r.filter(_ > 2))
+    println(r.filterNot(_ > 2))
+    println(r.map(_ * 2))
+    println(r.flatMap(x => 1 to x))
+    println(r.reverse)
+    println(r.contains(3))
+    println(r.exists(_ == 3))
+    println(r.forall(_ > 0))
+    println(r.count(_ % 2 == 0))
+    println(r.take(2))
+    println(r.drop(2))
+    println(r.takeWhile(_ < 3))
+    println(r.dropWhile(_ < 3))
+    println(r.head)
+    println(r.last)
+    println(r.isEmpty)
+    println(r.nonEmpty)
+    println(r.size)
+    println(r.zipWithIndex)
+    println(1 to 5 by 2)
+    println(1 until 3)
+  }
+}

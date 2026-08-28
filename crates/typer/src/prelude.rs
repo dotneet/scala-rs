@@ -396,6 +396,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_enumeration(st);
     }
     crate::prelude_seq::add_list_core(st, library_abi);
+    crate::prelude_text::install(st, library_abi);
     add_annotation_pkg(st);
     add_java_sam(st, java, java_lang);
 
@@ -653,7 +654,7 @@ pub(crate) fn class(
     id
 }
 
-fn iface(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
+pub(crate) fn iface(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
     let id = st.alloc(
         name,
         owner,
@@ -696,7 +697,7 @@ fn module_extending(
     m
 }
 
-fn method(
+pub(crate) fn method(
     st: &mut SymbolTable,
     owner: SymbolId,
     name: &str,
@@ -1505,21 +1506,21 @@ fn add_array_members(st: &mut SymbolTable) {
     );
 }
 
-fn fn1(arg: Type, ret: Type) -> Type {
+pub(crate) fn fn1(arg: Type, ret: Type) -> Type {
     Type::Function {
         params: vec![arg],
         ret: Box::new(ret),
     }
 }
 
-fn fn2(a: Type, b: Type, ret: Type) -> Type {
+pub(crate) fn fn2(a: Type, b: Type, ret: Type) -> Type {
     Type::Function {
         params: vec![a, b],
         ret: Box::new(ret),
     }
 }
 
-fn fn_n(params: Vec<Type>, ret: Type) -> Type {
+pub(crate) fn fn_n(params: Vec<Type>, ret: Type) -> Type {
     Type::Function {
         params,
         ret: Box::new(ret),
@@ -4758,21 +4759,20 @@ fn add_linked_hash_set(st: &mut SymbolTable) {
     st.get_mut(lhs_mod).members.extend(mems);
 }
 
+/// Base `scala.collection.mutable.StringBuilder` class symbol. The full
+/// member set (constructors, `append` overloads, `+=`, `insert`, `reverse`,
+/// ...) is added by `prelude_text::add_string_builder_full`, which reuses
+/// this same symbol (and aliases it under `scala` for the bare name) rather
+/// than declaring a second, conflicting one.
 fn add_string_builder(st: &mut SymbolTable) {
     let mutp = crate::classpath::ensure_package(st, "scala/collection/mutable");
-    let sb = class(
+    class(
         st,
         mutp,
         "StringBuilder",
         "scala/collection/mutable/StringBuilder",
         &[Type::AnyRef],
     );
-    let sb_t = Type::Class {
-        sym: sb,
-        args: vec![],
-    };
-    method(st, sb, "+=", vec![Type::Any], sb_t.clone(), Intrinsic::None);
-    method(st, sb, "append", vec![Type::String], sb_t, Intrinsic::None);
 }
 
 fn add_either(st: &mut SymbolTable) {
