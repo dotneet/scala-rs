@@ -4512,9 +4512,10 @@ impl Typer {
                             // `List.flatMap[B](f: A => IterableOnce[B])`: B is
                             // only determined by the lambda body, so the body
                             // must not be checked against `IterableOnce[B]`.
-                            let undetermined = !sym.is_none()
-                                && mentions_tparam(fr, &self.st.get(sym).tparams);
-                            let fret = if matches!(fr.as_ref(), Type::TypeParam(_)) || undetermined {
+                            let undetermined =
+                                !sym.is_none() && mentions_tparam(fr, &self.st.get(sym).tparams);
+                            let fret = if matches!(fr.as_ref(), Type::TypeParam(_)) || undetermined
+                            {
                                 Box::new(Type::Any)
                             } else {
                                 fr.clone()

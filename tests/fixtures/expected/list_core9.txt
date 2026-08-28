@@ -1,0 +1,15 @@
+apple,fig,pear
+fig
+13
+apple,pear,fig
+fig
+apple
+2
+true
+Some(fig)
+20,20,40
+[]
+0
+true
+0
+6

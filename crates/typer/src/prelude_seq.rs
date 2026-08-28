@@ -272,10 +272,7 @@ impl Env {
         }
     }
     fn one(&self, sym: SymbolId, t: Type) -> Type {
-        Type::Class {
-            sym,
-            args: vec![t],
-        }
+        Type::Class { sym, args: vec![t] }
     }
     fn two(&self, sym: SymbolId, a: Type, b: Type) -> Type {
         Type::Class {
@@ -368,7 +365,9 @@ fn add_parent(st: &mut SymbolTable, cls: SymbolId, parent: SymbolId, nargs: usiz
         .take(nargs)
         .map(Type::TypeParam)
         .collect::<Vec<_>>();
-    st.get_mut(cls).parents.push(Type::Class { sym: parent, args });
+    st.get_mut(cls)
+        .parents
+        .push(Type::Class { sym: parent, args });
 }
 
 /// `scala.math.Numeric` と `sum` / `product` 用の implicit インスタンス。
@@ -597,13 +596,7 @@ fn add_filters_and_slices(st: &mut SymbolTable, env: &Env) {
     for name in ["take", "drop", "takeRight", "dropRight"] {
         simple(st, l, name, vec![Type::Int], list_a.clone());
     }
-    simple(
-        st,
-        l,
-        "slice",
-        vec![Type::Int, Type::Int],
-        list_a.clone(),
-    );
+    simple(st, l, "slice", vec![Type::Int, Type::Int], list_a.clone());
     simple(st, l, "reverse", vec![], list_a.clone());
     simple(st, l, "distinct", vec![], list_a.clone());
     simple(st, l, "init", vec![], list_a.clone());
@@ -666,10 +659,7 @@ fn add_predicates_and_folds(st: &mut SymbolTable, env: &Env) {
     poly(st, l, "foldLeft", &["B"], |t| {
         let b = t[0].clone();
         (
-            vec![
-                vec![b.clone()],
-                vec![fn2(b.clone(), tb.clone(), b.clone())],
-            ],
+            vec![vec![b.clone()], vec![fn2(b.clone(), tb.clone(), b.clone())]],
             b,
         )
     });
@@ -677,10 +667,7 @@ fn add_predicates_and_folds(st: &mut SymbolTable, env: &Env) {
     poly(st, l, "foldRight", &["B"], |t| {
         let b = t[0].clone();
         (
-            vec![
-                vec![b.clone()],
-                vec![fn2(tb.clone(), b.clone(), b.clone())],
-            ],
+            vec![vec![b.clone()], vec![fn2(tb.clone(), b.clone(), b.clone())]],
             b,
         )
     });
@@ -689,10 +676,7 @@ fn add_predicates_and_folds(st: &mut SymbolTable, env: &Env) {
     poly(st, l, "scanLeft", &["B"], |t| {
         let b = t[0].clone();
         (
-            vec![
-                vec![b.clone()],
-                vec![fn2(b.clone(), tb.clone(), b.clone())],
-            ],
+            vec![vec![b.clone()], vec![fn2(b.clone(), tb.clone(), b.clone())]],
             Type::Class {
                 sym: l2,
                 args: vec![b],
@@ -902,13 +886,7 @@ fn add_grouping(st: &mut SymbolTable, env: &Env) {
     let it_of_list = env.one(env.iterator, list_a);
     simple(st, l, "grouped", vec![Type::Int], it_of_list.clone());
     simple(st, l, "sliding", vec![Type::Int], it_of_list.clone());
-    simple(
-        st,
-        l,
-        "sliding",
-        vec![Type::Int, Type::Int],
-        it_of_list,
-    );
+    simple(st, l, "sliding", vec![Type::Int, Type::Int], it_of_list);
 }
 
 /// `grouped` / `sliding` の結果を畳むための `Iterator.toList`。
