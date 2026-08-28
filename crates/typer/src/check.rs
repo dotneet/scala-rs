@@ -91,6 +91,10 @@ pub struct Typer {
     /// Signature pass: fill member types across the whole run before any body
     /// is typed, so a unit can call into one that comes later.
     sigs_only: bool,
+    /// Members whose signature the signature pass already built. Signature
+    /// work is not idempotent -- it synthesizes evidence parameters and
+    /// default getters -- so the body pass must not redo it.
+    sig_done: std::collections::HashSet<(usize, scala_rs_parser::NodeId)>,
     fatal_warnings: bool,
     library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
@@ -140,17 +144,15 @@ pub fn typecheck_units(
         t.namer(tree);
         t.register_sealed_from_namer(tree);
     }
-    if units.len() > 1 {
-        // Member types first, across every unit: typing a body may call into a
-        // file that comes later on the command line.
+    {
+        // Member types first, across every unit: typing a body may call a
+        // member declared further down the file, or in a file that comes
+        // later on the command line.
         t.sigs_only = true;
-        let saved = std::mem::take(&mut t.diags);
         for (tree, file_index) in units.iter_mut() {
             t.file_index = *file_index;
             t.typer(tree);
         }
-        // The signature pass reports the same diagnostics the full pass will.
-        t.diags = saved;
         t.sigs_only = false;
     }
     for (tree, file_index) in units.iter_mut() {
@@ -159,6 +161,10 @@ pub fn typecheck_units(
         t.report_macro_calls(tree);
         t.strip_macro_defs(tree);
     }
+    // Class headers are typed by both passes, so the same complaint about a
+    // parent or self type is raised twice. Member signatures are built once
+    // (see `sig_done`), so their diagnostics survive here.
+    dedup_diags(&mut t.diags);
     (t.st, t.diags)
 }
 
@@ -173,6 +179,7 @@ impl Typer {
             gensym: 0,
             pkg_nest: Vec::new(),
             sigs_only: false,
+            sig_done: std::collections::HashSet::new(),
             fatal_warnings: opts.fatal_warnings,
             library_abi: opts.library_abi,
             return_meth: None,
@@ -1169,7 +1176,11 @@ impl Typer {
             ),
             _ => return,
         };
-        let evidence = if is_trait {
+        // The signature pass and the body pass walk the same tree; the
+        // evidence clause must be appended by only one of them.
+        let ev_fresh = tree.id == scala_rs_parser::NodeId(0)
+            || self.sig_done.insert((self.file_index, tree.id));
+        let evidence = if is_trait || !ev_fresh {
             Vec::new()
         } else {
             self.class_bound_evidence(id, &tparams)
@@ -1812,9 +1823,17 @@ impl Typer {
         }
         if let Some(name) = self_name {
             if name != "this" {
-                let sid = self
-                    .st
-                    .alloc(&name, class_id, SymKind::Term, Flags::SYNTHETIC, "");
+                // The signature pass and the body pass both bind the alias;
+                // allocating twice would make `self` look like an overload.
+                let existing = self.st.get(class_id).members.iter().copied().find(|&m| {
+                    self.st.get(m).name == name
+                        && self.st.get(m).kind == SymKind::Term
+                        && self.st.get(m).flags.contains(Flags::SYNTHETIC)
+                });
+                let sid = existing.unwrap_or_else(|| {
+                    self.st
+                        .alloc(&name, class_id, SymKind::Term, Flags::SYNTHETIC, "")
+                });
                 self.st.get_mut(sid).ty = st;
                 self.st.enter_in_current(&name, sid);
             }
@@ -2069,6 +2088,15 @@ impl Typer {
     }
 
     fn type_member_sig(&mut self, tree: &mut Tree) {
+        // Signature work synthesizes evidence parameters and default getters,
+        // so it must run exactly once per member even though the signature
+        // pass and the body pass both walk the same tree.
+        if tree.id != scala_rs_parser::NodeId(0)
+            && matches!(tree.kind, TreeKind::ValDef { .. } | TreeKind::DefDef { .. })
+            && !self.sig_done.insert((self.file_index, tree.id))
+        {
+            return;
+        }
         match &tree.kind {
             TreeKind::ValDef { .. } => self.type_val_sig(tree),
             TreeKind::DefDef { .. } => self.type_def_sig(tree),
@@ -3997,6 +4025,7 @@ impl Typer {
             }
         }
         found.retain(|s| self.accessible(*s, Some(qual.as_ref())));
+        self.note_companion_access(&found);
         if found.is_empty() {
             self.error(
                 tree.span,
@@ -4185,12 +4214,67 @@ impl Typer {
         }
         let mut c = current;
         while !c.is_none() {
+            // A class and its companion object share private access, so at
+            // every enclosing level the companion counts as the same scope.
+            if c == owner || self.companion_scope(c) == Some(owner) {
+                return true;
+            }
+            c = self.st.get(c).owner;
+        }
+        false
+    }
+
+    /// `nested_in` without the companion rule: true enclosure only.
+    fn enclosed_by(&self, current: SymbolId, owner: SymbolId) -> bool {
+        if owner.is_none() {
+            return true;
+        }
+        let mut c = current;
+        while !c.is_none() {
             if c == owner {
                 return true;
             }
             c = self.st.get(c).owner;
         }
         false
+    }
+
+    /// Mark a `private` member read across the companion boundary; the JVM
+    /// would reject `ACC_PRIVATE` there, so the backend widens it.
+    fn note_companion_access(&mut self, members: &[SymbolId]) {
+        for &m in members {
+            let s = self.st.get(m);
+            if !s.flags.contains(Flags::PRIVATE) || s.flags.contains(Flags::LOCAL) {
+                continue;
+            }
+            let owner = s.owner;
+            if !self.enclosed_by(self.st.this_class, owner) {
+                self.st.get_mut(m).access_widened = true;
+            }
+        }
+    }
+
+    /// The companion of a class (its module class) or of a module class (the
+    /// class of the same name), for access checks.
+    fn companion_scope(&self, c: SymbolId) -> Option<SymbolId> {
+        let s = self.st.get(c);
+        match s.kind {
+            SymKind::Class => {
+                let m = self.st.companion_module(c)?;
+                Some(self.st.module_class_of(m))
+            }
+            SymKind::ModuleClass => {
+                let name = s.name.trim_end_matches('$').to_string();
+                let owner = s.owner;
+                self.st
+                    .get(owner)
+                    .members
+                    .iter()
+                    .copied()
+                    .find(|&m| self.st.get(m).kind == SymKind::Class && self.st.get(m).name == name)
+            }
+            _ => None,
+        }
     }
 
     fn access_within(&self, current: SymbolId, name: &str) -> bool {
@@ -11264,4 +11348,18 @@ fn is_annotated_lambda(tree: &Tree) -> bool {
         }
         _ => false,
     }
+}
+
+/// Drop diagnostics repeated verbatim at the same position, keeping the first.
+fn dedup_diags(diags: &mut Vec<Diagnostic>) {
+    let mut seen = std::collections::HashSet::new();
+    diags.retain(|d| {
+        seen.insert((
+            d.file_index,
+            d.span.lo,
+            d.span.hi,
+            d.level,
+            d.message.clone(),
+        ))
+    });
 }

@@ -198,5 +198,6 @@ conform!(
     companion_extends,
     case_companion,
     class_of,
-    variance
+    variance,
+    companion_private
 );

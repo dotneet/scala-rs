@@ -192,6 +192,9 @@ pub struct Symbol {
     /// Access qualifier `private[C]` / `protected[C]` (`C` is a class or package name).
     /// `private[this]` is `PRIVATE|LOCAL` with this field empty.
     pub private_within: Option<String>,
+    /// A `private` member the companion reads. The JVM has no companions, so
+    /// nsc widens such a member (`Counter$$step`); we drop `ACC_PRIVATE`.
+    pub access_widened: bool,
     /// Language annotations (`@deprecated(...)`, `@tailrec`, …) copied from modifiers.
     pub annotations: Vec<scala_rs_parser::Tree>,
     /// Lower bound of an abstract/HK type member (`type F[_] >: Lo`).
@@ -286,6 +289,7 @@ impl SymbolTable {
                 children: vec![],
                 self_type: None,
                 private_within: None,
+                access_widened: false,
                 annotations: vec![],
                 bound_lo: None,
                 bound_hi: None,
@@ -359,6 +363,7 @@ impl SymbolTable {
             children: vec![],
             self_type: None,
             private_within: None,
+            access_widened: false,
             annotations: vec![],
             bound_lo: None,
             bound_hi: None,

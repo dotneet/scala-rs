@@ -1317,8 +1317,10 @@ fn is_delayed_ctor_stat(t: &Tree) -> bool {
     }
 }
 
-fn field_access_flags(mods: Flags) -> u16 {
-    let mut acc = if mods.contains(Flags::PRIVATE) {
+/// `widened` marks a `private` member the companion reads: nsc renames such a
+/// member and exposes it, because the JVM would reject the cross-class access.
+fn field_access_flags(mods: Flags, widened: bool) -> u16 {
+    let mut acc = if mods.contains(Flags::PRIVATE) && !widened {
         ACC_PRIVATE
     } else {
         ACC_PUBLIC
@@ -1335,8 +1337,8 @@ fn field_access_flags(mods: Flags) -> u16 {
     acc
 }
 
-fn method_access_flags(mods: Flags) -> u16 {
-    let mut acc = if mods.contains(Flags::PRIVATE) {
+fn method_access_flags(mods: Flags, widened: bool) -> u16 {
+    let mut acc = if mods.contains(Flags::PRIVATE) && !widened {
         ACC_PRIVATE
     } else {
         ACC_PUBLIC
@@ -1660,7 +1662,8 @@ impl<'a> Gen<'a> {
                     if name == "<init>" || name == "<clinit>" {
                         continue;
                     }
-                    let acc = method_access_flags(mods.flags) | ACC_ABSTRACT;
+                    let acc =
+                        method_access_flags(mods.flags, widened(self.st, stt.sym)) | ACC_ABSTRACT;
                     b.add_abstract(acc, name, &def_method_desc(self.st, stt));
                     if needs_super_accessor(stt) {
                         let acc_name = super_accessor_name(self.st, class_id, name);
@@ -1705,7 +1708,7 @@ impl<'a> Gen<'a> {
                         p.ty.clone()
                     };
                     b.fields.push(Field {
-                        access: field_access_flags(mods.flags),
+                        access: field_access_flags(mods.flags, widened(self.st, p.sym)),
                         name: name.clone(),
                         desc: jvm_desc(self.st, &ty),
                     });
@@ -1736,7 +1739,7 @@ impl<'a> Gen<'a> {
                     stt.ty.clone()
                 };
                 b.fields.push(Field {
-                    access: field_access_flags(mods.flags),
+                    access: field_access_flags(mods.flags, widened(self.st, stt.sym)),
                     name: name.clone(),
                     desc: jvm_desc(self.st, &ty),
                 });
@@ -2400,7 +2403,7 @@ impl<'a> Gen<'a> {
         }
         let desc = def_method_desc_boxed(self.st, def, &self.boxed_vars);
         let ret = method_ret_ty(def);
-        let acc = method_access_flags(mods.flags);
+        let acc = method_access_flags(mods.flags, widened(self.st, def.sym));
         if mods.flags.contains(Flags::NATIVE) {
             b.add_abstract(acc, name, &desc);
             if let Some(d) = java_deprecated_desc(mods) {
@@ -3541,7 +3544,7 @@ impl<'a> Gen<'a> {
                     stt.ty.clone()
                 };
                 b.fields.push(Field {
-                    access: field_access_flags(mods.flags),
+                    access: field_access_flags(mods.flags, widened(self.st, stt.sym)),
                     name: name.clone(),
                     desc: jvm_desc(self.st, &ty),
                 });
@@ -13240,4 +13243,9 @@ fn emit_class_constant(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
             asm.ldc_class(&n);
         }
     }
+}
+
+/// Whether the typer widened this member's access for companion use.
+fn widened(st: &SymbolTable, sym: SymbolId) -> bool {
+    !sym.is_none() && st.get(sym).access_widened
 }
