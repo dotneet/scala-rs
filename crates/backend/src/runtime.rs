@@ -710,7 +710,446 @@ fn emit_list() -> EmittedClass {
         },
     );
 
+    add_list_core_runtime(&mut b);
+
     b.finish()
+}
+
+/// `prelude_seq::add_list_core_private` が宣言する分の実装。
+///
+/// 私有ランタイムの `List` は `isEmpty` / `head` / `tail` だけを抽象メソッドに
+///持つので、ここは全部それらの上に組み立てる。scala-library はリンクしない。
+fn add_list_core_runtime(b: &mut B) {
+    const LIST: &str = "scala/collection/immutable/List";
+    const CONS: &str = "scala/collection/immutable/$colon$colon";
+    const NIL: &str = "scala/collection/immutable/Nil$";
+    const F1: &str = "scala/Function1";
+
+    // length: 0 if empty else 1 + tail.length
+    b.add_code(ACC_PUBLIC, "length", "()I", 1, |asm| {
+        asm.aload(0);
+        asm.invokevirtual(LIST, "isEmpty", "()Z");
+        let nonempty = asm.fresh_label();
+        asm.ifeq(nonempty);
+        asm.iconst(0);
+        asm.ireturn();
+        asm.mark(nonempty);
+        asm.iconst(1);
+        asm.aload(0);
+        asm.invokevirtual(LIST, "tail", "()Lscala/collection/immutable/List;");
+        asm.invokevirtual(LIST, "length", "()I");
+        asm.iadd();
+        asm.ireturn();
+    });
+
+    b.add_code(ACC_PUBLIC, "size", "()I", 1, |asm| {
+        asm.aload(0);
+        asm.invokevirtual(LIST, "length", "()I");
+        asm.ireturn();
+    });
+
+    b.add_code(ACC_PUBLIC, "nonEmpty", "()Z", 1, |asm| {
+        asm.aload(0);
+        asm.invokevirtual(LIST, "isEmpty", "()Z");
+        let empty = asm.fresh_label();
+        asm.ifne(empty);
+        asm.iconst(1);
+        asm.ireturn();
+        asm.mark(empty);
+        asm.iconst(0);
+        asm.ireturn();
+    });
+
+    // last: tail.isEmpty ? head : tail.last
+    b.add_code(ACC_PUBLIC, "last", "()Ljava/lang/Object;", 1, |asm| {
+        asm.aload(0);
+        asm.invokevirtual(LIST, "tail", "()Lscala/collection/immutable/List;");
+        asm.invokevirtual(LIST, "isEmpty", "()Z");
+        let more = asm.fresh_label();
+        asm.ifeq(more);
+        asm.aload(0);
+        asm.invokevirtual(LIST, "head", "()Ljava/lang/Object;");
+        asm.areturn();
+        asm.mark(more);
+        asm.aload(0);
+        asm.invokevirtual(LIST, "tail", "()Lscala/collection/immutable/List;");
+        asm.invokevirtual(LIST, "last", "()Ljava/lang/Object;");
+        asm.areturn();
+    });
+
+    // reverse: iterative accumulate
+    b.add_code(
+        ACC_PUBLIC,
+        "reverse",
+        "()Lscala/collection/immutable/List;",
+        3,
+        |asm| {
+            asm.getstatic(NIL, "MODULE$", "Lscala/collection/immutable/Nil$;");
+            asm.checkcast(LIST);
+            asm.astore(1);
+            asm.aload(0);
+            asm.astore(2);
+            let loop_l = asm.fresh_label();
+            let end = asm.fresh_label();
+            asm.mark(loop_l);
+            asm.aload(2);
+            asm.invokevirtual(LIST, "isEmpty", "()Z");
+            asm.ifne(end);
+            asm.aload(1);
+            asm.aload(2);
+            asm.invokevirtual(LIST, "head", "()Ljava/lang/Object;");
+            asm.invokevirtual(
+                LIST,
+                "::",
+                "(Ljava/lang/Object;)Lscala/collection/immutable/List;",
+            );
+            asm.astore(1);
+            asm.aload(2);
+            asm.invokevirtual(LIST, "tail", "()Lscala/collection/immutable/List;");
+            asm.astore(2);
+            asm.goto(loop_l);
+            asm.mark(end);
+            asm.aload(1);
+            asm.areturn();
+        },
+    );
+
+    // filter: the private runtime's `withFilter` is a strict filter already.
+    b.add_code(
+        ACC_PUBLIC,
+        "filter",
+        "(Lscala/Function1;)Lscala/collection/immutable/List;",
+        2,
+        |asm| {
+            asm.aload(0);
+            asm.aload(1);
+            asm.invokevirtual(
+                LIST,
+                "withFilter",
+                "(Lscala/Function1;)Lscala/collection/immutable/List;",
+            );
+            asm.areturn();
+        },
+    );
+
+    b.add_code(
+        ACC_PUBLIC,
+        "filterNot",
+        "(Lscala/Function1;)Lscala/collection/immutable/List;",
+        2,
+        |asm| {
+            asm.aload(0);
+            asm.invokevirtual(LIST, "isEmpty", "()Z");
+            let nonempty = asm.fresh_label();
+            asm.ifeq(nonempty);
+            asm.getstatic(NIL, "MODULE$", "Lscala/collection/immutable/Nil$;");
+            asm.areturn();
+            asm.mark(nonempty);
+            asm.aload(1);
+            asm.aload(0);
+            asm.invokevirtual(LIST, "head", "()Ljava/lang/Object;");
+            asm.invokeinterface(F1, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;");
+            asm.checkcast("java/lang/Boolean");
+            asm.invokevirtual("java/lang/Boolean", "booleanValue", "()Z");
+            let drop = asm.fresh_label();
+            asm.ifne(drop);
+            asm.new_obj(CONS);
+            asm.dup();
+            asm.aload(0);
+            asm.invokevirtual(LIST, "head", "()Ljava/lang/Object;");
+            asm.aload(0);
+            asm.invokevirtual(LIST, "tail", "()Lscala/collection/immutable/List;");
+            asm.aload(1);
+            asm.invokevirtual(
+                LIST,
+                "filterNot",
+                "(Lscala/Function1;)Lscala/collection/immutable/List;",
+            );
+            asm.invokespecial(
+                CONS,
+                "<init>",
+                "(Ljava/lang/Object;Lscala/collection/immutable/List;)V",
+            );
+            asm.areturn();
+            asm.mark(drop);
+            asm.aload(0);
+            asm.invokevirtual(LIST, "tail", "()Lscala/collection/immutable/List;");
+            asm.aload(1);
+            asm.invokevirtual(
+                LIST,
+                "filterNot",
+                "(Lscala/Function1;)Lscala/collection/immutable/List;",
+            );
+            asm.areturn();
+        },
+    );
+
+    b.add_code(ACC_PUBLIC, "contains", "(Ljava/lang/Object;)Z", 3, |asm| {
+        asm.aload(0);
+        asm.astore(2);
+        let loop_l = asm.fresh_label();
+        let end = asm.fresh_label();
+        let hit = asm.fresh_label();
+        asm.mark(loop_l);
+        asm.aload(2);
+        asm.invokevirtual(LIST, "isEmpty", "()Z");
+        asm.ifne(end);
+        asm.aload(1);
+        asm.aload(2);
+        asm.invokevirtual(LIST, "head", "()Ljava/lang/Object;");
+        asm.invokestatic(
+            "java/util/Objects",
+            "equals",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+        );
+        asm.ifne(hit);
+        asm.aload(2);
+        asm.invokevirtual(LIST, "tail", "()Lscala/collection/immutable/List;");
+        asm.astore(2);
+        asm.goto(loop_l);
+        asm.mark(hit);
+        asm.iconst(1);
+        asm.ireturn();
+        asm.mark(end);
+        asm.iconst(0);
+        asm.ireturn();
+    });
+
+    for (name, stop_on) in [("exists", true), ("forall", false)] {
+        b.add_code(ACC_PUBLIC, name, "(Lscala/Function1;)Z", 3, move |asm| {
+            asm.aload(0);
+            asm.astore(2);
+            let loop_l = asm.fresh_label();
+            let end = asm.fresh_label();
+            let hit = asm.fresh_label();
+            asm.mark(loop_l);
+            asm.aload(2);
+            asm.invokevirtual(LIST, "isEmpty", "()Z");
+            asm.ifne(end);
+            asm.aload(1);
+            asm.aload(2);
+            asm.invokevirtual(LIST, "head", "()Ljava/lang/Object;");
+            asm.invokeinterface(F1, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;");
+            asm.checkcast("java/lang/Boolean");
+            asm.invokevirtual("java/lang/Boolean", "booleanValue", "()Z");
+            if stop_on {
+                asm.ifne(hit);
+            } else {
+                asm.ifeq(hit);
+            }
+            asm.aload(2);
+            asm.invokevirtual(LIST, "tail", "()Lscala/collection/immutable/List;");
+            asm.astore(2);
+            asm.goto(loop_l);
+            asm.mark(hit);
+            asm.iconst(if stop_on { 1 } else { 0 });
+            asm.ireturn();
+            asm.mark(end);
+            asm.iconst(if stop_on { 0 } else { 1 });
+            asm.ireturn();
+        });
+    }
+
+    b.add_code(ACC_PUBLIC, "count", "(Lscala/Function1;)I", 4, |asm| {
+        asm.iconst(0);
+        asm.istore(2);
+        asm.aload(0);
+        asm.astore(3);
+        let loop_l = asm.fresh_label();
+        let end = asm.fresh_label();
+        let skip = asm.fresh_label();
+        asm.mark(loop_l);
+        asm.aload(3);
+        asm.invokevirtual(LIST, "isEmpty", "()Z");
+        asm.ifne(end);
+        asm.aload(1);
+        asm.aload(3);
+        asm.invokevirtual(LIST, "head", "()Ljava/lang/Object;");
+        asm.invokeinterface(F1, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;");
+        asm.checkcast("java/lang/Boolean");
+        asm.invokevirtual("java/lang/Boolean", "booleanValue", "()Z");
+        asm.ifeq(skip);
+        asm.iload(2);
+        asm.iconst(1);
+        asm.iadd();
+        asm.istore(2);
+        asm.mark(skip);
+        asm.aload(3);
+        asm.invokevirtual(LIST, "tail", "()Lscala/collection/immutable/List;");
+        asm.astore(3);
+        asm.goto(loop_l);
+        asm.mark(end);
+        asm.iload(2);
+        asm.ireturn();
+    });
+
+    b.add_code(
+        ACC_PUBLIC,
+        "take",
+        "(I)Lscala/collection/immutable/List;",
+        2,
+        |asm| {
+            let cont = asm.fresh_label();
+            asm.iload(1);
+            asm.ifgt(cont);
+            asm.getstatic(NIL, "MODULE$", "Lscala/collection/immutable/Nil$;");
+            asm.areturn();
+            asm.mark(cont);
+            asm.aload(0);
+            asm.invokevirtual(LIST, "isEmpty", "()Z");
+            let nonempty = asm.fresh_label();
+            asm.ifeq(nonempty);
+            asm.getstatic(NIL, "MODULE$", "Lscala/collection/immutable/Nil$;");
+            asm.areturn();
+            asm.mark(nonempty);
+            asm.new_obj(CONS);
+            asm.dup();
+            asm.aload(0);
+            asm.invokevirtual(LIST, "head", "()Ljava/lang/Object;");
+            asm.aload(0);
+            asm.invokevirtual(LIST, "tail", "()Lscala/collection/immutable/List;");
+            asm.iload(1);
+            asm.iconst(1);
+            asm.isub();
+            asm.invokevirtual(LIST, "take", "(I)Lscala/collection/immutable/List;");
+            asm.invokespecial(
+                CONS,
+                "<init>",
+                "(Ljava/lang/Object;Lscala/collection/immutable/List;)V",
+            );
+            asm.areturn();
+        },
+    );
+
+    b.add_code(
+        ACC_PUBLIC,
+        "drop",
+        "(I)Lscala/collection/immutable/List;",
+        3,
+        |asm| {
+            asm.aload(0);
+            asm.astore(2);
+            let loop_l = asm.fresh_label();
+            let end = asm.fresh_label();
+            asm.mark(loop_l);
+            asm.iload(1);
+            asm.ifle(end);
+            asm.aload(2);
+            asm.invokevirtual(LIST, "isEmpty", "()Z");
+            asm.ifne(end);
+            asm.aload(2);
+            asm.invokevirtual(LIST, "tail", "()Lscala/collection/immutable/List;");
+            asm.astore(2);
+            asm.iload(1);
+            asm.iconst(1);
+            asm.isub();
+            asm.istore(1);
+            asm.goto(loop_l);
+            asm.mark(end);
+            asm.aload(2);
+            asm.areturn();
+        },
+    );
+
+    b.add_code(
+        ACC_PUBLIC,
+        "mkString",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+        7,
+        |asm| {
+            asm.new_obj("java/lang/StringBuilder");
+            asm.dup();
+            asm.invokespecial("java/lang/StringBuilder", "<init>", "()V");
+            asm.astore(4);
+            asm.aload(4);
+            asm.aload(1);
+            asm.invokevirtual(
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            );
+            asm.pop();
+            asm.aload(0);
+            asm.astore(5);
+            asm.iconst(1);
+            asm.istore(6);
+            let loop_l = asm.fresh_label();
+            let end = asm.fresh_label();
+            let no_sep = asm.fresh_label();
+            asm.mark(loop_l);
+            asm.aload(5);
+            asm.invokevirtual(LIST, "isEmpty", "()Z");
+            asm.ifne(end);
+            asm.iload(6);
+            asm.ifne(no_sep);
+            asm.aload(4);
+            asm.aload(2);
+            asm.invokevirtual(
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            );
+            asm.pop();
+            asm.mark(no_sep);
+            asm.iconst(0);
+            asm.istore(6);
+            asm.aload(4);
+            asm.aload(5);
+            asm.invokevirtual(LIST, "head", "()Ljava/lang/Object;");
+            asm.invokevirtual(
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
+            );
+            asm.pop();
+            asm.aload(5);
+            asm.invokevirtual(LIST, "tail", "()Lscala/collection/immutable/List;");
+            asm.astore(5);
+            asm.goto(loop_l);
+            asm.mark(end);
+            asm.aload(4);
+            asm.aload(3);
+            asm.invokevirtual(
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            );
+            asm.pop();
+            asm.aload(4);
+            asm.invokevirtual(
+                "java/lang/StringBuilder",
+                "toString",
+                "()Ljava/lang/String;",
+            );
+            asm.areturn();
+        },
+    );
+
+    b.add_code(
+        ACC_PUBLIC,
+        "mkString",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        2,
+        |asm| {
+            asm.aload(0);
+            asm.ldc_string("");
+            asm.aload(1);
+            asm.ldc_string("");
+            asm.invokevirtual(
+                LIST,
+                "mkString",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            );
+            asm.areturn();
+        },
+    );
+
+    b.add_code(ACC_PUBLIC, "mkString", "()Ljava/lang/String;", 1, |asm| {
+        asm.aload(0);
+        asm.ldc_string("");
+        asm.invokevirtual(LIST, "mkString", "(Ljava/lang/String;)Ljava/lang/String;");
+        asm.areturn();
+    });
 }
 
 fn emit_cons() -> EmittedClass {

@@ -3096,3 +3096,15 @@ fn fixtures_list_core1_bad_is_error() {
 fn fixtures_list_core2_bad_is_error() {
     compile_fails("list_core2_bad", "sorted is not a member of List[Int]");
 }
+
+/// 私有ランタイムでも動くコアメンバ（`runtime.rs` の `add_list_core_runtime`）。
+#[test]
+fn fixtures_list_core10() {
+    check("list_core10");
+}
+
+/// 同じソースが本物の scala-library に対しても同じ出力になること。
+#[test]
+fn scala_library_dual_run_list_core10() {
+    dual_run_fixture("list_core10");
+}

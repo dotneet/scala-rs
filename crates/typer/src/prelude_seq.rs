@@ -294,13 +294,21 @@ fn find_in_scala_pkg(st: &SymbolTable, name: &str) -> SymbolId {
         .unwrap_or(SymbolId::NONE)
 }
 
-/// `List` のコアメンバを scala-library 2.13.16 の実シグネチャで足す。
-/// **`library_abi` のときだけ**呼ぶこと。
-pub(crate) fn add_list_core(st: &mut SymbolTable) {
+/// `List` のコアメンバ。
+///
+/// `library_abi` のときは scala-library 2.13.16 の実シグネチャ一式を足す。
+/// 私有ランタイム（`--no-scala-library`）のときは
+/// `crates/backend/src/runtime.rs` が実際に classfile を出す分だけを足し、
+/// それ以外は宣言しない（＝`value X is not a member of List[A]` の診断が出る）。
+pub(crate) fn add_list_core(st: &mut SymbolTable, library_abi: bool) {
     let list = st.list_sym;
     let Some(a) = st.get(list).tparams.first().copied() else {
         return;
     };
+    if !library_abi {
+        add_list_core_private(st, list, a);
+        return;
+    }
 
     let iterable_once = find_iface(st, "scala/collection/IterableOnce");
     if st.get(iterable_once).tparams.is_empty() {
@@ -346,6 +354,40 @@ pub(crate) fn add_list_core(st: &mut SymbolTable) {
     add_conversions(st, &env);
     add_grouping(st, &env);
     add_iterator_to_list(st, &env);
+}
+
+/// 私有ランタイムの `List` classfile（`crates/backend/src/runtime.rs` の
+/// `add_list_core_runtime`）が実装している分だけ。ここに無いメンバは
+/// 非 jar モードで診断になる。
+fn add_list_core_private(st: &mut SymbolTable, list: SymbolId, a: SymbolId) {
+    let ta = Type::TypeParam(a);
+    let list_a = Type::Class {
+        sym: list,
+        args: vec![ta.clone()],
+    };
+    let pred = fn1(ta.clone(), Type::Boolean);
+    simple(st, list, "length", vec![], Type::Int);
+    simple(st, list, "size", vec![], Type::Int);
+    simple(st, list, "nonEmpty", vec![], Type::Boolean);
+    simple(st, list, "reverse", vec![], list_a.clone());
+    simple(st, list, "last", vec![], ta.clone());
+    simple(st, list, "filter", vec![pred.clone()], list_a.clone());
+    simple(st, list, "filterNot", vec![pred.clone()], list_a.clone());
+    simple(st, list, "contains", vec![ta], Type::Boolean);
+    simple(st, list, "exists", vec![pred.clone()], Type::Boolean);
+    simple(st, list, "forall", vec![pred.clone()], Type::Boolean);
+    simple(st, list, "count", vec![pred], Type::Int);
+    simple(st, list, "take", vec![Type::Int], list_a.clone());
+    simple(st, list, "drop", vec![Type::Int], list_a);
+    simple(st, list, "mkString", vec![], Type::String);
+    simple(st, list, "mkString", vec![Type::String], Type::String);
+    simple(
+        st,
+        list,
+        "mkString",
+        vec![Type::String, Type::String, Type::String],
+        Type::String,
+    );
 }
 
 fn add_parent(st: &mut SymbolTable, cls: SymbolId, parent: SymbolId, nargs: usize) {
