@@ -9,6 +9,17 @@ class Holder(val base: Int) {
   }
 }
 
+trait Maker {
+  def base: Int
+  // The enclosing instance here is the trait: `$outer` is typed as the
+  // interface and the receiver comes from the `$class` static implementation.
+  def make(x: Int): Adder = new Adder {
+    def add(k: Int): Int = k + base + x
+  }
+}
+
+class Impl extends Maker { def base: Int = 100 }
+
 object Main {
   // A lambda inside the anonymous class captures the same local again.
   def dbl(m: Int): Adder = new Adder {
@@ -51,5 +62,6 @@ object Main {
     nested(42).run()
     println(inLambda(5))
     println(inNestedDef(4))
+    println(new Impl().make(5).add(1))
   }
 }

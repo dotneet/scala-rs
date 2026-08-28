@@ -879,22 +879,25 @@ fn enclosing_instance(st: &SymbolTable, class_id: SymbolId) -> Option<SymbolId> 
     // `new T { … }` and local classes are owned by the method (or the `val`)
     // they appear in; the enclosing instance is the class around it.
     let mut owner = st.get(class_id).owner;
+    let mut in_method = false;
     while !owner.is_none() && matches!(st.get(owner).kind, SymKind::Method | SymKind::Term) {
+        in_method = true;
         owner = st.get(owner).owner;
     }
     if owner.is_none() {
         return None;
     }
     let o = st.get(owner);
-    if o.kind == SymKind::Class
-        && !o.flags.contains(Flags::TRAIT)
-        && !o.flags.contains(Flags::INTERFACE)
-        && !o.flags.contains(Flags::MODULE)
-    {
-        Some(owner)
-    } else {
-        None
+    if o.kind != SymKind::Class || o.flags.contains(Flags::MODULE) {
+        return None;
     }
+    // A class *member* of a trait has no enclosing instance (the trait is an
+    // interface), but a class written inside a trait *method* still needs the
+    // receiver to reach the trait's members.
+    if (o.flags.contains(Flags::TRAIT) || o.flags.contains(Flags::INTERFACE)) && !in_method {
+        return None;
+    }
+    Some(owner)
 }
 
 fn linearize(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
