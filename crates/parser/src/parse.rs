@@ -116,6 +116,14 @@ impl<'a> Parser<'a> {
         matches!(self.kind(), TokenKind::Ident(s) if s == "?") && !self.is_backquoted(self.span())
     }
 
+    /// `-Xsource:3` wildcard import selector `*`, spelled `_` in 2.13. Only
+    /// valid in import position; a backquoted ``` `*` ``` is an ordinary name.
+    fn at_star_wildcard(&self) -> bool {
+        self.opts.source3
+            && matches!(self.kind(), TokenKind::Ident(s) if s == "*")
+            && !self.is_backquoted(self.span())
+    }
+
     /// `-Xsource:3` intersection type separator `A & B`, spelled `with` in 2.13.
     fn at_amp_intersection(&self) -> bool {
         self.opts.source3
@@ -512,7 +520,7 @@ impl<'a> Parser<'a> {
             }
             self.bump();
             self.skip_nl();
-            if matches!(self.kind(), TokenKind::Underscore) {
+            if matches!(self.kind(), TokenKind::Underscore) || self.at_star_wildcard() {
                 let sp = self.span();
                 self.bump();
                 t = self.alloc(
@@ -547,6 +555,20 @@ impl<'a> Parser<'a> {
                 break;
             }
             let (name, sp) = self.expect_ident();
+            // `import a.b as c` (`-Xsource:3`) is `import a.{b => c}`.
+            if self.opts.source3 && matches!(self.kind(), TokenKind::Ident(s) if s == "as") {
+                self.bump();
+                self.skip_nl();
+                let (to, tsp) = self.expect_ident();
+                t = self.alloc(
+                    t.span.merge(tsp),
+                    TreeKind::Select {
+                        qual: Box::new(t),
+                        name: format!("{{{name}=>{to}}}"),
+                    },
+                );
+                break;
+            }
             t = self.alloc(
                 t.span.merge(sp),
                 TreeKind::Select {
@@ -568,13 +590,17 @@ impl<'a> Parser<'a> {
                 break;
             }
             let sp = self.span();
-            if matches!(self.kind(), TokenKind::Underscore) {
+            if matches!(self.kind(), TokenKind::Underscore) || self.at_star_wildcard() {
                 self.bump();
                 sels.push(ImportSelector::wildcard(sp));
             } else {
                 let (name, nsp) = self.expect_ident();
                 self.skip_nl();
-                let rename = if matches!(self.kind(), TokenKind::Arrow | TokenKind::Equals) {
+                // `A => B` (2.13) and `A as B` (`-Xsource:3`) both rename.
+                let renames = matches!(self.kind(), TokenKind::Arrow | TokenKind::Equals)
+                    || (self.opts.source3
+                        && matches!(self.kind(), TokenKind::Ident(s) if s == "as"));
+                let rename = if renames {
                     self.bump();
                     self.skip_nl();
                     if matches!(self.kind(), TokenKind::Underscore) {

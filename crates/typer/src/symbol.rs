@@ -214,11 +214,25 @@ impl Symbol {
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
     map: HashMap<String, Vec<SymbolId>>,
+    /// Owners brought in by a wildcard import (`import p._`) in this scope.
+    /// A package read from a jar cannot be enumerated up front, so the names
+    /// it offers are resolved on demand: see `Checker::expose_unqualified`.
+    wildcards: Vec<SymbolId>,
 }
 
 impl Scope {
     pub fn enter(&mut self, name: &str, id: SymbolId) {
         self.map.entry(name.to_string()).or_default().push(id);
+    }
+
+    pub fn enter_wildcard(&mut self, owner: SymbolId) {
+        if !self.wildcards.contains(&owner) {
+            self.wildcards.push(owner);
+        }
+    }
+
+    pub fn wildcards(&self) -> &[SymbolId] {
+        &self.wildcards
     }
 
     pub fn lookup(&self, name: &str) -> &[SymbolId] {
@@ -381,6 +395,24 @@ impl SymbolTable {
 
     pub fn enter_in_current(&mut self, name: &str, id: SymbolId) {
         self.scopes.last_mut().unwrap().enter(name, id);
+    }
+
+    /// Record `import owner._` in the innermost scope.
+    pub fn enter_wildcard_in_current(&mut self, owner: SymbolId) {
+        self.scopes.last_mut().unwrap().enter_wildcard(owner);
+    }
+
+    /// Wildcard-imported owners, innermost scope first.
+    pub fn wildcard_owners(&self) -> Vec<SymbolId> {
+        let mut out = Vec::new();
+        for sc in self.scopes.iter().rev() {
+            for &w in sc.wildcards() {
+                if !out.contains(&w) {
+                    out.push(w);
+                }
+            }
+        }
+        out
     }
 
     pub fn push_scope(&mut self) {
