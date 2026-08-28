@@ -192,6 +192,48 @@ trait の `val` は interface 上の getter / `$init$set$` と、`T$class.$init$
 
 スタック可能な trait の `abstract override` は、`T$class` 内の `super.m` を `T$$super$m`（実装クラスが線形化の次へフォワード）にします。`class C extends Base with A with B` で両方 `abstract override def msg` なら、実行時は `B-A-base` です。
 
+### 複数コンパイル単位のケーキパターン（ヘッダパス）
+
+`typecheck_units` は run 全体を 1 つのシンボル表で型検査します。パスは
+**namer（全ユニット）→ ヘッダパス（全ユニット）→ シグネチャパス（全ユニット）→ 本体パス**の
+4 段です。
+
+ヘッダパスは `crates/typer/src/check.rs` の `parents_pass` です。namer は親を**名前のまま**
+（`rough_parents`）記録し、その名前を解くのは `class_sym_of` で、**そのとき現在のスコープ**を
+引きます。シグネチャパスはユニットをコマンドライン順に歩くので、親鎖が後ろのファイルにある
+クラスは祖父母を別ファイルのスコープで引くことになり、そこで鎖が切れて継承した型がまるごと
+見えなくなっていました。slick の `DB2Profile`（`slick/jdbc/`）が 4 段上の
+`RelationalTableComponent`（`slick/relational/`）の内部クラス `Table` を参照する形が
+`not found: type Table` になっていたのはこれです。
+
+```scala
+// a.scala（コマンドラインで先）
+trait Child extends P1 { def f(t: Table[?]): String = t.n }
+// z.scala（後）
+trait TC { self: P1 => abstract class Table[T](val n: String) }
+trait P1 extends TC
+```
+
+ヘッダパスは全ユニットの親リストを**自分の定義位置のスコープ**（そのファイルの import 込み）で
+シンボルに固定します。内部クラスが外側の継承した名前を親に書くことがあるので、変化が無くなる
+まで（最大 3 周）回します。最後にもう 1 周して**プライマリコンストラクタのパラメータ型**を
+付けます。`extends Table[Int](n)` は親の `<init>` に対して検査されるので、親が後ろのファイルだと
+引数型が付いておらず `no matching overload for constructor` になっていました。
+
+ヘッダパスは解決のためだけに走るので、そこで出た診断は**すべて捨てます**（本物の診断は後続の
+シグネチャパス・本体パスが出します）。`import scala.language.*` によるフラグも前後で保存・
+復元します。
+
+自己型のエイリアス（`trait T { self: P => }` の `self`）は**継承されません**。親や自己型の
+メンバーをスコープに入れる箇所は `Symbol::self_alias` を見てこれを外します。そうしないと、
+複数のコンポーネントが揃って `self` と名乗る slick のようなケーキで `self` がオーバーロード
+集合になってしまいます。
+
+型選択の接頭辞は**項**なので、companion 対では object の側が選ばれなければいけません。
+`trait Rep[T]` と `object Rep { abstract class TypedRep[T] }` が並んでいるとき、
+`Rep.TypedRep` の `Rep` はオブジェクトです（`qualified_type_owners` が候補を全部返し、
+そのメンバーを実際に持つものを採る）。
+
 ### try / catch / finally
 
 `try` 本体を例外テーブルで覆い、ハンドラで catch のパターン（`case _: RuntimeException` など）を `instanceof` します。マッチしなければ再 throw します。`finally` は成功パスと catch パスの両方で実行します（`jsr` は使いません。コードを複製します）。
@@ -696,6 +738,14 @@ jar の**全 classfile**を走査して次を見ます。jar が無ければス�
 実行時の期待値は `tests/fixtures/` にあります。各 `.scala` に対して `tests/fixtures/expected/` に同名の `.txt`（`println` と同じ末尾改行付きの stdout）を置いています。`java` がある環境では CLI の e2e が stdout を比較します。
 
 scala-library 2.13.16 が取れる環境では、`--scala-library` でコンパイルして `java -cp out:scala-library.jar Main` を走らせ、私有ランタイム版と同じ stdout になることを確認します（私有の `scala/Option.class` / `scala/Predef$.class` 等が出ないこと）。対象のフィクスチャ一覧は `crates/cli/tests/e2e.rs` の `scala_library_dual_run_*` テストが正本です。フラグなしの `compile` は jar を自動検出してリンクし、`--no-scala-library` は私有ランタイムを出します。
+複数ファイルを 1 回の `compile` に渡す回帰テストは `crates/cli/tests/multifile.rs`、
+ソースは `tests/multi/` です。ケーキパターンのフィクスチャは接頭辞 `cake`（`cake_profile.scala` /
+`cake_relational.scala` / `cake_component.scala` の正常系と、`cake_bad_leaf.scala` /
+`cake_bad_base.scala` の異常系）で、正常系は**ファイル順を入れ替えても**同じ結果になることまで
+見ます。異常系は線形化に無い名前（どこにも無い `Missing`、ミックスインされていない
+コンポーネントの `Detached`）が黙って通らないことを固定します。どちらも real scalac 2.13.16 と
+出力・診断が一致することを確認済みです。
+
 prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭辞 `gap_`（`gap_numeric` / `gap_asinstanceof` / `gap_copy` / `gap_exception`、それぞれ `_bad` の異常系あり）で、`crates/cli/tests/e2e.rs` ではなく別ファイル `crates/cli/tests/gaps.rs` に置いています（他エージェントが同時に `e2e.rs` を編集していてもコンフリクトしないように）。`--scala-library` dual-run に加えて、`scalac` が取れる環境では実行結果を毎回その場で real scalac の出力と直接 diff します（`expected/*.txt` は real scalac の出力から作成済み）。`gap_copy` は private ランタイムでも動きます。
 
 
@@ -1011,6 +1061,7 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 - 他の mutable（`ArrayDeque` / `LinkedHashMap` / `LinkedHashSet` / `HashMap` / `HashSet` / `ArrayBuffer` / `ListBuffer` 以外）と他の immutable（`BitSet` / `SortedMap` / `TreeMap` / `SortedSet` / `TreeSet` / `Set` / `Map` / `Vector` 以外）。`scala.collection.View` の `List.view` / `map` / `toList` と `View.fill` / `View.iterate`、**`scala.collection.MapView`**（`Map.view` / `keys` / `values` / `filterKeys` / `mapValues` / `toMap` / `toList` / `toSeq` / `size` / `isEmpty` / `foreach`）は乗った（他の View/MapView メンバーは未）。`scala.util.control.Breaks` の `breakable` / `break` / `tryBreakable`+`catchBreak` は乗った（他の control は未）。`scala.math.BigInt` / `BigDecimal` の `apply(Int)` / `apply(String)` / `+` / `*` / `int2bigInt` は乗った（他の math は未）。`scala.util.chaining` の `pipe` / `tap` は乗った。`scala.util.Using.resource` / `Using.apply` / `Using.Manager` / `Using.resources`（2–4 引数）は乗った（他の Using は未）
 - **import の残り**: (a) **jar の package object にある型エイリアス**（`scala/package$` の `type NoSuchElementException = java.util.NoSuchElementException`、cats の `type Eq[A] = cats.kernel.Eq[A]` など）は classfile に出てこず pickle にしか無いため、まだ供給していない。エイリアス自体は名前としては見えるが型パラメータを持たないので、使うと `does not take type parameters` になる。(b) **同一テンプレート内で先に書かれた `val` を接頭辞にする import**（`object O { val h = new H; import h.Inner._ }`）は、import が `val` の型付けより先に走るため `<notype>` になる。別のオブジェクトに置いた `val`（`import O.h.Inner._`）は動く。(c) ワイルドカード import はパッケージのエントリを列挙せず、名前が要求されたときに 1 クラスずつ読むので、**同名の別クラスがあるときの曖昧さ検査**はしていない
 - **`-Xsource:3` の残り**: 実装したのは `?` ワイルドカード / `&` 交差型 / 可変長パターン `case Cast(ch*)` / `*` ワイルドカード import / `as` リネーム import だけ。`|` 合併型 / `enum` / `given` / `using` / `extension` / トレイトのパラメータは入っていない（`given` / `using` は 2.13 の構文ではないので対象外）。`-Xsource-features:<feature>` も未実装
+- **ケーキパターンのスライス**では 177 ファイルのエラーが **2,901 → 2,581**、エラーを含むファイルは **116 → 114** になった（`not found: type Table` 34 件と `not found: type Sequence` 17 件は 0 に、`no matching overload for constructor` は 42 → 26）。残る `not found: type Ref` / `Async` は cats-effect の package object エイリアスで別件
 - **slick の型検査で残っているもの**: import の解決で slick 177 ファイルのエラーは **13,245 → 7,727**（`tests/slick_measure.sh`）。import 由来で残っているのは、ビルド時に `.fm` テンプレートから生成される `slick.util.TupleSupport` / `ProductWrapper` / `slick.jdbc.GetResult` の 4 件だけで、これらはソースセットに存在しないので scalac でも同じく落ちる。残りの上位は `does not take type parameters`（142）、ラムダ本体からの型推論で import とは別の領域。**名前付き引数のスライス**では 177 ファイルのエラーが **6,504 → 6,300**、`unimplemented syntax: named arguments` は **43 → 1** になった（残り 1 件は `slick/jdbc/JdbcModelBuilder.scala` の、`-cp` 上の case class に対する `m.Column(name = …, …)` で、classpath のシンボルにパラメータ名が無いため）
 - **slick のパースで残っているもの**: slick 本体 176 ファイルのエラーは **23 → 11**（`-Xsource:3` 付き）。残りは `ShapedValue.scala:21` と `TableQuery.scala:36` の **def マクロ 2 箇所だけ**で、パースエラーはこの 2 ファイルを除くと **0** になる。`try e catch h` / `case Cast(ch*)` / 型位置の `super.T` はこのスライスで潰した
 - **型位置 `super.T` の残り**: 親クラスの型メンバーへのパスは通るが、`trait Mid { trait Impl extends super.Impl }` のように**親と同名**の入れ子型を定義すると、ミックス先で継承メンバーの解決が親側を選んでしまうことがある（`super` の解決ではなく、同名ネスト型のメンバー継承側の穴）
@@ -1027,6 +1078,15 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 - **名前付き引数の残り**: (a) **prelude / classpath のメソッドはパラメータ名を持たない**ので、`List(1,2,3).mkString(sep = "-")` や jar・`-cp` 上の case class への `copy(name = …)` は `unimplemented syntax: named arguments (method parameters not resolved)` になる（scala-library の pickle からパラメータ名を読む経路も、prelude 手書きシグネチャの名前付けも未実装。同一コンパイル単位のメソッド・クラスなら全部動く）。(b) **複数引数リストのコンストラクタ** `class C(a: Int)(b: Int)` は名前付き引数以前に `new C(1)(2)` 自体が未対応（`value apply is not a member`）。(c) 名前と型が同一で順序だけ違うオーバーロード（`h(s: String, n: Int)` と `h(n: Int, s: String)`）は nsc なら `ambiguous reference to overloaded definition` だが、こちらは先に宣言された方を黙って選ぶ
 - **`--no-scala-library` での `x == null`（reference 型）**（`scala.runtime.BoxesRunTime.equals` を経由しないため、`x` が実際に `null` だと `Object.equals` の invokevirtual で `NullPointerException`。`--scala-library` 時は正しく動く）
 - **lazy completer のスコープ**: namer だけが見た定義（別テンプレートからの前方参照）は、所有者チェーンのメンバーから組み直したスコープで完成させる。ファイル先頭の `import` は typer が処理するまで入らないので、import 名を右辺に使う定義を前方参照した場合は型が付かず `<notype>` のまま（診断はそのまま出る。黙って通すことはしない）
+- **trait のメンバークラスから外側インスタンスを読む codegen**（`trait T { def x = 1; class Inner { def y = x } }`）。
+  `enclosing_instance` は trait のメンバークラスに `$outer` を渡さないので、`x` は `this` を `T` へ
+  checkcast する形になり、実行時に `ClassCastException` になる。自己型エイリアス（`self`）を内部クラス
+  から読む形も同じ経路。型検査は通る（scalac と一致する）が、nsc のように interface 型の `$outer` を
+  コンストラクタで受け渡す実装が要る。trait の**自分のメソッド**の中で `self` を使う形は正しく動く
+- **jar の package object にある型エイリアス**（cats-effect の `cats.effect.Ref` / `Async` など）。
+  `import cats.effect.{Async, Ref, Resource}` は package object の pickle にしか無いので解決できず、
+  slick の `slick/basic/BasicBackend.scala` に `not found: type Ref` が残っている。
+  `import cats.effect.kernel.Ref` のように実クラスを直接指せば通る（「import の残り」(a) と同じ穴）
 - **trait の `val` / `lazy val` を継承先から読む codegen**（`IncompatibleClassChangeError: Found interface T, but class was expected`。lazysig 以前からある別件。fixture は trait の `def` を使って回避している）
 
 ## ライセンス
