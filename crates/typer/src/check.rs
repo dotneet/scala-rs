@@ -4509,7 +4509,12 @@ impl Typer {
                     ) && !param_tys.is_empty()
                     {
                         if let Type::Function { ret: fr, .. } = &param_tys[0] {
-                            let fret = if matches!(fr.as_ref(), Type::TypeParam(_)) {
+                            // `List.flatMap[B](f: A => IterableOnce[B])`: B is
+                            // only determined by the lambda body, so the body
+                            // must not be checked against `IterableOnce[B]`.
+                            let undetermined = !sym.is_none()
+                                && mentions_tparam(fr, &self.st.get(sym).tparams);
+                            let fret = if matches!(fr.as_ref(), Type::TypeParam(_)) || undetermined {
                                 Box::new(Type::Any)
                             } else {
                                 fr.clone()
@@ -9616,6 +9621,24 @@ fn type_args_are_instantiated(args: &[Type], tps: &[SymbolId]) -> bool {
     !args.is_empty()
         && (tps.is_empty() || args.len() == tps.len())
         && args.iter().all(|a| !still_raw_tparam(a, tps))
+}
+
+/// `ty` が `tps` のいずれかのメソッド型パラメータを含むか。
+fn mentions_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
+    match ty {
+        Type::TypeParam(id) => tps.contains(id),
+        Type::Class { args, .. } => args.iter().any(|a| mentions_tparam(a, tps)),
+        Type::Applied { ctor, args } => {
+            mentions_tparam(ctor, tps) || args.iter().any(|a| mentions_tparam(a, tps))
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(|p| mentions_tparam(p, tps)) || mentions_tparam(ret, tps)
+        }
+        Type::Array(e) | Type::ByName(e) | Type::Repeated(e) => mentions_tparam(e, tps),
+        Type::Annotated { tpe, .. } => mentions_tparam(tpe, tps),
+        Type::Tuple(ts) => ts.iter().any(|t| mentions_tparam(t, tps)),
+        _ => false,
+    }
 }
 
 fn still_raw_tparam(ty: &Type, tps: &[SymbolId]) -> bool {

@@ -5472,6 +5472,18 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_list(&owner) && emit_list_core_member(asm, ctx, name, id, result_ty) {
+            return;
+        }
+        if owner == "scala/collection/Iterator" && name == "toList" {
+            // `Iterator.toList` は `IterableOnceOps` の default メソッド。
+            asm.invokeinterface(
+                "scala/collection/IterableOnceOps",
+                "toList",
+                "()Lscala/collection/immutable/List;",
+            );
+            return;
+        }
         if name == "view" && is_stdlib_list(&owner) {
             asm.invokeinterface(
                 "scala/collection/SeqOps",
@@ -6876,6 +6888,414 @@ fn emit_newarray(asm: &mut Assembler, ctx: &EmitCtx, elem: &Type) {
         }
         _ => asm.anewarray("java/lang/Object"),
     }
+}
+
+/// `List` の JVM オーナー（scala-library 2.13.16）。
+const LIST_CLS: &str = "scala/collection/immutable/List";
+const ITERABLE_ONCE_OPS: &str = "scala/collection/IterableOnceOps";
+const ITERABLE_OPS: &str = "scala/collection/IterableOps";
+const SEQ_OPS: &str = "scala/collection/SeqOps";
+
+/// invoke 後の後処理。
+#[derive(Clone, Copy, PartialEq)]
+enum ListPost {
+    /// そのまま。
+    None,
+    /// erase された戻り値を `List` へ戻す。
+    CastList,
+    /// `Object` 戻りを結果型に合わせて unbox / checkcast する。
+    Erased,
+}
+
+/// `prelude_seq.rs` が足した `List` のコアメンバの invoke。
+///
+/// descriptor は `javap -s -cp scala-library-2.13.16.jar` で確認したもの。
+/// `List` 自身が持たないメンバは `IterableOnceOps` / `IterableOps` / `SeqOps`
+/// の default メソッドなので invokeinterface で呼ぶ。
+///
+/// 扱わない名前では `false` を返し、呼び出し側の既定の invoke に任せる。
+fn emit_list_core_member(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    name: &str,
+    id: SymbolId,
+    result_ty: Option<&Type>,
+) -> bool {
+    let s = ctx.st.get(id);
+    let nargs = match &s.ty {
+        Type::Method { paramss, .. } => paramss.iter().flatten().count(),
+        _ => s.params.len(),
+    };
+    // (invokeinterface か, オーナー, JVM 名, descriptor, 後処理)
+    let (iface, owner, jvm, desc, post): (bool, &str, &str, &str, ListPost) = match (name, nargs) {
+        // --- List 自身の virtual（戻り値も List）
+        ("filter", 1) | ("filterNot", 1) | ("takeWhile", 1) => (
+            false,
+            LIST_CLS,
+            name,
+            "(Lscala/Function1;)Lscala/collection/immutable/List;",
+            ListPost::None,
+        ),
+        ("take", 1) | ("takeRight", 1) => (
+            false,
+            LIST_CLS,
+            name,
+            "(I)Lscala/collection/immutable/List;",
+            ListPost::None,
+        ),
+        ("slice", 2) => (
+            false,
+            LIST_CLS,
+            "slice",
+            "(II)Lscala/collection/immutable/List;",
+            ListPost::None,
+        ),
+        ("reverse", 0) | ("toList", 0) => (
+            false,
+            LIST_CLS,
+            name,
+            "()Lscala/collection/immutable/List;",
+            ListPost::None,
+        ),
+        ("updated", 2) => (
+            false,
+            LIST_CLS,
+            "updated",
+            "(ILjava/lang/Object;)Lscala/collection/immutable/List;",
+            ListPost::None,
+        ),
+        ("splitAt", 1) => (
+            false,
+            LIST_CLS,
+            "splitAt",
+            "(I)Lscala/Tuple2;",
+            ListPost::None,
+        ),
+        ("span", 1) | ("partition", 1) => (
+            false,
+            LIST_CLS,
+            name,
+            "(Lscala/Function1;)Lscala/Tuple2;",
+            ListPost::None,
+        ),
+        ("forall", 1) | ("exists", 1) => (
+            false,
+            LIST_CLS,
+            name,
+            "(Lscala/Function1;)Z",
+            ListPost::None,
+        ),
+        ("contains", 1) => (
+            false,
+            LIST_CLS,
+            "contains",
+            "(Ljava/lang/Object;)Z",
+            ListPost::None,
+        ),
+        ("find", 1) => (
+            false,
+            LIST_CLS,
+            "find",
+            "(Lscala/Function1;)Lscala/Option;",
+            ListPost::None,
+        ),
+        ("headOption", 0) => (
+            false,
+            LIST_CLS,
+            "headOption",
+            "()Lscala/Option;",
+            ListPost::None,
+        ),
+        ("last", 0) => (
+            false,
+            LIST_CLS,
+            "last",
+            "()Ljava/lang/Object;",
+            ListPost::Erased,
+        ),
+        ("foldLeft", 2) | ("foldRight", 2) => (
+            false,
+            LIST_CLS,
+            name,
+            "(Ljava/lang/Object;Lscala/Function2;)Ljava/lang/Object;",
+            ListPost::Erased,
+        ),
+        // --- List の virtual だが戻り値が erase される
+        ("drop", 1) => (
+            false,
+            LIST_CLS,
+            "drop",
+            "(I)Lscala/collection/LinearSeq;",
+            ListPost::CastList,
+        ),
+        ("dropWhile", 1) => (
+            false,
+            LIST_CLS,
+            "dropWhile",
+            "(Lscala/Function1;)Lscala/collection/LinearSeq;",
+            ListPost::CastList,
+        ),
+        ("dropRight", 1) => (
+            false,
+            LIST_CLS,
+            "dropRight",
+            "(I)Ljava/lang/Object;",
+            ListPost::CastList,
+        ),
+        ("distinctBy", 1) => (
+            false,
+            LIST_CLS,
+            "distinctBy",
+            "(Lscala/Function1;)Ljava/lang/Object;",
+            ListPost::CastList,
+        ),
+        ("sorted", 1) => (
+            false,
+            LIST_CLS,
+            "sorted",
+            "(Lscala/math/Ordering;)Ljava/lang/Object;",
+            ListPost::CastList,
+        ),
+        ("zip", 1) => (
+            false,
+            LIST_CLS,
+            "zip",
+            "(Lscala/collection/IterableOnce;)Ljava/lang/Object;",
+            ListPost::CastList,
+        ),
+        ("zipWithIndex", 0) => (
+            false,
+            LIST_CLS,
+            "zipWithIndex",
+            "()Ljava/lang/Object;",
+            ListPost::CastList,
+        ),
+        ("scanLeft", 2) => (
+            false,
+            LIST_CLS,
+            "scanLeft",
+            "(Ljava/lang/Object;Lscala/Function2;)Ljava/lang/Object;",
+            ListPost::CastList,
+        ),
+        // --- 連結・追加。`++` / `:++` は `appendedAll`、`++:` は `prependedAll`。
+        (":::", 1) => (
+            false,
+            LIST_CLS,
+            ":::",
+            "(Lscala/collection/immutable/List;)Lscala/collection/immutable/List;",
+            ListPost::None,
+        ),
+        ("+:", 1) => (
+            false,
+            LIST_CLS,
+            "prepended",
+            "(Ljava/lang/Object;)Lscala/collection/immutable/List;",
+            ListPost::None,
+        ),
+        (":+", 1) => (
+            false,
+            LIST_CLS,
+            "appended",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ListPost::CastList,
+        ),
+        ("++", 1) | (":++", 1) | ("concat", 1) => (
+            false,
+            LIST_CLS,
+            "appendedAll",
+            "(Lscala/collection/IterableOnce;)Lscala/collection/immutable/List;",
+            ListPost::None,
+        ),
+        ("++:", 1) => (
+            false,
+            LIST_CLS,
+            "prependedAll",
+            "(Lscala/collection/IterableOnce;)Lscala/collection/immutable/List;",
+            ListPost::None,
+        ),
+        // --- IterableOnceOps の default メソッド
+        ("size", 0) => (true, ITERABLE_ONCE_OPS, "size", "()I", ListPost::None),
+        ("nonEmpty", 0) => (true, ITERABLE_ONCE_OPS, "nonEmpty", "()Z", ListPost::None),
+        ("count", 1) => (
+            true,
+            ITERABLE_ONCE_OPS,
+            "count",
+            "(Lscala/Function1;)I",
+            ListPost::None,
+        ),
+        ("mkString", 0) => (
+            true,
+            ITERABLE_ONCE_OPS,
+            "mkString",
+            "()Ljava/lang/String;",
+            ListPost::None,
+        ),
+        ("mkString", 1) => (
+            true,
+            ITERABLE_ONCE_OPS,
+            "mkString",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            ListPost::None,
+        ),
+        ("mkString", 3) => (
+            true,
+            ITERABLE_ONCE_OPS,
+            "mkString",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            ListPost::None,
+        ),
+        ("sum", 1) | ("product", 1) => (
+            true,
+            ITERABLE_ONCE_OPS,
+            name,
+            "(Lscala/math/Numeric;)Ljava/lang/Object;",
+            ListPost::Erased,
+        ),
+        ("min", 1) | ("max", 1) => (
+            true,
+            ITERABLE_ONCE_OPS,
+            name,
+            "(Lscala/math/Ordering;)Ljava/lang/Object;",
+            ListPost::Erased,
+        ),
+        ("minBy", 2) | ("maxBy", 2) => (
+            true,
+            ITERABLE_ONCE_OPS,
+            name,
+            "(Lscala/Function1;Lscala/math/Ordering;)Ljava/lang/Object;",
+            ListPost::Erased,
+        ),
+        ("reduce", 1) | ("reduceLeft", 1) | ("reduceRight", 1) => (
+            true,
+            ITERABLE_ONCE_OPS,
+            name,
+            "(Lscala/Function2;)Ljava/lang/Object;",
+            ListPost::Erased,
+        ),
+        ("toArray", 1) => (
+            true,
+            ITERABLE_ONCE_OPS,
+            "toArray",
+            "(Lscala/reflect/ClassTag;)Ljava/lang/Object;",
+            ListPost::Erased,
+        ),
+        ("toSet", 0) => (
+            true,
+            ITERABLE_ONCE_OPS,
+            "toSet",
+            "()Lscala/collection/immutable/Set;",
+            ListPost::None,
+        ),
+        ("toVector", 0) => (
+            true,
+            ITERABLE_ONCE_OPS,
+            "toVector",
+            "()Lscala/collection/immutable/Vector;",
+            ListPost::None,
+        ),
+        ("toSeq", 0) => (
+            true,
+            ITERABLE_ONCE_OPS,
+            "toSeq",
+            "()Lscala/collection/immutable/Seq;",
+            ListPost::None,
+        ),
+        // --- IterableOps の default メソッド
+        ("init", 0) => (
+            true,
+            ITERABLE_OPS,
+            "init",
+            "()Ljava/lang/Object;",
+            ListPost::CastList,
+        ),
+        ("lastOption", 0) => (
+            true,
+            ITERABLE_OPS,
+            "lastOption",
+            "()Lscala/Option;",
+            ListPost::None,
+        ),
+        ("groupBy", 1) => (
+            true,
+            ITERABLE_OPS,
+            "groupBy",
+            "(Lscala/Function1;)Lscala/collection/immutable/Map;",
+            ListPost::None,
+        ),
+        ("grouped", 1) | ("sliding", 1) => (
+            true,
+            ITERABLE_OPS,
+            name,
+            "(I)Lscala/collection/Iterator;",
+            ListPost::None,
+        ),
+        ("sliding", 2) => (
+            true,
+            ITERABLE_OPS,
+            "sliding",
+            "(II)Lscala/collection/Iterator;",
+            ListPost::None,
+        ),
+        // --- SeqOps の default メソッド
+        ("distinct", 0) => (
+            true,
+            SEQ_OPS,
+            "distinct",
+            "()Ljava/lang/Object;",
+            ListPost::CastList,
+        ),
+        ("sortBy", 2) => (
+            true,
+            SEQ_OPS,
+            "sortBy",
+            "(Lscala/Function1;Lscala/math/Ordering;)Ljava/lang/Object;",
+            ListPost::CastList,
+        ),
+        ("sortWith", 1) => (
+            true,
+            SEQ_OPS,
+            "sortWith",
+            "(Lscala/Function2;)Ljava/lang/Object;",
+            ListPost::CastList,
+        ),
+        ("indexOf", 1) => (
+            true,
+            SEQ_OPS,
+            "indexOf",
+            "(Ljava/lang/Object;)I",
+            ListPost::None,
+        ),
+        ("endsWith", 1) => (
+            true,
+            SEQ_OPS,
+            "endsWith",
+            "(Lscala/collection/Iterable;)Z",
+            ListPost::None,
+        ),
+        // `startsWith(that)` は `startsWith(that, 0)`（既定引数）。
+        ("startsWith", 1) => {
+            asm.iconst(0);
+            (
+                true,
+                SEQ_OPS,
+                "startsWith",
+                "(Lscala/collection/IterableOnce;I)Z",
+                ListPost::None,
+            )
+        }
+        _ => return false,
+    };
+    if iface {
+        asm.invokeinterface(owner, jvm, desc);
+    } else {
+        asm.invokevirtual(owner, jvm, desc);
+    }
+    match post {
+        ListPost::None => {}
+        ListPost::CastList => asm.checkcast(LIST_CLS),
+        ListPost::Erased => maybe_unbox_erased_result(asm, ctx, desc, result_ty),
+    }
+    true
 }
 
 fn is_stdlib_list(owner: &str) -> bool {

@@ -391,6 +391,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_using(st);
         add_xml(st);
         add_enumeration(st);
+        crate::prelude_seq::add_list_core(st);
     }
     add_annotation_pkg(st);
     add_java_sam(st, java, java_lang);
