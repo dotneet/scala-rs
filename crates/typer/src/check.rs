@@ -307,6 +307,25 @@ impl Typer {
             }
             TreeKind::ModuleDef { name, mods, .. } => {
                 let annots = mods.annotations.clone();
+                // A `case class` already synthesized its companion; reuse that
+                // symbol so `object C` does not become a second module.
+                let owner = self.st.owner;
+                if let Some(m) = self.st.lookup(name).into_iter().find(|&s| {
+                    self.st.get(s).kind == SymKind::Module
+                        && self.st.get(s).owner == owner
+                        && self.st.get(s).flags.contains(Flags::SYNTHETIC)
+                }) {
+                    let mut f = self.st.get(m).flags.with(mods.flags).with(Flags::MODULE);
+                    f.set(Flags::SYNTHETIC, false);
+                    self.st.get_mut(m).flags = f;
+                    self.st.get_mut(m).annotations = annots;
+                    let cls = self.st.module_class_of(m);
+                    let mut cf = self.st.get(cls).flags;
+                    cf.set(Flags::SYNTHETIC, false);
+                    self.st.get_mut(cls).flags = cf;
+                    tree.sym = m;
+                    return;
+                }
                 let jvm = format!("{}$", self.jvm_for_current(name));
                 let cls = self.st.alloc(
                     &format!("{name}$"),

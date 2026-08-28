@@ -135,5 +135,6 @@ conform!(
     self_type,
     decl_forms,
     layout,
-    companion_extends
+    companion_extends,
+    case_companion
 );
