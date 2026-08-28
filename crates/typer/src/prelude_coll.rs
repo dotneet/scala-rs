@@ -30,13 +30,22 @@ fn find_class(st: &SymbolTable, owner: SymbolId, name: &str) -> SymbolId {
 /// via `invokeinterface` (see `is_stdlib_coll_iterable` in gen.rs).
 fn find_or_create_iterable(st: &mut SymbolTable, iterator_sym: SymbolId) -> SymbolId {
     let coll = crate::classpath::ensure_package(st, "scala/collection");
+    // `add_array_ops_flat_map_from_array` in prelude.rs already allocates a
+    // bare `scala.collection.Iterable[A]` (tparam only, no members) as an
+    // implicit-conversion marker for `ArrayOps.flatMap`'s `asIterable`
+    // evidence — reuse that symbol rather than creating a second, ambiguous
+    // "Iterable" class, but still add our members onto it (it has none yet).
     let existing = find_class(st, coll, "Iterable");
-    if existing != SymbolId::NONE && st.get(existing).jvm_name == "scala/collection/Iterable" {
-        return existing;
+    let it = if existing != SymbolId::NONE {
+        existing
+    } else {
+        iface(st, coll, "Iterable", "scala/collection/Iterable")
+    };
+    if st.get(it).tparams.is_empty() {
+        let a = type_param(st, it, "A");
+        st.get_mut(it).tparams = vec![a];
     }
-    let it = iface(st, coll, "Iterable", "scala/collection/Iterable");
-    let a = type_param(st, it, "A");
-    st.get_mut(it).tparams = vec![a];
+    let a = st.get(it).tparams[0];
     let ta = Type::TypeParam(a);
     method(
         st,
@@ -963,9 +972,13 @@ fn add_immutable_map_extra(
     };
     let vk = st.get(map_view).tparams[0];
     let vv = st.get(map_view).tparams[1];
+    // `view`'s return must reference *`map`'s own* K/V (`tk`/`tv`) so a
+    // caller's `subst_tparams(map, [K, V], ...)` actually substitutes it —
+    // `MapView`'s own fresh tparams (`vk`/`vv`) are only for members
+    // declared directly on `MapView` (e.g. `mapValues` below).
     let view_t = Type::Class {
         sym: map_view,
-        args: vec![Type::TypeParam(vk), Type::TypeParam(vv)],
+        args: vec![tk.clone(), tv.clone()],
     };
     method(st, map, "view", vec![], view_t.clone(), Intrinsic::None);
     let mm = method(

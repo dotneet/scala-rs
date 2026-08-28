@@ -3054,3 +3054,18 @@ fn fixtures_coll_listbuffer1_bad_is_error() {
 fn scala_library_dual_run_coll_listbuffer1() {
     dual_run_fixture("coll_listbuffer1");
 }
+
+#[test]
+fn fixtures_coll_mutablemap1_bad_is_error() {
+    compile_fails_lib("coll_mutablemap1_bad", "noSuchMember is not a member");
+}
+
+#[test]
+fn scala_library_dual_run_coll_mutablemap1() {
+    dual_run_fixture("coll_mutablemap1");
+}
+
+#[test]
+fn scala_library_dual_run_coll_map_view1() {
+    dual_run_fixture("coll_map_view1");
+}

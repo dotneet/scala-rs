@@ -5636,6 +5636,52 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_mutable_map_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/Map$",
+                        "empty",
+                        "()Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/mutable/Map");
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/Map$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/mutable/Map");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_mutable_set_module(&owner) {
+            match name {
+                "empty" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/Set$",
+                        "empty",
+                        "()Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/mutable/Set");
+                    return;
+                }
+                "apply" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/Set$",
+                        "apply",
+                        "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+                    );
+                    asm.checkcast("scala/collection/mutable/Set");
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_stdlib_arraydeque_module(&owner) {
             match name {
                 "empty" => {
@@ -6666,6 +6712,343 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_mutable_map(&owner) {
+            let d_obj_obj = "(Ljava/lang/Object;)Ljava/lang/Object;";
+            match name {
+                "apply" => {
+                    asm.invokeinterface("scala/collection/MapOps", "apply", d_obj_obj);
+                    maybe_unbox_erased_result(asm, ctx, d_obj_obj, result_ty);
+                    return;
+                }
+                "get" => {
+                    asm.invokeinterface(
+                        "scala/collection/MapOps",
+                        "get",
+                        "(Ljava/lang/Object;)Lscala/Option;",
+                    );
+                    return;
+                }
+                "update" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/MapOps",
+                        "update",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                    );
+                    return;
+                }
+                "contains" => {
+                    asm.invokeinterface(
+                        "scala/collection/MapOps",
+                        "contains",
+                        "(Ljava/lang/Object;)Z",
+                    );
+                    return;
+                }
+                "keys" => {
+                    asm.invokeinterface(
+                        "scala/collection/MapOps",
+                        "keys",
+                        "()Lscala/collection/Iterable;",
+                    );
+                    return;
+                }
+                "values" => {
+                    asm.invokeinterface(
+                        "scala/collection/MapOps",
+                        "values",
+                        "()Lscala/collection/Iterable;",
+                    );
+                    return;
+                }
+                "+=" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Growable",
+                        "+=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Growable;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/Map");
+                    return;
+                }
+                "-=" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Shrinkable",
+                        "-=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Shrinkable;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/Map");
+                    return;
+                }
+                "remove" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/MapOps",
+                        "remove",
+                        "(Ljava/lang/Object;)Lscala/Option;",
+                    );
+                    return;
+                }
+                "size" => {
+                    asm.invokeinterface("scala/collection/IterableOnceOps", "size", "()I");
+                    return;
+                }
+                "isEmpty" => {
+                    asm.invokeinterface("scala/collection/IterableOnceOps", "isEmpty", "()Z");
+                    return;
+                }
+                "nonEmpty" => {
+                    asm.invokeinterface("scala/collection/IterableOnceOps", "nonEmpty", "()Z");
+                    return;
+                }
+                "clear" => {
+                    asm.invokeinterface("scala/collection/mutable/MapOps", "clear", "()V");
+                    return;
+                }
+                "foreach" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                "filter" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOps",
+                        "filter",
+                        "(Lscala/Function1;)Ljava/lang/Object;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/Map");
+                    return;
+                }
+                "toList" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "toList",
+                        "()Lscala/collection/immutable/List;",
+                    );
+                    return;
+                }
+                "toSeq" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "toSeq",
+                        "()Lscala/collection/immutable/Seq;",
+                    );
+                    return;
+                }
+                "iterator" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnce",
+                        "iterator",
+                        "()Lscala/collection/Iterator;",
+                    );
+                    return;
+                }
+                "mkString" => {
+                    let desc = mkstring_desc(ctx.st, id);
+                    asm.invokeinterface("scala/collection/IterableOnceOps", "mkString", desc);
+                    return;
+                }
+                "getOrElse" => {
+                    let d = "(Ljava/lang/Object;Lscala/Function0;)Ljava/lang/Object;";
+                    asm.invokeinterface("scala/collection/MapOps", "getOrElse", d);
+                    maybe_unbox_erased_result(asm, ctx, d, result_ty);
+                    return;
+                }
+                "getOrElseUpdate" => {
+                    let d = "(Ljava/lang/Object;Lscala/Function0;)Ljava/lang/Object;";
+                    asm.invokeinterface("scala/collection/mutable/MapOps", "getOrElseUpdate", d);
+                    maybe_unbox_erased_result(asm, ctx, d, result_ty);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_mutable_set(&owner) {
+            match name {
+                "contains" => {
+                    asm.invokeinterface(
+                        "scala/collection/SetOps",
+                        "contains",
+                        "(Ljava/lang/Object;)Z",
+                    );
+                    return;
+                }
+                "+=" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Growable",
+                        "+=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Growable;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/Set");
+                    return;
+                }
+                "-=" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Shrinkable",
+                        "-=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Shrinkable;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/Set");
+                    return;
+                }
+                "remove" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/SetOps",
+                        "remove",
+                        "(Ljava/lang/Object;)Z",
+                    );
+                    return;
+                }
+                "size" => {
+                    asm.invokeinterface("scala/collection/IterableOnceOps", "size", "()I");
+                    return;
+                }
+                "isEmpty" => {
+                    asm.invokeinterface("scala/collection/IterableOnceOps", "isEmpty", "()Z");
+                    return;
+                }
+                "nonEmpty" => {
+                    asm.invokeinterface("scala/collection/IterableOnceOps", "nonEmpty", "()Z");
+                    return;
+                }
+                "clear" => {
+                    asm.invokeinterface("scala/collection/mutable/Clearable", "clear", "()V");
+                    return;
+                }
+                "foreach" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                "map" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOps",
+                        "map",
+                        "(Lscala/Function1;)Ljava/lang/Object;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/Set");
+                    return;
+                }
+                "filter" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOps",
+                        "filter",
+                        "(Lscala/Function1;)Ljava/lang/Object;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/Set");
+                    return;
+                }
+                "toList" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "toList",
+                        "()Lscala/collection/immutable/List;",
+                    );
+                    return;
+                }
+                "toSeq" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "toSeq",
+                        "()Lscala/collection/immutable/Seq;",
+                    );
+                    return;
+                }
+                "iterator" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnce",
+                        "iterator",
+                        "()Lscala/collection/Iterator;",
+                    );
+                    return;
+                }
+                "mkString" => {
+                    let desc = mkstring_desc(ctx.st, id);
+                    asm.invokeinterface("scala/collection/IterableOnceOps", "mkString", desc);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_coll_iterable(&owner) {
+            match name {
+                "foreach" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                "mkString" => {
+                    let desc = mkstring_desc(ctx.st, id);
+                    asm.invokeinterface("scala/collection/IterableOnceOps", "mkString", desc);
+                    return;
+                }
+                "toList" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "toList",
+                        "()Lscala/collection/immutable/List;",
+                    );
+                    return;
+                }
+                "size" => {
+                    asm.invokeinterface("scala/collection/IterableOnceOps", "size", "()I");
+                    return;
+                }
+                "isEmpty" => {
+                    asm.invokeinterface("scala/collection/IterableOnceOps", "isEmpty", "()Z");
+                    return;
+                }
+                "iterator" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnce",
+                        "iterator",
+                        "()Lscala/collection/Iterator;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if is_stdlib_mapview(&owner) {
+            match name {
+                "mapValues" => {
+                    asm.invokeinterface(
+                        "scala/collection/MapOps",
+                        "mapValues",
+                        "(Lscala/Function1;)Lscala/collection/MapView;",
+                    );
+                    return;
+                }
+                "toList" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "toList",
+                        "()Lscala/collection/immutable/List;",
+                    );
+                    return;
+                }
+                "mkString" => {
+                    let desc = mkstring_desc(ctx.st, id);
+                    asm.invokeinterface("scala/collection/IterableOnceOps", "mkString", desc);
+                    return;
+                }
+                "foreach" => {
+                    asm.invokeinterface(
+                        "scala/collection/IterableOnceOps",
+                        "foreach",
+                        "(Lscala/Function1;)V",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_stdlib_hashmap(&owner) {
             match name {
                 "apply" => {
@@ -6885,6 +7268,21 @@ fn maybe_cast_erased_load(asm: &mut Assembler, ctx: &EmitCtx, from: &Type, want:
 /// the prelude (`ArrayBuffer[A]`, `ListBuffer[A]`, …) — unlike
 /// `maybe_unbox_erased_result`, this does not require the invoked
 /// descriptor's return type to literally be `Ljava/lang/Object;`.
+/// Picks the right `mkString` overload descriptor for the resolved symbol
+/// `id` (0/1/3 `String` params — the typer already chose the overload; we
+/// just need to know which arity to emit against `IterableOnceOps`).
+fn mkstring_desc(st: &SymbolTable, id: SymbolId) -> &'static str {
+    let n = match &st.get(id).ty {
+        Type::Method { paramss, .. } => paramss.first().map(|p| p.len()).unwrap_or(0),
+        _ => 0,
+    };
+    match n {
+        0 => "()Ljava/lang/String;",
+        1 => "(Ljava/lang/String;)Ljava/lang/String;",
+        _ => "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+    }
+}
+
 fn checkcast_to(asm: &mut Assembler, ctx: &EmitCtx, result_ty: Option<&Type>, fallback: &str) {
     if let Some(ty) = result_ty {
         if let Some(cn) = checkcast_internal(ctx.st, ty) {
@@ -7082,6 +7480,30 @@ fn is_stdlib_arraybuffer(owner: &str) -> bool {
 
 fn is_stdlib_arraybuffer_module(owner: &str) -> bool {
     owner == "scala/collection/mutable/ArrayBuffer$"
+}
+
+fn is_stdlib_mutable_map(owner: &str) -> bool {
+    owner == "scala/collection/mutable/Map"
+}
+
+fn is_stdlib_mutable_map_module(owner: &str) -> bool {
+    owner == "scala/collection/mutable/Map$"
+}
+
+fn is_stdlib_mutable_set(owner: &str) -> bool {
+    owner == "scala/collection/mutable/Set"
+}
+
+fn is_stdlib_mutable_set_module(owner: &str) -> bool {
+    owner == "scala/collection/mutable/Set$"
+}
+
+fn is_stdlib_coll_iterable(owner: &str) -> bool {
+    owner == "scala/collection/Iterable"
+}
+
+fn is_stdlib_mapview(owner: &str) -> bool {
+    owner == "scala/collection/MapView"
 }
 
 fn is_stdlib_arraydeque(owner: &str) -> bool {
