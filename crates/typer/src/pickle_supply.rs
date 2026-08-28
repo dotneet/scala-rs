@@ -725,6 +725,102 @@ fn desc_arity(desc: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TypecheckOptions;
+
+    fn jar() -> Option<std::path::PathBuf> {
+        let p = std::path::PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+        p.is_file().then_some(p)
+    }
+
+    fn library_opts(jar: &std::path::Path) -> TypecheckOptions {
+        TypecheckOptions {
+            library_abi: true,
+            binary_path: vec![jar.to_path_buf()],
+            ..TypecheckOptions::default()
+        }
+    }
+
+    /// A member the prelude declares by hand must keep coming from the
+    /// prelude: completion runs only after resolution failed, so it can add
+    /// members but never replace one. A supplied member is recognisable by the
+    /// JVM descriptor parked in its `jvm_name`.
+    #[test]
+    fn the_prelude_wins_over_the_pickle() {
+        let Some(jar) = jar() else {
+            eprintln!("skip: scala-library jar not present");
+            return;
+        };
+        let src = r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val xs = List(1, 2, 3)
+    xs.map(x => x + 1)
+    xs.filter(x => x > 1)
+  }
+}
+"#;
+        let (_t, st, diags) = crate::typecheck_str_opts(src, &library_opts(&jar));
+        assert!(
+            !crate::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let list = st.list_sym;
+        let maps: Vec<_> = st
+            .get(list)
+            .members
+            .iter()
+            .filter(|&&m| st.get(m).name == "map")
+            .collect();
+        assert_eq!(
+            maps.len(),
+            1,
+            "prelude List#map was duplicated by the pickle"
+        );
+        assert!(
+            st.get(*maps[0]).jvm_name.is_empty(),
+            "prelude List#map was replaced by a pickle-supplied one"
+        );
+        // ...while a member the prelude does not have does come from the pickle.
+        let filters: Vec<_> = st
+            .get(list)
+            .members
+            .iter()
+            .filter(|&&m| st.get(m).name == "filter")
+            .collect();
+        assert_eq!(filters.len(), 1, "expected exactly one supplied filter");
+        assert!(
+            st.get(*filters[0]).jvm_name.starts_with('('),
+            "List#filter should carry an erased descriptor, got {:?}",
+            st.get(*filters[0]).jvm_name
+        );
+    }
+
+    /// Nothing is read until a lookup actually misses.
+    #[test]
+    fn nothing_is_supplied_when_nothing_is_missing() {
+        let Some(jar) = jar() else {
+            eprintln!("skip: scala-library jar not present");
+            return;
+        };
+        let src = r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val xs = List(1, 2, 3)
+    xs.foreach(x => println(x))
+  }
+}
+"#;
+        let (_t, st, diags) = crate::typecheck_str_opts(src, &library_opts(&jar));
+        assert!(!crate::has_errors(&diags));
+        let supplied = st
+            .get(st.list_sym)
+            .members
+            .iter()
+            .filter(|&&m| st.get(m).jvm_name.starts_with('('))
+            .count();
+        assert_eq!(supplied, 0, "read a pickle for a member the prelude has");
+    }
 
     #[test]
     fn descriptor_arity() {
