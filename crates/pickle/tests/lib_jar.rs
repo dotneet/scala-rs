@@ -317,3 +317,65 @@ fn resolves_module_class_members() {
         sig.members.iter().map(|m| &m.name).collect::<Vec<_>>()
     );
 }
+
+/// Linearization order, not breadth-first order, decides which binding of an
+/// inherited type parameter a member comes back with.
+///
+/// `immutable.Set[A]` mixes in `Iterable[A]` *before* `SetOps[A, Set, Set[A]]`,
+/// so SLS 5.1.2 says the later parent wins and `IterableOps`'s `C` is `Set[A]`.
+/// A breadth-first walk reaches `IterableOps` through `Iterable` first and
+/// hands back the weaker `Iterable[A]`.
+#[test]
+fn set_filter_binds_c_through_setops_not_iterable() {
+    let jar = jar_path();
+    if !jar.is_file() {
+        eprintln!("skipping: {} not found", jar.display());
+        return;
+    }
+    let mut loader = SigLoader::new(JarSource::open(&jar));
+    let (hits, _) = loader.lookup("scala.collection.immutable.Set", false, "filter");
+    let hit = hits
+        .iter()
+        .find(|h| h.member.is_public_api())
+        .expect("Set#filter");
+    let r = render(&hit.member.ty);
+    assert!(
+        r.ends_with(")scala.collection.immutable.Set[A]"),
+        "filter should return Set[A], got {r}"
+    );
+}
+
+/// The linearization itself: a later parent and everything it brings must come
+/// before an earlier one.
+#[test]
+fn linearization_puts_later_parents_first() {
+    let jar = jar_path();
+    if !jar.is_file() {
+        eprintln!("skipping: {} not found", jar.display());
+        return;
+    }
+    let mut loader = SigLoader::new(JarSource::open(&jar));
+    let lin = loader.linearization("scala.collection.immutable.Set", false);
+    let names: Vec<&str> = lin.iter().map(|s| s.class_name.as_str()).collect();
+    assert_eq!(
+        names[0], "scala.collection.immutable.Set",
+        "self comes first"
+    );
+    let pos = |n: &str| names.iter().position(|x| *x == n);
+    let setops = pos("scala.collection.SetOps").expect("SetOps in linearization");
+    let iterable = pos("scala.collection.immutable.Iterable").expect("Iterable in linearization");
+    assert!(
+        setops < iterable,
+        "SetOps is the later parent and must linearize first: {names:?}"
+    );
+    // Every class appears once.
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    let before = sorted.len();
+    sorted.dedup();
+    assert_eq!(
+        before,
+        sorted.len(),
+        "duplicate in linearization: {names:?}"
+    );
+}
