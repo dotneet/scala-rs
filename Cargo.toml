@@ -4,6 +4,7 @@ members = [
     "crates/span",
     "crates/lexer",
     "crates/parser",
+    "crates/pickle",
     "crates/typer",
     "crates/backend",
     "crates/driver",
@@ -21,6 +22,7 @@ repository = "https://github.com/scala-rs/scala-rs"
 scala-rs-span = { path = "crates/span" }
 scala-rs-lexer = { path = "crates/lexer" }
 scala-rs-parser = { path = "crates/parser" }
+scala-rs-pickle = { path = "crates/pickle" }
 scala-rs-typer = { path = "crates/typer" }
 scala-rs-backend = { path = "crates/backend" }
 scala-rs-driver = { path = "crates/driver" }

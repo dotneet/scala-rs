@@ -60,6 +60,7 @@ name = "scala-rs-backend"
 version = "0.1.0"
 dependencies = [
  "scala-rs-parser",
+ "scala-rs-pickle",
  "scala-rs-span",
  "scala-rs-typer",
  "zip",
@@ -97,6 +98,13 @@ version = "0.1.0"
 dependencies = [
  "scala-rs-lexer",
  "scala-rs-span",
+]
+
+[[package]]
+name = "scala-rs-pickle"
+version = "0.1.0"
+dependencies = [
+ "zip",
 ]
 
 [[package]]

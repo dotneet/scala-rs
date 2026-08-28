@@ -4,9 +4,9 @@
 //! The jar is not vendored; when it is missing the test is skipped (the same
 //! convention the typer's library-ABI tests use).
 
-use scala_rs_backend::pickle_read::{read_pickle, Entry};
-use scala_rs_backend::pickle_sym::{render, ClassSource, MemberKind, SigLoader};
-use scala_rs_backend::scala_signature_bytes;
+use scala_rs_pickle::read::{read_pickle, Entry};
+use scala_rs_pickle::scala_signature_bytes;
+use scala_rs_pickle::sym::{render, ClassSource, MemberKind, SigLoader};
 use std::io::Read;
 
 fn jar_path() -> std::path::PathBuf {
@@ -76,7 +76,7 @@ fn scan(path: &std::path::Path) -> Stats {
                 }
                 // Every class signature must resolve; an unresolved reference
                 // is a hole that would otherwise surface as a wrong type.
-                for c in scala_rs_backend::pickle_sym::class_sigs(&p) {
+                for c in scala_rs_pickle::sym::class_sigs(&p) {
                     st.sigs += 1;
                     for u in &c.unresolved {
                         st.failures
@@ -119,7 +119,7 @@ fn reads_every_pickle_in_scala_library() {
     // LITERALunit(24), LITERALsymbol(37), ANNOTARGARRAY(44), MODIFIERS(50),
     // and the three tags scalac no longer writes at all —
     // IMPLICITMETHODtpe(22), SUPERtpe(46), DEBRUIJNINDEXtpe(47).
-    use scala_rs_backend::pickle_read::tags as t;
+    use scala_rs_pickle::read::tags as t;
     for (tag, what) in [
         (t::CLASSsym, "CLASSsym"),
         (t::MODULEsym, "MODULEsym"),

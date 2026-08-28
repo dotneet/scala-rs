@@ -1,21 +1,20 @@
 //! Turn a parsed pickle into class signatures, and resolve members across
 //! inheritance by loading the pickles of parent classes on demand.
 //!
-//! This is the bridge layer between [`crate::pickle_read`] (bytes -> entries)
+//! This is the bridge layer between [`crate::read`] (bytes -> entries)
 //! and a symbol table: entry indices are resolved into names and a
 //! self-contained [`SigType`] tree, and [`SigLoader`] walks parents so that
 //! `List#filter` is found on `scala.collection.IterableOps` without anyone
 //! having to say where it lives.
 //!
-//! It deliberately stops short of the typer's `Type`: `crates/typer` cannot
-//! depend on `crates/backend`, so the last hop (SigType -> `scala_rs_parser::Type`
-//! inside the typer) is a separate step. See README, "ScalaSignature からの
-//! シンボル自動供給".
+//! It stops short of the typer's `Type`: the last hop
+//! (`SigType` -> `scala_rs_parser::Type`) lives in
+//! `crates/typer/src/pickle_supply.rs`, which is where the symbol table is.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::pickle_read::{pflags, read_pickle, Constant, Entry, Idx, Pickle, ReadError};
+use crate::read::{pflags, read_pickle, Constant, Entry, Idx, Pickle, ReadError};
 
 /// A type recovered from a pickle, with all entry references resolved.
 #[derive(Clone, Debug, PartialEq)]
@@ -546,7 +545,7 @@ impl<S: ClassSource> SigLoader<S> {
             let Some(bytes) = self.src.class_bytes(c) else {
                 continue;
             };
-            let Some(raw) = crate::load::scala_signature_bytes(&bytes) else {
+            let Some(raw) = crate::classfile::scala_signature_bytes(&bytes) else {
                 last = LoadError::NoSignature(full_name.to_string());
                 continue;
             };
@@ -669,78 +668,5 @@ pub fn render(t: &SigType) -> String {
             this_tpe,
             super_tpe,
         } => format!("{}.super[{}]", render(this_tpe), render(super_tpe)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::pickle;
-
-    fn sigs_of(src: &str) -> Vec<ClassSig> {
-        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
-        assert!(
-            !scala_rs_typer::has_errors(&diags),
-            "type errors: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-        let mut out = Vec::new();
-        for raw in pickle::pickle_all(&st).values() {
-            let p = read_pickle(raw).expect("read our own pickle");
-            out.extend(class_sigs(&p));
-        }
-        out
-    }
-
-    #[test]
-    fn recovers_a_polymorphic_method_signature() {
-        let sigs = sigs_of(
-            r#"
-class Box[A](val get: A) {
-  def map[B](f: A => B): Box[B] = new Box(f(get))
-  def size: Int = 1
-}
-"#,
-        );
-        let boxc = sigs
-            .iter()
-            .find(|c| c.full_name == "Box" && !c.is_module)
-            .expect("Box");
-        assert_eq!(boxc.tparams.len(), 1);
-        assert_eq!(boxc.tparams[0].name, "A");
-        let map = boxc.member("map").expect("Box#map");
-        assert_eq!(map.kind, MemberKind::Def);
-        let rendered = render(&map.ty);
-        assert!(rendered.starts_with("[B](f: "), "{rendered}");
-        assert!(rendered.ends_with("Box[B]"), "{rendered}");
-        // A parameterless `def` stays a (nullary) method, not a val.
-        let size = boxc.member("size").expect("Box#size");
-        assert_eq!(render(&size.ty), "=> scala.Int");
-        assert_eq!(size.kind, MemberKind::Def);
-    }
-
-    #[test]
-    fn parents_and_module_classes_are_recovered() {
-        let sigs = sigs_of(
-            r#"
-trait Show { def show: String }
-class Impl extends Show { def show: String = "" }
-object Impl { val tag: String = "i" }
-"#,
-        );
-        let imp = sigs
-            .iter()
-            .find(|c| c.full_name == "Impl" && !c.is_module)
-            .expect("Impl class");
-        assert!(
-            !imp.parents.is_empty(),
-            "expected at least one parent for Impl"
-        );
-        assert!(imp.member("show").is_some(), "Impl#show");
-        let obj = sigs
-            .iter()
-            .find(|c| c.full_name == "Impl" && c.is_module)
-            .expect("Impl module class");
-        assert!(obj.member("tag").is_some(), "Impl.tag");
     }
 }
