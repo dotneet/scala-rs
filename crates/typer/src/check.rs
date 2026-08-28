@@ -4256,7 +4256,117 @@ impl Typer {
         true
     }
 
+    /// nsc synthesizes `def copy(x: T = this.x, …): C` on a case class.
+    /// Rewriting `p.copy(y = 3)` to a constructor call keeps the omitted
+    /// fields coming from the receiver without emitting a synthetic method.
+    fn try_rewrite_case_copy(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        let is_copy = match &tree.kind {
+            TreeKind::Apply { fun, .. } => {
+                matches!(&fun.kind, TreeKind::Select { name, .. } if name == "copy")
+            }
+            _ => false,
+        };
+        if !is_copy {
+            return false;
+        }
+        let class_id = {
+            let TreeKind::Apply { fun, .. } = &mut tree.kind else {
+                return false;
+            };
+            let TreeKind::Select { qual, .. } = &mut fun.kind else {
+                return false;
+            };
+            if qual.ty.is_no_type() {
+                self.type_expr(qual, &Type::NoType);
+            }
+            match self.st.class_sym_of(&qual.ty) {
+                Some(c) => c,
+                None => return false,
+            }
+        };
+        if !self.st.get(class_id).flags.contains(Flags::CASE) {
+            return false;
+        }
+        let fields = self.st.get(class_id).ctor_fields.clone();
+        if fields.is_empty() {
+            return false;
+        }
+        // A hand-written `copy` wins over the synthetic one.
+        if self
+            .st
+            .lookup_member(class_id, "copy")
+            .iter()
+            .any(|&s| !self.st.get(s).flags.contains(Flags::SYNTHETIC))
+        {
+            return false;
+        }
+        let span = tree.span;
+        let (fun, args) = match std::mem::replace(&mut tree.kind, TreeKind::Empty) {
+            TreeKind::Apply { fun, args } => (*fun, args),
+            _ => return false,
+        };
+        let qual = match fun.kind {
+            TreeKind::Select { qual, .. } => *qual,
+            _ => return false,
+        };
+        let names: Vec<String> = fields
+            .iter()
+            .map(|f| self.st.get(*f).name.clone())
+            .collect();
+        let mut slots: Vec<Option<Tree>> = names.iter().map(|_| None).collect();
+        let mut positional = 0usize;
+        for a in args {
+            if let Some((n, rhs)) = Self::named_arg_parts(&a) {
+                match names.iter().position(|p| p == &n) {
+                    Some(i) => slots[i] = Some(rhs),
+                    None => self.error(a.span, format!("no parameter named `{n}`")),
+                }
+            } else if positional < slots.len() {
+                slots[positional] = Some(a);
+                positional += 1;
+            } else {
+                self.error(a.span, "too many arguments");
+            }
+        }
+        // The receiver is evaluated once, as nsc's `copy$default$n` does.
+        let tmp = self.fresh("x$copy");
+        let tmp_def = Tree::dummy(TreeKind::ValDef {
+            mods: scala_rs_parser::Modifiers::default(),
+            name: tmp.clone(),
+            tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+            rhs: Box::new(qual),
+        });
+        let mut new_args = Vec::with_capacity(slots.len());
+        for (i, slot) in slots.into_iter().enumerate() {
+            new_args.push(match slot {
+                Some(a) => a,
+                None => Tree::dummy(TreeKind::Select {
+                    qual: Box::new(Tree::dummy(TreeKind::Ident { name: tmp.clone() })),
+                    name: names[i].clone(),
+                }),
+            });
+        }
+        let cls_name = self.st.get(class_id).name.clone();
+        let new_tree = Tree::dummy(TreeKind::New {
+            tpt: Box::new(Tree::dummy(TreeKind::Ident { name: cls_name })),
+        });
+        let ctor = Tree::dummy(TreeKind::Apply {
+            fun: Box::new(new_tree),
+            args: new_args,
+        });
+        tree.kind = TreeKind::Block {
+            stats: vec![tmp_def],
+            expr: Box::new(ctor),
+        };
+        tree.span = span;
+        self.type_expr(tree, pt);
+        true
+    }
+
     fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
+        if self.try_rewrite_case_copy(tree, pt) {
+            return;
+        }
         if self.try_rewrite_assignment_op(tree, pt) {
             return;
         }

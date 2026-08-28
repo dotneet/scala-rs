@@ -198,3 +198,13 @@ fn for_generator_patterns_run() {
 fn for_generator_pattern_binding_is_typed() {
     compile_fails("for_pat_bad", "nosuchmember");
 }
+
+#[test]
+fn case_class_copy_runs() {
+    run_both("case_copy");
+}
+
+#[test]
+fn case_class_copy_rejects_unknown_parameter() {
+    compile_fails("case_copy_bad", "no parameter named");
+}
