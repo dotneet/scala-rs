@@ -1350,7 +1350,16 @@ impl Typer {
         };
     }
 
+    /// Fill in the signatures of the `apply` / `unapply` that
+    /// `synthesize_case_members` allocated for a case class, now that the
+    /// constructor's parameter types are known. Only those synthetic members
+    /// are touched: a companion may also declare `apply`/`unapply` of its own
+    /// (`object LiteralNode { def apply(tp: Type, v: Any, vol: Boolean = false) }`),
+    /// and overwriting those with the constructor's signature would hide them.
     fn finish_case_apply(&mut self, class_id: SymbolId, ctor_param_tys: &[Type]) {
+        if class_id.is_none() || !self.st.get(class_id).flags.contains(Flags::CASE) {
+            return;
+        }
         let name = self.st.get(class_id).name.clone();
         let companion = self
             .st
@@ -1378,6 +1387,9 @@ impl Typer {
                 },
             };
             for mem in self.st.get(cls).members.clone() {
+                if !self.st.get(mem).flags.contains(Flags::SYNTHETIC) {
+                    continue;
+                }
                 let n = self.st.get(mem).name.clone();
                 if n == "apply" {
                     self.st.get_mut(mem).ty = Type::Method {
@@ -3968,6 +3980,12 @@ impl Typer {
                 .iter()
                 .copied()
                 .find(|&s| self.is_nullary_method_sym(s))
+                .or_else(|| {
+                    found
+                        .iter()
+                        .copied()
+                        .find(|&s| self.is_parameterless_sym(s))
+                })
                 .unwrap_or(found[0])
         };
     }
@@ -3997,9 +4015,16 @@ impl Typer {
                     })
                     .collect();
                 if let [Type::Method { ret, .. }] = nullary.as_slice() {
-                    (**ret).clone()
-                } else {
-                    ty
+                    return (**ret).clone();
+                }
+                // nsc (SLS 6.26.3): an overloaded reference in value position
+                // keeps only the alternatives that take no parameters. A `val`
+                // is not a method type at all, so `object Lib { val == = … }`
+                // reads as the value, not as the inherited `Any.==(x: Any)`.
+                let mut values = alts.iter().filter(|a| !matches!(a, Type::Method { .. }));
+                match (values.next(), values.next()) {
+                    (Some(v), None) if nullary.is_empty() => v.clone(),
+                    _ => ty,
                 }
             }
             Type::ByName(inner) => {
@@ -4023,6 +4048,12 @@ impl Typer {
             }
             _ => false,
         }
+    }
+
+    /// The alternatives `maybe_auto_apply` keeps in value position: a nullary
+    /// method or a `val`/`object` whose type is not a method type at all.
+    fn is_parameterless_sym(&self, id: SymbolId) -> bool {
+        !matches!(&self.st.get(id).ty, Type::Method { .. }) || self.is_nullary_method_sym(id)
     }
 
     /// `implicitly[Int]` is a TypeApply of a method whose remaining clause is
@@ -4337,6 +4368,12 @@ impl Typer {
                     .iter()
                     .copied()
                     .find(|&s| self.is_nullary_method_sym(s))
+                    .or_else(|| {
+                        found
+                            .iter()
+                            .copied()
+                            .find(|&s| self.is_parameterless_sym(s))
+                    })
                 {
                     tree.sym = id;
                 }
@@ -6105,6 +6142,16 @@ impl Typer {
                         ),
                     );
                 } else if !arg_tys.iter().any(|t| t.is_error()) {
+                    if std::env::var("SCALA_RS_DEBUG_OVL").is_ok() {
+                        eprintln!(
+                            "DBG fun.sym={:?} name={:?} kind={:?} owner={:?} fun_ty={:?}",
+                            fun.sym,
+                            self.st.get(fun.sym).name,
+                            self.st.get(fun.sym).kind,
+                            self.st.get(self.st.get(fun.sym).owner).name,
+                            fun_ty,
+                        );
+                    }
                     self.error(
                         tree.span,
                         format!(
