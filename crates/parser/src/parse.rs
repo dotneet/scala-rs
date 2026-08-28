@@ -73,6 +73,11 @@ struct Parser<'a> {
     placeholder_params: Vec<Tree>,
     placeholder_id: u32,
     opts: ParseOptions,
+    /// nsc `Location.InBlock`: the next `parse_expr1` is a *block statement*,
+    /// so a function literal there takes the rest of the block as its body
+    /// (`{ x => val n = 1; n }`). Consumed by `parse_expr1`, so nested
+    /// sub-expressions are back to `Local`.
+    in_block: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -87,6 +92,7 @@ impl<'a> Parser<'a> {
             placeholder_params: Vec::new(),
             placeholder_id: 0,
             opts: ParseOptions::default(),
+            in_block: false,
         }
     }
 
@@ -1262,7 +1268,11 @@ impl<'a> Parser<'a> {
         if is_mod_or_def_start(self.kind()) {
             return self.parse_tmpl_or_def();
         }
-        self.parse_expr()
+        // nsc: block statements are parsed as `expr(InBlock)`.
+        self.in_block = true;
+        let t = self.parse_expr();
+        self.in_block = false;
+        t
     }
 
     fn parse_val_def(&mut self, mut mods: Modifiers) -> Tree {
@@ -2094,6 +2104,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr1(&mut self) -> Tree {
+        // nsc `expr(location)`: only *this* expression is in block position;
+        // everything it nests is `Local`.
+        let in_block = std::mem::take(&mut self.in_block);
         self.skip_nl();
         match self.kind() {
             TokenKind::If => self.parse_if(),
@@ -2136,7 +2149,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let params = vec![self.parse_param(true)];
                 self.expect("=>", |k| matches!(k, TokenKind::Arrow));
-                let body = self.parse_expr();
+                let body = self.parse_function_body(in_block);
                 self.alloc(
                     lo.merge(body.span),
                     TreeKind::Function {
@@ -2159,27 +2172,20 @@ impl<'a> Parser<'a> {
                         },
                     );
                 }
-                if matches!(self.kind(), TokenKind::Arrow) {
-                    self.bump();
-                    let body = self.parse_expr();
-                    let vparams = self.convert_to_params(t.clone());
-                    return self.alloc(
-                        t.span.merge(body.span),
-                        TreeKind::Function {
-                            vparams,
-                            body: Box::new(body),
-                        },
-                    );
-                }
-                if matches!(self.kind(), TokenKind::Match) {
-                    return self.parse_match_rest(t);
-                }
+                // nsc parseOther: ascription first, then ARROW, so
+                // `{ x: Int => body }` is a lambda with a typed parameter and
+                // not an ascription to the function type `Int => body`.
                 if matches!(self.kind(), TokenKind::Colon) {
                     self.bump();
                     // nsc Ascription ::= COLON InfixType | COLON Annotation {Annotation}
                     // so `(n: @switch) match` / `n: @switch match` typecheck.
+                    // `typeOrInfixType(location)`: only a `Local` ascription may
+                    // swallow `=>` into a function *type*; in block position the
+                    // arrow belongs to the enclosing function literal.
                     let tpt = if matches!(self.kind(), TokenKind::At) {
                         self.parse_annot_ascription()
+                    } else if in_block {
+                        self.parse_infix_type()
                     } else {
                         self.parse_type()
                     };
@@ -2198,10 +2204,37 @@ impl<'a> Parser<'a> {
                         },
                     );
                     self.skip_nl();
+                    if matches!(self.kind(), TokenKind::Arrow) {
+                        self.bump();
+                        let body = self.parse_function_body(in_block);
+                        let vparams = self.convert_to_params(typed.clone());
+                        return self.alloc(
+                            typed.span.merge(body.span),
+                            TreeKind::Function {
+                                vparams,
+                                body: Box::new(body),
+                            },
+                        );
+                    }
                     if matches!(self.kind(), TokenKind::Match) {
                         return self.parse_match_rest(typed);
                     }
                     return typed;
+                }
+                if matches!(self.kind(), TokenKind::Arrow) {
+                    self.bump();
+                    let body = self.parse_function_body(in_block);
+                    let vparams = self.convert_to_params(t.clone());
+                    return self.alloc(
+                        t.span.merge(body.span),
+                        TreeKind::Function {
+                            vparams,
+                            body: Box::new(body),
+                        },
+                    );
+                }
+                if matches!(self.kind(), TokenKind::Match) {
+                    return self.parse_match_rest(t);
                 }
                 t
             }
@@ -2439,6 +2472,17 @@ impl<'a> Parser<'a> {
             pat,
             guard,
             body,
+        }
+    }
+
+    /// nsc: a function literal's body is `block()` in block position and
+    /// `expr()` otherwise. `{ x => val n = 1; n }` is a lambda whose body is
+    /// the whole remaining block, not `val` in expression position.
+    fn parse_function_body(&mut self, in_block: bool) -> Tree {
+        if in_block {
+            self.parse_case_body()
+        } else {
+            self.parse_expr()
         }
     }
 

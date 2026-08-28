@@ -209,3 +209,19 @@ fn help_mentions_xsource() {
     let s = String::from_utf8_lossy(&output.stdout);
     assert!(s.contains("-Xsource:"), "help missing -Xsource: {s}");
 }
+
+// ------------------------------------------- function literals in block position
+
+/// nsc `expr(InBlock)`: `{ x => val n = 1; n }` is a lambda whose body is the
+/// rest of the block, and `{ x: Int => … }` ascribes with `InfixType` so the
+/// `=>` stays with the lambda. Not `-Xsource:3` syntax — plain 2.13 — but it
+/// shares this fixture prefix.
+#[test]
+fn function_literal_takes_the_rest_of_the_block() {
+    check_runs("xsource3_block_lambda", &[]);
+}
+
+#[test]
+fn function_literal_block_body_under_xsource3() {
+    check_runs("xsource3_block_lambda", &["-Xsource:3"]);
+}

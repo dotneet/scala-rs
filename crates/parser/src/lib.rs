@@ -1127,4 +1127,83 @@ object Main {
         ));
         assert_eq!(amp, with_);
     }
+
+    #[test]
+    fn function_literal_body_is_a_block_in_block_position() {
+        // `val` is not an expression: before, the body was parsed with
+        // `expr()` and this failed with "expected expression, found val".
+        let t = parse_ok("object M { def f = xs.map { x => val n = x + 1; n } }");
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Function"), "{dump}");
+        assert!(
+            dump.contains("ValDef val n"),
+            "block body kept the val: {dump}"
+        );
+    }
+
+    #[test]
+    fn function_literal_body_block_spans_following_stats() {
+        let t = parse_ok(
+            r#"
+object M {
+  def f = xs.map { x =>
+    val n = x + 1
+    val m = n * 2
+    m
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(
+            dump.contains("ValDef val n") && dump.contains("ValDef val m"),
+            "{dump}"
+        );
+    }
+
+    #[test]
+    fn typed_lambda_param_without_parens_in_block() {
+        // nsc `typeOrInfixType`: in block position the ascription stops at
+        // InfixType, so `=>` belongs to the lambda and not to a function type.
+        let t = parse_ok("object M { val g = { x: Int => x + 1 } }");
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Function"), "{dump}");
+        assert!(
+            !dump.contains("Ident Function1"),
+            "not a function type: {dump}"
+        );
+    }
+
+    #[test]
+    fn ascription_to_a_function_type_still_works_outside_blocks() {
+        // In `Local` position the ascription is a full type and may contain `=>`.
+        let t = parse_ok("object M { val g = (f: Int => Int) }");
+        let dump = dump_tree(&t);
+        assert!(
+            dump.contains("Function1"),
+            "function type ascription: {dump}"
+        );
+    }
+
+    #[test]
+    fn function_literal_body_stops_at_case() {
+        let t = parse_ok(
+            r#"
+object M {
+  def f(i: Int) = i match {
+    case 0 =>
+      val z = 1
+      xs.map { x =>
+        val y = x
+        y
+      }
+    case _ => Nil
+  }
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Match"), "{dump}");
+        assert!(dump.contains("ValDef val y"), "{dump}");
+    }
 }
