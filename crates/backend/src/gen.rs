@@ -848,7 +848,12 @@ fn enclosing_instance(st: &SymbolTable, class_id: SymbolId) -> Option<SymbolId> 
     if st.get(class_id).flags.contains(Flags::JAVA) {
         return None;
     }
-    let owner = st.get(class_id).owner;
+    // `new T { … }` and local classes are owned by the method (or the `val`)
+    // they appear in; the enclosing instance is the class around it.
+    let mut owner = st.get(class_id).owner;
+    while !owner.is_none() && matches!(st.get(owner).kind, SymKind::Method | SymKind::Term) {
+        owner = st.get(owner).owner;
+    }
     if owner.is_none() {
         return None;
     }
@@ -1051,6 +1056,31 @@ fn is_owner_compatible(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> 
         }
     }
     false
+}
+
+/// Push the instance that owns `owner`'s members: `this`, or the `$outer`
+/// chain of the class being emitted when the member lives further out.
+fn load_owner_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
+    load_this(asm, ctx);
+    let mut cur = ctx.class_sym;
+    while !cur.is_none() && !owner.is_none() && !is_owner_compatible(ctx.st, cur, owner) {
+        let Some(o) = enclosing_instance(ctx.st, cur) else {
+            break;
+        };
+        asm.getfield(
+            &class_internal(ctx.st, cur),
+            "$outer",
+            &format!("L{};", class_internal(ctx.st, o)),
+        );
+        cur = o;
+    }
+    if !is_owner_compatible(ctx.st, cur, owner) {
+        let kind = ctx.st.get(owner).kind;
+        if matches!(kind, SymKind::Class | SymKind::ModuleClass) || is_interface_sym(ctx.st, owner)
+        {
+            asm.checkcast(&class_internal(ctx.st, owner));
+        }
+    }
 }
 
 fn maybe_checkcast_owner(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
@@ -3994,8 +4024,7 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
                 let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
             } else {
-                load_this(asm, ctx);
-                maybe_checkcast_owner(asm, ctx, owner);
+                load_owner_instance(asm, ctx, owner);
             }
             if is_trait_owned_term(ctx.st, id) {
                 let owner = class_internal(ctx.st, owner);
@@ -4026,8 +4055,7 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
                 let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
             } else {
-                load_this(asm, ctx);
-                maybe_checkcast_owner(asm, ctx, owner);
+                load_owner_instance(asm, ctx, owner);
             }
             invoke_method(asm, ctx, id, Some(&tree.ty));
         }
