@@ -8612,13 +8612,10 @@ impl Typer {
         let Some(cls) = self.st.class_sym_of(recv_ty) else {
             return Vec::new();
         };
-        if !self
-            .pickle
+        // Members found on a companion object land on that module class, not
+        // on `cls`, so take what completion reports rather than re-looking-up.
+        self.pickle
             .complete(&mut self.st, &mut self.binary, cls, name)
-        {
-            return Vec::new();
-        }
-        self.st.lookup_member(cls, name)
     }
 
     pub(crate) fn ensure_java_loaded(&mut self, class_id: SymbolId, span: Span) {
