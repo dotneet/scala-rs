@@ -123,6 +123,20 @@ fn ordering_and_alias_members_come_from_the_pickle() {
     run_against_library("pickle_lib2");
 }
 
+/// Linearization order, and members mentioning classes the prelude never
+/// declared.
+#[test]
+fn linearized_and_stubbed_members_come_from_the_pickle() {
+    run_against_library("pickle_lib3");
+}
+
+/// Operator members, companion-object members, and members needing an implicit
+/// the library itself provides.
+#[test]
+fn operator_and_companion_members_come_from_the_pickle() {
+    run_against_library("pickle_lib4");
+}
+
 /// Completion adds members; it must never invent one.
 #[test]
 fn a_member_in_no_pickle_is_still_an_error() {

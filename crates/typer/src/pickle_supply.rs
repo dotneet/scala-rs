@@ -183,6 +183,8 @@ impl PickleSupply {
 
         let mut installed: Vec<SymbolId> = Vec::new();
         let mut seen_shapes: HashSet<String> = HashSet::new();
+        // Whether an overload taking a function parameter is already in.
+        let mut took_function = false;
         for hit in hits {
             let m = hit.member;
             if m.kind != MemberKind::Def {
@@ -214,6 +216,7 @@ impl PickleSupply {
                 &shape,
                 &class_scope,
                 &mut seen_shapes,
+                &mut took_function,
             ) {
                 installed.push(id);
             }
@@ -237,6 +240,7 @@ impl PickleSupply {
         shape: &Shape,
         class_scope: &HashMap<String, Type>,
         seen_shapes: &mut HashSet<String>,
+        took_function: &mut bool,
     ) -> Option<SymbolId> {
         // Allocated ownerless, so a failure leaves nothing behind:
         // `SymbolTable::alloc` pushes into the owner's member list.
@@ -331,6 +335,22 @@ impl PickleSupply {
         // do -- supplying both would make every call ambiguous. Overloads that
         // differ in their parameters (`Iterator.from(Int)` vs
         // `from(IterableOnce)`) have different keys and all survive.
+        // At most one overload per name may take a function parameter. The
+        // typer infers a lambda's parameter types from a single expected type,
+        // so a second such overload turns `xs.segmentLength(_ < 3)` into an
+        // unsolvable overload set. Linearization order means the one kept is
+        // the most derived. Overloads that take no function -- `from(Int)` and
+        // `from(IterableOnce)` -- are unaffected.
+        let has_function = paramss_ty
+            .iter()
+            .flatten()
+            .any(|t| matches!(t, Type::Function { .. }));
+        if has_function && *took_function {
+            trace(format_args!(
+                "{internal}#{name}: skipping a second overload that takes a function"
+            ));
+            return None;
+        }
         let key = format!("{want:?}");
         if !seen_shapes.insert(key) {
             trace(format_args!(
@@ -389,6 +409,7 @@ impl PickleSupply {
 
         st.get_mut(m).owner = class_sym;
         st.get_mut(class_sym).members.push(m);
+        *took_function = *took_function || has_function;
         Some(m)
     }
 
@@ -487,36 +508,17 @@ impl PickleSupply {
         if let Some(id) = self.stubs.get(&key) {
             return Some(*id);
         }
-        let existing = crate::classpath::find_by_jvm(st, &key);
-        if let Some(id) = existing {
-            // `scala/collection/Seq` is already in the table, but as a Java
-            // stub with no type parameters, so `Seq[B]` would not typecheck
-            // against it. Give an empty stub the parameters its own pickle
-            // declares rather than declining every member that mentions it.
-            if st.get(id).tparams.is_empty() && st.get(id).members.is_empty() {
-                if let Ok(sig) = {
-                    let mut src = BinSource(bin);
-                    self.sigs.class_sig(&mut src, full_name, module)
-                } {
-                    if !sig.tparams.is_empty() {
-                        let tparams: Vec<SymbolId> = sig
-                            .tparams
-                            .iter()
-                            .map(|tp| {
-                                let t =
-                                    st.alloc(&tp.name, id, SymKind::TypeParam, Flags::EMPTY, "");
-                                st.get_mut(t).ty = Type::TypeParam(t);
-                                t
-                            })
-                            .collect();
-                        trace(format_args!(
-                            "gave {full_name} the {} type parameter(s) its pickle declares",
-                            tparams.len()
-                        ));
-                        st.get_mut(id).tparams = tparams;
-                    }
-                }
-            }
+        // A symbol already in the table wins, whatever shape it is in. An
+        // earlier version gave an under-specified one (`scala/collection/Seq`,
+        // entered by `find_or_stub_java_class` with no type parameters) the
+        // parameters its pickle declares, so that `Seq[B]` would match it. That
+        // unlocked `diff` / `intersect` / `union` / `indexOfSlice`, but it also
+        // mutates a symbol the prelude built and the rest of the typer already
+        // reasons about: with `Seq` reshaped, `xs.segmentLength(_ < 3)` and
+        // `xs.scanRight(0)(_ + _)` -- both hand-written prelude members --
+        // stopped resolving. Breaking a member that works is worse than not
+        // supplying one that does not, so the table is left alone.
+        if let Some(id) = crate::classpath::find_by_jvm(st, &key) {
             self.stubs.insert(key, id);
             return Some(id);
         }
