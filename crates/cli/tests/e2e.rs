@@ -3095,3 +3095,36 @@ fn fixtures_option_x2_bad_is_error() {
 fn fixtures_option_x2_needs_scala_library() {
     compile_fails("option_x2", "toList");
 }
+
+#[test]
+fn scala_library_dual_run_try_ops() {
+    dual_run_fixture("try_ops");
+}
+
+#[test]
+fn scala_library_dual_run_try_recover() {
+    dual_run_fixture("try_recover");
+}
+
+#[test]
+fn scala_library_dual_run_try_for() {
+    dual_run_fixture("try_for");
+}
+
+#[test]
+fn fixtures_try_ops_bad_is_error() {
+    compile_fails_lib("try_ops_bad", "noSuchTryMember is not a member");
+}
+
+/// `recover` takes a `PartialFunction`; a total function literal must not
+/// silently pass as one.
+#[test]
+fn fixtures_try_recover_bad_is_error() {
+    compile_fails_lib("try_recover_bad", "required: PartialFunction");
+}
+
+/// `scala.util.Try` is library-ABI only; the private runtime has no such class.
+#[test]
+fn fixtures_try_ops_needs_scala_library() {
+    compile_fails("try_ops", "Try");
+}

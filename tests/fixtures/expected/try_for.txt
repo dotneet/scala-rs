@@ -1,0 +1,6 @@
+Success(11)
+Failure(java.lang.ArithmeticException: / by zero)
+Success(10)
+Failure(java.util.NoSuchElementException: Predicate does not hold for 5)
+Success(30)
+5

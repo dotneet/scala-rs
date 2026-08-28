@@ -215,6 +215,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     };
     add_option_members(st, option_wf, library_abi);
     crate::prelude_either::install_option_core(st);
+    crate::prelude_either::install_java_lang_exceptions(st);
     add_list_members(st, with_filter, iterator, library_abi);
     add_function_types(st);
     add_partial_function(st);

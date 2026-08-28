@@ -724,8 +724,8 @@ fn install_try(st: &mut SymbolTable) {
         st,
         try_c,
         "withFilter",
-        vec![fn1(t_ty, Type::Boolean)],
-        ty_of(wf, vec![twa]),
+        vec![fn1(t_ty.clone(), Type::Boolean)],
+        ty_of(wf, vec![t_ty]),
         Intrinsic::None,
     );
 
@@ -758,4 +758,112 @@ pub fn install_library_abi(st: &mut SymbolTable) {
     install_option_library(st);
     install_either(st);
     install_try(st);
+}
+
+// ---------------------------------------------------------------------------
+// java.lang exceptions
+// ---------------------------------------------------------------------------
+
+/// The `java.lang` exceptions a `Try.recover { case _: ArithmeticException => … }`
+/// needs to name, plus the `(String)` constructor and `getMessage` that every
+/// `Throwable` has. Installed in both modes: these live in the JDK, not in
+/// scala-library.
+pub fn install_java_lang_exceptions(st: &mut SymbolTable) {
+    let java_lang = match st
+        .get(st.root)
+        .members
+        .iter()
+        .copied()
+        .find(|id| st.get(*id).name == "java")
+        .and_then(|java| {
+            st.get(java)
+                .members
+                .iter()
+                .copied()
+                .find(|id| st.get(*id).name == "lang")
+        }) {
+        Some(id) => id,
+        None => return,
+    };
+    let named = |st: &SymbolTable, name: &str| -> SymbolId {
+        st.get(java_lang)
+            .members
+            .iter()
+            .copied()
+            .find(|id| st.get(*id).name == name && st.get(*id).kind == SymKind::Class)
+            .unwrap_or(SymbolId::NONE)
+    };
+
+    let throwable = named(st, "Throwable");
+    if throwable.is_none() {
+        return;
+    }
+    method(
+        st,
+        throwable,
+        "getMessage",
+        vec![],
+        Type::String,
+        Intrinsic::None,
+    );
+    let runtime_ex = named(st, "RuntimeException");
+    let exception = named(st, "Exception");
+    for c in [throwable, exception, runtime_ex] {
+        if !c.is_none() {
+            add_throwable_ctors(st, c);
+        }
+    }
+
+    // (name, parent) — every one of these is in `java.lang`.
+    let parent_of_runtime = if runtime_ex.is_none() {
+        ty_of(throwable, vec![])
+    } else {
+        ty_of(runtime_ex, vec![])
+    };
+    let simple: &[&str] = &[
+        "ArithmeticException",
+        "ClassCastException",
+        "IllegalArgumentException",
+        "IllegalStateException",
+        "IndexOutOfBoundsException",
+        "NullPointerException",
+        "NumberFormatException",
+        "UnsupportedOperationException",
+    ];
+    for name in simple {
+        if !named(st, name).is_none() {
+            continue;
+        }
+        let id = class(
+            st,
+            java_lang,
+            name,
+            &format!("java/lang/{name}"),
+            std::slice::from_ref(&parent_of_runtime),
+        );
+        let f = st.get(id).flags.with(Flags::JAVA);
+        st.get_mut(id).flags = f;
+        add_throwable_ctors(st, id);
+    }
+}
+
+fn add_throwable_ctors(st: &mut SymbolTable, cls: SymbolId) {
+    let self_ty = ty_of(cls, vec![]);
+    let existing: Vec<Vec<Type>> = st
+        .get(cls)
+        .members
+        .iter()
+        .copied()
+        .filter(|id| st.get(*id).name == "<init>")
+        .filter_map(|id| match &st.get(id).ty {
+            Type::Method { paramss, .. } => Some(paramss.first().cloned().unwrap_or_default()),
+            _ => None,
+        })
+        .collect();
+    for params in [Vec::new(), vec![Type::String]] {
+        if existing.contains(&params) {
+            continue;
+        }
+        method(st, cls, "<init>", params, self_ty.clone(), Intrinsic::None);
+    }
 }

@@ -1,0 +1,8 @@
+Success(-1)
+Success(5)
+Failure(java.lang.ArithmeticException: / by zero)
+Success(42)
+Success(5)
+Success(five)
+true
+Success(99)

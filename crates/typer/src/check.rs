@@ -5133,7 +5133,7 @@ impl Typer {
             return false;
         };
         let n = self.st.get(id).name.as_str();
-        n == "WithFilter" || n == "Option$WithFilter"
+        n == "WithFilter" || n == "Option$WithFilter" || n == "Try$WithFilter"
     }
 
     fn is_array_ops_ty(&self, ty: Option<&Type>) -> bool {
@@ -6214,7 +6214,15 @@ impl Typer {
     }
 
     fn type_function(&mut self, vparams: &mut Vec<Tree>, body: &mut Tree, pt: &Type) -> Type {
-        let pf_result = partial_function_type(&self.st, pt);
+        // Only a `{ case … }` literal inhabits a `PartialFunction`; the parser
+        // encodes one as `x$pf => x$pf match { … }`. A total function literal
+        // must still be rejected, the way nsc rejects
+        // `t.recover((x: Int) => x + 1)`.
+        let pf_result = if is_case_block_literal(vparams, body) {
+            partial_function_type(&self.st, pt)
+        } else {
+            None
+        };
         let sam = if pf_result.is_none() {
             self.st.sam_sig(pt)
         } else {
@@ -9108,6 +9116,16 @@ fn is_function_pt(pt: &Type) -> bool {
 fn is_right_biased_either(name: &str) -> bool {
     matches!(name, "Either" | "Left" | "Right")
 }
+
+/// The parser desugars `{ case … }` into `x$pf => x$pf match { case … }`.
+fn is_case_block_literal(vparams: &[Tree], body: &Tree) -> bool {
+    vparams.len() == 1
+        && vparams[0].name() == Some(PF_PARAM)
+        && matches!(&body.kind, TreeKind::Match { .. })
+}
+
+/// Name the parser gives the synthesized parameter of a `{ case … }` literal.
+const PF_PARAM: &str = "x$pf";
 
 fn is_partial_function_sym(st: &SymbolTable, id: SymbolId) -> bool {
     if id.is_none() {
