@@ -178,7 +178,21 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
                 Type::Any
             }
         }
-        Type::TypeParam(_) | Type::TypeMember(_) => Type::Any,
+        // nsc: a type parameter erases to the erasure of its upper bound.
+        Type::TypeParam(_) => {
+            let hi = st.widen_type_param(ty);
+            if matches!(hi, Type::TypeParam(_)) {
+                Type::Any
+            } else {
+                let e = erase_ty(&hi, st);
+                if is_primitive(&e) {
+                    Type::Any
+                } else {
+                    e
+                }
+            }
+        }
+        Type::TypeMember(_) => Type::Any,
         Type::Applied { ctor, .. } => erase_ty(ctor, st),
         Type::Wildcard | Type::BoundedWildcard { .. } => Type::Any,
         Type::Constant(lit) => Type::lit_underlying(lit),

@@ -315,6 +315,24 @@ impl SymbolTable {
         out
     }
 
+    /// nsc: a type parameter stands for its upper bound when its members are
+    /// looked up (`def f[A <: Comparable[A]](x: A) = x.compareTo(...)`).
+    /// Unbounded parameters are left alone so the caller still sees `A`.
+    pub fn widen_type_param(&self, ty: &Type) -> Type {
+        let mut t = ty.clone();
+        for _ in 0..8 {
+            let Type::TypeParam(id) = &t else { break };
+            match self.get(*id).bound_hi.clone() {
+                Some(hi) => t = hi,
+                None => return ty.clone(),
+            }
+        }
+        if matches!(t, Type::TypeParam(_)) {
+            return ty.clone();
+        }
+        t
+    }
+
     pub fn class_sym_of(&self, ty: &Type) -> Option<SymbolId> {
         match ty {
             Type::Class { sym, .. } | Type::ModuleRef(sym) => Some(*sym),

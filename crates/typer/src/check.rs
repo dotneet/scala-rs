@@ -439,7 +439,7 @@ impl Typer {
 
     fn enter_tparams(&mut self, tparams: &mut [Tree], owner: SymbolId) -> Vec<SymbolId> {
         let mut ids = Vec::new();
-        for tp in tparams {
+        for tp in tparams.iter_mut() {
             let name = tp.name().unwrap_or("_").to_string();
             let flags = match &tp.kind {
                 TreeKind::TypeDef { mods, .. } => mods.flags,
@@ -462,6 +462,29 @@ impl Typer {
                 if !inner.is_empty() {
                     let inner_ids = self.enter_tparams(inner, id);
                     self.st.get_mut(id).tparams = inner_ids;
+                }
+            }
+        }
+        // Bounds resolve after every parameter is in scope, so F-bounded
+        // `A <: Comparable[A]` sees `A`.
+        for tp in tparams.iter() {
+            let TreeKind::TypeDef { lo, hi, .. } = &tp.kind else {
+                continue;
+            };
+            let id = tp.sym;
+            if id.is_none() {
+                continue;
+            }
+            if let Some(t) = lo {
+                let ty = self.tree_to_type(t);
+                if !ty.is_error() {
+                    self.st.get_mut(id).bound_lo = Some(ty);
+                }
+            }
+            if let Some(t) = hi {
+                let ty = self.tree_to_type(t);
+                if !ty.is_error() {
+                    self.st.get_mut(id).bound_hi = Some(ty);
                 }
             }
         }
@@ -3327,7 +3350,9 @@ impl Typer {
             tree.ty = Type::Error;
             return;
         }
-        let refined_term = match &qual.ty {
+        // nsc: `x.m` on `x: A` where `A <: T` resolves against `T`.
+        let mut recv_ty = self.st.widen_type_param(&qual.ty);
+        let refined_term = match &recv_ty {
             Type::Refined { decls, .. } => {
                 let from_term = decls.iter().any(|d| {
                     matches!(
@@ -3346,13 +3371,13 @@ impl Typer {
             _ => None,
         };
         if let Some(mty) = refined_term {
-            let mty = self.st.expand_in_type(&qual.ty, &mty);
+            let mty = self.st.expand_in_type(&recv_ty, &mty);
             tree.ty = self.maybe_auto_apply(mty, pt);
             return;
         }
         // String concatenation via any2stringadd: handled at Apply of +
         let mut found = Vec::new();
-        if let Type::Refined { parents, .. } = &qual.ty {
+        if let Type::Refined { parents, .. } = &recv_ty {
             for p in parents {
                 if let Some(o) = self.st.class_sym_of(p) {
                     found.extend(self.st.lookup_member(o, &name));
@@ -3360,9 +3385,9 @@ impl Typer {
             }
         }
         if found.is_empty() {
-            if let Some(o) = self.st.class_sym_of(&qual.ty) {
+            if let Some(o) = self.st.class_sym_of(&recv_ty) {
                 found = self.st.lookup_member(o, &name);
-                if found.is_empty() && matches!(&qual.ty, Type::Class { .. } | Type::ModuleRef(_)) {
+                if found.is_empty() && matches!(&recv_ty, Type::Class { .. } | Type::ModuleRef(_)) {
                     // `asList(...).size()`: the receiver type is a Java stub until
                     // the classfile is completed. `qual.sym` is the method, not List.
                     // Skip `Type::String` / primitives so StringOps / RichChar views
@@ -3374,7 +3399,7 @@ impl Typer {
         }
         // Module: members of module class
         if found.is_empty() {
-            if let Type::ModuleRef(id) = &qual.ty {
+            if let Type::ModuleRef(id) = &recv_ty {
                 found = self.st.lookup_member(*id, &name);
             }
         }
@@ -3387,7 +3412,7 @@ impl Typer {
             found = self.st.lookup_member(self.st.any_sym, "toString");
         }
         if found.is_empty() {
-            if let Some((conv, member, to)) = self.search_extension(&qual.ty, &name, tree.span) {
+            if let Some((conv, member, to)) = self.search_extension(&recv_ty, &name, tree.span) {
                 let span = qual.span;
                 let old = std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty));
                 let fun = self.ref_implicit(conv, span);
@@ -3407,6 +3432,9 @@ impl Typer {
                 } else {
                     vec![member]
                 };
+                // The member now belongs to the conversion's result, so
+                // substitution must see `to`, not the original receiver.
+                recv_ty = to.clone();
             }
         }
         if found.is_empty() && self.is_dynamic_receiver(&qual.ty) {
@@ -3458,13 +3486,13 @@ impl Typer {
         if !terms.is_empty() {
             found = terms;
         }
-        let subst_args: Vec<Type> = match &qual.ty {
+        let subst_args: Vec<Type> = match &recv_ty {
             Type::Class { args, .. } => args.clone(),
             Type::Tuple(ts) => ts.clone(),
             _ => Vec::new(),
         };
         let subst = |ty: Type| -> Type {
-            let ty = self.st.subst_as_seen_from(&qual.ty, &ty);
+            let ty = self.st.subst_as_seen_from(&recv_ty, &ty);
             if !subst_args.is_empty() {
                 if let Some(owner) = found.first().map(|s| self.st.get(*s).owner) {
                     return self.st.subst_tparams(owner, &subst_args, &ty);
@@ -3472,7 +3500,7 @@ impl Typer {
             }
             ty
         };
-        let expand = |ty: Type| -> Type { self.st.expand_in_type(&qual.ty, &ty) };
+        let expand = |ty: Type| -> Type { self.st.expand_in_type(&recv_ty, &ty) };
         if found.len() == 1 {
             let s = found[0];
             tree.sym = s;
