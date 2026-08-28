@@ -2060,7 +2060,15 @@ impl Typer {
                     }
                 }
                 if !p.sym.is_none() {
-                    self.st.get_mut(p.sym).ty = p.ty.clone();
+                    // nsc: `xs: T*` is a `Seq[T]` inside the body; the method
+                    // type keeps `Repeated` so call sites still wrap arguments.
+                    let sym_ty = match &p.ty {
+                        Type::Repeated(inner) => self
+                            .seq_of(inner)
+                            .unwrap_or_else(|| Type::Repeated(inner.clone())),
+                        other => other.clone(),
+                    };
+                    self.st.get_mut(p.sym).ty = sym_ty;
                     if let TreeKind::ValDef { mods, rhs, .. } = &p.kind {
                         if mods.flags.contains(Flags::DEFAULTPARAM) && !rhs.is_empty() {
                             self.st.get_mut(p.sym).default_rhs = Some((**rhs).clone());
@@ -2964,6 +2972,18 @@ impl Typer {
             }
             TreeKind::Typed { expr, tpt } => {
                 let ascr = self.tree_to_type(tpt);
+                // `xs: _*` passes the sequence straight through to a repeated
+                // parameter instead of wrapping the argument list.
+                if matches!(ascr, Type::Repeated(_)) {
+                    self.type_expr(expr, &Type::NoType);
+                    let elem = match &expr.ty {
+                        Type::Class { args, .. } if !args.is_empty() => args[0].clone(),
+                        Type::Array(t) => (**t).clone(),
+                        _ => Type::Any,
+                    };
+                    tree.ty = Type::Repeated(Box::new(elem));
+                    return;
+                }
                 let pt_inner = peel_empty_annot(&ascr);
                 self.type_expr(expr, &pt_inner);
                 if !pt_inner.is_no_type() {
@@ -5521,6 +5541,14 @@ impl Typer {
         let first = paramss_ids.first().cloned().unwrap_or_default();
         if args.len() < first.len() {
             let rest = first[args.len()..].to_vec();
+            // A repeated parameter accepts zero arguments (`count()`).
+            if rest.len() == 1
+                && param_tys
+                    .last()
+                    .is_some_and(|t| matches!(t, Type::Repeated(_)))
+            {
+                return None;
+            }
             let all_implicit = rest
                 .iter()
                 .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT));
@@ -6311,9 +6339,27 @@ impl Typer {
         Some(s)
     }
 
+    /// `Seq[T]` for a repeated parameter's element type, when the prelude has
+    /// `Seq` (it does in both modes).
+    fn seq_of(&self, elem: &Type) -> Option<Type> {
+        let sym = self
+            .st
+            .lookup("Seq")
+            .into_iter()
+            .find(|s| self.st.get(*s).kind == SymKind::Class)?;
+        Some(Type::Class {
+            sym,
+            args: vec![elem.clone()],
+        })
+    }
+
     fn arg_score(&self, arg: &Type, param: &Type) -> Option<i32> {
         if let Type::ByName(inner) = param {
             return self.arg_score(arg, inner);
+        }
+        // A `xs: _*` argument is already the sequence the parameter wants.
+        if let Type::Repeated(inner) = arg {
+            return self.arg_score(inner, param);
         }
         if let Type::Repeated(inner) = param {
             return self.arg_score(arg, inner);
@@ -8421,6 +8467,10 @@ impl Typer {
             return;
         }
         if pt.is_no_type() || tree.ty.is_error() || pt.is_error() {
+            return;
+        }
+        // `xs: _*` is already the sequence a repeated parameter takes.
+        if matches!(tree.ty, Type::Repeated(_)) {
             return;
         }
         self.complete_java_type(&tree.ty, tree.span);

@@ -1752,11 +1752,19 @@ impl<'a> Pickler<'a> {
             _ => (vec![], Type::Unit),
         };
         let params: Vec<(String, Type, Flags)> = if !s.params.is_empty() {
+            let sig: Vec<Type> = paramss.iter().flatten().cloned().collect();
             s.params
                 .iter()
-                .map(|p| {
+                .enumerate()
+                .map(|(i, p)| {
                     let ps = self.st.get(*p);
-                    (ps.name.clone(), ps.ty.clone(), ps.flags)
+                    // A repeated parameter is a `Seq` on its symbol (that is
+                    // its type in the body) but pickles as `<repeated>`.
+                    let ty = match sig.get(i) {
+                        Some(t @ Type::Repeated(_)) => t.clone(),
+                        _ => ps.ty.clone(),
+                    };
+                    (ps.name.clone(), ty, ps.flags)
                 })
                 .collect()
         } else {

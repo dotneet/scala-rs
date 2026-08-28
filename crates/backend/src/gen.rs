@@ -7844,7 +7844,15 @@ fn gen_call_args(
         Type::Repeated(t) => t.as_ref(),
         _ => &Type::Any,
     };
-    if java_varargs {
+    // `f(xs: _*)` already has the sequence; nothing to wrap.
+    let spliced = var_args.len() == 1 && matches!(var_args[0].ty, Type::Repeated(_));
+    if spliced {
+        let inner = match &var_args[0].kind {
+            TreeKind::Typed { expr, .. } => expr.as_ref(),
+            _ => &var_args[0],
+        };
+        gen_expr(asm, frame, ctx, inner);
+    } else if java_varargs {
         gen_java_varargs_array(asm, frame, ctx, var_args, elem);
     } else {
         gen_wrap_varargs(asm, frame, ctx, var_args, elem);

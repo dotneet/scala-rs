@@ -208,3 +208,23 @@ fn case_class_copy_runs() {
 fn case_class_copy_rejects_unknown_parameter() {
     compile_fails("case_copy_bad", "no parameter named");
 }
+
+/// A repeated parameter is a `Seq` in the body; the sequence types come from
+/// the library ABI.
+#[test]
+fn varargs_run() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let out = compile_with("varargs", &["--scala-library", jar.to_str().unwrap()]);
+    assert_eq!(run_java(&out, Some(&jar)), expected_stdout("varargs"));
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn varargs_parameter_is_a_seq() {
+    compile_fails("varargs_bad", "nosuchmember");
+}
