@@ -17,6 +17,12 @@ pub enum ImplicitSearch {
     Ambiguous(Vec<SymbolId>),
 }
 
+impl ImplicitSearch {
+    pub(crate) fn is_found(&self) -> bool {
+        matches!(self, ImplicitSearch::Found(_))
+    }
+}
+
 impl Typer {
     pub(crate) fn implicits_in_scope(&self) -> Vec<SymbolId> {
         let mut out = Vec::new();
@@ -202,20 +208,74 @@ impl Typer {
     }
 
     fn implicit_provides(&self, id: SymbolId, pt: &Type) -> bool {
+        self.implicit_provides_at(id, pt, 0)
+    }
+
+    /// Every parameter clause is implicit, so the candidate is usable as long
+    /// as its own implicits resolve (`implicit def listShow[A](implicit s:
+    /// Show[A]): Show[List[A]]`).
+    fn only_implicit_clauses(&self, id: SymbolId) -> bool {
+        let s = self.st.get(id);
+        s.paramss.iter().all(|c| {
+            c.iter()
+                .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
+        }) && (!s.paramss.is_empty() || s.params.is_empty())
+    }
+
+    fn implicit_provides_at(&self, id: SymbolId, pt: &Type, depth: usize) -> bool {
         let s = self.st.get(id);
         if !s.flags.contains(Flags::IMPLICIT) {
             return false;
         }
         match &s.ty {
             Type::Method { paramss, ret } => {
-                let empty = paramss.iter().all(|c| c.is_empty());
-                empty && self.implicit_result_conforms(ret, pt)
+                if paramss.iter().all(|c| c.is_empty()) {
+                    return self.implicit_result_matches(id, ret, pt);
+                }
+                // A derivation rule: usable when its own implicits resolve.
+                if depth >= 8 || !self.only_implicit_clauses(id) {
+                    return false;
+                }
+                if !self.implicit_result_matches(id, ret, pt) {
+                    return false;
+                }
+                let Some(args) = self.implicit_targs(id, ret, pt) else {
+                    return false;
+                };
+                let tps = self.st.get(id).tparams.clone();
+                paramss.iter().flatten().all(|p| {
+                    let want = crate::symbol::subst_tparams_slice(&tps, &args, p);
+                    self.search_implicit_at(&want, depth + 1).is_found()
+                })
             }
             Type::Function { params, ret } if params.is_empty() => {
                 self.implicit_result_conforms(ret, pt)
             }
             t => self.implicit_result_conforms(t, pt),
         }
+    }
+
+    /// Solve a candidate's type parameters from its result against the wanted
+    /// type: `Show[List[A]]` against `Show[List[Int]]` gives `A = Int`.
+    pub(crate) fn implicit_targs(&self, id: SymbolId, ret: &Type, pt: &Type) -> Option<Vec<Type>> {
+        let tps = self.st.get(id).tparams.clone();
+        let mut args = Vec::with_capacity(tps.len());
+        for tp in &tps {
+            args.push(crate::check::unify_one(*tp, ret, pt)?);
+        }
+        Some(args)
+    }
+
+    fn implicit_result_matches(&self, id: SymbolId, ret: &Type, pt: &Type) -> bool {
+        let tps = self.st.get(id).tparams.clone();
+        if tps.is_empty() {
+            return self.implicit_result_conforms(ret, pt);
+        }
+        let Some(args) = self.implicit_targs(id, ret, pt) else {
+            return false;
+        };
+        let inst = crate::symbol::subst_tparams_slice(&tps, &args, ret);
+        self.implicit_result_conforms(&inst, pt)
     }
 
     /// ClassTag is invariant. Covariant `is_sub_type` would let
@@ -271,10 +331,14 @@ impl Typer {
     }
 
     pub(crate) fn search_implicit(&self, pt: &Type) -> ImplicitSearch {
+        self.search_implicit_at(pt, 0)
+    }
+
+    pub(crate) fn search_implicit_at(&self, pt: &Type, depth: usize) -> ImplicitSearch {
         let local: Vec<SymbolId> = self
             .implicits_in_scope()
             .into_iter()
-            .filter(|id| self.implicit_provides(*id, pt))
+            .filter(|id| self.implicit_provides_at(*id, pt, depth))
             .collect();
         if !local.is_empty() {
             return self.most_specific(local);
@@ -282,7 +346,7 @@ impl Typer {
         let mut comps: Vec<SymbolId> = self
             .companion_implicits(pt)
             .into_iter()
-            .filter(|id| self.implicit_provides(*id, pt))
+            .filter(|id| self.implicit_provides_at(*id, pt, depth))
             .collect();
         comps.sort_by_key(|id| id.0);
         comps.dedup();

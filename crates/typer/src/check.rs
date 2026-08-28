@@ -279,23 +279,28 @@ impl Typer {
     }
 
     fn jvm_for_current(&self, name: &str) -> String {
-        let ow = self.st.get(self.st.owner);
-        if ow.kind == SymKind::Package
-            && ow.name != "<_root_>"
-            && !ow.jvm_name.is_empty()
-            && ow.jvm_name != "scala/runtime"
-        {
-            format!("{}/{}", ow.jvm_name, name)
-        } else if ow.kind == SymKind::Package {
-            name.to_string()
-        } else {
-            let base = ow.jvm_name.trim_end_matches('$');
-            if base.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}${}", base, name)
+        // A class defined inside a method (`new S { … }`) has the method as
+        // its owner; nsc still names it after the enclosing class.
+        let mut owner = self.st.owner;
+        while !owner.is_none() {
+            let ow = self.st.get(owner);
+            if ow.kind == SymKind::Package {
+                return if ow.name != "<_root_>"
+                    && !ow.jvm_name.is_empty()
+                    && ow.jvm_name != "scala/runtime"
+                {
+                    format!("{}/{}", ow.jvm_name, name)
+                } else {
+                    name.to_string()
+                };
             }
+            let base = ow.jvm_name.trim_end_matches('$');
+            if !base.is_empty() {
+                return format!("{base}${name}");
+            }
+            owner = ow.owner;
         }
+        name.to_string()
     }
 
     fn ensure_companion(&mut self, name: &str, class_id: SymbolId) -> SymbolId {
@@ -1618,6 +1623,11 @@ impl Typer {
             for m in self.st.get(pid).members.clone() {
                 let n = self.st.get(m).name.clone();
                 if n.ends_with('$') || n == "<init>" {
+                    continue;
+                }
+                // A parent's type parameters are not inherited names; entering
+                // them shadows an enclosing `A` of the same name.
+                if self.st.get(m).kind == SymKind::TypeParam {
                     continue;
                 }
                 self.st.enter_in_current(&n, m);
@@ -5764,6 +5774,67 @@ impl Typer {
         }
     }
 
+    /// The tree for a resolved implicit. A derivation rule
+    /// (`implicit def listShow[A](implicit s: Show[A]): Show[List[A]]`) is
+    /// applied to its own implicits, which are resolved the same way.
+    fn implicit_tree(&mut self, id: SymbolId, pt: &Type, span: Span, depth: usize) -> Tree {
+        let (paramss, ret) = match self.st.get(id).ty.clone() {
+            Type::Method { paramss, ret } => (paramss, (*ret).clone()),
+            _ => return self.ref_implicit(id, span),
+        };
+        if paramss.iter().all(|c| c.is_empty()) || depth >= 8 {
+            return self.ref_implicit(id, span);
+        }
+        let tps = self.st.get(id).tparams.clone();
+        let targs = self.implicit_targs(id, &ret, pt).unwrap_or_default();
+        let inst = |t: &Type| -> Type {
+            if targs.len() == tps.len() && !tps.is_empty() {
+                crate::symbol::subst_tparams_slice(&tps, &targs, t)
+            } else {
+                t.clone()
+            }
+        };
+        let mut tree = Tree {
+            id: scala_rs_parser::NodeId(0),
+            span,
+            kind: TreeKind::Ident {
+                name: self.st.get(id).name.clone(),
+            },
+            ty: inst(&ret),
+            sym: id,
+            postfix: false,
+        };
+        for clause in &paramss {
+            let mut cargs = Vec::with_capacity(clause.len());
+            for p in clause {
+                let want = inst(p);
+                match self.search_implicit(&want) {
+                    ImplicitSearch::Found(inner) => {
+                        cargs.push(self.implicit_tree(inner, &want, span, depth + 1))
+                    }
+                    _ => {
+                        self.error(span, self.missing_implicit_message(&want));
+                        return tree;
+                    }
+                }
+            }
+            let ty = tree.ty.clone();
+            tree = Tree {
+                id: scala_rs_parser::NodeId(0),
+                span,
+                kind: TreeKind::Apply {
+                    fun: Box::new(tree),
+                    args: cargs,
+                },
+                ty,
+                sym: id,
+                postfix: false,
+            };
+        }
+        tree.ty = inst(&ret);
+        tree
+    }
+
     fn fill_implicit_params(
         &mut self,
         span: Span,
@@ -5778,7 +5849,7 @@ impl Typer {
                 .unwrap_or_else(|| self.st.get(*pid).ty.clone());
             match self.search_implicit(&pty) {
                 ImplicitSearch::Found(id) => {
-                    let mut r = self.ref_implicit(id, span);
+                    let mut r = self.implicit_tree(id, &pty, span, 0);
                     self.adapt(&mut r, &pty);
                     args.push(r);
                 }
@@ -10059,7 +10130,7 @@ fn still_raw_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
     }
 }
 
-fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
+pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
     if let Type::Annotated { tpe, .. } = actual {
         return unify_one(tp, pattern, tpe);
     }

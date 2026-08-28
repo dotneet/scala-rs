@@ -247,3 +247,13 @@ fn qualified_package_paths_run() {
 fn qualified_package_path_rejects_unknown_member() {
     compile_fails("pkg_path_bad", "NoSuchThing");
 }
+
+#[test]
+fn typeclass_instances_run() {
+    run_both("typeclass");
+}
+
+#[test]
+fn missing_typeclass_instance_is_an_error() {
+    compile_fails("typeclass_bad", "no implicit");
+}

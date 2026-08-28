@@ -2735,21 +2735,30 @@ impl<'a> Gen<'a> {
                 if parent_params.len() != child_params.len() {
                     continue;
                 }
-                let ret = method_ret_from_sym(self.st, pmid);
+                let parent_ret = method_ret_from_sym(self.st, pmid);
+                let child_ret = method_ret_from_sym(self.st, *cid);
+                // `Show[Int]`'s `show(Object)` must unbox before calling
+                // `show(int)`, and box the result back when the parent's
+                // return erases to a reference.
+                let box_ret = is_jvm_primitive(&child_ret)
+                    && !is_unit_like(&child_ret)
+                    && !is_jvm_primitive(&parent_ret);
                 let mut locals = 1u16;
                 let mut loads = Vec::new();
-                let mut casts = Vec::new();
+                let mut adapts: Vec<Option<Type>> = Vec::new();
                 for (pty, cty) in parent_params.iter().zip(child_params.iter()) {
                     let sort = jvm_sort(pty);
                     loads.push((locals, sort));
-                    let cast = if jvm_desc(self.st, pty) != jvm_desc(self.st, cty) {
-                        checkcast_internal(self.st, cty)
+                    let adapt = if jvm_desc(self.st, pty) != jvm_desc(self.st, cty) {
+                        Some(cty.clone())
                     } else {
                         None
                     };
-                    casts.push(cast);
+                    adapts.push(adapt);
                     locals += sort.slots();
                 }
+                let ret = parent_ret;
+                let st = self.st;
                 let name = ps.name.clone();
                 let pdesc_c = pdesc.clone();
                 let cdesc_c = cdesc.clone();
@@ -2763,11 +2772,14 @@ impl<'a> Gen<'a> {
                         asm.aload(0);
                         for (i, (slot, sort)) in loads.iter().enumerate() {
                             load(asm, *slot, *sort);
-                            if let Some(cn) = casts.get(i).and_then(|c| c.as_deref()) {
-                                asm.checkcast(cn);
+                            if let Some(cty) = adapts.get(i).and_then(|c| c.as_ref()) {
+                                emit_from_erased_object(asm, st, cty);
                             }
                         }
                         asm.invokevirtual(&class_c, &name, &cdesc_c);
+                        if box_ret {
+                            emit_box(asm, &child_ret);
+                        }
                         emit_return(asm, &ret);
                     },
                 );
