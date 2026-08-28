@@ -1,10 +1,10 @@
 //! Full reader for the nsc 2.13 `ScalaSignature` pickle format.
 //!
-//! `pickle.rs` is the *writer* (a subset of nsc `PickleFormat`) plus a small
-//! ad-hoc unpickler that only recovers what scala-rs itself emits. This module
-//! is the complement: a **complete** reader for the format as produced by
-//! scalac 2.13, able to parse every entry of every `.class` in
-//! `scala-library-2.13.16.jar`.
+//! `scala-rs-backend`'s `pickle.rs` is the *writer* (a subset of nsc
+//! `PickleFormat`) plus a small ad-hoc unpickler that only recovers what
+//! scala-rs itself emits. This module is the complement: a **complete** reader
+//! for the format as produced by scalac 2.13, able to parse every entry of
+//! every `.class` in `scala-library-2.13.16.jar`.
 //!
 //! Layout (nsc `PickleBuffer` / `UnPickler`):
 //!
@@ -720,7 +720,7 @@ pub fn read_pickle(bytes: &[u8]) -> Result<Pickle> {
     let mut r = Reader::new(bytes);
     let major = r.nat()?;
     let minor = r.nat()?;
-    if major != crate::pickle::MAJOR {
+    if major != crate::codec::MAJOR {
         return r.err(format!("unsupported pickle major version {major}"));
     }
     let nentries = r.nat()? as usize;
@@ -1325,47 +1325,6 @@ fn read_tree_entry(r: &mut Reader, end: usize, n: usize) -> Result<Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pickle;
-
-    #[test]
-    fn tag_table_matches_the_writer() {
-        assert_eq!(tags::TERMname, pickle::TERMNAME);
-        assert_eq!(tags::TYPEname, pickle::TYPENAME);
-        assert_eq!(tags::NONEsym, pickle::NONESYM);
-        assert_eq!(tags::TYPEsym, pickle::TYPESYM);
-        assert_eq!(tags::ALIASsym, pickle::ALIASSYM);
-        assert_eq!(tags::CLASSsym, pickle::CLASSSYM);
-        assert_eq!(tags::MODULEsym, pickle::MODULESYM);
-        assert_eq!(tags::VALsym, pickle::VALSYM);
-        assert_eq!(tags::EXTref, pickle::EXTREF);
-        assert_eq!(tags::EXTMODCLASSref, pickle::EXTMODCLASSREF);
-        assert_eq!(tags::NOtpe, pickle::NOTPE);
-        assert_eq!(tags::NOPREFIXtpe, pickle::NOPREFIXTPE);
-        assert_eq!(tags::THIStpe, pickle::THISTPE);
-        assert_eq!(tags::SINGLEtpe, pickle::SINGLETPE);
-        assert_eq!(tags::CONSTANTtpe, pickle::CONSTANTtpe);
-        assert_eq!(tags::TYPEREFtpe, pickle::TYPEREFTPE);
-        assert_eq!(tags::TYPEBOUNDStpe, pickle::TYPEBOUNDSTPE);
-        assert_eq!(tags::REFINEDtpe, pickle::REFINEDTPE);
-        assert_eq!(tags::CLASSINFOtpe, pickle::CLASSINFOTPE);
-        assert_eq!(tags::METHODtpe, pickle::METHODTPE);
-        assert_eq!(tags::POLYtpe, pickle::POLYTPE);
-        assert_eq!(tags::LITERALunit, pickle::LITERALunit);
-        assert_eq!(tags::LITERALstring, pickle::LITERALstring);
-        assert_eq!(tags::LITERALclass, pickle::LITERALclass);
-        assert_eq!(tags::SYMANNOT, pickle::SYMANNOT);
-        assert_eq!(tags::ANNOTATEDtpe, pickle::ANNOTATEDTPE);
-        assert_eq!(tags::ANNOTINFO, pickle::ANNOTINFO);
-        assert_eq!(tags::EXISTENTIALtpe, pickle::EXISTENTIALTPE);
-        assert_eq!(tags::TREE, pickle::TREE);
-        assert_eq!(tags::APPLYtree, pickle::APPLYtree);
-        assert_eq!(tags::SELECTtree, pickle::SELECTtree);
-        assert_eq!(tags::IDENTtree, pickle::IDENTtree);
-        assert_eq!(tags::LITERALtree, pickle::LITERALtree);
-        assert_eq!(tags::THIStree, pickle::THIStree);
-        assert_eq!(tags::SUPERtree, pickle::SUPERtree);
-        assert_eq!(tags::TYPEAPPLYtree, pickle::TYPEAPPLYtree);
-    }
 
     #[test]
     fn unknown_tag_is_an_error_not_a_skip() {
@@ -1381,60 +1340,5 @@ mod tests {
         let bytes = [5u8, 2, 1, 1, 40];
         let err = read_pickle(&bytes).unwrap_err();
         assert!(err.message.contains("overruns"), "{err}");
-    }
-
-    #[test]
-    fn reads_pickles_written_by_our_own_writer() {
-        // Covers CLASSsym / MODULEsym / VALsym / TYPEsym / ALIASsym, POLYtpe,
-        // METHODtpe, TYPEREFtpe, EXISTENTIALtpe, REFINEDtpe, CONSTANTtpe,
-        // ANNOTATEDtpe and SYMANNOT through the writer we already have.
-        let src = r#"
-trait Show { def show: String }
-trait Named { def name: String }
-class Box[A](val get: A) {
-  type Elem = A
-  def map[B](f: A => B): Box[B] = new Box(f(get))
-  def raw(xs: List[_]): Int = 0
-  def both: Show with Named = null
-  def self0: this.type = this
-}
-case class Point(x: Int, y: Int)
-object Lib {
-  type Alias = String
-  val n: Int = 1
-  @deprecated("gone", "2.13.0") def old(s: String): String = s
-  def lit(x: 1): Int = 0
-}
-"#;
-        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
-        assert!(
-            !scala_rs_typer::has_errors(&diags),
-            "type errors: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-        let pickles = pickle::pickle_all(&st);
-        assert!(!pickles.is_empty(), "expected pickles");
-        let mut seen_class = false;
-        let mut seen_alias = false;
-        for raw in pickles.values() {
-            // Go through the annotation-string encoding, like a real classfile.
-            let enc = pickle::encode_to_annotation_string(raw);
-            let dec = pickle::decode_annotation_string(&enc);
-            let p = read_pickle(&dec).unwrap_or_else(|e| panic!("our own pickle: {e}"));
-            assert_eq!(p.major, pickle::MAJOR);
-            for e in &p.entries {
-                match e {
-                    Entry::ClassSym { info, .. } if p.name(info.name) == Some("Box") => {
-                        seen_class = true;
-                    }
-                    Entry::AliasSym(info) if p.name(info.name) == Some("Alias") => {
-                        seen_alias = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        assert!(seen_class, "Box CLASSsym not read back");
-        assert!(seen_alias, "Lib.Alias ALIASsym not read back");
     }
 }

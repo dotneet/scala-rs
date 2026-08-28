@@ -98,6 +98,9 @@ pub struct Typer {
     language_implicit_conversions: bool,
     binary: BinaryIndex,
     completed_java: HashSet<String>,
+    /// Fills library members the hand-written prelude does not declare, from
+    /// their `ScalaSignature` pickles. Only consulted when resolution failed.
+    pickle: crate::pickle_supply::PickleSupply,
 }
 
 pub fn typecheck(tree: &mut Tree, file_index: usize) -> (SymbolTable, Vec<Diagnostic>) {
@@ -138,6 +141,7 @@ impl Typer {
             ),
             binary: BinaryIndex::from_user_paths(opts.binary_path.clone()),
             completed_java: HashSet::new(),
+            pickle: crate::pickle_supply::PickleSupply::new(),
         }
     }
 
@@ -3507,6 +3511,12 @@ impl Typer {
             }
             self.rewrite_select_dynamic(tree, pt);
             return;
+        }
+        if found.is_empty() {
+            // Last resort: the hand-written prelude does not declare it, so
+            // ask the library's own pickle. Nothing above has matched, so this
+            // can only add members, never shadow one.
+            found = self.supply_from_pickle(&recv_ty, &name);
         }
         if found.is_empty() {
             self.error(
@@ -8478,6 +8488,25 @@ impl Typer {
                 self.ensure_java_loaded(s, span);
             }
         }
+    }
+
+    /// Install `name` on the receiver's class from the library `ScalaSignature`
+    /// and return whatever that made visible. Empty unless the receiver is a
+    /// standard-library class *and* the member could be expressed faithfully.
+    fn supply_from_pickle(&mut self, recv_ty: &Type, name: &str) -> Vec<SymbolId> {
+        if !self.library_abi {
+            return Vec::new();
+        }
+        let Some(cls) = self.st.class_sym_of(recv_ty) else {
+            return Vec::new();
+        };
+        if !self
+            .pickle
+            .complete(&mut self.st, &mut self.binary, cls, name)
+        {
+            return Vec::new();
+        }
+        self.st.lookup_member(cls, name)
     }
 
     pub(crate) fn ensure_java_loaded(&mut self, class_id: SymbolId, span: Span) {

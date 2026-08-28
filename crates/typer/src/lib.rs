@@ -5,6 +5,7 @@ mod implicits;
 mod javaclass;
 mod javasign;
 mod lambda_lift;
+mod pickle_supply;
 mod prelude;
 mod prelude_coll;
 mod prelude_either;

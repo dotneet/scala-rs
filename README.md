@@ -260,51 +260,121 @@ Cargo workspace のクレート:
 | `scala-rs-span` | ソース位置と診断 |
 | `scala-rs-lexer` | 字句解析（セミコロン推論用の改行トークン、`s`/`f`/`raw"..."` のモードスタック） |
 | `scala-rs-parser` | 再帰下降パーサ。AST は nsc の `Tree` に近い |
+| `scala-rs-pickle` | nsc `ScalaSignature` pickle のリーダ。`typer` と `backend` の両方が使う |
 | `scala-rs-typer` | namer + typer + uncurry + lambda-lift + erasure。implicit 探索を含む |
 | `scala-rs-backend` | JVM classfile 出力（major 52 / StackMapTable）と scala-rs ランタイム |
 | `scala-rs-driver` | パイプライン駆動 |
 | `scala-rs-cli` | コマンドライン。バイナリ名 `scala-rs` |
 
-### ScalaSignature からのシンボル自動供給（pickle リーダ）
+### ScalaSignature からのシンボル自動供給
 
-標準ライブラリのメンバは現在 `crates/typer/src/prelude*.rs` に手書きしています。
+標準ライブラリのメンバは長らく `crates/typer/src/prelude*.rs` に手書きしてきました。
 2.13 互換に到達するにはこの方式では足りないので、
 **scala-library の classfile に埋まっている `ScalaSignature`（nsc PickleFormat）を読んで
-シンボルを自動供給する**経路を作っています。現状は次の 2 層まで実装済みです。
+シンボルを自動供給する**経路を入れました。手書き prelude と併存し、
+**prelude に無いメンバだけをオンデマンドで補完**します。
 
 | モジュール | 役割 |
 | --- | --- |
+| `crates/pickle/src/codec.rs` | SID-10 ByteCodecs（ライタと共用） |
+| `crates/pickle/src/classfile.rs` | `ScalaSignature` に届くだけの classfile 解析。`ScalaLongSignature`（配列値）も扱う |
+| `crates/pickle/src/read.rs` | pickle **リーダ**。バイト列 → エントリ表 |
+| `crates/pickle/src/sym.rs` | エントリ表 → クラスシグネチャ。親を辿り、型引数を代入して解決 |
+| `crates/typer/src/pickle_supply.rs` | `SigType` → `scala_rs_parser::Type`、`SymbolTable` への投入 |
 | `crates/backend/src/pickle.rs` | pickle **ライタ**（既存。nsc PickleFormat のサブセット） |
-| `crates/backend/src/pickle_read.rs` | pickle **リーダ**（新規）。バイト列 → エントリ表 |
-| `crates/backend/src/pickle_sym.rs` | エントリ表 → クラスシグネチャ。親クラスを辿ってメンバを解決 |
-| `crates/backend/src/load.rs` | `scala_signature_bytes`。`ScalaLongSignature`（配列値）も扱う |
 
-`pickle_read.rs` は nsc 2.13 `PickleFormat.scala` のタグを**全て**扱います
+`crates/pickle` を独立クレートにしたのは、`crates/typer` が `crates/backend` に
+依存できない（依存は逆向き）ためです。
+
+#### リーダ
+
+`read.rs` は nsc 2.13 `PickleFormat.scala` のタグを**全て**扱います
 （シンボル / 型 / リテラル / `SYMANNOT` / `ANNOTINFO` / `CHILDREN` / `TREE` 各種 / `MODIFIERS`）。
 方針として**未知タグや長さの合わない本体は握り潰さず `ReadError` にします**。
 各エントリは宣言された長さをぴったり消費したことを検証するので、
 形式の取り違えはそのままテストの失敗になります。
 
-`pickle_sym.rs` の `SigLoader` は親クラスの classfile を `ClassSource` 越しにオンデマンドで開き、
-継承したメンバを宣言元ごと返します。実 jar に対して次が**手書きなしで**復元できています。
+`sym.rs` は親クラスの classfile を `ClassSource` 越しにオンデマンドで開き、
+**各ホップで親の型引数を代入**して、問い合わせたクラスの語彙で返します。
 
 ```
-List#filter (from scala.collection.IterableOps): (pred: scala.Function1[A, scala.Boolean])C
-List#sum    (from scala.collection.IterableOnceOps): [B](implicit num: scala.math.Numeric[B])B
+List#filter (from scala.collection.IterableOps)
+    (pred: scala.Function1[A, scala.Boolean])scala.collection.immutable.List[A]
 ```
 
-**まだ型検査経路には繋いでいません。** `crates/typer` は `crates/backend` に依存できない
-（依存は逆向き）ため、`SigType` → `scala_rs_parser::Type` の最後の一段と `SymbolTable` への
-投入は未着手です。移行の方針は次を想定しています。
+`IterableOps` の宣言は不透明な `C` を返しますが、代入により `List[A]` になります。
+これが無いと typer は `C` を束縛できません。
 
-1. リーダ（`pickle_read.rs` / `pickle_sym.rs`）を `typer` から使える位置に移すか、
-   共通クレートに切り出す。`pickle_read.rs` は `pickle::MAJOR` 以外に backend 依存を持たない。
-2. `javaclass.rs` と同じくオンデマンドで引く。`List` を参照した時点で
-   `scala/collection/immutable/List.class` の pickle を読む。全先読みは遅い。
-3. **手書き prelude を優先**し、そこに無いメンバだけ pickle から補完する。
-   段階的に入れて既存 fixture を壊さないため。
-4. codegen 側は erase 済み descriptor と checkcast が必要なので、
-   シグネチャ供給が通っても `gen.rs` 側は別途対応が要る。
+#### 型検査への接続（`pickle_supply.rs`）
+
+`check.rs` のメンバ解決が**完全に失敗したときだけ**呼ばれます。3 つの規則で嘘を防ぎます。
+
+1. **手書き prelude が必ず勝つ。** 何も見つからなかった後にしか動かないので、
+   既存の宣言を上書きも隠蔽もしません（`the_prelude_wins_over_the_pickle` で固定）。
+2. **忠実に表せないメンバは供給しない。** 型が `scala_rs_parser::Type` に落ちない、
+   erase 済み descriptor が一意に決まらない、といった場合は供給せず、
+   従来どおり `is not a member` を出します。誤った型より無い方がましです。
+3. **先読みしない。** 解決に失敗した `(受け手, 名前)` の組ごとに classfile 1 個、以降キャッシュ。
+
+erase 済み descriptor は scalac の erasure を再実装するのではなく、
+**classfile のメソッド表そのもの**から取ります（super とインタフェースを辿る。
+`List#mkString` は `IterableOnceOps` の default method）。
+同じ arity の候補が同じ階層に 2 つあるときは、選ばずに供給を諦めます。
+
+`SCALA_RS_PICKLE_DEBUG=1` で、どのメンバをなぜ供給した / しなかったかを追えます。
+
+#### codegen 側
+
+**`gen.rs` の変更は不要でした。** 既存の仕組みがそのまま噛み合っています。
+
+- メソッドシンボルの `jvm_name` が `(` で始まるとき、`method_desc_from_sym` は
+  それを descriptor としてそのまま使う。供給したメンバはここに erase 済み
+  descriptor を入れる。
+- 呼び出しの owner はシンボルの owner、つまり**受け手クラス自身**なので、
+  `invokevirtual scala/collection/immutable/List.mkString(...)` が
+  継承メソッド・interface default method のどちらにも正しく解決される。
+- 戻り値が `Object` の場合の checkcast / unbox は `maybe_unbox_erased_result` が既に行う。
+
+#### 今できること
+
+`--scala-library <jar>` のとき、**prelude に 1 行も書かずに**次が型検査を通り、
+`java -Xverify:all -cp out:jar Main` で scalac 2.13.16 と同じ出力を出します。
+
+- `List`: `filter` `filterNot` `count` `exists` `forall` `take` `drop` `takeWhile`
+  `dropWhile` `reverse` `mkString`(1/3 引数) `contains` `indexOf` `init` `last`
+  `distinct` `startsWith` `splitAt` `partition` `span` `slice` `headOption`
+  `lastOption` `find` `sorted` `sortBy` `sortWith` `max` `min` `maxBy` `toVector`
+  `toSet` `toArray` `scanLeft` `zip` `padTo` `updated` `patch` `indexWhere`
+  `tails` `combinations` `permutations` `zipWithIndex` `grouped` `sliding`
+- `Option`: `exists` `forall` `contains` `filter` `toList`
+- `Vector`: `filter` `mkString`。`Map`: `keySet`。`Iterator`: `toList`
+
+型パラメータの扱いで 2 点、nsc と同じ判断を入れています。
+
+- `scala.package.List` / `scala.package.Ordering` は package object の**型エイリアス**で、
+  pickle はエイリアス名で参照します。表を持たず、`scala/package.class` の pickle から
+  `ALIASsym` を引いて展開します。
+- `def max[B >: A](implicit ord: Ordering[B]): A` は呼び出し側に `B` を決める材料が
+  ありません。scalac は下限 `A` に解決するので同じことをします。これが無いと typer は
+  `Ordering[B]` を解けず、**エラーにせず `xs.max` を関数値へ eta 展開**して
+  `Main$$$anonfun$4@...` を印字していました。この処理後も未決定の型パラメータが残る
+  メンバは供給しません。
+
+#### まだできないこと
+
+- **`sum` / `product`**: `[B >: A](implicit num: Numeric[B])B`。
+  `scala.math.Numeric` がシンボル表に無いので供給しません。通すには
+  (a) 未知のライブラリクラスを pickle からスタブする、
+  (b) companion の implicit インスタンス（`Numeric.IntIsIntegral` など）も
+  pickle から供給する、の 2 つが要ります。`Ordering` は prelude にあるので `sorted` は通ります。
+- **`Set#filter` / `Map#filter`**: 親の探索が BFS で、宣言クラスへ最初に着いた経路の
+  代入を使います。受け手自身が宣言していれば override 意味論と一致しますが、
+  していない場合は `Set[A]` ではなく `Iterable[A]` のような**より弱い型**に着地しえます。
+  今はその型が表に無いので供給せず `is not a member` になります。正確には C3 線形化が要ります。
+- **デフォルト引数**（`lastIndexOf(elem, end = ...)`）と**演算子名**（`++` → `$plus$plus`）。
+  後者は JVM 名のマングリングを backend と共有していないため、英数字名だけに限定しています。
+- **implicit が見つからないとき**、typer が eta 展開して黙って通す既存挙動。
+  供給側では上の型パラメータ規則で塞いでいますが、根本の挙動は残っています。
 
 ### 2.13.16 の pickle で分かったこと
 
@@ -345,7 +415,7 @@ scalac の代替ではありません。サブセットの再実装です。
 cargo test
 ```
 
-pickle リーダの回帰テストは `crates/backend/tests/pickle_lib_jar.rs` です。
+pickle リーダの回帰テストは `crates/pickle/tests/lib_jar.rs` です。
 `/tmp/scala-rs-lib/scala-library-2.13.16.jar`（または `SCALA_LIBRARY_JAR`）があるとき、
 jar の**全 classfile**を走査して次を見ます。jar が無ければスキップします。
 
@@ -361,7 +431,25 @@ jar の**全 classfile**を走査して次を見ます。jar が無ければス�
 - `resolves_module_class_members`: module class（`object List`）の解決。
 
 自前ライタが書いた pickle を自前リーダで読み直すテストは
-`crates/backend/src/pickle_read.rs` と `pickle_sym.rs` のユニットテストです。
+`crates/backend/tests/pickle_roundtrip.rs` です。
+
+型検査への接続は `crates/cli/tests/pickle_lib.rs`（fixture 接頭辞 `pickle_lib`）です。
+`e2e.rs` とは別ファイルにしています。
+
+- `inherited_list_members_come_from_the_pickle`（`pickle_lib1`）と
+  `ordering_and_alias_members_come_from_the_pickle`（`pickle_lib2`）:
+  jar にリンクしてコンパイルし、`java -Xverify:all` で期待 stdout と比較する。
+  **この 2 つの期待値は本物の scalac 2.13.16 の出力とバイト単位で一致することを確認済み**
+  （自前コンパイラ同士の比較ではない）。
+- `a_member_in_no_pickle_is_still_an_error`（`pickle_lib1_bad`）:
+  どの pickle にも無い名前は補完せず `is not a member` になる。
+- `private_runtime_still_diagnoses_library_only_members`:
+  `--no-scala-library` では読む pickle が無いので、黙って通さずきちんと診断する。
+
+補完の不変条件は `crates/typer/src/pickle_supply.rs` のユニットテストで固定しています。
+`the_prelude_wins_over_the_pickle`（手書き `List#map` は置き換えも複製もされない。
+一方 prelude に無い `filter` は descriptor 付きで供給される）と
+`nothing_is_supplied_when_nothing_is_missing`（先読みしない）です。
 
 実行時の期待値は `tests/fixtures/` にあります。各 `.scala` に対して `tests/fixtures/expected/` に同名の `.txt`（`println` と同じ末尾改行付きの stdout）を置いています。`java` がある環境では CLI の e2e が stdout を比較します。
 
@@ -610,12 +698,15 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 - 残りの **StringOps**（`++` / `lengthIs` / `sizeIs` / `flatMap` / `iterator` / `sizeCompare` / `knownSize` / `appendedAll` / `prependedAll` / `>` / `>=` / `<=` / `compare` / `lengthCompare` / `patch(Int, String, Int)` / `<` / `map`（`Char => Char`）/ `:+` / `+:` / `foldRight` / `toByteOption` / `toShortOption` / `toFloatOption` / `grouped` / `foldLeft` / `toByte` / `toShort` / `toFloat` / `toLongOption` / `toDoubleOption` / `find` / `foreach` / `toBoolean` / `toBooleanOption` / `dropWhile` / `takeWhile` / `nonEmpty` / `headOption` / `lastOption` / `filterNot` / `indices` / `r` / `sorted` / `toArray` / `copyToArray` / `partition` / `exists` / `forall` / `splitAt` / `updated` / `count` / `span` / `diff` / `intersect` / `split(String)` / `filter` / `reverseIterator` 以外）
 - 残りの **ArrayOps**（`lengthIs` / `sizeIs` / `indexOf` / `copyToArray` / `iterator` / `zipWithIndex` / `knownSize` / `sizeCompare` / `filterNot` / `headOption` / `lastOption` / `partition` / `splitAt` / `span` / `find` / `contains` / `distinct` / `takeRight` / `dropRight` / `takeWhile` / `indices` / `lengthCompare` / `last` / `init` / `reverse` / `size` / `isEmpty` / `nonEmpty` / `scanLeft` / `count` / `forall` / `foldLeft` / `fold` / `foldRight` / `drop` / `dropWhile` / `exists` / `take` / `collect` / `zip` / `filter` / `slice` / 3 引数 `flatMap` / 4 引数 Array→Iterable `flatMap` と primitive wrappers / `genericArrayOps` の `head`/`map`/`foreach`/`tail` は揃った。他メソッド。`reduce` は 2.13.16 ArrayOps に無い）
 - 他の mutable（`ArrayDeque` / `LinkedHashMap` / `LinkedHashSet` / `HashMap` / `HashSet` / `ArrayBuffer` / `ListBuffer` 以外）と他の immutable（`BitSet` / `SortedMap` / `TreeMap` / `SortedSet` / `TreeSet` / `Set` / `Map` / `Vector` 以外）。`scala.collection.View` の `List.view` / `map` / `toList` と `View.fill` / `View.iterate` は乗った（他の View は未）。`scala.util.control.Breaks` の `breakable` / `break` / `tryBreakable`+`catchBreak` は乗った（他の control は未）。`scala.math.BigInt` / `BigDecimal` の `apply(Int)` / `apply(String)` / `+` / `*` / `int2bigInt` は乗った（他の math は未）。`scala.util.chaining` の `pipe` / `tap` は乗った。`scala.util.Using.resource` / `Using.apply` / `Using.Manager` / `Using.resources`（2–4 引数）は乗った（他の Using は未）
-- **pickle からのシンボル自動供給の残り**: リーダ（`pickle_read.rs`）と
-  シグネチャ復元 + 継承解決（`pickle_sym.rs`）は動いていて jar 全体で緑。
-  未着手は (a) `SigType` → `scala_rs_parser::Type` の変換、
-  (b) `SymbolTable` への投入（手書き prelude 優先で、無いメンバだけ補完）、
-  (c) `typer` から使えるようにするクレート配置、
-  (d) 供給されたメンバの erase 済み descriptor / checkcast の codegen。
+- **pickle からのシンボル自動供給の残り**: リーダ・シグネチャ復元・継承解決・
+  型検査への接続は動いていて、`List` / `Option` / `Vector` / `Map` の 50 以上のメンバが
+  prelude 手書きなしで通り、実行結果は scalac 2.13.16 と一致する。残りは
+  (a) `Numeric` など**シンボル表に無いライブラリクラスのスタブ**と、
+  companion の implicit インスタンス供給（これが要るので `sum` / `product` は未対応）、
+  (b) **C3 線形化**（今は BFS で最初に着いた経路の型引数代入を使うため、
+  受け手自身が宣言していないメンバは `Set[A]` でなく `Iterable[A]` のような
+  弱い型に着地しえて、その場合は供給を諦める）、
+  (c) デフォルト引数、(d) 演算子名の JVM マングリング共有。
   詳細は「ScalaSignature からのシンボル自動供給」節
 - **`Either` / `Try` / `Option` の残り**: `Either` の `joinLeft` / `joinRight` / `flatten` / `toTry` / `cond`（`<:<` を要求するもの、および companion）、`LeftProjection` の `filter`、`Try` の `flatten`、`Option` の `orNull` / `unzip` / `unzip3` / `iterator` / `when` / `unless` / `empty` / `apply`（companion）。**2.13 の `Either` に `withFilter` は無い**ので `for` のガードは nsc どおりコンパイルエラーのまま（`filterOrElse` を使う）。私有ランタイムは `Either` / `Try` を持たないので、そのまま診断する
 - **`java.lang` の例外**は `ArithmeticException` / `ClassCastException` / `IllegalArgumentException` / `IllegalStateException` / `IndexOutOfBoundsException` / `NullPointerException` / `NumberFormatException` / `UnsupportedOperationException` と `Throwable` / `Exception` / `RuntimeException` の `()` / `(String)` コンストラクタ、`getMessage` まで。他の JDK 例外・メソッドは未

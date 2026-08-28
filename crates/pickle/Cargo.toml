@@ -1,0 +1,11 @@
+[package]
+name = "scala-rs-pickle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reader for the nsc 2.13 ScalaSignature pickle format"
+
+[dependencies]
+
+[dev-dependencies]
+zip = { version = "0.6", default-features = false, features = ["deflate"] }

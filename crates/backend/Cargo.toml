@@ -8,6 +8,7 @@ description = "JVM classfile emitter for scala-rs"
 [dependencies]
 scala-rs-span.workspace = true
 scala-rs-parser.workspace = true
+scala-rs-pickle.workspace = true
 scala-rs-typer.workspace = true
 
 [dev-dependencies]

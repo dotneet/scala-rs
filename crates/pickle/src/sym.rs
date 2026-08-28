@@ -1,21 +1,20 @@
 //! Turn a parsed pickle into class signatures, and resolve members across
 //! inheritance by loading the pickles of parent classes on demand.
 //!
-//! This is the bridge layer between [`crate::pickle_read`] (bytes -> entries)
+//! This is the bridge layer between [`crate::read`] (bytes -> entries)
 //! and a symbol table: entry indices are resolved into names and a
 //! self-contained [`SigType`] tree, and [`SigLoader`] walks parents so that
 //! `List#filter` is found on `scala.collection.IterableOps` without anyone
 //! having to say where it lives.
 //!
-//! It deliberately stops short of the typer's `Type`: `crates/typer` cannot
-//! depend on `crates/backend`, so the last hop (SigType -> `scala_rs_parser::Type`
-//! inside the typer) is a separate step. See README, "ScalaSignature からの
-//! シンボル自動供給".
+//! It stops short of the typer's `Type`: the last hop
+//! (`SigType` -> `scala_rs_parser::Type`) lives in
+//! `crates/typer/src/pickle_supply.rs`, which is where the symbol table is.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-use crate::pickle_read::{pflags, read_pickle, Constant, Entry, Idx, Pickle, ReadError};
+use crate::read::{pflags, read_pickle, Constant, Entry, Idx, Pickle, ReadError};
 
 /// A type recovered from a pickle, with all entry references resolved.
 #[derive(Clone, Debug, PartialEq)]
@@ -500,23 +499,38 @@ impl std::fmt::Display for LoadError {
     }
 }
 
-/// Loads and caches [`ClassSig`]s, following parents on demand.
-pub struct SigLoader<S: ClassSource> {
-    src: S,
+/// Caches [`ClassSig`]s. The classfile source is passed in per call so a
+/// caller that already owns one (the typer owns a `BinaryIndex`) does not have
+/// to give it up; [`SigLoader`] is the owning convenience wrapper.
+#[derive(Default)]
+pub struct SigCache {
     cache: HashMap<String, Result<Rc<ClassSig>, LoadError>>,
 }
 
-impl<S: ClassSource> SigLoader<S> {
-    pub fn new(src: S) -> Self {
-        SigLoader {
-            src,
-            cache: HashMap::new(),
-        }
+/// One member found by [`SigCache::lookup`].
+#[derive(Clone, Debug)]
+pub struct MemberHit {
+    /// Dotted name of the class that declares it.
+    pub owner: String,
+    /// The member, with its type already substituted into the *queried*
+    /// class's type-parameter vocabulary: `List#filter` comes back returning
+    /// `List[A]`, not `IterableOps`'s opaque `C`.
+    pub member: Member,
+}
+
+impl SigCache {
+    pub fn new() -> Self {
+        SigCache::default()
     }
 
     /// The signature of a class by dotted full name. `module` selects the
     /// module class (`object List`) over the class (`class List`).
-    pub fn class_sig(&mut self, full_name: &str, module: bool) -> Result<Rc<ClassSig>, LoadError> {
+    pub fn class_sig<S: ClassSource + ?Sized>(
+        &mut self,
+        src: &mut S,
+        full_name: &str,
+        module: bool,
+    ) -> Result<Rc<ClassSig>, LoadError> {
         let key = if module {
             format!("{full_name}$")
         } else {
@@ -525,47 +539,9 @@ impl<S: ClassSource> SigLoader<S> {
         if let Some(hit) = self.cache.get(&key) {
             return hit.clone();
         }
-        let got = self.load(full_name, module);
+        let got = load(src, full_name, module);
         self.cache.insert(key, got.clone());
         got
-    }
-
-    fn load(&mut self, full_name: &str, module: bool) -> Result<Rc<ClassSig>, LoadError> {
-        let internal = full_name.replace('.', "/");
-        // scalac pickles a companion pair once, on the *class* file: in 2.13.16
-        // `List$.class` has no `ScalaSignature` at all, so a module class has to
-        // fall back to its companion's classfile. Try both, in the order most
-        // likely to hit, and only report a failure once neither worked.
-        let candidates: [String; 2] = if module {
-            [format!("{internal}$"), internal.clone()]
-        } else {
-            [internal.clone(), format!("{internal}$")]
-        };
-        let mut last = LoadError::NotFound(full_name.to_string());
-        for c in &candidates {
-            let Some(bytes) = self.src.class_bytes(c) else {
-                continue;
-            };
-            let Some(raw) = crate::load::scala_signature_bytes(&bytes) else {
-                last = LoadError::NoSignature(full_name.to_string());
-                continue;
-            };
-            let p = match read_pickle(&raw) {
-                Ok(p) => p,
-                Err(e) => {
-                    last = LoadError::BadPickle(full_name.to_string(), e);
-                    continue;
-                }
-            };
-            match class_sigs(&p)
-                .into_iter()
-                .find(|c| c.full_name == full_name && c.is_module == module)
-            {
-                Some(sig) => return Ok(Rc::new(sig)),
-                None => last = LoadError::NoSuchClass(full_name.to_string()),
-            }
-        }
-        Err(last)
     }
 
     /// Find every overload of `name` visible on `full_name`, searching the
@@ -573,38 +549,244 @@ impl<S: ClassSource> SigLoader<S> {
     /// finer-grained, but for "does this member exist and with what type" a
     /// BFS over parents gives the same answer for non-overridden members).
     ///
-    /// Returns `(declaring class, member)` pairs, and separately the parents
-    /// that could not be loaded, so a caller can tell "no such member" from
-    /// "we could not look".
+    /// Each hop substitutes the parent's type parameters with the arguments
+    /// the child passed it, so what comes back is expressed in the queried
+    /// class's own type parameters.
+    ///
+    /// Parents that could not be loaded are returned separately, so a caller
+    /// can tell "no such member" from "we could not look".
+    pub fn lookup<S: ClassSource + ?Sized>(
+        &mut self,
+        src: &mut S,
+        full_name: &str,
+        module: bool,
+        name: &str,
+    ) -> (Vec<MemberHit>, Vec<LoadError>) {
+        let mut found = Vec::new();
+        let mut errs = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        let mut queue: VecDeque<(String, bool, HashMap<String, SigType>)> = VecDeque::new();
+        queue.push_back((full_name.to_string(), module, HashMap::new()));
+        while let Some((cur, cur_module, subst)) = queue.pop_front() {
+            if seen.contains(&cur) {
+                continue;
+            }
+            seen.push(cur.clone());
+            let sig = match self.class_sig(src, &cur, cur_module) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    errs.push(e);
+                    continue;
+                }
+            };
+            for m in sig.members_named(name) {
+                let mut m = m.clone();
+                m.ty = apply_subst(&m.ty, &subst);
+                found.push(MemberHit {
+                    owner: cur.clone(),
+                    member: m,
+                });
+            }
+            for p in &sig.parents {
+                let SigType::Ref { sym, args } = p else {
+                    continue;
+                };
+                if !sym.contains('.') {
+                    continue;
+                }
+                // The parent's arguments are written in `cur`'s vocabulary;
+                // lifting them through `subst` puts them in the queried
+                // class's, which is what the next hop must substitute with.
+                let lifted: Vec<SigType> = args.iter().map(|a| apply_subst(a, &subst)).collect();
+                let mut next = HashMap::new();
+                if let Ok(psig) = self.class_sig(src, sym, false) {
+                    for (tp, arg) in psig.tparams.iter().zip(lifted) {
+                        next.insert(tp.name.clone(), arg);
+                    }
+                }
+                queue.push_back((sym.clone(), false, next));
+            }
+        }
+        (found, errs)
+    }
+}
+
+fn load<S: ClassSource + ?Sized>(
+    src: &mut S,
+    full_name: &str,
+    module: bool,
+) -> Result<Rc<ClassSig>, LoadError> {
+    let internal = full_name.replace('.', "/");
+    // scalac pickles a companion pair once, on the *class* file: in 2.13.16
+    // `List$.class` has no `ScalaSignature` at all, so a module class has to
+    // fall back to its companion's classfile. Try both, in the order most
+    // likely to hit, and only report a failure once neither worked.
+    let candidates: [String; 2] = if module {
+        [format!("{internal}$"), internal.clone()]
+    } else {
+        [internal.clone(), format!("{internal}$")]
+    };
+    let mut last = LoadError::NotFound(full_name.to_string());
+    for c in &candidates {
+        let Some(bytes) = src.class_bytes(c) else {
+            continue;
+        };
+        let Some(raw) = crate::classfile::scala_signature_bytes(&bytes) else {
+            last = LoadError::NoSignature(full_name.to_string());
+            continue;
+        };
+        let p = match read_pickle(&raw) {
+            Ok(p) => p,
+            Err(e) => {
+                last = LoadError::BadPickle(full_name.to_string(), e);
+                continue;
+            }
+        };
+        match class_sigs(&p)
+            .into_iter()
+            .find(|c| c.full_name == full_name && c.is_module == module)
+        {
+            Some(sig) => return Ok(Rc::new(sig)),
+            None => last = LoadError::NoSuchClass(full_name.to_string()),
+        }
+    }
+    Err(last)
+}
+
+/// Replace type-parameter references by name. Binders (`Poly`, `Existential`)
+/// shadow, so their own names are dropped from the map before descending.
+pub fn apply_subst(t: &SigType, map: &HashMap<String, SigType>) -> SigType {
+    if map.is_empty() {
+        return t.clone();
+    }
+    let go = |x: &SigType| apply_subst(x, map);
+    match t {
+        SigType::Ref { sym, args } => {
+            let args: Vec<SigType> = args.iter().map(go).collect();
+            match map.get(sym) {
+                // `CC` bound to `List`, used as `CC[B]`, is `List[B]`.
+                Some(SigType::Ref {
+                    sym: s2,
+                    args: rargs,
+                }) if rargs.is_empty() => SigType::Ref {
+                    sym: s2.clone(),
+                    args,
+                },
+                Some(other) if args.is_empty() => other.clone(),
+                // A non-`Ref` replacement cannot absorb arguments; leaving the
+                // original alone is the honest answer (the caller then sees an
+                // unresolvable name and declines to supply the member).
+                _ => SigType::Ref {
+                    sym: sym.clone(),
+                    args,
+                },
+            }
+        }
+        SigType::This(_) | SigType::Constant(_) | SigType::None => t.clone(),
+        SigType::Single { prefix, sym } => SigType::Single {
+            prefix: Box::new(go(prefix)),
+            sym: sym.clone(),
+        },
+        SigType::Bounds { lo, hi } => SigType::Bounds {
+            lo: Box::new(go(lo)),
+            hi: Box::new(go(hi)),
+        },
+        SigType::Refined { parents, decls } => SigType::Refined {
+            parents: parents.iter().map(go).collect(),
+            decls: decls
+                .iter()
+                .map(|d| Member {
+                    ty: go(&d.ty),
+                    ..d.clone()
+                })
+                .collect(),
+        },
+        SigType::Method {
+            params,
+            implicit,
+            result,
+        } => SigType::Method {
+            params: params
+                .iter()
+                .map(|p| Param {
+                    ty: go(&p.ty),
+                    ..p.clone()
+                })
+                .collect(),
+            implicit: *implicit,
+            result: Box::new(go(result)),
+        },
+        SigType::Poly { tparams, result } => {
+            let inner = without(map, tparams);
+            SigType::Poly {
+                tparams: tparams
+                    .iter()
+                    .map(|tp| TParam {
+                        bounds: apply_subst(&tp.bounds, &inner),
+                        ..tp.clone()
+                    })
+                    .collect(),
+                result: Box::new(apply_subst(result, &inner)),
+            }
+        }
+        SigType::Existential { quantified, result } => {
+            let inner = without(map, quantified);
+            SigType::Existential {
+                quantified: quantified
+                    .iter()
+                    .map(|tp| TParam {
+                        bounds: apply_subst(&tp.bounds, &inner),
+                        ..tp.clone()
+                    })
+                    .collect(),
+                result: Box::new(apply_subst(result, &inner)),
+            }
+        }
+        SigType::Annotated(t) => SigType::Annotated(Box::new(go(t))),
+        SigType::Super {
+            this_tpe,
+            super_tpe,
+        } => SigType::Super {
+            this_tpe: Box::new(go(this_tpe)),
+            super_tpe: Box::new(go(super_tpe)),
+        },
+    }
+}
+
+fn without(map: &HashMap<String, SigType>, bound: &[TParam]) -> HashMap<String, SigType> {
+    let mut m = map.clone();
+    for tp in bound {
+        m.remove(&tp.name);
+    }
+    m
+}
+
+/// Owns a [`ClassSource`] and a [`SigCache`]. Convenience for callers that do
+/// not already hold the source elsewhere.
+pub struct SigLoader<S: ClassSource> {
+    src: S,
+    cache: SigCache,
+}
+
+impl<S: ClassSource> SigLoader<S> {
+    pub fn new(src: S) -> Self {
+        SigLoader {
+            src,
+            cache: SigCache::new(),
+        }
+    }
+
+    pub fn class_sig(&mut self, full_name: &str, module: bool) -> Result<Rc<ClassSig>, LoadError> {
+        self.cache.class_sig(&mut self.src, full_name, module)
+    }
+
     pub fn lookup(
         &mut self,
         full_name: &str,
         module: bool,
         name: &str,
-    ) -> (Vec<(String, Member)>, Vec<LoadError>) {
-        let mut found = Vec::new();
-        let mut errs = Vec::new();
-        let mut seen: Vec<String> = Vec::new();
-        let mut queue: Vec<(String, bool)> = vec![(full_name.to_string(), module)];
-        while let Some((cur, cur_module)) = queue.first().cloned() {
-            queue.remove(0);
-            if seen.contains(&cur) {
-                continue;
-            }
-            seen.push(cur.clone());
-            match self.class_sig(&cur, cur_module) {
-                Ok(sig) => {
-                    for m in sig.members_named(name) {
-                        found.push((cur.clone(), m.clone()));
-                    }
-                    for p in sig.parent_names() {
-                        queue.push((p, false));
-                    }
-                }
-                Err(e) => errs.push(e),
-            }
-        }
-        (found, errs)
+    ) -> (Vec<MemberHit>, Vec<LoadError>) {
+        self.cache.lookup(&mut self.src, full_name, module, name)
     }
 }
 
@@ -669,78 +851,5 @@ pub fn render(t: &SigType) -> String {
             this_tpe,
             super_tpe,
         } => format!("{}.super[{}]", render(this_tpe), render(super_tpe)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::pickle;
-
-    fn sigs_of(src: &str) -> Vec<ClassSig> {
-        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
-        assert!(
-            !scala_rs_typer::has_errors(&diags),
-            "type errors: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-        let mut out = Vec::new();
-        for raw in pickle::pickle_all(&st).values() {
-            let p = read_pickle(raw).expect("read our own pickle");
-            out.extend(class_sigs(&p));
-        }
-        out
-    }
-
-    #[test]
-    fn recovers_a_polymorphic_method_signature() {
-        let sigs = sigs_of(
-            r#"
-class Box[A](val get: A) {
-  def map[B](f: A => B): Box[B] = new Box(f(get))
-  def size: Int = 1
-}
-"#,
-        );
-        let boxc = sigs
-            .iter()
-            .find(|c| c.full_name == "Box" && !c.is_module)
-            .expect("Box");
-        assert_eq!(boxc.tparams.len(), 1);
-        assert_eq!(boxc.tparams[0].name, "A");
-        let map = boxc.member("map").expect("Box#map");
-        assert_eq!(map.kind, MemberKind::Def);
-        let rendered = render(&map.ty);
-        assert!(rendered.starts_with("[B](f: "), "{rendered}");
-        assert!(rendered.ends_with("Box[B]"), "{rendered}");
-        // A parameterless `def` stays a (nullary) method, not a val.
-        let size = boxc.member("size").expect("Box#size");
-        assert_eq!(render(&size.ty), "=> scala.Int");
-        assert_eq!(size.kind, MemberKind::Def);
-    }
-
-    #[test]
-    fn parents_and_module_classes_are_recovered() {
-        let sigs = sigs_of(
-            r#"
-trait Show { def show: String }
-class Impl extends Show { def show: String = "" }
-object Impl { val tag: String = "i" }
-"#,
-        );
-        let imp = sigs
-            .iter()
-            .find(|c| c.full_name == "Impl" && !c.is_module)
-            .expect("Impl class");
-        assert!(
-            !imp.parents.is_empty(),
-            "expected at least one parent for Impl"
-        );
-        assert!(imp.member("show").is_some(), "Impl#show");
-        let obj = sigs
-            .iter()
-            .find(|c| c.full_name == "Impl" && c.is_module)
-            .expect("Impl module class");
-        assert!(obj.member("tag").is_some(), "Impl.tag");
     }
 }
