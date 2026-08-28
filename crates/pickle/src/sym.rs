@@ -76,6 +76,10 @@ pub struct Param {
     pub name: String,
     pub ty: SigType,
     pub by_name: bool,
+    /// Raw pickled flags; see [`crate::read::pflags`]. `DEFAULTPARAM` says the
+    /// caller may omit this argument, in which case the value comes from the
+    /// class's `<method>$default$<n>` getter.
+    pub flags: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -310,15 +314,19 @@ impl Builder<'_> {
             .and_then(|i| self.p.name(i.name))
             .unwrap_or("_")
             .to_string();
-        let (ty, by_name) = match info {
+        let (ty, by_name, flags) = match info {
             Some(i) => {
                 let t = self.ty(i.info, 0);
-                let by_name = i.has(pflags::BYNAMEPARAM);
-                (t, by_name)
+                (t, i.has(pflags::BYNAMEPARAM), i.flags)
             }
-            None => (SigType::None, false),
+            None => (SigType::None, false, 0),
         };
-        Param { name, ty, by_name }
+        Param {
+            name,
+            ty,
+            by_name,
+            flags,
+        }
     }
 
     /// Resolve a symbol reference to the name a `SigType::Ref` should carry.

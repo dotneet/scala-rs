@@ -113,6 +113,19 @@ impl PickleSupply {
         class_sym: SymbolId,
         name: &str,
     ) -> Vec<SymbolId> {
+        self.complete_named(st, bin, class_sym, name, false)
+    }
+
+    /// `synthetic_ok` is set only when fetching a `$default$` getter, which is
+    /// synthetic by construction and would otherwise be filtered out.
+    fn complete_named(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        name: &str,
+        synthetic_ok: bool,
+    ) -> Vec<SymbolId> {
         if class_sym.is_none() || name.is_empty() {
             return Vec::new();
         }
@@ -172,7 +185,10 @@ impl PickleSupply {
         let mut seen_shapes: HashSet<String> = HashSet::new();
         for hit in hits {
             let m = hit.member;
-            if m.kind != MemberKind::Def || !m.is_public_api() {
+            if m.kind != MemberKind::Def {
+                continue;
+            }
+            if !m.is_public_api() && !(synthetic_ok && is_default_getter(&m.name)) {
                 continue;
             }
             let Some(shape) = read_shape(&m.ty) else {
@@ -254,6 +270,8 @@ impl PickleSupply {
 
         let mut paramss_ty: Vec<Vec<Type>> = Vec::new();
         let mut paramss_sym: Vec<Vec<SymbolId>> = Vec::new();
+        // 1-based positions of parameters the caller may omit.
+        let mut default_slots: Vec<usize> = Vec::new();
         for clause in &shape.clauses {
             let mut tys = Vec::new();
             let mut syms = Vec::new();
@@ -268,11 +286,16 @@ impl PickleSupply {
                 if p.by_name && !matches!(t, Type::ByName(_)) {
                     t = Type::ByName(Box::new(t));
                 }
-                let flags = if clause.implicit {
+                let mut flags = if clause.implicit {
                     Flags::PARAM.with(Flags::IMPLICIT)
                 } else {
                     Flags::PARAM
                 };
+                if p.flags & pflags::DEFAULTPARAM != 0 {
+                    flags = flags.with(Flags::DEFAULTPARAM);
+                    default_slots
+                        .push(paramss_ty.iter().map(|c| c.len()).sum::<usize>() + tys.len() + 1);
+                }
                 let ps = st.alloc(&p.name, m, SymKind::Term, flags, "");
                 st.get_mut(ps).ty = t.clone();
                 tys.push(t);
@@ -332,6 +355,38 @@ impl PickleSupply {
             paramss: paramss_ty,
             ret: Box::new(ret),
         };
+        // A parameter the caller may omit is filled from the class's
+        // `<method>$default$<n>` getter. Without it the typer fills nothing and
+        // the call goes out with fewer arguments than the descriptor declares,
+        // which the verifier rejects -- so a getter we cannot supply makes the
+        // whole member ineligible. Done before attaching `m`, so declining
+        // leaves the class untouched.
+        for slot in default_slots {
+            let getter = format!("{name}$default${slot}");
+            let ids = self.complete_named(st, bin, class_sym, &getter, true);
+            let Some(&gid) = ids.first() else {
+                trace(format_args!(
+                    "{internal}#{name}: no {getter}, so the default cannot be filled"
+                ));
+                return None;
+            };
+            // `default_getter_apply` calls the getter with the arguments that
+            // precede the defaulted one. scalac does not always generate it
+            // that way -- `SeqOps.lastIndexOf$default$2()` takes nothing even
+            // though `elem` precedes `end` -- and calling a nullary getter with
+            // an argument is not a program we can emit. Where the two
+            // conventions disagree, leave the member alone.
+            let want_args = slot - 1;
+            let got_args = st.get(gid).params.len();
+            if got_args != want_args {
+                trace(format_args!(
+                    "{internal}#{name}: {getter} takes {got_args} argument(s) but the \
+                     default is filled with {want_args}"
+                ));
+                return None;
+            }
+        }
+
         st.get_mut(m).owner = class_sym;
         st.get_mut(class_sym).members.push(m);
         Some(m)
@@ -609,6 +664,8 @@ struct Param {
     name: String,
     ty: SigType,
     by_name: bool,
+    /// Raw pickled flags, for `DEFAULTPARAM`.
+    flags: u64,
 }
 
 struct Clause {
@@ -671,6 +728,7 @@ fn read_shape(t: &SigType) -> Option<Shape> {
                             name: p.name.clone(),
                             ty: p.ty.clone(),
                             by_name: p.by_name,
+                            flags: p.flags,
                         })
                         .collect(),
                     implicit: *implicit,
@@ -741,6 +799,7 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
                         name: p.name.clone(),
                         ty: scala_rs_pickle::sym::apply_subst(&p.ty, &pin),
                         by_name: p.by_name,
+                        flags: p.flags,
                     })
                     .collect(),
             })
@@ -982,6 +1041,14 @@ impl PickleSupply {
         // vocabulary, so the caller's scope is what finishes the job.
         self.conv_at(st, bin, scope, &target, d)
     }
+}
+
+/// `f$default$2` names the getter for `f`'s second parameter's default.
+fn is_default_getter(name: &str) -> bool {
+    let Some((_, n)) = name.rsplit_once("$default$") else {
+        return false;
+    };
+    !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Whether `cls` already has `target` somewhere above it.
