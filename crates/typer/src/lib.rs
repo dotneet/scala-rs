@@ -5,6 +5,7 @@ mod implicits;
 mod javaclass;
 mod javasign;
 mod lambda_lift;
+mod lazysig;
 mod prelude;
 mod symbol;
 mod uncurry;

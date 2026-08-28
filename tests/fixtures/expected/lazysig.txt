@@ -1,0 +1,8 @@
+60
+log:store
+[store]log:store
+40
+5
+c7:7
+100
+5

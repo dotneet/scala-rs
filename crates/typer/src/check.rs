@@ -3,12 +3,13 @@
 
 use crate::implicits::ImplicitSearch;
 use crate::javaclass::BinaryIndex;
+use crate::lazysig::PendingSig;
 use crate::prelude::install_prelude;
 use crate::symbol::{SymKind, SymbolTable};
 use crate::uncurry::{eta_expand, is_eta_marker};
 use scala_rs_parser::ast::*;
 use scala_rs_span::{Diagnostic, Span};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 pub struct TypecheckOptions {
@@ -89,7 +90,7 @@ pub struct Typer {
     fatal_warnings: bool,
     library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
-    return_meth: Option<SymbolId>,
+    pub(crate) return_meth: Option<SymbolId>,
     /// `import scala.language.dynamics` / `-language:dynamics`.
     language_dynamics: bool,
     /// `import scala.language.postfixOps` / `-language:postfixOps`.
@@ -98,6 +99,20 @@ pub struct Typer {
     language_implicit_conversions: bool,
     binary: BinaryIndex,
     completed_java: HashSet<String>,
+    /// Members without a type annotation, keyed by symbol: nsc's lazy
+    /// completers (see `crate::lazysig`).
+    pub(crate) pending_sigs: HashMap<SymbolId, PendingSig>,
+    /// Signatures being completed right now (nsc's `LOCKED` flag).
+    pub(crate) lazy_completing: Vec<SymbolId>,
+    /// Symbols a `recursive ... needs type` was already reported for.
+    pub(crate) lazy_cyclic: HashSet<SymbolId>,
+    /// Definitions completed on demand, waiting to be spliced back.
+    pub(crate) lazy_done: HashMap<SymbolId, Tree>,
+    /// Definitions already spliced back; both template passes skip them.
+    pub(crate) lazy_body_done: HashSet<SymbolId>,
+    /// Number of scopes the prelude occupies; they stay in place while a
+    /// signature is completed in the scope of its own definition.
+    pub(crate) lazy_base_scopes: usize,
 }
 
 pub fn typecheck(tree: &mut Tree, file_index: usize) -> (SymbolTable, Vec<Diagnostic>) {
@@ -122,6 +137,7 @@ impl Typer {
     pub fn new(file_index: usize, opts: &TypecheckOptions) -> Self {
         let mut st = SymbolTable::new();
         install_prelude(&mut st, opts.library_abi);
+        let lazy_base_scopes = st.scopes.len();
         Typer {
             st,
             diags: Vec::new(),
@@ -138,10 +154,16 @@ impl Typer {
             ),
             binary: BinaryIndex::from_user_paths(opts.binary_path.clone()),
             completed_java: HashSet::new(),
+            pending_sigs: HashMap::new(),
+            lazy_completing: Vec::new(),
+            lazy_cyclic: HashSet::new(),
+            lazy_done: HashMap::new(),
+            lazy_body_done: HashSet::new(),
+            lazy_base_scopes,
         }
     }
 
-    fn error(&mut self, span: Span, msg: impl Into<String>) {
+    pub(crate) fn error(&mut self, span: Span, msg: impl Into<String>) {
         self.diags
             .push(Diagnostic::error(self.file_index, span, msg));
     }
@@ -842,6 +864,12 @@ impl Typer {
                 self.namer_enter_tmpl(tree);
             }
             _ => {}
+        }
+        if matches!(
+            &tree.kind,
+            TreeKind::ValDef { .. } | TreeKind::DefDef { .. }
+        ) {
+            self.register_namer_sig(tree);
         }
     }
 
@@ -1817,6 +1845,9 @@ impl Typer {
     }
 
     fn type_member_sig(&mut self, tree: &mut Tree) {
+        if self.take_lazy_done(tree) {
+            return;
+        }
         match &tree.kind {
             TreeKind::ValDef { .. } => self.type_val_sig(tree),
             TreeKind::DefDef { .. } => self.type_def_sig(tree),
@@ -1825,9 +1856,18 @@ impl Typer {
             TreeKind::TypeDef { .. } => self.type_type_member(tree),
             _ => {}
         }
+        if matches!(
+            &tree.kind,
+            TreeKind::ValDef { .. } | TreeKind::DefDef { .. }
+        ) {
+            self.register_typed_sig(tree);
+        }
     }
 
     fn type_member_body(&mut self, tree: &mut Tree) {
+        if self.take_lazy_done(tree) {
+            return;
+        }
         match &tree.kind {
             TreeKind::ValDef { .. } => self.type_val_body(tree),
             TreeKind::DefDef { .. } => self.type_def_body(tree),
@@ -1841,7 +1881,7 @@ impl Typer {
         }
     }
 
-    fn type_val_sig(&mut self, tree: &mut Tree) {
+    pub(crate) fn type_val_sig(&mut self, tree: &mut Tree) {
         let (tpt, name, flags, within) = match &tree.kind {
             TreeKind::ValDef {
                 tpt, name, mods, ..
@@ -1908,7 +1948,7 @@ impl Typer {
         let _ = name;
     }
 
-    fn type_val_body(&mut self, tree: &mut Tree) {
+    pub(crate) fn type_val_body(&mut self, tree: &mut Tree) {
         let presuper = matches!(
             &tree.kind,
             TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::PRESUPER)
@@ -1945,10 +1985,14 @@ impl Typer {
             self.adapt(rhs, &declared);
             tree.ty = declared;
         }
+        // The signature is settled; nothing may complete this value again.
+        // Unlike a method it is *not* locked while its own right-hand side is
+        // typed: scalac reports `val x = y; val y = x` on the reference to `y`.
+        self.drop_lazy_sig(tree.sym);
         self.check_stored_annotations(tree);
     }
 
-    fn type_def_sig(&mut self, tree: &mut Tree) {
+    pub(crate) fn type_def_sig(&mut self, tree: &mut Tree) {
         let span = tree.span;
         let (tparams, vparamss, tpt, name, mods_within, mods_flags, is_conv) = match &mut tree.kind
         {
@@ -2268,7 +2312,7 @@ impl Typer {
         }
     }
 
-    fn type_def_body(&mut self, tree: &mut Tree) {
+    pub(crate) fn type_def_body(&mut self, tree: &mut Tree) {
         let is_ctor = match &tree.kind {
             TreeKind::DefDef { name, .. } => name == "<init>",
             _ => return,
@@ -2285,9 +2329,14 @@ impl Typer {
                 _ => return,
             };
             if rhs.is_empty() {
+                self.drop_lazy_sig(tree.sym);
                 self.check_stored_annotations(tree);
                 return;
             }
+            // nsc locks a method while its result type is being inferred, so a
+            // definition completed from this body that refers back reports
+            // `recursive method f needs result type` at that reference.
+            let locked = ret_pt.is_no_type() && self.lock_lazy_sig(tree.sym);
             self.st.push_scope();
             let saved_owner = self.st.owner;
             let saved_ret = self.return_meth;
@@ -2322,6 +2371,7 @@ impl Typer {
             self.st.owner = saved_owner;
             self.return_meth = saved_ret;
             self.st.pop_scope();
+            self.unlock_lazy_sig(locked);
         }
         if is_ctor {
             self.check_aux_ctor(tree);
@@ -3149,6 +3199,10 @@ impl Typer {
     fn bind_found(&mut self, tree: &mut Tree, mut found: Vec<SymbolId>, pt: &Type) {
         found.sort_by_key(|s| s.0);
         found.dedup();
+        let ref_span = tree.span;
+        for s in found.iter().copied() {
+            self.complete_lazy_sig(s, ref_span);
+        }
         if found.len() == 1 {
             let s = found[0];
             tree.sym = s;
@@ -3457,6 +3511,9 @@ impl Typer {
             .collect();
         if !terms.is_empty() {
             found = terms;
+        }
+        for s in found.iter().copied() {
+            self.complete_lazy_sig(s, tree.span);
         }
         let subst_args: Vec<Type> = match &qual.ty {
             Type::Class { args, .. } => args.clone(),
