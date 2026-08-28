@@ -178,3 +178,23 @@ fn tuple3_runs_on_the_library() {
     assert_eq!(run_java(&out, Some(&jar)), expected_stdout("tuple3_lit"));
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// `for ((a, b) <- xs)` needs List's library `map`/`withFilter`, so this one is
+/// library-only.
+#[test]
+fn for_generator_patterns_run() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let out = compile_with("for_pat", &["--scala-library", jar.to_str().unwrap()]);
+    assert_eq!(run_java(&out, Some(&jar)), expected_stdout("for_pat"));
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn for_generator_pattern_binding_is_typed() {
+    compile_fails("for_pat_bad", "nosuchmember");
+}

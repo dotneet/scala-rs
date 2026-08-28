@@ -4386,14 +4386,131 @@ fn desugar_for(
             postfix: false,
         }
     }
+    /// A generator pattern that always matches: a variable, `_`, or a tuple of
+    /// those. nsc filters the others, and so does `filter_lambda` below.
+    fn is_irrefutable(pat: &Tree) -> bool {
+        match &pat.kind {
+            TreeKind::Ident { .. } | TreeKind::Wildcard => true,
+            TreeKind::Bind { body, .. } => is_irrefutable(body),
+            TreeKind::Apply { fun, args } => {
+                matches!(&fun.kind, TreeKind::Ident { name } if name.starts_with("Tuple"))
+                    && args.iter().all(is_irrefutable)
+            }
+            _ => false,
+        }
+    }
     fn lambda(p: &mut Parser, pat: Tree, body: Tree) -> Tree {
         let span = pat.span.merge(body.span);
+        if !matches!(
+            &pat.kind,
+            TreeKind::Ident { .. } | TreeKind::Bind { .. } | TreeKind::Wildcard
+        ) {
+            // `for ((a, b) <- xs) yield a` — bind the element and match it,
+            // which is what nsc's pattern-matching anonymous function does.
+            p.placeholder_id += 1;
+            let name = format!("x$for{}", p.placeholder_id);
+            let sel = p.alloc(pat.span, TreeKind::Ident { name: name.clone() });
+            let guard = p.empty(pat.span);
+            let pat_span = pat.span;
+            let m = p.alloc(
+                span,
+                TreeKind::Match {
+                    selector: Box::new(sel),
+                    cases: vec![CaseDef {
+                        pat,
+                        guard,
+                        body,
+                        span,
+                    }],
+                },
+            );
+            let tpt = p.empty(pat_span);
+            let rhs = p.empty(pat_span);
+            let v = p.alloc(
+                pat_span,
+                TreeKind::ValDef {
+                    mods: Modifiers::new(Flags::PARAM),
+                    name,
+                    tpt: Box::new(tpt),
+                    rhs: Box::new(rhs),
+                },
+            );
+            return p.alloc(
+                span,
+                TreeKind::Function {
+                    vparams: vec![v],
+                    body: Box::new(m),
+                },
+            );
+        }
         let v = pat_to_param(pat);
         p.alloc(
             span,
             TreeKind::Function {
                 vparams: vec![v],
                 body: Box::new(body),
+            },
+        )
+    }
+
+    /// `{ x => x match { case pat => true; case _ => false } }` for a refutable
+    /// generator pattern, as nsc's `withFilter` insertion does.
+    fn filter_lambda(p: &mut Parser, pat: &Tree) -> Tree {
+        let span = pat.span;
+        p.placeholder_id += 1;
+        let name = format!("x$forf{}", p.placeholder_id);
+        let sel = p.alloc(span, TreeKind::Ident { name: name.clone() });
+        let yes = p.alloc(
+            span,
+            TreeKind::Literal {
+                lit: Lit::Boolean(true),
+            },
+        );
+        let no = p.alloc(
+            span,
+            TreeKind::Literal {
+                lit: Lit::Boolean(false),
+            },
+        );
+        let g1 = p.empty(span);
+        let g2 = p.empty(span);
+        let wild = p.alloc(span, TreeKind::Wildcard);
+        let m = p.alloc(
+            span,
+            TreeKind::Match {
+                selector: Box::new(sel),
+                cases: vec![
+                    CaseDef {
+                        pat: pat.clone(),
+                        guard: g1,
+                        body: yes,
+                        span,
+                    },
+                    CaseDef {
+                        pat: wild,
+                        guard: g2,
+                        body: no,
+                        span,
+                    },
+                ],
+            },
+        );
+        let tpt = p.empty(span);
+        let rhs = p.empty(span);
+        let v = p.alloc(
+            span,
+            TreeKind::ValDef {
+                mods: Modifiers::new(Flags::PARAM),
+                name,
+                tpt: Box::new(tpt),
+                rhs: Box::new(rhs),
+            },
+        );
+        p.alloc(
+            span,
+            TreeKind::Function {
+                vparams: vec![v],
+                body: Box::new(m),
             },
         )
     }
@@ -4439,6 +4556,23 @@ fn desugar_for(
                 },
             );
             continue;
+        }
+        if !e.is_val && !is_irrefutable(&e.pat) {
+            let pred = filter_lambda(p, &e.pat);
+            let sel = p.alloc(
+                rhs.span,
+                TreeKind::Select {
+                    qual: Box::new(rhs),
+                    name: "withFilter".into(),
+                },
+            );
+            rhs = p.alloc(
+                sel.span,
+                TreeKind::Apply {
+                    fun: Box::new(sel),
+                    args: vec![pred],
+                },
+            );
         }
         let method = if last {
             if is_yield {
