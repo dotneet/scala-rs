@@ -153,3 +153,28 @@ fn pattern_definitions_run() {
 fn pattern_definition_binding_is_typed() {
     compile_fails("pat_def_bad", "nosuchmember");
 }
+
+#[test]
+fn tuple_literals_run() {
+    run_both("tuple_lit");
+}
+
+#[test]
+fn tuple_literal_binding_is_typed() {
+    compile_fails("tuple_lit_bad", "nosuchmember");
+}
+
+/// `Tuple3` and up exist only on the library ABI; the private runtime ships
+/// `scala/Tuple2` alone.
+#[test]
+fn tuple3_runs_on_the_library() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let out = compile_with("tuple3_lit", &["--scala-library", jar.to_str().unwrap()]);
+    assert_eq!(run_java(&out, Some(&jar)), expected_stdout("tuple3_lit"));
+    let _ = std::fs::remove_dir_all(&out);
+}

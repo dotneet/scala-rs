@@ -273,7 +273,6 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         },
         Intrinsic::None,
     );
-    let _ = class(st, st.scala_pkg, "Tuple3", "scala/Tuple3", &[Type::AnyRef]);
     if let Some(so) = string_ops {
         let pair = Type::Class {
             sym: tuple2,
@@ -463,6 +462,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     import_members(st, st.predef);
     st.enter_in_current("String", st.string_sym);
     st.enter_in_current("Unit", st.unit_sym);
+    crate::prelude_tuple::add_tuples(st, library_abi);
     st.enter_in_current("::", st.cons_sym);
     st.enter_in_current("Ordered", ordered);
 }
@@ -593,7 +593,7 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
     }
 }
 
-fn class(
+pub(crate) fn class(
     st: &mut SymbolTable,
     owner: SymbolId,
     name: &str,
@@ -625,7 +625,7 @@ fn iface(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> Symbol
     id
 }
 
-fn module(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
+pub(crate) fn module(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
     let cls = st.alloc(
         &format!("{name}$"),
         owner,
@@ -672,6 +672,18 @@ fn method(
     };
     st.get_mut(id).intrinsic = intrinsic;
     id
+}
+
+/// `method` for sibling prelude modules.
+pub(crate) fn prelude_method(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    name: &str,
+    params: Vec<Type>,
+    ret: Type,
+    intrinsic: Intrinsic,
+) -> SymbolId {
+    method(st, owner, name, params, ret, intrinsic)
 }
 
 fn add_ordered(st: &mut SymbolTable) -> SymbolId {
@@ -1067,7 +1079,7 @@ fn add_sorted_map(st: &mut SymbolTable, ordering: SymbolId) {
     st.get_mut(tm_mod).members.extend(tmems);
 }
 
-fn type_param(st: &mut SymbolTable, owner: SymbolId, name: &str) -> SymbolId {
+pub(crate) fn type_param(st: &mut SymbolTable, owner: SymbolId, name: &str) -> SymbolId {
     let id = st.alloc(name, owner, SymKind::TypeParam, Flags::EMPTY, "");
     st.get_mut(id).ty = Type::TypeParam(id);
     id

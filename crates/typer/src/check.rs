@@ -6322,6 +6322,13 @@ impl Typer {
         if tps.is_empty() {
             return Vec::new();
         }
+        // A tuple scrutinee is `Type::Tuple`, which has no class symbol; its
+        // element types are the pattern class's arguments directly.
+        if let Type::Tuple(ts) = sel_ty {
+            if ts.len() == tps.len() {
+                return ts.clone();
+            }
+        }
         let Some(sel_sym) = self.st.class_sym_of(sel_ty) else {
             return Vec::new();
         };

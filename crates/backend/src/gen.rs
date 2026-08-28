@@ -4495,6 +4495,22 @@ fn gen_apply(
         gen_any_eq(asm, frame, ctx, fun, args, matches!(ic, Intrinsic::AnyEq));
         return;
     }
+    if let Intrinsic::NewTuple(n) = ic {
+        // nsc lowers a tuple literal to `new TupleN`, so no `TupleN$` module
+        // classfile is needed.
+        let cls = format!("scala/Tuple{n}");
+        asm.new_obj(&cls);
+        asm.dup();
+        for a in args.iter() {
+            gen_expr(asm, frame, ctx, a);
+            if is_jvm_primitive(&a.ty) {
+                emit_box(asm, &a.ty);
+            }
+        }
+        let desc = format!("({})V", "Ljava/lang/Object;".repeat(n));
+        asm.invokespecial(&cls, "<init>", &desc);
+        return;
+    }
     if matches!(ic, Intrinsic::Synchronized) {
         gen_synchronized(asm, frame, ctx, fun, args, &tree.ty);
         return;
