@@ -196,6 +196,116 @@ fn jvm_desc_maybe_boxed(
     }
 }
 
+// ---------------------------------------------------------------------------
+// captured enclosing-method locals (`new T { … }`, local `class`)
+// ---------------------------------------------------------------------------
+
+/// Enclosing-method locals a class defined inside a method has to receive.
+/// Filled by the typer's `anon_capture` pass; empty for every other class.
+fn class_captures(st: &SymbolTable, class_id: SymbolId) -> &[SymbolId] {
+    if class_id.is_none() {
+        return &[];
+    }
+    &st.get(class_id).captures
+}
+
+/// Field / constructor-parameter name of the `idx`-th capture (nsc: `x$1`).
+fn capture_field_name(st: &SymbolTable, id: SymbolId, idx: usize) -> String {
+    format!("{}${}", st.get(id).name, idx + 1)
+}
+
+/// Descriptor of a captured value; a `scala.runtime.*Ref` for captured `var`s.
+fn capture_field_desc(st: &SymbolTable, boxed: &HashSet<SymbolId>, id: SymbolId) -> String {
+    jvm_desc_maybe_boxed(st, &st.get(id).ty, id, boxed)
+}
+
+fn capture_field_sort(boxed: &HashSet<SymbolId>, st: &SymbolTable, id: SymbolId) -> JvmSort {
+    if boxed.contains(&id) {
+        JvmSort::Ref
+    } else {
+        jvm_sort(&st.get(id).ty)
+    }
+}
+
+/// The capture constructor parameters of `class_id`, as descriptor text.
+fn capture_params_desc(st: &SymbolTable, boxed: &HashSet<SymbolId>, class_id: SymbolId) -> String {
+    class_captures(st, class_id)
+        .iter()
+        .map(|c| capture_field_desc(st, boxed, *c))
+        .collect()
+}
+
+/// Splice extra parameter descriptors in front of the `)` of `desc`.
+fn desc_with_extra_params(desc: &str, extra: &str) -> String {
+    if extra.is_empty() {
+        return desc.to_string();
+    }
+    match desc.rfind(')') {
+        Some(i) => format!("{}{}{}", &desc[..i], extra, &desc[i..]),
+        None => desc.to_string(),
+    }
+}
+
+/// `(symbol, field name, field descriptor, JVM sort)` per capture.
+type CaptureSlots = Vec<(SymbolId, String, String, JvmSort)>;
+
+fn capture_slots(st: &SymbolTable, boxed: &HashSet<SymbolId>, class_id: SymbolId) -> CaptureSlots {
+    class_captures(st, class_id)
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            (
+                *c,
+                capture_field_name(st, *c, i),
+                capture_field_desc(st, boxed, *c),
+                capture_field_sort(boxed, st, *c),
+            )
+        })
+        .collect()
+}
+
+/// Read the capture fields into fresh locals at method entry, so the ordinary
+/// `Ident` path keeps finding the enclosing-method symbols in the frame.
+fn emit_capture_prologue(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    class_name: &str,
+    caps: &CaptureSlots,
+) {
+    for (id, fname, fdesc, sort) in caps {
+        asm.aload(0);
+        asm.getfield(class_name, fname, fdesc);
+        let slot = frame.alloc(*id, *sort);
+        store(asm, slot, *sort);
+    }
+}
+
+/// Push the current value of a captured local for a `new` of a capturing class.
+fn load_capture_arg(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, id: SymbolId) {
+    if let Some((slot, sort)) = frame.get(id) {
+        if is_boxed_var(ctx, id) {
+            // Forward the IntRef/ObjectRef itself, not its `elem`.
+            load(asm, slot, JvmSort::Ref);
+        } else {
+            load(asm, slot, sort);
+        }
+        return;
+    }
+    // Not a local here: we are inside a class that captured it as well.
+    let own = class_captures(ctx.st, ctx.class_sym);
+    if let Some(i) = own.iter().position(|c| *c == id) {
+        load_this(asm, ctx);
+        asm.getfield(
+            &class_internal(ctx.st, ctx.class_sym),
+            &capture_field_name(ctx.st, id, i),
+            &capture_field_desc(ctx.st, ctx.boxed_vars, id),
+        );
+        return;
+    }
+    throw_runtime(asm, &format!("cannot capture {}", ctx.st.get(id).name));
+    asm.aconst_null();
+}
+
 fn def_is_synthetic(st: &SymbolTable, def: &Tree) -> bool {
     if !def.sym.is_none() && st.get(def.sym).flags.contains(Flags::SYNTHETIC) {
         return true;
@@ -1502,6 +1612,15 @@ impl<'a> Gen<'a> {
                 desc: format!("L{};", class_internal(self.st, outer)),
             });
         }
+        // Enclosing-method locals read by the body of a class defined inside a
+        // method. Public so lambdas lifted out of this class can read them.
+        for (_, fname, fdesc, _) in capture_slots(self.st, &self.boxed_vars, class_id) {
+            b.fields.push(Field {
+                access: ACC_PUBLIC | ACC_FINAL,
+                name: fname,
+                desc: fdesc,
+            });
+        }
         for stt in &impl_.body {
             if let TreeKind::ValDef { name, mods, .. } = &stt.kind {
                 let ty = if stt.ty.is_no_type() && !stt.sym.is_none() {
@@ -1993,7 +2112,17 @@ impl<'a> Gen<'a> {
                 types.push(p.ty.clone());
             }
         }
-        let desc = jvm_method_desc(self.st, &types, &Type::Unit);
+        // Captures come last, after `$outer` and the source parameters.
+        let caps = capture_slots(self.st, &self.boxed_vars, class_id);
+        let mut cap_info = Vec::new();
+        for (id, fname, fdesc, sort) in &caps {
+            let slot = frame.alloc(*id, *sort);
+            cap_info.push((slot, *sort, fname.clone(), fdesc.clone()));
+        }
+        let desc = desc_with_extra_params(
+            &jvm_method_desc(self.st, &types, &Type::Unit),
+            &capture_params_desc(self.st, &self.boxed_vars, class_id),
+        );
         let super_name = b.super_name.clone();
         let (super_owner, super_desc, super_args) =
             parent_super_ctor(self.st, parents, &super_name);
@@ -2081,6 +2210,11 @@ impl<'a> Gen<'a> {
                 if fname.is_empty() {
                     continue;
                 }
+                asm.aload(0);
+                load(asm, *slot, *sort);
+                asm.putfield(&class_name, fname, fdesc);
+            }
+            for (slot, sort, fname, fdesc) in &cap_info {
                 asm.aload(0);
                 load(asm, *slot, *sort);
                 asm.putfield(&class_name, fname, fdesc);
@@ -2196,8 +2330,14 @@ impl<'a> Gen<'a> {
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
         let meth = def.sym;
+        let caps = if acc & ACC_STATIC == 0 {
+            capture_slots(self.st, &self.boxed_vars, class_id)
+        } else {
+            CaptureSlots::new()
+        };
         b.add_code(acc, name, &desc, max_locals, |asm| {
             let mut frame = frame;
+            emit_capture_prologue(asm, &mut frame, &class_name, &caps);
             let mut ctx = emit_ctx(
                 st,
                 class_id,
@@ -2915,8 +3055,10 @@ impl<'a> Gen<'a> {
             let mask = 1i32 << bit;
             bit += 1;
             let ret_ty = ty.clone();
+            let caps = capture_slots(self.st, &self.boxed_vars, class_id);
             b.add_code(ACC_PUBLIC, &fname, &desc, 4, |asm| {
                 let mut frame = Frame::instance();
+                emit_capture_prologue(asm, &mut frame, &class_name, &caps);
                 let lock = frame.alloc_tmp(JvmSort::Ref);
                 let result = frame.alloc_tmp(jvm_sort(&ret_ty));
                 asm.aload(0);
@@ -4247,7 +4389,10 @@ fn gen_new(
     let desc = if class_id.is_none() {
         desc
     } else {
-        with_enclosing_outer_param(ctx.st, class_id, &desc)
+        desc_with_extra_params(
+            &with_enclosing_outer_param(ctx.st, class_id, &desc),
+            &capture_params_desc(ctx.st, ctx.boxed_vars, class_id),
+        )
     };
     let field_tys: Vec<Type> = if !ctor_sym.is_none() && ctx.st.get(ctor_sym).name == "<init>" {
         match &ctx.st.get(ctor_sym).ty {
@@ -4277,6 +4422,9 @@ fn gen_new(
         if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
             emit_box(asm, &a.ty);
         }
+    }
+    for id in class_captures(ctx.st, class_id).to_vec() {
+        load_capture_arg(asm, frame, ctx, id);
     }
     asm.invokespecial(&internal, "<init>", &desc);
 }
@@ -7812,6 +7960,15 @@ fn is_jvm_primitive(ty: &Type) -> bool {
 fn collect_boxed_vars(tree: &Tree, st: &SymbolTable) -> HashSet<SymbolId> {
     let mut out = HashSet::new();
     walk_boxed_vars(tree, st, &mut out);
+    // A `var` captured by a class defined inside a method is shared with the
+    // enclosing method, exactly like one captured by a lambda.
+    for s in &st.symbols {
+        for c in &s.captures {
+            if st.get(*c).flags.contains(Flags::MUTABLE) {
+                out.insert(*c);
+            }
+        }
+    }
     out
 }
 
@@ -8033,8 +8190,28 @@ fn collect_free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>,
         TreeKind::Return { expr } | TreeKind::Throw { expr } => {
             collect_free(expr, bound, out, st);
         }
+        TreeKind::New { tpt } => {
+            // Instantiating a class that captures enclosing-method locals reads
+            // those locals right here.
+            if let Some(cid) = new_class_sym(st, tpt) {
+                for c in &st.get(cid).captures {
+                    if !bound.contains(c) && !out.contains(c) {
+                        out.push(*c);
+                    }
+                }
+            }
+            collect_free(tpt, bound, out, st);
+        }
         _ => {}
     }
+}
+
+/// Class symbol instantiated by `new <tpt>`, if it is known.
+fn new_class_sym(st: &SymbolTable, tpt: &Tree) -> Option<SymbolId> {
+    if !tpt.sym.is_none() && st.get(tpt.sym).is_class_like() {
+        return Some(tpt.sym);
+    }
+    st.class_sym_of(&tpt.ty)
 }
 
 fn is_partial_function_ty(st: &SymbolTable, ty: &Type) -> bool {
