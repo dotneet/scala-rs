@@ -6299,6 +6299,72 @@ impl Typer {
         self.st.pop_scope();
     }
 
+    /// `::` is entered both as the class `$colon$colon` and as an alias symbol
+    /// carrying its type. Patterns need the real class, which holds the
+    /// constructor fields.
+    fn follow_class_alias(&self, id: SymbolId) -> SymbolId {
+        if !self.st.get(id).ctor_fields.is_empty() {
+            return id;
+        }
+        if let Type::Class { sym, .. } = &self.st.get(id).ty {
+            if *sym != id && self.st.get(*sym).kind == SymKind::Class {
+                return *sym;
+            }
+        }
+        id
+    }
+
+    /// Recover a constructor pattern's type arguments from the scrutinee:
+    /// matching `Option[Int]` against `Some` gives `Some[Int]`. Walks the
+    /// pattern class's base types to find the scrutinee's class.
+    fn pattern_class_args(&self, class_id: SymbolId, sel_ty: &Type) -> Vec<Type> {
+        let tps = self.st.get(class_id).tparams.clone();
+        if tps.is_empty() {
+            return Vec::new();
+        }
+        let Some(sel_sym) = self.st.class_sym_of(sel_ty) else {
+            return Vec::new();
+        };
+        let self_ty = Type::Class {
+            sym: class_id,
+            args: tps.iter().map(|t| Type::TypeParam(*t)).collect(),
+        };
+        let mut cands = vec![self_ty];
+        let mut work: Vec<Type> = self
+            .st
+            .get(class_id)
+            .parents
+            .iter()
+            .map(|p| self.st.subst_tparams(class_id, &[], p))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(p) = work.pop() {
+            let Some(psym) = self.st.class_sym_of(&p) else {
+                continue;
+            };
+            if !seen.insert(psym.0) {
+                continue;
+            }
+            for q in self.st.get(psym).parents.clone() {
+                work.push(self.st.subst_as_seen_from(&p, &q));
+            }
+            cands.push(p);
+        }
+        for c in cands {
+            if self.st.class_sym_of(&c) != Some(sel_sym) {
+                continue;
+            }
+            let args: Vec<Type> = tps
+                .iter()
+                .map(|tp| unify_one(*tp, &c, sel_ty).unwrap_or(Type::Any))
+                .collect();
+            if args.iter().any(|a| !matches!(a, Type::Any)) {
+                return args;
+            }
+        }
+        Vec::new()
+    }
+
     fn type_pattern(&mut self, pat: &mut Tree, sel_ty: &Type) {
         match &mut pat.kind {
             TreeKind::Wildcard => {
@@ -6360,6 +6426,7 @@ impl Typer {
                         .lookup(n)
                         .into_iter()
                         .find(|s| self.st.get(*s).kind == SymKind::Class)
+                        .map(|s| self.follow_class_alias(s))
                 });
                 if class_id.is_some() {
                     self.reorder_named_pattern_args(args, class_id.unwrap());
@@ -6387,15 +6454,23 @@ impl Typer {
                 if use_ctor {
                     let class_id = class_id.unwrap();
                     let fields = self.st.get(class_id).ctor_fields.clone();
+                    // `case Some(x)` on an `Option[Int]` binds `x: Int`: recover
+                    // the pattern class's arguments from the scrutinee.
+                    let cargs = self.pattern_class_args(class_id, sel_ty);
                     let class_ty = Type::Class {
                         sym: class_id,
-                        args: vec![],
+                        args: cargs.clone(),
                     };
                     for (i, a) in args.iter_mut().enumerate() {
                         let ft = fields
                             .get(i)
                             .map(|f| self.st.get(*f).ty.clone())
                             .unwrap_or(Type::Any);
+                        let ft = if cargs.is_empty() {
+                            ft
+                        } else {
+                            self.st.subst_tparams(class_id, &cargs, &ft)
+                        };
                         self.type_pattern(a, &ft);
                     }
                     pat.ty = class_ty;

@@ -214,6 +214,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         None
     };
     add_option_members(st, option_wf, library_abi);
+    add_cons_members(st, library_abi);
     add_list_members(st, with_filter, iterator, library_abi);
     add_function_types(st);
     add_partial_function(st);
@@ -3151,22 +3152,65 @@ fn add_option_members(st: &mut SymbolTable, option_wf: SymbolId, library_abi: bo
     let some = st.some_sym;
     let sa = type_param(st, some, "A");
     st.get_mut(some).tparams = vec![sa];
+    let tsa = Type::TypeParam(sa);
+    // `Some[A] extends Option[A]`: without the argument a `case Some(x)` on an
+    // `Option[Int]` cannot recover `Int`.
+    st.get_mut(some).parents = vec![Type::Class {
+        sym: o,
+        args: vec![tsa.clone()],
+    }];
     method(
         st,
         some,
         "<init>",
-        vec![Type::Any],
+        vec![tsa.clone()],
         Type::Class {
             sym: some,
-            args: vec![],
+            args: vec![tsa.clone()],
         },
         Intrinsic::None,
     );
     st.get_mut(some).ctor_fields = {
-        let f = st.alloc("value", some, SymKind::Term, Flags::PARAM, "");
-        st.get_mut(f).ty = Type::Any;
+        // The jar's `Some.value` field is private; destructuring goes through
+        // the `value()` accessor. The private runtime keeps a public field.
+        let acc = if library_abi { "value" } else { "" };
+        let f = st.alloc("value", some, SymKind::Term, Flags::PARAM, acc);
+        st.get_mut(f).ty = tsa;
         vec![f]
     };
+    st.get_mut(st.none_sym).parents = vec![Type::Class {
+        sym: o,
+        args: vec![Type::Nothing],
+    }];
+}
+
+fn add_cons_members(st: &mut SymbolTable, library_abi: bool) {
+    let cons = st.cons_sym;
+    let ca = type_param(st, cons, "A");
+    st.get_mut(cons).tparams = vec![ca];
+    let tca = Type::TypeParam(ca);
+    let list_ca = Type::Class {
+        sym: st.list_sym,
+        args: vec![tca.clone()],
+    };
+    // `::[A] extends List[A]`, so `case h :: t` on a `List[Int]` binds `h: Int`.
+    st.get_mut(cons).parents = vec![list_ca.clone()];
+    st.get_mut(st.nil_sym).parents = vec![Type::Class {
+        sym: st.list_sym,
+        args: vec![Type::Nothing],
+    }];
+    let (head_acc, tail_acc) = if library_abi {
+        ("head", "tail")
+    } else {
+        ("", "")
+    };
+    let h = st.alloc("head", cons, SymKind::Term, Flags::PARAM, head_acc);
+    st.get_mut(h).ty = tca;
+    let t = st.alloc("tl", cons, SymKind::Term, Flags::PARAM, tail_acc);
+    st.get_mut(t).ty = list_ca;
+    st.get_mut(cons).ctor_fields = vec![h, t];
+    let f = st.get(cons).flags.with(Flags::CASE);
+    st.get_mut(cons).flags = f;
 }
 
 fn add_list_members(

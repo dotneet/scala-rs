@@ -9523,7 +9523,19 @@ fn gen_pattern(
                     let fdesc = jvm_desc(ctx.st, &fty);
                     load(asm, tmp, JvmSort::Ref);
                     asm.checkcast(&jvm);
-                    asm.getfield(&jvm, &fname, &fdesc);
+                    // Library classes keep the field private; `jvm_name` on the
+                    // constructor field names the accessor to call instead.
+                    let acc = ctx.st.get(*fid).jvm_name.clone();
+                    if acc.is_empty() {
+                        asm.getfield(&jvm, &fname, &fdesc);
+                    } else {
+                        asm.invokevirtual(&jvm, &acc, &format!("(){fdesc}"));
+                    }
+                    // A field declared as a type parameter erases to Object, so
+                    // `case Some(x)` on an `Option[Int]` must unbox before it binds.
+                    if fdesc == "Ljava/lang/Object;" {
+                        emit_from_erased_object(asm, ctx.st, &a.ty);
+                    }
                     bind_subpattern(asm, frame, ctx, a, fail);
                 } else {
                     throw_runtime(asm, "pattern arity");
@@ -9569,7 +9581,16 @@ fn bind_subpattern(
         TreeKind::Wildcard | TreeKind::Empty => {
             pop_if_value(asm, &pat.ty);
         }
-        TreeKind::Ident { .. } | TreeKind::Bind { .. } => {
+        // A lowercase identifier binds; `Nil` and other stable ids must be
+        // compared, so they fall through to `gen_pattern` below.
+        TreeKind::Ident { name }
+            if name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_lowercase() || c == '_')
+                || pat.sym.is_none()
+                || ctx.st.get(pat.sym).kind == SymKind::Term =>
+        {
             let sort = jvm_sort(&pat.ty);
             let slot = if pat.sym.is_none() {
                 frame.alloc_tmp(sort)
@@ -9580,24 +9601,13 @@ fn bind_subpattern(
             };
             store(asm, slot, sort);
         }
-        TreeKind::Literal { lit } => {
-            gen_literal(asm, lit);
-            match jvm_sort(&pat.ty) {
-                JvmSort::Int => asm.if_icmpne(fail),
-                JvmSort::Ref => {
-                    asm.invokevirtual("java/lang/Object", "equals", "(Ljava/lang/Object;)Z");
-                    asm.ifeq(fail);
-                }
-                _ => {
-                    asm.pop();
-                    asm.pop();
-                }
-            }
-        }
-        TreeKind::Typed { expr, .. } => bind_subpattern(asm, frame, ctx, expr, fail),
-        TreeKind::Star { elem } => bind_subpattern(asm, frame, ctx, elem, fail),
         _ => {
-            pop_if_value(asm, &pat.ty);
+            // Nested patterns (`case h :: Nil`, `case Some(Some(x))`) need the
+            // full matcher, which reads its value from a local.
+            let sort = jvm_sort(&pat.ty);
+            let tmp = frame.alloc_tmp(sort);
+            store(asm, tmp, sort);
+            gen_pattern(asm, frame, ctx, pat, tmp, sort, fail);
         }
     }
 }

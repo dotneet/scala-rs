@@ -3069,7 +3069,83 @@ impl<'a> Parser<'a> {
         self.parse_pattern3()
     }
 
+    /// `Pattern3 ::= SimplePattern { id [nl] SimplePattern }`. nsc desugars an
+    /// infix pattern `p op q` to the extractor call `op(p, q)`, so `h :: t` is
+    /// `::(h, t)`. `|` stays alternation and is handled by `parse_pattern`.
     fn parse_pattern3(&mut self) -> Tree {
+        self.parse_infix_pattern(0)
+    }
+
+    fn parse_infix_pattern(&mut self, min_prec: i32) -> Tree {
+        let mut left = self.parse_simple_pattern();
+        loop {
+            let saved = self.pos;
+            if matches!(self.kind(), TokenKind::Newline) {
+                self.skip_nl();
+            }
+            let Some(op) = self.ident_text() else {
+                self.pos = saved;
+                break;
+            };
+            // `|` is alternation and `*` closes a `_*` sequence pattern.
+            if op == "|" || op == "*" {
+                self.pos = saved;
+                break;
+            }
+            let prec = op_precedence(&op);
+            if prec < min_prec {
+                self.pos = saved;
+                break;
+            }
+            // A word-ident after a newline starts a new pattern, not an infix op.
+            if saved != self.pos && !is_operator_name(&op) {
+                self.pos = saved;
+                break;
+            }
+            let op_span = self.span();
+            self.bump();
+            if is_operator_name(&op) {
+                self.skip_nl();
+            }
+            if !self.looks_like_pattern_start() {
+                self.pos = saved;
+                break;
+            }
+            // Operators ending in `:` are right-associative (`a :: b :: c`).
+            let next_min = if op.ends_with(':') { prec } else { prec + 1 };
+            let right = self.parse_infix_pattern(next_min);
+            let fun = self.alloc(op_span, TreeKind::Ident { name: op });
+            left = self.alloc(
+                left.span.merge(right.span),
+                TreeKind::Apply {
+                    fun: Box::new(fun),
+                    args: vec![left, right],
+                },
+            );
+        }
+        left
+    }
+
+    fn looks_like_pattern_start(&self) -> bool {
+        matches!(
+            self.kind(),
+            TokenKind::Ident(_)
+                | TokenKind::This
+                | TokenKind::Underscore
+                | TokenKind::LParen
+                | TokenKind::True
+                | TokenKind::False
+                | TokenKind::Null
+                | TokenKind::IntLit(_)
+                | TokenKind::LongLit(_)
+                | TokenKind::DoubleLit(_)
+                | TokenKind::FloatLit(_)
+                | TokenKind::CharLit(_)
+                | TokenKind::StringLit(_)
+        )
+    }
+
+    fn parse_simple_pattern(&mut self) -> Tree {
         self.skip_nl();
         match self.kind().clone() {
             TokenKind::Underscore => {
