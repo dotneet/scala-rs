@@ -3060,3 +3060,38 @@ fn fixtures_either_ops_bad_is_error() {
 fn fixtures_either_ops_needs_scala_library() {
     compile_fails("either_ops", "Either");
 }
+
+/// `option_x1` only uses members the private runtime also implements, so it
+/// runs in both modes with identical output.
+#[test]
+fn fixtures_option_x1() {
+    check("option_x1");
+}
+
+#[test]
+fn scala_library_dual_run_option_x1() {
+    dual_run_fixture("option_x1");
+}
+
+#[test]
+fn scala_library_dual_run_option_x2() {
+    dual_run_fixture("option_x2");
+}
+
+#[test]
+fn fixtures_option_x1_bad_is_error() {
+    compile_fails("option_x1_bad", "noSuchOptionMember is not a member");
+}
+
+#[test]
+fn fixtures_option_x2_bad_is_error() {
+    compile_fails_lib("option_x2_bad", "noSuchEitherMember is not a member");
+}
+
+/// `Option.toRight` / `collect` / `flatten` need the real library ABI; the
+/// private runtime must reject them rather than emit a call that would not
+/// link.
+#[test]
+fn fixtures_option_x2_needs_scala_library() {
+    compile_fails("option_x2", "toList");
+}

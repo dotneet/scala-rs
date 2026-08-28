@@ -6187,6 +6187,14 @@ impl Typer {
         if matches!(arg, Type::Function { .. }) && matches!(param, Type::Function { .. }) {
             return Some(8);
         }
+        // A `{ case … }` literal reaches overload resolution as a one-parameter
+        // function; it inhabits a `PartialFunction[A, B]` parameter
+        // (`Try.recover`, `Option.collect`, `List.collect`).
+        if matches!(arg, Type::Function { params, .. } if params.len() == 1)
+            && partial_function_type(&self.st, param).is_some()
+        {
+            return Some(7);
+        }
         if matches!(param, Type::TypeParam(_)) || matches!(arg, Type::TypeParam(_)) {
             return Some(2);
         }
@@ -6213,7 +6221,15 @@ impl Typer {
             None
         };
         let (pts, ret_pt) = if let Some((from, to)) = &pf_result {
-            (vec![from.clone()], to.clone())
+            // The prelude spells the result of `collect` / `recover` as `Any`
+            // because the real signature is polymorphic. Leave it open so the
+            // case bodies supply it and `Option[String]` survives.
+            let to = if matches!(to, Type::Any) {
+                Type::NoType
+            } else {
+                to.clone()
+            };
+            (vec![from.clone()], to)
         } else if let Some(sam) = &sam {
             (sam.param_tys.clone(), sam.ret_ty.clone())
         } else {
@@ -6287,7 +6303,15 @@ impl Typer {
             ret_pt
         };
         self.st.pop_scope();
-        if pf_result.is_some() {
+        if let Some((from, to)) = pf_result {
+            if let (Type::Any, Type::Class { sym, .. }) = (&to, pt) {
+                if !ret.is_no_type() && !ret.is_error() {
+                    return Type::Class {
+                        sym: *sym,
+                        args: vec![from, ret.widen_constant()],
+                    };
+                }
+            }
             pt.clone()
         } else if sam.is_some() && param_tys.len() == pts.len() {
             pt.clone()

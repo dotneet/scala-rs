@@ -310,7 +310,179 @@ fn emit_option() -> EmittedClass {
         },
     );
 
+    add_option_predicates(&mut b);
+    add_option_filters(&mut b);
+
     b.finish()
+}
+
+/// `isDefined` / `nonEmpty` / `getOrElse` / `contains` / `exists` / `forall`,
+/// with the same erased descriptors the real `scala.Option` publishes.
+fn add_option_predicates(b: &mut B) {
+    for name in ["isDefined", "nonEmpty"] {
+        b.add_code(ACC_PUBLIC, name, "()Z", 1, |asm| {
+            asm.aload(0);
+            asm.invokevirtual("scala/Option", "isEmpty", "()Z");
+            let empty = asm.fresh_label();
+            asm.ifne(empty);
+            asm.iconst(1);
+            asm.ireturn();
+            asm.mark(empty);
+            asm.iconst(0);
+            asm.ireturn();
+        });
+    }
+
+    b.add_code(
+        ACC_PUBLIC,
+        "getOrElse",
+        "(Lscala/Function0;)Ljava/lang/Object;",
+        2,
+        |asm| {
+            asm.aload(0);
+            asm.invokevirtual("scala/Option", "isEmpty", "()Z");
+            let nonempty = asm.fresh_label();
+            asm.ifeq(nonempty);
+            asm.aload(1);
+            asm.invokeinterface("scala/Function0", "apply", "()Ljava/lang/Object;");
+            asm.areturn();
+            asm.mark(nonempty);
+            asm.aload(0);
+            asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
+            asm.areturn();
+        },
+    );
+
+    // nsc: `!isEmpty && this.get == elem` — `==` is null-safe equality.
+    b.add_code(ACC_PUBLIC, "contains", "(Ljava/lang/Object;)Z", 2, |asm| {
+        asm.aload(0);
+        asm.invokevirtual("scala/Option", "isEmpty", "()Z");
+        let empty = asm.fresh_label();
+        asm.ifne(empty);
+        asm.aload(0);
+        asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
+        asm.aload(1);
+        asm.invokestatic(
+            "java/util/Objects",
+            "equals",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+        );
+        asm.ireturn();
+        asm.mark(empty);
+        asm.iconst(0);
+        asm.ireturn();
+    });
+
+    // `exists` is false on None, `forall` is true on None.
+    for (name, on_empty) in [("exists", 0), ("forall", 1)] {
+        b.add_code(ACC_PUBLIC, name, "(Lscala/Function1;)Z", 2, move |asm| {
+            asm.aload(0);
+            asm.invokevirtual("scala/Option", "isEmpty", "()Z");
+            let empty = asm.fresh_label();
+            asm.ifne(empty);
+            asm.aload(1);
+            asm.aload(0);
+            asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
+            asm.invokeinterface(
+                "scala/Function1",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            );
+            asm.checkcast("java/lang/Boolean");
+            asm.invokevirtual("java/lang/Boolean", "booleanValue", "()Z");
+            asm.ireturn();
+            asm.mark(empty);
+            asm.iconst(on_empty);
+            asm.ireturn();
+        });
+    }
+}
+
+/// `filter` / `filterNot` / `orElse` / `fold`.
+fn add_option_filters(b: &mut B) {
+    // `filter` keeps `this` when the predicate holds, `filterNot` when it does
+    // not; both keep `None` as is.
+    for (name, keep_when) in [("filter", true), ("filterNot", false)] {
+        b.add_code(
+            ACC_PUBLIC,
+            name,
+            "(Lscala/Function1;)Lscala/Option;",
+            2,
+            move |asm| {
+                asm.aload(0);
+                asm.invokevirtual("scala/Option", "isEmpty", "()Z");
+                let keep = asm.fresh_label();
+                asm.ifne(keep);
+                asm.aload(1);
+                asm.aload(0);
+                asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
+                asm.invokeinterface(
+                    "scala/Function1",
+                    "apply",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                );
+                asm.checkcast("java/lang/Boolean");
+                asm.invokevirtual("java/lang/Boolean", "booleanValue", "()Z");
+                if keep_when {
+                    asm.ifne(keep);
+                } else {
+                    asm.ifeq(keep);
+                }
+                asm.getstatic("scala/None$", "MODULE$", "Lscala/None$;");
+                asm.areturn();
+                asm.mark(keep);
+                asm.aload(0);
+                asm.areturn();
+            },
+        );
+    }
+
+    b.add_code(
+        ACC_PUBLIC,
+        "orElse",
+        "(Lscala/Function0;)Lscala/Option;",
+        2,
+        |asm| {
+            asm.aload(0);
+            asm.invokevirtual("scala/Option", "isEmpty", "()Z");
+            let this = asm.fresh_label();
+            asm.ifeq(this);
+            asm.aload(1);
+            asm.invokeinterface("scala/Function0", "apply", "()Ljava/lang/Object;");
+            asm.checkcast("scala/Option");
+            asm.areturn();
+            asm.mark(this);
+            asm.aload(0);
+            asm.areturn();
+        },
+    );
+
+    // nsc: `def fold[B](ifEmpty: => B)(f: A => B): B`, one JVM method.
+    b.add_code(
+        ACC_PUBLIC,
+        "fold",
+        "(Lscala/Function0;Lscala/Function1;)Ljava/lang/Object;",
+        3,
+        |asm| {
+            asm.aload(0);
+            asm.invokevirtual("scala/Option", "isEmpty", "()Z");
+            let nonempty = asm.fresh_label();
+            asm.ifeq(nonempty);
+            asm.aload(1);
+            asm.invokeinterface("scala/Function0", "apply", "()Ljava/lang/Object;");
+            asm.areturn();
+            asm.mark(nonempty);
+            asm.aload(2);
+            asm.aload(0);
+            asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
+            asm.invokeinterface(
+                "scala/Function1",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            );
+            asm.areturn();
+        },
+    );
 }
 
 fn emit_some() -> EmittedClass {

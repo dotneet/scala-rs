@@ -5504,6 +5504,23 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
             );
             return;
         }
+        // nsc: `def flatten[B](implicit ev: A <:< Option[B]): Option[B]`. The
+        // evidence is erased, so `<:<.refl` (an `=:=`, hence a `<:<`) is the
+        // witness scalac itself would summon.
+        if name == "flatten" && is_stdlib_option(&owner) {
+            asm.getstatic(
+                "scala/$less$colon$less$",
+                "MODULE$",
+                "Lscala/$less$colon$less$;",
+            );
+            asm.invokevirtual("scala/$less$colon$less$", "refl", "()Lscala/$eq$colon$eq;");
+            asm.invokevirtual(
+                "scala/Option",
+                "flatten",
+                "(Lscala/$less$colon$less;)Lscala/Option;",
+            );
+            return;
+        }
         if owner == "scala/collection/WithFilter" && (name == "map" || name == "flatMap") {
             asm.invokevirtual(&owner, name, "(Lscala/Function1;)Ljava/lang/Object;");
             if let Some(ty) = result_ty {
