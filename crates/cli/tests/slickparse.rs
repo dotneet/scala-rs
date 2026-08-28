@@ -163,3 +163,36 @@ fn fails_with(name: &str, extra: &[&str], needle: &str) {
 fn catch_of_a_partial_function_value() {
     same_as_scalac("slickparse_catch_expr", &[]);
 }
+
+// ------------------------------------------- `-Xsource:3` varargs patterns
+
+/// `case Cast(ch*)` is the Scala 3 spelling of `case Cast(ch @ _*)`. nsc
+/// accepts it under `-Xsource:3` and `-Xsource:3-cross` only.
+#[test]
+fn pattern_star_with_xsource3() {
+    same_as_scalac("slickparse_pattern_star", &["-Xsource:3"]);
+}
+
+#[test]
+fn pattern_star_with_xsource3_cross() {
+    same_as_scalac("slickparse_pattern_star", &["-Xsource:3-cross"]);
+}
+
+/// Plain 2.13 rejects it with nsc's own wording.
+#[test]
+fn pattern_star_needs_xsource3() {
+    fails_with(
+        "slickparse_pattern_star_bad",
+        &[],
+        "bad simple pattern: use _* to match a sequence",
+    );
+}
+
+#[test]
+fn pattern_star_rejected_at_source_2_13() {
+    fails_with(
+        "slickparse_pattern_star_bad",
+        &["-Xsource:2.13"],
+        "bad simple pattern: use _* to match a sequence",
+    );
+}

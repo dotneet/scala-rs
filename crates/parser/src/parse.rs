@@ -3499,6 +3499,46 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// At `*` closing the last argument of an extractor pattern — `Cast(ch*)`,
+    /// the `-Xsource:3` spelling of `Cast(ch @ _*)`. A `*` with a pattern after
+    /// it is the infix extractor `p * q` instead, which nsc keeps accepting at
+    /// every source level, so only a `*` immediately before `)` counts.
+    fn at_trailing_pattern_star(&self) -> bool {
+        matches!(self.kind(), TokenKind::Ident(s) if s == "*")
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::RParen)
+            )
+    }
+
+    /// Consume that `*` and build `name @ _*`, which is what nsc rewrites
+    /// `name*` to. Off `-Xsource:3` the spelling is rejected with nsc's own
+    /// message rather than silently accepted.
+    fn finish_pattern_star(&mut self, name_span: Span, name: String) -> Tree {
+        let star_span = self.span();
+        self.bump();
+        if !self.opts.source3 {
+            self.error_span(
+                star_span,
+                "bad simple pattern: use _* to match a sequence".to_string(),
+            );
+        }
+        let wild = self.alloc(star_span, TreeKind::Wildcard);
+        let star = self.alloc(
+            star_span,
+            TreeKind::Star {
+                elem: Box::new(wild),
+            },
+        );
+        self.alloc(
+            name_span.merge(star_span),
+            TreeKind::Bind {
+                name,
+                body: Box::new(star),
+            },
+        )
+    }
+
     fn parse_simple_pattern(&mut self) -> Tree {
         self.skip_nl();
         match self.kind().clone() {
@@ -3542,6 +3582,12 @@ impl<'a> Parser<'a> {
                             elem: Box::new(wild),
                         },
                     );
+                }
+                if let TreeKind::Ident { name } = &t.kind {
+                    if self.at_trailing_pattern_star() {
+                        let name = name.clone();
+                        return self.finish_pattern_star(t.span, name);
+                    }
                 }
                 t
             }
