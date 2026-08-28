@@ -263,6 +263,58 @@ Cargo workspace のクレート:
 | `scala-rs-driver` | パイプライン駆動 |
 | `scala-rs-cli` | コマンドライン。バイナリ名 `scala-rs` |
 
+### ScalaSignature からのシンボル自動供給（pickle リーダ）
+
+標準ライブラリのメンバは現在 `crates/typer/src/prelude*.rs` に手書きしています。
+2.13 互換に到達するにはこの方式では足りないので、
+**scala-library の classfile に埋まっている `ScalaSignature`（nsc PickleFormat）を読んで
+シンボルを自動供給する**経路を作っています。現状は次の 2 層まで実装済みです。
+
+| モジュール | 役割 |
+| --- | --- |
+| `crates/backend/src/pickle.rs` | pickle **ライタ**（既存。nsc PickleFormat のサブセット） |
+| `crates/backend/src/pickle_read.rs` | pickle **リーダ**（新規）。バイト列 → エントリ表 |
+| `crates/backend/src/pickle_sym.rs` | エントリ表 → クラスシグネチャ。親クラスを辿ってメンバを解決 |
+| `crates/backend/src/load.rs` | `scala_signature_bytes`。`ScalaLongSignature`（配列値）も扱う |
+
+`pickle_read.rs` は nsc 2.13 `PickleFormat.scala` のタグを**全て**扱います
+（シンボル / 型 / リテラル / `SYMANNOT` / `ANNOTINFO` / `CHILDREN` / `TREE` 各種 / `MODIFIERS`）。
+方針として**未知タグや長さの合わない本体は握り潰さず `ReadError` にします**。
+各エントリは宣言された長さをぴったり消費したことを検証するので、
+形式の取り違えはそのままテストの失敗になります。
+
+`pickle_sym.rs` の `SigLoader` は親クラスの classfile を `ClassSource` 越しにオンデマンドで開き、
+継承したメンバを宣言元ごと返します。実 jar に対して次が**手書きなしで**復元できています。
+
+```
+List#filter (from scala.collection.IterableOps): (pred: scala.Function1[A, scala.Boolean])C
+List#sum    (from scala.collection.IterableOnceOps): [B](implicit num: scala.math.Numeric[B])B
+```
+
+**まだ型検査経路には繋いでいません。** `crates/typer` は `crates/backend` に依存できない
+（依存は逆向き）ため、`SigType` → `scala_rs_parser::Type` の最後の一段と `SymbolTable` への
+投入は未着手です。移行の方針は次を想定しています。
+
+1. リーダ（`pickle_read.rs` / `pickle_sym.rs`）を `typer` から使える位置に移すか、
+   共通クレートに切り出す。`pickle_read.rs` は `pickle::MAJOR` 以外に backend 依存を持たない。
+2. `javaclass.rs` と同じくオンデマンドで引く。`List` を参照した時点で
+   `scala/collection/immutable/List.class` の pickle を読む。全先読みは遅い。
+3. **手書き prelude を優先**し、そこに無いメンバだけ pickle から補完する。
+   段階的に入れて既存 fixture を壊さないため。
+4. codegen 側は erase 済み descriptor と checkcast が必要なので、
+   シグネチャ供給が通っても `gen.rs` 側は別途対応が要る。
+
+### 2.13.16 の pickle で分かったこと
+
+- `List$.class` には `ScalaSignature` が**無い**。companion pair の pickle は
+  クラス側の classfile にしか置かれないので、module class は companion にフォールバックする。
+- 純 Java 由来のクラス（`BoxesRunTime` / `*Ref` / `ScalaNumber` / `scala.collection.concurrent` の
+  ノード類）は `ScalaSignature` を持たない。
+- `pflags`（pickle 上の flag ビット）は bit 0..=31 だけ名前を付けている。
+  nsc は下位 12bit を `rawToPickledFlags` で並べ替えるため raw の Flags 位置とは違う。
+  32bit 以上（`LAZY` / `VARARGS` など）は値としては読めるが、
+  位置を取り違えるとシンボルを黙って誤分類するので名前を付けていない。
+
 ## scalac 2.13 との比較
 
 正直な差分です。
@@ -288,6 +340,22 @@ scalac の代替ではありません。サブセットの再実装です。
 ```bash
 cargo test
 ```
+
+pickle リーダの回帰テストは `crates/backend/tests/pickle_lib_jar.rs` です。
+`/tmp/scala-rs-lib/scala-library-2.13.16.jar`（または `SCALA_LIBRARY_JAR`）があるとき、
+jar の**全 classfile**を走査して次を見ます。jar が無ければスキップします。
+
+- `reads_every_pickle_in_scala_library`: `@ScalaSignature` / `@ScalaLongSignature` を
+  宣言している classfile（2.13.16 では 2891 個中 799 個）の pickle が**全て**読めること。
+  「宣言しているか」は定数プールのディスクリプタのバイト検索という独立した判定で見るので、
+  抽出漏れも失敗になる。合計 169275 エントリ。主要タグが実際に登場していることも確認する。
+- `list_pickle_has_the_collection_members`: `List.class` の pickle から `List` と `map`。
+- `resolves_inherited_list_members_through_parents`: `List#filter` / `sum` / `mkString` /
+  `map` / `flatMap` / `head` / `foldLeft` を**親クラスを辿って**解決できること。
+- `resolves_module_class_members`: module class（`object List`）の解決。
+
+自前ライタが書いた pickle を自前リーダで読み直すテストは
+`crates/backend/src/pickle_read.rs` と `pickle_sym.rs` のユニットテストです。
 
 実行時の期待値は `tests/fixtures/` にあります。各 `.scala` に対して `tests/fixtures/expected/` に同名の `.txt`（`println` と同じ末尾改行付きの stdout）を置いています。`java` がある環境では CLI の e2e が stdout を比較します。
 
@@ -497,6 +565,13 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 - 残りの **StringOps**（`++` / `lengthIs` / `sizeIs` / `flatMap` / `iterator` / `sizeCompare` / `knownSize` / `appendedAll` / `prependedAll` / `>` / `>=` / `<=` / `compare` / `lengthCompare` / `patch(Int, String, Int)` / `<` / `map`（`Char => Char`）/ `:+` / `+:` / `foldRight` / `toByteOption` / `toShortOption` / `toFloatOption` / `grouped` / `foldLeft` / `toByte` / `toShort` / `toFloat` / `toLongOption` / `toDoubleOption` / `find` / `foreach` / `toBoolean` / `toBooleanOption` / `dropWhile` / `takeWhile` / `nonEmpty` / `headOption` / `lastOption` / `filterNot` / `indices` / `r` / `sorted` / `toArray` / `copyToArray` / `partition` / `exists` / `forall` / `splitAt` / `updated` / `count` / `span` / `diff` / `intersect` / `split(String)` / `filter` / `reverseIterator` 以外）
 - 残りの **ArrayOps**（`lengthIs` / `sizeIs` / `indexOf` / `copyToArray` / `iterator` / `zipWithIndex` / `knownSize` / `sizeCompare` / `filterNot` / `headOption` / `lastOption` / `partition` / `splitAt` / `span` / `find` / `contains` / `distinct` / `takeRight` / `dropRight` / `takeWhile` / `indices` / `lengthCompare` / `last` / `init` / `reverse` / `size` / `isEmpty` / `nonEmpty` / `scanLeft` / `count` / `forall` / `foldLeft` / `fold` / `foldRight` / `drop` / `dropWhile` / `exists` / `take` / `collect` / `zip` / `filter` / `slice` / 3 引数 `flatMap` / 4 引数 Array→Iterable `flatMap` と primitive wrappers / `genericArrayOps` の `head`/`map`/`foreach`/`tail` は揃った。他メソッド。`reduce` は 2.13.16 ArrayOps に無い）
 - 他の mutable（`ArrayDeque` / `LinkedHashMap` / `LinkedHashSet` / `HashMap` / `HashSet` / `ArrayBuffer` / `ListBuffer` 以外）と他の immutable（`BitSet` / `SortedMap` / `TreeMap` / `SortedSet` / `TreeSet` / `Set` / `Map` / `Vector` 以外）。`scala.collection.View` の `List.view` / `map` / `toList` と `View.fill` / `View.iterate` は乗った（他の View は未）。`scala.util.control.Breaks` の `breakable` / `break` / `tryBreakable`+`catchBreak` は乗った（他の control は未）。`scala.math.BigInt` / `BigDecimal` の `apply(Int)` / `apply(String)` / `+` / `*` / `int2bigInt` は乗った（他の math は未）。`scala.util.chaining` の `pipe` / `tap` は乗った。`scala.util.Using.resource` / `Using.apply` / `Using.Manager` / `Using.resources`（2–4 引数）は乗った（他の Using は未）
+- **pickle からのシンボル自動供給の残り**: リーダ（`pickle_read.rs`）と
+  シグネチャ復元 + 継承解決（`pickle_sym.rs`）は動いていて jar 全体で緑。
+  未着手は (a) `SigType` → `scala_rs_parser::Type` の変換、
+  (b) `SymbolTable` への投入（手書き prelude 優先で、無いメンバだけ補完）、
+  (c) `typer` から使えるようにするクレート配置、
+  (d) 供給されたメンバの erase 済み descriptor / checkcast の codegen。
+  詳細は「ScalaSignature からのシンボル自動供給」節
 - **`@specialized` codegen** はこのスライスでは開始しない
 - 高階 `F[_] <% …` / `F[_]: C` は nsc どおり `takes type parameters`
 - placeholder の残り（より深い入れ子の完全再現。unary / Function2 / typed `_ : T` の必要形はこのスライスまで）
