@@ -10,9 +10,12 @@
 //! default メソッドなので、戻り値が `Object` に erase される。gen.rs 側で
 //! checkcast / unbox する。
 //!
-//! **私有ランタイム（`--no-scala-library`）では何も足さない。**
-//! 私有 `List` classfile はこれらのメソッドを持たないので、非 jar モードでは
-//! 従来どおり `value X is not a member of List[A]` の診断が出る。
+//! **私有ランタイム（`--no-scala-library`）** では、
+//! `crates/backend/src/runtime.rs` の `add_list_core_runtime` が実際に
+//! classfile へ出す分（`length` / `size` / `nonEmpty` / `last` / `reverse` /
+//! `filter` / `filterNot` / `contains` / `exists` / `forall` / `count` /
+//! `take` / `drop` / `mkString`）だけを宣言する。それ以外は宣言しないので
+//! `value X is not a member of List[A]` の診断が出る（黙って通さない）。
 
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};
@@ -532,7 +535,6 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
     }
 
     // `::` / `:::` / `+:` / `:+` / `++` も `B >: A` で多相。
-    let ta = env.ta();
     let existing = own_method(st, l, "::");
     poly_in(st, existing, l, "::", &["B"], usize::MAX, |t| {
         let b = t[0].clone();
@@ -544,7 +546,6 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
             },
         )
     });
-    let _ = ta;
 
     poly(st, l, ":::", &["B"], |t| {
         let b = t[0].clone();
