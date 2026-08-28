@@ -7151,6 +7151,8 @@ impl Typer {
                         args.push(lam);
                     } else if let Some(lam) = self.array_wrap_view(&pty, span) {
                         args.push(lam);
+                    } else if let Some(w) = self.conforms_witness_fallback(&pty, span) {
+                        args.push(w);
                     } else {
                         self.error(span, self.missing_implicit_message(&pty));
                     }
@@ -7453,6 +7455,81 @@ impl Typer {
         self.type_expr(&mut lam, pt);
         self.adapt(&mut lam, pt);
         Some(lam)
+    }
+
+    /// nsc resolves an implicit `A <:< B` / `A =:= B` parameter through
+    /// `<:<.refl[A]` (real 2.13.16 has no other generic witness backing these
+    /// — see `prelude_conform.rs`). That's a *polymorphic* implicit def (it
+    /// has its own `[A]`), and `search_implicit`/`implicit_provides`
+    /// (implicits.rs) only accept candidates whose type is already a fully
+    /// concrete, param-less `Type::Method` — they never unify a candidate's
+    /// own `tparams` against the requested `pt` the way `search_conversion`
+    /// does for extension-method views. So instead of trying to make
+    /// `<:<.refl` itself a discoverable implicit candidate, synthesize the
+    /// witness tree directly once `pt`'s shape is known: `A <:< B` (or
+    /// `A =:= B`) is provable iff `is_sub_type(A, B)` (both ways, for `=:=`)
+    /// holds under the same subtyping relation the rest of the typer uses,
+    /// and when it does, `<:<.refl[A]()` (of real nominal type `A =:= A`) is
+    /// a valid witness — `<:<`/`=:=`'s declared variance (`-From, +To`) makes
+    /// `A =:= A` a subtype of `A <:< B` whenever `A <: B`, exactly mirroring
+    /// how real scalac derives the same implicit.
+    fn conforms_witness_fallback(&self, pt: &Type, span: Span) -> Option<Tree> {
+        let Type::Class { sym, args } = pt else {
+            return None;
+        };
+        if args.len() != 2 {
+            return None;
+        }
+        let less_sym = crate::classpath::find_by_jvm(&self.st, "scala/$less$colon$less")?;
+        let eq_sym = crate::classpath::find_by_jvm(&self.st, "scala/$eq$colon$eq")?;
+        let (from, to) = (&args[0], &args[1]);
+        let provable = if *sym == eq_sym {
+            self.st.is_sub_type(from, to) && self.st.is_sub_type(to, from)
+        } else if *sym == less_sym {
+            self.st.is_sub_type(from, to)
+        } else {
+            return None;
+        };
+        if !provable {
+            return None;
+        }
+        let refl_owner = self.st.companion_module(less_sym)?;
+        let refl_cls = self.st.module_class_of(refl_owner);
+        let refl = self
+            .st
+            .lookup_member(refl_cls, "refl")
+            .into_iter()
+            .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)?;
+        let recv = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Ident { name: "<:<".into() },
+            ty: Type::ModuleRef(refl_owner),
+            sym: refl_owner,
+            postfix: false,
+        };
+        let fun = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(recv),
+                name: "refl".into(),
+            },
+            ty: self.st.get(refl).ty.clone(),
+            sym: refl,
+            postfix: false,
+        };
+        Some(Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Apply {
+                fun: Box::new(fun),
+                args: vec![],
+            },
+            ty: pt.clone(),
+            sym: refl,
+            postfix: false,
+        })
     }
 
     fn resolve_overload(

@@ -11,6 +11,7 @@ mod pickle_supply;
 mod prelude;
 mod prelude_arrconv;
 mod prelude_coll;
+mod prelude_conform;
 mod prelude_either;
 mod prelude_lang;
 mod prelude_lowbound;

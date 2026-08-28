@@ -3466,3 +3466,15 @@ fn fixtures_namedargs_unknown_bad_is_error() {
 fn fixtures_namedargs_order_bad_is_error() {
     compile_fails_lib("namedargs_order_bad", "positional after named argument.");
 }
+
+// scala.<:< / scala.=:= (type-constraint witnesses), Option.orNull, and
+// Iterable/IterableOnce.foreach. See crates/typer/src/prelude_conform.rs.
+#[test]
+fn scala_library_dual_run_conformty() {
+    dual_run_fixture("conformty");
+}
+
+#[test]
+fn fixtures_conformty_bad_is_error() {
+    compile_fails_lib("conformty_bad", "no implicit");
+}
