@@ -11569,7 +11569,8 @@ fn gen_pattern(
             // `case i: Int` / `case s: String` narrows an `Object` scrutinee,
             // so the bound value is unboxed or cast before it is stored.
             let want = jvm_sort(&pat.ty);
-            if want != sel_sort || jvm != "java/lang/Object" {
+            let binds = !matches!(expr.kind, TreeKind::Wildcard | TreeKind::Empty);
+            if binds && (want != sel_sort || jvm != "java/lang/Object") {
                 load(asm, tmp, sel_sort);
                 emit_from_erased_object(asm, ctx.st, &pat.ty);
                 let narrowed = frame.alloc_tmp(want);
@@ -11578,6 +11579,19 @@ fn gen_pattern(
             } else {
                 gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
             }
+        }
+        TreeKind::Alternative { trees } => {
+            // `case _: Int | _: String =>`: the first alternative that matches
+            // wins; only when they all fail does the case fail.
+            let ok = asm.fresh_label();
+            for alt in trees {
+                let next = asm.fresh_label();
+                gen_pattern(asm, frame, ctx, alt, tmp, sel_sort, next);
+                asm.goto(ok);
+                asm.mark(next);
+            }
+            asm.goto(fail);
+            asm.mark(ok);
         }
         _ => {}
     }

@@ -2440,6 +2440,31 @@ impl Typer {
     }
 
     fn type_parent_ctor_app(&mut self, tree: &mut Tree) {
+        // `extends A(1)(2)` arrives as nested Applies; the constructor takes
+        // one flat argument list on the JVM, so flatten the clauses.
+        loop {
+            let flat = match &mut tree.kind {
+                TreeKind::Apply { fun, args } => match &mut fun.kind {
+                    TreeKind::Apply {
+                        fun: inner_fun,
+                        args: inner_args,
+                    } => {
+                        let mut all = std::mem::take(inner_args);
+                        all.append(args);
+                        Some((
+                            std::mem::replace(inner_fun, Box::new(Tree::dummy(TreeKind::Empty))),
+                            all,
+                        ))
+                    }
+                    _ => None,
+                },
+                _ => return,
+            };
+            match flat {
+                Some((fun, args)) => tree.kind = TreeKind::Apply { fun, args },
+                None => break,
+            }
+        }
         let (fun, args) = match &mut tree.kind {
             TreeKind::Apply { fun, args } => (fun, args),
             _ => return,
@@ -2508,6 +2533,17 @@ impl Typer {
         if alts.is_empty() {
             return OverloadPick::None;
         }
+        // `extends A(1)(2)` and `new A(1)(2)` pass one flat argument list, so a
+        // multi-clause constructor is matched against its flattened clauses.
+        let flatten = |ty: Type| -> Type {
+            match ty {
+                Type::Method { paramss, ret } if paramss.len() > 1 => Type::Method {
+                    paramss: vec![paramss.into_iter().flatten().collect()],
+                    ret,
+                },
+                other => other,
+            }
+        };
         let fun_sym = alts[0];
         let fun_ty = if alts.len() == 1 {
             let ty = self.st.get(fun_sym).ty.clone();
@@ -2523,7 +2559,7 @@ impl Typer {
                     ret: Box::new(Type::Unit),
                 }
             } else {
-                ty
+                flatten(ty)
             }
         } else {
             Type::Overload(
@@ -2542,7 +2578,7 @@ impl Typer {
                                 ret: Box::new(Type::Unit),
                             }
                         } else {
-                            ty
+                            flatten(ty)
                         }
                     })
                     .collect(),
