@@ -309,7 +309,12 @@ slick の profile ケーキが多用する形を実 scalac 2.13.16 と突き合�
 
 `Rep[?]` のような**境界内のワイルドカード**、`Query[?, U, C]` のような**高階パラメータを型引数に渡す形**、`Profile#AbstractTable[?]` のような**型引数付き `#` 射影**、package object の**型パラメータ付き別名**（`type DBIO[+R] = DBIOAction[R, NoStream, Effect.All]`）は、いずれもこのスライスの前から通っていることを最小再現で確認しました。
 
-**残っているもの**: 高階型パラメータの**推論**（`def take[U, C[_]](q: Query[?, U, C])` に匿名サブクラスを渡すと `C` を合わせられない。明示の型引数なら通る）。
+計測（`tests/slick_measure.sh`、slick 177 ファイル、`-Xsource:3`）では、型検査エラーは **13,245 → 13,164**、そのうち **kind 関連のエラーは 605 → 34** になりました。「`X does not take type parameters`」の多くは実は**未解決の型名**で、今は `not found: type X` と正しく出ます。
+
+**残っているもの**:
+
+- 高階型パラメータの**推論**（`def take[U, C[_]](q: Query[?, U, C])` に匿名サブクラスを渡すと `C` を合わせられない。明示の型引数なら通る）
+- 残り 34 件の kind エラーはほぼ**別の担当**の下流です。`ColumnOption` / `::` / `Ordering` は `import slick.ast.*` の**スター形ワイルドカード import** が効いていないため（`import slick.ast._` は通る）、prelude の同名（`scala.math.Ordering` など）を拾ってしまっているものです。`IO` / `F` / `StreamIO` の kind 不一致は上の高階推論の穴です
 
 ## 実装していないもの
 
