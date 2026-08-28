@@ -252,5 +252,8 @@ fn fixtures_arrconv_gate_no_scala_library_is_error() {
 /// accepted by the private runtime either.
 #[test]
 fn fixtures_mapview_gate_no_scala_library_is_error() {
-    compile_fails_no_lib("mapview_gate", "view is not a member");
+    // Without the library `Map` itself is unavailable, so the gate holds at
+    // the constructor. `.view` is not reported: nsc does not follow a
+    // selection out of a receiver that already failed.
+    compile_fails_no_lib("mapview_gate", "not found: value Map");
 }

@@ -4220,13 +4220,17 @@ impl Typer {
             found = self.supply_from_pickle(&recv_ty, &name);
         }
         if found.is_empty() {
-            self.error(
-                tree.span,
-                format!(
-                    "value {name} is not a member of {}",
-                    self.st.display_type(&qual.ty)
-                ),
-            );
+            // nsc reports the cause once: a selection on a receiver that is
+            // already an error adds nothing.
+            if !qual.ty.is_error() {
+                self.error(
+                    tree.span,
+                    format!(
+                        "value {name} is not a member of {}",
+                        self.st.display_type(&qual.ty)
+                    ),
+                );
+            }
             tree.ty = Type::Error;
             return;
         }
@@ -4783,17 +4787,19 @@ impl Typer {
             self.type_expr(tree, pt);
             return true;
         }
-        self.error(
-            span,
-            format!(
-                "value {name} is not a member of {}",
-                self.st.display_type(&qual_ty)
-            ),
-        );
-        self.error(
-            span,
-            "Expression does not convert to assignment because receiver is not assignable.",
-        );
+        if !qual_ty.is_error() {
+            self.error(
+                span,
+                format!(
+                    "value {name} is not a member of {}",
+                    self.st.display_type(&qual_ty)
+                ),
+            );
+            self.error(
+                span,
+                "Expression does not convert to assignment because receiver is not assignable.",
+            );
+        }
         tree.ty = Type::Error;
         true
     }
@@ -6018,18 +6024,22 @@ impl Typer {
                 tree.ty = leftover.unwrap_or(ret);
             }
             OverloadPick::Ambiguous => {
-                self.error(
-                    tree.span,
-                    format!(
-                        "ambiguous overload for {} with arguments ({})",
-                        fun_name,
-                        arg_tys
-                            .iter()
-                            .map(|t| self.st.display_type(t))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                );
+                // An argument that already failed cannot pick an alternative;
+                // the cause is reported at the argument.
+                if !arg_tys.iter().any(|t| t.is_error()) {
+                    self.error(
+                        tree.span,
+                        format!(
+                            "ambiguous overload for {} with arguments ({})",
+                            fun_name,
+                            arg_tys
+                                .iter()
+                                .map(|t| self.st.display_type(t))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    );
+                }
                 tree.ty = Type::Error;
             }
             OverloadPick::None => {
@@ -6082,7 +6092,9 @@ impl Typer {
                     }
                     _ => false,
                 };
-                if !has_apply {
+                if fun_ty.is_error() {
+                    // The receiver already failed; do not report it twice.
+                } else if !has_apply {
                     self.error(
                         tree.span,
                         format!(
@@ -6090,7 +6102,7 @@ impl Typer {
                             self.st.display_type(&fun_ty)
                         ),
                     );
-                } else {
+                } else if !arg_tys.iter().any(|t| t.is_error()) {
                     self.error(
                         tree.span,
                         format!(
@@ -9285,6 +9297,10 @@ impl Typer {
     }
 
     fn project_from_prefix(&mut self, span: Span, prefix: &Type, name: &str) -> Type {
+        // A projection out of a prefix that already failed reports nothing new.
+        if prefix.is_error() {
+            return Type::Error;
+        }
         if let Type::Refined { .. } = prefix {
             if let Some(t) = self.st.lookup_type_member_on(prefix, name) {
                 return t;
