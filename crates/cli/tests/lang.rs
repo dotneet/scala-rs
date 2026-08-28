@@ -143,3 +143,13 @@ fn type_param_bound_members_run() {
 fn type_param_bound_member_is_checked() {
     compile_fails("tparam_bound_bad", "nosuchmember");
 }
+
+#[test]
+fn pattern_definitions_run() {
+    run_both("pat_def");
+}
+
+#[test]
+fn pattern_definition_binding_is_typed() {
+    compile_fails("pat_def_bad", "nosuchmember");
+}

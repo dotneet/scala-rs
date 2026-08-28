@@ -1308,18 +1308,80 @@ impl<'a> Parser<'a> {
                 )
             }
         } else {
-            // `val (a,b) = e` — emit ValDef with pattern name plus note
-            // Keep the pattern in the name field encoded; also emit nested vals
-            // as a Block assigned from Match. Desugar:
-            // val <tmp> = rhs; val a = <tmp>._1 ...  too heavy. Keep as ValDef
-            // named "<pat>" with the pattern tree in tpt? Better: use Bind.
-            self.alloc(
+            // nsc desugars a pattern definition to a temporary plus one
+            // selector per bound name:
+            //   val (a, b) = e
+            //     ~> val x$pat1 = e
+            //        val a = x$pat1 match { case (a, b) => a }
+            //        val b = x$pat1 match { case (a, b) => b }
+            self.placeholder_id += 1;
+            let tmp = format!("x$pat{}", self.placeholder_id);
+            let tmp_def = self.alloc(
                 span,
                 TreeKind::ValDef {
-                    mods,
-                    name: "<pat>".into(),
-                    tpt: Box::new(pat),
+                    mods: mods.clone(),
+                    name: tmp.clone(),
+                    tpt: Box::new(tpt),
                     rhs: Box::new(rhs),
+                },
+            );
+            let mut names = Vec::new();
+            pattern_bound_names(&pat, &mut names);
+            let mut stats = vec![tmp_def];
+            if names.is_empty() {
+                // No bindings: still run the match so a mismatch is an error.
+                let sel = self.alloc(span, TreeKind::Ident { name: tmp });
+                let body = self.alloc(span, TreeKind::Literal { lit: Lit::Unit });
+                let guard = self.empty(span);
+                let m = self.alloc(
+                    span,
+                    TreeKind::Match {
+                        selector: Box::new(sel),
+                        cases: vec![CaseDef {
+                            pat,
+                            guard,
+                            body,
+                            span,
+                        }],
+                    },
+                );
+                stats.push(m);
+            } else {
+                for n in names {
+                    let sel = self.alloc(span, TreeKind::Ident { name: tmp.clone() });
+                    let body = self.alloc(span, TreeKind::Ident { name: n.clone() });
+                    let guard = self.empty(span);
+                    let m = self.alloc(
+                        span,
+                        TreeKind::Match {
+                            selector: Box::new(sel),
+                            cases: vec![CaseDef {
+                                pat: pat.clone(),
+                                guard,
+                                body,
+                                span,
+                            }],
+                        },
+                    );
+                    let empty_tpt = self.empty(span);
+                    let def = self.alloc(
+                        span,
+                        TreeKind::ValDef {
+                            mods: mods.clone(),
+                            name: n,
+                            tpt: Box::new(empty_tpt),
+                            rhs: Box::new(m),
+                        },
+                    );
+                    stats.push(def);
+                }
+            }
+            let expr = stats.pop().unwrap();
+            self.alloc(
+                span,
+                TreeKind::Block {
+                    stats,
+                    expr: Box::new(expr),
                 },
             )
         }
@@ -4417,5 +4479,39 @@ fn dummy_ident_from(pat: &Tree) -> Tree {
         ty: Type::NoType,
         sym: SymbolId::NONE,
         postfix: false,
+    }
+}
+
+/// Variables a pattern binds, in source order (`case a :: Rest(b) =>` gives
+/// `a`, `b`). Used to desugar pattern definitions and generators.
+fn pattern_bound_names(pat: &Tree, out: &mut Vec<String>) {
+    match &pat.kind {
+        TreeKind::Ident { name } => {
+            if name != "_"
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_lowercase() || c == '_')
+            {
+                out.push(name.clone());
+            }
+        }
+        TreeKind::Bind { name, body } => {
+            out.push(name.clone());
+            pattern_bound_names(body, out);
+        }
+        TreeKind::Apply { args, .. } => {
+            for a in args {
+                pattern_bound_names(a, out);
+            }
+        }
+        TreeKind::Typed { expr, .. } => pattern_bound_names(expr, out),
+        TreeKind::Star { elem } => pattern_bound_names(elem, out),
+        TreeKind::Alternative { trees } => {
+            if let Some(first) = trees.first() {
+                pattern_bound_names(first, out);
+            }
+        }
+        _ => {}
     }
 }
