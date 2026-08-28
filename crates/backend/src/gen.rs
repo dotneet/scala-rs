@@ -1731,6 +1731,7 @@ impl<'a> Gen<'a> {
         self.emit_class_ctor(&mut b, class_id, vparamss, &impl_.body, &impl_.parents);
         self.emit_lazy_accessors(&mut b, class_id, &impl_.body);
         self.emit_val_getters(&mut b, &impl_.body);
+        self.emit_ctor_val_getters(&mut b, class_id, vparamss);
         for stt in &impl_.body {
             if matches!(stt.kind, TreeKind::DefDef { .. }) {
                 self.emit_def(&mut b, class_id, stt);
@@ -3333,6 +3334,113 @@ impl<'a> Gen<'a> {
 
     /// nsc-style val getters (`def Red: Value`) so `scala.Enumeration` reflection
     /// (`populateNameMap` / `isValDef`) can pair method `Red()` with field `Red`.
+    /// `class C(val x: Int)` needs the `x()` accessor nsc emits: without it a
+    /// constructor `val` cannot implement a trait's abstract `def x`.
+    /// A `var` also gets `x_$eq`.
+    fn emit_ctor_val_getters(
+        &self,
+        b: &mut ClassBuilder,
+        class_id: SymbolId,
+        vparamss: &[Vec<Tree>],
+    ) {
+        if class_id.is_none() {
+            return;
+        }
+        let class_name = b.this_name.clone();
+        let defined: HashSet<(String, String)> = b
+            .methods
+            .iter()
+            .map(|m| (m.name.clone(), m.desc.clone()))
+            .collect();
+        for clause in vparamss {
+            for p in clause {
+                let TreeKind::ValDef { name, mods, .. } = &p.kind else {
+                    continue;
+                };
+                let is_val = mods.flags.contains(Flags::ACCESSOR);
+                let is_var = mods.flags.contains(Flags::MUTABLE);
+                if !is_val && !is_var {
+                    continue;
+                }
+                let ty = if p.ty.is_no_type() && !p.sym.is_none() {
+                    self.st.get(p.sym).ty.clone()
+                } else {
+                    p.ty.clone()
+                };
+                if ty.is_no_type() || ty.is_error() {
+                    continue;
+                }
+                let fdesc = jvm_desc(self.st, &ty);
+                let getter = format!("(){fdesc}");
+                let enc = encode_method_name(name);
+                if !defined.contains(&(enc.clone(), getter.clone())) {
+                    let fname = name.clone();
+                    let cn = class_name.clone();
+                    let fd = fdesc.clone();
+                    let ret_ty = ty.clone();
+                    b.add_code(ACC_PUBLIC, name, &getter, 1, move |asm| {
+                        asm.aload(0);
+                        asm.getfield(&cn, &fname, &fd);
+                        emit_return(asm, &ret_ty);
+                    });
+                }
+                // The parent may declare the member with an erased signature
+                // (`def value: T` becomes `value()Object`); bridge to it.
+                for parent in linearize(self.st, class_id).into_iter().skip(1) {
+                    let Some(pm) = self.st.get(parent).members.iter().copied().find(|&m| {
+                        self.st.get(m).kind == SymKind::Method && self.st.get(m).name == *name
+                    }) else {
+                        continue;
+                    };
+                    if !method_params_from_sym(self.st, pm).is_empty() {
+                        continue;
+                    }
+                    let pret = method_ret_from_sym(self.st, pm);
+                    let pdesc = format!("(){}", jvm_desc(self.st, &pret));
+                    if pdesc == getter || defined.contains(&(enc.clone(), pdesc.clone())) {
+                        continue;
+                    }
+                    let cn = class_name.clone();
+                    let mname = name.clone();
+                    let cdesc = getter.clone();
+                    let child_ty = ty.clone();
+                    let ret_ty = pret.clone();
+                    b.add_code(
+                        ACC_PUBLIC | ACC_SYNTHETIC | ACC_BRIDGE,
+                        name,
+                        &pdesc,
+                        1,
+                        move |asm| {
+                            asm.aload(0);
+                            asm.invokevirtual(&cn, &mname, &cdesc);
+                            if is_jvm_primitive(&child_ty) && !is_jvm_primitive(&ret_ty) {
+                                emit_box(asm, &child_ty);
+                            }
+                            emit_return(asm, &ret_ty);
+                        },
+                    );
+                    break;
+                }
+                if is_var {
+                    let setter_name = format!("{name}_$eq");
+                    let setter = format!("({fdesc})V");
+                    if !defined.contains(&(setter_name.clone(), setter.clone())) {
+                        let fname = name.clone();
+                        let cn = class_name.clone();
+                        let fd = fdesc.clone();
+                        let sort = jvm_sort(&ty);
+                        b.add_code(ACC_PUBLIC, &setter_name, &setter, 3, move |asm| {
+                            asm.aload(0);
+                            load(asm, 1, sort);
+                            asm.putfield(&cn, &fname, &fd);
+                            asm.vreturn();
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     fn emit_val_getters(&self, b: &mut ClassBuilder, body: &[Tree]) {
         let class_name = b.this_name.clone();
         for stt in body {
