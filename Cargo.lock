@@ -62,6 +62,7 @@ dependencies = [
  "scala-rs-parser",
  "scala-rs-span",
  "scala-rs-typer",
+ "zip",
 ]
 
 [[package]]
