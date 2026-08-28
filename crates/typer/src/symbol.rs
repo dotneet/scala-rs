@@ -666,6 +666,29 @@ impl SymbolTable {
         subst_map(ty, &tps, args)
     }
 
+    /// nsc: a *alias* type member is equivalent to (not merely bounded by) its
+    /// right-hand side, so `type Scope = Map[K, V]` and `Map[K, V]` are the same
+    /// type in both directions. Abstract members (`type T <: Bound`) have no
+    /// right-hand side and are left alone; so are higher-kinded aliases, which
+    /// only expand once applied (`expand_applied_hk_alias`). The walk is bounded
+    /// because a pickled or malformed chain can be cyclic.
+    pub fn dealias(&self, ty: &Type) -> Type {
+        let mut t = ty.clone();
+        let mut seen: Vec<u32> = Vec::new();
+        while let Type::TypeMember(id) = &t {
+            if seen.contains(&id.0) {
+                return ty.clone();
+            }
+            seen.push(id.0);
+            let next = self.type_member_as_seen(*id);
+            if next == t {
+                break;
+            }
+            t = next;
+        }
+        t
+    }
+
     /// Use-site view of a type member: keep higher-kinded aliases as constructors
     /// (`type F[X] = Id[X]` stays `TypeMember` until applied as `F[Int]`).
     pub fn type_member_as_seen(&self, id: SymbolId) -> Type {
@@ -1037,6 +1060,21 @@ impl SymbolTable {
     pub fn is_sub_type(&self, a: &Type, b: &Type) -> bool {
         if a == b {
             return true;
+        }
+        // An alias type member stands for its right-hand side on either side of
+        // `<:`. This has to happen before the arms below, because the `Class`
+        // and `Applied` arms match without ever looking at `b`.
+        if matches!(a, Type::TypeMember(_)) {
+            let d = self.dealias(a);
+            if d != *a {
+                return self.is_sub_type(&d, b);
+            }
+        }
+        if matches!(b, Type::TypeMember(_)) {
+            let d = self.dealias(b);
+            if d != *b {
+                return self.is_sub_type(a, &d);
+            }
         }
         match (a, b) {
             (Type::Error, _) | (_, Type::Error) => true,

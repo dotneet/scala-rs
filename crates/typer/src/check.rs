@@ -4118,7 +4118,9 @@ impl Typer {
             return;
         }
         // nsc: `x.m` on `x: A` where `A <: T` resolves against `T`.
-        let mut recv_ty = self.st.widen_type_param(&qual.ty);
+        // An alias member (`type Scope = Map[K, V]`) is dealiased first, or the
+        // receiver's type arguments would be invisible to the substitution below.
+        let mut recv_ty = self.st.dealias(&self.st.widen_type_param(&qual.ty));
         let refined_term = match &recv_ty {
             Type::Refined { decls, .. } => {
                 let from_term = decls.iter().any(|d| {
@@ -9844,9 +9846,25 @@ impl Typer {
     }
 
     fn lookup_qualified_type(&mut self, prefix: &Tree, name: &str) -> Option<SymbolId> {
-        let owner = self.qualified_type_owner(prefix)?;
-        self.complete_binary_member(owner, name, prefix.span);
-        self.prefer_class_member(owner, name)
+        for owner in self.qualified_type_owners(prefix) {
+            self.complete_binary_member(owner, name, prefix.span);
+            if let Some(id) = self.prefer_class_member(owner, name) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// `p` in a type `p.T` denotes a *term* in Scala, so when a class and its
+    /// companion share a name the module class owns the member (`C#T` is how a
+    /// class projection is written). Java's static nested classes are still
+    /// reached through the class, so it stays a candidate behind the module.
+    fn type_owner_rank(&self, id: SymbolId) -> u8 {
+        match self.st.get(id).kind {
+            SymKind::Module | SymKind::ModuleClass => 0,
+            SymKind::Package => 1,
+            _ => 2,
+        }
     }
 
     /// Nested classes live on the module class (`object Outer { class Inner }`).
@@ -9879,25 +9897,66 @@ impl Typer {
     }
 
     fn qualified_type_owner(&mut self, t: &Tree) -> Option<SymbolId> {
+        self.qualified_type_owners(t).into_iter().next()
+    }
+
+    /// Every owner a `p.T` prefix can denote, best first (see `type_owner_rank`).
+    fn qualified_type_owners(&mut self, t: &Tree) -> Vec<SymbolId> {
+        let mut out: Vec<SymbolId> = Vec::new();
         match &t.kind {
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, t.span);
-                let id = self.st.lookup(name).into_iter().find(|id| {
-                    matches!(
-                        self.st.get(*id).kind,
-                        SymKind::Package | SymKind::Class | SymKind::Module | SymKind::ModuleClass
-                    )
-                })?;
-                Some(self.as_type_owner(id))
+                let mut found: Vec<SymbolId> = self
+                    .st
+                    .lookup(name)
+                    .into_iter()
+                    .filter(|id| {
+                        matches!(
+                            self.st.get(*id).kind,
+                            SymKind::Package
+                                | SymKind::Class
+                                | SymKind::Module
+                                | SymKind::ModuleClass
+                        )
+                    })
+                    .collect();
+                found.sort_by_key(|id| self.type_owner_rank(*id));
+                for id in found {
+                    let o = self.as_type_owner(id);
+                    if !out.contains(&o) {
+                        out.push(o);
+                    }
+                }
             }
             TreeKind::Select { qual, name } => {
-                let owner = self.qualified_type_owner(qual)?;
-                self.complete_binary_member(owner, name, t.span);
-                self.prefer_class_member(owner, name)
-                    .map(|id| self.as_type_owner(id))
+                for owner in self.qualified_type_owners(qual) {
+                    self.complete_binary_member(owner, name, t.span);
+                    let mut found: Vec<SymbolId> = self
+                        .st
+                        .lookup_member(owner, name)
+                        .into_iter()
+                        .filter(|id| {
+                            matches!(
+                                self.st.get(*id).kind,
+                                SymKind::Package
+                                    | SymKind::Class
+                                    | SymKind::Module
+                                    | SymKind::ModuleClass
+                            )
+                        })
+                        .collect();
+                    found.sort_by_key(|id| self.type_owner_rank(*id));
+                    for id in found {
+                        let o = self.as_type_owner(id);
+                        if !out.contains(&o) {
+                            out.push(o);
+                        }
+                    }
+                }
             }
-            _ => None,
+            _ => {}
         }
+        out
     }
 
     fn complete_binary_member(&mut self, owner: SymbolId, name: &str, span: Span) {
