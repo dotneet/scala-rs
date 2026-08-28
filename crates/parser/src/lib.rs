@@ -141,12 +141,23 @@ object M {
 
     #[test]
     fn unimplemented_is_reported() {
-        let r = parse_str("object M { def f = macro impl }\n");
+        let r = parse_str("object M { type T = Int forSome { def x: Int } }\n");
         assert!(
             has_errors(&r.diags)
                 || dump_tree(&r.tree).contains("Unimplemented")
                 || !r.diags.is_empty()
         );
+    }
+
+    #[test]
+    fn macro_rhs_parses() {
+        // `= macro <ref>` is accepted; the reference is kept unresolved for the
+        // typer, which checks it against the macro implementation rules.
+        let r = parse_str("object M { def f(x: Int): Int = macro Impl.method[A] }\n");
+        assert!(!has_errors(&r.diags), "{:?}", r.diags);
+        let dump = dump_tree(&r.tree);
+        assert!(dump.contains("MacroRhs"), "{dump}");
+        assert!(dump.contains("TypeApply"), "{dump}");
     }
 
     #[test]

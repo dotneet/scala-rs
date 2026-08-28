@@ -457,6 +457,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     st.push_scope();
     st.enter_in_current("scala", st.scala_pkg);
     st.enter_in_current("java", java);
+    crate::prelude_reflect::install_reflect_macros(st);
     import_members(st, st.scala_pkg);
     import_members(st, java_lang);
     import_members(st, st.predef);

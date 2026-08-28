@@ -5,7 +5,9 @@ mod implicits;
 mod javaclass;
 mod javasign;
 mod lambda_lift;
+mod macros;
 mod prelude;
+mod prelude_reflect;
 mod symbol;
 mod uncurry;
 
@@ -15,7 +17,7 @@ pub use check::{
 };
 pub use erasure::{erase, erase_type};
 pub use lambda_lift::lambda_lift;
-pub use symbol::{Intrinsic, SamSig, SymKind, Symbol, SymbolTable};
+pub use symbol::{Intrinsic, MacroBinding, SamSig, SymKind, Symbol, SymbolTable};
 pub use uncurry::uncurry;
 
 use scala_rs_parser::{parse_str, Tree};

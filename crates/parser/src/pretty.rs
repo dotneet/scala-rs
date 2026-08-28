@@ -30,6 +30,11 @@ fn dump_into(s: &mut String, t: &Tree, indent: usize) {
             dump_into(s, expr, indent + 1);
             Ok(())
         }
+        TreeKind::MacroRhs { impl_ref } => {
+            writeln!(s, "{pad}MacroRhs{ty}");
+            dump_into(s, impl_ref, indent + 1);
+            Ok(())
+        }
         TreeKind::ClassDef {
             name,
             tparams,

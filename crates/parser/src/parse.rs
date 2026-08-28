@@ -1366,9 +1366,23 @@ impl<'a> Parser<'a> {
             self.bump();
             self.skip_nl();
             if matches!(self.kind(), TokenKind::Macro) {
-                return self.unimplemented(self.span(), "macros");
+                let mlo = self.span();
+                self.bump(); // `macro`
+                self.skip_nl();
+                // The reference to the macro implementation. `parse_simple_expr`
+                // covers `impl`, `Obj.impl` and `Obj.impl[A, B]` without pulling
+                // in infix operators. Shapes nsc rejects here (an argument list,
+                // a literal) are diagnosed by the typer, which knows the name.
+                let impl_ref = self.parse_simple_expr();
+                self.alloc(
+                    mlo.merge(self.prev_span()),
+                    TreeKind::MacroRhs {
+                        impl_ref: Box::new(impl_ref),
+                    },
+                )
+            } else {
+                self.parse_expr()
             }
-            self.parse_expr()
         } else if matches!(self.peek_non_nl(), TokenKind::LBrace) {
             self.skip_nl();
             self.parse_block_expr()
