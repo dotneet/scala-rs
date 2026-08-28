@@ -380,6 +380,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         add_string_builder(st);
         add_hash_map(st);
         add_hash_set(st);
+        if let Some(it) = iterator {
+            crate::prelude_coll::add_collections_extra(st, tuple2, ordering, it);
+        }
         add_linked_hash_map(st);
         add_linked_hash_set(st);
         add_either(st);
@@ -592,7 +595,7 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
     }
 }
 
-fn class(
+pub(crate) fn class(
     st: &mut SymbolTable,
     owner: SymbolId,
     name: &str,
@@ -608,7 +611,7 @@ fn class(
     id
 }
 
-fn iface(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
+pub(crate) fn iface(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
     let id = st.alloc(
         name,
         owner,
@@ -624,7 +627,7 @@ fn iface(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> Symbol
     id
 }
 
-fn module(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
+pub(crate) fn module(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
     let cls = st.alloc(
         &format!("{name}$"),
         owner,
@@ -638,7 +641,7 @@ fn module(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> Symbo
     m
 }
 
-fn module_extending(
+pub(crate) fn module_extending(
     st: &mut SymbolTable,
     owner: SymbolId,
     name: &str,
@@ -651,7 +654,7 @@ fn module_extending(
     m
 }
 
-fn method(
+pub(crate) fn method(
     st: &mut SymbolTable,
     owner: SymbolId,
     name: &str,
@@ -1066,7 +1069,7 @@ fn add_sorted_map(st: &mut SymbolTable, ordering: SymbolId) {
     st.get_mut(tm_mod).members.extend(tmems);
 }
 
-fn type_param(st: &mut SymbolTable, owner: SymbolId, name: &str) -> SymbolId {
+pub(crate) fn type_param(st: &mut SymbolTable, owner: SymbolId, name: &str) -> SymbolId {
     let id = st.alloc(name, owner, SymKind::TypeParam, Flags::EMPTY, "");
     st.get_mut(id).ty = Type::TypeParam(id);
     id
@@ -1448,14 +1451,14 @@ fn add_array_members(st: &mut SymbolTable) {
     );
 }
 
-fn fn1(arg: Type, ret: Type) -> Type {
+pub(crate) fn fn1(arg: Type, ret: Type) -> Type {
     Type::Function {
         params: vec![arg],
         ret: Box::new(ret),
     }
 }
 
-fn fn2(a: Type, b: Type, ret: Type) -> Type {
+pub(crate) fn fn2(a: Type, b: Type, ret: Type) -> Type {
     Type::Function {
         params: vec![a, b],
         ret: Box::new(ret),

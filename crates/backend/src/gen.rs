@@ -6472,6 +6472,59 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                     );
                     return;
                 }
+                "map" | "filter" | "reverse" => {
+                    let d = "(Lscala/Function1;)Ljava/lang/Object;";
+                    let d0 = "()Ljava/lang/Object;";
+                    let desc = if name == "reverse" { d0 } else { d };
+                    asm.invokevirtual("scala/collection/mutable/ArrayBuffer", name, desc);
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ArrayBuffer");
+                    return;
+                }
+                "append" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Buffer",
+                        "append",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Buffer;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ArrayBuffer");
+                    return;
+                }
+                "++=" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Growable",
+                        "++=",
+                        "(Lscala/collection/IterableOnce;)Lscala/collection/mutable/Growable;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ArrayBuffer");
+                    return;
+                }
+                "-=" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Shrinkable",
+                        "-=",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Shrinkable;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ArrayBuffer");
+                    return;
+                }
+                "sortBy" => {
+                    asm.invokeinterface(
+                        "scala/collection/SeqOps",
+                        "sortBy",
+                        "(Lscala/Function1;Lscala/math/Ordering;)Ljava/lang/Object;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ArrayBuffer");
+                    return;
+                }
+                "sorted" => {
+                    asm.invokeinterface(
+                        "scala/collection/SeqOps",
+                        "sorted",
+                        "(Lscala/math/Ordering;)Ljava/lang/Object;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ArrayBuffer");
+                    return;
+                }
                 _ => {}
             }
         }
@@ -6762,6 +6815,24 @@ fn maybe_cast_erased_load(asm: &mut Assembler, ctx: &EmitCtx, from: &Type, want:
             asm.checkcast(&cn);
         }
     }
+}
+
+/// Unconditional checkcast to `result_ty`'s own JVM class (falling back to
+/// `fallback` when `result_ty` erases to something without a class name,
+/// e.g. a raw type param). Used after invoking a mixin default method whose
+/// *declared* return type (`Buffer`, `Growable`, `Shrinkable`, the bound `C`
+/// of `SeqOps`, …) is narrower than the concrete collection type we model in
+/// the prelude (`ArrayBuffer[A]`, `ListBuffer[A]`, …) — unlike
+/// `maybe_unbox_erased_result`, this does not require the invoked
+/// descriptor's return type to literally be `Ljava/lang/Object;`.
+fn checkcast_to(asm: &mut Assembler, ctx: &EmitCtx, result_ty: Option<&Type>, fallback: &str) {
+    if let Some(ty) = result_ty {
+        if let Some(cn) = checkcast_internal(ctx.st, ty) {
+            asm.checkcast(&cn);
+            return;
+        }
+    }
+    asm.checkcast(fallback);
 }
 
 /// After a generic invoke that returns `Object`, unbox when the tree still has

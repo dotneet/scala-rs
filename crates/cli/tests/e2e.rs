@@ -3031,3 +3031,16 @@ object UseLib {
     let _ = fs::remove_dir_all(&out_lib);
     let _ = fs::remove_dir_all(&probe);
 }
+
+// --- collections slice (ArrayBuffer/ListBuffer/mutable & immutable Map/Set/
+// Vector, Tuple2): `coll_*` fixtures, dual-run against scala-library 2.13.16.
+
+#[test]
+fn fixtures_coll_arraybuffer1_bad_is_error() {
+    compile_fails_lib("coll_arraybuffer1_bad", "noSuchMember is not a member");
+}
+
+#[test]
+fn scala_library_dual_run_coll_arraybuffer1() {
+    dual_run_fixture("coll_arraybuffer1");
+}
