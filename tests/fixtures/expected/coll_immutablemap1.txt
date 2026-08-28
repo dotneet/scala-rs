@@ -1,0 +1,22 @@
+1
+None
+-1
+true
+false
+3
+3
+3
+4
+2
+3
+false
+true
+2
+3
+3
+a -> 1,b -> 2,c -> 3
+true
+6
+6
+0
+4

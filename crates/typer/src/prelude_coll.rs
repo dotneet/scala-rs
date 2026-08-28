@@ -876,17 +876,15 @@ fn add_immutable_map_extra(
         map_t.clone(),
         Intrinsic::None,
     );
-    method(
-        st,
-        map,
-        "++",
-        vec![Type::Class {
-            sym: map,
-            args: vec![tk.clone(), tv.clone()],
-        }],
-        map_t.clone(),
-        Intrinsic::None,
-    );
+    // `++` is intentionally NOT added here: `scala.collection.immutable.Map`
+    // does not override `iterableFactory` (only `mapFactory`), so the
+    // inherited `IterableOps.++`/`concat` default builds through the base
+    // `immutable.Iterable` factory and does not reliably return a `Map` at
+    // runtime for every backing implementation (verified empirically against
+    // scala-library-2.13.16.jar: `Map(...) ++ Map(...)` throws
+    // ClassCastException to `::` for both the 4-or-fewer-entries `MapN` and
+    // larger `HashMap`-backed cases). `Set.++` does not have this problem
+    // (verified working) and is supported below.
     method(st, map, "size", vec![], Type::Int, Intrinsic::None);
     method(st, map, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
     method(st, map, "nonEmpty", vec![], Type::Boolean, Intrinsic::None);
@@ -949,6 +947,28 @@ fn add_immutable_map_extra(
         Intrinsic::None,
     );
     method(st, map, "head", vec![], pair.clone(), Intrinsic::None);
+    // foldLeft[B](z: B)(op: (B, (K, V)) => B): B
+    let m = method(st, map, "foldLeft", vec![], Type::Unit, Intrinsic::None);
+    let b = type_param(st, m, "B");
+    let tb = Type::TypeParam(b);
+    let z = alloc_param(st, m, "z", tb.clone(), false);
+    let op = alloc_param(
+        st,
+        m,
+        "op",
+        fn2(tb.clone(), pair.clone(), tb.clone()),
+        false,
+    );
+    st.get_mut(m).tparams = vec![b];
+    st.get_mut(m).params = vec![z, op];
+    st.get_mut(m).paramss = vec![vec![z], vec![op]];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![
+            vec![tb.clone()],
+            vec![fn2(tb.clone(), pair.clone(), tb.clone())],
+        ],
+        ret: Box::new(tb),
+    };
     method(
         st,
         map,

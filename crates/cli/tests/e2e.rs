@@ -3069,3 +3069,53 @@ fn scala_library_dual_run_coll_mutablemap1() {
 fn scala_library_dual_run_coll_map_view1() {
     dual_run_fixture("coll_map_view1");
 }
+
+#[test]
+fn fixtures_coll_mutableset1_bad_is_error() {
+    compile_fails_lib("coll_mutableset1_bad", "noSuchMember is not a member");
+}
+
+#[test]
+fn scala_library_dual_run_coll_mutableset1() {
+    dual_run_fixture("coll_mutableset1");
+}
+
+#[test]
+fn fixtures_coll_immutablemap1_bad_is_error() {
+    compile_fails_lib("coll_immutablemap1_bad", "noSuchMember is not a member");
+}
+
+#[test]
+fn scala_library_dual_run_coll_immutablemap1() {
+    dual_run_fixture("coll_immutablemap1");
+}
+
+#[test]
+fn fixtures_coll_immutableset1_bad_is_error() {
+    compile_fails_lib("coll_immutableset1_bad", "noSuchMember is not a member");
+}
+
+#[test]
+fn scala_library_dual_run_coll_immutableset1() {
+    dual_run_fixture("coll_immutableset1");
+}
+
+#[test]
+fn fixtures_coll_vector1_bad_is_error() {
+    compile_fails_lib("coll_vector1_bad", "noSuchMember is not a member");
+}
+
+#[test]
+fn scala_library_dual_run_coll_vector1() {
+    dual_run_fixture("coll_vector1");
+}
+
+#[test]
+fn fixtures_coll_tuple2_extra1_bad_is_error() {
+    compile_fails_lib("coll_tuple2_extra1_bad", "noSuchMember is not a member");
+}
+
+#[test]
+fn scala_library_dual_run_coll_tuple2_extra1() {
+    dual_run_fixture("coll_tuple2_extra1");
+}
