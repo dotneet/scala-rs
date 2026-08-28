@@ -18,6 +18,7 @@ mod prelude_reflect;
 mod prelude_seq;
 mod prelude_text;
 mod prelude_tuple;
+mod prelude_variance;
 mod symbol;
 mod uncurry;
 

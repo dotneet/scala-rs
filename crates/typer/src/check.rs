@@ -2021,7 +2021,11 @@ impl Typer {
                 }
                 self.check_variance_ty(vars, ret, pos, span, where_);
             }
-            Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => {
+            // `Array` is invariant; `=> T` and `T*` keep the position.
+            Type::Array(t) => {
+                self.check_variance_ty(vars, t, 0, span, where_);
+            }
+            Type::ByName(t) | Type::Repeated(t) => {
                 self.check_variance_ty(vars, t, pos, span, where_);
             }
             Type::Tuple(ts) => {
@@ -4953,10 +4957,26 @@ impl Typer {
                 _ => Vec::new(),
             };
             let infer = !tps.is_empty() && explicit.is_empty();
+            // Like the method path: type non-lambda args now so the ctor
+            // overload can be picked, and leave function literals untyped
+            // until their parameter type is known (`new S[String](x => …)`).
+            let mut arg_tys: Vec<Type> = Vec::new();
             for a in args.iter_mut() {
-                self.type_expr(a, &Type::NoType);
+                if let TreeKind::Function { vparams, .. } = &a.kind {
+                    if is_annotated_lambda(a) {
+                        self.type_expr(a, &Type::NoType);
+                        arg_tys.push(a.ty.clone());
+                        continue;
+                    }
+                    arg_tys.push(Type::Function {
+                        params: vec![Type::NoType; vparams.len()],
+                        ret: Box::new(Type::NoType),
+                    });
+                } else {
+                    self.type_expr(a, &Type::NoType);
+                    arg_tys.push(a.ty.clone());
+                }
             }
-            let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
             let field_tys: Vec<Type> = class_id
                 .map(|c| {
                     self.st
@@ -5013,7 +5033,6 @@ impl Typer {
                     };
                     fun.ty = tree.ty.clone();
                 } else if infer {
-                    let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
                     let pt_args: Vec<Type> = match pt {
                         Type::Class { args: a, sym } if *sym == c => a.clone(),
                         Type::Tuple(ts)
@@ -5027,6 +5046,7 @@ impl Typer {
                     for (i, tp) in tps.iter().enumerate() {
                         inferred_args.push(
                             self.unify_tparam_all(*tp, &unify_params, &arg_tys)
+                                .filter(|t| !t.is_no_type())
                                 .or_else(|| pt_args.get(i).cloned())
                                 .unwrap_or(Type::Any),
                         );
@@ -5052,6 +5072,9 @@ impl Typer {
                     if !inferred_args.is_empty() {
                         p = self.st.subst_tparams(c, &inferred_args, &p);
                     }
+                }
+                if a.ty.is_no_type() {
+                    self.type_expr(a, &p);
                 }
                 if !p.is_no_type() {
                     self.adapt(a, &p);
@@ -5102,6 +5125,11 @@ impl Typer {
         let mut arg_tys = Vec::new();
         for a in args.iter_mut() {
             if let TreeKind::Function { vparams, .. } = &a.kind {
+                if is_annotated_lambda(a) {
+                    self.type_expr(a, &Type::NoType);
+                    arg_tys.push(a.ty.clone());
+                    continue;
+                }
                 arg_tys.push(Type::Function {
                     params: vec![Type::NoType; vparams.len()],
                     ret: Box::new(Type::NoType),
@@ -11220,4 +11248,20 @@ fn structural_select_lhs(lhs: &Tree) -> bool {
 
 pub fn has_errors(diags: &[Diagnostic]) -> bool {
     diags.iter().any(|d| d.level == scala_rs_span::Level::Error)
+}
+
+/// A function literal whose parameters all carry a type annotation
+/// (`(x: String) => x.length`). Its type is known without an expected type,
+/// so it can be typed eagerly and drive type-parameter inference.
+fn is_annotated_lambda(tree: &Tree) -> bool {
+    match &tree.kind {
+        TreeKind::Function { vparams, .. } => {
+            !vparams.is_empty()
+                && vparams.iter().all(|p| match &p.kind {
+                    TreeKind::ValDef { tpt, .. } => !tpt.is_empty(),
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
 }

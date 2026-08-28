@@ -586,6 +586,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     add_scala_aliases(st);
     st.enter_in_current("::", st.cons_sym);
     st.enter_in_current("Ordered", ordered);
+    crate::prelude_variance::install(st);
 }
 
 /// Prelude classes are owned by `scala` but carry their real JVM package

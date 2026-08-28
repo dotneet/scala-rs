@@ -197,5 +197,6 @@ conform!(
     layout,
     companion_extends,
     case_companion,
-    class_of
+    class_of,
+    variance
 );
