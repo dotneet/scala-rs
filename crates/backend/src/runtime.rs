@@ -12,8 +12,22 @@ use crate::code::Assembler;
 
 const SRC: &str = "runtime.scala";
 
+/// `scala.runtime.*Ref` boxes, one per JVM sort. A `var` captured by a lambda
+/// or by a class defined inside a method is shared through one of these.
+const REF_BOXES: &[(&str, &str)] = &[
+    ("BooleanRef", "Z"),
+    ("ByteRef", "B"),
+    ("CharRef", "C"),
+    ("DoubleRef", "D"),
+    ("FloatRef", "F"),
+    ("IntRef", "I"),
+    ("LongRef", "J"),
+    ("ShortRef", "S"),
+    ("ObjectRef", "Ljava/lang/Object;"),
+];
+
 pub fn emit_runtime() -> Vec<EmittedClass> {
-    vec![
+    let mut out = vec![
         emit_function_n(0),
         emit_function_n(1),
         emit_partial_function(),
@@ -34,7 +48,9 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
         emit_non_local_return_control(),
         emit_delayed_init(),
         emit_app(),
-    ]
+    ];
+    out.extend(REF_BOXES.iter().map(|(n, d)| emit_ref_box(n, d)));
+    out
 }
 
 struct B {
@@ -967,6 +983,62 @@ fn emit_arrow_assoc() -> EmittedClass {
             asm.areturn();
         },
     );
+    b.finish()
+}
+
+/// One `scala.runtime.<name>` box: a mutable `elem` field, a constructor and
+/// the static `create` factory the backend calls when boxing a captured `var`.
+fn emit_ref_box(name: &str, elem: &str) -> EmittedClass {
+    let internal = format!("scala/runtime/{name}");
+    let mut b = B::class(&internal, "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_SUPER | ACC_FINAL;
+    b.fields.push(Field {
+        access: ACC_PUBLIC,
+        name: "elem".into(),
+        desc: elem.into(),
+    });
+    let wide = matches!(elem, "J" | "D");
+    let slots = if wide { 3 } else { 2 };
+    let load_arg = |asm: &mut Assembler, n: u16| match elem {
+        "J" => asm.lload(n),
+        "D" => asm.dload(n),
+        "F" => asm.fload(n),
+        "Ljava/lang/Object;" => asm.aload(n),
+        _ => asm.iload(n),
+    };
+    {
+        let internal = internal.clone();
+        b.add_code(
+            ACC_PUBLIC,
+            "<init>",
+            &format!("({elem})V"),
+            slots,
+            move |asm| {
+                asm.aload(0);
+                asm.invokespecial("java/lang/Object", "<init>", "()V");
+                asm.aload(0);
+                load_arg(asm, 1);
+                asm.putfield(&internal, "elem", elem);
+                asm.vreturn();
+            },
+        );
+    }
+    {
+        let internal = internal.clone();
+        b.add_code(
+            ACC_PUBLIC | ACC_STATIC,
+            "create",
+            &format!("({elem})L{internal};"),
+            slots - 1,
+            move |asm| {
+                asm.new_obj(&internal);
+                asm.dup();
+                load_arg(asm, 0);
+                asm.invokespecial(&internal, "<init>", &format!("({elem})V"));
+                asm.areturn();
+            },
+        );
+    }
     b.finish()
 }
 

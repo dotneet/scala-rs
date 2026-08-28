@@ -46,11 +46,9 @@ pub fn emit_opts(
         trait_vals: HashMap::new(),
         library_abi: opts.library_abi,
         pickles: opts.pickles,
-        boxed_vars: if opts.library_abi {
-            collect_boxed_vars(tree, st)
-        } else {
-            HashSet::new()
-        },
+        // `scala.runtime.*Ref` exists in both ABIs: on the jar, and as a
+        // private-runtime classfile (see `runtime::REF_BOXES`).
+        boxed_vars: collect_boxed_vars(tree, st),
     };
     g.collect_trait_impls(tree);
     g.walk(tree);
