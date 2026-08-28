@@ -1,0 +1,29 @@
+List(1, 2, 3)
+List(1, 2, 3)
+List(1, 2, 3)
+3
+1
+3
+Vector(3, 1, 2)
+List(1, 2, 3)
+3
+List(0, 3, 4, 6)
+List((3,3), (1,1), (2,2))
+List(3, 1, 2, 0, 0)
+List(9, 1, 2)
+List(7, 1, 2)
+0
+List(List(3, 1, 2), List(1, 2), List(2), List())
+List(List(3, 1), List(3, 2), List(1, 2))
+6
+true
+true
+true
+Some(3)
+List(3)
+Vector(2, 3)
+1-2-3
+Set(1, 2)
+List((3,0), (1,1), (2,2))
+List(List(3, 1), List(2))
+List(List(3, 1), List(1, 2))

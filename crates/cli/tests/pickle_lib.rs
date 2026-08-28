@@ -116,6 +116,13 @@ fn inherited_list_members_come_from_the_pickle() {
     run_against_library("pickle_lib1");
 }
 
+/// Ordering-driven members, package-object type aliases, curried and
+/// multi-argument members.
+#[test]
+fn ordering_and_alias_members_come_from_the_pickle() {
+    run_against_library("pickle_lib2");
+}
+
 /// Completion adds members; it must never invent one.
 #[test]
 fn a_member_in_no_pickle_is_still_an_error() {

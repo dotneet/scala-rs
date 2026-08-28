@@ -27,6 +27,15 @@ use scala_rs_pickle::ClassSource;
 use crate::javaclass::{parse_java_classfile, BinaryIndex, JavaClass};
 use crate::symbol::{SymKind, SymbolTable};
 
+/// `SCALA_RS_PICKLE_DEBUG=1` traces why a member was or was not supplied.
+/// Completion is silent otherwise: a member it declines to supply surfaces as
+/// the typer's ordinary "is not a member".
+fn trace(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("SCALA_RS_PICKLE_DEBUG").is_some() {
+        eprintln!("[pickle] {args}");
+    }
+}
+
 const ACC_STATIC: u16 = 0x0008;
 const ACC_BRIDGE: u16 = 0x0040;
 const ACC_SYNTHETIC: u16 = 0x1000;
@@ -94,6 +103,7 @@ impl PickleSupply {
             self.sigs.lookup(&mut src, &full, is_module, name)
         };
         if hits.is_empty() {
+            trace(format_args!("{full}#{name}: not found in any pickle"));
             return false;
         }
 
@@ -112,6 +122,16 @@ impl PickleSupply {
                 continue;
             }
             let Some(shape) = read_shape(&m.ty) else {
+                trace(format_args!(
+                    "{internal}#{name}: unreadable signature shape"
+                ));
+                continue;
+            };
+            let Some(shape) = pin_undetermined_tparams(shape) else {
+                trace(format_args!(
+                    "{internal}#{name}: type parameter appears only in an implicit \
+                     clause and has no lower bound to pin it to"
+                ));
                 continue;
             };
             // The same member is reachable through several parents; keep one.
@@ -123,6 +143,9 @@ impl PickleSupply {
                 installed += 1;
             }
         }
+        trace(format_args!(
+            "{full}#{name}: supplied {installed} overload(s)"
+        ));
         installed > 0
     }
 
@@ -141,6 +164,10 @@ impl PickleSupply {
         // from re-deriving scalac's erasure: the bytes are the truth, and a
         // descriptor we merely guessed would fail to link.
         let Some(desc) = self.erased_desc(bin, internal, name, shape.arity()) else {
+            trace(format_args!(
+                "{internal}#{name}/{}: no unambiguous erased descriptor",
+                shape.arity()
+            ));
             return false;
         };
 
@@ -159,7 +186,7 @@ impl PickleSupply {
         // Bounds are resolved after every parameter is in scope (`A <: B`).
         for (tp, id) in shape.tparams.iter().zip(tparams.iter().copied()) {
             if let Some(hi) = &tp.hi {
-                if let Some(t) = conv(st, &scope, hi) {
+                if let Some(t) = self.conv(st, bin, &scope, hi) {
                     st.get_mut(id).bound_hi = Some(t);
                 }
             }
@@ -171,7 +198,11 @@ impl PickleSupply {
             let mut tys = Vec::new();
             let mut syms = Vec::new();
             for p in &clause.params {
-                let Some(mut t) = conv(st, &scope, &p.ty) else {
+                let Some(mut t) = self.conv(st, bin, &scope, &p.ty) else {
+                    trace(format_args!(
+                        "{internal}#{name}: parameter {} has an unmappable type {:?}",
+                        p.name, p.ty
+                    ));
                     return false;
                 };
                 if p.by_name && !matches!(t, Type::ByName(_)) {
@@ -190,7 +221,11 @@ impl PickleSupply {
             paramss_ty.push(tys);
             paramss_sym.push(syms);
         }
-        let Some(ret) = conv(st, &scope, &shape.ret) else {
+        let Some(ret) = self.conv(st, bin, &scope, &shape.ret) else {
+            trace(format_args!(
+                "{internal}#{name}: unmappable result type {:?}",
+                shape.ret
+            ));
             return false;
         };
 
@@ -277,6 +312,7 @@ impl PickleSupply {
 
 struct ShapeTParam {
     name: String,
+    lo: Option<SigType>,
     hi: Option<SigType>,
 }
 
@@ -322,12 +358,14 @@ fn read_shape(t: &SigType) -> Option<Shape> {
                 result,
             } => {
                 for tp in tps {
+                    let (lo, hi) = match &tp.bounds {
+                        SigType::Bounds { lo, hi } => (Some((**lo).clone()), Some((**hi).clone())),
+                        _ => (None, None),
+                    };
                     tparams.push(ShapeTParam {
                         name: tp.name.clone(),
-                        hi: match &tp.bounds {
-                            SigType::Bounds { hi, .. } => Some((**hi).clone()),
-                            _ => None,
-                        },
+                        lo,
+                        hi,
                     });
                 }
                 cur = result;
@@ -361,117 +399,295 @@ fn read_shape(t: &SigType) -> Option<Shape> {
     }
 }
 
+/// `def max[B >: A](implicit ord: Ordering[B]): A` has nothing at the call site
+/// to infer `B` from; scalac resolves it to the lower bound, `A`. Do the same
+/// here, and drop the parameter.
+///
+/// Without this the typer cannot solve `Ordering[B]`, and instead of failing it
+/// eta-expands `xs.max` into a function value — a silently wrong program. Any
+/// type parameter left undetermined after this pass makes the whole member
+/// ineligible, so that shape can never reach the user.
+fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
+    let determined: HashSet<String> = shape
+        .clauses
+        .iter()
+        .filter(|c| !c.implicit)
+        .flat_map(|c| c.params.iter())
+        .flat_map(|p| mentioned(&p.ty))
+        .collect();
+    let mut pin: HashMap<String, SigType> = HashMap::new();
+    let mut kept = Vec::new();
+    for tp in &shape.tparams {
+        if determined.contains(&tp.name) {
+            kept.push(ShapeTParam {
+                name: tp.name.clone(),
+                lo: tp.lo.clone(),
+                hi: tp.hi.clone(),
+            });
+            continue;
+        }
+        match &tp.lo {
+            Some(lo) if !matches!(lo, SigType::Ref { sym, .. } if sym == "scala.Nothing") => {
+                pin.insert(tp.name.clone(), lo.clone());
+            }
+            // Unconstrained and undeterminable: refuse the member rather than
+            // hand the typer something it will silently eta-expand.
+            _ => return None,
+        }
+    }
+    if pin.is_empty() {
+        return Some(shape);
+    }
+    Some(Shape {
+        tparams: kept,
+        clauses: shape
+            .clauses
+            .iter()
+            .map(|c| Clause {
+                implicit: c.implicit,
+                params: c
+                    .params
+                    .iter()
+                    .map(|p| Param {
+                        name: p.name.clone(),
+                        ty: scala_rs_pickle::sym::apply_subst(&p.ty, &pin),
+                        by_name: p.by_name,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        ret: scala_rs_pickle::sym::apply_subst(&shape.ret, &pin),
+    })
+}
+
+/// Every bare name a type mentions, so we can tell which type parameters an
+/// explicit argument would determine.
+fn mentioned(t: &SigType) -> Vec<String> {
+    let mut out = Vec::new();
+    walk(t, &mut out, 0);
+    out
+}
+
+fn walk(t: &SigType, out: &mut Vec<String>, depth: u32) {
+    if depth > 24 {
+        return;
+    }
+    let d = depth + 1;
+    match t {
+        SigType::Ref { sym, args } => {
+            out.push(sym.clone());
+            for a in args {
+                walk(a, out, d);
+            }
+        }
+        SigType::Annotated(x) => walk(x, out, d),
+        SigType::Bounds { lo, hi } => {
+            walk(lo, out, d);
+            walk(hi, out, d);
+        }
+        SigType::Method { params, result, .. } => {
+            for p in params {
+                walk(&p.ty, out, d);
+            }
+            walk(result, out, d);
+        }
+        SigType::Poly { result, .. } | SigType::Existential { result, .. } => walk(result, out, d),
+        SigType::Refined { parents, decls } => {
+            for p in parents {
+                walk(p, out, d);
+            }
+            for m in decls {
+                walk(&m.ty, out, d);
+            }
+        }
+        _ => {}
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SigType -> scala_rs_parser::Type
 // ---------------------------------------------------------------------------
 
 /// Map a pickled type onto the typer's. `None` means "cannot express this",
 /// and the caller then declines to supply the member.
-fn conv(st: &SymbolTable, scope: &HashMap<String, Type>, t: &SigType) -> Option<Type> {
-    conv_at(st, scope, t, 0)
-}
-
-fn conv_at(
-    st: &SymbolTable,
-    scope: &HashMap<String, Type>,
-    t: &SigType,
-    depth: u32,
-) -> Option<Type> {
-    if depth > 24 {
-        return None;
+impl PickleSupply {
+    fn conv(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        t: &SigType,
+    ) -> Option<Type> {
+        self.conv_at(st, bin, scope, t, 0)
     }
-    let d = depth + 1;
-    match t {
-        SigType::Annotated(inner) => conv_at(st, scope, inner, d),
-        SigType::Existential { quantified, result } => {
-            // `List[_]`: the quantified variables stand for wildcards.
-            let mut inner = scope.clone();
-            for q in quantified {
-                inner.insert(q.name.clone(), Type::Wildcard);
+
+    fn conv_at(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        t: &SigType,
+        depth: u32,
+    ) -> Option<Type> {
+        if depth > 24 {
+            return None;
+        }
+        let d = depth + 1;
+        match t {
+            SigType::Annotated(inner) => self.conv_at(st, bin, scope, inner, d),
+            SigType::Existential { quantified, result } => {
+                // `List[_]`: the quantified variables stand for wildcards.
+                let mut inner = scope.clone();
+                for q in quantified {
+                    inner.insert(q.name.clone(), Type::Wildcard);
+                }
+                self.conv_at(st, bin, &inner, result, d)
             }
-            conv_at(st, &inner, result, d)
+            SigType::Ref { sym, args } => self.conv_ref(st, bin, scope, sym, args, d),
+            // A `val`'s own type is fine, but the remaining forms (`this.type`,
+            // singletons, `super`, bare bounds, refinements, literal types) have
+            // no faithful counterpart here yet.
+            _ => None,
         }
-        SigType::Ref { sym, args } => conv_ref(st, scope, sym, args, d),
-        // A `val`'s own type is fine, but the remaining forms (`this.type`,
-        // singletons, `super`, bare bounds, refinements, literal types) have no
-        // faithful counterpart here yet.
-        _ => None,
     }
-}
 
-fn conv_ref(
-    st: &SymbolTable,
-    scope: &HashMap<String, Type>,
-    sym: &str,
-    args: &[SigType],
-    d: u32,
-) -> Option<Type> {
-    if let Some(bound) = scope.get(sym) {
-        // A type parameter used as a constructor (`CC[B]`) is higher-kinded;
-        // not expressible here.
-        return if args.is_empty() {
-            Some(bound.clone())
-        } else {
-            None
+    fn conv_ref(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        sym: &str,
+        args: &[SigType],
+        d: u32,
+    ) -> Option<Type> {
+        if let Some(bound) = scope.get(sym) {
+            // A type parameter used as a constructor (`CC[B]`) is higher-kinded;
+            // not expressible here.
+            return if args.is_empty() {
+                Some(bound.clone())
+            } else {
+                None
+            };
+        }
+        match sym {
+            "scala.Unit" => return Some(Type::Unit),
+            "scala.Boolean" => return Some(Type::Boolean),
+            "scala.Byte" => return Some(Type::Byte),
+            "scala.Short" => return Some(Type::Short),
+            "scala.Int" => return Some(Type::Int),
+            "scala.Long" => return Some(Type::Long),
+            "scala.Float" => return Some(Type::Float),
+            "scala.Double" => return Some(Type::Double),
+            "scala.Char" => return Some(Type::Char),
+            "scala.Any" => return Some(Type::Any),
+            "scala.AnyRef" | "java.lang.Object" => return Some(Type::AnyRef),
+            "scala.AnyVal" => return Some(Type::AnyVal),
+            "scala.Nothing" => return Some(Type::Nothing),
+            "scala.Null" => return Some(Type::Null),
+            "java.lang.String" | "scala.Predef.String" => return Some(Type::String),
+            "scala.Array" => {
+                let a = self.conv_all(st, bin, scope, args, d)?;
+                return a.into_iter().next().map(|e| Type::Array(Box::new(e)));
+            }
+            "scala.<byname>" => {
+                let a = self.conv_all(st, bin, scope, args, d)?;
+                return a.into_iter().next().map(|e| Type::ByName(Box::new(e)));
+            }
+            "scala.<repeated>" => {
+                let a = self.conv_all(st, bin, scope, args, d)?;
+                return a.into_iter().next().map(|e| Type::Repeated(Box::new(e)));
+            }
+            _ => {}
+        }
+        if let Some(n) = sym.strip_prefix("scala.Function") {
+            if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() {
+                let mut a = self.conv_all(st, bin, scope, args, d)?;
+                let ret = a.pop()?;
+                return Some(Type::Function {
+                    params: a,
+                    ret: Box::new(ret),
+                });
+            }
+        }
+        if let Some(n) = sym.strip_prefix("scala.Tuple") {
+            if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() {
+                return Some(Type::Tuple(self.conv_all(st, bin, scope, args, d)?));
+            }
+        }
+        let internal = sym.replace('.', "/");
+        if let Some(cls) = crate::classpath::find_by_jvm(st, &internal) {
+            let a = self.conv_all(st, bin, scope, args, d)?;
+            if a.len() != st.get(cls).tparams.len() {
+                return None;
+            }
+            return Some(Type::Class { sym: cls, args: a });
+        }
+        // `scala.package.List` and friends: package-object type aliases, which
+        // pickles refer to by the alias, not the target. Expand through the
+        // owner's own pickle rather than hard-coding a table.
+        if let Some(expanded) = self.expand_alias(st, bin, scope, sym, args, d) {
+            return Some(expanded);
+        }
+        // Anything else would mean inventing a type the backend cannot name.
+        None
+    }
+
+    fn conv_all(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        args: &[SigType],
+        d: u32,
+    ) -> Option<Vec<Type>> {
+        args.iter()
+            .map(|a| self.conv_at(st, bin, scope, a, d))
+            .collect()
+    }
+
+    /// Resolve `owner.Name[args]` where `Name` is a type alias declared on
+    /// `owner` (typically a package object), by reading `owner`'s pickle and
+    /// substituting the alias's own type parameters.
+    fn expand_alias(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        sym: &str,
+        args: &[SigType],
+        d: u32,
+    ) -> Option<Type> {
+        let (owner, simple) = sym.rsplit_once('.')?;
+        let sig = {
+            let mut src = BinSource(bin);
+            self.sigs
+                .class_sig(&mut src, owner, true)
+                .or_else(|_| self.sigs.class_sig(&mut src, owner, false))
+                .ok()?
         };
-    }
-    let conv_args = |st: &SymbolTable| -> Option<Vec<Type>> {
-        args.iter().map(|a| conv_at(st, scope, a, d)).collect()
-    };
-    match sym {
-        "scala.Unit" => return Some(Type::Unit),
-        "scala.Boolean" => return Some(Type::Boolean),
-        "scala.Byte" => return Some(Type::Byte),
-        "scala.Short" => return Some(Type::Short),
-        "scala.Int" => return Some(Type::Int),
-        "scala.Long" => return Some(Type::Long),
-        "scala.Float" => return Some(Type::Float),
-        "scala.Double" => return Some(Type::Double),
-        "scala.Char" => return Some(Type::Char),
-        "scala.Any" => return Some(Type::Any),
-        "scala.AnyRef" | "java.lang.Object" => return Some(Type::AnyRef),
-        "scala.AnyVal" => return Some(Type::AnyVal),
-        "scala.Nothing" => return Some(Type::Nothing),
-        "scala.Null" => return Some(Type::Null),
-        "java.lang.String" | "scala.Predef.String" => return Some(Type::String),
-        "scala.Array" => {
-            let a = conv_args(st)?;
-            return a.into_iter().next().map(|e| Type::Array(Box::new(e)));
+        let alias = sig
+            .members
+            .iter()
+            .find(|m| m.name == simple && m.kind == MemberKind::TypeAlias)?
+            .clone();
+        // A parameterised alias (`type List[+A] = immutable.List[A]`) binds its
+        // own parameters to our arguments; a plain one has none.
+        let (tps, target) = match &alias.ty {
+            SigType::Poly { tparams, result } => (tparams.clone(), (**result).clone()),
+            other => (Vec::new(), other.clone()),
+        };
+        if tps.len() != args.len() {
+            return None;
         }
-        "scala.<byname>" => {
-            let a = conv_args(st)?;
-            return a.into_iter().next().map(|e| Type::ByName(Box::new(e)));
+        let mut map: HashMap<String, SigType> = HashMap::new();
+        for (tp, a) in tps.iter().zip(args.iter()) {
+            map.insert(tp.name.clone(), a.clone());
         }
-        "scala.<repeated>" => {
-            let a = conv_args(st)?;
-            return a.into_iter().next().map(|e| Type::Repeated(Box::new(e)));
-        }
-        _ => {}
+        let target = scala_rs_pickle::sym::apply_subst(&target, &map);
+        // The substituted arguments are still written in the caller's
+        // vocabulary, so the caller's scope is what finishes the job.
+        self.conv_at(st, bin, scope, &target, d)
     }
-    if let Some(n) = sym.strip_prefix("scala.Function") {
-        if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() {
-            let mut a = conv_args(st)?;
-            let ret = a.pop()?;
-            return Some(Type::Function {
-                params: a,
-                ret: Box::new(ret),
-            });
-        }
-    }
-    if let Some(n) = sym.strip_prefix("scala.Tuple") {
-        if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() {
-            return Some(Type::Tuple(conv_args(st)?));
-        }
-    }
-    // Anything else has to already be a class the symbol table knows: making
-    // one up here would invent a type the backend cannot name.
-    let internal = sym.replace('.', "/");
-    let cls = crate::classpath::find_by_jvm(st, &internal)?;
-    let a = conv_args(st)?;
-    if a.len() != st.get(cls).tparams.len() {
-        return None;
-    }
-    Some(Type::Class { sym: cls, args: a })
 }
 
 /// Number of parameters in a JVM method descriptor.
