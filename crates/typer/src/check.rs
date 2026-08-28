@@ -3488,6 +3488,17 @@ impl Typer {
             return;
         }
         found = self.drop_overridden(found);
+        // `x.toString` finds both `Any.toString` and `Int.toString`; they have
+        // the same type, so this is one member, not an ambiguous overload.
+        if found.len() > 1 {
+            let first_ty = self.st.get(found[0]).ty.clone();
+            if found
+                .iter()
+                .all(|&s| self.st.get(s).ty == first_ty && !first_ty.is_no_type())
+            {
+                found.truncate(1);
+            }
+        }
         found.retain(|s| self.accessible(*s, Some(qual.as_ref())));
         if found.is_empty() {
             self.error(

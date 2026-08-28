@@ -4098,6 +4098,17 @@ fn gen_select(
                 } else if ctx.st.is_value_class(ctx.st.get(tree.sym).owner) {
                     invoke_value_extension(asm, ctx, tree.sym, Some(&tree.ty));
                 } else {
+                    // `x.toString` on an `Int` dispatches on
+                    // `java/lang/Integer` (or `java/lang/Object` for the
+                    // inherited one), so box the primitive receiver.
+                    let owner_jvm = class_internal(ctx.st, s.owner);
+                    if !s.flags.contains(Flags::STATIC)
+                        && is_jvm_primitive(&qual.ty)
+                        && !is_unit_like(&qual.ty)
+                        && (is_boxed_primitive(&owner_jvm) || owner_jvm == "java/lang/Object")
+                    {
+                        emit_box(asm, &qual.ty);
+                    }
                     invoke_method(asm, ctx, tree.sym, Some(&tree.ty));
                 }
                 return;
@@ -4629,6 +4640,9 @@ fn gen_apply(
             }
             Intrinsic::AnyToString => {
                 gen_expr(asm, frame, ctx, qual);
+                if is_jvm_primitive(&qual.ty) && !is_unit_like(&qual.ty) {
+                    emit_box(asm, &qual.ty);
+                }
                 asm.invokevirtual("java/lang/Object", "toString", "()Ljava/lang/String;");
                 return;
             }
@@ -5375,6 +5389,18 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
                 }
             }
             gen_expr(asm, frame, ctx, qual);
+            // `x.toString` on an `Int` calls `java/lang/Integer.toString`, so
+            // the primitive receiver has to be boxed first.
+            if is_jvm_primitive(&qual.ty) && !is_unit_like(&qual.ty) && !fun.sym.is_none() {
+                let s = ctx.st.get(fun.sym);
+                let owner_jvm = class_internal(ctx.st, s.owner);
+                if matches!(s.intrinsic, Intrinsic::None)
+                    && !ctx.st.is_value_class(s.owner)
+                    && (is_boxed_primitive(&owner_jvm) || owner_jvm == "java/lang/Object")
+                {
+                    emit_box(asm, &qual.ty);
+                }
+            }
         }
         _ => {
             if fun.sym.is_none() {
@@ -10956,4 +10982,19 @@ object Main {
         };
         assert_eq!(out, "1x\n41\n42\nhere\n", "stdout: {out:?}");
     }
+}
+
+/// The JVM box for a Scala primitive; `x.toString` on an `Int` dispatches on it.
+fn is_boxed_primitive(jvm: &str) -> bool {
+    matches!(
+        jvm,
+        "java/lang/Integer"
+            | "java/lang/Long"
+            | "java/lang/Double"
+            | "java/lang/Float"
+            | "java/lang/Short"
+            | "java/lang/Byte"
+            | "java/lang/Character"
+            | "java/lang/Boolean"
+    )
 }

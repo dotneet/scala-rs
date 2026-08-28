@@ -257,3 +257,8 @@ fn typeclass_instances_run() {
 fn missing_typeclass_instance_is_an_error() {
     compile_fails("typeclass_bad", "no implicit");
 }
+
+#[test]
+fn primitive_to_string_runs() {
+    run_both("prim_tostring");
+}
