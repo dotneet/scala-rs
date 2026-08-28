@@ -139,9 +139,15 @@ pub mod tags {
 // Pickled flags (scala/reflect/internal/Flags.scala, pickled positions)
 // ---------------------------------------------------------------------------
 
-/// Pickled flag bits, i.e. the bits as they appear in a symbol's `flags_LongNat`
-/// *before* `pickledToRawFlags`. nsc pickles the "raw" long with the late/anti
-/// bits shifted; the low 32 bits below are position-stable across the mapping.
+/// Pickled flag bits, i.e. the bits as they appear in a symbol's `flags_LongNat`.
+///
+/// nsc permutes the low 12 bits when pickling (`rawToPickledFlags`), so these
+/// are *not* the raw `Flags` positions. Only bits 0..=31 are listed: they are
+/// the ones scala-rs needs and the ones whose pickled position is pinned by
+/// `Flags.scala`'s `PKL_MASK` block plus the identity range above it. Bits 32
+/// and up (LAZY, VARARGS, ARTIFACT, ...) are carried through verbatim in
+/// [`SymInfo::flags`] but deliberately not named here, because getting one of
+/// them wrong would silently misclassify a symbol.
 #[allow(non_upper_case_globals)]
 pub mod pflags {
     pub const IMPLICIT: u64 = 1 << 0;
@@ -176,27 +182,6 @@ pub mod pflags {
     pub const ACCESSOR: u64 = 1 << 29;
     pub const SUPERACCESSOR: u64 = 1 << 30;
     pub const PARAMACCESSOR: u64 = 1 << 31;
-    pub const MODULEVAR: u64 = 1 << 32;
-    pub const LAZY: u64 = 1 << 33;
-    pub const IS_ERROR: u64 = 1 << 34;
-    pub const OVERLOADED: u64 = 1 << 35;
-    pub const LIFTED: u64 = 1 << 36;
-    pub const EXISTENTIAL: u64 = 1 << 37;
-    pub const EXPANDEDNAME: u64 = 1 << 38;
-    pub const IMPLCLASS: u64 = 1 << 39;
-    pub const PRESUPER: u64 = 1 << 40;
-    pub const TRANS_FLAG: u64 = 1 << 41;
-    pub const LOCKED: u64 = 1 << 42;
-    pub const SPECIALIZED: u64 = 1 << 43;
-    pub const DEFAULTINIT: u64 = 1 << 44;
-    pub const VBRIDGE: u64 = 1 << 45;
-    pub const VARARGS: u64 = 1 << 46;
-    pub const TRIEDCOOKING: u64 = 1 << 47;
-    pub const SYNCHRONIZED: u64 = 1 << 48;
-    pub const ARTIFACT: u64 = 1 << 49;
-    pub const JAVA_DEFAULTMETHOD: u64 = 1 << 50;
-    pub const ENUM: u64 = 1 << 51;
-    pub const JAVA_ANNOTATION: u64 = 1 << 52;
 }
 
 // ---------------------------------------------------------------------------

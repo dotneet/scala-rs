@@ -6,6 +6,7 @@ pub mod gen;
 pub mod load;
 pub mod pickle;
 pub mod pickle_read;
+pub mod pickle_sym;
 pub mod runtime;
 
 pub use classfile::EmittedClass;

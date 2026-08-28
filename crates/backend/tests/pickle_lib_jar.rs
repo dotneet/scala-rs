@@ -5,6 +5,7 @@
 //! convention the typer's library-ABI tests use).
 
 use scala_rs_backend::pickle_read::{read_pickle, Entry};
+use scala_rs_backend::pickle_sym::{render, ClassSource, MemberKind, SigLoader};
 use scala_rs_backend::scala_signature_bytes;
 use std::io::Read;
 
@@ -190,4 +191,109 @@ fn list_pickle_has_the_collection_members() {
     }
     assert!(saw_list_class, "List CLASSsym not found");
     assert!(saw_map, "List#map VALsym not found");
+}
+
+/// `ClassSource` backed by the library jar.
+struct JarSource {
+    zip: zip::ZipArchive<std::fs::File>,
+}
+
+impl JarSource {
+    fn open(p: &std::path::Path) -> Self {
+        let f = std::fs::File::open(p).expect("open jar");
+        JarSource {
+            zip: zip::ZipArchive::new(f).expect("read jar"),
+        }
+    }
+}
+
+impl ClassSource for JarSource {
+    fn class_bytes(&mut self, internal_name: &str) -> Option<Vec<u8>> {
+        let mut e = self.zip.by_name(&format!("{internal_name}.class")).ok()?;
+        let mut v = Vec::new();
+        e.read_to_end(&mut v).ok()?;
+        Some(v)
+    }
+}
+
+/// The point of the whole exercise: members `prelude.rs` does not hand-write
+/// are recoverable from the library's own pickles, including the inherited
+/// ones (`filter` lives on `IterableOps`, `sum` and `mkString` on
+/// `IterableOnceOps`).
+#[test]
+fn resolves_inherited_list_members_through_parents() {
+    let jar = jar_path();
+    if !jar.is_file() {
+        eprintln!("skipping: {} not found", jar.display());
+        return;
+    }
+    let mut loader = SigLoader::new(JarSource::open(&jar));
+    let list = "scala.collection.immutable.List";
+
+    let sig = loader.class_sig(list, false).expect("List signature");
+    assert_eq!(sig.tparams.len(), 1, "List[+A]");
+    assert_eq!(sig.tparams[0].variance, 1, "A is covariant");
+    assert!(!sig.parents.is_empty(), "List has parents");
+
+    for name in [
+        "filter", "sum", "mkString", "map", "flatMap", "head", "foldLeft",
+    ] {
+        let (found, errs) = loader.lookup(list, false, name);
+        let public: Vec<_> = found.iter().filter(|(_, m)| m.is_public_api()).collect();
+        assert!(
+            !public.is_empty(),
+            "List#{name} not found via parents (load errors: {errs:?})"
+        );
+        for (owner, m) in &public {
+            assert_eq!(m.kind, MemberKind::Def, "List#{name} on {owner}");
+            let r = render(&m.ty);
+            assert!(!r.contains("<none>"), "List#{name} on {owner}: {r}");
+        }
+    }
+
+    // Spot-check the recovered shape of a signature the prelude cannot express
+    // by hand today. `filter` is declared on `IterableOps` and re-declared on
+    // `List` itself, so require that the search reaches the `IterableOps` one.
+    let (filter, _) = loader.lookup(list, false, "filter");
+    let (owner, m) = filter
+        .iter()
+        .find(|(o, m)| o == "scala.collection.IterableOps" && m.is_public_api())
+        .expect("IterableOps#filter reached through List's parents");
+    let r = render(&m.ty);
+    assert!(r.starts_with("(pred: "), "{r}");
+    assert!(r.contains("scala.Function1"), "{r}");
+    assert!(r.contains("scala.Boolean"), "{r}");
+    eprintln!("List#filter (from {owner}): {r}");
+
+    // `sum` is polymorphic with an implicit Numeric.
+    let (sum, _) = loader.lookup(list, false, "sum");
+    let (sum_owner, sum_m) = sum
+        .iter()
+        .find(|(_, m)| m.is_public_api())
+        .expect("public sum");
+    let sr = render(&sum_m.ty);
+    assert!(sr.starts_with("[B]"), "{sr}");
+    assert!(sr.contains("implicit"), "{sr}");
+    assert!(sr.contains("Numeric"), "{sr}");
+    eprintln!("List#sum (from {sum_owner}): {sr}");
+}
+
+/// A module class resolves independently of its companion.
+#[test]
+fn resolves_module_class_members() {
+    let jar = jar_path();
+    if !jar.is_file() {
+        eprintln!("skipping: {} not found", jar.display());
+        return;
+    }
+    let mut loader = SigLoader::new(JarSource::open(&jar));
+    let sig = loader
+        .class_sig("scala.collection.immutable.List", true)
+        .expect("List module class");
+    assert!(sig.is_module);
+    assert!(
+        sig.member("empty").is_some() || sig.member("apply").is_some(),
+        "List object has no empty/apply: {:?}",
+        sig.members.iter().map(|m| &m.name).collect::<Vec<_>>()
+    );
 }
