@@ -324,6 +324,34 @@ recursive method f needs result type  // object A { def f = g; def g = f }
 
 型の位置での `p.T` の `p` は**項**です。同名の trait と companion object があるときは module class を先に見ます（クラス射影は `C#T` と書く）。Java の static nested class のためにクラスもフォールバックとして残します。
 
+`new A(...)` の `A` がエイリアスなら、nsc と同じく**右辺を構築**します（`type Alias = Base` の `new Alias("hi")`）。エイリアスのシンボル自身はコンストラクタを持たないので、これが無いと `no matching overload for constructor Alias` になります。修飾付き（`new p.A(...)`）は従来から dealias 済みでした。抽象型メンバ（`type A <: Bound`）は対象外です（`new A` はプログラムではなく、上限を構築するのは別のプログラムです）。
+
+#### jar の package object にある型エイリアス
+
+scalac は package object の `type` を classfile に一切書きません。`ScalaSignature` の
+pickle にしか無いので、`<pkg>/package$.class` を読んでメンバーを畳み込むだけでは
+`scala.NoSuchElementException`（= `java.util.NoSuchElementException`）や
+`cats.effect.Ref` / `Async` / `Resource` が解決できませんでした。
+
+package object を**最初に必要としたとき**にその pickle から `ALIASsym` を読み、
+パッケージの型メンバー（`SymKind::TypeMember`）として登録します。先読みはしません。
+
+- 型パラメータ付きのエイリアス（`type Ref[F[_], A] = cats.effect.kernel.Ref[F, A]`）は、
+  各型パラメータの**カインド（arity）**まで復元します。`F[_]` の arity を 1 にしないと
+  使用側が `does not take type parameters` になります。
+- 右辺が名指すクラスは classpath からオンデマンドで読みます。pickle リーダ単独では
+  `scala.*` しか辿れないので、解決できなかった名前を報告させ、typer 側で classfile を
+  読み、もう一度変換する、というのを**何も新しく解決できなくなるまで**繰り返します。
+- prelude と実在のクラスが常に勝ちます。エイリアスは穴を埋めるだけです。
+- **右辺を復元できないエイリアスは登録しません**。代わりに理由を覚えておき、その名前が
+  使われたときに `not found: type ParallelF -- package object cats.effect declares it as
+  an alias for cats.effect.kernel.Par.ParallelF[F, A], which this compiler cannot express`
+  のように出します。黙って `Any` になるより、何が起きたか言う方が良いからです。
+- 併せて暗黙の `import scala._` を（`import java.lang._` より上の優先度で）入れました。
+  何も見つからなかったときだけ引く経路なので、実際に届くのは `scala` package object の
+  型エイリアスです。`--no-scala-library` では pickle が無いので供給せず、
+  `not found: value NoSuchElementException` と診断します。
+
 ### super / 修飾付き this
 
 `super.m(...)` はクラス親なら `invokespecial`、具象 trait 親なら `T$class.m($this, ...)` です。線形化の「右端の親」を `super` の対象にします（`super[T]` の mixin 指定もパースして使います）。`Outer.this` は内部クラスの `$outer` を辿ります。
@@ -376,7 +404,7 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 
 - **同一実行のパッケージ**（1 階層 / 2 階層 / 3 階層以上）
 - **jar 由来のパッケージ**。`p/n.class` / `p/n$.class` をオンデマンドで読み、無ければ `p/` プレフィックスがあるかで**パッケージ自体**を作る
-- **オブジェクト**と**package object**。package object は `p/package$` にコンパイルされ、そのメンバーは `p` 自身のメンバーです。同一実行のものは namer が畳み込み、jar のものはここで読み込んで畳み込みます（`import cats.syntax.all._` の `all` は `cats/syntax/package$all$`）
+- **オブジェクト**と**package object**。package object は `p/package$` にコンパイルされ、そのメンバーは `p` 自身のメンバーです。同一実行のものは namer が畳み込み、jar のものはここで読み込んで畳み込みます（`import cats.syntax.all._` の `all` は `cats/syntax/package$all$`）。**型エイリアス**は classfile に無いので、あわせて pickle からも読みます（「jar の package object にある型エイリアス」節）
 - **項（term）接頭辞**（`import someObject.field._`）は従来どおり typer に落とします
 
 選択子は 4 形すべて動きます。
@@ -657,7 +685,9 @@ SLS 5.1.2 の「後の親が勝つ」規則により `IterableOps` の不透明�
 
 - `scala.package.List` / `scala.package.Ordering` は package object の**型エイリアス**で、
   pickle はエイリアス名で参照します。表を持たず、`scala/package.class` の pickle から
-  `ALIASsym` を引いて展開します。
+  `ALIASsym` を引いて展開します。ソースが同じ別名を**名前で**使う経路（`new
+  NoSuchElementException("x")` / `Ref[F, A]`）は「jar の package object にある型エイリアス」
+  節を参照。同じ `ALIASsym` を、展開ではなくパッケージの型メンバーとして登録します。
 - `def max[B >: A](implicit ord: Ordering[B]): A` は呼び出し側に `B` を決める材料が
   ありません。scalac は下限 `A` に解決するので同じことをします。これが無いと typer は
   `Ordering[B]` を解けず、**エラーにせず `xs.max` を関数値へ eta 展開**して
@@ -791,6 +821,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/smallgaps` スライス（`@inline` / `@noinline` の配置、curried case class companion、companion への後方参照、`Option.flatMap` の多相性、`None`/`Some` の `lub`、`Iterable.apply`）のフィクスチャは接頭辞 `sgap`（`sgap` / `sgap_lib`）で、同じ理由から `crates/cli/tests/smallgaps.rs` に置いています。`sgap.scala` は `--no-scala-library` で `check` 済み、`sgap_lib.scala` は `Iterable.apply` が library ABI（`IterableFactory$Delegate.apply` の継承）にしか無いため library dual-run 専用（`fixtures_sgap_lib_without_library_is_error` で `--no-scala-library` が診断のまま残ることも見ています）。
 
+jar の package object にある**型エイリアス**のフィクスチャは接頭辞 `pkgalias`（`pkgalias` / `pkgalias_bad`）で、同じ理由から `crates/cli/tests/pkgalias.rs` に置いています。`pkgalias.scala` は `scala` package object の pickle にしか無い別名（`NoSuchElementException` / `Throwable` / `UnsupportedOperationException` / `IllegalArgumentException` / `Exception` / `IterableOnce[A]` / `Seq[A]`）だけを使い、library dual-run 専用です（`pkgalias_without_library_is_diagnosed` で `--no-scala-library` では `not found: value NoSuchElementException` と診断されることも見ています）。`pkgalias_bad.scala` は package object が宣言していない名前が黙って通らないことを固定します。`expected/pkgalias.txt` は real scalac 2.13.16 の出力です。
+
 
 | フィクスチャ | 内容 | 期待 stdout |
 | --- | --- | --- |
@@ -883,6 +915,7 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 | `inline.scala` | `@inline` / `@noinline` を付けたメソッドが動く（インライン化はしない） | `3` |
 | `sgap.scala`（`crates/cli/tests/smallgaps.rs`） | `agent/smallgaps` スライスの複合 fixture: `@inline val` / `@inline @noinline def` の受理、curried 主コンストラクタ（`case class Pair(a: Int)(val b: Int, val c: Int)`）の companion `apply` が正しく curry される、case class のフィールド型が**自分の companion に後方参照する**入れ子型（`Ordering.Direction`）を指すときの解決順序、`case object` が引数付きの `sealed abstract class` を extends するときの module `<init>` codegen、`Option.flatMap` の多相性、`if`/`else` の `None`/`Some` 分岐で（型注釈なしでも）`lub` が `Option[X]` になり `.getOrElse` が解決すること | `42` `6` `true` `n=5` `3` `-1` |
 | `sgap_lib.scala`（`crates/cli/tests/smallgaps.rs`、library dual-run のみ） | `Iterable(...)` companion `apply`（実ライブラリの `IterableFactory$Delegate.apply` 継承。私有ランタイムに裏付けが無いので `--no-scala-library` では診断のまま） | `List(a, b, c)` `3` |
+| `pkgalias.scala`（`crates/cli/tests/pkgalias.rs`、library dual-run のみ） | jar の package object にしかない**型エイリアス**（`scala/package$` の pickle）: `new NoSuchElementException(...)` と `catch`、`Throwable` / `UnsupportedOperationException` / `IllegalArgumentException` / `Exception`、型パラメータ付きの `IterableOnce[Int]` / `Seq[Int]` | `gone` `java.lang.UnsupportedOperationException` `java.lang.IllegalArgumentException` `3` `r` `9` |
 | `java_cp.scala` | JDK の Java `.class` から `Math.abs` / `Byte.MAX_VALUE` / `ArrayList.add` を解決して実行 | `3` `127` `true` `1` |
 | `java_sig.scala` | Java Signature（`ArrayList[String]#get` は `String`）、inner `Map.Entry` / `SimpleEntry`、Java varargs `String.format` / `Arrays.asList` を実行 | `hi` `2` `k` `v` `k` `x-3` `2` |
 | `java_wild.scala` | Signature の `Class[_]` / `Collection[_ <: Number]` / `Collections.max`（tparam bound）を存在型として実行 | `java.lang.String` `2` `9` |
@@ -1100,6 +1133,17 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   (c) **既定引数のゲッタ規約**の食い違い（`check.rs` 側の修正が要る）、
   (d) `String.format` のような拡張メソッド経路と `scala.io.Source` の Java ローダ経路、
   (e) ラムダ由来の型推論（`reduceOption`、インライン `collect { case … }`）。
+- **jar の package object の型エイリアスの残り**: `scala` / `cats.effect` の別名は解決するが、
+  右辺が **object にネストしたクラス**（`type ParallelF[F[_], A] =
+  cats.effect.kernel.Par.ParallelF[F, A]`）のものはまだ復元できない。
+  `install_classpath` が companion のある trait の単純名を module class の JVM 名で
+  先に取ってしまう（`Outcome` → `cats/effect/kernel/Outcome$`、型パラメータ 0 個）ため、
+  `resolve_dotted_class` は「パスが名指す classfile を読み直す」で直しているが、
+  `Par.ParallelF` のようにパスの途中が object の形はまだ通っていない。
+  復元できない別名は登録せず、使用時に理由付きで診断する。
+- **slick の `Ref[F, ExecState]` の推論**: 別名自体は解決するようになったが、
+  `Ref[F, ExecState]` を `Ref[Any, ExecState]` と照合してしまう（HK クラス型パラメータ `F`
+  が `Any` に落ちる）。これは別名ではなく型引数推論側の穴。
   詳細は「ScalaSignature からのシンボル自動供給」節
 - **`Either` / `Try` / `Option` の残り**: `Either` の `joinLeft` / `joinRight` / `flatten` / `toTry` / `cond`（`<:<` を要求するもの、および companion）、`LeftProjection` の `filter`、`Try` の `flatten`、`Option` の `orNull` / `unzip` / `unzip3` / `iterator` / `when` / `unless` / `empty` / `apply`（companion）。**2.13 の `Either` に `withFilter` は無い**ので `for` のガードは nsc どおりコンパイルエラーのまま（`filterOrElse` を使う）。私有ランタイムは `Either` / `Try` を持たないので、そのまま診断する
 - **`java.lang` の例外**は `ArithmeticException` / `ClassCastException` / `IllegalArgumentException` / `IllegalStateException` / `IndexOutOfBoundsException` / `NullPointerException` / `NumberFormatException` / `UnsupportedOperationException` と `Throwable` / `Exception` / `RuntimeException` の `()` / `(String)` コンストラクタ、`getMessage` まで。他の JDK 例外・メソッドは未
