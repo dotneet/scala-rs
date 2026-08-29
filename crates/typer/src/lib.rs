@@ -40,7 +40,7 @@ pub use check::{
     find_mains, has_errors, typecheck, typecheck_opts, typecheck_units, ClasspathClass,
     ClasspathMethod, ClasspathPickleMethod, TypecheckOptions, Typer,
 };
-pub use erasure::{erase, erase_type};
+pub use erasure::{erase, erase_type, note_source_value_classes};
 pub use lambda_lift::lambda_lift;
 pub use symbol::{Intrinsic, MacroBinding, SamSig, SymKind, Symbol, SymbolTable};
 pub use uncurry::uncurry;

@@ -126,7 +126,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - `super` / 修飾付き `this`（`Outer.this`）。trait の `super` は、具象クラスなら `T$class`、スタック可能な `abstract override` なら `T$$super$m` 経由
 - `sealed` 階層の match 網羅検査（不足は **warning**。`-Xfatal-warnings` でエラー）
 - extractor の `unapply`（`Option` / `Boolean` / `Tuple2`）と `unapplySeq`（`List` と可変長 `_*`）。名前付き extractor 引数（`Point(y = b, x = a)`）
-- `AnyVal` 値クラス（1 引数。生成は underlying へ erase。メソッドは `name$extension`）
+- `AnyVal` 値クラス（1 引数。生成は underlying へ erase。メソッドは `name$extension`）。`extends Any` した universal trait を mix-in でき、参照が要る位置（`Any` / その trait / 型引数 / 配列要素）では `new C(u)` で box する。パターンマッチ（`case x: C`）と `classOf[C]` / `asInstanceOf[C]` は box したクラスを見る。`equals` / `hashCode` は underlying から合成する（nsc の `equals$extension` / `hashCode$extension` 相当）
 - Predef の一部: `assert` / `require` / `???` / ArrowAssoc の `->` / `identity` / `locally` / `implicitly` / `any2stringadd`（`1 + "x"`）/ String の `length`・`toInt`（`toLong` / `toDouble` もある）。**`--scala-library`** 時はこれらを jar の `Predef$` / `StringOps` / `Predef$ArrowAssoc` / `Predef$any2stringadd` にリンクする。さらに `intWrapper` / `RichInt`（`abs` / `max` / `to` / `until`）、`longWrapper` / `RichLong`、`doubleWrapper` / `RichDouble`、`floatWrapper` / `RichFloat`、`charWrapper` / `RichChar`、`StringOps` の `*` / `take` / `drop` / `isEmpty` / `toUpperCase` / `toLowerCase` / `stripPrefix` / `split`、`Map` / `Vector` / `List` / `Set` / `Seq` / `LazyList` の varargs `apply`、**`Either`**（`Left` / `Right` / `isLeft` / `isRight` / `map` / `flatMap` / `fold` / `getOrElse` / `orElse` / `swap` / `toOption` / `toSeq` / `contains` / `exists` / `forall` / `foreach` / `filterOrElse`、および `left` が返す `LeftProjection` の `e` / `get` / `getOrElse` / `map` / `flatMap` / `foreach` / `exists` / `forall` / `toOption` / `toSeq` / `filterToOption`）、**`Try` / `Success` / `Failure`**（`Try(1)` / `isSuccess` / `isFailure` / `get` / `getOrElse` / `map` / `flatMap` / `filter` / `withFilter` / `foreach` / `orElse` / `recover` / `recoverWith` / `collect` / `toOption` / `toEither` / `failed` / `transform` / `fold`）も jar リンク時のみ。`Option` の `toList` / `toRight` / `toLeft` / `zip` / `collect` / `flatten` も jar リンク時のみ（`getOrElse` / `isDefined` / `nonEmpty` / `contains` / `exists` / `forall` / `filter` / `filterNot` / `orElse` / `fold` は私有ランタイムでも動く）。このスライスでは **ArrayOps の残り**（`lengthIs` / `sizeIs` / `indexOf` / `copyToArray` / `iterator`。`zipWithIndex`/`knownSize`/`sizeCompare`/`filterNot`/`headOption`/`lastOption`/`partition`/`splitAt`/`span`/`find`/`contains`/`distinct` とそれ以前は触らない）、**StringOps の残り**（`++` / `lengthIs` / `sizeIs` / `flatMap`。`iterator`/`sizeCompare`/`knownSize`/`appendedAll`/`prependedAll`/`>`/`>=`/`<=`/`compare`/`patch` とそれ以前は触らない）、**`scala.collection.View`**（`List.view.map.toList`、`View.fill` / `View.iterate`。私有 View classfile は出さない。LazyList/Iterator は View 呼び出しに必要な範囲以外は触らない）を同じ jar にリンクする
 - Predef の一部: `assert` / `require` / `???` / ArrowAssoc の `->` / `identity` / `locally` / `implicitly` / `any2stringadd`（`1 + "x"`）/ String の `length`・`toInt`（`toLong` / `toDouble` もある）。**`--scala-library`** 時はこれらを jar の `Predef$` / `StringOps` / `Predef$ArrowAssoc` / `Predef$any2stringadd` にリンクする。さらに `intWrapper` / `RichInt`（`abs` / `max` / `to` / `until`）、`longWrapper` / `RichLong`、`doubleWrapper` / `RichDouble`、`floatWrapper` / `RichFloat`、`charWrapper` / `RichChar`、`StringOps` の `*` / `take` / `drop` / `isEmpty` / `toUpperCase` / `toLowerCase` / `stripPrefix` / `split`、`Map` / `Vector` / `List` / `Set` / `Seq` / `LazyList` の varargs `apply`、`Either`（`Left` / `Right`）、`Try` / `Success` / `Failure`（`Try(1)` / `map` / `getOrElse`）も jar リンク時のみ。このスライスでは **ArrayOps の残り**（`lengthIs` / `sizeIs` / `indexOf` / `copyToArray` / `iterator`。`zipWithIndex`/`knownSize`/`sizeCompare`/`filterNot`/`headOption`/`lastOption`/`partition`/`splitAt`/`span`/`find`/`contains`/`distinct` とそれ以前は触らない）、**StringOps の残り**（`++` / `lengthIs` / `sizeIs` / `flatMap`。`iterator`/`sizeCompare`/`knownSize`/`appendedAll`/`prependedAll`/`>`/`>=`/`<=`/`compare`/`patch` とそれ以前は触らない）、**`scala.collection.View`**（`List.view.map.toList`、`View.fill` / `View.iterate`。私有 View classfile は出さない。LazyList/Iterator は View 呼び出しに必要な範囲以外は触らない）を同じ jar にリンクする
 - **`scala.collection.immutable.List` のコアメンバ**。`--scala-library` 時は scala-library 2.13.16 の実シグネチャ（`javap -s` で確認した descriptor）にリンクする。`map` / `flatMap` / `collect` / `zip` / `groupBy` / `sortBy` / `minBy` / `maxBy` / `foldLeft` / `foldRight` / `scanLeft` / `::` / `:::` / `+:` / `:+` / `++` / `:++` / `++:` / `updated` / `distinctBy` / `startsWith` / `endsWith` は**真に多相**（メソッド型パラメータ `B` を持つ）で、`xs.map(x => "n" + x): List[String]` のように要素型が追える。ほかに `filter` / `filterNot` / `take` / `drop` / `takeRight` / `dropRight` / `takeWhile` / `dropWhile` / `slice` / `splitAt` / `span` / `partition` / `reverse` / `distinct` / `init` / `last` / `headOption` / `lastOption` / `size` / `length` / `nonEmpty` / `contains` / `exists` / `forall` / `count` / `find` / `indexOf` / `mkString`（0/1/3 引数）/ `sum` / `product` / `min` / `max` / `reduce` / `reduceLeft` / `reduceRight` / `sorted` / `sortWith` / `zipWithIndex` / `grouped` / `sliding` / `toList` / `toArray` / `toSet` / `toVector` / `toSeq` / `Iterator.toList`。`List` 自身に無いものは `IterableOnceOps` / `IterableOps` / `SeqOps` の default メソッドなので invokeinterface で呼び、`Object` / `LinearSeq` に erase される戻り値は checkcast / unbox する。`sum` / `product` 用に `scala.math.Numeric`（`IntIsIntegral` / `LongIsIntegral` / `DoubleIsFractional`）、`sorted` / `max` / `sortBy` 用に `Ordering` の `String` / `Long` / `Boolean` インスタンスを implicit スコープに足した。**私有ランタイム（`--no-scala-library`）**では `crates/backend/src/runtime.rs` が classfile に実装している分（`length` / `size` / `nonEmpty` / `last` / `reverse` / `filter` / `filterNot` / `contains` / `exists` / `forall` / `count` / `take` / `drop` / `mkString` 0/1/3 引数）だけを宣言し、それ以外は**黙って通さず診断する**（`value sorted is not a member of List[Int]`）
@@ -503,9 +503,40 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 
 `unapplySeq` は `List` のコンパニオンと、ユーザー定義の可変長 extractor です。`List(a, b, c)`、`List(h, rest @ _*)`、`PairSeq(a, b)` が動きます。名前付き引数は case class のコンストラクタパターンで並べ替えます（`Point(y = b, x = a)`）。
 
-### AnyVal
+### AnyVal（値クラスと universal trait）
 
-`class Meter(val n: Int) extends AnyVal` は、値の表現を underlying（ここでは `Int`）に erase します。`new Meter(x)` は `x` になり、`m.n` は `m` です。メソッドは `Meter.doubled$extension(n)` のような static です。Any として使うときの box（`Integer`）は、他のプリミティブと同じ erasure の box 挿入に従います。値クラスをラップする専用のヒープオブジェクトは、このパスでは出しません。
+`class Meter(val n: Int) extends AnyVal` は、値の表現を underlying（ここでは `Int`）に erase
+します。`new Meter(x)` は `x` になり、`m.n` は `m` です。メソッドは `Meter.doubled$extension(n)`
+のような static です。
+
+**参照が要る位置では nsc と同じく本物の `Meter` インスタンスに box します。** `Integer` では
+ありません。box が要るのは
+
+- `Any` / `AnyRef` への代入と、`println` のような `Any` を取るパラメータ
+- `extends Any` した universal trait（`final class Meters(val n: Int) extends AnyVal with Univ`
+  の `Univ` 位置）。ここを `Integer` に box すると実行時 `IncompatibleClassChangeError` になる
+- 型引数（`List[Meters]` / `Option[Meters]` / ジェネリックメソッドの引数）と配列要素
+  （`Array[Meters]` は `[LMeters;`）。ラムダのパラメータも `FunctionN.apply` が `Object` を
+  取るので box された側を受け取る
+- 値クラス自身が宣言していないメンバの受け手（`==` / `toString` / `hashCode`）
+
+逆方向（unbox）は `((Meters) x).n()` です。パターン `case x: Meters` は `instanceof Meters` +
+`getfield`、`classOf[Meters]` は `Meters.class`（`Integer.TYPE` ではない）、
+`x.asInstanceOf[Meters]` は `checkcast Meters` です。
+
+`equals` / `hashCode` は nsc の `SyntheticMethods` と同じく underlying から合成します
+（`equals$extension(u, that)` / `hashCode$extension(u)` の static も出します）。これがないと
+box された `Meters(5)` 同士が参照比較になり、`Object.toString` も `Meters@5` ではなく identity
+hash を出します。case class のフィールドが値クラスのときの `toString` も
+`Leg(Meters@3,b)` と表示します（値は unbox のまま持ちますが、印字だけ box します）。
+
+box するのは**このコンパイル単位が出す値クラス**だけです。prelude が持つライブラリ側の値クラス
+（`StringOps` / `ArrayOps` など）は `augmentString` を identity 変換としてモデル化していて、
+underlying をそのまま表現に使っているので box しません（`erasure::note_source_value_classes`）。
+
+nsc との差: `$extension` static は nsc がコンパニオン `Meters$` に本体を置いてクラス側に
+フォワーダを出すのに対し、scala-rs はクラス側に直接出します。同一プログラム内では等価ですが、
+scalac が出した classfile との相互リンクはできません。
 
 ### ボックス型（`java.lang.Integer` と `scala.Int`）
 
@@ -616,6 +647,74 @@ value Nope is not a member of package p1
 `case class C` は、同じファイルの後ろにある `object C` が名前付けされる前に**合成コンパニオン**を持つので、`C` に Module が 2 つ答えることがあります。接頭辞解決は**同じ種類の候補を全部**（書かれた object を先に）返し、選択子をその全部から引きます。種類は最良のものだけに絞るので、`import scala.util.control.Breaks._` は同名のトレイトではなく object を指したままです。
 
 `scala.language` の機能名（`existentials` / `higherKinds` / `reflectiveCalls` / `experimental.macros`）も import できる名前として置きました（`crates/typer/src/prelude_lang.rs`）。これらは何もゲートしません。scala-rs が実際にコンパイルできない構文は、使用地点で従来どおり診断されます。
+
+### 単一型 `X.type` と名前空間
+
+Scala は**項の名前空間と型の名前空間が別**です。`X.type` の `X` は項なので、内側のスコープが
+`X` を型としてだけ束縛していても、外側の項 `X` に届かなければいけません。slick の
+`HList.scala` がこの形です。
+
+```scala
+object syntax {
+  type HNil = hl.HNil.type      // 型としての HNil
+}
+object HList {
+  import syntax._               // 型名 HNil を内側に持ち込む
+  def empty: HNil.type = HNil   // ここの HNil は外側の object HNil
+}
+object HNil extends HList { … }
+```
+
+`SymbolTable::lookup_type` の対になる `lookup_term` を足して、名前を型としてしか束縛していない
+スコープは飛ばして外へ探しに行くようにしました（`is_stable_path` / `term_path_sym` /
+`term_path_type` / 項位置の `type_ident`）。
+
+同じスライスで、`X.type` の接頭辞まわりの穴を 2 つ直しました。
+
+- **パッケージ接頭辞**（`p.HNil.type`）。パッケージは値ではないので型を持たず、
+  `term_path_type` が答えられませんでした。パッケージ / モジュールを直接たどる
+  `path_owner_sym` を通します。あわせて `singleton_to_type` が先頭の識別子を
+  `expose_unqualified` するようにしました（`p` がまだスコープに入っていないことがある）。
+- **object のネスト**（`ColumnOption.AutoInc.type`）。`object O { object I }` の `I` は
+  モジュールクラス `O$` のメンバなので、接頭辞の型からメンバを引くときに Module →
+  モジュールクラスへ正規化します（`path_member_owner`）。
+
+### 改行が文を切る条件（nsc `inLastOfStat` / `inFirstOfStat`）
+
+`crates/lexer/src/lib.rs` の `drop_non_separating_newlines` は nsc の Scanners と同じ規則で、
+改行の**前**のトークンが文を終われて、**後**のトークンが文を始められて、いま `{ … }` 領域
+（または最上位）にいるときだけ NEWLINE を残します。
+
+パーサ側にも対応する規則があります。nsc の `postfixExpr` のループは「今のトークンが識別子
+でなければ止まる」だけで、NEWLINE はそれ自体が 1 つのトークンなので**そこで中置式は終わり**
+です。つまり
+
+```scala
+val x = { 1 }
+-1          // ← 2 文。`{1} - 1` ではない
+```
+
+`}` は `inLastOfStat`、`-` は `inFirstOfStat` なので改行は残り、`-1` は別の文になります。
+`if (c) { 1 }` の直後、`(1)` の直後、識別子だけの行の直後も同じです。
+
+演算子が**行末**にある場合は続きます。これは nsc の `newLineOptWhenFollowing`（演算子を積んだ
+あとで、次が式を始められるなら NEWLINE を 1 つ読み飛ばす）に当たります。
+
+```scala
+val a = 1 +
+  -2        // ← 1 つの式。-1 になる
+```
+
+括弧・角括弧の中では改行がそもそも文を切らないので、`(c` で始まって次の行が `- 1)` の
+形は今までどおり引き算です。
+
+以前は「改行のあとの演算子は式の続き」と読んでいたため、上の 1 つ目が `{1} - 1` になり
+`value - is not a member of Nothing` のような診断になっていました。
+
+なお、値を持つ式が**文の位置**に来たとき（`if (c) { buf += x }` や `x match { case … => 1 }`）は
+nsc の `genLoadIf` / `genLoadMatch` と同じく `expectedType = UNIT` で生成します。片側だけが値を
+残す分岐を `Any` に lub した型で生成すると、合流点でスタックの高さが揃わず
+`VerifyError: Inconsistent stackmap frames` になっていました。
 
 ### ブロック位置の関数リテラル（nsc `expr(InBlock)`）
 
@@ -962,7 +1061,7 @@ SLS 5.1.2 の「後の親が勝つ」規則により `IterableOps` の不透明�
 - **ラムダ**: `FunctionN` を実装する合成クラス（`Main$$$anonfun$0` など）です。SAM 期待位置ではその Java インタフェース（`Runnable` / `Comparator` / `java.util.function.Function`）を実装します。`PartialFunction` 期待位置の `{ case }` は `scala/PartialFunction` を実装し、`isDefinedAt` / `apply` / `applyOrElse` を出します。invokedynamic / LambdaMetaFactory は使いません。
 - **フェーズ**: nsc の mixin などの独立パスはありません。**uncurry**、**lambda-lift**（ネスト def）、erasure、ラムダのクロージャ変換はあります。
 - **sealed**: 非網羅 match は scalac と同様 warning です。`-Xfatal-warnings` でエラーになります。
-- **AnyVal**: scalac は値クラスのクラスファイルと拡張メソッドの両方を出します。scala-rs もクラスは出しますが、呼び出しは `$extension` 静的メソッドで、`new C(x)` は underlying に消えます。
+- **AnyVal**: scalac は値クラスのクラスファイルと拡張メソッドの両方を出します。scala-rs も同じで、`new C(x)` は underlying に消え、呼び出しは `$extension` 静的メソッドです。参照が要る位置（`Any` / universal trait / 型引数 / 配列要素）では nsc と同じく `new C(u)` で box し、`equals` / `hashCode` も underlying から合成します。違いは `$extension` の本体の置き場所で、nsc はコンパニオン `C$` に置いてクラス側をフォワーダにしますが、scala-rs はクラス側に直接出します。
 - **Predef / StringOps**: 私有では `assert` / `require` / `???` / `->`（`Tuple2` 直結）/ `identity` / `locally` / `implicitly` / `any2stringadd` と String の `length`/`toInt`/`isEmpty`。library では `Predef$.println/assert/require/???/identity/locally/implicitly`、`any2stringadd.$plus$extension`、`ArrowAssoc.$minus$greater$extension`、`intWrapper` → `RichInt.abs$extension` / `max$extension` / `to$extension` / `until$extension`、`longWrapper` → `RichLong.abs$extension` / `max$extension` / `to` / `until`（`NumericRange$.inclusive` / `apply` + `Numeric$LongIsIntegral$`）、`doubleWrapper` → `RichDouble.abs$extension` / `max$extension`、`floatWrapper` → `RichFloat.abs$extension` / `max$extension`、`charWrapper` → `RichChar.isDigit$extension` / `intValue$extension`（`.toInt`）/ `to` / `until`（`NumericRange$.inclusive` / `apply` + `Numeric$CharIsIntegral$`）、`byteWrapper` → `RichByte.abs$extension` / `max$extension` / `to` / `until`（`NumericRange$.inclusive` / `apply` + `Numeric$ByteIsIntegral$`）、`shortWrapper` → `RichShort.max$extension` / `to` / `until`（`NumericRange$.inclusive` / `apply` + `Numeric$ShortIsIntegral$`）、`booleanWrapper` → `RichBoolean.compare(Object)`、`augmentString` → `StringOps.toInt$extension` / `size$extension`（`.length`）/ `$times$extension` / `take$extension` / `drop$extension` / `stripPrefix$extension` / `split$extension` / `stripSuffix$extension` / `padTo$extension`（`Int, Char`）/ `linesIterator$extension` / `toIntOption$extension` / `stripMargin$extension` / `lines$extension` / `capitalize$extension` / `reverse$extension` / `slice$extension` / `takeRight$extension` / `dropRight$extension` / `contains$extension`（`.isEmpty` / `.toUpperCase` / `.toLowerCase` は StringOps 経由で `String` にインライン。`startsWith` / `endsWith` / `indexOf` は nsc どおり `java.lang.String`。`head$extension` / `last$extension` / `stripLineEnd$extension` / `replaceAllLiterally$extension` / `tail$extension` / `init$extension` / `distinct$extension` / `mkString$extension` / `filter$extension` / `reverseIterator$extension`）。`intArrayOps` → `ArrayOps.head$extension` / `tail$extension` / `foreach$extension(Object,Function1)V` / `map$extension(Object,Function1,ClassTag)Object`。`longArrayOps` → 同じ `head` / `foreach`（`[J]`）。`refArrayOps` → 参照配列の `map`。**`StringOps` / `ArrayOps` / `RichInt` / `RichLong` / `RichDouble` / `RichFloat` / `RichChar` / `RichByte` / `RichShort` / `RichBoolean` / `ArrayBuffer` / `ListBuffer` / `StringBuilder` / `HashMap` / `HashSet` / `LinkedHashMap` / `LinkedHashSet` / `ArrayDeque` / `NumericRange` classfile は出していません。**
 - **unapplySeq**: `List` とユーザー定義 extractor、`_*`、名前付き case class パターン。library リンク時の `List.unapplySeq` は `SeqOps` 戻り。
 
@@ -1037,6 +1136,24 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 `agent/parentimpl` スライス（親コンストラクタの implicit 節・デフォルト引数の補完）のフィクスチャは接頭辞 `pimpl`（`pimpl` / `pimpl_bad`）で、同じ理由から `crates/cli/tests/parentimpl.rs` に置いています。`pimpl.scala` は slick の `ConstColumn` 形（`class ConstColumn[T : TT] extends TypedRep[T]`）、明示節＋2 引数の implicit 節、全部デフォルト／末尾だけデフォルト、デフォルト節＋implicit 節、匿名クラスの親、引数無しの `new` を 1 本にまとめ、**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせます。`real_scalac_dual_run_pimpl` は real scalac 2.13.16 でも同じソースを走らせて stdout が一致することを見ます（`expected/pimpl.txt` は scalac の出力そのもの）。`pimpl_late_a.scala` / `pimpl_late_z.scala` は**子を親より先にコンパイル**して、親の context bound の evidence がシグネチャパス時点で未生成でも埋まる（＝ファイル順に依存しない）ことを見ます。`pimpl_bad.scala` は witness の無い親 implicit 節が**黙って通らない**ことを固定し、`pimpl_bad_reports_the_extends_clause_once` で診断が `extends` の行に 1 件だけ出る（3 パス分に増えない）ことも見ています。
 
 trait の `val` / `override val` / `var` の実行時表現と `case object` の合成メンバーのフィクスチャは接頭辞 `tval`（`tval` / `tval_bad`）で、同じ理由から `crates/cli/tests/traitval.rs` に置いています。`tval.scala` は私有ランタイム（`--no-scala-library`）と library dual-run の両方で走らせ、`expected/tval.txt` は **real scalac 2.13.16 の出力そのもの**です（3 モードがバイト単位で一致することを確認済み）。バイトコード側の不変条件も 2 本のテストで固定しています。`trait_val_setters_follow_nsc_names` は mixin setter が nsc と同じ `Named$_setter_$label_$eq` であること、`override val` したクラスのその setter が空実装（`putfield` なし）であること、trait の `var` への代入が `putfield` ではなく `count_$eq` 呼び出しであることを `javap -p -c` で見ます。`case_object_members_are_on_the_module_class` は `Asc$` に `toString` / `productPrefix` / `hashCode` / `productArity` が出ていることを見ます。`tval_bad.scala` は trait の `val` への代入が `reassignment to val` になることを固定します。
+
+値クラス + universal trait、`}` の次の行の単項マイナス、`X.type` の名前解決のフィクスチャは
+接頭辞 `vcls`（`vcls` / `vcls_nl` / `vcls_arr` / `vcls_hnil` / `vcls_bad`）で、同じ理由から
+`crates/cli/tests/valclass.rs` に置いています。`vcls.scala`（値クラス + universal trait、`Any`
+への代入、パターンマッチ、`==`、`asInstanceOf`、`}` の次行の `-1`）と `vcls_nl.scala`
+（改行規則だけを集めたもの: `}` / `if` / `)` / 識別子の直後の `-`、行末演算子の継続、括弧内、
+文の位置の `if` / `match`）は**私有ランタイムと library dual-run の両方**で走ります。
+`vcls_arr.scala`（`Array[Meters]` / `List[Meters]` / `Option[Meters]` / ジェネリックメソッド /
+case class フィールド / `Set`）と `vcls_hnil.scala`（`import syntax._` で型名が隠れた
+`HNil.type`、パッケージ修飾の `p.HNil.type`、ネストした `object` の
+`ColumnOption.AutoInc.type`）は `List.apply` / `Array.apply` が要るので library dual-run 専用
+です。`expected/*.txt` はすべて real scalac 2.13.16 の stdout そのものです。
+`vcls_bad.scala` は universal trait 越しに underlying を触る（`u.n`）、存在しないメンバ、
+`def` を `X.type` に使うの 3 つが黙って通らないことを固定します。バイトコード側は
+`vcls_classfile_matches_nsc_shape`（`Meters implements Univ`、`describe$extension(int)` /
+`plus$extension(int, int)` / `equals$extension` / `hashCode$extension` の static、`equals` /
+`hashCode`）と `vcls_boxes_into_the_value_class_not_its_underlying_box`（universal trait を
+取る呼び出しの直前が `new Meters` であって `Integer.valueOf` ではないこと）で見ています。
 
 jar の package object にある**型エイリアス**のフィクスチャは接頭辞 `pkgalias`（`pkgalias` / `pkgalias_bad`）で、同じ理由から `crates/cli/tests/pkgalias.rs` に置いています。`pkgalias.scala` は `scala` package object の pickle にしか無い別名（`NoSuchElementException` / `Throwable` / `UnsupportedOperationException` / `IllegalArgumentException` / `Exception` / `IterableOnce[A]` / `Seq[A]`）だけを使い、library dual-run 専用です（`pkgalias_without_library_is_diagnosed` で `--no-scala-library` では `not found: value NoSuchElementException` と診断されることも見ています）。`pkgalias_bad.scala` は package object が宣言していない名前が黙って通らないことを固定します。`expected/pkgalias.txt` は real scalac 2.13.16 の出力です。
 
@@ -1135,6 +1252,10 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `oshadow.scala`（`crates/cli/tests/overloadshadow.rs`、library dual-run のみ） | 別のクラスを読んでも既存のオーバーロード集合が消えないこと: `java.math.BigDecimal` を**前にも後にも**置いた上での `BigDecimal(Int)` / `(Long)` / `(String)` / `(BigInt)` / `(java.math.BigDecimal)`、`Option[BigDecimal].getOrElse` | `2` `3` `4.25` `6` `12.5` `12.5` `-1` `7` `8.75` `9` |
 | `oshadow_java_first.scala` / `oshadow_java_last.scala`（`crates/cli/tests/overloadshadow.rs`、library dual-run のみ） | 同じプログラムを `java.math.BigDecimal` の位置だけ入れ替えた 2 本。両方通り、stdout が一致すること（順序依存の回帰テスト） | `1` `2` `3.5` |
 | `pimpl.scala`（`crates/cli/tests/parentimpl.rs`） | `agent/parentimpl` スライス: 親コンストラクタの implicit 節・デフォルト引数の補完（`class ConstColumn[T : TT] extends TypedRep[T]`、明示節＋2 引数の implicit 節、context bound の親への受け渡し、全部／末尾だけデフォルト、デフォルト節＋implicit 節、匿名クラスの親、引数無しの `new`）。私有ランタイム・library dual-run・real scalac dual-run の 3 通り | `rep[Int]` `rep[String]` … `anon:Int` `Int` |
+| `vcls.scala`（`crates/cli/tests/valclass.rs`） | 値クラス + universal trait（`Meters` / `Name` が `Univ`）、trait 位置と `Any` への代入で `new Meters` に box、`toString` / `isInstanceOf` / `case x: Meters` / `==` / `asInstanceOf`、`}` の次行の `-1`、行末 `+` の継続 | `5m` `5m5m` `<ada><ada>` `5m` `Meters@5` `true` `meters 5` `true` `false` `8m` `5` `-1` `-1` |
+| `vcls_nl.scala`（`crates/cli/tests/valclass.rs`） | 改行が文を切る条件: `}` / `if` / `)` / 識別子の直後の `-`、行末演算子の継続、括弧内は継続、文の位置の `if` / `match` | `-1` `-2` `-3` `-4` `-1` `4` `y` `` |
+| `vcls_arr.scala`（`crates/cli/tests/valclass.rs`、library dual-run のみ） | `Array[Meters]`（`[LMeters;`、`mkString`、`new Array` + 代入）、`List[Meters]` / `map(_.n)`、`Option[Meters]`、ジェネリックメソッド、case class のフィールド、`Set` | `2` `1` `Meters@1,Meters@2` `7m` `7` … `1` |
+| `vcls_hnil.scala`（`crates/cli/tests/valclass.rs`、library dual-run のみ） | `import syntax._` が型名 `HNil` を隠したうえでの `HNil.type`、前方参照、パッケージ修飾 `hl.HNil.type`、型引数位置、ネストした object の `ColumnOption.AutoInc.type` | `0` `2` `0` `0` `1` `1` `PrimaryKey` `AutoInc` `1` |
 | `pkgalias.scala`（`crates/cli/tests/pkgalias.rs`、library dual-run のみ） | jar の package object にしかない**型エイリアス**（`scala/package$` の pickle）: `new NoSuchElementException(...)` と `catch`、`Throwable` / `UnsupportedOperationException` / `IllegalArgumentException` / `Exception`、型パラメータ付きの `IterableOnce[Int]` / `Seq[Int]` | `gone` `java.lang.UnsupportedOperationException` `java.lang.IllegalArgumentException` `3` `r` `9` |
 | `java_cp.scala` | JDK の Java `.class` から `Math.abs` / `Byte.MAX_VALUE` / `ArrayList.add` を解決して実行 | `3` `127` `true` `1` |
 | `java_sig.scala` | Java Signature（`ArrayList[String]#get` は `String`）、inner `Map.Entry` / `SimpleEntry`、Java varargs `String.format` / `Arrays.asList` を実行 | `hi` `2` `k` `v` `k` `x-3` `2` |
@@ -1423,6 +1544,25 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 - **`}` の次の行が `-1` で始まると式が続いていると読む**。
   `if (c) { return n }` の直後の行の `-1` が `(return n) - 1` にパースされ、
   `value - is not a member of Nothing` になる（scalac は改行で切る）。
+- **親コンストラクタの implicit 節を埋めていない**。
+  `abstract class TypedRep[T](implicit val tpe: TT[T])` を
+  `class ConstColumn[T : TT] extends TypedRep[T]` が継承すると、`extends` に引数リストが
+  無いので witness を渡さず、コード生成が存在しない `TypedRep.<init>()` を呼ぶ
+  （実行時 `NoSuchMethodError`）。**黙って通っている**ので直すべき穴。
+  親位置の木は 2 回型付けされるため、埋めた implicit 引数（`Ident` として合成される）が
+  2 回目に名前で解決し直されて壊れる、というのが難しいところ。
+  ClassTag の `ClassTag.apply(classOf[T])` フォールバックも親位置では型付けできない。
+- **値クラスの `$extension` 静的メソッドの置き場所**が nsc と違う。nsc は本体をコンパニオン
+  `C$` に置いてクラス側をフォワーダにしますが、scala-rs はクラス側に直接出します。
+  同一プログラム内では等価ですが、scalac が出した classfile との相互リンクはできません。
+  （universal trait の実装・box / unbox・パターンマッチ・配列要素・`equals` / `hashCode` は
+  `agent/valclass` で nsc と一致させました。）
+- **ライブラリ側の値クラスは box しない**。prelude が `StringOps` / `ArrayOps` を
+  `augmentString` などの identity 変換としてモデル化していて、`map` の戻りのような
+  「本当は `String`」の位置を値クラス型で持っているため、そこを box すると
+  `println` に `StringOps` を渡してしまいます。box の対象はこのコンパイル単位が出す値クラス
+  だけに限ってあります（`erasure::note_source_value_classes`）。prelude の
+  `StringOps` シグネチャを実体に合わせれば外せる制限です。
 - **ボックス型と値クラスの同一視**。prelude が `scala.Int` に JVM 名 `java/lang/Integer`
   を与えているため、`java.lang.Integer` / `java.lang.Long` が `scala.Int` / `scala.Long`
   に解決されてしまう。`java.lang.Integer.valueOf(3)` は `value Integer is not a member of
