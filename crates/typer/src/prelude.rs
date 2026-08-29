@@ -3667,8 +3667,21 @@ fn add_function_types(st: &mut SymbolTable) {
             &format!("Function{n}"),
             &format!("scala/Function{n}"),
         );
-        let params = vec![Type::Any; n];
-        method(st, f, "apply", params, Type::Any, Intrinsic::None);
+        // `FunctionN` really is `FunctionN[-T1, …, -Tn, +R]`, and `apply` is
+        // its one *abstract* method. Both matter: a trait written as
+        // `trait C[-T] extends (T => R)` inherits that `apply`, and reading it
+        // through `C[X]` is what makes `C` a SAM whose parameter is `X`.
+        // Without the parameters there is nothing for `subst_as_seen_from` to
+        // substitute, and without `ABSTRACT` the SAM search finds no method.
+        let mut tps: Vec<SymbolId> = (1..=n)
+            .map(|i| type_param(st, f, &format!("T{i}")))
+            .collect();
+        let r = type_param(st, f, "R");
+        tps.push(r);
+        st.get_mut(f).tparams = tps.clone();
+        let params: Vec<Type> = tps[..n].iter().map(|p| Type::TypeParam(*p)).collect();
+        let apply = method(st, f, "apply", params, Type::TypeParam(r), Intrinsic::None);
+        st.get_mut(apply).flags = Flags::ABSTRACT;
     }
 }
 

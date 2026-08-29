@@ -1061,7 +1061,12 @@ fn linearize(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
         st.get(cls)
             .parents
             .iter()
-            .filter_map(|p| st.class_sym_of(p))
+            // A parent written as a function type is `scala.FunctionN`; the
+            // linearization has to contain it, or an implementation of a
+            // narrowed `apply` gets no bridge for `apply(Object)Object`.
+            .filter_map(|p| {
+                st.class_sym_of(&st.function_class_form(p).unwrap_or_else(|| p.clone()))
+            })
             .filter(|p| !skip_parent(st, *p))
             .collect()
     }
@@ -1516,8 +1521,14 @@ fn split_parents(st: &SymbolTable, parents: &[Tree]) -> (String, Vec<String>) {
     let mut ifaces = Vec::new();
     let mut found_class = false;
     for p in parents {
+        // `trait Mono extends (Int => String)` really is a `scala.Function1`
+        // on the JVM (nsc emits it in the interface list), so a parent written
+        // as a structural function has to be read back as the class.
+        let pty = st
+            .function_class_form(&p.ty)
+            .unwrap_or_else(|| p.ty.clone());
         let id = st
-            .class_sym_of(&p.ty)
+            .class_sym_of(&pty)
             .or_else(|| if p.sym.is_none() { None } else { Some(p.sym) });
         let Some(id) = id else {
             continue;
@@ -9984,6 +9995,17 @@ fn maybe_unbox_erased_result(
         return;
     };
     if !desc_returns_object(desc) {
+        // The descriptor may still be wider than what the typer settled on:
+        // `TreeMap[K, V] - key` is declared to return `Map` on the JVM, and
+        // `2.13`'s own signature narrows it to `C`. Without the cast the
+        // verifier sees a `Map` where a `TreeMap` is wanted.
+        if let (Some(declared), Some(want)) =
+            (desc_return_internal(desc), checkcast_internal(ctx.st, ty))
+        {
+            if declared != want && ty_extends_internal(ctx.st, ty, &declared) {
+                asm.checkcast(&want);
+            }
+        }
         return;
     }
     if is_jvm_primitive(ty) && !is_unit_like(ty) {
@@ -10036,6 +10058,40 @@ fn emit_from_erased_object(asm: &mut Assembler, st: &SymbolTable, ty: &Type) {
     if matches!(ty, Type::Tuple(_)) {
         asm.checkcast("scala/Tuple2");
     }
+}
+
+/// The internal name a descriptor returns, for an ordinary reference return
+/// (`(…)Lscala/collection/immutable/Map;` -> `scala/collection/immutable/Map`).
+/// `None` for primitives, arrays and `void`.
+fn desc_return_internal(desc: &str) -> Option<String> {
+    let (_, ret) = desc.rsplit_once(')')?;
+    let inner = ret.strip_prefix('L')?.strip_suffix(';')?;
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
+/// Does the class of `ty` reach `parent` (an internal name) through its own
+/// parents? `false` when `ty` names no class, which leaves the cast out.
+fn ty_extends_internal(st: &SymbolTable, ty: &Type, parent: &str) -> bool {
+    let Some(start) = st.class_sym_of(ty) else {
+        return false;
+    };
+    let mut work = vec![start];
+    let mut seen = HashSet::new();
+    while let Some(id) = work.pop() {
+        if !seen.insert(id.0) {
+            continue;
+        }
+        if class_internal(st, id) == parent {
+            return true;
+        }
+        for p in st.get(id).parents.clone() {
+            let p = st.function_class_form(&p).unwrap_or(p);
+            if let Some(pid) = st.class_sym_of(&p) {
+                work.push(pid);
+            }
+        }
+    }
+    false
 }
 
 fn desc_returns_object(desc: &str) -> bool {

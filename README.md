@@ -1355,6 +1355,147 @@ trait NullaryNode extends Node {
 - `Seq("a").map(m)`（`m: Map[String, Int]`）は `Map` が関数になっても通りません。
   適合ではなく推論（`Function2[B, …]` の `B` が未解決）の側です。
 
+### 関数型を継承したトレイトと省略された型引数（`type mismatch` 第 5 スライス）
+
+`agent/mismatch5` スライス。フィクスチャは `tests/fixtures/mism5*.scala`、テストは
+`crates/cli/tests/mismatch5.rs` です。8 つの原因を直しました。
+
+**1. 関数型を親に持つトレイトが SAM にならなかった**（最大の塊）。
+
+```scala
+trait CanBeQueryCondition[-T] extends (T => Rep[?])
+implicit val c: CanBeQueryCondition[Rep[Boolean]] = value => value
+```
+
+唯一の抽象メソッドは `Function1.apply` で、それは**構造的に書かれた親**から
+継承されます。`class_sym_of` は `Type::Function` をあえてクラスにしません
+（適合と erasure が構造的に扱うため）ので、**クラスを要る場所だけ**が
+`SymbolTable::function_class_form`（`function_class_shape` の逆）を呼ぶように
+しました —— SAM 探索（`abstract_sam_methods`）、メンバ検索（`lookup_member`）、
+as-seen-from（`subst_as_seen_from` の `walk`）、JVM の interface 一覧
+（backend `split_parents`）、線形化（backend `linearize`）の 5 か所です。
+
+同時に **prelude の `FunctionN` に本物の型パラメータを持たせ、`apply` を
+`ABSTRACT` にしました**。従来は `apply(Any): Any` かつ非 abstract だったので、
+(a) SAM 探索が抽象メソッドを 1 つも見つけられず、(b) 見つけたとしても
+`C[X]` を通して読んだときに置換するものが何もありませんでした。
+`self.apply(rs)`（`trait GetResult[+T] extends (PositionedResult => T) { self => }`）
+のために `walk` は `ThisType` も歩きます。
+`resolve_overload` の `Type::Class` 腕も `type_select` と同じく as-seen-from
+するようにしました（生のまま読むと `m(3)` が `found: 3 required: T1`）。
+`Select` が**値に解決されたとき**は `.apply` を挿入する受け手になります
+（従来は Select というだけで諦めていた）。
+
+**2. 2 回目の推論パスが「呼び出し側の型パラメータ」という解を捨てていた**。
+
+```scala
+def mk[T](f: PR => T): GR[T] = …
+def const[T](value: T): GR[T] = mk(_ => value)   // found: GR[T] required: GR[T]
+```
+
+`mk` の `T` はラムダの**結果**からしか決まらないので 2 回目のパスが解きますが、
+そこは `Type::TypeParam` をすべて弾いていました。弾くべきなのは
+**その呼び出し自身の**変数（`T := T` は解ではない）だけで、呼び出し側の型
+パラメータは立派な解です。
+
+**3. `extends Base(s)` が親の型引数を推論していなかった**。
+
+```scala
+class DerbySequenceDDLBuilder[T](seq: Sequence[T])
+  extends SequenceDDLBuilder.BuiltInSupport.OverrideActualStart(seq)
+```
+
+nsc の `parentTypes` はコンストラクタ引数から親の型引数を推論します。していないと
+パラメータが `Sequence[Base.this.T]` のまま残り、両辺が `Sequence[T]` と表示されて
+どちらも他方ではない、という診断になります。推論した型引数は**記録される親**にも
+なるので `Derived[X] <: Base[X]` も成り立ちます（`Typer::infer_parent_targs`）。
+
+**4. `new C` が期待型から型引数を読んでいなかった**。
+
+```scala
+def unit[R]: ResultConverter[R, W, U, Unit] = new UnitResultConverter
+```
+
+期待型が**親クラス**を指しているので、`UnitResultConverter[R] <: RC[R, …, Unit]` から
+`R` を読みます（コンストラクタパターンがスクルーティニに対してやるのと同じ計算＝
+`base_targs_from_pt`）。引数から解ける分と併せる必要があるので、パラメータごとに
+`Option` で返します。あわせて **`new C(args)` の頭は適用全体の期待型に適合しなくて
+よく**なりました（`type_expr_inner`）。頭だけを見て
+`found: ProductResultConverter required: ResultConverter[R, W, U, _]` と言っていた
+のはこれです。
+
+**5. パラメータのクラスに引数を揃えてから単一化していなかった**。`unify_one` は
+シンボル表を持たず型引数を位置で zip するので、`def id[R, U](c: RC[R, U])` に
+`UnitRC[String]`（＝`RC[String, Unit]`）を渡すと `[R, U]` に `[String]` を
+zip して `U` が解けませんでした。`unify_tparam_all` が
+`base_type_instance` で揃えます。
+
+**6. implicit だけの引数節が期待型で埋まらなかった**。`TreeMap.empty` は
+`[K: Ordering, V]: TreeMap[K, V]` で、`V` はどの implicit パラメータにも
+現れません。したがって探索だけでは決まらず、`adapt_implicit_apply` は
+「`TypeApply` を待つ」ため何もしないまま**メソッド型そのもの**を値の型に
+していました（`found: (Ordering[K])TreeMap[K, V]`）。nsc は
+`inferExprInstance` を先に走らせるので、**期待型が implicit パラメータに
+現れる型パラメータを全部決められるとき**は先へ進みます。
+
+**7. 注釈付きの型に `.apply` が挿入されなかった**。slick の
+`val (b, m: Map[…] @unchecked) = …` に続く `m(f)` が
+`value apply is not a member of Map[…] @unchecked` になっていました。注釈は
+型が**どんなメンバを持つか**については何も言わないので、形を問う場所は
+すべて注釈を透過します（`strip_annotations`）。
+
+**8. 同じ要素型の変換が受け手のコレクションを返していなかった**。2.13 は
+`filter` / `filterNot` / `take` / `reverse` / `++` / `:+` / `updated` / `sortWith`
+などを `C`（受け手自身のコレクション）を返すものとして宣言します。prelude は
+`C` を書けないので `Vector[Phase].filterNot(p)` が継承した `Seq[Phase]`、
+`phases ++ ps` が `IndexedSeq[Phase]` になっていました。第 4 スライスの `map` と
+同じ形の規則ですが、**消去後の descriptor が `Object` を返すメンバに限ります**
+（`erases_to_object`）。`TreeMap.filter` は JVM 上 `Map` を返すので、ここで
+`TreeMap` に絞ると codegen が `Map` を `TreeMap` のフィールドに積んで
+`VerifyError` になります（`to*` 変換は元から対象外＝`v.toSeq` は本当に `Seq`）。
+
+おまけに **コレクションファクトリの要素型を期待型で広げる**ようにしました。
+`Set` と `Map` は非変なので `def f(s: AnonSym): Set[Sym] = Set(s)` は
+部分型の問題ではなく、ファクトリの近道（引数だけから要素型を決める）が
+期待型に訊く必要があります（`factory_targs_from_pt`）。
+
+計測（`tests/slick_measure.sh`、slick 184 ファイル、`-Xsource:3`）は
+**620 → 547**、エラーを含むファイルは **87 → 81**、`type mismatch` は
+**127 → 98** になりました。新たにエラーを出すようになったファイルはありません。
+
+> 計測の注意: `tests/slick_measure.sh` の `BIN` は**親リポジトリの**
+> `target/release/scala-rs` を指しています。git worktree で作業していると
+> `cargo build --release` は worktree 側の `target/` に出るので、
+> スクリプトはビルドしたバイナリではなく `main` のバイナリを測ります
+> （実際に「変更しても数字が 1 ミリも動かない」形で踏みました）。
+> worktree では `SCALA_RS=<worktree>/target/release/scala-rs tests/slick_measure.sh`
+> と明示してください。
+
+**残っているもの**（このスライスでは直していない）:
+
+- **`MapOps` / `SetOps` の `-` / `removed` / `incl` / `excl` / `filter` は
+  受け手のコレクションに絞れない**。これらは JVM 上 `Map` / `Set` という
+  **名前のあるクラス**を返すので、typer が `TreeMap` に絞っても codegen の
+  Apply 結果型は消去後のシンボルから取り直され、`TreeMap` のフィールドへ
+  `Map` を積んで `VerifyError` になります。Apply 自身の結果型が erasure を
+  生き残るようになれば外せます（`agent/seqpat` が触っている領域）。
+  slick の `ConcurrencyControl` に 2 件残ります。
+- **タプルのパターン定義で成分に型を書くと `VerifyError`**（main でも同じ）。
+  `val (n: Int, s: String) = if (b) (1, "x") else (0, "y")` は
+  `Bad local variable type`（int を参照ローカルに入れている）になります。
+  slick の `HoistClientOps` の
+  `val (bl2: Bind, lrepl: Map[…] @unchecked) = …` がこの形です。
+- **タプル成分への期待型の伝播**。`(new Sel, Map(s -> a))` を
+  `(Node, Map[Sym, Int])` に対して型付けると、成分の `Map(s -> a)` は
+  期待型なしで型付けられて非変な `Map[AnonSym, Int]` になります。
+  nsc の `protoTypeArgs`（引数を型付ける前に期待型から型引数の見込みを立てる）
+  を入れてみましたが、by-name パラメータが `() => T` のまま渡って
+  611 → 604 と悪化したので巻き戻しました。by-name を除外した形なら通る
+  見込みです。
+- **`def wrong[A, B](v: B): GR[A] = mk(_ => v)` を通してしまう**（main でも同じ）。
+  期待型が非変位置で `T := A` を強制したあと、ラムダの本体が `A` に対して
+  再検査されません。scalac は `found: v.type required: A` を出します。
+
 ### jar のクラスを pickle から読む
 
 `load_classpath` はディレクトリしか歩きません。つまり **jar の中のクラスは
@@ -2236,6 +2377,25 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 `Seq.map` の結果を `IndexedSeq` に渡す）で固定しています。実 scalac 2.13.16 も
 すべて拒否します（nsc は typer で止まるので refchecks 側の 1 件は出しません）。
 
+| `mism5.scala` | 関数型を親に持つトレイトの SAM 変換、呼び出し側の型パラメータを解にする 2 回目の推論、`extends Base(s)` と `new C` が省略した型引数、パラメータのクラスへ引数を揃える単一化、implicit だけの引数節を期待型で埋めること、注釈付きの型への `.apply` 挿入、同じ要素型の変換が受け手のコレクションを返すこと、ファクトリの要素型を期待型で広げること（library dual-run のみ） | `true` `false` `k` `3` `unit` `prod1` `tmunit` `0` `x2` `Vector(1, 3)` `Vector(1, 2, 3, 4)` `Vector(1, 2)` `Vector(3, 2, 1)` `Vector(1, 2, 3, 5)` `Vector(9, 2, 3)` `Vector(3, 2, 1)` `Set(2)` `Vector(1, 2, 3)` `Set(anon)` `Map(anon -> 1)` |
+
+`mism5.scala` は `crates/cli/tests/mismatch5.rs` から回します。同ファイルには最小形の
+受理テスト（`a_trait_that_extends_a_function_type_is_a_sam` /
+`a_callees_parameter_may_be_solved_to_the_callers` /
+`a_parent_gets_its_type_arguments_from_the_ctor_args` /
+`a_new_gets_its_type_arguments_from_a_base_expected_type` /
+`an_argument_is_lined_up_with_the_parameters_class` /
+`an_implicit_only_clause_is_filled_from_the_expected_type` /
+`apply_is_inserted_through_an_annotated_type` /
+`a_transformation_keeps_the_receivers_own_collection` /
+`a_factorys_element_type_is_widened_by_the_expected_type`）も置いてあります。
+逆に、緩めた規則が診断を飲み込まないことは `mism5_bad.scala`
+（抽象メソッドが 2 つあるトレイトは SAM ではない／親の型引数がどう推論しても
+合わない引数／期待型が親クラスのインスタンスですらない `new`／`Seq.filter` の
+結果を `Vector` に渡す／`Set[String]` に `Int` を入れる／`apply` を持たない型を
+`@unchecked` 越しに関数として呼ぶ）で固定しています。実 scalac 2.13.16 も
+すべて拒否します。
+
 | `tyvar.scala` | 未確定の型変数（nsc の undetermined type variables）。引数位置の `Map.empty` / `Vector.empty` / `Set.empty` / `List.empty` / `Nil` / `Seq.empty`、空の `apply`（`Map()` / `Vector()` / `List()`）、入れ子の呼び出しから漏れる変数（`take(id(Map.empty))`）、期待型が結果型の変数を決める形（`val l: List[Map[String, Int]] = f(Map.empty)`）、可変長引数・by-name・デフォルト引数の位置、複数引数・複数節、オーバーロード選択、コンストラクタ引数、そして逆向きの「呼び先自身の未確定な型パラメータ」（`xs.collect { case … }`）（library dual-run のみ） | `0`×9 `List(Map())` `2` `0`×3 `1` `2` `0` `0` `List(2, 4)` `List(2, 3, 4, 5)` `Some(6)` |
 
 `tyvar.scala` は `crates/cli/tests/tyvar.rs` から回します。同ファイルには最小形の
@@ -2277,6 +2437,29 @@ implicit-only 型パラメータの両方に nsc と同じ趣旨の診断が出�
 計測は `files=184 errors=833 files_with_errors=102` → `errors=777 files_with_errors=93`。
 
 ### Remaining
+
+- **タプルのパターン定義で成分に型を書くと `VerifyError`**
+  （`agent/mismatch5` で確認、未修正。main でも同じ）。
+  `val (n: Int, s: String) = if (b) (1, "x") else (0, "y")` は
+  `VerifyError: Bad local variable type`（int を参照ローカルに入れている）に
+  なります。slick の `HoistClientOps` の
+  `val (bl2: Bind, lrepl: Map[…] @unchecked) = …` がこの形です。
+
+- **`MapOps` / `SetOps` の `-` / `removed` / `incl` / `excl` / `filter` を
+  受け手のコレクションに絞れない**（`agent/mismatch5` で原因まで特定、未修正）。
+  これらは JVM 上 `Map` / `Set` という**名前のあるクラス**を返すので、typer が
+  `TreeMap` に絞っても codegen は Apply の結果型を消去後のシンボルから取り直し、
+  `TreeMap` のフィールドへ `Map` を積んで `VerifyError` になります。
+  そのため `erases_to_object` で「消去後 `Object` を返すメンバ」だけに
+  限定しました。Apply 自身の結果型が erasure を生き残れば外せます。
+
+- **タプル成分への期待型の伝播**（`agent/mismatch5` で試して巻き戻し）。
+  `(new Sel, Map(s -> a))` を `(Node, Map[Sym, Int])` に対して型付けると、
+  成分の `Map(s -> a)` は期待型なしで型付けられて非変な `Map[AnonSym, Int]` に
+  なります。nsc の `protoTypeArgs`（引数を型付ける前に期待型から型引数の
+  見込みを立てる）を入れると by-name パラメータが `() => T` のまま渡り、
+  slick が 575 → 604 に悪化したので巻き戻しました。by-name を除外した形なら
+  通る見込みです。
 
 - **`case Seq(a, b)` が使えない**（`agent/mismatch4` で原因まで特定、未修正）。
   `unapplySeq` を持つのは prelude の `List` だけなので、`case Seq((s, _))` は

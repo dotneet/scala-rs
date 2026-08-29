@@ -600,7 +600,11 @@ impl SymbolTable {
                 }
             }
             for m in &sym.parents.clone() {
-                if let Some(ps) = self.class_sym_of(m) {
+                // `trait C[-T] extends (T => R)` really does inherit
+                // `Function1.apply`; the parent just names no class until the
+                // structural function is read back as one.
+                let m = self.function_class_form(m).unwrap_or_else(|| m.clone());
+                if let Some(ps) = self.class_sym_of(&m) {
                     work.push(ps);
                 }
             }
@@ -1015,6 +1019,28 @@ impl SymbolTable {
                     t
                 }
                 Type::Annotated { tpe, .. } => walk(st, tpe, ty, seen),
+                // `trait C[-T] extends (T => R)` inherits `Function1.apply`,
+                // and reading its type through `C[X]` means walking into
+                // `Function1[X, R]`. A structural function names no class, so
+                // it has to be read back as one first.
+                Type::Function { .. } => match st.function_class_form(recv) {
+                    Some(c) => walk(st, &c, ty, seen),
+                    None => ty,
+                },
+                // `trait GetResult[+T] extends (PositionedResult => T) { self => }`
+                // and then `self.apply(rs)`: the receiver is the class's own
+                // `this`, so the member has to be read through the class's
+                // parents at the class's own type parameters. Without this the
+                // inherited `Function1.apply` kept `T1` and `R`.
+                Type::ThisType(sym) => {
+                    let args: Vec<Type> = st
+                        .get(*sym)
+                        .tparams
+                        .iter()
+                        .map(|t| Type::TypeParam(*t))
+                        .collect();
+                    walk(st, &Type::Class { sym: *sym, args }, ty, seen)
+                }
                 // Only heads that `apply_type_ctor` folds may be re-walked: an
                 // abstract type-member head (`ColumnType[U]`) folds to the very
                 // same `Applied`, so recursing on it would not terminate — and
@@ -1753,6 +1779,22 @@ impl SymbolTable {
         })
     }
 
+    /// The structural `(T1, …, Tn) => R` read back as the class
+    /// `scala.FunctionN[T1, …, Tn, R]` -- the inverse of
+    /// `function_class_shape`. `class_sym_of` deliberately leaves
+    /// `Type::Function` structural (conformance and erasure want it that way),
+    /// so the places that need a *class* -- a parent walk, and a member's type
+    /// as seen from a prefix -- ask for this form explicitly.
+    pub fn function_class_form(&self, ty: &Type) -> Option<Type> {
+        let Type::Function { params, ret } = ty else {
+            return None;
+        };
+        let sym = crate::classpath::find_by_jvm(self, &format!("scala/Function{}", params.len()))?;
+        let mut args = params.clone();
+        args.push((**ret).clone());
+        Some(Type::Class { sym, args })
+    }
+
     fn is_tuple_arity(&self, sym: SymbolId, n: usize) -> bool {
         let s = self.get(sym);
         let name = s.name.trim_end_matches('$');
@@ -2267,12 +2309,18 @@ impl SymbolTable {
             return None;
         }
         let method = abstracts[0];
-        let targs: Vec<Type> = match ty {
-            Type::Class { args, .. } => args.clone(),
-            _ => Vec::new(),
+        // The abstract method may be declared in a *parent* (`trait C[-T]
+        // extends (T => R)` gets its `apply` from `Function1`), so its type has
+        // to be read as seen from `ty` -- substituting only `cls`'s own type
+        // parameters leaves the parent's untouched.
+        let recv = match ty {
+            Type::Class { .. } => ty.clone(),
+            _ => Type::Class {
+                sym: cls,
+                args: Vec::new(),
+            },
         };
-        let tps = self.get(cls).tparams.clone();
-        let subst = |t: &Type| subst_tparams_slice(&tps, &targs, t);
+        let subst = |t: &Type| self.subst_as_seen_from(&recv, t);
         let (raw_params, raw_ret) = match &self.get(method).ty {
             Type::Method { paramss, ret } => (
                 paramss.iter().flatten().cloned().collect::<Vec<_>>(),
@@ -2307,6 +2355,9 @@ impl SymbolTable {
                 by_name.entry(s.name.clone()).or_insert(*m);
             }
             for p in self.get(id).parents.clone() {
+                // A parent written as a function type (`trait C[-T] extends
+                // (T => R)`) declares `apply`, which is what makes `C` a SAM.
+                let p = self.function_class_form(&p).unwrap_or(p);
                 if let Some(c) = self.class_sym_of(&p) {
                     work.push(c);
                 }

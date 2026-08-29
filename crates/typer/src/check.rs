@@ -3605,11 +3605,20 @@ impl Typer {
         if class_id.is_none() {
             return;
         }
+        let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+        // `class Derived[T](s: Seqn[T]) extends Base(s)` writes no type
+        // arguments for `Base`, so nsc infers them from the constructor
+        // arguments, exactly as `new Base(s)` would. Without that the
+        // parameter stays `Seqn[Base.this.T]`, and both sides of the check
+        // print `Seqn[T]` while neither is the other. The inferred arguments
+        // become the recorded parent too, so `Derived[X] <: Base[X]` holds.
+        let class_ty = self.infer_parent_targs(class_id, &class_ty, &arg_tys);
+        fun.ty = class_ty.clone();
+        tree.ty = class_ty.clone();
         let targs: Vec<Type> = match &class_ty {
             Type::Class { args, .. } => args.clone(),
             _ => Vec::new(),
         };
-        let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
         match self.pick_ctor_at(class_id, &targs, &arg_tys, None) {
             OverloadPick::Found(sym, param_tys, _) => {
                 // `class Sub[T](y: T) extends Base[T](y)`: the constructor's
@@ -3657,6 +3666,38 @@ impl Typer {
                     ),
                 );
             }
+        }
+    }
+
+    /// nsc's `parentTypes`: an `extends` clause that names a parameterized
+    /// class without type arguments gets them from the constructor arguments,
+    /// the same inference `new Base(s)` runs. A parameter no argument mentions
+    /// is left alone -- writing nothing there keeps today's behaviour rather
+    /// than inventing an `Any`.
+    fn infer_parent_targs(&self, class_id: SymbolId, class_ty: &Type, arg_tys: &[Type]) -> Type {
+        if !matches!(class_ty, Type::Class { args, .. } if args.is_empty()) {
+            return class_ty.clone();
+        }
+        let tps = self.st.get(class_id).tparams.clone();
+        if tps.is_empty() || arg_tys.iter().any(|t| t.is_no_type() || t.is_error()) {
+            return class_ty.clone();
+        }
+        let OverloadPick::Found(_, param_tys, _) = self.pick_ctor_at(class_id, &[], arg_tys, None)
+        else {
+            return class_ty.clone();
+        };
+        let mut inferred = Vec::with_capacity(tps.len());
+        for tp in &tps {
+            match self.unify_tparam_all(*tp, &param_tys, arg_tys) {
+                Some(t) if !t.is_no_type() && !t.is_error() && !type_mentions_tparam(&t, *tp) => {
+                    inferred.push(t)
+                }
+                _ => return class_ty.clone(),
+            }
+        }
+        Type::Class {
+            sym: class_id,
+            args: inferred,
         }
     }
 
@@ -4951,6 +4992,18 @@ impl Typer {
                                 if type_args_are_instantiated(pt_args, &tps) {
                                     tree.ty = pt.clone();
                                 }
+                            } else {
+                                // `def mk[R]: RC[R, Unit] = new UnitRC` --
+                                // the expected type names a *base* class, so
+                                // the arguments come from the base type
+                                // instance: `UnitRC[R] <: RC[R, Unit]` forces
+                                // `R`. Same reading a constructor pattern
+                                // does on its scrutinee.
+                                let sym = *sym;
+                                let targs = self.pattern_class_targs(sym, pt);
+                                if !targs.is_empty() {
+                                    tree.ty = Type::Class { sym, args: targs };
+                                }
                             }
                         }
                     }
@@ -5986,20 +6039,6 @@ impl Typer {
         // (`toMap[K, V](implicit ev: A <:< (K, V))`), only the witness can pin
         // them down, and the search does it.
         let undet = self.undetermined_tparams(tree, &first);
-        if !self.st.get(tree.sym).tparams.is_empty()
-            && !matches!(tree.kind, TreeKind::TypeApply { .. })
-            && undet.is_empty()
-        {
-            return;
-        }
-        // An argument being typed before the alternative is picked: leave the
-        // clause alone. The parameter it fills is what says what the
-        // undetermined parameters are, and this pass has no expected type at
-        // all -- committing here picks a witness for `take(empty)` rather than
-        // reporting the one the parameter really asks for.
-        if self.typing_call_args && !undet.is_empty() && pt.is_no_type() {
-            return;
-        }
         let span = tree.span;
         let ret = match &tree.ty {
             Type::Method { ret, .. } => (**ret).clone(),
@@ -6014,6 +6053,45 @@ impl Typer {
             .into_iter()
             .filter(|(_, t)| !t.is_no_type() && !t.is_error() && !matches!(t, Type::TypeParam(_)))
             .collect();
+        if !self.st.get(tree.sym).tparams.is_empty()
+            && !matches!(tree.kind, TreeKind::TypeApply { .. })
+            && undet.is_empty()
+        {
+            // `TreeMap.empty` is `[K: Ordering, V]: TreeMap[K, V]`: `V` is in
+            // no implicit parameter, so the search alone cannot pin the
+            // parameters -- but `val m: TreeMap[Long, String] = TreeMap.empty`
+            // does. nsc runs `inferExprInstance` against the expected type and
+            // only then searches. Waiting for a `TypeApply` that never comes
+            // left the whole method type standing as the value's type.
+            let implicit_tps: Vec<SymbolId> = self
+                .st
+                .get(tree.sym)
+                .tparams
+                .iter()
+                .copied()
+                .filter(|tp| match &tree.ty {
+                    Type::Method { paramss, .. } => paramss
+                        .first()
+                        .is_some_and(|ps| ps.iter().any(|t| type_mentions_tparam(t, *tp))),
+                    _ => false,
+                })
+                .collect();
+            let pinned_by_pt = !implicit_tps.is_empty()
+                && implicit_tps
+                    .iter()
+                    .all(|tp| from_pt.iter().any(|(id, _)| id == tp));
+            if !pinned_by_pt {
+                return;
+            }
+        }
+        // An argument being typed before the alternative is picked: leave the
+        // clause alone. The parameter it fills is what says what the
+        // undetermined parameters are, and this pass has no expected type at
+        // all -- committing here picks a witness for `take(empty)` rather than
+        // reporting the one the parameter really asks for.
+        if self.typing_call_args && !undet.is_empty() && pt.is_no_type() {
+            return;
+        }
         let (ret, tree_ty) = if from_pt.is_empty() {
             (ret, tree.ty.clone())
         } else {
@@ -7642,7 +7720,14 @@ impl Typer {
         // new C(args)
         if matches!(&fun.kind, TreeKind::New { .. }) {
             self.new_is_applied = true;
-            self.type_expr(fun, pt);
+            // `type_expr_inner`, not `type_expr`: the head of `new C(args)` is
+            // not a value, and adapting it to the *application's* expected
+            // type reported `found: ProductResultConverter required:
+            // ResultConverter[R, W, U, _]` before the arguments had had their
+            // say. The expected type still reaches the head -- it is what the
+            // type arguments are read from -- it just no longer has to be
+            // satisfied there.
+            self.type_expr_inner(fun, pt);
             self.new_is_applied = false;
             if let Some(elem) = array_elem_of(&fun.ty) {
                 if needs_classtag_elem(&elem) {
@@ -7778,6 +7863,16 @@ impl Typer {
                         }
                         _ => Vec::new(),
                     };
+                    // `def mk[R, U](c: RC[R, U]): RC[R, U] = new ProdRC(c)`:
+                    // the expected type names a base class, and
+                    // `ProdRC[R, U] <: RC[R, U]` reads the arguments off it.
+                    // Without this the parameters that no constructor argument
+                    // mentions fell through to `Any`.
+                    let from_base = if pt_args.is_empty() {
+                        self.base_targs_from_pt(c, pt)
+                    } else {
+                        vec![None; tps.len()]
+                    };
                     for (i, tp) in tps.iter().enumerate() {
                         inferred_args.push(
                             self.unify_tparam_all(*tp, &unify_params, &arg_tys)
@@ -7790,6 +7885,7 @@ impl Typer {
                                 // type for expanded function`.
                                 .filter(|t| !mentions_no_type(t))
                                 .or_else(|| pt_args.get(i).cloned())
+                                .or_else(|| from_base.get(i).cloned().flatten())
                                 .unwrap_or(Type::Any),
                         );
                     }
@@ -8362,9 +8458,18 @@ impl Typer {
                             .infer_method_tparams(sym, &sig_param_tys, &now)
                             .into_iter()
                             .filter(|(_, t)| {
+                                // A solution that is *this* call's own variable
+                                // is no solution -- `T := T` leaves the result
+                                // exactly as it was. The caller's type
+                                // parameter is a perfectly good one, though:
+                                // `def const[T](v: T): GR[T] = mk(_ => v)`
+                                // solves `mk`'s `T` to `const`'s, and
+                                // rejecting every `TypeParam` printed the
+                                // result as `GR[T] required GR[T]`.
                                 !t.is_no_type()
                                     && !t.is_error()
-                                    && !matches!(t, Type::Nothing | Type::TypeParam(_))
+                                    && !matches!(t, Type::Nothing)
+                                    && !mentions_tparam(t, &tps)
                             })
                             .collect();
                         if !inst.is_empty() {
@@ -8483,6 +8588,50 @@ impl Typer {
                                         args: vec![fr.as_ref().widen_constant()],
                                     };
                                 }
+                            }
+                        }
+                    }
+                } else if returns_receiver_collection(&method_name)
+                    && erases_to_object(&self.st.get(sym).jvm_name)
+                {
+                    // 2.13 declares these as returning `C` (or `CC[B]`) --
+                    // the receiver's own collection. The prelude cannot spell
+                    // `C`, so `Vector[Phase].filterNot(p)` came back as the
+                    // inherited `Seq[Phase]` and `phases ++ ps` as
+                    // `IndexedSeq[Phase]`. The element types are the declared
+                    // result's; only the class is the receiver's. Same shape
+                    // as the `map` rule above, and gated the same way: a
+                    // `scala.collection` class that really is a subclass of
+                    // what the declaration named.
+                    if let Type::Class {
+                        sym: d,
+                        args: dargs,
+                    } = ret.clone()
+                    {
+                        let recv_cls = recv_ty
+                            .as_ref()
+                            .and_then(|t| self.st.class_sym_of(t))
+                            .map(|c| self.collection_root(c));
+                        if let Some(r) = recv_cls {
+                            if r != d
+                                && !dargs.is_empty()
+                                && self.st.get(r).tparams.len() == dargs.len()
+                                && self.maps_to_own_class(r)
+                                && self
+                                    .base_type_instance(
+                                        &Type::Class {
+                                            sym: r,
+                                            args: vec![],
+                                        },
+                                        d,
+                                        0,
+                                    )
+                                    .is_some()
+                            {
+                                ret = Type::Class {
+                                    sym: r,
+                                    args: dargs,
+                                };
                             }
                         }
                     }
@@ -8610,9 +8759,12 @@ impl Typer {
                                             self.st.get(*id).kind == crate::symbol::SymKind::Class
                                         })
                                     {
+                                        let targs = self
+                                            .factory_targs_from_pt(map, targs, pt)
+                                            .unwrap_or_else(|| targs.clone());
                                         ret = Type::Class {
                                             sym: map,
-                                            args: targs.clone(),
+                                            args: targs,
                                         };
                                     }
                                 }
@@ -8639,9 +8791,12 @@ impl Typer {
                             {
                                 // `List(circle, rect)` is a `List[Shape]`, so the
                                 // element type is the lub of every argument.
+                                let args1 = self
+                                    .factory_targs_from_pt(cls, std::slice::from_ref(&elem), pt)
+                                    .unwrap_or_else(|| vec![elem]);
                                 ret = Type::Class {
                                     sym: cls,
-                                    args: vec![elem],
+                                    args: args1,
                                 };
                             }
                         }
@@ -8781,7 +8936,7 @@ impl Typer {
                 }
                 // nsc: `c(1)` looks up `apply`, never `update`. Assignment
                 // `c(i) = v` is the only path that rewrites to `update`.
-                let has_apply = match &fun_ty {
+                let has_apply = match strip_annotations(&fun_ty) {
                     Type::Method { .. } | Type::Overload(_) | Type::Function { .. } => true,
                     Type::Array(_) => true,
                     Type::Class { sym, .. } | Type::ModuleRef(sym) => {
@@ -8973,6 +9128,12 @@ impl Typer {
             let Some(p) = param_at(params, i) else {
                 break;
             };
+            // `unify_one` zips type arguments positionally and has no symbol
+            // table to ask, so an argument of a *subclass* has to be lined up
+            // with the parameter's class first: `def id[R, U](c: RC[R, U])`
+            // given a `UnitRC[String]` is `RC[String, Unit]`, not a one-argument
+            // list zipped against `[R, U]`.
+            let a = &self.align_to_param_class(p, a);
             if let Some(t) = unify_one(tp, p, a) {
                 acc = Some(match acc {
                     None => t,
@@ -9258,6 +9419,22 @@ impl Typer {
             }
         }
         out
+    }
+
+    /// The argument type read as the parameter's own class, when it is a
+    /// strict subclass of it. Everything else is handed back unchanged.
+    fn align_to_param_class(&self, param: &Type, arg: &Type) -> Type {
+        let (Type::Class { sym: ps, args: pas }, Type::Class { sym: as_, .. }) = (param, arg)
+        else {
+            return arg.clone();
+        };
+        if ps == as_ || pas.is_empty() {
+            return arg.clone();
+        }
+        match self.base_type_instance(arg, *ps, 0) {
+            Some(b) => b,
+            None => arg.clone(),
+        }
     }
 
     fn as_tuple_args(&self, ty: &Type) -> Option<Vec<Type>> {
@@ -10686,7 +10863,14 @@ impl Typer {
             Type::Class { sym, .. } => {
                 let apply = self.st.lookup_member(*sym, "apply");
                 for m in apply {
-                    if let Type::Method { paramss, ret } = &self.st.get(m).ty {
+                    // As seen from the receiver, like `type_select`: an
+                    // `apply` inherited from a generic parent is only itself
+                    // once the receiver's arguments are in. `trait Mono
+                    // extends (Int => String)` gets `Function1.apply`, and
+                    // reading it raw made `m(3)` report
+                    // `found: 3  required: T1`.
+                    let mty = self.st.subst_as_seen_from(fun_ty, &self.st.get(m).ty);
+                    if let Type::Method { paramss, ret } = &mty {
                         cands.push((
                             m,
                             paramss.first().cloned().unwrap_or_default(),
@@ -11903,6 +12087,67 @@ impl Typer {
             }
         }
         out
+    }
+
+    /// A collection factory's element types, widened by the expected type.
+    /// `Set(s)` on an `AnonSym` is a `Set[AnonSym]` from its arguments alone,
+    /// but `def f(s: AnonSym): Set[Sym] = Set(s)` is a `Set[Sym]` -- and `Set`
+    /// is invariant, so the difference is an error rather than a subtype.
+    /// nsc reaches this through ordinary inference; the factory shortcuts here
+    /// bypass it, so they have to ask. `None` when the expected type is not
+    /// this very class, or does not admit what the arguments gave.
+    fn factory_targs_from_pt(
+        &self,
+        cls: SymbolId,
+        from_args: &[Type],
+        pt: &Type,
+    ) -> Option<Vec<Type>> {
+        let Type::Class { sym, args } = pt else {
+            return None;
+        };
+        if *sym != cls || args.len() != from_args.len() || args.is_empty() {
+            return None;
+        }
+        let tps = self.st.get(cls).tparams.clone();
+        if !type_args_are_instantiated(args, &tps) {
+            return None;
+        }
+        from_args
+            .iter()
+            .zip(args)
+            .all(|(a, p)| self.st.is_sub_type(a, p))
+            .then(|| args.clone())
+    }
+
+    /// `pattern_class_targs` one parameter at a time: what the expected type
+    /// says about each of `cls`'s type parameters, `None` where it says
+    /// nothing. `new TmRC(c, f)` checked against `RC[R, String]` learns `R`
+    /// and `V` this way and leaves `U` to the constructor arguments.
+    fn base_targs_from_pt(&self, cls: SymbolId, pt: &Type) -> Vec<Option<Type>> {
+        let tps = self.st.get(cls).tparams.clone();
+        let (pt_sym, pt_args) = match pt {
+            Type::Class { sym, args } if !args.is_empty() => (*sym, args.clone()),
+            _ => return vec![None; tps.len()],
+        };
+        if tps.is_empty() || pt_sym == cls {
+            return vec![None; tps.len()];
+        }
+        let open = Type::Class {
+            sym: cls,
+            args: tps.iter().map(|t| Type::TypeParam(*t)).collect(),
+        };
+        let Some(Type::Class {
+            args: base_args, ..
+        }) = self.base_type_instance(&open, pt_sym, 0)
+        else {
+            return vec![None; tps.len()];
+        };
+        tps.iter()
+            .map(|tp| {
+                unify_tparam(*tp, &base_args, &pt_args)
+                    .filter(|t| !t.is_no_type() && !t.is_error() && !mentions_no_type(t))
+            })
+            .collect()
     }
 
     fn find_unapply(&self, fun: &Tree) -> Option<SymbolId> {
@@ -14581,13 +14826,30 @@ impl Typer {
     }
 
     fn rewrite_receiver_apply(&mut self, fun: &mut Tree) {
-        if matches!(&fun.kind, TreeKind::Select { .. } | TreeKind::New { .. }) {
+        if matches!(&fun.kind, TreeKind::New { .. }) {
+            return;
+        }
+        // A `Select` that resolved to a *value* is a receiver like any other:
+        // `O.m1(3)` where `m1: Mono` is `O.m1.apply(3)`. Only a module
+        // selection is left alone -- `scala.Some(1)` already has its own
+        // `apply` path, and rewriting it here would change what codegen
+        // emits for every qualified companion call.
+        if matches!(&fun.kind, TreeKind::Select { .. })
+            && !matches!(
+                strip_annotations(&fun.ty),
+                Type::Class { .. } | Type::Array(_)
+            )
+        {
             return;
         }
         // nsc inserts `.apply` for `c(1)` / `xs(i)` when `c` is a value, not a method.
         // Leave method/overload idents alone (`f(1)`).
+        // An annotation is not part of what a type *is*: slick's
+        // `val (b, m: Map[…] @unchecked) = …` then calls `m(f)`, and without
+        // looking through `@unchecked` that reported
+        // `value apply is not a member of Map[…] @unchecked`.
         let insert = matches!(
-            &fun.ty,
+            strip_annotations(&fun.ty),
             Type::Array(_) | Type::Class { .. } | Type::ModuleRef(_)
         );
         if !insert {
@@ -14913,6 +15175,76 @@ fn is_native_annot(path: &str) -> bool {
 
 fn is_override_annot(path: &str) -> bool {
     matches!(path, "Override" | "java.lang.Override")
+}
+
+/// Does this JVM descriptor return `java/lang/Object`? A member declared to
+/// return `C` erases that way, and only then may the typer narrow the result
+/// to the receiver's own collection: where the descriptor names a class
+/// (`TreeMap.filter` returns `Lscala/collection/immutable/Map;`) codegen would
+/// store a `Map` where a `TreeMap` is wanted and the verifier would reject it.
+fn erases_to_object(desc: &str) -> bool {
+    desc.rsplit_once(')')
+        .is_some_and(|(_, ret)| ret == "Ljava/lang/Object;")
+}
+
+/// The `IterableOps` / `SeqOps` members whose 2.13 signature returns the
+/// receiver's own collection (`C`, or `CC[B]` for the ones that widen the
+/// element type). The conversions (`toSeq`, `toList`, …) are deliberately
+/// absent: those really do return the class they name.
+///
+/// `MapOps` / `SetOps`'s own `-` / `removed` / `incl` / `excl` are absent too,
+/// and for a different reason: they erase to a *named* class
+/// (`(Object)Lscala/collection/immutable/Map;`), so narrowing `TreeMap - key`
+/// to a `TreeMap` here leaves codegen storing a `Map` into a `TreeMap` field
+/// (`VerifyError`). The `C`-returning members above all erase to `Object`, so
+/// the cast `maybe_unbox_erased_result` already emits covers them. Reaching
+/// those needs the Apply's own result type to survive erasure -- see README.
+fn returns_receiver_collection(name: &str) -> bool {
+    matches!(
+        name,
+        "filter"
+            | "filterNot"
+            | "take"
+            | "takeRight"
+            | "takeWhile"
+            | "drop"
+            | "dropRight"
+            | "dropWhile"
+            | "slice"
+            | "tail"
+            | "init"
+            | "reverse"
+            | "distinct"
+            | "distinctBy"
+            | "sorted"
+            | "sortBy"
+            | "sortWith"
+            | "patch"
+            | "updated"
+            | "padTo"
+            | "diff"
+            | "intersect"
+            | "appended"
+            | "prepended"
+            | "appendedAll"
+            | "prependedAll"
+            | "$plus$plus"
+            | "++"
+            | "$colon$plus"
+            | ":+"
+            | "$plus$colon"
+            | "+:"
+    )
+}
+
+/// `T @annot` read as `T`. An annotation says nothing about what members a
+/// type has, so every question about its *shape* has to look through it.
+fn strip_annotations(ty: &Type) -> &Type {
+    let mut t = ty;
+    while let Type::Annotated { tpe, .. } = t {
+        t = tpe;
+    }
+    t
 }
 
 fn peel_empty_annot(ty: &Type) -> Type {
