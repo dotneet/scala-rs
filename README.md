@@ -1066,6 +1066,16 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 
 ### Remaining
 
+- **`Array` の非変性**。`Array[Int]` を `Array[Any]` に渡せてしまう（scalac は拒否）。
+  クラスの型引数は不変位置で等価性を要求するようにしたが、`Array` だけは covariant の
+  ままにしてある。`val a: Array[AnyRef] = Array("x", "y")` を通すには**期待型からの
+  メソッド型パラメータ推論**が要り、それが未実装のため。両方まとめて直すべき穴。
+- **ボックス型と値クラスの同一視**。prelude が `scala.Int` に JVM 名 `java/lang/Integer`
+  を与えているため、`java.lang.Integer` / `java.lang.Long` が `scala.Int` / `scala.Long`
+  に解決されてしまう。`java.lang.Integer.valueOf(3)` は `value Integer is not a member of
+  <notype>`、`new java.util.ArrayList[java.lang.Long]` への `add(7L)` は型不一致になる。
+  scalac では別の型なので、別シンボルとして分ける必要がある。
+
 - **implicit 探索の残り**: 多相 implicit のユニフィケーションと再帰導出、発散の打ち切り、nsc 相当の specificity は入った（「Implicit 解決」節）。残るのは (a) `xs.toMap` を `scala.collection.Iterable` にも載せること — pickle 供給が具象コレクション（`HashMap` / `ConstArray` …）に自前の `toMap` を付けるので、継承した 2 本目がオーバーロード衝突になる。いまは `List` / `Iterator` だけに宣言している、(b) 期待型からのメソッド型パラメータ推論が要る implicit（slick の `TypedType[T]` / `TypedType[P1]` はこちらで、implicit 探索ではなく `T` の推論が先に必要）、(c) 診断文面は nsc の複数行（`both … and … match expected type …`）ではなく 1 行のまま
 - **def マクロの展開**。`def f: T = macro Impl.method` は**パースして**バインディングを
   シンボル（`Symbol.macro_impl`）に記録し、マクロ def のバイトコードは nsc と同じく出さない。
