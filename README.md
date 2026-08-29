@@ -1187,6 +1187,13 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 
 ### Remaining
 
+- **override 検査が無い**。`override` 修飾子の要否も、override 時の型適合も検査していない。
+  scalac が拒否する次の 2 つを黙って通す:
+  `trait T { def f: Int = 1 }; class D extends T { def f: Int = 2 }`（`override` 無し。
+  scalac: ``` `override` modifier required to override concrete member ```）、
+  `class D extends T { override def f: String = "x" }`（親は `Int`。scalac:
+  `incompatible type in overriding`）。`val` も同様。受け入れすぎる側の穴。
+
 - **明示的な型適用が implicit 引数リストに伝わらない場合がある**。
   `Library.Abs.column[P1](n)`（`def column[T : TypedType]`）や
   `Library.==.typed[Boolean](ch)`（オーバーロードのある `def typed[T : ScalaBaseType]`）
