@@ -210,5 +210,6 @@ conform!(
     integral_ops,
     invariance,
     const_narrow,
-    setter_assign
+    setter_assign,
+    case_lambda_arity
 );

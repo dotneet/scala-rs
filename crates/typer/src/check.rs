@@ -8943,11 +8943,67 @@ impl Typer {
         out
     }
 
+    /// Rewrite `x$pf => x$pf match { … }` into `(x$1, …, x$n) => (x$1, …, x$n)
+    /// match { … }`, the way nsc adapts a pattern-matching anonymous function
+    /// to a `FunctionN`.
+    fn expand_case_block_to_arity(&mut self, vparams: &mut Vec<Tree>, body: &mut Tree, n: usize) {
+        let TreeKind::Match { selector, .. } = &mut body.kind else {
+            return;
+        };
+        let span = vparams[0].span;
+        let mut names = Vec::new();
+        let mut params = Vec::new();
+        for i in 0..n {
+            self.gensym += 1;
+            let name = format!("x$pm{}${}", self.gensym, i);
+            names.push(name.clone());
+            let mut p = Tree::dummy(TreeKind::ValDef {
+                mods: scala_rs_parser::Modifiers {
+                    flags: Flags::PARAM,
+                    ..Default::default()
+                },
+                name,
+                tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+                rhs: Box::new(Tree::dummy(TreeKind::Empty)),
+            });
+            p.span = span;
+            params.push(p);
+        }
+        let args: Vec<Tree> = names
+            .iter()
+            .map(|nm| {
+                let mut t = Tree::dummy(TreeKind::Ident { name: nm.clone() });
+                t.span = span;
+                t
+            })
+            .collect();
+        let mut fun = Tree::dummy(TreeKind::Ident {
+            name: format!("Tuple{n}"),
+        });
+        fun.span = span;
+        let mut tup = Tree::dummy(TreeKind::Apply {
+            fun: Box::new(fun),
+            args,
+        });
+        tup.span = span;
+        **selector = tup;
+        *vparams = params;
+    }
+
     fn type_function(&mut self, vparams: &mut Vec<Tree>, body: &mut Tree, pt: &Type) -> Type {
         // Only a `{ case … }` literal inhabits a `PartialFunction`; the parser
         // encodes one as `x$pf => x$pf match { … }`. A total function literal
         // must still be rejected, the way nsc rejects
         // `t.recover((x: Int) => x + 1)`.
+        // nsc: `{ case (a, b) => … }` where a `FunctionN` is expected takes N
+        // parameters and matches the N-tuple of them, not one parameter.
+        if is_case_block_literal(vparams, body) {
+            if let Some(n) = expected_function_arity(pt) {
+                if n > 1 {
+                    self.expand_case_block_to_arity(vparams, body, n);
+                }
+            }
+        }
         let pf_result = if is_case_block_literal(vparams, body) {
             partial_function_type(&self.st, pt)
         } else {
@@ -13430,5 +13486,16 @@ fn relax_open_tparams(ty: &Type) -> Type {
             }
         }
         _ => ty.clone(),
+    }
+}
+
+/// Number of parameters a `FunctionN` expected type takes, if it is one.
+fn expected_function_arity(pt: &Type) -> Option<usize> {
+    match pt {
+        Type::Function { params, .. } => Some(params.len()),
+        Type::Named { name, args } if name.starts_with("Function") && name != "Function" => {
+            (!args.is_empty()).then(|| args.len() - 1)
+        }
+        _ => None,
     }
 }
