@@ -18,7 +18,15 @@ fn tmp_dir(tag: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let p = std::env::temp_dir().join(format!("scala-rs-e2e-{tag}-{}-{nanos}", std::process::id()));
+    // Two tests can share a tag, and the clock is not fine enough to
+    // separate them: they ran in the same directory and each `java Main` saw
+    // the other's half-written output.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let p = std::env::temp_dir().join(format!(
+        "scala-rs-e2e-{tag}-{}-{nanos}-{seq}",
+        std::process::id()
+    ));
     fs::create_dir_all(&p).unwrap();
     p
 }
