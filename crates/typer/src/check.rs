@@ -9891,6 +9891,12 @@ impl Typer {
             };
             return self.arg_score(&f, param);
         }
+        // An overloaded method named as an argument (`constOp[Long]("min")(math.min)`)
+        // stands for whichever alternative the parameter takes; `adapt` picks
+        // that one once the callee is settled.
+        if let Type::Overload(alts) = arg {
+            return alts.iter().filter_map(|a| self.arg_score(a, param)).max();
+        }
         if self.st.is_sub_type(arg, param) {
             return Some(if arg == param { 10 } else { 5 });
         }
@@ -12826,6 +12832,14 @@ impl Typer {
         if matches!(pt, Type::Any | Type::AnyRef | Type::AnyVal) {
             return;
         }
+        // nsc `inferExprAlternative`: an *overloaded* method named where a
+        // function type is expected settles on the alternative that
+        // eta-expands to it -- `constOp[Long]("min")(math.min)` picks
+        // `min(Long, Long)` out of the four `math.min`s. Before the
+        // eta-expansion below, which needs a single method type.
+        if matches!(tree.ty, Type::Overload(_)) {
+            self.pick_overload_for_function(tree, pt);
+        }
         if let Type::Method { paramss, ret } = &tree.ty {
             if is_function_pt(pt) || self.st.sam_sig(pt).is_some() {
                 let mut params: Vec<Type> = paramss.iter().flatten().cloned().collect();
@@ -12903,6 +12917,77 @@ impl Typer {
             ),
         );
         tree.ty = Type::Error;
+    }
+
+    /// Narrow an overloaded reference to the one alternative whose
+    /// eta-expansion conforms to the expected function (or SAM) type. Leaves
+    /// the tree alone when the expected type is not a function shape, or when
+    /// no single alternative fits -- the caller then reports the mismatch it
+    /// would have reported anyway.
+    fn pick_overload_for_function(&mut self, tree: &mut Tree, pt: &Type) {
+        let want = match function_sig(pt) {
+            Some(sig) => sig,
+            None => match self.st.sam_sig(pt) {
+                Some(sam) => (sam.param_tys, sam.ret_ty),
+                None => return,
+            },
+        };
+        if tree.sym.is_none() {
+            return;
+        }
+        let name = self.st.get(tree.sym).name.clone();
+        let alts = self.drop_overridden(self.overload_alternatives(tree.sym, &name));
+        let instantiated = self.overload_member_types.get(&tree.sym.0).cloned();
+        let (want_params, want_ret) = want;
+        let mut hit: Option<(SymbolId, Type)> = None;
+        for m in alts {
+            let ty = instantiated
+                .as_ref()
+                .and_then(|g| g.iter().find(|(s, _)| *s == m).map(|(_, t)| t.clone()))
+                .unwrap_or_else(|| self.st.get(m).ty.clone());
+            let Type::Method { paramss, ret } = &ty else {
+                continue;
+            };
+            let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+            if params.len() != want_params.len() {
+                continue;
+            }
+            let as_fn = Type::Function {
+                params: params.clone(),
+                ret: ret.clone(),
+            };
+            let fits = self.st.is_sub_type(
+                &as_fn,
+                &Type::Function {
+                    params: want_params.clone(),
+                    ret: Box::new(want_ret.clone()),
+                },
+            );
+            if !fits {
+                continue;
+            }
+            // Two alternatives can both fit (`min(Int, Int)` conforms to
+            // nothing a `(Long, Long) => Long` wants, but a widening pair
+            // could); the exact one wins, as it does for an application.
+            let exact = params == want_params;
+            match &hit {
+                None => hit = Some((m, ty)),
+                Some((_, prev)) => {
+                    let prev_exact = matches!(prev, Type::Method { paramss, .. }
+                        if paramss.iter().flatten().cloned().collect::<Vec<_>>() == want_params);
+                    if exact && !prev_exact {
+                        hit = Some((m, ty));
+                    } else if !prev_exact {
+                        // Ambiguous: leave the overload alone.
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some((m, ty)) = hit {
+            tree.sym = m;
+            tree.ty = ty;
+        }
     }
 
     fn adapt_to_sam(&mut self, tree: &mut Tree, pt: &Type) -> bool {

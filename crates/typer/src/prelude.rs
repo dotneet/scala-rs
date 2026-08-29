@@ -522,6 +522,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     crate::prelude_seq::add_list_core(st, library_abi);
     crate::prelude_text::install(st, library_abi);
     crate::prelude_strhier::install_string_search(st);
+    crate::prelude_ovl2::install(st);
     add_annotation_pkg(st);
     add_java_sam(st, java, java_lang);
 
