@@ -701,21 +701,58 @@ struct LinWalk<'a> {
 const LIN_BUDGET: u32 = 4096;
 const LIN_MAX_DEPTH: u32 = 32;
 
+/// Classfiles that may carry the pickle describing `full_name`.
+///
+/// A pickle names classes with dots throughout, so `scala.reflect.api.Names`
+/// and `scala.reflect.api.Names.TermNameExtractor` look alike even though only
+/// the first is a file. Two rules recover the file:
+///
+/// * a nested class lives in `Outer$Inner.class`, so trailing dots become `$`;
+/// * scalac writes **one** `ScalaSignature` per top-level class, covering
+///   every class nested inside it, and nested classfiles carry none at all
+///   (`Names$TermNameExtractor.class` has no signature; `Names.class` has the
+///   signature for both). So the enclosing files are candidates too.
+///
+/// Splits are tried right to left, most specific first, and the companion
+/// (`X$.class`) variant of each: scalac pickles a companion pair once, on the
+/// class file, so `List$.class` has no signature of its own.
+pub fn pickle_files_for(full_name: &str, module: bool) -> Vec<String> {
+    let parts: Vec<&str> = full_name.split('.').collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |base: String| {
+        let (a, b) = if module {
+            (format!("{base}$"), base)
+        } else {
+            (base.clone(), format!("{base}$"))
+        };
+        for c in [a, b] {
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+    };
+    // `k` is where packages end and classes begin. The rightmost split is the
+    // common case (`a.b.C`), so it is tried first and nothing changes for a
+    // top-level class.
+    for k in (1..parts.len()).rev() {
+        push(format!("{}/{}", parts[..k].join("/"), parts[k..].join("$")));
+        if k + 1 < parts.len() {
+            // The top-level class under that split: its file holds the pickle.
+            push(format!("{}/{}", parts[..k].join("/"), parts[k]));
+        }
+    }
+    if parts.len() == 1 {
+        push(full_name.to_string());
+    }
+    out
+}
+
 fn load<S: ClassSource + ?Sized>(
     src: &mut S,
     full_name: &str,
     module: bool,
 ) -> Result<Rc<ClassSig>, LoadError> {
-    let internal = full_name.replace('.', "/");
-    // scalac pickles a companion pair once, on the *class* file: in 2.13.16
-    // `List$.class` has no `ScalaSignature` at all, so a module class has to
-    // fall back to its companion's classfile. Try both, in the order most
-    // likely to hit, and only report a failure once neither worked.
-    let candidates: [String; 2] = if module {
-        [format!("{internal}$"), internal.clone()]
-    } else {
-        [internal.clone(), format!("{internal}$")]
-    };
+    let candidates = pickle_files_for(full_name, module);
     let mut last = LoadError::NotFound(full_name.to_string());
     for c in &candidates {
         let Some(bytes) = src.class_bytes(c) else {

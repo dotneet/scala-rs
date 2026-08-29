@@ -5182,6 +5182,12 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
             if is_module_class(ctx.st, owner) {
                 let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+            } else if ctx.st.get(owner).kind == SymKind::Package {
+                // A package-object member (`scala.math.Pi`,
+                // `scala.reflect.runtime.universe`) is reached through the
+                // static forwarder on `<pkg>/package`, which takes no
+                // receiver. Falling through to `load_owner_instance` pushed
+                // `this` and produced a `VerifyError` at run time.
             } else {
                 load_owner_instance(asm, ctx, owner);
             }
@@ -5295,6 +5301,33 @@ fn gen_java_class_of(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
     }
 }
 
+/// Push `<pkg>/package$.MODULE$` for `scala.math.Pi` and friends.
+///
+/// The typer folds a package object's members into the package symbol, so
+/// `scala.math.Pi` is a `Select` whose qualifier is the *package* `scala.math`
+/// -- which has no runtime value and emits nothing -- while the member itself
+/// is owned by the package object's module class. Emitting the qualifier then
+/// left the stack empty under an `invokevirtual`, a `VerifyError` at run time.
+///
+/// Returns `false` when this is not that shape, and the caller emits the
+/// qualifier as usual.
+fn load_package_object_receiver(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    qual: &Tree,
+    owner: SymbolId,
+) -> bool {
+    if qual.sym.is_none() || ctx.st.get(qual.sym).kind != SymKind::Package {
+        return false;
+    }
+    if !is_module_class(ctx.st, owner) {
+        return false;
+    }
+    let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
+    asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+    true
+}
+
 fn gen_select(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -5360,8 +5393,10 @@ fn gen_select(
                     maybe_cast_erased_load(asm, ctx, &s.ty, &tree.ty);
                     return;
                 }
-                gen_expr(asm, frame, ctx, qual);
-                checkcast_refined_receiver(asm, ctx, &qual.ty, tree.sym);
+                if !load_package_object_receiver(asm, ctx, qual, s.owner) {
+                    gen_expr(asm, frame, ctx, qual);
+                    checkcast_refined_receiver(asm, ctx, &qual.ty, tree.sym);
+                }
                 if is_trait_owned_term(ctx.st, tree.sym) {
                     let owner = class_internal(ctx.st, s.owner);
                     let desc = format!("(){}", jvm_desc(ctx.st, &s.ty));
@@ -5382,8 +5417,10 @@ fn gen_select(
             SymKind::Method => {
                 let ic = s.intrinsic;
                 if !s.flags.contains(Flags::STATIC) {
-                    gen_expr(asm, frame, ctx, qual);
-                    checkcast_refined_receiver(asm, ctx, &qual.ty, tree.sym);
+                    if !load_package_object_receiver(asm, ctx, qual, s.owner) {
+                        gen_expr(asm, frame, ctx, qual);
+                        checkcast_refined_receiver(asm, ctx, &qual.ty, tree.sym);
+                    }
                     // Paren-less call to an `ArrayOps` member with no
                     // `$extension` in nsc 2.13.16 (`toList`, `sum`, …); see
                     // the matching Apply-path insertion above `invoke_value_extension`.
@@ -7286,17 +7323,24 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
     let s = ctx.st.get(id);
     let owner_id = s.owner;
     let mut owner = class_internal(ctx.st, owner_id);
-    if owner == "scala/math" {
-        // `scala.math.{abs,max,min,pow,...}` are methods directly attached to
-        // the `scala/math` *package* symbol (so `scala.math.abs` resolves at
-        // all -- packages otherwise have no runtime value). The real ABI
-        // lives on the static-forwarder class `scala.math.package`.
-        owner = "scala/math/package".to_string();
+    let owner_is_package = ctx.st.get(owner_id).kind == SymKind::Package;
+    if owner_is_package {
+        // `scala.math.{abs,max,min,Pi}` and `scala.reflect.runtime.universe`
+        // are members of a *package object*, and the typer folds those into
+        // the package symbol so `scala.math.abs` resolves at all (a package
+        // has no runtime value of its own). scalac emits a static forwarder
+        // for each on `<pkg>/package`, which is the ABI to call.
+        owner = format!("{owner}/package");
     }
     let name = s.name.as_str();
     let mut desc = method_desc_boxed(ctx.st, id, ctx.boxed_vars);
     if name == "<init>" {
         asm.invokespecial(&owner, "<init>", &desc);
+        return;
+    }
+    if owner_is_package && ctx.library_abi {
+        asm.invokestatic(&owner, name, &desc);
+        maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
         return;
     }
     if s.flags.contains(Flags::STATIC) {

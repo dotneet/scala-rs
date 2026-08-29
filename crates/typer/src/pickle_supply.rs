@@ -264,7 +264,22 @@ impl PickleSupply {
             return Vec::new();
         }
         let is_module = sym.kind == SymKind::ModuleClass;
+        // A pickle names a nested class `Outer.Inner`; its JVM name is
+        // `Outer$Inner`. Without undoing that, `Constants$ConstantExtractor`
+        // -- the receiver of `u.Constant(1)` -- has no pickle and so no
+        // members at all. The `$` form is tried first, because a `$` in a
+        // top-level name is part of that name.
         let full = internal.trim_end_matches('$').replace('/', ".");
+        let full = if self.has_pickle(bin, &full, is_module) {
+            full
+        } else {
+            let dotted = full.replace('$', ".");
+            if dotted != full && self.has_pickle(bin, &dotted, is_module) {
+                dotted
+            } else {
+                full
+            }
+        };
 
         self.attach_parents(st, bin, class_sym, &full, is_module);
 
@@ -615,10 +630,21 @@ impl PickleSupply {
         module: bool,
     ) -> Option<SymbolId> {
         let internal = full_name.replace('.', "/");
-        let key = if module {
-            format!("{internal}$")
-        } else {
-            internal.clone()
+        // A pickle writes `Outer.Inner` and `pkg.Class` the same way, so the
+        // JVM name of a nested class (`Outer$Inner`) cannot be read off the
+        // dotted name. Take the first candidate that is really a classfile;
+        // `key` decides both the symbol's `jvm_name` and its owner, and
+        // getting it wrong invents a package called `Names`.
+        let key = {
+            let plain = if module {
+                format!("{internal}$")
+            } else {
+                internal.clone()
+            };
+            scala_rs_pickle::sym::pickle_files_for(full_name, module)
+                .into_iter()
+                .find(|c| bin.find_class(c).ok().flatten().is_some())
+                .unwrap_or(plain)
         };
         if let Some(id) = self.stubs.get(&key) {
             return Some(*id);
@@ -646,9 +672,10 @@ impl PickleSupply {
             let mut src = BinSource(bin);
             self.sigs.class_sig(&mut src, full_name, module).ok()?
         };
-        let (pkg_jvm, simple) = match internal.rsplit_once('/') {
+        let base = key.strip_suffix('$').unwrap_or(&key).to_string();
+        let (pkg_jvm, simple) = match base.rsplit_once('/') {
             Some((p, n)) => (p.to_string(), n.to_string()),
-            None => (String::new(), internal.clone()),
+            None => (String::new(), base.clone()),
         };
         if simple.is_empty() {
             return None;
@@ -727,6 +754,7 @@ impl PickleSupply {
                 let Some(jc) = self.java_class(bin, cn) else {
                     continue;
                 };
+                let mut parents: Vec<String> = Vec::new();
                 for jm in &jc.methods {
                     if jm.name != name || jm.access & (ACC_BRIDGE | ACC_SYNTHETIC | ACC_STATIC) != 0
                     {
@@ -740,9 +768,29 @@ impl PickleSupply {
                     }
                 }
                 if let Some(s) = &jc.super_name {
-                    next.push(s.clone());
+                    if s != "java/lang/Object" {
+                        parents.push(s.clone());
+                    }
                 }
-                next.extend(jc.interfaces.iter().cloned());
+                parents.extend(jc.interfaces.iter().cloned());
+                let bare = parents.is_empty();
+                if jc.super_name.is_some() && bare {
+                    parents.push("java/lang/Object".to_string());
+                }
+                // A Scala trait whose members are all abstract can compile to
+                // an interface that lists no parents at all --
+                // `api/JavaUniverse.class` declares four methods and
+                // `interfaces: 0`, though the trait extends `Universe`. Its
+                // ancestry then exists only in the pickle. Only that case is
+                // topped up: reading the pickled parents of a class whose
+                // bytecode *does* declare its hierarchy widens the search to
+                // ancestors the JVM does not see, and the extra `map`
+                // descriptors that turns up make the answer ambiguous
+                // (`Map#map` regresses).
+                next.extend(parents);
+                if bare {
+                    next.extend(self.pickled_parent_files(bin, cn));
+                }
             }
             match hits.len() {
                 0 => {}
@@ -752,6 +800,49 @@ impl PickleSupply {
             level = next;
         }
         None
+    }
+
+    /// The classfiles of the parents `internal`'s *pickle* declares.
+    ///
+    /// Empty for anything outside the standard library and for any class whose
+    /// pickle is missing: this only tops up the bytecode hierarchy, it never
+    /// replaces it.
+    fn pickled_parent_files(&mut self, bin: &mut BinaryIndex, internal: &str) -> Vec<String> {
+        if !internal.starts_with("scala/") {
+            return Vec::new();
+        }
+        let module = internal.ends_with('$');
+        let full = internal.trim_end_matches('$').replace('/', ".");
+        let sig = {
+            let mut src = BinSource(bin);
+            match self.sigs.class_sig(&mut src, &full, module) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut out = Vec::new();
+        for p in &sig.parents {
+            let SigType::Ref { sym, .. } = p else {
+                continue;
+            };
+            if let Some(f) = self.class_file_of(bin, sym) {
+                out.push(f);
+            }
+        }
+        out
+    }
+
+    /// Whether a pickle describes `full_name`.
+    fn has_pickle(&mut self, bin: &mut BinaryIndex, full_name: &str, module: bool) -> bool {
+        let mut src = BinSource(bin);
+        self.sigs.class_sig(&mut src, full_name, module).is_ok()
+    }
+
+    /// The classfile that really holds `full_name`, or `None` if there is none.
+    fn class_file_of(&mut self, bin: &mut BinaryIndex, full_name: &str) -> Option<String> {
+        scala_rs_pickle::sym::pickle_files_for(full_name, false)
+            .into_iter()
+            .find(|c| bin.find_class(c).ok().flatten().is_some())
     }
 
     fn java_class(&mut self, bin: &mut BinaryIndex, internal: &str) -> Option<&JavaClass> {
@@ -1106,6 +1197,16 @@ impl PickleSupply {
                 return Some(Type::Tuple(self.conv_all(st, bin, scope, args, d)?));
             }
         }
+        // A type member named from inside its own class is pickled bare:
+        // `Internals.internal` returns `Internal`, not `...Internals.Internal`.
+        // There is no class by that name, so without this the member is
+        // declined and `u.internal` -- the door to the whole reification API
+        // -- is not a member of anything.
+        if args.is_empty() && !sym.contains('.') && scope.get(sym).is_none() {
+            if let Some(t) = self.self_type_member(st, bin, sym, d) {
+                return Some(t);
+            }
+        }
         // `scala.package.List` and friends: package-object type aliases, which
         // pickles refer to by the alias, not the target. Expand through the
         // owner's own pickle rather than hard-coding a table. Tried before
@@ -1117,6 +1218,16 @@ impl PickleSupply {
             }
         }
         let Some(cls) = self.ensure_class(st, bin, sym, false) else {
+            // `scala.reflect.api.Trees.Tree` names an *abstract type member* of
+            // trait `Trees`, not a class: there is no such classfile and never
+            // will be. Almost the whole reflection API is written this way
+            // (`Tree`, `Name`, `Symbol`, `Type`, `Position`, `FlagSet`), so
+            // declining here would make the API unusable.
+            if args.is_empty() {
+                if let Some(t) = self.abstract_type_member(st, bin, sym, d) {
+                    return Some(t);
+                }
+            }
             // Remembered rather than merely declined: the typer can often load
             // the classfile itself (any package on `-cp`, not just `scala.*`)
             // and ask again.
@@ -1148,6 +1259,119 @@ impl PickleSupply {
         args.iter()
             .map(|a| self.conv_at(st, bin, scope, a, d))
             .collect()
+    }
+
+    /// `T` as an abstract type member of the class whose member is being
+    /// completed, or of anything it inherits from.
+    ///
+    /// `None` outside a completion, and for any name no ancestor declares --
+    /// a bare `Ref` is far more often a type parameter or a class, and this
+    /// runs only after both of those have been ruled out.
+    fn self_type_member(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        name: &str,
+        d: u32,
+    ) -> Option<Type> {
+        let cls = match &self.self_ty {
+            Some(Type::Class { sym, .. }) => *sym,
+            _ => return None,
+        };
+        let internal = st.get(cls).jvm_name.clone();
+        if !internal.starts_with("scala/") {
+            return None;
+        }
+        let module = internal.ends_with('$');
+        // The receiver, then each class it is nested in: `ConstantExtractor`
+        // is declared inside trait `Constants`, and its `apply` returns that
+        // trait's `Constant`, not one of its own.
+        let mut owners: Vec<String> = Vec::new();
+        let mut cur = internal.trim_end_matches('$').replace('/', ".");
+        loop {
+            owners.push(cur.replace('$', "."));
+            match cur.rsplit_once('$') {
+                Some((outer, _)) => cur = outer.to_string(),
+                None => break,
+            }
+        }
+        for owner in owners {
+            let lin = {
+                let mut src = BinSource(bin);
+                let mut errs = Vec::new();
+                self.sigs.linearization(&mut src, &owner, module, &mut errs)
+            };
+            for step in lin {
+                let qualified = format!("{}.{name}", step.class_name);
+                if let Some(t) = self.abstract_type_member(st, bin, &qualified, d) {
+                    return Some(t);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve `Owner.T` where `T` is an **abstract type member** of `Owner`
+    /// (`type Tree >: Null <: TreeApi`), installing it as a `TypeMember`
+    /// symbol on `Owner` so the typer can see it through a path.
+    ///
+    /// Only abstract members are handled here; `type T = U` already goes
+    /// through `expand_alias`, which substitutes the right-hand side.
+    ///
+    /// The upper bound is converted too, and a member whose bound cannot be
+    /// converted is installed *unbounded* rather than declined: an opaque
+    /// `u.Tree` that can be named and passed around is right, and losing the
+    /// bound only means fewer members are reachable through it, never a wrong
+    /// one.
+    fn abstract_type_member(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        sym: &str,
+        d: u32,
+    ) -> Option<Type> {
+        let (owner_name, member) = sym.rsplit_once('.')?;
+        if member.is_empty() || !member.starts_with(|c: char| c.is_ascii_uppercase()) {
+            return None;
+        }
+        let owner = self.ensure_class(st, bin, owner_name, false)?;
+        if let Some(id) = st
+            .lookup_member(owner, member)
+            .into_iter()
+            .find(|&s| st.get(s).kind == SymKind::TypeMember)
+        {
+            return Some(Type::TypeMember(id));
+        }
+        let sig = {
+            let mut src = BinSource(bin);
+            self.sigs.class_sig(&mut src, owner_name, false).ok()?
+        };
+        let m = sig
+            .members
+            .iter()
+            .find(|m| m.name == member && m.kind == MemberKind::AbstractType)?
+            .clone();
+        let id = st.alloc(member, owner, SymKind::TypeMember, Flags::EMPTY, "");
+        st.get_mut(owner).members.push(id);
+        // Entered before the bound is converted: `type Tree >: Null <: TreeApi`
+        // and `type TreeApi` can refer to each other, and without the symbol
+        // being visible first that recurses until the depth limit.
+        if let SigType::Bounds { lo, hi } = &m.ty {
+            let scope = HashMap::new();
+            let (lo, hi) = (lo.clone(), hi.clone());
+            if let Some(h) = self.conv_at(st, bin, &scope, &hi, d) {
+                if !matches!(h, Type::Any | Type::AnyRef) {
+                    st.get_mut(id).bound_hi = Some(h);
+                }
+            }
+            if let Some(l) = self.conv_at(st, bin, &scope, &lo, d) {
+                if !matches!(l, Type::Nothing) {
+                    st.get_mut(id).bound_lo = Some(l);
+                }
+            }
+        }
+        trace(format_args!("abstract type member {sym}"));
+        Some(Type::TypeMember(id))
     }
 
     /// Resolve `owner.Name[args]` where `Name` is a type alias declared on
@@ -1204,7 +1428,7 @@ fn is_default_getter(name: &str) -> bool {
 }
 
 /// Whether `cls` already has `target` somewhere above it.
-fn inherits_from(st: &SymbolTable, cls: SymbolId, target: SymbolId) -> bool {
+pub(crate) fn inherits_from(st: &SymbolTable, cls: SymbolId, target: SymbolId) -> bool {
     let mut seen: Vec<u32> = Vec::new();
     let mut work = vec![cls];
     while let Some(c) = work.pop() {

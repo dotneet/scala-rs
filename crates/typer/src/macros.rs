@@ -323,7 +323,7 @@ impl Typer {
 /// The match is deliberately exhaustive with no wildcard arm: adding a
 /// `TreeKind` variant must be a compile error here, so a macro application
 /// nested inside new syntax can never be missed and silently emitted.
-fn push_children<'a>(t: &'a Tree, out: &mut Vec<&'a Tree>) {
+pub(crate) fn push_children<'a>(t: &'a Tree, out: &mut Vec<&'a Tree>) {
     fn all<'a>(v: &'a [Tree], out: &mut Vec<&'a Tree>) {
         out.extend(v.iter());
     }

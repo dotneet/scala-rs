@@ -35,6 +35,7 @@ mod prelude_text;
 mod prelude_tuple;
 mod prelude_universal;
 mod prelude_variance;
+mod quasiquote;
 mod symbol;
 mod uncurry;
 
