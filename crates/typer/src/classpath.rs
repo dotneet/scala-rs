@@ -751,9 +751,19 @@ fn java_class_owner(st: &mut SymbolTable, internal: &str) -> SymbolId {
     ensure_package(st, pkg)
 }
 
+/// The symbol *for* a JVM class.
+///
+/// The primitive value classes are deliberately excluded even though they
+/// carry a `java/lang/...` `jvm_name`: that name is the box `scala.Int` erases
+/// to, not `scala.Int`'s identity. Returning `scala.Int` here made
+/// `install_java_class_in` treat the real `java.lang.Integer` classfile as
+/// "already installed", pour its members into `scala.Int` and never enter
+/// `Integer` into `java.lang` — so `java.lang.Integer.valueOf(3)` failed with
+/// "value Integer is not a member of <notype>". nsc keeps the two apart, and
+/// so do we.
 pub fn find_by_jvm(st: &SymbolTable, jvm: &str) -> Option<SymbolId> {
     st.symbols.iter().find_map(|s| {
-        if s.jvm_name == jvm && s.is_class_like() {
+        if s.jvm_name == jvm && s.is_class_like() && !st.is_primitive_value_class(s.id) {
             Some(s.id)
         } else {
             None

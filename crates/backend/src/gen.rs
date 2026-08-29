@@ -5160,6 +5160,30 @@ fn gen_apply(
         }
         return;
     }
+    if let Intrinsic::BoxValue(desc) = ic {
+        // nsc's `Predef.int2Integer` is `Integer.valueOf` and nothing else, so
+        // emitting the wrapper call directly is faithful *and* works on the
+        // private runtime, which has no `scala/Predef$.int2Integer`.
+        let prim = prim_of_desc(desc);
+        if let Some(a) = args.first() {
+            gen_expr(asm, frame, ctx, a);
+            widen_primitive(asm, &a.ty, &prim);
+        } else {
+            push_default(asm, &prim);
+        }
+        emit_box(asm, &prim);
+        return;
+    }
+    if let Intrinsic::UnboxValue(desc) = ic {
+        let prim = prim_of_desc(desc);
+        if let Some(a) = args.first() {
+            gen_expr(asm, frame, ctx, a);
+        } else {
+            asm.aconst_null();
+        }
+        emit_unbox(asm, &prim);
+        return;
+    }
     if matches!(ic, Intrinsic::Any2StringAdd) {
         if let Some(a) = args.first() {
             gen_expr(asm, frame, ctx, a);
@@ -13364,6 +13388,48 @@ fn is_boxed_primitive(jvm: &str) -> bool {
             | "java/lang/Character"
             | "java/lang/Boolean"
     )
+}
+
+/// The primitive a `BoxValue` / `UnboxValue` intrinsic names.
+fn prim_of_desc(desc: &str) -> Type {
+    match desc {
+        "Z" => Type::Boolean,
+        "B" => Type::Byte,
+        "S" => Type::Short,
+        "C" => Type::Char,
+        "I" => Type::Int,
+        "J" => Type::Long,
+        "F" => Type::Float,
+        _ => Type::Double,
+    }
+}
+
+/// The conversion instruction between two JVM primitives, for the places that
+/// hand a value to something expecting a wider one. `widen_numeric` only knows
+/// the arithmetic-promotion cases; boxing needs `Char -> Int` (`val i:
+/// java.lang.Integer = 'c'` is legal in nsc) and `Int -> Float` as well.
+fn widen_primitive(asm: &mut Assembler, from: &Type, to: &Type) {
+    let from = from.widen_constant();
+    if from == *to {
+        return;
+    }
+    let int_shaped = matches!(
+        from,
+        Type::Int | Type::Char | Type::Short | Type::Byte | Type::Boolean
+    );
+    match to {
+        Type::Long if int_shaped => asm.i2l(),
+        Type::Long if matches!(from, Type::Long) => {}
+        Type::Float if int_shaped => asm.i2f(),
+        Type::Float if matches!(from, Type::Long) => asm.l2f(),
+        Type::Double if int_shaped => asm.i2d(),
+        Type::Double if matches!(from, Type::Long) => asm.l2d(),
+        Type::Double if matches!(from, Type::Float) => asm.f2d(),
+        // `Int`, `Char`, `Short`, `Byte` and `Boolean` all live in an int-sized
+        // slot; a narrowing `i2c`/`i2s`/`i2b` would be a real conversion, but
+        // no widening conversion reaches this arm.
+        _ => {}
+    }
 }
 
 /// `1 + 2.5` reaches `Double.+` with an `int` receiver; the JVM needs the

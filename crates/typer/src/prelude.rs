@@ -591,6 +591,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     st.enter_in_current("Ordered", ordered);
     crate::prelude_numops::install(st);
     crate::prelude_variance::install(st);
+    crate::prelude_boxed::install(st);
 }
 
 /// Prelude classes are owned by `scala` but carry their real JVM package
@@ -605,6 +606,11 @@ fn add_package_paths(st: &mut SymbolTable) {
                 && s.jvm_name.matches('/').count() >= 2
                 // A module's `Try$` is fine; a nested `Try$WithFilter` is not.
                 && !s.jvm_name.trim_end_matches('$').contains('$')
+                // `scala.Long`'s JVM name is the *box* it erases to, not a
+                // package path: entering it as `java.lang.Long` made
+                // `java.util.ArrayList[java.lang.Long]` an `ArrayList[Long]`
+                // that `add(7L)` could not satisfy.
+                && !st.is_primitive_value_class(*id)
         })
         .collect();
     for id in ids {
@@ -6676,6 +6682,10 @@ fn add_numeric_wrapper(
         Intrinsic::Identity,
     );
     st.get_mut(wrap).flags = st.get(wrap).flags.with(Flags::IMPLICIT);
+    // nsc declares `intWrapper` & co. in `LowPriorityImplicits`, which `Predef`
+    // extends, so `Predef`'s own `double2Double` outranks `doubleWrapper` when
+    // both results offer the selected member (`0.5.isNaN`).
+    st.get_mut(wrap).low_priority = true;
 }
 
 fn implicit_getter(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) -> SymbolId {
