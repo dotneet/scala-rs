@@ -601,6 +601,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     st.enter_in_current("Ordered", ordered);
     crate::prelude_numops::install(st);
     crate::prelude_mutops::install(st);
+    crate::prelude_universal::install(st);
     crate::prelude_bsops::install(st);
     crate::prelude_numconv::install(st);
     crate::prelude_variance::install(st);

@@ -29,6 +29,7 @@ mod prelude_seq;
 mod prelude_sgap;
 mod prelude_text;
 mod prelude_tuple;
+mod prelude_universal;
 mod prelude_variance;
 mod symbol;
 mod uncurry;

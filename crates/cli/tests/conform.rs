@@ -218,5 +218,6 @@ conform!(
     setter_assign,
     case_lambda_arity,
     tuple_fn_type,
-    mutable_ops
+    mutable_ops,
+    universal_hash
 );

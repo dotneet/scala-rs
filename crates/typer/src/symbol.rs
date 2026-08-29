@@ -112,6 +112,8 @@ pub enum Intrinsic {
     IntToFloat,
     LongToFloat,
     FloatToDouble,
+    /// `x.##`: `Statics.anyHash`, or the primitive-specific hash.
+    AnyHash,
     /// `classOf[T]`: a class constant for the erasure of `T`.
     ClassOf,
     /// `Any.getClass`: `Object.getClass`, or the boxed `TYPE` for a primitive.

@@ -327,9 +327,16 @@ impl<'a> Lexer<'a> {
                 self.emit(TokenKind::At, lo, self.pos as u32);
             }
             '#' => {
-                let lo = self.pos as u32;
-                self.bump();
-                self.emit(TokenKind::Hash, lo, self.pos as u32);
+                // A lone `#` is the type projection operator; `##` (and any
+                // other run of operator characters starting with `#`) is an
+                // ordinary operator identifier -- `x.##` is `Any.##`.
+                if self.peek_at(1).is_some_and(is_op_char) {
+                    self.lex_operator();
+                } else {
+                    let lo = self.pos as u32;
+                    self.bump();
+                    self.emit(TokenKind::Hash, lo, self.pos as u32);
+                }
             }
             c if is_id_start(c) => self.lex_ident_or_kw(),
             c if is_op_char(c) => self.lex_operator(),

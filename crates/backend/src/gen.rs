@@ -5139,6 +5139,8 @@ fn gen_select(
                 }
                 if matches!(qual.kind, TreeKind::Super { .. }) {
                     invoke_super(asm, ctx, tree.sym);
+                } else if matches!(ic, Intrinsic::AnyHash) {
+                    emit_any_hash(asm, &qual.ty);
                 } else if matches!(ic, Intrinsic::StringToInt) {
                     asm.invokestatic("java/lang/Integer", "parseInt", "(Ljava/lang/String;)I");
                 } else if matches!(ic, Intrinsic::StringToLong) {
@@ -5836,6 +5838,11 @@ fn gen_apply(
                     emit_box(asm, &qual.ty);
                 }
                 asm.invokevirtual("java/lang/Object", "toString", "()Ljava/lang/String;");
+                return;
+            }
+            Intrinsic::AnyHash => {
+                gen_expr(asm, frame, ctx, qual);
+                emit_any_hash(asm, &qual.ty);
                 return;
             }
             Intrinsic::GetClass => {
@@ -14084,4 +14091,22 @@ fn is_module_like(st: &SymbolTable, id: SymbolId) -> bool {
         st.get(id).kind,
         scala_rs_typer::SymKind::Module | scala_rs_typer::SymKind::ModuleClass
     )
+}
+
+/// `x.##`: nsc calls `Statics.doubleHash` and friends for the numeric types
+/// so that `1.0.##` and `1.##` agree, and `anyHash` for everything else.
+fn emit_any_hash(asm: &mut Assembler, recv: &Type) {
+    let ty = recv.widen_constant();
+    let (name, desc) = match ty {
+        Type::Double => ("doubleHash", "(D)I"),
+        Type::Float => ("floatHash", "(F)I"),
+        Type::Long => ("longHash", "(J)I"),
+        _ => {
+            if is_jvm_primitive(&ty) {
+                emit_box(asm, &ty);
+            }
+            ("anyHash", "(Ljava/lang/Object;)I")
+        }
+    };
+    asm.invokestatic("scala/runtime/Statics", name, desc);
 }
