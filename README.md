@@ -313,6 +313,51 @@ trait P1 extends TC
 `Rep.TypedRep` の `Rep` はオブジェクトです（`qualified_type_owners` が候補を全部返し、
 そのメンバーを実際に持つものを採る）。
 
+### 親コンストラクタの implicit / デフォルト引数
+
+`extends P` は引数を書いていなくても、`P` のコンストラクタが implicit 節や
+デフォルト引数だけの節を持つなら、JVM 上ではその引数を渡さなければいけません。
+
+```scala
+trait TT[T]
+class TypedRep[T](implicit val tpe: TT[T])
+class ConstColumn[T : TT] extends TypedRep[T]   // TypedRep.<init>(TT) を呼ぶ
+```
+
+`type_parent` は、親のコンストラクタが**そのクラス自身のものひとつだけ**で、書かれていない
+パラメータが全部 implicit かデフォルト付きのとき、親の木を `extends P()` の形（`Apply`）に
+書き換えてから、呼び出し側と同じ `fill_defaults_and_implicits` で埋めます。埋められなければ
+黙って通さず診断を出します（scalac は
+`could not find implicit value for parameter tpe: TT[String]`、こちらは同じ位置で
+`no implicit: could not find implicit value of type TT[String]`）。引数無しの `new P` も
+同じ書き換えを通ります。
+
+親位置は**ヘッダパス・シグネチャパス・本体パスの 3 回**歩かれるので、次の 3 点で二度目に
+壊れないようにしています。
+
+- 埋めるのは**本体パスだけ**（`sigs_only == false`）。シグネチャパスの時点では、後ろの
+  ファイルにある親の context bound の evidence パラメータがまだ生えていないことがある。
+- 埋めた木は `parent_fill_done`（file / NodeId / span / クラス）に記録して二度は埋めない。
+  `sig_done` / `lazy_done` と同じ考え方。
+- 合成した引数（`NodeId(0)` かつ型が付いている）は次のパスで**再型付けしない**。名前で
+  引き直すと、その時スコープに入っていない evidence パラメータを見失う。
+
+オーバーロード解決は**ソースに書かれた引数だけ**で行い、埋めるのはその後です。埋めた引数で
+解決をやり直すと、implicit が見つからなかった 1 件の診断が
+`no matching overload for constructor` に化けて増えてしまいます。
+
+implicit 探索のスコープも nsc に合わせます。親コンストラクタの引数はコンストラクタ自身の
+コンテキストで型付けされ、そこに `this` はまだ無いので、**自分のクラスと継承したメンバーは
+候補になりません**（`crates/typer/src/implicits.rs` の `implicits_in_scope` を
+`parent_ctor_scope` で切ります）。これが無いと
+`class NullJdbcType extends DriverJdbcType[Null]` が、親から継承しようとしている
+`implicit val classTag` 自身を親の `ClassTag[Null]` の答えに使ってしまい ambiguous になります。
+
+パラメータ付き型エイリアスの適用（`type BaseColumnType[T] = JdbcType[T] & BaseTypedType[T]`
+に対する `BaseColumnType[U]`）は `is_sub_type` で展開します。context bound
+`[U : BaseColumnType]` が作る evidence の型がこの形なので、展開しないと `JdbcType[U]` に
+適合せず implicit が見つかりません。
+
 ### try / catch / finally
 
 `try` 本体を例外テーブルで覆い、ハンドラで catch のパターン（`case _: RuntimeException` など）を `instanceof` します。マッチしなければ再 throw します。`finally` は成功パスと catch パスの両方で実行します（`jsr` は使いません。コードを複製します）。
@@ -989,6 +1034,7 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 `agent/smallgaps` スライス（`@inline` / `@noinline` の配置、curried case class companion、companion への後方参照、`Option.flatMap` の多相性、`None`/`Some` の `lub`、`Iterable.apply`）のフィクスチャは接頭辞 `sgap`（`sgap` / `sgap_lib`）で、同じ理由から `crates/cli/tests/smallgaps.rs` に置いています。`sgap.scala` は `--no-scala-library` で `check` 済み、`sgap_lib.scala` は `Iterable.apply` が library ABI（`IterableFactory$Delegate.apply` の継承）にしか無いため library dual-run 専用（`fixtures_sgap_lib_without_library_is_error` で `--no-scala-library` が診断のまま残ることも見ています）。
 
 オーバーロード集合が別のクラスの読み込みで消える回帰のフィクスチャは接頭辞 `oshadow`（`oshadow` / `oshadow_java_first` / `oshadow_java_last` / `oshadow_bad`）で、同じ理由から `crates/cli/tests/overloadshadow.rs` に置いています。`oshadow.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 の実行結果とも直接比較します（`oshadow_matches_scalac`）。`oshadow_java_first.scala` と `oshadow_java_last.scala` は `java.math.BigDecimal` の位置だけを入れ替えた同じプログラムで、`oshadow_order_independent` が両方通ることと stdout が一致することを固定します。`oshadow_bad.scala` は `BigDecimal(Some(1))`（real scalac も拒否）が `no matching overload` になり、しかも**候補一覧が丸ごと**出る（`(String)BigDecimal` を含む）ことを見ます。`oshadow_without_library_is_error` は `--no-scala-library` で `not found: value BigDecimal` の診断が残ることを見ます。
+`agent/parentimpl` スライス（親コンストラクタの implicit 節・デフォルト引数の補完）のフィクスチャは接頭辞 `pimpl`（`pimpl` / `pimpl_bad`）で、同じ理由から `crates/cli/tests/parentimpl.rs` に置いています。`pimpl.scala` は slick の `ConstColumn` 形（`class ConstColumn[T : TT] extends TypedRep[T]`）、明示節＋2 引数の implicit 節、全部デフォルト／末尾だけデフォルト、デフォルト節＋implicit 節、匿名クラスの親、引数無しの `new` を 1 本にまとめ、**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせます。`real_scalac_dual_run_pimpl` は real scalac 2.13.16 でも同じソースを走らせて stdout が一致することを見ます（`expected/pimpl.txt` は scalac の出力そのもの）。`pimpl_late_a.scala` / `pimpl_late_z.scala` は**子を親より先にコンパイル**して、親の context bound の evidence がシグネチャパス時点で未生成でも埋まる（＝ファイル順に依存しない）ことを見ます。`pimpl_bad.scala` は witness の無い親 implicit 節が**黙って通らない**ことを固定し、`pimpl_bad_reports_the_extends_clause_once` で診断が `extends` の行に 1 件だけ出る（3 パス分に増えない）ことも見ています。
 
 trait の `val` / `override val` / `var` の実行時表現と `case object` の合成メンバーのフィクスチャは接頭辞 `tval`（`tval` / `tval_bad`）で、同じ理由から `crates/cli/tests/traitval.rs` に置いています。`tval.scala` は私有ランタイム（`--no-scala-library`）と library dual-run の両方で走らせ、`expected/tval.txt` は **real scalac 2.13.16 の出力そのもの**です（3 モードがバイト単位で一致することを確認済み）。バイトコード側の不変条件も 2 本のテストで固定しています。`trait_val_setters_follow_nsc_names` は mixin setter が nsc と同じ `Named$_setter_$label_$eq` であること、`override val` したクラスのその setter が空実装（`putfield` なし）であること、trait の `var` への代入が `putfield` ではなく `count_$eq` 呼び出しであることを `javap -p -c` で見ます。`case_object_members_are_on_the_module_class` は `Asc$` に `toString` / `productPrefix` / `hashCode` / `productArity` が出ていることを見ます。`tval_bad.scala` は trait の `val` への代入が `reassignment to val` になることを固定します。
 
@@ -1088,6 +1134,7 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `sgap_lib.scala`（`crates/cli/tests/smallgaps.rs`、library dual-run のみ） | `Iterable(...)` companion `apply`（実ライブラリの `IterableFactory$Delegate.apply` 継承。私有ランタイムに裏付けが無いので `--no-scala-library` では診断のまま） | `List(a, b, c)` `3` |
 | `oshadow.scala`（`crates/cli/tests/overloadshadow.rs`、library dual-run のみ） | 別のクラスを読んでも既存のオーバーロード集合が消えないこと: `java.math.BigDecimal` を**前にも後にも**置いた上での `BigDecimal(Int)` / `(Long)` / `(String)` / `(BigInt)` / `(java.math.BigDecimal)`、`Option[BigDecimal].getOrElse` | `2` `3` `4.25` `6` `12.5` `12.5` `-1` `7` `8.75` `9` |
 | `oshadow_java_first.scala` / `oshadow_java_last.scala`（`crates/cli/tests/overloadshadow.rs`、library dual-run のみ） | 同じプログラムを `java.math.BigDecimal` の位置だけ入れ替えた 2 本。両方通り、stdout が一致すること（順序依存の回帰テスト） | `1` `2` `3.5` |
+| `pimpl.scala`（`crates/cli/tests/parentimpl.rs`） | `agent/parentimpl` スライス: 親コンストラクタの implicit 節・デフォルト引数の補完（`class ConstColumn[T : TT] extends TypedRep[T]`、明示節＋2 引数の implicit 節、context bound の親への受け渡し、全部／末尾だけデフォルト、デフォルト節＋implicit 節、匿名クラスの親、引数無しの `new`）。私有ランタイム・library dual-run・real scalac dual-run の 3 通り | `rep[Int]` `rep[String]` … `anon:Int` `Int` |
 | `pkgalias.scala`（`crates/cli/tests/pkgalias.rs`、library dual-run のみ） | jar の package object にしかない**型エイリアス**（`scala/package$` の pickle）: `new NoSuchElementException(...)` と `catch`、`Throwable` / `UnsupportedOperationException` / `IllegalArgumentException` / `Exception`、型パラメータ付きの `IterableOnce[Int]` / `Seq[Int]` | `gone` `java.lang.UnsupportedOperationException` `java.lang.IllegalArgumentException` `3` `r` `9` |
 | `java_cp.scala` | JDK の Java `.class` から `Math.abs` / `Byte.MAX_VALUE` / `ArrayList.add` を解決して実行 | `3` `127` `true` `1` |
 | `java_sig.scala` | Java Signature（`ArrayList[String]#get` は `String`）、inner `Map.Entry` / `SimpleEntry`、Java varargs `String.format` / `Arrays.asList` を実行 | `hi` `2` `k` `v` `k` `x-3` `2` |
@@ -1347,14 +1394,20 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   で、明示指定した型引数が後続の implicit 節に届かず `TypedType[P1]` /
   `ScalaBaseType[T]` を探しに行ってしまう。期待型からの推論（実装済み）とは別の穴で、
   TypeApply とオーバーロード解決の側にある。
-- **親コンストラクタの implicit 節を埋めていない**。
-  `abstract class TypedRep[T](implicit val tpe: TT[T])` を
-  `class ConstColumn[T : TT] extends TypedRep[T]` が継承すると、`extends` に引数リストが
-  無いので witness を渡さず、コード生成が存在しない `TypedRep.<init>()` を呼ぶ
-  （実行時 `NoSuchMethodError`）。**黙って通っている**ので直すべき穴。
-  親位置の木は 2 回型付けされるため、埋めた implicit 引数（`Ident` として合成される）が
-  2 回目に名前で解決し直されて壊れる、というのが難しいところ。
-  ClassTag の `ClassTag.apply(classOf[T])` フォールバックも親位置では型付けできない。
+- **自己型を通した型メンバーの解決**。`trait JdbcTypesComponent { self: JdbcProfile => }`
+  の中で `BaseColumnType` を書くと、自己型の `type BaseColumnType[T] = JdbcType[T] &
+  BaseTypedType[T]`（具象別名）ではなく線形化側の抽象宣言
+  `type BaseColumnType[T] <: ColumnType[T] & BaseTypedType[T]` が選ばれる。
+  そのため `def base[U : BaseColumnType]` の evidence が `JdbcType[U]` に適合せず、
+  `new MappedJdbcType[T, U] with BaseTypedType[T]` の親 implicit 節が
+  `could not find implicit value of type JdbcType[U]` になる（scalac は通す）。
+- **`Ordering[Null]` が探索で見つからない**。nsc は
+  `Ordering.ordered[Null](Predef.$conforms[Null])` を組み立てるが、こちらは
+  `implicit_tree` の**入れ子**の implicit 引数に対して identity view
+  （`A <: B` を `A => B` として使う）のフォールバックを回していないため、`ordered` を
+  候補として採れない。`implicitly[Ordering[Null]]` 単独でも落ちる既存の穴で、
+  親コンストラクタ／引数無し `new` を埋めるようにしたことで
+  slick の `new ScalaBaseType[Null]` からも見えるようになった。
 - **値クラス（`extends AnyVal`）が universal trait を mix-in したとき**、
   `final class C(val x: Rep[Int]) extends AnyVal with Numeric[Int, Int]` の
   インスタンスがインタフェースを実装していない classfile になる

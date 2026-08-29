@@ -96,6 +96,24 @@ pub struct Typer {
     /// work is not idempotent -- it synthesizes evidence parameters and
     /// default getters -- so the body pass must not redo it.
     sig_done: std::collections::HashSet<(usize, scala_rs_parser::NodeId)>,
+    /// Parent constructor calls whose omitted (implicit / defaulted) argument
+    /// list has already been synthesized. `extends P` is walked by the header
+    /// pass, the signature pass and the body pass; filling it more than once
+    /// would append the arguments twice, and re-running the implicit search on
+    /// a later pass would look up an evidence parameter that is no longer in
+    /// scope. Keyed by span as well as node id because a parent tree the
+    /// compiler itself built (an anonymous class's) carries `NodeId(0)`.
+    parent_fill_done: std::collections::HashSet<(usize, scala_rs_parser::NodeId, Span, SymbolId)>,
+    /// Set while `type_apply` types the `new C` of a `new C(…)`: that shape
+    /// already has an argument list, so the `New` arm must not add one.
+    new_is_applied: bool,
+    /// Set while the arguments of a *parent* constructor call are being
+    /// searched for. nsc types those in the constructor's own context, where
+    /// `this` does not exist yet, so the class's own and inherited members are
+    /// not implicit candidates: `class NullJdbcType extends
+    /// DriverJdbcType[Null]` must not answer its parent's `ClassTag[Null]`
+    /// with the `implicit val classTag` it is about to inherit from it.
+    pub(crate) parent_ctor_scope: bool,
     fatal_warnings: bool,
     library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
@@ -264,6 +282,9 @@ impl Typer {
             pkg_nest: Vec::new(),
             sigs_only: false,
             sig_done: std::collections::HashSet::new(),
+            parent_fill_done: std::collections::HashSet::new(),
+            new_is_applied: false,
+            parent_ctor_scope: false,
             fatal_warnings: opts.fatal_warnings,
             library_abi: opts.library_abi,
             return_meth: None,
@@ -3111,6 +3132,30 @@ impl Typer {
             if !self.st.get(id).flags.contains(Flags::TRAIT)
                 && !self.st.get(id).flags.contains(Flags::INTERFACE)
             {
+                // `class ConstColumn[T : TT] extends TypedRep[T]` writes no
+                // argument list, but `TypedRep`'s only clause is implicit:
+                // on the JVM the super call still has to pass it. Give the
+                // parent an explicit (empty) application and let the normal
+                // call-site machinery fill it, exactly as `new TypedRep[T]`
+                // would -- otherwise codegen emits `TypedRep.<init>()`, which
+                // type-checks here and fails with `NoSuchMethodError` at run
+                // time.
+                if !self.sigs_only && self.parent_ctor_is_fillable(id) {
+                    let head = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+                    *tree = Tree {
+                        id: head.id,
+                        span: head.span,
+                        kind: TreeKind::Apply {
+                            fun: Box::new(head),
+                            args: Vec::new(),
+                        },
+                        ty: Type::NoType,
+                        sym: SymbolId::NONE,
+                        postfix: false,
+                    };
+                    self.type_parent_ctor_app(tree);
+                    return;
+                }
                 let targs: Vec<Type> = match &tree.ty {
                     Type::Class { args, .. } => args.clone(),
                     _ => Vec::new(),
@@ -3142,6 +3187,121 @@ impl Typer {
         }
     }
 
+    /// `class_id`'s own constructor, when it has exactly one. `lookup_member`
+    /// also reports the *inherited* `<init>`, which is not an overload of it;
+    /// and a class with auxiliary constructors is resolved from the arguments
+    /// that are written, never filled from an empty list.
+    fn sole_own_ctor(&self, class_id: SymbolId) -> Option<SymbolId> {
+        let alts: Vec<SymbolId> = self
+            .st
+            .lookup_member(class_id, "<init>")
+            .into_iter()
+            .filter(|&id| {
+                self.st.get(id).kind == crate::symbol::SymKind::Method
+                    && self.st.get(id).owner == class_id
+            })
+            .collect();
+        match alts[..] {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    /// `extends P` (or `new P`) with no argument list, where `P`'s constructor
+    /// nevertheless takes parameters that a call site is allowed to omit:
+    /// every parameter is either implicit or has a default.
+    fn parent_ctor_is_fillable(&self, class_id: SymbolId) -> bool {
+        let Some(only) = self.sole_own_ctor(class_id) else {
+            return false;
+        };
+        let params = self.st.get(only).params.clone();
+        !params.is_empty()
+            && params.iter().all(|p| {
+                let f = self.st.get(*p).flags;
+                f.contains(Flags::IMPLICIT) || f.contains(Flags::DEFAULTPARAM)
+            })
+    }
+
+    /// Append the constructor arguments a parent clause is allowed to leave
+    /// out -- an implicit clause, a defaulted parameter -- so `extends P` and
+    /// `extends P(x)` reach codegen with the same flat argument list a
+    /// `new P` call site would build.
+    ///
+    /// Only the body pass does this. The signature pass walks the same tree,
+    /// and by then a parent declared in a later unit may still be missing the
+    /// evidence parameters its own context bounds add; running once, after
+    /// every signature is settled, also keeps the synthesized trees from being
+    /// appended twice. `parent_fill_done` is the belt to that braces: an
+    /// anonymous class's header can be re-entered from `complete_lazy_sig`.
+    fn fill_parent_ctor_args(
+        &mut self,
+        node: (NodeId, Span),
+        span: Span,
+        class_id: SymbolId,
+        targs: &[Type],
+        args: &mut Vec<Tree>,
+    ) {
+        if self.sigs_only {
+            return;
+        }
+        // Overloaded constructors are resolved from the arguments that are
+        // written; filling one of them here would beg the question.
+        let Some(ctor) = self.sole_own_ctor(class_id) else {
+            return;
+        };
+        let params = self.st.get(ctor).params.clone();
+        if args.len() >= params.len() {
+            return;
+        }
+        // Anything else missing is a real "not enough arguments", which the
+        // overload report below phrases the way nsc does.
+        if !params[args.len()..].iter().all(|p| {
+            let f = self.st.get(*p).flags;
+            f.contains(Flags::IMPLICIT) || f.contains(Flags::DEFAULTPARAM)
+        }) {
+            return;
+        }
+        if !self
+            .parent_fill_done
+            .insert((self.file_index, node.0, node.1, class_id))
+        {
+            return;
+        }
+        // `class TypedRep[T](implicit tpe: TT[T])` states its parameter in its
+        // own `T`; `extends TypedRep[String]` must search for `TT[String]`.
+        let mut ctor_ty = self.st.get(ctor).ty.clone();
+        if !targs.is_empty() {
+            ctor_ty = self.st.subst_tparams(class_id, targs, &ctor_ty);
+        }
+        let param_tys: Vec<Type> = match &ctor_ty {
+            Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+            _ => params
+                .iter()
+                .map(|p| {
+                    let t = self.st.get(*p).ty.clone();
+                    if targs.is_empty() {
+                        t
+                    } else {
+                        self.st.subst_tparams(class_id, targs, &t)
+                    }
+                })
+                .collect(),
+        };
+        let ctor_fun = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Ident {
+                name: "<init>".into(),
+            },
+            ty: ctor_ty,
+            sym: ctor,
+            postfix: false,
+        };
+        let saved = std::mem::replace(&mut self.parent_ctor_scope, true);
+        let _ = self.fill_defaults_and_implicits(span, args, &param_tys, &ctor_fun, &Type::NoType);
+        self.parent_ctor_scope = saved;
+    }
+
     fn type_parent_ctor_app(&mut self, tree: &mut Tree) {
         // `extends A(1)(2)` arrives as nested Applies; the constructor takes
         // one flat argument list on the JVM, so flatten the clauses.
@@ -3168,6 +3328,7 @@ impl Typer {
                 None => break,
             }
         }
+        let node = (tree.id, tree.span);
         let (fun, args) = match &mut tree.kind {
             TreeKind::Apply { fun, args } => (fun, args),
             _ => return,
@@ -3179,9 +3340,15 @@ impl Typer {
             fun.sym = class_id;
         }
         for a in args.iter_mut() {
+            // An argument this pass synthesized on an earlier walk of the same
+            // parent (a filled implicit or default) is already bound to its
+            // symbol. Re-typing it would resolve the name again, in a scope
+            // where the evidence parameter it refers to is no longer entered.
+            if a.id == NodeId(0) && !a.ty.is_no_type() {
+                continue;
+            }
             self.type_expr(a, &Type::NoType);
         }
-        let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
         tree.ty = class_ty.clone();
         if class_id.is_none() {
             return;
@@ -3190,6 +3357,7 @@ impl Typer {
             Type::Class { args, .. } => args.clone(),
             _ => Vec::new(),
         };
+        let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
         match self.pick_ctor_at(class_id, &targs, &arg_tys, None) {
             OverloadPick::Found(sym, param_tys, _) => {
                 // `class Sub[T](y: T) extends Base[T](y)`: the constructor's
@@ -3212,6 +3380,13 @@ impl Typer {
                     }
                 }
                 tree.sym = sym;
+                // Only now, with the constructor settled from what the source
+                // wrote: the omitted implicit / defaulted arguments are
+                // appended, and the overload is never re-resolved against
+                // them. A synthesized argument that failed to conform would
+                // otherwise turn one honest "could not find implicit" into a
+                // second, misleading "no matching overload".
+                self.fill_parent_ctor_args(node, tree.span, class_id, &targs, args);
             }
             OverloadPick::Ambiguous => {
                 self.error(tree.span, "ambiguous overload for constructor");
@@ -4193,6 +4368,10 @@ impl Typer {
             }
             TreeKind::Match { .. } => self.type_match(tree, pt),
             TreeKind::New { tpt } => {
+                // Set by `type_apply` for the `new C(…)` shape, where the
+                // argument list is the caller's business. Cleared here so the
+                // sub-trees typed below do not inherit it.
+                let applied = std::mem::take(&mut self.new_is_applied);
                 if matches!(&tpt.kind, TreeKind::ClassDef { .. }) {
                     self.type_anon_class(tpt);
                     tree.ty = tpt.ty.clone();
@@ -4286,6 +4465,34 @@ impl Typer {
                                 }
                             }
                         }
+                    }
+                }
+                // `new TypedRep[Int]` writes no argument list at all, but the
+                // class's only constructor clause is implicit and nsc still
+                // passes it. Rewrite to the empty application so the ordinary
+                // `new C()` path fills it; without this, codegen emits
+                // `TypedRep.<init>()` and the program dies with
+                // `NoSuchMethodError` at run time.
+                if !applied {
+                    let fillable = self
+                        .st
+                        .class_sym_of(&tree.ty)
+                        .is_some_and(|cls| self.parent_ctor_is_fillable(cls));
+                    if fillable {
+                        let head = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+                        *tree = Tree {
+                            id: head.id,
+                            span: head.span,
+                            kind: TreeKind::Apply {
+                                fun: Box::new(head),
+                                args: Vec::new(),
+                            },
+                            ty: Type::NoType,
+                            sym: SymbolId::NONE,
+                            postfix: false,
+                        };
+                        self.type_apply(tree, pt);
+                        return;
                     }
                 }
             }
@@ -6217,7 +6424,9 @@ impl Typer {
         };
         // new C(args)
         if matches!(&fun.kind, TreeKind::New { .. }) {
+            self.new_is_applied = true;
             self.type_expr(fun, pt);
+            self.new_is_applied = false;
             if let Some(elem) = array_elem_of(&fun.ty) {
                 if needs_classtag_elem(&elem) {
                     self.rewrite_generic_array_new(tree, elem);
@@ -6399,6 +6608,16 @@ impl Typer {
                     ty: ctor_ty,
                     sym: csym,
                     postfix: false,
+                };
+                // The picked constructor still speaks the class's own type
+                // parameters. `new TypedRep[Int]()` has to search for
+                // `TT[Int]`, not for the declared `TT[T]`.
+                let ctor_params: Vec<Type> = match class_id {
+                    Some(c) if !inferred_args.is_empty() => ctor_params
+                        .iter()
+                        .map(|p| self.st.subst_tparams(c, &inferred_args, p))
+                        .collect(),
+                    _ => ctor_params,
                 };
                 let _ =
                     self.fill_defaults_and_implicits(tree.span, args, &ctor_params, &ctor_fun, pt);
