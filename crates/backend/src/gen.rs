@@ -5,7 +5,7 @@ use crate::classfile::{
     ACC_FINAL, ACC_INTERFACE, ACC_NATIVE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER,
     ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
 };
-use crate::code::Assembler;
+use crate::code::{Assembler, Label};
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{Intrinsic, SymKind, SymbolTable};
 use std::cell::{Cell, RefCell};
@@ -422,6 +422,13 @@ impl JvmSort {
 struct Frame {
     locals: HashMap<SymbolId, (u16, JvmSort)>,
     next_slot: u16,
+    /// Exit labels of the enclosing `try ... finally` blocks, outermost first.
+    /// A direct `return` from inside one has to run the finalizers before it
+    /// leaves the method, so it jumps to the innermost exit instead of
+    /// returning on the spot.
+    finally_exits: Vec<Label>,
+    /// Slot parking a `return` value while those finalizers run.
+    return_slot: Option<u16>,
 }
 
 impl Frame {
@@ -429,6 +436,20 @@ impl Frame {
         Frame {
             locals: HashMap::new(),
             next_slot: 1,
+            finally_exits: Vec::new(),
+            return_slot: None,
+        }
+    }
+
+    /// Slot for a `return` value that still has finalizers to run through.
+    fn return_slot(&mut self, sort: JvmSort) -> u16 {
+        match self.return_slot {
+            Some(s) => s,
+            None => {
+                let s = self.alloc_tmp(sort);
+                self.return_slot = Some(s);
+                s
+            }
         }
     }
 
@@ -2673,6 +2694,8 @@ impl<'a> Gen<'a> {
         let mut frame = Frame {
             locals: HashMap::new(),
             next_slot: 0,
+            finally_exits: Vec::new(),
+            return_slot: None,
         };
         if let Some(fid) = field {
             frame.alloc(fid, jvm_sort(&under));
@@ -4331,6 +4354,25 @@ fn pop_if_value(asm: &mut Assembler, ty: &Type) {
     }
 }
 
+/// Leave the method with the value parked by a `return` that had finalizers to
+/// run: hand it to the next enclosing finalizer, or return it here.
+fn emit_pending_return(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx) {
+    if let Some(outer) = frame.finally_exits.last().copied() {
+        asm.goto(outer);
+        return;
+    }
+    if !is_unit_like(&ctx.ret_ty) {
+        let sort = jvm_sort(&ctx.ret_ty);
+        match frame.return_slot {
+            Some(slot) => load(asm, slot, sort),
+            // No `return` reached this exit, so the block is unreachable and
+            // will be dropped; keep the stack consistent all the same.
+            None => push_default(asm, &ctx.ret_ty),
+        }
+    }
+    emit_return(asm, &ctx.ret_ty);
+}
+
 fn emit_return(asm: &mut Assembler, ty: &Type) {
     match jvm_sort(ty) {
         JvmSort::Void => asm.vreturn(),
@@ -4397,6 +4439,7 @@ fn finish_method_body(
         asm.mark(rethrow);
         asm.athrow();
         asm.exception(start, end, handler, Some(NLRC));
+        asm.release_try_locals();
     } else {
         emit_body_return(asm, frame, ctx, rhs, ret);
     }
@@ -4703,15 +4746,25 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
         TreeKind::New { tpt } => gen_new(asm, frame, ctx, tpt, &[], SymbolId::NONE),
         TreeKind::Return { expr } => {
             if !ctx.method_sym.is_none() && (tree.sym == ctx.method_sym || tree.sym.is_none()) {
-                if !expr.is_empty() && !is_unit_like(&expr.ty) && !is_unit_like(&ctx.ret_ty) {
+                if !expr.is_empty() {
                     gen_expr(asm, frame, ctx, expr);
-                } else if !expr.is_empty() && !is_unit_like(&ctx.ret_ty) {
-                    gen_expr(asm, frame, ctx, expr);
-                } else if !expr.is_empty() {
-                    gen_expr(asm, frame, ctx, expr);
-                    pop_if_value(asm, &expr.ty);
+                    if is_unit_like(&ctx.ret_ty) {
+                        pop_if_value(asm, &expr.ty);
+                    }
                 }
-                emit_return(asm, &ctx.ret_ty);
+                match frame.finally_exits.last().copied() {
+                    // Inside a `try ... finally`: park the value and let the
+                    // finalizers run before the method actually returns.
+                    Some(exit) => {
+                        if !is_unit_like(&ctx.ret_ty) {
+                            let sort = jvm_sort(&ctx.ret_ty);
+                            let slot = frame.return_slot(sort);
+                            store(asm, slot, sort);
+                        }
+                        asm.goto(exit);
+                    }
+                    None => emit_return(asm, &ctx.ret_ty),
+                }
                 // Dead code after `return` still needs a dummy for the method
                 // epilogue (and for StackMapTable at the next instruction).
                 push_default(asm, &ctx.ret_ty);
@@ -12033,7 +12086,11 @@ fn gen_synchronized(
     load(asm, lock, JvmSort::Ref);
     asm.monitorenter();
     let try_s = asm.fresh_label();
+    asm.capture_try_locals();
+    // A `return` out of the body has to release the monitor first.
+    let ret_exit = asm.fresh_label();
     asm.mark(try_s);
+    frame.finally_exits.push(ret_exit);
     if let Some(body) = args.first() {
         let produced_ty = if let TreeKind::Function { body: inner, .. } = &body.kind {
             gen_expr(asm, frame, ctx, inner);
@@ -12074,6 +12131,7 @@ fn gen_synchronized(
     if let Some(r) = result {
         store(asm, r, sort);
     }
+    frame.finally_exits.pop();
     load(asm, lock, JvmSort::Ref);
     asm.monitorexit();
     let try_e = asm.fresh_label();
@@ -12082,7 +12140,7 @@ fn gen_synchronized(
     asm.goto(after);
     let handler = asm.fresh_label();
     asm.mark(handler);
-    asm.enter_handler();
+    asm.enter_handler_captured_locals();
     let ex = frame.alloc_tmp(JvmSort::Ref);
     asm.astore(ex);
     load(asm, lock, JvmSort::Ref);
@@ -12090,6 +12148,12 @@ fn gen_synchronized(
     asm.aload(ex);
     asm.athrow();
     asm.exception(try_s, try_e, handler, None);
+    asm.release_try_locals();
+    // Outside the guarded range, so a `return` does not re-enter the handler.
+    asm.mark(ret_exit);
+    load(asm, lock, JvmSort::Ref);
+    asm.monitorexit();
+    emit_pending_return(asm, frame, ctx);
     asm.mark(after);
     if let Some(r) = result {
         load(asm, r, sort);
@@ -12389,7 +12453,20 @@ fn gen_try(
     }
     let exn_slot = frame.alloc_tmp(JvmSort::Ref);
 
+    // The handlers below can be entered from any point of the guarded region, so
+    // their frames may only mention the locals that are live before it starts.
+    asm.capture_try_locals();
+    // A `return` out of the guarded body must not skip the finalizer; it jumps
+    // to `ret_exit`, which runs it (and any enclosing ones) and then returns.
+    let ret_exit = if has_finally {
+        Some(asm.fresh_label())
+    } else {
+        None
+    };
     asm.mark(start);
+    if let Some(l) = ret_exit {
+        frame.finally_exits.push(l);
+    }
     if unit {
         gen_stat(asm, frame, ctx, block);
     } else {
@@ -12402,6 +12479,9 @@ fn gen_try(
         }
         store(asm, result_slot.unwrap(), sel_sort);
     }
+    if ret_exit.is_some() {
+        frame.finally_exits.pop();
+    }
     asm.mark(end_try);
     if has_finally {
         gen_stat(asm, frame, ctx, finalizer);
@@ -12409,7 +12489,7 @@ fn gen_try(
     asm.goto(after);
 
     asm.mark(handler);
-    asm.enter_handler();
+    asm.enter_handler_captured_locals();
     store(asm, exn_slot, JvmSort::Ref);
     let catch_rethrow = if has_finally && !catches.is_empty() {
         Some(asm.fresh_label())
@@ -12426,6 +12506,9 @@ fn gen_try(
         let catch_start = asm.fresh_label();
         let catch_end = asm.fresh_label();
         asm.mark(catch_start);
+        if let Some(l) = ret_exit {
+            frame.finally_exits.push(l);
+        }
         if unit {
             gen_stat(asm, frame, ctx, &c.body);
         } else if is_unit_like(&c.body.ty) {
@@ -12442,6 +12525,9 @@ fn gen_try(
             if let Some(slot) = result_slot {
                 store(asm, slot, sel_sort);
             }
+        }
+        if ret_exit.is_some() {
+            frame.finally_exits.pop();
         }
         asm.mark(catch_end);
         if has_finally {
@@ -12461,11 +12547,20 @@ fn gen_try(
 
     if let Some(rethrow) = catch_rethrow {
         asm.mark(rethrow);
-        asm.enter_handler();
+        asm.enter_handler_captured_locals();
         store(asm, exn_slot, JvmSort::Ref);
         gen_stat(asm, frame, ctx, finalizer);
         load(asm, exn_slot, JvmSort::Ref);
         asm.athrow();
+    }
+    asm.release_try_locals();
+
+    if let Some(l) = ret_exit {
+        // Outside every guarded range: a finalizer that throws here must not be
+        // caught by the handler that would run it a second time.
+        asm.mark(l);
+        gen_stat(asm, frame, ctx, finalizer);
+        emit_pending_return(asm, frame, ctx);
     }
 
     asm.mark(after);

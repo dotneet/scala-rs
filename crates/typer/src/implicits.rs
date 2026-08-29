@@ -292,6 +292,37 @@ impl Typer {
         }) && (!s.paramss.is_empty() || s.params.is_empty())
     }
 
+    /// An inherited implicit is declared in terms of its *owner's* type
+    /// parameters. Seen from the class we are typing, those are the parent's
+    /// arguments: `implicit def p1Type: TT[P1]` on `trait Base[P1]` is
+    /// `TT[P1]` of `Mid` inside `trait Mid[P1] extends Base[P1]`. Without this
+    /// the candidate carries `Base`'s `P1`, which never matches the wanted
+    /// `TT[P1]` of `Mid`.
+    pub(crate) fn implicit_candidate_ty(&self, id: SymbolId) -> Type {
+        let ty = self.st.get(id).ty.clone();
+        let this = self.st.this_class;
+        let owner = self.st.get(id).owner;
+        if this.is_none()
+            || owner.is_none()
+            || owner == this
+            || !self.st.get(owner).is_class_like()
+            || self.st.get(owner).tparams.is_empty()
+        {
+            return ty;
+        }
+        let this_ty = Type::Class {
+            sym: this,
+            args: self
+                .st
+                .get(this)
+                .tparams
+                .iter()
+                .map(|t| Type::TypeParam(*t))
+                .collect(),
+        };
+        self.st.subst_as_seen_from(&this_ty, &ty)
+    }
+
     /// Whether `id` can inhabit `pt`, and with which type arguments.
     ///
     /// `undet` are call-site type parameters the search itself has to solve —
@@ -304,11 +335,11 @@ impl Typer {
         depth: usize,
         undet: &[SymbolId],
     ) -> Option<ImplicitFit> {
-        let s = self.st.get(id);
-        if !s.flags.contains(Flags::IMPLICIT) {
+        if !self.st.get(id).flags.contains(Flags::IMPLICIT) {
             return None;
         }
-        match &s.ty {
+        let cand_ty = self.implicit_candidate_ty(id);
+        match &cand_ty {
             Type::Method { paramss, ret } => {
                 let ret = ret.clone();
                 if paramss.iter().all(|c| c.is_empty()) {
@@ -580,15 +611,6 @@ impl Typer {
         self.most_specific(comps)
     }
 
-    /// nsc-style: `a` is as specific as `b` when `a`'s result type is a subtype
-    /// of `b`'s, and (for conversions) `a`'s argument type is a subtype of `b`'s,
-    /// **or** `a`'s defining class is a subclass of `b`'s (origin).
-    /// Type and origin can disagree (inherited more-specific vs local less-specific)
-    /// and then `most_specific` reports ambiguous, matching nsc.
-    fn is_as_specific(&self, a: SymbolId, b: SymbolId) -> bool {
-        self.is_as_specific_type(a, b) || self.is_as_specific_origin(a, b)
-    }
-
     fn is_as_specific_type(&self, a: SymbolId, b: SymbolId) -> bool {
         let ra = self.implicit_result_ty(a);
         let rb = self.implicit_result_ty(b);
@@ -627,8 +649,21 @@ impl Typer {
         )
     }
 
+    /// nsc `Infer#isStrictlyMoreSpecific`: the *sum* of the specificity
+    /// comparison and the owner-subclass comparison has to come out positive.
+    /// Two candidates of the same type are told apart by their owner
+    /// (`ConstColumn`'s own context-bound evidence beats the `tpe` it inherits
+    /// from `Rep.TypedRep`), and a type/origin disagreement cancels out to
+    /// ambiguous — both as in nsc.
     fn strictly_more_specific(&self, a: SymbolId, b: SymbolId) -> bool {
-        a != b && self.is_as_specific(a, b) && !self.is_as_specific(b, a)
+        if a == b {
+            return false;
+        }
+        let spec =
+            i32::from(self.is_as_specific_type(a, b)) - i32::from(self.is_as_specific_type(b, a));
+        let sub = i32::from(self.is_as_specific_origin(a, b))
+            - i32::from(self.is_as_specific_origin(b, a));
+        spec + sub > 0
     }
 
     fn most_specific(&self, cands: Vec<SymbolId>) -> ImplicitSearch {
@@ -655,7 +690,7 @@ impl Typer {
     /// `implicit def anyShow[A]: Show[A]`'s `Show[_]` but not the other way
     /// round, so the monomorphic instance wins.
     fn implicit_result_ty(&self, id: SymbolId) -> Type {
-        let ret = match &self.st.get(id).ty {
+        let ret = match &self.implicit_candidate_ty(id) {
             Type::Method { ret, .. } => (**ret).clone(),
             Type::Function { ret, .. } => (**ret).clone(),
             t => t.clone(),
@@ -664,7 +699,7 @@ impl Typer {
     }
 
     fn conversion_arg_ty(&self, id: SymbolId) -> Option<Type> {
-        match &self.st.get(id).ty {
+        match &self.implicit_candidate_ty(id) {
             Type::Method { paramss, .. } => {
                 let ps = paramss.first()?;
                 if ps.len() == 1 {
@@ -893,8 +928,7 @@ impl Typer {
     }
 
     pub(crate) fn ref_implicit(&self, id: SymbolId, span: Span) -> Tree {
-        let s = self.st.get(id);
-        let ty = match &s.ty {
+        let ty = match &self.implicit_candidate_ty(id) {
             Type::Method { paramss, ret }
                 if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
             {
@@ -906,7 +940,7 @@ impl Typer {
             id: scala_rs_parser::NodeId(0),
             span,
             kind: TreeKind::Ident {
-                name: s.name.clone(),
+                name: self.st.get(id).name.clone(),
             },
             ty,
             sym: id,
