@@ -223,5 +223,7 @@ conform!(
     any_on_function,
     null_reference,
     ctor_varargs,
-    regex_extractor
+    regex_extractor,
+    tuple_ordering,
+    nested_value_class
 );

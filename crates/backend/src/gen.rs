@@ -7208,7 +7208,12 @@ fn invoke_value_extension(
         return;
     }
     let desc = value_extension_desc(ctx.st, id);
-    if owner.contains('$') {
+    // A value class of the *library*'s (`Predef$ArrowAssoc`) keeps its
+    // `$extension` on a companion module, because that is where scalac put it.
+    // One of ours is emitted as a static on the class itself -- testing the
+    // JVM name for a `$` mistook every value class nested in an object for a
+    // library one and called a companion we never write.
+    if owner.contains('$') && !ctx.st.source_value_classes.contains(&owner_id) {
         // Nested Predef AnyVal: `$extension` is an instance method on the
         // companion `MODULE$`, not a static on the value class.
         let ext_owner = format!("{owner}$");
