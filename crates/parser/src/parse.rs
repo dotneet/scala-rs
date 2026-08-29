@@ -864,12 +864,22 @@ impl<'a> Parser<'a> {
         let (name, _) = self.expect_ident();
         self.skip_nl();
         let tparams = self.parse_type_param_clause();
+        // A constructor modifier (`class C private (x: Int)`) sits on the same
+        // line as the class name, so the decision has to be taken *before* the
+        // newlines are skipped: `parse_modifiers` skips them itself, so a
+        // plain `class Other` used to swallow the `final` / `abstract` /
+        // `sealed` of whatever definition came next -- every modifier after
+        // the first class in a file was silently dropped.
+        let has_ctor_mods = !is_trait
+            && matches!(
+                self.kind(),
+                TokenKind::Private | TokenKind::Protected | TokenKind::At
+            );
         self.skip_nl();
-        let ctor_mods = if is_trait {
-            Modifiers::default()
-        } else {
-            // optional ctor access modifier
+        let ctor_mods = if has_ctor_mods {
             self.parse_modifiers()
+        } else {
+            Modifiers::default()
         };
         self.skip_nl();
         let vparamss = if is_trait {

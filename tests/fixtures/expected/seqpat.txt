@@ -1,0 +1,28 @@
+empty
+one 1
+two 3
+many 3 2
+xyz|w
+q
+ab
+a2
+24
+3
+3
+xy|z
+4
+k7
+5
+abc
+arr 12
+seq 12
+seq 12
+lst 9
+?
+?
+table a
+plain a
+table b
+plain b
+table c
+plain c

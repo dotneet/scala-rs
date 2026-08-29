@@ -128,7 +128,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - **`scala.collection.mutable.Builder` の `+=` / `++=`**（`Growable` の default メソッド。`this.type` を返すので受け手の型がそのまま返る）。jar リンク時のみ
 - `super` / 修飾付き `this`（`Outer.this`）。trait の `super` は、具象クラスなら `T$class`、スタック可能な `abstract override` なら `T$$super$m` 経由
 - `sealed` 階層の match 網羅検査（不足は **warning**。`-Xfatal-warnings` でエラー）
-- extractor の `unapply`（`Option` / `Boolean` / `Tuple2`）と `unapplySeq`（`List` と可変長 `_*`）。名前付き extractor 引数（`Point(y = b, x = a)`）
+- extractor の `unapply`（`Option` / `Boolean` / `Tuple2`）と `unapplySeq`（`List` / `Seq` / `Vector` / `IndexedSeq` / `Array` と可変長 `_*`）。名前付き extractor 引数（`Point(y = b, x = a)`）
 - `AnyVal` 値クラス（1 引数。生成は underlying へ erase。メソッドは `name$extension`）。`extends Any` した universal trait を mix-in でき、参照が要る位置（`Any` / その trait / 型引数 / 配列要素）では `new C(u)` で box する。パターンマッチ（`case x: C`）と `classOf[C]` / `asInstanceOf[C]` は box したクラスを見る。`equals` / `hashCode` は underlying から合成する（nsc の `equals$extension` / `hashCode$extension` 相当）
 - Predef の一部: `assert` / `require` / `???` / ArrowAssoc の `->` / `identity` / `locally` / `implicitly` / `any2stringadd`（`1 + "x"`）/ String の `length`・`toInt`（`toLong` / `toDouble` もある）。**`--scala-library`** 時はこれらを jar の `Predef$` / `StringOps` / `Predef$ArrowAssoc` / `Predef$any2stringadd` にリンクする。さらに `intWrapper` / `RichInt`（`abs` / `max` / `to` / `until`）、`longWrapper` / `RichLong`、`doubleWrapper` / `RichDouble`、`floatWrapper` / `RichFloat`、`charWrapper` / `RichChar`、`StringOps` の `*` / `take` / `drop` / `isEmpty` / `toUpperCase` / `toLowerCase` / `stripPrefix` / `split`、`Map` / `Vector` / `List` / `Set` / `Seq` / `LazyList` の varargs `apply`、**`Either`**（`Left` / `Right` / `isLeft` / `isRight` / `map` / `flatMap` / `fold` / `getOrElse` / `orElse` / `swap` / `toOption` / `toSeq` / `contains` / `exists` / `forall` / `foreach` / `filterOrElse`、および `left` が返す `LeftProjection` の `e` / `get` / `getOrElse` / `map` / `flatMap` / `foreach` / `exists` / `forall` / `toOption` / `toSeq` / `filterToOption`）、**`Try` / `Success` / `Failure`**（`Try(1)` / `isSuccess` / `isFailure` / `get` / `getOrElse` / `map` / `flatMap` / `filter` / `withFilter` / `foreach` / `orElse` / `recover` / `recoverWith` / `collect` / `toOption` / `toEither` / `failed` / `transform` / `fold`）も jar リンク時のみ。`Option` の `toList` / `toRight` / `toLeft` / `zip` / `collect` / `flatten` も jar リンク時のみ（`getOrElse` / `isDefined` / `nonEmpty` / `contains` / `exists` / `forall` / `filter` / `filterNot` / `orElse` / `fold` は私有ランタイムでも動く）。このスライスでは **ArrayOps の残り**（`lengthIs` / `sizeIs` / `indexOf` / `copyToArray` / `iterator`。`zipWithIndex`/`knownSize`/`sizeCompare`/`filterNot`/`headOption`/`lastOption`/`partition`/`splitAt`/`span`/`find`/`contains`/`distinct` とそれ以前は触らない）、**StringOps の残り**（`++` / `lengthIs` / `sizeIs` / `flatMap`。`iterator`/`sizeCompare`/`knownSize`/`appendedAll`/`prependedAll`/`>`/`>=`/`<=`/`compare`/`patch` とそれ以前は触らない）、**`scala.collection.View`**（`List.view.map.toList`、`View.fill` / `View.iterate`。私有 View classfile は出さない。LazyList/Iterator は View 呼び出しに必要な範囲以外は触らない）を同じ jar にリンクする
 - Predef の一部: `assert` / `require` / `???` / ArrowAssoc の `->` / `identity` / `locally` / `implicitly` / `any2stringadd`（`1 + "x"`）/ String の `length`・`toInt`（`toLong` / `toDouble` もある）。**`--scala-library`** 時はこれらを jar の `Predef$` / `StringOps` / `Predef$ArrowAssoc` / `Predef$any2stringadd` にリンクする。さらに `intWrapper` / `RichInt`（`abs` / `max` / `to` / `until`）、`longWrapper` / `RichLong`、`doubleWrapper` / `RichDouble`、`floatWrapper` / `RichFloat`、`charWrapper` / `RichChar`、`StringOps` の `*` / `take` / `drop` / `isEmpty` / `toUpperCase` / `toLowerCase` / `stripPrefix` / `split`、`Map` / `Vector` / `List` / `Set` / `Seq` / `LazyList` の varargs `apply`、`Either`（`Left` / `Right`）、`Try` / `Success` / `Failure`（`Try(1)` / `map` / `getOrElse`）も jar リンク時のみ。このスライスでは **ArrayOps の残り**（`lengthIs` / `sizeIs` / `indexOf` / `copyToArray` / `iterator`。`zipWithIndex`/`knownSize`/`sizeCompare`/`filterNot`/`headOption`/`lastOption`/`partition`/`splitAt`/`span`/`find`/`contains`/`distinct` とそれ以前は触らない）、**StringOps の残り**（`++` / `lengthIs` / `sizeIs` / `flatMap`。`iterator`/`sizeCompare`/`knownSize`/`appendedAll`/`prependedAll`/`>`/`>=`/`<=`/`compare`/`patch` とそれ以前は触らない）、**`scala.collection.View`**（`List.view.map.toList`、`View.fill` / `View.iterate`。私有 View classfile は出さない。LazyList/Iterator は View 呼び出しに必要な範囲以外は触らない）を同じ jar にリンクする
@@ -608,7 +608,25 @@ scalac 2.13 と同じく hard error ではありません。`-Xfatal-warnings` �
 
 `Even(n)` のような extractor はコンパニオン（または object）の `unapply` を呼びます。戻りが `Option[T]` なら `isEmpty` / `get`、`Boolean` なら真偽、`Option[(A,B)]` なら `Tuple2` の `_1` / `_2` です。`unapply` が無いパターンは `not found: extractor` です。
 
-`unapplySeq` は `List` のコンパニオンと、ユーザー定義の可変長 extractor です。`List(a, b, c)`、`List(h, rest @ _*)`、`PairSeq(a, b)` が動きます。名前付き引数は case class のコンストラクタパターンで並べ替えます（`Point(y = b, x = a)`）。
+`unapplySeq` は `List` / `Seq` / `Vector` / `IndexedSeq` / `Array` のコンパニオンと、ユーザー定義の可変長 extractor です。`List(a, b, c)`、`List(h, rest @ _*)`、`Seq(a, b)`、`Vector(a, rest @ _*)`、`Array(a, b)`、`PairSeq(a, b)` が動きます。名前付き引数は case class のコンストラクタパターンで並べ替えます（`Point(y = b, x = a)`）。
+
+`List` だけは cons リストを head / tail で辿ります。それ以外は実 scalac と同じく
+添字で読みます（`scala.collection.SeqFactory$UnapplySeqWrapper$` の
+`lengthCompare$extension` / `apply$extension` / `drop$extension`。`Array` は
+`scala.Array$UnapplySeqWrapper$` の同名 extension）。`Vector` を `Seq` として
+渡しても落ちないのはこのためです。`rest @ _*` に付く型は extractor 自身の
+結果型のコンテナで、`List` パターンなら `List[A]`、`Seq` / `Array` パターン
+なら `Seq[A]`（`drop$extension` の戻り型）です。
+
+スクルーティニの静的型がシーケンスだと保証していないとき（`x: Any` など）は、
+scalac と同じく先に型テストを出します（`instanceof`、`Array` は
+`ScalaRunTime.isArray(Object, 1)`）。部分パターンの `_: T` は**テスト**なので
+`instanceof` で落とし、`checkcast` はしません（`case List((s, _: TableNode))`
+がマッチしない値で例外になっていました）。
+
+`SeqFactory$UnapplySeqWrapper$` は私有ランタイム（`--no-scala-library`）には
+無いので、jar 無しの `case Seq(…)` / `case Array(…)` は**診断を出します**
+（黙って要素型 `Any` のコードを出しません）。`List` パターンは両モードで動きます。
 
 ### AnyVal（値クラスと universal trait）
 
@@ -1342,16 +1360,19 @@ trait NullaryNode extends Node {
   実行時に落ちます。`SeqOps.length` / `apply(I)` を使う版か `toList` の挿入が要ります。
   ついでに `case List(a, b, rest @ _*)` の codegen は**現状でも** `VerifyError` を
   出します（星付きパターンの前の要素に checkcast が出ていない）。
+  → **`agent/seqpat` で解決**（後述）。`List(a, b, rest @ _*)` の `VerifyError` は
+  その前の `41d4bca` で既に直っていました。
 - **`StringOps.map[B](f: Char => B): IndexedSeq[B]`** が無く、
   `"…".map(_.toString)` が `found: String required: Char` になります。2.13 は
   `map(Char => Char): String` と 2 つのオーバーロードを持ちますが、prelude に
   2 つ並べるとリテラルの結果型が決まる前に `ambiguous overload` になり、
   1 つに畳むと erasure が結果型を symbol から取り直すため codegen が
   `IndexedSeq` を返す方を呼びます。オーバーロード解決がリテラルの結果型で
-  絞れるようになるまで保留です。
+  絞れるようになるまで保留です。→ **`agent/seqpat` で解決**（後述）。
 - **安定識別子パターンの型検査そのもの**。scalac 2.13.16 は
   `case Ids.other =>`（`other: Other`、スクルーティニ `ST[Int]`）を**通します**が、
   こちらは今も `type mismatch` を出します。今回は型引数が抽象なときだけ緩めました。
+  → **`agent/seqpat` で解決**（後述）。
 - `Seq("a").map(m)`（`m: Map[String, Int]`）は `Map` が関数になっても通りません。
   適合ではなく推論（`Function2[B, …]` の `B` が未解決）の側です。
 
@@ -1715,6 +1736,7 @@ SLS 5.1.2 の「後の親が勝つ」規則により `IterableOps` の不透明�
 - **ライブラリ**: デフォルトの **`compile` / `run`** は jar が自動検出できればリンクし、同名の私有 classfile は出さない。見つからなければ私有ランタイム。`--scala-library`（パス省略時は `SCALA_LIBRARY_JAR` / `/tmp/scala-rs-lib` / cwd を探索）で明示できる。**`--no-scala-library` は私有を強制**する。jar に乗るもの: `Option` / `Some` / `None` / `List` / `Nil` / `::` / `Function0` / `Function1` / `Tuple2` / `NotImplementedError` / `Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）/ `any2stringadd` / `ArrowAssoc` の `->` / `intWrapper` / `RichInt`（`abs` / `max` / `min` / `to` / `until`）/ `longWrapper` / `RichLong`（`abs` / `max` / `min` / `to` / `until` → 本物の `NumericRange[Long]`）/ `doubleWrapper` / `RichDouble`（`abs` / `max` / `min`）/ `floatWrapper` / `RichFloat`（`abs` / `max` / `min`）/ `charWrapper` / `RichChar`（`isDigit` / `toInt` via `intValue$extension` / `to` / `until` → 本物の `NumericRange[Char]`）/ `byteWrapper` / `RichByte`（`abs` / `max` / `min` / `to` / `until` → 本物の `NumericRange[Byte]`）/ `shortWrapper` / `RichShort`（`abs` / `max` / `min` / `to` / `until` → 本物の `NumericRange[Short]`）/ `booleanWrapper` / `RichBoolean.compare`（インスタンス `compare(Object)`）/ `StringOps`（`toInt$extension` / `size$extension` / `$times$extension` / `take$extension` / `drop$extension` / `isEmpty` via `augmentString` / `toUpperCase`/`toLowerCase` inlined to `String` / `stripPrefix$extension` / `split$extension` / `stripSuffix$extension` / `padTo$extension(Int,Char)` / `linesIterator$extension` / `toIntOption$extension` / `stripMargin$extension` / `lines$extension` / `capitalize$extension` / `reverse$extension` / `slice$extension` / `takeRight$extension` / `dropRight$extension` / `contains$extension(Char)` / `head$extension` / `last$extension` / `stripLineEnd$extension` / `replaceAllLiterally$extension` / `tail$extension` / `init$extension` / `distinct$extension` / `mkString$extension`）/ `WithFilter` / `Iterator` / `Map` / `Vector` / `IndexedSeq`（unqualified `IndexedSeq(1, 2)(1)`）/ `Queue`（`scala.collection.immutable.Queue` の `enqueue` / `dequeue`）/ `ArrayBuffer`（`scala.collection.mutable.ArrayBuffer` の varargs `apply` / `+=` / `apply` / `update`）/ `ListBuffer`（`scala.collection.mutable.ListBuffer` の varargs `apply` / `+=` / `apply`）/ `StringBuilder`（`scala.collection.mutable.StringBuilder` の `new` / `+=` / `append` / `toString`）/ `HashMap`（`scala.collection.mutable.HashMap` の companion `empty` / varargs `apply` / `update` / `+=` / `apply` / `get`）/ `HashSet`（`scala.collection.mutable.HashSet` の companion `empty` / varargs `apply` / `+=` / `contains`）/ `LinkedHashMap`（`scala.collection.mutable.LinkedHashMap` の companion `empty` / varargs `apply` / `update` / `+=` / `apply` / 挿入順 `foreach`。`HashMap` は順を保証しない）/ `LinkedHashSet`（`scala.collection.mutable.LinkedHashSet` の companion `empty` / varargs `apply` / `+=` / `contains` / 挿入順 `foreach`）/ `ArrayDeque`（`scala.collection.mutable.ArrayDeque` の companion `empty` / varargs `apply` / `+=` / `prepend` / `apply`）/ `ArrayOps`（`intArrayOps` 経由の `head` / `tail` / `foreach` / `map[B: ClassTag]`。`longArrayOps` 経由の `head` / `foreach`。`refArrayOps` 経由の参照配列 `map`。私有 `ArrayOps` classfile は出さない）/ `Set` / `Seq` / `LazyList`（`empty` / `foreach` / **varargs `apply`**）/ `Either`（`Left` / `Right` と right-biased な `isLeft` / `isRight` / `map` / `flatMap` / `fold` / `getOrElse` / `orElse` / `swap` / `toOption` / `toSeq` / `contains` / `exists` / `forall` / `foreach` / `filterOrElse` / `left`。`Either$LeftProjection` classfile は出さない）/ `Try`（`Try$` / `Success` / `Failure` の `apply` と `isSuccess` / `isFailure` / `get` / `getOrElse` / `map` / `flatMap` / `filter` / `withFilter`（`Try$WithFilter`）/ `foreach` / `orElse` / `recover` / `recoverWith` / `collect` / `toOption` / `toEither` / `failed` / `transform` / `fold`）/ `Array$`（varargs `apply` + `ClassTag`）。dual-run: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector` / `int_ops` / `string_ops` / `list_apply` / `set` / `long_ops` / `seq` / `either` / `float_ops` / `string_ops2` / `anonymous` / `eta` / `try_util` / `existentials` / `existential_bounds` / `implicit_specific` / `lambda_lift` / `view_bounds` / `view_bounds_class` / `hk_types` / `app` / `delayed_init` / `implicit_inherit_local` / `partial_function` / `list_collect` / `string_interp` / `overloading` / `classtag` / `context_bounds` / `context_bounds_class` / `type_member_hk` / `refine_hk` / `refine_bound` / `nested_proj` / `type_member_bounds` / `assign_op` / `collection_converters` / `pkg_implicit_class` / `structural_update` / `indexedseq_queue` / `string_ops3` / `byte_ops` / `arraybuffer` / `string_ops4` / `numeric_range` / `listbuffer` / `string_ops5` / `short_range` / `stringbuilder` / `string_ops6` / `long_range` / `hashmap` / `string_ops7` / `char_range` / `hashset` / `string_ops8` / `array_ops2` / `linkedhashmap` / `string_ops9` / `array_ops3` / `linkedhashset` / `string_ops10` / `array_ops4` / `arraydeque` / `custom_interp` / `array_ops` / `either_ops` / `either_left` / `either_for` / `option_x1` / `option_x2` / `try_ops` / `try_recover` / `try_for`。**まだ intrinsic / 私有、または未リンク**: 残りの StringOps、残りの numeric、他の mutable コレクション。`List.unapplySeq` は library では `SeqOps` の identity。`List`/`Seq`/`LazyList`/`Array` の varargs `apply` は **library のみ**。
 - **ライブラリ**: デフォルトの **`compile` / `run`** は jar が自動検出できればリンクし、同名の私有 classfile は出さない。見つからなければ私有ランタイム。`--scala-library`（パス省略時は `SCALA_LIBRARY_JAR` / `/tmp/scala-rs-lib` / cwd を探索）で明示できる。**`--no-scala-library` は私有を強制**する。jar に乗るもの: `Option` / `Some` / `None` / `List` / `Nil` / `::` / `Function0` / `Function1` / `Tuple2` / `NotImplementedError` / `Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）/ `any2stringadd` / `ArrowAssoc` の `->` / `intWrapper` / `RichInt`（`abs` / `max` / `min` / `to` / `until` / `toBinaryString` / `toHexString` / `toOctalString` / `sign`。`Range`（`withFilter` / `filter` / `map` / `flatMap` / `foldLeft` / `foldRight` / `sum` / `product` / `min` / `max` / `toList` / `toVector` / `zipWithIndex` / `take` / `drop` など）と `scala.math`（`abs` / `max` / `min` / `signum` / `pow` / `sqrt` / `floor` / `ceil` / `round` / `random`）も乗った）/ `longWrapper` / `RichLong`（`abs` / `max` / `min` / `to` / `until` → 本物の `NumericRange[Long]`）/ `doubleWrapper` / `RichDouble`（`abs` / `max` / `min`）/ `floatWrapper` / `RichFloat`（`abs` / `max` / `min`）/ `charWrapper` / `RichChar`（`isDigit` / `toInt` via `intValue$extension` / `to` / `until` → 本物の `NumericRange[Char]`）/ `byteWrapper` / `RichByte`（`abs` / `max` / `min` / `to` / `until` → 本物の `NumericRange[Byte]`）/ `shortWrapper` / `RichShort`（`abs` / `max` / `min` / `to` / `until` → 本物の `NumericRange[Short]`）/ `booleanWrapper` / `RichBoolean.compare`（インスタンス `compare(Object)`）/ `StringOps`（`toInt$extension` / `size$extension` / `$times$extension` / `take$extension` / `drop$extension` / `isEmpty` via `augmentString` / `toUpperCase`/`toLowerCase` inlined to `String` / `stripPrefix$extension` / `split$extension` / `stripSuffix$extension` / `padTo$extension(Int,Char)` / `linesIterator$extension` / `toIntOption$extension` / `stripMargin$extension` / `lines$extension` / `capitalize$extension` / `reverse$extension` / `slice$extension` / `takeRight$extension` / `dropRight$extension` / `contains$extension(Char)` / `head$extension` / `last$extension` / `stripLineEnd$extension` / `replaceAllLiterally$extension` / `tail$extension` / `init$extension` / `distinct$extension` / `mkString$extension`）/ `WithFilter` / `Iterator` / `Map` / `Vector` / `IndexedSeq`（unqualified `IndexedSeq(1, 2)(1)`）/ `Queue`（`scala.collection.immutable.Queue` の `enqueue` / `dequeue`）/ `ArrayBuffer`（`scala.collection.mutable.ArrayBuffer` の varargs `apply` / `+=` / `apply` / `update`）/ `ListBuffer`（`scala.collection.mutable.ListBuffer` の varargs `apply` / `+=` / `apply`）/ `StringBuilder`（`scala.collection.mutable.StringBuilder` の bare 名 / `new` / `append` 全オーバーロード / `+=` / `++=` / `insert` / `deleteCharAt` / `setLength` / `reverse` / `clear` / `toString` / `result`）/ `HashMap`（`scala.collection.mutable.HashMap` の companion `empty` / varargs `apply` / `update` / `+=` / `apply` / `get`）/ `HashSet`（`scala.collection.mutable.HashSet` の companion `empty` / varargs `apply` / `+=` / `contains`）/ `LinkedHashMap`（`scala.collection.mutable.LinkedHashMap` の companion `empty` / varargs `apply` / `update` / `+=` / `apply` / 挿入順 `foreach`。`HashMap` は順を保証しない）/ `LinkedHashSet`（`scala.collection.mutable.LinkedHashSet` の companion `empty` / varargs `apply` / `+=` / `contains` / 挿入順 `foreach`）/ `ArrayDeque`（`scala.collection.mutable.ArrayDeque` の companion `empty` / varargs `apply` / `+=` / `prepend` / `apply`）/ `ArrayOps`（`intArrayOps` 経由の `head` / `tail` / `foreach` / `map[B: ClassTag]`。`longArrayOps` 経由の `head` / `foreach`。`refArrayOps` 経由の参照配列 `map`。私有 `ArrayOps` classfile は出さない）/ `Set` / `Seq` / `LazyList`（`empty` / `foreach` / **varargs `apply`**）/ `Either`（`Left` / `Right` / `isLeft` / `getOrElse` / `map`）/ `Try`（`Try$` / `Success` / `Failure` の `apply` / `map` / `getOrElse`）/ `Array$`（varargs `apply` + `ClassTag`）。dual-run: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector` / `int_ops` / `string_ops` / `list_apply` / `set` / `long_ops` / `seq` / `either` / `float_ops` / `string_ops2` / `anonymous` / `eta` / `try_util` / `existentials` / `existential_bounds` / `implicit_specific` / `lambda_lift` / `view_bounds` / `view_bounds_class` / `hk_types` / `app` / `delayed_init` / `implicit_inherit_local` / `partial_function` / `list_collect` / `string_interp` / `overloading` / `classtag` / `context_bounds` / `context_bounds_class` / `type_member_hk` / `refine_hk` / `refine_bound` / `nested_proj` / `type_member_bounds` / `assign_op` / `collection_converters` / `pkg_implicit_class` / `structural_update` / `indexedseq_queue` / `string_ops3` / `byte_ops` / `arraybuffer` / `string_ops4` / `numeric_range` / `listbuffer` / `string_ops5` / `short_range` / `stringbuilder` / `string_ops6` / `long_range` / `hashmap` / `string_ops7` / `char_range` / `hashset` / `string_ops8` / `array_ops2` / `linkedhashmap` / `string_ops9` / `array_ops3` / `linkedhashset` / `string_ops10` / `array_ops4` / `arraydeque` / `custom_interp` / `array_ops`。**まだ intrinsic / 私有、または未リンク**: 残りの StringOps、残りの numeric、他の mutable コレクション。`List.unapplySeq` は library では `SeqOps` の identity。`List`/`Seq`/`LazyList`/`Array` の varargs `apply` は **library のみ**。
 - **ライブラリ**: デフォルトの **`compile` / `run`** は jar が自動検出できればリンクし、同名の私有 classfile は出さない。見つからなければ私有ランタイム。`--scala-library`（パス省略時は `SCALA_LIBRARY_JAR` / `/tmp/scala-rs-lib` / cwd を探索）で明示できる。**`--no-scala-library` は私有を強制**する。jar に乗るもの: `Option` / `Some` / `None` / `List` / `Nil` / `::` / `Function0` / `Function1` / `Tuple2`（`_1` / `_2` に加え `swap` / `toString`）/ `NotImplementedError` / `Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）/ `any2stringadd` / `ArrowAssoc` の `->` / `intWrapper` / `RichInt`（`abs` / `max` / `min` / `to` / `until`）/ `longWrapper` / `RichLong`（`abs` / `max` / `min` / `to` / `until` → 本物の `NumericRange[Long]`）/ `doubleWrapper` / `RichDouble`（`abs` / `max` / `min`）/ `floatWrapper` / `RichFloat`（`abs` / `max` / `min`）/ `charWrapper` / `RichChar`（`isDigit` / `toInt` via `intValue$extension` / `to` / `until` → 本物の `NumericRange[Char]`）/ `byteWrapper` / `RichByte`（`abs` / `max` / `min` / `to` / `until` → 本物の `NumericRange[Byte]`）/ `shortWrapper` / `RichShort`（`abs` / `max` / `min` / `to` / `until` → 本物の `NumericRange[Short]`）/ `booleanWrapper` / `RichBoolean.compare`（インスタンス `compare(Object)`）/ `StringOps`（`toInt$extension` / `size$extension` / `$times$extension` / `take$extension` / `drop$extension` / `isEmpty` via `augmentString` / `toUpperCase`/`toLowerCase` inlined to `String` / `stripPrefix$extension` / `split$extension` / `stripSuffix$extension` / `padTo$extension(Int,Char)` / `linesIterator$extension` / `toIntOption$extension` / `stripMargin$extension` / `lines$extension` / `capitalize$extension` / `reverse$extension` / `slice$extension` / `takeRight$extension` / `dropRight$extension` / `contains$extension(Char)` / `head$extension` / `last$extension` / `stripLineEnd$extension` / `replaceAllLiterally$extension` / `tail$extension` / `init$extension` / `distinct$extension` / `mkString$extension`）/ `WithFilter` / `Iterator` / `Map`（`apply` / `get` / `updated` / `+` / `foreach` に加え `getOrElse` / `contains` / `keys` / `values` / `keySet` / `-` / `size` / `isEmpty` / `nonEmpty` / `filter` / `toList` / `toSeq` / `iterator` / `mkString` / `head` / `foldLeft` / `withDefaultValue` / `view` / `MapView.mapValues`）/ `Vector`（`apply` / `length` / `updated` / `:+` / `foreach` に加え `size` / `isEmpty` / `nonEmpty` / `head` / `map` / `filter` / `toList` / `toSeq` / `iterator` / `mkString` / `foldLeft`）/ `IndexedSeq`（unqualified `IndexedSeq(1, 2)(1)`）/ `Queue`（`scala.collection.immutable.Queue` の `enqueue` / `dequeue`）/ `ArrayBuffer`（`scala.collection.mutable.ArrayBuffer` の varargs `apply` / `+=` / `apply` / `update` / `length` / `size` / `isEmpty` / `nonEmpty` / `head` / `last` / `mkString`(0/1/3) / `foreach` / `map` / `filter` / `toList` / `iterator` / `clear` / `remove` / `insert` / `contains` / `indexOf` / `reverse` / `foldLeft` / `append` / `++=` / `-=` / `sortBy` / `sorted`）/ `ListBuffer`（`scala.collection.mutable.ListBuffer` の同じメンバー一式）/ 新規 `mutable.Map[K, V]` と `mutable.Set[A]`（従来は `HashMap` / `HashSet` のみ乗っていた。`Map$` / `Set$` companion は `MapFactory$Delegate` / `IterableFactory$Delegate` 経由で `HashMap` / `HashSet` に実行時委譲するが静的型はトレイトのまま。`mutable.Map` は `apply` / `get` / `update` / `getOrElse` / `getOrElseUpdate` / `contains` / `keys` / `values` / `+=` / `-=` / `remove` / `size` / `isEmpty` / `nonEmpty` / `clear` / `foreach` / `filter` / `toList` / `toSeq` / `iterator` / `mkString`、`mutable.Set` は `contains` / `+=` / `-=` / `remove` / `size` / `isEmpty` / `nonEmpty` / `clear` / `foreach` / `map` / `filter` / `toList` / `toSeq` / `iterator` / `mkString`）/ `StringBuilder`（`scala.collection.mutable.StringBuilder` の `new` / `+=` / `append` / `toString`）/ `HashMap`（`scala.collection.mutable.HashMap` の companion `empty` / varargs `apply` / `update` / `+=` / `apply` / `get`）/ `HashSet`（`scala.collection.mutable.HashSet` の companion `empty` / varargs `apply` / `+=` / `contains`）/ `LinkedHashMap`（`scala.collection.mutable.LinkedHashMap` の companion `empty` / varargs `apply` / `update` / `+=` / `apply` / 挿入順 `foreach`。`HashMap` は順を保証しない）/ `LinkedHashSet`（`scala.collection.mutable.LinkedHashSet` の companion `empty` / varargs `apply` / `+=` / `contains` / 挿入順 `foreach`）/ `ArrayDeque`（`scala.collection.mutable.ArrayDeque` の companion `empty` / varargs `apply` / `+=` / `prepend` / `apply`）/ `ArrayOps`（`intArrayOps` 経由の `head` / `tail` / `foreach` / `map[B: ClassTag]`。`longArrayOps` 経由の `head` / `foreach`。`refArrayOps` 経由の参照配列 `map`。私有 `ArrayOps` classfile は出さない）/ `Set`（`contains` / `foreach` に加え `+` / `-` / `++` / `size` / `isEmpty` / `nonEmpty` / `filter` / `map` / `toList` / `toSeq` / `iterator` / `mkString` / `head`）/ `Seq` / `LazyList`（`empty` / `foreach` / **varargs `apply`**）/ `Either`（`Left` / `Right` / `isLeft` / `getOrElse` / `map`）/ `Try`（`Try$` / `Success` / `Failure` の `apply` / `map` / `getOrElse`）/ `Array$`（varargs `apply` + `ClassTag`）。dual-run: `hello` / `option_for` / `list_for` / `predef` / `predef_more` / `unapply` / `unapply_seq` / `iterator` / `map` / `vector` / `int_ops` / `string_ops` / `list_apply` / `set` / `long_ops` / `seq` / `either` / `float_ops` / `string_ops2` / `anonymous` / `eta` / `try_util` / `existentials` / `existential_bounds` / `implicit_specific` / `lambda_lift` / `view_bounds` / `view_bounds_class` / `hk_types` / `app` / `delayed_init` / `implicit_inherit_local` / `partial_function` / `list_collect` / `string_interp` / `overloading` / `classtag` / `context_bounds` / `context_bounds_class` / `type_member_hk` / `refine_hk` / `refine_bound` / `nested_proj` / `type_member_bounds` / `assign_op` / `collection_converters` / `pkg_implicit_class` / `structural_update` / `indexedseq_queue` / `string_ops3` / `byte_ops` / `arraybuffer` / `string_ops4` / `numeric_range` / `listbuffer` / `string_ops5` / `short_range` / `stringbuilder` / `string_ops6` / `long_range` / `hashmap` / `string_ops7` / `char_range` / `hashset` / `string_ops8` / `array_ops2` / `linkedhashmap` / `string_ops9` / `array_ops3` / `linkedhashset` / `string_ops10` / `array_ops4` / `arraydeque` / `custom_interp` / `array_ops`。**まだ intrinsic / 私有、または未リンク**: 残りの StringOps、残りの numeric、他の mutable コレクション。`List.unapplySeq` は library では `SeqOps` の identity。`List`/`Seq`/`LazyList`/`Array` の varargs `apply` は **library のみ**。
+- **ライブラリ（`agent/seqpat` の追加分）**: `Seq$` / `Vector$` / `IndexedSeq$` の `unapplySeq`（実体は identity。読み出しは `scala/collection/SeqFactory$UnapplySeqWrapper$` の `lengthCompare$extension` / `apply$extension` / `drop$extension`）と `Array$.unapplySeq`（`scala/Array$UnapplySeqWrapper$` の同名 extension）。`StringOps.map` は 2 本になり、`Char => Char` が `map$extension(String, Function1)String`、それ以外が `map$extension(String, Function1)IndexedSeq`。いずれも **library のみ**で、`--no-scala-library` では診断する。dual-run: `seqpat` / `seqpat_map` / `seqpat_ids`（`seqpat_ids` は私有ランタイムでも同じ出力）。
 - **object**: scalac と同様、`Main$`（モジュール）と静的フォワーダ `Main` を出します。`java Main` が動くのはそのためです。
 - **プリミティブ**: `Int` の `+` などは `scala.Int` のボックスメソッドではなく、JVM 命令（`iadd` など）として出します。
 - **trait**: 抽象メンバーだけの trait は JVM interface です。具象メンバーは `T$class` 静的実装と、C3 線形化順のインスタンスフォワーダです。Java 8 default method は使いません。`val` は getter/setter + `$init$` です。`abstract override` は `T$$super$m` です。
@@ -1725,7 +1747,7 @@ SLS 5.1.2 の「後の親が勝つ」規則により `IterableOps` の不透明�
 - **sealed**: 非網羅 match は scalac と同様 warning です。`-Xfatal-warnings` でエラーになります。
 - **AnyVal**: scalac は値クラスのクラスファイルと拡張メソッドの両方を出します。scala-rs も同じで、`new C(x)` は underlying に消え、呼び出しは `$extension` 静的メソッドです。参照が要る位置（`Any` / universal trait / 型引数 / 配列要素）では nsc と同じく `new C(u)` で box し、`equals` / `hashCode` も underlying から合成します。違いは `$extension` の本体の置き場所で、nsc はコンパニオン `C$` に置いてクラス側をフォワーダにしますが、scala-rs はクラス側に直接出します。
 - **Predef / StringOps**: 私有では `assert` / `require` / `???` / `->`（`Tuple2` 直結）/ `identity` / `locally` / `implicitly` / `any2stringadd` と String の `length`/`toInt`/`isEmpty`。library では `Predef$.println/assert/require/???/identity/locally/implicitly`、`any2stringadd.$plus$extension`、`ArrowAssoc.$minus$greater$extension`、`intWrapper` → `RichInt.abs$extension` / `max$extension` / `to$extension` / `until$extension`、`longWrapper` → `RichLong.abs$extension` / `max$extension` / `to` / `until`（`NumericRange$.inclusive` / `apply` + `Numeric$LongIsIntegral$`）、`doubleWrapper` → `RichDouble.abs$extension` / `max$extension`、`floatWrapper` → `RichFloat.abs$extension` / `max$extension`、`charWrapper` → `RichChar.isDigit$extension` / `intValue$extension`（`.toInt`）/ `to` / `until`（`NumericRange$.inclusive` / `apply` + `Numeric$CharIsIntegral$`）、`byteWrapper` → `RichByte.abs$extension` / `max$extension` / `to` / `until`（`NumericRange$.inclusive` / `apply` + `Numeric$ByteIsIntegral$`）、`shortWrapper` → `RichShort.max$extension` / `to` / `until`（`NumericRange$.inclusive` / `apply` + `Numeric$ShortIsIntegral$`）、`booleanWrapper` → `RichBoolean.compare(Object)`、`augmentString` → `StringOps.toInt$extension` / `size$extension`（`.length`）/ `$times$extension` / `take$extension` / `drop$extension` / `stripPrefix$extension` / `split$extension` / `stripSuffix$extension` / `padTo$extension`（`Int, Char`）/ `linesIterator$extension` / `toIntOption$extension` / `stripMargin$extension` / `lines$extension` / `capitalize$extension` / `reverse$extension` / `slice$extension` / `takeRight$extension` / `dropRight$extension` / `contains$extension`（`.isEmpty` / `.toUpperCase` / `.toLowerCase` は StringOps 経由で `String` にインライン。`startsWith` / `endsWith` / `indexOf` は nsc どおり `java.lang.String`。`head$extension` / `last$extension` / `stripLineEnd$extension` / `replaceAllLiterally$extension` / `tail$extension` / `init$extension` / `distinct$extension` / `mkString$extension` / `filter$extension` / `reverseIterator$extension`）。`intArrayOps` → `ArrayOps.head$extension` / `tail$extension` / `foreach$extension(Object,Function1)V` / `map$extension(Object,Function1,ClassTag)Object`。`longArrayOps` → 同じ `head` / `foreach`（`[J]`）。`refArrayOps` → 参照配列の `map`。**`StringOps` / `ArrayOps` / `RichInt` / `RichLong` / `RichDouble` / `RichFloat` / `RichChar` / `RichByte` / `RichShort` / `RichBoolean` / `ArrayBuffer` / `ListBuffer` / `StringBuilder` / `HashMap` / `HashSet` / `LinkedHashMap` / `LinkedHashSet` / `ArrayDeque` / `NumericRange` classfile は出していません。**
-- **unapplySeq**: `List` とユーザー定義 extractor、`_*`、名前付き case class パターン。library リンク時の `List.unapplySeq` は `SeqOps` 戻り。
+- **unapplySeq**: `List` / `Seq` / `Vector` / `IndexedSeq` / `Array` とユーザー定義 extractor、`_*`、名前付き case class パターン。library リンク時の `List.unapplySeq` は `SeqOps` 戻りで、`List` 以外は nsc と同じく `UnapplySeqWrapper` の `$extension` で添字読みします。`Seq` / `Array` のシーケンスパターンは jar リンク時のみ（`--no-scala-library` では診断する）。
 
 scalac の代替ではありません。サブセットの再実装です。
 
@@ -2276,34 +2298,144 @@ implicit-only 型パラメータの両方に nsc と同じ趣旨の診断が出�
 
 計測は `files=184 errors=833 files_with_errors=102` → `errors=777 files_with_errors=93`。
 
+### シーケンスパターン / `StringOps.map` / 安定識別子パターン（`agent/seqpat`）
+
+`case Seq(a, b)` が使えず、`StringOps.map` が 1 つしか無く、安定識別子パターンが
+nsc より厳しかった 3 件を片付けたスライスです。フィクスチャは
+`tests/fixtures/seqpat.scala` / `seqpat_map.scala` / `seqpat_ids.scala`
+（いずれも実 scalac 2.13.16 と stdout がバイト一致）と、拒否側の
+`seqpat_bad.scala` / `seqpat_star_bad.scala` / `seqpat_nolib_bad.scala`。
+テストは `crates/cli/tests/seqpat.rs` です。
+
+**1. `unapplySeq` を持つのが `List` のコンパニオンだけだった。**
+`Seq` / `Vector` / `IndexedSeq` / `Array` のコンパニオンに
+`unapplySeq[A](x: CC[A]): Option[Seq[A]]` を足しました
+（`crates/typer/src/prelude_seqpat.rs`）。codegen 側は
+`gen_unapply_seq_bind`（`checkcast List` から始まる **List 専用**の head/tail
+walk）に加えて `gen_unapply_wrapper_bind` を持ち、`SeqPatShape` で
+`scala/collection/SeqFactory$UnapplySeqWrapper$` と
+`scala/Array$UnapplySeqWrapper$` を切り替えます。実 scalac の `javap -p -c` と
+同じ `lengthCompare$extension` / `apply$extension` / `drop$extension` を呼ぶので、
+`Vector` を `Seq` として渡しても、`"abc".map(_.toString)` が返す `ArraySeq` を
+`case Seq(a, b, c)` で受けても落ちません。
+
+なお、README が「`case List(a, b, rest @ _*)` は main でも `VerifyError` を出す」
+としていた件は、**その後の `41d4bca`（extractor の checkcast）で既に直っていました**。
+`seqpat.scala` の `listShape` / `caseElems` で固定してあります。
+
+**1b. ついでに見つかった 2 つの黙って壊れていたもの。**
+
+- **`Any` のスクルーティニ**。`case Seq(a, b)` / `case List(a, b)` /
+  `case Array(a, b)` を `Any` に対して書くと、型テストなしで
+  `checkcast` / wrapper の extension に入っていました
+  （`ClassCastException` / `IllegalArgumentException: Argument is not an
+  array`）。scalac と同じく `instanceof`（`Array` は
+  `ScalaRunTime.isArray(Object, 1)`）を先に出し、静的型がすでに保証している
+  ときだけ省きます。
+- **`_: T` の部分パターン**。`case List((s, _: TableNode))` は、要素を束ねる
+  前に `checkcast TableNode` を出していたので、**マッチしない値が例外に
+  なっていました**（次の case に落ちない）。型アスクリプションは *テスト* で
+  あって cast ではないので、`gen_pattern` の `instanceof` に任せます
+  （`is_type_test_pat`）。case class のコンストラクタパターン
+  （`case Some((s, _: TableNode))`）にも同じ穴がありました。
+
+**2. `StringOps.map` の 2 つのオーバーロード。** 2.13 の `StringOps` は
+`map(Char => Char): String` と `map[B](Char => B): IndexedSeq[B]` を持ち、
+JVM descriptor は戻り型だけが違います（`javap -s` で確認）。prelude にも
+**2 つのシンボル**として持たせるのが正しく（`crates/typer/src/prelude_strmap.rs`）、
+1 つに畳むと `value_extension_desc` がシンボルの結果型から descriptor を作るため
+`Char => Char` のときにも `IndexedSeq` を返す方を呼んでしまいます。
+2 つ並べたときに `ambiguous overload` になっていた原因は、オーバーロード解決の
+3 か所でした:
+
+- `is_as_specific_method` が相手の型パラメータを未確定として扱っていなかった。
+  `map[B](Char => B)` の `B` を `Char` に決められないと、どちらも
+  「相手と同じくらい specific」になります。
+- 逆向きに、自分の型パラメータが**剛体**でなかった。`Char => B` の `B` は
+  `Char` ではないので、上界（既定は `Any`）に置き換えてから比べます。
+- `arg_score` が「パラメータの形が合えば関数型どうしは一致」と採点していた。
+  これは結果型がまだ無いラムダのための緩和なので、**両辺が確定している**
+  ときだけ本当の適合を要求するようにしました（`Unit` / `Any` パラメータの
+  value discarding と、数値拡大は従来どおり）。
+
+さらに nsc の `Infer.pretypeArgs` を入れました。どのオーバーロード候補も同じ
+関数パラメータ型を要求するなら、解決の前にラムダを型付けできます。これが無いと
+`"abc".map(_.toString)` は `(<notype>) => <notype>` のまま両方に applicable で、
+より specific な `Char => Char` 版が誤って勝ちます。
+
+**3. 安定識別子パターンの型検査。** nsc は適合ではなく
+**同時に住めること**しか要求しません。開いたクラスどうしは常に住めるので
+`case Ids.other =>`（`Other`）を `ST[Int]` のスクルーティニに書けます。
+`final` なクラス（`String`、値クラス、配列、object）とプリミティブだけが
+排除の根拠で、そこは scalac も `type mismatch` を出します
+（`stable_pattern_compatible` / `is_final_like`）。
+
+**おまけ: `final` / `abstract` / `sealed` がパーサに落ちていた。** クラスの
+省略可能なコンストラクタ修飾子（`class C private (x: Int)`）を読む
+`parse_modifiers` は改行を読み飛ばすので、`class Other` の直後に来る
+**次の定義の修飾子を食べていました**。ファイル中 2 つ目以降のクラスの
+`final` / `abstract` / `sealed` / `implicit` が全部消えていたということです
+（`FinalOther` が final でないので 3 の判定も効きませんでした）。
+コンストラクタ修飾子はクラス名と同じ行にあるので、**改行を読み飛ばす前に**
+`private` / `protected` / `@` が来ているかだけを見るようにしました。
+
+| `seqpat.scala`（library dual-run） | `Seq` / `List` / `Vector` / `IndexedSeq` / `Array` のシーケンスパターン（固定長・`_*`・入れ子・タプル要素・case class 要素）、`ArraySeq` を `Seq` で受ける形、`Any` スクルーティニ、`_: T` の部分パターン | `empty` `one 1` `two 3` `many 3 2` `xyz\|w` `q` `ab` `a2` `24` `3` `3` `xy\|z` `4` `k7` `5` `abc` `arr 12` `seq 12` `seq 12` `lst 9` `?` `?` `table a` `plain a` `table b` `plain b` `table c` `plain c` |
+| `seqpat_map.scala`（library dual-run） | `StringOps.map` の 2 つのオーバーロード（`Char => Char` は `String`、それ以外は `IndexedSeq[B]`） | `Ab` `ABC` `ArraySeq(a, b, c)` `ArraySeq(97, 98, 99)` `a-b` `abc` `3` `false,false,true,true,false` |
+| `seqpat_ids.scala`（library + 私有ランタイム dual-run） | 安定識別子パターン（無関係なクラス／trait／`Any` のスクルーティニ）と、クラスの後に続く定義の修飾子 | `st` `?` `tr` `?` `other` `?` `7` `true` `true` |
+
+拒否側は `seqpat_bad.scala`（`final` クラス／`String`／プリミティブが絡む 5 件。
+実 scalac 2.13.16 も同じ 5 件を出します）、`seqpat_star_bad.scala`（`_*` が
+最後でない）、`seqpat_nolib_bad.scala`（`--no-scala-library` での
+`case Array(…)` は診断）です。最小形の受理テストも `seqpat.rs` に置いてあります
+（`a_seq_pattern_binds_the_scrutinees_element_type` /
+`a_star_pattern_takes_the_extractors_own_container` /
+`a_user_unapply_seq_is_untouched` /
+`string_ops_map_picks_the_alternative_by_the_literals_result` /
+`a_stable_id_pattern_only_has_to_be_inhabitable` /
+`modifiers_after_a_class_are_not_swallowed` /
+`a_constructor_access_modifier_still_parses`）。
+
+計測は `files=184 errors=620 files_with_errors=87` → **変わらず
+`errors=620 files_with_errors=87`**（エラーの多重集合が 1 件も動きません）。
+slick 側の `case Seq((s, _: TableNode))`（`JdbcStatementBuilderComponent.scala`
+164-165 行）はまだ `found: A required: TermSymbol` のままです。同じ形を単体で
+書くと通る（`crates/cli/tests/seqpat.rs` の
+`a_seq_pattern_binds_the_scrutinees_element_type`）ので、slick の側は
+**同じファイルの別のエラーのカスケード**です。そのすぐ下の
+`currentUniqueFrom = from match { … }` には別の（main から続く）穴があり、
+下の Remaining に書きました。
+
 ### Remaining
 
-- **`case Seq(a, b)` が使えない**（`agent/mismatch4` で原因まで特定、未修正）。
-  `unapplySeq` を持つのは prelude の `List` だけなので、`case Seq((s, _))` は
-  `type_pattern` の「クラスパターン」枝に落ちて要素型が付かず、
-  `Some(s)` が `Some[A]`（extractor 自身の型パラメータ）になります。
-  prelude に `Seq.unapplySeq` を足すのは簡単ですが、codegen の
-  `gen_unapply_seq_bind` は `checkcast scala/collection/immutable/List` から
-  始まる **List 専用**なので、`Vector` を `Seq` として渡すと実行時に落ちます。
-  `SeqOps.length` / `apply(I)` を使う版か `toList` の挿入が要ります。
-  ついでに `case List(a, b, rest @ _*)` の codegen は **main でも**
-  `VerifyError: Bad type on operand stack` を出します（星付きパターンの前の
-  要素を束ねるローカルに checkcast が出ていない）。
+- **`scala.collection.immutable.ArraySeq` / `mutable.ArraySeq` を名指しした
+  シーケンスパターン**（`case ArraySeq(a, b)`）。`agent/seqpat` で
+  `Seq` / `Vector` / `IndexedSeq` / `Array` のコンパニオンには `unapplySeq` を
+  足しましたが、`ArraySeq` のコンパニオンは prelude にありません。`ArraySeq` の
+  値を `case Seq(a, b)` で受けるのは動きます（実行時に添字で読むので、
+  `"abc".map(_.toString)` の戻り値でも落ちません）。足すときは
+  `prelude_seqpat.rs` の `SEQ_FACTORY_MODULES` と `gen.rs` の
+  `SEQPAT_SEQOPS_MODULES` の**両方**に JVM 名を書きます。
 
-- **`StringOps.map[B](f: Char => B): IndexedSeq[B]` が無い**
-  （`agent/mismatch4` で原因まで特定、未修正）。`"…".map(_.toString)` は
-  `found: String  required: Char` になります。2.13 の `StringOps` は
-  `map(Char => Char): String` と 2 つのオーバーロードを持ちますが、prelude に
-  2 つ並べるとリテラルの結果型が決まる前に `ambiguous overload` になり、
-  1 つ（多相な方）に畳むと erasure が Apply の結果型を symbol から取り直すため
-  codegen が `IndexedSeq` を返す `map$extension` を呼びます（実行時に
-  `ClassCastException`）。オーバーロード解決が「関数リテラルの結果型で候補を
-  絞る」nsc の順序を持てるようになるまで保留です。
+- **抽象クラスの `new` が診断されない**（`agent/seqpat` で気づいた、未修正）。
+  `abstract class A { def n: Int }` に対する `new A` を通してしまいます
+  （nsc は `class A is abstract; cannot be instantiated`）。修飾子が
+  パーサから落ちていた件を直したので `Flags::ABSTRACT` は正しく載るように
+  なりましたが、`new` 側の検査はまだありません。
 
-- **安定識別子パターンの型検査**（`agent/mismatch4` で確認、未修正）。
-  scalac 2.13.16 は `case Ids.other =>`（`other: Other`、スクルーティニ
-  `ST[Int]`）を**通します**が、こちらは `type mismatch` を出します。
-  第 4 スライスでは型引数が抽象なときだけ緩めました。
+- **`match` の結果をフィールドに入れると `VerifyError`**（`agent/seqpat` で
+  気づいた、main からある、未修正）。分岐が `Some[T]` と `None$` のように
+  別クラスを積むと、こちらが出す `StackMapTable` の合流型が
+  `java/lang/Object` になり、`putfield Lscala/Option;` に checkcast が
+  付きません（`Bad type on operand stack`）。合流型を最小共通上位クラスに
+  するか、`gen_match` の後に静的型への checkcast を出すかのどちらかです。
+  `areturn` や引数渡しも同じはずです。slick の
+  `currentUniqueFrom = from match { case Seq((s, _)) => Some(s); case _ => None }`
+  がまさにこの形です。
+
+- **オーバーロード解決の specificity で、自分の型パラメータを上界に潰している**
+  （`agent/seqpat`）。nsc は skolem を作りますが、こちらは `bound_hi`（既定
+  `Any`）で置き換えます。`def f[T <: A](x: T)` と `def f(x: B)` のような、
+  上界が効く形では nsc と結論が変わりうるはずです。slick では出ていません。
 
 - **`Seq.toArray` / `Seq.zipWithIndex` が、あるファイルを一緒にコンパイルすると
   消去されたシグネチャに化ける**（`agent/impltail` で原因まで特定、未修正）。

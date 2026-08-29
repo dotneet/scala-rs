@@ -7635,6 +7635,12 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
             return;
         } else if name == "unapplySeq" && is_list_module_owner(&owner) {
             desc = "(Lscala/collection/SeqOps;)Lscala/collection/SeqOps;".into();
+        } else if name == "unapplySeq" && SEQPAT_SEQOPS_MODULES.contains(&owner.as_str()) {
+            // `SeqFactory.unapplySeq` is identity; the mixin forwarder on each
+            // companion has the `SeqOps` descriptor, not the prelude `Option`.
+            desc = "(Lscala/collection/SeqOps;)Lscala/collection/SeqOps;".into();
+        } else if name == "unapplySeq" && owner == SEQPAT_ARRAY_MODULE {
+            desc = "(Ljava/lang/Object;)Ljava/lang/Object;".into();
         }
         if is_stdlib_map_module(&owner) {
             match name {
@@ -10546,6 +10552,58 @@ fn is_list_module_owner(owner: &str) -> bool {
     owner == "scala/collection/immutable/List$"
 }
 
+/// How a sequence pattern reads its elements back out.
+///
+/// scalac wraps the `unapplySeq` result in a value class and calls
+/// `lengthCompare$extension` / `apply$extension` / `drop$extension` on it. The
+/// wrapper differs for arrays (`scala.Array$UnapplySeqWrapper$`, taking
+/// `Object`) and for every `SeqFactory`
+/// (`scala.collection.SeqFactory$UnapplySeqWrapper$`, taking `SeqOps`).
+/// `List` keeps its own head/tail walk, which the private runtime can back too.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SeqPatShape {
+    /// `List.unapplySeq`, and any user extractor returning `Option[List[T]]`.
+    List,
+    /// `Seq` / `Vector` / `IndexedSeq` companions.
+    SeqOps,
+    /// `scala.Array`.
+    Array,
+}
+
+fn seq_pat_shape(st: &SymbolTable, uid: SymbolId) -> SeqPatShape {
+    let owner = class_internal(st, st.get(uid).owner);
+    if owner == SEQPAT_ARRAY_MODULE {
+        return SeqPatShape::Array;
+    }
+    if SEQPAT_SEQOPS_MODULES.contains(&owner.as_str()) {
+        return SeqPatShape::SeqOps;
+    }
+    SeqPatShape::List
+}
+
+/// Kept in step with `prelude_seqpat::SEQ_FACTORY_MODULES` in the typer;
+/// a companion listed there but not here would fall back to the `List` walk
+/// and `checkcast` a `Vector` to a `List` at runtime.
+const SEQPAT_SEQOPS_MODULES: &[&str] = &[
+    "scala/collection/immutable/Seq$",
+    "scala/collection/immutable/Vector$",
+    "scala/collection/immutable/IndexedSeq$",
+];
+const SEQPAT_ARRAY_MODULE: &str = "scala/Array$";
+
+/// The class a `Seq` / `Vector` / `IndexedSeq` pattern tests and casts to: the
+/// extractor's own parameter class, which is what scalac names too.
+fn seq_pat_test_class(ctx: &EmitCtx, param0: Option<&Type>) -> String {
+    let name = param0.map(|p| type_jvm_name(ctx.st, p)).unwrap_or_default();
+    if name.is_empty() || name == "java/lang/Object" {
+        return "scala/collection/SeqOps".into();
+    }
+    name
+}
+
+const SEQOPS_WRAPPER: &str = "scala/collection/SeqFactory$UnapplySeqWrapper$";
+const ARRAY_WRAPPER: &str = "scala/Array$UnapplySeqWrapper$";
+
 fn is_stdlib_map(owner: &str) -> bool {
     matches!(
         owner,
@@ -13248,12 +13306,67 @@ fn gen_unapply_pattern(
     } else {
         ctx.st.get(uid).owner
     };
+    let is_seq = !uid.is_none() && ctx.st.get(uid).name == "unapplySeq";
+    let shape = if uid.is_none() {
+        SeqPatShape::List
+    } else {
+        seq_pat_shape(ctx.st, uid)
+    };
+    // `case Seq(a, b)` against an `Any` scrutinee has to *test* first: the
+    // wrapper's extension methods throw on anything that is not a sequence
+    // (`Array$UnapplySeqWrapper$.lengthCompare$extension` reflects on the
+    // argument). scalac emits `instanceof` / `ScalaRunTime.isArray` for the
+    // same reason, and only when the static type does not already say so.
+    if is_seq && sel_sort == JvmSort::Ref {
+        let known = match shape {
+            // `is_sub_type` is lenient about an `Array[A]` whose element is a
+            // bare type parameter; only a scrutinee that already *is* an array
+            // may skip the test.
+            SeqPatShape::Array => matches!(pat.ty, Type::Array(_)),
+            _ => param0
+                .as_ref()
+                .is_some_and(|p| ctx.st.is_sub_type(&pat.ty, p)),
+        };
+        if !known {
+            match shape {
+                // `Array$` only exists with the jar, so this arm is only
+                // reachable there; the private runtime never sees it.
+                SeqPatShape::Array => {
+                    if ctx.library_abi {
+                        asm.getstatic(
+                            "scala/runtime/ScalaRunTime$",
+                            "MODULE$",
+                            "Lscala/runtime/ScalaRunTime$;",
+                        );
+                        load(asm, tmp, sel_sort);
+                        asm.iconst(1);
+                        asm.invokevirtual(
+                            "scala/runtime/ScalaRunTime$",
+                            "isArray",
+                            "(Ljava/lang/Object;I)Z",
+                        );
+                        asm.ifeq(fail);
+                    }
+                }
+                SeqPatShape::List | SeqPatShape::SeqOps => {
+                    load(asm, tmp, sel_sort);
+                    asm.instanceof(&seq_pat_test_class(ctx, param0.as_ref()));
+                    asm.ifeq(fail);
+                }
+            }
+        }
+    }
     if !owner.is_none() && !is_module_class(ctx.st, owner) {
         gen_expr(asm, frame, ctx, fun);
     } else {
         gen_receiver(asm, frame, ctx, fun);
     }
     load(asm, tmp, sel_sort);
+    if is_seq && ctx.library_abi && shape == SeqPatShape::SeqOps {
+        // The forwarder's parameter is `SeqOps`; the scrutinee's static type
+        // may be anything the test above let through.
+        asm.checkcast(&seq_pat_test_class(ctx, param0.as_ref()));
+    }
     if let Some(p) = &param0 {
         if !is_jvm_primitive(p) && sel_sort != JvmSort::Ref && sel_sort != JvmSort::Void {
             let pty = match sel_sort {
@@ -13277,11 +13390,23 @@ fn gen_unapply_pattern(
         asm.ifeq(fail);
         return;
     }
-    let is_seq = ctx.st.get(uid).name == "unapplySeq";
-    if is_seq && ctx.library_abi && is_list_unapply_seq(ctx.st, uid) {
-        // scala-library `List.unapplySeq` is identity on SeqOps, not Option.
-        gen_unapply_seq_bind(asm, frame, ctx, args, fail);
-        return;
+    if is_seq && ctx.library_abi {
+        match shape {
+            // scala-library `List.unapplySeq` is identity on SeqOps, not Option.
+            SeqPatShape::List if is_list_unapply_seq(ctx.st, uid) => {
+                gen_unapply_seq_bind(asm, frame, ctx, args, fail);
+                return;
+            }
+            SeqPatShape::SeqOps => {
+                gen_unapply_wrapper_bind(asm, frame, ctx, args, fail, SeqPatShape::SeqOps);
+                return;
+            }
+            SeqPatShape::Array => {
+                gen_unapply_wrapper_bind(asm, frame, ctx, args, fail, SeqPatShape::Array);
+                return;
+            }
+            SeqPatShape::List => {}
+        }
     }
     asm.dup();
     asm.invokevirtual("scala/Option", "isEmpty", "()Z");
@@ -13291,7 +13416,6 @@ fn gen_unapply_pattern(
     asm.goto(fail);
     asm.mark(nonempty);
     asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
-    let is_seq = ctx.st.get(uid).name == "unapplySeq";
     if is_seq {
         gen_unapply_seq_bind(asm, frame, ctx, args, fail);
         return;
@@ -13300,7 +13424,7 @@ fn gen_unapply_pattern(
         if let Some(a) = args.first() {
             if is_jvm_primitive(&a.ty) {
                 emit_unbox(asm, &a.ty);
-            } else {
+            } else if !is_type_test_pat(a) {
                 emit_pattern_cast(asm, ctx, &a.ty);
             }
             bind_subpattern(asm, frame, ctx, a, fail);
@@ -13315,12 +13439,23 @@ fn gen_unapply_pattern(
             asm.getfield("scala/Tuple2", fname, "Ljava/lang/Object;");
             if is_jvm_primitive(&a.ty) {
                 emit_unbox(asm, &a.ty);
-            } else {
+            } else if !is_type_test_pat(a) {
                 emit_pattern_cast(asm, ctx, &a.ty);
             }
             bind_subpattern(asm, frame, ctx, a, fail);
         }
         asm.pop();
+    }
+}
+
+/// A `_: T` ascription **tests**; it does not cast. Emitting the narrowing
+/// `checkcast` before `gen_pattern`'s own `instanceof` turned a non-match into
+/// a `ClassCastException` (`case List((s, _: TableNode))` on a plain `Node`).
+fn is_type_test_pat(pat: &Tree) -> bool {
+    match &pat.kind {
+        TreeKind::Typed { .. } => true,
+        TreeKind::Bind { body, .. } => is_type_test_pat(body),
+        _ => false,
     }
 }
 
@@ -13339,6 +13474,83 @@ fn emit_pattern_cast(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
         return;
     }
     asm.checkcast(&target);
+}
+
+/// `case Seq(a, b)` / `case Vector(a, rest @ _*)` / `case Array(a, b)`.
+///
+/// Reads elements by index instead of walking a cons list, which is what
+/// scalac does and the only thing that works for a `Vector` or an
+/// `ArraySeq` reached through `Seq`. The value on the stack is whatever
+/// `unapplySeq` returned -- the identity `SeqOps` for a `SeqFactory`, the
+/// array itself for `scala.Array` -- and the wrapper's extension methods take
+/// exactly that.
+fn gen_unapply_wrapper_bind(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    args: &[Tree],
+    fail: crate::code::Label,
+    shape: SeqPatShape,
+) {
+    let (wrapper, self_desc) = match shape {
+        SeqPatShape::Array => (ARRAY_WRAPPER, "Ljava/lang/Object;"),
+        _ => (SEQOPS_WRAPPER, "Lscala/collection/SeqOps;"),
+    };
+    let module_desc = format!("L{wrapper};");
+    if shape != SeqPatShape::Array {
+        asm.checkcast("scala/collection/SeqOps");
+    }
+    let slot = frame.alloc_tmp(JvmSort::Ref);
+    store(asm, slot, JvmSort::Ref);
+    // `_*` is last: `type_pattern` rejects it anywhere else.
+    let has_star = args.last().is_some_and(is_star_pat);
+    let fixed = if has_star { args.len() - 1 } else { args.len() };
+
+    asm.getstatic(wrapper, "MODULE$", &module_desc);
+    load(asm, slot, JvmSort::Ref);
+    asm.iconst(fixed as i32);
+    asm.invokevirtual(
+        wrapper,
+        "lengthCompare$extension",
+        &format!("({self_desc}I)I"),
+    );
+    if has_star {
+        asm.iflt(fail);
+    } else {
+        asm.ifne(fail);
+    }
+
+    for (i, a) in args.iter().take(fixed).enumerate() {
+        asm.getstatic(wrapper, "MODULE$", &module_desc);
+        load(asm, slot, JvmSort::Ref);
+        asm.iconst(i as i32);
+        asm.invokevirtual(
+            wrapper,
+            "apply$extension",
+            &format!("({self_desc}I)Ljava/lang/Object;"),
+        );
+        if is_jvm_primitive(&a.ty) {
+            emit_unbox(asm, &a.ty);
+        } else if !is_type_test_pat(a) {
+            emit_pattern_cast(asm, ctx, &a.ty);
+        }
+        bind_subpattern(asm, frame, ctx, a, fail);
+    }
+
+    if let Some(star) = args.last().filter(|a| is_star_pat(a)) {
+        asm.getstatic(wrapper, "MODULE$", &module_desc);
+        load(asm, slot, JvmSort::Ref);
+        asm.iconst(fixed as i32);
+        asm.invokevirtual(
+            wrapper,
+            "drop$extension",
+            &format!("({self_desc}I)Lscala/collection/immutable/Seq;"),
+        );
+        if !is_type_test_pat(star) {
+            emit_pattern_cast(asm, ctx, &star.ty);
+        }
+        bind_subpattern(asm, frame, ctx, star, fail);
+    }
 }
 
 fn gen_unapply_seq_bind(
@@ -13366,7 +13578,7 @@ fn gen_unapply_seq_bind(
         emit_list_head(asm, ctx);
         if is_jvm_primitive(&a.ty) {
             emit_unbox(asm, &a.ty);
-        } else {
+        } else if !is_type_test_pat(a) {
             emit_pattern_cast(asm, ctx, &a.ty);
         }
         bind_subpattern(asm, frame, ctx, a, fail);
@@ -13530,8 +13742,14 @@ fn gen_pattern(
                         asm.invokevirtual(&jvm, &acc, &format!("(){fdesc}"));
                     }
                     // A field declared as a type parameter erases to Object, so
-                    // `case Some(x)` on an `Option[Int]` must unbox before it binds.
-                    if fdesc == "Ljava/lang/Object;" {
+                    // `case Some(x)` on an `Option[Int]` must unbox before it
+                    // binds. A `_: T` sub-pattern is a *test*, though: casting
+                    // to it here turned `case Some((s, _: TableNode))` on a
+                    // plain `Node` into a `ClassCastException` instead of a
+                    // failed match.
+                    if fdesc == "Ljava/lang/Object;"
+                        && (!is_type_test_pat(a) || is_jvm_primitive(&a.ty))
+                    {
                         emit_from_erased_object(asm, ctx.st, &a.ty);
                     }
                     bind_subpattern(asm, frame, ctx, a, fail);

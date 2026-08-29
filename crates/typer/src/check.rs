@@ -7893,10 +7893,32 @@ impl Typer {
         // wait for an expected Function type (for-comprehension desugaring).
         let mut arg_tys = Vec::new();
         let saved_taking_args = std::mem::replace(&mut self.typing_call_args, true);
-        for a in args.iter_mut() {
+        let fun_ty_for_pretype = fun.ty.clone();
+        for (ai, a) in args.iter_mut().enumerate() {
             if let TreeKind::Function { vparams, .. } = &a.kind {
                 if is_annotated_lambda(a) {
                     self.type_expr(a, &Type::NoType);
+                    arg_tys.push(a.ty.clone());
+                    continue;
+                }
+                // nsc `Infer.pretypeArgs`: when every alternative wants the
+                // same function *parameter* types at this position, the
+                // literal can be typed before the alternatives are weighed,
+                // and its result type is then what picks one. `StringOps` has
+                // `map(Char => Char): String` and `map[B](Char => B):
+                // IndexedSeq[B]`; without this `"abc".map(_.toString)` sees
+                // `(<notype>) => <notype>`, both alternatives are applicable
+                // and the more specific `Char => Char` wins wrongly.
+                if let Some(ps) = self.agreed_lambda_params(&fun_ty_for_pretype, ai, vparams.len())
+                {
+                    // `Wildcard`, not `NoType`: the parameters are what this
+                    // pre-typing fixes, the result is whatever the body says
+                    // and must not be checked against anything yet.
+                    let pt_arg = Type::Function {
+                        params: ps,
+                        ret: Box::new(Type::Wildcard),
+                    };
+                    self.type_expr(a, &pt_arg);
                     arg_tys.push(a.ty.clone());
                     continue;
                 }
@@ -10740,7 +10762,7 @@ impl Typer {
                     .filter(|a| {
                         applicable
                             .iter()
-                            .all(|b| a.0 == b.0 || self.is_as_specific_method(&a.1, &b.1))
+                            .all(|b| a.0 == b.0 || self.is_as_specific_method(a.0, b.0, &a.1, &b.1))
                     })
                     .cloned()
                     .collect();
@@ -10761,8 +10783,161 @@ impl Typer {
     }
 
     /// nsc: `A` is as specific as `B` when `B` is applicable to `A`'s parameter types.
-    fn is_as_specific_method(&self, a_ps: &[Type], b_ps: &[Type]) -> bool {
-        self.is_applicable(SymbolId::NONE, 0, b_ps, a_ps, true)
+    ///
+    /// `B`'s own type parameters are undetermined for that test, exactly as
+    /// they are for a real call. `StringOps` has both
+    /// `map(f: Char => Char): String` and `map[B](f: Char => B): IndexedSeq[B]`;
+    /// without instantiating `B := Char` neither alternative is as specific as
+    /// the other and every `"…".map(…)` was `ambiguous overload`.
+    fn is_as_specific_method(
+        &self,
+        a_sym: SymbolId,
+        b_sym: SymbolId,
+        a_ps: &[Type],
+        b_ps: &[Type],
+    ) -> bool {
+        // `A`'s own type parameters stand in for the *arguments* of this
+        // hypothetical call, so they are rigid: `B` in `map[B](Char => B)` is
+        // not a `Char`. Its upper bound is the closest rigid stand-in we have.
+        // Without this every polymorphic alternative was as specific as every
+        // monomorphic one and the pair came out `ambiguous overload`.
+        let a_ps = self.rigidify_own_tparams(a_sym, a_ps);
+        // `B`'s type parameters are undetermined, exactly as for a real call.
+        let inst = if b_sym.is_none() || self.st.get(b_sym).tparams.is_empty() {
+            Vec::new()
+        } else {
+            self.infer_method_tparams(b_sym, b_ps, &a_ps)
+        };
+        let b_ps: Vec<Type> = if inst.is_empty() {
+            b_ps.to_vec()
+        } else {
+            let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+            let tys: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+            b_ps.iter()
+                .map(|p| crate::symbol::subst_tparams_slice(&tps, &tys, p))
+                .collect()
+        };
+        self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, true)
+            && self.function_params_conform(&a_ps, &b_ps)
+    }
+
+    /// `arg_score` deliberately scores any two function types with the same
+    /// parameter shape as a match, because an un-inferred literal has no
+    /// result type yet. Specificity compares two *signatures*, where both
+    /// results are known, so `Char => Any` must not count as a `Char => Char`.
+    fn function_params_conform(&self, a_ps: &[Type], b_ps: &[Type]) -> bool {
+        a_ps.iter().zip(b_ps).all(|(a, b)| match (a, b) {
+            (Type::Function { .. }, Type::Function { .. })
+                if !mentions_no_type(a) && !mentions_no_type(b) =>
+            {
+                self.st.is_sub_type(a, b)
+            }
+            _ => true,
+        })
+    }
+
+    /// nsc's rule for a stable-identifier pattern: the pattern's type and the
+    /// scrutinee only have to be *inhabitable together*, not conforming.
+    ///
+    /// Two open classes always are -- a subclass of one could extend the other
+    /// -- so `case Ids.other =>` against an unrelated `ST[Int]` is accepted,
+    /// which is what scalac 2.13.16 does. A `final` class (`String`, a value
+    /// class, an array) or a primitive rules the pattern out, and scalac
+    /// reports the same `type mismatch` there.
+    fn stable_pattern_compatible(&self, pat_ty: &Type, sel_ty: &Type) -> bool {
+        if pat_ty.is_no_type() || pat_ty.is_error() || sel_ty.is_no_type() || sel_ty.is_error() {
+            return true;
+        }
+        let pat_ty = pat_ty.widen_constant();
+        if self.st.is_sub_type(&pat_ty, sel_ty) || self.st.is_sub_type(sel_ty, &pat_ty) {
+            return true;
+        }
+        !self.is_final_like(&pat_ty) && !self.is_final_like(sel_ty)
+    }
+
+    /// A type no further subclass can widen: primitives, `String`, arrays,
+    /// objects, and anything declared `final`.
+    fn is_final_like(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Int
+            | Type::Long
+            | Type::Short
+            | Type::Byte
+            | Type::Char
+            | Type::Float
+            | Type::Double
+            | Type::Boolean
+            | Type::Unit
+            | Type::String
+            | Type::Nothing
+            | Type::Null
+            | Type::Array(_)
+            | Type::ModuleRef(_)
+            | Type::Tuple(_) => true,
+            Type::Class { sym, .. } => {
+                let s = self.st.get(*sym);
+                s.flags.contains(Flags::FINAL) || s.flags.contains(Flags::MODULE)
+            }
+            _ => false,
+        }
+    }
+
+    /// nsc `Infer.pretypeArgs`. The parameter types every overload alternative
+    /// wants for the function literal at `idx`, when they all agree and are
+    /// fully determined. `None` leaves the literal untyped, as before.
+    fn agreed_lambda_params(&self, fun_ty: &Type, idx: usize, arity: usize) -> Option<Vec<Type>> {
+        let Type::Overload(alts) = fun_ty else {
+            return None;
+        };
+        if alts.len() < 2 {
+            return None;
+        }
+        let mut agreed: Option<Vec<Type>> = None;
+        for a in alts {
+            let Type::Method { paramss, .. } = a else {
+                return None;
+            };
+            let p = paramss.first()?.get(idx)?;
+            // A pickled signature spells a function parameter as `Function1`.
+            let p = match p {
+                Type::Class { sym, args } => self
+                    .st
+                    .function_class_shape(*sym, args)
+                    .unwrap_or_else(|| p.clone()),
+                other => other.clone(),
+            };
+            let Type::Function { params, .. } = p else {
+                return None;
+            };
+            if params.len() != arity || params.iter().any(mentions_no_type) {
+                return None;
+            }
+            match &agreed {
+                None => agreed = Some(params),
+                Some(prev) if *prev == params => {}
+                Some(_) => return None,
+            }
+        }
+        agreed
+    }
+
+    /// Replace a method's own type parameters by their upper bounds, so that
+    /// a specificity test cannot instantiate them.
+    fn rigidify_own_tparams(&self, sym: SymbolId, ps: &[Type]) -> Vec<Type> {
+        if sym.is_none() {
+            return ps.to_vec();
+        }
+        let tps = self.st.get(sym).tparams.clone();
+        if tps.is_empty() {
+            return ps.to_vec();
+        }
+        let his: Vec<Type> = tps
+            .iter()
+            .map(|t| self.st.get(*t).bound_hi.clone().unwrap_or(Type::Any))
+            .collect();
+        ps.iter()
+            .map(|p| crate::symbol::subst_tparams_slice(&tps, &his, p))
+            .collect()
     }
 
     fn is_applicable(
@@ -10980,7 +11155,16 @@ impl Typer {
         // plainly disagree: `scala.Function.untupled` overloads on nothing but
         // the arity of its argument's tuple parameter, so `((Int, Int)) => Int`
         // has to reject `((T1, T2, T3)) => R`.
-        if let (Type::Function { params: ap, .. }, Type::Function { params: pp, .. }) = (arg, param)
+        if let (
+            Type::Function {
+                params: ap,
+                ret: ar,
+            },
+            Type::Function {
+                params: pp,
+                ret: pr,
+            },
+        ) = (arg, param)
         {
             // A literal whose parameters are not inferred yet keeps matching
             // on any shape: `apply2 { case (n, s) => … }` arrives as one
@@ -10996,6 +11180,20 @@ impl Typer {
                         }
                     }));
             if shapes_agree {
+                // A literal that is *already* typed has to return what the
+                // parameter asks for. `StringOps` overloads `map` on nothing
+                // but the function's result type, so `Char => String` must not
+                // score as a `Char => Char`. A `Unit` (or `Any`) parameter
+                // still takes any result -- that is value discarding, which
+                // nsc allows for function literals too -- and an undetermined
+                // result constrains nothing.
+                let strict = !open
+                    && is_rigid_type(ar)
+                    && is_rigid_type(pr)
+                    && !matches!(**pr, Type::Unit | Type::Any | Type::AnyRef);
+                if strict && !self.st.is_sub_type(ar, pr) && numeric_widen(ar, pr).is_none() {
+                    return None;
+                }
                 return Some(8);
             }
         }
@@ -11229,7 +11427,9 @@ impl Typer {
         // `xs.collect { case … }` reaches here with `PartialFunction[Int, B]`,
         // `B` still undetermined. Typing the body against a bare type parameter
         // pins it to that parameter (and later to `Any`); let the body speak.
-        let ret_pt = if matches!(ret_pt, Type::TypeParam(_)) {
+        // `Wildcard` is what `pretypeArgs` writes: the parameters are fixed,
+        // the result is whatever the body turns out to be.
+        let ret_pt = if matches!(ret_pt, Type::TypeParam(_) | Type::Wildcard) {
             Type::NoType
         } else {
             ret_pt
@@ -11492,7 +11692,17 @@ impl Typer {
                     Type::Byte | Type::Short | Type::Char => Type::Int,
                     _ => relax_abstract_targs(sel_ty),
                 };
-                self.type_expr(pat, &pt);
+                // nsc does not demand conformance here, only that the two
+                // types could have a common instance: `case Ids.other =>`
+                // (an `Other`) against an `ST[Int]` scrutinee compiles,
+                // because a subclass of `Other` could still be an `ST[Int]`.
+                // It *is* an error when one side is final and unrelated
+                // (`String`, a `final class`, a primitive), which is what
+                // scalac 2.13.16 reports for exactly those cases.
+                self.type_expr(pat, &Type::NoType);
+                if !self.stable_pattern_compatible(&pat.ty, &pt) {
+                    self.adapt(pat, &pt);
+                }
             }
             TreeKind::Bind { name, body } => {
                 self.type_pattern(body, sel_ty);
@@ -11537,6 +11747,15 @@ impl Typer {
                 // `<notype>` and count one sub-pattern instead of two.
                 for u in unapply.iter().chain(unapply_seq.iter()) {
                     self.complete_lazy_sig(*u, pat.span);
+                }
+                // Without the jar there is no `Array$` / `Vector$` companion
+                // at all, so a sequence pattern on one finds no `unapplySeq`
+                // and every sub-pattern would silently come out `Any`. Say
+                // what is actually missing.
+                if unapply.is_none() && unapply_seq.is_none() {
+                    if let Some(c) = class_id {
+                        self.check_missing_seq_factory(c, pat.span);
+                    }
                 }
                 let use_ctor = !has_star
                     && class_id.is_some_and(|c| {
@@ -11612,14 +11831,17 @@ impl Typer {
                                 .unwrap_or(own)
                         }
                     };
+                    self.check_seq_pattern_backing(u, pat.span);
+                    // `rest @ _*` gets the container the extractor's own
+                    // result type names: `List` for `List.unapplySeq` (and for
+                    // a user extractor returning `Option[List[T]]`), `Seq` for
+                    // the `Seq` / `Vector` / `IndexedSeq` / `Array` factories,
+                    // which is what scalac's `drop$extension` returns.
+                    let star_ty = self.unapply_seq_star_type(u, &elem);
                     let n = args.len();
                     for (i, a) in args.iter_mut().enumerate() {
                         if pattern_has_star(a) {
-                            let list_ty = Type::Class {
-                                sym: self.st.list_sym,
-                                args: vec![elem.clone()],
-                            };
-                            self.type_pattern(a, &list_ty);
+                            self.type_pattern(a, &star_ty);
                         } else if has_star && i + 1 == n {
                             self.type_pattern(a, sel_ty);
                         } else {
@@ -11969,6 +12191,84 @@ impl Typer {
             .lookup_member(owner, "unapplySeq")
             .into_iter()
             .find(|m| self.st.get(*m).kind == SymKind::Method)
+    }
+
+    /// The type `rest @ _*` binds: the extractor's own result container
+    /// re-applied to the element type the scrutinee gave us.
+    ///
+    /// `List.unapplySeq: Option[List[A]]` keeps `rest: List[A]`, which is what
+    /// every existing fixture and the private runtime's `List` codegen expect.
+    /// The `Seq` / `Vector` / `IndexedSeq` / `Array` factories declare
+    /// `Option[Seq[A]]`, matching scalac, whose
+    /// `UnapplySeqWrapper.drop$extension` returns `immutable.Seq`.
+    fn unapply_seq_star_type(&self, unapply: SymbolId, elem: &Type) -> Type {
+        let fallback = Type::Class {
+            sym: self.st.list_sym,
+            args: vec![elem.clone()],
+        };
+        match self.unapply_extracted_types(unapply).into_iter().next() {
+            Some(Type::Class { sym, args }) if args.len() == 1 => Type::Class {
+                sym,
+                args: vec![elem.clone()],
+            },
+            _ => fallback,
+        }
+    }
+
+    /// A sequence pattern on `Seq` / `Vector` / `IndexedSeq` / `Array` compiles
+    /// to `scala.collection.SeqFactory$UnapplySeqWrapper$` (respectively
+    /// `scala.Array$UnapplySeqWrapper$`) extension calls. The private runtime
+    /// (`--no-scala-library`) emits neither, and `scala/collection/SeqOps`
+    /// does not exist there at all, so say so instead of emitting code that
+    /// cannot link.
+    fn check_seq_pattern_backing(&mut self, unapply: SymbolId, span: Span) {
+        if self.library_abi {
+            return;
+        }
+        let owner = self.st.get(unapply).owner;
+        let jvm = self.st.get(owner).jvm_name.clone();
+        let known = jvm == crate::prelude_seqpat::ARRAY_FACTORY_MODULE
+            || crate::prelude_seqpat::SEQ_FACTORY_MODULES.contains(&jvm.as_str());
+        if !known {
+            return;
+        }
+        let name = jvm.rsplit('/').next().unwrap_or(&jvm).trim_end_matches('$');
+        self.error(
+            span,
+            format!(
+                "sequence pattern on `{name}` needs the real scala-library \
+                 (`--scala-library`); the private runtime has no \
+                 `scala.collection.SeqOps`"
+            ),
+        );
+    }
+
+    /// `case Array(a, b)` with `--no-scala-library`: the class is in scope but
+    /// its companion (and therefore `unapplySeq`) is not.
+    fn check_missing_seq_factory(&mut self, cls: SymbolId, span: Span) {
+        if self.library_abi {
+            return;
+        }
+        let jvm = self.st.get(cls).jvm_name.clone();
+        let is_seq_class = cls == self.st.array_sym
+            || matches!(
+                jvm.as_str(),
+                "scala/collection/immutable/Seq"
+                    | "scala/collection/immutable/Vector"
+                    | "scala/collection/immutable/IndexedSeq"
+            );
+        if !is_seq_class {
+            return;
+        }
+        let name = self.st.get(cls).name.clone();
+        self.error(
+            span,
+            format!(
+                "sequence pattern on `{name}` needs the real scala-library \
+                 (`--scala-library`); the private runtime has no \
+                 `{name}` companion"
+            ),
+        );
     }
 
     fn unapply_seq_elem_type(&self, unapply: SymbolId) -> Type {
@@ -16008,6 +16308,32 @@ fn is_bare_lambda(t: &Tree) -> bool {
 
 /// Whether `ty` is, or contains, an unknown type. A lambda argument that has
 /// not been typed yet is carried as `(<notype>) => <notype>`.
+/// A type with nothing left to solve: no `<notype>`, no wildcard, no type
+/// parameter or abstract type member. Only such a pair may be compared
+/// strictly when scoring a function argument against a function parameter.
+fn is_rigid_type(ty: &Type) -> bool {
+    match ty {
+        Type::NoType
+        | Type::Wildcard
+        | Type::BoundedWildcard { .. }
+        | Type::TypeParam(_)
+        | Type::TypeMember(_)
+        | Type::Error => false,
+        Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
+            args.iter().all(is_rigid_type)
+        }
+        Type::Applied { ctor, args } => is_rigid_type(ctor) && args.iter().all(is_rigid_type),
+        Type::Function { params, ret } => params.iter().all(is_rigid_type) && is_rigid_type(ret),
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            is_rigid_type(t)
+        }
+        Type::Method { paramss, ret } => {
+            paramss.iter().flatten().all(is_rigid_type) && is_rigid_type(ret)
+        }
+        _ => true,
+    }
+}
+
 fn mentions_no_type(ty: &Type) -> bool {
     match ty {
         Type::NoType => true,
