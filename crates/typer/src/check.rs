@@ -154,6 +154,20 @@ pub struct Typer {
     /// ambiguous. This keeps the instantiated types the selection already
     /// computed.
     overload_member_types: HashMap<u32, Vec<(SymbolId, Type)>>,
+    /// nsc's undetermined type variables (`Context.undetparams`).
+    ///
+    /// An argument is typed with no expected type so that overload resolution
+    /// has something to select on, which leaves a polymorphic reference such
+    /// as `Map.empty` carrying its own type parameters: `Map[K, V]`. Those
+    /// parameters are not fixed -- they are variables the call still has to
+    /// solve -- so while this call's alternatives are being weighed they stand
+    /// for "anything a parameter can make them" (`undet_compatible`), and they
+    /// are solved from the picked parameter type afterwards
+    /// (`instantiate_undet_arg`).
+    ///
+    /// Saved and restored around each application, since typing an argument
+    /// runs another application inside this one.
+    undet_tvars: Vec<SymbolId>,
     /// Set while an argument list is being retried packed into a tuple.
     ///
     /// The retry builds a fresh `TupleN(a, b)` node and types it as the sole
@@ -362,6 +376,7 @@ impl Typer {
             completed_java: HashSet::new(),
             overload_groups: HashMap::new(),
             overload_member_types: HashMap::new(),
+            undet_tvars: Vec::new(),
             tupling: false,
             parent_ctx: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
@@ -5127,6 +5142,251 @@ impl Typer {
         ty
     }
 
+    /// Type each argument against the parameter it fills and adapt it there,
+    /// treating the callee's unsolved type parameters as variables: the
+    /// argument is what says what they are.
+    ///
+    /// Used by the two recoveries that pick an alternative a second time
+    /// (`widen_with_companion`, `rewrite_apply_extension`).
+    fn adapt_args_to_params(&mut self, args: &mut [Tree], param_tys: &[Type], sym: SymbolId) {
+        let own = (!sym.is_none()).then(|| self.st.get(sym).tparams.clone());
+        for (i, a) in args.iter_mut().enumerate() {
+            let p = param_at(param_tys, i).cloned().unwrap_or(Type::NoType);
+            let open = self.open_tparams_of(&p, own.as_deref());
+            if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type() {
+                let pt_arg = self.open_to_bounds(&p, &open);
+                self.type_expr(a, &pt_arg);
+            }
+            if !p.is_no_type() {
+                let p_check = self
+                    .solve_open_from_arg(&a.ty, &p, &open)
+                    .unwrap_or_else(|| self.open_to_bounds(&p, &open));
+                self.adapt(a, &p_check);
+            }
+        }
+    }
+
+    /// The type parameters an argument's type still carries because the
+    /// argument was typed with no expected type -- nsc's undetermined type
+    /// variables. `Map.empty` in argument position is `Map[K, V]` with `K` and
+    /// `V` undetermined; the call solves them, so they must not be compared as
+    /// if they were fixed types.
+    fn undetermined_of(&self, a: &Tree) -> Vec<SymbolId> {
+        if a.sym.is_none() || a.ty.is_no_type() || a.ty.is_error() {
+            return Vec::new();
+        }
+        // A residual method type is not a value yet; its own clauses are what
+        // is missing, not an instantiation (`Array.empty` is still
+        // `(ClassTag[T])Array[T]`).
+        if matches!(a.ty, Type::Method { .. } | Type::Overload(_)) {
+            return Vec::new();
+        }
+        self.st
+            .get(a.sym)
+            .tparams
+            .iter()
+            .copied()
+            .filter(|tp| type_mentions_tparam(&a.ty, *tp) && !self.tparam_in_scope(*tp))
+            .collect()
+    }
+
+    /// A type parameter an enclosing definition binds is a *type* here, not a
+    /// variable: `def g[K](m: Map[K, Int]) = take(m)` has to keep reporting
+    /// the mismatch, and `def rec[T](x: T): Map[T, Int] = take(rec(x))` must
+    /// not "solve" its own `T` from the parameter it is passed to. Only a
+    /// parameter of a method this argument has already applied -- one that can
+    /// no longer be named here -- is undetermined.
+    fn tparam_in_scope(&self, tp: SymbolId) -> bool {
+        let name = self.st.get(tp).name.clone();
+        self.st.lookup_type(&name).contains(&tp)
+    }
+
+    /// nsc's `isCompatible` with undetermined type variables in play: does
+    /// `arg` become `param` for *some* instantiation of the variables it still
+    /// carries? `Map[?K, ?V]` is compatible with `Map[String, Int]`; it is not
+    /// compatible with `List[Int]`.
+    ///
+    /// Only the variables recorded in `undet_tvars` count. A type parameter of
+    /// the enclosing method is a fixed type here, not a variable, so
+    /// `def m[T](x: T) = take(x)` still has to report the mismatch.
+    fn undet_compatible(&self, arg: &Type, param: &Type) -> bool {
+        if self.undet_tvars.is_empty() || param.is_no_type() || param.is_error() {
+            return false;
+        }
+        let open: Vec<SymbolId> = self
+            .undet_tvars
+            .iter()
+            .copied()
+            .filter(|tp| type_mentions_tparam(arg, *tp))
+            .collect();
+        if open.is_empty() {
+            return false;
+        }
+        let mut solved = arg.clone();
+        for tp in &open {
+            let Some(t) = unify_one(*tp, arg, param) else {
+                // The parameter pins nothing here (`def f(x: Any)` taking
+                // `List.empty`). Leave the variable to its bound: an
+                // undetermined variable is `Nothing` at worst, and `Nothing`
+                // inhabits every type.
+                let lo = self.st.get(*tp).bound_lo.clone().unwrap_or(Type::Nothing);
+                solved = crate::symbol::subst_tparams_slice(&[*tp], &[lo], &solved);
+                continue;
+            };
+            if t.is_no_type() || t.is_error() {
+                return false;
+            }
+            // A variable is still bounded. `Ordering.empty[T <: Comparable[T]]`
+            // handed to a `Seq[Int]` parameter is not compatible just because
+            // the shapes line up.
+            if let Some(hi) = self.st.get(*tp).bound_hi.clone() {
+                if !mentions_any_tparam(&hi) && !self.st.is_sub_type(&t, &hi) {
+                    return false;
+                }
+            }
+            if let Some(lo) = self.st.get(*tp).bound_lo.clone() {
+                if !mentions_any_tparam(&lo) && !self.st.is_sub_type(&lo, &t) {
+                    return false;
+                }
+            }
+            solved = crate::symbol::subst_tparams_slice(&[*tp], &[t], &solved);
+        }
+        self.st.is_sub_type(&solved, param)
+    }
+
+    /// Solve the variables an argument still carries from the parameter it
+    /// fills, and rewrite the argument's type to the solution. This is where
+    /// nsc's undetermined variables stop being variables: the alternative is
+    /// picked, so nothing else is going to constrain them.
+    ///
+    /// The rewrite only happens when it makes the argument conform. A solution
+    /// that does not is not an improvement -- the argument really is wrong,
+    /// and the mismatch should describe what was written.
+    fn instantiate_undet_arg(&mut self, a: &mut Tree, p: &Type) {
+        if p.is_no_type() || p.is_error() || self.undet_tvars.is_empty() {
+            return;
+        }
+        let open: Vec<SymbolId> = self
+            .undet_tvars
+            .iter()
+            .copied()
+            .filter(|tp| type_mentions_tparam(&a.ty, *tp))
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let mut solved = a.ty.clone();
+        for tp in &open {
+            let t = match unify_one(*tp, &a.ty, p) {
+                Some(t) if !t.is_no_type() && !t.is_error() => t,
+                // Nothing pins it. An unconstrained variable is its lower
+                // bound, the same instantiation nsc's `solve` picks.
+                _ => self.st.get(*tp).bound_lo.clone().unwrap_or(Type::Nothing),
+            };
+            solved = crate::symbol::subst_tparams_slice(&[*tp], &[t], &solved);
+        }
+        if self.st.is_sub_type(&solved, p) {
+            a.ty = solved;
+        }
+    }
+
+    /// Solve the variables that reached an application's *result* against the
+    /// expected type. `def f[T](x: T): List[T]` applied to `Map.empty` has a
+    /// result of `List[Map[?K, ?V]]`; a declared `List[Map[String, Int]]` is
+    /// what says what `?K` and `?V` are.
+    ///
+    /// A variable the expected type does not pin is left alone -- it is still
+    /// undetermined, and the call that encloses this one may yet fix it.
+    fn solve_undet_result(&mut self, tree: &mut Tree, pt: &Type) {
+        if pt.is_no_type()
+            || pt.is_error()
+            || tree.ty.is_no_type()
+            || tree.ty.is_error()
+            || self.undet_tvars.is_empty()
+        {
+            return;
+        }
+        let open: Vec<SymbolId> = self
+            .undet_tvars
+            .iter()
+            .copied()
+            .filter(|tp| type_mentions_tparam(&tree.ty, *tp))
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let mut solved = tree.ty.clone();
+        for tp in &open {
+            let Some(t) = unify_one(*tp, &tree.ty, pt) else {
+                continue;
+            };
+            if t.is_no_type() || t.is_error() {
+                continue;
+            }
+            solved = crate::symbol::subst_tparams_slice(&[*tp], &[t], &solved);
+        }
+        if self.st.is_sub_type(&solved, pt) {
+            tree.ty = solved;
+        }
+    }
+
+    /// The callee's type parameters that a parameter type still mentions
+    /// because this call has not solved them yet -- the other half of nsc's
+    /// undetermined type variables. `List.collect`'s `B` in
+    /// `PartialFunction[A, B]` after `A` came from the receiver.
+    fn open_tparams_of(&self, p: &Type, own: Option<&[SymbolId]>) -> Vec<SymbolId> {
+        let Some(own) = own else { return Vec::new() };
+        own.iter()
+            .copied()
+            .filter(|tp| type_mentions_tparam(p, *tp))
+            .collect()
+    }
+
+    /// A parameter type with its undetermined variables opened up to their
+    /// declared bounds, which is what an unsolved variable means as an
+    /// *expected* type: it constrains nothing beyond the bound. This is only
+    /// ever the expected type handed to an argument, never a result.
+    fn open_to_bounds(&self, p: &Type, open: &[SymbolId]) -> Type {
+        if open.is_empty() {
+            return p.clone();
+        }
+        let mut out = p.clone();
+        for tp in open {
+            let hi = self.st.get(*tp).bound_hi.clone().unwrap_or(Type::Any);
+            // A bound written in terms of the other open variables says
+            // nothing more than `Any` does here.
+            let hi = if mentions_tparam(&hi, open) {
+                Type::Any
+            } else {
+                hi
+            };
+            out = crate::symbol::subst_tparams_slice(&[*tp], &[hi], &out);
+        }
+        out
+    }
+
+    /// Solve a parameter's undetermined variables from the argument that fills
+    /// it, so the argument is checked against `PartialFunction[Int, String]`
+    /// rather than against an erased `PartialFunction[Int, Any]`.
+    ///
+    /// `None` when the argument does not pin every one of them; the call then
+    /// falls back to the bounds, and whatever is left undetermined is reported
+    /// by the usual mismatch rather than papered over.
+    fn solve_open_from_arg(&self, arg: &Type, p: &Type, open: &[SymbolId]) -> Option<Type> {
+        if open.is_empty() || arg.is_no_type() || arg.is_error() {
+            return None;
+        }
+        let mut out = p.clone();
+        for tp in open {
+            let t = unify_one(*tp, p, arg)?;
+            if t.is_no_type() || t.is_error() {
+                return None;
+            }
+            out = crate::symbol::subst_tparams_slice(&[*tp], &[t], &out);
+        }
+        (!mentions_tparam(&out, open)).then_some(out)
+    }
+
     /// Variance of `tp`'s occurrences in `ty`, or `None` when it does not
     /// occur. Two occurrences that disagree make the parameter invariant.
     fn tparam_variance_in(&self, ty: &Type, tp: SymbolId, variance: i8) -> Option<i8> {
@@ -6798,7 +7058,32 @@ impl Typer {
         true
     }
 
+    /// Every application gets its own set of undetermined type variables: an
+    /// argument of *this* call is typed by a nested `type_apply`, whose
+    /// variables must not still be in scope when this one weighs its own
+    /// alternatives. The body has many exits, so the set is saved and restored
+    /// here rather than at each of them.
     fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
+        let saved = std::mem::take(&mut self.undet_tvars);
+        self.type_apply_in(tree, pt);
+        // The expected type is the last constraint on what the arguments left
+        // undetermined, exactly as it is for the callee's own parameters:
+        // `val l: List[Map[String, Int]] = f(Map.empty)` pins the `K` and `V`
+        // that reached the result through `f`'s own `T`.
+        self.solve_undet_result(tree, pt);
+        // A variable this call could not solve is still undetermined for the
+        // call that encloses it: `take(id(Map.empty))` hands `Map[?K, ?V]`
+        // outward, and it is the *outer* parameter that fixes it.
+        let leaked: Vec<SymbolId> = self
+            .undet_tvars
+            .drain(..)
+            .filter(|tp| type_mentions_tparam(&tree.ty, *tp))
+            .collect();
+        self.undet_tvars = saved;
+        self.undet_tvars.extend(leaked);
+    }
+
+    fn type_apply_in(&mut self, tree: &mut Tree, pt: &Type) {
         if self.try_rewrite_case_copy(tree, pt) {
             return;
         }
@@ -6885,6 +7170,13 @@ impl Typer {
                     self.type_expr(a, &Type::NoType);
                     arg_tys.push(a.ty.clone());
                 }
+            }
+            // Same as the method path: what the arguments left undetermined is
+            // this call's to solve, so `new C(Map.empty)` may pick the
+            // constructor whose parameter fixes `K` and `V`.
+            for a in args.iter() {
+                let open = self.undetermined_of(a);
+                self.undet_tvars.extend(open);
             }
             let field_tys: Vec<Type> = class_id
                 .map(|c| {
@@ -7001,6 +7293,7 @@ impl Typer {
                 if !p.is_no_type() {
                     if !mentions_tparam(&p, &tps) {
                         a.ty = self.instantiate_parameterless(a.sym, a.ty.clone(), &p);
+                        self.instantiate_undet_arg(a, &p);
                     }
                     self.adapt(a, &p);
                 }
@@ -7080,6 +7373,14 @@ impl Typer {
                 self.type_expr(a, &Type::NoType);
                 arg_tys.push(a.ty.clone());
             }
+        }
+        // What the arguments left undetermined. Typing them with no expected
+        // type is what makes overload resolution possible, and it is also what
+        // leaves `Map.empty` as `Map[K, V]`; those parameters are this call's
+        // to solve, so record them before the alternatives are weighed.
+        for a in args.iter() {
+            let open = self.undetermined_of(a);
+            self.undet_tvars.extend(open);
         }
 
         if !self.library_abi {
@@ -7256,16 +7557,43 @@ impl Typer {
                             };
                         }
                     }
+                    // The callee's own type parameters that this call has not
+                    // solved are variables too (nsc's `undetparams`):
                     // `xs.collect { case … }` is checked against
-                    // `PartialFunction[Int, B]` with `B` still open. Nothing
-                    // conforms to an uninstantiated parameter, so relax it to
-                    // `Any` and let the literal's own result type pin `B`.
-                    p = relax_open_tparams(&p, own_tparams.as_deref());
+                    // `PartialFunction[Int, ?B]`. A variable constrains
+                    // nothing, so the literal is *typed* against the parameter
+                    // with the variables opened up to their bounds.
+                    let open = self.open_tparams_of(&p, own_tparams.as_deref());
                     if a.ty.is_no_type() {
-                        self.type_expr(a, &p);
+                        let pt_arg = self.open_to_bounds(&p, &open);
+                        self.type_expr(a, &pt_arg);
                     }
+                    // The alternative is picked; the argument's own
+                    // undetermined variables can be solved now. `take(Map
+                    // .empty)` on `take(m: Map[String, Int])` turns `Map[K, V]`
+                    // into `Map[String, Int]` here -- the same step the
+                    // constructor path already takes. A parameter that is
+                    // itself still an open type parameter of the callee pins
+                    // nothing, so it is left for the callee's own inference.
+                    if !p.is_no_type()
+                        && !own_tparams
+                            .as_deref()
+                            .is_some_and(|tps| mentions_tparam(&p, tps))
+                    {
+                        a.ty = self.instantiate_parameterless(a.sym, a.ty.clone(), &p);
+                        self.instantiate_undet_arg(a, &p);
+                    }
+                    // Adapt against the *solved* parameter, not against one
+                    // whose open variables have been erased to `Any`: the
+                    // argument is what tells this call what `?B` is, and the
+                    // erasure is what let a wrong `Any` reach the result three
+                    // times before. A variable the argument does not pin is
+                    // still open, and the check falls back to its bound.
                     if !p.is_no_type() {
-                        self.adapt(a, &p);
+                        let p_check = self
+                            .solve_open_from_arg(&a.ty, &p, &open)
+                            .unwrap_or_else(|| self.open_to_bounds(&p, &open));
+                        self.adapt(a, &p_check);
                     }
                     if let TreeKind::Function { body, .. } = &a.kind {
                         let body_ty = body.ty.widen_constant();
@@ -7761,17 +8089,7 @@ impl Typer {
                     {
                         fun.sym = sym;
                         tree.sym = sym;
-                        let own = (!sym.is_none()).then(|| self.st.get(sym).tparams.clone());
-                        for (i, a) in args.iter_mut().enumerate() {
-                            let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
-                            if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type() {
-                                self.type_expr(a, &p);
-                            }
-                            let p = relax_open_tparams(&p, own.as_deref());
-                            if !p.is_no_type() {
-                                self.adapt(a, &p);
-                            }
-                        }
+                        self.adapt_args_to_params(args, &param_tys, sym);
                         tree.ty = ret;
                         return;
                     }
@@ -7782,24 +8100,7 @@ impl Typer {
                         OverloadPick::Found(sym, param_tys, ret) => {
                             fun.sym = sym;
                             tree.sym = sym;
-                            let open_tps: Vec<SymbolId> = if sym.is_none() {
-                                Vec::new()
-                            } else {
-                                self.st.get(sym).tparams.clone()
-                            };
-                            for (i, a) in args.iter_mut().enumerate() {
-                                let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
-                                if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type()
-                                {
-                                    self.type_expr(a, &p);
-                                }
-                                let own =
-                                    (!sym.is_none()).then(|| self.st.get(sym).tparams.clone());
-                                let p = relax_open_tparams(&p, own.as_deref());
-                                if !p.is_no_type() {
-                                    self.adapt(a, &p);
-                                }
-                            }
+                            self.adapt_args_to_params(args, &param_tys, sym);
                             tree.ty = ret;
                             return;
                         }
@@ -9886,6 +10187,14 @@ impl Typer {
                     Some(7)
                 };
             }
+        }
+        // An argument that is still carrying undetermined type variables
+        // (`Map.empty` typed with no expected type is `Map[K, V]`) is
+        // applicable to whatever those variables can be made into. nsc keeps
+        // them as `TypeVar`s until the call is solved; they are solved here
+        // against the parameter and the instantiation is what is compared.
+        if self.undet_compatible(arg, param) {
+            return Some(4);
         }
         if matches!(param, Type::TypeParam(_)) || matches!(arg, Type::TypeParam(_)) {
             return Some(2);
@@ -14872,35 +15181,6 @@ fn dedup_diags(diags: &mut Vec<Diagnostic>) {
             d.message.clone(),
         ))
     });
-}
-
-/// A type argument that is still an uninstantiated type parameter admits
-/// nothing, so relax it to `Any` before checking an argument against it. Only
-/// arguments are relaxed: a parameter that *is* a type parameter (`def f[A](x:
-/// A)`) is left alone, so `f[Int]("s")` is still an error.
-/// `open` names the callee's own type parameters — the only ones the call can
-/// still leave undetermined; `None` means they are unknown and all of them are
-/// relaxed. A *class* type parameter in scope (`Rep[P1]` inside
-/// `trait Base[P1]`), or one of an enclosing method, is a perfectly
-/// determinate type and must be left alone: widening it to `Rep[Any]` made
-/// `def f[T](a: Inv[T]) = g(a)` check `Inv[T]` against `Inv[Any]` -- a
-/// mismatch for every invariant class and a silent widening for every
-/// covariant one.
-fn relax_open_tparams(ty: &Type, open: Option<&[SymbolId]>) -> Type {
-    let is_open = |a: &Type| match a {
-        Type::TypeParam(id) => open.is_none_or(|o| o.contains(id)),
-        _ => false,
-    };
-    match ty {
-        Type::Class { sym, args } if args.iter().any(is_open) => Type::Class {
-            sym: *sym,
-            args: args
-                .iter()
-                .map(|a| if is_open(a) { Type::Any } else { a.clone() })
-                .collect(),
-        },
-        _ => ty.clone(),
-    }
 }
 
 /// Re-read a parent's `this.type` as the overriding class's own.

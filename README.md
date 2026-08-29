@@ -184,9 +184,39 @@ nsc の `instantiateExpecting` と同じく、メソッドの型パラメータ�
 オーバーロード）が、絞らないままだと `fun.ty` にオーバーロード型が残り、後続の implicit 節が
 未代入の `ScalaBaseType[T]` を探しに行っていました。
 
-まだ決まっていない型パラメータを `Any` に緩めるのは（`xs.collect { case … }` の `B` のように）
-**呼び先自身の**型パラメータだけです。スコープにあるクラスの型パラメータは確定した型なので
-緩めません。`def take[T](r: Rep[T])` を `trait Base[P1]` の中で `take(c)`（`c: Rep[P1]`）と
+#### 未確定の型変数（nsc の undetermined type variables）
+
+引数はオーバーロード解決を型で駆動するために**期待型なしで**型付けします。その結果、
+`Map.empty` のような多相参照は自分の型パラメータを抱えたまま（`Map[K, V]`）引数位置に
+届きます。nsc はこれを **TypeVar**（`Context.undetparams`）として持ち回り、候補を選び終えて
+から一度に解きます。scala-rs も同じようにします（`check.rs` の `undet_tvars` /
+`undetermined_of` / `undet_compatible` / `instantiate_undet_arg`）。
+
+- 適用可能性の判定（`arg_score`）は、引数が抱えている変数をパラメータ型と単一化して
+  解いてから比較します。`take(m: Map[String, Int])` に `Map.empty` を渡せます。
+  空の `apply`（`Map()` / `Vector()` / `List()`）も同じ経路です。
+- 内側の呼び出しが解けなかった変数は、外側の呼び出しにとってまだ未確定なので
+  外へ持ち出します。`take(id(Map.empty))` は外側のパラメータ型が `K` / `V` を決めます。
+- 結果型まで届いた変数は**期待型**が決めます（`solve_undet_result`）。
+  `val l: List[Map[String, Int]] = f(Map.empty)`（`def f[T](x: T): List[T]`）の
+  `K` / `V` は宣言した型から解けます。可変長引数・by-name・デフォルト引数の位置も
+  同じ経路です。
+- **囲んでいる定義が束縛している型パラメータは変数ではなく確定した型**です。
+  スコープにその名前で引けるかどうかで区別します（`tparam_in_scope`）。
+  `def g[K](m: Map[K, Int]) = take(m)` や `def rec[T](x: T, m: Map[T, Int]) = take(m)` は
+  scalac と同じく拒否します。
+- 変数の上下界は無視しません。単一化した解が界に適合しない候補は選びません。
+- 解けない変数は `Nothing` で黙って埋めず、診断を出します。
+
+逆向き、つまり**呼び先自身の**型パラメータがまだ未確定な場合も同じ考えです。
+`xs.collect { case … }` は `PartialFunction[Int, ?B]` に対して検査され、`?B` はリテラルの
+結果型が決めます。以前はここでパラメータ型を `Any` に潰していました
+（`relax_open_tparams`）が、結果型を失う場に持ち込むと壊れる場当たりだったので
+**削除**し、引数から解いた解に対して適合を見るようにしました（`solve_open_from_arg`）。
+引数を型付けする時の期待型としては、未確定の変数をその**宣言された上界**まで開きます
+（`open_to_bounds`。上界が無ければ `Any`）。
+スコープにあるクラスの型パラメータは確定した型なので開きません。
+`def take[T](r: Rep[T])` を `trait Base[P1]` の中で `take(c)`（`c: Rep[P1]`）と
 呼ぶと `T = P1` であって、`Rep[Any]` を要求してはいけません。
 
 親コンストラクタの引数は**親の型引数を代入してから**照合します。
@@ -1684,6 +1714,24 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 作り変えない）ことは `mism2_bad.scala`（`Act[Int, …]` を `Act[String, …]` に渡す）で
 固定しています。
 
+| `tyvar.scala` | 未確定の型変数（nsc の undetermined type variables）。引数位置の `Map.empty` / `Vector.empty` / `Set.empty` / `List.empty` / `Nil` / `Seq.empty`、空の `apply`（`Map()` / `Vector()` / `List()`）、入れ子の呼び出しから漏れる変数（`take(id(Map.empty))`）、期待型が結果型の変数を決める形（`val l: List[Map[String, Int]] = f(Map.empty)`）、可変長引数・by-name・デフォルト引数の位置、複数引数・複数節、オーバーロード選択、コンストラクタ引数、そして逆向きの「呼び先自身の未確定な型パラメータ」（`xs.collect { case … }`）（library dual-run のみ） | `0`×9 `List(Map())` `2` `0`×3 `1` `2` `0` `0` `List(2, 4)` `List(2, 3, 4, 5)` `Some(6)` |
+
+`tyvar.scala` は `crates/cli/tests/tyvar.rs` から回します。同ファイルには最小形の
+受理テスト（`a_polymorphic_reference_in_argument_position_is_solved_by_the_parameter` /
+`an_empty_apply_is_solved_by_the_parameter` /
+`a_variable_leaks_out_of_a_nested_call` /
+`the_expected_type_solves_a_variable_that_reached_the_result` /
+`overload_selection_sees_through_an_undetermined_variable` /
+`a_constructor_argument_is_solved_by_its_parameter` /
+`a_callees_open_type_parameter_is_solved_from_the_argument`）と、
+**解けない変数を黙って埋めない**ことの拒否テスト
+（`an_enclosing_methods_type_parameter_is_not_a_variable` /
+`a_recursive_call_does_not_solve_its_own_type_parameter` /
+`a_variable_the_parameter_cannot_pin_stays_an_error` /
+`solving_a_callees_type_parameter_does_not_widen_the_result`）を置いてあります。
+まとまった拒否側は `tyvar_unsolved_bad.scala`（5 か所。実 scalac 2.13.16 も
+すべて拒否することを確認済み）で固定しています。
+
 ### Remaining
 
 - **`List.newBuilder` / `Vector.newBuilder` がコンパニオンに無い**。`Builder[A, To]`
@@ -1708,6 +1756,14 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   エラーを含むファイルは 109 → 107）になりました。残る `type mismatch` を機械分類すると、
   「解けないままの型パラメータがそのまま出ている」81、「同じクラスで型引数だけ違う」27、
   「`Any` に広がった」14、「found と required が同じ字面」11 で、残りは細かい単発です。
+  さらに `agent/tyvar`（未確定の型変数）スライスで **1059 → 1029**（エラーを含む
+  ファイルは 105 → 104、`no matching overload` は 280 → 266、`type mismatch` は
+  231 → 217）。減ったのは「多相参照が型パラメータを抱えたまま引数位置に届く」形
+  （`Vector[A]` / `Map[K, V]` / `Set[A]` が `found` に出るもの）です。
+  新たにエラーを出すようになったファイルはありません（もともとエラーのあった行に
+  カスケードが 1 本増えた箇所が数か所）。同スライスで `relax_open_tparams`
+  （未確定の型パラメータを `Any` に潰す場当たり。README の記録では 3 回別々の
+  バグの原因になっていた）を**削除**しました。
 
 - **override 検査が無い**。`override` 修飾子の要否も、override 時の型適合も検査していない。
   scalac が拒否する次の 2 つを黙って通す:
@@ -1726,16 +1782,24 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   `def f[F[_]](implicit F: Sync[F]) = F.pure(x)` の `F.pure` で、値の `F` ではなく
   型パラメータ `F` を選んでしまい `found: F  required: F[R]` になる
   （slick の `BasicBackend.scala`）。名前解決が項と型を分けていない。
-- **引数の位置に置いた式は期待型なしで型付けされる**。オーバーロード解決を引数の型で
-  行う都合上、最初のパスではどの引数も期待型 `NoType` で型付けする。直接の期待型が
-  あれば効く経路（タプル要素の関数リテラル、`Coll.empty` の型引数、パラメータを
-  取らない多相メソッドの具体化）が、入れ子になると効かない:
-  `def f(p: (String, Int => Int)) = …; f(("x", n => n + 1))` は
-  `missing parameter type for expanded function` になる（scalac は通す）。
-  nsc は型変数を引数の型付け中も未確定のまま持ち回り、呼び出し全体で一度に解く。
-  コンストラクタ引数（`new Box(Map.empty)`）はパラメータ型から解くようにしたが、
-  メソッド呼び出し（`Seq(Vector.empty)` / `Box(Map.empty)`）はオーバーロード選択が
-  引数の型を先に必要とするため、まだ解けない。
+- **残りの型変数の穴は、値になっていない引数のほう**。引数を期待型なしで型付けすること
+  自体は変えていない（オーバーロード解決が引数の型を先に必要とする）が、そこから出てくる
+  未確定の型変数は `agent/tyvar` スライスで持ち回って解くようにした
+  （「未確定の型変数」の節）。残っているのは、引数の型が**まだ値の型になっていない**場合:
+  - `Array.empty` は `(ClassTag[T])Array[T]`、つまり implicit 節が残ったメソッド型のまま
+    引数位置に届く。scalac は `take(a: Array[String])` に `Array.empty` を渡せるが、
+    こちらは `no matching overload … with arguments ((ClassTag[T])Array[T])` になる。
+    残っている implicit 節を引数位置で適用していないのが原因で、型変数の側ではない。
+    `Array.empty[String]` と書けば通る。
+  - `f(("x", n => n + 1))` のようにタプル要素の関数リテラルは、
+    **scalac 2.13.16 も拒否する**（`missing parameter type` ＋
+    `no type parameters for method apply … exist so that it can be applied to
+    arguments (String, ? => ?)` ＋ `undetermined type`）。以前ここに書いてあった
+    「scalac は通す」は誤りだった。`f("abc", s => s.length)` のような
+    同じ節の中での「先の引数から後の引数のラムダのパラメータ型を決める」形も
+    scalac は拒否する（こちらは通してしまうので、受け入れすぎている側の穴）。
+  - `h(new Box(Map.empty))`（`def h[A](b: Box[Map[String, A]])`）も
+    **scalac が拒否する**（`Box` が非変なため）。
 
 - **明示的な型適用が implicit 引数リストに伝わらない場合がある**。
   `Library.Abs.column[P1](n)`（`def column[T : TypedType]`）や
