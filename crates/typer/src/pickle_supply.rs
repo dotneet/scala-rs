@@ -63,6 +63,30 @@ pub struct PickleSupply {
     stubs: HashMap<String, SymbolId>,
     /// Classes whose pickled parents have already been attached.
     parented: HashSet<u32>,
+    /// Dotted names `conv` needed and could not turn into a symbol, since the
+    /// last `take_unresolved_refs`. The typer uses them to decide which
+    /// classfiles to load before trying again (see `Check::pickled_alias_type`).
+    unresolved_refs: Vec<String>,
+}
+
+/// One `type T[...] = U` recovered from a package object's pickle.
+///
+/// Package-object aliases exist *only* in the pickle: `<pkg>/package$.class`
+/// declares no member for them, so reading the classfile leaves them behind.
+#[derive(Clone, Debug)]
+pub struct PickledAlias {
+    pub name: String,
+    pub tparams: Vec<PickledTParam>,
+    /// The right-hand side, still in the alias's own vocabulary.
+    pub rhs: SigType,
+}
+
+/// A type parameter of a pickled alias. `arity` is its own kind arity, so
+/// `type Ref[F[_], A]` yields `[("F", 1), ("A", 0)]`.
+#[derive(Clone, Debug)]
+pub struct PickledTParam {
+    pub name: String,
+    pub arity: usize,
 }
 
 impl PickleSupply {
@@ -104,6 +128,67 @@ impl PickleSupply {
             }
         }
         out
+    }
+
+    /// The `type` aliases a package object declares, read from its pickle.
+    ///
+    /// `po_full` is the package object's dotted name (`scala.package`).
+    /// `Err` says the pickle is not there or does not parse -- the caller then
+    /// supplies nothing, rather than guessing.
+    pub fn package_object_aliases(
+        &mut self,
+        bin: &mut BinaryIndex,
+        po_full: &str,
+    ) -> Result<Vec<PickledAlias>, String> {
+        let sig = {
+            let mut src = BinSource(bin);
+            self.sigs
+                .class_sig(&mut src, po_full, true)
+                .map_err(|e| e.to_string())?
+        };
+        let mut out = Vec::new();
+        for m in &sig.members {
+            if m.kind != MemberKind::TypeAlias || !m.is_public_api() {
+                continue;
+            }
+            let (tps, rhs) = match &m.ty {
+                SigType::Poly { tparams, result } => (tparams.as_slice(), (**result).clone()),
+                other => (&[][..], other.clone()),
+            };
+            out.push(PickledAlias {
+                name: m.name.clone(),
+                tparams: tps
+                    .iter()
+                    .map(|tp| PickledTParam {
+                        name: tp.name.clone(),
+                        arity: tparam_arity(tp),
+                    })
+                    .collect(),
+                rhs,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Map a pickled type onto the typer's, in `scope`'s vocabulary.
+    ///
+    /// `None` means the type could not be expressed; the names that made it
+    /// fail are then available from `take_unresolved_refs`, so the caller can
+    /// load those classfiles and try again.
+    pub fn convert_pickled_type(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        t: &SigType,
+    ) -> Option<Type> {
+        self.unresolved_refs.clear();
+        self.conv(st, bin, scope, t)
+    }
+
+    /// Dotted names the last `convert_pickled_type` could not resolve.
+    pub fn take_unresolved_refs(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.unresolved_refs)
     }
 
     fn complete_on(
@@ -810,6 +895,16 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
     })
 }
 
+/// A type parameter's own kind arity. nsc pickles `F[_]` as a `POLYtpe` over
+/// the bounds, so the number of quantified names is the arity; a proper type
+/// parameter has plain `Bounds` and arity 0.
+fn tparam_arity(tp: &scala_rs_pickle::sym::TParam) -> usize {
+    match &tp.bounds {
+        SigType::Poly { tparams, .. } => tparams.len(),
+        _ => 0,
+    }
+}
+
 /// Every bare name a type mentions, so we can tell which type parameters an
 /// explicit argument would determine.
 fn mentioned(t: &SigType) -> Vec<String> {
@@ -974,7 +1069,15 @@ impl PickleSupply {
                 return Some(expanded);
             }
         }
-        let cls = self.ensure_class(st, bin, sym, false)?;
+        let Some(cls) = self.ensure_class(st, bin, sym, false) else {
+            // Remembered rather than merely declined: the typer can often load
+            // the classfile itself (any package on `-cp`, not just `scala.*`)
+            // and ask again.
+            if !self.unresolved_refs.iter().any(|s| s == sym) {
+                self.unresolved_refs.push(sym.to_string());
+            }
+            return None;
+        };
         let a = self.conv_all(st, bin, scope, args, d)?;
         if a.len() != st.get(cls).tparams.len() {
             trace(format_args!(

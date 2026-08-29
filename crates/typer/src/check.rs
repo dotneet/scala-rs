@@ -115,6 +115,13 @@ pub struct Typer {
     /// Fills library members the hand-written prelude does not declare, from
     /// their `ScalaSignature` pickles. Only consulted when resolution failed.
     pickle: crate::pickle_supply::PickleSupply,
+    /// Packages whose jar package object's pickled `type` aliases have been
+    /// installed (see `install_pickled_package_aliases`). One read per package.
+    pkg_aliases_done: HashSet<u32>,
+    /// Pickled package-object aliases whose right-hand side could not be
+    /// rebuilt, by simple name: the name then reports *why* it is missing
+    /// instead of the bare "not found".
+    pkg_alias_gaps: HashMap<String, String>,
     /// Members without a type annotation, keyed by symbol: nsc's lazy
     /// completers (see `crate::lazysig`).
     pub(crate) pending_sigs: HashMap<SymbolId, PendingSig>,
@@ -257,6 +264,8 @@ impl Typer {
             completed_java: HashSet::new(),
             parent_ctx: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
+            pkg_aliases_done: HashSet::new(),
+            pkg_alias_gaps: HashMap::new(),
             pending_sigs: HashMap::new(),
             lazy_completing: Vec::new(),
             lazy_cyclic: HashSet::new(),
@@ -662,7 +671,8 @@ impl Typer {
         // kind error: nsc reports `not found: type X`.
         if let Type::Named { name, args: pre } = &ctor {
             if pre.is_empty() && self.st.class_sym_of(&ctor).is_none() {
-                self.error(span, format!("not found: type {name}"));
+                let name = name.clone();
+                self.not_found_error(span, "type", &name);
                 return Type::Error;
             }
         }
@@ -3564,7 +3574,186 @@ impl Typer {
                 self.st.get_mut(owner).members.push(mem);
             }
         }
+        self.install_pickled_package_aliases(owner, span);
         Some(mcls)
+    }
+
+    /// A package object's `type` aliases never reach its classfile: scalac
+    /// writes them only into the `ScalaSignature` pickle. Folding
+    /// `<pkg>/package$`'s *members* into the package therefore leaves
+    /// `scala.NoSuchElementException` and `cats.effect.Ref` unresolvable.
+    /// Read them from the pickle and enter them as type members of the
+    /// package, which is where source code names them from.
+    ///
+    /// Lazy by construction: this runs when a package object is first needed,
+    /// so no package is read ahead of time. An alias whose right-hand side
+    /// cannot be rebuilt is *not* installed -- a type member pointing at
+    /// nothing would silently mean `Any` -- but it is remembered, so the name
+    /// reports why it is missing instead of a bare "not found".
+    fn install_pickled_package_aliases(&mut self, pkg: SymbolId, span: Span) {
+        if !self.pkg_aliases_done.insert(pkg.0) {
+            return;
+        }
+        let pkg_jvm = self.st.get(pkg).jvm_name.clone();
+        if pkg_jvm.is_empty() {
+            return;
+        }
+        let dotted = pkg_jvm.replace('/', ".");
+        let Ok(aliases) = self
+            .pickle
+            .package_object_aliases(&mut self.binary, &format!("{dotted}.package"))
+        else {
+            // No pickle (a Java-only package, or one compiled in this run):
+            // there is nothing to supply, and nothing is claimed.
+            return;
+        };
+        for a in aliases {
+            // Anything already there wins: the hand-written prelude, and any
+            // real class of the same name. This only fills a hole.
+            if a.name.is_empty() || !self.type_owner_members(pkg, &a.name).is_empty() {
+                continue;
+            }
+            match self.pickled_alias_type(&a, span) {
+                Some((id, ty)) => {
+                    self.st.get_mut(id).ty = ty;
+                    self.st.get_mut(id).owner = pkg;
+                    self.st.get_mut(pkg).members.push(id);
+                }
+                None => {
+                    self.pkg_alias_gaps
+                        .entry(a.name.clone())
+                        .or_insert_with(|| {
+                            format!(
+                                "not found: type {} -- package object {} declares it as an alias \
+                             for {}, which this compiler cannot express",
+                                a.name,
+                                dotted,
+                                scala_rs_pickle::sym::render(&a.rhs)
+                            )
+                        });
+                }
+            }
+        }
+    }
+
+    /// Build the symbol for one pickled package-object alias: its own type
+    /// parameters first, then its right-hand side.
+    ///
+    /// The classes the right-hand side names are loaded from the classpath on
+    /// demand. The pickle reader can only reach `scala.*` on its own, so
+    /// `cats.effect.kernel.Ref` has to be resolved here, where the whole
+    /// classpath is available; each round loads what the last one asked for
+    /// and tries again, and stops as soon as a round resolves nothing new.
+    ///
+    /// The symbol is allocated ownerless, so declining leaves the package
+    /// untouched.
+    fn pickled_alias_type(
+        &mut self,
+        a: &crate::pickle_supply::PickledAlias,
+        span: Span,
+    ) -> Option<(SymbolId, Type)> {
+        let id = self.st.alloc(
+            &a.name,
+            SymbolId::NONE,
+            SymKind::TypeMember,
+            Flags::EMPTY,
+            "",
+        );
+        let mut scope: HashMap<String, Type> = HashMap::new();
+        let mut tps = Vec::new();
+        for tp in &a.tparams {
+            let t = self
+                .st
+                .alloc(&tp.name, id, SymKind::TypeParam, Flags::EMPTY, "");
+            self.st.get_mut(t).ty = Type::TypeParam(t);
+            // `type Ref[F[_], A]`: `F` is itself a constructor, and getting its
+            // arity right is what keeps `Ref[F, A]` from reporting "does not
+            // take type parameters" at the use site.
+            let inner: Vec<SymbolId> = (0..tp.arity)
+                .map(|i| {
+                    let x =
+                        self.st
+                            .alloc(format!("_${i}"), t, SymKind::TypeParam, Flags::EMPTY, "");
+                    self.st.get_mut(x).ty = Type::TypeParam(x);
+                    x
+                })
+                .collect();
+            self.st.get_mut(t).tparams = inner;
+            scope.insert(tp.name.clone(), Type::TypeParam(t));
+            tps.push(t);
+        }
+        self.st.get_mut(id).tparams = tps;
+        let mut asked: HashSet<String> = HashSet::new();
+        for _ in 0..8 {
+            if let Some(ty) =
+                self.pickle
+                    .convert_pickled_type(&mut self.st, &mut self.binary, &scope, &a.rhs)
+            {
+                return Some((id, ty));
+            }
+            let mut progress = false;
+            for m in self.pickle.take_unresolved_refs() {
+                if asked.insert(m.clone()) && self.resolve_dotted_class(&m, span).is_some() {
+                    progress = true;
+                }
+            }
+            if !progress {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// The class a pickled dotted name denotes (`cats.effect.kernel.Ref`),
+    /// loading it from the classpath if it is not in the table yet.
+    ///
+    /// Walked one segment at a time rather than turned into a JVM name in one
+    /// go, so an object in the middle of the path
+    /// (`cats.effect.kernel.Par.ParallelF`) comes out as the nested class it
+    /// is, not as a package that does not exist.
+    fn resolve_dotted_class(&mut self, dotted: &str, span: Span) -> Option<SymbolId> {
+        let mut cur = self.st.root;
+        for seg in dotted.split('.') {
+            if seg.is_empty() {
+                return None;
+            }
+            let owner = self.as_type_owner(cur);
+            // The classfile this segment names, given where the walk is: a
+            // member of a package is `p/Seg`, one nested in a class `Outer$Seg`.
+            let want = if owner == self.st.root {
+                seg.to_string()
+            } else {
+                let base = self
+                    .st
+                    .get(owner)
+                    .jvm_name
+                    .trim_end_matches('$')
+                    .to_string();
+                match self.st.get(owner).kind {
+                    SymKind::Package => format!("{base}/{seg}"),
+                    _ => format!("{base}${seg}"),
+                }
+            };
+            self.complete_binary_member(owner, seg, span);
+            let mut found = self.type_owner_members(owner, seg);
+            // A companion's classfile can already hold the simple name with
+            // the module class's JVM name (`Outcome` -> `.../Outcome$`), which
+            // carries none of the trait's type parameters. Insist on the
+            // classfile the path really names, and read it if the table has
+            // not seen it: a type constructor of the wrong arity would make
+            // every use of the alias an error.
+            if !found.iter().any(|&s| self.st.get(s).jvm_name == want)
+                && self.load_binary_into(&want, owner, span, true)
+            {
+                found = self.type_owner_members(owner, seg);
+            }
+            cur = found
+                .iter()
+                .copied()
+                .find(|&s| self.st.get(s).jvm_name == want)
+                .or_else(|| found.into_iter().next())?;
+        }
+        Some(cur)
     }
 
     /// `import p.n` / `import p.{n => alias}`.
@@ -3896,7 +4085,8 @@ impl Typer {
                     self.expose_unqualified(&n, tpt.span);
                     let found = self.st.lookup(&n);
                     if let Some(id) = found
-                        .into_iter()
+                        .iter()
+                        .copied()
                         .find(|s| self.st.get(*s).kind == SymKind::Class)
                     {
                         tpt.sym = id;
@@ -3904,6 +4094,15 @@ impl Typer {
                             sym: id,
                             args: vec![],
                         };
+                    } else if let Some(alias) = self.new_alias_target(&found, tpt.span) {
+                        // `new A(…)` where `type A = C`: nsc constructs the
+                        // alias's right-hand side. The alias symbol has no
+                        // constructor of its own, so leaving it bound here
+                        // reports "no matching overload for constructor A".
+                        // The qualified form (`new p.A(…)`) already dealiases
+                        // through `class_sym_of`; this is the unqualified one.
+                        tpt.sym = self.st.class_sym_of(&alias).unwrap_or(SymbolId::NONE);
+                        tpt.ty = alias;
                     } else {
                         self.type_expr(tpt, &Type::NoType);
                     }
@@ -4147,6 +4346,42 @@ impl Typer {
             .find(|&s| self.st.get(s).kind == SymKind::Package)
     }
 
+    /// The class type `new <name>` builds when `name` binds a *type alias*.
+    ///
+    /// `None` for anything else, an abstract `type A <: Bound` included:
+    /// `new A` is not a program, and constructing the bound instead would be a
+    /// different one.
+    fn new_alias_target(&mut self, found: &[SymbolId], span: Span) -> Option<Type> {
+        let alias = found
+            .iter()
+            .copied()
+            .find(|&s| self.st.get(s).kind == SymKind::TypeMember)?;
+        self.complete_lazy_sig(alias, span);
+        let target = self.st.dealias(&Type::TypeMember(alias));
+        if matches!(target, Type::TypeMember(_)) {
+            return None;
+        }
+        self.st.class_sym_of(&target).map(|_| target)
+    }
+
+    /// `not found: <what> <name>`, unless a package object declares `name` as
+    /// an alias we could not rebuild -- then say so, rather than let the user
+    /// hunt for a name that is really there.
+    fn not_found_error(&mut self, span: Span, what: &str, name: &str) {
+        match self.pkg_alias_gaps.get(name).cloned() {
+            Some(msg) => self.error(span, msg),
+            None => self.error(span, format!("not found: {what} {name}")),
+        }
+    }
+
+    /// The `scala` package, for the implicit `import scala._`.
+    fn scala_package(&self) -> Option<SymbolId> {
+        self.st
+            .lookup_member(self.st.root, "scala")
+            .into_iter()
+            .find(|&s| self.st.get(s).kind == SymKind::Package)
+    }
+
     fn expose_unqualified(&mut self, name: &str, span: Span) {
         if name.is_empty() || !self.st.lookup(name).is_empty() {
             return;
@@ -4174,6 +4409,20 @@ impl Typer {
             pkg = owner;
         }
         let pkg = self.enclosing_package(from);
+        if self.st.lookup(name).is_empty() {
+            // Every Scala source has an implicit `import scala._`, which ranks
+            // above `java.lang._`. Almost every name it offers is already in
+            // the prelude, so what this reaches in practice is the `scala`
+            // package object's pickled type aliases -- `NoSuchElementException`,
+            // `Seq`, `Iterable` -- which `complete_binary_member` installs on
+            // the package the first time one is asked for.
+            if let Some(sp) = self.scala_package() {
+                self.complete_binary_member(sp, name, span);
+                for id in self.st.lookup_member(sp, name) {
+                    self.st.enter_in_current(name, id);
+                }
+            }
+        }
         if self.st.lookup(name).is_empty() {
             // Every Scala source has an implicit `import java.lang._`.
             if let Some(jl) = self.java_lang_package() {
@@ -4219,7 +4468,7 @@ impl Typer {
             found = self.st.lookup_member(self.st.root, &name);
         }
         if found.is_empty() {
-            self.error(tree.span, format!("not found: value {name}"));
+            self.not_found_error(tree.span, "value", &name);
             tree.ty = Type::Error;
             return;
         }
