@@ -226,5 +226,6 @@ conform!(
     regex_extractor,
     tuple_ordering,
     nested_value_class,
-    fn_compose
+    fn_compose,
+    try_extractor
 );

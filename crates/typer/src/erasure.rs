@@ -1175,6 +1175,21 @@ pub fn note_source_value_classes(tree: &Tree, st: &mut SymbolTable) {
     let mut found = Vec::new();
     collect_source_value_classes(tree, st, &mut found);
     st.source_value_classes.extend(found);
+    let mut all = Vec::new();
+    collect_source_classes(tree, &mut all);
+    st.source_classes.extend(all);
+}
+
+/// Every class and object this unit defines.
+fn collect_source_classes(tree: &Tree, out: &mut Vec<SymbolId>) {
+    if matches!(
+        tree.kind,
+        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+    ) && !tree.sym.is_none()
+    {
+        out.push(tree.sym);
+    }
+    for_each_child(tree, &mut |c| collect_source_classes(c, out));
 }
 
 fn collect_source_value_classes(tree: &Tree, st: &SymbolTable, out: &mut Vec<SymbolId>) {

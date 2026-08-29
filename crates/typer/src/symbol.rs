@@ -342,6 +342,11 @@ pub struct SymbolTable {
     /// Value classes compiled from source in this run; see
     /// `erasure::note_source_value_classes`.
     pub source_value_classes: std::collections::HashSet<SymbolId>,
+    /// Classes defined by the units being compiled, as opposed to ones read
+    /// from the prelude or the classpath. A library case class keeps its
+    /// constructor fields private behind accessors; ours are emitted with the
+    /// field public, so the two are read differently.
+    pub source_classes: std::collections::HashSet<SymbolId>,
 }
 
 impl SymbolTable {
@@ -406,6 +411,7 @@ impl SymbolTable {
             this_class: SymbolId(0),
             value_class_terms: std::collections::HashMap::new(),
             source_value_classes: std::collections::HashSet::new(),
+            source_classes: std::collections::HashSet::new(),
         };
         st.root = st.alloc(
             "<_root_>",

@@ -13789,13 +13789,24 @@ fn gen_pattern(
                     let fdesc = jvm_desc(ctx.st, &fty);
                     load(asm, tmp, JvmSort::Ref);
                     asm.checkcast(&jvm);
-                    // Library classes keep the field private; `jvm_name` on the
-                    // constructor field names the accessor to call instead.
+                    // A case class's field is private with a public accessor
+                    // (`scala.util.Failure.exception`), so reading the field
+                    // is an `IllegalAccessError`. Call the accessor whenever
+                    // the class has one -- which is what nsc emits, and what
+                    // our own case classes have too. `jvm_name` names it when
+                    // the accessor is spelled differently.
                     let acc = ctx.st.get(*fid).jvm_name.clone();
-                    if acc.is_empty() {
-                        asm.getfield(&jvm, &fname, &fdesc);
+                    let acc = if !acc.is_empty() {
+                        Some(acc)
+                    } else if ctx.st.source_classes.contains(&class_id) {
+                        // Our own classes emit the field public.
+                        None
                     } else {
-                        asm.invokevirtual(&jvm, &acc, &format!("(){fdesc}"));
+                        Some(fname.clone())
+                    };
+                    match acc {
+                        Some(a) => asm.invokevirtual(&jvm, &a, &format!("(){fdesc}")),
+                        None => asm.getfield(&jvm, &fname, &fdesc),
                     }
                     // A field declared as a type parameter erases to Object, so
                     // `case Some(x)` on an `Option[Int]` must unbox before it
