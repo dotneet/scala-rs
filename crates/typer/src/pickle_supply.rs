@@ -876,6 +876,18 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
             Some(lo) if !matches!(lo, SigType::Ref { sym, .. } if sym == "scala.Nothing") => {
                 pin.insert(tp.name.clone(), lo.clone());
             }
+            // No lower bound to pin it to, but the *result* names it: the call
+            // site can still determine it, from an explicit type application
+            // (`classTag[Short]`) or from the expected type. Keep the member.
+            // `max[B >: A](implicit ord: Ordering[B]): A` is the other shape --
+            // `B` is nowhere in the result, and it does have a lower bound.
+            _ if mentioned(&shape.ret).contains(&tp.name) => {
+                kept.push(ShapeTParam {
+                    name: tp.name.clone(),
+                    lo: tp.lo.clone(),
+                    hi: tp.hi.clone(),
+                });
+            }
             // Unconstrained and undeterminable: refuse the member rather than
             // hand the typer something it will silently eta-expand.
             _ => return None,
