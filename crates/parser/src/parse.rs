@@ -2874,23 +2874,19 @@ impl<'a> Parser<'a> {
     fn parse_infix_expr(&mut self, min_prec: i32) -> Tree {
         let mut left = self.parse_prefix_expr();
         loop {
-            // newline before operator continues the infix expr (Scala)
+            // nsc `postfixExpr`'s loop stops as soon as the current token is not
+            // an identifier, and a statement-separating NEWLINE is a token of its
+            // own. So `{ 1 }` followed by a line starting with `-` is two
+            // statements, not a subtraction. (An operator at the *end* of a line
+            // still continues -- that newline is skipped further down, matching
+            // nsc's `newLineOptWhenFollowing`.)
             let saved = self.pos;
-            if matches!(self.kind(), TokenKind::Newline) {
-                self.skip_nl();
-            }
             let Some(op) = self.ident_text() else {
                 self.pos = saved;
                 break;
             };
             let prec = op_precedence(&op);
             if prec < min_prec {
-                self.pos = saved;
-                break;
-            }
-            // Don't treat letter-idents as infix if they could start a new statement
-            // after a newline. `foo\nbar` is two stats; `foo\n+ bar` is infix.
-            if saved != self.pos && !is_operator_name(&op) {
                 self.pos = saved;
                 break;
             }

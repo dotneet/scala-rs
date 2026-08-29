@@ -311,6 +311,14 @@ pub struct SymbolTable {
     /// Enclosing owner while naming/typing.
     pub owner: SymbolId,
     pub this_class: SymbolId,
+    /// Terms whose pre-erasure type was a user value class, and which one.
+    /// Erasure replaces the type with the underlying representation, but the
+    /// backend still has to know that `case class Box(m: Meters)` prints its
+    /// field as a boxed `Meters`.
+    pub value_class_terms: std::collections::HashMap<SymbolId, SymbolId>,
+    /// Value classes compiled from source in this run; see
+    /// `erasure::note_source_value_classes`.
+    pub source_value_classes: std::collections::HashSet<SymbolId>,
 }
 
 impl SymbolTable {
@@ -371,6 +379,8 @@ impl SymbolTable {
             object_sym: SymbolId(0),
             owner: SymbolId(0),
             this_class: SymbolId(0),
+            value_class_terms: std::collections::HashMap::new(),
+            source_value_classes: std::collections::HashSet::new(),
         };
         st.root = st.alloc(
             "<_root_>",
@@ -504,6 +514,36 @@ impl SymbolTable {
             }
         }
         module_fallback
+    }
+
+    /// Look a name up in the *term* namespace, the mirror of `lookup_type`.
+    /// `import syntax._` bringing a `type HNil` alias into scope must not hide
+    /// the top-level `object HNil` from `HNil.type`, so a scope that binds the
+    /// name only in the type namespace is skipped and the search continues
+    /// outward.
+    pub fn lookup_term(&self, name: &str) -> Vec<SymbolId> {
+        for sc in self.scopes.iter().rev() {
+            let found = sc.lookup(name);
+            if found.is_empty() {
+                continue;
+            }
+            if found.iter().any(|&s| self.is_term_namespace(s)) {
+                return found.to_vec();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Names that live in the term namespace under their own spelling.
+    fn is_term_namespace(&self, s: SymbolId) -> bool {
+        matches!(
+            self.get(s).kind,
+            SymKind::Term
+                | SymKind::Method
+                | SymKind::Module
+                | SymKind::ModuleClass
+                | SymKind::Package
+        )
     }
 
     /// Names that live in the type namespace under their own spelling.

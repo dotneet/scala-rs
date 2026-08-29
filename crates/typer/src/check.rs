@@ -4581,6 +4581,20 @@ impl Typer {
         }
         self.expose_unqualified(&name, tree.span);
         let mut found = self.st.lookup(&name);
+        // A scope that binds the name only in the *type* namespace does not
+        // hide a term of that name further out: `import syntax._` bringing a
+        // `type HNil` alias into scope leaves `object HNil` reachable.
+        if !found.iter().any(|s| {
+            matches!(
+                self.st.get(*s).kind,
+                SymKind::Module | SymKind::ModuleClass | SymKind::Method | SymKind::Term
+            )
+        }) {
+            let terms = self.st.lookup_term(&name);
+            if !terms.is_empty() {
+                found = terms;
+            }
+        }
         if found.is_empty() {
             found = self.st.lookup_member(self.st.root, &name);
         }
@@ -10597,7 +10611,24 @@ impl Typer {
         }
     }
 
+    /// The leftmost identifier of a path has to be brought into scope before
+    /// the path can be resolved: `p.HNil.type` in package `p` only sees `p`
+    /// once `expose_unqualified` has entered it.
+    fn expose_path_head(&mut self, t: &Tree) {
+        match &t.kind {
+            TreeKind::Ident { name } => {
+                let name = name.clone();
+                self.expose_unqualified(&name, t.span);
+            }
+            TreeKind::Select { qual, .. } | TreeKind::SelectFromTypeTree { qual, .. } => {
+                self.expose_path_head(qual)
+            }
+            _ => {}
+        }
+    }
+
     fn singleton_to_type(&mut self, span: Span, ref_: &Tree) -> Type {
+        self.expose_path_head(ref_);
         match &ref_.kind {
             TreeKind::This { qual } => {
                 let id = if let Some(name) = qual {
@@ -10652,14 +10683,24 @@ impl Typer {
 
     fn term_path_sym(&self, t: &Tree) -> Option<SymbolId> {
         match &t.kind {
-            TreeKind::Ident { name } => self.st.lookup(name).into_iter().find(|s| {
+            TreeKind::Ident { name } => self.st.lookup_term(name).into_iter().find(|s| {
                 matches!(
                     self.st.get(*s).kind,
                     SymKind::Term | SymKind::Module | SymKind::ModuleClass
                 )
             }),
             TreeKind::Select { qual, name } | TreeKind::SelectFromTypeTree { qual, name, .. } => {
-                let qt = self.term_path_type(qual)?;
+                let Some(qt) = self.term_path_type(qual) else {
+                    // A package is not a value, so it has no type -- but it is
+                    // still a legal path prefix: `p.q.HNil.type`.
+                    let owner = self.path_owner_sym(qual)?;
+                    return self.st.lookup_member(owner, name).into_iter().find(|s| {
+                        matches!(
+                            self.st.get(*s).kind,
+                            SymKind::Term | SymKind::Module | SymKind::ModuleClass
+                        )
+                    });
+                };
                 if let Type::Refined { decls, .. } = &qt {
                     if decls.iter().any(|d| {
                         matches!(
@@ -10670,7 +10711,7 @@ impl Typer {
                         return None;
                     }
                 }
-                let cls = self.st.class_sym_of(&qt)?;
+                let cls = self.path_member_owner(&qt)?;
                 self.st.lookup_member(cls, name).into_iter().find(|s| {
                     matches!(
                         self.st.get(*s).kind,
@@ -10682,8 +10723,47 @@ impl Typer {
         }
     }
 
+    /// The owner a path prefix names when that prefix is a package or a
+    /// module. Packages carry no type, so `term_path_type` has nothing to hand
+    /// back for them, yet they are legal prefixes of a stable path.
+    fn path_owner_sym(&self, t: &Tree) -> Option<SymbolId> {
+        let pick = |st: &SymbolTable, cands: Vec<SymbolId>| -> Option<SymbolId> {
+            cands
+                .into_iter()
+                .find(|s| {
+                    matches!(
+                        st.get(*s).kind,
+                        SymKind::Package | SymKind::Module | SymKind::ModuleClass
+                    )
+                })
+                .map(|s| match st.get(s).kind {
+                    SymKind::Module => st.module_class_of(s),
+                    _ => s,
+                })
+        };
+        match &t.kind {
+            TreeKind::Ident { name } => pick(&self.st, self.st.lookup_term(name)),
+            TreeKind::Select { qual, name } | TreeKind::SelectFromTypeTree { qual, name, .. } => {
+                let owner = self.path_owner_sym(qual)?;
+                pick(&self.st, self.st.lookup_member(owner, name))
+            }
+            _ => None,
+        }
+    }
+
+    /// The symbol whose members a path prefix offers. `object O { object I }`
+    /// keeps `I` on the *module class* `O$`, so `O.I.type` has to look there
+    /// and not on the module symbol itself.
+    fn path_member_owner(&self, ty: &Type) -> Option<SymbolId> {
+        let cls = self.st.class_sym_of(ty)?;
+        Some(match self.st.get(cls).kind {
+            SymKind::Module => self.st.module_class_of(cls),
+            _ => cls,
+        })
+    }
+
     fn ident_is_stable(&self, name: &str) -> bool {
-        let found = self.st.lookup(name);
+        let found = self.st.lookup_term(name);
         found.iter().any(|s| {
             let sy = self.st.get(*s);
             match sy.kind {
@@ -10697,7 +10777,18 @@ impl Typer {
 
     fn member_is_stable(&self, qual: &Tree, name: &str) -> bool {
         let Some(pty) = self.term_path_type(qual) else {
-            return false;
+            // `p.HNil` under a package prefix: the package has no type.
+            return match self.path_owner_sym(qual) {
+                Some(owner) => self.st.lookup_member(owner, name).iter().any(|s| {
+                    let sy = self.st.get(*s);
+                    match sy.kind {
+                        SymKind::Module | SymKind::ModuleClass | SymKind::Package => true,
+                        SymKind::Term => !sy.flags.contains(Flags::MUTABLE),
+                        _ => false,
+                    }
+                }),
+                None => false,
+            };
         };
         if let Type::Refined { decls, .. } = &pty {
             if decls.iter().any(|d| {
@@ -10717,7 +10808,7 @@ impl Typer {
                 return false;
             }
         }
-        let Some(cls) = self.st.class_sym_of(&pty) else {
+        let Some(cls) = self.path_member_owner(&pty) else {
             return false;
         };
         self.st.lookup_member(cls, name).iter().any(|s| {
@@ -10747,7 +10838,7 @@ impl Typer {
                 (!parent.is_none()).then(|| self.st.type_of_class(parent))
             }
             TreeKind::Ident { name } => {
-                let found = self.st.lookup(name);
+                let found = self.st.lookup_term(name);
                 found.into_iter().find_map(|s| {
                     let sy = self.st.get(s);
                     match sy.kind {
@@ -10758,13 +10849,30 @@ impl Typer {
                 })
             }
             TreeKind::Select { qual, name } | TreeKind::SelectFromTypeTree { qual, name, .. } => {
-                let qt = self.term_path_type(qual)?;
+                let Some(qt) = self.term_path_type(qual) else {
+                    // A package prefix (`p.HNil`) carries no type of its own.
+                    let owner = self.path_owner_sym(qual)?;
+                    return self
+                        .st
+                        .lookup_member(owner, name)
+                        .into_iter()
+                        .find_map(|s| {
+                            let sy = self.st.get(s);
+                            match sy.kind {
+                                SymKind::Term | SymKind::Method => Some(sy.ty.clone()),
+                                SymKind::Module | SymKind::ModuleClass => {
+                                    Some(self.st.type_of_class(s))
+                                }
+                                _ => None,
+                            }
+                        });
+                };
                 if let Type::Refined { decls, .. } = &qt {
                     if let Some(t) = SymbolTable::refine_member_type(decls, name) {
                         return Some(self.st.expand_in_type(&qt, &t));
                     }
                 }
-                let cls = self.st.class_sym_of(&qt)?;
+                let cls = self.path_member_owner(&qt)?;
                 self.st.lookup_member(cls, name).into_iter().find_map(|s| {
                     let sy = self.st.get(s);
                     match sy.kind {

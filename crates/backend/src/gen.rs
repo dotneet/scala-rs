@@ -1987,6 +1987,7 @@ impl<'a> Gen<'a> {
         self.emit_mixin_forwarders(&mut b, class_id, &impl_.body);
         self.emit_delayed_init_support(&mut b, class_id, &impl_.body, false);
         self.emit_case_object_methods(&mut b, class_id);
+        self.emit_value_class_methods(&mut b, class_id);
         self.emit_erasure_bridges(&mut b, class_id);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out.push(b.finish());
@@ -2750,6 +2751,108 @@ impl<'a> Gen<'a> {
         );
     }
 
+    /// nsc's `SyntheticMethods` for a value class. A boxed `Meters(5)` has to
+    /// compare and hash by its underlying value -- otherwise `m == new
+    /// Meters(5)` is reference equality once either side is boxed, and
+    /// `Object.toString` prints an identity hash where nsc prints `Meters@5`.
+    /// The `$extension` statics mirror what nsc puts on the class.
+    fn emit_value_class_methods(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        if !self.st.is_value_class(class_id) {
+            return;
+        }
+        let Some(&f) = self.st.get(class_id).ctor_fields.first() else {
+            return;
+        };
+        let fname = self.st.get(f).name.clone();
+        let fty = self.st.get(f).ty.clone();
+        let fdesc = jvm_desc(self.st, &fty);
+        let cj = b.this_name.clone();
+        let defined: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
+        let wide = matches!(fty, Type::Long | Type::Double);
+        let fslots = if wide { 2u16 } else { 1 };
+
+        // `hashCode$extension(u)` = the underlying's own hash, which is what
+        // `Integer.hashCode(n)` gives for the common `Int` case.
+        if !defined.contains("hashCode$extension") {
+            let (t, d) = (fty.clone(), fdesc.clone());
+            b.add_code(
+                ACC_PUBLIC | ACC_STATIC,
+                "hashCode$extension",
+                &format!("({d})I"),
+                fslots,
+                move |asm| {
+                    load(asm, 0, jvm_sort(&t));
+                    if is_jvm_primitive(&t) {
+                        emit_box(asm, &t);
+                    }
+                    asm.invokestatic("java/util/Objects", "hashCode", "(Ljava/lang/Object;)I");
+                    asm.ireturn();
+                },
+            );
+        }
+        if !defined.contains("hashCode") {
+            let (cj2, fname2, fdesc2, d) =
+                (cj.clone(), fname.clone(), fdesc.clone(), fdesc.clone());
+            let cj3 = cj.clone();
+            b.add_code(ACC_PUBLIC, "hashCode", "()I", 1, move |asm| {
+                asm.aload(0);
+                asm.getfield(&cj2, &fname2, &fdesc2);
+                asm.invokestatic(&cj3, "hashCode$extension", &format!("({d})I"));
+                asm.ireturn();
+            });
+        }
+
+        // `equals$extension(u, that)` = `that.isInstanceOf[C] && u == that.u`.
+        if !defined.contains("equals$extension") {
+            let (t, d) = (fty.clone(), fdesc.clone());
+            let (cj2, fname2, fdesc2) = (cj.clone(), fname.clone(), fdesc.clone());
+            b.add_code(
+                ACC_PUBLIC | ACC_STATIC,
+                "equals$extension",
+                &format!("({d}Ljava/lang/Object;)Z"),
+                fslots + 1,
+                move |asm| {
+                    let no = asm.fresh_label();
+                    asm.aload(fslots);
+                    asm.instanceof(&cj2);
+                    asm.ifeq(no);
+                    load(asm, 0, jvm_sort(&t));
+                    asm.aload(fslots);
+                    asm.checkcast(&cj2);
+                    asm.getfield(&cj2, &fname2, &fdesc2);
+                    emit_field_ne_jump(asm, &t, no);
+                    asm.iconst(1);
+                    asm.ireturn();
+                    asm.mark(no);
+                    asm.iconst(0);
+                    asm.ireturn();
+                },
+            );
+        }
+        if !defined.contains("equals") {
+            let (cj2, fname2, fdesc2, d) =
+                (cj.clone(), fname.clone(), fdesc.clone(), fdesc.clone());
+            let cj3 = cj.clone();
+            b.add_code(
+                ACC_PUBLIC,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                2,
+                move |asm| {
+                    asm.aload(0);
+                    asm.getfield(&cj2, &fname2, &fdesc2);
+                    asm.aload(1);
+                    asm.invokestatic(
+                        &cj3,
+                        "equals$extension",
+                        &format!("({d}Ljava/lang/Object;)Z"),
+                    );
+                    asm.ireturn();
+                },
+            );
+        }
+    }
+
     fn emit_trait_impl_class(&mut self, tree: &Tree, iface: &str) {
         let class_id = tree.sym;
         let methods = self.trait_impls.get(&class_id).cloned().unwrap_or_default();
@@ -3235,6 +3338,19 @@ impl<'a> Gen<'a> {
                 (s.name.clone(), ty, desc)
             })
             .collect();
+        // A field of value-class type is stored unboxed but *printed* as an
+        // instance: nsc's `Box(Meters@3,b)`, not `Box(3,b)`.
+        let field_vc: Vec<Option<(String, String)>> = fields
+            .iter()
+            .map(|f| {
+                let c = *self.st.value_class_terms.get(f)?;
+                let under = self.st.value_class_underlying(c)?;
+                Some((
+                    class_internal(self.st, c),
+                    format!("({})V", jvm_desc(self.st, &under)),
+                ))
+            })
+            .collect();
 
         if !defined.contains("productPrefix") {
             let text = simple.clone();
@@ -3259,6 +3375,7 @@ impl<'a> Gen<'a> {
 
         if !defined.contains("toString") {
             let fi = field_info.clone();
+            let fvc = field_vc.clone();
             let cj = class_jvm.clone();
             let head = format!("{simple}(");
             b.add_code(ACC_PUBLIC, "toString", "()Ljava/lang/String;", 1, |asm| {
@@ -3269,6 +3386,19 @@ impl<'a> Gen<'a> {
                 for (i, (name, ty, desc)) in fi.iter().enumerate() {
                     if i > 0 {
                         append_str(asm, ",");
+                    }
+                    if let Some(Some((internal, ctor))) = fvc.get(i) {
+                        asm.new_obj(internal);
+                        asm.dup();
+                        asm.aload(0);
+                        asm.getfield(&cj, name, desc);
+                        asm.invokespecial(internal, "<init>", ctor);
+                        asm.invokevirtual(
+                            "java/lang/StringBuilder",
+                            "append",
+                            "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
+                        );
+                        continue;
                     }
                     asm.aload(0);
                     asm.getfield(&cj, name, desc);
@@ -4324,6 +4454,38 @@ fn emit_case_copy(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
 // bytecode helpers
 // ---------------------------------------------------------------------------
 
+/// Jump to `no` when the two values of type `ty` on the stack differ.
+fn emit_field_ne_jump(asm: &mut Assembler, ty: &Type, no: crate::code::Label) {
+    match ty {
+        Type::Long => {
+            asm.lcmp();
+            asm.ifne(no);
+        }
+        Type::Double => {
+            asm.dcmpl();
+            asm.ifne(no);
+        }
+        Type::Float => {
+            asm.fcmpl();
+            asm.ifne(no);
+        }
+        t if is_jvm_primitive(t) => {
+            let eq = asm.fresh_label();
+            asm.if_icmpeq(eq);
+            asm.goto(no);
+            asm.mark(eq);
+        }
+        _ => {
+            asm.invokestatic(
+                "java/util/Objects",
+                "equals",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+            );
+            asm.ifeq(no);
+        }
+    }
+}
+
 fn load(asm: &mut Assembler, slot: u16, sort: JvmSort) {
     match sort {
         JvmSort::Int => asm.iload(slot),
@@ -4640,6 +4802,28 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
             // nested member: not lifted in this pass
         }
         TreeKind::Import { .. } | TreeKind::TypeDef { .. } | TreeKind::Empty => {}
+        // nsc's `genLoadIf` with `expectedType = UNIT`: in statement position
+        // the value is dropped, so both branches are generated in statement
+        // mode. A one-legged `if` is `if (c) t else ()`, whose lub with a
+        // value-returning `t` is `Any` (`if (c) { buf += x }`); generating the
+        // branches for that type leaves the two paths at different stack
+        // heights, because the `else ()` pushes nothing.
+        TreeKind::If { cond, thenp, elsep } => {
+            gen_if(asm, frame, ctx, cond, thenp, elsep, &Type::Unit);
+        }
+        // Same story for the other branching forms: two arms whose types only
+        // meet at `Any` are not boxed to a common representation when the
+        // result is discarded, so each arm has to drop its own value.
+        TreeKind::Match { selector, cases } => {
+            gen_match(asm, frame, ctx, selector, cases, &Type::Unit);
+        }
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            gen_try(asm, frame, ctx, block, catches, finalizer, &Type::Unit);
+        }
         _ => {
             gen_expr(asm, frame, ctx, tree);
             if is_unit_like(&tree.ty) {
@@ -5572,6 +5756,50 @@ fn gen_apply(
         } else {
             push_default(asm, &tree.ty);
         }
+        return;
+    }
+    // A user value class boxes as a real instance of itself, not as the box of
+    // its underlying type: `new Meters(n)` / `((Meters) x).n()`. nsc's
+    // post-erasure `box`/`unbox` for `class C(val u: U) extends AnyVal`.
+    if fun.name() == Some("$vcbox") {
+        let cls = fun.sym;
+        let internal = class_internal(ctx.st, cls);
+        let under = ctx
+            .st
+            .get(cls)
+            .ctor_fields
+            .first()
+            .map(|f| ctx.st.get(*f).ty.clone())
+            .unwrap_or(Type::Any);
+        asm.new_obj(&internal);
+        asm.dup();
+        if let Some(a) = args.first() {
+            gen_expr(asm, frame, ctx, a);
+        } else {
+            push_default(asm, &under);
+        }
+        asm.invokespecial(
+            &internal,
+            "<init>",
+            &format!("({})V", jvm_desc(ctx.st, &under)),
+        );
+        return;
+    }
+    if fun.name() == Some("$vcunbox") {
+        let cls = fun.sym;
+        let internal = class_internal(ctx.st, cls);
+        let field = ctx.st.get(cls).ctor_fields.first().copied();
+        let (name, under) = match field {
+            Some(f) => (ctx.st.get(f).name.clone(), ctx.st.get(f).ty.clone()),
+            None => (String::new(), Type::Any),
+        };
+        if let Some(a) = args.first() {
+            gen_expr(asm, frame, ctx, a);
+        } else {
+            asm.aconst_null();
+        }
+        asm.checkcast(&internal);
+        asm.invokevirtual(&internal, &name, &format!("(){}", jvm_desc(ctx.st, &under)));
         return;
     }
 
@@ -11792,6 +12020,16 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
         // apply args occupy slots 1..arity as Object; remap param symbols after unbox
         for (i, p) in vparams.iter().enumerate() {
             let obj_slot = 1 + i as u16;
+            // A parameter instantiated at a value class receives the boxed
+            // instance; erasure recorded that on the symbol.
+            let p = &Tree {
+                ty: if p.sym.is_none() {
+                    p.ty.clone()
+                } else {
+                    st.get(p.sym).ty.clone()
+                },
+                ..p.clone()
+            };
             a.aload(obj_slot);
             if is_jvm_primitive(&p.ty) || matches!(p.ty, Type::String) {
                 emit_unbox(a, &p.ty);
@@ -13068,6 +13306,35 @@ fn gen_pattern(
             gen_pattern(asm, frame, ctx, body, tmp, sel_sort, fail);
         }
         TreeKind::Typed { expr, .. } => {
+            // `case x: Meters` on an `Any` tests for the boxed value class and
+            // reads the underlying back out of it; erasure stamped the class on
+            // the ascription node (`mark_value_class_patterns`).
+            if !pat.sym.is_none()
+                && ctx.st.is_value_class(pat.sym)
+                && sel_sort == JvmSort::Ref
+                && !matches!(pat.ty, Type::Class { .. })
+            {
+                let internal = class_internal(ctx.st, pat.sym);
+                load(asm, tmp, JvmSort::Ref);
+                asm.instanceof(&internal);
+                asm.ifeq(fail);
+                let binds = !matches!(expr.kind, TreeKind::Wildcard | TreeKind::Empty);
+                if binds {
+                    let field = ctx.st.get(pat.sym).ctor_fields.first().copied();
+                    let (fname, fty) = match field {
+                        Some(f) => (ctx.st.get(f).name.clone(), ctx.st.get(f).ty.clone()),
+                        None => (String::new(), Type::Any),
+                    };
+                    load(asm, tmp, JvmSort::Ref);
+                    asm.checkcast(&internal);
+                    asm.getfield(&internal, &fname, &jvm_desc(ctx.st, &fty));
+                    let want = jvm_sort(&fty);
+                    let narrowed = frame.alloc_tmp(want);
+                    store(asm, narrowed, want);
+                    gen_pattern(asm, frame, ctx, expr, narrowed, want, fail);
+                }
+                return;
+            }
             let jvm = type_jvm_name(ctx.st, &pat.ty);
             if jvm != "java/lang/Object" {
                 load(asm, tmp, JvmSort::Ref);
