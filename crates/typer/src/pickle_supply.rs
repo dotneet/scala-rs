@@ -67,6 +67,12 @@ pub struct PickleSupply {
     /// last `take_unresolved_refs`. The typer uses them to decide which
     /// classfiles to load before trying again (see `Check::pickled_alias_type`).
     unresolved_refs: Vec<String>,
+    /// What `this.type` means while a member of one class is being installed:
+    /// the receiver applied to its own type parameters. `Growable.addOne` and
+    /// `+=` / `++=` all return `this.type`, and for a
+    /// `Builder[Int, List[Int]]` receiver that is a `Builder`, not the
+    /// `Growable` the erased signature names.
+    self_ty: Option<Type>,
 }
 
 /// One `type T[...] = U` recovered from a package object's pickle.
@@ -277,6 +283,17 @@ impl PickleSupply {
         for tp in &st.get(class_sym).tparams {
             class_scope.insert(st.get(*tp).name.clone(), Type::TypeParam(*tp));
         }
+        // Nested completion (a `$default$n` getter) re-enters here, so the
+        // outer receiver's meaning of `this.type` is saved and restored.
+        let saved_self = self.self_ty.replace(Type::Class {
+            sym: class_sym,
+            args: st
+                .get(class_sym)
+                .tparams
+                .iter()
+                .map(|t| Type::TypeParam(*t))
+                .collect(),
+        });
 
         let mut installed: Vec<SymbolId> = Vec::new();
         let mut seen_shapes: HashSet<String> = HashSet::new();
@@ -318,6 +335,7 @@ impl PickleSupply {
                 installed.push(id);
             }
         }
+        self.self_ty = saved_self;
         trace(format_args!(
             "{full}#{name}: supplied {} overload(s)",
             installed.len()
@@ -1001,9 +1019,14 @@ impl PickleSupply {
                 self.conv_at(st, bin, &inner, result, d)
             }
             SigType::Ref { sym, args } => self.conv_ref(st, bin, scope, sym, args, d),
-            // A `val`'s own type is fine, but the remaining forms (`this.type`,
-            // singletons, `super`, bare bounds, refinements, literal types) have
-            // no faithful counterpart here yet.
+            // `this.type` widens to the receiver applied to its own type
+            // parameters; `type_select` then substitutes the receiver's
+            // arguments into it, so `b ++= xs` on a `Builder[Int, List[Int]]`
+            // yields that `Builder` and not `Growable`.
+            SigType::This(_) => self.self_ty.clone(),
+            // A `val`'s own type is fine, but the remaining forms (singletons,
+            // `super`, bare bounds, refinements, literal types) have no
+            // faithful counterpart here yet.
             _ => None,
         }
     }

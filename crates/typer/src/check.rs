@@ -215,6 +215,18 @@ fn numbered_arity(name: &str, prefix: &str) -> Option<usize> {
     rest.parse().ok()
 }
 
+/// Arity of a tuple type, whether it is written structurally (`(A, B)`) or as
+/// the class `TupleN[A, B]`. `None` for anything that is not a tuple.
+fn tuple_arity(st: &SymbolTable, ty: &Type) -> Option<usize> {
+    match ty {
+        Type::Tuple(ts) => Some(ts.len()),
+        Type::Class { sym, args } => {
+            numbered_arity(&st.get(*sym).name, "Tuple").filter(|n| *n == args.len())
+        }
+        _ => None,
+    }
+}
+
 pub fn typecheck(tree: &mut Tree, file_index: usize) -> (SymbolTable, Vec<Diagnostic>) {
     typecheck_opts(tree, file_index, &TypecheckOptions::default())
 }
@@ -5248,6 +5260,17 @@ impl Typer {
         )
     }
 
+    /// `scala.FunctionN` for a function type, so `f.tupled` has somewhere to
+    /// look. `class_sym_of` deliberately leaves `Type::Function` alone (it
+    /// feeds conformance and erasure, which treat function types structurally),
+    /// so this is a member-lookup-only detour.
+    fn function_class_of(&self, ty: &Type) -> Option<SymbolId> {
+        let Type::Function { params, .. } = ty else {
+            return None;
+        };
+        crate::classpath::find_by_jvm(&self.st, &format!("scala/Function{}", params.len()))
+    }
+
     fn type_select(&mut self, tree: &mut Tree, pt: &Type) {
         if tree.postfix && !self.language_postfix_ops {
             let name = match &tree.kind {
@@ -5341,6 +5364,13 @@ impl Typer {
         if found.is_empty() {
             if let Type::ModuleRef(id) = &recv_ty {
                 found = self.st.lookup_member(*id, &name);
+            }
+        }
+        // A function type is `scala.FunctionN[T1, …, Tn, R]`; `class_sym_of`
+        // has no symbol for it, so `f.tupled` / `f.curried` would find nothing.
+        if found.is_empty() {
+            if let Some(f) = self.function_class_of(&recv_ty) {
+                found = self.st.lookup_member(f, &name);
             }
         }
         // Package / term prefix: `scala.reflect.ClassTag` and Java `java.lang.Math`.
@@ -5462,6 +5492,12 @@ impl Typer {
         let subst_args: Vec<Type> = match &recv_ty {
             Type::Class { args, .. } => args.clone(),
             Type::Tuple(ts) => ts.clone(),
+            // `FunctionN`'s parameters are `T1 … Tn, R`, in that order.
+            Type::Function { params, ret } => {
+                let mut a = params.clone();
+                a.push((**ret).clone());
+                a
+            }
             _ => Vec::new(),
         };
         let subst = |ty: Type| -> Type {
@@ -6042,6 +6078,15 @@ impl Typer {
         if self.receiver_has_term(&qual_ty, &name)
             || self.search_extension(&qual_ty, &name, span).is_some()
         {
+            return false;
+        }
+        // A library class the prelude never declares reaches the typer through
+        // its pickle, and only `type_select` asks for that. Without asking
+        // here, `b ++= xs` on a `scala.collection.mutable.Builder` — whose
+        // `+=` / `++=` are `Growable`'s default methods — was rewritten into
+        // an assignment and then reported as an unassignable receiver, even
+        // though the member is right there.
+        if !self.supply_from_pickle(&qual_ty, &name).is_empty() {
             return false;
         }
         if self.is_assignable_lhs(qual) {
@@ -6811,6 +6856,7 @@ impl Typer {
         // are not auto-applied before this Apply is typed.
         self.type_expr(fun, &dummy_method);
         self.rewrite_receiver_apply(fun);
+        Self::auto_apply_nullary_function(fun, args.len());
         if !self.reorder_named_args(args, fun) {
             for a in args.iter_mut() {
                 self.type_expr(a, &Type::NoType);
@@ -9494,8 +9540,29 @@ impl Typer {
         if self.st.is_sub_type(arg, param) {
             return Some(if arg == param { 10 } else { 5 });
         }
-        if matches!(arg, Type::Function { .. }) && matches!(param, Type::Function { .. }) {
-            return Some(8);
+        // Two function types score as a match while their parameter types are
+        // still open (an un-inferred lambda literal), but not when they
+        // plainly disagree: `scala.Function.untupled` overloads on nothing but
+        // the arity of its argument's tuple parameter, so `((Int, Int)) => Int`
+        // has to reject `((T1, T2, T3)) => R`.
+        if let (Type::Function { params: ap, .. }, Type::Function { params: pp, .. }) = (arg, param)
+        {
+            // A literal whose parameters are not inferred yet keeps matching
+            // on any shape: `apply2 { case (n, s) => … }` arrives as one
+            // unknown parameter and only becomes a `(Int, String) => String`
+            // once the parameter it fills is known.
+            let open = ap.iter().any(|t| t.is_no_type());
+            let shapes_agree = open
+                || (ap.len() == pp.len()
+                    && ap.iter().zip(pp).all(|(a, p)| {
+                        match (tuple_arity(&self.st, a), tuple_arity(&self.st, p)) {
+                            (Some(x), Some(y)) => x == y,
+                            _ => true,
+                        }
+                    }));
+            if shapes_agree {
+                return Some(8);
+            }
         }
         // A `{ case … }` literal reaches overload resolution as a one-parameter
         // function; it inhabits a `PartialFunction[A, B]` parameter
@@ -12644,6 +12711,32 @@ impl Typer {
                 tree.ty = Type::Error;
             }
         }
+    }
+
+    /// nsc: a *parameterless* method whose result is a function takes no
+    /// argument list of its own, so `def g: Int => Int; g(3)` is `g.apply(3)`
+    /// — and so is `f.tupled((1, 2))`, since `tupled` is such a method.
+    /// The backend already applies a `Type::Function` callee
+    /// (`gen_function_apply`), so handing it the method's result is all this
+    /// takes. Only a non-empty argument list is rewritten: `g()` on a
+    /// `() => Int` stays the reference nsc's empty-application rules give it.
+    fn auto_apply_nullary_function(fun: &mut Tree, nargs: usize) {
+        if nargs == 0 {
+            return;
+        }
+        let Type::Method { paramss, ret } = &fun.ty else {
+            return;
+        };
+        if !paramss.is_empty() {
+            return;
+        }
+        let Type::Function { params, .. } = ret.as_ref() else {
+            return;
+        };
+        if params.len() != nargs {
+            return;
+        }
+        fun.ty = (**ret).clone();
     }
 
     fn rewrite_receiver_apply(&mut self, fun: &mut Tree) {

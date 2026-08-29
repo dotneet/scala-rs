@@ -123,6 +123,9 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - 内部クラス（`$outer`）とネストした object。匿名クラス `new Trait { def f = ... }` と `new { def x = 1 }`（合成 classfile。型は refinement ではなく `$anon$N`）
 - メソッド本体の中で定義したクラス（匿名クラス `new T { … }` と**ローカル `class` / `object`**）が、**囲みメソッドのパラメータ / ローカルをキャプチャ**する。nsc と同じ形で、自由変数ごとに `x$1` という public final フィールドと、末尾に付く追加のコンストラクタ引数を出す。各インスタンスメソッドの先頭でそのフィールドをローカルスロットに読み戻すので、キャプチャした `var` の `scala.runtime.*Ref` 経由の読み書きも、匿名クラス内のラムダによる二重キャプチャ（`$captured$N`）も、既存の経路のまま動く。メソッドの中のクラスにも `$outer` が付き、囲みクラスのメンバは `$outer` チェーンで読む
 - eta-expansion `foo _` と、FunctionN が期待される位置への未適用メソッド（`xs.map(inc)`）。ネストしたパラメータリストは **uncurry** で 1 リスト + クロージャになる。SIP-21 の SAM: ラムダ / 未適用メソッドを `Runnable` / `java.util.Comparator[Int]` / `java.util.function.Function[A,B]`（単一抽象メソッド）に適合。SAM でない型へは type mismatch（黙ってラップしない）。`def go(): Unit` を `_` なしで `Runnable` に渡すのは nsc と同じく auto-apply して mismatch。合成クラスは既存の anonfun と同じく invokedynamic は使わない
+- **コンストラクタ引数のアクセサ**。`class C(val x: Int)` も、キーワード無しで `val` になる **`case class` の第 1 引数リスト**も public なアクセサ `x()` になり、親の抽象メンバーを実装する（親が `def value: T` を `()Object` に erase する場合はブリッジも出す）。第 2 引数リスト以降は nsc と同じく private な状態のまま。`var` 引数は `x()` と `x_$eq(v)` の両方
+- **`FunctionN.tupled` / `curried`（arity 2〜22）と `scala.Function.untupled`（2〜5）**。`scala/FunctionN` の default メソッドと `scala/Function$` なので **jar リンク時のみ**（`--no-scala-library` では診断する）。あわせて、引数リストを持たないメソッドの結果が関数ならその引数リストは関数のもの（`def g: Int => Int; g(3)`）、カリー化された**関数値**の `f(1)(2)` は 2 回の `Function1.apply`（メソッドのカリー化とは違って平坦化しない）
+- **`scala.collection.mutable.Builder` の `+=` / `++=`**（`Growable` の default メソッド。`this.type` を返すので受け手の型がそのまま返る）。jar リンク時のみ
 - `super` / 修飾付き `this`（`Outer.this`）。trait の `super` は、具象クラスなら `T$class`、スタック可能な `abstract override` なら `T$$super$m` 経由
 - `sealed` 階層の match 網羅検査（不足は **warning**。`-Xfatal-warnings` でエラー）
 - extractor の `unapply`（`Option` / `Boolean` / `Tuple2`）と `unapplySeq`（`List` と可変長 `_*`）。名前付き extractor 引数（`Point(y = b, x = a)`）
@@ -854,14 +857,96 @@ repeated パラメータは JVM では `Seq` 引数 1 本（`<init>` のディ�
   `def f(xs: Int*)` も `class C(xs: T*)` も `scala/collection/immutable/Seq` を参照するので、
   実行時に `NoClassDefFoundError` になります（メソッド側から変わっていない既存の穴で、
   コンストラクタもこれに揃えました）。
-- **case class のコンストラクタ引数が抽象メンバーを実装しない**。
-  `trait Rep[T] { def value: T }` に対する `case class ConstRep[T](value: T) extends Rep[T]` は
-  コンパイルは通りますが、アクセサが出ないので実行時に `AbstractMethodError` になります。
+- ~~**case class のコンストラクタ引数が抽象メンバーを実装しない**~~ →
+  `agent/ctoraccessor` スライスで修正しました。下の
+  「コンストラクタ引数のアクセサと `FunctionN.tupled`」を参照。
 - **`Vector[T]` が `scala.collection.IndexedSeq[U]` に適合しない**（`immutable.Vector` →
   `collection.IndexedSeq` の辺が無い）。`Vector[Any](1)` のように**明示した型引数**が
   companion の `apply` に伝わらない穴もあります。
 - **タプル型の `ClassTag`**。`classTag[(_, _)]` の implicit が見つからず、
   `TupleSupport` に残る 2 件はこれです。
+
+### コンストラクタ引数のアクセサと `FunctionN.tupled`
+
+`agent/ctoraccessor` スライス。フィクスチャは `tests/fixtures/ctacc*.scala`、テストは
+`crates/cli/tests/ctoraccessor.rs` です。
+
+**1. `case class` のコンストラクタ引数がアクセサにならなかった**。これは
+**型検査は通るのに実行時に落ち、しかも黙って通る**種類の穴でした。
+
+```scala
+trait Rep[T] { def value: T }
+case class ConstRep[T](value: T) extends Rep[T]   // 実行時 AbstractMethodError
+```
+
+`class C(val x: Int)` は `emit_ctor_val_getters` が `x()` を出していましたが、判定が
+「パーサが `val` キーワードを見て `Flags::ACCESSOR` を立てたか」だけでした。`case class` は
+**キーワード無しで第 1 引数リストを `val` にする**ので、そこを通りません。フィールドだけが
+出て `value()` が無く、`Rep` 越しに呼ぶと `AbstractMethodError` になっていました。
+nsc は「case class の第 1 引数リストのみ」（第 2 リスト以降は private な状態のまま。
+nsc は `case class C(implicit x: Int)` 自体を拒否するので、第 1 リストは常に非 implicit）
+なので、そのとおりに条件を足しました。親が erase して `def value: Object` になる場合の
+ブリッジは既にある経路がそのまま使われます。`javap -p -s` で実 scalac 2.13.16 と付き合わせ、
+アクセサ名・ディスクリプタ・ブリッジの有無が一致することを
+`ctacc_case_class_params_get_public_accessors` が固定します。
+
+**2. `FunctionN.tupled` / `curried` と `scala.Function.untupled`**。slick の
+`generated/slick/lifted/CompilableFunctions.scala` は 21 通りの `CompiledFunction` を
+`f.tupled` で作るので、arity 2〜22 が全滅していました。関数型（`Type::Function`）には
+`class_sym_of` が返すシンボルが無く、メンバ探索の行き先が存在しなかったのが原因です。
+`scala.FunctionN` を `T1 … Tn, R` という型パラメータ付きで宣言し直し（`prelude_fntuple.rs`）、
+`type_select` が関数型の受け手のときだけそこを引くようにしました（置換は受け手の
+パラメータ型＋結果型を位置で当てます）。`prelude.rs` からは 1 行呼ぶだけです。
+`tupled` / `curried` は `scala/FunctionN` の default メソッド、`untupled` は
+`scala/Function$` なので、**`library_abi` 限定**です。私有ランタイムの `scala/Function0` /
+`Function1` は `apply` しか持たないので、`--no-scala-library` では
+`value tupled is not a member of (Int, Int) => Int` と診断します
+（`fixtures_ctacc_fn_without_library_is_error`）。
+
+このとき **3 つの一般的な穴**も直しています（どれも `tupled` 抜きで再現します）:
+
+- `def g: Int => Int` を `g(3)` と呼ぶと `no matching overload` でした。引数リストを
+  持たないメソッドの結果が関数なら、引数リストはその関数のものです
+  （`auto_apply_nullary_function`）。
+- `add(1)(2)`（カリー化された**関数値**）が 1 回の `Function1.apply` に潰れていました。
+  uncurry と backend の両方に apply 平坦化があり、どちらも「内側の Apply の結果が
+  関数型なら別の呼び出し」を見ていませんでした。`Function.untupled(f)(1, 2)` も同型です。
+- erasure が「呼び先ツリーの型が関数型なのに、そのツリーが持つシンボルの結果型」を
+  読んで unbox を巻いていました（`f.tupled(t)` のシンボルは `tupled` で、その結果が
+  いま適用されている関数そのもの）。
+
+`Function.untupled` の 4 本のオーバーロードは引数の**タプルの arity だけ**が違うので、
+オーバーロード採点で関数型どうしを無条件に一致とみなしていたのを、
+「引数側のパラメータ型がまだ未推論（`{ case … }` リテラル）でなければ arity と
+タプル arity を見る」に絞りました。
+
+**3. `Builder` の `+=` / `++=`**。`scala.collection.mutable.Builder` は prelude が
+宣言せず pickle 供給で来ます。`b ++= xs` は 2 つの理由で通っていませんでした:
+`try_rewrite_assignment_op`（`x += 1` を `x = x + 1` に書き換える nsc の
+`convertToAssignment`）が **pickle を引かずに**「メンバが無い」と判断していたことと、
+`Growable` の `+=` / `++=` が `this.type` を返すのを pickle 供給が
+「表現できない型」として断っていたことです。前者は補完も試すようにし、後者は
+`this.type` を**受け手を自分の型パラメータに適用した型**に写すようにしました
+（`type_select` がそこに受け手の型引数を入れるので、`Builder[Int, List[Int]]` に対して
+`Builder[Int, List[Int]]` が返り、`.result()` まで繋がります）。
+
+計測（`tests/slick_measure.sh`、slick 184 ファイル、`-Xsource:3`）は
+**1279 → 1219**、エラーを含むファイルは **109 → 107** になりました。
+`CompilableFunctions.scala` のエラーは 21 → 0、`++= is not a member of Builder` は 6 → 0 です。
+
+**残っているもの**（このスライスでは直していない）:
+
+- **コンストラクタフィールドの可視性**。nsc は `private final`、こちらは `public final` です
+  （アクセサ・ブリッジは一致）。パターンマッチの codegen が同名フィールドを直接
+  `getfield` するので、private にするならその経路をアクセサ呼び出しに移す必要があります。
+- **`Vector.newBuilder` / `List.newBuilder`** が companion に無いので、`Builder` の
+  インスタンスは自分で書くしかありません（`ctacc_builder.scala` はそうしています）。
+- **`xs.toArray` の `ClassTag` が埋まらない場合がある**。slick の
+  `ProductResultConverter`（`(ClassTag[B])Any` のまま `cha(i)` を呼ぶ 6 件）が残ります。
+- **コンストラクタ引数（`val` 無し）を外から読んだときの診断**が nsc と違います。
+  nsc は `value hidden is not a member of Plain`、こちらは
+  `value hidden cannot be accessed as a member of Plain from Main$` です
+  （どちらもエラーにはなります。`ctacc_plain_bad`）。
 
 ## 実装していないもの
 
@@ -1226,6 +1311,7 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/genrep` スライス（slick が `.fm` テンプレートから生成する 7 本を通すための穴: import を見ないクラス型パラメータ境界、型パラメータ付き `implicit class`、`TupleN extends Product`、継承したオーバーロードの受け手での型、引数リストのタプル化、`Tuple` で始まるだけのクラス名、可変長引数コンストラクタ、ワイルドカード型引数と反変、`package p { … }` の後ろのトップレベル定義）のフィクスチャは接頭辞 `genrep`（`genrep` / `genrep_bound_bad` / `genrep_tuple_bad` / `genrep_product_bad`）で、同じ理由から `crates/cli/tests/genrep.rs` に置いています。`genrep.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 との実行結果 diff（`real_scalac_dual_run_genrep`）でも見ます。異常系は 3 本: `genrep_bound_bad` は namer が黙るようにした境界でも**存在しない型はきちんと診断される**こと、`genrep_tuple_bad` はタプル化が**間違った呼び出しを通さない**こと、`genrep_product_bad` は `--no-scala-library` で `Product` の辺を張らない（私有ランタイムに裏付けが無い）ことを固定します。
 
+`agent/ctoraccessor` スライス（コンストラクタ引数のアクセサ、`FunctionN.tupled` / `curried` / `Function.untupled`、`Builder` の `+=` / `++=`）のフィクスチャは接頭辞 `ctacc`（`ctacc` / `ctacc_fn` / `ctacc_builder` / `ctacc_plain_bad`）で、同じ理由から `crates/cli/tests/ctoraccessor.rs` に置いています。`ctacc.scala` は**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせ、`real_scalac_dual_run_ctacc` で real scalac 2.13.16 の出力とも比較します（`expected/ctacc.txt` は scalac の出力そのもの）。`ctacc_case_class_params_get_public_accessors` は `javap -p -s` でアクセサのディスクリプタ（`ConstRep.value()Object` / `NumRep.n()I` / `IntBox.unwrap` の `()I` ＋ `()Object` ブリッジ / `StringBox.label` の `()String` ＋ `()Object` ブリッジ）と、**第 2 引数リストがアクセサにならない**こと（`Multi.extra`）を固定します。`ctacc_fn.scala` と `ctacc_builder.scala` は library ABI 限定（`scala/FunctionN` の default メソッド、`scala/Function$`、`Growable`）なので library dual-run と real scalac dual-run のみで、`fixtures_ctacc_fn_without_library_is_error` / `fixtures_ctacc_builder_without_library_is_error` が `--no-scala-library` で**きちんと診断される**ことを見ます。`ctacc_plain_bad.scala` は `val` の無いコンストラクタ引数が外から読めないままであること（case class の第 1 引数リストだけがアクセサになる）を固定します。
 オーバーロード集合が別のクラスの読み込みで消える回帰のフィクスチャは接頭辞 `oshadow`（`oshadow` / `oshadow_java_first` / `oshadow_java_last` / `oshadow_bad`）で、同じ理由から `crates/cli/tests/overloadshadow.rs` に置いています。`oshadow.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 の実行結果とも直接比較します（`oshadow_matches_scalac`）。`oshadow_java_first.scala` と `oshadow_java_last.scala` は `java.math.BigDecimal` の位置だけを入れ替えた同じプログラムで、`oshadow_order_independent` が両方通ることと stdout が一致することを固定します。`oshadow_bad.scala` は `BigDecimal(Some(1))`（real scalac も拒否）が `no matching overload` になり、しかも**候補一覧が丸ごと**出る（`(String)BigDecimal` を含む）ことを見ます。`oshadow_without_library_is_error` は `--no-scala-library` で `not found: value BigDecimal` の診断が残ることを見ます。
 `agent/parentimpl` スライス（親コンストラクタの implicit 節・デフォルト引数の補完）のフィクスチャは接頭辞 `pimpl`（`pimpl` / `pimpl_bad`）で、同じ理由から `crates/cli/tests/parentimpl.rs` に置いています。`pimpl.scala` は slick の `ConstColumn` 形（`class ConstColumn[T : TT] extends TypedRep[T]`）、明示節＋2 引数の implicit 節、全部デフォルト／末尾だけデフォルト、デフォルト節＋implicit 節、匿名クラスの親、引数無しの `new` を 1 本にまとめ、**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせます。`real_scalac_dual_run_pimpl` は real scalac 2.13.16 でも同じソースを走らせて stdout が一致することを見ます（`expected/pimpl.txt` は scalac の出力そのもの）。`pimpl_late_a.scala` / `pimpl_late_z.scala` は**子を親より先にコンパイル**して、親の context bound の evidence がシグネチャパス時点で未生成でも埋まる（＝ファイル順に依存しない）ことを見ます。`pimpl_bad.scala` は witness の無い親 implicit 節が**黙って通らない**ことを固定し、`pimpl_bad_reports_the_extends_clause_once` で診断が `extends` の行に 1 件だけ出る（3 パス分に増えない）ことも見ています。
 
@@ -1343,6 +1429,9 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `inline.scala` | `@inline` / `@noinline` を付けたメソッドが動く（インライン化はしない） | `3` |
 | `sgap.scala`（`crates/cli/tests/smallgaps.rs`） | `agent/smallgaps` スライスの複合 fixture: `@inline val` / `@inline @noinline def` の受理、curried 主コンストラクタ（`case class Pair(a: Int)(val b: Int, val c: Int)`）の companion `apply` が正しく curry される、case class のフィールド型が**自分の companion に後方参照する**入れ子型（`Ordering.Direction`）を指すときの解決順序、`case object` が引数付きの `sealed abstract class` を extends するときの module `<init>` codegen、`Option.flatMap` の多相性、`if`/`else` の `None`/`Some` 分岐で（型注釈なしでも）`lub` が `Option[X]` になり `.getOrElse` が解決すること | `42` `6` `true` `n=5` `3` `-1` |
 | `sgap_lib.scala`（`crates/cli/tests/smallgaps.rs`、library dual-run のみ） | `Iterable(...)` companion `apply`（実ライブラリの `IterableFactory$Delegate.apply` 継承。私有ランタイムに裏付けが無いので `--no-scala-library` では診断のまま） | `List(a, b, c)` `3` |
+| `ctacc.scala`（`crates/cli/tests/ctoraccessor.rs`、私有ランタイム・library dual-run・real scalac dual-run） | `agent/ctoraccessor` スライス: コンストラクタ引数が public アクセサになり親の抽象メンバーを実装する（`case class ConstRep[T](value: T) extends Rep[T]`、`case class NumRep(n: Int)`、`()Object` へのブリッジが要る `IntBox` / `StringBox`、`class Person(val name: String, …)`、`class Cell(var c: Int)` の getter/setter、第 2 引数リストがアクセサにならない `Multi`） | `42` `hi` `7` `5` `tag` `bob` `3` `11` `1` `x` `42` |
+| `ctacc_fn.scala`（`crates/cli/tests/ctoraccessor.rs`、library dual-run と real scalac dual-run） | `FunctionN.tupled` / `curried`（arity 2 / 3 / 5 / 22）と `scala.Function.untupled`、引数リストを持たないメソッドの結果を直接呼ぶ（`def adder: (Int, Int) => Int; adder(7, 8)`）。私有ランタイムには裏付けが無いので `--no-scala-library` では診断のまま | `7` `11` `7` `30` `1x2` `1y3` `4z5` `15` `15` `20` `22` `15` |
+| `ctacc_builder.scala`（`crates/cli/tests/ctoraccessor.rs`、library dual-run と real scalac dual-run） | `scala.collection.mutable.Builder` の `+=` / `++=`（`Growable` の default メソッド、`this.type` 返し）を pickle 供給から引く。`--no-scala-library` では `not found: type Builder` | `List(1, 2, 3, 4)` |
 | `genrep.scala`（`crates/cli/tests/genrep.rs`、library dual-run と real scalac dual-run） | `agent/genrep` スライス: import を見ないクラス型パラメータ境界（`class Boxed[T <: Rep[_]]`）、型パラメータ付き `implicit class` の合成変換、`new TupleN(…): Product`（jar でしか作られない arity 込み）、`scala.collection.Seq` の一意な `apply`、`Some(a, b)` のタプル化、`Tuple` で始まるだけのクラス名（`TupleOps2`）、`package p { … }` の後ろの `object Main` | `Rep(1)` `(Rep(1),Rep(x))` … `Some((1,x))` |
 | `oshadow.scala`（`crates/cli/tests/overloadshadow.rs`、library dual-run のみ） | 別のクラスを読んでも既存のオーバーロード集合が消えないこと: `java.math.BigDecimal` を**前にも後にも**置いた上での `BigDecimal(Int)` / `(Long)` / `(String)` / `(BigInt)` / `(java.math.BigDecimal)`、`Option[BigDecimal].getOrElse` | `2` `3` `4.25` `6` `12.5` `12.5` `-1` `7` `8.75` `9` |
 | `oshadow_java_first.scala` / `oshadow_java_last.scala`（`crates/cli/tests/overloadshadow.rs`、library dual-run のみ） | 同じプログラムを `java.math.BigDecimal` の位置だけ入れ替えた 2 本。両方通り、stdout が一致すること（順序依存の回帰テスト） | `1` `2` `3.5` |
@@ -1589,6 +1678,8 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   数字が増えたのは退行ではなく、計測が実際のコンパイル対象に追いついたためです。
   その後 `agent/genrep` スライスで **2064 → 1300**（生成 7 本は 736 → 41）になりました。
   内訳と残りは「slick が生成する 7 本（`.fm` テンプレート）が通るまで」を参照。
+  `agent/ctoraccessor` スライスでさらに **1279 → 1219**（エラーを含むファイルは 109 → 107、
+  `CompilableFunctions.scala` の `tupled` 21 件と `Builder` の `++=` 6 件がゼロ）。
 
 - **override 検査が無い**。`override` 修飾子の要否も、override 時の型適合も検査していない。
   scalac が拒否する次の 2 つを黙って通す:

@@ -317,6 +317,15 @@ fn flatten_apply(tree: &mut Tree) {
                 if matches!(&peel_new(fun).kind, TreeKind::New { .. }) {
                     return;
                 }
+                // Only a curried *method*'s clauses collapse into one call: a
+                // partial application leaves a method type behind. An inner
+                // application whose *result* is a function value
+                // (`f.curried(3)(4)`, `Function.untupled(g)(1, 2)`) is a call
+                // in its own right, and merging the argument lists would push
+                // the outer ones onto the inner `apply`.
+                if matches!(fun.ty, Type::Function { .. }) {
+                    return;
+                }
             }
             _ => return,
         }

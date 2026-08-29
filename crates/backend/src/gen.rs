@@ -1550,7 +1550,15 @@ fn flatten_apply_owned<'a>(fun: &'a Tree, args: &'a [Tree]) -> (&'a Tree, Vec<Tr
             TreeKind::Apply {
                 fun: inner,
                 args: ia,
-            } if !matches!(&peel_fun(inner).kind, TreeKind::New { .. }) => {
+            } if !matches!(&peel_fun(inner).kind, TreeKind::New { .. })
+                // Only a curried *method*'s clauses are one JVM call: a
+                // partial application leaves a method type behind. An inner
+                // application whose *result* is a function value
+                // (`f.curried(3)(4)`, `Function.untupled(g)(1, 2)`) is a call
+                // of its own, and merging the lists would push the outer
+                // arguments onto the inner `apply`.
+                && !matches!(p.ty, Type::Function { .. }) =>
+            {
                 let mut combined = ia.clone();
                 combined.append(&mut all);
                 all = combined;
@@ -3857,12 +3865,21 @@ impl<'a> Gen<'a> {
             .iter()
             .map(|m| (m.name.clone(), m.desc.clone()))
             .collect();
-        for clause in vparamss {
+        // A case class turns its first parameter list into `val`s even without
+        // the keyword, so `case class ConstRep[T](value: T) extends Rep[T]`
+        // implements `Rep.value` with the accessor emitted here. nsc rejects a
+        // case class whose first list is implicit, so clause 0 is the one.
+        let class_is_case = self.st.get(class_id).flags.contains(Flags::CASE);
+        for (clause_idx, clause) in vparamss.iter().enumerate() {
             for p in clause {
                 let TreeKind::ValDef { name, mods, .. } = &p.kind else {
                     continue;
                 };
-                let is_val = mods.flags.contains(Flags::ACCESSOR);
+                let is_val = mods.flags.contains(Flags::ACCESSOR)
+                    || (class_is_case
+                        && clause_idx == 0
+                        && !mods.flags.contains(Flags::IMPLICIT)
+                        && !mods.flags.contains(Flags::MUTABLE));
                 let is_var = mods.flags.contains(Flags::MUTABLE);
                 if !is_val && !is_var {
                     continue;
@@ -11381,6 +11398,10 @@ fn gen_function_apply(
         if !n.is_empty() {
             asm.checkcast(&n);
         }
+    } else if let Type::Function { params, .. } = result_ty {
+        // `f.curried(3)(4)`: `apply` returns `Object`, and the next `apply`
+        // needs a `scala/Function1` on the stack, not a bare reference.
+        asm.checkcast(&format!("scala/Function{}", params.len()));
     }
 }
 
