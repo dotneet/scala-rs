@@ -1137,8 +1137,16 @@ impl SymbolTable {
                             .unwrap_or(Flags::EMPTY);
                         if flags.contains(Flags::CONTRAVARIANT) {
                             self.is_sub_type(y, x)
-                        } else {
+                        } else if flags.contains(Flags::COVARIANT) {
                             self.is_sub_type(x, y)
+                        } else if is_wildcard_arg(x) || is_wildcard_arg(y) {
+                            // An invariant parameter still *contains* a
+                            // wildcard: `List[Byte]` is a
+                            // `Collection[_ <: Number]`.
+                            self.is_sub_type(x, y)
+                        } else {
+                            // Invariant: `A[Int]` is not an `A[Any]`.
+                            self.is_sub_type(x, y) && self.is_sub_type(y, x)
                         }
                     })
                 } else {
@@ -1232,6 +1240,11 @@ impl SymbolTable {
                     self.is_sub_type(&p, b)
                 })
             }
+            // `Array` is invariant in Scala, but making it so here needs the
+            // expected type to drive `Array("x", "y"): Array[AnyRef]`, which
+            // the inference does not do yet. Until then this stays covariant
+            // and accepts `Array[Int]` where `Array[Any]` is asked for --
+            // which scalac rejects. See README's Remaining.
             (Type::Array(x), Type::Array(y)) => self.is_sub_type(x, y),
             (Type::ModuleRef(s), Type::Class { sym, .. }) if s == sym => true,
             (Type::ModuleRef(s), b) => {
@@ -2129,4 +2142,9 @@ pub fn apply_type_ctor(ctor: Type, args: Vec<Type>) -> Type {
             args,
         },
     }
+}
+
+/// A type argument that stands for a range rather than one type.
+fn is_wildcard_arg(t: &Type) -> bool {
+    matches!(t, Type::Wildcard | Type::BoundedWildcard { .. })
 }

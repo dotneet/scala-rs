@@ -7451,8 +7451,6 @@ impl Typer {
         None
     }
 
-    /// Instantiate remaining clause types with method type arguments inferred
-    /// from the already-typed first clause (`T <% Ordered[T]` → `Box => Ordered[Box]`).
     fn instantiate_from_call(
         &self,
         sym: SymbolId,
