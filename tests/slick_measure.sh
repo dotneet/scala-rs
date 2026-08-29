@@ -5,11 +5,15 @@ set -e
 SP=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slick
 SRC=$SP/slick/slick/src/main
 COMPAT=$SP/slick/slick-compat-collections/src/main/scala-2.13+
-BIN=${SCALA_RS:-/Users/shinji/projects/scala-rs/target/release/scala-rs}
+# Default to *this* checkout's binary, not a fixed path: run from a git
+# worktree, the hardcoded path measured the parent repo's build and an agent's
+# own changes appeared to do nothing.
+ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
+BIN=${SCALA_RS:-$ROOT/target/release/scala-rs}
 # The release binary is not what `cargo test` builds; measuring a stale one
 # silently reports the previous commit's numbers.
 if [[ -z ${SCALA_RS:-} ]]; then
-  cargo build -p scala-rs-cli --release >/dev/null 2>/tmp/slick_measure_build.log \
+  (cd "$ROOT" && cargo build -p scala-rs-cli --release) >/dev/null 2>/tmp/slick_measure_build.log \
     || { cat /tmp/slick_measure_build.log; exit 1; }
 fi
 # slick keeps seven sources as FreeMarker templates that its own build
@@ -21,7 +25,7 @@ fi
 RUN=${SLICK_RUN:-$SP/run-$$}
 GEN=${SLICK_GEN:-$RUN/generated}
 rm -rf $GEN
-python3 "$(dirname $0)/expand_fm.py" $SRC/scala $GEN >/dev/null
+python3 "$ROOT/tests/expand_fm.py" $SRC/scala $GEN >/dev/null
 FILES=($(find $SRC/scala $SRC/scala-2 $COMPAT $GEN -name '*.scala' | sort))
 OUT=${SLICK_OUT:-$RUN/out}
 rm -rf $OUT; mkdir -p $OUT
