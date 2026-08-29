@@ -207,10 +207,6 @@ impl Typer {
         out
     }
 
-    fn implicit_provides(&self, id: SymbolId, pt: &Type) -> bool {
-        self.implicit_provides_at(id, pt, 0)
-    }
-
     /// Every parameter clause is implicit, so the candidate is usable as long
     /// as its own implicits resolve (`implicit def listShow[A](implicit s:
     /// Show[A]): Show[List[A]]`).

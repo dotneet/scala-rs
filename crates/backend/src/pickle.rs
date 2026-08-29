@@ -2135,6 +2135,9 @@ fn read_symbol_info(r: &mut Reader, end: usize) -> Option<(u32, u32, u64, u32)> 
 }
 
 /// Unpickle our subset. Returns the first class/module plus its methods.
+// The tag names are nsc's own (`CONSTANTtpe`, `LITERALint`); matching on them
+// keeps this readable against PickleFormat.scala.
+#[allow(non_upper_case_globals)]
 pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
     if bytes.is_empty() {
         return None;

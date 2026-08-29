@@ -9,7 +9,8 @@ BIN=${SCALA_RS:-/Users/shinji/projects/scala-rs/target/release/scala-rs}
 # The release binary is not what `cargo test` builds; measuring a stale one
 # silently reports the previous commit's numbers.
 if [[ -z ${SCALA_RS:-} ]]; then
-  cargo build -q -p scala-rs-cli --release
+  cargo build -p scala-rs-cli --release >/dev/null 2>/tmp/slick_measure_build.log \
+    || { cat /tmp/slick_measure_build.log; exit 1; }
 fi
 FILES=($(find $SRC/scala $SRC/scala-2 $COMPAT -name '*.scala' | sort))
 OUT=${SLICK_OUT:-$SP/measure-out}

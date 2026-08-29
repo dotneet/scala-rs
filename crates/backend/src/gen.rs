@@ -7696,14 +7696,6 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                     );
                     return;
                 }
-                "view" => {
-                    asm.invokeinterface(
-                        "scala/collection/MapOps",
-                        "view",
-                        "()Lscala/collection/MapView;",
-                    );
-                    return;
-                }
                 _ => {}
             }
         }
@@ -9490,11 +9482,6 @@ fn is_stdlib_map_module(owner: &str) -> bool {
 fn is_stdlib_mapview(owner: &str) -> bool {
     owner == "scala/collection/MapView"
 }
-
-fn is_stdlib_iterable(owner: &str) -> bool {
-    owner == "scala/collection/Iterable"
-}
-
 fn is_stdlib_vector(owner: &str) -> bool {
     matches!(
         owner,
@@ -12415,21 +12402,6 @@ fn gen_pattern(
             asm.mark(ok);
         }
         _ => {}
-    }
-}
-
-/// An `Object` on the stack that the typer knows more precisely: unbox it for a
-/// primitive sub-pattern, cast it for a reference one, leave it alone when the
-/// sub-pattern is itself erased (a bare type parameter).
-fn adapt_erased_field(asm: &mut Assembler, ctx: &EmitCtx, want: &Type) {
-    let want = want.widen_constant();
-    if is_jvm_primitive(&want) {
-        emit_unbox(asm, &want);
-        return;
-    }
-    let jvm = type_jvm_name(ctx.st, &want);
-    if jvm != "java/lang/Object" && !jvm.is_empty() && !jvm.starts_with('[') {
-        asm.checkcast(&jvm);
     }
 }
 

@@ -46,32 +46,6 @@ fn enter_bound(id: SymbolId) -> Option<BoundGuard> {
     })
 }
 
-thread_local! {
-    static PROBE: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-pub struct ProbeGuard;
-
-impl Drop for ProbeGuard {
-    fn drop(&mut self) {
-        PROBE.with(|p| {
-            p.borrow_mut().pop();
-        });
-    }
-}
-
-/// Temporary: panics with the recursion path when a cycle runs away.
-pub fn probe(name: &'static str) -> ProbeGuard {
-    PROBE.with(|p| {
-        let mut v = p.borrow_mut();
-        v.push(name);
-        if v.len() > 400 {
-            let tail: Vec<&str> = v[v.len() - 20..].to_vec();
-            panic!("recursion probe overflow, tail: {tail:?}");
-        }
-    });
-    ProbeGuard
-}
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -8,7 +8,7 @@ use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
     erase, find_mains, lambda_lift, mark_anon_captures, typecheck_units, uncurry, ClasspathClass,
-    ClasspathMethod, ClasspathPickleMethod, SymbolTable, TypecheckOptions,
+    ClasspathMethod, ClasspathPickleMethod, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -76,7 +76,6 @@ impl CompileResult {
 struct Unit {
     file_index: usize,
     tree: Tree,
-    st: Option<SymbolTable>,
     pickles: std::collections::HashMap<u32, Vec<u8>>,
 }
 
@@ -135,7 +134,6 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 units.push(Unit {
                     file_index,
                     tree: parsed.tree,
-                    st: None,
                     pickles: std::collections::HashMap::new(),
                 });
                 sources.push(sf);
