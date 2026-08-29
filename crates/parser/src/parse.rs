@@ -2807,7 +2807,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 continue;
             }
-            stats.push(self.parse_block_stat());
+            // A case body is a block: a pattern definition desugars to several
+            // statements, and they belong to *this* block so later statements
+            // can see what it binds.
+            stats.extend(flatten_val_block(self.parse_block_stat()));
             self.accept_separator();
         }
         block_from_stats(self, lo, stats)
