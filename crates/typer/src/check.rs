@@ -1545,7 +1545,13 @@ impl Typer {
                 self.type_val_sig(p);
                 ct.push(p.ty.clone());
                 if !p.sym.is_none() {
-                    self.st.get_mut(p.sym).ty = p.ty.clone();
+                    // The constructor takes `T*`; the field it becomes holds a
+                    // `Seq[T]`, which is what the class body sees.
+                    let field_ty = match &p.ty {
+                        Type::Repeated(elem) => self.seq_of(elem).unwrap_or_else(|| p.ty.clone()),
+                        other => other.clone(),
+                    };
+                    self.st.get_mut(p.sym).ty = field_ty;
                     // `type_val_sig` sets the `DEFAULTPARAM` flag but (unlike
                     // `type_def_sig` for ordinary methods) never captures the
                     // default value tree itself — a ctor param default
@@ -6588,10 +6594,13 @@ impl Typer {
                 tree.ty = fun.ty.clone();
             }
             for (i, a) in args.iter_mut().enumerate() {
+                // `param_at`, not `get`: a constructor can take a repeated
+                // parameter (`class C(val xs: Int*)`), and every argument past
+                // the fixed ones is checked against its element type.
                 let mut p = if infer && field_tys.len() == nargs && !field_tys.is_empty() {
-                    field_tys.get(i).cloned().unwrap_or(Type::NoType)
+                    param_at(&field_tys, i).cloned().unwrap_or(Type::NoType)
                 } else {
-                    ctor_params.get(i).cloned().unwrap_or(Type::NoType)
+                    param_at(&ctor_params, i).cloned().unwrap_or(Type::NoType)
                 };
                 if let Some(c) = class_id {
                     if !inferred_args.is_empty() {

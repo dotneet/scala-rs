@@ -221,5 +221,6 @@ conform!(
     mutable_ops,
     universal_hash,
     any_on_function,
-    null_reference
+    null_reference,
+    ctor_varargs
 );

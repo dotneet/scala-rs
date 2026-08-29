@@ -5663,11 +5663,17 @@ fn gen_new(
             None => load_outer_arg(asm, ctx, outer),
         }
     }
-    for (i, a) in args.iter().enumerate() {
-        gen_expr(asm, frame, ctx, a);
-        let pty = field_tys.get(i).unwrap_or(&a.ty);
-        if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
-            emit_box(asm, &a.ty);
+    if field_tys.iter().any(|p| matches!(p, Type::Repeated(_))) {
+        // `class C(val xs: Int*)`: the trailing arguments become one `Seq`,
+        // exactly as for a method call.
+        gen_call_args(asm, frame, ctx, args, &field_tys, true, false, ctor_sym);
+    } else {
+        for (i, a) in args.iter().enumerate() {
+            gen_expr(asm, frame, ctx, a);
+            let pty = field_tys.get(i).unwrap_or(&a.ty);
+            if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
+                emit_box(asm, &a.ty);
+            }
         }
     }
     for id in class_captures(ctx.st, class_id).to_vec() {
