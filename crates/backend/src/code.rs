@@ -53,13 +53,16 @@ pub struct Assembler {
     label_locals: Vec<Option<Vec<VType>>>,
     frames: BTreeMap<u16, (Vec<VType>, Vec<VType>)>,
     dead: bool,
+    /// Byte offset just past the terminator that made the code dead. Everything
+    /// emitted from here on is unreachable and is dropped again.
+    dead_start: Option<usize>,
     need_frame: bool,
     this_name: String,
     is_init: bool,
     ret_object: Option<String>,
-    /// Locals at the start of a try, used so exception handlers do not claim
-    /// locals the try body initialized later.
-    try_locals: Option<Vec<VType>>,
+    /// Stack of locals snapshots taken at the start of each open guarded region,
+    /// so exception handlers do not claim locals the body initialized later.
+    try_locals: Vec<Vec<VType>>,
 }
 
 impl Assembler {
@@ -84,11 +87,12 @@ impl Assembler {
             label_locals: Vec::new(),
             frames: BTreeMap::new(),
             dead: false,
+            dead_start: None,
             need_frame: false,
             this_name: String::new(),
             is_init: false,
             ret_object: None,
-            try_locals: None,
+            try_locals: Vec::new(),
         }
     }
 
@@ -135,6 +139,14 @@ impl Assembler {
         if i >= self.vlocals.len() {
             self.vlocals.resize(i + 1, VType::Top);
         }
+        // An open handler frame has to describe the slot at *every* point of the
+        // guarded region, so widen each open snapshot to the common supertype.
+        for snap in self.try_locals.iter_mut() {
+            if i >= snap.len() {
+                snap.resize(i + 1, VType::Top);
+            }
+            snap[i] = merge_vtype(&snap[i], &t, None);
+        }
         self.vlocals[i] = t;
         self.ensure_local(n);
     }
@@ -162,7 +174,9 @@ impl Assembler {
     }
 
     fn record_frame_at(&mut self, off: u16, stack: Vec<VType>, locals: Vec<VType>) {
-        if off == 0 {
+        if off == 0 || self.dead {
+            // A frame inside a dead region would be dropped with the bytes it
+            // describes, and its offset would then point at unrelated code.
             return;
         }
         self.frames.insert(off, (locals, stack));
@@ -187,26 +201,25 @@ impl Assembler {
     }
 
     pub fn mark(&mut self, l: Label) {
+        // Whatever was emitted after the last `return`/`athrow`/`goto` can never
+        // run. Drop it before the label takes its offset, so the label lands
+        // right behind the terminator instead of behind a stretch of code the
+        // verifier would still have to make sense of.
+        self.drop_dead();
         let off = self.bytes.len() as u16;
         self.labels[l.0] = Some(off);
         if self.dead {
             if let Some(st) = self.label_stack[l.0].clone() {
                 self.vstack = st;
                 self.stack = self.vstack.iter().map(|t| t.slots()).sum();
-                self.dead = false;
-            } else {
-                // No jump ever targeted this label, yet code follows it (the
-                // `applyOrElse` default branch after an irrefutable last case).
-                // The split verifier still checks that block from the frame we
-                // write here, so restart tracking with an empty stack instead
-                // of keeping the previous block's state.
-                self.vstack.clear();
-                self.stack = 0;
-                self.dead = false;
+                self.revive();
+                if let Some(loc) = self.label_locals[l.0].clone() {
+                    self.vlocals = loc;
+                }
             }
-            if let Some(loc) = self.label_locals[l.0].clone() {
-                self.vlocals = loc;
-            }
+            // Otherwise no jump ever targeted this label and control cannot
+            // fall into it either, so the block that follows stays dead and is
+            // dropped at the next label (or at `finish`).
         } else {
             if let Some(st) = self.label_stack[l.0].clone() {
                 self.vstack = merge_stack(&self.vstack, &st, self.ret_object.as_deref());
@@ -216,7 +229,7 @@ impl Assembler {
                 self.vlocals = merge_locals(&self.vlocals, &loc);
             }
         }
-        if self.label_stack[l.0].is_some() || self.need_frame {
+        if !self.dead && (self.label_stack[l.0].is_some() || self.need_frame) {
             self.record_frame_at(off, self.vstack.clone(), self.vlocals.clone());
             self.need_frame = false;
         }
@@ -235,14 +248,23 @@ impl Assembler {
             .push((start, end, handler, catch.map(str::to_string)));
     }
 
-    /// Snapshot locals for a following non-local-return exception handler.
+    /// Snapshot the locals at the start of a guarded region. A handler can be
+    /// entered from any point in that region, so its frame may only claim locals
+    /// that are already live on entry. Nested `try`s push and pop in order.
     pub fn capture_try_locals(&mut self) {
-        self.try_locals = Some(self.vlocals.clone());
+        self.try_locals.push(self.vlocals.clone());
+    }
+
+    /// Pop the snapshot pushed by [`Assembler::capture_try_locals`]; call it once
+    /// the region's handlers have been emitted.
+    pub fn release_try_locals(&mut self) {
+        self.try_locals.pop();
     }
 
     /// Handler entry: the JVM pushes the exception object. Reset tracked stack.
     pub fn enter_handler(&mut self) {
-        self.dead = false;
+        self.drop_dead();
+        self.revive();
         self.vstack = vec![VType::Object("java/lang/Throwable".into())];
         self.stack = 1;
         if self.stack > self.max_stack {
@@ -250,26 +272,29 @@ impl Assembler {
         }
         let off = self.bytes.len() as u16;
         self.record_frame_at(off, self.vstack.clone(), self.vlocals.clone());
+        self.need_frame = false;
     }
 
-    /// NLR catch: use locals from [`capture_try_locals`] so the handler frame
-    /// does not claim locals the try body initialized later.
+    /// Handler entry that restores the locals from [`capture_try_locals`], so the
+    /// frame does not claim locals the guarded body initialized later.
     pub fn enter_handler_captured_locals(&mut self) {
-        self.dead = false;
+        self.drop_dead();
+        self.revive();
         self.vstack = vec![VType::Object("java/lang/Throwable".into())];
         self.stack = 1;
         if self.stack > self.max_stack {
             self.max_stack = self.stack;
         }
-        if let Some(loc) = self.try_locals.take() {
+        if let Some(loc) = self.try_locals.last().cloned() {
             self.vlocals = loc;
         }
         let off = self.bytes.len() as u16;
         self.record_frame_at(off, self.vstack.clone(), self.vlocals.clone());
+        self.need_frame = false;
     }
 
     fn emit_op(&mut self, op: u8) {
-        if self.need_frame {
+        if self.need_frame && !self.dead {
             let off = self.bytes.len() as u16;
             self.record_frame_at(off, self.vstack.clone(), self.vlocals.clone());
             self.need_frame = false;
@@ -315,6 +340,11 @@ impl Assembler {
     }
 
     fn save_label(&mut self, l: Label) {
+        if self.dead {
+            // A jump we are about to drop must not contribute its (empty) state
+            // to the target's merged frame.
+            return;
+        }
         let stack = self.vstack.clone();
         let locals = self.vlocals.clone();
         self.label_stack[l.0] = Some(match self.label_stack[l.0].take() {
@@ -952,8 +982,33 @@ impl Assembler {
     fn kill(&mut self) {
         self.vstack.clear();
         self.stack = 0;
+        if !self.dead {
+            self.dead_start = Some(self.bytes.len());
+        }
         self.dead = true;
         self.need_frame = true;
+    }
+
+    /// Discard the instructions emitted since the last terminator. Codegen keeps
+    /// emitting through unreachable positions (`throw` in expression position
+    /// still has to be followed by the method's `ireturn`); rather than teaching
+    /// every emitter about reachability, we let it emit and rewind here.
+    fn drop_dead(&mut self) {
+        let Some(start) = self.dead_start else { return };
+        if self.bytes.len() <= start {
+            return;
+        }
+        self.bytes.truncate(start);
+        self.patches.retain(|(at, _)| *at < start);
+        self.patches_i32.retain(|(at, _, _)| *at < start);
+        let keep = start as u16;
+        self.frames.retain(|&off, _| off <= keep);
+    }
+
+    /// Reachable code starts here again.
+    fn revive(&mut self) {
+        self.dead = false;
+        self.dead_start = None;
     }
 
     pub fn getstatic(&mut self, owner: &str, name: &str, desc: &str) {
@@ -1171,6 +1226,12 @@ impl Assembler {
     }
 
     pub fn finish(mut self) -> (Code, Pool) {
+        // Trailing unreachable code would leave the method without a terminator
+        // in the eyes of the verifier ("falls through code end"), so drop it and
+        // let the `return`/`athrow` that killed it end the method.
+        self.drop_dead();
+        let end = self.bytes.len() as u16;
+        self.frames.retain(|&off, _| off < end);
         let copy = self.patches.clone();
         for (at, lab) in copy {
             let target = self.labels[lab.0].unwrap_or(0);
@@ -1196,6 +1257,11 @@ impl Assembler {
             let start_pc = self.labels[start.0].unwrap_or(0);
             let end_pc = self.labels[end.0].unwrap_or(0);
             let handler_pc = self.labels[handler.0].unwrap_or(0);
+            if start_pc >= end_pc {
+                // The whole guarded region was unreachable and got dropped. An
+                // empty range is rejected by the verifier and protects nothing.
+                continue;
+            }
             let catch_type = match catch {
                 Some(c) => self.pool.class(&c),
                 None => 0,
