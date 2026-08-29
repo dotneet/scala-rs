@@ -965,7 +965,22 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         fun_ty = fun.ty.clone();
         param_tys = method_param_types(st, fun, &fun_pre_ty);
         let pre_params = flat_params(&fun_pre_ty);
-        if !fun.sym.is_none() {
+        // This application calls whatever the callee *tree* denotes. Once that
+        // tree's own type is a function type the call is `FunctionN.apply`,
+        // and the symbol the tree carries stands for the callee only when it
+        // is a value of that same function type. It is not the callee for the
+        // inner `add(1)` of `add(1)(2)` (the symbol is `add`, whose result is
+        // the *inner* application's), nor for the parameterless `f.tupled`
+        // (whose result is the function now being applied) — reading the
+        // result off either wraps the wrong unbox around this call.
+        let sym_denotes_callee = match (&fun_pre_ty, &fun.kind) {
+            (Type::Function { .. }, TreeKind::Apply { .. }) => false,
+            (Type::Function { .. }, _) => {
+                matches!(st.get(fun.sym).ty, Type::Function { .. })
+            }
+            _ => true,
+        };
+        if !fun.sym.is_none() && sym_denotes_callee {
             match &st.get(fun.sym).ty {
                 Type::Method { ret, .. } | Type::Function { ret, .. } => {
                     fun_ty = Type::Method {
