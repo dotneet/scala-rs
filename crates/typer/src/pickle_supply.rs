@@ -109,21 +109,33 @@ impl PickleSupply {
         name: &str,
     ) -> Vec<SymbolId> {
         let mut out = self.complete_on(st, bin, class_sym, name);
-        if !out.is_empty() {
-            return out;
-        }
         // `Iterator.from(1)`: the prelude has the trait but no companion, so
         // the receiver resolved to the class. The member lives on the
         // companion object, which is where it has to be installed -- putting
         // it on the trait would emit an invokevirtual against a method that is
         // not there. codegen already loads `X$.MODULE$` when a method's owner
         // is a module class, so this comes out right.
+        //
+        // The companion is consulted even when the class itself supplied
+        // something, and the two results are unioned. Gating it on "the class
+        // supplied nothing" made the answer depend on unrelated global state:
+        // `scala.math.BigDecimal` declares an instance `apply(MathContext)`,
+        // whose parameter `conv` can only map once *some other* code has
+        // pulled `java.math.MathContext` into the symbol table. So
+        // `BigDecimal(2)` resolved against the companion's seven `apply`
+        // overloads on its own, but against that single instance `apply` in a
+        // unit that had already mentioned `java.math.BigDecimal` -- the same
+        // program compiled or not depending on statement order. Completion is
+        // additive by contract; a class-side hit must not hide the
+        // companion's.
         if !class_sym.is_none() && st.get(class_sym).kind == SymKind::Class {
             let internal = st.get(class_sym).jvm_name.clone();
             if internal.starts_with("scala/") {
                 let full = internal.replace('/', ".");
                 if let Some(m) = self.ensure_class(st, bin, &full, true) {
-                    out = self.complete_on(st, bin, m, name);
+                    if m != class_sym {
+                        out.extend(self.complete_on(st, bin, m, name));
+                    }
                 }
             }
         }
