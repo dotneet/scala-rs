@@ -1667,6 +1667,23 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 不変クラスの型引数が違えばちゃんと落ちることは `mism_bad.scala`
 （`Inv[Int]` を `Inv[Any]` に渡す）で固定しています。
 
+| `mism2.scala` | 型引数が解けないまま残る／宣言した結果型が上書きされる一群の修正（library dual-run のみ）：後続ユニットのメンバを参照するデフォルト引数、型パラメータが 3 つある型の `map` の結果型、ラムダの結果から解くメソッド型パラメータ、引数リスト無しの `RepShape[L, M, U]`、期待型から決まる `Coll.empty`、タプルや可変長引数の中の関数リテラル、package object の implicit 節（`classTag[Short]`）、引数を取らない `def` の値位置での適用、ブロック内のローカル `def` の前方参照 | `hi later` `Some(7)` `rep` `0` `5` `42` `short` |
+
+`mism2.scala` は `crates/cli/tests/mismatch2.rs` から回します。同ファイルには最小形の
+受理テスト（`a_default_argument_may_name_a_later_units_member` /
+`map_keeps_a_result_type_with_more_than_one_argument` /
+`a_lambdas_result_solves_a_nested_type_parameter` /
+`a_parameterless_module_apply_is_a_value` /
+`empty_takes_its_type_arguments_from_the_expected_type` /
+`a_function_literal_gets_its_parameter_type_from_the_expected_type` /
+`a_package_objects_implicit_clause_survives` /
+`a_parameterless_method_is_applied_where_a_function_is_expected` /
+`a_constructor_argument_is_solved_against_the_parameter_it_fills` /
+`a_local_def_may_be_called_before_it_is_written`）も置いてあります。
+逆に、`map` が宣言どおりの結果型で検査される（コレクションの近道が結果型を
+作り変えない）ことは `mism2_bad.scala`（`Act[Int, …]` を `Act[String, …]` に渡す）で
+固定しています。
+
 ### Remaining
 
 - **slick の計測は `.fm` テンプレートを展開してから行う**。slick は `GetResult` /
@@ -1680,6 +1697,10 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   内訳と残りは「slick が生成する 7 本（`.fm` テンプレート）が通るまで」を参照。
   `agent/ctoraccessor` スライスでさらに **1279 → 1219**（エラーを含むファイルは 109 → 107、
   `CompilableFunctions.scala` の `tupled` 21 件と `Builder` の `++=` 6 件がゼロ）。
+  さらに `agent/mismatch2` スライスで **1279 → 1123**（`type mismatch` は 320 → 227、
+  エラーを含むファイルは 109 → 107）になりました。残る `type mismatch` を機械分類すると、
+  「解けないままの型パラメータがそのまま出ている」81、「同じクラスで型引数だけ違う」27、
+  「`Any` に広がった」14、「found と required が同じ字面」11 で、残りは細かい単発です。
 
 - **override 検査が無い**。`override` 修飾子の要否も、override 時の型適合も検査していない。
   scalac が拒否する次の 2 つを黙って通す:
@@ -1687,23 +1708,27 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   scalac: ``` `override` modifier required to override concrete member ```）、
   `class D extends T { override def f: String = "x" }`（親は `Int`。scalac:
   `incompatible type in overriding`）。`val` も同様。受け入れすぎる側の穴。
-- **`obj[T1, T2]`（引数リスト無しの暗黙 `apply` 挿入）で型引数が落ちる**。
-  `object R { def apply[L, M, U]: Shape[L, M, U, M] = … }` に対し
-  `R.apply[L, Rep[T], T]` は通るが `R[L, Rep[T], T]` は
-  `found: Shape[L, Rep[T], T, Rep[T]]  required: Shape[L, Rep[T], T, Rep[T]]`
-  になる（表示は同じで `L` が呼び先の型パラメータのまま）。`apply` を挿し込む際に
-  TypeApply の型引数が結果型へ substitute されていない。slick の
-  `RepShape[Level, Rep[T], T]`（`Shape.scala` / `Query.scala`）がこれ。
-  明示的型適用まわりなので `agent/deadcode` の担当範囲。
 - **`Array[T]` から `Seq[T]` への暗黙変換**。`def k(x: Array[Int]): Seq[Int] = x` は scalac
   では（deprecation 警告つきで）通るが、こちらは type mismatch になる。`Predef` の
   `copyArrayToImmutableIndexedSeq` / `wrapIntArray` 相当の暗黙変換が prelude に無い。
-- **可変長引数の要素型を期待型から取れない**。`Vector(a, b)` の `A` は引数の lub からしか
-  決まらない。lub 側は反変パラメータと型パラメータ境界を見るようにしたので slick の
-  `AndThenAction[R2, S2, E with E2](Vector(this, a))` は通るようになったが、
-  期待型 `Iterable[(String, Dumpable)]` から `A` を決める経路（nsc の
-  `instantiateExpecting` を親型経由で辿る形）はまだ無い。slick の `DumpInfo(children = …)`
-  が `found: Vector[Any]  required: Iterable[(String, X)]` で落ちるのはこれ。
+- **`Vector[T]` が `scala.collection.IndexedSeq[T]` に適合しない**。prelude の
+  コレクション階層に `immutable.Vector`（および `immutable.IndexedSeq`）から
+  `collection.IndexedSeq` への辺が無い。`immutable.IndexedSeq` を書けば通るので、
+  足りないのは辺だけ。
+- **`F` が型パラメータ名と implicit 値名を兼ねると型側が勝つ**。
+  `def f[F[_]](implicit F: Sync[F]) = F.pure(x)` の `F.pure` で、値の `F` ではなく
+  型パラメータ `F` を選んでしまい `found: F  required: F[R]` になる
+  （slick の `BasicBackend.scala`）。名前解決が項と型を分けていない。
+- **引数の位置に置いた式は期待型なしで型付けされる**。オーバーロード解決を引数の型で
+  行う都合上、最初のパスではどの引数も期待型 `NoType` で型付けする。直接の期待型が
+  あれば効く経路（タプル要素の関数リテラル、`Coll.empty` の型引数、パラメータを
+  取らない多相メソッドの具体化）が、入れ子になると効かない:
+  `def f(p: (String, Int => Int)) = …; f(("x", n => n + 1))` は
+  `missing parameter type for expanded function` になる（scalac は通す）。
+  nsc は型変数を引数の型付け中も未確定のまま持ち回り、呼び出し全体で一度に解く。
+  コンストラクタ引数（`new Box(Map.empty)`）はパラメータ型から解くようにしたが、
+  メソッド呼び出し（`Seq(Vector.empty)` / `Box(Map.empty)`）はオーバーロード選択が
+  引数の型を先に必要とするため、まだ解けない。
 
 - **明示的な型適用が implicit 引数リストに伝わらない場合がある**。
   `Library.Abs.column[P1](n)`（`def column[T : TypedType]`）や

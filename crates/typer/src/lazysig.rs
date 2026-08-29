@@ -28,6 +28,24 @@ use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 use std::rc::Rc;
 
+/// A `name$default$n` body that still has to be typed.
+///
+/// The getter's *signature* is the parameter's type, so it is known as soon as
+/// the method is; only the expression has to wait until every unit has been
+/// walked. The scope stack of the definition is kept so the expression still
+/// sees the imports and enclosing members it was written under.
+pub(crate) struct PendingDefault {
+    param: SymbolId,
+    getter: SymbolId,
+    ret: Type,
+    tparams: Vec<SymbolId>,
+    preceding: Vec<SymbolId>,
+    owner: SymbolId,
+    this_class: SymbolId,
+    file_index: usize,
+    scopes: Rc<Vec<Scope>>,
+}
+
 /// A definition whose signature still needs its right-hand side typed.
 pub(crate) struct PendingSig {
     /// The definition tree. Typed at most once, then spliced back into the unit.
@@ -195,6 +213,53 @@ impl Typer {
         self.lazy_done.insert(id, t);
     }
 
+    /// Remember the body for `type_pending_defaults`, together with the scope
+    /// stack it was written in.
+    pub(crate) fn defer_default_getter_rhs(
+        &mut self,
+        param: SymbolId,
+        getter: SymbolId,
+        ret: &Type,
+        tparams: &[SymbolId],
+        preceding: &[SymbolId],
+    ) {
+        let scopes = Rc::new(self.st.scopes[self.lazy_base_scopes..].to_vec());
+        self.pending_defaults.push(PendingDefault {
+            param,
+            getter,
+            ret: ret.clone(),
+            tparams: tparams.to_vec(),
+            preceding: preceding.to_vec(),
+            owner: self.st.owner,
+            this_class: self.st.this_class,
+            file_index: self.file_index,
+            scopes,
+        });
+    }
+
+    /// Type every deferred default body. Called once the signature pass has
+    /// walked all units, so a default may name a member of any of them.
+    pub(crate) fn type_pending_defaults(&mut self) {
+        let saved_owner = self.st.owner;
+        let saved_this = self.st.this_class;
+        let saved_file = self.file_index;
+        // Typing one body can complete a signature that defines another
+        // default, so drain until the queue stops growing.
+        while !self.pending_defaults.is_empty() {
+            for p in std::mem::take(&mut self.pending_defaults) {
+                let saved_scopes = self.swap_in_scopes(Some(&p.scopes), p.owner);
+                self.st.owner = p.owner;
+                self.st.this_class = p.this_class;
+                self.file_index = p.file_index;
+                self.type_default_getter_rhs(p.param, p.getter, &p.ret, &p.tparams, &p.preceding);
+                self.swap_back_scopes(saved_scopes);
+            }
+        }
+        self.st.owner = saved_owner;
+        self.st.this_class = saved_this;
+        self.file_index = saved_file;
+    }
+
     /// nsc: `recursive value p needs type` / `recursive method f needs result type`.
     fn report_cyclic_sig(&mut self, id: SymbolId, span: Span) {
         if self.lazy_cyclic.insert(id) {
@@ -228,14 +293,18 @@ impl Typer {
     /// scopes stay in place — they are never popped and cloning them would be
     /// expensive; only what the unit pushed on top is swapped out.
     fn swap_in_pending_scopes(&mut self, p: &PendingSig) -> Vec<Scope> {
+        self.swap_in_scopes(p.scopes.as_ref(), p.owner)
+    }
+
+    fn swap_in_scopes(&mut self, scopes: Option<&Rc<Vec<Scope>>>, owner: SymbolId) -> Vec<Scope> {
         let mut saved = std::mem::take(&mut self.st.scopes);
         let base = self.lazy_base_scopes.min(saved.len());
         let mut stack: Vec<Scope> = saved.drain(..base).collect();
-        match &p.scopes {
+        match scopes {
             Some(sc) => stack.extend(sc.iter().cloned()),
             None => {
                 let mut chain = Vec::new();
-                let mut cur = p.owner;
+                let mut cur = owner;
                 while !cur.is_none() && cur != self.st.root {
                     chain.push(cur);
                     let up = self.st.get(cur).owner;

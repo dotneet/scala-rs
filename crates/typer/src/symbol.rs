@@ -1699,6 +1699,22 @@ impl SymbolTable {
             ),
             Type::Repeated(t) => format!("{}*", self.display_type(t)),
             Type::ByName(t) => format!("=> {}", self.display_type(t)),
+            // Without these the fallback `Display` runs, and it has no symbol
+            // table: every class inside a tuple prints as `#4711`.
+            Type::Tuple(ts) => format!(
+                "({})",
+                ts.iter()
+                    .map(|t| self.display_type(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Type::Named { name, args } if !args.is_empty() => format!(
+                "{name}[{}]",
+                args.iter()
+                    .map(|t| self.display_type(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             other => other.to_string(),
         }
     }

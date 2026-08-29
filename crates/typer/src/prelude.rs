@@ -691,6 +691,8 @@ fn add_scala_aliases(st: &mut SymbolTable, library_abi: bool) {
     crate::prelude_conform::install(st, library_abi);
     // Needs `<:<` (installed just above) and `Map`.
     crate::prelude_impl2::install(st, library_abi);
+    // `Coll.empty` は最後にまとめて多相化する（すべての companion が揃ってから）。
+    crate::prelude_empty::install(st);
 }
 
 fn mark_java(st: &mut SymbolTable, id: SymbolId) {

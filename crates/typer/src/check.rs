@@ -84,7 +84,7 @@ impl Default for TypecheckOptions {
 pub struct Typer {
     pub st: SymbolTable,
     pub diags: Vec<Diagnostic>,
-    file_index: usize,
+    pub(crate) file_index: usize,
     /// Counter for synthetic names.
     gensym: u32,
     /// Enclosing package clauses; a nested one is relative to the last.
@@ -189,6 +189,12 @@ pub struct Typer {
     /// Number of scopes the prelude occupies; they stay in place while a
     /// signature is completed in the scope of its own definition.
     pub(crate) lazy_base_scopes: usize,
+    /// Default-argument expressions waiting to be typed. While signatures are
+    /// being built the units that come later have not been walked yet, so a
+    /// default that names one of their members would see `<notype>`; nsc types
+    /// a `name$default$n` body with the other bodies, and so do we.
+    pub(crate) defer_default_rhs: bool,
+    pub(crate) pending_defaults: Vec<crate::lazysig::PendingDefault>,
     /// nsc's `openImplicits`: the (implicit symbol, target type) pairs whose
     /// own implicit parameters are being resolved right now. Used to cut off
     /// diverging expansions (`crate::implicits`).
@@ -256,6 +262,7 @@ pub fn typecheck_units(
     t.fatal_warnings = opts.fatal_warnings;
     crate::classpath::install_classpath(&mut t.st, &opts.classpath);
     t.link_tuple_products();
+    t.defer_default_rhs = true;
     for (tree, file_index) in units.iter_mut() {
         t.file_index = *file_index;
         t.namer(tree);
@@ -308,6 +315,11 @@ pub fn typecheck_units(
         }
         t.sigs_only = false;
     }
+    // Default arguments are bodies, not signatures: typing them during the
+    // pass above would let one name only the members of the units that come
+    // before its own on the command line.
+    t.defer_default_rhs = false;
+    t.type_pending_defaults();
     for (tree, file_index) in units.iter_mut() {
         t.file_index = *file_index;
         t.typer(tree);
@@ -361,6 +373,8 @@ impl Typer {
             lazy_done: HashMap::new(),
             lazy_body_done: HashSet::new(),
             lazy_base_scopes,
+            defer_default_rhs: false,
+            pending_defaults: Vec::new(),
             open_implicits: std::cell::RefCell::new(Vec::new()),
             diverged_implicit: std::cell::RefCell::new(None),
         }
@@ -3113,25 +3127,45 @@ impl Typer {
             self.st.get_mut(gid).params = preceding.clone();
             self.st.get_mut(gid).paramss = vec![preceding.clone()];
             self.st.get_mut(gid).tparams = tp_ids.to_vec();
-            if let Some(mut rhs) = self.st.get(*pid).default_rhs.clone() {
-                self.st.push_scope();
-                for tp in tp_ids {
-                    let n = self.st.get(*tp).name.clone();
-                    self.st.enter_in_current(&n, *tp);
+            if self.st.get(*pid).default_rhs.is_some() {
+                if self.defer_default_rhs {
+                    self.defer_default_getter_rhs(*pid, gid, &ret, tp_ids, &preceding);
+                } else {
+                    self.type_default_getter_rhs(*pid, gid, &ret, tp_ids, &preceding);
                 }
-                for p in &preceding {
-                    let n = self.st.get(*p).name.clone();
-                    self.st.enter_in_current(&n, *p);
-                }
-                self.type_expr(&mut rhs, &ret);
-                if !ret.is_no_type() {
-                    self.adapt(&mut rhs, &ret);
-                }
-                self.st.pop_scope();
-                self.st.get_mut(*pid).default_rhs = Some(rhs.clone());
-                self.st.get_mut(gid).default_rhs = Some(rhs);
             }
         }
+    }
+
+    /// Type a `name$default$n` body, in a scope holding the method's type
+    /// parameters and the parameters that precede the defaulted one.
+    pub(crate) fn type_default_getter_rhs(
+        &mut self,
+        param: SymbolId,
+        getter: SymbolId,
+        ret: &Type,
+        tparams: &[SymbolId],
+        preceding: &[SymbolId],
+    ) {
+        let Some(mut rhs) = self.st.get(param).default_rhs.clone() else {
+            return;
+        };
+        self.st.push_scope();
+        for tp in tparams {
+            let n = self.st.get(*tp).name.clone();
+            self.st.enter_in_current(&n, *tp);
+        }
+        for p in preceding {
+            let n = self.st.get(*p).name.clone();
+            self.st.enter_in_current(&n, *p);
+        }
+        self.type_expr(&mut rhs, ret);
+        if !ret.is_no_type() {
+            self.adapt(&mut rhs, ret);
+        }
+        self.st.pop_scope();
+        self.st.get_mut(param).default_rhs = Some(rhs.clone());
+        self.st.get_mut(getter).default_rhs = Some(rhs);
     }
 
     pub(crate) fn type_def_body(&mut self, tree: &mut Tree) {
@@ -3724,7 +3758,10 @@ impl Typer {
                 self.type_val_body(tree);
             }
             TreeKind::DefDef { .. } => {
-                self.type_def_sig(tree);
+                // `type_member_sig`, not `type_def_sig`: the block above may
+                // already have built this signature, and doing it twice would
+                // synthesize a second set of evidence parameters.
+                self.type_member_sig(tree);
                 self.type_def_body(tree);
             }
             TreeKind::Import { .. } => self.type_import(tree),
@@ -4292,7 +4329,16 @@ impl Typer {
                             .collect();
                         if let [only] = candidates[..] {
                             sym = only;
-                            base_ty = self.st.get(sym).ty.clone();
+                            // The symbol's own type still carries the method
+                            // wrapper. A *parameterless* factory
+                            // (`def apply[L, M, U]: Shape[L, M, U, M]`) is the
+                            // value itself, so `RepShape[L, M, U]` must not
+                            // keep a nullary method type -- an ordinary
+                            // `RepShape.apply[L, M, U]` does not either.
+                            base_ty = match self.st.get(sym).ty.clone() {
+                                Type::Method { paramss, ret } if paramss.is_empty() => *ret,
+                                other => other,
+                            };
                         }
                     }
                     // nsc (SLS 6.26.3): explicit type arguments first narrow an
@@ -4345,6 +4391,20 @@ impl Typer {
                     ) && s.sym.is_none()
                     {
                         self.namer(s);
+                    }
+                }
+                // A local `def` is in scope for the whole block, so it may be
+                // called before it is written -- and two of them may call each
+                // other. Only the signature is built here (which is what a
+                // reference needs); the body still waits its turn below. A
+                // `def` with no result type has nothing to build yet: its type
+                // comes from its own body, so a forward reference to it is the
+                // cycle nsc reports.
+                for s in stats.iter_mut() {
+                    if let TreeKind::DefDef { tpt, name, .. } = &s.kind {
+                        if name != "<init>" && !tpt.is_empty() {
+                            self.type_member_sig(s);
+                        }
                     }
                 }
                 for s in stats.iter_mut() {
@@ -4972,6 +5032,7 @@ impl Typer {
                 }
             }
             ty = self.maybe_auto_apply(ty, pt);
+            ty = self.instantiate_parameterless(s, ty, pt);
             if !self.st.this_class.is_none() {
                 ty = self.st.expand_type_members(self.st.this_class, &ty);
             }
@@ -4986,7 +5047,8 @@ impl Typer {
             found.truncate(1);
             let s = found[0];
             tree.sym = s;
-            tree.ty = self.maybe_auto_apply(first_ty, pt);
+            let ty = self.maybe_auto_apply(first_ty, pt);
+            tree.ty = self.instantiate_parameterless(s, ty, pt);
             return;
         }
         // Keep overloads intact so `println(1)` can still pick a 1-arg alternative.
@@ -5012,12 +5074,130 @@ impl Typer {
         };
     }
 
+    /// nsc's `inferExprInstance`: a *parameterless* polymorphic method used in
+    /// value position (`Vector.empty`, `mutable.HashMap.empty`) has nothing but
+    /// the expected type to solve its parameters from, and whatever the
+    /// expected type leaves open is solved to a bound -- the lower one
+    /// (`Nothing`) where the parameter occurs covariantly, the declared upper
+    /// one where it occurs contravariantly. Without this the reference keeps
+    /// `Vector[A]` and conforms to nothing.
+    ///
+    /// Only done when there *is* an expected type: with none, an open parameter
+    /// is still the more useful type here (the argument of a following call can
+    /// pin it), and nsc's own instantiation point is later than ours.
+    fn instantiate_parameterless(&self, sym: SymbolId, ty: Type, pt: &Type) -> Type {
+        if sym.is_none() || pt.is_no_type() || pt.is_error() {
+            return ty;
+        }
+        if matches!(ty, Type::Method { .. } | Type::Overload(_)) {
+            return ty;
+        }
+        let tps = self.st.get(sym).tparams.clone();
+        if tps.is_empty() || !mentions_tparam(&ty, &tps) {
+            return ty;
+        }
+        // The expected type is the reference's own open parameters handed back
+        // (an argument's parameter type inferred from that very argument): it
+        // constrains nothing, and solving against it would only invent bounds.
+        if mentions_tparam(pt, &tps) {
+            return ty;
+        }
+        if !self.is_nullary_method_sym(sym) {
+            return ty;
+        }
+        let inst = self.add_expected_constraints(sym, &ty, pt, Vec::new());
+        let ids: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+        let vals: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+        let mut ty = crate::symbol::subst_tparams_slice(&ids, &vals, &ty);
+        for tp in tps {
+            if ids.contains(&tp) {
+                continue;
+            }
+            let Some(v) = self.tparam_variance_in(&ty, tp, 1) else {
+                continue;
+            };
+            let s = self.st.get(tp);
+            let solved = if v < 0 {
+                s.bound_hi.clone().unwrap_or(Type::Any)
+            } else {
+                s.bound_lo.clone().unwrap_or(Type::Nothing)
+            };
+            ty = crate::symbol::subst_tparams_slice(&[tp], &[solved], &ty);
+        }
+        ty
+    }
+
+    /// Variance of `tp`'s occurrences in `ty`, or `None` when it does not
+    /// occur. Two occurrences that disagree make the parameter invariant.
+    fn tparam_variance_in(&self, ty: &Type, tp: SymbolId, variance: i8) -> Option<i8> {
+        let merge = |a: Option<i8>, b: Option<i8>| match (a, b) {
+            (None, x) | (x, None) => x,
+            (Some(x), Some(y)) if x == y => Some(x),
+            _ => Some(0),
+        };
+        match ty {
+            Type::TypeParam(id) if *id == tp => Some(variance),
+            Type::Class { sym, args } => {
+                let tparams = self.st.get(*sym).tparams.clone();
+                let mut out = None;
+                for (i, a) in args.iter().enumerate() {
+                    let v = tparams
+                        .get(i)
+                        .map(|&t| {
+                            let f = self.st.get(t).flags;
+                            if f.contains(Flags::COVARIANT) {
+                                1
+                            } else if f.contains(Flags::CONTRAVARIANT) {
+                                -1
+                            } else {
+                                0
+                            }
+                        })
+                        .unwrap_or(0);
+                    out = merge(
+                        out,
+                        self.tparam_variance_in(a, tp, compose_variance(variance, v)),
+                    );
+                }
+                out
+            }
+            Type::Tuple(ts) => ts.iter().fold(None, |acc, t| {
+                merge(acc, self.tparam_variance_in(t, tp, variance))
+            }),
+            Type::Function { params, ret } => {
+                let mut out = self.tparam_variance_in(ret, tp, variance);
+                for p in params {
+                    out = merge(out, self.tparam_variance_in(p, tp, flip_variance(variance)));
+                }
+                out
+            }
+            Type::Array(e) => self.tparam_variance_in(e, tp, 0),
+            Type::ByName(e) | Type::Repeated(e) => self.tparam_variance_in(e, tp, variance),
+            Type::Annotated { tpe, .. } => self.tparam_variance_in(tpe, tp, variance),
+            Type::Applied { ctor, args } => {
+                let mut out = self.tparam_variance_in(ctor, tp, 0);
+                for a in args {
+                    out = merge(out, self.tparam_variance_in(a, tp, 0));
+                }
+                out
+            }
+            _ => None,
+        }
+    }
+
     fn maybe_auto_apply(&self, ty: Type, pt: &Type) -> Type {
         match &ty {
             Type::Method { paramss, ret }
                 if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
             {
-                if matches!(pt, Type::Function { .. } | Type::Method { .. }) {
+                // Eta-expansion is for methods that *take* parameters: `def
+                // f(): T` may become `() => T`, a parameterless `def f: T` may
+                // not. Declining to apply the latter turned `val g: Int => Int
+                // = fs.head` into `() => (Int => Int)`. A `Method` expected
+                // type is not a value position at all -- it marks the callee
+                // of an `Apply`, which must stay a method.
+                let eta = !paramss.is_empty() && matches!(pt, Type::Function { .. });
+                if eta || matches!(pt, Type::Method { .. }) {
                     ty
                 } else {
                     (**ret).clone()
@@ -5514,7 +5694,8 @@ impl Typer {
             let s = found[0];
             tree.sym = s;
             let ty = expand(subst(self.st.get(s).ty.clone()));
-            tree.ty = self.maybe_auto_apply(ty, pt);
+            let ty = self.maybe_auto_apply(ty, pt);
+            tree.ty = self.instantiate_parameterless(s, ty, pt);
             if let Type::Array(elem) = &qual.ty {
                 if name == "apply" {
                     tree.ty = Type::Method {
@@ -6774,7 +6955,14 @@ impl Typer {
                     for (i, tp) in tps.iter().enumerate() {
                         inferred_args.push(
                             self.unify_tparam_all(*tp, &unify_params, &arg_tys)
-                                .filter(|t| !t.is_no_type())
+                                // A lambda argument is still a placeholder
+                                // (`(<notype>) => <notype>`) at this point.
+                                // Solving `B` from it would hide the expected
+                                // type, and the lambda would then be typed
+                                // against nothing: `val p: (Int, Int => Int) =
+                                // (1, n => n + 1)` reported `missing parameter
+                                // type for expanded function`.
+                                .filter(|t| !mentions_no_type(t))
                                 .or_else(|| pt_args.get(i).cloned())
                                 .unwrap_or(Type::Any),
                         );
@@ -6811,6 +6999,9 @@ impl Typer {
                     self.type_expr(a, &p);
                 }
                 if !p.is_no_type() {
+                    if !mentions_tparam(&p, &tps) {
+                        a.ty = self.instantiate_parameterless(a.sym, a.ty.clone(), &p);
+                    }
                     self.adapt(a, &p);
                 }
             }
@@ -6911,6 +7102,7 @@ impl Typer {
         let chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
         match chosen {
             OverloadPick::Found(sym, mut param_tys, mut ret) => {
+                let mut sig_param_tys = param_tys.clone();
                 if !sym.is_none() {
                     fun.sym = sym;
                     tree.sym = sym;
@@ -6929,6 +7121,7 @@ impl Typer {
                             ret = self.st.subst_tparams(owner, args, &ret);
                         }
                     }
+                    sig_param_tys = param_tys.clone();
                     if !self.st.get(sym).tparams.is_empty() {
                         let inst = self.infer_method_tparams_in(
                             sym,
@@ -6947,6 +7140,15 @@ impl Typer {
                         } else {
                             inst
                         };
+                        // A function literal has not been typed yet; the
+                        // placeholder `(<notype>) => <notype>` standing in for
+                        // it is not a solution, and taking it for one hides
+                        // the expected type from the parameter the lambda
+                        // fills.
+                        let inst: Vec<(SymbolId, Type)> = inst
+                            .into_iter()
+                            .filter(|(_, t)| !mentions_no_type(t))
+                            .collect();
                         // The expected type is a constraint too. Solve it here,
                         // before the implicit clauses are filled: slick's
                         // `def column[T](n: Node)(implicit tt: TypedType[T]): Rep[T]`
@@ -6965,6 +7167,42 @@ impl Typer {
                             // `fill_defaults_and_implicits`; leaving it raw
                             // would search `ClassTag[T]` after `T` is known.
                             fun.ty = crate::symbol::subst_tparams_slice(&tps, &args_t, &fun.ty);
+                        }
+                        // The parameter types the signature really declares.
+                        // What follows rewrites `param_tys` to get the lambda
+                        // arguments typed (`A => Any` instead of `A => B`, or
+                        // the expected type's `Int => Int` for a parameter
+                        // that is only an upper bound), which loses the very
+                        // parameter the second inference pass has to solve.
+                        sig_param_tys = param_tys.clone();
+                        // A parameter that only occurs *covariantly* in the
+                        // result is a mere upper bound, so it must not fix the
+                        // result type (nsc leaves `def cov[T]: List[T]`
+                        // checked against `List[Any]` at `T = Nothing`). It is
+                        // still what an argument has to be checked against,
+                        // though: `Tuple2(1, n => n + 1)` expected to be
+                        // `(Int, Int => Int)` can only give `n` a type this
+                        // way. Applied to the parameter types alone; the
+                        // result is re-inferred from the typed arguments.
+                        let open: Vec<SymbolId> = self
+                            .st
+                            .get(sym)
+                            .tparams
+                            .iter()
+                            .copied()
+                            .filter(|tp| !inst.iter().any(|(id, _)| id == tp))
+                            .collect();
+                        if !open.is_empty() && args.iter().any(is_bare_lambda) {
+                            let weak =
+                                self.add_expected_constraints_in(sym, &ret, pt, Vec::new(), true);
+                            let (ids, vals): (Vec<SymbolId>, Vec<Type>) =
+                                weak.into_iter().filter(|(id, _)| open.contains(id)).unzip();
+                            if !ids.is_empty() {
+                                param_tys = param_tys
+                                    .iter()
+                                    .map(|p| crate::symbol::subst_tparams_slice(&ids, &vals, p))
+                                    .collect();
+                            }
                         }
                     }
                 }
@@ -7184,15 +7422,32 @@ impl Typer {
                 }
                 // The first pass typed lambda arguments with no expected type,
                 // so a method type parameter that only shows up in a lambda's
-                // *result* (`Either.fold[C]`, `Try.fold[U]`, `Option.fold[B]`)
-                // is still uninstantiated. Now that the arguments carry their
-                // real types, infer it once more.
+                // *result* (`Either.fold[C]`, `Try.fold[U]`, `Option.fold[B]`,
+                // `def map[R2](f: R => R2): Act[R2, NoStream, E]`) is still
+                // uninstantiated. Now that the arguments carry their real
+                // types, infer it once more.
                 if !sym.is_none() {
                     let tps = self.st.get(sym).tparams.clone();
-                    if matches!(&ret, Type::TypeParam(id) if tps.contains(id)) {
-                        let now: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+                    if mentions_tparam(&ret, &tps) {
+                        let now: Vec<Type> = args
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| {
+                                // A by-name argument is carried as a thunk;
+                                // `=> T` is solved against what the thunk
+                                // yields, not against `() => T`.
+                                match (param_at(&sig_param_tys, i), &a.ty) {
+                                    (Some(Type::ByName(_)), Type::Function { params, ret })
+                                        if params.is_empty() =>
+                                    {
+                                        (**ret).clone()
+                                    }
+                                    _ => a.ty.clone(),
+                                }
+                            })
+                            .collect();
                         let inst: Vec<(SymbolId, Type)> = self
-                            .infer_method_tparams(sym, &param_tys, &now)
+                            .infer_method_tparams(sym, &sig_param_tys, &now)
                             .into_iter()
                             .filter(|(_, t)| {
                                 !t.is_no_type()
@@ -7274,6 +7529,7 @@ impl Typer {
                                         .as_ref()
                                         .and_then(|t| self.st.class_sym_of(t))
                                         .map(|c| self.collection_root(c))
+                                        .filter(|&c| self.takes_one_type_parameter(c))
                                 });
                                 if let Some(cls) = cls {
                                     ret = Type::Class {
@@ -7307,6 +7563,7 @@ impl Typer {
                                 .as_ref()
                                 .and_then(|t| self.st.class_sym_of(t))
                                 .map(|c| self.collection_root(c))
+                                .filter(|&c| self.takes_one_type_parameter(c))
                             {
                                 ret = Type::Class {
                                     sym: cls,
@@ -7346,8 +7603,19 @@ impl Typer {
                             }
                         }
                     } else if let Some(a0) = args.first() {
-                        if let Type::Function { ret: fr, .. } = &a0.ty {
-                            ret = (**fr).clone();
+                        // Only where ordinary inference left the result open.
+                        // `List.flatMap[B](f: A => IterableOnce[B]): List[B]`
+                        // is a real signature, and once `B` is solved the
+                        // lambda's own type has been widened to the parameter
+                        // type -- taking it for the result turned a
+                        // `List[String]` into an `IterableOnce[String]`.
+                        let open = sym.is_none()
+                            || mentions_tparam(&ret, &self.st.get(sym).tparams)
+                            || ret.is_no_type();
+                        if open {
+                            if let Type::Function { ret: fr, .. } = &a0.ty {
+                                ret = (**fr).clone();
+                            }
                         }
                     }
                 } else if method_name == "withFilter" {
@@ -7599,6 +7867,15 @@ impl Typer {
         }
     }
 
+    /// `xs.map(f)` is retyped as `Coll[B]` for a one-parameter collection whose
+    /// prelude signature does not carry the element type through on its own.
+    /// A receiver that takes any other number of parameters cannot be written
+    /// that way -- a user's `def map[R2](f: R => R2): Act[R2, NoStream, E]`
+    /// would lose two arguments -- so its declared result type stands.
+    fn takes_one_type_parameter(&self, cls: SymbolId) -> bool {
+        self.st.get(cls).tparams.len() == 1
+    }
+
     fn collection_root(&self, id: SymbolId) -> SymbolId {
         let n = self.st.get(id).name.as_str();
         if n == "Some" || n == "None$" || n == "None" {
@@ -7767,6 +8044,17 @@ impl Typer {
         pt: &Type,
         inst: Vec<(SymbolId, Type)>,
     ) -> Vec<(SymbolId, Type)> {
+        self.add_expected_constraints_in(method, ret, pt, inst, false)
+    }
+
+    fn add_expected_constraints_in(
+        &self,
+        method: SymbolId,
+        ret: &Type,
+        pt: &Type,
+        inst: Vec<(SymbolId, Type)>,
+        allow_covariant: bool,
+    ) -> Vec<(SymbolId, Type)> {
         if pt.is_no_type() || pt.is_error() || ret.is_no_type() || ret.is_error() {
             return inst;
         }
@@ -7775,7 +8063,7 @@ impl Typer {
             return inst;
         }
         let mut found: Vec<(SymbolId, Type, bool)> = Vec::new();
-        self.collect_expected(&tps, ret, pt, 1, 0, &mut found);
+        self.collect_expected(&tps, ret, pt, 1, 0, allow_covariant, &mut found);
         if found.is_empty() {
             return inst;
         }
@@ -7801,6 +8089,7 @@ impl Typer {
     /// each type parameter is forced to in a non-covariant position.
     /// `variance` is `1` covariant, `-1` contravariant, `0` invariant; the
     /// `bool` marks an invariant occurrence, which outranks the arguments.
+    #[allow(clippy::too_many_arguments)]
     fn collect_expected(
         &self,
         tps: &[SymbolId],
@@ -7808,6 +8097,7 @@ impl Typer {
         pt: &Type,
         variance: i8,
         depth: u32,
+        allow_covariant: bool,
         out: &mut Vec<(SymbolId, Type, bool)>,
     ) {
         if depth > 12 {
@@ -7815,13 +8105,13 @@ impl Typer {
         }
         match (ret, pt) {
             (Type::Annotated { tpe, .. }, _) => {
-                self.collect_expected(tps, tpe, pt, variance, depth + 1, out)
+                self.collect_expected(tps, tpe, pt, variance, depth + 1, allow_covariant, out)
             }
             (_, Type::Annotated { tpe, .. }) => {
-                self.collect_expected(tps, ret, tpe, variance, depth + 1, out)
+                self.collect_expected(tps, ret, tpe, variance, depth + 1, allow_covariant, out)
             }
             (Type::TypeParam(id), _) if tps.contains(id) => {
-                if variance != 1 {
+                if variance != 1 || allow_covariant {
                     if let Some(t) = self.expected_solution(tps, pt) {
                         out.push((*id, t, variance == 0));
                     }
@@ -7831,11 +8121,13 @@ impl Typer {
             // rebuilding it from the expected type as a whole would turn
             // `Type::Array` into `Type::Class { array_sym }`, whose JVM name is
             // the pseudo-name `[java/lang/Object`.
-            (Type::Array(a), Type::Array(b)) => self.collect_expected(tps, a, b, 0, depth + 1, out),
+            (Type::Array(a), Type::Array(b)) => {
+                self.collect_expected(tps, a, b, 0, depth + 1, allow_covariant, out)
+            }
             (Type::Array(a), Type::Class { sym, args })
                 if *sym == self.st.array_sym && args.len() == 1 =>
             {
-                self.collect_expected(tps, a, &args[0], 0, depth + 1, out)
+                self.collect_expected(tps, a, &args[0], 0, depth + 1, allow_covariant, out)
             }
             (
                 Type::Function {
@@ -7848,23 +8140,31 @@ impl Typer {
                 },
             ) if rp.len() == pp.len() => {
                 for (a, b) in rp.iter().zip(pp) {
-                    self.collect_expected(tps, a, b, flip_variance(variance), depth + 1, out);
+                    self.collect_expected(
+                        tps,
+                        a,
+                        b,
+                        flip_variance(variance),
+                        depth + 1,
+                        allow_covariant,
+                        out,
+                    );
                 }
-                self.collect_expected(tps, rr, pr, variance, depth + 1, out);
+                self.collect_expected(tps, rr, pr, variance, depth + 1, allow_covariant, out);
             }
             (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
                 for (x, y) in a.iter().zip(b) {
-                    self.collect_expected(tps, x, y, variance, depth + 1, out);
+                    self.collect_expected(tps, x, y, variance, depth + 1, allow_covariant, out);
                 }
             }
             (Type::Tuple(a), Type::Class { args, .. }) if a.len() == args.len() => {
                 for (x, y) in a.iter().zip(args) {
-                    self.collect_expected(tps, x, y, variance, depth + 1, out);
+                    self.collect_expected(tps, x, y, variance, depth + 1, allow_covariant, out);
                 }
             }
             (Type::Class { args, .. }, Type::Tuple(b)) if args.len() == b.len() => {
                 for (x, y) in args.iter().zip(b) {
-                    self.collect_expected(tps, x, y, variance, depth + 1, out);
+                    self.collect_expected(tps, x, y, variance, depth + 1, allow_covariant, out);
                 }
             }
             (Type::Class { sym: rs, args: ras }, Type::Class { sym: ps, args: pas }) => {
@@ -7893,6 +8193,7 @@ impl Typer {
                             y,
                             compose_variance(variance, v),
                             depth + 1,
+                            allow_covariant,
                             out,
                         );
                     }
@@ -7900,7 +8201,15 @@ impl Typer {
                     // `def f[T]: List[T]` against `Seq[Any]`: line the result
                     // up with the expected type's class first.
                     if !matches!(&base, Type::Class { sym, .. } if sym == rs) {
-                        self.collect_expected(tps, &base, pt, variance, depth + 1, out);
+                        self.collect_expected(
+                            tps,
+                            &base,
+                            pt,
+                            variance,
+                            depth + 1,
+                            allow_covariant,
+                            out,
+                        );
                     }
                 }
             }
@@ -11925,6 +12234,60 @@ impl Typer {
             if self.st.lookup_member(owner, name).is_empty() {
                 let _ = self.package_object_of(owner, span);
             }
+            self.complete_package_object_member(owner, name, span);
+        }
+    }
+
+    /// A package object's members reach the symbol table through its
+    /// *classfile*, and a JVM descriptor cannot say that a parameter clause is
+    /// implicit: `scala.reflect.classTag[T](implicit ct: ClassTag[T])` arrived
+    /// as an ordinary one-parameter method, so `classTag[Short]` kept a method
+    /// type and conformed to nothing. The pickle is the only place the real
+    /// signature is written down.
+    fn complete_package_object_member(&mut self, pkg: SymbolId, name: &str, span: Span) {
+        if !self.library_abi || !self.st.get(pkg).jvm_name.starts_with("scala/") {
+            return;
+        }
+        let Some(po) = self.package_object_of(pkg, span) else {
+            return;
+        };
+        let added = self
+            .pickle
+            .complete(&mut self.st, &mut self.binary, po, name);
+        if added.is_empty() {
+            return;
+        }
+        // The descriptor-derived symbol for the same JVM method is the same
+        // member seen through a poorer lens; keeping both would make every
+        // call an overload set. Matched on the erased descriptor, so a real
+        // overload the pickle did not supply is left in place.
+        let replaced: Vec<String> = added
+            .iter()
+            .map(|&m| self.st.get(m).jvm_name.clone())
+            .filter(|d| !d.is_empty())
+            .collect();
+        let stale: Vec<SymbolId> = self
+            .st
+            .get(po)
+            .members
+            .iter()
+            .copied()
+            .filter(|&m| {
+                !added.contains(&m)
+                    && self.st.get(m).name == name
+                    && replaced.contains(&self.st.get(m).jvm_name)
+            })
+            .collect();
+        for owner in [po, pkg] {
+            self.st
+                .get_mut(owner)
+                .members
+                .retain(|m| !stale.contains(m));
+        }
+        for m in added {
+            if !self.st.get(pkg).members.contains(&m) {
+                self.st.get_mut(pkg).members.push(m);
+            }
         }
     }
 
@@ -14100,6 +14463,34 @@ fn type_args_are_instantiated(args: &[Type], tps: &[SymbolId]) -> bool {
     !args.is_empty()
         && (tps.is_empty() || args.len() == tps.len())
         && args.iter().all(|a| !still_raw_tparam(a, tps))
+}
+
+/// A function literal whose parameter types are not written out. Its parameters
+/// can only come from the expected type.
+fn is_bare_lambda(t: &Tree) -> bool {
+    matches!(t.kind, TreeKind::Function { .. }) && !is_annotated_lambda(t)
+}
+
+/// Whether `ty` is, or contains, an unknown type. A lambda argument that has
+/// not been typed yet is carried as `(<notype>) => <notype>`.
+fn mentions_no_type(ty: &Type) -> bool {
+    match ty {
+        Type::NoType => true,
+        Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
+            args.iter().any(mentions_no_type)
+        }
+        Type::Applied { ctor, args } => mentions_no_type(ctor) || args.iter().any(mentions_no_type),
+        Type::Function { params, ret } => {
+            params.iter().any(mentions_no_type) || mentions_no_type(ret)
+        }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            mentions_no_type(t)
+        }
+        Type::Method { paramss, ret } => {
+            paramss.iter().flatten().any(mentions_no_type) || mentions_no_type(ret)
+        }
+        _ => false,
+    }
 }
 
 /// `ty` が `tps` のいずれかのメソッド型パラメータを含むか。
