@@ -664,6 +664,8 @@ fn add_scala_aliases(st: &mut SymbolTable, library_abi: bool) {
     // that literal name, which doesn't exist for anything under
     // `scala/collection/`).
     crate::prelude_conform::install(st, library_abi);
+    // Needs `<:<` (installed just above) and `Map`.
+    crate::prelude_impl2::install(st, library_abi);
 }
 
 fn mark_java(st: &mut SymbolTable, id: SymbolId) {

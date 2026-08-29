@@ -129,6 +129,13 @@ pub struct Typer {
     /// Number of scopes the prelude occupies; they stay in place while a
     /// signature is completed in the scope of its own definition.
     pub(crate) lazy_base_scopes: usize,
+    /// nsc's `openImplicits`: the (implicit symbol, target type) pairs whose
+    /// own implicit parameters are being resolved right now. Used to cut off
+    /// diverging expansions (`crate::implicits`).
+    pub(crate) open_implicits: std::cell::RefCell<Vec<(SymbolId, Type)>>,
+    /// The first expansion cut off as diverging during the current top-level
+    /// implicit search, for the diagnostic.
+    pub(crate) diverged_implicit: std::cell::RefCell<Option<(SymbolId, Type)>>,
 }
 
 pub fn typecheck(tree: &mut Tree, file_index: usize) -> (SymbolTable, Vec<Diagnostic>) {
@@ -256,6 +263,8 @@ impl Typer {
             lazy_done: HashMap::new(),
             lazy_body_done: HashSet::new(),
             lazy_base_scopes,
+            open_implicits: std::cell::RefCell::new(Vec::new()),
+            diverged_implicit: std::cell::RefCell::new(None),
         }
     }
 
@@ -4308,13 +4317,6 @@ impl Typer {
         if tree.sym.is_none() {
             return;
         }
-        // Wait for TypeApply when the method still has unsubstituted tparams.
-        // Otherwise `implicitly[Int]` types the Ident first and searches for `T`.
-        if !self.st.get(tree.sym).tparams.is_empty()
-            && !matches!(tree.kind, TreeKind::TypeApply { .. })
-        {
-            return;
-        }
         let paramss = self.st.get(tree.sym).paramss.clone();
         let first = paramss.first().cloned().unwrap_or_default();
         if first.is_empty() {
@@ -4327,6 +4329,19 @@ impl Typer {
             return;
         }
         if !matches!(&tree.ty, Type::Method { .. }) {
+            return;
+        }
+        // Wait for TypeApply when the method still has unsubstituted tparams —
+        // otherwise `implicitly[Int]` types the Ident first and searches for
+        // `T`. The exception is nsc's *undetermined* parameters: when every
+        // one of them sits strictly inside an implicit parameter's type
+        // (`toMap[K, V](implicit ev: A <:< (K, V))`), only the witness can pin
+        // them down, and the search does it.
+        let undet = self.undetermined_tparams(tree, &first);
+        if !self.st.get(tree.sym).tparams.is_empty()
+            && !matches!(tree.kind, TreeKind::TypeApply { .. })
+            && undet.is_empty()
+        {
             return;
         }
         let span = tree.span;
@@ -4345,9 +4360,33 @@ impl Typer {
                 _ => self.st.get(*id).ty.clone(),
             })
             .collect();
+        // With undetermined parameters, commit only when the witness really
+        // pins every one of them down. Otherwise leave the tree alone: a
+        // `show[Int]` still has its `TypeApply` coming.
+        let mut solved: Vec<(SymbolId, Type)> = Vec::new();
+        let mut tys = tys;
+        let mut ret = ret;
+        if !undet.is_empty() {
+            let Some(sol) = self.undet_solution(&tys, &undet) else {
+                return;
+            };
+            let ids: Vec<SymbolId> = sol.iter().map(|(i, _)| *i).collect();
+            let ts: Vec<Type> = sol.iter().map(|(_, t)| t.clone()).collect();
+            tys = tys
+                .iter()
+                .map(|t| crate::symbol::subst_tparams_slice(&ids, &ts, t))
+                .collect();
+            ret = crate::symbol::subst_tparams_slice(&ids, &ts, &ret);
+            solved = sol;
+        }
         let mut args = Vec::new();
         self.fill_implicit_params(span, &mut args, &tys, &first);
-        let inner = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+        let mut inner = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+        if !solved.is_empty() {
+            let ids: Vec<SymbolId> = solved.iter().map(|(i, _)| *i).collect();
+            let ts: Vec<Type> = solved.iter().map(|(_, t)| t.clone()).collect();
+            inner.ty = crate::symbol::subst_tparams_slice(&ids, &ts, &inner.ty);
+        }
         let id = inner.id;
         let sym = inner.sym;
         *tree = Tree {
@@ -4361,6 +4400,63 @@ impl Typer {
             sym,
             postfix: false,
         };
+    }
+
+    /// Solve `undet` from the implicit parameter types alone, without emitting
+    /// anything. `None` when a parameter has no (or no unique) witness, or when
+    /// the witness leaves a parameter open — the caller then leaves the tree be.
+    fn undet_solution(
+        &self,
+        param_tys: &[Type],
+        undet: &[SymbolId],
+    ) -> Option<Vec<(SymbolId, Type)>> {
+        let mut solved: Vec<(SymbolId, Type)> = Vec::new();
+        for pty in param_tys {
+            let ids: Vec<SymbolId> = solved.iter().map(|(i, _)| *i).collect();
+            let ts: Vec<Type> = solved.iter().map(|(_, t)| t.clone()).collect();
+            let pty = crate::symbol::subst_tparams_slice(&ids, &ts, pty);
+            let open: Vec<SymbolId> = undet
+                .iter()
+                .copied()
+                .filter(|u| solved.iter().all(|(s, _)| s != u))
+                .collect();
+            let (found, bindings) = self.search_implicit_undet(&pty, &open, 0);
+            if !found.is_found() {
+                return None;
+            }
+            solved.extend(bindings);
+        }
+        undet
+            .iter()
+            .all(|u| solved.iter().any(|(s, _)| s == u))
+            .then_some(solved)
+    }
+
+    /// nsc's undetermined type parameters: those of `tree.sym` that appear
+    /// *strictly inside* an implicit parameter's type, so the implicit search
+    /// is the only thing that can solve them. A parameter whose type is the
+    /// bare type parameter itself (`implicitly[T](implicit e: T)`) is not one:
+    /// every implicit in scope would match it.
+    fn undetermined_tparams(&self, tree: &Tree, first: &[SymbolId]) -> Vec<SymbolId> {
+        let tps = self.st.get(tree.sym).tparams.clone();
+        if tps.is_empty() || matches!(tree.kind, TreeKind::TypeApply { .. }) {
+            return Vec::new();
+        }
+        let ptys: Vec<Type> = match &tree.ty {
+            Type::Method { paramss, .. } => paramss.first().cloned().unwrap_or_default(),
+            _ => return Vec::new(),
+        };
+        if ptys.len() != first.len() || ptys.iter().any(|t| matches!(t, Type::TypeParam(_))) {
+            return Vec::new();
+        }
+        if tps
+            .iter()
+            .all(|tp| ptys.iter().any(|t| type_mentions_tparam(t, *tp)))
+        {
+            tps
+        } else {
+            Vec::new()
+        }
     }
 
     fn type_select(&mut self, tree: &mut Tree, pt: &Type) {
@@ -7416,11 +7512,22 @@ impl Typer {
             Type::Method { paramss, ret } => (paramss, (*ret).clone()),
             _ => return self.ref_implicit(id, span),
         };
-        if paramss.iter().all(|c| c.is_empty()) || depth >= 8 {
-            return self.ref_implicit(id, span);
-        }
         let tps = self.st.get(id).tparams.clone();
-        let targs = self.implicit_targs(id, &ret, pt).unwrap_or_default();
+        // The solved type arguments of a polymorphic implicit
+        // (`<:<.refl[A]` fitted to `Int <:< Any` gives `A = Int`), so the tree
+        // carries the instantiated type rather than the declared `=:=[A, A]`.
+        let targs = self
+            .implicit_fit_at(id, pt, depth, &[])
+            .map(|f| f.targs)
+            .or_else(|| self.implicit_targs(id, &ret, pt))
+            .unwrap_or_default();
+        if paramss.iter().all(|c| c.is_empty()) || depth >= crate::implicits::MAX_IMPLICIT_DEPTH {
+            let mut t = self.ref_implicit(id, span);
+            if targs.len() == tps.len() && !tps.is_empty() {
+                t.ty = crate::symbol::subst_tparams_slice(&tps, &targs, &ret);
+            }
+            return t;
+        }
         let inst = |t: &Type| -> Type {
             if targs.len() == tps.len() && !tps.is_empty() {
                 crate::symbol::subst_tparams_slice(&tps, &targs, t)
@@ -7447,7 +7554,8 @@ impl Typer {
                         cargs.push(self.implicit_tree(inner, &want, span, depth + 1))
                     }
                     _ => {
-                        self.error(span, self.missing_implicit_message(&want));
+                        let diverged = self.diverged_implicit.borrow().clone();
+                        self.error(span, self.missing_implicit_message(&want, diverged));
                         return tree;
                     }
                 }
@@ -7488,16 +7596,17 @@ impl Typer {
                     args.push(r);
                 }
                 ImplicitSearch::None => {
+                    // Read the divergence record before the fallbacks run their
+                    // own searches and reset it.
+                    let diverged = self.diverged_implicit.borrow().clone();
                     if let Some(ct) = self.classtag_apply_fallback(&pty, span) {
                         args.push(ct);
                     } else if let Some(lam) = self.identity_view(&pty, span) {
                         args.push(lam);
                     } else if let Some(lam) = self.array_wrap_view(&pty, span) {
                         args.push(lam);
-                    } else if let Some(w) = self.conforms_witness_fallback(&pty, span) {
-                        args.push(w);
                     } else {
-                        self.error(span, self.missing_implicit_message(&pty));
+                        self.error(span, self.missing_implicit_message(&pty, diverged));
                     }
                 }
                 ImplicitSearch::Ambiguous(ids) => {
@@ -7798,81 +7907,6 @@ impl Typer {
         self.type_expr(&mut lam, pt);
         self.adapt(&mut lam, pt);
         Some(lam)
-    }
-
-    /// nsc resolves an implicit `A <:< B` / `A =:= B` parameter through
-    /// `<:<.refl[A]` (real 2.13.16 has no other generic witness backing these
-    /// — see `prelude_conform.rs`). That's a *polymorphic* implicit def (it
-    /// has its own `[A]`), and `search_implicit`/`implicit_provides`
-    /// (implicits.rs) only accept candidates whose type is already a fully
-    /// concrete, param-less `Type::Method` — they never unify a candidate's
-    /// own `tparams` against the requested `pt` the way `search_conversion`
-    /// does for extension-method views. So instead of trying to make
-    /// `<:<.refl` itself a discoverable implicit candidate, synthesize the
-    /// witness tree directly once `pt`'s shape is known: `A <:< B` (or
-    /// `A =:= B`) is provable iff `is_sub_type(A, B)` (both ways, for `=:=`)
-    /// holds under the same subtyping relation the rest of the typer uses,
-    /// and when it does, `<:<.refl[A]()` (of real nominal type `A =:= A`) is
-    /// a valid witness — `<:<`/`=:=`'s declared variance (`-From, +To`) makes
-    /// `A =:= A` a subtype of `A <:< B` whenever `A <: B`, exactly mirroring
-    /// how real scalac derives the same implicit.
-    fn conforms_witness_fallback(&self, pt: &Type, span: Span) -> Option<Tree> {
-        let Type::Class { sym, args } = pt else {
-            return None;
-        };
-        if args.len() != 2 {
-            return None;
-        }
-        let less_sym = crate::classpath::find_by_jvm(&self.st, "scala/$less$colon$less")?;
-        let eq_sym = crate::classpath::find_by_jvm(&self.st, "scala/$eq$colon$eq")?;
-        let (from, to) = (&args[0], &args[1]);
-        let provable = if *sym == eq_sym {
-            self.st.is_sub_type(from, to) && self.st.is_sub_type(to, from)
-        } else if *sym == less_sym {
-            self.st.is_sub_type(from, to)
-        } else {
-            return None;
-        };
-        if !provable {
-            return None;
-        }
-        let refl_owner = self.st.companion_module(less_sym)?;
-        let refl_cls = self.st.module_class_of(refl_owner);
-        let refl = self
-            .st
-            .lookup_member(refl_cls, "refl")
-            .into_iter()
-            .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)?;
-        let recv = Tree {
-            id: NodeId(0),
-            span,
-            kind: TreeKind::Ident { name: "<:<".into() },
-            ty: Type::ModuleRef(refl_owner),
-            sym: refl_owner,
-            postfix: false,
-        };
-        let fun = Tree {
-            id: NodeId(0),
-            span,
-            kind: TreeKind::Select {
-                qual: Box::new(recv),
-                name: "refl".into(),
-            },
-            ty: self.st.get(refl).ty.clone(),
-            sym: refl,
-            postfix: false,
-        };
-        Some(Tree {
-            id: NodeId(0),
-            span,
-            kind: TreeKind::Apply {
-                fun: Box::new(fun),
-                args: vec![],
-            },
-            ty: pt.clone(),
-            sym: refl,
-            postfix: false,
-        })
     }
 
     fn resolve_overload(
@@ -8898,7 +8932,12 @@ impl Typer {
 
     /// The instance of `target` among `ty`'s base classes: `Some[Int]` seen as
     /// `Option` is `Option[Int]`. `None` when `target` is not a base class.
-    fn base_type_instance(&self, ty: &Type, target: SymbolId, depth: u32) -> Option<Type> {
+    pub(crate) fn base_type_instance(
+        &self,
+        ty: &Type,
+        target: SymbolId,
+        depth: u32,
+    ) -> Option<Type> {
         if depth > 16 {
             return None;
         }
@@ -10937,7 +10976,8 @@ impl Typer {
                 self.type_expr_inner(tree, &Type::NoType);
             }
             ImplicitSearch::None => {
-                self.error(span, self.missing_implicit_message(&ct_ty));
+                let diverged = self.diverged_implicit.borrow().clone();
+                self.error(span, self.missing_implicit_message(&ct_ty, diverged));
                 tree.ty = Type::Error;
             }
             ImplicitSearch::Ambiguous(ids) => {
@@ -11172,7 +11212,16 @@ impl Typer {
             || o.flags.contains(Flags::FINAL)
     }
 
-    fn missing_implicit_message(&self, ty: &Type) -> String {
+    fn missing_implicit_message(&self, ty: &Type, diverged: Option<(SymbolId, Type)>) -> String {
+        // nsc reports the cut-off expansion rather than a plain "not found"
+        // when the search ran into a diverging one.
+        if let Some((sym, pt)) = diverged {
+            return format!(
+                "diverging implicit expansion for type {} starting with method {}",
+                self.st.display_type(&pt),
+                self.st.get(sym).name
+            );
+        }
         if let Some(msg) = self.implicit_not_found_msg(ty) {
             return msg;
         }
@@ -12266,6 +12315,33 @@ fn still_raw_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
     }
 }
 
+/// Whether `tp` occurs anywhere in `ty`.
+pub(crate) fn type_mentions_tparam(ty: &Type, tp: SymbolId) -> bool {
+    match ty {
+        Type::TypeParam(id) => *id == tp,
+        Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
+            args.iter().any(|t| type_mentions_tparam(t, tp))
+        }
+        Type::Applied { ctor, args } => {
+            type_mentions_tparam(ctor, tp) || args.iter().any(|t| type_mentions_tparam(t, tp))
+        }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            type_mentions_tparam(t, tp)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(|t| type_mentions_tparam(t, tp)) || type_mentions_tparam(ret, tp)
+        }
+        Type::Method { paramss, ret } => {
+            paramss
+                .iter()
+                .flatten()
+                .any(|t| type_mentions_tparam(t, tp))
+                || type_mentions_tparam(ret, tp)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
     if let Type::Annotated { tpe, .. } = actual {
         return unify_one(tp, pattern, tpe);
@@ -12284,11 +12360,31 @@ pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<T
         }
         Type::Wildcard => None,
         Type::Class { args: pas, .. } => {
-            if let Type::Class { args: aas, .. } = actual {
-                for (p, a) in pas.iter().zip(aas) {
-                    if let Some(t) = unify_one(tp, p, a) {
-                        return Some(t);
-                    }
+            // `Tuple2[K, V]` against `(Int, String)`: the tuple sugar and the
+            // nominal class denote the same type (`is_sub_type` already treats
+            // them as such), so unify positionally when the arity agrees.
+            let aas = match actual {
+                Type::Class { args, .. } => args,
+                Type::Tuple(ts) if ts.len() == pas.len() => ts,
+                _ => return None,
+            };
+            for (p, a) in pas.iter().zip(aas) {
+                if let Some(t) = unify_one(tp, p, a) {
+                    return Some(t);
+                }
+            }
+            None
+        }
+        // `Show[(A, B)]` against `Show[Tuple2[Int, String]]`.
+        Type::Tuple(pts) => {
+            let aas = match actual {
+                Type::Tuple(ts) if ts.len() == pts.len() => ts,
+                Type::Class { args, .. } if args.len() == pts.len() => args,
+                _ => return None,
+            };
+            for (p, a) in pts.iter().zip(aas) {
+                if let Some(t) = unify_one(tp, p, a) {
+                    return Some(t);
                 }
             }
             None

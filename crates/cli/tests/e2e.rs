@@ -3499,3 +3499,48 @@ fn scala_library_dual_run_lazysig() {
 fn fixtures_lazysig_cyclic_bad_is_error() {
     compile_fails("lazysig_cyclic_bad", "recursive value y needs type");
 }
+
+// --- impl2: polymorphic implicit defs/vals (type-parameter unification) ----
+
+/// Recursive derivation (`showList[Int](showInt)`), tuple-shaped results
+/// (`Show[(A, B)]`), `<:<` through the ordinary search, and the `toMap` whose
+/// `[K, V]` only the witness can pin down. Library types, so jar mode only.
+#[test]
+fn scala_library_dual_run_impl2() {
+    dual_run_fixture("impl2");
+}
+
+/// The same derivation with nothing but user types, so it also runs against
+/// the private runtime.
+#[test]
+fn fixtures_impl2_poly() {
+    check("impl2_poly");
+}
+
+#[test]
+fn scala_library_dual_run_impl2_poly() {
+    dual_run_fixture("impl2_poly");
+}
+
+/// A derivation rule whose own implicit cannot be resolved is dropped; the
+/// type parameter is never silently filled with `Any`.
+#[test]
+fn fixtures_impl2_missing_bad_is_error() {
+    compile_fails("impl2_missing_bad", "no implicit");
+}
+
+/// Two equally specific polymorphic rules: nsc reports ambiguity.
+#[test]
+fn fixtures_impl2_ambiguous_bad_is_error() {
+    compile_fails("impl2_ambiguous_bad", "ambiguous implicit: boxA, boxB");
+}
+
+/// `implicit def loop[A](implicit a: A): A` must be cut off, not looped on
+/// (nsc's diverging implicit expansion).
+#[test]
+fn fixtures_impl2_diverging_bad_is_error() {
+    compile_fails(
+        "impl2_diverging_bad",
+        "diverging implicit expansion for type Show[Int] starting with method loop",
+    );
+}

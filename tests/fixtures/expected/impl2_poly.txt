@@ -1,0 +1,8 @@
+1
+Box(2)
+Box(Box(3))
+<4,four>
+Box(<5,five>)
+<Box(6),Box(six)>
+int
+any
