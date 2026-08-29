@@ -4981,10 +4981,26 @@ fn desugar_for(
     }
     // Work from the last enumerator backwards.
     let mut acc = body;
-    for (i, e) in enums.into_iter().rev().enumerate() {
-        let last = i == 0;
+    // Whether a *generator* has already been folded in. A trailing value
+    // definition (`y = e`) is not one: it becomes a `val` in the lambda's
+    // body, so the generator before it is still the innermost one and takes
+    // `map`, not `flatMap`. Counting enumerators instead made
+    // `for { m <- ms; q = f(m) } yield q` a `flatMap` whose function returned
+    // the element rather than a collection.
+    let mut seen_generator = false;
+    for e in enums.into_iter().rev() {
         let mut rhs = e.rhs;
-        if let Some(g) = e.guard {
+        if e.is_val && e.guard.is_some() {
+            // nsc pairs the value up with the generator's element and filters
+            // the resulting stream; the `val` in a block that this desugaring
+            // uses has no stream to filter. Diagnose rather than emit a
+            // `withFilter` on the value itself, which is not what it means.
+            p.error_span(
+                e.pat.span,
+                "unimplemented: a guard after a value definition in a for-comprehension",
+            );
+        }
+        if let Some(g) = e.guard.filter(|_| !e.is_val) {
             let pred = lambda(p, dummy_ident_from(&e.pat), g);
             let sel = p.alloc(
                 rhs.span,
@@ -5039,7 +5055,7 @@ fn desugar_for(
                 },
             );
         }
-        let method = if last {
+        let method = if !seen_generator {
             if is_yield {
                 "map"
             } else {
@@ -5050,6 +5066,7 @@ fn desugar_for(
         } else {
             "foreach"
         };
+        seen_generator = true;
         let fun = lambda(p, e.pat, acc);
         let sel = p.alloc(
             rhs.span,

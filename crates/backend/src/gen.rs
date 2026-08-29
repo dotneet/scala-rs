@@ -4643,7 +4643,11 @@ fn store(asm: &mut Assembler, slot: u16, sort: JvmSort) {
 }
 
 fn pop_if_value(asm: &mut Assembler, ty: &Type) {
-    match jvm_sort(ty) {
+    pop_sort(asm, jvm_sort(ty));
+}
+
+fn pop_sort(asm: &mut Assembler, sort: JvmSort) {
+    match sort {
         JvmSort::Void => {}
         JvmSort::Long | JvmSort::Double => asm.pop2(),
         _ => asm.pop(),
@@ -5720,6 +5724,9 @@ fn gen_if(
     gen_expr(asm, frame, ctx, cond);
     let else_l = asm.fresh_label();
     let end_l = asm.fresh_label();
+    if let Some(n) = join_class_of(ctx.st, result_ty) {
+        asm.set_join_class(end_l, &n);
+    }
     asm.ifeq(else_l);
     if is_unit_like(result_ty) {
         gen_stat(asm, frame, ctx, thenp);
@@ -13049,6 +13056,11 @@ fn gen_try(
     // Initialize the result local before the try so the exception handler
     // stack map does not claim a live value that the body never stored.
     if let Some(slot) = result_slot {
+        // The body and every catch store their own class into this slot; the
+        // static type of the whole `try` is the class it is declared to hold.
+        if let Some(n) = join_class_of(ctx.st, result_ty) {
+            asm.set_local_class(slot, &n);
+        }
         push_default(asm, result_ty);
         store(asm, slot, sel_sort);
     }
@@ -13078,6 +13090,7 @@ fn gen_try(
             // verifier still needs a value of the right sort under it.
             push_default(asm, result_ty);
         }
+        box_for_result_slot(asm, &block.ty, sel_sort);
         store(asm, result_slot.unwrap(), sel_sort);
     }
     if ret_exit.is_some() {
@@ -13123,6 +13136,7 @@ fn gen_try(
             }
         } else {
             gen_expr(asm, frame, ctx, &c.body);
+            box_for_result_slot(asm, &c.body.ty, sel_sort);
             if let Some(slot) = result_slot {
                 store(asm, slot, sel_sort);
             }
@@ -13171,6 +13185,44 @@ fn gen_try(
     asm.exception(start, end_try, handler, Some("java/lang/Throwable"));
 }
 
+/// A `try` parks its result in one local of one sort, but its branches have
+/// their own types: `try n catch { case _: Exception => "x" }` is an `Any`
+/// whose body leaves an `int`. Box it when the slot wants a reference and the
+/// branch did not already box (the assembler knows which, the tree's type does
+/// not -- an adaptation may have boxed it on the way).
+fn box_for_result_slot(asm: &mut Assembler, ty: &Type, sel_sort: JvmSort) {
+    if sel_sort != JvmSort::Ref || asm.top_is_reference() {
+        return;
+    }
+    if matches!(ty, Type::Nothing) {
+        return;
+    }
+    emit_box(asm, ty);
+}
+
+/// The class a value of `ty` has on the JVM, for the frame that merges the
+/// branches of a `match` or an `if`.
+///
+/// The branches push different classes (`scala/Some` and `scala/None$`), and
+/// the assembler has no class hierarchy to take their least upper bound with.
+/// The expression's own static type *is* an upper bound of all of them, so
+/// hand that over instead. `None` where there is nothing to say: a primitive,
+/// `Object` itself, or a branchless `Unit`/`Nothing`.
+fn join_class_of(st: &SymbolTable, ty: &Type) -> Option<String> {
+    if is_unit_like(ty) || matches!(ty, Type::Nothing | Type::NoType | Type::Error) {
+        return None;
+    }
+    let desc = jvm_desc(st, ty);
+    if desc.starts_with('[') {
+        return Some(desc);
+    }
+    let name = desc.strip_prefix('L')?.strip_suffix(';')?;
+    if name == "java/lang/Object" {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 fn gen_match(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -13187,6 +13239,9 @@ fn gen_match(
         return;
     }
     let end = asm.fresh_label();
+    if let Some(n) = join_class_of(ctx.st, result_ty) {
+        asm.set_join_class(end, &n);
+    }
     for c in cases {
         let fail = asm.fresh_label();
         gen_pattern(asm, frame, ctx, &c.pat, tmp, sel_sort, fail);
@@ -13288,6 +13343,9 @@ fn gen_int_switch(
     }
     let miss = asm.fresh_label();
     let end = asm.fresh_label();
+    if let Some(n) = join_class_of(ctx.st, result_ty) {
+        asm.set_join_class(end, &n);
+    }
     let def_lab = default_idx.map(|i| case_labs[i]).unwrap_or(miss);
     load(asm, tmp, sel_sort);
     let lo = keys.iter().map(|(k, _)| *k).min().unwrap();
@@ -13478,12 +13536,8 @@ fn gen_unapply_pattern(
     }
     if args.len() <= 1 {
         if let Some(a) = args.first() {
-            if is_jvm_primitive(&a.ty) {
-                emit_unbox(asm, &a.ty);
-            } else if !is_type_test_pat(a) {
-                emit_pattern_cast(asm, ctx, &a.ty);
-            }
-            bind_subpattern(asm, frame, ctx, a, fail);
+            let sort = coerce_subpattern(asm, ctx, a);
+            bind_subpattern(asm, frame, ctx, a, sort, fail);
         } else {
             asm.pop();
         }
@@ -13493,15 +13547,31 @@ fn gen_unapply_pattern(
             let fname = if i == 0 { "_1" } else { "_2" };
             asm.dup();
             asm.getfield("scala/Tuple2", fname, "Ljava/lang/Object;");
-            if is_jvm_primitive(&a.ty) {
-                emit_unbox(asm, &a.ty);
-            } else if !is_type_test_pat(a) {
-                emit_pattern_cast(asm, ctx, &a.ty);
-            }
-            bind_subpattern(asm, frame, ctx, a, fail);
+            let sort = coerce_subpattern(asm, ctx, a);
+            bind_subpattern(asm, frame, ctx, a, sort, fail);
         }
         asm.pop();
     }
+}
+
+/// Prepare the erased value on top of the stack for `pat`, and report the sort
+/// it is left in.
+///
+/// A `_: T` (or `x: T`) sub-pattern **tests**: it needs the reference the
+/// `instanceof` reads, and `gen_pattern`'s own `Typed` arm unboxes or casts it
+/// once the test has passed. Unboxing here left an `int` in the local that arm
+/// then `aload`ed -- `val (n: Int, s: String) = …` was
+/// `VerifyError: Bad local variable type`.
+fn coerce_subpattern(asm: &mut Assembler, ctx: &EmitCtx, pat: &Tree) -> JvmSort {
+    if is_type_test_pat(pat) {
+        return JvmSort::Ref;
+    }
+    if is_jvm_primitive(&pat.ty) {
+        emit_unbox(asm, &pat.ty);
+    } else {
+        emit_pattern_cast(asm, ctx, &pat.ty);
+    }
+    jvm_sort(&pat.ty)
 }
 
 /// A `_: T` ascription **tests**; it does not cast. Emitting the narrowing
@@ -13585,12 +13655,8 @@ fn gen_unapply_wrapper_bind(
             "apply$extension",
             &format!("({self_desc}I)Ljava/lang/Object;"),
         );
-        if is_jvm_primitive(&a.ty) {
-            emit_unbox(asm, &a.ty);
-        } else if !is_type_test_pat(a) {
-            emit_pattern_cast(asm, ctx, &a.ty);
-        }
-        bind_subpattern(asm, frame, ctx, a, fail);
+        let sort = coerce_subpattern(asm, ctx, a);
+        bind_subpattern(asm, frame, ctx, a, sort, fail);
     }
 
     if let Some(star) = args.last().filter(|a| is_star_pat(a)) {
@@ -13605,7 +13671,7 @@ fn gen_unapply_wrapper_bind(
         if !is_type_test_pat(star) {
             emit_pattern_cast(asm, ctx, &star.ty);
         }
-        bind_subpattern(asm, frame, ctx, star, fail);
+        bind_subpattern(asm, frame, ctx, star, JvmSort::Ref, fail);
     }
 }
 
@@ -13623,7 +13689,7 @@ fn gen_unapply_seq_bind(
     for a in args {
         if is_star_pat(a) {
             load(asm, list_slot, JvmSort::Ref);
-            bind_subpattern(asm, frame, ctx, a, fail);
+            bind_subpattern(asm, frame, ctx, a, JvmSort::Ref, fail);
             saw_star = true;
             break;
         }
@@ -13632,12 +13698,8 @@ fn gen_unapply_seq_bind(
         asm.ifne(fail);
         load(asm, list_slot, JvmSort::Ref);
         emit_list_head(asm, ctx);
-        if is_jvm_primitive(&a.ty) {
-            emit_unbox(asm, &a.ty);
-        } else if !is_type_test_pat(a) {
-            emit_pattern_cast(asm, ctx, &a.ty);
-        }
-        bind_subpattern(asm, frame, ctx, a, fail);
+        let sort = coerce_subpattern(asm, ctx, a);
+        bind_subpattern(asm, frame, ctx, a, sort, fail);
         load(asm, list_slot, JvmSort::Ref);
         emit_list_tail(asm, ctx);
         store(asm, list_slot, JvmSort::Ref);
@@ -13803,12 +13865,16 @@ fn gen_pattern(
                     // to it here turned `case Some((s, _: TableNode))` on a
                     // plain `Node` into a `ClassCastException` instead of a
                     // failed match.
-                    if fdesc == "Ljava/lang/Object;"
-                        && (!is_type_test_pat(a) || is_jvm_primitive(&a.ty))
-                    {
-                        emit_from_erased_object(asm, ctx.st, &a.ty);
-                    }
-                    bind_subpattern(asm, frame, ctx, a, fail);
+                    let sort = if is_type_test_pat(a) {
+                        // The test reads the field as it stands.
+                        jvm_sort(&fty)
+                    } else {
+                        if fdesc == "Ljava/lang/Object;" {
+                            emit_from_erased_object(asm, ctx.st, &a.ty);
+                        }
+                        jvm_sort(&a.ty)
+                    };
+                    bind_subpattern(asm, frame, ctx, a, sort, fail);
                 } else {
                     throw_runtime(asm, "pattern arity");
                 }
@@ -13858,6 +13924,14 @@ fn gen_pattern(
                 }
                 return;
             }
+            if sel_sort != JvmSort::Ref {
+                // The scrutinee is already unboxed, so its class is settled
+                // and the ascription only names it again (`case Point(x: Int)`
+                // on an `Int` field). There is nothing to test and nothing to
+                // load as a reference.
+                gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
+                return;
+            }
             let jvm = type_jvm_name(ctx.st, &pat.ty);
             if jvm != "java/lang/Object" {
                 load(asm, tmp, JvmSort::Ref);
@@ -13895,17 +13969,21 @@ fn gen_pattern(
     }
 }
 
+/// Bind the value on top of the stack to `pat`. `sort` is the sort that value
+/// actually has -- which is *not* always `jvm_sort(&pat.ty)`: a `_: T` test
+/// sub-pattern keeps the erased reference so `gen_pattern` can `instanceof` it.
 fn bind_subpattern(
     asm: &mut Assembler,
     frame: &mut Frame,
     ctx: &EmitCtx,
     pat: &Tree,
+    sort: JvmSort,
     fail: crate::code::Label,
 ) {
     // field value is on the stack
     match &pat.kind {
         TreeKind::Wildcard | TreeKind::Empty => {
-            pop_if_value(asm, &pat.ty);
+            pop_sort(asm, sort);
         }
         // A lowercase identifier binds; `Nil` and other stable ids must be
         // compared, so they fall through to `gen_pattern` below.
@@ -13917,7 +13995,6 @@ fn bind_subpattern(
                 || pat.sym.is_none()
                 || ctx.st.get(pat.sym).kind == SymKind::Term =>
         {
-            let sort = jvm_sort(&pat.ty);
             let slot = if pat.sym.is_none() {
                 frame.alloc_tmp(sort)
             } else if let Some((s, _)) = frame.get(pat.sym) {
@@ -13930,7 +14007,6 @@ fn bind_subpattern(
         _ => {
             // Nested patterns (`case h :: Nil`, `case Some(Some(x))`) need the
             // full matcher, which reads its value from a local.
-            let sort = jvm_sort(&pat.ty);
             let tmp = frame.alloc_tmp(sort);
             store(asm, tmp, sort);
             gen_pattern(asm, frame, ctx, pat, tmp, sort, fail);

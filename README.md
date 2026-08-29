@@ -77,11 +77,11 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - packages / imports
 - objects / classes / traits / case classes。**補助コンストラクタ** `def this(...) = this(...)`（連鎖の先頭は `this(...)`。`super(...)` や文のあとの `this` は診断）。サブクラスの `extends C(1)` は primary が親 ctor を呼ぶ。内部クラスの `new Inner` は ctor overload 選択後も `$outer` を `<init>` の第一引数に残す。**case class の `copy(...)`**（positional / 一部省略時は自分自身の対応フィールドを default / 名前付き引数。`copy` は namer 時点ではまだ ctor フィールドの型が確定していないため、フィールド型解決後の typer フェーズで `copy` 自身の引数シンボルと `copy$default$N` を作り直す。private ランタイムでも動く）。**コンストラクタの省略可能引数**（`class C(x: Int, y: Int = 5)` の `new C(1)` / `new C(y = 2, x = 1)`）: 末尾を省略した呼び出しへのデフォルト値の充填は、通常の `def` の default getter 経由ではなく（`this` が無い呼び出し元では使えないため）呼び出し側でその場を型付けする素朴なフォールバックのみ実装（先行引数を参照するデフォルトは非対応）。**名前付き引数での並べ替えは `new C(...)` でも動く**（コンストラクタのオーバーロードはパラメータ名で絞ってから型で決める）
 - `val` / `var` / `def`（ネストした `def` はパースする）
-- パラメータ、ラムダ（型付き / 期待型から推論）、ブロック。**placeholder `_`**（nsc `withPlaceholders`）: `_ + 1` / `_.abs` / `f(_)` / `xs.map(_ + 1)` / Function2 `_ + _` / 入れ子 `_.map(_ + 1)` に加え **typed `_ : T`**（`(_: Int) + 1` / `(_: Int) + (_: Int)` / `(_: Int).abs` / `xs.map((_: Int) + 1)`）。レキサが `_:` を `Ident("_")` にするので、式位置では Underscore と同じ placeholder にする。bare `(_: Int)` は `unbound placeholder parameter`。`xs.map(_ : Int)` は nsc どおり wrap せず map に Int が渡り mismatch。unary / Function2 の既存 wrap は触らない。**メソッド適用のセクション** `f(_, x)` / `f(_, _)` は期待型が無くても呼び先のシグネチャからパラメータ型を取る（nsc と同じ条件で、呼び先が単一の非ジェネリックメソッドのときだけ。`poly(_, 3)` や overload された `"abc".substring(_)` は `missing parameter type for expanded function` のまま）。合成パラメータはソース順で並べる（`two(_, _)` は `(a, b) => two(a, b)`）
+- パラメータ、ラムダ（型付き / 期待型から推論）、ブロック。**placeholder `_`**（nsc `withPlaceholders`）: `_ + 1` / `_.abs` / `f(_)` / `xs.map(_ + 1)` / Function2 `_ + _` / 入れ子 `_.map(_ + 1)` に加え **typed `_ : T`**（`(_: Int) + 1` / `(_: Int) + (_: Int)` / `(_: Int).abs` / `xs.map((_: Int) + 1)`）。レキサが `_:` を `Ident("_")` にするので、式位置では Underscore と同じ placeholder にする。bare `(_: Int)` は `unbound placeholder parameter`。`xs.map(_ : Int)` は nsc どおり wrap せず map に Int が渡り mismatch。unary / Function2 の既存 wrap は触らない。**メソッド適用のセクション** `f(_, x)` / `f(_, _)` は期待型が無くても呼び先のシグネチャからパラメータ型を取る（nsc と同じ条件で、呼び先が単一の非ジェネリックメソッドのときだけ。`poly(_, 3)` や overload された `"abc".substring(_)` は `missing parameter type for expanded function` のまま）。合成パラメータはソース順で並べる（`two(_, _)` は `(a, b) => two(a, b)`）。**リテラルの本体は期待型の結果に対して検査する** ── `xs.foreach((x: Int) => x + 1)` は value discarding、`fl((x: Int) => x)` は `Int => Long` への数値拡大。パラメータ型を書いたリテラルはオーバーロード解決のために期待型より先に型付けられるので、そのぶんは `adapt` 側でやる。関数**値**は対象外で、`val h: Int => Int = …; fu(h)` は nsc どおり `type mismatch`
 - `if` / `else`、`while`、`do { ... } while (cond)`
 - `try` / `catch` / `finally`（catch は `{ case ... }`。`try/finally` と `try/catch/finally`。finally は正常終了と例外（catch からの throw 含む）の両方で走る。JVM 例外テーブルを出す。パーサは `finally` を落とさない）
 - `match`（コンストラクタパターン、リテラル、ワイルドカード、Java enum 定数の安定識別子 `Thread.State.NEW`）
-- for-comprehension（`map` / `flatMap` / `foreach` / `withFilter` へデシュガー。私有ランタイムでは `List.withFilter` は eager な `List`。`--scala-library` 時は `scala.collection.WithFilter`。`Option.withFilter` は `Option$WithFilter`）
+- for-comprehension（`map` / `flatMap` / `foreach` / `withFilter` へデシュガー。私有ランタイムでは `List.withFilter` は eager な `List`。`--scala-library` 時は `scala.collection.WithFilter[+A, +CC[_]]` で、`map[B]` は `CC[B]` を返す。`Option.withFilter` は `Option$WithFilter`）。値定義 `q = e` はラムダ本体の `val` になる ── **生成子ではない**ので、その前の生成子はやはり最内で `map` を取る。値定義の**後ろのガード**は nsc のタプル化が要るので診断する
 - apply / select / infix（`:` 終わりの演算子は右結合で、レシーバは右オペランド。`1 :: Nil` → `Nil.::(1)`）。代入 `xs(i) = v` は nsc どおり `xs.update(i, v)`。代入でない `c(1)` で `apply` が無ければ診断する（黙って `update` にしない）
 - リテラル、タプル
 - 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）。infix 型 `A Either B` は `Either[A, B]`。`Map[K, V]` の applied 構文はそのまま。**高階型** `trait Functor[F[_]]` / `class Box[F[_], A](val fa: F[A])`。具象は `Id[_]` など。kind 不一致（`F[_]` を proper 位置で使う、proper 型を型コンストラクタとして使う）は診断する（黙って捨てない）。**高階型メンバー** `trait M { type F[_] }` とパス依存適用 `m.F[Int]`。具象は subclass で `type F[X] = Id[X]`（または `List[X]`）。メンバーの kind 不一致（`type F[_]` を `type F = Int` で束縛、逆も）は診断する。**refinement の高階型メンバー** `M { type F[X] = Id[X] }` と適用。**HK 境界** `type F[_] <: Bound`（proper な境界。`type F[_] <: List` は nsc どおり `takes type parameters`）。**refinement の境界** `{ type A <: Int }`。クラス / トレイトの nullary `type A <: T` は未実装のまま診断する。**入れ子型射影** `Outer#Inner#X` / `Holder#Inner#T`。違法な `Int#X` と抽象 `B#U#T`（メンバー無し）は nsc どおり `is not a member`
@@ -484,7 +484,9 @@ try close() catch {
 
 ハンドラ式は **case 節の中** で評価されます。つまり本体が実際に投げたときだけ、高々 1 回です。ハンドラが受け付けない例外はそのまま再送出します。`case` で始まらない `catch { expr }` も同じ扱いで、`catch {}` は「節が無い」のままです。
 
-`try` 本体が必ず投げる（`Nothing`）ときの型は、nsc どおりハンドラ側との lub です。`val n = try throw e catch toLen` は `Nothing` ではなく `Int` になります。
+`try` 本体が必ず投げる（`Nothing`）ときの型は、nsc どおりハンドラ側との lub です。`val n = try throw e catch toLen` は `Nothing` ではなく `Int` になります。ハンドラが本体の型に**適合しない**ときも lub です — `try Success(f) catch { case NonFatal(e) => Failure(e) }` は `Success` ではなく `Try` です。ただし全枝が参照型のときだけで、`Int` と `Unit` が混ざる形は本体の型のままにします（結果は 1 つのローカルに置くので、sort が混ざると箱詰めが要ります）。
+
+結果を置くそのローカルには**宣言型**を持たせます（`Assembler::set_local_class`）。枝が `Success` と `Failure` を入れると、クラス階層を持たないアセンブラの合流は `java/lang/Object` になり、続く `areturn` が検証に落ちるためです。参照のスロットにプリミティブが来る枝は箱詰めします（`box_for_result_slot`。既に箱詰め済みかは木の型では分からないので、アセンブラのスタックの実際の型を見ます）。`match` / `if` の合流も同じで、こちらはスタック最上段に対して `Assembler::set_join_class` を使います。宣言が無い合流は `java/lang/Object` です。
 
 本体や catch 節からの **`return`** は finalizer を飛ばしません。nsc と同じく、値をローカルに退避してから finalizer のコピー（例外テーブルの範囲**外**に置くので、finalizer 自身が投げても二重には走りません）へ跳び、そこで本当に return します。入れ子の `try ... finally` は内側から順に繋がります。`synchronized { ... return x ... }` も同じ仕組みで `monitorexit` を通ります。
 
@@ -1506,6 +1508,7 @@ zip して `U` が解けませんでした。`unify_tparam_all` が
   `Bad local variable type`（int を参照ローカルに入れている）になります。
   slick の `HoistClientOps` の
   `val (bl2: Bind, lrepl: Map[…] @unchecked) = …` がこの形です。
+  → **`agent/mismatch6` で解決**（`_: T` の部分パターンは参照のまま束ねる）。
 - **タプル成分への期待型の伝播**。`(new Sel, Map(s -> a))` を
   `(Node, Map[Sym, Int])` に対して型付けると、成分の `Map(s -> a)` は
   期待型なしで型付けられて非変な `Map[AnonSym, Int]` になります。
@@ -1516,6 +1519,152 @@ zip して `U` が解けませんでした。`unify_tparam_all` が
 - **`def wrong[A, B](v: B): GR[A] = mk(_ => v)` を通してしまう**（main でも同じ）。
   期待型が非変位置で `T := A` を強制したあと、ラムダの本体が `A` に対して
   再検査されません。scalac は `found: v.type required: A` を出します。
+
+### 合流型・型検査を通ってから落ちる 3 件（`type mismatch` 第 6 スライス）
+
+`agent/mismatch6` スライス。フィクスチャは `tests/fixtures/mism6*.scala`、テストは
+`crates/cli/tests/mismatch6.rs` です。README の Remaining に記録されていた
+**3 件**（うち 2 件は型検査を通ってから `VerifyError` になるコード生成のバグ、
+1 件は型検査で落ちる明示型ラムダ）と、`type mismatch` の 6 原因を直しました。
+以下の 9 項目です。
+
+**1. 分岐の合流型が `java/lang/Object` になっていた**（codegen）。
+
+```scala
+h.cur = (3: Int) match { case 0 => None; case n => Some(n) }
+```
+
+`match` の枝は `scala/Some` と `scala/None$` という**別のクラス**を積みます。
+アセンブラはクラス階層を持たないので、`merge_vtype` はその 2 つを
+`java/lang/Object` に潰していました。結果、`putfield Lscala/Option;` は
+`VerifyError: Bad type on operand stack` になります。
+
+**式の静的型そのものが全枝の上界**なので、生成側がそれを渡すようにしました
+（`Assembler::set_join_class`。`gen_match` / `gen_int_switch` / `gen_if` が
+`join_class_of(result_ty)` を合流ラベルに宣言する）。合流はスタック最上段
+——つまり合流の対象になっている値——にだけ適用します。下の段は分岐の前に
+積まれたもので、どの経路でも同じだからです。
+
+`try` は結果を**ローカル**に置くので同じ手当てが要ります
+（`Assembler::set_local_class`。宣言したスロットに入る参照はすべてその
+クラスとして記録されます）。
+
+同時に `ret_object` を**外しました**。これは「参照どうしの合流は**メソッドの
+戻り型**にする」という、`areturn` だけのために置かれた当て推量です。宣言する
+型が本当の上界である保証がどこにも無く、
+`Some(n match { case 1 => "one"; case _ => n })` のように `Option` を返す
+メソッドの**内側**で `String` と `Integer` が合流すると、フレームが
+`scala/Option` を名乗って `VerifyError: Inconsistent stackmap frames` に
+なっていました（main でも同じ）。宣言が無い合流は `java/lang/Object` ——
+どんな参照でも代入可能な、常に正しいフレーム型——にし、本当の型が分かる場所
+だけが `set_join_class` で言うようにしました。
+
+**2. `try` の型が本体の型のままだった**。上と対になる型検査側の穴です。
+
+```scala
+try Success(f) catch { case NonFatal(e) => Failure(e) }
+```
+
+コメントは「nsc は本体とハンドラの lub を取る」と書いてありましたが、実装は
+本体が `Nothing` のときしか lub を取らず、それ以外は本体の型をそのまま
+使っていました。ハンドラが本体に**適合しない**ときは lub が要ります。
+`try n catch { case _: Exception => "x" }` は `Any` であって `Int` ではなく、
+`Int` のままだと `int` のスロットに `Integer` を `istore` して
+`VerifyError` になっていました（main でも同じ）。
+
+結果は 1 つのローカル（1 つの JVM sort）に入るので、参照のスロットに
+プリミティブが来たら箱詰めします（`box_for_result_slot`）。枝が既に箱詰め
+済みかどうかは木の型では分からない——型検査側の adapt が箱詰めしていることが
+ある——ので、**アセンブラのスタックの実際の型**を見ます
+（`Assembler::top_is_reference`）。
+
+lub を取らないのは枝に `Unit` がある形だけです。nsc は文の位置の
+`try f() /* Int */ catch { println }` を `Any` に lub しますが、`gen_try` には
+その形のために「本体の sort の既定値を積む」経路が既にあります。
+
+**3. `_: T` の部分パターンが参照のままでなかった**（codegen）。
+
+```scala
+val (n: Int, s: String) = if (b) (1, "x") else (0, "y")
+```
+
+`Tuple2._1` を読んだあと `emit_from_erased_object` が `int` に開けてしまい、
+続く型テストがそのローカルを `aload` して
+`VerifyError: Bad local variable type` になっていました。`_: T` は
+**テスト**なので `instanceof` が読む参照が要ります —— 開けるのは
+`gen_pattern` の `Typed` 枝がテストを通ったあとにやります。
+部分パターンを束ねる 7 か所（`bind_subpattern`）は、パターンの型ではなく
+**スタックにある値の sort** を受け取るようにしました。スクルーティニが
+すでにプリミティブなら型テストは静的に決まっているので、`Typed` 枝は
+`instanceof` を出さずに素通しします。
+
+**4. 明示型ラムダの本体が期待結果型で検査されない**。
+
+```scala
+xs.foreach((x: Int) => x + 1)   // found: (Int) => Int  required: (Int) => Unit
+```
+
+nsc は関数リテラルの本体を期待型の**結果**に対して型付けます（value discarding も
+数値拡大もそこで起きます）。パラメータ型を書いたリテラルは、オーバーロード解決が
+その結果型を必要とするので**期待型が決まる前に**型付けられ、本体は期待結果型を
+見ないままでした。`adapt` に `adapt_function_literal_result` を足して、
+リテラルのときだけ本体を期待結果型に adapt します。**リテラルのときだけ**です ——
+`val h: Int => Int = …; fu(h)` は nsc と同じく `type mismatch` のままです
+（`tests/fixtures/mism6_bad.scala`）。
+
+**5. `Map` は自分が宣言している関数である**。2.13 の
+`MapOps[K, +V, …] extends IterableOps[…] with PartialFunction[K, V]` なので
+`on.map(columnIndexes)` はキー引きです。prelude に `MapOps` は無く、
+`Map` に `PartialFunction` の親を張ると継承メンバの走査順が変わって
+`toMap` の `A <:< (K, V)` が壊れる（`A` が `Char` になる）ので、
+`Typer::function_view`（`arg` を継承した構造的関数型として読む）に事実を
+書きました。使うのは 3 か所で、いずれも**それ以外が何も決まらなかったとき**の
+フォールバックです:
+
+- `arg_score` の最後（早い段階で採点すると slick の `map` 呼び出しが
+  軒並み `ambiguous overload` になりました）
+- `unify_tparam_all`（引数のままでは型パラメータが 1 つも決まらなかったとき）
+- `map` の「受け手のコレクションを保つ」近道（要素型は関数の戻り型）
+
+`scala.FunctionN` **クラス**自身はこの view の対象外です。すでにどこでも
+関数として扱われており、ここで構造的に書き直すと `map` の両オーバーロードが
+同時に applicable になります。
+
+**6. `WithFilter` が型構築子を持っていなかった**。2.13 は
+`class WithFilter[+A, +CC[_]]` で `map[B](f: A => B): CC[B]` です。prelude は
+`CC` に**適用済み**のコレクション（`List[A]`）を入れて `map: CC` としていたので、
+`for (x <- xs if p) yield x.toString` は `List[Int]` のままでした
+（jar モードのみ。私有ランタイムでは `withFilter` が受け手をそのまま返します）。
+`CC` を kind 1 の型パラメータにし、`map` / `flatMap` に自分の `B` を持たせて
+`Type::Applied { ctor: CC, args: [B] }` を返すようにしました。
+
+**7. for 内包の値定義が生成子として数えられていた**。
+
+```scala
+for { m <- ms if m > 0; q = f(m) } yield q
+```
+
+`q = e` はラムダ本体の `val` になるので、その前の生成子は**やはり最内**で
+`map` を取ります。列挙子の位置で数えていたため `flatMap` になり、関数が
+コレクションではなく要素を返す形になっていました。値定義の後ろに**ガード**が
+付く形（nsc はタプルに組んでストリームを絞る）は、この desugaring では
+表現できないので**診断します**（`tests/fixtures/mism6_forval_bad.scala`）。
+
+**8. コレクション階層に `scala.collection.IndexedSeq` と mutable の背骨が無かった**。
+`ArrayBuffer` はどこでも `IndexedSeq` ではなかったので、slick の
+`def and(ns: scala.collection.IndexedSeq[Node])` は自分が組み立てた
+`ArrayBuffer` を受け取れませんでした。`prelude_hier.rs` に
+`collection.IndexedSeq` / `mutable.Seq` / `mutable.IndexedSeq` /
+`mutable.Buffer` を足し、`ArrayBuffer` と `ListBuffer` をそこに繋ぎました。
+
+**9. `Success` / `Failure` の `apply` に型パラメータが無かった**。`apply` は
+生の `Success` / `Failure` を返していたので、`def a[R](…): Try[R] = Success(f)` は
+`found: Success required: Try[R]` でした。`Failure.apply[T]` の `T` は
+どのパラメータにも現れないので、期待型（か `Nothing`。`Try` は共変なので無害）
+だけが決められます。
+
+slick: `errors 537 → 526`、`type mismatch 90 → 83`、`files_with_errors` は 80 のまま。
+エラーが出るファイルの集合は変わっていません。
 
 ### jar のクラスを pickle から読む
 
@@ -2418,6 +2567,28 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 `@unchecked` 越しに関数として呼ぶ）で固定しています。実 scalac 2.13.16 も
 すべて拒否します。
 
+| `mism6.scala` | `match` / `if` の合流型を式の静的型にすること、`_: T` の部分パターンを参照のまま束ねること、明示型ラムダの本体を期待結果型に adapt すること、for 内包の末尾の値定義、`withFilter(…).map(f)` の要素型、`try` の lub と結果スロットへの箱詰め（**私有ランタイムと library の両モード**、`java -Xverify:all`） | `3` `-1` `true` `7` `-1` `5` `-1` `9` `1` `x` `4` `n1;n2;` `2;3;` `true` `one` `7` `5` `6` |
+
+`mism6.scala` は `crates/cli/tests/mismatch6.rs` の
+`mism6_fixture_runs_in_both_modes` から**両モードで**回し、どちらの stdout も
+**実 scalac 2.13.16 の出力そのもの**（`tests/fixtures/expected/mism6.txt`）と
+突き合わせます。同ファイルには最小形の受理テスト
+（`an_annotated_lambdas_body_is_adapted_to_the_expected_result` /
+`a_map_is_the_function_it_declares` /
+`with_filter_carries_a_type_constructor` /
+`a_for_comprehensions_value_definition_is_not_a_generator` /
+`a_try_is_the_lub_of_its_body_and_its_handlers` /
+`the_mutable_collections_reach_indexed_seq` /
+`patch_keeps_the_receivers_own_collection` /
+`a_branchs_merge_type_is_the_expressions_own` /
+`a_type_test_sub_pattern_keeps_the_erased_reference`）も置いてあります。
+逆に、緩めた規則が診断を飲み込まないことは `mism6_bad.scala`
+（関数**値**を別の結果型に adapt しない／`Map` をキーの型が違う `map` に渡す／
+`ArrayBuffer` を `Vector` に渡す／`Success[String]` を `Try[Int]` に渡す）で
+固定しています。実 scalac 2.13.16 も 4 件すべて拒否します。for 内包の値定義に
+続くガードは `mism6_forval_bad.scala` で、**nsc は通すがこちらは診断する**ことを
+固定しています（`a_guard_after_a_for_value_definition_is_diagnosed`）。
+
 | `tyvar.scala` | 未確定の型変数（nsc の undetermined type variables）。引数位置の `Map.empty` / `Vector.empty` / `Set.empty` / `List.empty` / `Nil` / `Seq.empty`、空の `apply`（`Map()` / `Vector()` / `List()`）、入れ子の呼び出しから漏れる変数（`take(id(Map.empty))`）、期待型が結果型の変数を決める形（`val l: List[Map[String, Int]] = f(Map.empty)`）、可変長引数・by-name・デフォルト引数の位置、複数引数・複数節、オーバーロード選択、コンストラクタ引数、そして逆向きの「呼び先自身の未確定な型パラメータ」（`xs.collect { case … }`）（library dual-run のみ） | `0`×9 `List(Map())` `2` `0`×3 `1` `2` `0` `0` `List(2, 4)` `List(2, 3, 4, 5)` `Some(6)` |
 
 `tyvar.scala` は `crates/cli/tests/tyvar.rs` から回します。同ファイルには最小形の
@@ -2567,6 +2738,40 @@ slick 側の `case Seq((s, _: TableNode))`（`JdbcStatementBuilderComponent.scal
 
 ### Remaining
 
+- **for 内包の値定義に続くガード**（`agent/mismatch6` で診断だけ入れた、未実装）。
+  `for { m <- ms; q = f(m); if q > 0 } yield q` は nsc では通ります。nsc は
+  値を生成子の要素とタプルに組んで**そのストリームを絞り**、後続の列挙子は
+  そのタプルをパターンで受けます。こちらの desugaring は値をラムダ本体の
+  `val` にするので絞る相手がおらず、
+  `unimplemented: a guard after a value definition in a for-comprehension` を
+  出します（`tests/fixtures/mism6_forval_bad.scala`）。直すにはタプル化の
+  desugaring そのものが要ります。
+
+- **`scala.collection.Seq` を名指しすると `patch` / `filterNot` などが
+  受け手のコレクションに絞れなくなる**（`agent/mismatch6` で確認、main でも
+  同じ）。`val c: scala.collection.Seq[Int] = …` と書いた**だけ**で jar から
+  本物の `scala/collection/Seq` が読まれ、`patch` の宣言結果である生の `Seq`
+  に型引数が付かなくなります。「受け手のコレクションを保つ」近道は
+  `dargs.is_empty()` で降りるので、`Vector("a").patch(0, Seq("b"), 0)` が
+  `found: Seq required: Vector[String]` になります。単体では通ります
+  （`crates/cli/tests/mismatch6.rs` の
+  `patch_keeps_the_receivers_own_collection`）。
+
+- **`Map.toMap` が実装されていない**（`agent/mismatch6` で確認、main でも同じ）。
+  `m.toMap` は `IterableOnceOps.toMap[K, V](implicit ev: A <:< (K, V))` の
+  implicit 節が埋まらず、eta 展開されて**関数オブジェクトそのもの**が値に
+  なります（`println(m.toMap)` が `Main$$$anonfun$2@…` を出す）。`A` が
+  `Char` として届いている（`<:<[Char, Tuple2[K$, V$]]`）ので、
+  `lookup_member` が `StringOps` 系のメンバを供給しているのが疑わしいです。
+  slick では `columns.map(…).toMap` の形で数件出ます。
+
+- **`Map` に `PartialFunction` の親を張れない**（`agent/mismatch6`）。
+  `Map[K, V] <: PartialFunction[K, V]` は 2.13 の事実ですが、
+  `prelude_hier.rs` にその辺を足すと継承メンバの走査順が変わり、上の
+  `toMap` の `A` が `Tuple2[…]` から `Char` に化けて slick が 526 → 570 に
+  悪化します。いまは `Typer::function_view` に事実だけ書いてあるので、
+  `val pf: PartialFunction[String, Int] = aMap` はまだ通りません。
+
 - **`scala.collection.immutable.ArraySeq` / `mutable.ArraySeq` を名指しした
   シーケンスパターン**（`case ArraySeq(a, b)`）。`agent/seqpat` で
   `Seq` / `Vector` / `IndexedSeq` / `Array` のコンパニオンには `unapplySeq` を
@@ -2575,13 +2780,6 @@ slick 側の `case Seq((s, _: TableNode))`（`JdbcStatementBuilderComponent.scal
   `"abc".map(_.toString)` の戻り値でも落ちません）。足すときは
   `prelude_seqpat.rs` の `SEQ_FACTORY_MODULES` と `gen.rs` の
   `SEQPAT_SEQOPS_MODULES` の**両方**に JVM 名を書きます。
-- **タプルのパターン定義で成分に型を書くと `VerifyError`**
-  （`agent/mismatch5` で確認、未修正。main でも同じ）。
-  `val (n: Int, s: String) = if (b) (1, "x") else (0, "y")` は
-  `VerifyError: Bad local variable type`（int を参照ローカルに入れている）に
-  なります。slick の `HoistClientOps` の
-  `val (bl2: Bind, lrepl: Map[…] @unchecked) = …` がこの形です。
-
 - **`MapOps` / `SetOps` の `-` / `removed` / `incl` / `excl` / `filter` を
   受け手のコレクションに絞れない**（`agent/mismatch5` で原因まで特定、未修正）。
   これらは JVM 上 `Map` / `Set` という**名前のあるクラス**を返すので、typer が
@@ -2615,16 +2813,6 @@ slick 側の `case Seq((s, _: TableNode))`（`JdbcStatementBuilderComponent.scal
   （nsc は `class A is abstract; cannot be instantiated`）。修飾子が
   パーサから落ちていた件を直したので `Flags::ABSTRACT` は正しく載るように
   なりましたが、`new` 側の検査はまだありません。
-
-- **`match` の結果をフィールドに入れると `VerifyError`**（`agent/seqpat` で
-  気づいた、main からある、未修正）。分岐が `Some[T]` と `None$` のように
-  別クラスを積むと、こちらが出す `StackMapTable` の合流型が
-  `java/lang/Object` になり、`putfield Lscala/Option;` に checkcast が
-  付きません（`Bad type on operand stack`）。合流型を最小共通上位クラスに
-  するか、`gen_match` の後に静的型への checkcast を出すかのどちらかです。
-  `areturn` や引数渡しも同じはずです。slick の
-  `currentUniqueFrom = from match { case Seq((s, _)) => Some(s); case _ => None }`
-  がまさにこの形です。
 
 - **オーバーロード解決の specificity で、自分の型パラメータを上界に潰している**
   （`agent/seqpat`）。nsc は skolem を作りますが、こちらは `bound_hi`（既定

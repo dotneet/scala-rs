@@ -688,22 +688,38 @@ fn install_try(st: &mut SymbolTable) {
     st.get_mut(wf).tparams = vec![wa];
     let twa = Type::TypeParam(wa);
     let wf_try = ty_of(try_c, vec![twa.clone()]);
-    method(
+    // `def map[B](f: T => B): Try[B]` -- the element type is what `f`
+    // returns, not what the filter was applied to.
+    let m = method(
         st,
         wf,
         "map",
         vec![fn1(twa.clone(), Type::Any)],
-        wf_try.clone(),
+        Type::Any,
         Intrinsic::None,
     );
-    method(
+    let mb = type_param(st, m, "B");
+    st.get_mut(m).tparams = vec![mb];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![vec![fn1(twa.clone(), Type::TypeParam(mb))]],
+        ret: Box::new(ty_of(try_c, vec![Type::TypeParam(mb)])),
+    };
+    let fm = method(
         st,
         wf,
         "flatMap",
         vec![fn1(twa.clone(), wf_try.clone())],
-        wf_try,
+        Type::Any,
         Intrinsic::None,
     );
+    let fb = type_param(st, fm, "B");
+    st.get_mut(fm).tparams = vec![fb];
+    let try_b = ty_of(try_c, vec![Type::TypeParam(fb)]);
+    st.get_mut(fm).ty = Type::Method {
+        paramss: vec![vec![fn1(twa.clone(), try_b.clone())]],
+        ret: Box::new(try_b),
+    };
+    let _ = wf_try;
     method(
         st,
         wf,

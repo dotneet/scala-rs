@@ -154,13 +154,48 @@ const EDGES: &[(&str, &str, Args)] = &[
         Args::Same,
     ),
     (
-        "scala/collection/mutable/ArrayBuffer",
+        "scala/collection/IndexedSeq",
         "scala/collection/Seq",
         Args::Same,
     ),
     (
-        "scala/collection/mutable/ListBuffer",
+        "scala/collection/immutable/IndexedSeq",
+        "scala/collection/IndexedSeq",
+        Args::Same,
+    ),
+    (
+        "scala/collection/mutable/Seq",
         "scala/collection/Seq",
+        Args::Same,
+    ),
+    (
+        "scala/collection/mutable/IndexedSeq",
+        "scala/collection/mutable/Seq",
+        Args::Same,
+    ),
+    (
+        "scala/collection/mutable/IndexedSeq",
+        "scala/collection/IndexedSeq",
+        Args::Same,
+    ),
+    (
+        "scala/collection/mutable/Buffer",
+        "scala/collection/mutable/Seq",
+        Args::Same,
+    ),
+    (
+        "scala/collection/mutable/ArrayBuffer",
+        "scala/collection/mutable/IndexedSeq",
+        Args::Same,
+    ),
+    (
+        "scala/collection/mutable/ArrayBuffer",
+        "scala/collection/mutable/Buffer",
+        Args::Same,
+    ),
+    (
+        "scala/collection/mutable/ListBuffer",
+        "scala/collection/mutable/Buffer",
         Args::Same,
     ),
 ];
@@ -179,8 +214,16 @@ const LINKS: &[(&str, &str)] = &[
     ("scala/collection/IterableOnce", "+"),
     ("scala/collection/Iterable", "+"),
     ("scala/collection/Seq", "+"),
+    // `ArrayBuffer` was an `IndexedSeq` nowhere, so
+    // `def and(ns: scala.collection.IndexedSeq[Node])` rejected the buffer
+    // slick builds for it.
+    ("scala/collection/IndexedSeq", "+"),
     ("scala/collection/Set", "="),
     ("scala/collection/Map", "=+"),
+    // The mutable spine. Mutable collections are invariant.
+    ("scala/collection/mutable/Seq", "="),
+    ("scala/collection/mutable/IndexedSeq", "="),
+    ("scala/collection/mutable/Buffer", "="),
 ];
 
 pub fn install(st: &mut SymbolTable) {

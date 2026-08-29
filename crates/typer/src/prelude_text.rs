@@ -289,7 +289,14 @@ fn add_range_ops(st: &mut SymbolTable) {
     let with_filter = find(st, st.scala_pkg, "WithFilter", SymKind::Class);
     let wf_t = Type::Class {
         sym: with_filter,
-        args: vec![Type::Int, idx_int.clone()],
+        // `CC` is the type *constructor*, so `map[B]` gives `IndexedSeq[B]`.
+        args: vec![
+            Type::Int,
+            Type::Class {
+                sym: idx,
+                args: vec![],
+            },
+        ],
     };
 
     // `withFilter` unblocks `for (x <- 1 to 3 if p) yield ...`.
