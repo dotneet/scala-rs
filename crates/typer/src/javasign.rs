@@ -5,6 +5,7 @@ pub enum JType {
     Void,
     Boolean,
     Byte,
+    Short,
     Char,
     Int,
     Long,
@@ -140,7 +141,7 @@ impl<'a> P<'a> {
             }
             b'S' => {
                 self.bump();
-                Some(JType::Byte)
+                Some(JType::Short)
             }
             _ => self.parse_ref(),
         }

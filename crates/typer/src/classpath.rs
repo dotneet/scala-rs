@@ -552,7 +552,8 @@ fn parse_field_ty(st: &SymbolTable, s: &str) -> (Type, usize) {
         b'F' => (Type::Float, 1),
         b'D' => (Type::Double, 1),
         b'C' => (Type::Char, 1),
-        b'B' | b'S' => (Type::Int, 1),
+        b'B' => (Type::Byte, 1),
+        b'S' => (Type::Short, 1),
         b'[' => {
             let (inner, n) = parse_field_ty(st, &s[1..]);
             (Type::Array(Box::new(inner)), n + 1)
@@ -1024,7 +1025,13 @@ fn jtype_to_type(
     match t {
         JType::Void => Type::Unit,
         JType::Boolean => Type::Boolean,
-        JType::Byte | JType::Int => Type::Int,
+        // `byte` and `short` used to be read as `Int` because `scala.Byte`
+        // and `scala.Short` had no usable JVM representation; they do now, so
+        // a Java `byte[]` really is an `Array[Byte]` and `Byte.valueOf(byte)`
+        // accepts a `Byte`.
+        JType::Byte => Type::Byte,
+        JType::Short => Type::Short,
+        JType::Int => Type::Int,
         JType::Char => Type::Char,
         JType::Long => Type::Long,
         JType::Float => Type::Float,
@@ -1092,7 +1099,8 @@ fn parse_field_ty_java(st: &mut SymbolTable, s: &str) -> (Type, usize) {
         b'F' => (Type::Float, 1),
         b'D' => (Type::Double, 1),
         b'C' => (Type::Char, 1),
-        b'B' | b'S' => (Type::Int, 1),
+        b'B' => (Type::Byte, 1),
+        b'S' => (Type::Short, 1),
         b'[' => {
             let (inner, n) = parse_field_ty_java(st, &s[1..]);
             (Type::Array(Box::new(inner)), n + 1)

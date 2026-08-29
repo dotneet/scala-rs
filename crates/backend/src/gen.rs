@@ -5161,6 +5161,8 @@ fn gen_select(
                     asm.i2b();
                 } else if matches!(ic, Intrinsic::IntToShort) {
                     asm.i2s();
+                } else if let Intrinsic::NumConv(code) = ic {
+                    emit_num_conv(asm, code);
                 } else if matches!(ic, Intrinsic::AsInstanceOf) {
                     // Reached without going through the `TypeApply` special case
                     // in `gen_expr` (e.g. a bare `.asInstanceOf` reference); the
@@ -5714,6 +5716,13 @@ fn gen_apply(
                 gen_expr(asm, frame, ctx, qual);
                 if let Some(r) = args.first() {
                     gen_expr(asm, frame, ctx, r);
+                    // `ishl` takes an `int` shift count even though nsc also
+                    // declares `Int.<<(x: Long): Int`.
+                    if matches!(op, "<<" | ">>" | ">>>")
+                        && matches!(r.ty.widen_constant(), Type::Long)
+                    {
+                        asm.l2i();
+                    }
                 } else {
                     asm.iconst(0);
                 }
@@ -5887,6 +5896,11 @@ fn gen_apply(
             Intrinsic::LongToDouble => {
                 gen_expr(asm, frame, ctx, qual);
                 asm.l2d();
+                return;
+            }
+            Intrinsic::NumConv(code) => {
+                gen_expr(asm, frame, ctx, qual);
+                emit_num_conv(asm, code);
                 return;
             }
             _ => {}
@@ -10509,18 +10523,35 @@ fn gen_call_args(
     }
 }
 
+/// Each primitive array has its own load opcode; `aaload` on a `[J` or a `[B`
+/// is a `VerifyError`, and `iaload` on a `[Z` is one too (`boolean[]` uses the
+/// `byte` opcodes).
 fn emit_array_load(asm: &mut Assembler, elem: &Type) {
-    match elem {
-        Type::Int | Type::Boolean => asm.iaload(),
+    match elem.widen_constant() {
+        Type::Int => asm.iaload(),
+        Type::Long => asm.laload(),
+        Type::Float => asm.faload(),
+        Type::Double => asm.daload(),
+        Type::Byte | Type::Boolean => asm.baload(),
+        Type::Char => asm.caload(),
+        Type::Short => asm.saload(),
         _ => asm.aaload(),
     }
 }
 
 fn emit_array_store(asm: &mut Assembler, arr_ty: &Type) {
-    match arr_ty {
-        Type::Array(elem) if matches!(elem.as_ref(), Type::Int | Type::Boolean) => {
-            asm.iastore();
-        }
+    let Type::Array(elem) = arr_ty else {
+        asm.aastore();
+        return;
+    };
+    match elem.widen_constant() {
+        Type::Int => asm.iastore(),
+        Type::Long => asm.lastore(),
+        Type::Float => asm.fastore(),
+        Type::Double => asm.dastore(),
+        Type::Byte | Type::Boolean => asm.bastore(),
+        Type::Char => asm.castore(),
+        Type::Short => asm.sastore(),
         _ => asm.aastore(),
     }
 }
@@ -13831,6 +13862,43 @@ object Main {
 }
 
 /// The JVM box for a Scala primitive; `x.toString` on an `Int` dispatches on it.
+/// The `iN`/`lN`/`fN`/`dN` sequence that turns a primitive of `code[0]` into
+/// one of `code[1]` (JVM descriptor letters). `Byte`, `Short` and `Char` are
+/// `int` on the stack, so a conversion *to* one of them is the `int` sequence
+/// followed by the truncating `i2b`/`i2s`/`i2c`, and a conversion *from* one
+/// starts from `int` with no instruction of its own.
+fn emit_num_conv(asm: &mut Assembler, code: &str) {
+    let b = code.as_bytes();
+    let (from, to) = (b[0], b[1]);
+    if from == to {
+        return;
+    }
+    // Step 1: down to the JVM computational type of `to`'s int-width family.
+    match (from, to) {
+        // int-like source: nothing to do, it is already an `int`.
+        (b'B' | b'S' | b'C' | b'I', b'B' | b'S' | b'C' | b'I') => {}
+        (b'B' | b'S' | b'C' | b'I', b'J') => asm.i2l(),
+        (b'B' | b'S' | b'C' | b'I', b'F') => asm.i2f(),
+        (b'B' | b'S' | b'C' | b'I', _) => asm.i2d(),
+        (b'J', b'B' | b'S' | b'C' | b'I') => asm.l2i(),
+        (b'J', b'F') => asm.l2f(),
+        (b'J', _) => asm.l2d(),
+        (b'F', b'B' | b'S' | b'C' | b'I') => asm.f2i(),
+        (b'F', b'J') => asm.f2l(),
+        (b'F', _) => asm.f2d(),
+        (_, b'B' | b'S' | b'C' | b'I') => asm.d2i(),
+        (_, b'J') => asm.d2l(),
+        (_, _) => asm.d2f(),
+    }
+    // Step 2: truncate the `int` to the narrower target.
+    match to {
+        b'B' => asm.i2b(),
+        b'S' => asm.i2s(),
+        b'C' => asm.i2c(),
+        _ => {}
+    }
+}
+
 fn is_boxed_primitive(jvm: &str) -> bool {
     matches!(
         jvm,
@@ -13901,6 +13969,13 @@ fn widen_numeric(asm: &mut Assembler, from: &Type, to: &Type) {
         (Type::Byte, Type::Double) => asm.i2d(),
         (Type::Long, Type::Double) => asm.l2d(),
         (Type::Float, Type::Double) => asm.f2d(),
+        // `FloatBin` had no widening at all, so `1 + 2.5f` pushed an `int`
+        // where the verifier wanted a `float`.
+        (Type::Int, Type::Float) => asm.i2f(),
+        (Type::Char, Type::Float) => asm.i2f(),
+        (Type::Short, Type::Float) => asm.i2f(),
+        (Type::Byte, Type::Float) => asm.i2f(),
+        (Type::Long, Type::Float) => asm.l2f(),
         _ => {}
     }
 }

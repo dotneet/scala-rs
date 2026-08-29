@@ -12,12 +12,14 @@ mod pickle_supply;
 mod prelude;
 mod prelude_arrconv;
 mod prelude_boxed;
+mod prelude_bsops;
 mod prelude_coll;
 mod prelude_conform;
 mod prelude_either;
 mod prelude_impl2;
 mod prelude_lang;
 mod prelude_lowbound;
+mod prelude_numconv;
 mod prelude_numeric;
 mod prelude_numops;
 mod prelude_reflect;
@@ -107,6 +109,8 @@ mod tests {
         ];
         let boxes = [
             ("java/lang/Boolean", "Boolean"),
+            ("java/lang/Byte", "Byte"),
+            ("java/lang/Short", "Short"),
             ("java/lang/Character", "Char"),
             ("java/lang/Integer", "Int"),
             ("java/lang/Long", "Long"),
