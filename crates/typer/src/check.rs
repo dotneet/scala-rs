@@ -4055,6 +4055,34 @@ impl Typer {
                     return;
                 }
                 self.type_expr(lhs, &Type::NoType);
+                // nsc: `x.f = v` where `f` is a *getter* (not a field) is
+                // `x.f_=(v)`. Assigning the field directly compiles and then
+                // throws `NoSuchFieldError` at the caller.
+                if self.setter_assign_lhs(lhs) {
+                    let lhs = std::mem::replace(lhs.as_mut(), Tree::dummy(TreeKind::Empty));
+                    let rhs = std::mem::replace(rhs.as_mut(), Tree::dummy(TreeKind::Empty));
+                    let (qual, name) = match lhs.kind {
+                        TreeKind::Select { qual, name } => (*qual, name),
+                        _ => unreachable!(),
+                    };
+                    let setter = Tree {
+                        id: lhs.id,
+                        span: lhs.span,
+                        kind: TreeKind::Select {
+                            qual: Box::new(qual),
+                            name: format!("{name}_="),
+                        },
+                        ty: Type::NoType,
+                        sym: SymbolId::NONE,
+                        postfix: false,
+                    };
+                    tree.kind = TreeKind::Apply {
+                        fun: Box::new(setter),
+                        args: vec![rhs],
+                    };
+                    self.type_expr(tree, pt);
+                    return;
+                }
                 if structural_select_lhs(lhs) {
                     // nsc: `x.foo = v` on a refinement is `x.foo_=(v)` (reflective).
                     let lhs = std::mem::replace(lhs.as_mut(), Tree::dummy(TreeKind::Empty));
@@ -11749,6 +11777,25 @@ impl Typer {
                 ret: Box::new(Type::NoType),
             },
         );
+    }
+
+    /// `x.f = v` where `f` resolved to a getter and the receiver has an
+    /// `f_=`: the assignment is that call, not a field store.
+    fn setter_assign_lhs(&mut self, lhs: &Tree) -> bool {
+        let TreeKind::Select { qual, name } = &lhs.kind else {
+            return false;
+        };
+        if lhs.sym.is_none() || self.st.get(lhs.sym).kind != SymKind::Method {
+            return false;
+        }
+        let Some(cls) = self.st.class_sym_of(&qual.ty) else {
+            return false;
+        };
+        let setter = format!("{name}_=");
+        self.st
+            .lookup_member(cls, &setter)
+            .into_iter()
+            .any(|m| self.st.get(m).kind == SymKind::Method)
     }
 
     /// nsc's `reassignment to val`. Without it `d.v = 5` on a trait's `val`

@@ -209,5 +209,6 @@ conform!(
     anon_pattern_capture,
     integral_ops,
     invariance,
-    const_narrow
+    const_narrow,
+    setter_assign
 );
