@@ -667,6 +667,7 @@ impl Typer {
     }
 
     fn most_specific(&self, cands: Vec<SymbolId>) -> ImplicitSearch {
+        let cands = self.drop_module_classes(cands);
         match cands.len() {
             0 => ImplicitSearch::None,
             1 => ImplicitSearch::Found(cands[0]),
@@ -683,6 +684,32 @@ impl Typer {
                 }
             }
         }
+    }
+
+    /// `implicit object GetString` is one implicit value, not two. Both the
+    /// module and its module class carry the flag and have the same type, so a
+    /// search that reaches both would report them as ambiguous with
+    /// themselves. Keep the module: that is what a reference to the name means.
+    fn drop_module_classes(&self, cands: Vec<SymbolId>) -> Vec<SymbolId> {
+        if cands.len() < 2 {
+            return cands;
+        }
+        let modules: Vec<SymbolId> = cands
+            .iter()
+            .copied()
+            .filter(|&c| self.st.get(c).kind == SymKind::Module)
+            .collect();
+        if modules.is_empty() {
+            return cands;
+        }
+        cands
+            .iter()
+            .copied()
+            .filter(|&c| {
+                self.st.get(c).kind != SymKind::ModuleClass
+                    || !modules.iter().any(|&m| self.st.module_class_of(m) == c)
+            })
+            .collect()
     }
 
     /// The result type with the candidate's own type parameters erased to

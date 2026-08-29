@@ -1,0 +1,12 @@
+Pair(Lit(1, Tagged(num), false),Lit(x, Tagged(str), false))
+Lit(true, Tagged(bool), false)
+Int 42 true
+-1
+true
+a:str0
+b:bool1
+n=2 n=0
+0
+r 6 3
+true
+0
