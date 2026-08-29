@@ -38,6 +38,7 @@ pub fn emit(tree: &Tree, st: &SymbolTable, source_name: &str) -> Vec<EmittedClas
 pub struct TraitImpls {
     impls: HashMap<SymbolId, Vec<Tree>>,
     vals: HashMap<SymbolId, Vec<Tree>>,
+    lazy_vals: HashMap<SymbolId, Vec<Tree>>,
 }
 
 /// Collect the concrete trait members of one unit into a shared map.
@@ -50,6 +51,7 @@ pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpl
         lambda_n: Cell::new(0),
         trait_impls: HashMap::new(),
         trait_vals: HashMap::new(),
+        trait_lazy_vals: HashMap::new(),
         library_abi: false,
         pickles: HashMap::new(),
         boxed_vars: HashSet::new(),
@@ -57,6 +59,7 @@ pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpl
     g.collect_trait_impls(tree);
     into.impls.extend(g.trait_impls);
     into.vals.extend(g.trait_vals);
+    into.lazy_vals.extend(g.trait_lazy_vals);
 }
 
 /// Walk a typed compilation unit and emit classes.
@@ -75,6 +78,7 @@ pub fn emit_opts(
         lambda_n: Cell::new(0),
         trait_impls: shared.impls,
         trait_vals: shared.vals,
+        trait_lazy_vals: shared.lazy_vals,
         library_abi: opts.library_abi,
         pickles: opts.pickles,
         // `scala.runtime.*Ref` exists in both ABIs: on the jar, and as a
@@ -98,6 +102,10 @@ struct Gen<'a> {
     trait_impls: HashMap<SymbolId, Vec<Tree>>,
     /// Trait `val` definitions with a right-hand side (`T$class.$init$`).
     trait_vals: HashMap<SymbolId, Vec<Tree>>,
+    /// Trait `lazy val` definitions. Unlike a plain `val` these are not set
+    /// from `$init$`; every implementing class gets its own field, bitmap bit
+    /// and accessor, exactly as nsc's mixin phase does.
+    trait_lazy_vals: HashMap<SymbolId, Vec<Tree>>,
     library_abi: bool,
     pickles: HashMap<u32, Vec<u8>>,
     /// Locals boxed into `scala.runtime.IntRef` / `ObjectRef` (library ABI).
@@ -781,10 +789,9 @@ fn method_desc_from_sym(st: &SymbolTable, id: SymbolId) -> String {
 /// Constructor symbols list only the source parameters, so descriptors from
 /// `method_desc_from_sym` must be adjusted at emit time.
 fn with_enclosing_outer_param(st: &SymbolTable, class_id: SymbolId, desc: &str) -> String {
-    let Some(outer) = enclosing_instance(st, class_id) else {
+    let Some(outer_ty) = outer_field_desc(st, class_id) else {
         return desc.to_string();
     };
-    let outer_ty = format!("L{};", class_internal(st, outer));
     let Some(rest) = desc.strip_prefix('(') else {
         return desc.to_string();
     };
@@ -802,8 +809,8 @@ fn ctor_desc(st: &SymbolTable, class_id: SymbolId, args: &[Tree]) -> String {
         return with_enclosing_outer_param(st, class_id, &method_desc_from_sym(st, id));
     }
     let mut d = String::from("(");
-    if let Some(outer) = enclosing_instance(st, class_id) {
-        d.push_str(&format!("L{};", class_internal(st, outer)));
+    if let Some(outer_ty) = outer_field_desc(st, class_id) {
+        d.push_str(&outer_ty);
     }
     let fields = &st.get(class_id).ctor_fields;
     if !fields.is_empty() && fields.len() == args.len() {
@@ -859,31 +866,60 @@ fn pick_init_sym(st: &SymbolTable, class_id: SymbolId, args: &[Tree]) -> Option<
     })
 }
 
+/// `(super internal name, `<init>` descriptor, explicit args, super class
+/// symbol)`. The symbol is what tells the caller whether the superclass is a
+/// nested class that needs an `$outer` argument ahead of the source ones.
 fn parent_super_ctor(
     st: &SymbolTable,
     parents: &[Tree],
     super_name: &str,
-) -> (String, String, Vec<Tree>) {
+) -> (String, String, Vec<Tree>, SymbolId) {
     for p in parents {
         if let TreeKind::Apply { args, .. } = &p.kind {
             if !p.sym.is_none() && st.get(p.sym).name == "<init>" {
-                let owner = class_internal(st, st.get(p.sym).owner);
-                return (owner, method_desc_from_sym(st, p.sym), args.clone());
+                let cls = st.get(p.sym).owner;
+                let owner = class_internal(st, cls);
+                let desc = with_enclosing_outer_param(st, cls, &method_desc_from_sym(st, p.sym));
+                return (owner, desc, args.clone(), cls);
             }
             if let Some(cls) = st.class_sym_of(&p.ty) {
                 let owner = class_internal(st, cls);
                 if owner == super_name || super_name == "java/lang/Object" {
                     let desc = ctor_desc(st, cls, args);
-                    return (owner, desc, args.clone());
+                    return (owner, desc, args.clone(), cls);
                 }
             }
         }
         if !p.sym.is_none() && st.get(p.sym).name == "<init>" {
-            let owner = class_internal(st, st.get(p.sym).owner);
-            return (owner, method_desc_from_sym(st, p.sym), Vec::new());
+            let cls = st.get(p.sym).owner;
+            let owner = class_internal(st, cls);
+            let desc = with_enclosing_outer_param(st, cls, &method_desc_from_sym(st, p.sym));
+            return (owner, desc, Vec::new(), cls);
         }
     }
-    (super_name.to_string(), "()V".into(), Vec::new())
+    // No explicit parent constructor call. A nested superclass still needs its
+    // `$outer`, so find the class the plain `extends A` names.
+    for p in parents {
+        if let Some(cls) = st.class_sym_of(&p.ty) {
+            if class_internal(st, cls) == super_name {
+                if let Some(outer_ty) = outer_field_desc(st, cls) {
+                    return (
+                        super_name.to_string(),
+                        format!("({outer_ty})V"),
+                        Vec::new(),
+                        cls,
+                    );
+                }
+                return (super_name.to_string(), "()V".into(), Vec::new(), cls);
+            }
+        }
+    }
+    (
+        super_name.to_string(),
+        "()V".into(),
+        Vec::new(),
+        SymbolId::NONE,
+    )
 }
 
 /// Java `<init>` descriptors come from the classfile (`(Ljava/lang/Object;…)V`),
@@ -913,9 +949,7 @@ fn enclosing_instance(st: &SymbolTable, class_id: SymbolId) -> Option<SymbolId> 
     // `new T { … }` and local classes are owned by the method (or the `val`)
     // they appear in; the enclosing instance is the class around it.
     let mut owner = st.get(class_id).owner;
-    let mut in_method = false;
     while !owner.is_none() && matches!(st.get(owner).kind, SymKind::Method | SymKind::Term) {
-        in_method = true;
         owner = st.get(owner).owner;
     }
     if owner.is_none() {
@@ -925,13 +959,37 @@ fn enclosing_instance(st: &SymbolTable, class_id: SymbolId) -> Option<SymbolId> 
     if o.kind != SymKind::Class || o.flags.contains(Flags::MODULE) {
         return None;
     }
-    // A class *member* of a trait has no enclosing instance (the trait is an
-    // interface), but a class written inside a trait *method* still needs the
-    // receiver to reach the trait's members.
-    if (o.flags.contains(Flags::TRAIT) || o.flags.contains(Flags::INTERFACE)) && !in_method {
-        return None;
-    }
+    // A member class of a trait gets an `$outer` just like one of a class:
+    // the trait is an interface, so its members are only reachable through an
+    // instance (nsc passes the interface type as the first `<init>` argument).
     Some(owner)
+}
+
+/// The JVM type of `class_id`'s `$outer` field. nsc types it as the enclosing
+/// class's *self* type, so a cake component (`trait C { self: P => class T }`)
+/// stores a `P` and reaches `P`'s members without a cast. The self type is
+/// only taken when it really is a subclass of the enclosing class, so the
+/// field can always stand in for the enclosing instance itself.
+fn outer_field_class(st: &SymbolTable, class_id: SymbolId) -> Option<SymbolId> {
+    let owner = enclosing_instance(st, class_id)?;
+    Some(self_repr_class(st, owner))
+}
+
+fn self_repr_class(st: &SymbolTable, owner: SymbolId) -> SymbolId {
+    let Some(sty) = st.get(owner).self_type.clone() else {
+        return owner;
+    };
+    let Some(s) = st.class_sym_of(&sty) else {
+        return owner;
+    };
+    if s == owner || st.get(s).flags.contains(Flags::JAVA) || !is_owner_compatible(st, s, owner) {
+        return owner;
+    }
+    s
+}
+
+fn outer_field_desc(st: &SymbolTable, class_id: SymbolId) -> Option<String> {
+    outer_field_class(st, class_id).map(|o| format!("L{};", class_internal(st, o)))
 }
 
 fn linearize(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
@@ -1134,27 +1192,88 @@ fn is_owner_compatible(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> 
 
 /// Push the instance that owns `owner`'s members: `this`, or the `$outer`
 /// chain of the class being emitted when the member lives further out.
+/// `cur` is the class we are lexically inside (it decides the next hop),
+/// `held` the static type on the stack — the two differ when a trait's
+/// `$outer` is typed as the trait's self type.
 fn load_owner_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
     load_this(asm, ctx);
     let mut cur = ctx.class_sym;
-    while !cur.is_none() && !owner.is_none() && !is_owner_compatible(ctx.st, cur, owner) {
+    let mut held = ctx.class_sym;
+    while !cur.is_none() && !owner.is_none() && !is_owner_compatible(ctx.st, held, owner) {
         let Some(o) = enclosing_instance(ctx.st, cur) else {
             break;
         };
+        let f = outer_field_class(ctx.st, cur).unwrap_or(o);
         asm.getfield(
             &class_internal(ctx.st, cur),
             "$outer",
-            &format!("L{};", class_internal(ctx.st, o)),
+            &format!("L{};", class_internal(ctx.st, f)),
         );
         cur = o;
+        held = f;
     }
-    if !is_owner_compatible(ctx.st, cur, owner) {
+    if !is_owner_compatible(ctx.st, held, owner) {
         let kind = ctx.st.get(owner).kind;
         if matches!(kind, SymKind::Class | SymKind::ModuleClass) || is_interface_sym(ctx.st, owner)
         {
             asm.checkcast(&class_internal(ctx.st, owner));
         }
     }
+}
+
+/// True when `load_owner_instance` can actually reach `owner` — either `this`
+/// or some link of the `$outer` chain conforms to it. When it cannot, the
+/// caller must look for an enclosing object instead of emitting a cast that
+/// would fail at run time.
+fn outer_chain_reaches(st: &SymbolTable, from: SymbolId, owner: SymbolId) -> bool {
+    let mut cur = from;
+    let mut held = from;
+    loop {
+        if is_owner_compatible(st, held, owner) {
+            return true;
+        }
+        let Some(o) = enclosing_instance(st, cur) else {
+            return false;
+        };
+        held = outer_field_class(st, cur).unwrap_or(o);
+        cur = o;
+    }
+}
+
+/// The nearest enclosing object whose instance can serve as `owner`'s
+/// `$outer`: `object DB2Profile extends … { class T extends Table }` hands
+/// `DB2Profile$.MODULE$` to `Table`'s constructor, exactly as nsc does.
+fn enclosing_module_for(st: &SymbolTable, from: SymbolId, owner: SymbolId) -> Option<SymbolId> {
+    if owner.is_none() {
+        return None;
+    }
+    let mut cur = from;
+    while !cur.is_none() {
+        let s = st.get(cur);
+        if (s.kind == SymKind::ModuleClass || s.flags.contains(Flags::MODULE))
+            && is_owner_compatible(st, cur, owner)
+        {
+            return Some(cur);
+        }
+        cur = s.owner;
+    }
+    None
+}
+
+/// Push the instance a nested class's `$outer` parameter wants at a `new` or
+/// at a super-constructor call.
+fn load_outer_arg(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
+    if !outer_chain_reaches(ctx.st, ctx.class_sym, owner) {
+        if let Some(m) = enclosing_module_for(ctx.st, ctx.class_sym, owner) {
+            let jvm = class_internal(ctx.st, m);
+            asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+            if !is_owner_compatible(ctx.st, m, owner) {
+                asm.checkcast(&class_internal(ctx.st, owner));
+            }
+            return;
+        }
+    }
+    load_owner_instance(asm, ctx, owner);
 }
 
 fn maybe_checkcast_owner(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
@@ -1430,6 +1549,20 @@ impl<'a> Gen<'a> {
                         .collect();
                     if !vals.is_empty() && !tree.sym.is_none() {
                         self.trait_vals.insert(tree.sym, vals);
+                    }
+                    let lazies: Vec<Tree> = impl_
+                        .body
+                        .iter()
+                        .filter(|s| match &s.kind {
+                            TreeKind::ValDef { rhs, mods, .. } => {
+                                !rhs.is_empty() && mods.flags.contains(Flags::LAZY)
+                            }
+                            _ => false,
+                        })
+                        .cloned()
+                        .collect();
+                    if !lazies.is_empty() && !tree.sym.is_none() {
+                        self.trait_lazy_vals.insert(tree.sym, lazies);
                     }
                 }
                 for s in &impl_.body {
@@ -1718,11 +1851,11 @@ impl<'a> Gen<'a> {
                 }
             }
         }
-        if let Some(outer) = enclosing_instance(self.st, class_id) {
+        if let Some(outer_desc) = outer_field_desc(self.st, class_id) {
             b.fields.push(Field {
                 access: ACC_PUBLIC | ACC_FINAL,
                 name: "$outer".into(),
-                desc: format!("L{};", class_internal(self.st, outer)),
+                desc: outer_desc,
             });
         }
         // Enclosing-method locals read by the body of a class defined inside a
@@ -1755,10 +1888,15 @@ impl<'a> Gen<'a> {
                 desc: jvm_desc(self.st, &ty),
             });
         }
-        if impl_.body.iter().any(|s| match &s.kind {
-            TreeKind::ValDef { mods, .. } => mods.flags.contains(Flags::LAZY),
-            _ => false,
-        }) {
+        let lazies = self.all_lazy_vals(class_id, &impl_.body);
+        for v in &self.mixin_lazy_vals(class_id, &impl_.body) {
+            b.fields.push(Field {
+                access: ACC_PRIVATE,
+                name: v.name().unwrap_or("").to_string(),
+                desc: jvm_desc(self.st, &val_tree_ty(self.st, v)),
+            });
+        }
+        if !lazies.is_empty() {
             b.fields.push(Field {
                 access: ACC_PRIVATE,
                 name: "bitmap$0".into(),
@@ -1766,7 +1904,7 @@ impl<'a> Gen<'a> {
             });
         }
         self.emit_class_ctor(&mut b, class_id, vparamss, &impl_.body, &impl_.parents);
-        self.emit_lazy_accessors(&mut b, class_id, &impl_.body);
+        self.emit_lazy_accessors(&mut b, class_id, &lazies);
         self.emit_val_getters(&mut b, &impl_.body);
         self.emit_ctor_val_getters(&mut b, class_id, vparamss);
         for stt in &impl_.body {
@@ -2201,8 +2339,8 @@ impl<'a> Gen<'a> {
     ) {
         let params: Vec<&Tree> = vparamss.iter().flatten().collect();
         let mut frame = Frame::instance();
-        let outer = enclosing_instance(self.st, class_id);
-        let outer_desc = outer.map(|o| format!("L{};", class_internal(self.st, o)));
+        let outer = outer_field_class(self.st, class_id);
+        let outer_desc = outer_field_desc(self.st, class_id);
         if outer.is_some() {
             frame.next_slot += 1; // slot 1 is $outer
         }
@@ -2244,8 +2382,9 @@ impl<'a> Gen<'a> {
             &capture_params_desc(self.st, &self.boxed_vars, class_id),
         );
         let super_name = b.super_name.clone();
-        let (super_owner, super_desc, super_args) =
+        let (super_owner, super_desc, super_args, super_cls) =
             parent_super_ctor(self.st, parents, &super_name);
+        let super_outer = outer_field_class(self.st, super_cls);
         let class_name = b.this_name.clone();
         let st = self.st;
         let inits: Vec<&Tree> = body
@@ -2262,22 +2401,7 @@ impl<'a> Gen<'a> {
         let is_app = extends_app(st, class_id);
         let has_outer = outer.is_some();
         let outer_desc_c = outer_desc.clone();
-        let mixin_inits: Vec<(String, String)> = if class_id.is_none() {
-            Vec::new()
-        } else {
-            linearize(st, class_id)
-                .into_iter()
-                .skip(1)
-                .rev()
-                .filter_map(|p| {
-                    if !self.trait_vals.contains_key(&p) || !is_interface_sym(st, p) {
-                        return None;
-                    }
-                    let iface = class_internal(st, p);
-                    Some((format!("{}$class", iface), format!("(L{iface};)V")))
-                })
-                .collect()
-        };
+        let mixin_inits = self.mixin_init_calls(class_id);
         b.add_code(ACC_PUBLIC, "<init>", &desc, max_locals, |asm| {
             let mut frame = frame;
             let ctx_early = emit_ctx(
@@ -2315,6 +2439,15 @@ impl<'a> Gen<'a> {
                 }
             }
             asm.aload(0);
+            // A nested superclass takes its enclosing instance first. Our own
+            // `$outer` is not stored yet, so read it out of the argument.
+            if let Some(o) = super_outer {
+                if has_outer && is_owner_compatible(st, outer.unwrap_or(SymbolId::NONE), o) {
+                    asm.aload(1);
+                } else {
+                    load_outer_arg(asm, &ctx_early, o);
+                }
+            }
             for a in &super_args {
                 gen_expr(asm, &mut frame, &ctx_early, a);
             }
@@ -2720,6 +2853,58 @@ impl<'a> Gen<'a> {
                 out.push((name, val_tree_ty(self.st, v)));
             }
         }
+        out
+    }
+
+    /// `lazy val`s inherited from mixed-in traits, in linearization order and
+    /// minus anything the class itself (re)defines. nsc's mixin phase copies
+    /// the accessor into every implementing class; so do we.
+    fn mixin_lazy_vals(&self, class_id: SymbolId, body: &[Tree]) -> Vec<Tree> {
+        let mut out = Vec::new();
+        if class_id.is_none() {
+            return out;
+        }
+        let mut have: HashSet<String> = HashSet::new();
+        for stt in body {
+            match &stt.kind {
+                TreeKind::ValDef { name, .. } | TreeKind::DefDef { name, .. } => {
+                    have.insert(name.clone());
+                }
+                _ => {}
+            }
+        }
+        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+            if !is_interface_sym(self.st, parent) {
+                continue;
+            }
+            let Some(vals) = self.trait_lazy_vals.get(&parent) else {
+                continue;
+            };
+            for v in vals {
+                let name = v.name().unwrap_or("").to_string();
+                if name.is_empty() || !have.insert(name.clone()) {
+                    continue;
+                }
+                out.push(v.clone());
+            }
+        }
+        out
+    }
+
+    /// The class's own `lazy val`s followed by the inherited ones: one list so
+    /// they share `bitmap$0` without colliding on a bit.
+    fn all_lazy_vals(&self, class_id: SymbolId, body: &[Tree]) -> Vec<Tree> {
+        let mut out: Vec<Tree> = body
+            .iter()
+            .filter(|s| match &s.kind {
+                TreeKind::ValDef { mods, rhs, .. } => {
+                    mods.flags.contains(Flags::LAZY) && !rhs.is_empty()
+                }
+                _ => false,
+            })
+            .cloned()
+            .collect();
+        out.extend(self.mixin_lazy_vals(class_id, body));
         out
     }
 
@@ -3295,9 +3480,11 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn emit_lazy_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
+    /// `lazies` is the class's complete list of `lazy val`s — its own and the
+    /// ones inherited from mixed-in traits — so bits in `bitmap$0` are unique.
+    fn emit_lazy_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId, lazies: &[Tree]) {
         let mut bit = 0i32;
-        for stt in body {
+        for stt in lazies {
             let TreeKind::ValDef {
                 name, mods, rhs, ..
             } = &stt.kind
@@ -3553,10 +3740,22 @@ impl<'a> Gen<'a> {
                 });
             }
         }
-        if impl_.body.iter().any(|s| match &s.kind {
-            TreeKind::ValDef { mods, .. } => mods.flags.contains(Flags::LAZY),
-            _ => false,
-        }) {
+        for (name, ty) in self.mixin_val_fields(cls, &[], &impl_.body) {
+            b.fields.push(Field {
+                access: ACC_PUBLIC,
+                name,
+                desc: jvm_desc(self.st, &ty),
+            });
+        }
+        let lazies = self.all_lazy_vals(cls, &impl_.body);
+        for v in &self.mixin_lazy_vals(cls, &impl_.body) {
+            b.fields.push(Field {
+                access: ACC_PRIVATE,
+                name: v.name().unwrap_or("").to_string(),
+                desc: jvm_desc(self.st, &val_tree_ty(self.st, v)),
+            });
+        }
+        if !lazies.is_empty() {
             b.fields.push(Field {
                 access: ACC_PRIVATE,
                 name: "bitmap$0".into(),
@@ -3566,7 +3765,7 @@ impl<'a> Gen<'a> {
 
         self.emit_module_init(&mut b, cls, &impl_.body, &impl_.parents);
         self.emit_module_clinit(&mut b);
-        self.emit_lazy_accessors(&mut b, cls, &impl_.body);
+        self.emit_lazy_accessors(&mut b, cls, &lazies);
         self.emit_val_getters(&mut b, &impl_.body);
 
         let mut forwarded: Vec<(String, String, Type, Vec<Type>)> = Vec::new();
@@ -3586,7 +3785,9 @@ impl<'a> Gen<'a> {
             }
         }
         // An `object` mixing in a trait needs the same `T$class` forwarders a
-        // class gets, or its concrete trait methods stay abstract.
+        // class gets, or its concrete trait methods stay abstract — and the
+        // same getter/`$init$set$` pair for the trait's `val`s.
+        self.emit_trait_val_accessors(&mut b, cls, &impl_.body);
         self.emit_mixin_forwarders(&mut b, cls, &impl_.body);
         self.emit_delayed_init_support(&mut b, cls, &impl_.body, true);
         if !cls.is_none()
@@ -3655,6 +3856,10 @@ impl<'a> Gen<'a> {
             }
         }
 
+        // `case object Asc extends Direction { override def reverse: Desc.type
+        // = Desc }`: a module overriding with a narrower result type needs the
+        // same bridge a class gets, or the parent's signature stays abstract.
+        self.emit_erasure_bridges(&mut b, cls);
         attach_scala_sig(&mut b, self.st, cls, &self.pickles);
         self.out.push(b.finish());
 
@@ -3669,6 +3874,26 @@ impl<'a> Gen<'a> {
         if !class_names.contains(name) && top_level && name != "package" {
             self.emit_forwarder(&this_name, &forwarded, cls);
         }
+    }
+
+    /// `T$class.$init$(this)` for every mixed-in trait that has `val`s to
+    /// set, in reverse linearization order (base traits first).
+    fn mixin_init_calls(&self, class_id: SymbolId) -> Vec<(String, String)> {
+        if class_id.is_none() {
+            return Vec::new();
+        }
+        linearize(self.st, class_id)
+            .into_iter()
+            .skip(1)
+            .rev()
+            .filter_map(|p| {
+                if !self.trait_vals.contains_key(&p) || !is_interface_sym(self.st, p) {
+                    return None;
+                }
+                let iface = class_internal(self.st, p);
+                Some((format!("{}$class", iface), format!("(L{iface};)V")))
+            })
+            .collect()
     }
 
     fn emit_module_init(
@@ -3702,7 +3927,10 @@ impl<'a> Gen<'a> {
         // (`NoSuchMethodError`) for any singleton extending a class whose
         // primary constructor takes parameters — e.g. slick's
         // `case object Asc extends Direction(false)`.
-        let (super_owner, super_desc, super_args) = parent_super_ctor(st, parents, &super_name);
+        let (super_owner, super_desc, super_args, super_cls) =
+            parent_super_ctor(st, parents, &super_name);
+        let super_outer = outer_field_class(st, super_cls);
+        let mixin_inits = self.mixin_init_calls(class_id);
         b.add_code(ACC_PRIVATE, "<init>", "()V", 4, |asm| {
             let mut frame = Frame::instance();
             let ctx = emit_ctx(
@@ -3717,12 +3945,19 @@ impl<'a> Gen<'a> {
                 boxed_vars,
             );
             asm.aload(0);
+            if let Some(o) = super_outer {
+                load_outer_arg(asm, &ctx, o);
+            }
             for a in &super_args {
                 gen_expr(asm, &mut frame, &ctx, a);
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);
             asm.aload(0);
             asm.putstatic(&class_name, "MODULE$", &format!("L{class_name};"));
+            for (impl_cls, init_desc) in &mixin_inits {
+                asm.aload(0);
+                asm.invokestatic(impl_cls, "$init$", init_desc);
+            }
             if delayed {
                 if library_abi && is_app {
                     asm.aload(0);
@@ -4408,7 +4643,8 @@ fn load_qualified_this(asm: &mut Assembler, ctx: &EmitCtx, name: &str) {
             break;
         };
         let owner = class_internal(ctx.st, cur);
-        let od = format!("L{};", class_internal(ctx.st, outer));
+        let f = outer_field_class(ctx.st, cur).unwrap_or(outer);
+        let od = format!("L{};", class_internal(ctx.st, f));
         asm.getfield(&owner, "$outer", &od);
         cur = outer;
     }
@@ -4452,10 +4688,22 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
     }
     let sym = ctx.st.get(id);
     if sym.flags.contains(Flags::LAZY) && sym.kind == SymKind::Term {
-        load_this(asm, ctx);
-        let owner = class_internal(ctx.st, sym.owner);
+        let owner_sym = sym.owner;
+        if is_module_class(ctx.st, owner_sym)
+            && module_class_id(ctx.st, owner_sym) != module_class_id(ctx.st, ctx.class_sym)
+        {
+            let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner_sym));
+            asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+        } else {
+            load_owner_instance(asm, ctx, owner_sym);
+        }
+        let owner = class_internal(ctx.st, owner_sym);
         let desc = format!("(){}", jvm_desc(ctx.st, &sym.ty));
-        asm.invokevirtual(&owner, &sym.name, &desc);
+        if is_trait_owned_term(ctx.st, id) {
+            asm.invokeinterface(&owner, &sym.name, &desc);
+        } else {
+            asm.invokevirtual(&owner, &sym.name, &desc);
+        }
         return;
     }
     match sym.kind {
@@ -4683,7 +4931,13 @@ fn gen_select(
             gen_expr(asm, frame, ctx, qual);
             let owner = class_internal(ctx.st, s.owner);
             let desc = format!("(){}", jvm_desc(ctx.st, &s.ty));
-            asm.invokevirtual(&owner, &s.name, &desc);
+            // A trait's `lazy val` is an interface member; every implementing
+            // class carries its own accessor (nsc's mixin phase).
+            if is_trait_owned_term(ctx.st, tree.sym) {
+                asm.invokeinterface(&owner, &s.name, &desc);
+            } else {
+                asm.invokevirtual(&owner, &s.name, &desc);
+            }
             return;
         }
         match s.kind {
@@ -4906,6 +5160,30 @@ fn gen_if(
     asm.mark(end_l);
 }
 
+/// `new p.Inner(…)` names its enclosing instance explicitly. The prefix is a
+/// *term* path (a val, a `this`, a chain of them); a type or package prefix
+/// (`new scala.Foo`, `new Outer.Inner` for an object `Outer`) is not one, and
+/// is left to the `$outer` chain / enclosing-object lookup.
+fn new_prefix_instance<'t>(ctx: &EmitCtx, tpt: &'t Tree, outer: SymbolId) -> Option<&'t Tree> {
+    let qual = match &tpt.kind {
+        TreeKind::Select { qual, .. } => qual,
+        TreeKind::AppliedTypeTree { tpt, .. }
+        | TreeKind::TypeApply { fun: tpt, .. }
+        | TreeKind::AnnotatedTypeTree { tpt, .. } => {
+            return new_prefix_instance(ctx, tpt, outer);
+        }
+        _ => return None,
+    };
+    if qual.ty.is_no_type() || qual.ty.is_error() {
+        return None;
+    }
+    let p = ctx.st.class_sym_of(&qual.ty)?;
+    if !is_owner_compatible(ctx.st, p, outer) {
+        return None;
+    }
+    Some(qual)
+}
+
 fn gen_new(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -4971,9 +5249,13 @@ fn gen_new(
     };
     asm.new_obj(&internal);
     asm.dup();
-    if !class_id.is_none() {
-        if enclosing_instance(ctx.st, class_id).is_some() {
-            load_this(asm, ctx);
+    if let Some(outer) = outer_field_class(ctx.st, class_id) {
+        match new_prefix_instance(ctx, tpt, outer) {
+            // `new i.Deep()` / `new c.Inner`: the enclosing instance is the
+            // prefix that was written, not the current `this`.
+            // `new_prefix_instance` already checked the prefix conforms.
+            Some(pfx) => gen_expr(asm, frame, ctx, pfx),
+            None => load_outer_arg(asm, ctx, outer),
         }
     }
     for (i, a) in args.iter().enumerate() {

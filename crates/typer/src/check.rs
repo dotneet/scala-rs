@@ -3891,6 +3891,7 @@ impl Typer {
                     if let Some(id) = self.st.class_sym_of(&tpt.ty) {
                         tpt.sym = id;
                     }
+                    self.type_new_prefix(tpt);
                 } else if let TreeKind::Ident { name } = &tpt.kind {
                     let n = name.clone();
                     self.expose_unqualified(&n, tpt.span);
@@ -9679,6 +9680,40 @@ impl Typer {
             return None;
         }
         Some(self.project_from_prefix(inner.span, &prefix, tname))
+    }
+
+    /// `new i.Deep()` names the enclosing instance of the class it creates.
+    /// `tree_to_type` only reads the prefix as a path, so the backend would
+    /// have no typed tree to evaluate; type it as an expression as well.
+    /// A type or package prefix (`new scala.Foo`, `new Outer.Inner`) is left
+    /// alone — there is nothing to evaluate there.
+    fn type_new_prefix(&mut self, tpt: &mut Tree) {
+        let qual = match &mut tpt.kind {
+            TreeKind::Select { qual, .. } => qual,
+            TreeKind::AppliedTypeTree { tpt, .. }
+            | TreeKind::TypeApply { fun: tpt, .. }
+            | TreeKind::AnnotatedTypeTree { tpt, .. } => {
+                self.type_new_prefix(tpt);
+                return;
+            }
+            _ => return,
+        };
+        if !qual.ty.is_no_type() || !self.is_stable_path(qual) {
+            return;
+        }
+        let term = self.type_select_is_term_prefix(qual);
+        let mut prefix = qual.as_ref().clone();
+        // Speculative: a package prefix (`new scala.Foo`) is not a value and
+        // must not leave "not found" diagnostics behind.
+        let mark = self.diags.len();
+        self.type_expr(&mut prefix, &Type::NoType);
+        self.diags.truncate(mark);
+        let usable = (term || matches!(prefix.ty, Type::ModuleRef(_)))
+            && !prefix.ty.is_no_type()
+            && !prefix.ty.is_error();
+        if usable {
+            **qual = prefix;
+        }
     }
 
     /// `p.T` where `p` is a term is path-dependent; `java.lang.String` is not.
