@@ -1673,7 +1673,7 @@ impl<'a> Parser<'a> {
             self.bump();
             let rhs = self.parse_type();
             let params = match &t.kind {
-                TreeKind::AppliedTypeTree { tpt, args } if matches!(&tpt.kind, TreeKind::Ident { name } if name.starts_with("Tuple") || name == "<tuple>") => {
+                TreeKind::AppliedTypeTree { tpt, args } if matches!(&tpt.kind, TreeKind::Ident { name } if name == "<tuple>") => {
                     args.clone()
                 }
                 _ if is_unit_tuple(&t) => vec![],
@@ -2170,13 +2170,27 @@ impl<'a> Parser<'a> {
                     }
                     self.expect(")", |k| matches!(k, TokenKind::RParen));
                     if ts.len() == 1 {
-                        ts.pop().unwrap()
+                        // `((A, B))` is one type, not a parameter list: the
+                        // inner parens are settled, so drop their marker.
+                        let mut only = ts.pop().unwrap();
+                        if let TreeKind::AppliedTypeTree { tpt, args } = &mut only.kind {
+                            if matches!(&tpt.kind, TreeKind::Ident { name } if name == "<tuple>") {
+                                tpt.kind = TreeKind::Ident {
+                                    name: format!("Tuple{}", args.len()),
+                                };
+                            }
+                        }
+                        only
                     } else {
+                        // `<tuple>` marks a *parenthesised list*: `(A, B) => C`
+                        // has two parameters, while `((A, B)) => C` and
+                        // `Tuple2[A, B] => C` have one. Everywhere but the
+                        // arrow it means `TupleN`.
                         let span = ts[0].span.merge(self.prev_span());
                         let tpt = self.alloc(
                             span,
                             TreeKind::Ident {
-                                name: format!("Tuple{}", ts.len()),
+                                name: "<tuple>".into(),
                             },
                         );
                         self.alloc(

@@ -10105,7 +10105,9 @@ impl Typer {
                         }
                         ctor => self.apply_types(ctor, as_, span),
                     },
-                    Some(n) if n.starts_with("Tuple") => Type::Tuple(as_),
+                    // `<tuple>` is the parser's marker for a parenthesised
+                    // type list; outside a function type it is just a tuple.
+                    Some(n) if n.starts_with("Tuple") || n == "<tuple>" => Type::Tuple(as_),
                     Some(_) => {
                         let ctor = self.tree_to_type(tpt);
                         self.apply_types(ctor, as_, span)
