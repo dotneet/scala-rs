@@ -605,6 +605,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     crate::prelude_numconv::install(st);
     crate::prelude_variance::install(st);
     crate::prelude_boxed::install(st);
+    crate::prelude_hier::install(st);
 }
 
 /// Prelude classes are owned by `scala` but carry their real JVM package
@@ -2114,14 +2115,17 @@ fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
         Intrinsic::None,
     );
     let seq = crate::classpath::find_or_stub_java_class(st, "scala/collection/Seq");
+    // `Seq` carries a type parameter (`prelude_hier` gives the stub one), so
+    // name the element type instead of leaving the parameter raw.
+    let seq_char = Type::Class {
+        sym: seq,
+        args: vec![Type::Char],
+    };
     method(
         st,
         so,
         "diff",
-        vec![Type::Class {
-            sym: seq,
-            args: vec![],
-        }],
+        vec![seq_char],
         Type::String,
         Intrinsic::None,
     );
@@ -3500,10 +3504,18 @@ fn add_cons_members(st: &mut SymbolTable, library_abi: bool) {
     };
     // `::[A] extends List[A]`, so `case h :: t` on a `List[Int]` binds `h: Int`.
     st.get_mut(cons).parents = vec![list_ca.clone()];
-    st.get_mut(st.nil_sym).parents = vec![Type::Class {
+    // `Nil` is built before `List` has its type parameter, so the parent it
+    // was given then is the *raw* `List`. Restate it now that `List[A]`
+    // exists — and on the module *class*, which is what `Type::ModuleRef`
+    // names and where the parent walk looks; the module symbol's own parent
+    // list is never consulted.
+    let nil_cls = st.module_class_of(st.nil_sym);
+    let nil_parent = vec![Type::Class {
         sym: st.list_sym,
         args: vec![Type::Nothing],
     }];
+    st.get_mut(st.nil_sym).parents = nil_parent.clone();
+    st.get_mut(nil_cls).parents = nil_parent;
     let (head_acc, tail_acc) = if library_abi {
         ("head", "tail")
     } else {
@@ -4097,9 +4109,10 @@ fn add_seq_and_lazylist(st: &mut SymbolTable) {
     });
     // `SeqHasAsJava` takes `scala.collection.Seq`, not `immutable.Seq`.
     let coll_seq = crate::classpath::find_or_stub_java_class(st, "scala/collection/Seq");
+    let la = st.get(st.list_sym).tparams[0];
     st.get_mut(st.list_sym).parents.push(Type::Class {
         sym: coll_seq,
-        args: vec![],
+        args: vec![Type::TypeParam(la)],
     });
 }
 
@@ -6452,7 +6465,7 @@ fn add_predef_members(
             "scala/collection/immutable/WrappedString",
             &[Type::Class {
                 sym: seq,
-                args: vec![],
+                args: vec![Type::Char],
             }],
         );
         let wrap_str = method(

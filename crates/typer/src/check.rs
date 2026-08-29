@@ -1985,7 +1985,10 @@ impl Typer {
                             };
                             // The bound is stated in the parent's terms, so a
                             // sibling member it mentions (`type B[T] <: C[T]`)
-                            // must be re-read as the child implements it.
+                            // must be re-read as the child implements it, and
+                            // a `this.type` in it (`type Self >: this.type`)
+                            // means *the child's* `this` at the override site.
+                            let t = t.map(|t| retarget_this(&t, class_id));
                             t.map(|t| st.expand_type_members(class_id, &t))
                         };
                         let parent_hi = align(&self.st, self.st.get(m).bound_hi.clone());
@@ -3167,6 +3170,18 @@ impl Typer {
         }
         match self.pick_ctor(class_id, &arg_tys, None) {
             OverloadPick::Found(sym, param_tys, _) => {
+                // `class Sub[T](y: T) extends Base[T](y)`: the constructor's
+                // parameters are stated in `Base`'s own `T`. Check the
+                // arguments at the type arguments the `extends` clause
+                // actually wrote -- otherwise both sides of the mismatch
+                // print `T` and neither one is the other.
+                let param_tys: Vec<Type> = match &class_ty {
+                    Type::Class { args: targs, .. } if !targs.is_empty() => param_tys
+                        .iter()
+                        .map(|p| self.st.subst_tparams(class_id, targs, p))
+                        .collect(),
+                    _ => param_tys,
+                };
                 for (i, a) in args.iter_mut().enumerate() {
                     if let Some(p) = param_tys.get(i) {
                         if !p.is_no_type() {
@@ -3920,7 +3935,7 @@ impl Typer {
                     tree.ty = Type::Error;
                 } else {
                     tree.sym = id;
-                    tree.ty = self.st.type_of_class(id);
+                    tree.ty = self.st.self_type_of_class(id);
                 }
             }
             TreeKind::Select { .. } => self.type_select(tree, pt),
@@ -4354,7 +4369,7 @@ impl Typer {
                     tree.ty = Type::AnyRef;
                 } else {
                     tree.sym = parent;
-                    tree.ty = self.st.type_of_class(parent);
+                    tree.ty = self.super_prefix_type(this_id, parent);
                 }
             }
             TreeKind::AppliedTypeTree { .. }
@@ -6367,6 +6382,11 @@ impl Typer {
                         }
                     }
                 }
+                let open_tps: Vec<SymbolId> = if sym.is_none() {
+                    Vec::new()
+                } else {
+                    self.st.get(sym).tparams.clone()
+                };
                 for (i, a) in args.iter_mut().enumerate() {
                     let mut p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                     // `Using.resource(r)(x => 10)`: A only appears in a later
@@ -6384,7 +6404,7 @@ impl Typer {
                     // `PartialFunction[Int, B]` with `B` still open. Nothing
                     // conforms to an uninstantiated parameter, so relax it to
                     // `Any` and let the literal's own result type pin `B`.
-                    p = relax_open_tparams(&p);
+                    p = relax_open_tparams(&p, &open_tps);
                     if a.ty.is_no_type() {
                         self.type_expr(a, &p);
                     }
@@ -6854,13 +6874,18 @@ impl Typer {
                         OverloadPick::Found(sym, param_tys, ret) => {
                             fun.sym = sym;
                             tree.sym = sym;
+                            let open_tps: Vec<SymbolId> = if sym.is_none() {
+                                Vec::new()
+                            } else {
+                                self.st.get(sym).tparams.clone()
+                            };
                             for (i, a) in args.iter_mut().enumerate() {
                                 let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                                 if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type()
                                 {
                                     self.type_expr(a, &p);
                                 }
-                                let p = relax_open_tparams(&p);
+                                let p = relax_open_tparams(&p, &open_tps);
                                 if !p.is_no_type() {
                                     self.adapt(a, &p);
                                 }
@@ -9595,6 +9620,23 @@ impl Typer {
         }
     }
 
+    /// The type `super` stands for: the ancestor *as seen from* the current
+    /// class, not the ancestor named on its own.
+    ///
+    /// `class Sub[A] extends Act[A]` inherits `Act`'s members at `A`; naming
+    /// the bare class instead leaves `Act`'s own `R` in the member types, and
+    /// `super.id` then reads as `Act[R]` where `Act[A]` is wanted — a mismatch
+    /// whose two sides print the same when `Sub` also happens to call its
+    /// parameter `R`.
+    fn super_prefix_type(&self, this_id: SymbolId, parent: SymbolId) -> Type {
+        let self_ty = self.st.self_type_of_class(this_id);
+        self.st
+            .base_type_seq(&self_ty)
+            .into_iter()
+            .find(|t| matches!(t, Type::Class { sym, args } if *sym == parent && !args.is_empty()))
+            .unwrap_or_else(|| self.st.type_of_class(parent))
+    }
+
     fn super_target(&self, this_id: SymbolId, mix: Option<&str>) -> SymbolId {
         if this_id.is_none() {
             return SymbolId::NONE;
@@ -10630,7 +10672,7 @@ impl Typer {
                 if self.st.this_class.is_none() {
                     None
                 } else {
-                    Some(self.st.type_of_class(self.st.this_class))
+                    Some(self.st.self_type_of_class(self.st.this_class))
                 }
             }
             // `super.T` in type position: the member is looked up in the
@@ -11551,8 +11593,35 @@ impl Typer {
         }
         if let Type::Method { paramss, ret } = &tree.ty {
             if is_function_pt(pt) || self.st.sam_sig(pt).is_some() {
-                let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
-                let ret = (**ret).clone();
+                let mut params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+                let mut ret = (**ret).clone();
+                // `val f: Node => Node = identity` eta-expands
+                // `def identity[A](x: A): A`. Solve `A` from the expected
+                // function type first: expanding the method as written yields
+                // `A => A`, which conforms to nothing.
+                if let Some((pt_params, pt_ret)) = function_sig(pt) {
+                    let tps = if tree.sym.is_none() {
+                        Vec::new()
+                    } else {
+                        self.st.get(tree.sym).tparams.clone()
+                    };
+                    if !tps.is_empty() && pt_params.len() == params.len() {
+                        let mut sig = params.clone();
+                        sig.push(ret.clone());
+                        let mut want = pt_params;
+                        want.push(pt_ret);
+                        let inst = self.infer_method_tparams(tree.sym, &sig, &want);
+                        if !inst.is_empty() {
+                            let ids: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+                            let vals: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+                            params = params
+                                .iter()
+                                .map(|p| crate::symbol::subst_tparams_slice(&ids, &vals, p))
+                                .collect();
+                            ret = crate::symbol::subst_tparams_slice(&ids, &vals, &ret);
+                        }
+                    }
+                }
                 eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
                 if self.st.is_sub_type(&tree.ty, pt) {
                     return;
@@ -11644,6 +11713,25 @@ impl Typer {
             }
             Type::SingleType { sym, .. } => {
                 if tree.sym == *sym {
+                    tree.ty = pt.clone();
+                    true
+                } else {
+                    false
+                }
+            }
+            // `type Self >: this.type <: Node`: the declaration says
+            // `this.type <: Self`, so `this` conforms to `Self` even though
+            // `Node` does not. Only the *lower* bound admits this, and only a
+            // tree that really is that singleton -- `def id: Self = someNode`
+            // still fails.
+            Type::TypeMember(id) => {
+                let Some(lo) = self.st.get(*id).bound_lo.clone() else {
+                    return false;
+                };
+                if lo.is_no_type() || lo.is_error() || matches!(lo, Type::Nothing) {
+                    return false;
+                }
+                if self.st.is_sub_type(&tree.ty, &lo) || self.adapt_singleton(tree, &lo) {
                     tree.ty = pt.clone();
                     true
                 } else {
@@ -12412,6 +12500,19 @@ fn is_inferable_param_pt(pt: &Type) -> bool {
         pt,
         Type::NoType | Type::Error | Type::Any | Type::AnyRef | Type::AnyVal | Type::Overload(_)
     )
+}
+
+/// The parameter and result types of an expected function type, for the
+/// `Function1`/`FunctionN` spellings the typer produces.
+fn function_sig(pt: &Type) -> Option<(Vec<Type>, Type)> {
+    match pt {
+        Type::Function { params, ret } => Some((params.clone(), (**ret).clone())),
+        Type::Class { sym: _, args } if args.len() >= 2 && is_function_pt(pt) => {
+            let (last, init) = args.split_last()?;
+            Some((init.to_vec(), last.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn is_function_pt(pt: &Type) -> bool {
@@ -13490,23 +13591,42 @@ fn dedup_diags(diags: &mut Vec<Diagnostic>) {
 /// nothing, so relax it to `Any` before checking an argument against it. Only
 /// arguments are relaxed: a parameter that *is* a type parameter (`def f[A](x:
 /// A)`) is left alone, so `f[Int]("s")` is still an error.
-fn relax_open_tparams(ty: &Type) -> Type {
+/// `open` is the *callee's* own type parameter list — the only ones that can
+/// still be undetermined here. A type parameter of the enclosing method or
+/// class is a perfectly good type, and relaxing it too turned
+/// `def f[T](a: Inv[T]) = g(a)` into a check of `Inv[T]` against `Inv[Any]`:
+/// a mismatch for every invariant class, and a silent widening for every
+/// covariant one.
+/// Re-read a parent's `this.type` as the overriding class's own.
+///
+/// `trait Nd { type Self >: this.type <: Nd }` overridden by
+/// `class Leafy extends Nd { type Self = Leafy }` has to compare `Leafy`
+/// against `Leafy.this.type`, not against `Nd.this.type`.
+fn retarget_this(ty: &Type, cls: SymbolId) -> Type {
     match ty {
-        Type::Class { sym, args } if args.iter().any(|a| matches!(a, Type::TypeParam(_))) => {
-            Type::Class {
-                sym: *sym,
-                args: args
-                    .iter()
-                    .map(|a| {
-                        if matches!(a, Type::TypeParam(_)) {
-                            Type::Any
-                        } else {
-                            a.clone()
-                        }
-                    })
-                    .collect(),
-            }
-        }
+        Type::ThisType(_) => Type::ThisType(cls),
+        Type::Class { sym, args } => Type::Class {
+            sym: *sym,
+            args: args.iter().map(|a| retarget_this(a, cls)).collect(),
+        },
+        Type::Refined { parents, decls } => Type::Refined {
+            parents: parents.iter().map(|p| retarget_this(p, cls)).collect(),
+            decls: decls.clone(),
+        },
+        _ => ty.clone(),
+    }
+}
+
+fn relax_open_tparams(ty: &Type, open: &[SymbolId]) -> Type {
+    let is_open = |a: &Type| matches!(a, Type::TypeParam(id) if open.contains(id));
+    match ty {
+        Type::Class { sym, args } if args.iter().any(is_open) => Type::Class {
+            sym: *sym,
+            args: args
+                .iter()
+                .map(|a| if is_open(a) { Type::Any } else { a.clone() })
+                .collect(),
+        },
         _ => ty.clone(),
     }
 }
