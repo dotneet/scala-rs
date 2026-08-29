@@ -1045,6 +1045,19 @@ impl SymbolTable {
             let (sym, args) = match &cur {
                 Type::Class { sym, args } => (*sym, args.clone()),
                 Type::ModuleRef(s) | Type::ThisType(s) => (*s, Vec::new()),
+                // A type parameter's ancestors are its upper bound's, so
+                // `lub(S, S2)` for `S <: NoStream` and `S2 <: NoStream` is
+                // `NoStream` and not `AnyRef`.
+                Type::TypeParam(id) | Type::TypeMember(id) => {
+                    if let Some(hi) = self.get(*id).bound_hi.clone() {
+                        if !seen.contains(&hi) {
+                            seen.push(hi.clone());
+                            out.push(hi.clone());
+                            queue.push_back(hi);
+                        }
+                    }
+                    continue;
+                }
                 _ => continue,
             };
             let s = self.get(sym);
@@ -1060,6 +1073,22 @@ impl SymbolTable {
             }
         }
         out
+    }
+
+    /// Greatest lower bound: the intersection type, reduced when one side
+    /// already conforms to the other. Only used to join a contravariant type
+    /// argument, where `A with B` is what nsc records too.
+    pub fn glb(&self, a: &Type, b: &Type) -> Type {
+        if a == b || self.is_sub_type(a, b) {
+            return a.clone();
+        }
+        if self.is_sub_type(b, a) {
+            return b.clone();
+        }
+        Type::Refined {
+            parents: vec![a.clone(), b.clone()],
+            decls: Vec::new(),
+        }
     }
 
     /// Least upper bound of two types, used for `[B >: A]` inference and for
@@ -1084,26 +1113,35 @@ impl SymbolTable {
             return a;
         }
         // Same class constructor, differing arguments: join the arguments.
+        // A contravariant parameter joins the other way -- the least upper
+        // bound of `Act[R, E]` and `Act[R2, E2]` with `Act[+R, -E]` is
+        // `Act[R lub R2, E glb E2]`. Giving up on the whole class because one
+        // parameter is contravariant used to send `lub(Act[…], Act[…])` all
+        // the way up to `AnyRef`, which is where `Vector(this, a)` got its
+        // `Vector[AnyRef]` element type.
         if let (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) = (&a, &b) {
             if s1 == s2 && !a1.is_empty() && a1.len() == a2.len() {
                 let tparams = self.get(*s1).tparams.clone();
-                let contra = a1.iter().enumerate().any(|(i, _)| {
-                    tparams
-                        .get(i)
-                        .map(|&tp| self.get(tp).flags.contains(Flags::CONTRAVARIANT))
-                        .unwrap_or(false)
-                });
-                if !contra {
-                    let joined: Vec<Type> = a1
-                        .iter()
-                        .zip(a2.iter())
-                        .map(|(x, y)| self.lub(x, y))
-                        .collect();
-                    return Type::Class {
-                        sym: *s1,
-                        args: joined,
-                    };
-                }
+                let joined: Vec<Type> = a1
+                    .iter()
+                    .zip(a2.iter())
+                    .enumerate()
+                    .map(|(i, (x, y))| {
+                        let contra = tparams
+                            .get(i)
+                            .map(|&tp| self.get(tp).flags.contains(Flags::CONTRAVARIANT))
+                            .unwrap_or(false);
+                        if contra {
+                            self.glb(x, y)
+                        } else {
+                            self.lub(x, y)
+                        }
+                    })
+                    .collect();
+                return Type::Class {
+                    sym: *s1,
+                    args: joined,
+                };
             }
         }
         // Not just `a`'s ancestors: `None` (`<: Option[Nothing]` only) paired
@@ -1302,6 +1340,26 @@ impl SymbolTable {
                 parents.iter().all(|p| self.is_sub_type(a, p))
                     && self.conforms_to_refinement(a, decls)
             }
+            // A module has exactly one value, so `Nil.type` and the type of
+            // the `Nil` object are the same type -- `Some(Nil)` is a
+            // `Some[Nil.type]`. Only for modules: `x.type` for an ordinary
+            // `val x: T` is strictly smaller than `T`. Before the
+            // Class-parent walk for the same reason as the arms below.
+            (a, Type::SingleType { sym, .. })
+                if matches!(self.get(*sym).kind, SymKind::Module | SymKind::ModuleClass) =>
+            {
+                let t = self.get(*sym).ty.clone();
+                !t.is_no_type()
+                    && !matches!(&t, Type::SingleType { sym: s2, .. } if s2 == sym)
+                    && self.is_sub_type(a, &t)
+            }
+            // Annotations are erased for conformance: `Node` is a
+            // `Node @uncheckedVariance`. Like the wildcards below, this has to
+            // come before the Class-parent walk, which matches every `Class`
+            // on the left whatever `b` is and would answer "no" by running out
+            // of parents.
+            (a, Type::Annotated { tpe, .. }) => self.is_sub_type(a, tpe),
+            (Type::Annotated { tpe, .. }, b) => self.is_sub_type(tpe, b),
             // Wildcards before the Class-parent walk: that arm matches every Class
             // and would otherwise treat `Byte <: List[_ <: Byte]` as "walk Byte's
             // parents" instead of the bound.
@@ -1395,8 +1453,6 @@ impl SymbolTable {
                     }
                 }
             }
-            (a, Type::Annotated { tpe, .. }) => self.is_sub_type(a, tpe),
-            (Type::Annotated { tpe, .. }, b) => self.is_sub_type(tpe, b),
             (
                 Type::Function {
                     params: p1,

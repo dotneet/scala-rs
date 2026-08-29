@@ -165,18 +165,27 @@ const EDGES: &[(&str, &str, Args)] = &[
     ),
 ];
 
-/// Links the prelude never built at all, but that the hierarchy runs through:
-/// `(jvm name, one variance character per type parameter)`. They are created
-/// empty — the members live on the concrete collections below them, and the
-/// only job these have is to carry the element type up the chain.
-const MISSING: &[(&str, &str)] = &[
+/// The interior of the chain: classes the prelude either never built at all
+/// or left as a bare placeholder, named as
+/// `(jvm name, one variance character per type parameter)`.
+///
+/// They are prepared *before* any edge is installed, because an edge can only
+/// pass `A` up to a parent that has somewhere to put it: `collection.Seq` with
+/// no type parameter of its own could carry nothing from `immutable.Seq[A]` to
+/// `Iterable[A]`, and the edge above it would be dropped as ill-formed.
+///
+/// They stay empty of members — those live on the concrete collections below.
+const LINKS: &[(&str, &str)] = &[
+    ("scala/collection/IterableOnce", "+"),
+    ("scala/collection/Iterable", "+"),
+    ("scala/collection/Seq", "+"),
     ("scala/collection/Set", "="),
     ("scala/collection/Map", "=+"),
 ];
 
 pub fn install(st: &mut SymbolTable) {
-    for (jvm, variance) in MISSING {
-        create_link(st, jvm, variance);
+    for (jvm, variance) in LINKS {
+        ensure_link(st, jvm, variance);
     }
     let tuple2 = find(st, "scala/Tuple2");
     for (child_jvm, parent_jvm, args) in EDGES {
@@ -231,25 +240,32 @@ fn find(st: &SymbolTable, jvm: &str) -> SymbolId {
         .unwrap_or(SymbolId::NONE)
 }
 
-/// Create the trait named by `jvm` if nothing carries that name yet.
-fn create_link(st: &mut SymbolTable, jvm: &str, variance: &str) {
-    if !find(st, jvm).is_none() {
+/// Find the trait named by `jvm`, creating it if nothing carries that name,
+/// and give it the type parameters `variance` describes if it has none.
+fn ensure_link(st: &mut SymbolTable, jvm: &str, variance: &str) {
+    let id = match find(st, jvm) {
+        i if i.is_none() => {
+            let (pkg, simple) = jvm.rsplit_once('/').unwrap_or(("", jvm));
+            let owner = crate::classpath::ensure_package(st, pkg);
+            let id = st.alloc(
+                simple,
+                owner,
+                SymKind::Class,
+                Flags::INTERFACE.with(Flags::ABSTRACT).with(Flags::TRAIT),
+                jvm,
+            );
+            st.get_mut(id).parents = vec![Type::AnyRef];
+            st.get_mut(id).ty = Type::Class {
+                sym: id,
+                args: vec![],
+            };
+            id
+        }
+        i => i,
+    };
+    if !st.get(id).tparams.is_empty() {
         return;
     }
-    let (pkg, simple) = jvm.rsplit_once('/').unwrap_or(("", jvm));
-    let owner = crate::classpath::ensure_package(st, pkg);
-    let id = st.alloc(
-        simple,
-        owner,
-        SymKind::Class,
-        Flags::INTERFACE.with(Flags::ABSTRACT).with(Flags::TRAIT),
-        jvm,
-    );
-    st.get_mut(id).parents = vec![Type::AnyRef];
-    st.get_mut(id).ty = Type::Class {
-        sym: id,
-        args: vec![],
-    };
     let names = ["A", "B", "C"];
     let tps: Vec<SymbolId> = variance
         .chars()

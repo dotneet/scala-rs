@@ -11458,8 +11458,35 @@ impl Typer {
         }
         if let Type::Method { paramss, ret } = &tree.ty {
             if is_function_pt(pt) || self.st.sam_sig(pt).is_some() {
-                let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
-                let ret = (**ret).clone();
+                let mut params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+                let mut ret = (**ret).clone();
+                // `val f: Node => Node = identity` eta-expands
+                // `def identity[A](x: A): A`. Solve `A` from the expected
+                // function type first: expanding the method as written yields
+                // `A => A`, which conforms to nothing.
+                if let Some((pt_params, pt_ret)) = function_sig(pt) {
+                    let tps = if tree.sym.is_none() {
+                        Vec::new()
+                    } else {
+                        self.st.get(tree.sym).tparams.clone()
+                    };
+                    if !tps.is_empty() && pt_params.len() == params.len() {
+                        let mut sig = params.clone();
+                        sig.push(ret.clone());
+                        let mut want = pt_params;
+                        want.push(pt_ret);
+                        let inst = self.infer_method_tparams(tree.sym, &sig, &want);
+                        if !inst.is_empty() {
+                            let ids: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+                            let vals: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+                            params = params
+                                .iter()
+                                .map(|p| crate::symbol::subst_tparams_slice(&ids, &vals, p))
+                                .collect();
+                            ret = crate::symbol::subst_tparams_slice(&ids, &vals, &ret);
+                        }
+                    }
+                }
                 eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
                 if self.st.is_sub_type(&tree.ty, pt) {
                     return;
@@ -12276,6 +12303,19 @@ fn is_inferable_param_pt(pt: &Type) -> bool {
         pt,
         Type::NoType | Type::Error | Type::Any | Type::AnyRef | Type::AnyVal | Type::Overload(_)
     )
+}
+
+/// The parameter and result types of an expected function type, for the
+/// `Function1`/`FunctionN` spellings the typer produces.
+fn function_sig(pt: &Type) -> Option<(Vec<Type>, Type)> {
+    match pt {
+        Type::Function { params, ret } => Some((params.clone(), (**ret).clone())),
+        Type::Class { sym: _, args } if args.len() >= 2 && is_function_pt(pt) => {
+            let (last, init) = args.split_last()?;
+            Some((init.to_vec(), last.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn is_function_pt(pt: &Type) -> bool {
