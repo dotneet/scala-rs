@@ -219,5 +219,6 @@ conform!(
     case_lambda_arity,
     tuple_fn_type,
     mutable_ops,
-    universal_hash
+    universal_hash,
+    any_on_function
 );

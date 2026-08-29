@@ -5073,6 +5073,11 @@ impl Typer {
             found = self.supply_from_pickle(&recv_ty, &name);
         }
         if found.is_empty() {
+            // `Any`'s members belong to every type, including the ones with no
+            // class symbol to walk: `(f: Int => String).asInstanceOf[…]`.
+            found = self.st.lookup_member(self.st.any_sym, &name);
+        }
+        if found.is_empty() {
             // nsc reports the cause once: a selection on a receiver that is
             // already an error adds nothing.
             if !qual.ty.is_error() {
