@@ -799,6 +799,33 @@ impl Assembler {
         let _ = self.pop_v();
         self.push_v(VType::Double);
     }
+    pub fn f2i(&mut self) {
+        self.emit_op(0x8b);
+        let _ = self.pop_v();
+        self.push_v(VType::Integer);
+    }
+    pub fn f2l(&mut self) {
+        self.emit_op(0x8c);
+        let _ = self.pop_v();
+        self.push_v(VType::Long);
+    }
+    pub fn d2i(&mut self) {
+        self.emit_op(0x8e);
+        let _ = self.pop_v();
+        self.push_v(VType::Integer);
+    }
+    pub fn d2l(&mut self) {
+        self.emit_op(0x8f);
+        let _ = self.pop_v();
+        self.push_v(VType::Long);
+    }
+    pub fn d2f(&mut self) {
+        self.emit_op(0x90);
+        let _ = self.pop_v();
+        self.push_v(VType::Float);
+    }
+    /// `i2b` / `i2c` / `i2s` leave an `int` on the stack, so the verification
+    /// type is unchanged and there is nothing to pop or push.
     pub fn i2b(&mut self) {
         self.emit_op(0x91);
     }
@@ -1113,6 +1140,34 @@ impl Assembler {
         self.push_v(VType::Integer);
     }
 
+    /// `laload` / `faload` / `daload` / `baload` / `caload` / `saload`: pop the
+    /// index and the array, push the element. `baload` serves both `[B` and
+    /// `[Z`, and `baload` / `caload` / `saload` all push an `int`.
+    fn typed_aload(&mut self, op: u8, elem: VType) {
+        self.emit_op(op);
+        let _ = self.pop_v();
+        let _ = self.pop_v();
+        self.push_v(elem);
+    }
+    pub fn laload(&mut self) {
+        self.typed_aload(0x2f, VType::Long);
+    }
+    pub fn faload(&mut self) {
+        self.typed_aload(0x30, VType::Float);
+    }
+    pub fn daload(&mut self) {
+        self.typed_aload(0x31, VType::Double);
+    }
+    pub fn baload(&mut self) {
+        self.typed_aload(0x33, VType::Integer);
+    }
+    pub fn caload(&mut self) {
+        self.typed_aload(0x34, VType::Integer);
+    }
+    pub fn saload(&mut self) {
+        self.typed_aload(0x35, VType::Integer);
+    }
+
     /// `anewarray class` — count → array ref.
     pub fn anewarray(&mut self, class: &str) {
         let i = self.pool.class(class);
@@ -1153,6 +1208,33 @@ impl Assembler {
         let _ = self.pop_v();
         let _ = self.pop_v();
         let _ = self.pop_v();
+    }
+
+    /// `lastore` / `fastore` / `dastore` / `bastore` / `castore` / `sastore`:
+    /// pop the value, the index and the array.
+    fn typed_astore(&mut self, op: u8) {
+        self.emit_op(op);
+        let _ = self.pop_v();
+        let _ = self.pop_v();
+        let _ = self.pop_v();
+    }
+    pub fn lastore(&mut self) {
+        self.typed_astore(0x50);
+    }
+    pub fn fastore(&mut self) {
+        self.typed_astore(0x51);
+    }
+    pub fn dastore(&mut self) {
+        self.typed_astore(0x52);
+    }
+    pub fn bastore(&mut self) {
+        self.typed_astore(0x54);
+    }
+    pub fn castore(&mut self) {
+        self.typed_astore(0x55);
+    }
+    pub fn sastore(&mut self) {
+        self.typed_astore(0x56);
     }
 
     pub fn athrow(&mut self) {

@@ -56,8 +56,18 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         "java/lang/Character",
         &[Type::AnyVal],
     );
-    st.byte_sym = class(st, st.scala_pkg, "Byte", "scala/Byte", &[Type::AnyVal]);
-    st.short_sym = class(st, st.scala_pkg, "Short", "scala/Short", &[Type::AnyVal]);
+    // Like `Int`/`Long` above, the JVM name of a primitive value class is the
+    // *box* it erases to, not a class of its own: `scala/Byte` does not exist
+    // at runtime, so a member call on a `Byte` came out as `invokevirtual
+    // scala/Byte.toInt` and the verifier rejected the `int` receiver.
+    st.byte_sym = class(st, st.scala_pkg, "Byte", "java/lang/Byte", &[Type::AnyVal]);
+    st.short_sym = class(
+        st,
+        st.scala_pkg,
+        "Short",
+        "java/lang/Short",
+        &[Type::AnyVal],
+    );
     // nsc `Byte.+` / `Short.+` / `Char.+` return Int; used by ArrayOps.map(_ + 1).
     method(
         st,
@@ -590,6 +600,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     st.enter_in_current("::", st.cons_sym);
     st.enter_in_current("Ordered", ordered);
     crate::prelude_numops::install(st);
+    crate::prelude_bsops::install(st);
+    crate::prelude_numconv::install(st);
     crate::prelude_variance::install(st);
     crate::prelude_boxed::install(st);
 }
@@ -1491,7 +1503,9 @@ fn add_long_members(st: &mut SymbolTable) {
     }
     method(st, c, "unary_-", vec![], Type::Long, Intrinsic::LongUn("-"));
     method(st, c, "unary_~", vec![], Type::Long, Intrinsic::LongUn("~"));
-    method(st, c, "toInt", vec![], Type::Int, Intrinsic::None);
+    // `Intrinsic::None` here boxed the receiver and called a `java.lang.Long`
+    // method that does not exist; `l2i` is the whole of `Long.toInt`.
+    method(st, c, "toInt", vec![], Type::Int, Intrinsic::NumConv("JI"));
     method(
         st,
         c,

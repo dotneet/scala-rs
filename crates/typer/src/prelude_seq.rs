@@ -441,6 +441,17 @@ fn add_numeric(st: &mut SymbolTable) -> SymbolId {
             "scala/math/Numeric$DoubleIsFractional$",
             Type::Double,
         ),
+        // `Ordering$Byte$` / `Ordering$Short$` と同じ理由。
+        (
+            "ByteIsIntegral",
+            "scala/math/Numeric$ByteIsIntegral$",
+            Type::Byte,
+        ),
+        (
+            "ShortIsIntegral",
+            "scala/math/Numeric$ShortIsIntegral$",
+            Type::Short,
+        ),
     ] {
         add_implicit_instance(st, num_cls, numeric, name, jvm, ty);
     }
@@ -458,6 +469,12 @@ fn add_ordering_instances(st: &mut SymbolTable, ordering: SymbolId) {
         ("String", "scala/math/Ordering$String$", Type::String),
         ("Long", "scala/math/Ordering$Long$", Type::Long),
         ("Boolean", "scala/math/Ordering$Boolean$", Type::Boolean),
+        // `Byte` と `Short` は JVM プリミティブとして本物になったので
+        // （`java/lang/Byte` / `java/lang/Short` へ erase される）、
+        // `xs.sortBy(_.keySeq)` の `Ordering[Short]` も要る。
+        // jar には `Ordering$Byte$` / `Ordering$Short$` が実在する。
+        ("Byte", "scala/math/Ordering$Byte$", Type::Byte),
+        ("Short", "scala/math/Ordering$Short$", Type::Short),
     ] {
         add_implicit_instance(st, ord_cls, ordering, name, jvm, ty);
     }

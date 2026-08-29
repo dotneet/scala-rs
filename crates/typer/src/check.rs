@@ -9199,7 +9199,16 @@ impl Typer {
             }
             TreeKind::Select { .. } => {
                 // Stable identifier pattern (`Color.RED`, `java.lang.Thread.State.NEW`).
-                self.type_expr(pat, sel_ty);
+                // A `Byte`/`Short`/`Char` scrutinee is an `int` on the stack and
+                // the pattern is only compared with `==`, so nsc accepts an
+                // `Int` constant there (`case DatabaseMetaData.functionNoTable`
+                // against `r.nextShort()`). Demanding conformance to the
+                // scrutinee would reject it for no runtime reason.
+                let pt = match sel_ty.widen_constant() {
+                    Type::Byte | Type::Short | Type::Char => Type::Int,
+                    _ => sel_ty.clone(),
+                };
+                self.type_expr(pat, &pt);
             }
             TreeKind::Bind { name, body } => {
                 self.type_pattern(body, sel_ty);
@@ -12393,6 +12402,17 @@ fn numeric_widen(a: &Type, b: &Type) -> Option<Type> {
         (Type::Long, Type::Double) => Some(Type::Double),
         (Type::Float, Type::Double) => Some(Type::Double),
         (Type::Int, Type::Float) => Some(Type::Float),
+        (Type::Long, Type::Float) => Some(Type::Float),
+        // SLS 3.5.3 weak conformance: `Byte <= Short <= Int <= Long <= Float
+        // <= Double` and `Char <= Int`. `Byte`/`Short`/`Char` are `int` on the
+        // stack, so widening to `Short` or `Int` needs no instruction and
+        // `wrap_numeric_widen` just retypes the tree.
+        (Type::Byte, Type::Short | Type::Int | Type::Long | Type::Float | Type::Double) => {
+            Some(b.clone())
+        }
+        (Type::Short | Type::Char, Type::Int | Type::Long | Type::Float | Type::Double) => {
+            Some(b.clone())
+        }
         _ => None,
     }
 }

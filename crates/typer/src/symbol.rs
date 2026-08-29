@@ -127,6 +127,12 @@ pub enum Intrinsic {
     BoxValue(&'static str),
     /// `Predef.Integer2int` and siblings: the reverse, `Integer.intValue`.
     UnboxValue(&'static str),
+    /// One of the 49 `toByte`/`toShort`/`toChar`/`toInt`/`toLong`/`toFloat`/
+    /// `toDouble` members nsc declares on every numeric value class. The
+    /// payload is `<from><to>` in JVM descriptor letters (`"IB"` is
+    /// `Int.toByte`), because the receiver's *static* type is what picks the
+    /// instruction sequence and `tree.ty` only carries the target.
+    NumConv(&'static str),
 }
 
 /// What a `def f = macro Impl.method` binds to.
