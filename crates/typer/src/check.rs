@@ -3896,7 +3896,7 @@ impl Typer {
                     tree.ty = Type::Error;
                 } else {
                     tree.sym = id;
-                    tree.ty = self.st.type_of_class(id);
+                    tree.ty = self.st.self_type_of_class(id);
                 }
             }
             TreeKind::Select { .. } => self.type_select(tree, pt),
@@ -4301,7 +4301,7 @@ impl Typer {
                     tree.ty = Type::AnyRef;
                 } else {
                     tree.sym = parent;
-                    tree.ty = self.st.type_of_class(parent);
+                    tree.ty = self.super_prefix_type(this_id, parent);
                 }
             }
             TreeKind::AppliedTypeTree { .. }
@@ -6314,6 +6314,11 @@ impl Typer {
                         }
                     }
                 }
+                let open_tps: Vec<SymbolId> = if sym.is_none() {
+                    Vec::new()
+                } else {
+                    self.st.get(sym).tparams.clone()
+                };
                 for (i, a) in args.iter_mut().enumerate() {
                     let mut p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                     // `Using.resource(r)(x => 10)`: A only appears in a later
@@ -6331,7 +6336,7 @@ impl Typer {
                     // `PartialFunction[Int, B]` with `B` still open. Nothing
                     // conforms to an uninstantiated parameter, so relax it to
                     // `Any` and let the literal's own result type pin `B`.
-                    p = relax_open_tparams(&p);
+                    p = relax_open_tparams(&p, &open_tps);
                     if a.ty.is_no_type() {
                         self.type_expr(a, &p);
                     }
@@ -6801,13 +6806,18 @@ impl Typer {
                         OverloadPick::Found(sym, param_tys, ret) => {
                             fun.sym = sym;
                             tree.sym = sym;
+                            let open_tps: Vec<SymbolId> = if sym.is_none() {
+                                Vec::new()
+                            } else {
+                                self.st.get(sym).tparams.clone()
+                            };
                             for (i, a) in args.iter_mut().enumerate() {
                                 let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                                 if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type()
                                 {
                                     self.type_expr(a, &p);
                                 }
-                                let p = relax_open_tparams(&p);
+                                let p = relax_open_tparams(&p, &open_tps);
                                 if !p.is_no_type() {
                                     self.adapt(a, &p);
                                 }
@@ -9477,6 +9487,23 @@ impl Typer {
         }
     }
 
+    /// The type `super` stands for: the ancestor *as seen from* the current
+    /// class, not the ancestor named on its own.
+    ///
+    /// `class Sub[A] extends Act[A]` inherits `Act`'s members at `A`; naming
+    /// the bare class instead leaves `Act`'s own `R` in the member types, and
+    /// `super.id` then reads as `Act[R]` where `Act[A]` is wanted — a mismatch
+    /// whose two sides print the same when `Sub` also happens to call its
+    /// parameter `R`.
+    fn super_prefix_type(&self, this_id: SymbolId, parent: SymbolId) -> Type {
+        let self_ty = self.st.self_type_of_class(this_id);
+        self.st
+            .base_type_seq(&self_ty)
+            .into_iter()
+            .find(|t| matches!(t, Type::Class { sym, args } if *sym == parent && !args.is_empty()))
+            .unwrap_or_else(|| self.st.type_of_class(parent))
+    }
+
     fn super_target(&self, this_id: SymbolId, mix: Option<&str>) -> SymbolId {
         if this_id.is_none() {
             return SymbolId::NONE;
@@ -10510,7 +10537,7 @@ impl Typer {
                 if self.st.this_class.is_none() {
                     None
                 } else {
-                    Some(self.st.type_of_class(self.st.this_class))
+                    Some(self.st.self_type_of_class(self.st.this_class))
                 }
             }
             // `super.T` in type position: the member is looked up in the
@@ -13316,23 +13343,22 @@ fn dedup_diags(diags: &mut Vec<Diagnostic>) {
 /// nothing, so relax it to `Any` before checking an argument against it. Only
 /// arguments are relaxed: a parameter that *is* a type parameter (`def f[A](x:
 /// A)`) is left alone, so `f[Int]("s")` is still an error.
-fn relax_open_tparams(ty: &Type) -> Type {
+/// `open` is the *callee's* own type parameter list — the only ones that can
+/// still be undetermined here. A type parameter of the enclosing method or
+/// class is a perfectly good type, and relaxing it too turned
+/// `def f[T](a: Inv[T]) = g(a)` into a check of `Inv[T]` against `Inv[Any]`:
+/// a mismatch for every invariant class, and a silent widening for every
+/// covariant one.
+fn relax_open_tparams(ty: &Type, open: &[SymbolId]) -> Type {
+    let is_open = |a: &Type| matches!(a, Type::TypeParam(id) if open.contains(id));
     match ty {
-        Type::Class { sym, args } if args.iter().any(|a| matches!(a, Type::TypeParam(_))) => {
-            Type::Class {
-                sym: *sym,
-                args: args
-                    .iter()
-                    .map(|a| {
-                        if matches!(a, Type::TypeParam(_)) {
-                            Type::Any
-                        } else {
-                            a.clone()
-                        }
-                    })
-                    .collect(),
-            }
-        }
+        Type::Class { sym, args } if args.iter().any(is_open) => Type::Class {
+            sym: *sym,
+            args: args
+                .iter()
+                .map(|a| if is_open(a) { Type::Any } else { a.clone() })
+                .collect(),
+        },
         _ => ty.clone(),
     }
 }

@@ -896,6 +896,29 @@ impl SymbolTable {
         }
     }
 
+    /// The type `this` has inside `id`: the class applied to *its own* type
+    /// parameters.
+    ///
+    /// `type_of_class` answers with the bare class symbol, which is right for
+    /// naming a class but wrong for `this`: in `trait Box[A] { def f = this }`
+    /// the raw `Box` carries no arguments, so every later conformance check
+    /// has to invent them — and inventing `Any` makes `Box[A]` and `Box[B]`
+    /// look interchangeable while making both fail against `Box[A]`.
+    pub fn self_type_of_class(&self, id: SymbolId) -> Type {
+        let s = self.get(id);
+        match s.kind {
+            SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
+            _ if s.tparams.is_empty() => Type::Class {
+                sym: id,
+                args: vec![],
+            },
+            _ => Type::Class {
+                sym: id,
+                args: s.tparams.iter().map(|t| Type::TypeParam(*t)).collect(),
+            },
+        }
+    }
+
     /// One of the nine primitive value classes (`scala.Int`, `scala.Unit`, ...).
     ///
     /// Their `jvm_name` records the *box* they erase to (`java/lang/Integer`),

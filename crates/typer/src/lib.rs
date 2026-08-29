@@ -15,6 +15,7 @@ mod prelude_boxed;
 mod prelude_coll;
 mod prelude_conform;
 mod prelude_either;
+mod prelude_hier;
 mod prelude_impl2;
 mod prelude_lang;
 mod prelude_lowbound;
