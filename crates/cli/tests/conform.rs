@@ -208,5 +208,6 @@ conform!(
     case_body_pattern_def,
     anon_pattern_capture,
     integral_ops,
-    invariance
+    invariance,
+    const_narrow
 );

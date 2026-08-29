@@ -8674,8 +8674,12 @@ impl Typer {
             Some(3) if !allow_widen => false, // numeric widen
             Some(_) => true,
             None if allow_widen => {
-                // nsc view: `wrapString` makes String applicable to Seq.
-                !matches!(self.search_conversion(arg, param), ImplicitSearch::None)
+                // Narrowing an `Int` literal (`take(3)` on a `Byte` parameter)
+                // is a fallback, like a view: without that, `sb.append(42)`
+                // would match `append(Char)` as readily as `append(Int)`.
+                self.st.narrows_to(arg, param)
+                    // nsc view: `wrapString` makes String applicable to Seq.
+                    || !matches!(self.search_conversion(arg, param), ImplicitSearch::None)
             }
             None => false,
         }
@@ -11399,6 +11403,21 @@ impl Typer {
             // left an `int` on the stack where a `double` was expected.
             self.wrap_numeric_widen(tree, &w);
             return;
+        }
+        // SLS 6.26.1: an `Int` *literal* in range narrows to `Byte`, `Short`
+        // or `Char` (`val b: Byte = 1`). Only a constant; `val b: Byte = n`
+        // stays an error.
+        if let Type::Constant(Lit::Int(v)) = &tree.ty {
+            let fits = match pt {
+                Type::Byte => (-128..=127).contains(v),
+                Type::Short => (-32768..=32767).contains(v),
+                Type::Char => (0..=65535).contains(v),
+                _ => false,
+            };
+            if fits {
+                tree.ty = pt.clone();
+                return;
+            }
         }
         if matches!(pt, Type::Unit) {
             // value discarded

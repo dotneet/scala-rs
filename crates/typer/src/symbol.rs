@@ -1115,6 +1115,21 @@ impl SymbolTable {
         }
     }
 
+    /// SLS 6.26.1: an `Int` literal in range converts to `Byte`, `Short` or
+    /// `Char`. This is *narrowing*, not conformance -- overload resolution
+    /// only falls back on it, so `sb.append(42)` still picks `append(Int)`.
+    pub fn narrows_to(&self, from: &Type, to: &Type) -> bool {
+        let Type::Constant(scala_rs_parser::Lit::Int(v)) = from else {
+            return false;
+        };
+        match to {
+            Type::Byte => (-128..=127).contains(v),
+            Type::Short => (-32768..=32767).contains(v),
+            Type::Char => (0..=65535).contains(v),
+            _ => false,
+        }
+    }
+
     pub fn is_sub_type(&self, a: &Type, b: &Type) -> bool {
         if a == b {
             return true;
