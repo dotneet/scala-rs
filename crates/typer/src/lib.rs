@@ -41,6 +41,7 @@ mod prelude_tuple;
 mod prelude_universal;
 mod prelude_variance;
 mod quasiquote;
+mod reify;
 mod symbol;
 mod uncurry;
 
@@ -2925,6 +2926,9 @@ object Main {
                 is_implicit: true,
             }]),
             pickle_tparams: vec![],
+            is_interface: false,
+            super_name: None,
+            interfaces: vec![],
         };
         let nested = ClasspathClass {
             jvm_name: "enrich/package$Rich".into(),
@@ -2956,6 +2960,9 @@ object Main {
                 },
             ]),
             pickle_tparams: vec![],
+            is_interface: false,
+            super_name: None,
+            interfaces: vec![],
         };
         if nested_first {
             vec![nested, pkg]

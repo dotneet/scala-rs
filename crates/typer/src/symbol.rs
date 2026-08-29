@@ -216,6 +216,27 @@ pub struct Symbol {
     /// Set on `def f = macro Impl.method`. Such a symbol has no bytecode: every
     /// call site must be replaced by the implementation's expansion.
     pub macro_impl: Option<MacroBinding>,
+    /// JVM internal name of the class that actually *declares* this method,
+    /// when the owner's own class file does not reach it.
+    ///
+    /// A member completed from a library pickle is installed on the class it
+    /// was asked for, because that is where the typer has to find it. The JVM
+    /// method it compiles to may be declared somewhere the bytecode hierarchy
+    /// does not lead: `scala.reflect.api.JavaUniverse` is an interface with
+    /// `interfaces: 0`, and `Constant()` is declared on
+    /// `scala.reflect.api.Constants`, reachable only through the abstract
+    /// class `Universe` that the class file cannot name. Naming the queried
+    /// class in the call is then a `NoSuchMethodError` at the first
+    /// invocation, so codegen names this class instead and `checkcast`s the
+    /// receiver to it -- exactly what nsc emits.
+    ///
+    /// Empty when the owner's own class file reaches the declaration, which is
+    /// every ordinary member.
+    pub declaring_class: String,
+    /// Whether [`Symbol::declaring_class`] is an interface, and so whether the
+    /// call is `invokeinterface` or `invokevirtual`. Meaningless when
+    /// `declaring_class` is empty.
+    pub declaring_is_interface: bool,
 }
 
 impl Symbol {
@@ -353,6 +374,8 @@ impl SymbolTable {
                 bound_hi: None,
                 captures: vec![],
                 macro_impl: None,
+                declaring_class: String::new(),
+                declaring_is_interface: false,
             }],
             scopes: vec![Scope::default()],
             root: SymbolId(0),
@@ -431,6 +454,8 @@ impl SymbolTable {
             bound_hi: None,
             captures: vec![],
             macro_impl: None,
+            declaring_class: String::new(),
+            declaring_is_interface: false,
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {
@@ -1186,6 +1211,23 @@ impl SymbolTable {
                             out.push(hi.clone());
                             queue.push_back(hi);
                         }
+                    }
+                    continue;
+                }
+                // A compound bound is every one of its parts. The reflect API
+                // is written in these -- `type Ident >: Null <: IdentApi with
+                // RefTree` -- and stopping here left `Ident` and `Literal`
+                // with no common ancestor but `AnyRef`, so `List(anIdent,
+                // aLiteral)` came out as `List[AnyRef]` and no `Syntactic*`
+                // call would take it.
+                Type::Refined { parents, .. } => {
+                    for p in parents.clone() {
+                        if seen.contains(&p) {
+                            continue;
+                        }
+                        seen.push(p.clone());
+                        out.push(p.clone());
+                        queue.push_back(p);
                     }
                     continue;
                 }

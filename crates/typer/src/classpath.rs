@@ -86,7 +86,15 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
                 installed.push((i, id));
                 continue;
             }
-            let id = st.alloc(&simple, owner, SymKind::Class, Flags::EMPTY, &c.jvm_name);
+            // A Scala trait compiles to an interface. Without the flag the
+            // backend emits `invokevirtual` against it and the JVM answers
+            // with `IncompatibleClassChangeError` at the first call.
+            let flags = if c.is_interface {
+                Flags::INTERFACE
+            } else {
+                Flags::EMPTY
+            };
+            let id = st.alloc(&simple, owner, SymKind::Class, flags, &c.jvm_name);
             st.get_mut(id).ty = Type::Class {
                 sym: id,
                 args: vec![],
@@ -99,7 +107,8 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
         }
     }
 
-    for (i, owner) in installed {
+    for (i, owner) in &installed {
+        let (i, owner) = (*i, *owner);
         let c = &classes[i];
         install_tparams(st, owner, &c.pickle_tparams);
         if let Some(p) = &c.pickle {
@@ -108,7 +117,25 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
                     continue;
                 }
                 if m.is_val {
-                    add_term(st, owner, &m.name, resolve_type_in(st, owner, &m.ret, &[]));
+                    let mut ty = resolve_type_in(st, owner, &m.ret, &[]);
+                    // The pickle subset keeps member types as *simple* names,
+                    // so a val whose type lives in another package comes back
+                    // unresolved. The getter's descriptor in the class file
+                    // names the same type in full, so fall back to it rather
+                    // than install a member nothing can be selected from.
+                    if matches!(ty, Type::Named { .. }) {
+                        if let Some(g) = c
+                            .methods
+                            .iter()
+                            .find(|g| g.name == m.name && g.desc.starts_with("()"))
+                        {
+                            let (_, ret) = parse_method_desc(st, &g.desc);
+                            if !matches!(ret, Type::Named { .. }) {
+                                ty = ret;
+                            }
+                        }
+                    }
+                    add_term(st, owner, &m.name, ty);
                     continue;
                 }
                 if m.is_ctor {
@@ -143,6 +170,74 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
         }
         mark_defaults_from_getters(st, owner);
         copy_package_object_members(st, owner, c);
+    }
+
+    attach_classpath_parents(st, classes, &installed);
+}
+
+/// Give each `-cp` class the parents its classfile header names.
+///
+/// The pickle subset records member types by *simple* name and drops the
+/// inheritance graph entirely, so without this a class from `-cp` looks like it
+/// extends nothing: `t.greet()` on a `trait T extends Base` is "not a member",
+/// and a member that *is* found is attributed to the wrong owner. The classfile
+/// header is where `super_class`/`interfaces` survive intact.
+///
+/// Run after every class is installed, so a parent that comes later in the scan
+/// is already there, and after members are installed, so `has_member` keeps
+/// deciding on a class's *own* declarations exactly as before.
+///
+/// Type arguments are not recoverable from the header (`extends Base[Int]` is
+/// just `Base` there), so a parent is attached without them. That is why an
+/// existing symbol whose parents are already known -- the prelude's, or the
+/// Java loader's, both of which carry arguments -- is left alone.
+fn attach_classpath_parents(
+    st: &mut SymbolTable,
+    classes: &[ClasspathClass],
+    installed: &[(usize, SymbolId)],
+) {
+    let mut by_jvm: std::collections::HashMap<String, SymbolId> = std::collections::HashMap::new();
+    for s in st.symbols.iter() {
+        if s.is_class_like() && !s.jvm_name.is_empty() {
+            by_jvm.entry(s.jvm_name.clone()).or_insert(s.id);
+        }
+    }
+    for (i, owner) in installed {
+        let c = &classes[*i];
+        let owner = *owner;
+        // Only when nothing better is known. `parents` is `[AnyRef]` for a
+        // class this module just created and richer for one that was already
+        // declared elsewhere.
+        if st
+            .get(owner)
+            .parents
+            .iter()
+            .any(|p| !matches!(p, Type::AnyRef))
+        {
+            continue;
+        }
+        let mut ps = vec![Type::AnyRef];
+        for n in c.super_name.iter().chain(c.interfaces.iter()) {
+            if n == "java/lang/Object" {
+                continue;
+            }
+            let Some(&pid) = by_jvm.get(n.as_str()) else {
+                continue;
+            };
+            if pid == owner || pid == st.object_sym {
+                continue;
+            }
+            let ty = Type::Class {
+                sym: pid,
+                args: vec![],
+            };
+            if !ps.iter().any(|p| same_class(p, &ty)) {
+                ps.push(ty);
+            }
+        }
+        if ps.len() > 1 {
+            st.get_mut(owner).parents = ps;
+        }
     }
 }
 
@@ -653,7 +748,22 @@ fn parse_field_ty(st: &SymbolTable, s: &str) -> (Type, usize) {
                     ret: Box::new(Type::Any),
                 }
             } else {
-                resolve_type_name(st, name)
+                let by_name = resolve_type_name(st, name);
+                // A descriptor names one exact class. When the simple name is
+                // not in scope -- `scala.reflect.api.JavaUniverse` is a member
+                // of its package, not of any open scope -- resolving it by
+                // internal name is still exact, and beats giving up on a
+                // `Type::Named` that nothing can select a member from.
+                match by_name {
+                    Type::Named { .. } => match find_by_jvm(st, inner) {
+                        Some(id) => Type::Class {
+                            sym: id,
+                            args: vec![],
+                        },
+                        None => by_name,
+                    },
+                    t => t,
+                }
             };
             let consumed = if end < s.len() { end + 1 } else { end };
             (ty, consumed)

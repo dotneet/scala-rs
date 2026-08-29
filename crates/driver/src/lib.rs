@@ -365,6 +365,9 @@ fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
                         .collect()
                 }),
                 pickle_tparams,
+                is_interface: c.is_interface,
+                super_name: c.super_name,
+                interfaces: c.interfaces,
             }
         })
         .collect()

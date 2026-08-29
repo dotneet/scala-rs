@@ -148,14 +148,27 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
   nsc と同じく**出さない**（だから Java から呼べない）。戻り値型の省略 / object のメソッド
   でない実装 / `Context` を第 1 引数に取らない実装 / 解決できない参照 / whitebox は診断する。
   **展開は未実装**なので、呼び出し地点は診断して落とす。設計は [`docs/macros.md`](docs/macros.md)
-- **quasiquote の認識と診断**: `q"..."` / `tq"..."` / `pq"..."` / `cq"..."` は
+- **quasiquote（`q"..."`）の reification**: `q"..."` / `tq"..."` / `pq"..."` / `cq"..."` は
   `StringContext` の普通の補間子ではなく、nsc の**コンパイラ内蔵マクロ**である。
   補間文字列の中身を（`$x` / `${…}` / `..$xs` / `...$xss` をプレースホルダに置き換えて）
-  **scala-rs のパーサで実際に構文解析し**、通らなければ
-  `unimplemented syntax: quasiquote q"..." (理由)`、通れば
-  `macro expansion is not implemented: cannot expand quasiquote q"..."` を出す。
-  **ユーザ定義の `q` 補間子は横取りしない**。展開（reification）は未実装
-  （[`docs/macros.md`](docs/macros.md) §6.2 / §7.1）
+  **scala-rs のパーサで実際に構文解析し**、`q"..."` については
+  `<universe>.internal.reificationSupport.Syntactic*` の呼び出しに脱糖して、
+  普通の式として型検査・コード生成する（`crates/typer/src/reify.rs`）。落とせるのは
+  リテラル / 名前 / 選択 / 適用（カリー化含む）/ `$x` 穴 / 引数リスト 1 節ぶんの `..$xs`。
+  universe は `import <universe>._` から採る。**落とせない形は必ず
+  `unimplemented syntax: quasiquote q"..." (どの形か)` で診断する**（黙って通さない）。
+  残りの形と `tq` / `pq` / `cq` は未実装で、同じ診断が出る
+  （[`docs/macros.md`](docs/macros.md) §7.4 / §7.5）
+- **`-cp` から読んだクラスとトレイト**: `-cp` の classfile から読んだ Scala の
+  トレイトは**インタフェース**として扱い（`ACC_INTERFACE` を読む）、
+  **親はヘッダの `super_class` / `interfaces`** から付ける。以前は前者が無くて
+  実行時 `IncompatibleClassChangeError`、後者が無くて継承メンバが `is not a member`
+  になっていた。さらに、pickle から補完したメンバの JVM 宣言が
+  **バイトコードの経路では届かない**クラスにあるとき（`scala.reflect.api.JavaUniverse`
+  は `interfaces: 0` のインタフェースで、`Constant()` を宣言するのは
+  `scala.reflect.api.Constants`）、`Symbol::declaring_class` にその内部名を記録し、
+  codegen はそのクラスを invoke のオーナーに使ってレシーバをそこへ `checkcast` する
+  （nsc と同形）。これで `scala.reflect.runtime.universe` 上の Tree 構築が実際に走る
 - **package object のメンバ**: jar の `scala.math.Pi` のような package object の
   `val` / `def`。typer はこれをパッケージシンボルに畳み込むが、パッケージには実行時の値が
   無いので、codegen は `<pkg>/package$.MODULE$` をレシーバに積む
@@ -1909,6 +1922,8 @@ trait のメンバークラスの `$outer` と、共変な戻り値型のオー�
 `outer_field_is_the_self_type` は `Comp$Table` が `(LProf;Ljava/lang/String;)V` である
 ことを（どちらも nsc と同じ `$outer` の型と位置）classfile のバイト列で固定します。
 
+`agent/reify2` スライス（宣言クラスでの呼び出しと quasiquote の reification）のフィクスチャは接頭辞 `reify`（`reify` / `reify_bad` / `reify_qq` / `reify_qq_bad`）で、コンフリクト回避のため `crates/cli/tests/reify.rs` に置いています。`reify.scala` は 1 コンパイル単位で trait-extends-class のディスパッチ（宣言クラスへの `checkcast` + `invokevirtual` と、トレイト自身の `invokeinterface`）を private ランタイム・library ABI の両方で見るもので、期待出力は実 scalac 2.13.16 の出力です。`reify_qq.scala` は **scala-reflect.jar を `-cp` に置いて**quasiquote を実行し、実 scalac の出力と毎回その場で比較します（`reify_qq_quasiquotes_build_the_same_trees_as_scalac`）。`reify_runtime_universe_builds_a_tree` は `scala.reflect.runtime.universe` 上で `SyntacticTermIdent` / `SyntacticSelectTerm` / `Literal(Constant(42))` を組み立てて**実行**します（以前は `NoSuchMethodError`）。`reify_classpath_trait_is_an_interface_and_inherits` は `-cp` 越しのトレイトのメンバと継承メンバ（以前は `IncompatibleClassChangeError` と `is not a member`）。異常系は `reify_bad.scala`（トレイトにもクラスにも無い名前）と `reify_qq_bad.scala`（reification が落とせない 6 つの形が、どれも形の名前つきで診断されること）。
+
 quasiquote と、その受け皿である reflect ABI の下地は `crates/cli/tests/quasi.rs` にまとめています。正常系 `tests/fixtures/quasi.scala` は `scala_library_dual_run_quasi`（jar リンクで実行し `expected/quasi.txt` と一致）と `real_scalac_dual_run_quasi`（**実 scalac 2.13.16** の stdout・期待値・scala-rs の出力の三者一致）の 2 通りで回し、package object のメンバ（`scala.math.Pi` / `abs` / `max`）、`import <値>._`、引数なし `def` の結果に対する `apply` 挿入（`Literal(1)` = `Literal.apply(1)`）、そして**ユーザ定義の `q` 補間子が quasiquote に横取りされないこと**を実行結果まで固定します。異常系 `quasi_bad.scala` は `fixtures_quasi_bad_is_error` が `q` / `tq` / `pq` / `cq` の 4 種すべてに診断が出ること、`q""` は `unimplemented syntax: quasiquote q"..." (empty quasiquote)` になることを見ます。`quasiquote_is_not_reported_as_a_stringcontext_member` は、以前の**誤った**診断 `value q is not a member of StringContext` が戻らないことを固定します。
 
 def マクロは `crates/cli/tests/macros.rs` にまとめています。呼ばれない macro def のコンパイルと、`Sugar$.class` にメソッドが出ていないことは `macro_def.scala`。マクロ呼び出しの診断は `macro_call_bad.scala`（`macro expansion is not implemented`）。戻り値型の無いマクロ def は `macro_no_result_type_bad.scala`。`Context` を第 1 引数に取らない実装は `macro_impl_shape_bad.scala`。解決できない実装参照は `macro_impl_missing_bad.scala`。whitebox は `macro_whitebox_bad.scala`。設計は [`docs/macros.md`](docs/macros.md)。
@@ -1942,6 +1957,8 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 
 | `mism2.scala` | 型引数が解けないまま残る／宣言した結果型が上書きされる一群の修正（library dual-run のみ）：後続ユニットのメンバを参照するデフォルト引数、型パラメータが 3 つある型の `map` の結果型、ラムダの結果から解くメソッド型パラメータ、引数リスト無しの `RepShape[L, M, U]`、期待型から決まる `Coll.empty`、タプルや可変長引数の中の関数リテラル、package object の implicit 節（`classTag[Short]`）、引数を取らない `def` の値位置での適用、ブロック内のローカル `def` の前方参照 | `hi later` `Some(7)` `rep` `0` `5` `42` `short` |
 
+| `reify.scala` / `reify_bad.scala`（`crates/cli/tests/reify.rs`） | クラスを継承したトレイト越しのメンバ呼び出し: 宣言クラスの `checkcast` + `invokevirtual` と、トレイト自身の `invokeinterface`。異常系はどちらにも無い名前が黙って通らないこと | `gear` `gear/gear` `6` `gear` `3` |
+| `reify_qq.scala` / `reify_qq_bad.scala`（`crates/cli/tests/reify.rs`、scala-reflect.jar が要る） | quasiquote の reification（実 scalac 2.13.16 と dual-run）: リテラル / 名前 / 選択 / 適用（カリー化含む）/ `$x` 穴 / `..$xs` 穴 / 引数ゼロ。異常系は落とせない 6 形が形の名前つきで診断されること | `1` `greet` `true` `"hi"` `a.b.c` `f(1)` `a.b(1)(2)` `g(x)` `h(x, 2)` `x.size` `k(p, q)` `k()` |
 | `quasi.scala` | quasiquote の下地（実 scalac 2.13.16 と dual-run）：jar の package object のメンバ（`scala.math.Pi` / `abs` / `max`）、`import <値>._` とその書き戻し、引数なし `def` の結果に対する `apply` 挿入（`Literal(1)` = `Literal.apply(1)`）、ユーザ定義 `q` 補間子が横取りされないこと | `3.141592653589793` `7` `9` `<1>` `<x>` `small` `<via-path>` `a$1b$2c` `user-q:a\|b` `user-tq:c` |
 
 `mism2.scala` は `crates/cli/tests/mismatch2.rs` から回します。同ファイルには最小形の
@@ -2271,18 +2288,22 @@ implicit-only 型パラメータの両方に nsc と同じ趣旨の診断が出�
   `scala.reflect` API の prelude と ABI コード生成（§6 フェーズ 3）、
   quasiquote と `reify`（fast track マクロなので自前実装が要る。§6.2）、
   whitebox と macro bundle。テストは `crates/cli/tests/macros.rs`
-- **quasiquote の reification**。`q"..."` / `tq"..."` / `pq"..."` / `cq"..."` は
-  **認識して中身を構文解析し**、通らなければ `unimplemented syntax: quasiquote ...`、
-  通れば `cannot expand quasiquote ...` と診断する（`crates/typer/src/quasiquote.rs`、
-  テストは `crates/cli/tests/quasi.rs`）。残件は 3 つで、`docs/macros.md` §7.3 に詳しい。
-  (a) 補完したメンバを**宣言クラス**で呼ぶこと — `u.Constant()` は
-  `scala.reflect.api.Constants` の宣言であり、`api.JavaUniverse` はバイトコード上
-  そのインタフェースを実装していない（`Universe` が abstract class なので
-  `trait JavaUniverse extends Universe` の classfile は `interfaces: 0` になる）。
-  nsc は `checkcast` を挟むが、こちらは `NoSuchMethodError` になる。
-  (b) 解析結果を `internal.reificationSupport.Syntactic*` 呼び出しに落とすこと。
-  (c) `c.Expr[T]` のようなパス依存型 — いまは `prelude_reflect.rs` が**空の `Context`** を
-  入れており、classpath 上の本物より優先されてしまう
+- **quasiquote の reification の残り**。`q"..."` はリテラル / 名前 / 選択 /
+  適用（カリー化含む）/ `$x` 穴 / 引数リスト 1 節ぶんの `..$xs` を
+  `internal.reificationSupport.Syntactic*` に落として実行できる
+  （`crates/typer/src/reify.rs`、実 scalac と dual-run 済み）。宣言クラスでの呼び出しも
+  済んでいて、`scala.reflect.runtime.universe` 上の Tree 構築は実際に走る。
+  残るのは `docs/macros.md` §7.5 の 5 つ:
+  (a) `tq` / `pq` / `cq` 全体、
+  (b) `q` の残りの形（ブロック / `new` / 関数リテラル / `if` / `match` / 型注釈 /
+  定義 / `this` / `super`）、
+  (c) `..$` と普通の引数の混在（`q"f(a, ..$xs)"`）、
+  (d) `Liftable`（`$x` の `x` が `Tree` でないとき nsc は implicit で持ち上げる。
+  `mapToImpl` は `$rTag` / `${c.prefix}` でこれを使う）、
+  (e) `c.Expr[T]` のようなパス依存型 — いまは `prelude_reflect.rs` が**空の `Context`** を
+  入れており、classpath 上の本物より優先されてしまう。マクロ実装の*中で*
+  quasiquote を書くにはこれが要る。
+  落とせない形は**すべて `unimplemented syntax: quasiquote ...` で診断する**
 - **`import <値>._` のスコープ**。プレフィクスが値のときの書き戻し
   (`term_import_prefixes`) はコンパイル単位をまたいで持ち越される。名前が
   そのクラスのメンバに解決できたときだけ使うので実害は見ていないが、

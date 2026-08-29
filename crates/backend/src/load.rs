@@ -16,6 +16,14 @@ pub struct LoadedClass {
     pub is_module: bool,
     pub methods: Vec<LoadedMethod>,
     pub pickle: Option<PickledClass>,
+    /// `ACC_INTERFACE`. A Scala trait compiles to an interface, and calling one
+    /// of its members needs `invokeinterface`, not `invokevirtual`.
+    pub is_interface: bool,
+    /// `super_class`, absent for `java/lang/Object` and for interfaces (whose
+    /// super is always `Object`).
+    pub super_name: Option<String>,
+    /// `interfaces`, in declaration order.
+    pub interfaces: Vec<String>,
 }
 
 use scala_rs_pickle::classfile::{parse_cp, skip_attrs, Cp, Cursor};
@@ -31,13 +39,23 @@ fn parse_classfile(bytes: &[u8]) -> Option<LoadedClass> {
     let _minor = c.u2()?;
     let _major = c.u2()?;
     let cp = parse_cp(&mut c)?;
-    let _access = c.u2()?;
+    let access = c.u2()?;
+    let is_interface = access & 0x0200 != 0;
     let this_i = c.u2()?;
     let internal_name = cp.class_name(this_i)?;
-    let _super = c.u2()?;
+    let super_i = c.u2()?;
+    let super_name = if super_i == 0 {
+        None
+    } else {
+        cp.class_name(super_i)
+    };
     let niface = c.u2()? as usize;
+    let mut interfaces = Vec::new();
     for _ in 0..niface {
-        let _ = c.u2()?;
+        let i = c.u2()?;
+        if let Some(n) = cp.class_name(i) {
+            interfaces.push(n);
+        }
     }
     let nfields = c.u2()? as usize;
     let mut is_module = false;
@@ -85,6 +103,9 @@ fn parse_classfile(bytes: &[u8]) -> Option<LoadedClass> {
         is_module,
         methods,
         pickle,
+        is_interface,
+        super_name,
+        interfaces,
     })
 }
 

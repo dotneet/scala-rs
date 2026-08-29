@@ -72,7 +72,7 @@ fn splice_placeholders(parts: &[String], nargs: usize) -> String {
     for i in 0..nargs {
         let raw = parts.get(i).map(String::as_str).unwrap_or("");
         out.push_str(strip_rank(raw));
-        out.push_str(&format!("qqHole{i}"));
+        out.push_str(&hole_name(i));
     }
     if let Some(last) = parts.get(nargs) {
         out.push_str(last);
@@ -107,6 +107,56 @@ fn wrap(kind: QuasiKind, body: &str) -> String {
 /// an `unimplemented syntax: quasiquote ...` diagnostic. An empty body is an
 /// error in nsc too (`q""` has nothing to build).
 pub(crate) fn check_body(kind: QuasiKind, parts: &[String], nargs: usize) -> Result<(), String> {
+    parse_program(kind, parts, nargs).map(|_| ())
+}
+
+/// The placeholder name standing in for hole `i`.
+pub(crate) fn hole_name(i: usize) -> String {
+    format!("qqHole{i}")
+}
+
+/// The hole a placeholder name stands for, if it is one.
+pub(crate) fn hole_index(name: &str) -> Option<usize> {
+    name.strip_prefix("qqHole")?.parse().ok()
+}
+
+/// The rank of each hole: `$x` is 0, `..$xs` is 1, `...$xss` is 2.
+///
+/// The dots are written at the *end of the part before* the hole, which is
+/// where the interpolation splits them off.
+pub(crate) fn hole_ranks(parts: &[String], nargs: usize) -> Vec<u8> {
+    (0..nargs)
+        .map(|i| {
+            let raw = parts.get(i).map(String::as_str).unwrap_or("");
+            if raw.ends_with("...") {
+                2
+            } else if raw.ends_with("..") {
+                1
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// Parse the body of a quasiquote, with each hole standing as `qqHole<i>`.
+///
+/// `Err(reason)` names the syntax scala-rs could not parse, for an
+/// `unimplemented syntax: quasiquote ...` diagnostic. An empty body is an
+/// error in nsc too (`q""` has nothing to build).
+pub(crate) fn parse_body(kind: QuasiKind, parts: &[String], nargs: usize) -> Result<Tree, String> {
+    let program = parse_program(kind, parts, nargs)?;
+    unwrap_body(kind, &program).ok_or_else(|| {
+        format!(
+            "the body of {}\"...\" is not one reification takes apart yet",
+            kind.prefix()
+        )
+    })
+}
+
+/// Parse the wrapper program around the body. Shared by the checker, which
+/// only wants to know whether it parsed, and by `parse_body`.
+fn parse_program(kind: QuasiKind, parts: &[String], nargs: usize) -> Result<Tree, String> {
     let body = splice_placeholders(parts, nargs);
     if body.trim().is_empty() {
         return Err("empty quasiquote".to_string());
@@ -123,7 +173,34 @@ pub(crate) fn check_body(kind: QuasiKind, parts: &[String], nargs: usize) -> Res
     if let Some(what) = first_unimplemented(&res.tree) {
         return Err(what);
     }
-    Ok(())
+    Ok(res.tree)
+}
+
+/// Dig the body back out of the program `wrap` built around it.
+fn unwrap_body(kind: QuasiKind, tree: &Tree) -> Option<Tree> {
+    let stats = match &tree.kind {
+        TreeKind::PackageDef { stats, .. } => stats,
+        _ => return None,
+    };
+    let probe = stats.iter().find_map(|s| match &s.kind {
+        TreeKind::ModuleDef { name, impl_, .. } if name == "qqProbe" => Some(impl_),
+        _ => None,
+    })?;
+    let member = probe.body.iter().find(|s| {
+        matches!(&s.kind, TreeKind::DefDef { name, .. } | TreeKind::TypeDef { name, .. }
+            if name == "qqBody")
+    })?;
+    match (kind, &member.kind) {
+        // `def qqBody = { <body> }`: the wrapper's own braces come back as a
+        // block, which is only a block of the quasiquote when the body really
+        // had several statements.
+        (QuasiKind::Term, TreeKind::DefDef { rhs, .. }) => Some(match &rhs.kind {
+            TreeKind::Block { stats, expr } if stats.is_empty() => (**expr).clone(),
+            _ => (**rhs).clone(),
+        }),
+        (QuasiKind::Type, TreeKind::TypeDef { rhs, .. }) => Some((**rhs).clone()),
+        _ => None,
+    }
 }
 
 /// The first `unimplemented syntax: ...` placeholder the parser left behind.
