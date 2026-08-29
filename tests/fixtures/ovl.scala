@@ -11,6 +11,13 @@ class Box[A](val value: A) {
 object Uses {
   def unwrap(s: Later.Scope): Int = s.get
   def name(n: Cfg.Names): String = n.get
+  // `Split.unapply` has no result type of its own, and it is declared further
+  // down; the pattern has to complete that signature before it can see that
+  // two sub-patterns come out of the `Option[(String, Int)]`.
+  def show(n: Node): String = n match {
+    case Split(op, arg) => op + "@" + arg
+    case _              => "?"
+  }
 }
 
 object Later {
@@ -57,6 +64,9 @@ class Op(val name: String) {
   def unapply(a: Node): Option[Int] = if (a.op eq this) Some(a.arg) else None
 }
 class Node(val op: Op, val arg: Int)
+object Split {
+  def unapply(n: Node) = Some((n.op.name, n.arg))
+}
 
 // `val ==` and the inherited `Any.==(x: Any)` are two alternatives; in value
 // position only the parameterless one survives, so `Library.==` is the `Op`.
@@ -88,5 +98,6 @@ object Main {
     println(Library.==.name)
     println(describe(new Node(Library.==, 42)))
     println(describe(new Node(Library.Not, 7)))
+    println(Uses.show(new Node(Library.Not, 7)))
   }
 }

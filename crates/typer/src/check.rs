@@ -8443,6 +8443,12 @@ impl Typer {
                 }
                 let unapply = self.find_unapply(fun);
                 let unapply_seq = self.find_unapply_seq(fun);
+                // `def unapply(n: Nd) = Some((n.v, n.tag))` has no result type
+                // of its own; without completing it the pattern would see
+                // `<notype>` and count one sub-pattern instead of two.
+                for u in unapply.iter().chain(unapply_seq.iter()) {
+                    self.complete_lazy_sig(*u, pat.span);
+                }
                 let use_ctor = !has_star
                     && class_id.is_some_and(|c| {
                         let s = self.st.get(c);

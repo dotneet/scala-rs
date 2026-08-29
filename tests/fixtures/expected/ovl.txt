@@ -10,3 +10,4 @@ string:0
 =
 eq 42
 not 7
+not@7
