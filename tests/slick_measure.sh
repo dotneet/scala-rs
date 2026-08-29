@@ -12,7 +12,13 @@ if [[ -z ${SCALA_RS:-} ]]; then
   cargo build -p scala-rs-cli --release >/dev/null 2>/tmp/slick_measure_build.log \
     || { cat /tmp/slick_measure_build.log; exit 1; }
 fi
-FILES=($(find $SRC/scala $SRC/scala-2 $COMPAT -name '*.scala' | sort))
+# slick keeps seven sources as FreeMarker templates that its own build
+# expands. Measuring without them reports errors scalac would report too, so
+# expand them here and compile them alongside.
+GEN=${SLICK_GEN:-$SP/generated}
+rm -rf $GEN
+python3 "$(dirname $0)/expand_fm.py" $SRC/scala $GEN >/dev/null
+FILES=($(find $SRC/scala $SRC/scala-2 $COMPAT $GEN -name '*.scala' | sort))
 OUT=${SLICK_OUT:-$SP/measure-out}
 rm -rf $OUT; mkdir -p $OUT
 $BIN compile "${FILES[@]}" -d $OUT -cp "$(cat $SP/deps.cp)" -Xsource:3 \
@@ -20,5 +26,5 @@ $BIN compile "${FILES[@]}" -d $OUT -cp "$(cat $SP/deps.cp)" -Xsource:3 \
 ERRORS=$(grep -c '^error' $SP/measure.txt || true)
 CLASSES=$(find $OUT -name '*.class' | wc -l | tr -d ' ')
 # Cascades inflate the raw count; files-with-errors is the honest progress metric.
-BADFILES=$(grep -A 2 '^error' $SP/measure.txt | grep -o 'src/main/[^:]*' | sort -u | wc -l | tr -d ' ')
+BADFILES=$(grep -A 2 '^error' $SP/measure.txt | grep -oE '(src/main|generated)/[^:]*' | sort -u | wc -l | tr -d ' ')
 echo "files=${#FILES[@]} errors=$ERRORS files_with_errors=$BADFILES classes=$CLASSES"

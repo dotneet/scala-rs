@@ -1364,6 +1364,14 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 
 ### Remaining
 
+- **slick の計測は `.fm` テンプレートを展開してから行う**。slick は `GetResult` /
+  `SetParameter` / `TupleSupport` など 7 本を FreeMarker テンプレートとして持ち、
+  ビルド時に生成します。生成せずに計測すると、その 7 本に依存する 7 ファイルが
+  「scalac でも落ちる」エラーを出すため、`tests/expand_fm.py` で展開して一緒に
+  コンパイルします（`tests/slick_measure.sh` が自動で実行）。この 7 本を含めた
+  時点で計測対象は 177 → 184 ファイルになり、エラー数も一段増えます（1371 → 2064）。
+  数字が増えたのは退行ではなく、計測が実際のコンパイル対象に追いついたためです。
+
 - **override 検査が無い**。`override` 修飾子の要否も、override 時の型適合も検査していない。
   scalac が拒否する次の 2 つを黙って通す:
   `trait T { def f: Int = 1 }; class D extends T { def f: Int = 2 }`（`override` 無し。
