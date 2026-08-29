@@ -212,5 +212,6 @@ conform!(
     const_narrow,
     setter_assign,
     case_lambda_arity,
-    tuple_fn_type
+    tuple_fn_type,
+    mutable_ops
 );

@@ -9260,6 +9260,39 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        // `Growable` / `Shrinkable` declare these once for every mutable
+        // collection; a concrete class inherits the interface default rather
+        // than overriding it, so the call is on the interface. `StringBuilder`
+        // is handled above: it has its own non-erased `addAll`.
+        if owner.starts_with("scala/collection/mutable/") {
+            match name {
+                "++=" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Growable",
+                        "$plus$plus$eq",
+                        "(Lscala/collection/IterableOnce;)Lscala/collection/mutable/Growable;",
+                    );
+                    return;
+                }
+                "-=" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Shrinkable",
+                        "$minus$eq",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Shrinkable;",
+                    );
+                    return;
+                }
+                "--=" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/Shrinkable",
+                        "$minus$minus$eq",
+                        "(Lscala/collection/IterableOnce;)Lscala/collection/mutable/Shrinkable;",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_stdlib_range(&owner) || is_stdlib_numeric_range(&owner) {
             if name == "mkString" {
                 asm.invokeinterface(

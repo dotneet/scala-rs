@@ -19,6 +19,7 @@ mod prelude_either;
 mod prelude_impl2;
 mod prelude_lang;
 mod prelude_lowbound;
+mod prelude_mutops;
 mod prelude_numconv;
 mod prelude_numeric;
 mod prelude_numops;
