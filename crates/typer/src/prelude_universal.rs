@@ -9,6 +9,19 @@ pub fn install(st: &mut SymbolTable) {
     if st.lookup_member(any, "##").is_empty() {
         prelude_method(st, any, "##", vec![], Type::Int, Intrinsic::AnyHash);
     }
+    // `"%d-%s".format(4, "z")` -- `StringOps.format(args: Any*)`.
+    if let Some(so) = crate::classpath::find_by_jvm(st, "scala/collection/StringOps") {
+        if st.lookup_member(so, "format").is_empty() {
+            prelude_method(
+                st,
+                so,
+                "format",
+                vec![Type::Repeated(Box::new(Type::Any))],
+                Type::String,
+                Intrinsic::StringFormat,
+            );
+        }
+    }
     let string = st.string_sym;
     // `java.lang.String` members the classpath does not supply because the
     // prelude owns `String` itself.

@@ -6284,6 +6284,17 @@ fn gen_apply(
                 asm.invokevirtual("java/lang/Object", "toString", "()Ljava/lang/String;");
                 return;
             }
+            Intrinsic::StringFormat => {
+                // `String.format(fmt, args)`: the receiver is the format.
+                gen_expr(asm, frame, ctx, qual);
+                emit_format_args(asm, frame, ctx, args);
+                asm.invokestatic(
+                    "java/lang/String",
+                    "format",
+                    "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
+                );
+                return;
+            }
             Intrinsic::AnyHash => {
                 gen_expr(asm, frame, ctx, qual);
                 emit_any_hash(asm, &qual.ty);
@@ -14650,4 +14661,19 @@ fn emit_any_hash(asm: &mut Assembler, recv: &Type) {
         }
     };
     asm.invokestatic("scala/runtime/Statics", name, desc);
+}
+
+/// Build the `Object[]` a `String.format` call takes, boxing as it goes.
+fn emit_format_args(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, args: &[Tree]) {
+    asm.iconst(args.len() as i32);
+    asm.anewarray("java/lang/Object");
+    for (i, a) in args.iter().enumerate() {
+        asm.dup();
+        asm.iconst(i as i32);
+        gen_expr(asm, frame, ctx, a);
+        if is_jvm_primitive(&a.ty) || matches!(a.ty, Type::Unit | Type::NoType) {
+            emit_box(asm, &a.ty);
+        }
+        asm.aastore();
+    }
 }
