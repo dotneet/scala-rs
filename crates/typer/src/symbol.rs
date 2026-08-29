@@ -1307,6 +1307,14 @@ impl SymbolTable {
             (Type::Applied { ctor, args }, other) => {
                 let folded = apply_type_ctor((**ctor).clone(), args.clone());
                 if let Type::Applied { ctor, .. } = &folded {
+                    // `type BaseColumnType[T] = JdbcType[T] & BaseTypedType[T]`
+                    // applied to `U` is that intersection, and conforms to
+                    // either half. Only an *abstract* member is stuck at its
+                    // upper bound.
+                    let expanded = self.expand_applied_hk_alias(folded.clone());
+                    if expanded != folded {
+                        return self.is_sub_type(&expanded, other);
+                    }
                     if let Type::TypeMember(id) = ctor.as_ref() {
                         if let Some(hi) = self.get(*id).bound_hi.clone() {
                             return self.is_sub_type(&hi, other);
@@ -1320,6 +1328,10 @@ impl SymbolTable {
             (other, Type::Applied { ctor, args }) => {
                 let folded = apply_type_ctor((**ctor).clone(), args.clone());
                 if matches!(folded, Type::Applied { .. }) {
+                    let expanded = self.expand_applied_hk_alias(folded.clone());
+                    if expanded != folded {
+                        return self.is_sub_type(other, &expanded);
+                    }
                     false
                 } else {
                     self.is_sub_type(other, &folded)

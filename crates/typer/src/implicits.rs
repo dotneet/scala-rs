@@ -102,7 +102,7 @@ impl Typer {
                 }
             }
         }
-        if !self.st.this_class.is_none() {
+        if !self.st.this_class.is_none() && !self.parent_ctor_scope {
             // Instance implicits on this class/module, walking parents (nsc
             // linearization is not reproduced; inheritance is).
             let mut work = vec![self.st.this_class];
