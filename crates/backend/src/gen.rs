@@ -728,6 +728,9 @@ fn checkcast_internal(st: &SymbolTable, ty: &Type) -> Option<String> {
         Type::Class { sym, .. } | Type::ModuleRef(sym) => Some(class_internal(st, *sym)),
         Type::String => Some("java/lang/String".into()),
         Type::Function { params, .. } => Some(format!("scala/Function{}", params.len())),
+        // `def show(p: (A, B))` erases to `show(Tuple2)`; the bridge from
+        // `show(Object)` has to checkcast, same as for any other class type.
+        Type::Tuple(ts) if !ts.is_empty() => Some(format!("scala/Tuple{}", ts.len())),
         Type::Named { name, .. } => Some(name.replace('.', "/")),
         _ => None,
     }

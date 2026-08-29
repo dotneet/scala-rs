@@ -14,6 +14,7 @@ mod prelude_arrconv;
 mod prelude_coll;
 mod prelude_conform;
 mod prelude_either;
+mod prelude_impl2;
 mod prelude_lang;
 mod prelude_lowbound;
 mod prelude_numeric;

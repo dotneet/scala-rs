@@ -17,14 +17,13 @@
 //!     itself is erased to return `Function1[A, A]`, not `<:<[A, A]` — it is
 //!     *not* usable as an `A <:< B` witness in real Scala either; real code
 //!     goes through `<:<.refl`. We mirror that: `$conforms` is declared with
-//!     its real signature (for source-compat / explicit calls) but implicit
-//!     search for `A <:< B` is resolved by a dedicated fallback in
-//!     `check.rs::conforms_witness_fallback`, which builds `<:<.refl[A]()`
-//!     directly whenever `A` actually is a subtype of `B` (checked with the
-//!     same `is_sub_type` the rest of the typer uses) rather than by making
-//!     `search_implicit` unify a polymorphic implicit def's own type params —
-//!     that unification step does not exist in this typer today (see comment
-//!     on `conforms_witness_fallback`).
+//!     its real signature (for source-compat / explicit calls) and `refl` is
+//!     flagged `implicit`, so the ordinary implicit search finds it. Fitting
+//!     it to the wanted type is the general polymorphic case
+//!     (`implicits.rs::implicit_solve`): `refl`'s own `[A]` binds from the
+//!     `From` position of `From <:< To`, and `<:<`'s declared variance
+//!     (`-From, +To`) then makes `A =:= A` conform to `A <:< To` exactly when
+//!     `A <: To` — the same derivation real scalac performs.
 //!
 //! Gated behind `library_abi`, exactly like `Either`/`Try`/`Using`: without a
 //! real scala-library on the classpath there is no private-runtime classfile
@@ -168,7 +167,16 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
     if crate::classpath::find_by_jvm(st, "scala/$less$colon$less$").is_none() {
         let less_mod = module(st, st.scala_pkg, "<:<", "scala/$less$colon$less$");
         let less_cls = st.module_class_of(less_mod);
-        let refl = st.alloc("refl", less_cls, SymKind::Method, Flags::FINAL, "");
+        // `refl` is the discoverable witness: implicit search unifies its own
+        // `[A]` against the wanted `From <:< To` / `From =:= To`
+        // (`implicits.rs::implicit_solve`), so no dedicated fallback is needed.
+        let refl = st.alloc(
+            "refl",
+            less_cls,
+            SymKind::Method,
+            Flags::FINAL.with(Flags::IMPLICIT),
+            "",
+        );
         let ra = type_param(st, refl, "A");
         st.get_mut(refl).tparams = vec![ra];
         st.get_mut(refl).ty = Type::Method {
@@ -182,12 +190,9 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
 
     // `Predef.$conforms[A]: A => A`, real erased signature (`Function1[A, A]`,
     // not `<:<[A, A]` — see module doc comment). Kept for source/bytecode
-    // compat with code that calls it explicitly; implicit search for
-    // `A <:< B` goes through `check.rs::conforms_witness_fallback` instead,
-    // since this typer's `search_implicit` can't unify a polymorphic implicit
-    // def's own `[A]` against the requested type (no `<:<`/`=:=`-shaped
-    // candidate would be found here even if `$conforms` were flagged
-    // implicit with a `<:<` return type).
+    // compat with code that calls it explicitly; it is deliberately *not*
+    // an implicit `<:<` witness (its result type isn't one), so implicit
+    // search for `A <:< B` lands on `<:<.refl` like real scalac's does.
     install_conforms_member(st);
 
     // `Option[A].orNull(implicit ev: Null <:< A): A`.
