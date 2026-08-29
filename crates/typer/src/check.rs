@@ -880,6 +880,30 @@ impl Typer {
             .collect()
     }
 
+    /// `productPrefix: String` and `productArity: Int`, the two `scala.Product`
+    /// members nsc synthesizes on every `case class` and `case object` without
+    /// needing the rest of `Product`. The backend folds both to constants.
+    fn synthesize_product_members(&mut self, class_id: SymbolId) {
+        for (name, ret) in [("productPrefix", Type::String), ("productArity", Type::Int)] {
+            if self
+                .st
+                .get(class_id)
+                .members
+                .iter()
+                .any(|&m| self.st.get(m).name == name)
+            {
+                continue;
+            }
+            let id = self
+                .st
+                .alloc(name, class_id, SymKind::Method, Flags::SYNTHETIC, "");
+            self.st.get_mut(id).ty = Type::Method {
+                paramss: vec![],
+                ret: Box::new(ret),
+            };
+        }
+    }
+
     fn synthesize_case_members(&mut self, class_id: SymbolId, name: &str) {
         let fields = self.st.get(class_id).ctor_fields.clone();
         let class_ty = Type::Class {
@@ -933,13 +957,7 @@ impl Typer {
         // Field types are not resolved yet at this point in the namer pass;
         // `type_class` re-syncs `copy`'s param types from the real ctor
         // signature and synthesizes `copy$default$N` there instead.
-        let _ = self.st.alloc(
-            "productArity",
-            class_id,
-            SymKind::Method,
-            Flags::SYNTHETIC,
-            "",
-        );
+        self.synthesize_product_members(class_id);
         // companion apply
         let companion = self
             .st
@@ -1015,6 +1033,12 @@ impl Typer {
         self.st.pop_scope();
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
+        // A `case object` is a `Product` too: nsc gives it `productPrefix` and
+        // `productArity` (0), both folded to constants by the backend.
+        if matches!(&tree.kind, TreeKind::ModuleDef { mods, .. } if mods.flags.contains(Flags::CASE))
+        {
+            self.synthesize_product_members(cls);
+        }
         if let TreeKind::ModuleDef { name, mods, .. } = &tree.kind {
             if name == "package" || mods.flags.contains(Flags::PACKAGE) {
                 let pkg = saved_owner;
@@ -4059,6 +4083,7 @@ impl Typer {
                 }
                 self.type_expr(rhs, &lhs.ty);
                 self.adapt(rhs, &lhs.ty);
+                self.check_reassignment(lhs);
                 tree.ty = Type::Unit;
             }
             TreeKind::Match { .. } => self.type_match(tree, pt),
@@ -11724,6 +11749,30 @@ impl Typer {
                 ret: Box::new(Type::NoType),
             },
         );
+    }
+
+    /// nsc's `reassignment to val`. Without it `d.v = 5` on a trait's `val`
+    /// type-checks and then fails at run time: the mixin setter a trait `val`
+    /// gets is not a setter a program may call.
+    fn check_reassignment(&mut self, lhs: &Tree) {
+        let id = lhs.sym;
+        if id.is_none() {
+            return;
+        }
+        let s = self.st.get(id);
+        // Only a term (a field or local) is an l-value here; a `Method` lhs is
+        // an already-resolved `x_=` setter or an unrelated resolution failure.
+        if s.kind != SymKind::Term || s.flags.contains(Flags::MUTABLE) {
+            return;
+        }
+        // Java fields carry no Scala mutability, and the compiler's own
+        // synthetic terms (`$outer`, capture fields, …) are written by the
+        // phases that create them.
+        if s.flags.contains(Flags::JAVA) || s.flags.contains(Flags::SYNTHETIC) {
+            return;
+        }
+        let name = s.name.clone();
+        self.error(lhs.span, format!("reassignment to val {name}"));
     }
 
     fn check_stored_annotations(&mut self, tree: &Tree) {

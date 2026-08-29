@@ -116,7 +116,9 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - view bounds `T <% Ordered[T]` / `T <% Ordered[Int]`（メソッド型パラメータ）と **クラス型パラメータ** `class C[A <% Ordered[A]](x: A)`。nsc と同様、implicit evidence `T => V`（クラスは primary ctor の extra implicit 節）へデシュガーする。evidence が無ければ `no implicit`。高階型パラメータの `F[_] <% V` は scalac 2.13.16 が全スペルを拒否する（`type F takes type parameters`）。同じ診断。Scala 3 的なエンコーディングはしない
 - `extends App` / `DelayedInit`。`object Main extends App { println(...) }` は nsc どおりコンストラクタ本体を `delayedInit` に移し、`App.main` から起動する。App なしで `DelayedInit` を継承する class も `delayedInit` フックを呼ぶ
 - **名前付き引数**（呼び出し側で並べ替え）。メソッド / コンパニオンの `apply` / case class の `copy` / **コンストラクタ `new C(b = 2, a = 1)`** / **オーバーロードのある呼び出し**、および可変長引数 （`def f(a: Int, rest: Int*)` の `f(a = 1)` / `f(a = 1, 2, 3)`）で動く。並べ替えは nsc の `NamesDefaults.removeNames` と同じ規則で、**自分の位置にある名前付き引数はそのあとの位置引数を許す**（`f(a = 1, 2)` は通り、`f(b = 1, 2)` は `positional after named argument.`）。オーバーロードは nsc と同じくまずパラメータ**名**で候補を絞り、名前だけで決まらないときに引数の型で決める。診断は実 scalac と同じ文面（`unknown parameter name: q` / `parameter 'c' is already specified at parameter position 2` / `positional after named argument.`）で、nsc と同様に 1 呼び出しにつき 1 件だけ出す（後続の「引数が足りない」等はカスケードなので出さない）
-- 具象メンバー付き trait の mixin（`T$class` 静的実装 + 線形化順のフォワーダ）。フォワーダは `class` と `object` の両方に出す
+- 具象メンバー付き trait の mixin（`T$class` 静的実装 + 線形化順のフォワーダ）。フォワーダは `class` と `object` の両方に出す。trait の `val` / `override val` / `var` の実行時表現は「Trait mixin」節
+- **case class / case object の合成メンバー**: case class は `toString` / `equals` / `hashCode` / `canEqual` / `productPrefix` / `productArity`。**case object** は module class 側に nsc と同じ定数畳み込みの `toString`（`Foo`。`Foo$@1a2b3c` ではない）/ `productPrefix` / `hashCode`（`"Foo".hashCode`）/ `productArity`（0）/ `canEqual` を出す。`equals` は nsc と同じくシングルトンの参照等価（`Object` 由来）のまま。手書きの定義があればそちらが勝つ。`scala.Product` を親に付けるところまでは実装していないので、`productElement` / `productIterator` はまだ無い
+- **`val` への再代入の診断**（`val x = 1; x = 2` も `d.v = 5`（trait の `val`）も nsc と同じ `reassignment to val`）。Java のフィールドとコンパイラ生成の synthetic な項は対象外
 - 内部クラス（`$outer`）とネストした object。匿名クラス `new Trait { def f = ... }` と `new { def x = 1 }`（合成 classfile。型は refinement ではなく `$anon$N`）
 - メソッド本体の中で定義したクラス（匿名クラス `new T { … }` と**ローカル `class` / `object`**）が、**囲みメソッドのパラメータ / ローカルをキャプチャ**する。nsc と同じ形で、自由変数ごとに `x$1` という public final フィールドと、末尾に付く追加のコンストラクタ引数を出す。各インスタンスメソッドの先頭でそのフィールドをローカルスロットに読み戻すので、キャプチャした `var` の `scala.runtime.*Ref` 経由の読み書きも、匿名クラス内のラムダによる二重キャプチャ（`$captured$N`）も、既存の経路のまま動く。メソッドの中のクラスにも `$outer` が付き、囲みクラスのメンバは `$outer` チェーンで読む
 - eta-expansion `foo _` と、FunctionN が期待される位置への未適用メソッド（`xs.map(inc)`）。ネストしたパラメータリストは **uncurry** で 1 リスト + クロージャになる。SIP-21 の SAM: ラムダ / 未適用メソッドを `Runnable` / `java.util.Comparator[Int]` / `java.util.function.Function[A,B]`（単一抽象メソッド）に適合。SAM でない型へは type mismatch（黙ってラップしない）。`def go(): Unit` を `_` なしで `Runnable` に渡すのは nsc と同じく auto-apply して mismatch。合成クラスは既存の anonfun と同じく invokedynamic は使わない
@@ -232,7 +234,11 @@ Java 6 には default method がないので、具象メンバー付き trait �
 
 `class C extends A with B` で A と B が同じ `msg` を持つとき、実行時は B です。線形化は Scala の C3 です（`C extends Base with A with B` → `C, B, A, Base`）。
 
-trait の `val` は interface 上の getter / `$init$set$` と、`T$class.$init$` で右辺を評価します。実装クラスがフィールドを持ち、コンストラクタが mixin `$init$` を（より一般的な親から）呼びます。`object O extends T` も同じで、フィールド・アクセサ・`$init$` 呼び出しをクラスと同じだけ出します。
+trait の `val` は interface 上の getter と **nsc と同じ名前の mixin setter `T$_setter_$v_$eq`**（パッケージ付きなら `p$q$T$_setter_$v_$eq`）で表し、`T$class.$init$` が右辺を評価してその setter を呼びます。実装クラスがフィールドを持ち、コンストラクタが mixin `$init$` を（より一般的な親から）呼びます。`object O extends T` も同じで、フィールド・アクセサ・`$init$` 呼び出しをクラスと同じだけ出します。
+
+`class D extends T { override val v = "d" }` は、nsc と同じく **mixin setter を空実装（`return` のみ）**にします。`D` は自分のフィールド・getter を持ち、`$init$` のあとにコンストラクタで自分の右辺を書くので、trait 側の初期化が override を上書きしません。
+
+trait の `var` は nsc どおり getter と**普通の setter `v_$eq`**（mixin setter ではない）です。抽象 `var n: Int` の場合も interface に `n()` と `n_$eq(I)` を出し、実装クラス側の `var n` がその両方を埋めます。trait 本体・実装クラス・外部（`d.n = 5`）のどこからの代入も、フィールドへの `putfield` ではなく `n_$eq` の `invokeinterface` にします（trait にフィールドは無いので `putfield` は `NoSuchFieldError` になる）。trait の `val` への代入は nsc どおり `reassignment to val` として診断します。
 
 スタック可能な trait の `abstract override` は、`T$class` 内の `super.m` を `T$$super$m`（実装クラスが線形化の次へフォワード）にします。`class C extends Base with A with B` で両方 `abstract override def msg` なら、実行時は `B-A-base` です。
 
@@ -882,6 +888,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/smallgaps` スライス（`@inline` / `@noinline` の配置、curried case class companion、companion への後方参照、`Option.flatMap` の多相性、`None`/`Some` の `lub`、`Iterable.apply`）のフィクスチャは接頭辞 `sgap`（`sgap` / `sgap_lib`）で、同じ理由から `crates/cli/tests/smallgaps.rs` に置いています。`sgap.scala` は `--no-scala-library` で `check` 済み、`sgap_lib.scala` は `Iterable.apply` が library ABI（`IterableFactory$Delegate.apply` の継承）にしか無いため library dual-run 専用（`fixtures_sgap_lib_without_library_is_error` で `--no-scala-library` が診断のまま残ることも見ています）。
 
+trait の `val` / `override val` / `var` の実行時表現と `case object` の合成メンバーのフィクスチャは接頭辞 `tval`（`tval` / `tval_bad`）で、同じ理由から `crates/cli/tests/traitval.rs` に置いています。`tval.scala` は私有ランタイム（`--no-scala-library`）と library dual-run の両方で走らせ、`expected/tval.txt` は **real scalac 2.13.16 の出力そのもの**です（3 モードがバイト単位で一致することを確認済み）。バイトコード側の不変条件も 2 本のテストで固定しています。`trait_val_setters_follow_nsc_names` は mixin setter が nsc と同じ `Named$_setter_$label_$eq` であること、`override val` したクラスのその setter が空実装（`putfield` なし）であること、trait の `var` への代入が `putfield` ではなく `count_$eq` 呼び出しであることを `javap -p -c` で見ます。`case_object_members_are_on_the_module_class` は `Asc$` に `toString` / `productPrefix` / `hashCode` / `productArity` が出ていることを見ます。`tval_bad.scala` は trait の `val` への代入が `reassignment to val` になることを固定します。
+
 jar の package object にある**型エイリアス**のフィクスチャは接頭辞 `pkgalias`（`pkgalias` / `pkgalias_bad`）で、同じ理由から `crates/cli/tests/pkgalias.rs` に置いています。`pkgalias.scala` は `scala` package object の pickle にしか無い別名（`NoSuchElementException` / `Throwable` / `UnsupportedOperationException` / `IllegalArgumentException` / `Exception` / `IterableOnce[A]` / `Seq[A]`）だけを使い、library dual-run 専用です（`pkgalias_without_library_is_diagnosed` で `--no-scala-library` では `not found: value NoSuchElementException` と診断されることも見ています）。`pkgalias_bad.scala` は package object が宣言していない名前が黙って通らないことを固定します。`expected/pkgalias.txt` は real scalac 2.13.16 の出力です。
 
 
@@ -1202,13 +1210,6 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   `type mismatch; found: 1  required: Byte` になる（`1.toByte` は通る）。ボックス型の分離
   とは独立の、定数型の narrowing の穴。
 
-- **trait の `val` をクラスが `override val` で上書きできない**。`trait T { val v = "v" }`
-  を `class D extends T { override val v = "d" }` で上書きすると、`D` に
-  `$init$set$v` が出ないので `T$class.$init$` から `AbstractMethodError` になる。
-  `$init$` は trait ごとに 1 本で全 `val` を代入する作りなので、「この実装クラスでは
-  この `val` の初期化を飛ばす」を表現できない。nsc は上書きされた `val` の初期化を
-  そもそも走らせない。`$init$` を実装クラスごとに分けるか、setter を no-op にしたうえで
-  右辺の評価も外す必要がある。
 - **テストハーネスの一時ディレクトリ衝突**（`cargo test --workspace` が不定期に落ちる）。
   `crates/cli/tests/{xsource3,imports,e2e,lang,...}.rs` の `tmp_dir(tag)` は
   `{tag}-{pid}-{nanos}` で名前を作るが、同じ fixture 名を tag に使うテストが
@@ -1222,14 +1223,14 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   `compile` に渡す）は通るが、先に emit した classfile を `-cp` 経由で読む別 run では
   `value describe is not a member of People` になる。pickle からメンバークラスの
   メンバを復元できていない（`$outer` 対応の前からある穴で、今回変えていない）。
-- **`case object` の `toString` / `equals` / `hashCode`**。`case object Foo` は
-  `Foo$@1a2b3c` を返す（scalac は `Foo`）。`emit_case_object_methods` は
-  `emit_class` からしか呼ばれず、module では走らない。case class 用に括弧つきの
-  文字列を組むコードなので、case object 用に単純名を返す分岐が要る。
-- **trait の `var` への代入**。`trait T { var n = 0 }` を実装クラスの側から
-  `n = n + 1` すると、setter を呼ばず trait の名前でフィールドへ `putfield` するので
-  `NoSuchFieldError: n` で落ちる。trait の `var` は interface 上の getter / setter の
-  ペアにして、代入を setter 呼び出しに落とす必要がある。
+- **`x.foo = v` の setter メソッド呼び出しへの書き換え**。`class C { def foo: Int = …;
+  def foo_=(x: Int): Unit = … }` に対する `c.foo = 4` は nsc なら `c.foo_=(4)` だが、
+  こちらは型検査を通したうえでフィールドへ `putfield` するので `NoSuchFieldError: foo`
+  で落ちる。refinement 型（`structural_select_lhs`）だけは書き換えている。
+- **`override` 修飾子と override 適合性の検査**。`class D extends T { val v = "d" }`
+  （`override` 無し）も `override val v: Int = 5`（親は `String`）も、nsc は
+  それぞれ `override modifier required` / `type mismatch` を出すが、こちらは黙って通す。
+  `val` に対する override 検査そのものが無い（`def` の `@Override` 検査だけがある）。
 - **implicit 探索の残り**: 多相 implicit のユニフィケーションと再帰導出、発散の打ち切り、nsc 相当の specificity は入った（「Implicit 解決」節）。残るのは (a) `xs.toMap` を `scala.collection.Iterable` にも載せること — pickle 供給が具象コレクション（`HashMap` / `ConstArray` …）に自前の `toMap` を付けるので、継承した 2 本目がオーバーロード衝突になる。いまは `List` / `Iterator` だけに宣言している、(b) 期待型からのメソッド型パラメータ推論が要る implicit（slick の `TypedType[T]` / `TypedType[P1]` はこちらで、implicit 探索ではなく `T` の推論が先に必要）、(c) 診断文面は nsc の複数行（`both … and … match expected type …`）ではなく 1 行のまま
 - **def マクロの展開**。`def f: T = macro Impl.method` は**パースして**バインディングを
   シンボル（`Symbol.macro_impl`）に記録し、マクロ def のバイトコードは nsc と同じく出さない。
@@ -1306,9 +1307,8 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 - placeholder の残り（より深い入れ子の完全再現。unary / Function2 / typed `_ : T` の必要形はこのスライスまで）
 - **implicit の導出**（`implicit def optShow[A](implicit s: Show[A]): Show[Option[A]]` のように、implicit パラメータを取る implicit def を型パラメータの単一化つきで再帰的に解決する形）。`implicit_provides` は今のところパラメータリストが空の implicit しか候補にしないので、`Show[Option[Int]]` は `no implicit` になる
 - **キャプチャしたクラスの JVM 名**（メソッドの中のクラスは nsc の `Outer$Inner$1` ではなく素の `Inner` / `$anon$N` として出る。既存の匿名クラスと同じ扱いで、同名のローカルクラスが 2 つあると衝突する）
-- **`val` への再代入の診断**（`val x = 1; x = 2` は今のところ通ってしまう。匿名クラスからのキャプチャでも同じ）
 - **`while` 本体で宣言したローカルの StackMapTable**（`while (c) { val s = …; … }` はループ先頭のフレームがそのスロットを含んでしまい `VerifyError: Instruction type does not match stack map` になる。匿名クラスとは無関係で、ループの外で `val` を束ねれば動く）
-- **case class の `toString` / `equals` / `hashCode`**（未実装。今は `Object` 由来の `ClassName@hash` と参照等価にフォールバックする。`copy` を実装した際に見つかった別の穴。case class の値を `println` したり `==` で比べたりするコードには影響する）
+- **`scala.Product` 本体**（case class / case object は `productPrefix` / `productArity` は持つが、`Product` を親に付けていないので `productElement` / `productIterator` / `productElementNames` は無く、`(x: Product)` にも渡せない）
 - **コンストラクタの省略可能引数のうち、先行する ctor パラメータを参照するデフォルト**（`class C(x: Int, y: Int = x + 1)`）。単純なリテラル / `null` のデフォルト（`class C(x: Int, y: Int = 5)` や slick の `SlickException(msg, parent: Throwable = null)`）は動く
 - **名前付き引数の残り**: (a) **prelude / classpath のメソッドはパラメータ名を持たない**ので、`List(1,2,3).mkString(sep = "-")` や jar・`-cp` 上の case class への `copy(name = …)` は `unimplemented syntax: named arguments (method parameters not resolved)` になる（scala-library の pickle からパラメータ名を読む経路も、prelude 手書きシグネチャの名前付けも未実装。同一コンパイル単位のメソッド・クラスなら全部動く）。(b) **複数引数リストのコンストラクタ** `class C(a: Int)(b: Int)` は名前付き引数以前に `new C(1)(2)` 自体が未対応（`value apply is not a member`）。(c) 名前と型が同一で順序だけ違うオーバーロード（`h(s: String, n: Int)` と `h(n: Int, s: String)`）は nsc なら `ambiguous reference to overloaded definition` だが、こちらは先に宣言された方を黙って選ぶ
 - **`--no-scala-library` での `x == null`（reference 型）**（`scala.runtime.BoxesRunTime.equals` を経由しないため、`x` が実際に `null` だと `Object.equals` の invokevirtual で `NullPointerException`。`--scala-library` 時は正しく動く）
