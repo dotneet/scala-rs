@@ -203,5 +203,6 @@ conform!(
     numeric_ops,
     extractor_bind,
     package_object,
-    val_extractor
+    val_extractor,
+    generic_case_class
 );

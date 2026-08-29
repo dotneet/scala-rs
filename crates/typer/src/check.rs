@@ -1608,9 +1608,12 @@ impl Typer {
                 Type::ModuleRef(c) => c,
                 _ => m,
             };
+            // nsc synthesizes `apply[A](a: A): Box[A]`, so `Box(1)` infers
+            // `A`. The class's own parameters stand in for the method's.
+            let tps = self.st.get(class_id).tparams.clone();
             let class_ty = Type::Class {
                 sym: class_id,
-                args: vec![],
+                args: tps.iter().map(|t| Type::TypeParam(*t)).collect(),
             };
             let unapply_ret = match ctor_param_tys.len() {
                 0 => Type::Boolean,
@@ -1626,11 +1629,13 @@ impl Typer {
             for mem in self.st.get(cls).members.clone() {
                 let n = self.st.get(mem).name.clone();
                 if n == "apply" {
+                    self.st.get_mut(mem).tparams = tps.clone();
                     self.st.get_mut(mem).ty = Type::Method {
                         paramss: vec![ctor_param_tys.to_vec()],
                         ret: Box::new(class_ty.clone()),
                     };
                 } else if n == "unapply" {
+                    self.st.get_mut(mem).tparams = tps.clone();
                     self.st.get_mut(mem).ty = Type::Method {
                         paramss: vec![vec![class_ty.clone()]],
                         ret: Box::new(unapply_ret.clone()),
@@ -2215,6 +2220,12 @@ impl Typer {
         }
         for m in self.st.get(class_id).members.clone() {
             if self.st.get(m).kind != SymKind::Method {
+                continue;
+            }
+            // nsc does not variance-check what it synthesized: `case class
+            // Box[+A](a: A)` is legal even though its `copy(a: A)` puts `A`
+            // in a contravariant position.
+            if self.st.get(m).flags.contains(Flags::SYNTHETIC) {
                 continue;
             }
             let name = self.st.get(m).name.clone();
