@@ -225,5 +225,6 @@ conform!(
     ctor_varargs,
     regex_extractor,
     tuple_ordering,
-    nested_value_class
+    nested_value_class,
+    fn_compose
 );

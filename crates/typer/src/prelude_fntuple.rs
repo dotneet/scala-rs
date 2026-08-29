@@ -39,6 +39,8 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
         let fun = function_class(st, n);
         if n >= 2 {
             add_tupled_and_curried(st, fun, n);
+        } else if n == 1 {
+            add_compose(st, fun, n);
         }
     }
     add_function_module(st);
@@ -103,6 +105,56 @@ fn add_tupled_and_curried(st: &mut SymbolTable, fun: SymbolId, n: usize) {
     }
     let c = method(st, fun, "curried", Vec::new(), curried_ty, Intrinsic::None);
     st.get_mut(c).flags = Flags::EMPTY;
+}
+
+/// `Function1.andThen` and `compose`. nsc declares them on `Function1` only,
+/// each with its own type parameter: `andThen[A](g: R => A): T1 => A` and
+/// `compose[A](g: A => T1): A => R`. Writing `Any` for `A` instead makes
+/// `compose` demand a function that accepts *anything*, which is the opposite
+/// of what it takes.
+fn add_compose(st: &mut SymbolTable, fun: SymbolId, n: usize) {
+    if n != 1 {
+        return;
+    }
+    let (args, ret) = tparam_types(st, fun);
+    let t1 = args[0].clone();
+    for name in ["andThen", "compose"] {
+        if !members_named(st, fun, name).is_empty() {
+            continue;
+        }
+        let m = method(st, fun, name, Vec::new(), Type::Any, Intrinsic::None);
+        let a = type_param(st, m, "A");
+        st.get_mut(m).tparams = vec![a];
+        let ta = Type::TypeParam(a);
+        let (param, result) = if name == "andThen" {
+            (
+                Type::Function {
+                    params: vec![ret.clone()],
+                    ret: Box::new(ta.clone()),
+                },
+                Type::Function {
+                    params: vec![t1.clone()],
+                    ret: Box::new(ta),
+                },
+            )
+        } else {
+            (
+                Type::Function {
+                    params: vec![ta.clone()],
+                    ret: Box::new(t1.clone()),
+                },
+                Type::Function {
+                    params: vec![ta],
+                    ret: Box::new(ret.clone()),
+                },
+            )
+        };
+        st.get_mut(m).ty = Type::Method {
+            paramss: vec![vec![param]],
+            ret: Box::new(result),
+        };
+        st.get_mut(m).flags = Flags::EMPTY;
+    }
 }
 
 /// `object Function` with nsc's four `untupled` overloads. They share a name
