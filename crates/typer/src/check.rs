@@ -1961,7 +1961,10 @@ impl Typer {
                             };
                             // The bound is stated in the parent's terms, so a
                             // sibling member it mentions (`type B[T] <: C[T]`)
-                            // must be re-read as the child implements it.
+                            // must be re-read as the child implements it, and
+                            // a `this.type` in it (`type Self >: this.type`)
+                            // means *the child's* `this` at the override site.
+                            let t = t.map(|t| retarget_this(&t, class_id));
                             t.map(|t| st.expand_type_members(class_id, &t))
                         };
                         let parent_hi = align(&self.st, self.st.get(m).bound_hi.clone());
@@ -3143,6 +3146,18 @@ impl Typer {
         }
         match self.pick_ctor(class_id, &arg_tys, None) {
             OverloadPick::Found(sym, param_tys, _) => {
+                // `class Sub[T](y: T) extends Base[T](y)`: the constructor's
+                // parameters are stated in `Base`'s own `T`. Check the
+                // arguments at the type arguments the `extends` clause
+                // actually wrote -- otherwise both sides of the mismatch
+                // print `T` and neither one is the other.
+                let param_tys: Vec<Type> = match &class_ty {
+                    Type::Class { args: targs, .. } if !targs.is_empty() => param_tys
+                        .iter()
+                        .map(|p| self.st.subst_tparams(class_id, targs, p))
+                        .collect(),
+                    _ => param_tys,
+                };
                 for (i, a) in args.iter_mut().enumerate() {
                     if let Some(p) = param_tys.get(i) {
                         if !p.is_no_type() {
@@ -11584,6 +11599,25 @@ impl Typer {
                     false
                 }
             }
+            // `type Self >: this.type <: Node`: the declaration says
+            // `this.type <: Self`, so `this` conforms to `Self` even though
+            // `Node` does not. Only the *lower* bound admits this, and only a
+            // tree that really is that singleton -- `def id: Self = someNode`
+            // still fails.
+            Type::TypeMember(id) => {
+                let Some(lo) = self.st.get(*id).bound_lo.clone() else {
+                    return false;
+                };
+                if lo.is_no_type() || lo.is_error() || matches!(lo, Type::Nothing) {
+                    return false;
+                }
+                if self.st.is_sub_type(&tree.ty, &lo) || self.adapt_singleton(tree, &lo) {
+                    tree.ty = pt.clone();
+                    true
+                } else {
+                    false
+                }
+            }
             Type::Annotated { tpe, .. } => {
                 if self.st.is_sub_type(&tree.ty, tpe) || self.adapt_singleton(tree, tpe) {
                     tree.ty = pt.clone();
@@ -13389,6 +13423,26 @@ fn dedup_diags(diags: &mut Vec<Diagnostic>) {
 /// `def f[T](a: Inv[T]) = g(a)` into a check of `Inv[T]` against `Inv[Any]`:
 /// a mismatch for every invariant class, and a silent widening for every
 /// covariant one.
+/// Re-read a parent's `this.type` as the overriding class's own.
+///
+/// `trait Nd { type Self >: this.type <: Nd }` overridden by
+/// `class Leafy extends Nd { type Self = Leafy }` has to compare `Leafy`
+/// against `Leafy.this.type`, not against `Nd.this.type`.
+fn retarget_this(ty: &Type, cls: SymbolId) -> Type {
+    match ty {
+        Type::ThisType(_) => Type::ThisType(cls),
+        Type::Class { sym, args } => Type::Class {
+            sym: *sym,
+            args: args.iter().map(|a| retarget_this(a, cls)).collect(),
+        },
+        Type::Refined { parents, decls } => Type::Refined {
+            parents: parents.iter().map(|p| retarget_this(p, cls)).collect(),
+            decls: decls.clone(),
+        },
+        _ => ty.clone(),
+    }
+}
+
 fn relax_open_tparams(ty: &Type, open: &[SymbolId]) -> Type {
     let is_open = |a: &Type| matches!(a, Type::TypeParam(id) if open.contains(id));
     match ty {

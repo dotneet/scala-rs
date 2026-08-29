@@ -21,6 +21,20 @@ class Sub[A](n: String) extends Leaf[A, NoStream, Eff](n) {
   override def label: String = "sub(" + super.label + ")"
 }
 
+// A super-constructor call whose parameter is stated in the *parent's* type
+// parameter, applied at the argument the `extends` clause writes.
+class Base[T](val x: T)
+class Wrap[T](y: T) extends Base[T](y)
+
+// `type Self >: this.type <: Node` declares `this.type <: Self`, so `this`
+// conforms to `Self` even though `Node` does not.
+trait Nd {
+  type Self >: this.type <: Nd
+  def tag: String
+  def id: Self = this
+}
+class Leafy(val tag: String) extends Nd { type Self = Leafy }
+
 object Mism {
   // A method type parameter is inferred from an argument whose type mentions
   // the *caller's* type parameter: `A` is `Inv[T]`, not `Inv[Any]`.
@@ -73,5 +87,7 @@ object Main {
     println(Mism.annotated(x => x))
     println(Mism.useFn(Mism.ident).value)
     println(new Sub[Int]("s").label)
+    println(new Wrap[String]("w").x)
+    println(new Leafy("leaf").id.tag)
   }
 }

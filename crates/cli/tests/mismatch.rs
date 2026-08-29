@@ -223,6 +223,48 @@ fn super_is_seen_from_the_subclass() {
     );
 }
 
+/// A super-constructor call in an `extends` clause: the parent's parameters
+/// are stated in the parent's own type parameter, and have to be read at the
+/// arguments the clause writes.
+#[test]
+fn parent_constructor_arguments_use_the_extends_clauses_arguments() {
+    accepts(
+        "mism_parent_ctor",
+        "import scala.reflect.ClassTag\n\
+         class Base[T](val x: T)\n\
+         class Sub[T](y: T) extends Base[T](y)\n\
+         class SBT[T](implicit val ct: ClassTag[T], val ord: Ordering[T])\n\
+         class ESBT[T](implicit val c2: ClassTag[T]) extends SBT[T]()(c2, null)\n",
+    );
+}
+
+/// `type Self >: this.type <: Nd` declares `this.type <: Self`, so `this`
+/// conforms to `Self`. An arbitrary `Nd` still does not.
+#[test]
+fn this_conforms_to_a_member_bounded_below_by_this_type() {
+    accepts(
+        "mism_self_member",
+        "trait Nd {\n\
+         \x20 type Self >: this.type <: Nd\n\
+         \x20 def id: Self = this\n\
+         }\n\
+         class Leafy extends Nd { type Self = Leafy }\n",
+    );
+    let err = diagnostics_of(
+        "mism_self_member_bad",
+        "trait Nd {\n\
+         \x20 type Self >: this.type <: Nd\n\
+         \x20 def other(n: Nd): Self = n\n\
+         }\n",
+    );
+    if !err.is_empty() {
+        assert!(
+            err.contains("type mismatch"),
+            "an arbitrary Nd must not conform to Self, got:\n{err}"
+        );
+    }
+}
+
 /// The collection hierarchy, with its type arguments threaded through.
 #[test]
 fn collections_conform_to_their_supertypes() {
