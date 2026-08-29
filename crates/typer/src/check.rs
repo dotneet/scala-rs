@@ -7050,12 +7050,13 @@ impl Typer {
                     {
                         fun.sym = sym;
                         tree.sym = sym;
+                        let own = (!sym.is_none()).then(|| self.st.get(sym).tparams.clone());
                         for (i, a) in args.iter_mut().enumerate() {
                             let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                             if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type() {
                                 self.type_expr(a, &p);
                             }
-                            let p = relax_open_tparams(&p);
+                            let p = relax_open_tparams(&p, own.as_deref());
                             if !p.is_no_type() {
                                 self.adapt(a, &p);
                             }
