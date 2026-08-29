@@ -222,5 +222,6 @@ conform!(
     universal_hash,
     any_on_function,
     null_reference,
-    ctor_varargs
+    ctor_varargs,
+    regex_extractor
 );

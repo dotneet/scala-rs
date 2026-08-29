@@ -29,6 +29,7 @@ mod prelude_numeric;
 mod prelude_numops;
 mod prelude_oshadow;
 mod prelude_reflect;
+mod prelude_regex;
 mod prelude_seq;
 mod prelude_sgap;
 mod prelude_text;
