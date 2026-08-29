@@ -31,6 +31,7 @@ mod prelude_oshadow;
 mod prelude_reflect;
 mod prelude_seq;
 mod prelude_sgap;
+mod prelude_strhier;
 mod prelude_text;
 mod prelude_tuple;
 mod prelude_universal;

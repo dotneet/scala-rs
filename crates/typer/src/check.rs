@@ -262,6 +262,7 @@ pub fn typecheck_units(
     t.fatal_warnings = opts.fatal_warnings;
     crate::classpath::install_classpath(&mut t.st, &opts.classpath);
     t.link_tuple_products();
+    t.link_string_parents();
     t.defer_default_rhs = true;
     for (tree, file_index) in units.iter_mut() {
         t.file_index = *file_index;
@@ -2380,6 +2381,13 @@ impl Typer {
                 if Some(m) == alias {
                     continue;
                 }
+                // A `private[this]` member is not inherited at all: a bare
+                // constructor parameter is one, so `class B(st: Int) extends
+                // A(…)` where `A` also takes an `st` sees only its own.
+                let f = self.st.get(m).flags;
+                if f.contains(Flags::PRIVATE) && f.contains(Flags::LOCAL) {
+                    continue;
+                }
                 self.st.enter_in_current(&n, m);
             }
             work.extend(self.st.get(pid).parents.clone());
@@ -3566,6 +3574,10 @@ impl Typer {
             .into_iter()
             .filter(|&id| Some(id) != skip)
             .filter(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)
+            // Constructors are not inherited (see `sole_own_ctor`): a parent's
+            // `<init>` that `lookup_member` walks into is not an alternative
+            // of this class's own.
+            .filter(|&id| self.st.get(id).owner == class_id)
             .collect();
         if alts.is_empty() {
             return OverloadPick::None;
@@ -4997,6 +5009,10 @@ impl Typer {
     fn bind_found(&mut self, tree: &mut Tree, mut found: Vec<SymbolId>, pt: &Type) {
         found.sort_by_key(|s| s.0);
         found.dedup();
+        // The template scope holds a class's own members next to the inherited
+        // ones, so `val symbolName` and the `def symbolName` it implements both
+        // answer to the name. An override is one member, not an overload.
+        found = self.drop_overridden(found);
         let ref_span = tree.span;
         for s in found.iter().copied() {
             self.complete_lazy_sig(s, ref_span);
@@ -5798,9 +5814,38 @@ impl Typer {
                         args: vec![],
                     };
                     self.st.is_sub_type(&child, &parent)
+                        // Inheriting is not overriding: nsc keeps `f(Int)`
+                        // declared on the parent as an alternative of `f`
+                        // alongside a `f(String)` the subclass adds. Only a
+                        // *matching* signature replaces the inherited one.
+                        && self.same_signature(other, s)
                 })
             })
             .collect()
+    }
+
+    /// nsc `matchingSymbols`: does `sub` override `base`? Both are members of
+    /// the same name, so what decides it is the parameter list. A
+    /// parameterless `val` matches a nullary `def` (that is how `override val
+    /// sqlType` implements `def sqlType: Int`).
+    fn same_signature(&self, sub: SymbolId, base: SymbolId) -> bool {
+        let sub_ps = flat_param_types(&self.st.get(sub).ty);
+        let base_ps = flat_param_types(&self.st.get(base).ty);
+        if sub_ps.len() != base_ps.len() {
+            return false;
+        }
+        // The parent declares its members in its own type parameters; a member
+        // seen from the subclass has them substituted away. Rather than
+        // reconstructing the prefix here, a parameter mentioning a type
+        // parameter matches anything -- an overload that differs only inside a
+        // type parameter is not one nsc can distinguish either.
+        sub_ps.iter().zip(&base_ps).all(|(a, b)| {
+            a == b
+                || a.is_no_type()
+                || b.is_no_type()
+                || sig_has_abstract_type(a)
+                || sig_has_abstract_type(b)
+        })
     }
 
     fn access_from_name(&self) -> String {
@@ -12348,6 +12393,18 @@ impl Typer {
         crate::prelude_genrep::link_tuple_products(&mut self.st);
     }
 
+    /// `java.lang.String` implements `CharSequence`, `Comparable<String>` and
+    /// `Serializable`; the prelude declares it with `AnyRef` alone. Unlike the
+    /// tuples above these are JDK classes, so this runs in both library modes.
+    fn link_string_parents(&mut self) {
+        for jvm in crate::prelude_strhier::STRING_PARENTS {
+            let pkg = jvm.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            let owner = crate::classpath::ensure_package(&mut self.st, pkg);
+            self.load_binary_into(jvm, owner, Span::new(0, 0), false);
+        }
+        crate::prelude_strhier::link_string_parents(&mut self.st);
+    }
+
     fn load_binary_into(
         &mut self,
         internal: &str,
@@ -14373,6 +14430,36 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
         out.push(conv);
     }
     out
+}
+
+/// Every parameter of a member, clauses flattened. A `val`/`var` (any
+/// non-method type) is parameterless, like a nullary `def`.
+fn flat_param_types(ty: &Type) -> Vec<Type> {
+    match ty {
+        Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `ty` mentions a type parameter or an abstract type member, i.e.
+/// whether it reads differently depending on the prefix it is seen from.
+fn sig_has_abstract_type(ty: &Type) -> bool {
+    match ty {
+        Type::TypeParam(_) | Type::TypeMember(_) => true,
+        Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
+            args.iter().any(sig_has_abstract_type)
+        }
+        Type::Applied { ctor, args } => {
+            sig_has_abstract_type(ctor) || args.iter().any(sig_has_abstract_type)
+        }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            sig_has_abstract_type(t)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(sig_has_abstract_type) || sig_has_abstract_type(ret)
+        }
+        _ => false,
+    }
 }
 
 fn split_repeated(params: &[Type]) -> (&[Type], Option<&Type>) {
