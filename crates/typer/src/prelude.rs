@@ -696,6 +696,8 @@ fn add_scala_aliases(st: &mut SymbolTable, library_abi: bool) {
     crate::prelude_conform::install(st, library_abi);
     // Needs `<:<` (installed just above) and `Map`.
     crate::prelude_impl2::install(st, library_abi);
+    // `Map[K, V] <: K => V`。階層表のあとに張る。
+    crate::prelude_mism4::install(st);
     // `Coll.empty` は最後にまとめて多相化する（すべての companion が揃ってから）。
     crate::prelude_empty::install(st);
 }

@@ -1484,10 +1484,22 @@ impl Typer {
                 return changed;
             }
         };
+        // Every import in the body first, then the aliases, then the nested
+        // templates: resolving a nested template's parent clause can complete
+        // one of this template's type aliases, and the alias's right-hand side
+        // is written in this unit's vocabulary. The header pass exists only to
+        // resolve parents and its diagnostics are dropped, so hoisting the
+        // imports above the templates that follow them costs nothing.
+        for stt in body.iter_mut() {
+            if matches!(stt.kind, TreeKind::Import { .. }) {
+                self.type_import(stt);
+            }
+        }
+        self.refresh_alias_sigs(body);
         for stt in body.iter_mut() {
             if matches!(
                 stt.kind,
-                TreeKind::Import { .. } | TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+                TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
             ) {
                 changed |= self.parents_pass(stt, ctors);
             }
@@ -8426,13 +8438,41 @@ impl Typer {
                                     Type::Class { sym, args } if args.len() == 1 => Some(*sym),
                                     _ => None,
                                 };
-                                let cls = declared.or_else(|| {
-                                    recv_ty
-                                        .as_ref()
-                                        .and_then(|t| self.st.class_sym_of(t))
-                                        .map(|c| self.collection_root(c))
-                                        .filter(|&c| self.takes_one_type_parameter(c))
-                                });
+                                let recv_cls = recv_ty
+                                    .as_ref()
+                                    .and_then(|t| self.st.class_sym_of(t))
+                                    .map(|c| self.collection_root(c))
+                                    .filter(|&c| self.takes_one_type_parameter(c));
+                                let cls = match (recv_cls, declared) {
+                                    // `IndexedSeq` does not redeclare `map`, so
+                                    // the declaration it inherits says `Seq[B]`
+                                    // -- but the real signature returns the
+                                    // receiver's own type constructor
+                                    // (`IterableOps.CC[B]`), and
+                                    // `xs.toSeq.map(f)` on an `IndexedSeq` is an
+                                    // `IndexedSeq`. Only a `scala.collection`
+                                    // class gets that: a user class that merely
+                                    // extends `Seq` inherits `Seq`'s `CC` and
+                                    // really does map to a `Seq`.
+                                    (Some(r), Some(d))
+                                        if r != d
+                                            && self.maps_to_own_class(r)
+                                            && self
+                                                .base_type_instance(
+                                                    &Type::Class {
+                                                        sym: r,
+                                                        args: vec![],
+                                                    },
+                                                    d,
+                                                    0,
+                                                )
+                                                .is_some() =>
+                                    {
+                                        Some(r)
+                                    }
+                                    (_, Some(d)) => Some(d),
+                                    (r, None) => r,
+                                };
                                 if let Some(cls) = cls {
                                     ret = Type::Class {
                                         sym: cls,
@@ -8781,6 +8821,13 @@ impl Typer {
     /// would lose two arguments -- so its declared result type stands.
     fn takes_one_type_parameter(&self, cls: SymbolId) -> bool {
         self.st.get(cls).tparams.len() == 1
+    }
+
+    /// A `scala.collection` class whose real `map` returns its own type
+    /// constructor. `Range` (no type parameter of its own) and a user class
+    /// that extends one of these are not among them.
+    fn maps_to_own_class(&self, cls: SymbolId) -> bool {
+        self.st.get(cls).jvm_name.starts_with("scala/collection/")
     }
 
     fn collection_root(&self, id: SymbolId) -> SymbolId {
@@ -10872,6 +10919,17 @@ impl Typer {
         if let Type::Repeated(inner) = param {
             return self.arg_score(arg, inner);
         }
+        // `scala.FunctionN[T1, …, R]` *is* the function type. A signature read
+        // back from a pickle spells a function parameter as the class
+        // (`reduceLeft[B >: A](op: Function2[B, A, B])`), and the
+        // function-against-function rule below has to see it: a literal whose
+        // parameters are not inferred yet would otherwise be inapplicable to
+        // every such method.
+        if let Type::Class { sym, args } = param {
+            if let Some(f) = self.st.function_class_shape(*sym, args) {
+                return self.arg_score(arg, &f);
+            }
+        }
         if let Type::Method { paramss, ret } = arg {
             let f = Type::Function {
                 params: paramss.iter().flatten().cloned().collect(),
@@ -11067,6 +11125,18 @@ impl Typer {
     }
 
     fn type_function(&mut self, vparams: &mut Vec<Tree>, body: &mut Tree, pt: &Type) -> Type {
+        // A `scala.FunctionN[T1, …, R]` *class* is the function type. The
+        // prelude writes function parameters structurally, but a signature read
+        // back from a pickle spells them as the class
+        // (`IterableOnceOps.reduceLeft[B >: A](op: Function2[B, A, B]): B`), and
+        // a literal passed to one of those was left with no parameter types at
+        // all: `xs.reduceLeft[Node]((a, b) => …)` reported
+        // `no matching overload … with arguments ((<notype>, <notype>) => <notype>)`.
+        let as_fn = match pt {
+            Type::Class { sym, args } => self.st.function_class_shape(*sym, args),
+            _ => None,
+        };
+        let pt = as_fn.as_ref().unwrap_or(pt);
         // Only a `{ case … }` literal inhabits a `PartialFunction`; the parser
         // encodes one as `x$pf => x$pf match { … }`. A total function literal
         // must still be rejected, the way nsc rejects
@@ -11391,7 +11461,7 @@ impl Typer {
                 // scrutinee would reject it for no runtime reason.
                 let pt = match sel_ty.widen_constant() {
                     Type::Byte | Type::Short | Type::Char => Type::Int,
-                    _ => sel_ty.clone(),
+                    _ => relax_abstract_targs(sel_ty),
                 };
                 self.type_expr(pat, &pt);
             }
@@ -11492,13 +11562,26 @@ impl Typer {
                     pat.sym = u;
                     pat.ty = sel_ty.clone();
                 } else if let Some(u) = unapply_seq {
+                    // `case Seq((s, _))` on a `Seq[(TermSymbol, Node)]` binds
+                    // `s: TermSymbol`. Only `List` was read off the scrutinee;
+                    // every other sequence kept `unapplySeq`'s own `A`, so
+                    // `Some(s)` came out a `Some[A]`. Unify the extractor's
+                    // parameter with the scrutinee, exactly as the `unapply`
+                    // branch above does -- a custom `unapplySeq` whose element
+                    // type is not one of its type parameters is left alone.
                     let elem = match sel_ty {
                         Type::Class { sym, args }
                             if *sym == self.st.list_sym && !args.is_empty() =>
                         {
                             args[0].clone()
                         }
-                        _ => self.unapply_seq_elem_type(u),
+                        _ => {
+                            let own = self.unapply_seq_elem_type(u);
+                            self.subst_unapply_tparams(u, sel_ty, vec![own.clone()])
+                                .into_iter()
+                                .next()
+                                .unwrap_or(own)
+                        }
                     };
                     let n = args.len();
                     for (i, a) in args.iter_mut().enumerate() {
@@ -14076,21 +14159,72 @@ impl Typer {
         true
     }
 
+    /// The class a `This` tree stands for derives from `cls`.
+    fn this_derives_from(&self, tree: &Tree, cls: SymbolId) -> bool {
+        if cls.is_none() || !matches!(&tree.kind, TreeKind::This { .. }) {
+            return false;
+        }
+        let here = if tree.sym.is_none() {
+            self.st.class_sym_of(&tree.ty).unwrap_or(SymbolId::NONE)
+        } else {
+            tree.sym
+        };
+        !here.is_none()
+            && self
+                .base_type_instance(&self.st.self_type_of_class(here), cls, 0)
+                .is_some()
+    }
+
+    /// `adapt_singleton` without the side effect, for the compound arm: a
+    /// parent may hold on its own without the whole type being adopted.
+    fn can_adapt_singleton(&self, tree: &Tree, pt: &Type) -> bool {
+        let mut probe = Tree {
+            id: tree.id,
+            span: tree.span,
+            kind: TreeKind::This { qual: None },
+            ty: tree.ty.clone(),
+            sym: tree.sym,
+            postfix: false,
+        };
+        if !matches!(&tree.kind, TreeKind::This { .. }) {
+            return false;
+        }
+        self.adapt_singleton(&mut probe, pt)
+    }
+
     fn adapt_singleton(&self, tree: &mut Tree, pt: &Type) -> bool {
         match pt {
             Type::ThisType(cls) => {
                 if !matches!(&tree.kind, TreeKind::This { .. }) {
                     return false;
                 }
+                // A `this.type` written in a *parent* is this class's `this`
+                // once it is read here: `type Self >: this.type <: Node`
+                // declared by `Node` means `NullaryNode.this.type` inside
+                // `trait NullaryNode extends Node`, so
+                // `def mapChildren(…): Self = this` is right. Only a `This`
+                // tree gets this -- an ordinary value of the class does not.
                 let ok = tree.sym == *cls
                     || matches!(
                         &tree.ty,
                         Type::Class { sym, .. } | Type::ModuleRef(sym) if *sym == *cls
-                    );
+                    )
+                    || self.this_derives_from(tree, *cls);
                 if ok {
                     tree.ty = pt.clone();
                 }
                 ok
+            }
+            // `Node.Self with DefNode`: each parent has to hold, and the
+            // `this.type` half holds the way the arm above says.
+            Type::Refined { parents, decls } if decls.is_empty() && !parents.is_empty() => {
+                let all = parents
+                    .iter()
+                    .all(|p| self.st.is_sub_type(&tree.ty, p) || self.can_adapt_singleton(tree, p));
+                if all {
+                    tree.ty = pt.clone();
+                }
+                all
             }
             Type::SingleType { sym, .. } => {
                 if tree.sym == *sym {
@@ -14988,6 +15122,33 @@ fn unwrap_fn0_or_byname(ty: &Type) -> Type {
         Type::ByName(t) => (**t).clone(),
         Type::Function { params, ret } if params.is_empty() => (**ret).clone(),
         other => other.clone(),
+    }
+}
+
+/// The scrutinee of a stable-identifier pattern, with everything it does not
+/// yet know replaced by `_`.
+///
+/// `case ScalaBaseType.byteType =>` inside `def f[T](t: ScalaType[T])` compares
+/// a `ScalaNumericType[Byte]` with a `ScalaType[T]`. nsc accepts it -- `T`
+/// *could* be `Byte`, and the pattern is only an `==` at run time -- so a
+/// scrutinee that still names a type parameter or an abstract type member
+/// rules nothing out. Only the arguments are relaxed: the head class still has
+/// to line up.
+fn relax_abstract_targs(ty: &Type) -> Type {
+    fn relax(t: &Type) -> Type {
+        match t {
+            Type::TypeParam(_) | Type::TypeMember(_) => Type::Wildcard,
+            _ => relax_abstract_targs(t),
+        }
+    }
+    match ty {
+        Type::Class { sym, args } if !args.is_empty() => Type::Class {
+            sym: *sym,
+            args: args.iter().map(relax).collect(),
+        },
+        Type::Tuple(ts) if !ts.is_empty() => Type::Tuple(ts.iter().map(relax).collect()),
+        Type::Array(t) => Type::Array(Box::new(relax(t))),
+        _ => ty.clone(),
     }
 }
 

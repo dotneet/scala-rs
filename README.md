@@ -1221,6 +1221,140 @@ nsc は**囲いのクラスすべて**について規則を判定するので、
 **833 → 772**、`type mismatch` は **201 → 168**、エラーを含むファイルは
 **102 → 100** になりました。新たにエラーを出すようになったファイルはありません。
 
+### 早すぎたエイリアス完了と `FunctionN`（`type mismatch` 第 4 スライス）
+
+`agent/mismatch4` スライス。フィクスチャは `tests/fixtures/mism4*.scala`、テストは
+`crates/cli/tests/mismatch4.rs` です。6 つの原因を直しました。
+
+**1. 遅延完了した型エイリアスがそのファイルの import を見ていなかった**（最大の塊）。
+型エイリアスは「名前を dealias しなければならなくなった瞬間」に完了します。
+*入れ子のテンプレート*の親句がまさにそれをやるので、シグネチャパスがエイリアスに
+辿り着く前に、ヘッダパス（`parents_pass`）から完了が走ります。
+
+```scala
+import slick.sql.FixedSqlAction
+trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
+  type ProfileAction[+R, +S <: NoStream, -E <: Effect] = FixedSqlAction[R, S, E]
+  abstract class SimpleJdbcProfileAction[+R](…) extends … with ProfileAction[R, NoStream, Effect]
+}
+```
+
+この時点でエイリアスを記録しているのは namer だけで、namer は**スコープを保存しません**
+（`PendingSig.scopes: None`）。`swap_in_scopes` は owner の鎖からスコープを組み直すので、
+囲いのテンプレートのメンバは入りますが**ファイルの import は入りません**。結果
+`FixedSqlAction` が `Type::Named` のまま解決できず、`ProfileAction` の型は
+`<error>` に固定され、以後 `new SimpleJdbcProfileAction[Unit](…) { … }` が
+すべて `type mismatch; found: $anon$N required: JdbcActionComponent.ProfileAction[…]`
+になっていました（`JdbcActionComponent` だけで 26 件、`MemoryProfile` /
+`MemoryQueryingProfile` にも同じものが）。
+
+ヘッダパスは**そのファイルの import を型付け済みで、テンプレートのメンバも
+入れ終わっている** —— エイリアスが書かれた語彙そのものです。`refresh_alias_sigs` が、
+入れ子テンプレートへ降りる直前に、まだ namer の記録しか持たない `TypeDef` の
+`PendingSig` へ現在のスコープスタックを渡します。
+
+**2. compound 型が「適用された抽象型メンバ」に適合しなかった**。
+
+```scala
+trait P { type M[+R] <: A[R];  type N[+R] <: A[R] with M[R] }
+trait Q extends P { type M[+R] <: B[R];  type N[+R] <: B[R] with M[R] }
+```
+
+`B[R] with M[R] <: A[R] with M[R]` を見るとき、右辺の `M[R]` は**抽象**メンバの適用で、
+展開する右辺を持ちません。`is_sub_type` の `(other, Applied)` 腕はそこで `false` を
+返していました。nsc は右辺で決められないときは**左辺の規則**へ落ちるので、compound は
+自分の親の 1 つを通して適合します。
+
+**3. `Map[K, V]` が `K => V` ではなかった**。2.13 の `scala.collection.Map[K, +V]` は
+`PartialFunction[K, V]` を継承しています（`javap` の interface 一覧に `scala/Function1`
+が並ぶ）。prelude の階層表（`prelude_hier.rs`）には `Iterable` 側の辺しか無く、
+slick の `val symbolToIndex: TermSymbol => Int = someMap` が落ちていました。
+辺は `crates/typer/src/prelude_mism4.rs` で張ります。
+
+同時に **`scala.FunctionN` という「クラス」と構造的な `(T1, …) => R` を同じ型として
+扱う**ようにしました（`SymbolTable::function_class_shape`）。prelude は
+`PartialFunction` の親などをクラスで書き、それ以外では構造的な形を使うので、
+両方を行き来できないと `PartialFunction[A, B] <: A => B` すら成り立ちません。
+これは `is_sub_type` の両方向、関数リテラルの期待型（`type_function`）、
+オーバーロードの適用判定（`arg_score`）の 3 か所に効きます。3 番目は
+**pickle 由来のシグネチャで関数パラメータがクラスとして書かれる**ため重要で、
+`IterableOnceOps.reduceLeft[B >: A](op: Function2[B, A, B]): B` に
+リテラルを渡すと `no matching overload … with arguments ((<notype>, <notype>) => <notype>)`
+になっていました。
+
+**4. `map` が受け手のコレクションを落としていた**。`IndexedSeq` は `map` を
+宣言し直さないので、継承した宣言は `Seq[B]` と言います。しかし実際のシグネチャは
+受け手自身の型構成子（`IterableOps.CC[B]`）を返すので、`xs.toSeq.map(f)` が
+`IndexedSeq` なら結果も `IndexedSeq` です。従来は「宣言された結果が勝つ」だけでした。
+受け手が **`scala.collection` のクラスで、宣言された結果クラスの子孫であるとき**に
+限って受け手を優先します。`Range`（自分の型パラメータを持たない）は従来どおり
+宣言された `IndexedSeq` のままですし、`Seq` を継承しただけのユーザクラスは
+`Seq` の builder を継承するので、こちらも宣言された結果のままです。
+
+**5. 安定識別子パターンが、まだ決まっていないスクルーティニに弾かれていた**。
+
+```scala
+def f[T](t: ScalaType[T]) = t match {
+  case ScalaBaseType.byteType => …    // found: ScalaNumericType[Byte] required: ScalaType[T]
+}
+```
+
+`T` は `Byte` かもしれず、パターンは実行時にはただの `==` なので、型引数がまだ
+分からないスクルーティニは何も排除しません。`relax_abstract_targs` が、期待型に使う
+スクルーティニの**型引数**にある型パラメータ・抽象型メンバを `_` に置き換えます
+（先頭のクラスは緩めません）。
+
+**6. `type Self >: this.type <: Node` に `this` が適合しなかった**。
+
+```scala
+trait Node { type Self >: this.type <: Node; def mapChildren(…): Self }
+trait NullaryNode extends Node {
+  override final def mapChildren(f: Node => Node, keepType: Boolean = false): Self = this
+}
+```
+
+`adapt_singleton` は「抽象型メンバの**下界**が `this.type` なら `this` は通る」を
+すでに持っていましたが、`ThisType(cls)` の判定が `tree.sym == cls` の**同一性**でした。
+下界は `Node` の語彙で書かれているので、`NullaryNode` から読めば
+`NullaryNode.this.type` です。`This` ツリーの指すクラスが `cls` の**子孫**であれば
+通すようにしました。**`This` ツリーにしか適用しない**ので、
+`def wrong(a: Node, b: Node): a.Self = b` は今も落ちます（scalac も落とします）
+——「素直に下界規則を入れると別の `Node` まで通る」という懸念はここで切れます。
+あわせて `Node.Self with DefNode` のような compound も、親を 1 つずつ見るように
+しました。`val n: Self = if(…) this else rebuild(…)` は、`this` が受理された時点で
+`Self` に広がる（`this.type <: Self` なので健全）ので、両枝の lub も `Self` です。
+
+計測（`tests/slick_measure.sh`、slick 184 ファイル、`-Xsource:3`）は
+**711 → 635**、エラーを含むファイルは **91 → 87** になりました。新たにエラーを
+出すようになったファイルはありません。`type mismatch` は **157 → 127** ですが、
+これは 3 番の効果で `no matching overload` だったものが本来の `type mismatch` に
+変わった分（`BasicBackend` の cats-effect まわりなど）を含みます。
+`type mismatch` だけを見ると 157 → 114 まで落ちたあと、`Function2` の穴を塞いだ
+ぶん 131 に戻り、`Self` で 127 になっています。
+
+**残っているもの**（このスライスでは直していない）:
+
+- **`case Seq(a, b)` が使えない**。`unapplySeq` を持つのは prelude の `List` だけで、
+  `Seq` には無いので `case Seq((s, _)) => Some(s)` は「クラスパターン」に落ちて
+  要素型が付きません（slick `JdbcStatementBuilderComponent` で 4 件）。
+  prelude に足すのは簡単ですが、codegen は `gen_unapply_seq_bind` が
+  `checkcast List` から始まる **List 専用**なので、`Vector` を `Seq` として渡すと
+  実行時に落ちます。`SeqOps.length` / `apply(I)` を使う版か `toList` の挿入が要ります。
+  ついでに `case List(a, b, rest @ _*)` の codegen は**現状でも** `VerifyError` を
+  出します（星付きパターンの前の要素に checkcast が出ていない）。
+- **`StringOps.map[B](f: Char => B): IndexedSeq[B]`** が無く、
+  `"…".map(_.toString)` が `found: String required: Char` になります。2.13 は
+  `map(Char => Char): String` と 2 つのオーバーロードを持ちますが、prelude に
+  2 つ並べるとリテラルの結果型が決まる前に `ambiguous overload` になり、
+  1 つに畳むと erasure が結果型を symbol から取り直すため codegen が
+  `IndexedSeq` を返す方を呼びます。オーバーロード解決がリテラルの結果型で
+  絞れるようになるまで保留です。
+- **安定識別子パターンの型検査そのもの**。scalac 2.13.16 は
+  `case Ids.other =>`（`other: Other`、スクルーティニ `ST[Int]`）を**通します**が、
+  こちらは今も `type mismatch` を出します。今回は型引数が抽象なときだけ緩めました。
+- `Seq("a").map(m)`（`m: Map[String, Int]`）は `Map` が関数になっても通りません。
+  適合ではなく推論（`Function2[B, …]` の `B` が未解決）の側です。
+
 ### jar のクラスを pickle から読む
 
 `load_classpath` はディレクトリしか歩きません。つまり **jar の中のクラスは
@@ -2079,6 +2213,22 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 （定義側の外から protected メンバを別インスタンス経由で触る／`this.type` を
 別の型引数の同名クラスに渡す）で固定しています。どちらも実 scalac 2.13.16 も拒否します。
 
+| `mism4.scala` | シグネチャパスより前に完了した型エイリアス、適用された抽象型メンバへの compound の適合、`Map` が `K => V` であること、`map` が受け手のコレクションを保つこと、型引数がまだ決まっていないスクルーティニへの安定識別子パターン、親が宣言した `type Self >: this.type` への `this`（library dual-run のみ） | `schema.create` `2` `10` `Vector(1, 2, 3)` `List(1, 2)` `Vector(1, 2)` `Vector(2, 4, 6)` `1` `4` `0` `leaf` `0` `up` `other` |
+
+`mism4.scala` は `crates/cli/tests/mismatch4.rs` から回します。同ファイルには最小形の
+受理テスト（`an_alias_completed_early_still_sees_the_units_imports` /
+`a_compound_conforms_to_an_applied_abstract_member` /
+`a_map_is_a_function_and_so_is_a_function_class` /
+`map_keeps_the_receivers_own_collection` /
+`this_conforms_to_a_self_member_declared_by_a_parent` /
+`a_stable_id_pattern_may_meet_an_abstract_scrutinee`）も置いてあります。
+逆に、緩めた規則が診断を飲み込まないことは `mism4_bad.scala`
+（解決するようになったエイリアスの型引数が合わない／抽象型メンバの上界を
+親より広く上書きする／`Map[String, Int]` を `Int => Int` に渡す／
+`this` ではない別の `Node` を `a.Self` に渡す／
+`Seq.map` の結果を `IndexedSeq` に渡す）で固定しています。実 scalac 2.13.16 も
+すべて拒否します（nsc は typer で止まるので refchecks 側の 1 件は出しません）。
+
 | `tyvar.scala` | 未確定の型変数（nsc の undetermined type variables）。引数位置の `Map.empty` / `Vector.empty` / `Set.empty` / `List.empty` / `Nil` / `Seq.empty`、空の `apply`（`Map()` / `Vector()` / `List()`）、入れ子の呼び出しから漏れる変数（`take(id(Map.empty))`）、期待型が結果型の変数を決める形（`val l: List[Map[String, Int]] = f(Map.empty)`）、可変長引数・by-name・デフォルト引数の位置、複数引数・複数節、オーバーロード選択、コンストラクタ引数、そして逆向きの「呼び先自身の未確定な型パラメータ」（`xs.collect { case … }`）（library dual-run のみ） | `0`×9 `List(Map())` `2` `0`×3 `1` `2` `0` `0` `List(2, 4)` `List(2, 3, 4, 5)` `Some(6)` |
 
 `tyvar.scala` は `crates/cli/tests/tyvar.rs` から回します。同ファイルには最小形の
@@ -2120,6 +2270,33 @@ implicit-only 型パラメータの両方に nsc と同じ趣旨の診断が出�
 計測は `files=184 errors=833 files_with_errors=102` → `errors=777 files_with_errors=93`。
 
 ### Remaining
+
+- **`case Seq(a, b)` が使えない**（`agent/mismatch4` で原因まで特定、未修正）。
+  `unapplySeq` を持つのは prelude の `List` だけなので、`case Seq((s, _))` は
+  `type_pattern` の「クラスパターン」枝に落ちて要素型が付かず、
+  `Some(s)` が `Some[A]`（extractor 自身の型パラメータ）になります。
+  prelude に `Seq.unapplySeq` を足すのは簡単ですが、codegen の
+  `gen_unapply_seq_bind` は `checkcast scala/collection/immutable/List` から
+  始まる **List 専用**なので、`Vector` を `Seq` として渡すと実行時に落ちます。
+  `SeqOps.length` / `apply(I)` を使う版か `toList` の挿入が要ります。
+  ついでに `case List(a, b, rest @ _*)` の codegen は **main でも**
+  `VerifyError: Bad type on operand stack` を出します（星付きパターンの前の
+  要素を束ねるローカルに checkcast が出ていない）。
+
+- **`StringOps.map[B](f: Char => B): IndexedSeq[B]` が無い**
+  （`agent/mismatch4` で原因まで特定、未修正）。`"…".map(_.toString)` は
+  `found: String  required: Char` になります。2.13 の `StringOps` は
+  `map(Char => Char): String` と 2 つのオーバーロードを持ちますが、prelude に
+  2 つ並べるとリテラルの結果型が決まる前に `ambiguous overload` になり、
+  1 つ（多相な方）に畳むと erasure が Apply の結果型を symbol から取り直すため
+  codegen が `IndexedSeq` を返す `map$extension` を呼びます（実行時に
+  `ClassCastException`）。オーバーロード解決が「関数リテラルの結果型で候補を
+  絞る」nsc の順序を持てるようになるまで保留です。
+
+- **安定識別子パターンの型検査**（`agent/mismatch4` で確認、未修正）。
+  scalac 2.13.16 は `case Ids.other =>`（`other: Other`、スクルーティニ
+  `ST[Int]`）を**通します**が、こちらは `type mismatch` を出します。
+  第 4 スライスでは型引数が抽象なときだけ緩めました。
 
 - **`Seq.toArray` / `Seq.zipWithIndex` が、あるファイルを一緒にコンパイルすると
   消去されたシグネチャに化ける**（`agent/impltail` で原因まで特定、未修正）。

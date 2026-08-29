@@ -1509,7 +1509,19 @@ impl SymbolTable {
                     if expanded != folded {
                         return self.is_sub_type(other, &expanded);
                     }
-                    false
+                    // An *abstract* member applied to arguments has no
+                    // right-hand side to expand, and nothing on the right can
+                    // decide the question. nsc then falls through to the rules
+                    // for the left side, which is how a compound type conforms
+                    // through one of its own parents:
+                    // `SqlStreamingAction[R, T, E] with PA[R, Streaming[T], E]`
+                    // is a `PA[R, Streaming[T], E]`.
+                    match other {
+                        Type::Refined { parents, .. } => {
+                            parents.iter().any(|p| self.is_sub_type(p, b))
+                        }
+                        _ => false,
+                    }
                 } else {
                     self.is_sub_type(other, &folded)
                 }
@@ -1588,6 +1600,13 @@ impl SymbolTable {
                 parents.iter().any(|p| self.is_sub_type(p, b))
             }
             (Type::Class { sym: s1, args: a1 }, b) => {
+                // `scala.FunctionN[T1, …, R]` and the structural function type
+                // are one and the same type; the prelude writes a parent that
+                // *is* a function (`PartialFunction`, `Map`) as the class and
+                // everything else as the structural form.
+                if let Some(f) = self.function_class_shape(*s1, a1) {
+                    return self.is_sub_type(&f, b);
+                }
                 // A malformed hierarchy (`object B extends B`) would otherwise
                 // walk its own parents forever. Depth, not identity: a legitimate
                 // walk revisits a class at a different type argument.
@@ -1702,11 +1721,36 @@ impl SymbolTable {
                     .all(|(exp, act)| self.is_sub_type(exp, act))
                     && self.is_sub_type(r1, r2)
             }
+            (Type::Function { .. }, Type::Class { sym, args }) => {
+                match self.function_class_shape(*sym, args) {
+                    Some(f) => self.is_sub_type(a, &f),
+                    None => false,
+                }
+            }
             (Type::ByName(a), Type::ByName(b)) => self.is_sub_type(a, b),
             (Type::Repeated(a), Type::Repeated(b)) => self.is_sub_type(a, b),
             (Type::Refined { parents, .. }, b) => parents.iter().any(|p| self.is_sub_type(p, b)),
             _ => false,
         }
+    }
+
+    /// `scala.FunctionN[T1, …, Tn, R]` read as the structural `(T1, …, Tn) => R`.
+    /// `None` for every other class, `PartialFunction` included -- that one
+    /// reaches its `Function1` parent through the ordinary walk.
+    pub(crate) fn function_class_shape(&self, sym: SymbolId, args: &[Type]) -> Option<Type> {
+        if args.is_empty() {
+            return None;
+        }
+        let s = self.get(sym);
+        let digits = s.jvm_name.strip_prefix("scala/Function")?;
+        let n: usize = digits.parse().ok()?;
+        if args.len() != n + 1 {
+            return None;
+        }
+        Some(Type::Function {
+            params: args[..n].to_vec(),
+            ret: Box::new(args[n].clone()),
+        })
     }
 
     fn is_tuple_arity(&self, sym: SymbolId, n: usize) -> bool {

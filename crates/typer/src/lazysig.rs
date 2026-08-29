@@ -123,6 +123,39 @@ impl Typer {
         );
     }
 
+    /// Give this template's still-pending type aliases the scope stack the
+    /// header pass is standing in.
+    ///
+    /// An alias is completed on demand as soon as a name has to be dealiased,
+    /// and the parent clause of a *nested* template does that before the
+    /// signature pass ever reaches the alias
+    /// (`abstract class Simple[R] extends ProfileAction[R, NoStream, Effect]`).
+    /// Only the namer had seen the alias by then, and the namer records no
+    /// scopes -- the stack rebuilt from the owner chain carries the enclosing
+    /// templates' members but none of the unit's imports, so an imported
+    /// right-hand side (`= FixedSqlAction[R, S, E]`) resolved to nothing and
+    /// the alias was stuck at `<error>` for the rest of the run. The header
+    /// pass has already typed this unit's imports and entered the template's
+    /// members: that is the vocabulary the alias was written in.
+    pub(crate) fn refresh_alias_sigs(&mut self, body: &[Tree]) {
+        if !body.iter().any(|s| {
+            matches!(s.kind, TreeKind::TypeDef { .. }) && self.pending_sigs.contains_key(&s.sym)
+        }) {
+            return;
+        }
+        let scopes = Rc::new(self.st.scopes[self.lazy_base_scopes..].to_vec());
+        for stt in body {
+            if !matches!(stt.kind, TreeKind::TypeDef { .. }) {
+                continue;
+            }
+            if let Some(p) = self.pending_sigs.get_mut(&stt.sym) {
+                if p.scopes.is_none() {
+                    p.scopes = Some(scopes.clone());
+                }
+            }
+        }
+    }
+
     /// A definition that was completed on demand replaces the tree the unit
     /// still holds; both template passes then skip it.
     pub(crate) fn take_lazy_done(&mut self, tree: &mut Tree) -> bool {
