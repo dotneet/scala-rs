@@ -626,23 +626,10 @@ scala-rs が型検査できなければ意味がない。フェーズ 3 の下�
 
 ### 7.3 まだ塞がっていない穴（次に要るもの）
 
-**A. 展開先を宣言したクラスで呼ぶこと。** `PickleSupply` は補完したメンバを
-*レシーバ*のクラスに載せる。ところが `u.Constant()` の実体は
-`scala.reflect.api.Constants` インタフェースの宣言であり、`api.JavaUniverse` は
-バイトコード上そのインタフェースを実装していない（7.2 の 2 と同じ理由）。
-nsc は `checkcast scala/reflect/api/Constants` を挟んでから
-`invokeinterface scala/reflect/api/Constants.Constant()` を出す。
-我々は `invokeinterface scala/reflect/api/JavaUniverse.Constant()` を出すので
-実行時に `NoSuchMethodError` になる。
-**必要な作業**: `MemberHit.owner`（宣言クラス）をシンボルに記録し、codegen が
-レシーバの静的型がそれを実装していないときに `checkcast` を挿む。
-これが済めば `scala.reflect.runtime.universe` 上の Tree 構築が**実行できる**ようになり、
-quasiquote の reification をエンドツーエンドで dual-run 検証できるようになる。
+**A. 展開先を宣言したクラスで呼ぶこと。済（`agent/reify2`）。** §7.4 の 1。
 
-**B. reification 本体。** 7.1 が作った構文木を
-`internal.reificationSupport.Syntactic*` 呼び出しに落とす（§6.2 の 2）。
-穴の rank（`$` / `..$` / `...$`）と、穴の型（Tree / Name / Type / リスト）による
-分岐がここに入る。§3.3 の一覧が slick に必要な最小セットである。
+**B. reification 本体。一部済（`agent/reify2`）。** §7.4 の 2。実装した部分集合と、
+まだ落とせない形は §7.4 に列挙してある。
 
 **C. `c.Expr[T]` などのパス依存型。** `blackbox.Context` の
 `type Expr[T] = universe.Expr[T]`（`scala.reflect.macros.Aliases`）が解決できないと
@@ -655,3 +642,97 @@ quasiquote の reification をエンドツーエンドで dual-run 検証でき�
 
 **D. engine（フェーズ 2）。** A〜C が済んでも、slick の `mapToImpl` を*呼ぶ*には
 §2.3 の JVM ブリッジが要る。こちらは prototype で検証済みで、順序としては最後でよい。
+
+### 7.4 宣言クラスでの呼び出しと reification（`agent/reify2` スライス）
+
+§7.3 の A と B。**`scala.reflect.runtime.universe` 上で Tree を組み立てるコードが
+実際に走るようになり**、その上で `q"…"` の一部が本当に脱糖されるようになった。
+
+#### 1. 宣言クラスで呼ぶ（A、済）
+
+`Symbol::declaring_class` / `declaring_is_interface` を足した
+（`crates/typer/src/symbol.rs`）。`pickle_supply::erased_desc` は 7.2 の 2 で
+「classfile が親を 1 つも宣言していないクラスは pickle の親で補う」ようになっていたが、
+**見つけた descriptor がどのクラスの宣言かを返していなかった**。そこを
+`ErasedDecl { desc, declared_in, declared_by_interface, off_the_bytecode_path }` にし、
+`off_the_bytecode_path`（＝pickle の親を辿ってしか届かない、JVM には見えない経路）で
+見つけたときだけ宣言クラスをシンボルに記録する。`gen.rs` はそれを invoke のオーナーに使い、
+レシーバをそこへ `checkcast` する。**受け手の classfile から届く普通のメンバの
+バイトコードは一切変わらない**（既存 fixture が全部それを固定している）。
+
+```
+// scala-rs が出すようになったもの（nsc と同形）
+invokeinterface scala/reflect/api/Constants.Constant:()Lscala/reflect/api/Constants$ConstantExtractor;
+// 以前: invokeinterface scala/reflect/api/JavaUniverse.Constant() → NoSuchMethodError
+```
+
+これだけでは `u.Literal(u.Constant(42))` は通らず、道中で 4 つ塞いだ。いずれも
+reflect 専用ではない一般の欠落である。
+
+- **入れ子クラスの名前が外側クラスに潰れる**（`pickle_supply::ensure_class`）。
+  `pickle_files_for` は「pickle が入っている classfile」も候補に出すので、
+  `scala.reflect.api.Constants.Constant`（実体のない抽象型メンバ）が
+  `scala/reflect/api/Constants` にマッチして**外側のトレイトそのもの**に解決していた。
+  `names_class` で「自分の単純名で終わる候補」だけを採る。
+- **複合上界が捨てられる**（`conv_upper_bound`）。reflect API は
+  `type Select >: Null <: SelectApi with RefTree` の形で書かれていて、
+  `Refined` を変換できず上界ごと落としていた。`Select <: Tree` が導けないので
+  `Syntactic*` に渡せるものが何も無かった。
+- **上界が受け手の語彙で解決されていた**（`abstract_type_member`）。上界は
+  *宣言クラス*の語彙で書かれている（`Ident` の上界の `RefTree` は同じ `Trees` の
+  別の抽象型メンバ）。変換の間だけ `self_ty` を宣言クラスに向ける。
+- **既定引数ゲッタの規約**。scalac は既定値が先行パラメータを読まないとき
+  **nullary の** `$default$n` を出す。呼び出し側はゲッタ自身の arity に合わせる
+  （`default_getter_apply`）。これが無いと `SyntacticTermIdent` が供給されない。
+- **複合上界が base type sequence に現れない**（`SymbolTable::base_type_seq`）。
+  `lub(Ident, Literal)` が `AnyRef` になり `List(ident, literal)` が
+  `List[AnyRef]` になっていた。
+
+#### 2. reification（B、部分実装）
+
+`crates/typer/src/reify.rs`。7.1 が構文解析した木を
+`<universe>.internal.reificationSupport.Syntactic*` の呼び出し木に落とし、
+**普通の式として型検査・コード生成する**。universe は
+`import <universe>._` が記録した term import のプレフィクスから採る
+（`Check::universe_in_scope`）。
+
+`q"…"` について落とせる形:
+
+| 形 | 落とす先 |
+| --- | --- |
+| リテラル | `u.Literal(u.Constant(v))` |
+| 名前 | `rs.SyntacticTermIdent(u.TermName("n"), false)` |
+| `a.b` | `rs.SyntacticSelectTerm(<a>, u.TermName("b"))` |
+| `f(a, b)` / `a.b(1)(2)` | `rs.SyntacticApplied(<f>, List(List(<a>, <b>)))` |
+| `$x` | 引数の式をそのまま差す |
+| `..$xs` | 引数リスト 1 節ぶんとして差す |
+| `f()` | `Nil`（`List()` は `A` を解けない。§7.5） |
+
+**落とせない形は必ず診断する**（`unimplemented syntax: quasiquote q"..." (…)` に
+どの形かを書く）。現状の穴: ブロック、関数リテラル、`new`、`if`、`match`、
+型注釈、型適用、`this` / `super`、定義（`val` / `def` / `class`）、
+`..$` と普通の引数の混在、`tq` / `pq` / `cq` 全体。
+
+検証: `tests/fixtures/reify_qq.scala` を実 scalac 2.13.16 と dual-run して
+**出力が完全一致**する（`crates/cli/tests/reify.rs`）。異常系は
+`tests/fixtures/reify_qq_bad.scala`。
+
+### 7.5 このスライスのあとに残っているもの
+
+1. **`tq` / `pq` / `cq`。** `mapToImpl` は 3 つとも使う。`tq` は
+   `SyntacticAppliedType` / `SyntacticSelectType` / `SyntacticTypeIdent` /
+   `SyntacticEmptyTypeTree` あたり、`pq` は `Bind` / `UnApply`、`cq` は `CaseDef`。
+2. **`q` の残りの形。** 特に `SyntacticBlock`（`q"""…"""` の複文）、
+   `SyntacticNew`、`SyntacticFunction`、`SyntacticValDef` / `SyntacticDefDef`、
+   `Typed`（`(x: T)`）。§3.3 の出現回数が優先順位そのものである。
+2. **`..$` と普通の引数の混在**（`q"f(a, ..$xs)"`）。連結の静的型を両側とも
+   正しく出す必要がある。
+3. **期待型からのメソッド型パラメータ推論。** `List()` が `List[A]` のまま
+   解けないので `Nil` で回避している。ここが入れば混在の連結も書きやすくなる。
+4. **`Liftable`。** `$x` の `x` が `Tree` でないとき（`Int`、`String`、`Name`、
+   `Symbol`、`WeakTypeTag`）、nsc は implicit `Liftable` で持ち上げる。
+   `mapToImpl` は `$rTag` / `$rCT` / `${c.prefix}` でこれを使う。
+   現状は `Tree` でない穴が型エラーになる（黙って通しはしない）。
+5. **§7.3 の C（`c.Expr[T]` などパス依存型）と D（engine）。** マクロ実装の
+   *中で* quasiquote を書くには C が要る。`import c.universe._` が通らないと
+   universe が見つからないので、`reify.rs` はそこでも診断のまま落ちる。

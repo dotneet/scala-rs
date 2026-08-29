@@ -1414,7 +1414,14 @@ fn checkcast_erased_method_receiver(asm: &mut Assembler, ctx: &EmitCtx, fun: &Tr
     if fun_is_super(fun) {
         return;
     }
-    let jn = class_internal(ctx.st, s.owner);
+    // The call names the declaring class when the owner's own class file does
+    // not reach the method, so the receiver has to be cast to that class and
+    // not to the owner (`Symbol::declaring_class`).
+    let jn = if s.declaring_class.is_empty() {
+        class_internal(ctx.st, s.owner)
+    } else {
+        s.declaring_class.clone()
+    };
     if jn.is_empty() || jn == "java/lang/Object" || jn.starts_with('[') {
         return;
     }
@@ -9811,6 +9818,20 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+    }
+    // A member completed from a pickle is installed on the class it was asked
+    // for, but the JVM method may be declared where the receiver's class file
+    // does not lead (see `Symbol::declaring_class`). Naming the receiver there
+    // is a `NoSuchMethodError`.
+    let declaring = &ctx.st.get(id).declaring_class;
+    if !declaring.is_empty() {
+        if ctx.st.get(id).declaring_is_interface {
+            asm.invokeinterface(declaring, name, &desc);
+        } else {
+            asm.invokevirtual(declaring, name, &desc);
+        }
+        maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
+        return;
     }
     if is_interface_sym(ctx.st, owner_id) {
         asm.invokeinterface(&owner, name, &desc);

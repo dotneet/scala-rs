@@ -1,0 +1,12 @@
+1
+greet
+true
+"hi"
+a.b.c
+f(1)
+a.b(1)(2)
+g(x)
+h(x, 2)
+x.size
+k(p, q)
+k()

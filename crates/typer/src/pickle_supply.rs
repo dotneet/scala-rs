@@ -31,10 +31,30 @@ use crate::symbol::{SymKind, SymbolTable};
 /// `SCALA_RS_PICKLE_DEBUG=1` traces why a member was or was not supplied.
 /// Completion is silent otherwise: a member it declines to supply surfaces as
 /// the typer's ordinary "is not a member".
-fn trace(args: std::fmt::Arguments<'_>) {
+pub(crate) fn trace(args: std::fmt::Arguments<'_>) {
     if std::env::var_os("SCALA_RS_PICKLE_DEBUG").is_some() {
         eprintln!("[pickle] {args}");
     }
+}
+
+/// One JVM method declaration matching a pickled member.
+struct ErasedDecl {
+    /// The erased descriptor to call it with.
+    desc: String,
+    /// JVM internal name of the class file that declares it.
+    declared_in: String,
+    /// Whether that class file is an interface, and so whether the call is
+    /// `invokeinterface` or `invokevirtual`.
+    declared_by_interface: bool,
+    /// True when the search reached `declared_in` only through a *pickled*
+    /// parent -- a hop the JVM cannot make, because the class file that named
+    /// it declares no parents at all (`api/JavaUniverse` has `interfaces: 0`
+    /// even though the trait extends the abstract class `Universe`).
+    ///
+    /// The call then cannot name the receiver's class: resolution would look
+    /// only where the bytecode leads and find nothing. It has to name
+    /// `declared_in`, with the receiver cast to it first.
+    off_the_bytecode_path: bool,
 }
 
 const ACC_STATIC: u16 = 0x0008;
@@ -489,15 +509,31 @@ impl PickleSupply {
             ));
             return None;
         }
-        let Some(desc) = self.erased_desc(bin, internal, jvm_member, &want) else {
+        let Some(found) = self.erased_desc(bin, internal, jvm_member, &want) else {
             trace(format_args!(
-                "{internal}#{name}/{}: no unambiguous erased descriptor",
+                "{internal}#{name}/{}: no unambiguous erased descriptor (want {want:?})",
                 shape.arity()
             ));
             return None;
         };
+        // The member is installed on the class it was asked for, because that
+        // is where the typer looks it up. The *call* is a different question:
+        // a declaration off the bytecode path is not reachable from the
+        // receiver's class, so naming the receiver is a `NoSuchMethodError` at
+        // the first invocation. nsc emits `checkcast scala/reflect/api/Constants`
+        // and then `invokeinterface scala/reflect/api/Constants.Constant()`;
+        // recording the class here is what lets codegen do the same.
+        if found.off_the_bytecode_path && found.declared_in != internal {
+            trace(format_args!(
+                "{internal}#{name}: declared by {}, which the receiver's class file \
+                 does not reach -- the call will name it",
+                found.declared_in
+            ));
+            st.get_mut(m).declaring_class = found.declared_in;
+            st.get_mut(m).declaring_is_interface = found.declared_by_interface;
+        }
 
-        st.get_mut(m).jvm_name = desc;
+        st.get_mut(m).jvm_name = found.desc;
         st.get_mut(m).tparams = tparams;
         st.get_mut(m).params = paramss_sym.iter().flatten().copied().collect();
         st.get_mut(m).paramss = paramss_sym;
@@ -520,18 +556,19 @@ impl PickleSupply {
                 ));
                 return None;
             };
-            // `default_getter_apply` calls the getter with the arguments that
-            // precede the defaulted one. scalac does not always generate it
-            // that way -- `SeqOps.lastIndexOf$default$2()` takes nothing even
-            // though `elem` precedes `end` -- and calling a nullary getter with
-            // an argument is not a program we can emit. Where the two
-            // conventions disagree, leave the member alone.
+            // `default_getter_apply` passes the arguments that precede the
+            // defaulted one, truncated to the getter's own arity: scalac emits
+            // a *nullary* getter whenever the default does not read an earlier
+            // parameter (`SeqOps.lastIndexOf$default$2()` takes nothing though
+            // `elem` comes first). Anything between those two shapes is a
+            // convention we do not know how to call, and a call we cannot make
+            // correctly is worse than a member we do not supply.
             let want_args = slot - 1;
             let got_args = st.get(gid).params.len();
-            if got_args != want_args {
+            if got_args != want_args && got_args != 0 {
                 trace(format_args!(
-                    "{internal}#{name}: {getter} takes {got_args} argument(s) but the \
-                     default is filled with {want_args}"
+                    "{internal}#{name}: {getter} takes {got_args} argument(s), which is \
+                     neither none nor the {want_args} that precede the default"
                 ));
                 return None;
             }
@@ -643,6 +680,17 @@ impl PickleSupply {
             };
             scala_rs_pickle::sym::pickle_files_for(full_name, module)
                 .into_iter()
+                // `pickle_files_for` also offers the *enclosing top-level*
+                // class file, because that is where a nested class's pickle
+                // actually lives. That candidate is right for reading bytes and
+                // wrong for naming a class: accepting it made
+                // `scala.reflect.api.Constants.Constant` -- an abstract type
+                // member, with no class file of its own -- resolve to the
+                // enclosing trait `Constants`, so `Literal(Constant(42))` was
+                // checked against a parameter of the wrong type and no erased
+                // descriptor matched. A candidate only names this class if it
+                // ends with this class's own simple name.
+                .filter(|c| names_class(c, full_name))
                 .find(|c| bin.find_class(c).ok().flatten().is_some())
                 .unwrap_or(plain)
         };
@@ -737,23 +785,27 @@ impl PickleSupply {
         internal: &str,
         name: &str,
         want: &[Option<String>],
-    ) -> Option<String> {
+    ) -> Option<ErasedDecl> {
         let arity = want.len();
         let mut seen: HashSet<String> = HashSet::new();
-        let mut level = vec![internal.to_string()];
+        // Each frontier entry remembers whether it was reached through a hop
+        // the JVM cannot make -- see `ErasedDecl::off_the_bytecode_path`.
+        let mut level = vec![(internal.to_string(), false)];
         for _ in 0..32 {
             if level.is_empty() {
                 return None;
             }
-            let mut hits: Vec<String> = Vec::new();
+            let mut hits: Vec<ErasedDecl> = Vec::new();
             let mut next = Vec::new();
-            for cn in &level {
+            for (cn, off_path) in &level {
+                let off_path = *off_path;
                 if !seen.insert(cn.clone()) {
                     continue;
                 }
                 let Some(jc) = self.java_class(bin, cn) else {
                     continue;
                 };
+                let declared_by_interface = crate::javaclass::is_java_interface(jc.access);
                 let mut parents: Vec<String> = Vec::new();
                 for jm in &jc.methods {
                     if jm.name != name || jm.access & (ACC_BRIDGE | ACC_SYNTHETIC | ACC_STATIC) != 0
@@ -762,9 +814,14 @@ impl PickleSupply {
                     }
                     if desc_arity(&jm.desc) == Some(arity)
                         && params_match(&jm.desc, want)
-                        && !hits.contains(&jm.desc)
+                        && !hits.iter().any(|h| h.desc == jm.desc)
                     {
-                        hits.push(jm.desc.clone());
+                        hits.push(ErasedDecl {
+                            desc: jm.desc.clone(),
+                            declared_in: cn.clone(),
+                            declared_by_interface,
+                            off_the_bytecode_path: off_path,
+                        });
                     }
                 }
                 if let Some(s) = &jc.super_name {
@@ -787,9 +844,13 @@ impl PickleSupply {
                 // ancestors the JVM does not see, and the extra `map`
                 // descriptors that turns up make the answer ambiguous
                 // (`Map#map` regresses).
-                next.extend(parents);
+                next.extend(parents.into_iter().map(|p| (p, off_path)));
                 if bare {
-                    next.extend(self.pickled_parent_files(bin, cn));
+                    next.extend(
+                        self.pickled_parent_files(bin, cn)
+                            .into_iter()
+                            .map(|p| (p, true)),
+                    );
                 }
             }
             match hits.len() {
@@ -1359,7 +1420,20 @@ impl PickleSupply {
         if let SigType::Bounds { lo, hi } = &m.ty {
             let scope = HashMap::new();
             let (lo, hi) = (lo.clone(), hi.clone());
-            if let Some(h) = self.conv_at(st, bin, &scope, &hi, d) {
+            // A bound is written in *its owner's* vocabulary, not the
+            // receiver's. `type Ident >: Null <: IdentApi with RefTree` names
+            // `RefTree` with a bare name, because it is another abstract type
+            // member of the same trait `Trees`; resolving it against whatever
+            // member happened to be under completion finds nothing when that
+            // member lives elsewhere (`Internals.SyntacticTermIdentExtractor`).
+            // The bound then loses `RefTree`, and with it the only path from
+            // `Ident` to `Tree` -- so nothing built out of an `Ident`
+            // typechecks. Point `self_ty` at the owner for the conversion.
+            let outer = self.self_ty.replace(Type::Class {
+                sym: owner,
+                args: Vec::new(),
+            });
+            if let Some(h) = self.conv_upper_bound(st, bin, &scope, &hi, d) {
                 if !matches!(h, Type::Any | Type::AnyRef) {
                     st.get_mut(id).bound_hi = Some(h);
                 }
@@ -1369,9 +1443,54 @@ impl PickleSupply {
                     st.get_mut(id).bound_lo = Some(l);
                 }
             }
+            self.self_ty = outer;
         }
         trace(format_args!("abstract type member {sym}"));
         Some(Type::TypeMember(id))
+    }
+
+    /// The upper bound of an abstract type member.
+    ///
+    /// Same as `conv_at`, except that a **compound** bound is kept rather than
+    /// declined. The reflect API is written entirely in these:
+    /// `type Select >: Null <: SelectApi with RefTree`, and `RefTree` in turn
+    /// leads to `Tree`. Dropping the bound because `conv_at` has no answer for
+    /// a refinement leaves `Select` unrelated to `Tree`, and then nothing built
+    /// out of `Tree`s -- every `Syntactic*` call reification would emit --
+    /// typechecks. Declarations inside the refinement are dropped: only the
+    /// parents decide conformance, and inventing members here would be a
+    /// guess. A parent that does not convert is skipped rather than failing the
+    /// bound, on the same principle as the caller's: fewer members reachable
+    /// through the type is right, a wrong one is not.
+    fn conv_upper_bound(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        hi: &SigType,
+        d: u32,
+    ) -> Option<Type> {
+        let SigType::Refined { parents, .. } = hi else {
+            return self.conv_at(st, bin, scope, hi, d);
+        };
+        let mut ps: Vec<Type> = Vec::new();
+        for p in parents {
+            let Some(t) = self.conv_at(st, bin, scope, p, d) else {
+                continue;
+            };
+            if matches!(t, Type::Any | Type::AnyRef) || ps.contains(&t) {
+                continue;
+            }
+            ps.push(t);
+        }
+        match ps.len() {
+            0 => None,
+            1 => Some(ps.remove(0)),
+            _ => Some(Type::Refined {
+                parents: ps,
+                decls: Vec::new(),
+            }),
+        }
     }
 
     /// Resolve `owner.Name[args]` where `Name` is a type alias declared on
@@ -1452,6 +1571,21 @@ pub(crate) fn inherits_from(st: &SymbolTable, cls: SymbolId, target: SymbolId) -
 /// certain. `None` means "some reference type" -- a type parameter, `Any`, or
 /// anything else that erases to `Object` or to a class we cannot pin down --
 /// and matches any reference slot.
+/// Whether the class file `candidate` (a JVM internal name) is the one that
+/// *declares* `full_name`, rather than merely an enclosing class whose file
+/// carries its pickle.
+///
+/// `a/b/Outer$Inner` names `a.b.Outer.Inner`; `a/b/Outer` does not. Trailing
+/// `$` (a module class) does not change the simple name.
+fn names_class(candidate: &str, full_name: &str) -> bool {
+    let Some(simple) = full_name.rsplit('.').next() else {
+        return false;
+    };
+    let last = candidate.rsplit('/').next().unwrap_or(candidate);
+    let last = last.strip_suffix('$').unwrap_or(last);
+    last == simple || last.rsplit('$').next() == Some(simple)
+}
+
 fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
     match ty {
         Type::Boolean => Some("Z".into()),

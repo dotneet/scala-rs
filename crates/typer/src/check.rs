@@ -67,6 +67,13 @@ pub struct ClasspathClass {
     pub pickle: Option<Vec<ClasspathPickleMethod>>,
     /// Class type parameter names recovered from the pickle, in order.
     pub pickle_tparams: Vec<String>,
+    /// The classfile is an interface -- a Scala trait, or a Java interface.
+    pub is_interface: bool,
+    /// `super_class` and `interfaces` as JVM internal names. The pickle subset
+    /// records member types by *simple* name only, so the classfile header is
+    /// the only place the inheritance graph survives intact.
+    pub super_name: Option<String>,
+    pub interfaces: Vec<String>,
 }
 
 impl Default for TypecheckOptions {
@@ -4368,6 +4375,90 @@ impl Typer {
         }
     }
 
+    /// Reify a quasiquote in place: rewrite it into the universe calls that
+    /// build the reflect `Tree`, and type the result.
+    ///
+    /// Returns false when this quasiquote is not one this compiler builds --
+    /// no universe in scope, a body that did not parse, or a form
+    /// `crates/typer/src/reify.rs` does not cover. The caller then reports it;
+    /// nothing is ever silently accepted.
+    fn reify_quasiquote(
+        &mut self,
+        tree: &mut Tree,
+        span: Span,
+        kind: crate::quasiquote::QuasiKind,
+        parts: &[String],
+        args: &[Tree],
+        pt: &Type,
+    ) -> bool {
+        let Some(universe) = self.universe_in_scope() else {
+            return false;
+        };
+        let Ok(body) = crate::quasiquote::parse_body(kind, parts, args.len()) else {
+            return false;
+        };
+        let ranks = crate::quasiquote::hole_ranks(parts, args.len());
+        let built = {
+            let r = crate::reify::Reifier::new(universe, args, &ranks, span);
+            match r.reify(kind, &body) {
+                Ok(t) => t,
+                Err(why) => {
+                    self.error(
+                        span,
+                        format!(
+                            "unimplemented syntax: quasiquote {}\"...\" ({why}). \
+                             See docs/macros.md \u{a7}7.",
+                            kind.prefix()
+                        ),
+                    );
+                    tree.ty = Type::Error;
+                    return true;
+                }
+            }
+        };
+        // Typed like any other expression. A failure here is a real one --
+        // a hole whose argument is not a `Tree`, say -- so its diagnostics are
+        // the ones to keep.
+        *tree = built;
+        self.type_expr(tree, pt);
+        true
+    }
+
+    /// The expression naming a `scala.reflect.api.Universe` currently in
+    /// scope, brought in by `import <universe>._`.
+    ///
+    /// That import is what makes `q"..."` resolve at all: `q` is a member of
+    /// `Quasiquotes.Quasiquote`, which is a member of the universe. The most
+    /// recent one wins, the same way the member lookup that found `q` does.
+    fn universe_in_scope(&self) -> Option<Tree> {
+        self.term_import_prefixes
+            .iter()
+            .rev()
+            .find(|(owner, _)| self.is_reflect_universe(*owner))
+            .map(|(_, prefix)| prefix.clone())
+    }
+
+    /// Whether `id` is `scala.reflect.api.Universe` or something that extends
+    /// it (`api.JavaUniverse`, `runtime.JavaUniverse`, a macro `Context`'s
+    /// universe).
+    fn is_reflect_universe(&self, id: SymbolId) -> bool {
+        if id.is_none() {
+            return false;
+        }
+        let named = |s: SymbolId| {
+            let jvm = &self.st.get(s).jvm_name;
+            jvm == "scala/reflect/api/Universe" || jvm == "scala/reflect/api/JavaUniverse"
+        };
+        if named(id) {
+            return true;
+        }
+        self.st
+            .symbols
+            .iter()
+            .filter(|s| named(s.id))
+            .any(|s| crate::pickle_supply::inherits_from(&self.st, id, s.id))
+    }
+
     /// Report a quasiquote that could not be typed, saying which of the two
     /// gaps it hit. See `crates/typer/src/quasiquote.rs`.
     fn report_quasiquote(
@@ -4408,20 +4499,22 @@ impl Typer {
             {
                 // Kept before desugaring, which replaces the node.
                 let quasi = crate::quasiquote::QuasiKind::of(prefix)
-                    .map(|k| (k, parts.clone(), args.len()));
+                    .map(|k| (k, parts.clone(), args.clone()));
                 let span = tree.span;
                 let before = self.diags.len();
                 self.desugar_custom_interpolator(tree);
                 self.type_expr_inner(tree, pt);
-                if let Some((kind, parts, nargs)) = quasi {
+                if let Some((kind, parts, args)) = quasi {
                     if self.diags.len() > before {
                         // A user-defined `q` interpolator would have typed.
                         // This one did not, so it is the reflection quasiquote,
                         // whose real problem is not that `StringContext` lacks
                         // the member.
                         self.diags.truncate(before);
-                        self.report_quasiquote(span, kind, &parts, nargs);
-                        tree.ty = Type::Error;
+                        if !self.reify_quasiquote(tree, span, kind, &parts, &args, pt) {
+                            self.report_quasiquote(span, kind, &parts, args.len());
+                            tree.ty = Type::Error;
+                        }
                     }
                 }
                 return;
@@ -9549,6 +9642,16 @@ impl Typer {
         let recv = self.method_receiver(fun);
         let mut preceding = Self::applied_clause_args(fun);
         preceding.extend_from_slice(prior);
+        // The getter's own arity is the truth, not the number of arguments
+        // that precede the default. scalac emits a *nullary* getter whenever
+        // the default does not read an earlier parameter --
+        // `SeqOps.lastIndexOf$default$2()` takes nothing though `elem` comes
+        // first, and so does
+        // `ReificationSupportApi.SyntacticTermIdent.apply$default$2()`. Passing
+        // arguments a nullary getter does not declare emits a call that cannot
+        // link.
+        let want = self.st.get(gid).paramss.iter().flatten().count();
+        preceding.truncate(want);
         let preceding = &preceding[..];
         let mut gfun = Tree {
             id: NodeId(0),
@@ -13118,8 +13221,21 @@ impl Typer {
             return Vec::new();
         }
         let Some(cls) = self.st.class_sym_of(recv_ty) else {
+            // Worth tracing: a receiver that never resolved to a class symbol
+            // (a `Type::Named` left behind by a pickle that records member
+            // types by simple name) can never be completed, and the user only
+            // sees "is not a member".
+            crate::pickle_supply::trace(format_args!(
+                "#{name}: receiver {} has no class symbol",
+                self.st.display_type(recv_ty)
+            ));
             return Vec::new();
         };
+        crate::pickle_supply::trace(format_args!(
+            "#{name}: asking {} ({})",
+            self.st.get(cls).name,
+            self.st.get(cls).jvm_name
+        ));
         // Members found on a companion object land on that module class, not
         // on `cls`, so take what completion reports rather than re-looking-up.
         self.pickle
