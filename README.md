@@ -232,7 +232,7 @@ Java 6 には default method がないので、具象メンバー付き trait �
 
 `class C extends A with B` で A と B が同じ `msg` を持つとき、実行時は B です。線形化は Scala の C3 です（`C extends Base with A with B` → `C, B, A, Base`）。
 
-trait の `val` は interface 上の getter / `$init$set$` と、`T$class.$init$` で右辺を評価します。実装クラスがフィールドを持ち、コンストラクタが mixin `$init$` を（より一般的な親から）呼びます。
+trait の `val` は interface 上の getter / `$init$set$` と、`T$class.$init$` で右辺を評価します。実装クラスがフィールドを持ち、コンストラクタが mixin `$init$` を（より一般的な親から）呼びます。`object O extends T` も同じで、フィールド・アクセサ・`$init$` 呼び出しをクラスと同じだけ出します。
 
 スタック可能な trait の `abstract override` は、`T$class` 内の `super.m` を `T$$super$m`（実装クラスが線形化の次へフォワード）にします。`class C extends Base with A with B` で両方 `abstract override def msg` なら、実行時は `B-A-base` です。
 
@@ -303,9 +303,30 @@ try close() catch {
 
 `class Outer { class Inner }` は `Outer$Inner` になり、非 static な内部クラスは `$outer` をコンストラクタで受け取ります。primary / 補助コンストラクタの overload 選択はソース引数だけを見ますが、呼び出す `<init>` 記述子には `$outer` を前置します。`object Outer { object Inner }` は `Outer$Inner$` と `MODULE$` です。
 
+**trait のメンバークラス**も同じです。nsc と同じく `$outer` の JVM 型は外側 trait の
+interface 型（自分型 `self: P =>` があり、それが外側 trait の派生なら `P`）で、
+`<init>` の第一引数に置きます。内側から外側の `def` / `val` / `lazy val` / 型メンバを
+読むと `$outer` を辿って `invokeinterface` になります。多段ネスト
+（`trait T { class Inner { class Deep } }`）は `$outer` を 2 段辿ります。
+
+`new` に外側インスタンスを渡す先は次の順で決めます。
+
+- `new p.Inner`（`p` は val / `this` / object）のように**前置詞が書かれていれば**それ
+- `this` とその `$outer` チェーンで届くならそこ
+- 届かなければ、外側の `object`（`object O extends T { class R extends Inner }` は
+  `O$.MODULE$` を親コンストラクタへ渡す。nsc と同じ）
+
+trait のメンバークラスを継承したクラス／オブジェクトは、親の `<init>` にも `$outer` を
+渡します。
+
 ### lazy val
 
 フィールドに加えて `bitmap$0: Int` と、同期したアクセサを出します。初期化は最初の読み取りまで遅延します。
+
+trait の `lazy val` は（nsc の mixin フェーズと同じく）実装クラス／オブジェクトごとに
+フィールド・`bitmap$0` のビット・アクセサを複製します。ビットはクラス自身の `lazy val`
+と継承したものを 1 本のリストにして採番するので衝突しません。interface 側は abstract
+宣言だけなので、呼び出しは `invokeinterface` です。
 
 ### 型注釈のないメンバのシグネチャ（lazy completer）
 
@@ -1126,6 +1147,22 @@ import の解決は `crates/cli/tests/imports.rs`（fixture 接頭辞 `imports`�
 
 slick 由来の構文は `crates/cli/tests/slickparse.rs`（fixture 接頭辞 `slickparse`）の専用スイート（6 本）です。正常系はすべて **scalac 2.13.16 と scala-rs の両方でコンパイルして実行し、stdout を突き合わせる**差分テストで、`scalac` か jar が無ければスキップします。`slickparse_catch_expr.scala` は `try b catch <PartialFunction 値>`（ハンドラの遅延評価・1 回だけ・受け付けない例外の再送出・`finally` 併用・値位置の `try`・`catch { 値 }`）、`slickparse_pattern_star.scala` は `-Xsource:3` / `-Xsource:3-cross` での `case List(h, t*)`（`t @ _*` / `_*` / ユーザー extractor / 大文字名の束縛と併記）、`slickparse_super_type.scala` は型位置の `super.T`（戻り値型 / パラメータ型 / ローカル `val` / 型エイリアス / `extends` の親 / `C.super`）を回します。負例は `slickparse_pattern_star_bad.scala` で、フラグ無しと `-Xsource:2.13` の両方で nsc と同じ `bad simple pattern: use _* to match a sequence` になることを見ています。
 
+trait のメンバークラスの `$outer` と、共変な戻り値型のオーバーライドで要る bridge は
+`crates/cli/tests/outer.rs`（fixture 接頭辞 `outer`）の専用スイート（5 本）です。
+`outer.scala` は trait のメンバークラス、`class` / `trait` / `object` からのインスタンス化、
+2 段ネスト（`Inner` の中の `Deep`）、`new p.Inner`（前置詞つき）、内側からの
+`def` / `val` / `lazy val` / 型メンバ参照、そして trait でない従来のネストクラスを回します。
+`outer_bridge.scala` は `case object` の `override def reverse: Desc.type = Desc` と
+`override def self: Dog` と `object` の共変オーバーライドです。どちらも**私有ランタイムと
+`--scala-library` の両方**でコンパイルして `java -Xverify:all` で実行し、期待出力は
+**実 scalac 2.13.16 の stdout そのまま**です。`outer_self.scala` は slick のケーキそのもの
+（`trait Comp { self: Prof => abstract class Table }`）で、trait メソッド内のローカル
+クラスと trait のメンバークラス内の匿名クラスも回します。
+`outer_field_is_the_trait_interface` は `T$Inner` の `<init>` が
+`(LT;Ljava/lang/String;)V`、`T$Inner$Deep` が `(LT$Inner;)V` であることを、
+`outer_field_is_the_self_type` は `Comp$Table` が `(LProf;Ljava/lang/String;)V` である
+ことを（どちらも nsc と同じ `$outer` の型と位置）classfile のバイト列で固定します。
+
 def マクロは `crates/cli/tests/macros.rs` にまとめています。呼ばれない macro def のコンパイルと、`Sugar$.class` にメソッドが出ていないことは `macro_def.scala`。マクロ呼び出しの診断は `macro_call_bad.scala`（`macro expansion is not implemented`）。戻り値型の無いマクロ def は `macro_no_result_type_bad.scala`。`Context` を第 1 引数に取らない実装は `macro_impl_shape_bad.scala`。解決できない実装参照は `macro_impl_missing_bad.scala`。whitebox は `macro_whitebox_bad.scala`。設計は [`docs/macros.md`](docs/macros.md)。
 
 名前付き引数とデフォルト引数は `tests/fixtures/namedargs.scala` にまとめ、`crates/cli/tests/e2e.rs` から 2 通りで回します: `scala_library_dual_run_namedargs`（jar リンクで実行し `expected/namedargs.txt` と一致）と `real_scalac_dual_run_namedargs`（**実 scalac 2.13.16 でコンパイル・実行した stdout** と、期待値および scala-rs の出力の三者が一致することを見る）。中身は並べ替え（`Api.area(height = 3, width = 4)`）、自分の位置にある名前付き引数のあとの位置引数（`Api.area(width = 4, 3)`）、デフォルトとの組み合わせ、コンパニオン `apply`、後続の引数リストのデフォルト（`Api.curried(1)(2)` / `Api.dep(4)()`）、可変長引数（`Api.tagged(first = 1)` / `Api.tagged(first = 1, 2, 3)`）、case class の `apply` / `copy` / `super.info.copy(port = 2)`、コンストラクタの名前付き引数とデフォルト（`new Server(threads = 8)` / `new Server()`）、パラメータ名で絞るオーバーロードです。負例は `namedargs_unknown_bad.scala`（`unknown parameter name: q`。メソッドとコンストラクタの両方）、`namedargs_dup_bad.scala`（`parameter 'c' is already specified at parameter position 2`）、`namedargs_order_bad.scala`（`positional after named argument.`）で、いずれも文面を実 scalac 2.13.16 に合わせています。
@@ -1165,6 +1202,34 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   `type mismatch; found: 1  required: Byte` になる（`1.toByte` は通る）。ボックス型の分離
   とは独立の、定数型の narrowing の穴。
 
+- **trait の `val` をクラスが `override val` で上書きできない**。`trait T { val v = "v" }`
+  を `class D extends T { override val v = "d" }` で上書きすると、`D` に
+  `$init$set$v` が出ないので `T$class.$init$` から `AbstractMethodError` になる。
+  `$init$` は trait ごとに 1 本で全 `val` を代入する作りなので、「この実装クラスでは
+  この `val` の初期化を飛ばす」を表現できない。nsc は上書きされた `val` の初期化を
+  そもそも走らせない。`$init$` を実装クラスごとに分けるか、setter を no-op にしたうえで
+  右辺の評価も外す必要がある。
+- **テストハーネスの一時ディレクトリ衝突**（`cargo test --workspace` が不定期に落ちる）。
+  `crates/cli/tests/{xsource3,imports,e2e,lang,...}.rs` の `tmp_dir(tag)` は
+  `{tag}-{pid}-{nanos}` で名前を作るが、同じ fixture 名を tag に使うテストが
+  複数あり、macOS の `SystemTime` はマイクロ秒粒度なので、並列実行で同じ瞬間に
+  入った 2 本が**同じディレクトリを共有**する。片方の `remove_dir_all` が
+  もう片方の classfile を消し、`NoClassDefFoundError` や
+  `ClassFormatError: Truncated class file` になる。main でも再現する。
+  各スイートを単独で回せば必ず通る。`tmp_dir` にプロセス内カウンタを足せば直る
+  （`crates/cli/tests/outer.rs` はそうしてある）。
+- **trait のメンバークラスの分割コンパイル**。同一 run（複数ファイルを 1 回の
+  `compile` に渡す）は通るが、先に emit した classfile を `-cp` 経由で読む別 run では
+  `value describe is not a member of People` になる。pickle からメンバークラスの
+  メンバを復元できていない（`$outer` 対応の前からある穴で、今回変えていない）。
+- **`case object` の `toString` / `equals` / `hashCode`**。`case object Foo` は
+  `Foo$@1a2b3c` を返す（scalac は `Foo`）。`emit_case_object_methods` は
+  `emit_class` からしか呼ばれず、module では走らない。case class 用に括弧つきの
+  文字列を組むコードなので、case object 用に単純名を返す分岐が要る。
+- **trait の `var` への代入**。`trait T { var n = 0 }` を実装クラスの側から
+  `n = n + 1` すると、setter を呼ばず trait の名前でフィールドへ `putfield` するので
+  `NoSuchFieldError: n` で落ちる。trait の `var` は interface 上の getter / setter の
+  ペアにして、代入を setter 呼び出しに落とす必要がある。
 - **implicit 探索の残り**: 多相 implicit のユニフィケーションと再帰導出、発散の打ち切り、nsc 相当の specificity は入った（「Implicit 解決」節）。残るのは (a) `xs.toMap` を `scala.collection.Iterable` にも載せること — pickle 供給が具象コレクション（`HashMap` / `ConstArray` …）に自前の `toMap` を付けるので、継承した 2 本目がオーバーロード衝突になる。いまは `List` / `Iterator` だけに宣言している、(b) 期待型からのメソッド型パラメータ推論が要る implicit（slick の `TypedType[T]` / `TypedType[P1]` はこちらで、implicit 探索ではなく `T` の推論が先に必要）、(c) 診断文面は nsc の複数行（`both … and … match expected type …`）ではなく 1 行のまま
 - **def マクロの展開**。`def f: T = macro Impl.method` は**パースして**バインディングを
   シンボル（`Symbol.macro_impl`）に記録し、マクロ def のバイトコードは nsc と同じく出さない。
