@@ -1049,8 +1049,40 @@ fn super_accessor_name(st: &SymbolTable, trait_id: SymbolId, method: &str) -> St
     format!("{}$$super${}", st.get(trait_id).name, method)
 }
 
-fn setter_name(field: &str) -> String {
-    format!("$init$set${field}")
+/// nsc's mixin setter for a trait `val`: `p$q$T$_setter_$v_$eq`. Naming it
+/// after the owning trait is what lets two traits carry a `val` of the same
+/// name, and what lets a class that `override val`s one implement the setter
+/// as a no-op (see `emit_trait_val_accessors`).
+fn trait_val_setter_name(st: &SymbolTable, trait_id: SymbolId, field: &str) -> String {
+    let owner = class_internal(st, trait_id).replace('/', "$");
+    format!("{owner}$_setter_${}_$eq", encode_method_name(field))
+}
+
+/// `java.lang.String.hashCode`, so a `case object`'s `hashCode` can be folded
+/// to the same constant nsc folds it to.
+fn java_string_hash(s: &str) -> i32 {
+    s.encode_utf16()
+        .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32))
+}
+
+/// A `var`'s setter, trait member or not: nsc's plain `v_$eq`.
+fn var_setter_name(field: &str) -> String {
+    format!("{}_$eq", encode_method_name(field))
+}
+
+/// The setter `T$class.$init$` (and an assignment) goes through for a trait
+/// member: a `var` has an ordinary public setter, a `val` only the mixin one.
+fn trait_member_setter_name(
+    st: &SymbolTable,
+    trait_id: SymbolId,
+    field: &str,
+    mutable: bool,
+) -> String {
+    if mutable {
+        var_setter_name(field)
+    } else {
+        trait_val_setter_name(st, trait_id, field)
+    }
 }
 
 fn tree_contains_super(tree: &Tree) -> bool {
@@ -1817,9 +1849,17 @@ impl<'a> Gen<'a> {
                     let ty = val_tree_ty(self.st, stt);
                     let gdesc = format!("(){}", jvm_desc(self.st, &ty));
                     b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, name, &gdesc);
-                    if !rhs.is_empty() && !mods.flags.contains(Flags::LAZY) {
-                        let sdesc = format!("({})V", jvm_desc(self.st, &ty));
-                        b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, &setter_name(name), &sdesc);
+                    let sdesc = format!("({})V", jvm_desc(self.st, &ty));
+                    if mods.flags.contains(Flags::MUTABLE) {
+                        // A trait `var` — abstract or not — is a getter plus a
+                        // public `v_$eq`, exactly as nsc emits it.
+                        b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, &var_setter_name(name), &sdesc);
+                    } else if !rhs.is_empty() && !mods.flags.contains(Flags::LAZY) {
+                        b.add_abstract(
+                            ACC_PUBLIC | ACC_ABSTRACT,
+                            &trait_val_setter_name(self.st, class_id, name),
+                            &sdesc,
+                        );
                     }
                 }
             }
@@ -2746,9 +2786,15 @@ impl<'a> Gen<'a> {
                     asm.aload(0);
                     gen_expr(asm, &mut frame, &ctx, rhs);
                     let ty = val_tree_ty(st, vd);
+                    let setter = trait_member_setter_name(
+                        st,
+                        trait_id,
+                        name,
+                        mods.flags.contains(Flags::MUTABLE),
+                    );
                     asm.invokeinterface(
                         &iface_owned,
-                        &setter_name(name),
+                        &setter,
                         &format!("({})V", jvm_desc(st, &ty)),
                     );
                 }
@@ -2921,7 +2967,8 @@ impl<'a> Gen<'a> {
         for m in &b.methods {
             skip.insert(m.name.clone());
         }
-        let mut needed: Vec<(String, Type)> = Vec::new();
+        // (name, type, owning trait, is a `var`)
+        let mut needed: Vec<(String, Type, SymbolId, bool)> = Vec::new();
         let mut seen = HashSet::new();
         for parent in linearize(self.st, class_id).into_iter().skip(1) {
             let Some(vals) = self.trait_vals.get(&parent) else {
@@ -2932,21 +2979,36 @@ impl<'a> Gen<'a> {
                 if name.is_empty() || !seen.insert(name.clone()) {
                     continue;
                 }
-                needed.push((name, val_tree_ty(self.st, v)));
+                let mutable = match &v.kind {
+                    TreeKind::ValDef { mods, .. } => mods.flags.contains(Flags::MUTABLE),
+                    _ => false,
+                };
+                needed.push((name, val_tree_ty(self.st, v), parent, mutable));
             }
         }
         let class_name = b.this_name.clone();
-        for (name, ty) in needed {
-            if skip.contains(&name) {
-                continue;
-            }
+        for (name, ty, owner, mutable) in needed {
             let fdesc = jvm_desc(self.st, &ty);
             let gdesc = format!("(){fdesc}");
             let sdesc = format!("({fdesc})V");
+            let sort = jvm_sort(&ty);
+            let setter = trait_member_setter_name(self.st, owner, &name, mutable);
+            // `override val v = …`: the class has its own field, getter and
+            // initialisation, but the trait's mixin setter is still abstract on
+            // the interface. nsc implements it as a no-op so `T$class.$init$`
+            // does not clobber the override — do the same.
+            if skip.contains(&name) {
+                if !mutable && !skip.contains(&setter) {
+                    b.add_code(ACC_PUBLIC, &setter, &sdesc, 1 + sort.slots(), |asm| {
+                        asm.vreturn();
+                    });
+                    skip.insert(setter);
+                }
+                continue;
+            }
             let fname = name.clone();
             let class_c = class_name.clone();
             let fdesc_c = fdesc.clone();
-            let sort = jvm_sort(&ty);
             b.add_code(ACC_PUBLIC, &name, &gdesc, 1, |asm| {
                 asm.aload(0);
                 asm.getfield(&class_c, &fname, &fdesc_c);
@@ -2955,18 +3017,14 @@ impl<'a> Gen<'a> {
             let fname = name.clone();
             let class_c = class_name.clone();
             let fdesc_c = fdesc.clone();
-            b.add_code(
-                ACC_PUBLIC,
-                &setter_name(&name),
-                &sdesc,
-                1 + sort.slots(),
-                |asm| {
-                    asm.aload(0);
-                    load(asm, 1, sort);
-                    asm.putfield(&class_c, &fname, &fdesc_c);
-                    asm.vreturn();
-                },
-            );
+            b.add_code(ACC_PUBLIC, &setter, &sdesc, 1 + sort.slots(), |asm| {
+                asm.aload(0);
+                load(asm, 1, sort);
+                asm.putfield(&class_c, &fname, &fdesc_c);
+                asm.vreturn();
+            });
+            skip.insert(name);
+            skip.insert(setter);
         }
     }
 
@@ -3139,6 +3197,12 @@ impl<'a> Gen<'a> {
         let class_jvm = b.this_name.clone();
         let simple = self.st.get(class_id).name.clone();
         let defined: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
+        if is_module_class(self.st, class_id) {
+            // The module class is `Asc$`; the `case object` is called `Asc`.
+            let name = simple.strip_suffix('$').unwrap_or(&simple).to_string();
+            Self::emit_case_module_methods(b, &name, &defined);
+            return;
+        }
         let field_info: Vec<(String, Type, String)> = fields
             .iter()
             .map(|f| {
@@ -3148,6 +3212,27 @@ impl<'a> Gen<'a> {
                 (s.name.clone(), ty, desc)
             })
             .collect();
+
+        if !defined.contains("productPrefix") {
+            let text = simple.clone();
+            b.add_code(
+                ACC_PUBLIC,
+                "productPrefix",
+                "()Ljava/lang/String;",
+                1,
+                move |asm| {
+                    asm.ldc_string(&text);
+                    asm.areturn();
+                },
+            );
+        }
+        if !defined.contains("productArity") {
+            let n = field_info.len() as i32;
+            b.add_code(ACC_PUBLIC, "productArity", "()I", 1, move |asm| {
+                asm.iconst(n);
+                asm.ireturn();
+            });
+        }
 
         if !defined.contains("toString") {
             let fi = field_info.clone();
@@ -3264,6 +3349,44 @@ impl<'a> Gen<'a> {
                     asm.invokestatic("java/util/Objects", "hashCode", "(Ljava/lang/Object;)I");
                     asm.iadd();
                 }
+                asm.ireturn();
+            });
+        }
+    }
+
+    /// A `case object`'s synthetic members. nsc gives the module class a
+    /// `toString`/`productPrefix` returning the object's name and a `hashCode`
+    /// folded at compile time to `name.hashCode`; `equals` stays `Object`'s
+    /// reference equality, which is exactly right for a singleton.
+    fn emit_case_module_methods(b: &mut ClassBuilder, name: &str, defined: &HashSet<String>) {
+        let class_jvm = b.this_name.clone();
+        for m in ["toString", "productPrefix"] {
+            if defined.contains(m) {
+                continue;
+            }
+            let text = name.to_string();
+            b.add_code(ACC_PUBLIC, m, "()Ljava/lang/String;", 1, move |asm| {
+                asm.ldc_string(&text);
+                asm.areturn();
+            });
+        }
+        if !defined.contains("hashCode") {
+            let h = java_string_hash(name);
+            b.add_code(ACC_PUBLIC, "hashCode", "()I", 1, move |asm| {
+                asm.iconst(h);
+                asm.ireturn();
+            });
+        }
+        if !defined.contains("productArity") {
+            b.add_code(ACC_PUBLIC, "productArity", "()I", 1, |asm| {
+                asm.iconst(0);
+                asm.ireturn();
+            });
+        }
+        if !defined.contains("canEqual") {
+            b.add_code(ACC_PUBLIC, "canEqual", "(Ljava/lang/Object;)Z", 2, |asm| {
+                asm.aload(1);
+                asm.instanceof(&class_jvm);
                 asm.ireturn();
             });
         }
@@ -3691,11 +3814,37 @@ impl<'a> Gen<'a> {
             let fname = name.clone();
             let fdesc = jvm_desc(self.st, &ty);
             let ret_ty = ty.clone();
+            let cls = class_name.clone();
             b.add_code(ACC_PUBLIC, &fname, &desc, 1, |asm| {
                 asm.aload(0);
-                asm.getfield(&class_name, &fname, &fdesc);
+                asm.getfield(&cls, &fname, &fdesc);
                 emit_return(asm, &ret_ty);
             });
+            // A `var` also gets nsc's `v_$eq`; that is the setter an abstract
+            // `var` declared in a mixed-in trait resolves to.
+            if !mods.flags.contains(Flags::MUTABLE) {
+                continue;
+            }
+            let setter = var_setter_name(name);
+            if b.methods.iter().any(|m| m.name == setter) {
+                continue;
+            }
+            let fname = name.clone();
+            let fdesc = jvm_desc(self.st, &ty);
+            let cls = class_name.clone();
+            let sort = jvm_sort(&ty);
+            b.add_code(
+                ACC_PUBLIC,
+                &setter,
+                &format!("({fdesc})V"),
+                1 + sort.slots(),
+                |asm| {
+                    asm.aload(0);
+                    load(asm, 1, sort);
+                    asm.putfield(&cls, &fname, &fdesc);
+                    asm.vreturn();
+                },
+            );
         }
     }
 
@@ -3855,6 +4004,10 @@ impl<'a> Gen<'a> {
                 ));
             }
         }
+
+        // `case object Asc`: nsc's `toString` / `hashCode` / `productPrefix`
+        // live on the module class, not on a companion.
+        self.emit_case_object_methods(&mut b, cls);
 
         // `case object Asc extends Direction { override def reverse: Desc.type
         // = Desc }`: a module overriding with a narrower result type needs the
@@ -5089,6 +5242,17 @@ fn gen_assign(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, lhs: &Tree,
             }
             if !id.is_none() {
                 let s = ctx.st.get(id);
+                // A trait's `var` lives on the implementing class, not on the
+                // interface: assign through nsc's `v_$eq` accessor. Reaching
+                // for the field would be a `NoSuchFieldError` on the trait.
+                if is_trait_owned_term(ctx.st, id) {
+                    load_owner_instance(asm, ctx, s.owner);
+                    gen_expr(asm, frame, ctx, rhs);
+                    let owner = class_internal(ctx.st, s.owner);
+                    let desc = format!("({})V", jvm_desc(ctx.st, &s.ty));
+                    asm.invokeinterface(&owner, &var_setter_name(&s.name), &desc);
+                    return;
+                }
                 load_this(asm, ctx);
                 gen_expr(asm, frame, ctx, rhs);
                 asm.putfield(
@@ -5108,7 +5272,7 @@ fn gen_assign(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, lhs: &Tree,
                 let s = ctx.st.get(lhs.sym);
                 let owner = class_internal(ctx.st, s.owner);
                 let desc = format!("({})V", jvm_desc(ctx.st, &s.ty));
-                asm.invokeinterface(&owner, &setter_name(&s.name), &desc);
+                asm.invokeinterface(&owner, &var_setter_name(&s.name), &desc);
                 return;
             }
             let owner = if !lhs.sym.is_none() {
