@@ -148,6 +148,23 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
   nsc と同じく**出さない**（だから Java から呼べない）。戻り値型の省略 / object のメソッド
   でない実装 / `Context` を第 1 引数に取らない実装 / 解決できない参照 / whitebox は診断する。
   **展開は未実装**なので、呼び出し地点は診断して落とす。設計は [`docs/macros.md`](docs/macros.md)
+- **quasiquote の認識と診断**: `q"..."` / `tq"..."` / `pq"..."` / `cq"..."` は
+  `StringContext` の普通の補間子ではなく、nsc の**コンパイラ内蔵マクロ**である。
+  補間文字列の中身を（`$x` / `${…}` / `..$xs` / `...$xss` をプレースホルダに置き換えて）
+  **scala-rs のパーサで実際に構文解析し**、通らなければ
+  `unimplemented syntax: quasiquote q"..." (理由)`、通れば
+  `macro expansion is not implemented: cannot expand quasiquote q"..."` を出す。
+  **ユーザ定義の `q` 補間子は横取りしない**。展開（reification）は未実装
+  （[`docs/macros.md`](docs/macros.md) §6.2 / §7.1）
+- **package object のメンバ**: jar の `scala.math.Pi` のような package object の
+  `val` / `def`。typer はこれをパッケージシンボルに畳み込むが、パッケージには実行時の値が
+  無いので、codegen は `<pkg>/package$.MODULE$` をレシーバに積む
+- **引数なし `def` の結果に対する `apply` 挿入**: `def mk: Box` に対する `mk("a")` は
+  `mk.apply("a")`。reflect API の抽出子（`def Literal: LiteralExtractor` → `Literal(x)`）が
+  この形
+- **`import <値>._`**: プレフィクスが object でも package でもなく**値**のとき、
+  その値の*型*のメンバを入れ、無修飾の参照を `値.メンバ` に書き戻す
+  （`import c.universe._` の形）
 
 フィクスチャで実際に動く範囲は README 末尾の表を見てください。
 
@@ -961,6 +978,15 @@ nsc は `case class C(implicit x: Int)` 自体を拒否するので、第 1 リ�
   実行モデルの設計・実証・段階的な計画は **[`docs/macros.md`](docs/macros.md)** にあります。
   当面のゲート: whitebox マクロ / macro bundle / マクロバインディングの pickle /
   `scala.reflect` API の prelude / quasiquote / `reify`
+- **quasiquote の展開（reification）**。`q"..."` / `tq"..."` / `pq"..."` / `cq"..."` は
+  **認識して診断する**ところまでです（上の「実装している言語サブセット」参照）。中身は
+  scala-rs のパーサで実際に構文解析するので、通らない構文は
+  `unimplemented syntax: quasiquote ...` として**その場で**報告されます。
+  残りは、解析結果を `internal.reificationSupport.Syntactic*` の呼び出しに落とすことと、
+  その受け皿である reflect ABI の型検査・コード生成です。何が要るかは
+  [`docs/macros.md`](docs/macros.md) §7.3 に列挙しました。
+  なお slick の `ShapedValue.mapToImpl` にある 14 箇所の quasiquote は
+  **すべて構文解析できて**おり、`unimplemented syntax` は 1 件も出ません
 - full nsc pickle（出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / MODULESYM / VALsym / EXTref / EXTMODCLASSref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe / TYPEBOUNDStpe / THIStpe / SINGLEtpe / NOPREFIXtpe / CONSTANTtpe / LITERALint / LITERALboolean / LITERALstring ほかリテラル / EXISTENTIALtpe / REFINEDtpe / SYMANNOT / ANNOTATEDtpe / ANNOTINFO / TREE（IDENTtree / SELECTtree / THIStree / SUPERtree / APPLYtree）のサブセット。ByteCodecs は SID-10。ワイヤ形式は nsc と同じ nentries + ビッグエンディアン Nat。vals は METHOD|STABLE|ACCESSOR ゲッター + NullaryMethodType。case class は CASE + フィールド CASEACCESSOR。Flags は nsc raw long を `rawToPickledFlags`（VARARGS / BRIDGE / JAVA を適用箇所で出す）。scalac 2.13.16 が `val` / パラメータ付き `def` / `id[T]` / `new Point` + `p.x` / companion apply `Point(...)` / term `Point` / extractor `unapply` / object の `def` / `def f(xs: List[_]): Int` / `@deprecated("msg", "2.13.0") def g` / `def me: this.type` / `def f(xs: List[_ <: AnyRef])` / `def h(x: Int @unchecked)` / `val one: 1` / `def lit(x: 1)` / `def nest(xs: List[_ <: List[_]])` / `def idRef(x: MixA with MixB { def f: Int })` / `@Ann(foo)` / `@Ann(c.x)` / `@Ann(this)` / `@Ann(classOf[Int])` / `@Ann(ident(1))` / `@Ann(this.x)` / `@Ann(super.foo)` / `@Ann(ident(ident(1)))` / `@Ann(foo = 1)` / `@Ann(foo = this.x)` / `@Ann(foo = bar)` / `Lib.join("a","b")` / `new OrdBox(1).compare(...)` を typecheck できる範囲。full pickle ではない。残る穴は Remaining）
 
 対象外（診断する / パースしない）:
@@ -1638,6 +1664,8 @@ trait のメンバークラスの `$outer` と、共変な戻り値型のオー�
 `outer_field_is_the_self_type` は `Comp$Table` が `(LProf;Ljava/lang/String;)V` である
 ことを（どちらも nsc と同じ `$outer` の型と位置）classfile のバイト列で固定します。
 
+quasiquote と、その受け皿である reflect ABI の下地は `crates/cli/tests/quasi.rs` にまとめています。正常系 `tests/fixtures/quasi.scala` は `scala_library_dual_run_quasi`（jar リンクで実行し `expected/quasi.txt` と一致）と `real_scalac_dual_run_quasi`（**実 scalac 2.13.16** の stdout・期待値・scala-rs の出力の三者一致）の 2 通りで回し、package object のメンバ（`scala.math.Pi` / `abs` / `max`）、`import <値>._`、引数なし `def` の結果に対する `apply` 挿入（`Literal(1)` = `Literal.apply(1)`）、そして**ユーザ定義の `q` 補間子が quasiquote に横取りされないこと**を実行結果まで固定します。異常系 `quasi_bad.scala` は `fixtures_quasi_bad_is_error` が `q` / `tq` / `pq` / `cq` の 4 種すべてに診断が出ること、`q""` は `unimplemented syntax: quasiquote q"..." (empty quasiquote)` になることを見ます。`quasiquote_is_not_reported_as_a_stringcontext_member` は、以前の**誤った**診断 `value q is not a member of StringContext` が戻らないことを固定します。
+
 def マクロは `crates/cli/tests/macros.rs` にまとめています。呼ばれない macro def のコンパイルと、`Sugar$.class` にメソッドが出ていないことは `macro_def.scala`。マクロ呼び出しの診断は `macro_call_bad.scala`（`macro expansion is not implemented`）。戻り値型の無いマクロ def は `macro_no_result_type_bad.scala`。`Context` を第 1 引数に取らない実装は `macro_impl_shape_bad.scala`。解決できない実装参照は `macro_impl_missing_bad.scala`。whitebox は `macro_whitebox_bad.scala`。設計は [`docs/macros.md`](docs/macros.md)。
 
 名前付き引数とデフォルト引数は `tests/fixtures/namedargs.scala` にまとめ、`crates/cli/tests/e2e.rs` から 2 通りで回します: `scala_library_dual_run_namedargs`（jar リンクで実行し `expected/namedargs.txt` と一致）と `real_scalac_dual_run_namedargs`（**実 scalac 2.13.16 でコンパイル・実行した stdout** と、期待値および scala-rs の出力の三者が一致することを見る）。中身は並べ替え（`Api.area(height = 3, width = 4)`）、自分の位置にある名前付き引数のあとの位置引数（`Api.area(width = 4, 3)`）、デフォルトとの組み合わせ、コンパニオン `apply`、後続の引数リストのデフォルト（`Api.curried(1)(2)` / `Api.dep(4)()`）、可変長引数（`Api.tagged(first = 1)` / `Api.tagged(first = 1, 2, 3)`）、case class の `apply` / `copy` / `super.info.copy(port = 2)`、コンストラクタの名前付き引数とデフォルト（`new Server(threads = 8)` / `new Server()`）、パラメータ名で絞るオーバーロードです。負例は `namedargs_unknown_bad.scala`（`unknown parameter name: q`。メソッドとコンストラクタの両方）、`namedargs_dup_bad.scala`（`parameter 'c' is already specified at parameter position 2`）、`namedargs_order_bad.scala`（`positional after named argument.`）で、いずれも文面を実 scalac 2.13.16 に合わせています。
@@ -1668,6 +1696,8 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 （`Inv[Int]` を `Inv[Any]` に渡す）で固定しています。
 
 | `mism2.scala` | 型引数が解けないまま残る／宣言した結果型が上書きされる一群の修正（library dual-run のみ）：後続ユニットのメンバを参照するデフォルト引数、型パラメータが 3 つある型の `map` の結果型、ラムダの結果から解くメソッド型パラメータ、引数リスト無しの `RepShape[L, M, U]`、期待型から決まる `Coll.empty`、タプルや可変長引数の中の関数リテラル、package object の implicit 節（`classTag[Short]`）、引数を取らない `def` の値位置での適用、ブロック内のローカル `def` の前方参照 | `hi later` `Some(7)` `rep` `0` `5` `42` `short` |
+
+| `quasi.scala` | quasiquote の下地（実 scalac 2.13.16 と dual-run）：jar の package object のメンバ（`scala.math.Pi` / `abs` / `max`）、`import <値>._` とその書き戻し、引数なし `def` の結果に対する `apply` 挿入（`Literal(1)` = `Literal.apply(1)`）、ユーザ定義 `q` 補間子が横取りされないこと | `3.141592653589793` `7` `9` `<1>` `<x>` `small` `<via-path>` `a$1b$2c` `user-q:a\|b` `user-tq:c` |
 
 `mism2.scala` は `crates/cli/tests/mismatch2.rs` から回します。同ファイルには最小形の
 受理テスト（`a_default_argument_may_name_a_later_units_member` /
@@ -1844,6 +1874,22 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   `scala.reflect` API の prelude と ABI コード生成（§6 フェーズ 3）、
   quasiquote と `reify`（fast track マクロなので自前実装が要る。§6.2）、
   whitebox と macro bundle。テストは `crates/cli/tests/macros.rs`
+- **quasiquote の reification**。`q"..."` / `tq"..."` / `pq"..."` / `cq"..."` は
+  **認識して中身を構文解析し**、通らなければ `unimplemented syntax: quasiquote ...`、
+  通れば `cannot expand quasiquote ...` と診断する（`crates/typer/src/quasiquote.rs`、
+  テストは `crates/cli/tests/quasi.rs`）。残件は 3 つで、`docs/macros.md` §7.3 に詳しい。
+  (a) 補完したメンバを**宣言クラス**で呼ぶこと — `u.Constant()` は
+  `scala.reflect.api.Constants` の宣言であり、`api.JavaUniverse` はバイトコード上
+  そのインタフェースを実装していない（`Universe` が abstract class なので
+  `trait JavaUniverse extends Universe` の classfile は `interfaces: 0` になる）。
+  nsc は `checkcast` を挟むが、こちらは `NoSuchMethodError` になる。
+  (b) 解析結果を `internal.reificationSupport.Syntactic*` 呼び出しに落とすこと。
+  (c) `c.Expr[T]` のようなパス依存型 — いまは `prelude_reflect.rs` が**空の `Context`** を
+  入れており、classpath 上の本物より優先されてしまう
+- **`import <値>._` のスコープ**。プレフィクスが値のときの書き戻し
+  (`term_import_prefixes`) はコンパイル単位をまたいで持ち越される。名前が
+  そのクラスのメンバに解決できたときだけ使うので実害は見ていないが、
+  本来はスコープと一緒に push / pop すべきである
 - **leftover pickle holes**（nsc 完全 pickle ではない）: MACRO / late・anti flags は **scalac 2.13.16 が既存 emit（`separate_lib` pickle）を typecheck するのに不要**だったので実装しない。`type T = Int` は nsc **ALIASsym**（tag 5）として載せた。2.13 PickleFormat に **ALIAStpe タグは無い**。named annot args の ctor 順並べ替えは **不要**: scalac 2.13.16 は `#29`/`#30` と同じ位置 pickle（ソース上の RHS 順）で `@Ann2(b = 2, a = "ok")` を typecheck する。nsc 自身は named annot をブロックに変換すると warning を出す。`@Ann(foo = 1)` の Constant と `@Ann(foo = this.x)` / `@Ann(foo = bar)` の TREE は nsc と同じ位置引数として載せた。**JAVA を EXTREF に載せない理由**: PickleFormat の `EXTref` / `EXTMODCLASSref` は `name_Ref [owner_Ref]` だけで flags フィールドが無い。余分な Nat を足すと scalac が owner と取り違える。`java.lang.Object` / `String` などは classpath の Java classfile から complete され、そこで JAVA が付く。local CLASSsym（prelude で `mark_java` したクラスを自前 pickle する場合）には既に JAVA を出している。full pickle とは主張しない
 - 残りの **StringOps**（`++` / `lengthIs` / `sizeIs` / `flatMap` / `iterator` / `sizeCompare` / `knownSize` / `appendedAll` / `prependedAll` / `>` / `>=` / `<=` / `compare` / `lengthCompare` / `patch(Int, String, Int)` / `<` / `map`（`Char => Char`）/ `:+` / `+:` / `foldRight` / `toByteOption` / `toShortOption` / `toFloatOption` / `grouped` / `foldLeft` / `toByte` / `toShort` / `toFloat` / `toLongOption` / `toDoubleOption` / `find` / `foreach` / `toBoolean` / `toBooleanOption` / `dropWhile` / `takeWhile` / `nonEmpty` / `headOption` / `lastOption` / `filterNot` / `indices` / `r` / `sorted` / `toArray` / `copyToArray` / `partition` / `exists` / `forall` / `splitAt` / `updated` / `count` / `span` / `diff` / `intersect` / `split(String)` / `filter` / `reverseIterator` 以外）
 - 残りの **ArrayOps**（`lengthIs` / `sizeIs` / `indexOf` / `copyToArray` / `iterator` / `zipWithIndex` / `knownSize` / `sizeCompare` / `filterNot` / `headOption` / `lastOption` / `partition` / `splitAt` / `span` / `find` / `contains` / `distinct` / `takeRight` / `dropRight` / `takeWhile` / `indices` / `lengthCompare` / `last` / `init` / `reverse` / `size` / `isEmpty` / `nonEmpty` / `scanLeft` / `count` / `forall` / `foldLeft` / `fold` / `foldRight` / `drop` / `dropWhile` / `exists` / `take` / `collect` / `zip` / `filter` / `slice` / 3 引数 `flatMap` / 4 引数 Array→Iterable `flatMap` と primitive wrappers / `genericArrayOps` の `head`/`map`/`foreach`/`tail` は揃った。他メソッド。`reduce` は 2.13.16 ArrayOps に無い）
@@ -1901,11 +1947,12 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   - `value length/varying is not a member of FieldSymbol`（23 件）と `value desc is not a member of Direction`（13 件）はカスケードではなく 3 つの独立した根本バグだった: (a) `qualified_type_owner`（`check.rs`）が `Foo.Bar` 型パスの `Foo` を解決するとき、同名の case class とその companion module が両方候補に挙がると宣言順で勝敗が決まっていた（companion を優先するよう修正）、(b) 複数引数リストを持つ case class（`case class F(a: A)(b: B, c: C)`）の companion `apply`/`unapply` が最初の引数リストしか見ておらず curry が崩れていた（`finish_case_apply`）、(c) `object X extends Y(args)` の module `<init>` codegen が常に無引数スーパーコンストラクタを呼んでいて `NoSuchMethodError` になっていた（`crates/backend/src/gen.rs::emit_module_init`）。
   - `value getOrElse is not a member of Any`（16 件）はカスケードで、根本原因は 2 つ: (a) `Option.flatMap` の prelude 宣言がクラス自身の型パラメータ `A` を使い回していて多相でなかった（`crates/typer/src/prelude_sgap.rs::fix_option_flat_map`）、(b) `if`/`else`（`match` も同様）の枝の `lub` が構造的な部分型判定だけで親を辿らない上に非対称だった（`SymbolTable::lub` を親チェーン探索・両側対称に拡張）。副次的に見つかった `None`（companion **module class** ではなく module 自体に `parents` を設定していた既存バグ）も修正。
   - `value apply is not a member of Iterable`（15 件）は prelude の穴で、`List` / `Seq` と同じパターン（companion `apply` が実ライブラリでは `IterableFactory$Delegate` 継承で pickle から見えない）に対処（`add_iterable_apply`、library ABI 限定・`crates/backend/src/gen.rs` に codegen を追加）。
-  - カスタム文字列補間子（`value q/tq/pq is not a member of StringContext`、14 件、`ShapedValue.scala` の `mapToImpl` 1 メソッド）は当初 `implicit class` パターンと想定していたが、実際は `scala.reflect.macros`（`scala-reflect.jar`）の **quasiquote**（`q"..."` / `tq"..."`）だった。`docs/macros.md` が既にこれを「JVM ブリッジでは展開できず scala-rs 自身の組み込み実装が要る最大の残作業」と明記しており、この小さなギャップのスライスでは手を付けていない。
+  - カスタム文字列補間子（`value q/tq/pq is not a member of StringContext`、14 件、`ShapedValue.scala` の `mapToImpl` 1 メソッド）は当初 `implicit class` パターンと想定していたが、実際は `scala.reflect.macros`（`scala-reflect.jar`）の **quasiquote**（`q"..."` / `tq"..."`）だった。**`agent/quasi` スライスで診断を正した**（以前の文面は誤りで、`q` は `Quasiquotes.Quasiquote` のメンバである）。中身は scala-rs のパーサで実際に構文解析するようにしたので、14 件すべてが構文解析できていること（`unimplemented syntax` は 0 件）が実測で分かった。残りは reification と reflect ABI で、`docs/macros.md` §7.3 に列挙した。
   - 副次的に見つけたが未修正: `case object X extends Y(...) { override def m: MoreSpecific = ... }` のように親の抽象メソッドを共変な戻り値型でオーバーライドすると `AbstractMethodError`（ブリッジメソッド未生成）。fixture 構築中に踏んだので `tests/fixtures/sgap.scala` はこのパターンを避けている。別の残課題として記録。
 - **型位置 `super.T` の残り**: 親クラスの型メンバーへのパスは通るが、`trait Mid { trait Impl extends super.Impl }` のように**親と同名**の入れ子型を定義すると、ミックス先で継承メンバーの解決が親側を選んでしまうことがある（`super` の解決ではなく、同名ネスト型のメンバー継承側の穴）
 - **`Unit` に具体化した多相メソッドの捨て方**: `PartialFunction[A, Unit].apply` のように JVM 上は `(Object)Object` を返すものだけ、statement 位置で `pop` する。`Breaks.catchBreak` / `Using.resource` のように emit 側で既に捨てている intrinsic とは重ならないよう、判定は意図的に狭くしてある（`unit_call_leaves_ref`）
 - **`agent/overloadshadow` スライス**（別のクラスを読むと既存のオーバーロード集合が消える）: 177 ファイルのエラーは **1,707 → 1,678**（`files_with_errors` は **111** のまま）。根本原因は 3 つ重なっていた: (a) `PickleSupply::complete` がクラス側で 1 つでも供給できたらコンパニオンを見ずに返していた（`java.math.MathContext` が入っているかどうかという**無関係な大域状態**で答えが変わる）、(b) `check.rs::resolve_overload` が `Type::Overload` の候補シンボルを `fun.sym` の owner から引き直すので、クラスとコンパニオンにまたがる集合の片側が丸ごと落ちる、(c) 一度クラス側に `apply(MathContext)` が入ると以降の `BigDecimal(...)` は `lookup_member` がそれを見つけて止まり、pickle 補完まで届かない。(a) は合併に、(b) は `Check::overload_groups`（引き直しで失われる集合だけ覚える）に、(c) は `Check::widen_with_companion`（**エラーを出す直前だけ**、term 位置のクラス名の選択をコンパニオンのメンバで広げて 1 度だけ解決し直す）で直した。併せて `scala.math.BigDecimal.apply(java.math.BigDecimal)`（JDBC の結果を Scala 値にするのに使う）を prelude に固定した（`crates/typer/src/prelude_oshadow.rs`。`library_abi` のみ）。残件: slick の `value getOrElse is not a member of Product`（16 件）は BigDecimal とは無関係で、`if (c) None else Some(x)` の `lub` が `Option[X]` にならず `Product` に落ちる別のバグ（`Boolean` / `Blob` / `Byte` … でも同じように出る）。`BigDecimal.apply` を eta 展開して `(Double) => BigDecimal` に渡す `new ScalaNumericType[BigDecimal](BigDecimal.apply)` は、オーバーロードの eta 展開を期待型で選べないため未対応
+- **`agent/quasi` スライス**（quasiquote と reflect ABI の下地）: slick 184 ファイルのエラーは **1,059 → 1,050**（`files_with_errors` は **105 → 104**）。数字が小さいのは、このスライスの主眼が「誤った診断を正しい診断に置き換えること」と「reflect ABI に至る道の穴を塞ぐこと」だったからである。塞いだ穴は、pickle が指す**ネストしたクラス**（`Names.TermNameExtractor` = `Names$TermNameExtractor`。しかもネストした classfile は `ScalaSignature` を持たない）、**バイトコード上の親を持たないトレイト**（`Universe` が abstract class なので `trait JavaUniverse extends Universe` の classfile は `interfaces: 0`）、**抽象型メンバ**（`type Tree >: Null <: TreeApi` — reflect API の語彙のほぼ全部）、**引数なし `def` の結果に対する `apply` 挿入**（reflect に限らない一般の欠落）、**package object のメンバのコード生成**（`scala.math.Pi` が `VerifyError` になる既存バグ）、**`import <値>._`**。詳細と残件は `docs/macros.md` §7.2 / §7.3
 - **`@specialized` codegen** はこのスライスでは開始しない
 - **オーバーロード / メソッド適用のスライスで残っているもの**: slick 177 ファイルのエラーは **2,901 → 2,539**（`tests/slick_measure.sh`。エラーを含むファイルは 116 → 115）。`no matching overload for (Type, Any, Boolean)LiteralNode` / `(#N*)(TypedType[T])Rep[T]` / `not found: extractor ==` / `type arg is not a member of OptionMapperDSL$.arg[B1, P1]` は消えた。残る上位は implicit 探索（`could not find implicit value of type TypedType[BR]` など）と、`.fm` テンプレート由来で存在しない型（`Table` / `Sequence` / `Ref`）のカスケード。`no matching overload for (String)String` は最小再現では通るので、別の穴のカスケード
 - 高階 `F[_] <% …` は nsc どおり `takes type parameters`（`F[_]: C` は nsc が受理するので実装済み。README の旧記述は誤りだったので実測に合わせて直した）

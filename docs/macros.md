@@ -565,3 +565,93 @@ blackbox だけを実装し、whitebox のマクロ def を見つけたら診断
 - §2.3 の prototype は [`docs/macro-engine-prototype/`](macro-engine-prototype/) にある。
   CI では走らない（scalac と scala-reflect.jar が要る）。走らせ方と、製品版に足りないものは
   そこの README に書いた。フェーズ 2 で `crates/macro-engine/` として正式に取り込む。
+
+### 7.1 quasiquote の**フロントエンド**（`crates/typer/src/quasiquote.rs`）
+
+`q"…"` / `tq"…"` / `pq"…"` / `cq"…"` を**認識して診断する**ところまでは動く。
+以前は `value q is not a member of StringContext` という**誤った**診断が出ていた
+（`q` は `Quasiquotes.Quasiquote` のメンバであり、欠けているのは展開である）。
+
+- 補間文字列の中身を、穴（`$x` / `${…}` / `..$xs` / `...$xss`）をプレースホルダ名に
+  置き換えて**再構成し、scala-rs のパーサで実際に構文解析する**。`..` / `...` は
+  直前の part の末尾に現れるので、そこから rank を剥がす。
+- パースできなければ `unimplemented syntax: quasiquote q"..." (理由)`。
+- パースできれば、残る欠落は reification なので
+  `macro expansion is not implemented: cannot expand quasiquote q"..."` を出す。
+- **ユーザ定義の `q` 補間子は横取りしない**。通常の custom interpolator として
+  型付けを試し、それが失敗したときだけ quasiquote として報告する
+  （fixture `quasi.scala` がこれを実行時まで検証している）。
+
+**slick での実測**: `ShapedValue.mapToImpl` の 14 箇所（`q` 12 / `tq` 1 / `pq` 1）が
+すべて認識され、しかも **`unimplemented syntax` は 1 件も出ない**。つまり
+**scala-rs のパーサは slick が使う quasiquote の中身をすべて構文解析できる**。
+残っているのは §6.2 の 2 と 3、すなわち解析結果を `Syntactic*` 呼び出しに落とす
+reification と、そのコード生成である。
+
+### 7.2 reflect ABI に向けて塞いだ穴
+
+`q"…"` を展開できても、それが落ちる先（`c.universe` / 実行時ユニバース）を
+scala-rs が型検査できなければ意味がない。フェーズ 3 の下地として次を実装した。
+いずれも reflect 専用ではない一般の修正である。
+
+1. **pickle が指すネストしたクラス**。pickle は `scala.reflect.api.Names.TermNameExtractor`
+   のように、パッケージ区切りとクラス区切りを区別せずドットで書く。実体は
+   `scala/reflect/api/Names$TermNameExtractor.class` で、しかも
+   **ネストしたクラスファイルは `ScalaSignature` を持たない**（pickle は最上位クラスの
+   classfile にまとめて入っている）。`scala_rs_pickle::sym::pickle_files_for` が
+   候補ファイルを右から順に生成して両方を解決する。
+2. **バイトコード上の親を持たないトレイト**。`scala.reflect.api.Universe` は
+   *abstract class* なので、`trait JavaUniverse extends Universe` の classfile は
+   `interfaces: 0` になり、継承関係が pickle にしか無い。
+   `erased_desc` は、classfile が親を 1 つも宣言していないクラスに限り
+   pickle の親で補う（無条件に補うと `Map#map` の erased descriptor が曖昧になる）。
+3. **抽象型メンバ**。`type Tree >: Null <: TreeApi` のような宣言は reflect API の
+   語彙そのもので、クラスではないので `ensure_class` では解決できない。
+   `PickleSupply::abstract_type_member` が `TypeMember` シンボルとして導入する。
+   クラス内部から `Constant` のように**修飾なしで**書かれる場合のために、
+   レシーバの線形化とその**外側のクラス**まで探す（`self_type_member`）。
+4. **引数なし `def` の `apply` 挿入**。`def Literal: LiteralExtractor` に対する
+   `Literal(x)` は `Literal.apply(x)` である。これは reflect に限らない一般の欠落で、
+   `def mk: Box` に対する `mk("a")` も通らなかった（`insert_apply_on_nullary`）。
+5. **package object のメンバのコード生成**。`scala.math.Pi` は
+   `scala/math/package$` の `val` だが、typer はそれをパッケージシンボルに畳み込む。
+   パッケージには実行時の値が無いので、レシーバが積まれないまま `invokevirtual` が
+   出て **`VerifyError` になっていた**（main でも再現する既存バグ）。
+   `load_package_object_receiver` が `<pkg>/package$.MODULE$` を積む。
+6. **`import <値>._`**。`import c.universe._` / `import scala.reflect.runtime.universe._`
+   の形。プレフィクスが値のときはその**型**のメンバを入れる必要があり、さらに
+   無修飾の `Literal` は `u.Literal` を意味するので、typer が
+   `Select(u, Literal)` に書き戻す（`term_import_prefixes` / `qualify_term_import`）。
+   これをしないと backend が `this` をレシーバにして `ClassCastException` になる。
+
+### 7.3 まだ塞がっていない穴（次に要るもの）
+
+**A. 展開先を宣言したクラスで呼ぶこと。** `PickleSupply` は補完したメンバを
+*レシーバ*のクラスに載せる。ところが `u.Constant()` の実体は
+`scala.reflect.api.Constants` インタフェースの宣言であり、`api.JavaUniverse` は
+バイトコード上そのインタフェースを実装していない（7.2 の 2 と同じ理由）。
+nsc は `checkcast scala/reflect/api/Constants` を挟んでから
+`invokeinterface scala/reflect/api/Constants.Constant()` を出す。
+我々は `invokeinterface scala/reflect/api/JavaUniverse.Constant()` を出すので
+実行時に `NoSuchMethodError` になる。
+**必要な作業**: `MemberHit.owner`（宣言クラス）をシンボルに記録し、codegen が
+レシーバの静的型がそれを実装していないときに `checkcast` を挿む。
+これが済めば `scala.reflect.runtime.universe` 上の Tree 構築が**実行できる**ようになり、
+quasiquote の reification をエンドツーエンドで dual-run 検証できるようになる。
+
+**B. reification 本体。** 7.1 が作った構文木を
+`internal.reificationSupport.Syntactic*` 呼び出しに落とす（§6.2 の 2）。
+穴の rank（`$` / `..$` / `...$`）と、穴の型（Tree / Name / Type / リスト）による
+分岐がここに入る。§3.3 の一覧が slick に必要な最小セットである。
+
+**C. `c.Expr[T]` などのパス依存型。** `blackbox.Context` の
+`type Expr[T] = universe.Expr[T]`（`scala.reflect.macros.Aliases`）が解決できないと
+マクロ実装のシグネチャ自体が型検査できない。現状 `crates/typer/src/prelude_reflect.rs`
+は**空の `Context`** を入れており、classpath 上の本物より優先されてしまう。
+7.2 の 1〜3 が入った今、**空の prelude をやめて scala-reflect.jar の本物を読む**方が
+筋が良い（prelude を外して試すと `Expr` が `Exprs$Expr$` として解決するところまでは
+確認済み）。ただし `--scala-library` だけでは scala-reflect.jar は classpath に無いので、
+無いときは診断を出して落とすこと。
+
+**D. engine（フェーズ 2）。** A〜C が済んでも、slick の `mapToImpl` を*呼ぶ*には
+§2.3 の JVM ブリッジが要る。こちらは prototype で検証済みで、順序としては最後でよい。

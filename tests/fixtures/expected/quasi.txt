@@ -1,0 +1,10 @@
+3.141592653589793
+7
+9
+<1>
+<x>
+small
+<via-path>
+a$1b$2c
+user-q:a|b
+user-tq:c

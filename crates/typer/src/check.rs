@@ -168,6 +168,15 @@ pub struct Typer {
     /// Fills library members the hand-written prelude does not declare, from
     /// their `ScalaSignature` pickles. Only consulted when resolution failed.
     pickle: crate::pickle_supply::PickleSupply,
+    /// `import <a value>._`: the class the members came from, and the typed
+    /// prefix tree to select them through.
+    ///
+    /// An object or package prefix needs nothing -- its members are reached
+    /// from `MODULE$` or are static -- but `import u._` where `u` is a *value*
+    /// leaves an unqualified `Literal` that only means `u.Literal`. Without
+    /// the prefix the backend loaded `this`, which is a `ClassCastException`
+    /// at run time. This is what `import c.universe._` needs.
+    term_import_prefixes: Vec<(SymbolId, Tree)>,
     /// Packages whose jar package object's pickled `type` aliases have been
     /// installed (see `install_pickled_package_aliases`). One read per package.
     pkg_aliases_done: HashSet<u32>,
@@ -365,6 +374,7 @@ impl Typer {
             tupling: false,
             parent_ctx: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
+            term_import_prefixes: Vec::new(),
             pkg_aliases_done: HashSet::new(),
             pkg_alias_gaps: HashMap::new(),
             pending_sigs: HashMap::new(),
@@ -3854,15 +3864,86 @@ impl Typer {
         self.type_expr(qual, &Type::NoType);
         if !qual.sym.is_none() {
             let id = qual.sym;
-            return vec![match self.st.get(id).kind {
-                SymKind::Module | SymKind::ModuleClass => self.st.module_class_of(id),
-                _ => id,
-            }];
+            match self.st.get(id).kind {
+                SymKind::Module | SymKind::ModuleClass => {
+                    return vec![self.st.module_class_of(id)];
+                }
+                // `import someVal._` / `import c.universe._`: the members are
+                // the members of the value's *type*, not of the val symbol,
+                // which has none. Falling through to `class_sym_of` below is
+                // what makes `import scala.reflect.runtime.universe._` bring
+                // in `Tree`, `TermName`, `internal`, ... at all.
+                SymKind::Method | SymKind::Term => {}
+                _ => return vec![id],
+            }
         }
         match self.st.class_sym_of(&qual.ty) {
-            Some(c) => vec![self.st.module_class_of(c)],
+            Some(c) => {
+                let owner = self.st.module_class_of(c);
+                if !matches!(
+                    self.st.get(owner).kind,
+                    SymKind::Module | SymKind::ModuleClass | SymKind::Package
+                ) {
+                    self.remember_term_import_prefix(owner, qual);
+                }
+                vec![owner]
+            }
             None => Vec::new(),
         }
+    }
+
+    /// Record the prefix `import <a value>._` selects its members through.
+    fn remember_term_import_prefix(&mut self, owner: SymbolId, qual: &Tree) {
+        if owner.is_none() || qual.ty.is_no_type() || qual.ty.is_error() {
+            return;
+        }
+        self.term_import_prefixes.retain(|(o, _)| *o != owner);
+        self.term_import_prefixes.push((owner, qual.clone()));
+    }
+
+    /// Turn an unqualified `Literal` that came from `import u._` back into
+    /// `u.Literal`, so the backend has a receiver to load.
+    ///
+    /// Only fires for a member the enclosing class does not itself have: a
+    /// name reached through `this` already emits correctly, and rewriting it
+    /// would change which symbol it means.
+    fn qualify_term_import(&mut self, tree: &mut Tree, name: &str, found: &[SymbolId]) -> bool {
+        if self.term_import_prefixes.is_empty() || found.is_empty() {
+            return false;
+        }
+        let owners: Vec<SymbolId> = found
+            .iter()
+            .map(|&s| self.st.get(s).owner)
+            .filter(|o| !o.is_none())
+            .collect();
+        if owners.is_empty() {
+            return false;
+        }
+        if !self.st.this_class.is_none()
+            && owners.iter().any(|&o| {
+                o == self.st.this_class
+                    || crate::pickle_supply::inherits_from(&self.st, self.st.this_class, o)
+            })
+        {
+            return false;
+        }
+        let Some((_, prefix)) = self.term_import_prefixes.iter().rev().find(|(o, _)| {
+            owners
+                .iter()
+                .any(|&m| m == *o || crate::pickle_supply::inherits_from(&self.st, *o, m))
+        }) else {
+            return false;
+        };
+        let qual = prefix.clone();
+        let span = tree.span;
+        tree.kind = TreeKind::Select {
+            qual: Box::new(qual),
+            name: name.to_string(),
+        };
+        tree.ty = Type::NoType;
+        tree.sym = SymbolId::NONE;
+        tree.span = span;
+        true
     }
 
     /// Resolve `a.b.c` to package / object / class symbols without typing it.
@@ -4260,14 +4341,63 @@ impl Typer {
         }
     }
 
+    /// Report a quasiquote that could not be typed, saying which of the two
+    /// gaps it hit. See `crates/typer/src/quasiquote.rs`.
+    fn report_quasiquote(
+        &mut self,
+        span: Span,
+        kind: crate::quasiquote::QuasiKind,
+        parts: &[String],
+        nargs: usize,
+    ) {
+        let p = kind.prefix();
+        match crate::quasiquote::check_body(kind, parts, nargs) {
+            Err(why) => self.error(
+                span,
+                format!("unimplemented syntax: quasiquote {p}\"...\" ({why})"),
+            ),
+            Ok(()) => self.error(
+                span,
+                format!(
+                    "macro expansion is not implemented: cannot expand quasiquote {p}\"...\". \
+                     Quasiquotes are compiler-internal macros with no implementation in \
+                     scala-reflect.jar, so scala-rs has to reify them itself; \
+                     see docs/macros.md \u{a7}6.2."
+                ),
+            ),
+        }
+    }
+
     fn type_expr_inner(&mut self, tree: &mut Tree, pt: &Type) {
-        if let TreeKind::InterpolatedString { prefix, .. } = &tree.kind {
-            if !matches!(prefix.as_str(), "s" | "f" | "raw") {
-                if self.library_abi && !self.st.lookup("StringContext").is_empty() {
-                    self.desugar_custom_interpolator(tree);
-                    self.type_expr_inner(tree, pt);
-                    return;
+        if let TreeKind::InterpolatedString {
+            prefix,
+            parts,
+            args,
+        } = &tree.kind
+        {
+            if !matches!(prefix.as_str(), "s" | "f" | "raw")
+                && self.library_abi
+                && !self.st.lookup("StringContext").is_empty()
+            {
+                // Kept before desugaring, which replaces the node.
+                let quasi = crate::quasiquote::QuasiKind::of(prefix)
+                    .map(|k| (k, parts.clone(), args.len()));
+                let span = tree.span;
+                let before = self.diags.len();
+                self.desugar_custom_interpolator(tree);
+                self.type_expr_inner(tree, pt);
+                if let Some((kind, parts, nargs)) = quasi {
+                    if self.diags.len() > before {
+                        // A user-defined `q` interpolator would have typed.
+                        // This one did not, so it is the reflection quasiquote,
+                        // whose real problem is not that `StringContext` lacks
+                        // the member.
+                        self.diags.truncate(before);
+                        self.report_quasiquote(span, kind, &parts, nargs);
+                        tree.ty = Type::Error;
+                    }
                 }
+                return;
             }
         }
         if matches!(&tree.kind, TreeKind::Assign { .. })
@@ -4991,6 +5121,10 @@ impl Typer {
             })
             .collect();
         let found = if terms.is_empty() { found } else { terms };
+        if self.qualify_term_import(tree, &name, &found) {
+            self.type_select(tree, pt);
+            return;
+        }
         self.bind_found(tree, found, pt);
     }
 
@@ -7099,6 +7233,7 @@ impl Typer {
             self.bind_array_ops_flat_map(fun, args, recv_ty.as_ref(), &mut arg_tys);
         }
         let fun_ty = fun.ty.clone();
+        self.ensure_apply_supplied(&fun_ty);
         let chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
         match chosen {
             OverloadPick::Found(sym, mut param_tys, mut ret) => {
@@ -7754,6 +7889,34 @@ impl Typer {
                 tree.ty = Type::Error;
             }
             OverloadPick::None => {
+                // `u.Constant("x")` where `def Constant: ConstantExtractor`:
+                // the arguments belong to the *result*'s `apply`, not to the
+                // parameterless def. nsc inserts the `apply`; without it every
+                // extractor in `scala.reflect` (`Literal`, `Constant`,
+                // `TermName`, ...) is unusable, and so is any `def m: T` whose
+                // `T` has an `apply`.
+                if self.insert_apply_on_nullary(fun) {
+                    let fun_ty = fun.ty.clone();
+                    if let OverloadPick::Found(sym, param_tys, ret) =
+                        self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt)
+                    {
+                        fun.sym = sym;
+                        tree.sym = sym;
+                        let own = (!sym.is_none()).then(|| self.st.get(sym).tparams.clone());
+                        for (i, a) in args.iter_mut().enumerate() {
+                            let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
+                            if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type() {
+                                self.type_expr(a, &p);
+                            }
+                            let p = relax_open_tparams(&p, own.as_deref());
+                            if !p.is_no_type() {
+                                self.adapt(a, &p);
+                            }
+                        }
+                        tree.ty = ret;
+                        return;
+                    }
+                }
                 if self.widen_with_companion(fun) {
                     let fun_ty = fun.ty.clone();
                     if let OverloadPick::Found(sym, param_tys, ret) =
@@ -9527,6 +9690,71 @@ impl Typer {
             .filter(|m| self.st.get(*m).tparams.len() == n);
         let first = hits.next()?;
         hits.next().is_none().then_some(first)
+    }
+
+    /// Rewrite `fun` from `m` to `m.apply` when `m` is a parameterless method
+    /// whose result type has an `apply` member.
+    ///
+    /// Returns `false` — leaving `fun` untouched — for anything else, so the
+    /// caller reports the original failure.
+    fn insert_apply_on_nullary(&mut self, fun: &mut Tree) -> bool {
+        let Type::Method { paramss, ret } = fun.ty.clone() else {
+            return false;
+        };
+        if !(paramss.is_empty() || paramss.iter().all(|c| c.is_empty())) {
+            return false;
+        }
+        if !matches!(*ret, Type::Class { .. } | Type::ModuleRef(_)) {
+            return false;
+        }
+        self.ensure_apply_supplied(&ret);
+        let Some(cls) = self.st.class_sym_of(&ret) else {
+            return false;
+        };
+        if self.st.lookup_member(cls, "apply").is_empty() {
+            return false;
+        }
+        // The receiver keeps its own symbol and span; only its type is the
+        // auto-applied one, which is exactly the shape `maybe_auto_apply`
+        // produces in value position, so the backend still emits the
+        // parameterless call before the `apply`.
+        let mut inner = fun.clone();
+        inner.ty = (*ret).clone();
+        let span = fun.span;
+        *fun = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(inner),
+                name: "apply".into(),
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+            postfix: false,
+        };
+        self.type_select(fun, &Type::NoType);
+        !fun.ty.is_error() && !fun.ty.is_no_type()
+    }
+
+    /// Make sure a value used as a function has whatever `apply` its pickle
+    /// declares before overloads are weighed.
+    ///
+    /// `u.Constant(1)` selects a `Constants.ConstantExtractor`, a library
+    /// class the prelude never declares, and then applies it. The receiver's
+    /// members are only ever fetched by `type_select`, which never runs for
+    /// the implied `.apply`, so the extractor looked empty and every
+    /// `Literal(Constant(x))` in the reflection API was rejected.
+    fn ensure_apply_supplied(&mut self, fun_ty: &Type) {
+        if !matches!(fun_ty, Type::Class { .. }) {
+            return;
+        }
+        let Some(cls) = self.st.class_sym_of(fun_ty) else {
+            return;
+        };
+        if !self.st.lookup_member(cls, "apply").is_empty() {
+            return;
+        }
+        self.supply_from_pickle(fun_ty, "apply");
     }
 
     fn resolve_overload(
