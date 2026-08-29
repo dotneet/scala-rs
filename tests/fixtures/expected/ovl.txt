@@ -1,0 +1,12 @@
+7
+1
+cfg
+t/2/true
+t/2/false
+int/5/false
+string/s/false
+int:3
+string:0
+=
+eq 42
+not 7

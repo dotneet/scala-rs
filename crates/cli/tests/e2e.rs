@@ -3499,3 +3499,30 @@ fn scala_library_dual_run_lazysig() {
 fn fixtures_lazysig_cyclic_bad_is_error() {
     compile_fails("lazysig_cyclic_bad", "recursive value y needs type");
 }
+
+// --- ovl: overload resolution and method application ----------------------
+
+/// Alias type members (`Later.Scope`, `Cfg.Names`), a factory `apply` on a
+/// plain class's companion, an overload whose alternatives differ by a
+/// trailing implicit clause after a repeated parameter, and a `val` that wins
+/// over the inherited `Any.==` in value and in extractor position.
+/// Library ABI only: the private runtime has no `Seq` for a repeated parameter.
+#[test]
+fn scala_library_dual_run_ovl() {
+    dual_run_fixture("ovl");
+}
+
+/// `Lit(1, 2)` matches `(Int, Any)` and `(Any, Int)` equally well; scalac
+/// reports `ambiguous reference to overloaded definition`.
+#[test]
+fn fixtures_ovl_ambiguous_bad_is_error() {
+    compile_fails_lib("ovl_ambiguous_bad", "ambiguous overload for apply");
+}
+
+/// A default on the last parameter does not make the earlier ones optional,
+/// and the companion's own `apply` is still checked against its parameter
+/// types. scalac reports a type mismatch on the first and third argument.
+#[test]
+fn fixtures_ovl_none_bad_is_error() {
+    compile_fails_lib("ovl_none_bad", "no matching overload");
+}

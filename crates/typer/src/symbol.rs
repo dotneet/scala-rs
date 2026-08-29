@@ -1422,6 +1422,15 @@ impl SymbolTable {
                     .join(", ");
                 format!("({}) => {}", p, self.display_type(ret))
             }
+            Type::Overload(alts) => format!(
+                "<overload {}>",
+                alts.iter()
+                    .map(|a| self.display_type(a))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ),
+            Type::Repeated(t) => format!("{}*", self.display_type(t)),
+            Type::ByName(t) => format!("=> {}", self.display_type(t)),
             other => other.to_string(),
         }
     }

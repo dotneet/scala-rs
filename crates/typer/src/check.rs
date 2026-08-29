@@ -6961,16 +6961,17 @@ impl Typer {
             return None;
         };
         let first = paramss_ids.first().cloned().unwrap_or_default();
-        if args.len() < first.len() {
-            let rest = first[args.len()..].to_vec();
-            // A repeated parameter accepts zero arguments (`count()`).
-            if rest.len() == 1
+        // A repeated parameter accepts zero arguments (`count()`), so a call
+        // that stops right before it is not short at all. Only this clause is
+        // settled by that: the clauses after it still need filling, which is
+        // what `f()(implicit …)` on `def f(xs: Int*)(implicit t: T)` needs.
+        let short_first = args.len() < first.len()
+            && !(first.len() - args.len() == 1
                 && param_tys
                     .last()
-                    .is_some_and(|t| matches!(t, Type::Repeated(_)))
-            {
-                return None;
-            }
+                    .is_some_and(|t| matches!(t, Type::Repeated(_))));
+        if short_first {
+            let rest = first[args.len()..].to_vec();
             let all_implicit = rest
                 .iter()
                 .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT));
