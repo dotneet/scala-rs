@@ -274,3 +274,30 @@ fn dead_every_method_ends_with_a_terminator() {
     }
     let _ = fs::remove_dir_all(&out);
 }
+
+/// Explicit type arguments have to reach the implicit parameter sections, and
+/// the type parameters of the enclosing *class* must not be widened away.
+/// Library-only: the repeated parameter needs the jar's `Seq` at run time.
+#[test]
+fn dead_targs_scala_library_dual_run() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip scala-library dual-run: jar not obtainable");
+        return;
+    };
+    let out = compile_fixture_with("dead_targs", &["--scala-library", jar.to_str().unwrap()]);
+    assert_eq!(run_java(&out, Some(&jar)), expected_stdout("dead_targs"));
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// Narrowing an overload by the explicit type argument must not silently fill
+/// an implicit that has no witness.
+#[test]
+fn dead_targs_bad_is_error() {
+    compile_fails(
+        "dead_targs_bad",
+        "could not find implicit value of type TT[String]",
+    );
+}

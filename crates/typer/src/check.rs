@@ -3070,7 +3070,11 @@ impl Typer {
             if !self.st.get(id).flags.contains(Flags::TRAIT)
                 && !self.st.get(id).flags.contains(Flags::INTERFACE)
             {
-                match self.pick_ctor(id, &[], None) {
+                let targs: Vec<Type> = match &tree.ty {
+                    Type::Class { args, .. } => args.clone(),
+                    _ => Vec::new(),
+                };
+                match self.pick_ctor_at(id, &targs, &[], None) {
                     OverloadPick::Found(sym, _, _) => {
                         tree.sym = id;
                         let _ = sym;
@@ -3141,7 +3145,11 @@ impl Typer {
         if class_id.is_none() {
             return;
         }
-        match self.pick_ctor(class_id, &arg_tys, None) {
+        let targs: Vec<Type> = match &class_ty {
+            Type::Class { args, .. } => args.clone(),
+            _ => Vec::new(),
+        };
+        match self.pick_ctor_at(class_id, &targs, &arg_tys, None) {
             OverloadPick::Found(sym, param_tys, _) => {
                 for (i, a) in args.iter_mut().enumerate() {
                     if let Some(p) = param_tys.get(i) {
@@ -3178,6 +3186,20 @@ impl Typer {
         arg_tys: &[Type],
         skip: Option<SymbolId>,
     ) -> OverloadPick {
+        self.pick_ctor_at(class_id, &[], arg_tys, skip)
+    }
+
+    /// `targs` are the type arguments the constructor is applied at
+    /// (`extends TypedRep[T](tt)`): a parameter declared as `TT[T]` in terms of
+    /// the *parent's* type parameter has to be read as `TT[T]` of the subclass
+    /// before the arguments are matched against it.
+    fn pick_ctor_at(
+        &self,
+        class_id: SymbolId,
+        targs: &[Type],
+        arg_tys: &[Type],
+        skip: Option<SymbolId>,
+    ) -> OverloadPick {
         if class_id.is_none() {
             return OverloadPick::None;
         }
@@ -3194,6 +3216,11 @@ impl Typer {
         // `extends A(1)(2)` and `new A(1)(2)` pass one flat argument list, so a
         // multi-clause constructor is matched against its flattened clauses.
         let flatten = |ty: Type| -> Type {
+            let ty = if targs.is_empty() {
+                ty
+            } else {
+                self.st.subst_tparams(class_id, targs, &ty)
+            };
             match ty {
                 Type::Method { paramss, ret } if paramss.len() > 1 => Type::Method {
                     paramss: vec![paramss.into_iter().flatten().collect()],
@@ -3244,6 +3271,16 @@ impl Typer {
         };
         match self.resolve_overload(&fun_ty, fun_sym, arg_tys, &Type::NoType) {
             OverloadPick::Found(sym, _, _) if Some(sym) == skip => OverloadPick::None,
+            // `resolve_overload` re-reads the alternatives off their symbols, so
+            // the picked clause comes back in terms of the class's own type
+            // parameters. Instantiate it here too.
+            OverloadPick::Found(sym, ps, ret) if !targs.is_empty() => OverloadPick::Found(
+                sym,
+                ps.iter()
+                    .map(|p| self.st.subst_tparams(class_id, targs, p))
+                    .collect(),
+                self.st.subst_tparams(class_id, targs, &ret),
+            ),
             other => other,
         }
     }
@@ -3933,6 +3970,17 @@ impl Typer {
                         if let [only] = candidates[..] {
                             sym = only;
                             base_ty = self.st.get(sym).ty.clone();
+                        }
+                    }
+                    // nsc (SLS 6.26.3): explicit type arguments first narrow an
+                    // overloaded reference to the alternatives that take that
+                    // many type parameters. Without this, `f.typed[Boolean](x)`
+                    // keeps the whole overload as its type and the implicit
+                    // clause is searched for the *uninstantiated* `TT[T]`.
+                    if matches!(base_ty, Type::Overload(_)) {
+                        if let Some(only) = self.only_alt_with_tparams(sym, targs.len()) {
+                            sym = only;
+                            base_ty = self.st.get(only).ty.clone();
                         }
                     }
                     tree.sym = sym;
@@ -6314,6 +6362,7 @@ impl Typer {
                         }
                     }
                 }
+                let own_tparams = (!sym.is_none()).then(|| self.st.get(sym).tparams.clone());
                 for (i, a) in args.iter_mut().enumerate() {
                     let mut p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                     // `Using.resource(r)(x => 10)`: A only appears in a later
@@ -6331,7 +6380,7 @@ impl Typer {
                     // `PartialFunction[Int, B]` with `B` still open. Nothing
                     // conforms to an uninstantiated parameter, so relax it to
                     // `Any` and let the literal's own result type pin `B`.
-                    p = relax_open_tparams(&p);
+                    p = relax_open_tparams(&p, own_tparams.as_deref());
                     if a.ty.is_no_type() {
                         self.type_expr(a, &p);
                     }
@@ -6807,7 +6856,9 @@ impl Typer {
                                 {
                                     self.type_expr(a, &p);
                                 }
-                                let p = relax_open_tparams(&p);
+                                let own =
+                                    (!sym.is_none()).then(|| self.st.get(sym).tparams.clone());
+                                let p = relax_open_tparams(&p, own.as_deref());
                                 if !p.is_no_type() {
                                     self.adapt(a, &p);
                                 }
@@ -8074,7 +8125,7 @@ impl Typer {
     /// (`implicit def listShow[A](implicit s: Show[A]): Show[List[A]]`) is
     /// applied to its own implicits, which are resolved the same way.
     fn implicit_tree(&mut self, id: SymbolId, pt: &Type, span: Span, depth: usize) -> Tree {
-        let (paramss, ret) = match self.st.get(id).ty.clone() {
+        let (paramss, ret) = match self.implicit_candidate_ty(id) {
             Type::Method { paramss, ret } => (paramss, (*ret).clone()),
             _ => return self.ref_implicit(id, span),
         };
@@ -8473,6 +8524,25 @@ impl Typer {
         self.type_expr(&mut lam, pt);
         self.adapt(&mut lam, pt);
         Some(lam)
+    }
+
+    /// The single overloaded alternative of `sym` that takes `n` type
+    /// parameters, if there is exactly one.
+    fn only_alt_with_tparams(&self, sym: SymbolId, n: usize) -> Option<SymbolId> {
+        if sym.is_none() {
+            return None;
+        }
+        let name = self.st.get(sym).name.clone();
+        let owner = self.st.get(sym).owner;
+        let mut alts = self.drop_overridden(self.st.lookup_member(owner, &name));
+        if alts.is_empty() {
+            alts = self.st.lookup(&name);
+        }
+        let mut hits = alts
+            .into_iter()
+            .filter(|m| self.st.get(*m).tparams.len() == n);
+        let first = hits.next()?;
+        hits.next().is_none().then_some(first)
     }
 
     fn resolve_overload(
@@ -13316,23 +13386,25 @@ fn dedup_diags(diags: &mut Vec<Diagnostic>) {
 /// nothing, so relax it to `Any` before checking an argument against it. Only
 /// arguments are relaxed: a parameter that *is* a type parameter (`def f[A](x:
 /// A)`) is left alone, so `f[Int]("s")` is still an error.
-fn relax_open_tparams(ty: &Type) -> Type {
+///
+/// `open` names the callee's own type parameters — the only ones the call can
+/// still leave undetermined; `None` means they are unknown and all of them are
+/// relaxed. A *class* type parameter in scope (`Rep[P1]` inside
+/// `trait Base[P1]`) is a perfectly determinate type and must be left alone:
+/// widening it to `Rep[Any]` rejected the only argument that could ever fit.
+fn relax_open_tparams(ty: &Type, open: Option<&[SymbolId]>) -> Type {
+    let is_open = |a: &Type| match a {
+        Type::TypeParam(id) => open.is_none_or(|o| o.contains(id)),
+        _ => false,
+    };
     match ty {
-        Type::Class { sym, args } if args.iter().any(|a| matches!(a, Type::TypeParam(_))) => {
-            Type::Class {
-                sym: *sym,
-                args: args
-                    .iter()
-                    .map(|a| {
-                        if matches!(a, Type::TypeParam(_)) {
-                            Type::Any
-                        } else {
-                            a.clone()
-                        }
-                    })
-                    .collect(),
-            }
-        }
+        Type::Class { sym, args } if args.iter().any(is_open) => Type::Class {
+            sym: *sym,
+            args: args
+                .iter()
+                .map(|a| if is_open(a) { Type::Any } else { a.clone() })
+                .collect(),
+        },
         _ => ty.clone(),
     }
 }
