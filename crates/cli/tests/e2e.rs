@@ -3573,3 +3573,44 @@ fn fixtures_ovl_ambiguous_bad_is_error() {
 fn fixtures_ovl_none_bad_is_error() {
     compile_fails_lib("ovl_none_bad", "no matching overload");
 }
+
+// --- exptype: method type parameters solved from the expected type --------
+
+/// nsc's `instantiateExpecting`: the expected type constrains a method's type
+/// parameters as much as the arguments do. `Array("x", "y")` checked against
+/// `Array[AnyRef]` is an `Array[AnyRef]` (`Array` is invariant), and
+/// `Library.column("id"): Rep[Int]` knows `T = Int` before its
+/// `implicit TypedType[T]` is searched for. A covariant occurrence stays a
+/// mere upper bound, so `cov("q"): List[Any]` keeps `T = String`.
+#[test]
+fn scala_library_dual_run_exptype() {
+    dual_run_fixture("exptype");
+}
+
+/// The same fixture compiled by the real scalac 2.13.16: the recorded
+/// expectation, scalac's stdout and ours all have to agree, because the point
+/// of the fixture is *which* type argument gets inferred.
+#[test]
+fn real_scalac_dual_run_exptype() {
+    namedargs_scalac_dual_run("exptype");
+}
+
+/// Neither the arguments nor the expected type pin `T` down: the implicit is
+/// searched with `T` still open and nothing is silently filled in.
+#[test]
+fn fixtures_exptype_unsolved_bad_is_error() {
+    compile_fails_lib(
+        "exptype_unsolved_bad",
+        "could not find implicit value of type TypedType[T]",
+    );
+}
+
+/// `Array` is invariant: an `Array[Int]` is not an `Array[Any]`, neither in an
+/// ascription nor as an argument.
+#[test]
+fn fixtures_exptype_arrayvar_bad_is_error() {
+    compile_fails_lib(
+        "exptype_arrayvar_bad",
+        "type mismatch; found: Array[Int]  required: Array[Any]",
+    );
+}

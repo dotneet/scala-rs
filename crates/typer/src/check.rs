@@ -6225,6 +6225,11 @@ impl Typer {
                         } else {
                             inst
                         };
+                        // The expected type is a constraint too. Solve it here,
+                        // before the implicit clauses are filled: slick's
+                        // `def column[T](n: Node)(implicit tt: TypedType[T]): Rep[T]`
+                        // gets `T` from nowhere else.
+                        let inst = self.add_expected_constraints(sym, &ret, pt, inst);
                         self.check_tparam_bounds(sym, &inst, recv_ty.as_ref(), tree.span, true);
                         if !inst.is_empty() {
                             let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
@@ -6234,6 +6239,10 @@ impl Typer {
                                 .map(|p| crate::symbol::subst_tparams_slice(&tps, &args_t, p))
                                 .collect();
                             ret = crate::symbol::subst_tparams_slice(&tps, &args_t, &ret);
+                            // The later clauses are read back off `fun.ty` by
+                            // `fill_defaults_and_implicits`; leaving it raw
+                            // would search `ClassTag[T]` after `T` is known.
+                            fun.ty = crate::symbol::subst_tparams_slice(&tps, &args_t, &fun.ty);
                         }
                     }
                 }
@@ -6979,6 +6988,191 @@ impl Typer {
             }
         }
         acc
+    }
+
+    /// nsc's `instantiateExpecting`: the expected type constrains a method's
+    /// type parameters just as the arguments do, so `Array("x", "y")` checked
+    /// against `Array[AnyRef]` is an `Array[AnyRef]`, and
+    /// `Library.CountAll.column(n): Rep[Int]` knows `T = Int` before its
+    /// `implicit TypedType[T]` is searched for.
+    ///
+    /// Merges into the argument solution `inst` rather than replacing it:
+    /// nsc prefers the arguments' lower bound, and only an *invariant*
+    /// occurrence in the result forces the expected type to win. A covariant
+    /// occurrence is a mere upper bound -- `def cov[T]: List[T]` checked
+    /// against `List[Any]` leaves `T = Nothing` in nsc, not `Any` -- so it is
+    /// not allowed to instantiate anything here either.
+    fn add_expected_constraints(
+        &self,
+        method: SymbolId,
+        ret: &Type,
+        pt: &Type,
+        inst: Vec<(SymbolId, Type)>,
+    ) -> Vec<(SymbolId, Type)> {
+        if pt.is_no_type() || pt.is_error() || ret.is_no_type() || ret.is_error() {
+            return inst;
+        }
+        let tps = self.st.get(method).tparams.clone();
+        if tps.is_empty() {
+            return inst;
+        }
+        let mut found: Vec<(SymbolId, Type, bool)> = Vec::new();
+        self.collect_expected(&tps, ret, pt, 1, 0, &mut found);
+        if found.is_empty() {
+            return inst;
+        }
+        let mut inst = inst;
+        for (tp, ty, strong) in found {
+            match inst.iter_mut().find(|(id, _)| *id == tp) {
+                // The arguments already pinned it. Only an invariant position
+                // overrides them, and only when the argument solution actually
+                // conforms -- otherwise the call is ill-typed and the argument
+                // type is what the user needs to see in the message.
+                Some(slot) => {
+                    if strong && slot.1 != ty && self.st.is_sub_type(&slot.1, &ty) {
+                        slot.1 = ty;
+                    }
+                }
+                None => inst.push((tp, ty)),
+            }
+        }
+        inst
+    }
+
+    /// Walk the method result type against the expected type, recording what
+    /// each type parameter is forced to in a non-covariant position.
+    /// `variance` is `1` covariant, `-1` contravariant, `0` invariant; the
+    /// `bool` marks an invariant occurrence, which outranks the arguments.
+    fn collect_expected(
+        &self,
+        tps: &[SymbolId],
+        ret: &Type,
+        pt: &Type,
+        variance: i8,
+        depth: u32,
+        out: &mut Vec<(SymbolId, Type, bool)>,
+    ) {
+        if depth > 12 {
+            return;
+        }
+        match (ret, pt) {
+            (Type::Annotated { tpe, .. }, _) => {
+                self.collect_expected(tps, tpe, pt, variance, depth + 1, out)
+            }
+            (_, Type::Annotated { tpe, .. }) => {
+                self.collect_expected(tps, ret, tpe, variance, depth + 1, out)
+            }
+            (Type::TypeParam(id), _) if tps.contains(id) => {
+                if variance != 1 {
+                    if let Some(t) = self.expected_solution(tps, pt) {
+                        out.push((*id, t, variance == 0));
+                    }
+                }
+            }
+            // `Array` is invariant, and its element must stay an element:
+            // rebuilding it from the expected type as a whole would turn
+            // `Type::Array` into `Type::Class { array_sym }`, whose JVM name is
+            // the pseudo-name `[java/lang/Object`.
+            (Type::Array(a), Type::Array(b)) => self.collect_expected(tps, a, b, 0, depth + 1, out),
+            (Type::Array(a), Type::Class { sym, args })
+                if *sym == self.st.array_sym && args.len() == 1 =>
+            {
+                self.collect_expected(tps, a, &args[0], 0, depth + 1, out)
+            }
+            (
+                Type::Function {
+                    params: rp,
+                    ret: rr,
+                },
+                Type::Function {
+                    params: pp,
+                    ret: pr,
+                },
+            ) if rp.len() == pp.len() => {
+                for (a, b) in rp.iter().zip(pp) {
+                    self.collect_expected(tps, a, b, flip_variance(variance), depth + 1, out);
+                }
+                self.collect_expected(tps, rr, pr, variance, depth + 1, out);
+            }
+            (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
+                for (x, y) in a.iter().zip(b) {
+                    self.collect_expected(tps, x, y, variance, depth + 1, out);
+                }
+            }
+            (Type::Tuple(a), Type::Class { args, .. }) if a.len() == args.len() => {
+                for (x, y) in a.iter().zip(args) {
+                    self.collect_expected(tps, x, y, variance, depth + 1, out);
+                }
+            }
+            (Type::Class { args, .. }, Type::Tuple(b)) if args.len() == b.len() => {
+                for (x, y) in args.iter().zip(b) {
+                    self.collect_expected(tps, x, y, variance, depth + 1, out);
+                }
+            }
+            (Type::Class { sym: rs, args: ras }, Type::Class { sym: ps, args: pas }) => {
+                if rs == ps {
+                    if ras.len() != pas.len() {
+                        return;
+                    }
+                    let tparams = self.st.get(*rs).tparams.clone();
+                    for (i, (x, y)) in ras.iter().zip(pas).enumerate() {
+                        let v = tparams
+                            .get(i)
+                            .map(|&tp| {
+                                let f = self.st.get(tp).flags;
+                                if f.contains(Flags::COVARIANT) {
+                                    1
+                                } else if f.contains(Flags::CONTRAVARIANT) {
+                                    -1
+                                } else {
+                                    0
+                                }
+                            })
+                            .unwrap_or(0);
+                        self.collect_expected(
+                            tps,
+                            x,
+                            y,
+                            compose_variance(variance, v),
+                            depth + 1,
+                            out,
+                        );
+                    }
+                } else if let Some(base) = self.base_type_instance(ret, *ps, 0) {
+                    // `def f[T]: List[T]` against `Seq[Any]`: line the result
+                    // up with the expected type's class first.
+                    if !matches!(&base, Type::Class { sym, .. } if sym == rs) {
+                        self.collect_expected(tps, &base, pt, variance, depth + 1, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The type an expected-type position forces a parameter to, or `None`
+    /// when it says nothing usable.
+    fn expected_solution(&self, tps: &[SymbolId], pt: &Type) -> Option<Type> {
+        let pt = pt.widen_constant();
+        match pt {
+            Type::NoType
+            | Type::Error
+            | Type::Nothing
+            | Type::Null
+            | Type::Wildcard
+            | Type::BoundedWildcard { .. }
+            | Type::Method { .. }
+            | Type::Overload(_)
+            | Type::ByName(_)
+            | Type::Repeated(_) => return None,
+            _ => {}
+        }
+        // Still open: the expected type is itself expressed in terms of the
+        // very parameters being solved.
+        if mentions_tparam(&pt, tps) {
+            return None;
+        }
+        Some(unarrayify(&pt, self.st.array_sym))
     }
 
     /// The declared lower bound of `tp`, as seen from the receiver type
@@ -12593,6 +12787,44 @@ fn mentions_any_tparam(ty: &Type) -> bool {
             params.iter().any(mentions_any_tparam) || mentions_any_tparam(ret)
         }
         _ => false,
+    }
+}
+
+fn flip_variance(v: i8) -> i8 {
+    -v
+}
+
+/// Variance of an occurrence nested `inner` deep inside an `outer` position.
+/// An invariant position stays invariant however it is nested.
+fn compose_variance(outer: i8, inner: i8) -> i8 {
+    if outer == 0 || inner == 0 {
+        0
+    } else {
+        outer * inner
+    }
+}
+
+/// `scala.Array` reached through a classfile signature arrives as
+/// `Class { sym: array_sym }`, whose JVM name is the pseudo-name
+/// `[java/lang/Object`. Anything used as an inferred type argument has to be
+/// in `Type::Array` form or the backend emits a method owner that no JVM can
+/// load.
+fn unarrayify(t: &Type, array_sym: SymbolId) -> Type {
+    match t {
+        Type::Class { sym, args } if *sym == array_sym && args.len() == 1 => {
+            Type::Array(Box::new(unarrayify(&args[0], array_sym)))
+        }
+        Type::Class { sym, args } if !args.is_empty() => Type::Class {
+            sym: *sym,
+            args: args.iter().map(|a| unarrayify(a, array_sym)).collect(),
+        },
+        Type::Array(e) => Type::Array(Box::new(unarrayify(e, array_sym))),
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(|a| unarrayify(a, array_sym)).collect()),
+        Type::Function { params, ret } => Type::Function {
+            params: params.iter().map(|a| unarrayify(a, array_sym)).collect(),
+            ret: Box::new(unarrayify(ret, array_sym)),
+        },
+        other => other.clone(),
     }
 }
 

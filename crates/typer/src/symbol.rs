@@ -815,6 +815,18 @@ impl SymbolTable {
                         st.subst_tparams(*sym, args, &ty)
                     };
                     for p in st.get(*sym).parents.clone() {
+                        // The parent is declared in terms of *this* class's
+                        // type parameters, so it has to be instantiated before
+                        // it can instantiate anything itself. Without this,
+                        // `OptionMapper2[B1, B2, Boolean, P1, P2, R].column`
+                        // keeps its `implicit TypedType[BR]` raw instead of
+                        // resolving `BR` to `Boolean` through
+                        // `OptionMapper[BR, R]`.
+                        let p = if args.is_empty() {
+                            p
+                        } else {
+                            st.subst_tparams(*sym, args, &p)
+                        };
                         t = walk(st, &p, t, seen);
                     }
                     t
@@ -1240,12 +1252,17 @@ impl SymbolTable {
                     self.is_sub_type(&p, b)
                 })
             }
-            // `Array` is invariant in Scala, but making it so here needs the
-            // expected type to drive `Array("x", "y"): Array[AnyRef]`, which
-            // the inference does not do yet. Until then this stays covariant
-            // and accepts `Array[Int]` where `Array[Any]` is asked for --
-            // which scalac rejects. See README's Remaining.
-            (Type::Array(x), Type::Array(y)) => self.is_sub_type(x, y),
+            // `Array` is invariant: scalac rejects an `Array[Int]` where an
+            // `Array[Any]` is asked for. A wildcard argument still *contains*
+            // the other (`Array[Byte]` is an `Array[_ <: AnyVal]`), same rule
+            // as for an invariant class parameter above.
+            (Type::Array(x), Type::Array(y)) => {
+                if is_wildcard_arg(x) || is_wildcard_arg(y) {
+                    self.is_sub_type(x, y)
+                } else {
+                    self.is_sub_type(x, y) && self.is_sub_type(y, x)
+                }
+            }
             (Type::ModuleRef(s), Type::Class { sym, .. }) if s == sym => true,
             (Type::ModuleRef(s), b) => {
                 let Some(_g) = enter_depth() else {

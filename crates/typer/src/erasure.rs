@@ -99,6 +99,22 @@ fn find_overridden_method(st: &SymbolTable, id: SymbolId) -> Option<SymbolId> {
     None
 }
 
+/// nsc erases `Array[T]` to `Object` only when the element is an *abstract*
+/// type: `def d[T](x: Array[T])` takes a plain `Object`. A concrete element
+/// that merely erases to `Object` keeps the array -- `Array[AnyRef]`,
+/// `Array[Any]` and `Array[AnyVal]` are all `[Ljava/lang/Object;` in nsc.
+fn array_elem_is_abstract(elem: &Type) -> bool {
+    match elem {
+        Type::TypeParam(_)
+        | Type::TypeMember(_)
+        | Type::Applied { .. }
+        | Type::Wildcard
+        | Type::BoundedWildcard { .. } => true,
+        Type::Annotated { tpe, .. } => array_elem_is_abstract(tpe),
+        _ => false,
+    }
+}
+
 pub fn erase_type(ty: &Type) -> Type {
     match ty {
         Type::TypeParam(_) | Type::TypeMember(_) => Type::Any,
@@ -109,7 +125,9 @@ pub fn erase_type(ty: &Type) -> Type {
         },
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
             let e = erase_type(&args[0]);
-            if matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) {
+            if array_elem_is_abstract(&args[0])
+                && matches!(e, Type::Any | Type::AnyRef | Type::AnyVal)
+            {
                 Type::Any
             } else {
                 Type::Array(Box::new(e))
@@ -121,7 +139,7 @@ pub fn erase_type(ty: &Type) -> Type {
         },
         Type::Array(t) => {
             let e = erase_type(t);
-            if matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) {
+            if array_elem_is_abstract(t) && matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) {
                 Type::Any
             } else {
                 Type::Array(Box::new(e))
@@ -232,7 +250,9 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         },
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
             let e = erase_ty(&args[0], st);
-            if matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) {
+            if array_elem_is_abstract(&args[0])
+                && matches!(e, Type::Any | Type::AnyRef | Type::AnyVal)
+            {
                 Type::Any
             } else {
                 Type::Array(Box::new(e))
@@ -244,7 +264,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         },
         Type::Array(t) => {
             let e = erase_ty(t, st);
-            if matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) {
+            if array_elem_is_abstract(t) && matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) {
                 Type::Any
             } else {
                 Type::Array(Box::new(e))
