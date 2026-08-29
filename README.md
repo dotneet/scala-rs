@@ -1686,6 +1686,13 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 
 ### Remaining
 
+- **`List.newBuilder` / `Vector.newBuilder` がコンパニオンに無い**。`Builder[A, To]`
+  自体は pickle から供給されて動く（`ctacc_builder` が通る）が、companion の
+  `newBuilder` は多相メソッドのため供給されない。prelude に `Builder` を自前宣言
+  して足そうとすると、pickle 側の `Builder`（`Growable` を継承し `addOne` が
+  abstract）を隠してしまい、`class ListB extends Builder[...]` が `addOne` を
+  実装しなくなって実行時 `AbstractMethodError` になる。試して巻き戻した。
+
 - **slick の計測は `.fm` テンプレートを展開してから行う**。slick は `GetResult` /
   `SetParameter` / `TupleSupport` など 7 本を FreeMarker テンプレートとして持ち、
   ビルド時に生成します。生成せずに計測すると、その 7 本に依存する 7 ファイルが
