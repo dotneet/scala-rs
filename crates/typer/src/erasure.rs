@@ -192,7 +192,12 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
                 }
             }
         }
-        Type::TypeMember(_) => Type::Any,
+        // An *alias* member erases like its right-hand side (`type Scope =
+        // Map[K, V]` is `Map`). An abstract member still erases to `Object`.
+        Type::TypeMember(_) => match st.dealias(ty) {
+            d if d == *ty => Type::Any,
+            d => erase_ty(&d, st),
+        },
         Type::Applied { ctor, .. } => erase_ty(ctor, st),
         Type::Wildcard | Type::BoundedWildcard { .. } => Type::Any,
         Type::Constant(lit) => Type::lit_underlying(lit),
