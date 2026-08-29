@@ -21,6 +21,7 @@ mod prelude_numeric;
 mod prelude_numops;
 mod prelude_reflect;
 mod prelude_seq;
+mod prelude_sgap;
 mod prelude_text;
 mod prelude_tuple;
 mod prelude_variance;
@@ -481,7 +482,14 @@ object Main {
     }
 
     #[test]
-    fn inline_on_method_ok_on_val_diagnosed() {
+    fn inline_accepted_anywhere_like_scalac() {
+        // Real scalac 2.13.16 accepts `@inline`/`@noinline` on any definition
+        // (val, var, class, type, ...) and even both together on the same
+        // definition, without error or warning (verified with `-Xlint:_
+        // -deprecation`): they are hints for the bytecode-level optimizer
+        // (`-opt:...`), which scala-rs does not implement and which never
+        // validates placement in the typer. See crates/cli/tests/smallgaps.rs
+        // (`sgap_inline`) for the scalac-verified dual-run fixture.
         ok(r#"
 object Main {
   @inline def f(): Int = 1
@@ -496,8 +504,8 @@ object Main {
 "#,
         );
         assert!(
-            has_errors(&diags) && diags.iter().any(|d| d.message.contains("only supported")),
-            "expected @inline-on-val error, got {:?}",
+            !has_errors(&diags),
+            "expected @inline val to typecheck cleanly, got {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
         let (_, _, diags) = typecheck_str(
@@ -508,11 +516,8 @@ object Main {
 "#,
         );
         assert!(
-            has_errors(&diags)
-                && diags
-                    .iter()
-                    .any(|d| d.message.contains("cannot be used together")),
-            "expected @inline/@noinline conflict, got {:?}",
+            !has_errors(&diags),
+            "expected @inline @noinline together to typecheck cleanly, got {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

@@ -315,6 +315,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         None
     };
     add_option_members(st, option_wf, library_abi);
+    crate::prelude_sgap::fix_option_flat_map(st);
     add_cons_members(st, library_abi);
     crate::prelude_either::install_option_core(st);
     crate::prelude_either::install_java_lang_exceptions(st);
@@ -487,6 +488,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
         if let Some(it) = iterator {
             crate::prelude_coll::add_collections_extra(st, tuple2, ordering, it);
         }
+        crate::prelude_sgap::add_iterable_apply(st, library_abi);
         if let Some(aops) = array_ops {
             // ArrayOps の変換・集約系 (toList/toSeq/groupBy/sum/...) と
             // scala.collection.MapView。Buffer / Iterable / MapView を
@@ -3446,7 +3448,20 @@ fn add_option_members(st: &mut SymbolTable, option_wf: SymbolId, library_abi: bo
         st.get_mut(f).ty = tsa;
         vec![f]
     };
-    st.get_mut(st.none_sym).parents = vec![Type::Class {
+    // `st.none_sym` is the *module* symbol; its expression type is
+    // `Type::ModuleRef(<module class>)` (see `prelude::module`), so anything
+    // that walks `None`'s ancestry from a typed `None` expression (e.g.
+    // `SymbolTable::lub`'s `base_type_seq`) reads the *module class*'s
+    // `parents`, not the module's own. Setting `.parents` on `none_sym` here
+    // was a no-op for that purpose: `module_extending` (which created
+    // `none_sym`) had already stamped the module *class* with the raw,
+    // unparameterized `Option` from its `parent` argument, and this line
+    // never touched that copy. The result: `lub(None, Some(x))` degraded to
+    // raw `Option` (dropping the element type) instead of `Option[X]`,
+    // e.g. `val r = if (c) None else Some(x)` losing `x`'s type. Fixed by
+    // writing to the module class, matching `module_extending`.
+    let none_cls = st.module_class_of(st.none_sym);
+    st.get_mut(none_cls).parents = vec![Type::Class {
         sym: o,
         args: vec![Type::Nothing],
     }];

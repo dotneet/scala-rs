@@ -3564,7 +3564,7 @@ impl<'a> Gen<'a> {
             });
         }
 
-        self.emit_module_init(&mut b, cls, &impl_.body);
+        self.emit_module_init(&mut b, cls, &impl_.body, &impl_.parents);
         self.emit_module_clinit(&mut b);
         self.emit_lazy_accessors(&mut b, cls, &impl_.body);
         self.emit_val_getters(&mut b, &impl_.body);
@@ -3671,7 +3671,13 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn emit_module_init(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
+    fn emit_module_init(
+        &self,
+        b: &mut ClassBuilder,
+        class_id: SymbolId,
+        body: &[Tree],
+        parents: &[Tree],
+    ) {
         let class_name = b.this_name.clone();
         let st = self.st;
         let inits: Vec<&Tree> = body
@@ -3686,12 +3692,19 @@ impl<'a> Gen<'a> {
         let delayed = extends_delayed_init(st, class_id);
         let is_app = extends_app(st, class_id);
         let super_name = b.super_name.clone();
+        // `object X extends Y(args)` / `case object X extends Y(args)`: the
+        // module's own private `<init>` always takes no arguments, but the
+        // *super* constructor it invokes must carry the parent's actual
+        // constructor arguments, exactly like an ordinary class `<init>`
+        // (see the `parent_super_ctor` use a few hundred lines up for
+        // `emit_class`). Previously this always emitted a no-arg
+        // `invokespecial(super, "<init>", "()V")`, which crashed at runtime
+        // (`NoSuchMethodError`) for any singleton extending a class whose
+        // primary constructor takes parameters — e.g. slick's
+        // `case object Asc extends Direction(false)`.
+        let (super_owner, super_desc, super_args) = parent_super_ctor(st, parents, &super_name);
         b.add_code(ACC_PRIVATE, "<init>", "()V", 4, |asm| {
             let mut frame = Frame::instance();
-            asm.aload(0);
-            asm.invokespecial(&super_name, "<init>", "()V");
-            asm.aload(0);
-            asm.putstatic(&class_name, "MODULE$", &format!("L{class_name};"));
             let ctx = emit_ctx(
                 st,
                 class_id,
@@ -3703,6 +3716,13 @@ impl<'a> Gen<'a> {
                 library_abi,
                 boxed_vars,
             );
+            asm.aload(0);
+            for a in &super_args {
+                gen_expr(asm, &mut frame, &ctx, a);
+            }
+            asm.invokespecial(&super_owner, "<init>", &super_desc);
+            asm.aload(0);
+            asm.putstatic(&class_name, "MODULE$", &format!("L{class_name};"));
             if delayed {
                 if library_abi && is_app {
                     asm.aload(0);
@@ -3759,7 +3779,7 @@ impl<'a> Gen<'a> {
             name: "MODULE$".into(),
             desc: format!("L{this_name};"),
         });
-        self.emit_module_init(&mut b, class_id, &[]);
+        self.emit_module_init(&mut b, class_id, &[], &[]);
         self.emit_module_clinit(&mut b);
         emit_case_apply(&mut b, self.st, class_id);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
@@ -7148,6 +7168,19 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        if is_stdlib_iterable_module(&owner) && name == "apply" {
+            // `Iterable$.apply` is inherited from `IterableFactory$Delegate`
+            // (not declared directly on `Iterable$`); its erased JVM
+            // descriptor returns `Object`, exactly like `Seq$.apply` above.
+            // See `crates/typer/src/prelude_sgap.rs::add_iterable_apply`.
+            asm.invokevirtual(
+                "scala/collection/Iterable$",
+                "apply",
+                "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+            );
+            asm.checkcast("scala/collection/Iterable");
+            return;
+        }
         if is_stdlib_lazylist_module(&owner) {
             match name {
                 "empty" => {
@@ -9763,6 +9796,10 @@ fn is_stdlib_seq(owner: &str) -> bool {
 
 fn is_stdlib_seq_module(owner: &str) -> bool {
     owner == "scala/collection/immutable/Seq$"
+}
+
+fn is_stdlib_iterable_module(owner: &str) -> bool {
+    owner == "scala/collection/Iterable$"
 }
 
 fn is_stdlib_lazylist(owner: &str) -> bool {
