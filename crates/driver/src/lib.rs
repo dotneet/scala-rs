@@ -8,7 +8,8 @@ use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
     erase, find_mains, lambda_lift, mark_anon_captures, note_source_value_classes, typecheck_units,
-    uncurry, ClasspathClass, ClasspathMethod, ClasspathPickleMethod, TypecheckOptions,
+    uncurry, ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType,
+    ClasspathTypeParam, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -311,6 +312,20 @@ fn class_path(out_dir: &Path, internal_name: &str) -> PathBuf {
     dest
 }
 
+fn cp_type(t: &scala_rs_backend::PickledType) -> ClasspathType {
+    ClasspathType {
+        name: t.name.clone(),
+        args: t.args.iter().map(cp_type).collect(),
+    }
+}
+
+fn cp_tparam(t: &scala_rs_backend::PickledTypeParam) -> ClasspathTypeParam {
+    ClasspathTypeParam {
+        name: t.name.clone(),
+        tparams: t.tparams.iter().map(cp_tparam).collect(),
+    }
+}
+
 fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
     if paths.is_empty() {
         return Vec::new();
@@ -321,7 +336,7 @@ fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
             let pickle_tparams = c
                 .pickle
                 .as_ref()
-                .map(|p| p.tparams.clone())
+                .map(|p| p.tparams.iter().map(cp_tparam).collect())
                 .unwrap_or_default();
             ClasspathClass {
                 jvm_name: c.internal_name,
@@ -340,9 +355,9 @@ fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
                         .map(|m| ClasspathPickleMethod {
                             name: m.name,
                             param_names: m.param_names,
-                            param_types: m.param_types,
-                            ret: m.ret,
-                            tparams: m.tparams,
+                            param_types: m.param_types.iter().map(cp_type).collect(),
+                            ret: cp_type(&m.ret),
+                            tparams: m.tparams.iter().map(cp_tparam).collect(),
                             is_val: m.is_val,
                             is_ctor: m.is_ctor,
                             is_implicit: m.is_implicit,

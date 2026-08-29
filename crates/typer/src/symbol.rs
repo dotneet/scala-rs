@@ -861,8 +861,89 @@ impl SymbolTable {
         }
     }
 
+    /// Classes `ty` names through `this.type`, in no particular order.
+    fn this_type_owners(ty: &Type, out: &mut Vec<SymbolId>) {
+        match ty {
+            Type::ThisType(c) => {
+                if !out.contains(c) {
+                    out.push(*c);
+                }
+            }
+            Type::Class { args, .. } | Type::Tuple(args) => {
+                for a in args {
+                    Self::this_type_owners(a, out);
+                }
+            }
+            Type::Applied { ctor, args } => {
+                Self::this_type_owners(ctor, out);
+                for a in args {
+                    Self::this_type_owners(a, out);
+                }
+            }
+            Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => Self::this_type_owners(t, out),
+            Type::Annotated { tpe, .. } => Self::this_type_owners(tpe, out),
+            Type::Function { params, ret } => {
+                for p in params {
+                    Self::this_type_owners(p, out);
+                }
+                Self::this_type_owners(ret, out);
+            }
+            Type::Method { paramss, ret } => {
+                for ps in paramss {
+                    for p in ps {
+                        Self::this_type_owners(p, out);
+                    }
+                }
+                Self::this_type_owners(ret, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn is_ancestor_of(&self, anc: SymbolId, cls: SymbolId) -> bool {
+        let mut work = vec![cls];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(c) = work.pop() {
+            if !seen.insert(c.0) {
+                continue;
+            }
+            if c == anc {
+                return true;
+            }
+            for p in self.get(c).parents.clone() {
+                if let Some(ps) = self.class_sym_of(&p) {
+                    work.push(ps);
+                }
+            }
+            if let Some(st) = self.get(c).self_type.clone() {
+                if let Some(ps) = self.class_sym_of(&st) {
+                    work.push(ps);
+                }
+            }
+        }
+        false
+    }
+
     /// Substitute inherited member types using applied parents (`Functor[Id].map`).
     pub fn subst_as_seen_from(&self, recv: &Type, ty: &Type) -> Type {
+        // `this.type` in a member's signature means the receiver it was
+        // selected on: `def add(v: T): this.type` on a `B[String]` gives back a
+        // `B[String]`, not a bare `B` whose argument has to be invented.
+        let ty = &{
+            let mut owners = Vec::new();
+            Self::this_type_owners(ty, &mut owners);
+            let mut out = ty.clone();
+            if !owners.is_empty() && !matches!(recv, Type::ThisType(_)) {
+                if let Some(rc) = self.class_sym_of(recv) {
+                    for c in owners {
+                        if c == rc || self.is_ancestor_of(c, rc) {
+                            out = subst_this_type(&out, c, recv);
+                        }
+                    }
+                }
+            }
+            out
+        };
         fn walk(
             st: &SymbolTable,
             recv: &Type,
@@ -1880,7 +1961,18 @@ impl SymbolTable {
                 }
                 t
             }
-            Type::Class { sym, .. } | Type::ModuleRef(sym) => self.expand_type_members(*sym, ty),
+            Type::Class { sym, args } => {
+                let t = self.expand_type_members(*sym, ty);
+                // The alias's right-hand side is written in its owner's
+                // vocabulary: `type Self = Base[T]` reached through a
+                // `Base[String]` is a `Base[String]`, not a `Base[T]`.
+                if args.is_empty() || t == *ty {
+                    t
+                } else {
+                    self.subst_as_seen_from(from, &t)
+                }
+            }
+            Type::ModuleRef(sym) => self.expand_type_members(*sym, ty),
             Type::ThisType(sym) => self.expand_type_members(*sym, ty),
             Type::Annotated { tpe, .. } => self.expand_in_type(tpe, ty),
             Type::SingleType { prefix, sym } => {
@@ -2377,6 +2469,39 @@ fn subst_refine_aliases(st: &SymbolTable, decls: &[RefineDecl], ty: &Type) -> Ty
 
 pub(crate) fn subst_tparams_slice(tps: &[SymbolId], args: &[Type], ty: &Type) -> Type {
     subst_map(ty, tps, args)
+}
+
+/// Replace `cls.this.type` with `to` throughout `ty`.
+fn subst_this_type(ty: &Type, cls: SymbolId, to: &Type) -> Type {
+    let go = |t: &Type| subst_this_type(t, cls, to);
+    match ty {
+        Type::ThisType(c) if *c == cls => to.clone(),
+        Type::Class { sym, args } => Type::Class {
+            sym: *sym,
+            args: args.iter().map(go).collect(),
+        },
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(go).collect()),
+        Type::Applied { ctor, args } => apply_type_ctor(go(ctor), args.iter().map(go).collect()),
+        Type::Array(t) => Type::Array(Box::new(go(t))),
+        Type::ByName(t) => Type::ByName(Box::new(go(t))),
+        Type::Repeated(t) => Type::Repeated(Box::new(go(t))),
+        Type::Annotated { tpe, annot } => Type::Annotated {
+            tpe: Box::new(go(tpe)),
+            annot: annot.clone(),
+        },
+        Type::Function { params, ret } => Type::Function {
+            params: params.iter().map(go).collect(),
+            ret: Box::new(go(ret)),
+        },
+        Type::Method { paramss, ret } => Type::Method {
+            paramss: paramss
+                .iter()
+                .map(|ps| ps.iter().map(go).collect())
+                .collect(),
+            ret: Box::new(go(ret)),
+        },
+        _ => ty.clone(),
+    }
 }
 
 /// Apply type arguments to a constructor (`Id` + `[A]` → `Id[A]`).

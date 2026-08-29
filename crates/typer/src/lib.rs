@@ -46,7 +46,8 @@ mod uncurry;
 pub use anon_capture::mark_anon_captures;
 pub use check::{
     find_mains, has_errors, typecheck, typecheck_opts, typecheck_units, ClasspathClass,
-    ClasspathMethod, ClasspathPickleMethod, TypecheckOptions, Typer,
+    ClasspathMethod, ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
+    Typer,
 };
 pub use erasure::{erase, erase_type, note_source_value_classes};
 pub use lambda_lift::lambda_lift;

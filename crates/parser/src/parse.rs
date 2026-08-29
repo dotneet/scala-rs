@@ -2992,10 +2992,19 @@ impl<'a> Parser<'a> {
         self.skip_nl();
         if matches!(self.kind(), TokenKind::Ident(s) if s == "<") {
             let t = self.parse_xml_literal();
-            return self.parse_simple_expr_rest(t);
+            return self.parse_simple_expr_rest(t, true);
         }
+        // nsc's `canApply`: `new C { … }` is not a function, so a following
+        // `{ … }` or `( … )` starts a new statement rather than an argument
+        // list. Applying it turned slick's
+        // `def build(…) = new SimpleFeatureNode[T] with SimpleFunction { … }`
+        // followed by a lambda into one (ill-typed) application.
+        let mut can_apply = true;
         let mut t = match self.kind().clone() {
-            TokenKind::New => self.parse_new(),
+            TokenKind::New => {
+                can_apply = false;
+                self.parse_new()
+            }
             TokenKind::LBrace => self.parse_block_expr(),
             TokenKind::LParen => self.parse_paren_expr(),
             TokenKind::This => {
@@ -3107,14 +3116,16 @@ impl<'a> Parser<'a> {
                 self.empty(sp)
             }
         };
-        t = self.parse_simple_expr_rest(t);
+        t = self.parse_simple_expr_rest(t, can_apply);
         t
     }
 
-    fn parse_simple_expr_rest(&mut self, mut t: Tree) -> Tree {
+    fn parse_simple_expr_rest(&mut self, mut t: Tree, mut can_apply: bool) -> Tree {
         loop {
             match self.kind() {
                 TokenKind::Dot => {
+                    // A selection out of `new C { … }` is a function again.
+                    can_apply = true;
                     self.bump();
                     self.skip_nl();
                     if matches!(self.kind(), TokenKind::This) {
@@ -3165,6 +3176,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 TokenKind::LBracket => {
+                    can_apply = true;
                     let args = self.parse_type_args();
                     t = self.alloc(
                         t.span.merge(self.prev_span()),
@@ -3174,6 +3186,7 @@ impl<'a> Parser<'a> {
                         },
                     );
                 }
+                TokenKind::LParen if !can_apply => break,
                 TokenKind::LParen => {
                     let args = self.parse_arg_exprs();
                     t = self.alloc(
@@ -3184,6 +3197,7 @@ impl<'a> Parser<'a> {
                         },
                     );
                 }
+                TokenKind::LBrace if !can_apply => break,
                 TokenKind::LBrace => {
                     // block argument: foo { ... }  (same line or after nl that isn't a semi)
                     let blk = self.parse_block_expr();
@@ -3195,6 +3209,7 @@ impl<'a> Parser<'a> {
                         },
                     );
                 }
+                TokenKind::Newline if !can_apply => break,
                 TokenKind::Newline => {
                     // `foo \n {` is application; `foo \n +` handled in infix;
                     // `foo \n bar` is two statements — don't consume.
