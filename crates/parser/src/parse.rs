@@ -376,14 +376,34 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let stats = self.parse_top_stats();
                 self.expect("}", |k| matches!(k, TokenKind::RBrace));
-                let mut more = self.parse_top_stats();
-                let mut stats = stats;
-                stats.append(&mut more);
-                return self.alloc(
+                let inner = self.alloc(
                     lo.merge(self.prev_span()),
                     TreeKind::PackageDef {
                         pid: Box::new(pid.unwrap()),
                         stats,
+                    },
+                );
+                let mut more = self.parse_top_stats();
+                if more.is_empty() {
+                    return inner;
+                }
+                // `package p { … }` is one member of the unit's root package.
+                // What follows the closing brace is its *sibling*, not another
+                // member of `p`: appending it here put a top-level `object
+                // Main` into `p` and emitted `p/Main.class`.
+                let mut all = vec![inner];
+                all.append(&mut more);
+                let root = self.alloc(
+                    pkg_span,
+                    TreeKind::Ident {
+                        name: "<empty>".into(),
+                    },
+                );
+                return self.alloc(
+                    lo.merge(self.prev_span()),
+                    TreeKind::PackageDef {
+                        pid: Box::new(root),
+                        stats: all,
                     },
                 );
             }

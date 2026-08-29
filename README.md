@@ -771,6 +771,98 @@ slick の profile ケーキが多用する形を実 scalac 2.13.16 と突き合�
 - 高階型パラメータの**推論**（`def take[U, C[_]](q: Query[?, U, C])` に匿名サブクラスを渡すと `C` を合わせられない。明示の型引数なら通る）
 - 残り 34 件の kind エラーはほぼ**別の担当**の下流です。`ColumnOption` / `::` / `Ordering` は `import slick.ast.*` の**スター形ワイルドカード import** が効いていないため（`import slick.ast._` は通る）、prelude の同名（`scala.math.Ordering` など）を拾ってしまっているものです。`IO` / `F` / `StreamIO` の kind 不一致は上の高階推論の穴です
 
+### slick が生成する 7 本（`.fm` テンプレート）が通るまで
+
+slick は `TupleSupport` / `TupleShapeImplicits` / `SetParameter` / `GetResult` などをビルド時に
+FreeMarker テンプレートから生成します。これを計測に含めた（177 → 184 ファイル）ところ、
+今まで見えていなかった穴がまとめて出てきました。最小再現は `tests/fixtures/genrep.scala`
+（異常系は `genrep_bound_bad` / `genrep_tuple_bad` / `genrep_product_bad`）にあり、
+`crates/cli/tests/genrep.rs` が **scalac と scala-rs の両方でコンパイルして `Main` の出力を
+比較**します。
+
+**1. クラス型パラメータの境界が import を見ていなかった**。`import slick.lifted._` の下で
+`class Boxed[T <: Rep[_]]` と書くと `not found: type Rep` になっていました。原因は
+**namer が境界を解決していた**ことです。namer は import 句を処理する前に走るので、
+その時点で imported な名前は引けません。`def` の型パラメータは `type_def_sig` が、型メンバーは
+`type_type_member` が改めて `enter_tparams` を呼ぶので通っていましたが、クラスだけは
+一度も解決し直していませんでした。namer 側は**暫定として黙って**解決し（`enter_tparams_provisional`）、
+`type_class` が import の見えるスコープで `resolve_tparam_bounds` を呼び直します。本当に
+存在しない境界は、そこで（1 回だけ）診断されます。
+
+**2. `implicit class` の合成変換が型パラメータを落としていた**。
+`implicit class RepOps[T <: Rep[_]](c: T)` は nsc では
+`implicit def RepOps[T <: Rep[_]](c: T): RepOps[T] = new RepOps[T](c)` にデシュガーされます。
+以前は型パラメータを付けずに合成していたので、結果型が裸の `RepOps` になり
+`RepOps takes type parameters` で落ちていました。クラスの型パラメータ木を**新しいシンボルで
+複製**して（`copy_tparams`）合成 `def` に付け、`new C[T1, …](x)` を作るようにしました。
+
+**3. `TupleN` が `Product` でも `Serializable` でもなかった**。prelude は `Tuple2` を `prelude.rs`
+で、`Tuple3`…`Tuple22` を `prelude_tuple.rs` で作りますが、親は `AnyRef` だけでした。そのため
+`def buildTuple(…): Product = … new Tuple4(a, b, c, d)`（生成された `TupleSupport`）も、
+ただの `val p: Product = (1, 2)` も通りませんでした。`scala.Product` と `java.io.Serializable`
+は jar 側（オンデマンドロード）なので、classpath を入れた直後に 2 本だけ先読みしてから
+辺を張ります（`prelude_genrep.rs`）。**jar が無ければ何もしません**: 私有ランタイムの
+`scala/Tuple2` はどちらも実装していないので、親を名乗ったら嘘になります。
+`--no-scala-library` では今までどおり診断します（`genrep_product_bad`）。
+
+**4. 継承したオーバーロードが受け手の型引数を失っていた**。`scala.collection.Seq[A]` の `apply` は
+`SeqOps.apply(Int): A` と、`PartialFunction[Int, A]` から継承した `apply` の 2 本です。
+`Type::Overload` は型だけを運び、`resolve_overload` は選んだ候補のシンボルを知るために
+**宣言をシンボルから読み直して**いたため、2 本目が `apply(A): B` という素の宣言に戻り、
+どちらがより特化しているとも言えず `ambiguous overload for apply` になっていました。
+選択時に計算済みの「受け手での型」を `overload_member_types` に控えて、読み直しのときに
+そちらを使います（`s(0)` が通るようになります）。
+
+**5. 引数リストのタプル化（nsc の tuple adaptation）**。`Some((p._1, p._2), p._3)` は
+`Some(((p._1, p._2), p._3))` の意味です。どの候補にも合わない引数リストを、最後の手段として
+1 個のタプルに詰め直して**もう一度だけ**型付けします。だめならツリーも診断も元に戻すので、
+エラーは書いたとおりのものが出ます。nsc と同じく**オーバーロードされた呼び先には適用しません**
+（`inferMethodAlternative` はタプル化しない）。合成した `TupleN(a, b)` 自身が再入しないよう
+再入フラグで止めています。
+
+**6. 名前が `Tuple` で始まるだけのクラスをタプル扱いしていた**。`TupleShape[L, M, U, P]`
+（slick 自身のクラス）が **4 要素タプル**として読まれ、`TupleShapeImplicits` が全滅していました。
+`starts_with("Tuple")` / `starts_with("Function")` を、**`TupleN` / `FunctionN` の N が実際の
+引数個数と一致するか**の判定に置き換えました（typer の型解決と backend の pickle の両方）。
+
+**7. 可変長引数のコンストラクタ**。`class C(xs: T*)` に `new C(a, b)` と渡すと
+`type mismatch; found: a  required: T*` になっていました。メソッド側は `param_at` で
+repeated を展開していましたが、コンストラクタ側は引数を**位置で**引いていたためです。
+slick の `new SetTupleParameter[(T1, T2)](c1, c2)` がこれです。codegen 側も直しました:
+repeated パラメータは JVM では `Seq` 引数 1 本（`<init>` のディスクリプタは元から
+`Lscala/collection/immutable/Seq;`）なので、要素を生のまま積むと `VerifyError` になります。
+メソッド呼び出しと同じ `gen_call_args` を通して包みます。
+
+**8. ワイルドカード型引数と反変**。`SetParameter[-T]` に対して `SetParameter[T1]` は
+`SetParameter[_]` に適合します。ワイルドカードは「何かの型」を表すので、パラメータの
+変位に関わらず相手を**含み**ます。反変のときだけ `_ <: T1` を見に行って落としていました。
+
+**9. `package p { … }` の後ろのトップレベル定義**。`package genrep { … }` に続けて
+`object Main` を書くと、`Main` が `genrep` パッケージに入って `genrep/Main.class` が
+出ていました。閉じ括弧の後は**兄弟**であってパッケージのメンバーではありません。
+
+計測（`tests/slick_measure.sh`、slick 184 ファイル、`-Xsource:3`）では **2064 → 1300**、
+生成 7 本のエラーは **736 → 41** になりました（`TupleSupport` 569 → 2、
+`TupleShapeImplicits` 65 → 0、`SetParameter` 46 → 4、`GetResult` 25 → 4）。
+
+**残っているもの**（このスライスでは直していない）:
+
+- **可変長引数のフィールド型**。`class C(val xs: T*)` の `xs` は nsc では `Seq[T]` ですが、
+  こちらは `T*` のままなので `c.xs.length` が `value length is not a member of T*` になります
+  （黙って通しはしません）。コンストラクタ**呼び出し**は通るようになりました。
+- **私有ランタイム（`--no-scala-library`）に可変長引数の裏付けが無い**のは今までどおりです。
+  `def f(xs: Int*)` も `class C(xs: T*)` も `scala/collection/immutable/Seq` を参照するので、
+  実行時に `NoClassDefFoundError` になります（メソッド側から変わっていない既存の穴で、
+  コンストラクタもこれに揃えました）。
+- **case class のコンストラクタ引数が抽象メンバーを実装しない**。
+  `trait Rep[T] { def value: T }` に対する `case class ConstRep[T](value: T) extends Rep[T]` は
+  コンパイルは通りますが、アクセサが出ないので実行時に `AbstractMethodError` になります。
+- **`Vector[T]` が `scala.collection.IndexedSeq[U]` に適合しない**（`immutable.Vector` →
+  `collection.IndexedSeq` の辺が無い）。`Vector[Any](1)` のように**明示した型引数**が
+  companion の `apply` に伝わらない穴もあります。
+- **タプル型の `ClassTag`**。`classTag[(_, _)]` の implicit が見つからず、
+  `TupleSupport` に残る 2 件はこれです。
+
 ## 実装していないもの
 
 次は実装していません。スタブで「動いたことにする」こともしていません。言語側の残りとライブラリ側の残りを分けます。
@@ -1132,6 +1224,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/smallgaps` スライス（`@inline` / `@noinline` の配置、curried case class companion、companion への後方参照、`Option.flatMap` の多相性、`None`/`Some` の `lub`、`Iterable.apply`）のフィクスチャは接頭辞 `sgap`（`sgap` / `sgap_lib`）で、同じ理由から `crates/cli/tests/smallgaps.rs` に置いています。`sgap.scala` は `--no-scala-library` で `check` 済み、`sgap_lib.scala` は `Iterable.apply` が library ABI（`IterableFactory$Delegate.apply` の継承）にしか無いため library dual-run 専用（`fixtures_sgap_lib_without_library_is_error` で `--no-scala-library` が診断のまま残ることも見ています）。
 
+`agent/genrep` スライス（slick が `.fm` テンプレートから生成する 7 本を通すための穴: import を見ないクラス型パラメータ境界、型パラメータ付き `implicit class`、`TupleN extends Product`、継承したオーバーロードの受け手での型、引数リストのタプル化、`Tuple` で始まるだけのクラス名、可変長引数コンストラクタ、ワイルドカード型引数と反変、`package p { … }` の後ろのトップレベル定義）のフィクスチャは接頭辞 `genrep`（`genrep` / `genrep_bound_bad` / `genrep_tuple_bad` / `genrep_product_bad`）で、同じ理由から `crates/cli/tests/genrep.rs` に置いています。`genrep.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 との実行結果 diff（`real_scalac_dual_run_genrep`）でも見ます。異常系は 3 本: `genrep_bound_bad` は namer が黙るようにした境界でも**存在しない型はきちんと診断される**こと、`genrep_tuple_bad` はタプル化が**間違った呼び出しを通さない**こと、`genrep_product_bad` は `--no-scala-library` で `Product` の辺を張らない（私有ランタイムに裏付けが無い）ことを固定します。
+
 オーバーロード集合が別のクラスの読み込みで消える回帰のフィクスチャは接頭辞 `oshadow`（`oshadow` / `oshadow_java_first` / `oshadow_java_last` / `oshadow_bad`）で、同じ理由から `crates/cli/tests/overloadshadow.rs` に置いています。`oshadow.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 の実行結果とも直接比較します（`oshadow_matches_scalac`）。`oshadow_java_first.scala` と `oshadow_java_last.scala` は `java.math.BigDecimal` の位置だけを入れ替えた同じプログラムで、`oshadow_order_independent` が両方通ることと stdout が一致することを固定します。`oshadow_bad.scala` は `BigDecimal(Some(1))`（real scalac も拒否）が `no matching overload` になり、しかも**候補一覧が丸ごと**出る（`(String)BigDecimal` を含む）ことを見ます。`oshadow_without_library_is_error` は `--no-scala-library` で `not found: value BigDecimal` の診断が残ることを見ます。
 `agent/parentimpl` スライス（親コンストラクタの implicit 節・デフォルト引数の補完）のフィクスチャは接頭辞 `pimpl`（`pimpl` / `pimpl_bad`）で、同じ理由から `crates/cli/tests/parentimpl.rs` に置いています。`pimpl.scala` は slick の `ConstColumn` 形（`class ConstColumn[T : TT] extends TypedRep[T]`）、明示節＋2 引数の implicit 節、全部デフォルト／末尾だけデフォルト、デフォルト節＋implicit 節、匿名クラスの親、引数無しの `new` を 1 本にまとめ、**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせます。`real_scalac_dual_run_pimpl` は real scalac 2.13.16 でも同じソースを走らせて stdout が一致することを見ます（`expected/pimpl.txt` は scalac の出力そのもの）。`pimpl_late_a.scala` / `pimpl_late_z.scala` は**子を親より先にコンパイル**して、親の context bound の evidence がシグネチャパス時点で未生成でも埋まる（＝ファイル順に依存しない）ことを見ます。`pimpl_bad.scala` は witness の無い親 implicit 節が**黙って通らない**ことを固定し、`pimpl_bad_reports_the_extends_clause_once` で診断が `extends` の行に 1 件だけ出る（3 パス分に増えない）ことも見ています。
 
@@ -1249,6 +1343,7 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `inline.scala` | `@inline` / `@noinline` を付けたメソッドが動く（インライン化はしない） | `3` |
 | `sgap.scala`（`crates/cli/tests/smallgaps.rs`） | `agent/smallgaps` スライスの複合 fixture: `@inline val` / `@inline @noinline def` の受理、curried 主コンストラクタ（`case class Pair(a: Int)(val b: Int, val c: Int)`）の companion `apply` が正しく curry される、case class のフィールド型が**自分の companion に後方参照する**入れ子型（`Ordering.Direction`）を指すときの解決順序、`case object` が引数付きの `sealed abstract class` を extends するときの module `<init>` codegen、`Option.flatMap` の多相性、`if`/`else` の `None`/`Some` 分岐で（型注釈なしでも）`lub` が `Option[X]` になり `.getOrElse` が解決すること | `42` `6` `true` `n=5` `3` `-1` |
 | `sgap_lib.scala`（`crates/cli/tests/smallgaps.rs`、library dual-run のみ） | `Iterable(...)` companion `apply`（実ライブラリの `IterableFactory$Delegate.apply` 継承。私有ランタイムに裏付けが無いので `--no-scala-library` では診断のまま） | `List(a, b, c)` `3` |
+| `genrep.scala`（`crates/cli/tests/genrep.rs`、library dual-run と real scalac dual-run） | `agent/genrep` スライス: import を見ないクラス型パラメータ境界（`class Boxed[T <: Rep[_]]`）、型パラメータ付き `implicit class` の合成変換、`new TupleN(…): Product`（jar でしか作られない arity 込み）、`scala.collection.Seq` の一意な `apply`、`Some(a, b)` のタプル化、`Tuple` で始まるだけのクラス名（`TupleOps2`）、`package p { … }` の後ろの `object Main` | `Rep(1)` `(Rep(1),Rep(x))` … `Some((1,x))` |
 | `oshadow.scala`（`crates/cli/tests/overloadshadow.rs`、library dual-run のみ） | 別のクラスを読んでも既存のオーバーロード集合が消えないこと: `java.math.BigDecimal` を**前にも後にも**置いた上での `BigDecimal(Int)` / `(Long)` / `(String)` / `(BigInt)` / `(java.math.BigDecimal)`、`Option[BigDecimal].getOrElse` | `2` `3` `4.25` `6` `12.5` `12.5` `-1` `7` `8.75` `9` |
 | `oshadow_java_first.scala` / `oshadow_java_last.scala`（`crates/cli/tests/overloadshadow.rs`、library dual-run のみ） | 同じプログラムを `java.math.BigDecimal` の位置だけ入れ替えた 2 本。両方通り、stdout が一致すること（順序依存の回帰テスト） | `1` `2` `3.5` |
 | `pimpl.scala`（`crates/cli/tests/parentimpl.rs`） | `agent/parentimpl` スライス: 親コンストラクタの implicit 節・デフォルト引数の補完（`class ConstColumn[T : TT] extends TypedRep[T]`、明示節＋2 引数の implicit 節、context bound の親への受け渡し、全部／末尾だけデフォルト、デフォルト節＋implicit 節、匿名クラスの親、引数無しの `new`）。私有ランタイム・library dual-run・real scalac dual-run の 3 通り | `rep[Int]` `rep[String]` … `anon:Int` `Int` |
@@ -1492,6 +1587,8 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   コンパイルします（`tests/slick_measure.sh` が自動で実行）。この 7 本を含めた
   時点で計測対象は 177 → 184 ファイルになり、エラー数も一段増えます（1371 → 2064）。
   数字が増えたのは退行ではなく、計測が実際のコンパイル対象に追いついたためです。
+  その後 `agent/genrep` スライスで **2064 → 1300**（生成 7 本は 736 → 41）になりました。
+  内訳と残りは「slick が生成する 7 本（`.fm` テンプレート）が通るまで」を参照。
 
 - **override 検査が無い**。`override` 修飾子の要否も、override 時の型適合も検査していない。
   scalac が拒否する次の 2 つを黙って通す:
