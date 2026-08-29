@@ -727,6 +727,25 @@ List#filter (from scala.collection.IterableOps)
    erase 済み descriptor が一意に決まらない、といった場合は供給せず、
    従来どおり `is not a member` を出します。誤った型より無い方がましです。
 3. **先読みしない。** 解決に失敗した `(受け手, 名前)` の組ごとに classfile 1 個、以降キャッシュ。
+4. **クラス側とコンパニオン側を両方見て合併する。** 受け手がクラスのときは
+   `PickleSupply::complete` がクラスとそのコンパニオンの**両方**に問い合わせ、結果を
+   合併します。以前は「クラス側で 1 つでも供給できたらコンパニオンは見ない」だったため、
+   答えが**関係のない大域状態に依存**していました。`scala.math.BigDecimal` は
+   インスタンスメソッド `apply(MathContext)` を宣言していますが、その引数型は
+   `java.math.MathContext` がシンボル表に入るまで表現できません。つまり
+   `java.math.BigDecimal` に触れた後だけクラス側の供給が成功し、コンパニオンの 7 個の
+   `apply` が丸ごと供給されなくなって、`BigDecimal(2)` が**文の順序次第で**通ったり
+   通らなかったりしていました。合併は順序に依存しません。
+
+オーバーロード集合が**複数の owner にまたがる**場合（クラスとそのコンパニオン）、
+`check.rs` の `resolve_overload` は `Type::Overload` が型しか持たないため候補の
+シンボルを `fun.sym` の owner から引き直します。これだと片方の owner の候補が
+**丸ごと落ちる**ので、引き直しで失われる集合だけを `Check::overload_groups` に
+覚えて使うようにしました。加えて、引数が 1 つも適合しなかったときに限り、
+**クラス名を term 位置で使った選択**（nsc ではコンパニオンオブジェクトを指す）を
+コンパニオンのメンバで広げてから 1 度だけ解決し直します
+（`Check::widen_with_companion`）。エラーを出す直前の経路にしかいないので、
+拒否を解決に変えることしかできません。
 
 erase 済み descriptor は scalac の erasure を再実装するのではなく、
 **classfile のメソッド表そのもの**から取ります（super とインタフェースを辿る。
@@ -969,6 +988,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/smallgaps` スライス（`@inline` / `@noinline` の配置、curried case class companion、companion への後方参照、`Option.flatMap` の多相性、`None`/`Some` の `lub`、`Iterable.apply`）のフィクスチャは接頭辞 `sgap`（`sgap` / `sgap_lib`）で、同じ理由から `crates/cli/tests/smallgaps.rs` に置いています。`sgap.scala` は `--no-scala-library` で `check` 済み、`sgap_lib.scala` は `Iterable.apply` が library ABI（`IterableFactory$Delegate.apply` の継承）にしか無いため library dual-run 専用（`fixtures_sgap_lib_without_library_is_error` で `--no-scala-library` が診断のまま残ることも見ています）。
 
+オーバーロード集合が別のクラスの読み込みで消える回帰のフィクスチャは接頭辞 `oshadow`（`oshadow` / `oshadow_java_first` / `oshadow_java_last` / `oshadow_bad`）で、同じ理由から `crates/cli/tests/overloadshadow.rs` に置いています。`oshadow.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 の実行結果とも直接比較します（`oshadow_matches_scalac`）。`oshadow_java_first.scala` と `oshadow_java_last.scala` は `java.math.BigDecimal` の位置だけを入れ替えた同じプログラムで、`oshadow_order_independent` が両方通ることと stdout が一致することを固定します。`oshadow_bad.scala` は `BigDecimal(Some(1))`（real scalac も拒否）が `no matching overload` になり、しかも**候補一覧が丸ごと**出る（`(String)BigDecimal` を含む）ことを見ます。`oshadow_without_library_is_error` は `--no-scala-library` で `not found: value BigDecimal` の診断が残ることを見ます。
+
 trait の `val` / `override val` / `var` の実行時表現と `case object` の合成メンバーのフィクスチャは接頭辞 `tval`（`tval` / `tval_bad`）で、同じ理由から `crates/cli/tests/traitval.rs` に置いています。`tval.scala` は私有ランタイム（`--no-scala-library`）と library dual-run の両方で走らせ、`expected/tval.txt` は **real scalac 2.13.16 の出力そのもの**です（3 モードがバイト単位で一致することを確認済み）。バイトコード側の不変条件も 2 本のテストで固定しています。`trait_val_setters_follow_nsc_names` は mixin setter が nsc と同じ `Named$_setter_$label_$eq` であること、`override val` したクラスのその setter が空実装（`putfield` なし）であること、trait の `var` への代入が `putfield` ではなく `count_$eq` 呼び出しであることを `javap -p -c` で見ます。`case_object_members_are_on_the_module_class` は `Asc$` に `toString` / `productPrefix` / `hashCode` / `productArity` が出ていることを見ます。`tval_bad.scala` は trait の `val` への代入が `reassignment to val` になることを固定します。
 
 jar の package object にある**型エイリアス**のフィクスチャは接頭辞 `pkgalias`（`pkgalias` / `pkgalias_bad`）で、同じ理由から `crates/cli/tests/pkgalias.rs` に置いています。`pkgalias.scala` は `scala` package object の pickle にしか無い別名（`NoSuchElementException` / `Throwable` / `UnsupportedOperationException` / `IllegalArgumentException` / `Exception` / `IterableOnce[A]` / `Seq[A]`）だけを使い、library dual-run 専用です（`pkgalias_without_library_is_diagnosed` で `--no-scala-library` では `not found: value NoSuchElementException` と診断されることも見ています）。`pkgalias_bad.scala` は package object が宣言していない名前が黙って通らないことを固定します。`expected/pkgalias.txt` は real scalac 2.13.16 の出力です。
@@ -1065,6 +1086,8 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `inline.scala` | `@inline` / `@noinline` を付けたメソッドが動く（インライン化はしない） | `3` |
 | `sgap.scala`（`crates/cli/tests/smallgaps.rs`） | `agent/smallgaps` スライスの複合 fixture: `@inline val` / `@inline @noinline def` の受理、curried 主コンストラクタ（`case class Pair(a: Int)(val b: Int, val c: Int)`）の companion `apply` が正しく curry される、case class のフィールド型が**自分の companion に後方参照する**入れ子型（`Ordering.Direction`）を指すときの解決順序、`case object` が引数付きの `sealed abstract class` を extends するときの module `<init>` codegen、`Option.flatMap` の多相性、`if`/`else` の `None`/`Some` 分岐で（型注釈なしでも）`lub` が `Option[X]` になり `.getOrElse` が解決すること | `42` `6` `true` `n=5` `3` `-1` |
 | `sgap_lib.scala`（`crates/cli/tests/smallgaps.rs`、library dual-run のみ） | `Iterable(...)` companion `apply`（実ライブラリの `IterableFactory$Delegate.apply` 継承。私有ランタイムに裏付けが無いので `--no-scala-library` では診断のまま） | `List(a, b, c)` `3` |
+| `oshadow.scala`（`crates/cli/tests/overloadshadow.rs`、library dual-run のみ） | 別のクラスを読んでも既存のオーバーロード集合が消えないこと: `java.math.BigDecimal` を**前にも後にも**置いた上での `BigDecimal(Int)` / `(Long)` / `(String)` / `(BigInt)` / `(java.math.BigDecimal)`、`Option[BigDecimal].getOrElse` | `2` `3` `4.25` `6` `12.5` `12.5` `-1` `7` `8.75` `9` |
+| `oshadow_java_first.scala` / `oshadow_java_last.scala`（`crates/cli/tests/overloadshadow.rs`、library dual-run のみ） | 同じプログラムを `java.math.BigDecimal` の位置だけ入れ替えた 2 本。両方通り、stdout が一致すること（順序依存の回帰テスト） | `1` `2` `3.5` |
 | `pkgalias.scala`（`crates/cli/tests/pkgalias.rs`、library dual-run のみ） | jar の package object にしかない**型エイリアス**（`scala/package$` の pickle）: `new NoSuchElementException(...)` と `catch`、`Throwable` / `UnsupportedOperationException` / `IllegalArgumentException` / `Exception`、型パラメータ付きの `IterableOnce[Int]` / `Seq[Int]` | `gone` `java.lang.UnsupportedOperationException` `java.lang.IllegalArgumentException` `3` `r` `9` |
 | `java_cp.scala` | JDK の Java `.class` から `Math.abs` / `Byte.MAX_VALUE` / `ArrayList.add` を解決して実行 | `3` `127` `true` `1` |
 | `java_sig.scala` | Java Signature（`ArrayList[String]#get` は `String`）、inner `Map.Entry` / `SimpleEntry`、Java varargs `String.format` / `Arrays.asList` を実行 | `hi` `2` `k` `v` `k` `x-3` `2` |
@@ -1461,6 +1484,7 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   - 副次的に見つけたが未修正: `case object X extends Y(...) { override def m: MoreSpecific = ... }` のように親の抽象メソッドを共変な戻り値型でオーバーライドすると `AbstractMethodError`（ブリッジメソッド未生成）。fixture 構築中に踏んだので `tests/fixtures/sgap.scala` はこのパターンを避けている。別の残課題として記録。
 - **型位置 `super.T` の残り**: 親クラスの型メンバーへのパスは通るが、`trait Mid { trait Impl extends super.Impl }` のように**親と同名**の入れ子型を定義すると、ミックス先で継承メンバーの解決が親側を選んでしまうことがある（`super` の解決ではなく、同名ネスト型のメンバー継承側の穴）
 - **`Unit` に具体化した多相メソッドの捨て方**: `PartialFunction[A, Unit].apply` のように JVM 上は `(Object)Object` を返すものだけ、statement 位置で `pop` する。`Breaks.catchBreak` / `Using.resource` のように emit 側で既に捨てている intrinsic とは重ならないよう、判定は意図的に狭くしてある（`unit_call_leaves_ref`）
+- **`agent/overloadshadow` スライス**（別のクラスを読むと既存のオーバーロード集合が消える）: 177 ファイルのエラーは **1,707 → 1,678**（`files_with_errors` は **111** のまま）。根本原因は 3 つ重なっていた: (a) `PickleSupply::complete` がクラス側で 1 つでも供給できたらコンパニオンを見ずに返していた（`java.math.MathContext` が入っているかどうかという**無関係な大域状態**で答えが変わる）、(b) `check.rs::resolve_overload` が `Type::Overload` の候補シンボルを `fun.sym` の owner から引き直すので、クラスとコンパニオンにまたがる集合の片側が丸ごと落ちる、(c) 一度クラス側に `apply(MathContext)` が入ると以降の `BigDecimal(...)` は `lookup_member` がそれを見つけて止まり、pickle 補完まで届かない。(a) は合併に、(b) は `Check::overload_groups`（引き直しで失われる集合だけ覚える）に、(c) は `Check::widen_with_companion`（**エラーを出す直前だけ**、term 位置のクラス名の選択をコンパニオンのメンバで広げて 1 度だけ解決し直す）で直した。併せて `scala.math.BigDecimal.apply(java.math.BigDecimal)`（JDBC の結果を Scala 値にするのに使う）を prelude に固定した（`crates/typer/src/prelude_oshadow.rs`。`library_abi` のみ）。残件: slick の `value getOrElse is not a member of Product`（16 件）は BigDecimal とは無関係で、`if (c) None else Some(x)` の `lub` が `Option[X]` にならず `Product` に落ちる別のバグ（`Boolean` / `Blob` / `Byte` … でも同じように出る）。`BigDecimal.apply` を eta 展開して `(Double) => BigDecimal` に渡す `new ScalaNumericType[BigDecimal](BigDecimal.apply)` は、オーバーロードの eta 展開を期待型で選べないため未対応
 - **`@specialized` codegen** はこのスライスでは開始しない
 - **オーバーロード / メソッド適用のスライスで残っているもの**: slick 177 ファイルのエラーは **2,901 → 2,539**（`tests/slick_measure.sh`。エラーを含むファイルは 116 → 115）。`no matching overload for (Type, Any, Boolean)LiteralNode` / `(#N*)(TypedType[T])Rep[T]` / `not found: extractor ==` / `type arg is not a member of OptionMapperDSL$.arg[B1, P1]` は消えた。残る上位は implicit 探索（`could not find implicit value of type TypedType[BR]` など）と、`.fm` テンプレート由来で存在しない型（`Table` / `Sequence` / `Ref`）のカスケード。`no matching overload for (String)String` は最小再現では通るので、別の穴のカスケード
 - 高階 `F[_] <% …` は nsc どおり `takes type parameters`（`F[_]: C` は nsc が受理するので実装済み。README の旧記述は誤りだったので実測に合わせて直した）

@@ -108,6 +108,19 @@ pub struct Typer {
     language_implicit_conversions: bool,
     binary: BinaryIndex,
     completed_java: HashSet<String>,
+    /// Overload sets whose alternatives do not all belong to one class's
+    /// linearization, keyed by the alternative the tree carries as its symbol.
+    ///
+    /// `resolve_overload` normally recovers the alternatives' symbols by
+    /// re-looking the name up on the owner of the tree's symbol, since
+    /// `Type::Overload` carries types and no symbols. That is exact as long as
+    /// every alternative is reachable from that owner -- which is how an
+    /// ordinary `x.f` set is built. It is not true of a set that spans a class
+    /// and its companion object (`supply_from_pickle` installs a companion's
+    /// members on the module class, which is not a parent of the class), and
+    /// there the re-lookup silently *dropped* every alternative from the other
+    /// owner. This remembers the real set for exactly those cases.
+    overload_groups: HashMap<u32, Vec<SymbolId>>,
     /// While a template's parent list is being typed: `(the class, the class
     /// that encloses it)`. nsc types parents in the *outer* context, so
     /// `class B extends super.B` inside `trait Mid` means `Mid`'s `super`.
@@ -262,6 +275,7 @@ impl Typer {
             ),
             binary: BinaryIndex::from_user_paths(opts.binary_path.clone()),
             completed_java: HashSet::new(),
+            overload_groups: HashMap::new(),
             parent_ctx: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
             pkg_aliases_done: HashSet::new(),
@@ -4661,6 +4675,8 @@ impl Typer {
         }
         // Keep overloads intact so `println(1)` can still pick a 1-arg alternative.
         // Nullary alternatives still auto-apply in value position (`"x".stripMargin`).
+        let ov_name = self.st.get(found[0]).name.clone();
+        self.record_overload_group(&found, &ov_name);
         let ov = Type::Overload(found.iter().map(|s| self.st.get(*s).ty.clone()).collect());
         tree.ty = self.maybe_auto_apply(ov, pt);
         tree.sym = if matches!(tree.ty, Type::Overload(_)) {
@@ -5136,6 +5152,9 @@ impl Typer {
         for s in found.iter().copied() {
             self.complete_lazy_sig(s, tree.span);
         }
+        if found.len() > 1 {
+            self.record_overload_group(&found, &name);
+        }
         let subst_args: Vec<Type> = match &recv_ty {
             Type::Class { args, .. } => args.clone(),
             Type::Tuple(ts) => ts.clone(),
@@ -5204,6 +5223,36 @@ impl Typer {
                 }
             }
         }
+    }
+
+    /// Remember `found` when re-deriving it from `found[0]`'s owner would lose
+    /// alternatives, so `resolve_overload` can use the real set.
+    ///
+    /// The common case -- every alternative reachable from the head's owner --
+    /// records nothing, and resolution keeps re-deriving as before.
+    fn record_overload_group(&mut self, found: &[SymbolId], name: &str) {
+        let Some(&head) = found.first() else { return };
+        if found.len() < 2 {
+            return;
+        }
+        let owner = self.st.get(head).owner;
+        let derived = self.st.lookup_member(owner, name);
+        if found.iter().all(|s| derived.contains(s)) {
+            return;
+        }
+        self.overload_groups.insert(head.0, found.to_vec());
+    }
+
+    /// The alternatives `fun_sym` stands for: the recorded set when the
+    /// overload spans owners, otherwise everything the owner declares.
+    fn overload_alternatives(&self, fun_sym: SymbolId, name: &str) -> Vec<SymbolId> {
+        if let Some(g) = self.overload_groups.get(&fun_sym.0) {
+            if self.st.get(fun_sym).name == name {
+                return g.clone();
+            }
+        }
+        let owner = self.st.get(fun_sym).owner;
+        self.st.lookup_member(owner, name)
     }
 
     /// Prefer a definition on a subclass over the inherited member it overrides.
@@ -5433,6 +5482,83 @@ impl Typer {
             id = self.st.get(id).owner;
         }
         self.st.root
+    }
+
+    /// A select on a *class name* in term position that no argument list
+    /// matched, widened with the companion object's members.
+    ///
+    /// nsc reads a class name in term position as its companion object, so
+    /// only the object's members are in scope there. This typer keeps the
+    /// class symbol as the receiver and lets `supply_from_pickle` install
+    /// companion members on the module class, which works as long as nothing
+    /// by that name sits on the class itself. `scala.math.BigDecimal` breaks
+    /// that: it declares an *instance* `apply(MathContext)`, and once
+    /// completion has installed it -- which it can only do after something in
+    /// the run has pulled `java.math.MathContext` in, since the parameter is
+    /// unmappable before that -- every later `BigDecimal(...)` finds that one
+    /// method, stops there, and never sees the companion's seven `apply`
+    /// overloads. The same program then compiled or not depending on the
+    /// order of unrelated statements.
+    ///
+    /// Nothing is loaded or installed here: both scopes are already in the
+    /// table, and this only runs on a path that is otherwise about to report
+    /// an error, so it can turn a rejection into a resolution and nothing else.
+    fn widen_with_companion(&mut self, fun: &mut Tree) -> bool {
+        let TreeKind::Select { qual, name } = &fun.kind else {
+            return false;
+        };
+        // A value receiver keeps the class's own scope; only a bare class name
+        // stands for its companion.
+        if qual.sym.is_none() || self.st.get(qual.sym).kind != SymKind::Class {
+            return false;
+        }
+        let name = name.clone();
+        let recv_ty = qual.ty.clone();
+        let Some(cls) = self.st.class_sym_of(&recv_ty) else {
+            return false;
+        };
+        let module = self.st.companion_module(cls);
+        let Some(module) = module else {
+            return false;
+        };
+        let mcls = self.st.module_class_of(module);
+        let before = match &fun.ty {
+            Type::Overload(alts) => alts.len(),
+            Type::Method { .. } => 1,
+            _ => return false,
+        };
+        let mut found = self.st.lookup_member(cls, &name);
+        for s in self.st.lookup_member(mcls, &name) {
+            if !found.contains(&s) {
+                found.push(s);
+            }
+        }
+        found.retain(|&s| self.st.get(s).kind == SymKind::Method);
+        found = self.drop_overridden(found);
+        if found.len() <= before || found.len() < 2 {
+            return false;
+        }
+        self.record_overload_group(&found, &name);
+        let subst_args: Vec<Type> = match &recv_ty {
+            Type::Class { args, .. } => args.clone(),
+            _ => Vec::new(),
+        };
+        let owner = self.st.get(found[0]).owner;
+        let alts: Vec<Type> = found
+            .iter()
+            .map(|&s| {
+                let t = self.st.subst_as_seen_from(&recv_ty, &self.st.get(s).ty);
+                let t = if subst_args.is_empty() {
+                    t
+                } else {
+                    self.st.subst_tparams(owner, &subst_args, &t)
+                };
+                self.st.expand_in_type(&recv_ty, &t)
+            })
+            .collect();
+        fun.ty = Type::Overload(alts);
+        fun.sym = found[0];
+        true
     }
 
     /// When a member exists on the receiver (e.g. `Int.+`) but the argument
@@ -6917,6 +7043,27 @@ impl Typer {
                 tree.ty = Type::Error;
             }
             OverloadPick::None => {
+                if self.widen_with_companion(fun) {
+                    let fun_ty = fun.ty.clone();
+                    if let OverloadPick::Found(sym, param_tys, ret) =
+                        self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt)
+                    {
+                        fun.sym = sym;
+                        tree.sym = sym;
+                        for (i, a) in args.iter_mut().enumerate() {
+                            let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
+                            if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type() {
+                                self.type_expr(a, &p);
+                            }
+                            let p = relax_open_tparams(&p);
+                            if !p.is_no_type() {
+                                self.adapt(a, &p);
+                            }
+                        }
+                        tree.ty = ret;
+                        return;
+                    }
+                }
                 if self.rewrite_apply_extension(fun) {
                     let fun_ty = fun.ty.clone();
                     match self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt) {
@@ -8659,9 +8806,8 @@ impl Typer {
                 }
                 if !fun_sym.is_none() {
                     let name = self.st.get(fun_sym).name.clone();
-                    let owner = self.st.get(fun_sym).owner;
                     cands.clear();
-                    let methods = self.drop_overridden(self.st.lookup_member(owner, &name));
+                    let methods = self.drop_overridden(self.overload_alternatives(fun_sym, &name));
                     for m in methods {
                         if let Type::Method { paramss, ret } = &self.st.get(m).ty {
                             cands.push((
