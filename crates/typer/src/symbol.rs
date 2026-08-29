@@ -1019,11 +1019,28 @@ impl SymbolTable {
                 }
             }
         }
+        // Not just `a`'s ancestors: `None` (`<: Option[Nothing]` only) paired
+        // with `Some[Boolean]` (`<: Option[Boolean]`) has no match walking
+        // only `a`'s chain (`Some[Boolean] <: Option[Nothing]` is false, since
+        // `Boolean` is not `<: Nothing`), but walking `b`'s chain finds
+        // `Option[Boolean]`, which *does* accept `a` (`Nothing <: Boolean`).
+        // A real LUB would also join partial candidates from both sides; this
+        // first-match version is simpler but covers the common "singleton
+        // case object vs. parameterized case class" pattern, which needs one
+        // side's own instantiation to be precise enough already.
         for cand in self.base_type_seq(&a) {
             if matches!(cand, Type::Any | Type::AnyRef | Type::AnyVal) {
                 continue;
             }
             if self.is_sub_type(&b, &cand) {
+                return cand;
+            }
+        }
+        for cand in self.base_type_seq(&b) {
+            if matches!(cand, Type::Any | Type::AnyRef | Type::AnyVal) {
+                continue;
+            }
+            if self.is_sub_type(&a, &cand) {
                 return cand;
             }
         }

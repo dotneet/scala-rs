@@ -1239,7 +1239,6 @@ impl Typer {
             paramss_ty.push(ct);
             paramss_ids.push(ids);
         }
-        let ctor_param_tys = paramss_ty.first().cloned().unwrap_or_default();
         // Primary `<init>` type must be visible before auxiliary `this(...)` bodies.
         if !id.is_none() {
             for mem in self.st.get(id).members.clone() {
@@ -1336,7 +1335,7 @@ impl Typer {
                 self.type_member_body(stt);
             }
         }
-        self.finish_case_apply(id, &ctor_param_tys);
+        self.finish_case_apply(id, &paramss_ty, &paramss_ids);
         self.check_type_member_kind_override(id, tree.span);
         self.check_self_conformance(id, tree.span);
         self.check_class_variance(id, tree.span);
@@ -1350,7 +1349,18 @@ impl Typer {
         };
     }
 
-    fn finish_case_apply(&mut self, class_id: SymbolId, ctor_param_tys: &[Type]) {
+    fn finish_case_apply(
+        &mut self,
+        class_id: SymbolId,
+        paramss_ty: &[Vec<Type>],
+        paramss_ids: &[Vec<SymbolId>],
+    ) {
+        // `unapply` extracts from the *first* parameter section only (nsc:
+        // extra curried sections, e.g. `case class F(name: String)(val opts: X)`,
+        // are not part of the pattern); `apply` mirrors every section, curried,
+        // exactly like the primary constructor. See sgap fixtures (repro2/repro8,
+        // scalac-verified) for a class with `val`s in a second parameter list.
+        let ctor_param_tys = paramss_ty.first().cloned().unwrap_or_default();
         let name = self.st.get(class_id).name.clone();
         let companion = self
             .st
@@ -1374,28 +1384,24 @@ impl Typer {
                 },
                 _ => Type::Class {
                     sym: self.st.option_sym,
-                    args: vec![Type::Tuple(ctor_param_tys.to_vec())],
+                    args: vec![Type::Tuple(ctor_param_tys.clone())],
                 },
             };
             for mem in self.st.get(cls).members.clone() {
                 let n = self.st.get(mem).name.clone();
                 if n == "apply" {
                     self.st.get_mut(mem).ty = Type::Method {
-                        paramss: vec![ctor_param_tys.to_vec()],
+                        paramss: paramss_ty.to_vec(),
                         ret: Box::new(class_ty.clone()),
                     };
+                    self.st.get_mut(mem).paramss = paramss_ids.to_vec();
+                    self.st.get_mut(mem).params = paramss_ids.iter().flatten().copied().collect();
                 } else if n == "unapply" {
                     self.st.get_mut(mem).ty = Type::Method {
                         paramss: vec![vec![class_ty.clone()]],
                         ret: Box::new(unapply_ret.clone()),
                     };
                 }
-            }
-            for f in self.st.get(class_id).ctor_fields.clone() {
-                if self.st.get(f).ty.is_no_type() {
-                    // already set
-                }
-                let _ = f;
             }
         }
         // Primary constructor only. Auxiliary `def this` already has a Method
@@ -1404,7 +1410,7 @@ impl Typer {
         for mem in self.st.get(class_id).members.clone() {
             if self.st.get(mem).name == "<init>" && self.st.get(mem).ty.is_no_type() {
                 self.st.get_mut(mem).ty = Type::Method {
-                    paramss: vec![ctor_param_tys.to_vec()],
+                    paramss: paramss_ty.to_vec(),
                     ret: Box::new(Type::Unit),
                 };
             }
@@ -3480,9 +3486,14 @@ impl Typer {
                 self.type_expr(thenp, pt);
                 self.type_expr(elsep, pt);
                 // `adapt` leaves the branch type as-is when it is a subtype of `pt`
-                // (`Some` stays `Some`, not `Option`). Structural lub cannot walk
-                // parents, so use the expected type when the typer has one.
-                tree.ty = pt_or_lub(pt, lub(&thenp.ty, &elsep.ty));
+                // (`Some` stays `Some`, not `Option`). Prefer the expected type when
+                // the typer has one; otherwise fall back to `SymbolTable::lub`, which
+                // (unlike the old structural-only `lub` below) walks the parent chain
+                // — needed for e.g. `if (c) None else Some(x)` with no ascription,
+                // whose branches share no direct subtype relation but do share
+                // `Option[X]` as a common ancestor (sgap fixture; slick's
+                // `PositionedResult.nextXOption()` methods rely on exactly this).
+                tree.ty = pt_or_lub(pt, self.st.lub(&thenp.ty, &elsep.ty));
             }
             TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
                 self.type_expr(cond, &Type::Boolean);
@@ -8181,7 +8192,7 @@ impl Typer {
                 self.type_expr(&mut c.guard, &Type::Boolean);
             }
             self.type_expr(&mut c.body, pt);
-            res = lub(&res, &c.body.ty);
+            res = self.st.lub(&res, &c.body.ty);
             self.st.pop_scope();
         }
         let span = tree.span;
@@ -9882,12 +9893,29 @@ impl Typer {
         match &t.kind {
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, t.span);
-                let id = self.st.lookup(name).into_iter().find(|id| {
-                    matches!(
-                        self.st.get(*id).kind,
-                        SymKind::Package | SymKind::Class | SymKind::Module | SymKind::ModuleClass
-                    )
-                })?;
+                // `Foo.Bar` (dot syntax) in type position requires `Foo` to be a
+                // stable term (an object): a class-level projection needs `#`
+                // instead. When a case class and its companion object share a
+                // name, both are entered under it; the companion module — whose
+                // module class actually hosts `Bar` — must win regardless of
+                // which one was declared (and thus entered into scope) first.
+                // See sgap fixtures / repro6-repro7 for the scalac-verified
+                // behavior this matches.
+                let found = self.st.lookup(name);
+                let id = found
+                    .iter()
+                    .copied()
+                    .find(|id| {
+                        matches!(
+                            self.st.get(*id).kind,
+                            SymKind::Module | SymKind::ModuleClass
+                        )
+                    })
+                    .or_else(|| {
+                        found.into_iter().find(|id| {
+                            matches!(self.st.get(*id).kind, SymKind::Package | SymKind::Class)
+                        })
+                    })?;
                 Some(self.as_type_owner(id))
             }
             TreeKind::Select { qual, name } => {
@@ -10714,12 +10742,11 @@ impl Typer {
                     self.check_java_override(tree);
                 }
             }
-            if is_inline_annot(&path) || is_noinline_annot(&path) {
-                if !matches!(&tree.kind, TreeKind::DefDef { .. }) {
-                    let simple = path.rsplit('.').next().unwrap_or(path.as_str());
-                    self.error(tree.span, format!("@{simple} is only supported on methods"));
-                }
-            }
+            // Real scalac accepts `@inline`/`@noinline` on any definition (val, var,
+            // class, type, ...): they are hints consumed only by the bytecode-level
+            // optimizer (`-opt:...`), which scala-rs does not implement, and placement
+            // is never validated by the typer. See sgap fixtures for confirmation
+            // against scalac 2.13.16 (no error, no warning, even with -Xlint:_).
             if is_native_annot(&path) {
                 if !matches!(&tree.kind, TreeKind::DefDef { .. }) {
                     self.error(tree.span, "@native is only supported on methods");
@@ -10729,17 +10756,6 @@ impl Typer {
                     }
                 }
             }
-        }
-        let has_inline = mods
-            .annotations
-            .iter()
-            .any(|a| is_inline_annot(&a.annotation_path()));
-        let has_noinline = mods
-            .annotations
-            .iter()
-            .any(|a| is_noinline_annot(&a.annotation_path()));
-        if has_inline && has_noinline {
-            self.error(tree.span, "@inline and @noinline cannot be used together");
         }
     }
 
@@ -10929,14 +10945,6 @@ fn is_tailrec_annot(path: &str) -> bool {
         path,
         "tailrec" | "annotation.tailrec" | "scala.annotation.tailrec"
     )
-}
-
-fn is_inline_annot(path: &str) -> bool {
-    matches!(path, "inline" | "scala.inline")
-}
-
-fn is_noinline_annot(path: &str) -> bool {
-    matches!(path, "noinline" | "scala.noinline")
 }
 
 fn is_native_annot(path: &str) -> bool {
@@ -11349,55 +11357,6 @@ fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
     }
 }
 
-fn is_sub_type(a: &Type, b: &Type) -> bool {
-    if a == b {
-        return true;
-    }
-    match (a, b) {
-        (Type::Error, _) | (_, Type::Error) => true,
-        (Type::Nothing, _) => true,
-        (_, Type::Any) => true,
-        (
-            Type::Null,
-            Type::AnyRef | Type::String | Type::Array(_) | Type::Class { .. } | Type::ModuleRef(_),
-        ) => true,
-        (
-            Type::Int
-            | Type::Long
-            | Type::Double
-            | Type::Boolean
-            | Type::Byte
-            | Type::Short
-            | Type::Unit
-            | Type::Char
-            | Type::Float,
-            Type::AnyVal,
-        ) => true,
-        (
-            Type::String
-            | Type::Array(_)
-            | Type::Class { .. }
-            | Type::ModuleRef(_)
-            | Type::Function { .. },
-            Type::AnyRef,
-        ) => true,
-        (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) if s1 == s2 => {
-            if a1.is_empty() || a2.is_empty() {
-                true
-            } else if a1.len() == a2.len() {
-                a1.iter().zip(a2.iter()).all(|(x, y)| is_sub_type(x, y))
-            } else {
-                false
-            }
-        }
-        (Type::Wildcard, Type::AnyRef | Type::AnyVal | Type::Wildcard) => true,
-        (_, Type::Wildcard) => true,
-        (Type::Array(x), Type::Array(y)) => is_sub_type(x, y),
-        (Type::ModuleRef(s), Type::Class { sym, .. }) if s == sym => true,
-        _ => false,
-    }
-}
-
 fn numeric_widen(a: &Type, b: &Type) -> Option<Type> {
     let a = a.widen_constant();
     let b = b.widen_constant();
@@ -11424,30 +11383,6 @@ fn pt_or_lub(pt: &Type, branches: Type) -> Type {
     } else {
         branches
     }
-}
-
-fn lub(a: &Type, b: &Type) -> Type {
-    if a == b {
-        return a.clone();
-    }
-    let a = a.widen_constant();
-    let b = b.widen_constant();
-    if a == b {
-        return a;
-    }
-    if is_sub_type(&a, &b) {
-        return b;
-    }
-    if is_sub_type(&b, &a) {
-        return a;
-    }
-    if matches!(a, Type::Nothing) {
-        return b;
-    }
-    if matches!(b, Type::Nothing) {
-        return a;
-    }
-    Type::Any
 }
 
 /// Undo the parser's `{A,B=>C,_}` encoding of an import selector list.

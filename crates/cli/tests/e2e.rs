@@ -1238,10 +1238,12 @@ fn fixtures_inline() {
     check("inline");
 }
 
-#[test]
-fn fixtures_inline_bad_is_error() {
-    compile_fails("inline_bad", "only supported on methods");
-}
+// NOTE: `inline_bad` used to assert that `@inline val` and `@inline @noinline def`
+// were compile errors ("only supported on methods" / "cannot be used together").
+// Verified against real scalac 2.13.16 (see crates/cli/tests/smallgaps.rs): neither
+// case is rejected -- @inline/@noinline are placement-unchecked hints for the
+// bytecode optimizer scala-rs does not implement. The fixture was removed and its
+// scenario now lives as a passing test, `sgap_inline`, in smallgaps.rs.
 
 #[test]
 fn fixtures_java_cp() {
