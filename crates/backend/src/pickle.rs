@@ -24,7 +24,7 @@
 //! - pickle = major, minor, **nentries**, then `{ tag_Nat, len_Nat, body }`
 //! - Nat / LongNat are **big-endian** base-128 (nsc `writeLongNat`)
 //! - `NOPREFIXtpe` for primitive `TypeRef` prefixes; class type params use `THIStpe`
-//! - `scala` / `java.lang` / `<empty>` `EXTMODCLASSref` (term names)
+//! - `scala` / `java.lang` / the class's own package / `<empty>` `EXTMODCLASSref` (term names)
 //! - objects pickle as `CLASSsym` + MODULE (type name), not `MODULEsym`
 //! - `POLYtpe` is restpe first, then tparams; empty tparams = NullaryMethodType
 //! - methods carry `METHOD`; vals are getters (`METHOD|STABLE|ACCESSOR` + `POLYtpe`)
@@ -265,6 +265,9 @@ struct Pickler<'a> {
     sym_index: std::collections::HashMap<u32, u32>,
     this_tpes: std::collections::HashMap<u32, u32>,
     class_tparams: std::collections::HashMap<u32, Vec<u32>>,
+    /// Pickle entry of the package a class entry belongs to, so a constructor
+    /// result written after the fact still names the right prefix.
+    class_pkg: std::collections::HashMap<u32, u32>,
     current_owner: u32,
     exist_n: u32,
     collection_immutable: Option<u32>,
@@ -287,6 +290,7 @@ impl<'a> Pickler<'a> {
             sym_index: std::collections::HashMap::new(),
             this_tpes: std::collections::HashMap::new(),
             class_tparams: std::collections::HashMap::new(),
+            class_pkg: std::collections::HashMap::new(),
             current_owner: 0,
             exist_n: 0,
             collection_immutable: None,
@@ -383,6 +387,32 @@ impl<'a> Pickler<'a> {
         i
     }
 
+    /// The module class of the package a JVM name lives in, as an
+    /// `EXTMODCLASSref` chain (`hklib`, `slick/ast`), or `<empty>` for the
+    /// default package.
+    ///
+    /// An unpickler reads a symbol's owner straight out of the pickle, so
+    /// writing `<empty>` for everything meant a class compiled inside
+    /// `package hklib` called itself `Monadic`, not `hklib.Monadic`. Neither
+    /// scalac 2.13.16 nor scala-rs's own `scala-rs-pickle` could then find it
+    /// ("not found: type Monadic" against our own classfiles), which is what
+    /// made a jar of scala-rs output unreadable while a *directory* of the
+    /// same classfiles worked -- the directory path recovers the package from
+    /// the file's path instead.
+    fn package_ref_of(&mut self, jvm_name: &str) -> u32 {
+        let Some((pkg, _)) = jvm_name.rsplit_once('/') else {
+            return self.empty_package();
+        };
+        let mut owner: Option<u32> = None;
+        for seg in pkg.split('/').filter(|s| !s.is_empty()) {
+            owner = Some(self.ext_mod(seg, owner));
+        }
+        match owner {
+            Some(o) => o,
+            None => self.empty_package(),
+        }
+    }
+
     fn scala_collection_immutable(&mut self) -> u32 {
         if let Some(i) = self.collection_immutable {
             return i;
@@ -394,11 +424,15 @@ impl<'a> Pickler<'a> {
         i
     }
 
-    /// nsc constructor result: `TypeRef(ThisType(<empty>), C, tparams)`.
+    /// nsc constructor result: `TypeRef(ThisType(<owning package>), C, tparams)`.
     fn ctor_result_type(&mut self, class_idx: u32) -> u32 {
-        let empty = self.empty_package();
+        let pkg = self
+            .class_pkg
+            .get(&class_idx)
+            .copied()
+            .unwrap_or_else(|| self.empty_package());
         let mut th = Vec::new();
-        write_nat_to(&mut th, empty);
+        write_nat_to(&mut th, pkg);
         let pref = self.add(THISTPE, th);
         let tparams = self
             .class_tparams
@@ -510,11 +544,6 @@ impl<'a> Pickler<'a> {
         self.add(TYPEREFTPE, body)
     }
 
-    fn type_ref_user_refs(&mut self, name: &str, arg_refs: &[u32]) -> u32 {
-        let empty = self.empty_package();
-        self.type_ref_in_refs(empty, name, arg_refs)
-    }
-
     fn class_type_ref(&mut self, class_sym: SymbolId, arg_refs: &[u32]) -> u32 {
         if let Some(&idx) = self.sym_index.get(&class_sym.0) {
             return self.type_ref_local_refs(idx, arg_refs);
@@ -565,7 +594,11 @@ impl<'a> Pickler<'a> {
                     self.type_ref_in_refs(sc, n, arg_refs)
                 }
             }
-            n => self.type_ref_user_refs(n, arg_refs),
+            n => {
+                let jvm = self.st.get(class_sym).jvm_name.clone();
+                let owner = self.package_ref_of(&jvm);
+                self.type_ref_in_refs(owner, n, arg_refs)
+            }
         }
     }
 
@@ -1335,8 +1368,23 @@ impl<'a> Pickler<'a> {
                 let n = n.trim_end_matches('$').to_string();
                 self.type_ref_named(&n)
             }
-            Type::Function { params, .. } => {
-                self.type_ref_named(&format!("Function{}", params.len()))
+            Type::Function { params, ret } => {
+                // With no arguments a reader sees a raw `Function1` and has to
+                // decline every signature that mentions one -- which is most of
+                // a collection or type-class API. `TupleN` was already written
+                // with its arguments; `FunctionN` is the same shape.
+                let name = format!("Function{}", params.len());
+                let mut all: Vec<Type> = params.clone();
+                all.push((**ret).clone());
+                if all.iter().any(type_has_wildcard) {
+                    // A wildcard here would need an `EXISTENTIALtpe` wrapped
+                    // around the function type, which this writer does not put
+                    // there yet. The bare constructor is the honest fallback:
+                    // a reader takes no arguments rather than wrong ones.
+                    return self.type_ref_named(&name);
+                }
+                let sc = self.scala_module();
+                self.type_ref_in_args(sc, &name, &all)
             }
             Type::Tuple(ts) => {
                 if ts.iter().any(type_has_wildcard) {
@@ -1393,6 +1441,9 @@ impl<'a> Pickler<'a> {
         // Placeholder; fill after children so the class exists as owner.
         let idx = self.add(tag, vec![]);
         self.sym_index.insert(class_id.0, idx);
+        let jvm_name = self.st.get(class_id).jvm_name.clone();
+        let pkg_ref = self.package_ref_of(&jvm_name);
+        self.class_pkg.insert(idx, pkg_ref);
 
         let this_tpe = {
             let mut body = Vec::new();
@@ -1480,7 +1531,7 @@ impl<'a> Pickler<'a> {
             extra |= 1 << 20; // JAVA (not remapped)
         }
         let flags = pickled_from_our(class_flags, class_kind, extra);
-        let owner = self.empty_package();
+        let owner = pkg_ref;
         let body = self.symbol_info(name_ref, owner, flags, info);
         self.entries[idx as usize] = (tag, body);
         self.pickle_sym_annots(class_id, idx);
@@ -1677,6 +1728,11 @@ impl<'a> Pickler<'a> {
             write_nat_to(&mut pt, ret_ref);
             self.add(POLYTPE, pt)
         } else {
+            // One `METHODtpe`, because `uncurry` has already flattened the
+            // parameter *lists* off the symbol by the time anything is
+            // pickled: `def bind(fa)(f)` reaches here as `bind(fa, f)` and the
+            // original shape is gone. So it pickles as one list, and a reader
+            // -- scalac included -- sees `bind(fa, f)`. See README Remaining.
             let mut mt = Vec::new();
             write_nat_to(&mut mt, ret_ref);
             for p in param_refs {

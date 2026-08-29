@@ -724,12 +724,23 @@ fn method_params_from_sym(st: &SymbolTable, id: SymbolId) -> Vec<Type> {
 /// A parent parameter that mentions a type parameter or an abstract type
 /// member is exactly the case a bridge exists for (`def f(x: A)` implemented
 /// as `f(x: Int)`), so it matches anything.
+///
+/// Two parameters that erase to the same descriptor are the same JVM parameter
+/// however differently they are written, so they cannot be what tells two
+/// overloads apart either: `def bind[A, B](fa: F[A])(f: A => F[B])`
+/// implemented at `F = Option` declares `f: A => Option[B]`, and both are
+/// `Lscala/Function1;`. Comparing those structurally said "not an override",
+/// no bridge was emitted, and calling `bind` through the interface threw
+/// `AbstractMethodError`. (When *every* parameter matches this way the two
+/// descriptors are equal and the caller skips the bridge anyway.)
 fn bridge_overrides(st: &SymbolTable, parent: &[Type], child: &[Type]) -> bool {
     parent.len() == child.len()
-        && parent
-            .iter()
-            .zip(child)
-            .all(|(p, c)| p == c || erases_to_object(st, p) || erases_to_object(st, c))
+        && parent.iter().zip(child).all(|(p, c)| {
+            p == c
+                || jvm_desc(st, p) == jvm_desc(st, c)
+                || erases_to_object(st, p)
+                || erases_to_object(st, c)
+        })
 }
 
 /// A parameter that carries no information after erasure. This is precisely
