@@ -123,6 +123,31 @@ fn free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>, st: &Sy
                 consider(id, bound, out, st);
             }
         }
+        TreeKind::Match { selector, cases } => {
+            free(selector, bound, out, st);
+            for c in cases {
+                let mut b = bound.clone();
+                pattern_binders(&c.pat, &mut b);
+                free(&c.pat, &b, out, st);
+                free(&c.guard, &b, out, st);
+                free(&c.body, &b, out, st);
+            }
+        }
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            free(block, bound, out, st);
+            for c in catches {
+                let mut b = bound.clone();
+                pattern_binders(&c.pat, &mut b);
+                free(&c.pat, &b, out, st);
+                free(&c.guard, &b, out, st);
+                free(&c.body, &b, out, st);
+            }
+            free(finalizer, bound, out, st);
+        }
         TreeKind::LabelDef { params, rhs, .. } => {
             let mut b = bound.clone();
             for p in params {
@@ -134,6 +159,29 @@ fn free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>, st: &Sy
         }
         _ => each_child(tree, &mut |c| free(c, bound, out, st)),
     }
+}
+
+/// Names a pattern introduces: a `Bind`, and an `Ident` that is a variable
+/// rather than a stable identifier -- the same lowercase test the typer uses.
+fn pattern_binders(pat: &Tree, out: &mut HashSet<SymbolId>) {
+    match &pat.kind {
+        TreeKind::Bind { .. } => {
+            if !pat.sym.is_none() {
+                out.insert(pat.sym);
+            }
+        }
+        TreeKind::Ident { name } => {
+            let varid = name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_lowercase() || c == '_');
+            if varid && !pat.sym.is_none() {
+                out.insert(pat.sym);
+            }
+        }
+        _ => {}
+    }
+    each_child(pat, &mut |c| pattern_binders(c, out));
 }
 
 /// Visit every sub-tree that can hold expressions.

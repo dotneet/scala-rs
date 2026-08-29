@@ -205,5 +205,6 @@ conform!(
     package_object,
     val_extractor,
     generic_case_class,
-    case_body_pattern_def
+    case_body_pattern_def,
+    anon_pattern_capture
 );
