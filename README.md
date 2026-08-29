@@ -1192,6 +1192,14 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 
 ### Remaining
 
+- **`obj[T1, T2]`（引数リスト無しの暗黙 `apply` 挿入）で型引数が落ちる**。
+  `object R { def apply[L, M, U]: Shape[L, M, U, M] = … }` に対し
+  `R.apply[L, Rep[T], T]` は通るが `R[L, Rep[T], T]` は
+  `found: Shape[L, Rep[T], T, Rep[T]]  required: Shape[L, Rep[T], T, Rep[T]]`
+  になる（表示は同じで `L` が呼び先の型パラメータのまま）。`apply` を挿し込む際に
+  TypeApply の型引数が結果型へ substitute されていない。slick の
+  `RepShape[Level, Rep[T], T]`（`Shape.scala` / `Query.scala`）がこれ。
+  明示的型適用まわりなので `agent/deadcode` の担当範囲。
 - **`Array[T]` から `Seq[T]` への暗黙変換**。`def k(x: Array[Int]): Seq[Int] = x` は scalac
   では（deprecation 警告つきで）通るが、こちらは type mismatch になる。`Predef` の
   `copyArrayToImmutableIndexedSeq` / `wrapIntArray` 相当の暗黙変換が prelude に無い。
