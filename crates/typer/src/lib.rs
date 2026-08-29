@@ -11,6 +11,7 @@ mod macros;
 mod pickle_supply;
 mod prelude;
 mod prelude_arrconv;
+mod prelude_boxed;
 mod prelude_coll;
 mod prelude_conform;
 mod prelude_either;
@@ -60,6 +61,16 @@ mod tests {
 
     /// Two class symbols with the same JVM name shadow each other: member
     /// lookup then finds only one of the two halves.
+    ///
+    /// The invariant is about *Scala types*, not about the `jvm_name` field:
+    /// that field records the class a type erases to, and several distinct
+    /// Scala types legitimately erase to the same one. `Any` / `AnyRef` /
+    /// `AnyVal` / `Object` all erase to `java/lang/Object`, and each primitive
+    /// value class records the box it erases to — `scala.Int` is
+    /// `java/lang/Integer` even though `java.lang.Integer` is a different type
+    /// with its own symbol. What must not happen is two symbols standing for
+    /// the *same* Scala type, which is why `find_by_jvm` skips the value
+    /// classes rather than the allow-list growing to cover them.
     #[test]
     fn prelude_has_no_duplicate_jvm_classes() {
         let jar = std::path::PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
@@ -84,18 +95,59 @@ mod tests {
                 .push(s.name.clone());
         }
         // `Any` / `AnyRef` / `AnyVal` / `Object` all erase to `java/lang/Object`,
-        // and `::` is entered under both spellings. Everything else sharing a
-        // JVM name is a bug: the second symbol shadows the first.
+        // and `::` is entered under both spellings. The boxes are the other
+        // legitimate case: `scala.Int` records `java/lang/Integer` as its
+        // erasure while `java.lang.Integer` is a class of its own, so those
+        // names carry exactly two symbols — the value class and the box.
+        // Everything else sharing a JVM name is a bug: the second symbol
+        // shadows the first.
         let allowed = [
             "java/lang/Object",
             "scala/collection/immutable/$colon$colon",
         ];
+        let boxes = [
+            ("java/lang/Boolean", "Boolean"),
+            ("java/lang/Character", "Char"),
+            ("java/lang/Integer", "Int"),
+            ("java/lang/Long", "Long"),
+            ("java/lang/Float", "Float"),
+            ("java/lang/Double", "Double"),
+        ];
         let dups: Vec<_> = seen
             .iter()
-            .filter(|(k, v)| v.len() > 1 && !allowed.contains(&k.as_str()))
+            .filter(|(k, v)| {
+                if v.len() <= 1 || allowed.contains(&k.as_str()) {
+                    return false;
+                }
+                // A box pair is allowed, and only as a pair: the value class
+                // plus the wrapper, never a third symbol.
+                !boxes
+                    .iter()
+                    .any(|(jvm, prim)| jvm == k && v.len() == 2 && v.iter().any(|n| n == prim))
+            })
             .map(|(k, v)| format!("{k} x{}", v.len()))
             .collect();
         assert!(dups.is_empty(), "duplicate prelude classes: {dups:?}");
+        // The point of the exception: the two really are separate symbols, and
+        // the wrapper is the one `java.lang` holds.
+        for (jvm, prim) in boxes {
+            let names = seen.get(jvm).cloned().unwrap_or_default();
+            assert!(
+                names.iter().any(|n| n == prim),
+                "{jvm}: missing the value class {prim}, got {names:?}"
+            );
+            let wrapper = crate::classpath::find_by_jvm(&st, jvm)
+                .unwrap_or_else(|| panic!("{jvm} has no symbol of its own"));
+            assert!(
+                !st.is_primitive_value_class(wrapper),
+                "{jvm} still resolves to the value class"
+            );
+            assert_eq!(
+                st.get(st.get(wrapper).owner).jvm_name,
+                "java/lang",
+                "{jvm} is not owned by the java.lang package"
+            );
+        }
     }
     use super::*;
     use scala_rs_parser::Type;

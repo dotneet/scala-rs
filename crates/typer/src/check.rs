@@ -4792,6 +4792,25 @@ impl Typer {
         }
     }
 
+    /// Whether a selection's qualifier names a *type* (or package / module)
+    /// rather than a value. `java.lang.Integer.valueOf(3)` selects through the
+    /// class symbol; `b.intValue` selects through a `val`. Only the first may
+    /// reach a Java `static` member, exactly as in nsc, where those live on the
+    /// companion object.
+    fn is_type_qualifier(&self, qual: &Tree) -> bool {
+        if qual.sym.is_none() {
+            return false;
+        }
+        matches!(
+            self.st.get(qual.sym).kind,
+            SymKind::Class
+                | SymKind::Module
+                | SymKind::ModuleClass
+                | SymKind::Package
+                | SymKind::TypeMember
+        )
+    }
+
     fn type_select(&mut self, tree: &mut Tree, pt: &Type) {
         if tree.postfix && !self.language_postfix_ops {
             let name = match &tree.kind {
@@ -4856,9 +4875,18 @@ impl Typer {
                 }
             }
         }
+        // nsc: "Static Java members belong to companion objects in Scala; they
+        // are not inherited". `b.parseInt("12")` on a `java.lang.Integer` value
+        // is an error in scalac, and letting statics through here is not merely
+        // lax: `java.lang.Integer.max(int,int)` competed with `RichInt.max` for
+        // `1.max(2)` and left the extension search with no winner.
+        let instance_receiver = !self.is_type_qualifier(qual);
         if found.is_empty() {
             if let Some(o) = self.st.class_sym_of(&recv_ty) {
                 found = self.st.lookup_member(o, &name);
+                if instance_receiver {
+                    found.retain(|&m| !self.st.get(m).flags.contains(Flags::STATIC));
+                }
                 if found.is_empty() && matches!(&recv_ty, Type::Class { .. } | Type::ModuleRef(_)) {
                     // `asList(...).size()`: the receiver type is a Java stub until
                     // the classfile is completed. `qual.sym` is the method, not List.
@@ -4866,6 +4894,9 @@ impl Typer {
                     // are not shadowed by `java.lang.String` / `Character` overloads.
                     self.ensure_java_loaded(o, tree.span);
                     found = self.st.lookup_member(o, &name);
+                    if instance_receiver {
+                        found.retain(|&m| !self.st.get(m).flags.contains(Flags::STATIC));
+                    }
                 }
             }
         }

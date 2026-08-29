@@ -468,6 +468,33 @@ impl Typer {
         }
     }
 
+    /// nsc `weak_<:<`: a view's argument only has to *weakly* conform, so the
+    /// numeric widenings the JVM performs count. `Predef.long2Long` therefore
+    /// applies to an `Int` (`xs.add(7)` on a `java.util.ArrayList[Long]`) and
+    /// `int2Integer` to a `Char` (`val i: java.lang.Integer = 'c'`) — both
+    /// compile in scalac. Only the numeric primitives take part; `Boolean` and
+    /// `Unit` have no weak conformances.
+    fn weak_conforms(&self, from: &Type, to: &Type) -> bool {
+        if self.st.is_sub_type(from, to) {
+            return true;
+        }
+        matches!(
+            (from.widen_constant(), to.widen_constant()),
+            (
+                Type::Byte,
+                Type::Short | Type::Int | Type::Long | Type::Float | Type::Double
+            ) | (
+                Type::Short,
+                Type::Int | Type::Long | Type::Float | Type::Double
+            ) | (
+                Type::Char,
+                Type::Int | Type::Long | Type::Float | Type::Double
+            ) | (Type::Int, Type::Long | Type::Float | Type::Double)
+                | (Type::Long, Type::Float | Type::Double)
+                | (Type::Float, Type::Double)
+        )
+    }
+
     fn conversion_provides(&self, id: SymbolId, from: &Type, to: &Type) -> bool {
         let s = self.st.get(id);
         if !s.flags.contains(Flags::IMPLICIT) {
@@ -479,10 +506,10 @@ impl Typer {
                 if ps.len() != 1 {
                     return false;
                 }
-                self.st.is_sub_type(from, &ps[0]) && self.st.is_sub_type(ret, to)
+                self.weak_conforms(from, &ps[0]) && self.st.is_sub_type(ret, to)
             }
             Type::Function { params, ret } if params.len() == 1 => {
-                self.st.is_sub_type(from, &params[0]) && self.st.is_sub_type(ret, to)
+                self.weak_conforms(from, &params[0]) && self.st.is_sub_type(ret, to)
             }
             _ => false,
         }
@@ -679,7 +706,12 @@ impl Typer {
             // install `java.lang.String#toUpperCase(Locale)` onto Predef
             // String and shadow StringOps.
             self.ensure_java_loaded(cls, span);
-            let members = self.st.lookup_member(cls, name);
+            let members: Vec<SymbolId> = self
+                .st
+                .lookup_member(cls, name)
+                .into_iter()
+                .filter(|&m| !self.st.get(m).flags.contains(Flags::STATIC))
+                .collect();
             if let Some(m) = members.first() {
                 hits.push((id, *m, to));
             }
@@ -701,7 +733,16 @@ impl Typer {
                 if declared.len() == 1 {
                     return Some(declared.into_iter().next().unwrap());
                 }
-                let pool = if declared.is_empty() { hits } else { declared };
+                let mut pool = if declared.is_empty() { hits } else { declared };
+                // nsc priority: a conversion `Predef` declares itself beats one
+                // it inherits from `LowPriorityImplicits`. `0.5.isNaN` is
+                // `double2Double(0.5).isNaN()` in scalac, not `RichDouble`.
+                if pool.iter().any(|(c, _, _)| !self.st.get(*c).low_priority) {
+                    pool.retain(|(c, _, _)| !self.st.get(*c).low_priority);
+                }
+                if pool.len() == 1 {
+                    return Some(pool.into_iter().next().unwrap());
+                }
                 let convs: Vec<SymbolId> = pool.iter().map(|(c, _, _)| *c).collect();
                 let winners: Vec<SymbolId> = convs
                     .iter()

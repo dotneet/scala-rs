@@ -119,6 +119,14 @@ pub enum Intrinsic {
     /// `TupleN.apply` — nsc allocates the tuple directly, so no `TupleN$`
     /// module classfile is needed on the private runtime.
     NewTuple(usize),
+    /// `Predef.int2Integer` and its seven siblings: box a primitive into its
+    /// `java.lang` wrapper. The payload is the JVM descriptor letter of the
+    /// primitive (`I`, `J`, `Z`, ...), so the emitter picks the right
+    /// `valueOf` even when the argument arrived as a narrower type
+    /// (`java.lang.Integer = 'c'` passes a `Char`).
+    BoxValue(&'static str),
+    /// `Predef.Integer2int` and siblings: the reverse, `Integer.intValue`.
+    UnboxValue(&'static str),
 }
 
 /// What a `def f = macro Impl.method` binds to.
@@ -178,6 +186,13 @@ pub struct Symbol {
     /// A `private` member the companion reads. The JVM has no companions, so
     /// nsc widens such a member (`Counter$$step`); we drop `ACC_PRIVATE`.
     pub access_widened: bool,
+    /// nsc `scala.LowPriorityImplicits`: `Predef` inherits `intWrapper` &
+    /// friends from a superclass, so a conversion declared in `Predef` itself
+    /// (`double2Double`) wins the tie for a member both results offer.
+    /// `0.5.isNaN` really is `Predef.double2Double(0.5).isNaN()` in scalac, not
+    /// `RichDouble.isNaN`. Modelling the superclass would change the emitted
+    /// owner of every wrapper call, so the priority is recorded here instead.
+    pub low_priority: bool,
     /// Language annotations (`@deprecated(...)`, `@tailrec`, …) copied from modifiers.
     pub annotations: Vec<scala_rs_parser::Tree>,
     /// Lower bound of an abstract/HK type member (`type F[_] >: Lo`).
@@ -314,6 +329,7 @@ impl SymbolTable {
                 self_alias: None,
                 private_within: None,
                 access_widened: false,
+                low_priority: false,
                 annotations: vec![],
                 bound_lo: None,
                 bound_hi: None,
@@ -389,6 +405,7 @@ impl SymbolTable {
             self_alias: None,
             private_within: None,
             access_widened: false,
+            low_priority: false,
             annotations: vec![],
             bound_lo: None,
             bound_hi: None,
@@ -877,6 +894,29 @@ impl SymbolTable {
                 args: vec![],
             },
         }
+    }
+
+    /// One of the nine primitive value classes (`scala.Int`, `scala.Unit`, ...).
+    ///
+    /// Their `jvm_name` records the *box* they erase to (`java/lang/Integer`),
+    /// not a class of their own — `scala/Int.class` does not exist. That makes
+    /// the field a representation, not an identity: `java.lang.Integer` is a
+    /// different Scala type that happens to share the name, so every lookup
+    /// that means "the symbol *for* this JVM class" has to skip these.
+    pub fn is_primitive_value_class(&self, id: SymbolId) -> bool {
+        !id.is_none()
+            && [
+                self.int_sym,
+                self.long_sym,
+                self.float_sym,
+                self.double_sym,
+                self.char_sym,
+                self.boolean_sym,
+                self.byte_sym,
+                self.short_sym,
+                self.unit_sym,
+            ]
+            .contains(&id)
     }
 
     /// `class C(val x: T) extends AnyVal` — one ctor param, parent AnyVal.
