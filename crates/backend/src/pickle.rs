@@ -477,11 +477,13 @@ impl<'a> Pickler<'a> {
                 let imm = self.scala_collection_immutable();
                 self.type_ref_in_refs(imm, "$colon$colon", arg_refs)
             }
-            n if n.starts_with("Tuple") => {
+            // A prefix test would claim slick's own `TupleShape` for the
+            // `scala` package; only the real `TupleN` / `FunctionN` live there.
+            n if numbered_arity(n, "Tuple").is_some() => {
                 let sc = self.scala_module();
                 self.type_ref_in_refs(sc, n, arg_refs)
             }
-            n if n.starts_with("Function") => {
+            n if numbered_arity(n, "Function").is_some() => {
                 if arg_refs.is_empty() {
                     self.type_ref_named(n)
                 } else {
@@ -1757,6 +1759,16 @@ impl<'a> Pickler<'a> {
         }
         buf.bytes
     }
+}
+
+/// The `N` of a standard-library `TupleN` / `FunctionN` name, when that is
+/// what the name actually is -- `TupleShape` and `FunctionSymbol` are not.
+fn numbered_arity(name: &str, prefix: &str) -> Option<usize> {
+    let rest = name.strip_prefix(prefix)?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
 }
 
 fn write_nat_to(out: &mut Vec<u8>, x: u32) {

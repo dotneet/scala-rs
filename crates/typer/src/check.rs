@@ -139,6 +139,28 @@ pub struct Typer {
     /// there the re-lookup silently *dropped* every alternative from the other
     /// owner. This remembers the real set for exactly those cases.
     overload_groups: HashMap<u32, Vec<SymbolId>>,
+    /// The member type each alternative of an overload had *at its receiver*,
+    /// keyed by the head alternative.
+    ///
+    /// `Type::Overload` carries types without symbols, so `resolve_overload`
+    /// re-reads the alternatives off their symbols to learn which one it
+    /// picked -- and a declaration read that way has lost the receiver's type
+    /// arguments. For a member inherited from a *generic* parent that is the
+    /// whole signature: `scala.collection.Seq[A]`'s two `apply`s are
+    /// `SeqOps.apply(Int): A` and `PartialFunction[Int, A].apply(Int): A`,
+    /// which differ only after instantiation. Read raw, the second one is
+    /// `apply(A): B` -- applicable to nothing in particular, and neither
+    /// alternative is more specific than the other, so `s(0)` came out
+    /// ambiguous. This keeps the instantiated types the selection already
+    /// computed.
+    overload_member_types: HashMap<u32, Vec<(SymbolId, Type)>>,
+    /// Set while an argument list is being retried packed into a tuple.
+    ///
+    /// The retry builds a fresh `TupleN(a, b)` node and types it as the sole
+    /// argument. That node is an application of two arguments in its own
+    /// right, so without this flag a `TupleN` that does not typecheck sends
+    /// the typer straight back here to wrap it again, forever.
+    tupling: bool,
     /// While a template's parent list is being typed: `(the class, the class
     /// that encloses it)`. nsc types parents in the *outer* context, so
     /// `class B extends super.B` inside `trait Mid` means `Mid`'s `super`.
@@ -176,6 +198,23 @@ pub struct Typer {
     pub(crate) diverged_implicit: std::cell::RefCell<Option<(SymbolId, Type)>>,
 }
 
+/// Highest `TupleN` scala-library defines.
+const MAX_TUPLE_ARITY: usize = 22;
+
+/// The `N` of a standard-library `TupleN` / `FunctionN` name, when that is
+/// what the name actually is.
+///
+/// A prefix test is not enough: slick's generated `TupleShape[L, M, U, P]`
+/// and `TupleShapeImplicits` are classes of their own, and reading them as
+/// 4-tuples turns every use into a type mismatch.
+fn numbered_arity(name: &str, prefix: &str) -> Option<usize> {
+    let rest = name.strip_prefix(prefix)?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
 pub fn typecheck(tree: &mut Tree, file_index: usize) -> (SymbolTable, Vec<Diagnostic>) {
     typecheck_opts(tree, file_index, &TypecheckOptions::default())
 }
@@ -204,6 +243,7 @@ pub fn typecheck_units(
     let mut t = Typer::new(first, opts);
     t.fatal_warnings = opts.fatal_warnings;
     crate::classpath::install_classpath(&mut t.st, &opts.classpath);
+    t.link_tuple_products();
     for (tree, file_index) in units.iter_mut() {
         t.file_index = *file_index;
         t.namer(tree);
@@ -297,6 +337,8 @@ impl Typer {
             binary: BinaryIndex::from_user_paths(opts.binary_path.clone()),
             completed_java: HashSet::new(),
             overload_groups: HashMap::new(),
+            overload_member_types: HashMap::new(),
+            tupling: false,
             parent_ctx: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
             pkg_aliases_done: HashSet::new(),
@@ -568,7 +610,7 @@ impl Typer {
         self.st.owner = id;
         self.st.this_class = id;
         self.st.push_scope();
-        let tp_ids = self.enter_tparams(tparams, id);
+        let tp_ids = self.enter_tparams_provisional(tparams, id);
         self.st.get_mut(id).tparams = tp_ids;
         for tp in tparams.iter() {
             if let TreeKind::TypeDef {
@@ -668,8 +710,37 @@ impl Typer {
                 }
             }
         }
-        // Bounds resolve after every parameter is in scope, so F-bounded
-        // `A <: Comparable[A]` sees `A`.
+        self.resolve_tparam_bounds(tparams);
+        ids
+    }
+
+    /// Enter type parameters without reporting anything their bounds cannot
+    /// resolve yet.
+    ///
+    /// The namer runs before `import` clauses are processed, so a bound naming
+    /// an imported type (`class C[T <: Rep[_]]` under `import slick.lifted._`)
+    /// is not resolvable there. A `def`'s parameters are re-entered by
+    /// `type_def_sig` and a type member's by `type_type_member`, both of which
+    /// run with the imports in scope; `type_class` does the same for a
+    /// template's own parameters via `resolve_tparam_bounds`. The namer's
+    /// attempt is therefore only provisional and must stay silent, or every
+    /// such bound draws a spurious `not found: type X`.
+    fn enter_tparams_provisional(
+        &mut self,
+        tparams: &mut [Tree],
+        owner: SymbolId,
+    ) -> Vec<SymbolId> {
+        let mark = self.diags.len();
+        let ids = self.enter_tparams(tparams, owner);
+        self.diags.truncate(mark);
+        ids
+    }
+
+    /// Resolve the `>: lo <: hi` bounds of already-entered type parameters.
+    ///
+    /// Bounds resolve after every parameter is in scope, so F-bounded
+    /// `A <: Comparable[A]` sees `A`.
+    fn resolve_tparam_bounds(&mut self, tparams: &[Tree]) {
         for tp in tparams.iter() {
             let TreeKind::TypeDef { lo, hi, .. } = &tp.kind else {
                 continue;
@@ -691,7 +762,6 @@ impl Typer {
                 }
             }
         }
-        ids
     }
 
     /// Apply `args` to a type constructor, diagnosing kind mismatches.
@@ -1139,7 +1209,7 @@ impl Typer {
                 if let TreeKind::TypeDef { tparams, .. } = &mut tree.kind {
                     if !tparams.is_empty() {
                         self.st.push_scope();
-                        let tp_ids = self.enter_tparams(tparams, id);
+                        let tp_ids = self.enter_tparams_provisional(tparams, id);
                         self.st.get_mut(id).tparams = tp_ids;
                         self.st.pop_scope();
                     }
@@ -1521,6 +1591,13 @@ impl Typer {
             ),
             _ => return,
         };
+        // The namer entered these parameters before the unit's `import`
+        // clauses were processed, so a bound naming an imported type could not
+        // resolve there. The class scope is now complete (the parameters
+        // themselves are members, re-entered above) and the imports are in
+        // scope, so this is where the bounds get their real types -- and where
+        // an unresolvable one is finally reported.
+        self.resolve_tparam_bounds(&tparams);
         // The signature pass and the body pass walk the same tree; the
         // evidence clause must be appended by only one of them.
         let ev_fresh = tree.id == scala_rs_parser::NodeId(0)
@@ -5397,22 +5474,17 @@ impl Typer {
             }
         } else {
             tree.sym = found[0];
-            let owner = self.st.get(found[0]).owner;
-            let args = subst_args.clone();
-            let ov = Type::Overload(
-                found
-                    .iter()
-                    .map(|s| {
-                        let t = self.st.get(*s).ty.clone();
-                        let t = if args.is_empty() {
-                            t
-                        } else {
-                            self.st.subst_tparams(owner, &args, &t)
-                        };
-                        expand(t)
-                    })
-                    .collect(),
-            );
+            // As-seen-from, like the single-member branch above: an
+            // alternative inherited from a generic parent is only itself once
+            // the receiver's arguments are in
+            // (`PartialFunction[Int, A].apply` is `apply(Int): A`, not
+            // `apply(A): B`).
+            let alts: Vec<(SymbolId, Type)> = found
+                .iter()
+                .map(|s| (*s, expand(subst(self.st.get(*s).ty.clone()))))
+                .collect();
+            self.overload_member_types.insert(found[0].0, alts.clone());
+            let ov = Type::Overload(alts.into_iter().map(|(_, t)| t).collect());
             tree.ty = self.maybe_auto_apply(ov, pt);
             if !matches!(tree.ty, Type::Overload(_)) {
                 if let Some(id) = found
@@ -5751,7 +5823,7 @@ impl Typer {
             _ => Vec::new(),
         };
         let owner = self.st.get(found[0]).owner;
-        let alts: Vec<Type> = found
+        let alts: Vec<(SymbolId, Type)> = found
             .iter()
             .map(|&s| {
                 let t = self.st.subst_as_seen_from(&recv_ty, &self.st.get(s).ty);
@@ -5760,10 +5832,11 @@ impl Typer {
                 } else {
                     self.st.subst_tparams(owner, &subst_args, &t)
                 };
-                self.st.expand_in_type(&recv_ty, &t)
+                (s, self.st.expand_in_type(&recv_ty, &t))
             })
             .collect();
-        fun.ty = Type::Overload(alts);
+        self.overload_member_types.insert(found[0].0, alts.clone());
+        fun.ty = Type::Overload(alts.into_iter().map(|(_, t)| t).collect());
         fun.sym = found[0];
         true
     }
@@ -6400,6 +6473,85 @@ impl Typer {
         true
     }
 
+    /// nsc's tuple adaptation: an argument list that fits no alternative is
+    /// retried packed into a single tuple, so `Some(a, b)` means `Some((a,
+    /// b))`. slick's generated `TupleSupport` writes `Some((p._1, p._2),
+    /// p._3)` at every arity.
+    ///
+    /// The retry cannot recurse: the new list holds exactly one argument.
+    /// When it does not typecheck either, the tree and the diagnostics are put
+    /// back so the error still describes what was written. Named arguments are
+    /// left alone -- `f(a = 1, b = 2)` is a names/defaults call, not a tuple.
+    ///
+    /// nsc only adapts a *single* method this way; an overloaded callee is
+    /// resolved by `inferMethodAlternative`, which never tuples. `Lit(1, 2,
+    /// 3)` against `apply(String, Any, Boolean = …)` / `apply[T](T)(implicit
+    /// Tagged[T])` stays the type mismatch scalac reports.
+    fn retry_tupled_args(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        let TreeKind::Apply { fun, args } = &tree.kind else {
+            return false;
+        };
+        if self.tupling
+            || args.len() < 2
+            || args.len() > MAX_TUPLE_ARITY
+            || Self::has_named_arg(args)
+        {
+            return false;
+        }
+        if args.iter().any(|a| a.ty.is_error() || a.ty.is_no_type()) {
+            return false;
+        }
+        let overloaded = match &fun.ty {
+            Type::Overload(_) => true,
+            Type::Class { sym, .. } | Type::ModuleRef(sym) => {
+                self.st.lookup_member(*sym, "apply").len() > 1
+            }
+            _ => false,
+        };
+        if overloaded {
+            return false;
+        }
+        let saved = tree.clone();
+        let mark = self.diags.len();
+        let TreeKind::Apply { args, .. } = &mut tree.kind else {
+            return false;
+        };
+        self.tupling = true;
+        let elems = std::mem::take(args);
+        let span = elems[0].span.merge(elems[elems.len() - 1].span);
+        let fun = Tree::new(
+            NodeId(0),
+            span,
+            TreeKind::Ident {
+                name: format!("Tuple{}", elems.len()),
+            },
+        );
+        args.push(Tree::new(
+            NodeId(0),
+            span,
+            TreeKind::Apply {
+                fun: Box::new(fun),
+                args: elems,
+            },
+        ));
+        self.type_apply(tree, pt);
+        self.tupling = false;
+        // A missing implicit leaves a perfectly good type behind, so the
+        // diagnostics -- not the type alone -- decide whether the tupled form
+        // really worked.
+        let complained = self.diags[mark..]
+            .iter()
+            .any(|d| d.level == scala_rs_span::Level::Error);
+        // The arguments were typed once already, so anything this second pass
+        // has to say about them is a duplicate either way.
+        self.diags.truncate(mark);
+        if complained || tree.ty.is_error() || tree.ty.is_no_type() {
+            *tree = saved;
+            return false;
+        }
+        true
+    }
+
     fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
         if self.try_rewrite_case_copy(tree, pt) {
             return;
@@ -6547,7 +6699,7 @@ impl Typer {
                     let pt_args: Vec<Type> = match pt {
                         Type::Class { args: a, sym } if *sym == c => a.clone(),
                         Type::Tuple(ts)
-                            if self.st.get(c).name.starts_with("Tuple")
+                            if numbered_arity(&self.st.get(c).name, "Tuple") == Some(ts.len())
                                 && ts.len() == tps.len() =>
                         {
                             ts.clone()
@@ -6574,10 +6726,16 @@ impl Typer {
                 tree.ty = fun.ty.clone();
             }
             for (i, a) in args.iter_mut().enumerate() {
+                // A repeated parameter covers every argument from its position
+                // on, and the argument's type is the *element* type. Indexing
+                // the clause by position (as this did) handed argument 0 the
+                // raw `T*` -- `new SetTupleParameter[(T1, T2)](c1, c2)` on a
+                // `(val children: SetParameter[_]*)` constructor could never
+                // typecheck. The method path has always used `param_at`.
                 let mut p = if infer && field_tys.len() == nargs && !field_tys.is_empty() {
-                    field_tys.get(i).cloned().unwrap_or(Type::NoType)
+                    param_at(&field_tys, i).cloned().unwrap_or(Type::NoType)
                 } else {
-                    ctor_params.get(i).cloned().unwrap_or(Type::NoType)
+                    param_at(&ctor_params, i).cloned().unwrap_or(Type::NoType)
                 };
                 if let Some(c) = class_id {
                     if !inferred_args.is_empty() {
@@ -7329,6 +7487,12 @@ impl Typer {
                         }
                         OverloadPick::None => {}
                     }
+                }
+                // Last resort, after every other rewrite: nsc packs an
+                // argument list that fits no alternative into one tuple, so
+                // `Some((a, b), c)` means `Some(((a, b), c))`.
+                if self.retry_tupled_args(tree, pt) {
+                    return;
                 }
                 // nsc: `c(1)` looks up `apply`, never `update`. Assignment
                 // `c(i) = v` is the only path that rewrites to `update`.
@@ -9028,8 +9192,16 @@ impl Typer {
                     let name = self.st.get(fun_sym).name.clone();
                     cands.clear();
                     let methods = self.drop_overridden(self.overload_alternatives(fun_sym, &name));
+                    // The declaration on the symbol is written in its own
+                    // owner's type parameters; the selection already worked
+                    // out what each alternative looks like at this receiver,
+                    // and that is what specificity has to compare.
+                    let instantiated = self.overload_member_types.get(&fun_sym.0);
                     for m in methods {
-                        if let Type::Method { paramss, ret } = &self.st.get(m).ty {
+                        let ty = instantiated
+                            .and_then(|g| g.iter().find(|(s, _)| *s == m).map(|(_, t)| t))
+                            .unwrap_or(&self.st.get(m).ty);
+                        if let Type::Method { paramss, ret } = ty {
                             cands.push((
                                 m,
                                 paramss.first().cloned().unwrap_or_default(),
@@ -10376,7 +10548,7 @@ impl Typer {
             Type::Tuple(ts) => ts,
             Type::Class { sym, args } => {
                 let n = self.st.get(sym).name.as_str();
-                if n == "Tuple2" || n.starts_with("Tuple") {
+                if numbered_arity(n, "Tuple").is_some_and(|k| args.is_empty() || k == args.len()) {
                     if args.is_empty() {
                         vec![Type::Any, Type::Any]
                     } else {
@@ -10572,7 +10744,10 @@ impl Typer {
                         sym: self.st.some_sym,
                         args: as_,
                     },
-                    Some(n) if n.starts_with("Function") && n != "Function" => {
+                    Some(n)
+                        if numbered_arity(n, "Function")
+                            .is_some_and(|k| as_.is_empty() || k + 1 == as_.len()) =>
+                    {
                         if as_.is_empty() {
                             Type::Function {
                                 params: vec![],
@@ -10594,7 +10769,9 @@ impl Typer {
                     },
                     // `<tuple>` is the parser's marker for a parenthesised
                     // type list; outside a function type it is just a tuple.
-                    Some(n) if n.starts_with("Tuple") || n == "<tuple>" => Type::Tuple(as_),
+                    Some(n) if numbered_arity(n, "Tuple") == Some(as_.len()) || n == "<tuple>" => {
+                        Type::Tuple(as_)
+                    }
                     Some(_) => {
                         let ctor = self.tree_to_type(tpt);
                         self.apply_types(ctor, as_, span)
@@ -11604,6 +11781,27 @@ impl Typer {
             }
         }
         out
+    }
+
+    /// Give the prelude's `TupleN` classes the `Product` / `Serializable`
+    /// parents nsc gives them.
+    ///
+    /// Both interfaces live in the library jar, which is read on demand, so
+    /// they are forced here -- once, before any unit is named, so that every
+    /// later `is_sub_type` sees the same hierarchy. Without the jar
+    /// (`--no-scala-library`) neither class is found and nothing is linked:
+    /// the private runtime's `scala/Tuple2` implements neither, and a parent
+    /// the backend cannot back up would be a lie.
+    fn link_tuple_products(&mut self) {
+        if !self.library_abi {
+            return;
+        }
+        for jvm in ["scala/Product", "java/io/Serializable"] {
+            let pkg = jvm.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            let owner = crate::classpath::ensure_package(&mut self.st, pkg);
+            self.load_binary_into(jvm, owner, Span::new(0, 0), false);
+        }
+        crate::prelude_genrep::link_tuple_products(&mut self.st);
     }
 
     fn load_binary_into(
@@ -13461,6 +13659,30 @@ fn needs_classtag_elem(elem: &Type) -> bool {
     )
 }
 
+/// Copy a type-parameter list for a synthesized definition.
+///
+/// The copy must own its symbols: `enter_tparams` reuses whatever `sym` a
+/// `TypeDef` already carries, so a straight `clone` would make the synthetic
+/// method's parameters *be* the class's, owned by the wrong symbol. Higher
+/// kinded parameters (`F[_]`) carry nested `TypeDef`s that get symbols too, so
+/// the reset recurses through them. Bound trees are read by `tree_to_type`,
+/// which never writes back into the tree, so they can be shared as cloned.
+fn copy_tparams(tparams: &[Tree]) -> Vec<Tree> {
+    tparams
+        .iter()
+        .map(|tp| {
+            let mut c = tp.clone();
+            c.id = NodeId(0);
+            c.sym = SymbolId::NONE;
+            c.ty = Type::NoType;
+            if let TreeKind::TypeDef { tparams: inner, .. } = &mut c.kind {
+                *inner = copy_tparams(inner);
+            }
+            c
+        })
+        .collect()
+}
+
 fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
     let mut out = Vec::new();
     for stt in body {
@@ -13468,6 +13690,7 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
             mods,
             name,
             vparamss,
+            tparams,
             ..
         } = &stt.kind
         else {
@@ -13495,14 +13718,51 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
             rhs: Box::new(Tree::dummy(TreeKind::Empty)),
         });
         param.span = p.span;
-        let cls_tpt = Tree {
+        // nsc: `implicit class C[T <: B](x: P)` desugars to
+        // `implicit def C[T <: B](x: P): C[T] = new C[T](x)`. Dropping the
+        // type parameters would leave a bare `C` behind -- a type constructor
+        // where a proper type is required.
+        let conv_tparams = copy_tparams(tparams);
+        let tparam_refs: Vec<Tree> = conv_tparams
+            .iter()
+            .map(|tp| Tree {
+                id: NodeId(0),
+                span: stt.span,
+                kind: TreeKind::Ident {
+                    name: tp.name().unwrap_or("_").to_string(),
+                },
+                ty: Type::NoType,
+                sym: SymbolId::NONE,
+                postfix: false,
+            })
+            .collect();
+        let cls_ident = |sym| Tree {
             id: NodeId(0),
             span: stt.span,
             kind: TreeKind::Ident { name: name.clone() },
             ty: Type::NoType,
-            sym: stt.sym,
+            sym,
             postfix: false,
         };
+        // `C` when the class is monomorphic, `C[T1, .., Tn]` otherwise.
+        let cls_type = |sym| {
+            if tparam_refs.is_empty() {
+                cls_ident(sym)
+            } else {
+                Tree {
+                    id: NodeId(0),
+                    span: stt.span,
+                    kind: TreeKind::AppliedTypeTree {
+                        tpt: Box::new(cls_ident(sym)),
+                        args: tparam_refs.clone(),
+                    },
+                    ty: Type::NoType,
+                    sym: SymbolId::NONE,
+                    postfix: false,
+                }
+            }
+        };
+        let cls_tpt = cls_type(stt.sym);
         let arg = Tree {
             id: NodeId(0),
             span: p.span,
@@ -13534,16 +13794,9 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
         let mut conv = Tree::dummy(TreeKind::DefDef {
             mods: Modifiers::new(Flags::IMPLICIT.with(Flags::SYNTHETIC)),
             name: name.clone(),
-            tparams: vec![],
+            tparams: conv_tparams,
             vparamss: vec![vec![param]],
-            tpt: Box::new(Tree {
-                id: NodeId(0),
-                span: stt.span,
-                kind: TreeKind::Ident { name: name.clone() },
-                ty: Type::NoType,
-                sym: stt.sym,
-                postfix: false,
-            }),
+            tpt: Box::new(cls_type(stt.sym)),
             rhs: Box::new(rhs),
         });
         conv.span = stt.span;

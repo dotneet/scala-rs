@@ -1278,7 +1278,19 @@ impl SymbolTable {
                             .map(|&tp| self.get(tp).flags)
                             .unwrap_or(Flags::EMPTY);
                         if flags.contains(Flags::CONTRAVARIANT) {
-                            self.is_sub_type(y, x)
+                            if is_wildcard_arg(y) {
+                                // A wildcard argument stands for *some* type,
+                                // so it contains the other whatever the
+                                // parameter's variance says: slick's
+                                // `SetParameter[T1]` is a `SetParameter[_]`
+                                // even though `SetParameter[-T]` is
+                                // contravariant. Reading the wildcard as a
+                                // type to flip against rejected every
+                                // `SetTupleParameter(c1, c2, …)`.
+                                self.is_sub_type(x, y)
+                            } else {
+                                self.is_sub_type(y, x)
+                            }
                         } else if flags.contains(Flags::COVARIANT) {
                             self.is_sub_type(x, y)
                         } else if is_wildcard_arg(x) || is_wildcard_arg(y) {
@@ -1413,6 +1425,26 @@ impl SymbolTable {
                     let p = subst_tparams_slice(&tps, a1, p);
                     self.is_sub_type(&p, b)
                 })
+            }
+            // `(A, B)` *is* `Tuple2[A, B]`, so everything it inherits --
+            // `Product`, `Serializable`, `Equals`, `Product2[A, B]` -- comes
+            // from that class's parents. The tuple-to-tuple arms above have
+            // already run; this is the ordinary parent walk for every other
+            // right-hand side.
+            (Type::Tuple(ts), b) if !ts.is_empty() => {
+                let Some(_g) = enter_depth() else {
+                    return false;
+                };
+                match self.class_sym_of(a) {
+                    Some(sym) => self.is_sub_type(
+                        &Type::Class {
+                            sym,
+                            args: ts.clone(),
+                        },
+                        b,
+                    ),
+                    None => false,
+                }
             }
             // `Array` is invariant: scalac rejects an `Array[Int]` where an
             // `Array[Any]` is asked for. A wildcard argument still *contains*

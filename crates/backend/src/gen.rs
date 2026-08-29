@@ -5479,11 +5479,32 @@ fn gen_new(
             None => load_outer_arg(asm, ctx, outer),
         }
     }
-    for (i, a) in args.iter().enumerate() {
-        gen_expr(asm, frame, ctx, a);
-        let pty = field_tys.get(i).unwrap_or(&a.ty);
-        if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
-            emit_box(asm, &a.ty);
+    // A repeated constructor parameter (`class C(xs: T*)`) is one `Seq`
+    // argument on the JVM, not one per element: `new SetTupleParameter(c1,
+    // c2)` has to wrap them. The descriptor already says `Seq` (`jvm_desc` of
+    // `Type::Repeated`), so emitting the elements raw was a `VerifyError`.
+    if field_tys.iter().any(|p| matches!(p, Type::Repeated(_))) {
+        let java_varargs = !ctor_sym.is_none() && {
+            let f = ctx.st.get(ctor_sym).flags;
+            f.contains(Flags::JAVA) && f.contains(Flags::VARARGS)
+        };
+        gen_call_args(
+            asm,
+            frame,
+            ctx,
+            args,
+            &field_tys,
+            ctx.library_abi,
+            java_varargs,
+            ctor_sym,
+        );
+    } else {
+        for (i, a) in args.iter().enumerate() {
+            gen_expr(asm, frame, ctx, a);
+            let pty = field_tys.get(i).unwrap_or(&a.ty);
+            if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
+                emit_box(asm, &a.ty);
+            }
         }
     }
     for id in class_captures(ctx.st, class_id).to_vec() {

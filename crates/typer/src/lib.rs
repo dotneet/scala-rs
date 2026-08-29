@@ -16,6 +16,7 @@ mod prelude_bsops;
 mod prelude_coll;
 mod prelude_conform;
 mod prelude_either;
+mod prelude_genrep;
 mod prelude_hier;
 mod prelude_impl2;
 mod prelude_lang;
