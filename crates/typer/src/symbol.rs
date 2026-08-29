@@ -1451,6 +1451,17 @@ impl SymbolTable {
                 Some(h) => self.is_sub_type(h, b),
                 None => matches!(b, Type::Any | Type::AnyRef | Type::Wildcard),
             },
+            // `Type::String` is `java.lang.String`, which is not a leaf: it
+            // implements `CharSequence`, `Comparable<String>` and
+            // `Serializable` (`prelude_strhier`). Without this walk every JDK
+            // overload taking a `CharSequence` was inapplicable to a `String`.
+            (Type::String, b) => {
+                let Some(_g) = enter_depth() else {
+                    return false;
+                };
+                let parents = self.get(self.string_sym).parents.clone();
+                parents.iter().any(|p| self.is_sub_type(p, b))
+            }
             (Type::Class { sym: s1, args: a1 }, b) => {
                 // A malformed hierarchy (`object B extends B`) would otherwise
                 // walk its own parents forever. Depth, not identity: a legitimate

@@ -715,6 +715,34 @@ fn method_params_from_sym(st: &SymbolTable, id: SymbolId) -> Vec<Type> {
     }
 }
 
+/// Whether a subclass method with `child` parameters overrides a parent one
+/// with `parent` parameters, rather than merely overloading it. A bridge is
+/// only owed for an override: `class Derived extends Base { def f(s: String) }`
+/// next to `Base.f(x: Int)` adds an alternative, and a `f(I)` bridge
+/// forwarding to `f(String)` is not verifiable code.
+///
+/// A parent parameter that mentions a type parameter or an abstract type
+/// member is exactly the case a bridge exists for (`def f(x: A)` implemented
+/// as `f(x: Int)`), so it matches anything.
+fn bridge_overrides(st: &SymbolTable, parent: &[Type], child: &[Type]) -> bool {
+    parent.len() == child.len()
+        && parent
+            .iter()
+            .zip(child)
+            .all(|(p, c)| p == c || erases_to_object(st, p) || erases_to_object(st, c))
+}
+
+/// A parameter that carries no information after erasure. This is precisely
+/// the shape a bridge exists for: `def show(a: A)` erased to `show(Object)`,
+/// implemented as `show(a: Int)`. A parameter that erases to something else --
+/// `Int` against `String` -- is a different method, not an override.
+fn erases_to_object(st: &SymbolTable, ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::TypeParam(_) | Type::TypeMember(_) | Type::Wildcard | Type::BoundedWildcard { .. }
+    ) || jvm_desc(st, ty) == "Ljava/lang/Object;"
+}
+
 fn method_ret_from_sym(st: &SymbolTable, id: SymbolId) -> Type {
     match &st.get(id).ty {
         Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
@@ -3583,7 +3611,19 @@ impl<'a> Gen<'a> {
                 if ps.name == "<init>" || ps.name == "<clinit>" {
                     continue;
                 }
-                let Some((_, cid)) = own.iter().find(|(n, _)| n == &ps.name) else {
+                // Among the class's own alternatives of that name, the one
+                // that overrides this parent method -- not just the first one
+                // spelled the same way.
+                let parent_params = method_params_from_sym(self.st, pmid);
+                let Some((_, cid)) = own.iter().find(|(n, id)| {
+                    n == &ps.name
+                        && *id != pmid
+                        && bridge_overrides(
+                            self.st,
+                            &parent_params,
+                            &method_params_from_sym(self.st, *id),
+                        )
+                }) else {
                     continue;
                 };
                 if *cid == pmid {
@@ -3601,11 +3641,7 @@ impl<'a> Gen<'a> {
                 if !seen.insert((enc.clone(), pdesc.clone())) {
                     continue;
                 }
-                let parent_params = method_params_from_sym(self.st, pmid);
                 let child_params = method_params_from_sym(self.st, *cid);
-                if parent_params.len() != child_params.len() {
-                    continue;
-                }
                 let ret = method_ret_from_sym(self.st, pmid);
                 let child_ret = method_ret_from_sym(self.st, *cid);
                 // The bridge takes the erased parent signature, so a parameter

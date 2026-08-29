@@ -285,6 +285,7 @@ pub fn typecheck_units(
     t.fatal_warnings = opts.fatal_warnings;
     crate::classpath::install_classpath(&mut t.st, &opts.classpath);
     t.link_tuple_products();
+    t.link_string_parents();
     t.defer_default_rhs = true;
     for (tree, file_index) in units.iter_mut() {
         t.file_index = *file_index;
@@ -2405,6 +2406,13 @@ impl Typer {
                 if Some(m) == alias {
                     continue;
                 }
+                // A `private[this]` member is not inherited at all: a bare
+                // constructor parameter is one, so `class B(st: Int) extends
+                // A(…)` where `A` also takes an `st` sees only its own.
+                let f = self.st.get(m).flags;
+                if f.contains(Flags::PRIVATE) && f.contains(Flags::LOCAL) {
+                    continue;
+                }
                 self.st.enter_in_current(&n, m);
             }
             work.extend(self.st.get(pid).parents.clone());
@@ -3591,6 +3599,10 @@ impl Typer {
             .into_iter()
             .filter(|&id| Some(id) != skip)
             .filter(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)
+            // Constructors are not inherited (see `sole_own_ctor`): a parent's
+            // `<init>` that `lookup_member` walks into is not an alternative
+            // of this class's own.
+            .filter(|&id| self.st.get(id).owner == class_id)
             .collect();
         if alts.is_empty() {
             return OverloadPick::None;
@@ -5146,6 +5158,10 @@ impl Typer {
     fn bind_found(&mut self, tree: &mut Tree, mut found: Vec<SymbolId>, pt: &Type) {
         found.sort_by_key(|s| s.0);
         found.dedup();
+        // The template scope holds a class's own members next to the inherited
+        // ones, so `val symbolName` and the `def symbolName` it implements both
+        // answer to the name. An override is one member, not an overload.
+        found = self.drop_overridden(found);
         let ref_span = tree.span;
         for s in found.iter().copied() {
             self.complete_lazy_sig(s, ref_span);
@@ -6192,9 +6208,38 @@ impl Typer {
                         args: vec![],
                     };
                     self.st.is_sub_type(&child, &parent)
+                        // Inheriting is not overriding: nsc keeps `f(Int)`
+                        // declared on the parent as an alternative of `f`
+                        // alongside a `f(String)` the subclass adds. Only a
+                        // *matching* signature replaces the inherited one.
+                        && self.same_signature(other, s)
                 })
             })
             .collect()
+    }
+
+    /// nsc `matchingSymbols`: does `sub` override `base`? Both are members of
+    /// the same name, so what decides it is the parameter list. A
+    /// parameterless `val` matches a nullary `def` (that is how `override val
+    /// sqlType` implements `def sqlType: Int`).
+    fn same_signature(&self, sub: SymbolId, base: SymbolId) -> bool {
+        let sub_ps = flat_param_types(&self.st.get(sub).ty);
+        let base_ps = flat_param_types(&self.st.get(base).ty);
+        if sub_ps.len() != base_ps.len() {
+            return false;
+        }
+        // The parent declares its members in its own type parameters; a member
+        // seen from the subclass has them substituted away. Rather than
+        // reconstructing the prefix here, a parameter mentioning a type
+        // parameter matches anything -- an overload that differs only inside a
+        // type parameter is not one nsc can distinguish either.
+        sub_ps.iter().zip(&base_ps).all(|(a, b)| {
+            a == b
+                || a.is_no_type()
+                || b.is_no_type()
+                || sig_has_abstract_type(a)
+                || sig_has_abstract_type(b)
+        })
     }
 
     fn access_from_name(&self) -> String {
@@ -10379,6 +10424,12 @@ impl Typer {
             };
             return self.arg_score(&f, param);
         }
+        // An overloaded method named as an argument (`constOp[Long]("min")(math.min)`)
+        // stands for whichever alternative the parameter takes; `adapt` picks
+        // that one once the callee is settled.
+        if let Type::Overload(alts) = arg {
+            return alts.iter().filter_map(|a| self.arg_score(a, param)).max();
+        }
         if self.st.is_sub_type(arg, param) {
             return Some(if arg == param { 10 } else { 5 });
         }
@@ -12889,6 +12940,18 @@ impl Typer {
         crate::prelude_genrep::link_tuple_products(&mut self.st);
     }
 
+    /// `java.lang.String` implements `CharSequence`, `Comparable<String>` and
+    /// `Serializable`; the prelude declares it with `AnyRef` alone. Unlike the
+    /// tuples above these are JDK classes, so this runs in both library modes.
+    fn link_string_parents(&mut self) {
+        for jvm in crate::prelude_strhier::STRING_PARENTS {
+            let pkg = jvm.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            let owner = crate::classpath::ensure_package(&mut self.st, pkg);
+            self.load_binary_into(jvm, owner, Span::new(0, 0), false);
+        }
+        crate::prelude_strhier::link_string_parents(&mut self.st);
+    }
+
     fn load_binary_into(
         &mut self,
         internal: &str,
@@ -13310,6 +13373,14 @@ impl Typer {
         if matches!(pt, Type::Any | Type::AnyRef | Type::AnyVal) {
             return;
         }
+        // nsc `inferExprAlternative`: an *overloaded* method named where a
+        // function type is expected settles on the alternative that
+        // eta-expands to it -- `constOp[Long]("min")(math.min)` picks
+        // `min(Long, Long)` out of the four `math.min`s. Before the
+        // eta-expansion below, which needs a single method type.
+        if matches!(tree.ty, Type::Overload(_)) {
+            self.pick_overload_for_function(tree, pt);
+        }
         if let Type::Method { paramss, ret } = &tree.ty {
             if is_function_pt(pt) || self.st.sam_sig(pt).is_some() {
                 let mut params: Vec<Type> = paramss.iter().flatten().cloned().collect();
@@ -13387,6 +13458,77 @@ impl Typer {
             ),
         );
         tree.ty = Type::Error;
+    }
+
+    /// Narrow an overloaded reference to the one alternative whose
+    /// eta-expansion conforms to the expected function (or SAM) type. Leaves
+    /// the tree alone when the expected type is not a function shape, or when
+    /// no single alternative fits -- the caller then reports the mismatch it
+    /// would have reported anyway.
+    fn pick_overload_for_function(&mut self, tree: &mut Tree, pt: &Type) {
+        let want = match function_sig(pt) {
+            Some(sig) => sig,
+            None => match self.st.sam_sig(pt) {
+                Some(sam) => (sam.param_tys, sam.ret_ty),
+                None => return,
+            },
+        };
+        if tree.sym.is_none() {
+            return;
+        }
+        let name = self.st.get(tree.sym).name.clone();
+        let alts = self.drop_overridden(self.overload_alternatives(tree.sym, &name));
+        let instantiated = self.overload_member_types.get(&tree.sym.0).cloned();
+        let (want_params, want_ret) = want;
+        let mut hit: Option<(SymbolId, Type)> = None;
+        for m in alts {
+            let ty = instantiated
+                .as_ref()
+                .and_then(|g| g.iter().find(|(s, _)| *s == m).map(|(_, t)| t.clone()))
+                .unwrap_or_else(|| self.st.get(m).ty.clone());
+            let Type::Method { paramss, ret } = &ty else {
+                continue;
+            };
+            let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+            if params.len() != want_params.len() {
+                continue;
+            }
+            let as_fn = Type::Function {
+                params: params.clone(),
+                ret: ret.clone(),
+            };
+            let fits = self.st.is_sub_type(
+                &as_fn,
+                &Type::Function {
+                    params: want_params.clone(),
+                    ret: Box::new(want_ret.clone()),
+                },
+            );
+            if !fits {
+                continue;
+            }
+            // Two alternatives can both fit (`min(Int, Int)` conforms to
+            // nothing a `(Long, Long) => Long` wants, but a widening pair
+            // could); the exact one wins, as it does for an application.
+            let exact = params == want_params;
+            match &hit {
+                None => hit = Some((m, ty)),
+                Some((_, prev)) => {
+                    let prev_exact = matches!(prev, Type::Method { paramss, .. }
+                        if paramss.iter().flatten().cloned().collect::<Vec<_>>() == want_params);
+                    if exact && !prev_exact {
+                        hit = Some((m, ty));
+                    } else if !prev_exact {
+                        // Ambiguous: leave the overload alone.
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some((m, ty)) = hit {
+            tree.sym = m;
+            tree.ty = ty;
+        }
     }
 
     fn adapt_to_sam(&mut self, tree: &mut Tree, pt: &Type) -> bool {
@@ -14914,6 +15056,36 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
         out.push(conv);
     }
     out
+}
+
+/// Every parameter of a member, clauses flattened. A `val`/`var` (any
+/// non-method type) is parameterless, like a nullary `def`.
+fn flat_param_types(ty: &Type) -> Vec<Type> {
+    match ty {
+        Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `ty` mentions a type parameter or an abstract type member, i.e.
+/// whether it reads differently depending on the prefix it is seen from.
+fn sig_has_abstract_type(ty: &Type) -> bool {
+    match ty {
+        Type::TypeParam(_) | Type::TypeMember(_) => true,
+        Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
+            args.iter().any(sig_has_abstract_type)
+        }
+        Type::Applied { ctor, args } => {
+            sig_has_abstract_type(ctor) || args.iter().any(sig_has_abstract_type)
+        }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            sig_has_abstract_type(t)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(sig_has_abstract_type) || sig_has_abstract_type(ret)
+        }
+        _ => false,
+    }
 }
 
 fn split_repeated(params: &[Type]) -> (&[Type], Option<&Type>) {

@@ -995,6 +995,83 @@ nsc は `case class C(implicit x: Int)` 自体を拒否するので、第 1 リ�
   `value hidden cannot be accessed as a member of Plain from Main$` です
   （どちらもエラーにはなります。`ctacc_plain_bad`）。
 
+### オーバーロードの候補集合（継承・`private[this]`・`java.lang.String`）
+
+`agent/ovl2` スライス。フィクスチャは `tests/fixtures/ovl2*.scala`、テストは
+`crates/cli/tests/ovl2.rs` です。slick に残っていた `no matching overload` の塊は、
+**解決の規則**ではなく**候補集合の作り方**が原因でした。
+
+**1. 継承はオーバーライドではない**。`drop_overridden` は「所有者がスーパークラスなら
+落とす」だけで、シグネチャを見ていませんでした。
+
+```scala
+class Base { def f(x: Int): String = "int:" + x }
+class Derived extends Base { def f(s: String): String = "str:" + s }
+new Derived().f(1)   // Base.f(Int) を落としていたので no matching overload
+```
+
+nsc の `matchingSymbols` と同じく、**シグネチャが一致するときだけ**親側を落とすように
+しました（引数リストを平坦化して個数と型を比較。型パラメータ／抽象型メンバを含む
+パラメータは as-seen-from を再構成せずに一致とみなします）。あわせて
+**コンストラクタは継承されない**ので、`pick_ctor_at` は `lookup_member` が親から拾ってくる
+`<init>` を候補から外します。
+
+同じ穴が backend にもありました。`emit_erasure_bridges` は「同名で
+ディスクリプタが違う」だけでブリッジを出していたので、上の `Derived` に
+`f(I)Ljava/lang/String;` という**検証不能な**ブリッジ（`Integer` を `String` の
+位置に積む）が出ていました。ブリッジを出すのは、親のパラメータが erase して
+`Object` になる（＝ジェネリックの実装）ときだけにしています。`-Xverify:all` で
+固定しました。
+
+**2. `private[this]` は継承されない**。テンプレートのスコープは自分のメンバと継承メンバを
+**同じスコープ**に入れるので、素のコンストラクタ引数（nsc では `private[this]`）が親子で
+衝突していました。slick の `LoggingPreparedStatement(st: PreparedStatement) extends
+LoggingStatement(st: Statement)` は `st` が `<overload Statement | PreparedStatement>` に
+なり、`st.execute()` が全滅していました。`enter_inherited_members` が
+`PRIVATE | LOCAL` のメンバを入れないようにしています。逆に、親の素の引数を子から
+名指しするのは nsc と同じくエラーです（`ovl2_bad`: `not found: value tag`）。
+
+**3. `val` が抽象 `def` を実装したら 1 つのメンバ**。同じ理由で、
+`trait InterpolationContext { def symbolName: SymbolNamer }` を実装する
+`val symbolName: SymbolNamer` が `<overload SymbolNamer | SymbolNamer>` になり、
+`symbolName(s)` が解決しませんでした。`bind_found`（識別子側）も
+`drop_overridden` を通します。
+
+**4. `java.lang.String` は `CharSequence` を実装している**。prelude は `String` の親を
+`AnyRef` だけにしていたので、`String <: CharSequence` が偽で、`CharSequence` を取る
+JDK のオーバーロードが**全て**不適合でした（`Instant.parse(s)` /
+`LocalDate.parse(s, fmt)` / `DateTimeFormatter.parse(s)`）。`prelude_strhier.rs` が
+JDK から `Comparable` / `CharSequence` / `Serializable` を読んで親に足し、
+`is_sub_type` がそれを辿ります。これは JVM の事実なので **`library_abi` に依らず**
+両モードで有効です。同じファイルで `indexOf` / `lastIndexOf` の
+`(Int)` / `(Int, Int)` / `(String, Int)` を足しています（`s.indexOf(':')` は
+`Char` を `Int` に広げて `indexOf(int)` を選ぶので、その候補が無いと落ちます）。
+
+**5. オーバーロードされたメソッドの η 展開**。期待型が関数型のとき、nsc の
+`inferExprAlternative` は「その関数型に η 展開できる 1 本」に絞ります。
+`constOp[Long]("min")(math.min)` と `val g: (Long, Long) => Long = math.max` の両方
+（引数位置と期待型位置）を通すため、`adapt` に `pick_overload_for_function` を足し、
+採点側では `Type::Overload` の引数を「どれか 1 本が合えば合う」と見るようにしました。
+
+**6. `new ArrayBuffer[R](g.length)`**。`ArrayBuffer` の
+`def this()` / `def this(initialSize: Int)` を prelude が宣言していませんでした
+（`prelude_ovl2.rs`）。どちらも 2.13.16 の実クラスにある `<init>()V` / `<init>(I)V` です。
+
+計測（`tests/slick_measure.sh`、slick 184 ファイル、`-Xsource:3`）は
+**1059 → 903**、エラーを含むファイルは **105 → 104** になりました。
+
+**残っているもの**（このスライスでは直していない）:
+
+- **`Map[K, V] <: Iterable[T]` から `T` が解けない**。`ConstArray.from(m)` の
+  `no matching overload` は候補集合ではなく `infer_method_tparams` 側で、
+  `h[T](xs: Iterable[T])` に `Map[String, Int]` を渡すだけで再現します
+  （`h2(xs: Iterable[(String, Int)])` と明示 `h[(String, Int)](m)` は通るので、
+  適合判定ではなく推論）。`agent/tyvar` の担当範囲なので触っていません。
+- **`java.lang.String` の JDK メンバが on-demand で読まれない**。`codePointAt` などは
+  prelude が宣言した分しか無く、`value codePointAt is not a member of String` です。
+- **`xs.toArray` の `ClassTag`**（slick `ProductResultConverter` の
+  `(ClassTag[B])Any`）は上の `agent/ctoraccessor` の残件のままです。
+
 ## 実装していないもの
 
 次は実装していません。スタブで「動いたことにする」こともしていません。言語側の残りとライブラリ側の残りを分けます。
@@ -1498,6 +1575,8 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `vcls_hnil.scala`（`crates/cli/tests/valclass.rs`、library dual-run のみ） | `import syntax._` が型名 `HNil` を隠したうえでの `HNil.type`、前方参照、パッケージ修飾 `hl.HNil.type`、型引数位置、ネストした object の `ColumnOption.AutoInc.type` | `0` `2` `0` `0` `1` `1` `PrimaryKey` `AutoInc` `1` |
 | `pkgalias.scala`（`crates/cli/tests/pkgalias.rs`、library dual-run のみ） | jar の package object にしかない**型エイリアス**（`scala/package$` の pickle）: `new NoSuchElementException(...)` と `catch`、`Throwable` / `UnsupportedOperationException` / `IllegalArgumentException` / `Exception`、型パラメータ付きの `IterableOnce[Int]` / `Seq[Int]` | `gone` `java.lang.UnsupportedOperationException` `java.lang.IllegalArgumentException` `3` `r` `9` |
 | `java_cp.scala` | JDK の Java `.class` から `Math.abs` / `Byte.MAX_VALUE` / `ArrayList.add` を解決して実行 | `3` `127` `true` `1` |
+| `ovl2.scala`（`crates/cli/tests/ovl2.rs`、私有ランタイム・library dual-run・real scalac dual-run） | `agent/ovl2` スライス: 継承はオーバーライドではない（`Base.f(Int)` と `Derived.f(String)` が両方候補に残り、erasure ブリッジも出ない）、素のコンストラクタ引数は `private[this]` なので継承されない、`val` が抽象 `def` を実装したら 1 つのメンバ、`String <: CharSequence`、`indexOf(':')` / `indexOf(':', 2)` / `lastIndexOf(':')` | `int:7/str:z` `42` `outer` `named!` `1` `1` `3` `3` `a` `5` |
+| `ovl2_lib.scala`（`crates/cli/tests/ovl2.rs`、library dual-run と real scalac dual-run） | オーバーロードされたメソッドの η 展開（`constOp[Long]("min")(math.min)`、`val g: (Double, Double) => Double = math.max`）、`new ArrayBuffer[Int](8)` と `new ArrayBuffer[String]()`、`Instant.parse` / `LocalDate.parse(s, fmt)` / `DateTimeFormatter.parse(s)`。私有ランタイムには裏付けが無いので `--no-scala-library` では診断のまま | `3` `4` `2.5` `1,2` `x` `2020-01-02T03:04:05Z` `2020-01-02` `true` |
 | `java_sig.scala` | Java Signature（`ArrayList[String]#get` は `String`）、inner `Map.Entry` / `SimpleEntry`、Java varargs `String.format` / `Arrays.asList` を実行 | `hi` `2` `k` `v` `k` `x-3` `2` |
 | `java_wild.scala` | Signature の `Class[_]` / `Collection[_ <: Number]` / `Collections.max`（tparam bound）を存在型として実行 | `java.lang.String` `2` `9` |
 | `java_throws.scala` | Java `throws` 検査例外（`Thread.sleep`）を Scala はチェックせず実行 | `ok` |
@@ -1794,6 +1873,21 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   カスケードが 1 本増えた箇所が数か所）。同スライスで `relax_open_tparams`
   （未確定の型パラメータを `Any` に潰す場当たり。README の記録では 3 回別々の
   バグの原因になっていた）を**削除**しました。
+  `agent/ovl2` スライス（オーバーロードの候補集合）でさらに **1059 → 903**、
+  エラーを含むファイルは 105 → 104 になりました。
+
+- **`Map[K, V]` を `Iterable[T]` に渡したとき `T` が解けない**。適合判定ではなく推論の
+  穴で、`def h[T](xs: Iterable[T]) = xs.size` に `Map[String, Int]` を渡すだけで
+  `no matching overload` になります（`h[(String, Int)](m)` と
+  `def h2(xs: Iterable[(String, Int)])` は通ります）。slick の
+  `ConstArray.from(newDefsM.map(…))` 5 件がこれです。
+
+- **`java.lang.String` の JDK メンバが on-demand で読まれない**。prelude が宣言した分
+  （`prelude.rs` の `add_string_members` / `prelude_text.rs` の `add_string_extra` /
+  `prelude_strhier.rs` の `indexOf` 群）しか無く、`s.codePointAt(0)` は
+  `value codePointAt is not a member of String` になります。他の Java クラスと違い
+  `Type::String` は受け手のクラスシンボルを持つのにメンバ探索が prelude で当たって
+  しまうため、`ensure_java_loaded` に到達しません。
 
 - **override 検査が無い**。`override` 修飾子の要否も、override 時の型適合も検査していない。
   scalac が拒否する次の 2 つを黙って通す:
