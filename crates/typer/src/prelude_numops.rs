@@ -15,6 +15,11 @@ const RANKED: &[(u8, &str)] = &[(0, "Int"), (1, "Long"), (2, "Float"), (3, "Doub
 
 const ARITH: &[&str] = &["+", "-", "*", "/", "%"];
 const COMPARE: &[&str] = &["==", "!=", "<", "<=", ">", ">="];
+/// `&`, `|`, `^` take the wider integral operand; a shift's result and its
+/// `Intrinsic` follow the *left* operand, and its right operand is an `Int`
+/// or a `Long` independently of that.
+const BITWISE: &[&str] = &["&", "|", "^"];
+const SHIFT: &[&str] = &["<<", ">>", ">>>"];
 
 pub fn install(st: &mut SymbolTable) {
     for &(lr, _) in RANKED {
@@ -49,6 +54,29 @@ pub fn install(st: &mut SymbolTable) {
                     bin(wide, op),
                 );
             }
+            // Integral operands only: `1.0 & 2` is not a Scala expression.
+            if lr > 1 || rr > 1 {
+                continue;
+            }
+            for op in BITWISE {
+                if has_member(st, recv, op, &arg) {
+                    continue;
+                }
+                prelude_method(
+                    st,
+                    recv,
+                    op,
+                    vec![arg.clone()],
+                    wide_ty.clone(),
+                    bin(wide, op),
+                );
+            }
+            for op in SHIFT {
+                if has_member(st, recv, op, &arg) {
+                    continue;
+                }
+                prelude_method(st, recv, op, vec![arg.clone()], ty_of(lr), bin(lr, op));
+            }
         }
     }
 }
@@ -75,6 +103,8 @@ fn bin(rank: u8, op: &str) -> Intrinsic {
     let op = ARITH
         .iter()
         .chain(COMPARE.iter())
+        .chain(BITWISE.iter())
+        .chain(SHIFT.iter())
         .find(|o| **o == op)
         .copied()
         .unwrap_or("+");

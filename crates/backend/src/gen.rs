@@ -5267,7 +5267,13 @@ fn gen_apply(
                 widen_numeric(asm, &qual.ty, &Type::Long);
                 if let Some(r) = args.first() {
                     gen_expr(asm, frame, ctx, r);
-                    if !matches!(op, "<<" | ">>" | ">>>") {
+                    if matches!(op, "<<" | ">>" | ">>>") {
+                        // A shift count is an `int` on the JVM, whatever
+                        // Scala's `<<(x: Long)` overload says.
+                        if matches!(r.ty.widen_constant(), Type::Long) {
+                            asm.l2i();
+                        }
+                    } else {
                         widen_numeric(asm, &r.ty, &Type::Long);
                     }
                 }
@@ -5277,6 +5283,12 @@ fn gen_apply(
             Intrinsic::LongUn("-") => {
                 gen_expr(asm, frame, ctx, qual);
                 asm.lneg();
+                return;
+            }
+            Intrinsic::LongUn("~") => {
+                gen_expr(asm, frame, ctx, qual);
+                asm.lconst(-1);
+                asm.lxor();
                 return;
             }
             Intrinsic::DoubleBin(op) => {
@@ -11544,6 +11556,9 @@ fn emit_long_bin(asm: &mut Assembler, op: &str) {
         "&" => asm.land(),
         "|" => asm.lor(),
         "^" => asm.lxor(),
+        "<<" => asm.lshl(),
+        ">>" => asm.lshr(),
+        ">>>" => asm.lushr(),
         _ => {
             asm.lcmp();
             emit_cmp_to_bool(asm, op);

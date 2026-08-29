@@ -664,6 +664,22 @@ impl Assembler {
     pub fn lrem(&mut self) {
         self.bin_long(0x71);
     }
+    /// A `long` shift takes an `int` count, so the stack loses only the count.
+    pub fn lshl(&mut self) {
+        self.shift_long(0x79);
+    }
+    pub fn lshr(&mut self) {
+        self.shift_long(0x7b);
+    }
+    pub fn lushr(&mut self) {
+        self.shift_long(0x7d);
+    }
+    fn shift_long(&mut self, op: u8) {
+        self.emit_op(op);
+        let _ = self.pop_v();
+        let _ = self.pop_v();
+        self.push_v(VType::Long);
+    }
     pub fn land(&mut self) {
         self.bin_long(0x7f);
     }
@@ -724,6 +740,11 @@ impl Assembler {
         self.emit_op(0x87);
         let _ = self.pop_v();
         self.push_v(VType::Double);
+    }
+    pub fn l2i(&mut self) {
+        self.emit_op(0x88);
+        let _ = self.pop_v();
+        self.push_v(VType::Integer);
     }
     pub fn l2d(&mut self) {
         self.emit_op(0x8a);

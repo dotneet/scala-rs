@@ -1484,6 +1484,7 @@ fn add_long_members(st: &mut SymbolTable) {
         );
     }
     method(st, c, "unary_-", vec![], Type::Long, Intrinsic::LongUn("-"));
+    method(st, c, "unary_~", vec![], Type::Long, Intrinsic::LongUn("~"));
     method(st, c, "toInt", vec![], Type::Int, Intrinsic::None);
     method(
         st,

@@ -206,5 +206,6 @@ conform!(
     val_extractor,
     generic_case_class,
     case_body_pattern_def,
-    anon_pattern_capture
+    anon_pattern_capture,
+    integral_ops
 );
