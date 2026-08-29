@@ -6678,6 +6678,15 @@ fn add_numeric_wrapper(
     st.get_mut(wrap).flags = st.get(wrap).flags.with(Flags::IMPLICIT);
 }
 
+/// A parameterless getter that is *not* an implicit candidate.
+fn plain_getter(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) {
+    let id = st.alloc(name, owner, SymKind::Method, Flags::EMPTY, "");
+    st.get_mut(id).ty = Type::Method {
+        paramss: vec![],
+        ret: Box::new(ty),
+    };
+}
+
 fn implicit_getter(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) -> SymbolId {
     let id = st.alloc(name, owner, SymKind::Method, Flags::IMPLICIT, "");
     st.get_mut(id).ty = Type::Method {
@@ -6735,7 +6744,11 @@ fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
     implicit_getter(st, mc, "Unit", tag(Type::Unit));
     implicit_getter(st, mc, "Any", tag(Type::Any));
     implicit_getter(st, mc, "AnyRef", tag(Type::AnyRef));
-    implicit_getter(st, mc, "Object", tag(Type::AnyRef));
+    // `scala.AnyRef` is an alias of `java.lang.Object`, so `ClassTag.Object`
+    // has the very type `ClassTag.AnyRef` has. Only one of the two may be a
+    // candidate or `Array("x", "y"): Array[AnyRef]` is ambiguous -- in nsc
+    // neither is implicit at all (the compiler materializes class tags).
+    plain_getter(st, mc, "Object", tag(Type::AnyRef));
     implicit_getter(st, mc, "Nothing", tag(Type::Nothing));
     implicit_getter(st, mc, "Null", tag(Type::Null));
     let apply = method(

@@ -9043,6 +9043,15 @@ fn is_concrete_array_elem(elem: &Type) -> bool {
             | Type::String
             | Type::Class { .. }
             | Type::ModuleRef(_)
+            // `Array[AnyRef]` erases to `[Ljava/lang/Object;`, not to
+            // `Object`: only an *abstract* element collapses the array away,
+            // so these still need the cast off `Array$.apply`'s `Object`.
+            | Type::Any
+            | Type::AnyRef
+            | Type::AnyVal
+            | Type::Array(_)
+            | Type::Tuple(_)
+            | Type::Function { .. }
     )
 }
 

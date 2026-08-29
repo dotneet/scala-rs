@@ -1,0 +1,15 @@
+2
+x
+[Ljava.lang.Object;
+2/x
+2
+2
+[Ljava.lang.Object;
+[I
+4
+id:int
+nm:str
+any
+int
+cov str
+List()

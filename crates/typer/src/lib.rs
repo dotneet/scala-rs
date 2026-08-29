@@ -4195,4 +4195,95 @@ object Main {
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
+
+    /// nsc's `instantiateExpecting`: the expected type solves a method's type
+    /// parameters together with the arguments. `T` here appears in no
+    /// argument at all, and has to be settled before the implicit clause is
+    /// searched; `Array` is invariant, so the ascription wins over the
+    /// arguments' `String` / `Int`.
+    #[test]
+    fn exptype_expected_type_solves_tparams_with_library() {
+        ok_lib(
+            r#"
+class Rep[T]
+class Inv[T]
+trait TypedType[T]
+object TypedType {
+  implicit val intType: TypedType[Int] = new TypedType[Int] {}
+  implicit val strType: TypedType[String] = new TypedType[String] {}
+  implicit val anyType: TypedType[Any] = new TypedType[Any] {}
+}
+object Library {
+  def column[T](n: String)(implicit tt: TypedType[T]): Rep[T] = new Rep[T]
+  def inv[T](x: T)(implicit tt: TypedType[T]): Inv[T] = new Inv[T]
+  def cov[T](x: T)(implicit tt: TypedType[T]): List[T] = Nil
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val a: Array[AnyRef] = Array("x", "y")
+    val b: Array[Any] = Array(1, 2)
+    val r: Rep[Int] = Library.column("id")
+    val i: Inv[Any] = Library.inv("q")
+    val k: List[Any] = Library.cov("q")
+    println(a.length + b.length + r.toString + i.toString + k.toString)
+  }
+}
+"#,
+        );
+    }
+
+    /// `Array` is invariant: `Array[Int]` does not conform to `Array[Any]`.
+    #[test]
+    fn exptype_array_is_invariant_with_library() {
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+object Main {
+  def take(a: Array[Any]): Int = a.length
+  def main(args: Array[String]): Unit = {
+    val xs: Array[Int] = Array(1, 2)
+    val ys: Array[Any] = xs
+    println(take(xs) + ys.length)
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: true,
+                classpath: Vec::new(),
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+            },
+        );
+        assert!(has_errors(&diags), "expected error, got {diags:?}");
+        assert!(
+            diags.iter().any(|d| d
+                .message
+                .contains("found: Array[Int]  required: Array[Any]")),
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// An inherited member's implicit clause is instantiated through the
+    /// *applied* parent: `OptionMapper2[…, Boolean, …].column` asks for a
+    /// `TypedType[Boolean]`, not for a raw `TypedType[BR]`.
+    #[test]
+    fn exptype_inherited_member_sees_applied_parent_with_library() {
+        ok_lib(
+            r#"
+class Rep[T]
+trait TypedType[T]
+trait OptionMapper[BR, R] {
+  def column(n: String)(implicit bt: TypedType[BR]): Rep[R] = new Rep[R]
+}
+trait OptionMapper2[B1, B2, BR, P1, P2, R] extends OptionMapper[BR, R]
+object Main {
+  implicit val boolType: TypedType[Boolean] = new TypedType[Boolean] {}
+  def use[P1, P2, R](om: OptionMapper2[Int, Int, Boolean, P1, P2, R]): Rep[R] =
+    om.column("c")
+  def main(args: Array[String]): Unit = println(use(null))
+}
+"#,
+        );
+    }
 }
