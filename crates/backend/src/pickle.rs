@@ -124,14 +124,88 @@ pub const IDENTtree: u8 = 36;
 #[allow(non_upper_case_globals)]
 pub const LITERALtree: u8 = 37;
 
+/// A type recovered from a pickle: the head symbol's name plus its type
+/// arguments. A `TYPEREFtpe` carries its arguments after the symbol reference,
+/// so `F[A]` reads back as `{ name: "F", args: ["A"] }` rather than as the bare
+/// head name.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PickledType {
+    pub name: String,
+    pub args: Vec<PickledType>,
+}
+
+impl PickledType {
+    pub fn simple(name: impl Into<String>) -> Self {
+        PickledType {
+            name: name.into(),
+            args: Vec::new(),
+        }
+    }
+}
+
+/// A type parameter recovered from a pickle, with its own parameters so that a
+/// type constructor (`F[_]`) is not read back as a proper type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickledTypeParam {
+    pub name: String,
+    pub tparams: Vec<PickledTypeParam>,
+}
+
+impl PickledTypeParam {
+    pub fn simple(name: impl Into<String>) -> Self {
+        PickledTypeParam {
+            name: name.into(),
+            tparams: Vec::new(),
+        }
+    }
+}
+
+// An argument-free pickled type is exactly its name; comparing against a name
+// keeps the unpickler's tests readable.
+impl PartialEq<str> for PickledType {
+    fn eq(&self, other: &str) -> bool {
+        self.args.is_empty() && self.name == other
+    }
+}
+
+impl PartialEq<&str> for PickledType {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
+impl PartialEq<String> for PickledType {
+    fn eq(&self, other: &String) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<str> for PickledTypeParam {
+    fn eq(&self, other: &str) -> bool {
+        self.tparams.is_empty() && self.name == other
+    }
+}
+
+impl PartialEq<&str> for PickledTypeParam {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
+impl PartialEq<String> for PickledTypeParam {
+    fn eq(&self, other: &String) -> bool {
+        self == other.as_str()
+    }
+}
+
 /// Pickled method, constructor, or val recovered by the subset unpickler.
 #[derive(Clone, Debug)]
 pub struct PickledMethod {
     pub name: String,
     pub param_names: Vec<String>,
-    pub param_types: Vec<String>,
-    pub ret: String,
-    pub tparams: Vec<String>,
+    pub param_types: Vec<PickledType>,
+    pub ret: PickledType,
+    pub tparams: Vec<PickledTypeParam>,
     pub is_val: bool,
     pub is_ctor: bool,
     pub is_implicit: bool,
@@ -142,7 +216,7 @@ pub struct PickledMethod {
 pub struct PickledClass {
     pub name: String,
     pub is_module: bool,
-    pub tparams: Vec<String>,
+    pub tparams: Vec<PickledTypeParam>,
     pub methods: Vec<PickledMethod>,
 }
 
@@ -1652,6 +1726,7 @@ impl<'a> Pickler<'a> {
         let s = self.st.get(id);
         let name = s.name.clone();
         let owner_id = s.owner.0;
+        let own_tparams = s.tparams.clone();
         let name_ref = self.type_name(&name);
         let idx = self.add(TYPESYM, vec![]);
         self.sym_index.insert(id.0, idx);
@@ -1661,9 +1736,25 @@ impl<'a> Pickler<'a> {
         let mut b = Vec::new();
         write_nat_to(&mut b, lo);
         write_nat_to(&mut b, hi);
-        let bounds = self.add(TYPEBOUNDSTPE, b);
+        let mut info = self.add(TYPEBOUNDSTPE, b);
+        // A higher-kinded parameter (`F[_]`) is a TYPEsym whose info is a
+        // POLYtpe over its own parameters. Without it the reader cannot tell
+        // `F[_]` from a proper type and every `Monad[F]` fails the kind check.
+        if !own_tparams.is_empty() {
+            let mut nested = Vec::new();
+            for tp in own_tparams {
+                nested.push(self.pickle_typesym(tp));
+            }
+            let mut body = Vec::new();
+            // nsc POLYtpe = restpe, {tparams}
+            write_nat_to(&mut body, info);
+            for r in nested {
+                write_nat_to(&mut body, r);
+            }
+            info = self.add(POLYTPE, body);
+        }
         let flags = raw_to_pickled((1u64 << 13) | (1u64 << 4)); // PARAM | DEFERRED
-        let body = self.symbol_info(name_ref, owner_ref, flags, bounds);
+        let body = self.symbol_info(name_ref, owner_ref, flags, info);
         self.entries[idx as usize] = (TYPESYM, body);
         idx
     }
@@ -2120,6 +2211,7 @@ enum Entry {
     TypeRef {
         prefix: u32,
         sym: u32,
+        args: Vec<u32>,
     },
     ClassInfo(u32),
     MethodTpe {
@@ -2286,8 +2378,17 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             TYPEREFTPE => {
                 let prefix = r.read_nat().unwrap_or(0);
                 let sym = r.read_nat().unwrap_or(0);
+                // nsc writes the type arguments after the symbol reference.
+                // Dropping them turned `F[A]` into a bare `F`.
+                let mut args = Vec::new();
+                while r.pos < end {
+                    match r.read_nat() {
+                        Some(a) => args.push(a),
+                        None => break,
+                    }
+                }
                 r.pos = end;
-                Entry::TypeRef { prefix, sym }
+                Entry::TypeRef { prefix, sym, args }
             }
             CLASSINFOTPE => {
                 let c = r.read_nat().unwrap_or(0);
@@ -2343,37 +2444,80 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
         match entries.get(i as usize) {
             Some(Entry::TermName(s) | Entry::TypeName(s)) => s.clone(),
             Some(Entry::ExtRef(n)) => name_of(entries, *n),
-            Some(Entry::TypeSym { name, .. }) => name_of(entries, *name),
+            Some(
+                Entry::TypeSym { name, .. }
+                | Entry::ClassSym { name, .. }
+                | Entry::ModuleSym { name, .. },
+            ) => name_of(entries, *name),
             _ => String::new(),
         }
     }
 
-    fn type_name_of(entries: &[Entry], i: u32) -> String {
+    /// An existential's quantified symbols (`_$1`) have no meaning outside the
+    /// pickle; name them `_` so the reader turns them into wildcards.
+    fn is_existential_name(n: &str) -> bool {
+        n.starts_with("_$")
+    }
+
+    // The entry graph can be cyclic (`class C[A <: C[A]]`); bound the walk.
+    const MAX_TYPE_DEPTH: usize = 12;
+
+    fn type_of(entries: &[Entry], i: u32, depth: usize) -> PickledType {
+        if depth > MAX_TYPE_DEPTH {
+            return PickledType::simple("Any");
+        }
         match entries.get(i as usize) {
-            Some(Entry::TypeRef { sym, .. }) => {
+            Some(Entry::TypeRef { sym, args, .. }) => {
                 let n = name_of(entries, *sym);
                 if n.is_empty() {
-                    type_name_of(entries, *sym)
-                } else {
-                    n
+                    return type_of(entries, *sym, depth + 1);
+                }
+                if is_existential_name(&n) {
+                    return PickledType::simple("_");
+                }
+                PickledType {
+                    name: n,
+                    args: args
+                        .iter()
+                        .map(|a| type_of(entries, *a, depth + 1))
+                        .collect(),
                 }
             }
-            Some(Entry::ExtRef(n)) => name_of(entries, *n),
-            Some(Entry::TermName(s) | Entry::TypeName(s)) => s.clone(),
-            Some(Entry::NoTpe) => "Any".into(),
-            Some(Entry::Existential(t)) => type_name_of(entries, *t),
+            Some(Entry::ExtRef(n)) => PickledType::simple(name_of(entries, *n)),
+            Some(Entry::TermName(s) | Entry::TypeName(s)) => PickledType::simple(s.clone()),
+            Some(Entry::NoTpe) => PickledType::simple("Any"),
+            Some(Entry::Existential(t)) => type_of(entries, *t, depth + 1),
             Some(Entry::ThisTpe(s)) => match entries.get(*s as usize) {
                 Some(Entry::ClassSym { name, .. } | Entry::ModuleSym { name, .. }) => {
-                    name_of(entries, *name)
+                    PickledType::simple(name_of(entries, *name))
                 }
-                _ => "Any".into(),
+                _ => PickledType::simple("Any"),
             },
-            Some(Entry::AnnotatedTpe(t)) => type_name_of(entries, *t),
-            Some(Entry::SingleTpe { prefix, .. }) => type_name_of(entries, *prefix),
-            Some(Entry::ConstantTpe(c)) => type_name_of(entries, *c),
-            Some(Entry::LiteralTy(s)) => s.clone(),
-            _ => "Any".into(),
+            Some(Entry::AnnotatedTpe(t)) => type_of(entries, *t, depth + 1),
+            Some(Entry::SingleTpe { prefix, .. }) => type_of(entries, *prefix, depth + 1),
+            Some(Entry::ConstantTpe(c)) => type_of(entries, *c, depth + 1),
+            Some(Entry::LiteralTy(s)) => PickledType::simple(s.clone()),
+            _ => PickledType::simple("Any"),
         }
+    }
+
+    /// A pickled type parameter keeps its own parameters: nsc gives `F[_]` a
+    /// `POLYtpe` info, and without reading it back `Applicative[F]` looked like
+    /// it took a proper type.
+    fn tparam_of(entries: &[Entry], i: u32, depth: usize) -> PickledTypeParam {
+        let name = name_of(entries, i);
+        let mut tparams = Vec::new();
+        if depth < 4 {
+            if let Some(Entry::TypeSym { info, .. }) = entries.get(i as usize) {
+                if let Some(Entry::PolyTpe { tparams: tps, .. }) = entries.get(*info as usize) {
+                    tparams = tps
+                        .iter()
+                        .map(|t| tparam_of(entries, *t, depth + 1))
+                        .collect();
+                }
+            }
+        }
+        PickledTypeParam { name, tparams }
     }
 
     let mut class_idx = None;
@@ -2404,11 +2548,11 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
         return None;
     }
 
-    fn peel_info(entries: &[Entry], info: u32) -> (Vec<String>, u32) {
+    fn peel_info(entries: &[Entry], info: u32) -> (Vec<PickledTypeParam>, u32) {
         match entries.get(info as usize) {
             Some(Entry::PolyTpe { tparams, rest }) => {
-                let names = tparams.iter().map(|t| name_of(entries, *t)).collect();
-                (names, *rest)
+                let tps = tparams.iter().map(|t| tparam_of(entries, *t, 0)).collect();
+                (tps, *rest)
             }
             _ => (Vec::new(), info),
         }
@@ -2454,9 +2598,9 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 }) = entries.get(*p as usize)
                 {
                     param_names.push(name_of(&entries, *pn));
-                    param_types.push(type_name_of(&entries, *pt));
+                    param_types.push(type_of(&entries, *pt, 0));
                 } else {
-                    param_types.push(type_name_of(&entries, *p));
+                    param_types.push(type_of(&entries, *p, 0));
                     param_names.push(format!("x${}", param_names.len()));
                 }
             }
@@ -2467,7 +2611,7 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 name: mname.clone(),
                 param_names,
                 param_types,
-                ret: type_name_of(&entries, *ret),
+                ret: type_of(&entries, *ret, 0),
                 tparams,
                 is_val: is_accessor,
                 is_ctor: mname == "<init>",
@@ -2482,7 +2626,7 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 name: mname,
                 param_names: Vec::new(),
                 param_types: Vec::new(),
-                ret: type_name_of(&entries, rest),
+                ret: type_of(&entries, rest, 0),
                 tparams,
                 is_val: is_accessor,
                 is_ctor: false,
@@ -2751,7 +2895,14 @@ object Lib {
             .find(|m| m.name == "unapply")
             .expect("unapply");
         assert_eq!(unapply.param_types, vec!["Point".to_string()]);
-        assert_eq!(unapply.ret, "Option");
+        // The result keeps its arguments: `Option[(Int, Int)]`, not `Option`.
+        assert_eq!(unapply.ret.name, "Option");
+        assert_eq!(unapply.ret.args.len(), 1);
+        assert_eq!(unapply.ret.args[0].name, "Tuple2");
+        assert_eq!(
+            unapply.ret.args[0].args,
+            vec!["Int".to_string(), "Int".to_string()]
+        );
     }
 
     #[test]
@@ -2791,7 +2942,9 @@ object Lib {
         );
         let p = unpickle(&raw).expect("unpickle Lib");
         let f = p.methods.iter().find(|m| m.name == "f").expect("f");
-        assert_eq!(f.param_types, vec!["List".to_string()]);
+        // `List[_]`: the existential's quantified symbol reads back as `_`.
+        assert_eq!(f.param_types[0].name, "List");
+        assert_eq!(f.param_types[0].args, vec!["_".to_string()]);
         assert_eq!(f.ret, "Int");
         let g = p.methods.iter().find(|m| m.name == "g").expect("g");
         assert_eq!(g.ret, "Int");
@@ -3360,7 +3513,8 @@ object Lib {
         );
         let p = unpickle(&raw).expect("unpickle Lib");
         let f = p.methods.iter().find(|m| m.name == "f").expect("f");
-        assert_eq!(f.param_types, vec!["List".to_string()]);
+        assert_eq!(f.param_types[0].name, "List");
+        assert_eq!(f.param_types[0].args, vec!["_".to_string()]);
         let h = p.methods.iter().find(|m| m.name == "h").expect("h");
         assert_eq!(h.param_types, vec!["Int".to_string()]);
     }

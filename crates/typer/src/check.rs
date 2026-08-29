@@ -45,14 +45,53 @@ pub struct ClasspathMethod {
     pub desc: String,
 }
 
+/// A type recovered from a pickle: the head name plus its type arguments.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ClasspathType {
+    pub name: String,
+    pub args: Vec<ClasspathType>,
+}
+
+impl ClasspathType {
+    pub fn simple(name: impl Into<String>) -> Self {
+        ClasspathType {
+            name: name.into(),
+            args: Vec::new(),
+        }
+    }
+}
+
+impl<S: Into<String>> From<S> for ClasspathType {
+    fn from(name: S) -> Self {
+        ClasspathType::simple(name)
+    }
+}
+
+/// A type parameter recovered from a pickle, with its own parameters so a type
+/// constructor (`F[_]`) does not arrive looking like a proper type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClasspathTypeParam {
+    pub name: String,
+    pub tparams: Vec<ClasspathTypeParam>,
+}
+
+impl ClasspathTypeParam {
+    pub fn simple(name: impl Into<String>) -> Self {
+        ClasspathTypeParam {
+            name: name.into(),
+            tparams: Vec::new(),
+        }
+    }
+}
+
 /// A method recovered from our ScalaSignature pickle subset.
 #[derive(Clone, Debug)]
 pub struct ClasspathPickleMethod {
     pub name: String,
     pub param_names: Vec<String>,
-    pub param_types: Vec<String>,
-    pub ret: String,
-    pub tparams: Vec<String>,
+    pub param_types: Vec<ClasspathType>,
+    pub ret: ClasspathType,
+    pub tparams: Vec<ClasspathTypeParam>,
     pub is_val: bool,
     pub is_ctor: bool,
     pub is_implicit: bool,
@@ -65,8 +104,8 @@ pub struct ClasspathClass {
     pub is_module: bool,
     pub methods: Vec<ClasspathMethod>,
     pub pickle: Option<Vec<ClasspathPickleMethod>>,
-    /// Class type parameter names recovered from the pickle, in order.
-    pub pickle_tparams: Vec<String>,
+    /// Class type parameters recovered from the pickle, in order.
+    pub pickle_tparams: Vec<ClasspathTypeParam>,
 }
 
 impl Default for TypecheckOptions {
@@ -2380,10 +2419,17 @@ impl Typer {
     /// Put inherited members in the template scope so `val Red = Value` inside
     /// `object Color extends Enumeration` resolves `Value` like nsc.
     fn enter_inherited_members(&mut self, cls: SymbolId) {
-        let mut work = self.st.get(cls).parents.clone();
+        // Breadth-first, last parent first: that is the order a member reaches
+        // the class through nsc's linearization, and the scope keeps the first
+        // entry for a name. Walking depth-first let a *grandparent's* deferred
+        // declaration be entered before its own subclass's concrete one, so
+        // `new SimpleFeatureNode[T] with SimpleFunction` saw `Node`'s abstract
+        // `type Self` instead of `SimpleFeatureNode`'s `type Self = …`.
+        let mut work: std::collections::VecDeque<Type> =
+            self.st.get(cls).parents.iter().rev().cloned().collect();
         let mut seen = std::collections::HashSet::new();
         seen.insert(cls.0);
-        while let Some(p) = work.pop() {
+        while let Some(p) = work.pop_front() {
             let Some(pid) = self.st.class_sym_of(&p) else {
                 continue;
             };
@@ -2415,7 +2461,7 @@ impl Typer {
                 }
                 self.st.enter_in_current(&n, m);
             }
-            work.extend(self.st.get(pid).parents.clone());
+            work.extend(self.st.get(pid).parents.iter().rev().cloned());
         }
     }
 
@@ -5182,7 +5228,13 @@ impl Typer {
             // `class UserStore extends Repo[User]`.
             if !self.st.this_class.is_none() {
                 let owner = self.st.get(s).owner;
-                if owner != self.st.this_class && !owner.is_none() {
+                // A self alias names the *enclosing* instance, not this one:
+                // inside `new CI[B] { def close() = self.close() }` the `self`
+                // of the surrounding `trait CI { self => }` still stands for
+                // the trait's own `this`, so its `CI.this.type` must not be
+                // re-read as the anonymous class.
+                let is_self_alias = self.st.get(owner).self_alias == Some(s);
+                if owner != self.st.this_class && !owner.is_none() && !is_self_alias {
                     let this_ty = Type::Class {
                         sym: self.st.this_class,
                         args: self
@@ -5535,6 +5587,60 @@ impl Typer {
             out = crate::symbol::subst_tparams_slice(&[*tp], &[t], &out);
         }
         (!mentions_tparam(&out, open)).then_some(out)
+    }
+
+    /// nsc's `solvedTypes` for what a call leaves over. A type parameter that
+    /// occurs in the result but in *no* parameter type is one no argument
+    /// could ever pin; once the expected type has had its say, nsc instantiates
+    /// it to a bound -- the lower one where it occurs covariantly, the upper
+    /// one where it occurs contravariantly. Leaving it a parameter is what made
+    /// `dbAction { … }` checked against `FixedBasicAction[Unit, Nothing,
+    /// Effect.Schema]` report `found: FixedBasicAction[Unit, S, Schema]`.
+    ///
+    /// A parameter that *does* occur in a parameter type is left alone: that is
+    /// the one the arguments (or a still-missing implicit) are supposed to
+    /// determine, and papering over it would hide the diagnostic.
+    fn instantiate_leftover_tparams(&self, method: SymbolId, ret: Type, pt: &Type) -> Type {
+        // Only where the call is what the expected type is checked against.
+        // With none, this is a receiver a further application may still solve
+        // (nsc keeps those in `Context.undetparams`).
+        if method.is_none() || pt.is_no_type() || pt.is_error() {
+            return ret;
+        }
+        let tps = self.st.get(method).tparams.clone();
+        if tps.is_empty() || !mentions_tparam(&ret, &tps) {
+            return ret;
+        }
+        let sig_params: Vec<Type> = match &self.st.get(method).ty {
+            Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+            _ => Vec::new(),
+        };
+        let mut out = ret;
+        for tp in tps {
+            if !mentions_tparam(&out, &[tp]) {
+                continue;
+            }
+            if sig_params.iter().any(|p| mentions_tparam(p, &[tp])) {
+                continue;
+            }
+            // A type *constructor* has no bound we could name: `Nothing` is not
+            // an `F[_]`, and putting it there gave `ActionListener[Nothing]`.
+            if !self.st.get(tp).tparams.is_empty() {
+                continue;
+            }
+            let v = self.tparam_variance_in(&out, tp, 1).unwrap_or(0);
+            let info = self.st.get(tp);
+            let bound = if v < 0 {
+                info.bound_hi.clone().unwrap_or(Type::Any)
+            } else {
+                info.bound_lo.clone().unwrap_or(Type::Nothing)
+            };
+            if bound.is_no_type() || bound.is_error() || mentions_tparam(&bound, &[tp]) {
+                continue;
+            }
+            out = crate::symbol::subst_tparams_slice(&[tp], &[bound], &out);
+        }
+        out
     }
 
     /// Variance of `tp`'s occurrences in `ty`, or `None` when it does not
@@ -6411,6 +6517,21 @@ impl Typer {
         if current.is_none() || owner.is_none() {
             return false;
         }
+        // nsc weighs the rule against every *enclosing* class, not only the
+        // innermost one: `new DDL { … self.createPhase1 … }` written inside
+        // `DDL` itself is in `DDL`'s template, so the prefix only has to be a
+        // `DDL`, not an instance of the anonymous class.
+        let mut c = current;
+        while !c.is_none() {
+            if self.st.get(c).is_class_like() && self.protected_ok_in(c, owner, prefix) {
+                return true;
+            }
+            c = self.st.get(c).owner;
+        }
+        false
+    }
+
+    fn protected_ok_in(&self, current: SymbolId, owner: SymbolId, prefix: Option<&Tree>) -> bool {
         let cur_ty = self.st.type_of_class(current);
         let own_ty = self.st.type_of_class(owner);
         if current != owner && !self.st.is_sub_type(&cur_ty, &own_ty) {
@@ -7250,6 +7371,12 @@ impl Typer {
         // `val l: List[Map[String, Int]] = f(Map.empty)` pins the `K` and `V`
         // that reached the result through `f`'s own `T`.
         self.solve_undet_result(tree, pt);
+        // The callee's own parameters that reached the result unsolved are
+        // undetermined too, not fixed types: `ConstArray.newBuilder()` is a
+        // `ConstArrayBuilder[?T]`, and the `+` applied to it is what says what
+        // `?T` is.
+        let own = self.undetermined_of(tree);
+        self.undet_tvars.extend(own);
         // A variable this call could not solve is still undetermined for the
         // call that encloses it: `take(id(Map.empty))` hands `Map[?K, ?V]`
         // outward, and it is the *outer* parameter that fixes it.
@@ -7528,7 +7655,7 @@ impl Typer {
             return;
         }
 
-        let recv_ty = match &fun.kind {
+        let mut recv_ty = match &fun.kind {
             TreeKind::Select { qual, .. } => Some(qual.ty.clone()),
             _ => None,
         };
@@ -7747,6 +7874,42 @@ impl Typer {
                     if a.ty.is_no_type() {
                         let pt_arg = self.open_to_bounds(&p, &open);
                         self.type_expr(a, &pt_arg);
+                    }
+                    // A *receiver* carries undetermined variables too:
+                    // `ConstArray.newBuilder()` is a `ConstArrayBuilder[?T]`,
+                    // and the argument of the call made on it (`b + from`) is
+                    // what fixes `?T`. nsc keeps them in `Context.undetparams`
+                    // until something does; without this the parameter stayed
+                    // a bare `T` and every `+` reported a mismatch.
+                    if !p.is_no_type() && !a.ty.is_no_type() && !a.ty.is_error() {
+                        let open_recv: Vec<SymbolId> = self
+                            .undet_tvars
+                            .iter()
+                            .copied()
+                            .filter(|tp| type_mentions_tparam(&p, *tp))
+                            .collect();
+                        let mut ids = Vec::new();
+                        let mut vals = Vec::new();
+                        for tp in open_recv {
+                            if let Some(t) = unify_one(tp, &p, &a.ty.widen_constant()) {
+                                if !t.is_no_type() && !t.is_error() && !type_mentions_tparam(&t, tp)
+                                {
+                                    ids.push(tp);
+                                    vals.push(t);
+                                }
+                            }
+                        }
+                        if !ids.is_empty() {
+                            p = crate::symbol::subst_tparams_slice(&ids, &vals, &p);
+                            param_tys = param_tys
+                                .iter()
+                                .map(|q| crate::symbol::subst_tparams_slice(&ids, &vals, q))
+                                .collect();
+                            ret = crate::symbol::subst_tparams_slice(&ids, &vals, &ret);
+                            recv_ty = recv_ty
+                                .map(|t| crate::symbol::subst_tparams_slice(&ids, &vals, &t));
+                            self.undet_tvars.retain(|tp| !ids.contains(tp));
+                        }
                     }
                     // The alternative is picked; the argument's own
                     // undetermined variables can be solved now. `take(Map
@@ -8240,7 +8403,7 @@ impl Typer {
                         }
                     }
                 }
-                tree.ty = leftover.unwrap_or(ret);
+                tree.ty = self.instantiate_leftover_tparams(sym, leftover.unwrap_or(ret), pt);
             }
             OverloadPick::Ambiguous => {
                 // An argument that already failed cannot pick an alternative;
@@ -13177,6 +13340,42 @@ impl Typer {
         self.resolve_type_name(name, args)
     }
 
+    /// An alias type member's right-hand side is written in its owner's
+    /// vocabulary. Seen from the class being checked it takes that class's own
+    /// arguments for the owner: inside `new SimpleFeatureNode[T] with …`,
+    /// `type Self = SimpleFeatureNode[T]` means *this* `T`, not the one
+    /// `SimpleFeatureNode` declares.
+    fn type_member_here(&self, id: SymbolId) -> Type {
+        let base = self.st.type_member_as_seen(id);
+        if matches!(base, Type::TypeMember(_)) {
+            return base;
+        }
+        let owner = self.st.get(id).owner;
+        let this = self.st.this_class;
+        if owner.is_none() || this.is_none() || owner == this {
+            return base;
+        }
+        if self.st.get(owner).tparams.is_empty() {
+            return base;
+        }
+        let this_ty = Type::Class {
+            sym: this,
+            args: self
+                .st
+                .get(this)
+                .tparams
+                .iter()
+                .map(|&t| Type::TypeParam(t))
+                .collect(),
+        };
+        match self.base_type_instance(&this_ty, owner, 0) {
+            Some(Type::Class { args, .. }) if !args.is_empty() => {
+                self.st.subst_tparams(owner, &args, &base)
+            }
+            _ => base,
+        }
+    }
+
     fn resolve_type_name(&self, name: &str, args: &[Type]) -> Type {
         match name {
             "Int" => Type::Int,
@@ -13217,7 +13416,7 @@ impl Typer {
                     match self.st.get(id).kind {
                         SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
                         SymKind::TypeParam => Type::TypeParam(id),
-                        SymKind::TypeMember => self.st.type_member_as_seen(id),
+                        SymKind::TypeMember => self.type_member_here(id),
                         _ => Type::Class {
                             sym: id,
                             args: args.to_vec(),

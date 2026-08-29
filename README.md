@@ -1072,6 +1072,98 @@ JDK から `Comparable` / `CharSequence` / `Serializable` を読んで親に足�
 - **`xs.toArray` の `ClassTag`**（slick `ProductResultConverter` の
   `(ClassTag[B])Any`）は上の `agent/ctoraccessor` の残件のままです。
 
+### 型メンバ・`this.type`・未確定変数の後始末（`type mismatch` 第 3 スライス）
+
+`agent/mismatch3` スライス。フィクスチャは `tests/fixtures/mism3*.scala`、テストは
+`crates/cli/tests/mismatch3.rs` です。8 つの原因を直しました。
+
+**1. 継承したメンバをスコープに入れる順序が線形化ではなかった**。
+`enter_inherited_members` は親を**深さ優先**で辿っていたので、*祖父母*の抽象宣言が
+その子クラスの具象宣言より先にスコープに入りました。
+
+```scala
+trait N { type Self >: this.type <: N; def self: Self }
+abstract class Base[T] extends N { type Self = Base[T] }
+trait Extra extends N
+new Base[T] with Extra { def self: Self = this }   // Self が N の抽象宣言に解決していた
+```
+
+親を**逆順（最後の mixin が先）に幅優先**で辿るようにしました。これは nsc の線形化で
+メンバが届く順序そのもので、直接の親については従来どおり「最後の mixin が勝つ」ままです。
+slick の `new SimpleFeatureNode[T] with SimpleFunction { … }` がこれでした。
+
+**2. エイリアス型メンバの右辺が as-seen-from されていなかった**。
+`type Self = Base3[T]` の `T` は `Base3` 自身の型パラメータなので、
+`Base3[String]` 越しに読めば `Base3[String]` でなければなりません。
+名前解決側（`Check::type_member_here`）と、レシーバ越しの展開
+（`SymbolTable::expand_in_type`）の両方で置換します。
+
+**3. どの引数も決められない型パラメータが型パラメータのまま残っていた**。
+`def dbAction[R, S <: NoStream, E <: Effect](f: Session => R): ProfileAction[R, S, E]` の
+`S` はどのパラメータ型にも出てこないので、nsc は `solvedTypes` で境界に確定させます
+（共変なら下界、反変なら上界）。こちらは `Act[Unit, S, Schema]` のまま報告していました。
+`instantiate_leftover_tparams` を足しました。**パラメータ型に現れる**型パラメータは
+対象外です（そちらは引数か implicit が決めるもので、潰すと診断が消えるため。
+`exptype_unsolved_bad` はそのまま落ちます）。期待型が無い呼び出し（レシーバ位置）も
+対象外で、そこは nsc の `Context.undetparams` と同じく後続の適用に委ねます。
+
+**4. `new C with T { … }` の次の行のブロックが引数になっていた**。nsc の
+`canApply` が無かったため、
+
+```scala
+def build(p: IndexedSeq[Node]): SimpleFeatureNode[T] = new SimpleFeatureNode[T] with SimpleFunction {
+  …
+}
+{ (paramsC: Seq[Rep[?]]) => … }      // これが上の無名クラスへの引数になっていた
+```
+
+となり、`build` がブロックの値として η 展開されて型が合いませんでした。
+`parse_simple_expr` が `new` の直後は `can_apply = false` にします（`.` と `[…]` を
+辿ったら真に戻すのも nsc と同じ）。
+
+**5. `this.type` が受け手の型引数を落としていた**。`def add(v: T): this.type` を
+`B[String]` に対して呼ぶと `B`（引数なし）になり、次の `add` のパラメータが裸の `T` に
+なっていました。`subst_as_seen_from` がメンバのシグネチャ中の `C.this.type` を
+レシーバそのものに置き換えます。self エイリアス（`trait T { self => }` の `self`）は
+**囲いのインスタンス**を指すので、そこは置き換えません。
+
+**6. レシーバが持ち越した未確定変数を、その呼び出しの引数が決められなかった**。
+`ConstArray.newBuilder()` は `ConstArrayBuilder[?T]` で、`b + from` の `from` が `?T` を
+決めます。呼び出しが結果に残した自分の型パラメータを `undet_tvars` に記録し、
+引数から解くようにしました（slick の `Comprehension.children` の `+` / `++` の塊）。
+
+**7. protected アクセスが一番内側のクラスしか見ていなかった**。
+
+```scala
+class DDL(val stmts: List[String]) { self =>
+  protected def phase: List[String] = stmts
+  def merge(other: DDL): DDL = new DDL(Nil) {
+    override protected def phase = self.phase ++ other.phase   // 「$anon から触れない」
+  }
+}
+```
+
+nsc は**囲いのクラスすべて**について規則を判定するので、`DDL` の本体に書かれている
+以上プレフィックスは `DDL` であれば足ります。`protected_subclass_ok` が owner を
+外向きに辿ります。あわせて backend の穴も 1 つ塞ぎました: self エイリアスの読み出しは
+`load_owner_instance` が「`this` が owner に適合するなら `this`」で止まるため、
+**owner のサブクラスでもある**無名クラスの中では `this` を読んでしまい、
+上の `self.phase` が自分のオーバーライドを呼んで無限再帰していました
+（`load_self_alias_instance` が `$outer` を同一性で辿ります）。
+
+**8. classpath の pickle が型引数と kind を捨てていた**。`unpickle` は `TYPEREFtpe` の
+型引数を読み飛ばし、クラスの型パラメータも名前だけでした。`Monad[F[_]]` を
+`-cp <ディレクトリ>` 越しに使うと `kinds of the type arguments (F) do not conform`、
+`c.as(1)` は `Any` になります。`PickledType` / `PickledTypeParam` を入れて、
+読み手（`classpath.rs`）が `Function1[A, B]` / `Tuple2[A, B]` / `Array[T]` を
+構造的な `Type` に戻せるようにしました。書き手側も、高階な型パラメータの
+`TYPEsym` に `POLYtpe` を書くようにしています（実 scalac 2.13.16 が
+`-cp` で読めることを確認済み）。jar のクラスはこの経路を通りません（後述）。
+
+計測（`tests/slick_measure.sh`、slick 184 ファイル、`-Xsource:3`）は
+**833 → 772**、`type mismatch` は **201 → 168**、エラーを含むファイルは
+**102 → 100** になりました。新たにエラーを出すようになったファイルはありません。
+
 ## 実装していないもの
 
 次は実装していません。スタブで「動いたことにする」こともしていません。言語側の残りとライブラリ側の残りを分けます。
@@ -1823,6 +1915,22 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 作り変えない）ことは `mism2_bad.scala`（`Act[Int, …]` を `Act[String, …]` に渡す）で
 固定しています。
 
+| `mism3.scala` | 抽象型メンバとエイリアス、どの引数も決められない型パラメータ、`this.type`、引数ではないブロック、内側の無名クラスからの protected アクセス（library dual-run のみ）：線形化で「継承した抽象宣言」より「具象エイリアス」が勝つこと、エイリアスの右辺がプレフィックス側の型引数で読めること、パラメータ型に出てこない型パラメータが下界（反変なら上界）に確定すること、`new C with T { … }` の次行のブロックが別の文であること、`this.type` が受け手の型引数を保つこと、レシーバが持ち越した未確定変数をその呼び出しの引数が決めること、self エイリアスが囲いのインスタンスを指すこと | `n` `4` `1` `List(x, y)` `f2` `List(a, b)` |
+
+`mism3.scala` は `crates/cli/tests/mismatch3.rs` から回します。同ファイルには最小形の
+受理テスト（`an_alias_overrides_the_abstract_member_it_inherits_twice` /
+`an_alias_type_member_is_read_through_its_prefix` /
+`a_parameter_no_argument_mentions_is_instantiated_to_its_bound` /
+`a_block_after_an_anonymous_class_is_not_an_argument` /
+`this_type_keeps_the_receivers_arguments` /
+`protected_access_counts_the_enclosing_class` /
+`a_classpath_pickle_carries_kinds_and_type_arguments`）も置いてあります。最後の 1 本は
+**2 段コンパイル**（ライブラリを別ディレクトリに出してから `-cp` で使う）で、
+`ScalaSignature` pickle 越しに高階型パラメータの kind と型引数が渡ることを見ます。
+逆に、緩めた規則が診断を飲み込まないことは `mism3_bad.scala`
+（定義側の外から protected メンバを別インスタンス経由で触る／`this.type` を
+別の型引数の同名クラスに渡す）で固定しています。どちらも実 scalac 2.13.16 も拒否します。
+
 | `tyvar.scala` | 未確定の型変数（nsc の undetermined type variables）。引数位置の `Map.empty` / `Vector.empty` / `Set.empty` / `List.empty` / `Nil` / `Seq.empty`、空の `apply`（`Map()` / `Vector()` / `List()`）、入れ子の呼び出しから漏れる変数（`take(id(Map.empty))`）、期待型が結果型の変数を決める形（`val l: List[Map[String, Int]] = f(Map.empty)`）、可変長引数・by-name・デフォルト引数の位置、複数引数・複数節、オーバーロード選択、コンストラクタ引数、そして逆向きの「呼び先自身の未確定な型パラメータ」（`xs.collect { case … }`）（library dual-run のみ） | `0`×9 `List(Map())` `2` `0`×3 `1` `2` `0` `0` `List(2, 4)` `List(2, 3, 4, 5)` `Some(6)` |
 
 `tyvar.scala` は `crates/cli/tests/tyvar.rs` から回します。同ファイルには最小形の
@@ -1875,6 +1983,37 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
   バグの原因になっていた）を**削除**しました。
   `agent/ovl2` スライス（オーバーロードの候補集合）でさらに **1059 → 903**、
   エラーを含むファイルは 105 → 104 になりました。
+  `agent/mismatch3` スライスで **833 → 772**（`type mismatch` は 201 → 168、
+  エラーを含むファイルは 102 → 100、新たにエラーを出すようになったファイルは
+  ありません）。原因は 8 つで、`type mismatch` そのものより「その手前で落ちていた
+  カスケード」の方が多く消えました。残る 168 件の機械分類は、単発 46、
+  「`found` が裸の型パラメータ」36（うち `F` は cats の HK シグネチャ、後述）、
+  「自己型ごしの型メンバ／`ProfileAction`」25、「同じクラスで型引数だけ違う」21、
+  「タプルの成分が解けない」11、「コレクションの結果型が広がる」11、
+  「`found` と `required` が同じ字面」8、「`Some`/`Failure` の要素型」6、
+  「`type Self >: this.type` に `this` が適合しない」4 です。
+
+- **jar のクラスは `ScalaSignature` ではなく JVM の generic signature から読んでいる**。
+  `-cp` に**ディレクトリ**を渡したときだけ pickle を読み（`load_classpath` は jar の中を
+  歩かない）、jar のクラスは `install_java_class` が classfile の `Signature` 属性から
+  作ります。JVM の signature は高階型の適用を書けないので、cats の
+  `def pure[A](a: A): F[A]` は `<A:Ljava/lang/Object;>(TA;)TF;` として届き、
+  `F.pure(v)` が `found: F  required: F[R]` になります。slick で最もエラーの多い
+  `BasicBackend.scala`（54 件）と `ConcurrencyControl.scala`（16 件）はまるごとこれで、
+  残る `type mismatch` の「裸の型パラメータ」36 件の大半を占めます。直すなら
+  `crates/pickle`（すでにフル機能の unpickler）を jar のクラスにも使うことになります。
+
+- **`p.State` のような依存メソッド型が置換されない**。`def get[P <: Phase](p: P): Option[p.State]`
+  の結果は `Option[Phase.State]` のまま届き、`state.get(Phase.assignUniqueSymbols)
+  .map(_.aggregate).getOrElse(true)` が `found: Any  required: Boolean` になります
+  （4 件）。`Type` にプレフィックス付きの型メンバ（`p.State`）を表す変種が無いのが原因。
+
+- **`type Self >: this.type <: Node` に `this` が適合しない**（4 件）。下界が
+  `C.this.type` の抽象型メンバに対する適合規則（`X <: lo ⇒ X <: Self`）が無く、
+  `val n: Self = if(…) this else rebuild(…)` が
+  `found: BinaryNode  required: Node.Self` になります。`this` の型が
+  `ThisType` ではなく素のクラス型なので、素直に入れると
+  「別の `Node` を `Self` に渡す」まで通ってしまうのが難所です。
 
 - **`Map[K, V]` を `Iterable[T]` に渡したとき `T` が解けない**。適合判定ではなく推論の
   穴で、`def h[T](xs: Iterable[T]) = xs.size` に `Map[String, Int]` を渡すだけで

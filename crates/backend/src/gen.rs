@@ -1302,6 +1302,58 @@ fn load_owner_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
     }
 }
 
+/// A template's self alias denotes *that* template's own `this`. A class
+/// written inside it may also be a *subclass* of it, and then `this` conforms
+/// to the alias's class while being the wrong object: in slick's
+/// `def ++(other: DDL) = new DDL { … self.createPhase1 … }` the alias means the
+/// enclosing `DDL`, so reading it off `this` called the override back and
+/// looped. Walk out to the class that owns the alias by identity, not by
+/// conformance.
+fn load_self_alias_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
+    if ctx.class_sym == owner || !outer_chain_reaches_exactly(ctx.st, ctx.class_sym, owner) {
+        load_owner_instance(asm, ctx, owner);
+        return;
+    }
+    load_this(asm, ctx);
+    let mut cur = ctx.class_sym;
+    let mut held = ctx.class_sym;
+    while cur != owner {
+        let Some(o) = enclosing_instance(ctx.st, cur) else {
+            break;
+        };
+        let f = outer_field_class(ctx.st, cur).unwrap_or(o);
+        asm.getfield(
+            &class_internal(ctx.st, cur),
+            "$outer",
+            &format!("L{};", class_internal(ctx.st, f)),
+        );
+        cur = o;
+        held = f;
+    }
+    if !is_owner_compatible(ctx.st, held, owner) {
+        let kind = ctx.st.get(owner).kind;
+        if matches!(kind, SymKind::Class | SymKind::ModuleClass) || is_interface_sym(ctx.st, owner)
+        {
+            asm.checkcast(&class_internal(ctx.st, owner));
+        }
+    }
+}
+
+/// `outer_chain_reaches` by identity: the `$outer` chain actually arrives at
+/// `owner` itself, not merely at something that conforms to it.
+fn outer_chain_reaches_exactly(st: &SymbolTable, from: SymbolId, owner: SymbolId) -> bool {
+    let mut cur = from;
+    loop {
+        if cur == owner {
+            return true;
+        }
+        let Some(o) = enclosing_instance(st, cur) else {
+            return false;
+        };
+        cur = o;
+    }
+}
+
 /// True when `load_owner_instance` can actually reach `owner` — either `this`
 /// or some link of the `$outer` chain conforms to it. When it cannot, the
 /// caller must look for an enclosing object instead of emitting a cast that
@@ -5157,7 +5209,7 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
             // is the *outer* instance, not this one, so it has to be reached
             // through `$outer` like any other enclosing-instance reference.
             if ctx.st.get(owner).self_alias == Some(id) {
-                load_owner_instance(asm, ctx, owner);
+                load_self_alias_instance(asm, ctx, owner);
                 if let Some(cls) = ctx.st.class_sym_of(&sym.ty) {
                     if !is_owner_compatible(ctx.st, owner, cls)
                         && (matches!(ctx.st.get(cls).kind, SymKind::Class | SymKind::ModuleClass)

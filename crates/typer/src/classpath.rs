@@ -2,7 +2,7 @@
 
 use scala_rs_parser::{Flags, SymbolId, Type};
 
-use crate::check::ClasspathClass;
+use crate::check::{ClasspathClass, ClasspathType, ClasspathTypeParam};
 use crate::symbol::{SymKind, SymbolTable};
 
 pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
@@ -152,24 +152,45 @@ fn has_member(st: &SymbolTable, owner: SymbolId, name: &str) -> bool {
         .any(|&id| matches!(st.get(id).kind, SymKind::Method | SymKind::Term))
 }
 
-fn install_tparams(st: &mut SymbolTable, owner: SymbolId, names: &[String]) {
-    if names.is_empty() || !st.get(owner).tparams.is_empty() {
+fn install_tparams(st: &mut SymbolTable, owner: SymbolId, tps: &[ClasspathTypeParam]) {
+    if tps.is_empty() || !st.get(owner).tparams.is_empty() {
         return;
     }
+    let ids = alloc_tparams(st, owner, tps);
+    st.get_mut(owner).tparams = ids;
+}
+
+/// Allocate type parameter symbols, keeping each one's own parameters. Without
+/// them a `F[_]` read from a classfile looked like a proper type and every
+/// `Applicative[F]` failed the kind check.
+fn alloc_tparams(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    tps: &[ClasspathTypeParam],
+) -> Vec<SymbolId> {
     let mut ids = Vec::new();
-    for n in names {
-        let id = st.alloc(n, owner, SymKind::TypeParam, Flags::EMPTY, "");
+    for tp in tps {
+        let id = st.alloc(&tp.name, owner, SymKind::TypeParam, Flags::EMPTY, "");
         st.get_mut(id).ty = Type::TypeParam(id);
+        if !tp.tparams.is_empty() {
+            let nested = alloc_tparams(st, id, &tp.tparams);
+            st.get_mut(id).tparams = nested;
+        }
         ids.push(id);
     }
-    st.get_mut(owner).tparams = ids;
+    ids
 }
 
 fn install_java_tparams(st: &mut SymbolTable, owner: SymbolId, params: &[crate::javasign::JParam]) {
     if params.is_empty() || !st.get(owner).tparams.is_empty() {
         return;
     }
-    let names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+    // A JVM generic signature cannot express a higher kind, so these are all
+    // proper types.
+    let names: Vec<ClasspathTypeParam> = params
+        .iter()
+        .map(|p| ClasspathTypeParam::simple(p.name.clone()))
+        .collect();
     install_tparams(st, owner, &names);
     let env = tparam_env(st, owner);
     let ids = st.get(owner).tparams.clone();
@@ -218,15 +239,29 @@ fn install_ctor(st: &mut SymbolTable, owner: SymbolId, m: &crate::check::Classpa
         "<init>",
         m.param_names.clone(),
         m.param_types.clone(),
-        "Unit".into(),
+        ClasspathType::simple("Unit"),
         Vec::new(),
     );
 }
 
-fn resolve_type_in(st: &SymbolTable, owner: SymbolId, name: &str, method_tps: &[SymbolId]) -> Type {
+fn resolve_type_in(
+    st: &SymbolTable,
+    owner: SymbolId,
+    ty: &ClasspathType,
+    method_tps: &[SymbolId],
+) -> Type {
+    let args: Vec<Type> = ty
+        .args
+        .iter()
+        .map(|a| resolve_type_in(st, owner, a, method_tps))
+        .collect();
+    let name = ty.name.as_str();
+    if name == "_" {
+        return Type::Wildcard;
+    }
     for id in method_tps.iter().chain(st.get(owner).tparams.iter()) {
         if st.get(*id).name == name {
-            return Type::TypeParam(*id);
+            return apply_args(Type::TypeParam(*id), args);
         }
     }
     let mut cur = owner;
@@ -238,16 +273,25 @@ fn resolve_type_in(st: &SymbolTable, owner: SymbolId, name: &str, method_tps: &[
             .find(|&s| st.get(s).is_class_like())
         {
             return match st.get(id).kind {
-                SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
-                _ => Type::Class {
-                    sym: id,
-                    args: vec![],
-                },
+                SymKind::Module | SymKind::ModuleClass => apply_args(Type::ModuleRef(id), args),
+                _ => Type::Class { sym: id, args },
             };
         }
         cur = st.get(cur).owner;
     }
-    resolve_type_name(st, name)
+    resolve_type_name_args(st, name, args)
+}
+
+/// Apply type arguments to a constructor that is not a class symbol. A bare
+/// constructor stays as it is.
+fn apply_args(ctor: Type, args: Vec<Type>) -> Type {
+    if args.is_empty() {
+        return ctor;
+    }
+    Type::Applied {
+        ctor: Box::new(ctor),
+        args,
+    }
 }
 
 fn add_method(
@@ -255,9 +299,9 @@ fn add_method(
     owner: SymbolId,
     name: &str,
     param_names: Vec<String>,
-    param_type_names: Vec<String>,
-    ret_name: String,
-    tparams: Vec<String>,
+    param_type_names: Vec<ClasspathType>,
+    ret_name: ClasspathType,
+    tparams: Vec<ClasspathTypeParam>,
 ) -> SymbolId {
     let flags = if name.contains("$default$") {
         Flags::SYNTHETIC
@@ -267,12 +311,7 @@ fn add_method(
         Flags::EMPTY
     };
     let id = st.alloc(name, owner, SymKind::Method, flags, "");
-    let mut tp_ids = Vec::new();
-    for n in &tparams {
-        let t = st.alloc(n, id, SymKind::TypeParam, Flags::EMPTY, "");
-        st.get_mut(t).ty = Type::TypeParam(t);
-        tp_ids.push(t);
-    }
+    let tp_ids = alloc_tparams(st, id, &tparams);
     st.get_mut(id).tparams = tp_ids.clone();
     let params: Vec<Type> = param_type_names
         .iter()
@@ -473,6 +512,48 @@ pub fn parse_default_getter(name: &str) -> Option<(String, usize)> {
 }
 
 fn resolve_type_name(st: &SymbolTable, name: &str) -> Type {
+    resolve_type_name_args(st, name, Vec::new())
+}
+
+fn resolve_type_name_args(st: &SymbolTable, name: &str, args: Vec<Type>) -> Type {
+    // `FunctionN` / `TupleN` are structural in our `Type`, so they only become
+    // themselves once their arguments are known.
+    if let Some(n) = name.strip_prefix("Function") {
+        if n.parse::<usize>().is_ok() && !args.is_empty() {
+            let mut args = args;
+            let ret = args.pop().unwrap_or(Type::Any);
+            return Type::Function {
+                params: args,
+                ret: Box::new(ret),
+            };
+        }
+    }
+    if let Some(n) = name.strip_prefix("Tuple") {
+        if n.parse::<usize>().is_ok() && args.len() > 1 {
+            return Type::Tuple(args);
+        }
+    }
+    if name == "Array" && args.len() == 1 {
+        return Type::Array(Box::new(args.into_iter().next().unwrap_or(Type::Any)));
+    }
+    if name == "<byname>" && args.len() == 1 {
+        return Type::ByName(Box::new(args.into_iter().next().unwrap_or(Type::Any)));
+    }
+    if name == "<repeated>" && args.len() == 1 {
+        return Type::Repeated(Box::new(args.into_iter().next().unwrap_or(Type::Any)));
+    }
+    match resolve_bare_type_name(st, name) {
+        Type::Class { sym, args: old } if old.is_empty() && !args.is_empty() => {
+            Type::Class { sym, args }
+        }
+        Type::Named { name, args: old } if old.is_empty() && !args.is_empty() => {
+            Type::Named { name, args }
+        }
+        t => t,
+    }
+}
+
+fn resolve_bare_type_name(st: &SymbolTable, name: &str) -> Type {
     match name {
         "Unit" | "V" => Type::Unit,
         "Boolean" | "Z" => Type::Boolean,
