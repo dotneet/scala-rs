@@ -698,6 +698,10 @@ fn add_scala_aliases(st: &mut SymbolTable, library_abi: bool) {
     crate::prelude_impl2::install(st, library_abi);
     // `Map[K, V] <: K => V`。階層表のあとに張る。
     crate::prelude_mism4::install(st);
+    // `case Seq(a, b)` / `case Array(a, b)`。companion が揃ってから足す。
+    crate::prelude_seqpat::install(st);
+    // `StringOps.map[B](Char => B): IndexedSeq[B]`（`IndexedSeq` が揃ってから）。
+    crate::prelude_strmap::install(st, library_abi);
     // `Coll.empty` は最後にまとめて多相化する（すべての companion が揃ってから）。
     crate::prelude_empty::install(st);
 }
