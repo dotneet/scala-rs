@@ -107,6 +107,12 @@ pub struct Typer {
     /// Set while `type_apply` types the `new C` of a `new C(…)`: that shape
     /// already has an argument list, so the `New` arm must not add one.
     new_is_applied: bool,
+    /// Set while a call's arguments are typed with *no* expected type, before
+    /// the alternative is picked. An argument that is still a method with an
+    /// all-implicit clause must not resolve that clause here: nothing has said
+    /// yet what the callee's type parameters are, and `take(empty)` would pick
+    /// the one witness in scope instead of the one the parameter asks for.
+    typing_call_args: bool,
     /// Set while the arguments of a *parent* constructor call are being
     /// searched for. nsc types those in the constructor's own context, where
     /// `this` does not exist yet, so the class's own and inherited members are
@@ -225,6 +231,11 @@ pub struct Typer {
     /// The first expansion cut off as diverging during the current top-level
     /// implicit search, for the diagnostic.
     pub(crate) diverged_implicit: std::cell::RefCell<Option<(SymbolId, Type)>>,
+    /// What the last `fill_defaults_and_implicits` pinned down by implicit
+    /// search alone: `mk(s)` on `def mk[T: TT](s: String): Seq[Int] => Rep[T]`
+    /// has no value argument mentioning `T`, so only the witness fixes it, and
+    /// the caller has to put that solution into the result type as well.
+    implicit_undet_solved: Vec<(SymbolId, Type)>,
 }
 
 /// Highest `TupleN` scala-library defines.
@@ -372,6 +383,7 @@ impl Typer {
             sig_done: std::collections::HashSet::new(),
             parent_fill_done: std::collections::HashSet::new(),
             new_is_applied: false,
+            typing_call_args: false,
             parent_ctor_scope: false,
             fatal_warnings: opts.fatal_warnings,
             library_abi: opts.library_abi,
@@ -403,6 +415,7 @@ impl Typer {
             pending_defaults: Vec::new(),
             open_implicits: std::cell::RefCell::new(Vec::new()),
             diverged_implicit: std::cell::RefCell::new(None),
+            implicit_undet_solved: Vec::new(),
         }
     }
 
@@ -3183,6 +3196,18 @@ impl Typer {
         let Some(mut rhs) = self.st.get(param).default_rhs.clone() else {
             return;
         };
+        // A repeated parameter's default is a *value*, not an argument list:
+        // `case class C(xs: T*)` gives `copy(xs: T* = this.xs)`, and `this.xs`
+        // is the `Seq[T]` the field holds. Checking it against `T*` reported a
+        // mismatch on a tree nsc never even writes down.
+        let seq_ret;
+        let ret = match ret {
+            Type::Repeated(elem) => {
+                seq_ret = self.seq_of(elem).unwrap_or_else(|| ret.clone());
+                &seq_ret
+            }
+            _ => ret,
+        };
         self.st.push_scope();
         for tp in tparams {
             let n = self.st.get(*tp).name.clone();
@@ -5132,6 +5157,20 @@ impl Typer {
             found = self.st.lookup_member(self.st.root, &name);
         }
         if found.is_empty() {
+            // A tree that already resolved keeps its symbol. The typer types
+            // some applications twice -- `retry_tupled_args` re-runs a call
+            // whose implicit arguments the first pass already filled in -- and
+            // a synthesized implicit reference (`ScalaBaseType.intType`,
+            // `<:<.refl`) names a companion member that was never in lexical
+            // scope. Re-resolving it by name would report `not found: value
+            // intType` for a reference the search had already settled.
+            if !tree.sym.is_none()
+                && self.st.get(tree.sym).name == name
+                && !tree.ty.is_error()
+                && !tree.ty.is_no_type()
+            {
+                return;
+            }
             self.not_found_error(tree.span, "value", &name);
             tree.ty = Type::Error;
             return;
@@ -5326,17 +5365,21 @@ impl Typer {
             return Vec::new();
         }
         // A residual method type is not a value yet; its own clauses are what
-        // is missing, not an instantiation (`Array.empty` is still
-        // `(ClassTag[T])Array[T]`).
-        if matches!(a.ty, Type::Method { .. } | Type::Overload(_)) {
-            return Vec::new();
-        }
+        // is missing, not an instantiation. The exception is a clause that is
+        // *all implicit*: `Array.empty` is `(ClassTag[T])Array[T]`, and the
+        // parameter it fills is the only thing that can say what `T` is, so
+        // `T` is undetermined here exactly as `Map.empty`'s `K`/`V` are.
+        let value_ty = match self.implicit_only_result(a) {
+            Some(ret) => ret,
+            None if matches!(a.ty, Type::Method { .. } | Type::Overload(_)) => return Vec::new(),
+            None => a.ty.clone(),
+        };
         self.st
             .get(a.sym)
             .tparams
             .iter()
             .copied()
-            .filter(|tp| type_mentions_tparam(&a.ty, *tp) && !self.tparam_in_scope(*tp))
+            .filter(|tp| type_mentions_tparam(&value_ty, *tp) && !self.tparam_in_scope(*tp))
             .collect()
     }
 
@@ -5680,6 +5723,28 @@ impl Typer {
         !matches!(&self.st.get(id).ty, Type::Method { .. }) || self.is_nullary_method_sym(id)
     }
 
+    /// The result of an argument that is still a method whose only remaining
+    /// clause is implicit (`Array.empty` is `(ClassTag[T])Array[T]` until the
+    /// expected type says what `T` is). `None` for anything else, including a
+    /// method value that is genuinely being eta-expanded.
+    fn implicit_only_result(&self, tree: &Tree) -> Option<Type> {
+        let Type::Method { paramss, ret } = &tree.ty else {
+            return None;
+        };
+        if paramss.len() != 1 || paramss[0].is_empty() || tree.sym.is_none() {
+            return None;
+        }
+        let first = self.st.get(tree.sym).paramss.first().cloned()?;
+        if first.len() != paramss[0].len()
+            || !first
+                .iter()
+                .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
+        {
+            return None;
+        }
+        Some((**ret).clone())
+    }
+
     /// `implicitly[Int]` is a TypeApply of a method whose remaining clause is
     /// implicit; rewrite to an Apply filled from implicit search.
     fn adapt_implicit_apply(&mut self, tree: &mut Tree, pt: &Type) {
@@ -5716,11 +5781,39 @@ impl Typer {
         {
             return;
         }
+        // An argument being typed before the alternative is picked: leave the
+        // clause alone. The parameter it fills is what says what the
+        // undetermined parameters are, and this pass has no expected type at
+        // all -- committing here picks a witness for `take(empty)` rather than
+        // reporting the one the parameter really asks for.
+        if self.typing_call_args && !undet.is_empty() && pt.is_no_type() {
+            return;
+        }
         let span = tree.span;
         let ret = match &tree.ty {
             Type::Method { ret, .. } => (**ret).clone(),
             _ => return,
         };
+        // The expected type pins the parameters the implicit search would
+        // otherwise have to guess: `take(Array.empty)` on
+        // `take(a: Array[String])` is `T = String`, so the search is for
+        // `ClassTag[String]` and not for an arbitrary `ClassTag[T]`.
+        let from_pt: Vec<(SymbolId, Type)> = self
+            .add_expected_constraints_in(tree.sym, &ret, pt, Vec::new(), true)
+            .into_iter()
+            .filter(|(_, t)| !t.is_no_type() && !t.is_error() && !matches!(t, Type::TypeParam(_)))
+            .collect();
+        let (ret, tree_ty) = if from_pt.is_empty() {
+            (ret, tree.ty.clone())
+        } else {
+            let ids: Vec<SymbolId> = from_pt.iter().map(|(i, _)| *i).collect();
+            let ts: Vec<Type> = from_pt.iter().map(|(_, t)| t.clone()).collect();
+            (
+                crate::symbol::subst_tparams_slice(&ids, &ts, &ret),
+                crate::symbol::subst_tparams_slice(&ids, &ts, &tree.ty),
+            )
+        };
+        tree.ty = tree_ty;
         let tys: Vec<Type> = first
             .iter()
             .map(|id| match &tree.ty {
@@ -5734,7 +5827,12 @@ impl Typer {
             .collect();
         // With undetermined parameters, commit only when the witness really
         // pins every one of them down. Otherwise leave the tree alone: a
-        // `show[Int]` still has its `TypeApply` coming.
+        // `show[Int]` still has its `TypeApply` coming. A parameter the
+        // expected type has already fixed is no longer one of them.
+        let undet: Vec<SymbolId> = undet
+            .into_iter()
+            .filter(|tp| tys.iter().any(|t| type_mentions_tparam(t, *tp)))
+            .collect();
         let mut solved: Vec<(SymbolId, Type)> = Vec::new();
         let mut tys = tys;
         let mut ret = ret;
@@ -6147,6 +6245,18 @@ impl Typer {
                 {
                     tree.sym = id;
                 }
+            }
+        }
+        // A function value's `apply` is the function itself. The prelude's
+        // `FunctionN.apply` is declared over erased parameters, so selecting it
+        // through a `Type::Function` receiver produced `(Any)Any` and
+        // `f.apply(xs)` came out as `Any` where `f(xs)` was exact.
+        if name == "apply" {
+            if let Type::Function { params, ret } = &recv_ty {
+                tree.ty = Type::Method {
+                    paramss: vec![params.clone()],
+                    ret: ret.clone(),
+                };
             }
         }
     }
@@ -7263,6 +7373,15 @@ impl Typer {
     }
 
     fn type_apply_in(&mut self, tree: &mut Tree, pt: &Type) {
+        // An application the typer already resolved once carries the implicit
+        // arguments and defaults that pass filled in. Resolving it again -- a
+        // tupled retry re-types the arguments it repacked, and each of them may
+        // be an application of its own -- has to start from what the user
+        // wrote, or the callee is weighed against an argument list that
+        // includes its own implicits.
+        if let TreeKind::Apply { args, .. } = &mut tree.kind {
+            args.retain(|a| !a.id.is_filled_arg());
+        }
         if self.try_rewrite_case_copy(tree, pt) {
             return;
         }
@@ -7537,6 +7656,7 @@ impl Typer {
         // Type non-lambda args first so overload resolution has info; lambdas
         // wait for an expected Function type (for-comprehension desugaring).
         let mut arg_tys = Vec::new();
+        let saved_taking_args = std::mem::replace(&mut self.typing_call_args, true);
         for a in args.iter_mut() {
             if let TreeKind::Function { vparams, .. } = &a.kind {
                 if is_annotated_lambda(a) {
@@ -7550,9 +7670,14 @@ impl Typer {
                 });
             } else {
                 self.type_expr(a, &Type::NoType);
-                arg_tys.push(a.ty.clone());
+                // `take(Array.empty)`: with no expected type the argument keeps
+                // its residual implicit clause, `(ClassTag[T])Array[T]`. What
+                // the callee sees is the *result*; the clause is filled once
+                // the parameter has told it what `T` is.
+                arg_tys.push(self.implicit_only_result(a).unwrap_or_else(|| a.ty.clone()));
             }
         }
+        self.typing_call_args = saved_taking_args;
         // What the arguments left undetermined. Typing them with no expected
         // type is what makes overload resolution possible, and it is also what
         // leaves `Map.empty` as `Map[K, V]`; those parameters are this call's
@@ -7773,6 +7898,13 @@ impl Typer {
                         let p_check = self
                             .solve_open_from_arg(&a.ty, &p, &open)
                             .unwrap_or_else(|| self.open_to_bounds(&p, &open));
+                        // Now that the parameter is known, an argument that
+                        // still carries an all-implicit clause can have it
+                        // filled: `take(Array.empty)` searches
+                        // `ClassTag[String]`, not `ClassTag[T]`.
+                        if self.implicit_only_result(a).is_some() {
+                            self.adapt_implicit_apply(a, &p_check);
+                        }
                         self.adapt(a, &p_check);
                     }
                     if let TreeKind::Function { body, .. } = &a.kind {
@@ -7972,6 +8104,12 @@ impl Typer {
                 }
                 let leftover =
                     self.fill_defaults_and_implicits(tree.span, args, &param_tys, fun, pt);
+                if !self.implicit_undet_solved.is_empty() {
+                    let sol = std::mem::take(&mut self.implicit_undet_solved);
+                    let ids: Vec<SymbolId> = sol.iter().map(|(i, _)| *i).collect();
+                    let ts: Vec<Type> = sol.iter().map(|(_, t)| t.clone()).collect();
+                    ret = crate::symbol::subst_tparams_slice(&ids, &ts, &ret);
+                }
                 let method_name = if !sym.is_none() {
                     self.st.get(sym).name.clone()
                 } else {
@@ -9364,6 +9502,7 @@ impl Typer {
         } else {
             return None;
         };
+        self.implicit_undet_solved.clear();
         let first = paramss_ids.first().cloned().unwrap_or_default();
         // A repeated parameter accepts zero arguments (`count()`), so a call
         // that stops right before it is not short at all. Only this clause is
@@ -9435,6 +9574,7 @@ impl Typer {
                         .collect()
                 };
                 let rest_tys = self.instantiate_from_call(sym, &first, args, rest_tys);
+                let rest_tys = self.solve_implicit_only_tparams(sym, rest_tys);
                 self.fill_implicit_params(span, args, &rest_tys, &rest_ids);
                 return None;
             }
@@ -9472,6 +9612,39 @@ impl Typer {
             });
         }
         None
+    }
+
+    /// nsc's undetermined type parameters, for a call whose value arguments
+    /// left some of the callee's parameters open: `mk(s)` on
+    /// `def mk[T: TT](s: String): Seq[Int] => Rep[T]` mentions `T` only in the
+    /// implicit clause, so the witness is the only thing that can pin it down
+    /// (`SimpleFunction.nullary` in slick relies on it). Solve them from the
+    /// implicit parameter types and substitute; when the search cannot settle
+    /// every one of them, leave the types as they were and let the ordinary
+    /// "could not find implicit value" diagnostic describe what happened.
+    fn solve_implicit_only_tparams(&mut self, sym: SymbolId, rest_tys: Vec<Type>) -> Vec<Type> {
+        let undet: Vec<SymbolId> = self
+            .st
+            .get(sym)
+            .tparams
+            .iter()
+            .copied()
+            .filter(|tp| rest_tys.iter().any(|t| type_mentions_tparam(t, *tp)))
+            .collect();
+        if undet.is_empty() {
+            return rest_tys;
+        }
+        let Some(sol) = self.undet_solution(&rest_tys, &undet) else {
+            return rest_tys;
+        };
+        let ids: Vec<SymbolId> = sol.iter().map(|(i, _)| *i).collect();
+        let ts: Vec<Type> = sol.iter().map(|(_, t)| t.clone()).collect();
+        let out = rest_tys
+            .iter()
+            .map(|t| crate::symbol::subst_tparams_slice(&ids, &ts, t))
+            .collect();
+        self.implicit_undet_solved = sol;
+        out
     }
 
     fn instantiate_from_call(
@@ -9692,6 +9865,22 @@ impl Typer {
     }
 
     fn fill_implicit_params(
+        &mut self,
+        span: Span,
+        args: &mut Vec<Tree>,
+        param_tys: &[Type],
+        rest: &[SymbolId],
+    ) {
+        let filled_from = args.len();
+        self.fill_implicit_params_in(span, args, param_tys, rest);
+        // Mark what this pass added, so a re-typing of the same application
+        // (`retry_tupled_args`) starts from the arguments the user wrote.
+        for a in args[filled_from..].iter_mut() {
+            a.id = NodeId::FILLED_ARG;
+        }
+    }
+
+    fn fill_implicit_params_in(
         &mut self,
         span: Span,
         args: &mut Vec<Tree>,

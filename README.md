@@ -303,6 +303,50 @@ specificity は nsc の `isAsSpecific` に寄せて、候補の型パラメー�
 
 同じ目標型に対して subtype 関係にある implicit が二つあるとき（`A` と `B extends A` を両方 `A` として探す）、より specific な `B` が勝ちます。同じ型が二つなら、これまでどおり曖昧です。定義クラスの origin も nsc と同じで、子クラスに定義した implicit は親の implicit より origin が specific です。親の more-specific な implicit と、子の less-specific な local が両方マッチすると、型と origin が食い違って **ambiguous** です。逆（親が less-specific、子が more-specific）は子が勝ちます。
 
+`implicit object X` は候補としては**一つ**です。module symbol と module class の両方が
+`IMPLICIT` を持ち、型も同じなので、そのままだと自分自身と `ambiguous implicit` になっていました
+（slick の `implicit object GetString extends GetResult[String]`）。module class は落とします。
+
+#### 一度埋めた implicit 引数を持つ呼び出しの再型付け
+
+typer は同じ application を二度型付けすることがあります（nsc のタプル適応にあたる
+`retry_tupled_args` は、引数を一つのタプルに詰め直してから呼び出しを型付けし直す）。
+一度目のパスが埋めた implicit 引数は argument list に残っているので、二度目のパスは
+それを「ユーザーが書いた引数」として数えてしまい、`LiteralNode(1)` が
+`not found: value intType`（companion の implicit をレキシカルスコープで引き直そうとした）や
+`no matching overload …(1, ScalaNumericType[Int])` になっていました。
+typer が自分で足した引数には `NodeId::FILLED_ARG` を付け、再解決の前に落とします。
+
+#### 引数位置の残余 implicit 節
+
+`take(a: Array[String])` に `Array.empty` を渡すと、引数は期待型なしで型付けされるので
+`(ClassTag[T])Array[T]` というメソッド型のまま届きます。オーバーロード解決にはその**結果型**
+`Array[T]` を見せ（`T` は nsc の未決定型変数として扱う）、パラメータ型が決まってから
+implicit 節を埋めます。埋める witness は**パラメータ型が要求するもの**で、スコープにある
+唯一の implicit ではありません（`take(empty)` で `Tag[Int]` しか無ければ
+`could not find implicit value of type Tag[String]`）。
+
+#### implicit 探索だけが決められる型パラメータ
+
+`def mk[T: TT](s: String): Seq[Int] => Rep[T]` の `T` は値引数のどこにも現れないので、
+witness を見つける探索そのものが決めるしかありません（slick の `SimpleFunction.nullary`）。
+第二節が全部 implicit の呼び出しでは、値引数から解けなかった型パラメータを implicit
+パラメータ型から解き、結果型にも反映します。
+
+#### prelude の穴
+
+- `scala.math.Numeric[T]` は `scala.math.Ordering[T]` を継承します（実 ABI の
+  `interface scala.math.Numeric<T> extends scala.math.Ordering<T>`）。prelude は
+  `sum` / `product` 用に `Numeric` を合成するだけでこの親を張っておらず、
+  `Numeric[T]` を `Ordering[T]` の位置に渡せませんでした（slick の
+  `ScalaNumericType[T] extends ScalaBaseType[T]()(tag, numeric)`）。
+  `crates/typer/src/prelude_numhier.rs`。
+- 関数値の `apply` は関数そのものです。prelude の `FunctionN.apply` は消去された
+  パラメータで宣言されているので、`f.apply(xs)` は `Any` になっていました（`f(xs)` は正しい）。
+- 可変長引数を持つ `case class` の `copy$default$n`（`this.cells`）は `T*` ではなく
+  `Seq[T]` として型付けします。nsc はこの形に `copy` を作らないので、`T*` に対して
+  検査すると誰も書いていないツリーに対する診断が出ていました。
+
 ### Trait mixin
 
 Java 6 には default method がないので、具象メンバー付き trait は次のように出します。
@@ -1841,7 +1885,63 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 まとまった拒否側は `tyvar_unsolved_bad.scala`（5 か所。実 scalac 2.13.16 も
 すべて拒否することを確認済み）で固定しています。
 
+### implicit の残件と prelude の穴（`agent/impltail`）
+
+slick に残っていた implicit 関連のエラーを追ったスライスです。フィクスチャは
+`tests/fixtures/itail.scala`（正常系。実 scalac 2.13.16 と stdout がバイト一致）と
+`tests/fixtures/itail_bad.scala`（異常系）、テストは `crates/cli/tests/impltail.rs` です。
+
+| `itail.scala`（`crates/cli/tests/impltail.rs`、library dual-run） | 一度 implicit を埋めた呼び出しの再型付け（タプル化リトライ）、`Numeric[T] <: Ordering[T]`、implicit 探索だけが決められる型パラメータ、関数値の `apply`、引数位置の残余 implicit 節（`take(Array.empty)`）、可変長引数を持つ case class | `Pair(Lit(1, …))` `Int 42 true` `-1` `a:str0` `b:bool1` `n=2 n=0` `0` `r 6 3` `true` `0` |
+
+最小形の受理／拒否テストは同じファイルにあります
+（`an_implicit_filled_call_survives_being_typed_twice` /
+`numeric_is_an_ordering` / `a_numeric_type_parameter_is_an_ordering` /
+`an_implicit_only_type_parameter_is_solved_by_the_witness` /
+`apply_on_a_function_value_is_the_function` /
+`a_residual_implicit_clause_is_applied_in_argument_position` /
+`the_parameter_decides_which_witness_a_residual_clause_needs` /
+`an_implicit_object_is_not_ambiguous_with_itself` /
+`a_repeated_case_class_parameter_has_a_sequence_default`）。
+`itail_bad.scala` は、証拠が無い残余 implicit 節と、候補がまったく無い
+implicit-only 型パラメータの両方に nsc と同じ趣旨の診断が出ることを固定します。
+
+計測は `files=184 errors=833 files_with_errors=102` → `errors=777 files_with_errors=93`。
+
 ### Remaining
+
+- **`Seq.toArray` / `Seq.zipWithIndex` が、あるファイルを一緒にコンパイルすると
+  消去されたシグネチャに化ける**（`agent/impltail` で原因まで特定、未修正）。
+  slick の `ProductResultConverter` の `elementConverters.toArray` は
+  `(ClassTag[B])Any` というメソッド型のまま残り、`cha.length` / `cha(i)` が
+  そのカスケードになります（5 件）。`ResultConverter.scala` を単体で
+  コンパイルすると `Seq#toArray` は prelude の `(ClassTag[A])Array[A]` に
+  解決されるのに、`slick/util/ConstArray.scala` を**先に**コンパイルすると
+  `IterableOnceOps#toArray : (ClassTag[B])Any` に解決されます（`Seq` の
+  symbol は同一で、`lookup_member(Seq, "toArray")` の結果が
+  `Seq` 自身のものから `IterableOnceOps` のものに入れ替わる）。
+  `Array[B]` は classfile 上 `Object` に消去されるので、classfile 由来の
+  メンバが prelude のメンバを覆うと結果型が `Any` になります。
+  implicit の問題ではなく、クラス完了時のメンバ供給の問題です。
+
+- **`implicitly[C[T]]` の結果に checkcast が入らない**（`agent/impltail` で確認、
+  未修正。main でも同じ）。`def f[T: C](…) = implicitly[C[T]].name` は
+  `implicitly` の戻り値（消去して `Object`）を `getfield` の receiver に
+  そのまま積むので `VerifyError: Bad type on operand stack` になります。
+  context bound の evidence を名前で受ける形（`def f[T](…)(implicit c: C[T])`）
+  なら通ります。
+
+- **`Integral[T]` / `Fractional[T]` が `Numeric[T]` にならない**。
+  `Numeric[T] <: Ordering[T]` は `crates/typer/src/prelude_numhier.rs` で
+  張りましたが、`Integral` / `Fractional` は prelude を組み立てる時点では
+  symbol table におらず（ソースが名前を出したときに jar から読まれる）、
+  同じ場所では親を張れません。
+
+- **cats の syntax（`import cats.syntax.all._`）による拡張メソッド**が
+  効きません（`value flatMap is not a member of F` など 20 件強）。
+  `implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])` のように
+  **高階型パラメータに適用された型**からの暗黙変換探索が要ります。
+  `Ref[F, A].get` が `F` （素の型パラメータ）になっている箇所もあり、
+  高階型の適用そのものが崩れている場合があります。
 
 - **`List.newBuilder` / `Vector.newBuilder` がコンパニオンに無い**。`Builder[A, To]`
   自体は pickle から供給されて動く（`ctacc_builder` が通る）が、companion の

@@ -9,6 +9,19 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct NodeId(pub u32);
 
+impl NodeId {
+    /// An argument the typer put into a call's argument list itself: a
+    /// resolved implicit, or a filled-in default. The parser never hands out
+    /// this id, so a pass that re-types an application can tell the
+    /// arguments the user wrote from the ones a previous pass added, and drop
+    /// the latter before resolving the call again.
+    pub const FILLED_ARG: NodeId = NodeId(u32::MAX);
+
+    pub fn is_filled_arg(self) -> bool {
+        self.0 == u32::MAX
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SymbolId(pub u32);
 
