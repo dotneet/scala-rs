@@ -4209,6 +4209,17 @@ impl Typer {
             tree.ty = ty;
             return;
         }
+        // The same member can be reached twice (inherited through two parents,
+        // or entered by both a package and its package object). Alternatives
+        // that agree on their type are one member, not an overload.
+        let first_ty = self.st.get(found[0]).ty.clone();
+        if !first_ty.is_no_type() && found.iter().all(|&s| self.st.get(s).ty == first_ty) {
+            found.truncate(1);
+            let s = found[0];
+            tree.sym = s;
+            tree.ty = self.maybe_auto_apply(first_ty, pt);
+            return;
+        }
         // Keep overloads intact so `println(1)` can still pick a 1-arg alternative.
         // Nullary alternatives still auto-apply in value position (`"x".stripMargin`).
         let ov = Type::Overload(found.iter().map(|s| self.st.get(*s).ty.clone()).collect());
