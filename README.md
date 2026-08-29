@@ -64,7 +64,7 @@ java -cp out:scala-library-2.13.16.jar Main
 - `-Xfatal-warnings` — warning をエラーにする（非網羅 match など）
 - `-Xsource:<version>` — ソースレベル。`2.13`（既定）/ `3` / `3-cross`。`3` 系は **Scala 3 の綴り**（このサブセットでは `A & B` の交差型）を受け付ける。nsc と同じく現行メジャー未満（`-Xsource:2.12` など）はエラー
 - `--scala-library <jar>` — scala-library 2.13 にリンク（私有 Option/List を出さない）。環境変数 `SCALA_LIBRARY_JAR` でも可。パス省略時は自動検出。**`compile` / `run` の既定は自動検出できた jar。見つからなければ私有。`--no-scala-library` で私有を強制**
-- `-cp` / `--class-path` — 先にコンパイルした classfile を読む（`ScalaSignature` pickle subset と JVM メソッド。vals / パラメータ付き defs / 型パラメータ / `$default$n` ゲッター / case class の ctor フィールドを含む。自前 `-cp` は companion `apply` も読む。nsc は companion apply `Point(...)` / term `Point` / extractor `unapply` / `List[_]` の existentials / `List[_ <: AnyRef]` / `List[_ <: List[_]]` / `@deprecated("msg", "2.13.0")` の annotation args / Java `@Deprecated`（SYMANNOT + `java.lang.Deprecated`） / `this.type` / `Int @unchecked` / refinement `A with B { def f: Int }` も読む）。**Java の `.class`** も同じ `-cp` / jar / jmod / JDK（`java.base.jmod` や `rt.jar`）からオンデマンドで読む（ScalaSignature の無い pickle-less Java は pickle インストーラに載せない。`JAVA` / `protected` / `static` を落とさないため）。prelude に無い JDK クラスのメソッド・フィールド（`java.lang.Math.abs` / `java.util.ArrayList#add`）を解決する。**Signature 属性**があればジェネリックを raw にしない（`ArrayList[String]#get` は `E`＝`String`。無ければ `Object` のまま `String` へは通さない）。**ワイルドカード／型パラメータ境界**（`Class[*]` → `Class[_]`、`Collection<+TT>` → `Collection[_ <: T]`、`<T:Number>` の hi bound）は存在型として残し raw `Object` にしない。`ArrayList[Byte] <: List[_ <: T]` は親ウォークより先にワイルドカードを照合し、継承した `add` は `drop_overridden` する。**静的 inner**（`java.util.Map.Entry` / `AbstractMap.SimpleEntry`）と **Java varargs**（`ACC_VARARGS` の `String.format` / `Arrays.asList`。Scala `Seq` wrap ではなく `Object[]`）も classfile から読む。Java の `throws` 検査例外は Scala と同様チェックしない。**Java `protected`** は同じパッケージかサブクラス（nsc / JLS）から見え、それ以外は診断する。Scala の `Base.secretStatic()` は Java クラスの `MODULE$` を出さず `invokestatic` する。ScalaSignature pickle だけに頼らない。**Java enum**（`ACC_ENUM` のクラスと定数。`values` / `valueOf` は classfile の static。非 enum に `values` を合成しない）。未対応の classfile 機能（未知 CP tag、`ACC_MODULE`、壊れた magic）は診断する（黙って成功にしない）
+- `-cp` / `--class-path` — 先にコンパイルした classfile を読む（`ScalaSignature` pickle subset と JVM メソッド。vals / パラメータ付き defs / 型パラメータ / `$default$n` ゲッター / case class の ctor フィールドを含む。自前 `-cp` は companion `apply` も読む。nsc は companion apply `Point(...)` / term `Point` / extractor `unapply` / `List[_]` の existentials / `List[_ <: AnyRef]` / `List[_ <: List[_]]` / `@deprecated("msg", "2.13.0")` の annotation args / Java `@Deprecated`（SYMANNOT + `java.lang.Deprecated`） / `this.type` / `Int @unchecked` / refinement `A with B { def f: Int }` も読む）。**jar の中の Scala クラス**は `ScalaSignature` pickle をそのまま読みます（`crates/pickle`。高階型パラメータ `F[_]` と `F[A]` を含む。読めなかったメンバだけ JVM signature に落ちる。`scala.*` / `java.*` は対象外。先読みはせず 1 クラスずつ。「jar のクラスを pickle から読む」節）。**Java の `.class`** も同じ `-cp` / jar / jmod / JDK（`java.base.jmod` や `rt.jar`）からオンデマンドで読む（ScalaSignature の無い pickle-less Java は pickle インストーラに載せない。`JAVA` / `protected` / `static` を落とさないため）。prelude に無い JDK クラスのメソッド・フィールド（`java.lang.Math.abs` / `java.util.ArrayList#add`）を解決する。**Signature 属性**があればジェネリックを raw にしない（`ArrayList[String]#get` は `E`＝`String`。無ければ `Object` のまま `String` へは通さない）。**ワイルドカード／型パラメータ境界**（`Class[*]` → `Class[_]`、`Collection<+TT>` → `Collection[_ <: T]`、`<T:Number>` の hi bound）は存在型として残し raw `Object` にしない。`ArrayList[Byte] <: List[_ <: T]` は親ウォークより先にワイルドカードを照合し、継承した `add` は `drop_overridden` する。**静的 inner**（`java.util.Map.Entry` / `AbstractMap.SimpleEntry`）と **Java varargs**（`ACC_VARARGS` の `String.format` / `Arrays.asList`。Scala `Seq` wrap ではなく `Object[]`）も classfile から読む。Java の `throws` 検査例外は Scala と同様チェックしない。**Java `protected`** は同じパッケージかサブクラス（nsc / JLS）から見え、それ以外は診断する。Scala の `Base.secretStatic()` は Java クラスの `MODULE$` を出さず `invokestatic` する。ScalaSignature pickle だけに頼らない。**Java enum**（`ACC_ENUM` のクラスと定数。`values` / `valueOf` は classfile の static。非 enum に `values` を合成しない）。未対応の classfile 機能（未知 CP tag、`ACC_MODULE`、壊れた magic）は診断する（黙って成功にしない）
 
 フィクスチャはデフォルトパッケージ（`package` 句なし）なので、`-cp out` の `Main` でそのまま動く想定です。
 
@@ -93,7 +93,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - 適合（conformance）まわり: **コレクションの継承関係**（`Vector[A] <: IndexedSeq[A] <: Seq[A] <: collection.Seq[A] <: Iterable[A] <: IterableOnce[A]`、`List` / `LazyList` / `Queue` / `Range` / `ArraySeq`、`Set[A] <: Iterable[A]`、`Map[K, V] <: Iterable[(K, V)]`、mutable 側も同様）を `crates/typer/src/prelude_hier.rs` の 1 枚の表で型引数つきに張る。**アノテーション付き型**は下の型と同じに適合する（`Node` は `Node @uncheckedVariance`）。**モジュールの `.type`** はそのモジュール自身の型（`Some(Nil): Some[Nil.type]`）。反変パラメータを持つクラスの lub はそのパラメータだけ glb を取る（`Act[+R, -E]` の lub は `Act[R lub R2, E glb E2]`）。型パラメータの lub はその上限境界まで辿る。`extends Base[T](y)` の親コンストラクタ引数は`extends` 節が書いた型引数で読む。`type Self >: this.type <: Nd` に対して `this` は適合し（`class Leafy extends Nd { type Self = Leafy }` のように下限の `this.type` をサブクラス側で読み直す）、任意の `Nd` は適合しない
 - 言語フラグ `implicitConversions` と `postfixOps` は nsc 2.13 どおり。ユーザー定義の `implicit def` / `implicit class` は import / `-language:implicitConversions` なしだと **warning**。postfix `42 bang` / `42 abs` は `import scala.language.postfixOps`（または `-language:postfixOps`）なしだと **warning**（`-Xfatal-warnings` でエラー）
 - 存在型のよくある形: `List[_]`、`T forSome { type X }`、`List[_]` を取るメソッド、境界付き `List[_ <: AnyRef]` と `List[X] forSome { type X <: AnyRef }`（名前付き量化は `BoundedWildcard` に落として既存の pickle/erase 経路を使う）。ワイルドカードは Object 相当に erase する。入れ子の `List[_ <: List[_]]` は hi bound 側の EXISTENTIALtpe として pickle する。`p.Inner forSome { val p: Outer }` は `Outer#Inner` にパックして実行する。その他の `forSome { val … }` は診断する（黙って捨てない）
-- compiled class/object に **ScalaSignature**（クラス属性 `ScalaSig` マーカー + `RuntimeVisibleAnnotations` の pickle subset）。`javap -v` で見える。自前 unpickler が読める範囲で `-cp` による別コンパイルができる。nsc 完全 pickle ではないが、ワイヤ形式は nsc と同じ（nentries、tag/len、ビッグエンディアン Nat、SID-10 は `0x7f→0`）。`val` / パラメータ付き `def` / 型パラメータ `id[T]` / `case class` の `new` と ctor フィールド / **companion apply `Point(3, 4)`（term `Point` / `MODULE$`）** / **extractor `unapply`（`p match { case Point(a, b) => … }`）** / object の `def` / **`List[_]`（EXISTENTIALtpe）** / **`List[_ <: AnyRef]`（量化 TYPEsym の hi bound）** / **`@deprecated("msg", "2.13.0")`（SYMANNOT + LITERALstring）** / **Java `@Deprecated`（SYMANNOT + TypeRef(java.lang, Deprecated)。scalac `-deprecation` がメソッド上のアノテーションを見る）** / **`this.type`（THIStpe をメソッド結果に）** / **`Int @unchecked`（ANNOTATEDtpe）** / **`val one: 1` と `def lit(x: 1)`（CONSTANTtpe + LITERALint）** / **`List[_ <: List[_]]`（入れ子 EXISTENTIALtpe）** / **`A with B { def f: Int }`（REFINEDtpe）** / **`@Ann(foo)` / `@Ann(c.x)` / `@Ann(3)` / `@Ann(this)` / `@Ann(classOf[Int])` / `@Ann(ident(1))` / `@Ann(this.x)` / `@Ann(super.foo)` / `@Ann(ident(ident(1)))` / `@Ann(foo = 1)`（TREE Ident/Select/This/Super/Apply + リテラル / LITERALclass Constant。ネストした Apply と Ident 以外の Select 修飾子を含む。named `@Ann(foo = 1)` は nsc と同じ位置 Constant）** / **`def join(xs: String*)`（VARARGS + `<repeated>`）** / **`Ordered` erasure bridge（BRIDGE）** / **`type T = Int`（ALIASsym。2.13 に ALIAStpe は無い）** は scalac 2.13.16 が読める形（object は CLASSsym+MODULE + MODULESYM、クラス pickle にも companion の MODULESYM を載せる、`<empty>` / scala / java.lang の EXTMODCLASSref、POLYtpe は restpe 先行、val は NullaryMethodType ゲッター、case class は CASE / CASEACCESSOR、ユーザー型は `<empty>` 所有の EXTREF、`Option` / `TupleN` / `List` は scala / `scala.collection.immutable` モジュール所有の TypeRef + 型引数、Flags は nsc raw long を `rawToPickledFlags` して出す）。full pickle とは主張しない。残る穴は README Remaining
+- compiled class/object に **ScalaSignature**（クラス属性 `ScalaSig` マーカー + `RuntimeVisibleAnnotations` の pickle subset）。`javap -v` で見える。自前 unpickler が読める範囲で `-cp` による別コンパイルができる。nsc 完全 pickle ではないが、ワイヤ形式は nsc と同じ（nentries、tag/len、ビッグエンディアン Nat、SID-10 は `0x7f→0`）。`val` / パラメータ付き `def` / 型パラメータ `id[T]` / `case class` の `new` と ctor フィールド / **companion apply `Point(3, 4)`（term `Point` / `MODULE$`）** / **extractor `unapply`（`p match { case Point(a, b) => … }`）** / object の `def` / **`List[_]`（EXISTENTIALtpe）** / **`List[_ <: AnyRef]`（量化 TYPEsym の hi bound）** / **`@deprecated("msg", "2.13.0")`（SYMANNOT + LITERALstring）** / **Java `@Deprecated`（SYMANNOT + TypeRef(java.lang, Deprecated)。scalac `-deprecation` がメソッド上のアノテーションを見る）** / **`this.type`（THIStpe をメソッド結果に）** / **`Int @unchecked`（ANNOTATEDtpe）** / **`val one: 1` と `def lit(x: 1)`（CONSTANTtpe + LITERALint）** / **`List[_ <: List[_]]`（入れ子 EXISTENTIALtpe）** / **`A with B { def f: Int }`（REFINEDtpe）** / **`@Ann(foo)` / `@Ann(c.x)` / `@Ann(3)` / `@Ann(this)` / `@Ann(classOf[Int])` / `@Ann(ident(1))` / `@Ann(this.x)` / `@Ann(super.foo)` / `@Ann(ident(ident(1)))` / `@Ann(foo = 1)`（TREE Ident/Select/This/Super/Apply + リテラル / LITERALclass Constant。ネストした Apply と Ident 以外の Select 修飾子を含む。named `@Ann(foo = 1)` は nsc と同じ位置 Constant）** / **`def join(xs: String*)`（VARARGS + `<repeated>`）** / **`Ordered` erasure bridge（BRIDGE）** / **`type T = Int`（ALIASsym。2.13 に ALIAStpe は無い）** は scalac 2.13.16 が読める形（object は CLASSsym+MODULE + MODULESYM、クラス pickle にも companion の MODULESYM を載せる、パッケージ（`hklib` / `slick/ast`）と scala / java.lang の EXTMODCLASSref、デフォルトパッケージだけ `<empty>`、POLYtpe は restpe 先行、val は NullaryMethodType ゲッター、case class は CASE / CASEACCESSOR、ユーザー型は**自分のパッケージ**所有の EXTREF、`Option` / `TupleN` / `FunctionN` / `List` は scala / `scala.collection.immutable` モジュール所有の TypeRef + 型引数、Flags は nsc raw long を `rawToPickledFlags` して出す）。full pickle とは主張しない。残る穴は README Remaining
 - `s"..."` / `f"..."` / `raw"..."` 文字列補間。`f"$n%02d"` は `String.format` に落とす。`raw` はエスケープを解釈しない。日付時刻（`%t`/`%T`）、引数インデックス、相対 `% <` は診断する。`--scala-library` 時はカスタム interpolator（`implicit class Q(sc: StringContext) { def q(args: Any*) }` の `q"a$x"`）を `StringContext.apply(parts*).q(args*)` へデシュガーして実行する。私有ランタイムでは `s`/`f`/`raw` 以外は診断する
 - コンテキストバウンド `T: ClassTag` / `T: Ordering` / `T: scala.reflect.ClassTag`（メソッド型パラメータ）と **クラス型パラメータ** `class C[T: Ordering](x: T)`。nsc と同様、implicit evidence `C[T]` へデシュガーする（クラスは primary ctor の extra implicit 節）。トレイトの `: C` / `<%` は nsc どおり `traits cannot have type parameters with context bounds ': ...' nor view bounds '<% ...'`。evidence が無ければ `no implicit`。`--scala-library` 時は jar の `scala.math.Ordering` を classfile から読み、companion の `implicit object Int`（`Ordering$Int$.MODULE$` / InnerClasses）と `ClassTag` にリンクして動く。ジェネリック `Array[T].length` は jar の `ScalaRunTime.array_length` に落とす
 - `lazy val`
@@ -1215,11 +1215,80 @@ nsc は**囲いのクラスすべて**について規則を判定するので、
 読み手（`classpath.rs`）が `Function1[A, B]` / `Tuple2[A, B]` / `Array[T]` を
 構造的な `Type` に戻せるようにしました。書き手側も、高階な型パラメータの
 `TYPEsym` に `POLYtpe` を書くようにしています（実 scalac 2.13.16 が
-`-cp` で読めることを確認済み）。jar のクラスはこの経路を通りません（後述）。
+`-cp` で読めることを確認済み）。jar のクラスはこの経路を通りません（次節の `adopt_binary_class` を通ります）。
 
 計測（`tests/slick_measure.sh`、slick 184 ファイル、`-Xsource:3`）は
 **833 → 772**、`type mismatch` は **201 → 168**、エラーを含むファイルは
 **102 → 100** になりました。新たにエラーを出すようになったファイルはありません。
+
+### jar のクラスを pickle から読む
+
+`load_classpath` はディレクトリしか歩きません。つまり **jar の中のクラスは
+`ScalaSignature` ではなく JVM の generic signature から**読まれていました。この形式は
+**高階の kind を書けません**。`trait Monad[F[_]]` は `<F:Ljava/lang/Object;>` として
+届くので `F` はただの型、`def pure[A](a: A): F[A]` は `(TA;)TF;` として届くので結果は
+`F[A]` ではなく `F` です。結果として `Monad[F]` はすべて
+`kinds of the type arguments (F) do not conform`、`F.pure(v)` はすべて
+`found: F required: F[Int]` になっていました。cats / cats-effect を使う
+`BasicBackend.scala` と `ConcurrencyControl.scala` はまるごとこれが原因です。
+
+pickle には本当のシグネチャが書いてあります。`crates/pickle` は 2.13.16 の pickle を
+読み切れる（scala-library の 799 個すべて）ので、**足りていたのは jar のエントリに
+それを使う経路だけ**でした。`PickleSupply::adopt_binary_class` がそれです。
+
+- classfile が `ScalaSig` を持つとき（＝ Scala のクラスのとき）だけ、
+  `install_java_class_in` が組んだシンボルを pickle で**上書きします**。
+  クラスの親・フラグ・フィールドは classfile から来たものをそのまま使い、
+  - 型パラメータの **kind**（`F[_]` の arity）と、
+  - pickle が宣言するメンバ 1 つずつのシグネチャ
+  を pickle から取ります。**pickle で表現できなかったメンバは classfile 読みの
+  ままにします**（`erased_desc` が決まらない、型が `Type` に落ちないなど）。
+  つまり精度は上がっても、メンバが消えることはありません。
+- `scala.*` / `java.*` は対象外です。標準ライブラリは prelude ＋ `complete` という
+  検証済みの経路を通ります（prelude が勝つ規則を壊さないため）。
+- **先読みはしません**。classfile が 1 つ読まれたときに、そのクラスだけを見ます。
+  slick の依存 classpath（cats / cats-effect / slf4j ほか 40 個超の jar）での計測時間は
+  1:58 → 1:51（user 101.5s → 107.5s）でした。
+
+あわせて 3 か所塞ぎました。
+
+1. **型パラメータの適用**（`conv_ref`）。`F[A]` は `Type::Applied` で書けるのに
+   「高階なので表現できない」と落としていました。`F` の kind arity が引数の数と
+   一致するときだけ `Applied` にします（存在型のワイルドカードや kind の分からない
+   ものは、間違った型を作るより落とす方がましなので落とします）。
+2. **プレースホルダのシンボルに kind を後付けする**（`give_stub_its_kinds`）。
+   `find_or_stub_java_class` は親リストやディスクリプタが名指した名前に
+   「中身の無いシンボル」を入れます。標準ライブラリの外ではこれが至る所で当たり、
+   `cats.effect.kernel.Sync` は型パラメータ 0 個のまま `Sync[F]` が
+   「applied to 1 argument but the symbol has 0」になって、`Ref.of` /
+   `Ref.ofEffect` / `Ref.lens` が全部落ちていました。まだ誰も埋めていない
+   シンボルにだけ、pickle が宣言する型パラメータを与えます。
+3. **erasure bridge の override 判定**（`bridge_overrides`）。同じディスクリプタに
+   erase する 2 つのパラメータは JVM から見て同じパラメータなので、オーバーロードを
+   区別する材料にはなりません。`def bind[A, B](fa: F[A], f: A => F[B])` を
+   `F = Option` で実装すると `f: A => Option[B]` になりますが、構造比較では
+   「override ではない」と見えてブリッジが出ず、インターフェース越しの `bind` が
+   実行時 `AbstractMethodError` になっていました。
+
+**pickle ライタ側**も 2 つ直しました。どちらも「自前で出した jar を読み戻せない」
+原因でした（ディレクトリなら通るのは、読み手がパッケージをファイルパスから
+復元しているからです）。
+
+- **トップレベルのクラスの所有者が `<empty>`** でした。unpickler は所有者を pickle から
+  読むので、`package hklib` の中のクラスは自分を `hklib.Monadic` ではなく `Monadic`
+  と名乗っていました。実 scalac 2.13.16 も自前リーダも見つけられません
+  （`not found: type Monadic`）。パッケージの module class を `EXTMODCLASSref` の
+  連鎖として書くようにしました。
+- **`FunctionN` に型引数が付いていません**でした（`TupleN` は付いていました）。
+  引数の無い `Function1` は読み手が落とすしかないので、`f: A => F[B]` を含む
+  シグネチャはすべて供給されませんでした。
+
+計測（同上）は **772 → 766**、エラーを含むファイルは **100 → 100** です。数字が
+小さいのは、`Monad[F]` が通るようになると今度はその先（cats の `implicits` 経由の
+implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラーの中身は
+`kinds of the type arguments (F) do not conform` のような「読み違え」から、
+`could not find implicit value of type Make[F]` のような
+「本当に足りていない機能」に変わりました。
 
 ## 実装していないもの
 
@@ -1243,7 +1312,7 @@ nsc は**囲いのクラスすべて**について規則を判定するので、
   [`docs/macros.md`](docs/macros.md) §7.3 に列挙しました。
   なお slick の `ShapedValue.mapToImpl` にある 14 箇所の quasiquote は
   **すべて構文解析できて**おり、`unimplemented syntax` は 1 件も出ません
-- full nsc pickle（出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / MODULESYM / VALsym / EXTref / EXTMODCLASSref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe / TYPEBOUNDStpe / THIStpe / SINGLEtpe / NOPREFIXtpe / CONSTANTtpe / LITERALint / LITERALboolean / LITERALstring ほかリテラル / EXISTENTIALtpe / REFINEDtpe / SYMANNOT / ANNOTATEDtpe / ANNOTINFO / TREE（IDENTtree / SELECTtree / THIStree / SUPERtree / APPLYtree）のサブセット。ByteCodecs は SID-10。ワイヤ形式は nsc と同じ nentries + ビッグエンディアン Nat。vals は METHOD|STABLE|ACCESSOR ゲッター + NullaryMethodType。case class は CASE + フィールド CASEACCESSOR。Flags は nsc raw long を `rawToPickledFlags`（VARARGS / BRIDGE / JAVA を適用箇所で出す）。scalac 2.13.16 が `val` / パラメータ付き `def` / `id[T]` / `new Point` + `p.x` / companion apply `Point(...)` / term `Point` / extractor `unapply` / object の `def` / `def f(xs: List[_]): Int` / `@deprecated("msg", "2.13.0") def g` / `def me: this.type` / `def f(xs: List[_ <: AnyRef])` / `def h(x: Int @unchecked)` / `val one: 1` / `def lit(x: 1)` / `def nest(xs: List[_ <: List[_]])` / `def idRef(x: MixA with MixB { def f: Int })` / `@Ann(foo)` / `@Ann(c.x)` / `@Ann(this)` / `@Ann(classOf[Int])` / `@Ann(ident(1))` / `@Ann(this.x)` / `@Ann(super.foo)` / `@Ann(ident(ident(1)))` / `@Ann(foo = 1)` / `@Ann(foo = this.x)` / `@Ann(foo = bar)` / `Lib.join("a","b")` / `new OrdBox(1).compare(...)` を typecheck できる範囲。full pickle ではない。残る穴は Remaining）
+- full nsc pickle（出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / MODULESYM / VALsym / EXTref / EXTMODCLASSref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe / TYPEBOUNDStpe / THIStpe / SINGLEtpe / NOPREFIXtpe / CONSTANTtpe / LITERALint / LITERALboolean / LITERALstring ほかリテラル / EXISTENTIALtpe / REFINEDtpe / SYMANNOT / ANNOTATEDtpe / ANNOTINFO / TREE（IDENTtree / SELECTtree / THIStree / SUPERtree / APPLYtree）のサブセット。ByteCodecs は SID-10。ワイヤ形式は nsc と同じ nentries + ビッグエンディアン Nat。vals は METHOD|STABLE|ACCESSOR ゲッター + NullaryMethodType。case class は CASE + フィールド CASEACCESSOR。Flags は nsc raw long を `rawToPickledFlags`（VARARGS / BRIDGE / JAVA を適用箇所で出す）。scalac 2.13.16 が `val` / パラメータ付き `def` / `id[T]` / `new Point` + `p.x` / companion apply `Point(...)` / term `Point` / extractor `unapply` / object の `def` / `def f(xs: List[_]): Int` / `@deprecated("msg", "2.13.0") def g` / `def me: this.type` / `def f(xs: List[_ <: AnyRef])` / `def h(x: Int @unchecked)` / `val one: 1` / `def lit(x: 1)` / `def nest(xs: List[_ <: List[_]])` / `def idRef(x: MixA with MixB { def f: Int })` / `@Ann(foo)` / `@Ann(c.x)` / `@Ann(this)` / `@Ann(classOf[Int])` / `@Ann(ident(1))` / `@Ann(this.x)` / `@Ann(super.foo)` / `@Ann(ident(ident(1)))` / `@Ann(foo = 1)` / `@Ann(foo = this.x)` / `@Ann(foo = bar)` / `Lib.join("a","b")` / `new OrdBox(1).compare(...)` を typecheck できる範囲。**パラメータ節は 1 つに潰れる**（`uncurry` がシンボル上の `paramss` を平坦化したあとに pickle するので、`def bind(fa)(f)` は `bind(fa, f)` として読まれる）。**CLASSINFOtpe の親は `Object` だけ**（`trait Monadic[F[_]] extends Functor[F]` の継承関係は pickle に載らない。classfile の interfaces には載るので、こちら側の `-cp` 読みでは効く）。full pickle ではない。残る穴は Remaining）
 
 対象外（診断する / パースしない）:
 
@@ -1553,6 +1622,24 @@ jar の**全 classfile**を走査して次を見ます。jar が無ければス�
 
 自前ライタが書いた pickle を自前リーダで読み直すテストは
 `crates/backend/tests/pickle_roundtrip.rs` です。
+
+**jar のクラスを pickle から読む**テストは `crates/cli/tests/jarpickle.rs`
+（fixture 接頭辞 `jarpk`）です。
+
+- `jarpk_fixture_dual_run`: `jarpk.scala`（`Functor[F[_]]` / `Monadic[F[_]]` と
+  `Option` / `List` / 自作 `Ident` の 3 インスタンス）を実 scala-library に対して
+  コンパイルし、実 scalac 2.13.16 の出力（`tests/fixtures/expected/jarpk.txt`）と
+  **完全一致**することを見る。
+- `jarpk_bad_is_still_rejected`: `Monadic2[Int]` の kind エラーと
+  `F.pure(1): F[String]` の型不一致。nsc 2.13.16 も両方拒否する。
+- `a_higher_kinded_trait_survives_a_jar_round_trip`: 高階トレイトを含むライブラリを
+  コンパイル → `jar cf` で jar に固める → **jar しか見えない**プログラムを
+  コンパイルして実行する。渡るのは `ScalaSignature` だけ。`jar` が無ければスキップ。
+- `a_higher_kinded_type_class_from_a_real_jar_typechecks` /
+  `a_proper_type_is_still_rejected_where_a_real_jar_wants_a_constructor`:
+  ローカルの Coursier キャッシュに cats-core / cats-kernel があれば、
+  実物の `cats.Monad` に対して `F.pure` / `F.flatMap` / `F.map` が通ることと、
+  `Monad[Int]` が kind エラーになることを見る。無ければスキップ（何もダウンロードしない）。
 
 型検査への接続は `crates/cli/tests/pickle_lib.rs`（fixture 接頭辞 `pickle_lib`）です。
 `e2e.rs` とは別ファイルにしています。
@@ -2067,6 +2154,30 @@ implicit-only 型パラメータの両方に nsc と同じ趣旨の診断が出�
   **高階型パラメータに適用された型**からの暗黙変換探索が要ります。
   `Ref[F, A].get` が `F` （素の型パラメータ）になっている箇所もあり、
   高階型の適用そのものが崩れている場合があります。
+- **jar のクラスを pickle から読む（`agent/jarpickle`）で残ったもの**。
+  - **cats の `implicits` 経由の implicit 探索**。`Monad[F]` のシグネチャは
+    正しく届くようになったが、`import cats.implicits._` から `Monad[Option]` を
+    見つける（`cats.instances.*` の深い継承をたどる）ところは通らない。
+    slick の `BasicBackend.scala` に残る `value flatMap is not a member of F[Any]`
+    などは cats の syntax 拡張メソッドで、同じ実装が要る。
+  - **`Ref.Make[F]` のような導出 implicit**。`Ref.of[F, Int](0)` はシグネチャが
+    通り、`could not find implicit value of type Make[F]` で止まる
+    （`MakeLowPriorityInstances#syncInstance` から `Sync[F]` 経由で導く）。
+  - **ソースレベルでも高階の引数節をまたぐ推論が効かない**。
+    `F.flatMap(fa)(a => F.pure(a))` の `a` が `Any` になる。これは jar とは無関係で、
+    同じ形をソースに書いても同じく落ちる（`trait MyMonad[F[_]]` で確認）。
+  - **trait のデフォルトメソッドの中のラムダ**が `M3$$anonfun$0 cannot be cast to M3`
+    で落ちる。jar とも高階とも無関係な backend の穴で、
+    `trait L1 { def base(n: Int): Int; def viaLambda(xs: List[Int]) = xs.flatMap(a => List(base(a))) }`
+    で再現する。
+  - **pickle ライタのパラメータ節と親**。上の「実装していないもの」参照。
+    どちらも自前で出した jar を自前で読み戻すときの上限で、
+    `-cp <ディレクトリ>` 経路（classfile の interfaces を読む）には影響しない。
+  - **`-cp` がディレクトリのときと jar のときで結果が違いうる**。ディレクトリは
+    `install_classpath`（backend の unpickler、親は `Object` のまま）、jar は
+    `adopt_binary_class`（`crates/pickle` ＋ classfile の interfaces）を通る。
+    今は jar の方が正確で、`Monadic[Option] <: Functor[Option]` はディレクトリ側だけ
+    通らない。統一するならディレクトリ側も `adopt_binary_class` に寄せる。
 
 - **`List.newBuilder` / `Vector.newBuilder` がコンパニオンに無い**。`Builder[A, To]`
   自体は pickle から供給されて動く（`ctacc_builder` が通る）が、companion の

@@ -13424,6 +13424,15 @@ impl Typer {
             Ok(Some(bytes)) => match crate::javaclass::parse_java_classfile(&bytes) {
                 Ok(jc) => {
                     let id = crate::classpath::install_java_class_in(&mut self.st, &jc, owner);
+                    // A Scala classfile on `-cp` carries a `ScalaSignature`,
+                    // and that is the only place its higher kinds are written
+                    // down. Read them off it before anything looks at the
+                    // symbol; the classfile reader's view stays underneath for
+                    // whatever the pickle cannot express.
+                    if jc.is_scala {
+                        self.pickle
+                            .adopt_binary_class(&mut self.st, &mut self.binary, id);
+                    }
                     self.complete_java_parents(id, span);
                     if with_nested {
                         self.complete_scala_nested(id, &jc, span);
@@ -13614,7 +13623,14 @@ impl Typer {
         match self.binary.find_class(&jvm) {
             Ok(Some(bytes)) => match crate::javaclass::parse_java_classfile(&bytes) {
                 Ok(jc) => {
-                    crate::classpath::install_java_class(&mut self.st, &jc);
+                    let id = crate::classpath::install_java_class(&mut self.st, &jc);
+                    // A `-cp` stub reached through a parent list arrives here
+                    // as "javaish" even when it is a Scala trait: see
+                    // `adopt_binary_class`.
+                    if jc.is_scala {
+                        self.pickle
+                            .adopt_binary_class(&mut self.st, &mut self.binary, id);
+                    }
                     self.complete_java_parents(class_id, span);
                 }
                 Err(e) => {

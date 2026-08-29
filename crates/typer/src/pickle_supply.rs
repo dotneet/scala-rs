@@ -93,6 +93,11 @@ pub struct PickleSupply {
     /// `Builder[Int, List[Int]]` receiver that is a `Builder`, not the
     /// `Growable` the erased signature names.
     self_ty: Option<Type>,
+    /// Classes read from a `-cp` jar/directory whose shape has been taken from
+    /// their `ScalaSignature` rather than from the JVM generic signature (see
+    /// [`PickleSupply::adopt_binary_class`]). Also the gate that lets
+    /// `complete_named` serve a class outside `scala.*`.
+    adopted: HashSet<u32>,
 }
 
 /// One `type T[...] = U` recovered from a package object's pickle.
@@ -229,6 +234,130 @@ impl PickleSupply {
         std::mem::take(&mut self.unresolved_refs)
     }
 
+    /// Re-read a class just loaded from a `-cp` classfile from its own pickle.
+    ///
+    /// `install_java_class_in` builds the symbol out of the JVM *generic
+    /// signature*, and that format cannot write a higher kind or a higher-kinded
+    /// application. `trait Monad[F[_]]` arrives as `Monad[F]` with `F` a proper
+    /// type, and `def pure[A](a: A): F[A]` as `(A)F` — so `Monad[F]` is a kind
+    /// error at every use site and `F.pure(v)` is `found: F, required: F[R]`.
+    /// scalac reads none of that from the signature: it reads the
+    /// `ScalaSignature` pickle, which has the real one.
+    ///
+    /// So does this. The class keeps the symbol it already has (its parents,
+    /// flags and fields all come from the classfile) and gains:
+    ///
+    /// * its pickled type parameters' *kinds*, and
+    /// * one pickled signature per member the pickle declares, replacing the
+    ///   JVM-signature member of the same name **only when the pickled one
+    ///   could be expressed**. A member the pickle path declines is left
+    ///   exactly as the classfile reader installed it, so this can add
+    ///   precision but never take a member away.
+    ///
+    /// Only classes outside `scala.*` / `java.*`: the standard library reaches
+    /// the typer through the hand-written prelude plus `complete`, and that
+    /// path is the one the prelude's shapes are validated against.
+    ///
+    /// Returns true if the class was adopted (so `complete_named` may serve it
+    /// from now on).
+    pub fn adopt_binary_class(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+    ) -> bool {
+        if class_sym.is_none() || !st.get(class_sym).is_class_like() {
+            return false;
+        }
+        let internal = st.get(class_sym).jvm_name.clone();
+        if internal.is_empty()
+            || internal.starts_with("scala/")
+            || internal.starts_with("java/")
+            || internal.starts_with("javax/")
+            || internal.contains("$anon")
+        {
+            return false;
+        }
+        if self.adopted.contains(&class_sym.0) {
+            return true;
+        }
+        let is_module = st.get(class_sym).kind == SymKind::ModuleClass;
+        let Some(full) = self.pickled_full_name(bin, &internal, is_module) else {
+            trace(format_args!("{internal}: no pickle to adopt"));
+            return false;
+        };
+        let Ok(sig) = ({
+            let mut src = BinSource(bin);
+            self.sigs.class_sig(&mut src, &full, is_module)
+        }) else {
+            return false;
+        };
+        // Marked adopted before any member work: `complete_named` refuses a
+        // class it does not know, and installing a member re-enters it (a
+        // `$default$n` getter).
+        self.adopted.insert(class_sym.0);
+        trace(format_args!("adopting {full} (module={is_module})"));
+        adopt_tparam_kinds(st, class_sym, &sig);
+
+        // Member names in declaration order, deduplicated: `complete_named`
+        // installs every overload of a name at once.
+        let mut names: Vec<String> = Vec::new();
+        for m in &sig.members {
+            if m.kind != MemberKind::Def || !m.is_public_api() {
+                continue;
+            }
+            let src_name = scala_rs_pickle::names::decode_method_name(&m.name);
+            if src_name.is_empty() || src_name == "<init>" || src_name.contains('$') {
+                continue;
+            }
+            if !names.contains(&src_name) {
+                names.push(src_name);
+            }
+        }
+        for name in names {
+            // What the classfile reader put there, so it can be dropped once
+            // the pickle has supplied something better.
+            let stale: Vec<SymbolId> = st
+                .get(class_sym)
+                .members
+                .iter()
+                .copied()
+                .filter(|&m| {
+                    let s = st.get(m);
+                    s.kind == SymKind::Method && s.name == name
+                })
+                .collect();
+            let installed = self.complete_named(st, bin, class_sym, &name, false);
+            if installed.is_empty() {
+                continue;
+            }
+            st.get_mut(class_sym).members.retain(|m| !stale.contains(m));
+        }
+        true
+    }
+
+    /// The dotted name whose pickle describes `internal`, if there is one.
+    ///
+    /// A pickle names a nested class `Outer.Inner` while its classfile is
+    /// `Outer$Inner`, so both spellings are tried (the `$` form first, since a
+    /// `$` in a top-level name is part of that name).
+    fn pickled_full_name(
+        &mut self,
+        bin: &mut BinaryIndex,
+        internal: &str,
+        is_module: bool,
+    ) -> Option<String> {
+        let full = internal.trim_end_matches('$').replace('/', ".");
+        if self.has_pickle(bin, &full, is_module) {
+            return Some(full);
+        }
+        let dotted = full.replace('$', ".");
+        if dotted != full && self.has_pickle(bin, &dotted, is_module) {
+            return Some(dotted);
+        }
+        None
+    }
+
     fn complete_on(
         &mut self,
         st: &mut SymbolTable,
@@ -278,9 +407,11 @@ impl PickleSupply {
             return Vec::new();
         }
         let internal = sym.jvm_name.clone();
-        // Scoped to the standard library: those are the pickles we validate
-        // against, and a user classfile on `-cp` already has its own path in.
-        if !internal.starts_with("scala/") {
+        // Scoped to the standard library, plus any class `adopt_binary_class`
+        // has taken over: those two are the pickles the typer reads. A plain
+        // Java classfile on `-cp` has no pickle at all and keeps its own path
+        // in through `install_java_class`.
+        if !internal.starts_with("scala/") && !self.adopted.contains(&class_sym.0) {
             return Vec::new();
         }
         let is_module = sym.kind == SymKind::ModuleClass;
@@ -401,6 +532,7 @@ impl PickleSupply {
         for tp in &shape.tparams {
             let id = st.alloc(&tp.name, m, SymKind::TypeParam, Flags::EMPTY, "");
             st.get_mut(id).ty = Type::TypeParam(id);
+            set_tparam_arity(st, id, tp.arity);
             scope.insert(tp.name.clone(), Type::TypeParam(id));
             tparams.push(id);
         }
@@ -709,12 +841,32 @@ impl PickleSupply {
         // supplying one that does not, so the table is left alone.
         if let Some(id) = crate::classpath::find_by_jvm(st, &key) {
             self.stubs.insert(key, id);
+            self.give_stub_its_kinds(st, bin, id, full_name, module);
             return Some(id);
         }
-        // Only classes the library really has: a stub for a name no pickle
-        // describes would be a type we invented.
+        // Outside the library, hand the placeholder to the ordinary classfile
+        // loader rather than building one here. `find_or_stub_java_class`
+        // marks it `JAVA`, which is what makes `ensure_java_loaded` complete it
+        // from its own classfile the moment the program names it; a stub built
+        // below would keep its empty member list forever. It still gets its
+        // kinds now, since that is what the signature being converted is about
+        // to apply.
         if !full_name.starts_with("scala.") {
-            return None;
+            if !self.has_pickle(bin, full_name, module) {
+                return None;
+            }
+            let id = crate::classpath::find_or_stub_java_class(st, &key);
+            // That function also answers by simple name, and a companion's
+            // placeholder -- `Async` standing for `.../Async$` -- is not the
+            // trait this signature names. Handing it back made
+            // `type Async[F[_]] = cats.effect.kernel.Async[F]` resolve to a
+            // class with no members at all, so `F.unit` stopped being one.
+            if st.get(id).jvm_name != key {
+                return None;
+            }
+            self.stubs.insert(key, id);
+            self.give_stub_its_kinds(st, bin, id, full_name, module);
+            return Some(id);
         }
         let sig = {
             let mut src = BinSource(bin);
@@ -756,6 +908,7 @@ impl PickleSupply {
                 .map(|tp| {
                     let t = st.alloc(&tp.name, id, SymKind::TypeParam, Flags::EMPTY, "");
                     st.get_mut(t).ty = Type::TypeParam(t);
+                    set_tparam_arity(st, t, tparam_arity(tp));
                     t
                 })
                 .collect();
@@ -770,6 +923,51 @@ impl PickleSupply {
         trace(format_args!("stubbed class {full_name} (module={module})"));
         self.stubs.insert(key, id);
         Some(id)
+    }
+
+    /// Give a *placeholder* symbol the type parameters its pickle declares.
+    ///
+    /// `find_or_stub_java_class` enters a bare symbol for every name a parent
+    /// list or a descriptor mentions, without reading the classfile. Outside
+    /// the library those placeholders are what a pickled signature keeps
+    /// running into: `cats.effect.kernel.Sync` is entered from `Ref`'s parent
+    /// list with no type parameters at all, so `Sync[F]` is "applied to 1
+    /// argument but the symbol has 0" and every `Ref.of` / `Ref.ofEffect` /
+    /// `Ref.lens` is declined for it.
+    ///
+    /// Only a symbol nothing has filled in yet, and never one of the
+    /// library's: a class the typer has really loaded already has its
+    /// parameters, and reshaping a prelude class is what `ensure_class`
+    /// deliberately refuses to do.
+    fn give_stub_its_kinds(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        id: SymbolId,
+        full_name: &str,
+        module: bool,
+    ) {
+        let jvm = st.get(id).jvm_name.clone();
+        if jvm.starts_with("scala/") || jvm.starts_with("java/") || jvm.starts_with("javax/") {
+            return;
+        }
+        if !st.get(id).tparams.is_empty() || !st.get(id).members.is_empty() {
+            return;
+        }
+        let Ok(sig) = ({
+            let mut src = BinSource(bin);
+            self.sigs.class_sig(&mut src, full_name, module)
+        }) else {
+            return;
+        };
+        if sig.tparams.is_empty() {
+            return;
+        }
+        trace(format_args!(
+            "{full_name}: giving the placeholder symbol its {} pickled type parameter(s)",
+            sig.tparams.len()
+        ));
+        adopt_tparam_kinds(st, id, &sig);
     }
 
     /// The declared descriptor of `name`, searched from `internal` up through
@@ -896,7 +1094,13 @@ impl PickleSupply {
     /// Whether a pickle describes `full_name`.
     fn has_pickle(&mut self, bin: &mut BinaryIndex, full_name: &str, module: bool) -> bool {
         let mut src = BinSource(bin);
-        self.sigs.class_sig(&mut src, full_name, module).is_ok()
+        let r = self.sigs.class_sig(&mut src, full_name, module);
+        if let Err(e) = &r {
+            trace(format_args!(
+                "has_pickle {full_name} module={module}: {e:?}"
+            ));
+        }
+        r.is_ok()
     }
 
     /// The classfile that really holds `full_name`, or `None` if there is none.
@@ -927,6 +1131,8 @@ struct ShapeTParam {
     name: String,
     lo: Option<SigType>,
     hi: Option<SigType>,
+    /// Its own kind arity: 1 for the `G[_]` of `def mapK[G[_]](…)`.
+    arity: usize,
 }
 
 struct Param {
@@ -981,6 +1187,7 @@ fn read_shape(t: &SigType) -> Option<Shape> {
                         name: tp.name.clone(),
                         lo,
                         hi,
+                        arity: tparam_arity(tp),
                     });
                 }
                 cur = result;
@@ -1039,6 +1246,7 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
                 name: tp.name.clone(),
                 lo: tp.lo.clone(),
                 hi: tp.hi.clone(),
+                arity: tp.arity,
             });
             continue;
         }
@@ -1056,6 +1264,7 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
                     name: tp.name.clone(),
                     lo: tp.lo.clone(),
                     hi: tp.hi.clone(),
+                    arity: tp.arity,
                 });
             }
             // Unconstrained and undeterminable: refuse the member rather than
@@ -1087,6 +1296,62 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
             .collect(),
         ret: scala_rs_pickle::sym::apply_subst(&shape.ret, &pin),
     })
+}
+
+/// Give a binary class's type parameters the kinds its pickle declares.
+///
+/// A JVM generic signature writes `trait Monad[F[_]]` as `<F:Ljava/lang/Object;>`
+/// — `F` is a proper type there, and there is no way to say otherwise. So the
+/// symbols are already allocated, in the right order and under the right names;
+/// what they are missing is the parameters *they* take. If the two disagree
+/// about how many there are, the JVM signature is left alone: a mismatch means
+/// this is not the class the pickle describes.
+fn adopt_tparam_kinds(
+    st: &mut SymbolTable,
+    class_sym: SymbolId,
+    sig: &scala_rs_pickle::sym::ClassSig,
+) {
+    let ids = st.get(class_sym).tparams.clone();
+    if ids.is_empty() {
+        // No generic signature at all (or none we parsed): the pickle is the
+        // only description there is.
+        if sig.tparams.is_empty() {
+            return;
+        }
+        let mut fresh = Vec::new();
+        for tp in &sig.tparams {
+            let id = st.alloc(&tp.name, class_sym, SymKind::TypeParam, Flags::EMPTY, "");
+            st.get_mut(id).ty = Type::TypeParam(id);
+            set_tparam_arity(st, id, tparam_arity(tp));
+            fresh.push(id);
+        }
+        st.get_mut(class_sym).tparams = fresh;
+        return;
+    }
+    if ids.len() != sig.tparams.len() {
+        return;
+    }
+    for (id, tp) in ids.into_iter().zip(&sig.tparams) {
+        if st.get(id).tparams.is_empty() {
+            set_tparam_arity(st, id, tparam_arity(tp));
+        }
+    }
+}
+
+/// Make `id` a type constructor of `arity` parameters. The names are
+/// placeholders: only the count is ever read (`SymbolTable::kind_arity`).
+fn set_tparam_arity(st: &mut SymbolTable, id: SymbolId, arity: usize) {
+    if arity == 0 {
+        return;
+    }
+    let inner: Vec<SymbolId> = (0..arity)
+        .map(|i| {
+            let x = st.alloc(format!("_${i}"), id, SymKind::TypeParam, Flags::EMPTY, "");
+            st.get_mut(x).ty = Type::TypeParam(x);
+            x
+        })
+        .collect();
+    st.get_mut(id).tparams = inner;
 }
 
 /// A type parameter's own kind arity. nsc pickles `F[_]` as a `POLYtpe` over
@@ -1205,13 +1470,27 @@ impl PickleSupply {
         d: u32,
     ) -> Option<Type> {
         if let Some(bound) = scope.get(sym) {
-            // A type parameter used as a constructor (`CC[B]`) is higher-kinded;
-            // not expressible here.
-            return if args.is_empty() {
-                Some(bound.clone())
-            } else {
-                None
-            };
+            if args.is_empty() {
+                return Some(bound.clone());
+            }
+            // A type parameter applied to arguments (`F[A]` for an `F[_]`).
+            // `Type::Applied` is exactly that, but only when the constructor
+            // really takes that many parameters: a wildcard from an
+            // existential, or a parameter whose kind we never recovered, would
+            // make `F[A]` a type nothing can be checked against.
+            let bound = bound.clone();
+            if st.kind_arity(&bound) != args.len() {
+                trace(format_args!(
+                    "{sym}: applied to {} argument(s) but is not a constructor of that kind",
+                    args.len()
+                ));
+                return None;
+            }
+            let a = self.conv_all(st, bin, scope, args, d)?;
+            return Some(Type::Applied {
+                ctor: Box::new(bound),
+                args: a,
+            });
         }
         match sym {
             "scala.Unit" => return Some(Type::Unit),
