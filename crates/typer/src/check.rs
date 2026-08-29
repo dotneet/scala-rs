@@ -6272,8 +6272,9 @@ impl Typer {
             if let Some((conv, member, to)) = self.search_extension(&recv_ty, &name, tree.span) {
                 let span = qual.span;
                 let old = std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty));
+                let from = old.ty.clone();
                 let fun = self.ref_implicit(conv, span);
-                **qual = Tree {
+                let applied = Tree {
                     id: old.id,
                     span,
                     kind: TreeKind::Apply {
@@ -6284,6 +6285,7 @@ impl Typer {
                     sym: conv,
                     postfix: false,
                 };
+                **qual = self.fill_conv_implicits(conv, &from, applied, span);
                 found = if let Some(cls) = self.st.class_sym_of(&to) {
                     self.st.lookup_member(cls, &name)
                 } else {
@@ -6853,8 +6855,9 @@ impl Typer {
         };
         let span = qual.span;
         let old = std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty));
+        let from = old.ty.clone();
         let conv_fun = self.ref_implicit(conv, span);
-        **qual = Tree {
+        let applied = Tree {
             id: old.id,
             span,
             kind: TreeKind::Apply {
@@ -6865,6 +6868,7 @@ impl Typer {
             sym: conv,
             postfix: false,
         };
+        **qual = self.fill_conv_implicits(conv, &from, applied, span);
         fun.sym = member;
         fun.ty = self.st.get(member).ty.clone();
         true
@@ -10102,6 +10106,7 @@ impl Typer {
             let mut cargs = Vec::with_capacity(clause.len());
             for p in clause {
                 let want = inst(p);
+                self.warm_implicit_scope(&want);
                 match self.search_implicit(&want) {
                     ImplicitSearch::Found(inner) => {
                         cargs.push(self.implicit_tree(inner, &want, span, depth + 1))
@@ -10158,6 +10163,7 @@ impl Typer {
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| self.st.get(*pid).ty.clone());
+            self.warm_implicit_scope(&pty);
             match self.search_implicit(&pty) {
                 ImplicitSearch::Found(id) => {
                     let mut r = self.implicit_tree(id, &pty, span, 0);
@@ -10863,7 +10869,30 @@ impl Typer {
 
     fn arg_score(&self, arg: &Type, param: &Type) -> Option<i32> {
         if let Type::ByName(inner) = param {
-            return self.arg_score(arg, inner);
+            if let Some(s) = self.arg_score(arg, inner) {
+                return Some(s);
+            }
+            // The argument is already the thunk `adapt` wrapped it in: this
+            // call is being typed a *second* time, which is what filling a
+            // `name$default$n` getter does -- the getter takes the parameters
+            // that precede the default, so the arguments already given are
+            // handed to it and typed again. `() => T` is what a `=> T`
+            // parameter ends up holding, so score it as `T`. Nothing matched
+            // it before, and slick's `copy(where = w2.orElse(where), …)` came
+            // out as `no matching overload for (=> Option[Node])Option[Node]
+            // with arguments (() => <notype>)`.
+            if let Type::Function { params, ret } = arg {
+                if params.is_empty() {
+                    // The body is re-typed by this very pass, so on the way in
+                    // it is the `<notype>` placeholder and constrains nothing —
+                    // exactly like an un-inferred function literal.
+                    if ret.is_no_type() {
+                        return Some(6);
+                    }
+                    return self.arg_score(ret, inner);
+                }
+            }
+            return None;
         }
         // A `xs: _*` argument is already the sequence the parameter wants.
         if let Type::Repeated(inner) = arg {
@@ -13407,6 +13436,116 @@ impl Typer {
         crate::prelude_strhier::link_string_parents(&mut self.st);
     }
 
+    /// Load `<internal>$`, a class's companion object, if it has one on the
+    /// classpath and is not already there.
+    ///
+    /// Only for Scala class files: a *Java* class's `Foo$` is a nested class,
+    /// not a companion, and installing it would enter a class called `Foo$` in
+    /// the package.
+    fn load_companion_module(&mut self, class_id: SymbolId) {
+        if class_id.is_none() || self.st.get(class_id).kind != SymKind::Class {
+            return;
+        }
+        if self.st.companion_module(class_id).is_some() {
+            return;
+        }
+        // Not gated on the `JAVA` flag: `find_or_stub_java_class` sets it on
+        // every placeholder it enters, including Scala classes reached through
+        // a parent list, and nothing clears it afterwards. The classfile's own
+        // `is_scala` below is the honest test.
+        let internal = self.st.get(class_id).jvm_name.clone();
+        if internal.is_empty()
+            || internal.ends_with('$')
+            || internal.starts_with('[')
+            || internal.starts_with("java/")
+            || internal.starts_with("javax/")
+            || internal.starts_with("scala/")
+        {
+            return;
+        }
+        let module = format!("{internal}$");
+        if !self.completed_java.insert(module.clone()) {
+            return;
+        }
+        let Ok(Some(bytes)) = self.binary.find_class(&module) else {
+            return;
+        };
+        let Ok(jc) = crate::javaclass::parse_java_classfile(&bytes) else {
+            return;
+        };
+        if !jc.is_scala {
+            return;
+        }
+        let pkg = internal.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        let owner = crate::classpath::ensure_package(&mut self.st, pkg);
+        let mid = crate::classpath::install_java_class_in(&mut self.st, &jc, owner);
+        // Deliberately *not* `adopt_binary_class`: only the implicits are
+        // wanted here, and adopting the whole companion costs minutes.
+        self.pickle
+            .supply_implicit_members(&mut self.st, &mut self.binary, mid);
+    }
+
+    /// Apply the implicit clauses of an implicit conversion that has any.
+    ///
+    /// `tree` is the conversion already applied to the receiver; a conversion
+    /// like cats' `toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])`
+    /// needs a second application for its implicit clause, or codegen emits a
+    /// call one argument short of the descriptor.
+    fn fill_conv_implicits(
+        &mut self,
+        conv: SymbolId,
+        from: &Type,
+        mut tree: Tree,
+        span: Span,
+    ) -> Tree {
+        for clause in self.conv_implicit_params(conv, from) {
+            let mut args = Vec::with_capacity(clause.len());
+            for want in &clause {
+                self.warm_implicit_scope(want);
+                match self.search_implicit(want) {
+                    ImplicitSearch::Found(id) => {
+                        let mut a = self.implicit_tree(id, want, span, 0);
+                        self.adapt(&mut a, want);
+                        args.push(a);
+                    }
+                    _ => {
+                        let diverged = self.diverged_implicit.borrow().clone();
+                        self.error(span, self.missing_implicit_message(want, diverged));
+                        return tree;
+                    }
+                }
+            }
+            let ty = tree.ty.clone();
+            tree = Tree {
+                id: NodeId(0),
+                span,
+                kind: TreeKind::Apply {
+                    fun: Box::new(tree),
+                    args,
+                },
+                ty,
+                sym: conv,
+                postfix: false,
+            };
+        }
+        tree
+    }
+
+    /// Make sure every companion object in `pt`'s implicit scope is loaded.
+    ///
+    /// A companion that came from a jar is a class file of its own that nothing
+    /// else asks for, so without this `Async[IO]` searches an implicit scope
+    /// that does not yet contain `cats.effect.IO.asyncForIO` — the only place
+    /// that witness exists. The search runs under an immutable borrow and
+    /// cannot load anything itself, so it has to happen here, on demand: doing
+    /// it for every jar class as it is adopted pulls in the whole transitive
+    /// closure of cats-effect and takes minutes.
+    pub(crate) fn warm_implicit_scope(&mut self, pt: &Type) {
+        for c in self.implicit_scope_classes(pt) {
+            self.load_companion_module(c);
+        }
+    }
+
     fn load_binary_into(
         &mut self,
         internal: &str,
@@ -13945,8 +14084,9 @@ impl Typer {
             ImplicitSearch::Found(id) => {
                 let span = tree.span;
                 let arg = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+                let from = arg.ty.clone();
                 let fun = self.ref_implicit(id, span);
-                *tree = Tree {
+                let applied = Tree {
                     id: arg.id,
                     span,
                     kind: TreeKind::Apply {
@@ -13957,6 +14097,7 @@ impl Typer {
                     sym: id,
                     postfix: false,
                 };
+                *tree = self.fill_conv_implicits(id, &from, applied, span);
                 return;
             }
             ImplicitSearch::Ambiguous(ids) => {
