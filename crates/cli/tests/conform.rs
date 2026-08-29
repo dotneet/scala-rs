@@ -220,5 +220,6 @@ conform!(
     tuple_fn_type,
     mutable_ops,
     universal_hash,
-    any_on_function
+    any_on_function,
+    null_reference
 );

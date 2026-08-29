@@ -1234,7 +1234,13 @@ impl SymbolTable {
                 | Type::Refined { .. }
                 | Type::ThisType(_)
                 | Type::SingleType { .. }
-                | Type::Annotated { .. },
+                | Type::Annotated { .. }
+                // A function and a tuple are reference types too: `val f: Int
+                // => String = null` is legal Scala.
+                | Type::Function { .. }
+                | Type::Tuple(_)
+                | Type::Applied { .. }
+                | Type::Named { .. },
             ) => true,
             (
                 Type::Int
