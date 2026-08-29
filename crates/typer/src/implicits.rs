@@ -266,6 +266,17 @@ impl Typer {
         }
     }
 
+    /// The classes whose companions form `ty`'s implicit scope (SLS 7.2):
+    /// the type constructor, its arguments, their base classes, and the
+    /// enclosing prefixes. Exposed so the typer can make sure each one's
+    /// companion object is actually *loaded* before a search runs — the search
+    /// itself holds an immutable borrow and cannot read a class file.
+    pub(crate) fn implicit_scope_classes(&self, ty: &Type) -> Vec<SymbolId> {
+        let mut parts = Vec::new();
+        self.collect_type_parts(ty, &mut parts, &mut std::collections::HashSet::new());
+        parts
+    }
+
     fn companion_implicits(&self, ty: &Type) -> Vec<SymbolId> {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -949,9 +960,80 @@ impl Typer {
         crate::symbol::subst_tparams_slice(&tps, &args_t, &ty)
     }
 
+    /// The conversion's own type arguments, solved from the receiver type.
+    fn conv_targs(&self, id: SymbolId, from: &Type) -> Vec<Type> {
+        let s = self.st.get(id);
+        let tps = s.tparams.clone();
+        let param = match &s.ty {
+            Type::Method { paramss, .. } => paramss.first().and_then(|c| c.first()).cloned(),
+            Type::Function { params, .. } => params.first().cloned(),
+            _ => None,
+        };
+        let Some(param) = param else {
+            return vec![Type::AnyRef; tps.len()];
+        };
+        tps.iter()
+            .map(|tp| unify_conv_tparam(*tp, &param, from).unwrap_or(Type::AnyRef))
+            .collect()
+    }
+
+    /// The conversion's *implicit* parameter clauses, with its type parameters
+    /// solved from the receiver.
+    ///
+    /// cats' syntax layer is
+    /// `implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])`:
+    /// applying it to the receiver alone leaves the second clause unfilled, and
+    /// the call goes out with fewer arguments than its descriptor declares.
+    pub(crate) fn conv_implicit_params(&self, id: SymbolId, from: &Type) -> Vec<Vec<Type>> {
+        let s = self.st.get(id);
+        let Type::Method { paramss, .. } = &s.ty else {
+            return Vec::new();
+        };
+        if paramss.len() < 2 {
+            return Vec::new();
+        }
+        let paramss = paramss.clone();
+        let tps = s.tparams.clone();
+        let targs = self.conv_targs(id, from);
+        paramss[1..]
+            .iter()
+            .map(|c| {
+                c.iter()
+                    .map(|p| crate::symbol::subst_tparams_slice(&tps, &targs, p))
+                    .collect()
+            })
+            .collect()
+    }
+
     fn conv_param_matches(&self, id: SymbolId, from: &Type, param: &Type) -> bool {
-        let param = self.erase_method_tparams(id, param);
-        self.st.is_sub_type(from, &param) || matches!(param, Type::Any | Type::Wildcard)
+        let erased = self.erase_method_tparams(id, param);
+        if self.st.is_sub_type(from, &erased) || matches!(erased, Type::Any | Type::Wildcard) {
+            return true;
+        }
+        // `fa: F[A]`, with `F` and `A` both the conversion's own parameters,
+        // erases to `?[?]`. Any type applied to the right number of arguments
+        // fits it -- a class (`Box[Int]`) just as much as another higher-kinded
+        // parameter (`G[Int]`), which is the only shape `is_sub_type`
+        // recognised.
+        let fits_ctor = match &erased {
+            Type::Applied { ctor, args } if matches!(**ctor, Type::Wildcard) => {
+                applied_args(from).is_some_and(|a| a.len() == args.len())
+            }
+            _ => false,
+        };
+        if !fits_ctor {
+            return false;
+        }
+        // That widening alone would let a higher-kinded conversion claim every
+        // applied type, turning "not a member" into "no implicit". A conversion
+        // whose own implicit clause has no witness is not applicable (nsc
+        // checks the same), and that is what keeps the widening honest. Only
+        // the widened path pays for the search; a conversion that matched by
+        // conformance is decided exactly as before.
+        self.conv_implicit_params(id, from)
+            .iter()
+            .flatten()
+            .all(|want| self.search_implicit_at(want, 1).is_found())
     }
 
     pub(crate) fn ref_implicit(&self, id: SymbolId, span: Span) -> Tree {
@@ -1176,6 +1258,42 @@ fn unify_conv_tparam(tp: SymbolId, param: &Type, from: &Type) -> Option<Type> {
             .iter()
             .zip(fa.iter())
             .find_map(|(p, f)| unify_conv_tparam(tp, p, f)),
+        // The parameter is an application of a higher-kinded parameter:
+        // `implicit def toFlatMapOps[F[_], A](fa: F[A])`. Solving `F` from a
+        // receiver `Box[Int]` means taking the receiver's type *constructor*,
+        // not one of its arguments; solving `A` means matching argument for
+        // argument, whether the receiver is a class application (`Box[Int]`)
+        // or another higher-kinded one (`G[Int]` inside `def go[G[_]]`).
+        // Without this `F` fell through to `AnyRef` and cats' whole syntax
+        // layer resolved to `FlatMap[AnyRef]`.
+        (Type::Applied { ctor, args: pa }, actual) => {
+            if matches!(**ctor, Type::TypeParam(id) if id == tp) {
+                return type_ctor_of(actual);
+            }
+            let fa = applied_args(actual)?;
+            pa.iter()
+                .zip(fa.iter())
+                .find_map(|(p, f)| unify_conv_tparam(tp, p, f))
+        }
+        _ => None,
+    }
+}
+
+/// The type constructor of an applied type: `Box[Int]` -> `Box`, `G[Int]` -> `G`.
+fn type_ctor_of(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Class { sym, args } if !args.is_empty() => Some(Type::Class {
+            sym: *sym,
+            args: Vec::new(),
+        }),
+        Type::Applied { ctor, .. } => Some((**ctor).clone()),
+        _ => None,
+    }
+}
+
+fn applied_args(ty: &Type) -> Option<&[Type]> {
+    match ty {
+        Type::Class { args, .. } | Type::Applied { args, .. } => Some(args),
         _ => None,
     }
 }

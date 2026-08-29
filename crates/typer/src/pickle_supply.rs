@@ -98,6 +98,8 @@ pub struct PickleSupply {
     /// [`PickleSupply::adopt_binary_class`]). Also the gate that lets
     /// `complete_named` serve a class outside `scala.*`.
     adopted: HashSet<u32>,
+    /// Classes [`PickleSupply::supply_implicit_members`] has already served.
+    implicits_supplied: HashSet<u32>,
 }
 
 /// One `type T[...] = U` recovered from a package object's pickle.
@@ -336,6 +338,88 @@ impl PickleSupply {
         true
     }
 
+    /// Install the members `class_sym`'s pickle marks `implicit`, and only
+    /// those.
+    ///
+    /// A companion object is in the implicit scope of its class (SLS 7.2), so
+    /// a search for `Async[IO]` has to see `cats.effect.IO.asyncForIO`. Going
+    /// through [`PickleSupply::adopt_binary_class`] to get it would install
+    /// every one of `IO$`'s ~200 members, and completing each of those drags
+    /// in most of cats-effect and cats-kernel — minutes of work for a
+    /// six-line source file. The implicit scope needs the implicits; the rest
+    /// of the companion is left to the ordinary on-demand path, which still
+    /// serves it when the program actually names a member.
+    ///
+    /// Returns how many members were installed.
+    pub fn supply_implicit_members(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+    ) -> usize {
+        if class_sym.is_none() || !st.get(class_sym).is_class_like() {
+            return 0;
+        }
+        let internal = st.get(class_sym).jvm_name.clone();
+        if internal.is_empty()
+            || internal.starts_with("scala/")
+            || internal.starts_with("java/")
+            || internal.starts_with("javax/")
+        {
+            return 0;
+        }
+        if !self.implicits_supplied.insert(class_sym.0) {
+            return 0;
+        }
+        let is_module = st.get(class_sym).kind == SymKind::ModuleClass;
+        let Some(full) = self.pickled_full_name(bin, &internal, is_module) else {
+            return 0;
+        };
+        let Ok(sig) = ({
+            let mut src = BinSource(bin);
+            self.sigs.class_sig(&mut src, &full, is_module)
+        }) else {
+            return 0;
+        };
+        let mut names: Vec<String> = Vec::new();
+        for m in &sig.members {
+            if m.kind != MemberKind::Def || !m.is_public_api() || !m.has(pflags::IMPLICIT) {
+                continue;
+            }
+            let src_name = scala_rs_pickle::names::decode_method_name(&m.name);
+            if src_name.is_empty() || src_name == "<init>" || src_name.contains('$') {
+                continue;
+            }
+            if !names.contains(&src_name) {
+                names.push(src_name);
+            }
+        }
+        let mut n = 0;
+        for name in names {
+            // What the classfile reader put there, so it can be dropped once
+            // the pickle has supplied something better -- two members of the
+            // same name and arity would make every call ambiguous.
+            let stale: Vec<SymbolId> = st
+                .get(class_sym)
+                .members
+                .iter()
+                .copied()
+                .filter(|&m| {
+                    let s = st.get(m);
+                    s.kind == SymKind::Method && s.name == name
+                })
+                .collect();
+            let installed = self.complete_named(st, bin, class_sym, &name, false);
+            if installed.is_empty() {
+                continue;
+            }
+            st.get_mut(class_sym).members.retain(|m| !stale.contains(m));
+            n += installed.len();
+        }
+        trace(format_args!("{full}: supplied {n} implicit member(s)"));
+        n
+    }
+
     /// The dotted name whose pickle describes `internal`, if there is one.
     ///
     /// A pickle names a nested class `Outer.Inner` while its classfile is
@@ -411,7 +495,10 @@ impl PickleSupply {
         // has taken over: those two are the pickles the typer reads. A plain
         // Java classfile on `-cp` has no pickle at all and keeps its own path
         // in through `install_java_class`.
-        if !internal.starts_with("scala/") && !self.adopted.contains(&class_sym.0) {
+        if !internal.starts_with("scala/")
+            && !self.adopted.contains(&class_sym.0)
+            && !self.implicits_supplied.contains(&class_sym.0)
+        {
             return Vec::new();
         }
         let is_module = sym.kind == SymKind::ModuleClass;
@@ -473,12 +560,13 @@ impl PickleSupply {
             if !m.is_public_api() && !(synthetic_ok && is_default_getter(&m.name)) {
                 continue;
             }
-            let Some(shape) = read_shape(&m.ty) else {
+            let Some(mut shape) = read_shape(&m.ty) else {
                 trace(format_args!(
                     "{internal}#{name}: unreadable signature shape"
                 ));
                 continue;
             };
+            shape.implicit = m.has(pflags::IMPLICIT);
             let Some(shape) = pin_undetermined_tparams(shape) else {
                 trace(format_args!(
                     "{internal}#{name}: type parameter appears only in an implicit \
@@ -706,6 +794,10 @@ impl PickleSupply {
             }
         }
 
+        if shape.implicit {
+            let f = st.get(m).flags.with(Flags::IMPLICIT);
+            st.get_mut(m).flags = f;
+        }
         st.get_mut(m).owner = class_sym;
         st.get_mut(class_sym).members.push(m);
         *took_function = *took_function || has_function;
@@ -1152,6 +1244,11 @@ struct Shape {
     tparams: Vec<ShapeTParam>,
     clauses: Vec<Clause>,
     ret: SigType,
+    /// The member is an `implicit def` / `implicit val`. Only the pickle says
+    /// so — a classfile has no bit for it — and without it a jar's companion
+    /// object contributes nothing to implicit search (`Async[IO]` is
+    /// `IO.asyncForIO`, and that is the only place it lives).
+    implicit: bool,
 }
 
 impl Shape {
@@ -1216,6 +1313,7 @@ fn read_shape(t: &SigType) -> Option<Shape> {
                     tparams,
                     clauses,
                     ret: other.clone(),
+                    implicit: false,
                 })
             }
         }
@@ -1277,6 +1375,7 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
     }
     Some(Shape {
         tparams: kept,
+        implicit: shape.implicit,
         clauses: shape
             .clauses
             .iter()
@@ -1447,7 +1546,7 @@ impl PickleSupply {
                 }
                 self.conv_at(st, bin, &inner, result, d)
             }
-            SigType::Ref { sym, args } => self.conv_ref(st, bin, scope, sym, args, d),
+            SigType::Ref { sym, args } => self.conv_ref(st, bin, scope, sym, args, d, 0),
             // `this.type` widens to the receiver applied to its own type
             // parameters; `type_select` then substitutes the receiver's
             // arguments into it, so `b ++= xs` on a `Builder[Int, List[Int]]`
@@ -1460,6 +1559,10 @@ impl PickleSupply {
         }
     }
 
+    /// `want_arity` is the kind the *position* expects: 0 for an ordinary
+    /// type, 1 for the argument of an `F[_]`-shaped parameter. Only a position
+    /// that wants a constructor may be filled by an unapplied class.
+    #[allow(clippy::too_many_arguments)]
     fn conv_ref(
         &mut self,
         st: &mut SymbolTable,
@@ -1468,6 +1571,7 @@ impl PickleSupply {
         sym: &str,
         args: &[SigType],
         d: u32,
+        want_arity: usize,
     ) -> Option<Type> {
         if let Some(bound) = scope.get(sym) {
             if args.is_empty() {
@@ -1576,14 +1680,40 @@ impl PickleSupply {
             }
             return None;
         };
-        let a = self.conv_all(st, bin, scope, args, d)?;
-        if a.len() != st.get(cls).tparams.len() {
-            trace(format_args!(
-                "{sym}: applied to {} arguments but the symbol has {}",
-                a.len(),
-                st.get(cls).tparams.len()
-            ));
-            return None;
+        // Each argument is converted knowing the *kind* its position wants, so
+        // an unapplied class reference is accepted exactly where a
+        // higher-kinded parameter stands and nowhere else.
+        let tps = st.get(cls).tparams.clone();
+        let mut a = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let want = tps.get(i).map(|t| st.get(*t).tparams.len()).unwrap_or(0);
+            let conv = match arg {
+                SigType::Ref {
+                    sym: asym,
+                    args: aargs,
+                } => self.conv_ref(st, bin, scope, asym, aargs, d, want),
+                other => self.conv_at(st, bin, scope, other, d),
+            };
+            a.push(conv?);
+        }
+        let arity = tps.len();
+        if a.len() != arity {
+            // A *wholly* unapplied reference to a parameterised class is a type
+            // constructor, not an arity error -- but only where the position
+            // asked for one: `implicit def asyncForIO: Async[IO]` pickles its
+            // argument as a bare `IO`, because `Async`'s parameter is itself
+            // `F[_]`. Declining it left every such witness unusable, and with
+            // it the whole implicit scope of `Async[IO]`. Accepting it
+            // *everywhere* was worse: a bare `Iterable` in an ordinary
+            // position became a memberless `Iterable` that shadowed the real
+            // `map`, and slick lost 99 more calls than it gained.
+            if !a.is_empty() || arity == 0 || want_arity != arity {
+                trace(format_args!(
+                    "{sym}: applied to {} arguments but the symbol has {arity}",
+                    a.len(),
+                ));
+                return None;
+            }
         }
         Some(Type::Class { sym: cls, args: a })
     }

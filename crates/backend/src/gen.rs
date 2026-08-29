@@ -11664,9 +11664,9 @@ fn walk_boxed_vars(tree: &Tree, st: &SymbolTable, out: &mut HashSet<SymbolId>) {
                 }
                 walk_boxed_vars(p, st, out);
             }
-            let mut free = Vec::new();
+            let mut free = FreeVars::default();
             collect_free(body, &bound, &mut free, st);
-            for id in free {
+            for id in free.vars {
                 let s = st.get(id);
                 if s.flags.contains(Flags::MUTABLE)
                     && matches!(st.get(s.owner).kind, SymKind::Method)
@@ -11742,13 +11742,40 @@ fn walk_boxed_vars(tree: &Tree, st: &SymbolTable, out: &mut HashSet<SymbolId>) {
     }
 }
 
-fn collect_free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>, st: &SymbolTable) {
+/// What a lambda body reaches for outside itself: the enclosing method's locals
+/// it captures, and whether it also needs the enclosing *instance*.
+#[derive(Default)]
+struct FreeVars {
+    vars: Vec<SymbolId>,
+    /// The body mentions the enclosing `this` — written out (`this.f`, `super.f`)
+    /// or, far more often, left implicit in a call to a method of the enclosing
+    /// class. Without this the lambda class gets no `$outer` and codegen's
+    /// `load_this` reads slot 0, which inside `apply` is the *lambda*:
+    /// `C$$anonfun$0 cannot be cast to C` at runtime.
+    uses_this: bool,
+}
+
+/// Does an `Ident` naming `id` compile to a call on the enclosing instance?
+/// Members of an *object* do not — they go through `MODULE$` — and neither do
+/// a nested `def`'s locals, whose owner is a method.
+fn ident_reads_enclosing_this(st: &SymbolTable, id: SymbolId) -> bool {
+    let s = st.get(id);
+    if s.kind != SymKind::Method {
+        return false;
+    }
+    matches!(st.get(s.owner).kind, SymKind::Class)
+}
+
+fn collect_free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut FreeVars, st: &SymbolTable) {
     match &tree.kind {
         TreeKind::Ident { .. } => {
             if !tree.sym.is_none() && !bound.contains(&tree.sym) {
                 let s = st.get(tree.sym);
-                if s.kind == SymKind::Term && !out.contains(&tree.sym) {
-                    out.push(tree.sym);
+                if s.kind == SymKind::Term && !out.vars.contains(&tree.sym) {
+                    out.vars.push(tree.sym);
+                }
+                if ident_reads_enclosing_this(st, tree.sym) {
+                    out.uses_this = true;
                 }
             }
         }
@@ -11761,7 +11788,7 @@ fn collect_free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>,
             }
             collect_free(body, &b, out, st);
         }
-        TreeKind::Super { .. } | TreeKind::This { .. } => {}
+        TreeKind::Super { .. } | TreeKind::This { .. } => out.uses_this = true,
         TreeKind::Select { qual, .. } => collect_free(qual, bound, out, st),
         TreeKind::UnApply { fun, args } => {
             collect_free(fun, bound, out, st);
@@ -11838,8 +11865,8 @@ fn collect_free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>,
             // those locals right here.
             if let Some(cid) = new_class_sym(st, tpt) {
                 for c in &st.get(cid).captures {
-                    if !bound.contains(c) && !out.contains(c) {
-                        out.push(*c);
+                    if !bound.contains(c) && !out.vars.contains(c) {
+                        out.vars.push(*c);
                     }
                 }
             }
@@ -12100,12 +12127,12 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             bound.insert(p.sym);
         }
     }
-    let mut free = Vec::new();
+    let mut free = FreeVars::default();
     collect_free(body, &bound, &mut free, ctx.st);
 
     let mut local_caps = Vec::new();
-    let mut need_outer = false;
-    for id in &free {
+    let mut need_outer = free.uses_this;
+    for id in &free.vars {
         if frame.get(*id).is_some() {
             local_caps.push(*id);
         } else {
