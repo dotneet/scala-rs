@@ -6188,6 +6188,107 @@ adopt は要りません。
   ループ）を `--scala-library` と real scalac の両方でコンパイル・実行し、
   `tests/fixtures/expected/t1_wildcard_inherited.txt` と一致することを見る。
 
+### `Seq` は `Int => A`（`agent/seqfn`）
+
+```scala
+val s = List(10, 20, 30)
+println(List(0, 2).map(s))            // List(10, 30) -- List を Int => A として渡す
+val f: Int => Int = List(10, 20, 30)  // 代入も通る
+List(1, 2).isDefinedAt(5)             // false
+```
+
+が `type mismatch; found: List[Int]  required: (Int) => Int` になっていました。
+`Map` を関数として渡す辺（`crates/typer/src/prelude_mism4.rs`、`Map[K, V] <:
+Function1[K, V]`）は既にあったのに、`Seq` 側だけ抜けていました。
+
+2.13 の `scala.collection.Seq[A]` は宣言そのものが `PartialFunction[Int, A]`
+（したがって `Int => A`）を継承しています（`javap scala.collection.Seq`）:
+
+```text
+public interface scala.collection.Seq<A> extends scala.collection.Iterable<A>,
+  scala.PartialFunction<java.lang.Object, A>, scala.collection.SeqOps<...>, scala.Equals
+```
+
+`Map` は `Function1` を直接の親にしていました（`PartialFunction` を挟むと
+`toMap` の型検査が壊れる既知の理由があったため）。`Seq` にはその理由が無いので、
+今回は真の階層どおり `Seq <: PartialFunction[Int, A] <: Function1[Int, A]` を
+`crates/typer/src/prelude_seqfn.rs`（新規ファイル）で張りました。辺は
+`scala/collection/Seq`（`prelude_hier.rs` が組み立てる、`List` / `Vector` /
+`ArraySeq` / `Range` / `LazyList` / `Queue` / `mutable.Seq`（`Buffer` /
+`ArrayBuffer` / `ListBuffer` を含む）などすべての共通祖先）1 箇所にだけ張り、
+`base_type_seq` の推移的な親探索で下位のすべての具象コレクションに伝播します。
+
+`PartialFunction` を親にしたことで、`Seq` は `isDefinedAt` / `applyOrElse` に加えて
+`lift` / `orElse`（今まで `add_partial_function` に無かったので同じファイルで追加）
+も継承します。`Seq[A]` は `SeqOps.apply(Int): A` と
+`PartialFunction[Int, A].apply(Int): A` という「実体化後にしか区別できない」2 つの
+`apply` を持つことになりますが、`s(1)` / `s.apply(2)` のような素の添字アクセスは
+（`overload_member_types` の既存の仕組みにより）今までどおり `List` 自身の
+具象 `apply` に解決され、`invokeinterface scala/collection/SeqOps.apply` を吐きます
+（`Function1` として渡した先だけが `invokeinterface scala/Function1.apply` になる）。
+
+`Array` は `Seq` そのものではなく、`Predef.wrapBooleanArray: Array[Boolean] =>
+mutable.ArraySeq[Boolean]` という**暗黙変換**を経由して初めて `Seq` にたどり着きます
+（`List(0, 2).filter(anArrayOfBoolean)` / `(2 to 30).filter(sieve)`）。この
+`wrapBooleanArray` はプレリュードに丸ごと欠けていたので新設し（`prelude_seqfn.rs`）、
+戻り値は実 jar の descriptor（`scala/collection/mutable/ArraySeq$ofBoolean`）に
+一致させています（`mutable.ArraySeq` トレイト自体を返す版は型検査は通るのに
+`NoSuchMethodError` で実行時リンクに失敗したため。`mutable.ArraySeq` は
+`prelude_mutcoll.rs` が `AnyRef` だけを親にして手組みしていたので、`Seq` の祖先
+`mutable.IndexedSeq` への辺もここで足しています）。`wrapIntArray` と同じ理由で
+`IMPLICIT` にはしていません（`xArrayOps` と競合させないため）。ただし
+`wrapXArray` は暗黙変換であって部分型付けではないので、`arg_score`（オーバーロード
+候補の適用可否）と `adapt`（実際の呼び出し木の構築）の両方に専用のフックが要ります
+（新規ファイル `crates/typer/src/seqfn_view.rs`）。
+
+これらはすべて `library_abi` 専用です。私有ランタイム（`--no-scala-library`、
+`crates/backend/src/runtime.rs`）の `scala/PartialFunction` は `isDefinedAt` /
+`applyOrElse` しか持たない抽象インタフェースで、`lift` / `orElse` の default 実装が
+無く、`List` / `Vector` などの private classfile も `scala/PartialFunction` /
+`scala/Function1` を implements しません。型だけ通して実装の無い相手に
+`invokeinterface` を飛ばす壊れたリンクを避けるため、非 jar モードでは今までどおり
+`type mismatch` / `value isDefinedAt is not a member of ...` を診断します。
+
+#### 検証
+
+fixture 接頭辞は `sf`、テストは `crates/cli/tests/seqfn.rs` です。
+
+| fixture | 中身 | 期待 |
+|---|---|---|
+| `sf.scala` | `List` / `Vector` / `mutable.ArrayBuffer` を `Int => A` として代入・引数の両方の位置で渡す、共変（`List[Dog] <: Int => Animal`）、`isDefinedAt` / `lift` / `orElse`、`wrapString` 経由の `String`、`wrapBooleanArray` 経由の `Array[Boolean]`（代入と `filter` の両方）（library モード、`java -Xverify:all`、期待出力は実 scalac 2.13.16 の stdout そのまま） | `20` `List(10, 30)` `c` `7` `Rex` `true` `false` `Some(2)` `None` `1` `-1` `c` `true` `false` `List(0, 2)` `List(0, 1)` |
+
+`sf.scala` は `seqfn_fixture_dual_run` から回します。同ファイルには最小形の
+受理テスト（`a_list_is_usable_as_int_to_a` /
+`partial_function_members_reach_list_without_upstaging_its_own_apply` /
+`vector_indexed_seq_and_array_buffer_are_all_usable_as_functions` /
+`a_string_is_usable_as_int_to_char_via_wrapped_string` /
+`a_boolean_array_is_usable_as_int_to_boolean` /
+`a_list_of_a_subtype_is_usable_as_int_to_the_supertype`）も置いてあります。
+逆に、緩めた規則が診断を飲み込まないことは `sf_bad.scala`（`List[Int]` を
+`String => Int` に渡す／`List[Animal]` を共変性の効かない向きで `Int => Dog` に渡す）
+で固定しています（`sf_bad_is_still_rejected`）。実 scalac 2.13.16 も両方拒否します。
+`--no-scala-library` で今までどおりの診断が出ることは
+`without_the_library_the_old_diagnostics_still_fire` で固定しています。
+
+#### Remaining
+
+- `Set[A] <: A => Boolean` も実在します（`SetOps` が `Function1[A, Boolean]` を
+  継承）が、今回は張っていません（`prelude_mism4.rs` が `Map` のときに残した
+  同じ判断で、オーバーロード解決・implicit 探索への波及を抑えるためです）。
+- `Predef.wrapXArray` は `Boolean` 以外（`Int` は既存の `wrapIntArray` があります
+  が `Seq` に繋がっていない `ArraySeq$ofInt` を返すだけで、`Byte` / `Short` /
+  `Char` / `Long` / `Float` / `Double` / `Unit` / 参照型は丸ごと無し）は
+  今回のスライスでは足していません。`Array[Int]` を `Int => Int` として渡す形は
+  実 scalac は通りますがこちらはまだ `type mismatch` のままです。
+- `Array` を関数として渡す変換は `arg_score` / `adapt` への専用フック
+  （`seqfn_view.rs`）で、汎用の「引数位置でも implicit view を試す」機構では
+  ありません。`arg_score` は元々 `is_sub_type` だけで判定しており、他の
+  暗黙変換一般が引数位置で効かない同種の穴が残っている可能性があります。
+- `s(1)` / `s.apply(2)` は今までどおり `invokeinterface
+  scala/collection/SeqOps.apply` を吐きます（実 scalac は `invokevirtual
+  scala/collection/immutable/List.apply` で、`agent/seqfn` 以前からの既存の差）。
+  実行結果は同じで、`java -Xverify:all` も通ります。
+
 ## ライセンス
 
 Apache-2.0

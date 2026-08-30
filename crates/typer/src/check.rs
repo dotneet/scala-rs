@@ -13388,6 +13388,17 @@ impl Typer {
             if let Some(view) = self.function_view(arg) {
                 return self.arg_score(&view, param);
             }
+            // `List(0, 2).filter(anArrayOfBoolean)`: the argument itself is
+            // not a function, but `Predef.wrapBooleanArray` turns it into one
+            // (`mutable.ArraySeq[Boolean] <: Seq[Boolean] <:
+            // PartialFunction[Int, Boolean] <: Int => Boolean`,
+            // `seqfn_view.rs`). Scored, not adapted -- `adapt` inserts the
+            // real call once this alternative is picked.
+            if let Type::Array(elem) = arg {
+                if let Some((_, view)) = self.array_seq_wrap(elem) {
+                    return self.arg_score(&view, param);
+                }
+            }
         }
         None
     }
@@ -16916,6 +16927,12 @@ impl Typer {
         if self.adapt_to_sam(tree, pt) {
             return;
         }
+        // `val f: Int => Boolean = anArrayOfBoolean` / an argument already
+        // scored applicable by the `Array` fallback in `arg_score`: build the
+        // real `wrapBooleanArray(...)` call now (`seqfn_view.rs`).
+        if is_function_pt(pt) && self.coerce_array_to_function(tree, pt) {
+            return;
+        }
         match self.search_conversion(&tree.ty, pt) {
             ImplicitSearch::Found(id) => {
                 let span = tree.span;
@@ -18164,7 +18181,7 @@ fn function_sig(pt: &Type) -> Option<(Vec<Type>, Type)> {
     }
 }
 
-fn is_function_pt(pt: &Type) -> bool {
+pub(crate) fn is_function_pt(pt: &Type) -> bool {
     match pt {
         Type::Function { .. } => true,
         Type::Named { name, .. }
