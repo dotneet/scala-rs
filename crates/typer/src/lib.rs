@@ -1931,12 +1931,16 @@ object Main {
 
     #[test]
     fn illegal_compound_is_diagnosed() {
+        // `A with B` is a legal *type* for two unrelated classes -- scalac
+        // 2.13.16 accepts `def bad(x: A with B)`. What it rejects is mixing a
+        // second class into a *template*.
         let (_, _, diags) = typecheck_str(
             r#"
 class A
 class B
+class C extends A with B
 object Main {
-  def bad(x: A with B): Int = 0
+  def ok(x: A with B): Int = 0
 }
 "#,
         );
@@ -1944,7 +1948,7 @@ object Main {
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("illegal inheritance")),
+                .any(|d| d.message.contains("needs to be a trait to be mixed in")),
             "{:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );

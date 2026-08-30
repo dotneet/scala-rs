@@ -1344,14 +1344,26 @@ impl SymbolTable {
                     .zip(a2.iter())
                     .enumerate()
                     .map(|(i, (x, y))| {
-                        let contra = tparams
+                        let flags = tparams
                             .get(i)
-                            .map(|&tp| self.get(tp).flags.contains(Flags::CONTRAVARIANT))
-                            .unwrap_or(false);
-                        if contra {
+                            .map(|&tp| self.get(tp).flags)
+                            .unwrap_or(Flags::EMPTY);
+                        if flags.contains(Flags::CONTRAVARIANT) {
                             self.glb(x, y)
-                        } else {
+                        } else if flags.contains(Flags::COVARIANT) || x == y {
                             self.lub(x, y)
+                        } else {
+                            // An *invariant* parameter admits neither argument
+                            // in place of the other, so joining them is not a
+                            // type either side conforms to: nsc's lub of
+                            // `SBT[Boolean]` and `SBT[Int]` is the existential
+                            // `SBT[_ >: Int with Boolean <: AnyVal]`, and
+                            // returning `SBT[AnyVal]` made `Seq(boolT, intT)`
+                            // inapplicable to `Seq(elems: A*)`.
+                            Type::BoundedWildcard {
+                                lo: None,
+                                hi: Some(Box::new(self.lub(x, y))),
+                            }
                         }
                     })
                     .collect();
@@ -1425,6 +1437,22 @@ impl SymbolTable {
             let d = self.dealias(b);
             if d != *b {
                 return self.is_sub_type(a, &d);
+            }
+        }
+        // An abstract type on the *right* is at least its lower bound:
+        // `def f[E, O >: E](x: E): O = x` is legal, and so is every
+        // `ShapedValue[_ <: E, U]` where a `ShapedValue[_ <: O, U]` is wanted.
+        // Only the bound can settle this -- every arm below either matches on
+        // `a` alone or asks for the two to be the same parameter.
+        if let Type::TypeParam(id) | Type::TypeMember(id) = b {
+            if let Some(lo) = self.get(*id).bound_lo.clone() {
+                if !matches!(lo, Type::Nothing) {
+                    if let Some(_g) = enter_bound(*id) {
+                        if self.is_sub_type(a, &lo) {
+                            return true;
+                        }
+                    }
+                }
             }
         }
         match (a, b) {

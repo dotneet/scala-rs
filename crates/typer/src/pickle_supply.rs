@@ -550,10 +550,10 @@ impl PickleSupply {
 
         let mut installed: Vec<SymbolId> = Vec::new();
         let mut seen_shapes: HashSet<String> = HashSet::new();
-        // Whether an overload taking a function parameter is already in.
-        let mut took_function = false;
-        for hit in hits {
-            let m = hit.member;
+        // The arities of the overloads taking a function parameter already in.
+        let mut took_function: Vec<usize> = Vec::new();
+        for hit in &hits {
+            let m = &hit.member;
             if m.kind != MemberKind::Def {
                 continue;
             }
@@ -609,7 +609,7 @@ impl PickleSupply {
         shape: &Shape,
         class_scope: &HashMap<String, Type>,
         seen_shapes: &mut HashSet<String>,
-        took_function: &mut bool,
+        took_function: &mut Vec<usize>,
     ) -> Option<SymbolId> {
         // Allocated ownerless, so a failure leaves nothing behind:
         // `SymbolTable::alloc` pushes into the owner's member list.
@@ -705,19 +705,25 @@ impl PickleSupply {
         // do -- supplying both would make every call ambiguous. Overloads that
         // differ in their parameters (`Iterator.from(Int)` vs
         // `from(IterableOnce)`) have different keys and all survive.
-        // At most one overload per name may take a function parameter. The
-        // typer infers a lambda's parameter types from a single expected type,
-        // so a second such overload turns `xs.segmentLength(_ < 3)` into an
-        // unsolvable overload set. Linearization order means the one kept is
-        // the most derived. Overloads that take no function -- `from(Int)` and
+        // At most one overload per name *and arity* may take a function
+        // parameter. The typer infers a lambda's parameter types from a single
+        // expected type, so a second same-arity overload turns
+        // `xs.segmentLength(_ < 3)` into an unsolvable overload set.
+        // Linearization order means the one kept is the most derived. A
+        // different arity is told apart before any lambda is typed, and 2.13's
+        // `SeqOps` really does declare both `indexWhere(p, from)` and
+        // `indexWhere(p)` -- dropping the shorter one made `xs.indexWhere(p)`
+        // an arity error. Overloads that take no function -- `from(Int)` and
         // `from(IterableOnce)` -- are unaffected.
         let has_function = paramss_ty
             .iter()
             .flatten()
             .any(|t| matches!(t, Type::Function { .. }));
-        if has_function && *took_function {
+        let arity: usize = paramss_ty.iter().map(|c| c.len()).sum();
+        if has_function && took_function.contains(&arity) {
             trace(format_args!(
-                "{internal}#{name}: skipping a second overload that takes a function"
+                "{internal}#{name}: skipping a second {arity}-argument overload that \
+                 takes a function"
             ));
             return None;
         }
@@ -800,7 +806,9 @@ impl PickleSupply {
         }
         st.get_mut(m).owner = class_sym;
         st.get_mut(class_sym).members.push(m);
-        *took_function = *took_function || has_function;
+        if has_function && !took_function.contains(&arity) {
+            took_function.push(arity);
+        }
         Some(m)
     }
 
