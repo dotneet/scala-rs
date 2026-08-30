@@ -2325,6 +2325,53 @@ slick: `errors 411 → 378`、`type mismatch 58 → 49`、`files_with_errors`
   ラムダ本体が `<error>` のとき関数の結果型も `<error>` にすれば消えますが、
   既存の negative fixture を弱めないか確かめていません。
 
+### ブロックの値を二重に箱詰めしていた（消去）
+
+`agent/anonbridge` スライス。**型検査は通り、実行時に `VerifyError` になる**
+サイレントな誤コンパイルでした。
+
+```scala
+val i = new It[Int] { def next(): Int = { val z = 1; z } }   // VerifyError
+val j = new It[Int] { def next(): Int = z }                  // これは動いていた
+```
+
+```text
+java.lang.VerifyError: Bad type on operand stack
+  Location: Main$$anon$1.next()Ljava/lang/Object; @6: invokestatic
+  Reason:   Type 'java/lang/Integer' is not assignable to integer
+```
+
+消去は `Block` / `If` / `Match` / `Try` の**期待型を、その値を作る部分式に
+そのまま渡します**（`{ …; z }` なら `z`、`if` なら両枝、`match` なら各 case
+本体、`try` なら本体と各 handler）。したがってそれらは**すでに箱詰め済み**
+なのですが、`erase_tree` の末尾は続けてノード自身にも `adapt_box_unbox` を
+かけていました。ノードの `ty` は箱詰め前の `Int` のままなので条件が成立し、
+`boxToInteger(boxToInteger(z))` が出ます。式本体は降りる先のノードが無いので
+1 回で済んでいた、というのが「ブロックのときだけ壊れる」の正体です。
+
+直したのは `crates/typer/src/erasure.rs` の 1 か所です。上の 4 種のノードでは
+**変換を二度目にかけるのをやめ、枝が持つに至った型を記録するだけ**にしました
+（`box_adaptation` が返す変換の結果型をノードの `ty` に入れる）。判定そのものは
+`adapt_box_unbox` と同じ関数を共有しているので、値クラスの `new Meters(n)` /
+`((Meters) x).n()` を含めて挙動は 1 か所で決まります。
+
+実 scalac は同じ匿名クラスを**メソッド 2 本**にします（本体を持つ `next()I` と、
+それを呼んで箱詰めするブリッジ `next()Ljava/lang/Object;`）。こちらは 2 本を
+畳んで消去後シグネチャの 1 本だけを出します。呼ぶ側から見た入口
+`next()Ljava/lang/Object;` は両者にあり、**そこで箱詰めがちょうど 1 回**という
+のが正しい形です。`crates/cli/tests/anonbridge.rs` の
+`scalac_and_ours_agree_on_the_erased_entry_point` が `javap -p -c -s` で
+両方を並べて固定しています。
+
+匿名クラスに限った話ではありませんでした。同じ二重箱詰めは
+`val x: Any = { val z = 1; z }`、`id({ val z = 1; z })`、`if` / `match` / `try`
+を本体に持つ形、名前付きクラス（`class C extends It[Int]`）、`abstract class`
+の実装、SAM 変換したラムダ、値クラス、そして逆向きの二重**開き**
+（`val n: Int = { val z: Any = 1; z.asInstanceOf[Int] }`）にも出ていました。
+
+slick の数字は動きません（`files=184 errors=378 files_with_errors=67` のまま）。
+型検査を通り抜けるバグなので、エラー数には現れない種類の修正です。
+
 ### jar のクラスを pickle から読む
 
 `load_classpath` はディレクトリしか歩きません。つまり **jar の中のクラスは
@@ -2825,6 +2872,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 `agent/product` スライス（`case class` / `case object` が `scala.Product` を実装し、合成コンパニオンが `scala.runtime.AbstractFunctionN` を継承するまで）のフィクスチャは接頭辞 `prod`（`prod` / `prod_lib` / `prod_vc` / `prod_bad`）で、同じ理由から `crates/cli/tests/product.rs` に置いています。`prod.scala` は 4 つの上書きアクセサ（`productPrefix` / `productArity` / `productElement` / `productElementName`）と範囲外 3 種（正の外・負の・arity 0）を **私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせ、`real_scalac_dual_run_prod` で real scalac 2.13.16 の stdout とも比較します（`expected/prod.txt` は scalac の出力そのもの。`case class Zero()` と `case object Solo` で **範囲外メッセージが違う**ところまで一致します）。`prod_vc.scala` は値クラスのフィールドが `productElement` でインスタンスに包み直されることを同じ 3 モードで固定します。`prod_lib.scala` は `Product` という**型**、`productIterator` / `productElementNames`、`tupled` / `curried`、`val f: (Int, String) => P = P`、arity 22 を扱うので library dual-run と real scalac dual-run のみで、`fixtures_prod_lib_without_library_is_error` が `--no-scala-library` でそれらが**きちんと診断される**ことを見ます。`prod_lib_classfile_shape` は `javap -p -c` で出した形そのもの（`implements scala.Product,java.io.Serializable`、`tableswitch`、`Statics.ioobe`、`ScalaRunTime$.typedProductIterator`、`Product.productElementNames$`、コンパニオンの `extends AbstractFunction2` と erase された `apply` ブリッジ、`AbstractFunction22`、case object が `AbstractFunctionN` を**継承しない**こと、case object の `productElementName` が `Product.productElementName$` へのフォワーダであること）を固定します。`prod_bad.scala` は real scalac も拒否する 4 つ（case class でないクラスの `productArity` / `productElement`、`productElement("0")`、`val bad: Product = new Plain(1)`）を診断します。
 
 `agent/smallgaps` スライス（`@inline` / `@noinline` の配置、curried case class companion、companion への後方参照、`Option.flatMap` の多相性、`None`/`Some` の `lub`、`Iterable.apply`）のフィクスチャは接頭辞 `sgap`（`sgap` / `sgap_lib`）で、同じ理由から `crates/cli/tests/smallgaps.rs` に置いています。`sgap.scala` は `--no-scala-library` で `check` 済み、`sgap_lib.scala` は `Iterable.apply` が library ABI（`IterableFactory$Delegate.apply` の継承）にしか無いため library dual-run 専用（`fixtures_sgap_lib_without_library_is_error` で `--no-scala-library` が診断のまま残ることも見ています）。
+
+`agent/anonbridge` スライス（`Block` / `If` / `Match` / `Try` の値が消去後に二重に箱詰めされていた件）のフィクスチャは接頭辞 `ab`（`ab` / `ab_bad`）で、同じ理由から `crates/cli/tests/anonbridge.rs` に置いています。`ab.scala` は 8 つのプリミティブすべてのブロック本体、`abstract class` と名前付きクラスの実装、プリミティブ引数、型パラメータ 2 つ、ジェネリックに適用したジェネリック、`val` による実装、SAM 変換したラムダ、`while` / `if` / `match` / `try` 本体、捕捉した `var`、匿名クラス抜きの `val x: Any = { … }` / `id({ … })`、逆向きの開き（`val n: Int = { val z: Any = 1; z.asInstanceOf[Int] }`）を 1 本にまとめてあり、**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせて `expected/ab.txt`（real scalac 2.13.16 の stdout）と比較します（`real_scalac_dual_run_ab`）。`erased_next_boxes_its_block_exactly_once` と `scalac_and_ours_agree_on_the_erased_entry_point` は `javap -p -c -s` で **`next()Ljava/lang/Object;` の中の箱詰めがちょうど 1 回**であることと、実 scalac が同じ入口を（`next()I` ＋ ブリッジという別の形で）持つことを直接見ます。実行出力だけでは二重箱詰めは見えないので、`javap` 側を別に固定しています。`ab.scala` に `Unit` が入っていないのは、`()` は参照位置に来ないので箱詰めが起きず、代わりに**別件の未修正**（下の Remaining）に当たるためです。`ab_bad.scala` は箱詰めが型の不一致を飲み込まないこと（real scalac と同じ `type mismatch; found: String  required: Int`）を固定します。
 
 `agent/stringops8` スライス（`StringOps` を jar の `ScalaSignature` から補完する経路）のフィクスチャは接頭辞 `so8`（`so8` / `so8_bad`）で、同じ理由から `crates/cli/tests/stringops8.rs` に置いています。`so8.scala` は `StringOps` が library ABI にしか無いため library dual-run 専用で、**期待値は実 scalac 2.13.16 の stdout そのもの**です（`java -Xverify:all` で一致を確認）。`fixtures_so8_without_library_is_error` は `--no-scala-library` で 40 件の診断が出続けること（黙って通さないこと）を、`fixtures_so8_bad_collect_result_type_is_error` は戻り型だけのオーバーロードが「解決はする」だけでは不十分で、`Int` を返す case ブロックの `collect` を `String` に束縛できないことを固定します。
 `agent/durrange` スライス（`scala.concurrent.duration` の後置単位、`Range` コンパニオンの `apply` / `inclusive`、関数型の implicit パラメータを implicit def から埋める view 経路）のフィクスチャは接頭辞 `dr`（`dr_duration` / `dr_range` / `dr_view` / `dr_viewuser` / `dr_view_bad`）で、同じ理由から `crates/cli/tests/durrange.rs` に置いています。`dr_duration.scala` は `DurationInt` / `DurationLong` / `DurationDouble` の単位メソッド 20 本すべてと `FiniteDuration` の算術、`dr_range.scala` は `Range$` の `apply` / `inclusive` / `count` 全多重定義（`javap` 上 `Int` 版のみ）、`dr_view.scala` は `Ordered.orderingToOrdered` を eta 展開して渡す経路と view bound を見ます。この 3 本は実ライブラリの jar にしか裏付けが無いので library dual-run 専用で、`expected/*.txt` は real scalac 2.13.16 の stdout そのものです。`fixtures_dr_*_without_library_is_error` が `--no-scala-library` で**きちんと診断される**ことを見ます。`dr_viewuser.scala` は同じ view 経路を利用者が書いた `implicit def`（単相・多相・自分の implicit 節を持つもの・view bound・入れ子の implicit パラメータ）だけで書いたもので、**私有ランタイムと `--scala-library` の両方**で走ります（この経路が jar 依存でないことの確認）。`dr_view_bad.scala` は witness の無い型（`Plain` / `Object`）が両モードで拒否されること（real scalac の `No implicit view available from Plain => Ordered[Plain]` に対応）を固定します。`dr_noimpl_bad.scala` は、**implicit しか取らないメソッドは埋まらなければ型エラー**であること（黙って eta 展開して関数値にしない）を両モードで固定します。
@@ -3437,6 +3486,7 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 渡す）で固定しています。実 scalac 2.13.16 も 3 件すべて拒否します。
 
 | `mism8.scala` | オブジェクトの型エイリアスを期待型として解く多相呼び出し、期待型がタプルの成分へ届く（`protoTypeArgs`）、依存メソッド型（`def get[P <: Phase](p: P): Option[p.State]`）、`private[p]` を定義側から解決、`private[this]` なコンストラクタ引数の下から継承メンバを読む（**私有ランタイムと library の両モード**、`java -Xverify:all`） | `Box` `true` `true` `false` `l/r` `true` `false` `f` |
+| `ab.scala`（`crates/cli/tests/anonbridge.rs`） | 消去後の `Block` / `If` / `Match` / `Try` の値をちょうど 1 回だけ箱詰めする（`agent/anonbridge`）：8 つのプリミティブのブロック本体、`abstract class` と名前付きクラスの実装、プリミティブ引数、型パラメータ 2 つ、`It[Cell[Int]]`、`val` 実装、SAM ラムダ、`while` / `if` / `match` / `try` 本体、捕捉した `var`、`val x: Any = { … }` / `id({ … })`、逆向きの `val n: Int = { val z: Any = …; … }`（**私有ランタイムと library の両モード**、`java -Xverify:all`、期待出力は実 scalac 2.13.16 の stdout そのまま） | `1` `2` `1.5` … `28` `29` |
 
 `mism8.scala` は `crates/cli/tests/mismatch8.rs` の
 `mism8_fixture_runs_in_both_modes` から**両モードで**回し、どちらの stdout も
@@ -4356,6 +4406,29 @@ error: value += is not a member of T
   確認）。jar モードの `List(Q)` に対して `scala.collection.immutable.$colon$colon@…`
   になるので、`MatchError` のメッセージがリストのときだけ 2 モードで違います
   （`cp_err.scala` はそこだけクラス名で比べています）。
+- **`Unit` のメンバが消去後 `Object` を返すとき、捨てた値がスタックに残る**
+  （`agent/anonbridge` で確認。`agent/unitbox` の領域なので手を入れていません）。
+
+  ```scala
+  val u = new It[Unit] { def next(): Unit = { seen += 1; () } }
+  u.next()   // invokevirtual next()Ljava/lang/Object; -- pop が無い
+  ```
+
+  `u.next()` は Scala の型が `Unit` なので `pop_if_value` が何も出しませんが、
+  JVM 側の `next()` は `Object` を返します。直線コードのうちは verifier も
+  黙っていて、あとに stackmap frame を要求する分岐（`try` / `match` など）が
+  来た時点で `VerifyError: Inconsistent stackmap frames` になります。**main
+  でも同じ**で、この修正の前後で変わりません。私有ランタイムでは
+  `println(u.next())` も別の形（余分な `aconst_null`）で落ちます。
+  そのため `ab.scala` からは `Unit` を外してあります。
+
+- **匿名クラス／サブクラスのメンバの結果型が親と食い違っても通る**
+  （`agent/anonbridge` で確認）。`new It[Int] { def next(): String = "x" }` を
+  受理して `next()Ljava/lang/Object;` に `String` を返す本体を出すので、
+  呼ぶ側の unbox で `ClassCastException` になります。real scalac は
+  `incompatible type in overriding` を出します。オーバーライドの結果型
+  適合検査そのものが無いので、箱詰めの話とは別に必要です
+  （`ab_bad.scala` には**両者が拒否する**形だけを入れてあります）。
 
 - **`"abc".appended(1)` のような `B >: Char` の下限推論**（`agent/stringops8`
   で確認）。scalac は `B := AnyVal` と lub を取って `IndexedSeq[AnyVal]` を
