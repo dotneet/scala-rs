@@ -385,6 +385,12 @@ pub fn typecheck_units(
         t.language_postfix_ops = saved_lang.1;
         t.language_implicit_conversions = saved_lang.2;
     }
+    // After the header pass: loading `scala.collection.IterableFactory` pulls
+    // in the `scala` package object, and doing that before any source has
+    // named a `scala.*` type made `install_pickled_package_aliases` run too
+    // early -- `type Integral[T] = scala.math.Integral[T]` came out
+    // unresolvable, and the memo kept it that way for the rest of the run.
+    t.link_collection_factories();
     {
         // Member types first, across every unit: typing a body may call a
         // member declared further down the file, or in a file that comes
@@ -8841,6 +8847,7 @@ impl Typer {
                         }
                     }
                     sig_param_tys = param_tys.clone();
+                    self.apply_open_views(sym, &param_tys, args, &mut arg_tys);
                     if !self.st.get(sym).tparams.is_empty() {
                         let inst = self.infer_method_tparams_in(
                             sym,
@@ -9369,10 +9376,27 @@ impl Typer {
                                     Type::Class { sym, args } if args.len() == 1 => Some(*sym),
                                     _ => None,
                                 };
-                                let recv_cls = recv_ty
-                                    .as_ref()
-                                    .and_then(|t| self.st.class_sym_of(t))
-                                    .map(|c| self.collection_root(c))
+                                // `Map.map` is `MapOps.map[K2, V2]` when the
+                                // lambda returns a pair: the declaration read
+                                // off `IterableOps` says `Iterable[B]`, and
+                                // `BuildFrom` puts the receiver's own two-
+                                // parameter class back.
+                                let pair_rebuild = declared.and_then(|d| {
+                                    let r = self.receiver_collection_root(recv_ty.as_ref())?;
+                                    (self.st.get(r).tparams.len() == 2).then_some(()).and_then(
+                                        |()| {
+                                            self.rebuild_widened(
+                                                r,
+                                                &Type::Class {
+                                                    sym: d,
+                                                    args: vec![fr.as_ref().widen_constant()],
+                                                },
+                                            )
+                                        },
+                                    )
+                                });
+                                let recv_cls = self
+                                    .receiver_collection_root(recv_ty.as_ref())
                                     .filter(|&c| self.takes_one_type_parameter(c));
                                 let cls = match (recv_cls, declared) {
                                     // `IndexedSeq` does not redeclare `map`, so
@@ -9404,7 +9428,9 @@ impl Typer {
                                     (_, Some(d)) => Some(d),
                                     (r, None) => r,
                                 };
-                                if let Some(cls) = cls {
+                                if let Some(t) = pair_rebuild {
+                                    ret = t;
+                                } else if let Some(cls) = cls {
                                     ret = Type::Class {
                                         sym: cls,
                                         args: vec![fr.as_ref().widen_constant()],
@@ -9413,9 +9439,7 @@ impl Typer {
                             }
                         }
                     }
-                } else if returns_receiver_collection(&method_name)
-                    && erases_to_object(&self.st.get(sym).jvm_name)
-                {
+                } else if returns_receiver_collection(&method_name) {
                     // 2.13 declares these as returning `C` (or `CC[B]`) --
                     // the receiver's own collection. The prelude cannot spell
                     // `C`, so `Vector[Phase].filterNot(p)` came back as the
@@ -9425,36 +9449,9 @@ impl Typer {
                     // as the `map` rule above, and gated the same way: a
                     // `scala.collection` class that really is a subclass of
                     // what the declaration named.
-                    if let Type::Class {
-                        sym: d,
-                        args: dargs,
-                    } = ret.clone()
-                    {
-                        let recv_cls = recv_ty
-                            .as_ref()
-                            .and_then(|t| self.st.class_sym_of(t))
-                            .map(|c| self.collection_root(c));
-                        if let Some(r) = recv_cls {
-                            if r != d
-                                && !dargs.is_empty()
-                                && self.st.get(r).tparams.len() == dargs.len()
-                                && self.maps_to_own_class(r)
-                                && self
-                                    .base_type_instance(
-                                        &Type::Class {
-                                            sym: r,
-                                            args: vec![],
-                                        },
-                                        d,
-                                        0,
-                                    )
-                                    .is_some()
-                            {
-                                ret = Type::Class {
-                                    sym: r,
-                                    args: dargs,
-                                };
-                            }
+                    if let Some(r) = self.receiver_collection_root(recv_ty.as_ref()) {
+                        if let Some(t) = self.rebuild_from_receiver(r, &ret) {
+                            ret = t;
                         }
                     }
                 } else if method_name == "pipe" {
@@ -9476,16 +9473,30 @@ impl Typer {
                         if let Some(to) = to {
                             if self.is_array_ops_ty(recv_ty.as_ref()) {
                                 ret = Type::Array(Box::new(to.widen_constant()));
-                            } else if let Some(cls) = recv_ty
-                                .as_ref()
-                                .and_then(|t| self.st.class_sym_of(t))
-                                .map(|c| self.collection_root(c))
+                            } else if let Some(cls) = self
+                                .receiver_collection_root(recv_ty.as_ref())
                                 .filter(|&c| self.takes_one_type_parameter(c))
                             {
                                 ret = Type::Class {
                                     sym: cls,
                                     args: vec![to.widen_constant()],
                                 };
+                            } else if let Some(r) = self.receiver_collection_root(recv_ty.as_ref())
+                            {
+                                // `MapOps.collect[K2, V2](pf): CC[K2, V2]` --
+                                // the `Map` counterpart of `map` above.
+                                let named = match &ret {
+                                    Type::Class { sym, args } if args.len() == 1 => {
+                                        Some(Type::Class {
+                                            sym: *sym,
+                                            args: vec![to.widen_constant()],
+                                        })
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(t) = named.and_then(|n| self.rebuild_widened(r, &n)) {
+                                    ret = t;
+                                }
                             }
                         }
                     }
@@ -9505,6 +9516,11 @@ impl Typer {
                                     }));
                                 }
                             }
+                        }
+                    } else if let Some(r) = self.receiver_collection_root(recv_ty.as_ref()) {
+                        // `zip[B](that): CC[(A, B)]`.
+                        if let Some(t) = self.rebuild_from_receiver(r, &ret) {
+                            ret = t;
                         }
                     }
                 } else if method_name == "flatMap" {
@@ -9534,10 +9550,19 @@ impl Typer {
                                 ret = (**fr).clone();
                             }
                         }
+                        // `flatMap` is `CC[B]` like `map` is: the class is the
+                        // receiver's, whatever class the inherited declaration
+                        // named. `IndexedSeq.flatMap` said `Seq[B]`, and a
+                        // `Map`'s said `Iterable[(K2, V2)]`.
+                        if let Some(r) = self.receiver_collection_root(recv_ty.as_ref()) {
+                            if let Some(t) = self.rebuild_widened(r, &ret) {
+                                ret = t;
+                            }
+                        }
                     }
                 } else if method_name == "withFilter" {
                     if !self.is_with_filter_ty(Some(&ret)) {
-                        if let Some(r) = recv_ty {
+                        if let Some(r) = recv_ty.clone() {
                             ret = r;
                         }
                     }
@@ -9658,6 +9683,15 @@ impl Typer {
                                 };
                             }
                         }
+                    }
+                }
+                // `partition` is `(C, C)` and `groupBy` / `groupMap` are
+                // `Map[K, C]`: the receiver's own collection sits *inside* the
+                // declared result, so the `BuildFrom` rebuild has to reach in.
+                let nested_recv = recv_ty.clone().or_else(|| self.curried_receiver_ty(fun));
+                if let Some(r) = self.receiver_collection_root(nested_recv.as_ref()) {
+                    if let Some(t) = self.rebuild_inside(r, &ret, &method_name) {
+                        ret = t;
                     }
                 }
                 let ret = leftover.unwrap_or(ret);
@@ -9826,6 +9860,174 @@ impl Typer {
     /// that extends one of these are not among them.
     fn maps_to_own_class(&self, cls: SymbolId) -> bool {
         self.st.get(cls).jvm_name.starts_with("scala/collection/")
+    }
+
+    /// The two components of a pair type, however it is spelled.
+    fn pair_args(&self, ty: &Type) -> Option<Vec<Type>> {
+        match ty {
+            Type::Class { sym, args } if args.len() == 2 && self.st.get(*sym).name == "Tuple2" => {
+                Some(args.clone())
+            }
+            Type::Tuple(args) if args.len() == 2 => Some(args.clone()),
+            _ => None,
+        }
+    }
+
+    /// 2.13's `BuildFrom`, as a type function on the *declared* result.
+    ///
+    /// Every transformation on `IterableOps` / `MapOps` / `SortedOps` is
+    /// declared to return the receiver's own type constructor -- `C`, `CC[B]`,
+    /// `CC[K2, V2]`. Neither the prelude nor the pickle can spell those, so
+    /// the declaration that reaches the typer names the class it was *read
+    /// from*: `Seq[B]` for a member inherited from `SeqOps`, `Iterable[(K, V)]`
+    /// for one inherited from `IterableOps` by a `Map`. This puts the
+    /// receiver's own class back, keeping the element types the declaration
+    /// computed.
+    ///
+    /// A `Map`-like receiver takes two parameters where `IterableOps` passes
+    /// one pair; that is exactly the difference between `IterableOps.map[B]`
+    /// and `MapOps.map[K2, V2]` (`javap -p -s scala.collection.MapOps`:
+    /// `<K2, V2> CC map(Function1<Tuple2<K, V>, Tuple2<K2, V2>>)`), so the pair
+    /// is unwrapped here. A lambda that does *not* return a pair keeps the
+    /// `Iterable[B]` the declaration named, which is what nsc infers too.
+    fn rebuild_from_receiver(&self, recv_root: SymbolId, declared: &Type) -> Option<Type> {
+        let Type::Class {
+            sym: d,
+            args: dargs,
+        } = declared
+        else {
+            return None;
+        };
+        let d = *d;
+        if dargs.is_empty() || d == recv_root || !self.maps_to_own_class(recv_root) {
+            return None;
+        }
+        // Only a real subclass rebuilds: a user class that merely extends `Seq`
+        // inherits `Seq`'s `CC` and really does map to a `Seq`.
+        self.base_type_instance(
+            &Type::Class {
+                sym: recv_root,
+                args: vec![],
+            },
+            d,
+            0,
+        )?;
+        let want = self.st.get(recv_root).tparams.len();
+        if want == dargs.len() {
+            return Some(Type::Class {
+                sym: recv_root,
+                args: dargs.clone(),
+            });
+        }
+        if want == 2 && dargs.len() == 1 {
+            if let Some(pair) = self.pair_args(&dargs[0]) {
+                return Some(Type::Class {
+                    sym: recv_root,
+                    args: pair,
+                });
+            }
+        }
+        None
+    }
+
+    /// `map` / `flatMap` / `collect` on a *sorted* map are
+    /// `SortedMapOps.map[K2, V2](f)(implicit ord: Ordering[K2]): CC[K2, V2]`
+    /// (`javap -p -s scala.collection.SortedMapOps`:
+    /// `(Lscala/Function1;Lscala/math/Ordering;)Lscala/collection/Map;`).
+    /// Without that witness the call lands on `MapOps.map`, which builds a
+    /// plain `Map` — narrowing the static type to `TreeMap` there is a
+    /// `ClassCastException` waiting at the assignment. The `C`-returning
+    /// members (`filter`, `take`, `-`, `+`, `updated`) need no witness and are
+    /// narrowed as usual.
+    fn needs_ordering_to_rebuild(&self, cls: SymbolId) -> bool {
+        [
+            "scala/collection/SortedMap",
+            "scala/collection/immutable/SortedMap",
+            "scala/collection/SortedSet",
+            "scala/collection/immutable/SortedSet",
+        ]
+        .iter()
+        .filter_map(|jvm| crate::classpath::find_by_jvm(&self.st, jvm))
+        .any(|sorted| {
+            cls == sorted
+                || self
+                    .base_type_instance(
+                        &Type::Class {
+                            sym: cls,
+                            args: vec![],
+                        },
+                        sorted,
+                        0,
+                    )
+                    .is_some()
+        })
+    }
+
+    /// [`Self::rebuild_from_receiver`] for the members that *widen* the element
+    /// type (`CC[B]` / `CC[K2, V2]`), which a sorted collection cannot do
+    /// without an `Ordering`.
+    fn rebuild_widened(&self, recv_root: SymbolId, declared: &Type) -> Option<Type> {
+        if self.needs_ordering_to_rebuild(recv_root) {
+            return None;
+        }
+        self.rebuild_from_receiver(recv_root, declared)
+    }
+
+    /// The receiver's own collection class, for the `BuildFrom` rebuild.
+    fn receiver_collection_root(&self, recv_ty: Option<&Type>) -> Option<SymbolId> {
+        recv_ty
+            .and_then(|t| self.st.class_sym_of(t))
+            .map(|c| self.collection_root(c))
+    }
+
+    /// `xs.partition(p)` is `(C, C)` and `xs.groupBy(f)` is `Map[K, C]`: the
+    /// receiver's collection is *inside* the result, not the result itself.
+    fn rebuild_inside(&self, recv_root: SymbolId, ret: &Type, method_name: &str) -> Option<Type> {
+        // A pair result reaches here either as `Tuple2[C, C]` or as the
+        // structural `(C, C)`, depending on whether the signature came from
+        // the prelude or from the jar.
+        let (n, args): (String, &Vec<Type>) = match ret {
+            Type::Class { sym, args } => (self.st.get(*sym).name.clone(), args),
+            Type::Tuple(args) => ("Tuple2".to_string(), args),
+            _ => return None,
+        };
+        let positions: Vec<usize> = match method_name {
+            "partition" | "span" | "splitAt" if n == "Tuple2" && args.len() == 2 => vec![0, 1],
+            "groupBy" | "groupMap" if n == "Map" && args.len() == 2 => vec![1],
+            _ => return None,
+        };
+        let mut out = args.clone();
+        let mut hit = false;
+        for i in positions {
+            if let Some(t) = self.rebuild_from_receiver(recv_root, &args[i]) {
+                out[i] = t;
+                hit = true;
+            }
+        }
+        if !hit {
+            return None;
+        }
+        Some(match ret {
+            Type::Class { sym, .. } => Type::Class {
+                sym: *sym,
+                args: out,
+            },
+            _ => Type::Tuple(out),
+        })
+    }
+
+    /// The collection a *curried* call was made on. `xs.groupMap(k)(f)` types
+    /// its second clause with the first `Apply` as the callee, so the plain
+    /// `Select` receiver is out of reach; walk down to it.
+    fn curried_receiver_ty(&self, fun: &Tree) -> Option<Type> {
+        let mut t = fun;
+        loop {
+            match &t.kind {
+                TreeKind::Select { qual, .. } => return Some(qual.ty.clone()),
+                TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } => t = fun,
+                _ => return None,
+            }
+        }
     }
 
     fn collection_root(&self, id: SymbolId) -> SymbolId {
@@ -10264,6 +10466,31 @@ impl Typer {
     /// The declared lower bound of `tp`, as seen from the receiver type
     /// (`List[Rect].::[B >: A]` has `B >: Rect`). `None` when there is no bound
     /// or when it is still expressed in terms of unresolved type parameters.
+    /// The arguments the *owner* of an inherited member sees, given the
+    /// receiver. `Map[K, V]` inherits `++` from `IterableOps[A, …]` with
+    /// `A = (K, V)`, so a bound written in terms of `A` has to be read through
+    /// the receiver's base type at the owner. Taking the receiver's own
+    /// arguments positionally instead made `A` the `K`. Empty when there is
+    /// nothing to substitute.
+    fn owner_args_as_seen_from(&self, owner: SymbolId, recv: Option<&Type>) -> Vec<Type> {
+        let Some(r) = recv else {
+            return Vec::new();
+        };
+        if let Some(Type::Class { args, .. }) = self.base_type_instance(r, owner, 0) {
+            if !args.is_empty() {
+                return args;
+            }
+        }
+        match r {
+            Type::Class { args, .. }
+                if !args.is_empty() && args.len() == self.st.get(owner).tparams.len() =>
+            {
+                args.clone()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn tparam_lower_bound(
         &self,
         method: SymbolId,
@@ -10271,12 +10498,20 @@ impl Typer {
         recv: Option<&Type>,
     ) -> Option<Type> {
         let lo = self.st.get(tp).bound_lo.clone()?;
-        let lo = match recv {
-            Some(Type::Class { args, .. }) if !args.is_empty() => {
-                let owner = self.st.get(method).owner;
-                self.st.subst_tparams(owner, args, &lo)
-            }
-            _ => lo,
+        // `[B >: A]` is the *owner's* `A`, so it has to be read through the
+        // receiver's base type at the owner -- not off the receiver's own
+        // arguments. `Map[K, V]`'s `++` is inherited from `IterableOps[A, …]`
+        // with `A = (K, V)`; substituting positionally made `A` the `K`, and
+        // `Map("a" -> 1) ++ Map("b" -> 2)` came out `Iterable[Serializable]`
+        // (`lub(String, (String, Int))`) -- but only in files that had already
+        // completed `IterableOps.++` for some other receiver, which is what
+        // made it look like an unrelated line's bug.
+        let owner = self.st.get(method).owner;
+        let owner_args = self.owner_args_as_seen_from(owner, recv);
+        let lo = if owner_args.is_empty() {
+            lo
+        } else {
+            self.st.subst_tparams(owner, &owner_args, &lo)
         };
         if lo.is_no_type()
             || lo.is_error()
@@ -10323,7 +10558,7 @@ impl Typer {
 
     /// The argument type read as the parameter's own class, when it is a
     /// strict subclass of it. Everything else is handed back unchanged.
-    fn align_to_param_class(&self, param: &Type, arg: &Type) -> Type {
+    pub(crate) fn align_to_param_class(&self, param: &Type, arg: &Type) -> Type {
         let Type::Class { sym: ps, args: pas } = param else {
             return arg.clone();
         };
@@ -10373,10 +10608,7 @@ impl Typer {
             return;
         }
         let owner = self.st.get(method).owner;
-        let recv_args: Vec<Type> = match recv {
-            Some(Type::Class { args, .. }) => args.clone(),
-            _ => Vec::new(),
-        };
+        let recv_args: Vec<Type> = self.owner_args_as_seen_from(owner, recv);
         let ids: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
         let vals: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
         let mut bad = false;
@@ -10698,7 +10930,7 @@ impl Typer {
                     .iter()
                     .find(|i| self.st.get(**i).name.as_str() == n.as_str())
                 {
-                    Some(&p) => self.arg_conforms(t, &self.st.get(p).ty, true),
+                    Some(&p) => self.arg_conforms(t, &self.st.get(p).ty, true, &[]),
                     None => false,
                 }
             })
@@ -10941,6 +11173,15 @@ impl Typer {
                 );
             }
         }
+        // How many clauses this call has already consumed. `paramss_ids` was
+        // trimmed to the clauses still to come, so anything the declaration
+        // has beyond that is behind us -- and the clause whose parameters
+        // these arguments are being matched against is that one, not the
+        // declaration's first. Reading the first clause here is what made
+        // `def f[K, B](k: A => K)(g: A => B)(r: (B, B) => B)` solve `K` twice
+        // and never `B`: `groupMapReduce`'s reduce function came out
+        // `(Any, Any) => Any`.
+        let clause_idx = s_paramss.len().saturating_sub(paramss_ids.len());
         if paramss_ids.len() > 1 {
             let rest_ids: Vec<SymbolId> = paramss_ids[1..].iter().flatten().copied().collect();
             let all_impl = !rest_ids.is_empty()
@@ -10967,7 +11208,7 @@ impl Typer {
                         .map(|id| self.st.get(*id).ty.clone())
                         .collect()
                 };
-                let rest_tys = self.instantiate_from_call(sym, &first, args, rest_tys);
+                let rest_tys = self.instantiate_from_call(sym, clause_idx, &first, args, rest_tys);
                 let rest_tys = self.solve_implicit_only_tparams(sym, rest_tys);
                 self.fill_implicit_params(span, args, &rest_tys, &rest_ids);
                 return None;
@@ -10986,7 +11227,7 @@ impl Typer {
             };
             let rest_tys: Vec<Vec<Type>> = rest_tys
                 .into_iter()
-                .map(|tys| self.instantiate_from_call(sym, &first, args, tys))
+                .map(|tys| self.instantiate_from_call(sym, clause_idx, &first, args, tys))
                 .collect();
             let ret = match fun_ty {
                 Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
@@ -10996,7 +11237,7 @@ impl Typer {
                 },
             };
             let ret = self
-                .instantiate_from_call(sym, &first, args, vec![ret])
+                .instantiate_from_call(sym, clause_idx, &first, args, vec![ret])
                 .into_iter()
                 .next()
                 .unwrap_or(Type::NoType);
@@ -11044,6 +11285,7 @@ impl Typer {
     fn instantiate_from_call(
         &self,
         sym: SymbolId,
+        clause_idx: usize,
         first: &[SymbolId],
         args: &[Tree],
         tys: Vec<Type>,
@@ -11054,7 +11296,7 @@ impl Typer {
         // The method type keeps `Repeated`; the parameter symbols carry `Seq`
         // (their type inside the body), which would not unify with an argument.
         let sig_first: Vec<Type> = match &self.st.get(sym).ty {
-            Type::Method { paramss, .. } => paramss.first().cloned().unwrap_or_default(),
+            Type::Method { paramss, .. } => paramss.get(clause_idx).cloned().unwrap_or_default(),
             _ => Vec::new(),
         };
         let orig_first: Vec<Type> = if sig_first.len() == first.len() {
@@ -12136,6 +12378,12 @@ impl Typer {
         } else {
             params
         };
+        let open: Vec<SymbolId> = if sym.is_none() {
+            Vec::new()
+        } else {
+            self.st.get(sym).tparams.clone()
+        };
+        let open = &open[..];
         let (fixed, repeated) = split_repeated(params);
         if let Some(elem) = repeated {
             if args.len() < fixed.len() {
@@ -12144,10 +12392,10 @@ impl Typer {
             return args
                 .iter()
                 .zip(fixed)
-                .all(|(a, p)| self.arg_conforms(a, p, allow_widen))
+                .all(|(a, p)| self.arg_conforms(a, p, allow_widen, open))
                 && args[fixed.len()..]
                     .iter()
-                    .all(|a| self.arg_conforms(a, elem, allow_widen));
+                    .all(|a| self.arg_conforms(a, elem, allow_widen, open));
         }
         if args.len() > params.len() {
             return false;
@@ -12159,10 +12407,13 @@ impl Typer {
         }
         args.iter()
             .zip(params)
-            .all(|(a, p)| self.arg_conforms(a, p, allow_widen))
+            .all(|(a, p)| self.arg_conforms(a, p, allow_widen, open))
     }
 
-    fn arg_conforms(&self, arg: &Type, param: &Type, allow_widen: bool) -> bool {
+    /// `open` are the callee's type parameters this call has not settled;
+    /// a parameter type that mentions one can still be reached by a view whose
+    /// own result says what it is (`xs.to(Vector)`).
+    fn arg_conforms(&self, arg: &Type, param: &Type, allow_widen: bool, open: &[SymbolId]) -> bool {
         match self.arg_score(arg, param) {
             Some(3) if !allow_widen => false, // numeric widen
             Some(_) => true,
@@ -12173,6 +12424,8 @@ impl Typer {
                 self.st.narrows_to(arg, param)
                     // nsc view: `wrapString` makes String applicable to Seq.
                     || !matches!(self.search_conversion(arg, param), ImplicitSearch::None)
+                    || (mentions_tparam(param, open)
+                        && self.search_conversion_open(arg, param, open).is_some())
             }
             None => false,
         }
@@ -12309,6 +12562,67 @@ impl Typer {
             }
         }
         None
+    }
+
+    /// Insert the views nsc's `inferView` inserts *before* it solves a call's
+    /// type parameters.
+    ///
+    /// `xs.to(Vector)` is `to[C1](f: Factory[A, C1]): C1`: the argument is
+    /// `Vector.type`, the parameter mentions the still-open `C1`, and only
+    /// `IterableFactory.toFactory` makes the two meet -- and says that `C1` is
+    /// `Vector[A]`. Rewriting the argument here lets ordinary inference see
+    /// `Factory[Int, Vector[Int]]` and solve `C1` from it, with no separate
+    /// path for `to`.
+    fn apply_open_views(
+        &mut self,
+        sym: SymbolId,
+        param_tys: &[Type],
+        args: &mut [Tree],
+        arg_tys: &mut [Type],
+    ) {
+        if sym.is_none() {
+            return;
+        }
+        let open = self.st.get(sym).tparams.clone();
+        if open.is_empty() {
+            return;
+        }
+        for i in 0..args.len() {
+            let Some(p) = param_at(param_tys, i).cloned() else {
+                continue;
+            };
+            if !mentions_tparam(&p, &open) {
+                continue;
+            }
+            let a_ty = args[i].ty.clone();
+            if a_ty.is_no_type() || a_ty.is_error() || self.arg_score(&a_ty, &p).is_some() {
+                continue;
+            }
+            let Some((id, solved, _)) = self.search_conversion_open(&a_ty, &p, &open) else {
+                continue;
+            };
+            let span = args[i].span;
+            let arg = std::mem::replace(&mut args[i], Tree::dummy(TreeKind::Empty));
+            let from = arg.ty.clone();
+            let fun = self.ref_implicit(id, span);
+            let applied = Tree {
+                id: arg.id,
+                span,
+                kind: TreeKind::Apply {
+                    fun: Box::new(fun),
+                    args: vec![arg],
+                },
+                ty: solved.clone(),
+                sym: id,
+                postfix: false,
+            };
+            let mut filled = self.fill_conv_implicits(id, &from, applied, span);
+            filled.ty = solved.clone();
+            args[i] = filled;
+            if let Some(t) = arg_tys.get_mut(i) {
+                *t = solved;
+            }
+        }
     }
 
     fn arg_score(&self, arg: &Type, param: &Type) -> Option<i32> {
@@ -15131,6 +15445,23 @@ impl Typer {
         crate::prelude_genrep::link_tuple_products(&mut self.st);
     }
 
+    /// `object Vector extends IterableFactory[Vector]` — the edge that lets
+    /// `IterableFactory.toFactory` see a collection companion as a `Factory`
+    /// source, so `xs.to(Vector)` types. `IterableFactory` lives in the jar,
+    /// and `install_prelude` runs before the classpath is installed, so this
+    /// has to be a separate pass.
+    fn link_collection_factories(&mut self) {
+        if !self.library_abi {
+            return;
+        }
+        for jvm in crate::prelude_buildfrom::FACTORY_CLASSES {
+            let pkg = jvm.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            let owner = crate::classpath::ensure_package(&mut self.st, pkg);
+            self.load_binary_into(jvm, owner, Span::new(0, 0), false);
+        }
+        crate::prelude_buildfrom::install(&mut self.st, true);
+    }
+
     /// `java.lang.String` implements `CharSequence`, `Comparable<String>` and
     /// `Serializable`; the prelude declares it with `AnyRef` alone. Unlike the
     /// tuples above these are JDK classes, so this runs in both library modes.
@@ -16720,28 +17051,20 @@ fn is_override_annot(path: &str) -> bool {
     matches!(path, "Override" | "java.lang.Override")
 }
 
-/// Does this JVM descriptor return `java/lang/Object`? A member declared to
-/// return `C` erases that way, and only then may the typer narrow the result
-/// to the receiver's own collection: where the descriptor names a class
-/// (`TreeMap.filter` returns `Lscala/collection/immutable/Map;`) codegen would
-/// store a `Map` where a `TreeMap` is wanted and the verifier would reject it.
-fn erases_to_object(desc: &str) -> bool {
-    desc.rsplit_once(')')
-        .is_some_and(|(_, ret)| ret == "Ljava/lang/Object;")
-}
-
-/// The `IterableOps` / `SeqOps` members whose 2.13 signature returns the
-/// receiver's own collection (`C`, or `CC[B]` for the ones that widen the
-/// element type). The conversions (`toSeq`, `toList`, …) are deliberately
-/// absent: those really do return the class they name.
+/// The `IterableOps` / `SeqOps` / `MapOps` / `SetOps` members whose 2.13
+/// signature returns the receiver's own collection (`C`, or `CC[B]` / `CC[K2,
+/// V2]` for the ones that widen the element type). The conversions (`toSeq`,
+/// `toList`, …) are deliberately absent: those really do return the class they
+/// name.
 ///
-/// `MapOps` / `SetOps`'s own `-` / `removed` / `incl` / `excl` are absent too,
-/// and for a different reason: they erase to a *named* class
-/// (`(Object)Lscala/collection/immutable/Map;`), so narrowing `TreeMap - key`
-/// to a `TreeMap` here leaves codegen storing a `Map` into a `TreeMap` field
-/// (`VerifyError`). The `C`-returning members above all erase to `Object`, so
-/// the cast `maybe_unbox_erased_result` already emits covers them. Reaching
-/// those needs the Apply's own result type to survive erasure -- see README.
+/// `-` / `removed` / `incl` / `excl` are here even though they erase to a
+/// *named* class (`(Object)Lscala/collection/immutable/Map;` for `MapOps`):
+/// `maybe_unbox_erased_result` casts a result whose static type is narrower
+/// than the descriptor's, so `TreeMap - key` is a `TreeMap` at both ends.
+///
+/// `+` and `-` reach this for every receiver, arithmetic included; only a
+/// `scala.collection` class rebuilds (`rebuild_from_receiver`), so `1 + 2` and
+/// `"a" + b` are untouched.
 fn returns_receiver_collection(name: &str) -> bool {
     matches!(
         name,
@@ -16777,6 +17100,17 @@ fn returns_receiver_collection(name: &str) -> bool {
             | ":+"
             | "$plus$colon"
             | "+:"
+            | "$minus"
+            | "-"
+            | "$minus$minus"
+            | "--"
+            | "$plus"
+            | "+"
+            | "removed"
+            | "removedAll"
+            | "incl"
+            | "excl"
+            | "concat"
     )
 }
 
@@ -17802,7 +18136,7 @@ fn param_at(params: &[Type], i: usize) -> Option<&Type> {
 }
 
 /// Whether `ty` still mentions a type parameter, i.e. is not a proper type yet.
-fn mentions_any_tparam(ty: &Type) -> bool {
+pub(crate) fn mentions_any_tparam(ty: &Type) -> bool {
     match ty {
         Type::TypeParam(_) => true,
         Type::Class { args, .. } | Type::Tuple(args) => args.iter().any(mentions_any_tparam),
