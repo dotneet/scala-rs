@@ -6399,6 +6399,39 @@ fn gen_apply(
         asm.invokespecial(&cls, "<init>", &desc);
         return;
     }
+    if matches!(ic, Intrinsic::NewWrapper) {
+        // `5.seconds` is `new package$DurationInt(5).seconds()` in scalac's
+        // own output: the conversion erases to the identity on the underlying
+        // primitive, and the unit methods live on the boxed class.
+        let s = ctx.st.get(fun.sym);
+        let (param, ret) = match &s.ty {
+            Type::Method { paramss, ret } => (
+                paramss
+                    .iter()
+                    .flatten()
+                    .next()
+                    .cloned()
+                    .unwrap_or(Type::Int),
+                (**ret).clone(),
+            ),
+            _ => (Type::Int, tree.ty.clone()),
+        };
+        let cls = ctx
+            .st
+            .class_sym_of(&ret)
+            .map(|c| class_internal(ctx.st, c))
+            .unwrap_or_default();
+        asm.new_obj(&cls);
+        asm.dup();
+        if let Some(a) = args.first() {
+            gen_expr(asm, frame, ctx, a);
+            widen_primitive(asm, &a.ty, &param);
+        } else {
+            push_default(asm, &param);
+        }
+        asm.invokespecial(&cls, "<init>", &format!("({})V", jvm_desc(ctx.st, &param)));
+        return;
+    }
     if matches!(ic, Intrinsic::Synchronized) {
         gen_synchronized(asm, frame, ctx, fun, args, &tree.ty);
         return;

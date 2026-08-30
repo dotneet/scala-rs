@@ -537,24 +537,138 @@ impl Typer {
         )
     }
 
+    /// Whether `id` is an implicit conversion that turns a `from` into a `to`.
+    ///
+    /// A *polymorphic* candidate is solved from the argument type first, the
+    /// way the member-directed search already does it
+    /// ([`Self::conversion_result`]): `orderingToOrdered[T](x: T)(implicit
+    /// ord: Ordering[T]): Ordered[T]` binds `T = String` from `from` and only
+    /// then compares `Ordered[String]` with the wanted `Ordered[String]`.
+    /// Comparing the *declared* types instead, as this used to, meant every
+    /// conversion with a type parameter of its own was invisible to
+    /// `search_conversion` — `implicit def boxit[T](x: T): Box[T]` did not make
+    /// `val b: Box[Int] = 3` compile, and neither did `orderingToOrdered`
+    /// satisfy an `A => Ordered[A]` view.
+    ///
+    /// A conversion whose own implicit clauses have no witness is not
+    /// applicable, exactly as in nsc — otherwise `orderingToOrdered` would
+    /// claim `Box[Int] => Ordered[Box[Int]]` and fail later, at the point where
+    /// its `Ordering[Box[Int]]` argument has to be produced.
     fn conversion_provides(&self, id: SymbolId, from: &Type, to: &Type) -> bool {
         let s = self.st.get(id);
         if !s.flags.contains(Flags::IMPLICIT) {
             return false;
         }
-        match &s.ty {
+        let (param, ret) = match &s.ty {
             Type::Method { paramss, ret } => {
                 let ps = paramss.first().cloned().unwrap_or_default();
                 if ps.len() != 1 {
                     return false;
                 }
-                self.weak_conforms(from, &ps[0]) && self.st.is_sub_type(ret, to)
+                (ps[0].clone(), (**ret).clone())
             }
             Type::Function { params, ret } if params.len() == 1 => {
-                self.weak_conforms(from, &params[0]) && self.st.is_sub_type(ret, to)
+                (params[0].clone(), (**ret).clone())
             }
-            _ => false,
+            _ => return false,
+        };
+        let tps = s.tparams.clone();
+        if tps.is_empty() {
+            return self.weak_conforms(from, &param)
+                && self.st.is_sub_type(&ret, to)
+                && self.conv_implicits_resolve(id, from);
         }
+        let targs = self.conv_targs(id, from);
+        let param = crate::symbol::subst_tparams_slice(&tps, &targs, &param);
+        let ret = crate::symbol::subst_tparams_slice(&tps, &targs, &ret);
+        self.weak_conforms(from, &param)
+            && self.st.is_sub_type(&ret, to)
+            && self.conv_implicits_resolve(id, from)
+    }
+
+    /// Call-site type parameters solved from the *view* that will fill a
+    /// function-typed implicit parameter.
+    ///
+    /// `List[Option[Int]].flatten` is
+    /// `flatten[B](implicit asIterable: Option[Int] => IterableOnce[B])`: `B`
+    /// appears nowhere else, so only the witness can pin it, and the witness
+    /// is a conversion rather than a value —
+    /// `Option.option2Iterable[Int]: Option[Int] => Iterable[Int]`. Unifying
+    /// its result `Iterable[Int]` against the wanted `IterableOnce[B]` (the
+    /// candidate side widens to the wanted class, as everywhere else in
+    /// [`Unify`]) gives `B = Int`.
+    ///
+    /// Without this the search returned nothing, `adapt_implicit_apply` left
+    /// the method type standing, and the whole selection was eta-expanded into
+    /// a function value — `println(List(Some(1), None, Some(3)).flatten)`
+    /// printed `Main$$$anonfun$0@…`. (`Typer::reject_unapplied_implicit_clause`
+    /// is the backstop that turns any remaining case of that into an error;
+    /// this is what makes the case at hand *compile* instead.)
+    ///
+    /// The source type has to be known already: a view out of a type the
+    /// search itself is still solving would let any conversion in scope claim
+    /// the parameter.
+    pub(crate) fn view_undet_bindings(
+        &self,
+        pt: &Type,
+        undet: &[SymbolId],
+    ) -> Option<Vec<(SymbolId, Type)>> {
+        let Type::Function { params, ret } = pt else {
+            return None;
+        };
+        if params.len() != 1 || undet.is_empty() {
+            return None;
+        }
+        let from = &params[0];
+        let unknowns: std::collections::HashSet<u32> = undet.iter().map(|s| s.0).collect();
+        if mentions_unknown(from, &unknowns) {
+            return None;
+        }
+        let mut cands: Vec<SymbolId> = self.implicits_in_scope();
+        cands.extend(self.companion_implicits(from));
+        cands.extend(self.companion_implicits(ret));
+        let mut hits: Vec<(SymbolId, Vec<(SymbolId, Type)>)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in cands {
+            if !seen.insert(id.0) {
+                continue;
+            }
+            let Some(res) = self.conversion_result(id, from) else {
+                continue;
+            };
+            if !self.conv_implicits_resolve(id, from) {
+                continue;
+            }
+            let mut u = Unify::new(self, undet.iter().copied());
+            if !u.unify(&res, ret) {
+                continue;
+            }
+            let sol: Vec<(SymbolId, Type)> = undet
+                .iter()
+                .filter_map(|d| u.solved(*d).map(|t| (*d, t)))
+                .collect();
+            if sol.len() != undet.len() {
+                continue;
+            }
+            hits.push((id, sol));
+        }
+        match self.most_specific(hits.iter().map(|(id, _)| *id).collect()) {
+            ImplicitSearch::Found(w) => hits
+                .into_iter()
+                .find(|(id, _)| *id == w)
+                .map(|(_, sol)| sol),
+            // Two conversions that disagree about the type argument are an
+            // ambiguity, not a guess.
+            _ => None,
+        }
+    }
+
+    /// Every implicit clause of a conversion has a witness.
+    fn conv_implicits_resolve(&self, id: SymbolId, from: &Type) -> bool {
+        self.conv_implicit_params(id, from)
+            .iter()
+            .flatten()
+            .all(|want| self.search_implicit_at(want, 1).is_found())
     }
 
     pub(crate) fn search_implicit(&self, pt: &Type) -> ImplicitSearch {
