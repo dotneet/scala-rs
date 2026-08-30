@@ -39,6 +39,7 @@ pub struct TraitImpls {
     impls: HashMap<SymbolId, Vec<Tree>>,
     vals: HashMap<SymbolId, Vec<Tree>>,
     lazy_vals: HashMap<SymbolId, Vec<Tree>>,
+    modules: HashMap<SymbolId, Vec<Tree>>,
 }
 
 /// Collect the concrete trait members of one unit into a shared map.
@@ -52,6 +53,7 @@ pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpl
         trait_impls: HashMap::new(),
         trait_vals: HashMap::new(),
         trait_lazy_vals: HashMap::new(),
+        trait_modules: HashMap::new(),
         library_abi: false,
         pickles: HashMap::new(),
         boxed_vars: HashSet::new(),
@@ -60,6 +62,7 @@ pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpl
     into.impls.extend(g.trait_impls);
     into.vals.extend(g.trait_vals);
     into.lazy_vals.extend(g.trait_lazy_vals);
+    into.modules.extend(g.trait_modules);
 }
 
 /// Walk a typed compilation unit and emit classes.
@@ -79,6 +82,7 @@ pub fn emit_opts(
         trait_impls: shared.impls,
         trait_vals: shared.vals,
         trait_lazy_vals: shared.lazy_vals,
+        trait_modules: shared.modules,
         library_abi: opts.library_abi,
         pickles: opts.pickles,
         // `scala.runtime.*Ref` exists in both ABIs: on the jar, and as a
@@ -106,6 +110,10 @@ struct Gen<'a> {
     /// from `$init$`; every implementing class gets its own field, bitmap bit
     /// and accessor, exactly as nsc's mixin phase does.
     trait_lazy_vals: HashMap<SymbolId, Vec<Tree>>,
+    /// Member `object`s declared in a trait. Like a trait `lazy val` these are
+    /// not set from `$init$`: every implementing class gets its own
+    /// `<name>$module` field and `<name>()` accessor, as nsc's mixin phase does.
+    trait_modules: HashMap<SymbolId, Vec<Tree>>,
     library_abi: bool,
     pickles: HashMap<u32, Vec<u8>>,
     /// Locals boxed into `scala.runtime.IntRef` / `ObjectRef` (library ABI).
@@ -1017,6 +1025,14 @@ fn enclosing_instance(st: &SymbolTable, class_id: SymbolId) -> Option<SymbolId> 
     }
     let o = st.get(owner);
     if o.kind != SymKind::Class || o.flags.contains(Flags::MODULE) {
+        // A member of a *non-static* `object` still has an enclosing instance:
+        // in `class Outer { object P { object N } }` nsc types `N`'s `$outer`
+        // as `Outer$P$`, because `P` itself is one instance per `Outer`.
+        if (o.kind == SymKind::ModuleClass || o.flags.contains(Flags::MODULE))
+            && member_module_outer(st, owner).is_some()
+        {
+            return Some(owner);
+        }
         return None;
     }
     // A member class of a trait gets an `$outer` just like one of a class:
@@ -1112,6 +1128,32 @@ fn linearize(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
 
 fn super_accessor_name(st: &SymbolTable, trait_id: SymbolId, method: &str) -> String {
     format!("{}$$super${}", st.get(trait_id).name, method)
+}
+
+/// nsc's expanded outer accessor of a *trait*: `Main$Outer$T$$$outer`.
+///
+/// A trait compiles to an interface and so cannot hold the `$outer` field
+/// itself. scalac declares this accessor abstractly on the interface and lets
+/// every implementing class return its own enclosing instance through it — the
+/// trait's own code (here: the `T$class` static implementations) then reads the
+/// enclosing instance by calling it instead of by `getfield $outer`.
+fn trait_outer_accessor_name(st: &SymbolTable, trait_id: SymbolId) -> String {
+    format!("{}$$$outer", class_internal(st, trait_id).replace('/', "$"))
+}
+
+/// Read the `$outer` of `cur` off an instance already on the stack.
+fn load_outer_of(asm: &mut Assembler, st: &SymbolTable, cur: SymbolId, held: SymbolId) {
+    let owner = class_internal(st, cur);
+    let desc = format!("L{};", class_internal(st, held));
+    if is_interface_sym(st, cur) {
+        asm.invokeinterface(
+            &owner,
+            &trait_outer_accessor_name(st, cur),
+            &format!("(){desc}"),
+        );
+    } else {
+        asm.getfield(&owner, "$outer", &desc);
+    }
 }
 
 /// nsc's mixin setter for a trait `val`: `p$q$T$_setter_$v_$eq`. Naming it
@@ -1301,11 +1343,7 @@ fn load_owner_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
             break;
         };
         let f = outer_field_class(ctx.st, cur).unwrap_or(o);
-        asm.getfield(
-            &class_internal(ctx.st, cur),
-            "$outer",
-            &format!("L{};", class_internal(ctx.st, f)),
-        );
+        load_outer_of(asm, ctx.st, cur, f);
         cur = o;
         held = f;
     }
@@ -1338,11 +1376,7 @@ fn load_self_alias_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId)
             break;
         };
         let f = outer_field_class(ctx.st, cur).unwrap_or(o);
-        asm.getfield(
-            &class_internal(ctx.st, cur),
-            "$outer",
-            &format!("L{};", class_internal(ctx.st, f)),
-        );
+        load_outer_of(asm, ctx.st, cur, f);
         cur = o;
         held = f;
     }
@@ -1414,8 +1448,7 @@ fn enclosing_module_for(st: &SymbolTable, from: SymbolId, owner: SymbolId) -> Op
 fn load_outer_arg(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
     if !outer_chain_reaches(ctx.st, ctx.class_sym, owner) {
         if let Some(m) = enclosing_module_for(ctx.st, ctx.class_sym, owner) {
-            let jvm = class_internal(ctx.st, m);
-            asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+            load_module_instance(asm, ctx, m);
             if !is_owner_compatible(ctx.st, m, owner) {
                 asm.checkcast(&class_internal(ctx.st, owner));
             }
@@ -1505,6 +1538,99 @@ fn module_class_id(st: &SymbolTable, id: SymbolId) -> SymbolId {
     match st.get(id).ty {
         Type::ModuleRef(c) => c,
         _ => id,
+    }
+}
+
+/// The template an `object` written *inside a class or trait* belongs to.
+///
+/// Such an object is not a static singleton: there is one instance per
+/// enclosing instance. nsc gives it an `$outer` field and an `<init>` taking
+/// the enclosing instance, and puts a lazily initialised `<name>$module` field
+/// plus a `<name>()` accessor on the enclosing template — verified against
+/// `javap -v -p -c` of scalac 2.13.16 output for `class Outer { object P }`.
+/// A top-level `object`, and one nested in another `object`, keeps `MODULE$`.
+///
+/// The owner test is deliberately *direct*: an `object` written inside a
+/// method is owned by the method, and nsc compiles those with a per-call
+/// `scala.runtime.LazyRef` instead. That shape is not implemented; the typer's
+/// `check_local_objects` diagnoses the ones that would need it.
+fn member_module_outer(st: &SymbolTable, id: SymbolId) -> Option<SymbolId> {
+    if id.is_none() {
+        return None;
+    }
+    let cls = module_class_id(st, id);
+    let s = st.get(cls);
+    if !(s.kind == SymKind::ModuleClass || s.flags.contains(Flags::MODULE))
+        || s.flags.contains(Flags::JAVA)
+    {
+        return None;
+    }
+    let owner = s.owner;
+    if owner.is_none() {
+        return None;
+    }
+    let o = st.get(owner);
+    if o.flags.contains(Flags::JAVA) {
+        return None;
+    }
+    if o.kind == SymKind::ModuleClass || o.flags.contains(Flags::MODULE) {
+        // `class Outer { object P { object N } }`: `P` is not static, so
+        // neither is `N` — scalac gives it a `$outer` of type `Outer$P$`.
+        return member_module_outer(st, owner).map(|_| owner);
+    }
+    if o.kind != SymKind::Class {
+        return None;
+    }
+    Some(owner)
+}
+
+/// Name of the accessor the enclosing template exposes for a member `object`
+/// (`P` for `Main$Outer$P$`), and of the field behind it (`P$module`).
+fn module_accessor_name(st: &SymbolTable, module_cls: SymbolId) -> String {
+    strip_module_dollar(&st.get(module_cls).name)
+}
+
+fn module_field_name(st: &SymbolTable, module_cls: SymbolId) -> String {
+    format!("{}$module", module_accessor_name(st, module_cls))
+}
+
+fn module_accessor_desc(st: &SymbolTable, module_cls: SymbolId) -> String {
+    format!("()L{};", class_internal(st, module_cls))
+}
+
+/// Push the single instance of `module_cls` onto the stack: `MODULE$` for a
+/// static singleton, or `<enclosing instance>.<name>()` for a member `object`.
+fn load_module_instance(asm: &mut Assembler, ctx: &EmitCtx, module_cls: SymbolId) {
+    let jvm = class_internal(ctx.st, module_cls);
+    let Some(outer) = member_module_outer(ctx.st, module_cls) else {
+        asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+        return;
+    };
+    // Inside the object itself — or inside a class nested in it — the single
+    // instance is already `this`, or one hop along the `$outer` chain.
+    if outer_chain_reaches(ctx.st, ctx.class_sym, module_cls) {
+        load_owner_instance(asm, ctx, module_cls);
+        return;
+    }
+    load_owner_instance(asm, ctx, outer);
+    invoke_module_accessor(asm, ctx.st, outer, module_cls);
+}
+
+/// `<outer>.<name>()` on an enclosing instance that is already on the stack.
+/// A trait's accessor is an interface method, a class's a virtual one.
+fn invoke_module_accessor(
+    asm: &mut Assembler,
+    st: &SymbolTable,
+    outer: SymbolId,
+    module_cls: SymbolId,
+) {
+    let owner = class_internal(st, outer);
+    let name = module_accessor_name(st, module_cls);
+    let desc = module_accessor_desc(st, module_cls);
+    if is_interface_sym(st, outer) {
+        asm.invokeinterface(&owner, &name, &desc);
+    } else {
+        asm.invokevirtual(&owner, &name, &desc);
     }
 }
 
@@ -1733,6 +1859,15 @@ impl<'a> Gen<'a> {
                         .collect();
                     if !lazies.is_empty() && !tree.sym.is_none() {
                         self.trait_lazy_vals.insert(tree.sym, lazies);
+                    }
+                    let modules: Vec<Tree> = impl_
+                        .body
+                        .iter()
+                        .filter(|s| matches!(s.kind, TreeKind::ModuleDef { .. }))
+                        .cloned()
+                        .collect();
+                    if !modules.is_empty() && !tree.sym.is_none() {
+                        self.trait_modules.insert(tree.sym, modules);
                     }
                 }
                 for s in &impl_.body {
@@ -2001,6 +2136,26 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
+            // A trait nested in a class reaches the enclosing instance
+            // through an accessor the interface declares and every
+            // implementing class fills in (`emit_trait_outer_accessors`).
+            if let Some(o) = outer_field_class(self.st, class_id) {
+                b.add_abstract(
+                    ACC_PUBLIC | ACC_ABSTRACT,
+                    &trait_outer_accessor_name(self.st, class_id),
+                    &format!("()L{};", class_internal(self.st, o)),
+                );
+            }
+            // A member `object` of a trait is one instance per implementing
+            // instance: the interface only declares the accessor, and every
+            // class that mixes the trait in gets the field and the body.
+            for mcls in self.member_modules_of(class_id, &impl_.body) {
+                b.add_abstract(
+                    ACC_PUBLIC | ACC_ABSTRACT,
+                    &module_accessor_name(self.st, mcls),
+                    &module_accessor_desc(self.st, mcls),
+                );
+            }
             attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
             self.out.push(b.finish());
             self.emit_trait_impl_class(tree, &this_name);
@@ -2082,6 +2237,11 @@ impl<'a> Gen<'a> {
             });
         }
         self.emit_class_ctor(&mut b, class_id, vparamss, &impl_.body, &impl_.parents);
+        let own_modules = self.member_modules_of(class_id, &impl_.body);
+        let mixin_modules = self.mixin_member_modules(class_id, &own_modules);
+        self.emit_member_module_accessors(&mut b, &own_modules);
+        self.emit_member_module_accessors(&mut b, &mixin_modules);
+        self.emit_trait_outer_accessors(&mut b, class_id);
         self.emit_lazy_accessors(&mut b, class_id, &lazies);
         self.emit_val_getters(&mut b, &impl_.body);
         self.emit_ctor_val_getters(&mut b, class_id, vparamss);
@@ -3180,6 +3340,42 @@ impl<'a> Gen<'a> {
         out
     }
 
+    /// Member `object`s inherited from mixed-in traits, in linearization
+    /// order. Each needs its own field and accessor on the implementing class,
+    /// because the trait can only declare the accessor abstractly.
+    fn mixin_member_modules(&self, class_id: SymbolId, own: &[SymbolId]) -> Vec<SymbolId> {
+        let mut out: Vec<SymbolId> = Vec::new();
+        if class_id.is_none() {
+            return out;
+        }
+        let mut have: HashSet<String> = own
+            .iter()
+            .map(|m| module_accessor_name(self.st, *m))
+            .collect();
+        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+            if !is_interface_sym(self.st, parent) {
+                continue;
+            }
+            let Some(mods) = self.trait_modules.get(&parent) else {
+                continue;
+            };
+            for m in mods {
+                if m.sym.is_none() {
+                    continue;
+                }
+                let mcls = module_class_id(self.st, m.sym);
+                if member_module_outer(self.st, mcls) != Some(parent) {
+                    continue;
+                }
+                if !have.insert(module_accessor_name(self.st, mcls)) {
+                    continue;
+                }
+                out.push(mcls);
+            }
+        }
+        out
+    }
+
     /// The class's own `lazy val`s followed by the inherited ones: one list so
     /// they share `bitmap$0` without colliding on a bit.
     fn all_lazy_vals(&self, class_id: SymbolId, body: &[Tree]) -> Vec<Tree> {
@@ -3881,6 +4077,142 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// The member `object`s a template holds itself: `class Outer { object P }`
+    /// keeps `P`'s single instance in a `private volatile P$module` field on
+    /// `Outer` and hands it out through a `P()` accessor that creates it on
+    /// first use, exactly as nsc's `lazyValNullables`/mixin phases emit it.
+    fn member_modules_of(&self, template: SymbolId, body: &[Tree]) -> Vec<SymbolId> {
+        let mut out = Vec::new();
+        for s in body {
+            // A `case class` nested here carries a synthetic companion that is
+            // nested too, and needs the same accessor even though there is no
+            // `ModuleDef` for it.
+            let mcls = match &s.kind {
+                TreeKind::ModuleDef { .. } if !s.sym.is_none() => module_class_id(self.st, s.sym),
+                TreeKind::ClassDef { mods, .. }
+                    if mods.flags.contains(Flags::CASE) && !s.sym.is_none() =>
+                {
+                    match self.st.companion_module(s.sym) {
+                        Some(m) => module_class_id(self.st, m),
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if member_module_outer(self.st, mcls) == Some(template) && !out.contains(&mcls) {
+                out.push(mcls);
+            }
+        }
+        out
+    }
+
+    /// Field + accessor for every member `object` a concrete template has to
+    /// hold — its own, and the ones inherited from mixed-in traits, whose
+    /// accessor is an interface method the class has to implement.
+    fn emit_member_module_accessors(&self, b: &mut ClassBuilder, modules: &[SymbolId]) {
+        for &mcls in modules {
+            let this_name = b.this_name.clone();
+            let mjvm = class_internal(self.st, mcls);
+            let mdesc = format!("L{mjvm};");
+            let fname = module_field_name(self.st, mcls);
+            let aname = module_accessor_name(self.st, mcls);
+            let adesc = module_accessor_desc(self.st, mcls);
+            b.fields.push(Field {
+                access: ACC_PRIVATE | ACC_VOLATILE,
+                name: fname.clone(),
+                desc: mdesc.clone(),
+            });
+            // The enclosing instance the module's `<init>` wants is typed by
+            // `outer_field_desc`; for a cake component that is the self type,
+            // so pass `this` through the same cast the field expects.
+            let ctor_desc = outer_field_desc(self.st, mcls)
+                .map(|d| format!("({d})V"))
+                .unwrap_or_else(|| format!("(L{this_name};)V"));
+            let cast_to = outer_field_class(self.st, mcls)
+                .filter(|o| class_internal(self.st, *o) != this_name)
+                .map(|o| class_internal(self.st, o));
+            b.add_code(ACC_PUBLIC, &aname, &adesc, 3, |asm| {
+                asm.aload(0);
+                asm.getfield(&this_name, &fname, &mdesc);
+                let done = asm.fresh_label();
+                asm.ifnonnull(done);
+                let lock = 1u16;
+                asm.aload(0);
+                asm.dup();
+                asm.astore(lock);
+                asm.monitorenter();
+                asm.aload(0);
+                asm.getfield(&this_name, &fname, &mdesc);
+                let made = asm.fresh_label();
+                asm.ifnonnull(made);
+                asm.aload(0);
+                asm.new_obj(&mjvm);
+                asm.dup();
+                asm.aload(0);
+                if let Some(c) = &cast_to {
+                    asm.checkcast(c);
+                }
+                asm.invokespecial(&mjvm, "<init>", &ctor_desc);
+                asm.putfield(&this_name, &fname, &mdesc);
+                asm.mark(made);
+                asm.aload(lock);
+                asm.monitorexit();
+                asm.mark(done);
+                asm.aload(0);
+                asm.getfield(&this_name, &fname, &mdesc);
+                asm.areturn();
+            });
+        }
+    }
+
+    /// Implement `<Trait>$$$outer()` for every mixed-in trait that is nested
+    /// in a class. nsc's mixin phase puts one on each implementing class; the
+    /// trait's own code calls it instead of reading a field it cannot have.
+    fn emit_trait_outer_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        if class_id.is_none() {
+            return;
+        }
+        let mut done: HashSet<String> = HashSet::new();
+        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+            if !is_interface_sym(self.st, parent) {
+                continue;
+            }
+            let Some(o) = outer_field_class(self.st, parent) else {
+                continue;
+            };
+            if !outer_chain_reaches(self.st, class_id, o) {
+                continue;
+            }
+            let name = trait_outer_accessor_name(self.st, parent);
+            if !done.insert(name.clone()) {
+                continue;
+            }
+            let desc = format!("()L{};", class_internal(self.st, o));
+            let class_name = b.this_name.clone();
+            let st = self.st;
+            let extras = &self.extras;
+            let lambda_n = &self.lambda_n;
+            let source = self.source_name;
+            let library_abi = self.library_abi;
+            let boxed_vars = &self.boxed_vars;
+            b.add_code(ACC_PUBLIC, &name, &desc, 2, |asm| {
+                let ctx = emit_ctx(
+                    st,
+                    class_id,
+                    &class_name,
+                    Type::Unit,
+                    extras,
+                    lambda_n,
+                    source,
+                    library_abi,
+                    boxed_vars,
+                );
+                load_owner_instance(asm, &ctx, o);
+                asm.areturn();
+            });
+        }
+    }
+
     /// `lazies` is the class's complete list of `lazy val`s — its own and the
     /// ones inherited from mixed-in traits — so bits in `bitmap$0` are unique.
     fn emit_lazy_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId, lazies: &[Tree]) {
@@ -4152,16 +4484,34 @@ impl<'a> Gen<'a> {
             class_internal(self.st, cls)
         };
 
+        // An `object` that is a member of a class or trait has one instance
+        // per enclosing instance, reached through the enclosing template's
+        // `<name>()` accessor — not a static `MODULE$` singleton.
+        let inner_outer = member_module_outer(self.st, cls);
         let mut b = ClassBuilder::new(this_name.clone(), self.source_name);
-        b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
+        b.access = if inner_outer.is_some() {
+            ACC_PUBLIC | ACC_SUPER
+        } else {
+            ACC_PUBLIC | ACC_FINAL | ACC_SUPER
+        };
         let (super_name, interfaces) = split_parents(self.st, &impl_.parents);
         b.super_name = super_name;
         b.interfaces = interfaces;
-        b.fields.push(Field {
-            access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
-            name: "MODULE$".into(),
-            desc: format!("L{this_name};"),
-        });
+        if let Some(o) = inner_outer {
+            let outer_desc = outer_field_desc(self.st, cls)
+                .unwrap_or_else(|| format!("L{};", class_internal(self.st, o)));
+            b.fields.push(Field {
+                access: ACC_PUBLIC | ACC_FINAL,
+                name: "$outer".into(),
+                desc: outer_desc,
+            });
+        } else {
+            b.fields.push(Field {
+                access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
+                name: "MODULE$".into(),
+                desc: format!("L{this_name};"),
+            });
+        }
         for stt in &impl_.body {
             if let TreeKind::ValDef { name, mods, .. } = &stt.kind {
                 let ty = if stt.ty.is_no_type() && !stt.sym.is_none() {
@@ -4199,8 +4549,15 @@ impl<'a> Gen<'a> {
             });
         }
 
-        self.emit_module_init(&mut b, cls, &impl_.body, &impl_.parents);
-        self.emit_module_clinit(&mut b);
+        self.emit_module_init(&mut b, cls, &impl_.body, &impl_.parents, inner_outer);
+        if inner_outer.is_none() {
+            self.emit_module_clinit(&mut b);
+        }
+        let own_modules = self.member_modules_of(cls, &impl_.body);
+        let mixin_modules = self.mixin_member_modules(cls, &own_modules);
+        self.emit_member_module_accessors(&mut b, &own_modules);
+        self.emit_member_module_accessors(&mut b, &mixin_modules);
+        self.emit_trait_outer_accessors(&mut b, cls);
         self.emit_lazy_accessors(&mut b, cls, &lazies);
         self.emit_val_getters(&mut b, &impl_.body);
 
@@ -4342,6 +4699,7 @@ impl<'a> Gen<'a> {
         class_id: SymbolId,
         body: &[Tree],
         parents: &[Tree],
+        inner_outer: Option<SymbolId>,
     ) {
         let class_name = b.this_name.clone();
         let st = self.st;
@@ -4371,8 +4729,21 @@ impl<'a> Gen<'a> {
             parent_super_ctor(st, parents, &super_name);
         let super_outer = outer_field_class(st, super_cls);
         let mixin_inits = self.mixin_init_calls(class_id);
-        b.add_code(ACC_PRIVATE, "<init>", "()V", 4, |asm| {
+        // A member `object` of a class or trait takes the enclosing instance
+        // and keeps it in `$outer`; there is no static `MODULE$` to publish.
+        let own_outer = inner_outer.map(|o| {
+            outer_field_desc(st, class_id).unwrap_or_else(|| format!("L{};", class_internal(st, o)))
+        });
+        let (acc, ctor_desc, max_locals) = match &own_outer {
+            Some(d) => (ACC_PUBLIC, format!("({d})V"), 4),
+            None => (ACC_PRIVATE, "()V".to_string(), 4),
+        };
+        let outer_cls = inner_outer.unwrap_or(SymbolId::NONE);
+        b.add_code(acc, "<init>", &ctor_desc, max_locals, |asm| {
             let mut frame = Frame::instance();
+            if own_outer.is_some() {
+                frame.next_slot += 1; // slot 1 is $outer
+            }
             let ctx = emit_ctx(
                 st,
                 class_id,
@@ -4384,16 +4755,40 @@ impl<'a> Gen<'a> {
                 library_abi,
                 boxed_vars,
             );
+            if own_outer.is_some() {
+                // nsc rejects a null enclosing instance up front.
+                asm.aload(1);
+                let ok = asm.fresh_label();
+                asm.ifnonnull(ok);
+                asm.aconst_null();
+                asm.athrow();
+                asm.mark(ok);
+            }
             asm.aload(0);
             if let Some(o) = super_outer {
-                load_outer_arg(asm, &ctx, o);
+                // Our own `$outer` is not stored yet; read it out of the
+                // argument when it is the instance the parent wants.
+                if own_outer.is_some() && is_owner_compatible(st, outer_cls, o) {
+                    asm.aload(1);
+                } else {
+                    load_outer_arg(asm, &ctx, o);
+                }
             }
             for a in &super_args {
                 gen_expr(asm, &mut frame, &ctx, a);
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);
-            asm.aload(0);
-            asm.putstatic(&class_name, "MODULE$", &format!("L{class_name};"));
+            match &own_outer {
+                Some(d) => {
+                    asm.aload(0);
+                    asm.aload(1);
+                    asm.putfield(&class_name, "$outer", d);
+                }
+                None => {
+                    asm.aload(0);
+                    asm.putstatic(&class_name, "MODULE$", &format!("L{class_name};"));
+                }
+            }
             for (impl_cls, init_desc) in &mixin_inits {
                 asm.aload(0);
                 asm.invokestatic(impl_cls, "$init$", init_desc);
@@ -4448,14 +4843,34 @@ impl<'a> Gen<'a> {
         };
         let this_name = format!("{class_jvm}$");
         let mut b = ClassBuilder::new(this_name.clone(), self.source_name);
-        b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
-        b.fields.push(Field {
-            access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
-            name: "MODULE$".into(),
-            desc: format!("L{this_name};"),
-        });
-        self.emit_module_init(&mut b, class_id, &[], &[]);
-        self.emit_module_clinit(&mut b);
+        // A case class nested in a class has a nested companion too: it gets
+        // the same `$outer` and per-enclosing-instance accessor.
+        let comp = self
+            .st
+            .companion_module(class_id)
+            .map(|m| module_class_id(self.st, m));
+        let inner_outer = comp.and_then(|c| member_module_outer(self.st, c));
+        b.access = if inner_outer.is_some() {
+            ACC_PUBLIC | ACC_SUPER
+        } else {
+            ACC_PUBLIC | ACC_FINAL | ACC_SUPER
+        };
+        match outer_field_desc(self.st, class_id).filter(|_| inner_outer.is_some()) {
+            Some(d) => b.fields.push(Field {
+                access: ACC_PUBLIC | ACC_FINAL,
+                name: "$outer".into(),
+                desc: d,
+            }),
+            None => b.fields.push(Field {
+                access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
+                name: "MODULE$".into(),
+                desc: format!("L{this_name};"),
+            }),
+        }
+        self.emit_module_init(&mut b, class_id, &[], &[], inner_outer);
+        if inner_outer.is_none() {
+            self.emit_module_clinit(&mut b);
+        }
         emit_case_apply(&mut b, self.st, class_id);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out.push(b.finish());
@@ -4527,10 +4942,28 @@ fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
         args: vec![],
     };
     let desc = jvm_method_desc(st, &params, &ret);
-    let ctor_d = jvm_method_desc(st, &params, &Type::Unit);
+    // A case class nested in a class takes its enclosing instance first; the
+    // companion is nested in the same class and holds the same one in its own
+    // `$outer`. Reading it off the builder keeps the two in step: a companion
+    // that is still a static singleton has none to pass.
+    let outer = b
+        .fields
+        .iter()
+        .find(|f| f.name == "$outer")
+        .map(|f| (b.this_name.clone(), f.desc.clone()));
+    let base_ctor_d = jvm_method_desc(st, &params, &Type::Unit);
+    let ctor_d = if outer.is_some() {
+        with_enclosing_outer_param(st, class_id, &base_ctor_d)
+    } else {
+        base_ctor_d
+    };
     b.add_code(ACC_PUBLIC, "apply", &desc, locals.max(1), |asm| {
         asm.new_obj(&class_jvm);
         asm.dup();
+        if let Some((owner, d)) = &outer {
+            asm.aload(0);
+            asm.getfield(owner, "$outer", d);
+        }
         for (slot, sort) in &loads {
             load(asm, *slot, *sort);
         }
@@ -4572,10 +5005,18 @@ fn emit_case_copy(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
         args: vec![],
     };
     let desc = jvm_method_desc(st, &params, &ret);
-    let ctor_d = jvm_method_desc(st, &params, &Type::Unit);
+    // `copy` runs on the instance itself, so its own `$outer` is the one the
+    // fresh instance gets.
+    let ctor_d =
+        with_enclosing_outer_param(st, class_id, &jvm_method_desc(st, &params, &Type::Unit));
+    let outer = outer_field_desc(st, class_id);
     b.add_code(ACC_PUBLIC, "copy", &desc, locals.max(1), |asm| {
         asm.new_obj(&class_jvm);
         asm.dup();
+        if let Some(d) = &outer {
+            asm.aload(0);
+            asm.getfield(&class_jvm, "$outer", d);
+        }
         for (slot, sort) in &loads {
             load(asm, *slot, *sort);
         }
@@ -5170,10 +5611,8 @@ fn load_qualified_this(asm: &mut Assembler, ctx: &EmitCtx, name: &str) {
         let Some(outer) = enclosing_instance(ctx.st, cur) else {
             break;
         };
-        let owner = class_internal(ctx.st, cur);
         let f = outer_field_class(ctx.st, cur).unwrap_or(outer);
-        let od = format!("L{};", class_internal(ctx.st, f));
-        asm.getfield(&owner, "$outer", &od);
+        load_outer_of(asm, ctx.st, cur, f);
         cur = outer;
     }
 }
@@ -5220,8 +5659,7 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
         if is_module_class(ctx.st, owner_sym)
             && module_class_id(ctx.st, owner_sym) != module_class_id(ctx.st, ctx.class_sym)
         {
-            let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner_sym));
-            asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+            load_module_instance(asm, ctx, module_class_id(ctx.st, owner_sym));
         } else {
             load_owner_instance(asm, ctx, owner_sym);
         }
@@ -5263,8 +5701,7 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
             if is_module_class(ctx.st, owner)
                 && module_class_id(ctx.st, owner) != module_class_id(ctx.st, ctx.class_sym)
             {
-                let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
-                asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+                load_module_instance(asm, ctx, module_class_id(ctx.st, owner));
             } else {
                 load_owner_instance(asm, ctx, owner);
             }
@@ -5286,13 +5723,23 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
             }
         }
         SymKind::Module | SymKind::ModuleClass => {
-            let jvm = class_internal(ctx.st, module_class_id(ctx.st, id));
-            asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+            load_module_instance(asm, ctx, module_class_id(ctx.st, id));
         }
         SymKind::Class => {
             // Java classes have no companion MODULE$. Scala `Foo.bar` still
             // loads `Foo$` when a companion exists.
             if ctx.st.get(id).flags.contains(Flags::JAVA) || ctx.st.companion_module(id).is_none() {
+                return;
+            }
+            // A companion of a class nested in a class is itself an inner
+            // `object`, reached through the enclosing instance's accessor.
+            if let Some(c) = ctx
+                .st
+                .companion_module(id)
+                .map(|m| module_class_id(ctx.st, m))
+                .filter(|c| member_module_outer(ctx.st, *c).is_some())
+            {
+                load_module_instance(asm, ctx, c);
                 return;
             }
             let jvm = format!("{}$", class_internal(ctx.st, id));
@@ -5301,8 +5748,7 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
         SymKind::Method => {
             let owner = ctx.st.get(id).owner;
             if is_module_class(ctx.st, owner) {
-                let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
-                asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+                load_module_instance(asm, ctx, module_class_id(ctx.st, owner));
             } else if ctx.st.get(owner).kind == SymKind::Package {
                 // A package-object member (`scala.math.Pi`,
                 // `scala.reflect.runtime.universe`) is reached through the
@@ -5489,7 +5935,7 @@ fn gen_select(
     if !tree.sym.is_none() {
         let s = ctx.st.get(tree.sym);
         if s.flags.contains(Flags::LAZY) && s.kind == SymKind::Term {
-            gen_expr(asm, frame, ctx, qual);
+            gen_select_receiver(asm, frame, ctx, qual, s.owner);
             let owner = class_internal(ctx.st, s.owner);
             let desc = format!("(){}", jvm_desc(ctx.st, &s.ty));
             // A trait's `lazy val` is an interface member; every implementing
@@ -5515,7 +5961,7 @@ fn gen_select(
                     return;
                 }
                 if !load_package_object_receiver(asm, ctx, qual, s.owner) {
-                    gen_expr(asm, frame, ctx, qual);
+                    gen_select_receiver(asm, frame, ctx, qual, s.owner);
                     checkcast_refined_receiver(asm, ctx, &qual.ty, tree.sym);
                 }
                 if is_trait_owned_term(ctx.st, tree.sym) {
@@ -5539,7 +5985,7 @@ fn gen_select(
                 let ic = s.intrinsic;
                 if !s.flags.contains(Flags::STATIC) {
                     if !load_package_object_receiver(asm, ctx, qual, s.owner) {
-                        gen_expr(asm, frame, ctx, qual);
+                        gen_select_receiver(asm, frame, ctx, qual, s.owner);
                         checkcast_refined_receiver(asm, ctx, &qual.ty, tree.sym);
                     }
                     // Paren-less call to an `ArrayOps` member with no
@@ -5616,7 +6062,22 @@ fn gen_select(
                 return;
             }
             SymKind::Module | SymKind::ModuleClass => {
-                let jvm = class_internal(ctx.st, module_class_id(ctx.st, tree.sym));
+                let mcls = module_class_id(ctx.st, tree.sym);
+                // `o.P` on a member `object`: the qualifier *is* the enclosing
+                // instance, and the instance comes from its `P()` accessor.
+                if let Some(outer) = member_module_outer(ctx.st, mcls) {
+                    gen_expr(asm, frame, ctx, qual);
+                    let known = ctx
+                        .st
+                        .class_sym_of(&qual.ty)
+                        .is_some_and(|q| is_owner_compatible(ctx.st, q, outer));
+                    if !known {
+                        asm.checkcast(&class_internal(ctx.st, outer));
+                    }
+                    invoke_module_accessor(asm, ctx.st, outer, mcls);
+                    return;
+                }
+                let jvm = class_internal(ctx.st, mcls);
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
                 return;
             }
@@ -7398,6 +7859,54 @@ fn value_extension_desc(st: &SymbolTable, id: SymbolId) -> String {
     format!("({}{}", jvm_desc(st, &under), rest)
 }
 
+/// Push the receiver for a member of `mcls`, given the qualifier as written.
+///
+/// `o.P.q` names the object itself, so the qualifier already evaluates to it.
+/// `o.K(2)` on a nested case class instead names the *enclosing* instance and
+/// leaves the companion implicit, so the accessor still has to run.
+fn gen_module_member_receiver(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    qual: &Tree,
+    mcls: SymbolId,
+) {
+    let Some(outer) = member_module_outer(ctx.st, mcls) else {
+        let jvm = class_internal(ctx.st, mcls);
+        asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+        return;
+    };
+    let qcls = ctx.st.class_sym_of(&qual.ty);
+    if qcls == Some(mcls) {
+        gen_expr(asm, frame, ctx, qual);
+        return;
+    }
+    if qcls.is_some_and(|q| is_owner_compatible(ctx.st, q, outer)) {
+        gen_expr(asm, frame, ctx, qual);
+        invoke_module_accessor(asm, ctx.st, outer, mcls);
+        return;
+    }
+    load_module_instance(asm, ctx, mcls);
+}
+
+/// Push the receiver of `owner`'s member from the qualifier as written.
+fn gen_select_receiver(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    qual: &Tree,
+    owner: SymbolId,
+) {
+    if is_module_class(ctx.st, owner) {
+        let mcls = module_class_id(ctx.st, owner);
+        if member_module_outer(ctx.st, mcls).is_some() {
+            gen_module_member_receiver(asm, frame, ctx, qual, mcls);
+            return;
+        }
+    }
+    gen_expr(asm, frame, ctx, qual);
+}
+
 fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tree) {
     if !fun.sym.is_none() && ctx.st.get(fun.sym).flags.contains(Flags::STATIC) {
         return;
@@ -7407,13 +7916,20 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
             if !fun.sym.is_none() {
                 let s = ctx.st.get(fun.sym);
                 if matches!(s.kind, SymKind::Module | SymKind::ModuleClass) {
-                    let jvm = class_internal(ctx.st, module_class_id(ctx.st, fun.sym));
-                    asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+                    let mcls = module_class_id(ctx.st, fun.sym);
+                    // A member `object` comes from its enclosing instance's
+                    // accessor; `gen_select` knows how to reach it.
+                    if member_module_outer(ctx.st, mcls).is_some() {
+                        gen_expr(asm, frame, ctx, fun);
+                    } else {
+                        let jvm = class_internal(ctx.st, mcls);
+                        asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+                    }
                     return;
                 }
                 if s.kind == SymKind::Method && is_module_class(ctx.st, s.owner) {
-                    let jvm = class_internal(ctx.st, module_class_id(ctx.st, s.owner));
-                    asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+                    let mcls = module_class_id(ctx.st, s.owner);
+                    gen_module_member_receiver(asm, frame, ctx, qual, mcls);
                     return;
                 }
                 if s.kind == SymKind::Package {
@@ -7441,14 +7957,12 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
             }
             let s = ctx.st.get(fun.sym);
             if matches!(s.kind, SymKind::Module | SymKind::ModuleClass) {
-                let jvm = class_internal(ctx.st, module_class_id(ctx.st, fun.sym));
-                asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+                load_module_instance(asm, ctx, module_class_id(ctx.st, fun.sym));
                 return;
             }
             let owner = s.owner;
             if is_module_class(ctx.st, owner) {
-                let jvm = class_internal(ctx.st, module_class_id(ctx.st, owner));
-                asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+                load_module_instance(asm, ctx, module_class_id(ctx.st, owner));
             } else if owner == ctx.class_sym || owner.is_none() {
                 load_this(asm, ctx);
             } else {

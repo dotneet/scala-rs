@@ -7,6 +7,7 @@ mod javaclass;
 mod javasign;
 mod lambda_lift;
 mod lazysig;
+mod localobj;
 mod macros;
 mod pickle_supply;
 mod prelude;
@@ -56,6 +57,7 @@ pub use check::{
 };
 pub use erasure::{erase, erase_type, note_source_value_classes};
 pub use lambda_lift::lambda_lift;
+pub use localobj::check_local_objects;
 pub use symbol::{Intrinsic, MacroBinding, SamSig, SymKind, Symbol, SymbolTable};
 pub use uncurry::uncurry;
 
