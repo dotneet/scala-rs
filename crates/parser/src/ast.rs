@@ -806,7 +806,53 @@ pub struct Enumerator {
     pub guard: Option<Tree>,
 }
 
+/// nsc `Chars.isOperatorPart`.
+fn is_operator_part(c: char) -> bool {
+    matches!(
+        c,
+        '~' | '!'
+            | '@'
+            | '#'
+            | '%'
+            | '^'
+            | '*'
+            | '+'
+            | '-'
+            | '<'
+            | '>'
+            | '?'
+            | ':'
+            | '='
+            | '&'
+            | '|'
+            | '/'
+            | '\\'
+    )
+}
+
+/// nsc `nme.isOpAssignmentName`: an operator that ends in `=`, does not start
+/// with `=`, is not `!=` / `<=` / `>=`, and begins with an operator character.
+/// A *letter*-headed name such as `max=` is not one (nsc gives it the
+/// alphabetic precedence instead).
+pub fn is_op_assignment_name(op: &str) -> bool {
+    let Some(first) = op.chars().next() else {
+        return false;
+    };
+    op.len() > 1
+        && op.ends_with('=')
+        && first != '='
+        && is_operator_part(first)
+        && !matches!(op, "!=" | "<=" | ">=")
+}
+
 pub fn op_precedence(op: &str) -> i32 {
+    // nsc `precedence`: an op-assignment binds *looser* than every other
+    // operator. Ranking `+=` with `+` made `n += i + x` parse as
+    // `(n += i) + x`, whose left operand is `Unit`; the typer then reached for
+    // `any2stringadd` and reported `no matching overload for (String)String`.
+    if is_op_assignment_name(op) {
+        return 0;
+    }
     match op.chars().next().unwrap_or('\0') {
         c if c.is_ascii_alphabetic() || c == '_' => 1,
         '|' => 2,

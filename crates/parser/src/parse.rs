@@ -4801,9 +4801,40 @@ fn refinement_has_impl(t: &Tree) -> bool {
     }
 }
 
+/// A block statement that is a *definition* rather than a term. nsc's
+/// `Trees.isTerm` is false for these, and `TreeBuilder.makeBlock` gives such a
+/// block the value `()` (visible in `-Xprint:parser`).
+fn stat_is_definition(t: &Tree) -> bool {
+    matches!(
+        t.kind,
+        TreeKind::ValDef { .. }
+            | TreeKind::DefDef { .. }
+            | TreeKind::ClassDef { .. }
+            | TreeKind::ModuleDef { .. }
+            | TreeKind::TypeDef { .. }
+            | TreeKind::Import { .. }
+    )
+}
+
 fn block_from_stats(p: &mut Parser, span: Span, mut stats: Vec<Tree>) -> Tree {
     if stats.is_empty() {
         return p.alloc(span, TreeKind::Literal { lit: Lit::Unit });
+    }
+    // nsc `makeBlock`: `{ ...; val v = 1 }` is `Block(stats :+ valdef, ())`.
+    // A definition pushes nothing, so leaving it as the block's result value
+    // made the block's type the definition's (`Int` here) and every consumer
+    // that discards a block's value emitted a `pop` against an empty stack
+    // (`VerifyError: Operand stack underflow` for `def m(): Unit = { val v = 1 }`).
+    if stat_is_definition(stats.last().unwrap()) {
+        let last = stats.last().unwrap().span;
+        let unit = p.alloc(last, TreeKind::Literal { lit: Lit::Unit });
+        return p.alloc(
+            span.merge(last),
+            TreeKind::Block {
+                stats,
+                expr: Box::new(unit),
+            },
+        );
     }
     let expr = stats.pop().unwrap();
     if stats.is_empty() {

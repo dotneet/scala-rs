@@ -7549,6 +7549,22 @@ impl Typer {
         if !self.supply_from_pickle(&qual_ty, &name).is_empty() {
             return false;
         }
+        // nsc `convertToAssignment`'s `mkUpdate` branch: when the receiver is
+        // an indexing, `t(i) op= x` is `t.update(i, t.apply(i) op x)`.
+        // Without it `arr(0) += 1` was reported as an unassignable receiver.
+        if let TreeKind::Apply {
+            fun: callee,
+            args: indices,
+        } = &qual.kind
+        {
+            if let Some(table) = index_table(callee) {
+                let table = table.clone();
+                let indices = indices.clone();
+                let rhs_args = args.clone();
+                return self
+                    .rewrite_update_assignment_op(tree, table, indices, &name, rhs_args, pt);
+            }
+        }
         if self.is_assignable_lhs(qual) {
             let op = name[..name.len() - 1].to_string();
             let lhs = (**qual).clone();
@@ -7605,6 +7621,121 @@ impl Typer {
         }
         let s = self.st.get(tree.sym);
         s.kind == SymKind::Term && s.flags.contains(Flags::MUTABLE)
+    }
+
+    /// nsc `convertToAssignment`'s `mkUpdate`: `t(i) op= x` is
+    /// `t.update(i, t.apply(i) op x)`. The table and every index are evaluated
+    /// once (nsc `gen.evalOnce`), so `f()(g()) += 1` does not run `f` and `g`
+    /// twice. The `Assign` case turns the `t(i) = …` back into `t.update`.
+    fn rewrite_update_assignment_op(
+        &mut self,
+        tree: &mut Tree,
+        table: Tree,
+        indices: Vec<Tree>,
+        name: &str,
+        rhs_args: Vec<Tree>,
+        pt: &Type,
+    ) -> bool {
+        let span = tree.span;
+        let mut stats: Vec<Tree> = Vec::new();
+        let table = self.eval_once(table, &mut stats);
+        let indices: Vec<Tree> = indices
+            .into_iter()
+            .map(|i| self.eval_once(i, &mut stats))
+            .collect();
+        let read = || Tree {
+            span,
+            ..Tree::dummy(TreeKind::Apply {
+                fun: Box::new(table.clone()),
+                args: indices.clone(),
+            })
+        };
+        let op = name[..name.len() - 1].to_string();
+        let combined = Tree {
+            span,
+            ..Tree::dummy(TreeKind::Apply {
+                fun: Box::new(Tree {
+                    span,
+                    ..Tree::dummy(TreeKind::Select {
+                        qual: Box::new(read()),
+                        name: op,
+                    })
+                }),
+                args: rhs_args,
+            })
+        };
+        let assign = TreeKind::Assign {
+            lhs: Box::new(read()),
+            rhs: Box::new(combined),
+        };
+        tree.kind = if stats.is_empty() {
+            assign
+        } else {
+            TreeKind::Block {
+                stats,
+                expr: Box::new(Tree {
+                    span,
+                    ..Tree::dummy(assign)
+                }),
+            }
+        };
+        tree.ty = Type::NoType;
+        tree.sym = SymbolId::NONE;
+        self.type_expr(tree, pt);
+        true
+    }
+
+    /// nsc `gen.evalOnce`: hand back a tree that may be used twice. A pure
+    /// reference is duplicated; anything else is bound to a fresh local whose
+    /// definition is pushed onto `stats`.
+    fn eval_once(&mut self, t: Tree, stats: &mut Vec<Tree>) -> Tree {
+        // Decide on the *typed* tree — `arr` inside `arr(0)` only looks like a
+        // stable reference while it still carries its symbol — then hand back a
+        // copy the typer can resolve again from the name.
+        let safe = self.is_safe_to_duplicate(&t);
+        let mut t = t;
+        reset_for_retyping(&mut t);
+        if safe {
+            return t;
+        }
+        let name = self.fresh("ev");
+        let span = t.span;
+        stats.push(Tree {
+            span,
+            ..Tree::dummy(TreeKind::ValDef {
+                mods: scala_rs_parser::Modifiers::default(),
+                name: name.clone(),
+                tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+                rhs: Box::new(t),
+            })
+        });
+        Tree {
+            span,
+            ..Tree::dummy(TreeKind::Ident { name })
+        }
+    }
+
+    /// nsc `treeInfo.isExprSafeToInline`, narrowed to the shapes the update
+    /// rewrite duplicates.
+    fn is_safe_to_duplicate(&self, t: &Tree) -> bool {
+        match &t.kind {
+            TreeKind::Literal { .. } | TreeKind::This { .. } | TreeKind::Super { .. } => true,
+            TreeKind::Ident { .. } => self.is_stable_ref(t),
+            TreeKind::Select { qual, .. } => {
+                self.is_stable_ref(t) && self.is_safe_to_duplicate(qual)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_stable_ref(&self, t: &Tree) -> bool {
+        if t.sym.is_none() {
+            return false;
+        }
+        let s = self.st.get(t.sym);
+        matches!(s.kind, SymKind::Term | SymKind::Module)
+            && !s.flags.contains(Flags::MUTABLE)
+            && !matches!(s.ty, Type::Method { .. })
     }
 
     fn try_rewrite_dynamic_apply(&mut self, tree: &mut Tree, pt: &Type) -> bool {
@@ -8633,6 +8764,30 @@ impl Typer {
                 if !sym.is_none() {
                     fun.sym = sym;
                     tree.sym = sym;
+                    // Codegen's `peel_fun` walks through a `TypeApply` to the
+                    // `Select`/`Ident` underneath and reads *that* node's
+                    // symbol, so an overload resolved here has to reach it too.
+                    // `Array.ofDim[Double](2, 3)` picked the two-dimensional
+                    // alternative here and still emitted a call to the
+                    // one-dimensional `ofDim(I, ClassTag)Object`.
+                    if let TreeKind::TypeApply { fun: inner, .. } = &mut fun.kind {
+                        if inner.sym != sym {
+                            inner.sym = sym;
+                            inner.ty = self.st.get(sym).ty.clone();
+                        }
+                    }
+                    // nsc (SLS 6.26.3): explicit type arguments *are* the
+                    // instantiation. `TypeApply` applies them itself when it
+                    // can name one alternative, but it cannot when several
+                    // take the same number of type parameters -- all five
+                    // `Array.ofDim` alternatives take one -- so the reference
+                    // arrives here still overloaded and the arguments the user
+                    // wrote have reached nothing. Without this,
+                    // `Array.ofDim[Double](2, 2)` stayed `Array[Array[T]]` and
+                    // every use of an element reported `required: T`.
+                    let pending_targs = matches!(&fun.ty, Type::Overload(_))
+                        .then(|| explicit_type_args(fun))
+                        .flatten();
                     // Remaining clauses (`Using.resources(a, b)(f)`) read `fun.ty`.
                     // Leave a Method type, not the Overload that selected this alt.
                     if matches!(&fun.ty, Type::Overload(_)) {
@@ -8676,6 +8831,20 @@ impl Typer {
                             .into_iter()
                             .filter(|(_, t)| !mentions_no_type(t))
                             .collect();
+                        // Explicit type arguments that could not be applied at
+                        // the `TypeApply` (see `pending_targs`) override what
+                        // the arguments alone could infer.
+                        let inst = match &pending_targs {
+                            Some(targs) if targs.len() == self.st.get(sym).tparams.len() => self
+                                .st
+                                .get(sym)
+                                .tparams
+                                .clone()
+                                .into_iter()
+                                .zip(targs.iter().cloned())
+                                .collect(),
+                            _ => inst,
+                        };
                         // The expected type is a constraint too. Solve it here,
                         // before the implicit clauses are filled: slick's
                         // `def column[T](n: Node)(implicit tt: TypedType[T]): Rep[T]`
@@ -17594,6 +17763,55 @@ fn is_rigid_type(ty: &Type) -> bool {
             paramss.iter().flatten().all(is_rigid_type) && is_rigid_type(ret)
         }
         _ => true,
+    }
+}
+
+/// The object an indexing applies to. `type_expr` has already rewritten `t(i)`
+/// to `t.apply(i)`, exactly as nsc does, and nsc's `convertToAssignment` takes
+/// its `mkUpdate` branch only for that shape
+/// (`treeInfo.Applied(Select(table, nme.apply), _, _)`): `foo.bar(0) += 1`,
+/// where `bar` is an ordinary method, is an error there, since rewriting it to
+/// `foo.bar.update(0, …)` would drop `bar`'s own argument list.
+fn index_table(callee: &Tree) -> Option<&Tree> {
+    match &callee.kind {
+        TreeKind::Select { qual, name } if name == "apply" => Some(qual),
+        TreeKind::TypeApply { fun, .. } => index_table(fun),
+        _ => None,
+    }
+}
+
+/// Clear what the typer wrote on a tree that is about to be re-typed in a new
+/// position, so it starts from the name again. `arr` inside `arr(0)` is left
+/// holding the array's `apply` *method* type, and moving that into
+/// `arr.update(…)` looked `update` up on `(Int)Int`. Ids are kept:
+/// `type_apply` recognises the arguments it filled in itself by id and drops
+/// them before resolving the call again.
+fn reset_for_retyping(c: &mut Tree) {
+    c.sym = SymbolId::NONE;
+    c.ty = Type::NoType;
+    match &mut c.kind {
+        TreeKind::Select { qual, .. } => reset_for_retyping(qual),
+        TreeKind::Apply { fun, args } | TreeKind::TypeApply { fun, args } => {
+            reset_for_retyping(fun);
+            for a in args.iter_mut() {
+                reset_for_retyping(a);
+            }
+        }
+        TreeKind::Typed { expr, .. } => reset_for_retyping(expr),
+        _ => {}
+    }
+}
+
+/// The type arguments the user wrote on the callee, if the callee is a
+/// `TypeApply`. `type_expr` has already resolved each argument tree's `ty`.
+fn explicit_type_args(fun: &Tree) -> Option<Vec<Type>> {
+    match &fun.kind {
+        TreeKind::TypeApply { args, .. } => {
+            let targs: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+            (!targs.is_empty() && !targs.iter().any(|t| t.is_no_type() || t.is_error()))
+                .then_some(targs)
+        }
+        _ => None,
     }
 }
 

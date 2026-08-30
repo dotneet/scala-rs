@@ -1,0 +1,16 @@
+2
+10
+[[I
+y
+[[Ljava.lang.String;
+7
+[[[I
+9
+[I
+s
+[Ljava.lang.String;
+[Ljava.lang.Object;
+1,2
+[Lscala.Tuple2;
+2
+[Lscala.Function1;
