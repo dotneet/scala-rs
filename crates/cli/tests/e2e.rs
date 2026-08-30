@@ -673,7 +673,10 @@ fn fixtures_this_type_bad_is_error() {
 
 #[test]
 fn fixtures_compound_bad_is_error() {
-    compile_fails("compound_bad", "illegal inheritance");
+    // `A with B` is a legal type even for two unrelated classes; what it is
+    // not is a way to reach a member neither parent declares. The template
+    // rule is `mism7_mixin_bad`.
+    compile_fails("compound_bad", "value c is not a member of A with B");
 }
 
 #[test]

@@ -1737,7 +1737,7 @@ impl Typer {
         self.type_class(tpt);
     }
 
-    fn type_eta(&mut self, tree: &mut Tree) {
+    fn type_eta(&mut self, tree: &mut Tree, pt: &Type) {
         let dummy_method = Type::Method {
             paramss: vec![],
             ret: Box::new(Type::NoType),
@@ -1753,18 +1753,21 @@ impl Typer {
             // One lambda per parameter list: `curry(1) _` on
             // `def curry(a: Int)(b: Int)(c: Int)` is `Int => Int => Int`, not
             // a flattened `(Int, Int) => Int`.
-            let clauses: Vec<Vec<Type>> = if paramss.is_empty() {
+            let mut clauses: Vec<Vec<Type>> = if paramss.is_empty() {
                 vec![Vec::new()]
             } else {
                 paramss
             };
-            crate::uncurry::eta_expand_curried(
-                &mut self.st,
-                &mut self.gensym,
-                tree,
-                &clauses,
-                *ret,
-            );
+            let mut ret = *ret;
+            // `xs.map(identity _)` names a polymorphic method: its own type
+            // parameters are the expected function type's to solve, exactly as
+            // for the `_`-less form.
+            if clauses.len() == 1 {
+                let (ps, r) = self.solve_eta_tparams(tree.sym, clauses[0].clone(), ret.clone(), pt);
+                clauses[0] = ps;
+                ret = r;
+            }
+            crate::uncurry::eta_expand_curried(&mut self.st, &mut self.gensym, tree, &clauses, ret);
         }
     }
 
@@ -2032,6 +2035,7 @@ impl Typer {
         self.finish_case_apply(id, &paramss_ty, &paramss_ids);
         self.check_type_member_kind_override(id, tree.span);
         self.check_self_conformance(id, tree.span);
+        self.check_mixin_parents(id, tree.span);
         self.check_class_variance(id, tree.span);
         if !self.sigs_only {
             let body_snapshot: Vec<Tree> = body.to_vec();
@@ -2213,6 +2217,7 @@ impl Typer {
             }
         }
         self.check_self_conformance(cls, tree.span);
+        self.check_mixin_parents(cls, tree.span);
         self.check_type_member_kind_override(cls, tree.span);
         if !self.sigs_only {
             let body_snapshot: Vec<Tree> = body.to_vec();
@@ -2739,6 +2744,35 @@ impl Typer {
             crate::traitparent::check_abstract_override_grounded(&self.st, class_id, headline)
         {
             self.error(span, msg);
+        }
+    }
+
+    /// nsc's `validateParentClasses`: only the *first* parent of a template may
+    /// be a class. Everything mixed in after it has to be a trait -- a second
+    /// class would bring a second constructor with it.
+    ///
+    /// This is a rule about templates, not about types: `def f(x: A with B)` is
+    /// a legal signature for two unrelated classes (the type is simply
+    /// uninhabited), and rejecting it turned slick's
+    /// `Query[B, BU, C] & TableQuery[B]` -- where one *is* a subclass of the
+    /// other -- into an error scalac does not report.
+    fn check_mixin_parents(&mut self, class_id: SymbolId, span: Span) {
+        if class_id.is_none() {
+            return;
+        }
+        for p in self.st.get(class_id).parents.clone().iter().skip(1) {
+            let Some(ps) = self.st.class_sym_of(p) else {
+                continue;
+            };
+            let f = self.st.get(ps).flags;
+            if f.contains(Flags::TRAIT) || f.contains(Flags::INTERFACE) {
+                continue;
+            }
+            let name = self.st.get(ps).name.clone();
+            self.error(
+                span,
+                format!("class {name} needs to be a trait to be mixed in"),
+            );
         }
     }
 
@@ -4805,7 +4839,7 @@ impl Typer {
             };
             tree.ty = ty;
         } else if matches!(&tree.kind, TreeKind::Typed { tpt, .. } if is_eta_marker(tpt)) {
-            self.type_eta(tree);
+            self.type_eta(tree, pt);
         } else {
             self.type_expr_inner(tree, pt);
         }
@@ -5019,6 +5053,13 @@ impl Typer {
                             .collect();
                         if let [only] = candidates[..] {
                             sym = only;
+                            // The redirect reaches a symbol nothing has
+                            // *selected*, so nothing has run its signature yet:
+                            // `object SE extends SE[Any, Any] { def apply[T, U] =
+                            // … }` named before its own definition came back
+                            // `<notype>`. A selection completes what it finds;
+                            // so does this.
+                            self.complete_lazy_sig(only, tree.span);
                             // The symbol's own type still carries the method
                             // wrapper. A *parameterless* factory
                             // (`def apply[L, M, U]: Shape[L, M, U, M]`) is the
@@ -5039,6 +5080,7 @@ impl Typer {
                     if matches!(base_ty, Type::Overload(_)) {
                         if let Some(only) = self.only_alt_with_tparams(sym, targs.len()) {
                             sym = only;
+                            self.complete_lazy_sig(only, tree.span);
                             base_ty = self.st.get(only).ty.clone();
                         }
                     }
@@ -5769,7 +5811,21 @@ impl Typer {
                 // the trait's own `this`, so its `CI.this.type` must not be
                 // re-read as the anonymous class.
                 let is_self_alias = self.st.get(owner).self_alias == Some(s);
-                if owner != self.st.this_class && !owner.is_none() && !is_self_alias {
+                // Only a *class's* member is seen through a prefix. A local or
+                // a parameter of an enclosing method is owned by that method,
+                // and its type is written in the method's own vocabulary: in
+                // `trait It[T] { def map[B](f: T => B) = new It[B] { … f … } }`
+                // the `T` of `f` is the enclosing trait's, not the one the
+                // anonymous class's parent `It[B]` binds.
+                let owner_is_class = matches!(
+                    self.st.get(owner).kind,
+                    SymKind::Class | SymKind::ModuleClass | SymKind::Module
+                );
+                if owner != self.st.this_class
+                    && !owner.is_none()
+                    && !is_self_alias
+                    && owner_is_class
+                {
                     let this_ty = Type::Class {
                         sym: self.st.this_class,
                         args: self
@@ -8076,6 +8132,14 @@ impl Typer {
         if overloaded && self.some_alt_takes_arity(&fun.ty, fun.sym, args.len()) {
             return false;
         }
+        // nsc never tuples a *varargs* call. `tryTupleApply` only runs where
+        // the formals and the arguments disagree in number, and a repeated
+        // parameter is expanded to the argument count before that comparison,
+        // so the two always agree. Without this, `Seq(a, b)` on elements with
+        // no common class quietly became a `Seq[(A, B)]`.
+        if self.callee_takes_repeated(fun) {
+            return false;
+        }
         let saved = tree.clone();
         let mark = self.diags.len();
         let TreeKind::Apply { args, .. } = &mut tree.kind else {
@@ -8115,6 +8179,26 @@ impl Typer {
             return false;
         }
         true
+    }
+
+    /// Whether the callee's first clause ends in a repeated parameter.
+    fn callee_takes_repeated(&self, fun: &Tree) -> bool {
+        let is_varargs = |t: &Type| {
+            matches!(t, Type::Method { paramss, .. }
+                if paramss
+                    .first()
+                    .and_then(|c| c.last())
+                    .is_some_and(|p| matches!(p, Type::Repeated(_))))
+        };
+        match &fun.ty {
+            Type::Method { .. } => is_varargs(&fun.ty),
+            Type::Class { sym, .. } | Type::ModuleRef(sym) => self
+                .st
+                .lookup_member(*sym, "apply")
+                .into_iter()
+                .any(|m| is_varargs(&self.st.get(m).ty)),
+            _ => false,
+        }
     }
 
     /// Every application gets its own set of undetermined type variables: an
@@ -8724,6 +8808,25 @@ impl Typer {
                     if a.ty.is_no_type() {
                         let pt_arg = self.open_to_bounds(&p, &open);
                         self.type_expr(a, &pt_arg);
+                    }
+                    // nsc adapts an argument before it constrains the call. An
+                    // argument that still carries an all-implicit clause is not
+                    // a value yet, and the witness is what pins the *argument
+                    // method's* own parameters: `one(paths.toMap)` fixed this
+                    // call's `A2` from the residual
+                    // `(A <:< (K, V))Map[K, V]`, and only then found the
+                    // witness -- so the parameter it had to conform to stayed
+                    // `Map[K, V]` while the argument had become
+                    // `Map[String, Int]`. Filling it here lets the open-variable
+                    // substitution below carry `K`/`V` into the parameter, the
+                    // result and the receiver, exactly as for any other
+                    // argument that pins one.
+                    if !a.ty.is_no_type()
+                        && !a.ty.is_error()
+                        && self.implicit_only_result(a).is_some()
+                    {
+                        let pt_arg = self.open_to_bounds(&p, &open);
+                        self.adapt_implicit_apply(a, &pt_arg);
                     }
                     // A *receiver* carries undetermined variables too:
                     // `ConstArray.newBuilder()` is a `ConstArrayBuilder[?T]`,
@@ -14216,9 +14319,6 @@ impl Typer {
         if ps.iter().any(|p| p.is_error()) {
             return Type::Error;
         }
-        if !self.compound_parents_ok(span, &ps) {
-            return Type::Error;
-        }
         let mut decls = Vec::new();
         let mut ok = true;
         self.st.push_scope();
@@ -14406,52 +14506,6 @@ impl Typer {
             lo: lo_ty,
             hi: hi_ty,
         })
-    }
-
-    fn is_non_trait_class_type(&self, ty: &Type) -> bool {
-        match ty {
-            Type::Int
-            | Type::Long
-            | Type::Float
-            | Type::Double
-            | Type::Boolean
-            | Type::Byte
-            | Type::Short
-            | Type::Unit
-            | Type::Char
-            | Type::String
-            | Type::AnyVal
-            | Type::AnyRef
-            | Type::Array(_)
-            | Type::ModuleRef(_) => true,
-            Type::Class { sym, .. } => {
-                let s = self.st.get(*sym);
-                !s.flags.contains(Flags::TRAIT) && !s.flags.contains(Flags::INTERFACE)
-            }
-            Type::Annotated { tpe, .. } => self.is_non_trait_class_type(tpe),
-            _ => false,
-        }
-    }
-
-    fn compound_parents_ok(&mut self, span: Span, ps: &[Type]) -> bool {
-        let classes: Vec<&Type> = ps
-            .iter()
-            .filter(|p| self.is_non_trait_class_type(p))
-            .collect();
-        if classes.len() <= 1 {
-            return true;
-        }
-        let has_most_specific = classes
-            .iter()
-            .any(|c| classes.iter().all(|d| self.st.is_sub_type(c, d)));
-        if has_most_specific {
-            return true;
-        }
-        self.error(
-            span,
-            "illegal inheritance: compound type has more than one class parent",
-        );
-        false
     }
 
     fn lookup_qualified_type(&mut self, prefix: &Tree, name: &str) -> Option<SymbolId> {
@@ -15433,35 +15487,9 @@ impl Typer {
         }
         if let Type::Method { paramss, ret } = &tree.ty {
             if is_function_pt(pt) || self.st.sam_sig(pt).is_some() {
-                let mut params: Vec<Type> = paramss.iter().flatten().cloned().collect();
-                let mut ret = (**ret).clone();
-                // `val f: Node => Node = identity` eta-expands
-                // `def identity[A](x: A): A`. Solve `A` from the expected
-                // function type first: expanding the method as written yields
-                // `A => A`, which conforms to nothing.
-                if let Some((pt_params, pt_ret)) = function_sig(pt) {
-                    let tps = if tree.sym.is_none() {
-                        Vec::new()
-                    } else {
-                        self.st.get(tree.sym).tparams.clone()
-                    };
-                    if !tps.is_empty() && pt_params.len() == params.len() {
-                        let mut sig = params.clone();
-                        sig.push(ret.clone());
-                        let mut want = pt_params;
-                        want.push(pt_ret);
-                        let inst = self.infer_method_tparams(tree.sym, &sig, &want);
-                        if !inst.is_empty() {
-                            let ids: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
-                            let vals: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
-                            params = params
-                                .iter()
-                                .map(|p| crate::symbol::subst_tparams_slice(&ids, &vals, p))
-                                .collect();
-                            ret = crate::symbol::subst_tparams_slice(&ids, &vals, &ret);
-                        }
-                    }
-                }
+                let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+                let ret = (**ret).clone();
+                let (params, ret) = self.solve_eta_tparams(tree.sym, params, ret, pt);
                 eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
                 if self.st.is_sub_type(&tree.ty, pt) {
                     return;
@@ -15510,6 +15538,61 @@ impl Typer {
             ),
         );
         tree.ty = Type::Error;
+    }
+
+    /// Solve a polymorphic method's own type parameters against the function
+    /// type its eta-expansion has to conform to.
+    ///
+    /// `val f: Node => Node = identity` expands `def identity[A](x: A): A`;
+    /// written as it stands that is `A => A`, which conforms to nothing. A
+    /// function's parameters are contravariant and its result covariant, so
+    /// `A => A <: Node => ?U` says `Node <: A` and `A <: ?U`: nsc solves `A`
+    /// from the *parameters*, and the result is only an upper bound. Taking
+    /// both at once made `xs.map(identity)` a `CA[Any]`, because a `map` whose
+    /// own result is still being inferred expects `Node => Any` and the lub of
+    /// the two swallowed `Node`. A parameter the arguments cannot pin -- one
+    /// that occurs only in the result -- is still the expected result's to fix.
+    fn solve_eta_tparams(
+        &mut self,
+        sym: SymbolId,
+        params: Vec<Type>,
+        ret: Type,
+        pt: &Type,
+    ) -> (Vec<Type>, Type) {
+        let Some((pt_params, pt_ret)) = function_sig(pt) else {
+            return (params, ret);
+        };
+        if sym.is_none() {
+            return (params, ret);
+        }
+        let tps = self.st.get(sym).tparams.clone();
+        if tps.is_empty() || pt_params.len() != params.len() {
+            return (params, ret);
+        }
+        let mut inst = self.infer_method_tparams(sym, &params, &pt_params);
+        if inst.len() < tps.len() {
+            let mut sig = params.clone();
+            sig.push(ret.clone());
+            let mut want = pt_params.clone();
+            want.push(pt_ret);
+            for (id, t) in self.infer_method_tparams(sym, &sig, &want) {
+                if !inst.iter().any(|(i, _)| *i == id) {
+                    inst.push((id, t));
+                }
+            }
+        }
+        if inst.is_empty() {
+            return (params, ret);
+        }
+        let ids: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+        let vals: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+        (
+            params
+                .iter()
+                .map(|p| crate::symbol::subst_tparams_slice(&ids, &vals, p))
+                .collect(),
+            crate::symbol::subst_tparams_slice(&ids, &vals, &ret),
+        )
     }
 
     /// Narrow an overloaded reference to the one alternative whose
