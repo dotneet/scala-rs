@@ -3637,6 +3637,16 @@ impl Typer {
                 .map(|id| self.st.get(*id).ty.clone())
                 .collect();
             let ret = self.st.get(*pid).ty.clone();
+            // A primary constructor declares no type parameters of its own:
+            // `class C[A](…)`'s `A` belongs to the *class*, and the `<init>`
+            // this runs for hands over an empty `tp_ids`. The default body is
+            // typed in a scope of its own, so `A` was bound to nothing there
+            // and `class C[A](val l: List[A] = List.empty[A])` reported
+            // `found: List[A] required: List[A]` -- the found `A` being an
+            // unresolved *name*. Whatever the parameter types are written in
+            // is in scope for the body that has to produce one.
+            let rhs_tparams = self.tparams_in_scope_for_default(tp_ids, &ret, &preceding_tys);
+            let rhs_tparams = &rhs_tparams[..];
             let gid = self.st.alloc(
                 &gname,
                 owner,
@@ -3653,12 +3663,70 @@ impl Typer {
             self.st.get_mut(gid).tparams = tp_ids.to_vec();
             if self.st.get(*pid).default_rhs.is_some() {
                 if self.defer_default_rhs {
-                    self.defer_default_getter_rhs(*pid, gid, &ret, tp_ids, &preceding);
+                    self.defer_default_getter_rhs(*pid, gid, &ret, rhs_tparams, &preceding);
                 } else {
-                    self.type_default_getter_rhs(*pid, gid, &ret, tp_ids, &preceding);
+                    self.type_default_getter_rhs(*pid, gid, &ret, rhs_tparams, &preceding);
                 }
             }
         }
+    }
+
+    /// Type a constructor default's stored body at the call site.
+    ///
+    /// A primary constructor's defaults have no `name$default$n` getters (see
+    /// `namer_tmpl`: there is no receiver to call one on), so the tree the
+    /// namer stored is typed here, in the caller's scope. The class's own type
+    /// parameters are not bound in that scope, and
+    /// `class C[A](val l: List[A] = List.empty[A])` reported
+    /// `found: List[A] required: List[A]` -- an unresolved *name* against the
+    /// class's `A`. Bind the names the parameter's type is written in, so the
+    /// body means what it meant where it was written; the two sides then agree,
+    /// and a type argument is erased by the time it reaches codegen.
+    fn type_default_rhs_here(&mut self, rhs: &mut Tree, pty: &Type) {
+        let mut tps: Vec<SymbolId> = Vec::new();
+        collect_tparams(pty, &mut tps);
+        tps.retain(|&tp| self.st.lookup(&self.st.get(tp).name).is_empty());
+        if !tps.is_empty() {
+            self.st.push_scope();
+            for tp in &tps {
+                let n = self.st.get(*tp).name.clone();
+                self.st.enter_in_current(&n, *tp);
+            }
+        }
+        self.type_expr(rhs, pty);
+        self.adapt(rhs, pty);
+        if !tps.is_empty() {
+            self.st.pop_scope();
+        }
+    }
+
+    /// The type parameters a `name$default$n` body may name: the method's own,
+    /// plus every one its parameter types mention -- which for a primary
+    /// constructor is the enclosing class's. A name already bound by the
+    /// method's own list is not rebound.
+    fn tparams_in_scope_for_default(
+        &self,
+        tp_ids: &[SymbolId],
+        ret: &Type,
+        preceding: &[Type],
+    ) -> Vec<SymbolId> {
+        let mut used: Vec<SymbolId> = Vec::new();
+        collect_tparams(ret, &mut used);
+        for p in preceding {
+            collect_tparams(p, &mut used);
+        }
+        let mut out = tp_ids.to_vec();
+        for u in used {
+            if out.contains(&u) {
+                continue;
+            }
+            let name = self.st.get(u).name.clone();
+            if out.iter().any(|&o| self.st.get(o).name == name) {
+                continue;
+            }
+            out.push(u);
+        }
+        out
     }
 
     /// Type a `name$default$n` body, in a scope holding the method's type
@@ -4016,6 +4084,24 @@ impl Typer {
     }
 
     fn type_parent_ctor_app(&mut self, tree: &mut Tree) {
+        // A parent's constructor *arguments* are ordinary expressions, and the
+        // signature pass types them before every unit's members have their
+        // types. `case class ColumnOrdered[T](column: Rep[T], ord: Ordering)
+        // extends Ordered(Vector((column.toNode, ord)))` is compiled with
+        // `Rep.scala` later on the command line, so `toNode` was not yet a
+        // member there and the tuple came out `(?T1, Ordering)`; the body pass
+        // types the very same tree again and gets `(Node, Ordering)`. So the
+        // signature pass's complaints about them are dropped, exactly as the
+        // header pass's are (`typecheck_units`): anything real is raised again
+        // by the pass that runs with every signature in hand.
+        let diag_mark = self.sigs_only.then_some(self.diags.len());
+        self.type_parent_ctor_app_in(tree);
+        if let Some(mark) = diag_mark {
+            self.diags.truncate(mark);
+        }
+    }
+
+    fn type_parent_ctor_app_in(&mut self, tree: &mut Tree) {
         // `extends A(1)(2)` arrives as nested Applies; the constructor takes
         // one flat argument list on the JVM, so flatten the clauses.
         loop {
@@ -6501,6 +6587,29 @@ impl Typer {
         out
     }
 
+    /// Whether an expected *tuple* type constrains nothing, because every one
+    /// of its components is an undetermined variable opened up to `Any`.
+    ///
+    /// `open_to_bounds` erases a variable structurally: `SortedMapOps.collect
+    /// [K2, V2](pf: PartialFunction[(K, V), (K2, V2)])(implicit Ordering[K2])`
+    /// reaches the literal as `PartialFunction[(Int, String), (Any, Any)]`.
+    /// A *bare* variable is already recognised and left open, so the case
+    /// bodies decide it; a variable inside a tuple was not, and `(k, v.length)`
+    /// came back `(Any, Any)` -- which then asked for `Ordering[Any]`.
+    ///
+    /// Only tuples: a component of one is always a reference, so leaving the
+    /// position open cannot drop a boxing an expected `Any` would have forced.
+    fn pt_says_nothing(&self, ty: &Type) -> bool {
+        let Some(args) = self.as_tuple_args(ty) else {
+            return false;
+        };
+        !args.is_empty()
+            && args.iter().all(|a| {
+                matches!(a, Type::Any | Type::Wildcard | Type::TypeParam(_))
+                    || self.pt_says_nothing(a)
+            })
+    }
+
     /// Solve a parameter's undetermined variables from the argument that fills
     /// it, so the argument is checked against `PartialFunction[Int, String]`
     /// rather than against an erased `PartialFunction[Int, Any]`.
@@ -7243,6 +7352,8 @@ impl Typer {
         // Still gated on nothing having matched, so it can only add members.
         if found.is_empty() {
             found = self.supply_from_pickle(&recv_ty, &name);
+        } else {
+            self.supply_receiver_override(&recv_ty, &name, &mut found);
         }
         if found.is_empty() {
             if let Some((conv, member, to)) = self.search_extension(&recv_ty, &name, tree.span) {
@@ -11776,8 +11887,7 @@ impl Typer {
                         args.push(filled);
                     } else if let Some(mut rhs) = self.st.get(*pid).default_rhs.clone() {
                         let pty = self.st.get(*pid).ty.clone();
-                        self.type_expr(&mut rhs, &pty);
-                        self.adapt(&mut rhs, &pty);
+                        self.type_default_rhs_here(&mut rhs, &pty);
                         args.push(rhs);
                     }
                 }
@@ -13616,7 +13726,7 @@ impl Typer {
             // The prelude spells the result of `collect` / `recover` as `Any`
             // because the real signature is polymorphic. Leave it open so the
             // case bodies supply it and `Option[String]` survives.
-            let to = if matches!(to, Type::Any) {
+            let to = if matches!(to, Type::Any) || self.pt_says_nothing(to) {
                 Type::NoType
             } else {
                 to.clone()
@@ -13654,7 +13764,9 @@ impl Typer {
         // pins it to that parameter (and later to `Any`); let the body speak.
         // `Wildcard` is what `pretypeArgs` writes: the parameters are fixed,
         // the result is whatever the body turns out to be.
-        let ret_pt = if matches!(ret_pt, Type::TypeParam(_) | Type::Wildcard) {
+        let ret_pt = if matches!(ret_pt, Type::TypeParam(_) | Type::Wildcard)
+            || self.pt_says_nothing(&ret_pt)
+        {
             Type::NoType
         } else {
             ret_pt
@@ -16614,6 +16726,89 @@ impl Typer {
             .complete(&mut self.st, &mut self.binary, cls, name)
     }
 
+    /// The receiver's *own* declaration of a member it also inherits.
+    ///
+    /// Library members are read from the pickle on demand and installed on the
+    /// class that declares them, so what the typer already has depends on what
+    /// earlier code happened to ask for. `Map#collect` is
+    /// `MapOps.collect[K2, V2](pf): Map[K2, V2]`, and once some `aMap.collect`
+    /// has installed it, `aTreeMap.collect` finds it by inheritance and never
+    /// asks `TreeMap` -- whose own `collect(pf)(implicit Ordering[K2]):
+    /// TreeMap[K2, V2]` is the one nsc picks. The call then went out as
+    /// `IterableOps.collect`, whose default implementation builds through
+    /// `iterableFactory`: `TreeMap(1 -> "a").collect(pf)` *returned a `List`*,
+    /// with no diagnostic anywhere. Which of the two you got depended on
+    /// whether a plain `Map.collect` appeared earlier in the file.
+    ///
+    /// So when every candidate is inherited, ask the receiver's class too and
+    /// union the answers -- `drop_overridden` and the specificity rules then
+    /// choose, as they do for a class the typer read in full. Completion is
+    /// memoised per `(class, name)`, so this costs one pickle walk per pair.
+    fn supply_receiver_override(&mut self, recv_ty: &Type, name: &str, found: &mut Vec<SymbolId>) {
+        if !self.library_abi || found.is_empty() {
+            return;
+        }
+        let Some(cls) = self.st.class_sym_of(recv_ty) else {
+            return;
+        };
+        // Nothing to add when the receiver's class already declares one.
+        if found.iter().any(|&m| self.st.get(m).owner == cls) {
+            return;
+        }
+        // Only a *new alternative* is worth reading the pickle for. A plain
+        // override -- `List.length` over `Seq.length` -- has the same
+        // descriptor, is dispatched virtually anyway, and installing it would
+        // only rename the call: the prelude types `aSet.toSeq` as `List` while
+        // the pickled `toSeq` it calls returns `Seq`, so `invokevirtual
+        // List.length` on that value is a `VerifyError` where `invokeinterface
+        // Seq.length` was fine. So the *classfile* is asked first, and the
+        // pickle only when it declares an arity none of the candidates has:
+        // `TreeMap.collect(PartialFunction, Ordering)` against `MapOps
+        // .collect(PartialFunction)`. Reading a classfile is cheap next to
+        // completing every inherited selection from the pickle.
+        let have: Vec<usize> = found.iter().map(|&m| self.value_param_count(m)).collect();
+        if !self.declares_other_arity(cls, name, &have) {
+            return;
+        }
+        if self.supply_from_pickle_class(cls, name).is_empty() {
+            return;
+        }
+        let now = self.st.lookup_member(cls, name);
+        if now.iter().any(|&m| self.st.get(m).owner == cls) {
+            *found = now;
+        }
+    }
+
+    /// Whether `cls`'s own classfile declares an instance method `name` whose
+    /// parameter count is not among `have`.
+    fn declares_other_arity(&mut self, cls: SymbolId, name: &str, have: &[usize]) -> bool {
+        let internal = self.st.get(cls).jvm_name.clone();
+        if internal.is_empty() || !internal.starts_with("scala/") {
+            return false;
+        }
+        let enc = scala_rs_pickle::names::encode_method_name(name);
+        let Ok(Some(bytes)) = self.binary.find_class(&internal) else {
+            return false;
+        };
+        let Ok(jc) = crate::javaclass::parse_java_classfile(&bytes) else {
+            return false;
+        };
+        jc.methods.iter().any(|m| {
+            m.name == enc
+                && !crate::javaclass::is_java_static(m.access)
+                && crate::pickle_supply::desc_arity(&m.desc).is_some_and(|n| !have.contains(&n))
+        })
+    }
+
+    /// The number of value parameters a method takes, across all its clauses --
+    /// the arity the JVM sees.
+    fn value_param_count(&self, m: SymbolId) -> usize {
+        match &self.st.get(m).ty {
+            Type::Method { paramss, .. } => paramss.iter().map(|c| c.len()).sum(),
+            _ => 0,
+        }
+    }
+
     /// [`Self::supply_from_pickle`] for a class symbol that is already known.
     ///
     /// The receiver-typed form reaches this through `class_sym_of`; a wildcard
@@ -19176,6 +19371,46 @@ pub(crate) fn mentions_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
         Type::Annotated { tpe, .. } => mentions_tparam(tpe, tps),
         Type::Tuple(ts) => ts.iter().any(|t| mentions_tparam(t, tps)),
         _ => false,
+    }
+}
+
+/// Every type parameter `ty` mentions, in order of first appearance.
+fn collect_tparams(ty: &Type, out: &mut Vec<SymbolId>) {
+    match ty {
+        Type::TypeParam(id) => {
+            if !out.contains(id) {
+                out.push(*id);
+            }
+        }
+        Type::Class { args, .. } | Type::Tuple(args) | Type::Named { args, .. } => {
+            for a in args {
+                collect_tparams(a, out);
+            }
+        }
+        Type::Applied { ctor, args } => {
+            collect_tparams(ctor, out);
+            for a in args {
+                collect_tparams(a, out);
+            }
+        }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            collect_tparams(t, out)
+        }
+        Type::Function { params, ret } => {
+            for p in params {
+                collect_tparams(p, out);
+            }
+            collect_tparams(ret, out);
+        }
+        Type::Method { paramss, ret } => {
+            for ps in paramss {
+                for p in ps {
+                    collect_tparams(p, out);
+                }
+            }
+            collect_tparams(ret, out);
+        }
+        _ => {}
     }
 }
 

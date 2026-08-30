@@ -2603,7 +2603,7 @@ fn desc_params(desc: &str) -> Option<Vec<String>> {
 }
 
 /// Number of parameters in a JVM method descriptor.
-fn desc_arity(desc: &str) -> Option<usize> {
+pub(crate) fn desc_arity(desc: &str) -> Option<usize> {
     let b = desc.as_bytes();
     if b.first() != Some(&b'(') {
         return None;
