@@ -284,22 +284,24 @@ fn minimal_repro_verifies() {
     let _ = fs::remove_dir_all(&out);
 }
 
-/// `List.range` needs an `Integral[Int]`, which the prelude does not model
-/// (`prelude_numhier` records the same gap for `Integral`/`Fractional`). It
-/// must stay a *diagnostic*: silently picking the `Numeric[Int]` instance
-/// would be the kind of "make it work" fix this project forbids.
+/// `List.range` needs an `Integral[Int]`, which the prelude did not model:
+/// this used to assert the `no implicit` diagnostic instead.
+/// `agent/integral` closed the gap for real -- `Integral[T] <: Numeric[T]` is
+/// now in the hierarchy and `Numeric.IntIsIntegral` carries its true type
+/// `Integral[Int]` -- so the snippet compiles. See `crates/cli/tests/integral.rs`
+/// for the full coverage, including the negative cases that make sure this is
+/// not the "silently pick the `Numeric[Int]` instance" fix this project forbids.
 #[test]
-fn range_still_reports_the_missing_integral() {
+fn range_resolves_the_integral() {
     let (ok, msgs) = compile_src(
         "object Snippet { def main(a: Array[String]): Unit = println(List.range(0, 3)) }\n",
         "fc-range",
     );
-    if msgs.is_empty() {
-        return; // no jar on this machine
-    }
-    assert!(!ok, "expected List.range to be diagnosed, got:\n{msgs}");
+    // With no jar on this machine `compile_src` reports `(true, "")`, which
+    // passes both assertions below without pretending anything was checked.
+    assert!(ok, "expected List.range to compile, got:\n{msgs}");
     assert!(
-        msgs.contains("Integral[Int]"),
-        "expected the diagnostic to name Integral[Int], got:\n{msgs}"
+        !msgs.contains("Integral[Int]"),
+        "expected no Integral[Int] diagnostic, got:\n{msgs}"
     );
 }
