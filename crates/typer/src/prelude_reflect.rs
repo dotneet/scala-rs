@@ -5,16 +5,33 @@
 //! reads that type to decide which kind of macro it is. So the two class
 //! symbols have to exist before a macro def can be checked at all.
 //!
-//! **These classes are deliberately empty.** None of `c.universe`, `c.Expr`,
-//! `c.prefix`, … is installed yet, so a real macro implementation body still
-//! fails to typecheck — loudly, with `value universe is not a member of
-//! Context`, which is the honest answer. Populating them is phase 3 in
-//! `docs/macros.md`, and it also needs path-dependent types (`c.Expr[Int]`)
-//! and code generation against the scala-reflect ABI.
+//! **These classes are deliberately empty**, and they are only installed when
+//! the real ones cannot be reached ([`want_context_stub`]). None of
+//! `c.universe`, `c.Expr`, `c.prefix`, … is on them, so a macro implementation
+//! body compiled without scala-reflect.jar fails to typecheck — loudly, with
+//! `value universe is not a member of Context`, which is the honest answer.
+//!
+//! With scala-reflect.jar on the classpath the real `Context` is read from its
+//! pickle instead and those members resolve for real (`docs/macros.md` §7.6).
+//! The stub used to be installed unconditionally and *shadowed* the real one,
+//! so adding the jar changed nothing.
 
 use scala_rs_parser::{Flags, SymbolId, Type};
 
+use crate::check::ClasspathClass;
 use crate::symbol::{SymKind, SymbolTable};
+
+/// `scala.reflect.macros.blackbox.Context` as the classfile names it.
+const BLACKBOX_CONTEXT_JVM: &str = "scala/reflect/macros/blackbox/Context";
+
+/// Whether the placeholder `Context` classes are wanted.
+///
+/// They are, unless the classpath has the real ones. Note that the *scala
+/// library* jar is not enough: `scala.reflect.macros` lives in
+/// scala-reflect.jar, which `--scala-library` does not imply.
+pub fn want_context_stub(classpath: &[ClasspathClass]) -> bool {
+    !classpath.iter().any(|c| c.jvm_name == BLACKBOX_CONTEXT_JVM)
+}
 
 pub fn install_reflect_macros(st: &mut SymbolTable) {
     let reflect = crate::classpath::ensure_package(st, "scala/reflect");

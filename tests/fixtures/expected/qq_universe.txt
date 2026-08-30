@@ -1,0 +1,14 @@
+hi
+T
+Constant(42)
+42
+<empty>
+<init>
+<none>
+Literal(Constant("s"))
+local/Local
+n N Constant(7) 7
+Apply(Select(Ident(TermName("a")), TermName("b")), List(Literal(Constant(1))))
+Apply(Ident(TermName("c")), List(Ident(TermName("d")), Ident(TermName("e"))))
+Apply(Select(Ident(TermName("scala")), TermName("List")), List(Ident(TermName("x")), Ident(TermName("x"))))
+Apply(Ident(TermName("g")), List(Literal(Constant(1))))

@@ -1,7 +1,11 @@
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};
 
-pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
+/// `reflect_context_stub` asks for the placeholder `blackbox.Context` /
+/// `whitebox.Context` of `crate::prelude_reflect`. It is wanted only when the
+/// real ones are *not* reachable: scala-reflect.jar on the classpath carries a
+/// `Context` with every member on it, and the stub would shadow it.
+pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_stub: bool) {
     let root = st.root;
     st.scala_pkg = st.alloc("scala", root, SymKind::Package, Flags::PACKAGE, "scala");
     let java = st.alloc("java", root, SymKind::Package, Flags::PACKAGE, "java");
@@ -591,7 +595,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     st.push_scope();
     st.enter_in_current("scala", st.scala_pkg);
     st.enter_in_current("java", java);
-    crate::prelude_reflect::install_reflect_macros(st);
+    if reflect_context_stub {
+        crate::prelude_reflect::install_reflect_macros(st);
+    }
     import_members(st, st.scala_pkg);
     import_members(st, java_lang);
     import_members(st, st.predef);
