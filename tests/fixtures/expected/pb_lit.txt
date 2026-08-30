@@ -1,0 +1,17 @@
+one
+o
+1.5
+o
+1.5f
+o
+a
+o
+int1
+long2
+d1.5
+charc
+bool
+o
+one-two
+any-two
+o

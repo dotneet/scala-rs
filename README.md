@@ -80,7 +80,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - パラメータ、ラムダ（型付き / 期待型から推論）、ブロック。**placeholder `_`**（nsc `withPlaceholders`）: `_ + 1` / `_.abs` / `f(_)` / `xs.map(_ + 1)` / Function2 `_ + _` / 入れ子 `_.map(_ + 1)` に加え **typed `_ : T`**（`(_: Int) + 1` / `(_: Int) + (_: Int)` / `(_: Int).abs` / `xs.map((_: Int) + 1)`）。レキサが `_:` を `Ident("_")` にするので、式位置では Underscore と同じ placeholder にする。bare `(_: Int)` は `unbound placeholder parameter`。`xs.map(_ : Int)` は nsc どおり wrap せず map に Int が渡り mismatch。unary / Function2 の既存 wrap は触らない。**メソッド適用のセクション** `f(_, x)` / `f(_, _)` は期待型が無くても呼び先のシグネチャからパラメータ型を取る（nsc と同じ条件で、呼び先が単一の非ジェネリックメソッドのときだけ。`poly(_, 3)` や overload された `"abc".substring(_)` は `missing parameter type for expanded function` のまま）。合成パラメータはソース順で並べる（`two(_, _)` は `(a, b) => two(a, b)`）。**リテラルの本体は期待型の結果に対して検査する** ── `xs.foreach((x: Int) => x + 1)` は value discarding、`fl((x: Int) => x)` は `Int => Long` への数値拡大。パラメータ型を書いたリテラルはオーバーロード解決のために期待型より先に型付けられるので、そのぶんは `adapt` 側でやる。関数**値**は対象外で、`val h: Int => Int = …; fu(h)` は nsc どおり `type mismatch`
 - `if` / `else`、`while`、`do { ... } while (cond)`
 - `try` / `catch` / `finally`（catch は `{ case ... }`。`try/finally` と `try/catch/finally`。finally は正常終了と例外（catch からの throw 含む）の両方で走る。JVM 例外テーブルを出す。パーサは `finally` を落とさない）
-- `match`（コンストラクタパターン、リテラル、ワイルドカード、Java enum 定数の安定識別子 `Thread.State.NEW`）
+- `match`（コンストラクタパターン、リテラル、ワイルドカード、Java enum 定数の安定識別子 `Thread.State.NEW`、`x @ Pat` の束縛、`case null`）
 - for-comprehension（`map` / `flatMap` / `foreach` / `withFilter` へデシュガー。私有ランタイムでは `List.withFilter` は eager な `List`。`--scala-library` 時は `scala.collection.WithFilter[+A, +CC[_]]` で、`map[B]` は `CC[B]` を返す。`Option.withFilter` は `Option$WithFilter`）。値定義 `q = e` はラムダ本体の `val` になる ── **生成子ではない**ので、その前の生成子はやはり最内で `map` を取る。値定義の**後ろのガード**は nsc のタプル化が要るので診断する
 - apply / select / infix（`:` 終わりの演算子は右結合で、レシーバは右オペランド。`1 :: Nil` → `Nil.::(1)`）。代入 `xs(i) = v` は nsc どおり `xs.update(i, v)`。代入でない `c(1)` で `apply` が無ければ診断する（黙って `update` にしない）
 - リテラル、タプル
@@ -790,6 +790,64 @@ scalac と同じく先に型テストを出します（`instanceof`、`Array` �
 `SeqFactory$UnapplySeqWrapper$` は私有ランタイム（`--no-scala-library`）には
 無いので、jar 無しの `case Seq(…)` / `case Array(…)` は**診断を出します**
 （黙って要素型 `Any` のコードを出しません）。`List` パターンは両モードで動きます。
+
+### `x @ Pat` の束縛と `null`
+
+`case n @ N(v, _)` の `n` は**パターン自身の型**（`N`）で束縛します。スクルーティニの型
+（`T`）のまま格納していたので、`n.copy(...)` が親の型の値から `N` のフィールドを読みに行き
+`VerifyError: Bad type on operand stack` になっていました。型パターンの綴り（`case n: N`）は
+動いていたので、`@` だけが壊れていた形です。nsc と同じ順で出します ──
+`instanceof` → `checkcast` → `astore`。テストが落ちたら束縛もしません。
+`case i @ (_: Int)` のようにプリミティブへ絞る `@` は、参照を int スロットに入れる前に
+unbox します。
+
+`null` はどのパターン種別に対しても nsc と同じ扱いです（SLS 8.1.1 / 8.1.2）。
+
+| パターン | 出すコード | `null` は |
+| --- | --- | --- |
+| `case null` | `ifnonnull`（**参照比較**） | マッチ |
+| `case "a"` / `case 1` / `case 1L` | 定数を**左**に置いて比較 | 不一致 |
+| `case Nil`（安定識別子） | 同上（`Nil$.MODULE$.equals(x)`） | 不一致 |
+| `case s: String` / `case x: Any` | `instanceof`（`Any` / `AnyRef` / 型パラメータでも出す） | 不一致 |
+| `case N(v, _)`（case class） | `instanceof` | 不一致 |
+| `case Ex(n)`（extractor） | `ifnull` で先に落とす | 不一致 |
+| `case Seq(a, b)` | `instanceof` | 不一致 |
+| `case _` | テストなし | マッチ |
+
+`case null` を `x.equals(null)` として出していたので、その case が捕まえるはずの唯一の値で
+`NullPointerException` になっていました。定数パターンを `x.equals(定数)` の向きで出していたのも
+同じ理由で直しています（`case "a"` が `null` スクルーティニで落ちていました）。
+
+定数パターンの比較そのものも直しました。`Long` / `Float` / `Double` のスクルーティニは両オペランドを
+`pop` して**無条件にマッチ**していた（`case 1L =>` がすべての `Long` に当たる）ので、
+nsc と同じ `lcmp` / `fcmpl` / `dcmpl` + `ifne` にしています。参照スクルーティニに対する
+プリミティブ定数は box してから比較します（jar モードは nsc と同じ
+`BoxesRunTime.equals`、私有ランタイムは `Object.equals`）。
+
+`Null` はどの値型にも適合しないので、`(x: Int) match { case null => … }` は nsc と同じく
+**エラー**です（黙って通らない case を出しません）。
+
+```
+type mismatch; found: Null(null)  required: Int
+```
+
+`case a: Array[Int]` は配列ディスクリプタで `instanceof` します。`type_jvm_name` が配列に
+`Object` を返していたため何もテストせず、`a.length` が `Object` に対する `arraylength` に
+なっていました。
+
+同じ話が `==` 演算子にもあります。`x == null` / `null == x`（と `!=`）は nsc と同じく
+**参照テスト 1 命令**（`ifnonnull` / `ifnull`）で、`equals` は呼びません。`null` 側は
+評価しません（リテラルなので副作用がありません）。値クラスとプリミティブは `null` に
+なり得ないので、この近道は取らず従来どおり box して比較します。
+一般の `x == y` は jar モードでは nsc と同じ `BoxesRunTime.equals`（null 安全）ですが、
+私有ランタイムには `BoxesRunTime` が無く、素の `recv.equals(arg)` は receiver が `null` の
+ときに落ちていました。ここは nsc 自身の展開に合わせています。
+
+```
+if (recv == null) arg == null else recv.equals(arg)
+```
+
+両辺を先にローカルへ落としてから分岐するので、どの分岐先でもオペランドスタックは空です。
 
 ### AnyVal（値クラスと universal trait）
 
@@ -2556,6 +2614,21 @@ interface がスーパークラスを継承せず、`T$class` 本体が継承メ
 異常系 6 本はすべて**両モードで**（`--no-scala-library` と `--scala-library`）診断されることを
 確認しており、文面は real scalac 2.13.16 のものです。`trex_mixin_bad` は名前付きクラスと匿名クラスの
 両方で拒否され、しかも**テンプレート 1 つにつき 1 件**（ヘッダパスとの二重報告なし）であることも見ます。
+`agent/patbind` スライス（`x @ Pat` の束縛型、`null` パターン、`==` の null）のフィクスチャは接頭辞 `pb`
+（`pb_bind` / `pb_null` / `pb_lit` / `pb_eqnull` / `pb_nullseq` / `pb_null_bad`）で、コンフリクト回避のため
+`crates/cli/tests/patbind.rs` に置いています。どれも**型検査は通って実行時に落ちていた**バグなので、
+テストは 3 通り（私有ランタイム / `--scala-library` / 実 scalac 2.13.16）走らせて
+stdout が全部一致することを見ます。`expected/pb_*.txt` は実 scalac の出力そのものです。
+`pb_bind.scala` は入れ子の `@`、型パターンとの併用（`case n @ (_: N)`）、ガード付き、抽出子、
+タプル、`catch` の中、`Any` からプリミティブへの絞り込みを 1 本にまとめてあります。
+`pb_null.scala` はリテラル / 安定識別子 / 型パターン / `AnyRef` / 抽出子 / case class /
+タプル / `case _` の 8 種類に `null` を通します。`pb_lit.scala` は `Long` / `Float` / `Double` /
+`Char` のスクルーティニと、参照スクルーティニに対する box した定数です。`pb_eqnull.scala` は
+`==` / `!=` の側で、`x == null` / `null == x` の参照テストと、私有ランタイムでの
+null 受け手（`(null: String) == "a"` が NPE になっていた）を見ます。`pb_nullseq.scala` は
+`Seq` / `::` / `Array[Int]` / `()` で、`SeqFactory$UnapplySeqWrapper$` が要るので
+library dual-run 専用です。`pb_null_bad.scala` は `(x: Int) match { case null => … }` が
+nsc と同じく `type mismatch; found: Null(null)` になることを固定します。
 
 trait の `val` / `override val` / `var` の実行時表現と `case object` の合成メンバーのフィクスチャは接頭辞 `tval`（`tval` / `tval_bad`）で、同じ理由から `crates/cli/tests/traitval.rs` に置いています。`tval.scala` は私有ランタイム（`--no-scala-library`）と library dual-run の両方で走らせ、`expected/tval.txt` は **real scalac 2.13.16 の出力そのもの**です（3 モードがバイト単位で一致することを確認済み）。バイトコード側の不変条件も 2 本のテストで固定しています。`trait_val_setters_follow_nsc_names` は mixin setter が nsc と同じ `Named$_setter_$label_$eq` であること、`override val` したクラスのその setter が空実装（`putfield` なし）であること、trait の `var` への代入が `putfield` ではなく `count_$eq` 呼び出しであることを `javap -p -c` で見ます。`case_object_members_are_on_the_module_class` は `Asc$` に `toString` / `productPrefix` / `hashCode` / `productArity` が出ていることを見ます。`tval_bad.scala` は trait の `val` への代入が `reassignment to val` になることを固定します。
 
@@ -2675,6 +2748,11 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `dr_range.scala`（`crates/cli/tests/durrange.rs`、library dual-run のみ） | `Range` コンパニオン: `Range(0, 5)` / `Range(0, 10, 2)` / `Range.inclusive(1, 3)` / `Range.inclusive(1, 9, 3)` / `Range.count`（`javap` 上 `Range$` にあるのは `Int` 版だけ）と、既に動いていた `1 until 10 by 3` の回帰 | `List(0, 1, 2, 3, 4)` … `4 2,3,4,5` |
 | `dr_view.scala`（`crates/cli/tests/durrange.rs`、library dual-run のみ） | 関数型の implicit パラメータ `implicit ev: A => Ordered[A]` を `Ordered.orderingToOrdered` の eta 展開で埋める。view bound `A <% Ordered[A]`、入れ子の implicit パラメータ、素の `val o: Ordered[Int] = 3` も同じ探索 | `5` `b` `2.5` … `true` `false` |
 | `dr_viewuser.scala`（`crates/cli/tests/durrange.rs`、私有ランタイム・library dual-run） | 同じ view 経路を利用者の `implicit def` だけで。単相な変換、自分の implicit 節を持つ多相な変換、view bound、implicit パラメータを内側の呼び出しへ渡し直す形、**未決定型パラメータを view の結果型から解く**形（`def unwrap[A, B](a: A)(implicit view: A => Wrap[B]): B`） | `<i7>` `<shi>` `7` `hi` `<szz>` `<i1>\|<i2>` `<sa>\|<sb>` `2 w9` |
+| `pb_bind.scala`（`crates/cli/tests/patbind.rs`、私有ランタイム・library・実 scalac の 3 通り） | `x @ Pat` はパターン自身の型で束縛する。`case n @ N(v, _) => n.copy(...)` が `VerifyError`（`n` が親の型のまま）だった。入れ子 `@`、`case n @ (_: N)`、ガード、抽出子、タプル、`catch`、`Any` → プリミティブの絞り込み | `N(11,L)` … `caught boom` |
+| `pb_null.scala`（`crates/cli/tests/patbind.rs`、3 通り） | `null` を 8 種類のパターンに通す。`case null` は `ifnonnull`（以前は `null.equals` で NPE）、定数は左オペランド、型パターン / case class / タプルは `instanceof`、抽出子は `ifnull` で先に落とす | `null` `A` `one` … `A` |
+| `pb_lit.scala`（`crates/cli/tests/patbind.rs`、3 通り） | `Long` / `Float` / `Double` / `Char` の定数パターン（以前は両オペランドを `pop` して無条件にマッチ）と、参照スクルーティニに対する box した定数 | `one` `o` `1.5` … `o` |
+| `pb_eqnull.scala`（`crates/cli/tests/patbind.rs`、3 通り） | `==` / `!=` の null。`x == null` / `null == x` は `ifnonnull` / `ifnull` の 1 命令（以前は `x.equals(null)` で NPE）。私有ランタイムの一般の `x == y` は `if (x == null) y == null else x.equals(y)`（`BoxesRunTime` が無いため） | `true` `false` … `o` |
+| `pb_nullseq.scala`（`crates/cli/tests/patbind.rs`、library dual-run のみ） | `Seq(a, b)` / `a :: b :: Nil` / `case a: Array[Int]` / `case ()` に `null` と実値を通す。`SeqFactory$UnapplySeqWrapper$` が要るので jar 限定 | `o` `seq 1 2` … `o` |
 | `cats_lambda.scala`（`crates/cli/tests/catsimpl.rs`、library dual-run のみ） | `agent/catsimpl` スライス: ラムダが囲いの `this` を捕まえる（trait のデフォルトメソッド内、クラスの暗黙 `this`、明示 `this.`、フィールド読み、入れ子ラムダ、`object` のメンバは `MODULE$` 経由で `this` が要らないこと）。`List.map` / `flatMap` を使うので library 限定 | `List(2, 4, 6)` … `List(3, 6, 9)` |
 | `cats_lambda2.scala`（`crates/cli/tests/catsimpl.rs`、私有ランタイム・library dual-run） | 同じ `$outer` 捕捉をライブラリのコレクション抜きで書いたもの。無ければ `M2$$anonfun$0 cannot be cast to M2` で落ちる（型検査は通る） | `10` `10` `6` `6` `105` `7` `15` |
 | `cats_syntax.scala`（`crates/cli/tests/catsimpl.rs`、library dual-run） | cats の syntax 形の暗黙変換 `implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])`: 受け手の**型構築子**から `F` を解く（以前は `AnyRef`）、変換自身の implicit 節を適用する（以前は落として descriptor より 1 引数少ない呼び出しになり `VerifyError`）、コンパニオンの `implicit def flatMapForBox` | `3` `41` `14` |
@@ -3607,6 +3685,17 @@ required: DBIOAction[R, S, E]`、**増えたものはありません**。slick �
   （2.13.13 以降 deprecated）。その eta 展開がこちらには無いので、
   `value tupled is not a member of P$` を出します。合成コンパニオン
   （＝`object P` を書いていない普通の case class）は継承で動きます。
+- **`Unit` を型に持つパラメータのディスクリプタが `(V)` になる**
+  （`agent/patbind` で見つけた、パターンとは無関係の別件）。
+  `def unit2(x: Unit): String` が `(V)Ljava/lang/String;` になり
+  `ClassFormatError: illegal signature` で落ちます。nsc は
+  `(Lscala/runtime/BoxedUnit;)` です。erasure 側の話なので触っていません。
+
+- **私有ランタイムに `scala.runtime.BoxedUnit` が無い**（`agent/patbind`）。
+  `--no-scala-library` では `Unit` を `Any` に入れると `null` になるので、
+  `(x: Any) match { case () => … }` は `null` にも当たります。jar モードは
+  nsc と一致します（`pb_nullseq.scala`）。私有ランタイムに `BoxedUnit` を
+  足すのが本筋ですが、`Unit` の box 表現全体を変える話になります。
 
 - **for 内包の値定義に続くガード**（`agent/mismatch6` で診断だけ入れた、未実装）。
   `for { m <- ms; q = f(m); if q > 0 } yield q` は nsc では通ります。nsc は

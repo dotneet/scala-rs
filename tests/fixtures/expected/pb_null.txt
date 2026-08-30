@@ -1,0 +1,20 @@
+null
+A
+one
+o
+o
+nil
+o
+s
+o
+ref
+o
+ex3
+o
+box3
+w
+null
+pair 1 2
+other
+o
+A
