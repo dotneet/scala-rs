@@ -31,6 +31,14 @@ enum OverloadPick {
     None,
 }
 
+/// How a case class's `copy` was written: `p.copy(…)` or, inside the class
+/// itself, a bare `copy(…)` on `this`.
+#[derive(Clone, Copy, PartialEq)]
+enum CopyCallee {
+    Qualified,
+    Bare,
+}
+
 enum CtorDelegation {
     This,
     Super,
@@ -8302,30 +8310,64 @@ impl Typer {
 
     /// nsc synthesizes `def copy(x: T = this.x, …): C` on a case class.
     /// Rewriting `p.copy(y = 3)` to a constructor call keeps the omitted
-    /// fields coming from the receiver without emitting a synthetic method.
+    /// fields coming from the receiver without emitting a synthetic method,
+    /// and re-infers the class's type parameters as nsc's `copy[T]` does.
     fn try_rewrite_case_copy(&mut self, tree: &mut Tree, pt: &Type) -> bool {
-        let is_copy = match &tree.kind {
-            TreeKind::Apply { fun, .. } => {
-                matches!(&fun.kind, TreeKind::Select { name, .. } if name == "copy")
-            }
-            _ => false,
+        let shape = match &tree.kind {
+            TreeKind::Apply { fun, .. } => match &fun.kind {
+                TreeKind::Select { name, .. } if name == "copy" => CopyCallee::Qualified,
+                // `copy(from = f2, …)` written inside the case class itself is
+                // the same call on `this`. Without this it went through the
+                // synthetic `copy` member, whose parameters are the *class's*
+                // type parameters: `case class Comprehension[+Fetch <:
+                // Option[Node]](…, fetch: Fetch = None, …)` could not be
+                // rebuilt with a different `Fetch`, and nsc's `copy[Fetch]`
+                // re-infers it.
+                TreeKind::Ident { name } if name == "copy" => CopyCallee::Bare,
+                _ => return false,
+            },
+            _ => return false,
         };
-        if !is_copy {
-            return false;
-        }
-        let class_id = {
-            let TreeKind::Apply { fun, .. } = &mut tree.kind else {
-                return false;
-            };
-            let TreeKind::Select { qual, .. } = &mut fun.kind else {
-                return false;
-            };
-            if qual.ty.is_no_type() {
-                self.type_expr(qual, &Type::NoType);
+        let class_id = match shape {
+            CopyCallee::Qualified => {
+                let TreeKind::Apply { fun, .. } = &mut tree.kind else {
+                    return false;
+                };
+                let TreeKind::Select { qual, .. } = &mut fun.kind else {
+                    return false;
+                };
+                if qual.ty.is_no_type() {
+                    self.type_expr(qual, &Type::NoType);
+                }
+                match self.st.class_sym_of(&qual.ty) {
+                    Some(c) => c,
+                    None => return false,
+                }
             }
-            match self.st.class_sym_of(&qual.ty) {
-                Some(c) => c,
-                None => return false,
+            CopyCallee::Bare => {
+                let cls = self.st.this_class;
+                if cls.is_none() {
+                    return false;
+                }
+                // Only when the name really does resolve to this class's own
+                // synthetic `copy`: a local `def copy`, an import, or an
+                // inherited one is an ordinary call.
+                let here: Vec<SymbolId> = self
+                    .st
+                    .get(cls)
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|&m| self.st.get(m).name == "copy")
+                    .collect();
+                let resolved = self.st.lookup("copy");
+                if here.len() != 1
+                    || !self.st.get(here[0]).flags.contains(Flags::SYNTHETIC)
+                    || resolved != here
+                {
+                    return false;
+                }
+                cls
             }
         };
         if !self.st.get(class_id).flags.contains(Flags::CASE) {
@@ -8351,6 +8393,7 @@ impl Typer {
         };
         let qual = match fun.kind {
             TreeKind::Select { qual, .. } => *qual,
+            TreeKind::Ident { .. } => Tree::dummy(TreeKind::This { qual: None }),
             _ => return false,
         };
         let names: Vec<String> = fields
@@ -10651,6 +10694,58 @@ impl Typer {
                     self.collect_expected(tps, x, y, variance, depth + 1, allow_covariant, out);
                 }
             }
+            // A higher-kinded application. `def flatMap[A, B](fa: F[A])(f: A =>
+            // F[B]): F[B]` on an abstract `F[_]` has an `Applied` result, not a
+            // `Class`, and nothing here matched it: `B` was never read out of
+            // the expected `F[String]` and every cats-style `F.flatMap(fa) { … }`
+            // came back `F[Any]`. A type constructor's parameter carries no
+            // variance annotation the application can see, so the argument
+            // position is invariant.
+            (
+                Type::Applied {
+                    ctor: rc,
+                    args: ras,
+                },
+                Type::Applied {
+                    ctor: pc,
+                    args: pas,
+                },
+            ) if ras.len() == pas.len() => {
+                self.collect_expected(tps, rc, pc, variance, depth + 1, allow_covariant, out);
+                for (x, y) in ras.iter().zip(pas) {
+                    self.collect_expected(tps, x, y, 0, depth + 1, allow_covariant, out);
+                }
+            }
+            // The same, where the expected type has already settled on a real
+            // class (`F[B]` against `List[String]`). The constructor is lined
+            // up unapplied so `F` itself is not solved to `List[String]`.
+            (Type::Applied { ctor, args: ras }, Type::Class { sym, args: pas })
+                if ras.len() == pas.len() =>
+            {
+                let unapplied = Type::Class {
+                    sym: *sym,
+                    args: vec![],
+                };
+                self.collect_expected(
+                    tps,
+                    ctor,
+                    &unapplied,
+                    variance,
+                    depth + 1,
+                    allow_covariant,
+                    out,
+                );
+                for (x, y) in ras.iter().zip(pas) {
+                    self.collect_expected(tps, x, y, 0, depth + 1, allow_covariant, out);
+                }
+            }
+            (Type::Class { args: ras, .. }, Type::Applied { args: pas, .. })
+                if ras.len() == pas.len() =>
+            {
+                for (x, y) in ras.iter().zip(pas) {
+                    self.collect_expected(tps, x, y, 0, depth + 1, allow_covariant, out);
+                }
+            }
             (Type::Class { sym: rs, args: ras }, Type::Class { sym: ps, args: pas }) => {
                 if rs == ps {
                     if ras.len() != pas.len() {
@@ -12358,6 +12453,28 @@ impl Typer {
                 // signatures are one alternative, not an ambiguity.
                 let mut winners = winners;
                 winners.dedup_by(|a, b| a.1 == b.1 && a.2 == b.2);
+                // nsc `isStrictlyMoreSpecific`: when neither signature is more
+                // specific than the other, the one whose *owner* is the proper
+                // subclass wins (`relativeWeight`'s `isInProperSubClassOf`).
+                // 2.13 declares `map[B](f)(implicit Ordering[B])` on
+                // `SortedSetOps` and `map[B](f)` on `IterableOps`, and both are
+                // applicable to a one-argument call: without the owners' own
+                // subclass relation every `TreeSet.map(f)` was `ambiguous
+                // overload`.
+                if winners.len() > 1 {
+                    let sub: Vec<(SymbolId, Vec<Type>, Type)> = winners
+                        .iter()
+                        .filter(|a| {
+                            winners
+                                .iter()
+                                .all(|b| a.0 == b.0 || self.owner_is_proper_subclass(a.0, b.0))
+                        })
+                        .cloned()
+                        .collect();
+                    if sub.len() == 1 {
+                        winners = sub;
+                    }
+                }
                 match winners.len() {
                     1 => {
                         let (s, p, r) = winners.into_iter().next().unwrap();
@@ -12367,6 +12484,33 @@ impl Typer {
                 }
             }
         }
+    }
+
+    /// nsc's `isInProperSubClassOf`: `a`'s owner is a class, `b`'s owner is a
+    /// different class, and the first is a subclass of the second. Only real
+    /// classes count -- two alternatives owned by the same class, or by
+    /// anything that is not a class, are not ordered by this rule.
+    fn owner_is_proper_subclass(&self, a: SymbolId, b: SymbolId) -> bool {
+        if a.is_none() || b.is_none() {
+            return false;
+        }
+        let ao = self.st.get(a).owner;
+        let bo = self.st.get(b).owner;
+        if ao.is_none() || bo.is_none() || ao == bo {
+            return false;
+        }
+        if !self.st.get(ao).is_class_like() || !self.st.get(bo).is_class_like() {
+            return false;
+        }
+        self.base_type_instance(
+            &Type::Class {
+                sym: ao,
+                args: vec![],
+            },
+            bo,
+            0,
+        )
+        .is_some()
     }
 
     /// nsc: `A` is as specific as `B` when `B` is applicable to `A`'s parameter types.
@@ -16490,6 +16634,14 @@ impl Typer {
                 return;
             }
             ImplicitSearch::None => {}
+        }
+        // A tree the typer could not give a type to has already been reported
+        // where it failed; `found: <notype>` only repeats it. nsc's `ErrorType`
+        // absorbs the same way, and every other arm here (the overload and
+        // constructor errors) already declines to speak for a failed operand.
+        if tree.ty.is_no_type() {
+            tree.ty = Type::Error;
+            return;
         }
         self.error(
             tree.span,

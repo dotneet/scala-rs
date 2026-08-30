@@ -739,14 +739,37 @@ impl PickleSupply {
             ));
             return None;
         }
-        let key = format!("{want:?}");
-        if !seen_shapes.insert(key) {
+        // The shape two alternatives are compared by is their *explicit*
+        // parameters: nsc's `isAsSpecific` looks through an implicit clause
+        // (`case mt: MethodType if mt.isImplicit => isAsSpecific(restpe, …)`),
+        // so `SortedSetOps.collect(pf)(implicit Ordering[B])` and
+        // `IterableOps.collect(pf)` are equally specific and only their owners
+        // separate them -- and the owner is exactly what pulling both copies
+        // down onto the receiver throws away. Keyed on the full list they
+        // looked like two different overloads, both survived, and every
+        // `TreeSet.collect(pf)` / `.map(f)` was `ambiguous overload`.
+        // Linearization order keeps the more derived one, which is the one
+        // whose `Ordering` witness makes the result a `TreeSet`.
+        let key_want: Vec<Option<String>> = shape
+            .clauses
+            .iter()
+            .zip(paramss_ty.iter())
+            .filter(|(c, _)| !c.implicit)
+            .flat_map(|(_, tys)| tys.iter())
+            .map(|t| erased_param_desc(st, t))
+            .collect();
+        let key = format!("{key_want:?}");
+        if seen_shapes.contains(&key) {
             trace(format_args!(
                 "{internal}#{name}: skipping an overload shadowed by a more \
                  derived declaration with the same parameters"
             ));
             return None;
         }
+        // Resolved before the shape is claimed: an alternative that has no
+        // descriptor is not supplied, so it must not shadow the next one
+        // either (`TreeMap.collect(pf)` erases to two class-file methods and
+        // would otherwise have taken `collect(pf)(Ordering)`'s place).
         let Some(found) = self.erased_desc(bin, internal, jvm_member, &want) else {
             trace(format_args!(
                 "{internal}#{name}/{}: no unambiguous erased descriptor (want {want:?})",
@@ -754,6 +777,7 @@ impl PickleSupply {
             ));
             return None;
         };
+        seen_shapes.insert(key);
         // The member is installed on the class it was asked for, because that
         // is where the typer looks it up. The *call* is a different question:
         // a declaration off the bytecode path is not reachable from the
