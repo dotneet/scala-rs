@@ -1,0 +1,16 @@
+20
+List(10, 30)
+c
+7
+Rex
+true
+false
+Some(2)
+None
+1
+-1
+c
+true
+false
+List(0, 2)
+List(0, 1)

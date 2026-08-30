@@ -614,6 +614,10 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     crate::prelude_variance::install(st);
     crate::prelude_boxed::install(st);
     crate::prelude_hier::install(st);
+    // `Seq[A] <: PartialFunction[Int, A] <: Int => A`（`scala/collection/Seq`
+    // は `prelude_hier` が組み立てるので、そのあと）。`PartialFunction` の
+    // `lift`/`orElse` も同じスライスで足す。library_abi 専用。
+    crate::prelude_seqfn::install(st, library_abi);
     crate::prelude_fntuple::install(st, library_abi);
     crate::prelude_mism9::install(st);
     if library_abi {
