@@ -389,6 +389,22 @@ pub struct SymbolTable {
     /// constructor fields private behind accessors; ours are emitted with the
     /// field public, so the two are read differently.
     pub source_classes: std::collections::HashSet<SymbolId>,
+    /// `scala.runtime.LazyRef` & friends, in `prelude_lazyref::CELL_NAMES`
+    /// order. The cell classes a method-local `lazy val` is compiled into.
+    pub lazy_cells: Vec<SymbolId>,
+    /// The synthetic cell `val`s a method-local `lazy val` leaves behind. The
+    /// backend gives each one a `new scala/runtime/Lazy…()` instead of the
+    /// eager right-hand side.
+    pub local_lazy_cells: std::collections::HashSet<SymbolId>,
+    /// Accessor method -> its cell parameter, for the local `lazy val`s
+    /// `lazy_local::lazy_locals` rewrote. The backend wraps the accessor's
+    /// body in the `initialized` / `synchronized` / `initialize` dance.
+    pub local_lazy_accessors: std::collections::HashMap<SymbolId, SymbolId>,
+    /// Methods a hoisted local-`lazy val` accessor `return`s out of. The
+    /// `return` moved into the accessor with the initialiser, so the method's
+    /// own body no longer shows it, yet the method still has to carry the
+    /// `NonLocalReturnControl` handler that catches it.
+    pub local_lazy_nlr: std::collections::HashSet<SymbolId>,
     /// One past the last symbol `install_prelude` built.
     ///
     /// The prelude hand-writes signatures for the part of `scala.*` the typer
@@ -465,6 +481,10 @@ impl SymbolTable {
             value_class_terms: std::collections::HashMap::new(),
             source_value_classes: std::collections::HashSet::new(),
             source_classes: std::collections::HashSet::new(),
+            lazy_cells: Vec::new(),
+            local_lazy_cells: std::collections::HashSet::new(),
+            local_lazy_accessors: std::collections::HashMap::new(),
+            local_lazy_nlr: std::collections::HashSet::new(),
             prelude_end: 0,
         };
         st.root = st.alloc(

@@ -98,7 +98,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - compiled class/object に **`InnerClasses`（JVMS §4.7.6）と `EnclosingMethod`（§4.7.7）**。以前は一切出しておらず、`getClass.getSimpleName` が `Circle` ではなく `Main$Circle` を返す、`isMemberClass` が常に `false`、`getEnclosingClass` / `getDeclaringClass` が常に `null` になっていた（すべてこの属性を読む）。ネストしたクラス / トレイト / object（`class Circle extends Shape` が両方とも `object Main` の直下）は自己エントリ（`outer_class_info` = 外側クラス、`inner_name` = ソース上の単純名）と、その classfile 自身の定数プールに現れる**他の**ネストクラス（`implements` / `checkcast` / フィールドや `$outer` の型など）を両方載せる。加えて、そのクラスが自身の直下に宣言しているネストクラス／object は、実際に参照していなくても**無条件で**載る（`javap -v` で確認した実 scalac の `Outer` / `Outer$Level1` の挙動と同じ）。ローカルクラスと無名クラス（`new Shape { ... }`）は `outer_class_info` を 0 のままにし（`isMemberClass` は `false`）、代わりに `EnclosingMethod` を出す。`inner_name` は無名クラスだけ 0（`getSimpleName` が空文字列）。`access_flags` は**ソース上の**修飾子（`public`/`private`/`protected`、`$outer` フィールドを持たない＝`static`、`final`）で、classfile 自身の `access_flags` とは別物（module class 自身の `final` は暗黙なので載せない。value class の `final` は書いていなくても `extends AnyVal` から来るので載る）。ネストしたオブジェクトの `object Main` 自身が生成する static フォワーダ（"mirror" class `Main`。`object` に `def main` があるときに出る）は自分自身が入れ子ではないので自己エントリは持たないが、実 scalac の mirror class と同じく、リンクした object の直下メンバーを無条件で載せる。case class のコンパニオンや value class の `$extension` を持つコンパニオンも普通のネストした module class として同じ経路を通る。ローカルクラスの `LocalC$1` のような**曖昧回避の数値サフィックス**は nsc にはあるが scala-rs にはまだ無い（この属性の話とは無関係な既存のギャップ）。fixture 接頭辞 `inner`（`crates/cli/tests/innerclasses.rs`）
 - `s"..."` / `f"..."` / `raw"..."` 文字列補間。`f"$n%02d"` は `String.format` に落とす。`raw` はエスケープを解釈しない。日付時刻（`%t`/`%T`）、引数インデックス、相対 `% <` は診断する。`--scala-library` 時はカスタム interpolator（`implicit class Q(sc: StringContext) { def q(args: Any*) }` の `q"a$x"`）を `StringContext.apply(parts*).q(args*)` へデシュガーして実行する。私有ランタイムでは `s`/`f`/`raw` 以外は診断する
 - コンテキストバウンド `T: ClassTag` / `T: Ordering` / `T: scala.reflect.ClassTag`（メソッド型パラメータ）と **クラス型パラメータ** `class C[T: Ordering](x: T)`。nsc と同様、implicit evidence `C[T]` へデシュガーする（クラスは primary ctor の extra implicit 節）。トレイトの `: C` / `<%` は nsc どおり `traits cannot have type parameters with context bounds ': ...' nor view bounds '<% ...'`。evidence が無ければ `no implicit`。`--scala-library` 時は jar の `scala.math.Ordering` を classfile から読み、companion の `implicit object Int`（`Ordering$Int$.MODULE$` / InnerClasses）と `ClassTag` にリンクして動く。ジェネリック `Array[T].length` は jar の `ScalaRunTime.array_length` に落とす
-- `lazy val`
+- `lazy val`。メンバは `bitmap$0` + アクセサ、**メソッドローカルは `scala.runtime.LazyRef`（プリミティブは `LazyInt` などの専用セル、`Unit` は `LazyUnit`）+ 持ち上げたアクセサ**で、宣言位置ではセルを作るだけ。初期化子は最初の読み取り時に高々 1 回、セルのモニタの下で走る（nsc の `lazyvals` フェーズと同じ形）。ブロックの中では `lazy val` だけ前方参照できる
 - implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む。候補が複数あるときは nsc 風の **more-specific**（結果型の subtype、または定義クラスが subclass である origin）。型と origin が食い違うと（親のより specific な implicit と、子に定義した less-specific な local）`ambiguous implicit`。同じ型が二つなら曖昧。目標型が `A => B` で `A <: B` のときは nsc と同様 identity view を合成する（view bound の呼び出し側）。**implicit class**（object / class 本体。`implicit class Rich(n: Int) { def twice: Int }` の `2.twice`）。**package object の `implicit class`**（同じパッケージの他 compilation unit、または `import pkg._`。pickle の IMPLICIT。トップレベル `implicit class` は nsc どおり `` `implicit` modifier cannot be used for top-level objects ``。import 無しでは enrichment が見えない）
 - `@tailrec`（末尾再帰でない `def` は nsc 風にエラー。object の末尾再帰は通して実行する。while 変換はしない）/ `@deprecated`（引数付きアノテーションを pickle の SYMANNOT に載せる。コンパイルは壊さない）/ Java `@Override`（本当に override しているメソッドは受理。そうでなければ `overrides nothing`）/ Java `@Deprecated`（メソッドの `RuntimeVisibleAnnotations` に `Ljava/lang/Deprecated;` を出す。pickle は `SYMANNOT` + `java.lang.Deprecated` の TypeRef。`javap -v` と scalac `-deprecation` の両方で見える）/ ユーザー定義の `StaticAnnotation`（`@Ann(foo)` / `@Ann(this)` / `@Ann(classOf[Int])` / `@Ann(ident(1))` / `@Ann(this.x)` / `@Ann(super.foo)` / `@Ann(ident(ident(1)))` / `@Ann(foo = 1)` / `@Ann(foo = this.x)` / `@Ann(foo = bar)` の Ident/Select/This/Super/Apply / リテラル / classOf / named Constant / named TREE 引数を TREE / Constant として pickle。named は nsc と同じく位置引数に直して pickle）/ `@implicitNotFound("…")`（欠ける implicit は nsc と同じくその文面。`${A}` は型引数）/ `@switch`（`(n: @switch) match`。密な Int は `tableswitch`、疎なら `lookupswitch`。switch にできない match は nsc と同じ warning `could not emit switch for @switch annotated match`）。`@inline` / `@noinline` はアノテーションとして格納するだけで、インライン化はしない。実 scalac 2.13.16 は配置を一切検証しない（val / var / class / type などどれに付けても、両方同時に付けても、警告すら出さない — `-opt:inline:...` のバイトコード最適化器だけが読む情報で、typer は無関係）ので、こちらも同様に検証しない。`@volatile` / `@transient` は classfile の `ACC_VOLATILE` / `ACC_TRANSIENT`（javap で見える）。`@native` はメソッドに付けて `ACC_NATIVE` を出し、本文は付けない（`.so` のリンクはしない。本文付きや val への付与は診断する）
 - 非ローカル `return`（ネストしたラムダ / `foreach` から囲みの名前付きメソッドへ。nsc 風 `scala.runtime.NonLocalReturnControl`）。ネストした `def` の `return` はその def 自身。クラスコンストラクタからの `return` は `return outside method definition`
@@ -799,12 +799,42 @@ trait のメンバークラスを継承したクラス／オブジェクトは�
 
 ### lazy val
 
-フィールドに加えて `bitmap$0: Int` と、同期したアクセサを出します。初期化は最初の読み取りまで遅延します。
+**クラス・trait・object のメンバ**は、フィールドに加えて `bitmap$0: Int` と、同期した
+アクセサを出します。初期化は最初の読み取りまで遅延します。
 
 trait の `lazy val` は（nsc の mixin フェーズと同じく）実装クラス／オブジェクトごとに
 フィールド・`bitmap$0` のビット・アクセサを複製します。ビットはクラス自身の `lazy val`
 と継承したものを 1 本のリストにして採番するので衝突しません。interface 側は abstract
 宣言だけなので、呼び出しは `invokeinterface` です。
+
+**メソッドの中の `lazy val`**（ローカル）は、フィールドを吊るすインスタンスが無いので
+nsc の `lazyvals` フェーズと同じく **`scala.runtime.LazyRef` 系のセル**になります
+（`crates/typer/src/lazy_local.rs`）。宣言位置ではセルを 1 個作るだけで、初期化子は
+**最初の読み取り時**に、セルのモニタの下で高々 1 回だけ走ります。
+
+```scala
+def f(n: Int) = {
+  lazy val s = { println("mk"); "v" + n }   // ここでは new LazyRef() だけ
+  s + s                                     // 読むたびに s$1(s$lzy) を呼ぶ（初期化は 1 回）
+}
+```
+
+- セルの型は結果型で決まります: `Boolean`/`Byte`/`Char`/`Short`/`Int`/`Long`/`Float`/
+  `Double` はそれぞれ `LazyBoolean` … `LazyDouble`（値をボックスしない）、`Unit` は
+  `LazyUnit`（フラグのみ）、それ以外は `LazyRef`。
+- アクセサは普通のネストした `def` としてラムダリフトに渡すので、初期化子が捕捉した
+  ローカル・引数・`var` はそのまま追加引数として渡ります。`lazy val` 同士の依存
+  （`lazy val a = b + 1; lazy val b = 2`）も、`a` のアクセサが `b` のセルを捕捉する形で
+  そのまま通ります（scalac の `a$lzycompute$1(LazyInt, LazyInt)` と同じ）。
+- ブロックの中では `lazy val` だけ**前方参照**できます（素の `val` は今までどおりエラー）。
+- 初期化子が例外を投げた場合、`_initialized` は値を格納した後にしか立てないので、
+  セルは未初期化のまま残り、次の読み取りで再試行します（scalac と同じ）。
+- ループの本体で宣言すると反復ごとに別のセルになります。
+- `--no-scala-library` では `scala/runtime/Lazy*` を私有ランタイムとして出します
+  （`crates/backend/src/runtime.rs`）。jar モードでは本物を使うので出しません。
+
+これ以前はローカルの `lazy val` の初期化子が**宣言位置で先行評価**されていました。
+型検査は通り値も合っていたので、`println` の出る順番でしか分からない誤コンパイルでした。
 
 ### 型注釈のないメンバのシグネチャ（lazy completer）
 
@@ -3614,6 +3644,36 @@ interface 側が `Opt()` を abstract で宣言し実装クラスがフィール
 value class の中の `object`（scalac と同じ `implementation restriction: nested object is
 not allowed in value class`。以前は `VerifyError` になっていました）の 2 つを見ます。
 
+メソッドローカルの `lazy val` は `crates/cli/tests/lazyref.rs`（fixture 接頭辞 `lr`）の
+専用スイート（15 本）です。`lr_local.scala` は「一度も読まない」「1 回」「複数回（初期化は
+1 回だけ）」、ローカル `val` / `var` / メソッド引数の捕捉、`lazy val` 同士の依存（前方・後方
+の両方向）、全セルクラス（`LazyBoolean` … `LazyDouble` / `LazyRef` / `LazyUnit`）、
+`while` の中（反復ごとに別セル）、ラムダの中とラムダからの捕捉、例外を投げる初期化子の
+再試行、ネストした `def` の中、結果型を書かない形（セルクラスは推論した型で決まる）、
+メソッド型パラメータ `A`（`Object` へ消去されるので `LazyRef`）を 1 本で回します。`lr_edge.scala` はローカル class から読む形、
+初期化子からの**囲みメソッドへの `return`**（`return` がアクセサへ移るので、メソッド側は
+それでも `NonLocalReturnControl` のハンドラを持たないといけない）、**value class** の結果
+（erasure でアクセサの戻りが `int` になる一方セルは `LazyRef` のまま）、`match` の case と
+`try` ブロック、外側ブロックのセルを読む初期化子、trait のメソッド、コンストラクタ本体、
+`this` の捕捉、同名の `lazy val` が兄弟スコープにある形を回します。`lr_nestdef.scala` は
+ラムダリフトの**推移的な捕捉**（持ち上げた `def` が別の持ち上げた `def` を呼ぶとき、
+その捕捉も渡せないといけない。素のネスト `def` でも壊れていた既存バグ）です。
+`lr_member.scala` は既存の
+`bitmap$0` 方式（クラス・trait・object のメンバ、および同じテンプレートにメンバと
+ローカルが同居する形）が壊れていないことの回帰です。どちらも**私有ランタイムと
+`--scala-library` の両方**でコンパイルして `java -Xverify:all` で実行し、期待出力は
+**実 scalac 2.13.16 の stdout そのまま**（`real_scalac_dual_run_lr_*` が毎回その場で
+突き合わせます）。laziness は値ではなく `println` の**順序**にしか現れないので、
+自分自身との比較では検出できないためです。形の固定は
+`local_lazy_val_compiles_to_a_lazy_cell`（`Main$` が `scala/runtime/Lazy*` と
+`initialized` / `initialize` を参照し、ローカル用に `bitmap$0` を使わないこと）、
+`member_lazy_val_still_uses_the_bitmap`、
+`cells_come_from_the_private_runtime_only_when_it_is_used`（jar モードでは
+`scala/runtime/Lazy*.class` を出さない）、`private_cells_match_the_library_signatures`
+（私有セルの 3 メソッドの記述子が scala-library と一致）。異常系は
+`lr_forward_bad.scala`（前方参照できるのは `lazy val` だけで、素の `val` は今までどおり
+`not found: value b`）。
+
 `agent/reify2` スライス（宣言クラスでの呼び出しと quasiquote の reification）のフィクスチャは接頭辞 `reify`（`reify` / `reify_bad` / `reify_qq` / `reify_qq_bad`）で、コンフリクト回避のため `crates/cli/tests/reify.rs` に置いています。`reify.scala` は 1 コンパイル単位で trait-extends-class のディスパッチ（宣言クラスへの `checkcast` + `invokevirtual` と、トレイト自身の `invokeinterface`）を private ランタイム・library ABI の両方で見るもので、期待出力は実 scalac 2.13.16 の出力です。`reify_qq.scala` は **scala-reflect.jar を `-cp` に置いて**quasiquote を実行し、実 scalac の出力と毎回その場で比較します（`reify_qq_quasiquotes_build_the_same_trees_as_scalac`）。`reify_runtime_universe_builds_a_tree` は `scala.reflect.runtime.universe` 上で `SyntacticTermIdent` / `SyntacticSelectTerm` / `Literal(Constant(42))` を組み立てて**実行**します（以前は `NoSuchMethodError`）。`reify_classpath_trait_is_an_interface_and_inherits` は `-cp` 越しのトレイトのメンバと継承メンバ（以前は `IncompatibleClassChangeError` と `is not a member`）。異常系は `reify_bad.scala`（トレイトにもクラスにも無い名前）と `reify_qq_bad.scala`（reification が落とせない 6 つの形が、どれも形の名前つきで診断されること）。
 
 quasiquote と、その受け皿である reflect ABI の下地は `crates/cli/tests/quasi.rs` にまとめています。正常系 `tests/fixtures/quasi.scala` は `scala_library_dual_run_quasi`（jar リンクで実行し `expected/quasi.txt` と一致）と `real_scalac_dual_run_quasi`（**実 scalac 2.13.16** の stdout・期待値・scala-rs の出力の三者一致）の 2 通りで回し、package object のメンバ（`scala.math.Pi` / `abs` / `max`）、`import <値>._`、引数なし `def` の結果に対する `apply` 挿入（`Literal(1)` = `Literal.apply(1)`）、そして**ユーザ定義の `q` 補間子が quasiquote に横取りされないこと**を実行結果まで固定します。異常系 `quasi_bad.scala` は `fixtures_quasi_bad_is_error` が `q` / `tq` / `pq` / `cq` の 4 種すべてに診断が出ること、`q""` は `unimplemented syntax: quasiquote q"..." (empty quasiquote)` になることを見ます。`quasiquote_is_not_reported_as_a_stringcontext_member` は、以前の**誤った**診断 `value q is not a member of StringContext` が戻らないことを固定します。
@@ -4695,6 +4755,15 @@ m.map { case (d, g) => d -> g.sum }   // scalac: Map(x -> 3)
 
 ### Remaining
 
+- **`Nothing` を返すものを値の位置で使うと `VerifyError`**（`agent/lazyref` で確認、
+  main でも同じ。ローカル `lazy val` とは無関係の既存バグ）。
+  `def boom: Nothing = throw new RuntimeException("x")` を
+  `if (n > 0) 1 else boom` のように使うと、`Nothing` の結果が `V` に消去されて
+  片方の枝だけスタックが空になり `Inconsistent stackmap frames` になります。
+  `lazy val boom: Nothing = throw …` も（アクセサへ持ち上がった結果）同じ経路に
+  乗るので、同じ形で落ちます。直すには `Nothing` を返す呼び出しのあとに
+  「到達しない」印を置いて、期待型ぶんのダミーを積む必要があります。
+
 - **`Seq`／`IndexedSeq` の `lazyZip`**（`agent/ambigmap` で確認）。
   `line.lazyZip(widths).map(…)` が
   `value lazyZip is not a member of IndexedSeq[String]` になります。
@@ -4946,7 +5015,11 @@ error: value += is not a member of T
   局所を読むローカル `object` は
   `not implemented: a local `object` that reads …` を出します
   （`tests/fixtures/nestedobj_bad.scala`）。外に何も読まないローカル `object` は
-  通ります。直すには `LazyRef` のローカル + キャプチャ引数の codegen が要ります。
+  通ります。直すには `LazyRef` のローカル + キャプチャ引数の codegen が要ります
+  （`agent/lazyref` でローカル `lazy val` 用に `scala.runtime.Lazy*` のセルと、
+  そのセルを取る持ち上げ済みアクセサの codegen が入ったので、下地はあります。
+  残っているのは `ModuleDef` を `$outer` とキャプチャを取るクラスへ組み替える
+  ところ）。
   なお **value class の中の `object`** は scalac 自身が
   `implementation restriction: nested object is not allowed in value class` で
   断るので、こちらも同じ文面で断ります（以前は通してしまい `VerifyError` でした）。

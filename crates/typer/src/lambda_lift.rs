@@ -72,13 +72,30 @@ impl<'a> Lifter<'a> {
             _ => {}
         }
         let mut cap_map: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
+        for d in &nested {
+            if d.sym.is_none() {
+                continue;
+            }
+            cap_map.insert(d.sym, self.captures(d));
+        }
+        // A def that *calls* another hoisted def has to be able to hand it its
+        // captures, and `extract_from` has already pulled the callee out of the
+        // caller's body, so nothing in the caller mentions them any more:
+        //
+        //     def f(n: Int) = { def inner(m: Int) = { def g = m + n; g + g }; … }
+        //
+        // `g` captures `m` and `n`; `inner` reads neither by itself, yet the
+        // rewritten `g(m, n)` inside it needs both. Only `m` is `inner`'s own,
+        // so `n` has to reach `inner` as a capture too. Without this the call
+        // to `inner` was emitted one argument short and the method ran on a
+        // shifted frame.
+        close_over_callees(&nested, &mut cap_map, self.st);
         for d in &mut nested {
             if d.sym.is_none() {
                 continue;
             }
-            let caps = self.captures(d);
+            let caps = cap_map.get(&d.sym).cloned().unwrap_or_default();
             self.reparent(d, class_id, &caps);
-            cap_map.insert(d.sym, caps);
         }
         match &mut tree.kind {
             TreeKind::ClassDef {
@@ -435,6 +452,202 @@ impl<'a> Lifter<'a> {
             self.st.get_mut(id).paramss = paramss;
         }
     }
+}
+
+/// Add to each hoisted def the captures of every hoisted def it calls, minus
+/// whatever it defines itself. Repeated to a fixpoint, so a chain of three
+/// nested defs threads the outermost local all the way down.
+fn close_over_callees(
+    nested: &[Tree],
+    cap_map: &mut HashMap<SymbolId, Vec<SymbolId>>,
+    st: &SymbolTable,
+) {
+    let known: HashSet<SymbolId> = cap_map.keys().copied().collect();
+    if known.len() < 2 {
+        return;
+    }
+    let mut bound: HashMap<SymbolId, HashSet<SymbolId>> = HashMap::new();
+    let mut callees: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
+    for d in nested {
+        if d.sym.is_none() {
+            continue;
+        }
+        let mut b = HashSet::new();
+        b.insert(d.sym);
+        for p in &st.get(d.sym).params {
+            b.insert(*p);
+        }
+        collect_bound(d, &mut b);
+        bound.insert(d.sym, b);
+        let mut c = Vec::new();
+        collect_callees(d, &known, &mut c);
+        callees.insert(d.sym, c);
+    }
+    loop {
+        let mut changed = false;
+        for d in nested {
+            if d.sym.is_none() {
+                continue;
+            }
+            let mut add: Vec<SymbolId> = Vec::new();
+            for callee in callees.get(&d.sym).into_iter().flatten() {
+                if *callee == d.sym {
+                    continue;
+                }
+                for c in cap_map.get(callee).into_iter().flatten() {
+                    if bound[&d.sym].contains(c) || cap_map[&d.sym].contains(c) || add.contains(c) {
+                        continue;
+                    }
+                    add.push(*c);
+                }
+            }
+            if !add.is_empty() {
+                changed = true;
+                cap_map.get_mut(&d.sym).expect("cap_map").extend(add);
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
+}
+
+/// Every symbol `tree` introduces below its own head: locals, nested defs and
+/// classes, lambda and pattern binders. Anything in here is in scope at a call
+/// site inside `tree`, so it is never a capture of it.
+fn collect_bound(tree: &Tree, out: &mut HashSet<SymbolId>) {
+    match &tree.kind {
+        TreeKind::ValDef { .. }
+        | TreeKind::DefDef { .. }
+        | TreeKind::ClassDef { .. }
+        | TreeKind::ModuleDef { .. }
+        | TreeKind::Bind { .. }
+        | TreeKind::LabelDef { .. }
+            if !tree.sym.is_none() =>
+        {
+            out.insert(tree.sym);
+        }
+        _ => {}
+    }
+    for c in child_trees(tree) {
+        collect_bound(c, out);
+    }
+}
+
+/// Hoisted defs named anywhere below `tree`.
+fn collect_callees(tree: &Tree, known: &HashSet<SymbolId>, out: &mut Vec<SymbolId>) {
+    if !tree.sym.is_none() && known.contains(&tree.sym) && !out.contains(&tree.sym) {
+        out.push(tree.sym);
+    }
+    for c in child_trees(tree) {
+        collect_callees(c, known, out);
+    }
+}
+
+fn child_trees(t: &Tree) -> Vec<&Tree> {
+    let mut v: Vec<&Tree> = Vec::new();
+    match &t.kind {
+        TreeKind::PackageDef { pid, stats } => {
+            v.push(pid);
+            v.extend(stats.iter());
+        }
+        TreeKind::ClassDef {
+            tparams,
+            vparamss,
+            impl_,
+            ..
+        } => {
+            v.extend(tparams.iter());
+            v.extend(vparamss.iter().flatten());
+            v.extend(impl_.parents.iter());
+            v.extend(impl_.body.iter());
+        }
+        TreeKind::ModuleDef { impl_, .. } => {
+            v.extend(impl_.parents.iter());
+            v.extend(impl_.body.iter());
+        }
+        TreeKind::ValDef { tpt, rhs, .. } => {
+            v.push(tpt);
+            v.push(rhs);
+        }
+        TreeKind::DefDef {
+            tparams,
+            vparamss,
+            tpt,
+            rhs,
+            ..
+        } => {
+            v.extend(tparams.iter());
+            v.extend(vparamss.iter().flatten());
+            v.push(tpt);
+            v.push(rhs);
+        }
+        TreeKind::Block { stats, expr } => {
+            v.extend(stats.iter());
+            v.push(expr);
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            v.push(cond);
+            v.push(thenp);
+            v.push(elsep);
+        }
+        TreeKind::Match { selector, cases } => {
+            v.push(selector);
+            for c in cases {
+                v.push(&c.pat);
+                v.push(&c.guard);
+                v.push(&c.body);
+            }
+        }
+        TreeKind::Function { vparams, body } => {
+            v.extend(vparams.iter());
+            v.push(body);
+        }
+        TreeKind::Assign { lhs, rhs } => {
+            v.push(lhs);
+            v.push(rhs);
+        }
+        TreeKind::While { cond, body } | TreeKind::DoWhile { body, cond } => {
+            v.push(cond);
+            v.push(body);
+        }
+        TreeKind::Return { expr } | TreeKind::Throw { expr } => v.push(expr),
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            v.push(block);
+            for c in catches {
+                v.push(&c.pat);
+                v.push(&c.guard);
+                v.push(&c.body);
+            }
+            v.push(finalizer);
+        }
+        TreeKind::New { tpt } => v.push(tpt),
+        TreeKind::Typed { expr, tpt } => {
+            v.push(expr);
+            v.push(tpt);
+        }
+        TreeKind::TypeApply { fun, args }
+        | TreeKind::Apply { fun, args }
+        | TreeKind::UnApply { fun, args } => {
+            v.push(fun);
+            v.extend(args.iter());
+        }
+        TreeKind::Select { qual, .. } => v.push(qual),
+        TreeKind::Bind { body, .. } => v.push(body),
+        TreeKind::Star { elem } => v.push(elem),
+        TreeKind::Alternative { trees } => v.extend(trees.iter()),
+        TreeKind::LabelDef { params, rhs, .. } => {
+            v.extend(params.iter());
+            v.push(rhs);
+        }
+        TreeKind::InterpolatedString { args, .. } => v.extend(args.iter()),
+        _ => {}
+    }
+    v
 }
 
 fn collect_captures(

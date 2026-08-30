@@ -6205,6 +6205,191 @@ fn emit_nonlocal_return(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, e
     asm.athrow();
 }
 
+/// The element descriptor a `scala.runtime.Lazy…` cell stores, or `None` for
+/// `LazyUnit`, which keeps only the flag.
+fn lazy_cell_elem(internal: &str) -> Option<&'static str> {
+    match internal.rsplit('/').next().unwrap_or("") {
+        "LazyBoolean" => Some("Z"),
+        "LazyByte" => Some("B"),
+        "LazyChar" => Some("C"),
+        "LazyShort" => Some("S"),
+        "LazyInt" => Some("I"),
+        "LazyLong" => Some("J"),
+        "LazyFloat" => Some("F"),
+        "LazyDouble" => Some("D"),
+        "LazyUnit" => None,
+        _ => Some("Ljava/lang/Object;"),
+    }
+}
+
+/// Bring a value read out of an `Ljava/lang/Object;` cell back to `ret`.
+/// Only `LazyRef` needs this; the unboxed cells already hold the right sort.
+fn lazy_cell_from_object(asm: &mut Assembler, ctx: &EmitCtx, ret: &Type) {
+    if is_jvm_primitive(ret) && !is_unit_like(ret) {
+        emit_unbox(asm, ret);
+        return;
+    }
+    if matches!(ret, Type::String) {
+        asm.checkcast("java/lang/String");
+        return;
+    }
+    if let Type::Array(elem) = ret {
+        if is_concrete_array_elem(elem) {
+            let d = jvm_desc(ctx.st, ret);
+            asm.checkcast(&d);
+        }
+        return;
+    }
+    if let Some(cn) = checkcast_internal(ctx.st, ret) {
+        if cn != "java/lang/Object" && has_class_sym(ctx.st, ret) {
+            asm.checkcast(&cn);
+        }
+    }
+}
+
+/// `cell.value()`, coerced to `ret`. Pushes nothing for `LazyUnit`.
+fn emit_lazy_cell_read(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    cn: &str,
+    elem: Option<&str>,
+    slot: u16,
+    ret: &Type,
+) {
+    let Some(e) = elem else {
+        return;
+    };
+    asm.aload(slot);
+    asm.invokevirtual(cn, "value", &format!("(){e}"));
+    if e == "Ljava/lang/Object;" {
+        lazy_cell_from_object(asm, ctx, ret);
+    }
+}
+
+/// nsc's `lazyvals` shape for a method-local `lazy val`, one method instead of
+/// scalac's `x$1` + `x$lzycompute$1` pair:
+///
+/// ```text
+/// if (cell.initialized()) cell.value()
+/// else synchronized (cell) {
+///   if (cell.initialized()) cell.value() else cell.initialize(<rhs>)
+/// }
+/// ```
+///
+/// `_initialized` is only set *after* the value is stored, so an initialiser
+/// that throws leaves the cell untouched and the next read retries it — the
+/// same as scalac.
+fn emit_local_lazy_body(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    rhs: &Tree,
+    ret: &Type,
+    cell: SymbolId,
+) {
+    let Some((slot, _)) = frame.get(cell) else {
+        throw_runtime(asm, "lazy val cell is missing");
+        push_default(asm, ret);
+        emit_return(asm, ret);
+        return;
+    };
+    let cell_ty = ctx.st.get(cell).ty.clone();
+    let cn = class_internal(
+        ctx.st,
+        ctx.st.class_sym_of(&cell_ty).unwrap_or(SymbolId::NONE),
+    );
+    let elem = lazy_cell_elem(&cn);
+    let sort = jvm_sort(ret);
+
+    // Fast path: no monitor once the cell is initialised.
+    asm.aload(slot);
+    asm.invokevirtual(&cn, "initialized", "()Z");
+    let slow = asm.fresh_label();
+    asm.ifeq(slow);
+    emit_lazy_cell_read(asm, ctx, &cn, elem, slot, ret);
+    emit_return(asm, ret);
+    asm.mark(slow);
+
+    let lock = frame.alloc_tmp(JvmSort::Ref);
+    asm.aload(slot);
+    store(asm, lock, JvmSort::Ref);
+    let result = if sort != JvmSort::Void {
+        Some(frame.alloc_tmp(sort))
+    } else {
+        None
+    };
+    // Stored before the guarded range so the handler's stack map does not
+    // claim a local the body has not written yet.
+    if let Some(r) = result {
+        push_default(asm, ret);
+        store(asm, r, sort);
+    }
+    load(asm, lock, JvmSort::Ref);
+    asm.monitorenter();
+    asm.capture_try_locals();
+    let try_s = asm.fresh_label();
+    asm.mark(try_s);
+
+    asm.aload(slot);
+    asm.invokevirtual(&cn, "initialized", "()Z");
+    let compute = asm.fresh_label();
+    asm.ifeq(compute);
+    emit_lazy_cell_read(asm, ctx, &cn, elem, slot, ret);
+    let done = asm.fresh_label();
+    asm.goto(done);
+    asm.mark(compute);
+    match elem {
+        None => {
+            // `LazyUnit`: there is no value to keep, only the flag.
+            gen_expr(asm, frame, ctx, rhs);
+            pop_if_value(asm, &rhs.ty);
+            asm.aload(slot);
+            asm.invokevirtual(&cn, "initialize", "()V");
+        }
+        Some(e) => {
+            asm.aload(slot);
+            gen_expr(asm, frame, ctx, rhs);
+            if e == "Ljava/lang/Object;" {
+                if is_jvm_primitive(&rhs.ty) && !is_unit_like(&rhs.ty) {
+                    emit_box(asm, &rhs.ty);
+                } else if is_unit_like(&rhs.ty) {
+                    push_default(asm, ret);
+                }
+            }
+            asm.invokevirtual(&cn, "initialize", &format!("({e}){e}"));
+            if e == "Ljava/lang/Object;" {
+                lazy_cell_from_object(asm, ctx, ret);
+            }
+        }
+    }
+    asm.mark(done);
+    if let Some(r) = result {
+        store(asm, r, sort);
+    }
+    load(asm, lock, JvmSort::Ref);
+    asm.monitorexit();
+    let try_e = asm.fresh_label();
+    asm.mark(try_e);
+    let after = asm.fresh_label();
+    asm.goto(after);
+    let handler = asm.fresh_label();
+    asm.mark(handler);
+    asm.enter_handler_captured_locals();
+    let ex = frame.alloc_tmp(JvmSort::Ref);
+    asm.astore(ex);
+    load(asm, lock, JvmSort::Ref);
+    asm.monitorexit();
+    asm.aload(ex);
+    asm.athrow();
+    asm.exception(try_s, try_e, handler, None);
+    asm.release_try_locals();
+    asm.mark(after);
+    if let Some(r) = result {
+        load(asm, r, sort);
+    }
+    emit_return(asm, ret);
+}
+
 fn finish_method_body(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -6212,7 +6397,19 @@ fn finish_method_body(
     rhs: &Tree,
     ret: &Type,
 ) {
-    let wrap = !ctx.method_sym.is_none() && tree_has_nlr_to(rhs, ctx.method_sym);
+    // A method-local `lazy val`'s accessor: `rhs` is the initialiser, and it
+    // runs at most once, behind the cell this method was handed.
+    if !ctx.method_sym.is_none() {
+        if let Some(&cell) = ctx.st.local_lazy_accessors.get(&ctx.method_sym) {
+            emit_local_lazy_body(asm, frame, ctx, rhs, ret, cell);
+            return;
+        }
+    }
+    let wrap = !ctx.method_sym.is_none()
+        && (tree_has_nlr_to(rhs, ctx.method_sym)
+            // A `return` that moved into a hoisted local-`lazy val` accessor is
+            // no longer visible in this method's own body.
+            || ctx.st.local_lazy_nlr.contains(&ctx.method_sym));
     if wrap {
         asm.capture_try_locals();
         let start = asm.fresh_label();
@@ -6434,6 +6631,19 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
                 tree.ty.clone()
             };
             let sort = jvm_sort(&ty);
+            // A method-local `lazy val`'s cell: `new scala/runtime/LazyInt()`
+            // and nothing else. The initialiser moved into the accessor
+            // `lazy_local::lazy_locals` put next to it.
+            if !tree.sym.is_none() && ctx.st.local_lazy_cells.contains(&tree.sym) {
+                let cn = class_internal(ctx.st, ctx.st.class_sym_of(&ty).unwrap_or(SymbolId::NONE));
+                asm.new_obj(&cn);
+                asm.dup();
+                asm.invokespecial(&cn, "<init>", "()V");
+                let slot = frame.alloc(tree.sym, JvmSort::Ref);
+                declare_local_ty(asm, ctx.st, slot, &ty);
+                store(asm, slot, JvmSort::Ref);
+                return;
+            }
             if rhs.is_empty() {
                 if is_boxed_var(ctx, tree.sym) {
                     push_default(asm, &ty);

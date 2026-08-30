@@ -6,7 +6,7 @@
 use crate::classfile::EmittedClass;
 use crate::classfile::{
     encode_method_name, ClassEmit, Field, Method, Pool, ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE,
-    ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER,
+    ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_VOLATILE,
 };
 use crate::code::Assembler;
 
@@ -24,6 +24,22 @@ const REF_BOXES: &[(&str, &str)] = &[
     ("LongRef", "J"),
     ("ShortRef", "S"),
     ("ObjectRef", "Ljava/lang/Object;"),
+];
+
+/// `scala.runtime.Lazy*`, the one-slot cells a *method-local* `lazy val` is
+/// compiled into (nsc's `lazyvals` phase). `LazyUnit` keeps only the flag, so
+/// its element descriptor is empty.
+const LAZY_CELLS: &[(&str, &str)] = &[
+    ("LazyBoolean", "Z"),
+    ("LazyByte", "B"),
+    ("LazyChar", "C"),
+    ("LazyShort", "S"),
+    ("LazyInt", "I"),
+    ("LazyLong", "J"),
+    ("LazyFloat", "F"),
+    ("LazyDouble", "D"),
+    ("LazyRef", "Ljava/lang/Object;"),
+    ("LazyUnit", ""),
 ];
 
 pub fn emit_runtime() -> Vec<EmittedClass> {
@@ -53,6 +69,7 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
         emit_app(),
     ];
     out.extend(REF_BOXES.iter().map(|(n, d)| emit_ref_box(n, d)));
+    out.extend(LAZY_CELLS.iter().map(|(n, d)| emit_lazy_cell(n, d)));
     out
 }
 
@@ -1652,6 +1669,99 @@ fn emit_ref_box(name: &str, elem: &str) -> EmittedClass {
                 load_arg(asm, 0);
                 asm.invokespecial(&internal, "<init>", &format!("({elem})V"));
                 asm.areturn();
+            },
+        );
+    }
+    b.finish()
+}
+
+/// Private-runtime stand-in for `scala.runtime.LazyRef` and its unboxed
+/// siblings. Mirrors scala-library: a `@volatile` `_initialized` flag written
+/// *after* `_value`, so a reader that sees the flag also sees the value, and an
+/// initialiser that throws leaves the cell untouched for the next attempt.
+fn emit_lazy_cell(name: &str, elem: &str) -> EmittedClass {
+    let internal = format!("scala/runtime/{name}");
+    let mut b = B::class(&internal, "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_SUPER;
+    b.interfaces.push("java/io/Serializable".into());
+    b.fields.push(Field {
+        access: ACC_PRIVATE | ACC_VOLATILE,
+        name: "_initialized".into(),
+        desc: "Z".into(),
+    });
+    if !elem.is_empty() {
+        b.fields.push(Field {
+            access: ACC_PRIVATE,
+            name: "_value".into(),
+            desc: elem.into(),
+        });
+    }
+    {
+        let internal = internal.clone();
+        b.add_code(ACC_PUBLIC, "<init>", "()V", 1, move |asm| {
+            asm.aload(0);
+            asm.invokespecial("java/lang/Object", "<init>", "()V");
+            let _ = &internal;
+            asm.vreturn();
+        });
+    }
+    {
+        let internal = internal.clone();
+        b.add_code(ACC_PUBLIC, "initialized", "()Z", 1, move |asm| {
+            asm.aload(0);
+            asm.getfield(&internal, "_initialized", "Z");
+            asm.ireturn();
+        });
+    }
+    if elem.is_empty() {
+        let internal = internal.clone();
+        b.add_code(ACC_PUBLIC, "initialize", "()V", 1, move |asm| {
+            asm.aload(0);
+            asm.iconst(1);
+            asm.putfield(&internal, "_initialized", "Z");
+            asm.vreturn();
+        });
+        return b.finish();
+    }
+    let wide = matches!(elem, "J" | "D");
+    let load_arg = |asm: &mut Assembler, n: u16| match elem {
+        "J" => asm.lload(n),
+        "D" => asm.dload(n),
+        "F" => asm.fload(n),
+        "Ljava/lang/Object;" => asm.aload(n),
+        _ => asm.iload(n),
+    };
+    let ret_val = |asm: &mut Assembler| match elem {
+        "J" => asm.lreturn(),
+        "D" => asm.dreturn(),
+        "F" => asm.freturn(),
+        "Ljava/lang/Object;" => asm.areturn(),
+        _ => asm.ireturn(),
+    };
+    {
+        let internal = internal.clone();
+        b.add_code(ACC_PUBLIC, "value", &format!("(){elem}"), 1, move |asm| {
+            asm.aload(0);
+            asm.getfield(&internal, "_value", elem);
+            ret_val(asm);
+        });
+    }
+    {
+        let internal = internal.clone();
+        b.add_code(
+            ACC_PUBLIC,
+            "initialize",
+            &format!("({elem}){elem}"),
+            if wide { 3 } else { 2 },
+            move |asm| {
+                asm.aload(0);
+                load_arg(asm, 1);
+                asm.putfield(&internal, "_value", elem);
+                asm.aload(0);
+                asm.iconst(1);
+                asm.putfield(&internal, "_initialized", "Z");
+                load_arg(asm, 1);
+                ret_val(asm);
             },
         );
     }

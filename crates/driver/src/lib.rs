@@ -7,7 +7,7 @@ use scala_rs_backend::{emit_opts, emit_runtime, load_classpath, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
-    check_local_objects, erase, find_mains, lambda_lift, mark_anon_captures,
+    check_local_objects, erase, find_mains, lambda_lift, lazy_locals, mark_anon_captures,
     note_source_value_classes, typecheck_units, uncurry, ClasspathClass, ClasspathMethod,
     ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
 };
@@ -210,6 +210,10 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         if !has_errors(&diags) {
             for u in units.iter_mut() {
                 uncurry(&mut u.tree, &mut st);
+                // A method-local `lazy val` becomes a cell plus a nested
+                // accessor def; lambda-lift then hoists the accessor and
+                // threads whatever the initialiser captured.
+                lazy_locals(&mut u.tree, &mut st);
                 lambda_lift(&mut u.tree, &mut st);
                 mark_anon_captures(&u.tree, &mut st);
             }
