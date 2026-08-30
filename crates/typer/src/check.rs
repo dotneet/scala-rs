@@ -7644,6 +7644,46 @@ impl Typer {
     /// resolved by `inferMethodAlternative`, which never tuples. `Lit(1, 2,
     /// 3)` against `apply(String, Any, Boolean = …)` / `apply[T](T)(implicit
     /// Tagged[T])` stays the type mismatch scalac reports.
+    /// `c(args)` where `c` has no `apply` but a conversion of it does.
+    ///
+    /// Rewrites to `c.apply(args)` and re-types. The rewrite is structural, so
+    /// the second pass sees a `Select` and takes the ordinary member path --
+    /// it cannot come back here and loop.
+    fn retry_apply_extension(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        let TreeKind::Apply { fun, .. } = &tree.kind else {
+            return false;
+        };
+        // Already `x.apply(…)`: the Select path has had its turn.
+        if matches!(&fun.kind, TreeKind::Select { name, .. } if name == "apply") {
+            return false;
+        }
+        let fun_ty = fun.ty.clone();
+        let span = fun.span;
+        if fun_ty.is_error() || fun_ty.is_no_type() {
+            return false;
+        }
+        if self.search_extension(&fun_ty, "apply", span).is_none() {
+            return false;
+        }
+        let TreeKind::Apply { fun, .. } = &mut tree.kind else {
+            return false;
+        };
+        let old = std::mem::replace(fun.as_mut(), Tree::dummy(TreeKind::Empty));
+        **fun = Tree {
+            id: old.id,
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(old),
+                name: "apply".to_string(),
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+            postfix: false,
+        };
+        self.type_expr(tree, pt);
+        true
+    }
+
     fn retry_tupled_args(&mut self, tree: &mut Tree, pt: &Type) -> bool {
         let TreeKind::Apply { fun, args } = &tree.kind else {
             return false;
@@ -8059,6 +8099,27 @@ impl Typer {
                 // IndexedSeq[B]`; without this `"abc".map(_.toString)` sees
                 // `(<notype>) => <notype>`, both alternatives are applicable
                 // and the more specific `Char => Char` wins wrongly.
+                // The same pre-typing for a `{ case … }` literal weighed
+                // against `PartialFunction` alternatives. `StringOps.collect`
+                // is the `map` pair again --
+                // `collect(PartialFunction[Char, Char]): String` and
+                // `collect[B](PartialFunction[Char, B]): IndexedSeq[B]` --
+                // but a PF parameter is a *class*, so `agreed_lambda_params`
+                // bailed and the more specific `Char` alternative won
+                // regardless of what the case bodies return
+                // (`"abc".collect { case c => c.toInt }` was
+                // `type mismatch; found: Int required: Char`).
+                let pf_literal = matches!(
+                    &a.kind,
+                    TreeKind::Function { vparams, body } if is_case_block_literal(vparams, body)
+                );
+                if pf_literal {
+                    if let Some(pt_arg) = self.agreed_pf_param(&fun_ty_for_pretype, ai) {
+                        self.type_expr(a, &pt_arg);
+                        arg_tys.push(a.ty.clone());
+                        continue;
+                    }
+                }
                 if let Some(ps) = self.agreed_lambda_params(&fun_ty_for_pretype, ai, vparams.len())
                 {
                     // `Wildcard`, not `NoType`: the parameters are what this
@@ -9042,6 +9103,15 @@ impl Typer {
                     }
                     _ => false,
                 };
+                // `"abcdef"(1)`: the callee has no `apply` of its own, but an
+                // implicit conversion of it does (`augmentString` ->
+                // `StringOps.apply`). nsc types `c(1)` as `c.apply(1)`, so
+                // re-type it in that shape and let the ordinary `Select` path
+                // insert the conversion. `s.apply(1)` already worked; only the
+                // indexing sugar reached this error.
+                if !has_apply && !fun_ty.is_error() && self.retry_apply_extension(tree, pt) {
+                    return;
+                }
                 if fun_ty.is_error() {
                     // The receiver already failed; do not report it twice.
                 } else if !has_apply {
@@ -9153,7 +9223,14 @@ impl Typer {
             return false;
         };
         let n = self.st.get(id).name.as_str();
-        n == "WithFilter" || n == "Option$WithFilter" || n == "Try$WithFilter"
+        // `StringOps$WithFilter`: without it the rule below replaced
+        // `"abc".withFilter(p)`'s result with the *receiver* (`StringOps`,
+        // which erases to `String`), and the following `.map` compiled to a
+        // `checkcast java/lang/String` on a real `StringOps$WithFilter`.
+        n == "WithFilter"
+            || n == "Option$WithFilter"
+            || n == "Try$WithFilter"
+            || n == "StringOps$WithFilter"
     }
 
     fn is_array_ops_ty(&self, ty: Option<&Type>) -> bool {
@@ -11193,6 +11270,50 @@ impl Typer {
             }
         }
         agreed
+    }
+
+    /// `agreed_lambda_params` for `PartialFunction` parameters.
+    ///
+    /// When every alternative wants a `PartialFunction[A, _]` at `idx` with
+    /// the same `A`, a `{ case … }` literal there can be typed before the
+    /// alternatives are weighed. The result is left open by asking for
+    /// `PartialFunction[A, Any]`: the case-block path in `type_function`
+    /// turns an `Any` result into `NoType`, so the case bodies supply it and
+    /// the literal comes back as the `PartialFunction` it really is -- which
+    /// is what then picks the alternative.
+    fn agreed_pf_param(&self, fun_ty: &Type, idx: usize) -> Option<Type> {
+        let Type::Overload(alts) = fun_ty else {
+            return None;
+        };
+        if alts.len() < 2 {
+            return None;
+        }
+        let mut agreed: Option<(SymbolId, Type)> = None;
+        for a in alts {
+            let Type::Method { paramss, .. } = a else {
+                return None;
+            };
+            let p = paramss.first()?.get(idx)?;
+            let Type::Class { sym, args } = p else {
+                return None;
+            };
+            if !is_partial_function_sym(&self.st, *sym) || args.len() != 2 {
+                return None;
+            }
+            if mentions_no_type(&args[0]) {
+                return None;
+            }
+            match &agreed {
+                None => agreed = Some((*sym, args[0].clone())),
+                Some((_, prev)) if *prev == args[0] => {}
+                Some(_) => return None,
+            }
+        }
+        let (sym, from) = agreed?;
+        Some(Type::Class {
+            sym,
+            args: vec![from, Type::Any],
+        })
     }
 
     /// Replace a method's own type parameters by their upper bounds, so that
@@ -14507,7 +14628,7 @@ impl Typer {
     /// Install `name` on the receiver's class from the library `ScalaSignature`
     /// and return whatever that made visible. Empty unless the receiver is a
     /// standard-library class *and* the member could be expressed faithfully.
-    fn supply_from_pickle(&mut self, recv_ty: &Type, name: &str) -> Vec<SymbolId> {
+    pub(crate) fn supply_from_pickle(&mut self, recv_ty: &Type, name: &str) -> Vec<SymbolId> {
         if !self.library_abi {
             return Vec::new();
         }

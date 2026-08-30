@@ -1,0 +1,39 @@
+Vector((a,0), (b,1), (c,2), (d,3), (e,4), (f,5))
+Vector((a,1), (b,2), (c,3))
+Vector(0, 97, 195, 294, 394, 495, 597)
+List(ab, bc, cd, de, ef)
+List(abc, cde, ef)
+List((a,a), (b,b), (c,c), (d,d), (e,e), (f,f))
+fedcba
+fedcba
+abcdef
+abcdef
+def
+Vector(100, 101, 102)
+(def,abc)
+(ab,cdef)
+(ab,cdef)
+List(abcdef, bcdef, cdef, def, ef, f, )
+List(abcdef, abcde, abcd, abc, ab, a, )
+List(abcdef, abcdfe, abcedf)
+List(ab, ac, ad)
+3
+4
+5
+3
+f
+xabcdef
+abcdefx
+abcdefxy
+xyabcdef
+List(abcdef)
+List(a, b, c)
+b
+e
+DEF
+Vector(100, 101, 102)
+e
+f
+abcdef
+a-b-c-d-e-f
+[a-b-c-d-e-f]

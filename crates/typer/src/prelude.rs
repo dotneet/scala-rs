@@ -702,6 +702,9 @@ fn add_scala_aliases(st: &mut SymbolTable, library_abi: bool) {
     crate::prelude_seqpat::install(st);
     // `StringOps.map[B](Char => B): IndexedSeq[B]`（`IndexedSeq` が揃ってから）。
     crate::prelude_strmap::install(st, library_abi);
+    // `StringOps` の残り。pickle から補完できないもの（戻り型だけのオーバー
+    // ロードなど）だけを手書きする。
+    crate::prelude_stringops8::install(st, library_abi);
     // `Coll.empty` は最後にまとめて多相化する（すべての companion が揃ってから）。
     crate::prelude_empty::install(st);
 }
@@ -6600,6 +6603,12 @@ fn add_predef_members(
             Intrinsic::None,
         );
         st.get_mut(wrap_str).flags = st.get(wrap_str).flags.with(Flags::IMPLICIT);
+        // javap: `wrapString` is declared on `scala.LowPriorityImplicits`,
+        // `augmentString` on `Predef$`. So `StringOps` outranks
+        // `WrappedString` whenever both offer the selected member -- which is
+        // what `search_extension` already documents but could not act on
+        // while this flag was unset (only `intWrapper` & co. carried it).
+        st.get_mut(wrap_str).low_priority = true;
     }
     if let Some(aops) = array_ops {
         let wrap = method(
