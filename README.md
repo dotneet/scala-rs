@@ -4126,7 +4126,8 @@ arguments (21)` になります。名前渡し自体は壊れていません
 して、レシーバへの読み替えは既にある `subst_as_seen_from` に任せます。
 `Builder[Int, List[Int]]` に対する `Growable#++=` は `Builder` を返します。
 
-**残っている隣接した穴**（このスライスでは直していません）:
+**残っている隣接した穴**（このスライスでは直していません。
+`agent/tail1` が本文を参照）:
 
 - **jar のコンパニオンの入れ子クラス**が、コンパニオンを
   パッケージオブジェクトの `val` 経由で掴んだときに引けません。
@@ -4139,6 +4140,9 @@ arguments (21)` になります。名前渡し自体は壊れていません
   「クラス `Outcome` の入れ子」と「オブジェクト `Outcome` の入れ子」を
   区別しないので、直すには `InnerClasses` の `outer_class_info_index`
   （`parse_inner_classes` は今これを捨てています）か pickle が要ります。
+  → 「`value X is not a member of Y$`（`agent/tail1`）」で、
+  `outer_class_info_index` ではなく**別の根**（`qual.sym` が val 自体を指し、
+  空の `jvm_name` から候補を組み立てていたこと）だと判明し、直りました。
 
 ### 同じ pickle 宣言のコピーが 2 つ（`agent/ambigmap`）
 
@@ -6000,6 +6004,189 @@ fixture 接頭辞は `cs`、テストは `crates/cli/tests/ctorstmt.rs` です�
 - 早期定義（`new { val x = 1 } with T`）の中に**文**を書けるかどうかは
   触っていません。nsc は early definition block に文を許しませんし、
   こちらも `val` だけを pre-super に出す既存の経路のままです。
+### slick の残エラーの小さい塊 3 つ（`agent/tail1`）
+
+独立した 3 件を並行して見た結果です。テストは
+`crates/cli/tests/tail1.rs`、fixture の接頭辞は `t1` です。
+
+計測は `files=184 errors=327 files_with_errors=64` →
+**`files=184 errors=305 files_with_errors=63`**（−22 件 / −1 ファイル）。
+3 つの塊それぞれの内訳:
+
+| 塊 | before | after |
+|---|---|---|
+| `value ExitCase is not a member of Resource$` / `Outcome.Succeeded` 系 | 6 件 | **1 件**（多ファイル限定の残件、後述） |
+| `value getOrElse is not a member of Product` | 4 件 | 4 件（**直せていません**、後述） |
+| `not found: value fromInt` | 3 件 | **0 件** |
+
+減った差分（−22）には上記 3 塊の直接分（6→1 で −5、3→0 で −3）に加えて、
+`fromInt` が見つからないことの巻き添えで出ていた `no implicit` などの
+カスケードした診断も含まれます。
+
+#### 1. `value X is not a member of Y$`（jar のコンパニオン + パッケージオブジェクト `val`）
+
+`agent/companionkind` の README 注記（「残っている隣接した穴」）が原因だと
+名指ししていた `InnerClasses` の `outer_class_info_index` は、実は**原因では
+ありませんでした**。`parse_inner_classes` を拡張して確かめましたが、
+`Resource$ExitCase$Succeeded$` のようなクラスは `InnerClasses` の**自分自身の
+エントリ**を見ても outer が常に正しく `Resource$ExitCase$`（引く側の
+コンパニオン）を指しており、区別できないケースは実際には踏んでいません。
+
+**本当の原因は `type_select`（`crates/typer/src/check.rs`）の
+メンバ探索フォールバックでした**。見つからないとき
+`complete_binary_member(qual.sym, name, span)` を呼んでいましたが、
+`qual.sym` は `Box.Const` の `Box` が**パッケージオブジェクトの `val`**
+（`val Box = tiny2.Box`。`cats.effect` の `package object effect` が
+`Resource` / `Outcome` にまさにこの形を使っています）のときその
+**val 自身のシンボル**で、`jvm_name` が空です。空の名前から組み立てた
+候補（`$Const` 相当）は当然何にも一致しません。`Box.of`（`Box$` の
+直接メンバ、jar 読み込み時に埋まる）が通って `Box.Const`（コンパニオンの
+入れ子）だけ落ちていたのはこのためで、直入インポート
+（`import tiny2.Box`、`qual.sym` がモジュールそのもの）では再現しません。
+
+`recv_ty`（val の**型**。`class_sym_of` で `ModuleRef` から実体の
+モジュールクラスへ解決できる）を先に試すよう変えたところ、芋づる式に
+4 つの隣接した穴が見つかりました:
+
+1. **`complete_binary_member` の候補ループが最初に見つかった JVM 名で
+   `return` していた**。`Const` / `Const$` のように**クラスとその
+   コンパニオンの両方**が存在するとき、クラスの方が先にヒットして
+   `return` し、コンパニオン（`apply` を持つ方）が永遠にインストール
+   されません。`Box.Const(5)` は `value apply is not a member of Const`
+   になっていました。全候補を試すように変更。
+2. **総称シグネチャの `scala/runtime/Nothing$` を `Type::Nothing` に
+   していなかった**。`case object Canceled extends Outcome[Nothing]`
+   のクラスファイル `Signature` は `Nothing` を書けず
+   `Lscala/runtime/Nothing$;`（実行時のプレースホルダクラス）と書きます。
+   `jtype_to_type`（`classpath.rs`）はこれを普通のクラス扱いしていたので、
+   `Outcome[Nothing] <: Outcome[Int]` の判定が
+   `is_sub_type(Nothing$_stub, Int)` になり **共変** `Outcome[+A]` でも
+   落ちていました（`type mismatch; found: Canceled$ required: Outcome[Int]`）。
+   `parse_field_ty`（ディスクリプタ用）は既にこの変換をしていたので、
+   総称シグネチャ側にも同じマッピングを足しました。
+3. **jar から読んだクラスの型パラメータに分散（variance）が付かなかった**。
+   JVM の総称シグネチャは分散を書けません（コンパイル時だけの概念）。
+   分散は **pickle** にしかないのに、`adopt_tparam_kinds`
+   （`pickle_supply.rs`）は arity だけ引き継いで分散を捨てていました。
+   2 の Nothing 修正だけでは `Outcome[+A]` が実は不変扱いのままで
+   同じ症状が残るので、`TParam::variance` から `Flags::COVARIANT` /
+   `CONTRAVARIANT` を立てるようにしました。
+4. **パッケージオブジェクトの `val` はクラスファイル上ただの 0 引数
+   メソッドで、`def` と見分きが付かない**。`Resource.ExitCase` の
+   ような `p.T` 型（SLS 3.2.3、`p` は stable path が必須）は
+   `Resource` が安定していないと「stable identifier required」に
+   なります。安定性は **pickle の `pflags::STABLE`** にしかないのに、
+   `adopt_binary_class` は pickle の `MemberKind::Val` を丸ごと無視
+   （`Def` だけ処理）していました。`Val` も処理対象に加え、
+   `pflags::STABLE` を立っている宣言に `Flags::ACCESSOR` を付け、
+   `ident_is_stable` / `member_is_stable` がそれを stable の根拠として
+   読むようにしました。加えて `import_named`（`import p.{Resource}` の
+   処理そのもの）が pickle 適用より先にクラスファイル由来の生シンボルを
+   scope に固定してしまう順序の穴もあり、import 処理の中で先に
+   `adopt_binary_class` を呼ぶようにして塞ぎました。
+   `type_select_is_term_prefix` も、型エイリアスと val が同じ名前を
+   共有するとき（`type Box[A] = …; val Box = …`）型側があるだけで
+   term 読みを**拒否**していたので、`p.T` の `p` は常に term として
+   読む（SLS の規定どおり）よう直しました。`new Outer.Inner()`
+   （オブジェクトのみでコンパニオンの val が無いケース）の既存の
+   優先順位（`qualified_type_owners`）は壊さないよう、
+   `SymKind::Module` はこの判定に含めていません。
+
+`project_from_prefix`（`p.T` の型解決）にも `complete_binary_member`
+フォールバックを足しましたが、`type_select` 側の同種のフォールバックは
+**`Type::ModuleRef` のときだけ**に絞りました。`Type::Class`（例:
+`Type::String`）に対して無条件に `complete_binary_member` を呼ぶと、
+その `owner.kind == Class` 分岐が `ensure_java_loaded` を呼んで
+`java.lang.String` の**生クラスファイル全体**を強制的にロードしてしまい、
+JDK 11 の `lines(): Stream[String]` が 2.13 の非推奨
+`StringOps.lines: Iterator[String]` を隠してしまいました
+（`e2e.rs` の `scala_library_dual_run_string_ops4` が退行として捕まえた
+ので、そこで絞り込みに気付きました）。
+
+**残っている隣接した穴**: slick の実ソース（`BasicBackend.scala` の
+`closeStreamIteratorAndRelease`）で `Resource.ExitCase` 型注釈が
+**1 件**だけまだ落ちます。自作の再現（`tail1.rs`、2 段のネスト・
+パッケージオブジェクト経由・共変トレイト付き）は real scalac も
+通し、私たちの binary も通ります。単一ファイルにも数ファイルの
+組み合わせにも縮小できず、slick の 184 ファイル全体でしか再現しません。
+これ以上の追跡はこのスライスの範囲外としました。
+
+#### 2. `value getOrElse is not a member of Product`（**直せていません**）
+
+`slick/jdbc/PositionedResult.scala` の `nextBlobOption() getOrElse(…)`
+（`{ … val rr = if (rs.wasNull) None else Some(r); …; rr }` という
+戻り型注釈の無いブロック）が原因です。**16 個ある同型の `nextXxxOption()`
+のうち `Blob` / `Bytes`（`Array[Byte]`）/ `Clob` / `Object` の 4 個だけ**
+落ち、`Boolean` / `Int` / `String` / `Date` / `BigDecimal` など残り 12 個は
+通ります。
+
+`abstract class … extends Closeable`、`import PositionedResult.
+SqlNullException`（コンパニオンの前方参照）、`java.sql.{Blob, Clob,
+ResultSet}` の実クラスファイルまで再現した縮小版を何本も作り、
+すべて real scalac でも私たちの binary でも**通ってしまいました**
+（`None` / `Some(r)` の lub、`Blob` / `Clob` の on-demand ロード、
+`getObject` の総称オーバーロードなど疑った箇所はどれも単独では
+再現しません）。SlickException / GetResult / GlobalConfig など
+slick 内部の依存を数ファイル足して近づけても、今度は無関係な
+未解決エラーのカスケードで埋もれてしまい、`Blob`/`Bytes`/`Clob`/
+`Object` だけが特別扱いされる理由には辿り着けませんでした。
+slick の 184 ファイル全体という状態に依存するらしい点は 1 の残件と
+同じ形ですが、こちらは真因の見当すら付いていません。
+**推測でスタブ的な回避はしていません**。次に見る人への手がかりとして
+`tail1.rs` の doc comment に縮小の試行錯誤を記録しています。
+
+#### 3. `not found: value fromInt`
+
+`import integral._`（`Integral[T]` の implicit）の後で裸の `zero` /
+`one` / `fromInt(n)` を呼ぶ形です。`Numeric[T]` はコンパイル済み
+scala-library の**pickle** にしかメンバが無い（クラスファイル自体には
+対応する入れ子クラスが無い）標準ライブラリの trait で、
+`expose_unqualified`（`check.rs`）のワイルドカードインポート
+フォールバックは `complete_binary_member` だけを呼んでいました。
+1 で見たとおり、これは「入れ子クラスファイルを探す」ためのもので、
+`fromInt` のような**ただのメソッド**は最初から見つけようがありません。
+`import_wildcard`（インポート時の即時コピー）は「その時点で既に
+`owner.members` にあるもの」しか拾わないので、まだ誰も触れていない
+`fromInt` はコピーに乗らず、後で参照されたときの遅延フォールバックに
+すべてがかかっていました。
+
+直った理由が奇妙なのは、`zero` / `one` は再現に成功したことです
+（`crates/cli/tests/tail1.rs::fixtures_t1_wildcard_inherited` で
+`zero` / `one` / `fromInt` を**3 つとも**使う最小再現を作ったところ、
+修正前は**3 つとも**「not found」でした。slick のソースでは
+`zero` / `one` はたまたま同じメソッド本体の中で先に別の形で触れられて
+いたため通っていた、と見られます）。修正は
+`expose_unqualified` のワイルドカードフォールバックに、
+`complete_binary_member` が失敗したときの次善策として
+`PickleSupply::complete`（普通のメンバ選択 `x.zero` が既に使っている
+pickle 経路）を足しただけです。`scala/` で始まる jvm 名は
+`complete_named` の中で無条件に許可されているので、追加の
+adopt は要りません。
+
+#### 触らなかった領域
+
+`agent/mismatch9`（`type mismatch` 一般）と `agent/quasi`
+（quasiquote / マクロ）には触れていません。
+
+#### fixture
+
+`crates/cli/tests/tail1.rs`:
+
+- `a_nested_member_through_a_package_object_val`: 実 scalac で
+  `t1lib.Box` / `t1lib.Outcome`（コンパニオンの入れ子 `Const`、
+  `Outcome[+A]` を継承する `case object Canceled extends Outcome[Nothing]`）
+  を jar に固め、`t1lib.alias`（`type` + `val` を同名で持つ
+  パッケージオブジェクト）経由でしか触らないユーザーコードをコンパイル・
+  実行して `java -Xverify:all` を通す。`bogus` メンバが無いことを
+  拒否する異常系も見る。
+- `real_scalac_accepts_the_same_program`: 同じ 3 ファイルを real scalac
+  だけでコンパイル・実行し、同じ標準出力になることを確認する
+  （fixture が「私たちのコンパイラの癖」ではなく正しい Scala だという裏付け）。
+- `fixtures_t1_wildcard_inherited` / `real_scalac_accepts_
+  t1_wildcard_inherited`: `tests/fixtures/t1_wildcard_inherited.scala`
+  （`import integral._` の後で `zero` / `one` / `fromInt` を使う
+  ループ）を `--scala-library` と real scalac の両方でコンパイル・実行し、
+  `tests/fixtures/expected/t1_wildcard_inherited.txt` と一致することを見る。
 
 ## ライセンス
 

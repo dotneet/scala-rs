@@ -4890,6 +4890,53 @@ impl Typer {
                 if let Some(po) = self.package_object_of(owner, span) {
                     self.complete_binary_member(po, from, span);
                     found = self.st.lookup_member(po, from);
+                    // `complete_binary_member` only ever looks for a *nested
+                    // classfile* named after `from` (a companion, an inner
+                    // class); an ordinary `val`/`def` member of a package
+                    // object is not one -- it is a method entry in `po`'s own
+                    // class file, which a plain classfile read already
+                    // installed with no way to tell a val's accessor from a
+                    // real `def` (see `ident_is_stable`). Only the pickle
+                    // knows. `adopt_binary_class` (full member install) is
+                    // what nsc's own "adopting the whole companion costs
+                    // minutes" comment nearby warns about, so it is not run
+                    // unconditionally on every import -- `import scala.
+                    // collection.immutable.{ListMap => LM}` from
+                    // `imports_jar.scala` alone took over 90s once it was.
+                    // `"scala/"`-prefixed classes never need it:
+                    // `complete_named` bypasses the adoption gate for them
+                    // already (`pickle_supply.rs`). Only a genuinely
+                    // non-`"scala/"` package object -- `cats.effect.package`
+                    // re-exporting `Resource` is the motivating case -- pays
+                    // for full adoption, and only once its targeted, cheap
+                    // completion below still finds nothing worth entering.
+                    let po_jvm = self.st.get(po).jvm_name.clone();
+                    if !po_jvm.starts_with("scala/") {
+                        let stale_or_missing = found.is_empty()
+                            || found.iter().all(|&s| {
+                                self.st.get(s).kind == SymKind::Method
+                                    && !self.st.get(s).flags.contains(Flags::ACCESSOR)
+                            });
+                        if stale_or_missing {
+                            let upgraded =
+                                self.pickle
+                                    .complete(&mut self.st, &mut self.binary, po, from);
+                            if !upgraded.is_empty() {
+                                found = upgraded;
+                            } else {
+                                // The targeted lookup itself declines
+                                // (`complete_named`'s gate: a non-`"scala/"`
+                                // class needs `self.adopted` set before it
+                                // will read anything from its pickle at
+                                // all) -- pay for full adoption only now,
+                                // once memoized per class by `self.adopted`.
+                                self.pickle
+                                    .adopt_binary_class(&mut self.st, &mut self.binary, po);
+                                self.complete_binary_member(po, from, span);
+                                found = self.st.lookup_member(po, from);
+                            }
+                        }
+                    }
                 }
             }
             for m in found {
@@ -5917,6 +5964,24 @@ impl Typer {
                     ) {
                         found = vec![id];
                     }
+                }
+                if found.is_empty() {
+                    // `complete_binary_member` only ever looks for a *nested
+                    // classfile* named after `name` (a companion, an inner
+                    // class) -- exactly what `import integral._; zero` /
+                    // `fromInt(5)` are not: `zero` and `fromInt` are ordinary
+                    // methods `scala.math.Numeric`'s own pickle declares,
+                    // with no classfile of their own. `import_wildcard`
+                    // (the eager half of a wildcard import) already snapshots
+                    // whatever is on the owner's member list *at import
+                    // time*; a standard-library trait's members are mostly
+                    // read from its pickle on demand, so a name nothing had
+                    // asked for yet was never in that snapshot. The pickle
+                    // path a plain member selection already uses
+                    // (`supply_from_pickle`) is the one this needs too.
+                    found = self
+                        .pickle
+                        .complete(&mut self.st, &mut self.binary, owner, name);
                 }
                 if found.is_empty() {
                     continue;
@@ -7069,9 +7134,39 @@ impl Typer {
             }
         }
         // Package / term prefix: `scala.reflect.ClassTag` and Java `java.lang.Math`.
-        if found.is_empty() && !qual.sym.is_none() {
-            self.complete_binary_member(qual.sym, &name, tree.span);
-            found = self.st.lookup_member(qual.sym, &name);
+        //
+        // A stable value's *type* -- not `qual.sym` -- names the real class or
+        // module it stands for. A package object's `val Box = tinylib.Box`
+        // (cats.effect's `package object effect` does this for `Resource` and
+        // `Outcome`) makes `qual.sym` the *val*, whose `jvm_name` is empty;
+        // `complete_binary_member` then built candidates like `$Const` from
+        // that empty name and never found `Box.Const`, even though `Box.of` --
+        // already loaded onto the module class when the jar's own classfile
+        // was read -- worked fine. `class_sym_of` unwraps `Type::ModuleRef` /
+        // `Type::Class` to the actual class-like symbol regardless of how the
+        // term reached it, so try that first and fall back to `qual.sym` for
+        // package/Java-static prefixes, which carry no `Type` of their own.
+        if found.is_empty() {
+            // Scoped to `Type::ModuleRef` specifically, not every
+            // `class_sym_of` hit: `complete_binary_member` on a *class*
+            // receiver (`Type::Class`, e.g. `Type::String`) calls
+            // `ensure_java_loaded` and pulls in the classfile's own members
+            // -- for `java.lang.String` that is JDK 11's `lines(): Stream
+            // <String>`, which then shadowed 2.13's deprecated `StringOps.
+            // lines: Iterator[String]` and the extension search below never
+            // got a chance to run. A module reference never has that
+            // problem: `complete_binary_member` on a `ModuleClass` owner
+            // only tries nested-class/companion candidates, never eagerly
+            // loads the receiver's own classfile.
+            if let Type::ModuleRef(o) = &recv_ty {
+                let o = *o;
+                self.complete_binary_member(o, &name, tree.span);
+                found = self.st.lookup_member(o, &name);
+            }
+            if found.is_empty() && !qual.sym.is_none() {
+                self.complete_binary_member(qual.sym, &name, tree.span);
+                found = self.st.lookup_member(qual.sym, &name);
+            }
         }
         if found.is_empty() && name == "toString" {
             found = self.st.lookup_member(self.st.any_sym, "toString");
@@ -15059,26 +15154,37 @@ impl Typer {
     }
 
     /// `p.T` where `p` is a term is path-dependent; `java.lang.String` is not.
+    ///
+    /// SLS 3.2.3: the dot in a type `p.T` always evaluates `p` as a term (a
+    /// stable path); `#` is the syntax for a genuine type projection. A
+    /// package object that re-exports a jar's module with both a `type` alias
+    /// and a `val` of the same name -- exactly what `cats.effect`'s package
+    /// object does for `Resource` and `Outcome`, so `import
+    /// cats.effect.Resource` brings in both -- used to make this return
+    /// `false`: a name that resolved to *any* type-like symbol (the alias)
+    /// vetoed the term reading even when a term of the same name also
+    /// existed. `Resource.ExitCase` then went through `project_from_prefix`
+    /// with `Resource` read as the *type* alias's dealiased class (the
+    /// trait), not the module -- so it could never see `ExitCase`, a member
+    /// only the module installs. A term/module denotation always wins the
+    /// dot, regardless of what else shares the name.
     fn type_select_is_term_prefix(&self, t: &Tree) -> bool {
         match &t.kind {
             TreeKind::This { .. } | TreeKind::Super { .. } => true,
             TreeKind::Ident { name } => {
                 let found = self.st.lookup(name);
-                let type_like = found.iter().any(|s| {
-                    matches!(
-                        self.st.get(*s).kind,
-                        SymKind::Class
-                            | SymKind::Module
-                            | SymKind::ModuleClass
-                            | SymKind::Package
-                            | SymKind::TypeParam
-                            | SymKind::TypeMember
-                    )
-                });
-                let term_like = found
+                // Deliberately *not* `SymKind::Module`: `new Outer.Inner()`
+                // must still go through `qualified_type_owners`, whose
+                // `type_owner_rank` already knows to prefer the module over
+                // the class for `p.T` and, unlike this path, disambiguates a
+                // class from its own companion of the same name --
+                // `path_dependent_type` has no such preference and bound
+                // `Outer.Inner` to nothing. Only an actual term (`val`,
+                // parameter, or a `def`-shaped accessor) forces the term
+                // reading.
+                found
                     .iter()
-                    .any(|s| matches!(self.st.get(*s).kind, SymKind::Term | SymKind::Method));
-                term_like && !type_like
+                    .any(|s| matches!(self.st.get(*s).kind, SymKind::Term | SymKind::Method))
             }
             TreeKind::Select { qual, .. } => self.type_select_is_term_prefix(qual),
             _ => false,
@@ -15191,6 +15297,17 @@ impl Typer {
             },
         };
         let mut found = self.st.lookup_member(cls, name);
+        if found.is_empty() {
+            // A jar's nested class or companion is loaded on demand, not
+            // eagerly: `cats.effect.Resource.ExitCase` reaches here as soon
+            // as `type_select_is_term_prefix` reads `Resource` as the term it
+            // is, and nothing has asked the classpath for `ExitCase` yet.
+            // `lookup_qualified_type` (the package/Java-static sibling of
+            // this path) already does this before giving up; a `p.T` through
+            // a *value* prefix needs the same on-demand load.
+            self.complete_binary_member(cls, name, span);
+            found = self.st.lookup_member(cls, name);
+        }
         found.sort_by_key(|s| if self.st.get(*s).owner == cls { 0 } else { 1 });
         for m in found {
             let ty = match self.st.get(m).kind {
@@ -15423,7 +15540,12 @@ impl Typer {
             match sy.kind {
                 SymKind::Module | SymKind::ModuleClass | SymKind::Package => true,
                 SymKind::Term => !sy.flags.contains(Flags::MUTABLE),
-                SymKind::Method => false,
+                // A JVM classfile cannot distinguish a `val`'s accessor from
+                // an ordinary `def` -- both are a bare zero-arg method. A val
+                // read from a pickle (`complete_named`, `pickle_supply.rs`)
+                // is marked `Flags::ACCESSOR` for exactly this check; a
+                // *real* `def` never carries it.
+                SymKind::Method => sy.flags.contains(Flags::ACCESSOR),
                 _ => false,
             }
         })
@@ -15438,6 +15560,7 @@ impl Typer {
                     match sy.kind {
                         SymKind::Module | SymKind::ModuleClass | SymKind::Package => true,
                         SymKind::Term => !sy.flags.contains(Flags::MUTABLE),
+                        SymKind::Method => sy.flags.contains(Flags::ACCESSOR),
                         _ => false,
                     }
                 }),
@@ -15470,7 +15593,12 @@ impl Typer {
             match sy.kind {
                 SymKind::Module | SymKind::ModuleClass | SymKind::Package => true,
                 SymKind::Term => !sy.flags.contains(Flags::MUTABLE),
-                SymKind::Method => false,
+                // A JVM classfile cannot distinguish a `val`'s accessor from
+                // an ordinary `def` -- both are a bare zero-arg method. A val
+                // read from a pickle (`complete_named`, `pickle_supply.rs`)
+                // is marked `Flags::ACCESSOR` for exactly this check; a
+                // *real* `def` never carries it.
+                SymKind::Method => sy.flags.contains(Flags::ACCESSOR),
                 _ => false,
             }
         })
@@ -15496,7 +15624,21 @@ impl Typer {
                 found.into_iter().find_map(|s| {
                     let sy = self.st.get(s);
                     match sy.kind {
-                        SymKind::Term | SymKind::Method => Some(sy.ty.clone()),
+                        // A package object's `val Resource = cats.effect.
+                        // kernel.Resource` compiles to a nullary method (see
+                        // `Flags::ACCESSOR` on `pflags::STABLE` above); its
+                        // stored type is `Type::Method { paramss: [], ret:
+                        // ModuleRef(..) }`, not the `ModuleRef` itself.
+                        // Ordinary expression typing widens that through
+                        // `maybe_auto_apply` on every other path; a bare
+                        // `sy.ty.clone()` here skipped it, so
+                        // `class_sym_of` saw a `Method` it does not handle
+                        // and `Resource.ExitCase` failed with "type ExitCase
+                        // is not a member of Resource$" even once `Resource`
+                        // itself resolved as a stable path.
+                        SymKind::Term | SymKind::Method => {
+                            Some(self.maybe_auto_apply(sy.ty.clone(), &Type::NoType))
+                        }
                         SymKind::Module | SymKind::ModuleClass => Some(self.st.type_of_class(s)),
                         _ => None,
                     }
@@ -15513,7 +15655,9 @@ impl Typer {
                         .find_map(|s| {
                             let sy = self.st.get(s);
                             match sy.kind {
-                                SymKind::Term | SymKind::Method => Some(sy.ty.clone()),
+                                SymKind::Term | SymKind::Method => {
+                                    Some(self.maybe_auto_apply(sy.ty.clone(), &Type::NoType))
+                                }
                                 SymKind::Module | SymKind::ModuleClass => {
                                     Some(self.st.type_of_class(s))
                                 }
@@ -15531,7 +15675,10 @@ impl Typer {
                     let sy = self.st.get(s);
                     match sy.kind {
                         SymKind::Term | SymKind::Method => {
-                            Some(self.st.expand_in_type(&qt, &sy.ty))
+                            Some(self.maybe_auto_apply(
+                                self.st.expand_in_type(&qt, &sy.ty),
+                                &Type::NoType,
+                            ))
                         }
                         SymKind::Module | SymKind::ModuleClass => Some(self.st.type_of_class(s)),
                         _ => None,
@@ -15880,10 +16027,22 @@ impl Typer {
             }
             return;
         }
+        // Try every candidate, not just the first hit: a case class with a
+        // companion (`Const` / `Const$`, or cats-effect's `Errored` /
+        // `Errored$`) is two class files under the same simple name, and
+        // stopping at the class alone left the module -- the one term
+        // position actually wants, and the only one with `apply`/`unapply`
+        // -- never installed. `Const(5)` then read as "value apply is not a
+        // member of Const" instead of finding the companion's constructor
+        // sugar.
+        let mut any = false;
         for internal in self.binary_member_candidates(owner, name) {
             if self.load_binary_into(&internal, owner, span, true) {
-                return;
+                any = true;
             }
+        }
+        if any {
+            return;
         }
         if self.st.get(owner).kind == SymKind::Package {
             // `<root>` is allocated with jvm_name `scala/runtime` (prelude). A

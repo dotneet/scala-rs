@@ -1308,6 +1308,24 @@ fn jtype_to_type(
                     return Type::String;
                 }
             }
+            // A generic signature cannot write the bottom types themselves,
+            // so scalac stands in with the synthetic runtime placeholder
+            // classes: `case object Canceled extends Outcome[Nothing]`'s own
+            // class Signature reads `Outcome<Lscala/runtime/Nothing$;>`.
+            // `parse_field_ty` (descriptor parsing, no generics) already
+            // makes this substitution; a generic-signature parent left it as
+            // an ordinary class stub named `Nothing$`, so `Outcome[Nothing]`
+            // was not recognised as a subtype of `Outcome[Int]` -- the
+            // covariance check compared `Nothing$` against `Int` and failed,
+            // surfacing as "type mismatch; found: Canceled$ required:
+            // Outcome[Int]" for every case object nested in a companion whose
+            // trait is parameterized.
+            if jvm == "scala/runtime/Nothing$" {
+                return Type::Nothing;
+            }
+            if jvm == "scala/runtime/Null$" {
+                return Type::Null;
+            }
             let sym = find_or_stub_java_class(st, jvm);
             let as_ = args.iter().map(|a| jtype_to_type(st, a, env)).collect();
             Type::Class { sym, args: as_ }
