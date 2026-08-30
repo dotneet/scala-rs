@@ -1016,7 +1016,15 @@ fn erases_to_boxed_unit(ty: &Type) -> bool {
 
 fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
     match ty {
-        Type::Unit | Type::NoType | Type::Nothing => "V".into(),
+        Type::Unit | Type::NoType => "V".into(),
+        // `Unit` is `V` only as a method *result* (see `BOXED_UNIT` above);
+        // `Nothing` gets no such treatment from nsc even there -- `def die():
+        // Nothing = throw ...` still compiles to `()Lscala/runtime/Nothing$;`
+        // (confirmed with `javap -c` on real scalac output), never `()V`. A
+        // caller invoking such a method needs that descriptor to know a real
+        // reference lands on the stack, for `gen_expr`'s `athrow`-append
+        // (see its doc comment) to consume.
+        Type::Nothing => "Lscala/runtime/Nothing$;".into(),
         Type::Boolean => "Z".into(),
         Type::Byte => "B".into(),
         Type::Short => "S".into(),
@@ -6171,6 +6179,22 @@ fn emit_pending_return(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx) {
 }
 
 fn emit_return(asm: &mut Assembler, ty: &Type) {
+    if matches!(ty, Type::Nothing) {
+        // `jvm_sort(Nothing) == Void`, right for a value slot's *stack
+        // effect* (an expression of type `Nothing` never actually leaves a
+        // value behind for the rest of codegen to track), but `jvm_desc`
+        // declares such a method's result `Lscala/runtime/Nothing$;` -- a
+        // reference, never `V` -- matching nsc's own erasure. A live return
+        // through this type (a static forwarder to a module method declared
+        // `Nothing`, a by-name lambda whose SAM result is `Nothing`) really
+        // does have that reference sitting on the stack and has to hand it
+        // back with `areturn`, exactly what `javap -c` shows nsc emitting
+        // there (confirmed on `T1.die()` 's static forwarder). Everywhere
+        // else this call is dead code padding after `gen_expr`'s own
+        // `athrow`, where the opcode choice cannot matter.
+        asm.areturn();
+        return;
+    }
     ret_of_sort(asm, jvm_sort(ty));
 }
 
@@ -6513,7 +6537,42 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
     }
 }
 
+/// nsc: a call whose *declared* return type is `Nothing` can never actually
+/// return a value, but the JVM invoke instruction still leaves a real
+/// `scala/runtime/Nothing$` (or whatever primitive descriptor) reference on
+/// the operand stack -- `Nothing` is `V`-sorted everywhere else in this
+/// backend (`jvm_sort`), so nothing downstream expects that phantom slot.
+/// Left alone it flows into whatever control-flow join follows -- a `match`
+/// arm's `goto`, an `if`'s `goto`, a `try`'s result store, an argument list
+/// -- and disagrees with the type the other edges of that join settled on:
+/// `VerifyError: Inconsistent stackmap frames`.
+///
+/// `javap -c` on real scalac output (`scala.sys.error`, `Predef.???`, a
+/// user `def die(): Nothing = throw ...`) shows it always follows such a
+/// call with `athrow`, in every position -- a `match`/`if` arm, a method
+/// body, an argument (`println(sys.error("x"))` never even emits the
+/// `invokevirtual println`), an ascription. The one exception is a value
+/// already in tail-return position of a method/lambda whose own declared
+/// return type is `Nothing`-shaped: there scalac just falls off the end
+/// with `areturn`, but appending `athrow` there too is equally valid --
+/// `athrow` does not care about the method's declared return descriptor --
+/// so one rule covers both.
+///
+/// `Assembler::athrow` marks the assembler `dead`, and every emitter after
+/// that keeps emitting into bytes `drop_dead`/`finish` later truncate, so
+/// this composes for free with every caller (statement, argument, arm,
+/// tail) without teaching each of them about `Nothing`. Calling it again
+/// when the expression already ended in `athrow`/`areturn`/`goto` (an
+/// explicit `throw`, `???`, `Breaks.break()`, a `return`) is a harmless
+/// no-op for the same reason.
 fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
+    gen_expr_inner(asm, frame, ctx, tree);
+    if matches!(tree.ty, Type::Nothing) {
+        asm.athrow();
+    }
+}
+
+fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
     match &tree.kind {
         TreeKind::Empty => {}
         TreeKind::Literal { lit } => gen_literal(asm, lit),
@@ -6727,7 +6786,8 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
     if matches!(ic, Intrinsic::NotImplemented) {
         if ctx.library_abi {
             emit_predef_nyi(asm);
-            if is_unit_like(&tree.ty) || matches!(tree.ty, Type::Nothing) {
+            // `Nothing` is handled generically by `gen_expr`'s `athrow`-append.
+            if is_unit_like(&tree.ty) {
                 asm.pop();
             }
         } else {
@@ -7133,7 +7193,9 @@ fn gen_select(
                         // Receiver was already pushed; Predef.??? is MODULE$.???().
                         asm.pop();
                         emit_predef_nyi(asm);
-                        if is_unit_like(&tree.ty) || matches!(tree.ty, Type::Nothing) {
+                        // `Nothing` is handled generically by `gen_expr`'s
+                        // `athrow`-append.
+                        if is_unit_like(&tree.ty) {
                             asm.pop();
                         }
                     } else {
@@ -7585,9 +7647,12 @@ fn gen_apply(
     if ctx.library_abi && matches!(ic, Intrinsic::NotImplemented) {
         emit_predef_nyi(asm);
         // `Predef.???` is declared to return `Nothing$` but always throws.
-        // Drop the phantom slot so a Unit/`Nothing` statement (e.g. `try ???`)
-        // does not leave a value under the catch handler.
-        if is_unit_like(&tree.ty) || matches!(tree.ty, Type::Nothing) {
+        // Drop the phantom slot so a `Unit` statement (e.g. `try ???`) does
+        // not leave a value under the catch handler. `Nothing` itself is
+        // handled generically by `gen_expr`'s `athrow`-append, which is what
+        // nsc actually emits here (`javap`: `invokevirtual ???; athrow`) --
+        // popping it too would empty the stack out from under that `athrow`.
+        if is_unit_like(&tree.ty) {
             asm.pop();
         }
         return;
