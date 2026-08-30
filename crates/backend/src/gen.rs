@@ -9071,6 +9071,26 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
         return;
     }
     if ctx.library_abi {
+        // `MapOps.map` / `flatMap` / `collect` *build a map*: they require the
+        // function to return a pair, and 2.13 picks the `IterableOps` overload
+        // of the same name whenever it does not
+        // (`m.map { case (_, v) => v.sum }` is an `Iterable[Int]`). scala-rs
+        // has one symbol for the pair, so the call has to follow the static
+        // result type -- calling `MapOps.map` with an `Int`-returning function
+        // threw `ClassCastException: Integer cannot be cast to Tuple2`.
+        if matches!(name, "map" | "flatMap" | "collect")
+            && desc.ends_with(")Lscala/collection/IterableOps;")
+            && !result_ty.is_some_and(|t| builds_pairs(ctx, t))
+        {
+            let d = if name == "collect" {
+                "(Lscala/PartialFunction;)Ljava/lang/Object;"
+            } else {
+                "(Lscala/Function1;)Ljava/lang/Object;"
+            };
+            asm.invokeinterface("scala/collection/IterableOps", name, d);
+            maybe_unbox_erased_result(asm, ctx, d, result_ty);
+            return;
+        }
         if owner == "scala/reflect/ClassTag$" {
             let desc = match name {
                 "Byte" => "()Lscala/reflect/ManifestFactory$ByteManifest;",
@@ -9662,7 +9682,7 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "+",
                         "(Ljava/lang/Object;)Lscala/collection/immutable/SetOps;",
                     );
-                    asm.checkcast("scala/collection/immutable/Set");
+                    cast_collection_result(asm, ctx, result_ty, "scala/collection/immutable/Set");
                     return;
                 }
                 "-" => {
@@ -9671,7 +9691,7 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "-",
                         "(Ljava/lang/Object;)Lscala/collection/immutable/SetOps;",
                     );
-                    asm.checkcast("scala/collection/immutable/Set");
+                    cast_collection_result(asm, ctx, result_ty, "scala/collection/immutable/Set");
                     return;
                 }
                 "++" => {
@@ -9680,7 +9700,7 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "++",
                         "(Lscala/collection/IterableOnce;)Ljava/lang/Object;",
                     );
-                    asm.checkcast("scala/collection/immutable/Set");
+                    cast_collection_result(asm, ctx, result_ty, "scala/collection/immutable/Set");
                     return;
                 }
                 "size" => {
@@ -9701,7 +9721,7 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "filter",
                         "(Lscala/Function1;)Ljava/lang/Object;",
                     );
-                    asm.checkcast("scala/collection/immutable/Set");
+                    cast_collection_result(asm, ctx, result_ty, "scala/collection/immutable/Set");
                     return;
                 }
                 "map" => {
@@ -9710,7 +9730,7 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "map",
                         "(Lscala/Function1;)Ljava/lang/Object;",
                     );
-                    asm.checkcast("scala/collection/immutable/Set");
+                    cast_collection_result(asm, ctx, result_ty, "scala/collection/immutable/Set");
                     return;
                 }
                 "toList" => {
@@ -10171,7 +10191,7 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "updated",
                         "(Ljava/lang/Object;Ljava/lang/Object;)Lscala/collection/immutable/MapOps;",
                     );
-                    asm.checkcast("scala/collection/immutable/Map");
+                    cast_collection_result(asm, ctx, result_ty, "scala/collection/immutable/Map");
                     return;
                 }
                 "apply" => {
@@ -10208,7 +10228,7 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "$plus",
                         "(Lscala/Tuple2;)Lscala/collection/immutable/MapOps;",
                     );
-                    asm.checkcast("scala/collection/immutable/Map");
+                    cast_collection_result(asm, ctx, result_ty, "scala/collection/immutable/Map");
                     return;
                 }
                 "foreach" => {
@@ -10263,7 +10283,7 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "-",
                         "(Ljava/lang/Object;)Lscala/collection/immutable/MapOps;",
                     );
-                    asm.checkcast("scala/collection/immutable/Map");
+                    cast_collection_result(asm, ctx, result_ty, "scala/collection/immutable/Map");
                     return;
                 }
                 "size" => {
@@ -10284,7 +10304,7 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "filter",
                         "(Lscala/Function1;)Ljava/lang/Object;",
                     );
-                    asm.checkcast("scala/collection/immutable/Map");
+                    cast_collection_result(asm, ctx, result_ty, "scala/collection/immutable/Map");
                     return;
                 }
                 "toList" => {
@@ -10882,6 +10902,17 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                     );
                     return;
                 }
+                // `javap -p -s scala.collection.mutable.MapOps`:
+                // `public default C $minus(K)`.
+                "-" => {
+                    asm.invokeinterface(
+                        "scala/collection/mutable/MapOps",
+                        "$minus",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/MapOps;",
+                    );
+                    cast_collection_result(asm, ctx, result_ty, "scala/collection/mutable/Map");
+                    return;
+                }
                 "contains" => {
                     asm.invokeinterface(
                         "scala/collection/MapOps",
@@ -11385,7 +11416,12 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "reverse",
                         "()Ljava/lang/Object;",
                     );
-                    asm.checkcast("scala/collection/mutable/StringBuilder");
+                    cast_collection_result(
+                        asm,
+                        ctx,
+                        result_ty,
+                        "scala/collection/mutable/StringBuilder",
+                    );
                     return;
                 }
                 _ => {}
@@ -11790,6 +11826,53 @@ fn erased_array_return(desc: &str) -> Option<(String, usize)> {
     let elem = ret.trim_start_matches('[');
     let depth = ret.len() - elem.len();
     (depth > 0 && elem == "Ljava/lang/Object;").then(|| (ret.to_string(), depth))
+}
+
+/// The cast a stdlib collection call's result needs.
+///
+/// These dispatch arms hardcode the descriptor they emit, so they also have to
+/// hardcode the cast that follows. The typer narrows a member declared to
+/// return `C` to the receiver's own collection (`TreeMap - key` is a
+/// `TreeMap`, not a `Map`), so casting to the *declared* class unconditionally
+/// left a `Map` on the stack where a `TreeMap` was wanted -- `VerifyError: Bad
+/// type on operand stack`. Take the typer's own result type whenever it is a
+/// subclass of `fallback`, and `fallback` otherwise.
+fn cast_collection_result(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    result_ty: Option<&Type>,
+    fallback: &str,
+) {
+    if let Some(ty) = result_ty {
+        if let Some(want) = checkcast_internal(ctx.st, ty) {
+            // `internal_conforms` is one-sided: narrow to the typer's own
+            // result only when it is *provably* the declared class or below.
+            if want != "java/lang/Object" && internal_conforms(ctx.st, &want, fallback) {
+                asm.checkcast(&want);
+                return;
+            }
+        }
+    }
+    asm.checkcast(fallback);
+}
+
+/// Does this result type still hold key/value pairs? `MapOps.map` builds a
+/// map and needs the function to return one; `IterableOps.map` is the
+/// overload for everything else. A sorted map's `map` lands here with
+/// `Iterable[(K2, V2)]` — still pairs, still `MapOps.map`.
+fn builds_pairs(ctx: &EmitCtx, ty: &Type) -> bool {
+    if checkcast_internal(ctx.st, ty)
+        .is_some_and(|n| internal_conforms(ctx.st, &n, "scala/collection/Map"))
+    {
+        return true;
+    }
+    let elem = match ty {
+        Type::Class { args, .. } if args.len() == 1 => args[0].clone(),
+        _ => return false,
+    };
+    matches!(&elem, Type::Tuple(ts) if ts.len() == 2)
+        || matches!(&elem, Type::Class { sym, args }
+            if args.len() == 2 && ctx.st.get(*sym).name == "Tuple2")
 }
 
 fn desc_returns_object(desc: &str) -> bool {

@@ -28,6 +28,10 @@ use scala_rs_span::Span;
 use crate::check::Typer;
 use crate::symbol::SymKind;
 
+/// The conversion a view search settled on, the target type with the callee's
+/// undetermined parameters filled in, and those bindings.
+pub(crate) type OpenView = (SymbolId, Type, Vec<(SymbolId, Type)>);
+
 /// Hard cap on nested derivations, on top of the divergence check.
 pub(crate) const MAX_IMPLICIT_DEPTH: usize = 8;
 
@@ -578,12 +582,26 @@ impl Typer {
                 && self.st.is_sub_type(&ret, to)
                 && self.conv_implicits_resolve(id, from);
         }
-        let targs = self.conv_targs(id, from);
-        let param = crate::symbol::subst_tparams_slice(&tps, &targs, &param);
-        let ret = crate::symbol::subst_tparams_slice(&tps, &targs, &ret);
-        self.weak_conforms(from, &param)
-            && self.st.is_sub_type(&ret, to)
+        // Read the argument at the parameter's own class before solving:
+        // `IterableFactory.toFactory(factory: IterableFactory[CC])` given
+        // `ArrayBuffer.type` has to see `IterableFactory[ArrayBuffer]`, or `CC`
+        // falls through to `AnyRef`.
+        let targs = self.conv_targs(id, &self.align_to_param_class(&param, from));
+        let param_s = crate::symbol::subst_tparams_slice(&tps, &targs, &param);
+        let ret_s = crate::symbol::subst_tparams_slice(&tps, &targs, &ret);
+        if self.weak_conforms(from, &param_s)
+            && self.st.is_sub_type(&ret_s, to)
             && self.conv_implicits_resolve(id, from)
+        {
+            return true;
+        }
+        // A parameter the *argument* cannot pin down is the wanted type's to
+        // fix: `toFactory[A, CC](f: IterableFactory[CC]): Factory[A, CC[A]]`
+        // gets `CC` from `ArrayBuffer.type` and `A` only from the wanted
+        // `Factory[Int, ArrayBuffer[Int]]`. `conv_targs` fills such a parameter
+        // with `AnyRef`, and `Factory[AnyRef, ArrayBuffer[AnyRef]]` conforms to
+        // nothing.
+        self.open_conversion_fit(id, from, to, &[]).is_some()
     }
 
     /// Call-site type parameters solved from the *view* that will fill a
@@ -734,6 +752,119 @@ impl Typer {
         comps.sort_by_key(|id| id.0);
         comps.dedup();
         self.most_specific(comps)
+    }
+
+    /// A view from `from` to `to` where `to` still mentions the *callee's*
+    /// undetermined type parameters, and the view is what settles them.
+    ///
+    /// nsc runs `inferView` with `Context.undetparams` in play. `xs.to(Vector)`
+    /// is `to[C1](f: Factory[A, C1]): C1`, and the only thing that can say what
+    /// `C1` is is the conversion itself —
+    /// `IterableFactory.toFactory[A, CC](f: IterableFactory[CC]): Factory[A, CC[A]]`
+    /// gives `C1 = Vector[A]`. Comparing the *declared* result with the wanted
+    /// type, as [`Self::conversion_provides`] does, leaves `C1` unbound and no
+    /// conversion ever applies.
+    ///
+    /// Returns the conversion, the target with those parameters filled in, and
+    /// the bindings. Every one of `open` has to come out solved: a view that
+    /// settles only some of them is no better than none.
+    pub(crate) fn search_conversion_open(
+        &self,
+        from: &Type,
+        to: &Type,
+        open: &[SymbolId],
+    ) -> Option<OpenView> {
+        if open.is_empty() || from.is_no_type() || from.is_error() {
+            return None;
+        }
+        let mut cands: Vec<SymbolId> = self.implicits_in_scope();
+        cands.extend(self.companion_implicits(to));
+        cands.extend(self.companion_implicits(from));
+        cands.sort_by_key(|id| id.0);
+        cands.dedup();
+        let mut hits: Vec<OpenView> = Vec::new();
+        for id in cands {
+            if let Some((solved, binds)) = self.open_conversion_fit(id, from, to, open) {
+                hits.push((id, solved, binds));
+            }
+        }
+        // Distinct conversions that agree on the answer are not a conflict;
+        // ones that disagree are, and nsc would report them ambiguous. Stay
+        // out of the way there and let the ordinary diagnostic stand.
+        let first = hits.first()?.clone();
+        hits.iter().all(|(_, t, _)| *t == first.1).then_some(first)
+    }
+
+    fn open_conversion_fit(
+        &self,
+        id: SymbolId,
+        from: &Type,
+        to: &Type,
+        open: &[SymbolId],
+    ) -> Option<(Type, Vec<(SymbolId, Type)>)> {
+        let s = self.st.get(id);
+        if !s.flags.contains(Flags::IMPLICIT) {
+            return None;
+        }
+        let (param, ret) = match &s.ty {
+            Type::Method { paramss, ret } => {
+                let ps = paramss.first().cloned().unwrap_or_default();
+                if ps.len() != 1 {
+                    return None;
+                }
+                (ps[0].clone(), (**ret).clone())
+            }
+            Type::Function { params, ret } if params.len() == 1 => {
+                (params[0].clone(), (**ret).clone())
+            }
+            _ => return None,
+        };
+        let tps = s.tparams.clone();
+        // What the *argument* pins down first (`CC = Vector` from
+        // `IterableFactory[CC]`), the way the member-directed search does it.
+        // The argument is matched at the parameter's own class:
+        // `IterableFactory[CC]` against a companion whose *base type* there is
+        // `IterableFactory[ArrayBuffer]`, not against `ArrayBuffer.type`.
+        let from_at_param = self.align_to_param_class(&param, from);
+        let solved_from_arg: Vec<Option<Type>> = tps
+            .iter()
+            .map(|tp| unify_conv_tparam(*tp, &param, &from_at_param))
+            .collect();
+        let (known_ids, known_tys): (Vec<SymbolId>, Vec<Type>) = tps
+            .iter()
+            .zip(solved_from_arg.iter())
+            .filter_map(|(tp, t)| t.clone().map(|t| (*tp, t)))
+            .unzip();
+        let param_k = crate::symbol::subst_tparams_slice(&known_ids, &known_tys, &param);
+        if !self.weak_conforms(from, &param_k) {
+            return None;
+        }
+        let ret_k = crate::symbol::subst_tparams_slice(&known_ids, &known_tys, &ret);
+        // What is left of the conversion's own parameters, plus the callee's,
+        // are all unknowns of one two-sided unification.
+        let rest: Vec<SymbolId> = tps
+            .iter()
+            .zip(solved_from_arg.iter())
+            .filter_map(|(tp, t)| t.is_none().then_some(*tp))
+            .collect();
+        let mut u = Unify::new(self, rest.iter().copied().chain(open.iter().copied()));
+        if !u.unify(&ret_k, to) {
+            return None;
+        }
+        let mut binds = Vec::new();
+        for o in open {
+            binds.push((*o, fold_applied(&u.solved(*o)?)));
+        }
+        let ids: Vec<SymbolId> = binds.iter().map(|(i, _)| *i).collect();
+        let tys: Vec<Type> = binds.iter().map(|(_, t)| t.clone()).collect();
+        let solved_to = fold_applied(&crate::symbol::subst_tparams_slice(&ids, &tys, to));
+        if crate::check::mentions_any_tparam(&solved_to) {
+            return None;
+        }
+        if !self.conv_implicits_resolve(id, from) {
+            return None;
+        }
+        Some((solved_to, binds))
     }
 
     fn is_as_specific_type(&self, a: SymbolId, b: SymbolId) -> bool {
@@ -1544,6 +1675,24 @@ fn mentions_unknown(ty: &Type, unknowns: &std::collections::HashSet<u32>) -> boo
             params.iter().any(|t| mentions_unknown(t, unknowns)) || mentions_unknown(ret, unknowns)
         }
         _ => false,
+    }
+}
+
+/// `CC` solved to `Vector` leaves the result as `Applied { Vector, [Int] }`;
+/// nothing downstream prints or erases that as `Vector[Int]`. Collapse it.
+fn fold_applied(ty: &Type) -> Type {
+    match ty {
+        Type::Applied { ctor, args } => crate::symbol::apply_type_ctor(
+            fold_applied(ctor),
+            args.iter().map(fold_applied).collect(),
+        ),
+        Type::Class { sym, args } => Type::Class {
+            sym: *sym,
+            args: args.iter().map(fold_applied).collect(),
+        },
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(fold_applied).collect()),
+        Type::Array(t) => Type::Array(Box::new(fold_applied(t))),
+        other => other.clone(),
     }
 }
 

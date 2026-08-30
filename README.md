@@ -2885,6 +2885,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 `agent/companionkind` スライス（コンパニオンとクラスが 1 つのシンボルを兼ねていた件）のフィクスチャは接頭辞 `ckind`（`ckind_future` / `ckind_future_bad`）で、同じ理由から `crates/cli/tests/companionkind.rs` に置いています。`ckind_future.scala` は `scala.concurrent.Future`——prelude が持たず、メンバがすべて jar から来るクラス——の**コンパニオンの名前渡しメンバ** `Future.apply` を呼びます。JVM の generic signature は名前渡しを書けないので `Function0[T]` になり、`Future(21)` が `no matching overload for (Function0[T], ExecutionContext)Future[T]` になっていました。`--scala-library` dual-run と **real scalac 2.13.16** との実行結果 diff（`real_scalac_dual_run_ckind_future`）の両方で見ます（`scala.concurrent` は私有ランタイムに無いので `--no-scala-library` では走らせません）。`ckind_future_bad.scala` は、シグネチャが本物になったことで**その implicit 節も本物**になること——`ExecutionContext` がスコープに無ければ scalac と同じく拒む——を固定します。`a_companion_and_its_class_are_separate_symbols` は **実 scalac** で cats を縮めた jar（高階トレイト `Ref[F[_], A]`、そのコンパニオン、`val Ref = tinyeff.Ref` と`type Ref[F[_], A] = tinyeff.Ref[F, A]` を持つパッケージオブジェクト）を作り、`r.update(_ + 1)` の結果型が `F[Unit]`（classfile 由来の素の `F` ではない）になること、コンパニオンの `Ref.const` がトレイト側に紛れ込まずに引けること、そして無い名前 `bogus` はきちんと拒まれることを見ます。
 `agent/ambigmap` スライス（同じ pickle 宣言のコピーが 2 つ入って `ambiguous overload for map` になっていた件）のフィクスチャは接頭辞 `am`（`am_pickledup` / `am_pickledup_bad`）で、同じ理由から `crates/cli/tests/ambigmap.rs` に置いています。`am_pickledup.scala` は **3 つのブロックの順番そのものが再現条件**です: 先に `scala.Seq` のレシーバが `map` を聞き、次に `scala.collection.IndexedSeq` のレシーバが聞き、最後に両方を親に持つ `scala.IndexedSeq` が聞きます。`map` だけでなく `flatMap` / `filter` / `partition` / `foldLeft` も同じ 3 レシーバに通すので、直っているのが「`map` の特別扱い」でないことが分かります。`--scala-library` dual-run と **real scalac 2.13.16** との実行結果 diff（`real_scalac_dual_run_am_pickledup`）の両方で `java -Xverify:all` の下に走らせます（載せ替えたシンボルは呼び先の owner とディスクリプタを変えるので、検証器を通すこと自体が確認です）。私有ランタイムには `scala.collection` が無く pickle も無い（＝束ねるコピーが存在しない）ので、`am_pickledup_without_the_library_is_diagnosed` が `--no-scala-library` で**黙って通さずに診断が出る**ことを固定します。`am_pickledup_bad.scala` は、束ねているのが名前ではなく**宣言**であること——本物のオーバーロード 2 本は 2 本のまま残り、決着が付かなければ scalac と同じく拒む——を固定します。
 
+`agent/buildfrom` スライス（変換メソッドの**結果型**が受け手のコレクションに絞られない件）のフィクスチャは接頭辞 `bf`（`bf_curried` / `bf_coll` / `bf_coll_bad`）で、同じ理由から `crates/cli/tests/buildfrom.rs` に置いています。`bf_curried.scala` は**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走ります（`scala.Function2` が私有ランタイムに無いので単項関数だけで書いてあります）。`bf_coll.scala` は結果型がすべて実物の `scala.collection` クラスなので jar 限定で、出力は **real scalac 2.13.16 の出力そのもの**（`expected/bf_coll.txt`）と一致します。`bf_coll_without_library_is_error` は私有ランタイムに `MapOps` / `Factory` / `TreeMap` が無いことを**黙って通さずに診断する**ことを固定します。`bf_coll_bad.scala` は narrowing が**通してはいけない 3 つ**——ペアを返さないラムダの `Map.map` は `Iterable`、`to(ArrayBuffer)` は `List` ではない、`groupMapReduce` の値型は第 2 節が返すもの——を、scalac と同じ理由で拒むことを固定します。単体寄りのケースは 9 本あり、特に `bf_plus_minus_on_non_collections_is_untouched`（`+` / `-` は全レシーバがこの経路を通るので、算術と文字列結合が無傷であること）と `bf_user_subclass_does_not_rebuild`（`scala.collection` のクラスでなければ組み直さない）が、直しているのが「症状ごとの特別扱い」でないことの担保です。
+
 `agent/hkinfer` スライス（引数の基底型からの型引数推論と、オーバーロードされた呼び先の自動タプル化）のフィクスチャは接頭辞 `hk`（`hk_base` / `hk_base_lib` / `hk_base_bad` / `hk_tuple` / `hk_tuple_lib` / `hk_tuple_bad`）で、同じ理由から `crates/cli/tests/hkinfer.rs` に置いています。`hk_base.scala` と `hk_tuple.scala` は**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走ります。`hk_base_lib.scala`（`Option` / `List`）と `hk_tuple_lib.scala`（`println(1, "a")`）は jar 限定です。異常系は 2 本で、どちらも**両モードで**エラー件数まで固定します: `hk_base_bad` は基底型の型引数が合わないもの、`hk_tuple_bad` はタプル化が通してはいけない 4 つの形（特に逆向きの `g((1, 2))` と、同じ引数個数の候補があるときの `c(1, "x")`）です。詳しくは下の「引数の基底型と自動タプル化」を見てください。
 
 `agent/genrep` スライス（slick が `.fm` テンプレートから生成する 7 本を通すための穴: import を見ないクラス型パラメータ境界、型パラメータ付き `implicit class`、`TupleN extends Product`、継承したオーバーロードの受け手での型、引数リストのタプル化、`Tuple` で始まるだけのクラス名、可変長引数コンストラクタ、ワイルドカード型引数と反変、`package p { … }` の後ろのトップレベル定義）のフィクスチャは接頭辞 `genrep`（`genrep` / `genrep_bound_bad` / `genrep_tuple_bad` / `genrep_product_bad`）で、同じ理由から `crates/cli/tests/genrep.rs` に置いています。`genrep.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 との実行結果 diff（`real_scalac_dual_run_genrep`）でも見ます。異常系は 3 本: `genrep_bound_bad` は namer が黙るようにした境界でも**存在しない型はきちんと診断される**こと、`genrep_tuple_bad` はタプル化が**間違った呼び出しを通さない**こと、`genrep_product_bad` は `--no-scala-library` で `Product` の辺を張らない（私有ランタイムに裏付けが無い）ことを固定します。
@@ -3090,6 +3092,9 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `csyn_ops_bad.scala`（`crates/cli/tests/catsyntax.rs`、異常系） | ラムダに宣言どおりの引数型を与えても、`FlatMap[Bag]` の witness が無い呼び出しは scalac と同じく通らない | （コンパイルエラー） |
 | `am_pickledup.scala`（`crates/cli/tests/ambigmap.rs`、library dual-run・real scalac dual-run） | `agent/ambigmap` スライス: `IterableOps.map` のコピーが `immutable.Seq` と `collection.IndexedSeq` の両方に載り、両方を親に持つ `scala.IndexedSeq` で `ambiguous overload for map` になっていた（`flatMap` / `filter` / `partition` / `foldLeft` も同型） | `2,3,4` `1,1,2,2,3,3` `2,3` `6` `8,10` `4,-4,5,-5` `5` `9` `16,17` `6\|7` `6,600,7,700` `7` `113` `6 / 7` |
 | `am_pickledup_bad.scala`（`crates/cli/tests/ambigmap.rs`、異常系） | 束ねるのは名前ではなく pickle の**宣言**: 本物のオーバーロード 2 本は 2 本のまま残り、決着が付かなければ scalac と同じく拒む | （コンパイルエラー） |
+| `bf_curried.scala`（`crates/cli/tests/buildfrom.rs`、私有ランタイム・library dual-run） | `agent/buildfrom` スライス: 3 つのパラメータリストを持つメソッドで、各節は**その節の宣言型**に対して型を解く（`groupMapReduce` の第 3 節が `Any` になっていた根） | `20` `1!` `yes\|1\|4` `20` |
+| `bf_coll.scala`（`crates/cli/tests/buildfrom.rs`、library dual-run） | `agent/buildfrom` スライス: `Map.map` / `flatMap` / `collect` / `filterNot` / `++` / `take` / `partition` / `groupBy`、`groupMapReduce` / `groupMap`、`TreeMap` の `-` / `+` / `updated`、`Set ++ List`、`IndexedSeq` の `flatMap` / `zip` / `partition` / `groupMap`、`to(ArrayBuffer)` / `to(List)` / `to(Map)`、`implicitly[Factory[…]]`、`mutable.Map - k`。出力は real scalac 2.13.16 のものと一致 | `expected/bf_coll.txt` |
+| `bf_coll_bad.scala`（`crates/cli/tests/buildfrom.rs`、異常系） | narrowing が通してはいけない 3 つ: ペアを返さない `Map.map` は `Iterable`、`to(ArrayBuffer)` は `List` でない、`groupMapReduce` の値型は第 2 節が返すもの。実 scalac も同じ 3 件 | （コンパイルエラー 3 件） |
 | `ckind_future.scala`（`crates/cli/tests/companionkind.rs`、library dual-run・real scalac dual-run） | `agent/companionkind` スライス: prelude が持たない `scala.*` のメンバが classfile からしか来ず、コンパニオンの名前渡し引数（`Future.apply` の `=> T`）が `Function0[T]` になっていた | `21` `20` |
 | `ckind_future_bad.scala`（`crates/cli/tests/companionkind.rs`、異常系） | pickle から読んだシグネチャは implicit 節も本物: `ExecutionContext` が無ければ `Future(21)` は通らない | （コンパイルエラー） |
 | `ctacc.scala`（`crates/cli/tests/ctoraccessor.rs`、私有ランタイム・library dual-run・real scalac dual-run） | `agent/ctoraccessor` スライス: コンストラクタ引数が public アクセサになり親の抽象メンバーを実装する（`case class ConstRep[T](value: T) extends Rep[T]`、`case class NumRep(n: Int)`、`()Object` へのブリッジが要る `IntBox` / `StringBox`、`class Person(val name: String, …)`、`class Cell(var c: Int)` の getter/setter、第 2 引数リストがアクセサにならない `Multi`） | `42` `hi` `7` `5` `tag` `bob` `3` `11` `1` `x` `42` |
@@ -4256,6 +4261,148 @@ java.lang.ClassFormatError: Method "f" in class Main has illegal signature
 1 つも出していない（`classes=0`）ので、バックエンドだけを直したこのスライスでは
 数字が動かないのが正しい姿です。動かしたのは**出したコードが JVM にロード
 できるか**であって、通る本数ではありません。
+### コレクションの変換メソッドの結果型（`BuildFrom`、`agent/buildfrom`）
+
+2.13 のコレクションは `map` などの結果型を `BuildFrom` / `IterableFactory` /
+`MapFactory` と `CC[_]` で決めます。scala-rs はこれが効いておらず、結果が
+上位のコレクションに落ちていました。
+
+```scala
+val m: Map[String, List[Int]] = Map("x" -> List(1,2))
+m.map { case (d, g) => d -> g.sum }   // scalac: Map(x -> 3)
+// scala-rs: found: Iterable[Tuple2[String, Int]] required: Map[String, Int]
+```
+
+主要コレクション × 主要メソッドの表を作り（`List` / `Vector` / `Seq` /
+`IndexedSeq` / `Set` / `Map` / `SortedMap` / `TreeMap` / `TreeSet` /
+`ArrayBuffer` / `ListBuffer` / `LazyList` / `Array` / `String` × `map` /
+`flatMap` / `collect` / `filter` / `filterNot` / `++` / `zip` / `groupBy` /
+`groupMap` / `groupMapReduce` / `partition` / `to` / `sorted` / `reverse` /
+`distinct` / `take` / `drop` / `updated` / `-` / `+`、308 通り）、実 scalac
+2.13.16 と突き合わせたところ **99 件**が食い違っていました。原因は 5 つです。
+
+1. **カリー化された呼び出しが、どの節も宣言の「第 1 節」に対して型を解いて
+   いた**。`Typer::instantiate_from_call` は `self.st.get(sym).ty` の
+   `paramss.first()` を無条件に読んでいたので、
+   `def f[K, B](k: A => K)(g: A => B)(r: (B, B) => B)` は `K` を 2 回解いて
+   `B` を一度も解きませんでした。`groupMapReduce(key)(f)(reduce)` の
+   `reduce` が `(Any, Any) => Any` になり、`_ + _` が
+   `no matching overload for (String)String with arguments (Any)` として
+   **無関係な行のエラーに見えていた**のはこれです。消費済みの節数
+   （`s_paramss.len() - paramss_ids.len()`）を渡して、その節の宣言型に
+   対して解きます。
+
+2. **`BuildFrom` そのもの**。`Typer::rebuild_from_receiver` を 1 つ置き、
+   宣言された結果型 `D[…]` を受け手の根クラス `R` で組み直します。`R` が
+   `D` の真の部分クラスで、かつ `scala.collection` のクラスであるときだけ
+   です（`maps_to_own_class`）。`R` と `D` の型引数の本数が同じならそのまま
+   差し替え、`R` が 2 つ取り `D` が 1 つのペアを渡しているなら
+   ペアをほどきます——これが `javap -p -s scala.collection.MapOps` の
+   `public default <K2, V2> CC map(Function1<Tuple2<K, V>, Tuple2<K2, V2>>)`
+   と `IterableOps` の `<B> CC map(Function1<A, B>)` の違いそのものです。
+   ペアを返さないラムダは `Iterable[B]` のままで、nsc もそう推論します。
+   `partition` は `(C, C)`、`groupBy` / `groupMap` は `Map[K, C]` なので、
+   結果の**内側**も組み直します（`rebuild_inside`）。カリー化された
+   `groupMap(k)(f)` はレシーバが `Select` の向こうにあるので
+   `curried_receiver_ty` で辿ります。
+
+3. **`erases_to_object` のゲートを外した**。`filter` / `take` / `++` …の
+   narrowing は「ディスクリプタが `Object` を返すときだけ」に絞られて
+   いました。`TreeMap - key` は
+   `(Object)Lscala/collection/immutable/Map;` を返すので対象外で、README
+   にも「Apply の結果型が erasure を生き延びる必要がある」と書いてありました。
+   `maybe_unbox_erased_result` は既に**宣言より狭い結果型には checkcast を
+   出す**ようになっていたので、ゲートは古くなっていました。外したうえで、
+   ディスクリプタを直書きしている stdlib ディスパッチ
+   （`is_stdlib_map` / `is_stdlib_set` の `+` / `-` / `++` / `filter` /
+   `map` / `updated`）が固定の `checkcast` を出していたところを
+   `cast_collection_result` に置き換え、typer が決めた型が宣言クラスの
+   部分クラスならそちらへキャストします。これをやらないと
+   `s.copy(waiting = s.waiting - key)` が
+   `VerifyError: Bad type on operand stack` になります。
+   `-` / `+` / `--` / `removed` / `incl` / `excl` / `concat` を
+   `returns_receiver_collection` に足しました（`1 + 2` や `"a" + b` も
+   この経路を通りますが、受け手が `scala.collection` のクラスでなければ
+   組み直さないので無傷です）。
+
+4. **`Map.map` の**オーバーロード**をコード生成でも選ぶ**。`MapOps.map` は
+   *マップを作る*ので関数がペアを返す必要があり、2.13 はそうでなければ
+   `IterableOps.map` を選びます。scala-rs はペア側のシンボルを 1 つしか
+   持たないので、結果型が対（あるいはマップ）でなければ
+   `IterableOps.map:(Lscala/Function1;)Ljava/lang/Object;` を呼びます。
+   これが無いと `m.map { case (_, v) => v }` が
+   `ClassCastException: Integer cannot be cast to Tuple2` で落ちます。
+
+5. **`xs.to(ArrayBuffer)` の `Factory`**（`agent/ambigmap` の残件）。
+   `to[C1](factory: Factory[A, C1]): C1` の引数はコンパニオン
+   *オブジェクト*で、`Factory` ではありません。橋渡しは
+   `object IterableFactory { implicit def toFactory[A, CC[_]](factory:
+   IterableFactory[CC]): Factory[A, CC[A]] }` という **view** で、必要な
+   ものが 3 つありました。
+   - コンパニオンに `IterableFactory[CC]` / `MapFactory[CC]` の親辺
+     （`prelude_buildfrom.rs`）。これは**適合のためだけの辺**なので、
+     factory トレイト側のメンバは落とします——class file 由来の
+     `apply` / `empty` はトレイト自身の抽象 `CC` を返すので、継承すると
+     `mutable.ArrayBuffer[Int]()` が `ArrayBuffer[A]` になってしまいます。
+   - `toFactory` を prelude で宣言し直す。Java の generic signature は
+     `CC[A]` を書けないので class file 側は `<A, CC> Factory<A, CC>` で、
+     `C1 = ArrayBuffer`（素の型構成子）と解かれます。`implicit` である
+     ことも pickle にしか無く、`PickleSupply::supply_implicit_members` は
+     `scala/` を意図的に飛ばします。
+   - **期待型に未確定の型パラメータが残ったままの view 探索**
+     （`Typer::search_conversion_open` / `apply_open_views`）。nsc の
+     `inferView` は `Context.undetparams` を持ったまま走ります。宣言型
+     同士を比べる従来の `conversion_provides` では `C1` が束縛されず、
+     どの conversion も適用できませんでした。conversion 自身の型引数は
+     まず引数から（引数は**パラメータのクラスで読んでから**——
+     `align_to_param_class`）、残りと呼び出し側の未確定を両側 `Unify` で
+     解きます。`implicitly[Factory[Int, Vector[Int]]]` の側は view では
+     なく**値**なので、コンパニオンの
+     `implicit def iterableFactory[A]: Factory[A, CC[A]]`（javap:
+     `List$.<A> Factory<A, List<A>> iterableFactory()`）を宣言して塞ぎます。
+
+ついでに落ちた小さい穴が 3 つあります。`[B >: A]` の下限を**受け手の
+「素の型引数」で置換していた**（`Map[K, V]` は `IterableOps[A, …]` から
+`++` を継承していて `A = (K, V)` なのに `A := K` になり、
+`Map("a" -> 1) ++ Map("b" -> 2)` が `Iterable[Serializable]` になっていた——
+しかも `IterableOps.++` を別のレシーバで先に完了させたファイルでだけ
+起きるので、**無関係な行のバグに見える**類でした）ので、owner での基底型を
+通して読むようにしました（`owner_args_as_seen_from`、`check_tparam_bounds`
+も同じ）。`immutable.Set.++` は `SetOps.concat(IterableOnce[A])` なのに
+`Set[A]` を取る宣言になっていました。`mutable.Map` に `-` がありません
+でした（javap: `mutable.MapOps.$minus(K)`、
+`(Ljava/lang/Object;)Lscala/collection/mutable/MapOps;`）。
+
+表の食い違いは **99 → 12** になりました。slick は
+`errors 354 → 339`、`files_with_errors` は 65 のまま。
+
+**原因まで分かって直していない**もの:
+
+- **ソート済みマップの `map` / `flatMap` / `collect`**。`TreeMap.map` は
+  `SortedMapOps.map[K2, V2](f)(implicit ord: Ordering[K2]): CC[K2, V2]`
+  （javap: `(Lscala/Function1;Lscala/math/Ordering;)Lscala/collection/Map;`）
+  で、witness を渡さない限り `MapOps.map` に落ちて素の `Map` ができます。
+  静的型だけ `TreeMap` に絞ると代入で `ClassCastException` になるので、
+  `rebuild_widened` はソート済みの受け手では組み直しません。`filter` /
+  `take` / `-` / `+` / `updated` は witness が要らないので今まで通りです。
+- **`TreeSet.map` / `flatMap` / `collect` / `zip`** は
+  `ambiguous overload`。`IterableOps.map[B]` と
+  `SortedSetOps.map[B](f)(implicit ord: Ordering[B])` の 2 本が両方
+  適用可能で、nsc は「宣言しているクラスが部分クラスの方」を選びます。
+  オーバーロードの特定性に owner の部分クラス関係が入っていません。
+- **`SortedMap.keySet` / `TreeMap.keySet`** は `SortedSet` /
+  `TreeSet` ではなく `Set` を返します（`SortedMapOps.keySet` の
+  対応が別に要ります）。
+- **`Array.to(…)` / `Array.groupMapReduce`** は `ArrayOps` に無い
+  メンバで、2.13 では `ArraySeq` 経由です。`"abc".zip(…)` も同様に
+  `WrappedString` 経由なので `IndexedSeq` ではなく `Iterable` になります。
+- **`Map.groupBy(f)` の `K$`** は、ラムダがキー型以外を返すと `Any` に
+  なります（`m.groupBy(_._2 > 1)` が `Map[Any, Map[Any, Int]]`）。
+  main の時点からある推論の穴で、このスライスでは動かしていません。
+- slick で 2 件だけ新しく出た
+  `found: TypedType[Option[Option[Any]]] required: TypedType[Option[Any]]`
+  （`lifted/OptionMapper.scala`）。最小化できておらず、原因は未特定です。
+
 
 ### Remaining
 
