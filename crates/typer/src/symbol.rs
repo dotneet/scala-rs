@@ -2689,6 +2689,79 @@ pub(crate) fn subst_tparams_slice(tps: &[SymbolId], args: &[Type], ty: &Type) ->
     subst_map(ty, tps, args)
 }
 
+/// Replace the abstract type member `m` with `to` throughout `ty`.
+pub(crate) fn subst_type_member(ty: &Type, m: SymbolId, to: &Type) -> Type {
+    let go = |t: &Type| subst_type_member(t, m, to);
+    match ty {
+        Type::TypeMember(id) if *id == m => to.clone(),
+        Type::Class { sym, args } => Type::Class {
+            sym: *sym,
+            args: args.iter().map(go).collect(),
+        },
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(go).collect()),
+        Type::Applied { ctor, args } => apply_type_ctor(go(ctor), args.iter().map(go).collect()),
+        Type::Array(t) => Type::Array(Box::new(go(t))),
+        Type::ByName(t) => Type::ByName(Box::new(go(t))),
+        Type::Repeated(t) => Type::Repeated(Box::new(go(t))),
+        Type::Annotated { tpe, annot } => Type::Annotated {
+            tpe: Box::new(go(tpe)),
+            annot: annot.clone(),
+        },
+        Type::Function { params, ret } => Type::Function {
+            params: params.iter().map(go).collect(),
+            ret: Box::new(go(ret)),
+        },
+        Type::Method { paramss, ret } => Type::Method {
+            paramss: paramss
+                .iter()
+                .map(|ps| ps.iter().map(go).collect())
+                .collect(),
+            ret: Box::new(go(ret)),
+        },
+        _ => ty.clone(),
+    }
+}
+
+/// Every abstract type member `ty` mentions, in order, without duplicates.
+pub(crate) fn collect_type_members(ty: &Type, out: &mut Vec<SymbolId>) {
+    match ty {
+        Type::TypeMember(id) => {
+            if !out.contains(id) {
+                out.push(*id);
+            }
+        }
+        Type::Class { args, .. } | Type::Tuple(args) | Type::Named { args, .. } => {
+            for a in args {
+                collect_type_members(a, out);
+            }
+        }
+        Type::Applied { ctor, args } => {
+            collect_type_members(ctor, out);
+            for a in args {
+                collect_type_members(a, out);
+            }
+        }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            collect_type_members(t, out)
+        }
+        Type::Function { params, ret } => {
+            for p in params {
+                collect_type_members(p, out);
+            }
+            collect_type_members(ret, out);
+        }
+        Type::Method { paramss, ret } => {
+            for ps in paramss {
+                for p in ps {
+                    collect_type_members(p, out);
+                }
+            }
+            collect_type_members(ret, out);
+        }
+        _ => {}
+    }
+}
+
 /// Replace `cls.this.type` with `to` throughout `ty`.
 fn subst_this_type(ty: &Type, cls: SymbolId, to: &Type) -> Type {
     let go = |t: &Type| subst_this_type(t, cls, to);
