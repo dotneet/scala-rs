@@ -163,8 +163,11 @@ fn pkgalias_without_library_is_diagnosed() {
         "expected pkgalias to fail without the library jar"
     );
     let err = diagnostics(&o);
+    // `throw new NoSuchElementException(...)` names the alias in *type*
+    // position. It used to fall through to the term namespace and come out as
+    // "not found: value"; nsc reports the type (see `parentcheck.rs`).
     assert!(
-        err.contains("not found: value NoSuchElementException"),
+        err.contains("not found: type NoSuchElementException"),
         "expected a diagnostic for the unsupplied alias, got {err:?}"
     );
     let _ = fs::remove_dir_all(&out);

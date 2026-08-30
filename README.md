@@ -691,6 +691,14 @@ abstract override def speak: String (defined in trait Loud) is marked `abstract`
 線形化（C3）は `crates/typer/src/lin.rs` に 1 つだけ置き、型検査（`abstract override` の
 接地判定）とコード生成（super アクセサ / mixin フォワーダ）の両方がこれを使います。
 
+#### 解決できない親は診断する
+
+`extends` の頭・`with` の各項・適用された親の型引数・自分型注釈・`new X` / `new X {}` で
+名前が解決できなければ、実 scalac 2.13.16 と同じ文面で拒否します（`not found: type X`、
+修飾付きなら `type X is not a member of package p` など）。以前は**両モードとも無言で**
+`java/lang/Object` を継承した classfile を書いていました。詳しくは
+下の「存在しない親クラス／トレイトを黙って受理していた（`agent/parentcheck`）」節を参照してください。
+
 ### 複数コンパイル単位のケーキパターン（ヘッダパス）
 
 `typecheck_units` は run 全体を 1 つのシンボル表で型検査します。パスは
@@ -3203,6 +3211,22 @@ interface がスーパークラスを継承せず、`T$class` 本体が継承メ
 兄弟メソッドに書いた `implicit class` が見えないこと（`value dbl is not a member of 3`）、
 `lc_ambiguous_bad.scala` は同じ特定度のローカル `implicit def` が 2 つあると scalac と同じ
 `ambiguous implicit` になることを、両方とも両モードで固定します。
+`agent/parentcheck` スライス（解決できない親クラス／トレイト・自分型・`new` を診断する）の
+フィクスチャは接頭辞 `pc`（`pc_parents` / `pc_extends_bad` / `pc_selfnew_bad` /
+`pc_qualified_bad`）で、同じ理由から `crates/cli/tests/parentcheck.rs` に置いています。
+`pc_parents.scala` は引数付きの親・ジェネリックな親・`with` 混入・自分型・匿名クラス・
+修飾付きの親・型エイリアス経由の親を 1 本にまとめた**正常系**で、**私有ランタイムと
+`--scala-library` の両方**で `java -Xverify:all` の下に走らせます（`expected/pc_parents.txt`
+は real scalac 2.13.16 の stdout そのもの）。規則が広すぎればここが落ちる、という受け皿です。
+異常系 3 本は**両モードで**拒否されることに加え、拒否したときに classfile を 1 つも
+書かないことも見ます。文面は実 scalac 2.13.16 のもので、`pc_extends_bad` は
+`extends` の頭・`with` の項・適用された親の頭・その型引数の 4 形（scalac と同じ 6 件）、
+`pc_selfnew_bad` は自分型・`new Missing` / `new Missing {}` / `new Obj`、
+`pc_qualified_bad` は修飾付きの 6 形（`is not a member of object …` /
+`… of package …` / `not found: value …` / `object … is not a member of package …`）です。
+`pc_new_of_a_missing_type_is_not_a_missing_value` は `new Missing` が
+`not found: value`（間違った名前空間）に戻らないことを固定します。
+
 ### オーバーライドの適合検査（`agent/override`）
 
 SLS 5.1.4 "Overriding"（nsc の `RefChecks.checkOverride`）と SLS 5.2.6
@@ -6784,6 +6808,94 @@ fixture 接頭辞は `jn`、テストは `crates/cli/tests/javanest.rs` です�
 - 抽象メンバ検査の緩和は「Java インタフェースが宣言したメンバ」に限っています。
   Scala の trait が deferred 宣言したものは今までどおり `lin[..bi]` だけを見ます
   （`abstract override` の意味があるため）。
+
+### 存在しない親クラス／トレイトを黙って受理していた（`agent/parentcheck`）
+
+```scala
+object Bogus extends NoSuchThingHere   // 両モードとも診断なしで classfile が出ていた
+class C extends AlsoMissing            // 同上
+```
+
+実 scalac 2.13.16 は `not found: type NoSuchThingHere` です。こちらは**一言も言わず**、
+`java/lang/Object` を継承した classfile を書いていました。受け入れすぎの中でも重い部類です。
+
+#### 原因
+
+型位置の名前解決（`resolve_type_name`、`crates/typer/src/check.rs`）は、見つからない名前を
+`Type::Named { name }` という**プレースホルダ**にして返します。これは失敗の印**ではありません** —
+jar から読んだメンバの型で、pickle が単純名しか書いておらず、そのパッケージをまだ読んでいない
+ものも同じ `Type::Named` になります（`crates/typer/src/classpath.rs`）。実行の広い範囲が
+これを意図的に許容しているので、「`Type::Named` を見たら即エラー」にはできません。
+
+`extends` 節ではそのプレースホルダが誰にも点検されないまま `Symbol::parents` に入り、
+codegen が親を解決できないと `java/lang/Object` に落として黙って書き出していました。
+型引数（`extends Seq[MissingArg]`）は `apply_types` が既に見ていましたが、**引数側**は素通り。
+自分型は `illegal inheritance: self-type G does not conform to MissingSelf`（存在しない型に
+「適合しない」と言う）、`new Missing` は `not found: value Missing`（名前空間が違う）、
+`new Missing {}`（匿名クラス）は無言でした。
+
+#### 直し方
+
+`Typer` に `strict_type_names` フラグを 1 本足し、**nsc が解決を終えているとわかっていて、
+かつ黙認が「scalac が拒否するプログラムの受理」になる場所でだけ**立てます。
+
+- テンプレートの親（`extends` の頭・`with` の各項・`extends P(args)` の頭）
+- 自分型注釈
+- `new X` / `new X {}`（匿名クラスは親として同じ経路を通ります）
+
+`tree_to_type` は再帰するので、`extends Seq[Missing]` は scalac と同じく `Missing` を指します。
+ヘッダパス（`parents_pass`）の診断は元から捨てられるので、pickle / jar 由来で**遅れて**
+解決される正当な親は影響を受けません（`expose_unqualified` が囲いパッケージ・`scala._` /
+`java.lang._`・ワイルドカード import・pickle をすべて試したあとの「本当に見つからない」
+だけが対象です）。
+
+修飾付きの親（`p.T`）は、**実際に欠けている区間**を名指しします。
+
+| 書いたもの | 診断（実 scalac 2.13.16 と一致） |
+|---|---|
+| `extends Holder.NoSuch` | `type NoSuch is not a member of object pcq.Holder` |
+| `extends pcq.NoSuchInPkg` | `type NoSuchInPkg is not a member of package pcq` |
+| `extends java.util.NoSuchJU` | `type NoSuchJU is not a member of package java.util` |
+| `extends pkgless.Missing` | `not found: value pkgless`（SLS 3.2.3 — `p.T` の前置は**項**） |
+| `extends scala.collection.nosuchpkg.Foo` | `object nosuchpkg is not a member of package collection` |
+
+nsc は欠けたパッケージ区間の持ち主を**単純名**（`package collection`）で、欠けた型の持ち主を
+**完全名**（`package java.util`）で書きます。そこも合わせています。
+
+`new Obj`（`Obj` は `object`）も `not found: type Obj` です。構築できる**型**が無いので、
+通していたときはどのコンストラクタも答えないモジュールクラスの `new` を出していました。
+
+#### 検証
+
+fixture 接頭辞は `pc`、テストは `crates/cli/tests/parentcheck.rs` です。異常系は
+**両モード**（私有ランタイムと jar）で拒否されること、かつ classfile を 1 つも書かないことを
+見ます。正常系は両モードで `java -Xverify:all` し、実 scalac 2.13.16 の出力と比較します。
+
+| fixture / テスト | 中身 |
+|---|---|
+| `pc_parents.scala`（正常系） | 引数付きの親・ジェネリックな親・`with` 混入・自分型・匿名クラス・修飾付きの親・型エイリアス経由の親。どれも未解決名と同じ経路を通るので、規則が広すぎればここが落ちる |
+| `pc_extends_bad.scala` | `extends` の頭・`with` の項・適用された親の頭・その型引数（6 件、scalac と同じ 6 件） |
+| `pc_selfnew_bad.scala` | 自分型（`A with B` の各項）・`new Missing`・`new Missing {}`・`new Obj` |
+| `pc_qualified_bad.scala` | 上の表の 6 件 |
+| `pc_new_of_a_missing_type_is_not_a_missing_value` | `new Missing` が `not found: value` に戻らないこと |
+
+slick（`tests/slick_measure.sh`）は **`errors=257 files_with_errors=63` のまま変化なし**で、
+新しい誤診断はゼロです。既存の 3 件が `not found: value DumpInfo` / `value Mapper` から
+`not found: type …` に**正しい名前空間**へ変わっただけでした。
+
+#### Remaining
+
+- `new T`（型パラメータ）/ `new A`（抽象型メンバ）は今も無言で通ります。scalac は
+  `class type required but T found` / `class type required but Q7.this.A found` です。
+  これは「未知の名前」ではなく「クラスでない型を構築した」別の検査で、このスライスの
+  対象外にしました。
+- 修飾付きの名前は、`lookup_qualified_type` が失敗したとき**裸の名前**での再解決に
+  フォールバックします（前置を模せない経路のため）。そのため `p.Foo` は、無関係な
+  トップレベルの `Foo` が居ると今でもそれに束縛されます。診断が出るのは両方失敗した
+  ときだけです。
+- 型位置一般（`val x: Missing`、`def f(x: Missing)`、型引数一般）は今回の対象外です。
+  `Type::Named` プレースホルダは jar 由来の正当な型でもあるので、そこを閉じるには
+  「未解決」と「未読込」を型として分ける必要があります。
 
 ## ライセンス
 
