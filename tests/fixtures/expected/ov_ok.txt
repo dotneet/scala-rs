@@ -1,0 +1,15 @@
+narrow
+int 1/str x
+implemented
+derived
+grounded
+final
+public
+2
+given
+bare
+boundless
+42
+7
+talks
+talks2

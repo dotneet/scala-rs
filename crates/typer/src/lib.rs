@@ -10,6 +10,7 @@ mod lazysig;
 mod lin;
 mod localobj;
 mod macros;
+mod override_check;
 mod pickle_supply;
 mod prelude;
 mod prelude_arrconv;
@@ -1340,7 +1341,7 @@ object Main {
     fn implicit_specificity_picks_subclass() {
         ok(r#"
 class A { def tag: String = "A" }
-class B extends A { def tag: String = "B" }
+class B extends A { override def tag: String = "B" }
 object Main {
   implicit val a: A = new A()
   implicit val b: B = new B()
@@ -2026,11 +2027,14 @@ class C { return 1 }
 
     #[test]
     fn java_override_ok_and_wrong_is_diagnosed() {
+        // Java's `@Override` is an annotation, not Scala's `override`
+        // *modifier*: real scalac 2.13.16 rejects this without the keyword
+        // (SLS 5.1.4), and so does `override_check` now.
         ok(r#"
 class A { def tag: String = "a" }
 class B extends A {
   @Override
-  def tag: String = "b"
+  override def tag: String = "b"
 }
 "#);
         let (_, _, diags) = typecheck_str(

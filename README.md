@@ -130,6 +130,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - **`FunctionN.tupled` / `curried`（arity 2〜22）と `scala.Function.untupled`（2〜5）**。`scala/FunctionN` の default メソッドと `scala/Function$` なので **jar リンク時のみ**（`--no-scala-library` では診断する）。あわせて、引数リストを持たないメソッドの結果が関数ならその引数リストは関数のもの（`def g: Int => Int; g(3)`）、カリー化された**関数値**の `f(1)(2)` は 2 回の `Function1.apply`（メソッドのカリー化とは違って平坦化しない）
 - **`scala.collection.mutable.Builder` の `+=` / `++=`**（`Growable` の default メソッド。`this.type` を返すので受け手の型がそのまま返る）。jar リンク時のみ
 - `super` / 修飾付き `this`（`Outer.this`）。trait の `super` は、具象クラスなら `T$class`、スタック可能な `abstract override` なら `T$$super$m` 経由
+- **オーバーライドの適合検査**（SLS 5.1.4 / 5.2.6。`crates/typer/src/override_check.rs`）。結果型の共変性（`incompatible type in overriding`）、パラメータ型の不変性（違えばオーバーロード。`override` を付けていれば `method f overrides nothing.` ＋ scalac と同じ `Note:`）、`override` 修飾子の要否、deferred な再宣言が下の具象実装を打ち消すこと、`final`、可視性を狭められないこと（`weaker access privileges in overriding`）、`val` は `def` を覆えるが逆は不可・具象 `var` は覆えないこと、型パラメータの個数と境界、そして**抽象メンバの実装漏れ**（`class X needs to be abstract.` / `object creation impossible.`）。文面は実 scalac 2.13.16 のもので、オーバーライドされた側は**オーバーライド地点から見た形**でエコーする。prelude と pickle 由来のメンバはフラグ（`FINAL` / `DEFERRED`）を運んでいないので、`final` と実装漏れの検査は**ソースと Java classfile 由来のメンバに限る**（詳細と残件は「オーバーライドの適合検査」節）
 - `sealed` 階層の match 網羅検査（不足は **warning**。`-Xfatal-warnings` でエラー）
 - extractor の `unapply`（`Option` / `Boolean` / `Tuple2`）と `unapplySeq`（`List` / `Seq` / `Vector` / `IndexedSeq` / `Array` と可変長 `_*`）。名前付き extractor 引数（`Point(y = b, x = a)`）
 - `AnyVal` 値クラス（1 引数。生成は underlying へ erase。メソッドは `name$extension`）。`extends Any` した universal trait を mix-in でき、参照が要る位置（`Any` / その trait / 型引数 / 配列要素）では `new C(u)` で box する。パターンマッチ（`case x: C`）と `classOf[C]` / `asInstanceOf[C]` は box したクラスを見る。`equals` / `hashCode` は underlying から合成する（nsc の `equals$extension` / `hashCode$extension` 相当）
@@ -2914,6 +2915,96 @@ interface がスーパークラスを継承せず、`T$class` 本体が継承メ
 異常系 6 本はすべて**両モードで**（`--no-scala-library` と `--scala-library`）診断されることを
 確認しており、文面は real scalac 2.13.16 のものです。`trex_mixin_bad` は名前付きクラスと匿名クラスの
 両方で拒否され、しかも**テンプレート 1 つにつき 1 件**（ヘッダパスとの二重報告なし）であることも見ます。
+### オーバーライドの適合検査（`agent/override`）
+
+SLS 5.1.4 "Overriding"（nsc の `RefChecks.checkOverride`）と SLS 5.2.6
+（"needs to be abstract"）が**丸ごと無く**、次の 2 つが黙って通っていました。
+
+```scala
+trait It[A] { def next(): A }
+val i = new It[Int] { def next(): String = "x" }
+println(i.next())          // 型検査を通り、呼ぶ側の unbox で ClassCastException
+
+abstract class B { def f: Int }
+class D extends B          // 型検査を通り、呼んだ瞬間 AbstractMethodError
+```
+
+規則そのものは `crates/typer/src/override_check.rs` に**シンボル表の純関数**として
+置き（`traitparent.rs` と同じ形）、`check.rs` は `type_class` / `type_module` の
+末尾に呼び出しを 2 行足すだけです。診断文面はすべて**実 scalac 2.13.16 を同じ
+ソースに掛けて採取**しました（`javap` ではありません）。オーバーライドされた側は
+**オーバーライド地点から見た形**でエコーします（`trait It[A]` の `def next(): A` は
+`new It[Int]` の下では `def next(): Int`）。
+
+| 規則 | scalac の文面 | 実装前 | 実装後 |
+| --- | --- | --- | --- |
+| 1. 結果型は共変 | `incompatible type in overriding` | 無 | 有 |
+| 2. パラメータ型は不変（違えばオーバーロード） | `method f overrides nothing.` + `Note: …` | 無 | 有 |
+| 3. `override` 修飾子の要否 | `` `override` modifier required to override concrete member: `` / `method h overrides nothing` | 無 | 有 |
+| 4. deferred な再宣言は下の具象実装を打ち消す | `class C needs to be abstract.` + `No implementation found in a subclass for deferred declaration` | 無 | 有 |
+| 5. `final` はオーバーライド不可 | `cannot override final member:` | 無 | 有（ソース由来のみ。下の残件） |
+| 6. 可視性は広げる方向のみ | `weaker access privileges in overriding` | 無 | 有 |
+| 7. `val` は `def` を覆える／逆は不可、具象 `var` は覆えない | `stable, immutable value required to override:` / `mutable variable cannot be overridden:` | 無 | 有 |
+| 8. 型パラメータの個数と境界 | `overrides nothing.` / `incompatible type in overriding` | 無 | 有 |
+| 9. 抽象メンバの未実装 | `class X needs to be abstract.` / `object creation impossible.` | 無 | 有（ソース／Java classfile 由来のみ。下の残件） |
+
+**受け入れすぎを直すスライスなので、誤診断こそが最大のリスク**です。slick 184 ファイルは
+**346 エラー / 64 ファイル**（着手前）→ **346 / 64**（実装後）で、**診断の多重集合が
+1 件も変わりません**。途中の 502 まで増えた版から潰した誤診断の原因は 5 つで、
+どれも「規則」ではなく**シンボル表の近似**が原因でした。
+
+1. **prelude のメンバのフラグは信用できない**。`prelude::method` は**全メンバに
+   `Flags::FINAL`** を立てるので `override def toString` が「final を覆っている」に
+   なり、逆に「deferred」を表す手段が無いので本当は抽象な `Product.productArity` が
+   具象に見えて、手書きの `Product` すべてに `override` を要求していました。pickle
+   から来たメンバも `Flags::EMPTY` で作られるので同じです。`modifiers_are_known`
+   （`prelude_end` より後 かつ `pickled_origin` が空）でゲートしました。
+2. **信用できない型の比較はしない**。`ClassTag[C[Any]]` と `ClassTag[_]`、
+   `Builder[E, C[E]]`、`BasicBackend.Session` — 型パラメータ・抽象型メンバ・未簡約の
+   適用・ワイルドカードが絡む比較は scala-rs の近似なので、`robust` でない型は
+   「一致する」として黙ります（150 件の誤診断がこれでした）。
+3. **結果型を書いていないメンバは検査しない**。nsc の namer は結果型が無いメンバを
+   **オーバーライド先の結果型を期待型として**型付けるので、推論された結果型が適合し
+   ないことは原理的にありません。こちらの推論は近似で、slick の
+   `override def toString = { … }` は `Any` になります。
+4. **素のコンストラクタ引数はメンバではない**（nsc の
+   `OverridingPairs.Cursor.exclude`）。slick の
+   `class JdbcFunction(name: String) extends FunctionSymbol(name)` は `private[this]`
+   なので何も覆いません。書かれた `private[this] val` の方は scalac 同様に診断します。
+5. **フィールド初期化子のラムダ引数がクラスの member リストに入る**。
+   `protected lazy val pkNames = pkSyms.map { fs => … }` の `fs` は所有者がクラスに
+   なるので、基底クラスの `fs` と衝突して `override` を要求していました。
+   `ctor_fields` に居る `PARAM` だけをメンバとして数えます。
+
+フィクスチャは接頭辞 `ov` で、コンフリクト回避のため `crates/cli/tests/override.rs` に
+置いています。正常系 `ov_ok.scala` は**合法なオーバーライドの形を全部**（共変な結果型、
+オーバーロード、deferred の実装、`final` の兄弟、可視性の拡大、`val` による `def` の
+オーバーライド、`val` コンストラクタ引数による抽象 `val` の実装、素の引数による遮蔽、
+境界の緩和、匿名クラスでの具体化、`def f` と `def f()` の相互一致、`toString` の
+オーバーライド）1 本にまとめ、**私有ランタイムと `--scala-library` の両方**で
+`java -Xverify:all` の下に走らせます。`expected/ov_ok.txt` は **real scalac 2.13.16 の
+出力そのもの**です。異常系 14 本は 1〜9 を 1 本ずつ潰しており、`rejected_once` が
+**両モードで拒否されること**に加えて**エラーが実 scalac と同じくちょうど 1 件**である
+ことを固定します（カスケードも、片方のモードだけの診断も、検査の抜けと同じく不合格です）。
+
+あわせて `agent/anonbridge` の残件をもう 1 つ直しました。**消去で `Object` を返すように
+なったメンバの結果を捨てるとき `pop` が出ない**問題です。`trait Box[A] { def get: A }` の
+`get` は**引数リストを持たない `def`** なので呼び出しが `Apply` を持たない裸の `Select`
+になり、`unit_stat_leaves_ref` の `Apply` の腕に当たりませんでした。直線コードでは
+verifier が黙っているので気づかれず、あとに stackmap frame を要する分岐（`try` / `while`）が
+来た瞬間 `VerifyError: Inconsistent stackmap frames` になります。`ov_unitpop.scala` が
+`Apply` 形・裸の `Select` 形・型パラメータのまま呼ぶ形・`while` の後端の 4 つを
+両モードで実行し、`ov_nilary_unit_select_is_popped` が `javap -c` で `pop` が
+本当に出ていることを見ます。
+
+既存フィクスチャ 2 本（`java_override.scala` / `implicit_specific.scala`）に `override`
+修飾子を足しました。どちらも**実 scalac 2.13.16 がそのままでは拒否する**ソースで
+（`java_override` は Java の `@Override` **アノテーション**が Scala の `override`
+**修飾子**の代わりにならないため、`implicit_specific` は `pick()` が typer で止まって
+RefChecks まで届かないため scalac が言わずに済んでいただけ）、検査が無かったから
+通っていたものです。テストの意図（`@Override` の受理／implicit の specificity）は
+変えていません。
+
 `agent/patbind` スライス（`x @ Pat` の束縛型、`null` パターン、`==` の null）のフィクスチャは接頭辞 `pb`
 （`pb_bind` / `pb_null` / `pb_lit` / `pb_eqnull` / `pb_nullseq` / `pb_null_bad`）で、コンフリクト回避のため
 `crates/cli/tests/patbind.rs` に置いています。どれも**型検査は通って実行時に落ちていた**バグなので、
@@ -3060,6 +3151,8 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `list_collect.scala` | `List.collect` に `PartialFunction`（library dual-run のみ） | `10` `20` |
 | `trait_val.scala` | trait `val` の初期化 | `from trait` |
 | `abstract_override.scala` | `abstract override` の super 連鎖 | `B-A-base` |
+| `ov_ok.scala`（`crates/cli/tests/override.rs`、私有ランタイム・library dual-run） | `agent/override` スライス: 合法なオーバーライドの形すべて（共変な結果型 / オーバーロード / deferred の実装 / `final` の兄弟 / 可視性の拡大 / `val` による `def` のオーバーライド / `val` 引数による抽象 `val` の実装 / 素の引数による遮蔽 / 境界の緩和 / 匿名クラスでの具体化 / `def f` と `def f()` / `toString`） | `narrow` `int 1/str x` `implemented` `derived` `grounded` `final` `public` `2` `given` `bare` `boundless` `42` `7` `talks` `talks2` |
+| `ov_unitpop.scala`（同上） | 消去で `Object` を返すメンバの結果を捨てるときの `pop`（`Apply` 形 / 裸の `Select` 形 / 型パラメータのまま / `while` の後端） | `a` `t1` `b` `t2` `p` `t3` `l` `l` `t4` |
 | `predef_more.scala` | `any2stringadd` / `implicitly` / `identity` / `locally` | `1x` `41` `42` `here` |
 | `sealed_non_exhaustive.scala` | 非網羅 match（warning。実行は覆っている入力だけ） | `3` |
 | `type_member.scala` | 抽象型メンバー `type A`、`type A = Int`、`Bar#A` | `41` `42` |
@@ -4561,29 +4654,33 @@ error: value += is not a member of T
   確認）。jar モードの `List(Q)` に対して `scala.collection.immutable.$colon$colon@…`
   になるので、`MatchError` のメッセージがリストのときだけ 2 モードで違います
   （`cp_err.scala` はそこだけクラス名で比べています）。
-- **`Unit` のメンバが消去後 `Object` を返すとき、捨てた値がスタックに残る**
-  （`agent/anonbridge` で確認。`agent/unitbox` の領域なので手を入れていません）。
+- ~~**`Unit` のメンバが消去後 `Object` を返すとき、捨てた値がスタックに残る**~~
+  （`agent/anonbridge` で確認）→ **`agent/override` で直した**（`ov_unitpop.scala`）。
+  引数リストを持たない `def`（`trait Box[A] { def get: A }` の `get`）は呼び出しが
+  `Apply` を持たない裸の `Select` になるので、`unit_stat_leaves_ref` の `Apply` の
+  腕に当たらず `pop` が出ていませんでした。`Select` / `Ident` の腕を足しています。
+
+  残っているのは**ライブラリのメンバ**の同じ形です。
 
   ```scala
-  val u = new It[Unit] { def next(): Unit = { seen += 1; () } }
-  u.next()   // invokevirtual next()Ljava/lang/Object; -- pop が無い
+  def f(o: Option[Unit]): Unit = {
+    o.get                       // invokevirtual get()Ljava/lang/Object; -- pop が無い
+    try { … } catch { … }       // VerifyError: Inconsistent stackmap frames
+  }
   ```
 
-  `u.next()` は Scala の型が `Unit` なので `pop_if_value` が何も出しませんが、
-  JVM 側の `next()` は `Object` を返します。直線コードのうちは verifier も
-  黙っていて、あとに stackmap frame を要求する分岐（`try` / `match` など）が
-  来た時点で `VerifyError: Inconsistent stackmap frames` になります。**main
-  でも同じ**で、この修正の前後で変わりません。私有ランタイムでは
-  `println(u.next())` も別の形（余分な `aconst_null`）で落ちます。
-  そのため `ab.scala` からは `Unit` を外してあります。
+  `unit_stat_leaves_ref` は `owner_defined_in_source` で**このコンパイル単位が
+  定義したメンバ**に限っています。ライブラリ側は `Using.resource` /
+  `Breaks.catchBreak` / `ArrayOps` のように emit 側で既に値を捨てている経路が
+  あり、そこで二重に `pop` するとスタックが underflow するためです。本筋の直し方は
+  判定を木の形から推測するのをやめて、`Assembler` が持っているスタック高
+  （`asm.stack`）を statement の前後で比べて残りを捨てることですが、
+  `gen_stat` の全経路に影響するのでこのスライスでは触っていません。
 
-- **匿名クラス／サブクラスのメンバの結果型が親と食い違っても通る**
-  （`agent/anonbridge` で確認）。`new It[Int] { def next(): String = "x" }` を
-  受理して `next()Ljava/lang/Object;` に `String` を返す本体を出すので、
-  呼ぶ側の unbox で `ClassCastException` になります。real scalac は
-  `incompatible type in overriding` を出します。オーバーライドの結果型
-  適合検査そのものが無いので、箱詰めの話とは別に必要です
-  （`ab_bad.scala` には**両者が拒否する**形だけを入れてあります）。
+- ~~**匿名クラス／サブクラスのメンバの結果型が親と食い違っても通る**~~
+  （`agent/anonbridge` で確認）→ **`agent/override` で直した**。
+  `new It[Int] { def next(): String = "x" }` は real scalac と同じ
+  `incompatible type in overriding` になります（`ov_result_bad.scala`）。
 
 - **`"abc".appended(1)` のような `B >: Char` の下限推論**（`agent/stringops8`
   で確認）。scalac は `B := AnyVal` と lub を取って `IndexedSeq[AnyVal]` を
@@ -4943,12 +5040,16 @@ error: value += is not a member of T
   `Type::String` は受け手のクラスシンボルを持つのにメンバ探索が prelude で当たって
   しまうため、`ensure_java_loaded` に到達しません。
 
-- **override 検査が無い**。`override` 修飾子の要否も、override 時の型適合も検査していない。
-  scalac が拒否する次の 2 つを黙って通す:
-  `trait T { def f: Int = 1 }; class D extends T { def f: Int = 2 }`（`override` 無し。
-  scalac: ``` `override` modifier required to override concrete member ```）、
-  `class D extends T { override def f: String = "x" }`（親は `Int`。scalac:
-  `incompatible type in overriding`）。`val` も同様。受け入れすぎる側の穴。
+- ~~**override 検査が無い**~~ → **`agent/override` で入った**（「オーバーライドの適合検査」節）。
+  SLS 5.1.4 の 1〜9 と SLS 5.2.6（`needs to be abstract`）を検査する。残るのは
+  **ライブラリ側のメンバに対する `final` と deferred**: `PickleSupply` は pickle の
+  `FINAL` / `DEFERRED` ビットを運ばないので（メンバは `Flags::EMPTY` で作られる）、
+  jar の `final` メソッドを覆っても、jar の trait の抽象メンバを実装し忘れても
+  診断できない。ソース由来と Java classfile 由来（`classpath.rs` は `ACC_ABSTRACT` を
+  読む）は診断する。塞ぐには `Shape` にフラグを足すのが筋。
+  もう 1 つの残件は **`class C extends A with T` の「accidental override」**
+  （scalac: `class C inherits conflicting members`）。無関係な `A.f` と `T.f` が
+  ぶつかったときに `override` を要求する規則で、1〜9 とは別の規則なので入れていない。
 - **`Array[T]` から `Seq[T]` への暗黙変換**。`def k(x: Array[Int]): Seq[Int] = x` は scalac
   では（deprecation 警告つきで）通るが、こちらは type mismatch になる。`Predef` の
   `copyArrayToImmutableIndexedSeq` / `wrapIntArray` 相当の暗黙変換が prelude に無い。
@@ -5073,10 +5174,9 @@ error: value += is not a member of T
   def foo_=(x: Int): Unit = … }` に対する `c.foo = 4` は nsc なら `c.foo_=(4)` だが、
   こちらは型検査を通したうえでフィールドへ `putfield` するので `NoSuchFieldError: foo`
   で落ちる。refinement 型（`structural_select_lhs`）だけは書き換えている。
-- **`override` 修飾子と override 適合性の検査**。`class D extends T { val v = "d" }`
-  （`override` 無し）も `override val v: Int = 5`（親は `String`）も、nsc は
-  それぞれ `override modifier required` / `type mismatch` を出すが、こちらは黙って通す。
-  `val` に対する override 検査そのものが無い（`def` の `@Override` 検査だけがある）。
+- ~~**`override` 修飾子と override 適合性の検査**~~ → **`agent/override` で入った**。
+  `val` も `var` も `def` と同じく検査する（`ov_valdef_bad` / `ov_var_bad` /
+  `ov_modreq_bad`）。残件は上のライブラリ側フラグの件。
 - **implicit 探索の残り**: 多相 implicit のユニフィケーションと再帰導出、発散の打ち切り、nsc 相当の specificity は入った（「Implicit 解決」節）。残るのは (a) `xs.toMap` を `scala.collection.Iterable` にも載せること — pickle 供給が具象コレクション（`HashMap` / `ConstArray` …）に自前の `toMap` を付けるので、継承した 2 本目がオーバーロード衝突になる。いまは `List` / `Iterator` だけに宣言している、(b) 期待型からのメソッド型パラメータ推論が要る implicit（slick の `TypedType[T]` / `TypedType[P1]` はこちらで、implicit 探索ではなく `T` の推論が先に必要）、(c) 診断文面は nsc の複数行（`both … and … match expected type …`）ではなく 1 行のまま
 - **def マクロの展開**。`def f: T = macro Impl.method` は**パースして**バインディングを
   シンボル（`Symbol.macro_impl`）に記録し、マクロ def のバイトコードは nsc と同じく出さない。
