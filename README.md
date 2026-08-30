@@ -90,7 +90,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - SIP-23 定数型のサブセット: `val x: 1 = 1`、`def f(x: 1): Int`。式のリテラルは定数型（`1 <: Int`）。不一致 `val y: 1 = 2` は type mismatch。classfile の pickle は nsc `CONSTANTtpe` + `LITERALint`（scalac 2.13.16 が `-cp` で `def f(x: 1)` / `val one: 1` を typecheck できる）
 - `scala.Dynamic`: `d.foo` → `selectDynamic("foo")`、`d.foo(args)` → `applyDynamic("foo")(args)`、`d.foo = v` → `updateDynamic("foo")(v)`、`d.foo(a = x)` → `applyDynamicNamed("foo")(("a", x))`。`import scala.language.dynamics`（または `-language:dynamics`）が必要。`--scala-library` 時は jar の `scala/Dynamic` に対して実行する
 - XML リテラルのサブセット（2.13）: `<a>t{e}</a>` / `<a/>` / `<a b={e} c="t"/>` / `<a xmlns:p="u" p:b={e} c="t"/>` / `<p:a xmlns:p="u"/>` / `<p:b xmlns:p="u">t</p:b>` / `<a><!--c--></a>` / `<a><![CDATA[x]]></a>` / `<a><?pi t?></a>` / `<a>&amp;</a>` / `<a>&#65;</a>`（elem / text / splice / 非プレフィックス属性 / `xmlns:p` とプレフィックス属性 `p:b` / プレフィックス付き要素名 / コメント / CDATA / PI / 定義済みエンティティ `&amp;` `&lt;` `&gt;` `&quot;` `&apos;` / 数値 `&#N;` `&#xN;`）。属性は nsc と同じ `UnprefixedAttribute` / `PrefixedAttribute` チェーンと `NamespaceBinding`。プレフィックス付き `Elem` は `prefix` に文字列、`label` にローカル名。コメント / CDATA / PI は `scala.xml.Comment` / `PCData` / `ProcInstr`。定義済みエンティティは `EntityRef`、数値参照は `Text`。レキサは `><!--` を `>` と `<` に分ける。未知のエンティティは診断する。`scala-rs run` は検出できた scala-xml jar を `java -cp` に足す
-- `scala.Enumeration`: `object Color extends Enumeration { val Red, Blue = Value }`（複数 `val`）。`--scala-library` 時は jar の `Enumeration.Value()` / `Value.id` / `toString` に対して実行する
+- `scala.Enumeration`: `object Color extends Enumeration { val Red, Blue = Value }`（複数 `val` で連番の id）。`--scala-library` 時は jar の `Enumeration` に対して実行し、`Value` の 4 オーバーロード（`Value` / `Value(i)` / `Value(name)` / `Value(i, name)`）・`values: ValueSet`（`toList` / `filter` / `size` / `contains`）・`withName` / `apply` / `maxId`・`Value.id` / `toString`・`case Color.Red =>` の安定識別子パターンが使える。`values` 以下は jar の `ScalaSignature` から読む（`agent/uniteq`）
 - 適合（conformance）まわり: **コレクションの継承関係**（`Vector[A] <: IndexedSeq[A] <: Seq[A] <: collection.Seq[A] <: Iterable[A] <: IterableOnce[A]`、`List` / `LazyList` / `Queue` / `Range` / `ArraySeq`、`Set[A] <: Iterable[A]`、`Map[K, V] <: Iterable[(K, V)]`、mutable 側も同様）を `crates/typer/src/prelude_hier.rs` の 1 枚の表で型引数つきに張る。**アノテーション付き型**は下の型と同じに適合する（`Node` は `Node @uncheckedVariance`）。**モジュールの `.type`** はそのモジュール自身の型（`Some(Nil): Some[Nil.type]`）。反変パラメータを持つクラスの lub はそのパラメータだけ glb を取る（`Act[+R, -E]` の lub は `Act[R lub R2, E glb E2]`）。型パラメータの lub はその上限境界まで辿る。`extends Base[T](y)` の親コンストラクタ引数は`extends` 節が書いた型引数で読む。`type Self >: this.type <: Nd` に対して `this` は適合し（`class Leafy extends Nd { type Self = Leafy }` のように下限の `this.type` をサブクラス側で読み直す）、任意の `Nd` は適合しない
 - 言語フラグ `implicitConversions` と `postfixOps` は nsc 2.13 どおり。ユーザー定義の `implicit def` / `implicit class` は import / `-language:implicitConversions` なしだと **warning**。postfix `42 bang` / `42 abs` は `import scala.language.postfixOps`（または `-language:postfixOps`）なしだと **warning**（`-Xfatal-warnings` でエラー）
 - 存在型のよくある形: `List[_]`、`T forSome { type X }`、`List[_]` を取るメソッド、境界付き `List[_ <: AnyRef]` と `List[X] forSome { type X <: AnyRef }`（名前付き量化は `BoundedWildcard` に落として既存の pickle/erase 経路を使う）。ワイルドカードは Object 相当に erase する。入れ子の `List[_ <: List[_]]` は hi bound 側の EXISTENTIALtpe として pickle する。`p.Inner forSome { val p: Outer }` は `Outer#Inner` にパックして実行する。その他の `forSome { val … }` は診断する（黙って捨てない）
@@ -4554,6 +4554,13 @@ java.lang.ClassFormatError: Method "f" in class Main has illegal signature
 1 つも出していない（`classes=0`）ので、バックエンドだけを直したこのスライスでは
 数字が動かないのが正しい姿です。動かしたのは**出したコードが JVM にロード
 できるか**であって、通る本数ではありません。
+
+このスライスで漏れていた 2 つの値の位置——**`==` / `!=` のオペランド**と、
+`Unit` の値に対して選んだメンバの**レシーバ**——は
+「[`Unit` の比較オペランドと `scala.Enumeration`](#unit-の比較オペランドと-scalaenumerationagentuniteq)」
+（`agent/uniteq`）で塞ぎました。`ub_boxed.scala` の `== ()` はレシーバが
+`Any` の形だけだったので、`() == ()` はここでは踏めていません。
+
 ### コレクションの変換メソッドの結果型（`BuildFrom`、`agent/buildfrom`）
 
 2.13 のコレクションは `map` などの結果型を `BuildFrom` / `IterableFactory` /
@@ -6349,6 +6356,139 @@ tail-return する場所（静的フォワーダ、`Function0` の by-name ラ�
   `println` すると `scala.Tuple2@<hash>` になります（jar モード・実 scalac は
   `(1,1)`）。この修正とは無関係の既存の差で、`nc_nothing.scala` はタプルを
   そのまま印字せず `._1` 経由で比較しています。
+
+### `Unit` の比較オペランドと `scala.Enumeration`（`agent/uniteq`）
+
+独立な 2 件です。fixture 接頭辞は `ue`、テストは `crates/cli/tests/uniteq.rs`。
+
+#### 1. `() == ()` が `VerifyError: Operand stack underflow`
+
+```scala
+println(() == ())                            // VerifyError（診断は出ない）
+val u1 = (); val u2 = (); println(u1 == u2)  // 同じ
+```
+
+`agent/unitbox` が `Unit` の**値の位置**——パラメータ・フィールド・配列要素・
+型引数——に `scala/runtime/BoxedUnit` を入れましたが、**比較のオペランド**と、
+`Unit` の値に対して選んだメンバの**レシーバ**が漏れていました。
+
+`Unit` の式はスタックに何も残しません。`() == ()` は erasure が引数側だけを
+`$box` していたので、`getstatic BoxedUnit.UNIT` が 1 個だけ積まれて
+`BoxesRunTime.equals(Object,Object)` が 2 個 pop する形になります。
+classfile は診断なしで書き出され、JVM が検証したときに初めて落ちます。
+
+```
+java.lang.VerifyError: Operand stack underflow
+  Location: Main$.main([Ljava/lang/String;)V @3: invokestatic
+  Reason: Attempt to pop empty stack.
+```
+
+`().toString` / `().hashCode` / `().isInstanceOf[T]` / `().asInstanceOf[T]` も
+同じ形で、レシーバが積まれないまま invoke していました。
+
+直したのは `crates/backend/src/gen.rs` の以下です。既存の
+`adapt_unit_arg`（`unit_leaves_boxed_ref` なら `checkcast`、そうでなければ
+`getstatic BoxedUnit.UNIT`）に乗せただけで、新しい仕組みは足していません。
+
+| 場所 | 直した内容 |
+|---|---|
+| `gen_receiver` | `Apply` のレシーバを `adapt_unit_arg` に通す |
+| `gen_select_receiver` | 引数無しの `Select`（`().toString`）のレシーバも同じ |
+| `gen_any_eq` / `gen_eq_ne` | 右辺のオペランドも同じ（`x == ()`） |
+| `TypeApply` の `asInstanceOf` / `isInstanceOf` | レシーバを積む。`asInstanceOf[Unit]` はそのあと `pop` するので釣り合う |
+| `emit_any_hash` | `Unit` を**自分では箱詰めしない**。レシーバは上で箱詰め済みなので二重に積んでしまう |
+
+`getClass` も巻き添えで直しました。引数無しの `.getClass` は intrinsic の
+分岐に無く素の `Object.getClass` に落ちていたので、`1.getClass` が nsc の
+`int` ではなく `class java.lang.Integer` を返していました（`().getClass` も
+`void` ではなく `class scala.runtime.BoxedUnit` になるところでした）。
+`Apply` 側は元から正しかったので、両方を `emit_get_class` に寄せています。
+
+scalac は `() == ()` を警告付きで `true` にします
+（`comparing values of types Unit and Unit using == will always yield true`）。
+こちらは警告を出しませんが、値は一致します。
+
+#### 2. `scala.Enumeration` のメンバが無い
+
+```scala
+object Color extends Enumeration {
+  val Red, Green, Blue = Value
+  val Custom = Value(10, "custom")   // no matching overload
+}
+Color.values                          // value values is not a member of Color$
+Color.withName("Green")               // 同じ
+```
+
+原因は **継承メンバの供給が効いていなかった**ことです。
+`PickleSupply::complete_named` は「レシーバのクラスが `scala/…`（または
+`adopt_binary_class` が引き取ったもの）」でなければ pickle を読みません。
+`Color$` はユーザのクラスなので、`object Color extends Enumeration` は
+prelude が手書きしていたもの（`Value` と `Value.id`）以外を**何も**
+受け取れませんでした。
+
+`PickleSupply::complete` に、ほかで何も見つからなかったときだけ
+**ライブラリ側の祖先**を順に（線形化順、近い方から）聞く経路を足しました
+（`crates/typer/src/pickle_supply.rs` の `library_ancestors`）。メンバは
+それを宣言している祖先の上に入るので、JVM の呼び出しが名指すクラスとも
+一致します。これで `values` / `withName` / `apply` / `maxId` と
+`ValueSet` の面は全部 `scala/Enumeration.class` の `ScalaSignature` から
+読めます。手書きの複製はしていません。
+
+prelude に足したのは `Value` の 3 オーバーロードだけです
+（`crates/typer/src/prelude_enum.rs`）。`Enumeration` は**クラス `Value`**と
+**4 つのメソッド `Value`**を同じ名前で持っていて、供給はメンバ探索が
+「何も見つからなかった」ときにしか走らないので、内側のクラスが名前に
+答えてしまうと 4 つのオーバーロードは永久に聞かれません。prelude の
+`Value`（引数無し）を消しても駄目で、今度は `Value(10, "custom")` が
+素の名前をクラスに解決して `value apply is not a member of Value` になります。
+
+`val Red, Green, Blue = Value` の連番はコンパイラ側の仕掛けではありません。
+ライブラリの `Value()` が実行時に `Enumeration.nextId` を読んで増やすので、
+右辺を名前ごとに 1 回ずつ評価する既存の多重代入の扱いだけで 0, 1, 2 になります。
+
+#### 検証
+
+| fixture | 何を固定するか | 期待出力 |
+| --- | --- | --- |
+| `ue_eq.scala`（両モード dual-run） | `Unit` のオペランド: リテラル・ローカル・`Unit` を返す呼び出し・`Unit` パラメータ、`equals` / `hashCode` / `toString` / `isInstanceOf[Unit]` / `asInstanceOf[Unit]` / `getClass`、`Any` 経由、`Unit` と非 `Unit`、型パラメータで erase された `id(())`、条件式と文の位置、`case () =>`、`case class` の `equals`、ユーザ定義 `equals` | `true` `false` … `2` |
+| `ue_eqlib.scala`（library dual-run のみ） | `##`（`scala.runtime.Statics`）、`List` / `Set` / `Map` / `Option` の中の `Unit`、`() -> 1`、`(Unit, Unit) => Boolean` のラムダ、`count(_ == ())`。私有ランタイムには `Statics` も可変長 `List.apply` も `Set` / `Map` / `Function2` も無いので jar 限定 | `0` `0` `true` … `List(())` |
+| `ue_eq_bad.scala`（異常系） | 箱詰めで typer が緩まないこと: `val s: String = ()`、`() eq ()`、`().length` はどれもエラー（実 scalac も同じ 3 件） | （コンパイルエラー） |
+| `ue_enum.scala`（library dual-run のみ） | `val Red, Green, Blue = Value` の連番、`Value(i, name)` / `Value(i)` / `Value(name)`、`values` / `withName` / `apply` / `maxId`、`ValueSet` の `toList` / `filter` / `size` / `contains`、`type Weekday = Value`、`case Color.Red =>` の安定識別子パターン、`Value` が `Ordered`、`withName` の `NoSuchElementException` | `(Red,0,10)` `List(Red, Green, Blue, custom)` `true` `Blue` `Color.ValueSet(Red, Green)` … |
+| `ue_enum_bad.scala`（異常系） | `withName(1)` / `Value(1, 2)` / `Color.nosuchMember` / `val n: Int = Color.Red` はどれもエラー（実 scalac も 4 件。`Value(1, 2)` は向こうでは `protected` 違反、こちらはオーバーロード不一致） | （コンパイルエラー） |
+
+`ue_enum` は私有ランタイムに `scala/Enumeration` が無いので、
+`--no-scala-library` では**診断が出ること**を固定しています
+（`ue_enum_private_runtime_is_diagnosed`）。`ue_eqlib` も同様です。
+
+バイトコードそのものも見ています（`ue_eq_pushes_both_operands`）。
+`javap -p -c` で `BoxesRunTime.equals` の直前 2 命令が両方
+`BoxedUnit.UNIT` であることを確認します——実行だけでは足りません。
+直す前の出力も**コンパイルは通っていて**、気づいたのは検証器だけだからです。
+
+slick の計測は `files=184 errors=327 files_with_errors=64` →
+`files=184 errors=322 files_with_errors=64` です。減ったのは主に継承メンバの
+供給で、`lazyZip` / `toMap` / `compare` が解決するようになりました
+（`lazyZip` が通った結果、その先の `LazyZip.map` が新しく見えています）。
+
+#### Remaining
+
+- **未知の親クラスが黙って通ります**。`object Bogus extends NoSuchThingHere`
+  は**両モードとも**診断なしで classfile が出ます（この修正以前からの挙動で、
+  `Unit` とも `Enumeration` とも無関係）。そのため
+  `object Color extends Enumeration` 自体は `--no-scala-library` でも
+  エラーになりません。`ue_enum` が私有ランタイムで落ちるのは、
+  中で `Value` を使っているからです。
+- `Color.Value` と `Weekday.Value` を**別の型**として区別しません。prelude の
+  `Value` は前置（パス依存）を持たない 1 つのクラスなので、nsc なら
+  `type mismatch` になる代入が通ります。`ue_enum_bad` はこの形を避けています。
+- `Unit` の比較に nsc の警告
+  （`comparing values of types Unit and Unit …`）は出しません。
+- `Unit => Boolean` を `Function1[Unit, Boolean]` ではなく
+  `() => Boolean` に読みます（`missing parameter type for expanded function`）。
+  パーサ側の別件で、`ue_eqlib` はこの形を避けています。
+- `##` は `scala.runtime.Statics.anyHash` を無条件に呼ぶので、私有ランタイムでは
+  `NoClassDefFoundError` になります（`Unit` に限らず `1.##` も同じ）。
+  これも既存の穴で、`ue_eqlib` を jar 限定にしてある理由の 1 つです。
 
 ## ライセンス
 
