@@ -1,0 +1,12 @@
+true
+false
+Set(admin)
+Set(first)
+true
+false
+1
+Map(c -> 3)
+20
+List(7, 8, 9)
+4
+List(1, 2)
