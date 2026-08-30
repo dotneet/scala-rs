@@ -863,6 +863,14 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         Some(t) => t,
         None => erase_ty(&orig, st),
     };
+    if forwards_expected_to_result(&tree.kind) {
+        // Already adapted through the branches: only record the type they now
+        // have, and do not convert a second time.
+        if let Some(a) = box_adaptation(&tree.ty, expected, &orig, st) {
+            tree.ty = a.result_ty();
+        }
+        return;
+    }
     adapt_box_unbox(tree, expected, &orig, st);
 }
 
@@ -1214,11 +1222,41 @@ pub(crate) fn value_class_of(ty: &Type, st: &SymbolTable) -> Option<SymbolId> {
     (st.source_value_classes.contains(&sym) && st.is_value_class(sym)).then_some(sym)
 }
 
-fn adapt_box_unbox(tree: &mut Tree, expected: Option<&Type>, orig: &Type, st: &SymbolTable) {
-    let Some(exp) = expected else {
-        return;
-    };
-    let got = &tree.ty;
+/// The box/unbox conversion erasure owes a value of erased type `got` that has
+/// to reach a position of erased type `expected`.
+enum BoxAdapt {
+    /// `BoxesRunTime.boxToInteger(x)` and friends.
+    Box,
+    /// `BoxesRunTime.unboxToInt(x)` and friends, to the named primitive.
+    Unbox(Type),
+    /// `new Meters(n)` -- the JVM-level box of a user value class.
+    VcBox(SymbolId),
+    /// `((Meters) x).n()` -- its unbox, to the underlying type.
+    VcUnbox(SymbolId, Type),
+}
+
+impl BoxAdapt {
+    /// The erased type the converted tree ends up with.
+    fn result_ty(&self) -> Type {
+        match self {
+            BoxAdapt::Box => Type::Any,
+            BoxAdapt::Unbox(to) => to.clone(),
+            BoxAdapt::VcBox(c) => Type::Class {
+                sym: *c,
+                args: vec![],
+            },
+            BoxAdapt::VcUnbox(_, to) => to.clone(),
+        }
+    }
+}
+
+fn box_adaptation(
+    got: &Type,
+    expected: Option<&Type>,
+    orig: &Type,
+    st: &SymbolTable,
+) -> Option<BoxAdapt> {
+    let exp = expected?;
     // `class Meters(val n: Int) extends AnyVal` erases to `int`, but a value of
     // it that reaches a reference position -- `Any`, a universal trait it
     // implements, a type argument -- is a real `Meters` instance, not an
@@ -1234,23 +1272,55 @@ fn adapt_box_unbox(tree: &mut Tree, expected: Option<&Type>, orig: &Type, st: &S
             // (`describe$extension(int)`); every other reference position -- a
             // universal trait, `Any`, a type argument -- takes the instance.
             if *got == under && *exp != under && is_ref_erased(exp) {
-                wrap_vc_box(tree, c);
-                return;
+                return Some(BoxAdapt::VcBox(c));
             }
             if *exp == under && *got != under && is_ref_erased(got) {
-                wrap_vc_unbox(tree, c, exp.clone());
-                return;
+                return Some(BoxAdapt::VcUnbox(c, exp.clone()));
             }
         }
-        return;
+        return None;
     }
     if is_primitive(got) && is_ref_erased(exp) && !matches!(exp, Type::Unit) {
-        wrap_box(tree);
-        return;
+        return Some(BoxAdapt::Box);
     }
     if is_ref_erased(got) && is_primitive(exp) && !matches!(exp, Type::Unit) {
-        wrap_unbox(tree, exp.clone());
+        return Some(BoxAdapt::Unbox(exp.clone()));
     }
+    None
+}
+
+fn adapt_box_unbox(tree: &mut Tree, expected: Option<&Type>, orig: &Type, st: &SymbolTable) {
+    match box_adaptation(&tree.ty, expected, orig, st) {
+        Some(BoxAdapt::Box) => wrap_box(tree),
+        Some(BoxAdapt::Unbox(to)) => wrap_unbox(tree, to),
+        Some(BoxAdapt::VcBox(c)) => wrap_vc_box(tree, c),
+        Some(BoxAdapt::VcUnbox(c, to)) => wrap_vc_unbox(tree, c, to),
+        None => {}
+    }
+}
+
+/// Whether erasure handed `expected` straight to the subexpressions that
+/// produce this node's value, rather than to a node that yields one itself.
+///
+/// A `Block`'s value *is* its last expression's, an `If`'s is whichever branch
+/// ran, a `Match`'s is the selected case body's, a `Try`'s is the body's or a
+/// handler's. Each of those was erased against `expected` and so has already
+/// been boxed or unboxed; the node is therefore adapted too, and running
+/// `adapt_box_unbox` on it a second time boxes the box.
+///
+/// That is what made
+/// `new It[Int] { def next(): Int = { val z = 1; z } }` emit
+/// `boxToInteger(boxToInteger(z))` in the erased `next()Ljava/lang/Object;`
+/// and fail verification, while the expression body `def next(): Int = z`
+/// -- no block to descend into -- came out right.
+fn forwards_expected_to_result(kind: &TreeKind) -> bool {
+    matches!(
+        kind,
+        TreeKind::Block { .. }
+            | TreeKind::If { .. }
+            | TreeKind::Match { .. }
+            | TreeKind::Try { .. }
+    )
 }
 
 fn wrap_marker(tree: &mut Tree, name: &str, sym: SymbolId, param: Type, result: Type) {
