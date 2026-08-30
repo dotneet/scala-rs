@@ -9046,6 +9046,25 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
     }
 }
 
+/// A member completed from a pickle that carries an implicit clause of its own
+/// (`SortedSetOps.map[B](f)(implicit ord: Ordering[B])`).
+///
+/// The hardcoded stdlib table below spells the `IterableOps` shape of these
+/// names -- `map:(Lscala/Function1;)Ljava/lang/Object;` -- and the witness is
+/// already on the stack by the time it runs, so `TreeSet.map(f)` went out as a
+/// one-argument call with two arguments pushed (`IncompatibleClassChangeError`
+/// at the first invocation). Those calls take the general path, which uses the
+/// erased descriptor the pickle recorded. The prelude's own sorted factories
+/// (`TreeSet(1, 2)`, whose `apply` takes an `Ordering` too) are hand-written,
+/// not pickled, and keep their table entry.
+fn pickled_with_implicit_clause(st: &SymbolTable, id: SymbolId) -> bool {
+    let s = st.get(id);
+    !s.pickled_origin.is_empty()
+        && s.paramss
+            .iter()
+            .any(|c| c.iter().any(|p| st.get(*p).flags.contains(Flags::IMPLICIT)))
+}
+
 fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Option<&Type>) {
     let s = ctx.st.get(id);
     let owner_id = s.owner;
@@ -9075,7 +9094,7 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
         maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
         return;
     }
-    if ctx.library_abi {
+    if ctx.library_abi && !pickled_with_implicit_clause(ctx.st, id) {
         // `MapOps.map` / `flatMap` / `collect` *build a map*: they require the
         // function to return a pair, and 2.13 picks the `IterableOps` overload
         // of the same name whenever it does not

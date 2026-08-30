@@ -29,6 +29,7 @@ mod prelude_impl2;
 mod prelude_lang;
 mod prelude_lowbound;
 mod prelude_mism4;
+mod prelude_mism9;
 mod prelude_mutcoll;
 mod prelude_mutops;
 mod prelude_numconv;
