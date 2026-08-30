@@ -6785,6 +6785,132 @@ fixture 接頭辞は `jn`、テストは `crates/cli/tests/javanest.rs` です�
   Scala の trait が deferred 宣言したものは今までどおり `lin[..bi]` だけを見ます
   （`abstract override` の意味があるため）。
 
+### trait の private メソッドと、ジェネリック親への `extends` 引数（`agent/traitpriv`）
+
+`tests/slick_subset.sh`（実 slick の閉包をコンパイルし、出た全 classfile を
+`-Xverify:all` で `Class.forName` する計測。「型検査を通る」だけでなく「実際に
+JVM がロードできる」を測る）が見つけた独立な 2 件と、`agent/javanest` が発見・
+位置特定していたもう 1 件です。
+
+#### 1. trait の private メソッドが `ACC_PRIVATE | ACC_ABSTRACT` で出ていた
+
+```
+BAD slick.util.ReadAheadIterator : java.lang.ClassFormatError: Method update
+    in class slick/util/ReadAheadIterator has illegal modifiers: 0x402
+```
+
+`slick/util/ReadAheadIterator.scala` は `private[this] def update()` を他の
+trait メンバから呼ぶだけの、ごく普通の形です。JVMS 4.6 はどんなメソッドにも
+`private` と `abstract` の同時指定を禁じていて、interface のメンバも例外では
+ありません。
+
+実 scalac がどう出すかを最小再現で確認しました（`javap -p -v`）。
+
+```scala
+trait T { private def h = 1; def g = h + 1 }
+```
+
+nsc 2.13.16 は trait を Java 8 default メソッドにコンパイルするので、`h` は
+interface に**本体付きの真の `private` メソッド**として直接乗り、`g`（interface
+自身に書かれた default メソッド）からは `invokespecial` で呼ばれます。
+
+```
+private int h();
+  flags: (0x0002) ACC_PRIVATE
+public default int g();
+  flags: (0x0001) ACC_PUBLIC
+    0: aload_0
+    1: invokespecial #20   // InterfaceMethod h:()I
+```
+
+この backend は default メソッドを使わず、trait の具象メンバを常に
+`<Iface>$class` という補助クラスへ `static` メソッドとして出し、interface 側は
+抽象シグネチャだけを宣言し、mix-in するクラスにフォワーダを生やす旧来の方式
+（Scala 2.11 の trait 実装）を採っています。この方式のまま nsc の形をそのまま
+真似ることはできません（`$class` の中身は interface とは**別クラス**なので、
+そこから `private` メンバを直接呼べない）。代わりに、nsc の形が守っている不変
+条件——`private` メンバを呼ぶコードは常にその trait 自身の中にある——を保つ形に
+しました。**genuine `private`（typer が `access_widened` していないもの）は
+interface に一切現れず**（抽象宣言もフォワーダもなし）、`$class` 上の実体は
+`private static` にし、同じ `$class` 内の他メンバからは `invokestatic` で
+（`invokeinterface` ではなく）呼びます。`access_widened`（`private` メンバを
+コンパニオンなど別クラスから読むために typer が公開化した場合）はこれまでどおり
+`public abstract` の通常経路のままです。
+
+`crates/backend/src/gen.rs` の `is_trait_private_def` が判定を持ち、4 か所から
+呼ばれます: interface の抽象メソッド宣言ループ（`emit_class`）、`$class` 側の
+アクセスフラグ（`emit_trait_impl_method`）、線形化上の「次の実装」探索
+（`next_lin_impl`）、mix-in フォワーダの選定（`emit_mixin_forwarders`）。後の 2
+つを直さないと、`private` メンバの名前が別トレイトの同名メンバのフォワーダ選定に
+紛れ込んだり、存在しない `private` シグネチャへのフォワーダを生成してしまいます。
+
+#### 2. ジェネリック親への `extends` コンストラクタ引数が box されない
+
+`agent/javanest` が実行中に発見し、修正箇所まで特定していたものです（上の
+javanest 節にはまだ載っていません）。ここで直します。
+
+```scala
+class A1 extends java.util.concurrent.atomic.AtomicReference[Int](1)
+// VerifyError: Type integer ... is not assignable to 'java/lang/Object'
+```
+
+式位置の `new AtomicReference[Int](1)` は `gen_new` が正しく box していました
+（消去後の実パラメータ型 `Object` とスタック上の値の静的型 `Int` を比べて、
+プリミティブなら `emit_box`）。`extends` 節が生成する superclass コンストラクタ
+呼び出しは同じ判定を持っていませんでした。`class` の `<init>` を組み立てる
+`super_args` ループと、`object … extends …(args)` の `<init>` を組み立てる方の
+`super_args` ループ（`crates/backend/src/gen.rs`、どちらも `emit_class` /
+モジュール `<init>` ビルダの中）の 2 か所です。
+
+`parent_super_ctor` がコンストラクタの**宣言された**引数型（Java の `<init>` の
+`ctor_sym` があればその型、なければクラスの `ctor_fields`）も返すようにし
+（`ctor_param_tys`。`gen_new` の同じ計算を共有関数へ切り出したもの）、両方の
+`super_args` ループで `gen_new` と同じ判定
+（`is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty)`）
+を入れました。Java のジェネリック親（`AtomicReference[Int]`）・Scala 自作の
+ジェネリック親（`class Box[T](val v: T)`）の両方、`class` と `object … extends`
+の両方、8 種のプリミティブ全部で実 scalac の出力と突き合わせています。
+
+#### 検証
+
+fixture 接頭辞は `tp`、テストは新規 `crates/cli/tests/traitpriv.rs` です。
+正常系は**私有ランタイムと jar の両モード**で `java -Xverify:all` し、実 scalac
+2.13.16 の出力と突き合わせます。1 の 3 本は classfile を直接読んでメソッドの
+アクセスフラグも固定します（`javap` は `private abstract` でも一見普通の宣言に
+見える逆アセンブルを出すことがあり、シェイプの回帰は出力比較だけでは検出できない
+ため）。
+
+| fixture / テスト | 中身 |
+|---|---|
+| `tp1.scala` | `ReadAheadIterator` そのものの形（`private[this] var` 2 本 ＋ `private[this] def update()` を 2 つの public メンバから呼ぶ）。`tp1_private_method_is_not_abstract_on_the_interface` が interface に `update` が一切無いこと、`$class` の `update` が `private static`（`abstract` でも `public` でもない）であることを固定 |
+| `tp2.scala` | 2 つの trait が同名の `private` メソッドを持つ場合の名前衝突。`tp2_private_method_gets_no_mixin_forwarder` が mix-in クラスに `helper` というメンバが一切無いことを固定 |
+| `tp3.scala` | `access_widened` される側の回帰ガード：trait のコンパニオンから読む `private def secret` は widen され、`tp3_widened_private_keeps_interface_signature` が interface に `public abstract` のまま残ることを固定（`tp1` の genuine private と対照） |
+| `tp4.scala` | `class ... extends java.util.concurrent.atomic.AtomicReference[Int](1)`（報告された再現そのもの） |
+| `tp5.scala` | 自作の Scala ジェネリック親 `Box[T]`、`object ... extends`、8 種のプリミティブ全部 |
+
+`./tests/slick_subset.sh` の verify 失敗数（着手時 → 完了時）:
+
+```
+着手時: subset_files=38 classes=204 (of 184 sources)  verified=203 failed=1
+        BAD slick.util.ReadAheadIterator : ClassFormatError (illegal modifiers 0x402)
+完了時: subset_files=38 classes=204 (of 184 sources)  verified=204 failed=0
+```
+
+`tests/slick_measure.sh`（型検査エラー数）は着手時・完了時とも
+`files=184 errors=257 files_with_errors=63 classes=0` で変化なし
+——この 2 件はどちらも型検査を通った後の codegen バグで、slick 184 ファイルの
+残りのエラーは無関係な既存の穴です。
+
+#### Remaining
+
+- `agent/javanest` の README 節の「Remaining」に載っている 3 件（`Arrays.toString`
+  への `Array[AnyRef]` 不適合、interface ジェネリック static への明示型引数、
+  `Set.of` の多重定義曖昧性）はこの修正の対象外です。
+- `private` trait メソッドの本体自身が `super.X()` を含む（かつ `X` の名前が
+  そのメソッド自身と同名の override チェインでない）ようなごく稀な形は、既存の
+  `needs_super_accessor` のヒューリスティックとの相互作用を確認していません
+  （実コードでは見つかりませんでした）。
+
 ## ライセンス
 
 Apache-2.0

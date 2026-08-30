@@ -1355,24 +1355,56 @@ fn pick_init_sym(st: &SymbolTable, class_id: SymbolId, args: &[Tree]) -> Option<
 /// `(super internal name, `<init>` descriptor, explicit args, super class
 /// symbol)`. The symbol is what tells the caller whether the superclass is a
 /// nested class that needs an `$outer` argument ahead of the source ones.
+/// The constructor's *declared* parameter types for `args`: `ctor_sym`'s own
+/// method type when it is known (matches a Java or generic-erased signature
+/// exactly, e.g. `AtomicReference[Int](x: Object)`), falling back to the
+/// class's constructor fields, and finally to the arguments' own static
+/// types when neither is available. Callers box a primitive argument
+/// wherever this says the parameter is not itself a JVM primitive -- the
+/// same check `gen_new` makes for an ordinary `new`.
+fn ctor_param_tys(
+    st: &SymbolTable,
+    ctor_sym: SymbolId,
+    class_id: SymbolId,
+    args: &[Tree],
+) -> Vec<Type> {
+    if !ctor_sym.is_none() && st.get(ctor_sym).name == "<init>" {
+        return match &st.get(ctor_sym).ty {
+            Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+            _ => args.iter().map(|a| a.ty.clone()).collect(),
+        };
+    }
+    if class_id.is_none() {
+        return args.iter().map(|a| a.ty.clone()).collect();
+    }
+    let fields = st.get(class_id).ctor_fields.clone();
+    if fields.is_empty() || fields.len() != args.len() {
+        args.iter().map(|a| a.ty.clone()).collect()
+    } else {
+        fields.iter().map(|f| st.get(*f).ty.clone()).collect()
+    }
+}
+
 fn parent_super_ctor(
     st: &SymbolTable,
     parents: &[Tree],
     super_name: &str,
-) -> (String, String, Vec<Tree>, SymbolId) {
+) -> (String, String, Vec<Tree>, SymbolId, Vec<Type>) {
     for p in parents {
         if let TreeKind::Apply { args, .. } = &p.kind {
             if !p.sym.is_none() && st.get(p.sym).name == "<init>" {
                 let cls = st.get(p.sym).owner;
                 let owner = class_internal(st, cls);
                 let desc = with_enclosing_outer_param(st, cls, &method_desc_from_sym(st, p.sym));
-                return (owner, desc, args.clone(), cls);
+                let field_tys = ctor_param_tys(st, p.sym, cls, args);
+                return (owner, desc, args.clone(), cls, field_tys);
             }
             if let Some(cls) = st.class_sym_of(&p.ty) {
                 let owner = class_internal(st, cls);
                 if owner == super_name || super_name == "java/lang/Object" {
                     let desc = ctor_desc(st, cls, args);
-                    return (owner, desc, args.clone(), cls);
+                    let field_tys = ctor_param_tys(st, SymbolId::NONE, cls, args);
+                    return (owner, desc, args.clone(), cls, field_tys);
                 }
             }
         }
@@ -1380,7 +1412,7 @@ fn parent_super_ctor(
             let cls = st.get(p.sym).owner;
             let owner = class_internal(st, cls);
             let desc = with_enclosing_outer_param(st, cls, &method_desc_from_sym(st, p.sym));
-            return (owner, desc, Vec::new(), cls);
+            return (owner, desc, Vec::new(), cls, Vec::new());
         }
     }
     // No explicit parent constructor call. A nested superclass still needs its
@@ -1394,9 +1426,16 @@ fn parent_super_ctor(
                         format!("({outer_ty})V"),
                         Vec::new(),
                         cls,
+                        Vec::new(),
                     );
                 }
-                return (super_name.to_string(), "()V".into(), Vec::new(), cls);
+                return (
+                    super_name.to_string(),
+                    "()V".into(),
+                    Vec::new(),
+                    cls,
+                    Vec::new(),
+                );
             }
         }
     }
@@ -1405,6 +1444,7 @@ fn parent_super_ctor(
         "()V".into(),
         Vec::new(),
         SymbolId::NONE,
+        Vec::new(),
     )
 }
 
@@ -2674,9 +2714,17 @@ impl<'a> Gen<'a> {
                     if name == "<init>" || name == "<clinit>" {
                         continue;
                     }
-                    let acc =
-                        method_access_flags(mods.flags, widened(self.st, stt.sym)) | ACC_ABSTRACT;
-                    b.add_abstract(acc, name, &def_method_desc(self.st, stt));
+                    // A genuinely private trait method (JVMS 4.6 forbids
+                    // `ACC_PRIVATE | ACC_ABSTRACT`) never appears in the
+                    // interface: only its `$class` body does, and every
+                    // caller lives inside the trait's own code, so nothing
+                    // outside needs an abstract signature to dispatch
+                    // through. See `is_trait_private_def`.
+                    if !is_trait_private_def(self.st, stt) {
+                        let acc = method_access_flags(mods.flags, widened(self.st, stt.sym))
+                            | ACC_ABSTRACT;
+                        b.add_abstract(acc, name, &def_method_desc(self.st, stt));
+                    }
                     if needs_super_accessor(stt) {
                         let acc_name = super_accessor_name(self.st, class_id, name);
                         b.add_abstract(
@@ -3304,7 +3352,7 @@ impl<'a> Gen<'a> {
             &capture_params_desc(self.st, &self.boxed_vars, class_id),
         );
         let super_name = b.super_name.clone();
-        let (super_owner, super_desc, super_args, super_cls) =
+        let (super_owner, super_desc, super_args, super_cls, super_field_tys) =
             parent_super_ctor(self.st, parents, &super_name);
         let super_outer = outer_field_class(self.st, super_cls);
         let class_name = b.this_name.clone();
@@ -3368,7 +3416,7 @@ impl<'a> Gen<'a> {
                     load_outer_arg(asm, &ctx_early, o);
                 }
             }
-            for a in &super_args {
+            for (i, a) in super_args.iter().enumerate() {
                 gen_expr(asm, &mut frame, &ctx_early, a);
                 // `class D extends B((), 5)`: the super constructor takes a
                 // `BoxedUnit` there and the `()` left nothing on the stack.
@@ -3376,6 +3424,14 @@ impl<'a> Gen<'a> {
                 // `Object` parameter, so a `Unit`-typed argument here really
                 // does mean a `Unit` parameter.
                 adapt_unit_arg(asm, &ctx_early, a, &a.ty);
+                // `class A1 extends AtomicReference[Int](1)`: a generic
+                // (often Java) superclass ctor takes `Object`, but a
+                // primitive argument is still on the stack unboxed. Same
+                // check `gen_new` makes for a plain `new`.
+                let pty = super_field_tys.get(i).unwrap_or(&a.ty);
+                if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
+                    emit_box(asm, &a.ty);
+                }
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);
             if has_outer {
@@ -3858,7 +3914,16 @@ impl<'a> Gen<'a> {
         let meth = def.sym;
         let caps = trait_capture_accessors(self.st, boxed_vars, trait_id);
         let max_locals = max_locals + caps.iter().map(|c| c.3.slots()).sum::<u16>();
-        b.add_code(ACC_PUBLIC | ACC_STATIC, name, &desc, max_locals, |asm| {
+        // The `$class` static forwarder is `private` when the source method
+        // is: nothing outside this file calls it (no interface signature, no
+        // mixin forwarder -- see `is_trait_private_def`), so keeping it
+        // `private` here matches source visibility instead of leaking it.
+        let static_acc = if is_trait_private_def(self.st, def) {
+            ACC_PRIVATE | ACC_STATIC
+        } else {
+            ACC_PUBLIC | ACC_STATIC
+        };
+        b.add_code(static_acc, name, &desc, max_locals, |asm| {
             let mut frame = frame;
             emit_trait_capture_prologue(asm, &mut frame, &iface_owned, &caps);
             let mut ctx = emit_ctx(
@@ -4147,7 +4212,13 @@ impl<'a> Gen<'a> {
     ) -> Option<(SymbolId, bool)> {
         for &s in lin.iter().skip(after_idx + 1) {
             if let Some(ms) = self.trait_impls.get(&s) {
-                if ms.iter().any(|m| m.name() == Some(method)) {
+                // A trait-private method never dispatches through `super`:
+                // it isn't part of the interface's signature, so it can't be
+                // the target of another trait's or class's `super.m()`.
+                if ms
+                    .iter()
+                    .any(|m| m.name() == Some(method) && !is_trait_private_def(self.st, m))
+                {
                     return Some((s, true));
                 }
             }
@@ -4192,7 +4263,13 @@ impl<'a> Gen<'a> {
             let iface = class_internal(self.st, *parent);
             for m in methods {
                 let name = m.name().unwrap_or("").to_string();
-                if name.is_empty() || !seen.insert(name.clone()) {
+                // A trait-private method has no interface signature to
+                // implement, so no mixing class ever needs a forwarder for
+                // it -- and its name must not shadow a same-named *public*
+                // method a farther trait in the linearization does need one
+                // for.
+                if name.is_empty() || is_trait_private_def(self.st, m) || !seen.insert(name.clone())
+                {
                     continue;
                 }
                 chosen.push((name, iface.clone(), m.clone()));
@@ -5419,7 +5496,7 @@ impl<'a> Gen<'a> {
         // (`NoSuchMethodError`) for any singleton extending a class whose
         // primary constructor takes parameters — e.g. slick's
         // `case object Asc extends Direction(false)`.
-        let (super_owner, super_desc, super_args, super_cls) =
+        let (super_owner, super_desc, super_args, super_cls, super_field_tys) =
             parent_super_ctor(st, parents, &super_name);
         let super_outer = outer_field_class(st, super_cls);
         let mixin_inits = self.mixin_init_calls(class_id);
@@ -5468,9 +5545,16 @@ impl<'a> Gen<'a> {
                     load_outer_arg(asm, &ctx, o);
                 }
             }
-            for a in &super_args {
+            for (i, a) in super_args.iter().enumerate() {
                 gen_expr(asm, &mut frame, &ctx, a);
                 adapt_unit_arg(asm, &ctx, a, &a.ty);
+                // `object O extends AtomicReference[Int](1)`: same generic /
+                // Java superclass boxing `gen_new` and the class `<init>`
+                // path above apply.
+                let pty = super_field_tys.get(i).unwrap_or(&a.ty);
+                if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
+                    emit_box(asm, &a.ty);
+                }
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);
             match &own_outer {
@@ -7688,21 +7772,7 @@ fn gen_new(
             &capture_params_desc(ctx.st, ctx.boxed_vars, class_id),
         )
     };
-    let field_tys: Vec<Type> = if !ctor_sym.is_none() && ctx.st.get(ctor_sym).name == "<init>" {
-        match &ctx.st.get(ctor_sym).ty {
-            Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
-            _ => args.iter().map(|a| a.ty.clone()).collect(),
-        }
-    } else if class_id.is_none() {
-        args.iter().map(|a| a.ty.clone()).collect()
-    } else {
-        let fields = ctx.st.get(class_id).ctor_fields.clone();
-        if fields.is_empty() || fields.len() != args.len() {
-            args.iter().map(|a| a.ty.clone()).collect()
-        } else {
-            fields.iter().map(|f| ctx.st.get(*f).ty.clone()).collect()
-        }
-    };
+    let field_tys: Vec<Type> = ctor_param_tys(ctx.st, ctor_sym, class_id, args);
     // `new ArrayDeque[Int]()` / `new Queue[Int]()` / `new Stack[Int]()`:
     // 2.13 declares these as `class Queue[A](initialSize: Int =
     // ArrayDeque.DefaultInitialSize)`, so there is no `<init>()V` to call --
@@ -12018,7 +12088,17 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
         return;
     }
     if is_interface_sym(ctx.st, owner_id) {
-        asm.invokeinterface(&owner, name, &desc);
+        // A trait-private method has no interface signature (see
+        // `is_trait_private_def`): every caller is textually inside the
+        // trait, so it's compiled onto `<Iface>$class` too, and reaching it
+        // is a same-class `invokestatic`, not `invokeinterface` on a
+        // declaration that doesn't exist.
+        if s.flags.contains(Flags::PRIVATE) && !widened(ctx.st, id) {
+            let static_desc = trait_static_desc(&owner, &desc);
+            asm.invokestatic(&format!("{owner}$class"), name, &static_desc);
+        } else {
+            asm.invokeinterface(&owner, name, &desc);
+        }
     } else {
         asm.invokevirtual(&owner, name, &desc);
     }
@@ -17878,6 +17958,23 @@ fn emit_class_constant(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
 /// Whether the typer widened this member's access for companion use.
 fn widened(st: &SymbolTable, sym: SymbolId) -> bool {
     !sym.is_none() && st.get(sym).access_widened
+}
+
+/// A trait method that stays genuinely `private` on the JVM (not widened by
+/// the typer). Real scalac keeps such a method's implementation entirely
+/// inside the interface as a `private` method with a body -- JVMS 4.6
+/// forbids `ACC_PRIVATE | ACC_ABSTRACT` on any method, interface ones
+/// included. Our trait encoding puts every concrete method's body on
+/// `<Iface>$class` instead, so the equivalent is: no abstract declaration on
+/// the interface at all (nothing outside the trait's own `$class` code may
+/// call it), and no mixin forwarder on any implementing class.
+fn is_trait_private_def(st: &SymbolTable, def: &Tree) -> bool {
+    match &def.kind {
+        TreeKind::DefDef { mods, .. } => {
+            mods.flags.contains(Flags::PRIVATE) && !widened(st, def.sym)
+        }
+        _ => false,
+    }
 }
 
 /// The module class of a package's package object, if it has one.
