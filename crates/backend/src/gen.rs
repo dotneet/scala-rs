@@ -1,9 +1,9 @@
 //! Walk a typed compilation unit and emit JVM classfiles (major 52).
 
 use crate::classfile::{
-    encode_method_name, ClassEmit, EmittedClass, Field, Method, Pool, ACC_ABSTRACT, ACC_BRIDGE,
-    ACC_FINAL, ACC_INTERFACE, ACC_NATIVE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER,
-    ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
+    encode_method_name, ClassEmit, EmittedClass, Field, InnerClassEntry, Method, Pool,
+    ACC_ABSTRACT, ACC_BRIDGE, ACC_FINAL, ACC_INTERFACE, ACC_NATIVE, ACC_PRIVATE, ACC_PROTECTED,
+    ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
 };
 use crate::code::{Assembler, Label};
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
@@ -55,6 +55,9 @@ pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpl
         library_abi: false,
         pickles: HashMap::new(),
         boxed_vars: HashSet::new(),
+        // Never consulted: this pass only harvests `trait_impls`/`trait_vals`
+        // / `trait_lazy_vals`, it never finishes a `ClassBuilder`.
+        jvm_index: HashMap::new(),
     };
     g.collect_trait_impls(tree);
     into.impls.extend(g.trait_impls);
@@ -84,6 +87,7 @@ pub fn emit_opts(
         // `scala.runtime.*Ref` exists in both ABIs: on the jar, and as a
         // private-runtime classfile (see `runtime::REF_BOXES`).
         boxed_vars: collect_boxed_vars(tree, st),
+        jvm_index: build_jvm_index(st),
     };
     g.collect_trait_impls(tree);
     g.walk(tree);
@@ -110,6 +114,23 @@ struct Gen<'a> {
     pickles: HashMap<u32, Vec<u8>>,
     /// Locals boxed into `scala.runtime.IntRef` / `ObjectRef` (library ABI).
     boxed_vars: HashSet<SymbolId>,
+    /// JVM internal name → class-like symbol, for the whole symbol table.
+    /// Built once; used to compute `InnerClasses`/`EnclosingMethod`.
+    jvm_index: HashMap<String, SymbolId>,
+}
+
+/// JVM internal name → class-like symbol, for every `Class`/`ModuleClass` in
+/// `st` (the current unit plus everything installed from the classpath).
+/// Built once per [`Gen`] and consulted by [`ClassBuilder::finish_full`] to
+/// compute `InnerClasses` entries without a linear scan per classfile.
+fn build_jvm_index(st: &SymbolTable) -> HashMap<String, SymbolId> {
+    let mut m = HashMap::new();
+    for s in &st.symbols {
+        if matches!(s.kind, SymKind::Class | SymKind::ModuleClass) {
+            m.entry(st.jvm_internal(s.id)).or_insert(s.id);
+        }
+    }
+    m
 }
 
 struct EmitCtx<'a> {
@@ -542,7 +563,55 @@ impl ClassBuilder {
         }
     }
 
+    /// Plain finish, with no `InnerClasses`/`EnclosingMethod` attribute.
+    /// Used for classfiles with no corresponding [`SymbolId`] (synthetic
+    /// helper classes: trait `$class` mixin impls, `DelayedInit` lambda
+    /// bodies, user lambda closures) — nobody reflects on these, and a wrong
+    /// guess from a name pattern is worse than omitting the attribute.
     fn finish(self) -> EmittedClass {
+        self.finish_inner(Vec::new(), None)
+    }
+
+    /// Full finish: computes `InnerClasses` (self, if nested; every direct
+    /// member of `extra_owner`'s class-like symbol, or of the symbol whose
+    /// binary name matches this classfile's own `this_name` if that lookup
+    /// succeeds; and every other nested class referenced anywhere in this
+    /// classfile's own constant pool) plus `EnclosingMethod` (if the class
+    /// itself turns out to be local or anonymous).
+    ///
+    /// `extra_owner` is consulted for the "list my own direct members" rule
+    /// only when `this_name` has no matching symbol — e.g. the mirror class
+    /// nsc calls a static forwarder: `Main` itself is never a symbol (only
+    /// `Main`/`Main$` are), but it should still list the object's own
+    /// nested classes, exactly as scalac's mirror class does.
+    fn finish_full(
+        mut self,
+        st: &SymbolTable,
+        jvm_index: &HashMap<String, SymbolId>,
+        extra_owner: SymbolId,
+    ) -> EmittedClass {
+        // `write_with_pool` (called below, by `finish_inner`) is what
+        // actually interns `super_name`/`interfaces` as `CONSTANT_Class`
+        // entries — method bodies intern their own references as they are
+        // assembled, but the superclass and interface list are still plain
+        // strings at this point. Rule 3 of `compute_inner_classes` (scan the
+        // pool for other referenced nested classes) needs them interned
+        // first, or a class that only reaches a nested interface through
+        // its `implements` clause (`class Circle extends Shape`) misses it.
+        self.pool.class(&self.super_name);
+        for i in &self.interfaces {
+            self.pool.class(i);
+        }
+        let (inner_classes, enclosing_method) =
+            compute_inner_classes(&self.this_name, &self.pool, st, jvm_index, extra_owner);
+        self.finish_inner(inner_classes, enclosing_method)
+    }
+
+    fn finish_inner(
+        self,
+        inner_classes: Vec<InnerClassEntry>,
+        enclosing_method: Option<EnclosingMethod>,
+    ) -> EmittedClass {
         let this_name = self.this_name.clone();
         let class = ClassEmit {
             access: self.access,
@@ -554,6 +623,8 @@ impl ClassBuilder {
             source: self.source,
             scala_signature: self.scala_signature,
             scala_raw: self.scala_raw,
+            inner_classes,
+            enclosing_method,
         };
         let bytes = class.write_with_pool(self.pool).expect("classfile write");
         EmittedClass {
@@ -580,6 +651,181 @@ fn attach_scala_sig(
         return;
     }
     b.scala_signature = Some(crate::pickle::encode_to_annotation_string(&raw));
+}
+
+// ---------------------------------------------------------------------------
+// InnerClasses (JVMS §4.7.6) / EnclosingMethod (JVMS §4.7.7)
+// ---------------------------------------------------------------------------
+
+/// JVMS §4.7.7 `EnclosingMethod`: the enclosing class's binary name, and —
+/// if a method/constructor rather than a field initializer encloses the
+/// class — that method's name and descriptor.
+type EnclosingMethod = (String, Option<(String, String)>);
+
+/// `getSimpleName`/`getEnclosingClass`/`isMemberClass`/`getDeclaringClass`
+/// all read a class's own `InnerClasses` self-entry (and, for a local or
+/// anonymous class, its `EnclosingMethod` attribute). Compute both for the
+/// classfile named `this_name`:
+///
+/// 1. a self-entry, if `this_name` names a nested (member, local, or
+///    anonymous) symbol;
+/// 2. every direct class-like member of that symbol — or, failing that
+///    lookup, of `extra_owner` (the mirror-class case, see
+///    [`ClassBuilder::finish_full`]) — regardless of whether it is otherwise
+///    used in this classfile's own bytecode: scalac always lists a class's
+///    own declared nested classes, not just the ones it happens to
+///    reference (verified against real scalac's `Outer`/`Outer$Level1`
+///    classfiles, which list an unused nested `Level2`);
+/// 3. every *other* nested class whose `CONSTANT_Class` already appears in
+///    this classfile's own constant pool (`new`/`checkcast`/`instanceof`,
+///    a field or method descriptor, the superclass or an interface, an
+///    `$outer` field type, …) — JVMS §4.7.6's actual requirement.
+fn compute_inner_classes(
+    this_name: &str,
+    pool: &Pool,
+    st: &SymbolTable,
+    jvm_index: &HashMap<String, SymbolId>,
+    extra_owner: SymbolId,
+) -> (Vec<InnerClassEntry>, Option<EnclosingMethod>) {
+    let mut entries: Vec<InnerClassEntry> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut enclosing_method = None;
+
+    let self_sym = jvm_index.get(this_name).copied();
+
+    if let Some(id) = self_sym {
+        if let Some((entry, encl)) = describe_nested(st, id, this_name) {
+            seen.insert(entry.inner_class.clone());
+            enclosing_method = encl;
+            entries.push(entry);
+        }
+    }
+
+    let members_owner = self_sym.filter(|id| !id.is_none()).unwrap_or(extra_owner);
+    if !members_owner.is_none() {
+        for m in st.get(members_owner).members.clone() {
+            let mk = st.get(m).kind;
+            if !matches!(mk, SymKind::Class | SymKind::ModuleClass) {
+                continue;
+            }
+            let name = st.jvm_internal(m);
+            if seen.contains(&name) {
+                continue;
+            }
+            if let Some((entry, _)) = describe_nested(st, m, &name) {
+                seen.insert(entry.inner_class.clone());
+                entries.push(entry);
+            }
+        }
+    }
+
+    for name in pool.interned_class_names() {
+        if seen.contains(&name) {
+            continue;
+        }
+        let Some(&id) = jvm_index.get(&name) else {
+            continue;
+        };
+        if let Some((entry, _)) = describe_nested(st, id, &name) {
+            seen.insert(entry.inner_class.clone());
+            entries.push(entry);
+        }
+    }
+
+    entries.sort_by(|a, b| a.inner_class.cmp(&b.inner_class));
+    (entries, enclosing_method)
+}
+
+/// Classify `id` (whose binary name is `name`) as a member, local, or
+/// anonymous nested class, and build its `InnerClasses` entry — or `None`
+/// if `id` is not nested at all (a top-level class/object). The second
+/// element of the pair is only meaningful for a self-entry: the
+/// `EnclosingMethod` this classfile needs if `id` is local/anonymous.
+fn describe_nested(
+    st: &SymbolTable,
+    id: SymbolId,
+    name: &str,
+) -> Option<(InnerClassEntry, Option<EnclosingMethod>)> {
+    let sym = st.get(id);
+    let owner = sym.owner;
+    if owner.is_none() {
+        return None;
+    }
+    let owner_kind = st.get(owner).kind;
+    if owner_kind == SymKind::Package {
+        return None; // top-level: no InnerClasses entry at all.
+    }
+    // A local class's own binary name still gets a `$anon`-free simple
+    // name; only literal anonymous classes (`new T { … }`) are unnamed.
+    let is_anon = sym.name.starts_with("$anon$");
+    let sflags = sym.flags;
+    let mut flags = 0u16;
+    if sflags.contains(Flags::PRIVATE) {
+        flags |= ACC_PRIVATE;
+    } else if sflags.contains(Flags::PROTECTED) {
+        flags |= ACC_PROTECTED;
+    } else {
+        flags |= ACC_PUBLIC;
+    }
+
+    if is_anon || owner_kind == SymKind::Method {
+        // Local or anonymous: JVMS says `outer_class_info_index` is zero.
+        // scalac never sets `ACC_STATIC` here either way (matches real
+        // scalac output for a local class in a module method).
+        if is_anon || sflags.contains(Flags::FINAL) {
+            flags |= ACC_FINAL;
+        }
+        let inner_name = if is_anon {
+            None
+        } else {
+            Some(sym.name.clone())
+        };
+        let (enclosing_class, method_info) = if owner_kind == SymKind::Method {
+            let mowner = st.get(owner).owner;
+            (
+                mowner,
+                Some((st.get(owner).name.clone(), method_desc_from_sym(st, owner))),
+            )
+        } else {
+            (owner, None)
+        };
+        if enclosing_class.is_none() {
+            return None;
+        }
+        let entry = InnerClassEntry {
+            inner_class: name.to_string(),
+            outer_class: None,
+            inner_name,
+            access_flags: flags,
+        };
+        let encl = (st.jvm_internal(enclosing_class), method_info);
+        return Some((entry, Some(encl)));
+    }
+
+    if !matches!(owner_kind, SymKind::Class | SymKind::ModuleClass) {
+        // Unrecognized owner shape (e.g. a `Term`/`Module` symbol slipped
+        // through) — be conservative and omit rather than guess.
+        return None;
+    }
+
+    // Member class: `static` means "no `$outer` field" (nsc's optimization
+    // for anything nested inside a module, which is a process-wide
+    // singleton and so never needs one). `final` mirrors the source
+    // modifier, except nsc never sets it for a module class itself (an
+    // object's implicit `final` is not a written modifier).
+    if outer_field_desc(st, id).is_none() {
+        flags |= ACC_STATIC;
+    }
+    if sflags.contains(Flags::FINAL) && sym.kind != SymKind::ModuleClass {
+        flags |= ACC_FINAL;
+    }
+    let entry = InnerClassEntry {
+        inner_class: name.to_string(),
+        outer_class: Some(st.jvm_internal(owner)),
+        inner_name: Some(sym.name.clone()),
+        access_flags: flags,
+    };
+    Some((entry, None))
 }
 
 // ---------------------------------------------------------------------------
@@ -2002,7 +2248,8 @@ impl<'a> Gen<'a> {
                 }
             }
             attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
-            self.out.push(b.finish());
+            self.out
+                .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
             self.emit_trait_impl_class(tree, &this_name);
             return;
         }
@@ -2107,7 +2354,8 @@ impl<'a> Gen<'a> {
         self.emit_value_class_methods(&mut b, class_id);
         self.emit_erasure_bridges(&mut b, class_id);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
-        self.out.push(b.finish());
+        self.out
+            .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
     }
 
     fn delayed_body_class(class_name: &str) -> String {
@@ -4301,7 +4549,8 @@ impl<'a> Gen<'a> {
         // same bridge a class gets, or the parent's signature stays abstract.
         self.emit_erasure_bridges(&mut b, cls);
         attach_scala_sig(&mut b, self.st, cls, &self.pickles);
-        self.out.push(b.finish());
+        self.out
+            .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
 
         let top_level = if cls.is_none() {
             true
@@ -4458,7 +4707,8 @@ impl<'a> Gen<'a> {
         self.emit_module_clinit(&mut b);
         emit_case_apply(&mut b, self.st, class_id);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
-        self.out.push(b.finish());
+        self.out
+            .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
     }
 
     fn emit_forwarder(
@@ -4495,7 +4745,14 @@ impl<'a> Gen<'a> {
             });
         }
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
-        self.out.push(b.finish());
+        // `class_id` is the module's own symbol: `fwd_name` (`Main`, no `$`)
+        // never matches a symbol's own jvm name, so the self-entry lookup
+        // always misses here — but scalac's mirror class still lists the
+        // object's own nested classes unconditionally (verified against
+        // real scalac's `Main.class`), so pass it through as the fallback
+        // "list my members" owner.
+        self.out
+            .push(b.finish_full(self.st, &self.jvm_index, class_id));
     }
 
     fn find_class_named(&self, name: &str) -> Option<SymbolId> {
