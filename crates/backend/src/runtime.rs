@@ -120,6 +120,8 @@ impl B {
             source: SRC.into(),
             scala_signature: None,
             scala_raw: false,
+            inner_classes: Vec::new(),
+            enclosing_method: None,
         };
         let bytes = class.write_with_pool(self.pool).expect("runtime classfile");
         EmittedClass {

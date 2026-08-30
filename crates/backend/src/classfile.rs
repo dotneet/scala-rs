@@ -7,6 +7,7 @@ pub use scala_rs_pickle::names::{decode_method_name, encode_method_name};
 
 pub const ACC_PUBLIC: u16 = 0x0001;
 pub const ACC_PRIVATE: u16 = 0x0002;
+pub const ACC_PROTECTED: u16 = 0x0004;
 pub const ACC_STATIC: u16 = 0x0008;
 pub const ACC_FINAL: u16 = 0x0010;
 pub const ACC_SUPER: u16 = 0x0020;
@@ -23,6 +24,23 @@ pub struct EmittedClass {
     /// e.g. `"Main"`, `"Main$"`, `"scala/Option"`
     pub internal_name: String,
     pub bytes: Vec<u8>,
+}
+
+/// One entry of the JVMS §4.7.6 `InnerClasses` attribute.
+#[derive(Clone, Debug)]
+pub struct InnerClassEntry {
+    /// Internal name of the nested class this entry describes.
+    pub inner_class: String,
+    /// Internal name of the class it is a *member* of. `None` for a local or
+    /// anonymous class (JVMS: `outer_class_info_index` is zero).
+    pub outer_class: Option<String>,
+    /// Source simple name. `None` for an anonymous class (JVMS:
+    /// `inner_name_index` is zero); local classes still carry one.
+    pub inner_name: Option<String>,
+    /// Source-level modifiers (`public`/`private`/`protected`, `static` for
+    /// "has no enclosing instance", `final`) — distinct from the nested
+    /// class's own classfile `access_flags`.
+    pub access_flags: u16,
 }
 
 /// JVMS §4.4.7 modified UTF-8 (U+0000 as `C0 80`).
@@ -206,6 +224,21 @@ impl Pool {
         i
     }
 
+    /// Internal names of every `CONSTANT_Class` already interned in this pool
+    /// (from actual bytecode: `new`/`checkcast`/`instanceof`, method and
+    /// field descriptors, the superclass and interface list, …). Used to
+    /// compute the `InnerClasses` attribute: JVMS §4.7.6 requires an entry
+    /// for every member class that appears anywhere in the constant pool.
+    pub fn interned_class_names(&self) -> Vec<String> {
+        self.class.keys().cloned().collect()
+    }
+
+    /// Public wrapper for [`Pool::nat`], needed to build an `EnclosingMethod`
+    /// attribute's `method_index` from outside this module.
+    pub fn name_and_type(&mut self, name: &str, desc: &str) -> u16 {
+        self.nat(name, desc)
+    }
+
     pub fn write_header(&self, w: &mut Vec<u8>) {
         w.extend_from_slice(&self.count.to_be_bytes());
         w.extend_from_slice(&self.bytes);
@@ -257,6 +290,15 @@ pub struct ClassEmit {
     pub scala_signature: Option<String>,
     /// nsc `Scala` attribute: pickle lives on the companion / mirror class.
     pub scala_raw: bool,
+    /// JVMS §4.7.6 `InnerClasses` entries. Empty means the attribute is
+    /// omitted entirely (a class that neither is, nor references, any
+    /// nested class).
+    pub inner_classes: Vec<InnerClassEntry>,
+    /// JVMS §4.7.7 `EnclosingMethod`, for a local or anonymous class: the
+    /// binary name of the innermost enclosing class, and — if it is
+    /// enclosed by a method/constructor rather than by a field initializer —
+    /// that method's name and descriptor.
+    pub enclosing_method: Option<(String, Option<(String, String)>)>,
 }
 
 impl ClassEmit {
@@ -298,6 +340,31 @@ impl ClassEmit {
             None
         };
         let sig_utf8 = self.scala_signature.as_deref().map(|s| pool.utf8(s));
+        let inner_classes_attr = if self.inner_classes.is_empty() {
+            None
+        } else {
+            Some(pool.utf8("InnerClasses"))
+        };
+        let inner_classes_idxs: Vec<(u16, u16, u16, u16)> = self
+            .inner_classes
+            .iter()
+            .map(|e| {
+                let inner = pool.class(&e.inner_class);
+                let outer = e.outer_class.as_deref().map_or(0, |o| pool.class(o));
+                let name = e.inner_name.as_deref().map_or(0, |n| pool.utf8(n));
+                (inner, outer, name, e.access_flags)
+            })
+            .collect();
+        let enclosing_method_attr = if self.enclosing_method.is_some() {
+            Some(pool.utf8("EnclosingMethod"))
+        } else {
+            None
+        };
+        let enclosing_method_idxs = self.enclosing_method.as_ref().map(|(cls, m)| {
+            let c = pool.class(cls);
+            let nt = m.as_ref().map_or(0, |(n, d)| pool.name_and_type(n, d));
+            (c, nt)
+        });
         let method_rva = if self.methods.iter().any(|m| !m.java_annots.is_empty()) {
             Some(pool.utf8("RuntimeVisibleAnnotations"))
         } else {
@@ -378,8 +445,31 @@ impl ClassEmit {
         let n_class_attrs = 1u16
             + if rva_attr.is_some() { 1 } else { 0 }
             + if scala_sig_attr.is_some() { 1 } else { 0 }
-            + if scala_raw_attr.is_some() { 1 } else { 0 };
+            + if scala_raw_attr.is_some() { 1 } else { 0 }
+            + if inner_classes_attr.is_some() { 1 } else { 0 }
+            + if enclosing_method_attr.is_some() {
+                1
+            } else {
+                0
+            };
         out.extend_from_slice(&n_class_attrs.to_be_bytes());
+        if let Some(ic) = inner_classes_attr {
+            out.extend_from_slice(&ic.to_be_bytes());
+            out.extend_from_slice(&((2 + inner_classes_idxs.len() * 8) as u32).to_be_bytes());
+            out.extend_from_slice(&(inner_classes_idxs.len() as u16).to_be_bytes());
+            for (inner, outer, name, flags) in &inner_classes_idxs {
+                out.extend_from_slice(&inner.to_be_bytes());
+                out.extend_from_slice(&outer.to_be_bytes());
+                out.extend_from_slice(&name.to_be_bytes());
+                out.extend_from_slice(&flags.to_be_bytes());
+            }
+        }
+        if let (Some(em), Some((c, nt))) = (enclosing_method_attr, enclosing_method_idxs) {
+            out.extend_from_slice(&em.to_be_bytes());
+            out.extend_from_slice(&4u32.to_be_bytes());
+            out.extend_from_slice(&c.to_be_bytes());
+            out.extend_from_slice(&nt.to_be_bytes());
+        }
         if let Some(raw) = scala_raw_attr {
             // nsc pickleMarkerForeign: pickle is on the companion / mirror.
             out.extend_from_slice(&raw.to_be_bytes());
