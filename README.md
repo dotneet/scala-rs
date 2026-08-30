@@ -476,6 +476,67 @@ view bound（`def f[A <% B]`、同じ implicit パラメータに脱糖される
 無い変換は nsc と同じく適用対象外です（そうしないと `orderingToOrdered` が
 `Box[Int] => Ordered[Box[Int]]` を名乗って、あとから `Ordering[Box[Int]]` が作れずに落ちます）。
 
+#### ローカルスコープの implicit 変換（view）
+
+`agent/localconv` スライス。実 scalac との差分テストで見つかった非対称です:
+implicit パラメータの探索（`fill_implicit_params_in` → `Typer::implicits_in_scope`）は
+メソッド本体 / ブロック / ラムダ本体に書いた `implicit val` / `implicit def` をちゃんと
+見つけるのに、view 探索（`search_conversion` / `search_extension`）は SLS 7.3 の言う
+「implicit パラメータと同じ候補プール」を実際には見ていませんでした。両方とも
+`implicits_in_scope` を呼んでいるので同じスコープ連鎖を歩くはずなのに、根本原因は
+3 つとも view 探索そのものではなく、その手前にありました。
+
+1. **`Typer::type_def_sig` が `Flags::IMPLICIT` をローカルの `def` にコピーしていなかった。**
+   クラス / object のメンバーは namer（`namer_member`）が `type_def_sig` より前に
+   完全な flag（`implicit` 込み）でシンボルを確保しているので問題が出ませんが、
+   ブロック内のローカル `def` には namer パスが無く、`type_def_sig` 自身が
+   `tree.sym.is_none()` を見て `Flags::EMPTY` で新規にシンボルを確保します。
+   その後 `LOCAL` / `PRIVATE` / `PROTECTED` はコピーするのに `IMPLICIT` だけ
+   コピーしていなかったため、ローカル `implicit def` はブロックのスコープに
+   正しく入っているのに、どの探索（`implicits_in_scope` は `Flags::IMPLICIT` で
+   絞り込む）にも一切見えていませんでした。
+2. **`implicit class` の desugar（`Typer::implicit_class_conversions`。
+   `implicit class C(x: P) { … }` → 合成 `implicit def C(x: P): C = new C(x)`）が
+   クラス / module のメンバーに対してしか走っていなかった。** ブロックの
+   `TreeKind::Block` 処理はローカル `class` / `object` を名前解決するだけで、
+   このデシュガーを一度も呼んでいなかったので、ローカル `implicit class` は
+   変換メソッドそのものが存在せず、探索する以前の問題でした。
+3. **`implicits_in_scope` のスコープ探索がシャドーイングをしていなかった。**
+   SLS 7.2 の候補は「プレフィックス無しで参照できる識別子」、つまり普通の
+   非修飾名前解決の対象で、これは**シャドーする**はずです。ところが実装は
+   スコープスタックの全レベルを just walk して `Flags::IMPLICIT` を持つシンボルを
+   重複除去なしで集めていたので、外側の `implicit def i2s` と同名のローカル
+   `implicit def i2s` が「シャドーされて 1 個だけ見える」ではなく
+   「2 個の候補があって `ambiguous implicit: i2s, i2s`」になっていました。
+   いまは内側から外側へスコープを歩きながら「このスコープで初めて見る名前」だけを
+   採用し、一度採用した名前は外側のスコープでは無視します（同名のインスタンス
+   メンバー / package object メンバーも同様にシャドーされます）。
+
+3 つとも直したうえで、副作用として見つかったもう一つの独立したバグも直しています:
+
+4. **`crates/typer/src/lambda_lift.rs` の自由変数解析が、ローカルクラスを
+   `new` するネストしたローカル `def` に、そのクラス自身が要求する capture を
+   伝播していなかった。** `implicit class` のデシュガー結果（`new C(x)`）は
+   必ず合成メソッドという「別のネストしたローカル `def`」の中に置かれるので、
+   `class C(...) { ... factor ... }` のようにローカルを capture するクラスを
+   ローカル `implicit class` にすると必ず踏みます。scalac が受理する
+   `val factor = 10; class F(...) { def scaled = n * factor }; def helper() = new F(3).scaled`
+   のような**素の**（implicit と無関係な）コードでも同じ形で再現し、
+   `RuntimeException: cannot capture factor` を実行時に投げていました。
+   `Symbol::captures`（どのローカルを capture するか）は `mark_anon_captures` が
+   計算しますが、ドライバはそれを `lambda_lift` の**あと**に走らせるため、
+   `lambda_lift` 自身の自由変数解析（`collect_captures`）が `new F(x)` を見た
+   時点ではまだ空でした。`lambda_lift` の入口で `mark_anon_captures` を先に
+   一度呼んで（ドライバの 2 回目の呼び出しはリフト後の木に対して再計算するだけで
+   無害）`Symbol::captures` を先に埋め、`collect_captures` の `New` の枝で
+   参照先クラスの capture を（`own` でフィルタしながら）自分の capture にも
+   加えるようにしました。
+
+優先順位はローカル > import（スコープに入るのでローカルと同列） > コンパニオン
+のまま変えていません（`search_conversion` / `search_conversion_open` /
+`view_undet_bindings` はどれも先に `implicits_in_scope`、空ならコンパニオン、
+という順序）。
+
 #### 埋まらなかった implicit 節を黙って eta 展開しない
 
 implicit しか取らないメソッドは値ではありません。nsc はその節を適用するか、
@@ -3092,6 +3153,26 @@ interface がスーパークラスを継承せず、`T$class` 本体が継承メ
 異常系 6 本はすべて**両モードで**（`--no-scala-library` と `--scala-library`）診断されることを
 確認しており、文面は real scalac 2.13.16 のものです。`trex_mixin_bad` は名前付きクラスと匿名クラスの
 両方で拒否され、しかも**テンプレート 1 つにつき 1 件**（ヘッダパスとの二重報告なし）であることも見ます。
+
+`agent/localconv` スライス（メソッド本体 / ブロック / ラムダ本体に書いたローカルの
+`implicit val` / `implicit def` / `implicit class` が view 探索から見えていなかった件。
+「実装している言語サブセット」の「ローカルスコープの implicit 変換（view）」節を参照）の
+フィクスチャは接頭辞 `lc`（`lc_param` / `lc_class` / `lc_conv` / `lc_shadow` / `lc_capture` /
+`lc_outofscope_bad` / `lc_ambiguous_bad`）で、同じ理由から `crates/cli/tests/localconv.rs` に
+置いています。`lc_param.scala` はローカルの `implicit val` がネストした `def` の implicit
+パラメータを埋める、直していない対照群（修正前から動いていた経路）です。`lc_class.scala` は
+ローカルの `implicit class` がメソッド本体・入れ子の `def`・ラムダ本体の 3 か所すべてから
+拡張メソッドとして見つかること、`lc_conv.scala` はローカルの `implicit def` が代入の型強制と、
+別に宣言したローカルクラスへの拡張メソッド源の両方に効くことを見ます。`lc_shadow.scala` は
+外側の `implicit def i2s` と同名のローカル `implicit def i2s` が**シャドー**すること（scalac
+と同じ `inner5`。曖昧にならないこと）、`lc_capture.scala` はローカルの `implicit class` が
+別のローカル（`factor`）を捕捉する形で、合成された変換メソッドという別のネストしたローカル
+`def` を経由して `new` される、という `lambda_lift` の自由変数解析の独立したバグを踏むケース
+です。すべて**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせ、
+`expected/*.txt` は real scalac 2.13.16 の stdout そのものです。`lc_outofscope_bad.scala` は
+兄弟メソッドに書いた `implicit class` が見えないこと（`value dbl is not a member of 3`）、
+`lc_ambiguous_bad.scala` は同じ特定度のローカル `implicit def` が 2 つあると scalac と同じ
+`ambiguous implicit` になることを、両方とも両モードで固定します。
 ### オーバーライドの適合検査（`agent/override`）
 
 SLS 5.1.4 "Overriding"（nsc の `RefChecks.checkOverride`）と SLS 5.2.6

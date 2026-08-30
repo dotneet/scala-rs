@@ -3579,6 +3579,22 @@ impl Typer {
                 let f = self.st.get(tree.sym).flags.with(Flags::PROTECTED);
                 self.st.get_mut(tree.sym).flags = f;
             }
+            // A class/module member's `implicit` is already on the symbol --
+            // the namer pre-allocates it (`namer_member`) with the full flag
+            // set before `type_def_sig` ever runs. A *local* `def` inside a
+            // block has no such namer pass: `tree.sym.is_none()` above
+            // allocates it fresh with `Flags::EMPTY`, and until now nothing
+            // ever copied `implicit` from the modifiers onto that symbol. Every
+            // implicit search (`implicits_in_scope`, used by both
+            // `search_implicit` for implicit *parameters* and by
+            // `search_conversion` / `search_extension` for views) filters
+            // candidates on `Flags::IMPLICIT`, so a local `implicit def` used
+            // as a view or an extension source was silently invisible even
+            // though it was correctly entered into the block's scope.
+            if mods_flags.contains(Flags::IMPLICIT) {
+                let f = self.st.get(tree.sym).flags.with(Flags::IMPLICIT);
+                self.st.get_mut(tree.sym).flags = f;
+            }
         }
         let _ = name;
     }
@@ -5280,6 +5296,21 @@ impl Typer {
                     {
                         self.namer(s);
                     }
+                }
+                // `implicit class C(x: P) { ... }` desugars to a synthetic
+                // `implicit def C(x: P): C = new C(x)` (SLS: nsc does this at
+                // the namer). `type_class`/`namer_class` and `namer_module`
+                // already run this for class/module *members*
+                // (`implicit_class_conversions` below); a block never did,
+                // so a local `implicit class` had no conversion method at all
+                // to search for, even after the local-implicit-def fix above.
+                // `namer_member` both allocates the symbol with the full flag
+                // set (`implicit` included) and enters it into the block's
+                // current scope, exactly as for a class/module body.
+                let conversions = implicit_class_conversions(stats);
+                for mut conv in conversions {
+                    self.namer_member(&mut conv);
+                    stats.push(conv);
                 }
                 // A local `def` is in scope for the whole block, so it may be
                 // called before it is written -- and two of them may call each

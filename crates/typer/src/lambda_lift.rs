@@ -13,6 +13,17 @@ use crate::symbol::{SymKind, SymbolTable};
 
 /// Rewrite `tree` in place: hoist nested defs and thread captured locals.
 pub fn lambda_lift(tree: &mut Tree, st: &mut SymbolTable) {
+    // The driver runs `mark_anon_captures` *after* this pass (it wants the
+    // already-lifted tree shape for the final, backend-facing answer). But a
+    // nested `def` that constructs a local class needing its own captured
+    // locals (`class F(...) { def m = ... factor ... }; def helper() = new
+    // F(x)`) has to receive `factor` too -- `collect_captures`'s `New` arm
+    // below reads it off `Symbol::captures`, which is otherwise still empty
+    // at this point. Seed it early from the pre-lift tree, which is exactly
+    // the shape `mark_anon_captures`'s own walk expects; the driver's later
+    // call recomputes it from the lifted tree and simply overwrites this with
+    // the same (or, for classes touched by lifting, the final) answer.
+    crate::anon_capture::mark_anon_captures(tree, st);
     let mut l = Lifter { st, gensym: 0 };
     l.lift_tree(tree);
 }
@@ -521,7 +532,22 @@ fn collect_captures(
             collect_captures(expr, own, out, st)
         }
         TreeKind::LabelDef { rhs, .. } => collect_captures(rhs, own, out, st),
-        TreeKind::New { tpt } => collect_captures(tpt, own, out, st),
+        TreeKind::New { tpt } => {
+            collect_captures(tpt, own, out, st);
+            // `new F(x)` where `F` is a local class that itself reads an
+            // enclosing-method local (`class F(...) { def m = ... factor
+            // ... }`) needs that local threaded into *this* nested def too --
+            // nothing here references `factor` by name, only `F`'s own
+            // constructor call does, once the backend adds the capture as an
+            // extra constructor argument. `Symbol::captures` is seeded before
+            // this pass runs (see `lambda_lift`) precisely so this is
+            // available already.
+            if !tpt.sym.is_none() && st.get(tpt.sym).kind == SymKind::Class {
+                for c in st.get(tpt.sym).captures.clone() {
+                    consider_capture(c, own, out, st);
+                }
+            }
+        }
         TreeKind::ClassDef {
             vparamss, impl_, ..
         } => {
