@@ -11,7 +11,7 @@ scala-rs は、Scala 2.13 の構文と意味論のごく一部を、Rust から 
 - フロントエンドは nsc の `Tree` に近い AST を持ちます。
 - ターゲットは Java 8 相当の classfile（major version 52）です。Code 属性に StackMapTable（full_frame）を出します。
 - デフォルトでは scala-library を同梱しません。Option / List / FunctionN は **scala-rs 独自のランタイム classfile**（`scala/Option` など）です。
-- `--scala-library [<jar>]`（または `SCALA_LIBRARY_JAR`）を付けると、Option / List / FunctionN / Tuple2 に加え、`Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）、`any2stringadd`（`1 + "x"`）、`ArrowAssoc` の `->`、`intWrapper` / `RichInt`（`1.abs` / `1.max` / `1.to`）、`longWrapper` / `doubleWrapper` / `charWrapper`（`(-3L).abs` / `1.0.max` / `'9'.isDigit`）、`StringOps`（`augmentString` 経由の `toInt` / `length` / `*` / `take` / `drop` / `isEmpty`）、`WithFilter` / `Iterator`、`Map` / `Vector` / `List` / `Set`（varargs `apply` を含む）、**`scala.jdk.CollectionConverters` の `asScala` / `asJava`** は **scala-library 2.13.16 の ABI** にリンクし、衝突する私有 classfile は出しません。jar パスを省略すると `SCALA_LIBRARY_JAR`、`/tmp/scala-rs-lib`、cwd を探します。**`scala-rs compile` と `scala-rs run` は、jar が自動検出できればそれを既定で使い**、見つからなければ私有ランタイムに落ちます。**`--no-scala-library` は私有ランタイムを強制**します。jar リンク時はさらに **right-biased な `Either`**（`map` / `flatMap` / `fold` / `swap` / `toOption` / `filterOrElse` / `left` の `LeftProjection`）と **`scala.util.Try`**（`recover` / `recoverWith` / `transform` / `toEither` / `withFilter`）も乗り、どちらも `for` 内包表記で使えます。
+- `--scala-library [<jar>]`（または `SCALA_LIBRARY_JAR`）を付けると、Option / List / FunctionN / Tuple2 に加え、`Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）、`any2stringadd`（`1 + "x"`）、`ArrowAssoc` の `->`、`intWrapper` / `RichInt`（`1.abs` / `1.max` / `1.to`）、`longWrapper` / `doubleWrapper` / `charWrapper`（`(-3L).abs` / `1.0.max` / `'9'.isDigit`）、`StringOps`（`augmentString` 経由の `toInt` / `length` / `*` / `take` / `drop` / `isEmpty` ほか。**prelude に無いメンバは jar の `ScalaSignature` から補完**します — `agent/stringops8` の節を参照）、`WithFilter` / `Iterator`、`Map` / `Vector` / `List` / `Set`（varargs `apply` を含む）、**`scala.jdk.CollectionConverters` の `asScala` / `asJava`** は **scala-library 2.13.16 の ABI** にリンクし、衝突する私有 classfile は出しません。jar パスを省略すると `SCALA_LIBRARY_JAR`、`/tmp/scala-rs-lib`、cwd を探します。**`scala-rs compile` と `scala-rs run` は、jar が自動検出できればそれを既定で使い**、見つからなければ私有ランタイムに落ちます。**`--no-scala-library` は私有ランタイムを強制**します。jar リンク時はさらに **right-biased な `Either`**（`map` / `flatMap` / `fold` / `swap` / `toOption` / `filterOrElse` / `left` の `LeftProjection`）と **`scala.util.Try`**（`recover` / `recoverWith` / `transform` / `toEither` / `withFilter`）も乗り、どちらも `for` 内包表記で使えます。
 
 完成した Scala コンパイラではありません。仕様への完全準拠も主張しません。
 
@@ -2129,6 +2129,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/smallgaps` スライス（`@inline` / `@noinline` の配置、curried case class companion、companion への後方参照、`Option.flatMap` の多相性、`None`/`Some` の `lub`、`Iterable.apply`）のフィクスチャは接頭辞 `sgap`（`sgap` / `sgap_lib`）で、同じ理由から `crates/cli/tests/smallgaps.rs` に置いています。`sgap.scala` は `--no-scala-library` で `check` 済み、`sgap_lib.scala` は `Iterable.apply` が library ABI（`IterableFactory$Delegate.apply` の継承）にしか無いため library dual-run 専用（`fixtures_sgap_lib_without_library_is_error` で `--no-scala-library` が診断のまま残ることも見ています）。
 
+`agent/stringops8` スライス（`StringOps` を jar の `ScalaSignature` から補完する経路）のフィクスチャは接頭辞 `so8`（`so8` / `so8_bad`）で、同じ理由から `crates/cli/tests/stringops8.rs` に置いています。`so8.scala` は `StringOps` が library ABI にしか無いため library dual-run 専用で、**期待値は実 scalac 2.13.16 の stdout そのもの**です（`java -Xverify:all` で一致を確認）。`fixtures_so8_without_library_is_error` は `--no-scala-library` で 40 件の診断が出続けること（黙って通さないこと）を、`fixtures_so8_bad_collect_result_type_is_error` は戻り型だけのオーバーロードが「解決はする」だけでは不十分で、`Int` を返す case ブロックの `collect` を `String` に束縛できないことを固定します。
+
 `agent/catsimpl` スライス（ラムダが囲いの `this` を捕まえる、cats の syntax 形の暗黙変換、コンパニオンの implicit スコープ、デフォルト引数を省いた呼び出しの by-name 引数）のフィクスチャは接頭辞 `cats`（`cats_lambda` / `cats_lambda2` / `cats_syntax` / `cats_syntax_bad` / `cats_byname`）で、同じ理由から `crates/cli/tests/catsimpl.rs` に置いています。`cats_lambda.scala` は `List.map` / `flatMap` を使うので library dual-run 専用、`cats_lambda2.scala` は同じ捕捉をライブラリのコレクション抜きで書いてあるので**私有ランタイムと `--scala-library` の両方**で走ります。`cats_syntax.scala` は `implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])` を自前で書いた 1 ファイル版で、抽象 `F[_]` と具象 `Box` の両方の受け手を通します。`cats_syntax_bad.scala` は、変換のパラメータを「1 引数に適用された任意の型」まで広げたことで**witness の無い型にまで変換が挿さらない**こと（scalac と同じ `value flatMap is not a member of Bag[Int]`）を固定します。`a_higher_kinded_companion_implicit_crosses_a_jar` はライブラリを自分でコンパイルして jar に詰め、`ScalaSignature` だけを通して `Async[Box]` ＝ `Box.asyncForBox` が見つかることと、**witness の無い型は依然として hard error**（`could not find implicit value of type Async[Crate]`）であることを両方見ます。
 
 `agent/catsyntax` スライス（cats の syntax による拡張メソッドが本物の cats に届くまで）のフィクスチャは接頭辞 `csyn`（`csyn_ops` / `csyn_ops_bad`）で、同じ理由から `crates/cli/tests/catsyntax.rs` に置いています。`csyn_ops.scala` は cats の `Ops[F[_], A]` と同じ形の受け手に `map` / `flatMap` / `foreach` を呼ぶもので、**暗黙変換を一切使わずに**（`new Ops[Box, Int](b)`）ラムダの引数型が第 1 型引数の `Box` になっていたずれを固定します。私有ランタイムと `--scala-library` の両方で走ります。`csyn_ops_bad.scala` は、ラムダに宣言どおりの引数型を与えても witness の無い呼び出しは通らないこと（`could not find implicit value of type FlatMap[Bag]`）を固定します。`a_simulacrum_style_syntax_layer_crosses_a_jar` は **実 scalac** で小さな cats（`Ops[F, A] { type TypeClassType = FlatMap[F] }` という refinement 結果型、パッケージオブジェクトの入れ子 `object all`、その `all` を `InnerClasses` に載せるだけの無関係なクラス）をコンパイルして jar に詰め、`ScalaSignature` だけを通して `b.flatMap(…)` と `b >> …` が解決し、`java -Xverify:all` で走ることを見ます。自前の pickle ライタは `REFINEDtpe` を出さないので、この fixture は scalac が書いたものでなければ意味がありません（scalac が無い環境では skip します）。同じテストで、witness の無い `Crate` には変換が挿さらないこと（`value flatMap is not a member of Crate[Int]`）も見ます。
@@ -2361,6 +2363,8 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `using3.scala` | `scala.util.Using.resources`（2 つの `AutoCloseable`、成功時と throw 時に close。library dual-run のみ。`Using.apply` / `Using.Manager` / `Using.resource` は触らない。私有 classfile は出さない） | `10` `1` `1` `caught` `1` `1` |
 | `array_ops20.scala` | ArrayOps `lengthIs` / `sizeIs` / `indexOf` / `copyToArray` / `iterator`（library dual-run のみ。`zipWithIndex`/`knownSize`/`sizeCompare`/`filterNot`/`headOption`/`lastOption`/`partition`/`splitAt`/`span`/`find`/`contains`/`distinct` とそれ以前は触らない） | `3` `3` `1` `-1` `3` `1` `3` `0` `1` `2` |
 | `string_ops24.scala` | `StringOps.++` / `lengthIs` / `sizeIs` / `flatMap`（library dual-run のみ。`iterator`/`sizeCompare`/`knownSize`/`appendedAll`/`prependedAll`/`>`/`>=`/`<=`/`compare`/`patch` とそれ以前は触らない） | `abcd` `3` `3` `xyxy` |
+| `so8.scala` | `StringOps` を pickle から補完する経路（`agent/stringops8`）：`zipWithIndex` / `zip` / `scanLeft`（`wrapString` 経由）、`sliding` / `groupBy` / `sortBy` / `sortWith` / `distinctBy` / `collect`×2 / `partition` / `span` / `splitAt` / `tails` / `inits` / `permutations` / `combinations` / `indexWhere` / `lastIndexWhere` / `fold` / `prepended` / `appended` / `:++` / `++:` / `linesWithSeparators` / `view` / `apply` / `s(i)` / `withFilter` / `addString`×3（library dual-run のみ。期待出力は実 scalac 2.13.16 の stdout そのまま） | `Vector((a,0), …)` … `[a-b-c-d-e-f]` |
+| `so8_bad.scala` | 戻り型だけのオーバーロードが**区別**できること：`Int` を返す case ブロックの `collect` は `IndexedSeq[B]` を選ぶので `String` に束縛できない（異常系。scalac も拒否する） | `type mismatch` |
 | `view.scala` | `List.view.map.toList` と `View.fill` / `View.iterate`（library dual-run のみ。私有 View classfile は出さない） | `List(2, 3, 4)` `List(7, 7, 7)` `List(1, 2, 3, 4)` |
 | `coll_arraybuffer1.scala` | `mutable.ArrayBuffer[Int]()` の `mkString(0/1/3)` / `length` / `size` / `isEmpty` / `nonEmpty` / `head` / `last` / `foreach` / `map` / `filter` / `toList` / `iterator` / `contains` / `indexOf` / `reverse` / `foldLeft` / `append` / `++=` / `-=` / `insert` / `remove` / `sortBy` / `sorted` / `clear`（library dual-run のみ。既存 `apply` / `update` / `+=` は触らない） | `1 4 9 16 25` … `true` |
 | `coll_listbuffer1.scala` | `mutable.ListBuffer[Int]()` の同じメンバー一式（library dual-run のみ。`ArrayBuffer` と同じ実装パターン） | `coll_arraybuffer1.scala` と同一出力 |
@@ -2949,8 +2953,107 @@ arguments (21)` になります。名前渡し自体は壊れていません
   「クラス `Outcome` の入れ子」と「オブジェクト `Outcome` の入れ子」を
   区別しないので、直すには `InnerClasses` の `outer_class_info_index`
   （`parse_inner_classes` は今これを捨てています）か pickle が要ります。
+### `StringOps` を jar から読む（`agent/stringops8`）
+
+`"abcdef".zipWithIndex` / `.sliding(2)` / `.groupBy(identity)` / `.sortBy(…)` /
+`.collect { … }` などが軒並み `is not a member of String` になっていました。
+原因は `StringOps` が **prelude に手書きされていた**ことで、1 メソッド足りない
+たびに手で足す形になっており、穴が延々出る構造でした。
+
+**結論: jar から読む形に寄せられます。そしてそれが本筋でした。**
+
+読む仕組み自体は既にありました。`crates/pickle`（`ScalaSignature` リーダー）と
+`crates/typer/src/pickle_supply.rs`（「prelude に無いメンバだけ、必要になった
+ときに pickle から補完する」）が揃っており、`List` などはこの経路で穴が
+埋まります。欠けていたのは**接続**だけでした:
+
+- `Check::supply_from_pickle` は**レシーバ**の型にしか聞いていませんでした。
+  `"abc".groupBy(f)` のレシーバは `java.lang.String` で、これは
+  `ScalaSignature` を持たないので、必ず空手で帰ってきます
+  (`[pickle] #groupBy: asking String (java/lang/String)`)。
+- 暗黙変換の候補探索 `Check::search_extension` は、変換の**結果**
+  （`StringOps`）に対して `lookup_member` を引くだけで、pickle には一切
+  聞いていませんでした。
+
+そこで `search_extension` に「prelude が何も持っていないときだけ、変換結果の
+pickle に聞く」1 か所を足しました。`pickle_supply` の 3 原則（prelude が常に
+勝つ／表現できないものは供給しない／先読みしない）はそのままです。
+
+これが効くのは、prelude が `StringOps` の**クラスの殻**（`parents = [AnyVal]` と
+`ctor_fields = [repr: String]`）を持ち続けるからです。`SymbolTable::is_value_class`
+がこの 2 つで決まり、backend の `invoke_value_extension` →
+`value_extension_desc` が「シンボルの型から descriptor を作り、レシーバの
+`Ljava/lang/String;` を先頭に足して `<name>$extension` を invokestatic する」
+という 2.13 の規約そのままなので、pickle が入れたメンバも**そのまま正しく
+リンクします**（pickle 由来のシンボルは classfile から読んだ erased
+descriptor を `jvm_name` に持ち、`method_desc_from_sym` がそれを優先します）。
+`ensure_class` が既存シンボルを作り直さない制約とも衝突しません。
+
+もう 1 つ、`Predef.wrapString` に `low_priority` が立っていませんでした。javap
+で確認すると `wrapString` は `scala.LowPriorityImplicits`、`augmentString` は
+`Predef$` の宣言なので、両方がメンバを持つときは `StringOps` が勝つのが nsc の
+規則です。`search_extension` のコメントはその規則を書いていたのに、フラグが
+立っていないので実行できていませんでした（立っていたのは `intWrapper` 系だけ）。
+これを直すまで `groupBy` は「`StringOps` と `WrappedString` の両方が供給して
+曖昧」で落ちていました。
+
+**pickle で表現できない分だけ**を `crates/typer/src/prelude_stringops8.rs` に
+手書きしました。2.13 の `StringOps` は**戻り型だけが違うオーバーロード**を
+持ち、`erased_desc` は*引数*の erasure でメンバを引くので、2 本見つけて
+区別できず供給を断ります（これは `pickle_supply` として正しい判断です）。
+ところが断られたメンバは下位の `wrapString` に流れて `WrappedString` として
+返るので、`"abcdef".collect { case c if c > 'c' => c }` が scalac の `"def"`
+ではなく `Vector(d, e, f)` になっていました。**間違った型は無いより悪い**ので、
+`prelude_strmap.rs` の `map` と同じく**2 シンボル**で宣言しています:
+
+| 手書きに残したもの | 理由 |
+|---|---|
+| `collect` × 2 | 戻り型だけのオーバーロード（`String` / `IndexedSeq[B]`） |
+| `withFilter` と `StringOps$WithFilter` | 戻り値が普通のクラスで、その `map` も同じ二重 erasure |
+| `addString` × 3 | `mutable.StringBuilder` の pickle 形状が合わない |
+| `apply(Int): Char` | classfile 側に対応する instance メソッドが無い |
+
+`collect` のオーバーロード解決には、`map` が使っている `Infer.pretypeArgs`
+相当の事前型付けを `PartialFunction` にも広げました（`agreed_pf_param`）。
+PF のパラメータは `Type::Function` ではなく**クラス**なので
+`agreed_lambda_params` が降りてしまい、case ブロックの本体が何を返しても
+より specific な `Char` 版が勝っていました。
+
+`"abcdef"(1)` の添字構文も直しました。`s.apply(1)` は通るのに `s(1)` が
+`value apply is not a member of String` になっていたのは、`Apply` の経路が
+「レシーバが `Type::Class` なら `apply` を探す」だけで、暗黙変換を試して
+いなかったためです（`retry_apply_extension`）。
+
+`withFilter` は `is_with_filter_ty` に `StringOps$WithFilter` を足すまで、
+結果型が**レシーバ**（`StringOps` = erasure は `String`）に上書きされ、
+続く `.map` が実物の `StringOps$WithFilter` に `checkcast java/lang/String`
+を出して `ClassCastException` になっていました。
+
+dual-run: `so8`（期待値は**実 scalac 2.13.16 の出力そのもの**、`java -Xverify:all`
+で一致）。異常系は `so8_bad`（戻り型だけのオーバーロードが「解決はする」だけ
+では不十分で、`Int` を返す case ブロックは `IndexedSeq[B]` を選ぶので `String`
+に束縛できないこと）。**私有ランタイム（`--no-scala-library`）には `StringOps`
+自体が無い**ので、`so8.scala` は 40 件の診断になります（黙って通しません）。
+slick: `errors=518 → 516`。
 
 ### Remaining
+
+- **`"abc".appended(1)` のような `B >: Char` の下限推論**（`agent/stringops8`
+  で確認）。scalac は `B := AnyVal` と lub を取って `IndexedSeq[AnyVal]` を
+  返しますが、こちらは `B := Int` と推論して
+  `inferred type arguments [Int] do not conform to method appended's type
+  parameter bounds [B >: Char <: Any]` を出します。`Char` 引数の
+  `appended('x'): String` は通るので、欠けているのは下限つき型パラメータの
+  lub 推論そのものです。`prepended` / `:+` / `+:` / `concat` も同じ形です。
+
+- **`LazyZip2` のメンバ**（`agent/stringops8` で確認）。`"abc".lazyZip(List(1,2,3))`
+  は `LazyZip2[Char, Int, String]` として解決しますが、`.map` / `.toList` が
+  無いので使えません。`lazyZip` 自体は pickle から入っています。
+
+- **`StringOps.partitionMap`**（`agent/stringops8` で確認）。
+  `s.partitionMap(c => if (…) Right(c) else Left(c))` が
+  `(Char) => AnyRef` になり、`Either` への lub が取れずに落ちます。
+  上の下限推論と同じ根です。
 
 - **for 内包の値定義に続くガード**（`agent/mismatch6` で診断だけ入れた、未実装）。
   `for { m <- ms; q = f(m); if q > 0 } yield q` は nsc では通ります。nsc は

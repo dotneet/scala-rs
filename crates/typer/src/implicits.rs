@@ -786,12 +786,27 @@ impl Typer {
             // install `java.lang.String#toUpperCase(Locale)` onto Predef
             // String and shadow StringOps.
             self.ensure_java_loaded(cls, span);
-            let members: Vec<SymbolId> = self
+            let mut members: Vec<SymbolId> = self
                 .st
                 .lookup_member(cls, name)
                 .into_iter()
                 .filter(|&m| !self.st.get(m).flags.contains(Flags::STATIC))
                 .collect();
+            // The hand-written prelude is not a complete `StringOps` (or
+            // `ArrayOps`, …), and until now nothing asked the library pickle
+            // about the conversion *result*: `supply_from_pickle` only ever
+            // saw the receiver, `java.lang.String`, which has no
+            // `ScalaSignature` at all. Ask the result's own pickle when the
+            // prelude has nothing, so `"abc".groupBy(f)` resolves the same way
+            // `List(1).groupBy(f)` already does. The prelude still wins
+            // whenever it declares the member.
+            if members.is_empty() {
+                members = self
+                    .supply_from_pickle(&to, name)
+                    .into_iter()
+                    .filter(|&m| !self.st.get(m).flags.contains(Flags::STATIC))
+                    .collect();
+            }
             if let Some(m) = members.first() {
                 hits.push((id, *m, to));
             }

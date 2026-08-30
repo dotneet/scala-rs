@@ -38,6 +38,7 @@ mod prelude_seq;
 mod prelude_seqpat;
 mod prelude_sgap;
 mod prelude_strhier;
+mod prelude_stringops8;
 mod prelude_strmap;
 mod prelude_text;
 mod prelude_tuple;
