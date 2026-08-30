@@ -2893,6 +2893,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 オーバーロード集合が別のクラスの読み込みで消える回帰のフィクスチャは接頭辞 `oshadow`（`oshadow` / `oshadow_java_first` / `oshadow_java_last` / `oshadow_bad`）で、同じ理由から `crates/cli/tests/overloadshadow.rs` に置いています。`oshadow.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 の実行結果とも直接比較します（`oshadow_matches_scalac`）。`oshadow_java_first.scala` と `oshadow_java_last.scala` は `java.math.BigDecimal` の位置だけを入れ替えた同じプログラムで、`oshadow_order_independent` が両方通ることと stdout が一致することを固定します。`oshadow_bad.scala` は `BigDecimal(Some(1))`（real scalac も拒否）が `no matching overload` になり、しかも**候補一覧が丸ごと**出る（`(String)BigDecimal` を含む）ことを見ます。`oshadow_without_library_is_error` は `--no-scala-library` で `not found: value BigDecimal` の診断が残ることを見ます。
 `agent/parentimpl` スライス（親コンストラクタの implicit 節・デフォルト引数の補完）のフィクスチャは接頭辞 `pimpl`（`pimpl` / `pimpl_bad`）で、同じ理由から `crates/cli/tests/parentimpl.rs` に置いています。`pimpl.scala` は slick の `ConstColumn` 形（`class ConstColumn[T : TT] extends TypedRep[T]`）、明示節＋2 引数の implicit 節、全部デフォルト／末尾だけデフォルト、デフォルト節＋implicit 節、匿名クラスの親、引数無しの `new` を 1 本にまとめ、**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせます。`real_scalac_dual_run_pimpl` は real scalac 2.13.16 でも同じソースを走らせて stdout が一致することを見ます（`expected/pimpl.txt` は scalac の出力そのもの）。`pimpl_late_a.scala` / `pimpl_late_z.scala` は**子を親より先にコンパイル**して、親の context bound の evidence がシグネチャパス時点で未生成でも埋まる（＝ファイル順に依存しない）ことを見ます。`pimpl_bad.scala` は witness の無い親 implicit 節が**黙って通らない**ことを固定し、`pimpl_bad_reports_the_extends_clause_once` で診断が `extends` の行に 1 件だけ出る（3 パス分に増えない）ことも見ています。
 
+`agent/integral` スライス（`Integral` / `Fractional` を `Numeric` の型クラス階層に入れる）のフィクスチャは接頭辞 `ig`（`ig_hier` / `ig_hier_bad`）で、同じ理由から `crates/cli/tests/integral.rs` に置いています。`ig_hier.scala` は `List.range` / `Vector.range` / `Seq.range`、`implicitly[…]` 13 件の**選ばれたインスタンスのクラス名**、`quot` / `rem` / `div`、`Numeric[T]` を implicit に取るユーザーコード、`sum` / `product` / `sorted` / `max` / `min` / `sortBy`、`Integral[Int]` → `Numeric[Int]` / `Ordering[Int]` の widening、`Ordering[Option[Int]]` を 1 本にまとめてあり、library dual-run と **real scalac 2.13.16** との実行結果 diff（`ig_hier_matches_real_scalac`）の両方で `java -Xverify:all` の下に走らせます。クラス名を出力しているので「一意になった」ではなく「**実 scalac と同じインスタンスを選んでいる**」ことが見えます。`ambiguity_did_not_increase` は `Ordering[Int/Double/Long/Byte/Short/Char/Float]` と `sum` / `product` / `sorted` / `max` / `min` / タプルの `sorted` に `ambiguous` が 1 件も出ないことを固定します（`Numeric[T] extends Ordering[T]` なので、ここが今回いちばん壊れやすい所でした）。`ig_hier_bad.scala` は階層がゴム印にならないこと——`Numeric[Int]` → `Integral[Int]` と `Ordering[Int]` → `Numeric[Int]` の逆流、実在しない `Integral[Double]` / `Fractional[Int]` / `Integral[String]`——を固定します（real scalac も同じ 6 行で 6 件出します）。私有ランタイムには `scala/math/Integral` が無いので、`range_is_diagnosed_without_the_jar` が `--no-scala-library` で `not found: type Integral` / `range is not a member of List$` と**きちんと診断される**ことを見ます。
+
 `agent/traitextends` スライス（trait がクラスを継承する、`abstract override` / stackable trait）の
 フィクスチャは接頭辞 `trex`（`trex_stack` / `trex_inherit` / `trex_mixin_bad` /
 `trex_ungrounded_bad` / `trex_object_bad` / `trex_ctorargs_bad` / `trex_absover_class_bad` /
@@ -5222,20 +5224,145 @@ checkcast     scala/collection/immutable/List      ← これが無かった
 
 #### Remaining
 
-- **`List.range` / `Vector.range` / `Seq.range` に `Integral[Int]` が無い**。
-  `List.range(0, 3)` は
-  `no implicit: could not find implicit value of type Integral[Int]` になります。
-  これは erasure ではなく `scala.math` の型クラス階層の穴で、
-  `crates/typer/src/prelude_numhier.rs` が既に
-  「`Integral` / `Fractional` は prelude の時点で symbol table にいない」
-  として記録している残件と同じものです。実 library では
-  `Numeric.IntIsIntegral` が `Integral[Int]` なので、prelude 側の
-  `add_numeric` が付ける型を `Numeric[Int]` から `Integral[Int]` に上げ、
-  `Integral[T] <: Numeric[T]` の辺を張るのが筋です。`sum` / `product` /
-  `Ordering` の implicit 解決に触るので別スライスにしました。
-  **診断は出る**ので黙って通ることはありません
-  （`fillconcat.rs` の `range_still_reports_the_missing_integral` が固定）。
+- ~~**`List.range` / `Vector.range` / `Seq.range` に `Integral[Int]` が無い**~~
+  → 次節 `agent/integral` で解消しました。`fillconcat.rs` のテストは
+  `range_resolves_the_integral`（通るようになった形）に書き換えてあります。
 - `Array.range(0, 3)` は `Integral` を取らない別オーバーロードなので通ります。
+
+### `Integral` / `Fractional` を型クラス階層に入れる（`agent/integral`）
+
+前節が残件にした 1 件です。
+
+```scala
+println(List.range(0, 5))   // error: no implicit: could not find implicit value of type Integral[Int]
+println(Vector.range(0, 3)) // 同上
+println(Seq.range(0, 3))    // 同上
+```
+
+`IterableFactory#range[A](start: A, end: A)(implicit ord: Integral[A])` が
+実シグネチャで（`javap -p scala.collection.IterableFactory`）、その下に
+**2 つ**穴がありました。
+
+1. `Integral` / `Fractional` が prelude の時点で symbol table にいない。
+   ソースが名前を出すと `pickle_supply` がスタブを起こしますが、pickle 由来の
+   親（`Numeric`）を付けるのは `attach_parents`＝**メンバ解決に失敗したとき
+   だけ**です。`SCALA_RS_PICKLE_DEBUG=1` で見ると
+   `#quot: asking Integral` → `attaching pickled parent Numeric` の順で、
+   subtyping の判定にはまるで間に合っていませんでした。だから
+   `def f(x: Integral[Int]): Numeric[Int] = x` が `type mismatch` でした。
+2. `object Numeric` の implicit インスタンスに `Numeric[Int]` を付けていた。
+   実 ABI はもう 1 段下です。
+
+`javap -p -s /tmp/scala-rs-lib/scala-library-2.13.16.jar` で確かめた形:
+
+```
+interface scala.math.Numeric<T>    extends scala.math.Ordering<T>
+interface scala.math.Integral<T>   extends scala.math.Numeric<T>
+interface scala.math.Fractional<T> extends scala.math.Numeric<T>
+```
+
+| implicit object（`Numeric$…$`） | implements | その trait の親 | 与えた型 |
+|---|---|---|---|
+| `IntIsIntegral$` | `Numeric$IntIsIntegral`, `Ordering$IntOrdering` | `Integral<Object>` | `Integral[Int]` |
+| `LongIsIntegral$` | `Numeric$LongIsIntegral`, `Ordering$LongOrdering` | `Integral<Object>` | `Integral[Long]` |
+| `ByteIsIntegral$` | `Numeric$ByteIsIntegral`, `Ordering$ByteOrdering` | `Integral<Object>` | `Integral[Byte]` |
+| `ShortIsIntegral$` | `Numeric$ShortIsIntegral`, `Ordering$ShortOrdering` | `Integral<Object>` | `Integral[Short]` |
+| `CharIsIntegral$` | `Numeric$CharIsIntegral`, `Ordering$CharOrdering` | `Integral<Object>` | `Integral[Char]`（新規） |
+| `BigIntIsIntegral$` | `Numeric$BigIntIsIntegral`, `Ordering$BigIntOrdering` | `Integral<BigInt>` | `Integral[BigInt]`（新規） |
+| `DoubleIsFractional$` | `Numeric$DoubleIsFractional`, `Ordering$Double$IeeeOrdering` | `Fractional<Object>` | `Fractional[Double]` |
+| `FloatIsFractional$` | `Numeric$FloatIsFractional`, `Ordering$Float$IeeeOrdering` | `Fractional<Object>` | `Fractional[Float]`（新規） |
+| `BigDecimalIsFractional$` | `Numeric$BigDecimalIsFractional`, `Ordering$BigDecimalOrdering` | `Numeric$BigDecimalIsConflicted`, `Fractional<BigDecimal>` | `Fractional[BigDecimal]`（新規） |
+
+「どれが implicit として実際に選ばれるか」は jar の形だけでは決まらないので
+（`BigDecimalAsIfIntegral` / `FloatAsIfIntegral` のように implicit でない
+兄弟がいる）、実 scalac に `implicitly[…].getClass.getName` を出力させて
+1 件ずつ確かめました。
+
+実装は `crates/typer/src/prelude_numhier.rs` に閉じています
+（`Integral` / `Fractional` を prelude に用意して `<: Numeric[T]` の辺を張り、
+`add_numeric` が付けた型を上書きし、足りないインスタンスを足す）。
+`prelude.rs` 側の変更は呼び出しに `library_abi` を渡す 1 行だけです。
+`quot` / `rem` / `div` は `pickle_supply` が jar から供給するので手書きしていません
+（`Integral` の型パラメータ名を実ライブラリと同じ `T` にしておく必要があります。
+`pickle_supply` は名前でスコープを作るので、違う名前だと `quot(T, T): T` を写せません）。
+
+#### なぜ曖昧にならないか
+
+`Numeric[T] extends Ordering[T]` なので、`Integral[Int]` を導入すると
+`Ordering[Int]` に適合する値が 1 つ増えます。**それでも候補は増えません**。
+`Ordering[Int]` の implicit scope（SLS 7.2、`implicits.rs` の
+`collect_type_parts` / `companion_implicits`）は `Ordering` とその基底クラス、
+および `Int` の companion であって、**`Numeric` の companion は入らない**
+からです。実 scalac も `implicitly[Ordering[Int]]` に `Ordering$Int$` を返し、
+`Numeric$IntIsIntegral$` を返しません。fixture `ig_hier.scala` は
+`implicitly[…].getClass.getName` を 13 件出力して real scalac と
+バイト単位で比較しているので、「一意だと主張する」ではなく
+「**実 scalac と同じものを選んでいる**」ことを見ています。
+`crates/cli/tests/integral.rs` の `ambiguity_did_not_increase` が
+`Ordering[Int/Double/Long/Byte/Short/Char/Float]` と `sum` / `product` /
+`sorted` / `max` / `min` / タプルの `sorted` に `ambiguous` が出ないことを固定します。
+slick でも `ambiguous` 8 件は**行単位で完全に同一**でした。
+
+#### 併せて塞いだ prelude の穴
+
+- `Numeric[Float]` / `Numeric[BigDecimal]`（`agent/mismatch8` が
+  `no implicit` 27 件の一部として報告していたもの）。
+- `Ordering.Option`（`implicit def Option[T](implicit ord: Ordering[T]):
+  Ordering[Option[T]]`、jar では
+  `Ordering$.Option:(Lscala/math/Ordering;)Lscala/math/Ordering;`）。
+  `List(Some(2), None, Some(1)).sorted` が通るようになりました。
+  `Ordering.TupleN`（`prelude_ordtuple.rs`）と同じ形の穴です。slick では
+  `Ordering[Option[String]]` と、それを要素に持つ
+  `Ordering[Tuple4[String, Option[String], Option[String], String]]` の
+  2 件がこれで消えました（`Ordering.Tuple4` は既にあったのに、その
+  implicit 引数の `Ordering[Option[String]]` が埋まらず落ちていた）。
+
+#### 私有ランタイム
+
+`--no-scala-library` には `scala/math/Integral` の classfile も
+`Numeric$IntIsIntegral$` もありません。読み込めないクラスを参照する
+バイトコードを出さないよう、`prelude_numhier::install` は `library_abi`
+でない場合に**何もせず戻ります**。`ig_hier.scala` を `--no-scala-library`
+でコンパイルすると `not found: type Integral` /
+`range is not a member of List$` が出ることを
+`range_is_diagnosed_without_the_jar` が固定しています。
+
+#### fixture
+
+| fixture | 見ているもの | 期待 |
+|---|---|---|
+| `ig_hier.scala` | `List`/`Vector`/`Seq`/`Long` の `range`、`implicitly` 13 件のクラス名、`quot`/`rem`/`div`、`Numeric[T]` を取るユーザーコード、`sum`/`product`/`sorted`/`max`/`min`/`sortBy`、`Integral[Int]` → `Numeric[Int]` / `Ordering[Int]` の widening、`Ordering[Option[Int]]` | 42 行（real scalac 2.13.16 と一致） |
+| `ig_hier_bad.scala`（異常系） | `Numeric[Int]` → `Integral[Int]` の逆流、`Ordering[Int]` → `Numeric[Int]` の逆流、実在しない `Integral[Double]` / `Fractional[Int]` / `Integral[String]`、`List.range("a", "z")` | コンパイルエラー 6 件（real scalac も同じ 6 行で 6 件） |
+
+計測は `files=184 errors=346 files_with_errors=64` →
+**`files=184 errors=342 files_with_errors=64`**（`no implicit` 26 → 22）。
+減った 4 件は `Numeric[Float]` / `Numeric[BigDecimal]` /
+`Ordering[Option[String]]` /
+`Ordering[Tuple4[String, Option[String], Option[String], String]]` で、
+**増えた診断は 1 件もありません**（`grep '^error' | sort | uniq -c` の差分が
+この 4 行の削除だけ。`ambiguous` の 8 行は行単位で完全に同一）。
+
+#### Remaining
+
+- slick は `Integral` / `Fractional` を使っていないので、減ったのは
+  `Numeric` / `Ordering` の穴 4 件だけです。残る `no implicit` 22 件は
+  別の型クラス（`ClassTag` / cats など）です。
+- 明示的に書く `Ordering.by(...)` は通ります。`Ordering.Iterable` は
+  implicit 探索に入れていませんが、`implicitly[Ordering[List[Int]]]` は
+  **real scalac 2.13.16 も拒否する**（`Ordering` は不変で
+  `Ordering[Iterable[Int]]` は `Ordering[List[Int]]` にならない）ので、
+  今のところ差はありません。
+- `import Numeric.Implicits._` で `a + b` を書く形は通りません
+  （`+` が `String` の連結として解決され `type mismatch` になる）。
+  この修正の前後で挙動は同じで、`n.plus(a, b)` の形は通ります。
+- `Numeric.BigDecimalAsIfIntegral` のような **implicit ではない**
+  インスタンスを名前で書くと、型検査は通るのに `pickle_supply` が
+  `Numeric$` のフィールドとして供給してしまい、実行時に
+  `NoSuchFieldError: BigDecimalAsIfIntegral` になります
+  （正しくは `Numeric$BigDecimalAsIfIntegral$.MODULE$`）。
+  **この修正の前後で同じ**（`agent/integral` 以前のバイナリでも再現）で、
+  pickle 由来の `object` メンバの形の問題です。implicit として選ばれる
+  9 個は prelude 側で module として持っているので影響を受けません。
 
 ## ライセンス
 
