@@ -1298,62 +1298,11 @@ fn outer_field_desc(st: &SymbolTable, class_id: SymbolId) -> Option<String> {
     outer_field_class(st, class_id).map(|o| format!("L{};", class_internal(st, o)))
 }
 
+/// SLS 5.1.2, `cls` first. The C3 merge itself lives in the typer
+/// (`scala_rs_typer::linearize`) so that the `abstract override` grounding
+/// check and the super accessors it drives cannot disagree about the order.
 fn linearize(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
-    fn skip_parent(st: &SymbolTable, p: SymbolId) -> bool {
-        let n = st.get(p).name.as_str();
-        n == "Any" || n == "AnyRef" || n == "AnyVal" || n == "Object"
-    }
-    fn parents_of(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
-        st.get(cls)
-            .parents
-            .iter()
-            // A parent written as a function type is `scala.FunctionN`; the
-            // linearization has to contain it, or an implementation of a
-            // narrowed `apply` gets no bridge for `apply(Object)Object`.
-            .filter_map(|p| {
-                st.class_sym_of(&st.function_class_form(p).unwrap_or_else(|| p.clone()))
-            })
-            .filter(|p| !skip_parent(st, *p))
-            .collect()
-    }
-    fn lin(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
-        let parents = parents_of(st, cls);
-        let mut lists: Vec<Vec<SymbolId>> = parents.iter().rev().map(|p| lin(st, *p)).collect();
-        lists.push(parents.iter().rev().copied().collect());
-        let mut out = vec![cls];
-        out.extend(c3_merge(lists));
-        out
-    }
-    fn c3_merge(mut lists: Vec<Vec<SymbolId>>) -> Vec<SymbolId> {
-        let mut out = Vec::new();
-        loop {
-            lists.retain(|l| !l.is_empty());
-            if lists.is_empty() {
-                break;
-            }
-            let mut chosen = None;
-            for l in &lists {
-                let h = l[0];
-                let in_tail = lists.iter().any(|o| o.iter().skip(1).any(|&x| x == h));
-                if !in_tail {
-                    chosen = Some(h);
-                    break;
-                }
-            }
-            let h = match chosen {
-                Some(h) => h,
-                None => lists[0][0],
-            };
-            out.push(h);
-            for l in &mut lists {
-                if l.first() == Some(&h) {
-                    l.remove(0);
-                }
-            }
-        }
-        out
-    }
-    lin(st, cls)
+    scala_rs_typer::linearize(st, cls)
 }
 
 fn super_accessor_name(st: &SymbolTable, trait_id: SymbolId, method: &str) -> String {
@@ -1509,8 +1458,24 @@ fn is_interface_sym(st: &SymbolTable, id: SymbolId) -> bool {
     s.flags.contains(Flags::TRAIT) || s.flags.contains(Flags::INTERFACE)
 }
 
+/// `Any` / `AnyRef` / `AnyVal` / `Object` — the top of every hierarchy, and
+/// the one class parent an interface really does reach on the JVM.
+fn is_top_class(st: &SymbolTable, id: SymbolId) -> bool {
+    matches!(
+        st.get(id).name.as_str(),
+        "Any" | "AnyRef" | "AnyVal" | "Object"
+    )
+}
+
 /// True when `owner` is `current` or a parent in the extends/with graph.
 /// Self types are *not* walked: a trait `self: Foo =>` must checkcast `$this`.
+///
+/// Nor is a trait's *superclass* (SLS 5.3.3 `trait T extends C`): that parent
+/// is a constraint on the classes that may mix `T` in, and `emit_class` drops
+/// it from the interface's class file, so `LT;` is not assignable to `LC;` on
+/// the JVM. Walking it made a trait body read an inherited `C` member off
+/// `$this` with no cast and the verifier rejected the method
+/// (`Type 'T' is not assignable to 'C'`).
 fn is_owner_compatible(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> bool {
     if owner.is_none() || current == owner {
         return true;
@@ -1524,8 +1489,12 @@ fn is_owner_compatible(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> 
         if id == owner {
             return true;
         }
+        let from_iface = is_interface_sym(st, id);
         for p in &st.get(id).parents {
             if let Some(ps) = st.class_sym_of(p) {
+                if from_iface && !is_interface_sym(st, ps) && !is_top_class(st, ps) {
+                    continue;
+                }
                 work.push(ps);
             }
         }

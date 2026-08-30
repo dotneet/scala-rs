@@ -237,6 +237,13 @@ pub struct Symbol {
     /// call is `invokeinterface` or `invokevirtual`. Meaningless when
     /// `declaring_class` is empty.
     pub declaring_is_interface: bool,
+    /// nsc `ABSOVERRIDE`: the source wrote `abstract override`, so `super` in
+    /// this member is bound by the *linearization* of whatever concrete class
+    /// mixes the trait in. `flags` cannot carry this: the namer already sets
+    /// `ABSTRACT` on every body-less `def`, so `override def close(): Unit`
+    /// (deferred) and `abstract override def close(): Unit = …` (stackable)
+    /// are indistinguishable there.
+    pub abstract_override: bool,
 }
 
 impl Symbol {
@@ -389,6 +396,7 @@ impl SymbolTable {
                 macro_impl: None,
                 declaring_class: String::new(),
                 declaring_is_interface: false,
+                abstract_override: false,
             }],
             scopes: vec![Scope::default()],
             root: SymbolId(0),
@@ -471,6 +479,7 @@ impl SymbolTable {
             macro_impl: None,
             declaring_class: String::new(),
             declaring_is_interface: false,
+            abstract_override: false,
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {

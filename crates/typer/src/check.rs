@@ -1285,6 +1285,11 @@ impl Typer {
                 name, mods, rhs, ..
             } => {
                 let annots = mods.annotations.clone();
+                // Record `abstract override` *before* the body-less `def`
+                // rule below adds `ABSTRACT`, which would make the two
+                // indistinguishable.
+                let abs_over =
+                    mods.flags.contains(Flags::ABSTRACT) && mods.flags.contains(Flags::OVERRIDE);
                 let mut flags = if rhs.is_empty() && !mods.flags.contains(Flags::NATIVE) {
                     mods.flags.with(Flags::ABSTRACT)
                 } else {
@@ -1298,6 +1303,7 @@ impl Typer {
                     .alloc(name, self.st.owner, SymKind::Method, flags, "");
                 self.st.get_mut(id).private_within = mods.private_within.clone();
                 self.st.get_mut(id).annotations = annots;
+                self.st.get_mut(id).abstract_override = abs_over;
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
@@ -1714,6 +1720,7 @@ impl Typer {
             ),
             _ => (None, None, false),
         };
+        let tree_span = tree.span;
         let (vparamss, body, parents, tparams) = match &mut tree.kind {
             TreeKind::ClassDef {
                 vparamss,
@@ -1850,6 +1857,52 @@ impl Typer {
         if !pts.is_empty() {
             self.st.get_mut(id).parents = pts;
         }
+        // `class X extends Loud` where `trait Loud extends Animal` really *is*
+        // an `Animal` (SLS 5.1): the trait's superclass becomes X's. Splice it
+        // in as a parent so member lookup, `super` and the emitted
+        // `invokespecial Animal.<init>` all see it — without this the class
+        // file extended `java/lang/Object` and every use as an `Animal`
+        // failed the verifier.
+        // Not during the header (`sigs_only`) pass: there a trait's own parents
+        // are still the unapplied `Type::Class { args: [] }` that
+        // `parents_pass_tmpl` installs, so the spliced parent would come out as
+        // a bare `StatementInvoker` and the real pass would then reject it with
+        // `StatementInvoker takes type parameters`.
+        let inherited_super = if self.sigs_only {
+            None
+        } else {
+            crate::traitparent::inherited_superclass(&self.st, id)
+        };
+        if let Some(kty) = inherited_super {
+            let k = self.st.class_sym_of(&kty).unwrap_or(SymbolId::NONE);
+            let span = parents.first().map(|p| p.span).unwrap_or(tree_span);
+            let mut t = Tree::new(
+                NodeId(0),
+                span,
+                TreeKind::Ident {
+                    name: self.st.get(k).name.clone(),
+                },
+            );
+            t.ty = kty.clone();
+            t.sym = k;
+            parents.insert(0, t);
+            let mut ps = self.st.get(id).parents.clone();
+            ps.insert(0, kty.clone());
+            self.st.get_mut(id).parents = ps;
+            // The class writes no argument list, so the trait's superclass
+            // must be constructible without one.
+            if !k.is_none() {
+                let targs: Vec<Type> = match &kty {
+                    Type::Class { args, .. } => args.clone(),
+                    _ => Vec::new(),
+                };
+                if matches!(self.pick_ctor_at(k, &targs, &[], None), OverloadPick::None) {
+                    let name = self.st.get(k).name.clone();
+                    self.error(span, format!("no matching overload for constructor {name}"));
+                }
+            }
+        }
+        self.check_mixin_superclasses(id, parents, tree_span);
         self.register_sealed_child(id);
         self.enter_inherited_members(id);
         self.bind_self_type(id, self_name, self_tpt.as_deref());
@@ -1883,6 +1936,19 @@ impl Typer {
         self.check_type_member_kind_override(id, tree.span);
         self.check_self_conformance(id, tree.span);
         self.check_class_variance(id, tree.span);
+        if !self.sigs_only {
+            let body_snapshot: Vec<Tree> = body.to_vec();
+            self.check_abstract_override_placement(id, &body_snapshot);
+            // `new C with T` reaches here as the `$anon` class the parser
+            // built; scalac reports that one as `object creation impossible.`
+            let anon = self.st.get(id).name.starts_with("$anon");
+            let headline = if anon {
+                "object creation impossible.".to_string()
+            } else {
+                format!("class {} needs to be a mixin.", self.st.get(id).name)
+            };
+            self.check_abstract_override_grounded(id, tree_span, &headline);
+        }
         self.st.pop_scope();
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
@@ -1999,6 +2065,7 @@ impl Typer {
             TreeKind::ModuleDef { impl_, .. } => (impl_.self_name.clone(), impl_.self_tpt.clone()),
             _ => (None, None),
         };
+        let mod_span = tree.span;
         let (body, parents) = match &mut tree.kind {
             TreeKind::ModuleDef { impl_, .. } => (&mut impl_.body, &mut impl_.parents),
             _ => return,
@@ -2016,6 +2083,7 @@ impl Typer {
         if !pts.is_empty() {
             self.st.get_mut(cls).parents = pts;
         }
+        self.check_mixin_superclasses(cls, parents, mod_span);
         self.register_sealed_child(cls);
         self.enter_inherited_members(cls);
         self.bind_self_type(cls, self_name, self_tpt.as_deref());
@@ -2042,6 +2110,14 @@ impl Typer {
         }
         self.check_self_conformance(cls, tree.span);
         self.check_type_member_kind_override(cls, tree.span);
+        if !self.sigs_only {
+            let body_snapshot: Vec<Tree> = body.to_vec();
+            self.check_abstract_override_placement(cls, &body_snapshot);
+            // scalac 2.13.16 reports an `object` the same way it reports a
+            // `new`: the instance is what cannot be built.
+            let headline = "object creation impossible.".to_string();
+            self.check_abstract_override_grounded(cls, mod_span, &headline);
+        }
         self.st.pop_scope();
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
@@ -2508,6 +2584,57 @@ impl Typer {
                 self.st.enter_in_current(&n, m);
             }
             work.extend(self.st.get(pid).parents.iter().rev().cloned());
+        }
+    }
+
+    /// SLS 5.3.3: `T` may only be mixed into a subclass of `T`'s own
+    /// superclass. `parents` supplies the span so the caret lands on the
+    /// offending mixin, as scalac's does.
+    fn check_mixin_superclasses(&mut self, class_id: SymbolId, parents: &[Tree], span: Span) {
+        for e in crate::traitparent::check_mixin_superclasses(&self.st, class_id) {
+            let at = parents.get(e.parent_index).map(|p| p.span).unwrap_or(span);
+            self.error(at, e.message);
+        }
+    }
+
+    /// `abstract override` is only meaningful where `super` is linearized,
+    /// which is only in a trait. scalac 2.13.16 points at the member.
+    fn check_abstract_override_placement(&mut self, class_id: SymbolId, body: &[Tree]) {
+        if class_id.is_none() || self.st.get(class_id).flags.contains(Flags::TRAIT) {
+            return;
+        }
+        for stt in body {
+            let TreeKind::DefDef { mods, .. } = &stt.kind else {
+                continue;
+            };
+            if mods.flags.contains(Flags::ABSTRACT) && mods.flags.contains(Flags::OVERRIDE) {
+                self.error(
+                    stt.span,
+                    "`abstract override` modifier only allowed for members of traits".to_string(),
+                );
+            }
+        }
+    }
+
+    /// Every `abstract override` a *concrete* class inherits must reach a real
+    /// implementation further down the linearization; otherwise `super.m`
+    /// inside the trait has no target. Without this the backend emitted a
+    /// `throw new RuntimeException("no super implementation for …")` stub.
+    fn check_abstract_override_grounded(&mut self, class_id: SymbolId, span: Span, headline: &str) {
+        if class_id.is_none() {
+            return;
+        }
+        let s = self.st.get(class_id);
+        if s.flags.contains(Flags::TRAIT)
+            || s.flags.contains(Flags::INTERFACE)
+            || s.flags.contains(Flags::ABSTRACT)
+        {
+            return;
+        }
+        for msg in
+            crate::traitparent::check_abstract_override_grounded(&self.st, class_id, headline)
+        {
+            self.error(span, msg);
         }
     }
 
@@ -3386,10 +3513,57 @@ impl Typer {
             .unwrap_or(false)
     }
 
+    /// SLS 5.3.3: a trait's parents are only *constraints*. `trait T extends C`
+    /// records that every class mixing `T` in must be a `C`, but `T` itself
+    /// never runs `C`'s constructor -- the concrete class does. So the parent
+    /// list of a trait takes no argument list, is not filled with implicits or
+    /// defaults, and is not resolved against `C`'s constructor overloads.
+    fn in_trait_parents(&self) -> bool {
+        match self.parent_ctx {
+            Some((owner, _)) if !owner.is_none() => {
+                let f = self.st.get(owner).flags;
+                f.contains(Flags::TRAIT) || f.contains(Flags::INTERFACE)
+            }
+            _ => false,
+        }
+    }
+
     fn type_parent(&mut self, tree: &mut Tree) {
+        // `extends A(1)(2)` is nested Applies; the type is under all of them.
+        fn ctor_head(tree: &mut Tree) -> Option<Tree> {
+            let mut cur = tree;
+            while matches!(&cur.kind, TreeKind::Apply { .. }) {
+                let TreeKind::Apply { fun, .. } = &mut cur.kind else {
+                    unreachable!()
+                };
+                cur = fun;
+            }
+            if matches!(&cur.kind, TreeKind::Empty) {
+                return None;
+            }
+            Some(std::mem::replace(cur, Tree::dummy(TreeKind::Empty)))
+        }
         if matches!(&tree.kind, TreeKind::Apply { .. }) {
-            self.type_parent_ctor_app(tree);
-            return;
+            if self.in_trait_parents() {
+                // scalac 2.13.16 points `parents of traits may not have
+                // parameters` at the parent's own name, not at the argument
+                // list. Then drop the arguments so the rest of the pass sees a
+                // plain parent type and does not cascade.
+                match ctor_head(tree) {
+                    Some(head) => {
+                        let span = head.span;
+                        *tree = head;
+                        self.error(
+                            span,
+                            "parents of traits may not have parameters".to_string(),
+                        );
+                    }
+                    None => return,
+                }
+            } else {
+                self.type_parent_ctor_app(tree);
+                return;
+            }
         }
         tree.ty = self.tree_to_type(tree);
         self.check_proper_type(&tree.ty, tree.span);
@@ -3397,6 +3571,7 @@ impl Typer {
             tree.sym = id;
             if !self.st.get(id).flags.contains(Flags::TRAIT)
                 && !self.st.get(id).flags.contains(Flags::INTERFACE)
+                && !self.in_trait_parents()
             {
                 // `class ConstColumn[T : TT] extends TypedRep[T]` writes no
                 // argument list, but `TypedRep`'s only clause is implicit:

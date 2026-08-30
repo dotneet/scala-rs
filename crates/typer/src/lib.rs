@@ -7,6 +7,7 @@ mod javaclass;
 mod javasign;
 mod lambda_lift;
 mod lazysig;
+mod lin;
 mod macros;
 mod pickle_supply;
 mod prelude;
@@ -47,6 +48,7 @@ mod prelude_variance;
 mod quasiquote;
 mod reify;
 mod symbol;
+mod traitparent;
 mod uncurry;
 
 pub use anon_capture::mark_anon_captures;
@@ -57,6 +59,7 @@ pub use check::{
 };
 pub use erasure::{erase, erase_type, note_source_value_classes};
 pub use lambda_lift::lambda_lift;
+pub use lin::{is_interface, linearize, trait_superclass};
 pub use symbol::{Intrinsic, MacroBinding, SamSig, SymKind, Symbol, SymbolTable};
 pub use uncurry::uncurry;
 
