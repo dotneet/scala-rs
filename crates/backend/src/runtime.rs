@@ -44,6 +44,8 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
         emit_tuple2(),
         emit_dynamic(),
         emit_arrow_assoc(),
+        emit_boxed_unit(),
+        emit_nothing(),
         emit_not_implemented(),
         emit_non_local_return_control(),
         emit_delayed_init(),
@@ -1652,6 +1654,89 @@ fn emit_ref_box(name: &str, elem: &str) -> EmittedClass {
             },
         );
     }
+    b.finish()
+}
+
+/// Private-runtime stand-in for `scala.runtime.BoxedUnit`. `Unit` erases to
+/// `V` only as a method result; as a parameter, a field, an array element or a
+/// type argument it erases to this class, and the single value `()` is the
+/// `UNIT` singleton. Without it the private runtime had to box `()` as `null`,
+/// so `(x: Any) => println(x)` printed `null` where scalac prints `()` and a
+/// `case () =>` pattern also matched `null`.
+///
+/// Mirrors scala-library's shape: `private` constructor, `UNIT`, `TYPE`,
+/// `equals` by identity, `hashCode` 0, `toString` `"()"`.
+fn emit_boxed_unit() -> EmittedClass {
+    const CN: &str = "scala/runtime/BoxedUnit";
+    const CD: &str = "Lscala/runtime/BoxedUnit;";
+    let mut b = B::class(CN, "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_SUPER | ACC_FINAL;
+    b.interfaces.push("java/io/Serializable".into());
+    b.fields.push(Field {
+        access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
+        name: "UNIT".into(),
+        desc: CD.into(),
+    });
+    b.fields.push(Field {
+        access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
+        name: "TYPE".into(),
+        desc: "Ljava/lang/Class;".into(),
+    });
+    b.add_code(ACC_PRIVATE, "<init>", "()V", 1, |asm| {
+        asm.aload(0);
+        asm.invokespecial("java/lang/Object", "<init>", "()V");
+        asm.vreturn();
+    });
+    b.add_code(ACC_STATIC, "<clinit>", "()V", 1, |asm| {
+        asm.new_obj(CN);
+        asm.dup();
+        asm.invokespecial(CN, "<init>", "()V");
+        asm.putstatic(CN, "UNIT", CD);
+        asm.getstatic("java/lang/Void", "TYPE", "Ljava/lang/Class;");
+        asm.putstatic(CN, "TYPE", "Ljava/lang/Class;");
+        asm.vreturn();
+    });
+    b.add_code(
+        ACC_PUBLIC,
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        2,
+        |asm: &mut Assembler| {
+            let ne = asm.fresh_label();
+            asm.aload(0);
+            asm.aload(1);
+            asm.if_acmpne(ne);
+            asm.iconst(1);
+            asm.ireturn();
+            asm.mark(ne);
+            asm.iconst(0);
+            asm.ireturn();
+        },
+    );
+    b.add_code(ACC_PUBLIC, "hashCode", "()I", 1, |asm| {
+        asm.iconst(0);
+        asm.ireturn();
+    });
+    b.add_code(ACC_PUBLIC, "toString", "()Ljava/lang/String;", 1, |asm| {
+        asm.ldc_string("()");
+        asm.areturn();
+    });
+    b.finish()
+}
+
+/// Private-runtime stand-in for `scala.runtime.Nothing$`. `Nothing` erases to
+/// `V` as a method result but to this class in a parameter, so
+/// `def f(x: Nothing)` is `(Lscala/runtime/Nothing$;)I` — and the verifier
+/// loads a parameter's class even for a method nobody can call. Mirrors
+/// scala-library: `public abstract class Nothing$ extends Throwable`.
+fn emit_nothing() -> EmittedClass {
+    let mut b = B::class("scala/runtime/Nothing$", "java/lang/Throwable");
+    b.access = ACC_PUBLIC | ACC_SUPER | ACC_ABSTRACT;
+    b.add_code(ACC_PUBLIC, "<init>", "()V", 1, |asm| {
+        asm.aload(0);
+        asm.invokespecial("java/lang/Throwable", "<init>", "()V");
+        asm.vreturn();
+    });
     b.finish()
 }
 

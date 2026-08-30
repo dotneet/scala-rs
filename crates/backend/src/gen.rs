@@ -250,7 +250,7 @@ fn jvm_desc_maybe_boxed(
     if !id.is_none() && boxed.contains(&id) {
         format!("L{};", runtime_ref_class(ty))
     } else {
-        jvm_desc(st, ty)
+        jvm_desc_val(st, ty)
     }
 }
 
@@ -389,7 +389,7 @@ fn def_method_desc_boxed(st: &SymbolTable, def: &Tree, boxed: &HashSet<SymbolId>
             if synthetic {
                 s.push_str(&jvm_desc_maybe_boxed(st, &ty, p.sym, boxed));
             } else {
-                s.push_str(&jvm_desc(st, &ty));
+                s.push_str(&jvm_desc_val(st, &ty));
             }
         }
     }
@@ -412,7 +412,7 @@ fn method_desc_boxed(st: &SymbolTable, id: SymbolId, boxed: &HashSet<SymbolId>) 
         if synthetic {
             d.push_str(&jvm_desc_maybe_boxed(st, p, pid, boxed));
         } else {
-            d.push_str(&jvm_desc(st, p));
+            d.push_str(&jvm_desc_val(st, p));
         }
     }
     d.push(')');
@@ -480,6 +480,23 @@ impl Frame {
             self.locals.insert(id, (slot, sort));
         }
         self.next_slot += sort.slots();
+        slot
+    }
+
+    /// Allocate the slot an incoming *parameter* occupies. Identical to
+    /// `alloc` except for `Unit`: the JVM really does pass a
+    /// `scala/runtime/BoxedUnit` there, so the slot has to be reserved or
+    /// every later parameter is read from the wrong index. The symbol itself
+    /// stays void-sorted, so reading it leaves nothing on the stack the way
+    /// every other `Unit` expression does (`load`/`store` of a void sort are
+    /// no-ops) and nothing is lost: `BoxedUnit.UNIT` is the slot's only
+    /// possible value and `emit_box` materialises it on demand.
+    fn alloc_param(&mut self, id: SymbolId, sort: JvmSort, ty: &Type) -> u16 {
+        let slot = self.next_slot;
+        if !id.is_none() {
+            self.locals.insert(id, (slot, sort));
+        }
+        self.next_slot += param_slots(ty).max(sort.slots());
         slot
     }
 
@@ -848,8 +865,72 @@ fn is_unit_like(ty: &Type) -> bool {
     matches!(ty, Type::Unit | Type::NoType)
 }
 
+/// Sort of a value held in a *slot* — a parameter or a local. Differs from
+/// `jvm_sort` only for the two types that are `V` as a method result but a
+/// real reference wherever a value is passed or stored: `Unit`
+/// (`scala/runtime/BoxedUnit`) and `Nothing` (`scala/runtime/Nothing$`).
+/// Pass-through code (forwarders, bridges, setters) uses this so it moves the
+/// argument it was handed; a method *body* keeps the void sort and only
+/// reserves the slot, see `Frame::alloc_param`.
+fn jvm_slot_sort(ty: &Type) -> JvmSort {
+    if erases_to_ref_slot(ty) {
+        JvmSort::Ref
+    } else {
+        jvm_sort(ty)
+    }
+}
+
+/// A type whose *result* erasure is `V` but whose *value* erasure is a
+/// reference, so it occupies a parameter slot.
+fn erases_to_ref_slot(ty: &Type) -> bool {
+    matches!(
+        ty.widen_constant(),
+        Type::Unit | Type::NoType | Type::Nothing
+    )
+}
+
+/// How many local slots a parameter of this type occupies.
+fn param_slots(ty: &Type) -> u16 {
+    jvm_slot_sort(ty).slots()
+}
+
 fn class_internal(st: &SymbolTable, id: SymbolId) -> String {
     st.jvm_internal(id)
+}
+
+/// `Unit` is `V` only as a method *result*. Everywhere a value actually lives
+/// -- a parameter, a field, an array element, a type argument -- nsc erases it
+/// to `scala/runtime/BoxedUnit`, whose sole instance is `BoxedUnit.UNIT`.
+/// A descriptor is not even well-formed with a bare `V` in those positions:
+/// `def f(x: Unit)` came out as `(V)Ljava/lang/String;` and the JVM rejected
+/// the whole class with `ClassFormatError: illegal signature`.
+const BOXED_UNIT: &str = "scala/runtime/BoxedUnit";
+const BOXED_UNIT_DESC: &str = "Lscala/runtime/BoxedUnit;";
+
+/// Erasure of a type in a *value* position, as opposed to a method result.
+/// `Nothing` has the same problem as `Unit` and nsc gives it its own class.
+fn jvm_desc_val(st: &SymbolTable, ty: &Type) -> String {
+    match ty.widen_constant() {
+        Type::Unit | Type::NoType => BOXED_UNIT_DESC.into(),
+        Type::Nothing => "Lscala/runtime/Nothing$;".into(),
+        _ => jvm_desc(st, ty),
+    }
+}
+
+/// Array elements are a value position too, so `Array[Unit]` is
+/// `[Lscala/runtime/BoxedUnit;`. `Array[Nothing]` is the one exception nsc
+/// makes: it erases to `Object[]`, not to `Nothing$[]`.
+fn jvm_desc_array_elem(st: &SymbolTable, ty: &Type) -> String {
+    match ty.widen_constant() {
+        Type::Nothing => "Ljava/lang/Object;".into(),
+        _ => jvm_desc_val(st, ty),
+    }
+}
+
+/// True when this type needs `BoxedUnit.UNIT` materialised to occupy the value
+/// position it was erased into.
+fn erases_to_boxed_unit(ty: &Type) -> bool {
+    matches!(ty.widen_constant(), Type::Unit | Type::NoType)
 }
 
 fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
@@ -864,7 +945,7 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::Double => "D".into(),
         Type::Char => "C".into(),
         Type::String => "Ljava/lang/String;".into(),
-        Type::Array(t) => format!("[{}", jvm_desc(st, t)),
+        Type::Array(t) => format!("[{}", jvm_desc_array_elem(st, t)),
         Type::Class { sym, .. } => format!("L{};", class_internal(st, *sym)),
         Type::ModuleRef(sym) => format!("L{};", class_internal(st, *sym)),
         Type::Any | Type::AnyRef | Type::AnyVal | Type::Null | Type::Error => {
@@ -893,7 +974,7 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::Annotated { tpe, .. } => jvm_desc(st, tpe),
         Type::Refined { .. } => "Ljava/lang/Object;".into(),
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
-            format!("[{}", jvm_desc(st, &args[0]))
+            format!("[{}", jvm_desc_array_elem(st, &args[0]))
         }
         Type::Named { name, .. } => {
             let n = name.replace('.', "/");
@@ -906,7 +987,7 @@ fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
 fn jvm_method_desc(st: &SymbolTable, params: &[Type], ret: &Type) -> String {
     let mut s = String::from("(");
     for p in params {
-        s.push_str(&jvm_desc(st, p));
+        s.push_str(&jvm_desc_val(st, p));
     }
     s.push(')');
     s.push_str(&jvm_desc(st, ret));
@@ -1016,6 +1097,16 @@ enum Adapt {
 }
 
 fn param_adapt(st: &SymbolTable, from: &Type, to: &Type) -> Adapt {
+    // `Unit` is not unboxed out of an `Object` -- it *is* a reference,
+    // `scala/runtime/BoxedUnit`. Treating it like the other primitives made a
+    // bridge `pop` its argument and then call a `(BoxedUnit)` method with
+    // nothing to hand it.
+    if erases_to_boxed_unit(to) {
+        return Adapt::Cast(BOXED_UNIT.to_string());
+    }
+    if erases_to_boxed_unit(from) {
+        return Adapt::None;
+    }
     if is_jvm_primitive(to) && !is_jvm_primitive(from) {
         Adapt::Unbox(to.clone())
     } else if is_jvm_primitive(from) && !is_jvm_primitive(to) {
@@ -2205,7 +2296,7 @@ impl<'a> Gen<'a> {
                     let ty = val_tree_ty(self.st, stt);
                     let gdesc = format!("(){}", jvm_desc(self.st, &ty));
                     b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, name, &gdesc);
-                    let sdesc = format!("({})V", jvm_desc(self.st, &ty));
+                    let sdesc = format!("({})V", jvm_desc_val(self.st, &ty));
                     if mods.flags.contains(Flags::MUTABLE) {
                         // A trait `var` — abstract or not — is a getter plus a
                         // public `v_$eq`, exactly as nsc emits it.
@@ -2243,7 +2334,7 @@ impl<'a> Gen<'a> {
                     b.fields.push(Field {
                         access: field_access_flags(mods.flags, widened(self.st, p.sym)),
                         name: name.clone(),
-                        desc: jvm_desc(self.st, &ty),
+                        desc: jvm_desc_val(self.st, &ty),
                     });
                 }
             }
@@ -2274,7 +2365,7 @@ impl<'a> Gen<'a> {
                 b.fields.push(Field {
                     access: field_access_flags(mods.flags, widened(self.st, stt.sym)),
                     name: name.clone(),
-                    desc: jvm_desc(self.st, &ty),
+                    desc: jvm_desc_val(self.st, &ty),
                 });
             }
         }
@@ -2282,7 +2373,7 @@ impl<'a> Gen<'a> {
             b.fields.push(Field {
                 access: ACC_PUBLIC,
                 name,
-                desc: jvm_desc(self.st, &ty),
+                desc: jvm_desc_val(self.st, &ty),
             });
         }
         let lazies = self.all_lazy_vals(class_id, &impl_.body);
@@ -2290,7 +2381,7 @@ impl<'a> Gen<'a> {
             b.fields.push(Field {
                 access: ACC_PRIVATE,
                 name: v.name().unwrap_or("").to_string(),
-                desc: jvm_desc(self.st, &val_tree_ty(self.st, v)),
+                desc: jvm_desc_val(self.st, &val_tree_ty(self.st, v)),
             });
         }
         if !lazies.is_empty() {
@@ -2677,7 +2768,7 @@ impl<'a> Gen<'a> {
                     } else {
                         stt.ty.clone()
                     };
-                    asm.putfield(&class_name, name, &jvm_desc(st, &ty));
+                    emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
                 } else {
                     gen_expr(asm, &mut frame, &ctx, stt);
                     pop_if_value(asm, &stt.ty);
@@ -2750,10 +2841,13 @@ impl<'a> Gen<'a> {
             } else {
                 p.ty.clone()
             };
-            let sort = jvm_sort(&ty);
-            let slot = frame.alloc(p.sym, sort);
+            // The field store below moves the argument straight through, so
+            // the slot sort is what the JVM actually passes: a `Unit`
+            // parameter arrives as `BoxedUnit`, not as nothing.
+            let sort = jvm_slot_sort(&ty);
+            let slot = frame.alloc_param(p.sym, jvm_sort(&ty), &ty);
             let fname = p.name().unwrap_or("").to_string();
-            param_info.push((slot, sort, fname, jvm_desc(self.st, &ty)));
+            param_info.push((slot, sort, fname, jvm_desc_val(self.st, &ty)));
         }
         let mut types: Vec<Type> = Vec::new();
         if let Some(o) = outer {
@@ -2834,7 +2928,7 @@ impl<'a> Gen<'a> {
                     } else {
                         vd.ty.clone()
                     };
-                    asm.putfield(&class_name, name, &jvm_desc(st, &ty));
+                    emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
                 }
             }
             asm.aload(0);
@@ -2849,6 +2943,12 @@ impl<'a> Gen<'a> {
             }
             for a in &super_args {
                 gen_expr(asm, &mut frame, &ctx_early, a);
+                // `class D extends B((), 5)`: the super constructor takes a
+                // `BoxedUnit` there and the `()` left nothing on the stack.
+                // Erasure has already `$box`ed any `()` that goes to an
+                // `Object` parameter, so a `Unit`-typed argument here really
+                // does mean a `Unit` parameter.
+                adapt_unit_arg(asm, &ctx_early, a, &a.ty);
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);
             if has_outer {
@@ -2911,7 +3011,7 @@ impl<'a> Gen<'a> {
                         } else {
                             vd.ty.clone()
                         };
-                        asm.putfield(&class_name, name, &jvm_desc(st, &ty));
+                        emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
                     }
                 }
             }
@@ -2969,7 +3069,7 @@ impl<'a> Gen<'a> {
                 } else {
                     jvm_sort(&ty)
                 };
-                frame.alloc(p.sym, sort);
+                frame.alloc_param(p.sym, sort, &ty);
             }
         }
         let class_name = b.this_name.clone();
@@ -3047,7 +3147,7 @@ impl<'a> Gen<'a> {
                 } else {
                     p.ty.clone()
                 };
-                frame.alloc(p.sym, jvm_sort(&ty));
+                frame.alloc_param(p.sym, jvm_sort(&ty), &ty);
             }
         }
         let class_name = b.this_name.clone();
@@ -3255,11 +3355,9 @@ impl<'a> Gen<'a> {
                         name,
                         mods.flags.contains(Flags::MUTABLE),
                     );
-                    asm.invokeinterface(
-                        &iface_owned,
-                        &setter,
-                        &format!("({})V", jvm_desc(st, &ty)),
-                    );
+                    let sdesc = jvm_desc_val(st, &ty);
+                    fill_boxed_unit_slot(asm, &sdesc);
+                    asm.invokeinterface(&iface_owned, &setter, &format!("({sdesc})V"));
                 }
             }
             asm.vreturn();
@@ -3296,7 +3394,7 @@ impl<'a> Gen<'a> {
                 } else {
                     p.ty.clone()
                 };
-                frame.alloc(p.sym, jvm_sort(&ty));
+                frame.alloc_param(p.sym, jvm_sort(&ty), &ty);
             }
         }
         let iface_owned = iface.to_string();
@@ -3451,10 +3549,10 @@ impl<'a> Gen<'a> {
         }
         let class_name = b.this_name.clone();
         for (name, ty, owner, mutable) in needed {
-            let fdesc = jvm_desc(self.st, &ty);
-            let gdesc = format!("(){fdesc}");
+            let fdesc = jvm_desc_val(self.st, &ty);
+            let gdesc = format!("(){}", jvm_desc(self.st, &ty));
             let sdesc = format!("({fdesc})V");
-            let sort = jvm_sort(&ty);
+            let sort = jvm_slot_sort(&ty);
             let setter = trait_member_setter_name(self.st, owner, &name, mutable);
             // `override val v = …`: the class has its own field, getter and
             // initialisation, but the trait's mixin setter is still abstract on
@@ -3474,7 +3572,7 @@ impl<'a> Gen<'a> {
             let fdesc_c = fdesc.clone();
             b.add_code(ACC_PUBLIC, &name, &gdesc, 1, |asm| {
                 asm.aload(0);
-                asm.getfield(&class_c, &fname, &fdesc_c);
+                emit_getfield(asm, &class_c, &fname, &fdesc_c);
                 emit_return(asm, &ty);
             });
             let fname = name.clone();
@@ -3623,7 +3721,10 @@ impl<'a> Gen<'a> {
             let mut locals = 1u16;
             let mut loads = Vec::new();
             for p in &pts {
-                let sort = jvm_sort(p);
+                // A forwarder passes its arguments straight on, so it moves
+                // what the JVM actually handed it: `Unit` arrives as a
+                // `BoxedUnit` reference.
+                let sort = jvm_slot_sort(p);
                 loads.push((locals, sort));
                 locals += sort.slots();
             }
@@ -3674,7 +3775,7 @@ impl<'a> Gen<'a> {
             .map(|f| {
                 let s = self.st.get(*f);
                 let ty = s.ty.clone();
-                let desc = jvm_desc(self.st, &ty);
+                let desc = jvm_desc_val(self.st, &ty);
                 (s.name.clone(), ty, desc)
             })
             .collect();
@@ -3752,7 +3853,9 @@ impl<'a> Gen<'a> {
                     asm.aload(0);
                     asm.getfield(&cj, name, desc);
                     let ad = append_desc(ty);
-                    if ad == "(Ljava/lang/Object;)Ljava/lang/StringBuilder;" && is_jvm_primitive(ty)
+                    if ad == "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
+                        && is_jvm_primitive(ty)
+                        && !erases_to_boxed_unit(ty)
                     {
                         emit_box(asm, ty);
                     }
@@ -3810,7 +3913,10 @@ impl<'a> Gen<'a> {
                             asm.fcmpl();
                             asm.ifne(no);
                         }
-                        t if is_jvm_primitive(t) => {
+                        // A `Unit` field is a `BoxedUnit` reference, not an
+                        // int-sorted primitive: `if_icmpeq` on two references
+                        // is a `VerifyError`.
+                        t if is_jvm_primitive(t) && !erases_to_boxed_unit(t) => {
                             let eq = asm.fresh_label();
                             asm.if_icmpeq(eq);
                             asm.goto(no);
@@ -3845,7 +3951,7 @@ impl<'a> Gen<'a> {
                     asm.imul();
                     asm.aload(0);
                     asm.getfield(&cj, name, desc);
-                    if is_jvm_primitive(ty) {
+                    if is_jvm_primitive(ty) && !erases_to_boxed_unit(ty) {
                         emit_box(asm, ty);
                     }
                     asm.invokestatic("java/util/Objects", "hashCode", "(Ljava/lang/Object;)I");
@@ -3968,7 +4074,7 @@ impl<'a> Gen<'a> {
                 let mut loads = Vec::new();
                 let mut casts: Vec<Adapt> = Vec::new();
                 for (pty, cty) in parent_params.iter().zip(child_params.iter()) {
-                    let sort = jvm_sort(pty);
+                    let sort = jvm_slot_sort(pty);
                     loads.push((locals, sort));
                     let adapt = if jvm_desc(self.st, pty) != jvm_desc(self.st, cty) {
                         param_adapt(self.st, pty, cty)
@@ -4072,7 +4178,7 @@ impl<'a> Gen<'a> {
             let pids = s.params.clone();
             for (i, ty) in pts.iter().enumerate() {
                 let id = pids.get(i).copied().unwrap_or(SymbolId::NONE);
-                frame.alloc(id, jvm_sort(ty));
+                frame.alloc_param(id, jvm_sort(ty), ty);
             }
             let class_name = b.this_name.clone();
             let st = self.st;
@@ -4135,7 +4241,7 @@ impl<'a> Gen<'a> {
             let desc = format!("(){}", jvm_desc(self.st, &ty));
             let class_name = b.this_name.clone();
             let fname = name.clone();
-            let fdesc = jvm_desc(self.st, &ty);
+            let fdesc = jvm_desc_val(self.st, &ty);
             let st = self.st;
             let extras = &self.extras;
             let lambda_n = &self.lambda_n;
@@ -4175,7 +4281,7 @@ impl<'a> Gen<'a> {
                 );
                 asm.aload(0);
                 gen_expr(asm, &mut frame, &ctx, &rhs);
-                asm.putfield(&class_name, &fname, &fdesc);
+                emit_putfield_from_expr(asm, &class_name, &fname, &fdesc);
                 asm.aload(0);
                 asm.aload(0);
                 asm.getfield(&class_name, "bitmap$0", "I");
@@ -4184,7 +4290,7 @@ impl<'a> Gen<'a> {
                 asm.putfield(&class_name, "bitmap$0", "I");
                 asm.mark(inited);
                 asm.aload(0);
-                asm.getfield(&class_name, &fname, &fdesc);
+                emit_getfield(asm, &class_name, &fname, &fdesc);
                 store(asm, result, jvm_sort(&ret_ty));
                 load(asm, lock, JvmSort::Ref);
                 asm.monitorexit();
@@ -4241,8 +4347,8 @@ impl<'a> Gen<'a> {
                 if ty.is_no_type() || ty.is_error() {
                     continue;
                 }
-                let fdesc = jvm_desc(self.st, &ty);
-                let getter = format!("(){fdesc}");
+                let fdesc = jvm_desc_val(self.st, &ty);
+                let getter = format!("(){}", jvm_desc(self.st, &ty));
                 let enc = encode_method_name(name);
                 if !defined.contains(&(enc.clone(), getter.clone())) {
                     let fname = name.clone();
@@ -4251,7 +4357,7 @@ impl<'a> Gen<'a> {
                     let ret_ty = ty.clone();
                     b.add_code(ACC_PUBLIC, name, &getter, 1, move |asm| {
                         asm.aload(0);
-                        asm.getfield(&cn, &fname, &fd);
+                        emit_getfield(asm, &cn, &fname, &fd);
                         emit_return(asm, &ret_ty);
                     });
                 }
@@ -4299,7 +4405,7 @@ impl<'a> Gen<'a> {
                         let fname = name.clone();
                         let cn = class_name.clone();
                         let fd = fdesc.clone();
-                        let sort = jvm_sort(&ty);
+                        let sort = jvm_slot_sort(&ty);
                         b.add_code(ACC_PUBLIC, &setter_name, &setter, 3, move |asm| {
                             asm.aload(0);
                             load(asm, 1, sort);
@@ -4331,12 +4437,12 @@ impl<'a> Gen<'a> {
             }
             let desc = format!("(){}", jvm_desc(self.st, &ty));
             let fname = name.clone();
-            let fdesc = jvm_desc(self.st, &ty);
+            let fdesc = jvm_desc_val(self.st, &ty);
             let ret_ty = ty.clone();
             let cls = class_name.clone();
             b.add_code(ACC_PUBLIC, &fname, &desc, 1, |asm| {
                 asm.aload(0);
-                asm.getfield(&cls, &fname, &fdesc);
+                emit_getfield(asm, &cls, &fname, &fdesc);
                 emit_return(asm, &ret_ty);
             });
             // A `var` also gets nsc's `v_$eq`; that is the setter an abstract
@@ -4349,9 +4455,9 @@ impl<'a> Gen<'a> {
                 continue;
             }
             let fname = name.clone();
-            let fdesc = jvm_desc(self.st, &ty);
+            let fdesc = jvm_desc_val(self.st, &ty);
             let cls = class_name.clone();
-            let sort = jvm_sort(&ty);
+            let sort = jvm_slot_sort(&ty);
             b.add_code(
                 ACC_PUBLIC,
                 &setter,
@@ -4414,7 +4520,7 @@ impl<'a> Gen<'a> {
                 b.fields.push(Field {
                     access: field_access_flags(mods.flags, widened(self.st, stt.sym)),
                     name: name.clone(),
-                    desc: jvm_desc(self.st, &ty),
+                    desc: jvm_desc_val(self.st, &ty),
                 });
             }
         }
@@ -4422,7 +4528,7 @@ impl<'a> Gen<'a> {
             b.fields.push(Field {
                 access: ACC_PUBLIC,
                 name,
-                desc: jvm_desc(self.st, &ty),
+                desc: jvm_desc_val(self.st, &ty),
             });
         }
         let lazies = self.all_lazy_vals(cls, &impl_.body);
@@ -4430,7 +4536,7 @@ impl<'a> Gen<'a> {
             b.fields.push(Field {
                 access: ACC_PRIVATE,
                 name: v.name().unwrap_or("").to_string(),
-                desc: jvm_desc(self.st, &val_tree_ty(self.st, v)),
+                desc: jvm_desc_val(self.st, &val_tree_ty(self.st, v)),
             });
         }
         if !lazies.is_empty() {
@@ -4633,6 +4739,7 @@ impl<'a> Gen<'a> {
             }
             for a in &super_args {
                 gen_expr(asm, &mut frame, &ctx, a);
+                adapt_unit_arg(asm, &ctx, a, &a.ty);
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);
             asm.aload(0);
@@ -4663,7 +4770,7 @@ impl<'a> Gen<'a> {
                         } else {
                             vd.ty.clone()
                         };
-                        asm.putfield(&class_name, name, &jvm_desc(st, &ty));
+                        emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
                     }
                 }
             }
@@ -4766,7 +4873,7 @@ impl<'a> Gen<'a> {
             let mut locals = 0u16;
             let mut loads = Vec::new();
             for p in params {
-                let sort = jvm_sort(p);
+                let sort = jvm_slot_sort(p);
                 loads.push((locals, sort));
                 locals += sort.slots();
             }
@@ -4884,7 +4991,7 @@ fn emit_product_accessors(
                             _ => {
                                 asm.aload(0);
                                 asm.getfield(&cj, name, desc);
-                                if is_jvm_primitive(ty) {
+                                if is_jvm_primitive(ty) && !erases_to_boxed_unit(ty) {
                                     emit_box(asm, ty);
                                 }
                             }
@@ -5098,7 +5205,12 @@ fn emit_case_apply_bridge(b: &mut ClassBuilder, st: &SymbolTable, class_id: Symb
         asm.aload(0);
         for (i, ty) in tys.iter().enumerate() {
             asm.aload(i as u16 + 1);
-            if is_jvm_primitive(ty) {
+            // `Unit` is a `BoxedUnit` reference here, not an unboxed
+            // primitive: unboxing it `pop`ped the argument and left the call
+            // below with nothing to pass.
+            if erases_to_boxed_unit(ty) {
+                asm.checkcast(BOXED_UNIT);
+            } else if is_jvm_primitive(ty) {
                 emit_unbox(asm, ty);
             } else if let Some(internal) = checkcast_internal(st, ty) {
                 asm.checkcast(&internal);
@@ -5117,7 +5229,9 @@ fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
     let mut loads = Vec::new();
     for f in &fields {
         let ty = st.get(*f).ty.clone();
-        let sort = jvm_sort(&ty);
+        // Pass-through: the argument the JVM handed us is what goes to the
+        // constructor, and a `Unit` one is a `BoxedUnit` reference in a slot.
+        let sort = jvm_slot_sort(&ty);
         loads.push((locals, sort));
         locals += sort.slots();
         params.push(ty);
@@ -5162,7 +5276,7 @@ fn emit_case_copy(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
     let mut loads = Vec::new();
     for f in &copy_params {
         let ty = st.get(*f).ty.clone();
-        let sort = jvm_sort(&ty);
+        let sort = jvm_slot_sort(&ty);
         loads.push((locals, sort));
         locals += sort.slots();
         params.push(ty);
@@ -5566,11 +5680,15 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
             gen_expr(asm, frame, ctx, tree);
             if is_unit_like(&tree.ty) {
                 // A polymorphic method instantiated at `Unit` still *returns* a
-                // reference on the JVM (`PartialFunction[Throwable, Unit].apply`
-                // is `(Object)Object`). In value position `unit_leaves_boxed_ref`
-                // lets the caller reuse that ref; discarded, it has to go, or a
-                // later `goto` merges two different stack heights.
-                if ctx.library_abi && unit_call_leaves_ref(tree, ctx.st) {
+                // reference on the JVM (`def id[A](a: A): A` is
+                // `(Object)Object`, `PartialFunction[Throwable, Unit].apply`
+                // likewise). In value position `unit_leaves_boxed_ref` lets the
+                // caller reuse that ref; discarded, it has to go, or a later
+                // `goto` merges two different stack heights -- exactly what nsc
+                // emits (`invokevirtual id; pop`).
+                if unit_stat_leaves_ref(tree, ctx.st)
+                    || (ctx.library_abi && unit_call_leaves_ref(tree, ctx.st))
+                {
                     asm.pop();
                 }
             } else {
@@ -5874,14 +5992,16 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
                 asm.invokeinterface(&owner, &sym.name, &desc);
             } else {
                 let owner = class_internal(ctx.st, owner);
-                let desc = jvm_desc(ctx.st, &sym.ty);
+                let desc = jvm_desc_val(ctx.st, &sym.ty);
                 // A library constructor field is private; `jvm_name` holds the
-                // accessor to call instead (`StringContext.parts`).
+                // accessor to call instead (`StringContext.parts`). Its
+                // *result* is a method result, so `Unit` is `V` there even
+                // though the field itself is a `BoxedUnit`.
                 if sym.jvm_name.is_empty() {
-                    asm.getfield(&owner, &sym.name, &desc);
+                    emit_getfield(asm, &owner, &sym.name, &desc);
                 } else {
                     let acc = sym.jvm_name.clone();
-                    asm.invokevirtual(&owner, &acc, &format!("(){desc}"));
+                    asm.invokevirtual(&owner, &acc, &format!("(){}", jvm_desc(ctx.st, &sym.ty)));
                 }
             }
         }
@@ -6108,9 +6228,12 @@ fn gen_select(
                     let desc = if !s.jvm_name.is_empty() && !s.jvm_name.starts_with('(') {
                         s.jvm_name.clone()
                     } else {
-                        jvm_desc(ctx.st, &s.ty)
+                        jvm_desc_val(ctx.st, &s.ty)
                     };
                     asm.getstatic(&owner, &s.name, &desc);
+                    if desc == BOXED_UNIT_DESC {
+                        asm.pop();
+                    }
                     maybe_cast_erased_load(asm, ctx, &s.ty, &tree.ty);
                     return;
                 }
@@ -6124,12 +6247,12 @@ fn gen_select(
                     asm.invokeinterface(&owner, &s.name, &desc);
                 } else {
                     let owner = class_internal(ctx.st, s.owner);
-                    let desc = jvm_desc(ctx.st, &s.ty);
+                    let desc = jvm_desc_val(ctx.st, &s.ty);
                     if s.jvm_name.is_empty() {
-                        asm.getfield(&owner, &s.name, &desc);
+                        emit_getfield(asm, &owner, &s.name, &desc);
                     } else {
                         let acc = s.jvm_name.clone();
-                        asm.invokevirtual(&owner, &acc, &format!("(){desc}"));
+                        asm.invokevirtual(&owner, &acc, &format!("(){}", jvm_desc(ctx.st, &s.ty)));
                     }
                     maybe_cast_erased_load(asm, ctx, &s.ty, &tree.ty);
                 }
@@ -6231,8 +6354,8 @@ fn gen_select(
     if let Some(cid) = ctx.st.class_sym_of(&qual.ty) {
         gen_expr(asm, frame, ctx, qual);
         let owner = class_internal(ctx.st, cid);
-        let desc = jvm_desc(ctx.st, &tree.ty);
-        asm.getfield(&owner, name, &desc);
+        let desc = jvm_desc_val(ctx.st, &tree.ty);
+        emit_getfield(asm, &owner, name, &desc);
         return;
     }
     throw_runtime(asm, &format!("select {name}"));
@@ -6265,16 +6388,18 @@ fn gen_assign(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, lhs: &Tree,
                     load_owner_instance(asm, ctx, s.owner);
                     gen_expr(asm, frame, ctx, rhs);
                     let owner = class_internal(ctx.st, s.owner);
-                    let desc = format!("({})V", jvm_desc(ctx.st, &s.ty));
-                    asm.invokeinterface(&owner, &var_setter_name(&s.name), &desc);
+                    let vd = jvm_desc_val(ctx.st, &s.ty);
+                    fill_boxed_unit_slot(asm, &vd);
+                    asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
                 load_this(asm, ctx);
                 gen_expr(asm, frame, ctx, rhs);
-                asm.putfield(
+                emit_putfield_from_expr(
+                    asm,
                     &class_internal(ctx.st, s.owner),
                     &s.name,
-                    &jvm_desc(ctx.st, &s.ty),
+                    &jvm_desc_val(ctx.st, &s.ty),
                 );
                 return;
             }
@@ -6287,8 +6412,9 @@ fn gen_assign(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, lhs: &Tree,
             if !lhs.sym.is_none() && is_trait_owned_term(ctx.st, lhs.sym) {
                 let s = ctx.st.get(lhs.sym);
                 let owner = class_internal(ctx.st, s.owner);
-                let desc = format!("({})V", jvm_desc(ctx.st, &s.ty));
-                asm.invokeinterface(&owner, &var_setter_name(&s.name), &desc);
+                let vd = jvm_desc_val(ctx.st, &s.ty);
+                fill_boxed_unit_slot(asm, &vd);
+                asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                 return;
             }
             let owner = if !lhs.sym.is_none() {
@@ -6299,11 +6425,11 @@ fn gen_assign(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, lhs: &Tree,
                 ctx.class_name.to_string()
             };
             let desc = if !lhs.ty.is_no_type() {
-                jvm_desc(ctx.st, &lhs.ty)
+                jvm_desc_val(ctx.st, &lhs.ty)
             } else {
-                jvm_desc(ctx.st, &rhs.ty)
+                jvm_desc_val(ctx.st, &rhs.ty)
             };
-            asm.putfield(&owner, name, &desc);
+            emit_putfield_from_expr(asm, &owner, name, &desc);
         }
         _ => {
             gen_expr(asm, frame, ctx, rhs);
@@ -6464,7 +6590,8 @@ fn gen_new(
         for (i, a) in args.iter().enumerate() {
             gen_expr(asm, frame, ctx, a);
             let pty = field_tys.get(i).unwrap_or(&a.ty);
-            if is_jvm_primitive(&a.ty) && !is_jvm_primitive(pty) {
+            adapt_unit_arg(asm, ctx, a, pty);
+            if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
                 emit_box(asm, &a.ty);
             }
         }
@@ -6531,14 +6658,11 @@ fn gen_apply(
         if let Some(a) = args.first() {
             gen_expr(asm, frame, ctx, a);
             if is_unit_like(&a.ty) {
-                // nsc boxes Unit as BoxedUnit.UNIT. ArrayOps.head already left
-                // that ref (or null) on the stack; a Unit literal left nothing.
-                if ctx.library_abi {
-                    if !unit_leaves_boxed_ref(a, ctx.st) {
-                        emit_boxed_unit(asm);
-                    }
-                } else {
-                    emit_box(asm, &a.ty);
+                // nsc boxes Unit as BoxedUnit.UNIT. A call erased through
+                // `Object` (`ArrayOps.head`, `def id[A](a: A): A`) already left
+                // that ref on the stack; a Unit literal left nothing.
+                if !unit_leaves_boxed_ref(a, ctx.st) {
+                    emit_boxed_unit(asm);
                 }
             } else {
                 emit_box(asm, &a.ty);
@@ -10777,6 +10901,9 @@ fn is_concrete_array_elem(elem: &Type) -> bool {
             | Type::Array(_)
             | Type::Tuple(_)
             | Type::Function { .. }
+            // `Array[Unit]` is `[Lscala/runtime/BoxedUnit;` — a concrete
+            // element like any other, not the `V` that `Unit` is as a result.
+            | Type::Unit
     )
 }
 
@@ -11735,6 +11862,23 @@ fn gen_wrap_varargs(
     }
 }
 
+/// Materialise the argument a `Unit` parameter expects. `Unit` erases to
+/// `scala/runtime/BoxedUnit` in parameter position, so the call really does
+/// push one -- but the expression that produced it left nothing on the stack
+/// (`f(())`, `f(g())` alike). Erasure sometimes hands over an expression that
+/// already produced a reference (`$box`, a generic `T` result); that one *is*
+/// the box, and only needs narrowing from `Object`.
+fn adapt_unit_arg(asm: &mut Assembler, ctx: &EmitCtx, a: &Tree, pty: &Type) {
+    if !erases_to_boxed_unit(pty) {
+        return;
+    }
+    if unit_leaves_boxed_ref(a, ctx.st) {
+        asm.checkcast(BOXED_UNIT);
+    } else {
+        emit_boxed_unit(asm);
+    }
+}
+
 fn gen_call_args(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -11765,8 +11909,14 @@ fn gen_call_args(
             }
         }
         gen_expr(asm, frame, ctx, a);
+        let pty = param_tys.get(i).unwrap_or(&a.ty);
+        // A `Unit` parameter is a `scala/runtime/BoxedUnit` on the JVM, so an
+        // argument really is pushed: `f(())` and `f(g())` alike leave nothing
+        // behind and need the singleton here. Erasure sometimes hands us an
+        // expression that already produced a reference (`$box`, a generic `T`
+        // result) -- that one is the value, so do not push a second.
+        adapt_unit_arg(asm, ctx, a, pty);
         if box_prims {
-            let pty = param_tys.get(i).unwrap_or(&a.ty);
             if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
                 emit_box(asm, &a.ty);
             } else if matches!(pty, Type::Array(_)) {
@@ -11854,11 +12004,37 @@ fn load_predef_module(asm: &mut Assembler) {
 }
 
 fn emit_boxed_unit(asm: &mut Assembler) {
-    asm.getstatic(
-        "scala/runtime/BoxedUnit",
-        "UNIT",
-        "Lscala/runtime/BoxedUnit;",
-    );
+    asm.getstatic(BOXED_UNIT, "UNIT", BOXED_UNIT_DESC);
+}
+
+/// Read a field whose Scala type may be `Unit`. Such a field really does hold
+/// a `scala/runtime/BoxedUnit`, but a `Unit` *expression* leaves nothing on
+/// the stack, so the value read is dropped again — which is exactly the body
+/// nsc gives a `Unit` getter (`getfield; pop; return`). Nothing is lost:
+/// `BoxedUnit.UNIT` is the only value the field can hold.
+fn emit_getfield(asm: &mut Assembler, owner: &str, name: &str, desc: &str) {
+    asm.getfield(owner, name, desc);
+    if desc == BOXED_UNIT_DESC {
+        asm.pop();
+    }
+}
+
+/// Store into a field whose Scala type may be `Unit`, when the value comes
+/// from an *expression* rather than from a slot: a `Unit` expression leaves
+/// nothing behind, so the singleton is materialised here.
+fn emit_putfield_from_expr(asm: &mut Assembler, owner: &str, name: &str, desc: &str) {
+    fill_boxed_unit_slot(asm, desc);
+    asm.putfield(owner, name, desc);
+}
+
+/// A `Unit` expression leaves nothing on the stack, but the value position it
+/// was erased into -- an argument, a field, an array slot -- has to actually
+/// hold the `BoxedUnit` singleton. Call this right after emitting the
+/// expression, with the descriptor of the slot it is going into.
+fn fill_boxed_unit_slot(asm: &mut Assembler, desc: &str) {
+    if desc == BOXED_UNIT_DESC {
+        emit_boxed_unit(asm);
+    }
 }
 
 /// Unit literals, and `$box(unit)` inserted by erasure (whose result type is
@@ -11878,11 +12054,9 @@ fn is_unit_varargs_elem(tree: &Tree) -> bool {
 }
 
 fn gen_varargs_elem(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, a: &Tree) {
-    if ctx.library_abi && is_unit_varargs_elem(a) {
-        if unit_leaves_boxed_ref(a, ctx.st) {
-            gen_expr(asm, frame, ctx, a);
-        } else {
-            gen_expr(asm, frame, ctx, a);
+    if is_unit_varargs_elem(a) {
+        gen_expr(asm, frame, ctx, a);
+        if !unit_leaves_boxed_ref(a, ctx.st) {
             emit_boxed_unit(asm);
         }
     } else {
@@ -11920,14 +12094,77 @@ fn method_erases_unit_to_ref(fun: &Tree, st: &SymbolTable) -> bool {
         return false;
     }
     let s = st.get(fun.sym);
+    // `x.asInstanceOf[Unit]` is emitted by `emit_as_instance_of`, which drops
+    // the receiver: the cast's result is a `Unit` expression like any other and
+    // leaves nothing, even though `asInstanceOf`'s declared result is a type
+    // parameter.
+    if matches!(s.intrinsic, Intrinsic::AsInstanceOf) {
+        return false;
+    }
     if st.get(s.owner).name == "ArrayOps" {
         return true;
     }
     match &s.ty {
+        // The call leaves exactly what its own descriptor returns. A
+        // `Unit`-typed expression whose callee is declared to return something
+        // that erases to a reference -- a type parameter, `Any` -- really did
+        // push one: `def id[A](a: A): A` is `(Object)Object` even at
+        // `id(())`, and nothing pops it.
         Type::Method { ret, .. } | Type::Function { ret, .. } => {
-            matches!(ret.as_ref(), Type::TypeParam(_))
+            !matches!(ret.as_ref(), Type::Unit | Type::NoType | Type::Nothing)
         }
         Type::TypeParam(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether this owner is a class or object defined in the unit being compiled.
+/// `SymbolTable::source_classes` records an `object`'s *module* symbol, while
+/// a method's owner is the module *class*, so both spellings have to match.
+fn owner_defined_in_source(st: &SymbolTable, owner: SymbolId) -> bool {
+    if st.source_classes.contains(&owner) {
+        return true;
+    }
+    if st.get(owner).kind != SymKind::ModuleClass {
+        return false;
+    }
+    st.source_classes
+        .iter()
+        .any(|&m| st.module_class_of(m) == owner)
+}
+
+/// A `Unit`-typed expression in *statement* position whose emitted code left a
+/// reference behind, so it has to be dropped -- `def id[A](a: A): A` is
+/// `(Object)Object` even at `id(())`, and nsc pops it too.
+///
+/// Deliberately narrower than `unit_leaves_boxed_ref`, which answers the same
+/// question for a *value* position: only a method **defined in this
+/// compilation unit** counts. Library members reach the backend through
+/// emitters of their own that already drop the value where they produce it
+/// (`Using.resource`, `Breaks.catchBreak`, `ArrayOps`), and popping it a
+/// second time underflows the stack. A callee declared to return `Unit`
+/// returns `V` and leaves nothing at all either way.
+fn unit_stat_leaves_ref(tree: &Tree, st: &SymbolTable) -> bool {
+    match &tree.kind {
+        TreeKind::Typed { expr, .. } | TreeKind::Block { expr, .. } => {
+            unit_stat_leaves_ref(expr, st)
+        }
+        TreeKind::Apply { fun, .. } => {
+            let f = peel_fun(fun);
+            if f.sym.is_none() {
+                return false;
+            }
+            let s = st.get(f.sym);
+            if !matches!(s.intrinsic, Intrinsic::None) || !owner_defined_in_source(st, s.owner) {
+                return false;
+            }
+            match &s.ty {
+                Type::Method { ret, .. } | Type::Function { ret, .. } => {
+                    !matches!(ret.as_ref(), Type::Unit | Type::NoType | Type::Nothing)
+                }
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
@@ -12018,7 +12255,11 @@ fn gen_predef_poly(
     };
     gen_expr(asm, frame, ctx, a);
     if is_unit_like(&a.ty) {
-        asm.aconst_null();
+        if unit_leaves_boxed_ref(a, ctx.st) {
+            asm.checkcast(BOXED_UNIT);
+        } else {
+            emit_boxed_unit(asm);
+        }
     } else if is_jvm_primitive(&a.ty) {
         emit_box(asm, &a.ty);
     }
@@ -12173,8 +12414,12 @@ fn emit_box_inner(asm: &mut Assembler, ty: &Type) {
         Type::Float => {
             asm.invokestatic("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;");
         }
+        // `()` boxes to the `BoxedUnit` singleton, never to `null`: that is
+        // what makes `println(x: Any)` print `()` and `(x: Any) == ()` true.
+        // The private runtime emits its own `scala/runtime/BoxedUnit`, so both
+        // modes agree here.
         Type::Unit | Type::NoType => {
-            asm.aconst_null();
+            emit_boxed_unit(asm);
         }
         _ => {}
     }
@@ -12262,9 +12507,11 @@ fn emit_as_instance_of(asm: &mut Assembler, ctx: &EmitCtx, target: &Type) {
     match target {
         Type::String => asm.checkcast("java/lang/String"),
         Type::Unit | Type::NoType => {
-            // Rare in practice; the cast result is discarded by every real
-            // caller. Leave the (Object) receiver on the stack rather than
-            // guessing at a BoxedUnit representation here.
+            // The result is a `Unit` *expression*, so it leaves nothing on the
+            // stack -- the receiver was only evaluated for its effect. nsc
+            // drops the cast entirely and materialises `BoxedUnit.UNIT` at
+            // whatever value position the result goes to.
+            asm.pop();
         }
         _ => {
             if let Some(cn) = checkcast_internal(ctx.st, target) {
@@ -12287,6 +12534,9 @@ fn emit_is_instance_of(asm: &mut Assembler, ctx: &EmitCtx, target: &Type) {
     }
     let cn = match target {
         Type::String => "java/lang/String".to_string(),
+        // `x.isInstanceOf[Unit]` is `instanceof scala/runtime/BoxedUnit`,
+        // which is what nsc emits.
+        t if erases_to_boxed_unit(t) => BOXED_UNIT.to_string(),
         _ => checkcast_internal(ctx.st, target).unwrap_or_else(|| "java/lang/Object".to_string()),
     };
     asm.instanceof(&cn);
@@ -13148,9 +13398,18 @@ fn gen_println(
     }
     let arg = &args[0];
     match &arg.ty.widen_constant() {
+        // `println(())` prints `()`, not a blank line: nsc calls
+        // `Predef.println(x: Any)` with the `BoxedUnit` singleton, whose
+        // `toString` is `"()"`. The private runtime now has that class too, so
+        // both modes print the same thing.
         Type::Unit | Type::NoType => {
             gen_expr(asm, frame, ctx, arg);
-            asm.invokevirtual("java/io/PrintStream", name, "()V");
+            if unit_leaves_boxed_ref(arg, ctx.st) {
+                asm.checkcast(BOXED_UNIT);
+            } else {
+                emit_boxed_unit(asm);
+            }
+            asm.invokevirtual("java/io/PrintStream", name, "(Ljava/lang/Object;)V");
         }
         Type::Int | Type::Byte | Type::Short => {
             gen_expr(asm, frame, ctx, arg);
@@ -14329,21 +14588,13 @@ fn is_type_test_pat(pat: &Tree) -> bool {
 /// `Any`), widened when the scrutinee is a wider primitive (`case 1 =>` on a
 /// `Long`). Without this the comparison below saw two different sorts and the
 /// verifier rejected the method.
-fn emit_pattern_operand(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type, sel_sort: JvmSort) {
+fn emit_pattern_operand(asm: &mut Assembler, ty: &Type, sel_sort: JvmSort) {
     let ty = ty.widen_constant();
     if !is_jvm_primitive(&ty) {
         return;
     }
     if sel_sort == JvmSort::Ref {
-        if is_unit_like(&ty) && ctx.library_abi {
-            // `emit_box` would push a bare `null` for `Unit`; against the real
-            // library a boxed `()` is `BoxedUnit.UNIT`. The private runtime
-            // has no `BoxedUnit`, and boxes `Unit` as `null` throughout, so
-            // `emit_box`'s `null` is the right operand there.
-            emit_boxed_unit(asm);
-        } else {
-            emit_box(asm, &ty);
-        }
+        emit_box(asm, &ty);
         return;
     }
     let want = match sel_sort {
@@ -14594,7 +14845,7 @@ fn gen_pattern(
                 // The stable id goes on the stack first, the scrutinee second:
                 // see `emit_pattern_eq_jump`.
                 gen_ident(asm, frame, ctx, pat);
-                emit_pattern_operand(asm, ctx, &pat.ty, sel_sort);
+                emit_pattern_operand(asm, &pat.ty, sel_sort);
                 load(asm, tmp, sel_sort);
                 emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
             }
@@ -14602,12 +14853,10 @@ fn gen_pattern(
         TreeKind::Literal { lit } => {
             // SLS 8.1.1: the `null` pattern is a *reference* comparison.
             // `x.equals(null)` threw a `NullPointerException` on the one
-            // scrutinee the case exists to catch. The private runtime has no
-            // `BoxedUnit` and boxes `Unit` as `null` throughout, so a `()`
-            // pattern against a reference scrutinee is the same comparison
-            // there.
-            let by_reference = matches!(lit, Lit::Null)
-                || (matches!(lit, Lit::Unit) && !ctx.library_abi && sel_sort == JvmSort::Ref);
+            // scrutinee the case exists to catch. A `()` pattern is *not* one
+            // of these: `()` boxes to `BoxedUnit.UNIT` in both modes now, so
+            // it compares by value and does not also match `null`.
+            let by_reference = matches!(lit, Lit::Null);
             if by_reference {
                 if sel_sort == JvmSort::Ref {
                     load(asm, tmp, sel_sort);
@@ -14618,14 +14867,14 @@ fn gen_pattern(
                 }
             } else {
                 gen_literal(asm, lit);
-                emit_pattern_operand(asm, ctx, &pat.ty, sel_sort);
+                emit_pattern_operand(asm, &pat.ty, sel_sort);
                 load(asm, tmp, sel_sort);
                 emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
             }
         }
         TreeKind::Select { .. } => {
             gen_expr(asm, frame, ctx, pat);
-            emit_pattern_operand(asm, ctx, &pat.ty, sel_sort);
+            emit_pattern_operand(asm, &pat.ty, sel_sort);
             load(asm, tmp, sel_sort);
             emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
         }
@@ -14653,7 +14902,12 @@ fn gen_pattern(
                     let fs = ctx.st.get(*fid);
                     let fname = fs.name.clone();
                     let fty = fs.ty.clone();
-                    let fdesc = jvm_desc(ctx.st, &fty);
+                    // The *field* is a value position (`Unit` is
+                    // `BoxedUnit` there); the accessor's *result* is not
+                    // (`Unit` is `V`). They are only the same descriptor for
+                    // every other type.
+                    let fdesc = jvm_desc_val(ctx.st, &fty);
+                    let acc_desc = format!("(){}", jvm_desc(ctx.st, &fty));
                     load(asm, tmp, JvmSort::Ref);
                     asm.checkcast(&jvm);
                     // A case class's field is private with a public accessor
@@ -14677,8 +14931,8 @@ fn gen_pattern(
                         None
                     };
                     match acc {
-                        Some(a) => asm.invokevirtual(&jvm, &a, &format!("(){fdesc}")),
-                        None => asm.getfield(&jvm, &fname, &fdesc),
+                        Some(a) => asm.invokevirtual(&jvm, &a, &acc_desc),
+                        None => emit_getfield(asm, &jvm, &fname, &fdesc),
                     }
                     // A field declared as a type parameter erases to Object, so
                     // `case Some(x)` on an `Option[Int]` must unbox before it
