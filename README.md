@@ -123,6 +123,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - **case class / case object は `scala.Product with java.io.Serializable`**（jar リンク時）。`val p: Product = P(1, 2)` も `List[Product]` も通り、`productIterator` / `productElementNames` は nsc と同じく `Product` から継承する。**合成コンパニオンは `scala.runtime.AbstractFunctionN` を継承する**ので `P.tupled` / `P.curried` / `val f: (Int, String) => P = P` が動く。詳しくは「case class を `Product` にする」節
 - **`val` への再代入の診断**（`val x = 1; x = 2` も `d.v = 5`（trait の `val`）も nsc と同じ `reassignment to val`）。Java のフィールドとコンパイラ生成の synthetic な項は対象外
 - 内部クラス（`$outer`）とネストした object。匿名クラス `new Trait { def f = ... }` と `new { def x = 1 }`（合成 classfile。型は refinement ではなく `$anon$N`）
+- **クラス / trait のメンバである `object`**。トップレベルの `object` と違って静的シングルトンではなく、**外側インスタンスごとに 1 つ**です。nsc と同じく `$outer` フィールドと外側インスタンスを取る `<init>`（`MODULE$` も `<clinit>` も無い）を出し、外側テンプレート側に `private volatile <name>$module` フィールドと、初回参照時に作る `<name>()` アクセサを出します。trait のメンバのときは interface が `<name>()` を abstract で宣言し、実装クラス側がフィールドとアクセサを持ちます（`lazy val` の mixin と同じ形）。非 static な `object` の中の `object` も同じく非 static です（`class Outer { object P { object N } }` の `N` は `$outer: Outer$P$`）。クラスにネストした `case class` のコンパニオンも同じ扱いで、`copy` は自分の `$outer` を新しいインスタンスへ渡します。詳細は「ネストした型」節
 - メソッド本体の中で定義したクラス（匿名クラス `new T { … }` と**ローカル `class` / `object`**）が、**囲みメソッドのパラメータ / ローカルをキャプチャ**する。nsc と同じ形で、自由変数ごとに `x$1` という public final フィールドと、末尾に付く追加のコンストラクタ引数を出す。各インスタンスメソッドの先頭でそのフィールドをローカルスロットに読み戻すので、キャプチャした `var` の `scala.runtime.*Ref` 経由の読み書きも、匿名クラス内のラムダによる二重キャプチャ（`$captured$N`）も、既存の経路のまま動く。メソッドの中のクラスにも `$outer` が付き、囲みクラスのメンバは `$outer` チェーンで読む
 - eta-expansion `foo _` と、FunctionN が期待される位置への未適用メソッド（`xs.map(inc)`）。ネストしたパラメータリストは **uncurry** で 1 リスト + クロージャになる。SIP-21 の SAM: ラムダ / 未適用メソッドを `Runnable` / `java.util.Comparator[Int]` / `java.util.function.Function[A,B]`（単一抽象メソッド）に適合。SAM でない型へは type mismatch（黙ってラップしない）。`def go(): Unit` を `_` なしで `Runnable` に渡すのは nsc と同じく auto-apply して mismatch。合成クラスは既存の anonfun と同じく invokedynamic は使わない
 - **コンストラクタ引数のアクセサ**。`class C(val x: Int)` も、キーワード無しで `val` になる **`case class` の第 1 引数リスト**も public なアクセサ `x()` になり、親の抽象メンバーを実装する（親が `def value: T` を `()Object` に erase する場合はブリッジも出す）。第 2 引数リスト以降は nsc と同じく private な状態のまま。`var` 引数は `x()` と `x_$eq(v)` の両方
@@ -660,6 +661,30 @@ try close() catch {
 ### ネストした型
 
 `class Outer { class Inner }` は `Outer$Inner` になり、非 static な内部クラスは `$outer` をコンストラクタで受け取ります。primary / 補助コンストラクタの overload 選択はソース引数だけを見ますが、呼び出す `<init>` 記述子には `$outer` を前置します。`object Outer { object Inner }` は `Outer$Inner$` と `MODULE$` です。
+
+**クラス / trait のメンバである `object`** は静的シングルトンではありません。`javap -v -p -c`
+で確かめた scalac 2.13.16 の形は次のとおりで、こちらも同じものを出します。
+
+- `Main$Outer$P$` に `$outer` フィールドと `public <init>(LMain$Outer;)V`
+  （先頭で引数の null チェック）。`MODULE$` も `<clinit>` も無い。フィールドの可視性
+  だけは nsc の `private final` ではなく、内部クラスの `$outer` と揃えて
+  `public final` です（既存の `$outer` チェーン読みがそのまま効くため）。
+- 外側 `Main$Outer` に `private volatile Main$Outer$P$ P$module` と、`null` なら
+  `synchronized` で作る `public Main$Outer$P$ P()` アクセサ。参照側は `getstatic MODULE$`
+  ではなく `<外側インスタンス>.P()` を呼びます。だから `o.P eq o.P` は `true`、
+  別の `Outer` の `P` とは `false` になります。
+- trait のメンバのときは interface に `public abstract <name>()` だけを置き、
+  実装クラスごとにフィールドとアクセサを出します（trait の `lazy val` と同じ mixin）。
+- **クラスにネストした trait**（`class Outer { trait T { def d = v } }`）は interface に
+  フィールドを持てないので、nsc と同じ展開名のアクセサ `Main$Outer$T$$$outer()` を
+  abstract で宣言し、実装クラス / `object` 側がそれを実装します。trait の実装
+  （`Main$Outer$T$class`）は `getfield $outer` ではなくこのアクセサを呼びます。
+
+**メソッド本体の中の `object`**（ローカル `object`）は別の形で、nsc は呼び出しごとに 1 つを
+`scala.runtime.LazyRef` に持ち、`$outer` とキャプチャした局所を `<init>` に渡します。これは
+まだ実装していないので、外側インスタンスや囲みメソッドの局所を読むローカル `object` は
+**コンパイル時に診断**します（黙って壊れた静的シングルトンを出しません）。外に何も
+読まないローカル `object` はこれまでどおり静的シングルトンとして通ります。
 
 **trait のメンバークラス**も同じです。nsc と同じく `$outer` の JVM 型は外側 trait の
 interface 型（自分型 `self: P =>` があり、それが外側 trait の派生なら `P`）で、
@@ -2992,6 +3017,22 @@ trait のメンバークラスの `$outer` と、共変な戻り値型のオー�
 正規化して比較します。`javap` は同じディレクトリに接頭辞を共有する classfile（`Foo.class` と
 `Foo$class.class` など）があると誤ったファイルを解決することがあるため、対象ファイルを空の
 一時ディレクトリへコピーしてから呼び出します（`run_javap`）。
+クラス / trait のメンバである `object` は `crates/cli/tests/nestedobj.rs`（fixture 接頭辞
+`nestedobj`）の専用スイート（7 本）です。`nestedobj.scala` は外側の `val` / `Outer.this`、
+二つのメンバ `object` の相互参照、メンバ trait を継承した `object`、非 static な `object`
+の中の `object`、2 段ネストしたクラスの中の `object`、そして**同一性**（`o.P eq o.P` が
+`true`、別インスタンスの `P` とは `false`）を回します。`nestedobj_trait.scala` は trait の
+メンバ `object` を実装クラスと匿名クラスの両方から使い、クラスにネストした `case class`
+も見ます。どちらも**私有ランタイムと `--scala-library` の両方**でコンパイルして
+`java -Xverify:all` で実行し、期待出力は**実 scalac 2.13.16 の stdout そのまま**です。
+`member_object_takes_its_enclosing_instance` は `Main$Outer$P$` の `<init>` が
+`(LMain$Outer;)V` で `MODULE$` が無いこと、`enclosing_class_holds_the_module_field` は
+`Main$Outer` が `P$module` と `P()` を持つこと、`trait_member_object_is_mixed_in` は
+interface 側が `Opt()` を abstract で宣言し実装クラスがフィールドを持つこと、および
+`Main$Outer$T$$$outer` が interface と実装の両方にあることを classfile のバイト列で固定
+します。異常系は `nestedobj_bad.scala` で、外側インスタンスを読むローカル `object` と、
+value class の中の `object`（scalac と同じ `implementation restriction: nested object is
+not allowed in value class`。以前は `VerifyError` になっていました）の 2 つを見ます。
 
 `agent/reify2` スライス（宣言クラスでの呼び出しと quasiquote の reification）のフィクスチャは接頭辞 `reify`（`reify` / `reify_bad` / `reify_qq` / `reify_qq_bad`）で、コンフリクト回避のため `crates/cli/tests/reify.rs` に置いています。`reify.scala` は 1 コンパイル単位で trait-extends-class のディスパッチ（宣言クラスへの `checkcast` + `invokevirtual` と、トレイト自身の `invokeinterface`）を private ランタイム・library ABI の両方で見るもので、期待出力は実 scalac 2.13.16 の出力です。`reify_qq.scala` は **scala-reflect.jar を `-cp` に置いて**quasiquote を実行し、実 scalac の出力と毎回その場で比較します（`reify_qq_quasiquotes_build_the_same_trees_as_scalac`）。`reify_runtime_universe_builds_a_tree` は `scala.reflect.runtime.universe` 上で `SyntacticTermIdent` / `SyntacticSelectTerm` / `Literal(Constant(42))` を組み立てて**実行**します（以前は `NoSuchMethodError`）。`reify_classpath_trait_is_an_interface_and_inherits` は `-cp` 越しのトレイトのメンバと継承メンバ（以前は `IncompatibleClassChangeError` と `is not a member`）。異常系は `reify_bad.scala`（トレイトにもクラスにも無い名前）と `reify_qq_bad.scala`（reification が落とせない 6 つの形が、どれも形の名前つきで診断されること）。
 
@@ -3696,6 +3737,26 @@ required: DBIOAction[R, S, E]`、**増えたものはありません**。slick �
   `(x: Any) match { case () => … }` は `null` にも当たります。jar モードは
   nsc と一致します（`pb_nullseq.scala`）。私有ランタイムに `BoxedUnit` を
   足すのが本筋ですが、`Unit` の box 表現全体を変える話になります。
+- **メソッドの中の `object`（ローカル `object`）が外を読む形**（`agent/nestedobj`）。
+  nsc は呼び出しごとに 1 つのインスタンスを `scala.runtime.LazyRef` に持ち、
+  `$outer` とキャプチャした局所を `<init>` に渡します（`javap -v -p -c` で確認）。
+  こちらはまだ静的シングルトンしか出せないので、外側インスタンスや囲みメソッドの
+  局所を読むローカル `object` は
+  `not implemented: a local `object` that reads …` を出します
+  （`tests/fixtures/nestedobj_bad.scala`）。外に何も読まないローカル `object` は
+  通ります。直すには `LazyRef` のローカル + キャプチャ引数の codegen が要ります。
+  なお **value class の中の `object`** は scalac 自身が
+  `implementation restriction: nested object is not allowed in value class` で
+  断るので、こちらも同じ文面で断ります（以前は通してしまい `VerifyError` でした）。
+
+- **パス依存のコンパニオン `apply` / `copy`**（`agent/nestedobj` で確認、main でも
+  同じ）。`class Box(val k: Int) { case class Pair(a: Int) }` に対して
+  `bx.Pair(6)` と `p.copy(9)` が `not found: value Pair` になります。
+  `new bx.Pair(6)` は通り、生成される classfile 側（`$outer` を先頭に取る
+  `<init>`、`copy` が自分の `$outer` を渡す形）は実装済みなので、残るのは
+  typer 側のコンパニオン解決だけです。同じ理由で、クラス本体に `object` が
+  先にあると後続の `case class` のコンパニオンも見つからなくなります
+  （`case class Holder(k: Int) { object Inner; case class Pair(a: Int) }`）。
 
 - **for 内包の値定義に続くガード**（`agent/mismatch6` で診断だけ入れた、未実装）。
   `for { m <- ms; q = f(m); if q > 0 } yield q` は nsc では通ります。nsc は

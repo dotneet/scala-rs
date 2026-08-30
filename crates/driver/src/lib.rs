@@ -7,9 +7,9 @@ use scala_rs_backend::{emit_opts, emit_runtime, load_classpath, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
-    erase, find_mains, lambda_lift, mark_anon_captures, note_source_value_classes, typecheck_units,
-    uncurry, ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType,
-    ClasspathTypeParam, TypecheckOptions,
+    check_local_objects, erase, find_mains, lambda_lift, mark_anon_captures,
+    note_source_value_classes, typecheck_units, uncurry, ClasspathClass, ClasspathMethod,
+    ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -198,6 +198,14 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         diags.extend(tdiags);
         for u in units.iter() {
             mains.extend(find_mains(&st, &u.tree));
+        }
+        // A local `object` reading the enclosing instance or a captured local
+        // is not compiled yet; say so rather than emitting a singleton that
+        // crashes at run time.
+        if !has_errors(&diags) {
+            for u in units.iter() {
+                diags.extend(check_local_objects(u.file_index, &u.tree, &st));
+            }
         }
         if !has_errors(&diags) {
             for u in units.iter_mut() {
