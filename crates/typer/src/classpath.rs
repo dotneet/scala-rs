@@ -969,10 +969,17 @@ pub fn find_or_stub_java_class(st: &mut SymbolTable, internal: &str) -> SymbolId
     }
     let simple = java_simple_name(internal);
     let owner = java_class_owner(st, internal);
+    // The owner's *own* declarations only. A nested class is always declared
+    // by the class its JVM name names, never inherited into it, and searching
+    // the parents too made every one of cats' `Foo.Ops` traits resolve to the
+    // first one entered: `cats/FlatMap$Ops` asked `FlatMap` for `Ops`, whose
+    // linearization reaches `Functor`, which by then had one.
     if let Some(id) = st
-        .lookup_member(owner, &simple)
-        .into_iter()
-        .find(|&s| st.get(s).is_class_like())
+        .get(owner)
+        .members
+        .iter()
+        .copied()
+        .find(|&s| st.get(s).name == simple && st.get(s).is_class_like())
     {
         return id;
     }

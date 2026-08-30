@@ -1043,7 +1043,13 @@ impl PickleSupply {
         if jvm.starts_with("scala/") || jvm.starts_with("java/") || jvm.starts_with("javax/") {
             return;
         }
-        if !st.get(id).tparams.is_empty() || !st.get(id).members.is_empty() {
+        // Members are not the test for "already filled in": a class the JVM
+        // loader completed from its class file has methods and still no type
+        // parameters, and `cats.FlatMap` in that state made every
+        // `FlatMap[F]` in cats' syntax layer an arity error -- which of the
+        // two happened first depended only on the order of the file's imports.
+        // Type parameters are, and a class that has them is left alone.
+        if !st.get(id).tparams.is_empty() {
             return;
         }
         let Ok(sig) = ({
@@ -1552,10 +1558,144 @@ impl PickleSupply {
             // arguments into it, so `b ++= xs` on a `Builder[Int, List[Int]]`
             // yields that `Builder` and not `Growable`.
             SigType::This(_) => self.self_ty.clone(),
+            SigType::Refined { parents, decls } => {
+                self.conv_refined(st, bin, scope, parents, decls, d)
+            }
             // A `val`'s own type is fine, but the remaining forms (singletons,
-            // `super`, bare bounds, refinements, literal types) have no
-            // faithful counterpart here yet.
+            // `super`, bare bounds, literal types) have no faithful
+            // counterpart here yet.
             _ => None,
+        }
+    }
+
+    /// `T { type A = U; def f: V }` — a `REFINEDtpe`.
+    ///
+    /// cats' whole syntax layer is written in these: simulacrum gives every
+    /// `toFooOps` the result type `Foo.Ops[F, A] { type TypeClassType =
+    /// Foo[F] }`, so declining the form meant declining `toFlatMapOps`,
+    /// `toMonadOps`, `toApplicativeErrorOps` … and with them every extension
+    /// method `import cats.syntax.all._` is supposed to bring into scope.
+    ///
+    /// Unlike [`Self::conv_upper_bound`], nothing here is dropped quietly: a
+    /// parent or a declaration that does not convert declines the whole type,
+    /// because these are the members a caller actually reaches through. The
+    /// only simplification is the one that loses nothing -- a single parent
+    /// with no declarations *is* that parent.
+    fn conv_refined(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        parents: &[SigType],
+        decls: &[scala_rs_pickle::sym::Member],
+        d: u32,
+    ) -> Option<Type> {
+        let mut ps: Vec<Type> = Vec::new();
+        for p in parents {
+            let Some(t) = self.conv_at(st, bin, scope, p, d) else {
+                trace(format_args!("refinement: parent {p:?} does not convert"));
+                return None;
+            };
+            // `Ops[F, A] with AnyRef` is `Ops[F, A]`; nsc writes the `AnyRef`
+            // whenever the refinement has no other parent to stand on.
+            if matches!(t, Type::AnyRef) && parents.len() > 1 || ps.contains(&t) {
+                continue;
+            }
+            ps.push(t);
+        }
+        let mut ds: Vec<scala_rs_parser::RefineDecl> = Vec::new();
+        for m in decls {
+            let Some(decl) = self.conv_refine_decl(st, bin, scope, m, d) else {
+                trace(format_args!(
+                    "refinement: declaration {} ({:?}) does not convert: {:?}",
+                    m.name, m.kind, m.ty
+                ));
+                return None;
+            };
+            ds.push(decl);
+        }
+        match (ps.len(), ds.is_empty()) {
+            (0, _) => None,
+            (1, true) => Some(ps.remove(0)),
+            _ => Some(Type::Refined {
+                parents: ps,
+                decls: ds,
+            }),
+        }
+    }
+
+    /// One declaration inside a refinement. `None` for anything the typer's
+    /// `RefineDecl` cannot hold (a polymorphic `def`, a nested class), so the
+    /// caller declines the refinement rather than handing back a type that
+    /// quietly lost a member.
+    fn conv_refine_decl(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        m: &scala_rs_pickle::sym::Member,
+        d: u32,
+    ) -> Option<scala_rs_parser::RefineDecl> {
+        let name = m.name.clone();
+        match m.kind {
+            MemberKind::TypeAlias => Some(scala_rs_parser::RefineDecl::Type {
+                name,
+                rhs: Some(self.conv_at(st, bin, scope, &m.ty, d)?),
+                tparams: 0,
+                lo: None,
+                hi: None,
+            }),
+            MemberKind::AbstractType => {
+                let SigType::Bounds { lo, hi } = &m.ty else {
+                    return None;
+                };
+                let lo = match lo.as_ref() {
+                    SigType::Ref { sym, .. } if sym == "scala.Nothing" => None,
+                    other => Some(self.conv_at(st, bin, scope, other, d)?),
+                };
+                let hi = match hi.as_ref() {
+                    SigType::Ref { sym, .. } if sym == "scala.Any" => None,
+                    other => Some(self.conv_upper_bound(st, bin, scope, other, d)?),
+                };
+                Some(scala_rs_parser::RefineDecl::Type {
+                    name,
+                    rhs: None,
+                    tparams: 0,
+                    lo,
+                    hi,
+                })
+            }
+            MemberKind::Val => Some(scala_rs_parser::RefineDecl::Val {
+                name,
+                ty: self.conv_at(st, bin, scope, &m.ty, d)?,
+            }),
+            MemberKind::Def => {
+                // `Poly { tparams: [] }` is nsc's `NullaryMethodType`: a
+                // parameterless `def`, not a polymorphic one. A `def` with
+                // type parameters of its own has nowhere to put them.
+                let mut ty = &m.ty;
+                if let SigType::Poly { tparams, result } = ty {
+                    if !tparams.is_empty() {
+                        return None;
+                    }
+                    ty = result;
+                }
+                let mut paramss: Vec<Vec<Type>> = Vec::new();
+                while let SigType::Method { params, result, .. } = ty {
+                    let mut ps = Vec::with_capacity(params.len());
+                    for p in params {
+                        ps.push(self.conv_at(st, bin, scope, &p.ty, d)?);
+                    }
+                    paramss.push(ps);
+                    ty = result;
+                }
+                Some(scala_rs_parser::RefineDecl::Def {
+                    name,
+                    paramss,
+                    ret: self.conv_at(st, bin, scope, ty, d)?,
+                })
+            }
+            MemberKind::Class | MemberKind::Module => None,
         }
     }
 

@@ -1977,6 +1977,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/catsimpl` スライス（ラムダが囲いの `this` を捕まえる、cats の syntax 形の暗黙変換、コンパニオンの implicit スコープ、デフォルト引数を省いた呼び出しの by-name 引数）のフィクスチャは接頭辞 `cats`（`cats_lambda` / `cats_lambda2` / `cats_syntax` / `cats_syntax_bad` / `cats_byname`）で、同じ理由から `crates/cli/tests/catsimpl.rs` に置いています。`cats_lambda.scala` は `List.map` / `flatMap` を使うので library dual-run 専用、`cats_lambda2.scala` は同じ捕捉をライブラリのコレクション抜きで書いてあるので**私有ランタイムと `--scala-library` の両方**で走ります。`cats_syntax.scala` は `implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])` を自前で書いた 1 ファイル版で、抽象 `F[_]` と具象 `Box` の両方の受け手を通します。`cats_syntax_bad.scala` は、変換のパラメータを「1 引数に適用された任意の型」まで広げたことで**witness の無い型にまで変換が挿さらない**こと（scalac と同じ `value flatMap is not a member of Bag[Int]`）を固定します。`a_higher_kinded_companion_implicit_crosses_a_jar` はライブラリを自分でコンパイルして jar に詰め、`ScalaSignature` だけを通して `Async[Box]` ＝ `Box.asyncForBox` が見つかることと、**witness の無い型は依然として hard error**（`could not find implicit value of type Async[Crate]`）であることを両方見ます。
 
+`agent/catsyntax` スライス（cats の syntax による拡張メソッドが本物の cats に届くまで）のフィクスチャは接頭辞 `csyn`（`csyn_ops` / `csyn_ops_bad`）で、同じ理由から `crates/cli/tests/catsyntax.rs` に置いています。`csyn_ops.scala` は cats の `Ops[F[_], A]` と同じ形の受け手に `map` / `flatMap` / `foreach` を呼ぶもので、**暗黙変換を一切使わずに**（`new Ops[Box, Int](b)`）ラムダの引数型が第 1 型引数の `Box` になっていたずれを固定します。私有ランタイムと `--scala-library` の両方で走ります。`csyn_ops_bad.scala` は、ラムダに宣言どおりの引数型を与えても witness の無い呼び出しは通らないこと（`could not find implicit value of type FlatMap[Bag]`）を固定します。`a_simulacrum_style_syntax_layer_crosses_a_jar` は **実 scalac** で小さな cats（`Ops[F, A] { type TypeClassType = FlatMap[F] }` という refinement 結果型、パッケージオブジェクトの入れ子 `object all`、その `all` を `InnerClasses` に載せるだけの無関係なクラス）をコンパイルして jar に詰め、`ScalaSignature` だけを通して `b.flatMap(…)` と `b >> …` が解決し、`java -Xverify:all` で走ることを見ます。自前の pickle ライタは `REFINEDtpe` を出さないので、この fixture は scalac が書いたものでなければ意味がありません（scalac が無い環境では skip します）。同じテストで、witness の無い `Crate` には変換が挿さらないこと（`value flatMap is not a member of Crate[Int]`）も見ます。
+
 `agent/genrep` スライス（slick が `.fm` テンプレートから生成する 7 本を通すための穴: import を見ないクラス型パラメータ境界、型パラメータ付き `implicit class`、`TupleN extends Product`、継承したオーバーロードの受け手での型、引数リストのタプル化、`Tuple` で始まるだけのクラス名、可変長引数コンストラクタ、ワイルドカード型引数と反変、`package p { … }` の後ろのトップレベル定義）のフィクスチャは接頭辞 `genrep`（`genrep` / `genrep_bound_bad` / `genrep_tuple_bad` / `genrep_product_bad`）で、同じ理由から `crates/cli/tests/genrep.rs` に置いています。`genrep.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 との実行結果 diff（`real_scalac_dual_run_genrep`）でも見ます。異常系は 3 本: `genrep_bound_bad` は namer が黙るようにした境界でも**存在しない型はきちんと診断される**こと、`genrep_tuple_bad` はタプル化が**間違った呼び出しを通さない**こと、`genrep_product_bad` は `--no-scala-library` で `Product` の辺を張らない（私有ランタイムに裏付けが無い）ことを固定します。
 
 `agent/ctoraccessor` スライス（コンストラクタ引数のアクセサ、`FunctionN.tupled` / `curried` / `Function.untupled`、`Builder` の `+=` / `++=`）のフィクスチャは接頭辞 `ctacc`（`ctacc` / `ctacc_fn` / `ctacc_builder` / `ctacc_plain_bad`）で、同じ理由から `crates/cli/tests/ctoraccessor.rs` に置いています。`ctacc.scala` は**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせ、`real_scalac_dual_run_ctacc` で real scalac 2.13.16 の出力とも比較します（`expected/ctacc.txt` は scalac の出力そのもの）。`ctacc_case_class_params_get_public_accessors` は `javap -p -s` でアクセサのディスクリプタ（`ConstRep.value()Object` / `NumRep.n()I` / `IntBox.unwrap` の `()I` ＋ `()Object` ブリッジ / `StringBox.label` の `()String` ＋ `()Object` ブリッジ）と、**第 2 引数リストがアクセサにならない**こと（`Multi.extra`）を固定します。`ctacc_fn.scala` と `ctacc_builder.scala` は library ABI 限定（`scala/FunctionN` の default メソッド、`scala/Function$`、`Growable`）なので library dual-run と real scalac dual-run のみで、`fixtures_ctacc_fn_without_library_is_error` / `fixtures_ctacc_builder_without_library_is_error` が `--no-scala-library` で**きちんと診断される**ことを見ます。`ctacc_plain_bad.scala` は `val` の無いコンストラクタ引数が外から読めないままであること（case class の第 1 引数リストだけがアクセサになる）を固定します。
@@ -2102,6 +2104,8 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `cats_syntax.scala`（`crates/cli/tests/catsimpl.rs`、library dual-run） | cats の syntax 形の暗黙変換 `implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])`: 受け手の**型構築子**から `F` を解く（以前は `AnyRef`）、変換自身の implicit 節を適用する（以前は落として descriptor より 1 引数少ない呼び出しになり `VerifyError`）、コンパニオンの `implicit def flatMapForBox` | `3` `41` `14` |
 | `cats_syntax_bad.scala`（`crates/cli/tests/catsimpl.rs`、異常系） | witness の無い型（`Bag`）には変換が挿さらず、scalac と同じ `value flatMap is not a member of Bag[Int]` のまま | （コンパイルエラー） |
 | `cats_byname.scala`（`crates/cli/tests/catsimpl.rs`、library dual-run） | デフォルト引数を省いた呼び出しは 2 度型付けされる（`name$default$n` ゲッターが先行パラメータを取るため）。2 度目に by-name 引数は既に `Function0` の thunk になっており、`() => <notype>` として何にも一致しなかった（slick の `copy(where = w2.orElse(where), …)`） | `Comp(1,Some(1),Some(2),None)` `Some(7) None` ×3 |
+| `csyn_ops.scala`（`crates/cli/tests/catsyntax.rs`、私有ランタイム・library dual-run） | `agent/catsyntax` スライス: 高階クラスの第 1 型引数は「要素」ではない。`Ops[F[_], A]` の `map` / `flatMap` / `foreach` でラムダの引数型が `Box` になっていた（暗黙変換抜き、`new Ops[Box, Int](b)` で再現）。抽象 `F[_]` の受け手も通す | `4` `6` `103` `40` |
+| `csyn_ops_bad.scala`（`crates/cli/tests/catsyntax.rs`、異常系） | ラムダに宣言どおりの引数型を与えても、`FlatMap[Bag]` の witness が無い呼び出しは scalac と同じく通らない | （コンパイルエラー） |
 | `ctacc.scala`（`crates/cli/tests/ctoraccessor.rs`、私有ランタイム・library dual-run・real scalac dual-run） | `agent/ctoraccessor` スライス: コンストラクタ引数が public アクセサになり親の抽象メンバーを実装する（`case class ConstRep[T](value: T) extends Rep[T]`、`case class NumRep(n: Int)`、`()Object` へのブリッジが要る `IntBox` / `StringBox`、`class Person(val name: String, …)`、`class Cell(var c: Int)` の getter/setter、第 2 引数リストがアクセサにならない `Multi`） | `42` `hi` `7` `5` `tag` `bob` `3` `11` `1` `x` `42` |
 | `ctacc_fn.scala`（`crates/cli/tests/ctoraccessor.rs`、library dual-run と real scalac dual-run） | `FunctionN.tupled` / `curried`（arity 2 / 3 / 5 / 22）と `scala.Function.untupled`、引数リストを持たないメソッドの結果を直接呼ぶ（`def adder: (Int, Int) => Int; adder(7, 8)`）。私有ランタイムには裏付けが無いので `--no-scala-library` では診断のまま | `7` `11` `7` `30` `1x2` `1y3` `4z5` `15` `15` `20` `22` `15` |
 | `ctacc_builder.scala`（`crates/cli/tests/ctoraccessor.rs`、library dual-run と real scalac dual-run） | `scala.collection.mutable.Builder` の `+=` / `++=`（`Growable` の default メソッド、`this.type` 返し）を pickle 供給から引く。`--no-scala-library` では `not found: type Builder` | `List(1, 2, 3, 4)` |
@@ -2565,6 +2569,88 @@ slick 側の `case Seq((s, _: TableNode))`（`JdbcStatementBuilderComponent.scal
 `currentUniqueFrom = from match { … }` には別の（main から続く）穴があり、
 下の Remaining に書きました。
 
+### cats の syntax による拡張メソッド（`agent/catsyntax`）
+
+`import cats.syntax.all._` が入れる `fa.flatMap(…)` / `a >> b` / `fa.attempt` が
+**本物の cats（cats-core 2.13.0 / cats-effect 3.7.1）で解決するようになりました**。
+`agent/catsimpl` が原因まで特定していた refinement の件を含め、5 つの穴があります。
+テストは `crates/cli/tests/catsyntax.rs`、fixture の接頭辞は `csyn` です。
+
+1. **高階クラスの第 1 型引数は「要素」ではない**（`agent/catsimpl` が別バグとして
+   報告していたもの）。`map` / `flatMap` / `foreach` / `withFilter` / `pipe` /
+   `tap` は、ラムダの引数型をレシーバの**第 1 型引数**で置き換えていました。
+   `List[A]` では正しく、cats の `Ops[F[_], A]` では誤りです。
+   `new Ops[Box, Int](b).flatMap(n => …)` の `n` が `Box` になり、
+   `n + 1` が `any2stringadd` に落ちていました（`csyn_ops`。暗黙変換抜きで再現）。
+   第 1 型引数の kind arity が 0 のときだけ要素として使います。結果型の側の
+   「未確定な `B` を含むなら `Any` に緩める」処理はそのまま残します
+   （両方消すと `fa.flatMap(_ => fa)` が `F[Any]` になりました）。
+
+2. **pickle の `REFINEDtpe` を `Type::Refined` に変換する**。simulacrum が生成する
+   `toFooOps` の結果型はすべて `Foo.Ops[F, A] { type TypeClassType = Foo[F] }` で、
+   `PickleSupply::conv` がこの形を表現できずメンバごと供給されませんでした
+   （`unmappable result type Refined { … }`）。`conv_refined` / `conv_refine_decl`
+   を足しました。**黙って落とさない**方針は変えていません。親か宣言が 1 つでも
+   変換できなければ refinement 全体を declined にし、`SCALA_RS_PICKLE_DEBUG=1` で
+   理由（どの親／どの宣言か）を出します。型パラメータを持つ `def` のように
+   `RefineDecl` に入らない形は `None` を返します。親 1 つ・宣言なしの
+   refinement だけは、失うものが無いのでその親そのものにします。
+   受け側も 2 か所要りました。`subst_as_seen_from` の `walk` に `Type::Refined`
+   の腕（親をたどらないと `Ops[F, Int]#flatMap` の `A` が素のままになる）と、
+   `elem_type` が refinement の親を見ること。
+   `cats.FlatMap.Ops` のような**入れ子クラスは所有者の直下宣言だけを探す**ように
+   もしました（`find_or_stub_java_class`）。親までたどっていたので、
+   `cats/FlatMap$Ops` が `FlatMap` に `Ops` を訊き、線形化の先にいた
+   `Functor.Ops` が返ってきていました。
+
+3. **`import o._` は `o` が *持つ* メンバを入れる**（SLS 4.7）。`cats.syntax.all` は
+   自分ではほとんど何も宣言せず、`toFlatMapOps` も `catsSyntaxApplicativeId` も
+   mixin した約 60 のトレイト側にあります。直下のメンバしか入れていなかったので、
+   cats の syntax 層は 1 つもスコープに入っていませんでした。
+   親を幅優先でたどって入れます。ただし**同じ拡張が 2 経路で来たときは 1 つ**に
+   します（`Typer::drop_inherited_duplicates`）。prelude はライブラリの一部の変換を
+   継承先のオブジェクトにも直接置いているので、そのままだと `xs.asJava` が
+   「同じメンバを同じ結果型で返す 2 つの変換」で決着せず、
+   `scala.jdk.CollectionConverters._` が壊れました。
+   codegen 側もレシーバが要ります（`Typer::wildcard_module_for`）。継承した変換を
+   裸の名前で出すと `this` を積んで宣言元のトレイトに checkcast するので、
+   `Main$ cannot be cast to tinycats.FlatMap$ToFlatMapOps` になります。
+   受け手は import したオブジェクトです。
+
+4. **`InnerClasses` は「宣言した入れ子クラス」の表ではない**。
+   `cats/effect/kernel/MonadCancel.class` は `cats/syntax/package$all$` を挙げます
+   （参照しているから）。これを採用していたので `cats.syntax.all` が
+   `MonadCancel` のメンバとして入り、`load_binary_into` は classfile を 1 度しか
+   完了させないので、後から来た `import cats.syntax.all._` は
+   `value all is not a member of <notype>` になっていました。
+   **`import cats.effect.… ` を先に書いた時だけ**起きるので import 順の癖に
+   見えていましたが、slick の `BasicBackend.scala` はまさにその順です。
+   自分の JVM 名を接頭辞に持つエントリだけ採用します。
+
+5. **変換自身の implicit 節から型引数を解く**（`solve_conv_targs_from_implicits`）。
+   `catsSyntaxApplicativeError[F[_], E, A](fa: F[A])(implicit F: ApplicativeError[F, E])`
+   の `E` は `F[A]` のどこにも現れないので `AnyRef` に落ち、`fa.attempt` が
+   `F[Either[AnyRef, A]]` という「解決はするがどこにも適合しない」型になって
+   いました。スコープの証人（`Async[F] <: MonadError[F, Throwable]`）が
+   `E = Throwable` を決めます。結果型が言及する型引数のときだけ探索します
+   （候補ごとに implicit 探索を回すため）。
+   あわせて `search_extension` の先頭でレシーバの implicit スコープを暖めます。
+   高階の変換が適用可能かどうかは「自分の implicit 節に証人があるか」で決めており
+   （`agent/catsimpl`）、その探索は `&self` なので自分では何も読み込めません。
+   `FlatMap[Box]` の証人は `Box` のコンパニオン＝誰も要求しない別 classfile です。
+
+計測は `files=184 errors=537 files_with_errors=80` → **`errors=529
+files_with_errors=80`**。生の件数はあまり動きませんが、**このスライスが狙った
+エラーの種類は消えています**。`… is not a member of F[…]`（`flatMap` / `>>` /
+`attempt` / `map` / `void` / `timeoutTo` / `guarantee` …）は **42 → 8**、
+`value all is not a member of <notype>`（項 4）は **2 → 0** です。
+残る 8 件（`value flatMap is not a member of F` 4 件と
+`value >> is not a member of F` 4 件）は**すべてレシーバが素の `F`** で、
+下の Remaining の「jar のメンバの結果型が素の `F` になる」です。
+差し引きが 8 件にしかならないのは、拡張メソッドが解決するようになったことで
+**その先で止まっていたカスケードが表に出た**ためです（`found: F required: F[Unit]`、
+`no matching overload for (Function0[A])F` など。どれも同じ「素の `F`」が原因）。
+
 ### Remaining
 
 - **`scala.collection.immutable.ArraySeq` / `mutable.ArraySeq` を名指しした
@@ -2658,19 +2744,26 @@ slick 側の `case Seq((s, _: TableNode))`（`JdbcStatementBuilderComponent.scal
   symbol table におらず（ソースが名前を出したときに jar から読まれる）、
   同じ場所では親を張れません。
 
-- **cats の syntax（`import cats.syntax.all._`）による拡張メソッド**は、
-  **仕組みは通るようになりましたが本物の cats ではまだ届きません**。
-  `implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])` の形の
-  暗黙変換は、受け手の**型構築子**から `F` を解けるようになり（以前は `AnyRef` に
-  落ちていた）、変換自身の implicit 節も適用されるようになりました
-  （`crates/cli/tests/catsimpl.rs` の `cats_syntax`。以前は descriptor より
-  引数が 1 つ少ない呼び出しを吐いて `VerifyError` になっていた）。
-  本物の cats で残るのは別の穴で、`cats.FlatMap.ToFlatMapOps#toFlatMapOps` の
-  結果型が **refinement**（`Ops[F, A] { type TypeClassType = FlatMap[F] }`）で、
-  pickle → Type 変換がそれを表現できずメンバごと供給されません
-  （`unmappable result type Refined { … }`）。
-  `Ref[F, A].get` が `F` （素の型パラメータ）になっている箇所もあり、
-  高階型の適用そのものが崩れている場合があります。
+- **cats の syntax（`import cats.syntax.all._`）による拡張メソッド**は
+  `agent/catsyntax` で**本物の cats に届くようになりました**（上の節）。
+- **jar のメンバの結果型が素の `F` になる**（`agent/catsyntax` で原因まで確認、未修正）。
+  `ctx.update(…) >> …` は `value >> is not a member of F`、
+  `asyncF.pure(x)` は `no matching overload for (Function0[A])F` になります。
+  `Ref[F[_], A]#update` の結果型は `F[Unit]` ですが、これが**pickle からではなく
+  classfile の generic signature から**来ています（`TF;` は高階の適用を書けないので
+  素の `F`）。pickle 供給が落ちる理由は
+  `cats/effect/kernel/Ref$#update/1: no unambiguous erased descriptor` で、
+  **`Ref` のシンボルの `jvm_name` がコンパニオンの `cats/effect/kernel/Ref$`**
+  だからです。`find_or_stub_java_class` は `cats/effect/kernel/Ref$` を渡されると
+  `java_simple_name` で末尾の `$` を落として `Ref` という名前の
+  **`SymKind::Class`** を作り、`jvm_name` にはコンパニオンの名前を入れます。
+  以後 `ensure_class("cats.effect.kernel.Ref")` は
+  「その名前のシンボルはあるが `jvm_name` が key と違う」で `None` を返すので、
+  本物のトレイトはシンボルを持てません。
+  `$` 付きなら `ModuleClass` を `Ref$` という名前で作る、と直すと
+  この経路は通りましたが、今度は `Async[F]` から `FlatMap[F]` が引けなくなり
+  （`agent/catsyntax` のスクラッチで確認）、差し引きで悪化したので戻しました。
+  slick に残る `F` 系のエラー 8 件はすべてこれです。
 - **jar のクラスを pickle から読む（`agent/jarpickle`）で残ったもの**。
   - **cats の `implicits` 経由の implicit 探索**。`Monad[F]` のシグネチャは
     正しく届くようになったが、`import cats.implicits._` から `Monad[Option]` を
