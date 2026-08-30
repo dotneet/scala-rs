@@ -1,0 +1,100 @@
+//! Class linearization (SLS 5.1.2), shared by the typer and the backend.
+//!
+//! The C3 merge used to live only in `crates/backend/src/gen.rs`, where it
+//! drives super accessors and mixin forwarders. The typer needs the *same*
+//! order to decide whether an `abstract override` member ever reaches a
+//! concrete implementation, so it lives here and `gen.rs` calls in.
+
+use crate::symbol::SymbolTable;
+use scala_rs_parser::{Flags, SymbolId};
+
+fn skip_parent(st: &SymbolTable, p: SymbolId) -> bool {
+    matches!(
+        st.get(p).name.as_str(),
+        "Any" | "AnyRef" | "AnyVal" | "Object"
+    )
+}
+
+fn parents_of(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
+    st.get(cls)
+        .parents
+        .iter()
+        // A parent written as a function type is `scala.FunctionN`; the
+        // linearization has to contain it, or an implementation of a
+        // narrowed `apply` gets no bridge for `apply(Object)Object`.
+        .filter_map(|p| st.class_sym_of(&st.function_class_form(p).unwrap_or_else(|| p.clone())))
+        .filter(|p| !skip_parent(st, *p))
+        .collect()
+}
+
+fn c3_merge(mut lists: Vec<Vec<SymbolId>>) -> Vec<SymbolId> {
+    let mut out = Vec::new();
+    loop {
+        lists.retain(|l| !l.is_empty());
+        if lists.is_empty() {
+            break;
+        }
+        let mut chosen = None;
+        for l in &lists {
+            let h = l[0];
+            let in_tail = lists.iter().any(|o| o.iter().skip(1).any(|&x| x == h));
+            if !in_tail {
+                chosen = Some(h);
+                break;
+            }
+        }
+        let h = match chosen {
+            Some(h) => h,
+            None => lists[0][0],
+        };
+        out.push(h);
+        for l in &mut lists {
+            if l.first() == Some(&h) {
+                l.remove(0);
+            }
+        }
+    }
+    out
+}
+
+fn lin(st: &SymbolTable, cls: SymbolId, depth: u32) -> Vec<SymbolId> {
+    // A cyclic `extends` graph gets its own diagnostic; do not hang here.
+    if depth > 64 {
+        return vec![cls];
+    }
+    let parents = parents_of(st, cls);
+    let mut lists: Vec<Vec<SymbolId>> = parents
+        .iter()
+        .rev()
+        .map(|p| lin(st, *p, depth + 1))
+        .collect();
+    lists.push(parents.iter().rev().copied().collect());
+    let mut out = vec![cls];
+    out.extend(c3_merge(lists));
+    out
+}
+
+/// `cls` itself first, then its ancestors most-derived first (SLS 5.1.2).
+/// `Any` / `AnyRef` / `Object` are not included.
+pub fn linearize(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
+    lin(st, cls, 0)
+}
+
+/// True for a `trait` (source) or a class-file / pickle `interface`.
+pub fn is_interface(st: &SymbolTable, id: SymbolId) -> bool {
+    let f = st.get(id).flags;
+    f.contains(Flags::TRAIT) || f.contains(Flags::INTERFACE)
+}
+
+/// SLS 5.3.3: the superclass a `trait` constrains its mixers to. `trait T
+/// extends C` names it directly; `trait U extends T` inherits `C` through `T`.
+/// The result is the *most derived* class in `id`'s linearization, ignoring
+/// `AnyRef`, or `None` when the trait constrains nothing.
+pub fn trait_superclass(st: &SymbolTable, id: SymbolId) -> Option<SymbolId> {
+    if !is_interface(st, id) {
+        return None;
+    }
+    linearize(st, id)
+        .into_iter()
+        .find(|&s| !is_interface(st, s) && !skip_parent(st, s))
+}

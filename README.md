@@ -378,6 +378,50 @@ trait の `var` は nsc どおり getter と**普通の setter `v_$eq`**（mixin
 
 スタック可能な trait の `abstract override` は、`T$class` 内の `super.m` を `T$$super$m`（実装クラスが線形化の次へフォワード）にします。`class C extends Base with A with B` で両方 `abstract override def msg` なら、実行時は `B-A-base` です。
 
+#### trait がクラスを継承する（SLS 5.3.3）
+
+`trait Loud extends Animal` のように **trait の親がクラス**でもかまいません。この親は
+「制約」であって初期化ではないので、trait は `Animal` のコンストラクタを**呼びません**。
+したがって trait の親に**引数リストは書けず**（`trait T extends C(x)` は scalac 2.13.16 と
+同じく `parents of traits may not have parameters`）、コンストラクタのオーバーロード解決も
+一切しません。親がコンストラクタ引数を取るだけで `no matching overload for constructor` に
+なっていたのを直しました。
+
+制約なので、その trait を mixin できるのは**そのスーパークラスのサブクラスだけ**です。
+`class Plain` に `Loud` を混ぜると scalac と同じ文面で拒否します。
+
+```
+illegal inheritance; superclass Plain
+ is not a subclass of the superclass Animal
+ of the mixin trait Loud
+```
+
+classfile 上では、trait の interface は**そのスーパークラスを継承しません**（scalac も
+`Main$Loud` の super は `java/lang/Object` です）。なので `T$class` の本体が継承メンバを
+`$this` 経由で読むときは `checkcast` を先に出します（`$this` の JVM 型は `LT;` なので、
+これが無いと `Type 'T' is not assignable to 'C'` で verify に落ちます）。
+
+逆に、**クラス側の親にクラスが 1 つも無いとき**は trait のスーパークラスがそのクラスの
+スーパークラスになります（SLS 5.1）。`class X extends Loud` は classfile でも
+`Main$Animal` を継承し、`val a: Animal = new X` が verify を通ります。
+
+`abstract override` は**線形化上の次の実装**を指すので、`new Dog with Polite with Loud` と
+`new Dog with Loud with Polite` は結果が変わります（`LOUD-please-woof` と `please-LOUD-woof`）。
+その連鎖が具象実装に届かない場合は、実行時に落とさず**コンパイル時に**拒否します。
+
+```
+object creation impossible.
+abstract override def speak: String (defined in trait Loud) is marked `abstract` and `override`, but no concrete implementation could be found in a base class
+```
+
+クラス自身の定義は線形化で trait より**上**にあるので super の受け皿にはなれません
+（scalac と同じく `` `abstract override` modifiers required to override `` です）。
+`abstract override` をクラスのメンバに付けるのも scalac と同じく拒否します
+（`` `abstract override` modifier only allowed for members of traits ``）。
+
+線形化（C3）は `crates/typer/src/lin.rs` に 1 つだけ置き、型検査（`abstract override` の
+接地判定）とコード生成（super アクセサ / mixin フォワーダ）の両方がこれを使います。
+
 ### 複数コンパイル単位のケーキパターン（ヘッダパス）
 
 `typecheck_units` は run 全体を 1 つのシンボル表で型検査します。パスは
@@ -2134,6 +2178,24 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 オーバーロード集合が別のクラスの読み込みで消える回帰のフィクスチャは接頭辞 `oshadow`（`oshadow` / `oshadow_java_first` / `oshadow_java_last` / `oshadow_bad`）で、同じ理由から `crates/cli/tests/overloadshadow.rs` に置いています。`oshadow.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 の実行結果とも直接比較します（`oshadow_matches_scalac`）。`oshadow_java_first.scala` と `oshadow_java_last.scala` は `java.math.BigDecimal` の位置だけを入れ替えた同じプログラムで、`oshadow_order_independent` が両方通ることと stdout が一致することを固定します。`oshadow_bad.scala` は `BigDecimal(Some(1))`（real scalac も拒否）が `no matching overload` になり、しかも**候補一覧が丸ごと**出る（`(String)BigDecimal` を含む）ことを見ます。`oshadow_without_library_is_error` は `--no-scala-library` で `not found: value BigDecimal` の診断が残ることを見ます。
 `agent/parentimpl` スライス（親コンストラクタの implicit 節・デフォルト引数の補完）のフィクスチャは接頭辞 `pimpl`（`pimpl` / `pimpl_bad`）で、同じ理由から `crates/cli/tests/parentimpl.rs` に置いています。`pimpl.scala` は slick の `ConstColumn` 形（`class ConstColumn[T : TT] extends TypedRep[T]`）、明示節＋2 引数の implicit 節、全部デフォルト／末尾だけデフォルト、デフォルト節＋implicit 節、匿名クラスの親、引数無しの `new` を 1 本にまとめ、**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせます。`real_scalac_dual_run_pimpl` は real scalac 2.13.16 でも同じソースを走らせて stdout が一致することを見ます（`expected/pimpl.txt` は scalac の出力そのもの）。`pimpl_late_a.scala` / `pimpl_late_z.scala` は**子を親より先にコンパイル**して、親の context bound の evidence がシグネチャパス時点で未生成でも埋まる（＝ファイル順に依存しない）ことを見ます。`pimpl_bad.scala` は witness の無い親 implicit 節が**黙って通らない**ことを固定し、`pimpl_bad_reports_the_extends_clause_once` で診断が `extends` の行に 1 件だけ出る（3 パス分に増えない）ことも見ています。
 
+`agent/traitextends` スライス（trait がクラスを継承する、`abstract override` / stackable trait）の
+フィクスチャは接頭辞 `trex`（`trex_stack` / `trex_inherit` / `trex_mixin_bad` /
+`trex_ungrounded_bad` / `trex_object_bad` / `trex_ctorargs_bad` / `trex_absover_class_bad` /
+`trex_ownimpl_bad`）で、
+同じ理由から `crates/cli/tests/traitextends.rs` に置いています。`trex_stack.scala` は
+コンストラクタ引数を取るクラスを継承した trait、`abstract override` の連鎖、線形化順で結果が
+変わる 2 通り（`LOUD-please-woof` / `please-LOUD-woof`）、trait 本体からの継承メンバ参照を 1 本にまとめ、
+**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせます。
+`expected/trex_stack.txt` と `expected/trex_inherit.txt` は **real scalac 2.13.16 の出力そのもの**です。
+バイトコード側の不変条件も 3 本で固定しています。`trex_super_accessor_shape` は匿名クラスの
+`Loud$$super$speak` が `invokespecial Main$Dog.speak` になること（scalac の `Main$$anon$1` と同じ形）、
+`trex_inherited_superclass_reaches_the_class_file` は `class X extends Loud` が classfile でも
+`Main$Animal` を継承すること、`trex_trait_interface_does_not_extend_its_superclass` は trait の
+interface がスーパークラスを継承せず、`T$class` 本体が継承メンバを読む前に `checkcast` を出すことを見ます。
+異常系 6 本はすべて**両モードで**（`--no-scala-library` と `--scala-library`）診断されることを
+確認しており、文面は real scalac 2.13.16 のものです。`trex_mixin_bad` は名前付きクラスと匿名クラスの
+両方で拒否され、しかも**テンプレート 1 つにつき 1 件**（ヘッダパスとの二重報告なし）であることも見ます。
+
 trait の `val` / `override val` / `var` の実行時表現と `case object` の合成メンバーのフィクスチャは接頭辞 `tval`（`tval` / `tval_bad`）で、同じ理由から `crates/cli/tests/traitval.rs` に置いています。`tval.scala` は私有ランタイム（`--no-scala-library`）と library dual-run の両方で走らせ、`expected/tval.txt` は **real scalac 2.13.16 の出力そのもの**です（3 モードがバイト単位で一致することを確認済み）。バイトコード側の不変条件も 2 本のテストで固定しています。`trait_val_setters_follow_nsc_names` は mixin setter が nsc と同じ `Named$_setter_$label_$eq` であること、`override val` したクラスのその setter が空実装（`putfield` なし）であること、trait の `var` への代入が `putfield` ではなく `count_$eq` 呼び出しであることを `javap -p -c` で見ます。`case_object_members_are_on_the_module_class` は `Asc$` に `toString` / `productPrefix` / `hashCode` / `productArity` が出ていることを見ます。`tval_bad.scala` は trait の `val` への代入が `reassignment to val` になることを固定します。
 
 値クラス + universal trait、`}` の次の行の単項マイナス、`X.type` の名前解決のフィクスチャは
@@ -2823,6 +2885,19 @@ files_with_errors=80`**。生の件数はあまり動きませんが、**この�
 `no matching overload for (Function0[A])F` など。どれも同じ「素の `F`」が原因）。
 
 ### Remaining
+
+- **jar の trait の `abstract override`**。`Symbol::abstract_override` は自分で
+  namer に通したソースにしか立ちません。pickle / classfile から読んだ trait の
+  stackable メンバは「接地しているか」の判定対象外なので、そこだけは診断せずに
+  通します（同じ理由で、その super 連鎖のコード生成も従来どおりです）。
+
+- **trait のスーパークラスを継承するときの型引数はヘッダパスでは埋まらない**。
+  `class X extends Loud` の暗黙のスーパークラス補完（SLS 5.1）は typer 本体の
+  パスでだけ行います。ヘッダ（`sigs_only`）パスでは trait の親がまだ
+  `Type::Class { args: [] }` なので、そこで補完すると
+  `StatementInvoker takes type parameters` になります（slick の
+  `class QueryInvokerImpl[R] extends QueryInvoker[R]` で実際に踏みました）。
+  したがって**別コンパイル単位のヘッダだけを見る経路では、この補完は効きません**。
 
 - **for 内包の値定義に続くガード**（`agent/mismatch6` で診断だけ入れた、未実装）。
   `for { m <- ms; q = f(m); if q > 0 } yield q` は nsc では通ります。nsc は
