@@ -782,6 +782,11 @@ fn tparam_bounds_ok(st: &SymbolTable, child: SymbolId, base: SymbolId) -> bool {
     true
 }
 
+/// A `-cp` / jar **Java** interface — not a Scala `trait` read from a pickle.
+fn is_java_interface(st: &SymbolTable, id: SymbolId) -> bool {
+    !id.is_none() && st.get(id).flags.contains(Flags::JAVA) && is_interface(st, id)
+}
+
 /// SLS 5.2.6: a concrete class (or object, or `new C { }`) must implement every
 /// deferred member it inherits, or the JVM throws `AbstractMethodError` at the
 /// first call. scalac 2.13.16:
@@ -803,6 +808,10 @@ pub fn check_missing_implementations(
         return None;
     }
     let lin = full_lin(st, cls);
+    let universals: Vec<SymbolId> = [st.object_sym, st.anyref_sym, st.any_sym]
+        .into_iter()
+        .filter(|s| !s.is_none() && *s != cls)
+        .collect();
     let mut missing: Vec<SymbolId> = Vec::new();
     let mut seen_names: Vec<(String, usize)> = Vec::new();
     for (bi, &base) in lin.iter().enumerate() {
@@ -851,7 +860,47 @@ pub fn check_missing_implementations(
             // `abstract class M extends B { override def f: Int }`,
             // `class C extends M` — scalac says `C needs to be abstract`,
             // because `M`'s declaration is what `C` inherits.
-            let implemented = lin[..bi].iter().any(|&b| {
+            //
+            // The universal classes are the exception: `full_lin` appends
+            // `Object` / `AnyRef` / `Any` *after* every real base so the
+            // backend's mixin machinery never sees them, but on the JVM they
+            // are the class's ultimate superclass and their concrete members
+            // implement anything a trait or a Java interface re-declares
+            // deferred. `trait T { def hashCode(): Int }; class D extends T`
+            // compiles under scalac, and so does every Java interface that
+            // re-declares `equals`/`hashCode` (JLS 9.2) —
+            // `java.util.Map`, `java.util.Map.Entry`, `java.util.List`, …
+            //
+            // A *Java interface*'s deferred member is the same story one level
+            // down. Java has no `abstract override`, so an interface can never
+            // un-implement anything: whatever the superclass chain defines is
+            // what the JVM resolves, wherever the interface happens to sit in
+            // the linearization. `java.util.List` re-declares
+            // `containsAll(Collection[_])` that `java.util.Collection` already
+            // declares, `java.util.AbstractCollection` defines it, and SLS
+            // 5.1.2 orders `AbstractCollection` *after* `List` for
+            // `java.util.ArrayList` — so `class C extends
+            // java.util.ArrayList[String]` was told to be abstract over a
+            // method it plainly inherits. Only non-interface bases count: an
+            // interface that redeclares a *superinterface*'s default method as
+            // abstract really does leave it unimplemented.
+            let java_iface_decl = is_java_interface(st, st.get(m).owner);
+            let later_class_impl = java_iface_decl
+                && lin[bi + 1..].iter().any(|&b| {
+                    !is_interface(st, b)
+                        && st.get(b).members.iter().any(|&c| {
+                            st.get(c).owner == b
+                                && c != m
+                                && is_member_of(st, b, c)
+                                && !is_private_to_owner(st, c)
+                                && !is_deferred(st, c)
+                                && matches(st, cls, c, m)
+                        })
+                });
+            if later_class_impl {
+                continue;
+            }
+            let implemented = lin[..bi].iter().chain(universals.iter()).any(|&b| {
                 st.get(b).members.iter().any(|&c| {
                     st.get(c).owner == b
                         && c != m

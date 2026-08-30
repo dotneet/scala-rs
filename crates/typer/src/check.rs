@@ -15866,7 +15866,22 @@ impl Typer {
         let owner = self.as_type_owner(owner);
         if self.st.get(owner).kind == SymKind::Class {
             self.ensure_java_loaded(owner, span);
-            if !self.st.lookup_member(owner, name).is_empty() {
+            let found = self.st.lookup_member(owner, name);
+            if !found.is_empty() {
+                // A nested Java class usually reaches the table as a *stub*
+                // long before anyone writes its name: `Map.entrySet()`'s
+                // generic signature mentions `java/util/Map$Entry`, so reading
+                // `Map` alone enters an `Entry` with no parents and no type
+                // parameters. Returning here on the strength of that stub
+                // meant `java/util/Map$Entry.class` was never read, and
+                // `java.util.Map.Entry[String, Int]` drew "Entry does not take
+                // type parameters". The nested class file is what carries the
+                // nested `Signature` (`<K:…;V:…>`), so complete it too.
+                for id in found {
+                    if self.st.get(id).kind == SymKind::Class {
+                        self.ensure_java_loaded(id, span);
+                    }
+                }
                 return;
             }
         } else if let Some(id) = self.st.lookup_member(owner, name).into_iter().find(|&id| {
