@@ -1097,9 +1097,80 @@ impl Typer {
             .collect()
     }
 
-    /// `productPrefix: String` and `productArity: Int`, the two `scala.Product`
-    /// members nsc synthesizes on every `case class` and `case object` without
-    /// needing the rest of `Product`. The backend folds both to constants.
+    /// Give a `case class` / `case object` the `scala.Product` and
+    /// `java.io.Serializable` parents nsc gives it. See
+    /// `crates/typer/src/prelude_product.rs` for what was read off scalac's
+    /// own classfiles, and why this is `library_abi`-only.
+    fn link_case_product(&mut self, class_id: SymbolId) {
+        if !self.library_abi || !crate::prelude_product::wants_product(&self.st, class_id) {
+            return;
+        }
+        let mut syms = Vec::new();
+        for jvm in crate::prelude_product::PRODUCT_PARENTS {
+            match self.ensure_jvm_class(jvm) {
+                Some(s) => syms.push(s),
+                // A classpath without `scala.Product` is not one where a
+                // half-linked `Product` would help.
+                None => return,
+            }
+        }
+        crate::prelude_product::add_parents(&mut self.st, class_id, &syms);
+    }
+
+    /// Give a case class's *synthetic* companion the
+    /// `scala.runtime.AbstractFunctionN` parent that `P.tupled` / `P.curried`
+    /// and `val f: (Int, String) => P = P` come from.
+    fn link_case_companion(&mut self, class_id: SymbolId, paramss: &[Vec<Type>]) {
+        if !self.library_abi {
+            return;
+        }
+        let Some(module_cls) = crate::prelude_product::synthetic_companion(&self.st, class_id)
+        else {
+            // A companion the user wrote gets neither parent from here: nsc
+            // leaves it alone, and `type_module` would overwrite the list
+            // anyway. The backend still marks the classfile `Serializable`.
+            return;
+        };
+        // Every case-class companion is `Serializable`, `AbstractFunctionN` or
+        // not (`class E$Gen$ implements java.io.Serializable`).
+        if let Some(ser) = self.ensure_jvm_class(crate::prelude_product::SERIALIZABLE) {
+            crate::prelude_product::add_parents(&mut self.st, module_cls, &[ser]);
+        }
+        let Some(jvm) =
+            crate::prelude_product::companion_function_class(&self.st, class_id, paramss)
+        else {
+            return;
+        };
+        let Some(abs_fn) = self.ensure_jvm_class(&jvm) else {
+            return;
+        };
+        let params = paramss.first().cloned().unwrap_or_default();
+        crate::prelude_product::link_companion_function(
+            &mut self.st,
+            module_cls,
+            class_id,
+            &params,
+            abs_fn,
+        );
+    }
+
+    /// Load `internal` from the classpath, if it is there, and return its
+    /// symbol. Loading is memoized by `load_binary_into`.
+    fn ensure_jvm_class(&mut self, internal: &str) -> Option<SymbolId> {
+        let pkg = internal.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        let owner = crate::classpath::ensure_package(&mut self.st, pkg);
+        self.load_binary_into(internal, owner, Span::new(0, 0), false);
+        crate::classpath::find_by_jvm(&self.st, internal)
+    }
+
+    /// `productPrefix: String`, `productArity: Int`, `productElement(n: Int): Any`
+    /// and `productElementName(n: Int): String`, the four `scala.Product`
+    /// members nsc *overrides* in every `case class` and `case object`
+    /// (`productIterator` and `productElementNames` it inherits instead). The
+    /// backend emits all four; the first two fold to constants.
+    ///
+    /// Synthesized in both library modes: none of the four mentions a library
+    /// type, so the private runtime backs them just as well.
     fn synthesize_product_members(&mut self, class_id: SymbolId) {
         for (name, ret) in [("productPrefix", Type::String), ("productArity", Type::Int)] {
             if self
@@ -1116,6 +1187,31 @@ impl Typer {
                 .alloc(name, class_id, SymKind::Method, Flags::SYNTHETIC, "");
             self.st.get_mut(id).ty = Type::Method {
                 paramss: vec![],
+                ret: Box::new(ret),
+            };
+        }
+        for (name, ret) in [
+            ("productElement", Type::Any),
+            ("productElementName", Type::String),
+        ] {
+            if self
+                .st
+                .get(class_id)
+                .members
+                .iter()
+                .any(|&m| self.st.get(m).name == name)
+            {
+                continue;
+            }
+            let id = self
+                .st
+                .alloc(name, class_id, SymKind::Method, Flags::SYNTHETIC, "");
+            let p = self.st.alloc("n", id, SymKind::Term, Flags::PARAM, "");
+            self.st.get_mut(p).ty = Type::Int;
+            self.st.get_mut(id).params = vec![p];
+            self.st.get_mut(id).paramss = vec![vec![p]];
+            self.st.get_mut(id).ty = Type::Method {
+                paramss: vec![vec![Type::Int]],
                 ret: Box::new(ret),
             };
         }
@@ -1903,6 +1999,7 @@ impl Typer {
             }
         }
         self.check_mixin_superclasses(id, parents, tree_span);
+        self.link_case_product(id);
         self.register_sealed_child(id);
         self.enter_inherited_members(id);
         self.bind_self_type(id, self_name, self_tpt.as_deref());
@@ -1979,6 +2076,9 @@ impl Typer {
         if class_id.is_none() || !self.st.get(class_id).flags.contains(Flags::CASE) {
             return;
         }
+        // The constructor's parameter types are only known here, and they are
+        // the `AbstractFunctionN` the companion extends.
+        self.link_case_companion(class_id, paramss_ty);
         let ctor_param_tys = paramss_ty.first().cloned().unwrap_or_default();
         let name = self.st.get(class_id).name.clone();
         let companion = self
@@ -2084,6 +2184,10 @@ impl Typer {
             self.st.get_mut(cls).parents = pts;
         }
         self.check_mixin_superclasses(cls, parents, mod_span);
+        // A `case object`'s module class is a `Product` too; a case class's
+        // companion is not, and `wants_product` tells them apart by the `CASE`
+        // flag the namer copies from the `object`'s own modifiers.
+        self.link_case_product(cls);
         self.register_sealed_child(cls);
         self.enter_inherited_members(cls);
         self.bind_self_type(cls, self_name, self_tpt.as_deref());
@@ -11329,7 +11433,12 @@ impl Typer {
                 }
             }
             Type::Class { sym, .. } => {
-                let apply = self.st.lookup_member(*sym, "apply");
+                // `drop_overridden`, as everywhere else a member is looked up
+                // by name: a case class's companion declares `apply(String): C`
+                // *and* inherits the abstract `Function1.apply(T1): R` through
+                // `scala.runtime.AbstractFunction1`, and the second is the
+                // first, not a second alternative.
+                let apply = self.drop_overridden(self.st.lookup_member(*sym, "apply"));
                 for m in apply {
                     // As seen from the receiver, like `type_select`: an
                     // `apply` inherited from a generic parent is only itself
@@ -11348,7 +11457,7 @@ impl Typer {
                 }
             }
             Type::ModuleRef(id) => {
-                for m in self.st.lookup_member(*id, "apply") {
+                for m in self.drop_overridden(self.st.lookup_member(*id, "apply")) {
                     if let Type::Method { paramss, ret } = &self.st.get(m).ty {
                         cands.push((
                             m,
@@ -12770,6 +12879,21 @@ impl Typer {
             .filter(|p| {
                 let n = self.st.get(*p).name.as_str();
                 n != "AnyRef" && n != "Any" && n != "AnyVal" && n != "Object"
+            })
+            // `Product` and `Serializable` are never what `super` means. nsc
+            // writes every case class as `C extends Base with Product with
+            // Serializable`, so they *are* the last parents, but `super.m`
+            // walks the linearization for something that defines `m` and
+            // neither of these defines anything a subclass overrides. Taking
+            // the list's last entry literally made `override def getDumpInfo =
+            // super.getDumpInfo…` in slick's case classes report
+            // `value getDumpInfo is not a member of Serializable` -- 30 times.
+            // The same two names are filtered whether the compiler put them
+            // there (`Typer::link_case_product`) or the user wrote them: a
+            // `super` call to either was already a dead end.
+            .filter(|p| {
+                let jvm = self.st.get(*p).jvm_name.as_str();
+                jvm != "scala/Product" && jvm != "java/io/Serializable"
             })
             .collect();
         if let Some(name) = mix {

@@ -2174,6 +2174,9 @@ impl<'a> Gen<'a> {
         let mut b = ClassBuilder::new(this_name.clone(), self.source_name);
         b.super_name = super_name;
         b.interfaces = interfaces;
+        if !is_trait && mods.flags.contains(Flags::CASE) {
+            self.add_product_interfaces(&mut b);
+        }
 
         if is_trait {
             b.access = ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT;
@@ -3661,6 +3664,9 @@ impl<'a> Gen<'a> {
             // The module class is `Asc$`; the `case object` is called `Asc`.
             let name = simple.strip_suffix('$').unwrap_or(&simple).to_string();
             Self::emit_case_module_methods(b, &name, &defined);
+            // A `case object` is a zero-field `Product`: every index is out of
+            // range, and `productIterator` is empty.
+            emit_product_accessors(b, &defined, &class_jvm, &[], &[], self.library_abi, true);
             return;
         }
         let field_info: Vec<(String, Type, String)> = fields
@@ -3706,6 +3712,15 @@ impl<'a> Gen<'a> {
                 asm.ireturn();
             });
         }
+        emit_product_accessors(
+            b,
+            &defined,
+            &class_jvm,
+            &field_info,
+            &field_vc,
+            self.library_abi,
+            false,
+        );
 
         if !defined.contains("toString") {
             let fi = field_info.clone();
@@ -4353,8 +4368,8 @@ impl<'a> Gen<'a> {
     }
 
     fn emit_module(&mut self, tree: &Tree, class_names: &HashSet<String>) {
-        let (name, impl_) = match &tree.kind {
-            TreeKind::ModuleDef { name, impl_, .. } => (name, impl_),
+        let (name, mods, impl_) = match &tree.kind {
+            TreeKind::ModuleDef { name, mods, impl_ } => (name, mods, impl_),
             _ => return,
         };
         let m = tree.sym;
@@ -4374,6 +4389,16 @@ impl<'a> Gen<'a> {
         let (super_name, interfaces) = split_parents(self.st, &impl_.parents);
         b.super_name = super_name;
         b.interfaces = interfaces;
+        match companion_case_class(self.st, cls) {
+            // A case class's companion the *user* wrote. nsc gives it
+            // `Serializable` and nothing else -- not even `AbstractFunctionN`,
+            // whatever it extends (`object WithTrait extends Mix` comes out as
+            // `class E$WithTrait$ implements E$Mix, java.io.Serializable`).
+            Some(_) => self.add_serializable(&mut b),
+            // `case object Q`: a `Product` in its own right.
+            None if mods.flags.contains(Flags::CASE) => self.add_product_interfaces(&mut b),
+            None => {}
+        }
         b.fields.push(Field {
             access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
             name: "MODULE$".into(),
@@ -4667,6 +4692,14 @@ impl<'a> Gen<'a> {
         let this_name = format!("{class_jvm}$");
         let mut b = ClassBuilder::new(this_name.clone(), self.source_name);
         b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
+        // The superclass the typer picked (`Typer::link_case_companion`), if
+        // it gave this companion one: nsc's
+        // `class Main$P$ extends scala.runtime.AbstractFunction2`.
+        let abs_fn = self.companion_abstract_function(class_id);
+        if let Some(sup) = &abs_fn {
+            b.super_name = sup.clone();
+        }
+        self.add_serializable(&mut b);
         b.fields.push(Field {
             access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
             name: "MODULE$".into(),
@@ -4675,9 +4708,48 @@ impl<'a> Gen<'a> {
         self.emit_module_init(&mut b, class_id, &[], &[]);
         self.emit_module_clinit(&mut b);
         emit_case_apply(&mut b, self.st, class_id);
+        if abs_fn.is_some() {
+            emit_case_apply_bridge(&mut b, self.st, class_id);
+        }
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out
             .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
+    }
+
+    /// The `scala/runtime/AbstractFunctionN` a case class's synthetic
+    /// companion extends, if the typer linked one
+    /// (`crates/typer/src/prelude_product.rs` for when it does).
+    fn companion_abstract_function(&self, class_id: SymbolId) -> Option<String> {
+        if class_id.is_none() {
+            return None;
+        }
+        let module = self.st.companion_module(class_id)?;
+        let cls = module_class_id(self.st, module);
+        self.st.get(cls).parents.iter().find_map(|p| {
+            let id = self.st.class_sym_of(p)?;
+            let jvm = class_internal(self.st, id);
+            jvm.starts_with("scala/runtime/AbstractFunction")
+                .then_some(jvm)
+        })
+    }
+
+    /// `scala.Product` and `java.io.Serializable`, the two interfaces nsc puts
+    /// on every `case class` and `case object`. Only under `--scala-library`:
+    /// the private runtime has no `scala/Product`, and naming an interface
+    /// that will not be on the classpath makes the class unloadable.
+    fn add_product_interfaces(&self, b: &mut ClassBuilder) {
+        if self.library_abi && !b.interfaces.iter().any(|i| i == "scala/Product") {
+            b.interfaces.push("scala/Product".into());
+        }
+        self.add_serializable(b);
+    }
+
+    /// `java.io.Serializable` alone -- a case class's companion, which is not
+    /// a `Product`. A JDK interface, so it needs no library.
+    fn add_serializable(&self, b: &mut ClassBuilder) {
+        if !b.interfaces.iter().any(|i| i == "java/io/Serializable") {
+            b.interfaces.push("java/io/Serializable".into());
+        }
     }
 
     fn emit_forwarder(
@@ -4733,6 +4805,308 @@ impl<'a> Gen<'a> {
             }
         })
     }
+}
+
+/// `scala.Product`'s indexed accessors on a `case class` / `case object`:
+/// `productElement`, `productElementName`, `productIterator` and
+/// `productElementNames`.
+///
+/// Checked against `javap -v -p` on scalac 2.13.16 (`crates/typer/src/prelude_product.rs`
+/// records the rest of that reading):
+///
+/// * `productElement` and `productElementName` are a `tableswitch` over
+///   `0 … arity-1` — a *table*, not a chain of comparisons, and one even for a
+///   single field (`tableswitch { // 0 to 0 }`). A zero-field case class emits
+///   no switch at all, just the out-of-range path.
+/// * Both take the out-of-range index to `scala.runtime.Statics.ioobe(I)`,
+///   which throws `IndexOutOfBoundsException(String.valueOf(i))`;
+///   `productElementName` follows it with `checkcast java/lang/String`, since
+///   `ioobe` is declared to return `Object`.
+/// * `productIterator` is *not* inherited: nsc overrides it with
+///   `ScalaRunTime$.MODULE$.typedProductIterator(this)`.
+/// * `productElementNames` *is* inherited — the emitted method is the mixin
+///   forwarder to `Product`'s default implementation,
+///   `scala/Product.productElementNames$(this)`.
+///
+/// A field of value-class type is read unboxed and wrapped back up, exactly as
+/// `toString` does it (nsc: `new G$Meters(this.m())` for
+/// `case class Box(m: Meters, b: String)`).
+///
+/// A `case object` (`module`) is the one exception: nsc synthesizes no
+/// `productElementName` for it at all, so the module class ends up with the
+/// mixin forwarder to `Product`'s default, whose message is
+/// `"0 is out of bounds (min 0, max -1)"` rather than the bare `"0"` a
+/// zero-field `case class Zero()` throws through `Statics.ioobe`. Both were
+/// read off scalac's own output, and both are reproduced here.
+///
+/// `productIterator` and `productElementNames` need `scala.collection.Iterator`,
+/// `scala.Product` and `scala.runtime.ScalaRunTime`, none of which the private
+/// runtime has, so they are emitted only under `--scala-library`; the typer
+/// leaves them undeclared in the other mode (`Typer::link_case_product`), so
+/// nothing calls what is not there. The other two need only `java.lang`, and
+/// are emitted in both modes with the throw written out where `Statics.ioobe`
+/// (or `Product`'s default) would go.
+fn emit_product_accessors(
+    b: &mut ClassBuilder,
+    defined: &HashSet<String>,
+    class_jvm: &str,
+    field_info: &[(String, Type, String)],
+    field_vc: &[Option<(String, String)>],
+    library_abi: bool,
+    module: bool,
+) {
+    let n = field_info.len();
+    if !defined.contains("productElement") {
+        let fi = field_info.to_vec();
+        let fvc = field_vc.to_vec();
+        let cj = class_jvm.to_string();
+        b.add_code(
+            ACC_PUBLIC,
+            "productElement",
+            "(I)Ljava/lang/Object;",
+            2,
+            move |asm| {
+                let dflt = asm.fresh_label();
+                let labs: Vec<crate::code::Label> = (0..n).map(|_| asm.fresh_label()).collect();
+                if n > 0 {
+                    asm.iload(1);
+                    asm.tableswitch(dflt, 0, n as i32 - 1, &labs);
+                    for (i, (name, ty, desc)) in fi.iter().enumerate() {
+                        asm.mark(labs[i]);
+                        match fvc.get(i) {
+                            Some(Some((internal, ctor))) => {
+                                asm.new_obj(internal);
+                                asm.dup();
+                                asm.aload(0);
+                                asm.getfield(&cj, name, desc);
+                                asm.invokespecial(internal, "<init>", ctor);
+                            }
+                            _ => {
+                                asm.aload(0);
+                                asm.getfield(&cj, name, desc);
+                                if is_jvm_primitive(ty) {
+                                    emit_box(asm, ty);
+                                }
+                            }
+                        }
+                        asm.areturn();
+                    }
+                }
+                asm.mark(dflt);
+                emit_ioobe(asm, library_abi, false);
+            },
+        );
+    }
+    if !defined.contains("productElementName") {
+        let names: Vec<String> = field_info.iter().map(|(nm, _, _)| nm.clone()).collect();
+        b.add_code(
+            ACC_PUBLIC,
+            "productElementName",
+            "(I)Ljava/lang/String;",
+            3,
+            move |asm| {
+                if module {
+                    emit_default_product_element_name(asm, library_abi, n as i32);
+                    return;
+                }
+                let dflt = asm.fresh_label();
+                let labs: Vec<crate::code::Label> = (0..n).map(|_| asm.fresh_label()).collect();
+                if n > 0 {
+                    asm.iload(1);
+                    asm.tableswitch(dflt, 0, n as i32 - 1, &labs);
+                    for (i, nm) in names.iter().enumerate() {
+                        asm.mark(labs[i]);
+                        asm.ldc_string(nm);
+                        asm.areturn();
+                    }
+                }
+                asm.mark(dflt);
+                emit_ioobe(asm, library_abi, true);
+            },
+        );
+    }
+    if !library_abi {
+        return;
+    }
+    if !defined.contains("productIterator") {
+        b.add_code(
+            ACC_PUBLIC,
+            "productIterator",
+            "()Lscala/collection/Iterator;",
+            1,
+            |asm| {
+                asm.getstatic(
+                    "scala/runtime/ScalaRunTime$",
+                    "MODULE$",
+                    "Lscala/runtime/ScalaRunTime$;",
+                );
+                asm.aload(0);
+                asm.invokevirtual(
+                    "scala/runtime/ScalaRunTime$",
+                    "typedProductIterator",
+                    "(Lscala/Product;)Lscala/collection/Iterator;",
+                );
+                asm.areturn();
+            },
+        );
+    }
+    if !defined.contains("productElementNames") {
+        b.add_code(
+            ACC_PUBLIC,
+            "productElementNames",
+            "()Lscala/collection/Iterator;",
+            1,
+            |asm| {
+                asm.aload(0);
+                asm.invokestatic_interface(
+                    "scala/Product",
+                    "productElementNames$",
+                    "(Lscala/Product;)Lscala/collection/Iterator;",
+                );
+                asm.areturn();
+            },
+        );
+    }
+}
+
+/// A `case object`'s `productElementName`: nsc synthesizes none, so the module
+/// class carries the mixin forwarder to `scala.Product`'s default. Every index
+/// is out of range for a zero-arity `Product`, and that default's message is
+/// `"<n> is out of bounds (min 0, max <arity - 1>)"`.
+///
+/// Without the jar the same message is built here, so the two library modes do
+/// not disagree about what a `case object` throws.
+fn emit_default_product_element_name(asm: &mut Assembler, library_abi: bool, arity: i32) {
+    if library_abi {
+        asm.aload(0);
+        asm.iload(1);
+        asm.invokestatic_interface(
+            "scala/Product",
+            "productElementName$",
+            "(Lscala/Product;I)Ljava/lang/String;",
+        );
+        asm.areturn();
+        return;
+    }
+    asm.new_obj("java/lang/IndexOutOfBoundsException");
+    asm.dup();
+    asm.new_obj("java/lang/StringBuilder");
+    asm.dup();
+    asm.invokespecial("java/lang/StringBuilder", "<init>", "()V");
+    asm.iload(1);
+    asm.invokevirtual(
+        "java/lang/StringBuilder",
+        "append",
+        "(I)Ljava/lang/StringBuilder;",
+    );
+    append_str(asm, " is out of bounds (min 0, max ");
+    asm.iconst(arity - 1);
+    asm.invokevirtual(
+        "java/lang/StringBuilder",
+        "append",
+        "(I)Ljava/lang/StringBuilder;",
+    );
+    append_str(asm, ")");
+    asm.invokevirtual(
+        "java/lang/StringBuilder",
+        "toString",
+        "()Ljava/lang/String;",
+    );
+    asm.invokespecial(
+        "java/lang/IndexOutOfBoundsException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    );
+    asm.athrow();
+}
+
+/// The out-of-range arm of `productElement` / `productElementName`, return
+/// included. `as_string` adds the `checkcast` the `String`-returning one needs.
+///
+/// `scala.runtime.Statics.ioobe` is what nsc calls, and it is exactly
+/// `throw new IndexOutOfBoundsException(String.valueOf(i))` (read back from
+/// the library jar with `javap -c`). It is declared to return `Object`, so nsc
+/// writes `areturn` after the call even though it never returns; without the
+/// jar the throw is written out here instead, and then there is nothing to
+/// return from.
+fn emit_ioobe(asm: &mut Assembler, library_abi: bool, as_string: bool) {
+    if library_abi {
+        asm.iload(1);
+        asm.invokestatic("scala/runtime/Statics", "ioobe", "(I)Ljava/lang/Object;");
+        if as_string {
+            asm.checkcast("java/lang/String");
+        }
+        asm.areturn();
+        return;
+    }
+    asm.new_obj("java/lang/IndexOutOfBoundsException");
+    asm.dup();
+    asm.iload(1);
+    asm.invokestatic("java/lang/String", "valueOf", "(I)Ljava/lang/String;");
+    asm.invokespecial(
+        "java/lang/IndexOutOfBoundsException",
+        "<init>",
+        "(Ljava/lang/String;)V",
+    );
+    asm.athrow();
+}
+
+/// The `case class` a module class is the companion of, if any.
+///
+/// That is what tells a case class's companion (`P$` next to `P`) from a
+/// `case object`'s module class (`Q$` alone). The `CASE` flag alone does not:
+/// `Typer::ensure_companion` stamps it on the companion it synthesizes too.
+fn companion_case_class(st: &SymbolTable, cls: SymbolId) -> Option<SymbolId> {
+    if cls.is_none() {
+        return None;
+    }
+    let name = st.get(cls).name.clone();
+    let base = name.strip_suffix('$').unwrap_or(&name).to_string();
+    let owner = st.get(cls).owner;
+    st.get(owner).members.iter().copied().find(|&m| {
+        st.get(m).kind == SymKind::Class
+            && st.get(m).name == base
+            && st.get(m).flags.contains(Flags::CASE)
+    })
+}
+
+/// `apply(Object, …): Object`, the erased `FunctionN.apply` a companion that
+/// extends `scala.runtime.AbstractFunctionN` has to implement. nsc emits it as
+/// `public java.lang.Object apply(java.lang.Object, java.lang.Object)` right
+/// after the typed `apply`.
+fn emit_case_apply_bridge(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
+    let fields = st.get(class_id).ctor_fields.clone();
+    let tys: Vec<Type> = fields.iter().map(|f| st.get(*f).ty.clone()).collect();
+    let ret = Type::Class {
+        sym: class_id,
+        args: vec![],
+    };
+    let target = jvm_method_desc(st, &tys, &ret);
+    let bridge = format!(
+        "({})Ljava/lang/Object;",
+        "Ljava/lang/Object;".repeat(tys.len())
+    );
+    if b.methods
+        .iter()
+        .any(|m| m.name == "apply" && m.desc == bridge)
+    {
+        return;
+    }
+    let this = b.this_name.clone();
+    let locals = tys.len() as u16 + 1;
+    b.add_code(ACC_PUBLIC, "apply", &bridge, locals, move |asm| {
+        asm.aload(0);
+        for (i, ty) in tys.iter().enumerate() {
+            asm.aload(i as u16 + 1);
+            if is_jvm_primitive(ty) {
+                emit_unbox(asm, ty);
+            } else if let Some(internal) = checkcast_internal(st, ty) {
+                asm.checkcast(&internal);
+            }
+        }
+        asm.invokevirtual(&this, "apply", &target);
+        asm.areturn();
+    });
 }
 
 fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
