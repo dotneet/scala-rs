@@ -742,6 +742,17 @@ fn parse_field_ty(st: &SymbolTable, s: &str) -> (Type, usize) {
                 Type::String
             } else if inner == "java/lang/Object" {
                 Type::Any
+            } else if inner == "scala/runtime/BoxedUnit" {
+                // `Unit` erases to `BoxedUnit` in every *value* position (a
+                // parameter, a field, an array element), so reading a
+                // descriptor back has to undo that -- otherwise a separately
+                // compiled `case class K(k: Unit, n: Int)` came back as
+                // `(BoxedUnit, Int)` and `K((), 2)` no longer type-checked
+                // against our own classfile. nsc's own classfile reader makes
+                // the same mapping.
+                Type::Unit
+            } else if inner == "scala/runtime/Nothing$" {
+                Type::Nothing
             } else if name.starts_with("Function") {
                 Type::Function {
                     params: vec![Type::Any],

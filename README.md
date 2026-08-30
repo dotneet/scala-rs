@@ -200,6 +200,8 @@ anon-capture は lambda-lift の直後、erasure の前です。メソッドの�
 
 erasure は型引数を落とし、型パラメータと unbounded ワイルドカードを `Object` にし、プリミティブと `Object` の境に box / unbox を挿入します。by-name は `Function0` に下げます。バックエンドの ad-hoc な推測だけには頼っていません。配列は nsc と同じく**要素が抽象型のときだけ** `Object` に潰します（`def d[T](x: Array[T])` は `(Ljava/lang/Object;)`、`Array[AnyRef]` / `Array[Any]` / `Array[AnyVal]` は `[Ljava/lang/Object;`）。
 
+`Unit` が `V` になるのは**メソッドの戻り値だけ**です。パラメータ・フィールド・配列要素・型引数では nsc と同じく `scala/runtime/BoxedUnit` に erase し、値は `BoxedUnit.UNIT` シングルトンです（`Nothing` は同様に `scala/runtime/Nothing$`）。詳しくは「`Unit` の引数と `scala.runtime.BoxedUnit`」を参照してください。
+
 ### メソッド型パラメータの推論（引数＋期待型）
 
 nsc の `instantiateExpecting` と同じく、メソッドの型パラメータは**引数と期待型の両方**を制約として解きます（`crates/typer/src/check.rs` の `add_expected_constraints`）。
@@ -4029,6 +4031,115 @@ public メソッド集合が nsc のそれを**包含する**ことを見ます�
 
 slick の計測は `files=184 errors=411 files_with_errors=72` で**前後とも同じ**です
 （型検査は通ってしまうバグなので、エラー数は元から動きません）。
+### `Unit` の引数と `scala.runtime.BoxedUnit`（`agent/unitbox`）
+
+`Unit` が `V` になるのは**メソッドの戻り値だけ**です。値が実際に置かれる場所
+——**パラメータ・フィールド・配列要素・型引数**——では nsc は
+`scala/runtime/BoxedUnit` に erase し、唯一の値 `()` は `BoxedUnit.UNIT`
+シングルトンです。そこに `V` を書くのは「nsc と違う」どころか
+**ディスクリプタとして不正**で、クラス全体がロードできません。
+
+```
+java.lang.ClassFormatError: Method "f" in class Main has illegal signature
+  "(V)Ljava/lang/String;"
+```
+
+`def f(x: Unit)`、`class C(val u: Unit)`、`var w: Unit`、
+`case class K(k: Unit, …)`、`Array[Unit]` がすべてこれで落ちていました。
+
+**`javap -v -p` で実 scalac 2.13.16 から読み取ったこと**（`Main.scala` を
+そのままコンパイルして確認）:
+
+- `def f(x: Unit): String` は `(Lscala/runtime/BoxedUnit;)Ljava/lang/String;`。
+- `f(())` は `getstatic scala/runtime/BoxedUnit.UNIT` を積む。
+- `f(g())`（`def g(): Unit`）は `invokevirtual g:()V` の**あとに**
+  `getstatic UNIT`。`V` の呼び出しは何も残さないので、引数はここで作る。
+- `val u: Unit = ()` は**スロットを取る**（`LocalVariableTable` に
+  `u Lscala/runtime/BoxedUnit;`）。
+- `class C(val u: Unit)` のコンストラクタは `(Lscala/runtime/BoxedUnit;)V`。
+  `var w: Unit` はフィールドが `Lscala/runtime/BoxedUnit;` で、getter は
+  `getfield; pop; return`（戻り値は `V`）、setter は `w_$eq(BoxedUnit)`。
+- `case class K(k: Unit)` は `apply(BoxedUnit)` / `copy(BoxedUnit)` /
+  `unapply` が `Option<BoxedUnit>`。
+- `List((), ())` は `anewarray scala/runtime/BoxedUnit` を作って
+  `ScalaRunTime.wrapUnitArray` に渡す。`Array[Unit]` は
+  `[Lscala/runtime/BoxedUnit;`（`Array[Nothing]` だけは例外で
+  `[Ljava/lang/Object;`）。`Nothing` のパラメータは `Lscala/runtime/Nothing$;`。
+- `val any: Any = ()` は `getstatic UNIT; astore`。`println` が `()` と出るのは
+  `BoxedUnit.toString` です。
+- ふつう `Unit` の式はスタックに何も残しませんが、`def id[A](a: A): A` を
+  `id(())` と使うと `(Object)Object` の呼び出しが**参照を残す**ので、
+  捨てる位置では nsc も `pop` を出します（`invokevirtual id; pop`）。
+- `x.asInstanceOf[Unit]` は結果が `Unit` の式なので何も残しません（nsc は
+  キャスト自体を落として、使う位置で `UNIT` を作ります）。
+  `x.isInstanceOf[Unit]` は `instanceof scala/runtime/BoxedUnit` です。
+
+実装は 3 つに分かれます。
+
+1. **ディスクリプタ**: `jvm_desc_val`（値の位置）を `jvm_desc`（結果の位置）と
+   分けました（`crates/backend/src/gen.rs`）。メソッドのパラメータ、フィールド、
+   配列要素はすべて前者です。
+2. **スロット**: `Unit` のパラメータは JVM 上では本当に渡ってくるので 1 枠を
+   占めます（`Frame::alloc_param`）。取らないと**その後ろのパラメータが全部
+   ずれます**。シンボル自体は void ソートのままなので、読んでも何も積まれず、
+   ほかの `Unit` 式と同じ扱いのままです。値は `BoxedUnit.UNIT` しかあり得ない
+   ので、必要な位置で作り直します（`fill_boxed_unit_slot` / `adapt_unit_arg`）。
+   転送だけする合成メソッド（forwarder・bridge・setter・`case class` の
+   `apply`/`copy`）は逆に「渡されたものをそのまま流す」ので `jvm_slot_sort`
+   （＝ `Unit` は `Ref`）を使います。捨てる位置で参照が残るのは
+   **このコンパイル単位で定義したメソッド**のときだけ数えます
+   （`unit_stat_leaves_ref`）: `Using.resource` / `Breaks.catchBreak` /
+   `ArrayOps` はそれぞれ専用の emitter が既に値を落としているので、
+   もう一度 `pop` するとスタックが枯れます。
+3. **私有ランタイム**: `crates/backend/src/runtime.rs` が
+   `scala/runtime/BoxedUnit`（`UNIT` / `TYPE` / `equals` は同一性 /
+   `hashCode` は 0 / `toString` は `"()"`）と `scala/runtime/Nothing$`
+   （`Throwable` を継承する abstract クラス。呼べないメソッドでも
+   パラメータのクラスは verifier が解決するので要ります）を出すように
+   なりました。これで
+   `emit_box(Unit)` は**両モードとも** `getstatic UNIT` になり、
+   `--no-scala-library` でも `println(x: Any)` が `()` を出し、
+   `case () =>` が `null` に当たらなくなりました（`agent/patbind` の残件）。
+   `library_abi` で分岐していた `Unit` のボックス表現は全部消えています。
+
+| fixture | 何を固定するか | 期待出力 |
+| --- | --- | --- |
+| `ub_param.scala`（`crates/cli/tests/unitbox.rs`、両モード dual-run） | `Unit` のパラメータ: `f(())`、`f(g())`、`middle(Int, Unit, String)`（`Unit` の後ろの引数がずれない）、2 個続く `Unit`、コンストラクタ `val u: Unit`、クラスのメソッド、`Nothing` のパラメータ（`never(scala.runtime.Nothing$)`） | `got` `got` `s1` `two` `()` `()` `42` `x7` |
+| `ub_field.scala`（`crates/cli/tests/unitbox.rs`、両モード dual-run） | `Unit` のフィールド: `val`/`var`/`lazy val` をクラス・`object`・trait で、getter/setter・ローカル `var`・`Any` 代入 | `()` ×12 |
+| `ub_case.scala`（`crates/cli/tests/unitbox.rs`、両モード dual-run） | `case class K(k: Unit, n: Int)`: `toString` / `equals` / `hashCode` / `copy` / `productElement` / コンパニオンの `apply` と erased `apply(Object,Object)` ブリッジ / パターン抽出 | `K((),3)` `()` `3` `K((),4)` `true` `false` `2` `()` `3` `true` `U(())` `matched` `()` `3` |
+| `ub_mixin.scala`（`crates/cli/tests/unitbox.rs`、両モード dual-run） | trait / 抽象クラス / 値クラス越しの `Unit` メンバ: インタフェースのメソッド、mixin forwarder、`T$class` の静的実装、erasure ブリッジ、抽象 `var` の setter、`Int => Unit` のラムダ | `()` ×4 `m` `d` `m` `d` `()` `sub` `3` `()` |
+| `ub_call.scala`（`crates/cli/tests/unitbox.rs`、両モード dual-run） | 普通の呼び出し経路を通らない引数: `this(…)` の委譲、trait の `$init$`、デフォルト引数、名前付き引数、2 つ目のパラメータリスト、by-name の `Unit`、`Unit` を 2 個続けて取るメソッド、`try`/`catch`・`match` の本体、再帰 | `9` `()` `()` `0` `7` `()` `()` `iv` `d1` `d3` `d4` `n5` `c6` `by` |
+| `ub_super.scala`（`crates/cli/tests/unitbox.rs`、両モード dual-run） | **スーパーコンストラクタ**の `Unit` 引数（`class D extends B((), 5)`、`case object Asc extends Dir(())`）、trait の抽象メンバ、メソッド内の `def` | `D5` `()` `5` `()` `E` `l2` |
+| `ub_boxed.scala`（`crates/cli/tests/unitbox.rs`、両モード dual-run） | `()` は `null` ではなく `BoxedUnit.UNIT`: `id(())`、`String.valueOf(())`、`== ()`、`case () =>` が `null` に当たらない、`toString` / `hashCode`、捨てる位置の `id(())` を `pop` する（ループの後方辺でスタック高が合う）、`asInstanceOf[Unit]` / `isInstanceOf[Unit]` | `()` `()` `true` `false` `unit` `null` `other` `()` `()` `0` `2` `()` `2` `true` `false` |
+| `ub_typearg.scala`（`crates/cli/tests/unitbox.rs`、library dual-run のみ） | 型引数位置の `Unit`: `List[Unit]` / `Array[Unit]`（`[Lscala/runtime/BoxedUnit;`）/ `Option[Unit]` / `Seq[Unit]` / `Tuple2` / `Map[String, Unit]` / `Set[Unit]` / `PartialFunction[Int, Unit]` / `Unit*` の可変長 / 結果が `Unit` のラムダ / `(Unit, Int) => String`。私有ランタイムには可変長の `List.apply` / `Array.apply` も `Map` / `Set` / `Function2` も無いので jar 限定 | `3` `()` `true` `2` `List((), ())` `2` `()` `Some(())` `()` `()` `((),1)` `List((), ())` `2` `()` `Map(a -> ())` `Set(())` `Some(())` `()` `()` `f1` |
+| `ub_sepdef.scala` + `ub_sepuse.scala`（`crates/cli/tests/unitbox.rs`、`-cp` 越しの分割コンパイル） | 別コンパイル単位から `Unit` メンバを使う: classfile の `Lscala/runtime/BoxedUnit;` を `Unit` に戻して読めること（`case class LK(k: Unit, n: Int)` の `apply` / パターン抽出、`class LC(val u: Unit)`）。クラス名をわざと `L` で始めてある（下記） | `libgot` `s1` `LK((),2)` `()` `()` `()` `m` `()` `2` |
+| `ub_param_bad.scala`（`crates/cli/tests/unitbox.rs`、異常系） | erase の都合で typer が緩まないこと: `def g(s: String)` に `g(())` はエラー（実 scalac も `type mismatch; found: Unit required: String`） | （コンパイルエラー） |
+
+ディスクリプタそのものも `javap -p` で見ています
+（`ub_param_descriptors_use_boxed_unit` / `ub_typearg_array_descriptor`）。
+実行だけでは足りません——`(V)` はクラスがロードできないので、
+「たまたま動いた」と区別が付かないからです。私有ランタイムが
+`scala/runtime/BoxedUnit` と `scala/runtime/Nothing$` を実際に出している
+ことも見ます（`private_runtime_emits_boxed_unit` /
+`private_runtime_emits_nothing_class`）。
+
+分割コンパイルで 2 つ、`Unit` とは無関係の穴も踏んだので直しました。
+
+- `StackMapTable` のフレームが名指すクラスを**ディスクリプタから作るとき、
+  `trim_start_matches('L')` が先頭の `L` を全部食っていました**
+  （`crates/backend/src/code.rs` の `vtype_from_desc`）。既定パッケージの
+  `LK` は `LLK;` なので `K` になり、`NoClassDefFoundError: K` で落ちます。
+  `strip_prefix` に直しました。`ub_sepdef.scala` のクラス名が `L` で
+  始まるのはこの回帰を踏ませるためです。
+- 別コンパイル単位の `var` は `-cp` から読むと `val` に見えます
+  （`reassignment to val w`）。フィールド型に依らないので、こちらは
+  Remaining に置いてあります。
+
+計測は `files=184 errors=411 files_with_errors=72` → **変わらず
+`errors=411 files_with_errors=72`**。slick は型検査で止まっていて classfile を
+1 つも出していない（`classes=0`）ので、バックエンドだけを直したこのスライスでは
+数字が動かないのが正しい姿です。動かしたのは**出したコードが JVM にロード
+できるか**であって、通る本数ではありません。
 
 ### Remaining
 
@@ -4213,11 +4324,13 @@ error: value += is not a member of T
   （2.13.13 以降 deprecated）。その eta 展開がこちらには無いので、
   `value tupled is not a member of P$` を出します。合成コンパニオン
   （＝`object P` を書いていない普通の case class）は継承で動きます。
-- **`Unit` を型に持つパラメータのディスクリプタが `(V)` になる**
-  （`agent/patbind` で見つけた、パターンとは無関係の別件）。
-  `def unit2(x: Unit): String` が `(V)Ljava/lang/String;` になり
-  `ClassFormatError: illegal signature` で落ちます。nsc は
-  `(Lscala/runtime/BoxedUnit;)` です。erasure 側の話なので触っていません。
+- **`Unit` を引数に取る関数型 `Unit => T` が `Function0[T]` になる**
+  （`agent/unitbox` で見つけた別件）。`crates/parser/src/parse.rs` の
+  `is_unit_tuple` が型位置の `Ident("Unit")` を空パラメータリスト扱いにするので、
+  `def h(f: Unit => Int)` が `() => Int` として型付けされ、`f(())` が
+  `no matching overload` になります。nsc では `Unit => T` は
+  `Function1[Unit, T]` で、`() => T` だけが `Function0[T]` です。
+  パーサの 1 行ですが、関数型の解釈が変わるので別のスライスにしました。
 
 - **私有ランタイムに `scala.runtime.BoxedUnit` が無い**（`agent/patbind`）。
   `--no-scala-library` では `Unit` を `Any` に入れると `null` になるので、
@@ -4244,6 +4357,20 @@ error: value += is not a member of T
   typer 側のコンパニオン解決だけです。同じ理由で、クラス本体に `object` が
   先にあると後続の `case class` のコンパニオンも見つからなくなります
   （`case class Holder(k: Int) { object Inner; case class Pair(a: Int) }`）。
+- **`Unit` パラメータへの value discarding**（SLS 6.26.1、`agent/unitbox`）。
+  scalac は `def f(x: Unit)` に `f("s")` を**警告付きで受理**し、値を捨てて
+  `()` を渡します。こちらは `no matching overload` を出します。オーバーロード
+  解決に手を入れる話なので、そちらのスライスに任せています。
+
+- **`def a: Array[T]` に続く `a(0)`**（`agent/unitbox` で見つけた、`Unit` とは
+  無関係の別件）。引数なしメソッドの結果への `apply` 挿入が無いので
+  `no matching overload for Array[String] with arguments (0)` になります。
+  `val` に受けてから `a(0)` すれば通ります。要素型に依りません。
+
+- **`-cp` から読んだ `var` が `val` に見える**（`agent/unitbox` で見つけた、
+  `Unit` とは無関係の別件）。別コンパイル単位の `class C { var w: Int }` に
+  `c.w = 5` すると `reassignment to val w` になります。フィールドの型に
+  依りません（`ub_sepuse.scala` のコメント参照）。
 
 - **for 内包の値定義に続くガード**（`agent/mismatch6` で診断だけ入れた、未実装）。
   `for { m <- ms; q = f(m); if q > 0 } yield q` は nsc では通ります。nsc は

@@ -1482,7 +1482,15 @@ fn vtype_from_desc(desc: &str) -> VType {
         Some('V') => VType::Top,
         Some('[') => VType::Object(desc.to_string()),
         Some('L') => {
-            let inner = desc.trim_start_matches('L').trim_end_matches(';');
+            // `strip_prefix`, not `trim_start_matches`: the latter eats *every*
+            // leading `L`, so a class in the default package whose name starts
+            // with one (`LK`, `Lib$`) lost its own first letter and the frame
+            // named a class that does not exist
+            // (`NoClassDefFoundError: K`).
+            let inner = desc
+                .strip_prefix('L')
+                .and_then(|s| s.strip_suffix(';'))
+                .unwrap_or(desc);
             VType::Object(inner.to_string())
         }
         _ => VType::Object("java/lang/Object".into()),
