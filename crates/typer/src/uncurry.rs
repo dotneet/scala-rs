@@ -431,3 +431,76 @@ fn flatten_method_symbols(st: &mut SymbolTable) {
         }
     }
 }
+
+/// Eta-expand a method with several parameter lists into nested lambdas:
+/// `curry _` on `def curry(a: Int)(b: Int)(c: Int): Int` is
+/// `Int => Int => Int => Int`, one lambda per list, each applying its own
+/// parameters to the partial application built so far.
+pub(crate) fn eta_expand_curried(
+    st: &mut SymbolTable,
+    gensym: &mut u32,
+    tree: &mut Tree,
+    paramss: &[Vec<Type>],
+    ret: Type,
+) {
+    let Some((first, rest)) = paramss.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        eta_expand(st, gensym, tree, first.clone(), ret);
+        return;
+    }
+    let span = tree.span;
+    let mut vparams = Vec::new();
+    let mut args = Vec::new();
+    for pty in first {
+        *gensym += 1;
+        let name = format!("x$eta${}", *gensym);
+        let id = st.alloc(&name, st.owner, SymKind::Term, Flags::PARAM, "");
+        st.get_mut(id).ty = pty.clone();
+        let mut vd = Tree::dummy(TreeKind::ValDef {
+            mods: Modifiers::new(Flags::PARAM),
+            name: name.clone(),
+            tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+            rhs: Box::new(Tree::dummy(TreeKind::Empty)),
+        });
+        vd.span = span;
+        vd.sym = id;
+        vd.ty = pty.clone();
+        vparams.push(vd);
+        let mut ident = Tree::dummy(TreeKind::Ident { name });
+        ident.span = span;
+        ident.sym = id;
+        ident.ty = pty.clone();
+        args.push(ident);
+    }
+    let inner = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+    let fun_sym = inner.sym;
+    let mut body = Tree {
+        id: inner.id,
+        span,
+        kind: TreeKind::Apply {
+            fun: Box::new(inner),
+            args,
+        },
+        ty: Type::NoType,
+        sym: fun_sym,
+        postfix: false,
+    };
+    eta_expand_curried(st, gensym, &mut body, rest, ret);
+    let body_ty = body.ty.clone();
+    *tree = Tree {
+        id: body.id,
+        span,
+        kind: TreeKind::Function {
+            vparams,
+            body: Box::new(body),
+        },
+        ty: Type::Function {
+            params: first.clone(),
+            ret: Box::new(body_ty),
+        },
+        sym: SymbolId::NONE,
+        postfix: false,
+    };
+}

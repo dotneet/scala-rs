@@ -1647,8 +1647,21 @@ impl Typer {
             *tree = *inner;
         }
         if let Type::Method { paramss, ret } = tree.ty.clone() {
-            let params: Vec<Type> = paramss.into_iter().flatten().collect();
-            eta_expand(&mut self.st, &mut self.gensym, tree, params, *ret);
+            // One lambda per parameter list: `curry(1) _` on
+            // `def curry(a: Int)(b: Int)(c: Int)` is `Int => Int => Int`, not
+            // a flattened `(Int, Int) => Int`.
+            let clauses: Vec<Vec<Type>> = if paramss.is_empty() {
+                vec![Vec::new()]
+            } else {
+                paramss
+            };
+            crate::uncurry::eta_expand_curried(
+                &mut self.st,
+                &mut self.gensym,
+                tree,
+                &clauses,
+                *ret,
+            );
         }
     }
 
