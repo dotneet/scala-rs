@@ -29,7 +29,13 @@ python3 "$ROOT/tests/expand_fm.py" $SRC/scala $GEN >/dev/null
 FILES=($(find $SRC/scala $SRC/scala-2 $COMPAT $GEN -name '*.scala' | sort))
 OUT=${SLICK_OUT:-$RUN/out}
 rm -rf $OUT; mkdir -p $OUT
-$BIN compile "${FILES[@]}" -d $OUT -cp "$(cat $SP/deps.cp)" -Xsource:3 \
+# slick's build.sbt depends on scala-reflect (its macros import
+# scala.reflect.macros.blackbox.Context); without the jar even real scalac
+# cannot compile ShapedValue.scala, so measuring without it asks for the
+# impossible. Appended here rather than in the shared deps.cp so a stale
+# scratchpad state cannot lose it.
+REFLECT=/tmp/scala-2.13.16/lib/scala-reflect.jar
+$BIN compile "${FILES[@]}" -d $OUT -cp "$(cat $SP/deps.cp):$REFLECT" -Xsource:3 \
   --scala-library /tmp/scala-rs-lib/scala-library-2.13.16.jar "$@" > ${SLICK_LOG:-$SP/measure.txt} 2>&1 || true
 ERRORS=$(grep -c '^error' ${SLICK_LOG:-$SP/measure.txt} || true)
 CLASSES=$(find $OUT -name '*.class' | wc -l | tr -d ' ')
