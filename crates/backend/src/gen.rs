@@ -38,6 +38,9 @@ pub fn emit(tree: &Tree, st: &SymbolTable, source_name: &str) -> Vec<EmittedClas
 pub struct TraitImpls {
     impls: HashMap<SymbolId, Vec<Tree>>,
     vals: HashMap<SymbolId, Vec<Tree>>,
+    /// `vals` plus the trait body's bare expression statements, in source
+    /// order — the whole of what `$init$` runs (SLS 5.1).
+    inits: HashMap<SymbolId, Vec<Tree>>,
     lazy_vals: HashMap<SymbolId, Vec<Tree>>,
     modules: HashMap<SymbolId, Vec<Tree>>,
 }
@@ -52,6 +55,7 @@ pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpl
         lambda_n: Cell::new(0),
         trait_impls: HashMap::new(),
         trait_vals: HashMap::new(),
+        trait_inits: HashMap::new(),
         trait_lazy_vals: HashMap::new(),
         trait_modules: HashMap::new(),
         library_abi: false,
@@ -64,6 +68,7 @@ pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpl
     g.collect_trait_impls(tree);
     into.impls.extend(g.trait_impls);
     into.vals.extend(g.trait_vals);
+    into.inits.extend(g.trait_inits);
     into.lazy_vals.extend(g.trait_lazy_vals);
     into.modules.extend(g.trait_modules);
 }
@@ -84,6 +89,7 @@ pub fn emit_opts(
         lambda_n: Cell::new(0),
         trait_impls: shared.impls,
         trait_vals: shared.vals,
+        trait_inits: shared.inits,
         trait_lazy_vals: shared.lazy_vals,
         trait_modules: shared.modules,
         library_abi: opts.library_abi,
@@ -110,6 +116,11 @@ struct Gen<'a> {
     trait_impls: HashMap<SymbolId, Vec<Tree>>,
     /// Trait `val` definitions with a right-hand side (`T$class.$init$`).
     trait_vals: HashMap<SymbolId, Vec<Tree>>,
+    /// What `T$class.$init$` actually runs: the entries of `trait_vals`
+    /// interleaved with the trait body's bare expression statements, in source
+    /// order (SLS 5.1). Kept apart from `trait_vals` because the accessor /
+    /// mixin-forwarder passes want the `val`s alone.
+    trait_inits: HashMap<SymbolId, Vec<Tree>>,
     /// Trait `lazy val` definitions. Unlike a plain `val` these are not set
     /// from `$init$`; every implementing class gets its own field, bitmap bit
     /// and accessor, exactly as nsc's mixin phase does.
@@ -2082,6 +2093,38 @@ fn extends_app(st: &SymbolTable, id: SymbolId) -> bool {
     class_extends_named(st, id, "App")
 }
 
+/// A bare expression statement in a template body — anything that is not a
+/// definition, an import or empty.
+///
+/// SLS 5.1: such a statement is part of the template's *initializer*. For a
+/// class it runs inside the primary constructor, for a trait inside `$init$`,
+/// for an `object` inside the module constructor — in every case interleaved
+/// with the `val`/`var` initializers in declaration order. Dropping them
+/// (which this backend used to do, since the constructor emitters filtered the
+/// body down to `ValDef`s) compiles silently and then simply does not run the
+/// code.
+fn is_template_stat(t: &Tree) -> bool {
+    !matches!(
+        t.kind,
+        TreeKind::DefDef { .. }
+            | TreeKind::TypeDef { .. }
+            | TreeKind::ClassDef { .. }
+            | TreeKind::ModuleDef { .. }
+            | TreeKind::ValDef { .. }
+            | TreeKind::Import { .. }
+            | TreeKind::PackageDef { .. }
+            | TreeKind::Empty
+    )
+}
+
+/// The template body entries the constructor has to run, in source order: the
+/// `val`/`var` initializers plus the bare statements between them.
+fn template_init_stats(body: &[Tree]) -> Vec<&Tree> {
+    body.iter()
+        .filter(|t| matches!(t.kind, TreeKind::ValDef { .. }) || is_template_stat(t))
+        .collect()
+}
+
 fn is_delayed_ctor_stat(t: &Tree) -> bool {
     match &t.kind {
         TreeKind::DefDef { .. }
@@ -2347,6 +2390,22 @@ impl<'a> Gen<'a> {
                         .collect();
                     if !vals.is_empty() && !tree.sym.is_none() {
                         self.trait_vals.insert(tree.sym, vals);
+                    }
+                    // `$init$` runs the `val` initializers *and* the trait
+                    // body's bare statements, in source order (SLS 5.1).
+                    let init_stats: Vec<Tree> = impl_
+                        .body
+                        .iter()
+                        .filter(|s| match &s.kind {
+                            TreeKind::ValDef { rhs, mods, .. } => {
+                                !rhs.is_empty() && !mods.flags.contains(Flags::LAZY)
+                            }
+                            _ => is_template_stat(s),
+                        })
+                        .cloned()
+                        .collect();
+                    if !init_stats.is_empty() && !tree.sym.is_none() {
+                        self.trait_inits.insert(tree.sym, init_stats);
                     }
                     let lazies: Vec<Tree> = impl_
                         .body
@@ -3242,10 +3301,8 @@ impl<'a> Gen<'a> {
         let super_outer = outer_field_class(self.st, super_cls);
         let class_name = b.this_name.clone();
         let st = self.st;
-        let inits: Vec<&Tree> = body
-            .iter()
-            .filter(|t| matches!(t.kind, TreeKind::ValDef { .. }))
-            .collect();
+        // `val` initializers *and* the body's bare statements, in source order.
+        let inits: Vec<&Tree> = template_init_stats(body);
         let max_locals = frame.next_slot.max(4);
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
@@ -3374,6 +3431,10 @@ impl<'a> Gen<'a> {
                             vd.ty.clone()
                         };
                         emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                    } else {
+                        // A bare statement of the template body (SLS 5.1),
+                        // in its source position among the `val` stores.
+                        gen_stat(asm, &mut frame, &ctx, vd);
                     }
                 }
             }
@@ -3655,8 +3716,8 @@ impl<'a> Gen<'a> {
     fn emit_trait_impl_class(&mut self, tree: &Tree, iface: &str) {
         let class_id = tree.sym;
         let methods = self.trait_impls.get(&class_id).cloned().unwrap_or_default();
-        let vals = self.trait_vals.get(&class_id).cloned().unwrap_or_default();
-        if methods.is_empty() && vals.is_empty() {
+        let inits = self.trait_inits.get(&class_id).cloned().unwrap_or_default();
+        if methods.is_empty() && inits.is_empty() {
             return;
         }
         let impl_name = format!("{}$class", iface);
@@ -3665,8 +3726,8 @@ impl<'a> Gen<'a> {
         for def in &methods {
             self.emit_trait_impl_method(&mut b, class_id, iface, def);
         }
-        if !vals.is_empty() {
-            self.emit_trait_init(&mut b, class_id, iface, &vals);
+        if !inits.is_empty() {
+            self.emit_trait_init(&mut b, class_id, iface, &inits);
         }
         self.out.push(b.finish());
     }
@@ -3676,7 +3737,9 @@ impl<'a> Gen<'a> {
         b: &mut ClassBuilder,
         trait_id: SymbolId,
         iface: &str,
-        vals: &[Tree],
+        // The `val` initializers interleaved with the trait body's bare
+        // statements, in source order.
+        inits: &[Tree],
     ) {
         let desc = format!("(L{iface};)V");
         let iface_owned = iface.to_string();
@@ -3686,7 +3749,7 @@ impl<'a> Gen<'a> {
         let source = self.source_name;
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
-        let vals = vals.to_vec();
+        let inits = inits.to_vec();
         let caps = trait_capture_accessors(self.st, boxed_vars, trait_id);
         let max_locals = 4 + caps.iter().map(|c| c.3.slots()).sum::<u16>();
         b.add_code(
@@ -3708,7 +3771,7 @@ impl<'a> Gen<'a> {
                     library_abi,
                     boxed_vars,
                 );
-                for vd in &vals {
+                for vd in &inits {
                     if let TreeKind::ValDef {
                         name, mods, rhs, ..
                     } = &vd.kind
@@ -3730,6 +3793,11 @@ impl<'a> Gen<'a> {
                         let sdesc = jvm_desc_val(st, &ty);
                         fill_boxed_unit_slot(asm, &sdesc);
                         asm.invokeinterface(&iface_owned, &setter, &format!("({sdesc})V"));
+                    } else {
+                        // A bare statement of the trait body (SLS 5.1): it runs
+                        // from `$init$`, in its source position among the `val`
+                        // setter calls.
+                        gen_stat(asm, &mut frame, &ctx, vd);
                     }
                 }
                 asm.vreturn();
@@ -5304,7 +5372,7 @@ impl<'a> Gen<'a> {
             .skip(1)
             .rev()
             .filter_map(|p| {
-                if !self.trait_vals.contains_key(&p) || !is_interface_sym(self.st, p) {
+                if !self.trait_inits.contains_key(&p) || !is_interface_sym(self.st, p) {
                     return None;
                 }
                 let iface = class_internal(self.st, p);
@@ -5323,10 +5391,8 @@ impl<'a> Gen<'a> {
     ) {
         let class_name = b.this_name.clone();
         let st = self.st;
-        let inits: Vec<&Tree> = body
-            .iter()
-            .filter(|t| matches!(t.kind, TreeKind::ValDef { .. }))
-            .collect();
+        // `val` initializers *and* the body's bare statements, in source order.
+        let inits: Vec<&Tree> = template_init_stats(body);
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
         let source = self.source_name;
@@ -5437,6 +5503,11 @@ impl<'a> Gen<'a> {
                             vd.ty.clone()
                         };
                         emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                    } else {
+                        // A bare statement of the module body (SLS 5.1): part
+                        // of module initialization, so it runs exactly once,
+                        // when `MODULE$` is created.
+                        gen_stat(asm, &mut frame, &ctx, vd);
                     }
                 }
             }

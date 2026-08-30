@@ -1,0 +1,14 @@
+n3;small;many;q33;acc6;f4;
+n2;small;many;q50;acc6;f3;sub2;
+Pt(3,4)
+pt3,4;norm25;
+hi
+greeter;
+true
+anon;
+local7;localz14;
+42
+42
+outer-stat;inner:outer;inner-v42;
+caught
+

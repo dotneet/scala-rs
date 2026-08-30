@@ -77,6 +77,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - packages / imports
 - objects / classes / traits / case classes。**補助コンストラクタ** `def this(...) = this(...)`（連鎖の先頭は `this(...)`。`super(...)` や文のあとの `this` は診断）。サブクラスの `extends C(1)` は primary が親 ctor を呼ぶ。内部クラスの `new Inner` は ctor overload 選択後も `$outer` を `<init>` の第一引数に残す。**case class の `copy(...)`**（positional / 一部省略時は自分自身の対応フィールドを default / 名前付き引数。`copy` は namer 時点ではまだ ctor フィールドの型が確定していないため、フィールド型解決後の typer フェーズで `copy` 自身の引数シンボルと `copy$default$N` を作り直す。private ランタイムでも動く）。**コンストラクタの省略可能引数**（`class C(x: Int, y: Int = 5)` の `new C(1)` / `new C(y = 2, x = 1)`）: 末尾を省略した呼び出しへのデフォルト値の充填は、通常の `def` の default getter 経由ではなく（`this` が無い呼び出し元では使えないため）呼び出し側でその場を型付けする素朴なフォールバックのみ実装（先行引数を参照するデフォルトは非対応）。**名前付き引数での並べ替えは `new C(...)` でも動く**（コンストラクタのオーバーロードはパラメータ名で絞ってから型で決める）
 - `val` / `var` / `def`（ネストした `def` はパースする）
+- **テンプレート本体の式文**（`class A { println("ctorA") }`）。SLS 5.1 / 5.3 どおり、class なら主コンストラクタ、trait なら `$init$`、`object` ならモジュール初期化の一部として、`val` / `var` の初期化と**宣言順に交互に**走る。早期の `require(...)` / `assert(...)`、`if` / `match` / `try` / ループ / ラムダ、`case class` / ローカルクラス / 匿名クラス / メンバ `object` の本体でも同じ。詳細は「テンプレート本体の式文」節
 - パラメータ、ラムダ（型付き / 期待型から推論）、ブロック。**placeholder `_`**（nsc `withPlaceholders`）: `_ + 1` / `_.abs` / `f(_)` / `xs.map(_ + 1)` / Function2 `_ + _` / 入れ子 `_.map(_ + 1)` に加え **typed `_ : T`**（`(_: Int) + 1` / `(_: Int) + (_: Int)` / `(_: Int).abs` / `xs.map((_: Int) + 1)`）。レキサが `_:` を `Ident("_")` にするので、式位置では Underscore と同じ placeholder にする。bare `(_: Int)` は `unbound placeholder parameter`。`xs.map(_ : Int)` は nsc どおり wrap せず map に Int が渡り mismatch。unary / Function2 の既存 wrap は触らない。**メソッド適用のセクション** `f(_, x)` / `f(_, _)` は期待型が無くても呼び先のシグネチャからパラメータ型を取る（nsc と同じ条件で、呼び先が単一の非ジェネリックメソッドのときだけ。`poly(_, 3)` や overload された `"abc".substring(_)` は `missing parameter type for expanded function` のまま）。合成パラメータはソース順で並べる（`two(_, _)` は `(a, b) => two(a, b)`）。**リテラルの本体は期待型の結果に対して検査する** ── `xs.foreach((x: Int) => x + 1)` は value discarding、`fl((x: Int) => x)` は `Int => Long` への数値拡大。パラメータ型を書いたリテラルはオーバーロード解決のために期待型より先に型付けられるので、そのぶんは `adapt` 側でやる。関数**値**は対象外で、`val h: Int => Int = …; fu(h)` は nsc どおり `type mismatch`
 - `if` / `else`、`while`、`do { ... } while (cond)`
 - `try` / `catch` / `finally`（catch は `{ case ... }`。`try/finally` と `try/catch/finally`。finally は正常終了と例外（catch からの throw 含む）の両方で走る。JVM 例外テーブルを出す。パーサは `finally` を落とさない）
@@ -1194,6 +1195,20 @@ val a = 1 +
 
 以前は「改行のあとの演算子は式の続き」と読んでいたため、上の 1 つ目が `{1} - 1` になり
 `value - is not a member of Nothing` のような診断になっていました。
+
+型の中でも改行は無条件には飛ばしません。`parse_compound_type` が `with` と refinement の
+`{` を探すところは nsc の `newLineOptWhenFollowedBy` と同じで、**改行の次が本当に
+`with` / `{` のときだけ**読み飛ばします。無条件に飛ばしていたころは
+
+```scala
+trait A {
+  val p: String
+  println("x")     // ← String println "x" という中置型に食われていた
+}
+```
+
+のように、右辺の無い宣言の次の行の文が型に飲まれていました。詳しくは
+「テンプレート本体の式文」節。
 
 なお、値を持つ式が**文の位置**に来たとき（`if (c) { buf += x }` や `x match { case … => 1 }`）は
 nsc の `genLoadIf` / `genLoadMatch` と同じく `expectedType = UNIT` で生成します。片側だけが値を
@@ -5718,6 +5733,92 @@ slick でも `ambiguous` 8 件は**行単位で完全に同一**でした。
   **この修正の前後で同じ**（`agent/integral` 以前のバイナリでも再現）で、
   pickle 由来の `object` メンバの形の問題です。implicit として選ばれる
   9 個は prelude 側で module として持っているので影響を受けません。
+
+### テンプレート本体の式文（`agent/ctorstmt`）
+
+`class A { println("ctorA") }` は型検査を通り、classfile も出て、**何も印字せずに**
+走っていました。`val` / `var` / `def` 以外のテンプレート本体の文（裸の式文）が、
+主コンストラクタにも trait の `$init$` にもモジュール初期化にも**一切入っていません**
+でした。診断は出ないので、気づけるのは実行結果の差だけです。
+
+SLS 5.1 / 5.3 では、テンプレート本体の文はテンプレートの**初期化子**の一部です。
+
+- **class**: 主コンストラクタの中で、`val` / `var` の初期化と**宣言順に交互に**走る
+- **trait**: `$init$` の中に入り、mixin 時に線形化順で走る
+- **object**: モジュール初期化（`MODULE$` を作るとき）に 1 度だけ走る
+
+原因は backend の 3 か所で、テンプレート本体を `ValDef` だけに絞っていたことです
+（`crates/backend/src/gen.rs`）。
+
+| 場所 | 直す前 | 直したあと |
+|---|---|---|
+| `emit_class_ctor` | `body.filter(ValDef)` | `template_init_stats(body)`（`ValDef` ＋裸の文をソース順に） |
+| `emit_module_init` | 同上 | 同上 |
+| `emit_trait_init` | `trait_vals`（`val` のみ） | `trait_inits`（`val` ＋裸の文をソース順に） |
+
+`ValDef` は今までどおり `gen_expr` ＋ `putfield`（trait なら mixin setter）で、
+裸の文は `gen_stat` で出します。`gen_stat` は値を残す式を捨てる既存の経路なので、
+`if` / `match` / `try` を**文の位置**で生成する（`expectedType = UNIT`）扱いも
+そのまま乗ります。
+
+`trait_vals` はアクセサ・mixin フォワーダの生成にも使われていて、そちらは `val` だけを
+見たいので、`$init$` が実際に走らせる並びは別のマップ `trait_inits` に持ちます。
+`T$class` を出すかどうかと、実装クラスが `$init$` を呼ぶかどうかの判定も
+`trait_inits` に切り替えました。これが無いと `trait T1 { note("T1") }` のように
+**本体が文だけの trait** に `$init$` がそもそも生成されません。
+
+`extends App` / `DelayedInit` の経路は元から `is_delayed_ctor_stat` で裸の文を
+拾っていたので、そちらは変わりません。
+
+#### `val x: T` の次の行の文が型に飲まれていた（パーサ）
+
+同じ「文が消える」現象のパーサ側の変種も直しました。
+
+```scala
+trait A {
+  val p: String
+  println("x")     // ← String println "x" という中置型になっていた
+}
+```
+
+`parse_compound_type` が、`with` と refinement の `{` を探すために改行を**無条件で**
+読み飛ばしていたため、文を切る NEWLINE まで消えて、次の行の識別子が中置型
+コンストラクタとして食われていました。nsc の `newLineOptWhenFollowedBy(LBRACE)` は
+「改行の次が本当に `{`（あるいは `with`）のときだけ読み飛ばす」ので、同じ
+`newline_opt_when_followed_by` を入れました（`crates/parser/src/parse.rs`）。
+直す前は `not found: type +` という無関係な診断になるか、右辺のある `val` なら
+文が黙って消えるかのどちらかでした。
+
+#### 検証
+
+fixture 接頭辞は `cs`、テストは `crates/cli/tests/ctorstmt.rs` です。
+どれも**私有ランタイムと jar の両モード**で `java -Xverify:all` して、
+実 scalac 2.13.16 の出力と突き合わせます。
+
+| fixture | 中身 | 期待 |
+|---|---|---|
+| `cs.scala` | class / trait / mixin / object の文、文と `val` の交互配置（class と trait の両方）、本体が文だけの trait、抽象 `val` のあとの文、本体の `var` を後続の文で更新、`O.v` を 2 回触ってもモジュール初期化は 1 回 | `A;T1;T2;B;` ほか。実 scalac と完全一致 |
+| `cs_forms.scala` | 早期の `require` / `assert`、`if` / `match` / `try` / `while` / ラムダ、`case class` 本体、ローカルクラス、匿名クラス（`new AnyRef { … }` と抽象メンバを実装する `new Greeter { … }`）、`$outer` 経路のメンバ `object` | 実 scalac と完全一致 |
+| `cs_bad.scala`（異常系） | class 本体の文の `notAMethod(1)`、trait 本体の文の `n.noSuchMember` | エラー 2 件（real scalac も同じ 2 行で 2 件） |
+
+`javap -p -c` で読んだ実 scalac の形も固定してあります。`Main$B()` は
+`invokespecial Main$A.<init>` → `T1.$init$` → `T2.$init$` → `Main$.note` の順で、
+これは私たちの出力と（trait の `$init$` を interface の static ではなく `T$class`
+に置くという既存の trait ABI の違いを除いて）同じです。
+
+#### Remaining
+
+- モジュールの初期化を、scalac は静的な `object` について `<clinit>` に畳んで
+  static フィールドへ書きます。こちらは `<init>` に置いてインスタンスフィールドへ
+  書きます（`agent/ctorstmt` 以前からの差）。どちらもモジュール初期化として
+  ちょうど 1 度走るので、観測できる差はありません。
+- 私有ランタイムの `require(cond, msg)` は例外メッセージに
+  `requirement failed: ` を付けません（jar モードと実 scalac は付ける）。
+  この修正とは独立の既存の差で、`cs_forms` はメッセージ本文に依存しない形に
+  してあります。
+- 早期定義（`new { val x = 1 } with T`）の中に**文**を書けるかどうかは
+  触っていません。nsc は early definition block に文を許しませんし、
+  こちらも `val` だけを pre-super に出す既存の経路のままです。
 
 ## ライセンス
 
