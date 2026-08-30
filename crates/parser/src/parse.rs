@@ -255,6 +255,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// nsc `newLineOptWhenFollowedBy`: a line break in front of `with` / `{`
+    /// is not a statement separator, so skip it — but *only* when that token
+    /// really is what follows. Skipping unconditionally eats the newline that
+    /// ends the enclosing statement, which made
+    /// `val p: String` + newline + `println("x")` parse as the infix type
+    /// `String println "x"` and silently swallow the statement.
+    fn newline_opt_when_followed_by(&mut self, pred: impl Fn(&TokenKind) -> bool) {
+        let skip = matches!(self.kind(), TokenKind::Newline) && pred(self.peek_non_nl());
+        if skip {
+            self.skip_nl();
+        }
+    }
+
     fn peek_non_nl(&self) -> &TokenKind {
         let mut i = self.pos;
         while i < self.tokens.len() && matches!(self.tokens[i].kind, TokenKind::Newline) {
@@ -1948,8 +1961,12 @@ impl<'a> Parser<'a> {
         }
         let t = self.parse_annot_type();
         let mut parents = vec![t.clone()];
+        let source3 = self.opts.source3;
         loop {
-            self.skip_nl();
+            self.newline_opt_when_followed_by(|k| {
+                matches!(k, TokenKind::With)
+                    || (source3 && matches!(k, TokenKind::Ident(s) if s == "&"))
+            });
             // `A with B`, and under `-Xsource:3` the Scala 3 spelling `A & B`.
             if matches!(self.kind(), TokenKind::With) || self.at_amp_intersection() {
                 self.bump();
@@ -1958,7 +1975,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        self.skip_nl();
+        self.newline_opt_when_followed_by(|k| matches!(k, TokenKind::LBrace));
         let refinements = if matches!(self.kind(), TokenKind::LBrace) {
             self.parse_refinement()
         } else {
