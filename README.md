@@ -80,7 +80,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - パラメータ、ラムダ（型付き / 期待型から推論）、ブロック。**placeholder `_`**（nsc `withPlaceholders`）: `_ + 1` / `_.abs` / `f(_)` / `xs.map(_ + 1)` / Function2 `_ + _` / 入れ子 `_.map(_ + 1)` に加え **typed `_ : T`**（`(_: Int) + 1` / `(_: Int) + (_: Int)` / `(_: Int).abs` / `xs.map((_: Int) + 1)`）。レキサが `_:` を `Ident("_")` にするので、式位置では Underscore と同じ placeholder にする。bare `(_: Int)` は `unbound placeholder parameter`。`xs.map(_ : Int)` は nsc どおり wrap せず map に Int が渡り mismatch。unary / Function2 の既存 wrap は触らない。**メソッド適用のセクション** `f(_, x)` / `f(_, _)` は期待型が無くても呼び先のシグネチャからパラメータ型を取る（nsc と同じ条件で、呼び先が単一の非ジェネリックメソッドのときだけ。`poly(_, 3)` や overload された `"abc".substring(_)` は `missing parameter type for expanded function` のまま）。合成パラメータはソース順で並べる（`two(_, _)` は `(a, b) => two(a, b)`）。**リテラルの本体は期待型の結果に対して検査する** ── `xs.foreach((x: Int) => x + 1)` は value discarding、`fl((x: Int) => x)` は `Int => Long` への数値拡大。パラメータ型を書いたリテラルはオーバーロード解決のために期待型より先に型付けられるので、そのぶんは `adapt` 側でやる。関数**値**は対象外で、`val h: Int => Int = …; fu(h)` は nsc どおり `type mismatch`
 - `if` / `else`、`while`、`do { ... } while (cond)`
 - `try` / `catch` / `finally`（catch は `{ case ... }`。`try/finally` と `try/catch/finally`。finally は正常終了と例外（catch からの throw 含む）の両方で走る。JVM 例外テーブルを出す。パーサは `finally` を落とさない）
-- `match`（コンストラクタパターン、リテラル、ワイルドカード、Java enum 定数の安定識別子 `Thread.State.NEW`、`x @ Pat` の束縛、`case null`）
+- `match`（コンストラクタパターン、リテラル、ワイルドカード、Java enum 定数の安定識別子 `Thread.State.NEW`、`x @ Pat` の束縛、`case null`、入れ子の抽出子 `case P(v) :: t`。どの case にも当たらなければ `scala.MatchError`）
 - for-comprehension（`map` / `flatMap` / `foreach` / `withFilter` へデシュガー。私有ランタイムでは `List.withFilter` は eager な `List`。`--scala-library` 時は `scala.collection.WithFilter[+A, +CC[_]]` で、`map[B]` は `CC[B]` を返す。`Option.withFilter` は `Option$WithFilter`）。値定義 `q = e` はラムダ本体の `val` になる ── **生成子ではない**ので、その前の生成子はやはり最内で `map` を取る。値定義の**後ろのガード**は nsc のタプル化が要るので診断する
 - apply / select / infix（`:` 終わりの演算子は右結合で、レシーバは右オペランド。`1 :: Nil` → `Nil.::(1)`）。代入 `xs(i) = v` は nsc どおり `xs.update(i, v)`。代入でない `c(1)` で `apply` が無ければ診断する（黙って `update` にしない）
 - リテラル、タプル
@@ -873,6 +873,52 @@ if (recv == null) arg == null else recv.equals(arg)
 ```
 
 両辺を先にローカルへ落としてから分岐するので、どの分岐先でもオペランドスタックは空です。
+
+### 入れ子のパターン（`case P(v) :: t`）
+
+**取り出した値を、部分パターン自身の型へ先に `checkcast` してはいけません。** nsc は
+取り出した値を**取り出し元の静的型**へ絞り（`List[C]` の `$colon$colon.head` なら
+`checkcast C`）、そのあとで部分パターンの `instanceof P` → `ifeq <次の case>` →
+`checkcast P` を出します。scala-rs は部分パターンの型へ無条件に `checkcast` していたので、
+`case P(v) :: t` は head が `P` でないリストすべてで `ClassCastException` になっていました
+（型検査は通るので、実行するまで分かりません）。`case h :: t` 単体が動いていたのは、
+束縛だけの部分パターンには絞り込みが要るからです。
+
+判定は `reads_erased_value`（`crates/backend/src/gen.rs`）にまとめ、部分パターンを束ねる
+すべての経路（case class のコンストラクタパターン、`unapply` の結果、`unapplySeq` の要素）で
+共有しています。**テストする**部分パターン（`P(...)` / `Foo(...)` / `_: T` / 定数 /
+安定識別子 / `x @ Pat`）は取り出したままの値を受け取り、**束縛だけ**の識別子パターンだけが
+絞り込みを受けます。これで次が全部直りました。
+
+| 形 | 直る前 |
+| --- | --- |
+| `case P(v) :: t` / `case P(a) :: P(b) :: _` / `case h :: P(v) :: _` | `ClassCastException` |
+| `case (p @ P(v)) :: t` | 同上（`@` の内側がテストでも絞っていた） |
+| `case Some(P(v))` / `case Some(Nil)` | 同上 |
+| `case Some(1)`（`Option[Any]`） | `Integer` へ unbox して `ClassCastException`。nsc と同じく box したまま `BoxesRunTime.equals` で比べます |
+
+`unapply` の呼び出し口も 2 か所直しました。入れ子の extractor は消去された `Object` を
+受け取るので、`unapply` のディスクリプタが要求する型へ `checkcast` します。そのうえで、
+スクルーティニの静的型が extractor の引数型に適合していないとき（`Option[Any]` に対する
+`case Some(Two(a, b))`）は、nsc と同じく `instanceof` → `ifeq` を前に置いて**次の case へ
+落とします**（以前は検証すら通りませんでした）。また `Option[(A, B)]` の結果を `dup` で
+スタックに載せたまま部分パターンが次の case へ飛んでいたため、ユーザー定義の中置 extractor
+（`case P(v) ~ _`）は `VerifyError: Inconsistent stackmap frames` でした。タプルはローカルへ
+落としてから読みます。`Tuple3` 以上を返す `unapply` も、アリティに関わらず
+`checkcast scala/Tuple2` していたのを、`scala/TupleN` の `_1()` … `_n()` に直しました
+（`Tuple2` だけは 2.13 でもフィールドが public なので `getfield` のままです）。
+
+コンストラクタパターンのアリティは typer が見ます。`case P(a, b)` を 1 フィールドの `P` に
+当てると、以前は `b` が `Any` で通ってしまい backend が実行時に
+`RuntimeException("pattern arity")` を投げていました。可変長の最終パラメータは対象外です。
+
+### 尽きた `match`（`MatchError`）
+
+どの case にも当たらなかった `match` は、nsc と同じく **`scala.MatchError` にスクルーティニを
+持たせて** 投げます（以前は `RuntimeException("match error")` で、`case _: MatchError` では
+捕まらず、どの値で落ちたのかも分かりませんでした）。プリミティブのスクルーティニは box して
+渡します。私有ランタイムには `scala/MatchError` を生成するので（`crates/backend/src/runtime.rs`）、
+両モードで同じクラス・同じメッセージ書式（`<値> (of class <クラス名>)`、`null` なら `null`）です。
 
 ### AnyVal（値クラスと universal trait）
 
@@ -2687,6 +2733,25 @@ null 受け手（`(null: String) == "a"` が NPE になっていた）を見ま�
 library dual-run 専用です。`pb_null_bad.scala` は `(x: Int) match { case null => … }` が
 nsc と同じく `type mismatch; found: Null(null)` になることを固定します。
 
+`agent/conspat` スライス（`::` の中に入れ子の抽出子がある形、`unapply` の呼び出し口、
+尽きた `match` の `MatchError`）のフィクスチャは接頭辞 `cp`
+（`cp_cons` / `cp_infix` / `cp_seq` / `cp_err` / `cp_cons_bad`）で、コンフリクト回避のため
+`crates/cli/tests/conspat.rs` に置いています。これも**型検査は通って実行時に落ちていた**
+バグなので、テストは 3 通り（私有ランタイム / `--scala-library` / 実 scalac 2.13.16）走らせて
+stdout が全部一致することを見ます。`expected/cp_*.txt` は実 scalac の出力そのものです。
+`cp_cons.scala` は `case P(v) :: t`、深さ 2（`case P(a) :: P(b) :: _`）、`::` の右の抽出子
+（`case _ :: P(v) :: _`）、タプル（`case (a, b) :: _`）、ガード付き、`@` 束縛
+（`case (p @ P(v)) :: _`）、型パターン（`case (p: P) :: _`）、`case Some(P(v))`、
+`Option[Any]` に対する定数パターン、`case P(v) :: Nil` / `case Some(Nil)` の安定識別子、
+それに従来から動いていた `case h :: t` を 1 本にまとめてあります。`cp_infix.scala` は
+ユーザー定義の中置抽出子（`object ~`）と、抽出子の引数型がスクルーティニより狭い形
+（`Option[Any]` に対する `case Some(Two(a, b))`）です。この 2 本は**私有ランタイムでも**
+走ります。`cp_seq.scala` は `case List(P(a), Q)` / `case Seq(P(a), _*)` と `Tuple3` を返す
+`unapply` で、`Seq` / `List` の抽出子パターンと `Tuple3` が jar にしか無いので library
+dual-run 専用です。`cp_err.scala` は尽きた `match` が `scala.MatchError` になること
+（クラス名とメッセージの両方）を両モードで見ます。`cp_cons_bad.scala` は
+`case P(a, b)`（アリティ違い）と `case Nope(a) :: _`（無い抽出子）が診断されることを固定します。
+
 trait の `val` / `override val` / `var` の実行時表現と `case object` の合成メンバーのフィクスチャは接頭辞 `tval`（`tval` / `tval_bad`）で、同じ理由から `crates/cli/tests/traitval.rs` に置いています。`tval.scala` は私有ランタイム（`--no-scala-library`）と library dual-run の両方で走らせ、`expected/tval.txt` は **real scalac 2.13.16 の出力そのもの**です（3 モードがバイト単位で一致することを確認済み）。バイトコード側の不変条件も 2 本のテストで固定しています。`trait_val_setters_follow_nsc_names` は mixin setter が nsc と同じ `Named$_setter_$label_$eq` であること、`override val` したクラスのその setter が空実装（`putfield` なし）であること、trait の `var` への代入が `putfield` ではなく `count_$eq` 呼び出しであることを `javap -p -c` で見ます。`case_object_members_are_on_the_module_class` は `Asc$` に `toString` / `productPrefix` / `hashCode` / `productArity` が出ていることを見ます。`tval_bad.scala` は trait の `val` への代入が `reassignment to val` になることを固定します。
 
 値クラス + universal trait、`}` の次の行の単項マイナス、`X.type` の名前解決のフィクスチャは
@@ -3714,6 +3779,24 @@ required: DBIOAction[R, S, E]`、**増えたものはありません**。slick �
 （どちらも実 scalac との差分から出てきたものです）。
 
 ### Remaining
+
+- **`+:` / `:+` のパターン**（`agent/conspat` で確認）。`case P(v) +: _` /
+  `case _ :+ P(v)` は `not found: value +:` / `not found: extractor +:` です。
+  `scala.collection.+:` / `:+` という抽出子オブジェクト自体が prelude にも
+  pickle 経路にも無く、`::` のような特別扱いもありません。入れ子パターンの穴
+  （本節の `case P(v) :: t`）はこの 2 つには**無い**ことを確認済みですが、
+  それは動く前に型検査で落ちるからです。
+
+- **私有ランタイムの `Tuple3` 以上と `List.apply` / `Seq` 抽出子**
+  （`agent/conspat` で確認）。`--no-scala-library` では `not found: value Tuple3` /
+  `value apply is not a member of List$` / `not found: extractor Seq` と診断が
+  出ます（黙って通ってはいません）。`cp_seq.scala` を library dual-run 専用に
+  してあるのはこのためです。
+
+- **私有ランタイムの `List` に Scala 版 `toString` が無い**（`agent/conspat` で
+  確認）。jar モードの `List(Q)` に対して `scala.collection.immutable.$colon$colon@…`
+  になるので、`MatchError` のメッセージがリストのときだけ 2 モードで違います
+  （`cp_err.scala` はそこだけクラス名で比べています）。
 
 - **`"abc".appended(1)` のような `B >: Char` の下限推論**（`agent/stringops8`
   で確認）。scalac は `B := AnyVal` と lub を取って `IndexedSeq[AnyVal]` を

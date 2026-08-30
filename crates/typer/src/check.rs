@@ -12723,14 +12723,44 @@ impl Typer {
                         self.check_missing_seq_factory(c, pat.span);
                     }
                 }
+                // A constructor pattern binds one sub-pattern per field. A class
+                // that also has an `unapply` of its own may take a different
+                // number (slick's `LiteralNode(v)` on a three-field class), so
+                // the constructor only wins when its arity fits; otherwise the
+                // extractor branches below get their turn. A repeated last
+                // parameter takes any number.
+                let ctor_fits = class_id.is_some_and(|c| {
+                    let fields = &self.st.get(c).ctor_fields;
+                    args.len() == fields.len()
+                        || fields
+                            .last()
+                            .is_some_and(|f| matches!(self.st.get(*f).ty, Type::Repeated(_)))
+                });
+                let has_extractor = unapply.is_some() || unapply_seq.is_some();
                 let use_ctor = !has_star
                     && class_id.is_some_and(|c| {
                         let s = self.st.get(c);
                         s.flags.contains(Flags::CASE) || !s.ctor_fields.is_empty()
-                    });
+                    })
+                    && (ctor_fits || !has_extractor);
                 if use_ctor {
                     let class_id = class_id.unwrap();
                     let fields = self.st.get(class_id).ctor_fields.clone();
+                    // Nothing said so before: `case P(a, b)` on a one-field `P`
+                    // with no `unapply` to fall back on typed `b` as `Any` and
+                    // reached the backend, which threw a
+                    // `RuntimeException("pattern arity")` at run time.
+                    if !ctor_fits {
+                        self.error(
+                            pat.span,
+                            format!(
+                                "wrong number of arguments for pattern {}: expected {}, found {}",
+                                self.st.get(class_id).name,
+                                fields.len(),
+                                args.len()
+                            ),
+                        );
+                    }
                     // `case Some(x)` on an `Option[Int]` binds `x: Int`: recover
                     // the pattern class's arguments from the scrutinee.
                     let cargs = self.pattern_class_args(class_id, sel_ty);
@@ -12759,8 +12789,10 @@ impl Typer {
                         self.error(
                             pat.span,
                             format!(
+                                // The symbol is always spelled `unapply`; name
+                                // the extractor the source names.
                                 "extractor {} expects {} argument(s), found {}",
-                                self.st.get(u).name,
+                                fun.name().unwrap_or("<pattern>"),
                                 extracted.len(),
                                 args.len()
                             ),
