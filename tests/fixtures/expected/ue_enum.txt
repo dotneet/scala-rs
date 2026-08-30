@@ -1,0 +1,21 @@
+(Red,0,10)
+(1,2)
+List(Red, Green, Blue, custom)
+true
+Blue
+Color.ValueSet(Red, Green)
+custom
+11
+Green
+4
+true
+red
+custom!
+other:Blue
+(1,2,3)
+List(Mon, tuesday, Wed)
+tuesday
+Mon
+true
+List(0, 1, 2, 10)
+no such: No value found for 'nope'

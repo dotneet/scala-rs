@@ -22,6 +22,7 @@ mod prelude_conform;
 mod prelude_durrange;
 mod prelude_either;
 mod prelude_empty;
+mod prelude_enum;
 mod prelude_fntuple;
 mod prelude_genrep;
 mod prelude_hier;

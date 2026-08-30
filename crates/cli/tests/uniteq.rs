@@ -301,10 +301,17 @@ fn ue_enum_matches_real_scalac() {
 /// one.
 #[test]
 fn ue_enum_private_runtime_is_diagnosed() {
-    private_compile_fails("ue_enum", &["error", "Enumeration"]);
+    private_compile_fails("ue_enum", &["error", "not found: value Value"]);
 }
 
 #[test]
 fn ue_enum_bad_is_rejected() {
-    compile_fails("ue_enum_bad", &["error"]);
+    compile_fails(
+        "ue_enum_bad",
+        &[
+            "no matching overload",
+            "value nosuchMember is not a member",
+            "type mismatch",
+        ],
+    );
 }

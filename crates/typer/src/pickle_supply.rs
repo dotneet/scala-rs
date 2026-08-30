@@ -172,6 +172,23 @@ impl PickleSupply {
                 }
             }
         }
+        // An *inherited* library member. `complete_named` reads a pickle only
+        // for a library (or adopted) class, so a user class that extends one
+        // gained nothing the prelude had not hand-written: `object Color
+        // extends Enumeration` had no `values`, no `withName`, no `maxId`.
+        // Ask the library ancestors themselves -- the member is installed on
+        // the ancestor that declares it, which is the class the JVM call has
+        // to name anyway, and ordinary member lookup finds it from there.
+        //
+        // Only when nothing else matched, so this stays additive.
+        if out.is_empty() {
+            for anc in library_ancestors(st, class_sym) {
+                out = self.complete_on(st, bin, anc, name);
+                if !out.is_empty() {
+                    break;
+                }
+            }
+        }
         out
     }
 
@@ -2123,6 +2140,42 @@ fn is_default_getter(name: &str) -> bool {
         return false;
     };
     !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+}
+
+/// `cls`'s ancestors that are standard-library classes, nearest first.
+///
+/// Linearization order (parents last-first, breadth-first) so a member a
+/// subclass's own library parent declares wins over a grandparent's, exactly
+/// as `Check::enter_inherited_members` orders the scope. `cls` itself is not
+/// included: `complete_named` has already been asked about it.
+fn library_ancestors(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
+    let mut out = Vec::new();
+    let mut seen: Vec<u32> = vec![cls.0];
+    let mut work: std::collections::VecDeque<SymbolId> = st
+        .get(cls)
+        .parents
+        .iter()
+        .rev()
+        .filter_map(|p| st.class_sym_of(p))
+        .collect();
+    while let Some(c) = work.pop_front() {
+        if seen.contains(&c.0) || seen.len() > 256 {
+            continue;
+        }
+        seen.push(c.0);
+        let jvm = &st.get(c).jvm_name;
+        // `scala/Any`, `scala/AnyRef` and friends have no pickle of their own
+        // and would only cost a classfile miss per name.
+        if jvm.starts_with("scala/") && jvm != "scala/Any" && jvm != "scala/AnyRef" {
+            out.push(c);
+        }
+        for p in st.get(c).parents.iter().rev() {
+            if let Some(ps) = st.class_sym_of(p) {
+                work.push_back(ps);
+            }
+        }
+    }
+    out
 }
 
 /// Whether `cls` already has `target` somewhere above it.
