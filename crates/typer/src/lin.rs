@@ -70,7 +70,42 @@ fn lin(st: &SymbolTable, cls: SymbolId, depth: u32) -> Vec<SymbolId> {
         .collect();
     lists.push(parents.iter().rev().copied().collect());
     let mut out = vec![cls];
-    out.extend(c3_merge(lists));
+    // `cls` heads its own linearization; a cyclic `extends` graph that reaches
+    // it again must not list it twice.
+    out.extend(
+        dedup_keep_last(c3_merge(lists))
+            .into_iter()
+            .filter(|&b| b != cls),
+    );
+    out
+}
+
+/// Drop every repeat of a class, keeping its **last** position.
+///
+/// SLS 5.1.2 builds `L(C) = C, L(Cn) +: … +: L(C1)`, and `a +: b` deletes from
+/// `a` whatever `b` already lists — so when a class is reachable through two
+/// parents, the *later* list decides where it sits. `c3_merge` above cannot
+/// always honour that: when the two parents impose contradictory orders it
+/// falls back to `lists[0][0]` and emits the class again later from the list
+/// that really owns it.
+///
+/// Java's collections hit this constantly, because a Java class re-`implements`
+/// an interface its own superclass already implements:
+/// `class LinkedHashMap<K,V> extends HashMap<K,V> implements Map<K,V>`. The
+/// fallback put `java.util.Map` at index 2 and `java.util.HashMap` at index 3,
+/// and since only a *more derived* base can implement a deferred member,
+/// `HashMap.put` no longer counted as implementing `Map.put` —
+/// `class Cache extends java.util.LinkedHashMap[String, Int]` was told it
+/// "needs to be abstract" over eight members `HashMap` and `AbstractMap`
+/// define. Keeping the last occurrence is precisely `+:`, and it also removes
+/// the duplicates, which nothing downstream wants.
+fn dedup_keep_last(v: Vec<SymbolId>) -> Vec<SymbolId> {
+    let mut out: Vec<SymbolId> = Vec::with_capacity(v.len());
+    for (i, &x) in v.iter().enumerate() {
+        if !v[i + 1..].contains(&x) {
+            out.push(x);
+        }
+    }
     out
 }
 

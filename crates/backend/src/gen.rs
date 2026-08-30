@@ -6726,6 +6726,12 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
             gen_try(asm, frame, ctx, block, catches, finalizer, &Type::Unit);
         }
         _ => {
+            // nsc's `genLoad(tree, UNIT)`: a discarded value is *dropped*, not
+            // adapted to the type the typer wrote.
+            if let Some(inner) = discarded_unbox(tree) {
+                gen_stat(asm, frame, ctx, inner);
+                return;
+            }
             gen_expr(asm, frame, ctx, tree);
             if is_unit_like(&tree.ty) {
                 // A polymorphic method instantiated at `Unit` still *returns* a
@@ -6745,6 +6751,28 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
             }
         }
     }
+}
+
+/// The operand of a discarded `$unbox`.
+///
+/// The typer wraps a call whose erased result is `java/lang/Object` in
+/// `$unbox` so the primitive the signature promises is on the stack.
+/// nsc inserts that adaptation from the *expected* type, and in statement
+/// position the expected type is `Unit` — so it emits `invokevirtual put; pop`
+/// and never touches the value. Unboxing only to `pop` is not merely wasted
+/// work: `java.util.Map[String, Int].put` returns the *previous* value, so
+/// `m.put("a", 1)` on a fresh map unboxed `null` and threw
+/// `NullPointerException` at the first insert while scalac ran fine. Every
+/// erased generic result read for effect has this shape (`map.remove(k)`,
+/// `list.set(i, x)`, `buf.remove(0)`, …).
+fn discarded_unbox(tree: &Tree) -> Option<&Tree> {
+    let TreeKind::Apply { fun, args } = &tree.kind else {
+        return None;
+    };
+    if fun.name() != Some("$unbox") {
+        return None;
+    }
+    args.first()
 }
 
 /// nsc: a call whose *declared* return type is `Nothing` can never actually
@@ -9455,7 +9483,20 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
         return;
     }
     if s.flags.contains(Flags::STATIC) {
-        asm.invokestatic(&owner, name, &desc);
+        // JVMS 4.4.2: a method declared by an *interface* -- `static` ones
+        // included -- must be named by a `CONSTANT_InterfaceMethodref`, never
+        // a `CONSTANT_Methodref`. The instruction is still `invokestatic`;
+        // only the constant's tag differs. Emitting a plain `Methodref` type
+        // checked fine and then died at the first call with
+        // `IncompatibleClassChangeError: Method '…java.util.Map.entry(…)'
+        // must be InterfaceMethodref constant` -- a silent miscompile of
+        // every Java 9+ interface factory (`Map.entry`, `List.of`, `Set.of`,
+        // `Comparator.comparing`, …).
+        if is_interface_sym(ctx.st, owner_id) && !is_module_class(ctx.st, owner_id) {
+            asm.invokestatic_interface(&owner, name, &desc);
+        } else {
+            asm.invokestatic(&owner, name, &desc);
+        }
         maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
         return;
     }

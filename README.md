@@ -64,7 +64,7 @@ java -cp out:scala-library-2.13.16.jar Main
 - `-Xfatal-warnings` — warning をエラーにする（非網羅 match など）
 - `-Xsource:<version>` — ソースレベル。`2.13`（既定）/ `3` / `3-cross`。`3` 系は **Scala 3 の綴り**（このサブセットでは `A & B` の交差型）を受け付ける。nsc と同じく現行メジャー未満（`-Xsource:2.12` など）はエラー
 - `--scala-library <jar>` — scala-library 2.13 にリンク（私有 Option/List を出さない）。環境変数 `SCALA_LIBRARY_JAR` でも可。パス省略時は自動検出。**`compile` / `run` の既定は自動検出できた jar。見つからなければ私有。`--no-scala-library` で私有を強制**
-- `-cp` / `--class-path` — 先にコンパイルした classfile を読む（`ScalaSignature` pickle subset と JVM メソッド。vals / パラメータ付き defs / 型パラメータ / `$default$n` ゲッター / case class の ctor フィールドを含む。自前 `-cp` は companion `apply` も読む。nsc は companion apply `Point(...)` / term `Point` / extractor `unapply` / `List[_]` の existentials / `List[_ <: AnyRef]` / `List[_ <: List[_]]` / `@deprecated("msg", "2.13.0")` の annotation args / Java `@Deprecated`（SYMANNOT + `java.lang.Deprecated`） / `this.type` / `Int @unchecked` / refinement `A with B { def f: Int }` も読む）。**jar の中の Scala クラス**は `ScalaSignature` pickle をそのまま読みます（`crates/pickle`。高階型パラメータ `F[_]` と `F[A]` を含む。読めなかったメンバだけ JVM signature に落ちる。`scala.*` / `java.*` は対象外。先読みはせず 1 クラスずつ。「jar のクラスを pickle から読む」節）。**Java の `.class`** も同じ `-cp` / jar / jmod / JDK（`java.base.jmod` や `rt.jar`）からオンデマンドで読む（ScalaSignature の無い pickle-less Java は pickle インストーラに載せない。`JAVA` / `protected` / `static` を落とさないため）。prelude に無い JDK クラスのメソッド・フィールド（`java.lang.Math.abs` / `java.util.ArrayList#add`）を解決する。**Signature 属性**があればジェネリックを raw にしない（`ArrayList[String]#get` は `E`＝`String`。無ければ `Object` のまま `String` へは通さない）。**ワイルドカード／型パラメータ境界**（`Class[*]` → `Class[_]`、`Collection<+TT>` → `Collection[_ <: T]`、`<T:Number>` の hi bound）は存在型として残し raw `Object` にしない。`ArrayList[Byte] <: List[_ <: T]` は親ウォークより先にワイルドカードを照合し、継承した `add` は `drop_overridden` する。**静的 inner**（`java.util.Map.Entry` / `AbstractMap.SimpleEntry`）と **Java varargs**（`ACC_VARARGS` の `String.format` / `Arrays.asList`。Scala `Seq` wrap ではなく `Object[]`）も classfile から読む。Java の `throws` 検査例外は Scala と同様チェックしない。**Java `protected`** は同じパッケージかサブクラス（nsc / JLS）から見え、それ以外は診断する。Scala の `Base.secretStatic()` は Java クラスの `MODULE$` を出さず `invokestatic` する。ScalaSignature pickle だけに頼らない。**Java enum**（`ACC_ENUM` のクラスと定数。`values` / `valueOf` は classfile の static。非 enum に `values` を合成しない）。未対応の classfile 機能（未知 CP tag、`ACC_MODULE`、壊れた magic）は診断する（黙って成功にしない）
+- `-cp` / `--class-path` — 先にコンパイルした classfile を読む（`ScalaSignature` pickle subset と JVM メソッド。vals / パラメータ付き defs / 型パラメータ / `$default$n` ゲッター / case class の ctor フィールドを含む。自前 `-cp` は companion `apply` も読む。nsc は companion apply `Point(...)` / term `Point` / extractor `unapply` / `List[_]` の existentials / `List[_ <: AnyRef]` / `List[_ <: List[_]]` / `@deprecated("msg", "2.13.0")` の annotation args / Java `@Deprecated`（SYMANNOT + `java.lang.Deprecated`） / `this.type` / `Int @unchecked` / refinement `A with B { def f: Int }` も読む）。**jar の中の Scala クラス**は `ScalaSignature` pickle をそのまま読みます（`crates/pickle`。高階型パラメータ `F[_]` と `F[A]` を含む。読めなかったメンバだけ JVM signature に落ちる。`scala.*` / `java.*` は対象外。先読みはせず 1 クラスずつ。「jar のクラスを pickle から読む」節）。**Java の `.class`** も同じ `-cp` / jar / jmod / JDK（`java.base.jmod` や `rt.jar`）からオンデマンドで読む（ScalaSignature の無い pickle-less Java は pickle インストーラに載せない。`JAVA` / `protected` / `static` を落とさないため）。prelude に無い JDK クラスのメソッド・フィールド（`java.lang.Math.abs` / `java.util.ArrayList#add`）を解決する。**Signature 属性**があればジェネリックを raw にしない（`ArrayList[String]#get` は `E`＝`String`。無ければ `Object` のまま `String` へは通さない）。**ワイルドカード／型パラメータ境界**（`Class[*]` → `Class[_]`、`Collection<+TT>` → `Collection[_ <: T]`、`<T:Number>` の hi bound）は存在型として残し raw `Object` にしない。`ArrayList[Byte] <: List[_ <: T]` は親ウォークより先にワイルドカードを照合し、継承した `add` は `drop_overridden` する。**静的 inner**（`java.util.Map.Entry` / `AbstractMap.SimpleEntry`。入れ子側の `Signature` にある**入れ子自身の型パラメータ**を含む — `Map.Entry[K, V]`）と **Java varargs**（`ACC_VARARGS` の `String.format` / `Arrays.asList`。Scala `Seq` wrap ではなく `Object[]`）も classfile から読む。**インタフェースの `static` メソッド**（`Map.entry` / `List.of`）は JVMS 4.4.2 のとおり定数プールで `CONSTANT_InterfaceMethodref`（`invokestatic` 命令はそのまま）。Java の `throws` 検査例外は Scala と同様チェックしない。**Java `protected`** は同じパッケージかサブクラス（nsc / JLS）から見え、それ以外は診断する。Scala の `Base.secretStatic()` は Java クラスの `MODULE$` を出さず `invokestatic` する。ScalaSignature pickle だけに頼らない。**Java enum**（`ACC_ENUM` のクラスと定数。`values` / `valueOf` は classfile の static。非 enum に `values` を合成しない）。未対応の classfile 機能（未知 CP tag、`ACC_MODULE`、壊れた magic）は診断する（黙って成功にしない）
 
 フィクスチャはデフォルトパッケージ（`package` 句なし）なので、`-cp out` の `Main` でそのまま動く想定です。
 
@@ -6643,6 +6643,147 @@ slick の計測は `files=184 errors=327 files_with_errors=64` →
 - `##` は `scala.runtime.Statics.anyHash` を無条件に呼ぶので、私有ランタイムでは
   `NoClassDefFoundError` になります（`Unit` に限らず `1.##` も同じ）。
   これも既存の穴で、`ue_eqlib` を jar 限定にしてある理由の 1 つです。
+
+### 入れ子の Java インタフェースとインタフェースの static（`agent/javanest`）
+
+Java 相互運用の 2 件と、1 件目にぶら下がっていたカスケード 2 件です。
+
+#### 1. 入れ子の Java ジェネリックインタフェースが型パラメータを失う
+
+```scala
+val e: java.util.Map.Entry[String, Int] = it.next()
+// error: Entry does not take type parameters
+```
+
+`java.util.Map$Entry` は `interface Map<K,V> { interface Entry<K,V> {…} }` で、
+**入れ子側にも独自の型パラメータ**があります。それを書いているのは
+`java/util/Map$Entry.class` の `Signature` 属性で、classfile リーダはこれを
+きちんと読んでいました（`crates/typer/src/javaclass.rs`）。
+
+原因はその手前です。`Map.entrySet()` の generic signature が
+`java/util/Map$Entry` を**名指しする**ので、`java/util/Map.class` を読むだけで
+`Entry` が親も型パラメータも無い**スタブ**としてシンボル表に入ります。
+`complete_binary_member`（`crates/typer/src/check.rs`）は所有者がクラスのとき
+「メンバが見つかったら戻る」だけで、見つけたのがそのスタブでも
+`java/util/Map$Entry.class` を読みに行きませんでした。見つけたメンバがクラスなら
+`ensure_java_loaded` を掛けるようにして直しています。
+
+#### 1a. 線形化が同じクラスを 2 度出していた（SLS 5.1.2）
+
+`class Cache extends java.util.LinkedHashMap[String, Int]` は、入れ子の型が
+直ったあとも **`class Cache needs to be abstract.`** のままでした。`HashMap` と
+`AbstractMap` が定義している `size` / `isEmpty` / `containsKey` / `put` /
+`remove` / `putAll` / `equals` / `hashCode` の 8 本が「未実装」と言われます。
+
+線形化を出してみると `java/util/Map` が **3 回**現れていて、しかも最初の 1 回が
+`java/util/HashMap` より**手前**でした。抽象メンバ検査は「より派生した基底だけが
+実装しうる」＝ `lin[..bi]` しか見ないので、`HashMap.put` が `Map.put` の実装として
+数えられません。
+
+`crates/typer/src/lin.rs` の C3 マージは、2 つの親が矛盾した順序を課したときに
+`lists[0][0]` へフォールバックし、そこで同じクラスを二重に出していました。
+Java のクラスは自分のスーパークラスが既に `implements` しているインタフェースを
+もう一度 `implements` するのが普通で（`class LinkedHashMap<K,V> extends
+HashMap<K,V> implements Map<K,V>`）、この形が毎回そこに落ちます。
+
+SLS 5.1.2 の `L(C) = C, L(Cn) +: … +: L(C1)` は、`a +: b` が「`b` に既にあるものを
+`a` から落とす」定義なので、**後ろの位置が勝ちます**。そこでマージ結果から
+**最後の出現だけを残す**ようにしました。これは `+:` そのもので、重複も消えます。
+
+```
+直す前: Cache, LinkedHashMap, Map, HashMap, Serializable, Cloneable, Map, AbstractMap, Map
+直したあと: Cache, LinkedHashMap, HashMap, Serializable, Cloneable, AbstractMap, Map
+```
+
+#### 1b. `Object` と superclass chain が実装するもの（JLS 9.2）
+
+Java のインタフェースは `equals` / `hashCode` を deferred で**再宣言**しますし
+（`java.util.Map`、`java.util.Map.Entry`、…）、スーパーインタフェースのメソッドも
+再宣言します（`java.util.List` が `java.util.Collection.containsAll` を）。
+
+`full_lin` は backend の mixin 機構に見せないために `Object` / `AnyRef` / `Any`
+を**列の最後**に足すので、`lin[..bi]` にはまず入りません。`Object` は実際には
+そのクラスの究極のスーパークラスなので、その具象メンバは常に実装として数えます
+（`trait T { def hashCode(): Int }; class D extends T` は scalac も通します）。
+
+同じ理由で、**Java インタフェース**が deferred 宣言したメンバは、線形化の
+どこにあっても**非インタフェースの基底**（＝スーパークラス連鎖）の具象メンバが
+実装します。Java に `abstract override` は無いので、インタフェースが下の実装を
+打ち消すことはありません。インタフェース同士は対象外です（スーパーインタフェースの
+default メソッドを abstract で再宣言したら、本当に未実装になります）。
+
+#### 2. インタフェースの static メソッドが `Methodref` で呼ばれる
+
+```scala
+val e = java.util.Map.entry("k", 7)
+// IncompatibleClassChangeError: Method 'java.util.Map$Entry
+//   java.util.Map.entry(...)' must be InterfaceMethodref constant
+```
+
+**型検査は通り、実行時に落ちる**サイレント誤コンパイルです。JVMS 4.4.2 では
+インタフェースが宣言するメソッド（`static` を含む）は定数プールで
+`CONSTANT_InterfaceMethodref` でなければなりません。`invokestatic` 命令自体は
+正しく、**定数のタグだけ**が違うので逆アセンブルしても見た目は同じです。
+
+`Assembler::invokestatic_interface` は既にあった（`scala/App.$init$` 用）ので、
+`invoke_method`（`crates/backend/src/gen.rs`）の `Flags::STATIC` 分岐で
+「所有者がインタフェースなら」そちらを使うようにしました。Java 9+ の
+インタフェースファクトリ（`Map.entry` / `List.of` / `Map.of` / `List.copyOf` /
+`Comparator.comparing` …）が全部これです。`invokeinterface` と
+`invokespecial` は元から `iface_ref` を使っていました。
+
+#### 3. 捨てられる erased な結果を unbox していた
+
+LRU キャッシュのプローブが通るようになってから出てきた、もう 1 つのサイレント
+誤コンパイルです。
+
+```scala
+val m = new java.util.HashMap[String, Int]()
+m.put("a", 1)   // NullPointerException（実 scalac は通る）
+```
+
+`java.util.Map[String, Int].put` は JVM 上 `(Object, Object)Object` なので、
+typer は結果を `$unbox` で包みます。nsc はこの適合を**期待型**から入れるので、
+文の位置（期待型 `Unit`）では `invokevirtual put; pop` で値に触りません。
+`put` は**直前の値**を返すため、最初の挿入では `null` を unbox して落ちます。
+`gen_stat` で、捨てられる `$unbox` はオペランドをそのまま文として出すように
+しました（`map.remove(k)` / `list.set(i, x)` / `buf.remove(0)` も同じ形）。
+
+#### 検証
+
+fixture 接頭辞は `jn`、テストは `crates/cli/tests/javanest.rs` です。正常系は
+**私有ランタイムと jar の両モード**で `java -Xverify:all` し、実 scalac 2.13.16
+の出力と突き合わせます。
+
+| fixture / テスト | 中身 |
+|---|---|
+| `jn_nested.scala` | `Map.Entry[K, V]`、Scala 側から `implements` する形、ワイルドカード `Entry[_, _]`、深さ 2 の `AbstractMap.SimpleEntry` |
+| `jn_static.scala` | `Map.entry` / `List.of` / `Map.of` / `List.copyOf`（インタフェース static）、`Iterator.next` / `CharSequence.length`（default メソッド ＝ `invokeinterface`）、`Integer.valueOf` / `String.valueOf`（クラスの static は `Methodref` のまま） |
+| `jn_lru.scala` | プローブ全体：`LinkedHashMap` の LRU キャッシュ ＋ `Thread` 継承 ＋ 匿名 `Comparator` ＋ `Arrays.sort` |
+| `jn_nested_bad.scala`（異常系） | `getValue` / `setValue` を書かない `Map.Entry` の実装。`class Half needs to be abstract.` と、`getValue` / `setValue` **だけ**が並ぶこと（`equals` / `hashCode` / `getKey` は並ばない）。実 scalac 2.13.16 も同じ 2 本を挙げる |
+| `jn_interface_static_constant_has_the_interface_tag` | classfile の定数プールを自前で読み、`Map.entry` / `List.of` がタグ 11、`Integer.valueOf` がタグ 10 であることを固定する。実行が通るだけでは間違ったタグを見逃せる |
+| `jn_extending_java_collections_is_concrete` | `HashMap` / `ArrayList` / `LinkedHashMap` / `LinkedList` / `Thread` の継承（どれも以前は「needs to be abstract」） |
+| `jn_object_members_implement_deferred_declarations` | `trait T { def hashCode(): Int }` などを `Object` が実装すること |
+| `jn_nested_arity_is_still_checked` | `Map.Entry[String, Int, Long]` は今でもエラー |
+| `jn_discarded_erased_result_is_not_unboxed` | `put` / `remove` / `set` を文の位置で呼んでも落ちないこと |
+
+#### Remaining
+
+- `java.util.Arrays.toString(a: Array[Object])` が
+  `no matching overload …with arguments (Array[AnyRef])` になります。
+  classfile の `[Ljava/lang/Object;` を `Array[Any]` に写しているためで、
+  配列は Scala では不変なので `Array[AnyRef]` が適合しません。
+  この修正とは独立の既存の差です。
+- `java.util.function.Function.identity[String]()` /
+  `java.util.Comparator.naturalOrder[String]()` のように、インタフェースの
+  ジェネリックな static を**明示的な型引数つきで**呼ぶと
+  `no matching overload` になります。定数プールのタグとは別の、
+  型引数適用側の既存の穴です。
+- `java.util.Set.of("x")` は `ambiguous overload`（可変長引数を含む
+  10 本の `of` の選択）。これも既存の多重定義解決の残件です。
+- 抽象メンバ検査の緩和は「Java インタフェースが宣言したメンバ」に限っています。
+  Scala の trait が deferred 宣言したものは今までどおり `lin[..bi]` だけを見ます
+  （`abstract override` の意味があるため）。
 
 ## ライセンス
 
