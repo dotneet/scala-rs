@@ -273,6 +273,12 @@ pub struct Symbol {
     /// (deferred) and `abstract override def close(): Unit = …` (stackable)
     /// are indistinguishable there.
     pub abstract_override: bool,
+    /// nsc `DEFERRED` for a **value**: `val v: Int` / `var v: Int` written with
+    /// no right-hand side. The namer sets `ABSTRACT` on a body-less `def` but
+    /// not on a body-less `val`, so without this an abstract `val` in a trait
+    /// looks exactly like a concrete one and `class C extends T` cannot tell
+    /// whether `v` still needs implementing.
+    pub deferred_val: bool,
 }
 
 impl Symbol {
@@ -427,6 +433,7 @@ impl SymbolTable {
                 declaring_is_interface: false,
                 pickled_origin: String::new(),
                 abstract_override: false,
+                deferred_val: false,
             }],
             scopes: vec![Scope::default()],
             root: SymbolId(0),
@@ -511,6 +518,7 @@ impl SymbolTable {
             declaring_is_interface: false,
             pickled_origin: String::new(),
             abstract_override: false,
+            deferred_val: false,
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {

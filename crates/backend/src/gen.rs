@@ -13097,19 +13097,44 @@ fn unit_stat_leaves_ref(tree: &Tree, st: &SymbolTable) -> bool {
         }
         TreeKind::Apply { fun, .. } => {
             let f = peel_fun(fun);
-            if f.sym.is_none() {
-                return false;
-            }
-            let s = st.get(f.sym);
-            if !matches!(s.intrinsic, Intrinsic::None) || !owner_defined_in_source(st, s.owner) {
-                return false;
-            }
-            match &s.ty {
-                Type::Method { ret, .. } | Type::Function { ret, .. } => {
-                    !matches!(ret.as_ref(), Type::Unit | Type::NoType | Type::Nothing)
-                }
-                _ => false,
-            }
+            leaves_ref_sym(f.sym, st, false)
+        }
+        // A **nilary** `def` has no argument list, so calling it builds a bare
+        // `Select` with no `Apply` above it and the arm above never sees it:
+        // `b.get` on a `Box[Unit]`, where `trait Box[A] { def get: A }`, still
+        // invokes `get()Ljava/lang/Object;`. Discarded without a `pop` the
+        // reference survives into the next stackmap frame, and the first
+        // branch after it (a `try`, an `if`, a `while`) is
+        // `VerifyError: Inconsistent stackmap frames`. Straight-line code got
+        // away with it, which is why this went unnoticed.
+        TreeKind::Select { .. } | TreeKind::Ident { .. } => leaves_ref_sym(tree.sym, st, true),
+        _ => false,
+    }
+}
+
+/// The shared test behind both arms of `unit_stat_leaves_ref`: a member this
+/// compilation unit defines whose *declared* result is not `Unit`, so its JVM
+/// signature returns a value even where the use site's type is `Unit`.
+///
+/// `only_methods` is set for the bare-`Select` arm. An `Apply` may be a call
+/// through a function-typed `val` (`Function1.apply` erases to
+/// `(Object)Object` too), but a bare `Select` of a `val` is a field read whose
+/// descriptor `pop_if_value` already covers from the tree's own type, and
+/// popping it a second time would underflow the stack.
+fn leaves_ref_sym(sym: SymbolId, st: &SymbolTable, only_methods: bool) -> bool {
+    if sym.is_none() {
+        return false;
+    }
+    let s = st.get(sym);
+    if only_methods && s.kind != SymKind::Method {
+        return false;
+    }
+    if !matches!(s.intrinsic, Intrinsic::None) || !owner_defined_in_source(st, s.owner) {
+        return false;
+    }
+    match &s.ty {
+        Type::Method { ret, .. } | Type::Function { ret, .. } => {
+            !matches!(ret.as_ref(), Type::Unit | Type::NoType | Type::Nothing)
         }
         _ => false,
     }

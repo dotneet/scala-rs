@@ -2,7 +2,9 @@ class A {
   def tag: String = "A"
 }
 class B extends A {
-  def tag: String = "B"
+  // Real scalac 2.13.16 requires `override` here (SLS 5.1.4); it never got as
+  // far as saying so for this file because `pick()` stops it in the typer.
+  override def tag: String = "B"
 }
 object Main {
   implicit val a: A = new A()

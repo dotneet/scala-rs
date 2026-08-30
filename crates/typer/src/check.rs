@@ -1396,13 +1396,19 @@ impl Typer {
 
     fn namer_member(&mut self, tree: &mut Tree) {
         match &tree.kind {
-            TreeKind::ValDef { name, mods, .. } => {
+            TreeKind::ValDef {
+                name, mods, rhs, ..
+            } => {
                 let annots = mods.annotations.clone();
+                // `val v: Int` with no right-hand side is nsc's DEFERRED; see
+                // `Symbol::deferred_val` for why the flag word cannot say so.
+                let deferred = rhs.is_empty();
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Term, mods.flags, "");
                 self.st.get_mut(id).private_within = mods.private_within.clone();
                 self.st.get_mut(id).annotations = annots;
+                self.st.get_mut(id).deferred_val = deferred;
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
@@ -2078,6 +2084,13 @@ impl Typer {
                 format!("class {} needs to be a mixin.", self.st.get(id).name)
             };
             self.check_abstract_override_grounded(id, tree_span, &headline);
+            self.check_overrides(id, &body_snapshot, tree_span);
+            let missing_headline = if anon {
+                "object creation impossible.".to_string()
+            } else {
+                format!("class {} needs to be abstract.", self.st.get(id).name)
+            };
+            self.check_missing_implementations(id, tree_span, &missing_headline);
         }
         self.st.pop_scope();
         self.st.owner = saved_owner;
@@ -2255,6 +2268,8 @@ impl Typer {
             // `new`: the instance is what cannot be built.
             let headline = "object creation impossible.".to_string();
             self.check_abstract_override_grounded(cls, mod_span, &headline);
+            self.check_overrides(cls, &body_snapshot, mod_span);
+            self.check_missing_implementations(cls, mod_span, &headline);
         }
         self.st.pop_scope();
         self.st.owner = saved_owner;
@@ -2771,6 +2786,56 @@ impl Typer {
         }
         for msg in
             crate::traitparent::check_abstract_override_grounded(&self.st, class_id, headline)
+        {
+            self.error(span, msg);
+        }
+    }
+
+    /// SLS 5.1.4: every rule an override has to satisfy. scalac points at the
+    /// offending *member*, so the body snapshot supplies its span; a member
+    /// with no tree of its own (a constructor field) falls back to the
+    /// template's.
+    fn check_overrides(&mut self, class_id: SymbolId, body: &[Tree], span: Span) {
+        // Which members wrote their result type. nsc types the others *at* the
+        // overridden member's result type, so they conform by construction;
+        // see `override_check::check_pair`.
+        let mut inferred: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for t in body {
+            let tpt = match &t.kind {
+                TreeKind::DefDef { tpt, .. } | TreeKind::ValDef { tpt, .. } => tpt,
+                _ => continue,
+            };
+            if tpt.is_empty() && !t.sym.is_none() {
+                inferred.insert(t.sym.0);
+            }
+        }
+        let is_inferred = |s: SymbolId| inferred.contains(&s.0);
+        for e in crate::override_check::check_overrides(&self.st, class_id, &is_inferred) {
+            let at = body
+                .iter()
+                .find(|t| t.sym == e.sym && !e.sym.is_none())
+                .map(|t| t.span)
+                .unwrap_or(span);
+            self.error(at, e.message);
+        }
+    }
+
+    /// SLS 5.2.6: a concrete template must implement every deferred member it
+    /// inherits. Without this a missing implementation compiled and then threw
+    /// `AbstractMethodError` at the first call.
+    fn check_missing_implementations(&mut self, class_id: SymbolId, span: Span, headline: &str) {
+        if class_id.is_none() {
+            return;
+        }
+        let s = self.st.get(class_id);
+        if s.flags.contains(Flags::TRAIT)
+            || s.flags.contains(Flags::INTERFACE)
+            || s.flags.contains(Flags::ABSTRACT)
+        {
+            return;
+        }
+        if let Some(msg) =
+            crate::override_check::check_missing_implementations(&self.st, class_id, headline)
         {
             self.error(span, msg);
         }
