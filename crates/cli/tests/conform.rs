@@ -230,5 +230,6 @@ conform!(
     try_extractor,
     curried_eta,
     ordering_double,
-    either_pattern
+    either_pattern,
+    local_simple_name
 );

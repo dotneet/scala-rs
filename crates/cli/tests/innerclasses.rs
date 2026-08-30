@@ -381,11 +381,11 @@ fn inner_local_anon_has_no_outer_and_is_final() {
 /// with its real name and no outer, plus `EnclosingMethod`. Real scalac:
 /// `public #11= #2;  // LocalC$1=class Main$LocalC$1`.
 ///
-/// The *binary* name now matches nsc's, `$1` and all (`agent/localtrait`:
-/// without the index two same-named local classes shared one classfile). The
-/// `inner_name` still differs — nsc repeats the indexed tail (`LocalC$1`),
-/// scala-rs keeps the source name (`LocalC`), so `getSimpleName` differs for
-/// a local class. Nothing else reads it, and no fixture pins it.
+/// Both halves match nsc's now: the *binary* name carries the index
+/// (`agent/localtrait`: without it two same-named local classes shared one
+/// classfile), and so does `inner_name`. `getSimpleName` reads that field,
+/// so returning `LocalC` where scalac returns `LocalC$1` showed up as a
+/// difference in a differential probe (`tests/conform/local_simple_name`).
 #[test]
 fn inner_local_class_has_no_outer() {
     if !javap_available() {
@@ -394,7 +394,7 @@ fn inner_local_class_has_no_outer() {
     }
     let out = compile("inner_local", "localc-javap", &["--no-scala-library"]);
     let local = out.join("Main$LocalC$1.class");
-    assert_inner_classes(&local, vec![InnerEntry::local("LocalC", "public")]);
+    assert_inner_classes(&local, vec![InnerEntry::local("LocalC$1", "public")]);
     assert_has_enclosing_method(&local);
     let _ = fs::remove_dir_all(&out);
 }

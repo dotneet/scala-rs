@@ -853,11 +853,6 @@ fn describe_nested(
         if is_anon || sflags.contains(Flags::FINAL) {
             flags |= ACC_FINAL;
         }
-        let inner_name = if is_anon {
-            None
-        } else {
-            Some(sym.name.clone())
-        };
         let (enclosing_class, method_info) = if owner_kind == SymKind::Method {
             let mowner = st.get(owner).owner;
             (
@@ -870,14 +865,28 @@ fn describe_nested(
         if enclosing_class.is_none() {
             return None;
         }
+        // A local class carries the disambiguating suffix in `inner_name`
+        // too, not just in the binary name: nsc writes `Dog$1`, not `Dog`,
+        // and `getSimpleName` reads this field. Derive it by removing the
+        // enclosing class's prefix rather than re-deriving the index.
+        let encl_internal = st.jvm_internal(enclosing_class);
+        let inner_name = if is_anon {
+            None
+        } else {
+            Some(
+                name.strip_prefix(&encl_internal)
+                    .map(|r| r.trim_start_matches('$').to_string())
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or_else(|| sym.name.clone()),
+            )
+        };
         let entry = InnerClassEntry {
             inner_class: name.to_string(),
             outer_class: None,
             inner_name,
             access_flags: flags,
         };
-        let encl = (st.jvm_internal(enclosing_class), method_info);
-        return Some((entry, Some(encl)));
+        return Some((entry, Some((encl_internal, method_info))));
     }
 
     if !matches!(owner_kind, SymKind::Class | SymKind::ModuleClass) {
