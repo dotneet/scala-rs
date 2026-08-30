@@ -5382,10 +5382,37 @@ impl Typer {
                     // module symbol itself has no tparams, so naively
                     // substituting against it is a no-op and the caller sees
                     // an un-substituted `HashMap[K, V]`.
-                    if self.st.get(sym).tparams.is_empty()
-                        && self.st.get(sym).kind == SymKind::Module
-                    {
-                        let cls = self.st.module_class_of(sym);
+                    // The reference need not *be* the module symbol: the
+                    // `scala` package object exports its aliases as accessors
+                    // (`def Equiv(): Equiv$`), so `Equiv[Int]` arrives as a
+                    // nullary method whose result is the module class. nsc
+                    // reads both the same way -- a stable value of a module's
+                    // type, with the type arguments meant for its `apply`.
+                    let module_cls = if self.st.get(sym).kind == SymKind::Module {
+                        Some(self.st.module_class_of(sym))
+                    } else {
+                        self.module_class_of_value(sym, &base_ty)
+                    };
+                    if let (true, Some(cls)) = (self.st.get(sym).tparams.is_empty(), module_cls) {
+                        // A library companion's `apply` is read from the
+                        // pickle on *selection*, and `Ordering[String]` never
+                        // writes one: without this the redirect found nothing,
+                        // the tree kept the module's own type, and
+                        // `Ordering[String].compare` was either "not a member
+                        // of Ordering$" or -- reached through the `scala`
+                        // package alias -- compiled into `Ordering$.MODULE$`
+                        // cast to `Ordering` (`ClassCastException` at run
+                        // time). `Ordering.apply[T](implicit ord: Ordering[T])`
+                        // is nsc's summoner and is what the type arguments
+                        // target here.
+                        //
+                        // Only when the module declares no `apply` at all: the
+                        // prelude writes its own for the collection factories,
+                        // and adding the pickle's overloads next to them made
+                        // `List[Int](1, 2)` "ambiguous overload for apply".
+                        if self.st.lookup_member(cls, "apply").is_empty() {
+                            self.supply_from_pickle_class(cls, "apply");
+                        }
                         let candidates: Vec<SymbolId> = self
                             .st
                             .lookup_member(cls, "apply")
@@ -16954,6 +16981,32 @@ impl Typer {
         }
         self.pickle
             .complete(&mut self.st, &mut self.binary, cls, name)
+    }
+
+    /// The module class a *value* reference stands for, if it stands for one.
+    ///
+    /// A module reference carries `Type::ModuleRef`; the `scala` package
+    /// object's aliases (`val Equiv = math.Equiv`) reach us as nullary
+    /// accessors, so the same thing also arrives wrapped in a method type with
+    /// no parameters. Used by `Module[T]` → `Module.apply[T]`: without it
+    /// `Equiv[Int]` kept the module class as its type and `.equiv` was "not a
+    /// member of Equiv$".
+    fn module_class_of_value(&self, sym: SymbolId, ty: &Type) -> Option<SymbolId> {
+        let s = self.st.get(sym);
+        if !matches!(s.kind, SymKind::Method | SymKind::Term) || !s.params.is_empty() {
+            return None;
+        }
+        let peeled = match ty {
+            Type::Method { paramss, ret } if paramss.iter().all(|c| c.is_empty()) => {
+                (**ret).clone()
+            }
+            other => other.clone(),
+        };
+        match peeled {
+            Type::ModuleRef(c) => Some(c),
+            Type::Class { sym: c, .. } if self.st.get(c).kind == SymKind::ModuleClass => Some(c),
+            _ => None,
+        }
     }
 
     pub(crate) fn ensure_java_loaded(&mut self, class_id: SymbolId, span: Span) {
