@@ -1,0 +1,19 @@
+N(11,L)
+N(11,L)
+1 1 2 2
+leaf 1 1
+L
+N3
+other
+pos1
+nonpos-1
+L
+int42
+str2
+o
+some 7 7
+o
+o
+1 1 2
+o
+caught boom

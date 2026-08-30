@@ -11983,6 +11983,30 @@ impl Typer {
                 pat.ty = sel_ty.clone();
             }
             TreeKind::Literal { lit } => {
+                // `Null` conforms to no value type, so `case null` against a
+                // primitive scrutinee is the mismatch nsc reports. Without
+                // this the case was accepted and silently never taken.
+                let primitive_sel = || {
+                    matches!(
+                        sel_ty.widen_constant(),
+                        Type::Int
+                            | Type::Long
+                            | Type::Double
+                            | Type::Float
+                            | Type::Short
+                            | Type::Byte
+                            | Type::Char
+                            | Type::Boolean
+                            | Type::Unit
+                    )
+                };
+                if matches!(lit, Lit::Null) && primitive_sel() {
+                    let want = self.st.display_type(sel_ty);
+                    self.error(
+                        pat.span,
+                        format!("type mismatch; found: Null(null)  required: {want}"),
+                    );
+                }
                 pat.ty = match lit {
                     Lit::Int(_) => Type::Int,
                     Lit::Boolean(_) => Type::Boolean,

@@ -12629,6 +12629,42 @@ fn gen_eq_ne(
     emit_ref_eq(asm, eq);
 }
 
+/// `null` written literally, however it was ascribed on the way here.
+fn is_null_literal(t: &Tree) -> bool {
+    match &t.kind {
+        TreeKind::Literal { lit } => matches!(lit, Lit::Null),
+        TreeKind::Typed { expr, .. } => is_null_literal(expr),
+        TreeKind::Block { stats, expr } if stats.is_empty() => is_null_literal(expr),
+        _ => matches!(t.ty.widen_constant(), Type::Null),
+    }
+}
+
+/// A static type whose values really can be `null` on the JVM: not a
+/// primitive, and not a value class (which erases to its underlying).
+fn is_nullable_ref(st: &SymbolTable, ty: &Type) -> bool {
+    let ty = ty.widen_constant();
+    if is_jvm_primitive(&ty) {
+        return false;
+    }
+    !st.class_sym_of(&ty).is_some_and(|s| st.is_value_class(s))
+}
+
+/// Leave `1` on the stack when the branch to `taken` is *not* taken, `0` when
+/// it is. `emit_test` writes the conditional jump.
+fn emit_bool_from_jump(
+    asm: &mut Assembler,
+    emit_test: impl FnOnce(&mut Assembler, crate::code::Label),
+) {
+    let is_false = asm.fresh_label();
+    let end = asm.fresh_label();
+    emit_test(asm, is_false);
+    asm.iconst(1);
+    asm.goto(end);
+    asm.mark(is_false);
+    asm.iconst(0);
+    asm.mark(end);
+}
+
 fn gen_any_eq(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -12637,15 +12673,46 @@ fn gen_any_eq(
     args: &[Tree],
     eq: bool,
 ) {
-    let recv_ty = match &fun.kind {
-        TreeKind::Select { qual, .. } => qual.ty.clone(),
-        _ => Type::AnyRef,
+    let recv = match &fun.kind {
+        TreeKind::Select { qual, .. } => Some(&**qual),
+        _ => None,
     };
+    let recv_ty = recv.map(|q| q.ty.clone()).unwrap_or(Type::AnyRef);
+    let arg = args.first();
+    // `x == null` is a *reference* test, not a call. nsc emits a bare
+    // `ifnonnull`; `x.equals(null)` threw a `NullPointerException` on exactly
+    // the value the test asks about (the private runtime has no
+    // `BoxesRunTime` to hide it). `null` itself has no side effect, so only
+    // the other side is evaluated.
+    let arg_is_null = arg.is_some_and(is_null_literal);
+    let recv_is_null = recv.is_some_and(is_null_literal);
+    let other = if arg_is_null {
+        Some(recv_ty.clone())
+    } else if recv_is_null {
+        arg.map(|a| a.ty.clone())
+    } else {
+        None
+    };
+    if other.is_some_and(|t| is_nullable_ref(ctx.st, &t)) {
+        if arg_is_null {
+            gen_receiver(asm, frame, ctx, fun);
+        } else {
+            gen_expr(asm, frame, ctx, arg.unwrap());
+        }
+        emit_bool_from_jump(asm, |a, is_false| {
+            if eq {
+                a.ifnonnull(is_false)
+            } else {
+                a.ifnull(is_false)
+            }
+        });
+        return;
+    }
     gen_receiver(asm, frame, ctx, fun);
     if is_jvm_primitive(&recv_ty) && !is_unit_like(&recv_ty) {
         emit_box(asm, &recv_ty);
     }
-    if let Some(arg) = args.first() {
+    if let Some(arg) = arg {
         gen_expr(asm, frame, ctx, arg);
         if is_jvm_primitive(&arg.ty) && !is_unit_like(&arg.ty) {
             emit_box(asm, &arg.ty);
@@ -12659,6 +12726,36 @@ fn gen_any_eq(
             "equals",
             "(Ljava/lang/Object;Ljava/lang/Object;)Z",
         );
+    } else if is_nullable_ref(ctx.st, &recv_ty) {
+        // No `BoxesRunTime` on the private runtime, and a bare
+        // `recv.equals(arg)` throws when `recv` is null. This is nsc's own
+        // expansion: `if (recv == null) arg == null else recv.equals(arg)`.
+        // Both sides go to locals first so every branch target has an empty
+        // operand stack.
+        let arg_slot = frame.alloc_tmp(JvmSort::Ref);
+        store(asm, arg_slot, JvmSort::Ref);
+        let recv_slot = frame.alloc_tmp(JvmSort::Ref);
+        store(asm, recv_slot, JvmSort::Ref);
+        let recv_null = asm.fresh_label();
+        let is_true = asm.fresh_label();
+        let is_false = asm.fresh_label();
+        let end = asm.fresh_label();
+        load(asm, recv_slot, JvmSort::Ref);
+        asm.ifnull(recv_null);
+        load(asm, recv_slot, JvmSort::Ref);
+        load(asm, arg_slot, JvmSort::Ref);
+        asm.invokevirtual("java/lang/Object", "equals", "(Ljava/lang/Object;)Z");
+        asm.ifeq(is_false);
+        asm.goto(is_true);
+        asm.mark(recv_null);
+        load(asm, arg_slot, JvmSort::Ref);
+        asm.ifnonnull(is_false);
+        asm.mark(is_true);
+        asm.iconst(1);
+        asm.goto(end);
+        asm.mark(is_false);
+        asm.iconst(0);
+        asm.mark(end);
     } else {
         asm.invokevirtual("java/lang/Object", "equals", "(Ljava/lang/Object;)Z");
     }
@@ -13470,6 +13567,15 @@ fn gen_unapply_pattern(
             }
         }
     }
+    // An extractor pattern never matches `null`: nsc guards the call with
+    // `ifnull` rather than handing the extractor a null to reason about, so
+    // `case Foo(a) => … case null => …` reaches the `null` case. The
+    // sequence shapes above already tested with `instanceof`, but a scrutinee
+    // whose static type made that test redundant still needs this.
+    if sel_sort == JvmSort::Ref {
+        load(asm, tmp, sel_sort);
+        asm.ifnull(fail);
+    }
     if !owner.is_none() && !is_module_class(ctx.st, owner) {
         gen_expr(asm, frame, ctx, fun);
     } else {
@@ -13582,6 +13688,85 @@ fn is_type_test_pat(pat: &Tree) -> bool {
         TreeKind::Typed { .. } => true,
         TreeKind::Bind { body, .. } => is_type_test_pat(body),
         _ => false,
+    }
+}
+
+/// Put a constant pattern's value on the stack in the *scrutinee's* JVM
+/// representation: boxed when the scrutinee is a reference (`case 1 =>` on an
+/// `Any`), widened when the scrutinee is a wider primitive (`case 1 =>` on a
+/// `Long`). Without this the comparison below saw two different sorts and the
+/// verifier rejected the method.
+fn emit_pattern_operand(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type, sel_sort: JvmSort) {
+    let ty = ty.widen_constant();
+    if !is_jvm_primitive(&ty) {
+        return;
+    }
+    if sel_sort == JvmSort::Ref {
+        if is_unit_like(&ty) && ctx.library_abi {
+            // `emit_box` would push a bare `null` for `Unit`; against the real
+            // library a boxed `()` is `BoxedUnit.UNIT`. The private runtime
+            // has no `BoxedUnit`, and boxes `Unit` as `null` throughout, so
+            // `emit_box`'s `null` is the right operand there.
+            emit_boxed_unit(asm);
+        } else {
+            emit_box(asm, &ty);
+        }
+        return;
+    }
+    let want = match sel_sort {
+        JvmSort::Int => Type::Int,
+        JvmSort::Long => Type::Long,
+        JvmSort::Float => Type::Float,
+        JvmSort::Double => Type::Double,
+        _ => return,
+    };
+    widen_primitive(asm, &ty, &want);
+}
+
+/// Compare a constant pattern with the scrutinee, jumping to `fail` when they
+/// differ. The pattern's value is pushed *first* and the scrutinee second,
+/// which is the order nsc emits: with the scrutinee as the receiver,
+/// `case "a" =>` threw a `NullPointerException` on a `null` scrutinee instead
+/// of falling through to the next case.
+fn emit_pattern_eq_jump(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    sel_sort: JvmSort,
+    fail: crate::code::Label,
+) {
+    match sel_sort {
+        JvmSort::Int => asm.if_icmpne(fail),
+        // A `Long`/`Float`/`Double` scrutinee used to have both operands
+        // popped and the case taken unconditionally: `case 1L =>` matched
+        // every `Long`.
+        JvmSort::Long => {
+            asm.lcmp();
+            asm.ifne(fail);
+        }
+        JvmSort::Float => {
+            asm.fcmpl();
+            asm.ifne(fail);
+        }
+        JvmSort::Double => {
+            asm.dcmpl();
+            asm.ifne(fail);
+        }
+        JvmSort::Ref => {
+            if ctx.library_abi {
+                // What nsc emits: it also equates a boxed `1` with a boxed
+                // `1L`, which `Integer.equals` does not.
+                asm.invokestatic(
+                    "scala/runtime/BoxesRunTime",
+                    "equals",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+                );
+            } else {
+                asm.invokevirtual("java/lang/Object", "equals", "(Ljava/lang/Object;)Z");
+            }
+            asm.ifeq(fail);
+        }
+        // A `Unit` scrutinee has one value, so a `Unit` pattern always matches.
+        JvmSort::Void => {}
     }
 }
 
@@ -13773,56 +13958,43 @@ fn gen_pattern(
                 };
                 store(asm, slot, sort);
             } else {
-                load(asm, tmp, sel_sort);
+                // The stable id goes on the stack first, the scrutinee second:
+                // see `emit_pattern_eq_jump`.
                 gen_ident(asm, frame, ctx, pat);
-                match sel_sort {
-                    JvmSort::Int => asm.if_icmpne(fail),
-                    JvmSort::Ref => {
-                        let ok = asm.fresh_label();
-                        // reference equality then equals
-                        // stack: tmp, ident — use Object.equals
-                        asm.invokevirtual("java/lang/Object", "equals", "(Ljava/lang/Object;)Z");
-                        asm.ifne(ok);
-                        asm.goto(fail);
-                        asm.mark(ok);
-                    }
-                    _ => {
-                        pop_if_value(asm, &pat.ty);
-                        pop_if_value(asm, &pat.ty);
-                    }
-                }
+                emit_pattern_operand(asm, ctx, &pat.ty, sel_sort);
+                load(asm, tmp, sel_sort);
+                emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
             }
         }
         TreeKind::Literal { lit } => {
-            load(asm, tmp, sel_sort);
-            gen_literal(asm, lit);
-            match sel_sort {
-                JvmSort::Int => asm.if_icmpne(fail),
-                JvmSort::Ref => {
-                    asm.invokevirtual("java/lang/Object", "equals", "(Ljava/lang/Object;)Z");
-                    asm.ifeq(fail);
+            // SLS 8.1.1: the `null` pattern is a *reference* comparison.
+            // `x.equals(null)` threw a `NullPointerException` on the one
+            // scrutinee the case exists to catch. The private runtime has no
+            // `BoxedUnit` and boxes `Unit` as `null` throughout, so a `()`
+            // pattern against a reference scrutinee is the same comparison
+            // there.
+            let by_reference = matches!(lit, Lit::Null)
+                || (matches!(lit, Lit::Unit) && !ctx.library_abi && sel_sort == JvmSort::Ref);
+            if by_reference {
+                if sel_sort == JvmSort::Ref {
+                    load(asm, tmp, sel_sort);
+                    asm.ifnonnull(fail);
+                } else {
+                    // A primitive scrutinee is never null.
+                    asm.goto(fail);
                 }
-                _ => {
-                    asm.pop();
-                    asm.pop();
-                }
+            } else {
+                gen_literal(asm, lit);
+                emit_pattern_operand(asm, ctx, &pat.ty, sel_sort);
+                load(asm, tmp, sel_sort);
+                emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
             }
         }
         TreeKind::Select { .. } => {
-            load(asm, tmp, sel_sort);
             gen_expr(asm, frame, ctx, pat);
-            match sel_sort {
-                JvmSort::Ref => {
-                    asm.invokevirtual("java/lang/Object", "equals", "(Ljava/lang/Object;)Z");
-                    asm.ifeq(fail);
-                }
-                JvmSort::Int => asm.if_icmpne(fail),
-                _ => {
-                    pop_if_value(asm, &pat.ty);
-                    pop_if_value(asm, &pat.ty);
-                    asm.goto(fail);
-                }
-            }
+            emit_pattern_operand(asm, ctx, &pat.ty, sel_sort);
+            load(asm, tmp, sel_sort);
+            emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
         }
         TreeKind::Apply { args, .. } => {
             let class_id = if pat.sym.is_none() {
@@ -13900,15 +14072,27 @@ fn gen_pattern(
             gen_unapply_pattern(asm, frame, ctx, pat, fun, args, tmp, sel_sort, fail);
         }
         TreeKind::Bind { body, .. } => {
-            load(asm, tmp, sel_sort);
+            // `case n @ N(v, _)` binds `n` at the pattern's *own* type, not at
+            // the scrutinee's: run the inner pattern's test first, then narrow
+            // what the test proved. Storing the raw scrutinee left `n` typed
+            // `T` in the frame and reading `N`'s fields off it was a
+            // `VerifyError`; `case n @ (_: Int)` on an `Any` stored a reference
+            // in an `int` slot the same way. nsc emits the same order:
+            // `instanceof`, `checkcast`, `astore`.
+            gen_pattern(asm, frame, ctx, body, tmp, sel_sort, fail);
             let sort = jvm_sort(&pat.ty);
+            load(asm, tmp, sel_sort);
+            if sel_sort == JvmSort::Ref {
+                emit_from_erased_object(asm, ctx.st, &pat.ty);
+            }
             let slot = if pat.sym.is_none() {
                 frame.alloc_tmp(sort)
+            } else if let Some((s, _)) = frame.get(pat.sym) {
+                s
             } else {
                 frame.alloc(pat.sym, sort)
             };
             store(asm, slot, sort);
-            gen_pattern(asm, frame, ctx, body, tmp, sel_sort, fail);
         }
         TreeKind::Typed { expr, .. } => {
             // `case x: Meters` on an `Any` tests for the boxed value class and
@@ -13948,12 +14132,26 @@ fn gen_pattern(
                 gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
                 return;
             }
-            let jvm = type_jvm_name(ctx.st, &pat.ty);
-            if jvm != "java/lang/Object" {
-                load(asm, tmp, JvmSort::Ref);
-                asm.instanceof(&jvm);
-                asm.ifeq(fail);
-            }
+            // A type pattern never matches `null` (SLS 8.1.2), which is what
+            // `instanceof` says on its own -- so the test is emitted even when
+            // the type erases to `Object` (`case x: Any`, `case x: AnyRef`,
+            // `case a: A`). Skipping it there let `null` reach a case that
+            // scalac's own `instanceof java/lang/Object` rules out.
+            // `type_jvm_name` reports `Object` for an array, which tested
+            // nothing and left `case a: Array[Int]` reading `arraylength` off
+            // an `Object`; `instanceof` takes the array descriptor directly.
+            let jvm = match pat.ty.widen_constant() {
+                Type::Array(_) => jvm_desc(ctx.st, &pat.ty),
+                _ => type_jvm_name(ctx.st, &pat.ty),
+            };
+            let jvm = if jvm.is_empty() {
+                "java/lang/Object".to_string()
+            } else {
+                jvm
+            };
+            load(asm, tmp, JvmSort::Ref);
+            asm.instanceof(&jvm);
+            asm.ifeq(fail);
             // `case i: Int` / `case s: String` narrows an `Object` scrutinee,
             // so the bound value is unboxed or cast before it is stored.
             let want = jvm_sort(&pat.ty);

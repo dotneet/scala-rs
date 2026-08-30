@@ -1,0 +1,12 @@
+o
+seq 1 2
+o
+o
+list 1 2
+o
+o
+ai2
+o
+o
+u
+o
