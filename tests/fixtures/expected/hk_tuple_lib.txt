@@ -1,0 +1,8 @@
+(1,a)
+1
+(true,Red,true)
+(3,4)
+(Set(2),Set(1, 2, 3),Set(2))
+(true,neg)
+(1,2,3,4)
+(1,b,3.0,true,c,6)

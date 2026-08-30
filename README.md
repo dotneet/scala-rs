@@ -205,6 +205,11 @@ nsc の `instantiateExpecting` と同じく、メソッドの型パラメータ�
 - **共変位置**の期待型は上界にすぎないので引数の解が勝ちます（`cov("q"): List[Any]` は `T = String`）。
 - 解いた型引数は**implicit 引数リストの解決より前**に確定します。`def column[T](n: String)(implicit tt: TypedType[T]): Rep[T]` を `Rep[Int]` の位置で呼ぶと `TypedType[Int]` を探しに行きます。
 - どちらでも決まらない型パラメータは `Nothing` で埋めず、nsc と同じ診断（`could not find implicit value …`）を出します。
+- 引数は、パラメータのクラスにおける**基底型**に直してから突き合わせます（nsc の
+  `Types.baseType`。`check.rs` の `align_to_param_class` / `base_type_instance`）。
+  `object OD extends D[Int]` を `def u[A](d: D[A])` に渡すと、引数の型は `OD.type`
+  なので `D[Int]` は基底型としてしか見えません。`this.type` / `p.type` も同じで、
+  単一型はまず**それが広がる先**を読みます（`agent/hkinfer`）。
 
 これに伴い `Array` は **非変** になりました（`Array[Int]` は `Array[Any]` に渡せません。scalac と同じ）。また、継承したメンバの型は**適用済みの親**を通して見るようになりました（`OptionMapper2[…, Boolean, …].column` の implicit は `TypedType[BR]` ではなく `TypedType[Boolean]` を探します）。
 
@@ -943,9 +948,11 @@ FreeMarker テンプレートから生成します。これを計測に含めた
 **5. 引数リストのタプル化（nsc の tuple adaptation）**。`Some((p._1, p._2), p._3)` は
 `Some(((p._1, p._2), p._3))` の意味です。どの候補にも合わない引数リストを、最後の手段として
 1 個のタプルに詰め直して**もう一度だけ**型付けします。だめならツリーも診断も元に戻すので、
-エラーは書いたとおりのものが出ます。nsc と同じく**オーバーロードされた呼び先には適用しません**
-（`inferMethodAlternative` はタプル化しない）。合成した `TupleN(a, b)` 自身が再入しないよう
-再入フラグで止めています。
+エラーは書いたとおりのものが出ます。合成した `TupleN(a, b)` 自身が再入しないよう
+再入フラグで止めています。オーバーロードされた呼び先の扱いは
+`agent/hkinfer` で直しました（下の「引数の基底型と自動タプル化」）。当初は
+「オーバーロードには一切適用しない」としていましたが、それでは `println(1, "a")` が
+通りません。正しくは**書いた引数個数を取る候補が 1 本でもあればタプル化しない**です。
 
 **6. 名前が `Tuple` で始まるだけのクラスをタプル扱いしていた**。`TupleShape[L, M, U, P]`
 （slick 自身のクラス）が **4 要素タプル**として読まれ、`TupleShapeImplicits` が全滅していました。
@@ -2128,6 +2135,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/catsyntax` スライス（cats の syntax による拡張メソッドが本物の cats に届くまで）のフィクスチャは接頭辞 `csyn`（`csyn_ops` / `csyn_ops_bad`）で、同じ理由から `crates/cli/tests/catsyntax.rs` に置いています。`csyn_ops.scala` は cats の `Ops[F[_], A]` と同じ形の受け手に `map` / `flatMap` / `foreach` を呼ぶもので、**暗黙変換を一切使わずに**（`new Ops[Box, Int](b)`）ラムダの引数型が第 1 型引数の `Box` になっていたずれを固定します。私有ランタイムと `--scala-library` の両方で走ります。`csyn_ops_bad.scala` は、ラムダに宣言どおりの引数型を与えても witness の無い呼び出しは通らないこと（`could not find implicit value of type FlatMap[Bag]`）を固定します。`a_simulacrum_style_syntax_layer_crosses_a_jar` は **実 scalac** で小さな cats（`Ops[F, A] { type TypeClassType = FlatMap[F] }` という refinement 結果型、パッケージオブジェクトの入れ子 `object all`、その `all` を `InnerClasses` に載せるだけの無関係なクラス）をコンパイルして jar に詰め、`ScalaSignature` だけを通して `b.flatMap(…)` と `b >> …` が解決し、`java -Xverify:all` で走ることを見ます。自前の pickle ライタは `REFINEDtpe` を出さないので、この fixture は scalac が書いたものでなければ意味がありません（scalac が無い環境では skip します）。同じテストで、witness の無い `Crate` には変換が挿さらないこと（`value flatMap is not a member of Crate[Int]`）も見ます。
 
+`agent/hkinfer` スライス（引数の基底型からの型引数推論と、オーバーロードされた呼び先の自動タプル化）のフィクスチャは接頭辞 `hk`（`hk_base` / `hk_base_lib` / `hk_base_bad` / `hk_tuple` / `hk_tuple_lib` / `hk_tuple_bad`）で、同じ理由から `crates/cli/tests/hkinfer.rs` に置いています。`hk_base.scala` と `hk_tuple.scala` は**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走ります。`hk_base_lib.scala`（`Option` / `List`）と `hk_tuple_lib.scala`（`println(1, "a")`）は jar 限定です。異常系は 2 本で、どちらも**両モードで**エラー件数まで固定します: `hk_base_bad` は基底型の型引数が合わないもの、`hk_tuple_bad` はタプル化が通してはいけない 4 つの形（特に逆向きの `g((1, 2))` と、同じ引数個数の候補があるときの `c(1, "x")`）です。詳しくは下の「引数の基底型と自動タプル化」を見てください。
+
 `agent/genrep` スライス（slick が `.fm` テンプレートから生成する 7 本を通すための穴: import を見ないクラス型パラメータ境界、型パラメータ付き `implicit class`、`TupleN extends Product`、継承したオーバーロードの受け手での型、引数リストのタプル化、`Tuple` で始まるだけのクラス名、可変長引数コンストラクタ、ワイルドカード型引数と反変、`package p { … }` の後ろのトップレベル定義）のフィクスチャは接頭辞 `genrep`（`genrep` / `genrep_bound_bad` / `genrep_tuple_bad` / `genrep_product_bad`）で、同じ理由から `crates/cli/tests/genrep.rs` に置いています。`genrep.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 との実行結果 diff（`real_scalac_dual_run_genrep`）でも見ます。異常系は 3 本: `genrep_bound_bad` は namer が黙るようにした境界でも**存在しない型はきちんと診断される**こと、`genrep_tuple_bad` はタプル化が**間違った呼び出しを通さない**こと、`genrep_product_bad` は `--no-scala-library` で `Product` の辺を張らない（私有ランタイムに裏付けが無い）ことを固定します。
 
 `agent/ctoraccessor` スライス（コンストラクタ引数のアクセサ、`FunctionN.tupled` / `curried` / `Function.untupled`、`Builder` の `+=` / `++=`）のフィクスチャは接頭辞 `ctacc`（`ctacc` / `ctacc_fn` / `ctacc_builder` / `ctacc_plain_bad`）で、同じ理由から `crates/cli/tests/ctoraccessor.rs` に置いています。`ctacc.scala` は**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせ、`real_scalac_dual_run_ctacc` で real scalac 2.13.16 の出力とも比較します（`expected/ctacc.txt` は scalac の出力そのもの）。`ctacc_case_class_params_get_public_accessors` は `javap -p -s` でアクセサのディスクリプタ（`ConstRep.value()Object` / `NumRep.n()I` / `IntBox.unwrap` の `()I` ＋ `()Object` ブリッジ / `StringBox.label` の `()String` ＋ `()Object` ブリッジ）と、**第 2 引数リストがアクセサにならない**こと（`Multi.extra`）を固定します。`ctacc_fn.scala` と `ctacc_builder.scala` は library ABI 限定（`scala/FunctionN` の default メソッド、`scala/Function$`、`Growable`）なので library dual-run と real scalac dual-run のみで、`fixtures_ctacc_fn_without_library_is_error` / `fixtures_ctacc_builder_without_library_is_error` が `--no-scala-library` で**きちんと診断される**ことを見ます。`ctacc_plain_bad.scala` は `val` の無いコンストラクタ引数が外から読めないままであること（case class の第 1 引数リストだけがアクセサになる）を固定します。
@@ -2822,6 +2831,89 @@ files_with_errors=80`**。生の件数はあまり動きませんが、**この�
 **その先で止まっていたカスケードが表に出た**ためです（`found: F required: F[Unit]`、
 `no matching overload for (Function0[A])F` など。どれも同じ「素の `F`」が原因）。
 
+### 引数の基底型と自動タプル化（`agent/hkinfer`）
+
+実 scalac との差分で見つかった、引数の適合まわりの独立した 2 件です。
+テストは `crates/cli/tests/hkinfer.rs`、fixture の接頭辞は `hk` です。
+
+**1. 引数の基底型から型引数が推論できていなかった。これは高階固有ではありません。**
+報告は `def use[F[_]](c: C[F])` に `object OC extends C[Option]` を渡す形でしたが、
+**1 階でも同じように落ちます**：
+
+```scala
+trait D[A]; object OD extends D[Int]
+def u[A](d: D[A]): A = ???
+u(OD)   // error: no matching overload for (D[A])A with arguments (OD$)
+```
+
+分けているのは kind の階数ではなく、**引数が単一型かどうか**でした。`new LC`
+（クラスのインスタンス）は元から通り、`OC` / `OD`（オブジェクト）だけが落ちます。
+`unify_tparam_all` は引数を `align_to_param_class` でパラメータのクラスに
+直してから単一化しますが、その `align_to_param_class` と `base_type_instance` が
+**`Type::Class` しか受け付けていなかった**ためです。オブジェクト参照の型は
+`Type::ModuleRef` なので、そこで素通りしていました。
+
+nsc の `Types.baseType` は単一型を**それが広がる先**を通して読みます。同じように
+`base_type_instance` に `ModuleRef` / `ThisType` / `SingleType` / `Annotated` を
+足し、`align_to_param_class` もその 3 つの単一型を通すようにしました。
+`this.type` を返すメソッドの結果（`SelfInt.me`）や、`val sv: SelfInt.type = SelfInt`
+のようなパス型も同じ経路で通ります。
+
+基底型が**在る**だけでは足りず、その型引数が合うことは今までどおり要求します
+（`hk_base_bad`: `object OD extends D[Int]` は `D[String]` ではなく、`A` を `Int` に
+固定するので `two(OD, "s")` も通りません。実 scalac も同じ 2 件を出します）。
+
+**2. 自動タプル化（SLS 6.6）がオーバーロードされた呼び先で効かなかった。**
+`retry_tupled_args` そのものは前からありましたが、
+「nsc はオーバーロードにタプル化しない」として呼び先が多重定義なら降りていました。
+`println` はまさに多重定義なので `println(1, "a")` が通りません。
+
+実 scalac に当てて確かめた順序は次のとおりです。
+
+- **書いた引数個数を取る候補が 1 本でもあれば、タプル化しない。**
+  `def c(x: String, y: String)` / `def c(t: (Int, String))` に `c(1, "x")` は
+  scalac でも `type mismatch; found: Int(1) required: String` です（`hk_tuple_bad`）。
+- どの候補もその個数を取らないときだけ、引数を 1 個のタプルに詰めて**もう一度だけ**
+  型付けし直します（`println(1, "a")` → `println((1, "a")): Any`）。
+- 詰め直した後は普通のオーバーロード解決が走ります。`def b(x: Any)` /
+  `def b(t: (Int, String))` に `b(1, "x")` は、より特化した `b((Int, String))` が
+  勝ちます（scalac も `bTup`）。
+- 通常の解決が先に成功するならそちらが勝つのは元のままです。`def h(a: Int, b: Int)` /
+  `def h(t: (Int, Int))` に `h(1, 2)` は `two-args` です。
+
+判定は `some_alt_takes_arity`（`check.rs`）で、可変長パラメータと省略可能な
+末尾デフォルトも数えます。**逆向きの展開はしません**: `def g(a: Int, b: Int)` に
+`g((1, 2))` はエラーのままです（`hk_tuple_bad`）。
+
+2 要素に限りません。`Tuple3` … `Tuple22` まで同じ経路で、要素は普通の式です
+（`hk_tuple_lib` で `println(Red == Red, Red.toString, Custom("a") == Custom("a"))`、
+`println(Set(1,2) & Set(2,3), Set(1,2) | Set(3), Set(1,2) diff Set(1))`、
+`println(f.isDefinedAt(1), f.applyOrElse(-1, (_: Int) => "neg"))`、
+4 要素・6 要素・22 要素を実 scalac と突き合わせています）。23 要素以上は
+`Tuple23` が無いので scalac と同じくエラーです。
+
+**警告は出しません。** nsc は自動タプル化のときに警告を出しますが、2.13.16 では
+`-deprecation` ではなく **`-Xlint:adapted-args`** です
+（`adapted the argument list to the expected 2-tuple: add additional parens instead`）。
+scala-rs はこの lint を持っていないので、**警告なしで受理します**。
+
+| fixture | 何を固定するか | 期待出力 |
+| --- | --- | --- |
+| `hk_base.scala`（`crates/cli/tests/hkinfer.rs`、私有ランタイム・library dual-run） | 引数の基底型から型引数を解く: オブジェクト（1 階 `Box[Int]` / 高階 `Ctor[IdBox]`）、クラスのインスタンス、`this.type` を返すメソッドの結果、`val sv: SelfInt.type` のパス型 | `7` `s` `3` `5` `6` `8` |
+| `hk_base_lib.scala`（`crates/cli/tests/hkinfer.rs`、library dual-run） | 報告そのままの形: `object OC extends C[Option]` / `class LC extends C[List]` を `def use[F[_]](c: C[F])` に。明示指定 `use[Option](OC)` と 1 階の `firstOrder(OD, 42)` も | `Some(1)` `List(1)` `Some(1)` `42` |
+| `hk_base_bad.scala`（`crates/cli/tests/hkinfer.rs`、異常系・両モード） | 基底型の型引数は合っていなければならない（`need(OD)` / `two(OD, "s")`）。実 scalac も 2 件 | （コンパイルエラー 2 件） |
+| `hk_tuple.scala`（`crates/cli/tests/hkinfer.rs`、私有ランタイム・library dual-run） | 自動タプル化の順序: 単一メソッド（`f` / `s`）、同じ個数の候補が勝つ（`h`）、多重定義でタプル化してから最特化で選ぶ（`a` / `b`） | `1` `3z` `two-args` `aAny` `bTup` |
+| `hk_tuple_lib.scala`（`crates/cli/tests/hkinfer.rs`、library dual-run のみ） | `println(1, "a")` が `(1,a)` を出す。`Tuple3` / `Tuple4` / `Tuple6` も同じ（`==`・拡張メソッド・`PartialFunction` のメンバを要素に持つ形も）。私有ランタイムの `Tuple2` には自前の `toString` が無く、`println((1, "a"))` と括弧を書いても同じように差が出るので jar 限定 | `(1,a)` `1` `(true,Red,true)` `(3,4)` `(Set(2),Set(1, 2, 3),Set(2))` `(true,neg)` `(1,2,3,4)` `(1,b,3.0,true,c,6)` |
+| `hk_tuple_bad.scala`（`crates/cli/tests/hkinfer.rs`、異常系・両モード） | タプル化が**通してはいけないもの**: `g((1, 2))` の逆展開、タプルでないパラメータ（`one(1, 2)`）、引数なしメソッド（`zero(1, 2)`）、同じ個数の候補があるとき（`c(1, "x")`）。実 scalac も同じ 4 件 | （コンパイルエラー 4 件） |
+
+計測は `files=184 errors=518 files_with_errors=80` → **`errors=517
+files_with_errors=80`**。エラーの多重集合の差は**ちょうど 1 件**で、
+消えたのは `type mismatch; found: DBIOAction[R, S, Effect with E with E2]
+required: DBIOAction[R, S, E]`、**増えたものはありません**。slick には
+`object` を型クラスの証人として渡す形も、引数個数の合わないオーバーロード呼び出しも
+ほとんど出てこないので、この 2 件は slick の数字ではあまり動きません
+（どちらも実 scalac との差分から出てきたものです）。
+
 ### Remaining
 
 - **for 内包の値定義に続くガード**（`agent/mismatch6` で診断だけ入れた、未実装）。
@@ -3312,6 +3404,19 @@ files_with_errors=80`**。生の件数はあまり動きませんが、**この�
   slick の `slick/basic/BasicBackend.scala` に `not found: type Ref` が残っている。
   `import cats.effect.kernel.Ref` のように実クラスを直接指せば通る（「import の残り」(a) と同じ穴）
 - **trait の `val` / `lazy val` を継承先から読む codegen**（`IncompatibleClassChangeError: Found interface T, but class was expected`。lazysig 以前からある別件。fixture は trait の `def` を使って回避している）
+
+- **私有ランタイムの `Tuple2` に `toString` が無い**（`agent/hkinfer` で気づいた、
+  自動タプル化とは無関係の別件。main でも同じ）。`--no-scala-library` では
+  `println((1, "a"))` が `(1,a)` ではなく `scala.Tuple2@…` になります。括弧を
+  省いた `println(1, "a")` でも当然同じなので、`hk_tuple_lib` は jar 限定に
+  してあります。`runtime.rs` が生成する `TupleN` に `toString` / `equals` /
+  `hashCode` を持たせるのが筋です。
+
+- **自動タプル化の `-Xlint:adapted-args` 警告**（`agent/hkinfer`、未実装）。
+  nsc は自動タプル化のときに
+  `adapted the argument list to the expected 2-tuple: add additional parens instead`
+  を出します（2.13.16 では `-deprecation` ではなく `-Xlint:adapted-args`）。
+  scala-rs にはこの lint の枠組みが無いので、**警告なしで受理**します。
 
 ## ライセンス
 

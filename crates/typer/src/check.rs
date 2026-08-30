@@ -7630,6 +7630,58 @@ impl Typer {
         true
     }
 
+    /// Whether some alternative of `fun_ty` can be called with `n` arguments,
+    /// counting a repeated parameter and omissible trailing defaults. Types
+    /// are not looked at: this is nsc's arity filter, which runs before
+    /// alternatives are weighed against the argument types.
+    fn some_alt_takes_arity(&self, fun_ty: &Type, fun_sym: SymbolId, n: usize) -> bool {
+        let mut sigs: Vec<(SymbolId, Vec<Type>)> = Vec::new();
+        match strip_annotations(fun_ty) {
+            Type::Overload(alts) => {
+                // Prefer the alternatives the selection found: the `Overload`
+                // type can carry a subset, and `drop_overridden` removes the
+                // ones an override already replaced.
+                let named = if fun_sym.is_none() {
+                    Vec::new()
+                } else {
+                    let name = self.st.get(fun_sym).name.clone();
+                    self.drop_overridden(self.overload_alternatives(fun_sym, &name))
+                };
+                if named.is_empty() {
+                    for a in alts {
+                        if let Type::Method { paramss, .. } = a {
+                            sigs.push((
+                                SymbolId::NONE,
+                                paramss.first().cloned().unwrap_or_default(),
+                            ));
+                        }
+                    }
+                } else {
+                    for m in named {
+                        if let Type::Method { paramss, .. } = &self.st.get(m).ty {
+                            sigs.push((m, paramss.first().cloned().unwrap_or_default()));
+                        }
+                    }
+                }
+            }
+            Type::Class { sym, .. } | Type::ModuleRef(sym) => {
+                for m in self.st.lookup_member(*sym, "apply") {
+                    if let Type::Method { paramss, .. } = &self.st.get(m).ty {
+                        sigs.push((m, paramss.first().cloned().unwrap_or_default()));
+                    }
+                }
+            }
+            _ => {}
+        }
+        sigs.iter().any(|(m, ps)| {
+            let (fixed, repeated) = split_repeated(ps);
+            if repeated.is_some() {
+                return n >= fixed.len();
+            }
+            n == ps.len() || (n < ps.len() && self.trailing_omissible(*m, 0, n, ps.len()))
+        })
+    }
+
     /// nsc's tuple adaptation: an argument list that fits no alternative is
     /// retried packed into a single tuple, so `Some(a, b)` means `Some((a,
     /// b))`. slick's generated `TupleSupport` writes `Some((p._1, p._2),
@@ -7640,10 +7692,14 @@ impl Typer {
     /// back so the error still describes what was written. Named arguments are
     /// left alone -- `f(a = 1, b = 2)` is a names/defaults call, not a tuple.
     ///
-    /// nsc only adapts a *single* method this way; an overloaded callee is
-    /// resolved by `inferMethodAlternative`, which never tuples. `Lit(1, 2,
+    /// An overloaded callee is filtered by *arity* first, and nsc reports
+    /// against the alternatives that take the written number of arguments
+    /// rather than tupling: `c(1, "x")` against `c(String, String)` /
+    /// `c((Int, String))` is the type mismatch scalac gives, and `Lit(1, 2,
     /// 3)` against `apply(String, Any, Boolean = …)` / `apply[T](T)(implicit
-    /// Tagged[T])` stays the type mismatch scalac reports.
+    /// Tagged[T])` stays a mismatch too. Only when *no* alternative takes that
+    /// many arguments -- `println(1, "a")`, whose alternatives are nullary and
+    /// unary -- is the whole list packed into one tuple.
     fn retry_tupled_args(&mut self, tree: &mut Tree, pt: &Type) -> bool {
         let TreeKind::Apply { fun, args } = &tree.kind else {
             return false;
@@ -7665,7 +7721,7 @@ impl Typer {
             }
             _ => false,
         };
-        if overloaded {
+        if overloaded && self.some_alt_takes_arity(&fun.ty, fun.sym, args.len()) {
             return false;
         }
         let saved = tree.clone();
@@ -9536,12 +9592,22 @@ impl Typer {
     /// The argument type read as the parameter's own class, when it is a
     /// strict subclass of it. Everything else is handed back unchanged.
     fn align_to_param_class(&self, param: &Type, arg: &Type) -> Type {
-        let (Type::Class { sym: ps, args: pas }, Type::Class { sym: as_, .. }) = (param, arg)
-        else {
+        let Type::Class { sym: ps, args: pas } = param else {
             return arg.clone();
         };
-        if ps == as_ || pas.is_empty() {
+        if pas.is_empty() {
             return arg.clone();
+        }
+        // A singleton argument (`object OD extends D[Int]`, `this`, `p.type`)
+        // is lined up the same way: its base type at the parameter's class is
+        // what carries the type arguments.
+        match arg {
+            Type::Class { sym: as_, .. } if as_ == ps => return arg.clone(),
+            Type::Class { .. }
+            | Type::ModuleRef(_)
+            | Type::ThisType(_)
+            | Type::SingleType { .. } => {}
+            _ => return arg.clone(),
         }
         match self.base_type_instance(arg, *ps, 0) {
             Some(b) => b,
@@ -12397,17 +12463,31 @@ impl Typer {
         if depth > 16 {
             return None;
         }
-        let Type::Class { sym, args } = ty else {
-            return None;
+        // nsc's `Types.baseType` reads a singleton type through the type it
+        // widens to: `OD.type` *is* a `D[Int]` when the module class extends
+        // `D[Int]`, so an argument written as a bare `object` name still
+        // pins the callee's type parameters.
+        let (sym, args) = match ty {
+            Type::Class { sym, args } => (*sym, args.clone()),
+            Type::ModuleRef(s) | Type::ThisType(s) => (*s, Vec::new()),
+            Type::SingleType { prefix, sym } => {
+                let under = self.st.get(*sym).ty.clone();
+                let under = if under.is_no_type() { prefix } else { &under };
+                return self.base_type_instance(under, target, depth + 1);
+            }
+            Type::Annotated { tpe, .. } => {
+                return self.base_type_instance(tpe, target, depth + 1);
+            }
+            _ => return None,
         };
-        if *sym == target {
+        if sym == target {
             return Some(ty.clone());
         }
-        for p in self.st.get(*sym).parents.clone() {
+        for p in self.st.get(sym).parents.clone() {
             let p = if args.is_empty() {
                 p
             } else {
-                self.st.subst_tparams(*sym, args, &p)
+                self.st.subst_tparams(sym, &args, &p)
             };
             if let Some(found) = self.base_type_instance(&p, target, depth + 1) {
                 return Some(found);
