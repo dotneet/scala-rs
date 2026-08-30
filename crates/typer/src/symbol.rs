@@ -252,6 +252,20 @@ pub struct Symbol {
     /// call is `invokeinterface` or `invokevirtual`. Meaningless when
     /// `declaring_class` is empty.
     pub declaring_is_interface: bool,
+    /// The pickled *declaration* a member completed from a library pickle
+    /// stands for: `<declaring class>#<jvm name><erased parameter descriptors>`.
+    ///
+    /// `PickleSupply` installs an inherited member on the class it was asked
+    /// for, so the one `IterableOps.map` is copied onto `immutable.Seq` when a
+    /// `Seq` receiver asks for it and onto `collection.IndexedSeq` when an
+    /// `IndexedSeq` receiver does. `immutable.IndexedSeq` has both above it and
+    /// then sees two `map`s, differing only in the vocabulary each copy was
+    /// rewritten into -- one declaration, not an overload set. This is what
+    /// says so; `Typer::collapse_pickled_copies` (check.rs) collapses them.
+    ///
+    /// Empty for everything the prelude, a source file or a class file
+    /// declares.
+    pub pickled_origin: String,
     /// nsc `ABSOVERRIDE`: the source wrote `abstract override`, so `super` in
     /// this member is bound by the *linearization* of whatever concrete class
     /// mixes the trait in. `flags` cannot carry this: the namer already sets
@@ -411,6 +425,7 @@ impl SymbolTable {
                 macro_impl: None,
                 declaring_class: String::new(),
                 declaring_is_interface: false,
+                pickled_origin: String::new(),
                 abstract_override: false,
             }],
             scopes: vec![Scope::default()],
@@ -494,6 +509,7 @@ impl SymbolTable {
             macro_impl: None,
             declaring_class: String::new(),
             declaring_is_interface: false,
+            pickled_origin: String::new(),
             abstract_override: false,
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {

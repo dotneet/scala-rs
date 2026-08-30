@@ -589,6 +589,7 @@ impl PickleSupply {
                 &internal,
                 name,
                 &jvm_member,
+                &hit.owner,
                 &shape,
                 &class_scope,
                 &mut seen_shapes,
@@ -614,6 +615,9 @@ impl PickleSupply {
         internal: &str,
         name: &str,
         jvm_member: &str,
+        // The pickled class that *declares* this member, which is not
+        // `internal` whenever the member is inherited.
+        pickle_owner: &str,
         shape: &Shape,
         class_scope: &HashMap<String, Type>,
         seen_shapes: &mut HashSet<String>,
@@ -767,6 +771,10 @@ impl PickleSupply {
             st.get_mut(m).declaring_is_interface = found.declared_by_interface;
         }
 
+        // Which pickled declaration this copy stands for. The receiver's class
+        // is *not* part of it: the point is that the same declaration, pulled
+        // down onto two different classes, is recognisable as one member.
+        st.get_mut(m).pickled_origin = format!("{pickle_owner}#{jvm_member}{want:?}");
         st.get_mut(m).jvm_name = found.desc;
         st.get_mut(m).tparams = tparams;
         st.get_mut(m).params = paramss_sym.iter().flatten().copied().collect();
