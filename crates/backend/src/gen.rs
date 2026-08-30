@@ -6545,11 +6545,17 @@ fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
                     let ic = ctx.st.get(fun.sym).intrinsic;
                     if matches!(ic, Intrinsic::AsInstanceOf) {
                         gen_expr(asm, frame, ctx, qual);
+                        // Both emitters consume a receiver, so a `Unit`
+                        // qualifier has to leave its `BoxedUnit` behind:
+                        // `().asInstanceOf[Unit]` pops it again, and
+                        // `().isInstanceOf[T]` tests it.
+                        adapt_unit_arg(asm, ctx, qual, &qual.ty);
                         emit_as_instance_of(asm, ctx, &tree.ty);
                         return;
                     }
                     if matches!(ic, Intrinsic::IsInstanceOf) {
                         gen_expr(asm, frame, ctx, qual);
+                        adapt_unit_arg(asm, ctx, qual, &qual.ty);
                         let target = args.first().map(|a| &a.ty).unwrap_or(&Type::Any);
                         emit_is_instance_of(asm, ctx, target);
                         return;
@@ -7096,6 +7102,12 @@ fn gen_select(
                     invoke_super(asm, ctx, tree.sym);
                 } else if matches!(ic, Intrinsic::AnyHash) {
                     emit_any_hash(asm, &qual.ty);
+                } else if matches!(ic, Intrinsic::GetClass) {
+                    // Same as the `Apply` path: `1.getClass` is `Integer.TYPE`
+                    // and `().getClass` is `Void.TYPE`, not the box's class.
+                    // Paren-less, this fell through to a plain
+                    // `Object.getClass` and printed `class java.lang.Integer`.
+                    emit_get_class(asm, ctx, &qual.ty);
                 } else if matches!(ic, Intrinsic::StringToInt) {
                     asm.invokestatic("java/lang/Integer", "parseInt", "(Ljava/lang/String;)I");
                 } else if matches!(ic, Intrinsic::StringToLong) {
@@ -7919,6 +7931,8 @@ fn gen_apply(
             }
             Intrinsic::AnyToString => {
                 gen_expr(asm, frame, ctx, qual);
+                // `().toString` is `BoxedUnit.UNIT.toString`, i.e. `"()"`.
+                adapt_unit_arg(asm, ctx, qual, &qual.ty);
                 if is_jvm_primitive(&qual.ty) && !is_unit_like(&qual.ty) {
                     emit_box(asm, &qual.ty);
                 }
@@ -7938,23 +7952,15 @@ fn gen_apply(
             }
             Intrinsic::AnyHash => {
                 gen_expr(asm, frame, ctx, qual);
+                // `().##` hashes the `BoxedUnit` singleton (`0`).
+                adapt_unit_arg(asm, ctx, qual, &qual.ty);
                 emit_any_hash(asm, &qual.ty);
                 return;
             }
             Intrinsic::GetClass => {
                 gen_expr(asm, frame, ctx, qual);
-                // `1.getClass` is `Integer.TYPE`, not `Integer.class`; the
-                // receiver is still evaluated for its effects.
-                if is_jvm_primitive(&qual.ty) {
-                    if matches!(qual.ty, Type::Long | Type::Double) {
-                        asm.pop2();
-                    } else {
-                        asm.pop();
-                    }
-                    emit_class_constant(asm, ctx, &qual.ty);
-                } else {
-                    asm.invokevirtual("java/lang/Object", "getClass", "()Ljava/lang/Class;");
-                }
+                adapt_unit_arg(asm, ctx, qual, &qual.ty);
+                emit_get_class(asm, ctx, &qual.ty);
                 return;
             }
             Intrinsic::Identity => {
@@ -9049,6 +9055,11 @@ fn gen_select_receiver(
         }
     }
     gen_expr(asm, frame, ctx, qual);
+    // A member selected *on* a `Unit` value needs a real receiver, exactly as
+    // in `gen_receiver`: `().toString`, `().hashCode`, `().isInstanceOf[T]`
+    // all invoke on the `BoxedUnit` singleton, and the qualifier expression
+    // left nothing on the stack.
+    adapt_unit_arg(asm, ctx, qual, &qual.ty);
 }
 
 fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tree) {
@@ -9081,6 +9092,14 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
                 }
             }
             gen_expr(asm, frame, ctx, qual);
+            // A method invoked *on* a `Unit` value gets a real receiver: the
+            // receiver is a value position like any other, and `Unit` erases
+            // to `scala/runtime/BoxedUnit` there. The expression itself left
+            // nothing on the stack (`()`, `g()`, a `Unit` local), so the
+            // singleton is materialised here -- otherwise `() == ()` popped an
+            // operand that was never pushed (`VerifyError: Operand stack
+            // underflow`).
+            adapt_unit_arg(asm, ctx, qual, &qual.ty);
             // `x.toString` on an `Int` calls `java/lang/Integer.toString`, so
             // the primitive receiver has to be boxed first.
             if is_jvm_primitive(&qual.ty) && !is_unit_like(&qual.ty) && !fun.sym.is_none() {
@@ -14697,6 +14716,9 @@ fn gen_eq_ne(
     gen_receiver(asm, frame, ctx, fun);
     if let Some(arg) = args.first() {
         gen_expr(asm, frame, ctx, arg);
+        // A `Unit` operand is a `BoxedUnit` on the JVM but leaves nothing on
+        // the stack, so the singleton has to be pushed here.
+        adapt_unit_arg(asm, ctx, arg, &arg.ty);
         if is_jvm_primitive(&arg.ty) && !matches!(arg.ty, Type::Unit | Type::NoType) {
             emit_box(asm, &arg.ty);
         }
@@ -14791,6 +14813,9 @@ fn gen_any_eq(
     }
     if let Some(arg) = arg {
         gen_expr(asm, frame, ctx, arg);
+        // `x == ()`: the right-hand operand is a `BoxedUnit` on the JVM even
+        // though the expression that produced it left nothing behind.
+        adapt_unit_arg(asm, ctx, arg, &arg.ty);
         if is_jvm_primitive(&arg.ty) && !is_unit_like(&arg.ty) {
             emit_box(asm, &arg.ty);
         }
@@ -17473,6 +17498,23 @@ fn append_desc(ty: &Type) -> &'static str {
 
 /// `classOf[T]`: `ldc` of the class constant, or the boxed type's `TYPE`
 /// field for a primitive, as nsc emits.
+/// `x.getClass` with the receiver already on the stack. A primitive (and
+/// `Unit`, whose receiver is the `BoxedUnit` singleton) answers with the
+/// `TYPE` constant -- `1.getClass` is `int`, `().getClass` is `void` -- so the
+/// receiver is dropped again after being evaluated for its effects.
+fn emit_get_class(asm: &mut Assembler, ctx: &EmitCtx, recv_ty: &Type) {
+    if !is_jvm_primitive(recv_ty) {
+        asm.invokevirtual("java/lang/Object", "getClass", "()Ljava/lang/Class;");
+        return;
+    }
+    match recv_ty.widen_constant() {
+        // A `Unit` receiver is a one-slot `BoxedUnit` reference, not two.
+        Type::Long | Type::Double => asm.pop2(),
+        _ => asm.pop(),
+    }
+    emit_class_constant(asm, ctx, &recv_ty.widen_constant());
+}
+
 fn emit_class_constant(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
     let boxed = |asm: &mut Assembler, owner: &str| {
         asm.getstatic(owner, "TYPE", "Ljava/lang/Class;");
@@ -17530,7 +17572,10 @@ fn emit_any_hash(asm: &mut Assembler, recv: &Type) {
         Type::Float => ("floatHash", "(F)I"),
         Type::Long => ("longHash", "(J)I"),
         _ => {
-            if is_jvm_primitive(&ty) {
+            // A `Unit` receiver is already the `BoxedUnit` singleton by the
+            // time it gets here (`gen_select_receiver` / `gen_receiver`
+            // materialise it); boxing again would push a second one.
+            if is_jvm_primitive(&ty) && !is_unit_like(&ty) {
                 emit_box(asm, &ty);
             }
             ("anyHash", "(Ljava/lang/Object;)I")
