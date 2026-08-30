@@ -5178,6 +5178,17 @@ fn add_either(st: &mut SymbolTable) {
     let lf = st.alloc("value", left, SymKind::Term, Flags::FINAL, "");
     st.get_mut(lf).ty = Type::TypeParam(la);
     st.get_mut(left).ctor_fields = vec![lf];
+    // The field is private in the library, so `case Left(s)` has to read it
+    // through the accessor -- without this the pattern emitted a `getfield`
+    // and threw `IllegalAccessError`. Same reason as `Success.value`.
+    method(
+        st,
+        left,
+        "value",
+        vec![],
+        Type::TypeParam(la),
+        Intrinsic::None,
+    );
     let left_mod = module(st, st.scala_pkg, "Left", "scala/util/Left$");
     let left_cls = st.module_class_of(left_mod);
     let left_apply = method(
@@ -5207,6 +5218,14 @@ fn add_either(st: &mut SymbolTable) {
     let rf = st.alloc("value", right, SymKind::Term, Flags::FINAL, "");
     st.get_mut(rf).ty = Type::TypeParam(rb);
     st.get_mut(right).ctor_fields = vec![rf];
+    method(
+        st,
+        right,
+        "value",
+        vec![],
+        Type::TypeParam(rb),
+        Intrinsic::None,
+    );
     let right_mod = module(st, st.scala_pkg, "Right", "scala/util/Right$");
     let right_cls = st.module_class_of(right_mod);
     let right_apply = method(

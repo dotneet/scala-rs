@@ -229,5 +229,6 @@ conform!(
     fn_compose,
     try_extractor,
     curried_eta,
-    ordering_double
+    ordering_double,
+    either_pattern
 );
