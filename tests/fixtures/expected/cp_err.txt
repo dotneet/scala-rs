@@ -1,0 +1,9 @@
+4
+scala.MatchError
+one
+scala.MatchError: 3 (of class java.lang.Integer)
+A
+scala.MatchError: b (of class java.lang.String)
+scala.MatchError: null
+p6
+scala.MatchError: Q (of class Main$Q$)

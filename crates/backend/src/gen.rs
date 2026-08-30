@@ -6300,6 +6300,29 @@ fn throw_runtime(asm: &mut Assembler, msg: &str) {
     asm.athrow();
 }
 
+/// A `match` that runs out of cases throws `scala.MatchError` carrying the
+/// scrutinee -- what nsc emits, and what `case _: MatchError` catches. A bare
+/// `RuntimeException("match error")` was neither. The private runtime emits its
+/// own `scala/MatchError` (`runtime.rs`), so both modes throw the same class.
+fn throw_match_error(asm: &mut Assembler, ctx: &EmitCtx, sel_ty: &Type, tmp: u16) {
+    let sel_ty = sel_ty.widen_constant();
+    let sel_sort = jvm_sort(&sel_ty);
+    asm.new_obj("scala/MatchError");
+    asm.dup();
+    load(asm, tmp, sel_sort);
+    if sel_sort == JvmSort::Void {
+        if ctx.library_abi {
+            emit_boxed_unit(asm);
+        } else {
+            asm.aconst_null();
+        }
+    } else if is_jvm_primitive(&sel_ty) {
+        emit_box(asm, &sel_ty);
+    }
+    asm.invokespecial("scala/MatchError", "<init>", "(Ljava/lang/Object;)V");
+    asm.athrow();
+}
+
 fn throw_not_implemented(asm: &mut Assembler) {
     asm.new_obj("scala/NotImplementedError");
     asm.dup();
@@ -15169,7 +15192,7 @@ fn gen_match(
         asm.goto(end);
         asm.mark(fail);
     }
-    throw_runtime(asm, "match error");
+    throw_match_error(asm, ctx, &selector.ty, tmp);
     asm.mark(end);
 }
 
@@ -15297,10 +15320,44 @@ fn gen_int_switch(
     }
     if default_idx.is_none() {
         asm.mark(miss);
-        throw_runtime(asm, "match error");
+        throw_match_error(asm, ctx, &selector.ty, tmp);
     }
     asm.mark(end);
     true
+}
+
+/// The class `unapply`'s first parameter is *declared* with, read off the
+/// descriptor the call will use.
+///
+/// The descriptor is the only reliable source: a type-parameter parameter
+/// erases to `Object` however its `Type` reads, and casting to the `Type`'s
+/// own name would name a class the method never sees. `None` means the
+/// parameter is `Object` or a primitive -- nothing to cast to.
+fn unapply_param_class(ctx: &EmitCtx, uid: SymbolId) -> Option<String> {
+    if uid.is_none() {
+        return None;
+    }
+    let desc = method_desc_boxed(ctx.st, uid, ctx.boxed_vars);
+    let params = desc.strip_prefix('(')?.split(')').next()?.to_string();
+    if let Some(rest) = params.strip_prefix('L') {
+        let n = rest.split(';').next()?;
+        return (n != "java/lang/Object").then(|| n.to_string());
+    }
+    if params.starts_with('[') {
+        // `[` runs to the end of one descriptor; the first parameter's is a
+        // prefix of `params`, and an array descriptor is its own cast target.
+        let bytes = params.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i] == b'[' {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'L' {
+            let end = params[i..].find(';')? + i + 1;
+            return Some(params[..end].to_string());
+        }
+        return Some(params[..=i.min(bytes.len() - 1)].to_string());
+    }
+    None
 }
 
 fn gen_unapply_pattern(
@@ -15391,6 +15448,26 @@ fn gen_unapply_pattern(
         load(asm, tmp, sel_sort);
         asm.ifnull(fail);
     }
+    // `unapply` takes its own parameter type, and the value in `tmp` does not
+    // always have it. A *nested* extractor is now handed the value as the
+    // source left it (see `reads_erased_value`), which is `Object` whenever the
+    // source field is erased -- and the pattern's own type may be wider than
+    // the extractor accepts (`case Some(Two(a, b))` on an `Option[Any]`). nsc
+    // emits `instanceof` / `ifeq` / `checkcast` in that second case and falls
+    // through to the next case; without the test the call did not even verify.
+    let param_class = (!is_seq && sel_sort == JvmSort::Ref)
+        .then(|| unapply_param_class(ctx, uid))
+        .flatten();
+    if let Some(cls) = &param_class {
+        let known = param0
+            .as_ref()
+            .is_some_and(|p| ctx.st.is_sub_type(&pat.ty, p));
+        if !known {
+            load(asm, tmp, sel_sort);
+            asm.instanceof(cls);
+            asm.ifeq(fail);
+        }
+    }
     if !owner.is_none() && !is_module_class(ctx.st, owner) {
         gen_expr(asm, frame, ctx, fun);
     } else {
@@ -15401,6 +15478,14 @@ fn gen_unapply_pattern(
         // The forwarder's parameter is `SeqOps`; the scrutinee's static type
         // may be anything the test above let through.
         asm.checkcast(&seq_pat_test_class(ctx, param0.as_ref()));
+    } else if let Some(cls) = &param_class {
+        asm.checkcast(cls);
+    } else if sel_sort == JvmSort::Ref {
+        // A primitive-parameter `unapply` reached through an erased field:
+        // the descriptor wants the unboxed value.
+        if let Some(p) = param0.as_ref().filter(|p| is_jvm_primitive(p)) {
+            emit_unbox(asm, p);
+        }
     }
     if let Some(p) = &param0 {
         if !is_jvm_primitive(p) && sel_sort != JvmSort::Ref && sel_sort != JvmSort::Void {
@@ -15463,15 +15548,29 @@ fn gen_unapply_pattern(
             asm.pop();
         }
     } else {
-        asm.checkcast("scala/Tuple2");
+        // The tuple goes in a local, not on the stack: a sub-pattern that
+        // tests jumps to `fail` from inside `bind_subpattern`, and the `dup`ed
+        // tuple left there made the two paths disagree about the stack
+        // (`VerifyError: Inconsistent stackmap frames`, for
+        // `case P(v) ~ _` on a user-defined infix extractor).
+        let tuple = format!("scala/Tuple{}", args.len());
+        asm.checkcast(&tuple);
+        let slot = frame.alloc_tmp(JvmSort::Ref);
+        store(asm, slot, JvmSort::Ref);
         for (i, a) in args.iter().enumerate() {
-            let fname = if i == 0 { "_1" } else { "_2" };
-            asm.dup();
-            asm.getfield("scala/Tuple2", fname, "Ljava/lang/Object;");
+            let fname = format!("_{}", i + 1);
+            load(asm, slot, JvmSort::Ref);
+            if args.len() == 2 {
+                // `scala.Tuple2`'s two fields are public, and so are the
+                // private runtime's; every wider tuple keeps them private
+                // behind an accessor, which is what nsc calls.
+                asm.getfield(&tuple, &fname, "Ljava/lang/Object;");
+            } else {
+                asm.invokevirtual(&tuple, &fname, "()Ljava/lang/Object;");
+            }
             let sort = coerce_subpattern(asm, ctx, a);
             bind_subpattern(asm, frame, ctx, a, sort, fail);
         }
-        asm.pop();
     }
 }
 
@@ -15484,7 +15583,7 @@ fn gen_unapply_pattern(
 /// then `aload`ed -- `val (n: Int, s: String) = …` was
 /// `VerifyError: Bad local variable type`.
 fn coerce_subpattern(asm: &mut Assembler, ctx: &EmitCtx, pat: &Tree) -> JvmSort {
-    if is_type_test_pat(pat) {
+    if reads_erased_value(ctx, pat) {
         return JvmSort::Ref;
     }
     if is_jvm_primitive(&pat.ty) {
@@ -15495,15 +15594,43 @@ fn coerce_subpattern(asm: &mut Assembler, ctx: &EmitCtx, pat: &Tree) -> JvmSort 
     jvm_sort(&pat.ty)
 }
 
-/// A `_: T` ascription **tests**; it does not cast. Emitting the narrowing
-/// `checkcast` before `gen_pattern`'s own `instanceof` turned a non-match into
-/// a `ClassCastException` (`case List((s, _: TableNode))` on a plain `Node`).
-fn is_type_test_pat(pat: &Tree) -> bool {
+/// Does this sub-pattern want the extracted value exactly as the source left
+/// it, rather than narrowed to the sub-pattern's own type?
+///
+/// Every sub-pattern that **tests** does. nsc casts an extracted value to the
+/// *source's* static type (`$colon$colon.head` on a `List[C]` is
+/// `checkcast C`) and only then emits `instanceof P` / `ifeq` / `checkcast P`
+/// for the sub-pattern; narrowing to the sub-pattern's type up front turns a
+/// non-match into a `ClassCastException`. That is what `case P(v) :: t` did to
+/// every list whose head was not a `P`, and what `case Some(1)` on an
+/// `Option[Any]` did to every non-`Int` element.
+///
+/// A binding `x` is the one shape that really does need the narrowing: its
+/// local is typed at the pattern's type. `x @ p` does not -- `gen_pattern`'s
+/// `Bind` arm re-reads the value and narrows it itself, after `p`'s test.
+fn reads_erased_value(ctx: &EmitCtx, pat: &Tree) -> bool {
     match &pat.kind {
-        TreeKind::Typed { .. } => true,
-        TreeKind::Bind { body, .. } => is_type_test_pat(body),
+        // `_: T` and `P(...)` / `Foo(...)` test before they narrow.
+        TreeKind::Typed { .. } | TreeKind::Apply { .. } | TreeKind::UnApply { .. } => true,
+        // A constant or stable-id pattern compares; nsc compares the boxed
+        // constant with `BoxesRunTime.equals` rather than unboxing first.
+        TreeKind::Literal { .. } | TreeKind::Select { .. } => true,
+        TreeKind::Ident { name } => !is_binding_ident(ctx, pat, name),
+        // Nothing to narrow, and `bind_subpattern` pops at the source's sort.
+        TreeKind::Wildcard | TreeKind::Empty => true,
+        TreeKind::Bind { .. } => true,
         _ => false,
     }
+}
+
+/// A lowercase (or `_`-leading) identifier pattern **binds**; `Nil`, `Q` and
+/// other stable ids must be compared.
+fn is_binding_ident(ctx: &EmitCtx, pat: &Tree, name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_lowercase() || c == '_')
+        || pat.sym.is_none()
+        || ctx.st.get(pat.sym).kind == SymKind::Term
 }
 
 /// Put a constant pattern's value on the stack in the *scrutinee's* JVM
@@ -15660,7 +15787,7 @@ fn gen_unapply_wrapper_bind(
             "drop$extension",
             &format!("({self_desc}I)Lscala/collection/immutable/Seq;"),
         );
-        if !is_type_test_pat(star) {
+        if !reads_erased_value(ctx, star) {
             emit_pattern_cast(asm, ctx, &star.ty);
         }
         bind_subpattern(asm, frame, ctx, star, JvmSort::Ref, fail);
@@ -15749,11 +15876,7 @@ fn gen_pattern(
     match &pat.kind {
         TreeKind::Wildcard | TreeKind::Empty => {}
         TreeKind::Ident { name } => {
-            let is_varid = name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_lowercase() || c == '_');
-            if is_varid || pat.sym.is_none() || ctx.st.get(pat.sym).kind == SymKind::Term {
+            if is_binding_ident(ctx, pat, name) {
                 load(asm, tmp, sel_sort);
                 let sort = jvm_sort(&pat.ty);
                 let slot = if pat.sym.is_none() {
@@ -15859,11 +15982,12 @@ fn gen_pattern(
                     }
                     // A field declared as a type parameter erases to Object, so
                     // `case Some(x)` on an `Option[Int]` must unbox before it
-                    // binds. A `_: T` sub-pattern is a *test*, though: casting
-                    // to it here turned `case Some((s, _: TableNode))` on a
-                    // plain `Node` into a `ClassCastException` instead of a
-                    // failed match.
-                    let sort = if is_type_test_pat(a) {
+                    // binds. A sub-pattern that *tests* must not be narrowed
+                    // here, though: casting to it turned
+                    // `case Some((s, _: TableNode))` on a plain `Node`, and
+                    // `case P(v) :: t` on every non-`P` head, into a
+                    // `ClassCastException` instead of a failed match.
+                    let sort = if reads_erased_value(ctx, a) {
                         // The test reads the field as it stands.
                         jvm_sort(&fty)
                     } else {
@@ -16011,14 +16135,7 @@ fn bind_subpattern(
         }
         // A lowercase identifier binds; `Nil` and other stable ids must be
         // compared, so they fall through to `gen_pattern` below.
-        TreeKind::Ident { name }
-            if name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_lowercase() || c == '_')
-                || pat.sym.is_none()
-                || ctx.st.get(pat.sym).kind == SymKind::Term =>
-        {
+        TreeKind::Ident { name } if is_binding_ident(ctx, pat, name) => {
             let slot = if pat.sym.is_none() {
                 frame.alloc_tmp(sort)
             } else if let Some((s, _)) = frame.get(pat.sym) {

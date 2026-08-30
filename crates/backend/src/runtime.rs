@@ -47,6 +47,7 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
         emit_boxed_unit(),
         emit_nothing(),
         emit_not_implemented(),
+        emit_match_error(),
         emit_non_local_return_control(),
         emit_delayed_init(),
         emit_app(),
@@ -1762,6 +1763,100 @@ fn emit_not_implemented() -> EmittedClass {
             "(Ljava/lang/String;)V",
         );
         asm.vreturn();
+    });
+    b.finish()
+}
+
+/// Private-runtime `scala.MatchError`: a `match` that runs out of cases throws
+/// this in both modes, so the class user code catches and the message it prints
+/// are the same with and without the jar. 2.13's message is
+/// `"<obj> (of class <class name>)"`, or `"null"`.
+fn emit_match_error() -> EmittedClass {
+    let mut b = B::class("scala/MatchError", "java/lang/RuntimeException");
+    b.access = ACC_PUBLIC | ACC_SUPER;
+    b.fields.push(Field {
+        access: ACC_PUBLIC | ACC_FINAL,
+        name: "obj".into(),
+        desc: "Ljava/lang/Object;".into(),
+    });
+    // The message is built by a static helper so the constructor has no branch
+    // while `this` is still uninitialised.
+    b.add_code(
+        ACC_PRIVATE | ACC_STATIC,
+        "objString",
+        "(Ljava/lang/Object;)Ljava/lang/String;",
+        2,
+        |asm| {
+            asm.aload(0);
+            let is_null = asm.fresh_label();
+            asm.ifnull(is_null);
+            asm.new_obj("java/lang/StringBuilder");
+            asm.dup();
+            asm.invokespecial("java/lang/StringBuilder", "<init>", "()V");
+            asm.aload(0);
+            asm.invokestatic(
+                "java/lang/String",
+                "valueOf",
+                "(Ljava/lang/Object;)Ljava/lang/String;",
+            );
+            asm.invokevirtual(
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            );
+            asm.ldc_string(" (of class ");
+            asm.invokevirtual(
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            );
+            asm.aload(0);
+            asm.invokevirtual("java/lang/Object", "getClass", "()Ljava/lang/Class;");
+            asm.invokevirtual("java/lang/Class", "getName", "()Ljava/lang/String;");
+            asm.invokevirtual(
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            );
+            asm.ldc_string(")");
+            asm.invokevirtual(
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            );
+            asm.invokevirtual(
+                "java/lang/StringBuilder",
+                "toString",
+                "()Ljava/lang/String;",
+            );
+            asm.areturn();
+            asm.mark(is_null);
+            asm.ldc_string("null");
+            asm.areturn();
+        },
+    );
+    b.add_code(ACC_PUBLIC, "<init>", "(Ljava/lang/Object;)V", 2, |asm| {
+        asm.aload(0);
+        asm.aload(1);
+        asm.invokestatic(
+            "scala/MatchError",
+            "objString",
+            "(Ljava/lang/Object;)Ljava/lang/String;",
+        );
+        asm.invokespecial(
+            "java/lang/RuntimeException",
+            "<init>",
+            "(Ljava/lang/String;)V",
+        );
+        asm.aload(0);
+        asm.aload(1);
+        asm.putfield("scala/MatchError", "obj", "Ljava/lang/Object;");
+        asm.vreturn();
+    });
+    b.add_code(ACC_PUBLIC, "obj", "()Ljava/lang/Object;", 1, |asm| {
+        asm.aload(0);
+        asm.getfield("scala/MatchError", "obj", "Ljava/lang/Object;");
+        asm.areturn();
     });
     b.finish()
 }
