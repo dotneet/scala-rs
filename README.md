@@ -5137,6 +5137,106 @@ error: value += is not a member of T
   jar モードは正しく動きます。既存の「`while` 本体で宣言したローカルの
   StackMapTable」と同じ根と思われます。
 
+### ファクトリメソッドの戻り型と `…Ops` への erasure（`agent/fillconcat`）
+
+型検査は通るのに実行時に落ちる 1 件から始まりました。
+
+```scala
+object Main { def main(a: Array[String]): Unit = println(List.fill(2)(5) ::: List(9)) }
+```
+
+```
+java.lang.VerifyError: Bad type on operand stack
+  Reason: Type 'scala/collection/SeqOps' (current frame, stack[1]) is not
+          assignable to 'scala/collection/immutable/List'
+```
+
+**`List.fill` の戻り型は間違っていません**。`javap -p` で jar を見ると
+`List$` には
+
+```
+public scala.collection.SeqOps fill(int, scala.Function0);
+public java.lang.Object       fill(int, scala.Function0);
+```
+
+の 2 本があり、実 scalac 2.13.16 も**前者**を呼びます
+（`StrictOptimizedSeqFactory[+CC[_] <: SeqOps[…]]` なので `CC[A]` は上限の
+`SeqOps` に erase される）。違いは**その次の 1 命令**だけでした。
+
+```
+# scalac
+invokevirtual List$.fill:(ILscala/Function0;)Lscala/collection/SeqOps;
+checkcast     scala/collection/immutable/List      ← これが無かった
+```
+
+**根本原因**は `crates/backend/src/gen.rs` の `maybe_unbox_erased_result` の
+判定です。ディスクリプタの戻り型が結果型の erasure より広いときに
+`checkcast` を足す規則はもともとありましたが、条件が「**結果型が、宣言された
+戻り型に prelude の継承関係で到達できるか**」でした。`crates/typer/src/prelude_hier.rs`
+は `SeqOps` / `IterableOps` などの `…Ops` トレイトを**意図的に**階層から
+外しているので（メンバを持たないので長さが増えるだけ、と書いてある）、
+`List <: SeqOps` は永遠に示せず、`checkcast` は一度も出ませんでした。
+
+そこで**決定可能な逆向きの問い**に変えました。「宣言された戻り型が、欲しい型に
+**適合すると示せるか**」——示せなければ `checkcast` を出します。片側だけの判定
+で、`false` は「適合しない」ではなく「示せない」を意味します。余計な
+`checkcast` は 3 バイトの無駄で済みますが、足りない `checkcast` は
+メソッド全体が `VerifyError` になるからです。
+
+これは `List.fill` の話でも `:::` の話でもありませんでした。`:::` は
+**右結合**なので `List.fill(2)(5) ::: List(9)` は `List(9).:::(List.fill(2)(5))`
+であり、ファクトリの結果はレシーバではなく**引数**です。実際に壊れていたのは:
+
+| 形 | 直す前 | 直したあと |
+|---|---|---|
+| `List.fill(2)(5) ::: List(9)` | VerifyError | OK |
+| `List.tabulate(3)(i => i) ::: List(9)` | VerifyError | OK |
+| `List.concat(List(1), List(2)) ::: List(9)` | VerifyError | OK |
+| `List.fill(2)(5).head` / `.reverse` | VerifyError | OK |
+| `Vector.fill(2)(5).length` | VerifyError | OK |
+| `val xs = Vector.tabulate(5)(i => i * i); xs.updated(0, 99)` | VerifyError（ローカルのフレーム型が `SeqOps`） | OK |
+| `ArrayBuffer.fill(2)(5).size` / `ListBuffer.fill(2)(5).size` | VerifyError | OK |
+| `List.iterate` / `List.empty` / `List.unfold` | もともと OK | OK |
+| `List.fill(2)(5) ++ List(9)` / `.length` / `.map` / `match` | もともと OK | OK |
+| `Seq.fill` / `Set.fill` / `IndexedSeq.fill` / `Iterator.fill` / `Array.fill` | もともと OK | OK |
+| `TreeMap(…) - key`（宣言は `Map`、結果型は `TreeMap`） | もともと OK（既存の規則） | OK |
+
+`++` や `.length` が通っていたのは `gen.rs` が別経路で明示的な
+ディスクリプタを書いていたからで、`fill` が特別だったわけではありません。
+
+**fixture**（すべて library dual-run のみ。私有ランタイムには `IterableFactory`
+が無いので、`--no-scala-library` では診断が出ることも
+`crates/cli/tests/fillconcat.rs` で見ています）:
+
+| fixture | 見ているもの | 期待 |
+|---|---|---|
+| `fc_factory.scala` | `List` / `Vector` / `Seq` / `Set` / `ArrayBuffer` / `ListBuffer` の `fill` / `tabulate` / `concat` / `iterate` / `empty` / `unfold` を `:::` の引数・レシーバ・`val` 経由・型注釈付き・`match` のスクルーティニで使う | `List(5, 5, 9)` ほか 22 行 |
+| `fc_ops.scala` | `TreeMap - key` / `TreeSet` / `SortedSet` / `SortedMap`、可変バッファ、`LazyList` / `Queue` / `Iterator`、`sum` / `sorted` / `zip` / `toArray` | `1` `2` `List(1, 2, 3)` ほか 25 行 |
+| `fc_local.scala` | ファクトリの結果を `val` に束縛してから複数のメソッドを呼ぶ形（落ちるのはこの形だけで、1 回使って捨てる分には落ちなかった）。`Seq[Int]` への widening と `def` の戻り値経由も | `Vector(0, 1, 4, 9, 16)` ほか 18 行 |
+| `fc_factory_bad.scala`（異常系） | 足した `checkcast` が型エラーを飲み込まないこと（`Vector[Int]` に `List[Int]` を入れる、`List[String]` に `List[Int]`、`::: Vector(9)`） | コンパイルエラー 3 件 |
+
+計測は `files=184 errors=346 files_with_errors=64` → **変わらず**。slick は
+型検査で止まっていて classfile を 1 つも出していない（`classes=0`）ので、
+バックエンドの codegen を直したこのスライスでは数字が動かないのが正しい姿です。
+動かしたのは**出したコードが JVM を通るか**であって、通る本数ではありません。
+
+#### Remaining
+
+- **`List.range` / `Vector.range` / `Seq.range` に `Integral[Int]` が無い**。
+  `List.range(0, 3)` は
+  `no implicit: could not find implicit value of type Integral[Int]` になります。
+  これは erasure ではなく `scala.math` の型クラス階層の穴で、
+  `crates/typer/src/prelude_numhier.rs` が既に
+  「`Integral` / `Fractional` は prelude の時点で symbol table にいない」
+  として記録している残件と同じものです。実 library では
+  `Numeric.IntIsIntegral` が `Integral[Int]` なので、prelude 側の
+  `add_numeric` が付ける型を `Numeric[Int]` から `Integral[Int]` に上げ、
+  `Integral[T] <: Numeric[T]` の辺を張るのが筋です。`sum` / `product` /
+  `Ordering` の implicit 解決に触るので別スライスにしました。
+  **診断は出る**ので黙って通ることはありません
+  （`fillconcat.rs` の `range_still_reports_the_missing_integral` が固定）。
+- `Array.range(0, 3)` は `Integral` を取らない別オーバーロードなので通ります。
+
 ## ライセンス
 
 Apache-2.0

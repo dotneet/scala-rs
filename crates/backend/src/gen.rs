@@ -11618,10 +11618,24 @@ fn maybe_unbox_erased_result(
         // `TreeMap[K, V] - key` is declared to return `Map` on the JVM, and
         // `2.13`'s own signature narrows it to `C`. Without the cast the
         // verifier sees a `Map` where a `TreeMap` is wanted.
+        //
+        // The old test was "does `ty` reach `declared` through its parents",
+        // which only fires for an ancestor the *prelude* models. The library's
+        // `…Ops` traits are deliberately left out of that hierarchy
+        // (`prelude_hier`), so every `IterableFactory` member whose `CC` is
+        // bounded by one — `List$.fill`/`tabulate`/`concat` are declared
+        // `()Lscala/collection/SeqOps;` on the JVM, exactly as in the real jar
+        // — got no cast and blew up in the verifier at the first use of the
+        // result. Ask the opposite, decidable question instead: is the
+        // descriptor's return type *known* to conform to what we want? If we
+        // cannot show that, cast, which is what scalac's erasure does.
         if let (Some(declared), Some(want)) =
             (desc_return_internal(desc), checkcast_internal(ctx.st, ty))
         {
-            if declared != want && ty_extends_internal(ctx.st, ty, &declared) {
+            if declared != want
+                && has_class_sym(ctx.st, ty)
+                && !internal_conforms(ctx.st, &declared, &want)
+            {
                 asm.checkcast(&want);
             }
         }
@@ -11702,10 +11716,42 @@ fn desc_return_internal(desc: &str) -> Option<String> {
     (!inner.is_empty()).then(|| inner.to_string())
 }
 
-/// Does the class of `ty` reach `parent` (an internal name) through its own
-/// parents? `false` when `ty` names no class, which leaves the cast out.
-fn ty_extends_internal(st: &SymbolTable, ty: &Type, parent: &str) -> bool {
-    let Some(start) = st.class_sym_of(ty) else {
+/// Does `ty` erase to a class we actually know, as opposed to a bare type
+/// parameter or an unresolved name? `checkcast_internal` happily turns
+/// `Type::Named { name: "A" }` into `A`, and casting to that would be a
+/// `NoClassDefFoundError`.
+fn has_class_sym(st: &SymbolTable, ty: &Type) -> bool {
+    matches!(ty, Type::String | Type::Function { .. } | Type::Tuple(_))
+        || st.class_sym_of(ty).is_some()
+}
+
+/// The class-like symbol whose JVM internal name is `internal`.
+fn class_sym_named(st: &SymbolTable, internal: &str) -> Option<SymbolId> {
+    st.symbols
+        .iter()
+        .find(|s| {
+            s.is_class_like()
+                && (s.jvm_name == internal
+                    // Source classes in the default package carry no
+                    // `jvm_name`; their internal name is built from the owners.
+                    || (s.jvm_name.is_empty() && class_internal(st, s.id) == internal))
+        })
+        .map(|s| s.id)
+}
+
+/// Is the JVM class `from` *known* to conform to `to`?
+///
+/// Deliberately one-sided: a `false` means "we cannot show it", not "it does
+/// not". Callers use it to decide whether a `checkcast` is needed, and an
+/// unnecessary one only costs three bytes, while a missing one costs the whole
+/// method to `VerifyError`. The library's `…Ops` traits are exactly the case
+/// that has to come out `false`: `scala/collection/SeqOps` is not in the
+/// prelude's hierarchy, so nothing here can show that a `List` is one.
+fn internal_conforms(st: &SymbolTable, from: &str, to: &str) -> bool {
+    if from == to || to == "java/lang/Object" {
+        return true;
+    }
+    let Some(start) = class_sym_named(st, from) else {
         return false;
     };
     let mut work = vec![start];
@@ -11714,7 +11760,7 @@ fn ty_extends_internal(st: &SymbolTable, ty: &Type, parent: &str) -> bool {
         if !seen.insert(id.0) {
             continue;
         }
-        if class_internal(st, id) == parent {
+        if class_internal(st, id) == to {
             return true;
         }
         for p in st.get(id).parents.clone() {
