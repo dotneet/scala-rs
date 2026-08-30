@@ -758,6 +758,13 @@ impl Typer {
         name: &str,
         span: Span,
     ) -> Option<(SymbolId, SymbolId, Type)> {
+        // A higher-kinded conversion is applicable only if its own implicit
+        // clause has a witness (`conv_param_matches`), and that search cannot
+        // load anything -- it takes `&self`. The witness for `FlatMap[Box]`
+        // lives on `Box`'s companion, which is a class file nothing else asks
+        // for, so warm the receiver's implicit scope here, where the mutable
+        // borrow still exists.
+        self.warm_implicit_scope(from);
         let mut hits: Vec<(SymbolId, SymbolId, Type)> = Vec::new();
         let mut ids = self.implicits_in_scope();
         ids.extend(
@@ -791,6 +798,7 @@ impl Typer {
         }
         hits.sort_by_key(|(c, m, _)| (c.0, m.0));
         hits.dedup_by_key(|(c, m, _)| (c.0, m.0));
+        self.drop_inherited_duplicates(&mut hits);
         match hits.len() {
             1 => Some(hits.pop().unwrap()),
             0 => None,
@@ -835,6 +843,38 @@ impl Typer {
                 pool.into_iter().find(|(c, _, _)| *c == winners[0])
             }
         }
+    }
+
+    /// One conversion reached by two routes is one candidate, not an ambiguity.
+    ///
+    /// `object CollectionConverters extends AsScalaExtensions` has
+    /// `ListHasAsScala` both as its own member (the prelude declares it there)
+    /// and as the trait's, and both are in scope after
+    /// `import scala.jdk.CollectionConverters._`. They are the same conversion
+    /// -- same name, same result type, same member -- so the one declared
+    /// further away is dropped rather than left to tie with itself.
+    fn drop_inherited_duplicates(&self, hits: &mut Vec<(SymbolId, SymbolId, Type)>) {
+        if hits.len() < 2 {
+            return;
+        }
+        let shadowed: Vec<bool> = hits
+            .iter()
+            .map(|(c, m, to)| {
+                let owner = self.st.get(*c).owner;
+                let name = &self.st.get(*c).name;
+                hits.iter().any(|(c2, m2, to2)| {
+                    let owner2 = self.st.get(*c2).owner;
+                    c2 != c
+                        && m2 == m
+                        && to2 == to
+                        && &self.st.get(*c2).name == name
+                        && owner != owner2
+                        && self.st.is_ancestor_of(owner, owner2)
+                })
+            })
+            .collect();
+        let mut keep = shadowed.iter().map(|s| !s);
+        hits.retain(|_| keep.next().unwrap_or(true));
     }
 
     fn conversion_declares_member(&self, to: &Type, member: SymbolId) -> bool {
@@ -932,14 +972,14 @@ impl Typer {
                     return None;
                 }
                 if self.conv_param_matches(id, from, &ps[0]) {
-                    Some(self.instantiate_conv_type(id, from, &ps[0], (**ret).clone()))
+                    Some(self.instantiate_conv_type(id, from, (**ret).clone()))
                 } else {
                     None
                 }
             }
             Type::Function { params, ret } if params.len() == 1 => {
                 if self.conv_param_matches(id, from, &params[0]) {
-                    Some(self.instantiate_conv_type(id, from, &params[0], (**ret).clone()))
+                    Some(self.instantiate_conv_type(id, from, (**ret).clone()))
                 } else {
                     None
                 }
@@ -948,15 +988,12 @@ impl Typer {
         }
     }
 
-    fn instantiate_conv_type(&self, id: SymbolId, from: &Type, param: &Type, ty: Type) -> Type {
+    fn instantiate_conv_type(&self, id: SymbolId, from: &Type, ty: Type) -> Type {
         let tps = self.st.get(id).tparams.clone();
         if tps.is_empty() {
             return ty;
         }
-        let args_t: Vec<Type> = tps
-            .iter()
-            .map(|tp| unify_conv_tparam(*tp, param, from).unwrap_or(Type::AnyRef))
-            .collect();
+        let args_t = self.conv_targs(id, from);
         crate::symbol::subst_tparams_slice(&tps, &args_t, &ty)
     }
 
@@ -972,9 +1009,73 @@ impl Typer {
         let Some(param) = param else {
             return vec![Type::AnyRef; tps.len()];
         };
-        tps.iter()
-            .map(|tp| unify_conv_tparam(*tp, &param, from).unwrap_or(Type::AnyRef))
+        let mut solved: Vec<Option<Type>> = tps
+            .iter()
+            .map(|tp| unify_conv_tparam(*tp, &param, from))
+            .collect();
+        self.solve_conv_targs_from_implicits(id, &tps, &mut solved);
+        solved
+            .into_iter()
+            .map(|t| t.unwrap_or(Type::AnyRef))
             .collect()
+    }
+
+    /// A type parameter the receiver does not mention can still be pinned by
+    /// the conversion's *own* implicit clause.
+    ///
+    /// cats writes `catsSyntaxApplicativeError[F[_], E, A](fa: F[A])(implicit
+    /// F: ApplicativeError[F, E])`: `E` appears nowhere in `F[A]`, so falling
+    /// back to `AnyRef` made `fa.attempt` an `F[Either[AnyRef, A]]` -- a
+    /// member that resolves and then fails to conform to anything the caller
+    /// wrote. The witness in scope (`Async[F] <: MonadError[F, Throwable]`)
+    /// says `E = Throwable`, which is exactly how nsc solves it.
+    ///
+    /// Only run for a parameter the *result* type mentions: this is on the
+    /// path of every candidate conversion, and an implicit search per
+    /// candidate is not free.
+    fn solve_conv_targs_from_implicits(
+        &self,
+        id: SymbolId,
+        tps: &[SymbolId],
+        solved: &mut [Option<Type>],
+    ) {
+        let Type::Method { paramss, ret } = &self.st.get(id).ty else {
+            return;
+        };
+        if paramss.len() < 2 {
+            return;
+        }
+        let undet: Vec<SymbolId> = tps
+            .iter()
+            .zip(solved.iter())
+            .filter(|(tp, s)| s.is_none() && crate::check::mentions_tparam(ret, &[**tp]))
+            .map(|(tp, _)| *tp)
+            .collect();
+        if undet.is_empty() {
+            return;
+        }
+        let clauses: Vec<Vec<Type>> = paramss[1..].to_vec();
+        for clause in &clauses {
+            for p in clause {
+                let known: Vec<Type> = tps
+                    .iter()
+                    .zip(solved.iter())
+                    .map(|(tp, s)| s.clone().unwrap_or(Type::TypeParam(*tp)))
+                    .collect();
+                let pt = crate::symbol::subst_tparams_slice(tps, &known, p);
+                let (found, bindings) = self.search_implicit_undet(&pt, &undet, 0);
+                if !found.is_found() {
+                    continue;
+                }
+                for (tp, t) in bindings {
+                    if let Some(i) = tps.iter().position(|x| *x == tp) {
+                        if solved[i].is_none() && !t.is_no_type() && !t.is_error() {
+                            solved[i] = Some(t);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The conversion's *implicit* parameter clauses, with its type parameters
@@ -1045,16 +1146,83 @@ impl Typer {
             }
             t => t.clone(),
         };
-        Tree {
+        let name = self.st.get(id).name.clone();
+        let ident = Tree {
+            id: scala_rs_parser::NodeId(0),
+            span,
+            kind: TreeKind::Ident { name: name.clone() },
+            ty: ty.clone(),
+            sym: id,
+            postfix: false,
+        };
+        let Some(module) = self.wildcard_module_for(id) else {
+            return ident;
+        };
+        let mcls = self.st.module_class_of(module);
+        let qual = Tree {
             id: scala_rs_parser::NodeId(0),
             span,
             kind: TreeKind::Ident {
-                name: self.st.get(id).name.clone(),
+                name: self.st.get(module).name.clone(),
+            },
+            ty: Type::ModuleRef(mcls),
+            sym: module,
+            postfix: false,
+        };
+        Tree {
+            id: scala_rs_parser::NodeId(0),
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(qual),
+                name,
             },
             ty,
             sym: id,
             postfix: false,
         }
+    }
+
+    /// The object a wildcard import brought `id` in through, when `id` is
+    /// *inherited* by that object rather than declared by it.
+    ///
+    /// `import tinycats.syntax.all._` (and `import cats.syntax.all._`) makes
+    /// `toFlatMapOps` visible, but it is declared by the trait
+    /// `FlatMap.ToFlatMapOps` that the object mixes in. Emitted as a bare
+    /// name, codegen loads `this` and casts it to that trait:
+    /// `Main$ cannot be cast to tinycats.FlatMap$ToFlatMapOps`. The receiver
+    /// is the imported object.
+    fn wildcard_module_for(&self, id: SymbolId) -> Option<SymbolId> {
+        let owner = self.st.get(id).owner;
+        if owner.is_none()
+            || matches!(
+                self.st.get(owner).kind,
+                SymKind::Module | SymKind::ModuleClass | SymKind::Package
+            )
+        {
+            return None;
+        }
+        // A member of the enclosing class is already reachable through `this`.
+        if !self.st.this_class.is_none()
+            && (owner == self.st.this_class
+                || crate::pickle_supply::inherits_from(&self.st, self.st.this_class, owner))
+        {
+            return None;
+        }
+        for sc in self.st.scopes.iter().rev() {
+            for w in sc.wildcards() {
+                if !w.offers(&self.st.get(id).name) {
+                    continue;
+                }
+                let m = w.owner;
+                if !matches!(self.st.get(m).kind, SymKind::Module | SymKind::ModuleClass) {
+                    continue;
+                }
+                if crate::pickle_supply::inherits_from(&self.st, m, owner) {
+                    return Some(m);
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn describe_implicits(&self, ids: &[SymbolId]) -> String {

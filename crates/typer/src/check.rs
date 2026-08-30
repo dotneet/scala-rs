@@ -4474,12 +4474,31 @@ impl Typer {
             }
         }
         for o in all {
-            for m in self.st.get(o).members.clone() {
-                let n = self.st.get(m).name.clone();
-                if n.ends_with('$') || n == "<init>" || hidden.iter().any(|h| h == &n) {
+            // `import o._` imports what `o` *has*, not only what it declares
+            // (SLS 4.7). `cats.syntax.all` is an object whose own member list
+            // is empty: every `toFlatMapOps` / `catsSyntaxApplicativeId` comes
+            // from one of the ~60 traits it mixes in, so importing the direct
+            // members alone brought none of cats' syntax layer into scope.
+            // Breadth-first from `o`, so a name a subclass declares is entered
+            // ahead of the one it overrides.
+            let mut work = std::collections::VecDeque::from([o]);
+            let mut walked = std::collections::HashSet::new();
+            while let Some(cur) = work.pop_front() {
+                if cur.is_none() || !walked.insert(cur.0) {
                     continue;
                 }
-                self.st.enter_in_current(&n, m);
+                for m in self.st.get(cur).members.clone() {
+                    let n = self.st.get(m).name.clone();
+                    if n.ends_with('$') || n == "<init>" || hidden.iter().any(|h| h == &n) {
+                        continue;
+                    }
+                    self.st.enter_in_current(&n, m);
+                }
+                for p in self.st.get(cur).parents.clone() {
+                    if let Some(ps) = self.st.class_sym_of(&p) {
+                        work.push_back(ps);
+                    }
+                }
             }
             self.st.enter_wildcard_in_current(o, hidden);
         }
@@ -8207,7 +8226,11 @@ impl Typer {
                         "map" | "flatMap" | "foreach" | "withFilter" | "pipe" | "tap"
                     ) && !param_tys.is_empty()
                     {
-                        if let Type::Function { ret: fr, .. } = &param_tys[0] {
+                        if let Type::Function {
+                            params: fp,
+                            ret: fr,
+                        } = &param_tys[0]
+                        {
                             // `List.flatMap[B](f: A => IterableOnce[B])`: B is
                             // only determined by the lambda body, so the body
                             // must not be checked against `IterableOnce[B]`.
@@ -8219,8 +8242,19 @@ impl Typer {
                             } else {
                                 fr.clone()
                             };
+                            // The first type argument is the element only when
+                            // it is a *proper* type. cats' syntax classes are
+                            // `Ops[F[_], A]`, so `args[0]` is the constructor
+                            // `F`, and taking it for the element gave
+                            // `Ops[Box, Int].flatMap`'s lambda the parameter
+                            // type `Box` where the declaration says `Int`.
+                            let fparams = if self.st.kind_arity(&elem) == 0 {
+                                vec![elem.clone()]
+                            } else {
+                                fp.clone()
+                            };
                             param_tys[0] = Type::Function {
-                                params: vec![elem.clone()],
+                                params: fparams,
                                 ret: fret,
                             };
                         }
@@ -9154,6 +9188,9 @@ impl Typer {
             Type::Class { sym, .. } if self.st.get(*sym).name == "Range" => Some(Type::Int),
             Type::Class { sym, .. } if self.st.get(*sym).name == "BitSet" => Some(Type::Int),
             Type::Class { args, .. } if !args.is_empty() => Some(args[0].clone()),
+            // cats' syntax layer hands back `Ops[F, A] { type TypeClassType =
+            // FlatMap[F] }`; the arguments live on the parent.
+            Type::Refined { parents, .. } => parents.iter().find_map(|p| self.elem_type(p)),
             Type::ModuleRef(id) => {
                 let name = self.st.get(*id).name.as_str();
                 if name == "Nil$" || name == "None$" {
@@ -14368,8 +14405,20 @@ impl Typer {
         } else {
             class_id
         };
+        // `InnerClasses` records every nested class the file *mentions*, not
+        // only the ones it declares: `cats/effect/kernel/MonadCancel.class`
+        // lists `cats/syntax/package$all$`. Adopting those installed
+        // `cats.syntax.all` as a member of `MonadCancel`, and since
+        // `load_binary_into` completes a class file once, the later
+        // `import cats.syntax.all._` found nothing to load and nothing in the
+        // package object -- but only when something under `cats.effect` was
+        // imported first, which is why it looked like an ordering quirk.
+        let nest_prefix = format!("{}$", jvm.trim_end_matches('$'));
         for inner in &jc.inner_classes {
             if !inner.inner_jvm.ends_with('$') || inner.inner_jvm.contains("$anon") {
+                continue;
+            }
+            if !inner.inner_jvm.starts_with(&nest_prefix) {
                 continue;
             }
             let simple = crate::classpath::java_simple_name(&inner.inner_jvm);
@@ -16865,7 +16914,7 @@ fn mentions_no_type(ty: &Type) -> bool {
 }
 
 /// `ty` が `tps` のいずれかのメソッド型パラメータを含むか。
-fn mentions_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
+pub(crate) fn mentions_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
     match ty {
         Type::TypeParam(id) => tps.contains(id),
         Type::Class { args, .. } => args.iter().any(|a| mentions_tparam(a, tps)),

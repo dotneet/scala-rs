@@ -937,7 +937,7 @@ impl SymbolTable {
         }
     }
 
-    fn is_ancestor_of(&self, anc: SymbolId, cls: SymbolId) -> bool {
+    pub(crate) fn is_ancestor_of(&self, anc: SymbolId, cls: SymbolId) -> bool {
         let mut work = vec![cls];
         let mut seen = std::collections::HashSet::new();
         while let Some(c) = work.pop() {
@@ -1065,6 +1065,18 @@ impl SymbolTable {
                         return ty;
                     }
                     walk(st, &t, ty, seen)
+                }
+                // A member reached through `Ops[F, A] { type TypeClassType =
+                // FlatMap[F] }` is declared by one of the parents and has to be
+                // read at that parent's arguments. Without this, cats' whole
+                // syntax layer -- every result type simulacrum writes is a
+                // refinement -- handed back `flatMap`'s raw `A`.
+                Type::Refined { parents, .. } => {
+                    let mut t = ty;
+                    for p in parents {
+                        t = walk(st, p, t, seen);
+                    }
+                    t
                 }
                 _ => ty,
             }
