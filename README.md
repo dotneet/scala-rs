@@ -1689,8 +1689,12 @@ pickle には本当のシグネチャが書いてあります。`crates/pickle` 
   を pickle から取ります。**pickle で表現できなかったメンバは classfile 読みの
   ままにします**（`erased_desc` が決まらない、型が `Type` に落ちないなど）。
   つまり精度は上がっても、メンバが消えることはありません。
-- `scala.*` / `java.*` は対象外です。標準ライブラリは prelude ＋ `complete` という
-  検証済みの経路を通ります（prelude が勝つ規則を壊さないため）。
+- `java.*` は対象外です。`scala.*` は **prelude が組み立てたシンボルだけ**が対象外
+  です（`SymbolTable::prelude_end` より前の id）。標準ライブラリのうち prelude が
+  手で書いている部分は prelude ＋ `complete` という検証済みの経路を通り、
+  prelude が名前を出していないもの（`scala.concurrent.Future` など）は
+  classfile しか情報源が無かったので、ここで pickle から読みます。
+  詳しくは「コンパニオンとクラスは別のシンボル（`agent/companionkind`）」。
 - **先読みはしません**。classfile が 1 つ読まれたときに、そのクラスだけを見ます。
   slick の依存 classpath（cats / cats-effect / slf4j ほか 40 個超の jar）での計測時間は
   1:58 → 1:51（user 101.5s → 107.5s）でした。
@@ -2128,6 +2132,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/catsyntax` スライス（cats の syntax による拡張メソッドが本物の cats に届くまで）のフィクスチャは接頭辞 `csyn`（`csyn_ops` / `csyn_ops_bad`）で、同じ理由から `crates/cli/tests/catsyntax.rs` に置いています。`csyn_ops.scala` は cats の `Ops[F[_], A]` と同じ形の受け手に `map` / `flatMap` / `foreach` を呼ぶもので、**暗黙変換を一切使わずに**（`new Ops[Box, Int](b)`）ラムダの引数型が第 1 型引数の `Box` になっていたずれを固定します。私有ランタイムと `--scala-library` の両方で走ります。`csyn_ops_bad.scala` は、ラムダに宣言どおりの引数型を与えても witness の無い呼び出しは通らないこと（`could not find implicit value of type FlatMap[Bag]`）を固定します。`a_simulacrum_style_syntax_layer_crosses_a_jar` は **実 scalac** で小さな cats（`Ops[F, A] { type TypeClassType = FlatMap[F] }` という refinement 結果型、パッケージオブジェクトの入れ子 `object all`、その `all` を `InnerClasses` に載せるだけの無関係なクラス）をコンパイルして jar に詰め、`ScalaSignature` だけを通して `b.flatMap(…)` と `b >> …` が解決し、`java -Xverify:all` で走ることを見ます。自前の pickle ライタは `REFINEDtpe` を出さないので、この fixture は scalac が書いたものでなければ意味がありません（scalac が無い環境では skip します）。同じテストで、witness の無い `Crate` には変換が挿さらないこと（`value flatMap is not a member of Crate[Int]`）も見ます。
 
+`agent/companionkind` スライス（コンパニオンとクラスが 1 つのシンボルを兼ねていた件）のフィクスチャは接頭辞 `ckind`（`ckind_future` / `ckind_future_bad`）で、同じ理由から `crates/cli/tests/companionkind.rs` に置いています。`ckind_future.scala` は `scala.concurrent.Future`——prelude が持たず、メンバがすべて jar から来るクラス——の**コンパニオンの名前渡しメンバ** `Future.apply` を呼びます。JVM の generic signature は名前渡しを書けないので `Function0[T]` になり、`Future(21)` が `no matching overload for (Function0[T], ExecutionContext)Future[T]` になっていました。`--scala-library` dual-run と **real scalac 2.13.16** との実行結果 diff（`real_scalac_dual_run_ckind_future`）の両方で見ます（`scala.concurrent` は私有ランタイムに無いので `--no-scala-library` では走らせません）。`ckind_future_bad.scala` は、シグネチャが本物になったことで**その implicit 節も本物**になること——`ExecutionContext` がスコープに無ければ scalac と同じく拒む——を固定します。`a_companion_and_its_class_are_separate_symbols` は **実 scalac** で cats を縮めた jar（高階トレイト `Ref[F[_], A]`、そのコンパニオン、`val Ref = tinyeff.Ref` と`type Ref[F[_], A] = tinyeff.Ref[F, A]` を持つパッケージオブジェクト）を作り、`r.update(_ + 1)` の結果型が `F[Unit]`（classfile 由来の素の `F` ではない）になること、コンパニオンの `Ref.const` がトレイト側に紛れ込まずに引けること、そして無い名前 `bogus` はきちんと拒まれることを見ます。
+
 `agent/genrep` スライス（slick が `.fm` テンプレートから生成する 7 本を通すための穴: import を見ないクラス型パラメータ境界、型パラメータ付き `implicit class`、`TupleN extends Product`、継承したオーバーロードの受け手での型、引数リストのタプル化、`Tuple` で始まるだけのクラス名、可変長引数コンストラクタ、ワイルドカード型引数と反変、`package p { … }` の後ろのトップレベル定義）のフィクスチャは接頭辞 `genrep`（`genrep` / `genrep_bound_bad` / `genrep_tuple_bad` / `genrep_product_bad`）で、同じ理由から `crates/cli/tests/genrep.rs` に置いています。`genrep.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 との実行結果 diff（`real_scalac_dual_run_genrep`）でも見ます。異常系は 3 本: `genrep_bound_bad` は namer が黙るようにした境界でも**存在しない型はきちんと診断される**こと、`genrep_tuple_bad` はタプル化が**間違った呼び出しを通さない**こと、`genrep_product_bad` は `--no-scala-library` で `Product` の辺を張らない（私有ランタイムに裏付けが無い）ことを固定します。
 
 `agent/ctoraccessor` スライス（コンストラクタ引数のアクセサ、`FunctionN.tupled` / `curried` / `Function.untupled`、`Builder` の `+=` / `++=`）のフィクスチャは接頭辞 `ctacc`（`ctacc` / `ctacc_fn` / `ctacc_builder` / `ctacc_plain_bad`）で、同じ理由から `crates/cli/tests/ctoraccessor.rs` に置いています。`ctacc.scala` は**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせ、`real_scalac_dual_run_ctacc` で real scalac 2.13.16 の出力とも比較します（`expected/ctacc.txt` は scalac の出力そのもの）。`ctacc_case_class_params_get_public_accessors` は `javap -p -s` でアクセサのディスクリプタ（`ConstRep.value()Object` / `NumRep.n()I` / `IntBox.unwrap` の `()I` ＋ `()Object` ブリッジ / `StringBox.label` の `()String` ＋ `()Object` ブリッジ）と、**第 2 引数リストがアクセサにならない**こと（`Multi.extra`）を固定します。`ctacc_fn.scala` と `ctacc_builder.scala` は library ABI 限定（`scala/FunctionN` の default メソッド、`scala/Function$`、`Growable`）なので library dual-run と real scalac dual-run のみで、`fixtures_ctacc_fn_without_library_is_error` / `fixtures_ctacc_builder_without_library_is_error` が `--no-scala-library` で**きちんと診断される**ことを見ます。`ctacc_plain_bad.scala` は `val` の無いコンストラクタ引数が外から読めないままであること（case class の第 1 引数リストだけがアクセサになる）を固定します。
@@ -2255,6 +2261,8 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `cats_byname.scala`（`crates/cli/tests/catsimpl.rs`、library dual-run） | デフォルト引数を省いた呼び出しは 2 度型付けされる（`name$default$n` ゲッターが先行パラメータを取るため）。2 度目に by-name 引数は既に `Function0` の thunk になっており、`() => <notype>` として何にも一致しなかった（slick の `copy(where = w2.orElse(where), …)`） | `Comp(1,Some(1),Some(2),None)` `Some(7) None` ×3 |
 | `csyn_ops.scala`（`crates/cli/tests/catsyntax.rs`、私有ランタイム・library dual-run） | `agent/catsyntax` スライス: 高階クラスの第 1 型引数は「要素」ではない。`Ops[F[_], A]` の `map` / `flatMap` / `foreach` でラムダの引数型が `Box` になっていた（暗黙変換抜き、`new Ops[Box, Int](b)` で再現）。抽象 `F[_]` の受け手も通す | `4` `6` `103` `40` |
 | `csyn_ops_bad.scala`（`crates/cli/tests/catsyntax.rs`、異常系） | ラムダに宣言どおりの引数型を与えても、`FlatMap[Bag]` の witness が無い呼び出しは scalac と同じく通らない | （コンパイルエラー） |
+| `ckind_future.scala`（`crates/cli/tests/companionkind.rs`、library dual-run・real scalac dual-run） | `agent/companionkind` スライス: prelude が持たない `scala.*` のメンバが classfile からしか来ず、コンパニオンの名前渡し引数（`Future.apply` の `=> T`）が `Function0[T]` になっていた | `21` `20` |
+| `ckind_future_bad.scala`（`crates/cli/tests/companionkind.rs`、異常系） | pickle から読んだシグネチャは implicit 節も本物: `ExecutionContext` が無ければ `Future(21)` は通らない | （コンパイルエラー） |
 | `ctacc.scala`（`crates/cli/tests/ctoraccessor.rs`、私有ランタイム・library dual-run・real scalac dual-run） | `agent/ctoraccessor` スライス: コンストラクタ引数が public アクセサになり親の抽象メンバーを実装する（`case class ConstRep[T](value: T) extends Rep[T]`、`case class NumRep(n: Int)`、`()Object` へのブリッジが要る `IntBox` / `StringBox`、`class Person(val name: String, …)`、`class Cell(var c: Int)` の getter/setter、第 2 引数リストがアクセサにならない `Multi`） | `42` `hi` `7` `5` `tag` `bob` `3` `11` `1` `x` `42` |
 | `ctacc_fn.scala`（`crates/cli/tests/ctoraccessor.rs`、library dual-run と real scalac dual-run） | `FunctionN.tupled` / `curried`（arity 2 / 3 / 5 / 22）と `scala.Function.untupled`、引数リストを持たないメソッドの結果を直接呼ぶ（`def adder: (Int, Int) => Int; adder(7, 8)`）。私有ランタイムには裏付けが無いので `--no-scala-library` では診断のまま | `7` `11` `7` `30` `1x2` `1y3` `4z5` `15` `15` `20` `22` `15` |
 | `ctacc_builder.scala`（`crates/cli/tests/ctoraccessor.rs`、library dual-run と real scalac dual-run） | `scala.collection.mutable.Builder` の `+=` / `++=`（`Growable` の default メソッド、`this.type` 返し）を pickle 供給から引く。`--no-scala-library` では `not found: type Builder` | `List(1, 2, 3, 4)` |
@@ -2817,10 +2825,111 @@ files_with_errors=80`**。生の件数はあまり動きませんが、**この�
 `value all is not a member of <notype>`（項 4）は **2 → 0** です。
 残る 8 件（`value flatMap is not a member of F` 4 件と
 `value >> is not a member of F` 4 件）は**すべてレシーバが素の `F`** で、
-下の Remaining の「jar のメンバの結果型が素の `F` になる」です。
+これは次の `agent/companionkind` で直りました。
 差し引きが 8 件にしかならないのは、拡張メソッドが解決するようになったことで
 **その先で止まっていたカスケードが表に出た**ためです（`found: F required: F[Unit]`、
 `no matching overload for (Function0[A])F` など。どれも同じ「素の `F`」が原因）。
+
+### コンパニオンとクラスは別のシンボル（`agent/companionkind`）
+
+`agent/catsyntax` が原因まで特定して戻した件（「jar のメンバの結果型が
+素の `F` になる」）を**根から直しました**。
+テストは `crates/cli/tests/companionkind.rs`、fixture の接頭辞は `ckind` です。
+
+計測は `files=184 errors=518 files_with_errors=80` →
+**`errors=443 files_with_errors=75`**（−75 件 / −5 ファイル）。
+このスライスが狙った 3 種類は**全部消えています**:
+`no matching overload for (Function0[A])F` は **8 → 0**、
+`value flatMap is not a member of F` は **4 → 0**、
+`value >> is not a member of F` は **4 → 0** です。
+
+**1. `find_or_stub_java_class` が `X$` から `SymKind::Class` を作っていた。**
+
+`find_or_stub_java_class` は、親リスト・ディスクリプタ・`InnerClasses` が
+名指した JVM 名すべての入り口です。`cats/effect/kernel/Ref$` を渡されると
+`java_simple_name` が末尾の `$` を落とし、`Ref` という名前の **`SymKind::Class`**
+を作って `jvm_name` には**コンパニオンの**名前（`…/Ref$`）を入れていました。
+1 つのシンボルが 2 つのものを兼ねるので、両方が壊れます。
+
+- **トレイト `Ref` が自分のシンボルを持てない。** `ensure_class("cats.effect.kernel.Ref")`
+  は「その名前のシンボルはあるが `jvm_name` が key と違う」で `None` を返すので、
+  `Ref#update` の型は pickle ではなく **classfile の generic signature** から
+  来ます。JVM のシグネチャは `F[Unit]` を書けず `TF;` としか書けないので、
+  結果型が**素の `F`** になります。これが slick の
+  `value >> is not a member of F` / `value flatMap is not a member of F` /
+  `no matching overload for (Function0[A])F` の正体でした。
+- **オブジェクトのメンバがトレイトに載る。** `Ref.of` / `Ref.const` が
+  トレイト側のメンバとして入ります。
+
+`$` 付きの名前は `install_java_module` と同じ形——`ModuleClass`（名前 `Ref$`）と
+その `Module`（名前 `Ref`）——を作るようにしました。既存シンボルの探索も
+`$` 付きなら `Module`、無しなら `Class` だけを見ます。
+
+この経路が最初に踏まれるのは、cats-effect のパッケージオブジェクトにある
+`val Ref = cats.effect.kernel.Ref` です。その getter のディスクリプタが
+`Lcats/effect/kernel/Ref$;` なので、`import cats.effect.{Async, Ref, Resource}`
+と書いた瞬間（slick の `BasicBackend.scala` の 5 行目）に
+コンパニオン名でトレイト名のシンボルが入っていました。
+
+`agent/catsyntax` のスクラッチではここで `Async[F]` から `FlatMap[F]` が
+引けなくなり差し引き悪化しましたが、**現在の main では再現しません**
+（同スライスが入れた `InnerClasses` の扱い・refinement の変換・
+`give_stub_its_kinds` が前提になっています）。この変更単独で
+`errors=518 → 494` です。
+
+**2. prelude が持たない `scala.*` を pickle から読む。**
+
+同じ「コンパニオン経由のメンバが classfile から読まれる」問題は、
+**cats を一切使わなくても**出ます:
+
+```scala
+import scala.concurrent.Future
+import scala.concurrent.ExecutionContext.Implicits.global
+object Main { def main(a: Array[String]): Unit = println(Future(21)) }
+```
+
+`Future.apply` は本体を**名前渡し**（`=> T`）で取りますが、JVM の
+generic signature には名前渡しが無く `Function0[T]` としか書けません。
+`no matching overload for (Function0[T], ExecutionContext)Future[T] with
+arguments (21)` になります。名前渡し自体は壊れていません
+（`Option.getOrElse` / `scala.util.Try` / `Using.resource` はすべて通る）。
+これらは**prelude が手で書いているクラス**で、`Future` は違うからです。
+
+`adopt_binary_class` は `scala/` で始まる JVM 名を**すべて**拒んでいました。
+理由は正しくて、prelude が組み立てたクラスを jar の形で作り直すと
+（`ensure_class` が拒むのと同じ理由で）動いていたメンバが壊れます。
+ただしその線引きは「`scala.*` かどうか」ではなく
+「**prelude が作ったかどうか**」です。`install_prelude` 直後の
+`st.symbols.len()` を `SymbolTable::prelude_end` に控え、それより後の
+シンボルだけ pickle から読むようにしました。
+実際に adopt されるのは `scala.concurrent.Future` / `Promise` /
+`scala.collection.mutable.Growable` / `Builder` / `SeqOps` など
+**prelude が名前を出していない 50 クラスほど**です。
+
+**3. pickle の `this.type` は「載せたクラスの `this.type`」。**
+
+2 の副作用で `scala.collection.mutable.Growable` が adopt されるようになり、
+`b ++= xs` が `Growable[Int]` を返すようになりました（`ctacc_builder` が落ちた）。
+`PickleSupply::conv` は `SigType::This` を **`self_ty`＝メンバを載せる
+クラスを自分の型パラメータに適用したもの**に潰していました。メンバを
+常にレシーバ自身のクラスに載せていた頃は正しく、**基底クラスをそれ自身として
+完了させた瞬間に誤り**になります。`Type::ThisType(class_sym)` を返すように
+して、レシーバへの読み替えは既にある `subst_as_seen_from` に任せます。
+`Builder[Int, List[Int]]` に対する `Growable#++=` は `Builder` を返します。
+
+**残っている隣接した穴**（このスライスでは直していません）:
+
+- **jar のコンパニオンの入れ子クラス**が、コンパニオンを
+  パッケージオブジェクトの `val` 経由で掴んだときに引けません。
+  `object Box { final case class Const[A](get: A) }` を `import tiny2.alias.Box`
+  （`val Box = tiny2.Box`）で使うと `Box.of` は通り
+  `Box.Const` は `value Const is not a member of Box$` になります。
+  main では `Box.of` すら通らないので**悪化ではありません**。
+  slick の `Outcome.Succeeded(_)` / `Resource.ExitCase.Errored(e)`（6 件）が
+  これです。`Outcome$Succeeded` という JVM 名は
+  「クラス `Outcome` の入れ子」と「オブジェクト `Outcome` の入れ子」を
+  区別しないので、直すには `InnerClasses` の `outer_class_info_index`
+  （`parse_inner_classes` は今これを捨てています）か pickle が要ります。
 
 ### Remaining
 
@@ -2934,24 +3043,11 @@ files_with_errors=80`**。生の件数はあまり動きませんが、**この�
 
 - **cats の syntax（`import cats.syntax.all._`）による拡張メソッド**は
   `agent/catsyntax` で**本物の cats に届くようになりました**（上の節）。
-- **jar のメンバの結果型が素の `F` になる**（`agent/catsyntax` で原因まで確認、未修正）。
-  `ctx.update(…) >> …` は `value >> is not a member of F`、
-  `asyncF.pure(x)` は `no matching overload for (Function0[A])F` になります。
-  `Ref[F[_], A]#update` の結果型は `F[Unit]` ですが、これが**pickle からではなく
-  classfile の generic signature から**来ています（`TF;` は高階の適用を書けないので
-  素の `F`）。pickle 供給が落ちる理由は
-  `cats/effect/kernel/Ref$#update/1: no unambiguous erased descriptor` で、
-  **`Ref` のシンボルの `jvm_name` がコンパニオンの `cats/effect/kernel/Ref$`**
-  だからです。`find_or_stub_java_class` は `cats/effect/kernel/Ref$` を渡されると
-  `java_simple_name` で末尾の `$` を落として `Ref` という名前の
-  **`SymKind::Class`** を作り、`jvm_name` にはコンパニオンの名前を入れます。
-  以後 `ensure_class("cats.effect.kernel.Ref")` は
-  「その名前のシンボルはあるが `jvm_name` が key と違う」で `None` を返すので、
-  本物のトレイトはシンボルを持てません。
-  `$` 付きなら `ModuleClass` を `Ref$` という名前で作る、と直すと
-  この経路は通りましたが、今度は `Async[F]` から `FlatMap[F]` が引けなくなり
-  （`agent/catsyntax` のスクラッチで確認）、差し引きで悪化したので戻しました。
-  slick に残る `F` 系のエラー 8 件はすべてこれです。
+- **jar のメンバの結果型が素の `F` になる**件は `agent/companionkind` で
+  **直りました**（上の「コンパニオンとクラスは別のシンボル」）。
+  そこで残った隣接の穴 —— jar のコンパニオンの入れ子クラス
+  （`Outcome.Succeeded(_)` / `Resource.ExitCase.Errored(e)`、6 件）—— は同節の
+  末尾に書いてあります。
 - **jar のクラスを pickle から読む（`agent/jarpickle`）で残ったもの**。
   - **cats の `implicits` 経由の implicit 探索**。`Monad[F]` のシグネチャは
     正しく届くようになったが、`import cats.implicits._` から `Monad[Option]` を
