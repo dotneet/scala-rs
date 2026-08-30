@@ -2531,6 +2531,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 `agent/catsyntax` スライス（cats の syntax による拡張メソッドが本物の cats に届くまで）のフィクスチャは接頭辞 `csyn`（`csyn_ops` / `csyn_ops_bad`）で、同じ理由から `crates/cli/tests/catsyntax.rs` に置いています。`csyn_ops.scala` は cats の `Ops[F[_], A]` と同じ形の受け手に `map` / `flatMap` / `foreach` を呼ぶもので、**暗黙変換を一切使わずに**（`new Ops[Box, Int](b)`）ラムダの引数型が第 1 型引数の `Box` になっていたずれを固定します。私有ランタイムと `--scala-library` の両方で走ります。`csyn_ops_bad.scala` は、ラムダに宣言どおりの引数型を与えても witness の無い呼び出しは通らないこと（`could not find implicit value of type FlatMap[Bag]`）を固定します。`a_simulacrum_style_syntax_layer_crosses_a_jar` は **実 scalac** で小さな cats（`Ops[F, A] { type TypeClassType = FlatMap[F] }` という refinement 結果型、パッケージオブジェクトの入れ子 `object all`、その `all` を `InnerClasses` に載せるだけの無関係なクラス）をコンパイルして jar に詰め、`ScalaSignature` だけを通して `b.flatMap(…)` と `b >> …` が解決し、`java -Xverify:all` で走ることを見ます。自前の pickle ライタは `REFINEDtpe` を出さないので、この fixture は scalac が書いたものでなければ意味がありません（scalac が無い環境では skip します）。同じテストで、witness の無い `Crate` には変換が挿さらないこと（`value flatMap is not a member of Crate[Int]`）も見ます。
 
 `agent/companionkind` スライス（コンパニオンとクラスが 1 つのシンボルを兼ねていた件）のフィクスチャは接頭辞 `ckind`（`ckind_future` / `ckind_future_bad`）で、同じ理由から `crates/cli/tests/companionkind.rs` に置いています。`ckind_future.scala` は `scala.concurrent.Future`——prelude が持たず、メンバがすべて jar から来るクラス——の**コンパニオンの名前渡しメンバ** `Future.apply` を呼びます。JVM の generic signature は名前渡しを書けないので `Function0[T]` になり、`Future(21)` が `no matching overload for (Function0[T], ExecutionContext)Future[T]` になっていました。`--scala-library` dual-run と **real scalac 2.13.16** との実行結果 diff（`real_scalac_dual_run_ckind_future`）の両方で見ます（`scala.concurrent` は私有ランタイムに無いので `--no-scala-library` では走らせません）。`ckind_future_bad.scala` は、シグネチャが本物になったことで**その implicit 節も本物**になること——`ExecutionContext` がスコープに無ければ scalac と同じく拒む——を固定します。`a_companion_and_its_class_are_separate_symbols` は **実 scalac** で cats を縮めた jar（高階トレイト `Ref[F[_], A]`、そのコンパニオン、`val Ref = tinyeff.Ref` と`type Ref[F[_], A] = tinyeff.Ref[F, A]` を持つパッケージオブジェクト）を作り、`r.update(_ + 1)` の結果型が `F[Unit]`（classfile 由来の素の `F` ではない）になること、コンパニオンの `Ref.const` がトレイト側に紛れ込まずに引けること、そして無い名前 `bogus` はきちんと拒まれることを見ます。
+`agent/ambigmap` スライス（同じ pickle 宣言のコピーが 2 つ入って `ambiguous overload for map` になっていた件）のフィクスチャは接頭辞 `am`（`am_pickledup` / `am_pickledup_bad`）で、同じ理由から `crates/cli/tests/ambigmap.rs` に置いています。`am_pickledup.scala` は **3 つのブロックの順番そのものが再現条件**です: 先に `scala.Seq` のレシーバが `map` を聞き、次に `scala.collection.IndexedSeq` のレシーバが聞き、最後に両方を親に持つ `scala.IndexedSeq` が聞きます。`map` だけでなく `flatMap` / `filter` / `partition` / `foldLeft` も同じ 3 レシーバに通すので、直っているのが「`map` の特別扱い」でないことが分かります。`--scala-library` dual-run と **real scalac 2.13.16** との実行結果 diff（`real_scalac_dual_run_am_pickledup`）の両方で `java -Xverify:all` の下に走らせます（載せ替えたシンボルは呼び先の owner とディスクリプタを変えるので、検証器を通すこと自体が確認です）。私有ランタイムには `scala.collection` が無く pickle も無い（＝束ねるコピーが存在しない）ので、`am_pickledup_without_the_library_is_diagnosed` が `--no-scala-library` で**黙って通さずに診断が出る**ことを固定します。`am_pickledup_bad.scala` は、束ねているのが名前ではなく**宣言**であること——本物のオーバーロード 2 本は 2 本のまま残り、決着が付かなければ scalac と同じく拒む——を固定します。
+
 `agent/hkinfer` スライス（引数の基底型からの型引数推論と、オーバーロードされた呼び先の自動タプル化）のフィクスチャは接頭辞 `hk`（`hk_base` / `hk_base_lib` / `hk_base_bad` / `hk_tuple` / `hk_tuple_lib` / `hk_tuple_bad`）で、同じ理由から `crates/cli/tests/hkinfer.rs` に置いています。`hk_base.scala` と `hk_tuple.scala` は**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走ります。`hk_base_lib.scala`（`Option` / `List`）と `hk_tuple_lib.scala`（`println(1, "a")`）は jar 限定です。異常系は 2 本で、どちらも**両モードで**エラー件数まで固定します: `hk_base_bad` は基底型の型引数が合わないもの、`hk_tuple_bad` はタプル化が通してはいけない 4 つの形（特に逆向きの `g((1, 2))` と、同じ引数個数の候補があるときの `c(1, "x")`）です。詳しくは下の「引数の基底型と自動タプル化」を見てください。
 
 `agent/genrep` スライス（slick が `.fm` テンプレートから生成する 7 本を通すための穴: import を見ないクラス型パラメータ境界、型パラメータ付き `implicit class`、`TupleN extends Product`、継承したオーバーロードの受け手での型、引数リストのタプル化、`Tuple` で始まるだけのクラス名、可変長引数コンストラクタ、ワイルドカード型引数と反変、`package p { … }` の後ろのトップレベル定義）のフィクスチャは接頭辞 `genrep`（`genrep` / `genrep_bound_bad` / `genrep_tuple_bad` / `genrep_product_bad`）で、同じ理由から `crates/cli/tests/genrep.rs` に置いています。`genrep.scala` は `--scala-library` dual-run に加えて real scalac 2.13.16 との実行結果 diff（`real_scalac_dual_run_genrep`）でも見ます。異常系は 3 本: `genrep_bound_bad` は namer が黙るようにした境界でも**存在しない型はきちんと診断される**こと、`genrep_tuple_bad` はタプル化が**間違った呼び出しを通さない**こと、`genrep_product_bad` は `--no-scala-library` で `Product` の辺を張らない（私有ランタイムに裏付けが無い）ことを固定します。
@@ -2682,6 +2684,8 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `cats_byname.scala`（`crates/cli/tests/catsimpl.rs`、library dual-run） | デフォルト引数を省いた呼び出しは 2 度型付けされる（`name$default$n` ゲッターが先行パラメータを取るため）。2 度目に by-name 引数は既に `Function0` の thunk になっており、`() => <notype>` として何にも一致しなかった（slick の `copy(where = w2.orElse(where), …)`） | `Comp(1,Some(1),Some(2),None)` `Some(7) None` ×3 |
 | `csyn_ops.scala`（`crates/cli/tests/catsyntax.rs`、私有ランタイム・library dual-run） | `agent/catsyntax` スライス: 高階クラスの第 1 型引数は「要素」ではない。`Ops[F[_], A]` の `map` / `flatMap` / `foreach` でラムダの引数型が `Box` になっていた（暗黙変換抜き、`new Ops[Box, Int](b)` で再現）。抽象 `F[_]` の受け手も通す | `4` `6` `103` `40` |
 | `csyn_ops_bad.scala`（`crates/cli/tests/catsyntax.rs`、異常系） | ラムダに宣言どおりの引数型を与えても、`FlatMap[Bag]` の witness が無い呼び出しは scalac と同じく通らない | （コンパイルエラー） |
+| `am_pickledup.scala`（`crates/cli/tests/ambigmap.rs`、library dual-run・real scalac dual-run） | `agent/ambigmap` スライス: `IterableOps.map` のコピーが `immutable.Seq` と `collection.IndexedSeq` の両方に載り、両方を親に持つ `scala.IndexedSeq` で `ambiguous overload for map` になっていた（`flatMap` / `filter` / `partition` / `foldLeft` も同型） | `2,3,4` `1,1,2,2,3,3` `2,3` `6` `8,10` `4,-4,5,-5` `5` `9` `16,17` `6\|7` `6,600,7,700` `7` `113` `6 / 7` |
+| `am_pickledup_bad.scala`（`crates/cli/tests/ambigmap.rs`、異常系） | 束ねるのは名前ではなく pickle の**宣言**: 本物のオーバーロード 2 本は 2 本のまま残り、決着が付かなければ scalac と同じく拒む | （コンパイルエラー） |
 | `ckind_future.scala`（`crates/cli/tests/companionkind.rs`、library dual-run・real scalac dual-run） | `agent/companionkind` スライス: prelude が持たない `scala.*` のメンバが classfile からしか来ず、コンパニオンの名前渡し引数（`Future.apply` の `=> T`）が `Function0[T]` になっていた | `21` `20` |
 | `ckind_future_bad.scala`（`crates/cli/tests/companionkind.rs`、異常系） | pickle から読んだシグネチャは implicit 節も本物: `ExecutionContext` が無ければ `Future(21)` は通らない | （コンパイルエラー） |
 | `ctacc.scala`（`crates/cli/tests/ctoraccessor.rs`、私有ランタイム・library dual-run・real scalac dual-run） | `agent/ctoraccessor` スライス: コンストラクタ引数が public アクセサになり親の抽象メンバーを実装する（`case class ConstRep[T](value: T) extends Rep[T]`、`case class NumRep(n: Int)`、`()Object` へのブリッジが要る `IntBox` / `StringBox`、`class Person(val name: String, …)`、`class Cell(var c: Int)` の getter/setter、第 2 引数リストがアクセサにならない `Multi`） | `42` `hi` `7` `5` `tag` `bob` `3` `11` `1` `x` `42` |
@@ -3392,6 +3396,64 @@ arguments (21)` になります。名前渡し自体は壊れていません
   「クラス `Outcome` の入れ子」と「オブジェクト `Outcome` の入れ子」を
   区別しないので、直すには `InnerClasses` の `outer_class_info_index`
   （`parse_inner_classes` は今これを捨てています）か pickle が要ります。
+
+### 同じ pickle 宣言のコピーが 2 つ（`agent/ambigmap`）
+
+`agent/companionkind` が入れた退行の後始末です。テストは
+`crates/cli/tests/ambigmap.rs`、fixture の接頭辞は `am` です。
+
+計測は `files=184 errors=411 files_with_errors=72` →
+**`errors=387 files_with_errors=70`**（−24 件 / −2 ファイル）。
+`ambiguous overload` は **32 → 7**、うち `ambiguous overload for map` は
+**25 → 0** です。
+
+**症状**。`pkSyms.map { fs => quoteIdentifier(fs.name) }` のような
+ごく普通の `map` が `ambiguous overload for map` になっていました。
+
+**原因は「同じ宣言のコピーが 2 つある」ことで、`map` 固有の話ではありません。**
+
+`map` は prelude が書き出していません。宣言しているのは
+`scala.collection.IterableOps` で、`Seq` も `IndexedSeq` も `Set` も
+そこから継承します。`PickleSupply::complete_named` は
+**聞かれたクラスにメンバを載せます**（そこが typer が次に引く場所だからです）。
+つまり `IterableOps.map` のコピーが**どのクラスに載るかは、どのレシーバが
+最初に聞いたか**＝コンパイル対象のプログラム次第です。
+
+`scala.Seq` のレシーバが先に聞くと `scala.collection.immutable.Seq` に
+1 つ載り、その後 `scala.collection.IndexedSeq` のレシーバが聞くと
+（`immutable.Seq` はその親ではないので何も見つからず）そちらにも 1 つ載ります。
+`scala.IndexedSeq`（＝`immutable.IndexedSeq`）は**その両方を親に持ち、
+かつ 2 つは互いに親子ではありません**。したがって
+
+- `drop_overridden` は「サブクラス側が親のメンバを override している」
+  形に当てはめられず、
+- 2 つは書き換えられた語彙が違うだけ（`Seq[B]` と `IndexedSeq[B]`）なので
+  specificity でも決着せず、
+
+`xs.map(f)` はすべて `ambiguous overload` になります。`map` が最も目立った
+だけで、`flatMap` / `filter` / `partition` / `foldLeft` も同じ形でした
+（fixture `am_pickledup.scala` は 5 個とも踏みます）。
+
+`agent/companionkind` 以前は、たまたま `scala.collection.Iterable` が最初に
+聞かれていて、コピーが 1 つしか出来ていませんでした。pickle 由来のクラスが
+50 個ほど増えて**聞かれる順番が変わった**のが引き金です。バグ自体は前から
+そこにありました。
+
+**直し方**。nsc から見れば `IterableOps.map` は 1 つです。そこで
+`Symbol::pickled_origin` に「このコピーがどの pickle 宣言を指しているか」＝
+**宣言元クラス＋メソッド名＋erased パラメータディスクリプタ**を記録します
+（**載せたクラスは入れません**。それが違うからこそ重複するので）。
+`Check::drop_overridden` は候補集合の先頭で
+`collapse_pickled_copies` を通し、同じ `pickled_origin` のコピーは
+最初の 1 つだけ残します。`lookup_member` は親を後ろから辿るので、
+先頭に来るのはレシーバに一番近いコピー（`immutable.IndexedSeq` なら
+`collection.IndexedSeq` 側、つまり結果型が `IndexedSeq[B]` の方）です。
+
+`pickled_origin` が空のシンボル（prelude・ソース・classfile 由来）は
+一切触りません。**名前ではなく宣言で束ねている**ので、本物のオーバーロードは
+2 つのまま残り、決着が付かなければ従来どおり `ambiguous overload` を出します
+（`am_pickledup_bad.scala`）。
+
 ### `StringOps` を jar から読む（`agent/stringops8`）
 
 `"abcdef".zipWithIndex` / `.sliding(2)` / `.groupBy(identity)` / `.sortBy(…)` /
@@ -3558,6 +3620,21 @@ required: DBIOAction[R, S, E]`、**増えたものはありません**。slick �
 （どちらも実 scalac との差分から出てきたものです）。
 
 ### Remaining
+
+- **`Seq`／`IndexedSeq` の `lazyZip`**（`agent/ambigmap` で確認）。
+  `line.lazyZip(widths).map(…)` が
+  `value lazyZip is not a member of IndexedSeq[String]` になります。
+  `map` が通るようになって初めて見えた**次のエラー**で、悪化ではありません
+  （slick の `util/TableDump.scala` と `jdbc/JdbcActionComponent.scala`）。
+  `lazyZip` の結果 `LazyZip2` にメンバが無いのは下の
+  「`LazyZip2` のメンバ」と同じ根です。
+
+- **`xs.to(ArrayBuffer)`**（`agent/ambigmap` で確認）。
+  コンパニオンから `Factory[A, C]` の implicit を取れないので
+  `no matching overload for (Factory[Any, C1])C1 with arguments (ArrayBuffer$)`
+  になります（`memory/HeapBackend.scala`）。これも `map` が通ってから
+  見えるようになった箇所で、直前は同じ行が
+  `ambiguous overload for map` で止まっていました。
 
 - **`"abc".appended(1)` のような `B >: Char` の下限推論**（`agent/stringops8`
   で確認）。scalac は `B := AnyVal` と lub を取って `IndexedSeq[AnyVal]` を

@@ -7009,6 +7009,7 @@ impl Typer {
         if found.len() <= 1 {
             return found;
         }
+        let found = self.collapse_pickled_copies(found);
         found
             .iter()
             .copied()
@@ -7037,6 +7038,40 @@ impl Typer {
                         // *matching* signature replaces the inherited one.
                         && self.same_signature(other, s)
                 })
+            })
+            .collect()
+    }
+
+    /// One pickled declaration reached through two classes is one member.
+    ///
+    /// `PickleSupply` installs an inherited member on the class the lookup
+    /// asked about, because that is where the typer has to find it. Which
+    /// class asks first is a property of the *program*, so `IterableOps.map`
+    /// gets copied onto `immutable.Seq` for `xs.map` on a `Seq` and onto
+    /// `collection.IndexedSeq` for `ys.map` on an `IndexedSeq` — and
+    /// `immutable.IndexedSeq`, which has both above it and neither below the
+    /// other, then offers two `map`s that differ only in the vocabulary each
+    /// copy was rewritten into (`Seq[B]` vs `IndexedSeq[B]`). `drop_overridden`
+    /// cannot relate them, specificity cannot separate them, and every
+    /// `xs.map(f)` on such a receiver was `ambiguous overload`.
+    ///
+    /// nsc sees one `IterableOps.map`. So does this: copies of one pickled
+    /// declaration collapse to the first, which is the one `lookup_member`
+    /// reached first and so the nearest to the receiver.
+    fn collapse_pickled_copies(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
+        if !found
+            .iter()
+            .any(|&s| !self.st.get(s).pickled_origin.is_empty())
+        {
+            return found;
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        found
+            .iter()
+            .copied()
+            .filter(|&s| {
+                let origin = self.st.get(s).pickled_origin.as_str();
+                origin.is_empty() || seen.insert(origin)
             })
             .collect()
     }
