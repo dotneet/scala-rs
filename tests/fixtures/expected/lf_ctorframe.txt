@@ -1,0 +1,7 @@
+b
+pos
+neg
+zero
+3
+g1
+d2

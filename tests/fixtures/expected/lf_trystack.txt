@@ -1,0 +1,12 @@
+w0
+w1
+y
+pq
+a
+n=3!
+boom
+ktrue
+ktrue
+kfalse
+true
+fin f

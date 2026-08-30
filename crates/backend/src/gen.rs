@@ -5,7 +5,7 @@ use crate::classfile::{
     ACC_ABSTRACT, ACC_BRIDGE, ACC_FINAL, ACC_INTERFACE, ACC_NATIVE, ACC_PRIVATE, ACC_PROTECTED,
     ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
 };
-use crate::code::{Assembler, Label};
+use crate::code::{Assembler, Label, StackEntry};
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{Intrinsic, SymKind, SymbolTable};
 use std::cell::{Cell, RefCell};
@@ -6371,7 +6371,8 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
                     store(asm, slot, JvmSort::Ref);
                     return;
                 }
-                frame.alloc(tree.sym, sort);
+                let slot = frame.alloc(tree.sym, sort);
+                declare_local_ty(asm, ctx.st, slot, &ty);
                 return;
             }
             if sort == JvmSort::Void {
@@ -6387,6 +6388,10 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
                 return;
             }
             let slot = frame.alloc(tree.sym, sort);
+            // Declared *before* the store: a `var` reassigned in a loop body
+            // merges at the loop head, and the merge has to see the declared
+            // class on both paths or it degrades to `java/lang/Object`.
+            declare_local_ty(asm, ctx.st, slot, &ty);
             store(asm, slot, sort);
         }
         TreeKind::DefDef { .. } | TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } => {
@@ -15101,6 +15106,54 @@ fn gen_sb_append(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, value: &
     asm.invokevirtual("java/lang/StringBuilder", "append", desc);
 }
 
+/// Park every value already on the operand stack in a local, so the guarded
+/// region of a `try` starts with an empty stack.
+///
+/// The JVM clears the operand stack when it enters an exception handler
+/// (JVMS 4.10.1.6), so anything pending is gone on the catch path: the join
+/// after the `try` then sees a stack of depth *n* on one side and 0 on the
+/// other, and the frames disagree -- `VerifyError: Inconsistent stackmap
+/// frames`. `println(try … catch …)`, `f(a, try …)` and `new Box(try …)` all
+/// hit it. scalac's `LiftTry` phase moves the `try` into a synthetic
+/// `liftedTree1$1()` method for exactly this reason; spilling to locals is the
+/// same fix without the extra method.
+///
+/// Returns the spill slots bottom-first, for [`restore_operand_stack`].
+fn spill_operand_stack(asm: &mut Assembler, frame: &mut Frame) -> Vec<(u16, JvmSort)> {
+    let entries = asm.stack_entries();
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut spilled = Vec::with_capacity(entries.len());
+    // Top of the stack first: a store pops from the top.
+    for e in entries.iter().rev() {
+        let sort = match e {
+            StackEntry::Int => JvmSort::Int,
+            StackEntry::Long => JvmSort::Long,
+            StackEntry::Float => JvmSort::Float,
+            StackEntry::Double => JvmSort::Double,
+            StackEntry::Ref(_) => JvmSort::Ref,
+        };
+        let slot = frame.alloc_tmp(sort);
+        // `None` is `null` or a `new` whose constructor has not run yet;
+        // neither has a class to declare, and the uninitialized one must keep
+        // its own verification type so the later `invokespecial` still matches.
+        if let StackEntry::Ref(Some(n)) = e {
+            asm.set_local_class(slot, n);
+        }
+        store(asm, slot, sort);
+        spilled.push((slot, sort));
+    }
+    spilled.reverse();
+    spilled
+}
+
+fn restore_operand_stack(asm: &mut Assembler, spilled: &[(u16, JvmSort)]) {
+    for (slot, sort) in spilled {
+        load(asm, *slot, *sort);
+    }
+}
+
 fn gen_try(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -15110,6 +15163,9 @@ fn gen_try(
     finalizer: &Tree,
     result_ty: &Type,
 ) {
+    // Before anything else, and before the locals snapshot the handlers use:
+    // the guarded region has to start with an empty operand stack.
+    let spilled = spill_operand_stack(asm, frame);
     let unit = is_unit_like(result_ty);
     let has_finally = !finalizer.is_empty();
     let start = asm.fresh_label();
@@ -15252,6 +15308,8 @@ fn gen_try(
     }
 
     asm.mark(after);
+    // Put back what was pending before the `try`, under its result.
+    restore_operand_stack(asm, &spilled);
     if let Some(slot) = result_slot {
         load(asm, slot, sel_sort);
     }
@@ -15294,6 +15352,40 @@ fn join_class_of(st: &SymbolTable, ty: &Type) -> Option<String> {
         return None;
     }
     Some(name.to_string())
+}
+
+/// Declare what class the local `slot` is *declared* to hold, so a merge at a
+/// loop head or a branch join reports the declared class instead of falling
+/// back to `java/lang/Object`.
+///
+/// This is what scalac does: `javap -v` on
+/// `var c: Option[Int] = Some(1); while (c.isDefined) c = None` shows the
+/// loop-head frame carrying `class scala/Option` -- the *declared* erased type
+/// of the slot, the same type its `LocalVariableTable` entry has -- not a
+/// computed least upper bound of `scala/Some` and `scala/None$`. The declared
+/// type is by construction an upper bound of everything the source can store
+/// there, so recording it needs no class hierarchy and never widens too far.
+fn declare_local_ty(asm: &mut Assembler, st: &SymbolTable, slot: u16, ty: &Type) {
+    if let Some(n) = local_class_of(st, ty) {
+        asm.set_local_class(slot, &n);
+    }
+}
+
+/// The erased class a local of type `ty` is declared to hold, as an internal
+/// name (or an array descriptor).
+///
+/// Unlike [`join_class_of`] this keeps `java/lang/Object`: `var a: Any` really
+/// is declared `Object`, and saying so is what keeps the frames inside a loop
+/// that stores an `Integer` and then a `String` into it consistent.
+fn local_class_of(st: &SymbolTable, ty: &Type) -> Option<String> {
+    if is_unit_like(ty) || matches!(ty, Type::Nothing | Type::NoType | Type::Error) {
+        return None;
+    }
+    let desc = jvm_desc(st, ty);
+    if desc.starts_with('[') {
+        return Some(desc);
+    }
+    Some(desc.strip_prefix('L')?.strip_suffix(';')?.to_string())
 }
 
 fn gen_match(
