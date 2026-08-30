@@ -603,6 +603,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     st.enter_in_current("::", st.cons_sym);
     st.enter_in_current("Ordered", ordered);
     crate::prelude_numops::install(st);
+    crate::prelude_mutcoll::install(st, library_abi);
     crate::prelude_mutops::install(st);
     crate::prelude_regex::install(st, library_abi);
     crate::prelude_ordtuple::install(st, library_abi);

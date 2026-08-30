@@ -5830,6 +5830,19 @@ fn gen_new(
             fields.iter().map(|f| ctx.st.get(*f).ty.clone()).collect()
         }
     };
+    // `new ArrayDeque[Int]()` / `new Queue[Int]()` / `new Stack[Int]()`:
+    // 2.13 declares these as `class Queue[A](initialSize: Int =
+    // ArrayDeque.DefaultInitialSize)`, so there is no `<init>()V` to call --
+    // the empty argument list means "take the default". Emitting `()V`
+    // compiled and then died with `NoSuchMethodError` at run time; nsc calls
+    // the synthetic default getter, and so do we.
+    if args.is_empty() && has_default_sized_ctor(&internal) {
+        asm.new_obj(&internal);
+        asm.dup();
+        asm.invokestatic(&internal, "$lessinit$greater$default$1", "()I");
+        asm.invokespecial(&internal, "<init>", "(I)V");
+        return;
+    }
     asm.new_obj(&internal);
     asm.dup();
     if let Some(outer) = outer_field_class(ctx.st, class_id) {
@@ -7839,6 +7852,27 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                 _ => {}
             }
         }
+        // The `scala.collection.mutable` factories `prelude_mutcoll` declares.
+        // Every one of these inherits `apply` from `IterableFactory` /
+        // `SortedIterableFactory` / `EvidenceIterableFactory`, so the JVM
+        // method takes an `immutable.Seq` (plus the evidence, erased to
+        // `Object` except on `TreeMap$`) and returns `Object`; `empty` is
+        // overridden per companion and returns the collection itself.
+        if let Some((cls, apply_desc, empty_desc)) = stdlib_mutcoll_factory(&owner) {
+            let module_cls = format!("{cls}$");
+            match name {
+                "apply" => {
+                    asm.invokevirtual(&module_cls, "apply", apply_desc);
+                    asm.checkcast(cls);
+                    return;
+                }
+                "empty" => {
+                    asm.invokevirtual(&module_cls, "empty", empty_desc);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if is_stdlib_listbuffer_module(&owner) {
             match name {
                 "empty" => {
@@ -9143,6 +9177,18 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "prepend",
                         "(Ljava/lang/Object;)Lscala/collection/mutable/ArrayDeque;",
                     );
+                    return;
+                }
+                // `append` is a `Buffer` default method that `ArrayDeque`
+                // does not override, so it returns `Buffer`, not the
+                // receiver's own class as `prepend` does.
+                "append" => {
+                    asm.invokevirtual(
+                        "scala/collection/mutable/ArrayDeque",
+                        "append",
+                        "(Ljava/lang/Object;)Lscala/collection/mutable/Buffer;",
+                    );
+                    checkcast_to(asm, ctx, result_ty, "scala/collection/mutable/ArrayDeque");
                     return;
                 }
                 _ => {}
@@ -10752,8 +10798,63 @@ fn is_stdlib_arraydeque(owner: &str) -> bool {
     owner == "scala/collection/mutable/ArrayDeque"
 }
 
+/// The `scala.collection.mutable` classes whose only constructor takes the
+/// initial capacity with a default (`javap`: `public Queue(int)` plus
+/// `public static int $lessinit$greater$default$1()`), so `new Queue[A]()`
+/// has to fetch the default rather than call a `<init>()V` that is not there.
+fn has_default_sized_ctor(internal: &str) -> bool {
+    matches!(
+        internal,
+        "scala/collection/mutable/ArrayDeque"
+            | "scala/collection/mutable/Queue"
+            | "scala/collection/mutable/Stack"
+    )
+}
+
 fn is_stdlib_arraydeque_module(owner: &str) -> bool {
     owner == "scala/collection/mutable/ArrayDeque$"
+}
+
+/// The `scala.collection.mutable` companions declared by
+/// `crates/typer/src/prelude_mutcoll.rs`, with the erased descriptor of the
+/// inherited `apply` and of the companion's own `empty`. `javap -p` on
+/// scala-library-2.13.16: the evidence parameter erases to `Object` for
+/// `EvidenceIterableFactory` / `SortedIterableFactory`, but `SortedMapFactory`
+/// (`TreeMap$`) declares it as `Ordering`.
+fn stdlib_mutcoll_factory(owner: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match owner {
+        "scala/collection/mutable/Queue$" => Some((
+            "scala/collection/mutable/Queue",
+            "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+            "()Lscala/collection/mutable/Queue;",
+        )),
+        "scala/collection/mutable/Stack$" => Some((
+            "scala/collection/mutable/Stack",
+            "(Lscala/collection/immutable/Seq;)Ljava/lang/Object;",
+            "()Lscala/collection/mutable/Stack;",
+        )),
+        "scala/collection/mutable/ArraySeq$" => Some((
+            "scala/collection/mutable/ArraySeq",
+            "(Lscala/collection/immutable/Seq;Ljava/lang/Object;)Ljava/lang/Object;",
+            "(Lscala/reflect/ClassTag;)Lscala/collection/mutable/ArraySeq;",
+        )),
+        "scala/collection/mutable/TreeSet$" => Some((
+            "scala/collection/mutable/TreeSet",
+            "(Lscala/collection/immutable/Seq;Ljava/lang/Object;)Ljava/lang/Object;",
+            "(Lscala/math/Ordering;)Lscala/collection/mutable/TreeSet;",
+        )),
+        "scala/collection/mutable/PriorityQueue$" => Some((
+            "scala/collection/mutable/PriorityQueue",
+            "(Lscala/collection/immutable/Seq;Ljava/lang/Object;)Ljava/lang/Object;",
+            "(Lscala/math/Ordering;)Lscala/collection/mutable/PriorityQueue;",
+        )),
+        "scala/collection/mutable/TreeMap$" => Some((
+            "scala/collection/mutable/TreeMap",
+            "(Lscala/collection/immutable/Seq;Lscala/math/Ordering;)Ljava/lang/Object;",
+            "(Lscala/math/Ordering;)Lscala/collection/mutable/TreeMap;",
+        )),
+        _ => None,
+    }
 }
 
 fn is_stdlib_listbuffer(owner: &str) -> bool {
