@@ -11476,6 +11476,20 @@ fn maybe_unbox_erased_result(
                 asm.checkcast(&want);
             }
         }
+        // An *array of* `Object` is just as erased as a bare one:
+        // `Array$.ofDim(IILscala/reflect/ClassTag;)` is declared
+        // `[Ljava/lang/Object;` while `Array.ofDim[Double](2, 2)` is `[[D`.
+        // scalac emits the `checkcast "[[D"`; without it the `dastore` that
+        // follows sees a `java/lang/Object` and the method fails verification.
+        if let (Some((declared, depth)), Type::Array(elem)) = (erased_array_return(desc), ty) {
+            let want = jvm_desc(ctx.st, ty);
+            if want != declared
+                && want.len() - want.trim_start_matches('[').len() >= depth
+                && is_concrete_array_elem(elem)
+            {
+                asm.checkcast(&want);
+            }
+        }
         return;
     }
     if is_jvm_primitive(ty) && !is_unit_like(ty) {
@@ -11564,6 +11578,16 @@ fn ty_extends_internal(st: &SymbolTable, ty: &Type, parent: &str) -> bool {
     false
 }
 
+/// An erased array-of-reference return: the descriptor and its `[` depth, for
+/// `(…)[Ljava/lang/Object;` and deeper. A generic signature may narrow such a
+/// return to a wholly different array descriptor.
+fn erased_array_return(desc: &str) -> Option<(String, usize)> {
+    let (_, ret) = desc.rsplit_once(')')?;
+    let elem = ret.trim_start_matches('[');
+    let depth = ret.len() - elem.len();
+    (depth > 0 && elem == "Ljava/lang/Object;").then(|| (ret.to_string(), depth))
+}
+
 fn desc_returns_object(desc: &str) -> bool {
     desc.rsplit_once(')')
         .map(|(_, ret)| ret == "Ljava/lang/Object;")
@@ -11618,7 +11642,25 @@ fn emit_newarray(asm: &mut Assembler, ctx: &EmitCtx, elem: &Type) {
         Type::Class { sym, .. } | Type::ModuleRef(sym) => {
             asm.anewarray(&class_internal(ctx.st, *sym));
         }
-        _ => asm.anewarray("java/lang/Object"),
+        // Everything else that erases to a reference: `anewarray`'s operand is
+        // an *internal name*, which for an array component is the descriptor
+        // itself. scalac emits `anewarray "[I"` for `new Array[Array[Int]](n)`;
+        // falling through to `java/lang/Object` produced `[Ljava/lang/Object;`,
+        // and the first `arr(i)(j)` then failed verification with
+        // `Bad type on operand stack in iaload`. The same descriptor gives
+        // `Array[(Int, Int)]` its `[Lscala/Tuple2;` and `Array[Int => Int]`
+        // its `[Lscala/Function1;`, both of which scalac also emits.
+        _ => {
+            let desc = jvm_desc(ctx.st, elem);
+            if desc.starts_with('[') {
+                asm.anewarray(&desc);
+            } else if let Some(inner) = desc.strip_prefix('L').and_then(|d| d.strip_suffix(';')) {
+                asm.anewarray(inner);
+            } else {
+                // `V`: `Unit` / `Nothing`, which have no element class here.
+                asm.anewarray("java/lang/Object");
+            }
+        }
     }
 }
 

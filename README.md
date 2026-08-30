@@ -3409,6 +3409,8 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 まとまった拒否側は `tyvar_unsolved_bad.scala`（5 か所。実 scalac 2.13.16 も
 すべて拒否することを確認済み）で固定しています。
 
+`agent/stmtval` スライス（最後の文が定義のブロック、op-assignment の優先順位、入れ子配列の要素型、`Array.ofDim` の型引数と `t(i) op= x`）のフィクスチャは接頭辞 `sv`（`sv_block` / `sv_opassign` / `sv_array` / `sv_update` / `sv_ofdim` / `sv_lib` / `sv_bad`）で、同じ理由から `crates/cli/tests/stmtval.rs` に置いています。`sv_block` / `sv_opassign` / `sv_array` / `sv_update` は**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走ります（1 と 3 は、以前の出力が verify を通らなかったことがそのものなので）。`sv_ofdim` と `sv_lib` は `Array.ofDim` / `List` / `Int.max` が実ライブラリにしか無いので library dual-run 専用で、`fixtures_sv_ofdim_without_library_is_error` / `fixtures_sv_lib_without_library_is_error` が`--no-scala-library` で**きちんと診断される**ことを見ます。`expected/*.txt` は 7 本とも real scalac 2.13.16 の stdout そのものです。`method_body_that_is_only_a_val_verifies` は報告そのままの 1 行（`object Main { def main(a: Array[String]): Unit = { val v = 1 } }`）をその場でコンパイルして走らせます。`sv_bad` は不変な受け手への op-assign がnsc と同じ 2 件の診断のままであること（`any2stringadd` のエラーに化けないこと）を固定します。
+
 ### implicit の残件と prelude の穴（`agent/impltail`）
 
 slick に残っていた implicit 関連のエラーを追ったスライスです。フィクスチャは
@@ -4044,6 +4046,124 @@ slick の計測は `files=184 errors=411 files_with_errors=72` で**前後とも
   になります（`memory/HeapBackend.scala`）。これも `map` が通ってから
   見えるようになった箇所で、直前は同じ行が
   `ambiguous overload for map` で止まっていました。
+### 定義で終わるブロック・op-assign の優先順位・入れ子配列（`agent/stmtval`）
+
+基本的な形が 4 つ壊れていました。互いに独立で、根も別々です。
+
+**1. 本体の最後が定義のブロックが `VerifyError`。**
+
+```scala
+object Main { def main(a: Array[String]): Unit = { val v = 1 } }
+// java.lang.VerifyError: Operand stack underflow
+//   Location: Main$.main([Ljava/lang/String;)V @2: pop
+```
+
+nsc の `TreeBuilder.makeBlock` は、最後の文が**項ではなく定義**のとき
+`Block(stats, ())` を作ります（`scalac -Xprint:parser` で見えます）。
+
+```
+def main(a: Array[String]): Unit = {
+  val v = 1;
+  ()
+}
+```
+
+こちらの `block_from_stats` は文が 1 つならそれをそのまま返し、複数なら
+最後の文をブロックの値にしていたので、`{ val v = 1 }` は**そのまま `ValDef`**
+でした。ブロックの型が定義の型（ここでは `Int`）になり、
+`emit_body_return` の `pop_if_value` が**積まれていない値を pop** します。
+これは `val` / `var` / `def` / `class` / `object` / `import` / `type` の
+どれで終わっても起きるので、**あらゆるメソッドに効きます**。修正は
+`crates/parser/src/parse.rs` の `block_from_stats` に nsc と同じ分岐を
+足しただけです（`stat_is_definition`）。空ブロック `{}` は元から
+`Literal(())` でした。
+
+**2. `n += i + x` が文字列連結に解決される。**
+
+```
+error: no matching overload for (String)String with arguments (Int)
+```
+
+nsc の `precedence` は `isOpAssignmentName`（`=` で終わり、`=` で始まらず、
+`!=` / `<=` / `>=` でなく、演算子文字で始まる名前）に**0＝最下位**を返します。
+こちらは先頭文字だけを見ていたので `+=` は `+` と同じ 8 で、`n += i + x` は
+**`(n += i) + x`** と解釈されていました。左辺 `n += i` は `Unit` なので、
+そこから `any2stringadd` → `String.+` が選ばれてあのエラーになります。
+`n += 1` のように後続の演算子が無ければ壊れないので、複合式のときだけ
+再現していました。`crates/parser/src/ast.rs` の `op_precedence` に
+`is_op_assignment_name` を足しただけです。`var s = "a"; s += 1`（`String + Any`）
+は今も通ります。
+
+**3. `new Array[Array[Int]](n)` が `anewarray java/lang/Object`。**
+
+`anewarray` のオペランドは**内部名**で、要素が配列型のときはその
+ディスクリプタそのもの（`[I`）です。scalac は
+`anewarray "[I"` を出します。`emit_newarray` は `String` / `Class` /
+`ModuleRef` 以外を全部 `java/lang/Object` に落としていたので、
+`Array[Array[Int]]` が `[Ljava/lang/Object;` になり、最初の `arr(i)(j)` が
+`VerifyError: Bad type on operand stack in iaload` で落ちていました。
+`jvm_desc` から内部名を作るようにしたので、`Array[(Int, Int)]` の
+`[Lscala/Tuple2;` と `Array[Int => Int]` の `[Lscala/Function1;` も
+scalac と同じになります（`Unit` / `Nothing` 要素の扱いは従来どおり）。
+
+**4. `Array.ofDim[T](n1, …)` の型引数が具体化されない ＋ `arr(i) += x`。**
+
+```
+error: type mismatch; found: 5  required: T
+error: value += is not a member of T
+```
+
+`scala.Array$.ofDim` は 1〜5 次元の 5 本のオーバーロードで、**どれも
+型パラメータを 1 つ取ります**。`TypeApply` は「その個数の型パラメータを
+取る候補が 1 つだけ」のときにしか参照を絞れないので、`ofDim` では絞れず、
+明示した `[Double]` は**どこにも届いていませんでした**（結果は
+`Array[Array[T]]` のまま）。オーバーロードが値引数で決まった時点で、
+書かれた型引数を選ばれた候補に適用するようにしました
+（SLS 6.26.3、`pending_targs`）。
+
+同じ呼び出しには続きが 2 つあります。コード生成の `peel_fun` は
+`TypeApply` を突き抜けて**下の `Select` の**シンボルを読むので、
+そこにも解決結果を伝えないと 1 次元の `ofDim(I, ClassTag)Object` を
+呼んでしまいます。そして 2 次元の `ofDim` の JVM 戻り値は
+`[Ljava/lang/Object;` なので、`Ljava/lang/Object;` と同じように
+**narrowing の `checkcast "[[D"`** が要ります（scalac も出します）。
+`maybe_unbox_erased_result` に `erased_array_return` を足しました。
+
+`arr(0) += 1` は別の穴でした。nsc の `convertToAssignment` は受け手が
+`t.apply(i)` のとき `mkUpdate` に入り、`t.update(i, t.apply(i) op x)` を
+作ります。表と添字は `gen.evalOnce` で**一度だけ**評価されます
+（純粋な参照は複製、それ以外は `val ev$…` に束縛）。こちらにはこの分岐が
+無く、「receiver is not assignable」で落としていました。`bar` のような
+**普通のメソッド呼び出しの受け手は対象外**です（nsc も
+`UnexpectedTreeAssignmentConversionError` にします）。`t(i)` を
+`t.apply(i)` に書き換えるのはこちらの typer も同じなので、`index_table` で
+その形だけを拾います。
+
+| fixture | 何を固定するか | 期待出力 |
+| --- | --- | --- |
+| `sv_block.scala`（`crates/cli/tests/stmtval.rs`、私有ランタイム・library dual-run） | 最後の文が定義のブロック: `val` / `var` / `def` / `import` / `class` / `object` / `type`、空ブロック `{}`、`if` の両枝、`while` の本体、`try` / `match` の本体、パターン `val`、ネストしたブロック、ラムダ本体。項で終わるブロックは値を保つ | `valLast` `nested` `42` `done` |
+| `sv_opassign.scala`（同上） | `+=` `-=` `*=` `/=` `%=` `<<=` `\|=` `&=` `^=` の右辺が複合式（`i + x`、`f(x) + g(y)`、`(a + b) * c`、`if`、英字演算子）。`var s = "a"; s += 1` は `String + Any` として通る | `3` `0` `12` `4` `1` `13` `9` `20` `6` `18` `8` `11` `3` `1` `4.5` `a1` `a1bc` `3` |
+| `sv_array.scala`（同上） | `new Array[Array[Int]]` / `Array[Array[String]]` / `Array[Array[Array[Int]]]` の要素型と `getClass.getName`。1 次元（`Int` / `String` / `Object`）、`Array[(Int, Int)]`、`Array[Int => Int]` | `2` `10` `[[I` `y` `[[Ljava.lang.String;` `7` `[[[I` `9` `[I` `s` `[Ljava.lang.String;` `[Ljava.lang.Object;` `1,2` `[Lscala.Tuple2;` `2` `[Lscala.Function1;` |
+| `sv_update.scala`（同上） | `t(i) op= x`: 配列（`Int` / `Double` / `String`）、入れ子 `nested(0)(1) += 3`、自前の `apply`/`update` を持つクラス、右辺が複合式、`evalOnce`（表と添字が 1 回ずつしか走らない） | `6` `12` `3` `2.0` `ab` `7` `15` `1` `2` |
+| `sv_ofdim.scala`（`crates/cli/tests/stmtval.rs`、library dual-run のみ。私有ランタイムには `ofDim` が無いので診断を出すことも見る） | `Array.ofDim[T]` の 1〜5 次元 × `Int` / `Double` / `String` / ユーザークラス。既に動いていた `val g: Array[Array[Int]] = Array.ofDim[Int](2, 3)` と `Array.fill(3)(0)`、`Array(1, 2, 3)` も | `7` `[I` `7` `[[I` `7` `[[[I` `7` `[[[[I` `7` `[[[[[I` `2.0` `[D` `6.0` `[[D` `2.5` `[[[D` `ab` `[Ljava.lang.String;` `z` `[[Ljava.lang.String;` `Cell(3)` `[LCell;` `Cell(4)` `[[LCell;` `0,0,0;0,0,9` `2` `[I` `1,2,3` |
+| `sv_lib.scala`（`crates/cli/tests/stmtval.rs`、library dual-run のみ） | 実 scala-library でしか裏付けられない形での同じ 4 件: `Array[List[Int]]` の要素型、`n += i max x`、`var lst ++= List(…)`、`foreach` のラムダ本体が定義で終わる形 | `List(1, 2)` `[Lscala.collection.immutable.List;` `2` `3` `List(1, 2, 3)` `6` `done` |
+| `sv_bad.scala`（`crates/cli/tests/stmtval.rs`、異常系） | 不変な受け手への op-assign は nsc の `convertToAssignment` の診断のまま（`value += is not a member of Int` ＋ `Expression does not convert to assignment because receiver is not assignable.`）。優先順位を直すまでは `any2stringadd` のエラーに化けていた | （コンパイルエラー 2 件） |
+
+
+### Remaining
+
+- **`t(i) op= x` の受け手が普通のメソッド呼び出しのとき**（`agent/stmtval`）。
+  `foo.bar(0) += 1`（`bar` はメソッド）は nsc も
+  `UnexpectedTreeAssignmentConversionError` でエラーにしますが、こちらの
+  文言は `value += is not a member of …` ＋
+  `Expression does not convert to assignment because receiver is not
+  assignable.` のままです。どちらもエラーにはなるので受理はしませんが、
+  診断は一致していません。
+
+- **`Int` の `max` / `min` が私有ランタイムに無い**（`agent/stmtval` で確認）。
+  `n += i max x` は jar モードでは通りますが、`--no-scala-library` では
+  `value max is not a member of Int` になります（`RichInt` のメンバなので、
+  診断としては正しい形です）。
 
 - **`"abc".appended(1)` のような `B >: Char` の下限推論**（`agent/stringops8`
   で確認）。scalac は `B := AnyVal` と lub を取って `IndexedSeq[AnyVal]` を
