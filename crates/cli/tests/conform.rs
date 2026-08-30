@@ -228,5 +228,6 @@ conform!(
     nested_value_class,
     fn_compose,
     try_extractor,
-    curried_eta
+    curried_eta,
+    ordering_double
 );

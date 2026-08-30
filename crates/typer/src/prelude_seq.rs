@@ -475,6 +475,22 @@ fn add_ordering_instances(st: &mut SymbolTable, ordering: SymbolId) {
         // jar には `Ordering$Byte$` / `Ordering$Short$` が実在する。
         ("Byte", "scala/math/Ordering$Byte$", Type::Byte),
         ("Short", "scala/math/Ordering$Short$", Type::Short),
+        // `Double` と `Float` は 2.13 では `Ordering.Double` / `Ordering.Float`
+        // が名前空間オブジェクトになり（`TotalOrdering` / `IeeeOrdering` を
+        // 抱える）、implicit として選ばれるのは `DeprecatedDoubleOrdering` /
+        // `DeprecatedFloatOrdering` のほう。scalac で
+        // `implicitly[Ordering[Double]]` を出させて確かめた。
+        (
+            "DeprecatedDoubleOrdering",
+            "scala/math/Ordering$DeprecatedDoubleOrdering$",
+            Type::Double,
+        ),
+        (
+            "DeprecatedFloatOrdering",
+            "scala/math/Ordering$DeprecatedFloatOrdering$",
+            Type::Float,
+        ),
+        ("Unit", "scala/math/Ordering$Unit$", Type::Unit),
     ] {
         add_implicit_instance(st, ord_cls, ordering, name, jvm, ty);
     }
