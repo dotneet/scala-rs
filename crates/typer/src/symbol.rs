@@ -347,6 +347,14 @@ pub struct SymbolTable {
     /// constructor fields private behind accessors; ours are emitted with the
     /// field public, so the two are read differently.
     pub source_classes: std::collections::HashSet<SymbolId>,
+    /// One past the last symbol `install_prelude` built.
+    ///
+    /// The prelude hand-writes signatures for the part of `scala.*` the typer
+    /// reasons about, and those must never be reshaped from a jar. Everything
+    /// `scala.*` the prelude does *not* cover (`scala.concurrent.Future`, for
+    /// one) arrives from a classfile instead, where a by-name parameter is
+    /// indistinguishable from a `Function0`. This is the line between the two.
+    pub prelude_end: u32,
 }
 
 impl SymbolTable {
@@ -412,6 +420,7 @@ impl SymbolTable {
             value_class_terms: std::collections::HashMap::new(),
             source_value_classes: std::collections::HashSet::new(),
             source_classes: std::collections::HashSet::new(),
+            prelude_end: 0,
         };
         st.root = st.alloc(
             "<_root_>",

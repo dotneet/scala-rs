@@ -273,10 +273,18 @@ impl PickleSupply {
         }
         let internal = st.get(class_sym).jvm_name.clone();
         if internal.is_empty()
-            || internal.starts_with("scala/")
             || internal.starts_with("java/")
             || internal.starts_with("javax/")
             || internal.contains("$anon")
+            // A *prelude* class is off limits: its signatures are hand-written
+            // and the rest of the typer reasons about them, so rebuilding one
+            // from a jar breaks members that work (the same reason
+            // `ensure_class` refuses). The line is not `scala.*` though --
+            // it is `scala.*` the prelude actually built. What it never names
+            // (`scala.concurrent.Future`, `Promise`, `mutable.Growable` …)
+            // had no source but the class file, where a by-name parameter is
+            // an ordinary `Function0` and `Future(21)` does not typecheck.
+            || (internal.starts_with("scala/") && class_sym.0 < st.prelude_end)
         {
             return false;
         }
@@ -1553,11 +1561,17 @@ impl PickleSupply {
                 self.conv_at(st, bin, &inner, result, d)
             }
             SigType::Ref { sym, args } => self.conv_ref(st, bin, scope, sym, args, d, 0),
-            // `this.type` widens to the receiver applied to its own type
-            // parameters; `type_select` then substitutes the receiver's
-            // arguments into it, so `b ++= xs` on a `Builder[Int, List[Int]]`
-            // yields that `Builder` and not `Growable`.
-            SigType::This(_) => self.self_ty.clone(),
+            // `this.type` stays a `this.type` of the class the member is
+            // installed on: `subst_as_seen_from` then reads it as the actual
+            // receiver, so `b ++= xs` on a `Builder[Int, List[Int]]` yields
+            // that `Builder` even though `++=` is declared by `Growable`.
+            // Widening it to the *installing* class here instead was fine
+            // while every member was installed on the receiver's own class,
+            // and wrong the moment a base class is completed in its own right.
+            SigType::This(_) => match &self.self_ty {
+                Some(Type::Class { sym, .. }) => Some(Type::ThisType(*sym)),
+                other => other.clone(),
+            },
             SigType::Refined { parents, decls } => {
                 self.conv_refined(st, bin, scope, parents, decls, d)
             }

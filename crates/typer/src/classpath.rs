@@ -969,19 +969,58 @@ pub fn find_or_stub_java_class(st: &mut SymbolTable, internal: &str) -> SymbolId
     }
     let simple = java_simple_name(internal);
     let owner = java_class_owner(st, internal);
+    // `cats/effect/kernel/Ref$` is the *companion*, not the trait. Stubbing it
+    // as a `SymKind::Class` called `Ref` -- with the companion's name in
+    // `jvm_name` -- made one symbol stand for two things: the object's members
+    // landed on the trait, and the trait could never get a symbol of its own
+    // (`ensure_class` declines a name whose `jvm_name` is not the key it
+    // asked for), so `Ref#update` was read from the class file's generic
+    // signature. That cannot write `F[Unit]`; it writes `TF;`, and every
+    // `ctx.update(…) >> …` became "value >> is not a member of F". A `$` name
+    // gets the shape `install_java_module` builds for a class file it has
+    // really read: a `ModuleClass` plus its `Module`.
+    let module = internal.len() > 1 && internal.ends_with('$');
     // The owner's *own* declarations only. A nested class is always declared
     // by the class its JVM name names, never inherited into it, and searching
     // the parents too made every one of cats' `Foo.Ops` traits resolve to the
     // first one entered: `cats/FlatMap$Ops` asked `FlatMap` for `Ops`, whose
     // linearization reaches `Functor`, which by then had one.
-    if let Some(id) = st
+    if module {
+        if let Some(m) = st
+            .get(owner)
+            .members
+            .iter()
+            .copied()
+            .find(|&s| st.get(s).name == simple && st.get(s).kind == SymKind::Module)
+        {
+            return st.module_class_of(m);
+        }
+    } else if let Some(id) = st
         .get(owner)
         .members
         .iter()
         .copied()
-        .find(|&s| st.get(s).name == simple && st.get(s).is_class_like())
+        .find(|&s| st.get(s).name == simple && st.get(s).kind == SymKind::Class)
     {
         return id;
+    }
+    if module {
+        let flags = Flags::JAVA.with(Flags::MODULE).with(Flags::FINAL);
+        let cls = st.alloc(
+            format!("{simple}$"),
+            owner,
+            SymKind::ModuleClass,
+            flags,
+            internal,
+        );
+        let m = st.alloc(&simple, owner, SymKind::Module, Flags::MODULE, internal);
+        st.get_mut(m).ty = Type::ModuleRef(cls);
+        st.get_mut(cls).ty = Type::ModuleRef(cls);
+        st.get_mut(cls).parents = vec![Type::AnyRef];
+        if owner == st.root {
+            st.enter_in_current(&simple, m);
+        }
+        return cls;
     }
     let id = st.alloc(&simple, owner, SymKind::Class, Flags::JAVA, internal);
     st.get_mut(id).ty = Type::Class {

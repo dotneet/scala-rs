@@ -418,6 +418,7 @@ impl Typer {
     pub fn new(file_index: usize, opts: &TypecheckOptions) -> Self {
         let mut st = SymbolTable::new();
         install_prelude(&mut st, opts.library_abi);
+        st.prelude_end = st.symbols.len() as u32;
         let lazy_base_scopes = st.scopes.len();
         Typer {
             st,
