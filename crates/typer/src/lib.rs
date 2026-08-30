@@ -39,7 +39,6 @@ mod prelude_numconv;
 mod prelude_numeric;
 mod prelude_numhier;
 mod prelude_numops;
-mod prelude_ordsummon;
 mod prelude_ordtuple;
 mod prelude_oshadow;
 mod prelude_ovl2;

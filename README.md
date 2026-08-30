@@ -623,18 +623,6 @@ scala-rs には三つ目がありました。`adapt_implicit_apply` は何箇所
   `Numeric[T]` を `Ordering[T]` の位置に渡せませんでした（slick の
   `ScalaNumericType[T] extends ScalaBaseType[T]()(tag, numeric)`）。
   `crates/typer/src/prelude_numhier.rs`。
-- **第 1 引数リストが implicit の method は view ではありません**（SLS 7.3。view は
-  「引数 1 個の *explicit* な implicit method」）。`implicit def Option[T](implicit
-  ord: Ordering[T]): Ordering[Option[T]]` は導出規則であって
-  `Ordering[T] => Ordering[Option[T]]` の変換ではないのに、暗黙変換の探索が
-  引数リストの implicit 性を見ずに拾っていました。`val o: Ordering[Option[Int]] =
-  Ordering.Int` が**黙って通り**、メンバが見つからなかった選択の受け手も
-  この変換で書き換えられて（`value Int is not a member of
-  Ordering[Option[AnyRef]]`）診断が化けていました。method の**型**では
-  どの節が implicit か分からないので、パラメータ**シンボル**の
-  `Flags::IMPLICIT` で判定します（`crates/typer/src/implicits.rs` の
-  `first_clause_is_implicit`）。導出規則としての利用（`List(Some(2), None).sorted`）は
-  そのまま通ります。
 - 関数値の `apply` は関数そのものです。prelude の `FunctionN.apply` は消去された
   パラメータで宣言されているので、`f.apply(xs)` は `Any` になっていました（`f(xs)` は正しい）。
 - 可変長引数を持つ `case class` の `copy$default$n`（`this.cells`）は `T*` ではなく
@@ -1307,53 +1295,6 @@ object HNil extends HList { … }
 - **object のネスト**（`ColumnOption.AutoInc.type`）。`object O { object I }` の `I` は
   モジュールクラス `O$` のメンバなので、接頭辞の型からメンバを引くときに Module →
   モジュールクラスへ正規化します（`path_member_owner`）。
-
-### `Ordering` コンパニオンと summon（`agent/ordsummon`）
-
-`package object scala` は型クラスを**型と項の両方**で無修飾に見せています。
-
-```scala
-type Ordering[T] = scala.math.Ordering[T]
-val  Ordering    = scala.math.Ordering
-```
-
-prelude（`add_scala_aliases`）は前者だけを入れていて、**項**位置の `Ordering` も
-trait そのものに解決されていました。そのため
-
-- `Ordering.Int` は trait のメンバを探して落ちる（`scala.math.Ordering.Int` と
-  完全修飾すれば通っていた）。
-- `Ordering[String]` は「trait を項に置いた型適用」として**型検査を黙って通り**、
-  codegen が `Ordering$.MODULE$` を積んで `Ordering` に checkcast していました
-  （実行時 `ClassCastException: scala.math.Ordering$ cannot be cast to
-  scala.math.Ordering`）。`Ordering[Int].reverse` は
-  `IncompatibleClassChangeError` の形で出ます。
-
-`crates/typer/src/prelude_ordsummon.rs` がコンパニオン module を項の名前空間にも
-入れます（`Ordering` / `Numeric` / `Equiv` / `Fractional` / `Integral` / `BigInt` /
-`BigDecimal`）。`SymbolTable::lookup` は class と module の両方を返し、項位置
-（`type_ident`）は module を、型位置（`resolve_type_name`）は class を選びます。
-`Integral` / `Fractional` は `prelude_numhier` が jar を読まずに trait だけ生やして
-いたのでコンパニオンが無く、ここで作ります（jar の `scala/math/Integral$` は実在し、
-`apply:(Lscala/math/Integral;)Lscala/math/Integral;` を持ちます）。作る前は
-`val i: Integral[Int] = Integral[Int]` が黙って通って実行時に落ちていました。
-
-summon（`Ordering[String]` = `Ordering.apply[String]`。nsc では
-`def apply[T](implicit ord: Ordering[T]): Ordering[T] = ord` の恒等）は
-`check.rs` の `Module[T]` → `Module.apply[T]` リダイレクトが受け持ちます。
-2 つ足りていませんでした。
-
-- ライブラリのコンパニオンの `apply` は**選択されたとき**に pickle から読まれるので、
-  `.apply` と書かない `Ordering[String]` では見つかりませんでした。module が
-  `apply` を 1 つも持たないときだけ pickle から供給します（コレクションの
-  ファクトリには prelude が自前の `apply` を持っており、そこへ pickle の
-  オーバーロードを足すと `List[Int](1, 2)` が `ambiguous overload` になります）。
-- 参照が module シンボルとは限りません。パッケージオブジェクトの別名は
-  アクセサ（`def Equiv(): Equiv$`）として届くので、**module クラス型の安定値**も
-  同じ扱いにします（`module_class_of_value`）。
-
-`--no-scala-library` では `scala/math/Ordering` の classfile も `Ordering$` も無く、
-`not found: value Ordering` の診断のままです（`prelude_ordsummon` は `library_abi`
-でゲート）。
 
 ### 改行が文を切る条件（nsc `inLastOfStat` / `inFirstOfStat`）
 
@@ -2971,15 +2912,6 @@ implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラー
   通ります（`agent/mismatch9`）
 - `mutable.ArrayBuilder[T]` に `Builder[T, Array[T]]` の基底型が無い
   （`ArrayBuilder.make[E]` を `mutable.Builder[E, Array[E]]` の位置に渡せない）
-- `Equiv[Int]`（`agent/ordsummon`）。summon 自体は `Equiv.apply[T]` に解決される
-  ようになりましたが、実 ABI の `Ordering[T] extends PartialOrdering[T] extends
-  Equiv[T]` を prelude が張っていないので `could not find implicit value of type
-  Equiv[Int]` になります（**診断であって誤コンパイルではありません**。実 scalac は
-  `Ordering.Int` を渡します）。`Numeric[T] <: Ordering[T]` と同じ形の辺を
-  1 本足す話ですが、`Ordering` の implicit スコープが変わるので別スライス扱い
-- `Ordering#compare` は prelude では `(Any, Any): Int` のままです。
-  `Ordering[String].compare(1, 2)` を real scalac は拒否しますが、こちらは通します
-  （`agent/ordsummon` の `os2_summon_bad.scala` はこの行を含めていません）
 
 パーサは未対応構文を黙って捨てず、診断と `Unimplemented` ノードを出します。
 
@@ -3353,8 +3285,6 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 `agent/parentimpl` スライス（親コンストラクタの implicit 節・デフォルト引数の補完）のフィクスチャは接頭辞 `pimpl`（`pimpl` / `pimpl_bad`）で、同じ理由から `crates/cli/tests/parentimpl.rs` に置いています。`pimpl.scala` は slick の `ConstColumn` 形（`class ConstColumn[T : TT] extends TypedRep[T]`）、明示節＋2 引数の implicit 節、全部デフォルト／末尾だけデフォルト、デフォルト節＋implicit 節、匿名クラスの親、引数無しの `new` を 1 本にまとめ、**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせます。`real_scalac_dual_run_pimpl` は real scalac 2.13.16 でも同じソースを走らせて stdout が一致することを見ます（`expected/pimpl.txt` は scalac の出力そのもの）。`pimpl_late_a.scala` / `pimpl_late_z.scala` は**子を親より先にコンパイル**して、親の context bound の evidence がシグネチャパス時点で未生成でも埋まる（＝ファイル順に依存しない）ことを見ます。`pimpl_bad.scala` は witness の無い親 implicit 節が**黙って通らない**ことを固定し、`pimpl_bad_reports_the_extends_clause_once` で診断が `extends` の行に 1 件だけ出る（3 パス分に増えない）ことも見ています。
 
 `agent/integral` スライス（`Integral` / `Fractional` を `Numeric` の型クラス階層に入れる）のフィクスチャは接頭辞 `ig`（`ig_hier` / `ig_hier_bad`）で、同じ理由から `crates/cli/tests/integral.rs` に置いています。`ig_hier.scala` は `List.range` / `Vector.range` / `Seq.range`、`implicitly[…]` 13 件の**選ばれたインスタンスのクラス名**、`quot` / `rem` / `div`、`Numeric[T]` を implicit に取るユーザーコード、`sum` / `product` / `sorted` / `max` / `min` / `sortBy`、`Integral[Int]` → `Numeric[Int]` / `Ordering[Int]` の widening、`Ordering[Option[Int]]` を 1 本にまとめてあり、library dual-run と **real scalac 2.13.16** との実行結果 diff（`ig_hier_matches_real_scalac`）の両方で `java -Xverify:all` の下に走らせます。クラス名を出力しているので「一意になった」ではなく「**実 scalac と同じインスタンスを選んでいる**」ことが見えます。`ambiguity_did_not_increase` は `Ordering[Int/Double/Long/Byte/Short/Char/Float]` と `sum` / `product` / `sorted` / `max` / `min` / タプルの `sorted` に `ambiguous` が 1 件も出ないことを固定します（`Numeric[T] extends Ordering[T]` なので、ここが今回いちばん壊れやすい所でした）。`ig_hier_bad.scala` は階層がゴム印にならないこと——`Numeric[Int]` → `Integral[Int]` と `Ordering[Int]` → `Numeric[Int]` の逆流、実在しない `Integral[Double]` / `Fractional[Int]` / `Integral[String]`——を固定します（real scalac も同じ 6 行で 6 件出します）。私有ランタイムには `scala/math/Integral` が無いので、`range_is_diagnosed_without_the_jar` が `--no-scala-library` で `not found: type Integral` / `range is not a member of List$` と**きちんと診断される**ことを見ます。
-
-`agent/ordsummon` スライス（`Ordering` コンパニオンの項位置と summon `Ordering[T]`）のフィクスチャは接頭辞 `os2`（`os2_summon` / `os2_summon_bad`）で、同じ理由から `crates/cli/tests/ordsummon.rs` に置いています。`os2_summon.scala` は `Ordering.Int.reverse` / `Ordering[String]` / `Ordering[Int].reverse` / `Ordering.String.reverse` / `implicitly[Ordering[Int]].reverse` / `List(…).sorted(Ordering[String].reverse)` / `Ordering.by[(String, Int), Int]` / `Numeric[Int]` / `Numeric.IntIsIntegral` / `Integral[Int]` / `Fractional[Double]` / `BigInt` の乗算／選ばれたインスタンスのクラス名（`scala.math.Ordering$Int$`）／`List(Some(2), None, Some(1)).sorted` を 1 本にまとめ、library dual-run と **real scalac 2.13.16** との実行結果 diff（`os2_summon_matches_real_scalac`）の両方で `java -Xverify:all` の下に走らせます。`ClassCastException` は**型検査を通ったあとに**出ていたので、コンパイルが通ることだけでは足りません。`the_three_reported_forms_run` が報告された 3 形をそのまま実行し、`integral_and_fractional_summon` は `val i: Integral[Int] = Integral[Int]` が黙って通って実行時に落ちていた形（`59d967a` では型エラー）を固定します。`option_ordering_is_still_derived_but_is_not_a_view` は `Ordering.Option` が導出規則としては効き続け、view としては効かない（`val o: Ordering[Option[Int]] = Ordering.Int` は `type mismatch`）ことを両方見ます。`module_apply_redirect_still_works` は `List[Int](1, 2)` / `Vector[String]` / `Option[Int]` / `Map[String, Int]` の既存のファクトリが `ambiguous overload` にならないことを固定します（pickle からの `apply` 供給をここで足したので、いちばん壊れやすい所でした）。`os2_summon_bad.scala` はコンパニオンを項に出せるようにしたことが「なんでも通る」ことにならない 5 行——`val a: Ordering[Int] = Ordering` / `val b: Ordering[Option[Int]] = Ordering.Int` / `Ordering.Foo` / `Numeric.Int` / `Ordering[Object]`——で、real scalac も同じ 5 行で 5 件出します。`summon_is_diagnosed_without_the_jar` は `--no-scala-library` で `not found: value Ordering` の診断が残ることを見ます。
 
 `agent/traitextends` スライス（trait がクラスを継承する、`abstract override` / stackable trait）の
 フィクスチャは接頭辞 `trex`（`trex_stack` / `trex_inherit` / `trex_mixin_bad` /

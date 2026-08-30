@@ -582,31 +582,9 @@ impl Typer {
     /// applicable, exactly as in nsc — otherwise `orderingToOrdered` would
     /// claim `Box[Int] => Ordered[Box[Int]]` and fail later, at the point where
     /// its `Ordering[Box[Int]]` argument has to be produced.
-    /// SLS 7.3: a view is an implicit method with *one explicit* parameter.
-    /// `implicit def Option[T](implicit ord: Ordering[T]): Ordering[Option[T]]`
-    /// is a derivation rule, not a conversion from `Ordering[T]`; reading it as
-    /// one accepted `val o: Ordering[Option[Int]] = Ordering.Int` (real scalac
-    /// rejects it) and re-typed the receiver of every failed selection on an
-    /// `Ordering`. The method *type* cannot say which clause is implicit, so
-    /// the parameter symbols are what we ask.
-    fn first_clause_is_implicit(&self, id: SymbolId) -> bool {
-        let s = self.st.get(id);
-        let first = match s.paramss.first() {
-            Some(c) => c,
-            None => return false,
-        };
-        !first.is_empty()
-            && first
-                .iter()
-                .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
-    }
-
     fn conversion_provides(&self, id: SymbolId, from: &Type, to: &Type) -> bool {
         let s = self.st.get(id);
         if !s.flags.contains(Flags::IMPLICIT) {
-            return false;
-        }
-        if self.first_clause_is_implicit(id) {
             return false;
         }
         let (param, ret) = match &s.ty {
@@ -850,9 +828,6 @@ impl Typer {
     ) -> Option<(Type, Vec<(SymbolId, Type)>)> {
         let s = self.st.get(id);
         if !s.flags.contains(Flags::IMPLICIT) {
-            return None;
-        }
-        if self.first_clause_is_implicit(id) {
             return None;
         }
         let (param, ret) = match &s.ty {
