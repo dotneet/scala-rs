@@ -3245,6 +3245,46 @@ impl<'a> Parser<'a> {
         t
     }
 
+    /// `f(xs*)` is the `-Xsource:3` spelling of `f(xs: _*)`. The infix loop
+    /// has already given up on the `*` and `parse_postfix_expr` turned it into
+    /// a postfix `Select`, so the last argument of a call arrives as
+    /// `xs.*`; only a `*` that closes the argument list is the splat, which is
+    /// also the only position varargs may occupy.
+    fn finish_arg_star(&mut self, arg: Tree) -> Tree {
+        if !self.opts.source3 || !matches!(self.kind(), TokenKind::RParen) {
+            return arg;
+        }
+        let TreeKind::Select { qual, name } = &arg.kind else {
+            return arg;
+        };
+        if name != "*" || !arg.postfix {
+            return arg;
+        }
+        let sp = arg.span;
+        let expr = qual.as_ref().clone();
+        let star = self.alloc(sp, TreeKind::Wildcard);
+        let repeated = self.alloc(
+            sp,
+            TreeKind::Ident {
+                name: "<repeated>".into(),
+            },
+        );
+        let tpt = self.alloc(
+            sp,
+            TreeKind::AppliedTypeTree {
+                tpt: Box::new(repeated),
+                args: vec![star],
+            },
+        );
+        self.alloc(
+            sp,
+            TreeKind::Typed {
+                expr: Box::new(expr),
+                tpt: Box::new(tpt),
+            },
+        )
+    }
+
     fn parse_arg_exprs(&mut self) -> Vec<Tree> {
         self.bump(); // (
         self.skip_nl();
@@ -3252,7 +3292,8 @@ impl<'a> Parser<'a> {
         if !matches!(self.kind(), TokenKind::RParen) {
             loop {
                 // named arg: id = expr
-                args.push(self.parse_expr());
+                let a = self.parse_expr();
+                args.push(self.finish_arg_star(a));
                 self.skip_nl();
                 if matches!(self.kind(), TokenKind::Comma) {
                     self.bump();

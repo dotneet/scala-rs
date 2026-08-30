@@ -6184,6 +6184,77 @@ impl Typer {
         (!mentions_tparam(&out, open)).then_some(out)
     }
 
+    /// nsc's `dependentTypeMap`. `def get[P <: Phase](p: P): Option[p.State]`
+    /// reads `State` off the *argument*, not off `Phase`, so
+    /// `get(Phase.assignUniqueSymbols)` is an `Option[UsedFeatures]` and not an
+    /// `Option[Phase#State]` that degrades to `Any`.
+    ///
+    /// The type carries no prefix, so the parameter that could have been one is
+    /// found by its bound: only when exactly one parameter's type has the
+    /// member's owner as a base class is that argument the prefix. An argument
+    /// that leaves the member abstract changes nothing.
+    fn subst_dependent_members(&self, param_tys: &[Type], arg_tys: &[Type], ret: &Type) -> Type {
+        let mut members = Vec::new();
+        crate::symbol::collect_type_members(ret, &mut members);
+        if members.is_empty() {
+            return ret.clone();
+        }
+        let mut out = ret.clone();
+        for m in members {
+            let info = self.st.get(m);
+            if !info.tparams.is_empty() {
+                continue;
+            }
+            let owner = info.owner;
+            let name = info.name.clone();
+            if owner.is_none() || !self.st.get(owner).is_class_like() {
+                continue;
+            }
+            let mut cand = None;
+            for (i, p) in param_tys.iter().enumerate() {
+                let base = match p {
+                    Type::TypeParam(id) => match &self.st.get(*id).bound_hi {
+                        Some(hi) => hi.clone(),
+                        None => continue,
+                    },
+                    other => other.clone(),
+                };
+                if self.base_type_instance(&base, owner, 0).is_none() {
+                    continue;
+                }
+                if cand.is_some() {
+                    cand = None;
+                    break;
+                }
+                cand = Some(i);
+            }
+            let Some(i) = cand else { continue };
+            let Some(acls) = arg_tys.get(i).and_then(|a| self.st.class_sym_of(a)) else {
+                continue;
+            };
+            let Some(found) = self
+                .st
+                .lookup_member(acls, &name)
+                .into_iter()
+                .find(|&s| self.st.get(s).kind == SymKind::TypeMember)
+            else {
+                continue;
+            };
+            if found == m {
+                continue;
+            }
+            let seen = self.st.dealias(&Type::TypeMember(found));
+            if seen.is_no_type()
+                || seen.is_error()
+                || matches!(&seen, Type::TypeMember(x) if *x == m)
+            {
+                continue;
+            }
+            out = crate::symbol::subst_type_member(&out, m, &seen);
+        }
+        out
+    }
+
     /// nsc's `solvedTypes` for what a call leaves over. A type parameter that
     /// occurs in the result but in *no* parameter type is one no argument
     /// could ever pin; once the expected type has had its say, nsc instantiates
@@ -6195,7 +6266,16 @@ impl Typer {
     /// A parameter that *does* occur in a parameter type is left alone: that is
     /// the one the arguments (or a still-missing implicit) are supposed to
     /// determine, and papering over it would hide the diagnostic.
-    fn instantiate_leftover_tparams(&self, method: SymbolId, ret: Type, pt: &Type) -> Type {
+    ///
+    /// `nargs` is how many arguments the call actually passed, because a
+    /// repeated parameter that got none is not one an argument can pin.
+    fn instantiate_leftover_tparams(
+        &self,
+        method: SymbolId,
+        ret: Type,
+        pt: &Type,
+        nargs: usize,
+    ) -> Type {
         // Only where the call is what the expected type is checked against.
         // With none, this is a receiver a further application may still solve
         // (nsc keeps those in `Context.undetparams`).
@@ -6206,8 +6286,25 @@ impl Typer {
         if tps.is_empty() || !mentions_tparam(&ret, &tps) {
             return ret;
         }
+        // A repeated parameter the call left empty solves nothing: `List()`
+        // has no element to read `A` out of, so `A` is unconstrained and nsc
+        // minimises it to `Nothing`. Leaving it in `sig_params` made every
+        // empty factory call -- `List()`, `Seq()`, `Map()` -- keep the
+        // callee's own parameter and fail to conform to anything.
         let sig_params: Vec<Type> = match &self.st.get(method).ty {
-            Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+            Type::Method { paramss, .. } => paramss
+                .iter()
+                .enumerate()
+                .flat_map(|(i, clause)| {
+                    clause
+                        .iter()
+                        .enumerate()
+                        .filter(move |(j, p)| {
+                            !(i == 0 && *j >= nargs && matches!(p, Type::Repeated(_)))
+                        })
+                        .map(|(_, p)| p.clone())
+                })
+                .collect(),
             _ => Vec::new(),
         };
         let mut out = ret;
@@ -6843,6 +6940,24 @@ impl Typer {
             tree.ty = Type::Error;
             return;
         }
+        // nsc's `nonLocalMember`: a `private[this]` member is not a member of
+        // any prefix but `this`. `class JdbcFunction(name: String) extends
+        // FunctionSymbol(name)` keeps its parameter as one, and `o.name` on
+        // another instance means the inherited `val` -- letting the parameter
+        // shadow it made every such selection inaccessible.
+        if !self.prefix_is_this(Some(qual.as_ref())) && found.len() > 1 {
+            let non_local: Vec<SymbolId> = found
+                .iter()
+                .copied()
+                .filter(|s| {
+                    let f = self.st.get(*s).flags;
+                    !(f.contains(Flags::PRIVATE) && f.contains(Flags::LOCAL))
+                })
+                .collect();
+            if !non_local.is_empty() {
+                found = non_local;
+            }
+        }
         found = self.drop_overridden(found);
         // `x.toString` finds both `Any.toString` and `Int.toString`; they have
         // the same type, so this is one member, not an ambiguous overload.
@@ -7094,7 +7209,7 @@ impl Typer {
         }
         if flags.contains(Flags::PRIVATE) {
             if let Some(w) = &s.private_within {
-                return self.access_within(current, w);
+                return self.access_within_of(current, w, owner);
             }
             return self.nested_in(current, owner);
         }
@@ -7106,13 +7221,13 @@ impl Typer {
             let by_qual = s
                 .private_within
                 .as_ref()
-                .map(|w| self.access_within(current, w))
+                .map(|w| self.access_within_of(current, w, owner))
                 .unwrap_or(false);
             let by_sub = self.protected_subclass_ok(current, owner, prefix);
             return by_qual || by_sub;
         }
         if let Some(w) = &s.private_within {
-            return self.access_within(current, w);
+            return self.access_within_of(current, w, owner);
         }
         true
     }
@@ -7193,8 +7308,25 @@ impl Typer {
         }
     }
 
-    fn access_within(&self, current: SymbolId, name: &str) -> bool {
-        let boundary = self.resolve_access_boundary(name);
+    /// `private[X]` names an enclosing class or package **of the definition**,
+    /// so `from` -- the member's owner -- is where the name is resolved. A
+    /// plain lookup found `scala.util` for slick's `private[util]` and every
+    /// use of `ConstArray.copySliceTo` was inaccessible.
+    fn access_within_of(&self, current: SymbolId, name: &str, from: SymbolId) -> bool {
+        let mut boundary = SymbolId::NONE;
+        let mut c = from;
+        while !c.is_none() {
+            if self.st.get(c).name == name || self.st.get(c).name.trim_end_matches('$') == name {
+                boundary = c;
+                break;
+            }
+            c = self.st.get(c).owner;
+        }
+        let boundary = if boundary.is_none() {
+            self.resolve_access_boundary(name)
+        } else {
+            boundary
+        };
         if boundary.is_none() {
             return false;
         }
@@ -8592,7 +8724,30 @@ impl Typer {
                     ret: Box::new(Type::NoType),
                 });
             } else {
-                self.type_expr(a, &Type::NoType);
+                let pt_arg = self.proto_arg_type(&fun_ty_for_pretype, fun.sym, ai, pt);
+                if pt_arg.is_no_type() {
+                    self.type_expr(a, &Type::NoType);
+                } else {
+                    // A prototype is a hint, never a constraint. An argument
+                    // the expected type does not actually fit -- one whose
+                    // implicit clause is still open, say -- is typed again as
+                    // if there had been none, and its diagnostics go with it.
+                    let saved = a.clone();
+                    let mark = self.diags.len();
+                    self.type_expr(a, &pt_arg);
+                    let complained = self.diags[mark..]
+                        .iter()
+                        .any(|d| d.level == scala_rs_span::Level::Error);
+                    if complained
+                        || a.ty.is_error()
+                        || a.ty.is_no_type()
+                        || !self.st.is_sub_type(&a.ty, &pt_arg)
+                    {
+                        self.diags.truncate(mark);
+                        *a = saved;
+                        self.type_expr(a, &Type::NoType);
+                    }
+                }
                 // `take(Array.empty)`: with no expected type the argument keeps
                 // its residual implicit clause, `(ClassTag[T])Array[T]`. What
                 // the callee sees is the *result*; the clause is filled once
@@ -9384,7 +9539,13 @@ impl Typer {
                     let owner_n = self.st.get(self.st.get(sym).owner).name.clone();
                     if owner_n == "Map$" {
                         if let Some(a0) = args.first() {
-                            if let Type::Class { args: targs, .. } = &a0.ty {
+                            // `Map(kvs: _*)` hands over the pairs marked
+                            // `Repeated`; the pair is what names `K` and `V`.
+                            let a0ty = match &a0.ty {
+                                Type::Repeated(e) => e.as_ref(),
+                                other => other,
+                            };
+                            if let Type::Class { args: targs, .. } = a0ty {
                                 if targs.len() == 2 {
                                     if let Some(map) = self.factory_result_class(&ret, "Map", 2) {
                                         let targs = self
@@ -9406,9 +9567,15 @@ impl Typer {
                     {
                         // `List(Circle(1), Rect(2, 3))` is a `List[Shape]`:
                         // the element type is the lub of every argument.
+                        // `Seq(xs: _*)` passes the sequence through, and its
+                        // tree carries the *element* type marked `Repeated`;
+                        // taking it as written made the call a `Seq[Int*]`.
                         if let Some(elem) = args
                             .iter()
-                            .map(|a| a.ty.widen_constant())
+                            .map(|a| match a.ty.widen_constant() {
+                                Type::Repeated(e) => (*e).clone(),
+                                other => other,
+                            })
                             .reduce(|acc, t| self.lub_ty(&acc, &t))
                         {
                             if let Some(cls) =
@@ -9458,7 +9625,10 @@ impl Typer {
                         }
                     }
                 }
-                tree.ty = self.instantiate_leftover_tparams(sym, leftover.unwrap_or(ret), pt);
+                let ret = leftover.unwrap_or(ret);
+                let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+                let ret = self.subst_dependent_members(&param_tys, &arg_tys, &ret);
+                tree.ty = self.instantiate_leftover_tparams(sym, ret, pt, args.len());
             }
             OverloadPick::Ambiguous => {
                 // An argument that already failed cannot pick an alternative;
@@ -9777,6 +9947,14 @@ impl Typer {
             // with the parameter's class first: `def id[R, U](c: RC[R, U])`
             // given a `UnitRC[String]` is `RC[String, Unit]`, not a one-argument
             // list zipped against `[R, U]`.
+            // `param_at` already unwrapped a repeated *parameter* to its
+            // element, and a `xs: _*` argument is the matching `Repeated` of
+            // its own element: unwrapping only one side solved
+            // `def mk[A](xs: A*)` to `A = Int*`.
+            let a = match a {
+                Type::Repeated(e) => e.as_ref(),
+                other => other,
+            };
             let a = &self.align_to_param_class(p, a);
             let mut hit = unify_one(tp, p, a);
             // The same step for a *function* parameter: a `Map[K, V]` is a
@@ -9889,6 +10067,38 @@ impl Typer {
                     if let Some(t) = self.expected_solution(tps, pt) {
                         out.push((*id, t, variance == 0));
                     }
+                }
+            }
+            // `type Scope = Map[TermSymbol, Type]` names a `Map`; the walk has
+            // to see through it or `Map.empty` solves nothing from it. Only an
+            // alias dealiases -- an abstract member stays itself, and the
+            // arms above have already had their say.
+            (_, Type::TypeMember(_)) => {
+                let expanded = self.st.dealias(pt);
+                if expanded != *pt {
+                    self.collect_expected(
+                        tps,
+                        ret,
+                        &expanded,
+                        variance,
+                        depth + 1,
+                        allow_covariant,
+                        out,
+                    );
+                }
+            }
+            (Type::TypeMember(_), _) => {
+                let expanded = self.st.dealias(ret);
+                if expanded != *ret {
+                    self.collect_expected(
+                        tps,
+                        &expanded,
+                        pt,
+                        variance,
+                        depth + 1,
+                        allow_covariant,
+                        out,
+                    );
                 }
             }
             // `Array` is invariant, and its element must stay an element:
@@ -11717,6 +11927,51 @@ impl Typer {
             }
             _ => false,
         }
+    }
+
+    /// nsc `Infer.protoTypeArgs`. Before a single argument has been typed, the
+    /// expected type already says what some of the callee's type parameters
+    /// have to be, and an argument that fills a bare one of them deserves that
+    /// as its prototype: `(new Select(…), Map(s -> a2))` checked against
+    /// `(Node, Map[TermSymbol, Aggregate])` types its second component against
+    /// `Map[TermSymbol, Aggregate]`, and an invariant `Map` keyed by the
+    /// argument's own `AnonSymbol` is no longer what comes back.
+    ///
+    /// Only a parameter that *is* a type parameter, and only a callee with one
+    /// alternative: anything else and the prototype would be weighing the
+    /// alternatives instead of the arguments. `NoType` means "as before".
+    fn proto_arg_type(&self, fun_ty: &Type, sym: SymbolId, idx: usize, pt: &Type) -> Type {
+        if sym.is_none() || pt.is_no_type() || pt.is_error() || matches!(fun_ty, Type::Overload(_))
+        {
+            return Type::NoType;
+        }
+        let Type::Method { paramss, ret } = fun_ty else {
+            return Type::NoType;
+        };
+        let tps = self.st.get(sym).tparams.clone();
+        if tps.is_empty() {
+            return Type::NoType;
+        }
+        let Some(params) = paramss.first() else {
+            return Type::NoType;
+        };
+        let Some(Type::TypeParam(tp)) = param_at(params, idx) else {
+            return Type::NoType;
+        };
+        if !tps.contains(tp) {
+            return Type::NoType;
+        }
+        self.add_expected_constraints_in(sym, ret, pt, Vec::new(), true)
+            .into_iter()
+            .find(|(id, _)| id == tp)
+            .map(|(_, t)| t)
+            .filter(|t| {
+                !t.is_no_type()
+                    && !t.is_error()
+                    && !matches!(t, Type::Nothing | Type::Any | Type::Wildcard)
+                    && !mentions_any_tparam(t)
+            })
+            .unwrap_or(Type::NoType)
     }
 
     /// nsc `Infer.pretypeArgs`. The parameter types every overload alternative
@@ -17798,7 +18053,14 @@ pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<T
             Type::ByName(a) => unify_one(tp, p, a),
             _ => unify_one(tp, p, actual),
         },
-        Type::Repeated(p) => unify_one(tp, p, actual),
+        // `Seq(xs: _*)` hands the parameter a `Repeated` of its *element*
+        // type, not of the sequence: unwrapping only the pattern solved
+        // `Seq.apply[A](A*)` to `A = Int*` and made `Seq(xs: _*)` a
+        // `Seq[Int*]`.
+        Type::Repeated(p) => match actual {
+            Type::Repeated(a) => unify_one(tp, p, a),
+            _ => unify_one(tp, p, actual),
+        },
         _ => None,
     }
 }

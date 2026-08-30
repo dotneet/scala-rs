@@ -261,6 +261,59 @@ nsc の `instantiateExpecting` と同じく、メソッドの型パラメータ�
 `class ReWrap[T : TT] extends Wrap[T](implicitly[TT[T]])` の `Wrap[A](val tt: TT[A])` は
 `TT[A]` ではなく `TT[T]` を要求します。
 
+#### 期待型は引数の**プロトタイプ**でもある（nsc `protoTypeArgs`）
+
+引数が一つも型付けされる前から、期待型は呼び先の型パラメータの一部を言い当てています。
+nsc の `Infer.protoTypeArgs` はそれを引数の期待型（プロトタイプ）として渡します。
+scala-rs も同じことをします（`check.rs` の `proto_arg_type`）。
+
+```scala
+def f(s: AnonSymbol, a2: Aggregate): (Node, Map[TermSymbol, Aggregate]) =
+  (Select(...).infer(), Map(s -> a2))
+```
+
+`Map` はキーについて**非変**なので、`Map(s -> a2)` を期待型なしで型付けすると
+`Map[AnonSymbol, Aggregate]` になり、`Map[TermSymbol, Aggregate]` には適合しません。
+プロトタイプがあれば nsc と同じ `Map[TermSymbol, Aggregate]` になります。
+
+- 対象は**パラメータ型がそのまま型パラメータ**である位置だけです（`Tuple2.apply[T1, T2]`）。
+  それ以外に広げると、オーバーロードの候補をプロトタイプが選び始めてしまいます。
+- 呼び先がオーバーロードのときはやりません。
+- プロトタイプは**ヒントであって制約ではありません**。それで型付けするとエラーになる引数
+  （implicit 節が残っている `kvs.toMap` など）は、診断ごと巻き戻して期待型なしで
+  型付けし直します。
+
+#### 空の可変長引数と `xs: _*`
+
+可変長パラメータに**何も渡さなかった**呼び出しには、要素の型を決める材料がありません。
+nsc はそれを制約なしと見て下界（`Nothing`）へ最小化します。scala-rs は呼び先のシグネチャに
+その型パラメータが「出てくる」ことだけを見て「引数が解くはず」と判断していたので、
+`List()` / `Seq()` / `Map()` は呼び先の型パラメータを抱えたままになり、何にも適合しません
+でした。渡した引数の数を見て、空の可変長パラメータは無かったことにします。
+
+`xs: _*` の引数は、要素型に `Repeated` の印を付けた型で届きます。パラメータ側は
+`param_at` が既に要素へ剥がしているので、**片側だけ剥がす**と
+`def mk[A](xs: A*)` が `A = Int*` に解けて `mk(xs: _*)` が `List[Int*]` になっていました。
+両側を剥がします（`unify_tparam_all` / `unify_one`）。`Map(kvs: _*)` /
+`Seq(xs: _*)` / `Vector` / `Set` / `Array` の各ファクトリも同じ扱いです。
+
+#### 依存メソッド型（nsc `dependentTypeMap`）
+
+```scala
+def get[P <: Phase](p: P): Option[p.State]
+```
+
+`p.State` は**引数**の `State` であって、`Phase` が宣言している抽象型メンバではありません。
+scala-rs の `Type::TypeMember` は接頭辞を持たないので、`get(Phase.assignUniqueSymbols)` の
+結果は `Option[Phase#State]` のままになり、`.map(_.aggregate)` が `Any` に落ちていました。
+
+接頭辞が型に無いので、**接頭辞になり得たパラメータをその境界から探します**
+（`check.rs` の `subst_dependent_members`）。抽象型メンバの所有者を基底型に持つ
+パラメータが**ちょうど一つ**のときだけ、その引数の同名メンバで置き換えます。
+引数側でも抽象なら何も変わりません。置き換えたあとも普通に型検査されるので、
+`val bad: Option[String] = (new CS).get(new P1)` は
+`type mismatch; found: Option[Int]  required: Option[String]` のままです。
+
 ### Implicit 解決
 
 nsc に寄せた探索順です。偽の「何でも変換」はありません。
@@ -737,6 +790,12 @@ recursive method f needs result type  // object A { def f = g; def g = f }
 
 `type Scope = Map[K, V]` は右辺と**同じ型**です（nsc の dealias）。`<:` の左右、`x.m` のレシーバ、消去（`Scope` は `Map` に消去される）のいずれでも右辺に展開します。抽象型メンバ（`type T <: Bound`）は展開せず、従来どおり上限境界で扱います。
 
+**呼び出しの型パラメータを期待型から解く経路**（`collect_expected`）でも展開します。
+`object Type { type Scope = Map[TermSymbol, Type] }` に対して `val s: Type.Scope = Map.empty`
+と書くと、展開しないままでは `Map[K, V]` と `Type$.Scope` が構造的に噛み合わず、
+`Map[Nothing, Nothing]` になっていました。展開するのはエイリアスだけで、
+抽象型メンバはそのまま期待型として使います。
+
 型の位置での `p.T` の `p` は**項**です。同名の trait と companion object があるときは module class を先に見ます（クラス射影は `C#T` と書く）。Java の static nested class のためにクラスもフォールバックとして残します。
 
 `new A(...)` の `A` がエイリアスなら、nsc と同じく**右辺を構築**します（`type Alias = Base` の `new Alias("hi")`）。エイリアスのシンボル自身はコンストラクタを持たないので、これが無いと `no matching overload for constructor Alias` になります。修飾付き（`new p.A(...)`）は従来から dealias 済みでした。抽象型メンバ（`type A <: Bound`）は対象外です（`new A` はプログラムではなく、上限を構築するのは別のプログラムです）。
@@ -1115,6 +1174,14 @@ bad simple pattern: use _* to match a sequence
 
 これは slick（`build.sbt` が `-Xsource:3` / `-Xsource:3-cross`）を通すためのスライスです。`?` は slick 176 ファイル中 59 ファイル、`&` は 41 箇所、`ch*` は 2 箇所で使われています。
 
+**可変長引数の splat `f(xs*)`** も `-Xsource:3` / `-Xsource:3-cross` のときだけ受け付け、2.13 の `f(xs: _*)` と**同じ木**（`Typed` + `<repeated>[_]`）に落とします。中置ループは `)` の前で右辺を諦めて `xs.*` という後置 `Select` にするので、引数リストを閉じる `*` だけを splat と読みます。varargs は引数の最後にしか置けないので、この位置以外に splat はありません。フラグ無しでは 2.13 素のまま後置演算子で、scalac 2.13.16 と同じ文面になります。
+
+```
+value * is not a member of List[Int]
+```
+
+slick では `Map(elems*)` など 3 箇所で使われています。
+
 **`*` ワイルドカード import と `as` リネーム**も `-Xsource:3` / `-Xsource:3-cross` のときだけ受け付け、2.13 の `_` / `=>` と**同じ木**に落とします（`import p.*` は `import p._`、`import p.{a as b}` と `import p.a as b` は `import p.{a => b}`）。フラグ無しでは `*` は普通の名前のままなので、scalac 2.13.16 と同じく import 選択子の位置で診断します（scalac は `object * is not a member of package p1`、こちらは `value * is not a member of package p1`）。slick では `import slick.ast.*` などで 60 箇所以上使われています。`given` / `using` は 2.13 の構文ではないので**対象外**です。
 
 ### 型パラメータを取る型メンバーと高階 context bound
@@ -1443,6 +1510,33 @@ LoggingStatement(st: Statement)` は `st` が `<overload Statement | PreparedSta
 なり、`st.execute()` が全滅していました。`enter_inherited_members` が
 `PRIVATE | LOCAL` のメンバを入れないようにしています。逆に、親の素の引数を子から
 名指しするのは nsc と同じくエラーです（`ovl2_bad`: `not found: value tag`）。
+
+同じ規則の**選択側**（nsc の `nonLocalMember`）も入れました。`private[this]` は
+`this` 以外のどの接頭辞のメンバでもないので、他のインスタンスに対する選択では候補から
+外し、同名の**継承メンバ**の方を読みます。
+
+```scala
+class Sym(val name: String)
+class Fun(name: String) extends Sym(name) {   // `name` はコンストラクタ引数
+  override def equals(o: Any) = o match {
+    case o: Fun => name == o.name             // `o.name` は Sym の val
+    case _      => false
+  }
+}
+```
+
+素の引数が継承メンバを覆い隠していたので、slick の `Library.JdbcFunction` /
+`SqlOperator` / `SqlFunction` の `o.name` は
+`value name cannot be accessed as a member of JdbcFunction from JdbcFunction` でした。
+
+#### `private[p]` は**定義側**の外側から解決する
+
+`private[X]` の `X` は、その定義を囲むクラスかパッケージの名前です。使用側のスコープで
+名前を引くと、slick の `private[util] def copySliceTo`（`package slick.util`）が
+`scala.util` に当たって、同じパッケージからの参照まで全部
+`cannot be accessed` になっていました。`X` はメンバの所有者から外へ辿って解決します
+（`check.rs` の `access_within_of`）。パッケージ境界そのものは変わっていないので、
+`mism8_access_bad.scala` は今までどおり拒否されます。
 
 **3. `val` が抽象 `def` を実装したら 1 つのメンバ**。同じ理由で、
 `trait InterpolationContext { def symbolName: SymbolNamer }` を実装する
@@ -2136,6 +2230,47 @@ applicable でなくなった瞬間に `Seq[(Inv[Boolean], Inv[Int])]` へ化け
 slick: `errors 518 → 495`、`type mismatch 96 → 84`、`files_with_errors`
 80 → 77。エラーが増えたファイルはありません。
 
+### 期待型・可変長引数・依存メソッド型（`type mismatch` 第 8 スライス）
+
+`agent/mismatch8` スライス。フィクスチャは `tests/fixtures/mism8*.scala`、テストは
+`crates/cli/tests/mismatch8.rs` です。7 つの原因を直しました。詳しくは上の
+「型エイリアス」「メソッド型パラメータの推論」「`-Xsource:3`」「オーバーロードの
+候補集合」の各節にあります。
+
+1. **期待型がエイリアスのとき dealias していなかった**。`collect_expected` は
+   `Map[K, V]` と `Type$.Scope` を構造的に突き合わせるので、
+   `val s: Type.Scope = Map.empty` は `Map[Nothing, Nothing]` でした。
+2. **空の可変長引数が「未解決」のままだった**。`List()` / `Seq()` / `Map()` は
+   要素型を決める材料が無い＝**制約なし**であって、呼び先の型パラメータを
+   抱えたままにしてよいわけではありません。
+3. **`xs: _*` を片側だけ剥がしていた**。`def mk[A](xs: A*)` が `A = Int*` に解け、
+   `mk(xs: _*)` が `List[Int*]` になっていました。
+4. **`-Xsource:3` の splat `f(xs*)` が未対応**だった（後置演算子として
+   `value * is not a member of Seq[…]`）。slick の `Map(elems*)` 3 箇所。
+5. **nsc の `protoTypeArgs` が無かった**。タプルの各成分は期待型の成分に対して
+   型付けされるべきで、非変な `Map` はそれが無いと引数側のキー型で固まります。
+6. **依存メソッド型**（`def get[P <: Phase](p: P): Option[p.State]`）。
+   `Type::TypeMember` に接頭辞が無いので、接頭辞になり得たパラメータを境界から
+   一意に決まるときだけ探し、その引数の同名メンバで置き換えます。
+   `Any` に落ちていた 4 件の `if(…getOrElse(true))` とそのカスケードが消えます。
+7. **`private[p]` を使用側のスコープで解決していた**。`private[util]` が
+   `scala.util` に当たり、`slick.util` の中からの参照まで拒否されていました。
+   併せて nsc の `nonLocalMember`（`private[this]` は `this` 以外の接頭辞の
+   メンバではない）を選択側にも入れました。
+
+slick: `errors 411 → 378`、`type mismatch 58 → 49`、`files_with_errors`
+72 → 67。エラーが増えたファイルはありません。
+
+このスライスで**原因まで分かって直していない**もの:
+
+- `mutable.ArrayBuilder[T]` / `StringBuilder` / `ListBuffer` が
+  `Builder[…]` / `Growable[…]` の基底型を持っていません
+  （`x.result()` が `Any`）。可変コレクションの階層なので `agent/mutcoll` の領域です。
+- `BasicBackend.scala` / `ConcurrencyControl.scala` の
+  `found: F[Any] required: F[R]` 13 件は、ラムダ本体の**本当のエラー**の
+  カスケードです。nsc は `ErrorType` を吸収するのでこれを出しません。
+  ラムダ本体が `<error>` のとき関数の結果型も `<error>` にすれば消えますが、
+  既存の negative fixture を弱めないか確かめていません。
 
 ### jar のクラスを pickle から読む
 
@@ -2965,7 +3100,7 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `boxed.scala` | `java.lang.Integer`/`Long`/`Character`/`Boolean`/`Double` と `scala.Int` などの相互変換（`int2Integer` / `Integer2int` ほか）、ラッパーの static（`valueOf` / `parseInt` / `MAX_VALUE` / `isDigit` / `parseDouble` / `toBinaryString`）、`java.util.ArrayList[java.lang.Long]` への `add`、`Any` への自動 boxing、値クラス側の回帰（`1.max(2)` / `(-3).abs` / `'9'.isDigit` / `toString` / `Array`）（library dual-run と real scalac diff の両方） | `3` `4` `4` `3` `-1` … `4` |
 | `boxed_rt.scala` | `boxed.scala` のうち私有ランタイムでも動く部分（変換 intrinsic と JDK ラッパー。`RichInt`/`Array.apply` は使わない）（private ランタイムと library dual-run の両方で同じ出力） | `4` `4` `3` `42` `2147483647` `true` `x` `true` `0.5` `99` `9` |
 
-implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` / `implicit_ambiguous_parents.scala` / `implicit_inherit_local_ambiguous.scala` のコンパイル失敗で見ています。`@implicitNotFound("no show for ${A}")` のカスタム文面は `implicit_not_found.scala` です。`private[this]` / `protected[C]` の違法アクセスは `private_this_bad.scala` / `protected_qual_bad.scala` です。オーバーロードの失敗は `overload_ambiguous.scala` / `overload_none.scala`。`f` interpolator の未対応フォーマットは `f_interp_bad.scala` です。境界付き存在型の値量化のうちパックできない形は `existential_val.scala`（`T forSome { val x: Int }`）で診断します。`p.Inner forSome { val p: Outer }` は `existential_val_ok.scala` で実行します。クラスコンストラクタからの `return` は `return_ctor.scala`、誤った `@Override` は `override_bad.scala` です。クラス型パラメータの view bounds で evidence が無いのは `view_bounds_class_bad.scala` です。kind 不一致は `hk_bad.scala` です。高階型メンバーの kind 不一致と `m.F` の proper 使用は `type_member_hk_bad.scala`。refinement HK の proper 使用は `refine_hk_bad.scala`。境界付き型メンバーの incompatible override は `type_member_bounds_bad.scala`。`{ type A <: Int }` に合わない具象は `refine_bound_bad.scala`。HK 境界の incompatible override は `hk_bounded_bad.scala`。入れ子射影の失敗は `nested_proj_bad.scala`（`Int#X`）/ `nested_proj_abs_bad.scala`（`B#U#T`）。`val` に `+=` メンバーが無いのは `assign_op_bad.scala`。`asScala` が無い（import なし）のは `collection_converters_bad.scala`。高階 view bound `F[_] <% Ordered[_]` は `hk_view_bounds.scala`（scalac 2.13.16 と同じ `takes type parameters`）。トレイトの context bound は `trait_context_bounds.scala`。不安定なパス依存型は `type_proj_bad.scala`（`stable identifier required`）、不安定な singleton は `this_type_bad.scala`、複合型に無いメンバは `compound_bad.scala`、テンプレートへの二つ目のクラスは `mism7_mixin_bad.scala`、構造的代入は `structural_bad.scala`（`foo_= is not a member`）。package object の enrichment は import 無しだと `pkg_implicit_class_bad.scala`、トップレベル `implicit class` は `pkg_implicit_toplevel_bad.scala`。`IndexedSeq` に無いメンバーは `indexedseq_queue_bad.scala`。`stripMargin` / `lines` に無いメンバーは `string_ops4_bad.scala`。`Range` に無いメンバーは `numeric_range_bad.scala`。`ListBuffer` に無いメンバーは `listbuffer_bad.scala`。`takeRight` / `dropRight` / `contains` に無いメンバーは `string_ops6_bad.scala`。`NumericRange[Long]` に無いメンバーは `long_range_bad.scala`。`HashMap` に無いメンバーは `hashmap_bad.scala`。`startsWith` / `endsWith` / `indexOf` に無いメンバーは `string_ops7_bad.scala`。`NumericRange[Char]` に無いメンバーは `char_range_bad.scala`。`HashSet` に無いメンバーは `hashset_bad.scala`。`head` / `last` / `stripLineEnd` / `replaceAllLiterally` に無いメンバーは `string_ops8_bad.scala`。`ArrayOps` に無いメンバーは `array_ops2_bad.scala`。`LinkedHashMap` に無いメンバーは `linkedhashmap_bad.scala`。`tail` / `init` / `distinct` / `mkString` に無いメンバーは `string_ops9_bad.scala`。`ArrayOps.foreach` に無いメンバーは `array_ops3_bad.scala`。`LinkedHashSet` に無いメンバーは `linkedhashset_bad.scala`。`filter` / `reverseIterator` に無いメンバーは `string_ops10_bad.scala`。`ArrayOps.map` に無いメンバーは `array_ops4_bad.scala`。`ArrayDeque` に無いメンバーは `arraydeque_bad.scala`。bare `_` は `placeholder_bad.scala`（`unbound placeholder parameter`）。`byteArrayOps` に無いメンバーは `array_ops5_bad.scala`。`diff` に無いメンバーは `string_ops11_bad.scala`。Function2 の arity 不一致 `_ + _` は `placeholder2_bad.scala`（`missing parameter type for expanded function`）。`charArrayOps` に無いメンバーは `array_ops6_bad.scala`。`updated` に無いメンバーは `string_ops12_bad.scala`。typed `(_: Int)` の bare は `placeholder3_bad.scala`（`unbound placeholder parameter`）。`doubleArrayOps` に無いメンバーは `array_ops7_bad.scala`。`partition` に無いメンバーは `string_ops13_bad.scala`。`genericArrayOps` に無いメンバーは `array_ops8_bad.scala`。`unitArrayOps` に無いメンバーは `array_ops9_bad.scala`。`SortedSet` に無いメンバーは `sortedset_bad.scala`。ArrayOps `filter` に無いメンバーは `array_ops10_bad.scala`。`sorted` に無いメンバーは `string_ops14_bad.scala`。`SortedMap` に無いメンバーは `sortedmap_bad.scala`。ArrayOps 4 引数 `flatMap` に無いメンバーは `array_ops11_bad.scala`。`indices` に無いメンバーは `string_ops15_bad.scala`。`BitSet` に無いメンバーは `bitset_bad.scala`。ArrayOps `take` に無いメンバーは `array_ops12_bad.scala`。`dropWhile` に無いメンバーは `string_ops16_bad.scala`。`Breaks` に無いメンバーは `breaks_bad.scala`。ArrayOps `drop` に無いメンバーは `array_ops13_bad.scala`。`find` に無いメンバーは `string_ops17_bad.scala`。`tryBreakable` に無いメンバーは `breaks2_bad.scala`。ArrayOps `foldLeft` に無いメンバーは `array_ops14_bad.scala`。`toByte` に無いメンバーは `string_ops18_bad.scala`。`BigInt` に無いメンバーは `bigint_bad.scala`。ArrayOps `scanLeft` に無いメンバーは `array_ops15_bad.scala`。`grouped` に無いメンバーは `string_ops19_bad.scala`。`pipe` に無いメンバーは `chaining_bad.scala`。ArrayOps `last` に無いメンバーは `array_ops16_bad.scala`。`:+` に無いメンバーは `string_ops20_bad.scala`。ArrayOps `find` に無いメンバーは `array_ops17_bad.scala`。`compare` に無いメンバーは `string_ops21_bad.scala`。`Using` に無いメンバーは `using_bad.scala`。ArrayOps `filterNot` に無いメンバーは `array_ops18_bad.scala`。`>` 系に無いメンバーは `string_ops22_bad.scala`。`Using.Manager` に無いメンバーは `using2_bad.scala`。ArrayOps `zipWithIndex` に無いメンバーは `array_ops19_bad.scala`。`iterator` に無いメンバーは `string_ops23_bad.scala`。`Using.resources` に無いメンバーは `using3_bad.scala`。ArrayOps `lengthIs` に無いメンバーは `array_ops20_bad.scala`。`flatMap` に無いメンバーは `string_ops24_bad.scala`。`View.fill` に無いメンバーは `view_bad.scala`。`Either` に無いメンバーは `either_ops_bad.scala`、`Option` に無いメンバーは `option_x1_bad.scala`、`Option.toRight` の結果の `Either` に無いメンバーは `option_x2_bad.scala`、`Try` に無いメンバーは `try_ops_bad.scala`、`Throwable` に無いメンバーは `try_exceptions_bad.scala`。`Try.recover` に `PartialFunction` でない全域関数リテラルを渡すのは `try_recover_bad.scala`（nsc どおり `required: PartialFunction`）。`either_ops.scala` / `option_x2.scala` / `try_ops.scala` は `--no-scala-library` では診断になることも見ています（私有ランタイムに `Either` / `Try` は無い）。キャプチャした `val` への `+=` は `capture_var_bad.scala`（`not assignable`）。self type の不正 mixin は `self_type_bad.scala`、共変パラメータの `var` は `variance_bad.scala`。循環 type alias は `type_alias_bad.scala`。`apply` の無い `c(1)` は `update_apply_bad.scala`（`update` には落とさない）。非末尾再帰の `@tailrec` は `tailrec_bad.scala`、未対応アノテーションは `annot_bad.scala`（`@specialized`）。`@inline` / `@noinline` は実 scalac 2.13.16 と同じくどの定義（val / var / class / type ...）にも、両方同時にも、警告なしで付けられる（`crates/cli/tests/smallgaps.rs` の `fixtures_sgap`。`inline_bad.scala` は削除）。SAM でない型へのラムダは `sam_bad.scala`。`@switch` にできない match は `switch_bad.scala`（nsc どおり warning）。early defs の違法 `def` は `early_defs_bad.scala`。定数型の不一致は `const_types_bad.scala`、`language.dynamics` なしの Dynamic 選択は `dynamic_bad.scala`、postfix / implicitConversions なしは `postfix_ops_bad.scala` / `implicit_conv_bad.scala`（nsc どおり warning。`-Xfatal-warnings` でエラー）です。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします（vals / パラメータ付き defs / 型パラメータ / case class `Point` / `val one: 1` / `def lit(x: 1)` を pickle から読む）。package object の `implicit class` は `pkg_implicit_lib.scala` を classfile にしてから `pkg_implicit_main.scala` を `-cp` でコンパイルします（pickle の IMPLICIT）。`scalac` 2.13 は PATH、`/tmp/scala-2.13.16`、または公式 tarball（約 20MB）で取れれば、同じ classfile に対して `Lib.greet` / `Lib.magic` / `Lib.id(42)` / `new Box("hi").get` / `Point(3, 4)` / `p.x` / `p match { case Point(a, b) => … }` / `Lib.add` / `Lib.f(List(1, 2))`（`List[_]`） / `Lib.g`（`@deprecated("msg", "2.13.0")`） / `new Holder().me.n`（`this.type`） / `Lib.fAnyRef(List("a"))`（`List[_ <: AnyRef]`） / `Lib.h(1)`（`Int @unchecked`） / `Lib.one`（`val one: 1`） / `Lib.lit(1)`（`def lit(x: 1)`） / `Lib.gone`（Java `@Deprecated`。`-deprecation` で warning） / `Lib.nest(List(List(1)))`（`List[_ <: List[_]]`） / `Lib.idRef(new MixD())` の `y.a + y.b + y.f`（refinement pickle） / `Lib.marked`（`@Ann(foo)` TREE Ident） / `Lib.markedSel`（`@Ann(c.x)` TREE Select） / `Lib.markedLit`（`@Ann(3)` リテラル） / `new Holder().markedThis`（`@Ann(this)` THIStree） / `new Holder().markedClass`（`@Ann(classOf[Int])` LITERALclass） / `Lib.markedApply`（`@Ann(ident(1))` APPLYtree） / `new Holder().markedThisSel`（`@Ann(this.x)` Select(This)） / `new Holder().markedSuper`（`@Ann(super.foo)` SUPERtree） / `Lib.markedNest`（`@Ann(ident(ident(1)))` ネスト APPLYtree） / `Lib.markedNamed`（`@Ann(foo = 1)` named → 位置 LITERALint） / `new Holder().markedNamedTree`（`@Ann(foo = this.x)` named TREE → 位置 Select） / `Lib.markedNamedIdent`（`@Ann(foo = bar)` named TREE → 位置 Ident） / `Lib.markedReorder`（`@Ann2(b = 2, a = "ok")` を位置ソース順 Constant のまま。ctor 順並べ替えなしでも scalac 2.13.16 が typecheck） / `Lib.join("a","b")`（VARARGS） / `new OrdBox(1).compare(new OrdBox(2))`（BRIDGE） / `Lib.usesAlias(1)` / `val x: Lib.T`（ALIASsym）を typecheck します。読めない pickle 形は成功扱いにしません。取れなければスキップします。未知の XML エンティティは `xml_attr_bad.scala` で診断します。本文付き `@native` は `native_bad.scala`。`-cp` 上の壊れた Java `.class` は `unsupported classfile` で診断します。Java `protected` の違法アクセスは `java_prot_bad.scala`。Java 非 enum の合成 `values` は `java_enum_bad.scala`。コンテキストバウンドの欠ける evidence は `context_bounds_bad.scala` / `context_bounds_class_bad.scala`。違法な補助コンストラクタ（`this` なし / 文のあとの `this` / `super`）は `aux_ctor_bad.scala` / `aux_ctor_stmt_bad.scala` / `aux_ctor_super_bad.scala`。
+implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニットテストと、`implicit_ambiguous.scala` / `implicit_ambiguous_parents.scala` / `implicit_inherit_local_ambiguous.scala` のコンパイル失敗で見ています。`@implicitNotFound("no show for ${A}")` のカスタム文面は `implicit_not_found.scala` です。`private[this]` / `protected[C]` の違法アクセスは `private_this_bad.scala` / `protected_qual_bad.scala` です。オーバーロードの失敗は `overload_ambiguous.scala` / `overload_none.scala`。`f` interpolator の未対応フォーマットは `f_interp_bad.scala` です。境界付き存在型の値量化のうちパックできない形は `existential_val.scala`（`T forSome { val x: Int }`）で診断します。`p.Inner forSome { val p: Outer }` は `existential_val_ok.scala` で実行します。クラスコンストラクタからの `return` は `return_ctor.scala`、誤った `@Override` は `override_bad.scala` です。クラス型パラメータの view bounds で evidence が無いのは `view_bounds_class_bad.scala` です。kind 不一致は `hk_bad.scala` です。高階型メンバーの kind 不一致と `m.F` の proper 使用は `type_member_hk_bad.scala`。refinement HK の proper 使用は `refine_hk_bad.scala`。境界付き型メンバーの incompatible override は `type_member_bounds_bad.scala`。`{ type A <: Int }` に合わない具象は `refine_bound_bad.scala`。HK 境界の incompatible override は `hk_bounded_bad.scala`。入れ子射影の失敗は `nested_proj_bad.scala`（`Int#X`）/ `nested_proj_abs_bad.scala`（`B#U#T`）。`val` に `+=` メンバーが無いのは `assign_op_bad.scala`。`asScala` が無い（import なし）のは `collection_converters_bad.scala`。高階 view bound `F[_] <% Ordered[_]` は `hk_view_bounds.scala`（scalac 2.13.16 と同じ `takes type parameters`）。トレイトの context bound は `trait_context_bounds.scala`。不安定なパス依存型は `type_proj_bad.scala`（`stable identifier required`）、不安定な singleton は `this_type_bad.scala`、複合型に無いメンバは `compound_bad.scala`、テンプレートへの二つ目のクラスは `mism7_mixin_bad.scala`、構造的代入は `structural_bad.scala`（`foo_= is not a member`）。package object の enrichment は import 無しだと `pkg_implicit_class_bad.scala`、トップレベル `implicit class` は `pkg_implicit_toplevel_bad.scala`。`IndexedSeq` に無いメンバーは `indexedseq_queue_bad.scala`。`stripMargin` / `lines` に無いメンバーは `string_ops4_bad.scala`。`Range` に無いメンバーは `numeric_range_bad.scala`。`ListBuffer` に無いメンバーは `listbuffer_bad.scala`。`takeRight` / `dropRight` / `contains` に無いメンバーは `string_ops6_bad.scala`。`NumericRange[Long]` に無いメンバーは `long_range_bad.scala`。`HashMap` に無いメンバーは `hashmap_bad.scala`。`startsWith` / `endsWith` / `indexOf` に無いメンバーは `string_ops7_bad.scala`。`NumericRange[Char]` に無いメンバーは `char_range_bad.scala`。`HashSet` に無いメンバーは `hashset_bad.scala`。`head` / `last` / `stripLineEnd` / `replaceAllLiterally` に無いメンバーは `string_ops8_bad.scala`。`ArrayOps` に無いメンバーは `array_ops2_bad.scala`。`LinkedHashMap` に無いメンバーは `linkedhashmap_bad.scala`。`tail` / `init` / `distinct` / `mkString` に無いメンバーは `string_ops9_bad.scala`。`ArrayOps.foreach` に無いメンバーは `array_ops3_bad.scala`。`LinkedHashSet` に無いメンバーは `linkedhashset_bad.scala`。`filter` / `reverseIterator` に無いメンバーは `string_ops10_bad.scala`。`ArrayOps.map` に無いメンバーは `array_ops4_bad.scala`。`ArrayDeque` に無いメンバーは `arraydeque_bad.scala`。bare `_` は `placeholder_bad.scala`（`unbound placeholder parameter`）。`byteArrayOps` に無いメンバーは `array_ops5_bad.scala`。`diff` に無いメンバーは `string_ops11_bad.scala`。Function2 の arity 不一致 `_ + _` は `placeholder2_bad.scala`（`missing parameter type for expanded function`）。`charArrayOps` に無いメンバーは `array_ops6_bad.scala`。`updated` に無いメンバーは `string_ops12_bad.scala`。typed `(_: Int)` の bare は `placeholder3_bad.scala`（`unbound placeholder parameter`）。`doubleArrayOps` に無いメンバーは `array_ops7_bad.scala`。`partition` に無いメンバーは `string_ops13_bad.scala`。`genericArrayOps` に無いメンバーは `array_ops8_bad.scala`。`unitArrayOps` に無いメンバーは `array_ops9_bad.scala`。`SortedSet` に無いメンバーは `sortedset_bad.scala`。ArrayOps `filter` に無いメンバーは `array_ops10_bad.scala`。`sorted` に無いメンバーは `string_ops14_bad.scala`。`SortedMap` に無いメンバーは `sortedmap_bad.scala`。ArrayOps 4 引数 `flatMap` に無いメンバーは `array_ops11_bad.scala`。`indices` に無いメンバーは `string_ops15_bad.scala`。`BitSet` に無いメンバーは `bitset_bad.scala`。ArrayOps `take` に無いメンバーは `array_ops12_bad.scala`。`dropWhile` に無いメンバーは `string_ops16_bad.scala`。`Breaks` に無いメンバーは `breaks_bad.scala`。ArrayOps `drop` に無いメンバーは `array_ops13_bad.scala`。`find` に無いメンバーは `string_ops17_bad.scala`。`tryBreakable` に無いメンバーは `breaks2_bad.scala`。ArrayOps `foldLeft` に無いメンバーは `array_ops14_bad.scala`。`toByte` に無いメンバーは `string_ops18_bad.scala`。`BigInt` に無いメンバーは `bigint_bad.scala`。ArrayOps `scanLeft` に無いメンバーは `array_ops15_bad.scala`。`grouped` に無いメンバーは `string_ops19_bad.scala`。`pipe` に無いメンバーは `chaining_bad.scala`。ArrayOps `last` に無いメンバーは `array_ops16_bad.scala`。`:+` に無いメンバーは `string_ops20_bad.scala`。ArrayOps `find` に無いメンバーは `array_ops17_bad.scala`。`compare` に無いメンバーは `string_ops21_bad.scala`。`Using` に無いメンバーは `using_bad.scala`。ArrayOps `filterNot` に無いメンバーは `array_ops18_bad.scala`。`>` 系に無いメンバーは `string_ops22_bad.scala`。`Using.Manager` に無いメンバーは `using2_bad.scala`。ArrayOps `zipWithIndex` に無いメンバーは `array_ops19_bad.scala`。`iterator` に無いメンバーは `string_ops23_bad.scala`。`Using.resources` に無いメンバーは `using3_bad.scala`。ArrayOps `lengthIs` に無いメンバーは `array_ops20_bad.scala`。`flatMap` に無いメンバーは `string_ops24_bad.scala`。`View.fill` に無いメンバーは `view_bad.scala`。`Either` に無いメンバーは `either_ops_bad.scala`、`Option` に無いメンバーは `option_x1_bad.scala`、`Option.toRight` の結果の `Either` に無いメンバーは `option_x2_bad.scala`、`Try` に無いメンバーは `try_ops_bad.scala`、`Throwable` に無いメンバーは `try_exceptions_bad.scala`。`Try.recover` に `PartialFunction` でない全域関数リテラルを渡すのは `try_recover_bad.scala`（nsc どおり `required: PartialFunction`）。`either_ops.scala` / `option_x2.scala` / `try_ops.scala` は `--no-scala-library` では診断になることも見ています（私有ランタイムに `Either` / `Try` は無い）。キャプチャした `val` への `+=` は `capture_var_bad.scala`（`not assignable`）。self type の不正 mixin は `self_type_bad.scala`、共変パラメータの `var` は `variance_bad.scala`。循環 type alias は `type_alias_bad.scala`。`apply` の無い `c(1)` は `update_apply_bad.scala`（`update` には落とさない）。非末尾再帰の `@tailrec` は `tailrec_bad.scala`、未対応アノテーションは `annot_bad.scala`（`@specialized`）。`@inline` / `@noinline` は実 scalac 2.13.16 と同じくどの定義（val / var / class / type ...）にも、両方同時にも、警告なしで付けられる（`crates/cli/tests/smallgaps.rs` の `fixtures_sgap`。`inline_bad.scala` は削除）。SAM でない型へのラムダは `sam_bad.scala`。`@switch` にできない match は `switch_bad.scala`（nsc どおり warning）。early defs の違法 `def` は `early_defs_bad.scala`。定数型の不一致は `const_types_bad.scala`、`language.dynamics` なしの Dynamic 選択は `dynamic_bad.scala`、postfix / implicitConversions なしは `postfix_ops_bad.scala` / `implicit_conv_bad.scala`（nsc どおり warning。`-Xfatal-warnings` でエラー）です。別コンパイルは `separate_lib.scala` を classfile にしてから `separate_main.scala` を `-cp` でコンパイルします（vals / パラメータ付き defs / 型パラメータ / case class `Point` / `val one: 1` / `def lit(x: 1)` を pickle から読む）。package object の `implicit class` は `pkg_implicit_lib.scala` を classfile にしてから `pkg_implicit_main.scala` を `-cp` でコンパイルします（pickle の IMPLICIT）。`scalac` 2.13 は PATH、`/tmp/scala-2.13.16`、または公式 tarball（約 20MB）で取れれば、同じ classfile に対して `Lib.greet` / `Lib.magic` / `Lib.id(42)` / `new Box("hi").get` / `Point(3, 4)` / `p.x` / `p match { case Point(a, b) => … }` / `Lib.add` / `Lib.f(List(1, 2))`（`List[_]`） / `Lib.g`（`@deprecated("msg", "2.13.0")`） / `new Holder().me.n`（`this.type`） / `Lib.fAnyRef(List("a"))`（`List[_ <: AnyRef]`） / `Lib.h(1)`（`Int @unchecked`） / `Lib.one`（`val one: 1`） / `Lib.lit(1)`（`def lit(x: 1)`） / `Lib.gone`（Java `@Deprecated`。`-deprecation` で warning） / `Lib.nest(List(List(1)))`（`List[_ <: List[_]]`） / `Lib.idRef(new MixD())` の `y.a + y.b + y.f`（refinement pickle） / `Lib.marked`（`@Ann(foo)` TREE Ident） / `Lib.markedSel`（`@Ann(c.x)` TREE Select） / `Lib.markedLit`（`@Ann(3)` リテラル） / `new Holder().markedThis`（`@Ann(this)` THIStree） / `new Holder().markedClass`（`@Ann(classOf[Int])` LITERALclass） / `Lib.markedApply`（`@Ann(ident(1))` APPLYtree） / `new Holder().markedThisSel`（`@Ann(this.x)` Select(This)） / `new Holder().markedSuper`（`@Ann(super.foo)` SUPERtree） / `Lib.markedNest`（`@Ann(ident(ident(1)))` ネスト APPLYtree） / `Lib.markedNamed`（`@Ann(foo = 1)` named → 位置 LITERALint） / `new Holder().markedNamedTree`（`@Ann(foo = this.x)` named TREE → 位置 Select） / `Lib.markedNamedIdent`（`@Ann(foo = bar)` named TREE → 位置 Ident） / `Lib.markedReorder`（`@Ann2(b = 2, a = "ok")` を位置ソース順 Constant のまま。ctor 順並べ替えなしでも scalac 2.13.16 が typecheck） / `Lib.join("a","b")`（VARARGS） / `new OrdBox(1).compare(new OrdBox(2))`（BRIDGE） / `Lib.usesAlias(1)` / `val x: Lib.T`（ALIASsym）を typecheck します。読めない pickle 形は成功扱いにしません。取れなければスキップします。未知の XML エンティティは `xml_attr_bad.scala` で診断します。本文付き `@native` は `native_bad.scala`。`-cp` 上の壊れた Java `.class` は `unsupported classfile` で診断します。Java `protected` の違法アクセスは `java_prot_bad.scala`。Java 非 enum の合成 `values` は `java_enum_bad.scala`。コンテキストバウンドの欠ける evidence は `context_bounds_bad.scala` / `context_bounds_class_bad.scala`。違法な補助コンストラクタ（`this` なし / 文のあとの `this` / `super`）は `aux_ctor_bad.scala` / `aux_ctor_stmt_bad.scala` / `aux_ctor_super_bad.scala`。パッケージ境界の外からの `private[p]` と、継承元の無いコンストラクタ引数は `mism8_access_bad.scala`。依存メソッド型が読み替えても型検査は残ることは `mism8_dep_bad.scala`。`-Xsource:3` 無しの `f(xs*)` は `mism8_star_bad.scala`。
 | `list_core1.scala` | `List` の `filter` / `take` / `drop` / `slice` / `reverse` / `distinct` / `init`（library dual-run のみ） | `3,4,5` … `3,1,4,1,5` |
 | `list_core2.scala` | `List` の `size` / `length` / `head` / `last` / `contains` / `exists` / `find` / `indexOf`（library dual-run のみ） | `3` … `None` |
 | `list_core3.scala` | `List` の `mkString` 0/1/3 引数 / `sum` / `product` / `min` / `max` / `minBy` / `maxBy`（library dual-run のみ） | `314` … `apple` |
@@ -3213,6 +3348,27 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 `mism7_lobound_bad.scala`（`def wrong[E, O >: E](x: O): E = x`）/
 `mism7_capture_bad.scala`（匿名クラス自身の `this.next()` を外側の `T` として
 渡す）で固定しています。実 scalac 2.13.16 も 3 件すべて拒否します。
+
+| `mism8.scala` | オブジェクトの型エイリアスを期待型として解く多相呼び出し、期待型がタプルの成分へ届く（`protoTypeArgs`）、依存メソッド型（`def get[P <: Phase](p: P): Option[p.State]`）、`private[p]` を定義側から解決、`private[this]` なコンストラクタ引数の下から継承メンバを読む（**私有ランタイムと library の両モード**、`java -Xverify:all`） | `Box` `true` `true` `false` `l/r` `true` `false` `f` |
+
+`mism8.scala` は `crates/cli/tests/mismatch8.rs` の
+`mism8_fixture_runs_in_both_modes` から**両モードで**回し、どちらの stdout も
+**実 scalac 2.13.16 の出力そのもの**（`tests/fixtures/expected/mism8.txt`）と
+突き合わせます。同ファイルには最小形の受理テスト
+（`an_expected_type_alias_is_seen_through_before_it_solves` /
+`an_empty_repeated_parameter_is_unconstrained_not_unsolved` /
+`a_splatted_argument_is_the_element_type` /
+`xsource3_spells_the_splat_without_the_ascription` /
+`the_expected_type_is_the_prototype_of_a_tuple_component` /
+`a_prototype_that_does_not_fit_is_dropped` /
+`a_dependent_method_type_reads_its_member_off_the_argument` /
+`a_qualified_private_is_resolved_from_the_definition`）も置いてあります。
+`Map` / `Vector` / `Set` / `Array` と可変長引数の本体は私有ランタイムに無いので、
+そちらはこの受理テスト側だけです。緩めた規則が診断を飲み込まないことは
+`mism8_access_bad.scala`（パッケージ境界の外からの `private[p]` と、継承元の無い
+コンストラクタ引数）/ `mism8_dep_bad.scala`（`Option[Int]` を `Option[String]` に）/
+`mism8_star_bad.scala`（`-Xsource:3` 無しの `f(xs*)`）で固定しています。
+実 scalac 2.13.16 も 3 件すべて拒否します。
 
 | `tyvar.scala` | 未確定の型変数（nsc の undetermined type variables）。引数位置の `Map.empty` / `Vector.empty` / `Set.empty` / `List.empty` / `Nil` / `Seq.empty`、空の `apply`（`Map()` / `Vector()` / `List()`）、入れ子の呼び出しから漏れる変数（`take(id(Map.empty))`）、期待型が結果型の変数を決める形（`val l: List[Map[String, Int]] = f(Map.empty)`）、可変長引数・by-name・デフォルト引数の位置、複数引数・複数節、オーバーロード選択、コンストラクタ引数、そして逆向きの「呼び先自身の未確定な型パラメータ」（`xs.collect { case … }`）（library dual-run のみ） | `0`×9 `List(Map())` `2` `0`×3 `1` `2` `0` `0` `List(2, 4)` `List(2, 3, 4, 5)` `Some(6)` |
 
