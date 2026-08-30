@@ -1,0 +1,6 @@
+LOUD-base 1 dog
+7
+meow cat!
+alias base
+anon
+LOUD-base 3

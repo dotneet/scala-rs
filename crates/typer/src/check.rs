@@ -149,6 +149,19 @@ pub struct Typer {
     /// Signature pass: fill member types across the whole run before any body
     /// is typed, so a unit can call into one that comes later.
     sigs_only: bool,
+    /// While set, an unqualified name in *type* position that resolves to
+    /// nothing is reported as `not found: type X` instead of being left as the
+    /// `Type::Named` placeholder.
+    ///
+    /// The placeholder is not only a failure: `classpath.rs` builds one for a
+    /// jar member whose type the pickle names in a package that has not been
+    /// read yet, and a great deal of the run tolerates it on purpose. So the
+    /// check is switched on only where nsc is known to have finished
+    /// resolution and where silence is an outright acceptance of a program
+    /// scalac rejects: the parents of a template, its self type, and the class
+    /// a `new` builds. `tree_to_type` recurses, so `extends Seq[Missing]`
+    /// points at `Missing`, exactly as nsc does.
+    strict_type_names: bool,
     /// Members whose signature the signature pass already built. Signature
     /// work is not idempotent -- it synthesizes evidence parameters and
     /// default getters -- so the body pass must not redo it.
@@ -454,6 +467,7 @@ impl Typer {
             local_class_n: std::collections::HashMap::new(),
             pkg_nest: Vec::new(),
             sigs_only: false,
+            strict_type_names: false,
             sig_done: std::collections::HashSet::new(),
             lazy_val_presig: std::collections::HashSet::new(),
             parent_fill_done: std::collections::HashSet::new(),
@@ -2653,7 +2667,10 @@ impl Typer {
     ) {
         let st = match self_tpt {
             Some(tpt) => {
-                let t = self.tree_to_type(tpt);
+                // A self type names its parts the same way an `extends` clause
+                // does; `trait N { self: Missing => }` is `not found: type
+                // Missing`, not an "illegal inheritance" against a placeholder.
+                let t = self.with_strict_type_names(|s| s.tree_to_type(tpt));
                 if t.is_error() {
                     return;
                 }
@@ -3837,7 +3854,11 @@ impl Typer {
                 return;
             }
         }
-        tree.ty = self.tree_to_type(tree);
+        let pty = {
+            let parent_tree: &Tree = tree;
+            self.with_strict_type_names(|s| s.tree_to_type(parent_tree))
+        };
+        tree.ty = pty;
         self.check_proper_type(&tree.ty, tree.span);
         if let Some(id) = self.st.class_sym_of(&tree.ty) {
             tree.sym = id;
@@ -4046,7 +4067,10 @@ impl Typer {
             TreeKind::Apply { fun, args } => (fun, args),
             _ => return,
         };
-        let class_ty = self.tree_to_type(fun);
+        let class_ty = {
+            let head: &Tree = &**fun;
+            self.with_strict_type_names(|s| s.tree_to_type(head))
+        };
         fun.ty = class_ty.clone();
         let class_id = self.st.class_sym_of(&class_ty).unwrap_or(SymbolId::NONE);
         if !class_id.is_none() {
@@ -5534,7 +5558,7 @@ impl Typer {
                         | TreeKind::AnnotatedTypeTree { .. }
                         | TreeKind::Select { .. }
                 ) {
-                    tpt.ty = self.tree_to_type(tpt);
+                    tpt.ty = self.with_strict_type_names(|s| s.tree_to_type(tpt));
                     if let Some(id) = self.st.class_sym_of(&tpt.ty) {
                         tpt.sym = id;
                     }
@@ -5563,7 +5587,29 @@ impl Typer {
                         tpt.sym = self.st.class_sym_of(&alias).unwrap_or(SymbolId::NONE);
                         tpt.ty = alias;
                     } else {
-                        self.type_expr(tpt, &Type::NoType);
+                        // `new Missing` names a *type* that is not there. Left
+                        // to `type_expr` it came out as `not found: value
+                        // Missing`, which is not what nsc says and points the
+                        // reader at the wrong namespace. `new Obj`, where the
+                        // only thing under the name is an `object`, is the
+                        // same report in nsc: there is no *type* `Obj` to
+                        // build, and letting it through emitted a `new` of the
+                        // module class that no constructor answers.
+                        self.expose_unqualified_type(&n);
+                        let types = self.st.lookup_type(&n);
+                        let only_module = !types.is_empty()
+                            && types.iter().all(|&s| {
+                                matches!(
+                                    self.st.get(s).kind,
+                                    SymKind::Module | SymKind::ModuleClass
+                                )
+                            });
+                        if only_module || (found.is_empty() && types.is_empty()) {
+                            self.not_found_error(tpt.span, "type", &n);
+                            tpt.ty = Type::Error;
+                        } else {
+                            self.type_expr(tpt, &Type::NoType);
+                        }
                     }
                 } else {
                     self.type_expr(tpt, &Type::NoType);
@@ -14914,6 +14960,79 @@ impl Typer {
         }
     }
 
+    /// `ty` is what `resolve_type_name` made of `name`. Under
+    /// [`Self::strict_type_names`], a `Type::Named` still carrying that very
+    /// name means the lookup found nothing at all -- `expose_unqualified` has
+    /// already tried every package, wildcard import and pickle -- so report it
+    /// the way nsc does instead of handing a placeholder to the rest of the
+    /// run.
+    fn reject_unresolved_type(&mut self, ty: Type, name: &str, span: Span) -> Type {
+        if !self.strict_type_names {
+            return ty;
+        }
+        match &ty {
+            Type::Named { name: n, args } if args.is_empty() && n == name => {
+                self.not_found_error(span, "type", name);
+                Type::Error
+            }
+            _ => ty,
+        }
+    }
+
+    /// `qual.name` denotes no type. Report it the way nsc does: blame the
+    /// leftmost segment that does not resolve, so `p2.sub.Foo` with no `sub`
+    /// is `object sub is not a member of package p2` and not a complaint about
+    /// `Foo`.
+    fn missing_qualified_type(&mut self, qual: &Tree, name: &str, span: Span) -> Type {
+        if let Some(owner) = self.qualified_type_owners(qual).first().copied() {
+            let desc = self.owner_desc(owner);
+            self.error(span, format!("type {name} is not a member of {desc}"));
+            return Type::Error;
+        }
+        match &qual.kind {
+            TreeKind::Select {
+                qual: inner,
+                name: seg,
+            } => {
+                let (inner, seg) = ((**inner).clone(), seg.clone());
+                if let Some(owner) = self.qualified_type_owners(&inner).first().copied() {
+                    // nsc names the owner of a missing *package segment* by
+                    // its simple name (`package collection`), and the owner of
+                    // a missing type by its full one (`package java.util`).
+                    let s = self.st.get(owner);
+                    let short = s.name.trim_end_matches('$').to_string();
+                    let desc = match s.kind {
+                        SymKind::Package => format!("package {short}"),
+                        SymKind::Module | SymKind::ModuleClass => format!("object {short}"),
+                        _ => short,
+                    };
+                    self.error(qual.span, format!("object {seg} is not a member of {desc}"));
+                    return Type::Error;
+                }
+                self.missing_qualified_type(&inner, &seg, qual.span)
+            }
+            TreeKind::Ident { name: head } => {
+                // SLS 3.2.3: the prefix of a type `p.T` is a *term*, so nsc
+                // reports the value it could not find, not a type.
+                let head = head.clone();
+                self.not_found_error(qual.span, "value", &head);
+                Type::Error
+            }
+            _ => {
+                self.error(span, format!("not found: type {name}"));
+                Type::Error
+            }
+        }
+    }
+
+    /// Run `f` with [`Self::strict_type_names`] on.
+    fn with_strict_type_names<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = std::mem::replace(&mut self.strict_type_names, true);
+        let r = f(self);
+        self.strict_type_names = saved;
+        r
+    }
+
     fn tree_to_type(&mut self, tpt: &Tree) -> Type {
         match &tpt.kind {
             TreeKind::Empty => Type::NoType,
@@ -14922,7 +15041,8 @@ impl Typer {
                 self.expose_unqualified(name, tpt.span);
                 self.expose_unqualified_type(name);
                 let name = name.clone();
-                self.resolve_type_name_completing(&name, &[], tpt.span)
+                let ty = self.resolve_type_name_completing(&name, &[], tpt.span);
+                self.reject_unresolved_type(ty, &name, tpt.span)
             }
             TreeKind::Select { name, qual } => {
                 if let TreeKind::Ident { name: q } = &qual.kind {
@@ -14945,7 +15065,21 @@ impl Typer {
                         },
                     }
                 } else {
-                    self.resolve_type_name(name, &[])
+                    // The prefix knows nothing of that name. Falling back on
+                    // the *bare* name is deliberate -- a path this pass cannot
+                    // model still resolves that way -- but when that fails too
+                    // the clause names nothing at all.
+                    let ty = self.resolve_type_name(name, &[]);
+                    match &ty {
+                        Type::Named { name: n, args }
+                            if self.strict_type_names && args.is_empty() && n == name =>
+                        {
+                            let name = name.clone();
+                            let qual = (**qual).clone();
+                            self.missing_qualified_type(&qual, &name, tpt.span)
+                        }
+                        _ => ty,
+                    }
                 }
             }
             TreeKind::SelectFromTypeTree { qual, name, hash } => {
