@@ -1,0 +1,12 @@
+matchArm(1) = 1
+matchArm(2) threw RuntimeException
+ifArm(1) = 1
+ifArm(-1) threw RuntimeException
+tryArm(1) threw RuntimeException
+before
+blockTail threw RuntimeException
+wholeBody threw RuntimeException
+ascribed threw NotImplementedError
+argPosition threw RuntimeException
+explicitThrowArm(1) = 1
+explicitThrowArm(2) threw RuntimeException

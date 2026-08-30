@@ -1,0 +1,7 @@
+f(1) = 1
+f(2) threw RuntimeException
+g threw RuntimeException
+h(1) = 1
+h(-1) threw RuntimeException
+opt(Some(1)) = 1
+opt(None) threw RuntimeException

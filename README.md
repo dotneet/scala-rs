@@ -6289,6 +6289,67 @@ fixture 接頭辞は `sf`、テストは `crates/cli/tests/seqfn.rs` です。
   scala/collection/immutable/List.apply` で、`agent/seqfn` 以前からの既存の差）。
   実行結果は同じで、`java -Xverify:all` も通ります。
 
+`agent/nothingcall` スライス（結果型が `Nothing` の**呼び出し**――`sys.error(...)` /
+`Predef.???` / 自前の `def die(): Nothing`――が `match` / `if` / `try` の腕や
+ブロック末尾、メソッド本体全体、引数位置、ascription に来ると、型検査は通るのに
+クラスロード時に `VerifyError` になっていた件）のフィクスチャは接頭辞 `nc`
+（`nc_nothing` / `nc_nothing_sys`）で、同じ理由から `crates/cli/tests/nothingcall.rs`
+に置いています。原因は 2 つ重なっていました。ひとつは、`Nothing` 型の式は
+`jvm_sort` 上ずっと `Unit` と同じ「値を残さない」扱いなのに、`Nothing` を返す
+**呼び出し**は JVM 上は普通に `scala/runtime/Nothing$`（もしくは呼び先が宣言する
+プリミティブ記述子）への実参照を1つスタックに積むこと――`throw` 自身はこの型では
+ないので影響がなく、`case _ => throw new RuntimeException(...)` は元から動いていました。
+その幽霊参照が、`match`/`if` の腕の join、`try` の結果スロット、引数リストへ
+そのまま流れ込み、他の腕が積んだ型（`Tuple2` や `Int` 等）と食い違って
+`VerifyError: Inconsistent stackmap frames` になっていました。もうひとつは、
+`jvm_desc`（メソッドの戻り型記述子を組み立てる関数）が `Nothing` を `Unit` と
+同じ `V` に潰していたことで、`def die(): Nothing` のようなユーザー定義メソッドは
+記述子上は `()V` になり、呼び出し側は実際には積まれる参照を picking up できず、
+逆に `emit_return` は `V` から `vreturn`（無引数 `return`）を選んでしまい、
+参照を返すはずの記述子と食い違って `VerifyError: Operand stack underflow` /
+`Method expects a return value` になっていました。`javap -c` で実 scalac
+2.13.16 の出力（`T1.die()`、`T1.f(Int)` の `tableswitch`、`$anonfun$opt$1` 等）を
+確認したところ、nsc は `Nothing` 型の呼び出しの直後に必ず `athrow` を続けて
+そこから先を到達不能にしており（`println(sys.error("x"))` は `invokevirtual
+println` 自体が出ない）、`Nothing` はメソッドの戻り型としても常に
+`Lscala/runtime/Nothing$;` のまま（`V` にはならない）で、その参照を
+tail-return する場所（静的フォワーダ、`Function0` の by-name ラムダ本体）だけ
+`areturn` を使う――という形でした。直し方は 3 点です。`gen_expr`
+（`crates/backend/src/gen.rs`）を薄いラッパーにして、式の型が `Nothing` なら
+必ず `athrow` を追加で挿すようにしました。アセンブラには元から「`athrow`/
+`return`/`goto` の後に出したバイトは次のラベルまで捨てる」という dead-code
+機構（`Assembler::kill` / `drop_dead`、`ab` スライス由来のコメントにある通り
+「every emitter about reachability」を教えない設計）があったため、この 1 箇所の
+変更だけで `match`/`if`/`try` の腕・ブロック末尾・引数位置・ascription の
+すべてに波及します（`Predef.???` 側にあった手書きの `pop` は `athrow` と二重に
+なるので削り、`is_unit_like` の場合だけ残しました）。`jvm_desc` の `Nothing`
+腕を `V` から `Lscala/runtime/Nothing$;` に直し（`jvm_desc_val` が既にこの
+表現を持っていたので合わせた形）、`emit_return` は `Nothing` を渡されたときだけ
+`areturn` を選ぶようにしました。`nc_nothing.scala` は `die(): Nothing` と `???`
+だけで書いてあるので**私有ランタイムと `--scala-library` の両方**で
+`java -Xverify:all` の下に走り、`nc_nothing_sys.scala` は元の再現ケースそのもの
+（`sys.error` と `Tuple2` を返す `match`、`Option.getOrElse` への by-name 引数）
+なので library dual-run 専用です。`nc_nothing_wholly_diverging_methods_end_at_athrow`
+/ `nc_nothing_diverging_arms_still_grow_an_athrow` /
+`nc_nothing_user_method_descriptor_is_not_void` は `javap -c` で
+バイトコードの形そのもの（本体全体が発散するメソッドは `athrow` で終わる、
+`match`/`if`/`try` の腕は `athrow` を含みつつ生きている側の `return` で終わる、
+`die()` の記述子が `V` でなく `Nothing$` であること）を固定します。
+明示 `throw` の既存経路（`explicitThrowArm`）は退行チェックとして同じ
+フィクスチャに含めてあります。
+
+#### Remaining
+
+- `println(sys.error("x"))` のような、`Nothing` 型の実引数からオーバーロードを
+  絞る経路には別の穴があります（`ambiguous overload for println with arguments
+  (Nothing)`）。今回のバックエンドの修正とは無関係の typer 側のオーバーロード
+  解決の話なので、`nc_nothing_sys.scala` では `takeAny(a: Any): Unit` という
+  単一シグネチャのメソッドに逃がしています。
+- 私有ランタイムの `scala/Tuple2` は `toString` を上書きしていないため、
+  `println` すると `scala.Tuple2@<hash>` になります（jar モード・実 scalac は
+  `(1,1)`）。この修正とは無関係の既存の差で、`nc_nothing.scala` はタプルを
+  そのまま印字せず `._1` 経由で比較しています。
+
 ## ライセンス
 
 Apache-2.0
