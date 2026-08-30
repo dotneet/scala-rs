@@ -231,5 +231,20 @@ conform!(
     curried_eta,
     ordering_double,
     either_pattern,
-    local_simple_name
+    local_simple_name,
+    coll_ops,
+    try_catch_forms,
+    arithmetic_edges,
+    try_parse,
+    bank_account,
+    shapes_guards,
+    monoid_implicits,
+    for_comprehensions,
+    sieve_quicksort,
+    val_destructuring,
+    string_match,
+    sorted_range,
+    rpn_eval,
+    json_render,
+    ledger_fold
 );
