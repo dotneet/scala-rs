@@ -9,7 +9,7 @@ scalac のソースを移植したものではありません。オリジナル�
 scala-rs は、Scala 2.13 の構文と意味論のごく一部を、Rust から JVM バイトコードへ落とす実験的コンパイラです。
 
 - フロントエンドは nsc の `Tree` に近い AST を持ちます。
-- ターゲットは Java 8 相当の classfile（major version 52）です。Code 属性に StackMapTable（full_frame）を出します。
+- ターゲットは Java 8 相当の classfile（major version 52）です。Code 属性に StackMapTable（full_frame）を出します。ローカルのフレーム型は scalac と同じく**そのスロットの宣言型の消去**です（`var c: Option[Int]` はループ先頭でも `scala/Option`。`Some` と `None$` の最小上界を計算するのではありません — 「ループ先頭のフレームとオペランドスタックの上の `try`」節）。
 - デフォルトでは scala-library を同梱しません。Option / List / FunctionN は **scala-rs 独自のランタイム classfile**（`scala/Option` など）です。
 - `--scala-library [<jar>]`（または `SCALA_LIBRARY_JAR`）を付けると、Option / List / FunctionN / Tuple2 に加え、`Predef$`（`println` / `assert` / `require` / `???` / `identity` / `locally` / `implicitly`）、`any2stringadd`（`1 + "x"`）、`ArrowAssoc` の `->`、`intWrapper` / `RichInt`（`1.abs` / `1.max` / `1.to`）、`longWrapper` / `doubleWrapper` / `charWrapper`（`(-3L).abs` / `1.0.max` / `'9'.isDigit`）、`StringOps`（`augmentString` 経由の `toInt` / `length` / `*` / `take` / `drop` / `isEmpty` ほか。**prelude に無いメンバは jar の `ScalaSignature` から補完**します — `agent/stringops8` の節を参照）、`WithFilter` / `Iterator`、`Map` / `Vector` / `List` / `Set`（varargs `apply` を含む）、**`scala.jdk.CollectionConverters` の `asScala` / `asJava`** は **scala-library 2.13.16 の ABI** にリンクし、衝突する私有 classfile は出しません。jar パスを省略すると `SCALA_LIBRARY_JAR`、`/tmp/scala-rs-lib`、cwd を探します。**`scala-rs compile` と `scala-rs run` は、jar が自動検出できればそれを既定で使い**、見つからなければ私有ランタイムに落ちます。**`--no-scala-library` は私有ランタイムを強制**します。jar リンク時はさらに **right-biased な `Either`**（`map` / `flatMap` / `fold` / `swap` / `toOption` / `filterOrElse` / `left` の `LeftProjection`）と **`scala.util.Try`**（`recover` / `recoverWith` / `transform` / `toEither` / `withFilter`）も乗り、どちらも `for` 内包表記で使えます。
 
@@ -4373,6 +4373,12 @@ error: value += is not a member of T
 | `sv_ofdim.scala`（`crates/cli/tests/stmtval.rs`、library dual-run のみ。私有ランタイムには `ofDim` が無いので診断を出すことも見る） | `Array.ofDim[T]` の 1〜5 次元 × `Int` / `Double` / `String` / ユーザークラス。既に動いていた `val g: Array[Array[Int]] = Array.ofDim[Int](2, 3)` と `Array.fill(3)(0)`、`Array(1, 2, 3)` も | `7` `[I` `7` `[[I` `7` `[[[I` `7` `[[[[I` `7` `[[[[[I` `2.0` `[D` `6.0` `[[D` `2.5` `[[[D` `ab` `[Ljava.lang.String;` `z` `[[Ljava.lang.String;` `Cell(3)` `[LCell;` `Cell(4)` `[[LCell;` `0,0,0;0,0,9` `2` `[I` `1,2,3` |
 | `sv_lib.scala`（`crates/cli/tests/stmtval.rs`、library dual-run のみ） | 実 scala-library でしか裏付けられない形での同じ 4 件: `Array[List[Int]]` の要素型、`n += i max x`、`var lst ++= List(…)`、`foreach` のラムダ本体が定義で終わる形 | `List(1, 2)` `[Lscala.collection.immutable.List;` `2` `3` `List(1, 2, 3)` `6` `done` |
 | `sv_bad.scala`（`crates/cli/tests/stmtval.rs`、異常系） | 不変な受け手への op-assign は nsc の `convertToAssignment` の診断のまま（`value += is not a member of Int` ＋ `Expression does not convert to assignment because receiver is not assignable.`）。優先順位を直すまでは `any2stringadd` のエラーに化けていた | （コンパイルエラー 2 件） |
+| `lf_frame.scala`（`crates/cli/tests/loopframe.rs`） | 最小形の `var c: Option[Int] = Some(1); while (c.isDefined) { c = None }`。実行に加えて **`javap -v` の `StackMapTable` を実 scalac のものと突き合わせる**（scalac は `class scala/Option` 1 つだけ。`java/lang/Object` / `scala/Some` / `scala/None$` に逃げていないことも見る）。両モード | `done` |
+| `lf_loopvar.scala`（同上、library dual-run のみ。私有ランタイムに可変長 `List.apply` が無い） | ループを跨ぐローカルの各種: `while` / `do while` / 入れ子ループ / `List` → `Nil` / 1 周で何度も別クラスになる / ループ内の `if`・`match`・`try`・`finally` の分岐 / ハンドラの中での参照 / ループを抜けたあとの参照 / `for` の desugar / ラムダの中のループ / `while` を含む `Unit` メソッド / ループ内のパターン束縛 / 宣言型が trait（フレーム型が interface）/ ラムダに捕まった `var` / もう一方の腕が `Nothing`。フレームが `scala/Option` と `scala/collection/immutable/List` を保つことも見る | `None`×3 `List()`×2 `None`×2 `List(0)` `Some(1)` `true` `Some(3)` `true` `1` `6` `9` `List(2, 1, 0)` `12` `true` `None` `List()` |
+| `lf_loopany.scala`（同上） | 宣言クラスが `java/lang/Object` になる形: `var a: Any` がループ内でプリミティブと参照のあいだを動く（フレームが `java/lang/Integer` に固定されていないことも見る）、配列ローカルの再代入、プリミティブだけのループ、`null` 初期値。両モード | `2` `2` `6` `z1` |
+| `lf_trystack.scala`（同上） | オペランドスタックが空でない位置の `try`: `println(try …)`、2 番目の引数、`new Box(try …)`（未初期化参照）、プリミティブを積んだ状態、実際に投げる形、ループ内の引数位置、`finally` 付き。両モード | `w0` `w1` `y` `pq` `a` `n=3!` `boom` `ktrue`×2 `kfalse` `true` `fin f` |
+| `lf_ctorframe.scala`（同上） | 親コンストラクタ呼び出しのあとの `this` の型: 分岐・ループ・`try` を本体に持つサブクラスのコンストラクタと、親コンストラクタの引数が `try` の形（未初期化の `this` がスタックに載る）。`C.<init>` のフレームが `C` であって `B` でないことも見る。両モード | `b` `pos` `neg` `zero` `3` `g1` `d2` |
+| `lf_loopvar_bad.scala`（同上、異常系） | ループ本体で `var c: Option[Int]` に `String` を入れる形。フレームの合流は宣言型なので、これは黙って `Any` に広がらず `type mismatch` になる | （コンパイルエラー） |
 
 
 ### Remaining
@@ -5123,19 +5129,121 @@ error: value += is not a member of T
   ローカル trait を実装する）はそもそも Scala では書けない形なので、
   `agent/localtrait` の fixture でも扱っていません。
 
-- **引数位置の `try` と `while` の StackMapTable**（`agent/localtrait` で気づいた
-  別件。ローカル宣言とは無関係で、main でも同じ）。`--no-scala-library` では
+- ~~**引数位置の `try` と `while` の StackMapTable**~~ →
+  `agent/loopframe` で直しました。**同じ根ではなく、別々の 2 件**でした
+  （「ループ先頭のフレームとオペランドスタックの上の `try`」節）。
 
-  ```scala
-  var i = 0
-  while (i < 2) { println("w" + i); i += 1 }
-  println(try { "y" } catch { case _: Throwable => "no" })
-  ```
+### ループ先頭のフレームとオペランドスタックの上の `try`（`agent/loopframe`）
 
-  が `VerifyError: Inconsistent stackmap frames at branch target …` になります。
-  `val t = try { … } catch { … }` と一度受けてから `println(t)` すれば通ります。
-  jar モードは正しく動きます。既存の「`while` 本体で宣言したローカルの
-  StackMapTable」と同じ根と思われます。
+型検査は通るのに**クラスロード時に落ちる** 3 件です。同じ根だと思われていた
+最初の 2 件は**別々の原因**でした。3 件目はそれを追ううちに見つけた既存の穴です。
+いずれも `crates/cli/tests/loopframe.rs` と `lf_*` fixture で押さえています。
+
+#### 1. ループを跨ぐローカルのフレームは「宣言型」
+
+```scala
+var c: Option[Int] = Some(1)
+while (c.isDefined) { c = None }
+```
+
+が `VerifyError: Bad type on operand stack` になっていました。スロットは
+入口で `scala/Some`、後ろ向き分岐で `scala/None$` を持つので、無関係な 2 クラス
+の合流はこのアセンブラでは `java/lang/Object` になります。フレームとしては
+正しいのですが、そのスロットを読む
+`invokevirtual scala/Option.isDefined` には**緩すぎ**ます。
+
+実 scalac 2.13.16 に `javap -v -c` をかけると答えが書いてあります。
+
+```text
+  StackMapTable: number_of_entries = 2
+    frame_type = 252 /* append */
+      offset_delta = 12
+      locals = [ class scala/Option ]
+  LocalVariableTable:
+     Start  Length  Slot  Name   Signature
+        12      23     2     c   Lscala/Option;
+```
+
+`class scala/Option`——`LocalVariableTable` と同じ、スロットの**宣言型の消去**です。
+scalac は `Some` と `None$` の最小上界など計算していません。ローカルの型は
+生存期間を通じて 1 つで、どのフレームもそれを繰り返すだけです。宣言型は
+ソースがそこに書き込みうるものすべての上界なので、クラス階層を持たなくても
+求まり、必要以上に広がることもありません。同じ規則を採りました
+（`declare_local_ty` → `Assembler::set_local_class`）。
+
+**合流のときだけでは足りません**。このアセンブラはフレームを 1 回の前向き
+パスで書くので、後ろ向き分岐を見る前に書き終えたフレームは入口の型のままです。
+
+```scala
+var a: Any = 1
+while (i < 2) { a = if (i == 0) "s" else 2; i += 1 }
+```
+
+はループ先頭こそ正しく `java/lang/Object` に合流したのに、条件式の中で先に
+出していたフレームが `java/lang/Integer` のままで
+`VerifyError: Inconsistent stackmap frames` でした。**書き込みのたびに**
+宣言クラスに揃えるのが要点で、`java/lang/Object` も（`var a: Any` の実際の
+宣言型として）他と同じく宣言クラスとして扱います。
+
+#### 2. オペランドスタックが空でない位置の `try`
+
+```scala
+println(try { "y" } catch { case _: Throwable => "no" })
+two("p", try { "q" } catch { case _: Throwable => "no" })
+new Box(try { "a" } catch { case _: Throwable => "b" })
+```
+
+JVM は例外ハンドラに入るときオペランドスタックを捨てます（JVMS 4.10.1.6）。
+`try` の前に積んであったもの——`Predef$` のレシーバ、先に評価した引数、
+`new` が残した**未初期化**参照——は catch 側では消えているので、`try` の後の
+合流点でスタック段数が片側 n・片側 0 になり
+`VerifyError: Inconsistent stackmap frames` でした。`println` が jar モード
+だけ通っていたのは、そこだけ引数を先に評価して `swap` する形だったからで、
+`two("p", try …)` は両モードで落ちていました。
+
+`javap -c` で見ると scalac は `LiftTry` フェーズで `try` を合成メソッド
+`private static final java.lang.String liftedTree1$1()` に持ち上げ、引数位置
+からはそれを呼びます。こちらは保護区間のあいだ**積んであった値をローカルへ
+退避**する形にしました（`spill_operand_stack` / `restore_operand_stack`）。
+メソッドを増やさずに済み、`new` の未初期化参照も——検証器は
+`uninitialized(Address)` をローカルに置くことを許すので——そのまま扱えます。
+
+#### 3. 親コンストラクタ呼び出しのあとの `this`（上の 2 件を追ううちに見つけた既存の穴）
+
+```scala
+class B(val s: String)
+class C(n: Int) extends B("b") {
+  val sign: String = if (n > 0) "pos" else "neg"
+}
+```
+
+が `VerifyError: Bad type on operand stack in putfield` /
+`Type 'B' … is not assignable to 'C'` でした。JVMS 4.10.1.9 では
+`invokespecial <init>` は `uninitializedThis` を**検証中のクラス**の型に
+置き換えますが、こちらは**呼んだ側のクラス**（＝親の `B`）に置き換えていました。
+親コンストラクタ呼び出しのあとにフレームが必要なコンストラクタ——分岐・ループ・
+`try` を本体に持つもの——はすべてこれで落ちていました
+（`Assembler::initialize`。fixture は `lf_ctorframe.scala`）。
+
+計測は `files=184 errors=346 files_with_errors=64` → **変わらず**（診断の中身も
+一字一句同じ）。slick は型検査で止まっていて classfile を 1 つも出していない
+（`classes=0`）ので、バックエンドだけを直したこのスライスで数字が動かないのが
+正しい姿です（`agent/unitbox` と同じ）。動かしたのは**出したコードが JVM に
+ロードできるか**です。
+
+#### Remaining
+
+- **フレームは今も `full_frame` だけ**です。scalac は `append` / `same` /
+  `same_locals_1_stack_item` に圧縮するので、同じ内容でも classfile は
+  こちらの方が大きくなります。検証器はどちらも受け付けるので正しさの問題では
+  ありませんが、`javap -v` の出力を 1 行ずつ比較することはできません
+  （`crates/cli/tests/loopframe.rs` が「フレームに現れるクラス」の集合で
+  突き合わせているのはこのためです）。
+- **`lf_loopvar.scala` は jar 限定**です。私有ランタイムに可変長の
+  `List.apply` が無いためで（`value apply is not a member of List$`）、
+  フレームの話とは無関係の既存の穴です。`Option` の `toString` が
+  case class のものでないのも同じ（`lf_trystack.scala` はそこを避けて
+  両モードで走ります）。
 
 ## ライセンス
 

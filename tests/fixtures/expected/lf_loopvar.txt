@@ -1,0 +1,20 @@
+None
+None
+None
+List()
+List()
+None
+None
+List(0)
+Some(1)
+true
+Some(3)
+true
+1
+6
+9
+List(2, 1, 0)
+12
+true
+None
+List()

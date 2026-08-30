@@ -7,6 +7,20 @@ use std::collections::BTreeMap;
 #[derive(Clone, Copy, Debug)]
 pub struct Label(pub usize);
 
+/// One tracked operand-stack entry, described well enough for the generator to
+/// spill it to a local and load it back. See [`Assembler::stack_entries`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StackEntry {
+    Int,
+    Long,
+    Float,
+    Double,
+    /// A reference. `Some(name)` is the tracked class, which the spill slot can
+    /// then be declared to hold; `None` covers `null` and the still
+    /// uninitialized result of a `new`, neither of which has a class to declare.
+    Ref(Option<String>),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum VType {
     Top,
@@ -145,8 +159,14 @@ impl Assembler {
     }
 
     /// Declare the class `slot` holds; see [`Assembler::local_class`].
+    ///
+    /// `java/lang/Object` counts: a `var a: Any` assigned an `Integer` before a
+    /// loop and a `String` inside it needs *every* frame in the loop -- not
+    /// just the loop head's -- to say `Object`, and only recording the
+    /// declaration at the store gets the frames this assembler already emitted
+    /// on its single forward pass to agree with the ones the back edge merges.
     pub fn set_local_class(&mut self, slot: u16, name: &str) {
-        if name.is_empty() || name == "java/lang/Object" {
+        if name.is_empty() {
             return;
         }
         self.local_class.insert(slot, name.to_string());
@@ -179,6 +199,30 @@ impl Assembler {
         let s = t.slots();
         self.vstack.push(t);
         self.bump(s);
+    }
+
+    /// The operand stack as the generator sees it, bottom first.
+    ///
+    /// Entering an exception handler *clears* the operand stack (JVMS 4.10.1.6),
+    /// so a `try` generated while values are already pending -- `println(try …)`,
+    /// `f(a, try …)`, `new Box(try …)` -- leaves the join after the `try` with
+    /// two different stack depths and the frames disagree. The generator parks
+    /// those pending values in locals for the duration of the guarded region;
+    /// this is what it asks to find out what is there. (scalac solves the same
+    /// problem in its `LiftTry` phase, by lifting the `try` into a synthetic
+    /// `liftedTree1$1` method called from the argument position.)
+    pub fn stack_entries(&self) -> Vec<StackEntry> {
+        self.vstack
+            .iter()
+            .map(|t| match t {
+                VType::Integer => StackEntry::Int,
+                VType::Long => StackEntry::Long,
+                VType::Float => StackEntry::Float,
+                VType::Double => StackEntry::Double,
+                VType::Object(n) => StackEntry::Ref(Some(n.clone())),
+                _ => StackEntry::Ref(None),
+            })
+            .collect()
     }
 
     /// Whether the value on top of the stack is a *reference*.
@@ -1178,6 +1222,14 @@ impl Assembler {
         let inited = VType::Object(owner.to_string());
         match recv {
             VType::UninitializedThis => {
+                // JVMS 4.10.1.9: `uninitializedThis` becomes the class *being
+                // verified*, not the one whose `<init>` was invoked. Those
+                // differ for the super constructor call every subclass makes,
+                // and writing the superclass made every frame after it claim
+                // `this` was a `B`: `class C(n: Int) extends B("b") { val e =
+                // if (n > 0) … else … }` was a `VerifyError: Bad type on
+                // operand stack in putfield`, `'B' … is not assignable to 'C'`.
+                let inited = VType::Object(self.this_name.clone());
                 for t in self.vstack.iter_mut().chain(self.vlocals.iter_mut()) {
                     if matches!(t, VType::UninitializedThis) {
                         *t = inited.clone();
