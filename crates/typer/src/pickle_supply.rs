@@ -938,6 +938,79 @@ impl PickleSupply {
             .flatten()
             .map(|t| erased_param_desc(st, t))
             .collect();
+        // `pickled_origin` only recognises a duplicate that was itself
+        // installed from a pickle -- it deliberately says nothing about a
+        // hand-written prelude member, so two copies of the same pickled
+        // declaration reaching the same receiver still collapse
+        // (`collapse_pickled_copies`) while a genuine prelude override is
+        // never treated as a spurious duplicate of a pickle hit. But a
+        // *pickle* copy of a member the *prelude itself already declared on
+        // this exact class* slips past both checks: it shares the prelude
+        // symbol's owner (so `drop_overridden`'s override rule, which only
+        // fires across owners, does not apply) and it is the only one of the
+        // pair carrying a `pickled_origin` (so `collapse_pickled_copies`,
+        // which only merges when *both* sides have one, does not apply
+        // either). `object Set extends IterableFactory[Set]`'s `apply` is
+        // hand-written in `prelude_coll` (`add_set`) so `Set(1, 2)` still
+        // works without the jar; asking the companion for `apply` again
+        // after something had already forced a *different* member
+        // (`SetOps.apply(A): Boolean`, from `u("x")`) to complete re-read
+        // `apply` from the jar and installed a second, pickle-derived copy
+        // of the very same overload next to it -- and a later `Set("admin")`
+        // saw both and was `ambiguous overload`, depending on whether
+        // something upstream had already touched the class. This is that
+        // case: prelude always wins, so a same-shaped hand-written member
+        // already on `class_sym` means nothing new is installed for it --
+        // see below for what is reported instead.
+        //
+        // `s.0 < st.prelude_end` is the part that must not be dropped: an
+        // empty `pickled_origin` is *also* what a member the raw classfile
+        // reader put there carries (`adopt_binary_class`'s "stale" members,
+        // which that function's own loop means to replace with the richer
+        // pickled signature this call is about to install). Those symbols
+        // are allocated long after the static prelude is built, so their id
+        // is never below `prelude_end`. Without this half of the condition,
+        // `scala.Equals.canEqual` and friends never got their pickle-precise
+        // signature (`adopt_binary_class` saw `installed.is_empty()` and
+        // left the crude classfile one in place), and every case class
+        // failed its `Equals` override check with "needs to be abstract".
+        //
+        // Handing back `None` here -- as if the hit simply could not be
+        // installed -- hid the prelude member from every caller that reads
+        // `complete_named`'s *return value*, not just from `class_sym`'s own
+        // member list (which had it all along). `PickleSupply::complete`'s
+        // class-plus-companion union (`agent/oshadow`, `agent/companionkind`)
+        // builds its answer purely from what completion reports back, never
+        // re-running `lookup_member`; a bare decline made
+        // `scala.math.BigDecimal`'s prelude-written `apply(Int)` /
+        // `apply(String)` / `apply(java.math.BigDecimal)` invisible to that
+        // union the moment something else forced `apply` to complete, and
+        // the overload set `type_select` built -- and `record_overload_group`
+        // then cached under the callee symbol -- had every *other* `apply`
+        // shape but not those three. `BigDecimal(2)` then had no exact match
+        // among `Long` / `Double` / `BigInt` and came out `ambiguous overload`
+        // before `Check::widen_with_companion` (which adds the missing three
+        // back in) ever ran: that fallback only fires when a resolution
+        // reports no match at all, and an *ambiguous* one reports and keeps
+        // a diagnostic straight away. Reporting the existing symbol instead
+        // keeps every caller's count and `found` set exactly as if the
+        // prelude member had always been part of the pickle's own answer,
+        // while still installing nothing new and leaving `class_sym.members`
+        // untouched.
+        if let Some(&blocker) = st.get(class_sym).members.iter().find(|&&s| {
+            s.0 < st.prelude_end && {
+                let e = st.get(s);
+                e.name == name
+                    && e.pickled_origin.is_empty()
+                    && flat_erased_params(st, &e.ty) == want
+            }
+        }) {
+            trace(format_args!(
+                "{internal}#{name}: a hand-written prelude overload already has these \
+                 erased parameters -- reporting it instead of installing a pickle copy"
+            ));
+            return Some(blocker);
+        }
         // One declaration per erased parameter list, the first one
         // linearization offers, i.e. the most derived. Two declarations that
         // erase alike are the same JVM method seen through different parents,
@@ -2525,6 +2598,20 @@ fn names_class(candidate: &str, full_name: &str) -> bool {
     let last = candidate.rsplit('/').next().unwrap_or(candidate);
     let last = last.strip_suffix('$').unwrap_or(last);
     last == simple || last.rsplit('$').next() == Some(simple)
+}
+
+/// A member's parameters, erased the same way [`erased_param_desc`] erases a
+/// freshly-read pickle shape, so an already-installed symbol's shape can be
+/// compared against one about to be installed.
+fn flat_erased_params(st: &SymbolTable, ty: &Type) -> Vec<Option<String>> {
+    match ty {
+        Type::Method { paramss, .. } => paramss
+            .iter()
+            .flatten()
+            .map(|t| erased_param_desc(st, t))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {

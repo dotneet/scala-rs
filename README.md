@@ -3339,6 +3339,8 @@ interface がスーパークラスを継承せず、`T$class` 本体が継承メ
 `pc_new_of_a_missing_type_is_not_a_missing_value` は `new Missing` が
 `not found: value`（間違った名前空間）に戻らないことを固定します。
 
+`agent/setapply` スライス（コンパニオンの `apply` が、手書きの prelude と jar 由来の pickle とで二重に載っていた件）のフィクスチャは接頭辞 `sa`（`sa_setapply` / `sa_setapply_bad`）で、同じ理由から `crates/cli/tests/setapply.rs` に置いています。`sa_setapply.scala` は `Repo` trait の `xs(tag)`（`SetOps.apply(String): Boolean` をメンバ経由で強制的に完了させる、元の報告と同じ形）→ `Set(...)` の順、逆順、`Map` / `List` / `Seq` の同型ケースを 1 本にまとめ、**`--scala-library` dual-run** と **real scalac 2.13.16** との実行結果 diff（`real_scalac_dual_run_sa_setapply`）の両方で `java -Xverify:all` の下に走らせます（載せ替えたシンボルはリンク先を変えるので、検証器を通すこと自体が確認です）。私有ランタイムには `scala.collection` の pickle が無い（＝二重に載る余地が無い）ので、`sa_setapply_without_the_library_is_diagnosed` が `--no-scala-library` で `Set` が**黙って通らず** `not found: type Set` と診断されることを固定します。`sa_setapply_bad.scala` は、直したのが「名前」ではなく「erased パラメータの形」であること——共通の親を持たない 2 つの実在するオーバーロード（`Ax` / `Bx` を実装する `Cx` への `Pick.apply`）は 2 つのまま残り、決着が付かなければ scalac と同じく拒む——を固定します。1 回目の版（見つからなかった候補を `None` で握りつぶす形）はマージ後の全体検証で `agent/oshadow`（`BigDecimal(2)` が `ambiguous overload`）と `agent/uniteq`（`scala.Enumeration` のメンバ欠落）を壊し、2 回目の版（同じ検査だが、握りつぶす代わりに既存の prelude シンボルをそのまま返す）で両方直っています。詳しくは下の該当節を参照してください。
+
 ### オーバーライドの適合検査（`agent/override`）
 
 SLS 5.1.4 "Overriding"（nsc の `RefChecks.checkOverride`）と SLS 5.2.6
@@ -7149,6 +7151,147 @@ slick（`tests/slick_measure.sh`）は **`errors=257 files_with_errors=63` の�
 - 型位置一般（`val x: Missing`、`def f(x: Missing)`、型引数一般）は今回の対象外です。
   `Type::Named` プレースホルダは jar 由来の正当な型でもあるので、そこを閉じるには
   「未解決」と「未読込」を型として分ける必要があります。
+
+### コンパニオンの `apply` が prelude と pickle とで二重に載っていた（`agent/setapply`）
+
+```scala
+val u: Set[String] = Set("x")
+val b = u("x")          // SetOps.apply(A): Boolean をメンバ経由で完了させる
+println(Set("admin"))   // error: ambiguous overload for apply with arguments ("admin")
+```
+
+2 行目が無ければ 3 行目は通ります。実 scalac 2.13.16 は両方とも通し、`Set(admin)` を
+出力します。
+
+#### 原因
+
+`object Set extends IterableFactory[Set]` の `apply(elems: A*): Set[A]` は
+`crates/typer/src/prelude.rs`（`add_set`）に**手書き**してあります。`--no-scala-library`
+でも `Set(1, 2, 3)` が動くようにするためで、このシンボルは `pickled_origin` を持ちません
+（pickle から供給されたときだけ立つ印だからです）。
+
+`u("x")` は `Set[String]` の**メンバ**としての `apply(A): Boolean`（`SetOps` 宣言）を要求します。
+これは prelude に無いので `Check::ensure_apply_supplied` が `PickleSupply::complete` を呼んで
+jar から補います。`complete` は「クラス側が見つかっても**必ず**コンパニオンにも聞く」——
+`scala.math.BigDecimal` のようにインスタンス側の `apply` だけを持つクラスで、コンパニオンの
+7 本を隠してしまわないための仕様です（`agent/companionkind` 由来）。この「必ず聞く」対象に
+コンパニオンの module class 自身が入っており、`Set$` に対して**その時点で初めて** `apply` を
+完了させます。ところが `Set$` の `apply` は prelude に**既にある**ので、これは
+「同じ宣言のコピーが 2 つ」（`agent/ambigmap`）そのものです——ただし今回は 2 つ目のコピーが
+別の**クラス**からではなく、別の**由来**（pickle）から同じクラスに載ります。
+
+`agent/ambigmap` の `collapse_pickled_copies` は `pickled_origin` が**両方とも**立っている
+コピー同士しか束ねません。手書きの prelude シンボルは意図的に対象外です（`pickled_origin`
+が空のシンボルは「一切触らない」——本物のオーバーロードを誤って消さないための境界線でした）。
+`drop_overridden` の override 規則も、2 つが**同じオーナー**（`Set$` 自身）を持つ場合は
+発動しません（「サブクラスが親を override している」形にしか当てはまらないからです）。
+結果、prelude 版と pickle 版の `Set$.apply` は誰にも束ねられずに両方生き残り、`Set(...)` は
+**メンバ側の完了が先に走った回数だけ** `ambiguous overload` になります——`u("x")` のような
+インスタンス側の呼び出しが 1 度でも先に来ると再現し、無ければ再現しません。順序依存という
+症状も `agent/ambigmap` と同型です。
+
+#### 直し方（1 回目、退行あり）
+
+最初の版は `PickleSupply::install`（`crates/typer/src/pickle_supply.rs`）に、pickle から
+読んだメンバを実際に載せる直前の検査を足しただけでした: **同じクラスに、同じ名前・同じ
+erased パラメータ形のメンバが、すでに prelude の手書きシンボルとして載っていたら、pickle 版は
+`None` を返して何も供給しない**。「prelude の手書きシンボル」かどうかは `pickled_origin` が
+空であることに加えて、そのシンボル ID が `SymbolTable::prelude_end` より小さいことで判定します
+（`pickled_origin` が空なのは prelude シンボルだけでなく `adopt_binary_class` が classfile
+リーダから読んだ**仮の**シンボルも同じで、ID だけを見ずに `pickled_origin` の空だけで判定すると
+`scala.Equals.canEqual` などが pickle の精密な型に差し替えられなくなり、**すべての case class**
+が `needs to be abstract` になる退行を一度作りました。`prelude_end` 未満という条件で防ぎます）。
+
+これはマージ後の全体検証で**別の 2 件**を壊しました（詳しくは次節）。原因はどちらも同じ形:
+`None` を返して**何も供給しない**という体裁が、`complete_named` の**戻り値**だけを読む
+呼び出し元（`PickleSupply::complete` のコンパニオン合併など）から prelude のメンバを
+**見えなくした**ことです。`class_sym.members` 自体には prelude 版がずっと載っていたので、
+`lookup_member` で直接引く経路は無傷でしたが、`complete_named` の戻り値だけを積み上げて
+候補集合を組み立てる経路は「何も返ってこなかった」としか解釈できませんでした。
+
+#### 直し方（2 回目、現在の版）
+
+`None` の代わりに、**すでに載っている prelude シンボルをそのまま返す**ようにしました
+（`Some(blocker)`）。新しいシンボルは作らず `class_sym.members` にも触れませんが、
+呼び出し元からは「pickle 自身がこの prelude の宣言を答えとして返してきた」のと**区別が
+付かなくなります**——`complete_named` の戻り値を読むどの経路も、prelude のメンバが最初から
+そこにあったかのように振る舞います。
+
+名前ではなく形（erased パラメータ）で比較している点は変わりません。**同じ名前でも形が違う**
+pickle のメンバは今までどおり新規に供給されます（`Set[A]` のメンバ `apply(A): Boolean` と
+コンパニオンの `apply(A*): Set[A]` はオーナーも形も違うので、この検査には一切触れません）。
+
+#### 1 回目の版が壊した 2 件
+
+1. **`agent/oshadow`**（`oshadow_order_independent` / `oshadow_bad_is_rejected`）。
+   `scala.math.BigDecimal` は `apply(Int)` / `apply(String)` /
+   `apply(java.math.BigDecimal)` の 3 本を prelude に手書きしています
+   （`crates/typer/src/prelude_oshadow.rs`。JDBC の結果を Scala 値にするのに使うため）。
+   `BigDecimal(2)` を型付けする際、`Check::type_select` は「クラス側（インスタンスの
+   `apply(MathContext)`）とコンパニオン側を両方 pickle に聞く」という `PickleSupply::complete`
+   の合併結果をそのまま `found`（候補集合）として使い、それを `Check::record_overload_group`
+   で `fun_sym` にキャッシュします。1 回目の版では、この合併結果から `apply(Int)` /
+   `apply(String)` / `apply(java.math.BigDecimal)` の 3 本が**まるごと欠けました**
+   （`None` を返したので `complete_named` の戻り値に現れず、`complete` の合併もそれを
+   見つけられない）。結果、`BigDecimal(2)` は `Long` / `Double` / `BigInt` としか比較されず、
+   どれも決定的に勝てないため `ambiguous overload` になり——しかもこの誤ったエラーは
+   `Check::widen_with_companion`（`OverloadPick::None` のときだけ動く、コンパニオンの
+   メンバで候補を広げ直す最後の砦）が一度でも走る**前に**確定・記録されてしまいます。
+   `Ambiguous` は `None` と違って widen_with_companion の対象にならないからです。
+   2 回目の版（`Some(blocker)`）では、この合併結果に最初から 3 本とも含まれるので、
+   `BigDecimal(2)` は 1 回目の解決で `apply(Int)` に一意に決まり、
+   `widen_with_companion` を経由する必要すらありません。
+2. **`agent/uniteq`**（`ue_enum_scala_library`）。`scala.Enumeration` は `Value`（引数無し）
+   を prelude に、残り 3 オーバーロード（`Value(Int)` / `Value(String)` /
+   `Value(Int, String)`）を `crates/typer/src/prelude_enum.rs` に手書きしています。
+   `values` / `withName` / `apply` / `maxId` は `PickleSupply::complete` の
+   `library_ancestors` フォールバック（ユーザクラスがライブラリの祖先を持つときだけ動く）で
+   pickle から読みます。1 回目の版はここでも同じ形で、`Enumeration` 自身のクラスに完了させる
+   `apply` / `Value` 系の一部が戻り値から欠け落ち、`object Color extends Enumeration` の
+   メンバ解決が壊れました。2 回目の版で同時に直っています。
+
+#### 検証
+
+fixture 接頭辞は `sa`、テストは `crates/cli/tests/setapply.rs` です。`sa_setapply.scala` は
+`Repo` trait の `xs(tag)`（`SetOps.apply(String): Boolean` をメンバ経由で強制的に完了させる、
+元の報告と同じ形）→ `Set(...)` の順、逆順、`Map` / `List` / `Seq` の同型ケースを 1 本にまとめ、
+`--scala-library` dual-run と real scalac 2.13.16 の実行結果 diff の両方で
+`java -Xverify:all` の下に走らせます。`Set[String]` のメンバ `apply` が今までどおり
+`Boolean` を返すこと（`u("x")` / `v(2)` / `m("a")` / `xs(1)` / `ys(0)`）も同じフィクスチャで
+固定しています。`Repo` の要素型は `A`（トレイトの型パラメータ）ではなく `String` に固定して
+あります——抽象型引数のまま `xs(tag)` を通すと、固定長パラメータと可変長パラメータの
+どちらも specificity で決着が付かないという**このバグとは無関係な既存の別バグ**を踏み、
+無関係な `ambiguous overload for apply` を追加で出してしまうためです（下記「既知の残件」）。
+私有ランタイムには `scala.collection` の pickle が無い（＝二重に載る余地が無い）ので、
+`sa_setapply_without_the_library_is_diagnosed` が `--no-scala-library` で `Set` が
+**黙って通らず** `not found: type Set` と診断されることを見ます。`sa_setapply_bad.scala` は、
+共通の親を持たない 2 つの実在するオーバーロード（`Ax` / `Bx` を実装する `Cx` への
+`Pick.apply`）が束ねられずに 2 つのまま残り、決着が付かなければ scalac と同じく
+`ambiguous overload` になることを固定します——直したのが「名前」ではなく「形」であることの
+担保です。
+
+2 回目の版では、上記に加えて `--test overloadshadow --test uniteq --test ambigmap
+--test mutcoll --test conform` をすべて前景で回し、1 回目の版が壊した 2 件を含め全件
+グリーンであることを確認しています。
+
+slick（`tests/slick_measure.sh`）は `files=184 errors=257 files_with_errors=63` →
+**`errors=241 files_with_errors=61`**（−16 件 / −2 ファイル）。元々の `Set` の順序依存
+自体は slick の 184 ファイルには現れていませんでしたが、2 回目の版が同時に直した
+`agent/oshadow` / `agent/uniteq` 型の「候補が `complete_named` の戻り値から欠け落ちる」
+経路は slick のコードにも当たっていたようです。
+
+#### 既知の残件
+
+- `java.util.Set.of("x")` の `ambiguous overload`（固定 arity 10 本 + 可変長引数の選択）は
+  **別根**です。`java.util.Set` は Java の classfile から直接読み込まれ（`javaclass.rs`）、
+  `pickle_supply.rs` の completion 経路を一切通らないので、この修正の対象外のままです
+  （`agent/javanest` の README 節の Remaining に記載済み）。
+- **固定長パラメータと可変長パラメータの specificity が、要素型が抽象型パラメータのときに
+  決着しません。** `trait Repo[A] { def hasTag(xs: Set[A], tag: A): Boolean = xs(tag) }` は
+  `xs(tag)` が `SetOps.apply(A): Boolean`（固定長）と `IterableFactory.apply(A*): CC[A]`
+  （可変長、`Set[A]` が継承）のどちらとも一致して `ambiguous overload for apply` になります。
+  要素型が具体型（`String` など）なら固定長側が正しく勝ちます。この修正の前から
+  `--scala-library` の素の main にも存在する既存のバグで、`agent/setapply` の対象外です。
 
 ## ライセンス
 
