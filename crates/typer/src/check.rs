@@ -5098,12 +5098,34 @@ impl Typer {
                 // nsc takes the lub of the body and the handlers. A body that
                 // always throws contributes `Nothing`, so `val n = try throw e
                 // catch h` has the handler's type, not `Nothing`.
+                //
+                // A handler that does *not* conform to the body needs the lub
+                // too: `try Success(f) catch { case NonFatal(e) => Failure(e) }`
+                // is a `Try[R]`, and taking the body's type alone left codegen
+                // parking a `Failure` in a slot it had declared `Success`
+                // (`VerifyError: Inconsistent stackmap frames`).
+                //
+                // Not where a branch is `Unit`: nsc lubs `try f() /* Int */
+                // catch { println }` to `Any` in statement position, and
+                // `gen_try` already fills a default of the body's own sort for
+                // that shape. Everything else is boxed into the result slot as
+                // needed.
+                let handlers: Vec<Type> = catches
+                    .iter()
+                    .map(|c| c.body.ty.clone())
+                    .filter(|t| !matches!(t, Type::Nothing) && !t.is_no_type() && !t.is_error())
+                    .collect();
+                let no_unit = !matches!(block.ty, Type::Unit)
+                    && !handlers.iter().any(|t| matches!(t, Type::Unit));
                 tree.ty = if matches!(block.ty, Type::Nothing) {
-                    catches
-                        .iter()
-                        .map(|c| c.body.ty.clone())
+                    handlers
+                        .into_iter()
                         .reduce(|a, b| self.lub_ty(&a, &b))
                         .unwrap_or_else(|| block.ty.clone())
+                } else if no_unit && !handlers.iter().all(|t| self.st.is_sub_type(t, &block.ty)) {
+                    handlers
+                        .into_iter()
+                        .fold(block.ty.clone(), |a, b| self.lub_ty(&a, &b))
                 } else {
                     block.ty.clone()
                 };
@@ -8560,8 +8582,15 @@ impl Typer {
                     } else if let Some(t) = self.either_map_result(recv_ty.as_ref(), args) {
                         ret = t;
                     } else if !self.is_with_filter_ty(recv_ty.as_ref()) {
-                        if let Some(a0) = args.first() {
-                            if let Type::Function { ret: fr, .. } = &a0.ty {
+                        // The argument need not be written as a function: a
+                        // `Map[K, V]` is one (`on.map(columnIndexes)`), and the
+                        // element type of the result is still what it returns.
+                        let a0_fn = args.first().and_then(|a| match &a.ty {
+                            Type::Function { .. } => Some(a.ty.clone()),
+                            other => self.function_view(other),
+                        });
+                        if let Some(a0) = a0_fn.as_ref() {
+                            if let Type::Function { ret: fr, .. } = a0 {
                                 // The declared result wins when it names another
                                 // class: `Range.map` is an `IndexedSeq`, not a
                                 // `Range`.
@@ -9156,7 +9185,18 @@ impl Typer {
             // given a `UnitRC[String]` is `RC[String, Unit]`, not a one-argument
             // list zipped against `[R, U]`.
             let a = &self.align_to_param_class(p, a);
-            if let Some(t) = unify_one(tp, p, a) {
+            let mut hit = unify_one(tp, p, a);
+            // The same step for a *function* parameter: a `Map[K, V]` is a
+            // `K => V`, and that is the shape `def map[B](f: A => B)` reads
+            // `B` out of. Only where the argument as written pinned nothing:
+            // weighing the view first changed which alternative slick's `map`
+            // calls resolved to.
+            if hit.is_none() && is_function_pt(p) && !matches!(a, Type::Function { .. }) {
+                if let Some(view) = self.function_view(a) {
+                    hit = unify_one(tp, p, &view);
+                }
+            }
+            if let Some(t) = hit {
                 acc = Some(match acc {
                     None => t,
                     Some(prev) => self.lub_ty(&prev, &t),
@@ -11273,6 +11313,57 @@ impl Typer {
         })
     }
 
+    /// `arg` seen as the structural function type it inherits, if it does.
+    /// `Map[K, V]`, a `PartialFunction`, and a user class extending `A => B`
+    /// all have one; a plain class has none.
+    fn function_view(&self, arg: &Type) -> Option<Type> {
+        // A `scala.FunctionN` *class* already is a function everywhere it
+        // matters; rewriting it structurally here only made both alternatives
+        // of slick's `map` calls applicable at once. This is about a type that
+        // is a function by *inheritance*.
+        if matches!(arg, Type::Function { .. }) {
+            return None;
+        }
+        if let Type::Class { sym, args } = arg {
+            if self.st.function_class_shape(*sym, args).is_some() {
+                return None;
+            }
+        }
+        // `base_type_seq` lists the *ancestors*; a `PartialFunction[A, B]`
+        // named outright is its own view.
+        let bases = std::iter::once(arg.clone()).chain(self.st.base_type_seq(arg));
+        for base in bases {
+            if let Type::Class { sym, args } = &base {
+                if let Some(f) = self.st.function_class_shape(*sym, args) {
+                    return Some(f);
+                }
+            }
+            // `PartialFunction[A, B]` is a `A => B` without being a
+            // `Function1` *class* in the prelude's parent chain.
+            if let Some((from, to)) = partial_function_type(&self.st, &base) {
+                return Some(Type::Function {
+                    params: vec![from],
+                    ret: Box::new(to),
+                });
+            }
+            // `MapOps[K, +V, …] extends IterableOps[…] with
+            // PartialFunction[K, V]`, so a `Map` *is* the function that looks a
+            // key up. The prelude has no `MapOps`, and giving `Map` a
+            // `PartialFunction` parent outright reorders the inherited-member
+            // walk enough to break `toMap`'s `A <:< (K, V)`, so the fact is
+            // stated here instead of as an edge.
+            if let Type::Class { sym, args } = &base {
+                if args.len() == 2 && self.st.get(*sym).jvm_name.ends_with("/Map") {
+                    return Some(Type::Function {
+                        params: vec![args[0].clone()],
+                        ret: Box::new(args[1].clone()),
+                    });
+                }
+            }
+        }
+        None
+    }
+
     fn arg_score(&self, arg: &Type, param: &Type) -> Option<i32> {
         if let Type::ByName(inner) = param {
             if let Some(s) = self.arg_score(arg, inner) {
@@ -11417,6 +11508,16 @@ impl Typer {
         }
         if matches!(param, Type::Any | Type::AnyRef | Type::AnyVal) {
             return Some(1);
+        }
+        // Last: a class that *is* a function inhabits a function parameter.
+        // `MapOps[K, V, …] extends PartialFunction[K, V]`, so `xs.map(aMap)`
+        // hands `map` a `K => V`. Only as a fallback -- weighed earlier it
+        // made alternatives applicable that nothing else had matched, and
+        // slick's `map` calls went from resolved to ambiguous.
+        if !matches!(arg, Type::Function { .. }) && is_function_pt(param) {
+            if let Some(view) = self.function_view(arg) {
+                return self.arg_score(&view, param);
+            }
         }
         None
     }
@@ -14629,6 +14730,9 @@ impl Typer {
         if self.adapt_singleton(tree, pt) {
             return;
         }
+        if self.adapt_function_literal_result(tree, pt) {
+            return;
+        }
         if let Some(w) = numeric_widen(&tree.ty, pt) {
             // The JVM needs the conversion instruction; setting the type alone
             // left an `int` on the stack where a `double` was expected.
@@ -14818,6 +14922,67 @@ impl Typer {
             tree.sym = m;
             tree.ty = ty;
         }
+    }
+
+    /// nsc types a function *literal*'s body against the expected result type,
+    /// so `foreach((x: Int) => x + 1)` discards the value and
+    /// `f((x: Int) => x)` against `Int => Long` widens it. A literal whose
+    /// parameter types are written out is typed *before* its expected type is
+    /// known -- overload resolution needs its result -- so its body never saw
+    /// the expected result. Adapt it here instead.
+    ///
+    /// Only a literal: `val h: Int => Int = …; fu(h)` stays the mismatch nsc
+    /// reports. And only the result -- the parameters have to be the ones the
+    /// expected type asks for already.
+    fn adapt_function_literal_result(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        if !matches!(tree.kind, TreeKind::Function { .. }) {
+            return false;
+        }
+        let Type::Function { params, ret } = tree.ty.clone() else {
+            return false;
+        };
+        let Some((pt_params, pt_ret)) = function_sig(pt) else {
+            return false;
+        };
+        if pt_params.len() != params.len() || pt_ret.is_no_type() || pt_ret.is_error() {
+            return false;
+        }
+        if self.st.is_sub_type(&ret, &pt_ret) {
+            // The result already fits; whatever else fails here is not ours.
+            return false;
+        }
+        if !pt_params
+            .iter()
+            .zip(&params)
+            .all(|(p, a)| self.st.is_sub_type(p, a) && self.st.is_sub_type(a, p))
+        {
+            return false;
+        }
+        let TreeKind::Function { body, .. } = &mut tree.kind else {
+            return false;
+        };
+        if body.ty.is_no_type() || body.ty.is_error() {
+            return false;
+        }
+        let mut adapted = std::mem::replace(body.as_mut(), Tree::dummy(TreeKind::Empty));
+        let before = self.diags.len();
+        self.adapt(&mut adapted, &pt_ret);
+        let ok = self.diags.len() == before && !adapted.ty.is_error();
+        self.diags.truncate(before);
+        if !ok {
+            // Put the body back and leave the function type as it was: the
+            // caller reports the mismatch on the whole literal, the way nsc
+            // does. (The body itself may have been rewritten on the way, but
+            // this expression is an error either way.)
+            **body = adapted;
+            return false;
+        }
+        **body = adapted;
+        tree.ty = Type::Function {
+            params,
+            ret: Box::new(pt_ret),
+        };
+        true
     }
 
     fn adapt_to_sam(&mut self, tree: &mut Tree, pt: &Type) -> bool {

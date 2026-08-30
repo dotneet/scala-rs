@@ -51,6 +51,14 @@ pub struct Assembler {
     vlocals: Vec<VType>,
     label_stack: Vec<Option<Vec<VType>>>,
     label_locals: Vec<Option<Vec<VType>>>,
+    /// The class the *top* of the stack merges to at this label, when the
+    /// generator knows it. Branches of a `match` or an `if` push different
+    /// classes (`scala/Some` and `scala/None$`); without this the merged frame
+    /// says `java/lang/Object` and every use of the result that wants the
+    /// static type -- `putfield`, a call's argument, `areturn` -- fails
+    /// verification. The static type of the expression *is* the join, so the
+    /// generator hands it over with [`Assembler::set_join_class`].
+    label_join: Vec<Option<String>>,
     frames: BTreeMap<u16, (Vec<VType>, Vec<VType>)>,
     dead: bool,
     /// Byte offset just past the terminator that made the code dead. Everything
@@ -59,10 +67,16 @@ pub struct Assembler {
     need_frame: bool,
     this_name: String,
     is_init: bool,
-    ret_object: Option<String>,
     /// Stack of locals snapshots taken at the start of each open guarded region,
     /// so exception handlers do not claim locals the body initialized later.
     try_locals: Vec<Vec<VType>>,
+    /// The class a local is *declared* to hold. `try`/`catch` parks its result
+    /// in one, and the branches store different classes into it (`Success` and
+    /// `Failure`); with no class hierarchy to take a least upper bound with,
+    /// the merge would be `java/lang/Object` and the `areturn` that follows
+    /// would fail verification. The static type of the expression is an upper
+    /// bound of every branch, so the generator declares that instead.
+    local_class: BTreeMap<u16, String>,
 }
 
 impl Assembler {
@@ -85,14 +99,15 @@ impl Assembler {
             vlocals: vec![VType::Top; max_locals as usize],
             label_stack: Vec::new(),
             label_locals: Vec::new(),
+            label_join: Vec::new(),
             frames: BTreeMap::new(),
             dead: false,
             dead_start: None,
             need_frame: false,
             this_name: String::new(),
             is_init: false,
-            ret_object: None,
             try_locals: Vec::new(),
+            local_class: BTreeMap::new(),
         }
     }
 
@@ -127,15 +142,24 @@ impl Assembler {
             }
         }
         self.max_locals = self.max_locals.max(i as u16);
-        let ret = desc.split_once(')').map(|(_, r)| r).unwrap_or("V");
-        self.ret_object = match vtype_from_desc(ret) {
-            VType::Object(s) => Some(s),
-            _ => None,
-        };
+    }
+
+    /// Declare the class `slot` holds; see [`Assembler::local_class`].
+    pub fn set_local_class(&mut self, slot: u16, name: &str) {
+        if name.is_empty() || name == "java/lang/Object" {
+            return;
+        }
+        self.local_class.insert(slot, name.to_string());
     }
 
     fn set_local(&mut self, n: u16, t: VType) {
         let i = n as usize;
+        let t = match (self.local_class.get(&n), &t) {
+            // Every reference stored into a declared slot is recorded as the
+            // declared class, which by construction is a supertype of it.
+            (Some(c), VType::Object(_) | VType::Null) => VType::Object(c.clone()),
+            _ => t,
+        };
         if i >= self.vlocals.len() {
             self.vlocals.resize(i + 1, VType::Top);
         }
@@ -155,6 +179,21 @@ impl Assembler {
         let s = t.slots();
         self.vstack.push(t);
         self.bump(s);
+    }
+
+    /// Whether the value on top of the stack is a *reference*.
+    ///
+    /// A branch of a `try` may have boxed its result already (the typer's own
+    /// adaptation) or not, and the tree's type does not say which. The slot the
+    /// result is parked in has one sort, so the generator asks what is actually
+    /// there before deciding to box.
+    pub fn top_is_reference(&self) -> bool {
+        matches!(
+            self.vstack.last(),
+            Some(
+                VType::Object(_) | VType::Null | VType::UninitializedThis | VType::Uninitialized(_)
+            )
+        )
     }
 
     fn pop_v(&mut self) -> VType {
@@ -197,7 +236,19 @@ impl Assembler {
         self.labels.push(None);
         self.label_stack.push(None);
         self.label_locals.push(None);
+        self.label_join.push(None);
         Label(i)
+    }
+
+    /// Tell the merge at `l` what class the value on top of the stack has
+    /// there. `name` is an internal class name (or an array descriptor); it has
+    /// to be a supertype of everything the branches push, which is exactly what
+    /// the expression's static type is.
+    pub fn set_join_class(&mut self, l: Label, name: &str) {
+        if name.is_empty() || name == "java/lang/Object" {
+            return;
+        }
+        self.label_join[l.0] = Some(name.to_string());
     }
 
     pub fn mark(&mut self, l: Label) {
@@ -222,7 +273,7 @@ impl Assembler {
             // dropped at the next label (or at `finish`).
         } else {
             if let Some(st) = self.label_stack[l.0].clone() {
-                self.vstack = merge_stack(&self.vstack, &st, self.ret_object.as_deref());
+                self.vstack = merge_stack(&self.vstack, &st, self.label_join[l.0].as_deref());
                 self.stack = self.vstack.iter().map(|t| t.slots()).sum();
             }
             if let Some(loc) = self.label_locals[l.0].clone() {
@@ -348,7 +399,7 @@ impl Assembler {
         let stack = self.vstack.clone();
         let locals = self.vlocals.clone();
         self.label_stack[l.0] = Some(match self.label_stack[l.0].take() {
-            Some(old) => merge_stack(&old, &stack, self.ret_object.as_deref()),
+            Some(old) => merge_stack(&old, &stack, self.label_join[l.0].as_deref()),
             None => stack,
         });
         self.label_locals[l.0] = Some(match self.label_locals[l.0].take() {
@@ -1511,16 +1562,29 @@ fn merge_locals(a: &[VType], b: &[VType]) -> Vec<VType> {
     out
 }
 
-fn merge_stack(a: &[VType], b: &[VType], object_lub: Option<&str>) -> Vec<VType> {
+/// `top_lub` applies to the topmost slot only: that is the value the join is
+/// *about*. The slots under it were pushed before the branch and are the same
+/// on every path, so they never actually differ.
+///
+/// Everything else merges to `java/lang/Object`, which is always a valid frame
+/// type. This used to be the *method's return type* -- a guess that made an
+/// `areturn` after a `match` verify, and made everything else fail: a `String`
+/// and an `Integer` merged inside a method returning `Option` were declared
+/// `scala/Option`, and `Some(n match { case 1 => "one"; case _ => n })` was
+/// `VerifyError: Inconsistent stackmap frames`. `set_join_class` states the
+/// real type where one is known.
+fn merge_stack(a: &[VType], b: &[VType], top_lub: Option<&str>) -> Vec<VType> {
     if a.len() != b.len() {
         if a.len() < b.len() {
             return a.to_vec();
         }
         return b.to_vec();
     }
+    let top = a.len().saturating_sub(1);
     a.iter()
         .zip(b.iter())
-        .map(|(x, y)| merge_vtype(x, y, object_lub))
+        .enumerate()
+        .map(|(i, (x, y))| merge_vtype(x, y, if i == top { top_lub } else { None }))
         .collect()
 }
 

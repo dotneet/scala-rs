@@ -1779,6 +1779,12 @@ pub(crate) fn fn_n(params: Vec<Type>, ret: Type) -> Type {
     }
 }
 
+/// `class WithFilter[+A, +CC[_]]`, as 2.13 declares it.
+///
+/// `CC` is a type *constructor*: `map[B](f: A => B): CC[B]` is what makes
+/// `for (x <- xs if p) yield x.toString` a `List[String]`. Holding the
+/// filtered collection whole (`CC = List[A]`, `map: CC`) made every guarded
+/// comprehension keep the element type it started with.
 fn add_with_filter(st: &mut SymbolTable) -> SymbolId {
     let wf = class(
         st,
@@ -1789,25 +1795,43 @@ fn add_with_filter(st: &mut SymbolTable) -> SymbolId {
     );
     let a = type_param(st, wf, "A");
     let cc = type_param(st, wf, "CC");
+    let cc_x = type_param(st, cc, "X");
+    st.get_mut(cc).tparams = vec![cc_x];
     st.get_mut(wf).tparams = vec![a, cc];
     let ta = Type::TypeParam(a);
     let tcc = Type::TypeParam(cc);
-    method(
+    let applied = |arg: Type| Type::Applied {
+        ctor: Box::new(tcc.clone()),
+        args: vec![arg],
+    };
+    let m = method(
         st,
         wf,
         "map",
         vec![fn1(ta.clone(), Type::Any)],
-        tcc.clone(),
+        Type::Any,
         Intrinsic::None,
     );
-    method(
+    let b = type_param(st, m, "B");
+    st.get_mut(m).tparams = vec![b];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(b))]],
+        ret: Box::new(applied(Type::TypeParam(b))),
+    };
+    let fm = method(
         st,
         wf,
         "flatMap",
-        vec![fn1(ta.clone(), tcc.clone())],
-        tcc.clone(),
+        vec![fn1(ta.clone(), Type::Any)],
+        Type::Any,
         Intrinsic::None,
     );
+    let fb = type_param(st, fm, "B");
+    st.get_mut(fm).tparams = vec![fb];
+    st.get_mut(fm).ty = Type::Method {
+        paramss: vec![vec![fn1(ta.clone(), applied(Type::TypeParam(fb)))]],
+        ret: Box::new(applied(Type::TypeParam(fb))),
+    };
     method(
         st,
         wf,
@@ -1823,7 +1847,7 @@ fn add_with_filter(st: &mut SymbolTable) -> SymbolId {
         vec![fn1(ta, Type::Boolean)],
         Type::Class {
             sym: wf,
-            args: vec![Type::TypeParam(a), Type::TypeParam(cc)],
+            args: vec![Type::TypeParam(a), tcc],
         },
         Intrinsic::None,
     );
@@ -1845,22 +1869,44 @@ fn add_option_with_filter(st: &mut SymbolTable) -> SymbolId {
         sym: st.option_sym,
         args: vec![ta.clone()],
     };
-    method(
+    // `def map[B](f: A => B): Option[B]` -- the element type is what `f`
+    // returns, not what the filter was applied to.
+    let m = method(
         st,
         wf,
         "map",
         vec![fn1(ta.clone(), Type::Any)],
-        opt.clone(),
+        Type::Any,
         Intrinsic::None,
     );
-    method(
+    let mb = type_param(st, m, "B");
+    st.get_mut(m).tparams = vec![mb];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(mb))]],
+        ret: Box::new(Type::Class {
+            sym: st.option_sym,
+            args: vec![Type::TypeParam(mb)],
+        }),
+    };
+    let fm = method(
         st,
         wf,
         "flatMap",
         vec![fn1(ta.clone(), opt.clone())],
-        opt.clone(),
+        Type::Any,
         Intrinsic::None,
     );
+    let fb = type_param(st, fm, "B");
+    st.get_mut(fm).tparams = vec![fb];
+    let opt_b = Type::Class {
+        sym: st.option_sym,
+        args: vec![Type::TypeParam(fb)],
+    };
+    st.get_mut(fm).ty = Type::Method {
+        paramss: vec![vec![fn1(ta.clone(), opt_b.clone())]],
+        ret: Box::new(opt_b),
+    };
+    let _ = opt;
     method(
         st,
         wf,
@@ -3598,7 +3644,14 @@ fn add_list_members(
     let wf_ret = if library_abi {
         Type::Class {
             sym: with_filter,
-            args: vec![ta.clone(), list_t.clone()],
+            // `CC` is the *constructor* `List`, so `map[B]` gives `List[B]`.
+            args: vec![
+                ta.clone(),
+                Type::Class {
+                    sym: l,
+                    args: vec![],
+                },
+            ],
         }
     } else {
         list_t.clone()
@@ -5215,19 +5268,37 @@ fn add_try(st: &mut SymbolTable, throwable: SymbolId) {
     let sf = st.alloc("value", success, SymKind::Term, Flags::FINAL, "");
     st.get_mut(sf).ty = Type::TypeParam(sa);
     st.get_mut(success).ctor_fields = vec![sf];
+    // The field is private in the library; a pattern reads it through this.
+    method(
+        st,
+        success,
+        "value",
+        vec![],
+        Type::TypeParam(sa),
+        Intrinsic::None,
+    );
     let success_mod = module(st, st.scala_pkg, "Success", "scala/util/Success$");
     let success_cls = st.module_class_of(success_mod);
-    method(
+    // `def apply[T](value: T): Success[T]`. A raw `Success` conformed to
+    // nothing: `def a[R](…): Try[R] = Success(f)` reported
+    // `found: Success required: Try[R]`.
+    let sm = method(
         st,
         success_cls,
         "apply",
         vec![Type::Any],
-        Type::Class {
-            sym: success,
-            args: vec![],
-        },
+        Type::Any,
         Intrinsic::None,
     );
+    let smt = type_param(st, sm, "T");
+    st.get_mut(sm).tparams = vec![smt];
+    st.get_mut(sm).ty = Type::Method {
+        paramss: vec![vec![Type::TypeParam(smt)]],
+        ret: Box::new(Type::Class {
+            sym: success,
+            args: vec![Type::TypeParam(smt)],
+        }),
+    };
     let mems = st.get(success_cls).members.clone();
     st.get_mut(success_mod).members.extend(mems);
 
@@ -5235,25 +5306,45 @@ fn add_try(st: &mut SymbolTable, throwable: SymbolId) {
         sym: throwable,
         args: vec![],
     };
+    let throwable_ty2 = throwable_ty.clone();
     let failure = class(st, st.scala_pkg, "Failure", "scala/util/Failure", &[try_t]);
     let fa = type_param(st, failure, "T");
     st.get_mut(failure).tparams = vec![fa];
     let ff = st.alloc("exception", failure, SymKind::Term, Flags::FINAL, "");
     st.get_mut(ff).ty = throwable_ty.clone();
     st.get_mut(failure).ctor_fields = vec![ff];
+    // The field is private in the library; a pattern reads it through this.
+    method(
+        st,
+        failure,
+        "exception",
+        vec![],
+        throwable_ty.clone(),
+        Intrinsic::None,
+    );
     let failure_mod = module(st, st.scala_pkg, "Failure", "scala/util/Failure$");
     let failure_cls = st.module_class_of(failure_mod);
-    method(
+    // `def apply[T](exception: Throwable): Failure[T]`. `T` appears in no
+    // parameter, so only the expected type (or `Nothing`, which `Try`'s
+    // covariance makes harmless) can pin it -- but a *raw* `Failure` could not
+    // be pinned at all.
+    let fm = method(
         st,
         failure_cls,
         "apply",
         vec![throwable_ty],
-        Type::Class {
-            sym: failure,
-            args: vec![],
-        },
+        Type::Any,
         Intrinsic::None,
     );
+    let fmt = type_param(st, fm, "T");
+    st.get_mut(fm).tparams = vec![fmt];
+    st.get_mut(fm).ty = Type::Method {
+        paramss: vec![vec![throwable_ty2]],
+        ret: Box::new(Type::Class {
+            sym: failure,
+            args: vec![Type::TypeParam(fmt)],
+        }),
+    };
     let mems = st.get(failure_cls).members.clone();
     st.get_mut(failure_mod).members.extend(mems);
 }
