@@ -1,0 +1,41 @@
+0
+once-init
+6
+thrice-init
+24
+captures-init
+b5/41|b5/41
+deps-b
+25
+z
+by
+ch
+sh
+i
+l
+f
+d
+s
+xs
+true7q911121.52.5str12
+unit-init
+1
+loop-init 0
+loop-init 1
+loop-init 2
+60
+lambda-init 1
+lambda-init 2
+outer-init
+L1L1L2L2OOOO
+boom 1;boom 2;ok after 3;ok after 3;
+nested-init 1
+nested-init 2
+46
+inf-s
+inf-a
+v6v66
+gen
+xx
+gen
+77

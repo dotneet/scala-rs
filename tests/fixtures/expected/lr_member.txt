@@ -1,0 +1,11 @@
+box-doubled
+6
+6
+box-local
+14
+trait-label
+NN
+reg-tag
+trait-label
+RNN
+0

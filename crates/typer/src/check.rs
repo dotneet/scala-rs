@@ -153,6 +153,11 @@ pub struct Typer {
     /// work is not idempotent -- it synthesizes evidence parameters and
     /// default getters -- so the body pass must not redo it.
     sig_done: std::collections::HashSet<(usize, scala_rs_parser::NodeId)>,
+    /// Local `lazy val`s whose signature a block already built so that the
+    /// statements before them could name them (nsc allows a forward reference
+    /// to a `lazy val`, but not to an eager one). Their bodies still wait
+    /// their turn, and their signature must not be built a second time.
+    lazy_val_presig: std::collections::HashSet<(usize, scala_rs_parser::NodeId)>,
     /// Parent constructor calls whose omitted (implicit / defaulted) argument
     /// list has already been synthesized. `extends P` is walked by the header
     /// pass, the signature pass and the body pass; filling it more than once
@@ -450,6 +455,7 @@ impl Typer {
             pkg_nest: Vec::new(),
             sigs_only: false,
             sig_done: std::collections::HashSet::new(),
+            lazy_val_presig: std::collections::HashSet::new(),
             parent_fill_done: std::collections::HashSet::new(),
             new_is_applied: false,
             typing_call_args: false,
@@ -4377,7 +4383,13 @@ impl Typer {
     fn type_stat(&mut self, tree: &mut Tree) {
         match &tree.kind {
             TreeKind::ValDef { .. } => {
-                self.type_val_sig(tree);
+                // The enclosing block may already have built a `lazy val`'s
+                // signature so that earlier statements could name it.
+                if tree.id == scala_rs_parser::NodeId(0)
+                    || !self.lazy_val_presig.contains(&(self.file_index, tree.id))
+                {
+                    self.type_val_sig(tree);
+                }
                 self.type_val_body(tree);
             }
             TreeKind::DefDef { .. } => {
@@ -5370,6 +5382,22 @@ impl Typer {
                     if let TreeKind::DefDef { tpt, name, .. } = &s.kind {
                         if name != "<init>" && !tpt.is_empty() {
                             self.type_member_sig(s);
+                        }
+                    }
+                }
+                // A local `lazy val` is in scope for the whole block as well:
+                // `lazy val a: Int = b + 1; lazy val b: Int = 2` is legal (an
+                // eager `val` may not be forward-referenced). As above, only
+                // the signature is built here; the initialiser waits, and with
+                // it the point at which the `lazy val` is forced.
+                for s in stats.iter_mut() {
+                    if let TreeKind::ValDef { tpt, mods, .. } = &s.kind {
+                        if mods.flags.contains(Flags::LAZY)
+                            && !tpt.is_empty()
+                            && s.id != scala_rs_parser::NodeId(0)
+                            && self.lazy_val_presig.insert((self.file_index, s.id))
+                        {
+                            self.type_val_sig(s);
                         }
                     }
                 }
