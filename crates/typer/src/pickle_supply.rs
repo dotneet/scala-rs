@@ -100,6 +100,17 @@ pub struct PickleSupply {
     adopted: HashSet<u32>,
     /// Classes [`PickleSupply::supply_implicit_members`] has already served.
     implicits_supplied: HashSet<u32>,
+    /// What [`PickleSupply::complete_type_member`] answered for each
+    /// `(class, name)`, so a miss costs one pickle walk and a hit stays
+    /// stable. A memo of the *answer*, not just of having asked: a nullary
+    /// alias installs no symbol of its own, so re-deriving it is the only way
+    /// to answer twice, and "already tried" would make the second mention of
+    /// `c.Tree` in one signature fail.
+    ///
+    /// Separate from `tried`, which is the term namespace: a class can have
+    /// both a `type Expr` and a `val Expr`, and asking for one must not make
+    /// the other look already-answered.
+    tried_types: HashMap<(u32, String), Option<Type>>,
 }
 
 /// One `type T[...] = U` recovered from a package object's pickle.
@@ -448,6 +459,179 @@ impl PickleSupply {
             return Some(dotted);
         }
         None
+    }
+
+    /// Install the **type** member `name` of `class_sym`, read from the pickle
+    /// of whichever class in its linearisation declares it.
+    ///
+    /// [`PickleSupply::complete`] is the term namespace; this is the type one,
+    /// which the reflection API is written almost entirely in.
+    /// `scala.reflect.macros.blackbox.Context` inherits
+    ///
+    /// ```text
+    /// type Tree      = universe.Tree            // from scala.reflect.macros.Aliases
+    /// type Expr[T]   = universe.Expr[T]
+    /// type WeakTypeTag[T] = universe.WeakTypeTag[T]
+    /// ```
+    ///
+    /// and a macro implementation cannot state its own signature without them
+    /// (`docs/macros.md` §7.6). Abstract members (`type Tree >: Null <:
+    /// TreeApi`) go to [`PickleSupply::abstract_type_member`], which keeps
+    /// their bounds; aliases are installed with their right-hand side, so
+    /// `c.Expr[Int]` really is `scala.reflect.api.Exprs.Expr[Int]`.
+    ///
+    /// **The prefix is dropped.** `universe.Expr[T]` becomes the class
+    /// `Exprs.Expr[T]`, not that class *as seen from* this particular `c`, so
+    /// two macro implementations' `Expr`s are one type here and are two in
+    /// nsc. That is a loss of precision inside a macro implementation's own
+    /// body, never a difference in what is emitted: the erased signature the
+    /// backend writes is `scala/reflect/api/Exprs$Expr` either way, which is
+    /// exactly what `Context.prefix()` returns in the classfile.
+    ///
+    /// `None` when nothing declares it, or when the right-hand side cannot be
+    /// expressed -- an alias installed with no target would silently be an
+    /// opaque type that conforms to nothing.
+    pub fn complete_type_member(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        name: &str,
+    ) -> Option<Type> {
+        if class_sym.is_none() || name.is_empty() {
+            return None;
+        }
+        if let Some(id) = st
+            .lookup_member(class_sym, name)
+            .into_iter()
+            .find(|&s| st.get(s).kind == SymKind::TypeMember)
+        {
+            return Some(st.type_member_as_seen(id));
+        }
+        let key = (class_sym.0, name.to_string());
+        if let Some(memo) = self.tried_types.get(&key) {
+            return memo.clone();
+        }
+        let answer = self.complete_type_member_uncached(st, bin, class_sym, name);
+        self.tried_types.insert(key, answer.clone());
+        answer
+    }
+
+    fn complete_type_member_uncached(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        name: &str,
+    ) -> Option<Type> {
+        let sym = st.get(class_sym);
+        if !sym.is_class_like() {
+            return None;
+        }
+        let internal = sym.jvm_name.clone();
+        // Same gate as `complete_named`: these are the pickles the typer reads.
+        if !internal.starts_with("scala/")
+            && !self.adopted.contains(&class_sym.0)
+            && !self.implicits_supplied.contains(&class_sym.0)
+        {
+            return None;
+        }
+        let is_module = sym.kind == SymKind::ModuleClass;
+        let full = self
+            .pickled_full_name(bin, &internal, is_module)
+            .unwrap_or_else(|| internal.trim_end_matches('$').replace('/', "."));
+        let (hits, _errs) = {
+            let mut src = BinSource(bin);
+            self.sigs.lookup(&mut src, &full, is_module, name)
+        };
+        let hit = hits.into_iter().find(|h| {
+            matches!(
+                h.member.kind,
+                MemberKind::TypeAlias | MemberKind::AbstractType
+            ) && h.member.is_public_api()
+        })?;
+        if hit.member.kind == MemberKind::AbstractType {
+            let qualified = format!("{}.{name}", hit.owner);
+            return self.abstract_type_member(st, bin, &qualified, 0);
+        }
+        self.install_type_alias(st, bin, &hit.owner, name, &hit.member.ty)
+    }
+
+    /// `type T[tps] = U` from a pickle, as the type it stands for.
+    ///
+    /// An alias is *transparent*: a nullary one is simply its right-hand side,
+    /// with no symbol of its own. That matters here — `type Tree =
+    /// universe.Tree` names an abstract type member, and giving the alias a
+    /// `TypeMember` symbol of its own would make `c.Tree` an opaque type that
+    /// conforms to nothing rather than the `Trees.Tree` it is.
+    ///
+    /// A *parameterised* alias does need a symbol, to carry the parameters
+    /// `expand_applied_hk_alias` substitutes at each use.
+    fn install_type_alias(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        owner_name: &str,
+        name: &str,
+        ty: &SigType,
+    ) -> Option<Type> {
+        let owner = self.ensure_class(st, bin, owner_name, false)?;
+        if let Some(id) = st
+            .lookup_member(owner, name)
+            .into_iter()
+            .find(|&s| st.get(s).kind == SymKind::TypeMember)
+        {
+            return Some(st.type_member_as_seen(id));
+        }
+        let (tps, rhs) = match ty {
+            SigType::Poly { tparams, result } => (tparams.clone(), (**result).clone()),
+            other => (Vec::new(), other.clone()),
+        };
+        if tps.is_empty() {
+            let outer = self.self_ty.replace(Type::Class {
+                sym: owner,
+                args: Vec::new(),
+            });
+            let conv = self.conv_at(st, bin, &HashMap::new(), &rhs, 0);
+            self.self_ty = outer;
+            if conv.is_none() {
+                trace(format_args!(
+                    "{owner_name}#{name}: type alias right-hand side {rhs:?} does not convert"
+                ));
+            }
+            return conv;
+        }
+        // Owned but not yet a member: a right-hand side that will not convert
+        // must leave the owner exactly as it was.
+        let id = st.alloc(name, owner, SymKind::TypeMember, Flags::EMPTY, "");
+        let mut scope: HashMap<String, Type> = HashMap::new();
+        let mut tparams = Vec::new();
+        for tp in &tps {
+            let t = st.alloc(&tp.name, id, SymKind::TypeParam, Flags::EMPTY, "");
+            st.get_mut(t).ty = Type::TypeParam(t);
+            set_tparam_arity(st, t, tparam_arity(tp));
+            scope.insert(tp.name.clone(), Type::TypeParam(t));
+            tparams.push(t);
+        }
+        st.get_mut(id).tparams = tparams;
+        // The right-hand side is written in the *declaring* class's
+        // vocabulary, the same way an abstract member's bound is.
+        let outer = self.self_ty.replace(Type::Class {
+            sym: owner,
+            args: Vec::new(),
+        });
+        let conv = self.conv_at(st, bin, &scope, &rhs, 0);
+        self.self_ty = outer;
+        let Some(target) = conv else {
+            trace(format_args!(
+                "{owner_name}#{name}: type alias right-hand side {rhs:?} does not convert"
+            ));
+            return None;
+        };
+        st.get_mut(id).ty = target;
+        st.get_mut(owner).members.push(id);
+        trace(format_args!("type alias {owner_name}.{name}"));
+        Some(Type::TypeMember(id))
     }
 
     fn complete_on(
@@ -826,6 +1010,34 @@ impl PickleSupply {
             took_function.push(arity);
         }
         Some(m)
+    }
+
+    /// [`PickleSupply::attach_parents`] for a class nobody has asked a member
+    /// of, working out its pickle name itself.
+    ///
+    /// Completing any member attaches the parents on the way
+    /// (`complete_named`), so a class the typer has already *used* has them.
+    /// One the typer has only *named* does not, and `import <a value>._` is
+    /// exactly that case: what the wildcard offers is almost all inherited,
+    /// and deciding what the value even is (`Check::is_reflect_universe`: does
+    /// this extend `scala.reflect.api.Universe`?) reads the same parent list.
+    pub fn ensure_parents(&mut self, st: &mut SymbolTable, bin: &mut BinaryIndex, cls: SymbolId) {
+        if cls.is_none() || self.parented.contains(&cls.0) {
+            return;
+        }
+        let sym = st.get(cls);
+        if !sym.is_class_like() {
+            return;
+        }
+        let internal = sym.jvm_name.clone();
+        if !internal.starts_with("scala/") && !self.adopted.contains(&cls.0) {
+            return;
+        }
+        let is_module = sym.kind == SymKind::ModuleClass;
+        let Some(full) = self.pickled_full_name(bin, &internal, is_module) else {
+            return;
+        };
+        self.attach_parents(st, bin, cls, &full, is_module);
     }
 
     /// Give a class the parents its own pickle declares, if it does not have

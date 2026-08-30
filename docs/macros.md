@@ -631,14 +631,7 @@ scala-rs が型検査できなければ意味がない。フェーズ 3 の下�
 **B. reification 本体。一部済（`agent/reify2`）。** §7.4 の 2。実装した部分集合と、
 まだ落とせない形は §7.4 に列挙してある。
 
-**C. `c.Expr[T]` などのパス依存型。** `blackbox.Context` の
-`type Expr[T] = universe.Expr[T]`（`scala.reflect.macros.Aliases`）が解決できないと
-マクロ実装のシグネチャ自体が型検査できない。現状 `crates/typer/src/prelude_reflect.rs`
-は**空の `Context`** を入れており、classpath 上の本物より優先されてしまう。
-7.2 の 1〜3 が入った今、**空の prelude をやめて scala-reflect.jar の本物を読む**方が
-筋が良い（prelude を外して試すと `Expr` が `Exprs$Expr$` として解決するところまでは
-確認済み）。ただし `--scala-library` だけでは scala-reflect.jar は classpath に無いので、
-無いときは診断を出して落とすこと。
+**C. `c.Expr[T]` などのパス依存型。済（`agent/quasi`）。** §7.6。
 
 **D. engine（フェーズ 2）。** A〜C が済んでも、slick の `mapToImpl` を*呼ぶ*には
 §2.3 の JVM ブリッジが要る。こちらは prototype で検証済みで、順序としては最後でよい。
@@ -733,6 +726,68 @@ reflect 専用ではない一般の欠落である。
    `Symbol`、`WeakTypeTag`）、nsc は implicit `Liftable` で持ち上げる。
    `mapToImpl` は `$rTag` / `$rCT` / `${c.prefix}` でこれを使う。
    現状は `Tree` でない穴が型エラーになる（黙って通しはしない）。
-5. **§7.3 の C（`c.Expr[T]` などパス依存型）と D（engine）。** マクロ実装の
-   *中で* quasiquote を書くには C が要る。`import c.universe._` が通らないと
-   universe が見つからないので、`reify.rs` はそこでも診断のまま落ちる。
+5. **§7.3 の C（`c.Expr[T]` などパス依存型）と D（engine）。** C は §7.6 で
+   済んだ。D（engine）が残っている。
+
+### 7.6 マクロ実装のシグネチャと `import c.universe._`（`agent/quasi` スライス）
+
+§7.3 の C。**scala-reflect.jar が classpath にあれば、マクロ実装のソースが
+コンパイルできるようになった。** 中身は「パス依存型」というより、
+**jar のクラスの遅延ロードが型名前空間とワイルドカード import に届いていなかった**
+という一般の欠落だった。
+
+| 直したもの | どこ |
+| --- | --- |
+| **`import <値>._` が継承メンバに届かない。** jar のクラスのメンバは名前ごとに pickle から遅延ロードされる。`import scala.reflect.runtime.universe._` が名乗る `JavaUniverse` は `TermName` / `Literal` / `Constant` / `termNames` を**すべて linearization の上の方**（`api.Names` / `Trees` / `Constants` / `StandardNames`）から継承していて、誰もそれを要求していないので import は**何も**持ち込んでいなかった。パス経由（`u.TermName`）は完了処理を通るので動いていた。reify した quasiquote は `u.TermName(...)` を明示的に組むので、この穴に気づかなかった | `Check::expose_unqualified` → `supply_from_pickle_class` |
+| **型名前空間。** reflect API は同じ名前を両方の名前空間に置く（`val TermName` と `type TermName`）。値を先に解決すると term が scope に入り、`expose_unqualified` が「もう束縛済み」と見て止まるので、`val n: TermName = TermName("f")` は右辺だけ通って左辺が `not found` だった | `Check::expose_unqualified_type` |
+| **jar のクラスの型メンバがそもそも読めない。** `def` の完了しか無かった。`blackbox.Context` は `scala.reflect.macros.Aliases` から `type Tree = universe.Tree` / `type Expr[T] = universe.Expr[T]` / `type WeakTypeTag[T] = …` を継承していて、これが無いとマクロ実装は**自分のシグネチャを書けない** | `PickleSupply::complete_type_member` / `install_type_alias` |
+| **refinement 越しの型メンバ。** slick の `mapToImpl` の `c` は `blackbox.Context { type PrefixType = ShapedValue[?, U] }` という**精製型**で、そこから `c.Expr[…]` / `c.Tree` を引く | `Check::project_from_prefix` の `Type::Refined` 枝 |
+| **`import <値>._` の親が未ロード。** `universe_in_scope` は「この prefix は `scala.reflect.api.Universe` を継承しているか」で universe を見分けるが、その親リストは pickle にしか無く、まだ誰も読んでいなかった。だから `import c.universe._` を書いた本体の `q"…"` は全部「cannot expand」になっていた | `PickleSupply::ensure_parents` |
+| **term import prefix のスコープ。** `import u._` の `u` はそのメソッドのローカルで、次のメソッドには無い。それでも prefix として使われ、**別メソッドのローカルに対する `getfield`** を吐いていた（`NoClassDefFoundError`）。しかも同じ owner の外側の import を追い出していたので、内側を抜けた後は receiver 無しになっていた | `Check::prefix_in_scope`、`remember_term_import_prefix` は置換をやめて追加に |
+| **空の `Context` prelude をやめた。** scala-reflect.jar が classpath にあるときだけ本物を読む。無いときは今までどおり空の `Context` を入れ、`value universe is not a member of Context` と**きちんと言う**（`--scala-library` は scala-reflect.jar を含まない） | `prelude_reflect::want_context_stub` |
+
+検証（`crates/cli/tests/quasi.rs`）:
+
+- `tests/fixtures/qq_universe.scala` — 実行して実 scalac 2.13.16 と**出力が完全一致**。
+  `showRaw` まで一致するので、**同じ木**を作っている。`java -Xverify:all`。
+- `tests/fixtures/qq_ctx.scala` — マクロ実装そのもの。scala-rs と実 scalac の
+  **両方**がコンパイルでき、吐いた classfile は JVM にロード・検証される。
+  展開には engine（D）が要るので実行はしない。
+- `tests/fixtures/qq_ctx_bad.scala` — reify できない形（型注釈・ブロック・`tq`）は
+  必ず**その形を名指しして**診断する。`Tree` でない穴も型エラーになる。
+- scala-reflect.jar 無しでは空の `Context` の診断が出ることも固定してある。
+
+**slick への効き方（重要）。** `tests/slick_measure.sh` が使う `deps.cp` には
+**scala-reflect.jar が入っていない**。slick 本体はこれに依存している
+（`build.sbt` の `scala-reflect`）ので、無ければ実 scalac でも
+`ShapedValue.scala` / `TableQuery.scala` はコンパイルできない。数字は:
+
+| classpath | errors | ShapedValue | TableQuery |
+| --- | --- | --- | --- |
+| 既定（scala-reflect 無し） | 327 → **320** | 29 → 29 | 23 → 23 |
+| `-cp scala-reflect.jar` を足す | 322 → **294** | 26 → **17** | 21 → **9** |
+
+（前後とも分岐元 `6c6fc7f` で実測。jar を足すだけで 327 → 322 になるのは、
+`Context` 以外の `scala.reflect.*` の名前がいくつか解決するため。）
+
+既定の classpath を勝手に変えると他のエージェントの基準値まで動くので、
+`deps.cp` は触っていない。**quasiquote の 12 件を減らすには、まず計測の
+classpath に scala-reflect.jar を足す必要がある。**
+
+そのうえで残っているもの:
+
+1. **reification の残りの形。** scala-reflect.jar を足した `ShapedValue.scala` の
+   残り 17 件のうち **11 件**がこれで、内訳は `Typed`（型注釈、8 件）、
+   `SyntacticBlock`（1 件）、`tq`（1 件）、`pq`（1 件）。§7.5 の 1・2 そのもの。
+   どれも「展開できない」ではなく**どの形が足りないか**を名指しする診断になった。
+2. **`Ident(TermName("x"))` / `New(TypeTree(…))` のオーバーロード。**
+   `val Ident: IdentExtractor` と `def Ident(name: String): Ident` の
+   オーバーロード集合に対して `apply` 挿入が働かない。`TableQuery` の 2 件。
+3. **`symbolOf[T]` / `typeOf[T]`。** 型パラメータが implicit 節にしか現れない
+   メンバは `pin_undetermined_tparams` が明示的に断っている（一般の制限）。
+4. **wildcard import の遮蔽。** `import c.universe._` は暗黙の `import scala._` を
+   遮蔽するはずだが、`Symbol` は `scala.Symbol` に解決されたままになる。
+5. **我々の pickle を scalac が読めない。** scala-rs がコンパイルしたマクロ実装を
+   実 scalac から `macro` で参照すると `macro implementation has incompatible
+   shape: found (c: Context, x: Tree): Tree` になる。パラメータ節がひとつに
+   潰れており、パス依存型も残っていない。§5 のフェーズ 2 の作業。

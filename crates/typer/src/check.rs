@@ -426,7 +426,11 @@ pub fn typecheck_units(
 impl Typer {
     pub fn new(file_index: usize, opts: &TypecheckOptions) -> Self {
         let mut st = SymbolTable::new();
-        install_prelude(&mut st, opts.library_abi);
+        install_prelude(
+            &mut st,
+            opts.library_abi,
+            crate::prelude_reflect::want_context_stub(&opts.classpath),
+        );
         st.prelude_end = st.symbols.len() as u32;
         let lazy_base_scopes = st.scopes.len();
         Typer {
@@ -4482,8 +4486,49 @@ impl Typer {
         if owner.is_none() || qual.ty.is_no_type() || qual.ty.is_error() {
             return;
         }
-        self.term_import_prefixes.retain(|(o, _)| *o != owner);
+        // What this import offers, and what the value *is*, both live in the
+        // pickled parent list, which nothing has read yet for a class the
+        // typer has only named. `import c.universe._` is the case that shows
+        // it: `scala.reflect.macros.Universe` extends
+        // `scala.reflect.api.Universe`, and until that parent is attached
+        // `universe_in_scope` does not recognise the prefix as a universe at
+        // all, so every `q"..."` in the body reported "cannot expand".
+        if self.library_abi {
+            self.pickle
+                .ensure_parents(&mut self.st, &mut self.binary, owner);
+        }
+        // Kept, not replaced. Two imports can name the same class through
+        // different values -- a file-level `import scala.reflect.runtime
+        // .universe._` and a method-local `import u._` -- and dropping the
+        // outer one when the inner is recorded left the *outer* references
+        // with no receiver at all once the method ended. Which one applies is
+        // decided at each use by `prefix_in_scope`.
+        self.term_import_prefixes
+            .retain(|(o, q)| !(*o == owner && path_display(q) == path_display(qual)));
         self.term_import_prefixes.push((owner, qual.clone()));
+    }
+
+    /// Whether an `import <a value>._` prefix can still be written here.
+    ///
+    /// The prefixes are remembered for the whole run, but `import u._` inside
+    /// one method says nothing about the next one: `u` is a local there and
+    /// gone here. Qualifying with it anyway emitted `getfield` for another
+    /// method's local -- a `NoClassDefFoundError` at the first use, from a
+    /// program that typechecked.
+    ///
+    /// The test is the one that matters for the rewrite: does the root of the
+    /// path still resolve, here, to the same symbol it did at the import?
+    fn prefix_in_scope(&self, qual: &Tree) -> bool {
+        let mut t = qual;
+        loop {
+            match &t.kind {
+                TreeKind::Select { qual, .. } => t = qual,
+                TreeKind::Ident { .. } if t.sym.is_none() => return true,
+                TreeKind::Ident { name } => return self.st.lookup(name).contains(&t.sym),
+                // `this.u`, `C.this.u`: reachable wherever the class is.
+                _ => return true,
+            }
+        }
     }
 
     /// Turn an unqualified `Literal` that came from `import u._` back into
@@ -4512,10 +4557,11 @@ impl Typer {
         {
             return false;
         }
-        let Some((_, prefix)) = self.term_import_prefixes.iter().rev().find(|(o, _)| {
+        let Some((_, prefix)) = self.term_import_prefixes.iter().rev().find(|(o, q)| {
             owners
                 .iter()
                 .any(|&m| m == *o || crate::pickle_supply::inherits_from(&self.st, *o, m))
+                && self.prefix_in_scope(q)
         }) else {
             return false;
         };
@@ -5008,7 +5054,9 @@ impl Typer {
         self.term_import_prefixes
             .iter()
             .rev()
-            .find(|(owner, _)| self.is_reflect_universe(*owner))
+            .find(|(owner, prefix)| {
+                self.is_reflect_universe(*owner) && self.prefix_in_scope(prefix)
+            })
             .map(|(_, prefix)| prefix.clone())
     }
 
@@ -5741,6 +5789,33 @@ impl Typer {
             .find(|&s| self.st.get(s).kind == SymKind::Package)
     }
 
+    /// [`Self::expose_unqualified`] for a name used in *type* position.
+    ///
+    /// The two namespaces are separate, and the reflection API puts the same
+    /// name in both: `import c.universe._` offers a `val TermName` **and** a
+    /// `type TermName`. Resolving the value first entered a term under that
+    /// name, and `expose_unqualified` then saw the name as already bound and
+    /// stopped -- so `val n: TermName = TermName("f")` had a right-hand side
+    /// and no left-hand type.
+    ///
+    /// Only the wildcard-import stage is repeated here. The earlier stages
+    /// (the enclosing packages, `scala._`, `java.lang._`) offer both
+    /// namespaces at once, so a name they answered is already right.
+    fn expose_unqualified_type(&mut self, name: &str) {
+        if name.is_empty() || !self.library_abi || !self.st.lookup_type(name).is_empty() {
+            return;
+        }
+        for owner in self.st.wildcard_owners_for(name) {
+            if let Some(Type::TypeMember(id)) =
+                self.pickle
+                    .complete_type_member(&mut self.st, &mut self.binary, owner, name)
+            {
+                self.st.enter_in_current(name, id);
+                return;
+            }
+        }
+    }
+
     fn expose_unqualified(&mut self, name: &str, span: Span) {
         if name.is_empty() || !self.st.lookup(name).is_empty() {
             return;
@@ -5802,7 +5877,39 @@ impl Typer {
             // at a time, so the name is only reachable now.
             for owner in self.st.wildcard_owners_for(name) {
                 self.complete_binary_member(owner, name, span);
-                let found = self.st.lookup_member(owner, name);
+                let mut found = self.st.lookup_member(owner, name);
+                if found.is_empty() {
+                    // `import <a value>._` where the value's class comes from a
+                    // jar. The members of such a class are read from its pickle
+                    // *on demand*, one name at a time, and the ones this import
+                    // offers are mostly inherited: `import
+                    // scala.reflect.runtime.universe._` names a `JavaUniverse`,
+                    // but `TermName` / `Literal` / `Constant` are declared on
+                    // `scala.reflect.api.Names` / `Trees` / `Constants` far up
+                    // its linearisation, so nothing had read them yet and the
+                    // import brought in nothing at all. Selecting the same
+                    // member through the path (`u.TermName`) always worked --
+                    // that route runs the completion below -- which is why
+                    // reified quasiquotes, which build `u.TermName(...)`
+                    // explicitly, did not notice.
+                    found = self.supply_from_pickle_class(owner, name);
+                }
+                if found.is_empty() && self.library_abi {
+                    // The type namespace, which the reflection API is written
+                    // in: `import c.universe._` is what puts `Tree`, `Symbol`
+                    // and `TermName` in scope as *types*, and they are
+                    // abstract type members of `scala.reflect.api.Trees` /
+                    // `Symbols` / `Names`. Completing one installs a symbol on
+                    // its declaring trait, which `lookup_member` then reaches.
+                    if let Some(Type::TypeMember(id)) = self.pickle.complete_type_member(
+                        &mut self.st,
+                        &mut self.binary,
+                        owner,
+                        name,
+                    ) {
+                        found = vec![id];
+                    }
+                }
                 if found.is_empty() {
                     continue;
                 }
@@ -14504,6 +14611,7 @@ impl Typer {
             TreeKind::Ident { name } if name == "_" => Type::Wildcard,
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, tpt.span);
+                self.expose_unqualified_type(name);
                 let name = name.clone();
                 self.resolve_type_name_completing(&name, &[], tpt.span)
             }
@@ -14870,9 +14978,27 @@ impl Typer {
         // `o#arg[…]`: the prefix may be an alias whose right-hand side lives in
         // a unit that has not been walked yet. Resolve it before projecting.
         let prefix = &self.complete_prefix_aliases(span, prefix);
-        if let Type::Refined { .. } = prefix {
+        if let Type::Refined { parents, .. } = prefix {
             if let Some(t) = self.st.lookup_type_member_on(prefix, name) {
                 return t;
+            }
+            // A refined jar class: the refinement declares one member and the
+            // rest come from the parent, whose *type* members are still
+            // unread. slick's `mapToImpl` is written exactly this way --
+            // `c: blackbox.Context { type PrefixType = ShapedValue[_, U] }`,
+            // and then `c.Expr[...]` / `c.Tree` for its own signature.
+            if self.library_abi {
+                for p in parents.clone() {
+                    let Some(cls) = self.st.class_sym_of(&p) else {
+                        continue;
+                    };
+                    if let Some(ty) =
+                        self.pickle
+                            .complete_type_member(&mut self.st, &mut self.binary, cls, name)
+                    {
+                        return self.st.expand_in_type(prefix, &ty);
+                    }
+                }
             }
             self.error(
                 span,
@@ -14932,6 +15058,19 @@ impl Typer {
                 _ => continue,
             };
             return self.st.expand_in_type(prefix, &ty);
+        }
+        // Nothing under that name yet. A class read from a jar has its members
+        // completed one at a time, and its *type* members were never completed
+        // at all: `c.Expr[T]` / `c.Tree` on a macro `Context` name aliases
+        // declared far up `scala.reflect.macros.Aliases`, which no `def`
+        // completion ever reaches. See `docs/macros.md` §7.6.
+        if self.library_abi {
+            if let Some(ty) =
+                self.pickle
+                    .complete_type_member(&mut self.st, &mut self.binary, cls, name)
+            {
+                return self.st.expand_in_type(prefix, &ty);
+            }
         }
         self.error(
             span,
@@ -16083,6 +16222,19 @@ impl Typer {
         ));
         // Members found on a companion object land on that module class, not
         // on `cls`, so take what completion reports rather than re-looking-up.
+        self.pickle
+            .complete(&mut self.st, &mut self.binary, cls, name)
+    }
+
+    /// [`Self::supply_from_pickle`] for a class symbol that is already known.
+    ///
+    /// The receiver-typed form reaches this through `class_sym_of`; a wildcard
+    /// import (`import <a value>._`) has the class in hand and no receiver type
+    /// to hand back.
+    pub(crate) fn supply_from_pickle_class(&mut self, cls: SymbolId, name: &str) -> Vec<SymbolId> {
+        if !self.library_abi || cls.is_none() {
+            return Vec::new();
+        }
         self.pickle
             .complete(&mut self.st, &mut self.binary, cls, name)
     }

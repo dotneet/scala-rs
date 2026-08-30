@@ -4,8 +4,8 @@
 //!
 //! Quasiquotes are **not** ordinary library macros: `scala-reflect.jar` holds
 //! no implementation for them, so nsc short-circuits to a compiler-internal
-//! one and scala-rs has to reify them itself. That is not implemented, and
-//! these tests pin down the two things that are:
+//! one and scala-rs has to reify them itself. A subset is reified
+//! (`crates/typer/src/reify.rs`); what these tests pin down is:
 //!
 //! 1. every quasiquote is diagnosed at its own span, distinguishing "this body
 //!    uses syntax scala-rs cannot parse" from "the body is fine, the
@@ -14,7 +14,12 @@
 //! 2. the pieces of the reflection API reached on the way there work, verified
 //!    by a dual run against the real scalac: package-object members, `import
 //!    <a value>._`, and applying a parameterless `def` whose result has an
-//!    `apply` (`def Literal: LiteralExtractor`, then `Literal(...)`).
+//!    `apply` (`def Literal: LiteralExtractor`, then `Literal(...)`);
+//! 3. with scala-reflect.jar on the classpath, `import <a universe>._` reaches
+//!    the names it offers, and a macro *implementation* -- `c.Tree`,
+//!    `c.Expr[T]`, `c.WeakTypeTag[T]`, `import c.universe._`, quasiquotes in
+//!    its body -- compiles, to a class file that loads and verifies. Without
+//!    that jar the placeholder `Context` stays and says what is missing.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -258,4 +263,285 @@ fn quasiquote_is_not_reported_as_a_stringcontext_member() {
         );
     }
     let _ = fs::remove_dir_all(&out);
+}
+
+// --- the reflect universe and macro `Context`, read from scala-reflect.jar --
+//
+// `docs/macros.md` §7.6. Everything below needs scala-reflect.jar: the macro
+// API lives there, and `--scala-library` alone does not put it on the
+// classpath. Without it scala-rs installs the placeholder `Context` of
+// `crates/typer/src/prelude_reflect.rs` and says so; the last test pins that.
+
+fn scala_reflect_jar() -> Option<PathBuf> {
+    let cached = PathBuf::from("/tmp/scala-2.13.16/lib/scala-reflect.jar");
+    cached.is_file().then_some(cached)
+}
+
+/// Compile `<name>.scala` against scala-reflect.jar.
+fn compile_reflect(name: &str, out: &Path, jar: &Path, reflect: &Path) -> std::process::Output {
+    Command::new(bin())
+        .args([
+            "compile",
+            fixtures_dir()
+                .join(format!("{name}.scala"))
+                .to_str()
+                .unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "-cp",
+            reflect.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs compile")
+}
+
+/// `tests/fixtures/qq_universe.scala`, run.
+///
+/// `import <a reflect universe>._` used to bring in nothing at all: the
+/// universe's names are declared far up its linearisation (`TermName` on
+/// `scala.reflect.api.Names`, `Literal` on `Trees`, `termNames` on
+/// `StandardNames`), and a jar class's members are read one at a time, so no
+/// completion had ever run for them. Reified quasiquotes did not notice,
+/// because they build `u.TermName(...)` through the path.
+///
+/// It also pins the scope of the prefix such an import is qualified with: the
+/// method-local `import u._` must not qualify anything after that method,
+/// which used to emit a `getfield` for a dead local.
+#[test]
+fn qq_universe_wildcard_import_reaches_inherited_members() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip qq_universe: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("qq_universe");
+    let output = compile_reflect("qq_universe", &out, &jar, &reflect);
+    assert!(
+        output.status.success(),
+        "compile qq_universe failed: {}",
+        diagnostics(&output)
+    );
+    let cp = format!("{}:{}:{}", out.display(), reflect.display(), jar.display());
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        run.status.success(),
+        "java -Xverify:all Main failed for qq_universe: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        expected_stdout("qq_universe"),
+        "stdout mismatch for qq_universe"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// The same fixture through real scalac 2.13.16: the trees have to be the same
+/// trees, or the recorded expectation only records what we happen to build.
+#[test]
+fn qq_universe_matches_real_scalac() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(reflect), Some(scalac)) =
+        (scala_library_jar(), scala_reflect_jar(), find_scalac())
+    else {
+        eprintln!("skip qq_universe scalac diff: scalac / jars not obtainable");
+        return;
+    };
+    let ref_out = tmp_dir("qq_universe-scalac");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            ref_out.to_str().unwrap(),
+            fixtures_dir().join("qq_universe.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected qq_universe.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        ref_out.display(),
+        reflect.display(),
+        jar.display()
+    );
+    let reference = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java (real scalac build)");
+    assert!(
+        reference.status.success(),
+        "java Main (real-scalac build) failed: {}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&reference.stdout),
+        expected_stdout("qq_universe"),
+        "recorded expectation for qq_universe does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&ref_out);
+}
+
+/// `tests/fixtures/qq_ctx.scala`: a macro *implementation* compiles.
+///
+/// `c.Tree` / `c.Expr[T]` / `c.WeakTypeTag[T]` are type aliases the macro
+/// `Context` inherits from `scala.reflect.macros.Aliases`, and a jar class's
+/// type members had no completion path at all -- so a macro implementation
+/// could not even state its own signature, and `import c.universe._` put no
+/// universe in scope for the quasiquotes in its body. Real scalac 2.13.16
+/// compiles the same file, so the fixture is known-good Scala rather than
+/// something we happen to accept, and the class file we emit has to load and
+/// verify.
+#[test]
+fn qq_ctx_macro_implementation_compiles() {
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip qq_ctx: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("qq_ctx");
+    let output = compile_reflect("qq_ctx", &out, &jar, &reflect);
+    assert!(
+        output.status.success(),
+        "compile qq_ctx failed: {}",
+        diagnostics(&output)
+    );
+
+    if java_available() {
+        // Loading a class links and verifies it, which is the check available
+        // here: expanding these needs the JVM bridge, which is not built
+        // (`docs/macros.md` §2.2). The trees their bodies build are checked
+        // against scalac's in `qq_universe.scala`.
+        let loader = out.join("loader");
+        fs::create_dir_all(&loader).unwrap();
+        let src = out.join("Loader.scala");
+        fs::write(
+            &src,
+            "object Main {\n  \
+             def main(args: Array[String]): Unit = println(Class.forName(\"QqCtx$\").getName)\n\
+             }\n",
+        )
+        .unwrap();
+        let built = Command::new(bin())
+            .args([
+                "compile",
+                src.to_str().unwrap(),
+                "-d",
+                loader.to_str().unwrap(),
+                "--scala-library",
+                jar.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run scala-rs compile");
+        assert!(
+            built.status.success(),
+            "compiling the loader failed: {}",
+            diagnostics(&built)
+        );
+        let cp = format!(
+            "{}:{}:{}:{}",
+            loader.display(),
+            out.display(),
+            reflect.display(),
+            jar.display()
+        );
+        let run = Command::new("java")
+            .args(["-Xverify:all", "-cp", &cp, "Main"])
+            .output()
+            .expect("java");
+        assert!(
+            run.status.success(),
+            "the macro implementation's class file does not verify: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "QqCtx$\n");
+    }
+
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip the scalac half of qq_ctx: scalac 2.13 not obtainable");
+        let _ = fs::remove_dir_all(&out);
+        return;
+    };
+    let ref_out = tmp_dir("qq_ctx-scalac");
+    let built = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            ref_out.to_str().unwrap(),
+            fixtures_dir().join("qq_ctx.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        built.status.success(),
+        "real scalac rejected qq_ctx.scala: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let _ = fs::remove_dir_all(&ref_out);
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// Every form a macro implementation's quasiquote cannot be reified into is
+/// reported, naming the form.
+///
+/// This is the failure that would matter: reifying `q"$x : Int"` as `$x`
+/// would compile, and expand to a tree nobody wrote.
+#[test]
+fn qq_ctx_bad_names_every_form_it_cannot_build() {
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip qq_ctx_bad: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("qq_ctx_bad");
+    let output = compile_reflect("qq_ctx_bad", &out, &jar, &reflect);
+    assert!(!output.status.success(), "expected qq_ctx_bad to fail");
+    let err = diagnostics(&output);
+    for needle in [
+        "a type ascription is not reified yet",
+        "a block is not reified yet",
+        "tq\"...\" is not reified yet",
+    ] {
+        assert!(
+            err.contains(needle),
+            "expected {needle:?} in diagnostics, got {err}"
+        );
+    }
+    // A hole that is not a `Tree` (nsc lifts it with an implicit `Liftable`)
+    // is a type error, never a silently different tree.
+    assert!(
+        err.contains("SyntacticApplied"),
+        "an unliftable hole must still be an error: {err}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// Without scala-reflect.jar the placeholder `Context` stays, and says so.
+///
+/// The macro API is not in scala-library.jar, so `--scala-library` on its own
+/// cannot type a macro implementation. The honest answer is `value universe is
+/// not a member of Context`, not a `Context` that quietly has everything.
+#[test]
+fn qq_ctx_without_scala_reflect_is_diagnosed() {
+    compile_fails_lib_all(
+        "qq_ctx",
+        &[
+            "value universe is not a member of Context",
+            "type Tree is not a member of Context",
+            "type Expr is not a member of Context",
+            "type WeakTypeTag is not a member of Context",
+        ],
+    );
 }
