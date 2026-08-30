@@ -755,6 +755,11 @@ interface 型（自分型 `self: P =>` があり、それが外側 trait の派�
 trait のメンバークラスを継承したクラス／オブジェクトは、親の `<init>` にも `$outer` を
 渡します。
 
+**メソッド本体の中の宣言**（ローカル `trait` / `class` / `object`）も、テンプレートの中
+の宣言と同じだけのものを出します。binary name は nsc と同じく索引つき
+（`Main$Same$1` / `Main$Same$2`）で、ローカル trait の捕捉はアクセサ経由です。
+詳しくは「メソッド本体の中の宣言（ローカル trait / class / object）」の節を参照。
+
 ### lazy val
 
 フィールドに加えて `bitmap$0: Int` と、同期したアクセサを出します。初期化は最初の読み取りまで遅延します。
@@ -2824,6 +2829,18 @@ null 受け手（`(null: String) == "a"` が NPE になっていた）を見ま�
 library dual-run 専用です。`pb_null_bad.scala` は `(x: Int) match { case null => … }` が
 nsc と同じく `type mismatch; found: Null(null)` になることを固定します。
 
+`agent/localtrait` スライス（メソッド本体の中の `trait` / `class` / `object`）の
+フィクスチャは接頭辞 `lt`（`lt1` / `lt2` / `lt3` / `lt4` / `lt1_bad`）で、
+コンフリクト回避のため `crates/cli/tests/localtrait.rs` に置いています。正常系は
+私有ランタイムと `--scala-library` の両方で走らせ、`expected/lt*.txt` は**実 scalac
+2.13.16 の出力そのもの**です。これも**型検査は通って実行時に落ちていた**（あるいは
+黙って別のクラスを上書きしていた）バグなので、`javap` でバイトコードの形も 4 本の
+テストで固定します。そのうち `implementing_class_members_match_scalac` は
+`/tmp/scala-2.13.16/bin/scalac` があるとき実 scalac を走らせ、実装クラスの public
+メソッド集合が nsc のそれを包含することを見ます（**誰も呼ばないフォワーダが欠けて
+いても stdout は一致してしまう**ため）。詳しくは「メソッド本体の中の宣言
+（ローカル trait / class / object）」の節を参照。
+
 trait の `val` / `override val` / `var` の実行時表現と `case object` の合成メンバーのフィクスチャは接頭辞 `tval`（`tval` / `tval_bad`）で、同じ理由から `crates/cli/tests/traitval.rs` に置いています。`tval.scala` は私有ランタイム（`--no-scala-library`）と library dual-run の両方で走らせ、`expected/tval.txt` は **real scalac 2.13.16 の出力そのもの**です（3 モードがバイト単位で一致することを確認済み）。バイトコード側の不変条件も 2 本のテストで固定しています。`trait_val_setters_follow_nsc_names` は mixin setter が nsc と同じ `Named$_setter_$label_$eq` であること、`override val` したクラスのその setter が空実装（`putfield` なし）であること、trait の `var` への代入が `putfield` ではなく `count_$eq` 呼び出しであることを `javap -p -c` で見ます。`case_object_members_are_on_the_module_class` は `Asc$` に `toString` / `productPrefix` / `hashCode` / `productArity` が出ていることを見ます。`tval_bad.scala` は trait の `val` への代入が `reassignment to val` になることを固定します。
 
 値クラス + universal trait、`}` の次の行の単項マイナス、`X.type` の名前解決のフィクスチャは
@@ -3931,6 +3948,86 @@ required: DBIOAction[R, S, E]`、**増えたものはありません**。slick �
 ほとんど出てこないので、この 2 件は slick の数字ではあまり動きません
 （どちらも実 scalac との差分から出てきたものです）。
 
+### メソッド本体の中の宣言（ローカル trait / class / object、`agent/localtrait`）
+
+`trait` / `class` / `object` は**メソッド本体（やブロック、`if` の枝、ラムダの中）**
+にも書けます。トップレベルの宣言では正しく動いていた 2 つの仕組みが、
+ここでは丸ごと抜けていました。**どちらも型検査は通り、実行時に落ちる／黙って
+間違ったコードになる**種類の穴です。
+
+**1. 具象メンバの収集がテンプレートの中しか歩いていなかった。**
+`collect_trait_impls` は `PackageDef` / `ClassDef` / `ModuleDef` の直下だけを
+辿っていたので、メソッド本体の中の `trait` は登録されず、`T$class` 実装クラスも
+mixin フォワーダも**1 本も出ませんでした**。
+
+```scala
+def main(a: Array[String]): Unit = {
+  trait L { val v: String; lazy val w = v + "!"; def plain = v + "?" }
+  class LC extends L { val v = "x" }
+  println(new LC().plain)   // AbstractMethodError
+}
+```
+
+`javap -p` で見ると `Main$LC` は `v()` しか持っていませんでした（`plain()` も
+`w()` も interface の abstract 宣言のまま）。`lazy val` だけでなく素の `def` も
+落ちていたのはこのためです。収集を汎用の子ノード走査（`for_each_term_child`）に
+替えて、宣言がどこにあっても拾うようにしました。トップレベルと同じ経路に乗るので、
+線形化・`super` アクセサ・`abstract override`・trait `val` の mixin setter・
+`lazy val` の複製もそのまま効きます。
+
+**2. ローカル宣言に索引が付いていなかった。** ローカルな名前は 1 つのメソッドの
+中でしか一意ではありません。nsc は `Main$Same$1` / `Main$Same$2` と索引を振りますが、
+こちらは両方 `Main$Same` という classfile を出していて、**後から出た方が先の方を
+黙って上書き**していました（`dupA()` が `dupB` を印字する）。`jvm_for_current` で
+「クラスに届くまでに項（メソッドや `val` の初期化子）を跨いだか」を見て、跨いだ場合
+だけ `$N` を付けます。`case class` のコンパニオンは、クラスが引いた索引を
+そのまま使います（別に引くと `Main$P$1` と `Main$P$2$` がずれる）。
+
+**ローカル trait が外側のローカルを捕捉する場合。** trait にはコンストラクタが
+無いので、ローカル `class` のように捕捉値をコンストラクタ引数にはできません。
+nsc は捕捉ごとに trait のアクセサ（`outerVal$1()`）を立てて実装クラスに持たせます。
+こちらも同じ形で、
+
+- `anon_capture` が trait の捕捉を**それを mixin する全クラスへ伝播**させ
+  （既存の「ローカル class の捕捉はコンストラクタ引数＋フィールド」の仕組みに乗る）、
+- interface に捕捉ごとの abstract アクセサを宣言し、
+- 実装クラスはそのアクセサを自分の捕捉フィールドから実装し、
+- `T$class` のメソッド本体・`$init$` は入口で `$this` 経由に `invokeinterface`
+  して普通のローカルスロットに落とす（`emit_trait_capture_prologue`）。
+
+アクセサ名は捕捉されたシンボル ID で作ります（`n$4492`）。位置での採番だと、
+同名の別ローカルを捕捉する 2 つの trait を 1 つのクラスに mixin したときに
+衝突するためです。捕捉した `var` は既存の `scala.runtime.*Ref` boxing に乗ります。
+
+**ローカル class が*トップレベルの* trait を実装する形は元から動いており**、
+`lt1.scala` で回帰させないようにしています。逆（トップレベルのクラスがローカル
+trait を実装する）は、ローカル trait がスコープの外から見えないのでそもそも
+書けません（ただし**こちらは今のところ `Main.Local` を拒否できていません** —
+Remaining の「ローカル宣言がスコープの外から見えてしまう」を参照。
+ローカル宣言の索引とは別の、名前解決側の既存の穴です）。
+
+| fixture | 何を固定するか | 期待出力 |
+| --- | --- | --- |
+| `lt1.scala`（`crates/cli/tests/localtrait.rs`、私有ランタイム・library dual-run） | ローカル trait の `val` / `lazy val` / `def`、interface 経由の呼び出し、ローカル class がトップレベル trait を実装、`new T {}` と `new C with T`、ブロック内・`if` の枝・ラムダ本体・`match` の case・`while` 本体・`try` ブロックでの宣言 | `x?` `x!` `F` `x?` `x!` `top:lc` `q` `q` `blockT` `ifU` `lam3` `mm` `w0` `w1` `y` |
+| `lt2.scala`（同上） | ローカル trait のスタッキングと線形化（`B with C` / `C with B`）、`abstract override`、ローカル trait がローカル trait を継承、`override` と `super`、ローカル trait がトップレベル trait を継承、型パラメータを取るローカル trait、自分型 | `C(B(A))` `B(C(A))` `mid(late)` `ab` `a` `Over.m/T.m` `T.label` `top/L` `top` `box:7` `7` `hi g` |
+| `lt3.scala`（同上） | ローカル trait による捕捉: `val` / メソッド引数 / `var`、trait `val` の右辺での捕捉、継承した trait の捕捉 | `cap42s` `cap42s` `p7` `1` `2` `13` `base!/base` `base!` `hio` |
+| `lt4.scala`（同上） | 2 つのメソッドが同名の `trait` / `class` / `object` を宣言、`if` の枝で外側のローカル class 名を隠す | `Aaoa` `Bbob` `P1` `Q2` |
+| `lt1_bad.scala`（同上、異常系） | ローカルな mixin にもトップレベルと同じ検査が効く（`illegal inheritance; superclass Other is not a subclass of the superclass Sup`）。実 scalac も同じ 1 件 | （コンパイルエラー 1 件） |
+
+`javap` の比較テストも入れています（`local_trait_gets_mixin_forwarders_and_impl_class`
+／`same_named_local_declarations_get_separate_classfiles`
+／`local_trait_captures_go_through_an_accessor`
+／`implementing_class_members_match_scalac`）。**メソッドの過不足は実行出力だけでは
+見逃す**（誰も呼ばないフォワーダが欠けていても stdout は一致する）ので、最後の 1 本は
+`/tmp/scala-2.13.16/bin/scalac` があるときに実 scalac を走らせ、実装クラスの
+public メソッド集合が nsc のそれを**包含する**ことを見ます。比較の前に、こちらと nsc で
+表記だけが違う 2 つを正規化します（ローカル索引を落として
+`Main$L$1$_setter_$fixed_$eq` = `Main$L$_setter_$fixed_$eq`、
+`super` アクセサの所有者エンコードを落として `B$$super$name` = `Main$B$$super$name`）。
+
+slick の計測は `files=184 errors=411 files_with_errors=72` で**前後とも同じ**です
+（型検査は通ってしまうバグなので、エラー数は元から動きません）。
+
 ### Remaining
 
 - **`Seq`／`IndexedSeq` の `lazyZip`**（`agent/ambigmap` で確認）。
@@ -4521,7 +4618,6 @@ required: DBIOAction[R, S, E]`、**増えたものはありません**。slick �
 - 高階 `F[_] <% …` は nsc どおり `takes type parameters`（`F[_]: C` は nsc が受理するので実装済み。README の旧記述は誤りだったので実測に合わせて直した）
 - placeholder の残り（より深い入れ子の完全再現。unary / Function2 / typed `_ : T` の必要形はこのスライスまで）
 - **implicit の導出**（`implicit def optShow[A](implicit s: Show[A]): Show[Option[A]]` のように、implicit パラメータを取る implicit def を型パラメータの単一化つきで再帰的に解決する形）。`implicit_provides` は今のところパラメータリストが空の implicit しか候補にしないので、`Show[Option[Int]]` は `no implicit` になる
-- **キャプチャしたクラスの JVM 名**（メソッドの中のクラスは nsc の `Outer$Inner$1` ではなく素の `Inner` / `$anon$N` として出る。既存の匿名クラスと同じ扱いで、同名のローカルクラスが 2 つあると衝突する）
 - **`while` 本体で宣言したローカルの StackMapTable**（`while (c) { val s = …; … }` はループ先頭のフレームがそのスロットを含んでしまい `VerifyError: Instruction type does not match stack map` になる。匿名クラスとは無関係で、ループの外で `val` を束ねれば動く）
 - **`scala.Product` 本体**（case class / case object は `productPrefix` / `productArity` は持つが、`Product` を親に付けていないので `productElement` / `productIterator` / `productElementNames` は無く、`(x: Product)` にも渡せない）
 - **コンストラクタの省略可能引数のうち、先行する ctor パラメータを参照するデフォルト**（`class C(x: Int, y: Int = x + 1)`）。単純なリテラル / `null` のデフォルト（`class C(x: Int, y: Int = 5)` や slick の `SlickException(msg, parent: Throwable = null)`）は動く
@@ -4552,6 +4648,93 @@ required: DBIOAction[R, S, E]`、**増えたものはありません**。slick �
   `adapted the argument list to the expected 2-tuple: add additional parens instead`
   を出します（2.13.16 では `-deprecation` ではなく `-Xlint:adapted-args`）。
   scala-rs にはこの lint の枠組みが無いので、**警告なしで受理**します。
+
+- **ブロックの中の `case class` / `case object`**（`agent/localtrait` で見つけた、
+  ローカル trait とは別件のパーサの穴）。ブロック文の先頭の `case` は必ず
+  `case` 節として読まれるので、
+
+  ```scala
+  def f(): Unit = {
+    case class P(x: Int)   // error: expected pattern, found class
+    println(P(1))
+  }
+  ```
+
+  が通りません。ブロック文の位置では `case` の次のトークンが `class` / `object`
+  なら定義として読む、というのが nsc の形です。**診断は出る**ので黙って
+  間違うことはありません。普通の（`case` でない）ローカル `class` / `object` /
+  `trait` は動きます。
+
+- **abstract メンバを実装しないクラスに `needs to be abstract` を出さない**
+  （`agent/localtrait` で気づいた既存の穴。ローカルに限らずトップレベルでも同じ）。
+
+  ```scala
+  trait L { def v: String; def plain = v + "?" }
+  class LC extends L        // scalac: class LC needs to be abstract.
+  ```
+
+  実 scalac はエラーにしますが、こちらは通してしまい、実行時に
+  `AbstractMethodError` になります。`agent/localtrait` の修正で mixin
+  フォワーダは正しく出るようになりましたが、**この検査そのものは未実装**です
+  （`lt1_bad.scala` は代わりに、こちらも実装済みの
+  `illegal inheritance; superclass … is not a subclass of …` を固定しています）。
+
+- **クラスの中の trait から外側インスタンスのメンバを読む codegen**
+  （`agent/localtrait` で確認。**ローカルかどうかとは無関係の既存の穴**で、
+  `$outer` を触る作業（`agent/nestedobj`）の領域なのでこのスライスでは直していません）。
+
+  ```scala
+  class Holder(val base: String) {
+    trait Tag { def t = base + "!" }   // 外側 Holder のメンバを読む
+    class TC extends Tag
+    def make(): String = new TC().t    // NoSuchFieldError: $outer
+  }
+  ```
+
+  `Holder$Tag$class.t` が `$this`（interface 型）に `getfield $outer` を出すので、
+  実行時に `NoSuchFieldError` になります。nsc は捕捉と同じやり方で、interface に
+  abstract アクセサ（`Holder$Tag$$$outer()`）を立てて実装クラスに自分の `$outer`
+  フィールドから実装させます。`agent/localtrait` で入れた
+  `trait_capture_accessors` はまさにその形なので、`$outer` にも同じ仕組みを
+  被せるのが筋です。ローカル trait でも同じ症状になります
+  （このスライスの前は同じコードが `AbstractMethodError` で落ちていたので、
+  悪化はしていません）。
+
+- **ローカルクラスの `InnerClasses` の `inner_name`**（`agent/localtrait`）。
+  binary name は nsc と同じ `Main$LocalC$1` になりましたが、`InnerClasses` の
+  `inner_name` は nsc が索引つきの `LocalC$1`、こちらは元の `LocalC` です。
+  そのため**ローカルクラスの `getSimpleName()` だけが nsc と食い違います**
+  （`Main$LocalC$1` の `EnclosingMethod` / `isLocalClass` / `isMemberClass` は
+  一致します）。`crates/cli/tests/innerclasses.rs` の
+  `inner_local_class_has_no_outer` に書いてあります。
+
+- **ローカル宣言がスコープの外から見えてしまう**（`agent/localtrait` で確認。
+  main でも同じ既存の穴）。
+
+  ```scala
+  object Main { def mk(): Unit = { trait Local { def l = "l" } } }
+  class TopUser extends Main.Local   // scalac: type Local is not a member of object Main
+  ```
+
+  実 scalac は拒否しますが、こちらは通してしまい、親を持たない `TopUser` を
+  出します。ローカル宣言のシンボルの所有者はメソッドなのに、`Main.Local` の
+  名前解決がそこまで届いてしまうためです。**逆向き**（トップレベルのクラスが
+  ローカル trait を実装する）はそもそも Scala では書けない形なので、
+  `agent/localtrait` の fixture でも扱っていません。
+
+- **引数位置の `try` と `while` の StackMapTable**（`agent/localtrait` で気づいた
+  別件。ローカル宣言とは無関係で、main でも同じ）。`--no-scala-library` では
+
+  ```scala
+  var i = 0
+  while (i < 2) { println("w" + i); i += 1 }
+  println(try { "y" } catch { case _: Throwable => "no" })
+  ```
+
+  が `VerifyError: Inconsistent stackmap frames at branch target …` になります。
+  `val t = try { … } catch { … }` と一度受けてから `println(t)` すれば通ります。
+  jar モードは正しく動きます。既存の「`while` 本体で宣言したローカルの
+  StackMapTable」と同じ根と思われます。
 
 ## ライセンス
 

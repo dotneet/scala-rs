@@ -19,22 +19,62 @@ use crate::symbol::{SymKind, SymbolTable};
 /// Record captured enclosing-method locals on every class symbol in `tree`.
 pub fn mark_anon_captures(tree: &Tree, st: &mut SymbolTable) {
     let mut found: Vec<(SymbolId, Vec<SymbolId>)> = Vec::new();
-    walk(tree, st, &mut found);
+    let mut classes: Vec<SymbolId> = Vec::new();
+    walk(tree, st, &mut found, &mut classes);
     for (cls, caps) in found {
+        st.get_mut(cls).captures = caps;
+    }
+    inherit_trait_captures(st, &classes);
+}
+
+/// A local `trait` has no constructor, so it cannot hold the enclosing-method
+/// locals its own body reads: the value has to come from the instance. Every
+/// class mixing such a trait in therefore captures what the trait captures
+/// too, and exposes each one through an accessor the trait's implementation
+/// reads back (`crates/backend/src/gen.rs`, `trait_capture_accessors`).
+///
+/// Only the *direct* captures of each ancestor are added, but the whole
+/// linearization is consulted, so one pass reaches every level.
+fn inherit_trait_captures(st: &mut SymbolTable, classes: &[SymbolId]) {
+    let mut updates: Vec<(SymbolId, Vec<SymbolId>)> = Vec::new();
+    for &cls in classes {
+        let mut caps = st.get(cls).captures.clone();
+        let before = caps.len();
+        for p in crate::lin::linearize(st, cls).into_iter().skip(1) {
+            if !crate::lin::is_interface(st, p) {
+                continue;
+            }
+            for c in st.get(p).captures.clone() {
+                if !caps.contains(&c) {
+                    caps.push(c);
+                }
+            }
+        }
+        if caps.len() != before {
+            updates.push((cls, caps));
+        }
+    }
+    for (cls, caps) in updates {
         st.get_mut(cls).captures = caps;
     }
 }
 
-fn walk(tree: &Tree, st: &SymbolTable, out: &mut Vec<(SymbolId, Vec<SymbolId>)>) {
+fn walk(
+    tree: &Tree,
+    st: &SymbolTable,
+    out: &mut Vec<(SymbolId, Vec<SymbolId>)>,
+    classes: &mut Vec<SymbolId>,
+) {
     if let TreeKind::ClassDef { .. } = &tree.kind {
         if !tree.sym.is_none() {
+            classes.push(tree.sym);
             let caps = class_captures(tree, st);
             if !caps.is_empty() {
                 out.push((tree.sym, caps));
             }
         }
     }
-    each_child(tree, &mut |c| walk(c, st, out));
+    each_child(tree, &mut |c| walk(c, st, out, classes));
 }
 
 /// Free enclosing-method terms of a `ClassDef`, in first-reference order.
