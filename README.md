@@ -118,7 +118,8 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - `extends App` / `DelayedInit`。`object Main extends App { println(...) }` は nsc どおりコンストラクタ本体を `delayedInit` に移し、`App.main` から起動する。App なしで `DelayedInit` を継承する class も `delayedInit` フックを呼ぶ
 - **名前付き引数**（呼び出し側で並べ替え）。メソッド / コンパニオンの `apply` / case class の `copy` / **コンストラクタ `new C(b = 2, a = 1)`** / **オーバーロードのある呼び出し**、および可変長引数 （`def f(a: Int, rest: Int*)` の `f(a = 1)` / `f(a = 1, 2, 3)`）で動く。並べ替えは nsc の `NamesDefaults.removeNames` と同じ規則で、**自分の位置にある名前付き引数はそのあとの位置引数を許す**（`f(a = 1, 2)` は通り、`f(b = 1, 2)` は `positional after named argument.`）。オーバーロードは nsc と同じくまずパラメータ**名**で候補を絞り、名前だけで決まらないときに引数の型で決める。診断は実 scalac と同じ文面（`unknown parameter name: q` / `parameter 'c' is already specified at parameter position 2` / `positional after named argument.`）で、nsc と同様に 1 呼び出しにつき 1 件だけ出す（後続の「引数が足りない」等はカスケードなので出さない）
 - 具象メンバー付き trait の mixin（`T$class` 静的実装 + 線形化順のフォワーダ）。フォワーダは `class` と `object` の両方に出す。trait の `val` / `override val` / `var` の実行時表現は「Trait mixin」節
-- **case class / case object の合成メンバー**: case class は `toString` / `equals` / `hashCode` / `canEqual` / `productPrefix` / `productArity`。**case object** は module class 側に nsc と同じ定数畳み込みの `toString`（`Foo`。`Foo$@1a2b3c` ではない）/ `productPrefix` / `hashCode`（`"Foo".hashCode`）/ `productArity`（0）/ `canEqual` を出す。`equals` は nsc と同じくシングルトンの参照等価（`Object` 由来）のまま。手書きの定義があればそちらが勝つ。`scala.Product` を親に付けるところまでは実装していないので、`productElement` / `productIterator` はまだ無い
+- **case class / case object の合成メンバー**: case class は `toString` / `equals` / `hashCode` / `canEqual` / `productPrefix` / `productArity` / `productElement` / `productElementName`。**case object** は module class 側に nsc と同じ定数畳み込みの `toString`（`Foo`。`Foo$@1a2b3c` ではない）/ `productPrefix` / `hashCode`（`"Foo".hashCode`）/ `productArity`（0）/ `canEqual` / `productElement` を出す。`equals` は nsc と同じくシングルトンの参照等価（`Object` 由来）のまま。手書きの定義があればそちらが勝つ
+- **case class / case object は `scala.Product with java.io.Serializable`**（jar リンク時）。`val p: Product = P(1, 2)` も `List[Product]` も通り、`productIterator` / `productElementNames` は nsc と同じく `Product` から継承する。**合成コンパニオンは `scala.runtime.AbstractFunctionN` を継承する**ので `P.tupled` / `P.curried` / `val f: (Int, String) => P = P` が動く。詳しくは「case class を `Product` にする」節
 - **`val` への再代入の診断**（`val x = 1; x = 2` も `d.v = 5`（trait の `val`）も nsc と同じ `reassignment to val`）。Java のフィールドとコンパイラ生成の synthetic な項は対象外
 - 内部クラス（`$outer`）とネストした object。匿名クラス `new Trait { def f = ... }` と `new { def x = 1 }`（合成 classfile。型は refinement ではなく `$anon$N`）
 - メソッド本体の中で定義したクラス（匿名クラス `new T { … }` と**ローカル `class` / `object`**）が、**囲みメソッドのパラメータ / ローカルをキャプチャ**する。nsc と同じ形で、自由変数ごとに `x$1` という public final フィールドと、末尾に付く追加のコンストラクタ引数を出す。各インスタンスメソッドの先頭でそのフィールドをローカルスロットに読み戻すので、キャプチャした `var` の `scala.runtime.*Ref` 経由の読み書きも、匿名クラス内のラムダによる二重キャプチャ（`$captured$N`）も、既存の経路のまま動く。メソッドの中のクラスにも `$outer` が付き、囲みクラスのメンバは `$outer` チェーンで読む
@@ -1071,6 +1072,96 @@ nsc は `case class C(implicit x: Int)` 自体を拒否するので、第 1 リ�
   nsc は `value hidden is not a member of Plain`、こちらは
   `value hidden cannot be accessed as a member of Plain from Main$` です
   （どちらもエラーにはなります。`ctacc_plain_bad`）。
+
+### case class を `Product` にする（`agent/product`）
+
+`agent/product` スライス。フィクスチャは `tests/fixtures/prod*.scala`、テストは
+`crates/cli/tests/product.rs` です。
+
+`productPrefix` と `productArity` だけが合成されていて、`scala.Product` を親に付けて
+いなかったので、**中途半端に `Product` に見える**状態でした。実 scalac が通す次の 6 つが
+すべて落ちていました。
+
+```scala
+case class P(x: Int, y: Int)
+val p = P(1, 2)
+p.productIterator.toList     // value productIterator is not a member of P
+p.productElement(0)          // 同上
+p.productElementName(0)      // 同上（2.13 で追加）
+P.tupled((5, 6))             // value tupled is not a member of P$
+P.curried(5)(6)              // 同上
+(p: Product).productArity    // type mismatch; found: P required: Product
+```
+
+**何を出すべきかは推測せず、scalac 2.13.16 の classfile を `javap -v -p` で読んで**
+決めました。読み取った規則はそのまま `crates/typer/src/prelude_product.rs` の
+ドキュメントコメントに残してあります。
+
+**1. `case class` / `case object` は `scala.Product with java.io.Serializable`**。
+これは無条件です。親を持つ case class もそのあとに付きます
+（`class E$L implements E$T, scala.Product, java.io.Serializable`）。この辺が無いと
+`val p: Product = P(1, 2)` も `List[Product]` も通らず、`productIterator` /
+`productElementNames` の来る先もありません（nsc は 4 つのうち `productIterator` /
+`productElement` / `productElementName` / `productPrefix` / `productArity` だけを
+case class 側で上書きし、`productElementNames` は `Product` の default 実装を継承します）。
+
+**2. `productElement` / `productElementName` は自前で出す**。どちらも
+`0 … arity-1` の **`tableswitch`** で、フィールドが 1 本でも表になります
+（`tableswitch { // 0 to 0 }`）。フィールドが 0 本の case class では switch 自体が
+無く、範囲外の道だけが残ります。範囲外は
+`scala.runtime.Statics.ioobe(I)`（＝`throw new IndexOutOfBoundsException(String.valueOf(i))`）で、
+`productElementName` はそのあとに `checkcast java/lang/String` が付きます。
+フィールドが値クラスのときは `toString` と同じく**インスタンスに包み直して**返します
+（`new G$Meters(this.m())`）。
+
+**3. `productIterator` は継承ではなく上書き**で、
+`ScalaRunTime$.MODULE$.typedProductIterator(this)` を呼びます。`productElementNames`
+は逆に `Product` の default 実装への **mixin フォワーダ**
+（`invokestatic InterfaceMethod scala/Product.productElementNames$`）です。
+
+**4. `case object` の `productElementName` だけ例外**。nsc は case object には
+`productElementName` を合成しないので、module class には `Product` の default 実装への
+フォワーダが載ります。その default はメッセージが違い、
+`case class Zero()` の `productElementName(0)` が `IndexOutOfBoundsException: 0` を投げるのに対し
+`case object Solo` は `IndexOutOfBoundsException: 0 is out of bounds (min 0, max -1)` を投げます。
+**同じプログラムの中で 2 つのメッセージが出る**ので、両方そのまま再現しています
+（`prod.scala` の最後の 4 行）。
+
+**5. コンパニオンは `scala.runtime.AbstractFunctionN` を継承する**。`tupled` /
+`curried` はここから来ます（`FunctionN` の default メソッド。prelude 側の
+`FunctionN` には `prelude_fntuple.rs` が同じ 2 つを入れています）。メソッドを直接
+生やすのではなく継承にしたのは、それが**実物だから**です。おかげで
+`val f: (Int, String) => P = P` と `List(1, 2, 3).map(One)` も通るようになりました。
+継承する条件も 4 つとも classfile から読み取ったものです。
+
+- **自分で書いた `object P` には付かない**。何を継承していようが関係なく、
+  `object P extends Base` は `class F$Plain$ extends E$Base`、
+  `object P extends SomeTrait` ですら `class F$WithTrait$ implements E$Mix` で
+  `AbstractFunction1` はどこにもありません（ただし `java.io.Serializable` は付きます）。
+- **型パラメータのある case class には付かない**。`case class Gen[A](a: A, b: Int)` は
+  `class E$Gen$ implements java.io.Serializable` だけ。
+- **引数節が 2 つ以上なら付かない**。implicit 節も数に入ります
+  （`case class Impl(a: Int)(implicit o: Ordering[Int])` も
+  `case class Curr(a: Int)(b: String)` も素の `Serializable`）。
+- **arity 23 以上には付かない**。`AbstractFunctionN` は 22 までで、
+  22 個ちょうどの兄弟には `AbstractFunction22` が付きます。
+
+可変長引数の case class には付きます（`case class Vararg(a: Int, rest: String*)` →
+`AbstractFunction2<Object, scala.collection.immutable.Seq<String>, F$Vararg>`）。
+`AbstractFunctionN` を継承する以上、erase された `apply(Object, …)Object` を実装する
+必要があるので、コンパニオンにはそのブリッジも出します（nsc も同じ位置に出します）。
+
+**全部 `library_abi` ゲート**です。`scala.Product`・`java.io.Serializable`・
+`scala.runtime.AbstractFunctionN`・`scala.collection.Iterator`・`scala.runtime.ScalaRunTime` は
+どれも jar 側で、私有ランタイム（`crates/backend/src/runtime.rs`）には 1 つもありません。
+`--no-scala-library` では親を張らず、`p.productIterator` は
+`value productIterator is not a member of P` のまま診断します
+（`fixtures_prod_lib_without_library_is_error`）。ただし `productElement` /
+`productElementName` は `java.lang` しか要らないので**両モードで出します**。
+私有ランタイム側では `Statics.ioobe` の代わりに同じ throw を、case object 側では
+`Product` の default と同じメッセージを、その場で書き出しています。
+`prod.scala` と `prod_vc.scala` は**私有ランタイム・jar・real scalac の 3 つが
+バイト単位で一致**します。
 
 ### オーバーロードの候補集合（継承・`private[this]`・`java.lang.String`）
 
@@ -2122,6 +2213,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 数値変換の塔と `Byte` / `Short` のプリミティブ化のフィクスチャは接頭辞 `numt`（`numt.scala` / `numt_bad.scala`）で、同じ理由から `crates/cli/tests/numtower.rs` に置いています。`numt.scala` は 7×7 の変換すべて（NaN / ±Inf / MIN・MAX 込み）、`Byte` / `Short` のパラメータ・戻り値・フィールド・配列・オーバーフロー、演算子の昇格、弱適合、`Short` スクルティニーの `Int` 定数パターンを 1 本にまとめてあり、**私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせて `expected/numt.txt`（real scalac 2.13.16 の stdout）と比較します。`no_scala_byte_or_short_class_reference` は、出した classfile の定数プールに `scala/Byte` / `scala/Short` という実在しないクラス名が現れないことを直接見ます。`numt_bad.scala` は real scalac も拒否するもの（暗黙の縮小変換、範囲外の定数、`Boolean` / `Unit` の `toX`、`Double` → `Int`）を jar モードと私有ランタイムモードの両方で診断します。プリミティブ配列の要素命令（`laload` / `dastore` / `baload` …）と `1 + 2.5f` の `i2f` は個別のテストで固定しています。
 
+`agent/product` スライス（`case class` / `case object` が `scala.Product` を実装し、合成コンパニオンが `scala.runtime.AbstractFunctionN` を継承するまで）のフィクスチャは接頭辞 `prod`（`prod` / `prod_lib` / `prod_vc` / `prod_bad`）で、同じ理由から `crates/cli/tests/product.rs` に置いています。`prod.scala` は 4 つの上書きアクセサ（`productPrefix` / `productArity` / `productElement` / `productElementName`）と範囲外 3 種（正の外・負の・arity 0）を **私有ランタイムと `--scala-library` の両方**で `java -Xverify:all` の下に走らせ、`real_scalac_dual_run_prod` で real scalac 2.13.16 の stdout とも比較します（`expected/prod.txt` は scalac の出力そのもの。`case class Zero()` と `case object Solo` で **範囲外メッセージが違う**ところまで一致します）。`prod_vc.scala` は値クラスのフィールドが `productElement` でインスタンスに包み直されることを同じ 3 モードで固定します。`prod_lib.scala` は `Product` という**型**、`productIterator` / `productElementNames`、`tupled` / `curried`、`val f: (Int, String) => P = P`、arity 22 を扱うので library dual-run と real scalac dual-run のみで、`fixtures_prod_lib_without_library_is_error` が `--no-scala-library` でそれらが**きちんと診断される**ことを見ます。`prod_lib_classfile_shape` は `javap -p -c` で出した形そのもの（`implements scala.Product,java.io.Serializable`、`tableswitch`、`Statics.ioobe`、`ScalaRunTime$.typedProductIterator`、`Product.productElementNames$`、コンパニオンの `extends AbstractFunction2` と erase された `apply` ブリッジ、`AbstractFunction22`、case object が `AbstractFunctionN` を**継承しない**こと、case object の `productElementName` が `Product.productElementName$` へのフォワーダであること）を固定します。`prod_bad.scala` は real scalac も拒否する 4 つ（case class でないクラスの `productArity` / `productElement`、`productElement("0")`、`val bad: Product = new Plain(1)`）を診断します。
+
 `agent/smallgaps` スライス（`@inline` / `@noinline` の配置、curried case class companion、companion への後方参照、`Option.flatMap` の多相性、`None`/`Some` の `lub`、`Iterable.apply`）のフィクスチャは接頭辞 `sgap`（`sgap` / `sgap_lib`）で、同じ理由から `crates/cli/tests/smallgaps.rs` に置いています。`sgap.scala` は `--no-scala-library` で `check` 済み、`sgap_lib.scala` は `Iterable.apply` が library ABI（`IterableFactory$Delegate.apply` の継承）にしか無いため library dual-run 専用（`fixtures_sgap_lib_without_library_is_error` で `--no-scala-library` が診断のまま残ることも見ています）。
 
 `agent/catsimpl` スライス（ラムダが囲いの `this` を捕まえる、cats の syntax 形の暗黙変換、コンパニオンの implicit スコープ、デフォルト引数を省いた呼び出しの by-name 引数）のフィクスチャは接頭辞 `cats`（`cats_lambda` / `cats_lambda2` / `cats_syntax` / `cats_syntax_bad` / `cats_byname`）で、同じ理由から `crates/cli/tests/catsimpl.rs` に置いています。`cats_lambda.scala` は `List.map` / `flatMap` を使うので library dual-run 専用、`cats_lambda2.scala` は同じ捕捉をライブラリのコレクション抜きで書いてあるので**私有ランタイムと `--scala-library` の両方**で走ります。`cats_syntax.scala` は `implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])` を自前で書いた 1 ファイル版で、抽象 `F[_]` と具象 `Box` の両方の受け手を通します。`cats_syntax_bad.scala` は、変換のパラメータを「1 引数に適用された任意の型」まで広げたことで**witness の無い型にまで変換が挿さらない**こと（scalac と同じ `value flatMap is not a member of Bag[Int]`）を固定します。`a_higher_kinded_companion_implicit_crosses_a_jar` はライブラリを自分でコンパイルして jar に詰め、`ScalaSignature` だけを通して `Async[Box]` ＝ `Box.asyncForBox` が見つかることと、**witness の無い型は依然として hard error**（`could not find implicit value of type Async[Crate]`）であることを両方見ます。
@@ -2823,6 +2916,27 @@ files_with_errors=80`**。生の件数はあまり動きませんが、**この�
 `no matching overload for (Function0[A])F` など。どれも同じ「素の `F`」が原因）。
 
 ### Remaining
+
+- **`-cp` で読み戻した case class の `Product` / `Serializable`**（`agent/product`）。
+  別コンパイルした `case class Pt(x: Int, y: String)` を `-cp` 経由で使うと、
+  `Pt.tupled`（コンパニオンの `AbstractFunction2` は**スーパークラス**なので
+  classfile から読める）は通りますが、`val q: Product = p` と
+  `val s: java.io.Serializable = p` は通りません。**インタフェース**側の親が
+  `-cp` 読みで落ちるためで、同じ `-cp` にあるユーザ定義 trait
+  （`class Plain extends Marker`）は落ちません。実 scalac が出した classfile を
+  読ませても同じなので、こちらが**出している**ものの問題ではなく、
+  classpath / pickle 読み側（`classpath.rs` の `find_or_stub_java_class` と
+  `pickle_supply.rs` の `attach_parents` あたり）の既存の穴です。1 コンパイル単位
+  なら jar モード・私有ランタイムモードとも real scalac と一致します。
+
+- **自分で書いたコンパニオンの `tupled` / `curried`**（`agent/product`）。
+  nsc は `object P` を自分で書いた case class のコンパニオンには
+  `AbstractFunctionN` を**継承させない**（classfile で確認済み）ので、
+  こちらもそうしています。それでも scalac が `P.tupled` を通すのは、
+  モジュールを `apply` 経由で eta 展開してから `tupled` を引くからです
+  （2.13.13 以降 deprecated）。その eta 展開がこちらには無いので、
+  `value tupled is not a member of P$` を出します。合成コンパニオン
+  （＝`object P` を書いていない普通の case class）は継承で動きます。
 
 - **for 内包の値定義に続くガード**（`agent/mismatch6` で診断だけ入れた、未実装）。
   `for { m <- ms; q = f(m); if q > 0 } yield q` は nsc では通ります。nsc は

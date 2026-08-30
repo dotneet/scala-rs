@@ -32,6 +32,7 @@ mod prelude_numops;
 mod prelude_ordtuple;
 mod prelude_oshadow;
 mod prelude_ovl2;
+mod prelude_product;
 mod prelude_reflect;
 mod prelude_regex;
 mod prelude_seq;

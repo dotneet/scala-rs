@@ -1,0 +1,24 @@
+productPrefix = P
+productArity = 2
+productElement 0 = 1
+productElement 1 = h
+productElementName 0 = x
+productElementName 1 = y
+IndexOutOfBoundsException 9
+IndexOutOfBoundsException -1
+IndexOutOfBoundsException 9
+IndexOutOfBoundsException -1
+One arity = 1
+One element = 7
+One name = a
+IndexOutOfBoundsException 1
+Zero arity = 0
+IndexOutOfBoundsException 0
+IndexOutOfBoundsException 0
+Sub prefix = Sub
+Sub element = 4
+Sub n = 4
+Solo prefix = Solo
+Solo arity = 0
+IndexOutOfBoundsException 0
+IndexOutOfBoundsException 0 is out of bounds (min 0, max -1)
