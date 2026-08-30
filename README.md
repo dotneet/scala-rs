@@ -2209,6 +2209,38 @@ implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラー
 `kinds of the type arguments (F) do not conform` のような「読み違え」から、
 `could not find implicit value of type Make[F]` のような
 「本当に足りていない機能」に変わりました。
+- **`scala.collection.mutable` のコレクション一式**（`agent/mutcoll` スライス、jar リンク時のみ）。
+  `f(args) = v` の `f.update(args, v)` への desugar（SLS 6.15）は配列・ユーザークラス・
+  多引数 `update`・選択された受け手・ジェネリックな `update`・`Unit` 以外を返す `update` の
+  どれでも効く（**私有ランタイムでも動く**。`update` を持たない受け手は
+  `value update is not a member of …` で拒否する）。**コンパニオンの varargs `apply` が
+  同名の immutable コレクションを返していたバグ**を直した（`mutable.Set(1,2,3)` が
+  `scala.collection.immutable.Set` と推論され、`+=` / `-=` / `++=` / `--=` / `add` が
+  「not a member」になっていた。`check.rs::factory_result_class`。ファクトリの
+  ショートカットは型引数だけを差し替えるもので、クラスは宣言された結果型のものを使う）。
+  新しく `mutable.Queue` / `Stack` / `TreeMap` / `TreeSet` / `PriorityQueue` / `ArraySeq` の
+  コンパニオン（0 引数を含む varargs `apply` と `empty`。`TreeMap` / `TreeSet` /
+  `PriorityQueue` は `Ordering`、`ArraySeq` は `ClassTag` の implicit 証拠つき）を
+  `crates/typer/src/prelude_mutcoll.rs` に宣言した。これらは `IterableFactory` /
+  `SortedIterableFactory` / `EvidenceIterableFactory` から `apply` を継承していて、
+  classfile シグネチャでは可変長パラメータが既に `Seq[A]` に、結果が抽象 `CC` に
+  なっているため、`Queue[Int]()` すら
+  `no matching overload for (Seq[Int])CC with arguments ()` だった。あわせて
+  `ArrayDeque.append`（`Buffer` の default メソッドなので戻り値は `Buffer`）、
+  `PriorityQueue.enqueue(elems: A*)`、`ArraySeq` の `apply` / `update` / `length` /
+  `size` / `toList`、`mutable.StringBuilder` のコンパニオン `newBuilder`（以前は
+  型検査を通って実行時に `RuntimeException: select StringBuilder` を投げていた）、
+  `Growable` / `Shrinkable` の `++=` / `--=` / `-=` を新しい型にも（`prelude_mutops.rs`）。
+  `new Queue[Int]()` / `new Stack[Int]()` / `new ArrayDeque[Int]()` は 2.13 では
+  `class Queue[A](initialSize: Int = ArrayDeque.DefaultInitialSize)` なので `<init>()V` が
+  存在せず、以前は型検査を通って実行時に `NoSuchMethodError` になっていた
+  （合成デフォルトゲッター `$lessinit$greater$default$1` を呼ぶようにした。
+  `gen.rs::has_default_sized_ctor`）。`new TreeMap[K, V]()` /
+  `new TreeSet[A]()` / `new PriorityQueue[A]()` は `Ordering` の implicit 節つき
+  コンストラクタとして宣言した。**診断**: `op=` が受け手のメンバーでないときは nsc と
+  同じく**1 つのエラー**（2 行目が
+  `Expression does not convert to assignment because receiver is not assignable.`）に
+  まとめた。以前は 2 つ別々に出ていて、直前の `m("a") = 1` が失敗したように読めた
 
 ## 実装していないもの
 
@@ -3306,6 +3338,11 @@ JVM descriptor は戻り型だけが違います（`javap -s` で確認）。pre
 | `seqpat.scala`（library dual-run） | `Seq` / `List` / `Vector` / `IndexedSeq` / `Array` のシーケンスパターン（固定長・`_*`・入れ子・タプル要素・case class 要素）、`ArraySeq` を `Seq` で受ける形、`Any` スクルーティニ、`_: T` の部分パターン | `empty` `one 1` `two 3` `many 3 2` `xyz\|w` `q` `ab` `a2` `24` `3` `3` `xy\|z` `4` `k7` `5` `abc` `arr 12` `seq 12` `seq 12` `lst 9` `?` `?` `table a` `plain a` `table b` `plain b` `table c` `plain c` |
 | `seqpat_map.scala`（library dual-run） | `StringOps.map` の 2 つのオーバーロード（`Char => Char` は `String`、それ以外は `IndexedSeq[B]`） | `Ab` `ABC` `ArraySeq(a, b, c)` `ArraySeq(97, 98, 99)` `a-b` `abc` `3` `false,false,true,true,false` |
 | `seqpat_ids.scala`（library + 私有ランタイム dual-run） | 安定識別子パターン（無関係なクラス／trait／`Any` のスクルーティニ）と、クラスの後に続く定義の修飾子 | `st` `?` `tr` `?` `other` `?` `7` `true` `true` |
+| `mc_update.scala`（`crates/cli/tests/mutcoll.rs`、library + 私有ランタイム dual-run） | `f(args) = v` → `f.update(args, v)`（SLS 6.15）: 配列、ユーザークラスの `update`、2 引数 `update`、選択された受け手（`h.b(1) = 41`）、ジェネリックな `update`、`Unit` 以外を返す `update`、`apply` の結果を受け手にする形 | `7,0,8` `15` `1:2:hi` `42` `3=x` `10` `5` |
+| `mc_maps.scala`（`crates/cli/tests/mutcoll.rs`、library dual-run） | `mutable.Map` / `HashMap` / `LinkedHashMap` / `Set` / `HashSet` / `LinkedHashSet` / `ArrayBuffer` / `ListBuffer` / `Buffer` のコンパニオン `apply`（0 引数と varargs）と `empty`、`m(k) = v`、`update` / `getOrElseUpdate` / `remove` / `contains`、`+=` / `-=` / `++=` / `--=`、入れ子の `Map` への `nested("outer")("inner") = 42` | `List((d,4), (e,5))` ほか 16 行 |
+| `mc_queue.scala`（`crates/cli/tests/mutcoll.rs`、library dual-run） | `mutable.Queue` / `Stack` / `ArrayDeque` / `PriorityQueue` / `TreeSet` / `TreeMap` / `ArraySeq` / `StringBuilder`: コンパニオン `apply`（0 引数含む）と `empty`、`new X[T]()`、`enqueue` / `dequeue` / `head` / `push` / `pop` / `top` / `append` / `prepend`、`Growable` / `Shrinkable` 演算子、`StringBuilder.newBuilder` | `1` `2` `2` `List(2, 3)` ほか 33 行 |
+| `mc_maps_bad.scala`（`crates/cli/tests/mutcoll.rs`） | `m("a") = "wrong type"` / `m(1) = 2` は desugar 後の `update(String, Int)` で拒否、`update` を持たないクラスへの `n(0) = 7` は `value update is not a member of NoUpdate`、`q.enqueue("not an Int")` は要素型で拒否 | 4 errors |
+| `mc_queue_bad.scala`（`crates/cli/tests/mutcoll.rs`） | `op=` が受け手のメンバーでないとき、nsc と同じく**1 つ**のエラー（2 行目が `Expression does not convert to assignment because receiver is not assignable.`） | 1 error |
 
 拒否側は `seqpat_bad.scala`（`final` クラス／`String`／プリミティブが絡む 5 件。
 実 scalac 2.13.16 も同じ 5 件を出します）、`seqpat_star_bad.scala`（`_*` が
@@ -4268,6 +4305,7 @@ required: DBIOAction[R, S, E]`、**増えたものはありません**。slick �
   slick の `slick/basic/BasicBackend.scala` に `not found: type Ref` が残っている。
   `import cats.effect.kernel.Ref` のように実クラスを直接指せば通る（「import の残り」(a) と同じ穴）
 - **trait の `val` / `lazy val` を継承先から読む codegen**（`IncompatibleClassChangeError: Found interface T, but class was expected`。lazysig 以前からある別件。fixture は trait の `def` を使って回避している）
+- **`agent/mutcoll` スライスで残っているもの**: (a) **`mutable.Buffer` のコンパニオンは参照の順に依存する**（このスライス以前からある既存バグで、`prelude_mutcoll` を外しても同じように再現する）。`mutable.Buffer(1, 2, 3)` / `mutable.Buffer[Int]()` を先に書けば `Buffer.empty[Int]` も通るが、`Buffer.empty[Int]` が `Buffer` の**最初の**言及だと型検査は通って実行時に `RuntimeException: select Buffer` になり、同じコンパイル単位で先に `Buffer` を**型として**使うと `value apply is not a member of Buffer$` になる（`object Buffer extends SeqFactory.Delegate[Buffer]` を pickle から補完する経路の順序依存で、`find_or_stub_java_class` のコンパニオン周り = 別スライスの担当）。`ArrayBuffer` / `ListBuffer` を経由すれば動く。(b) `mutable.PriorityQueue` の `Ordering` は暗黙値がスコープにあるものだけ（`Int` / `Long` / `Double` / `String` / `Boolean` など prelude が持つもの）。(c) `ArraySeq` は `apply` / `update` / `length` / `size` / `toList` / `mkString` までで、`ofInt` などの特殊化サブクラスは宣言していない。(d) `Queue.dequeueFirst` / `dequeueAll` / `Stack.popAll` / `popWhile` / `ArrayDeque.removeHead` などの残りのメンバーは pickle 供給頼みで、供給されないものは診断になる
 
 - **私有ランタイムの `Tuple2` に `toString` が無い**（`agent/hkinfer` で気づいた、
   自動タプル化とは無関係の別件。main でも同じ）。`--no-scala-library` では

@@ -20,6 +20,14 @@ const GROWABLE: &[&str] = &[
     "scala/collection/mutable/ArrayDeque",
     "scala/collection/mutable/Set",
     "scala/collection/mutable/Map",
+    // Declared by `prelude_mutcoll`; they reach `Growable` / `Shrinkable` the
+    // same way, and the generic `scala/collection/mutable/` arm in
+    // `gen.rs` already emits the interface call for all three operators.
+    "scala/collection/mutable/Queue",
+    "scala/collection/mutable/Stack",
+    "scala/collection/mutable/TreeMap",
+    "scala/collection/mutable/TreeSet",
+    "scala/collection/mutable/PriorityQueue",
 ];
 
 pub fn install(st: &mut SymbolTable) {

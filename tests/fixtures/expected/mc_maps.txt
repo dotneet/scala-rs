@@ -1,0 +1,16 @@
+List((d,4), (e,5))
+true
+List((x,1), (y,2), (z,3))
+List((j,2))
+List((x,1), (y,2), (z,3))
+List(1, 4, 5)
+true
+List(9)
+List(2, 3)
+List(3, 2, 4)
+List(30, 4, 5)
+List(20, 3, 4)
+List(7, 4, 9)
+List()
+List()
+List((inner,42))

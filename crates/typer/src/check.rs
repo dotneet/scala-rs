@@ -7583,16 +7583,18 @@ impl Typer {
             return true;
         }
         if !qual_ty.is_error() {
+            // One error, two lines -- what nsc reports here. Raising them as
+            // two errors doubled the count and, worse, read as a second,
+            // independent failure: `m("a") = 1` on the line above a bad
+            // `s -= 2` looked like the thing that "does not convert to
+            // assignment", and the `update` desugar was blamed for it.
             self.error(
                 span,
                 format!(
-                    "value {name} is not a member of {}",
+                    "value {name} is not a member of {}\n  Expression does not convert to \
+                     assignment because receiver is not assignable.",
                     self.st.display_type(&qual_ty)
                 ),
-            );
-            self.error(
-                span,
-                "Expression does not convert to assignment because receiver is not assignable.",
             );
         }
         tree.ty = Type::Error;
@@ -9384,11 +9386,7 @@ impl Typer {
                         if let Some(a0) = args.first() {
                             if let Type::Class { args: targs, .. } = &a0.ty {
                                 if targs.len() == 2 {
-                                    if let Some(map) =
-                                        self.st.lookup("Map").into_iter().find(|id| {
-                                            self.st.get(*id).kind == crate::symbol::SymKind::Class
-                                        })
-                                    {
+                                    if let Some(map) = self.factory_result_class(&ret, "Map", 2) {
                                         let targs = self
                                             .factory_targs_from_pt(map, targs, pt)
                                             .unwrap_or_else(|| targs.clone());
@@ -9413,11 +9411,8 @@ impl Typer {
                             .map(|a| a.ty.widen_constant())
                             .reduce(|acc, t| self.lub_ty(&acc, &t))
                         {
-                            if let Some(cls) = self
-                                .st
-                                .lookup(owner_n.trim_end_matches('$'))
-                                .into_iter()
-                                .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)
+                            if let Some(cls) =
+                                self.factory_result_class(&ret, owner_n.trim_end_matches('$'), 1)
                             {
                                 // `List(circle, rect)` is a `List[Shape]`, so the
                                 // element type is the lub of every argument.
@@ -13125,6 +13120,33 @@ impl Typer {
             }
         }
         out
+    }
+
+    /// The class a collection factory's `apply` really builds.
+    ///
+    /// The shortcuts below recompute a factory result's type arguments (the
+    /// lub of the elements, or the pair a `Tuple2` argument carries). They
+    /// used to recover the *class* by looking the companion's simple name up
+    /// in the call site's scope, which is only right for the factories
+    /// `Predef` exports: `scala.collection.mutable.Set(1, 2)` selects
+    /// `mutable.Set$.apply`, and `lookup("Set")` then answered
+    /// `scala.collection.immutable.Set`. The call was inferred to build an
+    /// *immutable* set, so `+=`, `-=` and `add` were "not a member" of it and
+    /// codegen was free to store one into the other. The result type the
+    /// signature already carries names the right class; the shortcut only
+    /// ever means to replace its arguments, so keep its symbol whenever it is
+    /// the companion's own class, and fall back to the scope only when the
+    /// declaration gives nothing usable.
+    fn factory_result_class(&self, ret: &Type, simple: &str, arity: usize) -> Option<SymbolId> {
+        if let Type::Class { sym, args } = ret {
+            if args.len() == arity && self.st.get(*sym).name == simple {
+                return Some(*sym);
+            }
+        }
+        self.st
+            .lookup(simple)
+            .into_iter()
+            .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)
     }
 
     /// A collection factory's element types, widened by the expected type.
