@@ -15,6 +15,7 @@ mod prelude_boxed;
 mod prelude_bsops;
 mod prelude_coll;
 mod prelude_conform;
+mod prelude_durrange;
 mod prelude_either;
 mod prelude_empty;
 mod prelude_fntuple;
@@ -47,6 +48,7 @@ mod quasiquote;
 mod reify;
 mod symbol;
 mod uncurry;
+mod views;
 
 pub use anon_capture::mark_anon_captures;
 pub use check::{

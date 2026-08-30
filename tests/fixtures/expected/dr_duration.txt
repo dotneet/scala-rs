@@ -1,0 +1,13 @@
+1 nanosecond 1 nanosecond 1 nanosecond 1 nanosecond
+2 microseconds 2 microseconds 2 microseconds 2 microseconds
+3 milliseconds 3 milliseconds 3 milliseconds 3 milliseconds
+4 seconds 4 seconds
+5 minutes 5 minutes
+6 hours 6 hours
+7 days 7 days
+8 seconds 8 milliseconds 9 days 10 hours
+1500 milliseconds 250 microseconds 2 minutes
+2000 2 seconds
+1500 milliseconds
+2 seconds
+5 seconds Duration.Inf

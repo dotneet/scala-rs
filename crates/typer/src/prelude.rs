@@ -614,6 +614,10 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool) {
     crate::prelude_boxed::install(st);
     crate::prelude_hier::install(st);
     crate::prelude_fntuple::install(st, library_abi);
+    if library_abi {
+        crate::prelude_durrange::install_range_companion(st);
+        crate::prelude_durrange::install_ordered_companion(st);
+    }
 }
 
 /// Prelude classes are owned by `scala` but carry their real JVM package

@@ -137,6 +137,21 @@ pub enum Intrinsic {
     /// `Int.toByte`), because the receiver's *static* type is what picks the
     /// instruction sequence and `tree.ty` only carries the target.
     NumConv(&'static str),
+    /// `scala.concurrent.duration.package$.DurationInt` and its `DurationLong`
+    /// / `DurationDouble` siblings: an implicit conversion whose target is a
+    /// value class, so nsc lowers it to `new <Box>(arg)` rather than to a call.
+    ///
+    /// The conversion itself really does exist on the package object, but it
+    /// is erased to the identity on the underlying primitive
+    /// (`DurationInt(int)int`), and the unit methods (`seconds`, `millis`, …)
+    /// are ordinary instance methods of the *boxed* `package$DurationInt`.
+    /// Emitting the call and then selecting on its `int` result is what
+    /// `javap` of scalac's own output rules out: it writes
+    /// `new package$DurationInt(5)` and calls `seconds()` on that.
+    ///
+    /// The box class is the conversion's declared result type and the
+    /// constructor's argument its declared parameter type.
+    NewWrapper,
 }
 
 /// What a `def f = macro Impl.method` binds to.

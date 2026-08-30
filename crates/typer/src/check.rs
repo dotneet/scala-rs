@@ -132,7 +132,7 @@ pub struct Typer {
     pub diags: Vec<Diagnostic>,
     pub(crate) file_index: usize,
     /// Counter for synthetic names.
-    gensym: u32,
+    pub(crate) gensym: u32,
     /// Enclosing package clauses; a nested one is relative to the last.
     pkg_nest: Vec<SymbolId>,
     /// Signature pass: fill member types across the whole run before any body
@@ -167,7 +167,7 @@ pub struct Typer {
     /// with the `implicit val classTag` it is about to inherit from it.
     pub(crate) parent_ctor_scope: bool,
     fatal_warnings: bool,
-    library_abi: bool,
+    pub(crate) library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
     pub(crate) return_meth: Option<SymbolId>,
     /// `import scala.language.dynamics` / `-language:dynamics`.
@@ -4206,6 +4206,7 @@ impl Typer {
             .into_iter()
             .find(|&s| matches!(self.st.get(s).kind, SymKind::Module | SymKind::ModuleClass))
         {
+            self.install_duration_syntax(owner, span);
             return Some(self.st.module_class_of(id));
         }
         if !self.load_binary_into(&format!("{pkg_jvm}/package$"), owner, span, true) {
@@ -4224,6 +4225,9 @@ impl Typer {
             }
         }
         self.install_pickled_package_aliases(owner, span);
+        // `scala.concurrent.duration`'s postfix unit syntax (`5.seconds`)
+        // hangs off this package object; see `prelude_durrange.rs`.
+        self.install_duration_syntax(owner, span);
         Some(mcls)
     }
 
@@ -4504,7 +4508,7 @@ impl Typer {
         }
     }
 
-    fn type_expr(&mut self, tree: &mut Tree, pt: &Type) {
+    pub(crate) fn type_expr(&mut self, tree: &mut Tree, pt: &Type) {
         if matches!(&tree.kind, TreeKind::Ident { .. }) {
             let name = match &tree.kind {
                 TreeKind::Ident { name } => name.clone(),
@@ -6180,6 +6184,11 @@ impl Typer {
         let mut tys = tys;
         let mut ret = ret;
         if !undet.is_empty() {
+            // `undet_solution` searches under an immutable borrow and cannot
+            // load a companion itself.
+            for t in tys.clone() {
+                self.warm_implicit_scope(&t);
+            }
             let Some(sol) = self.undet_solution(&tys, &undet) else {
                 return;
             };
@@ -6235,7 +6244,14 @@ impl Typer {
                 .collect();
             let (found, bindings) = self.search_implicit_undet(&pty, &open, 0);
             if !found.is_found() {
-                return None;
+                // No *value* of that type. A function-typed parameter is a
+                // view request, and the conversion that answers it can pin the
+                // open parameters just as well (`List[Option[A]].flatten`).
+                let Some(view) = self.view_undet_bindings(&pty, &open) else {
+                    return None;
+                };
+                solved.extend(view);
+                continue;
             }
             solved.extend(bindings);
         }
@@ -6412,6 +6428,20 @@ impl Typer {
         if found.is_empty() && name == "toString" {
             found = self.st.lookup_member(self.st.any_sym, "toString");
         }
+        // The library's own pickle, *before* the view search: a member the
+        // receiver really has always beats an implicit conversion (SLS 6.26.1
+        // applies a view only when the selection does not type-check, and nsc
+        // has every member loaded by then). scala-rs loads them on demand, so
+        // asking after the view search meant a member that merely had not been
+        // read yet lost to one. `1.second + 500.millis` was the case that
+        // showed it: `FiniteDuration`'s classfile spells `+` as `$plus`, so
+        // lookup missed it, `any2stringadd` claimed the selection, and the
+        // call came out as `no matching overload for (String)String with
+        // arguments (FiniteDuration)` instead of `FiniteDuration.$plus`.
+        // Still gated on nothing having matched, so it can only add members.
+        if found.is_empty() {
+            found = self.supply_from_pickle(&recv_ty, &name);
+        }
         if found.is_empty() {
             if let Some((conv, member, to)) = self.search_extension(&recv_ty, &name, tree.span) {
                 let span = qual.span;
@@ -6449,12 +6479,14 @@ impl Typer {
             self.rewrite_select_dynamic(tree, pt);
             return;
         }
-        if found.is_empty() {
-            // Last resort: the hand-written prelude does not declare it, so
-            // ask the library's own pickle. Nothing above has matched, so this
-            // can only add members, never shadow one.
-            found = self.supply_from_pickle(&recv_ty, &name);
-        }
+        // No second `supply_from_pickle` here: the search above already ran it
+        // for this receiver, and `PickleSupply::complete_named` memoizes
+        // `(class, name)` — asking twice returns the class's *raw* members
+        // under that name, past the `STATIC` filter that
+        // "static Java members are not inherited" depends on
+        // (`java.lang.Integer.valueOf(3).parseInt("12")` stopped being an
+        // error). The one path that moves the receiver, `search_extension`,
+        // leaves `found` non-empty anyway.
         if found.is_empty() {
             // `Any`'s members belong to every type, including the ones with no
             // class symbol to walk: `(f: Int => String).asInstanceOf[…]`.
@@ -10516,6 +10548,11 @@ impl Typer {
                         args.push(lam);
                     } else if let Some(lam) = self.array_wrap_view(&pty, span) {
                         args.push(lam);
+                    // SLS 7.2: an implicit parameter of type `A => B` is a
+                    // view request, and an `implicit def` answers it
+                    // eta-expanded (see `views.rs`).
+                    } else if let Some(lam) = self.conversion_view(&pty, span) {
+                        args.push(lam);
                     } else {
                         self.error(span, self.missing_implicit_message(&pty, diverged));
                     }
@@ -14325,7 +14362,7 @@ impl Typer {
         }
     }
 
-    fn load_binary_into(
+    pub(crate) fn load_binary_into(
         &mut self,
         internal: &str,
         owner: SymbolId,
@@ -14726,7 +14763,63 @@ impl Typer {
         };
     }
 
-    fn adapt(&mut self, tree: &mut Tree, pt: &Type) {
+    /// A method whose first parameter clause is implicit is never a value.
+    ///
+    /// nsc either applies that clause or reports the missing implicit; there
+    /// is no third outcome. scala-rs had one: `adapt_implicit_apply` bails in
+    /// several places (waiting for a `TypeApply`, or for an argument that is
+    /// being typed before its expected type is known), and when nothing ever
+    /// came back to apply the clause, the method type stood as the
+    /// expression's type — and was then **eta-expanded into a function
+    /// value**. `println(List(Some(1), None, Some(3)).flatten)` compiled
+    /// cleanly and printed `Main$$$anonfun$0@7a765367`: a silent miscompile,
+    /// with the lambda substituted for the result. Written where the type is
+    /// visible (`List(Some(1)).flatten.sum`) the same tree surfaced as
+    /// `value sum is not a member of ((Some[Int]) => IterableOnce[B])List[B]`.
+    ///
+    /// This is the backstop. `adapt` runs only when the tree is being used as
+    /// a value with a known expected type, and `adapt_implicit_apply` has
+    /// already had its chance with that same expected type, so a first clause
+    /// still standing here is one that will never be filled. Reported as the
+    /// missing implicit it is, never eta-expanded.
+    ///
+    /// Deliberately *not* fired for `pt: Type::Method` — a method being
+    /// applied by an enclosing `Apply` is typed against a method-shaped
+    /// expected type and `adapt` returns before this — nor for a first clause
+    /// that has an explicit parameter, which really can eta-expand.
+    fn reject_unapplied_implicit_clause(&mut self, tree: &mut Tree) -> bool {
+        let Type::Method { paramss, .. } = &tree.ty else {
+            return false;
+        };
+        if tree.sym.is_none() {
+            return false;
+        }
+        let first = self
+            .st
+            .get(tree.sym)
+            .paramss
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        if first.is_empty()
+            || !first
+                .iter()
+                .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
+        {
+            return false;
+        }
+        let want = paramss
+            .first()
+            .and_then(|c| c.first())
+            .cloned()
+            .unwrap_or_else(|| self.st.get(first[0]).ty.clone());
+        let diverged = self.diverged_implicit.borrow().clone();
+        self.error(tree.span, self.missing_implicit_message(&want, diverged));
+        tree.ty = Type::Error;
+        true
+    }
+
+    pub(crate) fn adapt(&mut self, tree: &mut Tree, pt: &Type) {
         if matches!(pt, Type::Method { .. }) {
             return;
         }
@@ -14735,6 +14828,9 @@ impl Typer {
         }
         // `xs: _*` is already the sequence a repeated parameter takes.
         if matches!(tree.ty, Type::Repeated(_)) {
+            return;
+        }
+        if self.reject_unapplied_implicit_clause(tree) {
             return;
         }
         self.complete_java_type(&tree.ty, tree.span);

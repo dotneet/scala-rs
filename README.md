@@ -346,8 +346,118 @@ witness を見つける探索そのものが決めるしかありません（sli
 第二節が全部 implicit の呼び出しでは、値引数から解けなかった型パラメータを implicit
 パラメータ型から解き、結果型にも反映します。
 
+#### 関数型の implicit パラメータ（view）を implicit def から埋める
+
+SLS 7.2 / 6.26.5 の view です。`A => B` 型の implicit パラメータは、`A => B` の **値**が
+無くても、`A` から `B` への **implicit conversion** を **eta 展開した関数値**で埋まります。
+実 scalac 2.13.16 は `def h[A](x: A, y: A)(implicit ev: A => Ordered[A])` の呼び出しに
+`$anonfun$main$1(int) = Predef.intWrapper(x)` /
+`$anonfun$main$2(String) = Ordered.orderingToOrdered(x)(Ordering.String)` を渡します。
+
+scala-rs にはこの経路がありませんでした。`fill_implicit_params_in` は `A => B` 型の
+**値**だけを探し、見つからなければ `identity_view`（`A <: B`）と `array_wrap_view` という
+二つの決め打ちしか試さないので、implicit def は候補にすら入らず、
+view bound（`def f[A <% B]`、同じ implicit パラメータに脱糖される）ごと
+`no implicit: could not find implicit value of type (Int) => Ordered[Int]` でした。
+
+`crates/typer/src/views.rs` の `Typer::conversion_view` が塞ぎます。`Ordered` 専用の
+特別扱いではありません。普通の view 探索 `search_conversion(A, B)` に訊き、見つかったら
+`(x$n: A) => x$n` を組み立てて **本体を `adapt` に `B` へ適応させる**だけです。
+`val b: B = (a: A)` が通るのとまったく同じ経路・同じ候補選択で、任意の `A => B` に効きます。
+ラムダの型付けは診断マーク付きで行い、本体の適応が何か報告したら巻き戻して `None` を返すので、
+探索が実際に witness を出さなかったものを受け入れることはありません
+（`def h[A](x: A)(implicit ev: A => Ordered[A])` に `new Object` を渡せば、
+実 scalac の `No implicit view available from Object => Ordered[Object]` と同じく拒否）。
+
+あわせて `search_conversion` の候補判定（`implicits.rs` の `conversion_provides`）が
+**多相な implicit def** を見るようになりました。それまでは宣言型のまま比較していたので、
+自分の型パラメータを持つ変換は view 探索から丸ごと見えず、
+`implicit def boxit[T](x: T): Box[T]` があっても `val b: Box[Int] = 3` は通りませんでした。
+いまはメンバー選択側の探索（`conversion_result` / `conv_targs`）と同じやり方で、
+引数型から候補の型パラメータを解いてから結果型を比べます。自分の implicit 節に witness が
+無い変換は nsc と同じく適用対象外です（そうしないと `orderingToOrdered` が
+`Box[Int] => Ordered[Box[Int]]` を名乗って、あとから `Ordering[Box[Int]]` が作れずに落ちます）。
+
+#### 埋まらなかった implicit 節を黙って eta 展開しない
+
+implicit しか取らないメソッドは値ではありません。nsc はその節を適用するか、
+足りない implicit を報告するかのどちらかで、三つ目の結末はありません。
+scala-rs には三つ目がありました。`adapt_implicit_apply` は何箇所かで諦めます
+（`TypeApply` 待ち、あるいは期待型がまだ分からない引数の型付け中）。誰も後から
+節を適用しなかったとき、**メソッド型がそのまま式の型として残り**、`adapt` が
+それを**関数値へ eta 展開**していました。
+`println(List(Some(1), None, Some(3)).flatten)` はエラー無しで通り、実行時に
+`Main$$$anonfun$0@7a765367` を印字します。**サイレントな誤コンパイル**です。
+型が見える書き方（`List(Some(1)).flatten.sum`）にすると同じ木が
+`value sum is not a member of ((Some[Int]) => IterableOnce[B])List[B]`
+として表に出ていました。
+
+`Typer::reject_unapplied_implicit_clause` がその歯止めです。`adapt` は、木が
+既知の期待型のもとで**値として**使われるときにしか走らず、その同じ期待型で
+`adapt_implicit_apply` は既に一度試しています。だからここまで残った第一節は
+もう誰も埋めません。足りない implicit として報告し、eta 展開はしません。
+期待型がメソッド型のとき（＝外側の `Apply` が適用する途中）と、第一節に
+非 implicit のパラメータがあるとき（＝本当に eta 展開できる）は対象外です。
+
+あわせて、関数型の implicit パラメータが**呼び出し側の未決定型パラメータ**を
+持つ場合、その view から解けるようにしました
+（`crates/typer/src/implicits.rs` の `view_undet_bindings`）。
+`flatten[B](implicit asIterable: A => IterableOnce[B])` の `B` は呼び出しの
+どこにも現れないので witness だけが決められますが、その witness は値ではなく
+変換です。変換の結果型を期待型と単一化して `B` を解きます
+（候補側は `Unify` が基底型へ広げるので `Iterable[Int]` を `IterableOnce[B]`
+に合わせられます）。
+
+`scala.math.Ordered` のコンパニオンと
+`implicit def orderingToOrdered[T](x: T)(implicit ord: Ordering[T]): Ordered[T]` は
+`crates/typer/src/prelude_durrange.rs` で宣言します（`javap -p -s scala.math.Ordered$` の
+とおり `Ordered$` のメンバーはこれ一つ）。`--scala-library` 専用です。私有ランタイムは
+`scala/math/Ordered` は出しますが `Ordered$` も `Ordering` も出さないので、jar なしでは
+これまでどおり `no implicit: …` を出します。view 経路そのものは jar に依存しません
+（`tests/fixtures/dr_viewuser.scala` は `--no-scala-library` でも通ります）。
+
 #### prelude の穴
 
+- `scala.concurrent.duration` の後置単位（`5.seconds` / `100.millis` /
+  `1.second + 500.millis`）。`package object duration` の
+  `implicit def DurationInt(n: Int): DurationInt`（`DurationLong` / `DurationDouble` も）と、
+  `DurationConversions` の単位メソッド 20 本（`nanoseconds` / `nanos` / `nanosecond` /
+  `nano`、`micro` 系 4 本、`milli` 系 4 本、`seconds` / `second`、`minutes` / `minute`、
+  `hours` / `hour`、`days` / `day`）です。`Duration(5, SECONDS)` と `Duration.Inf` は
+  もともと jar から読めていました。
+  これらは value class なので、`javap` 上の conversion は `DurationInt(int)int` と
+  **消去された恒等**であり、classfile リーダはそれを `Int => Int` として読み、`IMPLICIT`
+  も付きません（pickle からなら読めますが `PickleSupply` は `scala/` を除外します）。
+  それが `value seconds is not a member of 5` の全部です。単位メソッドは箱側の
+  `package$DurationInt` に**普通のインスタンスメソッド**として実在する（`$extension` は
+  `durationIn` / `hashCode` / `equals` だけ）ので、箱クラスは classfile から読み、
+  足すのは conversion だけです。scalac は `5.seconds` を
+  `new package$DurationInt(5).seconds()` に落とすので、conversion の codegen は
+  `Intrinsic::NewWrapper`（`new <箱>(引数)`）です。
+  package object は遅延ロードなので、この導入も `Typer::package_object_of` から遅延で
+  行います（`FiniteDuration` は jar を読むまで symbol が存在しないため）。
+  `crates/typer/src/prelude_durrange.rs`。`--scala-library` 専用。
+- `Range` のコンパニオン `Range$`。prelude はクラス `Range` しか宣言しておらず、
+  term 位置の識別子 `Range` はクラスシンボルに解決されていました。`Range(0, 5)` は
+  その**クラス自身の** `apply(i: Int): Int`（要素アクセサ）を見つけてしまい、
+  `no matching overload for (Int)Int` になっていました。`javap -p -s
+  scala.collection.immutable.Range$` のとおり `Range$` にあるのは `apply` 2 本 /
+  `inclusive` 2 本 / `count` 2 本（すべて `Int` 版）だけで、`BigInt` / `Long` /
+  `BigDecimal` 版は入れ子オブジェクト `Range.Long` などの側にあります（別スライス）。
+  `apply` は `Range$Exclusive`、`inclusive` は `Range$Inclusive` を返すので、
+  JVM ディスクリプタを明示します（`RichInt.to` が `gen.rs` で必要としたのと同じ理由）。
+  `--scala-library` 専用（prelude はクラス `Range` 自体を `library_abi` で gate しており、
+  jar なしでは `1 until 10` も診断です）。
+- **pickle からのメンバ供給を view 探索より先に**行うようになりました
+  （`type_select`）。SLS 6.26.1 の view は「選択が型検査を通らないとき」にだけ
+  挿さるもので、nsc はその時点で全メンバを読み終えています。scala-rs はメンバを
+  遅延で読むので、供給を view 探索の**後**に置くと「まだ読んでいないだけのメンバ」が
+  暗黙変換に負けていました。`1.second + 500.millis` がその例で、`FiniteDuration` の
+  classfile は `+` を `$plus` と綴るためメンバー探索が外し、`any2stringadd` が
+  選択を横取りして `no matching overload for (String)String with arguments
+  (FiniteDuration)` になっていました。いまは pickle が `+` を供給し、
+  `FiniteDuration.$plus` が呼ばれます。「何も見つかっていないとき」という条件は
+  そのままなので、既存のメンバを隠すことはありません。
 - `scala.math.Numeric[T]` は `scala.math.Ordering[T]` を継承します（実 ABI の
   `interface scala.math.Numeric<T> extends scala.math.Ordering<T>`）。prelude は
   `sum` / `product` 用に `Numeric` を合成するだけでこの親を張っておらず、
@@ -1776,6 +1886,11 @@ implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラー
 
 - 完全な Scala 標準ライブラリ。`--scala-library` なしでは Option / List / FunctionN / Tuple2 は私有ランタイム。**jar にリンクしても** 完全な StringOps / 全 numeric enrichment（`RichByte` など）などは未対応
 - implicit の `scala.Int` コンパニオンの enrichment（jar の `intWrapper` 経由の一部はリンク済み。`Int.MaxValue` 等の companion 定数そのものはこのスライスで実装済み。`RichInt` 側の追加メソッドは別）
+- `Range.Int` / `Range.Long` / `Range.BigInt` / `Range.BigDecimal` の入れ子オブジェクト（`Range$Long$` ほか。`NumericRange` を返す `apply` / `inclusive` を持つ。`Range$` 自体には `Int` 版しか無いことは `javap` で確認済み）
+- 期待型が関数型のときの `implicitly`（`implicitly[Int => Ordered[Int]]`）。`adapt_implicit_apply` は期待型が `Type::Function` だと eta 展開のために早期 return するので、implicit 節が埋まらずメソッド型のまま残ります。関数型の implicit **パラメータ**（`def f(implicit ev: A => B)` と view bound）は実装済みで、これは `implicitly` 側の別の穴です
+- `List[Option[A]].flatten`（`List(Some(1), None, Some(3)).flatten`）。witness は `scala.Option.option2Iterable[A](xo: Option[A]): Iterable[A]` で、classfile からは正しいシグネチャで読めています（`scala.Option.option2Iterable(Some(1))` は動く）が、classfile に `IMPLICIT` は無く、pickle から読める `PickleSupply::supply_implicit_members` は `scala/` を除外するので、探索から見えません。`scala/Option$` をこちらから `load_binary_into` で読み込んで flag を立てる方法は試しましたが、`Option(5)` 自身が通る経路と競合してモジュールクラスに `apply` が二つ入り、`Option(Option(5))` が `ambiguous overload for apply` になるため入れていません。**現状はサイレントな誤コンパイルではなく診断**（`no implicit: could not find implicit value of type (Option[Int]) => IterableOnce[…]`）です
+- `Array[Array[A]].flatten`（`value flatten is not a member of Array[Array[Int]]`）。`ArrayOps.flatten[B](implicit asIterable: A => IterableOnce[B], m: ClassTag[B]): Array[B]` が prelude に無い
+- 直接引数の位置にある、未決定型パラメータを持つ implicit 節（`println(xs.flatten)`）。`instantiate_undet_arg` が探索より先に未決定変数を下限（`Nothing`）へ確定させるので、診断が `IterableOnce[Nothing]` を名指しします。`val v = xs.flatten` と書けば正しく解けます
 
 パーサは未対応構文を黙って捨てず、診断と `Unimplemented` ノードを出します。
 
@@ -2124,6 +2239,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/smallgaps` スライス（`@inline` / `@noinline` の配置、curried case class companion、companion への後方参照、`Option.flatMap` の多相性、`None`/`Some` の `lub`、`Iterable.apply`）のフィクスチャは接頭辞 `sgap`（`sgap` / `sgap_lib`）で、同じ理由から `crates/cli/tests/smallgaps.rs` に置いています。`sgap.scala` は `--no-scala-library` で `check` 済み、`sgap_lib.scala` は `Iterable.apply` が library ABI（`IterableFactory$Delegate.apply` の継承）にしか無いため library dual-run 専用（`fixtures_sgap_lib_without_library_is_error` で `--no-scala-library` が診断のまま残ることも見ています）。
 
+`agent/durrange` スライス（`scala.concurrent.duration` の後置単位、`Range` コンパニオンの `apply` / `inclusive`、関数型の implicit パラメータを implicit def から埋める view 経路）のフィクスチャは接頭辞 `dr`（`dr_duration` / `dr_range` / `dr_view` / `dr_viewuser` / `dr_view_bad`）で、同じ理由から `crates/cli/tests/durrange.rs` に置いています。`dr_duration.scala` は `DurationInt` / `DurationLong` / `DurationDouble` の単位メソッド 20 本すべてと `FiniteDuration` の算術、`dr_range.scala` は `Range$` の `apply` / `inclusive` / `count` 全多重定義（`javap` 上 `Int` 版のみ）、`dr_view.scala` は `Ordered.orderingToOrdered` を eta 展開して渡す経路と view bound を見ます。この 3 本は実ライブラリの jar にしか裏付けが無いので library dual-run 専用で、`expected/*.txt` は real scalac 2.13.16 の stdout そのものです。`fixtures_dr_*_without_library_is_error` が `--no-scala-library` で**きちんと診断される**ことを見ます。`dr_viewuser.scala` は同じ view 経路を利用者が書いた `implicit def`（単相・多相・自分の implicit 節を持つもの・view bound・入れ子の implicit パラメータ）だけで書いたもので、**私有ランタイムと `--scala-library` の両方**で走ります（この経路が jar 依存でないことの確認）。`dr_view_bad.scala` は witness の無い型（`Plain` / `Object`）が両モードで拒否されること（real scalac の `No implicit view available from Plain => Ordered[Plain]` に対応）を固定します。`dr_noimpl_bad.scala` は、**implicit しか取らないメソッドは埋まらなければ型エラー**であること（黙って eta 展開して関数値にしない）を両モードで固定します。
+
 `agent/catsimpl` スライス（ラムダが囲いの `this` を捕まえる、cats の syntax 形の暗黙変換、コンパニオンの implicit スコープ、デフォルト引数を省いた呼び出しの by-name 引数）のフィクスチャは接頭辞 `cats`（`cats_lambda` / `cats_lambda2` / `cats_syntax` / `cats_syntax_bad` / `cats_byname`）で、同じ理由から `crates/cli/tests/catsimpl.rs` に置いています。`cats_lambda.scala` は `List.map` / `flatMap` を使うので library dual-run 専用、`cats_lambda2.scala` は同じ捕捉をライブラリのコレクション抜きで書いてあるので**私有ランタイムと `--scala-library` の両方**で走ります。`cats_syntax.scala` は `implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])` を自前で書いた 1 ファイル版で、抽象 `F[_]` と具象 `Box` の両方の受け手を通します。`cats_syntax_bad.scala` は、変換のパラメータを「1 引数に適用された任意の型」まで広げたことで**witness の無い型にまで変換が挿さらない**こと（scalac と同じ `value flatMap is not a member of Bag[Int]`）を固定します。`a_higher_kinded_companion_implicit_crosses_a_jar` はライブラリを自分でコンパイルして jar に詰め、`ScalaSignature` だけを通して `Async[Box]` ＝ `Box.asyncForBox` が見つかることと、**witness の無い型は依然として hard error**（`could not find implicit value of type Async[Crate]`）であることを両方見ます。
 
 `agent/catsyntax` スライス（cats の syntax による拡張メソッドが本物の cats に届くまで）のフィクスチャは接頭辞 `csyn`（`csyn_ops` / `csyn_ops_bad`）で、同じ理由から `crates/cli/tests/catsyntax.rs` に置いています。`csyn_ops.scala` は cats の `Ops[F[_], A]` と同じ形の受け手に `map` / `flatMap` / `foreach` を呼ぶもので、**暗黙変換を一切使わずに**（`new Ops[Box, Int](b)`）ラムダの引数型が第 1 型引数の `Box` になっていたずれを固定します。私有ランタイムと `--scala-library` の両方で走ります。`csyn_ops_bad.scala` は、ラムダに宣言どおりの引数型を与えても witness の無い呼び出しは通らないこと（`could not find implicit value of type FlatMap[Bag]`）を固定します。`a_simulacrum_style_syntax_layer_crosses_a_jar` は **実 scalac** で小さな cats（`Ops[F, A] { type TypeClassType = FlatMap[F] }` という refinement 結果型、パッケージオブジェクトの入れ子 `object all`、その `all` を `InnerClasses` に載せるだけの無関係なクラス）をコンパイルして jar に詰め、`ScalaSignature` だけを通して `b.flatMap(…)` と `b >> …` が解決し、`java -Xverify:all` で走ることを見ます。自前の pickle ライタは `REFINEDtpe` を出さないので、この fixture は scalac が書いたものでなければ意味がありません（scalac が無い環境では skip します）。同じテストで、witness の無い `Crate` には変換が挿さらないこと（`value flatMap is not a member of Crate[Int]`）も見ます。
@@ -2248,6 +2365,10 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `inline.scala` | `@inline` / `@noinline` を付けたメソッドが動く（インライン化はしない） | `3` |
 | `sgap.scala`（`crates/cli/tests/smallgaps.rs`） | `agent/smallgaps` スライスの複合 fixture: `@inline val` / `@inline @noinline def` の受理、curried 主コンストラクタ（`case class Pair(a: Int)(val b: Int, val c: Int)`）の companion `apply` が正しく curry される、case class のフィールド型が**自分の companion に後方参照する**入れ子型（`Ordering.Direction`）を指すときの解決順序、`case object` が引数付きの `sealed abstract class` を extends するときの module `<init>` codegen、`Option.flatMap` の多相性、`if`/`else` の `None`/`Some` 分岐で（型注釈なしでも）`lub` が `Option[X]` になり `.getOrElse` が解決すること | `42` `6` `true` `n=5` `3` `-1` |
 | `sgap_lib.scala`（`crates/cli/tests/smallgaps.rs`、library dual-run のみ） | `Iterable(...)` companion `apply`（実ライブラリの `IterableFactory$Delegate.apply` 継承。私有ランタイムに裏付けが無いので `--no-scala-library` では診断のまま） | `List(a, b, c)` `3` |
+| `dr_duration.scala`（`crates/cli/tests/durrange.rs`、library dual-run のみ） | `agent/durrange` スライス: `scala.concurrent.duration` の後置単位。`DurationInt` / `DurationLong` / `DurationDouble` の 20 本の単位メソッド（`nanoseconds` / `nanos` / `nanosecond` / `nano` … `days` / `day`）、`FiniteDuration` と `Duration` の相互運用、`+` / `-`、`Duration(5, SECONDS)` / `Duration.Inf` | `1 nanosecond …` `1500 milliseconds` `5 seconds Duration.Inf` |
+| `dr_range.scala`（`crates/cli/tests/durrange.rs`、library dual-run のみ） | `Range` コンパニオン: `Range(0, 5)` / `Range(0, 10, 2)` / `Range.inclusive(1, 3)` / `Range.inclusive(1, 9, 3)` / `Range.count`（`javap` 上 `Range$` にあるのは `Int` 版だけ）と、既に動いていた `1 until 10 by 3` の回帰 | `List(0, 1, 2, 3, 4)` … `4 2,3,4,5` |
+| `dr_view.scala`（`crates/cli/tests/durrange.rs`、library dual-run のみ） | 関数型の implicit パラメータ `implicit ev: A => Ordered[A]` を `Ordered.orderingToOrdered` の eta 展開で埋める。view bound `A <% Ordered[A]`、入れ子の implicit パラメータ、素の `val o: Ordered[Int] = 3` も同じ探索 | `5` `b` `2.5` … `true` `false` |
+| `dr_viewuser.scala`（`crates/cli/tests/durrange.rs`、私有ランタイム・library dual-run） | 同じ view 経路を利用者の `implicit def` だけで。単相な変換、自分の implicit 節を持つ多相な変換、view bound、implicit パラメータを内側の呼び出しへ渡し直す形、**未決定型パラメータを view の結果型から解く**形（`def unwrap[A, B](a: A)(implicit view: A => Wrap[B]): B`） | `<i7>` `<shi>` `7` `hi` `<szz>` `<i1>\|<i2>` `<sa>\|<sb>` `2 w9` |
 | `cats_lambda.scala`（`crates/cli/tests/catsimpl.rs`、library dual-run のみ） | `agent/catsimpl` スライス: ラムダが囲いの `this` を捕まえる（trait のデフォルトメソッド内、クラスの暗黙 `this`、明示 `this.`、フィールド読み、入れ子ラムダ、`object` のメンバは `MODULE$` 経由で `this` が要らないこと）。`List.map` / `flatMap` を使うので library 限定 | `List(2, 4, 6)` … `List(3, 6, 9)` |
 | `cats_lambda2.scala`（`crates/cli/tests/catsimpl.rs`、私有ランタイム・library dual-run） | 同じ `$outer` 捕捉をライブラリのコレクション抜きで書いたもの。無ければ `M2$$anonfun$0 cannot be cast to M2` で落ちる（型検査は通る） | `10` `10` `6` `6` `105` `7` `15` |
 | `cats_syntax.scala`（`crates/cli/tests/catsimpl.rs`、library dual-run） | cats の syntax 形の暗黙変換 `implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])`: 受け手の**型構築子**から `F` を解く（以前は `AnyRef`）、変換自身の implicit 節を適用する（以前は落として descriptor より 1 引数少ない呼び出しになり `VerifyError`）、コンパニオンの `implicit def flatMapForBox` | `3` `41` `14` |
