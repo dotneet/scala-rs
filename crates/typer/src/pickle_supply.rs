@@ -311,9 +311,23 @@ impl PickleSupply {
 
         // Member names in declaration order, deduplicated: `complete_named`
         // installs every overload of a name at once.
+        //
+        // `MemberKind::Val` alongside `Def`: a package object's `val Resource
+        // = cats.effect.kernel.Resource` compiles to a zero-arg accessor
+        // method indistinguishable, at the class-file level, from an
+        // ordinary `def` -- nothing in the bytecode says "this one is
+        // stable". Excluding vals here left the raw-classfile `Method`
+        // symbol `fill_java_members` had already installed as the only
+        // description of `Resource`, and `ident_is_stable` (correctly)
+        // refuses a bare `Method`. `Resource.ExitCase` then failed with
+        // "stable identifier required, but Resource found" even though the
+        // source is a plain `val`. `complete_named` installs a `Val` hit the
+        // same way it installs a zero-clause `Def` and marks the result
+        // `Flags::ACCESSOR`, which `ident_is_stable` / `member_is_stable` now
+        // read as a val's stability, not a def's absence of it.
         let mut names: Vec<String> = Vec::new();
         for m in &sig.members {
-            if m.kind != MemberKind::Def || !m.is_public_api() {
+            if (m.kind != MemberKind::Def && m.kind != MemberKind::Val) || !m.is_public_api() {
                 continue;
             }
             let src_name = scala_rs_pickle::names::decode_method_name(&m.name);
@@ -562,7 +576,7 @@ impl PickleSupply {
         let mut took_function: Vec<usize> = Vec::new();
         for hit in &hits {
             let m = &hit.member;
-            if m.kind != MemberKind::Def {
+            if m.kind != MemberKind::Def && m.kind != MemberKind::Val {
                 continue;
             }
             if !m.is_public_api() && !(synthetic_ok && is_default_getter(&m.name)) {
@@ -595,6 +609,21 @@ impl PickleSupply {
                 &mut seen_shapes,
                 &mut took_function,
             ) {
+                // A `val`'s accessor is stable; `ident_is_stable` /
+                // `member_is_stable` read this flag to accept it as a path
+                // prefix in type position (`Resource.ExitCase`) and in
+                // `stable identifier required` checks generally.
+                //
+                // `MemberKind::Val` is *not* the signal: nsc's pickle marks a
+                // package object's `val` accessor with `pflags::METHOD` too
+                // (it is a real zero-arg method once compiled), so `read()`
+                // (`crates/pickle/src/sym.rs`) classifies it as `Def`, same as
+                // an ordinary `def`. `pflags::STABLE` is the flag nsc itself
+                // uses to tell the two apart, and is set regardless of which
+                // `MemberKind` the entry came out as.
+                if m.has(pflags::STABLE) {
+                    st.get_mut(id).flags = st.get(id).flags.with(Flags::ACCESSOR);
+                }
                 installed.push(id);
             }
         }
@@ -1427,6 +1456,29 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
     })
 }
 
+/// The variance flags for `tp`, as `SLS 4.5` records them and `is_sub_type`
+/// reads them (`Flags::COVARIANT` / `Flags::CONTRAVARIANT`).
+///
+/// A JVM generic signature cannot write variance at all -- it is a
+/// compile-time-only concept, erased before the `Signature` attribute is
+/// produced -- so a class installed purely from a class file (or stubbed
+/// through `find_or_stub_java_class`) has every type parameter invariant.
+/// `Outcome[+A]`'s pickle is the only place `A`'s variance survives; without
+/// this, `case object Canceled extends Outcome[Nothing]`'s parent
+/// `Outcome[Nothing]` failed `is_sub_type` against `Outcome[Int]` (invariant
+/// comparison demands `Nothing =:= Int`), surfacing as "type mismatch; found:
+/// Canceled$ required: Outcome[Int]" for every case object nested in a
+/// companion whose trait a jar declares covariant.
+fn variance_flags(tp: &scala_rs_pickle::sym::TParam) -> Flags {
+    if tp.variance > 0 {
+        Flags::COVARIANT
+    } else if tp.variance < 0 {
+        Flags::CONTRAVARIANT
+    } else {
+        Flags::EMPTY
+    }
+}
+
 /// Give a binary class's type parameters the kinds its pickle declares.
 ///
 /// A JVM generic signature writes `trait Monad[F[_]]` as `<F:Ljava/lang/Object;>`
@@ -1449,7 +1501,13 @@ fn adopt_tparam_kinds(
         }
         let mut fresh = Vec::new();
         for tp in &sig.tparams {
-            let id = st.alloc(&tp.name, class_sym, SymKind::TypeParam, Flags::EMPTY, "");
+            let id = st.alloc(
+                &tp.name,
+                class_sym,
+                SymKind::TypeParam,
+                variance_flags(tp),
+                "",
+            );
             st.get_mut(id).ty = Type::TypeParam(id);
             set_tparam_arity(st, id, tparam_arity(tp));
             fresh.push(id);
@@ -1464,6 +1522,7 @@ fn adopt_tparam_kinds(
         if st.get(id).tparams.is_empty() {
             set_tparam_arity(st, id, tparam_arity(tp));
         }
+        st.get_mut(id).flags = st.get(id).flags.with(variance_flags(tp));
     }
 }
 
@@ -1591,9 +1650,23 @@ impl PickleSupply {
             SigType::Refined { parents, decls } => {
                 self.conv_refined(st, bin, scope, parents, decls, d)
             }
-            // A `val`'s own type is fine, but the remaining forms (singletons,
-            // `super`, bare bounds, literal types) have no faithful
-            // counterpart here yet.
+            // `p.x.type`: a package object's `val Resource = cats.effect.
+            // kernel.Resource` -- exactly the shape `cats.effect`'s real
+            // package object uses to re-export the kernel module -- has this
+            // as its inferred type, `sym` carrying the referent's full dotted
+            // name ("cats.effect.kernel.Resource") the same way `Ref` does
+            // for an ordinary class. `ensure_class(.., module: true)` finds
+            // its module class exactly as `Ref` finds a class's; only that
+            // shape (a *module's own* singleton type) is handled; a `.type`
+            // that resolves to something other than a module (a local `val`,
+            // `this.type`-like paths this pickle reader has not modelled) has
+            // no counterpart to build and is declined like the rest.
+            SigType::Single { sym, .. } => {
+                let cls = self.ensure_class(st, bin, sym, true)?;
+                Some(Type::ModuleRef(cls))
+            }
+            // The remaining forms (`super`, bare bounds, literal types) have
+            // no faithful counterpart here yet.
             _ => None,
         }
     }
