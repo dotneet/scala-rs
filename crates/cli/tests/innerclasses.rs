@@ -379,10 +379,13 @@ fn inner_local_anon_has_no_outer_and_is_final() {
 
 /// The local class (`class LocalC(...)` inside `def main`): a self-entry
 /// with its real name and no outer, plus `EnclosingMethod`. Real scalac:
-/// `public #11= #2;  // LocalC$1=class Main$LocalC$1` (scala-rs does not yet
-/// append nsc's disambiguating `$1` suffix to a local class's own name — a
-/// pre-existing, unrelated naming gap — so this checks the un-suffixed name
-/// scala-rs actually emits).
+/// `public #11= #2;  // LocalC$1=class Main$LocalC$1`.
+///
+/// The *binary* name now matches nsc's, `$1` and all (`agent/localtrait`:
+/// without the index two same-named local classes shared one classfile). The
+/// `inner_name` still differs — nsc repeats the indexed tail (`LocalC$1`),
+/// scala-rs keeps the source name (`LocalC`), so `getSimpleName` differs for
+/// a local class. Nothing else reads it, and no fixture pins it.
 #[test]
 fn inner_local_class_has_no_outer() {
     if !javap_available() {
@@ -390,7 +393,7 @@ fn inner_local_class_has_no_outer() {
         return;
     }
     let out = compile("inner_local", "localc-javap", &["--no-scala-library"]);
-    let local = out.join("Main$LocalC.class");
+    let local = out.join("Main$LocalC$1.class");
     assert_inner_classes(&local, vec![InnerEntry::local("LocalC", "public")]);
     assert_has_enclosing_method(&local);
     let _ = fs::remove_dir_all(&out);

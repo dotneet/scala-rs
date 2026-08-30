@@ -133,6 +133,9 @@ pub struct Typer {
     pub(crate) file_index: usize,
     /// Counter for synthetic names.
     pub(crate) gensym: u32,
+    /// Per-binary-name index for *local* classes/objects (`Main$Same$1`,
+    /// `Main$Same$2`), keyed by the un-indexed binary name.
+    local_class_n: std::collections::HashMap<String, u32>,
     /// Enclosing package clauses; a nested one is relative to the last.
     pkg_nest: Vec<SymbolId>,
     /// Signature pass: fill member types across the whole run before any body
@@ -425,6 +428,7 @@ impl Typer {
             diags: Vec::new(),
             file_index,
             gensym: 0,
+            local_class_n: std::collections::HashMap::new(),
             pkg_nest: Vec::new(),
             sigs_only: false,
             sig_done: std::collections::HashSet::new(),
@@ -579,7 +583,8 @@ impl Typer {
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
                 if mods.flags.contains(Flags::CASE) {
-                    self.ensure_companion(name, id);
+                    let class_jvm = jvm.clone();
+                    self.ensure_companion(name, &class_jvm, id);
                 }
             }
             TreeKind::ModuleDef { name, mods, .. } => {
@@ -630,14 +635,22 @@ impl Typer {
         }
     }
 
-    fn jvm_for_current(&self, name: &str) -> String {
+    fn jvm_for_current(&mut self, name: &str) -> String {
         // A class defined inside a method (`new S { … }`) has the method as
         // its owner; nsc still names it after the enclosing class.
         let mut owner = self.st.owner;
+        // Did we have to walk *through* a term (a method, a `val`'s
+        // initializer, a lambda) to reach the enclosing class? Then this is a
+        // *local* declaration, and its simple name is only unique within that
+        // one term: two methods of the same class may each declare a `trait
+        // Same`. nsc appends a fresh index (`Main$Same$1`, `Main$Same$2`); we
+        // did not, so the second classfile silently overwrote the first and
+        // both call sites got the second one's code.
+        let mut local = false;
         while !owner.is_none() {
             let ow = self.st.get(owner);
             if ow.kind == SymKind::Package {
-                return if ow.name != "<_root_>"
+                let base = if ow.name != "<_root_>"
                     && !ow.jvm_name.is_empty()
                     && ow.jvm_name != "scala/runtime"
                 {
@@ -645,17 +658,33 @@ impl Typer {
                 } else {
                     name.to_string()
                 };
+                return self.uniquify_local(base, local, name);
             }
             let base = ow.jvm_name.trim_end_matches('$');
             if !base.is_empty() {
-                return format!("{base}${name}");
+                return self.uniquify_local(format!("{base}${name}"), local, name);
             }
+            local = true;
             owner = ow.owner;
         }
-        name.to_string()
+        self.uniquify_local(name.to_string(), local, name)
     }
 
-    fn ensure_companion(&mut self, name: &str, class_id: SymbolId) -> SymbolId {
+    /// nsc's local-class index. Anonymous classes already carry a fresh
+    /// `$anon$N` in their simple name, so they are left alone.
+    fn uniquify_local(&mut self, base: String, local: bool, simple: &str) -> String {
+        if !local || simple.starts_with("$anon") {
+            return base;
+        }
+        let n = self.local_class_n.entry(base.clone()).or_insert(0);
+        *n += 1;
+        format!("{base}${n}")
+    }
+
+    /// `class_jvm` is the companion's *class*'s binary name: a local case
+    /// class carries an index (`Main$P$1`) that the companion has to reuse
+    /// rather than draw a fresh one for.
+    fn ensure_companion(&mut self, name: &str, class_jvm: &str, class_id: SymbolId) -> SymbolId {
         let existing = self
             .st
             .lookup(name)
@@ -664,7 +693,7 @@ impl Typer {
         if let Some(e) = existing {
             return e;
         }
-        let jvm = format!("{}$", self.jvm_for_current(name));
+        let jvm = format!("{class_jvm}$");
         let cls = self.st.alloc(
             &format!("{name}$"),
             self.st.owner,

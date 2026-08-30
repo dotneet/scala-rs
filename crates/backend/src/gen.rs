@@ -322,6 +322,59 @@ fn capture_slots(st: &SymbolTable, boxed: &HashSet<SymbolId>, class_id: SymbolId
         .collect()
 }
 
+/// A `trait` has no constructor, so an enclosing-method local its body reads
+/// cannot be a constructor parameter the way a local `class`'s is. The only
+/// handle the trait's `$class` implementation has is `$this`, typed as the
+/// interface — so each captured local becomes an accessor the interface
+/// declares abstract and every implementing class provides from its own
+/// capture field (nsc does the same, as `outerVal$1()` plus a mixin setter).
+///
+/// Keyed by the captured symbol rather than by its position in any one
+/// trait's capture list: two traits mixed into the same class may capture
+/// different locals that share a simple name, and a positional name would
+/// then collapse them into one accessor.
+fn capture_accessor_name(st: &SymbolTable, id: SymbolId) -> String {
+    format!("{}${}", st.get(id).name, id.0)
+}
+
+/// `(symbol, accessor name, getter descriptor, sort)` for each enclosing-method
+/// local `trait_id` itself captures. Empty for every non-local trait.
+fn trait_capture_accessors(
+    st: &SymbolTable,
+    boxed: &HashSet<SymbolId>,
+    trait_id: SymbolId,
+) -> Vec<(SymbolId, String, String, JvmSort)> {
+    class_captures(st, trait_id)
+        .iter()
+        .map(|c| {
+            (
+                *c,
+                capture_accessor_name(st, *c),
+                format!("(){}", capture_field_desc(st, boxed, *c)),
+                capture_field_sort(boxed, st, *c),
+            )
+        })
+        .collect()
+}
+
+/// Read the captured locals of a trait back through the interface accessors,
+/// so the ordinary `Ident` path finds them in the frame while emitting the
+/// trait's `$class` bodies. Mirrors [`emit_capture_prologue`], but the values
+/// come from `$this` rather than from `this`'s own fields.
+fn emit_trait_capture_prologue(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    iface: &str,
+    caps: &[(SymbolId, String, String, JvmSort)],
+) {
+    for (id, aname, adesc, sort) in caps {
+        asm.aload(0);
+        asm.invokeinterface(iface, aname, adesc);
+        let slot = frame.alloc(*id, *sort);
+        store(asm, slot, *sort);
+    }
+}
+
 /// Read the capture fields into fresh locals at method entry, so the ordinary
 /// `Ident` path keeps finding the enclosing-method symbols in the frame.
 fn emit_capture_prologue(
@@ -1897,14 +1950,148 @@ fn flatten_apply_owned<'a>(fun: &'a Tree, args: &'a [Tree]) -> (&'a Tree, Vec<Tr
 // walk
 // ---------------------------------------------------------------------------
 
+/// Every subtree of `tree` that can hold a term. Used by passes that look for
+/// one specific shape anywhere in a unit — a declaration can sit in a template
+/// body, a method body, an `if` branch, a `match` case or a lambda, and a pass
+/// that only descends through templates silently misses all but the first.
+fn for_each_term_child(tree: &Tree, f: &mut impl FnMut(&Tree)) {
+    match &tree.kind {
+        TreeKind::PackageDef { stats, .. } => {
+            for s in stats {
+                f(s);
+            }
+        }
+        TreeKind::Block { stats, expr } => {
+            for s in stats {
+                f(s);
+            }
+            f(expr);
+        }
+        TreeKind::ClassDef {
+            vparamss, impl_, ..
+        } => {
+            for p in vparamss.iter().flatten() {
+                f(p);
+            }
+            for p in &impl_.parents {
+                f(p);
+            }
+            for s in &impl_.body {
+                f(s);
+            }
+        }
+        TreeKind::ModuleDef { impl_, .. } => {
+            for p in &impl_.parents {
+                f(p);
+            }
+            for s in &impl_.body {
+                f(s);
+            }
+        }
+        TreeKind::ValDef { tpt, rhs, .. } => {
+            f(tpt);
+            f(rhs);
+        }
+        TreeKind::DefDef {
+            vparamss, tpt, rhs, ..
+        } => {
+            for p in vparamss.iter().flatten() {
+                f(p);
+            }
+            f(tpt);
+            f(rhs);
+        }
+        TreeKind::TypeDef { rhs, .. } => f(rhs),
+        TreeKind::LabelDef { params, rhs, .. } => {
+            for p in params {
+                f(p);
+            }
+            f(rhs);
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            f(cond);
+            f(thenp);
+            f(elsep);
+        }
+        TreeKind::Match { selector, cases } => {
+            f(selector);
+            for c in cases {
+                f(&c.pat);
+                f(&c.guard);
+                f(&c.body);
+            }
+        }
+        TreeKind::Function { vparams, body } => {
+            for p in vparams {
+                f(p);
+            }
+            f(body);
+        }
+        TreeKind::Assign { lhs, rhs } => {
+            f(lhs);
+            f(rhs);
+        }
+        TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
+            f(cond);
+            f(body);
+        }
+        TreeKind::Return { expr } | TreeKind::Throw { expr } | TreeKind::New { tpt: expr } => {
+            f(expr)
+        }
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            f(block);
+            for c in catches {
+                f(&c.pat);
+                f(&c.guard);
+                f(&c.body);
+            }
+            f(finalizer);
+        }
+        TreeKind::Typed { expr, tpt } => {
+            f(expr);
+            f(tpt);
+        }
+        TreeKind::TypeApply { fun, args }
+        | TreeKind::Apply { fun, args }
+        | TreeKind::UnApply { fun, args } => {
+            f(fun);
+            for a in args {
+                f(a);
+            }
+        }
+        TreeKind::Select { qual, .. }
+        | TreeKind::SelectFromTypeTree { qual, .. }
+        | TreeKind::Bind { body: qual, .. }
+        | TreeKind::Star { elem: qual }
+        | TreeKind::SingletonTypeTree { ref_: qual } => f(qual),
+        TreeKind::Alternative { trees } => {
+            for t in trees {
+                f(t);
+            }
+        }
+        TreeKind::AppliedTypeTree { tpt, args } => {
+            f(tpt);
+            for a in args {
+                f(a);
+            }
+        }
+        TreeKind::AnnotatedTypeTree { tpt, .. } => f(tpt),
+        TreeKind::InterpolatedString { args, .. } => {
+            for a in args {
+                f(a);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl<'a> Gen<'a> {
     fn collect_trait_impls(&mut self, tree: &Tree) {
         match &tree.kind {
-            TreeKind::PackageDef { stats, .. } => {
-                for s in stats {
-                    self.collect_trait_impls(s);
-                }
-            }
             TreeKind::ClassDef { mods, impl_, .. } => {
                 if mods.flags.contains(Flags::TRAIT) {
                     let methods: Vec<Tree> = impl_
@@ -1950,16 +2137,15 @@ impl<'a> Gen<'a> {
                         self.trait_lazy_vals.insert(tree.sym, lazies);
                     }
                 }
-                for s in &impl_.body {
-                    self.collect_trait_impls(s);
-                }
+                for_each_term_child(tree, &mut |c| self.collect_trait_impls(c));
             }
-            TreeKind::ModuleDef { impl_, .. } => {
-                for s in &impl_.body {
-                    self.collect_trait_impls(s);
-                }
-            }
-            _ => {}
+            // A `trait` is not only a template member: it can be declared in
+            // any block — a method body, an `if` branch, a lambda. Those local
+            // traits need their concrete members harvested exactly like a
+            // top-level one's, or every class mixing them in is emitted with
+            // no mixin forwarders at all and fails at run time with
+            // `AbstractMethodError`.
+            _ => for_each_term_child(tree, &mut |c| self.collect_trait_impls(c)),
         }
     }
 
@@ -2218,6 +2404,10 @@ impl<'a> Gen<'a> {
                         );
                     }
                 }
+            }
+            for (_, aname, adesc, _) in trait_capture_accessors(self.st, &self.boxed_vars, class_id)
+            {
+                b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, &aname, &adesc);
             }
             attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
             self.out
@@ -3225,45 +3415,54 @@ impl<'a> Gen<'a> {
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
         let vals = vals.to_vec();
-        b.add_code(ACC_PUBLIC | ACC_STATIC, "$init$", &desc, 4, |asm| {
-            let mut frame = Frame::instance();
-            let ctx = emit_ctx(
-                st,
-                trait_id,
-                &iface_owned,
-                Type::Unit,
-                extras,
-                lambda_n,
-                source,
-                library_abi,
-                boxed_vars,
-            );
-            for vd in &vals {
-                if let TreeKind::ValDef {
-                    name, mods, rhs, ..
-                } = &vd.kind
-                {
-                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
-                        continue;
+        let caps = trait_capture_accessors(self.st, boxed_vars, trait_id);
+        let max_locals = 4 + caps.iter().map(|c| c.3.slots()).sum::<u16>();
+        b.add_code(
+            ACC_PUBLIC | ACC_STATIC,
+            "$init$",
+            &desc,
+            max_locals,
+            |asm| {
+                let mut frame = Frame::instance();
+                emit_trait_capture_prologue(asm, &mut frame, &iface_owned, &caps);
+                let ctx = emit_ctx(
+                    st,
+                    trait_id,
+                    &iface_owned,
+                    Type::Unit,
+                    extras,
+                    lambda_n,
+                    source,
+                    library_abi,
+                    boxed_vars,
+                );
+                for vd in &vals {
+                    if let TreeKind::ValDef {
+                        name, mods, rhs, ..
+                    } = &vd.kind
+                    {
+                        if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                            continue;
+                        }
+                        asm.aload(0);
+                        gen_expr(asm, &mut frame, &ctx, rhs);
+                        let ty = val_tree_ty(st, vd);
+                        let setter = trait_member_setter_name(
+                            st,
+                            trait_id,
+                            name,
+                            mods.flags.contains(Flags::MUTABLE),
+                        );
+                        asm.invokeinterface(
+                            &iface_owned,
+                            &setter,
+                            &format!("({})V", jvm_desc(st, &ty)),
+                        );
                     }
-                    asm.aload(0);
-                    gen_expr(asm, &mut frame, &ctx, rhs);
-                    let ty = val_tree_ty(st, vd);
-                    let setter = trait_member_setter_name(
-                        st,
-                        trait_id,
-                        name,
-                        mods.flags.contains(Flags::MUTABLE),
-                    );
-                    asm.invokeinterface(
-                        &iface_owned,
-                        &setter,
-                        &format!("({})V", jvm_desc(st, &ty)),
-                    );
                 }
-            }
-            asm.vreturn();
-        });
+                asm.vreturn();
+            },
+        );
     }
 
     fn emit_trait_impl_method(
@@ -3309,8 +3508,11 @@ impl<'a> Gen<'a> {
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
         let meth = def.sym;
+        let caps = trait_capture_accessors(self.st, boxed_vars, trait_id);
+        let max_locals = max_locals + caps.iter().map(|c| c.3.slots()).sum::<u16>();
         b.add_code(ACC_PUBLIC | ACC_STATIC, name, &desc, max_locals, |asm| {
             let mut frame = frame;
+            emit_trait_capture_prologue(asm, &mut frame, &iface_owned, &caps);
             let mut ctx = emit_ctx(
                 st,
                 trait_id,
@@ -3641,8 +3843,61 @@ impl<'a> Gen<'a> {
                 emit_return(asm, &ret);
             });
         }
+        self.emit_trait_capture_accessors(b, class_id, &lin);
         if !self.library_abi {
             self.emit_ordered_forwarders(b, class_id, &defined);
+        }
+    }
+
+    /// Implement the capture accessors every mixed-in *local* trait declares
+    /// abstract, reading this class's own capture field. The trait's `$class`
+    /// body has nothing but `$this` to reach an enclosing-method local
+    /// through; `anon_capture` has already made this class capture whatever
+    /// its traits capture, so the field is here.
+    fn emit_trait_capture_accessors(
+        &self,
+        b: &mut ClassBuilder,
+        class_id: SymbolId,
+        lin: &[SymbolId],
+    ) {
+        // Not gated on this class having captures of its own: if a mixed-in
+        // trait captures and this class somehow did not, the accessor still
+        // has to be *declared* here — see the `else` arm below, which says so
+        // out loud rather than leaving an abstract method behind.
+        let slots = capture_slots(self.st, &self.boxed_vars, class_id);
+        let class_name = b.this_name.clone();
+        let mut done: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
+        for parent in lin.iter().skip(1) {
+            if !is_interface_sym(self.st, *parent) {
+                continue;
+            }
+            for (id, aname, adesc, sort) in
+                trait_capture_accessors(self.st, &self.boxed_vars, *parent)
+            {
+                if !done.insert(aname.clone()) {
+                    continue;
+                }
+                let Some((_, fname, fdesc, _)) = slots.iter().find(|s| s.0 == id) else {
+                    // `anon_capture` propagates a trait's captures to every
+                    // class mixing it in, so this cannot happen; a missing
+                    // field would be a silently wrong read, so say so.
+                    let msg = format!(
+                        "cannot capture {} for trait {}",
+                        self.st.get(id).name,
+                        self.st.get(*parent).name
+                    );
+                    b.add_code(ACC_PUBLIC, &aname, &adesc, 1, |asm| {
+                        throw_runtime(asm, &msg);
+                    });
+                    continue;
+                };
+                let (cn, fname, fdesc) = (class_name.clone(), fname.clone(), fdesc.clone());
+                b.add_code(ACC_PUBLIC, &aname, &adesc, 1, move |asm| {
+                    asm.aload(0);
+                    asm.getfield(&cn, &fname, &fdesc);
+                    ret_of_sort(asm, sort);
+                });
+            }
         }
     }
 
@@ -5274,7 +5529,11 @@ fn emit_pending_return(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx) {
 }
 
 fn emit_return(asm: &mut Assembler, ty: &Type) {
-    match jvm_sort(ty) {
+    ret_of_sort(asm, jvm_sort(ty));
+}
+
+fn ret_of_sort(asm: &mut Assembler, sort: JvmSort) {
+    match sort {
         JvmSort::Void => asm.vreturn(),
         JvmSort::Int => asm.ireturn(),
         JvmSort::Long => asm.lreturn(),
