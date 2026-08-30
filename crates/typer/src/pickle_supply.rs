@@ -960,7 +960,8 @@ impl PickleSupply {
         // saw both and was `ambiguous overload`, depending on whether
         // something upstream had already touched the class. This is that
         // case: prelude always wins, so a same-shaped hand-written member
-        // already on `class_sym` means nothing more is installed.
+        // already on `class_sym` means nothing new is installed for it --
+        // see below for what is reported instead.
         //
         // `s.0 < st.prelude_end` is the part that must not be dropped: an
         // empty `pickled_origin` is *also* what a member the raw classfile
@@ -973,7 +974,30 @@ impl PickleSupply {
         // signature (`adopt_binary_class` saw `installed.is_empty()` and
         // left the crude classfile one in place), and every case class
         // failed its `Equals` override check with "needs to be abstract".
-        if st.get(class_sym).members.iter().any(|&s| {
+        //
+        // Handing back `None` here -- as if the hit simply could not be
+        // installed -- hid the prelude member from every caller that reads
+        // `complete_named`'s *return value*, not just from `class_sym`'s own
+        // member list (which had it all along). `PickleSupply::complete`'s
+        // class-plus-companion union (`agent/oshadow`, `agent/companionkind`)
+        // builds its answer purely from what completion reports back, never
+        // re-running `lookup_member`; a bare decline made
+        // `scala.math.BigDecimal`'s prelude-written `apply(Int)` /
+        // `apply(String)` / `apply(java.math.BigDecimal)` invisible to that
+        // union the moment something else forced `apply` to complete, and
+        // the overload set `type_select` built -- and `record_overload_group`
+        // then cached under the callee symbol -- had every *other* `apply`
+        // shape but not those three. `BigDecimal(2)` then had no exact match
+        // among `Long` / `Double` / `BigInt` and came out `ambiguous overload`
+        // before `Check::widen_with_companion` (which adds the missing three
+        // back in) ever ran: that fallback only fires when a resolution
+        // reports no match at all, and an *ambiguous* one reports and keeps
+        // a diagnostic straight away. Reporting the existing symbol instead
+        // keeps every caller's count and `found` set exactly as if the
+        // prelude member had always been part of the pickle's own answer,
+        // while still installing nothing new and leaving `class_sym.members`
+        // untouched.
+        if let Some(&blocker) = st.get(class_sym).members.iter().find(|&&s| {
             s.0 < st.prelude_end && {
                 let e = st.get(s);
                 e.name == name
@@ -982,10 +1006,10 @@ impl PickleSupply {
             }
         }) {
             trace(format_args!(
-                "{internal}#{name}: skipping a pickle copy of a hand-written prelude \
-                 overload with the same erased parameters"
+                "{internal}#{name}: a hand-written prelude overload already has these \
+                 erased parameters -- reporting it instead of installing a pickle copy"
             ));
-            return None;
+            return Some(blocker);
         }
         // One declaration per erased parameter list, the first one
         // linearization offers, i.e. the most derived. Two declarations that

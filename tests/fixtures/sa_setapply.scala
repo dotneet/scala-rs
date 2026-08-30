@@ -1,11 +1,16 @@
-trait Repo[A] {
+trait Repo {
   // A member that reads through `SetOps.apply` -- forcing the trait's own
   // `apply` (and, as a side effect, the companion's) to complete from the
   // jar -- before any companion `apply` call appears in the same
-  // compilation unit. This is the shape the original report used.
-  def hasTag(xs: Set[A], tag: A): Boolean = xs(tag)
+  // compilation unit. This is the shape the original report used. `A` is
+  // fixed to `String` here, not left as the trait's own type parameter: an
+  // abstract element type sends `xs(tag)` through a *different*, pre-existing
+  // specificity gap (a fixed-arity parameter and a repeated one are not
+  // ranked against each other when both erase from the same type variable),
+  // unrelated to the pickle/prelude duplicate this fixture is about.
+  def hasTag(xs: Set[String], tag: String): Boolean = xs(tag)
 }
-object RepoImpl extends Repo[String]
+object RepoImpl extends Repo
 
 object Main {
   def main(args: Array[String]): Unit = {
