@@ -149,9 +149,19 @@ impl Typer {
                 continue;
             }
             if let Some(p) = self.pending_sigs.get_mut(&stt.sym) {
-                if p.scopes.is_none() {
-                    p.scopes = Some(scopes.clone());
-                }
+                // The *last* round's scope, not the first. The header pass
+                // repeats until the parent chains stop changing, and only the
+                // later rounds see a class whose grandparents live in a file
+                // that comes later on the command line. slick's
+                // `trait MemoryProfile extends RelationalProfile` writes
+                // `type SchemaDescription = SchemaDescriptionDef`, and
+                // `SchemaDescriptionDef` is a trait it inherits from
+                // `BasicProfile`: with the first round's scope frozen in, a
+                // reference from another unit completed the alias against a
+                // scope that did not have the name yet and left an unresolved
+                // `Type::Named` as its right-hand side. Every round's scope is
+                // this template's own, so a later one is only ever better.
+                p.scopes = Some(scopes.clone());
             }
         }
     }

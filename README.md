@@ -3011,6 +3011,106 @@ slick: `errors 237 → 234`、`type mismatch 20 → 17`、`files_with_errors 60`
   `found: State[_]` に変わっただけで、まだエラーです（cats の
   `Ref.of[F, State[F]]` 側の話）。
 
+### 構築子の上限・自前の `apply`・コンパニオンが継いだ implicit（`type mismatch` 第 12 スライス）
+
+`agent/mismatch12` スライス。フィクスチャは `tests/fixtures/mism12_*.scala` と
+`tests/multi/mism12_*.scala`、テストは `crates/cli/tests/mismatch12.rs` です。
+6 つの原因を直しました。うち 2 つは**型検査を通ったうえで別のメンバ・別の型を
+選んでいた**もので、引き継いだ診断のうち「`(Double)` オーバーロード未供給」
+（第 11 スライス）は正しく、「`Shape` の implicit 導出が本丸」（第 11 スライス）も
+正しかったのですが、真因は導出ではなく**コンパニオンが継承した implicit を
+そもそも候補にしていなかった**ことでした。
+
+1. **型構築子パラメータの上限を、適用の引数で具体化していなかった**。
+   `M[A]`（`M[+X] <: IterableOnce[X]`）は `IterableOnce[A]` です。上限は
+   構築子自身のパラメータで書かれているので、それを置き換えるまで意味を
+   持ちません。`widen_type_param` は**裸の** `M` しか広げていなかったので、
+   slick の `DBIOAction.traverse[A, B, M[+X] <: IterableOnce[X]]` の
+   `in.iterator` は `IterableOnce` 自身の `A` を返し、要素を使うたびに
+   `found: A required: A`（**表示が同じ別シンボル**）になっていました
+   （`DBIOAction.scala:349`）。
+
+2. **case class のコンパニオン `apply` に、クラスの型パラメータをそのまま
+   渡していた**（「クラスの型パラメータがメソッドのものを兼ねる」）。
+   1 つのシンボルが「ここでは決まっている」と「この呼び出しではこれから
+   推論する」の両方を意味してしまい、**クラスの内側からの呼び出し**は
+   `U := U` を代入した結果、引数型がまだ callee の型パラメータを含んだまま
+   ＝「未決定」と読まれ、引数は**上限**に対して検査されました
+   （`found: Bx[U] required: Bx[Any]`）。`fresh_method_tparams` で `apply` に
+   自前の型パラメータ（名前・種・境界は同じ、変位は付けない）を与えます。
+   slick の `ShapedValue.packedValue`（`ShapedValue.scala:16`）が通ります。
+
+3. **`scala.math.BigDecimal` のコンパニオンに `apply` が 17 個中 3 個しか
+   なかった**。手書きの prelude メンバはピクルのコピーを断る
+   （`agent/setapply`）ので、足りない分は**存在しません**。
+   `new ScalaNumericType[BigDecimal](BigDecimal.apply)`（`Type.scala:388`）は
+   `Double => BigDecimal` でイータ展開するので、選ぶ相手が無かったのです。
+   `crates/typer/src/prelude_mism12.rs` に `javap` が出す 17 個ぶんを
+   書きました（`library_abi` のみ。私有ランタイムは `scala/math/BigDecimal$`
+   を出さないので、非 jar モードでは診断が出ます）。
+
+4. **コンパニオンが*継承*した implicit を候補にしていなかった**。SLS 7.2 が
+   言うのはコンパニオン**オブジェクト**で、オブジェクトのメンバには継承した
+   ものも含まれます。slick は `Shape` のインスタンスをすべて
+   `trait RepShapeImplicits` / `ConstColumnShapeImplicits` /
+   `TupleShapeImplicits` に書き、`object Shape extends
+   ConstColumnShapeImplicits with …` としているので、**1 つも候補に
+   なっていませんでした**。`companion_implicits_of_class` を親までたどります。
+   継承したものは裸の名前で出すと `this` を積んで宣言元の trait に
+   キャストするコード（`Main$ cannot be cast to ConstShapes`）になるので、
+   **通ってきたオブジェクトを受け手に**します（`implicit_via_module`。
+   ワイルドカード import に対する既存の `wildcard_module_for` と同じ扱い）。
+
+5. **implicit の単一化が `_` と反変位置を扱えなかった**。求める型の中の `_` は
+   「そこは訊いていない」という意味なので何にでも一致します
+   （`packedValue[R](implicit ev: Shape[? <: FlatShapeLevel, T, ?, R])` の
+   `?` に候補の `U` を構造的に突き合わせて「不一致」と言っていました）。
+   反変パラメータは向きが逆で、**求める型のほうが部分型**です
+   （`constColumnShape: Shape[L, ConstColumn[T], T, ConstColumn[T]]` が
+   `Shape[FlatShapeLevel, LiteralColumn[Boolean], ?, ?BP]` に答える）。
+   4 と 5 で `ExtensionMethods` の `fold`（`BP`）2 件と `Query.scala:290` が
+   通り、そこからの `value toNode/zip is not a member of (…)…` 3 件も消えます。
+
+6. **遅延解決した型エイリアスが、ヘッダパス 1 巡目のスコープで固定されていた**。
+   `refresh_alias_sigs` は保留中のエイリアスに「そのテンプレートのスコープ」を
+   覚えさせますが、**最初の 1 回だけ**でした。ヘッダパスは親チェインが
+   変わらなくなるまで繰り返す設計で、**自分より後のファイルに祖父がいる**
+   クラスの継承メンバは 2 巡目以降にしか見えません。slick の
+   `trait MemoryProfile extends RelationalProfile`（`slick/memory/` は
+   `slick/relational/` より前）は `type SchemaDescription =
+   SchemaDescriptionDef` と書き、`SchemaDescriptionDef` は
+   `BasicProfile` の入れ子 trait で、`MemoryProfile.scala` はその名前を
+   import していません。入れ子クラスのコンストラクタ引数
+   （`class MemorySchemaActionExtensionMethodsImpl(schema: SchemaDescription)`）
+   がヘッダパス中にエイリアスを完成させるので、右辺は**未解決の
+   `Type::Named`** のまま残り、`new DDL(…)` が
+   `found: DDL required: SchemaDescriptionDef`（**両方 `SchemaDescriptionDef`
+   と表示される別物**）になっていました。**最後の**巡回のスコープを使います
+   （どの巡回のスコープもそのテンプレート自身のものなので、後のほうが
+   常により完全です）。第 9〜11 スライスが 3 回続けて最小化に失敗していた
+   2 件で、`tests/multi/mism12_*.scala` の 4 ファイルで再現します。
+
+slick: `errors 223 → 209`、`type mismatch 17 → 9`、`files_with_errors 60`
+（変わらず）。`tests/slick_subset.sh` は `verified=204 failed=0` で変化なし。
+**新しい種類のエラーは 1 つも出ず、新しくエラーになったファイルもありません。**
+
+このスライスで**分かっているが直していない**もの:
+
+- `a ++ b` で `++` が `SchemaDescriptionDef` の宣言（引数は抽象型メンバ
+  `SchemaDescription`）のとき、`MemoryProfile` から見た `++` の引数型が
+  `BasicProfile.SchemaDescription` のままで、`no matching overload for
+  (BasicProfile.SchemaDescription)…` になります。6 とは別の穴
+  （**抽象型メンバの as-seen-from**）なので、`tests/multi/mism12_*.scala`
+  からは外してあります。
+- 残る `type mismatch` 9 件: `Node.scala:636` の
+  `found: <overload String | <error>>`、`ConcurrencyControl.scala:202`、
+  `JdbcActionComponent` の `E with Effect` 2 件、`JdbcModelBuilder` /
+  `SQLiteProfile` の `found: Product required: Option[Option[Any]]` 2 件、
+  `ExtensionMethods.scala:210`（`flatten` の `P <:< Rep[Option[QO]]`）、
+  `Query.scala:153`、`RelationalProfile.scala:72`。
+- 第 11 スライスが記録した `LazyZip2.map` の `BuildFrom` 高階照合は
+  そのままです（4 と 5 では届きません）。
+
 ### ブロックの値を二重に箱詰めしていた（消去）
 
 `agent/anonbridge` スライス。**型検査は通り、実行時に `VerifyError` になる**
@@ -4449,6 +4549,22 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 `mism11_ordinary_element_types_are_unchanged`）と、拒否テスト
 （`mism11_bad_is_still_rejected`、フィクスチャは `mism11_bad.scala`。
 実 scalac 2.13.16 も同じ 3 件を拒否します）も置いてあります。
+
+`mism12_lang.scala` / `mism12_lib.scala` は `crates/cli/tests/mismatch12.rs` から
+回します（`mism12_lang` は**両モード**、`mism12_lib` は library モードのみ。
+私有ランタイムには `IterableOnce` / `Factory` / `scala.math.BigDecimal` の
+コンパニオンが無いので、`mism12_lib_without_library_is_error` で**黙って
+通さない**ことも見ています）。多ファイルの原因は `tests/multi/mism12_basic.scala`
+/ `mism12_memory.scala` / `mism12_relational.scala` / `mism12_use.scala` の 4 本
+（`mism12_late_parent_type_alias_resolves`）で、単一ファイルでは再現しません。
+同ファイルには最小形の受理テスト
+（`mism12_constructor_bound_is_applied` /
+`mism12_case_apply_from_inside_the_class` /
+`mism12_big_decimal_overloads` /
+`mism12_companion_inherits_its_implicits` /
+`mism12_wildcard_and_contravariant_witness`）と、拒否テスト
+（`mism12_bad_is_still_rejected`、フィクスチャは `mism12_bad.scala`。
+実 scalac 2.13.16 も同じ 4 件を拒否します）も置いてあります。
 
 `mism8.scala` は `crates/cli/tests/mismatch8.rs` の
 `mism8_fixture_runs_in_both_modes` から**両モードで**回し、どちらの stdout も
