@@ -1022,6 +1022,106 @@ fn lf2_ctx_lifts_tags_and_exprs_in_a_macro_implementation() {
     let _ = fs::remove_dir_all(&out);
 }
 
+/// `tests/fixtures/lf3_identsym.scala`: `u.Ident(sym: Symbol)`, the overload
+/// `PickleSupply::erased_param_desc` used to drop entirely.
+///
+/// `Ident` is both `val Ident: IdentExtractor` (the tree factory, `apply
+/// (Name)`) *and* a separate convenience method `def Ident(sym: Symbol):
+/// Ident` declared directly on `scala.reflect.internal.Trees` -- confirmed
+/// with `javap` against scala-reflect.jar 2.13.16, which shows
+/// `scala/reflect/api/Trees.class` declaring `abstract Trees$IdentApi Ident
+/// (Symbols$SymbolApi)` right next to the extractor. `erased_param_desc` had
+/// no case for `Type::TypeMember` -- what an abstract type member like
+/// `Symbol` converts to when it is reached from the abstract API rather than
+/// the concrete `JavaUniverse` a macro only gets at expansion time -- and
+/// fell through to the "any reference slot" wildcard, indistinguishable from
+/// `Ident(String)`'s own reference parameter. slick's
+/// `TableQueryMacroImpl.apply` is written in `Ident(typeOf[Tag].typeSymbol)`.
+#[test]
+fn lf3_identsym_supplies_the_symbol_overload_of_ident() {
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip lf3_identsym: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("lf3_identsym");
+    let output = compile_reflect("lf3_identsym", &out, &jar, &reflect);
+    assert!(
+        output.status.success(),
+        "compile lf3_identsym failed: {}",
+        diagnostics(&output)
+    );
+
+    if java_available() {
+        let loader = out.join("loader");
+        fs::create_dir_all(&loader).unwrap();
+        let src = out.join("Loader.scala");
+        fs::write(
+            &src,
+            "object Main {\n  \
+             def main(args: Array[String]): Unit = println(Class.forName(\"Lf3IdentSym$\").getName)\n\
+             }\n",
+        )
+        .unwrap();
+        let built = Command::new(bin())
+            .args([
+                "compile",
+                src.to_str().unwrap(),
+                "-d",
+                loader.to_str().unwrap(),
+                "--scala-library",
+                jar.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run scala-rs compile");
+        assert!(
+            built.status.success(),
+            "compiling the loader failed: {}",
+            diagnostics(&built)
+        );
+        let cp = format!(
+            "{}:{}:{}:{}",
+            loader.display(),
+            out.display(),
+            reflect.display(),
+            jar.display()
+        );
+        let run = Command::new("java")
+            .args(["-Xverify:all", "-cp", &cp, "Main"])
+            .output()
+            .expect("java");
+        assert!(
+            run.status.success(),
+            "the macro implementation's class file does not verify: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "Lf3IdentSym$\n");
+    }
+
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip the scalac half of lf3_identsym: scalac 2.13 not obtainable");
+        let _ = fs::remove_dir_all(&out);
+        return;
+    };
+    let ref_out = tmp_dir("lf3_identsym-scalac");
+    let built = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            ref_out.to_str().unwrap(),
+            fixtures_dir().join("lf3_identsym.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        built.status.success(),
+        "real scalac rejected lf3_identsym.scala: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let _ = fs::remove_dir_all(&ref_out);
+    let _ = fs::remove_dir_all(&out);
+}
+
 /// What `Liftable` refuses, and `reify { … }`, each named.
 ///
 /// The failure that would matter is the quiet one: lifting a type scala-rs has

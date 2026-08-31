@@ -2548,10 +2548,33 @@ impl<'a> Gen<'a> {
                 self.emit_anon_classes(rhs);
             }
             TreeKind::Block { stats, expr } => {
+                // Local `object` names declared alongside a local `case
+                // class` in this same block: like `walk_stats` at the top
+                // level, a user-written companion suppresses the synthetic
+                // one (`type_module` already merged the two).
+                let mut module_names = HashSet::new();
+                for s in stats {
+                    if let TreeKind::ModuleDef { name, .. } = &s.kind {
+                        module_names.insert(name.clone());
+                    }
+                }
                 for s in stats {
                     // Local `class` / `object` declared inside a method body.
                     match &s.kind {
-                        TreeKind::ClassDef { .. } => self.emit_class(s, &HashSet::new()),
+                        TreeKind::ClassDef { name, mods, .. } => {
+                            self.emit_class(s, &HashSet::new());
+                            // A local `case class` needs its companion
+                            // module class (`apply`/`unapply`) emitted too,
+                            // exactly like a top-level one in `walk_stats` —
+                            // otherwise `P(1)` type-checks (the typer linked
+                            // a companion symbol in `ensure_companion`) but
+                            // `Main$P$1$` never reaches the classfile and
+                            // the call fails at run time with
+                            // `NoClassDefFoundError`.
+                            if mods.flags.contains(Flags::CASE) && !module_names.contains(name) {
+                                self.emit_case_companion(s);
+                            }
+                        }
                         TreeKind::ModuleDef { .. } => self.emit_module(s, &HashSet::new()),
                         _ => {}
                     }

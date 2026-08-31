@@ -7,9 +7,10 @@ use scala_rs_backend::{emit_opts, emit_runtime, load_classpath, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
-    check_local_objects, erase, find_mains, lambda_lift, lazy_locals, mark_anon_captures,
-    note_source_value_classes, typecheck_units, uncurry, ClasspathClass, ClasspathMethod,
-    ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
+    check_local_case_class_captures, check_local_objects, erase, find_mains, lambda_lift,
+    lazy_locals, mark_anon_captures, note_source_value_classes, typecheck_units, uncurry,
+    ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType, ClasspathTypeParam,
+    TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -216,6 +217,16 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 lazy_locals(&mut u.tree, &mut st);
                 lambda_lift(&mut u.tree, &mut st);
                 mark_anon_captures(&u.tree, &mut st);
+            }
+            // A local `case class` whose companion would have to capture an
+            // enclosing-method local is the same unimplemented `LazyRef`
+            // shape as a capturing local `object` above, just reached
+            // through `P(args)` and the synthetic companion instead of a
+            // written body; `Symbol::captures` is only filled in by
+            // `mark_anon_captures` just above, so this check has to run
+            // here rather than alongside `check_local_objects`.
+            for u in units.iter() {
+                diags.extend(check_local_case_class_captures(u.file_index, &u.tree, &st));
             }
             let pickles = scala_rs_backend::pickle::pickle_all(&st);
             // Value classes are boxed across unit boundaries, so every unit's
