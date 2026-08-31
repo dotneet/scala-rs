@@ -42,9 +42,12 @@ object QqCtxBad {
     tq"=> Int"
   }
 
-  // A hole whose argument is not a tree. nsc lifts it with an implicit
-  // `Liftable`; we do not, so this is a type error rather than a wrong tree.
-  def unlifted(c: blackbox.Context)(n: Int): c.Tree = {
+  // A hole whose argument is neither a tree nor anything with a *standard*
+  // `Liftable` (`docs/macros.md` §7.8). nsc would look for a user-written
+  // `Liftable[File]` implicit; scala-rs only knows the standard instances, so
+  // it names the type it cannot lift rather than building some other tree.
+  // (`Int`, which used to stand here, is lifted now.)
+  def unlifted(c: blackbox.Context)(n: java.io.File): c.Tree = {
     import c.universe._
     q"f($n)"
   }

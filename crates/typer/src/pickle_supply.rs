@@ -1750,6 +1750,29 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
                     arity: tp.arity,
                 });
             }
+            // A *materialiser*: the whole member is one implicit clause, and
+            // the type parameter is what the implicit is asked for.
+            // `def typeOf[T](implicit ttag: TypeTag[T]): Type`,
+            // `symbolOf[T]`, `weakTypeOf[T]` -- the three slick's macro
+            // implementations are written with. These are always called with
+            // an explicit type argument (`symbolOf[R]`), which is exactly what
+            // the branch above accepts for `classTag[Short]`; the only
+            // difference is that the result type does not happen to name `T`.
+            // With no explicit type argument `T` is `Nothing` and the implicit
+            // search fails, which is a diagnostic, not a wrong program.
+            _ if shape.clauses.iter().all(|c| c.implicit)
+                && shape
+                    .clauses
+                    .iter()
+                    .any(|c| c.params.iter().any(|p| mentioned(&p.ty).contains(&tp.name))) =>
+            {
+                kept.push(ShapeTParam {
+                    name: tp.name.clone(),
+                    lo: tp.lo.clone(),
+                    hi: tp.hi.clone(),
+                    arity: tp.arity,
+                });
+            }
             // Unconstrained and undeterminable: refuse the member rather than
             // hand the typer something it will silently eta-expand.
             _ => return None,
