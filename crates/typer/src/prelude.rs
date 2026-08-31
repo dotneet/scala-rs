@@ -635,6 +635,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     // `val Ordering = scala.math.Ordering`（項位置の別名）。コンパニオンが
     // 出そろってから入れるので最後。
     crate::prelude_ordsummon::install(st, library_abi);
+    // `Ordering[T] <: PartialOrdering[T] <: Equiv[T]` と `object Equiv` の
+    // implicit instance。`Equiv` のコンパニオン別名が上の行で入ってから。
+    crate::prelude_eqtail::install(st, library_abi);
 }
 
 /// Prelude classes are owned by `scala` but carry their real JVM package
@@ -981,11 +984,18 @@ fn add_ordering(st: &mut SymbolTable) -> SymbolId {
     let ordering = iface(st, math, "Ordering", "scala/math/Ordering");
     let t = type_param(st, ordering, "T");
     st.get_mut(ordering).tparams = vec![t];
+    // nsc: `def compare(x: T, y: T): Int`. This was `(Any, Any): Int` --
+    // `Ordering[String].compare(1, 2)` type-checked here but real scalac
+    // rejects it (`found: Int(1) required: String`). `Type::TypeParam(t)`
+    // erases to `Ljava/lang/Object;` exactly like `Type::Any` did (see
+    // `jvm_desc` in `crates/backend/src/gen.rs`), so the erased descriptor
+    // `sorted` / `sortBy` codegen expects, `(Ljava/lang/Object;Ljava/lang/
+    // Object;)I`, is unchanged -- only the *typed* view becomes generic.
     method(
         st,
         ordering,
         "compare",
-        vec![Type::Any, Type::Any],
+        vec![Type::TypeParam(t), Type::TypeParam(t)],
         Type::Int,
         Intrinsic::None,
     );

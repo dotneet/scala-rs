@@ -5698,6 +5698,29 @@ impl Typer {
                         // through `class_sym_of`; this is the unqualified one.
                         tpt.sym = self.st.class_sym_of(&alias).unwrap_or(SymbolId::NONE);
                         tpt.ty = alias;
+                    } else if let Some(id) = found.iter().copied().find(|&s| {
+                        matches!(
+                            self.st.get(s).kind,
+                            SymKind::TypeParam | SymKind::TypeMember
+                        )
+                    }) {
+                        // SLS 5.3.2: `new` needs a class type. A type
+                        // parameter (`def f[T] = new T`) or an abstract type
+                        // member with no `=` right-hand side (`new_alias_target`
+                        // just declined it above, so anything reaching here is
+                        // genuinely abstract, not a jar alias mid-dealias) is
+                        // neither. nsc: "class type required but T found".
+                        // Scoped to "resolved, and not a class" exactly --
+                        // never to "did not resolve" -- so a name
+                        // `expose_unqualified` still has to try (a jar
+                        // `TypeMember` completed lazily) is never misjudged
+                        // (`agent/parentcheck`'s `strict_type_names` precedent).
+                        let desc = self.class_type_required_name(id, &n);
+                        self.error(tpt.span, format!("class type required but {desc} found"));
+                        tpt.ty = Type::Error;
+                        tree.ty = Type::Error;
+                        tree.sym = SymbolId::NONE;
+                        return;
                     } else {
                         // `new Missing` names a *type* that is not there. Left
                         // to `type_expr` it came out as `not found: value
@@ -6041,6 +6064,30 @@ impl Typer {
             return None;
         }
         self.st.class_sym_of(&target).map(|_| target)
+    }
+
+    /// The name nsc prints for `class type required but <this> found`.
+    ///
+    /// A bare type parameter is just its name (`T`). An abstract type member
+    /// referenced unqualified from inside its own class is the class's
+    /// `this`-qualified path (`X.this.A`) -- nsc always resolves an
+    /// unqualified name to an implicit `this.` prefix, and prints it that
+    /// way even though the source never wrote it.
+    fn class_type_required_name(&self, id: SymbolId, fallback: &str) -> String {
+        match self.st.get(id).kind {
+            SymKind::TypeParam => self.st.get(id).name.clone(),
+            SymKind::TypeMember => {
+                let owner = self.st.get(id).owner;
+                let member = self.st.get(id).name.clone();
+                if self.st.get(owner).is_class_like() {
+                    let owner_name = self.st.get(owner).name.trim_end_matches('$').to_string();
+                    format!("{owner_name}.this.{member}")
+                } else {
+                    member
+                }
+            }
+            _ => fallback.to_string(),
+        }
     }
 
     /// `not found: <what> <name>`, unless a package object declares `name` as

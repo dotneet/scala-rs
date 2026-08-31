@@ -1384,6 +1384,91 @@ module に解決されると module クラスには prelude 手書きの `apply`
 `not found: value Ordering` の診断のままです（`prelude_ordsummon` は `library_abi`
 でゲート）。
 
+### `Equiv[T]` の summon と `Ordering <: PartialOrdering <: Equiv`（`agent/eqtail`）
+
+`implicitly[Equiv[Int]]` / `Equiv[Int]` は real scalac が通しますが、`could not
+find implicit value` で落ちていました。実 ABI（`javap -p -s`）は
+
+```text
+interface scala.math.Ordering<T>        extends java.util.Comparator<T>, scala.math.PartialOrdering<T>
+interface scala.math.PartialOrdering<T> extends scala.math.Equiv<T>
+interface scala.math.Equiv<T>           extends java.io.Serializable
+```
+
+という階層ですが、prelude はこれを張っていませんでした。原因は 2 つ:
+
+1. `Ordering[T] <: PartialOrdering[T] <: Equiv[T]` の辺が無く、`val e:
+   Equiv[Int] = Ordering.Int` のような劣化代入が `type mismatch` になって
+   いました。
+2. `object Equiv` は implicit instance を 1 つも持っていませんでした。real
+   scalac は `implicitly[Equiv[Int]]` に `Ordering.Int` 経由の派生ではなく
+   `Equiv` 専用の instance（`Equiv$Int$`）を選びます
+   （`implicitly[Equiv[Int]].getClass.getName` で確認）。
+
+`crates/typer/src/prelude_eqtail.rs` が両方を足します。`Equiv` / `PartialOrdering`
+は他の `scala.math` 型クラス（`Ordering` / `Numeric` / `Integral` / `Fractional`）
+と同じ穴を踏むので、同じ手で塞ぎます: jar の遅延ロードを待つと `find_by_jvm` が
+まだ何も見つけられない時点（`install_prelude` は `install_classpath` より前に
+走ります）なので、prelude の時点で自前の class + companion module を作って
+現在スコープに `enter_in_current` してしまいます。あとから `Equiv` /
+`PartialOrdering` を参照した `check.rs` の `expose_unqualified` は「もうスコープに
+ある」ので通らず、この prelude シンボルだけが使われ、`equiv` 以外のメンバ
+（`fromComparator` / `by` / `TupleN` 等）は `jvm_name` が実クラスと一致してさえ
+いれば `pickle_supply` がオンデマンドで供給します（`Ordering` の `lt` / `gt` /
+`lteq` / `gteq` / `max` / `min` が今も同じやり方で効いているのと同じ）。
+
+`implicitly[PartialOrdering[Int]]` には real scalac にも instance が無いので、
+階層辺を足しても summon できるようになってはいけません。`PartialOrdering` には
+companion module を作らず、`object Equiv` の implicit instance だけを手書きします
+（`Unit` / `Boolean` / `Byte` / `Char` / `Short` / `Int` / `Long` / `BigInt` /
+`BigDecimal` / `String` と、2.13 で名前空間 object になった `Double` / `Float`
+の非推奨版 `DeprecatedDoubleEquiv` / `DeprecatedFloatEquiv`）。`--no-scala-library`
+では `scala/math/Equiv` の classfile が無く、`not found: type Equiv` の診断のまま
+です（`prelude_eqtail` は `library_abi` でゲート）。
+
+#### `Ordering#compare` の prelude 型（同じスライス）
+
+`crates/typer/src/prelude.rs` の `add_ordering` は `Ordering[T]#compare` を
+`(Any, Any): Int` で手書きしていました。`Ordering[String].compare(1, 2)` の
+ような **本来 real scalac が拒む** 呼び出しを scala-rs だけが黙って通して
+しまいます（受け入れすぎ）。`lt` / `gt` / `lteq` / `gteq` / `equiv` / `max` /
+`min` は手書きされておらず `pickle_supply` がオンデマンドで実 ABI の
+`(T, T)` シグネチャを供給するので、`compare` だけがこの穴を踏んでいました。
+`method()` に渡す引数を `Type::Any` から `Type::TypeParam(t)`（`Ordering`
+自身の型パラメータ）に変えるだけで直ります。`Type::TypeParam` は
+`Type::Any` と同じく `Ljava/lang/Object;` に erase される
+（`crates/backend/src/gen.rs` の `jvm_desc`）ので、`sorted` / `sortBy` の
+codegen が期待する erased descriptor `(Ljava/lang/Object;Ljava/lang/
+Object;)I` は変わりません。変わるのは型検査での**見え方**だけです。
+
+#### `new T` / `new A` の黙認（`agent/parentcheck` 残件、同じスライス）
+
+`agent/parentcheck`（上の節）が Remaining に残していた 2 形です。
+
+```scala
+def f[T] = new T   // scalac: class type required but T found
+trait X { type A; def f = new A }   // scalac: class type required but X.this.A found
+```
+
+`new` は SLS 5.3.2 でクラス型を要求しますが、型パラメータも（`=` の無い）抽象型メンバも
+クラス型ではありません。`check.rs` の `New { tpt }` の `Ident` 分岐（`new T` / `new A` の
+ような、型引数も修飾も無い裸の名前の形）は、`new_alias_target` が「エイリアスの右辺を
+構築する」変換を試みたあと、`found`（名前解決の結果）に `SymKind::Class` も型エイリアスも
+無ければそのまま `type_expr` に流していました。`found` が空でなければ「見つからなかった」
+扱いにもならないので、`new T` は黙って `Type::TypeParam` を、`new A` は黙って
+`Type::TypeMember` を身にまとった `new` 式になっていました。
+
+直したのは、`new_alias_target` が `None` を返した**あと**（＝ jar 由来のエイリアスは
+すでに一度 dealias を試されている）に、`found` の中身がなお `SymKind::TypeParam` /
+`SymKind::TypeMember` である symbol を探す 1 段です。**「解決済みで、かつクラスでない」**
+だけを見るので、`agent/parentcheck` の `strict_type_names`（「本当に見つからない」ときだけ
+発火し、jar 由来で遅れて解決される正当な型は素通りさせる）と同じ慎重さで、pickle から
+まだ読んでいない jar の型エイリアスを誤って「抽象型メンバ」と判定することはありません。
+
+メッセージは nsc の文面をそのまま再現します。型パラメータは裸の名前（`T`）、抽象型メンバは
+**`this` 修飾つき**（`X.this.A`）——nsc は無修飾の型メンバ参照を暗黙の `this.` 前置として
+表示するので、そこも合わせています（`Typer::class_type_required_name`）。
+
 ### 改行が文を切る条件（nsc `inLastOfStat` / `inFirstOfStat`）
 
 `crates/lexer/src/lib.rs` の `drop_non_separating_newlines` は nsc の Scanners と同じ規則で、
@@ -7249,10 +7334,8 @@ slick（`tests/slick_measure.sh`）は **`errors=257 files_with_errors=63` の�
 
 #### Remaining
 
-- `new T`（型パラメータ）/ `new A`（抽象型メンバ）は今も無言で通ります。scalac は
-  `class type required but T found` / `class type required but Q7.this.A found` です。
-  これは「未知の名前」ではなく「クラスでない型を構築した」別の検査で、このスライスの
-  対象外にしました。
+- ~~`new T`（型パラメータ）/ `new A`（抽象型メンバ）は今も無言で通ります。~~
+  `agent/eqtail`（後述）で直しました。
 - 修飾付きの名前は、`lookup_qualified_type` が失敗したとき**裸の名前**での再解決に
   フォールバックします（前置を模せない経路のため）。そのため `p.Foo` は、無関係な
   トップレベルの `Foo` が居ると今でもそれに束縛されます。診断が出るのは両方失敗した
@@ -7401,6 +7484,43 @@ slick（`tests/slick_measure.sh`）は `files=184 errors=257 files_with_errors=6
   （可変長、`Set[A]` が継承）のどちらとも一致して `ambiguous overload for apply` になります。
   要素型が具体型（`String` など）なら固定長側が正しく勝ちます。この修正の前から
   `--scala-library` の素の main にも存在する既存のバグで、`agent/setapply` の対象外です。
+
+`agent/eqtail` スライス（`Equiv[T]` の summon と `Ordering <: PartialOrdering <: Equiv`
+の階層辺）のフィクスチャは接頭辞 `eq2`（`eq2_summon` / `eq2_summon_bad`）で、同じ理由から
+`crates/cli/tests/eqtail.rs` に置いています。`eq2_summon.scala` は `implicitly[Equiv[T]]`
+（`Int` / `String` / `Long` / `Boolean` / `BigInt`）、`Equiv.Int` の直接参照、
+`getClass.getName` による instance の同一性確認（`Equiv$Int$` / `Equiv$DeprecatedDoubleEquiv$`）、
+`Ordering.Int` を `Equiv[Int]` / `PartialOrdering[Int]` へ渡す劣化代入を 1 本にまとめてあり、
+`--scala-library` dual-run と real scalac 2.13.16 の実行結果 diff（`eq2_summon_matches_real_scalac`）
+の両方で `java -Xverify:all` の下に走らせます。`eq2_summon_bad.scala` は、階層辺を足しても
+`implicitly[PartialOrdering[Int]]` が summon 可能にはならないこと（real scalac にも instance が
+無い）、`Equiv[Int]` を `Ordering[Int]` の位置には渡せないこと（劣化は `Equiv` 方向だけ）、
+companion object 自身は `Equiv` ではないことを固定します。私有ランタイムには
+`scala/math/Equiv` の classfile が無いので、`summon_is_diagnosed_without_the_jar` が
+`--no-scala-library` で `Equiv` が**黙って通らず** `not found: type Equiv` と診断されることを
+見ます。同じスライスの `Ordering#compare` 修正のフィクスチャは `eq2_compare` /
+`eq2_compare_bad` です。`eq2_compare.scala` は `Ordering[String]` / `Ordering[Int]` の
+`compare` / `lt` / `gt` / `lteq` / `gteq` / `equiv` / `max` / `min` と、`Ordering[T]`
+を受け取るジェネリックな関数（`cmp[T](ord: Ordering[T], x: T, y: T)`）を 1 本にまとめて
+あり、`--scala-library` dual-run と real scalac 2.13.16 の実行結果 diff（
+`eq2_compare_matches_real_scalac`）の両方で走らせます。`eq2_compare_bad.scala` は、
+修正前は黙って通っていた `Ordering[String].compare(1, 2)` / `Ordering[Int].compare("a",
+"b")` / `Ordering[String].lt(1, 2)` / `Ordering[String].max(1, 2)` が real scalac と
+同じ理由で拒まれることを固定します（`Ordering` 自体が `library_abi` 専用の手書き
+シンボルなので `--no-scala-library` のケースはありません）。`new T` / `new A` の
+修正（`agent/parentcheck` 残件）のフィクスチャは `eq2_newtype` / `eq2_newtype_bad`
+です。`eq2_newtype.scala` は、修正後も壊れていないことを確認するための正常系
+（型パラメータへ**適用**した実在のクラス `new Box[T](value)`、型エイリアス経由の
+`new Self`（`type Self = ConcreteNamed`）で、jar の機能を使わないので**私有ランタイムと
+`--scala-library` の両方**で `java -Xverify:all` の下に走らせ、real scalac
+2.13.16 の実行結果とも diff します（`eq2_newtype_matches_real_scalac`）。
+`eq2_newtype_bad.scala` は、直す前は両モードで無言で通っていた `new Self`（宣言した
+trait 自身の中で、`=` の無い抽象型メンバを裸で参照）と `new T`（メソッド型パラメータ）を、
+`class type required but Named.this.Self found` / `class type required but T found`
+という real scalac そのままの文面で両モードとも拒否することを固定します
+（`eq2_newtype_bad_is_rejected_private_runtime` / `_scala_library`）。slick のソースは
+`Equiv` / `PartialOrdering` を参照していないので、`tests/slick_measure.sh` の数字は
+このスライスの前後で変わりません。
 
 ## ライセンス
 
