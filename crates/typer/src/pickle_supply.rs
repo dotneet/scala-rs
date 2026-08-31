@@ -100,6 +100,8 @@ pub struct PickleSupply {
     adopted: HashSet<u32>,
     /// Classes [`PickleSupply::supply_implicit_members`] has already served.
     implicits_supplied: HashSet<u32>,
+    /// What [`PickleSupply::implicit_member_names`] answered for each class.
+    implicit_names: HashMap<u32, Vec<String>>,
     /// What [`PickleSupply::complete_type_member`] answered for each
     /// `(class, name)`, so a miss costs one pickle walk and a hit stays
     /// stable. A memo of the *answer*, not just of having asked: a nullary
@@ -470,6 +472,65 @@ impl PickleSupply {
         n
     }
 
+    /// The names of the implicit `def`s a class's own pickle declares.
+    ///
+    /// Members are read one name at a time, on demand, and an
+    /// `import <a value>._` asks for *no* name in particular: it offers
+    /// whatever the class has. `import seq.integral._` therefore brought no
+    /// implicit into scope at all -- `Numeric#mkNumericOps` and
+    /// `Ordering#mkOrderingOps` were never asked for, so `increment < zero`
+    /// reported `value < is not a member of T`. This says which names the
+    /// import has to ask for; the completion itself is the ordinary on-demand
+    /// one, so a member the prelude already declares is untouched.
+    ///
+    /// Unlike [`Self::supply_implicit_members`] this is not restricted to
+    /// classes outside `scala.*`: it installs nothing itself, and the caller
+    /// only asks for a name the class has no member for.
+    pub fn implicit_member_names(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+    ) -> Vec<String> {
+        if class_sym.is_none() || !st.get(class_sym).is_class_like() {
+            return Vec::new();
+        }
+        if let Some(cached) = self.implicit_names.get(&class_sym.0) {
+            return cached.clone();
+        }
+        let internal = st.get(class_sym).jvm_name.clone();
+        let is_module = st.get(class_sym).kind == SymKind::ModuleClass;
+        let mut names: Vec<String> = Vec::new();
+        if !internal.is_empty() && !internal.starts_with("java/") && !internal.starts_with("javax/")
+        {
+            if let Some(full) = self.pickled_full_name(bin, &internal, is_module) {
+                let sig = {
+                    let mut src = BinSource(bin);
+                    self.sigs.class_sig(&mut src, &full, is_module)
+                };
+                if let Ok(sig) = sig {
+                    for m in &sig.members {
+                        if m.kind != MemberKind::Def
+                            || !m.is_public_api()
+                            || !m.has(pflags::IMPLICIT)
+                        {
+                            continue;
+                        }
+                        let src_name = scala_rs_pickle::names::decode_method_name(&m.name);
+                        if src_name.is_empty() || src_name == "<init>" || src_name.contains('$') {
+                            continue;
+                        }
+                        if !names.contains(&src_name) {
+                            names.push(src_name);
+                        }
+                    }
+                }
+            }
+        }
+        self.implicit_names.insert(class_sym.0, names.clone());
+        names
+    }
+
     /// The dotted name whose pickle describes `internal`, if there is one.
     ///
     /// A pickle names a nested class `Outer.Inner` while its classfile is
@@ -730,15 +791,20 @@ impl PickleSupply {
         // -- the receiver of `u.Constant(1)` -- has no pickle and so no
         // members at all. The `$` form is tried first, because a `$` in a
         // top-level name is part of that name.
-        let full = internal.trim_end_matches('$').replace('/', ".");
-        let full = if self.has_pickle(bin, &full, is_module) {
-            full
+        let plain = internal.trim_end_matches('$').replace('/', ".");
+        // Whether the pickle answered to the *nested* spelling, which is what
+        // says this class really is one class's member and not a top-level
+        // name that happens to contain a `$`.
+        let mut nested = false;
+        let full = if self.has_pickle(bin, &plain, is_module) {
+            plain
         } else {
-            let dotted = full.replace('$', ".");
-            if dotted != full && self.has_pickle(bin, &dotted, is_module) {
+            let dotted = plain.replace('$', ".");
+            if dotted != plain && self.has_pickle(bin, &dotted, is_module) {
+                nested = true;
                 dotted
             } else {
-                full
+                plain
             }
         };
 
@@ -756,6 +822,26 @@ impl PickleSupply {
         // The receiver's own type parameters are the vocabulary the looked-up
         // types are already expressed in.
         let mut class_scope: HashMap<String, Type> = HashMap::new();
+        // A class nested in a *generic* one writes its members in terms of the
+        // outer class's parameters: `class OrderingOps(lhs: T) { def <(rhs: T)
+        // }` inside `trait Ordering[T]`. `OrderingOps` has no parameter of its
+        // own, so `T` was a name nothing in scope mapped and every member of
+        // it failed to install --
+        // `value < is not a member of Ordering$OrderingOps` for what the
+        // source wrote as `import seq.integral._; increment < zero`. The outer
+        // symbol is the one the parameters belong to, so its own are what the
+        // members are read at; the prefix the value was reached through is
+        // what later substitutes them (`Typer::at_import_prefix_of`).
+        if nested {
+            if let Some((outer, _)) = internal.trim_end_matches('$').rsplit_once('$') {
+                if let Some(o) = crate::classpath::find_by_jvm(st, outer) {
+                    for tp in &st.get(o).tparams {
+                        class_scope.insert(st.get(*tp).name.clone(), Type::TypeParam(*tp));
+                    }
+                }
+            }
+        }
+        // An inner class's own parameter shadows the outer's of the same name.
         for tp in &st.get(class_sym).tparams {
             class_scope.insert(st.get(*tp).name.clone(), Type::TypeParam(*tp));
         }

@@ -360,6 +360,35 @@ impl Typer {
         }) && (!s.paramss.is_empty() || s.params.is_empty())
     }
 
+    /// A type read through the `import <a value>._` prefix that made `id`
+    /// visible, when there is one.
+    ///
+    /// The value's class is where `id` is declared, and only the value says
+    /// what that class's type parameters are: `import b._` with `b: Box[Int]`
+    /// reads `class Box[T] { implicit def mkOps(lhs: T): Ops[T] }` as
+    /// `Int => Ops[Int]`. Left as `Box`'s own `T` the candidate matched
+    /// nothing, which is what made `import seq.integral._; increment < zero`
+    /// report `value < is not a member of T`.
+    ///
+    /// It is also what reads a member of a class *nested* in that one:
+    /// `Ordering[T]#OrderingOps` declares `def <(rhs: T)` at `Ordering`'s
+    /// parameter, and `subst_as_seen_from` replaces that symbol wherever it
+    /// occurs, however deeply the member is nested.
+    pub(crate) fn at_import_prefix_of(&self, id: SymbolId, ty: &Type) -> Option<Type> {
+        let owner = self.st.get(id).owner;
+        if owner.is_none()
+            || !self.st.get(owner).is_class_like()
+            || self.st.get(owner).tparams.is_empty()
+        {
+            return None;
+        }
+        let prefix = self.term_import_prefix_for(owner).map(|q| q.ty.clone())?;
+        if prefix.is_no_type() || prefix.is_error() {
+            return None;
+        }
+        Some(self.st.subst_as_seen_from(&prefix, ty))
+    }
+
     /// An inherited implicit is declared in terms of its *owner's* type
     /// parameters. Seen from the class we are typing, those are the parent's
     /// arguments: `implicit def p1Type: TT[P1]` on `trait Base[P1]` is
@@ -370,6 +399,17 @@ impl Typer {
         let ty = self.st.get(id).ty.clone();
         let this = self.st.this_class;
         let owner = self.st.get(id).owner;
+        // An implicit brought in by `import <a value>._` is declared in terms
+        // of that value's class parameters, and the value is what says what
+        // they are: `import b._` with `b: Box[Int]` reads
+        // `class Box[T] { implicit def mkOps(lhs: T): Ops[T] }` as
+        // `Int => Ops[Int]`. Left as `Box`'s own `T` the candidate matched
+        // nothing, which is why `import seq.integral._; increment < zero`
+        // (`Numeric[T]#mkOrderingOps`, reached through `Integral[T]`) reported
+        // `value < is not a member of T`.
+        if let Some(seen) = self.at_import_prefix_of(id, &ty) {
+            return seen;
+        }
         if this.is_none()
             || owner.is_none()
             || owner == this
@@ -645,7 +685,7 @@ impl Typer {
         if self.first_clause_is_implicit(id) {
             return false;
         }
-        let (param, ret) = match &s.ty {
+        let (param, ret) = match &self.implicit_candidate_ty(id) {
             Type::Method { paramss, ret } => {
                 let ps = paramss.first().cloned().unwrap_or_default();
                 if ps.len() != 1 {
@@ -891,7 +931,7 @@ impl Typer {
         if self.first_clause_is_implicit(id) {
             return None;
         }
-        let (param, ret) = match &s.ty {
+        let (param, ret) = match &self.implicit_candidate_ty(id) {
             Type::Method { paramss, ret } => {
                 let ps = paramss.first().cloned().unwrap_or_default();
                 if ps.len() != 1 {
@@ -1144,6 +1184,7 @@ impl Typer {
         hits.sort_by_key(|(c, m, _)| (c.0, m.0));
         hits.dedup_by_key(|(c, m, _)| (c.0, m.0));
         self.drop_inherited_duplicates(&mut hits);
+        self.drop_overridden_conversions(&mut hits);
         match hits.len() {
             1 => Some(hits.pop().unwrap()),
             0 => None,
@@ -1219,6 +1260,39 @@ impl Typer {
             })
             .collect();
         let mut keep = shadowed.iter().map(|s| !s);
+        hits.retain(|_| keep.next().unwrap_or(true));
+    }
+
+    /// A conversion a subclass *overrides* is not a second candidate.
+    ///
+    /// `trait Integral[T] extends Numeric[T]` narrows the result:
+    /// `mkNumericOps(lhs: T): IntegralOps` over `Numeric`'s `: NumericOps`.
+    /// `import seq.integral._` brings both names into scope, and because the
+    /// two results are different classes declaring different `unary_-`
+    /// symbols, [`Self::drop_inherited_duplicates`] -- which asks for the
+    /// *same* member and the *same* result -- saw two unrelated candidates and
+    /// the search gave up. In nsc there is one member, the derived one.
+    fn drop_overridden_conversions(&self, hits: &mut Vec<(SymbolId, SymbolId, Type)>) {
+        if hits.len() < 2 {
+            return;
+        }
+        let overridden: Vec<bool> = hits
+            .iter()
+            .map(|(c, _, _)| {
+                let name = &self.st.get(*c).name;
+                let owner = self.st.get(*c).owner;
+                !owner.is_none()
+                    && hits.iter().any(|(c2, _, _)| {
+                        let owner2 = self.st.get(*c2).owner;
+                        c2 != c
+                            && &self.st.get(*c2).name == name
+                            && owner2 != owner
+                            && !owner2.is_none()
+                            && self.st.is_ancestor_of(owner, owner2)
+                    })
+            })
+            .collect();
+        let mut keep = overridden.iter().map(|s| !s);
         hits.retain(|_| keep.next().unwrap_or(true));
     }
 
@@ -1306,11 +1380,10 @@ impl Typer {
     }
 
     fn conversion_result(&self, id: SymbolId, from: &Type) -> Option<Type> {
-        let s = self.st.get(id);
-        if !s.flags.contains(Flags::IMPLICIT) {
+        if !self.st.get(id).flags.contains(Flags::IMPLICIT) {
             return None;
         }
-        match &s.ty {
+        match &self.implicit_candidate_ty(id) {
             Type::Method { paramss, ret } => {
                 let ps = paramss.first().cloned().unwrap_or_default();
                 if ps.len() != 1 {
@@ -1344,9 +1417,8 @@ impl Typer {
 
     /// The conversion's own type arguments, solved from the receiver type.
     fn conv_targs(&self, id: SymbolId, from: &Type) -> Vec<Type> {
-        let s = self.st.get(id);
-        let tps = s.tparams.clone();
-        let param = match &s.ty {
+        let tps = self.st.get(id).tparams.clone();
+        let param = match &self.implicit_candidate_ty(id) {
             Type::Method { paramss, .. } => paramss.first().and_then(|c| c.first()).cloned(),
             Type::Function { params, .. } => params.first().cloned(),
             _ => None,
@@ -1384,7 +1456,7 @@ impl Typer {
         tps: &[SymbolId],
         solved: &mut [Option<Type>],
     ) {
-        let Type::Method { paramss, ret } = &self.st.get(id).ty else {
+        let Type::Method { paramss, ret } = &self.implicit_candidate_ty(id) else {
             return;
         };
         if paramss.len() < 2 {
@@ -1431,15 +1503,14 @@ impl Typer {
     /// applying it to the receiver alone leaves the second clause unfilled, and
     /// the call goes out with fewer arguments than its descriptor declares.
     pub(crate) fn conv_implicit_params(&self, id: SymbolId, from: &Type) -> Vec<Vec<Type>> {
-        let s = self.st.get(id);
-        let Type::Method { paramss, .. } = &s.ty else {
+        let Type::Method { paramss, .. } = &self.implicit_candidate_ty(id) else {
             return Vec::new();
         };
         if paramss.len() < 2 {
             return Vec::new();
         }
         let paramss = paramss.clone();
-        let tps = s.tparams.clone();
+        let tps = self.st.get(id).tparams.clone();
         let targs = self.conv_targs(id, from);
         paramss[1..]
             .iter()
@@ -1501,6 +1572,25 @@ impl Typer {
             postfix: false,
         };
         let Some(module) = self.wildcard_module_for(id) else {
+            // `import b._` where `b` is a *value*: the conversion is an
+            // instance member of `b`'s class, so the call needs `b` as its
+            // receiver. Emitted as a bare name, codegen loaded `this` and cast
+            // it -- `class Main$ cannot be cast to class NoTp` from a program
+            // that typechecked.
+            let owner = self.st.get(id).owner;
+            if let Some(prefix) = self.term_import_prefix_for(owner) {
+                return Tree {
+                    id: scala_rs_parser::NodeId(0),
+                    span,
+                    kind: TreeKind::Select {
+                        qual: Box::new(prefix.clone()),
+                        name,
+                    },
+                    ty,
+                    sym: id,
+                    postfix: false,
+                };
+            }
             return ident;
         };
         let mcls = self.st.module_class_of(module);

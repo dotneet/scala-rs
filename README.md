@@ -456,6 +456,32 @@ nsc に寄せた探索順です。偽の「何でも変換」はありません�
 `implicitly[TT[P1]]` が自分の親の実装を見つけられません（slick の
 `Library.Abs.column[P1](n)`）。
 
+`import <値>._` で入れた implicit も同じで、**その値の型を通して**見ます
+（`Typer::at_import_prefix_of`）。`class Box[T] { implicit def mkOps(lhs: T): Ops[T] }`
+を `b: Box[Int]` から使えば `Int => Ops[Int]` です。`Box` の `T` のままだと候補が
+何にも当たりません。結果が「その generic クラスに**ネストした**クラス」のときも同じ
+prefix で置換します（`Ordering[T]#OrderingOps` の `def <(rhs: T)` の `T` は
+`OrderingOps` ではなく `Ordering` のパラメータです）。
+さらに、この implicit は**インスタンスメンバ**なので、参照はその値を receiver として
+名前修飾します。素の名前で出すと codegen が `this` を積んでキャストし、
+`class Main$ cannot be cast to class NoTp` になっていました。
+サブクラスが**オーバーライド**した変換は候補 1 個です
+（`Integral[T]` は `Numeric[T]#mkNumericOps` の結果を `NumericOps` から
+`IntegralOps` に狭めます。結果クラスが違うので「同じ変換に 2 経路」の規則では
+落ちず、探索が諦めていました）。
+
+jar のメンバーは**名前を 1 つずつ**読みます。ところが implicit は
+「スコープを探して見つける」ものなので、プログラムがその名前を書くことは決してなく、
+`Numeric#mkNumericOps` も `Option.option2Iterable` もどのメンバー一覧にも
+入っていませんでした（slick の `import seq.integral._` と `where.reduceLeft(f)`）。
+`import <値>._` と「型の implicit スコープにあるコンパニオン」の両方で、pickle に
+**どの名前が implicit か**を聞いて、その名前だけを通常の on-demand 経路で
+補完します（`PickleSupply::implicit_member_names`）。クラスがすでにメンバーを
+持っている名前は聞かないので、手書き prelude の宣言が勝つのは従来どおりです。
+プリミティブのコンパニオンは対象外です（`object Int` の implicit は数値 widening
+そのもので、typer が組み込みで持っています。view として並べると `n + ":"` が
+ambiguous になるだけです）。
+
 同じ型の候補が複数あるときは nsc `Infer#isStrictlyMoreSpecific` と同じ**足し算**で決めます:
 （型の特定度の差）＋（定義クラスの subclass 関係の差）> 0。型が同じでも、より派生した
 クラスで定義されたほうが勝ちます（`ConstColumn[T : TypedType]` 自身の evidence が、
@@ -3140,6 +3166,70 @@ slick: `errors 223 → 209`、`type mismatch 17 → 9`、`files_with_errors 60`
 - 第 11 スライスが記録した `LazyZip2.map` の `BuildFrom` 高階照合は
   そのままです（4 と 5 では届きません）。
 
+### `import <値>._` で入れた view（`agent/tail2`）
+
+フィクスチャは `tests/fixtures/t2_*.scala`、テストは
+`crates/cli/tests/tail2.rs` です。slick の `MySQLProfile` /
+`JdbcStatementBuilderComponent` が書く
+
+```scala
+import seq.integral._
+val desc = increment < zero
+val beforeStart = start - increment
+if (desc) "…" + (-increment) + "…"
+```
+
+は全部 `value <op> is not a member of T` でした。原因は 4 つあり、いずれも
+「**generic クラスのインスタンスメンバである変換を、値を通して使う**」という
+同じ形です。
+
+1. **jar クラスの implicit がそもそもスコープに入らない**。メンバーは pickle から
+   名前 1 つずつ読みますが、implicit は誰も名前を書かない（スコープを探して
+   見つけるもの）ので、`Numeric#mkNumericOps` / `Ordering#mkOrderingOps` は
+   一度も要求されませんでした。同じ理由で `Option.option2Iterable` もどこにも
+   無く、`where.reduceLeft(f)` / `c.where.toSeq ++ on`（`Option[Node]`）が
+   `value reduceLeft is not a member of Option[Node]` でした。`import <値>._`
+   と「型の implicit スコープのコンパニオン」の両方で、pickle に **どの名前が
+   implicit か** を聞き、その名前だけを通常の on-demand 経路で補完します
+   （クラスが既にメンバーを持つ名前は聞かないので、prelude が勝つのは従来どおり。
+   プリミティブのコンパニオンは対象外 — `object Int` の implicit は数値 widening
+   そのもので、view として並べると `n + ":"` が ambiguous になります）。
+2. **候補が owner の型パラメータのままだった**。`b: Box[Int]` を通した
+   `class Box[T] { implicit def mkOps(lhs: T): Ops[T] }` は `Int => Ops[Int]`
+   です。値だけがそれを言えます（`Typer::at_import_prefix_of`）。
+3. **オーバーライドした変換が 2 個に数えられていた**。`Integral[T]` は
+   `Numeric[T]#mkNumericOps` の結果を `NumericOps` から `IntegralOps` に
+   狭めます。import 後は両方の名前がスコープにあり、結果クラスも宣言する
+   `unary_-` シンボルも違うので、既存の「同じ変換に 2 経路」の規則では落ちず、
+   探索が諦めていました。nsc ではメンバーは 1 個（派生側）です。
+4. **generic クラスにネストしたクラスのメンバーが読めなかった**。
+   `Ordering[T]#OrderingOps` の `def <(rhs: T)` の `T` は *`Ordering`* の
+   パラメータで、`OrderingOps` 自身は 1 つも持ちません。マップできない名前として
+   メンバーの install ごと失敗していました。外側のパラメータで読み、変換と同じ
+   prefix で置換します。
+
+これとは別に、**型検査を通ったうえで実行時に落ちる**バグが 1 つありました。この
+変換は値のインスタンスメンバなのに素の名前で出していたので、codegen が `this` を
+積んでキャストし、`class Main$ cannot be cast to class NoTp` になっていました。
+
+slick: `errors 203 → 196`、`files_with_errors 60`（変わらず）。
+`tests/slick_subset.sh` は `verified=204 failed=0` で変化なし。新しい種類の
+エラーは出ず、新しくエラーになったファイルもありません（既にエラーのある 2 ファイルで、
+先行するエラーの後続が 1 行ずつ増えています）。
+
+このスライスで**分かっているが直していない**もの:
+
+- generic な親から継承した内部クラスを、サブクラスの内部クラスが継承するとき
+  （`class SubBox[T] extends Box[T] { class Sharper(lhs: T) extends Inner(lhs) }`）、
+  `Inner` の構築子パラメータが `Box` の `T` のままで `found: T required: T` に
+  なります（as-seen-from の別の穴）。
+- ブリーフが挙げていた `a ++ b`（引数が抽象型メンバ `SchemaDescription`）の
+  `no matching overload for (BasicProfile.SchemaDescription)…` は、現在の
+  計測ログには**もう出ていません**。
+- `LazyZip2.map` の `BuildFrom` 高階照合（`toSeq` / `mkString is not a member of C`
+  4 件 ＋ `could not find implicit value of type BuildFrom[…, C]` 4 件）は
+  そのままです。
+
 ### ブロックの値を二重に箱詰めしていた（消去）
 
 `agent/anonbridge` スライス。**型検査は通り、実行時に `VerifyError` になる**
@@ -4611,6 +4701,18 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 `mism12_wildcard_and_contravariant_witness`）と、拒否テスト
 （`mism12_bad_is_still_rejected`、フィクスチャは `mism12_bad.scala`。
 実 scalac 2.13.16 も同じ 4 件を拒否します）も置いてあります。
+
+`t2_lang.scala` / `t2_lib.scala` は `crates/cli/tests/tail2.rs` から回します
+（`t2_lang` は**両モード**、`t2_lib` は library モードのみ。私有ランタイムには
+`scala.math.Integral` が無いので、`t2_lib_without_library_is_error` で**黙って
+通さない**ことも見ています）。同ファイルには最小形の受理テスト
+（`t2_wildcard_import_brings_a_jar_class_implicits_into_scope` /
+`t2_overridden_conversion_is_one_candidate` /
+`t2_companion_implicits_are_supplied_from_the_pickle` /
+`t2_primitive_companions_stay_out_of_the_view_search` /
+`t2_nested_class_members_read_at_the_outer_parameters`）と、拒否テスト
+（`t2_bad_is_still_rejected`、フィクスチャは `t2_bad.scala`。実 scalac 2.13.16 も
+同じ 3 件を拒否します）も置いてあります。
 
 `mism8.scala` は `crates/cli/tests/mismatch8.rs` の
 `mism8_fixture_runs_in_both_modes` から**両モードで**回し、どちらの stdout も
