@@ -14,15 +14,12 @@ import scala.reflect.runtime.universe._
 
 object Main {
   def main(args: Array[String]): Unit = {
-    // `a :: b` is `b.::(a)` once parsed; nsc keeps the operands in order by
-    // binding the left one to a fresh `val` first.
-    println(q"a :: b")
     // The parser supplies `()` for a missing `else`; nsc supplies an empty
     // block.
     println(q"if (a) b")
-    // `_.get` is a lambda over a parameter the parser invented, where nsc
-    // uses `freshTermName`.
-    println(q"_.get")
+    // `a :: b` and `_.get` used to stand here; both are reified now, out of
+    // the `freshTermName` block nsc builds for them
+    // (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.10).
     // A splice may stand for a whole argument list, but mixing it with
     // ordinary arguments needs a concatenation this does not build.
     val xs = List(q"p")

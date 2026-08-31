@@ -14,14 +14,6 @@
 import scala.reflect.macros.blackbox
 
 object QqCtxBad {
-  // `a :: b` is `b.::(a)` once parsed, indistinguishable from a written
-  // `b.::(a)`; nsc builds neither, it binds the left operand to a fresh `val`
-  // first so evaluation order is kept.
-  def rightAssoc(c: blackbox.Context): c.Tree = {
-    import c.universe._
-    q"a :: b"
-  }
-
   // The parser supplies `()` for a missing `else`; nsc supplies an empty
   // block.
   def ifNoElse(c: blackbox.Context): c.Tree = {
@@ -29,12 +21,9 @@ object QqCtxBad {
     q"if (a) b"
   }
 
-  // `_.get` is a lambda over a parameter the parser invented; nsc names that
-  // parameter with `freshTermName`.
-  def placeholder(c: blackbox.Context): c.Tree = {
-    import c.universe._
-    q"_.get"
-  }
+  // A right-associative operator and a `_` placeholder lambda used to stand
+  // here; both are reified now, out of the `freshTermName` block nsc builds
+  // for them (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.10).
 
   // A by-name type: nsc's own parser rejects it inside `tq"..."`.
   def byNameType(c: blackbox.Context): c.Tree = {

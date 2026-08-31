@@ -58,8 +58,7 @@ object DqDefsBad {
   // not an expression.
   val macroDef = q"def f = macro Impl.f"
 
-  // A `_` type argument is an existential whose bound type parameters nsc
-  // names with `freshTypeName`, in a block around the call -- the same reason
-  // the `_` placeholder lambda is refused.
-  val existential = q"def f(x: Bar[_]) = x"
+  // A `_` type argument (`q"def f(x: Bar[_]) = x"`) used to stand here; it is
+  // an existential, reified now out of the `freshTypeName` block nsc builds
+  // for it (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.10).
 }
