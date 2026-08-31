@@ -5382,10 +5382,36 @@ impl Typer {
                     // module symbol itself has no tparams, so naively
                     // substituting against it is a no-op and the caller sees
                     // an un-substituted `HashMap[K, V]`.
-                    if self.st.get(sym).tparams.is_empty()
-                        && self.st.get(sym).kind == SymKind::Module
-                    {
-                        let cls = self.st.module_class_of(sym);
+                    // The reference need not *be* the module symbol: the
+                    // `scala` package object exports its aliases as accessors
+                    // (`def Equiv(): Equiv$`), so `Equiv[Int]` arrives as a
+                    // nullary method whose result is the module class. nsc
+                    // reads both the same way -- a stable value of a module's
+                    // type, with the type arguments meant for its `apply`.
+                    let module_cls = if self.st.get(sym).kind == SymKind::Module {
+                        Some(self.st.module_class_of(sym))
+                    } else {
+                        self.module_class_of_value(sym, &base_ty)
+                    };
+                    if let (true, Some(cls)) = (self.st.get(sym).tparams.is_empty(), module_cls) {
+                        // A library companion's `apply` is read from the
+                        // pickle on *selection*, and `Ordering[String]` never
+                        // writes one: without this the redirect found nothing,
+                        // the tree kept the module's own type, and
+                        // `Ordering[String].compare` was either "not a member
+                        // of Ordering$" or -- reached through the `scala`
+                        // package alias -- compiled into `Ordering$.MODULE$`
+                        // cast to `Ordering` (`ClassCastException` at run
+                        // time). `Ordering.apply[T](implicit ord: Ordering[T])`
+                        // is nsc's summoner and is what the type arguments
+                        // target here.
+                        //
+                        // Safe next to the prelude's own factories because
+                        // `PickleSupply` declines a copy of a hand-written
+                        // member with the same erasure (`agent/setapply`);
+                        // before that gate landed this made `List[Int](1, 2)`
+                        // "ambiguous overload for apply".
+                        self.supply_from_pickle_class(cls, "apply");
                         let candidates: Vec<SymbolId> = self
                             .st
                             .lookup_member(cls, "apply")
@@ -8048,6 +8074,63 @@ impl Typer {
         true
     }
 
+    /// The pickle's alternatives for a *module* receiver whose overload set is
+    /// only what the prelude wrote by hand.
+    ///
+    /// `BigDecimal(3L)` used to reach the companion the long way round: the
+    /// term `BigDecimal` was the trait/class symbol, `apply` was not a member
+    /// of it, and the `found.is_empty()` branch in `type_select` read the
+    /// companion's seven alternatives out of the pickle on the way past.
+    /// Resolving the alias to the module directly (`prelude_ordsummon`, which
+    /// is what `val BigDecimal = scala.math.BigDecimal` means) short-circuits
+    /// that: the module class already carries the three `apply`s the prelude
+    /// writes, `found` is not empty, and nothing was ever read -- so
+    /// `BigDecimal(3L)` and `BigDecimal(BigInt(6))` became "no matching
+    /// overload".
+    ///
+    /// Asked only here, on the path that is otherwise about to report that
+    /// error, and only *adding*: `PickleSupply` declines a copy of a
+    /// hand-written prelude member (`agent/setapply`), so the alternatives that
+    /// arrive are the ones with an erasure the prelude does not already have.
+    fn widen_module_from_pickle(&mut self, fun: &mut Tree) -> bool {
+        if !self.library_abi {
+            return false;
+        }
+        let TreeKind::Select { qual, name } = &fun.kind else {
+            return false;
+        };
+        let name = name.clone();
+        let recv_ty = qual.ty.clone();
+        let Some(mcls) = self.st.class_sym_of(&recv_ty) else {
+            return false;
+        };
+        if self.st.get(mcls).kind != SymKind::ModuleClass {
+            return false;
+        }
+        let before = self.st.lookup_member(mcls, &name).len();
+        if self.supply_from_pickle_class(mcls, &name).is_empty() {
+            return false;
+        }
+        let mut found = self.st.lookup_member(mcls, &name);
+        found.retain(|&s| self.st.get(s).kind == SymKind::Method);
+        found = self.drop_overridden(found);
+        if found.len() <= before || found.is_empty() {
+            return false;
+        }
+        self.record_overload_group(&found, &name);
+        let alts: Vec<(SymbolId, Type)> = found
+            .iter()
+            .map(|&s| {
+                let t = self.st.subst_as_seen_from(&recv_ty, &self.st.get(s).ty);
+                (s, self.st.expand_in_type(&recv_ty, &t))
+            })
+            .collect();
+        self.overload_member_types.insert(found[0].0, alts.clone());
+        fun.ty = Type::Overload(alts.into_iter().map(|(_, t)| t).collect());
+        fun.sym = found[0];
+        true
+    }
+
     /// When a member exists on the receiver (e.g. `Int.+`) but the argument
     /// types do not match, try an implicit conversion that *does* have the
     /// method (`any2stringadd` for `1 + "x"`).
@@ -10476,6 +10559,22 @@ impl Typer {
                     }
                 }
                 if self.widen_with_companion(fun) {
+                    let fun_ty = fun.ty.clone();
+                    if let OverloadPick::Found(sym, param_tys, ret) =
+                        self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt)
+                    {
+                        fun.sym = sym;
+                        tree.sym = sym;
+                        self.adapt_args_to_params(args, &param_tys, sym);
+                        tree.ty = ret;
+                        return;
+                    }
+                }
+                // The same widening for a receiver that already *is* the
+                // companion (`BigDecimal(3L)` through the `scala` package
+                // object's alias): the alternatives the prelude did not write
+                // by hand are still in the pickle.
+                if self.widen_module_from_pickle(fun) {
                     let fun_ty = fun.ty.clone();
                     if let OverloadPick::Found(sym, param_tys, ret) =
                         self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt)
@@ -16954,6 +17053,32 @@ impl Typer {
         }
         self.pickle
             .complete(&mut self.st, &mut self.binary, cls, name)
+    }
+
+    /// The module class a *value* reference stands for, if it stands for one.
+    ///
+    /// A module reference carries `Type::ModuleRef`; the `scala` package
+    /// object's aliases (`val Equiv = math.Equiv`) reach us as nullary
+    /// accessors, so the same thing also arrives wrapped in a method type with
+    /// no parameters. Used by `Module[T]` → `Module.apply[T]`: without it
+    /// `Equiv[Int]` kept the module class as its type and `.equiv` was "not a
+    /// member of Equiv$".
+    fn module_class_of_value(&self, sym: SymbolId, ty: &Type) -> Option<SymbolId> {
+        let s = self.st.get(sym);
+        if !matches!(s.kind, SymKind::Method | SymKind::Term) || !s.params.is_empty() {
+            return None;
+        }
+        let peeled = match ty {
+            Type::Method { paramss, ret } if paramss.iter().all(|c| c.is_empty()) => {
+                (**ret).clone()
+            }
+            other => other.clone(),
+        };
+        match peeled {
+            Type::ModuleRef(c) => Some(c),
+            Type::Class { sym: c, .. } if self.st.get(c).kind == SymKind::ModuleClass => Some(c),
+            _ => None,
+        }
     }
 
     pub(crate) fn ensure_java_loaded(&mut self, class_id: SymbolId, span: Span) {

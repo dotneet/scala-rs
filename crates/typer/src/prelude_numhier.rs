@@ -129,11 +129,12 @@ fn add_ordering_option(st: &mut SymbolTable, ordering: SymbolId) {
     st.get_mut(m).flags = st.get(m).flags.with(Flags::IMPLICIT);
     let t = crate::prelude::type_param(st, m, "T");
     st.get_mut(m).tparams = vec![t];
+    let param_ty = Type::Class {
+        sym: ordering,
+        args: vec![Type::TypeParam(t)],
+    };
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![Type::Class {
-            sym: ordering,
-            args: vec![Type::TypeParam(t)],
-        }]],
+        paramss: vec![vec![param_ty.clone()]],
         ret: Box::new(Type::Class {
             sym: ordering,
             args: vec![Type::Class {
@@ -142,6 +143,25 @@ fn add_ordering_option(st: &mut SymbolTable, ordering: SymbolId) {
             }],
         }),
     };
+    // `def Option[T](implicit ord: Ordering[T])` -- the clause is *implicit*,
+    // and saying so is not decoration: a one-parameter implicit method with an
+    // explicit clause is a view (SLS 7.3), and the conversion search was
+    // reading this one as `Ordering[T] => Ordering[Option[T]]`. That silently
+    // accepted `val o: Ordering[Option[Int]] = Ordering.Int`, which real
+    // scalac rejects, and it rewrote the receiver of every failed selection on
+    // an `Ordering`: `Ordering.Int` reported "value Int is not a member of
+    // Ordering[Option[AnyRef]]". Only the parameter *symbols* carry the
+    // implicit flag, so a method type alone cannot be told apart.
+    let p = st.alloc(
+        "ord",
+        m,
+        SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(p).ty = param_ty;
+    st.get_mut(m).params = vec![p];
+    st.get_mut(m).paramss = vec![vec![p]];
     if !st.get(module).members.contains(&m) {
         st.get_mut(module).members.push(m);
     }
