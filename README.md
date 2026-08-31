@@ -1426,6 +1426,21 @@ companion module を作らず、`object Equiv` の implicit instance だけを�
 では `scala/math/Equiv` の classfile が無く、`not found: type Equiv` の診断のまま
 です（`prelude_eqtail` は `library_abi` でゲート）。
 
+#### `Ordering#compare` の prelude 型（同じスライス）
+
+`crates/typer/src/prelude.rs` の `add_ordering` は `Ordering[T]#compare` を
+`(Any, Any): Int` で手書きしていました。`Ordering[String].compare(1, 2)` の
+ような **本来 real scalac が拒む** 呼び出しを scala-rs だけが黙って通して
+しまいます（受け入れすぎ）。`lt` / `gt` / `lteq` / `gteq` / `equiv` / `max` /
+`min` は手書きされておらず `pickle_supply` がオンデマンドで実 ABI の
+`(T, T)` シグネチャを供給するので、`compare` だけがこの穴を踏んでいました。
+`method()` に渡す引数を `Type::Any` から `Type::TypeParam(t)`（`Ordering`
+自身の型パラメータ）に変えるだけで直ります。`Type::TypeParam` は
+`Type::Any` と同じく `Ljava/lang/Object;` に erase される
+（`crates/backend/src/gen.rs` の `jvm_desc`）ので、`sorted` / `sortBy` の
+codegen が期待する erased descriptor `(Ljava/lang/Object;Ljava/lang/
+Object;)I` は変わりません。変わるのは型検査での**見え方**だけです。
+
 ### 改行が文を切る条件（nsc `inLastOfStat` / `inFirstOfStat`）
 
 `crates/lexer/src/lib.rs` の `drop_non_separating_newlines` は nsc の Scanners と同じ規則で、
@@ -7457,8 +7472,18 @@ slick（`tests/slick_measure.sh`）は `files=184 errors=257 files_with_errors=6
 companion object 自身は `Equiv` ではないことを固定します。私有ランタイムには
 `scala/math/Equiv` の classfile が無いので、`summon_is_diagnosed_without_the_jar` が
 `--no-scala-library` で `Equiv` が**黙って通らず** `not found: type Equiv` と診断されることを
-見ます。slick のソースは `Equiv` / `PartialOrdering` を参照していないので、
-`tests/slick_measure.sh` の数字はこのスライスの前後で変わりません。
+見ます。同じスライスの `Ordering#compare` 修正のフィクスチャは `eq2_compare` /
+`eq2_compare_bad` です。`eq2_compare.scala` は `Ordering[String]` / `Ordering[Int]` の
+`compare` / `lt` / `gt` / `lteq` / `gteq` / `equiv` / `max` / `min` と、`Ordering[T]`
+を受け取るジェネリックな関数（`cmp[T](ord: Ordering[T], x: T, y: T)`）を 1 本にまとめて
+あり、`--scala-library` dual-run と real scalac 2.13.16 の実行結果 diff（
+`eq2_compare_matches_real_scalac`）の両方で走らせます。`eq2_compare_bad.scala` は、
+修正前は黙って通っていた `Ordering[String].compare(1, 2)` / `Ordering[Int].compare("a",
+"b")` / `Ordering[String].lt(1, 2)` / `Ordering[String].max(1, 2)` が real scalac と
+同じ理由で拒まれることを固定します（`Ordering` 自体が `library_abi` 専用の手書き
+シンボルなので `--no-scala-library` のケースはありません）。slick のソースは
+`Equiv` / `PartialOrdering` を参照していないので、`tests/slick_measure.sh` の数字は
+このスライスの前後で変わりません。
 
 ## ライセンス
 

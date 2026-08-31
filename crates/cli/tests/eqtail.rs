@@ -205,3 +205,50 @@ fn summon_is_diagnosed_without_the_jar() {
     );
     let _ = fs::remove_dir_all(&out);
 }
+
+// -------------------------------------------------------------- eq2_compare
+//
+// `Ordering[T]#compare` was hand-written in the prelude as `(Any, Any):
+// Int`, so `Ordering[String].compare(1, 2)` type-checked when real scalac
+// rejects it (`found: Int(1) required: String`). Fixed by giving `compare`
+// the class's own type parameter `T` instead of `Any` -- `lt` / `gt` /
+// `lteq` / `gteq` / `equiv` / `max` / `min` were never hand-written (they
+// come from `pickle_supply` on demand) and were already `(T, T)`.
+
+#[test]
+fn eq2_compare_scala_library() {
+    jar_run("eq2_compare");
+}
+
+#[test]
+fn eq2_compare_matches_real_scalac() {
+    matches_real_scalac("eq2_compare");
+}
+
+/// real scalac rejects every line here: `Ordering[T]` is generic in `T`,
+/// not `Any`.
+#[test]
+fn eq2_compare_bad_is_rejected() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip eq2_compare_bad: jar not present");
+        return;
+    };
+    let out = tmp_dir("eq2_compare_bad");
+    let (ok, msgs) = compile(
+        &out,
+        "eq2_compare_bad",
+        &["--scala-library", jar.to_str().unwrap()],
+    );
+    assert!(!ok, "expected eq2_compare_bad to be rejected, got:\n{msgs}");
+    for needle in [
+        "type mismatch; found: 1  required: T",
+        "type mismatch; found: \"a\"  required: T",
+        "do not conform to method max's type parameter bounds [U <: T]",
+    ] {
+        assert!(
+            msgs.contains(needle),
+            "expected {needle:?} in diagnostics for eq2_compare_bad, got:\n{msgs}"
+        );
+    }
+    let _ = fs::remove_dir_all(&out);
+}
