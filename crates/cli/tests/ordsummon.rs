@@ -371,3 +371,46 @@ fn module_apply_redirect_still_works() {
     }
     assert!(ok, "expected the module factories to compile, got:\n{msgs}");
 }
+
+/// Resolving the alias to the module changes which path `BigDecimal(3L)`
+/// takes: the term is no longer a *class*, so `widen_with_companion` -- the
+/// recovery that used to hand the companion's `apply` overloads over -- does
+/// not apply, and the module class carries only the three the prelude writes
+/// by hand. `widen_module_from_pickle` reads the rest. This is the regression
+/// the first version of this slice was reverted for; `oshadow` covers the same
+/// program end to end, and this pins the alias path itself.
+#[test]
+fn alias_module_keeps_the_pickled_overloads() {
+    let (Some(jar), true) = (scala_library_jar(), java_available()) else {
+        return;
+    };
+    let out = tmp_dir("os2-bigdec");
+    let path = out.join("Main.scala");
+    fs::write(
+        &path,
+        "object Main {\n  def main(a: Array[String]): Unit = {\n\
+         \x20   println(BigDecimal(3L))\n\
+         \x20   println(BigDecimal(2))\n\
+         \x20   println(BigDecimal(\"4.25\"))\n\
+         \x20   println(BigDecimal(BigInt(6)))\n\
+         \x20   println(BigDecimal(0.5))\n\
+         \x20   println(BigInt(\"7\"))\n\
+         \x20 }\n}\n",
+    )
+    .unwrap();
+    let output = Command::new(bin())
+        .arg("compile")
+        .arg(&path)
+        .args(["-d", out.to_str().unwrap()])
+        .args(["--scala-library", jar.to_str().unwrap()])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "compile failed: {}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(run_main(&out, Some(&jar)), "3\n2\n4.25\n6\n0.5\n7\n");
+    let _ = fs::remove_dir_all(&out);
+}

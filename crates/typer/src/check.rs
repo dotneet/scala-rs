@@ -5406,13 +5406,12 @@ impl Typer {
                         // is nsc's summoner and is what the type arguments
                         // target here.
                         //
-                        // Only when the module declares no `apply` at all: the
-                        // prelude writes its own for the collection factories,
-                        // and adding the pickle's overloads next to them made
-                        // `List[Int](1, 2)` "ambiguous overload for apply".
-                        if self.st.lookup_member(cls, "apply").is_empty() {
-                            self.supply_from_pickle_class(cls, "apply");
-                        }
+                        // Safe next to the prelude's own factories because
+                        // `PickleSupply` declines a copy of a hand-written
+                        // member with the same erasure (`agent/setapply`);
+                        // before that gate landed this made `List[Int](1, 2)`
+                        // "ambiguous overload for apply".
+                        self.supply_from_pickle_class(cls, "apply");
                         let candidates: Vec<SymbolId> = self
                             .st
                             .lookup_member(cls, "apply")
@@ -8075,6 +8074,63 @@ impl Typer {
         true
     }
 
+    /// The pickle's alternatives for a *module* receiver whose overload set is
+    /// only what the prelude wrote by hand.
+    ///
+    /// `BigDecimal(3L)` used to reach the companion the long way round: the
+    /// term `BigDecimal` was the trait/class symbol, `apply` was not a member
+    /// of it, and the `found.is_empty()` branch in `type_select` read the
+    /// companion's seven alternatives out of the pickle on the way past.
+    /// Resolving the alias to the module directly (`prelude_ordsummon`, which
+    /// is what `val BigDecimal = scala.math.BigDecimal` means) short-circuits
+    /// that: the module class already carries the three `apply`s the prelude
+    /// writes, `found` is not empty, and nothing was ever read -- so
+    /// `BigDecimal(3L)` and `BigDecimal(BigInt(6))` became "no matching
+    /// overload".
+    ///
+    /// Asked only here, on the path that is otherwise about to report that
+    /// error, and only *adding*: `PickleSupply` declines a copy of a
+    /// hand-written prelude member (`agent/setapply`), so the alternatives that
+    /// arrive are the ones with an erasure the prelude does not already have.
+    fn widen_module_from_pickle(&mut self, fun: &mut Tree) -> bool {
+        if !self.library_abi {
+            return false;
+        }
+        let TreeKind::Select { qual, name } = &fun.kind else {
+            return false;
+        };
+        let name = name.clone();
+        let recv_ty = qual.ty.clone();
+        let Some(mcls) = self.st.class_sym_of(&recv_ty) else {
+            return false;
+        };
+        if self.st.get(mcls).kind != SymKind::ModuleClass {
+            return false;
+        }
+        let before = self.st.lookup_member(mcls, &name).len();
+        if self.supply_from_pickle_class(mcls, &name).is_empty() {
+            return false;
+        }
+        let mut found = self.st.lookup_member(mcls, &name);
+        found.retain(|&s| self.st.get(s).kind == SymKind::Method);
+        found = self.drop_overridden(found);
+        if found.len() <= before || found.is_empty() {
+            return false;
+        }
+        self.record_overload_group(&found, &name);
+        let alts: Vec<(SymbolId, Type)> = found
+            .iter()
+            .map(|&s| {
+                let t = self.st.subst_as_seen_from(&recv_ty, &self.st.get(s).ty);
+                (s, self.st.expand_in_type(&recv_ty, &t))
+            })
+            .collect();
+        self.overload_member_types.insert(found[0].0, alts.clone());
+        fun.ty = Type::Overload(alts.into_iter().map(|(_, t)| t).collect());
+        fun.sym = found[0];
+        true
+    }
+
     /// When a member exists on the receiver (e.g. `Int.+`) but the argument
     /// types do not match, try an implicit conversion that *does* have the
     /// method (`any2stringadd` for `1 + "x"`).
@@ -10503,6 +10559,22 @@ impl Typer {
                     }
                 }
                 if self.widen_with_companion(fun) {
+                    let fun_ty = fun.ty.clone();
+                    if let OverloadPick::Found(sym, param_tys, ret) =
+                        self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt)
+                    {
+                        fun.sym = sym;
+                        tree.sym = sym;
+                        self.adapt_args_to_params(args, &param_tys, sym);
+                        tree.ty = ret;
+                        return;
+                    }
+                }
+                // The same widening for a receiver that already *is* the
+                // companion (`BigDecimal(3L)` through the `scala` package
+                // object's alias): the alternatives the prelude did not write
+                // by hand are still in the pickle.
+                if self.widen_module_from_pickle(fun) {
                     let fun_ty = fun.ty.clone();
                     if let OverloadPick::Found(sym, param_tys, ret) =
                         self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt)

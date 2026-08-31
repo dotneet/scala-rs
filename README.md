@@ -1343,13 +1343,25 @@ summon（`Ordering[String]` = `Ordering.apply[String]`。nsc では
 2 つ足りていませんでした。
 
 - ライブラリのコンパニオンの `apply` は**選択されたとき**に pickle から読まれるので、
-  `.apply` と書かない `Ordering[String]` では見つかりませんでした。module が
-  `apply` を 1 つも持たないときだけ pickle から供給します（コレクションの
-  ファクトリには prelude が自前の `apply` を持っており、そこへ pickle の
-  オーバーロードを足すと `List[Int](1, 2)` が `ambiguous overload` になります）。
+  `.apply` と書かない `Ordering[String]` では見つかりませんでした。ここで
+  pickle から供給します。prelude が自前の `apply` を書いているコレクションの
+  ファクトリと並べても安全なのは、`PickleSupply` が**同じ erasure の
+  手書きメンバのコピーを断る**ようになったから（`agent/setapply`）で、その門が
+  入る前は `List[Int](1, 2)` が `ambiguous overload` になっていました。
 - 参照が module シンボルとは限りません。パッケージオブジェクトの別名は
   アクセサ（`def Equiv(): Equiv$`）として届くので、**module クラス型の安定値**も
   同じ扱いにします（`module_class_of_value`）。
+
+項 `Ordering` が module になったことで、**オーバーロードの復旧経路も 1 本増えます**。
+`BigDecimal(3L)` は今まで「項 `BigDecimal` はクラス → `apply` はそのクラスのメンバでは
+ない → `type_select` の `found.is_empty()` 枝が pickle からコンパニオンの 7 本を読む →
+`widen_with_companion` が両スコープを合わせる」という遠回りで通っていました。別名が
+module に解決されると module クラスには prelude 手書きの `apply` が 3 本あるので
+`found` が空にならず、pickle が読まれません（`no matching overload for <(Int) |
+(String) | (BigDecimal)> with arguments (3L)`。このスライスが一度 revert された回帰が
+これです）。`widen_module_from_pickle` を `widen_with_companion` の隣に足して、
+**module 受け手でも**「どの候補にも当てはまらなかった」ときだけ pickle を読みます。
+足す方向にしか働きません（同 erasure のコピーは `agent/setapply` の門が断る）。
 
 `--no-scala-library` では `scala/math/Ordering` の classfile も `Ordering$` も無く、
 `not found: value Ordering` の診断のままです（`prelude_ordsummon` は `library_abi`
@@ -3354,7 +3366,7 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/integral` スライス（`Integral` / `Fractional` を `Numeric` の型クラス階層に入れる）のフィクスチャは接頭辞 `ig`（`ig_hier` / `ig_hier_bad`）で、同じ理由から `crates/cli/tests/integral.rs` に置いています。`ig_hier.scala` は `List.range` / `Vector.range` / `Seq.range`、`implicitly[…]` 13 件の**選ばれたインスタンスのクラス名**、`quot` / `rem` / `div`、`Numeric[T]` を implicit に取るユーザーコード、`sum` / `product` / `sorted` / `max` / `min` / `sortBy`、`Integral[Int]` → `Numeric[Int]` / `Ordering[Int]` の widening、`Ordering[Option[Int]]` を 1 本にまとめてあり、library dual-run と **real scalac 2.13.16** との実行結果 diff（`ig_hier_matches_real_scalac`）の両方で `java -Xverify:all` の下に走らせます。クラス名を出力しているので「一意になった」ではなく「**実 scalac と同じインスタンスを選んでいる**」ことが見えます。`ambiguity_did_not_increase` は `Ordering[Int/Double/Long/Byte/Short/Char/Float]` と `sum` / `product` / `sorted` / `max` / `min` / タプルの `sorted` に `ambiguous` が 1 件も出ないことを固定します（`Numeric[T] extends Ordering[T]` なので、ここが今回いちばん壊れやすい所でした）。`ig_hier_bad.scala` は階層がゴム印にならないこと——`Numeric[Int]` → `Integral[Int]` と `Ordering[Int]` → `Numeric[Int]` の逆流、実在しない `Integral[Double]` / `Fractional[Int]` / `Integral[String]`——を固定します（real scalac も同じ 6 行で 6 件出します）。私有ランタイムには `scala/math/Integral` が無いので、`range_is_diagnosed_without_the_jar` が `--no-scala-library` で `not found: type Integral` / `range is not a member of List$` と**きちんと診断される**ことを見ます。
 
-`agent/ordsummon` スライス（`Ordering` コンパニオンの項位置と summon `Ordering[T]`）のフィクスチャは接頭辞 `os2`（`os2_summon` / `os2_summon_bad`）で、同じ理由から `crates/cli/tests/ordsummon.rs` に置いています。`os2_summon.scala` は `Ordering.Int.reverse` / `Ordering[String]` / `Ordering[Int].reverse` / `Ordering.String.reverse` / `implicitly[Ordering[Int]].reverse` / `List(…).sorted(Ordering[String].reverse)` / `Ordering.by[(String, Int), Int]` / `Numeric[Int]` / `Numeric.IntIsIntegral` / `Integral[Int]` / `Fractional[Double]` / `BigInt` の乗算／選ばれたインスタンスのクラス名（`scala.math.Ordering$Int$`）／`List(Some(2), None, Some(1)).sorted` を 1 本にまとめ、library dual-run と **real scalac 2.13.16** との実行結果 diff（`os2_summon_matches_real_scalac`）の両方で `java -Xverify:all` の下に走らせます。`ClassCastException` は**型検査を通ったあとに**出ていたので、コンパイルが通ることだけでは足りません。`the_three_reported_forms_run` が報告された 3 形をそのまま実行し、`integral_and_fractional_summon` は `val i: Integral[Int] = Integral[Int]` が黙って通って実行時に落ちていた形（`59d967a` では型エラー）を固定します。`option_ordering_is_still_derived_but_is_not_a_view` は `Ordering.Option` が導出規則としては効き続け、view としては効かない（`val o: Ordering[Option[Int]] = Ordering.Int` は `type mismatch`）ことを両方見ます。`module_apply_redirect_still_works` は `List[Int](1, 2)` / `Vector[String]` / `Option[Int]` / `Map[String, Int]` の既存のファクトリが `ambiguous overload` にならないことを固定します（pickle からの `apply` 供給をここで足したので、いちばん壊れやすい所でした）。`os2_summon_bad.scala` はコンパニオンを項に出せるようにしたことが「なんでも通る」ことにならない 5 行——`val a: Ordering[Int] = Ordering` / `val b: Ordering[Option[Int]] = Ordering.Int` / `Ordering.Foo` / `Numeric.Int` / `Ordering[Object]`——で、real scalac も同じ 5 行で 5 件出します。`summon_is_diagnosed_without_the_jar` は `--no-scala-library` で `not found: value Ordering` の診断が残ることを見ます。
+`agent/ordsummon` スライス（`Ordering` コンパニオンの項位置と summon `Ordering[T]`）のフィクスチャは接頭辞 `os2`（`os2_summon` / `os2_summon_bad`）で、同じ理由から `crates/cli/tests/ordsummon.rs` に置いています。`os2_summon.scala` は `Ordering.Int.reverse` / `Ordering[String]` / `Ordering[Int].reverse` / `Ordering.String.reverse` / `implicitly[Ordering[Int]].reverse` / `List(…).sorted(Ordering[String].reverse)` / `Ordering.by[(String, Int), Int]` / `Numeric[Int]` / `Numeric.IntIsIntegral` / `Integral[Int]` / `Fractional[Double]` / `BigInt` の乗算／選ばれたインスタンスのクラス名（`scala.math.Ordering$Int$`）／`List(Some(2), None, Some(1)).sorted` を 1 本にまとめ、library dual-run と **real scalac 2.13.16** との実行結果 diff（`os2_summon_matches_real_scalac`）の両方で `java -Xverify:all` の下に走らせます。`ClassCastException` は**型検査を通ったあとに**出ていたので、コンパイルが通ることだけでは足りません。`the_three_reported_forms_run` が報告された 3 形をそのまま実行し、`integral_and_fractional_summon` は `val i: Integral[Int] = Integral[Int]` が黙って通って実行時に落ちていた形（`59d967a` では型エラー）を固定します。`option_ordering_is_still_derived_but_is_not_a_view` は `Ordering.Option` が導出規則としては効き続け、view としては効かない（`val o: Ordering[Option[Int]] = Ordering.Int` は `type mismatch`）ことを両方見ます。`module_apply_redirect_still_works` は `List[Int](1, 2)` / `Vector[String]` / `Option[Int]` / `Map[String, Int]` の既存のファクトリが `ambiguous overload` にならないことを固定します（pickle からの `apply` 供給をここで足したので、いちばん壊れやすい所でした）。`alias_module_keeps_the_pickled_overloads` は `BigDecimal(3L)` / `BigDecimal(BigInt(6))` / `BigInt("7")`——**このスライスが一度 revert された回帰**（別名が module に解決されると `widen_with_companion` の経路を通らず、prelude 手書きの 3 本しか候補に残らない）——を固定します（`oshadow` が同じプログラムを端から端まで見ますが、こちらは別名の経路そのものを見ます）。`os2_summon_bad.scala` はコンパニオンを項に出せるようにしたことが「なんでも通る」ことにならない 5 行——`val a: Ordering[Int] = Ordering` / `val b: Ordering[Option[Int]] = Ordering.Int` / `Ordering.Foo` / `Numeric.Int` / `Ordering[Object]`——で、real scalac も同じ 5 行で 5 件出します。`summon_is_diagnosed_without_the_jar` は `--no-scala-library` で `not found: value Ordering` の診断が残ることを見ます。
 
 `agent/traitextends` スライス（trait がクラスを継承する、`abstract override` / stackable trait）の
 フィクスチャは接頭辞 `trex`（`trex_stack` / `trex_inherit` / `trex_mixin_bad` /
