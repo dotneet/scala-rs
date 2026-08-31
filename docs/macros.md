@@ -1449,3 +1449,152 @@ TypeTags$TypeTag[...]` で、`c.typeOf[slick.collection.heterogeneous.HList]` �
 4. **`reify { … }` 本体**（§7.8 の残件 2）。式全体の `TreeCreator` 化。
    materialization と同じ機構の上に載る。
 5. **engine（フェーズ 2）。** マクロを*呼ぶ*ための JVM ブリッジ。
+
+### 7.11 engine — マクロ実装を本当に呼ぶ（`agent/engine` スライス）
+
+§6 の**フェーズ 2**。§2.3 の prototype を製品コードにし、
+**`def f = macro Impl.m` の呼び出しが実際に展開され、展開後のプログラムが走る**
+ようになった。実 scalac 2.13.16 と同じ 2 ファイル・2 回コンパイルの構成で
+dual-run し、**プログラム出力が完全一致**する（`crates/cli/tests/engine.rs`）。
+
+#### 形（ブリッジの構成）
+
+engine は **Java 1 ファイル**（`crates/typer/java/ScalaRsMacroEngine.java`）で、
+Scala のクラスは**すべてリフレクション経由**で触る。したがって `javac` に
+scala-reflect.jar は要らず、リポジトリに classfile も置かない。
+`include_str!` でバイナリに埋め込み、初回展開時に
+
+```
+$TMPDIR/scala-rs-macro-engine-<ソースの FNV ハッシュ>/
+```
+
+へ書き出して `javac` する（ハッシュ付きなので古い classfile が走ることはない）。
+
+- **常駐 1 プロセス／1 コンパイル。** 最初の展開で `java` を起動し、
+  以降は 1 行 1 リクエストのパイプで捌く（§6.4 のリスク表「engine プロセスの
+  起動コスト」への回答）。`Typer` が落ちるときに `Drop` で kill する。
+- **classpath は `binary_path` そのもの**（`-cp` ＋ `--scala-library`）。
+  nsc が `-Ymacro-classpath` 既定でコンパイル classpath を使うのと同じで、
+  §2.3 で分かった「reify の `staticModule` はコンパイル対象のクラスも要求する」
+  という注意もこれで満たされる。
+- **`Context` は `java.lang.reflect.Proxy`**（prototype と同じ）。実装したのは
+  `universe` / `mirror` / `Expr` / `WeakTypeTag` / `TypeTag` / `TermName` /
+  `TypeName` / `freshName` / `abort` と、トレイトの default 実装
+  （`invokeDefault`）。それ以外は `UnsupportedOperationException` で落ち、
+  Rust 側は**その名前を診断に出す**。
+- **直列化は S 式**（JSON ではなく）。両端とも自前パーサが 60 行で書け、
+  1 行 1 メッセージでパイプに乗る。§4.2 の JSON 案と情報量は同じである。
+
+```
+→ (expand "EgImpl$" "plusImpl" (argss (args (arg expr <tree> (ty "scala.Int")))) (tags))
+← (ok (t "Apply" (s0) (t "Select" (s0) (t "Literal" (s0) (c "Int" "41")) (n term "$plus"))
+        (l (t "Literal" (s0) (c "Int" "1")))))
+```
+
+**戻りの木は engine が汎用に書く**。ノード種別を engine は知らない：
+`productPrefix` と `productElement` をそのまま並べ、`Symbol` は
+`isStatic` のときだけ完全修飾名を添える。「この形は作れない」と判断するのは
+**Rust 側だけ**で、知らない `Prefix` は必ず名指しの診断になる。
+
+#### 展開をどこでやるか
+
+nsc と同じく **typer の中**、**macro application の一番外側**で展開する
+（`Check::type_expr` の末尾、`adapt` の**手前**）。「一番外側」は
+`typing_callee` という 1 ビットで見分ける：`Apply` / `TypeApply` が callee を
+型付ける直前に立て、`type_expr` の入口で `mem::take` する。だから
+`M.f` は `M.f(1)` の head としては展開されず、レシーバの中の
+`M.g(1).h` は展開される。カリー化されたマクロの内側の `Apply` は
+「まだ `Type::Method`」で弾かれる。
+
+blackbox なので、展開結果は**宣言された戻り値型**を期待型として 1 回だけ
+型検査し、型はその宣言型に戻す（nsc の `Typed(expanded, TypeTree(innerPt))`）。
+
+**展開できなかったものは 1 件残らず診断になる。** `report_macro_calls` の
+掃除は phase 1 のまま残してあり、展開器は失敗の**理由**を span ごとに記録して
+そこに載せるだけである:
+
+```
+error: macro expansion is not implemented: cannot expand nameOf
+       (implementation EgImpl$.nameOfImpl): scala-rs cannot build a type tag for
+       `List[Int]`, a type constructor applied to type arguments. See docs/macros.md.
+```
+
+#### 2 回コンパイルであることは仕様である
+
+nsc は「マクロ実装は**展開が起きる run より前に**コンパイル済みでなければ
+ならない」と決めている（§1.3）。scala-rs も同じで、実装が macro classpath に
+無ければ engine が `ClassNotFoundException` を返し、それが
+`is not on the macro classpath (nsc requires the implementation to have been
+compiled by an earlier run)` という理由になる
+（`tests/fixtures/eg_samerun_bad.scala` が固定）。
+マクロ **def** の側は現在の run にあってよい（slick もその形）。
+
+#### 通るようになった形
+
+| 形 | 例 | 備考 |
+| --- | --- | --- |
+| 引数なし | `def const(): Int = macro EgImpl.constImpl` | 展開は `Literal(Constant(42))` |
+| `c.Expr[T]` 引数 | `def plus1(x: Int): Int` | 呼び出し地点の木を `Expr` に包んで渡す |
+| 生の `c.Tree` 引数 | `def twice(x: Int): Int` | 2.11 以降の形。slick の `mapToImpl` がこれ |
+| `c.WeakTypeTag[T]` | `def nameOf[T]: String = macro EgImpl.nameOfImpl[T]` | 型引数は**明示**のときだけ |
+| 展開結果の木 | `Literal` / `Ident` / `Select` / `Apply` / `TypeApply` / `Block` / `If` / `Typed` / `This` / `EmptyTree` / `TypeTree` | それ以外は名指しで断る |
+| static シンボル | 展開の `Ident(EgHelper)` | `isStatic` なら完全修飾パスに展開して呼び出し地点で解決する |
+
+#### 道中で塞いだ 2 つの一般の穴（どちらも「今まで誰も走らせていなかった」）
+
+| 直したもの | どこ |
+| --- | --- |
+| **`blackbox.Context` がインタフェースとして立っていなかった。** `prelude_reflect` の placeholder は `Flags::EMPTY` で、scala-reflect.jar がある実行でも**この symbol がそのまま本物として使われる**（`ensure_class` は `find_by_jvm` でこれを返す）。結果、マクロ実装の `c.universe` は `invokevirtual` になり、**実行した瞬間に `IncompatibleClassChangeError`** だった。§7.6 の fixture は「classfile がロード・検証できる」までしか見ていなかったので気づけていない | `prelude_reflect::ctx` |
+| **pickle が trait と言っているのに placeholder が class のままだった。** `find_or_stub_java_class` が descriptor から建てた symbol は trait/class を知らない。`give_stub_its_kinds` は型パラメータのある classだけを直していたので、`scala.reflect.macros.Universe` のような **型パラメータの無い** trait は class のままだった | `PickleSupply::give_stub_its_kinds` |
+
+#### 検証
+
+- `tests/fixtures/eg_impl.scala` + `tests/fixtures/eg_use.scala` —
+  scala-rs で 2 段コンパイルして実行し、8 行の出力が
+  `tests/fixtures/expected/eg_use.txt` と一致する（`java -Xverify:all`）。
+  **同じ 2 ファイルを実 scalac 2.13.16 でも 2 段コンパイルして実行し、
+  同じ 8 行になることを別テストで固定**している。マクロが「違う木」に
+  展開されてもコンパイルは通ってしまうので、**出力の比較だけが
+  間違った展開を捕まえられる**。
+- `tests/fixtures/eg_samerun_bad.scala` — 同一 run に実装がある場合。
+- `tests/fixtures/eg_gaps_bad.scala` — 渡せない引数の形・作れないタグ。
+
+#### このスライスのあとに残っているもの
+
+1. **`c.Expr[T](tree)` が scala-rs でコンパイルできない。** `Context.Expr` の
+   オーバーロード（`def Expr[T: WeakTypeTag](tree: Tree): Expr[T]`）に解決せず、
+   `universe.Expr.apply` の方に当たる。だから fixture の実装は
+   すべて `c.Tree` を返している。**slick の `TableQueryMacroImpl` は
+   `c.Expr` を返す**ので、これは必要になる。
+2. **推論された型引数がタグにならない。** `M.f[T]` と明示された場合だけ
+   タグを作る。呼び出し地点で推論された型引数は typer が木に残さないので、
+   いまは名指しで断っている。
+3. **引数の木は「書かれた構文」しか運べない。** 型付き木のまま渡す
+   （§4.3）のではなく、`Literal` / `Ident` / `Select` / `Apply` / `This` を
+   構文として渡して呼び出し地点で型検査し直す。ブロック・関数リテラル・`new`
+   などは名指しで断る。slick の `mapToImpl` は `c.prefix` を見るので、
+   ここは `prefix` の実装（未実装、`UnsupportedOperationException`）と
+   合わせて次の一手になる。
+4. **`c.prefix` / `c.enclosingPosition` / `c.typecheck` / `c.inferImplicitValue`。**
+   `prefix` は呼び出し地点のレシーバ木、`enclosingPosition` は span の変換で
+   でき、`typecheck` / `inferImplicitValue` は engine → Rust の逆方向 RPC が要る
+   （§6.4）。slick が使うのは `prefix` / `enclosingPosition` / `abort` までで、
+   `abort` は実装済み。
+5. **展開結果の `TypeTree` は型引数の無いクラスだけ。** `List[Int]` を
+   埋めた木は断る。
+6. **whitebox。** 変わらず未実装（§6.3）。
+7. **`MACRO` フラグと `@macroImpl` の pickle（§5）。** マクロ def を
+   *別 run* から展開することはまだできない。いまは「マクロ def は現在の run、
+   実装は前の run」という形だけが通る。slick は 1 ファイルに def と実装を
+   並べるので、この形で足りる。
+
+#### slick への効き方
+
+`tests/slick_measure.sh` で `errors=203 → 203`、`files_with_errors=60 → 60`、
+`tests/slick_subset.sh` は `204/204` のまま。**数字は動かない。**
+slick の `TableQuery.apply` / `ShapedValue.mapTo` の呼び出し地点は
+「実装が同じ run にある」ので nsc でも展開できない形であり、
+engine が効くのは**slick を classfile として先にコンパイルできてから**である。
+このスライスが動かすのは §7.1〜7.10 が積み上げてきた「実装をコンパイルする」
+側ではなく、その先の「実装を呼ぶ」側で、slick に効くのは
+残件 1（`c.Expr`）と 3〜4（`c.prefix`）が入ってからになる。

@@ -152,7 +152,20 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
   `Impl$` / `method` のバインディングをシンボルに記録し、マクロ def のバイトコードは
   nsc と同じく**出さない**（だから Java から呼べない）。戻り値型の省略 / object のメソッド
   でない実装 / `Context` を第 1 引数に取らない実装 / 解決できない参照 / whitebox は診断する。
-  **展開は未実装**なので、呼び出し地点は診断して落とす。設計は [`docs/macros.md`](docs/macros.md)
+  設計は [`docs/macros.md`](docs/macros.md)
+- **def マクロの展開（JVM ブリッジ）**: nsc と同じく、マクロ実装の classfile を
+  **JVM 上で本当にロードして呼ぶ**。`java` と scala-reflect.jar があれば
+  `def f(): Int = macro Impl.m` の呼び出しが展開され、展開後のプログラムが走る。
+  engine は Java 1 ファイル（`crates/typer/java/ScalaRsMacroEngine.java`）で、
+  初回展開時に `javac` して `$TMPDIR` にキャッシュし、コンパイル 1 回につき
+  1 プロセスを常駐させる。`Context` は `Proxy` で作り、`universe` には
+  `scala.reflect.runtime.universe` を差す。**nsc と同じく、マクロ実装は
+  前の run でコンパイル済みでなければならない**（同じ run にあると
+  `is not on the macro classpath` という理由つきで診断する）。渡せる引数の形
+  （`Literal` / `Ident` / `Select` / `Apply` / `this`）、作れるタグ（型引数の無い
+  クラス、明示された型引数のみ）、戻せる木の種類は**部分集合**で、外れる形は
+  すべて名指しで診断する（黙って違う木に展開しない）
+  （[`docs/macros.md`](docs/macros.md) §7.11）
 - **quasiquote（`q"..."`）の reification**: `q"..."` / `tq"..."` / `pq"..."` / `cq"..."` は
   `StringContext` の普通の補間子ではなく、nsc の**コンパイラ内蔵マクロ**である。
   補間文字列の中身を（`$x` / `${…}` / `..$xs` / `...$xss` をプレースホルダに置き換えて）
@@ -3298,15 +3311,21 @@ implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラー
 
 言語:
 
-- **def マクロの展開**。定義側（`def f: T = macro Impl.method`）はパースし、実装への
-  バインディングをシンボルに記録しますが、**展開は未実装**です。呼び出し地点は
-  `macro expansion is not implemented: cannot expand f (implementation Impl$.method)` と
-  診断します（黙って通しません）。マクロ def は nsc と同じくバイトコードを持ちません。
-  実行モデルの設計・実証・段階的な計画は **[`docs/macros.md`](docs/macros.md)** にあります。
-  当面のゲート: whitebox マクロ / macro bundle / マクロバインディングの pickle /
-  `reify`。**マクロ実装のソース自体は**、scala-reflect.jar が `-cp` にあれば
-  コンパイルできます（`c.Expr[T]` / `c.Tree` / `c.WeakTypeTag[T]` /
-  `import c.universe._` / 本体の `q"..."`。`tests/fixtures/qq_ctx.scala`）
+- **def マクロの展開の残り**。展開そのものは動きます（上の「def マクロの展開
+  （JVM ブリッジ）」）。まだできないのは:
+  **whitebox マクロ** / **macro bundle**（`class B(val c: Context)`）/
+  **マクロバインディングの pickle**（`MACRO` フラグと `@macroImpl`。だから
+  マクロ def を*別 run*から展開することはできず、「マクロ def は現在の run、
+  実装は前の run」という形だけが通ります）/ **`c.Expr[T](tree)` を返す実装**
+  （`Context.Expr` のオーバーロードに解決しない）/ **推論された型引数のタグ**
+  （明示された `f[T]` だけ）/ **`c.prefix` / `c.enclosingPosition` /
+  `c.typecheck` / `c.inferImplicitValue`**（呼ばれると engine が
+  `UnsupportedOperationException` を投げ、その名前が診断に出ます）/
+  **ブロック・関数リテラル・`new` などの引数を実装に渡すこと** /
+  **型引数のある型のタグ**。どれも「黙って別の木に展開する」ことはせず、
+  `macro expansion is not implemented: cannot expand f (implementation Impl$.m):
+  <理由>` と理由つきで診断します
+  （**[`docs/macros.md`](docs/macros.md)** §7.11）
 - **quasiquote の展開（reification）の残り**。`q"..."` / `tq"..."` / `pq"..."` /
   `cq"..."` は `internal.reificationSupport.Syntactic*` の呼び出しに落として
   実行でき、型注釈 / eta 展開 / ブロックと `val` / `new` / `match` / 部分関数 /
@@ -4392,6 +4411,8 @@ quasiquote と、その受け皿である reflect ABI の下地は `crates/cli/t
 接頭辞 `tt` は **`TypeTag` / `WeakTypeTag` の materialization**（`docs/macros.md` §7.10）です。`tests/fixtures/tt_tags.scala` はタグを 1 つも書かずに `typeOf` / `weakTypeOf` / `typeTag` / `weakTypeTag` を呼び、作られたタグの `tpe` を **30 行ぶん印字**して `tt_tags_materialises_type_tags`（`java -Xverify:all` で実行して `expected/tt_tags.txt` と一致）と `tt_tags_matches_real_scalac`（**実 scalac 2.13.16** と三者一致）の 2 通りで回します。scala-rs が組む木は nsc の木と同じではない（`$u` / `$m` の束縛を省き、mirror を cast し、creator の結果型を書き下す）ので、固定しているのは**答え**——`toString` / `=:=` / `<:<` / `typeSymbol.fullName`——です。`tests/fixtures/tt_ctx.scala` はマクロ実装の中の `c.typeOf[T]`（slick の `ShapedValue.mapToImpl` が `uTag.tpe <:< c.typeOf[HList]` と書く形）で、`tt_ctx_materialises_in_a_macro_implementation` が両コンパイラでコンパイルできること・classfile が JVM にロード・検証されることを見ます。異常系 `tt_tags_bad.scala` は `tt_tags_bad_names_every_tag_it_cannot_build` が、組めない 7 形（型引数のある型・入れ子クラス・`AnyRef`・型パラメータ・singleton 型）を**その形の名前つきで**診断し、`no implicit: could not find implicit value of type TypeTags$TypeTag[...]` に戻らないことを固定します。
 
 def マクロは `crates/cli/tests/macros.rs` にまとめています。呼ばれない macro def のコンパイルと、`Sugar$.class` にメソッドが出ていないことは `macro_def.scala`。マクロ呼び出しの診断は `macro_call_bad.scala`（`macro expansion is not implemented`）。戻り値型の無いマクロ def は `macro_no_result_type_bad.scala`。`Context` を第 1 引数に取らない実装は `macro_impl_shape_bad.scala`。解決できない実装参照は `macro_impl_missing_bad.scala`。whitebox は `macro_whitebox_bad.scala`。設計は [`docs/macros.md`](docs/macros.md)。
+
+def マクロの**展開**（JVM ブリッジ）は接頭辞 `eg`、`crates/cli/tests/engine.rs` です。nsc と同じく**2 回コンパイル**します: `tests/fixtures/eg_impl.scala`（マクロ実装 5 つ——引数なし / `c.Expr[Int]` / 生の `c.Tree` / `c.WeakTypeTag[T]` / static シンボルを名指す木）を先にコンパイルし、その出力を `-cp` に載せて `tests/fixtures/eg_use.scala`（マクロ def と呼び出し地点）をコンパイルします。`eg_macros_expand_and_run` が `java -Xverify:all` で走らせて `expected/eg_use.txt` の 8 行と一致することを見て、`eg_macros_match_real_scalac` が**同じ 2 ファイルを実 scalac 2.13.16 で 2 段コンパイル・実行した stdout** と三者一致することを見ます。マクロが「違う木」に展開されてもコンパイルは通ってしまうので、**出力の比較だけが間違った展開を捕まえられます**。異常系は `eg_samerun_bad.scala`（実装が同じ run にある。nsc も同じ理由で断る）と `eg_gaps_bad.scala`（渡せない引数の形＝ブロック・関数リテラル、作れないタグ＝`List[Int]`）で、いずれも**その形を名指しした理由つき**で診断されることを固定します。`java` / `javac` / scala-reflect.jar が無い環境ではスキップします。
 
 名前付き引数とデフォルト引数は `tests/fixtures/namedargs.scala` にまとめ、`crates/cli/tests/e2e.rs` から 2 通りで回します: `scala_library_dual_run_namedargs`（jar リンクで実行し `expected/namedargs.txt` と一致）と `real_scalac_dual_run_namedargs`（**実 scalac 2.13.16 でコンパイル・実行した stdout** と、期待値および scala-rs の出力の三者が一致することを見る）。中身は並べ替え（`Api.area(height = 3, width = 4)`）、自分の位置にある名前付き引数のあとの位置引数（`Api.area(width = 4, 3)`）、デフォルトとの組み合わせ、コンパニオン `apply`、後続の引数リストのデフォルト（`Api.curried(1)(2)` / `Api.dep(4)()`）、可変長引数（`Api.tagged(first = 1)` / `Api.tagged(first = 1, 2, 3)`）、case class の `apply` / `copy` / `super.info.copy(port = 2)`、コンストラクタの名前付き引数とデフォルト（`new Server(threads = 8)` / `new Server()`）、パラメータ名で絞るオーバーロードです。負例は `namedargs_unknown_bad.scala`（`unknown parameter name: q`。メソッドとコンストラクタの両方）、`namedargs_dup_bad.scala`（`parameter 'c' is already specified at parameter position 2`）、`namedargs_order_bad.scala`（`positional after named argument.`）で、いずれも文面を実 scalac 2.13.16 に合わせています。
 | `lazysig.scala` | 型注釈のないメンバを前方参照（`Store.base` / `prefix` / `lazy val`） | `60` `log:store` `[store]log:store` `40` `5` `c7:7` |
@@ -6226,14 +6247,18 @@ error: value += is not a member of T
   `val` も `var` も `def` と同じく検査する（`ov_valdef_bad` / `ov_var_bad` /
   `ov_modreq_bad`）。残件は上のライブラリ側フラグの件。
 - **implicit 探索の残り**: 多相 implicit のユニフィケーションと再帰導出、発散の打ち切り、nsc 相当の specificity は入った（「Implicit 解決」節）。残るのは (a) `xs.toMap` を `scala.collection.Iterable` にも載せること — pickle 供給が具象コレクション（`HashMap` / `ConstArray` …）に自前の `toMap` を付けるので、継承した 2 本目がオーバーロード衝突になる。いまは `List` / `Iterator` だけに宣言している、(b) 期待型からのメソッド型パラメータ推論が要る implicit（slick の `TypedType[T]` / `TypedType[P1]` はこちらで、implicit 探索ではなく `T` の推論が先に必要）、(c) 診断文面は nsc の複数行（`both … and … match expected type …`）ではなく 1 行のまま
-- **def マクロの展開**。`def f: T = macro Impl.method` は**パースして**バインディングを
-  シンボル（`Symbol.macro_impl`）に記録し、マクロ def のバイトコードは nsc と同じく出さない。
-  展開器はまだ無いので、呼び出し地点は `macro expansion is not implemented` で診断する。
-  残件は、実行モデルの実装（`docs/macros.md` §2 の JVM ブリッジ。設計は動く prototype で
-  実証済み）、マクロバインディングの pickle（nsc の `MACRO` フラグ + `@macroImpl`。§5）、
-  `scala.reflect` API の prelude と ABI コード生成（§6 フェーズ 3）、
-  quasiquote と `reify`（fast track マクロなので自前実装が要る。§6.2）、
-  whitebox と macro bundle。テストは `crates/cli/tests/macros.rs`
+- **def マクロの展開の残り**。JVM ブリッジ（`docs/macros.md` §2 / §7.11）は入り、
+  マクロ実装を**本当にロードして呼ぶ**。`java` と scala-reflect.jar があれば
+  `def f(): Int = macro Impl.m` は展開され、展開後のプログラムは実 scalac の
+  出力と一致する（`crates/cli/tests/engine.rs`）。残件は、
+  マクロバインディングの pickle（nsc の `MACRO` フラグ + `@macroImpl`。§5。
+  だからマクロ def を*別 run*から展開することはできない）、
+  `c.Expr[T](tree)` を返す実装、推論された型引数のタグ、
+  `c.prefix` / `c.enclosingPosition` / `c.typecheck` / `c.inferImplicitValue`、
+  引数に渡せる木の形（ブロック・関数リテラル・`new` は不可）、
+  型引数のある型のタグ、whitebox と macro bundle。
+  外れる形は**すべて理由つきで診断する**。
+  テストは `crates/cli/tests/macros.rs` と `crates/cli/tests/engine.rs`
 - **quasiquote の reification の残り**。`q"..."` はリテラル / 名前 / 選択 /
   適用（カリー化含む）/ `$x` 穴 / 引数リスト 1 節ぶんの `..$xs` を
   `internal.reificationSupport.Syntactic*` に落として実行できる
@@ -6265,7 +6290,7 @@ error: value += is not a member of T
   (c) `_` プレースホルダ関数リテラル・右結合演算子・`else` の無い `if`・
   by-name / 可変長パラメータ・手続き構文・パターン定義・自分型・early definition・
   `type` 定義（いずれもパーサが nsc の保つ区別ごと正規化してしまう形）、
-  (d) 展開器（engine）そのもの。
+  (d) 展開器（engine）そのものは入った（§7.11、上の「def マクロの展開の残り」）。
   落とせない形は**すべて `unimplemented syntax: quasiquote ...` で診断する**
 - **ローカルな `case class` のコンパニオン**。メソッド本体で宣言した
   `case class P(a: Int)` は、クラス `Main$P$1` は出るが**コンパニオン

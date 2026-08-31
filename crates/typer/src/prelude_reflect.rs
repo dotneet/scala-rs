@@ -54,7 +54,14 @@ fn pkg(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId
 }
 
 fn ctx(st: &mut SymbolTable, owner: SymbolId, jvm: &str) -> SymbolId {
-    let id = st.alloc("Context", owner, SymKind::Class, Flags::EMPTY, jvm);
+    // `blackbox.Context` is a *trait*, and this symbol is the one the pickle
+    // supply fills in when scala-reflect.jar is there (`ensure_class` answers
+    // `find_by_jvm` with it rather than building a second one). Without the
+    // flag the backend emitted `invokevirtual Context.universe()` and the
+    // macro implementation died with `IncompatibleClassChangeError` the first
+    // time it was actually run -- which nothing did until the engine landed.
+    let flags = Flags::INTERFACE.with(Flags::TRAIT).with(Flags::ABSTRACT);
+    let id = st.alloc("Context", owner, SymKind::Class, flags, jvm);
     st.get_mut(id).parents = vec![Type::AnyRef];
     st.get_mut(id).ty = Type::Class {
         sym: id,

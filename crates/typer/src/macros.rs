@@ -63,6 +63,7 @@ impl Typer {
         if let Some(binding) = self.resolve_macro_impl(&impl_ref, tree.span) {
             if !tree.sym.is_none() {
                 self.st.get_mut(tree.sym).macro_impl = Some(binding);
+                self.has_macro_defs = true;
             }
         }
         true
@@ -153,62 +154,118 @@ impl Typer {
             impl_class,
             impl_method: name,
             blackbox,
+            tag_params: self.macro_impl_tag_params(sym),
+            expr_args: self.macro_impl_expr_args(sym),
         })
     }
 
-    /// Look up the method a macro implementation reference names.
-    fn lookup_macro_impl_method(&self, base: &Tree) -> Option<SymbolId> {
-        let pick = |cands: Vec<SymbolId>| -> Option<SymbolId> {
-            cands
-                .into_iter()
-                .find(|&s| self.st.get(s).kind == SymKind::Method)
-        };
-        match &base.kind {
-            TreeKind::Ident { name } => pick(self.st.lookup(name)),
-            TreeKind::Select { qual, name } => {
-                let owner = self.lookup_macro_impl_owner(qual)?;
-                pick(self.st.lookup_member(owner, name))
-            }
-            _ => None,
+    /// Which of the implementation's value parameters are `c.Expr[T]`.
+    ///
+    /// The leading `Context` and the trailing tag clause are not arguments of
+    /// the macro application, so they are left out; what is left lines up one
+    /// for one with the call site's arguments.
+    fn macro_impl_expr_args(&self, impl_sym: SymbolId) -> Vec<bool> {
+        let mut flat = self.macro_impl_params(impl_sym);
+        // The leading `Context`, then the trailing tags.
+        if !flat.is_empty() {
+            flat.remove(0);
+        }
+        while flat.last().is_some_and(|&p| self.is_tag_param(p)) {
+            flat.pop();
+        }
+        flat.iter()
+            .map(|&p| self.st.display_type(&self.st.get(p).ty).contains("Expr"))
+            .collect()
+    }
+
+    /// Every value parameter of the implementation, clauses flattened.
+    ///
+    /// A method read back from a class file may carry its parameters in
+    /// `paramss` or, when the pickle recorded no clause structure, in `params`.
+    fn macro_impl_params(&self, impl_sym: SymbolId) -> Vec<SymbolId> {
+        let sym = self.st.get(impl_sym);
+        if sym.paramss.is_empty() {
+            sym.params.clone()
+        } else {
+            sym.paramss.iter().flatten().copied().collect()
         }
     }
 
-    /// Resolve the object part of `Impl.method` to its module *class*.
-    fn lookup_macro_impl_owner(&self, qual: &Tree) -> Option<SymbolId> {
-        let by_name = |cands: Vec<SymbolId>| {
-            cands.into_iter().find(|&s| {
-                matches!(
-                    self.st.get(s).kind,
-                    SymKind::Module | SymKind::ModuleClass | SymKind::Package
-                )
-            })
+    /// Is this parameter one of the `c.WeakTypeTag[T]` a macro implementation's
+    /// trailing implicit clause takes?
+    ///
+    /// The simple-name arm is for implementations read from a class file
+    /// scala-rs wrote: its pickle subset records member types by simple name,
+    /// so `c.WeakTypeTag[T]` arrives as an unresolved `WeakTypeTag`.
+    fn is_tag_param(&self, p: SymbolId) -> bool {
+        let ty = self.st.get(p).ty.clone();
+        if crate::materialize::tag_request(&self.st, &ty).is_some() {
+            return true;
+        }
+        matches!(&ty, Type::Named { name, args }
+            if args.len() == 1 && (name == "WeakTypeTag" || name == "TypeTag"))
+    }
+
+    /// How many `c.WeakTypeTag[T]` the implementation's trailing clause takes.
+    ///
+    /// nsc allows the clause to be left out entirely -- an implementation that
+    /// does not look at its type arguments simply does not ask for tags -- so
+    /// the count has to come off the implementation's own signature and not
+    /// off the macro def's type parameters.
+    fn macro_impl_tag_params(&self, impl_sym: SymbolId) -> usize {
+        self.macro_impl_params(impl_sym)
+            .iter()
+            .rev()
+            .take_while(|&&p| self.is_tag_param(p))
+            .count()
+    }
+
+    /// Look up the method a macro implementation reference names.
+    ///
+    /// The reference is *typed*, not looked up by hand. nsc requires the
+    /// implementation to be compiled by an earlier run, so it is normally a
+    /// class file on `-cp`, and reaching a class file's members means going
+    /// through the same lazy loading (`install_java_class`, the pickle
+    /// supply, companion modules) that an ordinary selection goes through --
+    /// a hand-rolled scope walk found only the implementations that this run
+    /// happens to compile itself, which are exactly the ones that *cannot*
+    /// be expanded.
+    ///
+    /// The probe types a copy, and its diagnostics are rolled back: what a
+    /// failure means here is "macro implementation not found", which the
+    /// caller reports.
+    fn lookup_macro_impl_method(&mut self, base: &Tree) -> Option<SymbolId> {
+        let mut probe = base.clone();
+        // A method type as the expected type, the way `type_apply` types a
+        // callee: a nullary implementation must not be auto-applied, and an
+        // implementation with parameters must not be eta-expanded.
+        let dummy = Type::Method {
+            paramss: Vec::new(),
+            ret: Box::new(Type::NoType),
         };
-        let sym = match &qual.kind {
-            TreeKind::Ident { name } => by_name(self.st.lookup(name))?,
-            TreeKind::Select { qual, name } => {
-                let outer = self.lookup_macro_impl_owner(qual)?;
-                by_name(self.st.lookup_member(outer, name))?
-            }
-            _ => return None,
-        };
-        Some(if self.st.get(sym).kind == SymKind::Module {
-            self.st.module_class_of(sym)
-        } else {
-            sym
-        })
+        let mark = self.diags.len();
+        let saved_callee = std::mem::replace(&mut self.typing_callee, true);
+        self.type_expr(&mut probe, &dummy);
+        self.typing_callee = saved_callee;
+        self.diags.truncate(mark);
+        let sym = probe.sym;
+        if sym.is_none() || self.st.get(sym).kind != SymKind::Method {
+            return None;
+        }
+        Some(sym)
     }
 
     /// `Some(true)` for a blackbox `Context` first parameter, `Some(false)` for
     /// whitebox, `None` when the first parameter is not a macro `Context`.
-    fn macro_context_kind(&self, impl_sym: SymbolId) -> Option<bool> {
+    fn macro_context_kind(&mut self, impl_sym: SymbolId) -> Option<bool> {
         let sym = self.st.get(impl_sym);
         let first = sym
             .paramss
             .first()
             .and_then(|c| c.first())
             .or_else(|| sym.params.first())?;
-        let ty = &self.st.get(*first).ty;
-        let name = match ty {
+        let ty = self.st.get(*first).ty.clone();
+        let name = match &ty {
             Type::Class { sym, .. } => {
                 let s = self.st.get(*sym);
                 if s.jvm_name.is_empty() {
@@ -216,6 +273,15 @@ impl Typer {
                 } else {
                     s.jvm_name.replace(['/', '$'], ".")
                 }
+            }
+            // Our own class files record a member's parameter types by
+            // *simple* name (`install_classpath`'s pickle subset), so a macro
+            // implementation compiled by scala-rs arrives with an unresolved
+            // `Context` -- and "blackbox or whitebox" cannot be read off a
+            // simple name at all. The erased descriptor in the class file can,
+            // so it is the answer here.
+            Type::Named { name, .. } if name == "Context" => {
+                self.macro_context_from_descriptor(impl_sym)?
             }
             _ => return None,
         };
@@ -228,23 +294,51 @@ impl Typer {
         }
     }
 
-    /// Report every macro application in a typed tree.
+    /// The first parameter type of the implementation, read off its class
+    /// file's method descriptor.
+    fn macro_context_from_descriptor(&mut self, impl_sym: SymbolId) -> Option<String> {
+        let owner = self.st.get(impl_sym).owner;
+        let jvm = self.st.get(owner).jvm_name.clone();
+        let name = self.st.get(impl_sym).name.clone();
+        if jvm.is_empty() {
+            return None;
+        }
+        let bytes = self.binary.find_class(&jvm).ok().flatten()?;
+        let jc = crate::javaclass::parse_java_classfile(&bytes).ok()?;
+        let m = jc.methods.iter().find(|m| m.name == name)?;
+        let first = m.desc.strip_prefix('(')?;
+        let end = first.find(';')?;
+        Some(first.get(1..end)?.replace('/', "."))
+    }
+
+    /// Report every macro application the expander left standing.
     ///
-    /// Expansion is not implemented (see `docs/macros.md`), so this always
-    /// reports an error. It must never silently accept the call: the macro def
-    /// has no bytecode, so the emitted class file would reference a method that
-    /// does not exist.
+    /// `crates/typer/src/expand.rs` replaces the ones it can expand while the
+    /// call site is typed; whatever is still a macro application here could
+    /// not be expanded, and this is the sweep that guarantees it is an error
+    /// rather than silently accepted -- the macro def has no bytecode, so the
+    /// emitted class file would reference a method that does not exist.
+    ///
+    /// When the expander recorded *why* it gave up, that reason is part of the
+    /// message: "cannot expand" with no reason at all was the phase-1 answer
+    /// and is now only what an application nobody even tried gets.
     pub(crate) fn report_macro_calls(&mut self, tree: &Tree) {
         // Report the *macro application* — the outermost Apply/TypeApply — the
         // way nsc does, so `M.f(1)` is one error rather than one per node.
         if let Some(sym) = self.macro_symbol_of(tree) {
             let name = self.st.get(sym).name.clone();
             let binding = self.st.get(sym).macro_impl.clone().expect("macro symbol");
+            let why = self
+                .macro_failures
+                .get(&self.macro_failure_key(tree.span))
+                .cloned()
+                .map(|w| format!(": {w}"))
+                .unwrap_or_default();
             self.error(
                 tree.span,
                 format!(
                     "macro expansion is not implemented: cannot expand {name} \
-                     (implementation {}.{}). See docs/macros.md.",
+                     (implementation {}.{}){why}. See docs/macros.md.",
                     binding.impl_class, binding.impl_method
                 ),
             );
@@ -294,7 +388,7 @@ impl Typer {
     }
 
     /// The macro symbol this tree applies, if it is a macro application.
-    fn macro_symbol_of(&self, tree: &Tree) -> Option<SymbolId> {
+    pub(crate) fn macro_symbol_of(&self, tree: &Tree) -> Option<SymbolId> {
         let head = match &tree.kind {
             TreeKind::Apply { .. } | TreeKind::TypeApply { .. } => {
                 let mut t = tree;

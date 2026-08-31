@@ -173,6 +173,19 @@ pub struct MacroBinding {
     /// the declared result type; whitebox macros may refine it, which changes
     /// how the call site re-typechecks the expansion.
     pub blackbox: bool,
+    /// How many `c.WeakTypeTag[T]` arguments the implementation's trailing
+    /// implicit clause takes. nsc records the same thing per parameter as a
+    /// `Tagged(i)` fingerprint; the expander needs it because the tags are
+    /// *optional* -- an implementation may declare none -- and sending the
+    /// wrong number is an `IllegalArgumentException` inside the engine
+    /// rather than a diagnostic.
+    pub tag_params: usize,
+    /// For each value parameter of the implementation, in order and after the
+    /// leading `Context`: `true` when it is declared `c.Expr[T]`, `false` when
+    /// it is the raw `c.Tree` nsc has also allowed since 2.11 (slick's
+    /// `mapToImpl` takes `Tree`s). Read off the *source* signature, because a
+    /// class file scala-rs writes erases both to `Object`.
+    pub expr_args: Vec<bool>,
 }
 
 #[derive(Clone, Debug)]
