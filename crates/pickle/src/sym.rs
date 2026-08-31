@@ -845,6 +845,7 @@ pub fn apply_subst(t: &SigType, map: &HashMap<String, SigType>) -> SigType {
         },
         SigType::Poly { tparams, result } => {
             let inner = without(map, tparams);
+            let (tparams, result) = avoid_capture(tparams, result, &inner);
             SigType::Poly {
                 tparams: tparams
                     .iter()
@@ -853,11 +854,12 @@ pub fn apply_subst(t: &SigType, map: &HashMap<String, SigType>) -> SigType {
                         ..tp.clone()
                     })
                     .collect(),
-                result: Box::new(apply_subst(result, &inner)),
+                result: Box::new(apply_subst(&result, &inner)),
             }
         }
         SigType::Existential { quantified, result } => {
             let inner = without(map, quantified);
+            let (quantified, result) = avoid_capture(quantified, result, &inner);
             SigType::Existential {
                 quantified: quantified
                     .iter()
@@ -866,7 +868,7 @@ pub fn apply_subst(t: &SigType, map: &HashMap<String, SigType>) -> SigType {
                         ..tp.clone()
                     })
                     .collect(),
-                result: Box::new(apply_subst(result, &inner)),
+                result: Box::new(apply_subst(&result, &inner)),
             }
         }
         SigType::Annotated(t) => SigType::Annotated(Box::new(go(t))),
@@ -878,6 +880,114 @@ pub fn apply_subst(t: &SigType, map: &HashMap<String, SigType>) -> SigType {
             super_tpe: Box::new(go(super_tpe)),
         },
     }
+}
+
+/// Every bare (undotted) name a signature mentions -- the shape a reference to
+/// a type *parameter* has, as against the dotted full name of a class.
+fn bare_names(t: &SigType, out: &mut Vec<String>) {
+    match t {
+        SigType::Ref { sym, args } => {
+            if !sym.contains('.') && !out.contains(sym) {
+                out.push(sym.clone());
+            }
+            for a in args {
+                bare_names(a, out);
+            }
+        }
+        SigType::This(_) | SigType::Constant(_) | SigType::None => {}
+        SigType::Single { prefix, .. } => bare_names(prefix, out),
+        SigType::Bounds { lo, hi } => {
+            bare_names(lo, out);
+            bare_names(hi, out);
+        }
+        SigType::Refined { parents, decls } => {
+            for p in parents {
+                bare_names(p, out);
+            }
+            for d in decls {
+                bare_names(&d.ty, out);
+            }
+        }
+        SigType::Method { params, result, .. } => {
+            for p in params {
+                bare_names(&p.ty, out);
+            }
+            bare_names(result, out);
+        }
+        SigType::Poly { tparams, result } => {
+            for tp in tparams {
+                bare_names(&tp.bounds, out);
+            }
+            bare_names(result, out);
+        }
+        SigType::Existential { quantified, result } => {
+            for tp in quantified {
+                bare_names(&tp.bounds, out);
+            }
+            bare_names(result, out);
+        }
+        SigType::Annotated(t) => bare_names(t, out),
+        SigType::Super {
+            this_tpe,
+            super_tpe,
+        } => {
+            bare_names(this_tpe, out);
+            bare_names(super_tpe, out);
+        }
+    }
+}
+
+/// Rename a binder whose name occurs free in the *range* of `map`.
+///
+/// Looking a member up walks the linearization, and every hop substitutes the
+/// parent's type parameters with the arguments the child passed it
+/// ([`SigCache::lookup`]). `Iterator.GroupedIterator[B] extends
+/// AbstractIterator[Seq[B]]` makes one of those substitutions `A := Seq[B]`,
+/// and the `Iterator.map[B](f: A => B): Iterator[B]` it is applied to binds a
+/// `B` of its own. Without renaming, the *class's* `B` inside `Seq[B]` lands
+/// under the *method's* binder and the two become one type: `g.map(f)` then
+/// takes an `Int` where it takes a `Seq[Int]`, which type-checks a lambda
+/// against the wrong element type and is a `VerifyError` once it runs.
+fn avoid_capture(
+    tparams: &[TParam],
+    result: &SigType,
+    map: &HashMap<String, SigType>,
+) -> (Vec<TParam>, SigType) {
+    if map.is_empty() {
+        return (tparams.to_vec(), result.clone());
+    }
+    let mut free: Vec<String> = Vec::new();
+    for v in map.values() {
+        bare_names(v, &mut free);
+    }
+    let mut rename: HashMap<String, SigType> = HashMap::new();
+    let mut out = tparams.to_vec();
+    for tp in out.iter_mut() {
+        if !free.contains(&tp.name) {
+            continue;
+        }
+        let mut n = 1;
+        let mut fresh = format!("{}${n}", tp.name);
+        while free.contains(&fresh) || tparams.iter().any(|o| o.name == fresh) {
+            n += 1;
+            fresh = format!("{}${n}", tp.name);
+        }
+        rename.insert(
+            tp.name.clone(),
+            SigType::Ref {
+                sym: fresh.clone(),
+                args: Vec::new(),
+            },
+        );
+        tp.name = fresh;
+    }
+    if rename.is_empty() {
+        return (out, result.clone());
+    }
+    for tp in out.iter_mut() {
+        tp.bounds = apply_subst(&tp.bounds, &rename);
+    }
+    (out, apply_subst(result, &rename))
 }
 
 fn without(map: &HashMap<String, SigType>, bound: &[TParam]) -> HashMap<String, SigType> {

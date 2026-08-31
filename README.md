@@ -2683,7 +2683,11 @@ slick: `errors 327 → 308`、`type mismatch 44 → 26`、`files_with_errors` 64
   スライスから続く可変コレクション階層の穴）。第 10 スライスで、これが
   「スタブに親を付けない」制約そのものだと分かりました（`ArrayBuilder` /
   `Iterator.GroupedIterator` は**メンバを一度も尋ねられていない**スタブなので
-  親鎖がありません）。
+  親鎖がありません）。→ **この読みは誤りでした**。第 11 スライスで再検証した
+  ところ、`GroupedIterator` は `withPartial` を尋ねた時点で親（`AbstractIterator
+  [Seq[B]]`）が付いており、原因は**線形化置換の捕獲**でした。`ArrayBuilder` も
+  親は classfile 由来で付いていて、原因は**その親の引数が消去されていた**
+  ことでした（下の「継承メンバの型パラメータ捕獲…」を参照）。
 
 ### クラスヘッダの 2 パスと、ソート済みマップの `collect`（`type mismatch` 第 10 スライス）
 
@@ -2780,6 +2784,7 @@ slick: `errors 257 → 241`、`type mismatch 25 → 22`、`files_with_errors 63 
   「**スタブに親を付けない**」制約の系列（上の「まだできないこと」を参照）。
   `xs.iterator.grouped(2).map { case Seq(i, t) => (i, t) }` は要素型を取り違えた
   ラムダを出すので、`VerifyError` になるサイレントな誤コンパイルでもあります。
+  → **第 11 スライスで直しました**。原因はこの制約ではありません（次節）。
 - `MemoryProfile` の `found: DDL required: SchemaDescriptionDef` 2 件。
   抽象型メンバ `type SchemaDescription <: SchemaDescriptionDef` を継承先で
   `= SchemaDescriptionDef` に固定する形は書けましたが、slick と同じ症状には
@@ -2789,6 +2794,97 @@ slick: `errors 257 → 241`、`type mismatch 25 → 22`、`files_with_errors 63 
   `JdbcActionComponent` の `E with Effect` 2 件、`Type.scala:388` の
   `BigDecimal.apply` のイータ展開（**単独ファイルでは再現しません**。
   `java.math.MathContext` をシンボル表に入れても再現しないので、多ファイル依存です）。
+
+### 継承メンバの型パラメータ捕獲と、消去された親（`type mismatch` 第 11 スライス）
+
+`agent/mismatch11` スライス。フィクスチャは `tests/fixtures/mism11_*.scala`、
+テストは `crates/cli/tests/mismatch11.rs` です。3 つの原因を直しました。うち 2 つは
+**型検査を通って実行時に別物を分解する／呼べるはずの呼び出しを断る**もので、
+第 10 スライスが「**スタブに親を付けない**制約」と記録した 2 件は、
+**どちらもその制約ではありませんでした**（引き継いだ診断の再検証で分かりました）。
+
+1. **ピクルの線形化置換が、メソッド自身の型パラメータに捕獲されていた**。
+   継承メンバは各ホップで「子が親に渡した引数」を代入して、尋ねたクラスの
+   語彙に直されます（`SigCache::lookup`）。
+   `Iterator.GroupedIterator[B] extends AbstractIterator[Seq[B]]` はその置換が
+   `A := Seq[B]` で、当たる先の `Iterator.map[B](f: A => B): Iterator[B]` は
+   **自分の `B`** を束縛します。名前で代入していたので*クラスの* `B` が
+   *メソッドの*束縛子の下に落ち、`map` は `Seq[B]` ではなく `B` を取る、という
+   一つの型になっていました。`apply_subst` を捕獲回避にして、置換の**値側**に
+   自由に現れる名前を束縛している型パラメータだけ改名します
+   （`crates/pickle/src/sym.rs` の `avoid_capture`）。
+
+2. **「コレクションの要素型はレシーバの第 1 型引数」という規則が、宣言が
+   はっきり言っている引数型を上書きしていた**。`grouped(n)` が返すのは
+   `GroupedIterator[B]` で、要素は `Seq[B]` です。推測が宣言に勝ってはいけない
+   ので、上書きするのは**引数が 1 つで、その型がまだ決まっていない**ときだけに
+   しました。ついでに `LazyZip2[A, B, C].map(f: (A, B) => R)` のような
+   **2 引数**の関数を 1 引数に潰していたのも直ります
+   （`xs.lazyZip(ys).map((a, b) => …)` は `found: (String, Int) => String
+   required: (String) => Any` になっていました）。
+   1 と 2 が揃って、`clauses.iterator.grouped(2).map { case Seq(i, t) => (i, t) }`
+   （slick `Node.scala:724`）が通ります。これは**要素型を取り違えたラムダを
+   出していた**ので、`VerifyError` になるサイレントな誤コンパイルでもありました。
+
+3. **`scala.` のプレースホルダにピクルの型パラメータを付けていなかった**。
+   `find_or_stub_java_class` は classfile の親リストが名指した名前をすべて
+   空のシンボルとして入れます。`give_stub_its_kinds` はそこに型パラメータを
+   付ける役ですが、`scala/` で始まる名前を一律に断っていました。断る理由は
+   「**prelude が組んだ**シンボルを作り替えない」ことなので、線は `scala.`
+   パッケージではなく `prelude_end` です。`ArrayBuilder` の親リストから入った
+   `scala/collection/mutable/ReusableBuilder` がまさにそれで、
+   `ReusableBuilder[T, Array[T]]` が「引数 2 個だがシンボルは 0 個」になり、
+   `ArrayBuilder` は親を得られませんでした。
+   さらに、classfile の総称シグネチャは `ArrayBuilder<T> implements
+   ReusableBuilder<T, Object>` としか書けません。`To` は非変なので、これでは
+   `Builder[E, Array[E]]` になりません。**同じクラスを指す親が、引数だけ違って
+   すでに載っている**ときは、ピクルの側（scalac 自身の記録）で**精密化**します
+   （prelude のクラスには一切触れません）。これで
+   `mutable.ArrayBuilder.make[E]` を `mutable.Builder[E, Array[E]]` として
+   返せます（slick `Type.scala:203`）。
+
+4. **未決定の*型構築子*が、引数の期待型に上限として届いていた**。
+   `Any` は構築子の**種**の住人ではありません。slick の
+   `flatMap[F, T, D[_]](f: E => Query[F, T, D])` はラムダに
+   `Query[F, T, Any]` として届き、本体の `Query[G, T, Seq]` が
+   `found: Query[G, T, Seq] required: Query[G, T, Any]` になっていました
+   （`Query.scala:37`）。`open_to_bounds` は、型パラメータ自身が型パラメータを
+   持つ（＝構築子である）ときはワイルドカードで開きます。「まだ決まっていない
+   どれか」を `is_sub_type` が既に理解している形で書くだけです。
+
+slick: `errors 237 → 234`、`type mismatch 20 → 17`、`files_with_errors 60`
+（変わらず）。`tests/slick_subset.sh` は `verified=204 failed=0` で変化なし。
+**新しい種類のエラーは 1 つも出ず、新しくエラーになったファイルもありません。**
+
+このスライスで**分かっているが直していない**もの:
+
+- `LazyZip2.map` は、上の 3 で `BuildFrom[C1, B, C]` が書けるようになった結果
+  **供給されるようになりました**が、`C` を決められるのは implicit 探索だけで、
+  こちらの探索は「手にしている型を探す」ものなので探している型の中の変数は
+  解けません。`implicitly[BuildFrom[Seq[String], String, Seq[String]]]`
+  （完全に適用した形）でさえ見つかりません。結果、slick の 5 箇所は
+  `value map is not a member of LazyZip2[…]` 1 本から
+  `no implicit: could not find implicit value of type BuildFrom[…]` ＋
+  未解決の `C` に対するカスケード 1 本に変わっています（種類は既存のもの
+  だけで、新しくエラーになったファイルはありません）。
+  `BuildFrom` の implicit を本当に見つけるには
+  `buildFromIterableOps[CC[X] <: Iterable[X] with IterableOps[X, CC, _], A0, A]`
+  を高階で照合できる implicit 探索が要ります。**供給を断つ**方向も試しました
+  （「型パラメータが implicit 節でしか決まらないメンバは供給しない」）が、
+  それは効きすぎて `errors 235 → 309` になったので入れていません。
+- 残る `type mismatch` 17 件のうち、`MemoryProfile` の `DDL /
+  SchemaDescriptionDef` 2 件、`ExtensionMethods` の `BP` / `P` 3 件
+  （`No matching Shape found` のカスケード）、`JdbcActionComponent` の
+  `E with Effect` 2 件、`Query.scala` の残り 2 件、`Type.scala:388` の
+  `BigDecimal.apply` のイータ展開は、いずれも第 9・第 10 スライスからの
+  引き継ぎで、単独ファイルでは再現しません。
+  `JdbcModelBuilder` / `SQLiteProfile` の `found: Product required:
+  Option[Option[Any]]` 2 件は、`if (v == "NULL") None else Some(…)` の lub が
+  `Option` にならない形に見えますが、**その形だけを書いても再現しません**
+  （同じファイルの他のエラーからのカスケードです）。
+- `ConcurrencyControl.scala:202` は 4 の変更で `found: State[Any]` が
+  `found: State[_]` に変わっただけで、まだエラーです（cats の
+  `Ref.of[F, State[F]]` 側の話）。
 
 ### ブロックの値を二重に箱詰めしていた（消去）
 
@@ -3226,6 +3322,13 @@ SLS 5.1.2 の「後の親が勝つ」規則により `IterableOps` の不透明�
   スタブ型は基本的にそれ自身としてしか使えません。
   なお、補完したクラスには pickle が宣言する親を**足します**（`attach_parents`）。
   これが無いと `Set#&`（引数が `collection.Set[A]`）は供給できても呼べません。
+  第 11 スライスで 2 つだけ広げました。(a) `find_or_stub_java_class` が入れた
+  **空のプレースホルダ**には、`scala/` の名前でも `prelude_end` より後に
+  確保されたものならピクルの型パラメータを付けます（`give_stub_its_kinds`。
+  prelude が組んだシンボルは今までどおり触りません）。(b) 同じクラスを指す親が
+  **引数だけ違って**すでに載っているときは、ピクルの側で精密化します
+  ── classfile の総称シグネチャは `ReusableBuilder<T, Object>` としか書けず、
+  `To` は非変なので `ArrayBuilder[E]` が `Builder[E, Array[E]]` になりません。
 - **既定引数のゲッタ規約の食い違い**。`default_getter_apply` は既定引数より前の実引数を
   ゲッタに渡しますが、scalac は `SeqOps.lastIndexOf$default$2()` を引数無しで生成します。
   食い違う形は供給しません（`lastIndexOf` は現状これで落ちます）。
@@ -4158,6 +4261,8 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 | `mism9_coll.scala` | ソート済みコレクションの `map` / `flatMap` / `collect`（`TreeSet` / `TreeMap`。静的型を `TreeSet[Int]` に絞っても実行時に `TreeSet` が返る）、`foreach[U](f: A => U)` に**関数値**を渡す（library モードのみ。期待出力は実 scalac 2.13.16 の stdout そのまま） | `TreeSet(2, 3, 4)` … `123` |
 | `mism10_ctor.scala` | 親コンストラクタの実引数が**後ろで宣言された**メンバを名指す（`extends Base(Chain.of((column.toNode, ord)))`）、プライマリコンストラクタの既定引数が**クラス自身の型パラメータ**を名指す（`class Box[A](one: Chain[A] = Chain.empty[A])` / `class HkBox[F[_]](cell: Cell[F] = Cell.empty[F])`）（**私有ランタイムと library の両モード**、`java -Xverify:all`、期待出力は実 scalac 2.13.16 の stdout そのまま） | `n:asc` `7` `8` `2` `z` `empty` `given` |
 | `mism10_coll.scala` | ソート済みマップの `collect`（リテラルの `{ case (k, v) => … }` から `K2` を解く／型注釈付きの `PartialFunction` 値でも `TreeMap` が返る。前に `Map.collect` があっても変わらない）（library モードのみ、期待出力は実 scalac 2.13.16 の stdout そのまま） | `Map(10 -> 1, 20 -> 2)` … `TreeMap(101 -> a, 102 -> bb)` |
+| `mism11_hkopen.scala` | 未決定の**型構築子**が引数の期待型に届く形（`flatMap[F, T, D[_]](f: E => Qry[F, T, D])` の本体が `Qry[G, T, Box]` を返す。slick `Query.map` と同じ書き方）（**私有ランタイムと library の両モード**、`java -Xverify:all`、期待出力は実 scalac 2.13.16 の stdout そのまま） | `2` `n1` `4` |
+| `mism11_coll.scala` | `it.grouped(2).map { case Seq(i, t) => … }`（要素は `Seq[B]`）と `mutable.ArrayBuilder.make[E]` を `Builder[E, Array[E]]` として返す（library モードのみ、期待出力は実 scalac 2.13.16 の stdout そのまま） | `List((1,2), (3,4), (5,6))` … `x-y` |
 | `ab.scala`（`crates/cli/tests/anonbridge.rs`） | 消去後の `Block` / `If` / `Match` / `Try` の値をちょうど 1 回だけ箱詰めする（`agent/anonbridge`）：8 つのプリミティブのブロック本体、`abstract class` と名前付きクラスの実装、プリミティブ引数、型パラメータ 2 つ、`It[Cell[Int]]`、`val` 実装、SAM ラムダ、`while` / `if` / `match` / `try` 本体、捕捉した `var`、`val x: Any = { … }` / `id({ … })`、逆向きの `val n: Int = { val z: Any = …; … }`（**私有ランタイムと library の両モード**、`java -Xverify:all`、期待出力は実 scalac 2.13.16 の stdout そのまま） | `1` `2` `1.5` … `28` `29` |
 
 `mism9_hk.scala` / `mism9_coll.scala` は `crates/cli/tests/mismatch9.rs` から回します
@@ -4186,6 +4291,18 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 （`mism10_wrong_parent_argument_is_rejected` /
 `mism10_wrong_ctor_default_is_rejected` / `mism10_bad_is_still_rejected`、
 フィクスチャは `mism10_bad.scala`）も置いてあります。
+
+`mism11_hkopen.scala` / `mism11_coll.scala` は `crates/cli/tests/mismatch11.rs` から
+回します（`mism11_hkopen` は**両モード**、`mism11_coll` は library モードのみ。
+私有ランタイムには `ArrayBuilder` / `ClassTag` が無いので、
+`mism11_coll_without_library_is_error` で**黙って通さない**ことも見ています）。
+同ファイルには最小形の受理テスト
+（`mism11_grouped_element_is_a_seq` /
+`mism11_two_argument_lambda_keeps_its_parameters` /
+`mism11_array_builder_is_a_builder` /
+`mism11_ordinary_element_types_are_unchanged`）と、拒否テスト
+（`mism11_bad_is_still_rejected`、フィクスチャは `mism11_bad.scala`。
+実 scalac 2.13.16 も同じ 3 件を拒否します）も置いてあります。
 
 `mism8.scala` は `crates/cli/tests/mismatch8.rs` の
 `mism8_fixture_runs_in_both_modes` から**両モードで**回し、どちらの stdout も
