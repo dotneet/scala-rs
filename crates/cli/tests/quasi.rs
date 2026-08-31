@@ -1368,3 +1368,238 @@ fn renumber_fresh_names_keeps_binder_identity() {
         "Select(x$pf, $colon$colon)"
     );
 }
+
+/// `tests/fixtures/tt_tags.scala`: `TypeTag` / `WeakTypeTag` materialisation.
+///
+/// Nothing in that file writes a tag down. `typeOf[T]` asks for an implicit
+/// `TypeTag[T]`, and nsc answers it not by *finding* a value but by expanding
+/// the compiler-internal `materializeTypeTag[T](u)` into a `TypeCreator` that
+/// rebuilds `T` inside the mirror the tag is handed; scala-rs has to do the
+/// same or `c.typeOf[HList]` and `implicitly[TypeTag[T]]` are dead ends
+/// (`crates/typer/src/materialize.rs`, `docs/macros.md` §7.10).
+///
+/// The tree scala-rs builds is *not* nsc's tree -- it skips the `$u` / `$m`
+/// bindings, casts the mirror, and writes the creator's erased result type
+/// out -- so what is pinned here is the answer: 30 lines of `tag.tpe`
+/// printed, `=:=` and `<:<` between independently materialised tags, and the
+/// symbol each tag names.
+#[test]
+fn tt_tags_materialises_type_tags() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip tt_tags: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("tt_tags");
+    let output = compile_reflect("tt_tags", &out, &jar, &reflect);
+    assert!(
+        output.status.success(),
+        "compile tt_tags failed: {}",
+        diagnostics(&output)
+    );
+    let cp = format!("{}:{}:{}", out.display(), reflect.display(), jar.display());
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        run.status.success(),
+        "java -Xverify:all Main failed for tt_tags: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        expected_stdout("tt_tags"),
+        "stdout mismatch for tt_tags"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// The same fixture through real scalac 2.13.16, whose own
+/// `materializeTypeTag` builds the tags. Trees differ; every answer must not.
+#[test]
+fn tt_tags_matches_real_scalac() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(reflect), Some(scalac)) =
+        (scala_library_jar(), scala_reflect_jar(), find_scalac())
+    else {
+        eprintln!("skip tt_tags scalac diff: scalac / jars not obtainable");
+        return;
+    };
+    let ref_out = tmp_dir("tt_tags-scalac");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            ref_out.to_str().unwrap(),
+            fixtures_dir().join("tt_tags.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected tt_tags.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        ref_out.display(),
+        reflect.display(),
+        jar.display()
+    );
+    let reference = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java (real scalac build)");
+    assert!(
+        reference.status.success(),
+        "java Main (real-scalac build) failed for tt_tags: {}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&reference.stdout),
+        expected_stdout("tt_tags"),
+        "recorded expectation for tt_tags does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&ref_out);
+}
+
+/// `tests/fixtures/tt_ctx.scala`: the same materialisation inside a macro
+/// *implementation*, where the universe is `c.universe` and the mirror is its
+/// `rootMirror`.
+///
+/// This is slick's `ShapedValue.mapToImpl` shape --
+/// `uTag.tpe <:< c.typeOf[HList]` -- which reported "no implicit: could not
+/// find implicit value of type TypeTags$TypeTag[HList]" before. Expanding a
+/// macro needs the JVM bridge (`docs/macros.md` §2.2), so what is checked is
+/// that both compilers accept the file and that the class file loads and
+/// verifies.
+#[test]
+fn tt_ctx_materialises_in_a_macro_implementation() {
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip tt_ctx: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("tt_ctx");
+    let output = compile_reflect("tt_ctx", &out, &jar, &reflect);
+    assert!(
+        output.status.success(),
+        "compile tt_ctx failed: {}",
+        diagnostics(&output)
+    );
+
+    if java_available() {
+        let loader = out.join("loader");
+        fs::create_dir_all(&loader).unwrap();
+        let src = out.join("Loader.scala");
+        fs::write(
+            &src,
+            "object Main {\n  \
+             def main(args: Array[String]): Unit = println(Class.forName(\"TtCtx$\").getName)\n\
+             }\n",
+        )
+        .unwrap();
+        let built = Command::new(bin())
+            .args([
+                "compile",
+                src.to_str().unwrap(),
+                "-d",
+                loader.to_str().unwrap(),
+                "--scala-library",
+                jar.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run scala-rs compile");
+        assert!(
+            built.status.success(),
+            "compiling the loader failed: {}",
+            diagnostics(&built)
+        );
+        let cp = format!(
+            "{}:{}:{}:{}",
+            loader.display(),
+            out.display(),
+            reflect.display(),
+            jar.display()
+        );
+        let run = Command::new("java")
+            .args(["-Xverify:all", "-cp", &cp, "Main"])
+            .output()
+            .expect("java");
+        assert!(
+            run.status.success(),
+            "the macro implementation's class file does not verify: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "TtCtx$\n");
+    }
+
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip the scalac half of tt_ctx: scalac 2.13 not obtainable");
+        let _ = fs::remove_dir_all(&out);
+        return;
+    };
+    let ref_out = tmp_dir("tt_ctx-scalac");
+    let built = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            ref_out.to_str().unwrap(),
+            fixtures_dir().join("tt_ctx.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        built.status.success(),
+        "real scalac rejected tt_ctx.scala: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let _ = fs::remove_dir_all(&ref_out);
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// What the materialiser refuses, each named.
+///
+/// The failure that would matter is the quiet one: a tag built for a type
+/// that is not the type asked about is not a compile error at all, it is a
+/// wrong `Type` handed to a macro at run time. So a shape one `staticClass`
+/// call cannot rebuild says which shape it was, and the old "could not find
+/// implicit value of type TypeTag[List[Int]]" -- which pointed at a value no
+/// program was ever going to define -- must not come back for these.
+#[test]
+fn tt_tags_bad_names_every_tag_it_cannot_build() {
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip tt_tags_bad: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("tt_tags_bad");
+    let output = compile_reflect("tt_tags_bad", &out, &jar, &reflect);
+    assert!(!output.status.success(), "expected tt_tags_bad to fail");
+    let err = diagnostics(&output);
+    for needle in [
+        "cannot build a TypeTag for `List`, a type constructor applied to type arguments",
+        "cannot build a WeakTypeTag for `Option`, a type constructor applied to type arguments",
+        "cannot build a TypeTag for `Inner`, a class nested in a class or an object",
+        "cannot build a TypeTag for `AnyRef`, which is an alias rather than a class",
+        "cannot build a TypeTag for `T`, an abstract type with no tag in scope",
+        "cannot build a WeakTypeTag for `T`, an abstract type with no tag in scope",
+        "cannot build a TypeTag for `Main.type`, a singleton type",
+        "docs/macros.md",
+    ] {
+        assert!(
+            err.contains(needle),
+            "expected {needle:?} in diagnostics, got {err}"
+        );
+    }
+    assert!(
+        !err.contains("could not find implicit value of type TypeTags$TypeTag"),
+        "a tag request reported as a plain missing implicit again: {err}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
