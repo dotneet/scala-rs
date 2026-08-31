@@ -520,11 +520,13 @@ fn qq_ctx_bad_names_every_form_it_cannot_build() {
             "expected {needle:?} in diagnostics, got {err}"
         );
     }
-    // A hole that is not a `Tree` (nsc lifts it with an implicit `Liftable`)
-    // is a type error, never a silently different tree.
+    // A hole that is neither a `Tree` nor anything with a standard `Liftable`
+    // is reported by its type, never turned into a silently different tree.
+    // (`Int` used to stand here; `docs/macros.md` §7.8 lifts it now, so the
+    // fixture asks for a `File`, which no standard instance covers.)
     assert!(
-        err.contains("SyntacticApplied"),
-        "an unliftable hole must still be an error: {err}"
+        err.contains("a hole of type `File` is not lifted"),
+        "an unliftable hole must still be an error, naming its type: {err}"
     );
     let _ = fs::remove_dir_all(&out);
 }
@@ -675,5 +677,251 @@ fn qr_forms_bad_names_every_form_it_cannot_build() {
             "expected {needle:?} in diagnostics, got {err}"
         );
     }
+    let _ = fs::remove_dir_all(&out);
+}
+
+// --- `Liftable`: holes that are not trees (`agent/liftable`, §7.8) ---------
+
+/// `tests/fixtures/lf2_lift.scala`, run.
+///
+/// A quasiquote hole does not have to be a `Tree`: nsc infers an implicit
+/// `Liftable[T]` for the argument's type and splices `Liftable.liftX[T](arg)`
+/// (`scala/reflect/api/StandardLiftables.scala`). scala-rs picks the standard
+/// instance from the type and builds *the tree that instance builds*, so what
+/// this pins is the tree, not that something typechecked: every line prints
+/// `showRaw`, and `show` where the result is a `TypeTree` (whose `showRaw`
+/// hides the type it carries).
+///
+/// `lf2_lift_matches_real_scalac` is what makes the recorded expectation mean
+/// anything: without it this would only record what we happen to build.
+#[test]
+fn lf2_lift_builds_the_standard_liftable_trees() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip lf2_lift: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("lf2_lift");
+    let output = compile_reflect("lf2_lift", &out, &jar, &reflect);
+    assert!(
+        output.status.success(),
+        "compile lf2_lift failed: {}",
+        diagnostics(&output)
+    );
+    let cp = format!("{}:{}:{}", out.display(), reflect.display(), jar.display());
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        run.status.success(),
+        "java -Xverify:all Main failed for lf2_lift: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        expected_stdout("lf2_lift"),
+        "stdout mismatch for lf2_lift"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// The same fixture through real scalac 2.13.16, whose own quasiquote macro
+/// does the `Liftable` inference. Every instance in `crate::reify::Lift` is
+/// pinned to the tree nsc's instance produces.
+#[test]
+fn lf2_lift_matches_real_scalac() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(reflect), Some(scalac)) =
+        (scala_library_jar(), scala_reflect_jar(), find_scalac())
+    else {
+        eprintln!("skip lf2_lift scalac diff: scalac / jars not obtainable");
+        return;
+    };
+    let ref_out = tmp_dir("lf2_lift-scalac");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            ref_out.to_str().unwrap(),
+            fixtures_dir().join("lf2_lift.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected lf2_lift.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        ref_out.display(),
+        reflect.display(),
+        jar.display()
+    );
+    let reference = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java (real scalac build)");
+    assert!(
+        reference.status.success(),
+        "java Main (real-scalac build) failed for lf2_lift: {}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&reference.stdout),
+        expected_stdout("lf2_lift"),
+        "recorded expectation for lf2_lift does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&ref_out);
+}
+
+/// `tests/fixtures/lf2_ctx.scala`: the two instances only a macro
+/// implementation can reach.
+///
+/// A `WeakTypeTag` arrives in the implicit clause a macro's type parameters
+/// come through, and an `Expr` is what `c.prefix` is -- neither can be got at
+/// run time without a materialiser, so they are checked here by compiling the
+/// implementation itself, the way `qq_ctx.scala` is. This is the shape slick's
+/// `ShapedValue.mapToImpl` is written in: `q"($rModule.tupled) : ($uTag =>
+/// $rTag)"` reported `no matching overload for SyntacticFunctionTypeExtractor
+/// with arguments (List[TypeTags$WeakTypeTag[U]], TypeTags$WeakTypeTag[R])`
+/// before this.
+///
+/// It also covers `symbolOf[T]` / `weakTypeOf[T]`, whose type parameter is
+/// named only in their implicit clause -- `pin_undetermined_tparams` used to
+/// refuse the member outright, so `symbolOf` was "not found: value symbolOf".
+#[test]
+fn lf2_ctx_lifts_tags_and_exprs_in_a_macro_implementation() {
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip lf2_ctx: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("lf2_ctx");
+    let output = compile_reflect("lf2_ctx", &out, &jar, &reflect);
+    assert!(
+        output.status.success(),
+        "compile lf2_ctx failed: {}",
+        diagnostics(&output)
+    );
+
+    if java_available() {
+        // Loading the class links and verifies it, which is the check
+        // available here: expanding a macro needs the JVM bridge
+        // (`docs/macros.md` §2.2), which is not built.
+        let loader = out.join("loader");
+        fs::create_dir_all(&loader).unwrap();
+        let src = out.join("Loader.scala");
+        fs::write(
+            &src,
+            "object Main {\n  \
+             def main(args: Array[String]): Unit = println(Class.forName(\"Lf2Ctx$\").getName)\n\
+             }\n",
+        )
+        .unwrap();
+        let built = Command::new(bin())
+            .args([
+                "compile",
+                src.to_str().unwrap(),
+                "-d",
+                loader.to_str().unwrap(),
+                "--scala-library",
+                jar.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run scala-rs compile");
+        assert!(
+            built.status.success(),
+            "compiling the loader failed: {}",
+            diagnostics(&built)
+        );
+        let cp = format!(
+            "{}:{}:{}:{}",
+            loader.display(),
+            out.display(),
+            reflect.display(),
+            jar.display()
+        );
+        let run = Command::new("java")
+            .args(["-Xverify:all", "-cp", &cp, "Main"])
+            .output()
+            .expect("java");
+        assert!(
+            run.status.success(),
+            "the macro implementation's class file does not verify: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "Lf2Ctx$\n");
+    }
+
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip the scalac half of lf2_ctx: scalac 2.13 not obtainable");
+        let _ = fs::remove_dir_all(&out);
+        return;
+    };
+    let ref_out = tmp_dir("lf2_ctx-scalac");
+    let built = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            ref_out.to_str().unwrap(),
+            fixtures_dir().join("lf2_ctx.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        built.status.success(),
+        "real scalac rejected lf2_ctx.scala: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let _ = fs::remove_dir_all(&ref_out);
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// What `Liftable` refuses, and `reify { … }`, each named.
+///
+/// The failure that would matter is the quiet one: lifting a type scala-rs has
+/// no instance for would build a tree nobody wrote. And `reify` is a
+/// compiler-internal macro like the quasiquotes -- reporting `value reify is
+/// not a member of JavaUniverse` was the same untruth `value q is not a member
+/// of StringContext` was, and points at the wrong thing to fix.
+#[test]
+fn lf2_lift_bad_names_every_hole_it_cannot_lift() {
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip lf2_lift_bad: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("lf2_lift_bad");
+    let output = compile_reflect("lf2_lift_bad", &out, &jar, &reflect);
+    assert!(!output.status.success(), "expected lf2_lift_bad to fail");
+    let err = diagnostics(&output);
+    for needle in [
+        // No standard instance for this type.
+        "a hole of type `File` is not lifted",
+        // nsc's `liftList` builds a `List(...)` call, not a splice; scala-rs
+        // does not build it, and does not approximate it either.
+        "a hole of type `List[Int]` is not lifted",
+        // A `Symbol` is lifted on its own but has no `Liftable`, so `..$` over
+        // symbols is refused -- nsc refuses it too.
+        "a hole of type `Symbols.ModuleSymbol` is not lifted",
+        "macro expansion is not implemented: cannot expand reify { ... }",
+        "docs/macros.md",
+    ] {
+        assert!(
+            err.contains(needle),
+            "expected {needle:?} in diagnostics, got {err}"
+        );
+    }
+    // The old, untrue diagnostic must not come back.
+    assert!(
+        !err.contains("value reify is not a member"),
+        "`reify` reported as a missing member again: {err}"
+    );
     let _ = fs::remove_dir_all(&out);
 }

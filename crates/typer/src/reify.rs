@@ -26,12 +26,62 @@
 //! produces; `tests/fixtures/reify_qq.scala` and `qq_universe.scala` then
 //! compare `showRaw` of the result.
 
-use scala_rs_parser::{CaseDef, Lit, NodeId, SymbolId, Tree, TreeKind, Type};
+use scala_rs_parser::{CaseDef, Flags, Lit, Modifiers, NodeId, SymbolId, Tree, TreeKind, Type};
 use scala_rs_pickle::names::encode_method_name;
 use scala_rs_span::Span;
 
 use crate::quasiquote::{hole_index, QuasiKind};
 use crate::uncurry::is_eta_marker;
+
+/// How a hole's argument becomes a reflect `Tree`.
+///
+/// nsc infers an implicit `Liftable[T]` for a hole whose argument is not a
+/// `Tree` and splices `Liftable.liftX[T](arg)`
+/// (`scala/reflect/api/StandardLiftables.scala`). scala-rs picks the standard
+/// instance by the argument's type -- `crate::check::Check::lift_for` -- and
+/// builds the *same tree that instance builds*, which is what the dual run
+/// against real scalac in `tests/fixtures/lf2_lift.scala` compares. A hole
+/// whose type has no standard instance is `Unknown` and is diagnosed; a
+/// user-written `Liftable` is not searched for.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Lift {
+    /// Already a `Tree` (`liftTree`, the identity): splice it.
+    Tree,
+    /// A `Name`. Which tree it becomes depends on the position it stands in.
+    Name,
+    /// A primitive or `String` (`liftInt` &co): `u.Literal(u.Constant(v))`.
+    Value,
+    /// A `Constant` (`liftConstant`): `u.Literal(c)`.
+    Constant,
+    /// A `Type` (`liftType`): `rs.mkTypeTree(t)`.
+    Type,
+    /// A `WeakTypeTag` / `TypeTag` (`liftTypeTag`): `rs.mkTypeTree(tag.tpe)`.
+    TypeTag,
+    /// An `Expr[T]` (`liftExpr`): `e.tree`.
+    Expr,
+    /// A `Symbol`: `rs.mkRefTree(u.EmptyTree, sym)`. Not a `Liftable` at all
+    /// -- nsc special-cases the hole -- so, unlike the rest, it cannot appear
+    /// under `..$` (nsc says "consider omitting the dots or providing an
+    /// implicit instance of `Liftable[Symbol]`" there).
+    Symbol,
+    /// A rank-1 (`..$xs`) hole over elements that themselves need lifting.
+    /// `to_list` is set when the collection is not already a `List`, which is
+    /// how nsc writes it (`xs.toList.map(x => lift(x))`).
+    Elems { to_list: bool, elem: Box<Lift> },
+    /// No standard `Liftable`; the string is the type, for the diagnostic.
+    Unknown(String),
+}
+
+/// Where a hole stands, which decides what a `Name` becomes there.
+#[derive(Clone, Copy, PartialEq)]
+enum Pos {
+    Term,
+    Type,
+    Pat,
+    /// A name slot of an enclosing form (`q"$x.$n"`, `q"val $n = e"`): the
+    /// argument is the name itself, so nothing is built around it.
+    Name,
+}
 
 /// The `Modifiers` flag set nsc gives a function literal's parameter
 /// (`Flags.PARAM`, `1 << 13`). Read off `-Ymacro-debug-lite` for
@@ -48,6 +98,8 @@ pub(crate) struct Reifier<'a> {
     args: &'a [Tree],
     /// `ranks[i]` is 0 for `$x`, 1 for `..$xs`, 2 for `...$xss`.
     ranks: &'a [u8],
+    /// `lifts[i]` says how `args[i]` becomes a `Tree`; see `Lift`.
+    lifts: &'a [Lift],
     /// The quasiquote's own span, worn by everything this builds.
     span: Span,
     /// The source `crates/typer/src/quasiquote.rs` reconstructed and parsed,
@@ -67,6 +119,7 @@ impl<'a> Reifier<'a> {
         universe: Tree,
         args: &'a [Tree],
         ranks: &'a [u8],
+        lifts: &'a [Lift],
         span: Span,
         src: &'a str,
     ) -> Self {
@@ -74,6 +127,7 @@ impl<'a> Reifier<'a> {
             universe,
             args,
             ranks,
+            lifts,
             span,
             src,
         }
@@ -113,7 +167,7 @@ impl<'a> Reifier<'a> {
         match &t.kind {
             TreeKind::Literal { lit } => Ok(self.constant(lit.clone())),
             TreeKind::Ident { name } => match hole_index(name) {
-                Some(i) => self.hole(i, 0),
+                Some(i) => self.hole(i, 0, Pos::Term),
                 None => Ok(self.term_ident(name)),
             },
             TreeKind::Select { qual, name } => {
@@ -374,7 +428,7 @@ impl<'a> Reifier<'a> {
                 vec![],
             )),
             TreeKind::Ident { name } => match hole_index(name) {
-                Some(i) => self.hole(i, 0),
+                Some(i) => self.hole(i, 0, Pos::Type),
                 None => Ok(self.call(
                     self.support_member("SyntacticTypeIdent"),
                     vec![self.type_name(name)],
@@ -488,7 +542,7 @@ impl<'a> Reifier<'a> {
             TreeKind::Literal { lit } => Ok(self.constant(lit.clone())),
             TreeKind::Wildcard => Ok(self.term_ident("_")),
             TreeKind::Ident { name } => match hole_index(name) {
-                Some(i) => self.hole(i, 0),
+                Some(i) => self.hole(i, 0, Pos::Pat),
                 None if name == "_" => Ok(self.term_ident("_")),
                 // Scala's rule: an identifier that starts lower case is a
                 // variable pattern, which nsc reifies as a `Bind` over `_`;
@@ -558,7 +612,7 @@ impl<'a> Reifier<'a> {
 
     /// The arguments of a pattern application, as a `List[Tree]`.
     fn pat_clause(&self, args: &[Tree]) -> Result<Tree, String> {
-        if let Some(t) = self.splice_clause(args)? {
+        if let Some(t) = self.splice_clause(args, Pos::Pat)? {
             return Ok(t);
         }
         let mut out = Vec::new();
@@ -599,7 +653,7 @@ impl<'a> Reifier<'a> {
     /// and building it wrong would silently reorder a call's arguments, so it
     /// is refused instead.
     fn arg_clause(&self, args: &[Tree]) -> Result<Tree, String> {
-        if let Some(t) = self.splice_clause(args)? {
+        if let Some(t) = self.splice_clause(args, Pos::Term)? {
             return Ok(t);
         }
         let mut out = Vec::new();
@@ -612,12 +666,12 @@ impl<'a> Reifier<'a> {
     /// `rs.SyntacticBlock(<xs>)` when `elems` is exactly one `..$xs`.
     fn stats_splice(&self, elems: &[Tree]) -> Result<Option<Tree>, String> {
         Ok(self
-            .splice_clause(elems)?
+            .splice_clause(elems, Pos::Term)?
             .map(|xs| self.call(self.support_member("SyntacticBlock"), vec![xs])))
     }
 
     /// `..$xs` standing for a whole clause, if that is what `args` is.
-    fn splice_clause(&self, args: &[Tree]) -> Result<Option<Tree>, String> {
+    fn splice_clause(&self, args: &[Tree], pos: Pos) -> Result<Option<Tree>, String> {
         let rank = |a: &Tree| match &a.kind {
             TreeKind::Ident { name } => match hole_index(name) {
                 Some(i) => self.ranks.get(i).copied().unwrap_or(0),
@@ -633,13 +687,14 @@ impl<'a> Reifier<'a> {
                 unreachable!("rank comes from a hole");
             };
             let i = hole_index(name).expect("rank comes from a hole");
-            return self.hole(i, 1).map(Some);
+            return self.hole(i, 1, pos).map(Some);
         }
         Err("a `..$` splice mixed with ordinary arguments is not reified yet".to_string())
     }
 
-    /// The expression filling hole `i`, which must have been written at `rank`.
-    fn hole(&self, i: usize, rank: u8) -> Result<Tree, String> {
+    /// The expression filling hole `i`, which must have been written at
+    /// `rank`, lifted for the position it stands in.
+    fn hole(&self, i: usize, rank: u8, pos: Pos) -> Result<Tree, String> {
         let got = self.ranks.get(i).copied().unwrap_or(0);
         if got != rank {
             return Err(format!(
@@ -651,10 +706,88 @@ impl<'a> Reifier<'a> {
                 }
             ));
         }
-        self.args
+        let arg = self
+            .args
             .get(i)
             .cloned()
-            .ok_or_else(|| format!("hole {i} has no argument"))
+            .ok_or_else(|| format!("hole {i} has no argument"))?;
+        let lift = self.lifts.get(i).unwrap_or(&Lift::Tree);
+        self.lift(arg, lift, pos)
+    }
+
+    /// Build the tree the standard `Liftable` for `lift` builds around `arg`.
+    ///
+    /// A `Name` is the one that depends on where it stands: nsc's quasiquote
+    /// parser puts the hole in an identifier position, so `q"$n"` is a term
+    /// identifier, `tq"$n"` a type identifier and `pq"$n"` a variable pattern.
+    fn lift(&self, arg: Tree, lift: &Lift, pos: Pos) -> Result<Tree, String> {
+        match lift {
+            Lift::Tree => Ok(arg),
+            Lift::Name => Ok(match pos {
+                Pos::Name => arg,
+                Pos::Term => self.call(
+                    self.support_member("SyntacticTermIdent"),
+                    vec![arg, self.lit(Lit::Boolean(false))],
+                ),
+                Pos::Type => self.call(self.support_member("SyntacticTypeIdent"), vec![arg]),
+                Pos::Pat => self.call(
+                    self.universe_member("Bind"),
+                    vec![arg, self.term_ident("_")],
+                ),
+            }),
+            // `liftInt` &co: `Liftable(v => Literal(Constant(v)))`.
+            Lift::Value => Ok(self.call(
+                self.universe_member("Literal"),
+                vec![self.call(self.universe_member("Constant"), vec![arg])],
+            )),
+            Lift::Constant => Ok(self.call(self.universe_member("Literal"), vec![arg])),
+            // `liftType` / `liftTypeTag`: `TypeTree(tpe)`, which the reflect
+            // API spells `internal.reificationSupport.mkTypeTree`.
+            Lift::Type => Ok(self.call(self.support_member("mkTypeTree"), vec![arg])),
+            Lift::TypeTag => Ok(self.call(
+                self.support_member("mkTypeTree"),
+                vec![self.select(arg, "tpe")],
+            )),
+            Lift::Expr => Ok(self.select(arg, "tree")),
+            Lift::Symbol => Ok(self.call(
+                self.support_member("mkRefTree"),
+                vec![self.universe_member("EmptyTree"), arg],
+            )),
+            Lift::Elems { to_list, elem } => {
+                let xs = if *to_list {
+                    self.select(arg, "toList")
+                } else {
+                    arg
+                };
+                if **elem == Lift::Tree {
+                    return Ok(xs);
+                }
+                // `xs.map(v => <lift v>)`, the shape nsc writes with a
+                // `freshTermName`. The parameter is only ever read by the
+                // lift, so the name cannot collide with the body's.
+                let name = "x$qq";
+                let param = self.node(TreeKind::ValDef {
+                    mods: Modifiers::new(Flags::PARAM),
+                    name: name.to_string(),
+                    tpt: Box::new(self.node(TreeKind::Empty)),
+                    rhs: Box::new(self.node(TreeKind::Empty)),
+                });
+                let v = self.node(TreeKind::Ident {
+                    name: name.to_string(),
+                });
+                let body = self.lift(v, elem, pos)?;
+                let f = self.node(TreeKind::Function {
+                    vparams: vec![param],
+                    body: Box::new(body),
+                });
+                Ok(self.call(self.select(xs, "map"), vec![f]))
+            }
+            Lift::Unknown(ty) => Err(format!(
+                "a hole of type `{ty}` is not lifted (the Liftable instances \
+                 scala-rs builds are trees, names, symbols, types, type tags, \
+                 `Expr`s, constants and literals)"
+            )),
+        }
     }
 
     // -- building blocks ---------------------------------------------------
@@ -757,14 +890,14 @@ impl<'a> Reifier<'a> {
     /// `TermName` straight in.
     fn term_name_or_hole(&self, s: &str) -> Result<Tree, String> {
         match hole_index(s) {
-            Some(i) => self.hole(i, 0),
+            Some(i) => self.hole(i, 0, Pos::Name),
             None => Ok(self.term_name(s)),
         }
     }
 
     fn type_name_or_hole(&self, s: &str) -> Result<Tree, String> {
         match hole_index(s) {
-            Some(i) => self.hole(i, 0),
+            Some(i) => self.hole(i, 0, Pos::Name),
             None => Ok(self.type_name(s)),
         }
     }

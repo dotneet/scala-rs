@@ -914,3 +914,144 @@ error: no matching overload for SyntacticFunctionTypeExtractor
    同じ fast track マクロで、自前実装が要る。`TableQuery` の残り 6 件のうち
    3 件がこれ。
 6. **engine（フェーズ 2）。** マクロを*呼ぶ*ための JVM ブリッジ。
+
+### 7.8 `Liftable`、`symbolOf` / `weakTypeOf`、`reify` の診断（`agent/liftable` スライス）
+
+§7.7 の残り 1 と 5。**`Tree` でない穴が持ち上がるようになった**ので、
+`ShapedValue.mapToImpl` の `q"($rModule.tupled) : ($uTag => $rTag)"` 系が
+「形が足りない」でも「穴が `Tree` でない」でもなくなった。
+
+#### 1. `Liftable`
+
+nsc は `Tree` でない穴について implicit `Liftable[T]` を探し、
+`Liftable.liftX[T](arg)` を差す（`scala/reflect/api/StandardLiftables.scala`）。
+scala-rs は **implicit 探索はしない**。穴の引数の型から標準インスタンスを選び、
+**そのインスタンスが作るのと同じ木を直接組む**。
+
+型を知るために、reify の前に各引数を**投機的に**型付けする
+（クローンを型付けし、診断は巻き戻す。`Check::probe_named_arg_types` と同じ形。
+呼び出し地点の木は 1 度しか型付けされない）。分類は `Check::lift_for`、
+木の組み立ては `Reifier::lift`（`crates/typer/src/reify.rs` の `Lift`）。
+
+| 穴の型 | nsc | scala-rs が組む木 |
+| --- | --- | --- |
+| `Tree`（`Trees` の型メンバすべて） | `liftTree` = identity | そのまま差す |
+| `Int` / `Long` / `Short` / `Byte` / `Char` / `Float` / `Double` / `Boolean` / `Unit` / `String` | `liftInt` &co | `u.Literal(u.Constant(v))` |
+| `Constant` | `liftConstant` | `u.Literal(c)` |
+| `Type`（`Types` の型メンバ） | `liftType` | `rs.mkTypeTree(t)` |
+| `WeakTypeTag` / `TypeTag` | `liftTypeTag` | `rs.mkTypeTree(tag.tpe)` |
+| `Expr[T]` | `liftExpr` | `e.tree` |
+| `Symbol`（`Symbols` の型メンバ） | Liftable では**ない**（穴の特別扱い） | `rs.mkRefTree(u.EmptyTree, sym)` |
+| `Name`（項の位置） | 穴の特別扱い | `rs.SyntacticTermIdent(n, false)` |
+| `Name`（型の位置） | 同上 | `rs.SyntacticTypeIdent(n)` |
+| `Name`（パターンの位置） | 同上 | `u.Bind(n, rs.SyntacticTermIdent(u.TermName("_"), false))` |
+| `..$xs` の要素が上のどれか | `xs.toList.map(v => liftX(v))` | 同形（`List` のときは `.toList` を付けない） |
+
+`Name` の位置依存は nsc のパーサ由来である。`q"$n"` の穴は識別子の位置に立つので、
+`q` なら項識別子、`tq` なら型識別子、`pq` なら変数パターンになる。名前の**枠**
+（`q"$x.$n"` の `$n`、`q"val $n = e"` の `$n`）はもともとそのまま差していた。
+
+`Symbol` だけは `Liftable` ではなく穴の特別扱いなので、**`..$` の下では nsc 自身が
+断る**（"consider omitting the dots or providing an implicit instance of
+`Liftable[Symbol]`"）。scala-rs も同じく断る。
+
+**組まないものは名指しで診断する**:
+`a hole of type `X` is not lifted (the Liftable instances scala-rs builds are …)`。
+ユーザが書いた `Liftable` は探さないので、それも同じ診断になる（黙って別の木を
+作るよりよい）。nsc にはあって scala-rs が組まないのは `liftList` / `liftArray` /
+`liftMap` / `liftOption` / `liftEither` / `liftTuple*` / `liftScalaSymbol` で、
+いずれも rank 0 の穴の形。
+
+検証: `tests/fixtures/lf2_lift.scala` を実 scalac 2.13.16 と dual-run し、
+**`showRaw` が完全一致**する（`TypeTree` は `showRaw` が中身の型を隠すので
+`show` も並べて印字する）。29 行。`WeakTypeTag` と `Expr` は materialiser 無しには
+実行時に作れないので、`tests/fixtures/lf2_ctx.scala` で**マクロ実装として**
+コンパイルし、両コンパイラが通し、classfile が `java -Xverify:all` でロード・検証
+されることを見る。異常系は `tests/fixtures/lf2_lift_bad.scala`。
+
+#### 2. `symbolOf[T]` / `weakTypeOf[T]` / `typeOf[T]`
+
+§7.6 の 3。`def symbolOf[T](implicit tag: WeakTypeTag[T]): TypeSymbol` は
+型パラメータを**implicit 節にしか**書かず、結果型にも書かない。
+`pin_undetermined_tparams`（`crates/typer/src/pickle_supply.rs`）はこの形の
+メンバを**丸ごと落として**いたので、`symbolOf` は `not found: value symbolOf`
+だった。
+
+落とす理由は「型パラメータが決まらないまま implicit が解けず、typer が黙って
+eta 展開する」ことの回避である。しかし *materialiser* の形
+——節が implicit だけで、その implicit が当の型パラメータを要求する——は
+`classTag[Short]` と同じく**常に明示型引数で呼ばれる**。そこで、この形に限って
+メンバを残すようにした。明示型引数が無ければ `T` は `Nothing` になり
+「implicit が見つからない」という診断になる（誤ったプログラムにはならない）。
+
+効果:
+
+- **マクロ実装の中では実際に解ける。** `implicit rTag: c.WeakTypeTag[R]` が
+  スコープにあるので、`symbolOf[R]` / `weakTypeOf[R]` の implicit はそれで埋まる。
+  slick の `ShapedValue.mapToImpl` の `val rSym = symbolOf[R]` がこれ。
+- **外では正直な診断に変わる。** `u.typeOf[Int]` は
+  `no implicit: could not find implicit value of type TypeTags$TypeTag[Int]`。
+  `TypeTag` の materialization（型を `TypeCreator` に reify するコンパイラ内蔵
+  マクロ）は未実装で、これが `c.typeOf[HList]` の残る障害である。
+
+#### 3. `reify { … }` の診断
+
+`scala.reflect.api.Universe` の `def reify[T](expr: T): Expr[T] = macro …` は
+quasiquote と同じ**コンパイラ内蔵マクロ**で、scala-reflect.jar に実装は無く、
+pickle のエントリには消去後の descriptor すら無い。そのため
+`value reify is not a member of JavaUniverse` と言っていた——
+`value q is not a member of StringContext` と同じ**嘘**である。
+
+`Check::report_internal_universe_macro` が、レシーバが universe のとき
+（無修飾なら `import <universe>._` が効いているとき）に
+
+```
+macro expansion is not implemented: cannot expand reify { ... }.
+`reify` is a compiler-internal macro with no implementation in scala-reflect.jar,
+so scala-rs would have to reify the expression itself, the way it does
+quasiquotes; see docs/macros.md §6.2.
+```
+
+と言う。**式全体の木化は実装していない**（quasiquote と違い、任意の式を
+`TreeCreator` の無名クラスに落とす必要がある）。
+
+#### slick への効き方
+
+`tests/slick_measure.sh`（scala-reflect.jar 入り）で `errors=237 → 228`、
+`files_with_errors=60 → 60`。内訳:
+
+| ファイル | before | after |
+| --- | --- | --- |
+| `ShapedValue.scala` | 20 | **10** |
+| `TableQuery.scala` | 6 | 7 |
+
+`TableQuery.scala` が 1 増えるのは、`typeOf` が「見つからない」から
+「implicit が無い」に変わったことで、同じ行の 2 つめの穴
+（`Ident(sym: Symbol)` のオーバーロードが未供給）まで見えるようになったため。
+診断は正確になっている。
+
+`ShapedValue.scala` の残り 10 件:
+
+| 診断 | 件数 |
+| --- | --- |
+| `_` プレースホルダ（`(_.get)`、§7.7 の既知の形） | 3 |
+| 持ち上げられない穴（`<error>` / `AnyRef`。下の cascade） | 3 |
+| `value collect is not a member of Scopes.MemberScope` | 1 |
+| `no implicit: TypeTag[HList]`（materialization 未実装） | 1 |
+| マクロ def のシグネチャ検査（`must take blackbox.Context`） | 1 |
+| `Shape` の型不一致（quasiquote と無関係） | 1 |
+
+#### このスライスのあとに残っているもの
+
+1. **`TypeTag` / `WeakTypeTag` の materialization。** `c.typeOf[HList]` と
+   `implicitly[TypeTag[T]]` はこれが要る。型を `TypeCreator` の無名クラスに
+   reify するコンパイラ内蔵マクロで、`reify { … }` と同じ機構になる。
+2. **`reify { … }` 本体。** 式全体の木化。
+3. **`_` プレースホルダと右結合演算子**（§7.7 の 2）。
+4. **定義の quasiquote**（§7.7 の 4）。`ShapedValue` の `q"""…"""` 全体。
+5. **universe の入れ子クラスがパス越しに引けない。** `u.WeakTypeTag[T]` /
+   `u.TypeTag.Int` は `value TypeTag is not a member of JavaUniverse` になる
+   （`c.WeakTypeTag[T]` は `Aliases` の型別名なので通る）。
+6. **`c.universe.TermName` が `stable identifier required` になる。**
+   `c.universe` は `val` なので安定しているはず。
+7. **engine（フェーズ 2）。** マクロを*呼ぶ*ための JVM ブリッジ。

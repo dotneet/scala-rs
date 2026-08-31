@@ -5211,8 +5211,9 @@ impl Typer {
             return false;
         };
         let ranks = crate::quasiquote::hole_ranks(parts, args.len());
+        let lifts = self.hole_lifts(args, &ranks);
         let built = {
-            let r = crate::reify::Reifier::new(universe, args, &ranks, span, &src);
+            let r = crate::reify::Reifier::new(universe, args, &ranks, &lifts, span, &src);
             match r.reify(kind, &body) {
                 Ok(t) => t,
                 Err(why) => {
@@ -5235,6 +5236,106 @@ impl Typer {
         *tree = built;
         self.type_expr(tree, pt);
         true
+    }
+
+    /// How each hole's argument becomes a reflect `Tree` -- `Liftable`.
+    ///
+    /// A hole is not required to be a `Tree`: nsc infers an implicit
+    /// `Liftable[T]` for the argument's type and splices
+    /// `Liftable.liftX[T](arg)` (`scala/reflect/api/StandardLiftables.scala`),
+    /// which is how `q"($uTag) => $rTag"` works in slick's
+    /// `ShapedValue.mapToImpl` where both holes are `WeakTypeTag`s.
+    ///
+    /// The argument's type is what picks the instance, so each argument is
+    /// typed *speculatively* on a clone: the call site's own trees are
+    /// untouched and typed once, as part of the reified tree, and the
+    /// diagnostics of this probe are rolled back (the same shape as
+    /// `probe_named_arg_types`). A function literal says nothing without an
+    /// expected type, and is never anything but a tree here, so it is left
+    /// alone.
+    fn hole_lifts(&mut self, args: &[Tree], ranks: &[u8]) -> Vec<crate::reify::Lift> {
+        let mark = self.diags.len();
+        let mut out = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            if matches!(a.kind, TreeKind::Function { .. }) {
+                out.push(crate::reify::Lift::Tree);
+                continue;
+            }
+            let mut probe = a.clone();
+            self.type_expr(&mut probe, &Type::NoType);
+            let rank = ranks.get(i).copied().unwrap_or(0);
+            out.push(self.lift_for(&probe.ty, rank));
+        }
+        self.diags.truncate(mark);
+        out
+    }
+
+    /// The standard `Liftable` instance for a hole of type `ty` at `rank`.
+    ///
+    /// Matched by where the type is *declared*: every tree node type is an
+    /// abstract type member of `scala.reflect.api.Trees`, every name of
+    /// `Names`, every type of `Types`, and `WeakTypeTag` / `Expr` are classes
+    /// nested in `TypeTags` / `Exprs`. Anything else has no standard instance
+    /// and is reported rather than guessed at (`Lift::Unknown`).
+    fn lift_for(&self, ty: &Type, rank: u8) -> crate::reify::Lift {
+        use crate::reify::Lift;
+        let unknown = || Lift::Unknown(self.st.display_type(ty));
+        // `..$xs` lifts the elements, not the collection.
+        if rank == 1 {
+            let Type::Class { sym, args } = ty else {
+                return unknown();
+            };
+            if args.len() != 1 {
+                return unknown();
+            }
+            let elem = self.lift_for(&args[0], 0);
+            // `Symbol` is not a `Liftable`: nsc special-cases the hole and
+            // refuses it under `..$` ("consider omitting the dots or
+            // providing an implicit instance of Liftable[Symbol]").
+            if matches!(elem, Lift::Unknown(_) | Lift::Symbol) {
+                return Lift::Unknown(self.st.display_type(&args[0]));
+            }
+            let to_list = self.st.get(*sym).jvm_name != "scala/collection/immutable/List";
+            return Lift::Elems {
+                to_list,
+                elem: Box::new(elem),
+            };
+        }
+        if rank != 0 {
+            return unknown();
+        }
+        match ty {
+            Type::Int
+            | Type::Long
+            | Type::Short
+            | Type::Byte
+            | Type::Char
+            | Type::Float
+            | Type::Double
+            | Type::Boolean
+            | Type::Unit
+            | Type::String => Lift::Value,
+            Type::Constant(_) => Lift::Value,
+            Type::TypeMember(id) => {
+                let owner = self.st.get(self.st.get(*id).owner).jvm_name.clone();
+                match owner.as_str() {
+                    "scala/reflect/api/Trees" => Lift::Tree,
+                    "scala/reflect/api/Names" => Lift::Name,
+                    "scala/reflect/api/Types" => Lift::Type,
+                    "scala/reflect/api/Constants" => Lift::Constant,
+                    "scala/reflect/api/Symbols" => Lift::Symbol,
+                    _ => unknown(),
+                }
+            }
+            Type::Class { sym, .. } => match self.st.get(*sym).jvm_name.as_str() {
+                "scala/reflect/api/TypeTags$WeakTypeTag" | "scala/reflect/api/TypeTags$TypeTag" => {
+                    Lift::TypeTag
+                }
+                "scala/reflect/api/Exprs$Expr" => Lift::Expr,
+                _ => unknown(),
+            },
+            _ => unknown(),
+        }
     }
 
     /// The expression naming a `scala.reflect.api.Universe` currently in
@@ -6047,10 +6148,49 @@ impl Typer {
     /// an alias we could not rebuild -- then say so, rather than let the user
     /// hunt for a name that is really there.
     fn not_found_error(&mut self, span: Span, what: &str, name: &str) {
+        if what == "value" && self.report_internal_universe_macro(span, name, false) {
+            return;
+        }
         match self.pkg_alias_gaps.get(name).cloned() {
             Some(msg) => self.error(span, msg),
             None => self.error(span, format!("not found: {what} {name}")),
         }
+    }
+
+    /// `reify { … }` is a *compiler-internal* macro, like the quasiquotes.
+    ///
+    /// `scala.reflect.api.Universe` declares `def reify[T](expr: T): Expr[T] =
+    /// macro …`, but scala-reflect.jar holds no implementation for it: nsc
+    /// short-circuits to one built into the compiler (`docs/macros.md` §6.2),
+    /// so there is no method to call and the pickle's entry has no erased
+    /// descriptor. Reporting "value reify is not a member of JavaUniverse"
+    /// was the same untruth the quasiquotes used to draw from `StringContext`
+    /// -- `reify` *is* a member, what is missing is the expansion.
+    ///
+    /// `on_universe` says the receiver is known to be a universe; an
+    /// unqualified `reify` is accepted when one is in scope, which is what
+    /// `import c.universe._` puts there.
+    fn report_internal_universe_macro(
+        &mut self,
+        span: Span,
+        name: &str,
+        on_universe: bool,
+    ) -> bool {
+        if name != "reify" || !self.library_abi {
+            return false;
+        }
+        if !on_universe && self.universe_in_scope().is_none() {
+            return false;
+        }
+        self.error(
+            span,
+            "macro expansion is not implemented: cannot expand reify { ... }. \
+             `reify` is a compiler-internal macro with no implementation in \
+             scala-reflect.jar, so scala-rs would have to reify the expression \
+             itself, the way it does quasiquotes; see docs/macros.md \u{a7}6.2."
+                .to_string(),
+        );
+        true
     }
 
     /// The `scala` package, for the implicit `import scala._`.
@@ -7510,7 +7650,12 @@ impl Typer {
         if found.is_empty() {
             // nsc reports the cause once: a selection on a receiver that is
             // already an error adds nothing.
-            if !qual.ty.is_error() {
+            if !qual.ty.is_error()
+                && !self.report_internal_universe_macro(tree.span, &name, {
+                    let owner = self.st.class_sym_of(&qual.ty).unwrap_or(SymbolId::NONE);
+                    self.is_reflect_universe(owner)
+                })
+            {
                 self.error(
                     tree.span,
                     format!(
