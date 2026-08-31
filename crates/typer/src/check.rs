@@ -8130,7 +8130,7 @@ impl Typer {
             return found;
         }
         let found = self.collapse_pickled_copies(found);
-        found
+        let kept: Vec<SymbolId> = found
             .iter()
             .copied()
             .filter(|&s| {
@@ -8159,7 +8159,16 @@ impl Typer {
                         && self.same_signature(other, s)
                 })
             })
-            .collect()
+            .collect();
+        // Dropping *every* candidate is never what this rule means -- it
+        // removes shadowed duplicates, and a set that eliminates itself
+        // mutually (seen first with agent/tail2's supplied jar implicits next
+        // to prelude twins) must fall back to what it was given rather than
+        // leave the caller to index into nothing.
+        if kept.is_empty() {
+            return found;
+        }
+        kept
     }
 
     /// One pickled declaration reached through two classes is one member.

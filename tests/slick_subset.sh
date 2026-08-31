@@ -23,6 +23,14 @@ for round in 1 2 3 4 5 6 7 8; do
   $BIN compile $(cat $RUN/files.txt) -d $OUT -cp "$CP" -Xsource:3 \
     --scala-library $LIB > $RUN/log.txt 2>&1 || true
   # Files named in any error line leave the set; repeat until none are.
+  # A panic prints no `error:` lines and no `-->`, which used to read as
+  # "converged, clean" -- round 2 once reported 126 files / 0 classes off a
+  # crash in file one. A crash is a compiler bug, never a fixpoint.
+  if grep -q "panicked at" $RUN/log.txt; then
+    echo "COMPILER PANIC (not a fixpoint):" >&2
+    grep -m1 "panicked at" $RUN/log.txt >&2
+    exit 1
+  fi
   grep -oE '^\s+--> [^:]+\.scala' $RUN/log.txt | awk '{print $2}' | sort -u > $RUN/bad.txt
   if [[ ! -s $RUN/bad.txt ]]; then break; fi
   grep -vxF -f $RUN/bad.txt $RUN/files.txt > $RUN/files2.txt
