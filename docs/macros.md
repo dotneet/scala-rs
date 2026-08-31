@@ -1175,3 +1175,118 @@ nsc でビット 2）。値はすべて `-Ymacro-debug-lite` が印字する
 4. **`q"{ type T = Int }"`**（`SyntacticTypeDef`）
 5. **`reify { … }` と `typeOf[T]` / `symbolOf[T]`**
 6. **engine（フェーズ 2）**
+
+### 7.10 fresh 名を要する 3 形（`agent/freshname` スライス）
+
+§7.9 の残件 2。**`_` プレースホルダ関数リテラル・`_` 型引数（存在型）・
+右結合演算子が落とせるようになった。** この 3 つは、それまでの形と決定的に違う
+点が 1 つある：**nsc の展開が 1 個の式ではなく「ブロック」である**。
+
+```scala
+// q"_.get" の -Ymacro-debug-lite 出力（universe を u、
+// u.internal.reificationSupport を rs と略記）
+{
+  val nn$macro$1: u.TermName = rs.freshTermName("x$");
+  rs.SyntacticFunction(
+    List(rs.SyntacticValDef(u.Modifiers(rs.FlagsRepr(2105344L)), nn$macro$1,
+                            rs.SyntacticEmptyTypeTree(), u.EmptyTree)),
+    rs.SyntacticSelectTerm(rs.SyntacticTermIdent(nn$macro$1, false),
+                           u.TermName("get")))
+}
+```
+
+名前は**実行時に universe のカウンタから引く**（`freshTermName` /
+`freshTypeName`）。だから scala-rs も「名前を決め打ちする」のではなく、
+**同じ呼び出しをするブロックごと組む**必要がある。実装は `Reifier` に
+`Fresh` 状態（`crates/typer/src/reify.rs`）を持たせ、木を組む途中で要求された
+束縛を溜め、`reify` が最後にブロックで包む。3 形とも**同じ 1 つのブロック**に
+まとめて持ち上げられる（nsc と同じ）。
+
+#### 落とせるようになった形
+
+| 形 | 落とす先 |
+| --- | --- |
+| `q"_.get"` | `{ val n = rs.freshTermName("x$"); rs.SyntacticFunction(List(rs.SyntacticValDef(mods(PARAM\|SYNTHETIC), n, …)), <本体の `_` は `SyntacticTermIdent(n, false)`>) }` |
+| `q"_.foo(_)"` | 同じ。プレースホルダ 1 つにつき fresh 名 1 つ |
+| `q"(_: Int).get"` | パラメータの型欄も本体の型注釈も nsc と同じく残る |
+| `tq"P[_, _]"` | `{ val a = rs.freshTypeName("_$"); val b = …; rs.SyntacticExistentialType(rs.SyntacticAppliedType(<P>, List(rs.SyntacticTypeIdent(a), rs.SyntacticTypeIdent(b))), List(u.TypeDef(mods(DEFERRED\|SYNTHETIC), a, Nil, u.TypeBoundsTree(…)), …)) }` |
+| `tq"P[_ <: Int]"` | 上界・下界は `TypeBoundsTree` に入る |
+| `tq"Option[P[_]]"` | 存在型は**直下の引数に `_` を持つ適用**を包む（nsc と同じ入れ子位置） |
+| `q"a :: b"` | `{ val n = rs.freshTermName("rassoc$"); rs.SyntacticBlock(List(rs.SyntacticValDef(mods(FINAL\|SYNTHETIC\|ARTIFACT), n, …, <a>), rs.SyntacticApplied(rs.SyntacticSelectTerm(<b>, u.TermName("$colon$colon")), List(List(rs.SyntacticTermIdent(n, false)))))) }` |
+| `q"a :: b :: c"` | ブロックが入れ子になる（fresh 名 2 つ） |
+| `q"b.::(a)"` | **ブロックにしない。** ドット呼びは普通の選択である |
+| `pq"_: R[_, _]"` | 型変数パターン。`u.Bind(u.TypeName("_"), u.EmptyTree)`。fresh 名は要らない |
+| `pq"_: R[_ <: Int]"` | 境界つきはパターンの中でも存在型 |
+
+フラグ値はすべて `-Ymacro-debug-lite` の `FlagsRepr(<n>L)` から読み戻した:
+`PARAM|SYNTHETIC` = 2105344、`DEFERRED|SYNTHETIC` = 2097168、
+`FINAL|SYNTHETIC|ARTIFACT` = 70368746274848（`ARTIFACT` は `1L << 46`）。
+
+#### パーサが潰す区別を、また元のソース文字列で戻す
+
+- **`a :: b` と `b.::(a)`。** パーサは右結合演算子の受け手を右辺にするので
+  どちらも `Apply(Select(b, "::"), [a])` になる。nsc はこの 2 つに**違う木**を作る
+  （前者はブロック、後者は素の適用）。選択ノードの span のテキストが
+  **演算子で始まるか**で見分ける: 中置なら span は演算子から始まり、
+  ドット呼びなら被選択子から始まる。
+- **プレースホルダのパラメータ。** パーサが作る `x$n` は
+  `PARAM | SYNTHETIC`、ソースが書いたパラメータは `PARAM` だけ。この差で
+  「名前を作る」のか「fresh 名を引く」のかを決める。
+- **パターンの中の `_` 型引数。** 裸の `_` は型変数パターン（`Bind`）、
+  境界つきは存在型。`pq` / `case` の下を歩いているかを `Fresh::pat_depth` で
+  持ち回る。
+
+#### 落とせない形は名指しで診断する（`tests/fixtures/fn2_fresh_bad.scala`）
+
+| 形 | 診断 | 理由 |
+| --- | --- | --- |
+| `q"_"` | unbound placeholder parameter | 束縛するものが無い。実 scalac も同じく拒否する |
+| `tq"_"` | a `_` type argument (an existential) … | 同上（nsc は "unbound wildcard type"） |
+
+#### 検証: fresh 名をどう突き合わせるか
+
+`tests/fixtures/fn2_fresh.scala` を実 scalac 2.13.16 と dual-run し、32 行を
+`showRaw` で比較する（`java -Xverify:all`）。ただし fresh 名の**番号**は
+そのままでは一致しない。理由は 2 つあり、どちらも木の違いではない:
+
+1. カウンタは universe ごとにグローバルで、その行より前の全行と共有している。
+2. nsc は右から左に名前を配る（`q"_.foo(_)"` は引数側のパラメータを先に採番する）。
+
+そこで `crates/cli/tests/quasi.rs` の `renumber_fresh_names` が、
+**1 行ごとに、初出順で 1 から採番し直してから**比較する。これで落ちるのは
+上の 2 つだけで、**どの出現がどの束縛を指すか**は落ちない
+（`_$1 … _$2` と `_$1 … _$1` は別の文字列のまま）。正規化そのものも
+`renumber_fresh_names_keeps_binder_identity` で固定してある。
+
+#### slick への効き方
+
+`tests/slick_measure.sh`（scala-reflect.jar 入り）で
+`errors=223 → 220`、`files_with_errors=60 → 60`。内訳:
+
+| ファイル | before | after |
+| --- | --- | --- |
+| `ShapedValue.scala` | 10 | **7** |
+| `TableQuery.scala` | 7 | 7 |
+
+消えた 3 件は `(($rModule.unapply _) : $rTag => Option[$uTag]).andThen(_.get)`
+の `_` プレースホルダ（62 / 65 / 68 行）である。`TableQuery.scala` は
+`reify { … }` と `TypeTag` の materialization で落ちており、この 3 形とは無関係。
+
+`ShapedValue.scala` の巨大な `q"""…"""`（77 行）は
+`ProductResultConverter[_, _, _, _]`（パターン中の型変数パターン）と
+`TypeMappingResultConverter[…, _]`（存在型）を**両方とも通るようになった**が、
+いま落ちているのは `$f` / `$g` の型が `AnyRef` になる cascade で、その大元は
+`rTag.tpe.decls.collect`（`value collect is not a member of MemberScope`）である。
+形の問題は残っていない。同じ形を `fn2_fresh.scala` の最後の行が
+（穴を持ち上げられるものに替えて）実 scalac と突き合わせている。
+
+#### このスライスのあとに残っているもの（§7.9 の一覧の更新）
+
+1. **`MemberScope#collect` など reflect API のコレクション操作**（`ShapedValue`
+   の現在の大元）
+2. **`TypeTag` / `WeakTypeTag` の materialization**（`c.typeOf[HList]`、
+   `TableQuery` の `typeOf[Tag]`）
+3. **`reify { … }` 本体**（式全体の木化。`TableQuery` の残り）
+4. **`..$` と普通の引数の混在**、および**期待型からの型パラメータ推論**（§7.5）
+5. **`q"{ type T = Int }"`**（`SyntacticTypeDef`）
+6. **engine（フェーズ 2）**

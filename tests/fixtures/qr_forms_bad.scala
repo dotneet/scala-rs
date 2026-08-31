@@ -8,18 +8,13 @@ import scala.reflect.runtime.universe._
 object QrFormsBad {
   val xs: List[Tree] = List(q"a")
 
-  // `a :: b` is `b.::(a)` after parsing, indistinguishable from a written
-  // `b.::(a)`; nsc builds neither -- it binds the left operand to a fresh
-  // `val` first, to keep evaluation order.
-  val rightAssoc = q"a :: b"
-
   // The parser supplies `()` for a missing `else`; nsc supplies an empty
   // block, and the two are different trees.
   val ifNoElse = q"if (a) b"
 
-  // `_.get` is a lambda over a parameter the parser invented. nsc names that
-  // parameter with `freshTermName`, so the trees differ in the name.
-  val placeholder = q"_.get"
+  // A right-associative operator and a `_` placeholder lambda used to stand
+  // here; both are reified now, out of a `freshTermName` block
+  // (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.10).
 
   // A by-name type: nsc's own parser rejects it inside `tq"..."`.
   val byName = tq"=> Int"

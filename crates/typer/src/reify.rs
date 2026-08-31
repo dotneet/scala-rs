@@ -26,6 +26,8 @@
 //! produces; `tests/fixtures/reify_qq.scala` and `qq_universe.scala` then
 //! compare `showRaw` of the result.
 
+use std::cell::RefCell;
+
 use scala_rs_parser::{CaseDef, Flags, Lit, Modifiers, NodeId, SymbolId, Tree, TreeKind, Type};
 use scala_rs_pickle::names::encode_method_name;
 use scala_rs_span::Span;
@@ -95,6 +97,52 @@ enum Pos {
 /// `SyntacticValDef(Modifiers(FlagsRepr(8192L), TypeName(""), List()), ...)`.
 const PARAM_FLAGS: i64 = 8192;
 
+/// `Flags.PARAM | Flags.SYNTHETIC` (`1 << 13 | 1 << 21`), the modifiers nsc
+/// gives the parameter it invents for a `_` placeholder lambda. Read off
+/// `-Ymacro-debug-lite` for `q"_.get"`.
+const PLACEHOLDER_PARAM_FLAGS: i64 = 2105344;
+
+/// `Flags.DEFERRED | Flags.SYNTHETIC` (`1 << 4 | 1 << 21`), the modifiers on
+/// the `TypeDef` an existential's bound type parameter gets. Read off
+/// `-Ymacro-debug-lite` for `tq"P[_, _]"`.
+const EXISTENTIAL_TPARAM_FLAGS: i64 = 2097168;
+
+/// `Flags.FINAL | Flags.SYNTHETIC | Flags.ARTIFACT`
+/// (`1 << 5 | 1 << 21 | 1L << 46`), the modifiers on the `val` nsc binds the
+/// left operand of a right-associative operator to. Read off
+/// `-Ymacro-debug-lite` for `q"a :: b"`.
+const RASSOC_VAL_FLAGS: i64 = 70368746274848;
+
+/// The fresh names a body needs, and what they stand for while it is built.
+///
+/// nsc's quasiquote macro does not invent names itself: it emits
+/// `val nn$macro$k = <universe>.internal.reificationSupport.freshTermName("x$")`
+/// into a **block around the whole expansion** and uses `nn$macro$k` wherever
+/// the name is needed, so the reflect `Tree` gets a name drawn from the
+/// universe's own counter at run time. Three forms need this -- a `_`
+/// placeholder lambda, a `_` type argument (an existential) and a
+/// right-associative operator -- and all three hoist to the same block, which
+/// is why this is per-`Reifier` state rather than something `term` returns.
+#[derive(Default)]
+struct Fresh {
+    /// The `val nn$macro$k = rs.fresh{Term,Type}Name("...")` bindings, in the
+    /// order they were asked for; `reify` wraps the body in a block of them.
+    defs: Vec<Tree>,
+    /// How many have been handed out, for the local's name.
+    next: usize,
+    /// Placeholder parameters in scope, innermost last: the parser's invented
+    /// `x$n` mapped to the local holding its fresh `TermName`. An `Ident` of
+    /// one of these in the body is that parameter, not a name to build.
+    params: Vec<(String, String)>,
+    /// `_` type arguments in scope, keyed by the node the parser made for
+    /// them: the local holding the fresh `TypeName` the existential binds.
+    wilds: Vec<(NodeId, String)>,
+    /// How deep inside a pattern the walk is. A `_` type argument is an
+    /// existential only in a *type*; in a pattern (`pq"_: R[_, _]"`) nsc
+    /// leaves it as `Bind(TypeName("_"), EmptyTree)` and needs no fresh name.
+    pat_depth: usize,
+}
+
 /// Lowers one quasiquote.
 pub(crate) struct Reifier<'a> {
     /// The expression naming the universe (`scala.reflect.runtime.universe`,
@@ -118,6 +166,10 @@ pub(crate) struct Reifier<'a> {
     /// a bare `Ident` for the written name). The text under the head's span
     /// settles which was written.
     src: &'a str,
+    /// The fresh names the body needs; see `Fresh`. Interior mutability
+    /// because building a tree is otherwise a pure `&self` walk and only
+    /// these three forms have to reach back out of it.
+    fresh: RefCell<Fresh>,
 }
 
 impl<'a> Reifier<'a> {
@@ -136,11 +188,29 @@ impl<'a> Reifier<'a> {
             lifts,
             span,
             src,
+            fresh: RefCell::new(Fresh::default()),
         }
     }
 
-    /// Lower a quasiquote body.
+    /// Lower a quasiquote body, in the block of fresh-name bindings it needs.
+    ///
+    /// The block is nsc's own shape: every `freshTermName` / `freshTypeName`
+    /// the body asked for is bound once, ahead of the expression that builds
+    /// the tree, so a name used twice (a placeholder parameter and its
+    /// occurrences) is the *same* name.
     pub(crate) fn reify(&self, kind: QuasiKind, body: &Tree) -> Result<Tree, String> {
+        let built = self.reify_body(kind, body)?;
+        let defs = std::mem::take(&mut self.fresh.borrow_mut().defs);
+        if defs.is_empty() {
+            return Ok(built);
+        }
+        Ok(self.node(TreeKind::Block {
+            stats: defs,
+            expr: Box::new(built),
+        }))
+    }
+
+    fn reify_body(&self, kind: QuasiKind, body: &Tree) -> Result<Tree, String> {
         match kind {
             // `q"..$stats"` / `q"{ ..$stats }"`: a rank-1 hole standing for
             // the whole body is a block of those statements. The parser folds
@@ -174,14 +244,28 @@ impl<'a> Reifier<'a> {
             TreeKind::Literal { lit } => Ok(self.constant(lit.clone())),
             TreeKind::Ident { name } => match hole_index(name) {
                 Some(i) => self.hole(i, 0, Pos::Term),
-                None => Ok(self.term_ident(name)),
+                // An occurrence of a `_` placeholder's parameter is the fresh
+                // name the enclosing `SyntacticFunction` binds, not a name
+                // built from the one the parser invented.
+                None => Ok(match self.placeholder_param(name) {
+                    Some(local) => self.call(
+                        self.support_member("SyntacticTermIdent"),
+                        vec![self.local(&local), self.lit(Lit::Boolean(false))],
+                    ),
+                    None => self.term_ident(name),
+                }),
             },
             TreeKind::Select { qual, name } => {
                 // `$x.foo` and `a.b`: the qualifier is a term either way.
                 let q = self.term(qual)?;
-                Ok(self.select_term(q, name)?)
+                Ok(self.select_term(q, name, t.span)?)
             }
             TreeKind::Apply { fun, args } => {
+                // `a :: b`: a right-associative operator, whose left operand
+                // nsc binds to a fresh `val` first.
+                if let Some(t) = self.right_assoc(fun, args)? {
+                    return Ok(t);
+                }
                 // `(a, b)` is `Apply(Ident("TupleN"), ...)` after parsing,
                 // exactly like a written `TupleN(a, b)`, and nsc builds
                 // different trees for the two. The source text under the
@@ -369,6 +453,7 @@ impl<'a> Reifier<'a> {
             }
         }
         let mut ps = Vec::new();
+        let scope = self.fresh.borrow().params.len();
         for p in vparams {
             let TreeKind::ValDef {
                 mods, name, tpt, ..
@@ -377,27 +462,38 @@ impl<'a> Reifier<'a> {
                 return Err("a function literal's parameter is not reified yet".to_string());
             };
             // The parser turns `_.get` into a lambda over a parameter it
-            // invented; nsc keeps the placeholder and reifies it with a
-            // `freshTermName` bound in a block around the call, so the
-            // parameter's *name* differs and the trees are not the same.
-            if mods.flags != scala_rs_parser::Flags::PARAM {
-                return Err("a `_` placeholder function literal is not reified yet".to_string());
-            }
-            let mods = self.mods(PARAM_FLAGS);
+            // invented (`x$1`, `PARAM | SYNTHETIC`). nsc invents one too, but
+            // draws its name from the universe at run time, so the name is
+            // `freshTermName("x$")` and every occurrence in the body is that
+            // same local -- not a `TermName` built from what the parser chose.
+            let (flags, name) = if is_parser_placeholder(mods.flags, name) {
+                let local = self.fresh_name(true, "x$");
+                self.fresh
+                    .borrow_mut()
+                    .params
+                    .push((name.clone(), local.clone()));
+                (PLACEHOLDER_PARAM_FLAGS, self.local(&local))
+            } else if mods.flags == Flags::PARAM {
+                (PARAM_FLAGS, self.term_name_or_hole(name)?)
+            } else {
+                return Err("a modified function literal parameter is not reified yet".to_string());
+            };
+            let mods = self.mods(flags);
             ps.push(self.call(
                 self.support_member("SyntacticValDef"),
                 vec![
                     mods,
-                    self.term_name_or_hole(name)?,
+                    name,
                     self.type_or_empty(tpt)?,
                     self.universe_member("EmptyTree"),
                 ],
             ));
         }
-        let b = self.term(body)?;
+        let b = self.term(body);
+        self.fresh.borrow_mut().params.truncate(scope);
         Ok(self.call(
             self.support_member("SyntacticFunction"),
-            vec![self.list(ps), b],
+            vec![self.list(ps), b?],
         ))
     }
 
@@ -467,6 +563,28 @@ impl<'a> Reifier<'a> {
                     vec![self.list(ps), self.list(vec![])],
                 ))
             }
+            // A `_` type argument the enclosing application has bound: the
+            // fresh `TypeName` its `SyntacticExistentialType` introduces. One
+            // that reached here unbound (`tq"_"`, which nsc rejects too) falls
+            // through to the diagnostic below.
+            TreeKind::TypeDef { .. } if is_wildcard_type(t) => {
+                // A bare `_` in a pattern is a *type-variable pattern*, which
+                // nsc writes `Bind(TypeName("_"), EmptyTree)` and gives no
+                // name; only a bounded one is an existential there.
+                if !self.wildcard_binds_a_name(t) {
+                    return Ok(self.call(
+                        self.universe_member("Bind"),
+                        vec![self.type_name("_"), self.universe_member("EmptyTree")],
+                    ));
+                }
+                match self.wildcard_local(t.id) {
+                    Some(local) => Ok(self.call(
+                        self.support_member("SyntacticTypeIdent"),
+                        vec![self.local(&local)],
+                    )),
+                    None => Err(format!("{} is not reified yet", describe_type(&t.kind))),
+                }
+            }
             other => Err(format!("{} is not reified yet", describe_type(other))),
         }
     }
@@ -478,6 +596,73 @@ impl<'a> Reifier<'a> {
     /// text under the head's span, which is the operand or the `=>` when the
     /// head was synthesised.
     fn applied_type(&self, tpt: &Tree, args: &[Tree]) -> Result<Tree, String> {
+        // `P[_, _]` is an existential: nsc names each `_` with
+        // `freshTypeName("_$")` and wraps *this* application -- the innermost
+        // one whose own arguments hold the wildcards -- in
+        // `SyntacticExistentialType` over a `TypeDef` per name.
+        let wild: Vec<&Tree> = args
+            .iter()
+            .filter(|a| is_wildcard_type(a) && self.wildcard_binds_a_name(a))
+            .collect();
+        if !wild.is_empty() {
+            let scope = self.fresh.borrow().wilds.len();
+            let mut defs = Vec::new();
+            for w in wild {
+                let local = self.fresh_name(false, "_$");
+                defs.push(self.wildcard_type_def(w, &local)?);
+                self.fresh.borrow_mut().wilds.push((w.id, local));
+            }
+            let inner = self.applied_type_head(tpt, args);
+            self.fresh.borrow_mut().wilds.truncate(scope);
+            return Ok(self.call(
+                self.support_member("SyntacticExistentialType"),
+                vec![inner?, self.list(defs)],
+            ));
+        }
+        self.applied_type_head(tpt, args)
+    }
+
+    /// Whether this `_` type argument is an existential, which binds a fresh
+    /// `TypeName`, rather than a *type-variable pattern*.
+    ///
+    /// They are the same syntax and only the position tells them apart: inside
+    /// a pattern a bare `_` matches any type argument and nsc writes it
+    /// `Bind(TypeName("_"), EmptyTree)`, while one carrying bounds
+    /// (`pq"_: R[_ <: Int]"`) is an existential there as everywhere else.
+    fn wildcard_binds_a_name(&self, w: &Tree) -> bool {
+        let TreeKind::TypeDef { lo, hi, .. } = &w.kind else {
+            return false;
+        };
+        self.fresh.borrow().pat_depth == 0 || lo.is_some() || hi.is_some()
+    }
+
+    /// `u.TypeDef(u.Modifiers(DEFERRED | SYNTHETIC), <local>, Nil,
+    /// u.TypeBoundsTree(<lo>, <hi>))` for one `_` type argument.
+    fn wildcard_type_def(&self, w: &Tree, local: &str) -> Result<Tree, String> {
+        let TreeKind::TypeDef { lo, hi, .. } = &w.kind else {
+            unreachable!("only a wildcard type gets here");
+        };
+        let bound = |b: &Option<Box<Tree>>| match b {
+            Some(t) => self.typ(t),
+            None => Ok(self.universe_member("EmptyTree")),
+        };
+        let bounds = self.call(
+            self.universe_member("TypeBoundsTree"),
+            vec![bound(lo)?, bound(hi)?],
+        );
+        Ok(self.call(
+            self.universe_member("TypeDef"),
+            vec![
+                self.mods(EXISTENTIAL_TPARAM_FLAGS),
+                self.local(local),
+                self.list(vec![]),
+                bounds,
+            ],
+        ))
+    }
+
+    /// `applied_type` once the wildcards among `args`, if any, are bound.
+    fn applied_type_head(&self, tpt: &Tree, args: &[Tree]) -> Result<Tree, String> {
         if let TreeKind::Ident { name } = &tpt.kind {
             if name == "<tuple>" {
                 let mut ts = Vec::new();
@@ -531,7 +716,17 @@ impl<'a> Reifier<'a> {
 
     /// Lower one pattern: the whole of `pq"..."`, and a `case` clause's
     /// pattern inside `q"..."` / `cq"..."`.
+    ///
+    /// The depth is what tells the type walk it is under a pattern, where a
+    /// `_` type argument is a `Bind` and not an existential.
     fn pat(&self, t: &Tree) -> Result<Tree, String> {
+        self.fresh.borrow_mut().pat_depth += 1;
+        let r = self.pat_inner(t);
+        self.fresh.borrow_mut().pat_depth -= 1;
+        r
+    }
+
+    fn pat_inner(&self, t: &Tree) -> Result<Tree, String> {
         match &t.kind {
             TreeKind::Literal { lit } => Ok(self.constant(lit.clone())),
             TreeKind::Wildcard => Ok(self.term_ident("_")),
@@ -550,7 +745,7 @@ impl<'a> Reifier<'a> {
             // A stable-identifier pattern (`a.b.None`): a term selection.
             TreeKind::Select { qual, name } => {
                 let q = self.term(qual)?;
-                self.select_term(q, name)
+                self.select_term(q, name, t.span)
             }
             TreeKind::Bind { name, body } => {
                 let b = self.pat(body)?;
@@ -784,6 +979,69 @@ impl<'a> Reifier<'a> {
         }
     }
 
+    // -- fresh names -------------------------------------------------------
+
+    /// Bind `rs.freshTermName("<prefix>")` (or `freshTypeName`) to a new local
+    /// and answer that local's name.
+    ///
+    /// The local is `nn$macro$k`, nsc's own spelling. Its scope is the block
+    /// `reify` puts around this quasiquote, so two quasiquotes -- including a
+    /// nested one spliced through a hole -- never see each other's.
+    fn fresh_name(&self, term: bool, prefix: &str) -> String {
+        let mut fresh = self.fresh.borrow_mut();
+        fresh.next += 1;
+        let local = format!("nn$macro${}", fresh.next);
+        drop(fresh);
+        let maker = if term {
+            "freshTermName"
+        } else {
+            "freshTypeName"
+        };
+        let rhs = self.call(
+            self.support_member(maker),
+            vec![self.lit(Lit::String(prefix.to_string()))],
+        );
+        let def = self.node(TreeKind::ValDef {
+            mods: Modifiers::default(),
+            name: local.clone(),
+            tpt: Box::new(self.node(TreeKind::Empty)),
+            rhs: Box::new(rhs),
+        });
+        self.fresh.borrow_mut().defs.push(def);
+        local
+    }
+
+    /// An `Ident` of a local `fresh_name` handed out.
+    fn local(&self, name: &str) -> Tree {
+        self.node(TreeKind::Ident {
+            name: name.to_string(),
+        })
+    }
+
+    /// The local holding the fresh name for the placeholder parameter the
+    /// parser called `name`, if that is what `name` is.
+    fn placeholder_param(&self, name: &str) -> Option<String> {
+        let fresh = self.fresh.borrow();
+        fresh
+            .params
+            .iter()
+            .rev()
+            .find(|(p, _)| p == name)
+            .map(|(_, local)| local.clone())
+    }
+
+    /// The local holding the fresh name the existential binds for the `_`
+    /// type argument `id`, if that argument is one being reified now.
+    fn wildcard_local(&self, id: NodeId) -> Option<String> {
+        let fresh = self.fresh.borrow();
+        fresh
+            .wilds
+            .iter()
+            .rev()
+            .find(|(w, _)| *w == id)
+            .map(|(_, local)| local.clone())
+    }
+
     // -- building blocks ---------------------------------------------------
 
     fn node(&self, kind: TreeKind) -> Tree {
@@ -906,21 +1164,81 @@ impl<'a> Reifier<'a> {
 
     /// `rs.SyntacticSelectTerm(<qual>, u.TermName("<name>"))`.
     ///
-    /// A right-associative operator is refused: the parser has already turned
-    /// `a :: b` into `b.::(a)`, which is indistinguishable from a written
-    /// `b.::(a)` -- and nsc builds *neither* of those for the infix form (it
-    /// binds the left operand to a fresh `val` first, to keep evaluation
-    /// order). Guessing would silently swap a call's operands.
-    fn select_term(&self, qual: Tree, name: &str) -> Result<Tree, String> {
-        if is_right_associative(name) {
+    /// An *infix* right-associative operator never gets here: the parser has
+    /// turned `a :: b` into `b.::(a)`, and nsc builds neither that nor the
+    /// plain selection but a block binding the left operand first, which
+    /// `right_assoc` builds. A written `b.::(a)` is an ordinary selection and
+    /// does get here; the two are told apart by the source text, since the
+    /// operator comes *before* its qualifier only when it was written infix.
+    fn select_term(&self, qual: Tree, name: &str, span: Span) -> Result<Tree, String> {
+        if self.written_infix(span, name) {
             return Err(format!(
-                "a right-associative operator (`{name}`) is not reified yet"
+                "a right-associative operator (`{name}`) in this position is not reified yet"
             ));
         }
         Ok(self.call(
             self.support_member("SyntacticSelectTerm"),
             vec![qual, self.term_name_or_hole(name)?],
         ))
+    }
+
+    /// Whether the selection under `span` is a right-associative operator that
+    /// was written infix (`a :: b`), rather than as a call (`b.::(a)`).
+    ///
+    /// The parser puts the *right* operand in the qualifier, so the merged
+    /// span of the selection starts at the operator; a written selection
+    /// starts at its qualifier.
+    fn written_infix(&self, span: Span, name: &str) -> bool {
+        is_right_associative(name) && self.text(span).starts_with(name)
+    }
+
+    /// `a :: b` -- `Ok(None)` when the application is not one.
+    ///
+    /// nsc keeps Scala's evaluation order (left operand first) by binding it
+    /// to a fresh `val` and calling the operator on that:
+    ///
+    /// ```text
+    /// { val rassoc$1 = a; b.::(rassoc$1) }
+    /// ```
+    ///
+    /// so the reified tree is a `SyntacticBlock`, not a bare application.
+    fn right_assoc(&self, fun: &Tree, args: &[Tree]) -> Result<Option<Tree>, String> {
+        let TreeKind::Select { qual, name } = &fun.kind else {
+            return Ok(None);
+        };
+        if !self.written_infix(fun.span, name) {
+            return Ok(None);
+        }
+        let [lhs] = args else {
+            return Ok(None);
+        };
+        let local = self.fresh_name(true, "rassoc$");
+        let bound = self.call(
+            self.support_member("SyntacticValDef"),
+            vec![
+                self.mods(RASSOC_VAL_FLAGS),
+                self.local(&local),
+                self.type_or_empty(&self.node(TreeKind::Empty))?,
+                self.term(lhs)?,
+            ],
+        );
+        let recv = self.term(qual)?;
+        let sel = self.call(
+            self.support_member("SyntacticSelectTerm"),
+            vec![recv, self.term_name(name)],
+        );
+        let arg = self.call(
+            self.support_member("SyntacticTermIdent"),
+            vec![self.local(&local), self.lit(Lit::Boolean(false))],
+        );
+        let applied = self.call(
+            self.support_member("SyntacticApplied"),
+            vec![sel, self.list(vec![self.list(vec![arg])])],
+        );
+        Ok(Some(self.call(
+            self.support_member("SyntacticBlock"),
+            vec![self.list(vec![bound, applied])],
+        )))
     }
 
     /// `List(<elems>)`, or `Nil` when there are none.
@@ -971,6 +1289,23 @@ fn is_tuple_name(name: &str, arity: usize) -> bool {
 /// Scala's rule: a method whose name ends in `:` is right-associative.
 fn is_right_associative(name: &str) -> bool {
     name.len() > 1 && name.ends_with(':') && !name.ends_with("::=")
+}
+
+/// Whether `flags` and `name` are what `Parser::fresh_placeholder` puts on the
+/// parameter it invents for a `_` in expression position (`_.get`), as opposed
+/// to a parameter the source wrote.
+fn is_parser_placeholder(flags: Flags, name: &str) -> bool {
+    flags == Flags::PARAM.with(Flags::SYNTHETIC)
+        && name
+            .strip_prefix("x$")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether `t` is the anonymous `TypeDef` the parser makes for a `_` (or `?`)
+/// type argument.
+fn is_wildcard_type(t: &Tree) -> bool {
+    matches!(&t.kind, TreeKind::TypeDef { name, tparams, rhs, .. }
+        if name == "_" && tparams.is_empty() && matches!(rhs.kind, TreeKind::Empty))
 }
 
 /// A short name for a form, for the diagnostic. Deliberately coarse: the point

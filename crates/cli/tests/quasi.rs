@@ -510,9 +510,7 @@ fn qq_ctx_bad_names_every_form_it_cannot_build() {
     assert!(!output.status.success(), "expected qq_ctx_bad to fail");
     let err = diagnostics(&output);
     for needle in [
-        "a right-associative operator (`::`) is not reified yet",
         "an `if` without an `else` is not reified yet",
-        "a `_` placeholder function literal is not reified yet",
         "a by-name type is not reified yet",
     ] {
         assert!(
@@ -664,9 +662,7 @@ fn qr_forms_bad_names_every_form_it_cannot_build() {
     assert!(!output.status.success(), "expected qr_forms_bad to fail");
     let err = diagnostics(&output);
     for needle in [
-        "a right-associative operator (`::`) is not reified yet",
         "an `if` without an `else` is not reified yet",
-        "a `_` placeholder function literal is not reified yet",
         "a by-name type is not reified yet",
         "a `..$` splice mixed with ordinary arguments is not reified yet",
         "a type definition is not reified yet",
@@ -808,7 +804,6 @@ fn dq_defs_bad_names_every_form_it_cannot_build() {
         "a `case` class whose parents are a `..$` splice is not reified yet",
         "an implicit parameter clause that is not the last is not reified yet",
         "a `macro` definition is not reified yet",
-        "a `_` type argument (an existential) is not reified yet",
     ] {
         assert!(
             err.contains(needle),
@@ -1062,4 +1057,214 @@ fn lf2_lift_bad_names_every_hole_it_cannot_lift() {
         "`reify` reported as a missing member again: {err}"
     );
     let _ = fs::remove_dir_all(&out);
+}
+
+// --- the fresh-name forms (`agent/freshname`, §7.10) ----------------------
+
+/// Renumber the fresh names in one line of `showRaw` output, in order of first
+/// appearance.
+///
+/// The three forms in `tests/fixtures/fn2_fresh.scala` get their names from
+/// the *universe's* `freshTermName` / `freshTypeName` at run time, off one
+/// global counter, so `x$7` says nothing except "the seventh name this JVM
+/// handed out". Two things make the raw numbers differ between the two
+/// compilers even when the trees are identical: the counter is shared with
+/// every line before this one, and nsc happens to allocate right-to-left
+/// (`q"_.foo(_)"` names the argument's parameter before the receiver's).
+///
+/// Renumbering per line from 1, in order of first appearance, drops exactly
+/// that and keeps everything else -- in particular **which binder each
+/// occurrence refers to**, which is the whole point of these forms: `_$1 ...
+/// _$2` and `_$1 ... _$1` do not normalise to the same string, so a
+/// reification that reused one name where nsc binds two still fails.
+///
+/// A fresh name is `<prefix>$<digits>` (`x$1`, `_$1`, `rassoc$1`).
+/// `$colon$colon` and `x$pf` have no digits after the `$` and are left alone.
+fn renumber_fresh_names(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for line in s.split_inclusive('\n') {
+        let mut seen: Vec<&str> = Vec::new();
+        let b = line.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'$' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+                // Walk back over the prefix and forward over the digits.
+                let mut lo = i;
+                while lo > 0 && (b[lo - 1].is_ascii_alphanumeric() || b[lo - 1] == b'_') {
+                    lo -= 1;
+                }
+                let mut hi = i + 1;
+                while hi < b.len() && b[hi].is_ascii_digit() {
+                    hi += 1;
+                }
+                if lo < i {
+                    let name = &line[lo..hi];
+                    let n = match seen.iter().position(|s| *s == name) {
+                        Some(k) => k,
+                        None => {
+                            seen.push(name);
+                            seen.len() - 1
+                        }
+                    };
+                    // The prefix is already in `out` -- everything up to `i`
+                    // was copied byte by byte -- so only the number changes.
+                    out.push('$');
+                    out.push_str(&(n + 1).to_string());
+                    i = hi;
+                    continue;
+                }
+            }
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `tests/fixtures/fn2_fresh.scala`, run: the three forms whose expansion nsc
+/// builds out of a fresh name.
+///
+/// A `_` placeholder lambda, a `_` type argument (an existential) and a
+/// right-associative operator are the forms where nsc's expansion is a *block*
+/// -- `val nn$macro$k = u.internal.reificationSupport.freshTermName("x$")`
+/// ahead of the call -- and not one expression. Getting the block wrong is
+/// invisible to a compile: the tree would simply carry a different name, or
+/// the same name in two places that have to differ. So this runs the fixture
+/// and compares `showRaw` (renumbered, see `renumber_fresh_names`).
+#[test]
+fn fn2_fresh_reifies_the_fresh_name_forms() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip fn2_fresh: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("fn2_fresh");
+    let output = compile_reflect("fn2_fresh", &out, &jar, &reflect);
+    assert!(
+        output.status.success(),
+        "compile fn2_fresh failed: {}",
+        diagnostics(&output)
+    );
+    let cp = format!("{}:{}:{}", out.display(), reflect.display(), jar.display());
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        run.status.success(),
+        "java -Xverify:all Main failed for fn2_fresh: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        renumber_fresh_names(&String::from_utf8_lossy(&run.stdout)),
+        renumber_fresh_names(&expected_stdout("fn2_fresh")),
+        "stdout mismatch for fn2_fresh"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// The same fixture through real scalac 2.13.16. Without this the recorded
+/// expectation would only say what we happen to build; with it, every fresh
+/// name -- how many, and where each one is used -- is pinned to nsc's own
+/// quasiquote expansion.
+#[test]
+fn fn2_fresh_matches_real_scalac() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(reflect), Some(scalac)) =
+        (scala_library_jar(), scala_reflect_jar(), find_scalac())
+    else {
+        eprintln!("skip fn2_fresh scalac diff: scalac / jars not obtainable");
+        return;
+    };
+    let ref_out = tmp_dir("fn2_fresh-scalac");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            ref_out.to_str().unwrap(),
+            fixtures_dir().join("fn2_fresh.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected fn2_fresh.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        ref_out.display(),
+        reflect.display(),
+        jar.display()
+    );
+    let reference = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java (real scalac build)");
+    assert!(
+        reference.status.success(),
+        "java Main (real-scalac build) failed for fn2_fresh: {}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    assert_eq!(
+        renumber_fresh_names(&String::from_utf8_lossy(&reference.stdout)),
+        renumber_fresh_names(&expected_stdout("fn2_fresh")),
+        "recorded expectation for fn2_fresh does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&ref_out);
+}
+
+/// A `_` with nothing to bind it is still refused, in both name spaces.
+///
+/// `q"_"` and `tq"_"` are errors in real scalac too ("unbound placeholder
+/// parameter", "unbound wildcard type"), so this is the same answer and not a
+/// gap: a `_` is a name only relative to the lambda or the applied type that
+/// binds it.
+#[test]
+fn fn2_fresh_bad_refuses_an_unbound_wildcard() {
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip fn2_fresh_bad: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("fn2_fresh_bad");
+    let output = compile_reflect("fn2_fresh_bad", &out, &jar, &reflect);
+    assert!(!output.status.success(), "expected fn2_fresh_bad to fail");
+    let err = diagnostics(&output);
+    for needle in [
+        "quasiquote q\"...\" (unbound placeholder parameter)",
+        "quasiquote tq\"...\" (a `_` type argument (an existential) is not reified yet)",
+    ] {
+        assert!(
+            err.contains(needle),
+            "expected {needle:?} in diagnostics, got {err}"
+        );
+    }
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// The renumbering itself: the comparison above is only as good as this is.
+#[test]
+fn renumber_fresh_names_keeps_binder_identity() {
+    // Order of first appearance, per line, from 1.
+    assert_eq!(
+        renumber_fresh_names("f(x$7, x$5, x$7)\n"),
+        "f(x$1, x$2, x$1)\n"
+    );
+    // Two lines do not share a numbering.
+    assert_eq!(renumber_fresh_names("a(_$4)\nb(_$9)\n"), "a(_$1)\nb(_$1)\n");
+    // Two distinct binders never collapse into one.
+    assert_ne!(
+        renumber_fresh_names("P(_$6, _$5)"),
+        renumber_fresh_names("P(_$6, _$6)")
+    );
+    // Names with no number after the `$` are left alone.
+    assert_eq!(
+        renumber_fresh_names("Select(x$pf, $colon$colon)"),
+        "Select(x$pf, $colon$colon)"
+    );
 }

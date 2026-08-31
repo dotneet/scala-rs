@@ -423,9 +423,7 @@ fn reify_qq_bad_names_every_form_it_cannot_build() {
         String::from_utf8_lossy(&output.stdout)
     );
     for needle in [
-        "a right-associative operator (`::`) is not reified yet",
         "an `if` without an `else` is not reified yet",
-        "a `_` placeholder function literal is not reified yet",
         "a `..$` splice mixed with ordinary arguments is not reified yet",
         "cannot stand for a single tree",
         "docs/macros.md",
