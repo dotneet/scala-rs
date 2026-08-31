@@ -1441,6 +1441,34 @@ companion module を作らず、`object Equiv` の implicit instance だけを�
 codegen が期待する erased descriptor `(Ljava/lang/Object;Ljava/lang/
 Object;)I` は変わりません。変わるのは型検査での**見え方**だけです。
 
+#### `new T` / `new A` の黙認（`agent/parentcheck` 残件、同じスライス）
+
+`agent/parentcheck`（上の節）が Remaining に残していた 2 形です。
+
+```scala
+def f[T] = new T   // scalac: class type required but T found
+trait X { type A; def f = new A }   // scalac: class type required but X.this.A found
+```
+
+`new` は SLS 5.3.2 でクラス型を要求しますが、型パラメータも（`=` の無い）抽象型メンバも
+クラス型ではありません。`check.rs` の `New { tpt }` の `Ident` 分岐（`new T` / `new A` の
+ような、型引数も修飾も無い裸の名前の形）は、`new_alias_target` が「エイリアスの右辺を
+構築する」変換を試みたあと、`found`（名前解決の結果）に `SymKind::Class` も型エイリアスも
+無ければそのまま `type_expr` に流していました。`found` が空でなければ「見つからなかった」
+扱いにもならないので、`new T` は黙って `Type::TypeParam` を、`new A` は黙って
+`Type::TypeMember` を身にまとった `new` 式になっていました。
+
+直したのは、`new_alias_target` が `None` を返した**あと**（＝ jar 由来のエイリアスは
+すでに一度 dealias を試されている）に、`found` の中身がなお `SymKind::TypeParam` /
+`SymKind::TypeMember` である symbol を探す 1 段です。**「解決済みで、かつクラスでない」**
+だけを見るので、`agent/parentcheck` の `strict_type_names`（「本当に見つからない」ときだけ
+発火し、jar 由来で遅れて解決される正当な型は素通りさせる）と同じ慎重さで、pickle から
+まだ読んでいない jar の型エイリアスを誤って「抽象型メンバ」と判定することはありません。
+
+メッセージは nsc の文面をそのまま再現します。型パラメータは裸の名前（`T`）、抽象型メンバは
+**`this` 修飾つき**（`X.this.A`）——nsc は無修飾の型メンバ参照を暗黙の `this.` 前置として
+表示するので、そこも合わせています（`Typer::class_type_required_name`）。
+
 ### 改行が文を切る条件（nsc `inLastOfStat` / `inFirstOfStat`）
 
 `crates/lexer/src/lib.rs` の `drop_non_separating_newlines` は nsc の Scanners と同じ規則で、
@@ -7306,10 +7334,8 @@ slick（`tests/slick_measure.sh`）は **`errors=257 files_with_errors=63` の�
 
 #### Remaining
 
-- `new T`（型パラメータ）/ `new A`（抽象型メンバ）は今も無言で通ります。scalac は
-  `class type required but T found` / `class type required but Q7.this.A found` です。
-  これは「未知の名前」ではなく「クラスでない型を構築した」別の検査で、このスライスの
-  対象外にしました。
+- ~~`new T`（型パラメータ）/ `new A`（抽象型メンバ）は今も無言で通ります。~~
+  `agent/eqtail`（後述）で直しました。
 - 修飾付きの名前は、`lookup_qualified_type` が失敗したとき**裸の名前**での再解決に
   フォールバックします（前置を模せない経路のため）。そのため `p.Foo` は、無関係な
   トップレベルの `Foo` が居ると今でもそれに束縛されます。診断が出るのは両方失敗した
@@ -7481,7 +7507,18 @@ companion object 自身は `Equiv` ではないことを固定します。私有
 修正前は黙って通っていた `Ordering[String].compare(1, 2)` / `Ordering[Int].compare("a",
 "b")` / `Ordering[String].lt(1, 2)` / `Ordering[String].max(1, 2)` が real scalac と
 同じ理由で拒まれることを固定します（`Ordering` 自体が `library_abi` 専用の手書き
-シンボルなので `--no-scala-library` のケースはありません）。slick のソースは
+シンボルなので `--no-scala-library` のケースはありません）。`new T` / `new A` の
+修正（`agent/parentcheck` 残件）のフィクスチャは `eq2_newtype` / `eq2_newtype_bad`
+です。`eq2_newtype.scala` は、修正後も壊れていないことを確認するための正常系
+（型パラメータへ**適用**した実在のクラス `new Box[T](value)`、型エイリアス経由の
+`new Self`（`type Self = ConcreteNamed`）で、jar の機能を使わないので**私有ランタイムと
+`--scala-library` の両方**で `java -Xverify:all` の下に走らせ、real scalac
+2.13.16 の実行結果とも diff します（`eq2_newtype_matches_real_scalac`）。
+`eq2_newtype_bad.scala` は、直す前は両モードで無言で通っていた `new Self`（宣言した
+trait 自身の中で、`=` の無い抽象型メンバを裸で参照）と `new T`（メソッド型パラメータ）を、
+`class type required but Named.this.Self found` / `class type required but T found`
+という real scalac そのままの文面で両モードとも拒否することを固定します
+（`eq2_newtype_bad_is_rejected_private_runtime` / `_scala_library`）。slick のソースは
 `Equiv` / `PartialOrdering` を参照していないので、`tests/slick_measure.sh` の数字は
 このスライスの前後で変わりません。
 

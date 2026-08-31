@@ -21,6 +21,16 @@
 //! `implicitly[PartialOrdering[Int]]` には real scalac にも instance が
 //! 無いので、階層辺を足しても summon できるようになってはいけない
 //! （`eq2_summon_bad` で確認）。
+//!
+//! 同じブランチ（`agent/parentcheck` 残件）で `new T`（型パラメータ）/
+//! `new A`（未エイリアスの抽象型メンバ）も直す。real scalac は
+//! `class type required but T found`（型パラメータ）/ `class type required
+//! but X.this.A found`（抽象型メンバ、実装のいらない `this` 修飾つき）で
+//! 拒否するが、scala-rs は黙って通していた。`check.rs` の `new` 式の
+//! `Ident` 分岐に「解決済みで、かつクラスでない」ときだけ発火する判定を足す
+//! （`new_alias_target` が dealias を試したあと、まだ `TypeParam` /
+//! `TypeMember` のままの symbol だけを見るので、jar 由来の type alias を
+//! 誤判定しない）。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -251,4 +261,104 @@ fn eq2_compare_bad_is_rejected() {
         );
     }
     let _ = fs::remove_dir_all(&out);
+}
+
+// -------------------------------------------------------------- eq2_newtype
+//
+// `new T` (a type parameter) and `new A` (an unaliased abstract type
+// member) both type-checked in scala-rs; real scalac rejects both with
+// "class type required but ... found". Unaffected: `new C[T](...)` (a real
+// class applied to a type parameter *argument*, not the `new` target
+// itself) and `new A` where `type A = SomeClass` is a genuine alias
+// (`new_alias_target` still handles that first).
+
+/// This program only exercises basics (constructors, an abstract-type
+/// alias) that do not need the scala-library jar, so it runs identically
+/// under both modes -- unlike `eq2_summon` / `eq2_compare`, which need real
+/// `Ordering` / `Equiv` instances.
+fn run_main_private(out: &Path) -> String {
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", out.to_str().unwrap(), "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        output.status.success(),
+        "java -Xverify:all -cp {} Main failed: {}",
+        out.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn eq2_newtype_private_runtime() {
+    if !java_available() {
+        return;
+    }
+    let out = tmp_dir("eq2_newtype-priv");
+    let (ok, msgs) = compile(&out, "eq2_newtype", &["--no-scala-library"]);
+    assert!(ok, "compile eq2_newtype (private) failed:\n{msgs}");
+    assert_eq!(
+        run_main_private(&out),
+        expected_stdout("eq2_newtype"),
+        "stdout mismatch for eq2_newtype (private runtime)"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn eq2_newtype_scala_library() {
+    jar_run("eq2_newtype");
+}
+
+#[test]
+fn eq2_newtype_matches_real_scalac() {
+    matches_real_scalac("eq2_newtype");
+}
+
+/// real scalac rejects both lines, in both modes: `Named.this.Self` (the
+/// abstract member, referenced from inside the trait that declares it, with
+/// no `=`) and `T` (a method type parameter) are neither one a class type.
+#[test]
+fn eq2_newtype_bad_is_rejected_private_runtime() {
+    let out = tmp_dir("eq2_newtype_bad-priv");
+    let (ok, msgs) = compile(&out, "eq2_newtype_bad", &["--no-scala-library"]);
+    assert!(
+        !ok,
+        "expected eq2_newtype_bad to be rejected (private runtime), got:\n{msgs}"
+    );
+    assert_newtype_bad_diagnostics(&msgs);
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn eq2_newtype_bad_is_rejected_scala_library() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip eq2_newtype_bad: jar not present");
+        return;
+    };
+    let out = tmp_dir("eq2_newtype_bad-lib");
+    let (ok, msgs) = compile(
+        &out,
+        "eq2_newtype_bad",
+        &["--scala-library", jar.to_str().unwrap()],
+    );
+    assert!(
+        !ok,
+        "expected eq2_newtype_bad to be rejected (scala-library), got:\n{msgs}"
+    );
+    assert_newtype_bad_diagnostics(&msgs);
+    let _ = fs::remove_dir_all(&out);
+}
+
+fn assert_newtype_bad_diagnostics(msgs: &str) {
+    for needle in [
+        "class type required but Named.this.Self found",
+        "class type required but T found",
+    ] {
+        assert!(
+            msgs.contains(needle),
+            "expected {needle:?} in diagnostics for eq2_newtype_bad, got:\n{msgs}"
+        );
+    }
 }
