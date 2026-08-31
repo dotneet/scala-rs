@@ -861,8 +861,8 @@ scala-rs のパーサは nsc が区別する形をいくつか正規化してし
 | `q"_.get"` | a `_` placeholder function literal is not reified yet | パーサが作るパラメータ名と、nsc の `freshTermName` が違う |
 | `tq"=> T"` | a by-name type is not reified yet | nsc のパーサ自身が `tq` の中では拒否する |
 | `q"f(a, ..$xs)"` | a `..$` splice mixed with ordinary arguments | 連結の静的型を両側とも正しく出す必要がある（§7.5 の 2） |
-| `q"class C"` など定義 | a class definition is not reified yet | `SyntacticClassDef` などが未実装 |
-| `q"{ lazy val a = 1 }"` | a modified `val` definition is not reified yet | `Modifiers` のフラグ変換が未実装 |
+| `q"class C"` など定義 | a class definition is not reified yet | `SyntacticClassDef` などが未実装（**§7.8 で入った**） |
+| `q"{ lazy val a = 1 }"` | a modified `val` definition is not reified yet | `Modifiers` のフラグ変換が未実装（**§7.8 で入った**） |
 | `q"{ $x }"` | （診断なし。既知の差） | パーサが `{ e }` を `e` に潰すので、単一の穴だけは nsc の `SyntacticBlock(List(x))` に対して `x` になる。意味は同じだが木は違う |
 
 #### ついでに直した一般の穴
@@ -914,3 +914,124 @@ error: no matching overload for SyntacticFunctionTypeExtractor
    同じ fast track マクロで、自前実装が要る。`TableQuery` の残り 6 件のうち
    3 件がこれ。
 6. **engine（フェーズ 2）。** マクロを*呼ぶ*ための JVM ブリッジ。
+
+### 7.8 定義の quasiquote（`agent/defquasi` スライス）
+
+§7.7 の残件 4。**`q"class C(...)"` / `q"case class C(...)"` / `q"trait T"` /
+`q"object O { ... }"` / `q"def f(...) = ..."` / 修飾つきの `q"lazy val a = 1"`
+のような定義が落とせるようになった。** 形はすべて実 scalac 2.13.16 の
+`-Ymacro-debug-lite` から読み取り、`tests/fixtures/dq_defs.scala` が
+**101 行ぶん `showRaw` まで実 scalac と突き合わせている**
+（`java -Xverify:all` で実行、完全一致）。実装は
+`crates/typer/src/reify_defs.rs`（`reify.rs` の `#[path]` 子モジュール。
+`agent/liftable` と同じファイルを触らないための分割で、`reify.rs` 側の変更は
+`mod` 宣言・`stat` の委譲・`term` の 2 アーム・`new_spine` の 1 フックだけ）。
+
+#### 落とせるようになった形
+
+| 形 | 落とす先 |
+| --- | --- |
+| `q"class C"` | `rs.SyntacticClassDef(mods, name, tparams, ctorMods, paramss, earlyDefs, parents, self, body)` |
+| `q"trait T"` | `rs.SyntacticTraitDef(mods, name, tparams, earlyDefs, parents, self, body)` |
+| `q"object O"` | `rs.SyntacticObjectDef(mods, name, earlyDefs, parents, self, body)` |
+| `q"def f = 1"` | `rs.SyntacticDefDef(mods, name, tparams, paramss, tpt, rhs)` |
+| `q"lazy val a = 1"` | `rs.SyntacticValDef(u.Modifiers(rs.FlagsRepr(2147483648L)), …)` |
+| `q"var x = 1"` | `rs.SyntacticVarDef(…)`（`MUTABLE` は残す） |
+| 末尾の implicit 節 | `rs.ImplicitParams(<残りの節>, <implicit 節>)` |
+| 型パラメータ | `u.TypeDef(u.Modifiers(PARAM \| 変位), u.TypeName("T"), Nil, u.TypeBoundsTree(lo, hi))` |
+| `q"new C(1) { ..$body }"` | `rs.SyntacticNew(Nil, List(<C(1)>), u.noSelfType, <body>)` |
+| `q"super.foo"` | `rs.SyntacticSelectTerm(u.Super(u.This(u.TypeName("")), u.TypeName("")), …)` |
+| `q"def f: Unit = {..$xs}"` | 右辺は `rs.SyntacticBlock(<xs>)` |
+| 穴 | 名前（`q"class $tname"`）、パラメータリスト（`..$params`）、型パラメータ、親（`extends ..$parents`）、本体（`{ ..$body }`） |
+
+#### `Modifiers` のフラグ変換が肝
+
+`Modifiers` が運ぶのは **`scala.reflect.internal.Flags` のビット**で、
+scala-rs のパーサの `Flags` とは**番号が違う**（`PRIVATE` はパーサでビット 0、
+nsc でビット 2）。値はすべて `-Ymacro-debug-lite` が印字する
+`FlagsRepr(<n>L)` から読み戻した:
+
+| 修飾子 | nsc のビット | 確認に使った形 |
+| --- | --- | --- |
+| `PROTECTED` / `OVERRIDE` / `PRIVATE` | `1<<0` / `1<<1` / `1<<2` | `protected def f = 1` ほか |
+| `ABSTRACT` / `DEFERRED` / `FINAL` | `1<<3` / `1<<4` / `1<<5` | `abstract class C` / `val a: Int` / `final class C` |
+| `INTERFACE` / `IMPLICIT` / `SEALED` | `1<<7` / `1<<9` / `1<<10` | `trait T` / `implicit val` / `sealed class C` |
+| `CASE` / `MUTABLE` / `PARAM` | `1<<11` / `1<<12` / `1<<13` | `case class C` / `var x = 1` / `def f(x: Int)` |
+| `COVARIANT` / `CONTRAVARIANT` | `1<<16` / `1<<17` | `class C[+T]` |
+| `LOCAL` | `1<<19` | `private[this] val x = 1` |
+| `CASEACCESSOR` | `1<<24` | `case class C(x: Int)` の `x` |
+| `TRAIT` ＝ `DEFAULTPARAM` | `1<<25` | `trait T` / `def f(x: Int = 1)` |
+| `PARAMACCESSOR` | `1<<29` | クラス・パラメータ |
+| `LAZY` | `1<<31` | `lazy val a = 1` |
+
+パラメータのフラグは**クラスか `def` かで違う**。`def` のパラメータは `PARAM`
+だけだが、クラス・パラメータは `PARAMACCESSOR` に加えて:
+
+- `case` クラスの**第 1 節**は `CASEACCESSOR`（第 2 節以降は普通の扱い）
+- `val` / `var` の無い非 `case` のパラメータは `PRIVATE | LOCAL`（メンバではない）
+- `var` は `MUTABLE` かつ `SyntacticVarDef`
+
+そして nsc の**パーサが補う親**も再現する: 親が書かれていなければ
+`rs.ScalaDot(u.TypeName("AnyRef"))`、`case` なら書かれた親のうしろに
+`rs.ScalaDot(Product)` と `rs.ScalaDot(Serializable)`（`case` のときは `AnyRef`
+を補わない）。
+
+#### パーサが潰す区別を、また元のソース文字列で戻す
+
+- **`class C` と `class C {}`。** 本体が空でも、波括弧が書かれていれば nsc の
+  body は `List(u.EmptyTree)`、書かれていなければ `List()` である。パーサは
+  どちらも `body: []` にするので、定義の span のテキストが `}` で終わるかで決める。
+- **`def f = {..$xs}` と `def f = $x`。** パーサは `{ e }` を `e` に潰すので、
+  右辺の直前のテキストが `{` で終わるかで `SyntacticBlock` に包むかを決める。
+- **手続き構文 `def f() { … }`。** nsc は結果型に `_root_.scala.Unit` を補うが、
+  パーサは型を空のままにする。右辺の手前に `=` があるかで見分け、無ければ拒否する。
+
+#### 落とせない形は名指しで診断する（`tests/fixtures/dq_defs_bad.scala`）
+
+| 形 | 診断 | 理由 |
+| --- | --- | --- |
+| `q"class C { self => … }"` | a self type … | 本体が空のときの `List(EmptyTree)` と区別できない |
+| `q"class C extends { val x = 1 } with D"` | an early definition … | nsc の `PRESUPER` はビット 37 で、パーサのフラグ語（32 ビット）に無い |
+| `q"private[foo] val x = 1"` | a qualified access modifier (`private[X]`) … | `Modifiers` の名前欄。フラグしか運んでいない |
+| `q"def f(x: => Int) = x"` | a by-name parameter … | nsc の型は `_root_.scala.<byname>[T]`、パーサはフラグ |
+| `q"def f(x: Int*) = x"` | a repeated parameter (`T*`) … | 同上（`<repeated>`） |
+| `q"def f() { 1 }"` | procedure syntax … | 上記 |
+| `q"def f()"` | a `def` with neither a result type nor a body … | nsc は `_root_.scala.Unit` を補う |
+| `q"{ val (a, b) = e; a }"` | a pattern definition … | パーサが 3 つの定義に脱糖する。nsc は 1 つの `SyntacticPatDef` |
+| `q"class C[F[_]]"` | a higher-kinded type parameter … | 入れ子の型パラメータ |
+| `q"def f[T: Ordering] = 1"` | a context bound (`T : C`) … | nsc の脱糖はパーサではなく typer |
+| `q"case class C(x: Int) extends ..$parents"` | a `case` class whose parents are a `..$` splice … | `Product with Serializable` の連結が要る |
+| `q"def f(implicit x: Int)(y: Int) = y"` | an implicit parameter clause that is not the last … | `ImplicitParams` は末尾の 1 節だけ |
+| `q"def f = macro Impl.f"` | a `macro` definition … | 右辺が式ではない |
+| `q"def f(x: Bar[_]) = x"` | a `_` type argument (an existential) … | nsc は `freshTypeName` で名前を作り、呼び出しの外側のブロックに束ねる |
+
+#### ついでに直した一般の穴
+
+| 直したもの | どこ |
+| --- | --- |
+| **`{ case class X(…); … }` が部分関数と誤読されていた。** ブロックの先頭の `case` は、次が `class` / `object` なら**修飾子**であって節の始まりではない。ローカルの `case class` を持つブロックが `expected pattern, found class` になっていた | `Parser::parse_block_expr` |
+
+#### slick への効き方
+
+`tests/slick_measure.sh`（scala-reflect.jar 入り）で `errors=237 → 237`。
+**数字は動かない。** `ShapedValue.mapToImpl` の 15 行のエラーは
+`symbolOf` / `Liftable`（`$uTag` / `$rTag` が `WeakTypeTag`）/
+`_` プレースホルダ関数リテラルで落ちており、定義の形はそのどれでもない。
+ただし本体の巨大な `q"""…"""`（`case class` ではなく `val` 3 つと、本体つきの
+`new … { ..$fpChildren; override def read … }`）は、このスライスで
+**`super` と `{..$xs}` の右辺まで通るようになり、残る唯一の障害が
+`ProductResultConverter[_, _, _, _]` の `_` 型引数（存在型）になった**。
+つまり `ShapedValue` の `q"""…"""` の次の一手は §7.7 と同じ性質の
+「nsc が `fresh*Name` を使う形」であり、定義ではない。
+
+#### このスライスのあとに残っているもの（§7.7 の一覧の更新）
+
+1. **`Liftable`**（変わらず。`ShapedValue` の主要因）
+2. **`_` プレースホルダ / 右結合演算子 / `_` 型引数（存在型）。** いずれも nsc が
+   `freshTermName` / `freshTypeName` を使ったブロックを作る形で、同じ形を作るなら
+   `rs.freshTypeName("_$")` を呼ぶブロックごと組む必要がある。
+   `ShapedValue` の `q"""…"""` はこれ 1 つで止まっている
+3. **`..$` と普通の引数の混在**、および**期待型からの型パラメータ推論**（§7.5）
+4. **`q"{ type T = Int }"`**（`SyntacticTypeDef`）
+5. **`reify { … }` と `typeOf[T]` / `symbolOf[T]`**
+6. **engine（フェーズ 2）**

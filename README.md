@@ -166,13 +166,23 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
   そして `q"..."` の型注釈 / eta 展開（`f _`）/ 型適用 / ブロックと `val` 定義 /
   `new` / `match` / 部分関数 `{ case … }` / 関数リテラル / `this` / 代入 /
   `if`-`else` / タプル**。演算子名は `NameTransformer` で符号化する。
+  **定義**も落とせる（`crates/typer/src/reify_defs.rs`）: `class` / `case class` /
+  `trait` / `object` / `def` / 修飾つきの `val`・`var`（`SyntacticClassDef` /
+  `SyntacticTraitDef` / `SyntacticObjectDef` / `SyntacticDefDef` /
+  `SyntacticValDef` / `SyntacticVarDef`）。`Modifiers` のフラグは
+  `scala.reflect.internal.Flags` のビット（パーサの番号とは**別物**）に翻訳し、
+  nsc のパーサが補う親（`AnyRef`、`case` なら `Product with Serializable`）と
+  クラス・パラメータのアクセサ・フラグ（`PARAMACCESSOR` / `CASEACCESSOR` /
+  `PRIVATE | LOCAL`）、末尾の implicit 節（`ImplicitParams`）、
+  匿名クラスの本体（`new C { … }`）まで再現する。
   形はすべて実 scalac 2.13.16 の `-Ymacro-debug-lite` から読み取り、
   `showRaw` まで実 scalac と一致することを確認している。**落とせない形は必ず
   `unimplemented syntax: quasiquote q"..." (どの形か)` で診断する**（黙って通さない）。
   残っているのは、パーサが nsc の保つ区別ごと正規化してしまう形
-  （右結合演算子 `a :: b`、`else` の無い `if`、`_` プレースホルダ、by-name 型）と、
-  `..$` と普通の引数の混在、`class` / `def` 定義
-  （[`docs/macros.md`](docs/macros.md) §7.4 / §7.7）
+  （右結合演算子 `a :: b`、`else` の無い `if`、`_` プレースホルダ、by-name 型、
+  by-name / 可変長パラメータ、手続き構文 `def f() { … }`、パターン定義、
+  自分型、early definition）と、`..$` と普通の引数の混在、`type` 定義
+  （[`docs/macros.md`](docs/macros.md) §7.4 / §7.7 / §7.8）
 - **`-cp` から読んだクラスとトレイト**: `-cp` の classfile から読んだ Scala の
   トレイトは**インタフェース**として扱い（`ACC_INTERFACE` を読む）、
   **親はヘッダの `super_class` / `interfaces`** から付ける。以前は前者が無くて
@@ -2961,14 +2971,17 @@ implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラー
   `cq"..."` は `internal.reificationSupport.Syntactic*` の呼び出しに落として
   実行でき、型注釈 / eta 展開 / ブロックと `val` / `new` / `match` / 部分関数 /
   関数リテラル / 型・パターン・`case` 節まで**実 scalac 2.13.16 と `showRaw` が
-  一致**します（`tests/fixtures/qr_forms.scala`）。残っているのは
+  一致**します（`tests/fixtures/qr_forms.scala`）。定義（`class` / `case class` /
+  `trait` / `object` / `def` / 修飾つき `val`・`var`）も同じく一致します
+  （`tests/fixtures/dq_defs.scala`、93 行）。残っているのは
   **`Liftable`**（`Tree` でない穴 — `WeakTypeTag` / `Name` / `Int` — の持ち上げ）、
   パーサが nsc の保つ区別ごと正規化してしまう形（右結合演算子 `a :: b`、
-  `else` の無い `if`、`_` プレースホルダ、by-name 型）、`..$` と普通の引数の混在、
-  `class` / `def` 定義、そして `reify { … }` です。いずれも
+  `else` の無い `if`、`_` プレースホルダ、by-name 型、by-name / 可変長パラメータ、
+  手続き構文、パターン定義、自分型、early definition）、`..$` と普通の引数の混在、
+  `type` 定義、そして `reify { … }` です。いずれも
   `unimplemented syntax: quasiquote ... (どの形か)` と**その形を名指しして**
   報告します（黙って通しません）。何が要るかは
-  [`docs/macros.md`](docs/macros.md) §7.7 に列挙しました。
+  [`docs/macros.md`](docs/macros.md) §7.7 / §7.8 に列挙しました。
   slick の `ShapedValue.mapToImpl` は、scala-reflect.jar を `-cp` に置くと
   形の診断が 11 件 → 4 件になり、8 つの型注釈が落ちる理由は
   「形が無い」ではなく `$uTag` / `$rTag` が `WeakTypeTag` で `Tree` でないこと
@@ -4003,7 +4016,9 @@ quasiquote と、その受け皿である reflect ABI の下地は `crates/cli/t
 
 同じファイルの後半（接頭辞 `qq`）は **scala-reflect.jar が `-cp` にあるとき**の reflect universe とマクロ `Context` です。`tests/fixtures/qq_universe.scala` は `qq_universe_wildcard_import_reaches_inherited_members`（`java -Xverify:all` で実行し `expected/qq_universe.txt` と一致）と `qq_universe_matches_real_scalac`（**実 scalac 2.13.16** と三者一致）の 2 通りで回し、`import <universe>._` が継承メンバ（`TermName` / `TypeName` / `Constant` / `Literal` / `EmptyTree` / `termNames` / `NoSymbol`）を値としても型としても持ち込むこと、メソッドローカルの `import u._` の prefix がそのメソッドの外に漏れないこと、そして `showRaw` まで含めて**同じ木**ができることを固定します。`tests/fixtures/qq_ctx.scala` は**マクロ実装そのもの**で、`qq_ctx_macro_implementation_compiles` が scala-rs と実 scalac の両方でコンパイルできること、吐いた classfile が JVM にロード・検証されること（`java -Xverify:all` + `Class.forName`）を見ます（展開には engine が要るので実行はしません）。異常系 `qq_ctx_bad.scala` は `qq_ctx_bad_names_every_form_it_cannot_build` が、reify できない形（右結合演算子・`else` の無い `if`・`_` プレースホルダ・by-name 型）を**その形の名前つきで**診断すること、`Tree` でない穴が型エラーになることを見ます。`qq_ctx_without_scala_reflect_is_diagnosed` は scala-reflect.jar が無いときに空の `Context`（`crates/typer/src/prelude_reflect.rs`）のまま `value universe is not a member of Context` と言うことを固定します。
 
-接頭辞 `qr` は **reification の残りの形**（`docs/macros.md` §7.7）です。`tests/fixtures/qr_forms.scala` は `tq"..."` / `pq"..."` / `cq"..."` と `q"..."` の型注釈・eta 展開（`f _`）・型適用・ブロックと `val` 定義・`new`（カリー化コンストラクタ含む）・`match`・部分関数 `{ case … }`・関数リテラル・`this`・代入・`if`-`else`・演算子名の符号化・名前の位置の穴を **56 行ぶん `showRaw` で印字**し、`qr_forms_reifies_the_remaining_shapes`（`java -Xverify:all` で実行して `expected/qr_forms.txt` と一致）と `qr_forms_matches_real_scalac`（**実 scalac 2.13.16** と三者一致）の 2 通りで回します。同じファイルの末尾は、オーバーロード集合になっている木のファクトリ（`Ident(TermName("x"))` / `Bind` / `This` / `New`。slick の `TableQuery` のマクロ実装はこれだけで書かれている）が通り、JVM の検証も通ることを見ます。異常系 `qr_forms_bad.scala` は `qr_forms_bad_names_every_form_it_cannot_build` が、パーサが nsc の保つ区別ごと正規化してしまう形（右結合演算子・`else` の無い `if`・`_` プレースホルダ・by-name 型・`..$` と普通の引数の混在・`class` 定義・修飾つき `val`）を**その形の名前つきで**診断することを固定します。
+接頭辞 `qr` は **reification の残りの形**（`docs/macros.md` §7.7）です。`tests/fixtures/qr_forms.scala` は `tq"..."` / `pq"..."` / `cq"..."` と `q"..."` の型注釈・eta 展開（`f _`）・型適用・ブロックと `val` 定義・`new`（カリー化コンストラクタ含む）・`match`・部分関数 `{ case … }`・関数リテラル・`this`・代入・`if`-`else`・演算子名の符号化・名前の位置の穴を **56 行ぶん `showRaw` で印字**し、`qr_forms_reifies_the_remaining_shapes`（`java -Xverify:all` で実行して `expected/qr_forms.txt` と一致）と `qr_forms_matches_real_scalac`（**実 scalac 2.13.16** と三者一致）の 2 通りで回します。同じファイルの末尾は、オーバーロード集合になっている木のファクトリ（`Ident(TermName("x"))` / `Bind` / `This` / `New`。slick の `TableQuery` のマクロ実装はこれだけで書かれている）が通り、JVM の検証も通ることを見ます。異常系 `qr_forms_bad.scala` は `qr_forms_bad_names_every_form_it_cannot_build` が、パーサが nsc の保つ区別ごと正規化してしまう形（右結合演算子・`else` の無い `if`・`_` プレースホルダ・by-name 型・`..$` と普通の引数の混在・`type` 定義）を**その形の名前つきで**診断することを固定します。
+
+接頭辞 `dq` は **定義の reification**（`docs/macros.md` §7.8）です。`tests/fixtures/dq_defs.scala` は `class` / `case class` / `trait` / `object` / `def` / 修飾つきの `val`・`var`、クラス・パラメータのアクセサ・フラグ（`PARAMACCESSOR` / `CASEACCESSOR` / `PRIVATE | LOCAL`）、implicit 節（`ImplicitParams`）、型パラメータと変位・境界、nsc が補う親（`AnyRef` と `case` の `Product with Serializable`）、定義を含むブロック、匿名クラスの本体（`new C(1) { … }`）、そして名前・パラメータリスト・親・本体の位置の穴を **93 行ぶん `showRaw` で印字**し、`dq_defs_reifies_definitions`（`java -Xverify:all` で実行して `expected/dq_defs.txt` と一致）と `dq_defs_matches_real_scalac`（**実 scalac 2.13.16** と三者一致）の 2 通りで回します。異常系 `dq_defs_bad.scala` は `dq_defs_bad_names_every_form_it_cannot_build` が、13 の落とせない形（自分型・early definition・`private[X]`・by-name パラメータ・可変長パラメータ・手続き構文・型も本体も無い `def`・パターン定義・高階型パラメータ・context bound・`case` クラスの親の `..$`・末尾でない implicit 節・`macro` 定義）を**その形の名前つきで**診断することを固定します。
 
 def マクロは `crates/cli/tests/macros.rs` にまとめています。呼ばれない macro def のコンパイルと、`Sugar$.class` にメソッドが出ていないことは `macro_def.scala`。マクロ呼び出しの診断は `macro_call_bad.scala`（`macro expansion is not implemented`）。戻り値型の無いマクロ def は `macro_no_result_type_bad.scala`。`Context` を第 1 引数に取らない実装は `macro_impl_shape_bad.scala`。解決できない実装参照は `macro_impl_missing_bad.scala`。whitebox は `macro_whitebox_bad.scala`。設計は [`docs/macros.md`](docs/macros.md)。
 
@@ -4042,7 +4057,9 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 | `qq_universe.scala`（`crates/cli/tests/quasi.rs`、scala-reflect.jar が要る） | `import <universe>._` が継承メンバを値・型の両方で持ち込むこと、メソッドローカル import の prefix がスコープを越えないこと、`showRaw` まで実 scalac 2.13.16 と一致すること | `hi` `T` `Constant(42)` `42` `<empty>` `<init>` `<none>` `Literal(Constant("s"))` `local/Local` `n N Constant(7) 7` ほか `showRaw` 4 行 |
 | `qq_ctx.scala` / `qq_ctx_bad.scala`（同上、コンパイルのみ） | マクロ実装のシグネチャ `c.Tree` / `c.Expr[T]` / `c.WeakTypeTag[T]`（精製 `Context` からも）と本体の `import c.universe._` + `q"..."`。scala-rs と実 scalac の両方が通し、classfile は `java -Xverify:all` でロード・検証される。異常系は reify できない形を名指しで診断 | （コンパイル結果のみ） |
 | `qr_forms.scala`（`crates/cli/tests/quasi.rs`、scala-reflect.jar が要る） | reification の残りの形（実 scalac 2.13.16 と三者一致、`showRaw` まで）: `tq` / `pq` / `cq` 全体と `q` の型注釈 / eta / 型適用 / ブロック / `val` / `new` / `match` / 部分関数 / 関数リテラル / `this` / 代入 / `if` / 演算子名の符号化。末尾はオーバーロード集合の木ファクトリ（`Ident(TermName("x"))` ほか） | `expected/qr_forms.txt`（56 行） |
-| `qr_forms_bad.scala`（同上） | パーサが区別ごと正規化してしまう形が、必ず名指しで診断されること（右結合演算子 / `else` の無い `if` / `_` プレースホルダ / by-name 型 / `..$` の混在 / `class` 定義 / 修飾つき `val`） | （診断のみ） |
+| `qr_forms_bad.scala`（同上） | パーサが区別ごと正規化してしまう形が、必ず名指しで診断されること（右結合演算子 / `else` の無い `if` / `_` プレースホルダ / by-name 型 / `..$` の混在 / `type` 定義） | （診断のみ） |
+| `dq_defs.scala`（`crates/cli/tests/quasi.rs`、scala-reflect.jar が要る） | 定義の reification（実 scalac 2.13.16 と三者一致、`showRaw` まで）: `class` / `case class` / `trait` / `object` / `def` / 修飾つき `val`・`var`、`Modifiers` のフラグ、クラス・パラメータのアクセサ・フラグ、implicit 節、型パラメータと変位・境界、nsc が補う親、定義を含むブロック、匿名クラスの本体、名前・パラメータ・親・本体の位置の穴 | `expected/dq_defs.txt`（93 行） |
+| `dq_defs_bad.scala`（同上） | 定義のうち落とせない 13 形が、必ず名指しで診断されること（自分型 / early definition / `private[X]` / by-name・可変長パラメータ / 手続き構文 / 型も本体も無い `def` / パターン定義 / 高階型パラメータ / context bound / `case` クラスの親の `..$` / 末尾でない implicit 節 / `macro` 定義） | （診断のみ） |
 
 `mism2.scala` は `crates/cli/tests/mismatch2.rs` から回します。同ファイルには最小形の
 受理テスト（`a_default_argument_may_name_a_later_units_member` /
@@ -5814,17 +5831,25 @@ error: value += is not a member of T
   `internal.reificationSupport.Syntactic*` に落として実行できる
   （`crates/typer/src/reify.rs`、実 scalac と dual-run 済み）。宣言クラスでの呼び出しも
   済んでいて、`scala.reflect.runtime.universe` 上の Tree 構築は実際に走る。
-  残るのは `docs/macros.md` §7.5 の 5 つ:
-  (a) `tq` / `pq` / `cq` 全体、
-  (b) `q` の残りの形（ブロック / `new` / 関数リテラル / `if` / `match` / 型注釈 /
-  定義 / `this` / `super`）、
-  (c) `..$` と普通の引数の混在（`q"f(a, ..$xs)"`）、
-  (d) `Liftable`（`$x` の `x` が `Tree` でないとき nsc は implicit で持ち上げる。
+  `tq` / `pq` / `cq` 全体と `q` の残りの形（§7.7）、そして**定義**
+  （`class` / `case class` / `trait` / `object` / `def` / 修飾つき `val`・`var`。
+  §7.8、`crates/typer/src/reify_defs.rs`）も入った。残るのは:
+  (a) `..$` と普通の引数の混在（`q"f(a, ..$xs)"`）、
+  (b) `Liftable`（`$x` の `x` が `Tree` でないとき nsc は implicit で持ち上げる。
   `mapToImpl` は `$rTag` / `${c.prefix}` でこれを使う）、
-  (e) `c.Expr[T]` のようなパス依存型 — いまは `prelude_reflect.rs` が**空の `Context`** を
-  入れており、classpath 上の本物より優先されてしまう。マクロ実装の*中で*
-  quasiquote を書くにはこれが要る。
+  (c) `_` プレースホルダ関数リテラル・右結合演算子・`else` の無い `if`・
+  by-name / 可変長パラメータ・手続き構文・パターン定義・自分型・early definition・
+  `type` 定義（いずれもパーサが nsc の保つ区別ごと正規化してしまう形）、
+  (d) 展開器（engine）そのもの。
   落とせない形は**すべて `unimplemented syntax: quasiquote ...` で診断する**
+- **ローカルな `case class` のコンパニオン**。メソッド本体で宣言した
+  `case class P(a: Int)` は、クラス `Main$P$1` は出るが**コンパニオン
+  `Main$P$1$` を出していない**ので、`P(1)`（合成 `apply`）が実行時に
+  `NoClassDefFoundError` になる。型検査は通ってしまう既存のバグで、
+  `agent/defquasi` が `{ case class X(…); … }` を**パースできる**ように
+  したことで新しい綴りからも届くようになった（バグ自体は以前からある。
+  `{ … }` の先頭でない `case class` は元から同じ経路）。`case object` と
+  ローカルな非 `case` クラスは正しく出ている
 - **`import <値>._` のスコープ**。プレフィクスが値のときの書き戻し
   (`term_import_prefixes`) はコンパイル単位をまたいで持ち越される。名前が
   そのクラスのメンバに解決できたときだけ使うので実害は見ていないが、

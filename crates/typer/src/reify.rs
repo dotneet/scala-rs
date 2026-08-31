@@ -33,6 +33,12 @@ use scala_rs_span::Span;
 use crate::quasiquote::{hole_index, QuasiKind};
 use crate::uncurry::is_eta_marker;
 
+/// Definitions -- `class`, `trait`, `object`, `def`, `val` -- live in their
+/// own file. It is a child module rather than a sibling so it can use the
+/// building blocks below without any of them becoming visible crate-wide.
+#[path = "reify_defs.rs"]
+mod defs;
+
 /// The `Modifiers` flag set nsc gives a function literal's parameter
 /// (`Flags.PARAM`, `1 << 13`). Read off `-Ymacro-debug-lite` for
 /// `q"(y: Int) => y"`, which reifies the parameter as
@@ -218,7 +224,11 @@ impl<'a> Reifier<'a> {
                 self.universe_member("This"),
                 vec![self.type_name(qual.as_deref().unwrap_or(""))],
             )),
-            TreeKind::ValDef { .. } => self.stat(t),
+            TreeKind::Super { qual, mix } => Ok(self.super_ref(qual.as_deref(), mix.as_deref())),
+            TreeKind::ValDef { .. }
+            | TreeKind::DefDef { .. }
+            | TreeKind::ClassDef { .. }
+            | TreeKind::ModuleDef { .. } => self.definition(t),
             other => Err(format!("{} is not reified yet", describe(other))),
         }
     }
@@ -231,6 +241,11 @@ impl<'a> Reifier<'a> {
     /// through `Apply` instead would put the `SyntacticApplied` *outside* the
     /// `SyntacticNew`, which is a different tree.
     fn new_spine(&self, t: &Tree) -> Result<Option<Tree>, String> {
+        // `new C { ... }` is an anonymous class after parsing; nsc keeps the
+        // parents and the body in the `SyntacticNew` itself.
+        if let Some(t) = self.anon_new(t)? {
+            return Ok(Some(t));
+        }
         let mut clauses: Vec<&Vec<Tree>> = Vec::new();
         let mut cur = t;
         loop {
@@ -333,30 +348,9 @@ impl<'a> Reifier<'a> {
     }
 
     /// One statement of a block: a definition, or an ordinary term.
+    /// `crates/typer/src/reify_defs.rs` holds the definitions.
     fn stat(&self, t: &Tree) -> Result<Tree, String> {
-        match &t.kind {
-            TreeKind::ValDef {
-                mods,
-                name,
-                tpt,
-                rhs,
-            } => {
-                if mods.flags != scala_rs_parser::Flags::EMPTY || !mods.annotations.is_empty() {
-                    return Err("a modified `val` definition is not reified yet".to_string());
-                }
-                let r = self.term(rhs)?;
-                Ok(self.call(
-                    self.support_member("SyntacticValDef"),
-                    vec![
-                        self.mods(0),
-                        self.term_name_or_hole(name)?,
-                        self.type_or_empty(tpt)?,
-                        r,
-                    ],
-                ))
-            }
-            _ => self.term(t),
-        }
+        self.definition(t)
     }
 
     // -- types -------------------------------------------------------------
@@ -880,6 +874,10 @@ fn describe_type(k: &TreeKind) -> &'static str {
     match k {
         TreeKind::ExistentialTypeTree { .. } => "an existential type",
         TreeKind::AnnotatedTypeTree { .. } => "an annotated type",
+        // The parser turns a `_` type argument into the existential's bound
+        // type parameter. nsc names those with `freshTypeName` and binds them
+        // in a block around the call, so the names -- and the trees -- differ.
+        TreeKind::TypeDef { .. } => "a `_` type argument (an existential)",
         TreeKind::Wildcard => "a wildcard type",
         TreeKind::Function { .. } => "a by-name type",
         _ => describe(k),

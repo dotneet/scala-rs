@@ -667,8 +667,146 @@ fn qr_forms_bad_names_every_form_it_cannot_build() {
         "a `_` placeholder function literal is not reified yet",
         "a by-name type is not reified yet",
         "a `..$` splice mixed with ordinary arguments is not reified yet",
-        "a class definition is not reified yet",
-        "a modified `val` definition is not reified yet",
+        "a type definition is not reified yet",
+    ] {
+        assert!(
+            err.contains(needle),
+            "expected {needle:?} in diagnostics, got {err}"
+        );
+    }
+    let _ = fs::remove_dir_all(&out);
+}
+
+// -- definitions (`agent/defquasi`) ---------------------------------------
+
+/// `tests/fixtures/dq_defs.scala`: `class` / `case class` / `trait` /
+/// `object` / `def` / a modified `val`, reified.
+///
+/// The whole point is the `Modifiers`, which carry
+/// `scala.reflect.internal.Flags` bits that are *not* the parser's numbering
+/// (`PRIVATE` is bit 2 there and bit 0 in the parser), plus the parents nsc's
+/// parser supplies for a source that does not write them -- `AnyRef`, and
+/// `Product with Serializable` for every `case` class. Getting either wrong
+/// builds a definition nobody wrote, which is why this compares `showRaw`.
+#[test]
+fn dq_defs_reifies_definitions() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip dq_defs: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("dq_defs");
+    let output = compile_reflect("dq_defs", &out, &jar, &reflect);
+    assert!(
+        output.status.success(),
+        "compile dq_defs failed: {}",
+        diagnostics(&output)
+    );
+    let cp = format!("{}:{}:{}", out.display(), reflect.display(), jar.display());
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        run.status.success(),
+        "java -Xverify:all Main failed for dq_defs: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        expected_stdout("dq_defs"),
+        "stdout mismatch for dq_defs"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// The same fixture through real scalac 2.13.16, so the recorded expectation
+/// is nsc's tree and not merely ours.
+#[test]
+fn dq_defs_matches_real_scalac() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(reflect), Some(scalac)) =
+        (scala_library_jar(), scala_reflect_jar(), find_scalac())
+    else {
+        eprintln!("skip dq_defs scalac diff: scalac / jars not obtainable");
+        return;
+    };
+    let ref_out = tmp_dir("dq_defs-scalac");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            ref_out.to_str().unwrap(),
+            fixtures_dir().join("dq_defs.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected dq_defs.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        ref_out.display(),
+        reflect.display(),
+        jar.display()
+    );
+    let reference = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java (real scalac build)");
+    assert!(
+        reference.status.success(),
+        "java Main (real-scalac build) failed for dq_defs: {}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&reference.stdout),
+        expected_stdout("dq_defs"),
+        "recorded expectation for dq_defs does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&ref_out);
+}
+
+/// The definition forms reification still refuses, each named.
+///
+/// Every one of these is a place where the parser has normalised away
+/// something nsc keeps -- braces around an empty body, a by-name or repeated
+/// parameter's type, the `=` that separates procedure syntax from a result
+/// type, a pattern definition -- or a flag that does not fit the parser's word
+/// (`PRESUPER` is bit 37). Building anything at all would build a definition
+/// nobody wrote.
+#[test]
+fn dq_defs_bad_names_every_form_it_cannot_build() {
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip dq_defs_bad: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("dq_defs_bad");
+    let output = compile_reflect("dq_defs_bad", &out, &jar, &reflect);
+    assert!(!output.status.success(), "expected dq_defs_bad to fail");
+    let err = diagnostics(&output);
+    for needle in [
+        "a self type (`class C { self => ... }`) is not reified yet",
+        "an early definition (`extends { val x = 1 } with T`) is not reified yet",
+        "a qualified access modifier (`private[X]`) is not reified yet",
+        "a by-name parameter is not reified yet",
+        "a repeated parameter (`T*`) is not reified yet",
+        "procedure syntax (`def f() { ... }`) is not reified yet",
+        "a `def` with neither a result type nor a body is not reified yet",
+        "a pattern definition (`val (a, b) = ...`) is not reified yet",
+        "a higher-kinded type parameter is not reified yet",
+        "a context bound (`T : C`) is not reified yet",
+        "a `case` class whose parents are a `..$` splice is not reified yet",
+        "an implicit parameter clause that is not the last is not reified yet",
+        "a `macro` definition is not reified yet",
+        "a `_` type argument (an existential) is not reified yet",
     ] {
         assert!(
             err.contains(needle),

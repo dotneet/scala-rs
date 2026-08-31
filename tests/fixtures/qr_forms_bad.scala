@@ -29,9 +29,10 @@ object QrFormsBad {
   val mixed = q"f(a, ..$xs)"
   val mixedStats = q"{ a; ..$xs }"
 
-  // Definitions other than a plain `val`.
-  val cls = q"class C"
-  val lazyVal = q"{ lazy val a = 1; a }"
+  // Definitions are reified now (`tests/fixtures/dq_defs.scala`); what is
+  // still refused among them is in `tests/fixtures/dq_defs_bad.scala`. A
+  // `type` definition is the one left over here.
+  val typeDef = q"{ type T = Int; 1 }"
 
   // `cq"..."` is one clause and is written without its `case`.
   val twoCases = cq"case a => b"
