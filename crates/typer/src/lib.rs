@@ -76,7 +76,7 @@ pub use erasure::{erase, erase_type, note_source_value_classes};
 pub use lambda_lift::lambda_lift;
 pub use lazy_local::lazy_locals;
 pub use lin::{is_interface, linearize, trait_superclass};
-pub use localobj::check_local_objects;
+pub use localobj::{check_local_case_class_captures, check_local_objects};
 pub use symbol::{Intrinsic, MacroBinding, SamSig, SymKind, Symbol, SymbolTable};
 pub use uncurry::uncurry;
 

@@ -18,6 +18,7 @@
 
 use std::collections::HashSet;
 
+use scala_rs_parser::ast::Flags;
 use scala_rs_parser::{SymbolId, Tree, TreeKind};
 use scala_rs_span::Diagnostic;
 
@@ -30,6 +31,66 @@ pub fn check_local_objects(file_index: usize, tree: &Tree, st: &SymbolTable) -> 
     let mut out = Vec::new();
     walk(file_index, tree, st, &mut out);
     out
+}
+
+/// A local `case class` whose synthetic companion would need to capture an
+/// enclosing-method local.
+///
+/// `P(args)` compiles to a call through the companion's `apply`
+/// (`crates/backend/src/gen.rs`, `emit_case_apply`), and the companion is
+/// emitted as a static `MODULE$` singleton
+/// (`crates/backend/src/gen.rs`, `emit_case_companion`) exactly like any
+/// other local `object` -- the same shape `check_local_objects` above refuses
+/// once its body reads outside itself. A case class's companion has no body
+/// in source for that check to walk (it is synthesized, not written), so this
+/// is a second, narrower check: run *after* `mark_anon_captures` has filled
+/// in `Symbol::captures`, and refuse a local case class whose free-variable
+/// list is non-empty. Until the companion gets the same `LazyRef` treatment a
+/// capturing local `object` would need, `P(1)` for such a class would type-check
+/// and then throw `NoSuchMethodError` building the real `<init>` at run time
+/// (the class itself does correctly gain a capture constructor parameter; only
+/// the companion's `apply` never learns to supply it).
+pub fn check_local_case_class_captures(
+    file_index: usize,
+    tree: &Tree,
+    st: &SymbolTable,
+) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk_case_captures(file_index, tree, st, &mut out);
+    out
+}
+
+fn walk_case_captures(file_index: usize, tree: &Tree, st: &SymbolTable, out: &mut Vec<Diagnostic>) {
+    if let TreeKind::ClassDef { name, mods, .. } = &tree.kind {
+        if mods.flags.contains(Flags::CASE)
+            && !tree.sym.is_none()
+            && is_local_case_class(st, tree.sym)
+            && !st.get(tree.sym).captures.is_empty()
+        {
+            out.push(Diagnostic::error(
+                file_index,
+                tree.span,
+                format!(
+                    "not implemented: a local `case class {name}` that reads a local \
+                     of the enclosing method (its synthetic companion would have to \
+                     capture it too, the same shape a local `object` needs and cannot \
+                     get yet). Move it out of the method, or drop `case` and write an \
+                     ordinary local `class`."
+                ),
+            ));
+        }
+    }
+    each_child(tree, &mut |c| walk_case_captures(file_index, c, st, out));
+}
+
+/// A `class` written inside a method body: owned by the method (or by a
+/// `val` inside one), not by a template.
+fn is_local_case_class(st: &SymbolTable, id: SymbolId) -> bool {
+    let owner = st.get(id).owner;
+    if owner.is_none() {
+        return false;
+    }
+    matches!(st.get(owner).kind, SymKind::Method | SymKind::Term)
 }
 
 fn walk(file_index: usize, tree: &Tree, st: &SymbolTable, out: &mut Vec<Diagnostic>) {

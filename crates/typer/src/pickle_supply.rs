@@ -2680,29 +2680,60 @@ fn flat_erased_params(st: &SymbolTable, ty: &Type) -> Vec<Option<String>> {
 }
 
 fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
-    match ty {
-        Type::Boolean => Some("Z".into()),
-        Type::Byte => Some("B".into()),
-        Type::Short => Some("S".into()),
-        Type::Char => Some("C".into()),
-        Type::Int => Some("I".into()),
-        Type::Long => Some("J".into()),
-        Type::Float => Some("F".into()),
-        Type::Double => Some("D".into()),
-        Type::Unit => Some("V".into()),
-        Type::String => Some("Ljava/lang/String;".into()),
-        Type::Function { params, .. } => Some(format!("Lscala/Function{};", params.len())),
-        Type::ByName(_) => Some("Lscala/Function0;".into()),
-        Type::Class { sym, .. } => {
-            let n = st.get(*sym).jvm_name.clone();
-            if n.is_empty() || n.starts_with('[') {
-                None
-            } else {
-                Some(format!("L{n};"))
+    // An abstract type member (`Type::TypeMember`) has to resolve to its own
+    // upper bound before it can name a fixed slot; the loop below re-runs
+    // this match on that bound (which may itself be another abstract type
+    // member, chained a few hops deeper) instead of recursing, with a
+    // generous but finite cap against a cyclic bound.
+    let mut cur = ty.clone();
+    for _ in 0..16 {
+        cur = match &cur {
+            Type::Boolean => return Some("Z".into()),
+            Type::Byte => return Some("B".into()),
+            Type::Short => return Some("S".into()),
+            Type::Char => return Some("C".into()),
+            Type::Int => return Some("I".into()),
+            Type::Long => return Some("J".into()),
+            Type::Float => return Some("F".into()),
+            Type::Double => return Some("D".into()),
+            Type::Unit => return Some("V".into()),
+            Type::String => return Some("Ljava/lang/String;".into()),
+            Type::Function { params, .. } => {
+                return Some(format!("Lscala/Function{};", params.len()))
             }
-        }
-        _ => None,
+            Type::ByName(_) => return Some("Lscala/Function0;".into()),
+            Type::Class { sym, .. } => {
+                let n = st.get(*sym).jvm_name.clone();
+                return if n.is_empty() || n.starts_with('[') {
+                    None
+                } else {
+                    Some(format!("L{n};"))
+                };
+            }
+            // `type Symbol >: Null <: SymbolApi`, reached from the abstract
+            // `scala.reflect.api.Trees`/`Universe` API rather than the
+            // concrete `JavaUniverse` a macro only gets at actual expansion
+            // time (`u.Ident(sym: Symbol)` -- `crates/cli/tests/quasi.rs`'s
+            // `lf3_identsym_*`, slick's `TableQueryMacroImpl.apply`). nsc
+            // itself erases an abstract type to its own upper bound
+            // (`Object` with none), and
+            // the classfile really does declare `Ident(LSymbolApi;)Lscala
+            // /reflect/api/Trees$IdentApi;` at this level, verified with
+            // `javap` on `scala.reflect.api.Trees` in scala-reflect.jar
+            // 2.13.16. Without this, every abstract-type-member parameter
+            // erased to `None` (a wildcard "any reference slot") instead, so
+            // `Ident(String)` and `Ident(Symbol)` -- both one reference
+            // parameter -- were indistinguishable at the "which classfile
+            // method is this" step (`no unambiguous erased descriptor`), and
+            // only the arbitrarily-first one of the two ever installed.
+            Type::TypeMember(id) => match st.get(*id).bound_hi.clone() {
+                Some(hi) => hi,
+                None => return Some("Ljava/lang/Object;".into()),
+            },
+            _ => return None,
+        };
     }
+    None
 }
 
 /// Whether a candidate descriptor's parameters agree with the slots we could

@@ -7724,6 +7724,197 @@ trait 自身の中で、`=` の無い抽象型メンバを裸で参照）と `ne
 `Equiv` / `PartialOrdering` を参照していないので、`tests/slick_measure.sh` の数字は
 このスライスの前後で変わりません。
 
+### ローカル `case class` のコンパニオン classfile が出ていなかった（`agent/localcc`）
+
+```scala
+def main(a: Array[String]): Unit = {
+  case class P(n: Int)
+  println(P(1))       // 型検査は通り、実行時 NoClassDefFoundError: Main$P$1$
+}
+```
+
+型検査は通りますが（`Typer::ensure_companion` が companion のシンボルをちゃんと
+リンクしています）、実行すると `NoClassDefFoundError: Main$P$1$` で落ちます。
+**サイレントな誤コンパイル**です。
+
+#### 原因
+
+トップレベル（またはクラス直下）の `case class` は `Backend::walk_stats`
+（`crates/backend/src/gen.rs`）が `emit_class` の直後に `emit_case_companion` を
+呼び、`apply` を持つコンパニオンの module class を出しています。ところが
+**メソッド本体の中**で宣言された `case class` は別の経路（`Backend::emit_anon_classes`
+の `Block` 腕）を通り、そちらは `emit_class` だけ呼んで `emit_case_companion` を
+一度も呼んでいませんでした。`Main$P$1` は出ますが `apply` を持つ `Main$P$1$` が
+出ないので、`P(1)`（コンパニオンの `apply` 呼び出しへデシュガーされる）が
+リンクエラーになります。ローカルの `case object`（コンパニオンを持たず `object`
+自身がそのまま module）や、既にローカルの `trait` / `class` / `object`
+（`agent/localtrait`）を捕まえている周辺の仕組みは無関係で正しく動いていました。
+
+#### 直し方
+
+`emit_anon_classes` の `Block` 腕に、トップレベル用の `walk_stats` と同じ判定
+（`case` フラグが立っていて、同じブロックにユーザーが書いた同名のコンパニオン
+`object` が無ければ `emit_case_companion` を呼ぶ）を足しました。
+
+#### 検証で見つかった追加の穴（同じ修正の一部）
+
+修正を入れて `lcc1`（このバグの再現そのもの）を通した後、ブリーフが名指しした
+「捕捉ありの形」（ローカル `case class` の本体がメソッドの外側の局所変数を読む）を
+確認したところ、**もう一つ**サイレント誤コンパイルが見つかりました:
+
+```scala
+def main(a: Array[String]): Unit = {
+  val base = 10
+  case class Q(n: Int) { def total: Int = n + base }
+  println(Q(5).total)   // 型検査は通り、実行時 NoSuchMethodError: 'void Main$Q$1.<init>(int)'
+}
+```
+
+`Q` クラス自身は既存の一般的な仕組み（`crates/typer/src/anon_capture.rs`）で
+`base` を捕捉フィールド付きのコンストラクタに正しく変えています（`<init>(int,
+int)`）。しかしコンパニオンの `apply`（`emit_case_apply`）は `ctor_fields` だけを
+見て `new Main$Q$1(n)` を組み立てており、捕捉引数を一切知りません。実 scalac は
+（`javap` で確認: `Cap$Q$2$` は自分自身に `private final int base$1` を持ち、
+`MODULE$` 静的シングルトンではなく**呼び出しごとに新しいコンパニオンを構築**する
+——通常のローカル `object` が `scala.runtime.LazyRef` 経由で一度得る「捕捉あり
+ローカル型は毎回新しいインスタンス」という形そのものです（`crates/typer/src/localobj.rs`
+の `check_local_objects` が既にローカル `object` 側でこの形を拒否しています）。
+
+この形はコンパニオンの `MODULE$` 静的シングルトン表現を丸ごと作り直す必要があり
+（`LazyRef` 相当）、このスライスの本題（コンパニオンが**出ない**こと）とは別の、
+それ自体で 1 スライス分ある実装課題です。`localobj.rs` が既に確立している方針
+（未実装の形は診断で断る。動いたことにしない）にそのまま倣い、
+`check_local_case_class_captures`（`crates/typer/src/localobj.rs`）を追加しました。
+`mark_anon_captures` が `Symbol::captures` を埋めた**直後**（`crates/driver/src/lib.rs`）
+に、ローカル `case class` の `captures` が非空なら診断してコンパイルを止めます。
+これで「型検査は通るが実行時に落ちる」が「コンパイルが通らない」に変わります。
+
+#### 検証
+
+fixture 接頭辞は `lcc`、テストは新ファイル `crates/cli/tests/localcc.rs` です。
+`lcc1.scala` はブリーフの再現そのもの（`P(1)` の構築 + `case P(x) => …` のパターン
+マッチ）、`lcc2.scala` はローカル `case object`（元から壊れていないことの回帰
+ガード）、`lcc3.scala` は同じメソッド名 `P` を持つ 2 つのメソッド（別々のクラス**と**
+別々のコンパニオンが出て互いに漏れないこと）です。3 本とも `--no-scala-library` /
+`--scala-library` の両モードで `java -Xverify:all` の下に走らせ、期待値は
+実 scalac 2.13.16 の実行結果（`tests/fixtures/expected/lcc{1,2,3}.txt`）です。
+修正前の `main`（`emit_case_companion` 呼び出しを外した状態）で `lcc1` を実行すると
+`NoClassDefFoundError: Main$P$1$` で落ちることを確認しています。捕捉ありの形は
+`lcc4_bad.scala`（コンパイルが `not implemented: a local case class Q that reads a
+local of the enclosing method …` という診断で失敗することを固定する
+`compile_fails` テスト）です。`local_case_class_companion_has_apply` /
+`same_named_local_case_classes_get_separate_companions` の 2 本は `javap` で
+実際に出た classfile の形（`Main$P$1$` が存在し `apply(int): Main$P$1` を持つこと、
+`lcc3` が `Main$P$1` / `Main$P$2` と 2 つの別コンパニオンを出すこと）を見ます。
+
+`--test localcc --test localtrait --test ctorstmt --test quasi --test product
+--test companionkind --test outer --test nestedobj` を前景で回し、全 64 + 6 本
+グリーンです（`quasi.rs` はこのスライスの item 2 のテストも含みます）。
+
+#### 既知の残件
+
+- **case class の companion に `unapply` の実体が無い。** `crates/typer/src/check.rs`
+  の `namer_class`（コンパニオン合成のところ）は `unapply` のシンボルを作るだけで
+  `.ty` を設定せず、`crates/backend/src/gen.rs` には `emit_case_apply` はあっても
+  `emit_case_unapply` が存在しません。トップレベルの `case class P(n: Int)` に対して
+  `P.unapply(P(1))` を**明示的に**呼ぶと（`p match { case P(x) => … }` というパターン
+  マッチ自体は別経路でフィールドを直接読むので無関係に動きます）、型検査は通り
+  実行時 `NoSuchMethodError: 'scala.Option P$.unapply(P)'` になります。これは
+  ローカルに限らずトップレベルの case class にも共通する既存の別ギャップで、
+  今回のスライスの対象外です。
+- **ローカル `case class` が外側の局所変数を捕捉する形は診断で拒否したまま**
+  （上記「検証で見つかった追加の穴」）。`LazyRef` 相当の実装が要ります。
+
+### `u.Ident(sym: Symbol)` オーバーロードの供給漏れ（`agent/liftable` 残件、`agent/localcc`）
+
+```scala
+// slick の TableQueryMacroImpl.apply（scala-2/slick/lifted/TableQuery.scala）
+Ident(typeOf[Tag].typeSymbol)
+```
+
+`Ident` はツリーファクトリの `val Ident: IdentExtractor`（`apply(name: Name)`）
+**だけ**ではなく、`scala.reflect.internal.Trees` トレイトが直接宣言する便利メソッド
+`def Ident(sym: Symbol): Ident` も同じ名前で持っています（scala-reflect.jar
+2.13.16 を `javap` で確認: `scala/reflect/api/Trees.class` は `abstract
+Trees$IdentApi Ident(Symbols$SymbolApi)` を extractor の `apply` のすぐ隣に
+宣言しています）。`Ident(sym)` はこの後者に一致するはずですが、
+`no matching overload for <overload Trees$IdentExtractor | (String)Trees.Ident>
+with arguments (Symbol)` と、候補一覧に **`Symbol` を取る版が最初から入っていない**
+状態で拒否されていました。
+
+#### 原因
+
+`PickleSupply::install`（`crates/typer/src/pickle_supply.rs`）は同じ名前・同じ
+arity の複数の pickle 由来オーバーロードを、パラメータの**消去後**シグネチャで
+区別します（`erased_param_desc`）。抽象 API（`scala.reflect.api.Trees` /
+`scala.reflect.macros.Universe`。マクロが実際の展開時にだけ手にする具体的な
+`JavaUniverse` ではありません）から見えている段階では、`Symbol` は具象クラスでは
+なく**抽象型メンバー**（`type Symbol >: Null <: SymbolApi`）で、`Type::TypeMember`
+に変換されます。ところが `erased_param_desc` は `Type::TypeMember` のケースを
+持たず `_ => None`（「参照型なら何でもよいワイルドカード」の意味）に落ちていました。
+`Ident(String)` も `Ident(Symbol)` もどちらも「参照 1 個」のワイルドカードに
+潰れてしまうので、`erased_desc` は候補が 1 つに決まらず
+（`no unambiguous erased descriptor`）、`Symbol` を取る版は**そもそも一度も
+インストールされていません**でした。
+
+実 scalac 自身、抽象型は自分の上限境界へ消去します（境界が無ければ `Object`）。
+実際に `scala.reflect.api.Trees.class` の classfile も
+`Ident(LSymbolApi;)LTrees$IdentApi;` という具体的なディスクリプタを持っています
+（`javap` で確認済み）。`erased_param_desc` に `Type::TypeMember` のケースを足し、
+自分の `bound_hi`（無ければ `Object`）へ**再帰的に**（循環境界に備えて 16 段で
+打ち切り）解決するようにしました。
+
+#### 検証
+
+最小のマクロ実装を 2 段コンパイル（`lf2_ctx.scala` と同じ方式）で確認します。
+`Ident(c.internal.enclosingOwner)` は修正前 `no matching overload for <overload
+Trees$IdentExtractor | (String)Trees.Ident> with arguments (Symbol)` で拒否され、
+修正後は候補一覧に `(Symbols.Symbol)Trees.Ident` が加わり通ります。新しい
+fixture は `tests/fixtures/lf3_identsym.scala`（接頭辞 `lf`、`agent/liftable` の
+既存の番号付けに続けて `lf3`）、テストは `crates/cli/tests/quasi.rs` の
+`lf3_identsym_supplies_the_symbol_overload_of_ident`（`lf2_ctx` と同じ形:
+コンパイルが通ることと、`javap`/`java -Xverify:all` で実際にロード・検証できる
+classfile になることを見て、real scalac 2.13.16 でも同じソースが通ることを
+確認します）。slick 本体の該当行（`TableQueryMacroImpl.apply` の
+`Ident(typeOf[Tag].typeSymbol)`）でも `no matching overload` が消えたことを
+`tests/slick_measure.sh` の生ログで確認しています。
+
+継ぎ目（`pickle_supply.rs`）を触ったので、ブリーフの必須一覧
+`--test overloadshadow --test ambigmap --test setapply --test uniteq --test
+integral --test ordsummon --test mutcoll --test conform --test e2e`
+をすべて前景で回し、グリーンであることを確認しました。
+
+slick（`tests/slick_measure.sh`）は `files=184 errors=223 files_with_errors=60`
+→ `files=184 errors=222 files_with_errors=60`。`TableQuery.scala` の
+`no matching overload … Ident` 行はログから消えました（同じファイルには
+`typeOf` の implicit 未実装など、この修正と無根の別エラーが残っているので
+ファイル数自体は変わりません）。
+
+#### 同根の確認（`u.WeakTypeTag[T]` / `u.TypeTag.Int` 残件との関係）
+
+ブリーフが「同根か確認してほしい」としていた `u.WeakTypeTag[T]` /
+`u.TypeTag.Int` が `not a member of JavaUniverse` になる件は、**別根**と
+判断しました。`import scala.reflect.runtime.universe._` の下で
+`WeakTypeTag[Int]` / `TypeTag.Int` は今回の修正後も `not found: type
+WeakTypeTag` / `not found: value TypeTag` のまま —— そもそも「型が見つかって
+オーバーロードが絞れない」ではなく「ワイルドインポートされた名前として見えて
+すらいない」という、もっと手前で失敗する別の症状です。今回の修正
+（`erased_param_desc` の消去）はオーバーロード**候補の絞り込み**の話であり、
+名前解決そのものの失敗には触れません。残件のままにしています。
+
+#### 見つかった副産物の残件（今回の修正の対象外）
+
+`Ident(sym)` を直そうとする過程で、無関係の**別の**バグも見つけました:
+`import c.universe._` の下で `Symbol` という**裸の型注釈**を書くと（
+`val sym: Symbol = c.internal.enclosingOwner` のように）、ワイルドインポート
+された `c.universe.Symbol`（reflection API の抽象型）ではなく、常にスコープに
+ある無関係の `scala.Symbol`（`'foo` のようなシンボルリテラルのクラス）に
+解決されてしまい、`type mismatch; found: Symbols.Symbol  required: Symbol` に
+なります。ワイルドインポートは暗黙の `scala._` より優先されるべきところが
+そうなっていません。slick の実際のコード（`Ident(typeOf[Tag].typeSymbol)`）は
+明示的な `Symbol` 注釈を書かないのでこの副産物には当たらず、今回の修正の
+検証には影響しません。別チケットとして残しています。
+
 ## ライセンス
 
 Apache-2.0
