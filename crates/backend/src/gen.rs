@@ -5376,6 +5376,15 @@ impl<'a> Gen<'a> {
         // class gets, or its concrete trait methods stay abstract — and the
         // same getter/`$init$set$` pair for the trait's `val`s.
         self.emit_trait_val_accessors(&mut b, cls, &impl_.body);
+        // `emit_class` also implements every mixed-in trait's abstract
+        // `T$$super$m` accessors here (`emit_super_accessors`); this path
+        // never did, so `object Impl extends Mid` (`Mid` itself calling
+        // `super.m` from its own overriding body) linked but threw
+        // `AbstractMethodError` at the first call -- the interface declared
+        // `Mid$$super$m` abstractly (every trait with a `super` call in its
+        // body gets one, whether it is ultimately mixed into a `class` or an
+        // `object`) and no concrete class ever provided it.
+        self.emit_super_accessors(&mut b, cls);
         self.emit_mixin_forwarders(&mut b, cls, &impl_.body);
         self.emit_delayed_init_support(&mut b, cls, &impl_.body, true);
         if !cls.is_none()

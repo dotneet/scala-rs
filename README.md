@@ -8078,6 +8078,158 @@ WeakTypeTag` / `not found: value TypeTag` のまま —— そもそも「型が
 明示的な `Symbol` 注釈を書かないのでこの副産物には当たらず、今回の修正の
 検証には影響しません。別チケットとして残しています。
 
+### `super` と自己型、`x @ Extractor(...)` の束縛型、カリー化した `copy`（`agent/tail3`）
+
+割り当ては slick 残エラーの単発・カスケード群（多いもの順）でした。テストは
+`crates/cli/tests/tail3.rs`、fixture 接頭辞は `t3` です。
+
+計測は `files=184 errors=203 files_with_errors=60` →
+**`files=184 errors=184 files_with_errors=57`**（−19 件 / −3 ファイル）。
+
+| 塊 | before | after |
+|---|---|---|
+| `value volatileHint is not a member of Node` | 3 件 | **0 件** |
+| `recursive method computeCapabilities needs result type` | 3 件 | **0 件** |
+| `value apply is not a member of TableNode` | 3 件 | **0 件** |
+| `value getDumpInfo is not a member of TypeGenerator` | 2 件（同根の副産物） | **0 件** |
+| `value getOrElse is not a member of Product` | 4 件 | 4 件（**直せていません**、`agent/tail1` と同じ理由） |
+
+#### 1. `x @ Extractor(...)` は束縛型を絞らなければならない
+
+`slick/jdbc/{DerbyProfile,JdbcStatementBuilderComponent,SQLServerProfile}
+.scala` はいずれも `case c @ LiteralNode(_) if c.volatileHint => …`（あるいは
+`:@` を挟んだ同形）を `Node` 型のスクルーティニーに対して書いています。
+`volatileHint` は `Node` ではなく `LiteralNode`（`case class` ではなく、
+コンパニオンに手書きの `def unapply(n: LiteralNode): Option[Any]` を持つ
+普通のクラス）にしかありません。実 scalac は `x @ Extractor(...)` の `x` を
+**抽出子自身が宣言する受け取り型**（`case x: T` と同じ暗黙の型テスト）に
+束縛しますが、`crates/typer/src/check.rs`（`type_pattern` の `unapply` 枝）は
+パターン全体の型（`pat.ty`）を常に**スクルーティニーの型のまま**にしていた
+ので、`c` はずっと `Node` で `c.volatileHint` が拒否されていました。
+
+直しは `TreeKind::Bind` の**中だけ**: 内側のパターンを型付けした後、新しい
+`unapply_receiver_type`（抽出子の宣言パラメータ型を、`subst_unapply_tparams`
+と同じやり方でスクルーティニーに対して単一化する）で束縛変数の型だけ絞ります。
+`TreeKind::UnApply` ノード自身の `pat.ty` はわざと**スクルーティニーの型の
+まま**にしています —— `crates/backend/src/gen.rs` の `gen_unapply_pattern`
+がそれを読んで実行時 `instanceof` テストが冗長かどうか
+（`is_sub_type(pat.ty, param_ty)`）を判定しているので、ここも絞ってしまうと
+その判定が常に真になって**テスト自体が消えて**しまいます。実際、型検査だけの
+版で `describe(new OtherNode)`（どちらの `LiteralNode` ケースにも一致しない
+はず）を実行すると `ClassCastException: OtherNode cannot be cast to
+LiteralNode` になりました —— `-Xverify:all` の下で実行し、real scalac の
+標準出力とも突き合わせてから信用する、というブリーフの手順が実際に効いた例
+です。
+
+#### 2. `super` は自己型を歩いてはいけない
+
+`slick/{jdbc/DB2Profile,relational/RelationalProfile,sql/SqlProfile}.scala`
+はいずれも `computeCapabilities`（戻り型注釈なし）を
+`super.computeCapabilities ++ …Capabilities.all` でオーバーライドしています。
+基底（`BasicProfile.computeCapabilities: Set[Capability] = Set.empty`）には
+明示的な型があるので本当の循環にはならないはずです —— ブリーフの指示どおり、
+まず最小再現を real scalac に通してから調べました（`t3_super_chain.scala` は
+scalac も一発で通ります）。
+
+原因は 2 つ重なっていました:
+
+* **型検査**: `RelationalProfile extends BasicProfile with
+  RelationalTableComponent with … with RelationalActionComponent` で、
+  `RelationalActionComponent { self: RelationalProfile => }` は（`super_target`
+  の旧「最後の親を使う」ヒューリスティックでは）`super` が最初に選ぶ親です。
+  `SymbolTable::lookup_member`（普通のメンバ探索）は自己型も辿りますが、これは
+  自己型付きトレイトの本体**内側**からの `this.foo` / 無限定参照には正しい
+  一方、SLS 6.7.3 上 `super` は自己型を絶対に経由しません（実継承の親だけ）。
+  `RelationalProfile` の中の `super.computeCapabilities` が
+  `RelationalActionComponent` の自己型経由で `RelationalProfile` **自分自身**
+  の、まだ完了していないオーバーライドに戻ってしまい、本物の循環参照には
+  なるものの nsc が報告するのとは違う理由でした。`SymbolTable::
+  lookup_member_real`（自己型を辿らない版）と `Typer::super_select_member`
+  （`this_id` の実の親を後方宣言優先で辿り、実継承チェーンに `name` を持つ
+  最初の親を探す）を足し、`type_select` の中で qualifier が `Super` のときだけ
+  差し替えました。
+* **バックエンド**: 上を直すと型検査は通りましたが、`ClassImpl`（普通の
+  `class`）と `ObjectImpl`（`object`）で挙動が違いました —— `ObjectImpl.m` は
+  `AbstractMethodError: … Mid$$super$m() of interface Mid` を投げました。
+  `crates/backend/src/gen.rs` の `emit_class` は `emit_super_accessors`
+  （トレイトの `super.m` 呼び出しが必要とする抽象 `Trait$$super$m` アクセサを
+  ミックスインされる側の具象クラスに実装する）を呼びますが、`emit_module`
+  （`object` 専用の別コード経路）は**一度も**呼んでいませんでした。自分の
+  本体で `super` を呼ぶトレイトを継いだ `object Foo extends SomeTrait`
+  （まさに slick の各データベース用プロファイルオブジェクト、
+  `object H2Profile extends JdbcProfile` 等）は全て影響を受けますが、
+  1 の型検査バグが常に先に拒否していたので実際にコンパイルが通ったことが
+  一度もありませんでした。`emit_module` に
+  `self.emit_super_accessors(&mut b, cls);` を 1 行足すだけです。
+
+#### 3. `p.copy(...)( ...)` はチェーン全体を先に見なければならない
+
+`slick/ast/Node.scala` は `final case class TableNode(schemaName, tableName,
+identity, baseIdentity)(val profileTable: Any)` —— 第 2 引数リストが 1 個の
+`val` だけの、カリー化した `case class` です。実際の使用側
+（`slick/compiler/{AssignUniqueSymbols,EmulateOuterJoins}.scala`）は
+`t.copy(identity = x)(t.profileTable)` と、コンストラクタと同じ 2 引数リストで
+書きます。
+
+`Typer::try_rewrite_case_copy`（`crates/typer/src/check.rs`）は `p.copy(…)` を
+コンストラクタ呼び出しに直接書き換えます（`copy[T]` 独自の型推論を再実装せず
+既存のコンストラクタ呼び出し推論に乗せるため）。この関数は `Apply` ノード
+**1 個ずつ**に対して呼ばれるので、`t.copy(identity = x)(t.profileTable)` では
+まず**内側**の `Apply`（`t.copy(identity = x)`）だけに対して発火し —— 外側の
+`Apply`（`(t.profileTable)` を渡す方）がまだ検討もされていないうちに —— 第 2
+リストに属する分も含めて**全フィールド**を `t` 自身の値で埋め、完成した
+`TableNode` を返してしまいました。外側の `(t.profileTable)` はその
+`TableNode` 値への `.apply` 呼び出しとして読まれ、「value apply is not a
+member of TableNode」になっていました。（型がバイトコード上も本当にカリー化
+されたままか、それとも 1 本の引数リストに潰れているのか —— コンストラクタ
+自身も含め、複数引数リストの Scala メソッドは JVM 上では**常に**1 本の
+メソッドへ消去されるので、javap だけでは区別できません —— という点は、何も
+触る前に real scalac 2.13.16 で `r.copy(a = 2)(r.extra)` が実際に通ることを
+確認して裏を取りました。）
+
+`Typer::try_rewrite_case_copy_curried` を新設し、`try_rewrite_case_copy` の
+**先頭**で試すようにしました。`Apply` チェーンを `copy` の選択まで剥がし、
+2 段以上あれば、コンストラクタの本当の引数リスト形状に合わせて
+`ClassName(list1)(list2)…` という呼び出し列を再構築します（`new C(…)(…)`
+ではなくコンパニオンの `apply` を使う点に注意 —— カリー化した `new` 呼び出し
+自体にも**別の**、より狭いオーバーロード解決の穴があり（`Apply` 層を 1 個
+ずつ独立にしか見ない）、そちらに乗せると別のバグと交換するだけでした。剥がす
+先が 2 段に満たなければ（`depth < 2`）何もせず既存の単一リスト版に委ねるので、
+圧倒的多数を占める非カリー化のケースには触れていません）。
+
+#### 検証
+
+`t3_extractor_bind.scala` / `t3_super_chain.scala` / `t3_curried_copy.scala`
+はいずれも `--scala-library` と `--no-scala-library` の両方で
+`-Xverify:all` を通し、real scalac 2.13.16 の標準出力とも突き合わせています
+（`crates/cli/tests/tail3.rs`）。修正前の `main` では 3 本とも拒否されることを
+確認済みです。継ぎ目（`check.rs` / `symbol.rs` / `gen.rs`）に触れたので
+`--test tail3 --test conform --test e2e` を前景で回し、`cargo test --workspace`
+もグリーンであることを確認しました。
+
+#### 残件
+
+* `value getOrElse is not a member of Product`（4 件）: `agent/tail1` が
+  既に縮小を試みて単独再現に失敗したのと同じ症状（`nextBlobOption()
+  getOrElse(…)` の `if (rs.wasNull) None else Some(r)` の lub が `Blob` /
+  `Array[Byte]` / `Clob` / `Object` の 4 つだけ `Product` に落ちる）。今回も
+  スクラッチから何本か縮小版を作りましたが、real scalac でも私たちの binary
+  でも**通ってしまい**、slick 184 ファイル全体という状態に依存する点は
+  `tail1.rs` の記録と変わりませんでした。追加の手掛かりはありません。
+* `no matching overload for (=> F[B])(FlatMap[F])F[B]`（3 件、cats の
+  `>>` 拡張メソッド）、`value map is not a member of Any`（3 件）、
+  `value flatMap is not a member of Async$` / `value effect is not a member
+  of <notype>` / `value database is not a member of BasicBackend.Session` /
+  `value reduceLeft is not a member of Option[Node]`（各 2 件）は時間内に
+  調査できませんでした。
+* **副産物として見つけた別バグ（未修正）**: カリー化した `new C(…)(…)`
+  （コンストラクタへの直接呼び出し、`copy` 経由ではない）は `Apply` 層を
+  1 個ずつ独立に検査するらしく、`slick/lifted/SimpleFunction.scala:74`
+  の `new SimpleLiteral(name)(tpe)` で `ambiguous overload for apply with
+  arguments (String)` を出しています（今回の変更の前から存在する症状で、
+  今回のどの修正が原因でもありません）。`try_rewrite_case_copy_curried` が
+  `new` 経由の再構築を避けた理由がまさにこれで、同じ根を踏むはずです。
+
 ## ライセンス
 
 Apache-2.0
