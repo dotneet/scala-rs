@@ -3,6 +3,43 @@
 # Usage: tests/slick_measure.sh [extra scala-rs args...]
 set -e
 SP=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slick
+# --- self-restore -----------------------------------------------------------
+# Everything under /tmp vanishes on reboot (it did, 2026-08-31). Rebuild the
+# toolchain from the Coursier cache and re-clone slick at the pinned revision
+# whenever a piece is missing, so a reboot costs one slow run instead of a
+# debugging session.
+SLICK_REV=475fc6e7719867025e832fa0e6ac7fb21b36bbc3
+CCACHE=$HOME/Library/Caches/Coursier/v1/https/repo1.maven.org/maven2
+if [[ ! -x /tmp/scala-2.13.16/bin/scalac ]]; then
+  mkdir -p /tmp/scala-2.13.16/bin /tmp/scala-2.13.16/lib /tmp/scala-rs-lib
+  cp $CCACHE/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16.jar /tmp/scala-rs-lib/
+  cp $CCACHE/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16.jar /tmp/scala-2.13.16/lib/scala-library.jar
+  cp $CCACHE/org/scala-lang/scala-reflect/2.13.16/scala-reflect-2.13.16.jar /tmp/scala-2.13.16/lib/scala-reflect.jar
+  cp $CCACHE/org/scala-lang/scala-compiler/2.13.16/scala-compiler-2.13.16.jar /tmp/scala-2.13.16/lib/scala-compiler.jar
+  printf '#!/bin/sh\nL=/tmp/scala-2.13.16/lib\nexec java -cp "$L/scala-compiler.jar:$L/scala-library.jar:$L/scala-reflect.jar" scala.tools.nsc.Main "$@"\n' > /tmp/scala-2.13.16/bin/scalac
+  chmod +x /tmp/scala-2.13.16/bin/scalac
+fi
+if [[ ! -d $SP/slick/.git ]]; then
+  mkdir -p $SP; rm -rf $SP/slick
+  git clone https://github.com/slick/slick.git $SP/slick >/dev/null 2>&1
+  (cd $SP/slick && git checkout -q $SLICK_REV)
+fi
+if [[ ! -s $SP/deps.cp ]]; then
+  for j in com/typesafe/config/1.4.9/config-1.4.9.jar \
+           org/reactivestreams/reactive-streams/1.0.4/reactive-streams-1.0.4.jar \
+           org/slf4j/slf4j-api/2.0.18/slf4j-api-2.0.18.jar \
+           org/typelevel/cats-core_2.13/2.13.0/cats-core_2.13-2.13.0.jar \
+           org/typelevel/cats-kernel_2.13/2.13.0/cats-kernel_2.13-2.13.0.jar \
+           org/typelevel/cats-effect_2.13/3.7.1/cats-effect_2.13-3.7.1.jar \
+           org/typelevel/cats-effect-kernel_2.13/3.7.1/cats-effect-kernel_2.13-3.7.1.jar \
+           org/typelevel/cats-effect-std_2.13/3.7.1/cats-effect-std_2.13-3.7.1.jar \
+           org/typelevel/cats-mtl_2.13/1.6.0/cats-mtl_2.13-1.6.0.jar \
+           org/scodec/scodec-bits_2.13/1.2.4/scodec-bits_2.13-1.2.4.jar \
+           co/fs2/fs2-core_2.13/3.13.0/fs2-core_2.13-3.13.0.jar; do
+    echo $CCACHE/$j
+  done | paste -sd: - > $SP/deps.cp
+fi
+# ---------------------------------------------------------------------------
 SRC=$SP/slick/slick/src/main
 COMPAT=$SP/slick/slick-compat-collections/src/main/scala-2.13+
 # Default to *this* checkout's binary, not a fixed path: run from a git
