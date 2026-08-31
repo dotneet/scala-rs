@@ -13456,6 +13456,55 @@ fn gen_wrap_varargs(
     }
 }
 
+/// nsc's erasure adaptation, for an argument whose static type the typer only
+/// knows as `Any`.
+///
+/// `scala.reflect`'s API is written in abstract type members with compound
+/// bounds -- `type TermName >: Null <: TermNameApi with Name`, `type Name >:
+/// Null <: NameApi` -- which the typer carries as `Any` and the *classfile*
+/// erases to `Names$TermNameApi` and `Names$NameApi`. The JVM knows of no
+/// relation between those two classes, so `Ident(TermName("tag"))` does not
+/// verify: "Type 'scala/reflect/api/Names$TermNameApi' is not assignable to
+/// 'scala/reflect/api/Names$NameApi'". nsc emits a `checkcast` to the
+/// parameter's erasure at exactly this point; so does this.
+///
+/// Scoped to an argument the typer typed as `Any` (or an abstract type
+/// member) whose parameter descriptor names a *specific* class: an ordinary
+/// call cannot pass an `Any` where a class is wanted, so every other call
+/// emits what it emitted before.
+fn adapt_type_member_arg(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    aty: &Type,
+    pty: &Type,
+    declared: Option<&str>,
+) {
+    let opaque = matches!(
+        aty,
+        Type::Any | Type::AnyRef | Type::TypeMember(_) | Type::NoType
+    ) || matches!(pty, Type::TypeMember(_));
+    if !opaque || is_jvm_primitive(pty) {
+        return;
+    }
+    let pd = declared
+        .map(str::to_string)
+        .unwrap_or_else(|| jvm_desc(ctx.st, pty));
+    if pd == "Ljava/lang/Object;" {
+        return;
+    }
+    let Some(cls) = pd.strip_prefix('L').and_then(|d| d.strip_suffix(';')) else {
+        return;
+    };
+    // Only when the value on the stack really is some *other* class: a value
+    // already of that class, or one whose class the assembler does not track,
+    // is left alone.
+    match asm.top_object() {
+        Some(t) if t != cls => {}
+        _ => return,
+    }
+    asm.checkcast(cls);
+}
+
 /// Materialise the argument a `Unit` parameter expects. `Unit` erases to
 /// `scala/runtime/BoxedUnit` in parameter position, so the call really does
 /// push one -- but the expression that produced it left nothing on the stack
@@ -13488,6 +13537,15 @@ fn gen_call_args(
     } else {
         ctx.st.get(method).params.clone()
     };
+    // The parameter descriptors the call really names. `jvm_desc` of the
+    // parameter's *type* is not the same thing for an abstract type member --
+    // it comes out `Object` -- and it is the descriptor in the `Methodref`
+    // that the verifier checks the argument against.
+    let declared: Vec<String> = if method.is_none() {
+        Vec::new()
+    } else {
+        crate::code::param_descs(&method_desc_from_sym(ctx.st, method))
+    };
     let load_arg = |asm: &mut Assembler, frame: &mut Frame, i: usize, a: &Tree| {
         let callee_synthetic =
             !method.is_none() && ctx.st.get(method).flags.contains(Flags::SYNTHETIC);
@@ -13510,6 +13568,7 @@ fn gen_call_args(
         // expression that already produced a reference (`$box`, a generic `T`
         // result) -- that one is the value, so do not push a second.
         adapt_unit_arg(asm, ctx, a, pty);
+        adapt_type_member_arg(asm, ctx, &a.ty, pty, declared.get(i).map(String::as_str));
         if box_prims {
             if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
                 emit_box(asm, &a.ty);

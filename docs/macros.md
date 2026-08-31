@@ -702,9 +702,9 @@ reflect 専用ではない一般の欠落である。
 | `f()` | `Nil`（`List()` は `A` を解けない。§7.5） |
 
 **落とせない形は必ず診断する**（`unimplemented syntax: quasiquote q"..." (…)` に
-どの形かを書く）。現状の穴: ブロック、関数リテラル、`new`、`if`、`match`、
-型注釈、型適用、`this` / `super`、定義（`val` / `def` / `class`）、
-`..$` と普通の引数の混在、`tq` / `pq` / `cq` 全体。
+どの形かを書く）。このスライス時点の穴（**§7.7 でほとんど埋まった**）: ブロック、
+関数リテラル、`new`、`if`、`match`、型注釈、型適用、`this` / `super`、
+定義（`val` / `def` / `class`）、`..$` と普通の引数の混在、`tq` / `pq` / `cq` 全体。
 
 検証: `tests/fixtures/reify_qq.scala` を実 scalac 2.13.16 と dual-run して
 **出力が完全一致**する（`crates/cli/tests/reify.rs`）。異常系は
@@ -791,3 +791,126 @@ classpath に scala-reflect.jar を足す必要がある。**
    実 scalac から `macro` で参照すると `macro implementation has incompatible
    shape: found (c: Context, x: Tree): Tree` になる。パラメータ節がひとつに
    潰れており、パス依存型も残っていない。§5 のフェーズ 2 の作業。
+
+### 7.7 reification の残りの形（`agent/reify2` 第 2 スライス）
+
+§7.6 の 1 と 2。**`tq"…"` / `pq"…"` / `cq"…"` と、`q"…"` の残りの形が
+落とせるようになった。** 形はすべて実 scalac 2.13.16 の `-Ymacro-debug-lite`
+（nsc 自身の quasiquote マクロが吐く展開が印字される）から読み取り、
+`tests/fixtures/qr_forms.scala` が `showRaw` まで実 scalac と突き合わせている
+（`java -Xverify:all` で実行、56 行が完全一致）。
+
+#### 落とせるようになった形
+
+| 形 | 落とす先 |
+| --- | --- |
+| `tq"T"` | `rs.SyntacticTypeIdent(u.TypeName("T"))` |
+| `tq"a.b.C"` | `rs.SyntacticSelectType(<a.b を項として>, u.TypeName("C"))` |
+| `tq"F[A, B]"` | `rs.SyntacticAppliedType(<F>, List(<A>, <B>))` |
+| `tq"A => B"` | `rs.SyntacticFunctionType(List(<A>), <B>)` |
+| `tq"(A, B)"` | `rs.SyntacticTupleType(List(<A>, <B>))` |
+| `tq"a.b.type"` | `rs.SyntacticSingletonType(<a.b>)` |
+| `tq"A#B"` | `rs.SyntacticTypeProjection(<A>, u.TypeName("B"))` |
+| `tq"A with B"` | `rs.SyntacticCompoundType(List(<A>, <B>), Nil)` |
+| 型の空欄（`val x = e` の型） | `rs.SyntacticEmptyTypeTree.apply()` |
+| `q"x: T"` | `u.Typed(<x>, <T>)` |
+| `q"f _"` | `u.Typed(<f>, rs.SyntacticFunction(Nil, u.EmptyTree))` |
+| `q"f[T](a)"` | `rs.SyntacticTypeApplied(<f>, List(<T>))` の上に `SyntacticApplied` |
+| `q"{ a; b }"` / `q"..$stats"` | `rs.SyntacticBlock(List(<a>, <b>))` |
+| `q"val v: T = e"` | `rs.SyntacticValDef(u.Modifiers(rs.FlagsRepr(0L)), u.TermName("v"), <T>, <e>)` |
+| `q"new C[T](a)(b)"` | `rs.SyntacticNew(Nil, List(rs.SyntacticApplied(<C[T]>, List(<a>, <b>))), u.noSelfType, Nil)` |
+| `q"e match { … }"` | `rs.SyntacticMatch(<e>, List(<case>))` |
+| `q"{ case p => e }"` | `rs.SyntacticPartialFunction(List(<case>))` |
+| `q"(y: T) => e"` | `rs.SyntacticFunction(List(<param>), <e>)` |
+| `q"this"` / `q"C.this"` | `u.This(u.TypeName(""))` / `u.This(u.TypeName("C"))` |
+| `q"a.b = c"` | `rs.SyntacticAssign(<a.b>, <c>)` |
+| `q"if (a) b else c"` | `u.If(<a>, <b>, <c>)` |
+| `pq"_"` | `rs.SyntacticTermIdent(u.TermName("_"), false)` |
+| `pq"x"`（小文字始まり） | `u.Bind(u.TermName("x"), rs.SyntacticTermIdent(u.TermName("_"), false))` |
+| `pq"a.b.C(p)"` | `rs.SyntacticApplied(<a.b.C>, List(List(<p>)))` |
+| `pq"x @ p"` / `pq"a \| b"` / `pq"_: T"` | `u.Bind` / `u.Alternative` / `u.Typed` |
+| `cq"p if g => e"` | `u.CaseDef(<p>, <g>, <e>)`（ガード無しは `u.EmptyTree`） |
+| 演算子名 | `NameTransformer` で符号化（`q"a + b"` は `u.TermName("$plus")`） |
+| `q"$x.$n"` | 名前の位置の穴は `TermName` をそのまま差す |
+
+#### パーサが潰してしまう区別を、元のソース文字列で戻す
+
+scala-rs のパーサは nsc が区別する形をいくつか正規化してしまう。reification は
+**quasiquote の本文テキストを持ち回って**そこを見分ける（`Reifier::src`）。
+
+- `A => B` は `AppliedTypeTree(Ident("Function1"), …)` になり、**書かれた**
+  `Function1[A, B]` と同じ木になる。nsc は前者を `_root_.scala.Function1`、
+  後者を裸の `Ident` にする。頭の span のテキストが `Function1` かどうかで決める。
+- `(a, b)` は `Apply(Ident("Tuple2"), …)` になり、書かれた `Tuple2(a, b)` と
+  同じ木になる。nsc は前者だけ `SyntacticTuple`。同じ判定。
+- `q"val v = e"` と `q"{ val v = e }"`。ラッパが足す `{}` と作者の `{}` は
+  パース後には区別できないので、**本文が `{` で始まるか**を渡している
+  （`unwrap_body` の `braced`）。前者は裸の `SyntacticValDef`、後者は
+  `SyntacticBlock`。
+
+#### 落とせない形は今までどおり名指しで診断する
+
+パーサが**情報ごと**捨ててしまい、何を作っても「誰も書いていない木」になる形は
+作らない。`tests/fixtures/qr_forms_bad.scala` / `reify_qq_bad.scala` /
+`qq_ctx_bad.scala` がそれぞれ診断を固定している。
+
+| 形 | 診断 | 理由 |
+| --- | --- | --- |
+| `q"a :: b"` | a right-associative operator (`::`) is not reified yet | パースで `b.::(a)` になり、書かれた `b.::(a)` と区別できない。nsc はそのどちらでもなく、左辺を fresh な `val` に束ねた**ブロック**を作る |
+| `q"if (a) b"` | an `if` without an `else` is not reified yet | パーサは `else` に `()` を補う。nsc は空ブロックを補う |
+| `q"_.get"` | a `_` placeholder function literal is not reified yet | パーサが作るパラメータ名と、nsc の `freshTermName` が違う |
+| `tq"=> T"` | a by-name type is not reified yet | nsc のパーサ自身が `tq` の中では拒否する |
+| `q"f(a, ..$xs)"` | a `..$` splice mixed with ordinary arguments | 連結の静的型を両側とも正しく出す必要がある（§7.5 の 2） |
+| `q"class C"` など定義 | a class definition is not reified yet | `SyntacticClassDef` などが未実装 |
+| `q"{ lazy val a = 1 }"` | a modified `val` definition is not reified yet | `Modifiers` のフラグ変換が未実装 |
+| `q"{ $x }"` | （診断なし。既知の差） | パーサが `{ e }` を `e` に潰すので、単一の穴だけは nsc の `SyntacticBlock(List(x))` に対して `x` になる。意味は同じだが木は違う |
+
+#### ついでに直した一般の穴
+
+reification が要求しただけで、いずれも reflect 専用ではない。
+
+| 直したもの | どこ |
+| --- | --- |
+| **オーバーロード集合への `apply` 挿入。** `val Ident: IdentExtractor` と `def Ident(name: String): Ident` は同じ名前のオーバーロード集合で、`Ident(TermName("x"))` はどちらにも当たらず `Ident.apply(...)` である。`Bind` / `This` / `New` も同じ形。§7.6 の 2 で、slick の `TableQuery` のマクロ実装はこれだけで書かれている | `Check::insert_apply_on_nullary` の `Type::Overload` 枝 |
+| **同名の型メンバに項の選択が食われる。** reflect API は `type Modifiers` と `def Modifiers(flags: FlagSet)` を両方置く。jar のメンバは名前ごとに遅延ロードされるので、**型メンバが先に入る**（`NoMods` を完了すると入る）と名前はもう「見つからない」ではなくなり、項のオーバーロードは読まれないまま `u.Modifiers(flags)` が `<notype>` の `TypeMember` に解決していた（`value apply is not a member of <notype>`）。§7.6 の `expose_unqualified_type` の鏡像 | `Check::type_select` |
+| **`invokeinterface` の `count` がスロット数でない。** `long` / `double` の引数は 2 スロット。`reificationSupport.FlagsRepr(8192L)` が `VerifyError: Inconsistent args count operand in invokeinterface` になっていた | `Assembler::invokeinterface` / `count_param_slots` |
+| **抽象型メンバの引数に erasure 適応の `checkcast` が無い。** `type TermName >: Null <: TermNameApi with Name` は `Names$TermNameApi` に、`Name` は `Names$NameApi` に erase され、JVM は両者の関係を知らない。nsc はここで `checkcast` を出す | `gen.rs` の `adapt_type_member_arg` |
+| **`NoMods` が `Universe` の宣言。** `scala.reflect.api.Universe` は abstract class で、`JavaUniverse` からの継承は pickle にしかない。`u.NoMods` は `invokevirtual scala/reflect/api/Universe.NoMods()` になり検証に落ちる。reification は同じ値を作る `u.Modifiers(rs.FlagsRepr(0L))` を使う（`Modifiers(flags)` は `Modifiers(flags, typeNames.EMPTY, Nil)`） | `Reifier::mods` |
+
+#### slick への効き方
+
+`tests/slick_measure.sh`（scala-reflect.jar 入り）で `errors=257 → 255`。
+数字が動かないのは、**同じ行が別の理由で落ちるようになった**からで、
+quasiquote 系の内訳は次のとおり。
+
+| 診断 | before | after |
+| --- | --- | --- |
+| `unimplemented syntax: quasiquote …`（形が足りない） | 10 | **4** |
+| `cannot expand quasiquote …`（reify 自体が無い） | 1 | **0** |
+| `TableQuery.scala` のエラー合計 | 11 | **6** |
+
+残り 4 件の内訳は `q"…_.get…"` が 3 件（`_` プレースホルダ）と
+`q"""…"""` の中の `type` 定義が 1 件。`ShapedValue.mapToImpl` の 8 つの型注釈は
+**形としては通るようになり**、いま落ちているのは `$uTag` / `$rTag` が
+`WeakTypeTag` で `Tree` ではないため（§7.5 の 4、`Liftable`）である:
+
+```
+error: no matching overload for SyntacticFunctionTypeExtractor
+       with arguments (List[TypeTags$WeakTypeTag[U]], TypeTags$WeakTypeTag[R])
+```
+
+つまり `mapToImpl` の次の一手は **`Liftable`** であって、形ではない。
+
+#### このスライスのあとに残っているもの
+
+1. **`Liftable`。** `Tree` でない穴（`WeakTypeTag` / `Name` / `Int` / `String` /
+   `Symbol`）を implicit で持ち上げる。`ShapedValue` の残りはすべてこれ。
+2. **`_` プレースホルダと右結合演算子。** どちらも nsc は `freshTermName` を
+   使ったブロックを作る。作るなら同じ形にする必要がある。
+3. **`..$` と普通の引数の混在**、および**期待型からの型パラメータ推論**（§7.5）。
+4. **定義の quasiquote**（`SyntacticClassDef` / `SyntacticDefDef` / `Modifiers`
+   のフラグ変換）。`ShapedValue` の `q"""…"""` 全体はこれが要る。
+5. **`reify { … }` と `typeOf[T]` / `symbolOf[T]`。** `reify` も quasiquote と
+   同じ fast track マクロで、自前実装が要る。`TableQuery` の残り 6 件のうち
+   3 件がこれ。
+6. **engine（フェーズ 2）。** マクロを*呼ぶ*ための JVM ブリッジ。

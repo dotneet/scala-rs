@@ -95,9 +95,13 @@ fn wrap(kind: QuasiKind, body: &str) -> String {
         QuasiKind::Pattern => format!(
             "object qqProbe {{ def qqBody(qqScrut: Any) = qqScrut match {{ case {body} => () }} }}\n"
         ),
-        QuasiKind::Case => {
-            format!("object qqProbe {{ def qqBody(qqScrut: Any) = qqScrut match {{\n{body}\n}} }}\n")
-        }
+        // `cq"..."` writes the clause *without* its `case` keyword
+        // (`cq"x => y"`); nsc rejects `cq"case x => y"` outright, so the
+        // keyword is supplied here and a body that spells it out fails to
+        // parse, exactly as it does under nsc.
+        QuasiKind::Case => format!(
+            "object qqProbe {{ def qqBody(qqScrut: Any) = qqScrut match {{\ncase {body}\n}} }}\n"
+        ),
     }
 }
 
@@ -144,19 +148,35 @@ pub(crate) fn hole_ranks(parts: &[String], nargs: usize) -> Vec<u8> {
 /// `Err(reason)` names the syntax scala-rs could not parse, for an
 /// `unimplemented syntax: quasiquote ...` diagnostic. An empty body is an
 /// error in nsc too (`q""` has nothing to build).
-pub(crate) fn parse_body(kind: QuasiKind, parts: &[String], nargs: usize) -> Result<Tree, String> {
-    let program = parse_program(kind, parts, nargs)?;
-    unwrap_body(kind, &program).ok_or_else(|| {
+///
+/// The wrapper source the body was parsed from comes back with it: the spans
+/// in the tree index into it, and reification needs the text to tell apart two
+/// types the parser folds into one node (`A => B` and `Function1[A, B]`).
+pub(crate) fn parse_body(
+    kind: QuasiKind,
+    parts: &[String],
+    nargs: usize,
+) -> Result<(Tree, String), String> {
+    let (program, src) = parse_program(kind, parts, nargs)?;
+    let braced = splice_placeholders(parts, nargs)
+        .trim_start()
+        .starts_with('{');
+    let body = unwrap_body(kind, &program, braced).ok_or_else(|| {
         format!(
             "the body of {}\"...\" is not one reification takes apart yet",
             kind.prefix()
         )
-    })
+    })?;
+    Ok((body, src))
 }
 
 /// Parse the wrapper program around the body. Shared by the checker, which
 /// only wants to know whether it parsed, and by `parse_body`.
-fn parse_program(kind: QuasiKind, parts: &[String], nargs: usize) -> Result<Tree, String> {
+fn parse_program(
+    kind: QuasiKind,
+    parts: &[String],
+    nargs: usize,
+) -> Result<(Tree, String), String> {
     let body = splice_placeholders(parts, nargs);
     if body.trim().is_empty() {
         return Err("empty quasiquote".to_string());
@@ -173,11 +193,16 @@ fn parse_program(kind: QuasiKind, parts: &[String], nargs: usize) -> Result<Tree
     if let Some(what) = first_unimplemented(&res.tree) {
         return Err(what);
     }
-    Ok(res.tree)
+    Ok((res.tree, src))
 }
 
 /// Dig the body back out of the program `wrap` built around it.
-fn unwrap_body(kind: QuasiKind, tree: &Tree) -> Option<Tree> {
+///
+/// `braced` says whether the quasiquote's *own* text opened with `{`. The
+/// wrapper adds braces of its own, and the parser cannot tell them from the
+/// author's -- but nsc can: `q"val v = $x"` is a bare `SyntacticValDef` and
+/// `q"{ val v = 1 }"` is a `SyntacticBlock` holding one.
+fn unwrap_body(kind: QuasiKind, tree: &Tree, braced: bool) -> Option<Tree> {
     let stats = match &tree.kind {
         TreeKind::PackageDef { stats, .. } => stats,
         _ => return None,
@@ -196,9 +221,35 @@ fn unwrap_body(kind: QuasiKind, tree: &Tree) -> Option<Tree> {
         // had several statements.
         (QuasiKind::Term, TreeKind::DefDef { rhs, .. }) => Some(match &rhs.kind {
             TreeKind::Block { stats, expr } if stats.is_empty() => (**expr).clone(),
+            // A body that is one definition and nothing else: the block is the
+            // wrapper's, not the quasiquote's.
+            TreeKind::Block { stats, expr }
+                if !braced
+                    && stats.len() == 1
+                    && matches!(
+                        &expr.kind,
+                        TreeKind::Empty
+                            | TreeKind::Literal {
+                                lit: scala_rs_parser::Lit::Unit
+                            }
+                    ) =>
+            {
+                stats[0].clone()
+            }
             _ => (**rhs).clone(),
         }),
         (QuasiKind::Type, TreeKind::TypeDef { rhs, .. }) => Some((**rhs).clone()),
+        // `qqScrut match { case <body> => () }`: the pattern alone.
+        (QuasiKind::Pattern, TreeKind::DefDef { rhs, .. }) => match &rhs.kind {
+            TreeKind::Match { cases, .. } if cases.len() == 1 => Some(cases[0].pat.clone()),
+            _ => None,
+        },
+        // `qqScrut match { <body> }`: the `match` itself, whose single case is
+        // what `cq"..."` wrote.
+        (QuasiKind::Case, TreeKind::DefDef { rhs, .. }) => match &rhs.kind {
+            TreeKind::Match { .. } => Some((**rhs).clone()),
+            _ => None,
+        },
         _ => None,
     }
 }
