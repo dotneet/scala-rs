@@ -4741,6 +4741,34 @@ impl Typer {
         }
     }
 
+    /// The `import <a value>._` prefix a member of `owner` was reached
+    /// through, when that prefix can still be written here.
+    ///
+    /// Shared by the two places that need it: rewriting a bare name back into
+    /// `u.name` for the backend ([`Self::qualify_term_import`]), and reading
+    /// an imported implicit at the prefix's type
+    /// (`Typer::implicit_candidate_ty`). A member the enclosing class already
+    /// has is reached through `this` and is not this import's.
+    pub(crate) fn term_import_prefix_for(&self, owner: SymbolId) -> Option<&Tree> {
+        if owner.is_none() || self.term_import_prefixes.is_empty() {
+            return None;
+        }
+        if !self.st.this_class.is_none()
+            && (owner == self.st.this_class
+                || crate::pickle_supply::inherits_from(&self.st, self.st.this_class, owner))
+        {
+            return None;
+        }
+        self.term_import_prefixes
+            .iter()
+            .rev()
+            .find(|(o, q)| {
+                (*o == owner || crate::pickle_supply::inherits_from(&self.st, *o, owner))
+                    && self.prefix_in_scope(q)
+            })
+            .map(|(_, q)| q)
+    }
+
     /// Turn an unqualified `Literal` that came from `import u._` back into
     /// `u.Literal`, so the backend has a receiver to load.
     ///
@@ -4767,12 +4795,7 @@ impl Typer {
         {
             return false;
         }
-        let Some((_, prefix)) = self.term_import_prefixes.iter().rev().find(|(o, q)| {
-            owners
-                .iter()
-                .any(|&m| m == *o || crate::pickle_supply::inherits_from(&self.st, *o, m))
-                && self.prefix_in_scope(q)
-        }) else {
+        let Some(prefix) = owners.iter().find_map(|&o| self.term_import_prefix_for(o)) else {
             return false;
         };
         let qual = prefix.clone();
@@ -5207,6 +5230,26 @@ impl Typer {
             while let Some(cur) = work.pop_front() {
                 if cur.is_none() || !walked.insert(cur.0) {
                     continue;
+                }
+                // A jar class's members are read one name at a time, and this
+                // import asks for no name in particular. Its *implicits* are
+                // the ones nothing else will ever ask for -- an implicit is
+                // found by searching the scope, not by being written down --
+                // so `import seq.integral._` brought neither
+                // `Numeric#mkNumericOps` nor `Ordering#mkOrderingOps` into
+                // scope and `increment < zero` was
+                // `value < is not a member of T`. Only a name the class has
+                // no member for is asked, so a hand-written prelude
+                // declaration still wins.
+                if self.library_abi {
+                    for n in self
+                        .pickle
+                        .implicit_member_names(&self.st, &mut self.binary, cur)
+                    {
+                        if self.st.lookup_member(cur, &n).is_empty() {
+                            self.supply_from_pickle_class(cur, &n);
+                        }
+                    }
                 }
                 for m in self.st.get(cur).members.clone() {
                     let n = self.st.get(m).name.clone();
@@ -7719,8 +7762,13 @@ impl Typer {
                 found = terms;
             }
         }
+        // The conversion a view inserted, when one was: the member it produced
+        // may be declared at the type parameters of the *value* the conversion
+        // was imported from, which only that prefix can fill in.
+        let mut ext_conv = SymbolId::NONE;
         if found.is_empty() {
             if let Some((conv, member, to)) = self.search_extension(&recv_ty, &name, tree.span) {
+                ext_conv = conv;
                 let span = qual.span;
                 let old = std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty));
                 let from = old.ty.clone();
@@ -7866,6 +7914,15 @@ impl Typer {
             _ => Vec::new(),
         };
         let subst = |ty: Type| -> Type {
+            // `import seq.integral._; increment < zero` is
+            // `integral.mkOrderingOps(increment) < zero`, and `OrderingOps#<`
+            // takes an `Ordering`'s `T`, not one of its own: the receiver here
+            // is `OrderingOps`, which has no argument to read it off.
+            let ty = if ext_conv.is_none() {
+                ty
+            } else {
+                self.at_import_prefix_of(ext_conv, &ty).unwrap_or(ty)
+            };
             let ty = self.st.subst_as_seen_from(&recv_ty, &ty);
             if !subst_args.is_empty() {
                 if let Some(owner) = found.first().map(|s| self.st.get(*s).owner) {
@@ -8455,7 +8512,8 @@ impl Typer {
         };
         **qual = self.fill_conv_implicits(conv, &from, applied, span);
         fun.sym = member;
-        fun.ty = self.st.get(member).ty.clone();
+        let mty = self.st.get(member).ty.clone();
+        fun.ty = self.at_import_prefix_of(conv, &mty).unwrap_or(mty);
         true
     }
 
@@ -17224,6 +17282,54 @@ impl Typer {
     pub(crate) fn warm_implicit_scope(&mut self, pt: &Type) {
         for c in self.implicit_scope_classes(pt) {
             self.load_companion_module(c);
+            self.warm_pickled_implicits(c);
+        }
+    }
+
+    /// The implicit members a *standard library* companion declares.
+    ///
+    /// [`Self::load_companion_module`] deliberately stops at `scala.*`: the
+    /// prelude is what describes the library. But the prelude describes what
+    /// programs *name*, and nothing ever names an implicit -- it is found by
+    /// searching a scope. `Option.option2Iterable` was therefore in no
+    /// member list at all, and `where.reduceLeft(f)` / `c.where.toSeq` on an
+    /// `Option[Node]` (slick's `JdbcStatementBuilderComponent`) were
+    /// `value reduceLeft is not a member of Option[Node]`.
+    ///
+    /// Only a name the companion has no member for is asked, so a
+    /// hand-written prelude declaration still wins and no second copy of one
+    /// is installed next to it.
+    fn warm_pickled_implicits(&mut self, class_id: SymbolId) {
+        if !self.library_abi || class_id.is_none() {
+            return;
+        }
+        // `object Int`'s implicits are `int2long` / `int2float` / `int2double`
+        // -- the numeric widenings, which `weak_conforms` already implements
+        // directly. As *views* they would only compete: `n + ":"` has no
+        // `Int#+(String)` in the prelude, so it is `any2stringadd`, and with
+        // three more conversions that also offer a `+` the search became
+        // ambiguous and the selection failed outright.
+        if self.st.is_primitive_value_class(class_id) {
+            return;
+        }
+        let mcls = match self.st.get(class_id).kind {
+            SymKind::Module => self.st.module_class_of(class_id),
+            SymKind::ModuleClass => class_id,
+            _ => match self.st.companion_module(class_id) {
+                Some(m) => self.st.module_class_of(m),
+                None => return,
+            },
+        };
+        if mcls.is_none() {
+            return;
+        }
+        for n in self
+            .pickle
+            .implicit_member_names(&self.st, &mut self.binary, mcls)
+        {
+            if self.st.lookup_member(mcls, &n).is_empty() {
+                self.supply_from_pickle_class(mcls, &n);
+            }
         }
     }
 
