@@ -1284,7 +1284,7 @@ impl PickleSupply {
     /// parent chain would change subtyping for everything, and the prelude's
     /// own hierarchy is the one existing programs are checked against. The cost
     /// is that a stubbed type is only usable as itself (see README).
-    fn ensure_class(
+    pub(crate) fn ensure_class(
         &mut self,
         st: &mut SymbolTable,
         bin: &mut BinaryIndex,

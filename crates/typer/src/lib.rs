@@ -11,6 +11,7 @@ mod lazysig;
 mod lin;
 mod localobj;
 mod macros;
+mod materialize;
 mod override_check;
 mod pickle_supply;
 mod prelude;

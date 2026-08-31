@@ -1175,3 +1175,163 @@ nsc でビット 2）。値はすべて `-Ymacro-debug-lite` が印字する
 4. **`q"{ type T = Int }"`**（`SyntacticTypeDef`）
 5. **`reify { … }` と `typeOf[T]` / `symbolOf[T]`**
 6. **engine（フェーズ 2）**
+
+### 7.10 `TypeTag` / `WeakTypeTag` の materialization（`agent/typetag` スライス）
+
+§7.8 の残件 1。**`typeOf[T]` / `weakTypeOf[T]` / `typeTag[T]` が単相型について
+実際に動くようになった。** `c.typeOf[HList]`（slick の `ShapedValue.mapToImpl`）
+と `TableQuery` の `typeOf[Tag]` はこれが無くて止まっていた。
+
+#### nsc が何をしているか（`-Xprint:typer` で実物確認）
+
+`def typeOf[T](implicit ttag: TypeTag[T]): Type` の implicit が見つからないとき、
+nsc は「見つからない」と言わない。**コンパイラ内蔵マクロ
+`materializeTypeTag[T](u)`** を展開して、その場でタグを**作る**:
+
+```scala
+scala.reflect.runtime.`package`.universe.typeOf[String](({
+  val $u: reflect.runtime.universe.type = scala.reflect.runtime.`package`.universe;
+  val $m: $u.Mirror = $u.runtimeMirror(this.getClass().getClassLoader());
+  $u.TypeTag.apply[String]($m, {
+    final class $typecreator1 extends TypeCreator {
+      def apply[U <: scala.reflect.api.Universe with Singleton](
+          $m$untyped: scala.reflect.api.Mirror[U]): U#Type = {
+        val $u: U = $m$untyped.universe;
+        val $m: $u.Mirror = $m$untyped.asInstanceOf[$u.Mirror];
+        $u.internal.reificationSupport.TypeRef(…)   // String はここまで書く
+      }
+    };
+    new $typecreator1()
+  })
+}: reflect.runtime.universe.TypeTag[String]))
+```
+
+マクロ実装の中（`c.typeOf[Hl]`）だと `$u` は `c.universe`、`$m` は
+`c.universe.rootMirror` になり、トップレベルのクラスは
+`$m.staticClass("Hl").asType.toTypeConstructor` の 1 行で済む。
+`Int` のような基本型は `TypeCreator` すら作らず `$u.TypeTag.Int` を使う。
+
+#### scala-rs が組む木
+
+実装は `crates/typer/src/materialize.rs`、入口は
+`Check::materialize_tag`（`fill_implicit_params_in` の
+`classtag_apply_fallback` と同じ並びのフォールバック。nsc が `ClassTag` を
+materialize するのと同じ位置である）。
+
+```text
+{
+  final class $typecreator1 extends scala.reflect.api.TypeCreator {
+    def apply[U <: scala.reflect.api.Universe with Singleton](
+        $m$untyped: scala.reflect.api.Mirror[U]): <Types.TypeApi> =
+      $m$untyped.staticClass("Foo").asType.toTypeConstructor
+  }
+  <universe>.TypeTag.apply[Foo](
+    <universe>.rootMirror.asInstanceOf[<api.Mirror>], new $typecreator1())
+}
+```
+
+これは**普通の untyped な scala-rs の木**で、quasiquote の reification と同じく
+そのまま `type_expr` に通す。ローカルクラスがブロックの中に立つのは、typer の
+`TreeKind::Block` が「まだシンボルの無い `ClassDef` にはその場で namer を回す」
+ようにできているからで、implicit 探索の最中に定義を 1 つ生やせる。
+
+universe をどれにするかは `universe_in_scope()`——`import <universe>._` の prefix
+——で決める。quasiquote が `q"..."` の universe を決めるのと同じ読み方である。
+その import が無ければ materialize せず、今までどおり「no implicit」と言う。
+
+#### nsc と違えた 3 点（**木の一致は要求しない**）
+
+タグの木そのものではなく、**`tag.tpe` の実行結果**（`toString` / `=:=` / `<:<` /
+`typeSymbol.fullName`）が実 scalac 2.13.16 と一致することを検証している
+（`tests/fixtures/tt_tags.scala`、30 行）。違いは 3 つ:
+
+| | nsc | scala-rs | なぜ |
+| --- | --- | --- | --- |
+| `$u` / `$m` の束縛 | `val` に束ねてから使う | `apply` の引数を直接選択する | 木が小さい。`tag.tpe` は同じ |
+| runtime universe の mirror | `runtimeMirror(getClass.getClassLoader)` | `rootMirror` | `JavaUniverse#runtimeMirror` はまだ供給できない（パラメータの `java.lang.ClassLoader` にシンボルが無く、`ensure_class` が `scala.` 以外の pickle 無しクラスを断る）。root mirror の class loader から見えないクラスでだけ挙動が違い、そのときは `ScalaReflectionException` になる（黙って違う型にはならない） |
+| creator の結果型 | `U#Type` と書き、nsc の erasure が `Types$TypeApi` にする | `Types$TypeApi` を直接書く | scala-rs は抽象型メンバを `Object` に erase する（`erasure::erase_ty`）。`TypeCreator.apply` は**抽象**なので、`Object` を返す descriptor は何も override せず、最初の `tag.tpe` が `AbstractMethodError` になる |
+
+mirror の引数に `asInstanceOf` を挟むのも同じ性質の埋め合わせである。
+`rootMirror` の型は universe の抽象メンバ `Mirror` で、その上界は pickle 上
+`JavaMirror` までしか辿れない（`JavaMirror extends api.Mirror[self.type]` の
+親は、singleton 引数が変換できないので `conv_upper_bound` が落とす）。
+値は本当に `Mirror` なので、cast は常に成功する `checkcast` になる。
+
+#### 供給側で塞いだ穴
+
+`u.TypeTag.apply` を呼ぶには、その前に 3 つ足りないものがあった（§7.8 の残件 5
+がまさにこれ）。
+
+| 直したもの | どこ |
+| --- | --- |
+| **`TypeTags$TypeTag$` にシンボルが無い。** トレイトの入れ子オブジェクトの classfile は自分の `ScalaSignature` を持たない（pickle は囲む `TypeTags` の中）ので `install_classpath` が読み飛ばす。結果、descriptor `()Lscala/reflect/api/TypeTags$TypeTag$;` は解決できない `Type::Named` のままで、`value apply is not a member of TypeTags$TypeTag$` だった。`ModuleClass` を建て、`apply[T](Mirror, TypeCreator): TypeTag[T]` を**手で**入れる。erased descriptor は書き下す（メソッドシンボルの `jvm_name` が `(` で始まればそれが descriptor になる。pickle 供給と同じ約束）。pickle の署名は `Mirror[TypeTags.this.type]` で、この singleton 引数を scala-rs は綴れない | `materialize::ensure_tag_module` |
+| **`TypeTags#typeOf` の implicit パラメータが `Type::Named`。** `install_classpath` が読む pickle サブセットはメンバ型を**単純名**で持つので、`TypeTags$TypeTag` という名前は誰も入れておらず未解決だった。これが `no implicit: could not find implicit value of type TypeTags$TypeTag[Foo]` の正体で、erasure もこの型から descriptor を書くところだった | `materialize::resolve_named_tags` |
+| **`TypeTags#TypeTag` のアクセサ自体が無いことがある。** `TypeTags` が classfile として読まれれば `TypeTag()` はメソッド一覧に載るが、pickle 経由（classpath 走査で誰も名指ししなかったとき）だと module メンバは `complete_named` が入れる形に含まれず、アクセサごと無い。descriptor を書いてここで宣言する。さらに `TypeTags` は `JavaUniverse` の**直接の**親ではない（`api.Universe` の親で、そこは pickle にしかない）ので、先に `supply_from_pickle` で祖先を辿らせておく——さもないと**その run の最初の `typeOf[T]` だけ**が「value TypeTag is not a member of JavaUniverse」で落ちた | `materialize::ensure_tag_module` / `Check::materialize_tag` |
+| **解決済みの型を型木として差せない。** `TypeTag.apply[T]` の `T` も、cast 先の `api.Mirror` も、使用地点には名前で辿る道が無い（`scala.reflect.api.Mirror` は import されていない）。nsc の `TypeTree(tp)` にあたる目印 `Ident("$resolvedType")` を置き、`tree_to_type` がその `ty` をそのまま返す | `materialize::RESOLVED_TYPE` / `Check::tree_to_type` |
+
+#### 作れる形と、名指しで断る形
+
+`staticClass(<name>)` は**クラスを 1 つ**名指しする呼び出しなので、
+scala-rs が組むのは**型引数の無いクラス型**だけである。
+
+作れる: 9 つの基本型 / `Unit` / `String` / `Any` / `AnyVal` / `Nothing` / `Null` /
+トップレベルのクラス・トレイト（`Foo`、`scala.math.BigInt`、
+`slick.collection.heterogeneous.HList`）。
+
+断る（`tests/fixtures/tt_tags_bad.scala` が固定している）:
+
+| 形 | 診断 | 理由 |
+| --- | --- | --- |
+| `typeOf[List[Int]]` | a type constructor applied to type arguments | nsc は prefix と symbol と引数から `TypeRef` を組む |
+| `typeOf[Nest.Inner]` | a class nested in a class or an object rather than a top-level one | `staticClass` はパッケージしか辿らない。nsc は `selectType` を使う |
+| `typeOf[AnyRef]` | which is an alias rather than a class | `java.lang.Object` の別名。`staticClass` は実行時に落ちる |
+| `typeOf[T]`（型パラメータ） | an abstract type with no tag in scope | nsc も `No TypeTag available for T` と断る。`WeakTypeTag` は free type を作るが未実装 |
+| `typeOf[Main.type]` | a singleton type | |
+| 構造的型 / 関数型 / タプル / 配列 | a structural type / whose type arguments would have to be reified too | |
+
+**黙って別の型を作らない**ことが要点である。間違ったタグはコンパイルエラーに
+ならず、実行時に「違う `Type`」としてマクロに渡るだけなので、後から見つけるのが
+最も難しい種類の欠陥になる。
+
+#### 検証
+
+- `tests/fixtures/tt_tags.scala` — scala-rs と実 scalac 2.13.16 の**両方**で
+  コンパイルして実行し、30 行の出力が完全一致する（`java -Xverify:all`）。
+  `crates/cli/tests/quasi.rs` の `tt_tags_materialises_type_tags` /
+  `tt_tags_matches_real_scalac`。
+- `tests/fixtures/tt_ctx.scala` — マクロ実装の中の `c.typeOf[HL]` /
+  `c.weakTypeOf[Rep]`（slick の `mapToImpl` の形）。両コンパイラが通し、
+  classfile が JVM にロード・検証される（展開には engine が要る）。
+- `tests/fixtures/tt_tags_bad.scala` — 断る 7 形がすべて名指しで診断される。
+
+#### slick への効き方
+
+`tests/slick_measure.sh`（scala-reflect.jar 入り）で `errors=223 → 221`、
+`files_with_errors=60 → 60`。内訳:
+
+| ファイル | before | after |
+| --- | --- | --- |
+| `ShapedValue.scala` | 10 | **9** |
+| `TableQuery.scala` | 7 | **6** |
+
+どちらも消えたのは `no implicit: could not find implicit value of type
+TypeTags$TypeTag[...]` で、`c.typeOf[slick.collection.heterogeneous.HList]` と
+`typeOf[Tag]` が**実際に通る**ようになった。ログに `TypeTag` の implicit エラーは
+1 件も残っていない。
+
+#### このスライスのあとに残っているもの
+
+1. **型引数のある型のタグ。** `TypeTag[List[Int]]`。nsc の
+   `internal.reificationSupport.TypeRef` / `SingleType` / `selectType` を
+   creator の本体に組む必要がある。入れ子クラス（`selectType`）も同じ道具立て。
+2. **タグの型を名前で書けない。** `implicitly[TypeTag[Foo]]` は
+   materialization ではなく `TypeTag` という**型名**が引けないところで落ちる
+   （無修飾は `not found: type TypeTag`、パス越しの `u.TypeTag[Foo]` は
+   `type TypeTag is not a member of JavaUniverse`）。§7.8 の残件 4・5 のままで、
+   `typeTag[Foo]` / `weakTypeTag[Foo]` は同じ implicit を要求するので通る。
+3. **`runtimeMirror(getClass.getClassLoader)`。** `java.lang.ClassLoader` に
+   シンボルが無く、`ensure_class` が `scala.` 以外の pickle 無しクラスを断るため
+   メンバごと供給されない（`parameter cl has an unmappable type`）。
+4. **`reify { … }` 本体**（§7.8 の残件 2）。式全体の `TreeCreator` 化。
+   materialization と同じ機構の上に載る。
+5. **engine（フェーズ 2）。** マクロを*呼ぶ*ための JVM ブリッジ。

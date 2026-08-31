@@ -202,9 +202,29 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
   だった。節が implicit だけで、その implicit が当の型パラメータを要求する形に
   限って残す（`classTag[Short]` と同じく常に明示型引数で呼ばれる）。
   マクロ実装の中では `implicit rTag: c.WeakTypeTag[R]` が implicit を埋めるので
-  `symbolOf[R]` が実際に解ける。外では
-  `no implicit: could not find implicit value of type TypeTags$TypeTag[Int]` と
-  正直に言う（`TypeTag` の materialization は未実装）
+  `symbolOf[R]` が実際に解ける
+- **`TypeTag` / `WeakTypeTag` の materialization**: `typeOf[T]` の implicit は
+  プログラムのどこにも書かれていない。nsc は「見つからない」と言わず、
+  コンパイラ内蔵マクロ `materializeTypeTag[T](u)` を展開して**その場でタグを作る**。
+  scala-rs も同じ位置（`fill_implicit_params_in` の `ClassTag` フォールバックの隣）で、
+  `TypeCreator` の無名クラスを含むブロックを組んで普通の式として型検査する
+  （`crates/typer/src/materialize.rs`）。作るのは
+  `<universe>.TypeTag.apply[T](<universe>.rootMirror, new $typecreator1())` で、
+  creator の本体は `$m$untyped.staticClass("Foo").asType.toTypeConstructor`。
+  universe は `import <universe>._` の prefix から決める（quasiquote と同じ読み方）。
+  **木は nsc と同じでなくてよく、`tag.tpe` の実行結果が一致する**ことを
+  実 scalac 2.13.16 との dual-run で見る（`tests/fixtures/tt_tags.scala`、30 行一致）。
+  `staticClass` はクラスを 1 つ名指しする呼び出しなので、組めるのは
+  **型引数の無いトップレベルのクラス型**（＋基本型 / `Unit` / `String` / `Any` /
+  `AnyVal` / `Nothing` / `Null`）だけで、`List[Int]` / 入れ子クラス / `AnyRef` /
+  型パラメータ / singleton 型は
+  `materialisation is not implemented: cannot build a TypeTag for ...` と
+  **その形を名指しして**断る（黙って別の型を作らない）。
+  ついでに、`TypeTags$TypeTag$` のシンボルが無いこと（トレイトの入れ子オブジェクトの
+  classfile は自分の pickle を持たない）、`typeOf` の implicit パラメータが
+  未解決の `Type::Named` だったこと、`TypeTags#TypeTag` アクセサが供給されないことを
+  直した。slick の `c.typeOf[HList]` / `typeOf[Tag]` はこれで通る
+  （[`docs/macros.md`](docs/macros.md) §7.10）
 - **`reify { … }` の診断**: `reify` は quasiquote と同じコンパイラ内蔵マクロで、
   scala-reflect.jar に実装が無い。`value reify is not a member of JavaUniverse`
   という**誤った**診断をやめ、
@@ -3187,8 +3207,9 @@ implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラー
   残っているのは、パーサが nsc の保つ区別ごと正規化してしまう形
   （右結合演算子 `a :: b`、`else` の無い `if`、`_` プレースホルダ、by-name 型）、
   `..$` と普通の引数の混在、`class` / `def` 定義、標準インスタンスの無い型の穴
-  （`liftList` / `liftTuple*` など）、そして `reify { … }` と
-  `TypeTag` の materialization です。いずれも
+  （`liftList` / `liftTuple*` など）、そして `reify { … }` です
+  （`TypeTag` / `WeakTypeTag` の materialization は**単相型について実装済み**。
+  型引数のある型・入れ子クラスは名指しで断ります。§7.10）。いずれも
   `unimplemented syntax: quasiquote ... (どの形か)` / `a hole of type X is not
   lifted (…)` / `cannot expand reify { ... }` と**名指しして**報告します
   （黙って通しません）。何が要るかは
@@ -3202,9 +3223,10 @@ implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラー
   `type` 定義、そして `reify { … }` です。いずれも
   `unimplemented syntax: quasiquote ... (どの形か)` と**その形を名指しして**
   報告します（黙って通しません）。何が要るかは
-  [`docs/macros.md`](docs/macros.md) §7.7 / §7.8 に列挙しました。
+  [`docs/macros.md`](docs/macros.md) §7.7 / §7.8 / §7.10 に列挙しました。
   slick の `ShapedValue.mapToImpl` は、scala-reflect.jar を `-cp` に置くと
-  エラーが 20 件 → 10 件になりました（`Liftable` と `symbolOf[R]`）
+  エラーが 20 件 → 9 件になりました（`Liftable` / `symbolOf[R]` /
+  `TypeTag` の materialization）
 - full nsc pickle（出しているのは TERMname / TYPEname / TYPEsym / CLASSsym / MODULESYM / VALsym / EXTref / EXTMODCLASSref / METHODtpe / POLYtpe / TYPEREFtpe / CLASSINFOtpe / TYPEBOUNDStpe / THIStpe / SINGLEtpe / NOPREFIXtpe / CONSTANTtpe / LITERALint / LITERALboolean / LITERALstring ほかリテラル / EXISTENTIALtpe / REFINEDtpe / SYMANNOT / ANNOTATEDtpe / ANNOTINFO / TREE（IDENTtree / SELECTtree / THIStree / SUPERtree / APPLYtree）のサブセット。ByteCodecs は SID-10。ワイヤ形式は nsc と同じ nentries + ビッグエンディアン Nat。vals は METHOD|STABLE|ACCESSOR ゲッター + NullaryMethodType。case class は CASE + フィールド CASEACCESSOR。Flags は nsc raw long を `rawToPickledFlags`（VARARGS / BRIDGE / JAVA を適用箇所で出す）。scalac 2.13.16 が `val` / パラメータ付き `def` / `id[T]` / `new Point` + `p.x` / companion apply `Point(...)` / term `Point` / extractor `unapply` / object の `def` / `def f(xs: List[_]): Int` / `@deprecated("msg", "2.13.0") def g` / `def me: this.type` / `def f(xs: List[_ <: AnyRef])` / `def h(x: Int @unchecked)` / `val one: 1` / `def lit(x: 1)` / `def nest(xs: List[_ <: List[_]])` / `def idRef(x: MixA with MixB { def f: Int })` / `@Ann(foo)` / `@Ann(c.x)` / `@Ann(this)` / `@Ann(classOf[Int])` / `@Ann(ident(1))` / `@Ann(this.x)` / `@Ann(super.foo)` / `@Ann(ident(ident(1)))` / `@Ann(foo = 1)` / `@Ann(foo = this.x)` / `@Ann(foo = bar)` / `Lib.join("a","b")` / `new OrdBox(1).compare(...)` を typecheck できる範囲。**パラメータ節は 1 つに潰れる**（`uncurry` がシンボル上の `paramss` を平坦化したあとに pickle するので、`def bind(fa)(f)` は `bind(fa, f)` として読まれる）。**CLASSINFOtpe の親は `Object` だけ**（`trait Monadic[F[_]] extends Functor[F]` の継承関係は pickle に載らない。classfile の interfaces には載るので、こちら側の `-cp` 読みでは効く）。full pickle ではない。残る穴は Remaining）
 
 対象外（診断する / パースしない）:
@@ -4248,6 +4270,8 @@ quasiquote と、その受け皿である reflect ABI の下地は `crates/cli/t
 
 接頭辞 `lf2` は **`Liftable`**（`docs/macros.md` §7.8）です。`tests/fixtures/lf2_lift.scala` は `Tree` でない穴——リテラル 7 種・`Constant`・`TermName` / `TypeName`（項・型・パターン・名前枠の 4 つの位置）・`Type`・`Symbol`・`..$` 越しの要素——を **29 行ぶん `showRaw`（`TypeTree` は中身の型が隠れるので `show` も）で印字**し、`lf2_lift_builds_the_standard_liftable_trees`（`java -Xverify:all` で実行して `expected/lf2_lift.txt` と一致）と `lf2_lift_matches_real_scalac`（**実 scalac 2.13.16** と三者一致）の 2 通りで回します。実 scalac 側は nsc 自身が implicit `Liftable` を推論するので、これで scala-rs が組む木が**標準インスタンスの作る木と同じ**であることが固定されます。`tests/fixtures/lf2_ctx.scala` は materialiser 無しには実行時に作れない 2 つ（`WeakTypeTag` と `Expr`。slick の `mapToImpl` が使うもの）を**マクロ実装として**書いたもので、`lf2_ctx_lifts_tags_and_exprs_in_a_macro_implementation` が scala-rs と実 scalac の両方でコンパイルできること、classfile が JVM にロード・検証されることを見ます。`symbolOf[T]` / `weakTypeOf[T]`（型パラメータを implicit 節にしか書かないメンバ）もここに入っています。異常系 `lf2_lift_bad.scala` は `lf2_lift_bad_names_every_hole_it_cannot_lift` が、標準インスタンスの無い型（`File`）・rank 0 のコレクション（`List[Int]`）・`..$` 越しの `Symbol`（nsc も断る）を**型を名指しして**診断し、`reify { … }` が `cannot expand reify { ... }` になること（以前の**誤った**診断 `value reify is not a member of JavaUniverse` が戻らないこと）を固定します。
 
+接頭辞 `tt` は **`TypeTag` / `WeakTypeTag` の materialization**（`docs/macros.md` §7.10）です。`tests/fixtures/tt_tags.scala` はタグを 1 つも書かずに `typeOf` / `weakTypeOf` / `typeTag` / `weakTypeTag` を呼び、作られたタグの `tpe` を **30 行ぶん印字**して `tt_tags_materialises_type_tags`（`java -Xverify:all` で実行して `expected/tt_tags.txt` と一致）と `tt_tags_matches_real_scalac`（**実 scalac 2.13.16** と三者一致）の 2 通りで回します。scala-rs が組む木は nsc の木と同じではない（`$u` / `$m` の束縛を省き、mirror を cast し、creator の結果型を書き下す）ので、固定しているのは**答え**——`toString` / `=:=` / `<:<` / `typeSymbol.fullName`——です。`tests/fixtures/tt_ctx.scala` はマクロ実装の中の `c.typeOf[T]`（slick の `ShapedValue.mapToImpl` が `uTag.tpe <:< c.typeOf[HList]` と書く形）で、`tt_ctx_materialises_in_a_macro_implementation` が両コンパイラでコンパイルできること・classfile が JVM にロード・検証されることを見ます。異常系 `tt_tags_bad.scala` は `tt_tags_bad_names_every_tag_it_cannot_build` が、組めない 7 形（型引数のある型・入れ子クラス・`AnyRef`・型パラメータ・singleton 型）を**その形の名前つきで**診断し、`no implicit: could not find implicit value of type TypeTags$TypeTag[...]` に戻らないことを固定します。
+
 def マクロは `crates/cli/tests/macros.rs` にまとめています。呼ばれない macro def のコンパイルと、`Sugar$.class` にメソッドが出ていないことは `macro_def.scala`。マクロ呼び出しの診断は `macro_call_bad.scala`（`macro expansion is not implemented`）。戻り値型の無いマクロ def は `macro_no_result_type_bad.scala`。`Context` を第 1 引数に取らない実装は `macro_impl_shape_bad.scala`。解決できない実装参照は `macro_impl_missing_bad.scala`。whitebox は `macro_whitebox_bad.scala`。設計は [`docs/macros.md`](docs/macros.md)。
 
 名前付き引数とデフォルト引数は `tests/fixtures/namedargs.scala` にまとめ、`crates/cli/tests/e2e.rs` から 2 通りで回します: `scala_library_dual_run_namedargs`（jar リンクで実行し `expected/namedargs.txt` と一致）と `real_scalac_dual_run_namedargs`（**実 scalac 2.13.16 でコンパイル・実行した stdout** と、期待値および scala-rs の出力の三者が一致することを見る）。中身は並べ替え（`Api.area(height = 3, width = 4)`）、自分の位置にある名前付き引数のあとの位置引数（`Api.area(width = 4, 3)`）、デフォルトとの組み合わせ、コンパニオン `apply`、後続の引数リストのデフォルト（`Api.curried(1)(2)` / `Api.dep(4)()`）、可変長引数（`Api.tagged(first = 1)` / `Api.tagged(first = 1, 2, 3)`）、case class の `apply` / `copy` / `super.info.copy(port = 2)`、コンストラクタの名前付き引数とデフォルト（`new Server(threads = 8)` / `new Server()`）、パラメータ名で絞るオーバーロードです。負例は `namedargs_unknown_bad.scala`（`unknown parameter name: q`。メソッドとコンストラクタの両方）、`namedargs_dup_bad.scala`（`parameter 'c' is already specified at parameter position 2`）、`namedargs_order_bad.scala`（`positional after named argument.`）で、いずれも文面を実 scalac 2.13.16 に合わせています。
@@ -4292,6 +4316,9 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 | `qr_forms_bad.scala`（同上） | パーサが区別ごと正規化してしまう形が、必ず名指しで診断されること（右結合演算子 / `else` の無い `if` / `_` プレースホルダ / by-name 型 / `..$` の混在 / `type` 定義） | （診断のみ） |
 | `dq_defs.scala`（`crates/cli/tests/quasi.rs`、scala-reflect.jar が要る） | 定義の reification（実 scalac 2.13.16 と三者一致、`showRaw` まで）: `class` / `case class` / `trait` / `object` / `def` / 修飾つき `val`・`var`、`Modifiers` のフラグ、クラス・パラメータのアクセサ・フラグ、implicit 節、型パラメータと変位・境界、nsc が補う親、定義を含むブロック、匿名クラスの本体、名前・パラメータ・親・本体の位置の穴 | `expected/dq_defs.txt`（93 行） |
 | `dq_defs_bad.scala`（同上） | 定義のうち落とせない 13 形が、必ず名指しで診断されること（自分型 / early definition / `private[X]` / by-name・可変長パラメータ / 手続き構文 / 型も本体も無い `def` / パターン定義 / 高階型パラメータ / context bound / `case` クラスの親の `..$` / 末尾でない implicit 節 / `macro` 定義） | （診断のみ） |
+| `tt_tags.scala`（`crates/cli/tests/quasi.rs`、scala-reflect.jar が要る） | `TypeTag` / `WeakTypeTag` の materialization。`typeOf` / `weakTypeOf` / `typeTag` / `weakTypeTag` が作ったタグの `tpe` を、クラス・トレイト・9 つの基本型・`Unit` / `String` / `Any` / `AnyVal` / `Nothing` / `Null`・ライブラリのクラスについて印字し、`=:=` / `<:<` / `typeSymbol.fullName` まで**実 scalac 2.13.16 と三者一致**（`java -Xverify:all`） | `expected/tt_tags.txt`（30 行） |
+| `tt_ctx.scala`（同上） | マクロ実装の中の `c.typeOf[T]` / `c.weakTypeOf[T]`（slick の `ShapedValue.mapToImpl` の形）。scala-rs と実 scalac の**両方**がコンパイルでき、classfile が JVM にロード・検証されること | （ロード確認のみ。展開には engine が要る） |
+| `tt_tags_bad.scala`（同上） | 組めないタグの 7 形が、必ず名指しで診断されること（`List[Int]` / `Option[Foo]` / 入れ子クラス / `AnyRef` / 型パラメータ（`TypeTag` と `WeakTypeTag`）/ singleton 型）と、`no implicit: ... TypeTags$TypeTag` に戻らないこと | （診断のみ） |
 
 `mism2.scala` は `crates/cli/tests/mismatch2.rs` から回します。同ファイルには最小形の
 受理テスト（`a_default_argument_may_name_a_later_units_member` /
@@ -6088,8 +6115,9 @@ error: value += is not a member of T
   メソッド型パラメータ推論、
   (c) `class` / `def` 定義の quasiquote（`SyntacticClassDef` / `Modifiers` の
   フラグ変換）。`ShapedValue` の `q"""…"""` 全体はこれが要る、
-  (d) `reify { … }` 本体と `TypeTag` の materialization（どちらも式・型を
-  `TreeCreator` / `TypeCreator` の無名クラスに落とすコンパイラ内蔵マクロ）。
+  (d) `reify { … }` 本体（式を `TreeCreator` の無名クラスに落とす
+  コンパイラ内蔵マクロ）。対になる `TypeTag` / `WeakTypeTag` の materialization は
+  §7.10 で入り、単相型については実 scalac と実行結果が一致する。
   落とせない形は**すべて名指しで診断する**
   （`unimplemented syntax: quasiquote ...` / `a hole of type X is not lifted (…)` /
   `cannot expand reify { ... }`）

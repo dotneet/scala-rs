@@ -12699,6 +12699,10 @@ impl Typer {
                     // eta-expanded (see `views.rs`).
                     } else if let Some(lam) = self.conversion_view(&pty, span) {
                         args.push(lam);
+                    // nsc does not report a missing `TypeTag[T]` either: it
+                    // expands `materializeTypeTag` (`crate::materialize`).
+                    } else if let Some(tag) = self.materialize_tag(&pty, span) {
+                        args.push(tag);
                     } else {
                         self.error(span, self.missing_implicit_message(&pty, diverged));
                     }
@@ -12772,6 +12776,116 @@ impl Typer {
             sym: apply,
             postfix: false,
         })
+    }
+
+    /// A class of the reflection API, loaded if the program has not named it.
+    ///
+    /// The materialiser reaches for `Mirror` and `TypeCreator`, which
+    /// `typeOf[Foo]` never mentions, so nothing has entered a symbol for
+    /// them; `ensure_class` reads the pickle the way a signature conversion
+    /// would.
+    fn reflect_class(&mut self, full_name: &str, jvm: &str) -> Option<SymbolId> {
+        if let Some(id) = crate::classpath::find_by_jvm(&self.st, jvm) {
+            return Some(id);
+        }
+        self.pickle
+            .ensure_class(&mut self.st, &mut self.binary, full_name, false)
+    }
+
+    /// nsc's `materializeTypeTag` / `materializeWeakTypeTag`: a `TypeTag[T]`
+    /// is *built*, not found (`crate::materialize`, `docs/macros.md` §7.10).
+    ///
+    /// Returns `None` when this is not a tag request at all, or when there is
+    /// no universe to build one in -- both keep the ordinary "no implicit"
+    /// report. A tag request whose type scala-rs cannot rebuild is *named*
+    /// here and the error is this method's, because "could not find implicit
+    /// value of type TypeTag[List[Int]]" points at the wrong thing: no
+    /// program was ever going to define that value.
+    fn materialize_tag(&mut self, pt: &Type, span: Span) -> Option<Tree> {
+        if !self.library_abi {
+            return None;
+        }
+        let (tag, arg) = crate::materialize::tag_request(&self.st, pt)?;
+        // The tag has to name a universe, and which universe it is comes from
+        // `import <universe>._` -- the same reading a quasiquote uses.
+        let universe = self.universe_in_scope()?;
+        let classes = crate::materialize::TagClasses {
+            // `TypeTags$TypeTag.class` has no pickle of its own -- a trait's
+            // nested class is pickled inside the trait -- so only the
+            // enclosing trait's signature can name it.
+            tag_cls: self.reflect_class(tag.pickle_name(), tag.jvm())?,
+            type_tags: self
+                .reflect_class("scala.reflect.api.TypeTags", "scala/reflect/api/TypeTags")?,
+            mirror: self.reflect_class("scala.reflect.api.Mirror", "scala/reflect/api/Mirror")?,
+            creator: self.reflect_class(
+                "scala.reflect.api.TypeCreator",
+                "scala/reflect/api/TypeCreator",
+            )?,
+        };
+        let type_api = self.reflect_class(
+            "scala.reflect.api.Types.TypeApi",
+            "scala/reflect/api/Types$TypeApi",
+        )?;
+        let (tag_cls, mirror) = (classes.tag_cls, classes.mirror);
+        crate::materialize::ensure_tag_module(&mut self.st, tag, classes)?;
+        let tag_name = tag.simple().to_string();
+        // `TypeTags` is not a *direct* parent of `JavaUniverse` -- it is one
+        // of `scala.reflect.api.Universe`'s, and those live only in the
+        // pickle. Until something asks the universe for a member it does not
+        // have, the link is not there and the accessor above is unreachable:
+        // the first `typeOf[T]` in a run reported "value TypeTag is not a
+        // member of JavaUniverse" and every later one worked, because the
+        // failed lookup itself attached the ancestors. Ask here instead.
+        let universe_ty = universe.ty.clone();
+        let _ = self.supply_from_pickle(&universe_ty, &tag_name);
+        let class_name = match crate::materialize::static_class_name(&self.st, &arg) {
+            Ok(n) => n,
+            Err(why) => {
+                self.error(
+                    span,
+                    format!(
+                        "materialisation is not implemented: cannot build a \
+                         {tag_name} for {why}. scala-rs rebuilds a tag with one \
+                         `staticClass` call, so it materialises a class type \
+                         with no type arguments and nothing else; see \
+                         docs/macros.md \u{a7}7.10.",
+                    ),
+                );
+                return Some(Tree {
+                    id: NodeId(0),
+                    span,
+                    kind: TreeKind::Empty,
+                    ty: Type::Error,
+                    sym: SymbolId::NONE,
+                    postfix: false,
+                });
+            }
+        };
+        self.gensym += 1;
+        let creator_name = format!("$typecreator{}", self.gensym);
+        let want = Type::Class {
+            sym: tag_cls,
+            args: vec![arg.clone()],
+        };
+        let mut tree = crate::materialize::Materialiser {
+            universe: &universe,
+            creator_name,
+            arg,
+            class_name,
+            tag_name,
+            mirror_ty: Type::Class {
+                sym: mirror,
+                args: vec![],
+            },
+            type_api: Type::Class {
+                sym: type_api,
+                args: vec![],
+            },
+            span,
+        }
+        .build();
+        self.type_expr(&mut tree, &want);
+        Some(tree)
     }
 
     /// nsc: `A <: B` is a view `A => B` (identity / asInstanceOf).
@@ -15540,6 +15654,11 @@ impl Typer {
     fn tree_to_type(&mut self, tpt: &Tree) -> Type {
         match &tpt.kind {
             TreeKind::Empty => Type::NoType,
+            // nsc's `TypeTree(tp)`: a type the compiler already knows,
+            // standing where the source would have written a path. Built by
+            // `crate::materialize`, which has the `Type` and no name to
+            // reach it by at the use site.
+            TreeKind::Ident { name } if name == crate::materialize::RESOLVED_TYPE => tpt.ty.clone(),
             TreeKind::Ident { name } if name == "_" => Type::Wildcard,
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, tpt.span);
