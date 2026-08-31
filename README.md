@@ -1384,6 +1384,48 @@ module に解決されると module クラスには prelude 手書きの `apply`
 `not found: value Ordering` の診断のままです（`prelude_ordsummon` は `library_abi`
 でゲート）。
 
+### `Equiv[T]` の summon と `Ordering <: PartialOrdering <: Equiv`（`agent/eqtail`）
+
+`implicitly[Equiv[Int]]` / `Equiv[Int]` は real scalac が通しますが、`could not
+find implicit value` で落ちていました。実 ABI（`javap -p -s`）は
+
+```text
+interface scala.math.Ordering<T>        extends java.util.Comparator<T>, scala.math.PartialOrdering<T>
+interface scala.math.PartialOrdering<T> extends scala.math.Equiv<T>
+interface scala.math.Equiv<T>           extends java.io.Serializable
+```
+
+という階層ですが、prelude はこれを張っていませんでした。原因は 2 つ:
+
+1. `Ordering[T] <: PartialOrdering[T] <: Equiv[T]` の辺が無く、`val e:
+   Equiv[Int] = Ordering.Int` のような劣化代入が `type mismatch` になって
+   いました。
+2. `object Equiv` は implicit instance を 1 つも持っていませんでした。real
+   scalac は `implicitly[Equiv[Int]]` に `Ordering.Int` 経由の派生ではなく
+   `Equiv` 専用の instance（`Equiv$Int$`）を選びます
+   （`implicitly[Equiv[Int]].getClass.getName` で確認）。
+
+`crates/typer/src/prelude_eqtail.rs` が両方を足します。`Equiv` / `PartialOrdering`
+は他の `scala.math` 型クラス（`Ordering` / `Numeric` / `Integral` / `Fractional`）
+と同じ穴を踏むので、同じ手で塞ぎます: jar の遅延ロードを待つと `find_by_jvm` が
+まだ何も見つけられない時点（`install_prelude` は `install_classpath` より前に
+走ります）なので、prelude の時点で自前の class + companion module を作って
+現在スコープに `enter_in_current` してしまいます。あとから `Equiv` /
+`PartialOrdering` を参照した `check.rs` の `expose_unqualified` は「もうスコープに
+ある」ので通らず、この prelude シンボルだけが使われ、`equiv` 以外のメンバ
+（`fromComparator` / `by` / `TupleN` 等）は `jvm_name` が実クラスと一致してさえ
+いれば `pickle_supply` がオンデマンドで供給します（`Ordering` の `lt` / `gt` /
+`lteq` / `gteq` / `max` / `min` が今も同じやり方で効いているのと同じ）。
+
+`implicitly[PartialOrdering[Int]]` には real scalac にも instance が無いので、
+階層辺を足しても summon できるようになってはいけません。`PartialOrdering` には
+companion module を作らず、`object Equiv` の implicit instance だけを手書きします
+（`Unit` / `Boolean` / `Byte` / `Char` / `Short` / `Int` / `Long` / `BigInt` /
+`BigDecimal` / `String` と、2.13 で名前空間 object になった `Double` / `Float`
+の非推奨版 `DeprecatedDoubleEquiv` / `DeprecatedFloatEquiv`）。`--no-scala-library`
+では `scala/math/Equiv` の classfile が無く、`not found: type Equiv` の診断のまま
+です（`prelude_eqtail` は `library_abi` でゲート）。
+
 ### 改行が文を切る条件（nsc `inLastOfStat` / `inFirstOfStat`）
 
 `crates/lexer/src/lib.rs` の `drop_non_separating_newlines` は nsc の Scanners と同じ規則で、
@@ -7401,6 +7443,22 @@ slick（`tests/slick_measure.sh`）は `files=184 errors=257 files_with_errors=6
   （可変長、`Set[A]` が継承）のどちらとも一致して `ambiguous overload for apply` になります。
   要素型が具体型（`String` など）なら固定長側が正しく勝ちます。この修正の前から
   `--scala-library` の素の main にも存在する既存のバグで、`agent/setapply` の対象外です。
+
+`agent/eqtail` スライス（`Equiv[T]` の summon と `Ordering <: PartialOrdering <: Equiv`
+の階層辺）のフィクスチャは接頭辞 `eq2`（`eq2_summon` / `eq2_summon_bad`）で、同じ理由から
+`crates/cli/tests/eqtail.rs` に置いています。`eq2_summon.scala` は `implicitly[Equiv[T]]`
+（`Int` / `String` / `Long` / `Boolean` / `BigInt`）、`Equiv.Int` の直接参照、
+`getClass.getName` による instance の同一性確認（`Equiv$Int$` / `Equiv$DeprecatedDoubleEquiv$`）、
+`Ordering.Int` を `Equiv[Int]` / `PartialOrdering[Int]` へ渡す劣化代入を 1 本にまとめてあり、
+`--scala-library` dual-run と real scalac 2.13.16 の実行結果 diff（`eq2_summon_matches_real_scalac`）
+の両方で `java -Xverify:all` の下に走らせます。`eq2_summon_bad.scala` は、階層辺を足しても
+`implicitly[PartialOrdering[Int]]` が summon 可能にはならないこと（real scalac にも instance が
+無い）、`Equiv[Int]` を `Ordering[Int]` の位置には渡せないこと（劣化は `Equiv` 方向だけ）、
+companion object 自身は `Equiv` ではないことを固定します。私有ランタイムには
+`scala/math/Equiv` の classfile が無いので、`summon_is_diagnosed_without_the_jar` が
+`--no-scala-library` で `Equiv` が**黙って通らず** `not found: type Equiv` と診断されることを
+見ます。slick のソースは `Equiv` / `PartialOrdering` を参照していないので、
+`tests/slick_measure.sh` の数字はこのスライスの前後で変わりません。
 
 ## ライセンス
 

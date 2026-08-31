@@ -1,0 +1,12 @@
+true
+false
+true
+true
+false
+true
+true
+scala.math.Equiv$Int$
+scala.math.Equiv$DeprecatedDoubleEquiv$
+true
+true
+false

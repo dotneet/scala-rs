@@ -635,6 +635,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     // `val Ordering = scala.math.Ordering`（項位置の別名）。コンパニオンが
     // 出そろってから入れるので最後。
     crate::prelude_ordsummon::install(st, library_abi);
+    // `Ordering[T] <: PartialOrdering[T] <: Equiv[T]` と `object Equiv` の
+    // implicit instance。`Equiv` のコンパニオン別名が上の行で入ってから。
+    crate::prelude_eqtail::install(st, library_abi);
 }
 
 /// Prelude classes are owned by `scala` but carry their real JVM package
