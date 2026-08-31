@@ -186,19 +186,48 @@ impl Typer {
         if class_id.is_none() {
             return out;
         }
-        let mcls = match self.st.get(class_id).kind {
-            SymKind::Module => self.st.module_class_of(class_id),
-            SymKind::ModuleClass => class_id,
+        let (module_sym, mcls) = match self.st.get(class_id).kind {
+            SymKind::Module => (class_id, self.st.module_class_of(class_id)),
+            // Reached as a module *class*; there is no back-pointer to the
+            // module symbol, so nothing is recorded for it.
+            SymKind::ModuleClass => (SymbolId::NONE, class_id),
             _ => {
                 let Some(module) = self.st.companion_module(class_id) else {
                     return out;
                 };
-                self.st.module_class_of(module)
+                (module, self.st.module_class_of(module))
             }
         };
-        for mem in &self.st.get(mcls).members {
-            if self.st.get(*mem).flags.contains(Flags::IMPLICIT) {
-                out.push(*mem);
+        // SLS 7.2 names the companion *object*, and an object's members
+        // include the ones it inherits. slick declares every `Shape` instance
+        // in `trait RepShapeImplicits` / `ConstColumnShapeImplicits` /
+        // `TupleShapeImplicits` and writes
+        // `object Shape extends ConstColumnShapeImplicits with …`, so stopping
+        // at the module class's own members found none of them at all.
+        let mut work = vec![mcls];
+        let mut walked = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = work.pop() {
+            if id.is_none() || !walked.insert(id.0) {
+                continue;
+            }
+            for mem in self.st.get(id).members.clone() {
+                if self.st.get(mem).flags.contains(Flags::IMPLICIT) && seen.insert(mem.0) {
+                    if id != mcls && !module_sym.is_none() {
+                        // Declared by a trait the object mixes in; the
+                        // reference has to name the object (see
+                        // `wildcard_module_for`).
+                        self.implicit_via_module
+                            .borrow_mut()
+                            .insert(mem.0, module_sym);
+                    }
+                    out.push(mem);
+                }
+            }
+            for p in self.st.get(id).parents.clone() {
+                if let Some(ps) = self.st.class_sym_of(&p) {
+                    work.push(ps);
+                }
             }
         }
         out
@@ -520,6 +549,13 @@ impl Typer {
                 a1.iter().zip(a2.iter()).enumerate().all(|(i, (x, y))| {
                     if x == y {
                         return true;
+                    }
+                    // An invariant position the wanted type left as `_` is not
+                    // a constraint at all, in either direction.
+                    if matches!(x, Type::Wildcard | Type::BoundedWildcard { .. })
+                        || matches!(y, Type::Wildcard | Type::BoundedWildcard { .. })
+                    {
+                        return self.st.is_sub_type(x, y) || self.st.is_sub_type(y, x);
                     }
                     let flags = tparams
                         .get(i)
@@ -1531,7 +1567,9 @@ impl Typer {
                 }
             }
         }
-        None
+        // Not imported, but reached through a companion object that only
+        // *inherits* it (`object Shape extends ConstColumnShapeImplicits`).
+        self.implicit_via_module.borrow().get(&id.0).copied()
     }
 
     pub(crate) fn describe_implicits(&self, ids: &[SymbolId]) -> String {
@@ -1629,6 +1667,25 @@ impl<'a> Unify<'a> {
                 None => self.bind(id, a),
             };
         }
+        // `_` in the wanted type is a position the search is not asking about.
+        // slick writes `packedValue[R](implicit ev: Shape[? <: Level, T, ?, R])`
+        // and the witness in scope is a `Shape[? <: Level, E, U, R]`: matching
+        // `U` against `?` structurally said "no", so `R` was never solved and
+        // the implicit clause stayed unfilled. A bounded one still has to hold
+        // its bound.
+        match (a, b) {
+            (Type::Wildcard, _) | (_, Type::Wildcard) => return true,
+            (Type::BoundedWildcard { hi, .. }, other)
+            | (other, Type::BoundedWildcard { hi, .. }) => {
+                return match hi {
+                    Some(h) => {
+                        self.typer.st.is_sub_type(other, h) || self.unify_at(other, h, depth + 1)
+                    }
+                    None => true,
+                };
+            }
+            _ => {}
+        }
         match (a, b) {
             (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) => {
                 if s1 == s2 && a1.len() == a2.len() {
@@ -1642,13 +1699,27 @@ impl<'a> Unify<'a> {
                 }
                 // `=:=[A0, A0]` fitted to `<:<[From, To]`: widen the candidate
                 // side to the wanted class before matching arguments.
-                let Some(base) = self.typer.base_type_instance(a, *s2, 0) else {
-                    return false;
-                };
-                match &base {
-                    Type::Class { args, .. } if args.len() == a2.len() => args
+                if let Some(Type::Class { args, .. }) = self.typer.base_type_instance(a, *s2, 0) {
+                    if args.len() == a2.len()
+                        && args
+                            .iter()
+                            .zip(a2.iter())
+                            .all(|(x, y)| self.unify_at(x, y, depth + 1))
+                    {
+                        return true;
+                    }
+                }
+                // A *contravariant* position is the other way round: the
+                // candidate declares the supertype and the wanted type is the
+                // subtype. slick's
+                // `constColumnShape[T]: Shape[L, ConstColumn[T], T, ConstColumn[T]]`
+                // has to answer a wanted `Shape[FlatShapeLevel, LiteralColumn[Boolean], ?, ?BP]`
+                // (`Mixed_` is `-`), and `T` is only reachable by seeing the
+                // wanted `LiteralColumn[Boolean]` as a `ConstColumn`.
+                match self.typer.base_type_instance(b, *s1, 0) {
+                    Some(Type::Class { args, .. }) if args.len() == a1.len() => a1
                         .iter()
-                        .zip(a2.iter())
+                        .zip(args.iter())
                         .all(|(x, y)| self.unify_at(x, y, depth + 1)),
                     _ => false,
                 }

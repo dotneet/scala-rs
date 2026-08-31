@@ -518,6 +518,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         add_big_int(st);
         add_big_decimal(st);
         crate::prelude_oshadow::install(st);
+        crate::prelude_mism12::install(st);
         add_chaining(st);
         add_using(st);
         add_xml(st);

@@ -306,6 +306,12 @@ pub struct Typer {
     /// The first expansion cut off as diverging during the current top-level
     /// implicit search, for the diagnostic.
     pub(crate) diverged_implicit: std::cell::RefCell<Option<(SymbolId, Type)>>,
+    /// The companion object an implicit was reached *through*, for the ones a
+    /// companion only inherits (`object Shape extends RepShapeImplicits`).
+    /// Emitting a bare name for those loads `this` and casts it to the trait
+    /// that declares them; the receiver is the object. Filled by the companion
+    /// half of the implicit scope, read when the reference is materialised.
+    pub(crate) implicit_via_module: std::cell::RefCell<HashMap<u32, SymbolId>>,
     /// What the last `fill_defaults_and_implicits` pinned down by implicit
     /// search alone: `mk(s)` on `def mk[T: TT](s: String): Seq[Int] => Rep[T]`
     /// has no value argument mentioning `T`, so only the witness fixes it, and
@@ -504,6 +510,7 @@ impl Typer {
             pending_defaults: Vec::new(),
             open_implicits: std::cell::RefCell::new(Vec::new()),
             diverged_implicit: std::cell::RefCell::new(None),
+            implicit_via_module: std::cell::RefCell::new(HashMap::new()),
             implicit_undet_solved: Vec::new(),
         }
     }
@@ -2199,10 +2206,30 @@ impl Typer {
                 }
                 let n = self.st.get(mem).name.clone();
                 if n == "apply" {
-                    self.st.get_mut(mem).tparams = tps.clone();
+                    // `apply` is a *method*, and nsc gives it parameters of its
+                    // own. Handing it the class's meant one symbol stood for
+                    // both, and a call made from inside the class substituted
+                    // `U := U`: the parameter still mentioned a type parameter
+                    // of the callee, which is what "undetermined" is read from,
+                    // so the argument was checked against the *bound*.
+                    // `case class SV[T, U](a: T, b: Bx[U]) { def f = SV(1, b) }`
+                    // reported `found: Bx[U]  required: Bx[Any]` -- and so did
+                    // slick's `ShapedValue.packedValue`.
+                    let own = self.fresh_method_tparams(mem, &tps);
+                    let to: Vec<Type> = own.iter().map(|t| Type::TypeParam(*t)).collect();
+                    let paramss: Vec<Vec<Type>> = paramss_ty
+                        .iter()
+                        .map(|ps| {
+                            ps.iter()
+                                .map(|t| crate::symbol::subst_tparams_slice(&tps, &to, t))
+                                .collect()
+                        })
+                        .collect();
+                    let ret = crate::symbol::subst_tparams_slice(&tps, &to, &class_ty);
+                    self.st.get_mut(mem).tparams = own;
                     self.st.get_mut(mem).ty = Type::Method {
-                        paramss: paramss_ty.to_vec(),
-                        ret: Box::new(class_ty.clone()),
+                        paramss,
+                        ret: Box::new(ret),
                     };
                     self.st.get_mut(mem).paramss = paramss_ids.to_vec();
                     self.st.get_mut(mem).params = paramss_ids.iter().flatten().copied().collect();
@@ -2226,6 +2253,43 @@ impl Typer {
                 };
             }
         }
+    }
+
+    /// Fresh type parameters for `owner`, mirroring `src`'s names, kinds and
+    /// bounds. A synthesized method (a case class's companion `apply`) needs
+    /// its own; reusing the class's makes one symbol both "fixed here" and
+    /// "still to be inferred at the call", and nothing downstream can tell the
+    /// two apart. Variance is *not* copied: a method's type parameters have
+    /// none, and carrying `+T` over would let the variance check read them.
+    fn fresh_method_tparams(&mut self, owner: SymbolId, src: &[SymbolId]) -> Vec<SymbolId> {
+        if src.is_empty() {
+            return Vec::new();
+        }
+        let out: Vec<SymbolId> = src
+            .iter()
+            .map(|tp| {
+                let name = self.st.get(*tp).name.clone();
+                let id = self
+                    .st
+                    .alloc(&name, owner, SymKind::TypeParam, Flags::EMPTY, "");
+                self.st.get_mut(id).ty = Type::TypeParam(id);
+                let inner = self.st.get(*tp).tparams.clone();
+                let inner_new = self.fresh_method_tparams(id, &inner);
+                self.st.get_mut(id).tparams = inner_new;
+                id
+            })
+            .collect();
+        // An F-bound (`C[T <: Ordered[T]]`) names the parameters being copied.
+        let to: Vec<Type> = out.iter().map(|t| Type::TypeParam(*t)).collect();
+        for (i, tp) in src.iter().enumerate() {
+            let hi = self.st.get(*tp).bound_hi.clone();
+            let lo = self.st.get(*tp).bound_lo.clone();
+            self.st.get_mut(out[i]).bound_hi =
+                hi.map(|t| crate::symbol::subst_tparams_slice(src, &to, &t));
+            self.st.get_mut(out[i]).bound_lo =
+                lo.map(|t| crate::symbol::subst_tparams_slice(src, &to, &t));
+        }
+        out
     }
 
     fn type_module(&mut self, tree: &mut Tree) {

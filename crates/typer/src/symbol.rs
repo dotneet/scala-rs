@@ -703,13 +703,35 @@ impl SymbolTable {
     /// nsc: a type parameter stands for its upper bound when its members are
     /// looked up (`def f[A <: Comparable[A]](x: A) = x.compareTo(...)`).
     /// Unbounded parameters are left alone so the caller still sees `A`.
+    ///
+    /// A *type constructor* parameter stands for its bound applied to the very
+    /// arguments the application passes: `M[A]` where `M[+X] <: IterableOnce[X]`
+    /// is an `IterableOnce[A]`. The bound is written in the constructor's own
+    /// parameters, so it means nothing until they are replaced -- without this
+    /// step `in.iterator` on an `M[A]` came back as `IterableOnce`'s own `A`
+    /// and every use of the element was `found: A  required: A`.
     pub fn widen_type_param(&self, ty: &Type) -> Type {
         let mut t = ty.clone();
         for _ in 0..8 {
-            let Type::TypeParam(id) = &t else { break };
-            match self.get(*id).bound_hi.clone() {
-                Some(hi) => t = hi,
-                None => return ty.clone(),
+            match &t {
+                Type::TypeParam(id) => match self.get(*id).bound_hi.clone() {
+                    Some(hi) => t = hi,
+                    None => return ty.clone(),
+                },
+                Type::Applied { ctor, args } => {
+                    let Type::TypeParam(id) = ctor.as_ref() else {
+                        break;
+                    };
+                    let tps = self.get(*id).tparams.clone();
+                    let Some(hi) = self.get(*id).bound_hi.clone() else {
+                        return ty.clone();
+                    };
+                    if tps.len() != args.len() {
+                        return ty.clone();
+                    }
+                    t = subst_tparams_slice(&tps, args, &hi);
+                }
+                _ => break,
             }
         }
         if matches!(t, Type::TypeParam(_)) {

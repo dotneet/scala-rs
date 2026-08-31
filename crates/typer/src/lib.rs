@@ -33,6 +33,7 @@ mod prelude_impl2;
 mod prelude_lang;
 mod prelude_lazyref;
 mod prelude_lowbound;
+mod prelude_mism12;
 mod prelude_mism4;
 mod prelude_mism9;
 mod prelude_mutcoll;
