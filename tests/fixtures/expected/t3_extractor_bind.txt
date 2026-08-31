@@ -1,0 +1,4 @@
+volatile literal a
+literal b
+other
+42

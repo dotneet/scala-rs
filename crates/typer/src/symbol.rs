@@ -700,6 +700,44 @@ impl SymbolTable {
         out
     }
 
+    /// `lookup_member`, but walking only real `extends`/`with` parents, never
+    /// a `self:` annotation. A self-type is a constraint on what a class may
+    /// be *mixed into*, not a supertype: it makes the annotated type's own
+    /// members visible from **inside** that class's body (which
+    /// `lookup_member` models by also walking `self_type`, needed so
+    /// `RelationalActionComponent { self: RelationalProfile => }` can call
+    /// `RelationalProfile`'s members unqualified), but SLS 6.7.3 never lets
+    /// `super.m` reach through it: `super` walks the actual mixin
+    /// linearization only. Reusing `lookup_member` for `super.computeCapabilities`
+    /// let `RelationalActionComponent`'s `self: RelationalProfile` answer for
+    /// it via the self-type, which is `RelationalProfile`'s own
+    /// still-being-completed override -- a false "recursive method
+    /// computeCapabilities needs result type" instead of finding
+    /// `BasicProfile`'s further up the real chain.
+    pub fn lookup_member_real(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut work = vec![owner];
+        while let Some(id) = work.pop() {
+            if !seen.insert(id.0) {
+                continue;
+            }
+            let sym = self.get(id);
+            for m in &sym.members {
+                if self.get(*m).name == name {
+                    out.push(*m);
+                }
+            }
+            for m in &sym.parents.clone() {
+                let m = self.function_class_form(m).unwrap_or_else(|| m.clone());
+                if let Some(ps) = self.class_sym_of(&m) {
+                    work.push(ps);
+                }
+            }
+        }
+        out
+    }
+
     /// nsc: a type parameter stands for its upper bound when its members are
     /// looked up (`def f[A <: Comparable[A]](x: A) = x.compareTo(...)`).
     /// Unbounded parameters are left alone so the caller still sees `A`.

@@ -2015,14 +2015,32 @@ impl Typer {
                     for (pid, ty) in copy_params.iter().zip(all_ctor_param_tys.iter()) {
                         self.st.get_mut(*pid).ty = ty.clone();
                     }
+                    // `copy` must be curried exactly like the constructor it
+                    // mirrors: a case class with a second (or later) ctor
+                    // parameter list (`case class TableNode(a, b)(val
+                    // profileTable: Any)`, slick's `ast/Node.scala`) has a
+                    // `copy` nsc curries the same way. Flattening every list
+                    // into one made `t.copy(identity = x)(t.profileTable)`
+                    // (real, curried, two calls) type as `t.copy(identity =
+                    // x)` alone returning a `TableNode` already, so the
+                    // trailing `(t.profileTable)` read as `TableNode`'s own
+                    // `apply` — "value apply is not a member of TableNode".
+                    let mut copy_paramss: Vec<Vec<SymbolId>> = Vec::with_capacity(paramss_ty.len());
+                    let mut rest = copy_params.as_slice();
+                    for group in &paramss_ty {
+                        let (head, tail) = rest.split_at(group.len());
+                        copy_paramss.push(head.to_vec());
+                        rest = tail;
+                    }
+                    self.st.get_mut(copy_id).paramss = copy_paramss.clone();
                     self.st.get_mut(copy_id).ty = Type::Method {
-                        paramss: vec![all_ctor_param_tys],
+                        paramss: paramss_ty.clone(),
                         ret: Box::new(Type::Class {
                             sym: id,
                             args: vec![],
                         }),
                     };
-                    self.synthesize_default_getters(id, copy_id, "copy", &[], &[copy_params]);
+                    self.synthesize_default_getters(id, copy_id, "copy", &[], &copy_paramss);
                 }
             }
         }
@@ -7565,6 +7583,29 @@ impl Typer {
         // An alias member (`type Scope = Map[K, V]`) is dealiased first, or the
         // receiver's type arguments would be invisible to the substitution below.
         let mut recv_ty = self.st.dealias(&self.st.widen_type_param(&qual.ty));
+        // `super.m` (`qual` is a `Super` tree): resolve `m` against the real
+        // mixin linearization, not against the one parent `TreeKind::Super`
+        // picked independent of `m`'s name and not through that parent's own
+        // self-type (`lookup_member_real`/`super_select_member`'s doc comment
+        // explains why -- reusing the generic member search below found a
+        // self-type-provided member of the very definition being completed
+        // and reported a false `recursive method … needs result type`).
+        let mut super_found: Option<Vec<SymbolId>> = None;
+        if let TreeKind::Super { qual: sq, mix } = &qual.kind {
+            let this_id = if let Some(nm) = sq.clone() {
+                self.st
+                    .enclosing_class_named(self.st.this_class, &nm)
+                    .unwrap_or(self.st.this_class)
+            } else {
+                self.st.this_class
+            };
+            if let Some((parent, members)) =
+                self.super_select_member(this_id, mix.as_deref(), &name)
+            {
+                recv_ty = self.super_prefix_type(this_id, parent);
+                super_found = Some(members);
+            }
+        }
         let refined_term = match &recv_ty {
             Type::Refined { decls, .. } => {
                 let from_term = decls.iter().any(|d| {
@@ -7589,7 +7630,7 @@ impl Typer {
             return;
         }
         // String concatenation via any2stringadd: handled at Apply of +
-        let mut found = Vec::new();
+        let mut found = super_found.take().unwrap_or_default();
         if let Type::Refined { parents, .. } = &recv_ty {
             for p in parents {
                 if let Some(o) = self.st.class_sym_of(p) {
@@ -9106,11 +9147,188 @@ impl Typer {
         true
     }
 
+    /// The primary constructor's parameter symbols, grouped by parameter
+    /// list, for a class whose `ctor_fields` were already resolved (`type_class`
+    /// syncs the real `<init>` member's own `.paramss` to this shape).
+    fn primary_ctor_paramss(&self, class_id: SymbolId) -> Option<Vec<Vec<SymbolId>>> {
+        let fields = self.st.get(class_id).ctor_fields.clone();
+        self.st
+            .get(class_id)
+            .members
+            .iter()
+            .copied()
+            .find(|&m| self.st.get(m).name == "<init>" && self.st.get(m).params == fields)
+            .map(|m| self.st.get(m).paramss.clone())
+    }
+
+    /// `p.copy(x = 1)(y = 2)`: a curried case class's `copy` mirrors the
+    /// constructor's own parameter-list shape, same as nsc's synthesized one
+    /// does (`TableNode(schemaName, …)(val profileTable: Any)` in slick's
+    /// `ast/Node.scala` is the motivating case, via `t.copy(identity =
+    /// x)(t.profileTable)`). The single-`Apply` rewrite below only ever sees
+    /// one argument list: called on the *inner* `Apply` alone
+    /// (`f.copy(a = 2)`, before the outer `Apply` supplying `(f.extra)` is
+    /// even considered) it filled every field — including ones that belong
+    /// to the second list — from the receiver's own value and returned a
+    /// complete instance, so the *outer* `(f.extra)` then read as an
+    /// `.apply` call on that instance: "value apply is not a member of
+    /// TableNode". This peels the whole `Apply` chain down to `copy` first
+    /// and builds one `C(…)(…)` call (the companion's own curried `apply`,
+    /// not `new C(…)(…)` -- see the comment below on why) with the matching
+    /// list shape, falling through to the single-list rewrite when there is
+    /// no second list to peel (the overwhelmingly common case).
+    fn try_rewrite_case_copy_curried(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        fn depth_to_copy(t: &Tree) -> Option<u32> {
+            match &t.kind {
+                TreeKind::Apply { fun, .. } => match &fun.kind {
+                    TreeKind::Select { name, .. } | TreeKind::Ident { name } if name == "copy" => {
+                        Some(1)
+                    }
+                    TreeKind::Apply { .. } => depth_to_copy(fun).map(|d| d + 1),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        if depth_to_copy(tree).is_none_or(|d| d < 2) {
+            return false;
+        }
+        // Peel: unwind one `Apply` layer at a time (outermost first),
+        // collecting each layer's own argument list, until the innermost
+        // `copy` selection/identifier is reached.
+        let owned = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+        let span = owned.span;
+        let mut arg_lists_outer_first: Vec<Vec<Tree>> = Vec::new();
+        let mut cur = owned;
+        let (qual, is_bare) = loop {
+            let TreeKind::Apply { fun, args } = cur.kind else {
+                return false;
+            };
+            arg_lists_outer_first.push(args);
+            match fun.kind {
+                TreeKind::Apply { .. } => cur = *fun,
+                TreeKind::Select { qual, .. } => break (Some(*qual), false),
+                TreeKind::Ident { .. } => break (None, true),
+                _ => return false,
+            }
+        };
+        let mut arg_lists = arg_lists_outer_first;
+        arg_lists.reverse();
+        let class_id = if is_bare {
+            let cls = self.st.this_class;
+            if cls.is_none() {
+                return false;
+            }
+            let here: Vec<SymbolId> = self
+                .st
+                .get(cls)
+                .members
+                .iter()
+                .copied()
+                .filter(|&m| self.st.get(m).name == "copy")
+                .collect();
+            let resolved = self.st.lookup("copy");
+            if here.len() != 1
+                || !self.st.get(here[0]).flags.contains(Flags::SYNTHETIC)
+                || resolved != here
+            {
+                return false;
+            }
+            cls
+        } else {
+            let mut q = qual.clone().unwrap();
+            if q.ty.is_no_type() {
+                self.type_expr(&mut q, &Type::NoType);
+            }
+            match self.st.class_sym_of(&q.ty) {
+                Some(c) => c,
+                None => return false,
+            }
+        };
+        if !self.st.get(class_id).flags.contains(Flags::CASE) {
+            return false;
+        }
+        if self
+            .st
+            .lookup_member(class_id, "copy")
+            .iter()
+            .any(|&s| !self.st.get(s).flags.contains(Flags::SYNTHETIC))
+        {
+            return false;
+        }
+        let Some(groups) = self.primary_ctor_paramss(class_id) else {
+            return false;
+        };
+        if groups.len() != arg_lists.len() || groups.len() < 2 {
+            return false;
+        }
+        let qual_expr = if is_bare {
+            Tree::dummy(TreeKind::This { qual: None })
+        } else {
+            qual.unwrap()
+        };
+        // The receiver is evaluated once, as nsc's `copy$default$n` does.
+        let tmp = self.fresh("x$copy");
+        let tmp_def = Tree::dummy(TreeKind::ValDef {
+            mods: scala_rs_parser::Modifiers::default(),
+            name: tmp.clone(),
+            tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+            rhs: Box::new(qual_expr),
+        });
+        let mut new_arg_lists: Vec<Vec<Tree>> = Vec::with_capacity(groups.len());
+        for (group, args) in groups.iter().zip(arg_lists) {
+            let names: Vec<String> = group.iter().map(|f| self.st.get(*f).name.clone()).collect();
+            let (slots, extra, ok) = self.named_arg_slots(args, &names);
+            if ok {
+                for a in extra {
+                    self.error(a.span, "too many arguments");
+                }
+            }
+            let mut new_args = Vec::with_capacity(slots.len());
+            for (i, slot) in slots.into_iter().enumerate() {
+                new_args.push(match slot {
+                    Some(a) => a,
+                    None => Tree::dummy(TreeKind::Select {
+                        qual: Box::new(Tree::dummy(TreeKind::Ident { name: tmp.clone() })),
+                        name: names[i].clone(),
+                    }),
+                });
+            }
+            new_arg_lists.push(new_args);
+        }
+        // The companion's own (also curried) `apply`, not `new C(…)(…)`:
+        // `Foo(1, "x")("e")` -- exactly this call shape -- already works
+        // through ordinary curried-call resolution, and slick itself always
+        // constructs `TableNode` this way. A curried `new C(…)(…)` hit a
+        // separate, narrower gap in constructor-call overload resolution
+        // (checked one `Apply` layer in isolation instead of threading the
+        // whole chain), so building on that path here would trade one bug
+        // for another.
+        let cls_name = self.st.get(class_id).name.clone();
+        let mut ctor = Tree::dummy(TreeKind::Ident { name: cls_name });
+        for args in new_arg_lists {
+            ctor = Tree::dummy(TreeKind::Apply {
+                fun: Box::new(ctor),
+                args,
+            });
+        }
+        *tree = Tree::dummy(TreeKind::Block {
+            stats: vec![tmp_def],
+            expr: Box::new(ctor),
+        });
+        tree.span = span;
+        self.type_expr(tree, pt);
+        true
+    }
+
     /// nsc synthesizes `def copy(x: T = this.x, …): C` on a case class.
     /// Rewriting `p.copy(y = 3)` to a constructor call keeps the omitted
     /// fields coming from the receiver without emitting a synthetic method,
     /// and re-infers the class's type parameters as nsc's `copy[T]` does.
     fn try_rewrite_case_copy(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        if self.try_rewrite_case_copy_curried(tree, pt) {
+            return true;
+        }
         let shape = match &tree.kind {
             TreeKind::Apply { fun, .. } => match &fun.kind {
                 TreeKind::Select { name, .. } if name == "copy" => CopyCallee::Qualified,
@@ -14683,14 +14901,38 @@ impl Typer {
             }
             TreeKind::Bind { name, body } => {
                 self.type_pattern(body, sel_ty);
+                // A constructor pattern's `body.ty` is already the narrowed
+                // class type (`type_pattern`'s ctor-pattern arm sets it).
+                // A custom `unapply`'s `body.ty` deliberately stays the
+                // scrutinee's own type -- the backend's `gen_unapply_pattern`
+                // reads it back to know whether the pattern already proved
+                // the runtime type test redundant, and narrowing it there
+                // would make that check trivially (and wrongly) true. The
+                // extractor's receiver type is what `c` should be bound at,
+                // though (`case c @ LiteralNode(_) if c.volatileHint`), so
+                // narrow it here instead, same as nsc's own type test order:
+                // run the inner pattern's check, *then* narrow what it
+                // proved.
+                let bind_ty = if matches!(body.kind, TreeKind::UnApply { .. }) {
+                    let receiver = self
+                        .unapply_receiver_type(body.sym, sel_ty)
+                        .unwrap_or_else(|| body.ty.clone());
+                    if self.st.is_sub_type(&body.ty, &receiver) {
+                        body.ty.clone()
+                    } else {
+                        receiver
+                    }
+                } else {
+                    body.ty.clone()
+                };
                 let n = name.clone();
                 let id = self
                     .st
                     .alloc(n.clone(), self.st.owner, SymKind::Term, Flags::PARAM, "");
-                self.st.get_mut(id).ty = body.ty.clone();
+                self.st.get_mut(id).ty = bind_ty.clone();
                 self.st.enter_in_current(&n, id);
                 pat.sym = id;
-                pat.ty = body.ty.clone();
+                pat.ty = bind_ty;
             }
             TreeKind::Apply { fun, args } => {
                 self.type_expr(fun, &Type::NoType);
@@ -14813,6 +15055,15 @@ impl Typer {
                         let ft = extracted.get(i).cloned().unwrap_or(Type::Any);
                         self.type_pattern(a, &ft);
                     }
+                    // `pat.ty` here stays the *scrutinee's* type, not the
+                    // extractor's receiver type: the backend's
+                    // `gen_unapply_pattern` reads it back to decide whether
+                    // the runtime `instanceof` test is redundant (comparing
+                    // it against the extractor's own parameter type), and
+                    // that check is only sound against what was true walking
+                    // *into* this pattern. The type a `c @ Extractor(...)`
+                    // binds `c` at is narrowed separately in `TreeKind::Bind`
+                    // below, which is the only place that needs it.
                     let fun = std::mem::replace(fun, Box::new(Tree::dummy(TreeKind::Empty)));
                     let args = std::mem::take(args);
                     pat.kind = TreeKind::UnApply { fun, args };
@@ -15073,6 +15324,63 @@ impl Typer {
         } else {
             parents.last().copied().unwrap_or(SymbolId::NONE)
         }
+    }
+
+    /// `super.m`'s real target member, found by walking `this_id`'s actual
+    /// mixin parents (never a `self:` annotation -- see
+    /// `SymbolTable::lookup_member_real`) in linearization order.
+    ///
+    /// `super_target` above picks one parent (the syntactically last one) up
+    /// front, independent of which member will be selected, and
+    /// `lookup_member` (used for an ordinary selection on that parent's type)
+    /// also walks the parent's own self-type -- which found
+    /// `RelationalActionComponent { self: RelationalProfile => }`'s self-type
+    /// member for `super.computeCapabilities` inside `RelationalProfile`
+    /// itself, i.e. the very override being completed. This walks every real
+    /// parent, last-declared first (later mixins are more specific in Scala's
+    /// linearization, so `super` prefers them), and returns the first parent
+    /// whose *real* inheritance chain actually defines `name` -- `Relational
+    /// ActionComponent` has no `computeCapabilities` of its own, so the
+    /// search continues past it to `BasicProfile`, which does.
+    fn super_select_member(
+        &self,
+        this_id: SymbolId,
+        mix: Option<&str>,
+        name: &str,
+    ) -> Option<(SymbolId, Vec<SymbolId>)> {
+        if this_id.is_none() {
+            return None;
+        }
+        let mut parents: Vec<SymbolId> = self
+            .st
+            .get(this_id)
+            .parents
+            .iter()
+            .filter_map(|p| self.st.class_sym_of(p))
+            .filter(|p| {
+                let n = self.st.get(*p).name.as_str();
+                n != "AnyRef" && n != "Any" && n != "AnyVal" && n != "Object"
+            })
+            .filter(|p| {
+                let jvm = self.st.get(*p).jvm_name.as_str();
+                jvm != "scala/Product" && jvm != "java/io/Serializable"
+            })
+            .collect();
+        if let Some(mix_name) = mix {
+            parents.retain(|p| {
+                let n = self.st.get(*p).name.as_str();
+                n == mix_name || n.trim_end_matches('$') == mix_name
+            });
+        } else {
+            parents.reverse();
+        }
+        for p in parents {
+            let members = self.st.lookup_member_real(p, name);
+            if !members.is_empty() {
+                return Some((p, members));
+            }
+        }
+        None
     }
 
     /// The instance of `target` among `ty`'s base classes: `Some[Int]` seen as
@@ -15504,6 +15812,41 @@ impl Typer {
         out.iter()
             .map(|t| crate::symbol::subst_tparams_slice(&ids, &tys, t))
             .collect()
+    }
+
+    /// The type an `x @ Extractor(...)` pattern narrows `x` to: the
+    /// `unapply`'s own declared parameter type (substituting its type
+    /// parameters, unified against the scrutinee, exactly as
+    /// `subst_unapply_tparams` does for the extracted sub-patterns). nsc
+    /// performs the same implicit type test a `case x: T` pattern does, so
+    /// `case c @ LiteralNode(_) if c.volatileHint` sees `c: LiteralNode`
+    /// (which declares `volatileHint`), not the scrutinee's static `Node`.
+    fn unapply_receiver_type(&self, unapply: SymbolId, sel_ty: &Type) -> Option<Type> {
+        let param = match &self.st.get(unapply).ty {
+            Type::Method { paramss, .. } => paramss.first().and_then(|p| p.first()).cloned(),
+            Type::Function { params, .. } => params.first().cloned(),
+            _ => None,
+        }?;
+        let tps = self.st.get(unapply).tparams.clone();
+        if tps.is_empty() || sel_ty.is_no_type() {
+            return Some(param);
+        }
+        let params = [param.clone()];
+        let args = [sel_ty.clone()];
+        let mut ids = Vec::new();
+        let mut tys = Vec::new();
+        for tp in tps {
+            if let Some(t) = unify_tparam(tp, &params, &args) {
+                if !t.is_no_type() && !t.is_error() {
+                    ids.push(tp);
+                    tys.push(t);
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Some(param);
+        }
+        Some(crate::symbol::subst_tparams_slice(&ids, &tys, &param))
     }
 
     fn unapply_extracted_types(&self, unapply: SymbolId) -> Vec<Type> {
