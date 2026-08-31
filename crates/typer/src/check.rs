@@ -5097,12 +5097,12 @@ impl Typer {
         let Some(universe) = self.universe_in_scope() else {
             return false;
         };
-        let Ok(body) = crate::quasiquote::parse_body(kind, parts, args.len()) else {
+        let Ok((body, src)) = crate::quasiquote::parse_body(kind, parts, args.len()) else {
             return false;
         };
         let ranks = crate::quasiquote::hole_ranks(parts, args.len());
         let built = {
-            let r = crate::reify::Reifier::new(universe, args, &ranks, span);
+            let r = crate::reify::Reifier::new(universe, args, &ranks, span, &src);
             match r.reify(kind, &body) {
                 Ok(t) => t,
                 Err(why) => {
@@ -7243,6 +7243,36 @@ impl Typer {
         // Still gated on nothing having matched, so it can only add members.
         if found.is_empty() {
             found = self.supply_from_pickle(&recv_ty, &name);
+        }
+        // The same name in both namespaces, term side missing. The reflect API
+        // writes `type Modifiers >: Null <: ModifiersApi` next to
+        // `def Modifiers(flags: FlagSet): Modifiers`, and a jar class's
+        // members are read one name at a time -- so once the *type* member was
+        // installed (completing `NoMods`, whose result type is `Modifiers`,
+        // installs it), the name was no longer missing here, the term
+        // overloads were never read, and `u.Modifiers(flags)` selected a
+        // `TypeMember` whose value type is `NoType`: "value apply is not a
+        // member of <notype>". The mirror image of `expose_unqualified_type`
+        // (`docs/macros.md` §7.6), and just as additive: only a *term*-shaped
+        // member can win here.
+        if !found.is_empty()
+            && found
+                .iter()
+                .all(|&s| self.st.get(s).kind == SymKind::TypeMember)
+        {
+            let more = self.supply_from_pickle(&recv_ty, &name);
+            let terms: Vec<SymbolId> = more
+                .into_iter()
+                .filter(|&s| {
+                    matches!(
+                        self.st.get(s).kind,
+                        SymKind::Module | SymKind::Method | SymKind::Term
+                    )
+                })
+                .collect();
+            if !terms.is_empty() {
+                found = terms;
+            }
         }
         if found.is_empty() {
             if let Some((conv, member, to)) = self.search_extension(&recv_ty, &name, tree.span) {
@@ -12506,15 +12536,44 @@ impl Typer {
     /// Rewrite `fun` from `m` to `m.apply` when `m` is a parameterless method
     /// whose result type has an `apply` member.
     ///
+    /// An *overload set* counts too, as long as exactly one alternative is
+    /// value-shaped. `scala.reflect`'s tree factories are written that way --
+    /// `val Ident: IdentExtractor` next to `def Ident(name: String): Ident`,
+    /// `val Bind: BindExtractor` next to `def Bind(sym: Symbol, body: Tree)`,
+    /// and the same for `This` and `New` -- so `Ident(TermName("x"))` matches
+    /// no alternative and is `Ident.apply(TermName("x"))`. Without this every
+    /// one of them was rejected, `TableQuery`'s macro implementation among
+    /// them.
+    ///
     /// Returns `false` — leaving `fun` untouched — for anything else, so the
     /// caller reports the original failure.
     fn insert_apply_on_nullary(&mut self, fun: &mut Tree) -> bool {
-        let Type::Method { paramss, ret } = fun.ty.clone() else {
-            return false;
+        let ret = match fun.ty.clone() {
+            Type::Method { paramss, ret }
+                if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
+            {
+                ret
+            }
+            Type::Overload(alts) => {
+                let mut vals = alts.iter().filter_map(|a| match a {
+                    Type::Method { paramss, ret }
+                        if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
+                    {
+                        Some((**ret).clone())
+                    }
+                    Type::Class { .. } | Type::ModuleRef(_) => Some(a.clone()),
+                    _ => None,
+                });
+                let Some(only) = vals.next() else {
+                    return false;
+                };
+                if vals.next().is_some() {
+                    return false;
+                }
+                Box::new(only)
+            }
+            _ => return false,
         };
-        if !(paramss.is_empty() || paramss.iter().all(|c| c.is_empty())) {
-            return false;
-        }
         if !matches!(*ret, Type::Class { .. } | Type::ModuleRef(_)) {
             return false;
         }

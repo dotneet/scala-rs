@@ -240,6 +240,16 @@ impl Assembler {
         )
     }
 
+    /// The internal name of the object currently on top of the verifier's
+    /// model of the stack, if it is one. Used to skip a `checkcast` that the
+    /// value already satisfies exactly.
+    pub fn top_object(&self) -> Option<&str> {
+        match self.vstack.last() {
+            Some(VType::Object(n)) => Some(n.as_str()),
+            _ => None,
+        }
+    }
+
     fn pop_v(&mut self) -> VType {
         if let Some(t) = self.vstack.pop() {
             self.bump(-t.slots());
@@ -1197,7 +1207,13 @@ impl Assembler {
         let i = self.pool.iface_ref(owner, &name, desc);
         self.emit_op(0xb9);
         self.emit_u16(i);
-        let n_args = 1 + count_params(desc);
+        // JVMS 6.5 `invokeinterface`: `count` is the number of argument
+        // *slots* plus one for the receiver, so a `long` or `double`
+        // parameter counts twice. Counting parameters instead made
+        // `reificationSupport.FlagsRepr(8192L)` -- an interface method taking
+        // one `Long` -- fail to verify with "Inconsistent args count operand
+        // in invokeinterface".
+        let n_args = 1 + count_param_slots(desc);
         self.bytes.push(n_args as u8);
         self.bytes.push(0);
         self.apply_invoke(desc, true, false, owner);
@@ -1549,7 +1565,7 @@ fn vtype_from_desc(desc: &str) -> VType {
     }
 }
 
-fn param_descs(desc: &str) -> Vec<String> {
+pub fn param_descs(desc: &str) -> Vec<String> {
     let inner = desc
         .split_once(')')
         .map(|(a, _)| a.trim_start_matches('('))
@@ -1666,6 +1682,37 @@ fn compact_locals(slots: &[VType]) -> Vec<VType> {
         out.pop();
     }
     out
+}
+
+/// The number of local-variable slots a descriptor's parameters occupy:
+/// `long` and `double` take two, everything else one. Only `invokeinterface`'s
+/// `count` operand needs this; the verifier's stack model has one entry per
+/// value.
+fn count_param_slots(desc: &str) -> usize {
+    let inner = desc
+        .split_once(')')
+        .map(|(a, _)| a.trim_start_matches('('))
+        .unwrap_or("");
+    let mut n = 0;
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        n += if c == 'J' || c == 'D' { 2 } else { 1 };
+        match c {
+            'L' => while chars.next() != Some(';') {},
+            '[' => {
+                while chars.peek() == Some(&'[') {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'L') {
+                    while chars.next() != Some(';') {}
+                } else {
+                    chars.next();
+                }
+            }
+            _ => {}
+        }
+    }
+    n
 }
 
 fn count_params(desc: &str) -> usize {

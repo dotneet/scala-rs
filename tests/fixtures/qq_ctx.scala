@@ -53,4 +53,22 @@ object QqCtx {
     val trees: List[Tree] = List(q"k", q"m")
     q"n(..$trees)"
   }
+
+  // The forms `agent/reify2` added, in a macro implementation: a type
+  // quasiquote, a type ascription over a function type, an eta expansion, a
+  // block with a definition in it, `new`, a pattern and a case clause.
+  // `qr_forms.scala` checks the trees these build against real scalac; what
+  // this adds is that they compile where a macro implementation writes them,
+  // which is where slick writes them (`docs/macros.md` §7.7).
+  def forms(c: blackbox.Context)(x: c.Tree, u: c.Tree, r: c.Tree): c.Tree = {
+    import c.universe._
+    val ty: Tree = tq"_root_.scala.collection.immutable.HNil.type"
+    val fn: Tree = q"($x.tupled) : ($u => $r)"
+    val eta: Tree = q"($x.apply _) : ($u => $r)"
+    val blk: Tree = q"{ val v = $x; v }"
+    val nw: Tree = q"new $r(..${List(x)})"
+    val pat: Tree = pq"_root_.scala.Some(y)"
+    val cse: Tree = cq"$pat => $x"
+    q"{ ..${List(ty, fn, eta, blk, nw, cse)} }"
+  }
 }

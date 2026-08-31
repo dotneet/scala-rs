@@ -510,9 +510,10 @@ fn qq_ctx_bad_names_every_form_it_cannot_build() {
     assert!(!output.status.success(), "expected qq_ctx_bad to fail");
     let err = diagnostics(&output);
     for needle in [
-        "a type ascription is not reified yet",
-        "a block is not reified yet",
-        "tq\"...\" is not reified yet",
+        "a right-associative operator (`::`) is not reified yet",
+        "an `if` without an `else` is not reified yet",
+        "a `_` placeholder function literal is not reified yet",
+        "a by-name type is not reified yet",
     ] {
         assert!(
             err.contains(needle),
@@ -544,4 +545,135 @@ fn qq_ctx_without_scala_reflect_is_diagnosed() {
             "type WeakTypeTag is not a member of Context",
         ],
     );
+}
+
+// --- the rest of the quasiquote forms (`agent/reify2`, docs/macros.md §7.7) --
+
+/// `tests/fixtures/qr_forms.scala`, run: `tq"..."`, `pq"..."`, `cq"..."` and
+/// the `q"..."` shapes reification did not build before -- ascriptions, eta
+/// expansion, blocks, `new`, `match`, function literals -- plus the tree
+/// factories that are overload sets (`Ident`, `Bind`, `This`, `New`).
+///
+/// Every line prints `showRaw`, so what is compared is the *tree*, not the
+/// fact that something typechecked. The recorded expectation is checked
+/// against real scalac by `qr_forms_matches_real_scalac`.
+#[test]
+fn qr_forms_reifies_the_remaining_shapes() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip qr_forms: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("qr_forms");
+    let output = compile_reflect("qr_forms", &out, &jar, &reflect);
+    assert!(
+        output.status.success(),
+        "compile qr_forms failed: {}",
+        diagnostics(&output)
+    );
+    let cp = format!("{}:{}:{}", out.display(), reflect.display(), jar.display());
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        run.status.success(),
+        "java -Xverify:all Main failed for qr_forms: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        expected_stdout("qr_forms"),
+        "stdout mismatch for qr_forms"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// The same fixture through real scalac 2.13.16. Without this the recorded
+/// expectation would only say what we happen to build; with it, every
+/// `Syntactic*` call in `crates/typer/src/reify.rs` is pinned to the tree
+/// nsc's own quasiquote macro produces.
+#[test]
+fn qr_forms_matches_real_scalac() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(reflect), Some(scalac)) =
+        (scala_library_jar(), scala_reflect_jar(), find_scalac())
+    else {
+        eprintln!("skip qr_forms scalac diff: scalac / jars not obtainable");
+        return;
+    };
+    let ref_out = tmp_dir("qr_forms-scalac");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            ref_out.to_str().unwrap(),
+            fixtures_dir().join("qr_forms.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected qr_forms.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        ref_out.display(),
+        reflect.display(),
+        jar.display()
+    );
+    let reference = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java (real scalac build)");
+    assert!(
+        reference.status.success(),
+        "java Main (real-scalac build) failed for qr_forms: {}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&reference.stdout),
+        expected_stdout("qr_forms"),
+        "recorded expectation for qr_forms does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&ref_out);
+}
+
+/// The forms reification still refuses, each named.
+///
+/// These are the ones where the parser normalises away something nsc keeps: a
+/// right-associative operator, an `if` with no `else`, a `_` placeholder
+/// lambda, a by-name type. Building *anything* for them would build a tree
+/// nobody wrote, which is worse than not compiling.
+#[test]
+fn qr_forms_bad_names_every_form_it_cannot_build() {
+    let (Some(jar), Some(reflect)) = (scala_library_jar(), scala_reflect_jar()) else {
+        eprintln!("skip qr_forms_bad: scala-library / scala-reflect not obtainable");
+        return;
+    };
+    let out = tmp_dir("qr_forms_bad");
+    let output = compile_reflect("qr_forms_bad", &out, &jar, &reflect);
+    assert!(!output.status.success(), "expected qr_forms_bad to fail");
+    let err = diagnostics(&output);
+    for needle in [
+        "a right-associative operator (`::`) is not reified yet",
+        "an `if` without an `else` is not reified yet",
+        "a `_` placeholder function literal is not reified yet",
+        "a by-name type is not reified yet",
+        "a `..$` splice mixed with ordinary arguments is not reified yet",
+        "a class definition is not reified yet",
+        "a modified `val` definition is not reified yet",
+    ] {
+        assert!(
+            err.contains(needle),
+            "expected {needle:?} in diagnostics, got {err}"
+        );
+    }
+    let _ = fs::remove_dir_all(&out);
 }

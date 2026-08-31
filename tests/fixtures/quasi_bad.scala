@@ -20,7 +20,7 @@ object QuasiBad {
     val term = q"$x + 1"
     val tpe = tq"_root_.scala.List[Int]"
     val pat = pq"_root_.scala.Some(y)"
-    val cse = cq"case y => y"
+    val cse = cq"y => y"
     c.Expr[Int](term)
   }
 }
