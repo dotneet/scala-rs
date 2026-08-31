@@ -2,6 +2,7 @@ mod anon_capture;
 mod check;
 mod classpath;
 mod erasure;
+mod expand;
 mod implicits;
 mod javaclass;
 mod javasign;

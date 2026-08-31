@@ -148,7 +148,7 @@ pub struct Typer {
     pkg_nest: Vec<SymbolId>,
     /// Signature pass: fill member types across the whole run before any body
     /// is typed, so a unit can call into one that comes later.
-    sigs_only: bool,
+    pub(crate) sigs_only: bool,
     /// While set, an unqualified name in *type* position that resolves to
     /// nothing is reported as `not found: type X` instead of being left as the
     /// `Type::Named` placeholder.
@@ -188,6 +188,33 @@ pub struct Typer {
     /// yet what the callee's type parameters are, and `take(empty)` would pick
     /// the one witness in scope instead of the one the parameter asks for.
     typing_call_args: bool,
+    /// Set just before the *callee* of an `Apply` / `TypeApply` is typed, and
+    /// taken by the first [`Typer::type_expr`] that sees it. A macro
+    /// application is expanded at its outermost node the way nsc's is, so
+    /// `M.f` must not expand while it stands as the head of `M.f(1)`.
+    /// Everything typed *inside* the callee sees the flag already cleared, so
+    /// a macro application nested in a receiver (`M.g(1).h`) still expands.
+    pub(crate) typing_callee: bool,
+    /// The JVM half of the def-macro expander (`crates/typer/src/expand.rs`),
+    /// started on the first expansion and killed when the typer is dropped.
+    pub(crate) macro_engine: Option<crate::expand::MacroEngine>,
+    /// Why the engine could not be started, once it has failed once.
+    pub(crate) macro_engine_error: Option<String>,
+    /// What `java` is given as its classpath: the run's own binary path, so
+    /// the macro implementation, scala-library.jar and scala-reflect.jar are
+    /// all on it.
+    pub(crate) macro_classpath: Vec<PathBuf>,
+    /// Why a macro application could not be expanded, by span. Reported by
+    /// `report_macro_calls`, which is the one place that guarantees every
+    /// unexpanded call site is an error.
+    pub(crate) macro_failures: HashMap<(usize, u32, u32), String>,
+    /// How deep the current chain of expansions is.
+    pub(crate) macro_depth: u32,
+    /// Set once any `def f = macro Impl.m` in this run has been resolved.
+    /// `type_expr` asks about macro expansion on *every* expression, and
+    /// walking an application's spine to find out is not free; almost no
+    /// compilation defines a macro at all.
+    pub(crate) has_macro_defs: bool,
     /// Set while the arguments of a *parent* constructor call are being
     /// searched for. nsc types those in the constructor's own context, where
     /// `this` does not exist yet, so the class's own and inherited members are
@@ -205,7 +232,7 @@ pub struct Typer {
     language_postfix_ops: bool,
     /// `import scala.language.implicitConversions` / `-language:implicitConversions`.
     language_implicit_conversions: bool,
-    binary: BinaryIndex,
+    pub(crate) binary: BinaryIndex,
     completed_java: HashSet<String>,
     /// Overload sets whose alternatives do not all belong to one class's
     /// linearization, keyed by the alternative the tree carries as its symbol.
@@ -479,6 +506,13 @@ impl Typer {
             parent_fill_done: std::collections::HashSet::new(),
             new_is_applied: false,
             typing_call_args: false,
+            typing_callee: false,
+            macro_engine: None,
+            macro_engine_error: None,
+            macro_classpath: opts.binary_path.clone(),
+            macro_failures: HashMap::new(),
+            macro_depth: 0,
+            has_macro_defs: false,
             parent_ctor_scope: false,
             fatal_warnings: opts.fatal_warnings,
             library_abi: opts.library_abi,
@@ -3237,6 +3271,19 @@ impl Typer {
             TreeKind::TypeDef { .. } => self.type_type_member(tree),
             _ => {}
         }
+        // A macro def's binding is part of its *signature* for the rest of the
+        // run: a call site is expanded where it is typed, and the call may
+        // stand above the def in the same file. Resolving it in the body pass
+        // alone made expansion depend on the order the members are written in.
+        // The body pass resolves it again and is what reports; here the
+        // diagnostics are rolled back.
+        if self.sigs_only
+            && matches!(&tree.kind, TreeKind::DefDef { rhs, .. } if matches!(rhs.kind, TreeKind::MacroRhs { .. }))
+        {
+            let mark = self.diags.len();
+            self.type_macro_def(tree);
+            self.diags.truncate(mark);
+        }
         if matches!(
             &tree.kind,
             TreeKind::ValDef { .. } | TreeKind::DefDef { .. }
@@ -5287,6 +5334,9 @@ impl Typer {
     }
 
     pub(crate) fn type_expr(&mut self, tree: &mut Tree, pt: &Type) {
+        // Taken, not read: everything typed below this point is no longer the
+        // callee of the application that set it. See `typing_callee`.
+        let callee = std::mem::take(&mut self.typing_callee);
         if matches!(&tree.kind, TreeKind::Ident { .. }) {
             let name = match &tree.kind {
                 TreeKind::Ident { name } => name.clone(),
@@ -5306,6 +5356,12 @@ impl Typer {
             self.type_eta(tree, pt);
         } else {
             self.type_expr_inner(tree, pt);
+        }
+        // nsc expands a macro application in the typer, at the outermost
+        // `Apply`/`TypeApply`, and typechecks what comes back at the call
+        // site. Before `adapt`, so what is adapted to `pt` is the expansion.
+        if !callee && self.has_macro_defs {
+            self.expand_macro_application(tree);
         }
         self.adapt_implicit_apply(tree, pt);
         if !pt.is_no_type() && !tree.ty.is_no_type() && !tree.ty.is_error() {
@@ -5590,7 +5646,9 @@ impl Typer {
             TreeKind::Select { .. } => self.type_select(tree, pt),
             TreeKind::Apply { .. } => self.type_apply(tree, pt),
             TreeKind::TypeApply { fun, args } => {
+                self.typing_callee = true;
                 self.type_expr(fun, &Type::NoType);
+                self.typing_callee = false;
                 let mut targs = Vec::new();
                 for a in args.iter_mut() {
                     let t = self.tree_to_type(a);
@@ -10031,7 +10089,9 @@ impl Typer {
         };
         // Expected type Method so nullary methods (`unary_-`, `def f: Int` called as `f()`)
         // are not auto-applied before this Apply is typed.
+        self.typing_callee = true;
         self.type_expr(fun, &dummy_method);
+        self.typing_callee = false;
         self.rewrite_receiver_apply(fun);
         Self::auto_apply_nullary_function(fun, args.len());
         if !self.reorder_named_args(args, fun) {

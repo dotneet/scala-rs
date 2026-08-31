@@ -1542,22 +1542,32 @@ impl PickleSupply {
         if jvm.starts_with("scala/") && id.0 < st.prelude_end {
             return;
         }
-        // Members are not the test for "already filled in": a class the JVM
-        // loader completed from its class file has methods and still no type
-        // parameters, and `cats.FlatMap` in that state made every
-        // `FlatMap[F]` in cats' syntax layer an arity error -- which of the
-        // two happened first depended only on the order of the file's imports.
-        // Type parameters are, and a class that has them is left alone.
-        if !st.get(id).tparams.is_empty() {
-            return;
-        }
+        let had_tparams = !st.get(id).tparams.is_empty();
         let Ok(sig) = ({
             let mut src = BinSource(bin);
             self.sigs.class_sig(&mut src, full_name, module)
         }) else {
             return;
         };
-        if sig.tparams.is_empty() {
+        // A placeholder built by the class-file loader (`find_or_stub_java_class`)
+        // does not know a Scala trait from a class, and the backend reads
+        // exactly that to choose `invokeinterface` over `invokevirtual`:
+        // `scala.reflect.macros.Universe` reached through a descriptor came
+        // out unmarked, and every `u.Literal(...)` a macro implementation
+        // compiled to an `invokevirtual` the JVM rejects with
+        // `IncompatibleClassChangeError`. Only ever *adds* the flag, and only
+        // when the pickle says so.
+        if sig.flags & pflags::TRAIT != 0 || sig.flags & pflags::INTERFACE != 0 {
+            let f = st.get(id).flags;
+            st.get_mut(id).flags = f.with(Flags::INTERFACE).with(Flags::TRAIT);
+        }
+        // Members are not the test for "already filled in": a class the JVM
+        // loader completed from its class file has methods and still no type
+        // parameters, and `cats.FlatMap` in that state made every
+        // `FlatMap[F]` in cats' syntax layer an arity error -- which of the
+        // two happened first depended only on the order of the file's imports.
+        // Type parameters are, and a class that has them is left alone.
+        if had_tparams || sig.tparams.is_empty() {
             return;
         }
         trace(format_args!(
