@@ -1220,6 +1220,7 @@ impl PickleSupply {
                 continue;
             }
             let Some(t) = self.conv(st, bin, &scope, &p) else {
+                trace(format_args!("{full}: parent {sym} unconvertible"));
                 continue;
             };
             let Type::Class { sym: psym, .. } = &t else {
@@ -1228,12 +1229,33 @@ impl PickleSupply {
             if *psym == class_sym {
                 continue;
             }
-            let already = st
+            // The same class, already above this one but with *different*
+            // arguments, is the erased generic signature of a class file
+            // talking: `ArrayBuilder<T> implements ReusableBuilder<T, Object>`
+            // is what javac's format can say, while the pickle says
+            // `ReusableBuilder[T, Array[T]]` -- and `To` is invariant, so
+            // `ArrayBuilder[E]` was not a `Builder[E, Array[E]]` and
+            // `mutable.ArrayBuilder.make[E]` could not be returned as one.
+            // The pickle is scalac's own record of the declaration, so it
+            // refines the parent it agrees with on the class. Never a prelude
+            // class: its hierarchy is hand-written and reasoned about.
+            let existing = st
                 .get(class_sym)
                 .parents
                 .iter()
-                .any(|q| matches!(q, Type::Class { sym: q, .. } if q == psym));
-            if already {
+                .position(|q| matches!(q, Type::Class { sym: q, .. } if q == psym));
+            if let Some(i) = existing {
+                let refines = class_sym.0 >= st.prelude_end
+                    && !matches!(&st.get(class_sym).parents[i], Type::Class { args, .. }
+                        if *args == parent_args(&t));
+                if refines {
+                    trace(format_args!(
+                        "{full}: refining parent {} to {}",
+                        st.get(*psym).name,
+                        st.display_type(&t)
+                    ));
+                    st.get_mut(class_sym).parents[i] = t;
+                }
                 continue;
             }
             // A parent that already has this class above it would make the
@@ -1406,10 +1428,19 @@ impl PickleSupply {
     /// argument but the symbol has 0" and every `Ref.of` / `Ref.ofEffect` /
     /// `Ref.lens` is declined for it.
     ///
-    /// Only a symbol nothing has filled in yet, and never one of the
-    /// library's: a class the typer has really loaded already has its
-    /// parameters, and reshaping a prelude class is what `ensure_class`
-    /// deliberately refuses to do.
+    /// Only a symbol nothing has filled in yet, and never one the *prelude*
+    /// built: a class the typer has really loaded already has its parameters,
+    /// and reshaping a prelude class is what `ensure_class` deliberately
+    /// refuses to do.
+    ///
+    /// "Prelude" is the line, not the `scala.` package. `find_or_stub_java_class`
+    /// enters library names too -- `scala/collection/mutable/ReusableBuilder`
+    /// comes in from `ArrayBuilder`'s classfile parent list, with no type
+    /// parameters and no members -- and refusing those left
+    /// `ReusableBuilder[T, Array[T]]` "applied to 2 arguments but the symbol
+    /// has 0", so `ArrayBuilder` never got the parent that makes it a
+    /// `Builder[E, Array[E]]`. A symbol allocated after `prelude_end` was
+    /// built by no hand the rest of the typer reasons about.
     fn give_stub_its_kinds(
         &mut self,
         st: &mut SymbolTable,
@@ -1419,7 +1450,10 @@ impl PickleSupply {
         module: bool,
     ) {
         let jvm = st.get(id).jvm_name.clone();
-        if jvm.starts_with("scala/") || jvm.starts_with("java/") || jvm.starts_with("javax/") {
+        if jvm.starts_with("java/") || jvm.starts_with("javax/") {
+            return;
+        }
+        if jvm.starts_with("scala/") && id.0 < st.prelude_end {
             return;
         }
         // Members are not the test for "already filled in": a class the JVM
@@ -2581,6 +2615,14 @@ fn library_ancestors(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
         }
     }
     out
+}
+
+/// The type arguments of a class type, empty for anything else.
+fn parent_args(t: &Type) -> Vec<Type> {
+    match t {
+        Type::Class { args, .. } => args.clone(),
+        _ => Vec::new(),
+    }
 }
 
 /// Whether `cls` already has `target` somewhere above it.

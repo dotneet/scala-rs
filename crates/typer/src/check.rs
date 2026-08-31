@@ -6833,6 +6833,17 @@ impl Typer {
         }
         let mut out = p.clone();
         for tp in open {
+            // A *type constructor* has no bound that is a type. `Any` is not
+            // one of its inhabitants -- it is not even the same kind -- so
+            // slick's `flatMap[F, T, D[_]](f: E => Query[F, T, D])` reached
+            // the lambda as `Query[F, T, Any]` and its `Query[G, T, Seq]` body
+            // was `found: Query[G, T, Seq]  required: Query[G, T, Any]`. A
+            // wildcard is what "some constructor, not yet decided" means in a
+            // position `is_sub_type` already understands.
+            if !self.st.get(*tp).tparams.is_empty() {
+                out = crate::symbol::subst_tparams_slice(&[*tp], &[Type::Wildcard], &out);
+                continue;
+            }
             let hi = self.st.get(*tp).bound_hi.clone().unwrap_or(Type::Any);
             // A bound written in terms of the other open variables says
             // nothing more than `Any` does here.
@@ -9989,11 +10000,42 @@ impl Typer {
                             // `F`, and taking it for the element gave
                             // `Ops[Box, Int].flatMap`'s lambda the parameter
                             // type `Box` where the declaration says `Int`.
-                            let fparams = if self.st.kind_arity(&elem) == 0 {
-                                vec![elem.clone()]
-                            } else {
-                                fp.clone()
+                            //
+                            // And only for a *one-argument* function whose
+                            // parameter the declaration has not already
+                            // settled. `LazyZip2[A, B, C].map(f: (A, B) => R)`
+                            // takes two, and replacing them with one element
+                            // type made `xs.lazyZip(ys).map((a, b) => …)`
+                            // "found (String, Int) => String, required
+                            // (String) => Any". `Iterator[A].grouped(n)` hands
+                            // back an `Iterator.GroupedIterator[B]` whose
+                            // element type is `Seq[B]`, not `B`: the first type
+                            // argument is the element for the collections this
+                            // rule was written for, and a guess about which
+                            // must not overrule a parameter type the signature
+                            // states outright. Before that,
+                            // `it.grouped(2).map { case Seq(i, t) => … }` typed
+                            // its lambda against `Int` and emitted a
+                            // `checkcast` that is a `VerifyError` at run time.
+                            let settled = fp.len() == 1 && {
+                                let mut open = Vec::new();
+                                collect_tparams(&fp[0], &mut open);
+                                open.is_empty()
+                                    && !fp[0].is_no_type()
+                                    && !matches!(
+                                        fp[0],
+                                        Type::Named { .. }
+                                            | Type::Any
+                                            | Type::AnyRef
+                                            | Type::TypeMember(_)
+                                    )
                             };
+                            let fparams =
+                                if fp.len() == 1 && !settled && self.st.kind_arity(&elem) == 0 {
+                                    vec![elem.clone()]
+                                } else {
+                                    fp.clone()
+                                };
                             param_tys[0] = Type::Function {
                                 params: fparams,
                                 ret: fret,
