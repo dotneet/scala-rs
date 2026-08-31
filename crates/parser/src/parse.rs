@@ -3371,7 +3371,14 @@ impl<'a> Parser<'a> {
         let lo = self.span();
         self.bump(); // {
         self.skip_nl_semi();
-        if matches!(self.kind(), TokenKind::Case) {
+        // `{ case class X(...); ... }` is a block that opens with a *definition*,
+        // not a partial function: `case` is a modifier there. Only `case` followed
+        // by something other than `class` / `object` starts a clause.
+        let case_definition = matches!(
+            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            Some(TokenKind::Class) | Some(TokenKind::Object)
+        );
+        if matches!(self.kind(), TokenKind::Case) && !case_definition {
             let cases = self.parse_cases();
             self.expect("}", |k| matches!(k, TokenKind::RBrace));
             // Partial function: (x => x match cases) encoded as Function with Match
