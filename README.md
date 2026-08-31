@@ -7826,6 +7826,12 @@ slick（`tests/slick_measure.sh`）は **`errors=257 files_with_errors=63` の�
 
 #### Remaining
 
+- **`Ordering[String].compare(1, 2)` の診断文面が scalac から乖離**(拒否自体は健在)。
+  `agent/tail2` の jar implicit 供給で prelude の `compare` の隣に pickle 由来の候補が並び、
+  単一候補の `type mismatch; found: 1 required: T`(scalac と同文)が
+  `no matching overload` に変わった。同 erasure の重複が供給の門(`agent/setapply2`)を
+  すり抜ける新しい継ぎ目と思われる。文面だけの問題。
+
 - ~~`new T`（型パラメータ）/ `new A`（抽象型メンバ）は今も無言で通ります。~~
   `agent/eqtail`（後述）で直しました。
 - 修飾付きの名前は、`lookup_qualified_type` が失敗したとき**裸の名前**での再解決に
