@@ -37,3 +37,11 @@ true
 false
 true
 scala.collection.immutable.List
+(Int, Foo)
+Int => Foo
+(Int, String) => Foo
+Array[Int]
+List[(Int, Foo)]
+true
+scala.Tuple2
+scala.Function1

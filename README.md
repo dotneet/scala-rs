@@ -185,6 +185,24 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
   プログラム出力が一致する（`tests/fixtures/ex_impl.scala` +
   `tests/fixtures/ex_use.scala`）
   （[`docs/macros.md`](docs/macros.md) §7.12）
+- **展開結果の `Function` / `ValDef`**: slick の `TableQueryMacroImpl.apply` が
+  組む `Function(List(ValDef(Modifiers(Flag.PARAM), TermName("tag"),
+  Ident(typeOf[Tag].typeSymbol), EmptyTree)), …)` が丸ごと往復する。
+  `Modifiers` は**フラグの名前**で運ぶ（`universe.Flag` の値を反射で列挙する。
+  nsc のビット配置は内部仕様で、しかも 1 ビットに 2 つ名前が乗る）。
+  表に無い名前と名前の付かない残りビットは診断で、黙って落とさない
+  （`var` を `val` に組み替えても誰も気づかないため）。あわせて
+  `import c.universe._` が暗黙の `import scala._` に負けていたのを直し
+  （SLS 2 の優先順位。`Function` が `scala.Function` に解決していた）、
+  パスとして書いた `scala.Int` が primitive にならなかったのを直し、
+  タプル・関数型・配列のタグ（`scala.TupleN` / `scala.FunctionN` /
+  `scala.Array`）を組めるようにし、**引数を取らないマクロの結果を適用する形**
+  （`M.f(1, 2)` で `f` が引数無し）で `Apply` をマクロ自身の引数節と
+  読んでいたのを直した（マクロ def のパラメータ節の数で止める）。
+  実 scalac 2.13.16 との dual-run で
+  プログラム出力が一致する（`tests/fixtures/sd_impl.scala` +
+  `tests/fixtures/sd_use.scala`）
+  （[`docs/macros.md`](docs/macros.md) §7.13）
 - **quasiquote（`q"..."`）の reification**: `q"..."` / `tq"..."` / `pq"..."` / `cq"..."` は
   `StringContext` の普通の補間子ではなく、nsc の**コンパイラ内蔵マクロ**である。
   補間文字列の中身を（`$x` / `${…}` / `..$xs` / `...$xss` をプレースホルダに置き換えて）
@@ -3574,13 +3592,14 @@ implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラー
   `UnsupportedOperationException` を投げ、その名前が診断に出ます）/
   **ブロック・関数リテラル・`new` などの引数（およびレシーバ）を実装に渡すこと** /
   **レシーバを書かない呼び出しの `c.prefix`**（nsc の `This(<囲むクラス>)`）/
-  **展開結果の `Function` / `ValDef`**（本物の slick の `TableQueryMacroImpl` が
-  作るのはこの形なので、slick 本体に効かせるにはこれが要ります）/
+  **同じ run でコンパイルするクラスを型引数に取ること**（タグは
+  `staticClass(<完全名>)` で組むので、engine の mirror が解決できるのは
+  マクロ classpath＝*前の run* が書いたクラスだけです）/
   **タグを持たない型パラメータのタグ**（nsc は free type symbol を立てますが、
   scala-rs は断ります）。どれも「黙って別の木に展開する」ことはせず、
   `macro expansion is not implemented: cannot expand f (implementation Impl$.m):
   <理由>` と理由つきで診断します
-  （**[`docs/macros.md`](docs/macros.md)** §7.11 / §7.12）
+  （**[`docs/macros.md`](docs/macros.md)** §7.11 / §7.12 / §7.13）
 - **quasiquote の展開（reification）の残り**。`q"..."` / `tq"..."` / `pq"..."` /
   `cq"..."` は `internal.reificationSupport.Syntactic*` の呼び出しに落として
   実行でき、型注釈 / eta 展開 / ブロックと `val` / `new` / `match` / 部分関数 /

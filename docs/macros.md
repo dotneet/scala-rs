@@ -1732,3 +1732,146 @@ scala-rs の木では `Apply(New(tpt), args)`。`New` を受け取れるよう�
 段階 D（slick を 2 段コンパイルする実験）には上の残件 3・4 が要る。
 このスライスが動かしたのは「slick の 2 マクロと**同じ形**のマクロを
 書いて展開できる」ところまでである。
+
+### 7.13 段階 D-1: 展開結果の `Function` / `ValDef`（`agent/staged` スライス）
+
+§7.12 の残件 3。**展開結果に `Function` と `ValDef` を作れるようになった**ので、
+slick の `TableQueryMacroImpl.apply` が組む木——
+
+```scala
+Function(
+  List(ValDef(Modifiers(Flag.PARAM), TermName("tag"),
+              Ident(typeOf[Tag].typeSymbol), EmptyTree)),
+  Apply(Select(New(TypeTree(e.tpe)), termNames.CONSTRUCTOR),
+        List(Ident(TermName("tag")))))
+```
+
+——が丸ごと往復し、展開後のプログラムが走る。実 scalac 2.13.16 と 2 段コンパイルで
+dual-run し、出力が完全一致する（`tests/fixtures/sd_impl.scala` +
+`tests/fixtures/sd_use.scala`）。
+
+#### 1. `Modifiers` は**名前**で運ぶ
+
+`ValDef` を作るには `Modifiers` が要る。engine は `productElement` を
+そのまま流すので、これまで `Modifiers` は `(o "Modifiers(PARAM)")` という
+`toString` になっていた。
+
+数値（`FlagSet` は `Long`）を送る案は採らない。nsc のビット配置は内部仕様で、
+しかも **1 つのビットに 2 つの名前が乗っている**（`BYNAMEPARAM` は `COVARIANT`、
+`DEFAULTPARAM` は `TRAIT`）。そこで engine は `universe.Flag` の
+**0 引数・戻り値 `long` のメソッドを反射で列挙**し、立っているビットの名前を
+すべて書く。名前の付かなかった残りビットは 16 進数で添える。
+
+```
+(mods (f "PARAM") (rest "0") "" (l))
+```
+
+Rust 側は名前を自分の `Flags` に写す。**表に無い名前と、名前の付かない残りビットは
+どちらも診断**である（`the expansion contains a definition marked `DEFERRED`,
+a modifier scala-rs cannot rebuild yet`）。黙って落とすと `var` を `val` に、
+`lazy val` を正格な `val` に組み替えてしまい、誰も気づかない。
+2 つ名前のあるビットは、**この展開器が組む唯一の定義である `ValDef` としての
+読み**を採る（`BYNAMEPARAM` / `DEFAULTPARAM`）。`privateWithin` と
+アノテーションも運ぶ（アノテーション付きは現状 診断）。
+
+#### 2. 道中で塞いだ 3 つの一般の穴
+
+| 直したもの | どこ | 影響 |
+| --- | --- | --- |
+| **`import c.universe._` が暗黙の `import scala._` に負けていた。** `expose_unqualified` は「囲むパッケージ → `scala._` → `java.lang._` → root → **wildcard import**」の順で探していた。SLS 2 では明示の import の方が上（`scala._` / `java.lang._` は最外側の wildcard import）。そのため `Function(vparams, body)` は `scala.Function`（`apply` を持たないオブジェクト）に解決し、**slick が書いているマクロ実装をそもそもコンパイルできなかった** | `Check::expose_from_wildcards` | wildcard 段を `scala._` の前に出した。eager に入る名前は現行スコープにあるのでこの経路を通らず、影響は「pickle から遅延で読む名前」に限られる |
+| **`scala.Int` と書くと primitive にならなかった。** パスとして書かれた `scala.Int` はパッケージのメンバ探索に当たって `Type::Class` になる。表示は `Int` なのに何とも等しくないので `val x: scala.Int = 1` が `type mismatch; found: 1  required: Int` だった | `check::scala_value_type` | 展開結果の `TypeTree(typeOf[Int])` は完全名で届くので、この経路がそのまま必要 |
+| **タプル・関数型・配列のタグが作れなかった**（§7.12 の既知の残件） | `Check::tag_body` | `scala.TupleN` / `scala.FunctionN` / `scala.Array` を名指しして §7.12 の `appliedType` 合成に乗せる。slick の `c.Expr[Tag => E]` がこれを要求する。`tt_tags.scala` が実 scalac と `toString` まで一致することを固定 |
+
+#### 検証
+
+- `tests/fixtures/sd_impl.scala` + `tests/fixtures/sd_use.scala` — scala-rs で
+  2 段コンパイルして実行し、`tests/fixtures/expected/sd_use.txt` と一致する
+  （`java -Xverify:all`）。**同じ 2 ファイルを実 scalac 2.13.16 でも 2 段
+  コンパイルして実行し、同じ 6 行になることを別テストで固定**している。
+  パラメータ名を取り違えた `Function`、修飾子を落とした `ValDef` は
+  どちらもコンパイルは通ってしまうので、**出力の比較だけが捕まえられる**。
+- `tests/fixtures/sd_gaps_bad.scala` — 断る 2 形。
+- `tests/fixtures/tt_tags.scala` — タプル・関数型・配列のタグを追加。
+
+#### 3. 引数を取らないマクロの結果を適用する形
+
+`SdUse.adder(20, 22)` で `adder` が**引数を取らない**マクロのとき、
+`Apply` はマクロ自身の引数節ではなく**展開結果への適用**である。
+展開器は `Apply` を無条件に剥がしていたので
+`the implementation takes 0 argument(s) and the call site supplies 2` という
+——実 scalac が通す呼び出しに対する——誤った診断を出していた。
+
+マクロ def 自身のパラメータ節の数（シンボルの `Type::Method` の `paramss`）を
+数え、多い分は**中に入って**そこで展開する。層は素の `Apply` とは限らず、
+関数値の適用は typer が挟む `apply` 選択を通るので、層数を数えて降りるのでは
+なく「頭が当のマクロで、節の数がちょうど合う」ノードを探す
+（`macro_application_node`）。外側の `Apply` はマクロ def のシンボルを
+**持ったまま**なので落とす。残しておくと `report_macro_calls` が
+「展開されていないマクロ」を——理由の文字列すら無い形で——報告する。
+
+#### 4. `reify` に足りないもの（D-2 の調査結果）
+
+段階 D-2（自前の `reify`）は**このスライスでは実装していない**。
+設計は確定し、**組むべき木が実 scalac 2.13.16 で通ることまで確認した**が、
+その手前に scala-rs 側の穴が 3 つ残っている。
+
+`reify { … }` が展開されるべき形は（nsc の `-Xprint:typer` と同じ）:
+
+```scala
+{
+  final class $treecreator1 extends scala.reflect.api.TreeCreator {
+    def apply[U <: scala.reflect.api.Universe with Singleton](
+        m: scala.reflect.api.Mirror[U]): U#Tree = {
+      val u = m.universe
+      u.internal.reificationSupport.SyntacticApplied(…)   // ← §7.1 の reifier
+    }
+  }
+  c.universe.Expr.apply[T](
+    c.universe.rootMirror.asInstanceOf[scala.reflect.api.Mirror[c.universe.type]],
+    new $treecreator1())
+}
+```
+
+**この形は実 scalac が受理する**（`u.internal.reificationSupport.Syntactic*` を
+パス依存の `U` 越しに呼ぶところも含めて）。つまり
+`crates/typer/src/reify.rs` の reifier に universe として
+`m.universe` を渡せば、本体はそのまま流用できる——
+`crates/typer/src/materialize.rs` の `TypeCreator` 合成が
+`TreeCreator` 版のひな型になる。
+
+scala-rs 側で塞がっていない穴は 3 つで、いずれも `reify` 以前の問題である:
+
+| 穴 | 症状 |
+| --- | --- |
+| universe の**入れ子オブジェクト**がパスからも wildcard import からも引けない | `c.universe.Expr` は `value Expr is not a member of Universe`、`import c.universe._` 下の `Expr` は `not found: value Expr`。`Exprs.Expr` は trait の中の `object` で、`PickleSupply` が供給していない（§7.8 残件 5 と同じ穴） |
+| `c.universe` が**安定識別子**として型に書けない | `Mirror[c.universe.type]` が `stable identifier required, but c.universe found`（§7.8 残件 6）。`c.universe` は `val` なので安定のはず。合成側は `RESOLVED_TYPE` で型を直接埋めれば避けられるが、穴自体は残る |
+| reify 本体の**衛生性** | nsc の reify は*型付き*の木を作るので、`TableQuery` は `staticModule("slick.lifted.TableQuery")` に解決される。§7.1 の reifier は書かれた名前をそのまま `SyntacticTermIdent` にするので、展開先のスコープで解決される。静的シンボルは `_root_.` 付き完全パスに書き換え、それ以外（ローカル・パラメータ）は**名指しで断る**、というのが設計だが未実装 |
+
+したがって `reify { … }` は §7.8 の診断のままである。
+
+#### このスライスのあとに残っているもの
+
+1. **展開の型引数が「前の run のクラス」でなければならない。**
+   タグは `staticClass(<完全名>)` で組むので、engine の mirror が
+   解決できるのは**マクロ classpath にあるクラスだけ**である。
+   `TableQuery[Coffees]` のように *同じ run* で定義する行クラスは
+   まだ渡せない（`sd_gaps_bad.scala` が固定）。nsc はコンパイラ自身の
+   universe を使うのでこの制約が無い。**本物の slick の利用側**を
+   通すにはここが要る。
+2. **`reify`**（上の 4）、**`c.prefix` の `This`**（§7.12 残件 1）、
+   **型付き木のまま渡す**（同 2）はそのまま。
+3. **`TableQuery.apply[E](cons.splice)` のオーバーロード選択。**
+   `TableQuery.apply` は「引数 1 つ」と「引数無し（マクロ）」の 2 つがあり、
+   scala-rs は後者を選んでから結果に `(cons.splice)` を適用しようとして
+   `value apply is not a member of TableQuery[E]` になる。nsc は前者を選ぶ。
+   本物の `TableQuery.scala` を通すのに要る 3 件のうちの 1 つ
+   （残り 2 件は `reify` と、マクロと無関係な
+   `new BaseTag { base => … }` の自己名 `base` が引けないこと）。
+
+#### slick への効き方
+
+`tests/slick_measure.sh` は `errors=155 → 154`、`files_with_errors=52 → 52`。
+`tests/slick_subset.sh` は `38 files / 204 classes / verified=204 failed=0` のまま。
+減った 1 件は `TableQuery.scala` の `c.Expr[Tag => E]`（関数型のタグ）である。
+残りは §7.12 と同じく、slick の 2 マクロが「def と実装が同じ run にある」形
+だからで、段階 D-3 には `reify` が要る。

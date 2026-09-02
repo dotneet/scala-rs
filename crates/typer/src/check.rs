@@ -6691,6 +6691,17 @@ impl Typer {
             pkg = owner;
         }
         let pkg = self.enclosing_package(from);
+        // An `import p._` the program wrote outranks the implicit
+        // `import scala._` and `import java.lang._` every source carries: SLS
+        // 2 makes those two wildcard imports at the outermost nesting level,
+        // so any import written in the file shadows them. While this ran
+        // *after* them, `import c.universe._; Function(vparams, body)`
+        // resolved to `scala.Function` -- an object with no `apply` -- and the
+        // macro implementation slick writes could not be compiled at all.
+        //
+        // The eager half of `import_wildcard` is not affected: a name it could
+        // enter is already in the current scope and neither branch runs.
+        self.expose_from_wildcards(name, span);
         if self.st.lookup(name).is_empty() {
             // Every Scala source has an implicit `import scala._`, which ranks
             // above `java.lang._`. Almost every name it offers is already in
@@ -6720,70 +6731,76 @@ impl Typer {
                 self.st.enter_in_current(name, id);
             }
         }
-        if self.st.lookup(name).is_empty() {
-            // `import p._` where `p` is a jar package: its classes are read one
-            // at a time, so the name is only reachable now.
-            for owner in self.st.wildcard_owners_for(name) {
-                self.complete_binary_member(owner, name, span);
-                let mut found = self.st.lookup_member(owner, name);
-                if found.is_empty() {
-                    // `import <a value>._` where the value's class comes from a
-                    // jar. The members of such a class are read from its pickle
-                    // *on demand*, one name at a time, and the ones this import
-                    // offers are mostly inherited: `import
-                    // scala.reflect.runtime.universe._` names a `JavaUniverse`,
-                    // but `TermName` / `Literal` / `Constant` are declared on
-                    // `scala.reflect.api.Names` / `Trees` / `Constants` far up
-                    // its linearisation, so nothing had read them yet and the
-                    // import brought in nothing at all. Selecting the same
-                    // member through the path (`u.TermName`) always worked --
-                    // that route runs the completion below -- which is why
-                    // reified quasiquotes, which build `u.TermName(...)`
-                    // explicitly, did not notice.
-                    found = self.supply_from_pickle_class(owner, name);
-                }
-                if found.is_empty() && self.library_abi {
-                    // The type namespace, which the reflection API is written
-                    // in: `import c.universe._` is what puts `Tree`, `Symbol`
-                    // and `TermName` in scope as *types*, and they are
-                    // abstract type members of `scala.reflect.api.Trees` /
-                    // `Symbols` / `Names`. Completing one installs a symbol on
-                    // its declaring trait, which `lookup_member` then reaches.
-                    if let Some(Type::TypeMember(id)) = self.pickle.complete_type_member(
-                        &mut self.st,
-                        &mut self.binary,
-                        owner,
-                        name,
-                    ) {
-                        found = vec![id];
-                    }
-                }
-                if found.is_empty() {
-                    // `complete_binary_member` only ever looks for a *nested
-                    // classfile* named after `name` (a companion, an inner
-                    // class) -- exactly what `import integral._; zero` /
-                    // `fromInt(5)` are not: `zero` and `fromInt` are ordinary
-                    // methods `scala.math.Numeric`'s own pickle declares,
-                    // with no classfile of their own. `import_wildcard`
-                    // (the eager half of a wildcard import) already snapshots
-                    // whatever is on the owner's member list *at import
-                    // time*; a standard-library trait's members are mostly
-                    // read from its pickle on demand, so a name nothing had
-                    // asked for yet was never in that snapshot. The pickle
-                    // path a plain member selection already uses
-                    // (`supply_from_pickle`) is the one this needs too.
-                    found = self
-                        .pickle
-                        .complete(&mut self.st, &mut self.binary, owner, name);
-                }
-                if found.is_empty() {
-                    continue;
-                }
-                for id in found {
-                    self.st.enter_in_current(name, id);
-                }
-                break;
+    }
+
+    /// The lazily-read half of a wildcard import.
+    ///
+    /// `import p._` where `p` is a jar package, or a value whose class comes
+    /// from a jar: those members are read one name at a time, so a name
+    /// nothing has asked for yet is not on the owner's member list and
+    /// `import_wildcard` could not enter it eagerly.
+    fn expose_from_wildcards(&mut self, name: &str, span: Span) {
+        if !self.st.lookup(name).is_empty() {
+            return;
+        }
+        for owner in self.st.wildcard_owners_for(name) {
+            self.complete_binary_member(owner, name, span);
+            let mut found = self.st.lookup_member(owner, name);
+            if found.is_empty() {
+                // `import <a value>._` where the value's class comes from a
+                // jar. The members of such a class are read from its pickle
+                // *on demand*, one name at a time, and the ones this import
+                // offers are mostly inherited: `import
+                // scala.reflect.runtime.universe._` names a `JavaUniverse`,
+                // but `TermName` / `Literal` / `Constant` are declared on
+                // `scala.reflect.api.Names` / `Trees` / `Constants` far up
+                // its linearisation, so nothing had read them yet and the
+                // import brought in nothing at all. Selecting the same
+                // member through the path (`u.TermName`) always worked --
+                // that route runs the completion below -- which is why
+                // reified quasiquotes, which build `u.TermName(...)`
+                // explicitly, did not notice.
+                found = self.supply_from_pickle_class(owner, name);
             }
+            if found.is_empty() && self.library_abi {
+                // The type namespace, which the reflection API is written
+                // in: `import c.universe._` is what puts `Tree`, `Symbol`
+                // and `TermName` in scope as *types*, and they are
+                // abstract type members of `scala.reflect.api.Trees` /
+                // `Symbols` / `Names`. Completing one installs a symbol on
+                // its declaring trait, which `lookup_member` then reaches.
+                if let Some(Type::TypeMember(id)) =
+                    self.pickle
+                        .complete_type_member(&mut self.st, &mut self.binary, owner, name)
+                {
+                    found = vec![id];
+                }
+            }
+            if found.is_empty() {
+                // `complete_binary_member` only ever looks for a *nested
+                // classfile* named after `name` (a companion, an inner
+                // class) -- exactly what `import integral._; zero` /
+                // `fromInt(5)` are not: `zero` and `fromInt` are ordinary
+                // methods `scala.math.Numeric`'s own pickle declares,
+                // with no classfile of their own. `import_wildcard`
+                // (the eager half of a wildcard import) already snapshots
+                // whatever is on the owner's member list *at import
+                // time*; a standard-library trait's members are mostly
+                // read from its pickle on demand, so a name nothing had
+                // asked for yet was never in that snapshot. The pickle
+                // path a plain member selection already uses
+                // (`supply_from_pickle`) is the one this needs too.
+                found = self
+                    .pickle
+                    .complete(&mut self.st, &mut self.binary, owner, name);
+            }
+            if found.is_empty() {
+                continue;
+            }
+            for id in found {
+                self.st.enter_in_current(name, id);
+            }
+            break;
         }
     }
 
@@ -13611,6 +13628,37 @@ impl Typer {
                     args: built,
                 })
             }
+            // A function, a tuple and an array are `Type`s of their own here
+            // and `TypeRef`s to an ordinary class there. nsc's tag for
+            // `Tag => E` is `TypeRef(scala.type, Function1, List(Tag, E))`,
+            // which is what `appliedType(staticClass("scala.Function1"), …)`
+            // builds -- slick's `TableQueryMacroImpl` asks for exactly that
+            // one (`c.Expr[Tag => E]`). The arity bound is the library's:
+            // `FunctionN` and `TupleN` stop at 22.
+            Type::Function { params, ret } if params.len() <= 22 => {
+                let mut built = Vec::new();
+                for a in params.iter().chain(std::iter::once(&**ret)) {
+                    built.push(self.tag_body(tag, a, span)?);
+                }
+                Ok(TagBody::Applied {
+                    class_name: format!("scala.Function{}", params.len()),
+                    args: built,
+                })
+            }
+            Type::Tuple(xs) if (1..=22).contains(&xs.len()) => {
+                let mut built = Vec::new();
+                for a in xs {
+                    built.push(self.tag_body(tag, a, span)?);
+                }
+                Ok(TagBody::Applied {
+                    class_name: format!("scala.Tuple{}", xs.len()),
+                    args: built,
+                })
+            }
+            Type::Array(elem) => Ok(TagBody::Applied {
+                class_name: "scala.Array".to_string(),
+                args: vec![self.tag_body(tag, elem, span)?],
+            }),
             Type::TypeParam(id) | Type::TypeMember(id) => {
                 let name = self.st.get(*id).name.clone();
                 let Some(tag_cls) = self.reflect_class(tag.pickle_name(), tag.jvm()) else {
@@ -16572,6 +16620,8 @@ impl Typer {
                 }
                 if name == "String" && !self.type_select_is_term_prefix(qual) {
                     Type::String
+                } else if let Some(t) = scala_value_type(qual, name) {
+                    t
                 } else if self.type_select_is_term_prefix(qual) {
                     self.path_dependent_type(tpt.span, qual, name)
                 } else if let Some(id) = self.lookup_qualified_type(qual, name) {
@@ -21417,6 +21467,45 @@ fn path_display(t: &Tree) -> String {
         TreeKind::New { tpt } => format!("new {}", tpt.name().unwrap_or("?")),
         _ => t.name().unwrap_or("<expr>").to_string(),
     }
+}
+
+/// `scala.Int` and its siblings, written out as a path.
+///
+/// The primitives and the top and bottom types are `Type`s of their own here,
+/// not class symbols, so resolving `scala.Int` through the package's member
+/// list produced a `Type::Class` that *printed* as `Int` and was equal to
+/// nothing: `val x: scala.Int = 1` was `type mismatch; found: 1  required:
+/// Int`, and `1 + 1` on such a value found no `+` overload. A macro expansion
+/// arrives as exactly this path -- `TypeTree(typeOf[Int])` is serialised by
+/// full name -- which is how it was found.
+fn scala_value_type(qual: &Tree, name: &str) -> Option<Type> {
+    let scala_pkg = match &qual.kind {
+        TreeKind::Ident { name } => name == "scala",
+        TreeKind::Select { qual, name } => {
+            name == "scala" && matches!(&qual.kind, TreeKind::Ident { name } if name == "_root_")
+        }
+        _ => false,
+    };
+    if !scala_pkg {
+        return None;
+    }
+    Some(match name {
+        "Boolean" => Type::Boolean,
+        "Byte" => Type::Byte,
+        "Short" => Type::Short,
+        "Char" => Type::Char,
+        "Int" => Type::Int,
+        "Long" => Type::Long,
+        "Float" => Type::Float,
+        "Double" => Type::Double,
+        "Unit" => Type::Unit,
+        "Any" => Type::Any,
+        "AnyVal" => Type::AnyVal,
+        "AnyRef" => Type::AnyRef,
+        "Nothing" => Type::Nothing,
+        "Null" => Type::Null,
+        _ => return None,
+    })
 }
 
 fn structural_select_lhs(lhs: &Tree) -> bool {

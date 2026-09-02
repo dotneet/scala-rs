@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
-use scala_rs_parser::{Lit, NodeId, SymbolId, Tree, TreeKind, Type};
+use scala_rs_parser::{Flags, Lit, Modifiers, NodeId, SymbolId, Tree, TreeKind, Type};
 use scala_rs_pickle::names::{decode_method_name, encode_method_name};
 use scala_rs_span::Span;
 
@@ -289,6 +289,35 @@ impl Typer {
             || tree.ty.is_no_type()
             || matches!(tree.ty, Type::Overload(_))
         {
+            return;
+        }
+        // The macro application is the node that supplies the macro *def*'s
+        // own parameter clauses, and no more. `M.f(1, 2)` where `f` takes
+        // none -- a macro whose *result* is a function -- is an application
+        // of the expansion, not of the macro: reading its argument list as
+        // the macro's own reported "the implementation takes 0 argument(s)
+        // and the call site supplies 2" for a call real scalac compiles.
+        // Walk in to the node that does match, and expand there; the outer
+        // application keeps the type it was already given, which is the
+        // declared result type the expansion is checked against anyway.
+        let want = match &self.st.get(sym).ty {
+            Type::Method { paramss, .. } => paramss.len(),
+            _ => 0,
+        };
+        if apply_layers(tree) > want {
+            // The `apply` the typer inserted to call the expansion's result
+            // sits between the two, so the node is found by matching rather
+            // than by counting layers off the top.
+            if let Some(inner) = macro_application_node(tree, sym, want) {
+                self.expand_macro_application(inner);
+                // The outer application still carries the macro's symbol from
+                // when its callee was resolved. Left there,
+                // `report_macro_calls` sees an unexpanded macro at a node that
+                // is not one any more, and reports it with no reason at all.
+                if tree.sym == sym {
+                    tree.sym = SymbolId::NONE;
+                }
+            }
             return;
         }
         let binding = match self.st.get(sym).macro_impl.clone() {
@@ -605,6 +634,34 @@ impl Typer {
                 // `tree_to_type` reads it.
                 Ok(path_tree(&name, span))
             }
+            // `Function(vparams, body)` and the `ValDef`s under it. slick's
+            // `TableQueryMacroImpl.apply` builds exactly this -- a function
+            // literal whose one parameter is spelled out with a `Modifiers`,
+            // a `TermName` and a type `Ident` -- and hands it to
+            // `TableQuery.apply[E]`.
+            "Function" => {
+                let mut vparams = Vec::new();
+                for a in at(kids, 0)?.list()?.iter().skip(1) {
+                    vparams.push(self.tree_from_reply(a, span)?);
+                }
+                let body = self.tree_from_reply(at(kids, 1)?, span)?;
+                Ok(node(TreeKind::Function {
+                    vparams,
+                    body: Box::new(body),
+                }))
+            }
+            "ValDef" => {
+                let mods = mods_from(at(kids, 0)?)?;
+                let name = decode_method_name(&name_from(at(kids, 1)?)?);
+                let tpt = self.tree_from_reply(at(kids, 2)?, span)?;
+                let rhs = self.tree_from_reply(at(kids, 3)?, span)?;
+                Ok(node(TreeKind::ValDef {
+                    mods,
+                    name,
+                    tpt: Box::new(tpt),
+                    rhs: Box::new(rhs),
+                }))
+            }
             "This" => Ok(node(TreeKind::This { qual: None })),
             "EmptyTree" => Ok(node(TreeKind::Empty)),
             other => Err(format!(
@@ -612,6 +669,75 @@ impl Typer {
             )),
         }
     }
+}
+
+/// The `Modifiers` of a `ValDef` the engine sent back.
+///
+/// Every flag arrives by *name*, so scala-rs never has to know nsc's bit
+/// layout -- just as well, because several bits carry two names and a number
+/// on the wire would make this guess. The ambiguous pairs are resolved for the
+/// only definition this expander rebuilds, a `ValDef`: on a value the
+/// `BYNAMEPARAM`/`COVARIANT` bit is by-name and the `DEFAULTPARAM`/`TRAIT` bit
+/// is a default argument, so the type-parameter reading of each is dropped.
+///
+/// A name that is not in the table, and a leftover bit with no name at all,
+/// are both diagnostics. A modifier dropped in silence would rebuild a
+/// *different* definition -- a `var` as a `val`, a `lazy val` as a strict one
+/// -- and nothing downstream would notice.
+fn mods_from(s: &Sexp) -> Result<Modifiers, String> {
+    let items = s.list()?;
+    if items.first().and_then(|s| s.atom()) != Some("mods") {
+        return Err(format!("expected modifiers, got {s:?}"));
+    }
+    let mut flags = Flags::EMPTY;
+    for f in at(items, 1)?.list()?.iter().skip(1) {
+        let name = f.text();
+        let one = match name.as_str() {
+            "PARAM" => Flags::PARAM,
+            "IMPLICIT" => Flags::IMPLICIT,
+            "LAZY" => Flags::LAZY,
+            "MUTABLE" => Flags::MUTABLE,
+            "FINAL" => Flags::FINAL,
+            "PRIVATE" => Flags::PRIVATE,
+            "PROTECTED" => Flags::PROTECTED,
+            "LOCAL" => Flags::LOCAL,
+            "OVERRIDE" => Flags::OVERRIDE,
+            "BYNAMEPARAM" => Flags::BYNAME,
+            "DEFAULTPARAM" => Flags::DEFAULTPARAM,
+            "PRESUPER" => Flags::PRESUPER,
+            "SYNTHETIC" => Flags::SYNTHETIC,
+            // The second name on a bit already read above, and the two that
+            // only record how nsc produced the definition.
+            "COVARIANT" | "TRAIT" | "ARTIFACT" | "STABLE" => Flags::EMPTY,
+            other => {
+                return Err(format!(
+                    "the expansion contains a definition marked `{other}`, \
+                     a modifier scala-rs cannot rebuild yet"
+                ))
+            }
+        };
+        flags = flags.with(one);
+    }
+    let rest = at(items, 2)?.list()?;
+    let rest = at(rest, 1)?.text();
+    if rest != "0" {
+        return Err(format!(
+            "the expansion contains a definition with unnamed modifier bits \
+             (0x{rest}), which scala-rs cannot rebuild"
+        ));
+    }
+    let within = at(items, 3)?.text();
+    let annots = at(items, 4)?.list()?;
+    if annots.len() > 1 {
+        return Err("the expansion contains an annotated definition, \
+                    which scala-rs cannot rebuild yet"
+            .to_string());
+    }
+    Ok(Modifiers {
+        flags,
+        private_within: (!within.is_empty()).then_some(within),
+        annotations: Vec::new(),
+    })
 }
 
 /// `a.b.C` as a term path.
@@ -685,6 +811,53 @@ fn name_from(s: &Sexp) -> Result<String, String> {
     match items.first().and_then(|s| s.atom()) {
         Some("n") => Ok(at(items, 2)?.text()),
         _ => Err(format!("expected a name, got {s:?}")),
+    }
+}
+
+/// How many `Apply` clauses `tree` carries.
+fn apply_layers(tree: &Tree) -> usize {
+    let mut n = 0;
+    let mut t = tree;
+    while let TreeKind::Apply { fun, .. } = &t.kind {
+        n += 1;
+        t = fun;
+    }
+    n
+}
+
+/// The symbol at the head of an application spine, the way
+/// [`Typer::macro_symbol_of`] reads it.
+fn head_symbol(t: &Tree) -> SymbolId {
+    let mut h = t;
+    while let TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } = &h.kind {
+        h = fun;
+    }
+    if h.sym.is_none() {
+        t.sym
+    } else {
+        h.sym
+    }
+}
+
+/// The node inside `tree` that really is the application of macro `sym`: the
+/// one whose head is `sym` and which carries exactly the macro def's own
+/// `want` argument clauses.
+///
+/// Needed because a macro whose *result* is applied puts more layers on the
+/// tree than the macro def has clauses, and the extra ones are not always
+/// plain `Apply`s: applying a function value goes through an `apply`
+/// selection the typer inserts, so `M.f(1, 2)` on a nullary `f` arrives as
+/// `Apply(Select(Select(M, f), apply), args)`.
+fn macro_application_node(tree: &mut Tree, sym: SymbolId, want: usize) -> Option<&mut Tree> {
+    if apply_layers(tree) == want && head_symbol(tree) == sym {
+        return Some(tree);
+    }
+    match &mut tree.kind {
+        TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } => {
+            macro_application_node(fun, sym, want)
+        }
+        TreeKind::Select { qual, .. } => macro_application_node(qual, sym, want),
+        _ => None,
     }
 }
 

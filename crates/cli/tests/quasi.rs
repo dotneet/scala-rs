@@ -1584,13 +1584,11 @@ fn tt_tags_bad_names_every_tag_it_cannot_build() {
     let err = diagnostics(&output);
     for needle in [
         // A constructor at its arguments is built now (`docs/macros.md`
-        // §7.12) -- `tt_tags.scala` runs those against real scalac. What is
-        // refused is a constructor whose *argument* has no body, and a shape
-        // with no `staticClass` at all.
-        "cannot build a WeakTypeTag for `(Int, Foo)`, whose type arguments would have to be \
-         reified too",
-        "cannot build a TypeTag for `(Int) => Foo`, whose type arguments would have to be \
-         reified too",
+        // §7.12), and so are tuples, function types and arrays (§7.13) --
+        // `tt_tags.scala` runs those against real scalac. What is refused is
+        // a constructor (or a tuple) whose *argument* has no body, and a
+        // shape with no `staticClass` at all.
+        "cannot build a WeakTypeTag for `Inner`, a class nested in a class or an object",
         "cannot build a TypeTag for `Inner`, a class nested in a class or an object",
         "cannot build a TypeTag for `AnyRef`, which is an alias rather than a class",
         "cannot build a TypeTag for `T`, an abstract type with no tag in scope",
