@@ -37,6 +37,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::Duration;
 
 use scala_rs_parser::{Lit, NodeId, SymbolId, Tree, TreeKind, Type};
 use scala_rs_pickle::names::{decode_method_name, encode_method_name};
@@ -61,6 +62,9 @@ pub(crate) struct MacroEngine {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// Set when an expansion timed out and the child was killed: the pipe is
+    /// no longer in sync with the requests, so nothing more may be asked.
+    poisoned: bool,
 }
 
 impl Drop for MacroEngine {
@@ -70,20 +74,104 @@ impl Drop for MacroEngine {
     }
 }
 
+/// How long one expansion may take before the engine is presumed hung.
+///
+/// A macro implementation is *user code* running inside the engine: it can
+/// loop forever, deadlock, or block on something that never arrives, and
+/// `read_line` on the pipe would wait for all of it. That is not theoretical
+/// -- a killed parent once left twelve `scala-rs` processes blocked here for
+/// nine minutes each, and they went on holding a core apiece until they were
+/// killed by hand. A compiler must fail with a diagnostic instead of hanging,
+/// so the read runs on a helper thread and this is how long we wait for it.
+/// Override with `SCALA_RS_MACRO_TIMEOUT_SECS` (0 disables, for debugging an
+/// implementation under a JVM debugger).
+fn expansion_timeout() -> Option<Duration> {
+    match std::env::var("SCALA_RS_MACRO_TIMEOUT_SECS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(Duration::from_secs(n)),
+            Err(_) => Some(Duration::from_secs(20)),
+        },
+        Err(_) => Some(Duration::from_secs(20)),
+    }
+}
+
 impl MacroEngine {
     /// One request, one reply. `Err` is a reason, already phrased for a user.
+    ///
+    /// The reply is read on a helper thread so a wedged implementation costs a
+    /// diagnostic and a killed child, not a process that never returns. Once
+    /// timed out the engine is poisoned: the pipe still holds whatever that
+    /// expansion eventually writes, so every later request would read the
+    /// wrong reply.
     fn ask(&mut self, request: &str) -> Result<Sexp, String> {
+        if self.poisoned {
+            return Err("the macro engine was shut down after an expansion \
+                        timed out; later expansions in this run cannot be \
+                        trusted and are not attempted"
+                .to_string());
+        }
         writeln!(self.stdin, "{request}").map_err(|e| format!("the macro engine died ({e})"))?;
         self.stdin
             .flush()
             .map_err(|e| format!("the macro engine died ({e})"))?;
-        let mut line = String::new();
-        match self.stdout.read_line(&mut line) {
-            Ok(0) => Err("the macro engine exited without a reply".to_string()),
-            Ok(_) => Sexp::parse(line.trim_end()),
-            Err(e) => Err(format!("the macro engine died ({e})")),
+
+        let Some(limit) = expansion_timeout() else {
+            let mut line = String::new();
+            return match self.stdout.read_line(&mut line) {
+                Ok(0) => Err("the macro engine exited without a reply".to_string()),
+                Ok(_) => Sexp::parse(line.trim_end()),
+                Err(e) => Err(format!("the macro engine died ({e})")),
+            };
+        };
+
+        // `read_line` cannot be interrupted, so it runs where it can be
+        // abandoned. The reader owns the handle for the duration and gives it
+        // back with the line; on a timeout it is dropped along with the child.
+        let mut stdout = std::mem::replace(&mut self.stdout, BufReader::new(dead_pipe()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let r = stdout.read_line(&mut line).map(|n| (n, line));
+            let _ = tx.send((stdout, r));
+        });
+        match rx.recv_timeout(limit) {
+            Ok((stdout, r)) => {
+                self.stdout = stdout;
+                match r {
+                    Ok((0, _)) => Err("the macro engine exited without a reply".to_string()),
+                    Ok((_, line)) => Sexp::parse(line.trim_end()),
+                    Err(e) => Err(format!("the macro engine died ({e})")),
+                }
+            }
+            Err(_) => {
+                self.poisoned = true;
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                Err(format!(
+                    "the macro implementation did not return within {}s -- it \
+                     is looping, deadlocked, or waiting on something that \
+                     never arrives (set SCALA_RS_MACRO_TIMEOUT_SECS to change \
+                     or 0 to disable)",
+                    limit.as_secs()
+                ))
+            }
         }
     }
+}
+
+/// A closed pipe to hold `stdout`'s place while the reader thread has it.
+/// Reading it yields EOF, which is the truth once the child has been killed.
+fn dead_pipe() -> ChildStdout {
+    // `Stdio::null()` cannot become a `ChildStdout`, so borrow one from a
+    // process that exits immediately.
+    let mut c = Command::new("true")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn placeholder");
+    let out = c.stdout.take().expect("placeholder stdout");
+    let _ = c.wait();
+    out
 }
 
 /// Compile the engine into a cache directory and start it.
@@ -147,6 +235,7 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
         child,
         stdin,
         stdout,
+        poisoned: false,
     };
     if hello.trim_end() != "(ready)" {
         let why = match Sexp::parse(hello.trim_end()) {

@@ -1,0 +1,16 @@
+# Test fan-out cap.
+#
+# `cargo test` runs one test binary at a time but fills it with
+# `num_cpus` threads, and nearly every test here spawns a `scala-rs`
+# child (and some a `java` macro engine on top). On a 16-core machine
+# that is 30+ heavy processes from a single `cargo test`, which is
+# enough to make the machine unusable for anything else -- and with
+# several agents testing at once it thrashes.
+#
+# Six leaves most of the machine free. The tests are dominated by
+# subprocess work rather than in-process CPU, so the wall-clock cost of
+# the cap is small. Override for a dedicated run:
+#
+#     RUST_TEST_THREADS=16 cargo test --release ...
+[env]
+RUST_TEST_THREADS = { value = "6", force = false }
