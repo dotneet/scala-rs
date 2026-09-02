@@ -3541,7 +3541,19 @@ impl<'a> Parser<'a> {
                 TokenKind::InterpId(name) => {
                     let sp = self.span();
                     self.bump();
-                    args.push(self.alloc(sp, TreeKind::Ident { name }));
+                    // SLS 1: `this` is a keyword, not an identifier, and
+                    // nsc's interpolation parser reads the `$`-form as the
+                    // expression it spells -- `s"for $this"` is `this`, the
+                    // same as `s"for ${this}"`. Read as an `Ident` it was
+                    // looked up as a term and slick's
+                    // `s"No type for symbol $sym found in $this"` failed with
+                    // "not found: value this".
+                    let t = if name == "this" {
+                        TreeKind::This { qual: None }
+                    } else {
+                        TreeKind::Ident { name }
+                    };
+                    args.push(self.alloc(sp, t));
                 }
                 TokenKind::InterpEnd(s) => {
                     parts.push(s);

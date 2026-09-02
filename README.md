@@ -4026,6 +4026,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/catsyntax` スライス（cats の syntax による拡張メソッドが本物の cats に届くまで）のフィクスチャは接頭辞 `csyn`（`csyn_ops` / `csyn_ops_bad`）で、同じ理由から `crates/cli/tests/catsyntax.rs` に置いています。`csyn_ops.scala` は cats の `Ops[F[_], A]` と同じ形の受け手に `map` / `flatMap` / `foreach` を呼ぶもので、**暗黙変換を一切使わずに**（`new Ops[Box, Int](b)`）ラムダの引数型が第 1 型引数の `Box` になっていたずれを固定します。私有ランタイムと `--scala-library` の両方で走ります。`csyn_ops_bad.scala` は、ラムダに宣言どおりの引数型を与えても witness の無い呼び出しは通らないこと（`could not find implicit value of type FlatMap[Bag]`）を固定します。`a_simulacrum_style_syntax_layer_crosses_a_jar` は **実 scalac** で小さな cats（`Ops[F, A] { type TypeClassType = FlatMap[F] }` という refinement 結果型、パッケージオブジェクトの入れ子 `object all`、その `all` を `InnerClasses` に載せるだけの無関係なクラス）をコンパイルして jar に詰め、`ScalaSignature` だけを通して `b.flatMap(…)` と `b >> …` が解決し、`java -Xverify:all` で走ることを見ます。自前の pickle ライタは `REFINEDtpe` を出さないので、この fixture は scalac が書いたものでなければ意味がありません（scalac が無い環境では skip します）。同じテストで、witness の無い `Crate` には変換が挿さらないこと（`value flatMap is not a member of Crate[Int]`）も見ます。
 
+`agent/cats2` スライス（cats-effect の summoner が `F.type` を返す件と、文字列補間の `$this`）のフィクスチャは接頭辞 `c2`（`c2_thisinterp` / `c2_thisinterp_bad`）で、同じ理由から `crates/cli/tests/cats2.rs` に置いています。`c2_thisinterp.scala` はクラス・トレイト・`object`・ラムダの中の `s"… $this …"` を通し、私有ランタイムと `--scala-library` の両方で `-Xverify:all` の下に走らせて real scalac 2.13.16 の出力と一致することを見ます。`c2_thisinterp_bad.scala` は、`$this` を特別扱いしたことで `$name` が何でも通るようになっていないこと（`not found: value nosuchvalue`）を固定します。`a_summoner_returning_its_own_parameters_type_crosses_a_jar` は **実 scalac** で `def apply[F[_]](implicit F: TC[F]): F.type = F` という cats-effect 形の summoner と、`val TC = tinyeff.TC` を持つパッケージオブジェクト（`import cats.effect.Async` が通る経路そのもの）を持つ小さなライブラリをコンパイルして jar に固め、`ScalaSignature` だけを通して `TC[G].flatMap(fa)(…)` が解決し `java -Xverify:all` で走ることを見ます。自前の pickle ライタはパラメータを指す `SINGLEtype` を書かないので、この fixture は scalac が書いたものでなければ意味がありません（scalac が無い環境では skip します）。同じテストで、witness の無い `TC[Crate]` は `could not find implicit value of type TC[Crate]` のままであることも見ます。
+
 `agent/companionkind` スライス（コンパニオンとクラスが 1 つのシンボルを兼ねていた件）のフィクスチャは接頭辞 `ckind`（`ckind_future` / `ckind_future_bad`）で、同じ理由から `crates/cli/tests/companionkind.rs` に置いています。`ckind_future.scala` は `scala.concurrent.Future`——prelude が持たず、メンバがすべて jar から来るクラス——の**コンパニオンの名前渡しメンバ** `Future.apply` を呼びます。JVM の generic signature は名前渡しを書けないので `Function0[T]` になり、`Future(21)` が `no matching overload for (Function0[T], ExecutionContext)Future[T]` になっていました。`--scala-library` dual-run と **real scalac 2.13.16** との実行結果 diff（`real_scalac_dual_run_ckind_future`）の両方で見ます（`scala.concurrent` は私有ランタイムに無いので `--no-scala-library` では走らせません）。`ckind_future_bad.scala` は、シグネチャが本物になったことで**その implicit 節も本物**になること——`ExecutionContext` がスコープに無ければ scalac と同じく拒む——を固定します。`a_companion_and_its_class_are_separate_symbols` は **実 scalac** で cats を縮めた jar（高階トレイト `Ref[F[_], A]`、そのコンパニオン、`val Ref = tinyeff.Ref` と`type Ref[F[_], A] = tinyeff.Ref[F, A]` を持つパッケージオブジェクト）を作り、`r.update(_ + 1)` の結果型が `F[Unit]`（classfile 由来の素の `F` ではない）になること、コンパニオンの `Ref.const` がトレイト側に紛れ込まずに引けること、そして無い名前 `bogus` はきちんと拒まれることを見ます。
 `agent/ambigmap` スライス（同じ pickle 宣言のコピーが 2 つ入って `ambiguous overload for map` になっていた件）のフィクスチャは接頭辞 `am`（`am_pickledup` / `am_pickledup_bad`）で、同じ理由から `crates/cli/tests/ambigmap.rs` に置いています。`am_pickledup.scala` は **3 つのブロックの順番そのものが再現条件**です: 先に `scala.Seq` のレシーバが `map` を聞き、次に `scala.collection.IndexedSeq` のレシーバが聞き、最後に両方を親に持つ `scala.IndexedSeq` が聞きます。`map` だけでなく `flatMap` / `filter` / `partition` / `foldLeft` も同じ 3 レシーバに通すので、直っているのが「`map` の特別扱い」でないことが分かります。`--scala-library` dual-run と **real scalac 2.13.16** との実行結果 diff（`real_scalac_dual_run_am_pickledup`）の両方で `java -Xverify:all` の下に走らせます（載せ替えたシンボルは呼び先の owner とディスクリプタを変えるので、検証器を通すこと自体が確認です）。私有ランタイムには `scala.collection` が無く pickle も無い（＝束ねるコピーが存在しない）ので、`am_pickledup_without_the_library_is_diagnosed` が `--no-scala-library` で**黙って通さずに診断が出る**ことを固定します。`am_pickledup_bad.scala` は、束ねているのが名前ではなく**宣言**であること——本物のオーバーロード 2 本は 2 本のまま残り、決着が付かなければ scalac と同じく拒む——を固定します。
 
@@ -4366,6 +4368,8 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `cats_byname.scala`（`crates/cli/tests/catsimpl.rs`、library dual-run） | デフォルト引数を省いた呼び出しは 2 度型付けされる（`name$default$n` ゲッターが先行パラメータを取るため）。2 度目に by-name 引数は既に `Function0` の thunk になっており、`() => <notype>` として何にも一致しなかった（slick の `copy(where = w2.orElse(where), …)`） | `Comp(1,Some(1),Some(2),None)` `Some(7) None` ×3 |
 | `csyn_ops.scala`（`crates/cli/tests/catsyntax.rs`、私有ランタイム・library dual-run） | `agent/catsyntax` スライス: 高階クラスの第 1 型引数は「要素」ではない。`Ops[F[_], A]` の `map` / `flatMap` / `foreach` でラムダの引数型が `Box` になっていた（暗黙変換抜き、`new Ops[Box, Int](b)` で再現）。抽象 `F[_]` の受け手も通す | `4` `6` `103` `40` |
 | `csyn_ops_bad.scala`（`crates/cli/tests/catsyntax.rs`、異常系） | ラムダに宣言どおりの引数型を与えても、`FlatMap[Bag]` の witness が無い呼び出しは scalac と同じく通らない | （コンパイルエラー） |
+| `c2_thisinterp.scala`（`crates/cli/tests/cats2.rs`、私有ランタイム・library dual-run） | `agent/cats2` スライス: 文字列補間の `$this`。`this` はキーワードなので `Ident` として項に探しに行くと `not found: value this` になる（slick の `s"No type for symbol $sym found in $this"`）。クラス・トレイト・`object`・ラムダの中で見る | `2 of Node(a)` … `5 in MAIN` |
+| `c2_thisinterp_bad.scala`（`crates/cli/tests/cats2.rs`、異常系） | `$this` を特別扱いしても、スコープに無い `$name` は依然 `not found: value nosuchvalue` | （コンパイルエラー） |
 | `am_pickledup.scala`（`crates/cli/tests/ambigmap.rs`、library dual-run・real scalac dual-run） | `agent/ambigmap` スライス: `IterableOps.map` のコピーが `immutable.Seq` と `collection.IndexedSeq` の両方に載り、両方を親に持つ `scala.IndexedSeq` で `ambiguous overload for map` になっていた（`flatMap` / `filter` / `partition` / `foldLeft` も同型） | `2,3,4` `1,1,2,2,3,3` `2,3` `6` `8,10` `4,-4,5,-5` `5` `9` `16,17` `6\|7` `6,600,7,700` `7` `113` `6 / 7` |
 | `am_pickledup_bad.scala`（`crates/cli/tests/ambigmap.rs`、異常系） | 束ねるのは名前ではなく pickle の**宣言**: 本物のオーバーロード 2 本は 2 本のまま残り、決着が付かなければ scalac と同じく拒む | （コンパイルエラー） |
 | `bf_curried.scala`（`crates/cli/tests/buildfrom.rs`、私有ランタイム・library dual-run） | `agent/buildfrom` スライス: 3 つのパラメータリストを持つメソッドで、各節は**その節の宣言型**に対して型を解く（`groupMapReduce` の第 3 節が `Any` になっていた根） | `20` `1!` `yes\|1\|4` `20` |
@@ -8691,6 +8695,122 @@ Opt[Nothing]` / `case class Sm[+A](v: A) extends Opt[A]`）なので、
 
 slick: `errors=177 files_with_errors=57` → `errors=166 files_with_errors=53`。
 subset は `38 files / 204 classes / verified=204 failed=0` のままです。
+
+### cats-effect の summoner（`F.type`）と `$this` 補間（`agent/cats2`）
+
+テストは `crates/cli/tests/cats2.rs`、fixture 接頭辞は `c2` です。
+
+計測は `files=184 errors=155 files_with_errors=52` →
+**`files=184 errors=151 files_with_errors=52`**（−4 件）。
+
+ブリーフの仮説は「型射影 `A#B` のメンバ解決が根で、そこから `<notype>` /
+`Any` が cats 側にカスケードしている」でしたが、**偽**でした。
+`BasicBackend.scala` / `ConcurrencyControl.scala` の塊は型射影とは無関係で、
+根は次の 2 つです。
+
+#### 1. 結果型が自分自身のパラメータの `F.type` である summoner
+
+cats-effect の型クラスはコンパニオンの summoner をこう書きます。
+
+```scala
+object Async {
+  def apply[F[_]](implicit F: Async[F]): F.type = F
+}
+```
+
+この `F.type` は pickle 上 `SINGLEtype` で、指しているのは**そのメソッド自身の
+implicit パラメータ**です。`PickleSupply::conv` はモジュールの singleton
+（`p.x.type`）しか読めなかったので、`Async$#apply` は
+「unmappable result type」として**まるごと拒否**され、classfile 側の読み
+—— 消去済みディスクリプタから作った `apply(x$0: Async[F]): Async[F]` ——
+だけが残りました。JVM には implicit という概念が無いので `x$0` は**明示
+パラメータ**であり、`adapt_implicit_apply` は implicit 節を埋めず、
+`Async[F]` はメソッド型のまま。結果:
+
+```
+error: value flatMap is not a member of (Async[F])Async[F]
+error: value pure is not a member of (Sync[G])Sync[G]
+```
+
+cats-core は同じ summoner を `: Applicative[F]` と書くので、`Applicative[F]`
+は通り `Async[F]` は通らない、という非対称が出ていました。
+（tail4 が「引数が既に `Any`/`AnyRef` なのでカスケードに見える」と書いた
+`>>` の 3 件は**これとは別**で、直した後も 3 件のまま残っています。）
+
+直しは `PickleSupply` に「そのメンバ自身のパラメータを指す `p.type` は、
+そのパラメータの宣言型に widen する」1 ルールを足すこと
+（`param_singletons`）。`F.type` の指す値の型は `Async[F]` なので、
+summoner の結果として選択できるメンバは同じです。
+
+もう 1 つ、`import cats.effect.Async` が実際に通る経路
+—— `cats.effect` の package object の `val Async = cats.effect.kernel.Async`
+—— では、モジュールクラス `Async$` は `find_or_stub_java_class` が
+スタブするだけで **pickle から adopt されない**ので、`complete_named` が
+そもそも配ってくれませんでした（`value flatMap is not a member of Async$`）。
+`Module[T]` → `Module.apply[T]` のリダイレクトが `apply` を要求する直前に
+モジュールクラスを adopt するようにしています（`Check::adopt_cp_module_class`）。
+投機的に adopt はしません —— コンパニオンの adopt は全メンバを入れるので。
+
+#### 2. 文字列補間の `$this`
+
+`this` は識別子ではなくキーワードなので、`s"for $this"` は `${this}` と
+同じく `this` という式です。`Ident` として読んでいたため項として探され、
+slick の `s"No type for symbol $sym found in $this"` が
+`not found: value this` になっていました
+（`Type.scala` と `BasicBackend.scala` の 2 件）。
+
+#### 検証
+
+`c2_thisinterp.scala` は `--scala-library` と `--no-scala-library` の両方で
+`-Xverify:all` を通し、real scalac 2.13.16 の標準出力と一致することを
+確認しています。`c2_thisinterp_bad.scala` は、`$name` が何でも通るように
+なっていないこと（`not found: value nosuchvalue`）を固定します。
+
+`a_summoner_returning_its_own_parameters_type_crosses_a_jar` は
+`F.type` を返す summoner と package object 越しの再エクスポートを持つ
+小さなライブラリを**実 scalac** でコンパイルして jar に固め
+（自前ライタは `SINGLEtype` を書かないので、fixture は scalac 由来でなければ
+意味がない）、jar しか見えないプログラムを通して実行します。
+witness の無い `TC[Crate]` は
+`could not find implicit value of type TC[Crate]` のままです。
+
+パーサと `pickle_supply.rs` の継ぎ目に触れたので `cargo test --workspace`
+（`--release`）を回しました。subset は
+`38 files / 204 classes / verified=204 failed=0` のままです。
+
+#### 既知の残件
+
+- `Plain[Box].unit` の形（コンパニオン summoner の結果から、**引数を取らない**
+  メンバを選び、型引数が具象クラスのとき）で、クラスの型パラメータが
+  as-seen-from されず `F[Unit]` のまま返る。実 cats では再現せず
+  （`cats.Applicative[G].unit` は通る）、slick にも現れないので今回の対象外。
+- `def apply[F[_]](implicit F: TD[F]): F.type` を**ソース側**で書くと
+  `type mismatch; found: F[Int] required: F[Int]` になる。上の直しは pickle
+  経路だけで、ソースの `F.type` は別経路。
+- 同じファイルに `Async` を明示 implicit パラメータで受け取る定義があると
+  `Functor[F].map(x)(f)` が
+  `no matching overload for (F[A])((A) => B)F[B]` になる（修正前の `main` でも
+  同じ）。cats 側の完了順に依存する別の穴。
+- `slick.cats` パッケージがあるせいで `slick.dbio` 内の `cats.effect.IO` が
+  `value effect is not a member of <notype>` になる 2 件。根は特定済みで、
+  `Check::expose_unqualified` が「囲っているパッケージを owner チェーンで
+  全部辿る」ことです。nsc はそうしません: **修飾付きのパッケージ句**
+  `package p.q` からは `p` のクラスもサブパッケージも見えず
+  （2.13.16 は `-Xsource:3` の有無に関わらず `not found: type Widget` /
+  `not found: value cats`）、入れ子の `package p { package q { … } }` からは
+  両方見えます。ファイルのパッケージ句が開いたパッケージ（`PackageDef`
+  1 つにつき 1 個）だけを辿るように直すと該当 2 件は消えますが、
+  今度は `package slick.jdbc` からの**修飾**参照 `slick.ControlsConfig` が
+  解決しなくなって差し引き +1 件になったので、今回は戻しました。
+  規則自体は正しいので、緩い読みに寄りかかっている別の箇所と一緒に
+  ほどく必要があります。
+- tail4 が残した `value database is not a member of BasicBackend.Session`
+  （型射影のメンバ再読み込み）も手つかず。
+- cats の `>>`（`no matching overload for (=> F[B])(FlatMap[F])F[B]`）3 件は
+  before/after とも 3 件。`Async` / `Deferred` が潰れていたせいではなく、
+  `decrementDepth >> releaseIfUnpinned >> …` の左辺が `Any` / `AnyRef` に
+  落ちる別の原因（`BasicBackend.scala` は 6 → 5 件、
+  `ConcurrencyControl.scala` も 6 → 5 件）。
 
 ## ライセンス
 

@@ -93,6 +93,13 @@ pub struct PickleSupply {
     /// `Builder[Int, List[Int]]` receiver that is a `Builder`, not the
     /// `Growable` the erased signature names.
     self_ty: Option<Type>,
+    /// What a `p.type` naming one of the member's *own* parameters means,
+    /// while that member is being installed: the parameter's declared type.
+    ///
+    /// Keyed by the pickled path's tail, `".<member>.<param>"`, which is how
+    /// nsc spells the reference (`cats.effect.kernel.Async.apply.F` for the
+    /// `F` of `Async.apply`). See [`PickleSupply::conv_at`]'s `Single` arm.
+    param_singletons: HashMap<String, Type>,
     /// Classes read from a `-cp` jar/directory whose shape has been taken from
     /// their `ScalaSignature` rather than from the JVM generic signature (see
     /// [`PickleSupply::adopt_binary_class`]). Also the gate that lets
@@ -1019,7 +1026,28 @@ impl PickleSupply {
             paramss_ty.push(tys);
             paramss_sym.push(syms);
         }
-        let Some(ret) = self.conv(st, bin, &scope, &shape.ret) else {
+        // `def apply[F[_]](implicit F: Async[F]): F.type = F` -- how every
+        // cats-effect type class writes its summoner. The result is a
+        // singleton of the method's own parameter, which nothing outside this
+        // signature can name; without a reading for it the whole member was
+        // declined and `Async$.apply` stayed as the class file's erased
+        // `apply(Async): Async`, whose parameter carries no `implicit` flag.
+        // `Async[F]` was then a bare method type and `Async[F].pure(a)` read
+        // "value pure is not a member of (Async[F])Async[F]".
+        //
+        // The parameter's declared type is that singleton's widening, and it
+        // has exactly the members a selection off the result can reach, which
+        // is all a summoner is for.
+        let saved_singletons = std::mem::take(&mut self.param_singletons);
+        for (clause, tys) in shape.clauses.iter().zip(paramss_ty.iter()) {
+            for (p, t) in clause.params.iter().zip(tys.iter()) {
+                self.param_singletons
+                    .insert(format!(".{name}.{}", p.name), t.clone());
+            }
+        }
+        let ret = self.conv(st, bin, &scope, &shape.ret);
+        self.param_singletons = saved_singletons;
+        let Some(ret) = ret else {
             trace(format_args!(
                 "{internal}#{name}: unmappable result type {:?}",
                 shape.ret
@@ -2154,6 +2182,17 @@ impl PickleSupply {
             // `this.type`-like paths this pickle reader has not modelled) has
             // no counterpart to build and is declined like the rest.
             SigType::Single { sym, .. } => {
+                // `F.type` where `F` is a parameter of the member being
+                // installed (`def apply[F[_]](implicit F: Async[F]): F.type`):
+                // the parameter's own type is what that singleton widens to.
+                if let Some(t) = self
+                    .param_singletons
+                    .iter()
+                    .find(|(suffix, _)| sym.ends_with(suffix.as_str()))
+                    .map(|(_, t)| t.clone())
+                {
+                    return Some(t);
+                }
                 let cls = self.ensure_class(st, bin, sym, true)?;
                 Some(Type::ModuleRef(cls))
             }

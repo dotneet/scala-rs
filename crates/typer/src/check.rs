@@ -5901,6 +5901,7 @@ impl Typer {
                         // member with the same erasure (`agent/setapply`);
                         // before that gate landed this made `List[Int](1, 2)`
                         // "ambiguous overload for apply".
+                        self.adopt_cp_module_class(cls);
                         self.supply_from_pickle_class(cls, "apply");
                         let candidates: Vec<SymbolId> = self
                             .st
@@ -6675,6 +6676,21 @@ impl Typer {
         };
         // A name is visible from every enclosing package, not just the
         // innermost: `slick.jdbc.meta` sees `slick.jdbc`'s members.
+        //
+        // Not what nsc does, and the difference is observable: a *qualified*
+        // clause `package p.q` sees neither a class nor a subpackage of `p`
+        // (2.13.16: "not found: type Widget" / "not found: value cats", with
+        // and without `-Xsource:3`), while the nested spelling
+        // `package p { package q { … } }` sees both. slick has its own
+        // `slick.cats` package, so this makes `cats.effect.IO` inside
+        // `package slick.dbio` resolve to it and fail with
+        // "value effect is not a member of <notype>" (2 errors).
+        // `agent/cats2` tried opening only the packages the file's clauses
+        // name (one `PackageDef` each) and the two errors did go away, but
+        // `slick.ControlsConfig` -- a *qualified* reference from
+        // `package slick.jdbc` -- then failed to resolve, for a net +1. The
+        // rule is right; something else leans on the loose reading, and the
+        // two have to be untangled together.
         let mut pkg = self.enclosing_package(from);
         loop {
             self.complete_binary_member(pkg, name, span);
@@ -18467,6 +18483,42 @@ impl Typer {
     /// The receiver-typed form reaches this through `class_sym_of`; a wildcard
     /// import (`import <a value>._`) has the class in hand and no receiver type
     /// to hand back.
+    /// Read a `-cp` companion object's shape off its `ScalaSignature` pickle
+    /// before the `Module[T]` redirect asks it for `apply`.
+    ///
+    /// A Scala class file on `-cp` gets two readings: the class file itself
+    /// (`install_java_class`: erased descriptors plus the JVM generic
+    /// signature) and, for the classes `PickleSupply` has *adopted*, the
+    /// pickle. Only the pickle records which parameter clause is implicit --
+    /// the JVM has no such notion -- and only the pickle can write a higher
+    /// kind. `load_binary_into` adopts the class it loads, but a companion
+    /// *module* class reached through a package object's re-export
+    /// (`val Async = cats.effect.kernel.Async`, which is how `import
+    /// cats.effect.Async` arrives) is only ever stubbed by
+    /// `find_or_stub_java_class`, which adopts nothing. `Async$` then kept
+    /// the class file's `apply(x$0: Async[F]): Async[F]` with an *explicit*
+    /// parameter, `complete_named` refused to serve the module class at all,
+    /// and `Async[F].flatMap(…)` was "value flatMap is not a member of
+    /// `Async$`".
+    ///
+    /// Only module classes, and only where the redirect is about to ask for
+    /// `apply` anyway: adopting a companion installs every member it
+    /// declares, which is not something to do speculatively.
+    fn adopt_cp_module_class(&mut self, cls: SymbolId) {
+        // `adopt_binary_class` declines `java.*` and the prelude's own
+        // `scala.*` classes itself; a name that is not a companion's cannot
+        // have a companion pickle to read.
+        if !self.library_abi
+            || cls.is_none()
+            || self.st.get(cls).kind != SymKind::ModuleClass
+            || !self.st.get(cls).jvm_name.ends_with('$')
+        {
+            return;
+        }
+        self.pickle
+            .adopt_binary_class(&mut self.st, &mut self.binary, cls);
+    }
+
     pub(crate) fn supply_from_pickle_class(&mut self, cls: SymbolId, name: &str) -> Vec<SymbolId> {
         if !self.library_abi || cls.is_none() {
             return Vec::new();

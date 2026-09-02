@@ -1,0 +1,6 @@
+2 of Node(a)
+3 of Node(a)
+1@Node(a),2@Node(a)
+tagged Node(leaf)
+4 of Node(leaf)
+5 in MAIN
