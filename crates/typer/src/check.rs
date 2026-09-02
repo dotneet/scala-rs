@@ -5994,6 +5994,17 @@ impl Typer {
                             base_ty = self.st.get(only).ty.clone();
                         }
                     }
+                    // nsc reads a Java signature's `Object` as `ObjectTpeJava`,
+                    // a type that is *both* `Any` and `AnyRef`: writing `Any`
+                    // for a Java method's type parameter therefore instantiates
+                    // it at `Object`, not at `scala.Any`.
+                    // `java.util.Arrays.copyOf[Any](a: Array[AnyRef], n)`
+                    // (slick's `ConstArray`) is what depends on it -- `Array`
+                    // is invariant, so with a literal `Any` the argument does
+                    // not fit. Real scalac takes the call and gives it back an
+                    // `Array[Object]`, which is why `copyOf[Any](…): Array[Any]`
+                    // is an error there too.
+                    let targs = self.java_object_targs(sym, targs.clone());
                     tree.sym = sym;
                     tree.ty = self.st.subst_tparams(sym, &targs, &base_ty);
                     // Codegen's `peel_fun` walks straight through this
@@ -10410,7 +10421,37 @@ impl Typer {
             // overload can be picked, and leave function literals untyped
             // until their parameter type is known (`new S[String](x => …)`).
             let mut arg_tys: Vec<Type> = Vec::new();
-            for a in args.iter_mut() {
+            // The primary constructor's own parameter types, for the same
+            // reason the method path hands them out (`proto_arg_type`): a
+            // function literal *inside* an argument -- slick's
+            // `StatementParameters(…, if (…) … else { s => …; … }, …)`, whose
+            // case-class `apply` lands on this path -- has nowhere else to
+            // read its parameter types from. Only for a monomorphic class,
+            // only where the arity settles which constructor this is, and only
+            // for a fully determined function-shaped parameter.
+            let ctor_protos: Vec<Type> = class_id
+                .filter(|_| tps.is_empty())
+                .map(|c| self.st.get(c).ctor_fields.clone())
+                .filter(|fs| fs.len() == args.len())
+                .map(|fs| {
+                    fs.iter()
+                        .map(|f| {
+                            let t = self.st.get(*f).ty.clone();
+                            if !t.is_no_type()
+                                && !t.is_error()
+                                && !type_mentions_wildcard(&t)
+                                && !mentions_any_tparam(&t)
+                                && self.is_function_shaped(&t)
+                            {
+                                t
+                            } else {
+                                Type::NoType
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (ai, a) in args.iter_mut().enumerate() {
                 if let TreeKind::Function { vparams, .. } = &a.kind {
                     if is_annotated_lambda(a) {
                         self.type_expr(a, &Type::NoType);
@@ -10422,7 +10463,33 @@ impl Typer {
                         ret: Box::new(Type::NoType),
                     });
                 } else {
-                    self.type_expr(a, &Type::NoType);
+                    let pt_arg = ctor_protos.get(ai).cloned().unwrap_or(Type::NoType);
+                    if pt_arg.is_no_type() {
+                        self.type_expr(a, &Type::NoType);
+                    } else {
+                        // A prototype is a hint, never a constraint -- the same
+                        // rollback the method path does. slick's
+                        // `new StructValue(…, xs.toMap)` has a `TermSymbol =>
+                        // Int` parameter, and solving `toMap`'s `K` / `V`
+                        // through `Map <: Function1` is not something the
+                        // expected type can do here; typed with no prototype it
+                        // is a `Map[TermSymbol, Int]` and conforms after all.
+                        let saved = a.clone();
+                        let mark = self.diags.len();
+                        self.type_expr(a, &pt_arg);
+                        let complained = self.diags[mark..]
+                            .iter()
+                            .any(|d| d.level == scala_rs_span::Level::Error);
+                        if complained
+                            || a.ty.is_error()
+                            || a.ty.is_no_type()
+                            || !self.st.is_sub_type(&a.ty, &pt_arg)
+                        {
+                            self.diags.truncate(mark);
+                            *a = saved;
+                            self.type_expr(a, &Type::NoType);
+                        }
+                    }
                     arg_tys.push(a.ty.clone());
                 }
             }
@@ -14800,23 +14867,82 @@ impl Typer {
     /// `Map[TermSymbol, Aggregate]`, and an invariant `Map` keyed by the
     /// argument's own `AnonSymbol` is no longer what comes back.
     ///
-    /// Only a parameter that *is* a type parameter, and only a callee with one
-    /// alternative: anything else and the prototype would be weighing the
-    /// alternatives instead of the arguments. `NoType` means "as before".
+    /// Only a parameter that *is* a type parameter, and (for the type-argument
+    /// route) only a callee with one alternative: anything else and the
+    /// prototype would be weighing the alternatives instead of the arguments.
+    /// A *fully determined function-shaped* parameter is the exception --
+    /// nothing about it is still being solved, and a function literal nested in
+    /// the argument has nowhere else to read its parameter types from.
+    /// `NoType` means "as before".
     fn proto_arg_type(&self, fun_ty: &Type, sym: SymbolId, idx: usize, pt: &Type) -> Type {
-        if sym.is_none() || matches!(fun_ty, Type::Overload(_)) {
+        if sym.is_none() {
             return Type::NoType;
+        }
+        // An overloaded reference has no single parameter type -- except where
+        // every alternative wants the *same* one, which is `Infer.pretypeArgs`
+        // again (`agreed_lambda_params` does it for a literal that is itself
+        // the argument). A case class's companion `apply` arrives here as an
+        // overload, and slick's
+        // `StatementParameters(…, if (…) … else { s => …; … }, …)` needed the
+        // function parameter's type to reach the literal inside the if/else.
+        if let Type::Overload(alts) = fun_ty {
+            return self.agreed_function_param(alts, idx);
+        }
+        // `rewrite_receiver_apply` deliberately leaves `Obj(args)` as a
+        // reference to the *module* (`named_arg_param_ids` says why), so the
+        // callee's type here is a `ModuleRef` and the parameters live on its
+        // `apply`. slick's `StatementParameters(…, if (…) … else { s => …;
+        // … }, …)` is exactly that shape.
+        if let Type::ModuleRef(cls) = fun_ty {
+            // A case class's companion also *inherits* `AbstractFunctionN.apply`,
+            // whose signature is written in that parent's own type parameters
+            // (`(T1, T2, T3)R`). Read it through the companion, or the two
+            // alternatives never agree.
+            let recv = Type::Class {
+                sym: *cls,
+                args: Vec::new(),
+            };
+            let alts: Vec<Type> = self
+                .st
+                .lookup_member(*cls, "apply")
+                .into_iter()
+                .map(|a| self.st.subst_as_seen_from(&recv, &self.st.get(a).ty))
+                .collect();
+            return if alts.is_empty() {
+                Type::NoType
+            } else {
+                self.agreed_function_param(&alts, idx)
+            };
         }
         let Type::Method { paramss, ret } = fun_ty else {
             return Type::NoType;
         };
         let tps = self.st.get(sym).tparams.clone();
-        if tps.is_empty() {
-            return Type::NoType;
-        }
         let Some(params) = paramss.first() else {
             return Type::NoType;
         };
+        if tps.is_empty() {
+            // nsc types every argument against its parameter type; scala-rs
+            // only handed one out where inference needs it, so a monomorphic
+            // callee gave none. A function literal that *is* the argument gets
+            // its parameter types in `type_apply_in` instead -- but one that
+            // merely sits inside the argument (`f(if (c) { s => … } else { s
+            // => …; … })`, slick's `JdbcBackend.createStatement`) had nothing
+            // to read them from. The one-expression branch only ever worked by
+            // accident: `section_param_types` recovers `s` from the call in
+            // `{ s => si(s) }`, and a two-statement body has no such call.
+            return match param_at(params, idx) {
+                Some(p)
+                    if !p.is_no_type()
+                        && !p.is_error()
+                        && !type_mentions_wildcard(p)
+                        && self.is_function_shaped(p) =>
+                {
+                    p.clone()
+                }
+                _ => Type::NoType,
+            };
+        }
         // Explicit type arguments have already settled this parameter, and
         // that settled type *is* the expected type of the argument. Typing it
         // against nothing leaves whatever only an expectation can fix
@@ -14853,6 +14979,86 @@ impl Typer {
                     && !mentions_any_tparam(t)
             })
             .unwrap_or(Type::NoType)
+    }
+
+    /// Explicit type arguments for a *Java* method, with `Any` read as the
+    /// `Object` its type parameter is really bounded by (nsc's
+    /// `ObjectTpeJava`). Anything else, and any Scala-defined method, is left
+    /// exactly as written.
+    fn java_object_targs(&self, sym: SymbolId, targs: Vec<Type>) -> Vec<Type> {
+        if sym.is_none()
+            || !self.st.get(sym).flags.contains(Flags::JAVA)
+            || !targs.iter().any(|t| matches!(t, Type::Any))
+        {
+            return targs;
+        }
+        let tps = self.st.get(sym).tparams.clone();
+        targs
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let object_bound = match tps.get(i).map(|tp| self.st.get(*tp).bound_hi.clone()) {
+                    Some(None) | Some(Some(Type::AnyRef)) => true,
+                    Some(Some(other)) => matches!(&other, Type::Class { sym, .. }
+                        if self.st.get(*sym).jvm_name == "java/lang/Object"),
+                    None => false,
+                };
+                if matches!(t, Type::Any) && object_bound {
+                    Type::AnyRef
+                } else {
+                    t
+                }
+            })
+            .collect()
+    }
+
+    /// A parameter a function literal can inhabit: a function type, a pickled
+    /// `FunctionN` class, or a single-abstract-method trait.
+    fn is_function_shaped(&self, p: &Type) -> bool {
+        if is_function_pt(p) {
+            return true;
+        }
+        match p {
+            Type::Class { sym, args } => {
+                self.st.function_class_shape(*sym, args).is_some() || self.st.sam_sig(p).is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// The parameter type at `idx` every alternative agrees on, when it is a
+    /// fully determined function-shaped one. `Infer.pretypeArgs` again, for an
+    /// argument that is not itself the function literal
+    /// (`agreed_lambda_params` covers the literal). An alternative's own type
+    /// parameter must stay open until the real candidate is known -- that is
+    /// `agreed_lambda_params`'s measured note about cats' `uncancelable[A]`.
+    fn agreed_function_param(&self, alts: &[Type], idx: usize) -> Type {
+        let mut agreed: Option<&Type> = None;
+        for a in alts {
+            let Type::Method { paramss, .. } = a else {
+                return Type::NoType;
+            };
+            let Some(p) = paramss.first().and_then(|c| param_at(c, idx)) else {
+                return Type::NoType;
+            };
+            match agreed {
+                None => agreed = Some(p),
+                Some(prev) if prev == p => {}
+                Some(_) => return Type::NoType,
+            }
+        }
+        match agreed {
+            Some(p)
+                if !p.is_no_type()
+                    && !p.is_error()
+                    && !type_mentions_wildcard(p)
+                    && !mentions_any_tparam(p)
+                    && self.is_function_shaped(p) =>
+            {
+                p.clone()
+            }
+            _ => Type::NoType,
+        }
     }
 
     /// nsc `Infer.pretypeArgs`. The parameter types every overload alternative
@@ -20449,7 +20655,7 @@ impl Typer {
                 }
                 if let Type::Method { ret, .. } = &cand_ty {
                     if !ret.is_no_type() {
-                        return Some((**ret).clone());
+                        return Some(self.own_type_members(owner, ret));
                     }
                 }
             }
@@ -20460,6 +20666,43 @@ impl Typer {
             }
         }
         None
+    }
+
+    /// An inherited signature's abstract type members, read through the class
+    /// that inherits it. `trait Node { type Self <: Node; def rebuild(…): Self }`
+    /// overridden in `case class StructNode(…) { type Self = StructNode }` has
+    /// result type `StructNode` -- nsc sees the declaration as-seen-from
+    /// `StructNode.this.type`, so returning a `StructNode` from a `rebuild`
+    /// with no written result type is not `found: StructNode required:
+    /// Node.Self` (slick's `ast/Node.scala`).
+    fn own_type_members(&self, owner: SymbolId, ty: &Type) -> Type {
+        let mut members = Vec::new();
+        crate::symbol::collect_type_members(ty, &mut members);
+        let mut out = ty.clone();
+        for m in members {
+            let info = self.st.get(m);
+            if !info.tparams.is_empty() {
+                continue;
+            }
+            let name = info.name.clone();
+            let Some(found) = self
+                .st
+                .lookup_member(owner, &name)
+                .into_iter()
+                .find(|&s| s != m && self.st.get(s).kind == SymKind::TypeMember)
+            else {
+                continue;
+            };
+            let seen = self.st.dealias(&Type::TypeMember(found));
+            if seen.is_no_type()
+                || seen.is_error()
+                || matches!(&seen, Type::TypeMember(x) if *x == m)
+            {
+                continue;
+            }
+            out = crate::symbol::subst_type_member(&out, m, &seen);
+        }
+        out
     }
 
     fn check_java_override(&mut self, tree: &Tree) {
