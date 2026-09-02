@@ -99,7 +99,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - `s"..."` / `f"..."` / `raw"..."` 文字列補間。`f"$n%02d"` は `String.format` に落とす。`raw` はエスケープを解釈しない。日付時刻（`%t`/`%T`）、引数インデックス、相対 `% <` は診断する。`--scala-library` 時はカスタム interpolator（`implicit class Q(sc: StringContext) { def q(args: Any*) }` の `q"a$x"`）を `StringContext.apply(parts*).q(args*)` へデシュガーして実行する。私有ランタイムでは `s`/`f`/`raw` 以外は診断する
 - コンテキストバウンド `T: ClassTag` / `T: Ordering` / `T: scala.reflect.ClassTag`（メソッド型パラメータ）と **クラス型パラメータ** `class C[T: Ordering](x: T)`。nsc と同様、implicit evidence `C[T]` へデシュガーする（クラスは primary ctor の extra implicit 節）。トレイトの `: C` / `<%` は nsc どおり `traits cannot have type parameters with context bounds ': ...' nor view bounds '<% ...'`。evidence が無ければ `no implicit`。`--scala-library` 時は jar の `scala.math.Ordering` を classfile から読み、companion の `implicit object Int`（`Ordering$Int$.MODULE$` / InnerClasses）と `ClassTag` にリンクして動く。ジェネリック `Array[T].length` は jar の `ScalaRunTime.array_length` に落とす
 - `lazy val`。メンバは `bitmap$0` + アクセサ、**メソッドローカルは `scala.runtime.LazyRef`（プリミティブは `LazyInt` などの専用セル、`Unit` は `LazyUnit`）+ 持ち上げたアクセサ**で、宣言位置ではセルを作るだけ。初期化子は最初の読み取り時に高々 1 回、セルのモニタの下で走る（nsc の `lazyvals` フェーズと同じ形）。ブロックの中では `lazy val` だけ前方参照できる
-- implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む。候補が複数あるときは nsc 風の **more-specific**（結果型の subtype、または定義クラスが subclass である origin）。型と origin が食い違うと（親のより specific な implicit と、子に定義した less-specific な local）`ambiguous implicit`。同じ型が二つなら曖昧。目標型が `A => B` で `A <: B` のときは nsc と同様 identity view を合成する（view bound の呼び出し側）。**implicit class**（object / class 本体。`implicit class Rich(n: Int) { def twice: Int }` の `2.twice`）。**package object の `implicit class`**（同じパッケージの他 compilation unit、または `import pkg._`。pickle の IMPLICIT。トップレベル `implicit class` は nsc どおり `` `implicit` modifier cannot be used for top-level objects ``。import 無しでは enrichment が見えない）
+- implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む。候補が複数あるときは nsc 風の **more-specific**（結果型の subtype、または定義クラスが subclass である origin）。型と origin が食い違うと（親のより specific な implicit と、子に定義した less-specific な local）`ambiguous implicit`。同じ型が二つなら曖昧。目標型が `A => B` で `A <: B` のときは nsc と同様 identity view を合成する（view bound の呼び出し側）。**implicit class**（object / class 本体。`implicit class Rich(n: Int) { def twice: Int }` の `2.twice`）。**package object の `implicit class`**（同じパッケージの他 compilation unit、または `import pkg._`。pickle の IMPLICIT。トップレベル `implicit class` は nsc どおり `` `implicit` modifier cannot be used for top-level objects ``。import 無しでは enrichment が見えない）。**`Function1` を継承したクラスの値も implicit conversion です**（nsc の「候補の型が `From => To` に適合するか」。`scala.<:<[-From, +To] extends (From => To)` なので `implicit ev: P <:< Q` は `P` を `Q` へ変換し、適用は `Function1.apply`。引数を取らない implicit メソッド（`<:<.refl`）はビューにしません）
 - `@tailrec`（末尾再帰でない `def` は nsc 風にエラー。object の末尾再帰は通して実行する。while 変換はしない）/ `@deprecated`（引数付きアノテーションを pickle の SYMANNOT に載せる。コンパイルは壊さない）/ Java `@Override`（本当に override しているメソッドは受理。そうでなければ `overrides nothing`）/ Java `@Deprecated`（メソッドの `RuntimeVisibleAnnotations` に `Ljava/lang/Deprecated;` を出す。pickle は `SYMANNOT` + `java.lang.Deprecated` の TypeRef。`javap -v` と scalac `-deprecation` の両方で見える）/ ユーザー定義の `StaticAnnotation`（`@Ann(foo)` / `@Ann(this)` / `@Ann(classOf[Int])` / `@Ann(ident(1))` / `@Ann(this.x)` / `@Ann(super.foo)` / `@Ann(ident(ident(1)))` / `@Ann(foo = 1)` / `@Ann(foo = this.x)` / `@Ann(foo = bar)` の Ident/Select/This/Super/Apply / リテラル / classOf / named Constant / named TREE 引数を TREE / Constant として pickle。named は nsc と同じく位置引数に直して pickle）/ `@implicitNotFound("…")`（欠ける implicit は nsc と同じくその文面。`${A}` は型引数）/ `@switch`（`(n: @switch) match`。密な Int は `tableswitch`、疎なら `lookupswitch`。switch にできない match は nsc と同じ warning `could not emit switch for @switch annotated match`）。`@inline` / `@noinline` はアノテーションとして格納するだけで、インライン化はしない。実 scalac 2.13.16 は配置を一切検証しない（val / var / class / type などどれに付けても、両方同時に付けても、警告すら出さない — `-opt:inline:...` のバイトコード最適化器だけが読む情報で、typer は無関係）ので、こちらも同様に検証しない。`@volatile` / `@transient` は classfile の `ACC_VOLATILE` / `ACC_TRANSIENT`（javap で見える）。`@native` はメソッドに付けて `ACC_NATIVE` を出し、本文は付けない（`.so` のリンクはしない。本文付きや val への付与は診断する）
 - 非ローカル `return`（ネストしたラムダ / `foreach` から囲みの名前付きメソッドへ。nsc 風 `scala.runtime.NonLocalReturnControl`）。ネストした `def` の `return` はその def 自身。クラスコンストラクタからの `return` は `return outside method definition`
 - `eq` / `ne`（AnyRef の参照等価）と `synchronized`（monitorenter / monitorexit。本体はロック中に評価）
@@ -4913,6 +4913,29 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 （`mism12_bad_is_still_rejected`、フィクスチャは `mism12_bad.scala`。
 実 scalac 2.13.16 も同じ 4 件を拒否します）も置いてあります。
 
+`mism13_lang.scala` / `mism13_lib.scala` は `crates/cli/tests/mismatch13.rs` から
+回します（`mism13_lang` は**両モード**、`mism13_lib` は library モードのみ。
+私有ランタイムには `scala.<:<` が無いので、
+`mism13_lib_without_library_is_error` で `not found: type <:<` を出して**黙って
+通さない**ことも見ています）。多ファイルの原因は `tests/multi/mism13_util.scala`
+/ `mism13_ast.scala` / `mism13_jdbc.scala` の 3 本
+（`mism13_copy_names_no_class_in_the_using_file`）で、`copy` の書き換え先の
+クラスを**その名前で解決できないファイル**が要るので単一ファイルでは再現
+しません。同ファイルには最小形の受理テスト
+（`mism13_self_new_substitutes_once` /
+`mism13_conformance_witness_is_a_view` /
+`mism13_nested_lambda_result_variable` /
+`mism13_lub_sees_the_sequence_head` /
+`mism13_inherited_member_at_owner_targs` /
+`mism13_explicit_targs_are_the_argument_pt` /
+`mism13_branch_join_closes_a_free_variable` /
+`mism13_branch_join_keeps_a_parameter_in_scope`）と、拒否テスト
+（`mism13_bad_is_still_rejected`、フィクスチャは `mism13_bad.scala`。
+実 scalac 2.13.16 も同じ 6 件を拒否します）も置いてあります。13 本のうち
+10 本は**修正前の `main` で落ちること**を確認済みで、残る 3 本
+（`mism13_lib_without_library_is_error` と 2 つの「広げすぎない」ガード）は
+before/after どちらでも通る性質のものです。
+
 `t2_lang.scala` / `t2_lib.scala` は `crates/cli/tests/tail2.rs` から回します
 （`t2_lang` は**両モード**、`t2_lib` は library モードのみ。私有ランタイムには
 `scala.math.Integral` が無いので、`t2_lib_without_library_is_error` で**黙って
@@ -8999,6 +9022,219 @@ witness の無い `TC[Crate]` は
   `decrementDepth >> releaseIfUnpinned >> …` の左辺が `Any` / `AnyRef` に
   落ちる別の原因（`BasicBackend.scala` は 6 → 5 件、
   `ConcurrencyControl.scala` も 6 → 5 件）。
+### slick に残る `type mismatch` 11 件の 8 つの根（`agent/mismatch13`）
+
+テストは `crates/cli/tests/mismatch13.rs`、fixture 接頭辞は `mism13` です。
+
+計測は `files=184 errors=155 files_with_errors=52` →
+**`files=184 errors=141 files_with_errors=48`**（−14 件 / −4 ファイル）。
+`tests/slick_subset.sh` は `38 files / 204 classes / verified=204 failed=0` の
+ままです。`type mismatch` は **11 件 → 2 件**で、残る 2 件はどちらも
+`type mismatch` 以外のエラーのカスケードです（末尾「残っているもの」）。
+
+| 塊 | before | after |
+|---|---|---|
+| `found: Tuple2[T, T2] required: (((T, T2), T2), T2)` ほか `ShapedValue.zip` | 2 件 | **0 件** |
+| `found: DBIOAction[R, S, E with Effect] required: DBIOAction[Any, NoStream, Effect]` ほか | 2 件 | **0 件** |
+| `found: P required: Rep[Option[QO]]`（`ExtensionMethods.flatten`） | 1 件 | **0 件** |
+| `found: Product required: Option[Option[Any]]`（`SQLiteProfile`） | 1 件 | **0 件** |
+| `found: Query[G, T, U] required: Query[G, T, C]`（`Query.zipWith`） | 1 件 | **0 件** |
+| `found: State[_] required: State[F]`（`ConcurrencyControl.create`） | 1 件 | **0 件** |
+| `found: <overload String | <error>> required: String`（`Node.toString`） | 1 件 | **0 件** |
+| `not found: type DumpInfo` / `no matching overload for (…)DumpInfo` | 3 件 | **0 件** |
+| `no implicit: could not find implicit value of type <:<[…]` | 1 件 | **0 件** |
+| `not found: type Mapper` | 1 件 | **0 件** |
+
+引き継いだ診断のうち検証できたのは 1 つだけでした。`tail4` が残した
+「`lub` が交差型を組まないので `found: Product required: Option[Option[Any]]`
+が 1 件残る」は**場所は合っていて理由が違い**、交差型は要らず、`lub` が
+base type sequence の**先頭（＝その型自身）**を見ていなかっただけです（4）。
+`JdbcActionComponent` の `E with Effect` は交差型の問題ではなく**ラムダの
+結果型の中の変数**（3）、`Query.scala` / `RelationalProfile.scala` /
+`Node.scala:636` / `ConcurrencyControl.scala:202` はそれぞれ別の根でした。
+
+#### 1. 置換を 3 回かけていた（`new C[…]` が自分自身のクラスのとき）
+
+`pick_ctor_at`（`crates/typer/src/check.rs`）は、適用可能性を見るために
+`flatten` で 1 回、`resolve_overload` から返ってきた結果にもう 1 回、
+`subst_tparams(class_id, targs, …)` をかけていました。さらに `new` の側でも
+`p = subst_tparams(c, &inferred_args, &p)` で 3 回目です。型引数が
+**置換される当の型パラメータを含まない**限りこれは冪等なので、これまで誰も
+気づきませんでした。`ShapedValue[T, U]` の中の
+`new ShapedValue[(T, T2), (U, U2)](…)` はまさにそれを含みます:
+`T` は `(T, T2)` → `((T, T2), T2)` → `(((T, T2), T2), T2)` になり、
+`found: Tuple2[T, T2]  required: (((T, T2), T2), T2)` でした。
+
+`pick_ctor_at` の契約を「返す引数型・結果型は `targs` で読んだもの、ちょうど
+1 回」に決めました。候補が 1 つのときは `flatten` の結果がそのまま返るので
+出口では置換せず、2 つ以上のときだけ置換します（`resolve_overload` は
+`Type::Overload` のときだけ候補をシンボルから読み直すため）。`extends` 側と
+`new` 側の呼び出し元は、その分の再置換をやめました。
+
+#### 2. `<:<` は implicit の**ビュー**（typer と codegen の両方）
+
+nsc は「候補の型が `From => To` に適合するか」を見るので、`Function1` を
+**継承しているクラス**の値もビューです。`scala.<:<` はまさに
+`sealed abstract class <:<[-From, +To] extends (From => To)` で、slick の
+
+```scala
+def flatten[QO](implicit ev: P <:< Rep[Option[QO]]): Rep[Option[QO]] =
+  flatMap[QO](identity(_))
+```
+
+（`lifted/ExtensionMethods.scala:210`）はこれだけに頼っています。
+`conversion_provides`（`crates/typer/src/implicits.rs`）は構造的な
+`Type::Function` と 1 引数メソッドしか見ていなかったので、`Ext` の中の
+`r: P` も `identity(_)` の結果も `Rep[Option[QO]]` になれませんでした。
+`view_shape` を切り出し、クラス型のときは base type sequence から
+`FunctionN` の形を拾います。**引数を取らない** implicit メソッドはビューに
+しません（`<:<.refl[A]: A =:= A` が全部の型を自分自身に変換してしまいます）。
+
+codegen 側にも穴がありました。ビューの適用は `Apply { fun: <ev への参照>,
+args: [x] }` という木になりますが、`gen_apply`（`crates/backend/src/gen.rs`）は
+`fun.ty` が構造的な `Type::Function` のときしか `FunctionN.apply` を出さず、
+それ以外は `invoke_method(fun.sym)` に落ちます。`ev` はメソッドではなく
+**値**なので、囲んでいる**メソッド**のメンバ呼び出しが出て
+`NoClassDefFoundError: direct` になっていました（型検査は通ったうえで）。
+`fun.sym` がメソッドでなく、その型のクラスが `FunctionN` を継承していて
+引数の数が合うときも `gen_function_apply` に回します。
+
+#### 3. ラムダの**結果**の中にしか出ない型変数
+
+`def h[B](f: Int => Bx[B]): Bx[B]` の `B` は、ラムダの本体だけが決められます。
+`p` がちょうど `Type::Function { ret: TypeParam }` のときは既に `Any` に
+緩めていましたが、`Bx[B]` のように**1 段中**に入ると `open_to_bounds` が
+境界へ開いて `Bx[Any]` になり、不変な `Bx[Int]` はそれに適合しません ——
+2 回目の推論が本体から `B` を読む前に、引数が落ちていました。
+
+引数を型付けするときの**期待型だけ**を緩めます。境界ではなく
+`Type::Wildcard`（`is_sub_type` が「まだ決まっていない」として扱える形。
+`open_to_bounds` が高階パラメータに対して既に使っています）を入れるので、
+本体には「`Bx` でなければならない」ことは伝わったままです。`p` 自身は宣言の
+ままなので、`solve_open_from_arg` が型付け済みの引数から `B` を読みます。
+ワイルドカードがラムダの型に残ると呼び出しの結果まで運ばれる
+（`Act[_, _, Effect with _]`）ので、本体の型で貼り直す既存の後始末を
+ワイルドカードを含む場合にも広げました。slick の
+`DBIOAction.flatMap[R2, S2, E2](f: R => DBIOAction[R2, S2, E2])` がこの形です。
+
+#### 4. `lub` が base type sequence の**先頭**を見ていなかった
+
+`agent/tail4` が「両方の列が同じクラスで出会ったら型引数を join して止まる」
+ようにしましたが、`base_type_seq` は**その型自身**を返しません（SLS 3.5.2 では
+先頭にあります）。`lub(Some[X], Option[Y])` は 2 つ目の列に `Option` を
+見つけられず、`Option[X]` を素通りして `Option` 自身の親 `Product` に着地して
+いました。両側の列の先頭にその型を足すだけで、`Option[Option[Any]]` に
+なります。`tail4` の記録は「交差型を組んでいないから」でしたが、
+`Option[X] with Product with Serializable` は要りません。
+
+#### 5. 継承したメンバは**宣言したクラス**の型パラメータで読む
+
+`type_select`（`crates/typer/src/check.rs`）は `subst_as_seen_from` で親を
+たどって正しく読んだあと、**受け手自身の型引数**でもう一度
+`subst_tparams(owner, recv_args, …)` をかけていました。位置が揃うのは受け手が
+その宣言クラス自身のときだけです。slick の
+`BaseJoinQuery[E1, E2, U1, U2, C, B1, B2] <: Query[+E, U, C[_]]` では
+`Query` の 3 つのパラメータに join の先頭 3 引数が入り、`Query.map` の
+`Query[G, T, C]` が `Query[G, T, U1]` になっていました
+（`Query.zipWith`）。しかも 2 回目が効くのは **1 回目が恒等だったとき**
+—— `stdJoin` が囲んでいるクラス自身の `C` を書くので `C := C` ——
+なので、同じ形を小さく書いても再現しません。クラス型の受け手では
+2 回目をやめました（タプル / 関数型は `subst_as_seen_from` が歩けないので
+位置による置換を残します）。`extends`・`new` 側も同様です。
+
+#### 6. 明示した型引数は、その引数の**期待型**
+
+`proto_arg_type` は「パラメータがちょうど裸の型パラメータ」のときだけ期待型を
+作っていました。`Ref.of[F, State[F]](State(max, min, TreeMap.empty))`
+（`basic/ConcurrencyControl.scala:202`）では `[F, State[F]]` を明示しているので
+パラメータは既に `State[F]` です。それを渡さないと `State(…)` は期待型なしで
+型付けされ、`case class State[F[_]]` の**高階の `F`** はどの引数にも現れない
+ので決まらず、`State[_]` になっていました。型引数で決まりきったパラメータは
+そのまま期待型として渡します。
+
+#### 7. `copy` の書き換え先を**名前**で綴っていた
+
+`copy(x = 1)` は `{ val t = recv; new C(t.a, 1, …) }` に書き換えられますが、
+その `new C` の `C` を**名前の `Ident`**で作っていたので、書き換えが走った
+ファイルのスコープで解決されます。slick の
+
+```scala
+override def getDumpInfo = super.getDumpInfo.copy(mainInfo = s"idx=$index")
+```
+
+（`jdbc/JdbcResultConverter.scala` / `memory/MemoryQueryingProfile.scala`）は
+`DumpInfo` を継承したメンバ経由でしか知らず import していないので、
+**位置の無い** `not found: type DumpInfo` が出ていました。`crate::materialize`
+が既に持っている「解決済みの型」マーカー（nsc の `TypeTree(tp)`）を使って
+シンボルそのものを載せます。`tests/multi/mism13_*.scala` の 3 ファイルが
+これを再現します。
+
+#### 8. `if` / `match` の分岐の join
+
+`Node.getDumpInfo`（`ast/Node.scala`）の
+
+```scala
+val ch = this match {
+  case Path(_ :: _ :: _) if !GlobalConfig.dumpPaths => Vector.empty
+  case _                                            => childNames.zip(children.toSeq).toVector
+}
+```
+
+は `Vector[A]`（`Vector.empty` の決まっていない `A`）と
+`Vector[(String, Node)]` の join で、引数の join が `AnyRef` まで歩いて
+`Vector[AnyRef]` になり、`DumpInfo(…, ch)` が通らず `getDumpInfo` の推論型が
+エラーになり、それが `override final def toString` をエラーにし、最後に
+`n.toString` が `found: <overload String | <error>>  required: String`
+（`Node.scala:636`）でした —— 4 段のカスケードです。
+
+nsc の `solve` は何も縛らなかった変数をその境界で読むので、
+`Vector[Nothing]` は `Vector[(String, Node)]` です。`lub_branches` は
+join の前にそれをやりますが、条件を 3 つ付けて**取りこぼしだけ**を閉じます:
+その型パラメータが**このスコープから名前で引けない**こと（囲んでいる
+`def f[T]` の `T` は引けるので開いたまま）、もう一方の分岐がそれを含まない
+こと、共変位置にあること。そのうえで**答えは必ず 2 つの分岐型のどちらか**
+です（閉じた結果が他方の部分型になったときだけ他方を返し、そうでなければ
+従来どおりの `lub`）。`Option.getOrElse` の `[B >: A]` を pickle から読めて
+いない別の穴があり、join がより正確になったことでそれが表に出たのを、この
+最後の条件が抑えています。
+
+#### 検証
+
+`mism13_lang.scala` は `--scala-library` と `--no-scala-library` の両方で
+`-Xverify:all` を通し、real scalac 2.13.16 の標準出力とも突き合わせます
+（`expected/mism13_lang.txt`）。`mism13_lib.scala` は `<:<` が jar 側にしか
+無いので library モードのみ、私有ランタイムでは `not found: type <:<` を
+出します。`mism13_bad.scala` は 6 件を拒否し、nsc 2.13.16 も同じ 6 件を
+出します。13 本のテストのうち 10 本は**修正前の `main` で落ちる**ことを
+確認済みです。`--release` で `mismatch13` / `mismatch12` / `tail4` /
+`buildfrom2` / `conform` / `e2e` / `multifile` と `cargo test --workspace` を
+回しました。`cargo clippy --workspace --all-targets` の警告は 70 件のまま
+（行番号だけがずれる）で、新規はありません。
+
+**残っているもの**（このスライスでは直していない）:
+
+* `slick/compiler/MergeToComprehensions.scala:218` の
+  `found: Some[Tuple2[TableNode, ConstArray[T]]]`。根は 3 行上の
+  `tableFields.getOrElse(t.identity, Seq.empty)` が出す
+  `no matching overload for (Any, => Vector[TermSymbol])Vector[TermSymbol]`
+  です。`Map.getOrElse[V1 >: V](key: K, default: => V1): V1` を
+  `prelude_coll.rs` が `V` で単相にモデル化しているので、`Seq.empty` を
+  受けられません。5 行で再現します:
+  `val m: Map[String, Vector[Int]] = Map.empty; m.getOrElse("k", Seq.empty)`。
+* `slick/relational/RelationalProfile.scala:72` の `found: C required:
+  CompiledFunction[…]`。同じ行の
+  `no implicit: could not find implicit value of type TypedType[Boolean]`
+  （`Library.==.column[Boolean](…)`）の下流で、`Compiled.apply[V, C <:
+  Compiled[V]](raw: V)(implicit compilable: Compilable[V, C], …): C` の `C` は
+  witness だけが決められます。implicit 側が先です。
+* `Option.getOrElse[B >: A](default: => B): B` の `B` を pickle から読めて
+  いません（シグネチャが `(=> A)A` になり、`Option(1).getOrElse("x")` が
+  `no matching overload` です）。ソースで書いた同じ形
+  （`def orElseN[B >: A](d: => B): B`）は通るので、穴は unpickler 側です。
+* `Ext[P].flatten` を**型引数なしで**呼ぶと `<:<` の witness から `QO` を
+  解けません（`e.flatten` は駄目、`e.flatten[Int]` は通る）。`Rp[Option[QO]]`
+  のように呼び出し側の型パラメータが**入れ子**にあるときの
+  `implicit_solve` の穴で、slick 本体はこの形で呼んでいません。
 
 ## ライセンス
 

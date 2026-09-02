@@ -8449,6 +8449,20 @@ fn gen_apply(
         gen_function_apply(asm, frame, ctx, fun, args, &tree.ty);
         return;
     }
+    // A value whose *class* inherits `FunctionN` is applied the same way: the
+    // only thing a non-method can mean in call position is its `apply`. An
+    // implicit `ev: P <:< Q` used as a view is such a value
+    // (`sealed abstract class <:<[-From, +To] extends (From => To)`), and
+    // falling through to `invoke_method` emitted a call to a member of the
+    // enclosing *method* -- `NoClassDefFoundError: direct` from a program that
+    // typechecked.
+    if !fun.sym.is_none()
+        && ctx.st.get(fun.sym).kind != SymKind::Method
+        && inherited_function_arity(ctx.st, &fun.ty) == Some(args.len())
+    {
+        gen_function_apply(asm, frame, ctx, fun, args, &tree.ty);
+        return;
+    }
 
     // regular method / apply
     if fun.sym.is_none() {
@@ -14250,6 +14264,29 @@ fn emit_is_instance_of(asm: &mut Assembler, ctx: &EmitCtx, target: &Type) {
         _ => checkcast_internal(ctx.st, target).unwrap_or_else(|| "java/lang/Object".to_string()),
     };
     asm.instanceof(&cn);
+}
+
+/// The arity of the `FunctionN` a *class* type inherits, if any. Structural
+/// `Type::Function` is handled directly everywhere; this is for the classes
+/// that extend one (`<:<`, `=:=`, `PartialFunction`, `trait Mono extends
+/// (Int => String)`).
+fn inherited_function_arity(st: &SymbolTable, ty: &Type) -> Option<usize> {
+    if !matches!(ty, Type::Class { .. }) {
+        return None;
+    }
+    st.base_type_seq(ty).into_iter().find_map(|b| match b {
+        Type::Function { params, .. } => Some(params.len()),
+        Type::Class { sym, args } => {
+            let n: usize = st
+                .get(sym)
+                .jvm_name
+                .strip_prefix("scala/Function")?
+                .parse()
+                .ok()?;
+            (args.len() == n + 1).then_some(n)
+        }
+        _ => None,
+    })
 }
 
 fn gen_function_apply(

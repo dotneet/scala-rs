@@ -1549,8 +1549,18 @@ impl SymbolTable {
         // state it depends on is the library's, not slick's). So when the two
         // sequences meet at the same class with different arguments, the
         // arguments are joined and the walk stops there.
-        let b_seq = self.base_type_seq(&b);
-        for cand in self.base_type_seq(&a) {
+        //
+        // A type is at the head of its own base type sequence (SLS 3.5.2), and
+        // leaving it out is the same failure one step earlier: `lub(Some[X],
+        // Option[Y])` never saw `Option` on the second side at all, walked
+        // past `Option[X]` and answered `Product` again.
+        let with_self = |t: &Type| {
+            let mut v = vec![t.clone()];
+            v.extend(self.base_type_seq(t));
+            v
+        };
+        let b_seq = with_self(&b);
+        for cand in with_self(&a) {
             if matches!(cand, Type::Any | Type::AnyRef | Type::AnyVal) {
                 continue;
             }
