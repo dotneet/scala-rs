@@ -3460,27 +3460,50 @@ impl<'a> Parser<'a> {
             has_braces = true;
         }
         if !has_braces && parents.len() == 1 {
-            // new C or new C(args) — parent may already be Apply
-            match parents.pop().unwrap() {
-                t @ Tree {
-                    kind: TreeKind::Apply { .. },
-                    ..
-                } => {
-                    // new C(args) => Apply(New(C), args)
-                    if let TreeKind::Apply { fun, args } = t.kind {
-                        let nw = self.alloc(fun.span, TreeKind::New { tpt: fun });
-                        return self.alloc(
-                            lo.merge(t.span),
-                            TreeKind::Apply {
-                                fun: Box::new(nw),
-                                args,
-                            },
-                        );
+            // new C, new C(args), new C(a)(b) — the parent is an `Apply`
+            // *chain* whose head is the class. `new` belongs on the head, not
+            // on the outermost `Apply`: a curried constructor is one call with
+            // two parameter lists, so `new C(a)(b)` is
+            // `Apply(Apply(New(C), a), b)`. Wrapping only the outermost layer
+            // made `New` hold `C(a)` and turned the second list into a call to
+            // `apply` on its result -- slick's `new SimpleLiteral(name)(tpe)`
+            // then reported `ambiguous overload for apply`.
+            let mut head = parents.pop().unwrap();
+            let mut argss: Vec<(Span, Vec<Tree>)> = Vec::new();
+            while matches!(head.kind, TreeKind::Apply { .. }) {
+                let span = head.span;
+                match head.kind {
+                    TreeKind::Apply { fun, args } => {
+                        argss.push((span, args));
+                        head = *fun;
                     }
-                    unreachable!()
+                    _ => unreachable!(),
                 }
-                tpt => self.alloc(lo.merge(tpt.span), TreeKind::New { tpt: Box::new(tpt) }),
             }
+            if argss.is_empty() {
+                return self.alloc(
+                    lo.merge(head.span),
+                    TreeKind::New {
+                        tpt: Box::new(head),
+                    },
+                );
+            }
+            let mut out = self.alloc(
+                head.span,
+                TreeKind::New {
+                    tpt: Box::new(head),
+                },
+            );
+            for (span, args) in argss.into_iter().rev() {
+                out = self.alloc(
+                    lo.merge(span),
+                    TreeKind::Apply {
+                        fun: Box::new(out),
+                        args,
+                    },
+                );
+            }
+            out
         } else {
             let impl_ = Template {
                 parents,
