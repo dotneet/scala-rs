@@ -9246,8 +9246,10 @@ join の前にそれをやりますが、条件を 3 つ付けて**取りこぼ�
 
 計測は `files=184 errors=134 files_with_errors=48` →
 **`files=184 errors=120 files_with_errors=41`**（−14 件 / −7 ファイル）。
+`no matching overload` は **49 件 → 35 件**になりました。
 `tests/slick_subset.sh` は `38 files / 204 classes / verified=204 failed=0`
-のままです。`no matching overload` は **49 件 → 35 件**になりました。
+のままです（`crates/backend` は触っていないので、この数字は
+`StringBuilder` のコンストラクタを足す前の 1 回だけ実測しています)。
 
 `no matching overload` は「候補が複数あって選べない」ときのメッセージでは
 ありません。**候補が 1 本しか無くても**、その 1 本が引数を受け付けなければ
