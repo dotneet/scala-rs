@@ -110,10 +110,20 @@ public final class ScalaRsMacroEngine {
             return err("no method " + methodName + " on " + className);
         }
 
+        Ctx handler = new Ctx();
+        // `c.prefix`: the receiver of the macro application, or the reason
+        // there is none -- which is raised only if the implementation reads it.
+        Sexp pfx = req.field("prefix").items.get(1);
+        if (pfx.isList() && "no".equals(pfx.items.get(0).atom)) {
+            handler.prefixWhy = pfx.items.get(1).text();
+        } else {
+            handler.prefixTree = buildTree(pfx);
+        }
+
         Object ctx = Proxy.newProxyInstance(
             ScalaRsMacroEngine.class.getClassLoader(),
             new Class<?>[]{Class.forName("scala.reflect.macros.blackbox.Context", true, macroCl)},
-            new Ctx());
+            handler);
 
         // 2.11 onwards an implementation may take a raw `c.Tree` instead of a
         // `c.Expr[T]`, and slick's `mapToImpl` does. Which one is wanted is
@@ -225,7 +235,11 @@ public final class ScalaRsMacroEngine {
 
     /** `(ty "java.lang.String")` as a `universe.WeakTypeTag`. */
     static Object buildTag(Sexp s) throws Exception {
-        String name = s.items.get(1).text();
+        return tagFor(s.items.get(1).text());
+    }
+
+    /** `WeakTypeTag` for the class `name`, in the runtime universe. */
+    static Object tagFor(String name) throws Exception {
         Object cls = call(mirror, "staticClass", 1, name);
         Object tpe = call(call(cls, "asType", 0), "toType", 0);
         Class<?> creatorCls =
@@ -413,9 +427,30 @@ public final class ScalaRsMacroEngine {
     }
 
     static final class Ctx implements InvocationHandler {
+        /** The receiver of this macro application, or null. */
+        Object prefixTree;
+        /** Why there is no prefix tree, when there is none. */
+        String prefixWhy;
+        /** Built once: `prefix` is a `val` in nsc and is read more than once. */
+        Object prefix;
+
         public Object invoke(Object proxy, Method m, Object[] a) throws Throwable {
             String n = m.getName();
             int arity = m.getParameterCount();
+            if (n.equals("prefix") && arity == 0) {
+                if (prefixTree == null) {
+                    throw new UnsupportedOperationException(
+                        "scala-rs macro engine: c.prefix is not available here -- " + prefixWhy);
+                }
+                if (prefix == null) {
+                    // nsc: `Expr[Nothing](prefixTree)(TypeTag.Nothing)`. The
+                    // prefix carries no type of its own -- `PrefixType` is an
+                    // abstract member of the blackbox `Context` -- so
+                    // `c.prefix.staticType` is `Nothing` there too.
+                    prefix = mkExpr(prefixTree, call(companion("TypeTag"), "Nothing", 0));
+                }
+                return prefix;
+            }
             switch (n) {
                 case "universe":
                     return universe;

@@ -5850,6 +5850,22 @@ impl Typer {
                 if !fun.sym.is_none() {
                     let mut sym = fun.sym;
                     let mut base_ty = fun.ty.clone();
+                    // nsc (SLS 6.26.3): explicit type arguments narrow an
+                    // overloaded reference *before* anything else looks at it.
+                    // A selection in value position has already dropped the
+                    // alternatives that take parameters (`maybe_auto_apply`),
+                    // so by the time the type arguments are read the overload
+                    // may be gone. `scala.reflect.macros.Aliases` declares
+                    // `Expr` twice -- `val Expr: universe.Expr.type` next to
+                    // `def Expr[T: WeakTypeTag](tree: Tree): Expr[T]` -- and
+                    // the collapse kept the val, so `c.Expr[Int](tree)` became
+                    // `universe.Expr.apply[Int](tree)` and failed against that
+                    // method's `(Mirror, TreeCreator)` parameters.
+                    // `docs/macros.md` §7.11 residual 1.
+                    if let Some((only, ty)) = self.alt_taking_targs(sym, targs.len()) {
+                        sym = only;
+                        base_ty = ty;
+                    }
                     // `Module[T1, T2]` with no explicit `.apply` written still
                     // means the type args target the module's generic `apply`
                     // factory (`HashMap[String, Int]()`, `List[Int]()`) — the
@@ -8252,7 +8268,7 @@ impl Typer {
                 .map(|s| (*s, expand(subst(self.st.get(*s).ty.clone()))))
                 .collect();
             self.overload_member_types.insert(found[0].0, alts.clone());
-            let ov = Type::Overload(alts.into_iter().map(|(_, t)| t).collect());
+            let ov = Type::Overload(alts.clone().into_iter().map(|(_, t)| t).collect());
             tree.ty = self.maybe_auto_apply(ov, pt);
             if !matches!(tree.ty, Type::Overload(_)) {
                 if let Some(id) = found
@@ -8267,6 +8283,18 @@ impl Typer {
                     })
                 {
                     tree.sym = id;
+                    // Value position dropped the alternatives that take
+                    // parameters (SLS 6.26.3), but explicit type arguments are
+                    // read *before* that rule applies, so a `TypeApply` above
+                    // has to be able to get back to the set. Record it under
+                    // the surviving symbol too -- the key the caller has.
+                    if id != found[0] {
+                        self.overload_member_types.insert(id.0, alts);
+                        self.record_overload_group(&found, &name);
+                        if let Some(g) = self.overload_groups.get(&found[0].0).cloned() {
+                            self.overload_groups.insert(id.0, g);
+                        }
+                    }
                 }
             }
         }
@@ -13499,17 +13527,16 @@ impl Typer {
         // failed lookup itself attached the ancestors. Ask here instead.
         let universe_ty = universe.ty.clone();
         let _ = self.supply_from_pickle(&universe_ty, &tag_name);
-        let class_name = match crate::materialize::static_class_name(&self.st, &arg) {
-            Ok(n) => n,
+        let body = match self.tag_body(tag, &arg, span) {
+            Ok(b) => b,
             Err(why) => {
                 self.error(
                     span,
                     format!(
                         "materialisation is not implemented: cannot build a \
-                         {tag_name} for {why}. scala-rs rebuilds a tag with one \
-                         `staticClass` call, so it materialises a class type \
-                         with no type arguments and nothing else; see \
-                         docs/macros.md \u{a7}7.10.",
+                         {tag_name} for {why}. scala-rs rebuilds a tag out of \
+                         `staticClass` calls, `appliedType` and the tags in \
+                         scope; see docs/macros.md \u{a7}7.10 and \u{a7}7.12.",
                     ),
                 );
                 return Some(Tree {
@@ -13532,7 +13559,7 @@ impl Typer {
             universe: &universe,
             creator_name,
             arg,
-            class_name,
+            body,
             tag_name,
             mirror_ty: Type::Class {
                 sym: mirror,
@@ -13547,6 +13574,67 @@ impl Typer {
         .build();
         self.type_expr(&mut tree, &want);
         Some(tree)
+    }
+
+    /// How the synthetic `TypeCreator` rebuilds `ty`, or why it cannot.
+    ///
+    /// Three shapes, and nothing else (`crate::materialize::TagBody`):
+    /// a monomorphic class is one `staticClass` call; a type constructor at
+    /// arguments is `appliedType` over the same, applied to each argument's
+    /// own body; a type *parameter* is only knowable through a tag in scope,
+    /// which is how `c.Expr[F[E]]` works inside `def impl[E](c: Context)
+    /// (implicit e: c.WeakTypeTag[E])` -- slick's `TableQueryMacroImpl`.
+    ///
+    /// The tag for a type parameter is looked up by the ordinary implicit
+    /// search, which cannot come back here: materialisation is only the
+    /// *fallback* after a search failed, so there is no cycle.
+    fn tag_body(
+        &mut self,
+        tag: crate::materialize::Tag,
+        ty: &Type,
+        span: Span,
+    ) -> Result<crate::materialize::TagBody, String> {
+        use crate::materialize::TagBody;
+        let flat = self.st.dealias(ty);
+        if let Ok(name) = crate::materialize::static_class_name(&self.st, &flat) {
+            return Ok(TagBody::StaticClass(name));
+        }
+        match &flat {
+            Type::Class { sym, args } if !args.is_empty() => {
+                let class_name = crate::materialize::static_class_of_sym(&self.st, *sym)?;
+                let mut built = Vec::new();
+                for a in args {
+                    built.push(self.tag_body(tag, a, span)?);
+                }
+                Ok(TagBody::Applied {
+                    class_name,
+                    args: built,
+                })
+            }
+            Type::TypeParam(id) | Type::TypeMember(id) => {
+                let name = self.st.get(*id).name.clone();
+                let Some(tag_cls) = self.reflect_class(tag.pickle_name(), tag.jvm()) else {
+                    return Err(format!("`{name}`, an abstract type"));
+                };
+                let want = Type::Class {
+                    sym: tag_cls,
+                    args: vec![flat.clone()],
+                };
+                self.warm_implicit_scope(&want);
+                match self.search_implicit(&want) {
+                    crate::implicits::ImplicitSearch::Found(id) => Ok(TagBody::FromTag(Box::new(
+                        self.implicit_tree(id, &want, span, 0),
+                    ))),
+                    // Same wording as `static_class_name`'s: this is the
+                    // same refusal, reached after the implicit search that
+                    // could have supplied the tag came up empty.
+                    _ => Err(format!("`{name}`, an abstract type with no tag in scope")),
+                }
+            }
+            other => Err(crate::materialize::static_class_name(&self.st, other)
+                .err()
+                .unwrap_or_else(|| format!("`{}`", self.st.display_type(other)))),
+        }
     }
 
     /// nsc: `A <: B` is a view `A => B` (identity / asInstanceOf).
@@ -13780,6 +13868,30 @@ impl Typer {
 
     /// The single overloaded alternative of `sym` that takes `n` type
     /// parameters, if there is exactly one.
+    /// The alternative an explicit `[T1, …, Tn]` picks out of an overload set
+    /// that value position has already collapsed.
+    ///
+    /// Only fires when the set really had more than one alternative at this
+    /// receiver (`overload_member_types`, recorded by the selection), exactly
+    /// one of which takes `n` type parameters, and the symbol the collapse
+    /// left behind takes a different number. So an ordinary
+    /// `Ordering[String]`, whose `Ordering` is a single accessor, is untouched
+    /// and still redirects to the module's `apply`.
+    fn alt_taking_targs(&self, sym: SymbolId, n: usize) -> Option<(SymbolId, Type)> {
+        if n == 0 || sym.is_none() || self.st.get(sym).tparams.len() == n {
+            return None;
+        }
+        let alts = self.overload_member_types.get(&sym.0)?;
+        if alts.len() < 2 || !alts.iter().any(|(s, _)| *s == sym) {
+            return None;
+        }
+        let mut hits = alts.iter().filter(|(s, t)| {
+            self.st.get(*s).tparams.len() == n && matches!(t, Type::Method { .. })
+        });
+        let first = hits.next()?;
+        hits.next().is_none().then(|| (first.0, first.1.clone()))
+    }
+
     fn only_alt_with_tparams(&self, sym: SymbolId, n: usize) -> Option<SymbolId> {
         if sym.is_none() {
             return None;

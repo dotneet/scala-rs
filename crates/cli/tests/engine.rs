@@ -314,3 +314,186 @@ fn eg_unsupported_forms_are_named() {
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&out_dir);
 }
+
+// ---------------------------------------------------------------------------
+// `c.Expr[T](tree)`, `c.prefix`, and a tag composed out of a type constructor
+// and the tags in scope. `docs/macros.md` §7.12.
+//
+// `eg_*` above had to write every implementation body as a bare `c.Tree`:
+// `c.Expr[T](tree)` did not resolve to `Context.Expr` at all -- it landed on
+// `universe.Expr.apply`, whose parameters are `(Mirror, TreeCreator)` -- and
+// `c.prefix` was not implemented. Those are the two members slick's macros
+// are written with, so `ex_*` is the same two-stage, dual-run shape for them.
+
+/// The macro implementations of `ex_impl.scala`, expanded for real.
+///
+/// Three things at once, and the recorded output is real scalac's:
+/// implementations that *return* `c.Expr[T]`, implementations that read
+/// `c.prefix`, and `c.Expr[ExBox[E]]` -- whose implicit `WeakTypeTag` no
+/// program defines and which is composed from `appliedType` over the tag in
+/// scope for `E`. That last one is the shape of `TableQueryMacroImpl.apply`.
+#[test]
+fn ex_expr_and_prefix_macros_expand_and_run() {
+    if !prerequisites("ex_use") {
+        return;
+    }
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("ex_impl");
+    let uses = tmp_dir("ex_use");
+
+    let out = compile("ex_impl", &impls, &[]);
+    assert!(
+        out.status.success(),
+        "compile ex_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out = compile("ex_use", &uses, &[&impls]);
+    assert!(
+        out.status.success(),
+        "compile ex_use failed: {}",
+        diagnostics(&out)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "ex_use"),
+        expected_stdout("ex_use"),
+        "stdout mismatch for ex_use"
+    );
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
+/// The same two files through real scalac 2.13.16.
+///
+/// Without this the recorded expectation would only say what scala-rs does.
+/// It is what pins the *composed tag*: `ExBox[ExRow]` is printed out of
+/// `weakTypeOf[ExBox[E]]`, and `Nothing` out of `c.prefix.staticType`, which
+/// is nsc's answer because nsc builds the prefix as `Expr[Nothing]`.
+#[test]
+fn ex_macros_match_real_scalac() {
+    if !prerequisites("ex_use scalac diff") {
+        return;
+    }
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip ex_use scalac diff: scalac not obtainable");
+        return;
+    };
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("ex_impl-scalac");
+    let uses = tmp_dir("ex_use-scalac");
+
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            impls.to_str().unwrap(),
+            fixtures_dir().join("ex_impl.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected ex_impl.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            &format!("{}:{}", reflect.display(), impls.display()),
+            "-d",
+            uses.to_str().unwrap(),
+            fixtures_dir().join("ex_use.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected ex_use.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "ex_use (real scalac build)"),
+        expected_stdout("ex_use"),
+        "recorded expectation for ex_use does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
+/// A tag that cannot be composed is named, not approximated.
+///
+/// `c.Expr[ExnBox[E]]` needs a `WeakTypeTag[ExnBox[E]]`, and `E` has no tag in
+/// scope. nsc goes further and builds one with a free type symbol; scala-rs
+/// does not, and the diagnostic says which part is missing. Real scalac
+/// compiles this file, so it records a gap rather than an error in the source.
+#[test]
+fn ex_uncomposable_tag_is_named() {
+    if !prerequisites("ex_notag_bad") {
+        return;
+    }
+    let out_dir = tmp_dir("ex_notag_bad");
+    let out = compile("ex_notag_bad", &out_dir, &[]);
+    let err = diagnostics(&out);
+    assert!(
+        !out.status.success(),
+        "expected ex_notag_bad to fail, got: {err}"
+    );
+    assert!(
+        err.contains("cannot build a WeakTypeTag for `E`, an abstract type with no tag in scope"),
+        "expected the missing-tag reason, got {err:?}"
+    );
+    let _ = fs::remove_dir_all(&out_dir);
+}
+
+/// The two receivers `c.prefix` cannot be built from, each named.
+#[test]
+fn ex_unsupported_prefixes_are_named() {
+    if !prerequisites("ex_gaps_bad") {
+        return;
+    }
+    let impls = tmp_dir("ex_impl-gaps");
+    let out = compile("ex_impl", &impls, &[]);
+    assert!(
+        out.status.success(),
+        "compile ex_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out_dir = tmp_dir("ex_gaps_bad");
+    let out = compile("ex_gaps_bad", &out_dir, &[&impls]);
+    let err = diagnostics(&out);
+    assert!(
+        !out.status.success(),
+        "expected ex_gaps_bad to fail, got: {err}"
+    );
+    for needle in [
+        // No receiver written at all.
+        "the macro was called without a receiver",
+        // A receiver the bridge will not re-evaluate at the call site.
+        "cannot hand a `new` to a macro implementation",
+    ] {
+        assert!(
+            err.contains(needle),
+            "expected {needle:?} in diagnostics, got {err:?}"
+        );
+    }
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&out_dir);
+}

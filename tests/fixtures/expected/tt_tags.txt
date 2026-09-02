@@ -28,3 +28,12 @@ true
 Baz
 Foo
 scala.math.BigInt
+List[Int]
+Option[Foo]
+true
+scala.collection.immutable.Map
+List[List[Int]]
+true
+false
+true
+scala.collection.immutable.List

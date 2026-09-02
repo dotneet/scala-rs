@@ -1598,3 +1598,137 @@ engine が効くのは**slick を classfile として先にコンパイルでき
 このスライスが動かすのは §7.1〜7.10 が積み上げてきた「実装をコンパイルする」
 側ではなく、その先の「実装を呼ぶ」側で、slick に効くのは
 残件 1（`c.Expr`）と 3〜4（`c.prefix`）が入ってからになる。
+
+### 7.12 `c.Expr[T](tree)` と `c.prefix`（`agent/expr` スライス）
+
+§7.11 の残件 1（`c.Expr`）と 4 の一部（`c.prefix`）。あわせて、
+**`c.Expr[F[E]]` が要求する `WeakTypeTag[F[E]]` を組み立てられる**
+ようになった。この 3 つが揃うと **slick の `TableQueryMacroImpl.apply` と
+同じ形のマクロ**が書けて展開でき、実 scalac 2.13.16 と dual-run で
+プログラム出力が一致する（`tests/fixtures/ex_impl.scala` +
+`tests/fixtures/ex_use.scala`）。
+
+#### 1. `c.Expr[T](tree)` — 値位置の畳み込みが早すぎた
+
+`scala.reflect.macros.Aliases` は `Expr` を **2 つ**宣言している:
+
+```scala
+val Expr: universe.Expr.type                       // 抽出子オブジェクト
+def Expr[T: WeakTypeTag](tree: Tree): Expr[T]      // 生成メソッド
+```
+
+`c.Expr` の選択は `Type::Overload` で始まるが、`maybe_auto_apply` が
+**SLS 6.26.3（値位置ではパラメータを取らない候補だけ残す）** をその場で
+適用して `val` の方に潰していた。潰れた結果は `universe.Expr$` という
+モジュールなので、続く `[Int]` はモジュール→`apply` のリダイレクトに乗り、
+`universe.Expr.apply(Mirror, TreeCreator)` に当たって
+`no matching overload` になっていた。
+
+nsc の順序は逆で、**明示型引数はオーバーロードを先に絞る**。そこで:
+
+- 選択が畳み込んだときは、その集合を**生き残ったシンボルの側にも**記録する
+  （`overload_member_types` / `overload_groups`。呼び出し側が持っている鍵は
+  `found[0]` ではなく畳み込み後のシンボルなので）。
+- `TypeApply` は、型引数の個数に合う候補が**ちょうど 1 つ**あり、いま持って
+  いるシンボルの型パラメータ数がそれと違うときだけ、そちらへ差し替える
+  （`Check::alt_taking_targs`）。集合が本当に 2 つ以上だった場合に限るので、
+  `Ordering[String]` のような「候補 1 つ」の従来経路は素通りする。
+
+#### 2. `c.prefix` — 呼び出し地点のレシーバ
+
+`peel_application` が `Apply`/`TypeApply` を剥がした先が `Select` なら、
+その `qual` が prefix である。**木だけ**を engine に送り、engine 側は
+nsc と同じく `Expr[Nothing](prefixTree)(TypeTag.Nothing)` を作る
+（blackbox の `PrefixType` は抽象メンバなので、nsc でも
+`c.prefix.staticType` は `Nothing` になる。fixture がこれを固定している）。
+
+運べないレシーバ（`new`、ブロック、レシーバなしの呼び出し）は
+**その場ではエラーにしない**。実装が `prefix` を読むかどうかは呼び出し側から
+分からないので、**理由の文字列を一緒に送り**、engine は `prefix` が実際に
+読まれたときだけその理由を載せて投げる。読まない実装は素通しで展開される。
+
+#### 3. `WeakTypeTag[F[E]]` の組み立て
+
+`c.Expr[ExBox[E]](tree)` は暗黙の `WeakTypeTag[ExBox[E]]` を要求する。
+§7.10 の materialiser は `staticClass` 1 回で作れる**単相クラスだけ**だったので、
+ここで止まっていた。creator の本体を 3 形の合成に一般化した
+（`materialize::TagBody`）:
+
+| 形 | 生成する木 |
+| --- | --- |
+| 単相クラス | `$m$untyped.staticClass("N").asType.toTypeConstructor`（従来） |
+| 型構築子の適用 | `$m$untyped.universe.appliedType($m$untyped.staticClass("N"), List(<各引数>))` |
+| 型パラメータ | `<スコープ内のタグ>.in($m$untyped).tpe` |
+
+`appliedType(sym, args)` は nsc が書く
+`internal.reificationSupport.TypeRef(thisPrefix(owner), sym, List(…))` の
+公開版である（シンボルの `typeConstructor` が `TypeRef(owner.thisType, sym, Nil)`
+だから同じ `TypeRef` になる）。型パラメータのタグは**通常の暗黙探索**で
+引く。materialisation は探索が失敗した*あと*の代替なので、循環はしない。
+
+作れない形は従来どおり名指しで断る。合成は**再帰する**ので、引数が作れない
+`List[Nest.Inner]` は「`Inner`, a class nested in a class or an object」と、
+引数の方を名指しする。タプル・関数型（`scala.TupleN` / `scala.FunctionN` への
+展開が要る）と、タグの無い型パラメータ（nsc は free type symbol を立てるが
+scala-rs はやらない）は引き続き断る。`tests/fixtures/tt_tags_bad.scala` が固定する。
+
+**既知のずれ（1 件）**: `Predef.Map` のような**型別名**を経由した構築子では、
+nsc の creator が別名を保つ（`selectType(staticModule("scala.Predef"), "Map")`）のに対し、
+scala-rs は別名の指すクラスを `staticClass` する。両者は `=:=` で `typeSymbol` も同じだが、
+`toString` が `Map[String,Foo]` と `scala.collection.immutable.Map[String,Foo]` に分かれる。
+§7.10 が `Predef.String` について既に記録しているのと同じずれで、`String` では
+たまたま表示が一致していただけである。`tt_tags.scala` は `Map` については
+`=:=` と `typeSymbol.fullName` を比較している（`toString` ではなく）。
+
+#### 4. 展開結果の `New`
+
+reflect の `new C(args)` は `Apply(Select(New(tpt), termNames.CONSTRUCTOR), args)`、
+scala-rs の木では `Apply(New(tpt), args)`。`New` を受け取れるようにし、
+`New` の上の `<init>` 選択は畳んで落とす。slick の `TableQueryMacroImpl` が
+`New(TypeTree(e.tpe))` を書くので、これが要る。
+
+#### 検証
+
+- `tests/fixtures/ex_impl.scala` + `tests/fixtures/ex_use.scala` — scala-rs で
+  2 段コンパイルして実行し、`tests/fixtures/expected/ex_use.txt` と一致する
+  （`java -Xverify:all`）。**同じ 2 ファイルを実 scalac 2.13.16 でも 2 段
+  コンパイルして実行し、同じ 10 行になることを別テストで固定**している。
+  出力には `weakTypeOf[ExBox[E]].toString`（＝合成したタグの型）と
+  `c.prefix.staticType.toString` が含まれるので、**タグと prefix の作り方が
+  nsc と違えば行が変わる**。
+- `tests/fixtures/tt_tags.scala` — マクロの外の materialisation。
+  `List[Int]` / `Option[Foo]` / `List[List[Int]]` を追加し、実 scalac と
+  `tag.tpe` の文字列まで一致することを固定した（従来は名指しで断っていた）。
+- `tests/fixtures/ex_notag_bad.scala` — 合成できないタグ。
+- `tests/fixtures/ex_gaps_bad.scala` — 運べないレシーバ 2 種。
+  どちらも実 scalac は通るので、scala-rs 側の穴を固定した fixture である。
+
+#### このスライスのあとに残っているもの
+
+1. **`c.prefix` に `This` を作れない。** レシーバを書かずに呼んだマクロは
+   nsc なら `This(<囲むクラス>)` が prefix になる。`ex_gaps_bad.scala` が
+   名指しで固定している。
+2. **引数・レシーバの木は「書かれた構文」のまま**（§7.11 残件 3）。
+   `new`・ブロック・関数リテラルは運べない。§4.3 の「型付き木のまま渡す」は
+   未実装で、slick の `mapToImpl` は `c.prefix` の**木**しか見ないので
+   そこは足りるが、`ShapedValue(...)` のような式をレシーバに書かれると届かない。
+3. **展開結果に `Function` / `ValDef` / `Modifiers` を作れない。**
+   slick の `TableQueryMacroImpl` は `Function(List(ValDef(…)), …)` を
+   `TableQuery.apply[E](cons)` に渡すので、**本物の slick に効かせるには
+   これが要る**。いまは名指しで断る。
+4. **`reify`。** `TableQueryMacroImpl` の最後の 1 行は `reify { … }` で、
+   これは fast track マクロなので JVM ブリッジでは展開できない（§6.2）。
+   実装を scala-rs でコンパイルするには自前の reify が要る（§7.8 に診断あり）。
+5. 推論された型引数がタグにならない（§7.11 残件 2）、`TypeTree` に型引数を
+   埋められない（同 5）、whitebox（同 6）、`@macroImpl` の pickle（同 7）は
+   そのまま。
+
+#### slick への効き方
+
+`tests/slick_measure.sh` は `errors=177 → 177`、`files_with_errors=57 → 57`。
+`tests/slick_subset.sh` は `38 files / 204 classes / verified=204 failed=0` のまま。
+**数字は動かない。** §7.11 に書いたとおり、slick の 2 マクロは
+「def と実装が同じ run にある」ので nsc でも展開できない形であり、
+段階 D（slick を 2 段コンパイルする実験）には上の残件 3・4 が要る。
+このスライスが動かしたのは「slick の 2 マクロと**同じ形**のマクロを
+書いて展開できる」ところまでである。
