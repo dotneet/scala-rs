@@ -81,7 +81,9 @@ pub use lambda_lift::lambda_lift;
 pub use lazy_local::lazy_locals;
 pub use lin::{is_interface, linearize, trait_superclass};
 pub use localobj::{check_local_case_class_captures, check_local_objects};
-pub use symbol::{Intrinsic, MacroBinding, SamSig, SymKind, Symbol, SymbolTable};
+pub use symbol::{
+    Intrinsic, MacroBinding, SamSig, SymKind, Symbol, SymbolTable, AS_SEEN_FROM_MARK,
+};
 pub use uncurry::uncurry;
 
 use scala_rs_parser::{parse_str, Tree};

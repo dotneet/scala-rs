@@ -2,6 +2,11 @@
 
 use scala_rs_parser::{Flags, RefineDecl, SymbolId, Type};
 
+/// Decl name that marks a refinement as the as-seen-from view of a type
+/// projection rather than something the program wrote. Not a legal Scala
+/// identifier, so it can never collide with a real member.
+pub const AS_SEEN_FROM_MARK: &str = "<asSeenFrom>";
+
 thread_local! {
     /// Type parameters whose upper bound `is_sub_type` is already expanding.
     /// An F-bound (`A <: Rep[A]`) would otherwise recurse forever.
@@ -1620,6 +1625,17 @@ impl SymbolTable {
         if a == b {
             return true;
         }
+        // `A#B` carries what `A` settles as a refinement so member reads can
+        // see it, but it *is* `B`: the same class reached by an alias
+        // (`type Session = JdbcSessionDef`) carries nothing, and slick passes
+        // the two to each other constantly. Constraining either direction
+        // would invent errors nsc does not have.
+        if let Some(p) = Self::as_seen_from_view(a) {
+            return self.is_sub_type(p, b);
+        }
+        if let Some(p) = Self::as_seen_from_view(b) {
+            return self.is_sub_type(a, p);
+        }
         // An alias type member stands for its right-hand side on either side of
         // `<:`. This has to happen before the arms below, because the `Class`
         // and `Applied` arms match without ever looking at `b`.
@@ -2052,6 +2068,11 @@ impl SymbolTable {
     }
 
     pub fn display_type(&self, ty: &Type) -> String {
+        // The as-seen-from view of `A#B` prints as `B`: its decls are the
+        // compiler's bookkeeping, not something the program wrote.
+        if let Some(p) = Self::as_seen_from_view(ty) {
+            return self.display_type(p);
+        }
         match ty {
             Type::Class { sym, args } => {
                 let mut s = self.get(*sym).name.clone();
@@ -2200,8 +2221,63 @@ impl SymbolTable {
         parts.join("/")
     }
 
+    /// Is this refinement the *as-seen-from view* of a type projection
+    /// (`A#B`) rather than a refinement the program wrote?
+    ///
+    /// See `Checker::projected_class_type`. Such a view constrains nothing --
+    /// it only records what the prefix settles -- so subtyping, display and
+    /// pickling read it as the bare parent.
+    pub fn as_seen_from_view(ty: &Type) -> Option<&Type> {
+        let Type::Refined { parents, decls } = ty else {
+            return None;
+        };
+        if !decls
+            .iter()
+            .any(|d| matches!(d, RefineDecl::Type { name, .. } if name == AS_SEEN_FROM_MARK))
+        {
+            return None;
+        }
+        parents.first()
+    }
+
+    /// Every type member `cls` (or an ancestor of it) leaves abstract.
+    ///
+    /// Used by `A#B` projection: these are the names whose meaning the
+    /// projection prefix can settle.
+    pub(crate) fn abstract_type_member_names(&self, cls: SymbolId) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut work = vec![cls];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(id) = work.pop() {
+            if !visited.insert(id.0) {
+                continue;
+            }
+            for m in self.get(id).members.clone() {
+                let info = self.get(m);
+                if info.kind != SymKind::TypeMember {
+                    continue;
+                }
+                let abstract_ = match &info.ty {
+                    Type::NoType | Type::Error => true,
+                    Type::TypeMember(inner) => *inner == m,
+                    _ => false,
+                };
+                if abstract_ && seen.insert(info.name.clone()) {
+                    out.push(info.name.clone());
+                }
+            }
+            for p in self.get(id).parents.clone() {
+                if let Some(ps) = self.class_sym_of(&p) {
+                    work.push(ps);
+                }
+            }
+        }
+        out
+    }
+
     /// `from` and the class-like symbols lexically enclosing it, innermost first.
-    fn enclosing_classes(&self, from: SymbolId) -> Vec<SymbolId> {
+    pub(crate) fn enclosing_classes(&self, from: SymbolId) -> Vec<SymbolId> {
         let mut out = Vec::new();
         let mut cur = from;
         while !cur.is_none() {

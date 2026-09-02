@@ -74,7 +74,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 
 パースできる（またはデシュガーする）構文:
 
-- packages / imports
+- packages / imports。**`package` 句が開くのはそれが名指したパッケージだけ**（SLS 9.2）: 修飾付きの `package p.q` は `p.q` だけを開き、`p` のクラスもサブパッケージも見えない。入れ子の `package p { package q { … } }` は両方を開く。ルートは常に最後に見るので、`package p.q` からの修飾参照 `p.X` は解決する。この違いは観測できる —— `package slick.dbio` から見た `cats` は `slick.cats` ではなくトップレベルの `cats`（`agent/proj`。開いていないパッケージへの最終フォールバックが 1 つ残っており、その理由は `Checker::expose_from_unopened_packages` に書いてあります）
 - objects / classes / traits / case classes。**補助コンストラクタ** `def this(...) = this(...)`（連鎖の先頭は `this(...)`。`super(...)` や文のあとの `this` は診断）。サブクラスの `extends C(1)` は primary が親 ctor を呼ぶ。内部クラスの `new Inner` は ctor overload 選択後も `$outer` を `<init>` の第一引数に残す。**case class の `copy(...)`**（positional / 一部省略時は自分自身の対応フィールドを default / 名前付き引数。`copy` は namer 時点ではまだ ctor フィールドの型が確定していないため、フィールド型解決後の typer フェーズで `copy` 自身の引数シンボルと `copy$default$N` を作り直す。private ランタイムでも動く）。**コンストラクタの省略可能引数**（`class C(x: Int, y: Int = 5)` の `new C(1)` / `new C(y = 2, x = 1)`）: 末尾を省略した呼び出しへのデフォルト値の充填は、通常の `def` の default getter 経由ではなく（`this` が無い呼び出し元では使えないため）呼び出し側でその場を型付けする素朴なフォールバックのみ実装（先行引数を参照するデフォルトは非対応）。**名前付き引数での並べ替えは `new C(...)` でも動く**（コンストラクタのオーバーロードはパラメータ名で絞ってから型で決める）
 - `val` / `var` / `def`（ネストした `def` はパースする）
 - **テンプレート本体の式文**（`class A { println("ctorA") }`）。SLS 5.1 / 5.3 どおり、class なら主コンストラクタ、trait なら `$init$`、`object` ならモジュール初期化の一部として、`val` / `var` の初期化と**宣言順に交互に**走る。早期の `require(...)` / `assert(...)`、`if` / `match` / `try` / ループ / ラムダ、`case class` / ローカルクラス / 匿名クラス / メンバ `object` の本体でも同じ。詳細は「テンプレート本体の式文」節
@@ -85,7 +85,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - for-comprehension（`map` / `flatMap` / `foreach` / `withFilter` へデシュガー。私有ランタイムでは `List.withFilter` は eager な `List`。`--scala-library` 時は `scala.collection.WithFilter[+A, +CC[_]]` で、`map[B]` は `CC[B]` を返す。`Option.withFilter` は `Option$WithFilter`）。値定義 `q = e` はラムダ本体の `val` になる ── **生成子ではない**ので、その前の生成子はやはり最内で `map` を取る。値定義の**後ろのガード**は nsc のタプル化が要るので診断する
 - apply / select / infix（`:` 終わりの演算子は右結合で、レシーバは右オペランド。`1 :: Nil` → `Nil.::(1)`）。代入 `xs(i) = v` は nsc どおり `xs.update(i, v)`。代入でない `c(1)` で `apply` が無ければ診断する（黙って `update` にしない）
 - リテラル、タプル
-- 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）。infix 型 `A Either B` は `Either[A, B]`。`Map[K, V]` の applied 構文はそのまま。**高階型** `trait Functor[F[_]]` / `class Box[F[_], A](val fa: F[A])`。具象は `Id[_]` など。kind 不一致（`F[_]` を proper 位置で使う、proper 型を型コンストラクタとして使う）は診断する（黙って捨てない）。**高階型メンバー** `trait M { type F[_] }` とパス依存適用 `m.F[Int]`。具象は subclass で `type F[X] = Id[X]`（または `List[X]`）。メンバーの kind 不一致（`type F[_]` を `type F = Int` で束縛、逆も）は診断する。**refinement の高階型メンバー** `M { type F[X] = Id[X] }` と適用。**HK 境界** `type F[_] <: Bound`（proper な境界。`type F[_] <: List` は nsc どおり `takes type parameters`）。**refinement の境界** `{ type A <: Int }`。クラス / トレイトの nullary `type A <: T` は未実装のまま診断する。**入れ子型射影** `Outer#Inner#X` / `Holder#Inner#T`。違法な `Int#X` と抽象 `B#U#T`（メンバー無し）は nsc どおり `is not a member`
+- 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）。infix 型 `A Either B` は `Either[A, B]`。`Map[K, V]` の applied 構文はそのまま。**高階型** `trait Functor[F[_]]` / `class Box[F[_], A](val fa: F[A])`。具象は `Id[_]` など。kind 不一致（`F[_]` を proper 位置で使う、proper 型を型コンストラクタとして使う）は診断する（黙って捨てない）。**高階型メンバー** `trait M { type F[_] }` とパス依存適用 `m.F[Int]`。具象は subclass で `type F[X] = Id[X]`（または `List[X]`）。メンバーの kind 不一致（`type F[_]` を `type F = Int` で束縛、逆も）は診断する。**refinement の高階型メンバー** `M { type F[X] = Id[X] }` と適用。**HK 境界** `type F[_] <: Bound`（proper な境界。`type F[_] <: List` は nsc どおり `takes type parameters`）。**refinement の境界** `{ type A <: Int }`。クラス / トレイトの nullary `type A <: T` は未実装のまま診断する。**入れ子型射影** `Outer#Inner#X` / `Holder#Inner#T`。違法な `Int#X` と抽象 `B#U#T`（メンバー無し）は nsc どおり `is not a member`。**射影のメンバーは前置型から読み直す**: `A#B` の `B` が `A` の祖先の入れ子クラスなら、`B` のメンバーの型に出てくる抽象型メンバーは `A` が与えた定義で読む（`Sub#Ctx` の `def session: S` は `type S = Sess` を持つ `Sub` 越しに `Sess`）。読み直しは as-seen-from であって制約ではないので、`A#B` は部分型としても表示としても素の `B`（`agent/proj`）
 - 2.13 の early field defs: `class C extends { val x = 1 } with T`。`x` は親 ctor / trait `$init$` の前にフィールドへ書く（nsc と同じ）。具象フィールド以外（`def` / 文 / 抽象 val）は nsc どおり `only concrete field definitions allowed in early object initialization section`。early 内の `this` は `this can be used only in a class, object, or template`
 - SIP-23 定数型のサブセット: `val x: 1 = 1`、`def f(x: 1): Int`。式のリテラルは定数型（`1 <: Int`）。不一致 `val y: 1 = 2` は type mismatch。classfile の pickle は nsc `CONSTANTtpe` + `LITERALint`（scalac 2.13.16 が `-cp` で `def f(x: 1)` / `val one: 1` を typecheck できる）
 - `scala.Dynamic`: `d.foo` → `selectDynamic("foo")`、`d.foo(args)` → `applyDynamic("foo")(args)`、`d.foo = v` → `updateDynamic("foo")(v)`、`d.foo(a = x)` → `applyDynamicNamed("foo")(("a", x))`。`import scala.language.dynamics`（または `-language:dynamics`）が必要。`--scala-library` 時は jar の `scala/Dynamic` に対して実行する
@@ -4940,6 +4940,25 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 （`mism13_lib_without_library_is_error` と 2 つの「広げすぎない」ガード）は
 before/after どちらでも通る性質のものです。
 
+`pj_projmember.scala` / `pj_pkgscope.scala` は `crates/cli/tests/proj.rs` から
+**両モード**（`--scala-library` / `--no-scala-library`）で `-Xverify:all` の下に
+走らせ、real scalac 2.13.16 の標準出力と突き合わせます。`pj_projmember` は
+型射影 `A#B` のメンバーを前置型で読み直すこと（選択・引数として渡すこと・
+親から継承した射影 `Sub#Deep`・エイリアス経由の同じクラス `Sub#S` と同一で
+あること）、`pj_pkgscope` は入れ子の `package p { package q { … } }` が両方を
+開くことを見ます。修飾付きの `package p.q` はファイル先頭にしか書けないので
+多ファイルが要り、`a_qualified_package_clause_does_not_open_its_parent` が
+一時ディレクトリに 5 本書き出して「`package pjq.sub` から見た `inner` は
+`pjq.inner` ではなくトップレベル」を確かめます（同じプログラムを実 scalac に
+も通す `scalac_agrees_…` 付き）。拒否テストは `pj_projmember_bad.scala`
+（`pj_projmember_bad_is_rejected`）で、前置型が何も決めていない `Base#Ctx`、
+`database` を持たないクラスに決まる `Alt#Ctx`、そもそも無いメンバーの 3 件。
+実 scalac 2.13.16 も同じ 3 件を拒否することを
+`scalac_agrees_pj_projmember_bad_is_rejected` で固定しています。8 本のうち
+4 本（`fixtures_pj_projmember` / `…_private` / `…_bad_is_rejected` /
+`a_qualified_package_clause_does_not_open_its_parent`）は**修正前の `main` で
+落ちること**を確認済みです。
+
 `t2_lang.scala` / `t2_lib.scala` は `crates/cli/tests/tail2.rs` から回します
 （`t2_lang` は**両モード**、`t2_lib` は library モードのみ。私有ランタイムには
 `scala.math.Integral` が無いので、`t2_lib_without_library_is_error` で**黙って
@@ -9019,8 +9038,12 @@ witness の無い `TC[Crate]` は
   解決しなくなって差し引き +1 件になったので、今回は戻しました。
   規則自体は正しいので、緩い読みに寄りかかっている別の箇所と一緒に
   ほどく必要があります。
+  → `agent/proj` で解決（「型射影 `A#B` のメンバ再読み込みと、`package` 句が
+  開くもの」節）。寄りかかっていたのは**デフォルト引数の右辺が呼び出し側の
+  スコープで型付けされること**でした。
 - tail4 が残した `value database is not a member of BasicBackend.Session`
   （型射影のメンバ再読み込み）も手つかず。
+  → `agent/proj` で解決。tail4 の診断は当たっていました。
 - cats の `>>`（`no matching overload for (=> F[B])(FlatMap[F])F[B]`）3 件は
   before/after とも 3 件。`Async` / `Deferred` が潰れていたせいではなく、
   `decrementDepth >> releaseIfUnpinned >> …` の左辺が `Any` / `AnyRef` に
@@ -9396,6 +9419,185 @@ prelude には無く、`warm_pickled_implicits` が pickle から供給します
   スタブで、`apply` / `contains` は jar の pickle 頼みです。
 * cats の `>>`（`BasicBackend.scala:329` / `432` / `434`、3 件）と
   `DBIOAction.scala` の `<:<` を `Function1` として渡す 3 件は未調査です。
+### 型射影 `A#B` のメンバ再読み込みと、`package` 句が開くもの（`agent/proj`）
+
+テストは `crates/cli/tests/proj.rs`、fixture 接頭辞は `pj` です。
+
+計測は `files=184 errors=134 files_with_errors=48` →
+**`files=184 errors=129 files_with_errors=48`**（−5 件）。
+`tests/slick_subset.sh`（着手時 `38 files / 204 classes / verified=204
+failed=0`）は**回していません**: このスライスは typer 側で、backend の変更は
+`pickle.rs` の 1 箇所（射影の as-seen-from ビューを素の親として書く）だけです。
+subset の検証は `Class.forName(initialize=false)` によるバイトコード検証で、
+`ScalaSignature` を読まないので、pickle の変更を検出できません。代わりに
+下の「検証」のとおり `jarpickle` / `e2e` / `multifile` を回し、classfile の
+バイト差分で pickle 側の効果を直接見ています。
+
+`agent/tail4` の診断（「`HeapBackend#BasicActionContext` の `session` を射影先の
+prefix で読み直せていない」）は**当たっていました**。`agent/cats2` の診断
+（「`value effect is not a member of <notype>` の根は `expose_unqualified` が
+囲いパッケージを owner チェーンで全部辿ること」）も**当たっていました**。
+外れていたのは「その規則を入れると `slick.ControlsConfig` が解決しなくなる」の
+**理由**の方で、パッケージ解決の話ではありませんでした（下の 2 を参照）。
+
+#### 1. `A#B` は前置型を落としていた
+
+`project_from_prefix`（`crates/typer/src/check.rs`）は射影に素の
+`Type::Class` で答えます。`Type::Class` に前置型を書く場所はないので、
+`A#B` を作った瞬間に「`A` 越しに見ている」という事実が消え、あとの選択は
+**`B` の owner の宣言**でメンバーを読みます。slick の
+
+```scala
+def run(ctx: HeapBackend#BasicActionContext): R = f(ctx.session)
+```
+
+で `session: Session` を宣言しているのは `BasicBackend` で、そこでは
+`type Session >: Null <: BasicSessionDef` は抽象です。`type Session =
+HeapSessionDef` と言っているのは `HeapBackend` の方なので、結果は
+`value database is not a member of BasicBackend.Session` でした。
+
+直しは、射影が**前置型の決めたぶんだけ**を型だけの refinement として
+持ち歩くこと（`Checker::projected_class_type` /
+`projection_refinements`）。`B` の**字句上の**囲いクラス（とその祖先）が
+抽象のままにしている型メンバーの名前を集め、前置型のクラスがそれに具体的な
+定義を与えていれば `type S = Sess` として貼ります。メンバーの読み出しは
+`expand_in_type` / `subst_as_seen_from` が refinement を既に読むので、
+これで `ctx.session` は `Sess` になります。
+
+**ただし refinement は制約でもあります。** 最初の版はそのまま貼ったので、
+`type Session = JdbcSessionDef` というエイリアス経由で得た素の
+`JdbcSessionDef` を `JdbcBackend#JdbcSessionDef` の引数に渡す
+—— slick が至るところでやっていること —— が通らなくなり、
+`JdbcActionComponent` / `JdbcProfile` / `StreamingInvokerAction` に
+**新規 8 件**（`no matching overload for (JdbcSessionDef { type Database[_]
+= …; type Session = … })R with arguments (JdbcSessionDef)`）が出ました。
+134 → 138 です。
+
+そこで refinement に `symbol::AS_SEEN_FROM_MARK`（`<asSeenFrom>`。Scala の
+識別子にはなり得ない名前）という decl を 1 つ足して**印**とし、
+`SymbolTable::is_sub_type` と `display_type` はその印のある refinement を
+素の親として読むようにしました。as-seen-from は「どう見えるか」であって
+「何を要求するか」ではない、という区別をそのまま置いたものです。型だけの
+refinement は erasure が親へ落とすので、classfile 側は素の `B` のままです。
+pickle も同じで、`backend/src/pickle.rs` は印のある refinement を素の親として
+書きます（`<asSeenFrom>` という名前をシグネチャに出さないため）。
+`A#B#C` は印を剥がして親から射影し直し、決まったぶんを持ち越します。
+
+#### 2. `package p.q` は `p` を開かない
+
+`expose_unqualified` は未解決の名前を **owner チェーンを遡って**探して
+いました。nsc はそうしません（2.13.16 で実測、`-Xsource:3` の有無に
+無関係）:
+
+| 書き方 | `p` のクラス | `p` のサブパッケージ |
+|---|---|---|
+| `package p.q`（修飾付き） | 見えない | 見えない |
+| `package p { package q { … } }`（入れ子） | 見える | 見える（トップレベルの同名を隠す） |
+
+slick は自前の `slick.cats` パッケージを持っているので、緩い読みでは
+`package slick.*` のすべてのファイルから `cats` が `slick.cats` に解決され、
+`slick/dbio/DBIOAction.scala` の `cats.effect.IO` が
+`value effect is not a member of <notype>` になっていました（2 件）。
+
+`Checker::open_packages` は、いま型付けているファイルの `package` 句が
+開いたパッケージ（namer が `PackageDef` ごとに 1 つ記録します）を内側から
+順に返し、**最後にルート**を返します。ルートを walk に残すのが要点です:
+`package slick.jdbc` からの修飾参照 `slick.ControlsConfig` の頭の `slick` は
+ルートのメンバーとして解決します。`agent/cats2` はここでルートも一緒に
+落としてしまい、差し引き +1 になっていました。
+
+##### 残した最終フォールバックと、その本当の理由
+
+正しい規則だけにすると `slick/jdbc/DatabaseConfig.scala` で
+`not found: value ControlsConfig` が出ます。原因を
+`not_found_error` に仕掛けたトラップのバックトレースで押さえました:
+
+```
+Typer::not_found_error ← type_expr ← type_apply_in ← type_apply
+  ← type_expr ← fill_defaults_and_implicits ← type_apply_in ← …
+```
+
+**デフォルト引数の右辺が、呼び出し側のスコープで型付けされています。**
+`default_getter_apply` が `f$default$n` ゲッターを見つけられないとき、
+`fill_defaults_and_implicits`（`type_default_rhs_here` 経由）も名前付き引数の
+経路も、保存してある**未型付けの木**をそのまま引数に差し込み、それが呼び出し
+場所で型付けされます。`slick/basic/DatabaseConfig.scala` は
+`import slick.{ControlsConfig, SlickException}` と
+`classLoader: ClassLoader = ClassLoaderUtil.defaultClassLoader` を書いていて、
+`package slick.jdbc` の呼び出し側はその import を持っていません。緩い
+パッケージ walk がそれを覆い隠していただけです（同じ穴は修正前の `main` でも
+`not found: value ClassLoaderUtil` として顔を出しています）。
+
+そこで、正しい規則を先に走らせ、**何も見つからなかったときだけ**開いていない
+中間パッケージを見る `expose_from_unopened_packages` を残しました。解決できて
+いたものは全部解決できたまま、変わるのは**優先順位**だけ —— そして優先順位が
+まさに `slick.cats` 問題の中身でした。デフォルト引数がつねに自分のゲッターの
+呼び出しになるか、書かれたスコープで型付けされるようになったら、この
+フォールバックは消せます（コメントにもそう書いてあります）。
+
+#### 検証
+
+`pj_projmember.scala` / `pj_pkgscope.scala` は `--scala-library` と
+`--no-scala-library` の両方で `-Xverify:all` を通し、real scalac 2.13.16 の
+標準出力と一致します。修飾付きパッケージ句は多ファイルが要るので
+`a_qualified_package_clause_does_not_open_its_parent` が 5 本書き出して確かめ、
+同じプログラムを実 scalac にも通します。`pj_projmember_bad.scala` は 3 件を
+拒否し、nsc 2.13.16 も同じ 3 件を出します。8 本のうち 4 本は**修正前の `main`
+で落ちる**ことを確認済みです。パッケージ解決と型射影という継ぎ目に触れたので
+`--release` で `proj` / `cats2` / `tail4` / `tmember` / `conform` / `e2e` /
+`pkgalias` / `imports` / `multifile` / `jarpickle` を回しました。
+`cargo clippy --workspace --all-targets` は前後とも 78 件で新規ゼロです。
+
+`pickle.rs` の 1 行は、`pj_projmember.scala` を有り／無しでコンパイルして
+`Main.class` / `Main$.class` の**バイトが変わる**ことで効いていることを
+確認しました（`def db(ctx: Sub#Ctx)` の引数型が、無しでは
+`<refinement>` を被った `REFINEDTPE` になります）。scalac に読み直させる
+黒箱テストは書けません —— **入れ子クラスの owner を空パッケージとして
+pickle している**別の穴があり、射影と無関係な
+`object Holder { class Inner(val n: Int) }` +
+`object Api { def take(i: Holder.Inner) }` を書き出して scalac に `-cp` で
+読ませるだけで `Symbol 'type <empty>.Inner' is missing from the classpath` /
+`type Inner is not a member of object Holder` になります（下の残件）。
+
+#### 既知の残件
+
+* `cats.effect.IO` が見えるようになった結果、`DBIOAction.scala:237` の
+  `cats.effect.IO(fa)` が `no matching overload for IO$ with arguments
+  (Future[R])` になります（2 件が 1 件に変わっただけで、正味 −1）。`IO$` の
+  `apply[A](thunk: => A): IO[A]` を jar の pickle から供給できていない別の穴で、
+  `agent/cats2` が `Async$` について直したのと同じ族です。
+* cats の `>>`（`no matching overload for (=> F[B])(FlatMap[F])F[B]`）3 件は
+  before/after とも 3 件で、**型射影とは無関係**でした（`agent/cats2` の記録が
+  正しい）。左辺が `Any` / `AnyRef` に落ちる別の原因です。
+* `value map is not a member of Any` 3 件は手つかずです。射影ともパッケージとも
+  無関係で、3 つとも根が違います。1 つだけ根を特定しました:
+  `DatabaseUrlDataSource.scala:31` の `findFirstMatchIn(url).map(…)` は
+  **`prelude_regex.rs` が `("findFirstMatchIn", vec![Type::String], Type::Any)`
+  と宣言している**のがそのままです。6 行で再現します
+  （`val re = "a(b)c".r; re.findFirstMatchIn("abc").map(_ => "")`）。直すなら
+  `Option[Regex.Match]` にするだけでなく、パラメータも実 ABI どおり
+  `CharSequence` にする必要があります（同ファイルの `unapplySeq` のコメント
+  参照。いまの `String` のままだと descriptor が合わずリンクしません）。
+  残る 2 件は `RewriteJoins.scala:139` の `foundRefs.filter(…)` と
+  `JdbcActionComponent.scala:162` の `prit` で、根は追っていません。
+* デフォルト引数の右辺が呼び出し側で型付けされる件（上の 2）は根の特定まで。
+  直せば `expose_from_unopened_packages` と、修正前から出ている
+  `not found: value ClassLoaderUtil` の両方が消えるはずです。
+* 射影が持ち歩けるのは**抽象型メンバー**だけです。ジェネリックな外側
+  （`C[Int]#Inner` の `T` → `Int`）は `RefineDecl` が名前で照合する仕組みの
+  都合で持ち歩けません。slick には現れません。
+* 前置型が jar 由来のクラスのとき、その型メンバーは要求されるまで読まれない
+  ので、決められるはずのものを取りこぼすことがあります（slick の該当箇所は
+  すべてソース側です）。
+* **入れ子クラスを pickle するとき owner が空パッケージになります**（新規に
+  見つけた別の穴、このスライスの変更とは無関係）。2 行で再現します:
+  `object Holder { class Inner(val n: Int) }` /
+  `object Api { def take(i: Holder.Inner): Int = i.n }` を scala-rs で
+  コンパイルし、その classfile を `-cp` に置いて scalac に
+  `Api.take` を呼ばせると `type Inner is not a member of object Holder` と
+  `Symbol 'type <empty>.Inner' is missing from the classpath` が出ます。
+  `--scala-library` モードのみ確認。scala-rs 同士では `-cp` 経由でも通るので、
+  実害は「scalac に読ませたとき」に限られます。
 
 ## ライセンス
 
