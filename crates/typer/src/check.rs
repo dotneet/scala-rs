@@ -13062,6 +13062,13 @@ impl Typer {
         if undet.is_empty() {
             return rest_tys;
         }
+        // `undet_solution` searches under an immutable borrow and cannot load
+        // a companion itself. Without this the search for `LazyZip2.map`'s
+        // `BuildFrom[C1, B, C]` ran against a scope that did not yet hold
+        // `BuildFrom`'s companion at all.
+        for t in rest_tys.clone() {
+            self.warm_implicit_scope(&t);
+        }
         let Some(sol) = self.undet_solution(&rest_tys, &undet) else {
             return rest_tys;
         };
@@ -13261,16 +13268,15 @@ impl Typer {
                 t.clone()
             }
         };
-        let mut tree = Tree {
-            id: scala_rs_parser::NodeId(0),
-            span,
-            kind: TreeKind::Ident {
-                name: self.st.get(id).name.clone(),
-            },
-            ty: inst(&ret),
-            sym: id,
-            postfix: false,
-        };
+        // Through `ref_implicit`, not as a bare `Ident`: a witness declared by
+        // a trait its companion object only *mixes in* has to be named through
+        // that object. `BuildFrom.buildFromSortedSetOps` is declared in
+        // `BuildFromLowPriority1` and takes an `Ordering`, which is exactly
+        // the case this branch handles -- emitted bare, codegen loaded `this`
+        // and cast it: `class Main$ cannot be cast to class
+        // BuildFromLowPriority1` from a program that type-checked.
+        let mut tree = self.ref_implicit(id, span);
+        tree.ty = inst(&ret);
         for clause in &paramss {
             let mut cargs = Vec::with_capacity(clause.len());
             for p in clause {
@@ -17839,6 +17845,22 @@ impl Typer {
     /// Only for Scala class files: a *Java* class's `Foo$` is a nested class,
     /// not a companion, and installing it would enter a class called `Foo$` in
     /// the package.
+    ///
+    /// `scala.*` is *not* excluded, though the prelude is what describes the
+    /// standard library. The prelude describes what programs *name*, and
+    /// nothing ever names an implicit -- it is found by searching a scope. So
+    /// a library companion the prelude never declared held no witnesses at
+    /// all. `scala.collection.BuildFrom` is one, and `buildFromIterableOps` is
+    /// the only witness `LazyZip2.map` can use: unless the program happened to
+    /// *import* `BuildFrom` by name, it was in no scope, which is what made a
+    /// fully applied `implicitly[BuildFrom[…]]` work while
+    /// `xs.lazyZip(ys).map(f)` did not.
+    ///
+    /// Nothing a hand-written declaration owns is replaced: a class that
+    /// already has a companion returns at the check above, a companion already
+    /// entered under that JVM name is left alone, and for `scala.*` only the
+    /// implicits are installed -- everything else keeps coming from the pickle
+    /// on demand, exactly as it did when the companion was an empty stub.
     fn load_companion_module(&mut self, class_id: SymbolId) {
         if class_id.is_none() || self.st.get(class_id).kind != SymKind::Class {
             return;
@@ -17856,11 +17878,26 @@ impl Typer {
             || internal.starts_with('[')
             || internal.starts_with("java/")
             || internal.starts_with("javax/")
-            || internal.starts_with("scala/")
         {
             return;
         }
+        // A *nested* `scala.*` object is not this pass's business. Its class
+        // file has no `ScalaSignature` of its own (a trait's nested object is
+        // pickled inside the enclosing trait), and `materialize::ensure_tag_module`
+        // hand-builds `TypeTags#TypeTag$` -- taking the presence of a symbol
+        // under that JVM name as the record that it already did. Entering the
+        // bare class file first made it stand down, and `typeOf[T]`'s
+        // `TypeTag.apply(mirror, creator)` had no `apply` to resolve to
+        // (slick's `ShapedValue` / `TableQuery` macros).
+        let simple = internal.rsplit('/').next().unwrap_or("");
+        if internal.starts_with("scala/") && simple.contains('$') {
+            return;
+        }
         let module = format!("{internal}$");
+        // Already there under that JVM name; never enter a second copy.
+        if crate::classpath::find_by_jvm(&self.st, &module).is_some() {
+            return;
+        }
         if !self.completed_java.insert(module.clone()) {
             return;
         }
@@ -17876,10 +17913,41 @@ impl Typer {
         let pkg = internal.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
         let owner = crate::classpath::ensure_package(&mut self.st, pkg);
         let mid = crate::classpath::install_java_class_in(&mut self.st, &jc, owner);
+        // SLS 7.2 names the companion *object*, whose members include the ones
+        // it inherits, and 2.13 puts the low-priority half of an implicit set
+        // in traits the object mixes in:
+        // `object BuildFrom extends BuildFromLowPriority1 extends
+        // BuildFromLowPriority2`, and `buildFromIterableOps` -- the only
+        // witness a plain `List` receiver has -- is declared in the *last* of
+        // those. Loading only the object left it invisible.
+        self.complete_java_parents(mid, Span::new(0, 0));
         // Deliberately *not* `adopt_binary_class`: only the implicits are
         // wanted here, and adopting the whole companion costs minutes.
-        self.pickle
-            .supply_implicit_members(&mut self.st, &mut self.binary, mid);
+        // For a standard-library companion the *pickle* is the authority, and
+        // the ordinary on-demand path reads it a name at a time. The members
+        // the classfile reader just entered carry erased signatures and would
+        // sit next to the pickled ones as bogus overloads -- `Option$` gained
+        // a second `apply` and `Option(2)` became `ambiguous overload`. Before
+        // this pass existed, `scala.*` companions reached the typer as an
+        // empty stub and got everything from the pickle; keep it that way and
+        // only add what a stub cannot have: the implicits, below.
+        if internal.starts_with("scala/") {
+            self.st.get_mut(mid).members.clear();
+        }
+        let mut work = vec![mid];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = work.pop() {
+            if id.is_none() || !seen.insert(id.0) {
+                continue;
+            }
+            self.pickle
+                .supply_implicit_members(&mut self.st, &mut self.binary, id);
+            for p in self.st.get(id).parents.clone() {
+                if let Some(ps) = self.st.class_sym_of(&p) {
+                    work.push(ps);
+                }
+            }
+        }
     }
 
     /// Apply the implicit clauses of an implicit conversion that has any.

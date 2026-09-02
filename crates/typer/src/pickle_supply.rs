@@ -412,12 +412,16 @@ impl PickleSupply {
         if class_sym.is_none() || !st.get(class_sym).is_class_like() {
             return 0;
         }
+        // `scala.*` is not excluded. The only caller is
+        // `Typer::load_companion_module`, which reaches here solely for a
+        // companion object it has *just installed itself* -- a class the
+        // prelude gave no companion at all -- so there is no hand-written
+        // declaration here to protect. Without it a library companion the
+        // prelude never names (`scala.collection.BuildFrom`) keeps the plain
+        // classfile members the reader entered, which carry no `implicit`
+        // flag, and its witnesses are in no implicit scope.
         let internal = st.get(class_sym).jvm_name.clone();
-        if internal.is_empty()
-            || internal.starts_with("scala/")
-            || internal.starts_with("java/")
-            || internal.starts_with("javax/")
-        {
+        if internal.is_empty() || internal.starts_with("java/") || internal.starts_with("javax/") {
             return 0;
         }
         if !self.implicits_supplied.insert(class_sym.0) {
@@ -465,7 +469,16 @@ impl PickleSupply {
             if installed.is_empty() {
                 continue;
             }
-            st.get_mut(class_sym).members.retain(|m| !stale.contains(m));
+            // Never drop a member `complete_named` itself reported back.
+            // Completion caches the names it has already served, and when the
+            // answer is a member the *pickle* installed earlier (an
+            // `adopt_binary_class` of the same class), that member is both in
+            // `stale` and in `installed`: removing it deleted the very
+            // signature this call went to fetch, leaving the class with no
+            // member of that name at all.
+            st.get_mut(class_sym)
+                .members
+                .retain(|m| !stale.contains(m) || installed.contains(m));
             n += installed.len();
         }
         trace(format_args!("{full}: supplied {n} implicit member(s)"));

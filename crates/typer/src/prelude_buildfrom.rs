@@ -277,8 +277,8 @@ fn add_to_factory(st: &mut SymbolTable) {
         // `CC[A]`, so the class file's signature is `<A, CC> Factory<A, CC>`:
         // `xs.to(ArrayBuffer)` solved `C1 = ArrayBuffer` (the bare type
         // constructor) instead of `ArrayBuffer[Int]`. It is also not marked
-        // `implicit` — that lives only in the Scala pickle, which
-        // `PickleSupply::supply_implicit_members` skips for `scala/` classes.
+        // `implicit` — that lives only in the Scala pickle, and this pass runs
+        // before anything reads one.
         let keep: Vec<SymbolId> = st
             .get(owner)
             .members

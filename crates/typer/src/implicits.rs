@@ -536,7 +536,7 @@ impl Typer {
                 .implicit_result_conforms(ret, pt)
                 .then(ImplicitFit::default);
         }
-        let mut u = Unify::new(self, tps.iter().copied().chain(undet.iter().copied()));
+        let mut u = Unify::new(self, tps.iter().copied(), undet.iter().copied());
         if !u.unify(ret, pt) {
             // Fall back to the one-sided guess. It cannot solve `undet`, so a
             // call whose type parameters only the witness can pin down fails
@@ -556,23 +556,145 @@ impl Typer {
         let mut targs = Vec::with_capacity(tps.len());
         for tp in &tps {
             match u.solved(*tp) {
-                Some(t) => targs.push(t),
+                Some(t) => targs.push(self.simplify_solved(&t)),
                 // Not pinned down by the result type; the one-sided guess is
                 // the last chance before the candidate is dropped.
                 None => targs.push(crate::check::unify_one(*tp, ret, pt)?),
             }
         }
+        // A solution read off a higher-kinded position is an `Applied` whose
+        // constructor is now a class (`CC[A]` with `CC := List`); nothing
+        // downstream prints or erases that as `List[String]`.
         let undet_out: Vec<(SymbolId, Type)> = undet
             .iter()
-            .filter_map(|d| u.solved(*d).map(|t| (*d, t)))
+            .filter_map(|d| u.solved(*d).map(|t| (*d, self.simplify_solved(&t))))
             .collect();
-        let inst = crate::symbol::subst_tparams_slice(&tps, &targs, ret);
+        if !self.candidate_bounds_hold(&tps, &targs) {
+            return None;
+        }
+        let inst = self.simplify_solved(&crate::symbol::subst_tparams_slice(&tps, &targs, ret));
         let want = self.subst_undet(pt, &undet_out);
         self.implicit_result_conforms(&inst, &want)
             .then_some(ImplicitFit {
                 targs,
                 undet: undet_out,
             })
+    }
+
+    /// nsc checks a candidate's own type parameter bounds before deciding it
+    /// applies (`Infer#checkBounds`), and among the `BuildFrom` witnesses that
+    /// check is sometimes the *only* thing telling two of them apart.
+    /// `object BuildFrom` declares
+    ///
+    /// ```text
+    /// implicit def buildFromBitSet[C <: BitSet with BitSetOps[C]]: BuildFrom[C, Int, C]
+    /// ```
+    ///
+    /// whose result type is a bare `C` on both sides. Left unchecked it
+    /// answered `BuildFrom[List[Int], Int, ?]` -- it is declared in the
+    /// companion itself, so it beats `buildFromIterableOps` on origin -- and
+    /// `List(1, 2).lazyZip(…).map(_ + _)` type-checked and then died with
+    /// `class ::$ cannot be cast to class scala.collection.BitSet`.
+    ///
+    /// Only a *first-order* parameter is checked here. A higher-kinded one
+    /// arrives with its bound already folded into the type
+    /// (`buildFromSortedSetOps` is
+    /// `BuildFrom[CC[A0] with SortedSet[A0], A, CC[A] with SortedSet[A]]`),
+    /// where the unifier enforces it directly; re-deriving that from
+    /// `CC`'s own F-bounded, higher-kinded `bound_hi` would only risk
+    /// dropping a candidate nsc accepts.
+    ///
+    /// The test is deliberately the permissive one -- conformance, or failing
+    /// that merely having the bound's class among the solution's base classes.
+    /// Rejecting less than nsc leaves an existing diagnostic in place;
+    /// rejecting more turns working code into an error.
+    fn candidate_bounds_hold(&self, tps: &[SymbolId], targs: &[Type]) -> bool {
+        if tps.len() != targs.len() {
+            return true;
+        }
+        for (tp, targ) in tps.iter().zip(targs) {
+            if !self.st.get(*tp).tparams.is_empty() {
+                continue;
+            }
+            let Some(hi) = self.st.get(*tp).bound_hi.clone() else {
+                continue;
+            };
+            if targ.is_no_type() || targ.is_error() || matches!(targ, Type::TypeParam(_)) {
+                continue;
+            }
+            let hi = crate::symbol::subst_tparams_slice(tps, targs, &hi);
+            let parents: Vec<Type> = match &hi {
+                Type::Refined { parents, .. } => parents.clone(),
+                other => vec![other.clone()],
+            };
+            for parent in &parents {
+                if self.st.is_sub_type(targ, parent) {
+                    continue;
+                }
+                let Some(psym) = self.st.class_sym_of(parent) else {
+                    continue;
+                };
+                if self.st.class_sym_of(targ) == Some(psym) {
+                    continue;
+                }
+                if self.base_type_instance(targ, psym, 0).is_none() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// A solved type, tidied.
+    ///
+    /// Two things need it, both introduced by matching at a higher kind. An
+    /// `Applied` whose constructor is now a class is collapsed (`CC[A]` with
+    /// `CC := List` is `List[String]`; nothing downstream prints or erases the
+    /// open form). And an intersection whose parents form a subtype chain
+    /// becomes its most specific member: the F-bound reaches the typer folded
+    /// into the type, so `buildFromSortedSetOps` answers a `TreeSet` receiver
+    /// with `CC[A] with SortedSet[A]` = `TreeSet[Int] with SortedSet[Int]`,
+    /// where nsc infers plain `TreeSet[Int]`.
+    fn simplify_solved(&self, ty: &Type) -> Type {
+        self.collapse_refinements(&fold_applied(ty))
+    }
+
+    fn collapse_refinements(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Refined { parents, decls } if decls.is_empty() && !parents.is_empty() => {
+                let parents: Vec<Type> = parents
+                    .iter()
+                    .map(|p| self.collapse_refinements(p))
+                    .collect();
+                let mut keep: Vec<Type> = Vec::new();
+                for p in &parents {
+                    // Dropped when another parent is strictly below it, and
+                    // when an equal one is already kept.
+                    let redundant = parents
+                        .iter()
+                        .any(|q| q != p && self.st.is_sub_type(q, p) && !self.st.is_sub_type(p, q));
+                    if redundant || keep.contains(p) {
+                        continue;
+                    }
+                    keep.push(p.clone());
+                }
+                match keep.len() {
+                    1 => keep.remove(0),
+                    _ => Type::Refined {
+                        parents: keep,
+                        decls: decls.clone(),
+                    },
+                }
+            }
+            Type::Class { sym, args } => Type::Class {
+                sym: *sym,
+                args: args.iter().map(|a| self.collapse_refinements(a)).collect(),
+            },
+            Type::Tuple(ts) => {
+                Type::Tuple(ts.iter().map(|t| self.collapse_refinements(t)).collect())
+            }
+            other => other.clone(),
+        }
     }
 
     /// ClassTag is invariant. Covariant `is_sub_type` would let
@@ -779,7 +901,7 @@ impl Typer {
             if !self.conv_implicits_resolve(id, from) {
                 continue;
             }
-            let mut u = Unify::new(self, undet.iter().copied());
+            let mut u = Unify::new(self, std::iter::empty(), undet.iter().copied());
             if !u.unify(&res, ret) {
                 continue;
             }
@@ -972,7 +1094,7 @@ impl Typer {
             .zip(solved_from_arg.iter())
             .filter_map(|(tp, t)| t.is_none().then_some(*tp))
             .collect();
-        let mut u = Unify::new(self, rest.iter().copied().chain(open.iter().copied()));
+        let mut u = Unify::new(self, rest.iter().copied(), open.iter().copied());
         if !u.unify(&ret_k, to) {
             return None;
         }
@@ -1680,16 +1802,43 @@ impl Typer {
 struct Unify<'a> {
     typer: &'a Typer,
     unknowns: std::collections::HashSet<u32>,
+    /// The subset of `unknowns` allowed to stand for a *type constructor*.
+    ///
+    /// Only the candidate's own parameters are: solving
+    /// `buildFromIterableOps[CC[X], A0, A]` means reading `CC := List` off the
+    /// wanted type, which is the whole point. A *call site's* undetermined
+    /// constructor is not -- it is what ordinary inference from the argument
+    /// settles. Letting a conversion bind it made
+    /// `firstLength[A, M[+X] <: Iterable[X]](in: M[A])` accept
+    /// `IterableOnce.iterableOnceExtensionMethods` as a way to reach `M[A]`
+    /// from a `List[Int]` that already conformed with `M := List`
+    /// (`tests/fixtures/mism12_lib.scala`, a `ClassCastException` at run time).
+    ctor_unknowns: std::collections::HashSet<u32>,
     bound: std::collections::HashMap<u32, Type>,
 }
 
 impl<'a> Unify<'a> {
-    fn new(typer: &'a Typer, unknowns: impl IntoIterator<Item = SymbolId>) -> Self {
+    /// `own` are the candidate's own type parameters, `undet` the call site's.
+    fn new(
+        typer: &'a Typer,
+        own: impl IntoIterator<Item = SymbolId>,
+        undet: impl IntoIterator<Item = SymbolId>,
+    ) -> Self {
+        let ctor_unknowns: std::collections::HashSet<u32> = own.into_iter().map(|s| s.0).collect();
+        let mut unknowns = ctor_unknowns.clone();
+        unknowns.extend(undet.into_iter().map(|s| s.0));
         Unify {
             typer,
-            unknowns: unknowns.into_iter().map(|s| s.0).collect(),
+            unknowns,
+            ctor_unknowns,
             bound: std::collections::HashMap::new(),
         }
+    }
+
+    /// Whether `ty` is an unknown this unification may solve to a type
+    /// *constructor*; see [`Unify::ctor_unknowns`].
+    fn unknown_ctor(&self, ty: &Type) -> bool {
+        matches!(ty, Type::TypeParam(id) if self.ctor_unknowns.contains(&id.0))
     }
 
     fn unknown_of(&self, ty: &Type) -> Option<u32> {
@@ -1739,6 +1888,57 @@ impl<'a> Unify<'a> {
         self.unify_at(a, b, 0)
     }
 
+    /// One side is an intersection (`CC[A0] with SortedSet[A0]`): every part
+    /// of it has to unify with the other side.
+    ///
+    /// `Some(_)` only when this shape applies. Two refinements on both sides
+    /// fall through to the structural equality at the end, as before.
+    fn unify_refinement(&mut self, a: &Type, b: &Type, depth: usize) -> Option<bool> {
+        let (parents, other) = match (a, b) {
+            (Type::Refined { parents, decls }, other) if decls.is_empty() => (parents, other),
+            (other, Type::Refined { parents, decls }) if decls.is_empty() => (parents, other),
+            _ => return None,
+        };
+        if matches!(other, Type::Refined { .. }) {
+            return None;
+        }
+        let parents = parents.clone();
+        let other = other.clone();
+        Some(!parents.is_empty() && parents.iter().all(|p| self.unify_at(p, &other, depth + 1)))
+    }
+
+    /// One side is `?F[X, …]` with `?F` an unknown constructor: match `?F`
+    /// against the other side's *constructor* and the arguments positionally.
+    ///
+    /// `Some(_)` only when this shape applies, so an ordinary pair falls
+    /// through to the structural cases.
+    fn unify_higher_kinded(&mut self, a: &Type, b: &Type, depth: usize) -> Option<bool> {
+        let (hk_ctor, hk_args, other) = match (a, b) {
+            (Type::Applied { ctor, args }, other) if self.unknown_ctor(ctor) => (ctor, args, other),
+            (other, Type::Applied { ctor, args }) if self.unknown_ctor(ctor) => (ctor, args, other),
+            _ => return None,
+        };
+        // Both sides `Applied` with the same arity is already the structural
+        // case below; leave it there so a bound constructor is followed.
+        if matches!(other, Type::Applied { .. }) {
+            return None;
+        }
+        let (octor, oargs) = as_application(other)?;
+        if oargs.len() != hk_args.len() {
+            return None;
+        }
+        let hk_ctor = (**hk_ctor).clone();
+        let hk_args = hk_args.clone();
+        let oargs = oargs.to_vec();
+        Some(
+            self.unify_at(&hk_ctor, &octor, depth + 1)
+                && hk_args
+                    .iter()
+                    .zip(oargs.iter())
+                    .all(|(x, y)| self.unify_at(x, y, depth + 1)),
+        )
+    }
+
     fn unify_at(&mut self, a: &Type, b: &Type, depth: usize) -> bool {
         if depth > 24 {
             return false;
@@ -1775,6 +1975,32 @@ impl<'a> Unify<'a> {
                 };
             }
             _ => {}
+        }
+        // An F-bounded higher-kinded parameter reaches the typer with its
+        // bound folded into the type: `buildFromSortedSetOps` is
+        // `BuildFrom[CC[A0] with SortedSet[A0], A, CC[A] with SortedSet[A]]`,
+        // and `buildFromMapOps` is `BuildFrom[CC[K0, V0] with Map[K0, V0], …]`.
+        // That intersection is what tells the `BuildFrom` witnesses apart --
+        // they are otherwise the same type -- so every part of it has to hold:
+        // a `List[Int]` matches `CC[A0]` but not `SortedSet[A0]`, a
+        // `TreeSet[Int]` matches both.
+        if let Some(r) = self.unify_refinement(a, b, depth) {
+            return r;
+        }
+        // An *unknown type constructor* applied to arguments, against a
+        // concrete application. `BuildFrom`'s only general witness is
+        // `buildFromIterableOps[CC[X] <: Iterable[X] with IterableOps[X, CC, _],
+        // A0, A]: BuildFrom[CC[A0], A, CC[A]]`, so fitting it to
+        // `BuildFrom[List[String], String, ?C]` means reading `CC := List` and
+        // `A0 := String` off the first argument -- and only then is `?C`
+        // solvable as `CC[A]`. Structurally an `Applied` never equalled a
+        // `Class`, so `xs.lazyZip(ys).map(f)` reported
+        // `could not find implicit value of type BuildFrom[…, C]`.
+        // One-sided `check::unify_one` already reads a constructor this way;
+        // this is the two-sided pass, which is the only one that also solves
+        // the call site's `?C`.
+        if let Some(r) = self.unify_higher_kinded(a, b, depth) {
+            return r;
         }
         match (a, b) {
             (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) => {
@@ -1884,6 +2110,7 @@ fn mentions_unknown(ty: &Type, unknowns: &std::collections::HashSet<u32>) -> boo
         Type::Function { params, ret } => {
             params.iter().any(|t| mentions_unknown(t, unknowns)) || mentions_unknown(ret, unknowns)
         }
+        Type::Refined { parents, .. } => parents.iter().any(|t| mentions_unknown(t, unknowns)),
         _ => false,
     }
 }
@@ -1902,6 +2129,10 @@ fn fold_applied(ty: &Type) -> Type {
         },
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(fold_applied).collect()),
         Type::Array(t) => Type::Array(Box::new(fold_applied(t))),
+        Type::Refined { parents, decls } => Type::Refined {
+            parents: parents.iter().map(fold_applied).collect(),
+            decls: decls.clone(),
+        },
         other => other.clone(),
     }
 }
@@ -1931,6 +2162,23 @@ fn unify_conv_tparam(tp: SymbolId, param: &Type, from: &Type) -> Option<Type> {
                 .zip(fa.iter())
                 .find_map(|(p, f)| unify_conv_tparam(tp, p, f))
         }
+        _ => None,
+    }
+}
+
+/// An applied type split into its constructor and arguments:
+/// `List[String]` -> (`List`, `[String]`). A type that is not an application
+/// is not one, so a higher-kinded unknown never binds to a proper type.
+fn as_application(ty: &Type) -> Option<(Type, &[Type])> {
+    match ty {
+        Type::Class { sym, args } if !args.is_empty() => Some((
+            Type::Class {
+                sym: *sym,
+                args: Vec::new(),
+            },
+            args,
+        )),
+        Type::Applied { ctor, args } if !args.is_empty() => Some(((**ctor).clone(), args)),
         _ => None,
     }
 }

@@ -143,6 +143,25 @@ const EDGES: &[(&str, &str, Args)] = &[
         "scala/collection/immutable/SortedMap",
         Args::Same,
     ),
+    // The *unqualified* sorted traits. `BuildFrom`'s witnesses name them --
+    // `buildFromSortedSetOps[CC[X] <: SortedSet[X] with SortedSetOps[X, CC, _]]`
+    // is `scala.collection.SortedSet` -- and without the edge a `TreeSet`
+    // was no `collection.SortedSet` at all: the *unsorted*
+    // `buildFromIterableOps` answered instead and built through
+    // `iterableFactory`, so `TreeSet(1,2).lazyZip(ys).map(f)` type-checked and
+    // then died with `class Set$Set3 cannot be cast to class TreeSet`.
+    // `val x: scala.collection.SortedSet[Int] = TreeSet(1)` was a
+    // `type mismatch` for the same reason.
+    (
+        "scala/collection/immutable/SortedSet",
+        "scala/collection/SortedSet",
+        Args::Same,
+    ),
+    (
+        "scala/collection/immutable/SortedMap",
+        "scala/collection/SortedMap",
+        Args::Same,
+    ),
     (
         "scala/collection/mutable/Set",
         "scala/collection/Set",
@@ -220,6 +239,9 @@ const LINKS: &[(&str, &str)] = &[
     ("scala/collection/IndexedSeq", "+"),
     ("scala/collection/Set", "="),
     ("scala/collection/Map", "=+"),
+    // Named by `BuildFrom`'s sorted witnesses; see the edges below.
+    ("scala/collection/SortedSet", "="),
+    ("scala/collection/SortedMap", "=+"),
     // The mutable spine. Mutable collections are invariant.
     ("scala/collection/mutable/Seq", "="),
     ("scala/collection/mutable/IndexedSeq", "="),

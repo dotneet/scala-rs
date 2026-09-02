@@ -457,7 +457,13 @@ nsc に寄せた探索順です。偽の「何でも変換」はありません�
 
 1. 現在のスコープと、囲んでいるクラス / object の `implicit` メンバー（親 class / trait から inherited したメンバーと、`import Foo._` で入れたメンバーを含む）
 2. 囲んでいるパッケージのパッケージオブジェクト（`package object p` の implicit メンバー）
-3. 目標型の部分（型コンストラクタ・型引数・ネストした prefix）と、その **基底クラス** のコンパニオン（`Option[T]` なら `Option`、`Outer.Inner` なら `Inner`、`A =:= B` なら `=:=` が継承している `<:<` のコンパニオン）。変換なら元の型の部分も見る
+3. 目標型の部分（型コンストラクタ・型引数・ネストした prefix）と、その **基底クラス** のコンパニオン（`Option[T]` なら `Option`、`Outer.Inner` なら `Inner`、`A =:= B` なら `=:=` が継承している `<:<` のコンパニオン）。変換なら元の型の部分も見る。コンパニオンが jar にしかないときは、探索の直前にその classfile を読み込んで
+   pickle から implicit だけを補います（**`scala.*` も含みます** — prelude が
+   describe するのはプログラムが名前で書くものだけで、`scala.collection.BuildFrom`
+   のように prelude がコンパニオンを与えていないクラスの witness は、
+   コンパニオンを入れない限りどのスコープにも現れません）。コンパニオンが
+   mixin したトレイトの宣言も同じように辿ります
+   （`object BuildFrom extends BuildFromLowPriority1 extends BuildFromLowPriority2`）
 
 呼び出し側で implicit パラメータ節を明示できます: `add(5)(3)` / `foo(x)(ev)`。探索で埋めるのは、その節が省略されたときだけです。
 
@@ -761,6 +767,22 @@ scala-rs には三つ目がありました。`adapt_implicit_apply` は何箇所
   `Flags::IMPLICIT` で判定します（`crates/typer/src/implicits.rs` の
   `first_clause_is_implicit`）。導出規則としての利用（`List(Some(2), None).sorted`）は
   そのまま通ります。
+- **高階の候補**。候補の型パラメータが**型構築子**のとき
+  （`buildFromIterableOps[CC[X] <: Iterable[X] with IterableOps[X, CC, _], A0, A]:
+  BuildFrom[CC[A0], A, CC[A]]`）、`CC[A0]` を `List[String]` に照合して
+  `CC := List` / `A0 := String` を読み、同じ束縛で `CC[A]` を答えます。
+  これで `LazyZip2.map[B, C](f)(implicit bf: BuildFrom[C1, B, C]): C` のように
+  **implicit 節にしか現れない** `C` が解けます
+  （「[`BuildFrom` の高階 implicit 照合](#buildfrom-の高階-implicit-照合lazyzipagentbuildfrom2)」）。
+  構築子に立てられるのは**候補自身の**型パラメータだけで、呼び出し側の未確定な
+  `M[_]` は引数からの通常の推論が決めます。
+- **候補自身の型パラメータ境界を検査します**（nsc `Infer#checkBounds`）。
+  `BuildFrom` の witness は境界以外は同じ型なので、これが唯一の区別です。
+  高階の境界は型に畳み込まれて届くので交差型の単一化がそれを担い
+  （`BuildFrom[CC[A0] with SortedSet[A0], …]`）、一階の F-bound
+  （`buildFromBitSet[C <: BitSet with BitSetOps[C]]`）は `bound_hi` を見ます。
+  検査するのは境界が名指す**クラス**が解の基底クラスにあるかどうかだけで、
+  引数の位置には触れません（nsc より緩い方向にだけ外します）。
 - 関数値の `apply` は関数そのものです。prelude の `FunctionN.apply` は消去された
   パラメータで宣言されているので、`f.apply(xs)` は `Any` になっていました（`f(xs)` は正しい）。
 - 可変長引数を持つ `case class` の `copy$default$n`（`this.cells`）は `T*` ではなく
@@ -3242,7 +3264,128 @@ slick: `errors 203 → 196`、`files_with_errors 60`（変わらず）。
   計測ログには**もう出ていません**。
 - `LazyZip2.map` の `BuildFrom` 高階照合（`toSeq` / `mkString is not a member of C`
   4 件 ＋ `could not find implicit value of type BuildFrom[…, C]` 4 件）は
-  そのままです。
+  次の節（`agent/buildfrom2`）で塞ぎました。
+
+### `BuildFrom` の高階 implicit 照合（`LazyZip2`、`agent/buildfrom2`）
+
+`agent/mismatch11` と `agent/tail2` が原因まで書いて未着手にしていた残件です。
+フィクスチャは `tests/fixtures/bf2_lazyzip.scala` / `bf2_lazyzip_bad.scala`、
+テストは `crates/cli/tests/buildfrom2.rs`。
+
+2.13 の `LazyZip2` は
+
+```scala
+class LazyZip2[+El1, +El2, C1] {
+  def map[B, C](f: (El1, El2) => B)(implicit bf: BuildFrom[C1, B, C]): C
+}
+```
+
+で、`C` は **implicit 節にしか現れません**。つまり結果型を決められるのは
+witness だけで、汎用の witness は 1 つしかありません。
+
+```scala
+implicit def buildFromIterableOps[CC[X] <: Iterable[X] with IterableOps[X, CC, _], A0, A]
+  : BuildFrom[CC[A0], A, CC[A]]
+```
+
+両者の間に 5 つ穴があり、**手前の穴が奥の穴を隠していました**。
+
+1. **`BuildFrom` のコンパニオンがシンボル表に無かった**。jar クラスの
+   コンパニオンを読む `load_companion_module` は `scala/` を一律に断って
+   いました。理由は「標準ライブラリを describe するのは prelude だ」ですが、
+   prelude が describe するのは**プログラムが名前で書くもの**で、implicit は
+   誰も名前を書きません（スコープを探して見つけるもの）。だから
+   `import scala.collection.BuildFrom` とたまたま書いたプログラム以外では、
+   `BuildFrom` の witness はどのスコープにも入っていませんでした。
+   手書きの宣言は何も置き換えません: すでにコンパニオンを持つクラスは先頭の
+   早期 return で素通りし、同じ JVM 名のコンパニオンが既に入っていれば二重に
+   入れず、`scala.*` については**入れるのは implicit だけ**で、それ以外は
+   これまで通り pickle からの on-demand です（classfile が入れたメンバは
+   落とします。Java の総称シグネチャは `CC[A]` を綴れないので、pickle 由来の
+   宣言の隣に**消去された別のオーバーロード**として並んでしまいます）。
+2. **低優先の半分がまだ足りなかった**。
+   `object BuildFrom extends BuildFromLowPriority1 extends BuildFromLowPriority2`
+   で、`buildFromIterableOps` は**一番下**のトレイトが宣言します。
+   コンパニオンだけ読んでも見えないので、親も辿って implicit を供給します。
+3. **供給した implicit を、その場で消していた**。`supply_implicit_members` は
+   pickle 由来のシグネチャで置き換えた classfile 由来のメンバを落としますが、
+   補完は**一度出した名前を覚えている**ので、答えがすでに pickle 由来の
+   メンバだったとき、それが「落とす側」と「入れる側」の両方になり、クラスは
+   その名前のメンバを 1 つも持たなくなっていました。
+4. **二方向の単一化が、未知の*型構築子*を照合できなかった**。`CC[A0]` は頭が
+   型パラメータの `Applied` で、`List[String]` は `Class` です。両者を結ぶ枝が
+   無く `a == b` に落ちていました。**完全適用した** `implicitly[BuildFrom[…]]`
+   が通っていたのは、そこだけ一方向の `unify_one`（構築子を読める）に
+   フォールバックするからで、そのフォールバックは**呼び出し側に未確定
+   パラメータがあるときだけ飛ばされます** — それがまさに `LazyZip2.map` です。
+   `xs.lazyZip(ys).map(f)` が
+   `could not find implicit value of type BuildFrom[…, C]` ＋
+   `value mkString is not a member of C` だったのはこれです。
+5. **witness を区別するものが無かった**。`BuildFrom` の witness たちは
+   **境界以外は同じ型**です。高階の境界は型の中に畳み込まれて届くので
+   （`buildFromSortedSetOps` は
+   `BuildFrom[CC[A0] with SortedSet[A0], A, CC[A] with SortedSet[A]]`）、
+   交差型を単一化することがそのまま境界検査になります。ただし
+   `immutable.TreeSet` が `collection.SortedSet` だと prelude の階層が
+   言っていなかったので（`val x: scala.collection.SortedSet[Int] = TreeSet(1)`
+   も `type mismatch` でした）、ソート版が当たらず**非ソート版が答えて**
+   `iterableFactory` で組み立て、`TreeSet(1,2).lazyZip(ys).map(f)` が
+   `class Set$Set3 cannot be cast to class TreeSet` になっていました。
+   一階の F-bound は `bound_hi` に残るので、そちらは nsc の `checkBounds`
+   相当を足します。検査しないままだと
+   `buildFromBitSet[C <: BitSet with BitSetOps[C]]: BuildFrom[C, Int, C]`
+   が `List` に対して答えてしまい（コンパニオン直下なので origin で勝つ）、
+   `List(1, 2).lazyZip(…).map(_ + _)` は**型検査を通ってから**
+   `class ::$ cannot be cast to class scala.collection.BitSet` で落ちました。
+
+**フィクスチャを読むのではなく走らせて**見つかったバグが 3 つあります。
+
+- **自分の implicit 節を持つ witness が、素の名前で出ていた**。
+  `implicit_tree` はその枝だけ `ref_implicit` を通さず `Ident` を組んでいたので、
+  コンパニオンが mixin したトレイトの宣言（`buildFromSortedSetOps` はまさに
+  これで、しかも `Ordering` を取ります）が `this` を積んでキャストされ、
+  `class Main$ cannot be cast to class BuildFromLowPriority1` になりました。
+- **呼び出し側の未知の型構築子を、変換が決めてはいけない**。候補**自身**の
+  型パラメータ `CC` を解くのが 4 の目的で、呼び出し側の `M[_]` は引数からの
+  通常の推論が決めるものです。区別せずに開いたところ、
+  `firstLength[A, M[+X] <: Iterable[X]](in: M[A])` が、すでに `M := List` で
+  適合している `List[Int]` に対して
+  `IterableOnce.iterableOnceExtensionMethods` を「`M[A]` に届く変換」として
+  受け入れました（`tests/fixtures/mism12_lib.scala` が
+  `ClassCastException` で捕まえました）。単一化の未知は 2 種類に分け、
+  **構築子に立てるのは候補自身の型パラメータだけ**にします。
+
+- **標準ライブラリのコンパニオンを classfile から入れると、pickle の宣言と
+  二重になる**。`object Option` はこれまで pickle の空スタブとして届いていて、
+  `apply` も pickle から来ていました。classfile 側の消去された `apply` が
+  隣に並んだ結果、`Option(2)` が `ambiguous overload for apply` になりました
+  （`tests/fixtures/jarpk.scala`）。`scala.*` のコンパニオンは classfile の
+  メンバを捨てて、これまで通り pickle に任せます。
+
+slick: `errors 177 → 166`、`files_with_errors 57 → 56`
+（`QueryInterpreter.scala` が丸ごと通るようになりました）。
+`tests/slick_subset.sh` は `verified=204 failed=0` / `subset_files=38 classes=204`
+で変化なし。**新しい種類のエラーは 1 つも出ず、新しくエラーになったファイルも
+ありません**（消えたのは `BuildFrom[…]` の `no implicit` 4 件、`C` に対する
+`is not a member` 4 件、それに巻き添えだった `Function0[…] IO[…]` と
+`NotGiven[…]` が 1 件ずつ）。
+
+このスライスで**分かっているが直していない**もの:
+
+- `scala.collection.immutable.ArraySeq(1, 2, 3)` は
+  `no implicit: could not find implicit value of type AnyRef[AnyRef]` ＋
+  `value lazyZip is not a member of Builder[A, ArraySeq[A]]` になります
+  （`ArraySeq.apply` の `ClassTag` 側の別件で、`lazyZip` / `BuildFrom` には
+  届いていません）。フィクスチャからは外してあります。
+- 高階パラメータの F-bound のうち `IterableOps[X, CC, _]` の部分は検査して
+  いません。prelude のコレクションは `IterableOps` の引数まで持っていないので、
+  検査すると nsc が受け入れる候補まで落ちます。nsc がこの部分で
+  `buildFromIterableOps` を退けるのはソート済みコレクションのときだけで、
+  そちらは 5 の交差型と階層で同じ結論になります。
+- `collection.SortedSet` / `collection.SortedMap` は今回 `prelude_hier.rs` の
+  リンク（メンバを持たない中継ノード）として入れました。`firstKey` などを
+  これらの型の値に対して直接呼ぶ形は、pickle からの on-demand 供給に任せて
+  います。
 
 ### ブロックの値を二重に箱詰めしていた（消去）
 
@@ -4736,6 +4879,22 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 （`t2_bad_is_still_rejected`、フィクスチャは `t2_bad.scala`。実 scalac 2.13.16 も
 同じ 3 件を拒否します）も置いてあります。
 
+`bf2_lazyzip.scala` / `bf2_lazyzip_bad.scala` は
+`crates/cli/tests/buildfrom2.rs` から回します（`BuildFrom` / `LazyZip2` /
+`IterableOps` は jar 側にしか無いので library モードのみ。私有ランタイムで
+**黙って通さない**ことは `bf2_lazyzip_without_library_is_error` で見ています）。
+`bf2_lazyzip.scala` の stdout は **real scalac 2.13.16 の出力そのもの**
+（`expected/bf2_lazyzip.txt`）と一致し、`bf2_lazyzip_bad.scala` は実 scalac が
+`Cannot construct a collection of type … based on a collection of type …` と
+言う 3 行を、こちらも 3 件のエラーとして拒みます。同ファイルの単体寄りテストは、
+**どの witness が答えるか**を実行結果で固定するためにあります:
+`bf2_sorted_witness_does_not_answer_for_a_list` /
+`bf2_sorted_witness_answers_for_a_treeset` /
+`bf2_string_receiver_builds_a_string` /
+`bf2_lazyzip_on_a_map_rebuilds_a_map` /
+`bf2_lazyzip_at_an_abstract_element_type`（slick の
+`values.lazyZip(…).map(mux).toSeq` の形）。
+
 `mism8.scala` は `crates/cli/tests/mismatch8.rs` の
 `mism8_fixture_runs_in_both_modes` から**両モードで**回し、どちらの stdout も
 **実 scalac 2.13.16 の出力そのもの**（`tests/fixtures/expected/mism8.txt`）と
@@ -5667,13 +5826,10 @@ m.map { case (d, g) => d -> g.sum }   // scalac: Map(x -> 3)
   乗るので、同じ形で落ちます。直すには `Nothing` を返す呼び出しのあとに
   「到達しない」印を置いて、期待型ぶんのダミーを積む必要があります。
 
-- **`Seq`／`IndexedSeq` の `lazyZip`**（`agent/ambigmap` で確認）。
-  `line.lazyZip(widths).map(…)` が
-  `value lazyZip is not a member of IndexedSeq[String]` になります。
-  `map` が通るようになって初めて見えた**次のエラー**で、悪化ではありません
-  （slick の `util/TableDump.scala` と `jdbc/JdbcActionComponent.scala`）。
-  `lazyZip` の結果 `LazyZip2` にメンバが無いのは下の
-  「`LazyZip2` のメンバ」と同じ根です。
+- ~~**`Seq`／`IndexedSeq` の `lazyZip`**（`agent/ambigmap` で確認）~~。
+  `lazyZip` 自体はその後 pickle から入り、`LazyZip2.map` の `BuildFrom` も
+  「[`BuildFrom` の高階 implicit 照合](#buildfrom-の高階-implicit-照合lazyzipagentbuildfrom2)」
+  （`agent/buildfrom2`）で解けるようになりました。
 
 - **`xs.to(ArrayBuffer)`**（`agent/ambigmap` で確認）。
   コンパニオンから `Factory[A, C]` の implicit を取れないので
@@ -5858,9 +6014,11 @@ error: value += is not a member of T
   `appended('x'): String` は通るので、欠けているのは下限つき型パラメータの
   lub 推論そのものです。`prepended` / `:+` / `+:` / `concat` も同じ形です。
 
-- **`LazyZip2` のメンバ**（`agent/stringops8` で確認）。`"abc".lazyZip(List(1,2,3))`
-  は `LazyZip2[Char, Int, String]` として解決しますが、`.map` / `.toList` が
-  無いので使えません。`lazyZip` 自体は pickle から入っています。
+- ~~**`LazyZip2` のメンバ**（`agent/stringops8` で確認）~~。
+  `"abc".lazyZip(List(1,2,3)).map(…)` は
+  「[`BuildFrom` の高階 implicit 照合](#buildfrom-の高階-implicit-照合lazyzipagentbuildfrom2)」
+  （`agent/buildfrom2`）で通るようになりました（`String` レシーバは
+  `buildFromString` が答えるので結果も `String` です）。
 
 - **`StringOps.partitionMap`**（`agent/stringops8` で確認）。
   `s.partitionMap(c => if (…) Right(c) else Left(c))` が
