@@ -9340,7 +9340,9 @@ prelude には無く、`warm_pickled_implicits` が pickle から供給します
 （`expected/o3_lib.txt`）。`o3_bad.scala` は
 `Option[Int].getOrElse("no")` が `Any` になることを見ます（lub まで広がる
 だけで、`Int` にはならない）。nsc 2.13.16 も同じ行を拒否します。
-7 本のテストはいずれも**修正前の `main` で落ちる**ことを確認済みです。
+7 本のテストのうち 6 本は**修正前の `main` で落ちる**ことを確認済みです
+（残る 1 本は `--no-scala-library` での診断を見る否定テストで、修正前も
+コンパイルは失敗します）。
 `--release` で `overloadshadow` / `ambigmap` / `setapply` / `uniteq` /
 `integral` / `ordsummon` / `mutcoll` / `conform` / `ovl2` / `ovl3` /
 `mismatch13` / `buildfrom2` / `lowbound` / `e2e` と
