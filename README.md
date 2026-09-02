@@ -9247,7 +9247,7 @@ join の前にそれをやりますが、条件を 3 つ付けて**取りこぼ�
 計測は `files=184 errors=134 files_with_errors=48` →
 **`files=184 errors=120 files_with_errors=41`**（−14 件 / −7 ファイル）。
 `tests/slick_subset.sh` は `38 files / 204 classes / verified=204 failed=0`
-のままです。`no matching overload` は **49 件 → 36 件**になりました。
+のままです。`no matching overload` は **49 件 → 35 件**になりました。
 
 `no matching overload` は「候補が複数あって選べない」ときのメッセージでは
 ありません。**候補が 1 本しか無くても**、その 1 本が引数を受け付けなければ
@@ -9362,7 +9362,7 @@ prelude には無く、`warm_pickled_implicits` が pickle から供給します
 --all-targets` の警告（78 件）はどれもこのスライスが触っていない場所で、
 新規はありません。
 
-**残っているもの**（`no matching overload` 36 件、このスライスでは直して
+**残っているもの**（`no matching overload` 35 件、このスライスでは直して
 いない）:
 
 * `java.util.Arrays.copyOf[Any](a: Array[AnyRef], n)`（`ConstArray.scala:314`
@@ -9383,6 +9383,15 @@ prelude には無く、`warm_pickled_implicits` が pickle から供給します
   **期待型から `RefId.apply` の `E` を決める**必要があります
   (`VerifyTypes.scala:38` / `41`)。引数を期待型なしで型付けしてから
   多重定義を選ぶ順序に手を入れる話で、影響範囲が広いので触っていません。
+* `allTSyms -- referenced.map(_._1)`（`PruneProjections.scala:14`）。
+  `.toSet` が返す `immutable.HashSet` に pickle から載った `map` の型
+  パラメータが解けず、引数が `HashSet[A]` のままになります。
+* `ConfigFactory` の `c.root.asScala`（`GlobalConfig.scala:71` / `78`、2 件）。
+  `ConfigObject` が実装している `java.util.Map<String, ConfigValue>` の
+  型引数を読めておらず、`Map[AnyRef, AnyRef]` になります。
+* `expansions(tsym)` / `expansions contains tsym`（`ExpandTables.scala:25`）。
+  `scala.collection.Map` は `prelude_hier` の LINKS が作る**メンバの無い**
+  スタブで、`apply` / `contains` は jar の pickle 頼みです。
 * cats の `>>`（`BasicBackend.scala:329` / `432` / `434`、3 件）と
   `DBIOAction.scala` の `<:<` を `Function1` として渡す 3 件は未調査です。
 
