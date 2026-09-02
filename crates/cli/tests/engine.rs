@@ -614,7 +614,7 @@ fn sd_function_and_valdef_match_real_scalac() {
     let _ = fs::remove_dir_all(&uses);
 }
 
-/// The three stage-D forms that are refused, each by name.
+/// The stage-D forms that are refused, each by name.
 #[test]
 fn sd_unsupported_forms_are_named() {
     if !prerequisites("sd_gaps_bad") {
@@ -637,8 +637,6 @@ fn sd_unsupported_forms_are_named() {
     for needle in [
         // A row class this run compiles is not on the macro classpath yet.
         "class SdLocalRow not found",
-        // A nullary macro whose result is applied.
-        "the implementation takes 0 argument(s) and the call site supplies 2",
         // A modifier with no name in the table.
         "a definition marked `DEFERRED`, a modifier scala-rs cannot rebuild yet",
     ] {

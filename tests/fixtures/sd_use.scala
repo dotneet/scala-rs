@@ -14,6 +14,10 @@ object SdUse {
   // an expansion that builds `tag => new E(tag)` out of the tag's type.
   def query[E]: SdQuery[E] = macro SdImpl.queryImpl[E]
 
+  // A macro that takes no arguments and whose *result* is a function. The
+  // argument list at `SdUse.adder(20, 22)` below belongs to the expansion,
+  // not to the macro: the expander walks in to the node that carries the
+  // macro def's own clauses (here, none).
   def adder: (Int, Int) => Int = macro SdImpl.adderImpl
 
   def twice(x: Int): Int = macro SdImpl.twiceImpl
@@ -28,6 +32,9 @@ object Main {
 
     val f = SdUse.adder
     println(f(3, 4))
+    // The macro is nullary and its *result* is applied: the argument list
+    // belongs to the expansion, not to the macro.
+    println(SdUse.adder(20, 22))
 
     var calls = 0
     def bump(): Int = { calls += 1; 5 }

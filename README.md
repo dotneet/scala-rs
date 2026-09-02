@@ -196,7 +196,10 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
   （SLS 2 の優先順位。`Function` が `scala.Function` に解決していた）、
   パスとして書いた `scala.Int` が primitive にならなかったのを直し、
   タプル・関数型・配列のタグ（`scala.TupleN` / `scala.FunctionN` /
-  `scala.Array`）を組めるようにした。実 scalac 2.13.16 との dual-run で
+  `scala.Array`）を組めるようにし、**引数を取らないマクロの結果を適用する形**
+  （`M.f(1, 2)` で `f` が引数無し）で `Apply` をマクロ自身の引数節と
+  読んでいたのを直した（マクロ def のパラメータ節の数で止める）。
+  実 scalac 2.13.16 との dual-run で
   プログラム出力が一致する（`tests/fixtures/sd_impl.scala` +
   `tests/fixtures/sd_use.scala`）
   （[`docs/macros.md`](docs/macros.md) §7.13）
@@ -3592,8 +3595,6 @@ implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラー
   **同じ run でコンパイルするクラスを型引数に取ること**（タグは
   `staticClass(<完全名>)` で組むので、engine の mirror が解決できるのは
   マクロ classpath＝*前の run* が書いたクラスだけです）/
-  **引数を取らないマクロの結果を適用する形**（`M.f(1, 2)` で `f` が
-  引数無しのとき、`Apply` をマクロ自身の引数節と読んでしまいます）/
   **タグを持たない型パラメータのタグ**（nsc は free type symbol を立てますが、
   scala-rs は断ります）。どれも「黙って別の木に展開する」ことはせず、
   `macro expansion is not implemented: cannot expand f (implementation Impl$.m):

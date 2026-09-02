@@ -291,6 +291,35 @@ impl Typer {
         {
             return;
         }
+        // The macro application is the node that supplies the macro *def*'s
+        // own parameter clauses, and no more. `M.f(1, 2)` where `f` takes
+        // none -- a macro whose *result* is a function -- is an application
+        // of the expansion, not of the macro: reading its argument list as
+        // the macro's own reported "the implementation takes 0 argument(s)
+        // and the call site supplies 2" for a call real scalac compiles.
+        // Walk in to the node that does match, and expand there; the outer
+        // application keeps the type it was already given, which is the
+        // declared result type the expansion is checked against anyway.
+        let want = match &self.st.get(sym).ty {
+            Type::Method { paramss, .. } => paramss.len(),
+            _ => 0,
+        };
+        if apply_layers(tree) > want {
+            // The `apply` the typer inserted to call the expansion's result
+            // sits between the two, so the node is found by matching rather
+            // than by counting layers off the top.
+            if let Some(inner) = macro_application_node(tree, sym, want) {
+                self.expand_macro_application(inner);
+                // The outer application still carries the macro's symbol from
+                // when its callee was resolved. Left there,
+                // `report_macro_calls` sees an unexpanded macro at a node that
+                // is not one any more, and reports it with no reason at all.
+                if tree.sym == sym {
+                    tree.sym = SymbolId::NONE;
+                }
+            }
+            return;
+        }
         let binding = match self.st.get(sym).macro_impl.clone() {
             Some(b) => b,
             None => return,
@@ -782,6 +811,53 @@ fn name_from(s: &Sexp) -> Result<String, String> {
     match items.first().and_then(|s| s.atom()) {
         Some("n") => Ok(at(items, 2)?.text()),
         _ => Err(format!("expected a name, got {s:?}")),
+    }
+}
+
+/// How many `Apply` clauses `tree` carries.
+fn apply_layers(tree: &Tree) -> usize {
+    let mut n = 0;
+    let mut t = tree;
+    while let TreeKind::Apply { fun, .. } = &t.kind {
+        n += 1;
+        t = fun;
+    }
+    n
+}
+
+/// The symbol at the head of an application spine, the way
+/// [`Typer::macro_symbol_of`] reads it.
+fn head_symbol(t: &Tree) -> SymbolId {
+    let mut h = t;
+    while let TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } = &h.kind {
+        h = fun;
+    }
+    if h.sym.is_none() {
+        t.sym
+    } else {
+        h.sym
+    }
+}
+
+/// The node inside `tree` that really is the application of macro `sym`: the
+/// one whose head is `sym` and which carries exactly the macro def's own
+/// `want` argument clauses.
+///
+/// Needed because a macro whose *result* is applied puts more layers on the
+/// tree than the macro def has clauses, and the extra ones are not always
+/// plain `Apply`s: applying a function value goes through an `apply`
+/// selection the typer inserts, so `M.f(1, 2)` on a nullary `f` arrives as
+/// `Apply(Select(Select(M, f), apply), args)`.
+fn macro_application_node(tree: &mut Tree, sym: SymbolId, want: usize) -> Option<&mut Tree> {
+    if apply_layers(tree) == want && head_symbol(tree) == sym {
+        return Some(tree);
+    }
+    match &mut tree.kind {
+        TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } => {
+            macro_application_node(fun, sym, want)
+        }
+        TreeKind::Select { qual, .. } => macro_application_node(qual, sym, want),
+        _ => None,
     }
 }
 
