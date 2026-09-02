@@ -440,7 +440,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
             args: vec![],
         },
         Type::SingleType { prefix, sym } => {
-            let t = st.get(*sym).ty.clone();
+            let t = st.singleton_underlying(*sym);
             if t.is_no_type() {
                 erase_ty(prefix, st)
             } else {

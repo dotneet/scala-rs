@@ -271,11 +271,26 @@ pub(crate) fn ensure_tag_module(
     } = cls;
     let tag_jvm = tag.jvm().to_string();
     let module_jvm = format!("{tag_jvm}$");
-    // Everything below happens once per tag: the module's presence is the
-    // record that it did. (`resolve_named_tags` walks the whole symbol table,
-    // and a file with many `typeOf[T]`s would otherwise pay for each one.)
-    if let Some(id) = crate::classpath::find_by_jvm(st, &module_jvm) {
-        return Some(id);
+    // Everything below happens once per tag, and `apply` is the record that
+    // it did. (`resolve_named_tags` walks the whole symbol table, and a file
+    // with many `typeOf[T]`s would otherwise pay for each one.)
+    //
+    // The *module class* alone is not that record: `PickleSupply::
+    // install_nested_module` enters one for every nested `object` a pickle
+    // declares, `TypeTags.TypeTag` included, and it deliberately installs no
+    // members -- `apply`'s signature is one no pickle conversion can express.
+    // Returning on the module's mere presence therefore left the tag
+    // companion with no `apply` at all, depending only on whether some
+    // earlier line in the file had written `u.TypeTag`.
+    let existing = crate::classpath::find_by_jvm(st, &module_jvm);
+    if let Some(id) = existing {
+        if st
+            .lookup_member(id, "apply")
+            .into_iter()
+            .any(|m| st.get(m).kind == SymKind::Method)
+        {
+            return Some(id);
+        }
     }
     resolve_named_tags(st, tag, tag_cls);
     let simple = tag.simple();
@@ -283,16 +298,19 @@ pub(crate) fn ensure_tag_module(
     // Allocated ownerless and then re-owned: entering it in `TypeTags`'
     // member list would put a second `TypeTag` next to the accessor the class
     // file already declares, and member lookup would have to choose.
-    let mcls = st.alloc(
-        format!("{simple}$"),
-        SymbolId::NONE,
-        SymKind::ModuleClass,
-        Flags::MODULE.with(Flags::FINAL),
-        &module_jvm,
-    );
-    st.get_mut(mcls).owner = type_tags;
-    st.get_mut(mcls).ty = Type::ModuleRef(mcls);
-    st.get_mut(mcls).parents = vec![Type::AnyRef];
+    let mcls = existing.unwrap_or_else(|| {
+        let id = st.alloc(
+            format!("{simple}$"),
+            SymbolId::NONE,
+            SymKind::ModuleClass,
+            Flags::MODULE.with(Flags::FINAL),
+            &module_jvm,
+        );
+        st.get_mut(id).owner = type_tags;
+        st.get_mut(id).ty = Type::ModuleRef(id);
+        st.get_mut(id).parents = vec![Type::AnyRef];
+        id
+    });
 
     let ap = st.alloc("apply", mcls, SymKind::Method, Flags::EMPTY, "");
     let t = st.alloc("T", ap, SymKind::TypeParam, Flags::EMPTY, "");
@@ -325,11 +343,21 @@ pub(crate) fn ensure_tag_module(
     // missing entirely ("value TypeTag is not a member of JavaUniverse").
     // Declared here, with the descriptor written out, so the call is the same
     // either way.
-    if !st
-        .lookup_member(type_tags, simple)
-        .into_iter()
-        .any(|m| matches!(st.get(m).kind, SymKind::Method | SymKind::Term))
-    {
+    //
+    // Unless one already points at this module class from somewhere else:
+    // `PickleSupply::install_nested_module` supplies the accessor for every
+    // nested `object` a pickle declares, and it installs it on the *receiver*
+    // class the lookup started from rather than on `TypeTags`. Adding a
+    // second one here would leave `u.TypeTag` with two nullary candidates
+    // that mean the same thing.
+    let already = st.symbols.iter().any(|s| {
+        s.name == simple
+            && matches!(s.kind, SymKind::Method | SymKind::Term)
+            && matches!(&s.ty, Type::Method { paramss, ret }
+                if paramss.iter().all(|c| c.is_empty())
+                    && matches!(**ret, Type::ModuleRef(m) if m == mcls))
+    });
+    if !already {
         let acc = st.alloc(
             simple,
             type_tags,

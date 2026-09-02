@@ -7504,6 +7504,20 @@ fn gen_select(
                     if !load_package_object_receiver(asm, ctx, qual, s.owner) {
                         gen_select_receiver(asm, frame, ctx, qual, s.owner);
                         checkcast_refined_receiver(asm, ctx, &qual.ty, tree.sym);
+                        // The call names `declaring_class` when the owner's
+                        // own class file does not reach the method
+                        // (`Symbol::declaring_class`), so the receiver has to
+                        // be cast to that class first -- the same step the
+                        // `Apply` path takes in
+                        // `checkcast_erased_method_receiver`. Paren-less, it
+                        // was missing: `u.Expr` left a `JavaUniverse` on the
+                        // stack under `invokevirtual
+                        // scala/reflect/api/Universe.Expr()` and the verifier
+                        // threw the whole method out.
+                        let dc = s.declaring_class.clone();
+                        if !dc.is_empty() && !matches!(qual.kind, TreeKind::Super { .. }) {
+                            asm.checkcast(&dc);
+                        }
                     }
                     // Paren-less call to an `ArrayOps` member with no
                     // `$extension` in nsc 2.13.16 (`toList`, `sum`, …); see
@@ -9445,13 +9459,37 @@ fn gen_module_member_receiver(
         asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
         return;
     };
-    let qcls = ctx.st.class_sym_of(&qual.ty);
+    // A qualifier that is itself a paren-less accessor (`universe.Liftable`,
+    // whose symbol is `def Liftable: Liftables$Liftable$`) still carries its
+    // *method* type here, which `class_sym_of` has no answer for. Unwidened,
+    // the qualifier was thrown away and the object reached through
+    // `load_module_instance` -- `aload_0`, the enclosing *source* class, and
+    // a `ClassCastException` at the first call.
+    let qty = match &qual.ty {
+        Type::Method { paramss, ret } if paramss.iter().all(|c| c.is_empty()) => (**ret).clone(),
+        other => other.clone(),
+    };
+    let qcls = ctx.st.class_sym_of(&qty);
     if qcls == Some(mcls) {
         gen_expr(asm, frame, ctx, qual);
         return;
     }
-    if qcls.is_some_and(|q| is_owner_compatible(ctx.st, q, outer)) {
+    // The qualifier is a *value* of some class: it is the enclosing instance,
+    // whether or not the symbol table can see the inheritance. A library
+    // class's pickled parents are attached one level at a time, so
+    // `is_owner_compatible(JavaUniverse, Liftables)` is routinely false for a
+    // chain that really does hold -- and falling through to
+    // `load_module_instance` then reached for the *enclosing source class's*
+    // instance instead (`aload_0`), which is a `ClassCastException` at the
+    // first call. nsc emits exactly the cast below.
+    if let Some(q) = qcls {
         gen_expr(asm, frame, ctx, qual);
+        if !is_owner_compatible(ctx.st, q, outer) {
+            let jn = class_internal(ctx.st, outer);
+            if !jn.is_empty() && jn != "java/lang/Object" && !jn.starts_with('(') {
+                asm.checkcast(&jn);
+            }
+        }
         invoke_module_accessor(asm, ctx.st, outer, mcls);
         return;
     }
@@ -9486,6 +9524,19 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
         return;
     }
     match &fun.kind {
+        // `o.P.apply[T](x)`: an explicit type application wraps the `Select`,
+        // and the fallback arm below reads only `fun.sym` -- for a member
+        // `object` it loaded `this` and the enclosing instance's accessor
+        // (`aload_0; checkcast Liftables; invokeinterface Liftables.Liftable()`
+        // for `universe.Liftable[String](f)`), which is a
+        // `ClassCastException` at the first call from a compile that reported
+        // nothing. Peel it and take the `Select` path, which knows how to
+        // reach the object through its qualifier.
+        TreeKind::TypeApply { fun: inner, .. } | TreeKind::Typed { expr: inner, .. }
+            if matches!(inner.kind, TreeKind::Select { .. }) =>
+        {
+            gen_receiver(asm, frame, ctx, inner)
+        }
         TreeKind::Select { qual, .. } => {
             if !fun.sym.is_none() {
                 let s = ctx.st.get(fun.sym);

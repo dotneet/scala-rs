@@ -648,3 +648,197 @@ fn sd_unsupported_forms_are_named() {
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&out_dir);
 }
+
+// ---------------------------------------------------------------------------
+// The two gaps in front of a self-built `reify`: a nested `object` of the
+// reflection API, and `<a pickled val>.type` as a stable identifier.
+// `docs/macros.md` §7.8 residuals 5 and 6, §7.13.4 gaps 1 and 2.
+
+/// `tests/fixtures/rd_nested.scala`, compiled by scala-rs and run.
+///
+/// Every line of it drew a diagnostic before: "value Expr is not a member of
+/// Universe", "not found: value Expr", "stable identifier required, but
+/// scala.reflect.runtime.universe found". *Running* it is what makes the test
+/// mean something -- a member `object` reached through the wrong receiver
+/// compiles perfectly well and throws `ClassCastException` at the first call.
+#[test]
+fn rd_nested_objects_and_stable_paths_run() {
+    if !prerequisites("rd_nested") {
+        return;
+    }
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let out_dir = tmp_dir("rd_nested");
+    let out = compile("rd_nested", &out_dir, &[]);
+    assert!(
+        out.status.success(),
+        "compile rd_nested failed: {}",
+        diagnostics(&out)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        out_dir.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "rd_nested"),
+        expected_stdout("rd_nested"),
+        "stdout mismatch for rd_nested"
+    );
+    let _ = fs::remove_dir_all(&out_dir);
+}
+
+/// The same file through real scalac 2.13.16: the recorded expectation is
+/// nsc's output, not scala-rs's.
+#[test]
+fn rd_nested_matches_real_scalac() {
+    if !prerequisites("rd_nested scalac diff") {
+        return;
+    }
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip rd_nested scalac diff: scalac not obtainable");
+        return;
+    };
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let out_dir = tmp_dir("rd_nested-scalac");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            out_dir.to_str().unwrap(),
+            fixtures_dir().join("rd_nested.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected rd_nested.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        out_dir.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "rd_nested (real scalac build)"),
+        expected_stdout("rd_nested"),
+        "recorded expectation for rd_nested does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&out_dir);
+}
+
+/// `rd_impl.scala` + `rd_use.scala`: the shape `reify { … }` expands into,
+/// written out by hand and **expanded for real** through the bridge.
+///
+/// `reify` itself is still the §7.8 diagnostic, but everything it has to emit
+/// is exercised here: `c.universe.Expr.apply` (whose pickled signature says
+/// `Mirror[Universe.this.type]` and is written out, the way `TypeTag.apply`
+/// is), `Mirror[c.universe.type]`, a `TreeCreator` subclass, a static symbol
+/// resolved through `mirror.staticModule`, and a splice through `Expr.in`.
+#[test]
+fn rd_reify_shape_expands_and_runs() {
+    if !prerequisites("rd_use") {
+        return;
+    }
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("rd_impl");
+    let uses = tmp_dir("rd_use");
+
+    let out = compile("rd_impl", &impls, &[]);
+    assert!(
+        out.status.success(),
+        "compile rd_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out = compile("rd_use", &uses, &[&impls]);
+    assert!(
+        out.status.success(),
+        "compile rd_use failed: {}",
+        diagnostics(&out)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "rd_use"),
+        expected_stdout("rd_use"),
+        "stdout mismatch for rd_use"
+    );
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
+/// The same two files through real scalac 2.13.16. A creator that resolved
+/// the static symbol in the wrong universe, or spliced the argument's tree
+/// without rebasing it, would still compile -- only the output would differ.
+#[test]
+fn rd_reify_shape_matches_real_scalac() {
+    if !prerequisites("rd_use scalac diff") {
+        return;
+    }
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip rd_use scalac diff: scalac not obtainable");
+        return;
+    };
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("rd_impl-scalac");
+    let uses = tmp_dir("rd_use-scalac");
+
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            impls.to_str().unwrap(),
+            fixtures_dir().join("rd_impl.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected rd_impl.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            &format!("{}:{}", reflect.display(), impls.display()),
+            "-d",
+            uses.to_str().unwrap(),
+            fixtures_dir().join("rd_use.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected rd_use.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "rd_use (real scalac build)"),
+        expected_stdout("rd_use"),
+        "recorded expectation for rd_use does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}

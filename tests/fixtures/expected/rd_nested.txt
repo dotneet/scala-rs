@@ -1,0 +1,5 @@
+scala.Int
+Literal(Constant(5))
+Literal(Constant("hi"))
+true
+true
