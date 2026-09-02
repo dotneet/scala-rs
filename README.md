@@ -141,6 +141,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - **`scala.collection.immutable.List` のコアメンバ**。`--scala-library` 時は scala-library 2.13.16 の実シグネチャ（`javap -s` で確認した descriptor）にリンクする。`map` / `flatMap` / `collect` / `zip` / `groupBy` / `sortBy` / `minBy` / `maxBy` / `foldLeft` / `foldRight` / `scanLeft` / `::` / `:::` / `+:` / `:+` / `++` / `:++` / `++:` / `updated` / `distinctBy` / `startsWith` / `endsWith` は**真に多相**（メソッド型パラメータ `B` を持つ）で、`xs.map(x => "n" + x): List[String]` のように要素型が追える。ほかに `filter` / `filterNot` / `take` / `drop` / `takeRight` / `dropRight` / `takeWhile` / `dropWhile` / `slice` / `splitAt` / `span` / `partition` / `reverse` / `distinct` / `init` / `last` / `headOption` / `lastOption` / `size` / `length` / `nonEmpty` / `contains` / `exists` / `forall` / `count` / `find` / `indexOf` / `mkString`（0/1/3 引数）/ `sum` / `product` / `min` / `max` / `reduce` / `reduceLeft` / `reduceRight` / `sorted` / `sortWith` / `zipWithIndex` / `grouped` / `sliding` / `toList` / `toArray` / `toSet` / `toVector` / `toSeq` / `Iterator.toList`。`List` 自身に無いものは `IterableOnceOps` / `IterableOps` / `SeqOps` の default メソッドなので invokeinterface で呼び、`Object` / `LinearSeq` に erase される戻り値は checkcast / unbox する。`sum` / `product` 用に `scala.math.Numeric`（`IntIsIntegral` / `LongIsIntegral` / `DoubleIsFractional`）、`sorted` / `max` / `sortBy` 用に `Ordering` の `String` / `Long` / `Boolean` インスタンスを implicit スコープに足した。**私有ランタイム（`--no-scala-library`）**では `crates/backend/src/runtime.rs` が classfile に実装している分（`length` / `size` / `nonEmpty` / `last` / `reverse` / `filter` / `filterNot` / `contains` / `exists` / `forall` / `count` / `take` / `drop` / `mkString` 0/1/3 引数）だけを宣言し、それ以外は**黙って通さず診断する**（`value sorted is not a member of List[Int]`）
 - Predef の一部: `assert` / `require` / `???` / ArrowAssoc の `->` / `identity` / `locally` / `implicitly` / `any2stringadd`（`1 + "x"`）/ String の `length`・`toInt`（`toLong` / `toDouble` もある）。**`--scala-library`** 時はこれらを jar の `Predef$` / `StringOps` / `Predef$ArrowAssoc` / `Predef$any2stringadd` にリンクする。さらに `intWrapper` / `RichInt`（`abs` / `max` / `to` / `until`）、`longWrapper` / `RichLong`、`doubleWrapper` / `RichDouble`、`floatWrapper` / `RichFloat`、`charWrapper` / `RichChar`、`StringOps` の `*` / `take` / `drop` / `isEmpty` / `toUpperCase` / `toLowerCase` / `stripPrefix` / `split`、`Map` / `Vector` / `List` / `Set` / `Seq` / `LazyList` の varargs `apply`、`Either`（`Left` / `Right`）、`Try` / `Success` / `Failure`（`Try(1)` / `map` / `getOrElse`）も jar リンク時のみ。このスライスでは **ArrayOps の変換・集約系**（`toList` / `toSeq` / `toIndexedSeq` / `toSet` / `toVector` / `toBuffer` / `groupBy` / `sortBy` / `sorted` / `sortWith` / `sum` / `product` / `min` / `max` / `minBy` / `maxBy` / `mkString`（0/1/3 引数）/ `reduce` / `reduceLeft` / `indexWhere`（1/2 引数）/ `lastIndexOf` / `patch` / `updated` / `appended` / `prepended` / `concat` / `++`。`toList`/`toSet`/`toVector`/`toBuffer`/`sum`/`product`/`min`/`max`/`minBy`/`maxBy`/`mkString`/`reduce`/`reduceLeft` は `javap -s scala.collection.ArrayOps` で確認したとおり `ArrayOps` 自身には `$extension` も直接メソッドも無く、実行時は `scala.Predef$.MODULE$.genericWrapArray` で `scala.collection.mutable.ArraySeq` に包んでから `scala.collection.IterableOnceOps` のデフォルトメソッドを呼ぶ。`sum`/`product`/`min`/`max`/`minBy`/`maxBy` 用に `scala.math.Numeric`（`Int`/`Long`/`Double` の `implicit object`）を新設。他メソッドは既存の `Ordering`/`ClassTag` implicit をそのまま使う）、**`scala.collection.MapView`**（`Map.view` / `keys` / `values` / `filterKeys` / `mapValues`（型引数は明示無しで推論できる）/ `toMap`（`A <:< (K, V)` witness は `scala.$less$colon$less$.MODULE$.refl()` を codegen 側で合成）/ `toList` / `toSeq` / `size` / `isEmpty` / `foreach`。私有 MapView classfile は出さない）を同じ jar にリンクする
 - 具象 `val` 付き trait の初期化（`T$class.$init$`）と `abstract override` の super 連鎖
+- コレクションの `[B >: A]` な広がり: `Option.getOrElse` / `Option.orElse` / `immutable.Map.getOrElse` / `mutable.Map.getOrElse` は nsc どおり下限付き型パラメータを持ち、引数が結果の型を lub まで広げる（`(o: Option[Sub]).getOrElse(base): Base`）。`List.::` と同じ仕組み（`prelude_lowbound.rs` / `prelude_ovl3.rs`）。`scala.collection.mutable.HashSet` / `HashMap` / `LinkedHashSet` / `LinkedHashMap` は `mutable.Set` / `mutable.Map`（従って `scala.collection.Set` / `Map`）のサブタイプ。`Option` を `IterableOnce` として使う view（`Option.option2Iterable`）は jar の pickle から供給する（`--scala-library` のときだけ。私有ランタイムでは診断）
 - 抽象型メンバーと型射影: `trait Foo { type A; def x: A }`、`type A = Int`、メソッド署名の `Bar#A`。object / class の **type alias** `type T = List[Int]` とトレイトの `type A = String` は vals/defs で underlying 型として使う。循環 `type A = B; type B = A` は `illegal cyclic reference`。pickle は nsc `ALIASsym`（2.13 に `ALIAStpe` タグは無い）
 - パス依存型: 安定パス `c.A`（`c: Foo { type A = Int }` や object / `this` / `val`）。`var` や `def` など不安定パスは nsc と同じ `stable identifier required, but … found`
 - singleton / this-types: 安定パスの `x.type` と `this.type` を戻り型として型付け・実行する。不安定な `x.type`（`var` / `def` / `new C()`）は `stable identifier required` で診断する
@@ -3659,7 +3660,7 @@ implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラー
 - implicit の `scala.Int` コンパニオンの enrichment（jar の `intWrapper` 経由の一部はリンク済み。`Int.MaxValue` 等の companion 定数そのものはこのスライスで実装済み。`RichInt` 側の追加メソッドは別）
 - `Range.Int` / `Range.Long` / `Range.BigInt` / `Range.BigDecimal` の入れ子オブジェクト（`Range$Long$` ほか。`NumericRange` を返す `apply` / `inclusive` を持つ。`Range$` 自体には `Int` 版しか無いことは `javap` で確認済み）
 - 期待型が関数型のときの `implicitly`（`implicitly[Int => Ordered[Int]]`）。`adapt_implicit_apply` は期待型が `Type::Function` だと eta 展開のために早期 return するので、implicit 節が埋まらずメソッド型のまま残ります。関数型の implicit **パラメータ**（`def f(implicit ev: A => B)` と view bound）は実装済みで、これは `implicitly` 側の別の穴です
-- `List[Option[A]].flatten`（`List(Some(1), None, Some(3)).flatten`）。witness は `scala.Option.option2Iterable[A](xo: Option[A]): Iterable[A]` で、classfile からは正しいシグネチャで読めています（`scala.Option.option2Iterable(Some(1))` は動く）が、classfile に `IMPLICIT` は無く、pickle から読める `PickleSupply::supply_implicit_members` は `scala/` を除外するので、探索から見えません。`scala/Option$` をこちらから `load_binary_into` で読み込んで flag を立てる方法は試しましたが、`Option(5)` 自身が通る経路と競合してモジュールクラスに `apply` が二つ入り、`Option(Option(5))` が `ambiguous overload for apply` になるため入れていません。**現状はサイレントな誤コンパイルではなく診断**（`no implicit: could not find implicit value of type (Option[Int]) => IterableOnce[…]`）です
+- `List[Option[A]].flatten`（`List(Some(1), None, Some(3)).flatten`）。witness の `scala.Option.option2Iterable[A](xo: Option[A]): Iterable[A]` は pickle から供給されるようになり、**view としては効きます**（`List(1) ++ anOption` / `val xs: Iterable[String] = anOption` は `agent/ovl3` で通るようになりました）。残っているのは `flatten[B](implicit asIterable: A => IterableOnce[B])` の側で、implicit **値**として `Function1` が要求されたときに implicit 変換*メソッド*を eta 展開しません。**現状はサイレントな誤コンパイルではなく診断**（`value mkString is not a member of ((Option[Int]) => IterableOnce[B])List[B]`）です
 - `Array[Array[A]].flatten`（`value flatten is not a member of Array[Array[Int]]`）。`ArrayOps.flatten[B](implicit asIterable: A => IterableOnce[B], m: ClassTag[B]): Array[B]` が prelude に無い
 - 直接引数の位置にある、未決定型パラメータを持つ implicit 節（`println(xs.flatten)`）。`instantiate_undet_arg` が探索より先に未決定変数を下限（`Nothing`）へ確定させるので、診断が `IterableOnce[Nothing]` を名指しします。`val v = xs.flatten` と書けば正しく解けます
 
@@ -4411,6 +4412,9 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `java_cp.scala` | JDK の Java `.class` から `Math.abs` / `Byte.MAX_VALUE` / `ArrayList.add` を解決して実行 | `3` `127` `true` `1` |
 | `ovl2.scala`（`crates/cli/tests/ovl2.rs`、私有ランタイム・library dual-run・real scalac dual-run） | `agent/ovl2` スライス: 継承はオーバーライドではない（`Base.f(Int)` と `Derived.f(String)` が両方候補に残り、erasure ブリッジも出ない）、素のコンストラクタ引数は `private[this]` なので継承されない、`val` が抽象 `def` を実装したら 1 つのメンバ、`String <: CharSequence`、`indexOf(':')` / `indexOf(':', 2)` / `lastIndexOf(':')` | `int:7/str:z` `42` `outer` `named!` `1` `1` `3` `3` `a` `5` |
 | `ovl2_lib.scala`（`crates/cli/tests/ovl2.rs`、library dual-run と real scalac dual-run） | オーバーロードされたメソッドの η 展開（`constOp[Long]("min")(math.min)`、`val g: (Double, Double) => Double = math.max`）、`new ArrayBuffer[Int](8)` と `new ArrayBuffer[String]()`、`Instant.parse` / `LocalDate.parse(s, fmt)` / `DateTimeFormatter.parse(s)`。私有ランタイムには裏付けが無いので `--no-scala-library` では診断のまま | `3` `4` `2.5` `1,2` `x` `2020-01-02T03:04:05Z` `2020-01-02` `true` |
+| `o3.scala`（`crates/cli/tests/ovl3.rs`、私有ランタイム・library dual-run・real scalac dual-run） | `agent/ovl3` スライス: `Option.getOrElse[B >: A]` / `orElse[B >: A]` が引数で結果を広げる（`Option[Sub].getOrElse(base): Base`）。`Nothing`（`throw`）は何も広げない | `got Sub` `got Base` `got Base` `got Sub` `fallback` `Sub` |
+| `o3_lib.scala`（`crates/cli/tests/ovl3.rs`、library dual-run と real scalac dual-run） | `mutable.HashSet` / `HashMap` が `scala.collection.Set` / `Map` として渡せる、`Map.getOrElse[V1 >: V]`（immutable / mutable 両方）、`Option` を `IterableOnce` として使う（`Seq("a") ++ anOption` / `val it: Iterable[String] = anOption`）。私有ランタイムには裏付けが無いので `--no-scala-library` では診断のまま | `2` `1` `Base Sub` `Base` `a,x` `a` `1` |
+| `o3_bad.scala`（`crates/cli/tests/ovl3.rs`、両モードで拒否） | `Option[Int].getOrElse("no")` は lub の `Any`。`Int` には代入できない（nsc 2.13.16 も拒否） | `type mismatch; found: Any  required: Int` |
 | `java_sig.scala` | Java Signature（`ArrayList[String]#get` は `String`）、inner `Map.Entry` / `SimpleEntry`、Java varargs `String.format` / `Arrays.asList` を実行 | `hi` `2` `k` `v` `k` `x-3` `2` |
 | `java_wild.scala` | Signature の `Class[_]` / `Collection[_ <: Number]` / `Collections.max`（tparam bound）を存在型として実行 | `java.lang.String` `2` `9` |
 | `java_throws.scala` | Java `throws` 検査例外（`Thread.sleep`）を Scala はチェックせず実行 | `ok` |
@@ -9235,6 +9239,139 @@ join の前にそれをやりますが、条件を 3 つ付けて**取りこぼ�
   解けません（`e.flatten` は駄目、`e.flatten[Int]` は通る）。`Rp[Option[QO]]`
   のように呼び出し側の型パラメータが**入れ子**にあるときの
   `implicit_solve` の穴で、slick 本体はこの形で呼んでいません。
+
+### slick の `no matching overload` 49 件のうち 13 件（`agent/ovl3`）
+
+テストは `crates/cli/tests/ovl3.rs`、fixture 接頭辞は `o3` です。
+
+計測は `files=184 errors=134 files_with_errors=48` →
+**`files=184 errors=121 files_with_errors=42`**（−13 件 / −6 ファイル）。
+`tests/slick_subset.sh` は `204/204` のままです。`no matching overload` は
+**49 件 → 37 件**になりました。
+
+`no matching overload` は「候補が複数あって選べない」ときのメッセージでは
+ありません。**候補が 1 本しか無くても**、その 1 本が引数を受け付けなければ
+同じ文が出ます。つまり *prelude が単相にモデル化したシグネチャ* が
+「多重定義が足りない」ように見えていた、というのがこの塊の正体でした。
+表面の 49 件は 4 つの根に落ちます。
+
+| 根 | before | after |
+|---|---|---|
+| `Option.getOrElse` / `orElse` / `Map.getOrElse` の `[B >: A]` 欠落 | 7 件 | **0 件** |
+| `mutable.HashSet` / `HashMap` が `collection.Set` / `Map` でなかった | 4 件 | **0 件** |
+| pickle にしか無い view（`Option.option2Iterable`）が読まれていなかった | 1 件 | **0 件** |
+| 同一シグネチャの prelude 宣言と pickle 宣言が `ambiguous` になっていた | 0 件 | **0 件**（1 の副作用として発生したものを解消） |
+
+#### 1. `[B >: A]` の欠落（`crates/typer/src/prelude_ovl3.rs`）
+
+nsc は `def getOrElse[B >: A](default: => B): B` です。prelude は
+`prelude_either.rs` で `(=> A)A`、`prelude_coll.rs` で
+`getOrElse[V1 >: V]` を「`V` で単相にモデル化」（コメントにそう書いてある）
+していました。だから `(o: Option[Sub]).getOrElse(base)` は
+`no matching overload for (=> Sub)Sub with arguments (Base)` でした。
+
+`Typer::infer_method_tparams_in` は既に「引数から解いた型と下限の lub を
+取る」（`prelude_lowbound.rs` が `List.::` でそれを使っている）ので、
+**下限を宣言するだけ**が修正の全部です。`B` / `V1` は型パラメータなので
+erasure は変わらず、私有ランタイム・実 jar のどちらの ABI にも影響しません。
+対象は `Option.getOrElse` / `Option.orElse` /
+`immutable.Map.getOrElse` / `mutable.Map.getOrElse`。
+
+slick 側の該当箇所は `EmulateOuterJoins.scala:78`、`CreateAggregates.scala:54`、
+`MergeToComprehensions.scala:215`、`H2Profile.scala:71`、
+`MySQLProfile.scala:94`、`SQLServerProfile.scala:112`、
+`JdbcModelBuilder.scala:253` の 7 件です（`mismatch13` が残件として挙げていた
+`m.getOrElse("k", Seq.empty)` もこれです）。
+
+#### 2. `mutable.HashSet` / `HashMap` の親（`prelude_ovl3::install_hierarchy`）
+
+`prelude_hier.rs` の辺の表に `mutable/Set` → `collection/Set` はあっても、
+`mutable/HashSet` → `mutable/Set` がありませんでした。`add_hash_set` /
+`add_hash_map`（prelude.rs）が `&[Type::AnyRef]` で作ったままだったからです。
+slick は `mutable.HashSet.empty[TypeSymbol]` を
+`def containsSymbol(tss: scala.collection.Set[TypeSymbol])` に渡すので、
+`Util.scala:72` / `ExpandSums.scala:323` / `ExpandTables.scala:73` /
+`ExpandTables.scala:82` が落ちていました。`LinkedHashSet` / `LinkedHashMap`
+も同じ形なので一緒に入れています。
+
+#### 3. 同一シグネチャの重複（`resolve_overload`、`crates/typer/src/check.rs`）
+
+2 の辺を入れた副作用で、`mutable.HashMap` が `getOrElse` を**2 経路**で
+見るようになりました――prelude の `mutable.Map` 宣言と、jar から取り込んだ
+`collection.MapOps` の pickle 宣言です。どちらも
+`(K, => V1)V1` で、nsc なら 1 個のシンボルです。
+`resolve_overload` には既に「同じシグネチャは 1 つの候補」という
+`winners.dedup_by(|a, b| a.1 == b.1 && a.2 == b.2)` がありましたが、
+2 つの `V1` は**別のシンボル**なので `==` が成立しませんでした。
+片方の型パラメータをもう片方に読み替えてから比べる
+（`canonical_sig`）ようにして、意図どおりの比較にしています。
+先に来た候補（＝レシーバに近い方）を残すので、辺を入れる前と同じ側が
+選ばれます。
+
+#### 4. pickle にしか無い view を読むタイミング（`check.rs`）
+
+`Seq("a") ++ anOption` は `option2Iterable` が要ります。この implicit は
+prelude には無く、`warm_pickled_implicits` が pickle から供給します
+（コメントに `Option.option2Iterable` と名指しで書いてある）。ところが
+適用可能性の判定（`arg_conforms` → `search_conversion`）は `&self` で走るので
+**classfile を読めません**。結果、同じファイルの先行行が `Option` のメンバを
+選択して（`search_extension` 経由で）暖めていたときだけ通る、という
+再現性の無い挙動になっていました。
+
+`resolve_overload` が `None` を返したときと、`adapt` が変換探索に降りるとき
+――どちらも既に失敗が確定している場所――で、**その型自身の**コンパニオンを
+暖めてから一度だけ問い直します。クラスごとに 1 回だけなので費用は有界です。
+
+基底クラスまで暖めないのは意図的です。コンパニオンの pickle を読むと
+そのコンパニオンの pickled parent が張られ、コレクションではそれが
+`IterableFactory.Delegate` などの**prelude が手で書いている**ファクトリ系に
+なります。`mutable.Set[T]` の実装型スコープを全部暖めたら `Iterable$` /
+`Seq$` / `Set$` に `Delegate` が付き、その `apply[A](A*): CC[A]` が prelude の
+`apply` と並んで、`mutable.Set[TypeSymbol]()` が `Set[A]` になりました
+（実測でこの退行が出たので、型自身のクラスで止めています）。
+
+#### 検証
+
+`o3.scala` は `--scala-library` と `--no-scala-library` の両方で
+`-Xverify:all` を通し、real scalac 2.13.16 の標準出力とも突き合わせます
+（`expected/o3.txt`）。`o3_lib.scala` は `mutable.HashSet` /
+`collection.Set` のメンバが jar 側にしか無いので library モードのみで、
+私有ランタイムでは `value size is not a member of Set[String]` を出します
+（`expected/o3_lib.txt`）。`o3_bad.scala` は
+`Option[Int].getOrElse("no")` が `Any` になることを見ます（lub まで広がる
+だけで、`Int` にはならない）。nsc 2.13.16 も同じ行を拒否します。
+7 本のテストはいずれも**修正前の `main` で落ちる**ことを確認済みです。
+`--release` で `overloadshadow` / `ambigmap` / `setapply` / `uniteq` /
+`integral` / `ordsummon` / `mutcoll` / `conform` / `ovl2` / `ovl3` /
+`mismatch13` / `buildfrom2` / `lowbound` / `e2e` と
+`cargo test --workspace` を回しました。`cargo clippy --workspace
+--all-targets` の警告は 78 件のままで、新規はありません。
+
+**残っているもの**（`no matching overload` 37 件、このスライスでは直して
+いない）:
+
+* `java.util.Arrays.copyOf[Any](a: Array[AnyRef], n)`（`ConstArray.scala:314`
+  / `516`、2 件）。nsc は Java シグネチャ中の `Object` を `ObjectTpeJava` と
+  して読み、`Any` とも `AnyRef` とも適合させるので**呼び出しは通り**、
+  結果を `Array[Any]` に代入するところだけが
+  `found: Array[Any] required: Array[Any]` になります（scalac で確認済み）。
+  こちらは `Array` の不変性でそのまま落ちています。
+* `Array[T]` → `IterableOnce[T]` の暗黙変換（`Predef.genericWrapArray` /
+  `wrapRefArray`）が view として登録されていない。`Map() ++ anArray`
+  (`JdbcTypesComponent.scala:526`)、`TupleSupport.buildTuple(anArray)`
+  (`ResultConverter.scala:58`)、`val xs: IndexedSeq[Any] = anArray` の 3 形。
+  backend 側には `emit_array_wrap_to_iterable_ops` が既にあります。
+* `Set() ++ anOption` (`JdbcModelBuilder.scala:280`)。1 の続きで、
+  `Set.++` / `Seq.++` の `[B >: A]` も単相のままです。ここは
+  `prelude_buildfrom` と噛み合うので別スライス向き。
+* `RefId[E <: AnyRef]` は不変なので `errors.contains(RefId(n1))` は
+  **期待型から `RefId.apply` の `E` を決める**必要があります
+  (`VerifyTypes.scala:38` / `41`)。引数を期待型なしで型付けしてから
+  多重定義を選ぶ順序に手を入れる話で、影響範囲が広いので触っていません。
+* `new StringBuilder(s.length, "")`（`TableDump.scala:50`）。
+  `prelude_text.rs` のコンストラクタ表に `(Int, String)` がありません。
+* cats の `>>`（`BasicBackend.scala:329` / `432` / `434`、3 件）と
+  `DBIOAction.scala` の `<:<` を `Function1` として渡す 3 件は未調査です。
 
 ## ライセンス
 

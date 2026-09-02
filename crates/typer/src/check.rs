@@ -179,6 +179,11 @@ pub struct Typer {
     /// scope. Keyed by span as well as node id because a parent tree the
     /// compiler itself built (an anonymous class's) carries `NodeId(0)`.
     parent_fill_done: std::collections::HashSet<(usize, scala_rs_parser::NodeId, Span, SymbolId)>,
+    /// Classes whose companion has already been searched for pickled
+    /// implicits. [`Typer::warm_implicit_scope`] reads a class file and asks
+    /// the pickle for every implicit name the companion declares; doing that
+    /// again for the same class can only find what is already installed.
+    warmed_scopes: std::collections::HashSet<u32>,
     /// Set while `type_apply` types the `new C` of a `new C(…)`: that shape
     /// already has an argument list, so the `New` arm must not add one.
     new_is_applied: bool,
@@ -504,6 +509,7 @@ impl Typer {
             sig_done: std::collections::HashSet::new(),
             lazy_val_presig: std::collections::HashSet::new(),
             parent_fill_done: std::collections::HashSet::new(),
+            warmed_scopes: std::collections::HashSet::new(),
             new_is_applied: false,
             typing_call_args: false,
             typing_callee: false,
@@ -10657,7 +10663,27 @@ impl Typer {
         }
         let fun_ty = fun.ty.clone();
         self.ensure_apply_supplied(&fun_ty);
-        let chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
+        let mut chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
+        if matches!(chosen, OverloadPick::None) {
+            // A *view* can make an argument applicable, but the test for one
+            // (`arg_conforms` -> `search_conversion`) runs on `&self` and so
+            // cannot read a class file. `Option.option2Iterable` exists only
+            // in the library pickle, so `Seq("a") ++ anOption` had no
+            // conversion to find -- unless some earlier line in the same file
+            // had selected a member on an `Option`, which warms the scope
+            // through `search_extension` and made the very same call compile.
+            // Warm the arguments' implicit scopes here, where the mutable
+            // borrow exists, and ask once more. Only a call that has already
+            // failed pays for it, and only the first time per class.
+            let tys = arg_tys.clone();
+            let mut fresh = false;
+            for t in &tys {
+                fresh |= self.warm_own_scope_once(t);
+            }
+            if fresh {
+                chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
+            }
+        }
         match chosen {
             OverloadPick::Found(sym, mut param_tys, mut ret) => {
                 let mut sig_param_tys = param_tys.clone();
@@ -14444,6 +14470,34 @@ impl Typer {
                 // signatures are one alternative, not an ambiguity.
                 let mut winners = winners;
                 winners.dedup_by(|a, b| a.1 == b.1 && a.2 == b.2);
+                // The same test again, but blind to *which* symbols a
+                // candidate's own type parameters are. `mutable.HashMap`
+                // reaches `getOrElse[V1 >: V](K, => V1): V1` twice -- once as
+                // the prelude's declaration on `mutable.Map`, once as the
+                // pickled `collection.MapOps` one adopted off the jar -- and
+                // the two `V1`s are different symbols, so `==` above saw two
+                // alternatives where nsc sees one member. Renaming one side's
+                // type parameters to the other's makes the comparison the one
+                // that was meant. The first survivor is kept, which is the one
+                // `lookup_member` reached first, i.e. nearest the receiver.
+                if winners.len() > 1 {
+                    let keyed: Vec<Vec<Type>> = winners
+                        .iter()
+                        .map(|(s, ps, r)| self.canonical_sig(*s, ps, r))
+                        .collect();
+                    let mut seen: Vec<Vec<Type>> = Vec::new();
+                    let mut i = 0;
+                    winners.retain(|_| {
+                        let k = &keyed[i];
+                        i += 1;
+                        if seen.contains(k) {
+                            false
+                        } else {
+                            seen.push(k.clone());
+                            true
+                        }
+                    });
+                }
                 // nsc `isStrictlyMoreSpecific`: when neither signature is more
                 // specific than the other, the one whose *owner* is the proper
                 // subclass wins (`relativeWeight`'s `isInProperSubClassOf`).
@@ -14475,6 +14529,29 @@ impl Typer {
                 }
             }
         }
+    }
+
+    /// One alternative's parameter and result types with its *own* type
+    /// parameters rewritten to positional markers, so two declarations of the
+    /// same signature compare equal however their type parameters were
+    /// allocated. The markers are `TypeMember` of ids no symbol can have; they
+    /// are only ever compared, never looked up.
+    fn canonical_sig(&self, sym: SymbolId, ps: &[Type], ret: &Type) -> Vec<Type> {
+        let mut out: Vec<Type> = ps.to_vec();
+        out.push(ret.clone());
+        if sym.is_none() {
+            return out;
+        }
+        let tps = &self.st.get(sym).tparams;
+        if tps.is_empty() {
+            return out;
+        }
+        let marks: Vec<Type> = (0..tps.len())
+            .map(|i| Type::TypeMember(SymbolId(u32::MAX - i as u32)))
+            .collect();
+        out.iter()
+            .map(|t| crate::symbol::subst_tparams_slice(tps, &marks, t))
+            .collect()
     }
 
     /// nsc's `isInProperSubClassOf`: `a`'s owner is a class, `b`'s owner is a
@@ -18485,10 +18562,47 @@ impl Typer {
     /// it for every jar class as it is adopted pulls in the whole transitive
     /// closure of cats-effect and takes minutes.
     pub(crate) fn warm_implicit_scope(&mut self, pt: &Type) {
+        self.warm_implicit_scope_once(pt);
+    }
+
+    /// [`Self::warm_implicit_scope`], reporting whether any class in `pt`'s
+    /// implicit scope had not been warmed before. Callers that only want to
+    /// *retry* something after new implicits appeared can skip the retry when
+    /// this says nothing is new.
+    pub(crate) fn warm_implicit_scope_once(&mut self, pt: &Type) -> bool {
+        let mut fresh = false;
         for c in self.implicit_scope_classes(pt) {
-            self.load_companion_module(c);
-            self.warm_pickled_implicits(c);
+            fresh |= self.warm_one_scope(c);
         }
+        fresh
+    }
+
+    /// Warm only the class `ty` *names*, not the base classes SLS 7.2 adds to
+    /// its implicit scope.
+    ///
+    /// Reading a companion's pickle attaches that companion's own pickled
+    /// parents, and for a collection those are the factory traits the prelude
+    /// models by hand: warming `mutable.Set[T]`'s full scope reached
+    /// `collection.Iterable` and gave `Iterable$` (and `Seq$`, `Set$`, …) a
+    /// pickled `IterableFactory.Delegate` parent, whose `apply[A](A*): CC[A]`
+    /// then stood next to the prelude's own — and `mutable.Set[TypeSymbol]()`
+    /// came back as `Set[A]`. The conversions this is here to find
+    /// (`Option.option2Iterable`) live on the companion of the type itself, so
+    /// nothing is lost by stopping there.
+    fn warm_own_scope_once(&mut self, ty: &Type) -> bool {
+        match self.st.class_sym_of(ty) {
+            Some(c) => self.warm_one_scope(c),
+            None => false,
+        }
+    }
+
+    fn warm_one_scope(&mut self, c: SymbolId) -> bool {
+        if c.is_none() || !self.warmed_scopes.insert(c.0) {
+            return false;
+        }
+        self.load_companion_module(c);
+        self.warm_pickled_implicits(c);
+        true
     }
 
     /// The implicit members a *standard library* companion declares.
@@ -19284,6 +19398,14 @@ impl Typer {
         if is_function_pt(pt) && self.coerce_array_to_function(tree, pt) {
             return;
         }
+        // Same reason as the retry in `type_apply`'s `OverloadPick::None`:
+        // `search_conversion` runs on `&self`, and the conversion this
+        // position needs may still be sitting unread in a library pickle
+        // (`val xs: Iterable[String] = anOption`). Everything above has
+        // already declined, so this costs a class file only where the
+        // alternative is an error.
+        let from_ty = tree.ty.clone();
+        self.warm_own_scope_once(&from_ty);
         match self.search_conversion(&tree.ty, pt) {
             ImplicitSearch::Found(id) => {
                 let span = tree.span;

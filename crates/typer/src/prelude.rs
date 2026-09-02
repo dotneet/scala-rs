@@ -592,6 +592,8 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     );
 
     crate::prelude_lowbound::install(st);
+    // `Option.getOrElse` / `orElse` / `Map.getOrElse` の `[B >: A]`。
+    crate::prelude_ovl3::install(st);
     crate::prelude_lang::install(st);
     crate::prelude_lazyref::install(st);
 
@@ -623,6 +625,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     crate::prelude_variance::install(st);
     crate::prelude_boxed::install(st);
     crate::prelude_hier::install(st);
+    // `HashSet <: mutable.Set` などの残りの辺。`prelude_hier` が
+    // `collection.Set` / `collection.Map` 側を組み立てたあとで。
+    crate::prelude_ovl3::install_hierarchy(st);
     // `Seq[A] <: PartialFunction[Int, A] <: Int => A`（`scala/collection/Seq`
     // は `prelude_hier` が組み立てるので、そのあと）。`PartialFunction` の
     // `lift`/`orElse` も同じスライスで足す。library_abi 専用。

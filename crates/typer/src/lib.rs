@@ -47,6 +47,7 @@ mod prelude_ordsummon;
 mod prelude_ordtuple;
 mod prelude_oshadow;
 mod prelude_ovl2;
+mod prelude_ovl3;
 mod prelude_product;
 mod prelude_reflect;
 mod prelude_regex;
