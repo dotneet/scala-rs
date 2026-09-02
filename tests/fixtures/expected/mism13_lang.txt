@@ -1,0 +1,7 @@
+1:s
+a+b
+2
+mapped(join)
+3
+0
+k

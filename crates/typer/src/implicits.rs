@@ -799,6 +799,45 @@ impl Typer {
                 .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
     }
 
+    /// What a candidate looks like *as a view*: its one parameter and its
+    /// result.
+    ///
+    /// nsc asks whether the candidate's type conforms to `From => To`, so a
+    /// one-parameter method, a `Function1`-typed value, and a value of any
+    /// class that *inherits* `Function1` all qualify. The last of those is
+    /// how `implicit ev: P <:< Rp[Option[QO]]` converts a `P`
+    /// (`sealed abstract class <:<[-From, +To] extends (From => To)`), which
+    /// is what slick's `flatten[QO](implicit ev: P <:< Rp[Option[QO]]) =
+    /// flatMap[QO](identity(_))` leans on entirely.
+    ///
+    /// A parameterless implicit method is *not* a view: `<:<.refl[A]: A =:= A`
+    /// would otherwise convert every type to itself.
+    fn view_shape(&self, ty: &Type) -> Option<(Type, Type)> {
+        match ty {
+            Type::Method { paramss, ret } => {
+                let ps = paramss.first()?;
+                (ps.len() == 1).then(|| (ps[0].clone(), (**ret).clone()))
+            }
+            Type::Function { params, ret } if params.len() == 1 => {
+                Some((params[0].clone(), (**ret).clone()))
+            }
+            Type::Class { .. } => self.st.base_type_seq(ty).into_iter().find_map(|b| {
+                let f = match &b {
+                    Type::Function { .. } => Some(b.clone()),
+                    Type::Class { sym, args } => self.st.function_class_shape(*sym, args),
+                    _ => None,
+                };
+                match f {
+                    Some(Type::Function { params, ret }) if params.len() == 1 => {
+                        Some((params[0].clone(), *ret))
+                    }
+                    _ => None,
+                }
+            }),
+            _ => None,
+        }
+    }
+
     fn conversion_provides(&self, id: SymbolId, from: &Type, to: &Type) -> bool {
         let s = self.st.get(id);
         if !s.flags.contains(Flags::IMPLICIT) {
@@ -807,18 +846,8 @@ impl Typer {
         if self.first_clause_is_implicit(id) {
             return false;
         }
-        let (param, ret) = match &self.implicit_candidate_ty(id) {
-            Type::Method { paramss, ret } => {
-                let ps = paramss.first().cloned().unwrap_or_default();
-                if ps.len() != 1 {
-                    return false;
-                }
-                (ps[0].clone(), (**ret).clone())
-            }
-            Type::Function { params, ret } if params.len() == 1 => {
-                (params[0].clone(), (**ret).clone())
-            }
-            _ => return false,
+        let Some((param, ret)) = self.view_shape(&self.implicit_candidate_ty(id)) else {
+            return false;
         };
         let tps = s.tparams.clone();
         if tps.is_empty() {

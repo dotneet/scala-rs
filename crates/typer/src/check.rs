@@ -4512,17 +4512,12 @@ impl Typer {
         match self.pick_ctor_at(class_id, &targs, &arg_tys, None) {
             OverloadPick::Found(sym, param_tys, _) => {
                 // `class Sub[T](y: T) extends Base[T](y)`: the constructor's
-                // parameters are stated in `Base`'s own `T`. Check the
-                // arguments at the type arguments the `extends` clause
-                // actually wrote -- otherwise both sides of the mismatch
-                // print `T` and neither one is the other.
-                let param_tys: Vec<Type> = match &class_ty {
-                    Type::Class { args: targs, .. } if !targs.is_empty() => param_tys
-                        .iter()
-                        .map(|p| self.st.subst_tparams(class_id, targs, p))
-                        .collect(),
-                    _ => param_tys,
-                };
+                // parameters are stated in `Base`'s own `T`, and
+                // `pick_ctor_at` has already read them at the type arguments
+                // the `extends` clause wrote -- otherwise both sides of the
+                // mismatch print `T` and neither one is the other. Doing it
+                // again here is not a no-op when an argument mentions the
+                // parameter it replaces.
                 for (i, a) in args.iter_mut().enumerate() {
                     if let Some(p) = param_tys.get(i) {
                         if !p.is_no_type() {
@@ -4686,16 +4681,24 @@ impl Typer {
         };
         match self.resolve_overload(&fun_ty, fun_sym, arg_tys, &Type::NoType) {
             OverloadPick::Found(sym, _, _) if Some(sym) == skip => OverloadPick::None,
-            // `resolve_overload` re-reads the alternatives off their symbols, so
-            // the picked clause comes back in terms of the class's own type
-            // parameters. Instantiate it here too.
-            OverloadPick::Found(sym, ps, ret) if !targs.is_empty() => OverloadPick::Found(
-                sym,
-                ps.iter()
-                    .map(|p| self.st.subst_tparams(class_id, targs, p))
-                    .collect(),
-                self.st.subst_tparams(class_id, targs, &ret),
-            ),
+            // With two or more alternatives `resolve_overload` re-reads them
+            // off their symbols, so the picked clause comes back in terms of
+            // the class's own type parameters and has to be instantiated here.
+            // With one it hands back the very clause `flatten` built, which is
+            // already at `targs`; substituting a second time is not a no-op
+            // when an argument *mentions* the parameter it replaces
+            // (`new Box[(T, T2), …]` inside `Box[T, U]` turned `T` into
+            // `((T, T2), T2)`), so the contract is: what comes out of
+            // `pick_ctor_at` is read at `targs`, exactly once.
+            OverloadPick::Found(sym, ps, ret) if !targs.is_empty() && alts.len() > 1 => {
+                OverloadPick::Found(
+                    sym,
+                    ps.iter()
+                        .map(|p| self.st.subst_tparams(class_id, targs, p))
+                        .collect(),
+                    self.st.subst_tparams(class_id, targs, &ret),
+                )
+            }
             other => other,
         }
     }
@@ -6047,7 +6050,7 @@ impl Typer {
                 // whose branches share no direct subtype relation but do share
                 // `Option[X]` as a common ancestor (sgap fixture; slick's
                 // `PositionedResult.nextXOption()` methods rely on exactly this).
-                tree.ty = pt_or_lub(pt, self.st.lub(&thenp.ty, &elsep.ty));
+                tree.ty = pt_or_lub(pt, self.lub_branches(&thenp.ty, &elsep.ty));
             }
             TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
                 self.type_expr(cond, &Type::Boolean);
@@ -6165,6 +6168,14 @@ impl Typer {
                         tpt.sym = id;
                     }
                     self.type_new_prefix(tpt);
+                } else if matches!(&tpt.kind, TreeKind::Ident { name } if name == crate::materialize::RESOLVED_TYPE)
+                {
+                    // Already a type: `resolved_class_tpt` built this for a
+                    // `copy` rewrite, where the class must not be looked up by
+                    // name in whatever file the rewrite runs in.
+                    if let Some(id) = self.st.class_sym_of(&tpt.ty) {
+                        tpt.sym = id;
+                    }
                 } else if let TreeKind::Ident { name } = &tpt.kind {
                     let n = name.clone();
                     self.expose_unqualified(&n, tpt.span);
@@ -7204,6 +7215,68 @@ impl Typer {
     /// because this call has not solved them yet -- the other half of nsc's
     /// undetermined type variables. `List.collect`'s `B` in
     /// `PartialFunction[A, B]` after `A` came from the receiver.
+    /// `SymbolTable::lub` for the branches of an `if` or a `match`, with a
+    /// variable nothing has pinned closed first.
+    ///
+    /// `if (c) Vector.empty else names.zip(kids).toVector` joins `Vector[?A]`
+    /// with `Vector[(String, Int)]`. `?A` is undetermined, so joining the
+    /// arguments walked all the way to `AnyRef` and the result conformed to
+    /// nothing the source had written -- slick's `Node.getDumpInfo` built its
+    /// `ch` this way and the whole method's inferred type became an error,
+    /// which is what left `n.toString` an `<overload String | <error>>`.
+    /// nsc's `solve` instantiates an unconstrained variable to its lower
+    /// bound, and `Vector[Nothing]` *is* a `Vector[(String, Int)]`.
+    ///
+    /// Three conditions keep this narrow, so that only a leftover is closed:
+    /// the parameter is *not in scope* here (an enclosing `def f[T]`'s own `T`
+    /// is, and stays open), the other branch does not mention it (one both
+    /// sides carry is still the enclosing call's to fix), and it occurs
+    /// covariantly (an invariant occurrence has no bound to read it at).
+    fn lub_branches(&self, a: &Type, b: &Type) -> Type {
+        if a == b
+            || matches!(a, Type::Nothing)
+            || matches!(b, Type::Nothing)
+            || a.is_no_type()
+            || b.is_no_type()
+            || a.is_error()
+            || b.is_error()
+            || self.st.is_sub_type(a, b)
+            || self.st.is_sub_type(b, a)
+        {
+            return self.st.lub(a, b);
+        }
+        let closed = |ty: &Type, other: &Type| -> Type {
+            let mut open = Vec::new();
+            collect_tparams(ty, &mut open);
+            let mut out = ty.clone();
+            for tp in open {
+                if type_mentions_tparam(other, tp)
+                    || self.st.get(tp).kind != SymKind::TypeParam
+                    || self.st.lookup(&self.st.get(tp).name).contains(&tp)
+                    || self.tparam_variance_in(&out, tp, 1) != Some(1)
+                {
+                    continue;
+                }
+                let lo = self.st.get(tp).bound_lo.clone().unwrap_or(Type::Nothing);
+                out = crate::symbol::subst_tparams_slice(&[tp], &[lo], &out);
+            }
+            out
+        };
+        // And the answer is still one of the two branch types: closing may
+        // only reveal that one of them already *is* the join. Anything else
+        // stays with the ordinary walk rather than invent a `Nothing` the
+        // source never wrote.
+        let ca = closed(a, b);
+        if ca != *a && self.st.is_sub_type(&ca, b) {
+            return b.clone();
+        }
+        let cb = closed(b, a);
+        if cb != *b && self.st.is_sub_type(&cb, a) {
+            return a.clone();
+        }
+        self.st.lub(a, b)
+    }
+
     fn open_tparams_of(&self, p: &Type, own: Option<&[SymbolId]>) -> Vec<SymbolId> {
         let Some(own) = own else { return Vec::new() };
         own.iter()
@@ -8207,8 +8280,17 @@ impl Typer {
         if found.len() > 1 {
             self.record_overload_group(&found, &name);
         }
+        // Only the receivers `subst_as_seen_from` cannot walk. A *class*
+        // receiver it walks properly, parent by parent; reading the member a
+        // second time at the receiver's own arguments assumes the declaring
+        // class's parameters sit at the same positions, which slick's
+        // `BaseJoinQuery[E1, E2, U1, U2, C, B1, B2] <: Query[+E, U, C[_]]`
+        // disproves -- `Query.map`'s `Query[G, T, C]` came back as
+        // `Query[G, T, U1]`. And where the receiver names the enclosing
+        // class's own parameters (`stdJoin` inside `Query` builds a
+        // `BaseJoinQuery[E, E2, …]`), the second pass is not even idempotent:
+        // `f: E => F` became `f: ((E, E2), E2) => F`.
         let subst_args: Vec<Type> = match &recv_ty {
-            Type::Class { args, .. } => args.clone(),
             Type::Tuple(ts) => ts.clone(),
             // `FunctionN`'s parameters are `T1 … Tn, R`, in that order.
             Type::Function { params, ret } => {
@@ -9646,9 +9728,8 @@ impl Typer {
         // tpe)`, and a companion that declares any `apply` gets no synthetic
         // one emitted, so `copy()(buildType)` compiled to a call to a method
         // that is not in the classfile.
-        let cls_name = self.st.get(class_id).name.clone();
         let mut ctor = Tree::dummy(TreeKind::New {
-            tpt: Box::new(Tree::dummy(TreeKind::Ident { name: cls_name })),
+            tpt: Box::new(self.resolved_class_tpt(class_id)),
         });
         for args in new_arg_lists {
             ctor = Tree::dummy(TreeKind::Apply {
@@ -9784,9 +9865,8 @@ impl Typer {
                 }),
             });
         }
-        let cls_name = self.st.get(class_id).name.clone();
         let new_tree = Tree::dummy(TreeKind::New {
-            tpt: Box::new(Tree::dummy(TreeKind::Ident { name: cls_name })),
+            tpt: Box::new(self.resolved_class_tpt(class_id)),
         });
         let ctor = Tree::dummy(TreeKind::Apply {
             fun: Box::new(new_tree),
@@ -10162,6 +10242,10 @@ impl Typer {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            // Whether `ctor_params` are already read at `explicit`: what
+            // `pick_ctor_at` picks is, what the `ctor_fields` fallback below
+            // is not.
+            let mut params_at_targs = false;
             let (ctor_sym, ctor_params) = if let Some(c) = class_id {
                 // `new C[A, B](x)(ev)`: the constructor's clauses are written
                 // in the *class's* type parameters, so an argument is weighed
@@ -10173,7 +10257,10 @@ impl Typer {
                 // its `targs` all along (`pick_ctor_at`); the `new` path did
                 // not.
                 match self.pick_ctor_at(c, &explicit, &arg_tys, None) {
-                    OverloadPick::Found(sym, ps, _) => (Some(sym), ps),
+                    OverloadPick::Found(sym, ps, _) => {
+                        params_at_targs = !explicit.is_empty();
+                        (Some(sym), ps)
+                    }
                     OverloadPick::Ambiguous => {
                         self.error(tree.span, "ambiguous overload for constructor");
                         (None, Vec::new())
@@ -10277,7 +10364,11 @@ impl Typer {
                     param_at(&ctor_params, i).cloned().unwrap_or(Type::NoType)
                 };
                 if let Some(c) = class_id {
-                    if !inferred_args.is_empty() {
+                    // ... but only if it is not already: `new Box[(T, T2), …]`
+                    // written *inside* `Box[T, U]` substitutes a type that
+                    // mentions the parameter it replaces, so a second pass
+                    // turns `T` into `((T, T2), T2)`.
+                    if !inferred_args.is_empty() && !params_at_targs {
                         p = self.st.subst_tparams(c, &inferred_args, &p);
                     }
                 }
@@ -10518,14 +10609,27 @@ impl Typer {
                     if matches!(&fun.ty, Type::Overload(_)) {
                         fun.ty = self.st.get(sym).ty.clone();
                     }
-                    if let Some(Type::Class { args, .. }) = recv_ty.as_ref() {
-                        if !args.is_empty() {
-                            let owner = self.st.get(sym).owner;
+                    if let Some(recv @ Type::Class { args, .. }) = recv_ty.as_ref() {
+                        // At the *owner's* arguments, not the receiver's own:
+                        // an inherited member is declared in the parameters of
+                        // the class that declares it, and those line up with
+                        // the receiver's only when the receiver is that class.
+                        // slick's `BaseJoinQuery[E1, E2, U1, U2, C, B1, B2] <:
+                        // Query[+E, U, C[_]]` gave `Query.map`'s result
+                        // `Query[G, T, C]` the receiver's third argument --
+                        // `U1` -- and `zipWith` was `found: Query[G, T, U]
+                        // required: Query[G, T, C]`.
+                        let owner = self.st.get(sym).owner;
+                        let at_owner = match self.base_type_instance(recv, owner, 0) {
+                            Some(Type::Class { args, .. }) => args,
+                            _ => args.clone(),
+                        };
+                        if !at_owner.is_empty() {
                             param_tys = param_tys
                                 .iter()
-                                .map(|p| self.st.subst_tparams(owner, args, p))
+                                .map(|p| self.st.subst_tparams(owner, &at_owner, p))
                                 .collect();
-                            ret = self.st.subst_tparams(owner, args, &ret);
+                            ret = self.st.subst_tparams(owner, &at_owner, &ret);
                         }
                     }
                     sig_param_tys = param_tys.clone();
@@ -10732,7 +10836,37 @@ impl Typer {
                     // with the variables opened up to their bounds.
                     let open = self.open_tparams_of(&p, own_tparams.as_deref());
                     if a.ty.is_no_type() {
-                        let pt_arg = self.open_to_bounds(&p, &open);
+                        // A variable inside the *result* of a function-typed
+                        // parameter is one the argument itself decides:
+                        // `def h[B](f: Int => Bx[B])` states `B` nowhere else.
+                        // Opened to its bound the body was checked against
+                        // `Bx[Any]`, and an invariant `Bx[Int]` is not that --
+                        // the argument was rejected before the second
+                        // inference pass could read `B` off it. A wildcard is
+                        // what "not decided yet" means in a position
+                        // `is_sub_type` already understands, and unlike
+                        // relaxing the whole result to `Any` it still tells
+                        // the body that it must be a `Bx`. Only the expected
+                        // type is relaxed: `p` itself stays the declaration,
+                        // so `solve_open_from_arg` below still reads `B` off
+                        // the typed argument. slick's `DBIOAction.flatMap[R2,
+                        // S2, E2](f: R => DBIOAction[R2, S2, E2])` is this
+                        // shape.
+                        let relaxed = match &p {
+                            Type::Function { params, ret }
+                                if !params.is_empty() && mentions_tparam(ret, &open) =>
+                            {
+                                let wilds = vec![Type::Wildcard; open.len()];
+                                Type::Function {
+                                    params: params.clone(),
+                                    ret: Box::new(crate::symbol::subst_tparams_slice(
+                                        &open, &wilds, ret,
+                                    )),
+                                }
+                            }
+                            _ => p.clone(),
+                        };
+                        let pt_arg = self.open_to_bounds(&relaxed, &open);
                         self.type_expr(a, &pt_arg);
                     }
                     // nsc adapts an argument before it constrains the call. An
@@ -10827,7 +10961,14 @@ impl Typer {
                     if let TreeKind::Function { body, .. } = &a.kind {
                         let body_ty = body.ty.widen_constant();
                         if let Type::Function { params, ret } = &a.ty {
-                            if matches!(ret.as_ref(), Type::Any | Type::NoType | Type::TypeParam(_))
+                            // A wildcard here is one the relaxation above put
+                            // in, standing for "the body decides"; leaving it
+                            // in the argument's type carries it into the
+                            // call's own result (`Act[_, _, Effect with _]`).
+                            if (matches!(
+                                ret.as_ref(),
+                                Type::Any | Type::NoType | Type::TypeParam(_)
+                            ) || type_mentions_wildcard(ret))
                                 && !body_ty.is_no_type()
                                 && !body_ty.is_error()
                             {
@@ -12559,6 +12700,27 @@ impl Typer {
 
     fn has_named_arg(args: &[Tree]) -> bool {
         args.iter().any(|a| Self::named_arg_parts(a).is_some())
+    }
+
+    /// A `new C` type tree that names `class_id` outright.
+    ///
+    /// The `copy` rewrites below build a constructor call, and spelling the
+    /// class by *name* re-resolves it in whatever scope the rewrite happens
+    /// to run in. `override def getDumpInfo = super.getDumpInfo.copy(mainInfo
+    /// = …)` is written in files that never import `DumpInfo` -- it comes in
+    /// through the inherited member -- and those reported `not found: type
+    /// DumpInfo` with no position at all. nsc's `TypeTree(tp)`, the same
+    /// marker `crate::materialize` uses.
+    fn resolved_class_tpt(&self, class_id: SymbolId) -> Tree {
+        let mut t = Tree::dummy(TreeKind::Ident {
+            name: crate::materialize::RESOLVED_TYPE.to_string(),
+        });
+        t.ty = Type::Class {
+            sym: class_id,
+            args: Vec::new(),
+        };
+        t.sym = class_id;
+        t
     }
 
     /// nsc's `NamesDefaults.removeNames`: place `name = value` arguments at
@@ -14321,8 +14483,7 @@ impl Typer {
     /// alternative: anything else and the prototype would be weighing the
     /// alternatives instead of the arguments. `NoType` means "as before".
     fn proto_arg_type(&self, fun_ty: &Type, sym: SymbolId, idx: usize, pt: &Type) -> Type {
-        if sym.is_none() || pt.is_no_type() || pt.is_error() || matches!(fun_ty, Type::Overload(_))
-        {
+        if sym.is_none() || matches!(fun_ty, Type::Overload(_)) {
             return Type::NoType;
         }
         let Type::Method { paramss, ret } = fun_ty else {
@@ -14335,6 +14496,25 @@ impl Typer {
         let Some(params) = paramss.first() else {
             return Type::NoType;
         };
+        // Explicit type arguments have already settled this parameter, and
+        // that settled type *is* the expected type of the argument. Typing it
+        // against nothing leaves whatever only an expectation can fix
+        // unsolved: `take[F, State[F]](State(max, min, TreeMap.empty))` --
+        // slick's `ConnectionArbiter.create` -- has to read the higher-kinded
+        // `F` of `case class State[F[_]]` off `State[F]`, since no argument
+        // mentions it, and the argument came back `State[_]`.
+        if let Some(p) = param_at(params, idx) {
+            if !p.is_no_type()
+                && !p.is_error()
+                && !mentions_tparam(p, &tps)
+                && !type_mentions_wildcard(p)
+            {
+                return p.clone();
+            }
+        }
+        if pt.is_no_type() || pt.is_error() {
+            return Type::NoType;
+        }
         let Some(Type::TypeParam(tp)) = param_at(params, idx) else {
             return Type::NoType;
         };
@@ -15205,7 +15385,7 @@ impl Typer {
                 self.type_expr(&mut c.guard, &Type::Boolean);
             }
             self.type_expr(&mut c.body, pt);
-            res = self.st.lub(&res, &c.body.ty);
+            res = self.lub_branches(&res, &c.body.ty);
             self.st.pop_scope();
         }
         let span = tree.span;
@@ -21105,6 +21285,28 @@ fn still_raw_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
 }
 
 /// Whether `tp` occurs anywhere in `ty`.
+/// Whether a wildcard occurs anywhere in `ty` -- i.e. whether it is a type the
+/// expected-type relaxation put there rather than one the source wrote.
+pub(crate) fn type_mentions_wildcard(ty: &Type) -> bool {
+    match ty {
+        Type::Wildcard | Type::BoundedWildcard { .. } => true,
+        Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
+            args.iter().any(type_mentions_wildcard)
+        }
+        Type::Applied { ctor, args } => {
+            type_mentions_wildcard(ctor) || args.iter().any(type_mentions_wildcard)
+        }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            type_mentions_wildcard(t)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(type_mentions_wildcard) || type_mentions_wildcard(ret)
+        }
+        Type::Refined { parents, .. } => parents.iter().any(type_mentions_wildcard),
+        _ => false,
+    }
+}
+
 pub(crate) fn type_mentions_tparam(ty: &Type, tp: SymbolId) -> bool {
     match ty {
         Type::TypeParam(id) => *id == tp,
