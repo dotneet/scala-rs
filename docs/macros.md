@@ -1875,3 +1875,119 @@ scala-rs 側で塞がっていない穴は 3 つで、いずれも `reify` 以�
 減った 1 件は `TableQuery.scala` の `c.Expr[Tag => E]`（関数型のタグ）である。
 残りは §7.12 と同じく、slick の 2 マクロが「def と実装が同じ run にある」形
 だからで、段階 D-3 には `reify` が要る。
+
+### 7.14 段階 D-2 の手前: 入れ子 `object` と `<val>.type`（`agent/reifyd` スライス）
+
+§7.13.4 が名指しした 3 つの穴のうち、**1 と 2 を塞いだ**。どちらも `reify`
+専用ではなく一般の機能追加で、マクロと無関係なコードにも効く。3（reify 本体の
+衛生性）と `reify` の展開そのものは**このスライスでも未実装**であり、診断は
+§7.8 のままである。
+
+#### 1. trait の中の `object` が供給されていなかった（§7.8 残件 5）
+
+`trait Exprs { object Expr { … } }` は、インタフェースメソッド
+`Expr()Lscala/reflect/api/Exprs$Expr$;` と module 自身の classfile に落ちる。
+`PickleSupply::complete_named` は pickle の `Def` と `Val` しか読まないので、
+`MemberKind::Module` のエントリは**丸ごと捨てられて**いた。結果、
+
+- `c.universe.Expr` → `value Expr is not a member of Universe`
+- `import c.universe._` 下の `Expr` → `not found: value Expr`
+
+という、どちらも**嘘**の診断になっていた（メンバは pickle にある）。
+
+`PickleSupply::install_nested_module` を足した。module class を
+`Outer$Name$` の JVM 名で入れ、**`class_sym`（探索を始めた受け手のクラス）**に
+0 引数のアクセサを立てる。宣言元の trait に置く案は捨てた:
+`Check::qualify_term_import` は「メンバの owner」を import 接頭辞のクラスと
+突き合わせて `import u._` 下の裸の名前を `u.name` に戻すのだが、ライブラリ
+クラスの pickle 親は 1 段ずつしか繋がらないので、linearisation の遠くにある
+trait に置いたアクセサは「この import のもの」と認識されず、
+`Main$.Expr()` を吐いて `ClassCastException` になった。`install` と同じ
+規約（受け手のクラスに入れる）が正しい。
+
+呼び出し先は `erased_desc` に決めさせる。`api/JavaUniverse` の classfile は
+`interfaces: 0` なので、`invokevirtual JavaUniverse.Expr()` は解決しない
+（`NoSuchMethodError`）。`declaring_class` / `declaring_is_interface` を
+記録し、`checkcast` を挟んでそのクラスを名指しする — nsc と同じ形である。
+
+classfile 由来の**壊れたアクセサは修理する**。`adopt_binary_class` が
+`Exprs.class` を読むと descriptor から `def Expr(): Exprs$Expr$` を入れるが、
+`Exprs$Expr$` のシンボルは誰も作っていないので戻り値は未解決の
+`Type::Named` のまま、`class_sym_of` が `None` を返し
+`c.universe.Expr.apply` は `value apply is not a member of Exprs$Expr$` に
+なっていた。解決済みの戻り値は**触らない**（精度は足すが、メンバは奪わない）。
+
+`materialize::ensure_tag_module` は「module class があること」を仕事済みの
+印にしていたが、この供給が先に module class を作るようになったので、
+印を **`apply` があること**に変えた。アクセサの二重登録も、同じ module class
+を指すものが既にあれば足さない、という条件に変えてある。
+
+#### 2. `c.universe` が安定識別子として型に書けなかった（§7.8 残件 6）
+
+`Mirror[c.universe.type]` が `stable identifier required, but c.universe
+found`。原因は `member_is_stable` ではなく **`Check::term_path_sym`** で、
+`SymKind::Term | Module | ModuleClass` しか受けていなかった。pickle から
+読んだ `val` は 0 引数の **`SymKind::Method`**（classfile は `val` の
+アクセサと素の `def` を区別できない）に `Flags::ACCESSOR` を立てて入るので、
+これが落ちていた。`c.universe.Tree` は `path_dependent_type` を通り
+`member_is_stable`（こちらは `ACCESSOR` を見る）しか呼ばないので通っていた、
+という食い違いである。
+
+`Type::SingleType { sym }` の読み手 3 か所（`class_sym_of` /
+`expand_in_type` / `erase_ty`）は `sym.ty` をそのまま見ていたので、
+0 引数 `Method` を結果型に開く `SymbolTable::singleton_underlying` を通す。
+
+#### 3. 道中で塞いだ 3 つの一般の穴（いずれも**黙って壊れる**形だった）
+
+| 直したもの | どこ | 症状 |
+| --- | --- | --- |
+| **メソッドの引数がそのメソッドの「メンバ」に見えていた。** `install` は引数シンボルを method の owner 下に確保するので、`qual.sym` がメソッド（＝適用の被呼側）のとき `lookup_member(qual.sym, name)` がそれを拾う | `Check::type_select` の `qual.sym` フォールバック | `m.staticClass(n).fullName` が `staticClass` の**引数 `fullName`** に解決し、codegen が「所有者クラス＝メソッドの erased descriptor」で `Fieldref` を吐いた。`ClassFormatError: Illegal class name "(Ljava/lang/String;)L…;"` — **コンパイルは無言で成功する** |
+| **括弧なし選択で `declaring_class` の `checkcast` が抜けていた。** `Apply` 経路は `checkcast_erased_method_receiver` で入れているのに、`Select` 単独の経路には無かった | `gen::gen_select` の `SymKind::Method` 枝 | `u.Expr` が `JavaUniverse` をスタックに積んだまま `invokevirtual Universe.Expr()`。`VerifyError` |
+| **メンバ `object` の受け手が捨てられていた。** 修飾子が 0 引数アクセサ（型が `Type::Method`）だと `class_sym_of` が答えられず、また pickle 親が繋がっていないと `is_owner_compatible` も偽になるので、`load_module_instance` に落ちて**囲む source クラスの `this`** を積んでいた | `gen::gen_module_member_receiver` | `universe.Liftable[String](f)` が `aload_0` を積み `ClassCastException: Main$ cannot be cast to scala.reflect.api.Liftables`。**コンパイルは無言で成功する** |
+
+`gen_receiver` の `TypeApply` / `Typed` も剥がすようにした（`o.P.apply[T](x)`
+は関数が `TypeApply` に包まれていて、フォールバック枝が `fun.sym` しか見て
+いなかった）。
+
+#### 検証
+
+- `tests/fixtures/rd_nested.scala` — 実行時 universe に対して、パス越しと
+  wildcard import 越しの入れ子 `object`（`Expr` / `Liftable`）と
+  `Mirror[scala.reflect.runtime.universe.type]` を使い、5 行印字する。
+  **実 scalac 2.13.16 でも同じ 5 行**（`tests/fixtures/expected/rd_nested.txt`）。
+  受け手を取り違えた member object はコンパイルが通ってしまうので、
+  **走らせる以外に捕まえる方法が無い**。
+- `tests/fixtures/rd_ctx.scala` — 同じ 2 件をマクロ実装の中で使い、
+  §7.13.4 の `TreeCreator` を手書きで組む。両コンパイラが通し、
+  classfile が `java -Xverify:all` でロード・検証される。
+
+#### このスライスのあとに残っているもの
+
+1. **`reify` 本体**（§7.13.4 の穴 3 と展開そのもの）。`Expr.apply` は
+   pickle から供給されるが、その第 1 引数 `Mirror[Universe.this.type]` の
+   `this.type` が「完了中のクラス」＝ `Expr$` に解決してしまい、
+   `Mirror[Expr$]` になる。`ensure_tag_module` が `TypeTag.apply` を
+   手書きしているのと同じ理由で、`Exprs$Expr$#apply` も手書きが要る。
+   nsc の展開形（`-Xprint:typer` 実測）は
+
+   ```scala
+   { val $u: c.universe.type = c.universe
+     val $m: $u.Mirror = c.universe.rootMirror
+     $u.Expr.apply[T]($m, new $treecreator1())($u.TypeTag.apply[T]($m, new $typecreator2())) }
+   ```
+
+   で、creator の本体は `val $u = $m$untyped.universe` の下に §7.1 の
+   reifier を置いたもの。衛生性は静的シンボルを
+   `$u.internal.reificationSupport.mkIdent($m.staticModule("P5Helper"))` に、
+   `splice` を `x.in[$u.type]($m).tree` に落とす。
+2. **trait の中の入れ子*クラス***（`u.Liftable[Int]` を**型**として書く形）は
+   まだ `not found: type Liftable`。今回入れたのは term 側だけである。
+3. §7.13 の残件 1・3（展開の型引数、`TableQuery.apply` のオーバーロード選択）は
+   そのまま。
+
+#### slick への効き方
+
+`tests/slick_measure.sh` は `errors=134 → 134`、`files_with_errors=48 → 48`。
+`tests/slick_subset.sh` は `38 files / 204 classes / verified=204 failed=0` の
+まま。slick の 2 マクロは `reify` が要るところで止まっており、この 2 件は
+その手前を通しただけなので数字は動かない。

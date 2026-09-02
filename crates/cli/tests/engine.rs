@@ -648,3 +648,171 @@ fn sd_unsupported_forms_are_named() {
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&out_dir);
 }
+
+// ---------------------------------------------------------------------------
+// The two gaps in front of a self-built `reify`: a nested `object` of the
+// reflection API, and `<a pickled val>.type` as a stable identifier.
+// `docs/macros.md` §7.8 residuals 5 and 6, §7.13.4 gaps 1 and 2.
+
+/// `tests/fixtures/rd_nested.scala`, compiled by scala-rs and run.
+///
+/// Every line of it drew a diagnostic before: "value Expr is not a member of
+/// Universe", "not found: value Expr", "stable identifier required, but
+/// scala.reflect.runtime.universe found". *Running* it is what makes the test
+/// mean something -- a member `object` reached through the wrong receiver
+/// compiles perfectly well and throws `ClassCastException` at the first call.
+#[test]
+fn rd_nested_objects_and_stable_paths_run() {
+    if !prerequisites("rd_nested") {
+        return;
+    }
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let out_dir = tmp_dir("rd_nested");
+    let out = compile("rd_nested", &out_dir, &[]);
+    assert!(
+        out.status.success(),
+        "compile rd_nested failed: {}",
+        diagnostics(&out)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        out_dir.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "rd_nested"),
+        expected_stdout("rd_nested"),
+        "stdout mismatch for rd_nested"
+    );
+    let _ = fs::remove_dir_all(&out_dir);
+}
+
+/// The same file through real scalac 2.13.16: the recorded expectation is
+/// nsc's output, not scala-rs's.
+#[test]
+fn rd_nested_matches_real_scalac() {
+    if !prerequisites("rd_nested scalac diff") {
+        return;
+    }
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip rd_nested scalac diff: scalac not obtainable");
+        return;
+    };
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let out_dir = tmp_dir("rd_nested-scalac");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            out_dir.to_str().unwrap(),
+            fixtures_dir().join("rd_nested.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected rd_nested.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        out_dir.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "rd_nested (real scalac build)"),
+        expected_stdout("rd_nested"),
+        "recorded expectation for rd_nested does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&out_dir);
+}
+
+/// `tests/fixtures/rd_ctx.scala`: the same two members inside a **macro
+/// implementation**, which is where the self-built `reify` needs them, plus
+/// the `TreeCreator` half of that expansion written out by hand.
+///
+/// A macro implementation is a library, so there is nothing to run: what is
+/// checked is that both compilers accept the file and that the class files
+/// scala-rs emits load with the verifier on.
+#[test]
+fn rd_ctx_compiles_in_a_macro_implementation() {
+    if !prerequisites("rd_ctx") {
+        return;
+    }
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let out_dir = tmp_dir("rd_ctx");
+    let out = compile("rd_ctx", &out_dir, &[]);
+    assert!(
+        out.status.success(),
+        "compile rd_ctx failed: {}",
+        diagnostics(&out)
+    );
+
+    // Loading the class runs the verifier over every method in it; the loader
+    // is compiled by scala-rs too, the same shape `quasi.rs` uses for
+    // `tt_ctx`.
+    let loader = out_dir.join("loader");
+    fs::create_dir_all(&loader).unwrap();
+    let src = out_dir.join("Loader.scala");
+    fs::write(
+        &src,
+        "object Main {\n  \
+         def main(args: Array[String]): Unit = println(Class.forName(\"RdCtx$\").getName)\n\
+         }\n",
+    )
+    .unwrap();
+    let built = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            loader.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        built.status.success(),
+        "compiling the loader failed: {}",
+        diagnostics(&built)
+    );
+    let cp = format!(
+        "{}:{}:{}:{}",
+        loader.display(),
+        out_dir.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(run_main(&cp, "rd_ctx loader"), "RdCtx$\n");
+
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip the scalac half of rd_ctx: scalac not obtainable");
+        let _ = fs::remove_dir_all(&out_dir);
+        return;
+    };
+    let ref_out = tmp_dir("rd_ctx-scalac");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            ref_out.to_str().unwrap(),
+            fixtures_dir().join("rd_ctx.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected rd_ctx.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = fs::remove_dir_all(&ref_out);
+    let _ = fs::remove_dir_all(&out_dir);
+}

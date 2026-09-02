@@ -791,6 +791,23 @@ impl SymbolTable {
         t
     }
 
+    /// What the singleton type `p.type` stands for, given `p`'s symbol.
+    ///
+    /// A `val` read from a pickle is installed as a **zero-argument method**:
+    /// a class file cannot tell a `val`'s accessor from an ordinary `def`
+    /// (see `Flags::ACCESSOR` in `pickle_supply::complete_named`). So
+    /// `c.universe.type` names a symbol whose stored type is
+    /// `Method { paramss: [], ret: Universe }`, and every reader of a
+    /// `SingleType` that took `sym.ty` unwidened saw a shape it does not
+    /// handle -- `class_sym_of` answered `None`, so the singleton conformed
+    /// to nothing and erased to `Object`.
+    pub fn singleton_underlying(&self, sym: SymbolId) -> Type {
+        match self.get(sym).ty.clone() {
+            Type::Method { paramss, ret } if paramss.iter().all(|c| c.is_empty()) => *ret,
+            other => other,
+        }
+    }
+
     pub fn class_sym_of(&self, ty: &Type) -> Option<SymbolId> {
         match ty {
             Type::Class { sym, .. } | Type::ModuleRef(sym) => Some(*sym),
@@ -856,7 +873,7 @@ impl SymbolTable {
             Type::ThisType(sym) => Some(*sym),
             Type::Constant(lit) => self.class_sym_of(&Type::lit_underlying(lit)),
             Type::SingleType { prefix, sym } => {
-                let t = self.get(*sym).ty.clone();
+                let t = self.singleton_underlying(*sym);
                 if t.is_no_type() {
                     self.class_sym_of(prefix)
                 } else {
@@ -2348,7 +2365,7 @@ impl SymbolTable {
             Type::ThisType(sym) => self.expand_type_members(*sym, ty),
             Type::Annotated { tpe, .. } => self.expand_in_type(tpe, ty),
             Type::SingleType { prefix, sym } => {
-                let t = self.get(*sym).ty.clone();
+                let t = self.singleton_underlying(*sym);
                 if t.is_no_type() {
                     self.expand_in_type(prefix, ty)
                 } else {

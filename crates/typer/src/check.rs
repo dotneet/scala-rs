@@ -8170,7 +8170,20 @@ impl Typer {
                 self.complete_binary_member(o, &name, tree.span);
                 found = self.st.lookup_member(o, &name);
             }
-            if found.is_empty() && !qual.sym.is_none() {
+            // Never a *method*. `qual.sym` on an application is the callee,
+            // and a method symbol's member list is its own parameters
+            // (`PickleSupply::install` allocates each one owned by the
+            // method). `m.staticClass(n).fullName` therefore found
+            // `staticClass`'s parameter -- which is called `fullName` -- as
+            // if it were a member of the result, and codegen read it as a
+            // field whose owner class was the method's erased descriptor:
+            // `ClassFormatError: Illegal class name
+            // "(Ljava/lang/String;)Lscala/reflect/api/Symbols$ClassSymbolApi;"`
+            // at load time, from a compile that reported nothing.
+            if found.is_empty()
+                && !qual.sym.is_none()
+                && self.st.get(qual.sym).kind != SymKind::Method
+            {
                 self.complete_binary_member(qual.sym, &name, tree.span);
                 found = self.st.lookup_member(qual.sym, &name);
             }
@@ -17546,23 +17559,21 @@ impl Typer {
 
     fn term_path_sym(&self, t: &Tree) -> Option<SymbolId> {
         match &t.kind {
-            TreeKind::Ident { name } => self.st.lookup_term(name).into_iter().find(|s| {
-                matches!(
-                    self.st.get(*s).kind,
-                    SymKind::Term | SymKind::Module | SymKind::ModuleClass
-                )
-            }),
+            TreeKind::Ident { name } => self
+                .st
+                .lookup_term(name)
+                .into_iter()
+                .find(|s| self.names_a_singleton(*s)),
             TreeKind::Select { qual, name } | TreeKind::SelectFromTypeTree { qual, name, .. } => {
                 let Some(qt) = self.term_path_type(qual) else {
                     // A package is not a value, so it has no type -- but it is
                     // still a legal path prefix: `p.q.HNil.type`.
                     let owner = self.path_owner_sym(qual)?;
-                    return self.st.lookup_member(owner, name).into_iter().find(|s| {
-                        matches!(
-                            self.st.get(*s).kind,
-                            SymKind::Term | SymKind::Module | SymKind::ModuleClass
-                        )
-                    });
+                    return self
+                        .st
+                        .lookup_member(owner, name)
+                        .into_iter()
+                        .find(|s| self.names_a_singleton(*s));
                 };
                 if let Type::Refined { decls, .. } = &qt {
                     if decls.iter().any(|d| {
@@ -17575,14 +17586,32 @@ impl Typer {
                     }
                 }
                 let cls = self.path_member_owner(&qt)?;
-                self.st.lookup_member(cls, name).into_iter().find(|s| {
-                    matches!(
-                        self.st.get(*s).kind,
-                        SymKind::Term | SymKind::Module | SymKind::ModuleClass
-                    )
-                })
+                self.st
+                    .lookup_member(cls, name)
+                    .into_iter()
+                    .find(|s| self.names_a_singleton(*s))
             }
             _ => None,
+        }
+    }
+
+    /// Whether `s` is a term a singleton type can be written over.
+    ///
+    /// The same three kinds `ident_is_stable` / `member_is_stable` accept,
+    /// **plus a `val` accessor read from a pickle**: a class file cannot tell
+    /// a `val`'s accessor from an ordinary `def`, so such a member is a
+    /// `SymKind::Method` carrying `Flags::ACCESSOR`. Leaving it out is what
+    /// made `Mirror[c.universe.type]` -- `c.universe` is `val universe: Universe`
+    /// on `blackbox.Context` -- report `stable identifier required, but
+    /// c.universe found` while `c.universe.Tree`, which goes through
+    /// `path_dependent_type` and only asks `member_is_stable`, compiled fine.
+    /// `docs/macros.md` §7.8 residual 6.
+    fn names_a_singleton(&self, s: SymbolId) -> bool {
+        let sy = self.st.get(s);
+        match sy.kind {
+            SymKind::Term | SymKind::Module | SymKind::ModuleClass => true,
+            SymKind::Method => sy.flags.contains(Flags::ACCESSOR),
+            _ => false,
         }
     }
 

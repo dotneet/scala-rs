@@ -883,6 +883,22 @@ impl PickleSupply {
         let mut took_function: Vec<usize> = Vec::new();
         for hit in &hits {
             let m = &hit.member;
+            // A nested `object`. Not a signature at all: what the class file
+            // carries is an accessor returning the module class, and the
+            // module's own members are read from its own pickle when someone
+            // asks for one. See `install_nested_module`.
+            if m.kind == MemberKind::Module && m.is_public_api() {
+                let owner = hit.owner.clone();
+                if let Some(id) = self.install_nested_module(st, bin, class_sym, &owner, name) {
+                    // The same object can be reached through more than one
+                    // hit (a trait inherited twice over); one accessor is
+                    // one member, not an overload of itself.
+                    if !installed.contains(&id) {
+                        installed.push(id);
+                    }
+                }
+                continue;
+            }
             if m.kind != MemberKind::Def && m.kind != MemberKind::Val {
                 continue;
             }
@@ -940,6 +956,155 @@ impl PickleSupply {
             installed.len()
         ));
         installed
+    }
+
+    /// Supply a nested `object` a pickle declares, as a **module accessor**.
+    ///
+    /// `trait Exprs { object Expr { … } }` compiles to an interface method
+    /// `Expr()Lscala/reflect/api/Exprs$Expr$;` plus a class file for the
+    /// module itself. `complete_named` reads only `Def` and `Val` members, so
+    /// a `MemberKind::Module` entry was dropped whole: `c.universe.Expr` was
+    /// "value Expr is not a member of Universe" and `import c.universe._;
+    /// Expr` was "not found: value Expr", both untrue -- the member is right
+    /// there in the pickle (`docs/macros.md` §7.8 residual 5, §7.13.4 gap 1).
+    ///
+    /// The accessor is installed on **`class_sym`**, the receiver the lookup
+    /// started from, exactly as `install` does for an inherited `def`. That
+    /// is not cosmetic: `Check::qualify_term_import` rewrites an unqualified
+    /// name from `import u._` back into `u.name` by matching the *member's
+    /// owner* against the import prefix's class, and a library class's
+    /// pickled parents are attached one level at a time -- so an accessor
+    /// parked on the declaring trait far up the linearisation is not
+    /// recognised as this import's, and the backend emitted `Main$.Expr()`
+    /// (`ClassCastException: Main$ cannot be cast to scala.reflect.api.Exprs`)
+    /// from a compile that reported nothing.
+    ///
+    /// The module's own members are *not* installed here. They are read from
+    /// its own pickle the first time one is asked for, which is the same
+    /// on-demand path every other library member takes; the nested spelling
+    /// (`scala.reflect.api.Exprs.Expr`) is what `complete_named` recovers
+    /// from the `$`-joined JVM name.
+    fn install_nested_module(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        pickle_owner: &str,
+        name: &str,
+    ) -> Option<SymbolId> {
+        let decl = self.ensure_class(st, bin, pickle_owner, false)?;
+        let decl_jvm = st.get(decl).jvm_name.clone();
+        if decl_jvm.is_empty() {
+            return None;
+        }
+        let module_jvm = format!("{decl_jvm}${name}$");
+        // The class file has to be there. Without this the accessor would
+        // name a class that does not exist and the call would fail to link at
+        // run time rather than at compile time.
+        if bin.find_class(&module_jvm).ok().flatten().is_none() {
+            trace(format_args!(
+                "{pickle_owner}#{name}: no class file {module_jvm} for the nested object"
+            ));
+            return None;
+        }
+        let mcls = match crate::classpath::find_by_jvm(st, &module_jvm) {
+            Some(id) => id,
+            None => {
+                // Allocated ownerless and then re-owned, the way
+                // `ensure_tag_module` does it: entering it in the declaring
+                // class's member list would put a second `Expr` next to the
+                // accessor, and member lookup would have to choose.
+                let id = st.alloc(
+                    format!("{name}$"),
+                    SymbolId::NONE,
+                    SymKind::ModuleClass,
+                    Flags::MODULE.with(Flags::FINAL),
+                    &module_jvm,
+                );
+                st.get_mut(id).owner = decl;
+                st.get_mut(id).ty = Type::ModuleRef(id);
+                st.get_mut(id).parents = vec![Type::AnyRef];
+                self.stubs.insert(module_jvm.clone(), id);
+                id
+            }
+        };
+        let want = Type::Method {
+            paramss: Vec::new(),
+            ret: Box::new(Type::ModuleRef(mcls)),
+        };
+        // An accessor already reachable from here may be **useless**. Reading
+        // `Exprs.class` as a plain class file (`adopt_binary_class`) installs
+        // `def Expr(): Exprs$Expr$` out of the JVM descriptor, and nothing
+        // had entered a symbol for `Exprs$Expr$` -- so the result type stayed
+        // an unresolved `Type::Named`, `class_sym_of` answered `None`, and
+        // `c.universe.Expr.apply` read "value apply is not a member of
+        // Exprs$Expr$". Every such copy is repaired, wherever it sits;
+        // `materialize::resolve_named_tags` does the same for the two tag
+        // companions. A result type that *did* resolve is left exactly as it
+        // is -- this adds precision, it never takes a member away.
+        let mut here = SymbolId::NONE;
+        for id in st.lookup_member(class_sym, name) {
+            if !matches!(st.get(id).kind, SymKind::Method | SymKind::Term) {
+                continue;
+            }
+            // Only a *method* is repaired: a `Term` of this name is a field
+            // some other path installed, and rewriting its type into a method
+            // type would break whatever reads it.
+            let resolved = st.get(id).kind != SymKind::Method
+                || match &st.get(id).ty {
+                    Type::Method { paramss, ret } if paramss.iter().all(|c| c.is_empty()) => {
+                        st.class_sym_of(ret).is_some()
+                    }
+                    other => st.class_sym_of(other).is_some(),
+                };
+            if !resolved {
+                st.get_mut(id).ty = want.clone();
+                let f = st.get(id).flags.with(Flags::ACCESSOR);
+                st.get_mut(id).flags = f;
+                if st.get(id).jvm_name.is_empty() {
+                    st.get_mut(id).jvm_name = format!("()L{module_jvm};");
+                }
+                trace(format_args!(
+                    "{pickle_owner}#{name}: repaired an accessor of nested object {module_jvm}"
+                ));
+            }
+            if st.get(id).owner == class_sym {
+                here = id;
+            }
+        }
+        if !here.is_none() {
+            return Some(here);
+        }
+        // Where the *call* has to name the accessor. `api/JavaUniverse` is a
+        // class file with `interfaces: 0` even though the trait extends
+        // `api.Universe`, so `invokevirtual JavaUniverse.Expr()` resolves to
+        // nothing (`NoSuchMethodError` at the first use, from a compile that
+        // reported nothing). `erased_desc` walks the same frontier `install`
+        // uses and says which class file really declares it, and whether the
+        // hop is one the JVM can make.
+        let internal = st.get(class_sym).jvm_name.clone();
+        let jvm_member = scala_rs_pickle::names::encode_method_name(name);
+        let found = self.erased_desc(bin, &internal, &jvm_member, &[])?;
+        // `alloc` enters it in `class_sym`'s member list, which is what
+        // `lookup_member` and `qualify_term_import` both read.
+        let acc = st.alloc(
+            name,
+            class_sym,
+            SymKind::Method,
+            // An `object` is a stable path: `ident_is_stable` and
+            // `member_is_stable` read `ACCESSOR` to say so.
+            Flags::ACCESSOR,
+            found.desc.clone(),
+        );
+        if found.off_the_bytecode_path && found.declared_in != internal {
+            st.get_mut(acc).declaring_class = found.declared_in;
+            st.get_mut(acc).declaring_is_interface = found.declared_by_interface;
+        }
+        st.get_mut(acc).ty = want;
+        trace(format_args!(
+            "{pickle_owner}#{name}: supplied nested object {module_jvm}"
+        ));
+        Some(acc)
     }
 
     #[allow(clippy::too_many_arguments)]
