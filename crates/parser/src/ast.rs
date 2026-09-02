@@ -20,6 +20,18 @@ impl NodeId {
     pub fn is_filled_arg(self) -> bool {
         self.0 == u32::MAX
     }
+
+    /// A default argument's right-hand side that the typer already typed, in
+    /// the scope the default was *written* in rather than the one the call
+    /// happens to sit in. Re-typing such a tree would undo exactly that, so
+    /// `Typer::type_expr` leaves it alone; unlike `FILLED_ARG` it stays in the
+    /// argument list when an application is resolved a second time, because it
+    /// occupies a parameter slot the re-resolution would otherwise mis-count.
+    pub const PRETYPED_DEFAULT: NodeId = NodeId(u32::MAX - 1);
+
+    pub fn is_pretyped_default(self) -> bool {
+        self.0 == u32::MAX - 1
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

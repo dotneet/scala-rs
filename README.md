@@ -74,8 +74,8 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 
 パースできる（またはデシュガーする）構文:
 
-- packages / imports。**`package` 句が開くのはそれが名指したパッケージだけ**（SLS 9.2）: 修飾付きの `package p.q` は `p.q` だけを開き、`p` のクラスもサブパッケージも見えない。入れ子の `package p { package q { … } }` は両方を開く。ルートは常に最後に見るので、`package p.q` からの修飾参照 `p.X` は解決する。この違いは観測できる —— `package slick.dbio` から見た `cats` は `slick.cats` ではなくトップレベルの `cats`（`agent/proj`。開いていないパッケージへの最終フォールバックが 1 つ残っており、その理由は `Checker::expose_from_unopened_packages` に書いてあります）
-- objects / classes / traits / case classes。**補助コンストラクタ** `def this(...) = this(...)`（連鎖の先頭は `this(...)`。`super(...)` や文のあとの `this` は診断）。サブクラスの `extends C(1)` は primary が親 ctor を呼ぶ。内部クラスの `new Inner` は ctor overload 選択後も `$outer` を `<init>` の第一引数に残す。**case class の `copy(...)`**（positional / 一部省略時は自分自身の対応フィールドを default / 名前付き引数。`copy` は namer 時点ではまだ ctor フィールドの型が確定していないため、フィールド型解決後の typer フェーズで `copy` 自身の引数シンボルと `copy$default$N` を作り直す。private ランタイムでも動く）。**コンストラクタの省略可能引数**（`class C(x: Int, y: Int = 5)` の `new C(1)` / `new C(y = 2, x = 1)`）: 末尾を省略した呼び出しへのデフォルト値の充填は、通常の `def` の default getter 経由ではなく（`this` が無い呼び出し元では使えないため）呼び出し側でその場を型付けする素朴なフォールバックのみ実装（先行引数を参照するデフォルトは非対応）。**名前付き引数での並べ替えは `new C(...)` でも動く**（コンストラクタのオーバーロードはパラメータ名で絞ってから型で決める）
+- packages / imports。**`package` 句が開くのはそれが名指したパッケージだけ**（SLS 9.2）: 修飾付きの `package p.q` は `p.q` だけを開き、`p` のクラスもサブパッケージも見えない。入れ子の `package p { package q { … } }` は両方を開く。ルートは常に最後に見るので、`package p.q` からの修飾参照 `p.X` は解決する。この違いは観測できる —— `package slick.dbio` から見た `cats` は `slick.cats` ではなくトップレベルの `cats`（`agent/proj`）。**開いていないパッケージへの最終フォールバックは削除しました**（`agent/tail6`）—— それが覆っていた穴（デフォルト引数の右辺が呼び出し側で型付けされる）を塞いだためです
+- objects / classes / traits / case classes。**補助コンストラクタ** `def this(...) = this(...)`（連鎖の先頭は `this(...)`。`super(...)` や文のあとの `this` は診断）。サブクラスの `extends C(1)` は primary が親 ctor を呼ぶ。内部クラスの `new Inner` は ctor overload 選択後も `$outer` を `<init>` の第一引数に残す。**case class の `copy(...)`**（positional / 一部省略時は自分自身の対応フィールドを default / 名前付き引数。`copy` は namer 時点ではまだ ctor フィールドの型が確定していないため、フィールド型解決後の typer フェーズで `copy` 自身の引数シンボルと `copy$default$N` を作り直す。private ランタイムでも動く）。**コンストラクタの省略可能引数**（`class C(x: Int, y: Int = 5)` の `new C(1)` / `new C(y = 2, x = 1)`）: 末尾を省略した呼び出しへのデフォルト値の充填は、通常の `def` の default getter 経由ではなく（`this` が無い呼び出し元では使えないため）保存した木をその場に差し込む形で実装。**その木は「書かれたスコープ」で型付けします**（`agent/tail6`。`Checker::record_default_scope` / `type_default_rhs_here`）—— 呼び出し側で型付けすると、定義ファイルの import が効かず、クラス自身のメンバまで見えてしまいます。コンストラクタのデフォルトからはクラスのメンバも先行する ctor 引数も見えません（`class Pair(a: Int, b: Int = a)` は nsc も `not found: value a`）。**名前付き引数での並べ替えは `new C(...)` でも動く**（コンストラクタのオーバーロードはパラメータ名で絞ってから型で決める）
 - `val` / `var` / `def`（ネストした `def` はパースする）
 - **テンプレート本体の式文**（`class A { println("ctorA") }`）。SLS 5.1 / 5.3 どおり、class なら主コンストラクタ、trait なら `$init$`、`object` ならモジュール初期化の一部として、`val` / `var` の初期化と**宣言順に交互に**走る。早期の `require(...)` / `assert(...)`、`if` / `match` / `try` / ループ / ラムダ、`case class` / ローカルクラス / 匿名クラス / メンバ `object` の本体でも同じ。詳細は「テンプレート本体の式文」節
 - パラメータ、ラムダ（型付き / 期待型から推論）、ブロック。**placeholder `_`**（nsc `withPlaceholders`）: `_ + 1` / `_.abs` / `f(_)` / `xs.map(_ + 1)` / Function2 `_ + _` / 入れ子 `_.map(_ + 1)` に加え **typed `_ : T`**（`(_: Int) + 1` / `(_: Int) + (_: Int)` / `(_: Int).abs` / `xs.map((_: Int) + 1)`）。レキサが `_:` を `Ident("_")` にするので、式位置では Underscore と同じ placeholder にする。bare `(_: Int)` は `unbound placeholder parameter`。`xs.map(_ : Int)` は nsc どおり wrap せず map に Int が渡り mismatch。unary / Function2 の既存 wrap は触らない。**メソッド適用のセクション** `f(_, x)` / `f(_, _)` は期待型が無くても呼び先のシグネチャからパラメータ型を取る（nsc と同じ条件で、呼び先が単一の非ジェネリックメソッドのときだけ。`poly(_, 3)` や overload された `"abc".substring(_)` は `missing parameter type for expanded function` のまま）。合成パラメータはソース順で並べる（`two(_, _)` は `(a, b) => two(a, b)`）。**リテラルの本体は期待型の結果に対して検査する** ── `xs.foreach((x: Int) => x + 1)` は value discarding、`fl((x: Int) => x)` は `Int => Long` への数値拡大。パラメータ型を書いたリテラルはオーバーロード解決のために期待型より先に型付けられるので、そのぶんは `adapt` 側でやる。関数**値**は対象外で、`val h: Int => Int = …; fu(h)` は nsc どおり `type mismatch`
@@ -4971,6 +4971,22 @@ before/after どちらでも通る性質のものです。
 `a_qualified_package_clause_does_not_open_its_parent`）は**修正前の `main` で
 落ちること**を確認済みです。
 
+`t6_defaults.scala` / `t6_defaults_bad.scala` / `t6_regex.scala` は
+`crates/cli/tests/tail6.rs` から回します。`t6_defaults` は**両モード**で
+`-Xverify:all` の下に走らせ、実 scalac 2.13.16 の標準出力と突き合わせます
+（デフォルト引数の右辺が**定義されたスコープ**で解決されること、default 付き
+implicit 引数が探索の空振り時に default に落ちること）。`t6_defaults_bad` は
+定義スコープに無い名前（`Hidden`）と、コンストラクタのデフォルトからは見えない
+先行 ctor 引数（`a`）の 2 件を拒み、`scalac_agrees_t6_defaults_bad_is_rejected`
+が**実 scalac も同じ 2 件を拒む**ことを固定します。`t6_regex` は `Regex` の実
+ABI（`CharSequence` パラメータ）が要るので library モードのみで、私有ランタイム
+では**黙って通さない**ことを `t6_regex_is_diagnosed_without_the_library` で
+見ています。cats-effect の jar が Coursier キャッシュにあるときだけ走る
+`an_implicit_from_a_jar_answers_for_its_supertypes` は、`implicit F: Async[F]`
+が `Sync[F]` / `GenTemporal[F, Throwable]` にも答えること（jar クラスの親を
+読むこと）を見ます。9 本のうち 5 本は**修正前の `main` で落ちること**を確認
+済みです。
+
 `t2_lang.scala` / `t2_lib.scala` は `crates/cli/tests/tail2.rs` から回します
 （`t2_lang` は**両モード**、`t2_lib` は library モードのみ。私有ランタイムには
 `scala.math.Integral` が無いので、`t2_lib_without_library_is_error` で**黙って
@@ -9581,7 +9597,8 @@ pickle している**別の穴があり、射影と無関係な
 * cats の `>>`（`no matching overload for (=> F[B])(FlatMap[F])F[B]`）3 件は
   before/after とも 3 件で、**型射影とは無関係**でした（`agent/cats2` の記録が
   正しい）。左辺が `Any` / `AnyRef` に落ちる別の原因です。
-* `value map is not a member of Any` 3 件は手つかずです。射影ともパッケージとも
+* （**`agent/tail6` で 1 件解決**。残り 2 件は下記のとおり根が別）
+  `value map is not a member of Any` 3 件は手つかずです。射影ともパッケージとも
   無関係で、3 つとも根が違います。1 つだけ根を特定しました:
   `DatabaseUrlDataSource.scala:31` の `findFirstMatchIn(url).map(…)` は
   **`prelude_regex.rs` が `("findFirstMatchIn", vec![Type::String], Type::Any)`
@@ -9595,6 +9612,7 @@ pickle している**別の穴があり、射影と無関係な
 * デフォルト引数の右辺が呼び出し側で型付けされる件（上の 2）は根の特定まで。
   直せば `expose_from_unopened_packages` と、修正前から出ている
   `not found: value ClassLoaderUtil` の両方が消えるはずです。
+  → **`agent/tail6` で解決**（予想どおり両方消えました）。
 * 射影が持ち歩けるのは**抽象型メンバー**だけです。ジェネリックな外側
   （`C[Int]#Inner` の `T` → `Int`）は `RefineDecl` が名前で照合する仕組みの
   都合で持ち歩けません。slick には現れません。
@@ -9774,6 +9792,149 @@ slick の `TableQueryMacroImpl` の `reify { TableQuery.apply[E](cons.splice) }`
   `rb_use.scala` は `RbUse.idOf[Int](5)` と型引数を書き下ろしています。
 * ローカル・パラメータの *free term*、ブロック、関数リテラル、`this`、型注釈は
   いずれも未実装（名指しで診断）。
+### デフォルト引数が型付けされる場所、`Regex` の実 ABI、default 付き implicit 引数（`agent/tail6`）
+
+`agent/proj` が「根は特定したが直していない」と残した 3 件を扱いました。
+`tests/slick_measure.sh` は **`errors=115 → 110`、`files_with_errors=41 → 39`**
+（新規エラーは 0）。codegen（`crates/backend/`）は触っていないので
+`tests/slick_subset.sh` は省略しています。
+
+#### 1. デフォルト引数の右辺は**書かれたスコープ**で型付けする
+
+`f$default$n` getter を呼べないデフォルト——とくに primary constructor の
+もの（nsc はコンパニオンに getter を出しますが、こちらは合成していません）
+——は、namer が保存した木を引数リストに差し込み、**呼び出しがある場所で**
+型付けしていました。その結果:
+
+* 名前が**呼び出し側のスコープ**で解決される。slick の
+  `class DriverDataSource(…, classLoader: ClassLoader =
+  ClassLoaderUtil.defaultClassLoader)` は `import slick.util.ClassLoaderUtil`
+  の下に書かれていますが、`slick/jdbc/DatabaseConfig.scala` の
+  `new DriverDataSource(…, driverObject = driver)` はその import を持たず
+  `not found: value ClassLoaderUtil`。
+* しかも span は**定義側の**もののまま、file index は呼び出し側なので、
+  キャレットが無関係な行（`DatabaseConfig.scala:48` の `new DriverDataSource`）
+  に立っていました。これが「呼び出し側で型付けしている」証拠です。
+* 同名の別シンボルにも化けます。`BasicBackend.scala:69` の
+  `actionListener: ActionListener[F] = defaultActionLogger[F]` は
+  `HeapBackend.scala:52` で再型付けされて `F` が **HeapBackend の** `F` に
+  なり、`found: ActionListener[F]  required: ActionListener[F]`。
+
+`Checker::record_default_scope` が定義時のスコープスタック・owner・
+`this_class`・unit を憶え、`type_default_rhs_here` がそれを差し戻して型付け
+します。型付け済みの木は `NodeId::PRETYPED_DEFAULT` を持ち、`type_expr` は
+それを見たら**再型付けせず** `adapt` だけします（名前付き引数の経路では
+呼び出し側の引数ループがもう一度型を付けにくるため）。
+
+コンストラクタのデフォルトでは、憶えるスコープから**クラス自身のメンバ
+スコープを外し**、owner もクラスの外に出します。`new C(1)` の時点で
+インスタンスは無いので、フィールドも先行する ctor 引数も名指しできません
+——これは nsc も同じで、`class Pair(a: Int, b: Int = a)` は実 scalac 2.13.16
+でも `not found: value a` です（`val a` でも同じ）。外さずに残すと `a` が
+**フィールド**に解決し、差し込まれた木が呼び出し側の `this` からそれを
+読んで実行時 `ClassCastException` になりました。
+
+これで `agent/proj` が「消す条件」をコメントに書き残した最終フォールバック
+**`Checker::expose_from_unopened_packages` を削除**しました。
+副作用として `crates/cli/tests/multifile.rs` の
+`enclosing_package_names_are_visible` が落ちます。この fixture
+（`tests/multi/pkg_inner.scala`）は `package top.inner` から `top.Helper` を
+無修飾で見ており、**実 scalac 2.13.16 はこれを拒否します**（`-Xsource:3` の
+有無に関わらず `not found: value Helper`）。緩いフォールバックだけが通して
+いた形なので、fixture を入れ子綴り `package top { package inner { … } }` に
+直しました（nsc が受理する形。修飾綴りの方は `crates/cli/tests/proj.rs` が
+固定しています）。
+
+#### 2. default 付きの implicit 引数
+
+implicit 探索が空振りしたとき、その引数に default があれば nsc は
+**default を使います**（`missing implicit` を出すのは default が無いとき
+だけ）。slick の `ScalaBaseType` はそれ前提で書かれていて——
+
+```scala
+def apply[T](implicit classTag: ClassTag[T], ordering: scala.math.Ordering[T] = null)
+```
+
+——`ScalaBaseType[T]` が `could not find implicit value of type Ordering[T]`
+になっていました（`JdbcTypesComponent.scala` の 2 か所）。
+`Checker::implicit_param_default` を `fill_implicit_params_in` の
+フォールバック列（`ClassTag` / view / `TypeTag` の隣）に足しました。
+default の本体は 1 と同じく**書かれたスコープ**で型付けします。
+
+#### 3. `prelude_regex` が jar のシグネチャを覆い隠していた
+
+`prelude_regex.rs` は `unapplySeq` のほかに `findAllIn` /
+`findFirstMatchIn` / `replaceAllIn` / `replaceFirstIn` / `split` を
+「pickle が無いときのフォールバック」として宣言していました。ところが
+**jar のメンバは誰かが要求するまで `lookup_member` に見えない**ので、
+install 時のガード `is_empty()` は常に真——つまり**フォールバックが常に
+本番**でした。結果は 2 つ:
+
+* `findAllIn` / `findFirstMatchIn` の結果型が `Any`。
+  `MysqlCustomProperties.findFirstMatchIn(url).map(…)` が
+  `value map is not a member of Any`（`DatabaseUrlDataSource.scala:31`）。
+* 使える結果型を持っていた方も、パラメータが `String`。実 ABI は
+  `CharSequence` なので descriptor が合わず、コンパイルは通って実行時に
+  `NoSuchMethodError: Regex.replaceAllIn(String, String)`。
+
+**5 つとも削除**しました。pickle は 5 つとも実シグネチャで供給できます
+（`unapplySeq` だけは供給されないので残します）。これで供給できない名前は
+「`Regex` のメンバではない」と診断されます——嘘の型を黙って与えるより
+正直です。
+
+`value map is not a member of Any` の残り 2 件
+（`RewriteJoins.scala:139` の `foundRefs.filter(…)` と
+`JdbcActionComponent.scala:162` の `prit`）は**同種ではありません**。
+`agent/proj` の記録どおり 3 件は根が別々でした。
+
+#### 4. jar 由来の implicit 候補は、親を読むまで自分の型にしか合わない
+
+`class C[F[_]](implicit F: Async[F])` の下で `implicitly[Sync[F]]` が
+`could not find implicit value of type Sync[F]`。`Async` の親リストは
+プログラムが**名前を書いただけ**のクラスでは空のままで、implicit 探索は
+不変借用の下で走るので自分では完了させられません。同じファイルの前の行で
+`Async[F]` を型として書くだけで通るようになる——スコープ規則ではなく
+補完漏れの形です。`Checker::warm_implicit_candidates`（探索が空振りした
+**あとだけ**走る）を足しました。標準ライブラリのクラスは対象外です:
+親を classfile から足し直すと `mutable.HashSet` の階層が書き換わり、slick に
+`containsSymbol(Set[A])` のオーバーロードエラーが 2 件増えました
+（`warm_own_scope_once` のコメントが警告しているのと同じ罠）。
+
+#### fixture とテスト
+
+* `tests/fixtures/t6_defaults.scala`（+ `expected/`）——
+  default の右辺が定義スコープで解決されること（positional / 名前付きの
+  `new`、通常メソッド、default 付き implicit 引数の 4 経路）。両モード。
+* `tests/fixtures/t6_defaults_bad.scala` —— 定義スコープに無い名前は
+  エラー（`Hidden`）、コンストラクタのデフォルトからは先行 ctor 引数も
+  見えない（`a`）。**実 scalac も同じ 2 件を出す**ことを別テストで固定。
+* `tests/fixtures/t6_regex.scala`（+ `expected/`）—— `Regex` の 7 メソッドと
+  `unapplySeq`。jar モードのみ（private ランタイムには `Regex` が無いので
+  診断されることを固定）。
+* cats-effect の jar が Coursier キャッシュにあるときだけ走る
+  `an_implicit_from_a_jar_answers_for_its_supertypes`。
+
+テストは新ファイル `crates/cli/tests/tail6.rs` の 9 本です。
+**修正前の main では 5 本が落ちる**ことを確認しています。
+
+#### 残件
+
+* **`GenTemporal[F, _]` 2 件は残しました**（`ConcurrencyControl.scala` の
+  `wait.timeoutTo(timeout, …)`）。4 の修正で
+  `implicitly[GenTemporal[F, Throwable]]` は通るようになりましたが、
+  `timeoutTo[B >: A, E](…)(implicit F: GenTemporal[F, E])` の `E` は
+  implicit 節にしか現れない型パラメータで、探索に届く前に **`Type::Wildcard`
+  に潰されて**います（`GenTemporal[F, _]`）。`timeoutTo[Unit, Throwable]` と
+  **明示的に型引数を書いても同じ**なので、`solve_implicit_only_tparams` /
+  `adapt_implicit_apply` より手前——`cats.effect.syntax` の暗黙変換で得た
+  `GenTemporalOps_` の `Select` を型付けする段階——で潰れています。
+  `Wildcard` は変数の同一性を消すので、どの候補も合わせられません。
+* `Ordering[Null]`（`Type.scala:395`、`new ScalaBaseType[Null]`）は default
+  ではなく実際に `Ordering[Null]` を要求する呼び出しで、別の根です。
+* コンストラクタのデフォルトに対する nsc のコンパニオン getter
+  （`C$default$n`）は依然として未合成です。上に書いたとおり nsc でも
+  先行 ctor 引数は参照できないので観測できる差は無いはずですが、
+  分離コンパイルで jar 越しにデフォルトを補うことはできません。
 
 ## ライセンス
 

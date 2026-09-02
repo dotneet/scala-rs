@@ -86,7 +86,14 @@ fn cross_file_references_resolve() {
     let _ = fs::remove_dir_all(&out);
 }
 
-/// A name in an enclosing package is visible without an import.
+/// A name in an enclosing package is visible without an import -- when the
+/// clause that opened it is the *nested* one (SLS 9.2). `tests/multi/
+/// pkg_inner.scala` used to say `package top.inner`, which nsc 2.13.16
+/// rejects (`not found: value Helper`, with and without `-Xsource:3`); it
+/// compiled here only through the last-resort package walk `agent/proj` left
+/// in place, and `agent/tail6` deleted that walk once the hole it covered --
+/// a default argument typed at the call site -- was closed. The qualified
+/// spelling is `crates/cli/tests/proj.rs`.
 #[test]
 fn enclosing_package_names_are_visible() {
     let Some(jar) = scala_library_jar() else {
