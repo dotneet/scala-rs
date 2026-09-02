@@ -497,3 +497,156 @@ fn ex_unsupported_prefixes_are_named() {
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&out_dir);
 }
+
+/// Stage D-1: an expansion containing `Function` and `ValDef`.
+///
+/// This is the tree slick's `TableQueryMacroImpl.apply` builds --
+/// `Function(List(ValDef(Modifiers(Flag.PARAM), TermName("tag"),
+/// Ident(typeOf[Tag].typeSymbol), EmptyTree)), Apply(Select(New(TypeTree(
+/// e.tpe)), termNames.CONSTRUCTOR), List(Ident(TermName("tag")))))` -- so
+/// every node in it has to survive the trip: the function literal, the
+/// parameter's modifiers, the type `Ident` built from a symbol, and a
+/// reference from the body back to a parameter whose symbol has no name the
+/// bridge could carry.
+#[test]
+fn sd_function_and_valdef_expand_and_run() {
+    if !prerequisites("sd_use") {
+        return;
+    }
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("sd_impl");
+    let uses = tmp_dir("sd_use");
+
+    let out = compile("sd_impl", &impls, &[]);
+    assert!(
+        out.status.success(),
+        "compile sd_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out = compile("sd_use", &uses, &[&impls]);
+    assert!(
+        out.status.success(),
+        "compile sd_use failed: {}",
+        diagnostics(&out)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "sd_use"),
+        expected_stdout("sd_use"),
+        "stdout mismatch for sd_use"
+    );
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
+/// The same two files through real scalac 2.13.16.
+///
+/// A `Function` rebuilt with the wrong parameter name, or a `ValDef` whose
+/// modifiers were dropped, would still compile and still run: only the output
+/// would differ. This is what makes the recorded expectation nsc's answer
+/// rather than scala-rs's.
+#[test]
+fn sd_function_and_valdef_match_real_scalac() {
+    if !prerequisites("sd_use scalac diff") {
+        return;
+    }
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip sd_use scalac diff: scalac not obtainable");
+        return;
+    };
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("sd_impl-scalac");
+    let uses = tmp_dir("sd_use-scalac");
+
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            impls.to_str().unwrap(),
+            fixtures_dir().join("sd_impl.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected sd_impl.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            &format!("{}:{}", reflect.display(), impls.display()),
+            "-d",
+            uses.to_str().unwrap(),
+            fixtures_dir().join("sd_use.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected sd_use.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "sd_use (real scalac build)"),
+        expected_stdout("sd_use"),
+        "recorded expectation for sd_use does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
+/// The three stage-D forms that are refused, each by name.
+#[test]
+fn sd_unsupported_forms_are_named() {
+    if !prerequisites("sd_gaps_bad") {
+        return;
+    }
+    let impls = tmp_dir("sd_impl-gaps");
+    let out = compile("sd_impl", &impls, &[]);
+    assert!(
+        out.status.success(),
+        "compile sd_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out_dir = tmp_dir("sd_gaps_bad");
+    let out = compile("sd_gaps_bad", &out_dir, &[&impls]);
+    let err = diagnostics(&out);
+    assert!(
+        !out.status.success(),
+        "expected sd_gaps_bad to fail, got: {err}"
+    );
+    for needle in [
+        // A row class this run compiles is not on the macro classpath yet.
+        "class SdLocalRow not found",
+        // A nullary macro whose result is applied.
+        "the implementation takes 0 argument(s) and the call site supplies 2",
+        // A modifier with no name in the table.
+        "a definition marked `DEFERRED`, a modifier scala-rs cannot rebuild yet",
+    ] {
+        assert!(
+            err.contains(needle),
+            "expected {needle:?} in diagnostics, got {err:?}"
+        );
+    }
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&out_dir);
+}

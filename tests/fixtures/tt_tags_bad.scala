@@ -7,7 +7,9 @@
 //
 // A type constructor at its arguments is *not* on this list any more: it is
 // built with `appliedType`, and `tt_tags.scala` runs the result against real
-// scalac. What is still refused is a constructor one of whose *arguments*
+// scalac. Neither are tuples, function types and arrays (§7.13), which name
+// `scala.TupleN` / `scala.FunctionN` / `scala.Array` and compose the same
+// way. What is still refused is a constructor one of whose *arguments*
 // cannot be built, and a type whose shape has no `staticClass` at all.
 
 import scala.reflect.runtime.universe._
@@ -23,11 +25,10 @@ object Main {
   // recurses, so the reason names the argument rather than the constructor.
   val a = typeOf[List[Nest.Inner]]
 
-  // A tuple and a function type: their arguments would have to be reified
-  // into `scala.TupleN` / `scala.FunctionN` first, which is a shape the
-  // creator does not write.
-  val b = weakTypeOf[(Int, Foo)]
-  val b2 = typeOf[Int => Foo]
+  // A tuple whose *element* cannot be built. The tuple itself is composed
+  // now -- `scala.Tuple2` at its arguments, `tt_tags.scala` runs it against
+  // real scalac -- so what is left is the element that has no body.
+  val b = weakTypeOf[(Int, Nest.Inner)]
 
   // A class nested in an object: `staticClass` walks packages only; nsc
   // reaches this one with `selectType` on the module class.

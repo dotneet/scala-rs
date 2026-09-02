@@ -86,5 +86,20 @@ object Main {
     println(typeOf[List[Int]] =:= typeOf[List[String]])
     println(typeOf[List[Int]] <:< typeOf[Any])
     println(typeOf[List[Int]].typeSymbol.fullName)
+
+    // A tuple, a function type and an array. Each is a `Type` of its own in
+    // scala-rs and an ordinary `TypeRef` in reflect, so the creator names
+    // `scala.TupleN` / `scala.FunctionN` / `scala.Array` and composes the
+    // arguments the same way (`docs/macros.md` §7.13). slick's
+    // `TableQueryMacroImpl` asks for exactly the function one --
+    // `c.Expr[Tag => E]` -- and was stopped here.
+    println(show(weakTypeOf[(Int, Foo)]))
+    println(show(typeOf[Int => Foo]))
+    println(show(typeOf[(Int, String) => Foo]))
+    println(show(typeOf[Array[Int]]))
+    println(show(typeOf[List[(Int, Foo)]]))
+    println(typeOf[Int => Foo] =:= typeOf[Function1[Int, Foo]])
+    println(typeOf[(Int, Foo)].typeSymbol.fullName)
+    println(typeOf[Int => Foo].typeSymbol.fullName)
   }
 }

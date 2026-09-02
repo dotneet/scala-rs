@@ -285,6 +285,10 @@ public final class ScalaRsMacroEngine {
             serConstant(o, sb);
             return;
         }
+        if (isA(o, "scala.reflect.api.Trees$ModifiersApi")) {
+            serMods(o, sb);
+            return;
+        }
         if (isA(o, "scala.collection.immutable.List")) {
             sb.append("(l");
             Object it = call(o, "iterator", 0);
@@ -413,6 +417,47 @@ public final class ScalaRsMacroEngine {
         }
         sb.append("(c ").append(Sexp.quote(kind)).append(' ')
           .append(Sexp.quote(text)).append(')');
+    }
+
+    /**
+     * `Modifiers`, as the *names* of the flags that are set.
+     *
+     * The flag values are read off `universe.Flag` reflectively rather than
+     * hard-coded: nsc's bit layout is an internal detail, several bits carry
+     * two names (`BYNAMEPARAM` is `COVARIANT`, `DEFAULTPARAM` is `TRAIT`), and
+     * a number on the wire would make scala-rs guess. Every name whose bit is
+     * set is written, and whatever bits are left over travel as a hex number
+     * so the Rust side can refuse a modifier it has no name for rather than
+     * dropping it.
+     *
+     * `privateWithin` and the annotations travel too, for the same reason: a
+     * `ValDef` scala-rs rebuilds without them would be a different definition.
+     */
+    static void serMods(Object mods, StringBuilder sb) throws Exception {
+        long flags = ((Number) call(mods, "flags", 0)).longValue();
+        sb.append("(mods (f");
+        long known = 0;
+        Object flagValues = call(universe, "Flag", 0);
+        for (Method m : flagValues.getClass().getMethods()) {
+            if (m.getParameterCount() != 0 || m.getReturnType() != long.class) {
+                continue;
+            }
+            String n = m.getName();
+            if (!n.equals(n.toUpperCase()) || n.isEmpty()) {
+                continue;
+            }
+            m.setAccessible(true);
+            long v = ((Number) m.invoke(flagValues)).longValue();
+            if (v != 0 && (flags & v) == v) {
+                known |= v;
+                sb.append(' ').append(Sexp.quote(n));
+            }
+        }
+        sb.append(") (rest ").append(Sexp.quote(Long.toHexString(flags & ~known))).append(") ");
+        Object pw = call(mods, "privateWithin", 0);
+        sb.append(Sexp.quote(pw == null ? "" : String.valueOf(pw))).append(' ');
+        ser(call(mods, "annotations", 0), sb);
+        sb.append(')');
     }
 
     // -------------------------------------------------------------- Context
