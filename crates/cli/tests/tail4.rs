@@ -17,7 +17,11 @@
 //! puts `New` on its head, and `Typer::flatten_curried_new` folds the clauses
 //! into the single flat argument list that `pick_ctor` (and the JVM) already
 //! expect -- the same thing `type_parent_ctor_app_in` has always done for
-//! `extends A(1)(2)`.
+//! `extends A(1)(2)` -- but only as far as the constructor the *first* list
+//! picks has room for. `new Foo(1)(2)` on a one-parameter `Foo` with an
+//! `apply` is `(new Foo(1)).apply(2)`, and folding the two lists together
+//! would build a two-argument `Foo` instead, silently where the class has one
+//! (`Ov` in the fixture).
 //!
 //! Two further bugs were behind that one, both only reachable once a curried
 //! `new` typechecked at all:

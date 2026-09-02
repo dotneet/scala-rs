@@ -8416,6 +8416,16 @@ Product` を直しました（5）。slick には依存しておらず、`Symbol
 先頭が `New` のときに限り引数リストを 1 本に潰す。`pick_ctor` も JVM も
 コンストラクタの引数リストは平坦なものとして扱うので、ここが合流点です。
 
+ただし潰すのは**第 1 リストが選ぶコンストラクタが受け取れる分だけ**です。
+`class Foo(a: Int) { def apply(b: Int) = … }` の `new Foo(1)(2)` は nsc では
+`(new Foo(1)).apply(2)` で、2 リストを潰すと**2 引数の `Foo` を作ってしまう**
+——クラスがそういうコンストラクタを持っていれば黙って。どのコンストラクタを
+作っているかは第 1 リストの長さが決めるので（`class Ov(a: Int) { def this(a:
+Int, b: Int) = … }` の `new Ov(1)(2)` は 1 引数の方）、第 1 節の長さが一致する
+候補から総引数数を取り、無ければ「第 1 節がそれ以上長い」候補で代用します
+（省略されたデフォルト・implicit の分）。両方 `t4_curried_new.scala` に
+入れてあります。
+
 #### 2. コンストラクタの節は `new` に書かれた型引数で読む
 
 `slick/lifted/Case.scala:21` の
@@ -8499,6 +8509,7 @@ Opt[Nothing]` / `case class Sm[+A](v: A) extends Opt[A]`）なので、
 継ぎ目に触れたので `cargo test --workspace` を回しました。
 
 slick: `errors=177 files_with_errors=57` → `errors=166 files_with_errors=53`。
+subset は `38 files / 204 classes / verified=204 failed=0` のままです。
 
 ## ライセンス
 
