@@ -5908,8 +5908,9 @@ impl Typer {
             span,
             format!(
                 "cannot expand reify {{ ... }}: {why}. scala-rs reifies literals, \
-                 applications and selections over static `object` references and \
-                 `.splice`d expressions; see docs/macros.md \u{a7}7.14."
+                 applications and selections over static `object` references, \
+                 `.splice`d expressions, and type arguments it can rebuild from a \
+                 tag; see docs/macros.md \u{a7}7.15."
             ),
         );
     }
@@ -5961,6 +5962,30 @@ impl Typer {
                 self.reify_refs_in(fun, out);
                 for a in args {
                     self.reify_refs_in(a, out);
+                }
+            }
+            // A type argument is rebuilt rather than named: `f[E]` inside a
+            // macro implementation means the `E` *that implementation* was
+            // instantiated at, which is knowable only through the tag in
+            // scope. Same three shapes a `TypeTag` is built from, so the same
+            // builder answers -- and the same refusal when it cannot.
+            TreeKind::TypeApply { fun, args } => {
+                self.reify_refs_in(fun, out);
+                for a in args {
+                    let ty = self.tree_to_type(a);
+                    if ty.is_no_type() || ty.is_error() {
+                        continue;
+                    }
+                    let mark = self.diags.len();
+                    let body = self.tag_body(crate::materialize::Tag::Weak, &ty, a.span);
+                    self.diags.truncate(mark);
+                    out.insert(
+                        a.id,
+                        match body {
+                            Ok(b) => crate::reify::ReifyRef::Type(Box::new(b)),
+                            Err(why) => crate::reify::ReifyRef::TypeGap(why),
+                        },
+                    );
                 }
             }
             TreeKind::If { cond, thenp, elsep } => {

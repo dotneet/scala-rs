@@ -32,4 +32,15 @@ object RbBad {
     import c.universe._
     reify { { val k = 1; k } }
   }
+
+  /** A type argument with no tag in scope: there is nothing to rebuild `T`
+    * from, and guessing would put the wrong type into the expansion. */
+  def noTag[T](c: Context)(x: c.Expr[T]): c.Expr[T] = {
+    import c.universe._
+    reify { RbBadHelper.id[T](x.splice) }
+  }
+}
+
+object RbBadHelper {
+  def id[T](x: T): T = x
 }

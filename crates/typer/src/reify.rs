@@ -166,6 +166,23 @@ pub(crate) enum ReifyRef {
     /// `x.splice`: the argument's own tree, rebased into the mirror the
     /// creator was handed -- `x.in[$u.type]($m).tree`. Carries the `x`.
     Splice(Box<Tree>),
+    /// A type argument, rebuilt inside the creator and wrapped in
+    /// `rs.mkTypeTree(...)` -- which is `TypeTree().setType(...)`, the tree
+    /// nsc's reifier puts in a type position.
+    ///
+    /// The type itself is built the way a `TypeTag` is
+    /// (`crate::materialize::TagBody`): a monomorphic class is one
+    /// `staticClass` call, a type constructor at arguments is `appliedType`
+    /// over those, and an abstract type is only knowable through a tag in
+    /// scope -- which is the case slick's `TableQueryMacroImpl` needs, where
+    /// `reify { TableQuery.apply[E](cons.splice) }` reaches `E` through the
+    /// implicit `c.WeakTypeTag[E]`.
+    Type(Box<crate::materialize::TagBody>),
+    /// A type argument whose type scala-rs cannot rebuild, carrying the
+    /// reason the tag builder gave. Kept as a classification of its own so
+    /// the report says *which* type and why, rather than "a type in a reify
+    /// body is not reified yet".
+    TypeGap(String),
 }
 
 /// What a `reify { … }` body needs beyond a quasiquote's.
@@ -449,6 +466,13 @@ impl<'a> Reifier<'a> {
                     )],
                 ),
                 ReifyRef::Splice(e) => self.splice_tree(ctx, e),
+                ReifyRef::Type(body) => self.call(
+                    self.support_member("mkTypeTree"),
+                    vec![self.rebuild_type(ctx, body)],
+                ),
+                ReifyRef::TypeGap(why) => {
+                    return Err(format!("a type argument cannot be rebuilt: {why}"))
+                }
             }));
         }
         match &t.kind {
@@ -457,6 +481,7 @@ impl<'a> Reifier<'a> {
             TreeKind::Literal { .. }
             | TreeKind::Select { .. }
             | TreeKind::Apply { .. }
+            | TreeKind::TypeApply { .. }
             | TreeKind::If { .. } => Ok(None),
             TreeKind::Ident { name } => Err(format!(
                 "`{name}` is a local, a parameter, or a name that does not stand for \
@@ -464,6 +489,64 @@ impl<'a> Reifier<'a> {
             )),
             other => Err(format!("{} is not reified yet", describe(other))),
         }
+    }
+
+    /// One type, rebuilt inside the creator; see `ReifyRef::Type`.
+    ///
+    /// The same three shapes `crate::materialize` builds, written against the
+    /// creator's *cast* mirror rather than its parameter: `$m` is
+    /// `Mirror[$u.type]`, so `$m.staticClass(n)` is a `$u.ClassSymbol` and the
+    /// result is a `$u.Type` -- which is what `mkTypeTree` and the tree being
+    /// built around it want. The materialiser's own creator can select on the
+    /// parameter directly because its result is erased to `Types$TypeApi` and
+    /// nothing further is built on it.
+    fn rebuild_type(&self, ctx: &ReifyCtx, body: &crate::materialize::TagBody) -> Tree {
+        use crate::materialize::TagBody;
+        let static_class = |name: &str| {
+            self.call(
+                self.select(self.local(&ctx.mirror_local), "staticClass"),
+                vec![self.lit(Lit::String(name.to_string()))],
+            )
+        };
+        match body {
+            TagBody::StaticClass(name) => self.select(
+                self.select(static_class(name), "asType"),
+                "toTypeConstructor",
+            ),
+            TagBody::Applied { class_name, args } => {
+                let list = self.call(
+                    self.node(TreeKind::Ident {
+                        name: "List".to_string(),
+                    }),
+                    args.iter().map(|a| self.rebuild_type(ctx, a)).collect(),
+                );
+                self.call(
+                    self.universe_member("appliedType"),
+                    vec![static_class(class_name), list],
+                )
+            }
+            TagBody::FromTag(tag) => self.select(self.rebased(ctx, tag), "tpe"),
+        }
+    }
+
+    /// `<e>.in[$u.type]($m)` -- an `Expr` or a tag moved into the mirror the
+    /// creator was handed.
+    ///
+    /// The type argument is written out because `$m`'s own type is
+    /// `Mirror[$u.type]` only after the cast the creator makes: the universe's
+    /// abstract `Mirror` loses its `api.Mirror[self.type]` bound in the
+    /// pickle (`docs/macros.md` §7.14, item 3).
+    fn rebased(&self, ctx: &ReifyCtx, e: &Tree) -> Tree {
+        let singleton = self.node(TreeKind::SingletonTypeTree {
+            ref_: Box::new(self.local(&ctx.universe_local)),
+        });
+        self.call(
+            self.node(TreeKind::TypeApply {
+                fun: Box::new(self.select(e.clone(), "in")),
+                args: vec![singleton],
+            }),
+            vec![self.local(&ctx.mirror_local)],
+        )
     }
 
     /// `<e>.in[$u.type]($m).tree` -- what `.splice` becomes.
@@ -475,17 +558,7 @@ impl<'a> Reifier<'a> {
     /// abstract `Mirror` loses its `api.Mirror[self.type]` bound in the
     /// pickle (`docs/macros.md` §7.14, item 3).
     fn splice_tree(&self, ctx: &ReifyCtx, e: &Tree) -> Tree {
-        let singleton = self.node(TreeKind::SingletonTypeTree {
-            ref_: Box::new(self.local(&ctx.universe_local)),
-        });
-        let rebased = self.call(
-            self.node(TreeKind::TypeApply {
-                fun: Box::new(self.select(e.clone(), "in")),
-                args: vec![singleton],
-            }),
-            vec![self.local(&ctx.mirror_local)],
-        );
-        self.select(rebased, "tree")
+        self.select(self.rebased(ctx, e), "tree")
     }
 
     /// `new C`, `new C(a)`, `new C(a)(b)` -- `Ok(None)` when `t` is not one.
@@ -629,11 +702,20 @@ impl<'a> Reifier<'a> {
         // that is a second reifier (nsc's `reifyType`) scala-rs does not have.
         // Refused rather than reified as the written name, which would mean
         // whatever the call site's scope makes of it.
-        if self.reify.is_some() {
-            return Err(format!(
-                "{} in a `reify` body is not reified yet",
-                describe_type(&t.kind)
-            ));
+        if let Some(ctx) = &self.reify {
+            return match ctx.refs.get(&t.id) {
+                Some(ReifyRef::Type(body)) => Ok(self.call(
+                    self.support_member("mkTypeTree"),
+                    vec![self.rebuild_type(ctx, body)],
+                )),
+                Some(ReifyRef::TypeGap(why)) => {
+                    Err(format!("a type argument cannot be rebuilt: {why}"))
+                }
+                _ => Err(format!(
+                    "{} in a `reify` body is not reified yet",
+                    describe_type(&t.kind)
+                )),
+            };
         }
         match &t.kind {
             // Written with the `apply` spelled out: `SyntacticEmptyTypeTree`

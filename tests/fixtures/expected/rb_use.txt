@@ -9,4 +9,8 @@ head-tail
 false
 7
 3
+5
+s
+1/x
+3
 2

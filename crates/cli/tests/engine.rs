@@ -847,10 +847,12 @@ fn rd_reify_shape_matches_real_scalac() {
 /// (`docs/macros.md` §7.14, `crates/typer/src/reify_expand.rs`).
 ///
 /// `rd_impl.scala` above writes out, by hand, the tree `reify` has to build;
-/// this pair writes `reify` and makes the compiler build it. Twelve lines of
-/// output cover the three stages: a literal body, a static `object` reached
-/// through `mirror.staticModule`, and `.splice` rebased through `Expr.in` --
-/// including two splices whose side effects say each was evaluated once.
+/// this pair writes `reify` and makes the compiler build it. Sixteen lines of
+/// output cover the four stages: a literal body, a static `object` reached
+/// through `mirror.staticModule`, `.splice` rebased through `Expr.in`, and a
+/// type argument rebuilt from `staticClass` or from the tag in scope (the
+/// shape slick's `TableQueryMacroImpl` needs) -- including two splices whose
+/// side effects say each was evaluated once.
 #[test]
 fn rb_reify_expands_and_runs() {
     if !prerequisites("rb_use") {
@@ -955,10 +957,11 @@ fn rb_reify_matches_real_scalac() {
     let _ = fs::remove_dir_all(&uses);
 }
 
-/// The bodies `reify` refuses, each named. Real scalac accepts all four (it
-/// reifies a local as a *free term* and has a reifier for types); scala-rs
-/// does not build those, and says so rather than reifying the bare name --
-/// which would compile, run, and mean whatever stood at the call site.
+/// The bodies `reify` refuses, each named. Real scalac accepts all five (it
+/// reifies a local as a *free term*, and its type reifier does not need a tag
+/// in scope); scala-rs does not build those, and says so rather than reifying
+/// the bare name -- which would compile, run, and mean whatever stood at the
+/// call site.
 #[test]
 fn rb_reify_gaps_are_named() {
     if !prerequisites("rb_bad") {
@@ -973,6 +976,7 @@ fn rb_reify_gaps_are_named() {
         "`n` is a local, a parameter, or a name that does not stand for a static `object`",
         "a type ascription is not reified yet",
         "a block is not reified yet",
+        "a type argument cannot be rebuilt: `T`, an abstract type with no tag in scope",
     ] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }

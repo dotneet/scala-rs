@@ -2065,16 +2065,35 @@ lowering は quasiquote と同じ `crates/typer/src/reify.rs` の `Reifier` だ�
 | --- | --- |
 | 静的 `object` | `$u.internal.reificationSupport.mkIdent($m.staticModule("<full name>"))` |
 | `x.splice` | `x.in[$u.type]($m).tree` |
-| それ以外の識別子・型・ブロック・関数リテラル・`this` | **診断**（`cannot expand reify { ... }: …`） |
+| 型引数 | `$u.internal.reificationSupport.mkTypeTree(<型>)` |
+| それ以外の識別子・ブロック・関数リテラル・`this`・型注釈 | **診断**（`cannot expand reify { ... }: …`） |
 
 最後の行が肝である。nsc はローカルやパラメータを *free term*
 （`newFreeTerm` + `mkIdent`）にして展開に持ち回るが、scala-rs はそれを組めない。
 裸の名前で組めば**コンパイルも実行も通り**、展開先にたまたま在る同名の
 何かを指す——reification が防ぐためにある、まさにそのバグになる。よって断る。
 
-型についても同じで、reify モードの `Reifier::typ` は必ず `Err` を返す。
-nsc の `reifyType` に相当するものが無いからで、書かれた名前で `TypeTree` を
-組めば同じ捕まらないバグになる。
+**型引数**も名前では組まない。`f[E]` はマクロ実装が**どの `E` で実体化されたか**を
+意味するので、書かれた名前で `TypeTree` を組めば同じ捕まらないバグになる。中身は
+`TypeTag` を組むのと同じ材料（`crate::materialize::TagBody`）で作り、
+`Reifier::rebuild_type` が creator の**キャストした** mirror `$m`
+（`Mirror[$u.type]`）に対して書き下ろす:
+
+| `TagBody` | 木 |
+| --- | --- |
+| `StaticClass(n)` | `$m.staticClass(n).asType.toTypeConstructor` |
+| `Applied { c, args }` | `$u.appliedType($m.staticClass(c), List(<args>))` |
+| `FromTag(tag)` | `tag.in[$u.type]($m).tpe` |
+
+materialiser 自身の creator は結果が `Types$TypeApi` に erase されてそれ以上
+何も積まないのでパラメータに直接 select できるが、こちらは結果を `mkTypeTree` に
+渡すので `$u.Type` でなければならない。最後の `FromTag` が slick の
+`reify { TableQuery.apply[E](cons.splice) }` に要るものである。
+組めない型（スコープにタグの無い抽象型など）は `ReifyRef::TypeGap` になり、
+タグ生成器の言い分をそのまま添えて診断する。
+
+型引数**以外**の型（型注釈 `(3: Int)` の右辺など）は依然として `Err` である。
+nsc の `reifyType` に相当するものは無い。
 
 #### 識別子の判定
 
@@ -2084,6 +2103,9 @@ nsc の `reifyType` に相当するものが無いからで、書かれた名前
 無い）なら静的 `object`、`Expr[T]` の `.splice` なら splice、それ以外は
 分類しない＝`Reifier` が名指しで断る。`NodeId` で引くので、判定と lowering が
 同じ節点を見ていることが保証される。
+
+型引数は `tree_to_type` で `Type` にしてから `Check::tag_body` に渡す
+（`Tag::Weak`。`TypeTag <: WeakTypeTag` なのでどちらのタグでも見つかる）。
 
 `Expr.apply[T]` の `T` は本体全体を 1 度だけ投機型付けして取る（`Type::Constant`
 は `lit_underlying` で widen する）。implicit 節の `WeakTypeTag[T]` は §7.10 の
@@ -2103,20 +2125,25 @@ driver が既に持っている `SourceFile::src` を渡すようにした。渡
 
 #### 検証
 
-`tests/fixtures/rb_impl.scala` + `rb_use.scala` を 2 段コンパイルして 12 行印字し、
-**同じ 2 ファイルを実 scalac 2.13.16 で 2 段コンパイルして実行しても同じ 12 行**
+`tests/fixtures/rb_impl.scala` + `rb_use.scala` を 2 段コンパイルして 16 行印字し、
+**同じ 2 ファイルを実 scalac 2.13.16 で 2 段コンパイルして実行しても同じ 16 行**
 （`tests/fixtures/expected/rb_use.txt`）。最後の 2 行は splice を副作用つきの式で
 埋めたもので、木が splice を落としたり 2 回組んだりしたら数が変わる。
-`rb_bad.scala` は断る 4 形が名指しで診断されることを固定する（実 scalac は
-4 つとも通すので、これは未実装の告白である）。
+`rb_bad.scala` は断る 5 形が名指しで診断されることを固定する（実 scalac は
+5 つとも通すので、これは未実装の告白である）。
+
+slick は `errors=115 → 113`、`files_with_errors=41 → 41`。
+`TableQuery.scala:50` の `reify { TableQuery.apply[E](cons.splice) }` は
+**展開できるようになり**、`cannot expand reify` と、その巻き添えだった
+`cannot expand apply` の 2 件が消えた。`crates/backend/` は触っていないので
+`slick_subset.sh` は回していない。
 
 #### 残っているもの
 
-1. **型の reification。** slick の `TableQueryMacroImpl` は
-   `reify { TableQuery.apply[E](cons.splice) }` で、型引数 `E` を
-   スコープの `WeakTypeTag[E]` から `mkTypeTree(tag.in($m).tpe)` に落とす必要が
-   ある（`crate::materialize` の `TagBody::FromTag` と同じ材料）。ここが
-   slick の 2 マクロに届くための次の 1 手である。
-2. ローカル・パラメータの *free term*、ブロック、関数リテラル、`this`。
-3. §7.13 / §7.14 の残件（展開の型引数、`TableQuery.apply` のオーバーロード選択、
-   trait の中の入れ子*クラス*を型として書く形）はそのまま。
+1. 同じ行に残る `value apply is not a member of TableQuery[E]` は §7.13 の残件
+   （`TableQuery.apply` のオーバーロード選択）で、reify とは別件である。
+2. 呼び出し側で**推論された**型引数はまだマクロに渡らない（§7.13 の残件 1）。
+   `rb_use.scala` が `RbUse.idOf[Int](5)` と書き下ろしているのはそのためである。
+3. ローカル・パラメータの *free term*、ブロック、関数リテラル、`this`、
+   型引数以外の型。
+4. §7.14 の残件（trait の中の入れ子*クラス*を型として書く形）はそのまま。

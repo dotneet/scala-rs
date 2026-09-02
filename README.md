@@ -290,11 +290,15 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
   `Expr.apply[T]($m, new $treecreator1())` を組む
   （`crates/typer/src/reify_expand.rs`）。**衛生性**は nsc と同じで、
   静的 `object` は `mkIdent($m.staticModule("..."))`、`.splice` は
-  `x.in[$u.type]($m).tree`、ローカル・パラメータ・型は**名指しで断る**
-  （`cannot expand reify { ... }: ...`。黙って裸の名前を組まない）。
-  リテラル / 静的 `object` への適用と選択 / `.splice` が実 scalac 2.13.16 と
-  dual-run で一致する（`tests/fixtures/rb_impl.scala` + `rb_use.scala`、
-  [`docs/macros.md`](docs/macros.md) §7.15）
+  `x.in[$u.type]($m).tree`、型引数は `mkTypeTree`（単相クラスは
+  `staticClass`、型パラメータはスコープの `WeakTypeTag` から
+  `tag.in($m).tpe`）。ローカル・パラメータ・ブロック・型注釈・タグの無い型は
+  **名指しで断る**（`cannot expand reify { ... }: ...`。黙って裸の名前を組まない）。
+  リテラル / 静的 `object` への適用と選択 / `.splice` / 型引数が
+  実 scalac 2.13.16 と dual-run で一致する（`tests/fixtures/rb_impl.scala` +
+  `rb_use.scala`、[`docs/macros.md`](docs/macros.md) §7.15）。
+  slick の `TableQueryMacroImpl` の `reify { TableQuery.apply[E](cons.splice) }`
+  はこれで通り、`errors=115 → 113`
   （`else` の無い `if`、by-name 型、by-name / 可変長パラメータ、
   手続き構文 `def f() { … }`、パターン定義、自分型、early definition）と、
   `..$` と普通の引数の混在、`type` 定義
@@ -4743,8 +4747,8 @@ implicit の失敗（`no implicit` / `ambiguous implicit`）は typer のユニ�
 | `lf2_lift.scala`（同上） | `Liftable`（実 scalac 2.13.16 と三者一致、`showRaw` まで）: `Tree` でない穴——リテラル / `Constant` / `Name`（項・型・パターン・名前枠）/ `Type` / `Symbol` / `..$` の要素——が標準インスタンスと同じ木になること | `expected/lf2_lift.txt`（29 行） |
 | `lf2_ctx.scala`（同上、コンパイルのみ） | マクロ実装の中の `WeakTypeTag` / `Expr` の持ち上げ（slick の `mapToImpl` の形）と `symbolOf[T]` / `weakTypeOf[T]`。scala-rs と実 scalac の両方が通し、classfile は `java -Xverify:all` でロード・検証される | （コンパイル結果のみ） |
 | `lf2_lift_bad.scala`（同上） | 持ち上げられない穴が型を名指しで診断されること（`File` / rank 0 の `List[Int]` / `..$` 越しの `Symbol`）と、`reify { … }` がローカルを名指しで断ること（`cannot expand reify { ... }: \`f\` is a local ...`） | （診断のみ） |
-| `rb_impl.scala` + `rb_use.scala`（`crates/cli/tests/engine.rs`、2 段コンパイル） | **`reify { … }` の展開**（実 scalac 2.13.16 と dual-run）: リテラル 4 種、静的 `object` への適用、`.splice`（引数 1 つ / 2 つ / `String` / `Boolean`）、`c.universe.reify` の形。splice は副作用で「1 回ずつ評価される」ことまで見る | `42` `hello` `true` `9000000000` `42` `42` `42` `head-tail` `false` `7` `3` `2` |
-| `rb_bad.scala`（同上） | `reify` が断る 4 形が名指しで診断されること（パラメータ / ローカル / 型注釈 / ブロック）。実 scalac は 4 つとも通すので、これは**未実装の告白**である | （診断のみ） |
+| `rb_impl.scala` + `rb_use.scala`（`crates/cli/tests/engine.rs`、2 段コンパイル） | **`reify { … }` の展開**（実 scalac 2.13.16 と dual-run）: リテラル 4 種、静的 `object` への適用、`.splice`（引数 1 つ / 2 つ / `String` / `Boolean`）、`c.universe.reify` の形、型引数（単相クラス `staticClass` と、タグから解く型パラメータ 1 つ・2 つ）。splice は副作用で「1 回ずつ評価される」ことまで見る | `42` `hello` `true` `9000000000` `42` `42` `42` `head-tail` `false` `7` `3` `5` `s` `1/x` `3` `2` |
+| `rb_bad.scala`（同上） | `reify` が断る 5 形が名指しで診断されること（パラメータ / ローカル / 型注釈 / ブロック / タグの無い型引数）。実 scalac は 5 つとも通すので、これは**未実装の告白**である | （診断のみ） |
 | `qr_forms_bad.scala`（同上） | パーサが区別ごと正規化してしまう形が、必ず名指しで診断されること（右結合演算子 / `else` の無い `if` / `_` プレースホルダ / by-name 型 / `..$` の混在 / `type` 定義） | （診断のみ） |
 | `dq_defs.scala`（`crates/cli/tests/quasi.rs`、scala-reflect.jar が要る） | 定義の reification（実 scalac 2.13.16 と三者一致、`showRaw` まで）: `class` / `case class` / `trait` / `object` / `def` / 修飾つき `val`・`var`、`Modifiers` のフラグ、クラス・パラメータのアクセサ・フラグ、implicit 節、型パラメータと変位・境界、nsc が補う親、定義を含むブロック、匿名クラスの本体、名前・パラメータ・親・本体の位置の穴 | `expected/dq_defs.txt`（93 行） |
 | `dq_defs_bad.scala`（同上） | 定義のうち落とせない 13 形が、必ず名指しで診断されること（自分型 / early definition / `private[X]` / by-name・可変長パラメータ / 手続き構文 / 型も本体も無い `def` / パターン定義 / 高階型パラメータ / context bound / `case` クラスの親の `..$` / 末尾でない implicit 節 / `macro` 定義） | （診断のみ） |
@@ -9716,7 +9720,13 @@ fixture は 2 組です。
   あっても意味は変わりません。
 * `x.splice` は `x.in[$u.type]($m).tree`。creator が渡された mirror に
   rebase するので、周りの木と同じ universe に属します。
-* **ローカル・パラメータ・`this`・型・ブロックは名指しで断ります。** nsc は
+* **型引数**は `mkTypeTree(...)`。中身は `TypeTag` を組むのと同じ材料
+  （`crate::materialize::TagBody`）で、単相クラスは `$m.staticClass(...)`、
+  型構築子は `appliedType`、型パラメータは**スコープのタグ**から
+  `tag.in[$u.type]($m).tpe` です。最後のものが slick の
+  `reify { TableQuery.apply[E](cons.splice) }` に要ります。
+* **ローカル・パラメータ・`this`・ブロック・型注釈・タグの無い型引数は
+  名指しで断ります。** nsc は
   ローカルを *free term* にして展開に持ち回りますが、scala-rs はそれを組めません。
   裸の名前で組めばコンパイルも実行も通り、**呼び出し先にたまたま在る名前**を
   指してしまう——reification が防ぐためにある、まさにそのバグです。
@@ -9737,26 +9747,33 @@ fixture は 1 組 + 異常系 1 本です。
 
 * `tests/fixtures/rb_impl.scala` + `tests/fixtures/rb_use.scala` —
   リテラル 4 種 / 静的 `object` への適用 / `.splice`（1 つ・2 つ・`String`・
-  `Boolean`）/ `c.universe.reify` を macro 実装として書き、2 段コンパイルして
-  **12 行印字**します。同じ 2 ファイルを実 scalac 2.13.16 で 2 段コンパイル
-  して実行しても**同じ 12 行**です。最後の 2 行は splice を副作用つきの式で
-  埋めたもので、木が splice を落としたり 2 回組んだりしたら数が変わります。
-* `tests/fixtures/rb_bad.scala` — 断る 4 形（パラメータ / ローカル / 型注釈 /
-  ブロック）。実 scalac は 4 つとも通すので、これは**未実装の告白**です。
+  `Boolean`）/ `c.universe.reify` / 型引数（`Int` と、タグから解く型パラメータ
+  1 つ・2 つ）を macro 実装として書き、2 段コンパイルして **16 行印字**します。
+  同じ 2 ファイルを実 scalac 2.13.16 で 2 段コンパイルして実行しても
+  **同じ 16 行**です。最後の 2 行は splice を副作用つきの式で埋めたもので、
+  木が splice を落としたり 2 回組んだりしたら数が変わります。
+* `tests/fixtures/rb_bad.scala` — 断る 5 形（パラメータ / ローカル / 型注釈 /
+  ブロック / タグの無い型引数）。実 scalac は 5 つとも通すので、これは
+  **未実装の告白**です。
 
 テストは `crates/cli/tests/engine.rs` に追記した 3 本
 （`rb_reify_expands_and_runs` / `rb_reify_matches_real_scalac` /
 `rb_reify_gaps_are_named`）です。
 
+`tests/slick_measure.sh` は `errors=115 → 113`、`files_with_errors=41 → 41`。
+slick の `TableQueryMacroImpl` の `reify { TableQuery.apply[E](cons.splice) }`
+は**展開できるようになり**、`cannot expand reify` と、その巻き添えだった
+`cannot expand apply` の 2 件が消えました。`crates/backend/` を触っていないので
+`tests/slick_subset.sh` は省略しています。
+
 #### 残件
 
-* **型の reification が無い**ので、`TableQuery.apply[E](cons.splice)`
-  （slick の `TableQueryMacroImpl`）はまだ届きません。型引数 `E` は
-  スコープの `WeakTypeTag[E]` から `mkTypeTree(tag.in($m).tpe)` に落とすのが
-  nsc の形です。
-* ローカル・パラメータの *free term*、ブロック、関数リテラル、`this` は
+* 同じ行に残る `value apply is not a member of TableQuery[E]` は §7.13 の残件
+  （`TableQuery.apply` のオーバーロード選択）で、reify とは別件です。
+* 呼び出し側で**推論された型引数**はまだマクロに渡らない（§7.13 の残件 1）ので、
+  `rb_use.scala` は `RbUse.idOf[Int](5)` と型引数を書き下ろしています。
+* ローカル・パラメータの *free term*、ブロック、関数リテラル、`this`、型注釈は
   いずれも未実装（名指しで診断）。
-* `TableQuery.apply` のオーバーロード選択（§7.13 の残件）はそのままです。
 
 ## ライセンス
 

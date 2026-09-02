@@ -19,6 +19,8 @@ object RbHelper {
   def twice(n: Int): Int = n * 2
   def join(a: String, b: String): String = a + "-" + b
   def flip(b: Boolean): Boolean = !b
+  def id[T](x: T): T = x
+  def pair[A, B](a: A, b: B): String = a.toString + "/" + b.toString
 }
 
 object RbImpl {
@@ -76,4 +78,28 @@ object RbImpl {
 
   /** `reify` written on the universe rather than imported from it. */
   def qualified(c: Context): c.Expr[Int] = c.universe.reify { 7 }
+
+  /** A *type argument* built from a monomorphic class: one `staticClass`. */
+  def three(c: Context): c.Expr[Int] = {
+    import c.universe._
+    reify { RbHelper.id[Int](3) }
+  }
+
+  /** A type argument that is a type *parameter*, knowable only through the
+    * tag in scope -- `tag.in($m).tpe`. This is the shape slick's
+    * `TableQueryMacroImpl` needs: `reify { TableQuery.apply[E](cons.splice) }`.
+    */
+  def idOf[T](c: Context)(x: c.Expr[T])(implicit t: c.WeakTypeTag[T]): c.Expr[T] = {
+    import c.universe._
+    reify { RbHelper.id[T](x.splice) }
+  }
+
+  /** Two of them, so the tags are told apart rather than reused. */
+  def pair[A, B](c: Context)(a: c.Expr[A], b: c.Expr[B])(implicit
+      ta: c.WeakTypeTag[A],
+      tb: c.WeakTypeTag[B]
+  ): c.Expr[String] = {
+    import c.universe._
+    reify { RbHelper.pair[A, B](a.splice, b.splice) }
+  }
 }

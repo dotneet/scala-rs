@@ -19,6 +19,11 @@ object RbUse {
   def join(a: String): String = macro RbImpl.join
   def flipped(b: Boolean): Boolean = macro RbImpl.flipped
   def qualified: Int = macro RbImpl.qualified
+  def three: Int = macro RbImpl.three
+  // The type argument is written out at every call below: an *inferred* one
+  // is not handed to a macro yet (`docs/macros.md` §7.13, residual 1).
+  def idOf[T](x: T): T = macro RbImpl.idOf[T]
+  def pair[A, B](a: A, b: B): String = macro RbImpl.pair[A, B]
 }
 
 object Main {
@@ -33,6 +38,10 @@ object Main {
     println(RbUse.join("head"))
     println(RbUse.flipped(true))
     println(RbUse.qualified)
+    println(RbUse.three)
+    println(RbUse.idOf[Int](5))
+    println(RbUse.idOf[String]("s"))
+    println(RbUse.pair[Int, String](1, "x"))
     // The splices are evaluated where they stand, so a reified body that
     // dropped or duplicated one shows up as a different count.
     var n = 0
