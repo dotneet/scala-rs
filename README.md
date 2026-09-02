@@ -8711,6 +8711,176 @@ Opt[Nothing]` / `case class Sm[+A](v: A) extends Opt[A]`）なので、
 slick: `errors=177 files_with_errors=57` → `errors=166 files_with_errors=53`。
 subset は `38 files / 204 classes / verified=204 failed=0` のままです。
 
+### slick 残 155 件の小さな塊 4 つ（`agent/tail5`）
+
+テストは `crates/cli/tests/tail5.rs`、fixture 接頭辞は `t5` です。
+
+計測は `files=184 errors=155 files_with_errors=52` →
+**`files=184 errors=149 files_with_errors=49`**（−6 件 / −3 ファイル）。
+
+ブリーフの推測はどれも一部または全部が外れていました（過去のスライスと同じ
+パターンです）。実際に確かめて分かった根は次の 4 つです。
+
+#### 1. 修飾されたコンパニオンへの named arguments
+
+`pkg1.Bar(a = 1, b = "x")`（修飾）は「unimplemented syntax: named
+arguments (method parameters not resolved)」でしたが、`Bar(a = 1, b =
+"x")`（非修飾）は最初から通っていました。`fun.sym` が違うのが原因です。
+非修飾は `apply` メソッドそのものに解決されますが、修飾された方は
+**モジュール** `Bar` に解決されます —— `rewrite_receiver_apply` は修飾
+されたコンパニオン参照をわざと書き換えません（`scala.Some(1)` の codegen
+がそこに依存しています）。モジュールシンボルは自分の `paramss` を持たない
+ので、`first_clause_ids` は何も見つけられませんでした。
+
+`named_arg_param_ids` に、`fun.sym` が `Module` のときはそのモジュールの
+`apply` メンバーからパラメータ名を読む分岐を足しました。オーバーロードの
+callee がすでにやっていることと同じです。fixture: `t5_named_qual(_bad)`。
+
+#### 2. `override def f = ...` は戻り型を継承する
+
+`override def run(n: Node) = n match { case Wrap(x) => run(x) ... }` は
+`def run(n: Node): Any = ...` をオーバーライドしていても「recursive
+method run needs result type」でした。SLS 6.1 の「オーバーライドする定義
+が自分の型を書いていなければ、オーバーライドされるメンバーの型とみなす」
+の通りにすると、戻り型は上書き前から分かっているはずです。何もオーバー
+ライドしていない同じ形のメソッド（`t5_override_infer_bad.scala`）は、
+実 scalac 2.13.16 と同じく引き続きこのエラーになります —— オーバーライド
+の場合だけが間違っていました。
+
+`type_def_sig`（`override` 修飾子が付いているときだけ）が
+`overridden_ret_type` で祖先を辿り、すでに戻り型が分かっている同名・同引数
+のメンバーを探して借ります。借りるのは戻り型だけで、本体は書かれた通りに
+検査・推論されます。
+
+直接の修正の裏に、孤立した再現では気付かなかった 2 つの副作用がありました
+（slick 全体で計測して初めて見つかったもの）：
+
+- **借りた型は「オーバーライドしたクラスから見た」形に読み替えないと
+  いけません。** 最初の版は祖先の宣言をそのまま返していて、非ジェネリック
+  なオーバーライドでは正しくても、ジェネリックだと同じ文字が違うシンボル
+  を指しているだけの `type mismatch; found: T required: T` を大量に出し
+  ました。`subst_as_seen_from`（`bind_found` / `type_select` が継承した
+  メンバーに使うのと同じもの）で読み替えるようにしました。
+- **型が「分かった」メンバーが、まだ遅延完了待ちのまま残っていました。**
+  `register_typed_sig` はパース構文（`: T` が書かれているか）しか見ておらず、
+  別の方法で型が確定していても関係なく `pending_sigs` に残していました。
+  本体の中の**自己参照**がその途中で自分自身に `complete_lazy_sig` を
+  呼んでしまい、シンボルをロックして、いままさに型付け中の本体の複製に
+  もう一度 `type_def_body` を再入し、その複製の中の自己参照が今度こそ
+  ロックされたシンボルを見つけて偽の循環参照を報告していました。
+  `register_typed_sig` は、戻り型がすでに分かっている `DefDef` はもう遅延
+  ではないと扱うようにしました。
+- **`overridden_ret_type` は最初、まだ未完了の祖先候補をその場で
+  `complete_lazy_sig` により強制完了させていました。** これは候補の本体
+  （と、その本体がする前方参照）を、**候補の宣言ファイル自身の**トップ
+  ダウンパスがまだそのファイルの本当のスコープ（import 込み）を登録して
+  いない段階で走らせてしまい、その import 経由でしか見えない名前が
+  「owner chain」フォールバックで解決され、でっち上げた無関係な span に
+  「not found: value X」を報告していました（slick で計測すると
+  `errors=155` が `errors=307` になりました。多くは `not found: value
+  Capability` / `DumpInfo` が、実際には正しく import しているファイルの
+  中に出るというものでした）。まだ未完了の候補は単に見つからなかったのと
+  同じように読み飛ばし、その候補自身のさらに祖先へ探索を続けるだけに
+  変えました。それで十分です —— 本当に該当する例はすべて、戻り型が明示的
+  に書かれていて何も強制しなくてよい祖先に行き着きます。
+
+fixture: `t5_override_infer(_bad)`。
+
+#### 3. `recv.copy(...)` が `new C(...)` を**名前**で組み立てていた
+
+`try_rewrite_case_copy` は `recv.copy(f = v)` を `new C(...)` に書き換え
+ますが、その `new` の型の頭を裸の `Ident { name: "C" }` として組み立てて
+いました —— 呼び出し元はすでに `C` の本物の `SymbolId`（レシーバの型に対
+する `class_sym_of`）を持っているのに、書き換えた木を型付けするときに
+**通常の字句名前解決**でもう一度 `C` を見つけさせていました。別ファイルの
+継承チェーンを経由するだけで、`.copy()` を呼ぶファイル自身が単純名で import
+していないクラスには、その名前がスコープにある理由がありません。これは
+行・列なしの「not found: type C」でした（合成した木は本物の span を持た
+ないため）。slick の `slick.jdbc.BaseResultConverter` の `override def
+getDumpInfo = super.getDumpInfo.copy(...)` は `slick.util.DumpInfo` を
+一度も import しておらず、まさにこれでした。
+
+直し方は、この書き換えが合成する `Ident` にすでに分かっている `SymbolId`
+から `sym` / `ty` を直接設定し、`New` を型付けするコードにそれが設定済み
+のときは名前で解決し直さずそのまま使わせるようにしただけです。
+fixture: `t5_case_copy_qual(_bad)`。
+
+#### 4. SAM（リテラル `FunctionN` ではない）パラメータへの関数リテラル
+
+`case class Builder(sql: String, setParameter: SetParameter[Unit])`
+（`SetParameter[-T] extends ((T, PositionedParameters) => Unit)`）に対する
+`Builder(sql, (u, pp) => ...)` は、オーバーロード採点の段階でまるっきり
+マッチしませんでした。関数リテラルを callee の期待するパラメータ形に
+事前型付けする仕組み（nsc の `pretypeArgs`、`agreed_lambda_params`）は
+2 個以上の候補を持つ本物の `Overload` でしか動かず、`Builder(...)` は
+ケースクラスが合成した `apply` 1 個だけなのでそれに当たらず、
+リテラルは `(<notype>, <notype>) => <notype>` のまま採点に回りました。
+仮に型付けできていたとしても、`arg_score` の関数パラメータの規則は
+リテラルな `scala.FunctionN` しか認識しておらず、それを継承するだけの
+トレイトは通りませんでした。slick の `SQLActionBuilder(sql, (u, pp) =>
+...)` と `case class SQLActionBuilder(sql: String, setParameter:
+SetParameter[Unit])` が同じ形です。
+
+直したのは `arg_score` だけです：クラス型のパラメータが SAM 変換可能
+（`SymbolTable::sam_sig`）なら、その抽象メソッドが表す関数型として比較
+します。リテラルな `FunctionN` にすでにあった扱いと同じです。型が未確定
+のリテラルはパラメータが空いている間はどんな関数形のパラメータにも
+マッチする既存の規則があるので、採点自体が SAM を見通せれば別途の事前
+型付けは不要でした。`agreed_lambda_params` の事前型付けを単一候補にも
+広げる案も試しましたが、これは元に戻しました —— slick 全体で計測すると、
+cats-effect の `Async[F].uncancelable[A](body: Poll[F] => F[A]): F[A]`
+のような、まだ自分の型パラメータが確定していない単一候補シグネチャにも
+事前型付けがかかってしまい、呼び出し自身の推論が `A` を解決する前に
+間違った（未確定の）型を先に決めてしまって、`arg_score` 単独の修正より
+はるかに多くの退行を起こしたためです（リテラルはどちらにせよ正しく型付け
+されます —— 本当の（そしてここでは唯一の）候補が決まったあとに走る
+`adapt_args_to_params` が、実際のパラメータ型に対してすべての引数を
+もう一度型付けし直します）。fixture: `t5_sam_ctor(_bad)`。
+
+`t5_sam_ctor` は `--scala-library` でのみ検証しています。`SetParameter`
+は `Function2` を継承しますが、私有ランタイム（`--no-scala-library`）は
+今のところ `scala.Function0` / `scala.Function1` しか出しておらず、これは
+名前付き引数にもオーバーライドにも SAM 変換にも関係のない、独立した既存の
+穴です（`val f: (Int, Int) => Int = (a, b) => a + b` だけの最小再現でも
+`--no-scala-library` の出力が `NoClassDefFoundError: scala/Function2` で
+落ちることを確認済み）。このスライスには含めず、別件として切り出しました。
+
+#### 検証
+
+4 本の正常系はすべて `--scala-library` / `--no-scala-library` 両方で
+`-Xverify:all` を通し、real scalac 2.13.16 の標準出力とも突き合わせて
+います（`t5_sam_ctor` のみ `--scala-library` だけ、上記の理由により）。
+4 本とも修正前の `main` では失敗することを確認済みです。4 本の異常系は、
+それぞれの直した経路が「何でも通す」ようになっていないこと（未知の
+パラメータ名、オーバーライドしていない再帰、SAM パラメータへのアリティ
+違反）を固定しており、real scalac 2.13.16 も同じ 4 本を拒否します。
+`crates/typer/src/check.rs` と `crates/typer/src/lazysig.rs`（遅延シグネ
+チャ補完の継ぎ目）に触れたので、`--test tail5 --test tail3 --test tail4
+--test conform --test e2e`（553 本）と、供給の継ぎ目チェックリスト
+（`--test overloadshadow --test ambigmap --test setapply --test uniteq
+--test integral --test ordsummon --test mutcoll`）を前景で回しました。
+全て green です。`cargo fmt --all -- --check` は差分なし、`cargo clippy
+--workspace --all-targets --release` の警告は変更前後で完全に同一（新規
+警告ゼロ）です。
+
+#### 残件
+
+「quasiquote q"..." (a hole of type `<error>` is not lifted)」（3 件、
+`slick/lifted/ShapedValue.scala`）はブリーフの言う通りカスケードでした
+——根はクオートやマクロとは無関係で、`slick/lifted/ShapedValue.scala:42`
+の `rTag.tpe.decls.collect(...)` が `value collect is not a member of
+Scopes.MemberScope` になっていることです。実 scala-reflect の
+`ScopeApi`（`javap` で確認）は `scala.collection.Iterable[SymbolApi]` を
+継承しているので `collect` はそこにあるはずですが、scala-rs 側のリフレク
+ション API プレリュード／pickle 補完がそれを見つけられていません。
+`MemberScope` は scala-rs 側で自前定義しておらず、scala-reflect の jar の
+pickle をそのまま読んでいるので、これは pickle 補完（`pickle_supply.rs`
+／このスライスでは触っていない領域）の別の穴です。「クオートの穴」という
+症状表現は誤りで、実装すべきは quasiquote 側ではなくこの `collect` 供給
+漏れです。3 件のみで影響範囲が狭く、今回は根の特定までにとどめました。
+
+slick: `errors=155 files_with_errors=52` → `errors=149 files_with_errors=49`。
+
 ## ライセンス
 
 Apache-2.0

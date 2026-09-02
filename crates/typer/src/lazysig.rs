@@ -58,6 +58,13 @@ pub(crate) struct PendingSig {
     pub scopes: Option<Rc<Vec<Scope>>>,
     /// `type_val_sig` / `type_def_sig` already ran on this tree.
     pub sig_done: bool,
+    /// The unit this definition's source spans are relative to. A diagnostic
+    /// raised while completing it on demand (`complete_lazy_sig`) has to be
+    /// tagged with *this* index, not whatever unit was being typed when the
+    /// forward reference triggered the completion -- the two are the same
+    /// unit only by coincidence. `PendingDefault` (`type_pending_defaults`)
+    /// already carries this for the same reason.
+    pub file_index: usize,
 }
 
 /// `val x = rhs` / `def f = rhs`: no type annotation, but a body to infer from.
@@ -95,6 +102,7 @@ impl Typer {
                 this_class: self.st.this_class,
                 scopes: None,
                 sig_done: false,
+                file_index: self.file_index,
             },
         );
     }
@@ -106,7 +114,23 @@ impl Typer {
         if tree.sym.is_none() {
             return;
         }
-        if !needs_lazy_sig(tree) {
+        // `needs_lazy_sig` only reads the parsed syntax (no written `: T`),
+        // which stays true for `override def run(n: Node) = ...` even after
+        // `type_def_sig` has already filled in a concrete return type by
+        // borrowing the overridden member's (see its call to
+        // `overridden_ret_type`). Leaving such a symbol pending anyway meant
+        // a self-recursive call inside its own body -- typed moments later
+        // by the body pass -- found itself still in `pending_sigs` and ran
+        // `complete_lazy_sig` on itself: that call locks the symbol and
+        // re-enters `type_def_body` on a cloned copy of the very body
+        // already being typed, whose own self-reference then finds the
+        // symbol locked and reports a spurious "recursive method run needs
+        // result type" -- even though the return type was never actually in
+        // question. A `DefDef` whose signature pass already produced a real
+        // return type has nothing left to infer, so it is not lazy anymore.
+        let ret_known = matches!(&tree.kind, TreeKind::DefDef { name, .. } if name != "<init>")
+            && matches!(&tree.ty, Type::Method { ret, .. } if !ret.is_no_type());
+        if !needs_lazy_sig(tree) || ret_known {
             self.pending_sigs.remove(&tree.sym);
             return;
         }
@@ -119,6 +143,7 @@ impl Typer {
                 this_class: self.st.this_class,
                 scopes: Some(scopes),
                 sig_done: true,
+                file_index: self.file_index,
             },
         );
     }
@@ -224,10 +249,26 @@ impl Typer {
         let saved_owner = self.st.owner;
         let saved_this = self.st.this_class;
         let saved_ret = self.return_meth;
+        let saved_file = self.file_index;
         let saved_scopes = self.swap_in_pending_scopes(&p);
         self.st.owner = p.owner;
         self.st.this_class = p.this_class;
         self.return_meth = None;
+        // The tree being completed carries spans relative to *its own* unit,
+        // not whichever one was being typed when the forward/self reference
+        // triggered this completion. Without this, a diagnostic raised while
+        // completing a member declared in another file was tagged with the
+        // *caller's* `file_index`, and rendering then applied that member's
+        // real byte offsets to the wrong file's source text -- landing the
+        // caret on unrelated code and, since the message is unaffected,
+        // reporting a real error under a nonsensical location. Surfaced by
+        // `overridden_ret_type` (`type_def_sig`), which forces far more
+        // cross-file completions than the call sites this already handled
+        // correctly by accident (each was typically referencing a symbol
+        // whose own file had already finished typing, so the mismatch was
+        // latent). `type_pending_defaults` already carries `file_index` on
+        // its own `PendingDefault` for the identical reason.
+        self.file_index = p.file_index;
 
         let mut t = p.tree;
         let is_val = matches!(t.kind, TreeKind::ValDef { .. });
@@ -252,6 +293,7 @@ impl Typer {
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
         self.return_meth = saved_ret;
+        self.file_index = saved_file;
         self.lazy_completing.pop();
         self.lazy_done.insert(id, t);
     }

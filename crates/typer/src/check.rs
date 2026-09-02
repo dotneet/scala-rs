@@ -3698,7 +3698,38 @@ impl Typer {
         let ret = if name == "<init>" {
             Type::Unit
         } else if tpt.is_empty() {
-            Type::NoType
+            // An override that omits its own result type takes the
+            // overridden member's: `class Sub extends Base { override def
+            // run(n: Node) = n match { case Wrap(x) => run(x) ... } }`
+            // compiles under real scalac when `Base.run` declares `: Any`,
+            // even though the identical body in a class with no such parent
+            // reports "recursive method run needs result type" (confirmed
+            // against scalac 2.13.16). `type_def_body`'s cycle lock only
+            // fires when this stays `Type::NoType`, so borrowing the
+            // overridden return type here -- and only the return type, the
+            // body is still checked/inferred exactly as written -- is what
+            // lets the self-recursive call through.
+            //
+            // Gated on the written `override` modifier: an ancestor search
+            // for every unannotated method regardless -- most method bodies
+            // never write a result type at all -- forced far more ancestor
+            // signatures/bodies through `complete_lazy_sig` than the real
+            // bug needed, completing them out of their normal top-down order
+            // and, measured end-to-end against slick, actually reporting
+            // *more* errors than before (names other members would have
+            // exposed by the time the normal pass reached them were not
+            // exposed yet). `override` is required by SLS 5.1.3 on every
+            // non-synthetic overriding member other than a case class's
+            // generated ones, and a hand-written override that omits it is
+            // already its own separate diagnostic elsewhere -- not a case
+            // this lookup needs to widen itself to catch.
+            let my_ps: Vec<Type> = paramss_ty.iter().flatten().cloned().collect();
+            if mods_flags.contains(Flags::OVERRIDE) {
+                self.overridden_ret_type(saved_owner, &name, &my_ps)
+                    .unwrap_or(Type::NoType)
+            } else {
+                Type::NoType
+            }
         } else {
             let ret = self.tree_to_type(&tpt);
             self.check_proper_type(&ret, span);
@@ -6163,6 +6194,26 @@ impl Typer {
                     tpt.ty = self.with_strict_type_names(|s| s.tree_to_type(tpt));
                     if let Some(id) = self.st.class_sym_of(&tpt.ty) {
                         tpt.sym = id;
+                    }
+                    self.type_new_prefix(tpt);
+                } else if matches!(&tpt.kind, TreeKind::Ident { .. }) && !tpt.sym.is_none() {
+                    // A synthetic `new C(...)` rebuilt from an already-resolved
+                    // class symbol (`try_rewrite_case_copy`'s rewrite of
+                    // `recv.copy(...)`, which knows `recv`'s class by its
+                    // *type*, not by scanning for the name). The class may not
+                    // even be lexically reachable by its simple name from this
+                    // call site: slick's `ResultConverter.getDumpInfo` returns
+                    // a `slick.util.DumpInfo`, and a subclass three files away
+                    // that only ever writes `super.getDumpInfo.copy(...)`
+                    // never imports `DumpInfo` itself. Falling through to the
+                    // ordinary `Ident` branch below, which resolves purely by
+                    // name, reported "not found: type DumpInfo" there. The
+                    // resolution already happened; nothing left to look up.
+                    if tpt.ty.is_no_type() {
+                        tpt.ty = Type::Class {
+                            sym: tpt.sym,
+                            args: vec![],
+                        };
                     }
                     self.type_new_prefix(tpt);
                 } else if let TreeKind::Ident { name } = &tpt.kind {
@@ -9664,8 +9715,10 @@ impl Typer {
         // one emitted, so `copy()(buildType)` compiled to a call to a method
         // that is not in the classfile.
         let cls_name = self.st.get(class_id).name.clone();
+        let mut ctor_tpt = Tree::dummy(TreeKind::Ident { name: cls_name });
+        ctor_tpt.sym = class_id;
         let mut ctor = Tree::dummy(TreeKind::New {
-            tpt: Box::new(Tree::dummy(TreeKind::Ident { name: cls_name })),
+            tpt: Box::new(ctor_tpt),
         });
         for args in new_arg_lists {
             ctor = Tree::dummy(TreeKind::Apply {
@@ -9802,8 +9855,10 @@ impl Typer {
             });
         }
         let cls_name = self.st.get(class_id).name.clone();
+        let mut new_tpt = Tree::dummy(TreeKind::Ident { name: cls_name });
+        new_tpt.sym = class_id;
         let new_tree = Tree::dummy(TreeKind::New {
-            tpt: Box::new(Tree::dummy(TreeKind::Ident { name: cls_name })),
+            tpt: Box::new(new_tpt),
         });
         let ctor = Tree::dummy(TreeKind::Apply {
             fun: Box::new(new_tree),
@@ -12904,6 +12959,24 @@ impl Typer {
                 return found;
             }
         }
+        // `pkg.Bar(a = 1)`: `rewrite_receiver_apply` deliberately leaves a
+        // qualified reference to a module (`fun.kind` a `Select`, `fun.ty` a
+        // `Type::ModuleRef`) un-rewritten into `pkg.Bar.apply`, so codegen
+        // keeps emitting a direct companion-apply call (see its doc comment).
+        // `fun.sym` therefore names the module itself, not `apply`, and the
+        // module carries no `paramss` of its own -- `first_clause_ids` below
+        // would find nothing. Read the parameter names off the module's
+        // `apply` member(s) instead, exactly as the `Overload` branch above
+        // does for an ordinary overloaded callee.
+        if !fun.sym.is_none() && self.st.get(fun.sym).kind == SymKind::Module {
+            let alts = self.st.lookup_member(fun.sym, "apply");
+            if !alts.is_empty() {
+                let named = self.probe_named_arg_types(args);
+                if let Some(found) = self.alt_for_named_args(&alts, &named, args.len()) {
+                    return found;
+                }
+            }
+        }
         let ids = self.first_clause_ids(fun);
         // `fun.ty` may already have shed earlier clauses (`f(1)(b = 2)`), so
         // match the clause by length rather than taking the first.
@@ -14406,23 +14479,54 @@ impl Typer {
     /// wants for the function literal at `idx`, when they all agree and are
     /// fully determined. `None` leaves the literal untyped, as before.
     fn agreed_lambda_params(&self, fun_ty: &Type, idx: usize, arity: usize) -> Option<Vec<Type>> {
-        let Type::Overload(alts) = fun_ty else {
-            return None;
+        // Pre-typing is only for narrowing an *overload*: a lambda argument
+        // to a single-candidate callee is untyped (every parameter
+        // `NoType`) at the scoring stage regardless, and `arg_score`'s
+        // "shapes agree while a literal's parameters are still open" rule
+        // already treats that as a match against any function-shaped (or
+        // SAM-shaped, see its own comment) parameter -- scoring does not
+        // need real parameter types, only arity-shaped compatibility.
+        // Actually pre-typing the literal here for a single candidate was
+        // tried and measured against slick end-to-end: it fixed
+        // `SQLActionBuilder(sql, (u, pp) => ...)` (a case class apply, whose
+        // sole "overload" has no type parameters of its own) but also
+        // pre-typed cats-effect's `Async[F].uncancelable[A](body: Poll[F]
+        // => F[A]): F[A]` against `A` before the call's own usage-driven
+        // inference had solved it, locking in the wrong type and turning
+        // 155 baseline slick errors into 232. The lambda still ends up
+        // correctly typed either way -- `adapt_args_to_params`, run once
+        // the real winning candidate is known, retypes every argument
+        // against its actual parameter type, `Unit`/`PositionedParameters`
+        // included -- so restricting this pre-typing back to true overloads
+        // costs nothing here, it just moves the SAM-parameter case's real
+        // typing to the adapt step instead of the scoring step.
+        let alts: Vec<Type> = match fun_ty {
+            Type::Overload(alts) if alts.len() >= 2 => alts.clone(),
+            _ => return None,
         };
-        if alts.len() < 2 {
-            return None;
-        }
         let mut agreed: Option<Vec<Type>> = None;
-        for a in alts {
+        for a in &alts {
             let Type::Method { paramss, .. } = a else {
                 return None;
             };
             let p = paramss.first()?.get(idx)?;
             // A pickled signature spells a function parameter as `Function1`.
+            // A parameter that is merely SAM-shaped (`trait SetParameter[-T]
+            // extends ((T, PositionedParameters) => Unit)`, not literally a
+            // `scala.FunctionN`) needs the SAM search instead -- exactly what
+            // `type_function` itself falls back to once the literal is
+            // typed, just needed here too so it is typed with real
+            // parameter types in the first place.
             let p = match p {
                 Type::Class { sym, args } => self
                     .st
                     .function_class_shape(*sym, args)
+                    .or_else(|| {
+                        self.st.sam_sig(p).map(|sam| Type::Function {
+                            params: sam.param_tys,
+                            ret: Box::new(sam.ret_ty),
+                        })
+                    })
                     .unwrap_or_else(|| p.clone()),
                 other => other.clone(),
             };
@@ -14819,6 +14923,27 @@ impl Typer {
         if let Type::Class { sym, args } = param {
             if let Some(f) = self.st.function_class_shape(*sym, args) {
                 return self.arg_score(arg, &f);
+            }
+            // A parameter that is merely SAM-shaped (`trait SetParameter[-T]
+            // extends ((T, PositionedParameters) => Unit)`, not literally a
+            // `scala.FunctionN`) still accepts a function literal, same as
+            // real scalac's SAM conversion. Gated on `arg` already being a
+            // `Type::Function` -- an ordinary class-typed value is never SAM-
+            // convertible, only a literal (or an already-function-typed
+            // argument) is. Without this, `SQLActionBuilder(sql, (u, pp) =>
+            // ...)` against `case class SQLActionBuilder(sql: String,
+            // setParameter: SetParameter[Unit])` scored no match at all even
+            // after `agreed_lambda_params` gave the literal real parameter
+            // types, because the *parameter* side was still only compared as
+            // a plain class.
+            if matches!(arg, Type::Function { .. }) {
+                if let Some(sam) = self.st.sam_sig(param) {
+                    let f = Type::Function {
+                        params: sam.param_tys,
+                        ret: Box::new(sam.ret_ty),
+                    };
+                    return self.arg_score(arg, &f);
+                }
             }
         }
         if let Type::Method { paramss, ret } = arg {
@@ -19617,6 +19742,109 @@ impl Typer {
                 }
             }
         }
+    }
+
+    /// The return type of the member `owner`'s ancestors declare under
+    /// `name` with the same value-parameter arity/types, if any of them has
+    /// one already known. Used only to seed an unannotated override's own
+    /// result type (`type_def_sig`) before its body is typed -- so a
+    /// still-`Type::NoType` overridden signature (itself mid-completion) is
+    /// skipped rather than borrowed, same as finding nothing.
+    fn overridden_ret_type(&self, owner: SymbolId, name: &str, my_ps: &[Type]) -> Option<Type> {
+        if owner.is_none() || name.is_empty() {
+            return None;
+        }
+        // The candidate may be declared on a *generic* ancestor (`trait
+        // Base[A] { def f: A }`), so its raw signature has to be read
+        // as-seen-from `owner`'s own type -- the same substitution
+        // `bind_found`/`type_select` apply to every other inherited member
+        // -- or a type parameter that happens to share a letter with one in
+        // scope here reads as itself unsubstituted. Returning the raw type
+        // regressed real generic overrides across slick with `type
+        // mismatch; found: T required: T`-shaped errors once measured
+        // end-to-end, even though the monomorphic case this was written
+        // against kept passing on its own.
+        let owner_ty = Type::Class {
+            sym: owner,
+            args: self
+                .st
+                .get(owner)
+                .tparams
+                .iter()
+                .map(|tp| Type::TypeParam(*tp))
+                .collect(),
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut work: Vec<SymbolId> = self
+            .st
+            .get(owner)
+            .parents
+            .clone()
+            .iter()
+            .filter_map(|p| self.st.class_sym_of(p))
+            .collect();
+        work.push(self.st.anyref_sym);
+        work.push(self.st.any_sym);
+        while let Some(id) = work.pop() {
+            if id.is_none() || id == owner || !seen.insert(id.0) {
+                continue;
+            }
+            for m in self.st.get(id).members.clone() {
+                let (cand_name, cand_kind) = {
+                    let cand = self.st.get(m);
+                    (cand.name.clone(), cand.kind)
+                };
+                if cand_name != name || !matches!(cand_kind, SymKind::Method | SymKind::Term) {
+                    continue;
+                }
+                // Deliberately *not* `complete_lazy_sig`: forcing a
+                // still-pending candidate to complete here ran it (and
+                // whatever forward references its own body makes) before
+                // its declaring file's own top-down pass had registered its
+                // real scope, so a name only visible via that file's own
+                // imports resolved against the bare "owner chain" fallback
+                // instead and came back "not found". Measured against
+                // slick's `computeCapabilities` chain (`JdbcProfile`
+                // overriding `SqlProfile` overriding `RelationalProfile`
+                // overriding `BasicProfile`, spread across files ordered
+                // alphabetically *after* some of the profile traits that
+                // reference them): forcing eager completion here turned 155
+                // slick errors into 307. A still-pending candidate's `.ty`
+                // is simply skipped, exactly like not finding it -- the
+                // walk continues up through this candidate's own further
+                // ancestors instead (already queued below), and every real
+                // motivating case (`Dumpable.getDumpInfo: DumpInfo`,
+                // `QueryInterpreter.run(n: Node): Any`,
+                // `BasicProfile.computeCapabilities: Set[Capability]`)
+                // bottoms out at an ancestor whose return type was written
+                // explicitly and is therefore already known without forcing
+                // anything.
+                let cand_ty = self.st.get(m).ty.clone();
+                let cand_ty = self.st.subst_as_seen_from(&owner_ty, &cand_ty);
+                let ps = method_value_params(&cand_ty);
+                if ps.len() != my_ps.len() {
+                    continue;
+                }
+                let ok = my_ps
+                    .iter()
+                    .zip(ps.iter())
+                    .all(|(a, b)| a == b || self.st.is_sub_type(a, b) || self.st.is_sub_type(b, a));
+                if !ok {
+                    continue;
+                }
+                if let Type::Method { ret, .. } = &cand_ty {
+                    if !ret.is_no_type() {
+                        return Some((**ret).clone());
+                    }
+                }
+            }
+            for p in self.st.get(id).parents.clone() {
+                if let Some(c) = self.st.class_sym_of(&p) {
+                    work.push(c);
+                }
+            }
+        }
+        None
     }
 
     fn check_java_override(&mut self, tree: &Tree) {
