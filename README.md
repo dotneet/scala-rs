@@ -127,6 +127,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - **クラス / trait のメンバである `object`**。トップレベルの `object` と違って静的シングルトンではなく、**外側インスタンスごとに 1 つ**です。nsc と同じく `$outer` フィールドと外側インスタンスを取る `<init>`（`MODULE$` も `<clinit>` も無い）を出し、外側テンプレート側に `private volatile <name>$module` フィールドと、初回参照時に作る `<name>()` アクセサを出します。trait のメンバのときは interface が `<name>()` を abstract で宣言し、実装クラス側がフィールドとアクセサを持ちます（`lazy val` の mixin と同じ形）。非 static な `object` の中の `object` も同じく非 static です（`class Outer { object P { object N } }` の `N` は `$outer: Outer$P$`）。クラスにネストした `case class` のコンパニオンも同じ扱いで、`copy` は自分の `$outer` を新しいインスタンスへ渡します。詳細は「ネストした型」節
 - メソッド本体の中で定義したクラス（匿名クラス `new T { … }` と**ローカル `class` / `object`**）が、**囲みメソッドのパラメータ / ローカルをキャプチャ**する。nsc と同じ形で、自由変数ごとに `x$1` という public final フィールドと、末尾に付く追加のコンストラクタ引数を出す。各インスタンスメソッドの先頭でそのフィールドをローカルスロットに読み戻すので、キャプチャした `var` の `scala.runtime.*Ref` 経由の読み書きも、匿名クラス内のラムダによる二重キャプチャ（`$captured$N`）も、既存の経路のまま動く。メソッドの中のクラスにも `$outer` が付き、囲みクラスのメンバは `$outer` チェーンで読む
 - eta-expansion `foo _` と、FunctionN が期待される位置への未適用メソッド（`xs.map(inc)`）。ネストしたパラメータリストは **uncurry** で 1 リスト + クロージャになる。SIP-21 の SAM: ラムダ / 未適用メソッドを `Runnable` / `java.util.Comparator[Int]` / `java.util.function.Function[A,B]`（単一抽象メソッド）に適合。SAM でない型へは type mismatch（黙ってラップしない）。`def go(): Unit` を `_` なしで `Runnable` に渡すのは nsc と同じく auto-apply して mismatch。合成クラスは既存の anonfun と同じく invokedynamic は使わない
+- **カリー化したコンストラクタ** `class C(a: Int)(b: Int)` の `new C(1)(2)`。`extends A(1)(2)` と同じく、JVM 上は 1 本の `<init>` なので引数リストを平坦化してから解決します。明示された implicit 節（`new K[B]("s")(ev)`）は**探索し直しません**。後続の節の名前付き引数（`new C(1)(c = 3, b = 2)`）も通ります。case class の `copy(…)(…)` はこのコンストラクタ呼び出しに書き換わります（`agent/tail4`）
 - **コンストラクタ引数のアクセサ**。`class C(val x: Int)` も、キーワード無しで `val` になる **`case class` の第 1 引数リスト**も public なアクセサ `x()` になり、親の抽象メンバーを実装する（親が `def value: T` を `()Object` に erase する場合はブリッジも出す）。第 2 引数リスト以降は nsc と同じく private な状態のまま。`var` 引数は `x()` と `x_$eq(v)` の両方
 - **`FunctionN.tupled` / `curried`（arity 2〜22）と `scala.Function.untupled`（2〜5）**。`scala/FunctionN` の default メソッドと `scala/Function$` なので **jar リンク時のみ**（`--no-scala-library` では診断する）。あわせて、引数リストを持たないメソッドの結果が関数ならその引数リストは関数のもの（`def g: Int => Int; g(3)`）、カリー化された**関数値**の `f(1)(2)` は 2 回の `Function1.apply`（メソッドのカリー化とは違って平坦化しない）
 - **`scala.collection.mutable.Builder` の `+=` / `++=`**（`Growable` の default メソッド。`this.type` を返すので受け手の型がそのまま返る）。jar リンク時のみ
@@ -6478,7 +6479,7 @@ error: value += is not a member of T
 - **`while` 本体で宣言したローカルの StackMapTable**（`while (c) { val s = …; … }` はループ先頭のフレームがそのスロットを含んでしまい `VerifyError: Instruction type does not match stack map` になる。匿名クラスとは無関係で、ループの外で `val` を束ねれば動く）
 - **`scala.Product` 本体**（case class / case object は `productPrefix` / `productArity` は持つが、`Product` を親に付けていないので `productElement` / `productIterator` / `productElementNames` は無く、`(x: Product)` にも渡せない）
 - **コンストラクタの省略可能引数のうち、先行する ctor パラメータを参照するデフォルト**（`class C(x: Int, y: Int = x + 1)`）。単純なリテラル / `null` のデフォルト（`class C(x: Int, y: Int = 5)` や slick の `SlickException(msg, parent: Throwable = null)`）は動く
-- **名前付き引数の残り**: (a) **prelude / classpath のメソッドはパラメータ名を持たない**ので、`List(1,2,3).mkString(sep = "-")` や jar・`-cp` 上の case class への `copy(name = …)` は `unimplemented syntax: named arguments (method parameters not resolved)` になる（scala-library の pickle からパラメータ名を読む経路も、prelude 手書きシグネチャの名前付けも未実装。同一コンパイル単位のメソッド・クラスなら全部動く）。(b) **複数引数リストのコンストラクタ** `class C(a: Int)(b: Int)` は名前付き引数以前に `new C(1)(2)` 自体が未対応（`value apply is not a member`）。(c) 名前と型が同一で順序だけ違うオーバーロード（`h(s: String, n: Int)` と `h(n: Int, s: String)`）は nsc なら `ambiguous reference to overloaded definition` だが、こちらは先に宣言された方を黙って選ぶ
+- **名前付き引数の残り**: (a) **prelude / classpath のメソッドはパラメータ名を持たない**ので、`List(1,2,3).mkString(sep = "-")` や jar・`-cp` 上の case class への `copy(name = …)` は `unimplemented syntax: named arguments (method parameters not resolved)` になる（scala-library の pickle からパラメータ名を読む経路も、prelude 手書きシグネチャの名前付けも未実装。同一コンパイル単位のメソッド・クラスなら全部動く）。(b) ~~**複数引数リストのコンストラクタ** `class C(a: Int)(b: Int)` は名前付き引数以前に `new C(1)(2)` 自体が未対応~~ → `agent/tail4` で `new C(1)(2)` も `new C(1)(c = 3, b = 2)` も実装済み（`tests/fixtures/t4_curried_new.scala`）。(c) 名前と型が同一で順序だけ違うオーバーロード（`h(s: String, n: Int)` と `h(n: Int, s: String)`）は nsc なら `ambiguous reference to overloaded definition` だが、こちらは先に宣言された方を黙って選ぶ
 - **`--no-scala-library` での `x == null`（reference 型）**（`scala.runtime.BoxesRunTime.equals` を経由しないため、`x` が実際に `null` だと `Object.equals` の invokevirtual で `NullPointerException`。`--scala-library` 時は正しく動く）
 - **lazy completer のスコープ**: namer だけが見た定義（別テンプレートからの前方参照）は、所有者チェーンのメンバーから組み直したスコープで完成させる。ファイル先頭の `import` は typer が処理するまで入らないので、import 名を右辺に使う定義を前方参照した場合は型が付かず `<notype>` のまま（診断はそのまま出る。黙って通すことはしない）
 - **trait のメンバークラスから外側インスタンスを読む codegen**（`trait T { def x = 1; class Inner { def y = x } }`）。
@@ -8355,13 +8356,160 @@ member of TableNode」になっていました。（型がバイトコード上�
   of <notype>` / `value database is not a member of BasicBackend.Session` /
   `value reduceLeft is not a member of Option[Node]`（各 2 件）は時間内に
   調査できませんでした。
-* **副産物として見つけた別バグ（未修正）**: カリー化した `new C(…)(…)`
-  （コンストラクタへの直接呼び出し、`copy` 経由ではない）は `Apply` 層を
-  1 個ずつ独立に検査するらしく、`slick/lifted/SimpleFunction.scala:74`
-  の `new SimpleLiteral(name)(tpe)` で `ambiguous overload for apply with
-  arguments (String)` を出しています（今回の変更の前から存在する症状で、
-  今回のどの修正が原因でもありません）。`try_rewrite_case_copy_curried` が
-  `new` 経由の再構築を避けた理由がまさにこれで、同じ根を踏むはずです。
+* **副産物として見つけた別バグ**: カリー化した `new C(…)(…)`
+  （コンストラクタへの直接呼び出し、`copy` 経由ではない）が
+  `slick/lifted/SimpleFunction.scala:74` の `new SimpleLiteral(name)(tpe)` で
+  `ambiguous overload for apply with arguments (String)` を出していました
+  （このスライスの変更の前から存在する症状）。→ `agent/tail4` で修正済み。
+  根は「`Apply` 層ごとの独立解決」ではなく**パーサが `New` をチェーンの
+  先頭に置いていなかった**ことでした。下の「カリー化した `new C(…)(…)` は
+  1 個のコンストラクタ呼び出し」を参照。`try_rewrite_case_copy_curried` が
+  `new` 経由の再構築を避けていたのも、そこで直しています。
+
+### カリー化した `new C(…)(…)` は 1 個のコンストラクタ呼び出し（`agent/tail4`）
+
+テストは `crates/cli/tests/tail4.rs`、fixture 接頭辞は `t4` です。
+
+計測は `files=184 errors=177 files_with_errors=57` →
+**`files=184 errors=166 files_with_errors=53`**（−11 件 / −4 ファイル）。
+
+| 塊 | before | after |
+|---|---|---|
+| `value getOrElse is not a member of Product` | 4 件 | **0 件** |
+| `value apply is not a member of ConstColumn[T]` / `TypedCase[B, P]` / `ConnectionArbiter$` | 3 件 | **0 件** |
+| `ambiguous overload for apply with arguments (String)` | 2 件 | **0 件** |
+| `recursive method apply needs result type` | 1 件（同根のカスケード） | **0 件** |
+| `type mismatch; found: Option[Product] required: Option[Option[Any]]` ほか `Product` 由来 3 件 | 3 件 | **0 件** |
+
+（新しく到達可能になったエラーが 2 件出ています:
+`slick/lifted/Query.scala` の `Shape[…]` / `Tuple2[T, T2]` の型不一致。
+これまで手前で落ちていた行が通るようになった結果です。）
+
+`agent/tail3` が「未修正バグ」として残した
+`slick/lifted/SimpleFunction.scala:74` の `new SimpleLiteral(name)(tpe)`
+（`ambiguous overload for apply with arguments (String)`）を追ったところ、
+根は**オーバーロード解決ではなくパーサ**にありました（1）。それが直ったことで
+初めて到達可能になった穴が 2 つ（2・3）と、`tail3` の `copy` 書き換えが
+`new` を避けたことによる**サイレントな誤コンパイル**が 1 つ（4）出てきます。
+
+もう 1 つ、独立した根として、4 スライスが「slick 184 ファイル全体の状態に
+依存する」として縮小に失敗していた `value getOrElse is not a member of
+Product` を直しました（5）。slick には依存しておらず、`SymbolTable::lub` が
+「クラスは合っているが型引数が違う」候補を素通りしていたのが原因です。
+
+#### 1. 根: `New` がチェーンの**先頭**に付いていなかった
+
+`parse_new`（`crates/parser/src/parse.rs`）は親（`Apply(Apply(C, a), b)`）の
+`Apply` を**1 段だけ**分解し、その `fun`（＝`C(a)`）を `New` で包んでいました。
+つまり `new C(a)(b)` は `Apply(New(C(a)), b)` になり、`New` の「型」の位置に
+**適用式**が入ります。`New` の型付けはそこを普通の式として型付けするので、
+`C(a)` は `apply` の探索になります —— コンパニオンが自前の `apply` を持つ
+`SimpleLiteral` では `ambiguous overload for apply`、持たないクラスでは
+`no matching overload for constructor apply` でした（`tail3` が見た
+「`Apply` 層ごとに独立して解決している」という観察は症状の言い換えで、
+実際には `New` の位置がずれていただけです）。
+
+`parse_new` はチェーンを最後まで剥がして先頭に `New` を置くようにし
+（`new C(a)(b)` → `Apply(Apply(New(C), a), b)`）、`Typer::flatten_curried_new`
+（`crates/typer/src/check.rs`）が `extends A(1)(2)` に対して
+`type_parent_ctor_app_in` が昔からやっているのと同じことをします ——
+先頭が `New` のときに限り引数リストを 1 本に潰す。`pick_ctor` も JVM も
+コンストラクタの引数リストは平坦なものとして扱うので、ここが合流点です。
+
+ただし潰すのは**第 1 リストが選ぶコンストラクタが受け取れる分だけ**です。
+`class Foo(a: Int) { def apply(b: Int) = … }` の `new Foo(1)(2)` は nsc では
+`(new Foo(1)).apply(2)` で、2 リストを潰すと**2 引数の `Foo` を作ってしまう**
+——クラスがそういうコンストラクタを持っていれば黙って。どのコンストラクタを
+作っているかは第 1 リストの長さが決めるので（`class Ov(a: Int) { def this(a:
+Int, b: Int) = … }` の `new Ov(1)(2)` は 1 引数の方）、第 1 節の長さが一致する
+候補から総引数数を取り、無ければ「第 1 節がそれ以上長い」候補で代用します
+（省略されたデフォルト・implicit の分）。両方 `t4_curried_new.scala` に
+入れてあります。
+
+#### 2. コンストラクタの節は `new` に書かれた型引数で読む
+
+`slick/lifted/Case.scala:21` の
+`new TypedCase[B, P](ConstArray(cond, res.toNode))(bType, om.liftedType(bType))`
+は、宣言が `TypedType[B]` の節に `BaseTypedType[B]` を渡します。この適合は
+クラスの型パラメータを `[B, P]` に読み替えたあとでしか成立しませんが、
+`new` の経路は `pick_ctor`（型引数を渡さない版）を呼んでいました。
+`extends A(1)(2)` は最初から `pick_ctor_at` で型引数を渡しています。同じに
+しました。
+
+#### 3. 明示的に書かれた implicit 節を**もう一度探索しない**
+
+コンストラクタの引数は平坦化されて `fill_defaults_and_implicits` に届く一方、
+コンストラクタ**シンボル**の `paramss` は 2 節のままなので、第 2 節が
+「まだ埋まっていない」と読まれ、ユーザーが書いた引数の**後ろに**探索結果が
+追加されていました。`new K[B]("s")(tb)` は型検査を通ったうえで
+「2 パラメータのコンストラクタに引数 3 個」というバイトコードになり、
+`java -Xverify:all` が `VerifyError: Bad type on operand stack` を出します
+——診断ではなく誤コンパイルです。呼び出しが本当に**足りない**とき
+（`args.len() < ctor_params.len()`）だけ埋めるようにしました。
+
+#### 4. `copy()(x)` はコンパニオンの `apply` ではなく `new`
+
+`tail3` の `try_rewrite_case_copy_curried` は、カリー化した `new` が壊れて
+いたためコンパニオンの `apply` を経由していました。しかし両者が同じメソッド
+なのは**コンパニオンが合成のときだけ**です。`emit_module`
+（`crates/backend/src/gen.rs`）は、コンパニオンの本体が `apply` を 1 つでも
+宣言していると合成 `apply` を出しません。`SimpleLiteral` はまさにそれなので、
+`def rebuild = copy()(buildType)` は classfile に無いメソッドへの呼び出しに
+コンパイルされていました（`NoSuchMethodError: SimpleLiteral$.apply(String,
+Type)`。1 が直って初めて到達できる経路です）。nsc の `copy` はコンストラクタ
+呼び出しそのものなので、`new C(…)(…)` を組むように変えました。
+
+#### 5. `lub` が「クラスは合っているが型引数が違う」候補を素通りしていた
+
+`value getOrElse is not a member of Product`（4 件、
+`slick/jdbc/PositionedResult.scala`）は `agent/tail1` / `mismatch10` /
+`mismatch11` / `tail3` の 4 スライスがいずれも縮小に失敗し、「slick 184
+ファイル全体の状態に依存する」と記録していた症状です。実際には slick には
+**まったく依存していません**。依存しているのは、その run が
+scala-library をどこまで読み込んだかです。
+
+`SymbolTable::lub`（`crates/typer/src/symbol.rs`）は `a` の base type
+sequence を歩き、`b` が適合する**最初の**候補を返していました。
+`if (rs.wasNull) None else Some(r)` ではその列は `None.type`、
+`Option[Nothing]`、そのあとは `Option` 自身の親です。
+`Some[Blob] <: Option[Nothing]` は偽（`Blob` は `Nothing` の部分型ではない）
+なので次の候補に進みますが、`scala/Option` の classfile は
+`implements scala.Product` と書いてあるので、その run のどこかで
+`scala/Option` の classfile が読まれていれば `Product` がすでに上界として
+並んでおり、そこで止まります。関数はこのあと `b` の列も歩くので、そちらまで
+行けば `Option[Blob]` が見つかったはずでした。
+
+素通りしていたのは**クラスは合っているが型引数が違う**候補です。2 つの列は
+`Option` で出会っていて、片側が `Nothing`、もう片側が `Blob` だっただけです。
+そこで、`b` の列に**同じクラス**の項があれば型引数を join して（`lub` が
+自分で持っている「同じクラスなら引数を join する」枝に投げ直すだけ）、
+その型で歩きを止めるようにしました。答えは `Option[Blob]` になり、
+ライブラリをどこまで読んだかには依存しません。
+
+候補を全部集めて「specificity で順位付け」する版も試しましたが、**間違い**
+です: `lub(Circle, Rect)` では `Product` も `Shape` も極小で、
+`Product <: Equals` があるぶん `Product` の方が「特殊」に見えてしまいます。
+なお nsc の答えは正確には `Option[Blob] with Product with Serializable` で、
+交差型を組むところまでは実装していません。
+
+`t4_lub_bases.scala` はこの形をユーザーコードで書き下したもの
+（`sealed abstract class Opt[+A] extends Marker` / `case object Nn extends
+Opt[Nothing]` / `case class Sm[+A](v: A) extends Opt[A]`）なので、
+ライブラリの読み込み状態に依存せず、素の `main` でも
+`value get is not a member of Product` として落ちます。
+
+#### 検証
+
+`t4_curried_new.scala` / `t4_lub_bases.scala` は `--scala-library` と `--no-scala-library` の両方で
+`-Xverify:all` を通し、real scalac 2.13.16 の標準出力とも突き合わせています
+（`crates/cli/tests/tail4.rs`）。修正前の `main` では拒否されることを確認済み
+です。`t4_curried_new_bad.scala` は、平坦化が何でも通すようになっていない
+こと —— 第 3 引数リスト、第 2 リストの型不一致、埋められない evidence ——
+を固定します（nsc 2.13.16 も同じ 3 件を出します）。パーサと `check.rs` の
+継ぎ目に触れたので `cargo test --workspace` を回しました。
+
+slick: `errors=177 files_with_errors=57` → `errors=166 files_with_errors=53`。
+subset は `38 files / 204 classes / verified=204 failed=0` のままです。
 
 ## ライセンス
 

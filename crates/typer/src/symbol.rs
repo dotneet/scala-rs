@@ -1528,10 +1528,28 @@ impl SymbolTable {
         // only `a`'s chain (`Some[Boolean] <: Option[Nothing]` is false, since
         // `Boolean` is not `<: Nothing`), but walking `b`'s chain finds
         // `Option[Boolean]`, which *does* accept `a` (`Nothing <: Boolean`).
-        // A real LUB would also join partial candidates from both sides; this
-        // first-match version is simpler but covers the common "singleton
-        // case object vs. parameterized case class" pattern, which needs one
-        // side's own instantiation to be precise enough already.
+        // A real LUB would also *join* partial candidates from both sides
+        // (nsc's answer here is `Option[X] with Product with Serializable`);
+        // this version picks one of them, which covers the common "singleton
+        // case object vs. parameterized case class" pattern, since one side's
+        // own instantiation is precise enough already.
+        //
+        // The entry that stops the walk may be the *right class at the wrong
+        // arguments*: `None`'s sequence reaches `Option[Nothing]`, which
+        // `Some[X]` does not conform to, and walking past it lands on whatever
+        // `Option`'s own parents are. `scala/Option`'s classfile says
+        // `implements scala.Product`, so as soon as anything in a run had made
+        // that parent visible, `lub(None, Some(x))` -- which nothing in a
+        // small program could get wrong -- answered `Product` in a large one:
+        // slick's `PositionedResult.nextBlobOption()` is
+        // `if (rs.wasNull) None else Some(r)`, and `nextBlobOption()
+        // getOrElse (…)` was `value getOrElse is not a member of Product`
+        // (`agent/tail1` / `mismatch10` / `mismatch11` / `tail3` each recorded
+        // this as irreproducible outside the full 184-file slick run; the
+        // state it depends on is the library's, not slick's). So when the two
+        // sequences meet at the same class with different arguments, the
+        // arguments are joined and the walk stops there.
+        let b_seq = self.base_type_seq(&b);
         for cand in self.base_type_seq(&a) {
             if matches!(cand, Type::Any | Type::AnyRef | Type::AnyVal) {
                 continue;
@@ -1539,8 +1557,26 @@ impl SymbolTable {
             if self.is_sub_type(&b, &cand) {
                 return cand;
             }
+            let Type::Class { sym, args } = &cand else {
+                continue;
+            };
+            if args.is_empty() {
+                continue;
+            }
+            let same = b_seq.iter().find(|t| {
+                matches!(t, Type::Class { sym: s2, args: a2 }
+                         if s2 == sym && a2.len() == args.len())
+            });
+            if let Some(other) = same {
+                // Both are `Type::Class` at the same symbol, so this hits the
+                // argument-joining arm above and terminates.
+                let joined = self.lub(&cand, other);
+                if self.is_sub_type(&a, &joined) && self.is_sub_type(&b, &joined) {
+                    return joined;
+                }
+            }
         }
-        for cand in self.base_type_seq(&b) {
+        for cand in b_seq {
             if matches!(cand, Type::Any | Type::AnyRef | Type::AnyVal) {
                 continue;
             }

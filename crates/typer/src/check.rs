@@ -4233,6 +4233,196 @@ impl Typer {
         self.parent_ctor_scope = saved;
     }
 
+    /// The class a `new` at the head of an `Apply` chain names, when a plain
+    /// name says which it is. Read-only: nothing is typed and nothing is
+    /// reported, so it is safe on a tree that is about to be typed properly.
+    fn new_head_class(&self, t: &Tree) -> Option<SymbolId> {
+        fn head(t: &Tree) -> Option<&Tree> {
+            match &t.kind {
+                TreeKind::New { tpt } => Some(tpt),
+                TreeKind::Apply { fun, .. } => head(fun),
+                _ => None,
+            }
+        }
+        fn base_name(t: &Tree) -> Option<&str> {
+            match &t.kind {
+                TreeKind::Ident { name } => Some(name),
+                TreeKind::Select { name, .. } => Some(name),
+                TreeKind::AppliedTypeTree { tpt, .. } => base_name(tpt),
+                TreeKind::TypeApply { fun, .. } => base_name(fun),
+                _ => None,
+            }
+        }
+        let name = base_name(head(t)?)?;
+        let mut found = self
+            .st
+            .lookup_type(name)
+            .into_iter()
+            .chain(self.st.lookup(name))
+            .filter(|&s| self.st.get(s).kind == SymKind::Class);
+        let first = found.next()?;
+        // Two classes under one name: which constructor this is cannot be
+        // settled here, so say nothing rather than guess.
+        found.all(|s| s == first).then_some(first)
+    }
+
+    /// How many arguments `C`'s constructor can take in all, clauses
+    /// flattened, given that the call's first list has `first_len` of them --
+    /// `None` when that is not a fixed number (a repeated parameter) or when
+    /// there is no constructor to ask.
+    ///
+    /// The first list picks the alternative: `class Ov(a: Int) { def this(a:
+    /// Int, b: Int) = … }` has a two-argument constructor, but `new Ov(1)(2)`
+    /// is not it -- the list the user wrote has one argument, so the
+    /// one-argument constructor is the one this call is building, and `(2)` is
+    /// something else. Alternatives whose first clause is *longer* count only
+    /// when none matches exactly, since the extra parameters may be defaults
+    /// or implicits the call leaves out.
+    fn new_head_ctor_arity(&self, class_id: SymbolId, first_len: usize) -> Option<usize> {
+        let alts: Vec<SymbolId> = self
+            .st
+            .lookup_member(class_id, "<init>")
+            .into_iter()
+            .filter(|&id| self.st.get(id).kind == SymKind::Method)
+            .filter(|&id| self.st.get(id).owner == class_id)
+            .collect();
+        if alts.is_empty() {
+            return None;
+        }
+        // (first clause length, total length) per alternative.
+        let mut shapes: Vec<(usize, usize)> = Vec::new();
+        for id in alts {
+            let clauses: Vec<Vec<Type>> = match &self.st.get(id).ty {
+                Type::Method { paramss, .. } => paramss.clone(),
+                _ => vec![self
+                    .st
+                    .get(id)
+                    .params
+                    .iter()
+                    .map(|p| self.st.get(*p).ty.clone())
+                    .collect()],
+            };
+            if clauses
+                .iter()
+                .flatten()
+                .any(|t| matches!(t, Type::Repeated(_)))
+            {
+                return None;
+            }
+            shapes.push((
+                clauses.first().map(|c| c.len()).unwrap_or(0),
+                clauses.iter().map(|c| c.len()).sum(),
+            ));
+        }
+        let exact: Vec<usize> = shapes
+            .iter()
+            .filter(|(f, _)| *f == first_len)
+            .map(|(_, t)| *t)
+            .collect();
+        let usable = if exact.is_empty() {
+            shapes
+                .iter()
+                .filter(|(f, _)| *f >= first_len)
+                .map(|(_, t)| *t)
+                .collect::<Vec<_>>()
+        } else {
+            exact
+        };
+        usable.into_iter().max()
+    }
+
+    /// `Apply(Apply(New(C), a), b)` -> `Apply(New(C), a ++ b)`, for as many
+    /// lists as `C`'s constructor has room for.
+    ///
+    /// Only when the head of the whole `Apply` chain is a `New`: every other
+    /// nested application is a real call whose result is applied again. And
+    /// only while the arguments still fit the constructor: `new Foo(1)(2)` on
+    /// a one-parameter `Foo` with an `apply` is `(new Foo(1)).apply(2)` in
+    /// nsc, and folding those two lists together would construct a
+    /// two-argument `Foo` instead -- silently, where the class has such a
+    /// constructor too.
+    fn flatten_curried_new(&self, tree: &mut Tree) {
+        fn head_is_new(t: &Tree) -> bool {
+            match &t.kind {
+                TreeKind::New { .. } => true,
+                TreeKind::Apply { fun, .. } => head_is_new(fun),
+                _ => false,
+            }
+        }
+        fn chain_len(t: &Tree) -> usize {
+            match &t.kind {
+                TreeKind::Apply { fun, .. } => 1 + chain_len(fun),
+                _ => 0,
+            }
+        }
+        // The innermost list is the one the constructor is picked by.
+        fn first_list_len(t: &Tree, depth: usize) -> usize {
+            match &t.kind {
+                TreeKind::Apply { fun, args } => {
+                    if depth <= 1 {
+                        args.len()
+                    } else {
+                        first_list_len(fun, depth - 1)
+                    }
+                }
+                _ => 0,
+            }
+        }
+        let lists = chain_len(tree);
+        if lists < 2 || !head_is_new(tree) {
+            return;
+        }
+        // Unknown constructor: fold everything, as this always did.
+        // `extends A(1)(2)` takes the same view (`type_parent_ctor_app_in`).
+        let first_len = first_list_len(tree, lists);
+        let arity = self
+            .new_head_class(tree)
+            .and_then(|c| self.new_head_ctor_arity(c, first_len))
+            .unwrap_or(usize::MAX);
+        // Peel the chain apart, innermost list last, keeping each `Apply`'s
+        // own node id and span: they are what a re-typed call is recognised
+        // by, and a freshly minted id would lose the filled arguments an
+        // earlier pass recorded.
+        let mut argss: Vec<(NodeId, Span, Vec<Tree>)> = Vec::new();
+        let mut head = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+        while matches!(head.kind, TreeKind::Apply { .. }) {
+            let (id, span) = (head.id, head.span);
+            match head.kind {
+                TreeKind::Apply { fun, args } => {
+                    argss.push((id, span, args));
+                    head = *fun;
+                }
+                _ => unreachable!(),
+            }
+        }
+        argss.reverse();
+        // The first list is the constructor's whatever happens; the rest join
+        // it only while they still fit.
+        let mut take = 1usize;
+        let mut n = argss[0].2.len();
+        while take < argss.len() && n + argss[take].2.len() <= arity {
+            n += argss[take].2.len();
+            take += 1;
+        }
+        let rebuild = |fun: Tree, id: NodeId, span: Span, args: Vec<Tree>| -> Tree {
+            let mut t = Tree::dummy(TreeKind::Apply {
+                fun: Box::new(fun),
+                args,
+            });
+            t.id = id;
+            t.span = span;
+            t
+        };
+        let tail = argss.split_off(take);
+        let (ctor_id, ctor_span, _) = *argss.last().expect("at least one clause");
+        let flat: Vec<Tree> = argss.into_iter().flat_map(|(_, _, a)| a).collect();
+        let mut out = rebuild(head, ctor_id, ctor_span, flat);
+        for (id, span, args) in tail {
+            out = rebuild(out, id, span, args);
+        }
+        *tree = out;
+    }
+
     fn type_parent_ctor_app(&mut self, tree: &mut Tree) {
         // A parent's constructor *arguments* are ordinary expressions, and the
         // signature pass types them before every unit's members have their
@@ -9421,16 +9611,17 @@ impl Typer {
             }
             new_arg_lists.push(new_args);
         }
-        // The companion's own (also curried) `apply`, not `new C(…)(…)`:
-        // `Foo(1, "x")("e")` -- exactly this call shape -- already works
-        // through ordinary curried-call resolution, and slick itself always
-        // constructs `TableNode` this way. A curried `new C(…)(…)` hit a
-        // separate, narrower gap in constructor-call overload resolution
-        // (checked one `Apply` layer in isolation instead of threading the
-        // whole chain), so building on that path here would trade one bug
-        // for another.
+        // `new C(…)(…)`, which is what nsc's `copy` is. Going through the
+        // companion's `apply` instead -- what this did while curried `new` was
+        // broken -- is only the same method when the companion is synthetic:
+        // slick's `SimpleLiteral` declares its own `apply[T](name)(implicit
+        // tpe)`, and a companion that declares any `apply` gets no synthetic
+        // one emitted, so `copy()(buildType)` compiled to a call to a method
+        // that is not in the classfile.
         let cls_name = self.st.get(class_id).name.clone();
-        let mut ctor = Tree::dummy(TreeKind::Ident { name: cls_name });
+        let mut ctor = Tree::dummy(TreeKind::New {
+            tpt: Box::new(Tree::dummy(TreeKind::Ident { name: cls_name })),
+        });
         for args in new_arg_lists {
             ctor = Tree::dummy(TreeKind::Apply {
                 fun: Box::new(ctor),
@@ -9843,6 +10034,12 @@ impl Typer {
             self.type_ctor_delegation(tree);
             return;
         }
+        // `new C(a)(b)`: like `extends A(1)(2)`, a curried constructor is one
+        // call whose clauses are flat on the JVM. The clauses arrive as nested
+        // `Apply`s, and left alone the outer one was an application of the
+        // *instance* -- slick's `new SimpleLiteral(name)(tpe)` looked up
+        // `apply` on the companion and reported `ambiguous overload`.
+        self.flatten_curried_new(tree);
         let (fun, args) = match &mut tree.kind {
             TreeKind::Apply { fun, args } => (fun, args),
             _ => return,
@@ -9938,7 +10135,16 @@ impl Typer {
                 })
                 .unwrap_or_default();
             let (ctor_sym, ctor_params) = if let Some(c) = class_id {
-                match self.pick_ctor(c, &arg_tys, None) {
+                // `new C[A, B](x)(ev)`: the constructor's clauses are written
+                // in the *class's* type parameters, so an argument is weighed
+                // against `TT[B]` and not against `TT[Int]`. `new TypedCase[B,
+                // P](…)(bType, om.liftedType(bType))` in slick's `Case.scala`
+                // passes a `BaseTypedType[B]` for a `TypedType[B]` parameter,
+                // and that conformance only holds once the class's parameters
+                // are the call's. `extends A(1)(2)` has read the arguments at
+                // its `targs` all along (`pick_ctor_at`); the `new` path did
+                // not.
+                match self.pick_ctor_at(c, &explicit, &arg_tys, None) {
                     OverloadPick::Found(sym, ps, _) => (Some(sym), ps),
                     OverloadPick::Ambiguous => {
                         self.error(tree.span, "ambiguous overload for constructor");
@@ -10086,8 +10292,21 @@ impl Typer {
                         .collect(),
                     _ => ctor_params,
                 };
-                let _ =
-                    self.fill_defaults_and_implicits(tree.span, args, &ctor_params, &ctor_fun, pt);
+                // Only when the call is *short*. A constructor's clauses reach
+                // this path already flattened, so `new C(x)(ev)` on
+                // `C(x)(implicit ev)` has nothing left to fill -- and filling
+                // anyway appended a second, searched `ev` after the one the
+                // user wrote: `new K[B]("s")(tb)` typechecked and then failed
+                // the verifier with three arguments for two parameters.
+                if args.len() < ctor_params.len() {
+                    let _ = self.fill_defaults_and_implicits(
+                        tree.span,
+                        args,
+                        &ctor_params,
+                        &ctor_fun,
+                        pt,
+                    );
+                }
             }
             return;
         }
@@ -12584,8 +12803,35 @@ impl Typer {
                 .filter_map(|a| Self::named_arg_parts(a).map(|(n, _)| (n, Type::NoType)))
                 .collect()
         };
-        let (ids, repeated_last) = self
-            .alt_for_named_args(&alts, &named, args.len())
+        // `new C(1)(c = 3, b = 2)`: constructor arguments reach this path with
+        // every clause flattened into one list (`flatten_curried_new`), so a
+        // name has to be looked for across all of them. `first_clause_of` --
+        // what `alt_for_named_args` uses, and right for a method, whose
+        // clauses arrive one `Apply` at a time -- only ever saw `a`.
+        let flat = {
+            let ctor_alts: Vec<SymbolId> = alts
+                .iter()
+                .copied()
+                .filter(|&m| self.st.get(m).kind == SymKind::Method)
+                .collect();
+            match ctor_alts.as_slice() {
+                [only] if self.st.get(*only).paramss.len() > 1 => {
+                    let s = self.st.get(*only);
+                    let ids: Vec<SymbolId> = s.paramss.iter().flatten().copied().collect();
+                    let repeated = match &s.ty {
+                        Type::Method { paramss, .. } => paramss
+                            .last()
+                            .and_then(|c| c.last())
+                            .is_some_and(|t| matches!(t, Type::Repeated(_))),
+                        _ => false,
+                    };
+                    (!ids.is_empty()).then_some((ids, repeated))
+                }
+                _ => None,
+            }
+        };
+        let (ids, repeated_last) = flat
+            .or_else(|| self.alt_for_named_args(&alts, &named, args.len()))
             .unwrap_or_else(|| (self.st.get(class_id).ctor_fields.clone(), false));
         if ids.is_empty() {
             Self::strip_named_args(args);
