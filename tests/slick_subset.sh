@@ -18,6 +18,22 @@ REFLECT=/tmp/scala-2.13.16/lib/scala-reflect.jar
 CP="$(cat $SP/deps.cp):$REFLECT"
 LIB=/tmp/scala-rs-lib/scala-library-2.13.16.jar
 find $SRC/scala $SRC/scala-2 $COMPAT $GEN -name '*.scala' | sort > $RUN/files.txt
+# Round 1 compiles exactly what `slick_measure.sh` just compiled -- all 184
+# files, same flags -- and that pass costs 4.5 minutes. When a fresh measure
+# log is available, start from its verdict instead. `SLICK_SEED_LOG` is set by
+# the verification pipeline; without it the loop runs from scratch as before.
+if [[ -n ${SLICK_SEED_LOG:-} && -s ${SLICK_SEED_LOG:-/nonexistent} ]]; then
+  if grep -q "panicked at" $SLICK_SEED_LOG; then
+    echo "COMPILER PANIC in the seed measurement (not a fixpoint):" >&2
+    grep -m1 "panicked at" $SLICK_SEED_LOG >&2
+    exit 1
+  fi
+  grep -oE '^\s+--> [^:]+\.scala' $SLICK_SEED_LOG | awk '{print $2}' | sort -u > $RUN/seed_bad.txt
+  if [[ -s $RUN/seed_bad.txt ]]; then
+    grep -vxF -f $RUN/seed_bad.txt $RUN/files.txt > $RUN/files2.txt
+    mv $RUN/files2.txt $RUN/files.txt
+  fi
+fi
 for round in 1 2 3 4 5 6 7 8; do
   OUT=$RUN/out; rm -rf $OUT; mkdir -p $OUT
   $BIN compile $(cat $RUN/files.txt) -d $OUT -cp "$CP" -Xsource:3 \
