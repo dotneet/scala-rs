@@ -1,9 +1,10 @@
-//! The `[B >: A]` widening members, and the collection hierarchy edges the
-//! concrete `Hash*`/`LinkedHash*`/`Tree*` classes were missing.
+//! The `[B >: A]` widening members, the collection hierarchy edges the
+//! concrete `Hash*`/`LinkedHash*` classes were missing, and one absent
+//! `StringBuilder` constructor.
 //!
-//! Both showed up in slick as `no matching overload`, which is the message the
-//! typer prints when a *single* candidate's parameters reject the arguments —
-//! so a monomorphic signature reads like a missing alternative:
+//! All three showed up in slick as `no matching overload`, which is the
+//! message the typer prints when a *single* candidate's parameters reject the
+//! arguments — so a monomorphic signature reads like a missing alternative:
 //!
 //!   - `Option.getOrElse` was declared `(default: => A): A` with a note in
 //!     `prelude_coll` admitting the same shortcut for `Map.getOrElse`
@@ -17,16 +18,64 @@
 //!   - `scala.collection.mutable.HashSet` / `HashMap` extended `AnyRef` and
 //!     nothing else, so slick's `def containsSymbol(tss: collection.Set[…])`
 //!     rejected the `mutable.HashSet` it is always called with.
+//!   - `StringBuilder`'s constructor table simply had no `(Int, String)`.
 //!
 //! Erasure is unaffected: `B` and `V1` are type parameters, so every widened
 //! signature still erases to the descriptor the previous one did.
 
-use crate::symbol::{SymKind, SymbolTable};
+use crate::prelude::prelude_method;
+use crate::symbol::{Intrinsic, SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};
 
-pub(crate) fn install(st: &mut SymbolTable) {
+pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     widen_option(st);
     widen_map_get_or_else(st);
+    if library_abi {
+        add_string_builder_ctor(st);
+    }
+}
+
+/// `new StringBuilder(initCapacity: Int, initValue: String)`
+/// (`slick/util/TableDump.scala:50`).
+///
+/// `prelude_text`'s constructor table has `()` / `(Int)` / `(String)`. The
+/// two-argument one is `library_abi`-only for the same reason that whole
+/// table is: `--no-scala-library` compiles `scala.collection.mutable.
+/// StringBuilder` down to `java.lang.StringBuilder`, which has no
+/// `(int, String)` constructor at all.
+fn add_string_builder_ctor(st: &mut SymbolTable) {
+    let Some(sb) = crate::classpath::find_by_jvm(st, "scala/collection/mutable/StringBuilder")
+    else {
+        return;
+    };
+    let already = st
+        .get(sb)
+        .members
+        .iter()
+        .copied()
+        .any(|m| st.get(m).name == "<init>" && flat_params(&st.get(m).ty) == 2);
+    if already {
+        return;
+    }
+    let sb_t = Type::Class {
+        sym: sb,
+        args: vec![],
+    };
+    prelude_method(
+        st,
+        sb,
+        "<init>",
+        vec![Type::Int, Type::String],
+        sb_t,
+        Intrinsic::None,
+    );
+}
+
+fn flat_params(ty: &Type) -> usize {
+    match ty {
+        Type::Method { paramss, .. } => paramss.iter().map(|c| c.len()).sum(),
+        _ => 0,
+    }
 }
 
 /// The hierarchy edges. Run after `prelude_hier::install`, which is what

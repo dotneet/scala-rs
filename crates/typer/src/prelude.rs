@@ -593,7 +593,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
 
     crate::prelude_lowbound::install(st);
     // `Option.getOrElse` / `orElse` / `Map.getOrElse` の `[B >: A]`。
-    crate::prelude_ovl3::install(st);
+    crate::prelude_ovl3::install(st, library_abi);
     crate::prelude_lang::install(st);
     crate::prelude_lazyref::install(st);
 

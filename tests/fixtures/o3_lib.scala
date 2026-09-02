@@ -29,6 +29,12 @@ object Main {
     val mm = mutable.Map[String, Sub]("k" -> new Sub)
     val d3: Base = mm.getOrElse("absent", new Base)
     println(d3)
+    // A `HashMap` receiver reaches `getOrElse` through both the prelude's
+    // `mutable.Map` and the pickled `collection.MapOps`; the call has to stay
+    // one member, and has to run.
+    val hm2 = mutable.HashMap.empty[String, Sub]
+    hm2.update("k", new Sub)
+    println(hm2.getOrElse("k", new Base).toString + " " + hm2.getOrElse("x", new Base))
 
     // `Option` as a collection.
     val some: Option[String] = Some("x")
@@ -37,5 +43,10 @@ object Main {
     println((Seq("a") ++ none).mkString(","))
     val it: Iterable[String] = some
     println(it.size)
+
+    // `new StringBuilder(initCapacity, initValue)`.
+    val sb = new StringBuilder(8, "ab")
+    sb.append("c")
+    println(sb.toString)
   }
 }
