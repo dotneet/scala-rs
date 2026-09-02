@@ -143,6 +143,49 @@ struct Fresh {
     pat_depth: usize,
 }
 
+/// How one identifier of a `reify { … }` body is rebuilt inside the
+/// `TreeCreator`, which is the whole of reify's **hygiene**.
+///
+/// A quasiquote reifies a name as the name that was written
+/// (`SyntacticTermIdent(TermName("f"), false)`), and the tree it builds means
+/// whatever `f` means where the tree is finally typed. `reify` must not do
+/// that: the expression was written in the macro implementation's scope and
+/// has to keep meaning what it meant there, wherever the expansion lands. So
+/// nsc reifies each reference by its *symbol*, and this is the subset
+/// scala-rs builds -- see `docs/macros.md` §7.14 and `tests/fixtures/
+/// rd_impl.scala`, which is this same shape written out by hand.
+///
+/// Everything else -- a local, a parameter, `this` -- is **refused by name**.
+/// nsc turns those into free terms carried in the expansion; building the
+/// bare name instead would silently capture whatever stands there at the call
+/// site, which is exactly the bug reification exists to prevent.
+#[derive(Clone)]
+pub(crate) enum ReifyRef {
+    /// A static `object`: `rs.mkIdent($m.staticModule("<full name>"))`.
+    StaticModule(String),
+    /// `x.splice`: the argument's own tree, rebased into the mirror the
+    /// creator was handed -- `x.in[$u.type]($m).tree`. Carries the `x`.
+    Splice(Box<Tree>),
+}
+
+/// What a `reify { … }` body needs beyond a quasiquote's.
+pub(crate) struct ReifyCtx {
+    /// The classification of each identifier of the body, by node.
+    ///
+    /// Built by `Check::reify_refs`, which types a *clone* of each candidate
+    /// to find out what it means -- the same speculative shape
+    /// `Check::hole_lifts` uses. Nodes the walk did not classify are the ones
+    /// refused above.
+    pub(crate) refs: std::collections::HashMap<NodeId, ReifyRef>,
+    /// The local the creator binds the mirror to, cast to
+    /// `Mirror[$u.type]` (`docs/macros.md` §7.14, item 3).
+    pub(crate) mirror_local: String,
+    /// The local the creator binds `$m$untyped.universe` to. `Reifier`'s
+    /// `universe` is an `Ident` of it; the name is needed again for the
+    /// `$u.type` in `x.in[$u.type]($m)`.
+    pub(crate) universe_local: String,
+}
+
 /// Lowers one quasiquote.
 pub(crate) struct Reifier<'a> {
     /// The expression naming the universe (`scala.reflect.runtime.universe`,
@@ -170,6 +213,9 @@ pub(crate) struct Reifier<'a> {
     /// because building a tree is otherwise a pure `&self` walk and only
     /// these three forms have to reach back out of it.
     fresh: RefCell<Fresh>,
+    /// Set when this is a `reify { … }` body rather than a quasiquote; see
+    /// `ReifyCtx`.
+    reify: Option<ReifyCtx>,
 }
 
 impl<'a> Reifier<'a> {
@@ -189,7 +235,14 @@ impl<'a> Reifier<'a> {
             span,
             src,
             fresh: RefCell::new(Fresh::default()),
+            reify: None,
         }
+    }
+
+    /// Turn this into the reifier for a `reify { … }` body.
+    pub(crate) fn in_reify(mut self, ctx: ReifyCtx) -> Self {
+        self.reify = Some(ctx);
+        self
     }
 
     /// Lower a quasiquote body, in the block of fresh-name bindings it needs.
@@ -235,6 +288,9 @@ impl<'a> Reifier<'a> {
 
     /// Lower one term of the body.
     fn term(&self, t: &Tree) -> Result<Tree, String> {
+        if let Some(t) = self.reify_term(t)? {
+            return Ok(t);
+        }
         // `new C(a)(b)`: the parser leaves an application spine whose head is
         // `New`, and nsc puts *every* clause inside the one `SyntacticNew`.
         if let Some(t) = self.new_spine(t)? {
@@ -369,6 +425,67 @@ impl<'a> Reifier<'a> {
             | TreeKind::ModuleDef { .. } => self.definition(t),
             other => Err(format!("{} is not reified yet", describe(other))),
         }
+    }
+
+    /// The reify-only reading of one term: `Ok(None)` when the ordinary walk
+    /// below should take it.
+    ///
+    /// Two things happen here and nowhere else. A node the classification
+    /// resolved is built from its *symbol* rather than from the name that was
+    /// written, and every remaining form is checked against the subset reify
+    /// builds -- so an unclassified `Ident` is a local, and is refused by
+    /// name rather than reified as the bare name it happens to carry.
+    fn reify_term(&self, t: &Tree) -> Result<Option<Tree>, String> {
+        let Some(ctx) = &self.reify else {
+            return Ok(None);
+        };
+        if let Some(r) = ctx.refs.get(&t.id) {
+            return Ok(Some(match r {
+                ReifyRef::StaticModule(name) => self.call(
+                    self.support_member("mkIdent"),
+                    vec![self.call(
+                        self.select(self.local(&ctx.mirror_local), "staticModule"),
+                        vec![self.lit(Lit::String(name.clone()))],
+                    )],
+                ),
+                ReifyRef::Splice(e) => self.splice_tree(ctx, e),
+            }));
+        }
+        match &t.kind {
+            // The forms whose *parts* are what carry meaning: each is walked
+            // on and its own leaves are classified or refused.
+            TreeKind::Literal { .. }
+            | TreeKind::Select { .. }
+            | TreeKind::Apply { .. }
+            | TreeKind::If { .. } => Ok(None),
+            TreeKind::Ident { name } => Err(format!(
+                "`{name}` is a local, a parameter, or a name that does not stand for \
+                 a static `object`"
+            )),
+            other => Err(format!("{} is not reified yet", describe(other))),
+        }
+    }
+
+    /// `<e>.in[$u.type]($m).tree` -- what `.splice` becomes.
+    ///
+    /// `in` rebases the `Expr` into the mirror the creator was handed, so the
+    /// spliced tree belongs to the same universe as the one being built
+    /// around it. The type argument is written out because `$m`'s own type is
+    /// `Mirror[$u.type]` only after the cast the creator makes: the universe's
+    /// abstract `Mirror` loses its `api.Mirror[self.type]` bound in the
+    /// pickle (`docs/macros.md` §7.14, item 3).
+    fn splice_tree(&self, ctx: &ReifyCtx, e: &Tree) -> Tree {
+        let singleton = self.node(TreeKind::SingletonTypeTree {
+            ref_: Box::new(self.local(&ctx.universe_local)),
+        });
+        let rebased = self.call(
+            self.node(TreeKind::TypeApply {
+                fun: Box::new(self.select(e.clone(), "in")),
+                args: vec![singleton],
+            }),
+            vec![self.local(&ctx.mirror_local)],
+        );
+        self.select(rebased, "tree")
     }
 
     /// `new C`, `new C(a)`, `new C(a)(b)` -- `Ok(None)` when `t` is not one.
@@ -508,6 +625,16 @@ impl<'a> Reifier<'a> {
     /// Lower one type of the body: the whole of `tq"..."`, and the right-hand
     /// side of an ascription or a type application inside `q"..."`.
     fn typ(&self, t: &Tree) -> Result<Tree, String> {
+        // A type in a reified body has to be rebuilt from its symbol too, and
+        // that is a second reifier (nsc's `reifyType`) scala-rs does not have.
+        // Refused rather than reified as the written name, which would mean
+        // whatever the call site's scope makes of it.
+        if self.reify.is_some() {
+            return Err(format!(
+                "{} in a `reify` body is not reified yet",
+                describe_type(&t.kind)
+            ));
+        }
         match &t.kind {
             // Written with the `apply` spelled out: `SyntacticEmptyTypeTree`
             // is a parameterless `def` returning the extractor, and an empty

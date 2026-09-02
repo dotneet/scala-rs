@@ -64,6 +64,7 @@ mod prelude_universal;
 mod prelude_variance;
 mod quasiquote;
 mod reify;
+mod reify_expand;
 mod seqfn_view;
 mod symbol;
 mod traitparent;
@@ -72,9 +73,9 @@ mod views;
 
 pub use anon_capture::mark_anon_captures;
 pub use check::{
-    find_mains, has_errors, typecheck, typecheck_opts, typecheck_units, ClasspathClass,
-    ClasspathMethod, ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
-    Typer,
+    find_mains, has_errors, typecheck, typecheck_opts, typecheck_opts_src, typecheck_units,
+    typecheck_units_src, ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType,
+    ClasspathTypeParam, TypecheckOptions, Typer,
 };
 pub use erasure::{erase, erase_type, note_source_value_classes};
 pub use lambda_lift::lambda_lift;
@@ -97,7 +98,7 @@ pub fn typecheck_str_opts(
     opts: &TypecheckOptions,
 ) -> (Tree, SymbolTable, Vec<scala_rs_span::Diagnostic>) {
     let mut r = parse_str(src);
-    let (st, mut tdiags) = typecheck_opts(&mut r.tree, 0, opts);
+    let (st, mut tdiags) = typecheck_opts_src(&mut r.tree, 0, opts, src);
     let mut diags = r.diags;
     diags.append(&mut tdiags);
     (r.tree, st, diags)

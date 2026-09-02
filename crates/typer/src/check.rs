@@ -139,6 +139,20 @@ pub struct Typer {
     pub st: SymbolTable,
     pub diags: Vec<Diagnostic>,
     pub(crate) file_index: usize,
+    /// The text of each unit, by `file_index`.
+    ///
+    /// A span is only a pair of offsets, and two forms the parser folds into
+    /// one node are told apart by the text under them -- `A => B` against
+    /// `Function1[A, B]`, `(a, b)` against `Tuple2(a, b)`, `a :: b` against
+    /// `b.::(a)`. `crate::reify::Reifier` reads exactly those, and a
+    /// `reify { … }` body is *file* text rather than a string the quasiquote
+    /// machinery rebuilt, so the file has to reach the typer for the same
+    /// readings to work. Empty is allowed: `Reifier::text` then answers `""`
+    /// and every reading falls to its written-out branch.
+    ///
+    /// `Rc` because the reifier borrows one for the length of a build while
+    /// the typer is `&mut self` throughout.
+    sources: Vec<std::rc::Rc<str>>,
     /// Counter for synthetic names.
     pub(crate) gensym: u32,
     /// Per-binary-name index for *local* classes/objects (`Main$Same$1`,
@@ -400,6 +414,19 @@ pub fn typecheck_opts(
     typecheck_units(&mut units, opts)
 }
 
+/// [`typecheck_opts`] with the unit's source text; see [`typecheck_units_src`].
+pub fn typecheck_opts_src(
+    tree: &mut Tree,
+    file_index: usize,
+    opts: &TypecheckOptions,
+    src: &str,
+) -> (SymbolTable, Vec<Diagnostic>) {
+    let mut units = [(tree, file_index)];
+    let mut sources = vec![String::new(); file_index + 1];
+    sources[file_index] = src.to_string();
+    typecheck_units_src(&mut units, opts, &sources)
+}
+
 /// How many times the header pass may sweep the run. Each round can only
 /// turn rough (by-name) parents into resolved ones, so it converges; the cap
 /// just bounds the work for deeply nested templates.
@@ -411,8 +438,30 @@ pub fn typecheck_units(
     units: &mut [(&mut Tree, usize)],
     opts: &TypecheckOptions,
 ) -> (SymbolTable, Vec<Diagnostic>) {
+    typecheck_units_src(units, opts, &[])
+}
+
+/// [`typecheck_units`] with the text of each unit, indexed by `file_index`.
+///
+/// Only one thing reads it, and it is not optional there: `reify { … }` hands
+/// its body to `crate::reify::Reifier`, which tells two forms the parser folds
+/// into one node apart by the text under their span (`A => B` against
+/// `Function1[A, B]`, `(a, b)` against `Tuple2(a, b)`). A quasiquote's body is
+/// a string that module rebuilt and can therefore be handed straight back; a
+/// `reify` body is *file* text, so the file has to come with it. A caller with
+/// no text -- every unit test that types a snippet -- passes none, and each of
+/// those readings falls to its written-out branch.
+pub fn typecheck_units_src(
+    units: &mut [(&mut Tree, usize)],
+    opts: &TypecheckOptions,
+    sources: &[String],
+) -> (SymbolTable, Vec<Diagnostic>) {
     let first = units.first().map(|(_, i)| *i).unwrap_or(0);
     let mut t = Typer::new(first, opts);
+    t.sources = sources
+        .iter()
+        .map(|s| std::rc::Rc::from(s.as_str()))
+        .collect();
     t.fatal_warnings = opts.fatal_warnings;
     crate::classpath::install_classpath(&mut t.st, &opts.classpath);
     t.link_tuple_products();
@@ -508,6 +557,7 @@ impl Typer {
             st,
             diags: Vec::new(),
             file_index,
+            sources: Vec::new(),
             gensym: 0,
             local_class_n: std::collections::HashMap::new(),
             pkg_nest: Vec::new(),
@@ -5661,6 +5711,296 @@ impl Typer {
         true
     }
 
+    /// The universe a `reify { … }` application belongs to, if `tree` is one.
+    ///
+    /// `reify` is declared on `scala.reflect.api.Universe` and has no
+    /// implementation to call (`Self::report_internal_universe_macro`), so an
+    /// application of it is recognised the same way that diagnostic
+    /// recognises the name: written on a universe, or written bare with a
+    /// universe in scope and no other `reify` bound. A program with its own
+    /// `reify` in scope keeps it.
+    fn reify_universe(&mut self, tree: &Tree) -> Option<Tree> {
+        if !self.library_abi {
+            return None;
+        }
+        let TreeKind::Apply { fun, args } = &tree.kind else {
+            return None;
+        };
+        if args.len() != 1 {
+            return None;
+        }
+        match &fun.kind {
+            TreeKind::Ident { name } if name == "reify" => {
+                if !self.st.lookup("reify").is_empty() {
+                    return None;
+                }
+                self.universe_in_scope()
+            }
+            TreeKind::Select { qual, name } if name == "reify" => {
+                let mark = self.diags.len();
+                let mut probe = (**qual).clone();
+                self.type_expr(&mut probe, &Type::NoType);
+                self.diags.truncate(mark);
+                let owner = self.st.class_sym_of(&probe.ty).unwrap_or(SymbolId::NONE);
+                // `scala.reflect.macros.Universe extends
+                // scala.reflect.api.Universe` only in the pickle, and until
+                // that parent is attached `c.universe` is not recognisable as
+                // a universe at all -- the same reading
+                // `remember_term_import_prefix` has to force for `import
+                // c.universe._`.
+                if !owner.is_none() {
+                    self.pickle
+                        .ensure_parents(&mut self.st, &mut self.binary, owner);
+                }
+                self.is_reflect_universe(owner).then_some(probe)
+            }
+            _ => None,
+        }
+    }
+
+    /// Expand `reify { … }` in place (`docs/macros.md` §7.14,
+    /// `crate::reify_expand`).
+    ///
+    /// Returns false only when this is not a `reify` application at all. A
+    /// body reify cannot build is an *error* here, never a silent pass: an
+    /// expansion that reified a local as the bare name it was written with
+    /// would compile, run, and mean whatever stood at the call site.
+    fn try_expand_reify(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        let Some(universe) = self.reify_universe(tree) else {
+            return false;
+        };
+        let span = tree.span;
+        let TreeKind::Apply { args, .. } = &tree.kind else {
+            return false;
+        };
+        let body = args[0].clone();
+
+        // `T` of the resulting `Expr[T]`: what the body means in the macro
+        // implementation's own scope. Typed on a clone -- the shape
+        // `Self::hole_lifts` uses -- so the tree the call site keeps is typed
+        // once, as part of the expansion. A body that does not typecheck is
+        // reported from here, with the probe's own diagnostics.
+        let mark = self.diags.len();
+        let mut probe = body.clone();
+        self.type_expr(&mut probe, &Type::NoType);
+        if self.diags[mark..]
+            .iter()
+            .any(|d| d.level == scala_rs_span::Level::Error)
+        {
+            tree.ty = Type::Error;
+            return true;
+        }
+        self.diags.truncate(mark);
+        let arg = match &probe.ty {
+            Type::Constant(l) => Type::lit_underlying(l),
+            t => t.clone(),
+        };
+        if arg.is_no_type() || arg.is_error() {
+            self.error(
+                span,
+                "cannot expand reify { ... }: the type of the expression is not known here"
+                    .to_string(),
+            );
+            tree.ty = Type::Error;
+            return true;
+        }
+
+        self.gensym += 1;
+        let n = self.gensym;
+        let (universe_local, mirror_local) = (format!("$u${n}"), format!("$m${n}"));
+        let refs = self.reify_refs(&body);
+        let needs_mirror = !refs.is_empty();
+        let src = self
+            .sources
+            .get(self.file_index)
+            .cloned()
+            .unwrap_or_else(|| std::rc::Rc::from(""));
+        let built = {
+            let universe_ident = Tree::new(
+                NodeId(0),
+                span,
+                TreeKind::Ident {
+                    name: universe_local.clone(),
+                },
+            );
+            let r = crate::reify::Reifier::new(universe_ident, &[], &[], &[], span, &src).in_reify(
+                crate::reify::ReifyCtx {
+                    refs,
+                    mirror_local: mirror_local.clone(),
+                    universe_local: universe_local.clone(),
+                },
+            );
+            match r.reify(crate::quasiquote::QuasiKind::Term, &body) {
+                Ok(t) => t,
+                Err(why) => {
+                    self.report_reify_gap(span, &why);
+                    tree.ty = Type::Error;
+                    return true;
+                }
+            }
+        };
+
+        let Some(mirror) =
+            self.reflect_class("scala.reflect.api.Mirror", "scala/reflect/api/Mirror")
+        else {
+            return false;
+        };
+        let Some(tree_api) = self.reflect_class(
+            "scala.reflect.api.Trees.TreeApi",
+            "scala/reflect/api/Trees$TreeApi",
+        ) else {
+            return false;
+        };
+        // `Expr` is a nested `object` of the universe, supplied on demand
+        // (`PickleSupply::install_nested_module`); nothing has asked for it
+        // on this receiver yet.
+        let universe_ty = universe.ty.clone();
+        let _ = self.supply_from_pickle(&universe_ty, "Expr");
+        let mut built = crate::reify_expand::ReifyExpander {
+            universe: &universe,
+            creator_name: format!("$treecreator{n}"),
+            body: built,
+            arg,
+            mirror_ty: Type::Class {
+                sym: mirror,
+                args: vec![],
+            },
+            tree_api: Type::Class {
+                sym: tree_api,
+                args: vec![],
+            },
+            universe_local,
+            mirror_local,
+            needs_mirror,
+            span,
+        }
+        .build();
+        // The `WeakTypeTag[T]` of `Expr.apply` is *materialised*, and
+        // `Check::materialize_tag` needs a universe to build it in -- which it
+        // reads off `import <universe>._`. `c.universe.reify { … }` brings no
+        // such import, so the universe this expansion was written against is
+        // offered for as long as it is being typed. Restored after: it is this
+        // expansion's, not the enclosing scope's.
+        //
+        // Pushed unconditionally rather than only when no equal prefix is
+        // there: `term_import_prefixes` is kept for the whole run, so an
+        // `import c.universe._` in an *earlier* method leaves an entry that
+        // spells the same path and is no longer in scope (its `c` is that
+        // method's parameter). `universe_in_scope` would find that one and
+        // reject it, and never reach this one.
+        let owner = self.st.class_sym_of(&universe.ty).unwrap_or(SymbolId::NONE);
+        let pushed = !owner.is_none();
+        if pushed {
+            self.term_import_prefixes.push((owner, universe.clone()));
+        }
+        self.type_expr(&mut built, pt);
+        if pushed {
+            self.term_import_prefixes.pop();
+        }
+        *tree = built;
+        true
+    }
+
+    /// A form `reify` does not build. Named, with the reason, and pointed at
+    /// the design note -- never accepted.
+    fn report_reify_gap(&mut self, span: Span, why: &str) {
+        self.error(
+            span,
+            format!(
+                "cannot expand reify {{ ... }}: {why}. scala-rs reifies literals, \
+                 applications and selections over static `object` references and \
+                 `.splice`d expressions; see docs/macros.md \u{a7}7.14."
+            ),
+        );
+    }
+
+    /// Classify every identifier of a `reify { … }` body; see
+    /// `crate::reify::ReifyRef`.
+    ///
+    /// Each candidate is typed on a *clone* and rolled back, the way
+    /// `Self::hole_lifts` types a hole's argument: what a name means is a
+    /// question only the typer can answer, and asking it must not type the
+    /// body twice for real. A name this does not classify is left out, and
+    /// `crate::reify` refuses it by name.
+    fn reify_refs(&mut self, body: &Tree) -> HashMap<NodeId, crate::reify::ReifyRef> {
+        let mut out = HashMap::new();
+        self.reify_refs_in(body, &mut out);
+        out
+    }
+
+    fn reify_refs_in(&mut self, t: &Tree, out: &mut HashMap<NodeId, crate::reify::ReifyRef>) {
+        match &t.kind {
+            // `x.splice`: `Expr[T].splice` is the marker nsc replaces with the
+            // argument's own tree. The receiver is left as it was written --
+            // it names something in the macro implementation, and the
+            // expansion keeps it there.
+            TreeKind::Select { qual, name } if name == "splice" => {
+                let probed = self.reify_probe(qual);
+                if matches!(&probed, Type::Class { sym, .. }
+                    if self.st.get(*sym).jvm_name == "scala/reflect/api/Exprs$Expr")
+                {
+                    out.insert(
+                        t.id,
+                        crate::reify::ReifyRef::Splice(Box::new((**qual).clone())),
+                    );
+                    return;
+                }
+                self.reify_refs_in(qual, out);
+            }
+            TreeKind::Ident { .. } | TreeKind::Select { .. } => {
+                let probed = self.reify_probe(t);
+                if let Some(name) = self.static_module_name(&probed) {
+                    out.insert(t.id, crate::reify::ReifyRef::StaticModule(name));
+                    return;
+                }
+                if let TreeKind::Select { qual, .. } = &t.kind {
+                    self.reify_refs_in(qual, out);
+                }
+            }
+            TreeKind::Apply { fun, args } => {
+                self.reify_refs_in(fun, out);
+                for a in args {
+                    self.reify_refs_in(a, out);
+                }
+            }
+            TreeKind::If { cond, thenp, elsep } => {
+                self.reify_refs_in(cond, out);
+                self.reify_refs_in(thenp, out);
+                self.reify_refs_in(elsep, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// The type a subtree of a reify body has, found speculatively.
+    fn reify_probe(&mut self, t: &Tree) -> Type {
+        let mark = self.diags.len();
+        let mut probe = t.clone();
+        self.type_expr(&mut probe, &Type::NoType);
+        self.diags.truncate(mark);
+        probe.ty
+    }
+
+    /// The full name `Mirror.staticModule` is given for a reference to a
+    /// static `object`, if that is what `ty` is.
+    ///
+    /// Static means reachable through packages alone, which is what
+    /// `staticModule` walks: an `object` nested in a class or another object
+    /// has a `$` in its class file's simple name and is reached by
+    /// `selectTerm` on the enclosing symbol instead -- a second shape, and
+    /// `crate::reify` refuses the name rather than building the wrong one.
+    fn static_module_name(&self, ty: &Type) -> Option<String> {
+        let Type::ModuleRef(mcls) = ty else {
+            return None;
+        };
+        let jvm = self.st.jvm_internal(*mcls);
+        let full = jvm.strip_suffix('$').unwrap_or(&jvm);
+        if full.is_empty() || full.rsplit('/').next().is_some_and(|s| s.contains('$')) {
+            return None;
+        }
+        Some(full.replace('/', "."))
+    }
+
     /// How each hole's argument becomes a reflect `Tree` -- `Liftable`.
     ///
     /// A hole is not required to be a `Tree`: nsc infers an implicit
@@ -10325,6 +10665,9 @@ impl Typer {
         // includes its own implicits.
         if let TreeKind::Apply { args, .. } = &mut tree.kind {
             args.retain(|a| !a.id.is_filled_arg());
+        }
+        if self.try_expand_reify(tree, pt) {
+            return;
         }
         if self.try_rewrite_case_copy(tree, pt) {
             return;

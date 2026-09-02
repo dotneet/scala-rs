@@ -842,3 +842,143 @@ fn rd_reify_shape_matches_real_scalac() {
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&uses);
 }
+
+/// `rb_impl.scala` + `rb_use.scala`: **`reify { … }` expanded by scala-rs**
+/// (`docs/macros.md` §7.14, `crates/typer/src/reify_expand.rs`).
+///
+/// `rd_impl.scala` above writes out, by hand, the tree `reify` has to build;
+/// this pair writes `reify` and makes the compiler build it. Twelve lines of
+/// output cover the three stages: a literal body, a static `object` reached
+/// through `mirror.staticModule`, and `.splice` rebased through `Expr.in` --
+/// including two splices whose side effects say each was evaluated once.
+#[test]
+fn rb_reify_expands_and_runs() {
+    if !prerequisites("rb_use") {
+        return;
+    }
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("rb_impl");
+    let uses = tmp_dir("rb_use");
+
+    let out = compile("rb_impl", &impls, &[]);
+    assert!(
+        out.status.success(),
+        "compile rb_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out = compile("rb_use", &uses, &[&impls]);
+    assert!(
+        out.status.success(),
+        "compile rb_use failed: {}",
+        diagnostics(&out)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "rb_use"),
+        expected_stdout("rb_use"),
+        "stdout mismatch for rb_use"
+    );
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
+/// The same two files through real scalac 2.13.16. A reified body that
+/// resolved `RbHelper` in the wrong universe, or spliced an argument's tree
+/// without rebasing it, would still compile and still run -- only the output
+/// would differ, which is why the comparison is of output.
+#[test]
+fn rb_reify_matches_real_scalac() {
+    if !prerequisites("rb_use scalac diff") {
+        return;
+    }
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip rb_use scalac diff: scalac not obtainable");
+        return;
+    };
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("rb_impl-scalac");
+    let uses = tmp_dir("rb_use-scalac");
+
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            impls.to_str().unwrap(),
+            fixtures_dir().join("rb_impl.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected rb_impl.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            &format!("{}:{}", reflect.display(), impls.display()),
+            "-d",
+            uses.to_str().unwrap(),
+            fixtures_dir().join("rb_use.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected rb_use.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "rb_use (real scalac build)"),
+        expected_stdout("rb_use"),
+        "recorded expectation for rb_use does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
+/// The bodies `reify` refuses, each named. Real scalac accepts all four (it
+/// reifies a local as a *free term* and has a reifier for types); scala-rs
+/// does not build those, and says so rather than reifying the bare name --
+/// which would compile, run, and mean whatever stood at the call site.
+#[test]
+fn rb_reify_gaps_are_named() {
+    if !prerequisites("rb_bad") {
+        return;
+    }
+    let out_dir = tmp_dir("rb_bad");
+    let out = compile("rb_bad", &out_dir, &[]);
+    assert!(!out.status.success(), "rb_bad.scala should not compile");
+    let text = diagnostics(&out);
+    for want in [
+        "`x` is a local, a parameter, or a name that does not stand for a static `object`",
+        "`n` is a local, a parameter, or a name that does not stand for a static `object`",
+        "a type ascription is not reified yet",
+        "a block is not reified yet",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    assert!(
+        text.contains("cannot expand reify { ... }"),
+        "the report should name reify:\n{text}"
+    );
+    let _ = fs::remove_dir_all(&out_dir);
+}

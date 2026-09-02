@@ -2031,3 +2031,92 @@ implicit 節はそのまま残してあるので、手書きの
 `tests/slick_subset.sh` は `38 files / 204 classes / verified=204 failed=0` の
 まま。slick の 2 マクロは `reify` が要るところで止まっており、この 2 件は
 その手前を通しただけなので数字は動かない。
+
+### 7.15 `reify { … }` の展開（`agent/reifybody` スライス）
+
+§7.14 が「手書きなら丸ごと動く」ところまで通した木を、コンパイラが組むように
+した。`crates/typer/src/reify_expand.rs` が §7.14 の 1 に書いた nsc の展開形を
+そのまま作る:
+
+```text
+{ final class $treecreator1 extends scala.reflect.api.TreeCreator {
+    def apply[U <: scala.reflect.api.Universe with Singleton](
+        $m$untyped: scala.reflect.api.Mirror[U]): <Trees.TreeApi> = {
+      val $u = $m$untyped.universe
+      val $m = $m$untyped.asInstanceOf[scala.reflect.api.Mirror[$u.type]]
+      <本体>
+    }
+  }
+  <universe>.Expr.apply[T](
+    <universe>.rootMirror.asInstanceOf[<api.Mirror>], new $treecreator1()) }
+```
+
+nsc との差は `crate::materialize` と同じ 3 点（`rootMirror` を使う、
+creator の結果型を `U#Tree` ではなく上限 `Trees$TreeApi` で書く、mirror に
+cast を入れる）で、理由も同じである。`val $m` は本体が要るときだけ置く。
+
+#### 本体 — 衛生性
+
+lowering は quasiquote と同じ `crates/typer/src/reify.rs` の `Reifier` だが、
+`ReifyCtx` を持たせた「reify モード」で走る。違いは 3 つだけで、どれも
+**名前ではなくシンボルで解決する**ことに尽きる。
+
+| 形 | 組む木 |
+| --- | --- |
+| 静的 `object` | `$u.internal.reificationSupport.mkIdent($m.staticModule("<full name>"))` |
+| `x.splice` | `x.in[$u.type]($m).tree` |
+| それ以外の識別子・型・ブロック・関数リテラル・`this` | **診断**（`cannot expand reify { ... }: …`） |
+
+最後の行が肝である。nsc はローカルやパラメータを *free term*
+（`newFreeTerm` + `mkIdent`）にして展開に持ち回るが、scala-rs はそれを組めない。
+裸の名前で組めば**コンパイルも実行も通り**、展開先にたまたま在る同名の
+何かを指す——reification が防ぐためにある、まさにそのバグになる。よって断る。
+
+型についても同じで、reify モードの `Reifier::typ` は必ず `Err` を返す。
+nsc の `reifyType` に相当するものが無いからで、書かれた名前で `TypeTree` を
+組めば同じ捕まらないバグになる。
+
+#### 識別子の判定
+
+`Check::reify_refs` が本体を歩き、`Ident` / `Select` ごとに**クローンを投機的に
+型付けして巻き戻す**（`hole_lifts` と同じ形）。結果が `Type::ModuleRef` で、
+その module class の JVM 名がパッケージだけで到達できる（simple name に `$` が
+無い）なら静的 `object`、`Expr[T]` の `.splice` なら splice、それ以外は
+分類しない＝`Reifier` が名指しで断る。`NodeId` で引くので、判定と lowering が
+同じ節点を見ていることが保証される。
+
+`Expr.apply[T]` の `T` は本体全体を 1 度だけ投機型付けして取る（`Type::Constant`
+は `lit_underlying` で widen する）。implicit 節の `WeakTypeTag[T]` は §7.10 の
+materialiser が埋めるが、それは `import <universe>._` から universe を探すので、
+`c.universe.reify { … }` のために**展開を型付けしている間だけ**その universe を
+import prefix として積んでいる（積みっぱなしにはしない）。
+
+#### ソース文字列を typer に渡した
+
+`Reifier` は `src`（元ソース）でパーサが畳んでしまう区別を復元する
+（`A => B` と `Function1[A, B]`、`(a, b)` と `Tuple2(a, b)`、`a :: b` と
+`b.::(a)`）。quasiquote の本体は `quasiquote.rs` が組み直した文字列なのでその場に
+あったが、`reify` の本体は**実ファイルのテキスト**である。`Typer` はソースを
+持っていなかったので `typecheck_units_src` / `typecheck_opts_src` を足し、
+driver が既に持っている `SourceFile::src` を渡すようにした。渡さない呼び出し
+（スニペットを型付けする単体テスト）では空で、各読み取りは書き下ろし側の枝に落ちる。
+
+#### 検証
+
+`tests/fixtures/rb_impl.scala` + `rb_use.scala` を 2 段コンパイルして 12 行印字し、
+**同じ 2 ファイルを実 scalac 2.13.16 で 2 段コンパイルして実行しても同じ 12 行**
+（`tests/fixtures/expected/rb_use.txt`）。最後の 2 行は splice を副作用つきの式で
+埋めたもので、木が splice を落としたり 2 回組んだりしたら数が変わる。
+`rb_bad.scala` は断る 4 形が名指しで診断されることを固定する（実 scalac は
+4 つとも通すので、これは未実装の告白である）。
+
+#### 残っているもの
+
+1. **型の reification。** slick の `TableQueryMacroImpl` は
+   `reify { TableQuery.apply[E](cons.splice) }` で、型引数 `E` を
+   スコープの `WeakTypeTag[E]` から `mkTypeTree(tag.in($m).tpe)` に落とす必要が
+   ある（`crate::materialize` の `TagBody::FromTag` と同じ材料）。ここが
+   slick の 2 マクロに届くための次の 1 手である。
+2. ローカル・パラメータの *free term*、ブロック、関数リテラル、`this`。
+3. §7.13 / §7.14 の残件（展開の型引数、`TableQuery.apply` のオーバーロード選択、
+   trait の中の入れ子*クラス*を型として書く形）はそのまま。

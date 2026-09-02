@@ -1,0 +1,12 @@
+42
+hello
+true
+9000000000
+42
+42
+42
+head-tail
+false
+7
+3
+2
