@@ -8,7 +8,7 @@ use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
     check_local_case_class_captures, check_local_objects, erase, find_mains, lambda_lift,
-    lazy_locals, mark_anon_captures, note_source_value_classes, typecheck_units, uncurry,
+    lazy_locals, mark_anon_captures, note_source_value_classes, typecheck_units_src, uncurry,
     ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType, ClasspathTypeParam,
     TypecheckOptions,
 };
@@ -180,7 +180,8 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 (&mut u.tree, fi)
             })
             .collect();
-        let (mut st, tdiags) = typecheck_units(
+        let src_text: Vec<String> = sources.iter().map(|s| s.src.clone()).collect();
+        let (mut st, tdiags) = typecheck_units_src(
             &mut refs,
             &TypecheckOptions {
                 fatal_warnings: opts.fatal_warnings,
@@ -195,6 +196,10 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 },
                 language_features: opts.language_features.clone(),
             },
+            // The typer reads the text under a span for the forms the parser
+            // folds together; `reify { … }` is the one whose body is *file*
+            // text rather than a string the quasiquote machinery rebuilt.
+            &src_text,
         );
         diags.extend(tdiags);
         for u in units.iter() {

@@ -2031,3 +2031,119 @@ implicit 節はそのまま残してあるので、手書きの
 `tests/slick_subset.sh` は `38 files / 204 classes / verified=204 failed=0` の
 まま。slick の 2 マクロは `reify` が要るところで止まっており、この 2 件は
 その手前を通しただけなので数字は動かない。
+
+### 7.15 `reify { … }` の展開（`agent/reifybody` スライス）
+
+§7.14 が「手書きなら丸ごと動く」ところまで通した木を、コンパイラが組むように
+した。`crates/typer/src/reify_expand.rs` が §7.14 の 1 に書いた nsc の展開形を
+そのまま作る:
+
+```text
+{ final class $treecreator1 extends scala.reflect.api.TreeCreator {
+    def apply[U <: scala.reflect.api.Universe with Singleton](
+        $m$untyped: scala.reflect.api.Mirror[U]): <Trees.TreeApi> = {
+      val $u = $m$untyped.universe
+      val $m = $m$untyped.asInstanceOf[scala.reflect.api.Mirror[$u.type]]
+      <本体>
+    }
+  }
+  <universe>.Expr.apply[T](
+    <universe>.rootMirror.asInstanceOf[<api.Mirror>], new $treecreator1()) }
+```
+
+nsc との差は `crate::materialize` と同じ 3 点（`rootMirror` を使う、
+creator の結果型を `U#Tree` ではなく上限 `Trees$TreeApi` で書く、mirror に
+cast を入れる）で、理由も同じである。`val $m` は本体が要るときだけ置く。
+
+#### 本体 — 衛生性
+
+lowering は quasiquote と同じ `crates/typer/src/reify.rs` の `Reifier` だが、
+`ReifyCtx` を持たせた「reify モード」で走る。違いは 3 つだけで、どれも
+**名前ではなくシンボルで解決する**ことに尽きる。
+
+| 形 | 組む木 |
+| --- | --- |
+| 静的 `object` | `$u.internal.reificationSupport.mkIdent($m.staticModule("<full name>"))` |
+| `x.splice` | `x.in[$u.type]($m).tree` |
+| 型引数 | `$u.internal.reificationSupport.mkTypeTree(<型>)` |
+| それ以外の識別子・ブロック・関数リテラル・`this`・型注釈 | **診断**（`cannot expand reify { ... }: …`） |
+
+最後の行が肝である。nsc はローカルやパラメータを *free term*
+（`newFreeTerm` + `mkIdent`）にして展開に持ち回るが、scala-rs はそれを組めない。
+裸の名前で組めば**コンパイルも実行も通り**、展開先にたまたま在る同名の
+何かを指す——reification が防ぐためにある、まさにそのバグになる。よって断る。
+
+**型引数**も名前では組まない。`f[E]` はマクロ実装が**どの `E` で実体化されたか**を
+意味するので、書かれた名前で `TypeTree` を組めば同じ捕まらないバグになる。中身は
+`TypeTag` を組むのと同じ材料（`crate::materialize::TagBody`）で作り、
+`Reifier::rebuild_type` が creator の**キャストした** mirror `$m`
+（`Mirror[$u.type]`）に対して書き下ろす:
+
+| `TagBody` | 木 |
+| --- | --- |
+| `StaticClass(n)` | `$m.staticClass(n).asType.toTypeConstructor` |
+| `Applied { c, args }` | `$u.appliedType($m.staticClass(c), List(<args>))` |
+| `FromTag(tag)` | `tag.in[$u.type]($m).tpe` |
+
+materialiser 自身の creator は結果が `Types$TypeApi` に erase されてそれ以上
+何も積まないのでパラメータに直接 select できるが、こちらは結果を `mkTypeTree` に
+渡すので `$u.Type` でなければならない。最後の `FromTag` が slick の
+`reify { TableQuery.apply[E](cons.splice) }` に要るものである。
+組めない型（スコープにタグの無い抽象型など）は `ReifyRef::TypeGap` になり、
+タグ生成器の言い分をそのまま添えて診断する。
+
+型引数**以外**の型（型注釈 `(3: Int)` の右辺など）は依然として `Err` である。
+nsc の `reifyType` に相当するものは無い。
+
+#### 識別子の判定
+
+`Check::reify_refs` が本体を歩き、`Ident` / `Select` ごとに**クローンを投機的に
+型付けして巻き戻す**（`hole_lifts` と同じ形）。結果が `Type::ModuleRef` で、
+その module class の JVM 名がパッケージだけで到達できる（simple name に `$` が
+無い）なら静的 `object`、`Expr[T]` の `.splice` なら splice、それ以外は
+分類しない＝`Reifier` が名指しで断る。`NodeId` で引くので、判定と lowering が
+同じ節点を見ていることが保証される。
+
+型引数は `tree_to_type` で `Type` にしてから `Check::tag_body` に渡す
+（`Tag::Weak`。`TypeTag <: WeakTypeTag` なのでどちらのタグでも見つかる）。
+
+`Expr.apply[T]` の `T` は本体全体を 1 度だけ投機型付けして取る（`Type::Constant`
+は `lit_underlying` で widen する）。implicit 節の `WeakTypeTag[T]` は §7.10 の
+materialiser が埋めるが、それは `import <universe>._` から universe を探すので、
+`c.universe.reify { … }` のために**展開を型付けしている間だけ**その universe を
+import prefix として積んでいる（積みっぱなしにはしない）。
+
+#### ソース文字列を typer に渡した
+
+`Reifier` は `src`（元ソース）でパーサが畳んでしまう区別を復元する
+（`A => B` と `Function1[A, B]`、`(a, b)` と `Tuple2(a, b)`、`a :: b` と
+`b.::(a)`）。quasiquote の本体は `quasiquote.rs` が組み直した文字列なのでその場に
+あったが、`reify` の本体は**実ファイルのテキスト**である。`Typer` はソースを
+持っていなかったので `typecheck_units_src` / `typecheck_opts_src` を足し、
+driver が既に持っている `SourceFile::src` を渡すようにした。渡さない呼び出し
+（スニペットを型付けする単体テスト）では空で、各読み取りは書き下ろし側の枝に落ちる。
+
+#### 検証
+
+`tests/fixtures/rb_impl.scala` + `rb_use.scala` を 2 段コンパイルして 16 行印字し、
+**同じ 2 ファイルを実 scalac 2.13.16 で 2 段コンパイルして実行しても同じ 16 行**
+（`tests/fixtures/expected/rb_use.txt`）。最後の 2 行は splice を副作用つきの式で
+埋めたもので、木が splice を落としたり 2 回組んだりしたら数が変わる。
+`rb_bad.scala` は断る 5 形が名指しで診断されることを固定する（実 scalac は
+5 つとも通すので、これは未実装の告白である）。
+
+slick は `errors=115 → 113`、`files_with_errors=41 → 41`。
+`TableQuery.scala:50` の `reify { TableQuery.apply[E](cons.splice) }` は
+**展開できるようになり**、`cannot expand reify` と、その巻き添えだった
+`cannot expand apply` の 2 件が消えた。`crates/backend/` は触っていないので
+`slick_subset.sh` は回していない。
+
+#### 残っているもの
+
+1. 同じ行に残る `value apply is not a member of TableQuery[E]` は §7.13 の残件
+   （`TableQuery.apply` のオーバーロード選択）で、reify とは別件である。
+2. 呼び出し側で**推論された**型引数はまだマクロに渡らない（§7.13 の残件 1）。
+   `rb_use.scala` が `RbUse.idOf[Int](5)` と書き下ろしているのはそのためである。
+3. ローカル・パラメータの *free term*、ブロック、関数リテラル、`this`、
+   型引数以外の型。
+4. §7.14 の残件（trait の中の入れ子*クラス*を型として書く形）はそのまま。

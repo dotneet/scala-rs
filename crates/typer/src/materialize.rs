@@ -130,6 +130,7 @@ pub(crate) fn tag_request(st: &SymbolTable, pt: &Type) -> Option<(Tag, Type)> {
 /// A tag for a *monomorphic* class is one `staticClass` call
 /// ([`TagBody::StaticClass`]). Everything else is a composition, and each
 /// piece is either built or named in a diagnostic -- never approximated.
+#[derive(Clone)]
 pub(crate) enum TagBody {
     /// `$m$untyped.staticClass("<name>").asType.toTypeConstructor`.
     StaticClass(String),

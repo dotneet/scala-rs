@@ -1143,7 +1143,9 @@ fn lf2_lift_bad_names_every_hole_it_cannot_lift() {
         // A `Symbol` is lifted on its own but has no `Liftable`, so `..$` over
         // symbols is refused -- nsc refuses it too.
         "a hole of type `Symbols.ModuleSymbol` is not lifted",
-        "macro expansion is not implemented: cannot expand reify { ... }",
+        // `reify` is expanded now (§7.14); what it cannot build it names.
+        "cannot expand reify { ... }: `f` is a local",
+        "cannot expand reify { ... }: `xs` is a local",
         "docs/macros.md",
     ] {
         assert!(

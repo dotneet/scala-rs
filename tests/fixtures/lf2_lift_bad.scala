@@ -6,7 +6,8 @@
 // into some other tree. `reify { … }` is a compiler-internal macro like the
 // quasiquotes, with no implementation in scala-reflect.jar: saying `value
 // reify is not a member of JavaUniverse` was untrue, the same way `value q is
-// not a member of StringContext` was.
+// not a member of StringContext` was. It has an expansion now (§7.14), and
+// what it still refuses it refuses by name.
 import scala.reflect.runtime.universe._
 
 object Main {
@@ -27,8 +28,13 @@ object Main {
     // `Liftable[Symbol]`, so under `..$` it refuses -- and so do we.
     val syms = List(definitions.ListModule, definitions.ListModule)
     println(showRaw(q"g(..$syms)"))
-    // A compiler-internal macro, unqualified and qualified.
-    println(reify(1).toString)
-    println(scala.reflect.runtime.universe.reify(2).toString)
+    // `reify { … }` is expanded now (`docs/macros.md` §7.14), but only over
+    // static `object` references and `.splice`d expressions: a local is a
+    // *free term* in nsc's reifier and scala-rs does not build those, so it
+    // is named here rather than reified as the bare name it was written with.
+    // Unqualified and qualified, since the two reach the expander by
+    // different doors.
+    println(reify(f).toString)
+    println(scala.reflect.runtime.universe.reify(xs).toString)
   }
 }
