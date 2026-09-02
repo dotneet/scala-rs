@@ -66,5 +66,25 @@ object Main {
     println(typeOf[Baz].typeSymbol.name.toString)
     println(typeOf[Foo].typeSymbol.fullName)
     println(typeOf[scala.math.BigInt].typeSymbol.fullName)
+
+    // A type constructor at its arguments. One `staticClass` call cannot
+    // rebuild these: the creator composes `appliedType` over the class and
+    // each argument's own body (`docs/macros.md` §7.12). Until that landed
+    // every one of them was refused by name, and `tt_tags_bad.scala` still
+    // pins the arguments that cannot be composed.
+    println(show(typeOf[List[Int]]))
+    println(show(weakTypeOf[Option[Foo]]))
+    // `Map` is `Predef.Map`, an *alias*: nsc's creator keeps the alias
+    // (`selectType(staticModule("scala.Predef"), "Map")`), scala-rs's names
+    // the class it points at. The two types are `=:=` and have the same
+    // symbol; only `toString` differs, so that is what is compared here --
+    // the same deviation the `String` case above already carries.
+    println(typeOf[Map[String, Foo]] =:= typeOf[scala.collection.immutable.Map[String, Foo]])
+    println(typeOf[Map[String, Foo]].typeSymbol.fullName)
+    println(show(typeOf[List[List[Int]]]))
+    println(typeOf[List[Int]] =:= typeOf[List[Int]])
+    println(typeOf[List[Int]] =:= typeOf[List[String]])
+    println(typeOf[List[Int]] <:< typeOf[Any])
+    println(typeOf[List[Int]].typeSymbol.fullName)
   }
 }

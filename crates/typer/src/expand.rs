@@ -324,8 +324,8 @@ impl Typer {
 
     /// Run the implementation and rebuild what it returned.
     fn macro_expansion(&mut self, tree: &Tree, binding: &MacroBinding) -> Result<Tree, String> {
-        let (argss, targs) = peel_application(tree);
-        let request = self.expansion_request(binding, &argss, &targs)?;
+        let (argss, targs, prefix) = peel_application(tree);
+        let request = self.expansion_request(binding, &argss, &targs, prefix.as_ref())?;
         if let Some(why) = &self.macro_engine_error {
             // Starting it costs a `javac` and a JVM; a run whose first attempt
             // failed must not pay that again at every call site.
@@ -368,6 +368,7 @@ impl Typer {
         binding: &MacroBinding,
         argss: &[Vec<Tree>],
         targs: &[Type],
+        prefix: Option<&Tree>,
     ) -> Result<String, String> {
         let mut out = String::from("(expand ");
         quote_into(&mut out, &binding.impl_class);
@@ -419,6 +420,40 @@ impl Typer {
             for t in targs {
                 out.push(' ');
                 type_to_wire(&self.st, t, &mut out)?;
+            }
+        }
+        out.push(')');
+        // `c.prefix` -- the receiver the macro was called on. nsc hands the
+        // implementation `Expr[Nothing](prefixTree)(TypeTag.Nothing)`, so only
+        // the *tree* travels; the tag is a constant on the other side.
+        //
+        // Whether the implementation reads it is not knowable from here, so a
+        // receiver this bridge cannot carry is *not* an error at the call
+        // site: the reason travels instead and the engine raises it, named,
+        // only if `prefix` is really asked for. Otherwise every macro called
+        // on an awkward receiver would stop expanding for a member it never
+        // touches.
+        out.push_str(" (prefix ");
+        match prefix {
+            None => {
+                out.push_str("(no ");
+                quote_into(
+                    &mut out,
+                    "the macro was called without a receiver, and scala-rs does not \
+                     synthesise the enclosing `this` for a prefix yet",
+                );
+                out.push(')');
+            }
+            Some(p) => {
+                let mut built = String::new();
+                match tree_to_wire(p, &mut built) {
+                    Err(why) => {
+                        out.push_str("(no ");
+                        quote_into(&mut out, &why);
+                        out.push(')');
+                    }
+                    Ok(()) => out.push_str(&built),
+                }
             }
         }
         out.push_str("))");
@@ -485,10 +520,23 @@ impl Typer {
             "Select" => {
                 let qual = self.tree_from_reply(at(kids, 0)?, span)?;
                 let name = decode_method_name(&name_from(at(kids, 1)?)?);
+                // `new C(args)` is `Apply(Select(New(tpt), <init>), args)` in
+                // reflect and `Apply(New(tpt), args)` here: the constructor
+                // selection is spelled out there and implicit in our tree.
+                if name == "<init>" && matches!(qual.kind, TreeKind::New { .. }) {
+                    return Ok(qual);
+                }
                 Ok(node(TreeKind::Select {
                     qual: Box::new(qual),
                     name,
                 }))
+            }
+            // `New(tpt)` on its own is `new C` with no argument list; nsc
+            // always wraps it in the `<init>` selection above when there is
+            // one, so both arrive here as our `New`.
+            "New" => {
+                let tpt = self.tree_from_reply(at(kids, 0)?, span)?;
+                Ok(node(TreeKind::New { tpt: Box::new(tpt) }))
             }
             "Apply" => {
                 let fun = self.tree_from_reply(at(kids, 0)?, span)?;
@@ -642,7 +690,7 @@ fn name_from(s: &Sexp) -> Result<String, String> {
 
 /// The argument clauses and explicit type arguments of a macro application,
 /// outermost application last -- i.e. in source order.
-fn peel_application(tree: &Tree) -> (Vec<Vec<Tree>>, Vec<Type>) {
+fn peel_application(tree: &Tree) -> (Vec<Vec<Tree>>, Vec<Type>, Option<Tree>) {
     let mut argss: Vec<Vec<Tree>> = Vec::new();
     let mut targs: Vec<Type> = Vec::new();
     let mut t = tree;
@@ -659,7 +707,15 @@ fn peel_application(tree: &Tree) -> (Vec<Vec<Tree>>, Vec<Type>) {
             _ => break,
         }
     }
-    (argss, targs)
+    // `c.prefix` is the receiver of the macro application. `M.f(1)` has one;
+    // an unqualified `f(1)` does not (nsc synthesises `This`, which is not a
+    // tree this bridge can hand over), and that is said by name rather than
+    // guessed at.
+    let prefix = match &t.kind {
+        TreeKind::Select { qual, .. } => Some((**qual).clone()),
+        _ => None,
+    };
+    (argss, targs, prefix)
 }
 
 // ------------------------------------------------------------ our tree → wire

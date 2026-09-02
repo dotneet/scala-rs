@@ -162,10 +162,28 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
   `scala.reflect.runtime.universe` を差す。**nsc と同じく、マクロ実装は
   前の run でコンパイル済みでなければならない**（同じ run にあると
   `is not on the macro classpath` という理由つきで診断する）。渡せる引数の形
-  （`Literal` / `Ident` / `Select` / `Apply` / `this`）、作れるタグ（型引数の無い
-  クラス、明示された型引数のみ）、戻せる木の種類は**部分集合**で、外れる形は
-  すべて名指しで診断する（黙って違う木に展開しない）
+  （`Literal` / `Ident` / `Select` / `Apply` / `this`）、作れるタグ、戻せる木の
+  種類は**部分集合**で、外れる形はすべて名指しで診断する（黙って違う木に
+  展開しない）
   （[`docs/macros.md`](docs/macros.md) §7.11）
+- **`c.Expr[T](tree)` を返す実装と `c.prefix`**: `scala.reflect.macros.Aliases` は
+  `Expr` を `val`（抽出子）と `def Expr[T: WeakTypeTag](tree: Tree)` の 2 つ
+  宣言している。明示型引数はオーバーロードを**値位置の畳み込みより先に**
+  絞る（SLS 6.26.3 の順序）ので、`c.Expr[Int](tree)` は生成メソッドに解決する。
+  `c.prefix` は呼び出し地点のレシーバ木を engine に渡し、nsc と同じく
+  `Expr[Nothing](tree)(TypeTag.Nothing)` として渡す。運べないレシーバ
+  （`new`・レシーバなし）は、実装が `prefix` を読んだときにだけ理由つきで
+  診断する。あわせて `WeakTypeTag[F[E]]` を `appliedType` とスコープ内の
+  タグから合成できるようになった（マクロの外でも同じで、`typeOf[List[Int]]` /
+  `weakTypeOf[Option[Foo]]` が通るようになった。ただし `Predef.Map` のような
+  **型別名**経由の構築子は、nsc が別名を保つのに対し scala-rs は指す先のクラスを
+  名指すので `toString` だけが食い違う。`=:=` と `typeSymbol` は一致する）ので、
+  **slick の `TableQueryMacroImpl.apply`
+  と同じ形**（`c.Expr[F[E]]` を返し `WeakTypeTag[E]` を取り `New(TypeTree(e.tpe))`
+  を書く）のマクロが展開できる。実 scalac 2.13.16 との dual-run で
+  プログラム出力が一致する（`tests/fixtures/ex_impl.scala` +
+  `tests/fixtures/ex_use.scala`）
+  （[`docs/macros.md`](docs/macros.md) §7.12）
 - **quasiquote（`q"..."`）の reification**: `q"..."` / `tq"..."` / `pq"..."` / `cq"..."` は
   `StringContext` の普通の補間子ではなく、nsc の**コンパイラ内蔵マクロ**である。
   補間文字列の中身を（`$x` / `${…}` / `..$xs` / `...$xss` をプレースホルダに置き換えて）
@@ -3406,16 +3424,19 @@ implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラー
   **whitebox マクロ** / **macro bundle**（`class B(val c: Context)`）/
   **マクロバインディングの pickle**（`MACRO` フラグと `@macroImpl`。だから
   マクロ def を*別 run*から展開することはできず、「マクロ def は現在の run、
-  実装は前の run」という形だけが通ります）/ **`c.Expr[T](tree)` を返す実装**
-  （`Context.Expr` のオーバーロードに解決しない）/ **推論された型引数のタグ**
-  （明示された `f[T]` だけ）/ **`c.prefix` / `c.enclosingPosition` /
+  実装は前の run」という形だけが通ります）/ **推論された型引数のタグ**
+  （明示された `f[T]` だけ）/ **`c.enclosingPosition` /
   `c.typecheck` / `c.inferImplicitValue`**（呼ばれると engine が
   `UnsupportedOperationException` を投げ、その名前が診断に出ます）/
-  **ブロック・関数リテラル・`new` などの引数を実装に渡すこと** /
-  **型引数のある型のタグ**。どれも「黙って別の木に展開する」ことはせず、
+  **ブロック・関数リテラル・`new` などの引数（およびレシーバ）を実装に渡すこと** /
+  **レシーバを書かない呼び出しの `c.prefix`**（nsc の `This(<囲むクラス>)`）/
+  **展開結果の `Function` / `ValDef`**（本物の slick の `TableQueryMacroImpl` が
+  作るのはこの形なので、slick 本体に効かせるにはこれが要ります）/
+  **タグを持たない型パラメータのタグ**（nsc は free type symbol を立てますが、
+  scala-rs は断ります）。どれも「黙って別の木に展開する」ことはせず、
   `macro expansion is not implemented: cannot expand f (implementation Impl$.m):
   <理由>` と理由つきで診断します
-  （**[`docs/macros.md`](docs/macros.md)** §7.11）
+  （**[`docs/macros.md`](docs/macros.md)** §7.11 / §7.12）
 - **quasiquote の展開（reification）の残り**。`q"..."` / `tq"..."` / `pq"..."` /
   `cq"..."` は `internal.reificationSupport.Syntactic*` の呼び出しに落として
   実行でき、型注釈 / eta 展開 / ブロックと `val` / `new` / `match` / 部分関数 /
@@ -4503,6 +4524,8 @@ quasiquote と、その受け皿である reflect ABI の下地は `crates/cli/t
 def マクロは `crates/cli/tests/macros.rs` にまとめています。呼ばれない macro def のコンパイルと、`Sugar$.class` にメソッドが出ていないことは `macro_def.scala`。マクロ呼び出しの診断は `macro_call_bad.scala`（`macro expansion is not implemented`）。戻り値型の無いマクロ def は `macro_no_result_type_bad.scala`。`Context` を第 1 引数に取らない実装は `macro_impl_shape_bad.scala`。解決できない実装参照は `macro_impl_missing_bad.scala`。whitebox は `macro_whitebox_bad.scala`。設計は [`docs/macros.md`](docs/macros.md)。
 
 def マクロの**展開**（JVM ブリッジ）は接頭辞 `eg`、`crates/cli/tests/engine.rs` です。nsc と同じく**2 回コンパイル**します: `tests/fixtures/eg_impl.scala`（マクロ実装 5 つ——引数なし / `c.Expr[Int]` / 生の `c.Tree` / `c.WeakTypeTag[T]` / static シンボルを名指す木）を先にコンパイルし、その出力を `-cp` に載せて `tests/fixtures/eg_use.scala`（マクロ def と呼び出し地点）をコンパイルします。`eg_macros_expand_and_run` が `java -Xverify:all` で走らせて `expected/eg_use.txt` の 8 行と一致することを見て、`eg_macros_match_real_scalac` が**同じ 2 ファイルを実 scalac 2.13.16 で 2 段コンパイル・実行した stdout** と三者一致することを見ます。マクロが「違う木」に展開されてもコンパイルは通ってしまうので、**出力の比較だけが間違った展開を捕まえられます**。異常系は `eg_samerun_bad.scala`（実装が同じ run にある。nsc も同じ理由で断る）と `eg_gaps_bad.scala`（渡せない引数の形＝ブロック・関数リテラル、作れないタグ＝`List[Int]`）で、いずれも**その形を名指しした理由つき**で診断されることを固定します。`java` / `javac` / scala-reflect.jar が無い環境ではスキップします。
+
+`c.Expr[T](tree)` を返す実装・`c.prefix`・型構築子のタグは接頭辞 `ex`、同じ `crates/cli/tests/engine.rs` に同じ 2 段構成で入れました。`tests/fixtures/ex_impl.scala`（`c.Expr[T]` を返す実装、`c.prefix` を読む実装、そして **slick の `TableQueryMacroImpl.apply` と同じ形**――`c.Expr[ExBox[E]]` を返し `WeakTypeTag[E]` を取り `New(TypeTree(e.tpe))` を書く実装）を先にコンパイルし、`tests/fixtures/ex_use.scala` をその出力に対してコンパイルします。`ex_expr_and_prefix_macros_expand_and_run` が `expected/ex_use.txt` の 10 行と一致することを、`ex_macros_match_real_scalac` が実 scalac 2.13.16 の 2 段コンパイル・実行と一致することを見ます。出力には `weakTypeOf[ExBox[E]].toString`（合成したタグの型）と `c.prefix.staticType.toString` が含まれるので、**タグや prefix の作り方が nsc と違えば行が変わります**。異常系は `ex_notag_bad.scala`（タグの無い型パラメータ）と `ex_gaps_bad.scala`（運べないレシーバ＝`new`、レシーバなしの呼び出し）で、どちらも実 scalac は通るので**scala-rs 側の穴を名指しで固定した fixture** です（[`docs/macros.md`](docs/macros.md) §7.12）。
 
 名前付き引数とデフォルト引数は `tests/fixtures/namedargs.scala` にまとめ、`crates/cli/tests/e2e.rs` から 2 通りで回します: `scala_library_dual_run_namedargs`（jar リンクで実行し `expected/namedargs.txt` と一致）と `real_scalac_dual_run_namedargs`（**実 scalac 2.13.16 でコンパイル・実行した stdout** と、期待値および scala-rs の出力の三者が一致することを見る）。中身は並べ替え（`Api.area(height = 3, width = 4)`）、自分の位置にある名前付き引数のあとの位置引数（`Api.area(width = 4, 3)`）、デフォルトとの組み合わせ、コンパニオン `apply`、後続の引数リストのデフォルト（`Api.curried(1)(2)` / `Api.dep(4)()`）、可変長引数（`Api.tagged(first = 1)` / `Api.tagged(first = 1, 2, 3)`）、case class の `apply` / `copy` / `super.info.copy(port = 2)`、コンストラクタの名前付き引数とデフォルト（`new Server(threads = 8)` / `new Server()`）、パラメータ名で絞るオーバーロードです。負例は `namedargs_unknown_bad.scala`（`unknown parameter name: q`。メソッドとコンストラクタの両方）、`namedargs_dup_bad.scala`（`parameter 'c' is already specified at parameter position 2`）、`namedargs_order_bad.scala`（`positional after named argument.`）で、いずれも文面を実 scalac 2.13.16 に合わせています。
 | `lazysig.scala` | 型注釈のないメンバを前方参照（`Store.base` / `prefix` / `lazy val`） | `60` `log:store` `[store]log:store` `40` `5` `c7:7` |

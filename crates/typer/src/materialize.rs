@@ -125,6 +125,33 @@ pub(crate) fn tag_request(st: &SymbolTable, pt: &Type) -> Option<(Tag, Type)> {
     Some((tag, args[0].clone()))
 }
 
+/// What the synthetic `TypeCreator.apply` evaluates to.
+///
+/// A tag for a *monomorphic* class is one `staticClass` call
+/// ([`TagBody::StaticClass`]). Everything else is a composition, and each
+/// piece is either built or named in a diagnostic -- never approximated.
+pub(crate) enum TagBody {
+    /// `$m$untyped.staticClass("<name>").asType.toTypeConstructor`.
+    StaticClass(String),
+    /// `$m$untyped.universe.appliedType($m$untyped.staticClass("<name>"),
+    /// List(<args>))` -- a type constructor at its arguments.
+    ///
+    /// nsc writes `internal.reificationSupport.TypeRef(thisPrefix(<owner>),
+    /// <sym>, List(…))`; `appliedType(sym, args)` is the public spelling of
+    /// the same `TypeRef`, since a symbol's `typeConstructor` *is*
+    /// `TypeRef(owner.thisType, sym, Nil)`. `crates/cli/tests/engine.rs`
+    /// compares the resulting `tpe` against the tag real scalac builds.
+    Applied {
+        class_name: String,
+        args: Vec<TagBody>,
+    },
+    /// `<tag>.in($m$untyped).tpe` -- a type parameter whose tag is in scope,
+    /// rebased into the mirror the creator is handed. This is what makes
+    /// `c.Expr[F[E]]` inside `def impl[E](c: Context)(implicit e:
+    /// c.WeakTypeTag[E])` work: `F[E]` is only knowable through `e`.
+    FromTag(Box<Tree>),
+}
+
 /// The name `Mirror.staticClass` is given for `ty`, or why there is none.
 ///
 /// Every accepted form is a *class* with no type arguments, which is exactly
@@ -153,30 +180,7 @@ pub(crate) fn static_class_name(st: &SymbolTable, ty: &Type) -> Result<String, S
         // An alias for `java.lang.Object`, not a class: `staticClass` would
         // throw at run time, so it is refused at compile time instead.
         Type::AnyRef => Err("`AnyRef`, which is an alias rather than a class".to_string()),
-        Type::Class { sym, args } if args.is_empty() => {
-            let s = st.get(*sym);
-            if !matches!(s.kind, SymKind::Class) {
-                return Err(format!("`{}`, which is not a class", s.name));
-            }
-            let jvm = st.jvm_internal(*sym);
-            let simple = jvm.rsplit('/').next().unwrap_or(&jvm);
-            if jvm.is_empty() {
-                return Err(format!("`{}`, which has no class name", s.name));
-            }
-            // `staticClass` walks packages and stops: a class nested in a
-            // class or an object is reached by `selectType` on the enclosing
-            // symbol's info instead, which is a second shape of creator body
-            // and not built here. `Nest$Inner` -- a `$` anywhere in the
-            // class file's simple name -- is exactly that case.
-            if simple.contains('$') {
-                return Err(format!(
-                    "`{}`, a class nested in a class or an object rather than \
-                     a top-level one",
-                    s.name
-                ));
-            }
-            Ok(jvm.replace('/', "."))
-        }
+        Type::Class { sym, args } if args.is_empty() => static_class_of_sym(st, *sym),
         Type::Class { sym, .. } => Err(format!(
             "`{}`, a type constructor applied to type arguments",
             st.get(*sym).name
@@ -195,6 +199,31 @@ pub(crate) fn static_class_name(st: &SymbolTable, ty: &Type) -> Result<String, S
         )),
         other => Err(format!("`{}`", st.display_type(other))),
     }
+}
+
+/// The name `Mirror.staticClass` is given a class symbol, or why there is none.
+///
+/// `staticClass` walks packages and stops: a class nested in a class or an
+/// object is reached by `selectType` on the enclosing symbol's info instead,
+/// which is a second shape of creator body and not built here. `Nest$Inner` --
+/// a `$` anywhere in the class file's simple name -- is exactly that case.
+pub(crate) fn static_class_of_sym(st: &SymbolTable, sym: SymbolId) -> Result<String, String> {
+    let s = st.get(sym);
+    if !matches!(s.kind, SymKind::Class) {
+        return Err(format!("`{}`, which is not a class", s.name));
+    }
+    let jvm = st.jvm_internal(sym);
+    if jvm.is_empty() {
+        return Err(format!("`{}`, which has no class name", s.name));
+    }
+    let simple = jvm.rsplit('/').next().unwrap_or(&jvm);
+    if simple.contains('$') {
+        return Err(format!(
+            "`{}`, a class nested in a class or an object rather than a top-level one",
+            s.name
+        ));
+    }
+    Ok(jvm.replace('/', "."))
 }
 
 /// The reflection classes the materialiser needs symbols for.
@@ -412,8 +441,8 @@ pub(crate) struct Materialiser<'a> {
     pub(crate) creator_name: String,
     /// The `Type` the tag stands for, spliced into `TypeTag.apply[T]`.
     pub(crate) arg: Type,
-    /// What the creator hands to `staticClass`.
-    pub(crate) class_name: String,
+    /// How the creator rebuilds the type.
+    pub(crate) body: TagBody,
     /// The tag companion's simple name: `TypeTag` or `WeakTypeTag`.
     pub(crate) tag_name: String,
     /// `scala.reflect.api.Mirror`, for the cast on the mirror argument.
@@ -507,23 +536,7 @@ impl Materialiser<'_> {
             views: vec![],
             ctx_bounds: vec![],
         });
-        let body = self.select(
-            self.select(
-                self.node(TreeKind::Apply {
-                    fun: Box::new(self.select(
-                        self.node(TreeKind::Ident {
-                            name: "$m$untyped".to_string(),
-                        }),
-                        "staticClass",
-                    )),
-                    args: vec![self.node(TreeKind::Literal {
-                        lit: Lit::String(self.class_name.clone()),
-                    })],
-                }),
-                "asType",
-            ),
-            "toTypeConstructor",
-        );
+        let body = self.rebuild(&self.body);
         let apply = self.node(TreeKind::DefDef {
             mods: Modifiers::default(),
             name: "apply".to_string(),
@@ -556,6 +569,69 @@ impl Materialiser<'_> {
                 span: self.span,
             },
         })
+    }
+
+    /// The creator's body: how one type is rebuilt inside `$m$untyped`.
+    fn rebuild(&self, body: &TagBody) -> Tree {
+        match body {
+            TagBody::StaticClass(name) => self.select(
+                self.select(self.static_class(name), "asType"),
+                "toTypeConstructor",
+            ),
+            TagBody::Applied { class_name, args } => {
+                let list = self.node(TreeKind::Apply {
+                    fun: Box::new(self.immutable_list()),
+                    args: args.iter().map(|a| self.rebuild(a)).collect(),
+                });
+                self.node(TreeKind::Apply {
+                    fun: Box::new(self.select(self.mirror_universe(), "appliedType")),
+                    args: vec![self.static_class(class_name), list],
+                })
+            }
+            // `.in` rebases the tag into the mirror this creator was handed,
+            // the way nsc's own reifier writes `e.in($m).tpe`. Without it the
+            // type would be the one from the tag's *original* universe.
+            TagBody::FromTag(tag) => self.select(
+                self.node(TreeKind::Apply {
+                    fun: Box::new(self.select((**tag).clone(), "in")),
+                    args: vec![self.untyped_mirror()],
+                }),
+                "tpe",
+            ),
+        }
+    }
+
+    fn untyped_mirror(&self) -> Tree {
+        self.node(TreeKind::Ident {
+            name: "$m$untyped".to_string(),
+        })
+    }
+
+    /// `$m$untyped.staticClass("<name>")`.
+    fn static_class(&self, name: &str) -> Tree {
+        self.node(TreeKind::Apply {
+            fun: Box::new(self.select(self.untyped_mirror(), "staticClass")),
+            args: vec![self.node(TreeKind::Literal {
+                lit: Lit::String(name.to_string()),
+            })],
+        })
+    }
+
+    /// `$m$untyped.universe` -- the universe the tag is being read in.
+    fn mirror_universe(&self) -> Tree {
+        self.select(self.untyped_mirror(), "universe")
+    }
+
+    /// `scala.collection.immutable.List`, spelled out: the creator's body is
+    /// typed in the macro implementation's scope, where `import
+    /// c.universe._` may have brought in another `List`.
+    fn immutable_list(&self) -> Tree {
+        let scala = self.node(TreeKind::Ident {
+            name: "scala".to_string(),
+        });
+        let coll = self.select(scala, "collection");
+        let imm = self.select(coll, "immutable");
+        self.select(imm, "List")
     }
 
     // -- building blocks ---------------------------------------------------
