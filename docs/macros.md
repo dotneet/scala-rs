@@ -1957,18 +1957,48 @@ found`。原因は `member_is_stable` ではなく **`Check::term_path_sym`** �
   **実 scalac 2.13.16 でも同じ 5 行**（`tests/fixtures/expected/rd_nested.txt`）。
   受け手を取り違えた member object はコンパイルが通ってしまうので、
   **走らせる以外に捕まえる方法が無い**。
-- `tests/fixtures/rd_ctx.scala` — 同じ 2 件をマクロ実装の中で使い、
-  §7.13.4 の `TreeCreator` を手書きで組む。両コンパイラが通し、
-  classfile が `java -Xverify:all` でロード・検証される。
+- `tests/fixtures/rd_impl.scala` + `tests/fixtures/rd_use.scala` — **`reify`
+  が展開されるべき形を手書きし、実際に展開して走らせる**。下の 4 を参照。
+  `rd_impl` は `c.universe.Expr` をパス越しと wildcard import 越しに、
+  `Mirror[c.universe.type]` を型引数に使い、`TreeCreator` を 3 つ組む。
+  scala-rs で 2 段コンパイルして実行すると 3 行になり、**同じ 2 ファイルを
+  実 scalac 2.13.16 で 2 段コンパイルして実行しても同じ 3 行**である
+  （`tests/fixtures/expected/rd_use.txt`）。静的シンボルを別の universe で
+  解決した creator も、splice を rebase し忘れた creator も**コンパイルは
+  通る**ので、出力の比較だけが捕まえられる。
+
+#### 4. `Exprs#Expr.apply` を手書きする
+
+`reify` の展開は最後に `c.universe.Expr.apply[T](mirror, creator)` を呼ぶ。
+`Expr` が引けるようになっても、この `apply` は**呼べなかった**:
+pickle の署名は
+
+```text
+def apply[T](mirror1: Mirror[Universe.this.type], treec: TreeCreator)
+            (implicit tag: WeakTypeTag[T]): Expr[T]
+```
+
+で、`Universe.this.type` は「完了中のクラス」に対して変換されるのだが、
+それは module `Expr$` 自身なので第 1 引数が `Mirror[Expr$]` になり、
+どの呼び出しとも合わない（`no matching overload for
+(Mirror[Expr$], TreeCreator)(WeakTypeTag[T])Exprs$Expr[T]`）。
+`materialize::ensure_tag_module` が `TypeTag.apply` を手書きしているのと
+まったく同じ理由なので、同じ扱いにした
+（`PickleSupply::install_expr_apply`、erased descriptor も書き下ろし）。
+implicit 節はそのまま残してあるので、手書きの
+`c.universe.Expr.apply[T](m, creator)` は `WeakTypeTag[T]` を
+§7.10 の materialiser から受け取る。
+
+これで **`reify` が組むべき木は、手書きなら丸ごと動く**:
+`rd_use.scala` の 3 つのマクロは engine で本当に展開され、
+`42 / 42 / true` を印字する。残っているのは
+「`reify { … }` からこの木を**自動で組む**こと」だけである。
 
 #### このスライスのあとに残っているもの
 
-1. **`reify` 本体**（§7.13.4 の穴 3 と展開そのもの）。`Expr.apply` は
-   pickle から供給されるが、その第 1 引数 `Mirror[Universe.this.type]` の
-   `this.type` が「完了中のクラス」＝ `Expr$` に解決してしまい、
-   `Mirror[Expr$]` になる。`ensure_tag_module` が `TypeTag.apply` を
-   手書きしているのと同じ理由で、`Exprs$Expr$#apply` も手書きが要る。
-   nsc の展開形（`-Xprint:typer` 実測）は
+1. **`reify { … }` の展開そのもの**（§7.13.4 の穴 3）。木の材料は揃った
+   ので、残るのは check.rs 側の合成と**衛生性**である。nsc の展開形
+   （`-Xprint:typer` 実測）は
 
    ```scala
    { val $u: c.universe.type = c.universe
@@ -1978,11 +2008,21 @@ found`。原因は `member_is_stable` ではなく **`Check::term_path_sym`** �
 
    で、creator の本体は `val $u = $m$untyped.universe` の下に §7.1 の
    reifier を置いたもの。衛生性は静的シンボルを
-   `$u.internal.reificationSupport.mkIdent($m.staticModule("P5Helper"))` に、
-   `splice` を `x.in[$u.type]($m).tree` に落とす。
+   `$u.internal.reificationSupport.mkIdent($m.staticModule("RdHelper"))` に、
+   `splice` を `x.in[$u.type]($m).tree` に落とす——**どちらも
+   `rd_impl.scala` で手書きして動くことを確認済み**。ローカルやパラメータは
+   名指しで断る、というのが設計で、これが未実装。
+   合成側は各識別子が静的シンボルかどうかを知る必要があるので、
+   `Check::hole_lifts` と同じ「クローンを投機的に型付けして巻き戻す」形で
+   本体を先に解決するのが素直である。
 2. **trait の中の入れ子*クラス***（`u.Liftable[Int]` を**型**として書く形）は
    まだ `not found: type Liftable`。今回入れたのは term 側だけである。
-3. §7.13 の残件 1・3（展開の型引数、`TableQuery.apply` のオーバーロード選択）は
+3. **`u.Mirror` の上限が読めない。** `Mirrors#Mirror` は
+   `type Mirror >: Null <: api.Mirror[self.type]` で、`conv_upper_bound` が
+   この上限を落とすので `x.in[u.type](mm)` の `mm` は
+   `u.Mirror` ではなく `scala.reflect.api.Mirror[u.type]` に cast して
+   渡す必要がある（nsc は前者を書く）。`rd_impl.scala` のコメント参照。
+4. §7.13 の残件 1・3（展開の型引数、`TableQuery.apply` のオーバーロード選択）は
    そのまま。
 
 #### slick への効き方

@@ -9273,11 +9273,33 @@ join の前にそれをやりますが、条件を 3 つ付けて**取りこぼ�
   いました（`gen_module_member_receiver`）。`universe.Liftable[String](f)` が
   `ClassCastException: Main$ cannot be cast to scala.reflect.api.Liftables`。
 
-fixture は `tests/fixtures/rd_nested.scala`（実行時 universe に対して 5 行
-印字し、**実 scalac 2.13.16 と一致**）と `tests/fixtures/rd_ctx.scala`
-（マクロ実装の中で同じ 2 件と `TreeCreator` を組み、両コンパイラが通して
-classfile が `java -Xverify:all` で検証される）。テストは
-`crates/cli/tests/engine.rs` に追記した 3 本です。
+さらに **`Exprs#Expr.apply` を手書き**しました。`reify` の展開は最後に
+`c.universe.Expr.apply[T](mirror, creator)` を呼びますが、pickle の署名は
+第 1 引数が `Mirror[Universe.this.type]` で、この `this.type` は完了中の
+クラス（module `Expr$` 自身）に対して変換されるため `Mirror[Expr$]` になり、
+どの呼び出しとも合いませんでした。`ensure_tag_module` が `TypeTag.apply` を
+手書きしているのと同じ理由なので、同じ扱い（`install_expr_apply`、erased
+descriptor も書き下ろし）にしています。implicit 節は残してあるので、
+`WeakTypeTag[T]` は既存の materialiser が埋めます。
+
+これで **`reify` が組むべき木は、手書きなら丸ごと動きます**。
+
+fixture は 2 組です。
+
+* `tests/fixtures/rd_nested.scala` — 実行時 universe に対して、パス越しと
+  wildcard import 越しの入れ子 `object` と
+  `Mirror[scala.reflect.runtime.universe.type]` を使い 5 行印字。
+  **実 scalac 2.13.16 と一致**します。
+* `tests/fixtures/rd_impl.scala` + `tests/fixtures/rd_use.scala` —
+  `reify { 42 }` / `reify { RdHelper.twice(x.splice) }` が展開されるべき形を
+  `TreeCreator` で手書きし、**engine で実際に展開して走らせます**
+  （静的シンボルは `mirror.staticModule`、splice は `Expr.in` 経由）。
+  同じ 2 ファイルを実 scalac でも 2 段コンパイルして実行し、
+  `42 / 42 / true` が一致することを別テストで固定しています。受け手や
+  universe を取り違えた creator はコンパイルが通ってしまうので、出力の比較
+  だけが捕まえられます。
+
+テストは `crates/cli/tests/engine.rs` に追記した 4 本です。
 
 `tests/slick_measure.sh` は `errors=134 → 134`、`files_with_errors=48 → 48`、
 `tests/slick_subset.sh` は `38 files / 204 classes / verified=204 failed=0` で
@@ -9286,15 +9308,16 @@ classfile が `java -Xverify:all` で検証される）。テストは
 
 #### 残件
 
-* **`reify` 本体は未実装**で、診断は `docs/macros.md` §7.8 のままです。
-  `Expr.apply` は pickle から供給されますが、第 1 引数
-  `Mirror[Universe.this.type]` の `this.type` が完了中のクラス（`Expr$`）に
-  解決して `Mirror[Expr$]` になるため、`ensure_tag_module` が
-  `TypeTag.apply` を手書きしているのと同じ理由で `Exprs$Expr$#apply` も
-  手書きが要ります。nsc の展開形は `docs/macros.md` §7.14 に実測で記録して
-  あります。
+* **`reify { … }` の展開そのものは未実装**で、診断は `docs/macros.md` §7.8 の
+  ままです。木の材料は揃ったので、残るのは合成と**衛生性**（静的シンボルを
+  `mkIdent(mirror.staticModule(...))` に、`splice` を `x.in(m).tree` に落とし、
+  ローカルは名指しで断る）です。nsc の展開形は `docs/macros.md` §7.14 に実測
+  で記録してあります。
 * trait の中の入れ子***クラス***を**型**として書く形（`u.Liftable[Int]`）は
   まだ `not found: type Liftable` です。今回入れたのは term 側だけです。
+* `u.Mirror` の上限（`api.Mirror[self.type]`）を pickle から読めないので、
+  creator の中では `scala.reflect.api.Mirror[u.type]` に cast する必要が
+  あります（nsc は `u.Mirror` と書きます）。
 
 ## ライセンス
 

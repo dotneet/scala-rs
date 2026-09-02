@@ -732,87 +732,113 @@ fn rd_nested_matches_real_scalac() {
     let _ = fs::remove_dir_all(&out_dir);
 }
 
-/// `tests/fixtures/rd_ctx.scala`: the same two members inside a **macro
-/// implementation**, which is where the self-built `reify` needs them, plus
-/// the `TreeCreator` half of that expansion written out by hand.
+/// `rd_impl.scala` + `rd_use.scala`: the shape `reify { … }` expands into,
+/// written out by hand and **expanded for real** through the bridge.
 ///
-/// A macro implementation is a library, so there is nothing to run: what is
-/// checked is that both compilers accept the file and that the class files
-/// scala-rs emits load with the verifier on.
+/// `reify` itself is still the §7.8 diagnostic, but everything it has to emit
+/// is exercised here: `c.universe.Expr.apply` (whose pickled signature says
+/// `Mirror[Universe.this.type]` and is written out, the way `TypeTag.apply`
+/// is), `Mirror[c.universe.type]`, a `TreeCreator` subclass, a static symbol
+/// resolved through `mirror.staticModule`, and a splice through `Expr.in`.
 #[test]
-fn rd_ctx_compiles_in_a_macro_implementation() {
-    if !prerequisites("rd_ctx") {
+fn rd_reify_shape_expands_and_runs() {
+    if !prerequisites("rd_use") {
         return;
     }
     let jar = scala_library_jar().unwrap();
     let reflect = scala_reflect_jar().unwrap();
-    let out_dir = tmp_dir("rd_ctx");
-    let out = compile("rd_ctx", &out_dir, &[]);
+    let impls = tmp_dir("rd_impl");
+    let uses = tmp_dir("rd_use");
+
+    let out = compile("rd_impl", &impls, &[]);
     assert!(
         out.status.success(),
-        "compile rd_ctx failed: {}",
+        "compile rd_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out = compile("rd_use", &uses, &[&impls]);
+    assert!(
+        out.status.success(),
+        "compile rd_use failed: {}",
         diagnostics(&out)
     );
 
-    // Loading the class runs the verifier over every method in it; the loader
-    // is compiled by scala-rs too, the same shape `quasi.rs` uses for
-    // `tt_ctx`.
-    let loader = out_dir.join("loader");
-    fs::create_dir_all(&loader).unwrap();
-    let src = out_dir.join("Loader.scala");
-    fs::write(
-        &src,
-        "object Main {\n  \
-         def main(args: Array[String]): Unit = println(Class.forName(\"RdCtx$\").getName)\n\
-         }\n",
-    )
-    .unwrap();
-    let built = Command::new(bin())
-        .args([
-            "compile",
-            src.to_str().unwrap(),
-            "-d",
-            loader.to_str().unwrap(),
-            "--scala-library",
-            jar.to_str().unwrap(),
-        ])
-        .output()
-        .expect("run scala-rs compile");
-    assert!(
-        built.status.success(),
-        "compiling the loader failed: {}",
-        diagnostics(&built)
-    );
     let cp = format!(
         "{}:{}:{}:{}",
-        loader.display(),
-        out_dir.display(),
+        uses.display(),
+        impls.display(),
         reflect.display(),
         jar.display()
     );
-    assert_eq!(run_main(&cp, "rd_ctx loader"), "RdCtx$\n");
+    assert_eq!(
+        run_main(&cp, "rd_use"),
+        expected_stdout("rd_use"),
+        "stdout mismatch for rd_use"
+    );
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
 
+/// The same two files through real scalac 2.13.16. A creator that resolved
+/// the static symbol in the wrong universe, or spliced the argument's tree
+/// without rebasing it, would still compile -- only the output would differ.
+#[test]
+fn rd_reify_shape_matches_real_scalac() {
+    if !prerequisites("rd_use scalac diff") {
+        return;
+    }
     let Some(scalac) = find_scalac() else {
-        eprintln!("skip the scalac half of rd_ctx: scalac not obtainable");
-        let _ = fs::remove_dir_all(&out_dir);
+        eprintln!("skip rd_use scalac diff: scalac not obtainable");
         return;
     };
-    let ref_out = tmp_dir("rd_ctx-scalac");
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("rd_impl-scalac");
+    let uses = tmp_dir("rd_use-scalac");
+
     let out = Command::new(&scalac)
         .args([
             "-cp",
             reflect.to_str().unwrap(),
             "-d",
-            ref_out.to_str().unwrap(),
-            fixtures_dir().join("rd_ctx.scala").to_str().unwrap(),
+            impls.to_str().unwrap(),
+            fixtures_dir().join("rd_impl.scala").to_str().unwrap(),
         ])
         .output()
         .expect("scalac");
     assert!(
         out.status.success(),
-        "real scalac rejected rd_ctx.scala: {}",
+        "real scalac rejected rd_impl.scala: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let _ = fs::remove_dir_all(&ref_out);
-    let _ = fs::remove_dir_all(&out_dir);
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            &format!("{}:{}", reflect.display(), impls.display()),
+            "-d",
+            uses.to_str().unwrap(),
+            fixtures_dir().join("rd_use.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected rd_use.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "rd_use (real scalac build)"),
+        expected_stdout("rd_use"),
+        "recorded expectation for rd_use does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
 }

@@ -1028,6 +1028,9 @@ impl PickleSupply {
                 id
             }
         };
+        if module_jvm == Self::EXPR_MODULE {
+            self.install_expr_apply(st, bin, mcls);
+        }
         let want = Type::Method {
             paramss: Vec::new(),
             ret: Box::new(Type::ModuleRef(mcls)),
@@ -1105,6 +1108,102 @@ impl PickleSupply {
             "{pickle_owner}#{name}: supplied nested object {module_jvm}"
         ));
         Some(acc)
+    }
+
+    /// JVM name of the one nested object whose `apply` has to be written out.
+    const EXPR_MODULE: &'static str = "scala/reflect/api/Exprs$Expr$";
+
+    /// `Exprs#Expr.apply`, written out rather than read from the pickle.
+    ///
+    /// The pickled signature is
+    ///
+    /// ```text
+    /// def apply[T](mirror1: Mirror[Universe.this.type], treec: TreeCreator)
+    ///             (implicit tag: WeakTypeTag[T]): Expr[T]
+    /// ```
+    ///
+    /// and `Universe.this.type` is converted against whatever class is under
+    /// completion -- here the module `Expr$` itself -- so the first parameter
+    /// came out `Mirror[Expr$]` and no call site could ever match it
+    /// (`no matching overload for (Mirror[Expr$], TreeCreator)(WeakTypeTag[T])
+    /// Exprs$Expr[T]`). `materialize::ensure_tag_module` writes `TypeTag.apply`
+    /// out by hand for exactly the same reason; see `docs/macros.md` §7.10 and
+    /// §7.14.
+    ///
+    /// This is the constructor of every `Expr`, which is what `reify { … }`
+    /// expands into, so it is the one nested object that needs the treatment.
+    /// The erased descriptor is written out too -- the same convention
+    /// `install` uses for a library member whose Scala signature does not
+    /// convert.
+    fn install_expr_apply(&mut self, st: &mut SymbolTable, bin: &mut BinaryIndex, mcls: SymbolId) {
+        // Whatever is there already wins, and asking the pickle for `apply`
+        // must never add the unusable one next to this one.
+        let fresh = self.tried.insert((mcls.0, "apply".to_string()));
+        if !fresh || !st.lookup_member(mcls, "apply").is_empty() {
+            return;
+        }
+        let Some(mirror) = self.ensure_class(st, bin, "scala.reflect.api.Mirror", false) else {
+            return;
+        };
+        let Some(creator) = self.ensure_class(st, bin, "scala.reflect.api.TreeCreator", false)
+        else {
+            return;
+        };
+        let Some(wtt) = self.ensure_class(st, bin, "scala.reflect.api.TypeTags.WeakTypeTag", false)
+        else {
+            return;
+        };
+        let Some(expr) = self.ensure_class(st, bin, "scala.reflect.api.Exprs.Expr", false) else {
+            return;
+        };
+
+        let ap = st.alloc("apply", mcls, SymKind::Method, Flags::EMPTY, "");
+        let t = st.alloc("T", ap, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(t).ty = Type::TypeParam(t);
+        st.get_mut(ap).tparams = vec![t];
+
+        let mirror_ty = Type::Class {
+            sym: mirror,
+            args: vec![],
+        };
+        let creator_ty = Type::Class {
+            sym: creator,
+            args: vec![],
+        };
+        let tag_ty = Type::Class {
+            sym: wtt,
+            args: vec![Type::TypeParam(t)],
+        };
+        let p1 = st.alloc("mirror1", ap, SymKind::Term, Flags::PARAM, "");
+        st.get_mut(p1).ty = mirror_ty.clone();
+        let p2 = st.alloc("treec", ap, SymKind::Term, Flags::PARAM, "");
+        st.get_mut(p2).ty = creator_ty.clone();
+        // The tag clause is implicit, which is what lets a hand-written
+        // `c.universe.Expr.apply[T](m, creator)` reach the materialiser
+        // (`Check::materialize_tag`) for its `WeakTypeTag[T]`.
+        let p3 = st.alloc(
+            "evidence$1",
+            ap,
+            SymKind::Term,
+            Flags::PARAM.with(Flags::IMPLICIT),
+            "",
+        );
+        st.get_mut(p3).ty = tag_ty.clone();
+        st.get_mut(ap).params = vec![p1, p2, p3];
+        st.get_mut(ap).paramss = vec![vec![p1, p2], vec![p3]];
+        st.get_mut(ap).ty = Type::Method {
+            paramss: vec![vec![mirror_ty, creator_ty], vec![tag_ty]],
+            ret: Box::new(Type::Class {
+                sym: expr,
+                args: vec![Type::TypeParam(t)],
+            }),
+        };
+        st.get_mut(ap).jvm_name = "(Lscala/reflect/api/Mirror;\
+             Lscala/reflect/api/TreeCreator;\
+             Lscala/reflect/api/TypeTags$WeakTypeTag;)\
+             Lscala/reflect/api/Exprs$Expr;"
+            .to_string();
+        trace(format_args!("wrote out {}#apply", Self::EXPR_MODULE));
     }
 
     #[allow(clippy::too_many_arguments)]
