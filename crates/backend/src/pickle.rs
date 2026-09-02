@@ -1409,6 +1409,18 @@ impl<'a> Pickler<'a> {
                 write_nat_to(&mut body, c);
                 self.add(CONSTANTtpe, body)
             }
+            // The as-seen-from view of a type projection (`A#B`) is the
+            // compiler's own bookkeeping, not a refinement the program wrote:
+            // pickle the bare `B`. Writing the `<asSeenFrom>` decl would put a
+            // name no Scala compiler can read into the signature.
+            Type::Refined { .. }
+                if scala_rs_typer::SymbolTable::as_seen_from_view(ty).is_some() =>
+            {
+                let parent = scala_rs_typer::SymbolTable::as_seen_from_view(ty)
+                    .cloned()
+                    .unwrap_or(Type::AnyRef);
+                self.pickle_type(&parent)
+            }
             Type::Refined { parents, decls } => self.pickle_refined(parents, decls),
             _ => self.type_ref_named("Any"),
         }

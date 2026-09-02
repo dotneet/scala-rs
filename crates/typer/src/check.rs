@@ -146,6 +146,13 @@ pub struct Typer {
     local_class_n: std::collections::HashMap<String, u32>,
     /// Enclosing package clauses; a nested one is relative to the last.
     pkg_nest: Vec<SymbolId>,
+    /// Packages a file's `package` clauses actually *open*, by file index.
+    ///
+    /// SLS 9.2: a clause opens the package it names, not the ones on the way
+    /// there. `package p.q` opens only `p.q`, while `package p { package q
+    /// { … } }` opens both -- and nsc really does tell the two apart
+    /// (2.13.16, with and without `-Xsource:3`). See `expose_unqualified`.
+    open_pkgs: HashMap<usize, Vec<SymbolId>>,
     /// Signature pass: fill member types across the whole run before any body
     /// is typed, so a unit can call into one that comes later.
     pub(crate) sigs_only: bool,
@@ -499,6 +506,7 @@ impl Typer {
             gensym: 0,
             local_class_n: std::collections::HashMap::new(),
             pkg_nest: Vec::new(),
+            open_pkgs: HashMap::new(),
             sigs_only: false,
             strict_type_names: false,
             sig_done: std::collections::HashSet::new(),
@@ -576,6 +584,10 @@ impl Typer {
                 let saved = self.st.owner;
                 self.st.owner = pkg;
                 self.pkg_nest.push(pkg);
+                let opened = self.open_pkgs.entry(self.file_index).or_default();
+                if !opened.contains(&pkg) {
+                    opened.push(pkg);
+                }
                 self.st.push_scope();
                 // First pass: enter classes/modules so they can forward-ref.
                 for stt in stats.iter_mut() {
@@ -6727,6 +6739,47 @@ impl Typer {
         }
     }
 
+    /// Is `outer` `inner` itself, or one of its enclosing packages?
+    fn encloses_package(&self, outer: SymbolId, inner: SymbolId) -> bool {
+        let mut cur = inner;
+        for _ in 0..64 {
+            if cur == outer {
+                return true;
+            }
+            let owner = self.st.get(cur).owner;
+            if owner.is_none() || owner == cur {
+                return false;
+            }
+            cur = owner;
+        }
+        false
+    }
+
+    /// The package scopes an unqualified name may be looked up in, innermost
+    /// first, ending at the root.
+    ///
+    /// The file's `package` clauses decide this, not the owner chain: only a
+    /// clause *opens* a package. A file that reaches here without a recorded
+    /// clause (a lazy completion driven from another unit) gets the strict
+    /// answer -- its own package and the root.
+    fn open_packages(&self, from: SymbolId) -> Vec<SymbolId> {
+        let encl = self.enclosing_package(from);
+        let mut out = vec![encl];
+        if let Some(opened) = self.open_pkgs.get(&self.file_index) {
+            // Innermost first, and only the ones this definition is actually
+            // inside: two sibling clauses in one file do not see each other.
+            for &p in opened.iter().rev() {
+                if p != encl && !out.contains(&p) && self.encloses_package(p, encl) {
+                    out.push(p);
+                }
+            }
+        }
+        if !out.contains(&self.st.root) {
+            out.push(self.st.root);
+        }
+        out
+    }
+
     fn expose_unqualified(&mut self, name: &str, span: Span) {
         if name.is_empty() || !self.st.lookup(name).is_empty() {
             return;
@@ -6736,37 +6789,31 @@ impl Typer {
         } else {
             self.st.owner
         };
-        // A name is visible from every enclosing package, not just the
-        // innermost: `slick.jdbc.meta` sees `slick.jdbc`'s members.
+        // Only the packages the file's own clauses opened, innermost first.
         //
-        // Not what nsc does, and the difference is observable: a *qualified*
-        // clause `package p.q` sees neither a class nor a subpackage of `p`
-        // (2.13.16: "not found: type Widget" / "not found: value cats", with
-        // and without `-Xsource:3`), while the nested spelling
-        // `package p { package q { … } }` sees both. slick has its own
-        // `slick.cats` package, so this makes `cats.effect.IO` inside
-        // `package slick.dbio` resolve to it and fail with
-        // "value effect is not a member of <notype>" (2 errors).
-        // `agent/cats2` tried opening only the packages the file's clauses
-        // name (one `PackageDef` each) and the two errors did go away, but
-        // `slick.ControlsConfig` -- a *qualified* reference from
-        // `package slick.jdbc` -- then failed to resolve, for a net +1. The
-        // rule is right; something else leans on the loose reading, and the
-        // two have to be untangled together.
-        let mut pkg = self.enclosing_package(from);
-        loop {
+        // A *qualified* clause `package p.q` sees neither a class nor a
+        // subpackage of `p` (2.13.16: "not found: type Widget" /
+        // "not found: value cats", with and without `-Xsource:3`), while the
+        // nested spelling `package p { package q { … } }` sees both. Walking
+        // the owner chain instead made slick's own `slick.cats` package
+        // shadow the real `cats` for every file under `package slick.*`:
+        // `cats.effect.IO` in `package slick.dbio` came out as
+        // "value effect is not a member of <notype>".
+        //
+        // The root package stays at the end of the walk: nsc's context chain
+        // for `package p.q` is `q` then the root, and a *qualified*
+        // reference like slick's `slick.ControlsConfig` from
+        // `package slick.jdbc` resolves its head there. Dropping it from the
+        // walk (rather than only the packages in between) is what cost
+        // `agent/cats2` a net +1 error.
+        for pkg in self.open_packages(from) {
             self.complete_binary_member(pkg, name, span);
             for id in self.st.lookup_member(pkg, name) {
                 self.st.enter_in_current(name, id);
             }
-            if !self.st.lookup(name).is_empty() || pkg == self.st.root {
+            if !self.st.lookup(name).is_empty() {
                 break;
             }
-            let owner = self.st.get(pkg).owner;
-            if owner.is_none() || owner == pkg {
-                break;
-            }
-            pkg = owner;
         }
         let pkg = self.enclosing_package(from);
         // An `import p._` the program wrote outranks the implicit
@@ -6807,6 +6854,57 @@ impl Typer {
             self.complete_binary_member(self.st.root, name, span);
             for id in self.st.lookup_member(self.st.root, name) {
                 self.st.enter_in_current(name, id);
+            }
+        }
+        if self.st.lookup(name).is_empty() {
+            self.expose_from_unopened_packages(name, span, pkg);
+        }
+    }
+
+    /// Last resort: the packages *between* the file's clause and the root,
+    /// which SLS 9.2 does not open.
+    ///
+    /// This is not a scoping rule; it is a patch over a hole elsewhere, and
+    /// the hole is now pinned down: **a default argument's right-hand side is
+    /// typed at the call site, in the caller's scope.** When
+    /// `default_getter_apply` finds no `f$default$n` to call, both
+    /// `fill_defaults_and_implicits` (via `type_default_rhs_here`) and the
+    /// named-argument path splice the *untyped* stored tree into the
+    /// arguments, and it is then typed wherever the call happens to be.
+    /// slick's `slick/basic/DatabaseConfig.scala` writes
+    /// `import slick.ControlsConfig` and
+    /// `classLoader: ClassLoader = ClassLoaderUtil.defaultClassLoader`; every
+    /// caller under `package slick.jdbc` re-types those bodies without that
+    /// file's imports, and only the old, too-loose package walk was making
+    /// them resolve. (`not found: value ClassLoaderUtil` in
+    /// `slick/jdbc/DatabaseConfig.scala` is the same hole showing through
+    /// even on `main`.)
+    ///
+    /// Running the correct rule first and this only when nothing at all was
+    /// found keeps that cover while making `slick.cats` stop shadowing the
+    /// real `cats` for every file under `package slick.*`: precedence is what
+    /// the shadowing bug was about, and precedence is now nsc's.
+    ///
+    /// Delete this once a default argument is always either a call to its
+    /// getter or typed in the scope it was written in; the packages it
+    /// reaches are ones nsc reports as not found.
+    fn expose_from_unopened_packages(&mut self, name: &str, span: Span, from_pkg: SymbolId) {
+        let opened = self.open_packages(from_pkg);
+        let mut pkg = from_pkg;
+        loop {
+            let owner = self.st.get(pkg).owner;
+            if owner.is_none() || owner == pkg || pkg == self.st.root {
+                return;
+            }
+            pkg = owner;
+            if !opened.contains(&pkg) {
+                self.complete_binary_member(pkg, name, span);
+                for id in self.st.lookup_member(pkg, name) {
+                    self.st.enter_in_current(name, id);
+                }
+                if !self.st.lookup(name).is_empty() {
+                    return;
+                }
             }
         }
     }
@@ -17312,6 +17410,124 @@ impl Typer {
         }
     }
 
+    /// `A#B` (and `a.B`) where `B` is nested in a class `O` that `A` extends.
+    ///
+    /// `B`'s members are written in `O`'s vocabulary, so an abstract type
+    /// member of `O` that `A` makes concrete has to be read at `A`'s
+    /// definition: slick's `HeapBackend#BasicActionContext` inherits
+    /// `def session: Session` from `BasicBackend.BasicActionContext`, and
+    /// `Session` is `BasicBackend`'s abstract member -- `HeapSessionDef` only
+    /// through `HeapBackend`.
+    ///
+    /// `Type::Class` has no room for a prefix, so the projection would drop
+    /// that fact and every later selection would read the abstract member
+    /// (`value database is not a member of BasicBackend.Session`). Pin what
+    /// the prefix settles onto the result as a type-only refinement instead;
+    /// `expand_in_type` / `subst_as_seen_from` already read refinements, and
+    /// erasure discards a refinement with no term members, so the projected
+    /// type still erases to `B`.
+    fn projected_class_type(&mut self, prefix: &Type, pcls: SymbolId, member: SymbolId) -> Type {
+        let base = Type::Class {
+            sym: member,
+            args: vec![],
+        };
+        let decls = self.projection_refinements(prefix, pcls, member);
+        Self::as_seen_from(base, decls)
+    }
+
+    /// Wrap `base` in the as-seen-from view carrying `decls`, or hand it back
+    /// unchanged when the prefix settles nothing.
+    fn as_seen_from(base: Type, mut decls: Vec<RefineDecl>) -> Type {
+        if decls.is_empty() {
+            return base;
+        }
+        decls.insert(
+            0,
+            RefineDecl::Type {
+                name: crate::symbol::AS_SEEN_FROM_MARK.to_string(),
+                rhs: None,
+                tparams: 0,
+                lo: None,
+                hi: None,
+            },
+        );
+        Type::Refined {
+            parents: vec![base],
+            decls,
+        }
+    }
+
+    /// The aliases `pcls` supplies for the abstract type members declared
+    /// beside `member` (in its lexically enclosing classes and their
+    /// ancestors). Empty when the prefix adds nothing.
+    fn projection_refinements(
+        &mut self,
+        prefix: &Type,
+        pcls: SymbolId,
+        member: SymbolId,
+    ) -> Vec<RefineDecl> {
+        let mut decls: Vec<RefineDecl> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for owner in self.st.enclosing_classes(member).into_iter().skip(1) {
+            // Only an enclosing class the prefix actually is can settle
+            // anything; an unrelated lexical owner leaves `member` alone.
+            if owner != pcls && !self.st.is_ancestor_of(owner, pcls) {
+                continue;
+            }
+            for name in self.st.abstract_type_member_names(owner) {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let Some(rhs) = self.concrete_type_member_of(prefix, pcls, &name) else {
+                    continue;
+                };
+                decls.push(RefineDecl::Type {
+                    name,
+                    rhs: Some(rhs.0),
+                    tparams: rhs.1,
+                    lo: None,
+                    hi: None,
+                });
+            }
+        }
+        decls
+    }
+
+    /// `pcls`'s answer for the type member `name`, read through `prefix`, or
+    /// `None` when `pcls` leaves it abstract too. The `usize` is the kind
+    /// arity (`type Database[F[_]] = HeapDatabaseDef[F]` → 1).
+    fn concrete_type_member_of(
+        &mut self,
+        prefix: &Type,
+        pcls: SymbolId,
+        name: &str,
+    ) -> Option<(Type, usize)> {
+        for m in self.st.lookup_member(pcls, name) {
+            if self.st.get(m).kind != SymKind::TypeMember {
+                continue;
+            }
+            let info = self.st.get(m);
+            let arity = info.tparams.len();
+            if matches!(&info.ty, Type::NoType | Type::Error) {
+                continue;
+            }
+            if let Type::TypeMember(inner) = &info.ty {
+                // Still abstract (a member stands for itself): nothing to pin.
+                if *inner == m {
+                    continue;
+                }
+            }
+            if arity > 0 {
+                // A higher-kinded alias stays a constructor until applied;
+                // `expand_applied_hk_alias` expands it at the use site.
+                return Some((Type::TypeMember(m), arity));
+            }
+            let rhs = info.ty.clone();
+            return Some((self.st.expand_in_type(prefix, &rhs), 0));
+        }
+        None
+    }
+
     fn project_from_prefix(&mut self, span: Span, prefix: &Type, name: &str) -> Type {
         // A projection out of a prefix that already failed reports nothing new.
         if prefix.is_error() {
@@ -17320,6 +17536,29 @@ impl Typer {
         // `o#arg[…]`: the prefix may be an alias whose right-hand side lives in
         // a unit that has not been walked yet. Resolve it before projecting.
         let prefix = &self.complete_prefix_aliases(span, prefix);
+        // `A#B#C`: the view wrapped around `A#B` is not a structural type, so
+        // project through its parent and keep carrying what `A` settled.
+        if let Some(parent) = SymbolTable::as_seen_from_view(prefix) {
+            if let Some(t) = self.st.lookup_type_member_on(prefix, name) {
+                return t;
+            }
+            let parent = parent.clone();
+            let Type::Refined { decls, .. } = prefix.clone() else {
+                unreachable!()
+            };
+            let t = self.project_from_prefix(span, &parent, name);
+            let carried: Vec<RefineDecl> = decls
+                .into_iter()
+                .filter(|d| {
+                    !matches!(d, RefineDecl::Type { name, .. }
+                        if name == crate::symbol::AS_SEEN_FROM_MARK)
+                })
+                .collect();
+            return match t {
+                Type::Class { .. } => Self::as_seen_from(t, carried),
+                other => other,
+            };
+        }
         if let Type::Refined { parents, .. } = prefix {
             if let Some(t) = self.st.lookup_type_member_on(prefix, name) {
                 return t;
@@ -17404,10 +17643,7 @@ impl Typer {
         for m in found {
             let ty = match self.st.get(m).kind {
                 SymKind::TypeMember => self.st.type_member_as_seen(m),
-                SymKind::Class | SymKind::ModuleClass => Type::Class {
-                    sym: m,
-                    args: vec![],
-                },
+                SymKind::Class | SymKind::ModuleClass => self.projected_class_type(prefix, cls, m),
                 _ => continue,
             };
             return self.st.expand_in_type(prefix, &ty);
