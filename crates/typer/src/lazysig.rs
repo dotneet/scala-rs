@@ -46,6 +46,27 @@ pub(crate) struct PendingDefault {
     scopes: Rc<Vec<Scope>>,
 }
 
+/// Where a default argument's right-hand side was written.
+///
+/// A default whose `name$default$n` getter cannot be called -- a primary
+/// constructor's above all, since nsc puts those on the companion and we
+/// synthesize none -- is spliced into the argument list as the tree the namer
+/// stored, and was then typed wherever the call happened to be. That resolves
+/// its names in the *caller's* scope: slick writes
+/// `class DriverDataSource(…, classLoader: ClassLoader =
+/// ClassLoaderUtil.defaultClassLoader)` under
+/// `import slick.util.ClassLoaderUtil`, and a caller in another file without
+/// that import reported `not found: value ClassLoaderUtil` -- with the span of
+/// the *definition* against the caller's source, so the caret landed on an
+/// unrelated line. Keeping the scope stack, owner and unit here lets
+/// `Typer::type_default_rhs_here` type the body where it was written.
+pub(crate) struct DefaultScope {
+    pub owner: SymbolId,
+    pub this_class: SymbolId,
+    pub file_index: usize,
+    pub scopes: Rc<Vec<Scope>>,
+}
+
 /// A definition whose signature still needs its right-hand side typed.
 pub(crate) struct PendingSig {
     /// The definition tree. Typed at most once, then spliced back into the unit.
@@ -298,6 +319,55 @@ impl Typer {
         self.lazy_done.insert(id, t);
     }
 
+    /// Remember the scope a default's right-hand side was written in, so
+    /// `type_default_rhs_here` can type it there instead of at the call site.
+    ///
+    /// `has_this` is false for a *constructor* parameter: `new C(1)` has no
+    /// instance yet, so the body cannot mean `this.field`. Left true, an
+    /// `a` in `class Pair(a: Int, b: Int = a)` resolved to the field and the
+    /// spliced tree loaded it off whatever `this` the *caller* had -- a
+    /// `ClassCastException` at run time where nsc emits a companion getter.
+    /// With no `this` it is `not found: value a`, which is what this compiler
+    /// can honestly say until those getters exist.
+    pub(crate) fn record_default_scope(&mut self, param: SymbolId, has_this: bool) {
+        if param.is_none() {
+            return;
+        }
+        let base = self.lazy_base_scopes.min(self.st.scopes.len());
+        let mut stack = self.st.scopes[base..].to_vec();
+        let owner = if has_this {
+            self.st.owner
+        } else {
+            // The innermost scope here is the class's own member scope, and
+            // the owner is the class. Neither is reachable from a constructor
+            // default: `new C(1)` has no instance, so nothing the class
+            // declares -- its fields, its methods, the constructor parameters
+            // that precede this one -- can be named. Dropping both makes
+            // `class Pair(a: Int, b: Int = a)` say `not found: value a`; left
+            // in, `a` resolved to the *field* and the spliced tree read it off
+            // the caller's `this` (a `ClassCastException` at run time). nsc
+            // accepts that program by emitting `Pair$default$2(a: Int)` on the
+            // companion, which this compiler does not synthesize yet, so an
+            // error is the honest answer.
+            stack.pop();
+            self.st.get(self.st.owner).owner
+        };
+        let scopes = Rc::new(stack);
+        self.default_scopes.insert(
+            param,
+            DefaultScope {
+                owner,
+                this_class: if has_this {
+                    self.st.this_class
+                } else {
+                    SymbolId::NONE
+                },
+                file_index: self.file_index,
+                scopes,
+            },
+        );
+    }
+
     /// Remember the body for `type_pending_defaults`, together with the scope
     /// stack it was written in.
     pub(crate) fn defer_default_getter_rhs(
@@ -381,7 +451,11 @@ impl Typer {
         self.swap_in_scopes(p.scopes.as_ref(), p.owner)
     }
 
-    fn swap_in_scopes(&mut self, scopes: Option<&Rc<Vec<Scope>>>, owner: SymbolId) -> Vec<Scope> {
+    pub(crate) fn swap_in_scopes(
+        &mut self,
+        scopes: Option<&Rc<Vec<Scope>>>,
+        owner: SymbolId,
+    ) -> Vec<Scope> {
         let mut saved = std::mem::take(&mut self.st.scopes);
         let base = self.lazy_base_scopes.min(saved.len());
         let mut stack: Vec<Scope> = saved.drain(..base).collect();
@@ -413,7 +487,7 @@ impl Typer {
         saved
     }
 
-    fn swap_back_scopes(&mut self, saved: Vec<Scope>) {
+    pub(crate) fn swap_back_scopes(&mut self, saved: Vec<Scope>) {
         let mut cur = std::mem::take(&mut self.st.scopes);
         cur.truncate(self.lazy_base_scopes.min(cur.len()));
         cur.extend(saved);

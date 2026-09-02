@@ -338,6 +338,11 @@ pub struct Typer {
     /// a `name$default$n` body with the other bodies, and so do we.
     pub(crate) defer_default_rhs: bool,
     pub(crate) pending_defaults: Vec<crate::lazysig::PendingDefault>,
+    /// Where each default's right-hand side was written. A default with no
+    /// `name$default$n` getter to call is spliced into the argument list as
+    /// the stored tree; this is the scope it has to be typed in, which is not
+    /// the one the call sits in. See `crate::lazysig::DefaultScope`.
+    pub(crate) default_scopes: HashMap<SymbolId, crate::lazysig::DefaultScope>,
     /// nsc's `openImplicits`: the (implicit symbol, target type) pairs whose
     /// own implicit parameters are being resolved right now. Used to cut off
     /// diverging expansions (`crate::implicits`).
@@ -555,6 +560,7 @@ impl Typer {
             lazy_body_done: HashSet::new(),
             lazy_base_scopes,
             defer_default_rhs: false,
+            default_scopes: HashMap::new(),
             pending_defaults: Vec::new(),
             open_implicits: std::cell::RefCell::new(Vec::new()),
             diverged_implicit: std::cell::RefCell::new(None),
@@ -2012,6 +2018,7 @@ impl Typer {
                     if let TreeKind::ValDef { mods, rhs, .. } = &p.kind {
                         if mods.flags.contains(Flags::DEFAULTPARAM) && !rhs.is_empty() {
                             self.st.get_mut(p.sym).default_rhs = Some((**rhs).clone());
+                            self.record_default_scope(p.sym, false);
                         }
                     }
                     ids.push(p.sym);
@@ -3595,6 +3602,7 @@ impl Typer {
                     if let TreeKind::ValDef { mods, rhs, .. } = &p.kind {
                         if mods.flags.contains(Flags::DEFAULTPARAM) && !rhs.is_empty() {
                             self.st.get_mut(p.sym).default_rhs = Some((**rhs).clone());
+                            self.record_default_scope(p.sym, true);
                         }
                     }
                     all_params.push(p.sym);
@@ -3866,18 +3874,59 @@ impl Typer {
         }
     }
 
-    /// Type a constructor default's stored body at the call site.
+    /// Type a default's stored body for a call that omitted the argument.
     ///
     /// A primary constructor's defaults have no `name$default$n` getters (see
     /// `namer_tmpl`: there is no receiver to call one on), so the tree the
-    /// namer stored is typed here, in the caller's scope. The class's own type
-    /// parameters are not bound in that scope, and
-    /// `class C[A](val l: List[A] = List.empty[A])` reported
+    /// namer stored is typed here rather than in a getter body.
+    ///
+    /// **Where** it is typed is the whole point. `record_default_scope` kept
+    /// the scope stack of the definition, and it is swapped back in here: a
+    /// default's right-hand side means what it meant where it was written, not
+    /// what its names happen to mean at the call site. Without that, slick's
+    /// `class DriverDataSource(…, classLoader: ClassLoader =
+    /// ClassLoaderUtil.defaultClassLoader)` -- written under
+    /// `import slick.util.ClassLoaderUtil` -- was `not found: value
+    /// ClassLoaderUtil` in every file that called it without that import.
+    /// The result is marked `NodeId::PRETYPED_DEFAULT` so the argument list it
+    /// is spliced into does not type it a second time in the wrong scope.
+    ///
+    /// A default whose scope was never recorded (a parameter read from a jar,
+    /// where the pickle's getter is the intended route) is typed in the
+    /// current scope, as before.
+    fn type_default_rhs_here(&mut self, param: SymbolId, rhs: &mut Tree, pty: &Type) {
+        let ctx = self.default_scopes.get(&param).map(|d| {
+            (
+                d.owner,
+                d.this_class,
+                d.file_index,
+                std::rc::Rc::clone(&d.scopes),
+            )
+        });
+        let Some((owner, this_class, file_index, scopes)) = ctx else {
+            self.type_default_rhs_in_scope(rhs, pty);
+            return;
+        };
+        let saved_scopes = self.swap_in_scopes(Some(&scopes), owner);
+        let saved_owner = std::mem::replace(&mut self.st.owner, owner);
+        let saved_this = std::mem::replace(&mut self.st.this_class, this_class);
+        let saved_file = std::mem::replace(&mut self.file_index, file_index);
+        self.type_default_rhs_in_scope(rhs, pty);
+        self.file_index = saved_file;
+        self.st.this_class = saved_this;
+        self.st.owner = saved_owner;
+        self.swap_back_scopes(saved_scopes);
+        rhs.id = NodeId::PRETYPED_DEFAULT;
+    }
+
+    /// The typing half of `type_default_rhs_here`, in whatever scope is
+    /// current. The class's own type parameters are not bound in that scope,
+    /// and `class C[A](val l: List[A] = List.empty[A])` reported
     /// `found: List[A] required: List[A]` -- an unresolved *name* against the
     /// class's `A`. Bind the names the parameter's type is written in, so the
-    /// body means what it meant where it was written; the two sides then agree,
-    /// and a type argument is erased by the time it reaches codegen.
-    fn type_default_rhs_here(&mut self, rhs: &mut Tree, pty: &Type) {
+    /// two sides agree; a type argument is erased by the time it reaches
+    /// codegen.
+    fn type_default_rhs_in_scope(&mut self, rhs: &mut Tree, pty: &Type) {
         let mut tps: Vec<SymbolId> = Vec::new();
         collect_tparams(pty, &mut tps);
         tps.retain(|&tp| self.st.lookup(&self.st.get(tp).name).is_empty());
@@ -3889,7 +3938,9 @@ impl Typer {
             }
         }
         self.type_expr(rhs, pty);
-        self.adapt(rhs, pty);
+        if !pty.is_no_type() {
+            self.adapt(rhs, pty);
+        }
         if !tps.is_empty() {
             self.st.pop_scope();
         }
@@ -5579,6 +5630,16 @@ impl Typer {
         // Taken, not read: everything typed below this point is no longer the
         // callee of the application that set it. See `typing_callee`.
         let callee = std::mem::take(&mut self.typing_callee);
+        if tree.id.is_pretyped_default() {
+            // A default argument's body, already typed in the scope it was
+            // written in (`type_default_rhs_here`). Typing it again here would
+            // resolve its names in the caller's scope -- which is the bug that
+            // typing it there fixes -- so only fit it to the expectation.
+            if !pt.is_no_type() && !tree.ty.is_no_type() && !tree.ty.is_error() {
+                self.adapt(tree, pt);
+            }
+            return;
+        }
         if matches!(&tree.kind, TreeKind::Ident { .. }) {
             let name = match &tree.kind {
                 TreeKind::Ident { name } => name.clone(),
@@ -6862,57 +6923,6 @@ impl Typer {
                 self.st.enter_in_current(name, id);
             }
         }
-        if self.st.lookup(name).is_empty() {
-            self.expose_from_unopened_packages(name, span, pkg);
-        }
-    }
-
-    /// Last resort: the packages *between* the file's clause and the root,
-    /// which SLS 9.2 does not open.
-    ///
-    /// This is not a scoping rule; it is a patch over a hole elsewhere, and
-    /// the hole is now pinned down: **a default argument's right-hand side is
-    /// typed at the call site, in the caller's scope.** When
-    /// `default_getter_apply` finds no `f$default$n` to call, both
-    /// `fill_defaults_and_implicits` (via `type_default_rhs_here`) and the
-    /// named-argument path splice the *untyped* stored tree into the
-    /// arguments, and it is then typed wherever the call happens to be.
-    /// slick's `slick/basic/DatabaseConfig.scala` writes
-    /// `import slick.ControlsConfig` and
-    /// `classLoader: ClassLoader = ClassLoaderUtil.defaultClassLoader`; every
-    /// caller under `package slick.jdbc` re-types those bodies without that
-    /// file's imports, and only the old, too-loose package walk was making
-    /// them resolve. (`not found: value ClassLoaderUtil` in
-    /// `slick/jdbc/DatabaseConfig.scala` is the same hole showing through
-    /// even on `main`.)
-    ///
-    /// Running the correct rule first and this only when nothing at all was
-    /// found keeps that cover while making `slick.cats` stop shadowing the
-    /// real `cats` for every file under `package slick.*`: precedence is what
-    /// the shadowing bug was about, and precedence is now nsc's.
-    ///
-    /// Delete this once a default argument is always either a call to its
-    /// getter or typed in the scope it was written in; the packages it
-    /// reaches are ones nsc reports as not found.
-    fn expose_from_unopened_packages(&mut self, name: &str, span: Span, from_pkg: SymbolId) {
-        let opened = self.open_packages(from_pkg);
-        let mut pkg = from_pkg;
-        loop {
-            let owner = self.st.get(pkg).owner;
-            if owner.is_none() || owner == pkg || pkg == self.st.root {
-                return;
-            }
-            pkg = owner;
-            if !opened.contains(&pkg) {
-                self.complete_binary_member(pkg, name, span);
-                for id in self.st.lookup_member(pkg, name) {
-                    self.st.enter_in_current(name, id);
-                }
-                if !self.st.lookup(name).is_empty() {
-                    return;
-                }
-            }
-        }
     }
 
     /// The lazily-read half of a wildcard import.
@@ -7990,7 +8000,19 @@ impl Typer {
             for t in tys.clone() {
                 self.warm_implicit_scope(&t);
             }
-            let Some(sol) = self.undet_solution(&tys, &undet) else {
+            let mut solution = self.undet_solution(&tys, &undet);
+            if solution.is_none() && self.warm_implicit_candidates() {
+                // A witness whose class came from a jar answers only once its
+                // pickled/JVM parents have been read: `implicit F: Async[F]`
+                // is a `GenTemporal[F, Throwable]` through three levels of
+                // `extends`, and that chain is what says `E = Throwable` for
+                // `timeoutTo[B, E](…)(implicit F: GenTemporal[F, E])`. Left
+                // unsolved, the parameter reached the search as
+                // `GenTemporal[F, _]` and nothing matched
+                // (`slick/basic/ConcurrencyControl.scala`).
+                solution = self.undet_solution(&tys, &undet);
+            }
+            let Some(sol) = solution else {
                 return;
             };
             let ids: Vec<SymbolId> = sol.iter().map(|(i, _)| *i).collect();
@@ -13125,6 +13147,30 @@ impl Typer {
             .cloned()
     }
 
+    /// A default spliced into a named-argument list is typed by the caller's
+    /// own argument loop, which runs in the caller's scope. Type it here
+    /// instead, where the scope the default was written in is still known, and
+    /// let `NodeId::PRETYPED_DEFAULT` keep that loop off it. Defaults with no
+    /// recorded scope (jar parameters) are left exactly as they were.
+    fn pretype_spliced_default(&mut self, param: SymbolId, mut rhs: Tree) -> Tree {
+        if !self.default_scopes.contains_key(&param) {
+            return rhs;
+        }
+        let pty = self.st.get(param).ty.clone();
+        // The expectation stays the call site's. A declared type that names a
+        // type parameter is not one here: slick's
+        // `case class Comprehension[+Fetch <: Option[Node]](…, fetch: Fetch =
+        // None, …)` would be checking `None` against the bare `Fetch`, which
+        // is a mismatch nsc never reports -- it is `Option[Node]` by the time
+        // the call has settled what `Fetch` is. Only the *scope* moves here;
+        // the fitting is left to the `adapt` in `type_expr`'s pretyped branch.
+        let mut tps = Vec::new();
+        collect_tparams(&pty, &mut tps);
+        let pt = if tps.is_empty() { pty } else { Type::NoType };
+        self.type_default_rhs_here(param, &mut rhs, &pt);
+        rhs
+    }
+
     /// Move each `name = value` into its parameter slot and fill the gaps left
     /// by omitted defaults. Shared by the method, constructor and `apply`
     /// paths; `defaults_inline` inlines a parameter's default expression
@@ -13153,7 +13199,7 @@ impl Typer {
             let default_rhs = self.st.get(pid).default_rhs.clone();
             if defaults_inline {
                 if let Some(rhs) = default_rhs {
-                    out.push(rhs);
+                    out.push(self.pretype_spliced_default(pid, rhs));
                     continue;
                 }
             } else if flags.contains(Flags::DEFAULTPARAM) {
@@ -13161,7 +13207,7 @@ impl Typer {
                 if let Some(filled) = self.default_getter_apply(fun, pid, idx, &out) {
                     out.push(filled);
                 } else if let Some(rhs) = default_rhs {
-                    out.push(rhs);
+                    out.push(self.pretype_spliced_default(pid, rhs));
                 }
                 continue;
             }
@@ -13380,7 +13426,7 @@ impl Typer {
                         args.push(filled);
                     } else if let Some(mut rhs) = self.st.get(*pid).default_rhs.clone() {
                         let pty = self.st.get(*pid).ty.clone();
-                        self.type_default_rhs_here(&mut rhs, &pty);
+                        self.type_default_rhs_here(*pid, &mut rhs, &pty);
                         args.push(rhs);
                     }
                 }
@@ -13498,7 +13544,17 @@ impl Typer {
         for t in rest_tys.clone() {
             self.warm_implicit_scope(&t);
         }
-        let Some(sol) = self.undet_solution(&rest_tys, &undet) else {
+        let mut solved = self.undet_solution(&rest_tys, &undet);
+        if solved.is_none() && self.warm_implicit_candidates() {
+            // The witness may be a jar class whose parents nothing had read:
+            // `implicit F: Async[F]` answers `GenTemporal[F, E]` only through
+            // `Async extends … GenTemporal[F, Throwable]`, and that is what
+            // says `E = Throwable`. Left unsolved, the parameter reached
+            // `fill_implicit_params` as `GenTemporal[F, _]` and no candidate
+            // could match it (slick's `slick/basic/ConcurrencyControl.scala`).
+            solved = self.undet_solution(&rest_tys, &undet);
+        }
+        let Some(sol) = solved else {
             return rest_tys;
         };
         let ids: Vec<SymbolId> = sol.iter().map(|(i, _)| *i).collect();
@@ -13768,7 +13824,11 @@ impl Typer {
                 .cloned()
                 .unwrap_or_else(|| self.st.get(*pid).ty.clone());
             self.warm_implicit_scope(&pty);
-            match self.search_implicit(&pty) {
+            let mut search = self.search_implicit(&pty);
+            if matches!(search, ImplicitSearch::None) && self.warm_implicit_candidates() {
+                search = self.search_implicit(&pty);
+            }
+            match search {
                 ImplicitSearch::Found(id) => {
                     let mut r = self.implicit_tree(id, &pty, span, 0);
                     self.adapt(&mut r, &pty);
@@ -13793,6 +13853,8 @@ impl Typer {
                     // expands `materializeTypeTag` (`crate::materialize`).
                     } else if let Some(tag) = self.materialize_tag(&pty, span) {
                         args.push(tag);
+                    } else if let Some(d) = self.implicit_param_default(*pid, &pty) {
+                        args.push(d);
                     } else {
                         self.error(span, self.missing_implicit_message(&pty, diverged));
                     }
@@ -13805,6 +13867,26 @@ impl Typer {
                 }
             }
         }
+    }
+
+    /// An implicit parameter that carries a default falls back to it when the
+    /// search comes up empty; nsc reports a missing implicit only for a
+    /// parameter that has nothing to fall back on.
+    ///
+    /// slick's `ScalaBaseType` is written around exactly that:
+    /// `def apply[T](implicit classTag: ClassTag[T],
+    ///               ordering: Ordering[T] = null): ScalaBaseType[T]`,
+    /// called as `ScalaBaseType[T]` for an abstract `T` and for `Null`. The
+    /// body is typed where it was written (`type_default_rhs_here`), so the
+    /// fallback is the declaration's expression, not something re-resolved in
+    /// the caller's scope.
+    fn implicit_param_default(&mut self, param: SymbolId, pty: &Type) -> Option<Tree> {
+        if !self.st.get(param).flags.contains(Flags::DEFAULTPARAM) {
+            return None;
+        }
+        let mut rhs = self.st.get(param).default_rhs.clone()?;
+        self.type_default_rhs_here(param, &mut rhs, pty);
+        Some(rhs)
     }
 
     /// nsc fills `ClassTag[String]` via `ClassTag.apply(classOf[String])` when
@@ -18828,6 +18910,84 @@ impl Typer {
     /// closure of cats-effect and takes minutes.
     pub(crate) fn warm_implicit_scope(&mut self, pt: &Type) {
         self.warm_implicit_scope_once(pt);
+    }
+
+    /// The same, for the *candidates* rather than the wanted type.
+    ///
+    /// A candidate fits a supertype of its own declared type, and for a class
+    /// that came from a jar those parents are only read when something warms
+    /// it. `class C[F[_]](implicit F: Async[F])` asking for `Sync[F]` -- or,
+    /// through `cats.effect.syntax`, `GenTemporal[F, E]` -- searched with
+    /// `Async`'s parent list still empty and found nothing; asking for
+    /// `Async[F]` first anywhere in the same file made the later searches
+    /// work, which is the shape of a missing completion, not of a scoping
+    /// rule. Reported by `slick/basic/ConcurrencyControl.scala`.
+    ///
+    /// Run only after a search has already come up empty: it reads a pickle
+    /// per candidate class, and `warmed_scopes` makes each one a one-off, but
+    /// the walk itself is not free. Answers whether anything was new, so the
+    /// caller only retries the search when a retry could say something else.
+    pub(crate) fn warm_implicit_candidates(&mut self) -> bool {
+        let tys: Vec<Type> = self
+            .implicits_in_scope()
+            .into_iter()
+            .map(|id| self.implicit_candidate_ty(id))
+            .collect();
+        let mut fresh = false;
+        for t in tys {
+            // Parents only. Warming a candidate's *implicit scope* the way
+            // `warm_implicit_scope` warms the wanted type's pulls pickled
+            // parents onto standard-library companions -- the hazard
+            // `warm_own_scope_once` documents -- and cost slick two new
+            // `containsSymbol(Set[A])` overload errors when it was tried.
+            fresh |= self.ensure_pickled_parents(&t);
+        }
+        fresh
+    }
+
+    /// Attach the pickled parents of every class `ty` names, and of the
+    /// parents that appear as that goes on.
+    ///
+    /// `PickleSupply::attach_parents` runs one level at a time and only for a
+    /// class something has completed a member of. A candidate the program
+    /// merely *named* -- `(implicit F: Async[F])` -- has an empty parent list
+    /// until then, so it fits nothing but its own type. Answers whether any
+    /// class gained parents.
+    fn ensure_pickled_parents(&mut self, ty: &Type) -> bool {
+        if !self.library_abi {
+            return false;
+        }
+        let mut work: Vec<SymbolId> = self.implicit_scope_classes(ty);
+        let mut seen: std::collections::HashSet<u32> = work.iter().map(|c| c.0).collect();
+        let mut fresh = false;
+        while let Some(c) = work.pop() {
+            if c.is_none() {
+                continue;
+            }
+            // Never the standard library. Its hierarchy is the prelude's,
+            // hand-written and reasoned about, and topping it up from the
+            // class files rewrote `mutable.HashSet`'s parents well enough to
+            // turn `HashSet[A]`'s `+`/`contains` into `Set`'s -- two new
+            // errors in slick for a hierarchy nobody had asked to change.
+            // What this is for is a *jar* class the program only named.
+            let jvm = self.st.get(c).jvm_name.clone();
+            if c.0 < self.st.prelude_end || jvm.starts_with("scala/") || jvm.starts_with("java/") {
+                continue;
+            }
+            let before = self.st.get(c).parents.len();
+            self.ensure_java_loaded(c, Span::DUMMY);
+            self.pickle
+                .ensure_parents(&mut self.st, &mut self.binary, c);
+            fresh |= self.st.get(c).parents.len() != before;
+            for p in self.st.get(c).parents.clone() {
+                if let Some(ps) = self.st.class_sym_of(&p) {
+                    if seen.insert(ps.0) {
+                        work.push(ps);
+                    }
+                }
+            }
+        }
+        fresh
     }
 
     /// [`Self::warm_implicit_scope`], reporting whether any class in `pt`'s

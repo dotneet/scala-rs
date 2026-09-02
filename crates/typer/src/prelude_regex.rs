@@ -4,6 +4,22 @@
 //! Scala matches with a regular expression, and the prelude's `Regex` had
 //! `findFirstIn` and `matches` but no `unapplySeq`, so every such pattern was
 //! reported as an unknown extractor.
+//!
+//! `unapplySeq` is all this installs. `findAllIn`, `findFirstMatchIn`,
+//! `replaceAllIn`, `replaceFirstIn` and `split` were declared here too, as a
+//! fallback -- and the fallback was what every call actually got, because
+//! `lookup_member` only sees a jar member that something has already asked
+//! for, so the guard `is_empty()` was always true at install time. Two things
+//! followed: `findAllIn` / `findFirstMatchIn` answered `Any`
+//! (`value map is not a member of Any` on slick's
+//! `MysqlCustomProperties.findFirstMatchIn(url).map(…)`), and the ones that
+//! did have a usable result type took `String` where the library takes
+//! `CharSequence`, so the call compiled to a descriptor that does not link
+//! (`NoSuchMethodError: Regex.replaceAllIn(String, String)`). The pickle
+//! supplies every one of them with the real signature on demand, so the
+//! honest thing is to declare none of them; a name the pickle cannot supply
+//! is then reported as not a member of `Regex` rather than silently given a
+//! wrong type.
 
 use crate::prelude::prelude_method;
 use crate::symbol::{Intrinsic, SymbolTable};
@@ -45,27 +61,4 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
         },
         Intrinsic::None,
     );
-    for (name, params, ret) in [
-        ("findAllIn", vec![Type::String], Type::Any),
-        ("findFirstMatchIn", vec![Type::String], Type::Any),
-        (
-            "replaceAllIn",
-            vec![Type::String, Type::String],
-            Type::String,
-        ),
-        (
-            "replaceFirstIn",
-            vec![Type::String, Type::String],
-            Type::String,
-        ),
-        (
-            "split",
-            vec![Type::String],
-            Type::Array(Box::new(Type::String)),
-        ),
-    ] {
-        if st.lookup_member(regex, name).is_empty() {
-            prelude_method(st, regex, name, params, ret, Intrinsic::None);
-        }
-    }
 }
