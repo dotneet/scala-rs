@@ -1217,6 +1217,20 @@ impl SymbolTable {
                         };
                         t = walk(st, &p, t, seen);
                     }
+                    // A self type is a second place `this` inherits members
+                    // from, and they are declared in *its* vocabulary:
+                    // `trait P[A] { self: Q[A] => def p: A = q }` reads `q`
+                    // out of `Q`, whose own `A` has to become `P`'s. Without
+                    // this the two `A`s printed the same and compared
+                    // unequal -- "type mismatch; found: A required: A".
+                    if let Some(sf) = st.get(*sym).self_type.clone() {
+                        let sf = if args.is_empty() {
+                            sf
+                        } else {
+                            st.subst_tparams(*sym, args, &sf)
+                        };
+                        t = walk(st, &sf, t, seen);
+                    }
                     t
                 }
                 Type::ModuleRef(sym) => {

@@ -3126,10 +3126,10 @@ impl Typer {
         if is_trait {
             return;
         }
-        let this_ty = Type::Class {
-            sym: class_id,
-            args: vec![],
-        };
+        // `class C[F[_]] extends P[F]` conforms to `P`'s self type as `C[F]`,
+        // not as a bare `C`: dropping the arguments made every parameterized
+        // cake class "not conform".
+        let this_ty = self.st.self_type_of_class(class_id);
         let mut work = vec![class_id];
         let mut seen = std::collections::HashSet::new();
         while let Some(id) = work.pop() {
@@ -3137,6 +3137,16 @@ impl Typer {
                 continue;
             }
             if let Some(st) = self.st.get(id).self_type.clone() {
+                // The self type was written in the *declaring* trait's
+                // vocabulary. Two things separate it from what it means here:
+                // the parent's type parameters (`this: Database[F] =>` on
+                // `BasicDatabaseDef[F]`), and the abstract type members its
+                // enclosing cake left open (`type Database[F[_]]` on
+                // `BasicBackend`, aliased to `JdbcDatabaseDef[F]` by
+                // `JdbcBackend`). Reading it raw compares `JdbcDatabaseDef`
+                // against `BasicBackend.Database[F]`, which nothing satisfies.
+                let st = self.st.subst_as_seen_from(&this_ty, &st);
+                let st = self.st.expand_type_members(class_id, &st);
                 if !self.st.is_sub_type(&this_ty, &st) {
                     self.error(
                         span,
@@ -3211,6 +3221,27 @@ impl Typer {
         }
     }
 
+    /// Declared variances of `sym`'s own type parameters (`+` → 1, `-` → -1).
+    /// Works for classes, abstract type members and higher-kinded type
+    /// parameters alike; they all hang their parameters off `tparams`.
+    fn tparam_variances(&self, sym: SymbolId) -> Vec<i8> {
+        self.st
+            .get(sym)
+            .tparams
+            .iter()
+            .map(|tp| {
+                let f = self.st.get(*tp).flags;
+                if f.contains(Flags::COVARIANT) {
+                    1
+                } else if f.contains(Flags::CONTRAVARIANT) {
+                    -1
+                } else {
+                    0
+                }
+            })
+            .collect()
+    }
+
     fn check_variance_ty(
         &mut self,
         vars: &[(SymbolId, i8, String)],
@@ -3258,28 +3289,33 @@ impl Typer {
                 }
             }
             Type::Class { sym, args } => {
-                let tps = self.st.get(*sym).tparams.clone();
+                let vs = self.tparam_variances(*sym);
                 for (i, a) in args.iter().enumerate() {
-                    let vp = tps
-                        .get(i)
-                        .map(|tp| {
-                            let f = self.st.get(*tp).flags;
-                            if f.contains(Flags::COVARIANT) {
-                                1
-                            } else if f.contains(Flags::CONTRAVARIANT) {
-                                -1
-                            } else {
-                                0
-                            }
-                        })
-                        .unwrap_or(0);
+                    let vp = vs.get(i).copied().unwrap_or(0);
                     self.check_variance_ty(vars, a, pos * vp, span, where_);
                 }
             }
             Type::Applied { ctor, args } => {
                 self.check_variance_ty(vars, ctor, pos, span, where_);
-                for a in args {
-                    self.check_variance_ty(vars, a, 0, span, where_);
+                // nsc reads the variances off `sym.typeParams` of whatever the
+                // application heads on, not off classes alone. An abstract type
+                // member (`type M[+X] <: ...`) and a higher-kinded type
+                // parameter (`F[+X]`) both carry declared variances, and both
+                // must be honoured -- treating their arguments as invariant
+                // rejects `def head: ResultAction[T, NoStream, E]`, which nsc
+                // accepts.
+                let vs = match ctor.as_ref() {
+                    Type::TypeMember(id) | Type::TypeParam(id) => self.tparam_variances(*id),
+                    Type::Class { sym, args: pre } => {
+                        let mut vs = self.tparam_variances(*sym);
+                        vs.drain(0..pre.len().min(vs.len()));
+                        vs
+                    }
+                    _ => Vec::new(),
+                };
+                for (i, a) in args.iter().enumerate() {
+                    let vp = vs.get(i).copied().unwrap_or(0);
+                    self.check_variance_ty(vars, a, pos * vp, span, where_);
                 }
             }
             Type::Function { params, ret } => {

@@ -10699,6 +10699,117 @@ case a: SynchronousDatabaseAction[?, ?, ?, ?] => … superZip(a) …
 `no matching overload for (Iterable[U], RowsPerStatement)…` は 1 のカスケード
 だと思って調べましたが、名前付き引数の修正後も残っています（別の根）。
 
+### 拒否する側の規則が出していた偽陽性 11 件（`agent/reject`）
+
+`tests/slick_measure.sh` は **`errors=65 → 54`、`files_with_errors=34 → 29`**。
+消えた 11 件はちょうど担当分（分散検査 7 件、self-type 適合 4 件）で、
+**新規エラーは 0**（`grep '^error' ` の集合差が 11 行の削除だけ）。
+codegen（`crates/backend/`）は触っていないので `tests/slick_subset.sh` は省略。
+
+分散検査（SLS 4.5）と self-type 適合検査は、どちらも「拒否する側」の規則です。
+slick は実 scalac 2.13.16 で完全に通るので 11 件は全部偽陽性でした。
+ただし**症状の数え方はブリーフと違い**、`covariant` は 2 件ではなく 4 件
+（`BasicProfile.scala` の `head` / `headOption` で 2 件、`SqlProfile.scala` の
+`overrideStatements` で `R` と `S` の 2 件）、`contravariant` 3 件と合わせて
+**分散は 7 件**、self-type は 4 件（`JdbcBackend.scala` に 2 件：名前付きクラスと
+`new JdbcDatabaseDef[F](…){}` の匿名クラス）で、合計 11 件です。
+
+そして根は**症状の数だけありませんでした**。分散 7 件は 1 根、self-type 4 件も
+1 根で、都合 2 根です。「同じ症状が 1 根とは限らない」の逆側もあります。
+
+**1. 型引数がどの位置に立つかを、クラスからしか読んでいなかった**（分散 7 件）。
+
+`check_variance_ty` は `Type::Class { sym, args }` のときだけ `sym` の型引数の
+分散（`+` / `-`）を見て位置を反転させ、`Type::Applied { ctor, args }`
+——つまり**クラスでない型構築子の適用**——では引数を一律に**不変位置**として
+扱っていました。nsc は頭が何であれ `sym.typeParams` を読みます。頭が
+**抽象型メンバ**でも**高階の型パラメータ**でも、宣言された分散はクラスと同じに
+効きます。slick の
+
+```scala
+trait BasicAction[+R, +S <: NoStream, -E <: Effect] extends DatabaseAction[R, S, E] {
+  type ResultAction[+R, +S <: NoStream, -E <: Effect] <: BasicAction[R, S, E]
+}
+trait BasicStreamingAction[+R, +T, -E <: Effect] extends BasicAction[R, Streaming[T], E] {
+  def head: ResultAction[T, NoStream, E]
+}
+```
+
+の `ResultAction[T, NoStream, E]` は、第 1 引数が `+` なので共変 `T` は共変位置、
+第 3 引数が `-` なので反変 `E` は反変位置で、どちらも合法です。不変扱いすると
+`head` 1 本から `covariant type T …` と `contravariant type E …` の 2 件が出て、
+`headOption` と `SqlAction.overrideStatements` を合わせて 7 件になります。
+`Type::TypeMember` / `Type::TypeParam` / 部分適用された `Type::Class` の
+`tparams` から分散を読む `tparam_variances` を足し、`Applied` の枝で使うように
+しました（`crates/typer/src/check.rs`）。
+
+**緩めすぎていないこと**は拒否側で確かめてあります。注釈の無い `type M[X]` は
+不変のまま（`covariant type A occurs in invariant position`）、`type N[-X]` は
+位置を**反転**させる（`… occurs in contravariant position`）、高階の型パラメータ
+`F[X]` / `G[-Y]` も同じ、の 4 形は実 scalac と同じ 4 件で落ちます
+（`tests/fixtures/rej_bad.scala`）。
+
+**2. self-type を、型引数を捨てた素のクラスと、宣言元の語彙のまま比べていた**
+（self-type 4 件）。
+
+`check_self_conformance` は検査対象を `Type::Class { sym, args: vec![] }`
+——**型引数を落とした**形——で作り、親の `self_type` を**そのまま**相手にして
+いました。self type は宣言したトレイトの語彙で書かれているので、ここで読むには
+2 つの読み替えが要ります。
+
+- 親の型パラメータ。`this: Database[F] =>` の `F` は `BasicDatabaseDef` の `F`
+  であって、`JdbcDatabaseDef` の `F` ではありません。
+- 囲っているケーキが後から別名にした**抽象型メンバ**。`Database` は
+  `BasicBackend` の `type Database[F[_]] >: Null <: BasicDatabaseDef[F]` で、
+  `JdbcBackend` の中では `type Database[F[_]] = JdbcDatabaseDef[F]` です。
+
+```scala
+trait BasicBackend {
+  type Database[F[_]] >: Null <: BasicDatabaseDef[F]
+  trait BasicDatabaseDef[F[_]] extends AnyDatabaseDef { this: Database[F] => … }
+}
+trait JdbcBackend extends RelationalBackend {
+  type Database[F[_]] = JdbcDatabaseDef[F]
+  abstract class JdbcDatabaseDef[F[_]](…) extends BasicDatabaseDef[F] { … }
+}
+```
+
+読み替えないと、比べているのは「素の `JdbcDatabaseDef`」と
+「`BasicBackend.Database[F]`」で、**これに適合できるものは存在しません**。だから
+`JdbcBackend` / `HeapBackend` / `DistributedBackend` の 3 クラスと
+`new JdbcDatabaseDef[F](…){}` の匿名クラスが揃って落ちていました。
+`self_type_of_class` で型引数を入れ、`subst_as_seen_from` で親の型パラメータを、
+`expand_type_members` で囲っているクラスの別名を解決します。
+`expand_type_members` は `enclosing_classes` を内側から辿るので、匿名クラスも
+`object JdbcBackend` 経由で同じ別名に届きます。
+
+こちらも拒否側は生きています。ケーキの別名が `Real[F]` のとき
+`class Fake[F[_]] extends DbDef[F]` は落ちますし（実 scalac も同じ）、
+`trait P[A] { self: Q[A] => }` に対する `class Miss[A] extends P[A]` も落ちます。
+修正前の main はここで `Real[F]` **自身**まで落としていた（7 件）ので、
+拒否側のテストは「落ちること」だけでなく**件数**も見ています。
+
+**3. ついでに見つかった 3 つ目**：`subst_as_seen_from` はクラスの**親**は辿るのに
+**self type** を辿っていませんでした。self type は `this` がメンバを継ぐ
+もう 1 つの経路なので、そこから来たメンバの型は self type の語彙のままでした。
+
+```scala
+trait Q[A] { def q: A }
+trait P[A] { self: Q[A] => def p: A = q }   // type mismatch; found: A  required: A
+```
+
+`Q` の `A` と `P` の `A` は表示が同じで別物です。`walk` のクラス枝で、親を辿った
+あとに（クラスの型引数で具体化した）self type も辿るようにしました
+（`crates/typer/src/symbol.rs`）。slick の 54 件は 1 件も動きませんが、
+`rej_ok.scala` の 5 番目のケースがこれです。
+
+fixture は `tests/fixtures/rej_ok.scala`（受理側 5 ケース・dual-run、期待出力
+`expected/rej_ok.txt`）と `tests/fixtures/rej_bad.scala`（拒否側 6 ケース）の
+2 本で、テストは `crates/cli/tests/reject.rs`。`rej_bad.scala` は実 scalac に
+1 回で全部は出させられません——`illegal inheritance` は typer、分散検査は
+refchecks で、nsc は typer でエラーが出ると refchecks に進まないからです。
+分散 4 件は同じ 4 トレイトだけのファイルで別に確認しました。
+
 ## ライセンス
 
 Apache-2.0
