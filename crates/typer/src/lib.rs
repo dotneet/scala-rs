@@ -22,6 +22,7 @@ mod prelude_bsops;
 mod prelude_buildfrom;
 mod prelude_coll;
 mod prelude_conform;
+mod prelude_dbio;
 mod prelude_durrange;
 mod prelude_either;
 mod prelude_empty;

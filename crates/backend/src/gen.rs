@@ -1822,6 +1822,18 @@ fn load_self_alias_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId)
     }
 }
 
+/// A `private[this]` member denotes *that* instance, exactly like a self
+/// alias: a class nested inside the owner may also be a *subclass* of it, and
+/// then `this` conforms to the owner while being the wrong object. slick's
+/// `SynchronousDatabaseAction` reaches `private[this] def superZip` from an
+/// anonymous `SynchronousDatabaseAction.Fused`, and calling it on `this` ran
+/// the fused action's own state instead of the enclosing one's. So the
+/// receiver has to be walked out by identity (`load_self_alias_instance`).
+fn is_private_this(st: &SymbolTable, id: SymbolId) -> bool {
+    let f = st.get(id).flags;
+    f.contains(Flags::PRIVATE) && f.contains(Flags::LOCAL)
+}
+
 /// `outer_chain_reaches` by identity: the `$outer` chain actually arrives at
 /// `owner` itself, not merely at something that conforms to it.
 fn outer_chain_reaches_exactly(st: &SymbolTable, from: SymbolId, owner: SymbolId) -> bool {
@@ -7220,6 +7232,8 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
                 && module_class_id(ctx.st, owner) != module_class_id(ctx.st, ctx.class_sym)
             {
                 load_module_instance(asm, ctx, module_class_id(ctx.st, owner));
+            } else if is_private_this(ctx.st, id) {
+                load_self_alias_instance(asm, ctx, owner);
             } else {
                 load_owner_instance(asm, ctx, owner);
             }
@@ -7275,6 +7289,8 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
                 // static forwarder on `<pkg>/package`, which takes no
                 // receiver. Falling through to `load_owner_instance` pushed
                 // `this` and produced a `VerifyError` at run time.
+            } else if is_private_this(ctx.st, id) {
+                load_self_alias_instance(asm, ctx, owner);
             } else {
                 load_owner_instance(asm, ctx, owner);
             }
@@ -10514,10 +10530,16 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "getOrElse",
                         "(Lscala/Function0;)Ljava/lang/Object;",
                     );
+                    // `getOrElse[B1 >: B]` erases its result to `Object`, so
+                    // anything the typer knows about it -- since
+                    // `prelude_dbio` gave the method its real signature, that
+                    // is now a class, not `Any` -- needs the narrowing the
+                    // JVM verifier demands. `lazy_cell_from_object` is the
+                    // existing "bring an `Object` back to `ret`" helper; it
+                    // unboxes a primitive and no-ops when `ret` erases to
+                    // `Object` anyway.
                     if let Some(ty) = result_ty {
-                        if is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            emit_unbox(asm, ty);
-                        }
+                        lazy_cell_from_object(asm, ctx, ty);
                     }
                     return;
                 }
@@ -10549,10 +10571,10 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
                         "getOrElse",
                         "(Lscala/Function0;)Ljava/lang/Object;",
                     );
+                    // See the `Either.getOrElse` case above: `[U >: T]` erases
+                    // to `Object`, and the verifier wants the narrowing.
                     if let Some(ty) = result_ty {
-                        if is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            emit_unbox(asm, ty);
-                        }
+                        lazy_cell_from_object(asm, ctx, ty);
                     }
                     return;
                 }

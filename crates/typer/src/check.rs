@@ -4647,6 +4647,34 @@ impl Typer {
         if !class_id.is_none() {
             fun.sym = class_id;
         }
+        // `extends Base(_name = "…", statements = …)` (slick's
+        // `MultiInsertAction`). A parent constructor takes named arguments
+        // like any other, and for the same reason as `new C(b = 2, a = 1)`
+        // they have to be placed *before* the constructor overload is picked,
+        // since the pick is driven by the argument types. Without this the
+        // `name = value` pairs were typed as assignments to variables that do
+        // not exist -- `not found: value _name`, `not found: value statements`
+        // -- and the two `Unit`s they left behind produced a third error, `no
+        // matching overload for constructor Base with arguments (Unit, Unit)`.
+        if Self::has_named_arg(args) {
+            let cid = (!class_id.is_none()).then_some(class_id);
+            let mut placed = args.clone();
+            if self.reorder_named_ctor_args(&mut placed, cid, fun) {
+                *args = placed;
+            } else {
+                // Leave the `name = value` arguments in the tree. Every parent
+                // constructor is typed twice, and the signature pass throws its
+                // diagnostics away (`type_parent_ctor_app`); consuming the
+                // named arguments there would hand the body pass -- the pass
+                // whose diagnostics are kept -- a positional argument list with
+                // nothing left to report but a misleading `no matching
+                // overload`. Typing them here would only add the
+                // `not found: value <name>` cascade this whole branch exists
+                // to remove.
+                tree.ty = Type::Error;
+                return;
+            }
+        }
         for a in args.iter_mut() {
             // An argument this pass synthesized on an earlier walk of the same
             // parent (a filled implicit or default) is already bound to its
@@ -7505,9 +7533,41 @@ impl Typer {
                     self.st.get(owner).kind,
                     SymKind::Class | SymKind::ModuleClass | SymKind::Module
                 );
+                // A `private[this]` member is not inherited (SLS 5.2), so the
+                // only prefix an unqualified reference to one can have is its
+                // *own* class's `this` -- never the class we happen to be
+                // inside. slick's `SynchronousDatabaseAction` writes
+                //
+                //   private[this] def superZip[R2, E2](a: …) = super.zip(a)
+                //   override def zip[R2, E2](a: …) = … new Fused[(R, R2), …] {
+                //     override def nonFusedEquivalentAction = superZip(a)
+                //   }
+                //
+                // and the anonymous class is another `SynchronousDatabaseAction`,
+                // at `R = (R, R2)`. Reading `superZip` through it turned
+                // `DBIOAction[(R, R2), …]` into `DBIOAction[((R, R2), R2), …]`
+                // (and `superAsTry` into `Try[Try[R]]`). `enter_inherited_members`
+                // already keeps such a member out of the subclass scope, so the
+                // name resolved to the enclosing class's own -- only the
+                // prefix was wrong. With a *public* `superZip` nsc reports the
+                // very mismatch we did, so this is exactly the `private[this]`
+                // case and nothing wider.
+                let f = self.st.get(s).flags;
+                let private_this = f.contains(Flags::PRIVATE) && f.contains(Flags::LOCAL);
+                // Reaching it from a *different* class means the JVM sees a
+                // cross-class call to an `ACC_PRIVATE` member, which is an
+                // `IllegalAccessError` however well it type-checks. Same
+                // widening `note_companion_access` performs for a companion
+                // read (which deliberately skips `LOCAL`, because until now
+                // nothing else could reach one).
+                if private_this && owner != self.st.this_class && !owner.is_none() && owner_is_class
+                {
+                    self.st.get_mut(s).access_widened = true;
+                }
                 if owner != self.st.this_class
                     && !owner.is_none()
                     && !is_self_alias
+                    && !private_this
                     && owner_is_class
                 {
                     let this_ty = Type::Class {
@@ -13178,10 +13238,26 @@ impl Typer {
         } else {
             self.st.subst_tparams(owner, &owner_args, &lo)
         };
+        // A bound that still mentions the *owner's* parameters was not read
+        // through the receiver at all (`owner_args` was empty), and one that
+        // mentions the method's own is a variable this very call is solving:
+        // neither is usable as a lower bound. A parameter of an enclosing
+        // method or class is a different matter -- it is a fixed type here,
+        // and dropping the bound because of it is what made
+        //
+        //   def use[T](e: Either[Int, It[T]]) =
+        //     e.getOrElse(throw new NoSuchElementException).xs
+        //
+        // (slick's `JdbcActionComponent.openStream`) solve `B1` to the
+        // argument's `Nothing` and report `value xs is not a member of
+        // Nothing`, while the same code with `It[String]` compiled.
+        let owner_tps = self.st.get(owner).tparams.clone();
+        let method_tps = self.st.get(method).tparams.clone();
         if lo.is_no_type()
             || lo.is_error()
             || matches!(lo, Type::Nothing)
-            || mentions_any_tparam(&lo)
+            || mentions_tparam(&lo, &owner_tps)
+            || mentions_tparam(&lo, &method_tps)
         {
             return None;
         }
@@ -16957,6 +17033,7 @@ impl Typer {
                 let saved = std::mem::replace(&mut self.pattern_tpt, true);
                 let ty = self.tree_to_type(tpt);
                 self.pattern_tpt = saved;
+                let ty = self.pattern_targs_from_scrutinee(&ty, sel_ty);
                 self.type_pattern(expr, &ty);
                 pat.ty = ty;
             }
@@ -16969,6 +17046,88 @@ impl Typer {
             _ => {
                 pat.ty = sel_ty.clone();
             }
+        }
+    }
+
+    /// nsc's `inferTypedPattern`: `case a: T[?, …]` keeps whatever the
+    /// scrutinee already said about `T`'s parameters -- the pattern only has
+    /// to *narrow* the type, and a wildcard written in it stands for "not
+    /// stated here", not "forgotten".
+    ///
+    /// slick's `SynchronousDatabaseAction`:
+    ///
+    /// ```scala
+    /// override def zip[R2, E2 <: Effect](a: DBIOAction[R2, NoStream, E2]) = a match {
+    ///   case a: SynchronousDatabaseAction[?, ?, ?, ?] => … superZip(a) …
+    /// ```
+    ///
+    /// `superZip` takes a `DBIOAction[R2, NoStream, E2]`, and a bare
+    /// `SynchronousDatabaseAction[_, _, _, _]` is not one -- the scrutinee's
+    /// `R2` / `NoStream` / `E2` were dropped by the pattern. Solving the
+    /// pattern class's parameters from its own base type at the scrutinee's
+    /// class puts them back, and leaves the result a plain class type, so
+    /// erasure and codegen see exactly what they saw before.
+    ///
+    /// Only wildcards are filled in: an argument the source wrote stays as
+    /// written, and a parameter the scrutinee does not pin (slick's `C`, which
+    /// `DBIOAction` does not take) stays a wildcard.
+    fn pattern_targs_from_scrutinee(&self, pat_ty: &Type, sel_ty: &Type) -> Type {
+        let Type::Class { sym, args } = pat_ty else {
+            return pat_ty.clone();
+        };
+        if args.is_empty() || !args.iter().any(|a| matches!(a, Type::Wildcard)) {
+            return pat_ty.clone();
+        }
+        let tps = self.st.get(*sym).tparams.clone();
+        if tps.len() != args.len() {
+            return pat_ty.clone();
+        }
+        let Some(sel_sym) = self.st.class_sym_of(sel_ty) else {
+            return pat_ty.clone();
+        };
+        if sel_sym == *sym {
+            return pat_ty.clone();
+        }
+        let Some(Type::Class { args: sel_args, .. }) = self.base_type_instance(sel_ty, sel_sym, 0)
+        else {
+            return pat_ty.clone();
+        };
+        // The pattern class's own base type at the scrutinee's class, written
+        // in the pattern class's parameters: `SynchronousDatabaseAction[R, S,
+        // C, E]` seen as `DBIOAction` is `DBIOAction[R, S, E]`.
+        let probe = Type::Class {
+            sym: *sym,
+            args: tps.iter().map(|&t| Type::TypeParam(t)).collect(),
+        };
+        let Some(Type::Class {
+            args: base_args, ..
+        }) = self.base_type_instance(&probe, sel_sym, 0)
+        else {
+            return pat_ty.clone();
+        };
+        if base_args.len() != sel_args.len() {
+            return pat_ty.clone();
+        }
+        let mut out = args.clone();
+        for (i, tp) in tps.iter().enumerate() {
+            if !matches!(out[i], Type::Wildcard) {
+                continue;
+            }
+            let Some(solved) = self.unify_tparam_all(*tp, &base_args, &sel_args) else {
+                continue;
+            };
+            if solved.is_no_type()
+                || solved.is_error()
+                || matches!(solved, Type::Wildcard | Type::Nothing)
+                || mentions_tparam(&solved, &tps)
+            {
+                continue;
+            }
+            out[i] = solved;
+        }
+        Type::Class {
+            sym: *sym,
+            args: out,
         }
     }
 

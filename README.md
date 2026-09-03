@@ -1018,6 +1018,26 @@ class ConstColumn[T : TT] extends TypedRep[T]   // TypedRep.<init>(TT) を呼ぶ
 解決をやり直すと、implicit が見つからなかった 1 件の診断が
 `no matching overload for constructor` に化けて増えてしまいます。
 
+親コンストラクタは**名前付き引数**も取ります（`agent/dbio`）。
+
+```scala
+class MultiInsertAction(…)
+  extends SimpleJdbcProfileAction[MultiInsertResult](
+    _name = "MultiInsertAction",
+    statements = rowsPerStatement match { … }
+  )
+```
+
+`new C(b = 2, a = 1)` と同じく、**オーバーロードを選ぶ前に**パラメータ順へ並べ替えます
+（`reorder_named_ctor_args`）。並べ替えなしだと `name = value` が「存在しない変数への代入」
+として型付けされ、slick のこの 1 か所から `not found: value _name`、
+`not found: value statements`、そして残った 2 個の `Unit` による
+`no matching overload for constructor SimpleJdbcProfileAction with arguments (Unit, Unit)`
+の 3 件が出ていました。並べ替えに失敗したとき（`unknown parameter name: …`）は木を
+**書き換えずに**返します。親位置はシグネチャパスでも歩かれ、そちらの診断は捨てられるので、
+そこで名前付き引数を消費してしまうと本体パスには位置引数しか残らず、
+`no matching overload` という別の（誤解を招く）診断しか出せなくなるためです。
+
 implicit 探索のスコープも nsc に合わせます。親コンストラクタの引数はコンストラクタ自身の
 コンテキストで型付けされ、そこに `this` はまだ無いので、**自分のクラスと継承したメンバーは
 候補になりません**（`crates/typer/src/implicits.rs` の `implicits_in_scope` を
@@ -10514,6 +10534,170 @@ not assignable to '[I'` を出したので足しました。
   `IllegalAccessError`。nsc は `O$$secret` に改名して public にします。
   今回の作業中に見つけた**既存の**codegen バグで、このスライスとは独立です。
 * `@tailrec` は検査だけで、末尾呼び出しの**変換はしていません**（従来どおり）。
+### slick の `JdbcActionComponent` / `DBIOAction` 13 件の 5 つの根（`agent/dbio`）
+
+`tests/slick_measure.sh` は **`errors=99 → 90`、`files_with_errors=39 → 39`**
+（消えた 9 件は全部この 2 ファイル、新規エラーは 0）。担当した 2 ファイルは
+**13 件 → 4 件**（`JdbcActionComponent.scala` 7 → 1、`DBIOAction.scala` 6 → 3）。
+codegen を触ったので `tests/slick_subset.sh` も回して
+`subset_files=38 classes=204 verified=204 failed=0`。
+5 つの根はどれも**症状より上流**にあり、1 つの根が 3 件ずつ出していました。
+
+**1. 親コンストラクタの名前付き引数**（3 件）。§「親コンストラクタの implicit /
+デフォルト引数」に書いたとおり。`extends SimpleJdbcProfileAction[R](_name = …,
+statements = …)` の 1 か所から `not found: value _name` /
+`not found: value statements` / `no matching overload for constructor …
+with arguments (Unit, Unit)` の 3 件が出ていました。
+
+**2. `private[this]` メンバは継承されない**（1 件を単独で、2 件を 5 と合わせて）。
+SLS 5.2 のとおり、
+`private[this]` は**そのインスタンス**のものなので、無修飾参照の prefix は
+「自分のクラスの `this`」以外にありません。slick は
+
+```scala
+trait SynchronousDatabaseAction[+R, +S, C, -E] extends DatabaseAction[R, S, E] { self =>
+  private[this] def superZip[R2, E2 <: Effect](a: DBIOAction[R2, NoStream, E2]) = super.zip(a)
+  override def zip[R2, E2 <: Effect](a: DBIOAction[R2, NoStream, E2]) = a match {
+    case a: SynchronousDatabaseAction[?, ?, ?, ?] => new SynchronousDatabaseAction.Fused[(R, R2), NoStream, C, E with E2] {
+      override def nonFusedEquivalentAction: DBIOAction[(R, R2), NoStream, E with E2] = superZip(a)
+    }
+```
+
+と書きます。匿名クラスは**また別の型引数の** `SynchronousDatabaseAction`
+（`R = (R, R2)`）なので、`superZip` を「このクラスを通して」読むと
+`DBIOAction[((R, R2), R2), NoStream, E with E2 with E2]` になっていました
+（`superAsTry` は `Try[Try[R]]`）。`enter_inherited_members` は
+`private[this]` を子のスコープに**入れていない**ので、名前解決は最初から
+外側のものに当たっており、間違っていたのは `bind_found` の
+`subst_as_seen_from` だけです。`superZip` を `private` でなく public に書くと
+**実 scalac もこちらと同じ mismatch を出す**ので、これは `private[this]` に
+固有の形です（`tests/fixtures/db.scala`）。
+
+これは codegen 側にも 2 つ帰結があります。
+
+- 呼び出しレシーバも**同一性で**外へ歩かないといけません（`gen_ident` の
+  `is_private_this` → `load_self_alias_instance`）。`this` は owner に適合して
+  しまうので `load_owner_instance` はその場で止まり、匿名クラス自身の
+  `r` を読んでいました（自己型別名の `agent/tail3` と同じ罠）。
+- 別クラスから届く以上、JVM から見れば `ACC_PRIVATE` への他クラス呼び出しなので
+  `IllegalAccessError` になります。コンパニオン越しの読み出しと同じ
+  `access_widened` を立てます。
+
+**3. `Either.getOrElse` / `Try.getOrElse` が `(=> Any): Any` だった**（4 と
+合わせて 3 件）。
+prelude の `add_either` / `add_try` の署名は widening ではなく**結果の消去**
+でした。slick の
+
+```scala
+val prit = inv.results(0, …)(ctx.session).getOrElse(throw new NoSuchElementException)
+val rows = prit.map(value => new Mutator(value, prit.pr, inv))
+```
+
+は使うたびに `… is not a member of Any` を出し、1 つの署名から 3 件になって
+いました。nsc は `getOrElse[B1 >: B](or: => B1): B1` /
+`getOrElse[U >: T](default: => U): U` です
+（`crates/typer/src/prelude_dbio.rs`。`prelude_ovl3` が `Option.getOrElse` に
+やったのと同じ形）。消去は変わりません（境界の無い型パラメータは `Object`）が、
+**呼び出し側に checkcast が要る**ようになったので、gen.rs の
+`Either`/`Try` の `getOrElse` 直書き経路でプリミティブの unbox だけでなく
+`lazy_cell_from_object` を通します。
+
+**4. `[B >: A]` の下限が呼び出し側の型パラメータを含むと捨てられていた**
+（3 と同じ 3 件のもう半分。3 だけ直すと `is not a member of Any` が
+`is not a member of Nothing` に変わっただけでした）。
+`tparam_lower_bound` はレシーバを通して読んだあとの下限が
+**どれか型パラメータを含んでいれば**捨てていました。捨ててよいのは
+**owner 自身**の（＝レシーバから読めていない）ものと、**そのメソッド自身**の
+（＝この呼び出しが解こうとしている変数）ものだけです。囲むメソッドの型
+パラメータはここでは固定型なので、
+
+```scala
+def use[T](e: Either[Int, It[T]]) = e.getOrElse(throw new NoSuchElementException).xs
+```
+
+は `B1` が引数の `Nothing` に解けて `value xs is not a member of Nothing` に
+なっていました（`It[String]` と書くと通る、という形で出ます）。
+
+**5. 型付きパターンは走査対象の型引数を保つ**（2 件）。nsc の
+`inferTypedPattern` です。
+
+```scala
+case a: SynchronousDatabaseAction[?, ?, ?, ?] => … superZip(a) …
+```
+
+の `a` を裸の `SynchronousDatabaseAction[_, _, _, _]` として束縛すると、
+走査対象が既に言っていた `R2` / `NoStream` / `E2` が消えるので
+`superZip(a: DBIOAction[R2, NoStream, E2])` に渡せません。パターンのクラスの
+**走査対象のクラスにおける基底型**からパラメータを解いて、`_` と書かれた
+ところだけ埋めます（`pattern_targs_from_scrutinee`）。結果は交差型ではなく
+素のクラス型のままなので、消去も codegen も従来どおりです。走査対象が
+決めないパラメータ（slick の `C`。`DBIOAction` は取らない）は `_` のままです。
+
+#### テスト
+
+`crates/cli/tests/dbio.rs` の 7 本、fixture は `db` 接頭辞の 3 本です。
+**修正前の main では 7 本中 6 本が落ちる**ことを確認しています（残り 1 本は
+`--no-scala-library` で `Either` が診断されることを見る否定テストで、main でも
+通ります）。
+
+* `tests/fixtures/db.scala`（+ `expected/`）—— 1・2・4・5 を 1 ファイルに。
+  標準ライブラリを使わないので**両モード**で走り、実 scalac との dual-run も
+  します。
+* `tests/fixtures/db_lib.scala`（+ `expected/`）—— 3。`Either` / `Try` は
+  library ABI 専用（`prelude::add_either` が `library_abi` の中）なので jar
+  モードのみ。`--no-scala-library` では診断されることも固定しています。
+* `tests/fixtures/db_bad.scala`（異常系）—— 親コンストラクタの名前付き引数の
+  名前が違う形。実 scalac と同じ `unknown parameter name: stmt` を出すこと。
+  並べ替えに失敗したときに木を書き換えないのは、シグネチャパス（診断を捨てる）
+  で名前付き引数を消費すると本体パスに `no matching overload` しか残らない
+  ためです。
+
+#### 残件
+
+担当 2 ファイルに残る 4 件は、それぞれ別の根で、いずれも最小再現を
+**実 scalac 2.13.16 が通す**ことまで確認済みです。
+
+* **`<:<` を `Function1` として渡すときの型引数推論**（`DBIOAction.scala:52`、
+  `def flatten[R2, S2, E2](implicit ev: R <:< DBIOAction[R2, S2, E2]) = flatMap(ev)`）。
+  適合自体は通ります——`val g: R => Act[R2] = ev; flatMap(g)` と書けば
+  コンパイルできます。落ちるのは `flatMap[R2](f: R => Act[R2])` の `R2` を
+  **引数から解く**ところで、引数が `<:<[R, Act[R2]]` という*クラス*なので
+  `Type::Function` のパラメータと突き合わせる前に `Function1` における基底型を
+  読んでいません。
+* **固定の型パラメータを引数に取るオーバーロード**（`DBIOAction.scala:367`、
+  `String.valueOf(value)` の `value: R`）。`arg_score` に
+  `if matches!(param, TypeParam(_)) || matches!(arg, TypeParam(_)) { Some(2) }`
+  という腕があり、**引数の型が型パラメータなら全ての候補に適合**します。
+  最小再現:
+
+  ```scala
+  object Q { def h(x: Any) = "any"; def h(x: Boolean) = "bool"; def h(x: Long) = "long" }
+  def c[R](v: R) = Q.h(v)          // ambiguous overload for h with arguments (R)
+  object O { def f(x: Any) = "any"; def f(x: Int) = "int" }
+  def a[R](v: R) = O.f(v)          // type mismatch; found: R  required: Int
+  ```
+
+  `R` は解こうとしている変数ではなく**固定型**なので、適合は
+  `is_sub_type(R, param)`（＝上のどちらも `Any` の腕だけ）でなければ
+  いけません。`arg` 側の腕を落とすのが直しですが、`arg_score` は
+  すべてのオーバーロード解決が通る場所なので、このスライスでは触っていません。
+* **引数位置の parameterless polymorphic method**（`JdbcActionComponent.scala:725`、
+  `session.withPreparedInsertStatement(sql, keyColumns.toArray)(f)`）。
+  `ConstArray` の `def toArray[R >: T : ClassTag]: Array[R]` は期待型が無いと
+  `instantiate_parameterless` を通らず（「期待型があるときだけ」という注釈の
+  とおり）`Array[R]` のまま残り、`(String, Array[String])` と
+  `(String, Array[Int])` の両方に適合して ambiguous になります。nsc は
+  `R` を下限 `T` に解いてから解決します。
+* **`cats.effect.IO(fa)`**（`DBIOAction.scala:237`）。`IO$` の `apply` が
+  見つからない、という形ですが、**単体では再現しません**——同じ式を
+  `LiftF[cats.effect.IO, R](cats.effect.IO.fromFuture(cats.effect.IO(fa)))`
+  として（兄弟の `from[F[_], R]` オーバーロード込みで）書いても通ります。
+  slick 全体を一度に読ませたときだけ出るので、pickle からのメンバ供給の
+  順序依存が疑われます。
+
+`SQLiteProfile.scala:183` の
+`no matching overload for (Iterable[U], RowsPerStatement)…` は 1 のカスケード
+だと思って調べましたが、名前付き引数の修正後も残っています（別の根）。
 
 ## ライセンス
 

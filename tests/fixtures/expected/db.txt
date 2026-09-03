@@ -1,0 +1,7 @@
+Reordered[one]
+Reordered[all]
+InOrder[s7s7]
+wrapped:x
+41
+fused(plain(sync,other))
+plain(sync,plainRhs)
