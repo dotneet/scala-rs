@@ -4218,7 +4218,22 @@ impl Typer {
                     }
                 }
             }
+            // `typing_call_args` says "this expression is an argument whose
+            // parameter has not been picked yet", and it is what makes
+            // `adapt_implicit_apply` leave a residual implicit clause standing
+            // for the parameter to settle. A method *body* is never that, but
+            // the flag is the typer's, not the expression's, and a body typed
+            // from inside an argument -- a lazy signature completion above all
+            // -- inherited it. slick's
+            // `final def buildForeignKeys(builders) = …map(…).flatten` is
+            // completed from `m.Table(…, buildForeignKeys(builders), …)`, so
+            // `flatten`'s `(A => IterableOnce[B])Seq[B]` was never filled and
+            // the method's *inferred result type* became that method type
+            // (`jdbc/JdbcModelBuilder.scala:159`). The same definition written
+            // above its use compiled fine, which is what gives the flag away.
+            let saved_call_args = std::mem::take(&mut self.typing_call_args);
             self.type_expr(rhs, &ret_pt);
+            self.typing_call_args = saved_call_args;
             if !ret_pt.is_no_type() {
                 self.adapt(rhs, &ret_pt);
             } else if !is_ctor {
@@ -8465,6 +8480,60 @@ impl Typer {
         Some((**ret).clone())
     }
 
+    /// nsc's `adaptToImplicitMethod`: the undetermined type parameters of an
+    /// expression whose only remaining clause is implicit are instantiated
+    /// *before* the witness is searched (`inferExprInstance` with
+    /// `keepNothings = false`). A variable that would come out `Nothing` is
+    /// kept undetermined -- that is what leaves `take(Array.empty)` for the
+    /// parameter to settle -- but one with a real lower bound is instantiated
+    /// *at* that bound, and stops being a variable at all.
+    ///
+    /// slick's `ConstArray#toArray[R >: T : ClassTag]: Array[R]` is the case
+    /// that needs it: `session.withPreparedInsertStatement(sql,
+    /// keyColumns.toArray)` weighs `(String, Array[String])` against
+    /// `(String, Array[Int])`, and an argument left as `Array[R]` fits both
+    /// (`jdbc/JdbcActionComponent.scala:725`, "ambiguous overload").
+    fn solve_lower_bounded_undet(&mut self, a: &mut Tree) {
+        if a.sym.is_none() || self.implicit_only_result(a).is_none() {
+            return;
+        }
+        // The bound is written in the *declaration*'s type parameters
+        // (`R >: T`); what this call sees is that bound at the receiver.
+        let recv = match &a.kind {
+            TreeKind::Select { qual, .. } => Some(qual.ty.clone()),
+            _ => None,
+        };
+        let mut ids: Vec<SymbolId> = Vec::new();
+        let mut vals: Vec<Type> = Vec::new();
+        for tp in self.st.get(a.sym).tparams.clone() {
+            if !type_mentions_tparam(&a.ty, tp) || self.tparam_in_scope(tp) {
+                continue;
+            }
+            let Some(lo) = self.st.get(tp).bound_lo.clone() else {
+                continue;
+            };
+            let lo = match &recv {
+                Some(r) if !r.is_no_type() && !r.is_error() => self.st.subst_as_seen_from(r, &lo),
+                _ => lo,
+            };
+            // `Nothing` is the "no constraint" answer nsc keeps open, and a
+            // bound that is still a type parameter nothing here can name says
+            // the receiver did not substitute it.
+            if matches!(lo, Type::Nothing | Type::NoType | Type::Error)
+                || type_mentions_tparam(&lo, tp)
+                || matches!(lo, Type::TypeParam(id) if !self.tparam_in_scope(id))
+            {
+                continue;
+            }
+            ids.push(tp);
+            vals.push(lo);
+        }
+        if ids.is_empty() {
+            return;
+        }
+        a.ty = crate::symbol::subst_tparams_slice(&ids, &vals, &a.ty);
+    }
+
     /// `implicitly[Int]` is a TypeApply of a method whose remaining clause is
     /// implicit; rewrite to an Apply filled from implicit search.
     fn adapt_implicit_apply(&mut self, tree: &mut Tree, pt: &Type) {
@@ -8509,7 +8578,22 @@ impl Typer {
             .into_iter()
             .filter(|(_, t)| !t.is_no_type() && !t.is_error() && !matches!(t, Type::TypeParam(_)))
             .collect();
-        if !self.st.get(tree.sym).tparams.is_empty()
+        // Whether this method type has already had its own parameters
+        // substituted away. Asking only "does the clause still mention them"
+        // is not enough: `type_mentions_tparam` does not look inside a
+        // compound type, so slick's `BaseColumnType[U]` (=
+        // `ScalaType[U] with BaseTypedType[U]`) reads as mentioning nothing
+        // and the search would run at an unsubstituted `U` (fixture `ovl4`).
+        // Comparing against the *declaration* keeps that case waiting and lets
+        // through only the one where a parameter demonstrably went away --
+        // `keyColumns.toArray`'s `R`, instantiated from its lower bound by
+        // `solve_lower_bounded_undet`.
+        let tps_of = self.st.get(tree.sym).tparams.clone();
+        let decl_ty = self.st.get(tree.sym).ty.clone();
+        let already_substituted = tps_of.iter().any(|tp| type_mentions_tparam(&decl_ty, *tp))
+            && !tps_of.iter().any(|tp| type_mentions_tparam(&tree.ty, *tp));
+        if !already_substituted
+            && !self.st.get(tree.sym).tparams.is_empty()
             && !matches!(tree.kind, TreeKind::TypeApply { .. })
             && undet.is_empty()
         {
@@ -11467,6 +11551,7 @@ impl Typer {
                 // its residual implicit clause, `(ClassTag[T])Array[T]`. What
                 // the callee sees is the *result*; the clause is filled once
                 // the parameter has told it what `T` is.
+                self.solve_lower_bounded_undet(a);
                 arg_tys.push(self.implicit_only_result(a).unwrap_or_else(|| a.ty.clone()));
             }
         }
@@ -11894,6 +11979,32 @@ impl Typer {
                                     !t.is_no_type() && !t.is_error() && !type_mentions_tparam(t, tp)
                                 });
                             if let Some(t) = hit {
+                                // nsc's `instantiateExpecting`: where the
+                                // variable occurs *invariantly* in the result,
+                                // the expected type outranks what the argument
+                                // said -- as long as the argument's own
+                                // solution still conforms to it. `Set() ++
+                                // dbType.map(SqlType(_))` checked against
+                                // `Set[ColumnOption[_]]` reads `?A` off the
+                                // argument as `SqlType` and an invariant `Set`
+                                // then rejects the whole call
+                                // (`jdbc/JdbcModelBuilder.scala:279`). The
+                                // callee's *own* parameters already get this
+                                // treatment in `add_expected_constraints`; a
+                                // receiver's did not.
+                                let t = match unify_one(tp, &ret, pt) {
+                                    Some(e)
+                                        if e != t
+                                            && !e.is_no_type()
+                                            && !e.is_error()
+                                            && !type_mentions_tparam(&e, tp)
+                                            && self.tparam_variance_in(&ret, tp, 1) == Some(0)
+                                            && self.st.is_sub_type(&t, &e) =>
+                                    {
+                                        e
+                                    }
+                                    _ => t,
+                                };
                                 ids.push(tp);
                                 vals.push(t);
                             }
@@ -13110,11 +13221,54 @@ impl Typer {
             if let Some(t) = hit {
                 acc = Some(match acc {
                     None => t,
-                    Some(prev) => self.lub_ty(&prev, &t),
+                    // Two arguments contributing to the same parameter: nsc
+                    // *minimises* each one's own undetermined variables before
+                    // it joins them (`solvedTypes`, no upper constraint ⇒ the
+                    // lower bound). `m.getOrElse(1, Seq.empty)` on a
+                    // `Map[K, Vector[TS]]` is `lub(Vector[TS], Seq[Nothing])`
+                    // = `Seq[TS]`; joining against `Seq[A]` with `A` still a
+                    // variable walked the base types until the arguments met
+                    // at `Seq` and answered `Seq[AnyRef]`
+                    // (slick `compiler/MergeToComprehensions.scala:218`).
+                    Some(prev) => {
+                        let prev = self.minimize_undet(&prev);
+                        let t = self.minimize_undet(&t);
+                        self.lub_ty(&prev, &t)
+                    }
                 });
             }
         }
         acc
+    }
+
+    /// Substitute every undetermined variable in `t` by its lower bound
+    /// (`Nothing` when it has none) -- nsc's minimisation of a type variable
+    /// nothing constrains from above.
+    fn minimize_undet(&self, t: &Type) -> Type {
+        if self.undet_tvars.is_empty() {
+            return t.clone();
+        }
+        let ids: Vec<SymbolId> = self
+            .undet_tvars
+            .iter()
+            .copied()
+            .filter(|tp| type_mentions_tparam(t, *tp))
+            .collect();
+        if ids.is_empty() {
+            return t.clone();
+        }
+        let vals: Vec<Type> = ids
+            .iter()
+            .map(|tp| {
+                self.st
+                    .get(*tp)
+                    .bound_lo
+                    .clone()
+                    .filter(|b| !b.is_no_type() && !b.is_error())
+                    .unwrap_or(Type::Nothing)
+            })
+            .collect();
+        crate::symbol::subst_tparams_slice(&ids, &vals, t)
     }
 
     /// nsc's `instantiateExpecting`: the expected type constrains a method's
@@ -13518,7 +13672,23 @@ impl Typer {
             let inferred = self.unify_tparam_all(tp, param_tys, arg_tys);
             let lo = self.tparam_lower_bound(method, tp, recv);
             match (inferred, lo) {
-                (Some(t), Some(lo)) => out.push((tp, self.lub_ty(&t, &lo))),
+                // The declared lower bound joins with what the arguments said,
+                // and the argument's own undetermined variables are minimised
+                // first -- `m.getOrElse(1, Seq.empty)` on a
+                // `Map[K, Vector[TS]]` is `lub(Seq[Nothing], Vector[TS])` =
+                // `Seq[TS]`, where joining `Seq[A]` with `A` still open landed
+                // on `Seq[AnyRef]`.
+                // The bound is minimised the same way. `Set() ++ opt` reads
+                // `++[B >: A]`'s bound off a receiver whose own `A` is still a
+                // variable, and `lub(SqlType, ?A)` walked up to `AnyRef` --
+                // which no longer conforms to the expected
+                // `Set[ColumnOption[_]]`, so the expected type could not
+                // override it either (`jdbc/JdbcModelBuilder.scala:279`).
+                (Some(t), Some(lo)) => {
+                    let t = self.minimize_undet(&t);
+                    let lo = self.minimize_undet(&lo);
+                    out.push((tp, self.lub_ty(&t, &lo)))
+                }
                 (Some(t), None) => out.push((tp, t)),
                 (None, Some(lo)) => out.push((tp, lo)),
                 (None, None) => {}
@@ -15469,6 +15639,23 @@ impl Typer {
                     }
                 }
             }
+            // A self alias (`class C { self => ... self(i) ... }`) types as
+            // `C.this.type`, and the `apply` that `self(i)` means is the
+            // class's own. Only the `Select` path widened a `this.type` to the
+            // class; the application path stopped at `_ => None` and reported
+            // `value apply is not a member of C.this.type`
+            // (slick `util/ConstArray.scala`'s `def apply(idx: Int) = self(idx)`).
+            Type::ThisType(sym) => {
+                let args: Vec<Type> = self
+                    .st
+                    .get(*sym)
+                    .tparams
+                    .iter()
+                    .map(|t| Type::TypeParam(*t))
+                    .collect();
+                let cls = Type::Class { sym: *sym, args };
+                return self.resolve_overload(&cls, fun_sym, arg_tys, _pt);
+            }
             Type::Class { sym, .. } => {
                 // `drop_overridden`, as everywhere else a member is looked up
                 // by name: a case class's companion declares `apply(String): C`
@@ -15869,11 +16056,14 @@ impl Typer {
                 .into_iter()
                 .map(|a| self.st.subst_as_seen_from(&recv, &self.st.get(a).ty))
                 .collect();
-            return if alts.is_empty() {
-                Type::NoType
-            } else {
-                self.agreed_function_param(&alts, idx)
-            };
+            if alts.is_empty() {
+                return Type::NoType;
+            }
+            let f = self.agreed_function_param(&alts, idx);
+            if !f.is_no_type() {
+                return f;
+            }
+            return self.agreed_value_param(&alts, idx);
         }
         let Type::Method { paramss, ret } = fun_ty else {
             return Type::NoType;
@@ -15906,8 +16096,15 @@ impl Typer {
             //
             // The prototype stays a hint: the caller re-types the argument
             // with none whenever it does not fit.
+            // A wildcard in the parameter is no reason to withhold the
+            // prototype: `case class Column(…, options: Set[ColumnOption[_]])`
+            // taking `Set() ++ …` has nothing *but* the parameter to say what
+            // `++`'s element type is, and without it the call was
+            // `Set[ColumnOption[Nothing]]` against an invariant `Set`
+            // (`jdbc/JdbcModelBuilder.scala:279`). The prototype stays a hint
+            // -- the caller re-types with none when the argument does not fit.
             return match param_at(params, idx) {
-                Some(p) if !p.is_no_type() && !p.is_error() && !type_mentions_wildcard(p) => {
+                Some(p) if !p.is_no_type() && !p.is_error() => {
                     // A by-name or repeated formal expects the *value*;
                     // wrapping it is `adapt`'s job and the caller would throw
                     // a prototype the argument cannot be a subtype of away.
@@ -16118,6 +16315,41 @@ impl Typer {
             {
                 p.clone()
             }
+            _ => Type::NoType,
+        }
+    }
+
+    /// The parameter type at `idx` every alternative agrees on, when it names
+    /// no type parameter of its own. Unlike `agreed_function_param` this does
+    /// not insist on a function shape, and unlike `only_concrete_param` it
+    /// does not reject a wildcard.
+    ///
+    /// `rewrite_receiver_apply` leaves `m.Column(name = …, options = Set() ++
+    /// …)` as a reference to the *module*, so the monomorphic branch below
+    /// never sees it; the case class's `apply` and the `AbstractFunctionN.apply`
+    /// it inherits agree on `Set[ColumnOption[_]]`, and that declared type is
+    /// the only thing that says what `++`'s element type is
+    /// (`jdbc/JdbcModelBuilder.scala:279`).
+    fn agreed_value_param(&self, alts: &[Type], idx: usize) -> Type {
+        let mut agreed: Option<&Type> = None;
+        for a in alts {
+            let Type::Method { paramss, .. } = a else {
+                return Type::NoType;
+            };
+            let Some(p) = paramss.first().and_then(|c| param_at(c, idx)) else {
+                return Type::NoType;
+            };
+            match agreed {
+                None => agreed = Some(p),
+                Some(prev) if prev == p => {}
+                Some(_) => return Type::NoType,
+            }
+        }
+        match agreed {
+            Some(p) if !p.is_no_type() && !p.is_error() && !mentions_any_tparam(p) => match p {
+                Type::ByName(inner) | Type::Repeated(inner) => (**inner).clone(),
+                other => other.clone(),
+            },
             _ => Type::NoType,
         }
     }
@@ -17374,12 +17606,24 @@ impl Typer {
                             .is_some_and(|f| matches!(self.st.get(*f).ty, Type::Repeated(_)))
                 });
                 let has_extractor = unapply.is_some() || unapply_seq.is_some();
+                // SLS 8.1.6/8.1.7: only a *case* class has a constructor
+                // pattern. A plain class whose companion defines an extractor
+                // is matched through that extractor even when its constructor
+                // happens to take as many arguments -- slick's
+                // `final class ConstArray[+T](a: Array[Any], val length: Int)`
+                // has an `unapplySeq`, and `case ConstArray(disc, map)` bound
+                // `Array[Any]` and `Int` instead of two `Node`s, so
+                // `ConstArray(disc, map)` on the right-hand side came out
+                // `ConstArray[Any]` (`compiler/ExpandSums.scala:245`).
+                // The `ctor_fields`-only arm stays for a class with no
+                // extractor at all, which is where it was needed.
+                let is_case = class_id.is_some_and(|c| self.st.get(c).flags.contains(Flags::CASE));
                 let use_ctor = !has_star
                     && class_id.is_some_and(|c| {
                         let s = self.st.get(c);
                         s.flags.contains(Flags::CASE) || !s.ctor_fields.is_empty()
                     })
-                    && (ctor_fits || !has_extractor);
+                    && ((ctor_fits && is_case) || !has_extractor);
                 if use_ctor {
                     let class_id = class_id.unwrap();
                     let fields = self.st.get(class_id).ctor_fields.clone();

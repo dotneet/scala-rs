@@ -1,0 +1,8 @@
+xy
+sess1
+Tbl(t,List(t3, t4))
+(f1,2),(f2,2)
+[]
+prod(x,y)
+auto sql:VARCHAR
+0
