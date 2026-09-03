@@ -380,6 +380,22 @@ nsc の `instantiateExpecting` と同じく、メソッドの型パラメータ�
 - **共変位置**の期待型は上界にすぎないので引数の解が勝ちます（`cov("q"): List[Any]` は `T = String`）。
 - 解いた型引数は**implicit 引数リストの解決より前**に確定します。`def column[T](n: String)(implicit tt: TypedType[T]): Rep[T]` を `Rep[Int]` の位置で呼ぶと `TypedType[Int]` を探しに行きます。
 - どちらでも決まらない型パラメータは `Nothing` で埋めず、nsc と同じ診断（`could not find implicit value …`）を出します。
+- 引数の期待型（prototype）は、**型パラメータを 1 つも持たない callee** でも
+  渡します。ただし「関数型・`FunctionN`・SAM のいずれかで、しかも完全に決まって
+  いる」パラメータに限ります（`Typer::proto_arg_type` / `agreed_function_param`）。
+  引数**そのもの**が関数リテラルなら `agreed_lambda_params` が面倒を見ますが、
+  リテラルが引数の**中**にある `f(if (c) { s => … } else { s => …; … })`
+  （slick の `JdbcBackend`）には期待型が届いていませんでした。1 式だけの分岐が
+  通っていたのは偶然で、`section_param_types` が本体の呼び出しからパラメータ型を
+  拾えていただけです。多重定義（case class のコンパニオン `apply` は
+  継承した `AbstractFunctionN.apply` と 2 候補になります）は**全候補が同じ**
+  パラメータ型を要求するときだけ、コンストラクタ（`new C(…)` / `C(…)`）は
+  クラスに型パラメータが無くアリティが一意のときだけです。
+- Java メソッドの型引数に書いた `Any` は、その型パラメータの上限である
+  `Object` として読みます（nsc の `ObjectTpeJava`）。
+  `java.util.Arrays.copyOf[Any](a: Array[AnyRef], n)`（slick の `ConstArray`）は
+  `Array` が不変でも通り、結果は `Array[AnyRef]` です。`Array[String]` を渡すのは
+  nsc と同じく拒否します。
 - 引数は、パラメータのクラスにおける**基底型**に直してから突き合わせます（nsc の
   `Types.baseType`。`check.rs` の `align_to_param_class` / `base_type_instance`）。
   `object OD extends D[Int]` を `def u[A](d: D[A])` に渡すと、引数の型は `OD.type`
@@ -522,6 +538,15 @@ nsc に寄せた探索順です。偽の「何でも変換」はありません�
 `Mid` の `P1` です（`Typer::implicit_candidate_ty`）。ここを素の宣言型のままにすると
 `implicitly[TT[P1]]` が自分の親の実装を見つけられません（slick の
 `Library.Abs.column[P1](n)`）。
+
+変換の型引数は、受け手をパラメータのクラスにおける**基底型**に直してから解きます
+（`Typer::conv_targs` が `base_type_instance` を通す。`agent/mismatch14`）。
+`implicit def mapAsScalaMapConverter[K, V](m: java.util.Map[K, V])` に
+`ConfigObject`（`extends java.util.Map[String, ConfigValue]`）を渡すと、
+受け手そのものには突き合わせる型引数が 1 つも無いので、`K` も `V` も
+`AnyRef` に落ちていました（`config.root.asScala` が `Map[AnyRef, AnyRef]`）。
+`implicit class` の型パラメータも同じ経路です
+（`class Sub extends Base[String, Int]` に対する `sub.firstOf: String`）。
 
 `import <値>._` で入れた implicit も同じで、**その値の型を通して**見ます
 （`Typer::at_import_prefix_of`）。`class Box[T] { implicit def mkOps(lhs: T): Ops[T] }`
@@ -1137,6 +1162,13 @@ recursive method f needs result type  // object A { def f = g; def g = f }
 ### 型エイリアス（alias type member）
 
 `type Scope = Map[K, V]` は右辺と**同じ型**です（nsc の dealias）。`<:` の左右、`x.m` のレシーバ、消去（`Scope` は `Map` に消去される）のいずれでも右辺に展開します。抽象型メンバ（`type T <: Bound`）は展開せず、従来どおり上限境界で扱います。
+
+結果型を書かないオーバーライドが親から受け継ぐ型に**抽象型メンバ**が出てくるときは、
+そのサブクラス自身の具象エイリアスで読み直します（nsc の as-seen-from。
+`Typer::own_type_members`、`agent/mismatch14`）。
+`trait Node { type Self <: Node; def rebuild(…): Self }` を
+`case class StructNode(…) { type Self = StructNode }` が実装したら、
+`rebuild` の結果型は `StructNode` です。
 
 **呼び出しの型パラメータを期待型から解く経路**（`collect_expected`）でも展開します。
 `object Type { type Scope = Map[TermSymbol, Type] }` に対して `val s: Type.Scope = Map.empty`
@@ -4425,6 +4457,9 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `o3.scala`（`crates/cli/tests/ovl3.rs`、私有ランタイム・library dual-run・real scalac dual-run） | `agent/ovl3` スライス: `Option.getOrElse[B >: A]` / `orElse[B >: A]` が引数で結果を広げる（`Option[Sub].getOrElse(base): Base`）。`Nothing`（`throw`）は何も広げない | `got Sub` `got Base` `got Base` `got Sub` `fallback` `Sub` |
 | `o3_lib.scala`（`crates/cli/tests/ovl3.rs`、library dual-run と real scalac dual-run） | `mutable.HashSet` / `HashMap` が `scala.collection.Set` / `Map` として渡せる、`Map.getOrElse[V1 >: V]`（immutable / mutable 両方）、`Option` を `IterableOnce` として使う（`Seq("a") ++ anOption` / `val it: Iterable[String] = anOption`）、`new StringBuilder(8, "ab")`。私有ランタイムには裏付けが無いので `--no-scala-library` では診断のまま | `2` `1` `Base Sub` `Base` `Sub Base` `a,x` `a` `1` `abc` |
 | `o3_bad.scala`（`crates/cli/tests/ovl3.rs`、両モードで拒否） | `Option[Int].getOrElse("no")` は lub の `Any`。`Int` には代入できない（nsc 2.13.16 も拒否） | `type mismatch; found: Any  required: Int` |
+| `mism14.scala`（`crates/cli/tests/mismatch14.rs`、私有ランタイム・library dual-run・real scalac dual-run） | `agent/mismatch14` スライス: 単相の callee / SAM パラメータ / case class のコンパニオン `apply` のいずれでも、`if/else` の中の関数リテラルがパラメータ型を受け取る（2 文の本体は `section_param_types` では拾えない）。generic な**基底型**しか持たない受け手の `implicit class`（`Sub extends Holder[String, Int]`）。継承した結果型の抽象型メンバ（`type Self = Leaf`）。`Arrays.copyOf[Any](Array[AnyRef], n)` | `aaabbb` `zz` `si si 7` `leaf1` `mnnn` `3 x null` |
+| `mism14_lib.scala`（`crates/cli/tests/mismatch14.rs`、library dual-run と real scalac dual-run） | `java.util.ArrayList[String]` / `HashMap[String, Integer]` を**継承した** Scala クラスに `asScala`（slick の `ConfigObject` と同じ形）。私有ランタイムには `scala.jdk.CollectionConverters` が無いので `--no-scala-library` では診断のまま | `x,y` `7` `1` |
+| `mism14_bad.scala`（`crates/cli/tests/mismatch14.rs`、両モードで拒否） | Java の型引数 `Any` を `Object` と読んでも `Array` は不変のまま。`copyOf[Any](Array[String], 3)` は拒否（nsc 2.13.16 も拒否） | `no matching overload for (Array[AnyRef], Int)Array[AnyRef] with arguments (Array[String], 3)` |
 | `java_sig.scala` | Java Signature（`ArrayList[String]#get` は `String`）、inner `Map.Entry` / `SimpleEntry`、Java varargs `String.format` / `Arrays.asList` を実行 | `hi` `2` `k` `v` `k` `x-3` `2` |
 | `java_wild.scala` | Signature の `Class[_]` / `Collection[_ <: Number]` / `Collections.max`（tparam bound）を存在型として実行 | `java.lang.String` `2` `9` |
 | `java_throws.scala` | Java `throws` 検査例外（`Thread.sleep`）を Scala はチェックせず実行 | `ok` |
@@ -9447,6 +9482,141 @@ prelude には無く、`warm_pickled_implicits` が pickle から供給します
   スタブで、`apply` / `contains` は jar の pickle 頼みです。
 * cats の `>>`（`BasicBackend.scala:329` / `432` / `434`、3 件）と
   `DBIOAction.scala` の `<:<` を `Function1` として渡す 3 件は未調査です。
+### 引数の中の関数リテラル・基底型・Java の `Object`（`agent/mismatch14`）
+
+テストは `crates/cli/tests/mismatch14.rs`、fixture 接頭辞は `mism14` です。
+
+計測は `files=184 errors=115 files_with_errors=41` →
+**`files=184 errors=106 files_with_errors=41`**（−9 件）。
+
+`agent/ovl3` が根拠付きで残した 2 つ（`Arrays.copyOf[Any]` 2 件、
+`ConfigObject.asScala` 2 件）と、`type mismatch` の `Node.Self` 2 件、
+`JdbcBackend` の `(Statement) => Unit` 2 件（＋道連れの
+`missing parameter type for expanded function` 1 件）が、次の 4 つの根に
+落ちました。消えた 9 件以外に**増えた診断はありません**（差分は無名クラスの
+連番だけ）。
+
+| 根 | before | after |
+|---|---|---|
+| 単相の callee が引数に期待型を渡していなかった | 3 件 | **0 件** |
+| 変換の型引数を受け手の**基底型**から解いていなかった | 2 件 | **0 件** |
+| Java の型引数 `Any` を `scala.Any` として代入していた | 2 件 | **0 件** |
+| 継承した結果型の抽象型メンバをサブクラスで読み直していなかった | 2 件 | **0 件** |
+
+#### 1. 引数の中の関数リテラルに期待型が届いていなかった
+
+```scala
+def take(f: Statement => Unit): Int = 1
+take(if (cond) { s => si(s) } else { s => si(s); si(s) })
+```
+
+`else` 側の `s` が `<notype>` のまま `si(s)` を呼び、
+`no matching overload for (Statement)Unit with arguments (<notype>)` が
+2 本（本体の文の数だけ）出ていました。`then` 側が通っていたのは**偶然**で、
+`section_param_types` が「本体が呼び出し 1 個ならその callee の署名から
+パラメータ型を拾う」規則を持っているからです。2 文の本体にはその拾い先が
+ありません。
+
+真犯人は `Typer::proto_arg_type` の先頭にあった
+「型パラメータを持たない callee には prototype を出さない」でした。nsc は
+すべての引数をパラメータ型に対して型付けします（`Typers.typedArg`）。
+ただし丸ごと真似すると影響が大きいので、**関数型・`FunctionN`・SAM のいずれかで、
+しかも型パラメータもワイルドカードも含まない**パラメータに限りました。
+まだ解けていない型パラメータを prototype にしてはいけないのは
+`agreed_lambda_params` のコメントが実測付きで書いているとおりです
+（cats の `uncancelable[A]` を先に固定して slick が 155→232 になった件）。
+
+同じ穴が 2 つの別経路にもありました。
+
+* **多重定義**（`Type::Overload`）: 全候補が同じ関数型パラメータを要求する
+  ときだけ prototype を出します（`agreed_function_param`）。
+* **コンストラクタ**（`new C(…)`、および `C(…)` から回るケース）:
+  クラスに型パラメータが無く、アリティが一次コンストラクタと一致するときだけ、
+  そのフィールド型を prototype にします。
+* **コンパニオンの `apply`**: `rewrite_receiver_apply` は
+  `Obj(args)` を `Obj.apply(args)` に**書き換えません**（codegen の都合。
+  `named_arg_param_ids` のコメント参照）。したがって callee の型は
+  `Type::ModuleRef` で、パラメータはその `apply` にあります。ここで
+  `AbstractFunctionN.apply` を**継承**しているのを忘れると候補が
+  `(String, (Statement) => Unit, Int)SP` と `(T1, T2, T3)R` になって
+  「全候補が一致」に届かないので、モジュールクラス越しの as-seen-from を
+  通してから比べます。slick の
+  `JdbcBackend.StatementParameters(…, if (…) … else { s => …; … }, …)` が
+  ちょうどこの形です。
+
+prototype は**制約ではなくヒント**です。メソッド経路が既にそうしているように、
+prototype 付きで型付けした引数が文句を言った（あるいは結果がパラメータに
+適合しなかった）ら、診断ごと捨てて prototype 無しで型付けし直します。
+コンストラクタ経路にこの巻き戻しを入れ忘れると、slick の
+`new StructValue(…, xs.toMap)` が新しく落ちました:
+`StructValue` の第 2 パラメータは `TermSymbol => Int` で、`Map <: Function1`
+を通して `toMap` の `K` / `V` を解く経路が無いからです。prototype 無しで
+型付ければ `Map[TermSymbol, Int]` で、そのまま適合します。
+
+#### 2. 変換の型引数は受け手の基底型から解く
+
+`Typer::conv_targs` は変換のパラメータと受け手を**同じ位置どうし**で
+突き合わせていました。`java.util.Map[K, V]` に対して受け手が
+`ConfigObject`（型引数を 1 つも持たない）だと zip する相手が無く、
+`K` も `V` も `AnyRef` に落ちます。`base_type_instance` で
+`java.util.Map[String, ConfigValue]` に直してから解きます。純 Scala でも
+同じことが起きていました（`class Sub extends Base[String, Int]` に対する
+`implicit class Ops[A, B](b: Base[A, B])` の `sub.firstOf` が `AnyRef`）。
+
+#### 3. Java の型パラメータに書いた `Any` は `Object`
+
+nsc は Java シグネチャ中の `Object` を `ObjectTpeJava` として読みます。
+`<T> T[] copyOf(T[], int)` を `copyOf[Any](…)` と呼ぶと `T` は
+`scala.Any` ではなく `Object` に固定されるので、`Array[AnyRef]` は通り、
+結果を `Array[Any]` に代入するところだけが落ちます（実 scalac で確認:
+`found: Array[Any] required: Array[Any]` という一見不可解な文面は、
+`found` 側が `Array[Object]` だからです）。scala-rs は `TypeApply` で
+明示された `Any` を、`JAVA` フラグの立った callee の `Object` 上限の
+型パラメータに限って `AnyRef` に読み替えます（`java_object_targs`）。
+`Array` の不変性は変わらないので `copyOf[Any](Array[String], 3)` は
+拒否したままです（`mism14_bad.scala`）。
+
+#### 4. 継承した結果型の抽象型メンバ
+
+```scala
+trait Node { type Self >: this.type <: Node; def rebuild(ch: …): Self }
+case class StructNode(…) extends Node {
+  type Self = StructNode
+  override def rebuild(ch: …) = StructNode(…)   // found: StructNode required: Node.Self
+}
+```
+
+結果型を書かないオーバーライドは `overridden_ret_type` が親の宣言から
+取ってきますが、`subst_as_seen_from` が置換するのは型**パラメータ**だけで、
+抽象型**メンバ**はそのままでした。nsc は宣言を `StructNode.this.type` から
+見るので `Self` は `StructNode` です。取ってきた結果型の型メンバを、
+その名前でサブクラス自身が持っている具象エイリアスに置き換えます
+（`own_type_members`）。slick の `ast/Node.scala` の `StructNode` /
+`Filter` がこれです。
+
+#### 検証
+
+`mism14.scala` は `--scala-library` と `--no-scala-library` の両方で
+`-Xverify:all` を通し、real scalac 2.13.16 の標準出力とも突き合わせます。
+`mism14_lib.scala` は `scala.jdk.CollectionConverters` が jar 側にしか
+無いので library モードのみで、私有ランタイムでは
+`value asScala is not a member of Names` を出します。`mism14_bad.scala` は
+`Array` の不変性が残っていることを、診断文面ごと固定します
+（修正前の文面は `(Array[Any], Int)Array[Any]` だったので、この否定テストも
+修正前の `main` では落ちます）。7 本すべて修正前の `main` で落ちることを
+確認済みです。`cargo test --workspace` に加えて、`--release` で
+`overloadshadow` / `ambigmap` / `setapply` / `uniteq` / `integral` /
+`ordsummon` / `mutcoll` / `conform` / `e2e` / `mismatch14` / `ovl3` /
+`mismatch13` / `buildfrom2` を回しています。
+
+**残っているもの**（このスライスでは直していない）:
+
+* `RelationalProfile.scala:82` の `missing parameter type for expanded
+  function` は別件です（`mp.genericFastPath { … }` の側）。
+* `agent/ovl3` が挙げた残件のうち、`Array[T]` → `IterableOnce[T]` の view、
+  `Set.++` / `Seq.++` の `[B >: A]`、`RefId[E <: AnyRef]` を期待型から解く件、
+  `collection.Map` のメンバ無しスタブ、cats の `>>` は手つかずです。
+
 ### 型射影 `A#B` のメンバ再読み込みと、`package` 句が開くもの（`agent/proj`）
 
 テストは `crates/cli/tests/proj.rs`、fixture 接頭辞は `pj` です。

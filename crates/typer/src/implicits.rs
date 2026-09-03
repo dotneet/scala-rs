@@ -1577,6 +1577,18 @@ impl Typer {
         let Some(param) = param else {
             return vec![Type::AnyRef; tps.len()];
         };
+        // nsc solves the conversion's parameters against the receiver's *base
+        // type* at the parameter's class, not against the receiver as written.
+        // `implicit def mapAsScalaMapConverter[K, V](m: java.util.Map[K, V])`
+        // applied to a `ConfigObject` (which merely *extends*
+        // `java.util.Map[String, ConfigValue]`) has nothing to zip argument by
+        // argument, so both `K` and `V` fell through to `AnyRef` and
+        // `config.root.asScala` came back a `Map[AnyRef, AnyRef]`.
+        let seen_as = match &param {
+            Type::Class { sym, args } if !args.is_empty() => self.base_type_instance(from, *sym, 0),
+            _ => None,
+        };
+        let from = seen_as.as_ref().unwrap_or(from);
         let mut solved: Vec<Option<Type>> = tps
             .iter()
             .map(|tp| unify_conv_tparam(*tp, &param, from))
