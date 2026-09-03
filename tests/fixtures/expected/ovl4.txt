@@ -1,0 +1,9 @@
+x
+42
+str/str
+box:boxed
+refid:NodeX
+HI
+-
+v
+wrote
