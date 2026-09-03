@@ -24,6 +24,15 @@
 //!    A member that is *not* overloaded kept the substituted type from
 //!    `type_select` all along, which is why only overloaded ones were hit.
 //!
+//! 3. **A conversion's own implicit clause did not complete its candidates.**
+//!    `fill_implicit_params_in` warms a jar candidate's parents and retries
+//!    when a search comes up empty (`agent/tail6`); `fill_conv_implicits`, the
+//!    same step for an implicit *conversion*, did not. cats'
+//!    `toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])` therefore
+//!    could not be filled from `implicit val asyncF: Async[F]` unless some
+//!    earlier line in the same file had happened to warm `Async`
+//!    (slick's `BasicBackend.scala:151`).
+//!
 //! Kept out of `crates/cli/tests/e2e.rs` to avoid merge conflicts; see
 //! `.agent-brief.md`. All fixtures use the `c3` prefix.
 
@@ -335,12 +344,29 @@ object C3Cats {
 }
 "#;
 
-fn compile_cats_user() -> Option<String> {
+/// slick's `BasicDatabaseDef[F[_]]`, alone in its compilation unit -- which is
+/// the whole point: the witness is an *abstract* member and the syntax
+/// conversion `toFlatMapOps(…)(implicit FlatMap[F])` is what asks for it.
+/// Filling a *conversion's* implicit clause did not complete a jar candidate's
+/// parents, so `Async[F]` could not answer `FlatMap[F]`. Put this next to any
+/// other line that mentions `Async` and it compiles either way, so it has to
+/// stand on its own.
+const CATS_DB: &str = r#"
+import cats.effect.Async
+import cats.syntax.all._
+
+trait C3Db[F[_]] {
+  implicit val asyncF: Async[F]
+  def run(fa: F[Long]): F[Int] = fa.flatMap(_ => asyncF.pure(1))
+}
+"#;
+
+fn compile_cats_user(tag: &str, source: &str) -> Option<String> {
     let jar = scala_library_jar()?;
     let cats = cats_effect_jars()?;
-    let dir = tmp_dir("cats");
+    let dir = tmp_dir(tag);
     let src = dir.join("user.scala");
-    fs::write(&src, CATS_USER).unwrap();
+    fs::write(&src, source).unwrap();
     let out = dir.join("out");
     fs::create_dir_all(&out).unwrap();
     let cp = cats
@@ -371,24 +397,42 @@ fn compile_cats_user() -> Option<String> {
 
 #[test]
 fn cats_flat_map_then_and_timeout_to_compile() {
-    let Some(msgs) = compile_cats_user() else {
+    let Some(msgs) = compile_cats_user("cats", CATS_USER) else {
         eprintln!("skip: cats jars or scala-library jar not present");
         return;
     };
     assert!(msgs.is_empty(), "compile failed:\n{msgs}");
 }
 
+#[test]
+fn cats_syntax_conversion_completes_its_own_witness() {
+    let Some(msgs) = compile_cats_user("catsdb", CATS_DB) else {
+        eprintln!("skip: cats jars or scala-library jar not present");
+        return;
+    };
+    assert!(msgs.is_empty(), "compile failed:\n{msgs}");
+}
+
+#[test]
+fn scalac_agrees_cats_syntax_conversion_completes_its_own_witness() {
+    scalac_accepts("scalac-catsdb", CATS_DB);
+}
+
 /// The same eleven lines through real scalac, so the test above cannot be
 /// asserting something nsc rejects.
 #[test]
 fn scalac_agrees_cats_flat_map_then_and_timeout_to() {
+    scalac_accepts("scalac-cats", CATS_USER);
+}
+
+fn scalac_accepts(tag: &str, source: &str) {
     let (Some(sc), Some(cats)) = (scalac(), cats_effect_jars()) else {
         eprintln!("skip: scalac or cats jars not present");
         return;
     };
-    let dir = tmp_dir("scalac-cats");
+    let dir = tmp_dir(tag);
     let src = dir.join("user.scala");
-    fs::write(&src, CATS_USER).unwrap();
+    fs::write(&src, source).unwrap();
     let out = dir.join("out");
     fs::create_dir_all(&out).unwrap();
     let cp = cats

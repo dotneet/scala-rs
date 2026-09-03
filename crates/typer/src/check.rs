@@ -19507,7 +19507,19 @@ impl Typer {
             let mut args = Vec::with_capacity(clause.len());
             for want in &clause {
                 self.warm_implicit_scope(want);
-                match self.search_implicit(want) {
+                let mut search = self.search_implicit(want);
+                // The same completion `fill_implicit_params_in` does for an
+                // ordinary implicit clause (`agent/tail6`): a candidate whose
+                // class came from a jar answers for its supertypes only once
+                // something has read its parents, and the search itself runs
+                // under an immutable borrow. `implicit val asyncF: Async[F]`
+                // in a trait could not answer `toFlatMapOps`'s `FlatMap[F]`
+                // until some earlier line in the same file happened to warm
+                // it (slick's `BasicBackend.scala`, `run`).
+                if matches!(search, ImplicitSearch::None) && self.warm_implicit_candidates() {
+                    search = self.search_implicit(want);
+                }
+                match search {
                     ImplicitSearch::Found(id) => {
                         let mut a = self.implicit_tree(id, want, span, 0);
                         self.adapt(&mut a, want);
