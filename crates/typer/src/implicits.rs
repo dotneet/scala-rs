@@ -994,6 +994,14 @@ impl Typer {
             fits.sort_by_key(|(id, _)| id.0);
             fits.dedup_by_key(|(id, _)| id.0);
         }
+        if fits.is_empty() {
+            if let Some(c) = self.conforms_witness(pt) {
+                fits = self
+                    .implicit_fit_at(c, pt, depth, undet)
+                    .map(|f| vec![(c, f)])
+                    .unwrap_or_default();
+            }
+        }
         let cands: Vec<SymbolId> = fits.iter().map(|(id, _)| *id).collect();
         let found = self.most_specific(cands);
         let bindings = match &found {
@@ -1005,6 +1013,38 @@ impl Typer {
             _ => Vec::new(),
         };
         (found, bindings)
+    }
+
+    /// `Predef.$conforms[A]: A => A`, when the wanted type is a one-argument
+    /// function type that it could satisfy.
+    ///
+    /// nsc has `$conforms` in scope everywhere (it is a `Predef` member and
+    /// `Predef._` is imported into every compilation unit), which is how
+    /// `implicitly[String => CharSequence]` and, through it,
+    /// `Ordering.ordered[A](implicit asComparable: A => Comparable[A])`
+    /// resolve -- slick's `ScalaBaseType[Null]` needs exactly that chain for
+    /// its `Ordering[Null]`. Our `Predef` members are entered into the base
+    /// scope before `prelude_conform` adds `$conforms`, so the ordinary scope
+    /// walk never sees it. Offering it here, only after every real candidate
+    /// has failed and only against a function type, keeps it from displacing
+    /// anything: an identity view is what nsc falls back on too.
+    fn conforms_witness(&self, pt: &Type) -> Option<SymbolId> {
+        let Type::Function { params, .. } = pt else {
+            return None;
+        };
+        if params.len() != 1 {
+            return None;
+        }
+        let predef = self.st.predef;
+        if predef.is_none() {
+            return None;
+        }
+        self.st
+            .get(predef)
+            .members
+            .iter()
+            .copied()
+            .find(|&m| self.st.get(m).name == "$conforms")
     }
 
     pub(crate) fn search_conversion(&self, from: &Type, to: &Type) -> ImplicitSearch {

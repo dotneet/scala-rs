@@ -183,6 +183,11 @@ pub struct Typer {
     /// a `new` builds. `tree_to_type` recurses, so `extends Seq[Missing]`
     /// points at `Missing`, exactly as nsc does.
     strict_type_names: bool,
+    /// Inside a *type pattern* (`case o: TC[_]`), where nsc lets a wildcard
+    /// type argument stand for a type constructor. In an ordinary type
+    /// position the same `TC[_]` is an existential over a proper type and nsc
+    /// rejects it (`_$1 takes no type parameters, expected: 1`).
+    pattern_tpt: bool,
     /// Members whose signature the signature pass already built. Signature
     /// work is not idempotent -- it synthesizes evidence parameters and
     /// default getters -- so the body pass must not redo it.
@@ -569,6 +574,7 @@ impl Typer {
             open_pkgs: HashMap::new(),
             sigs_only: false,
             strict_type_names: false,
+            pattern_tpt: false,
             sig_done: std::collections::HashSet::new(),
             lazy_val_presig: std::collections::HashSet::new(),
             parent_fill_done: std::collections::HashSet::new(),
@@ -1101,6 +1107,16 @@ impl Typer {
         let expected = self.st.tparam_arities(&ctor);
         for (i, a) in args.iter().enumerate() {
             let exp = expected.get(i).copied().unwrap_or(0);
+            // In a type *pattern* an unbounded wildcard stands for some type
+            // of whatever kind the parameter has: nsc accepts
+            // `case o: TypedCollectionTypeConstructor[?]` (slick's
+            // `ast/Type.scala`) for a `C[_]` parameter. Everywhere else the
+            // same wildcard is an existential over a proper type, and nsc
+            // reports `_$1 takes no type parameters` -- so this stays inside
+            // the pattern.
+            if self.pattern_tpt && matches!(a, Type::Wildcard) {
+                continue;
+            }
             let got = self.st.kind_arity(a);
             if got != exp {
                 let ctor_s = self.st.display_type(&ctor);
@@ -16865,7 +16881,9 @@ impl Typer {
                 pat.ty = sel_ty.clone();
             }
             TreeKind::Typed { expr, tpt } => {
+                let saved = std::mem::replace(&mut self.pattern_tpt, true);
                 let ty = self.tree_to_type(tpt);
+                self.pattern_tpt = saved;
                 self.type_pattern(expr, &ty);
                 pat.ty = ty;
             }
@@ -19641,12 +19659,32 @@ impl Typer {
         if mcls.is_none() {
             return;
         }
-        for n in self
-            .pickle
-            .implicit_member_names(&self.st, &mut self.binary, mcls)
-        {
-            if self.st.lookup_member(mcls, &n).is_empty() {
-                self.supply_from_pickle_class(mcls, &n);
+        // The companion object's *own* declarations, and the ones it inherits.
+        // SLS 7.2 names the object, and an object's members include inherited
+        // ones: `object Ordering extends LowPriorityOrderingImplicits`, and
+        // `ordered[A](implicit asComparable: A => Comparable[A])` -- the only
+        // way to an `Ordering[Null]` (slick's `ScalaBaseType.nullType`) -- is
+        // declared by that parent trait, whose member list stays empty until
+        // something completes it. The parent is only asked for the members it
+        // does not have; nothing about the hierarchy itself is touched.
+        let mut work = vec![mcls];
+        let mut walked = std::collections::HashSet::new();
+        while let Some(c) = work.pop() {
+            if c.is_none() || !walked.insert(c.0) {
+                continue;
+            }
+            for n in self
+                .pickle
+                .implicit_member_names(&self.st, &mut self.binary, c)
+            {
+                if self.st.lookup_member(c, &n).is_empty() {
+                    self.supply_from_pickle_class(c, &n);
+                }
+            }
+            for p in self.st.get(c).parents.clone() {
+                if let Some(ps) = self.st.class_sym_of(&p) {
+                    work.push(ps);
+                }
             }
         }
     }
@@ -21321,7 +21359,13 @@ impl Typer {
         }
         let mut tail = 0;
         let mut nontail = 0;
-        count_tailrec_calls(rhs, tree.sym, true, &mut tail, &mut nontail);
+        // A call to a *parameterless* method is a bare `Select` -- there is no
+        // `Apply` node to recognise. `NominalType.sourceNominalType`
+        // (slick's `ast/Type.scala`) is `structuralView match { case n:
+        // NominalType => n.sourceNominalType; case _ => this }`, which nsc
+        // accepts and this counted as no recursive call at all.
+        let nullary = self.st.get(tree.sym).paramss.is_empty();
+        count_tailrec_calls(rhs, tree.sym, nullary, true, &mut tail, &mut nontail);
         if nontail > 0 {
             self.error(
                 tree.span,
@@ -21671,10 +21715,28 @@ fn rec_fun_is_method(tree: &Tree, meth: SymbolId) -> bool {
 fn count_tailrec_calls(
     tree: &Tree,
     meth: SymbolId,
+    nullary: bool,
     tail: bool,
     n_tail: &mut u32,
     n_nontail: &mut u32,
 ) {
+    // A parameterless method is called by naming it: `n.sourceNominalType`
+    // is a `Select`, with no `Apply` wrapped round it.
+    if nullary
+        && tree.sym == meth
+        && !meth.is_none()
+        && matches!(&tree.kind, TreeKind::Select { .. } | TreeKind::Ident { .. })
+    {
+        if tail {
+            *n_tail += 1;
+        } else {
+            *n_nontail += 1;
+        }
+        if let TreeKind::Select { qual, .. } = &tree.kind {
+            count_tailrec_calls(qual, meth, nullary, false, n_tail, n_nontail);
+        }
+        return;
+    }
     if is_rec_apply(tree, meth) {
         if tail {
             *n_tail += 1;
@@ -21684,13 +21746,13 @@ fn count_tailrec_calls(
         match &tree.kind {
             TreeKind::Apply { args, .. } => {
                 for a in args {
-                    count_tailrec_calls(a, meth, false, n_tail, n_nontail);
+                    count_tailrec_calls(a, meth, nullary, false, n_tail, n_nontail);
                 }
             }
             TreeKind::TypeApply { fun, .. } => {
                 if let TreeKind::Apply { args, .. } = &fun.kind {
                     for a in args {
-                        count_tailrec_calls(a, meth, false, n_tail, n_nontail);
+                        count_tailrec_calls(a, meth, nullary, false, n_tail, n_nontail);
                     }
                 }
             }
@@ -21700,63 +21762,67 @@ fn count_tailrec_calls(
     }
     match &tree.kind {
         TreeKind::If { cond, thenp, elsep } => {
-            count_tailrec_calls(cond, meth, false, n_tail, n_nontail);
-            count_tailrec_calls(thenp, meth, tail, n_tail, n_nontail);
-            count_tailrec_calls(elsep, meth, tail, n_tail, n_nontail);
+            count_tailrec_calls(cond, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(thenp, meth, nullary, tail, n_tail, n_nontail);
+            count_tailrec_calls(elsep, meth, nullary, tail, n_tail, n_nontail);
         }
         TreeKind::Block { stats, expr } => {
             for s in stats {
-                count_tailrec_calls(s, meth, false, n_tail, n_nontail);
+                count_tailrec_calls(s, meth, nullary, false, n_tail, n_nontail);
             }
-            count_tailrec_calls(expr, meth, tail, n_tail, n_nontail);
+            count_tailrec_calls(expr, meth, nullary, tail, n_tail, n_nontail);
         }
         TreeKind::Match { selector, cases } => {
-            count_tailrec_calls(selector, meth, false, n_tail, n_nontail);
+            count_tailrec_calls(selector, meth, nullary, false, n_tail, n_nontail);
             for c in cases {
                 if !c.guard.is_empty() {
-                    count_tailrec_calls(&c.guard, meth, false, n_tail, n_nontail);
+                    count_tailrec_calls(&c.guard, meth, nullary, false, n_tail, n_nontail);
                 }
-                count_tailrec_calls(&c.body, meth, tail, n_tail, n_nontail);
+                count_tailrec_calls(&c.body, meth, nullary, tail, n_tail, n_nontail);
             }
         }
         TreeKind::Apply { fun, args } => {
-            count_tailrec_calls(fun, meth, false, n_tail, n_nontail);
+            count_tailrec_calls(fun, meth, nullary, false, n_tail, n_nontail);
             for a in args {
-                count_tailrec_calls(a, meth, false, n_tail, n_nontail);
+                count_tailrec_calls(a, meth, nullary, false, n_tail, n_nontail);
             }
         }
         TreeKind::TypeApply { fun, args } => {
-            count_tailrec_calls(fun, meth, tail, n_tail, n_nontail);
+            count_tailrec_calls(fun, meth, nullary, tail, n_tail, n_nontail);
             let _ = args;
         }
-        TreeKind::Select { qual, .. } => count_tailrec_calls(qual, meth, false, n_tail, n_nontail),
-        TreeKind::Typed { expr, .. } => count_tailrec_calls(expr, meth, tail, n_tail, n_nontail),
+        TreeKind::Select { qual, .. } => {
+            count_tailrec_calls(qual, meth, nullary, false, n_tail, n_nontail)
+        }
+        TreeKind::Typed { expr, .. } => {
+            count_tailrec_calls(expr, meth, nullary, tail, n_tail, n_nontail)
+        }
         TreeKind::Assign { lhs, rhs } => {
-            count_tailrec_calls(lhs, meth, false, n_tail, n_nontail);
-            count_tailrec_calls(rhs, meth, false, n_tail, n_nontail);
+            count_tailrec_calls(lhs, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(rhs, meth, nullary, false, n_tail, n_nontail);
         }
         TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
-            count_tailrec_calls(cond, meth, false, n_tail, n_nontail);
-            count_tailrec_calls(body, meth, false, n_tail, n_nontail);
+            count_tailrec_calls(cond, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(body, meth, nullary, false, n_tail, n_nontail);
         }
         TreeKind::Try {
             block,
             catches,
             finalizer,
         } => {
-            count_tailrec_calls(block, meth, false, n_tail, n_nontail);
+            count_tailrec_calls(block, meth, nullary, false, n_tail, n_nontail);
             for c in catches {
-                count_tailrec_calls(&c.body, meth, false, n_tail, n_nontail);
+                count_tailrec_calls(&c.body, meth, nullary, false, n_tail, n_nontail);
             }
             if !finalizer.is_empty() {
-                count_tailrec_calls(finalizer, meth, false, n_tail, n_nontail);
+                count_tailrec_calls(finalizer, meth, nullary, false, n_tail, n_nontail);
             }
         }
         TreeKind::Function { body, .. } => {
-            count_tailrec_calls(body, meth, false, n_tail, n_nontail);
+            count_tailrec_calls(body, meth, nullary, false, n_tail, n_nontail);
         }
         TreeKind::Return { expr } | TreeKind::Throw { expr } => {
-            count_tailrec_calls(expr, meth, false, n_tail, n_nontail);
+            count_tailrec_calls(expr, meth, nullary, false, n_tail, n_nontail);
         }
         _ => {}
     }

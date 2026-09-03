@@ -404,6 +404,13 @@ fn erase_elem_ty(ty: &Type, st: &SymbolTable) -> Type {
 }
 
 fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
+    // `Array[T]` reached through a classfile signature, or built by
+    // substituting `Array` for a `C[_]` parameter, is `Class { array_sym }`.
+    // Erasing that as a plain class emits the pseudo-name `[java/lang/Object`,
+    // which no JVM will load.
+    if let Some(a) = st.array_class_form(ty) {
+        return erase_ty(&a, st);
+    }
     match ty {
         Type::Class { sym, .. } if st.is_value_class(*sym) => {
             if let Some(u) = st.value_class_underlying(*sym) {

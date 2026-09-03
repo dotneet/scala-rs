@@ -1174,8 +1174,39 @@ fn existing_java_method(
     })
 }
 
+/// A mixin forwarder or bridge in a *generic Scala* class file: a method with
+/// no `Signature` attribute, where the erased descriptor is all there is.
+///
+/// scalac writes a `Signature` for every method whose Scala type mentions a
+/// type parameter, so on a class that *has* type parameters an unsigned method
+/// is a forwarder or bridge for a declaration that lives, properly typed,
+/// somewhere the pickle describes. `scala.collection.immutable.HashMap` carries
+/// `public Object filter(Function1)` and `public IterableOps map(Function1)`
+/// -- forwarders for the `filter`/`map` its `MapOps` parent declares -- and
+/// reading those as `(Any) => Any` / `(Any) => IterableOps` is what made
+/// `foundRefs.filter(_._2._2.isEmpty).map { … }` (slick's
+/// `compiler/RewriteJoins.scala`) report `value _2 is not a member of Any`.
+/// Installing the forwarder hides the real declaration, which ordinary member
+/// lookup would otherwise reach through the parent (or have
+/// `PickleSupply::complete` supply from an ancestor's pickle on demand).
+///
+/// Restricted to a class with type parameters: on a monomorphic class an
+/// unsigned descriptor is the whole truth, and an `Object` in it is a real
+/// `Any`.
+fn is_erased_scala_forwarder(
+    st: &SymbolTable,
+    owner: SymbolId,
+    c: &crate::javaclass::JavaClass,
+    m: &crate::javaclass::JavaMethod,
+) -> bool {
+    c.is_scala && m.signature.is_none() && m.name != "<init>" && !st.get(owner).tparams.is_empty()
+}
+
 fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass::JavaClass) {
     for m in &c.methods {
+        if is_erased_scala_forwarder(st, owner, c, m) {
+            continue;
+        }
         if let Some(id) = existing_java_method(st, owner, m) {
             st.get_mut(id).flags = java_method_flags(m);
             if st.get(id).jvm_name.is_empty() {
