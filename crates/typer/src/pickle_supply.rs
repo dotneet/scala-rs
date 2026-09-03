@@ -709,6 +709,13 @@ impl PickleSupply {
             && !self.adopted.contains(&class_sym.0)
             && !self.implicits_supplied.contains(&class_sym.0)
         {
+            // Worth tracing: the answer is memoised in `tried_types`, so a
+            // class asked for a type member *before* anything adopted it
+            // keeps that `None` for the rest of the run. Order-dependent
+            // "type X is not a member of Y$" reports start here.
+            trace(format_args!(
+                "{internal}#{name}: no pickle read -- the class has not been adopted yet"
+            ));
             return None;
         }
         let is_module = sym.kind == SymKind::ModuleClass;

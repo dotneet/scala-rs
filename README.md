@@ -12052,6 +12052,143 @@ unify する必要があるので、そこも 1 行足してあります。
   `checkcast` するので `ClassCastException` になります。これも main からある件で、
   fixture では要素代入で配列を作って避けました。
 
+### cats-effect の 3 件——「単体では再現しない」の正体（`agent/final2`）
+
+slick に残っていた cats-effect まわり 3 件（`Resource.ExitCase`、`Ref.Make[F]`、
+`cats.effect.IO(fa)`）を直しました。slick は
+`errors=17 files_with_errors=13` → **`errors=13 files_with_errors=10`**
+（`tests/slick_measure.sh`。エラーが消えたファイル: `basic/BasicBackend.scala`、
+`basic/ConcurrencyControl.scala`、`dbio/DBIOAction.scala`。ついでに
+`JdbcModelBuilder.scala` の `Column$` 1 件も消えました）。
+fixture は `tests/fixtures/f2_cats.scala`（正常系・全ケース 1 ファイル）と
+`tests/fixtures/f2_cats_bad.scala`、テストは `crates/cli/tests/final2.rs`。
+修正前の main（`d7e7767`）ではこの 1 ファイルで 5 件のエラーが出ます。
+
+3 件のうち 2 件は「slick を丸ごとコンパイルしたときだけ壊れる」と 3 スライス
+報告され続けていました。**根はどれも同じ形**です——ある記号が、プログラムが
+その名前を書くより先に**別の経路**で記号表に入り、先に入った方の答えが残る。
+だから最初にやったのは、その「先に入る経路」を特定して**1 ファイルに畳むこと**
+でした（下の「再現手段」）。
+
+#### 1. `Ref.of` の `implicit mk: Ref.Make[F]` が見つからない
+
+`ConcurrencyControl.scala:202`。**これは単体で再現します**（前スライスの
+「(a) 暗黙引数の挿入」「(b) 存在型 `GenConcurrent[F, ?]` の implicit スコープ」
+という見立ては**どちらも違いました**）。
+
+```scala
+def create[F[_]](n: Long)(implicit F: Async[F]): F[Ref[F, Long]] = Ref.of[F, Long](n)
+```
+
+`Make[F]` の候補は `Ref.Make` のコンパニオンが継承する
+`Ref.MakeInstances#concurrentInstance` / `MakeLowPriorityInstances#syncInstance`
+だけです。`SCALA_RS_IMPL_DEBUG`（調査用に一時的に足した trace）で見ると
+候補集合が空でした。原因は `Check::load_companion_module` で、
+`cats/effect/kernel/Ref$Make$` を **パッケージ** `cats.effect.kernel` に
+`Make` という名前で入れていたこと。`SymbolTable::companion_module` は
+「そのクラス自身の owner のメンバから同名の module を探す」ので、
+`Make` の owner である `Ref` を見にいって何も見つけられません。
+`Ref.Make` と**ソースに書けば**別経路でコンパニオンが作られて通る——だから
+順序依存に見えていました。修正は 1 行の意図どおりの owner に直しただけです。
+
+```rust
+// load_companion_module: 入れ子クラスのコンパニオンは、パッケージではなく
+// そのクラスを囲むものに属する。
+let owner = {
+    let o = self.st.get(class_id).owner;
+    if !o.is_none() && self.st.get(o).is_class_like() { o }
+    else { crate::classpath::ensure_package(&mut self.st, pkg) }
+};
+```
+
+#### 2. `type ExitCase is not a member of Resource$`
+
+`BasicBackend.scala:421`。**再現手段はこれです**——同じファイルが
+`fs2.Stream` を名前に出すこと。
+
+```scala
+def stream(s: fs2.Stream[cats.effect.IO, Int]): Int = 0
+def succeeded(e: Resource.ExitCase): Boolean = e == Resource.ExitCase.Succeeded
+```
+
+`fs2/Stream.class` を読むと、そのメンバ記述子が
+`cats/effect/kernel/Resource$ExitCase` に触れます。入れ子クラスファイル
+`Outer$Inner` は「`class Outer` と `object Outer` のどちらが宣言したか」を
+何も語らないので、`classpath::java_class_owner` は**常にクラスの方**を答えます。
+その結果 `ExitCase` は**トレイト `Resource`** のメンバとして入り、ソースの
+`Resource.ExitCase`（`Resource` **オブジェクト**を通る経路）は `Resource$` を
+探して見つけられません。`BasicBackend.scala` を単体でコンパイルすると
+逆の順序（`Resource$` から先に読む）になるので通っていた、というだけでした。
+
+修正は `classpath::install_java_class_in` に `enter_in_companion_scope` を足し、
+「訊いてきた owner が、いま持っている owner のコンパニオン module class なら、
+同じ記号をそちらのスコープにも入れる」ようにしたもの。記号は増やしませんし
+owner も書き換えません。両方の綴りが**1 つしかないクラス**に届くだけです。
+
+なお、`pickle_supply.rs` の `complete_type_member` はこの `None` を
+`tried_types` に**記憶する**ので、一度失敗すると以後ずっと失敗します。
+その入口に `SCALA_RS_PICKLE_DEBUG=1` の trace を足しました
+（`… : no pickle read -- the class has not been adopted yet`）。
+順序依存の「type X is not a member of Y$」はここから始まります。
+
+**前スライスの見立ての訂正**: 「パッケージオブジェクトの val 越しのネスト
+クラス」は `agent/implfind` の指摘どおり成り立ちません。ただし「供給の重複」
+でもなく、**入れ子クラスの owner がクラスかコンパニオンかを classfile 名から
+決められない**ことでした。
+
+#### 3. `cats.effect.IO(fa)` が `no matching overload`
+
+`DBIOAction.scala:237`。これも `fs2.Stream` を同じファイルに書けば単体で
+再現します。`IO.apply(thunk: => A): IO[A]` は**by-name 引数**なので、
+classfile の総称シグネチャには書けません（`(Lscala/Function0<TA;>;)…`）。
+classfile リーダの写しは `apply(Function0[A]): IO[A]` になり、`Future[R]` は
+どれにも当たりません。しかも pickle からの補完は
+「`lookup_member` が**何も**見つけられなかったときだけ」走るので、
+この誤った写しがある限り永久に直りません。scalac はコンパニオンの各メソッドを
+**クラス側の static forwarder** としても出すので、`cats/effect/IO` の側にも
+同じ erasure の `apply` が載ります（今回はそちらが選ばれていました）。
+
+`Check::retry_module_apply_from_pickle` を足しました。**「no matching overload
+を出す直前」でだけ**走り、レシーバのコンパニオン module class に対して
+`apply` を pickle から補完し、木を型付けし直します。何も新しく入らなければ
+`false` を返すので再帰しません。コンパニオンを先回りして adopt することは
+しません（`IO$` の adopt は ~200 メンバの完成を引き起こし、6 行のソースに
+分単位かかる——`supply_implicit_members` の doc コメントにあるとおり）。
+
+#### 再現手段（次に同じ形に当たった人へ）
+
+* **順序依存を疑ったら、記号がどこで作られたかを見る。**
+  `find_or_stub_java_class` に `std::backtrace::Backtrace::force_capture()` を
+  1 行足して slick を丸ごと 1 周させると、`Resource$ExitCase` を作った犯人が
+  `fill_java_members`（＝`fs2/Stream.class` を読んだとき）だと 1 回で出ます。
+  そこから「その classfile を読ませる 1 行」を書けば単体再現になります。
+* **ファイル集合の二分は要りませんでした。** 184 ファイルを削っていくより、
+  「誰がその記号を先に作ったか」を直接見る方が速い（1 周 ≒ 90 秒、二分は
+  最低でも 8 周）。
+* **同一ファイル内では、シグネチャの解決が本体の型付けより先**です。
+  だから「先に別のメンバを触っておく」形の warm-up は、同じファイルでも
+  2 ファイルでも `Resource.ExitCase` より先には来ません。効くのは
+  `parents_pass` 中に classfile を読ませる形（型として名前を書く）だけです。
+
+#### 残件（この節では直していません）
+
+* 暗黙引数節を持つメソッドを**明示的に**書き、期待型を与えた場合に
+  暗黙引数が挿入されません。slick には出てきませんが、同じ領域です。
+
+  ```scala
+  def a3[F[_]](implicit F: Async[F]): Ref.Make[F] = Ref.Make.concurrentInstance[F]
+  // type mismatch; found: (GenConcurrent[F, _])Make[F]  required: Make[F]
+  ```
+
+  `implicitly[Ref.Make[F]]` と `Ref.of[F, Long](n)` はどちらも通るので、
+  implicit 探索そのものではなく「明示参照に節を適用する」側です。
+* `cats.effect.IO` が**項の位置でクラス記号に解決される**ことがあります
+  （`IO$` がまだ記号表に無いとき）。3 の修正はその状態からでも動きますが、
+  本来は module に解決されるべきで、そこを直せば static forwarder を
+  選ぶこと自体が無くなります。
+* `IO(1, 2)` を nsc は `too many arguments` で拒否しますが、こちらは
+  自動タプル化して `IO[(Int, Int)]` にします（main からある差）。
+
 ## ライセンス
 
 Apache-2.0

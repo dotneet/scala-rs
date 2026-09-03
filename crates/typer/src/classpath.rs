@@ -850,6 +850,7 @@ pub fn install_java_class_in(
     if let Some(id) = find_by_jvm(st, &c.internal_name) {
         apply_java_class_meta(st, id, c);
         fill_java_members(st, id, c);
+        enter_in_companion_scope(st, id, owner, &c.internal_name);
         return id;
     }
     let flags = java_class_flags(c);
@@ -864,6 +865,46 @@ pub fn install_java_class_in(
     apply_java_class_meta(st, id, c);
     fill_java_members(st, id, c);
     id
+}
+
+/// A nested class file `Outer$Inner` does not say whether `Inner` was declared
+/// by `class Outer` or by `object Outer`, and [`java_class_owner`] always
+/// answers the *class*. Whichever spelling reaches the class file first is
+/// therefore the only one that can see it: with
+/// `cats/effect/kernel/Resource$ExitCase` entered while reading some other
+/// jar class's member descriptors (`fs2/Stream` mentions it), the owner is the
+/// trait `Resource`, and the source's `Resource.ExitCase` — a path through the
+/// `Resource` **object** — looked `ExitCase` up on `Resource$`, found nothing,
+/// and reported "type ExitCase is not a member of Resource$". Compiling
+/// `slick/basic/BasicBackend.scala` on its own got the other order and worked,
+/// which is what made the failure look like it needed the whole program.
+///
+/// So when the owner that *asked* is the companion module class of the owner
+/// that has it, enter the same symbol in its scope too. No second symbol is
+/// created and no owner is rewritten: both spellings simply reach the one
+/// class there is.
+fn enter_in_companion_scope(st: &mut SymbolTable, id: SymbolId, owner: SymbolId, internal: &str) {
+    if owner.is_none() || st.get(owner).kind != SymKind::ModuleClass {
+        return;
+    }
+    let held_by = st.get(id).owner;
+    if held_by == owner || held_by.is_none() || st.get(held_by).kind != SymKind::Class {
+        return;
+    }
+    let module_jvm = st.get(owner).jvm_name.clone();
+    let Some(outer) = module_jvm.strip_suffix('$') else {
+        return;
+    };
+    if outer.is_empty()
+        || st.get(held_by).jvm_name != outer
+        || !internal.starts_with(&format!("{outer}$"))
+    {
+        return;
+    }
+    if st.get(owner).members.contains(&id) {
+        return;
+    }
+    st.get_mut(owner).members.push(id);
 }
 
 fn java_class_flags(c: &crate::javaclass::JavaClass) -> Flags {
