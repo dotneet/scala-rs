@@ -1,0 +1,8 @@
+List((1,10), (2,20))
+false
+true
+HI
+7
+q+p+t
+coll
+coll

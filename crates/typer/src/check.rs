@@ -8658,6 +8658,35 @@ impl Typer {
         };
         if qual.ty.is_no_type() {
             self.type_expr(qual, &Type::NoType);
+            // A *qualifier* is never "an argument still waiting for its
+            // alternative": `pack` in `SV(pack.to[Seq], "x")` has to be a
+            // value before `to` can be looked up on it, exactly as nsc types
+            // a qualifier in EXPRmode and adapts it. `adapt_implicit_apply`
+            // bails while `typing_call_args` is set, which is about the
+            // *argument* tree, and letting that reach down into a qualifier
+            // inside it left slick's `ShapedValue(pack.to[Seq], …)` with
+            // `value to is not a member of (Shape[…])Query[R, U, C]`.
+            //
+            // Retried here rather than by clearing the flag around
+            // `type_expr` above: the flag also decides how a *tag* request
+            // inside the qualifier is answered, and clearing it wholesale
+            // made `weakTypeOf[ExBox[E]]` in `tests/fixtures/ex_impl.scala`
+            // pick the tag in scope for `E` instead of composing one
+            // (`ExBox[ExRow]` printed as `ExRow`). Only a clause that
+            // actually survived is retried.
+            if self.implicit_only_result(qual).is_some() {
+                let saved = std::mem::replace(&mut self.typing_call_args, false);
+                self.adapt_implicit_apply(qual, &Type::NoType);
+                self.typing_call_args = saved;
+            }
+            // …and a clause that could not be filled even then is the missing
+            // implicit, not `value to is not a member of (Sh[Int, R])Qy[R]`.
+            // `adapt`'s backstop never sees a qualifier: it is typed with no
+            // expected type at all.
+            if self.reject_unapplied_implicit_clause(qual) {
+                tree.ty = Type::Error;
+                return;
+            }
         }
         if name == "_" {
             self.error(
@@ -12929,7 +12958,7 @@ impl Typer {
                 Type::Repeated(e) => e.as_ref(),
                 other => other,
             };
-            let a = &self.align_to_param_class(p, a);
+            let a = &self.align_arg_to_param(p, a);
             let mut hit = unify_one(tp, p, a);
             // The same step for a *function* parameter: a `Map[K, V]` is a
             // `K => V`, and that is the shape `def map[B](f: A => B)` reads
@@ -13403,6 +13432,42 @@ impl Typer {
             Some(b) => b,
             None => arg.clone(),
         }
+    }
+
+    /// `align_to_param_class` where the parameter is a *function* type: the
+    /// lambda's result has to be lined up with the parameter's result class
+    /// too, not just the argument as a whole.
+    ///
+    /// `unify_one` zips type arguments positionally without consulting the
+    /// symbol table, so `flatMap[B](f: A => IterableOnce[B])` given a literal
+    /// whose body is a `Map[K, V]` zipped `[B]` against `[K, V]` and solved
+    /// `B = K`. `mapped.iterator.flatMap(_._2).toMap` (slick's
+    /// `CreateAggregates`) then asked for a `TermSymbol <:< (K, V)`, found
+    /// none, and left `toMap`'s implicit clause standing as the expression's
+    /// type — `value isEmpty is not a member of (<:<[TermSymbol, (K, V)])Map[K, V]`.
+    /// Only the *result* is realigned: a function parameter is contravariant,
+    /// and reading the literal's parameter as the expected one's base class
+    /// would throw away what the literal actually said.
+    fn align_arg_to_param(&self, param: &Type, arg: &Type) -> Type {
+        if let (
+            Type::Function {
+                params: pps,
+                ret: pr,
+            },
+            Type::Function {
+                params: aps,
+                ret: ar,
+            },
+        ) = (param, arg)
+        {
+            if pps.len() == aps.len() {
+                return Type::Function {
+                    params: aps.clone(),
+                    ret: Box::new(self.align_to_param_class(pr, ar)),
+                };
+            }
+        }
+        self.align_to_param_class(param, arg)
     }
 
     fn as_tuple_args(&self, ty: &Type) -> Option<Vec<Type>> {
@@ -14423,6 +14488,29 @@ impl Typer {
                 match self.search_implicit(&want) {
                     ImplicitSearch::Found(inner) => {
                         cargs.push(self.implicit_tree(inner, &want, span, depth + 1))
+                    }
+                    // A tag is *built*, not found. `fill_implicit_params` has
+                    // always known that; this recursion did not, so a rule
+                    // reached through another implicit could not have a
+                    // `ClassTag` parameter of its own even though
+                    // `implicitly[ClassTag[Seq[Any]]]` written out compiled.
+                    _ if self.classtag_apply_fallback(&want, span).is_some()
+                        || crate::materialize::tag_request(&self.st, &want).is_some() =>
+                    {
+                        match self.classtag_apply_fallback(&want, span) {
+                            Some(t) => cargs.push(t),
+                            None => match self.materialize_tag(&want, span) {
+                                Some(t) => cargs.push(t),
+                                None => {
+                                    let diverged = self.diverged_implicit.borrow().clone();
+                                    self.error(
+                                        span,
+                                        self.missing_implicit_message(&want, diverged),
+                                    );
+                                    return tree;
+                                }
+                            },
+                        }
                     }
                     _ => {
                         let diverged = self.diverged_implicit.borrow().clone();
@@ -16119,6 +16207,16 @@ impl Typer {
         // named outright is its own view.
         let bases = std::iter::once(arg.clone()).chain(self.st.base_type_seq(arg));
         for base in bases {
+            // `class Conv[-A, +B] extends (A => B)` — and `<:<` itself — record
+            // that parent as a structural `Type::Function`, not as an applied
+            // `Function1` *class*. Skipping it left `flatMap(ev)` on slick's
+            // `DBIOAction.flatten` with nothing to read `R2` out of: the
+            // conversion conformed (`val g: R => Act[R2] = ev` typed fine) but
+            // the callee's type parameters stayed open, and the call was
+            // reported as `no matching overload`.
+            if matches!(base, Type::Function { .. }) {
+                return Some(base);
+            }
             if let Type::Class { sym, args } = &base {
                 if let Some(f) = self.st.function_class_shape(*sym, args) {
                     return Some(f);

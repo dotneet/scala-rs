@@ -469,6 +469,7 @@ impl Typer {
                 let ok = paramss.iter().flatten().all(|p| {
                     let want = crate::symbol::subst_tparams_slice(&tps, &fit.targs, p);
                     self.search_implicit_at(&want, depth + 1).is_found()
+                        || self.built_not_found(&want)
                 });
                 self.open_implicits.borrow_mut().pop();
                 ok.then_some(fit)
@@ -482,6 +483,32 @@ impl Typer {
                 self.implicit_solve(id, &t, pt, undet)
             }
         }
+    }
+
+    /// An implicit that is *built* rather than found, so `search_implicit_at`
+    /// answering `None` says nothing about whether the parameter can be filled.
+    ///
+    /// `fill_implicit_params` has always had these fallbacks; the viability
+    /// check for a derivation rule did not, so a rule with a `ClassTag`
+    /// parameter of its own was judged unusable and never even tried.
+    /// `implicit def forColl[C[X] <: Iterable[X]](implicit cbf: Factory[Any,
+    /// C[Any]], tag: ClassTag[C[Any]]): TypedCollectionTypeConstructor[C]`
+    /// (slick's `ast/Type.scala`) is exactly that shape, and `q.to[Seq]` was
+    /// reported as a missing `TypedCollectionTypeConstructor[Seq]` while
+    /// `implicitly[ClassTag[Seq[Any]]]` on its own compiled fine.
+    ///
+    /// Deliberately only the tags: the view fallbacks (`identity_view`,
+    /// `array_wrap_view`, `conversion_view`) run their own searches and would
+    /// make a function-typed parameter look satisfiable without saying which
+    /// conversion answers it.
+    fn built_not_found(&self, want: &Type) -> bool {
+        if crate::materialize::tag_request(&self.st, want).is_some() {
+            return true;
+        }
+        matches!(want, Type::Class { sym, args }
+            if !args.is_empty()
+                && self.st.get(*sym).name == "ClassTag"
+                && self.st.companion_module(*sym).is_some())
     }
 
     /// nsc's "diverging implicit expansion": the same implicit is already being
