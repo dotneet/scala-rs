@@ -12182,6 +12182,168 @@ object HB { def s: String = "x" }              // ← DP より後ろにある�
   ——違います。`Predef` の型エイリアスが 1 本無いだけでした。
 * 「`FixRowNumberOrdering` は `agent/tq` が直した `(Applied, Wildcard)` の周辺」
   ——隣ですが別の腕（`Class`/`Class` の引数比較）でした。
+### コレクション引数まわり 7 件の 7 つの根（`agent/final1`）
+
+slick に残っていた「コレクションを引数に渡すところ」の 7 件を **1 件ずつ最小再現**
+したところ、**7 件で 7 つの根**でした（同じ症状も同じファイルも 1 根ではない、という
+これまでの観測どおり）。すべて実 scalac 2.13.16 で通ること／落ちることを先に確認して
+から直しています。slick は `errors=17 files_with_errors=13` →
+**`errors=10 files_with_errors=8`**（`tests/slick_measure.sh`。新規エラーは 0 件。
+エラーが消えたファイル: `util/ConstArray.scala`、`jdbc/JdbcModelBuilder.scala`、
+`jdbc/JdbcActionComponent.scala`、`compiler/ExpandSums.scala`、
+`compiler/MergeToComprehensions.scala`）。
+
+fixture は `tests/fixtures/final1.scala` の 1 ファイルに全ケース（＋異常系
+`final1_bad.scala`）、テストは `crates/cli/tests/final1.rs`。修正前の main
+（`d7e7767`）ではこの 1 ファイルで 12 件のエラーが出ます。
+
+**1. 自己別名 `self =>` に `apply` を挿せない。**
+`final class ConstArray[+T](a: Array[Any], val length: Int) { self => … }` の
+`def apply(idx: Int) = self(idx)` が
+`value apply is not a member of ConstArray.this.type`。`self` の型は
+`C.this.type`（`Type::ThisType`）で、`Select` 側はこれをクラスへ widen して
+メンバを引いていましたが、**適用側の `resolve_overload` には `ThisType` の腕が
+無く** `_ => None` で止まっていました。クラス自身の型引数を入れた
+`Type::Class` に読み替えて `Class` の腕へ委譲します。
+
+**2. 下限しか持たない型パラメータが、implicit 節の手前で確定しない。**
+`session.withPreparedInsertStatement(sql, keyColumns.toArray)` が
+`ambiguous overload … with arguments (String, Array[R])`。
+`ConstArray#toArray[R >: T : ClassTag]: Array[R]` の `R` が未確定のまま
+`Array[R]` として残り、`(String, Array[String])` と `(String, Array[Int])` の
+両方に適合していました。
+
+nsc は `adaptToImplicitMethod` で、implicit 節を探す**前に**
+`inferExprInstance(..., keepNothings = false)` を回します。`Nothing` になる変数は
+開いたまま（`take(Array.empty)` が引数の側で決まるのはこれ）ですが、実の下限を
+持つ変数は**その下限で確定**します。`solve_lower_bounded_undet` がそれで、下限は
+宣言のものではなく**受け手から見た**ものを使います（`R >: T` の `T` は
+`ConstArray[String]` では `String`）。
+
+`adapt_implicit_apply` 側にも手当てが要りました。「型パラメータを持つのに
+`TypeApply` でない」ものは witness 待ちで抜ける規則があり、`R` が消えた
+`(ClassTag[String])Array[String]` までそこで止まっていたためです。ただし
+「今の型がパラメータに言及しない」だけでは足りません——`type_mentions_wildcard`
+と違って `type_mentions_tparam` は**複合型の中を見ない**ので、slick の
+`BaseColumnType[U] = ScalaType[U] with BaseTypedType[U]` は「何にも言及していない」
+と読まれ、未代入の `U` で implicit 探索が走ります（fixture `ovl4` が落ちます）。
+**宣言の型と今の型を比べて、実際に代入が済んだ場合だけ**通します。
+
+**3. 「引数を型付け中」フラグが、遅延シグネチャ補完に漏れていた。**
+`m.Table(namer.qualifiedName, columns, primaryKey, buildForeignKeys(builders), indices)`
+の第 4 引数が `((Option[ForeignKey]) => IterableOnce[B])Seq[B]` という**未適用の
+メソッド型**になっていました。
+
+`typing_call_args` は「この式は、まだ引数の当たり先が決まっていない引数だ」という
+印で、`adapt_implicit_apply` が implicit 節を残す条件に使われます。ところがこれは
+**typer のフラグであって式のものではなく**、引数の途中から走る遅延シグネチャ補完が
+そのまま引き継いでいました。結果、前方参照された
+
+```scala
+final def buildForeignKeys(builders: Builders) =
+  mForeignKeys.map(mf => createForeignKeyBuilder(this, mf).buildModel(builders)).flatten
+```
+
+の `.flatten` の implicit 節（`A => IterableOnce[B]`）が埋まらず、それが
+**メソッドの推論結果型そのもの**になっていました。同じ定義を使用より上に書けば
+通る、というのが決め手です。`type_def_body` が本体を型付けする間だけフラグを
+落とします。`JdbcModelBuilder.scala:93` の `m.Model(… .map(_.buildModel(builders)))`
+はこのカスケードで、一緒に消えました。
+
+**4. 引数が持ち込んだ未確定変数を、join の前に最小化していなかった。**
+`tableFields.getOrElse(t.identity, Seq.empty)` が `Seq[AnyRef]` になり、その先の
+`f` が `AnyRef` になって
+`found: Some[(TableNode, ConstArray[((TypeSymbol, AnyRef), List[AnyRef])])]`。
+
+`getOrElse[V1 >: V]` の `V1` は「宣言された下限 `Vector[TermSymbol]`」と「引数
+`Seq.empty` の型」の join です。`Seq.empty` の `A` は未確定変数のままで、
+`lub(Vector[TermSymbol], Seq[?A])` は基底型を辿って両者が `Seq` で出会い、引数を
+join して `Seq[AnyRef]` を返していました。nsc は上から縛るものが無い変数を下限
+（既定では `Nothing`）に最小化してから join するので `Seq[TermSymbol]` です。
+`minimize_undet` を `unify_tparam_all` の join と、宣言下限との join の両方に
+入れました。
+
+**5. case class でないクラスにコンストラクタパターンを当てていた。**
+`case IfThenElse(ConstArray(Library.Not(…), ProductNode(ConstArray(Disc1, map)), …))`
+の `map` が `Node` ではなく `Int` に、`disc` が `Array[Any]` になり、
+`ProductNode(ConstArray(disc, map))` が `ConstArray[Any]` になっていました。
+
+SLS 8.1.6/8.1.7 では、コンストラクタパターンを持つのは **case class だけ**です。
+`ConstArray` は `final class ConstArray[+T](a: Array[Any], val length: Int)` で、
+コンパニオンに `unapplySeq` があります。こちらは「`ctor_fields` が空でなく、
+引数の数が合えばコンストラクタ」を先に見ていたので、`a: Array[Any]` と
+`length: Int` の 2 つを束縛していました。抽出子があるなら抽出子を使い、
+`ctor_fields` だけの腕は**抽出子が無いクラス**（それが必要だった場面）に残します。
+
+**6. レシーバが持ち込んだ未確定変数に、期待型が効かない。**
+`def sqlOptions(dbType: Option[String]): Set[ColumnOption[_]] =
+Set() ++ dbType.map(SqlType(_))` が `Set[SqlType]` になり、**不変**な `Set` が
+期待型を受け付けませんでした。`Set()` の `?A` は引数から `SqlType` と読まれた
+きりで、`Set[?A]` の `?A` は結果の不変位置にあるのに期待型が上書きしません。
+callee 自身の型パラメータには `add_expected_constraints` が同じことをしています
+（nsc の `instantiateExpecting`）。レシーバ由来の変数にも、
+**不変位置で、かつ引数の解が期待型に適合するときだけ**同じ規則を入れました。
+
+**7. 解くものが何も無い変換探索が、形だけの unify で通っていた。**
+6 を直しても
+`Set() ++ … ++ (if(!autoInc && !generated) convenientDefault else None)` の鎖は
+`Set[ColumnOption[Nothing]]` のままでした。最後の `++` の引数
+`Option[Default[_]]` に対し、**`Option.option2Iterable` が
+`IterableOnce[ColumnOption[Nothing]]` への view を名乗って**いたためです。それが
+通ると単相の `Set#++(IterableOnce[A]): Set[A]`（prelude の広げ役）が適用可能に
+なり、型パラメータを持たないので期待型に上書きされる余地も無くなります。
+
+根は `open_conversion_fit` で、**解くべき変数が候補側にも呼び出し側にも残って
+いない**とき、それでも `Unify` に判定させていたことです。`Unify` にとって
+ワイルドカードは何にでも合うので `Iterable[Default[_]]` が
+`IterableOnce[ColumnOption[Nothing]]` に「合って」しまいます。解くものが無い
+ときは適合そのものを訊く（`is_sub_type`）ようにしました。実 scalac もこの view
+を認めず、`Option[Default[_]]` を `IterableOnce[ColumnOption[Nothing]]` に
+渡す 3 つの形（`w2`/`w5`/`x2` 相当）を拒否します。
+
+**ブリーフの見立てとの照合。** 引き継がれた 3 つの仮説のうち、当たったものは
+ありません。
+
+* 「`Column$` の件の根は `proto_arg_type` の `!type_mentions_wildcard(p)`。
+  `ModuleRef` 経路を見よ」——**違います**。その除外を外し `ModuleRef` 経路に
+  「全 alternative が一致する具体的な引数型」を渡すようにしても数字は動きません
+  でした（改善そのものは正しいので残してあります）。同じ呼び出しは**ワイルドカードが
+  どこにも無くても**失敗します（`Set[ColumnOption[String]]` でも同じ）。根は上の
+  6 と 7 です。
+* 「`toArray` は下限に落とせばよい」——方向は合っていますが、**下限だけでは
+  足りません**。落とすのが implicit 節を探す前だ、というタイミングの方が本体です。
+* 「`Table$` の件は `agent/implclause` と同種の根の残り」——**別の根**です。
+  implicit 節が残ること自体は同じ症状ですが、原因は `typing_call_args` の
+  遅延補完への漏れで、`implclause` が直した 4 つとは無関係です。
+* `JdbcModelBuilder.scala:93` は 159 のカスケードでした（これは当たり）。
+
+**ついでに見つかった別件（この節では直していません）**
+
+* 期待型のない `val x = ca.toArray`（`toArray[R >: T : ClassTag]`）は、
+  implicit 節を残したまま `(ClassTag[R])Array[R]` が値の型になります。実 scalac は
+  `Array[String]` にします。2 を引数位置に限って入れたので、`val` の初期化子は
+  そのままです。
+* 抽象な `R` の `new Array[R](len)` を含むメソッドを持つクラスは、定数プールに
+  `[java/lang/Object` という擬似クラス名を書いてしまい `ClassFormatError` に
+  なります（型検査は通り、slick の計測にも出ません）。fixture では
+  `Array.tabulate[R]` で避けました。codegen 側の穴です。
+
+  ```scala
+  final class Holder[+T](a: Array[Any], val length: Int) {
+    def toArray[R >: T : ClassTag]: Array[R] = {
+      val ar = new Array[R](length)   // ClassFormatError: Illegal class name "[java/lang/Object"
+      ar
+    }
+  }
+  ```
+
+* `(0 until n).map(f).toSeq.toArray[R]` のように**明示型引数**を書いた
+  `toArray[R]` は `Array[T]` になり `found: Array[T] required: Array[R]`。
+  `agent/setmap` が記録した「明示型引数を書いたメンバ呼び出しが as-seen-from を
+  通らない」件と同じ形です。
+* `val y = Seq.empty` は `Seq[A]`（`A` は `Seq.empty` の型パラメータ）のままで、
+  `val z: Seq[Nothing] = y` が `found: Seq[A]`。未確定変数を値の型に残す設計の
+  副作用で、4 の最小化は引数位置だけに入れてあります。
 
 ## ライセンス
 

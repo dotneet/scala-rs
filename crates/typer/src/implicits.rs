@@ -1318,6 +1318,21 @@ impl Typer {
         if !u.unify(&ret_k, to) {
             return None;
         }
+        // With nothing left to solve on either side this whole pass is a
+        // *shape* check, and a wildcard unifies with anything: `Iterable[_]`
+        // was accepted for a wanted `IterableOnce[ColumnOption[Nothing]]`. So
+        // `Option.option2Iterable` answered the view out of an
+        // `Option[Default[_]]`, which made the monomorphic
+        // `Set#++(IterableOnce[A]): Set[A]` applicable and pinned the whole
+        // `Set() ++ …` chain at `Set[ColumnOption[Nothing]]` -- against an
+        // invariant `Set[ColumnOption[_]]` parameter
+        // (slick `jdbc/JdbcModelBuilder.scala:279`; real scalac has no such
+        // view here and takes the polymorphic `concat[B >: A]`). Where there
+        // is nothing to solve, conformance is the question, and
+        // `conversion_provides` has already asked it the honest way.
+        if rest.is_empty() && open.is_empty() && !self.st.is_sub_type(&ret_k, to) {
+            return None;
+        }
         let mut binds = Vec::new();
         for o in open {
             binds.push((*o, fold_applied(&u.solved(*o)?)));
