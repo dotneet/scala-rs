@@ -1092,6 +1092,18 @@ impl Typer {
         }
     }
 
+    /// Is `ty` the `scala.Function` module class?
+    ///
+    /// A bare `Function` in type position resolves to it, because the symbol
+    /// table has the module (nsc's `Function.chain`/`untupled` live there) but
+    /// not `Predef`'s `type Function[-A, +B] = Function1[A, B]`. Applied to two
+    /// arguments the name means the alias, never the module.
+    fn is_scala_function_module(&self, ty: &Type) -> bool {
+        self.st
+            .class_sym_of(ty)
+            .is_some_and(|s| self.st.get(s).jvm_name == "scala/Function$")
+    }
+
     /// Apply `args` to a type constructor, diagnosing kind mismatches.
     fn apply_types(&mut self, ctor: Type, args: Vec<Type>, span: Span) -> Type {
         if args.is_empty() {
@@ -3435,6 +3447,7 @@ impl Typer {
             && matches!(tree.kind, TreeKind::ValDef { .. } | TreeKind::DefDef { .. })
             && !self.sig_done.insert((self.file_index, tree.id))
         {
+            self.retry_overridden_ret(tree);
             return;
         }
         match &tree.kind {
@@ -3464,6 +3477,66 @@ impl Typer {
         ) {
             self.register_typed_sig(tree);
         }
+    }
+
+    /// Second chance at `overridden_ret_type` for an `override def` that wrote
+    /// no result type.
+    ///
+    /// `overridden_ret_type` deliberately does not force a candidate's
+    /// signature (doing so measured 155 slick errors -> 307), so it can only
+    /// read one that is already known. During the signature pass that is a
+    /// matter of command-line order: `memory/DistributedProfile.scala`'s
+    /// `override def run(n: Node) = … run(from) …` is walked before
+    /// `memory/QueryInterpreter.scala`, whose `def run(n: Node): Any` states
+    /// the very type it wants, so the search found nothing and the method
+    /// stayed inference-bound -- and its own self-call then reported
+    /// `recursive method run needs result type`. By the body pass every
+    /// written signature is in place, so the search is simply run again on a
+    /// method that is *still* without a result type. Nothing else about the
+    /// signature is redone: no evidence parameter or default getter is
+    /// synthesized twice.
+    pub(crate) fn retry_overridden_ret(&mut self, tree: &mut Tree) {
+        if self.sigs_only {
+            return;
+        }
+        let TreeKind::DefDef {
+            mods, name, tpt, ..
+        } = &tree.kind
+        else {
+            return;
+        };
+        if !tpt.is_empty() || name == "<init>" || !mods.flags.contains(Flags::OVERRIDE) {
+            return;
+        }
+        let name = name.clone();
+        let sym = tree.sym;
+        if sym.is_none() {
+            return;
+        }
+        let Type::Method { paramss, ret } = self.st.get(sym).ty.clone() else {
+            return;
+        };
+        if !ret.is_no_type() {
+            return;
+        }
+        let owner = self.st.get(sym).owner;
+        let my_ps: Vec<Type> = paramss.iter().flatten().cloned().collect();
+        let Some(found) = self.overridden_ret_type(owner, &name, &my_ps) else {
+            return;
+        };
+        if found.is_no_type() || found.is_error() {
+            return;
+        }
+        let mty = Type::Method {
+            paramss,
+            ret: Box::new(found),
+        };
+        tree.ty = mty.clone();
+        self.st.get_mut(sym).ty = mty;
+        // With a result type there is nothing left to infer, so the method is
+        // no longer lazy: leaving it pending would make its own recursive call
+        // re-enter `complete_lazy_sig` and report the cycle this just removed.
+        self.drop_lazy_sig(sym);
     }
 
     fn type_member_body(&mut self, tree: &mut Tree) {
@@ -18690,12 +18763,40 @@ impl Typer {
                             }
                         }
                     }
-                    Some("Function") => match self.tree_to_type(tpt) {
-                        Type::Class { sym, .. } => {
-                            self.apply_types(Type::Class { sym, args: vec![] }, as_, span)
+                    // `Predef.Function[A, B]` / `scala.Predef.Function[A, B]`
+                    // names the alias explicitly; there is no such member to
+                    // resolve, so answer before `tree_to_type` reports one.
+                    Some("Function")
+                        if as_.len() == 2
+                            && matches!(&tpt.kind, TreeKind::Select { qual, .. }
+                                if qual.name() == Some("Predef")) =>
+                    {
+                        Type::Function {
+                            params: vec![as_[0].clone()],
+                            ret: Box::new(as_[1].clone()),
                         }
-                        ctor => self.apply_types(ctor, as_, span),
-                    },
+                    }
+                    Some("Function") => {
+                        let ctor = self.tree_to_type(tpt);
+                        // `Predef` aliases `type Function[-A, +B] = Function1[A, B]`,
+                        // so a bare applied `Function[A, B]` is a function type. The
+                        // name otherwise resolves to the `scala.Function` *module*
+                        // class, whose kind arity is 0 -- without this it drew
+                        // "Function does not take type parameters".
+                        if as_.len() == 2 && self.is_scala_function_module(&ctor) {
+                            Type::Function {
+                                params: vec![as_[0].clone()],
+                                ret: Box::new(as_[1].clone()),
+                            }
+                        } else {
+                            match ctor {
+                                Type::Class { sym, .. } => {
+                                    self.apply_types(Type::Class { sym, args: vec![] }, as_, span)
+                                }
+                                ctor => self.apply_types(ctor, as_, span),
+                            }
+                        }
+                    }
                     // `<tuple>` is the parser's marker for a parenthesised
                     // type list; outside a function type it is just a tuple.
                     Some(n) if numbered_arity(n, "Tuple") == Some(as_.len()) || n == "<tuple>" => {

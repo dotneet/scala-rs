@@ -260,12 +260,43 @@ impl Typer {
             return;
         }
         if self.lazy_completing.contains(&id) {
+            // Re-entering a completion is only a cycle while the type is still
+            // being *inferred*. `retry_overridden_ret` can install the result
+            // type an `override def` borrows from its parent after this
+            // completion has already started, and from that moment the
+            // recursive call inside the body has a type to use -- reporting
+            // "recursive method run needs result type" against it would
+            // contradict the signature the symbol now carries.
+            let known = match &self.st.get(id).ty {
+                Type::Method { ret, .. } => !ret.is_no_type(),
+                ty => !ty.is_no_type(),
+            };
+            if known {
+                return;
+            }
             self.report_cyclic_sig(id, span);
             return;
         }
         let Some(p) = self.pending_sigs.remove(&id) else {
             return;
         };
+        // Everything needed to put the definition back if this completion
+        // turns out to have run too early (see the check after it).
+        let retry = self.sigs_only.then(|| {
+            (
+                self.diags.len(),
+                PendingSig {
+                    tree: p.tree.clone(),
+                    owner: p.owner,
+                    this_class: p.this_class,
+                    scopes: p.scopes.clone(),
+                    sig_done: p.sig_done,
+                    file_index: p.file_index,
+                },
+                self.st.get(id).ty.clone(),
+                self.lazy_cyclic.contains(&id),
+            )
+        });
         self.lazy_completing.push(id);
         let saved_owner = self.st.owner;
         let saved_this = self.st.this_class;
@@ -302,6 +333,13 @@ impl Typer {
                 } else {
                     self.type_def_sig(&mut t);
                 }
+            } else {
+                // `sig_done` means `type_def_sig` ran during the signature
+                // pass, where an `override def` with no result type may have
+                // found nothing to borrow only because the overridden member's
+                // own file had not been walked yet. This is the last point
+                // before the body is typed, so ask again.
+                self.retry_overridden_ret(&mut t);
             }
             if is_val {
                 self.type_val_body(&mut t);
@@ -316,6 +354,50 @@ impl Typer {
         self.return_meth = saved_ret;
         self.file_index = saved_file;
         self.lazy_completing.pop();
+        // A completion forced during the signature pass can read a member
+        // whose *own* signature that pass has not reached yet. Only definitions
+        // without a written type are deferred here, so `def s: String` in an
+        // object further down the command line is still `<notype>` while it is
+        // being read, and the inferred type comes out `<notype>` too --
+        // permanently, because the result is cached below. slick's
+        // `val emptyHeapDB = HeapBackend.createEmptyDatabase` was forced this
+        // way by the nested `class DistributedQueryInterpreter(...) extends
+        // QueryInterpreter(emptyHeapDB, param)` (a nested template's parents
+        // are typed in the enclosing template's *signature* phase), and the
+        // parent clause then reported `no matching overload for constructor
+        // QueryInterpreter with arguments (<notype>, Any)`.
+        //
+        // nsc has a lazy completer on every symbol, so the annotated member
+        // would simply be completed on demand. We only defer the unannotated
+        // ones, so instead: a signature-pass completion that produced nothing
+        // is undone -- diagnostics and all -- and left pending for the body
+        // pass, by which time every written signature is in place.
+        //
+        // A cycle reported *by this completion, about this very symbol* is
+        // undone for the same reason. `override def run(n: Node) = … run(from)
+        // …` is only self-recursive because `overridden_ret_type` could not
+        // read `QueryInterpreter.run(n: Node): Any` yet -- exactly the
+        // signature-pass ordering above -- so reporting "recursive method run
+        // needs result type" here is premature. The body pass runs the
+        // override search again (`retry_overridden_ret`) and, if the method
+        // really has nothing to borrow, types the body and reports the cycle
+        // there instead.
+        if let Some((mark, again, saved_ty, was_cyclic)) = retry {
+            let cyclic_now = !was_cyclic && self.lazy_cyclic.contains(&id);
+            let unresolved = match &self.st.get(id).ty {
+                Type::Method { ret, .. } => ret.is_no_type(),
+                ty => ty.is_no_type(),
+            };
+            if unresolved || cyclic_now {
+                self.diags.truncate(mark);
+                if cyclic_now {
+                    self.lazy_cyclic.remove(&id);
+                    self.st.get_mut(id).ty = saved_ty;
+                }
+                self.pending_sigs.insert(id, again);
+                return;
+            }
+        }
         self.lazy_done.insert(id, t);
     }
 

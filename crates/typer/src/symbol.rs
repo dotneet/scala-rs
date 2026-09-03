@@ -1655,6 +1655,34 @@ impl SymbolTable {
                 };
             }
         }
+        // `FunctionN[-T1, …, -Tn, +R]` is a class like any other, but it has
+        // its own `Type` variant and so never reached the arm above: the lub of
+        // `String => Timestamp` and `String => String` walked the base type
+        // sequence and answered `AnyRef`. slick's SQLite model builder holds a
+        // `Seq` of exactly such mixed converters, and `convertors.iterator.map(fn
+        // => Try(fn(v2)))` then said `value apply is not a member of AnyRef`.
+        if let (
+            Type::Function {
+                params: p1,
+                ret: r1,
+            },
+            Type::Function {
+                params: p2,
+                ret: r2,
+            },
+        ) = (&a, &b)
+        {
+            if p1.len() == p2.len() {
+                return Type::Function {
+                    params: p1
+                        .iter()
+                        .zip(p2.iter())
+                        .map(|(x, y)| self.glb(x, y))
+                        .collect(),
+                    ret: Box::new(self.lub(r1, r2)),
+                };
+            }
+        }
         // Not just `a`'s ancestors: `None` (`<: Option[Nothing]` only) paired
         // with `Some[Boolean]` (`<: Option[Boolean]`) has no match walking
         // only `a`'s chain (`Some[Boolean] <: Option[Nothing]` is false, since
@@ -1862,6 +1890,30 @@ impl SymbolTable {
                             .get(i)
                             .map(|&tp| self.get(tp).flags)
                             .unwrap_or(Flags::EMPTY);
+                        // `C[_]` for `class C[+F <: Option[Node]]` is
+                        // `C[_$1] forSome { type _$1 <: Option[Node] }`: the
+                        // parameter's own bound is the wildcard's. Without it
+                        // `C[_] <: C[Option[Node]]` asked `_ <: Option[Node]`
+                        // with nothing to answer from and said no, and slick's
+                        // `case (c: Comprehension[?], _) => fix(ch, Some(c))`
+                        // reported `no matching overload … with arguments
+                        // (Node, Some[Comprehension[_]])`. Only the *left*
+                        // side is widened: a wildcard on the right already
+                        // contains everything.
+                        let bounded;
+                        let x = match (x, tparams.get(i)) {
+                            (Type::Wildcard, Some(&tp)) => match self.get(tp).bound_hi.clone() {
+                                Some(hi) => {
+                                    bounded = Type::BoundedWildcard {
+                                        lo: None,
+                                        hi: Some(Box::new(hi)),
+                                    };
+                                    &bounded
+                                }
+                                None => x,
+                            },
+                            _ => x,
+                        };
                         if flags.contains(Flags::CONTRAVARIANT) {
                             if is_wildcard_arg(y) {
                                 // A wildcard argument stands for *some* type,

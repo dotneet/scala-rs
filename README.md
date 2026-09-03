@@ -12052,6 +12052,137 @@ unify する必要があるので、そこも 1 行足してあります。
   `checkcast` するので `ClassCastException` になります。これも main からある件で、
   fixture では要素代入で配列を作って避けました。
 
+### `Predef.Function`、シグネチャパスの順序、関数型の lub（`agent/final3`）
+
+slick に残っていた単発 7 件を個別に最小再現したところ、**5 つの根**でした。
+6 件が消え、1 件が残っています。slick は `errors=17 files_with_errors=13` →
+**`errors=11 files_with_errors=9`**（`tests/slick_measure.sh`。新規エラーはゼロ。
+エラーが消えたファイル: `lifted/Shape.scala`、`relational/RelationalProfile.scala`、
+`memory/DistributedProfile.scala`、`compiler/FixRowNumberOrdering.scala`）。
+fixture は `tests/fixtures/final3.scala`（単一ファイルの全ケース）、
+`final3_use.scala` ＋ `final3_def.scala`（**コマンドラインの順序**が再現条件なので
+2 ファイル必要）、`final3_bad.scala`。テストは `crates/cli/tests/final3.rs`。
+修正前の main（`d7e7767`）では 5 本中 4 本が落ちます。
+
+**診断の言葉は 1 件も根を指していませんでした。** 以下、診断ではなく根で並べます。
+
+**1. `Function` は `Predef` の型エイリアスであって `scala.Function` オブジェクト
+ではない。** `Shape.scala:397` の `def genericFastPath(f: Function[Any, Any])` が
+`Function does not take type parameters`。ブリーフの見立て（型ラムダ
+`({ type L[X] = … })#L`、`agent/probe12` の残件と同じ根かもしれない）は**外れ**で、
+型ラムダはまったく関係ありません。`scala.Predef` は
+
+```scala
+type Function[-A, +B] = Function1[A, B]
+```
+
+を宣言していますが（実 scalac 2.13.16 で確認）、シンボル表にはこのエイリアスが無く、
+`prelude_fntuple.rs` が入れている `object Function`（`Function.untupled` の置き場）の
+モジュールクラス（kind arity 0）に解決されていました。`tree_to_type` の
+`AppliedTypeTree` に `Function` の腕はもともとあって（`java.util.function.Function`
+用）、そこで解決先が `scala/Function$` のときだけ 2 引数を関数型に読み替えます。
+`java.util.function.Function[A, B]` は arity 2 の interface に解決されるので影響を
+受けません。`Predef.Function[A, B]` と明示的に書いた形も、解決を試みる前に受け付けます。
+
+**2. `RelationalProfile.scala:82` の `missing parameter type for expanded function`
+は 1 の 1 段下流。** `genericFastPath` のパラメータ型が `<error>` なので、渡している
+パターンマッチ匿名関数に期待型が降りてこないだけでした。**3 行で両方同時に再現します**:
+
+```scala
+object A1 {
+  def genericFastPath(f: Function[Any, Any]): Any = f("x")
+  val r: Any = genericFastPath(x => x)
+}
+```
+
+**3. シグネチャパス中に強制した lazy completion が、まだ型の付いていない
+「明示注釈付きメンバ」を読んでいた。** `DistributedProfile.scala:76` の
+`no matching overload for constructor QueryInterpreter with arguments (<notype>, Any)`。
+`<notype>` は第 1 引数の `val emptyHeapDB = HeapBackend.createEmptyDatabase` です。
+`createEmptyDatabase: AnyHeapDatabaseDef` は結果型を**書いている**ので lazy 対象では
+なく、その型は `HeapBackend.scala` がシグネチャパスで歩かれたときに初めて入ります。
+ところが `memory/DistributedProfile.scala` はコマンドライン順で先です。さらに、
+**入れ子テンプレートの親句は外側テンプレートの「シグネチャ相」で型付けされる**ので
+（`type_class` は本体の全メンバのシグネチャ → 全メンバの本体、の順）、
+`class DistributedQueryInterpreter(...) extends QueryInterpreter(emptyHeapDB, param)`
+が `emptyHeapDB` をそこで強制し、`<notype>` のまま `lazy_done` に**恒久キャッシュ**
+されていました。nsc は全シンボルに lazy completer を持つので起きません。
+`complete_lazy_sig` を、**シグネチャパス中に走った完了が何も決められなかったとき、
+診断ごと巻き戻して pending に戻す**ようにしました。ボディパスの時点では書かれた
+シグネチャは全部入っているので、そこで正しく決まります。10 行で再現します。
+
+```scala
+class QI(db: String, param: Any)
+class DP {
+  val v = HB.s
+  class Sub(param: Any) extends QI(v, param)   // no matching overload … (<notype>, Any)
+}
+object HB { def s: String = "x" }              // ← DP より後ろにあることが条件
+```
+
+**4. `recursive method run needs result type` は 3 のカスケードでは
+ありませんでした**（3 を直しても残りました）。同じ順序問題の別の消費者です。
+`overridden_ret_type` は「候補のシグネチャを強制しない」と決めてあり
+（強制すると slick 155 件 → 307 件になった、とコメントに実測が残っています）、
+`memory/QueryInterpreter.scala` の `def run(n: Node): Any` はまだ型が入っていないので
+`override def run(n: Node) = …` は借りる先を見つけられず、推論待ちのまま自己再帰を
+踏んでいました。**ボディが型付けされる直前にもう一度だけ探索し直す**
+（`retry_overridden_ret`）ようにし、あわせて **`complete_lazy_sig` の再入検査を
+「型がまだ決まっていないときだけ循環」** に変えました（結果型が既に入った時点で
+再帰呼び出しは循環ではありません）。この 2 つが揃って初めて消えます
+（片方だけでは数字が動きませんでした——ブリーフの「1 つ直して数字が動かなくても
+無関係と結論しないこと」がそのまま当たりました）。
+
+**5. 関数型の lub が `AnyRef` に落ちていた。** `SQLiteProfile.scala:138` の
+`value apply is not a member of AnyRef`。`Seq((s: String) => Timestamp…, (s: String) => …String)`
+の要素型です。`lub` には「同じクラスで引数だけ違うなら引数を join する」腕が
+ありますが、`FunctionN` は `Type::Function` という独自のバリアントなのでそこに
+入らず、基底型列を歩いて `AnyRef` になっていました。`Function` 同士・同アリティなら
+パラメータは `glb`（反変）、結果は `lub`（共変）で join します。
+
+**6. ワイルドカード型引数は、その型パラメータの宣言境界を持つ。**
+`FixRowNumberOrdering.scala:19` の
+`no matching overload for (Node, Option[Comprehension[Option[Node]]])Node with arguments (Node, Some[Comprehension[_]])`。
+`final case class Comprehension[+Fetch <: Option[Node]]` なので
+`Comprehension[_]` は `Comprehension[_$1] forSome { type _$1 <: Option[Node] }` です。
+`is_sub_type` の `Class`/`Class` 同一シンボル腕で、**左辺**の裸の `Wildcard` を
+その型パラメータの `bound_hi` を上限とする `BoundedWildcard` に読み替えます。
+右辺は触りません（右辺のワイルドカードは既に何でも含みます）。`agent/tq` が直した
+`(Applied, Wildcard)` とは別の場所です。**緩和のみ**なので、これまで通っていた形が
+落ちることはありません。境界が効いていることは `final3_bad.scala` で確認しています
+（`ComprB[_]` は `ComprB[Some[NdB]]` ではない。実 scalac も
+`type mismatch; found: ComprB[_] required: ComprB[Some[NdB]]` と言います）。
+
+**残件（最小再現と診断まで）**
+
+* `jdbc/SQLiteProfile.scala:183`。
+  `no matching overload for (Iterable[U], JdbcActionComponent.RowsPerStatement)…
+  with arguments (Iterable[U], RowsPerStatement)` ——両辺は接頭辞を除けば同じ名前です。
+  `JdbcActionComponent` は
+
+  ```scala
+  type RowsPerStatement >: slick.jdbc.RowsPerStatement.One.type <: slick.jdbc.RowsPerStatement
+  ```
+
+  という**境界付き抽象型メンバ**を持ち、`MultipleRowsPerStatementSupport` が
+  `override type RowsPerStatement = slick.jdbc.RowsPerStatement` で具体化します。
+  `SQLiteProfile` はそれを mixin しているので実 scalac では同一ですが、こちらは
+  親の宣言側の抽象型メンバを派生側の具体化を通して as-seen-from できていません。
+  この節の 5 つの根とは形が違い、抽象型メンバの精練の一般的な扱いに入るため
+  手を付けていません。
+
+**ブリーフの見立てとの差分**
+
+* 「7 件すべて別の根と思って始めてください」——実際は 7 件 5 根で、
+  `Shape.scala:397` と `RelationalProfile.scala:82` は同一根の 1 段違いでした。
+* 「`DistributedProfile.scala` は `recursive method run` が根で `:76` が
+  カスケードかもしれない」——**逆でも同じでもなく、独立した 2 根**でした。
+  `:76` を直しても `:91` は残り、別の修正が要りました。
+* 「`Shape.scala:397` は型ラムダかもしれない（`agent/probe12` の残件と同じ根か）」
+  ——違います。`Predef` の型エイリアスが 1 本無いだけでした。
+* 「`FixRowNumberOrdering` は `agent/tq` が直した `(Applied, Wildcard)` の周辺」
+  ——隣ですが別の腕（`Class`/`Class` の引数比較）でした。
+
 ## ライセンス
 
 Apache-2.0
