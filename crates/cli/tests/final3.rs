@@ -270,7 +270,10 @@ fn real_scalac_dual_run_final3_pair() {
         .args(["-d", ref_out.to_str().unwrap()])
         .status()
         .expect("scalac");
-    assert!(status.success(), "real scalac failed to compile final3 pair");
+    assert!(
+        status.success(),
+        "real scalac failed to compile final3 pair"
+    );
     let jar_s = jar.to_str().unwrap();
     let reference = run_java(&ref_out, "final3use.Main", Some(jar_s));
     assert_eq!(
