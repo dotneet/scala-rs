@@ -12065,7 +12065,7 @@ slick に残っていた「コレクションを引数に渡すところ」の 7
 
 fixture は `tests/fixtures/final1.scala` の 1 ファイルに全ケース（＋異常系
 `final1_bad.scala`）、テストは `crates/cli/tests/final1.rs`。修正前の main
-（`d7e7767`）ではこの 1 ファイルで 11 件のエラーが出ます。
+（`d7e7767`）ではこの 1 ファイルで 12 件のエラーが出ます。
 
 **1. 自己別名 `self =>` に `apply` を挿せない。**
 `final class ConstArray[+T](a: Array[Any], val length: Int) { self => … }` の

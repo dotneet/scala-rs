@@ -64,7 +64,10 @@ object Main {
   //     unify」で通っていたせいで単相の `++(IterableOnce[A]): Set[A]` が
   //     適用可能になり、鎖全体が `Set[ColOpt[Nothing]]` に落ちていた。
   def options(dbType: Option[String], autoInc: Boolean, dflt: Option[DefaultOpt[_]]): Set[ColOpt[_]] =
-    sqlOptions(dbType) ++ (if (autoInc) Some(AutoInc) else None) ++ dflt
+    Set() ++
+      dbType.map(s => SqlType(s)) ++
+      (if (autoInc) Some(AutoInc) else None) ++
+      dflt
 
   def fuse(n: Node): String = n match {
     case Prod(CArr(a, b)) => "prod(" + describe(a) + "," + describe(b) + ")"
