@@ -7,7 +7,7 @@ use crate::classfile::{
 };
 use crate::code::{Assembler, Label, StackEntry};
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
-use scala_rs_typer::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_typer::{Intrinsic, SeqPayload, SymKind, SymbolTable};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
@@ -1688,6 +1688,42 @@ fn is_trait_owned_term(st: &SymbolTable, id: SymbolId) -> bool {
     }
     let o = s.owner;
     !o.is_none() && is_interface_sym(st, o) && !is_module_class(st, o)
+}
+
+/// A class's `val` / `var` member is read through its accessor, not its field.
+///
+/// scala-rs emits such a field public and used to read it with `getfield` on
+/// the class that *declares* it. A subclass's `override val` has a slot of its
+/// own, so the override was invisible (`(new A: P).pre` gave the parent's
+/// value), and an `abstract val` read a slot nothing ever wrote (`null`).
+/// nsc calls the accessor for every member value that is not `private`, and
+/// virtual dispatch then lands on whichever class actually holds the value.
+///
+/// Constructor parameters (`case class C(name: String)`) keep the direct read:
+/// they are the hot path, and the synthesized members that back them
+/// (`equals`, `copy`, `productElement`) read the field too.
+fn reads_via_accessor(st: &SymbolTable, id: SymbolId) -> bool {
+    if id.is_none() {
+        return false;
+    }
+    let s = st.get(id);
+    if s.kind != SymKind::Term
+        || s.flags.contains(Flags::PARAM)
+        || s.flags.contains(Flags::STATIC)
+        || s.flags.contains(Flags::PRIVATE)
+        || !s.jvm_name.is_empty()
+    {
+        return false;
+    }
+    let o = s.owner;
+    // Only classes compiled in this run: those are the ones scala-rs emits an
+    // accessor for. A prelude or classfile symbol says how to reach it in
+    // `jvm_name` (empty means "read the field", which is right for the private
+    // runtime's `Tuple2._1`).
+    !o.is_none()
+        && st.get(o).is_class_like()
+        && !is_interface_sym(st, o)
+        && st.source_classes.contains(&o)
 }
 
 fn trait_static_desc(iface: &str, inst_desc: &str) -> String {
@@ -7248,7 +7284,13 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
                 // accessor to call instead (`StringContext.parts`). Its
                 // *result* is a method result, so `Unit` is `V` there even
                 // though the field itself is a `BoxedUnit`.
-                if sym.jvm_name.is_empty() {
+                if reads_via_accessor(ctx.st, id) {
+                    asm.invokevirtual(
+                        &owner,
+                        &sym.name,
+                        &format!("(){}", jvm_desc(ctx.st, &sym.ty)),
+                    );
+                } else if sym.jvm_name.is_empty() {
                     emit_getfield(asm, &owner, &sym.name, &desc);
                 } else {
                     let acc = sym.jvm_name.clone();
@@ -7400,6 +7442,12 @@ fn gen_java_class_of(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
             asm.ldc_class(&class_internal(ctx.st, *sym));
         }
         Type::Named { name, .. } => asm.ldc_class(&name.replace('.', "/")),
+        // An array's class-literal constant is spelled with its *descriptor*
+        // (`[I`, `[[I`, `[Ljava/lang/String;`), not an internal name. Falling
+        // through to `java/lang/Object` gave `Array(Array(1, 2), Array(3, 4))`
+        // a `ClassTag[Object]`, so `Array.apply` built an `Object[]` and the
+        // `checkcast [[I` on the result threw `ClassCastException`.
+        Type::Array(_) => asm.ldc_class(&jvm_desc(ctx.st, ty)),
         _ => asm.ldc_class("java/lang/Object"),
     }
 }
@@ -7510,7 +7558,13 @@ fn gen_select(
                 } else {
                     let owner = class_internal(ctx.st, s.owner);
                     let desc = jvm_desc_val(ctx.st, &s.ty);
-                    if s.jvm_name.is_empty() {
+                    if reads_via_accessor(ctx.st, tree.sym) {
+                        asm.invokevirtual(
+                            &owner,
+                            &s.name,
+                            &format!("(){}", jvm_desc(ctx.st, &s.ty)),
+                        );
+                    } else if s.jvm_name.is_empty() {
                         emit_getfield(asm, &owner, &s.name, &desc);
                     } else {
                         let acc = s.jvm_name.clone();
@@ -9620,6 +9674,17 @@ fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, fun: &Tre
                 load_module_instance(asm, ctx, module_class_id(ctx.st, owner));
             } else if owner == ctx.class_sym || owner.is_none() {
                 load_this(asm, ctx);
+            } else if !is_owner_compatible(ctx.st, ctx.class_sym, owner)
+                && outer_chain_reaches(ctx.st, ctx.class_sym, owner)
+            {
+                // The method lives further out than `this`: a class nested in
+                // another class reaches the enclosing instance's methods
+                // through `$outer`, exactly as reading an enclosing *field*
+                // already did. Casting `this` to the enclosing class instead
+                // compiled clean and threw `ClassCastException` on the first
+                // call (`class Outer { def deco(s: String) = …; class Inner {
+                // def q(c: String) = deco(c) } }`).
+                load_owner_instance(asm, ctx, owner);
             } else {
                 load_this(asm, ctx);
                 maybe_checkcast_owner(asm, ctx, owner);
@@ -13068,6 +13133,23 @@ fn seq_pat_shape(st: &SymbolTable, uid: SymbolId) -> SeqPatShape {
     SeqPatShape::List
 }
 
+/// How the `Option`'s payload of a *user-written* `unapplySeq` has to be read.
+///
+/// `seq_pat_shape` only knows the built-in companions; everything else fell to
+/// `SeqPatShape::List`, and the cons walk opens with `checkcast List`. That is
+/// right only when the extractor declares `Option[List[A]]`. The natural
+/// spelling is `Option[Seq[A]]` -- `Some(s.split(" ").toSeq)` hands back an
+/// `ArraySeq$ofRef` -- and the cast blew up at runtime. scalac reads any
+/// non-`List` sequence through `SeqFactory$UnapplySeqWrapper$` (an `Array`
+/// through `Array$UnapplySeqWrapper$`), which is what those shapes emit.
+fn user_unapply_seq_shape(ctx: &EmitCtx, uid: SymbolId) -> SeqPatShape {
+    match ctx.st.seq_extractor_payload.get(&uid) {
+        Some(SeqPayload::Array) => SeqPatShape::Array,
+        Some(SeqPayload::Seq) => SeqPatShape::SeqOps,
+        None => SeqPatShape::List,
+    }
+}
+
 /// Kept in step with `prelude_seqpat::SEQ_FACTORY_MODULES` in the typer;
 /// a companion listed there but not here would fall back to the `List` walk
 /// and `checkcast` a `Vector` to a `List` at runtime.
@@ -15810,6 +15892,12 @@ fn sb_append_string(asm: &mut Assembler, s: &str) {
 fn gen_sb_append(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, value: &Tree) {
     let desc = match &value.ty {
         Type::Unit | Type::NoType => {
+            // `s"x ${println(1)}"` still *runs* the expression; only its value
+            // is the constant `"()"`. Emitting the literal alone dropped the
+            // side effect, so the interpolation printed `x ()` and the `1`
+            // never appeared. `gen_stat` is the statement form: it discards
+            // whatever the call really leaves on the stack.
+            gen_stat(asm, frame, ctx, value);
             asm.ldc_string("()");
             "(Ljava/lang/String;)Ljava/lang/StringBuilder;"
         }
@@ -16510,7 +16598,15 @@ fn gen_unapply_pattern(
     asm.mark(nonempty);
     asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
     if is_seq {
-        gen_unapply_seq_bind(asm, frame, ctx, args, fail);
+        let payload = if ctx.library_abi {
+            user_unapply_seq_shape(ctx, uid)
+        } else {
+            SeqPatShape::List
+        };
+        match payload {
+            SeqPatShape::List => gen_unapply_seq_bind(asm, frame, ctx, args, fail),
+            other => gen_unapply_wrapper_bind(asm, frame, ctx, args, fail, other),
+        }
         return;
     }
     if args.len() <= 1 {

@@ -431,6 +431,27 @@ pub struct SymbolTable {
     /// one) arrives from a classfile instead, where a by-name parameter is
     /// indistinguishable from a `Function0`. This is the line between the two.
     pub prelude_end: u32,
+    /// User-written `unapplySeq`s whose `Option` payload is *not* a `List`.
+    ///
+    /// The backend reads a sequence pattern's elements off the payload, and
+    /// which code it emits depends on the container: a `List` is walked
+    /// head/tail, anything else goes through scalac's
+    /// `SeqFactory$UnapplySeqWrapper$` (an `Array` through
+    /// `Array$UnapplySeqWrapper$`). Erasure has flattened `Option[Seq[A]]` to
+    /// a bare `Option` by the time the backend looks, so the answer is
+    /// recorded here while the type arguments are still there. Extractors
+    /// absent from the map are walked as `List`, which is what `List`'s own
+    /// `unapplySeq` and every built-in factory want.
+    pub seq_extractor_payload: std::collections::HashMap<SymbolId, SeqPayload>,
+}
+
+/// The container a `unapplySeq` hands back inside its `Option`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SeqPayload {
+    /// `Option[Seq[A]]`, `Option[IndexedSeq[A]]`, `Option[Vector[A]]`, …
+    Seq,
+    /// `Option[Array[A]]`.
+    Array,
 }
 
 impl SymbolTable {
@@ -504,6 +525,7 @@ impl SymbolTable {
             local_lazy_accessors: std::collections::HashMap::new(),
             local_lazy_nlr: std::collections::HashSet::new(),
             prelude_end: 0,
+            seq_extractor_payload: std::collections::HashMap::new(),
         };
         st.root = st.alloc(
             "<_root_>",
