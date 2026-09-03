@@ -1241,11 +1241,11 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
                 .iter()
                 .map(|t| jtype_to_type(st, t, &env))
                 .collect();
-            let ret = jtype_to_type(st, &ms.ret, &env);
+            let ret = java_result_obj(jtype_to_type(st, &ms.ret, &env));
             (params, ret, tp_ids)
         } else {
             let (p, r) = parse_method_desc_java(st, &m.desc);
-            (p, r, Vec::new())
+            (p, java_result_obj(r), Vec::new())
         };
         let mut params = params;
         if crate::javaclass::is_java_varargs(m.access) {
@@ -1361,6 +1361,24 @@ fn jtype_to_type(
             let as_ = args.iter().map(|a| jtype_to_type(st, a, env)).collect();
             Type::Class { sym, args: as_ }
         }
+    }
+}
+
+/// nsc's `objToAny` widens a Java *parameter* of type `Object` to `Any`; a
+/// **result** of type `Object` stays `AnyRef`, and that is what gives it `eq`,
+/// `ne` and `synchronized`. Every `Object` was read as `Any` here, so
+/// `cv.unwrapped eq null` (slick's `GlobalConfig`, on typesafe-config's
+/// `ConfigValue.unwrapped(): Object`) was "value eq is not a member of Any".
+///
+/// Only the top level of the result is narrowed. Turning `Object` into
+/// `AnyRef` *inside* a signature as well is what nsc does, but it also
+/// rewrites every `Hashtable<Object, Object>` in sight, and that regressed
+/// `IndexedSeq[Any] <: Int => Any` in slick's `HeapBackend`; the wider change
+/// bought nothing on slick, so it is not made here.
+fn java_result_obj(t: Type) -> Type {
+    match t {
+        Type::Any => Type::AnyRef,
+        other => other,
     }
 }
 

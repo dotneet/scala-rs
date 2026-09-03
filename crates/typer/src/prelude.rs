@@ -631,6 +631,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     // `HashSet <: mutable.Set` などの残りの辺。`prelude_hier` が
     // `collection.Set` / `collection.Map` 側を組み立てたあとで。
     crate::prelude_ovl3::install_hierarchy(st);
+    // `collection.Map` の `get`/`contains`/`getOrElse`/`apply`。
+    // `prelude_hier` がリンク用トレイトを作ったあとで。
+    crate::prelude_implfind::install(st);
     // `Seq[A] <: PartialFunction[Int, A] <: Int => A`（`scala/collection/Seq`
     // は `prelude_hier` が組み立てるので、そのあと）。`PartialFunction` の
     // `lift`/`orElse` も同じスライスで足す。library_abi 専用。

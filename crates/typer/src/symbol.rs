@@ -684,6 +684,29 @@ impl SymbolTable {
         Vec::new()
     }
 
+    /// Look up the *function* of a constructor pattern (`case x :@ y`).
+    ///
+    /// nsc's `Context.lookupSymbol` qualifier for `typingConstructorPattern`
+    /// drops `sym.isMethod && !sym.isStable`, so a plain `def` of that name
+    /// never shadows an extractor further out. slick's `Node` declares
+    /// `final def :@ (newType: Type): Self` and imports the extractor
+    /// `object :@` from `TypeUtil`; without the rule, `val from2 :@ … = …`
+    /// found the method and reported "not found: extractor :@".
+    pub fn lookup_extractor(&self, name: &str) -> Vec<SymbolId> {
+        for sc in self.scopes.iter().rev() {
+            let found: Vec<SymbolId> = sc
+                .lookup(name)
+                .iter()
+                .copied()
+                .filter(|&s| self.get(s).kind != SymKind::Method)
+                .collect();
+            if !found.is_empty() {
+                return found;
+            }
+        }
+        Vec::new()
+    }
+
     /// Names that live in the term namespace under their own spelling.
     fn is_term_namespace(&self, s: SymbolId) -> bool {
         matches!(
@@ -1905,6 +1928,19 @@ impl SymbolTable {
                     }
                     if let Type::TypeMember(id) = ctor.as_ref() {
                         if let Some(hi) = self.get(*id).bound_hi.clone() {
+                            // The bound is written in the member's *own*
+                            // parameters: `type CT[T] <: TT[T]` applied to `U`
+                            // is bounded by `TT[U]`, not `TT[T]`. Comparing
+                            // the un-substituted bound made every applied
+                            // abstract member fail its own bound, which is how
+                            // slick's `implicitly[BaseColumnType[U]]` (whose
+                            // only candidate is the context bound's own
+                            // evidence) reported "could not find implicit".
+                            let args = match &folded {
+                                Type::Applied { args, .. } => args.clone(),
+                                _ => Vec::new(),
+                            };
+                            let hi = self.subst_tparams(*id, &args, &hi);
                             return self.is_sub_type(&hi, other);
                         }
                     }

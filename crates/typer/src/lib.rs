@@ -33,6 +33,7 @@ mod prelude_fntuple;
 mod prelude_genrep;
 mod prelude_hier;
 mod prelude_impl2;
+mod prelude_implfind;
 mod prelude_lang;
 mod prelude_lazyref;
 mod prelude_lowbound;
