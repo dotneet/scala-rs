@@ -1225,6 +1225,12 @@ fn checkcast_internal(st: &SymbolTable, ty: &Type) -> Option<String> {
         // `def show(p: (A, B))` erases to `show(Tuple2)`; the bridge from
         // `show(Object)` has to checkcast, same as for any other class type.
         Type::Tuple(ts) if !ts.is_empty() => Some(format!("scala/Tuple{}", ts.len())),
+        // An array's "internal name" in a `checkcast` is its descriptor
+        // (`[I`), which is what the JVM spec asks for. Without this the bridge
+        // `sizeOf(Object)I` for `def sizeOf(c: C[Int])` implemented at
+        // `C = Array` handed an `Object` straight to `sizeOf([I)I`:
+        // `VerifyError: Type 'java/lang/Object' is not assignable to '[I'`.
+        Type::Array(_) => Some(jvm_desc(st, ty)),
         Type::Named { name, .. } => Some(name.replace('.', "/")),
         _ => None,
     }

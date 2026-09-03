@@ -1023,16 +1023,44 @@ impl SymbolTable {
         }
     }
 
+    /// `Class { sym: array_sym, args: [T] }` re-spelled as `Type::Array(T)`.
+    ///
+    /// `None` for anything else, including the bare `Array` constructor, which
+    /// has no element yet.
+    pub fn array_class_form(&self, ty: &Type) -> Option<Type> {
+        match ty {
+            Type::Class { sym, args } if *sym == self.array_sym && args.len() == 1 => {
+                Some(Type::Array(Box::new(args[0].clone())))
+            }
+            _ => None,
+        }
+    }
+
+    /// How many type parameters a class declares.
+    ///
+    /// `scala.Array` is the one class whose parameter is not in the symbol
+    /// table: source `Array[T]` becomes `Type::Array`, so the symbol carries no
+    /// `T`. Its kind is still `* -> *` -- `TypedCollectionTypeConstructor[Array]`
+    /// (slick's `ast/Type.scala`) passes it as a type *constructor* -- so the
+    /// count has to say 1 or every such use is rejected as a kind error.
+    pub fn class_tparam_count(&self, sym: SymbolId) -> usize {
+        if sym == self.array_sym {
+            1
+        } else {
+            self.get(sym).tparams.len()
+        }
+    }
+
     /// Remaining kind arity: 0 is a proper type (`*`), 1 is `* -> *`, etc.
     pub fn kind_arity(&self, ty: &Type) -> usize {
         match ty {
             Type::TypeParam(id) | Type::TypeMember(id) => self.get(*id).tparams.len(),
-            Type::Class { sym, args } => self.get(*sym).tparams.len().saturating_sub(args.len()),
+            Type::Class { sym, args } => self.class_tparam_count(*sym).saturating_sub(args.len()),
             Type::Applied { ctor, args } => self.kind_arity(ctor).saturating_sub(args.len()),
             Type::Named { args, .. } => {
                 if args.is_empty() {
                     self.class_sym_of(ty)
-                        .map(|c| self.get(c).tparams.len())
+                        .map(|c| self.class_tparam_count(c))
                         .unwrap_or(0)
                 } else {
                     0
@@ -1046,6 +1074,11 @@ impl SymbolTable {
     /// Kinds of the next type parameters of a type constructor (`F[_]` → `[0]`).
     pub fn tparam_arities(&self, ty: &Type) -> Vec<usize> {
         match ty {
+            // `Array`'s element parameter is a proper type and is not in the
+            // symbol table (see `class_tparam_count`).
+            Type::Class { sym, args } if *sym == self.array_sym => {
+                vec![0; 1usize.saturating_sub(args.len())]
+            }
             Type::Class { sym, args } => self
                 .get(*sym)
                 .tparams
@@ -1670,6 +1703,15 @@ impl SymbolTable {
         }
         if let Some(p) = Self::as_seen_from_view(b) {
             return self.is_sub_type(a, p);
+        }
+        // `Array[T]` has two spellings: `Type::Array` from source, and
+        // `Class { sym: array_sym }` from a classfile signature or from
+        // substituting `Array` for a `C[_]` parameter. They are the same type.
+        if let Some(n) = self.array_class_form(a) {
+            return self.is_sub_type(&n, b);
+        }
+        if let Some(n) = self.array_class_form(b) {
+            return self.is_sub_type(a, &n);
         }
         // An alias type member stands for its right-hand side on either side of
         // `<:`. This has to happen before the arms below, because the `Class`

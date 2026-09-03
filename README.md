@@ -85,7 +85,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - for-comprehension（`map` / `flatMap` / `foreach` / `withFilter` へデシュガー。私有ランタイムでは `List.withFilter` は eager な `List`。`--scala-library` 時は `scala.collection.WithFilter[+A, +CC[_]]` で、`map[B]` は `CC[B]` を返す。`Option.withFilter` は `Option$WithFilter`）。値定義 `q = e` はラムダ本体の `val` になる ── **生成子ではない**ので、その前の生成子はやはり最内で `map` を取る。値定義の**後ろのガード**は nsc のタプル化が要るので診断する
 - apply / select / infix（`:` 終わりの演算子は右結合で、レシーバは右オペランド。`1 :: Nil` → `Nil.::(1)`）。代入 `xs(i) = v` は nsc どおり `xs.update(i, v)`。代入でない `c(1)` で `apply` が無ければ診断する（黙って `update` にしない）
 - リテラル、タプル
-- 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）。infix 型 `A Either B` は `Either[A, B]`。`Map[K, V]` の applied 構文はそのまま。**高階型** `trait Functor[F[_]]` / `class Box[F[_], A](val fa: F[A])`。具象は `Id[_]` など。kind 不一致（`F[_]` を proper 位置で使う、proper 型を型コンストラクタとして使う）は診断する（黙って捨てない）。**高階型メンバー** `trait M { type F[_] }` とパス依存適用 `m.F[Int]`。具象は subclass で `type F[X] = Id[X]`（または `List[X]`）。メンバーの kind 不一致（`type F[_]` を `type F = Int` で束縛、逆も）は診断する。**refinement の高階型メンバー** `M { type F[X] = Id[X] }` と適用。**HK 境界** `type F[_] <: Bound`（proper な境界。`type F[_] <: List` は nsc どおり `takes type parameters`）。**refinement の境界** `{ type A <: Int }`。クラス / トレイトの nullary `type A <: T` は未実装のまま診断する。**入れ子型射影** `Outer#Inner#X` / `Holder#Inner#T`。違法な `Int#X` と抽象 `B#U#T`（メンバー無し）は nsc どおり `is not a member`。**射影のメンバーは前置型から読み直す**: `A#B` の `B` が `A` の祖先の入れ子クラスなら、`B` のメンバーの型に出てくる抽象型メンバーは `A` が与えた定義で読む（`Sub#Ctx` の `def session: S` は `type S = Sess` を持つ `Sub` 越しに `Sess`）。読み直しは as-seen-from であって制約ではないので、`A#B` は部分型としても表示としても素の `B`（`agent/proj`）
+- 名前付き型・ジェネリック型（`Array[String]`、`def id[T](x: T): T` など）。infix 型 `A Either B` は `Either[A, B]`。`Map[K, V]` の applied 構文はそのまま。**高階型** `trait Functor[F[_]]` / `class Box[F[_], A](val fa: F[A])`。具象は `Id[_]` など。kind 不一致（`F[_]` を proper 位置で使う、proper 型を型コンストラクタとして使う）は診断する（黙って捨てない）。**`Array` は kind `* -> *`**（ソースの `Array[T]` は `Type::Array` になりシンボルに型パラメータが入らないので、`kind_arity` が特別扱いする。`TC[Array]` は nsc と同じく通る。`agent/asttype`）。ワイルドカード型引数がパラメータの kind を引き受けるのは**型パターンの中だけ**（`case o: TC[_]`）で、普通の型位置の `TC[_]` は nsc と同じく拒否する。**高階型メンバー** `trait M { type F[_] }` とパス依存適用 `m.F[Int]`。具象は subclass で `type F[X] = Id[X]`（または `List[X]`）。メンバーの kind 不一致（`type F[_]` を `type F = Int` で束縛、逆も）は診断する。**refinement の高階型メンバー** `M { type F[X] = Id[X] }` と適用。**HK 境界** `type F[_] <: Bound`（proper な境界。`type F[_] <: List` は nsc どおり `takes type parameters`）。**refinement の境界** `{ type A <: Int }`。クラス / トレイトの nullary `type A <: T` は未実装のまま診断する。**入れ子型射影** `Outer#Inner#X` / `Holder#Inner#T`。違法な `Int#X` と抽象 `B#U#T`（メンバー無し）は nsc どおり `is not a member`。**射影のメンバーは前置型から読み直す**: `A#B` の `B` が `A` の祖先の入れ子クラスなら、`B` のメンバーの型に出てくる抽象型メンバーは `A` が与えた定義で読む（`Sub#Ctx` の `def session: S` は `type S = Sess` を持つ `Sub` 越しに `Sess`）。読み直しは as-seen-from であって制約ではないので、`A#B` は部分型としても表示としても素の `B`（`agent/proj`）
 - 2.13 の early field defs: `class C extends { val x = 1 } with T`。`x` は親 ctor / trait `$init$` の前にフィールドへ書く（nsc と同じ）。具象フィールド以外（`def` / 文 / 抽象 val）は nsc どおり `only concrete field definitions allowed in early object initialization section`。early 内の `this` は `this can be used only in a class, object, or template`
 - SIP-23 定数型のサブセット: `val x: 1 = 1`、`def f(x: 1): Int`。式のリテラルは定数型（`1 <: Int`）。不一致 `val y: 1 = 2` は type mismatch。classfile の pickle は nsc `CONSTANTtpe` + `LITERALint`（scalac 2.13.16 が `-cp` で `def f(x: 1)` / `val one: 1` を typecheck できる）
 - `scala.Dynamic`: `d.foo` → `selectDynamic("foo")`、`d.foo(args)` → `applyDynamic("foo")(args)`、`d.foo = v` → `updateDynamic("foo")(v)`、`d.foo(a = x)` → `applyDynamicNamed("foo")(("a", x))`。`import scala.language.dynamics`（または `-language:dynamics`）が必要。`--scala-library` 時は jar の `scala/Dynamic` に対して実行する
@@ -100,7 +100,7 @@ Scala **2.13** 構文です。Scala 3 の `then`、トップレベル定義、TA
 - コンテキストバウンド `T: ClassTag` / `T: Ordering` / `T: scala.reflect.ClassTag`（メソッド型パラメータ）と **クラス型パラメータ** `class C[T: Ordering](x: T)`。nsc と同様、implicit evidence `C[T]` へデシュガーする（クラスは primary ctor の extra implicit 節）。トレイトの `: C` / `<%` は nsc どおり `traits cannot have type parameters with context bounds ': ...' nor view bounds '<% ...'`。evidence が無ければ `no implicit`。`--scala-library` 時は jar の `scala.math.Ordering` を classfile から読み、companion の `implicit object Int`（`Ordering$Int$.MODULE$` / InnerClasses）と `ClassTag` にリンクして動く。ジェネリック `Array[T].length` は jar の `ScalaRunTime.array_length` に落とす
 - `lazy val`。メンバは `bitmap$0` + アクセサ、**メソッドローカルは `scala.runtime.LazyRef`（プリミティブは `LazyInt` などの専用セル、`Unit` は `LazyUnit`）+ 持ち上げたアクセサ**で、宣言位置ではセルを作るだけ。初期化子は最初の読み取り時に高々 1 回、セルのモニタの下で走る（nsc の `lazyvals` フェーズと同じ形）。ブロックの中では `lazy val` だけ前方参照できる
 - implicit val / def（ローカル、import、パッケージオブジェクト、コンパニオン）、implicit パラメータ、スコープ内の implicit conversion。第二パラメータ節の明示渡し `foo(x)(y)` を含む。候補が複数あるときは nsc 風の **more-specific**（結果型の subtype、または定義クラスが subclass である origin）。型と origin が食い違うと（親のより specific な implicit と、子に定義した less-specific な local）`ambiguous implicit`。同じ型が二つなら曖昧。目標型が `A => B` で `A <: B` のときは nsc と同様 identity view を合成する（view bound の呼び出し側）。**implicit class**（object / class 本体。`implicit class Rich(n: Int) { def twice: Int }` の `2.twice`）。**package object の `implicit class`**（同じパッケージの他 compilation unit、または `import pkg._`。pickle の IMPLICIT。トップレベル `implicit class` は nsc どおり `` `implicit` modifier cannot be used for top-level objects ``。import 無しでは enrichment が見えない）。**`Function1` を継承したクラスの値も implicit conversion です**（nsc の「候補の型が `From => To` に適合するか」。`scala.<:<[-From, +To] extends (From => To)` なので `implicit ev: P <:< Q` は `P` を `Q` へ変換し、適用は `Function1.apply`。引数を取らない implicit メソッド（`<:<.refl`）はビューにしません）
-- `@tailrec`（末尾再帰でない `def` は nsc 風にエラー。object の末尾再帰は通して実行する。while 変換はしない）/ `@deprecated`（引数付きアノテーションを pickle の SYMANNOT に載せる。コンパイルは壊さない）/ Java `@Override`（本当に override しているメソッドは受理。そうでなければ `overrides nothing`）/ Java `@Deprecated`（メソッドの `RuntimeVisibleAnnotations` に `Ljava/lang/Deprecated;` を出す。pickle は `SYMANNOT` + `java.lang.Deprecated` の TypeRef。`javap -v` と scalac `-deprecation` の両方で見える）/ ユーザー定義の `StaticAnnotation`（`@Ann(foo)` / `@Ann(this)` / `@Ann(classOf[Int])` / `@Ann(ident(1))` / `@Ann(this.x)` / `@Ann(super.foo)` / `@Ann(ident(ident(1)))` / `@Ann(foo = 1)` / `@Ann(foo = this.x)` / `@Ann(foo = bar)` の Ident/Select/This/Super/Apply / リテラル / classOf / named Constant / named TREE 引数を TREE / Constant として pickle。named は nsc と同じく位置引数に直して pickle）/ `@implicitNotFound("…")`（欠ける implicit は nsc と同じくその文面。`${A}` は型引数）/ `@switch`（`(n: @switch) match`。密な Int は `tableswitch`、疎なら `lookupswitch`。switch にできない match は nsc と同じ warning `could not emit switch for @switch annotated match`）。`@inline` / `@noinline` はアノテーションとして格納するだけで、インライン化はしない。実 scalac 2.13.16 は配置を一切検証しない（val / var / class / type などどれに付けても、両方同時に付けても、警告すら出さない — `-opt:inline:...` のバイトコード最適化器だけが読む情報で、typer は無関係）ので、こちらも同様に検証しない。`@volatile` / `@transient` は classfile の `ACC_VOLATILE` / `ACC_TRANSIENT`（javap で見える）。`@native` はメソッドに付けて `ACC_NATIVE` を出し、本文は付けない（`.so` のリンクはしない。本文付きや val への付与は診断する）
+- `@tailrec`（末尾再帰でない `def` は nsc 風にエラー。object の末尾再帰は通して実行する。while 変換はしない。**パラメータリストを取らないメソッド**の再帰呼び出しは `Apply` を持たない裸の `Select` なので、`paramss` が空の宣言ではそれも呼び出しとして数える —— slick の `NominalType.sourceNominalType` の形。非末尾位置ならこれまでどおり `a recursive call not in tail position`。`agent/asttype`）/ `@deprecated`（引数付きアノテーションを pickle の SYMANNOT に載せる。コンパイルは壊さない）/ Java `@Override`（本当に override しているメソッドは受理。そうでなければ `overrides nothing`）/ Java `@Deprecated`（メソッドの `RuntimeVisibleAnnotations` に `Ljava/lang/Deprecated;` を出す。pickle は `SYMANNOT` + `java.lang.Deprecated` の TypeRef。`javap -v` と scalac `-deprecation` の両方で見える）/ ユーザー定義の `StaticAnnotation`（`@Ann(foo)` / `@Ann(this)` / `@Ann(classOf[Int])` / `@Ann(ident(1))` / `@Ann(this.x)` / `@Ann(super.foo)` / `@Ann(ident(ident(1)))` / `@Ann(foo = 1)` / `@Ann(foo = this.x)` / `@Ann(foo = bar)` の Ident/Select/This/Super/Apply / リテラル / classOf / named Constant / named TREE 引数を TREE / Constant として pickle。named は nsc と同じく位置引数に直して pickle）/ `@implicitNotFound("…")`（欠ける implicit は nsc と同じくその文面。`${A}` は型引数）/ `@switch`（`(n: @switch) match`。密な Int は `tableswitch`、疎なら `lookupswitch`。switch にできない match は nsc と同じ warning `could not emit switch for @switch annotated match`）。`@inline` / `@noinline` はアノテーションとして格納するだけで、インライン化はしない。実 scalac 2.13.16 は配置を一切検証しない（val / var / class / type などどれに付けても、両方同時に付けても、警告すら出さない — `-opt:inline:...` のバイトコード最適化器だけが読む情報で、typer は無関係）ので、こちらも同様に検証しない。`@volatile` / `@transient` は classfile の `ACC_VOLATILE` / `ACC_TRANSIENT`（javap で見える）。`@native` はメソッドに付けて `ACC_NATIVE` を出し、本文は付けない（`.so` のリンクはしない。本文付きや val への付与は診断する）
 - 非ローカル `return`（ネストしたラムダ / `foreach` から囲みの名前付きメソッドへ。nsc 風 `scala.runtime.NonLocalReturnControl`）。ネストした `def` の `return` はその def 自身。クラスコンストラクタからの `return` は `return outside method definition`
 - `eq` / `ne`（AnyRef の参照等価）と `synchronized`（monitorenter / monitorexit。本体はロック中に評価）
 - `asInstanceOf[T]` / `isInstanceOf[T]`（`Any` の真にジェネリックなメソッドとして型パラメータ `T0` を持つ。プリミティブは box の `checkcast` + unbox 呼び出し、`String` / クラス型は `checkcast`、erase された/境界なしの対象（`Any` / `AnyRef` / 型パラメータ）はキャスト不要。`x.asInstanceOf[T]` は `TypeApply` の外側ノードでのみ代入された具体的な `T` を持つため、erasure フェーズと backend の両方でこの外側ノードから読む必要がある）。`null` は `AnyRef`／`Any` としてメンバー解決する（`null.asInstanceOf[String]` が動く）。境界なしの型パラメータ `T` も `Any` としてメンバー解決する（`x: T` の `x.asInstanceOf[AnyRef]` が動く）
@@ -4474,6 +4474,8 @@ jar の package object にある**型エイリアス**のフィクスチャは�
 | `mism14.scala`（`crates/cli/tests/mismatch14.rs`、私有ランタイム・library dual-run・real scalac dual-run） | `agent/mismatch14` スライス: 単相の callee / SAM パラメータ / case class のコンパニオン `apply` のいずれでも、`if/else` の中の関数リテラルがパラメータ型を受け取る（2 文の本体は `section_param_types` では拾えない）。generic な**基底型**しか持たない受け手の `implicit class`（`Sub extends Holder[String, Int]`）。継承した結果型の抽象型メンバ（`type Self = Leaf`）。`Arrays.copyOf[Any](Array[AnyRef], n)` | `aaabbb` `zz` `si si 7` `leaf1` `mnnn` `3 x null` |
 | `mism14_lib.scala`（`crates/cli/tests/mismatch14.rs`、library dual-run と real scalac dual-run） | `java.util.ArrayList[String]` / `HashMap[String, Integer]` を**継承した** Scala クラスに `asScala`（slick の `ConfigObject` と同じ形）。私有ランタイムには `scala.jdk.CollectionConverters` が無いので `--no-scala-library` では診断のまま | `x,y` `7` `1` |
 | `mism14_bad.scala`（`crates/cli/tests/mismatch14.rs`、両モードで拒否） | Java の型引数 `Any` を `Object` と読んでも `Array` は不変のまま。`copyOf[Any](Array[String], 3)` は拒否（nsc 2.13.16 も拒否） | `no matching overload for (Array[AnyRef], Int)Array[AnyRef] with arguments (Array[String], 3)` |
+| `at.scala`（`crates/cli/tests/asttype.rs`、library dual-run と real scalac dual-run） | `agent/asttype` スライス: `class TC[C[_]]` に `Array` / `List` を渡す（`Array` は kind `* -> *`）、型パターンの `case t: TC[_]`、無引数メソッドの `@tailrec`（`n.last`）、`implicitly[Ordering[Null]]` / `Ordering[java.util.Date]`（`Ordering.ordered` ＋ `Predef.$conforms`）、`ConstArray` 形の `toMap[R, U](implicit ev: T <:< (R, U))` と `immutable.HashMap` の `filter` / `map` / `collect` / `++`（slick `RewriteJoins.hoistFilterFromBind` の形）。`@tailrec` / `Ordering` / `<:<` / `HashMap` は私有ランタイムに裏付けが無いので `--no-scala-library` では診断のまま | `3` `2` `array/list` `true` `false` `3` `2` `true` `-1` `1` `2` `Some(s1)` `1` |
+| `at_bad.scala`（`crates/cli/tests/asttype.rs`、拒否） | proper type は型構築子ではない（`TC[Int]`）。ワイルドカードが kind を引き受けるのは型パターンの中だけ（`def anyOf(t: TC[_])` は nsc も `_$1 takes no type parameters` で拒否）。無引数の再帰呼び出しでも非末尾なら `@tailrec` は不可（`def loop: Int = loop + 1`） | `kinds of the type arguments (Int) do not conform …` / `kinds of the type arguments (_) do not conform …` / `a recursive call not in tail position` |
 | `java_sig.scala` | Java Signature（`ArrayList[String]#get` は `String`）、inner `Map.Entry` / `SimpleEntry`、Java varargs `String.format` / `Arrays.asList` を実行 | `hi` `2` `k` `v` `k` `x-3` `2` |
 | `java_wild.scala` | Signature の `Class[_]` / `Collection[_ <: Number]` / `Collections.max`（tparam bound）を存在型として実行 | `java.lang.String` `2` `9` |
 | `java_throws.scala` | Java `throws` 検査例外（`Thread.sleep`）を Scala はチェックせず実行 | `ok` |
@@ -10389,6 +10391,129 @@ reified yet」でした。nsc の `reifyList` と同じにしました: **連続
    その**展開**（`mapTo` の呼び出し側）には上の 1〜3 と、展開結果の匿名クラス
    （`ClassDef` を expand.rs が組めない）が要ります。slick 本体のコンパイルには
    不要です。
+### `Array` は型構築子、無引数メソッドの自己呼び出しも末尾呼び出し（`agent/asttype`）
+
+slick の `ast/Type.scala`（6 件）と `compiler/RewriteJoins.scala`（4 件）を
+担当しました。`tests/slick_measure.sh` は **`errors=99 → 86`、
+`files_with_errors=39 → 36`**。2 ファイルは **6 件 → 0 件 / 4 件 → 0 件**、
+新規エラーは 0（ほかに `jdbc/JdbcBackend.scala` 2 件と
+`lifted/AbstractTable.scala` 1 件が巻き添えで消えました）。
+codegen も 1 箇所だけ触りました（下記 5）。
+
+#### 1. `Array` の kind は `* -> *`
+
+`class TypedCollectionTypeConstructor[C[_]]` に `Array` を渡す
+（`implicit val forArray: TypedCollectionTypeConstructor[Array]`）のは
+実 scalac で通ります。こちらは `kinds of the type arguments (Array) do not
+conform …` を出していました。`SymbolTable::kind_arity` はクラスシンボルの
+`tparams.len()` を読みますが、**`scala.Array` のシンボルには型パラメータが
+1 つも入っていません**——ソースの `Array[T]` は `Type::Array` になるので、
+`T` を作る場所が無いからです。`class_tparam_count` が `array_sym` にだけ
+1 を返すようにしました。
+
+そうすると substitution（`C := Array` を `C[E]` に代入）が
+`Class { array_sym, [E] }` を作ります。これは classfile 由来の綴りとして
+既に存在していて、`Type::Array` と**同じ型**です。`is_sub_type` の入口で
+`array_class_form` により正規化し、`erasure::erase_ty` でも同じ変換を
+掛けます（後者が無いと、擬似名 `[java/lang/Object` がそのまま
+クラス名として出て `ClassFormatError: Illegal class name`）。
+
+#### 2. ワイルドカードの kind は**型パターンの中でだけ**引き受ける
+
+slick は `case o: TypedCollectionTypeConstructor[?]` と書きます。nsc は
+型パターンではワイルドカードにパラメータの kind を与えますが、**普通の型
+位置では**同じ `TC[_]` を「proper type の存在型」と読んで
+`_$1 takes no type parameters, expected: 1` を出します（実 scalac 2.13.16 で
+確認）。そこで `Checker::pattern_tpt` が立っている間だけ kind 検査を
+飛ばします。`def anyOf(t: TC[_])` は今も診断されます
+（`tests/fixtures/at_bad.scala`）。
+
+#### 3. 無引数メソッドの再帰呼び出しは `Select` であって `Apply` ではない
+
+```scala
+@tailrec
+def sourceNominalType: NominalType = structuralView match {
+  case n: NominalType => n.sourceNominalType
+  case _              => this
+}
+```
+
+`count_tailrec_calls` は `Apply` / `TypeApply` しか再帰呼び出しと見ません。
+パラメータリストを 1 つも取らないメソッドの呼び出しには `Apply` が無いので、
+`could not optimize @tailrec annotated method: it contains no recursive calls`
+になっていました。宣言に `paramss` が無いときだけ、`sym` の一致する
+`Select` / `Ident` も呼び出しとして数えます。非末尾位置なら今までどおり
+`a recursive call not in tail position` になります（`def loop: Int = loop + 1`
+は以前「再帰呼び出しが無い」と誤診されていました）。
+
+#### 4. `Ordering[Null]` は `Ordering.ordered` と `Predef.$conforms` の合わせ技
+
+実 scalac の `-Xprint:typer` は
+`Ordering.ordered[Null](scala.Predef.$conforms[Null])` と出します。こちらは
+両方に届いていませんでした。
+
+* `ordered` は `object Ordering` が**継承している**
+  `trait LowPriorityOrderingImplicits` の宣言です。`warm_pickled_implicits`
+  はコンパニオンの**自分自身の**メンバしか pickle から補っていなかったので、
+  implicit スコープに入っていませんでした。親を辿るようにしました
+  （SLS 7.2 の「コンパニオン**オブジェクト**のメンバ」には継承分も含まれます）。
+  優先順位は既存の `is_as_specific_origin`（owner の派生関係）が見るので、
+  `Ordering[String]` は今までどおり `Ordering.String` が勝ちます。
+* `$conforms[A]: A => A` は `prelude_conform` が `Predef` に足しますが、
+  それは `import_members(st, st.predef)` が基底スコープに取り込んだ**後**
+  なので、スコープ経由の候補には決してなりません。ほかの候補が全部落ちた
+  ときにだけ、**1 引数の関数型**に対して候補として提示します
+  （`Implicits::conforms_witness`）。これで
+  `implicitly[Ordering[java.util.Date]]` も通ります。
+
+#### 5. Scala classfile の mixin forwarder は pickle の宣言を隠していた
+
+`RewriteJoins.hoistFilterFromBind` の
+`foundRefs.filter(_._2._2.isEmpty).map { … }` が
+`value _2 is not a member of Any` でした。`foundRefs` は
+`immutable.HashMap` で、その classfile には
+
+```
+public java.lang.Object filter(scala.Function1);
+public scala.collection.IterableOps map(scala.Function1);
+```
+
+という `Signature` 属性を持たない**転送メソッド**が入っています。scalac は
+Scala の型が型パラメータに触れるメソッドには必ず `Signature` を書くので、
+**型パラメータを持つクラスで `Signature` の無いメソッドは転送か bridge**
+です。これを `(Any) => Any` として親の宣言の隣に載せると、親（pickle が
+ちゃんと書いている `MapOps.filter`）が隠れます。
+`classpath::is_erased_scala_forwarder` で読み飛ばし、通常のメンバ探索と
+`PickleSupply::complete` の祖先経路に任せます。これだけで slick の
+`no matching overload` / `is not a member` が 13 件（担当外の 3 件を含む）
+消えました。
+
+`C = Array` で実装した `def sizeOf(c: C[Int])` の bridge
+`sizeOf(Object)I` には `checkcast [I` が要ります。`checkcast_internal` に
+配列の腕が無く、`-Xverify:all` が `VerifyError: Type 'java/lang/Object' is
+not assignable to '[I'` を出したので足しました。
+
+#### テストと fixture
+
+`crates/cli/tests/asttype.rs`（6 本）。fixture は 1 ファイルに全ケースを
+まとめた `tests/fixtures/at.scala`（+ `expected/at.txt`）と、拒否側の
+`tests/fixtures/at_bad.scala`。`at.scala` は `@tailrec` / `Ordering` /
+`<:<` / `immutable.HashMap` を使うので library ABI 専用で、
+`--no-scala-library` では**診断されること**をテストしています。修正前の
+`main` では 6 本中 3 本が落ちます。
+
+#### Remaining
+
+* `implicitly[String => String]` のように**関数型そのもの**を implicit
+  引数として要求する形は、探索に入る前に `reject_unapplied_implicit_clause`
+  が「埋まらない implicit 節」として診断してしまい、上記 4 の
+  `$conforms` に届きません（`Ordering.ordered` 経由の間接要求は通ります）。
+* `immutable.HashMap("a" -> x, "b" -> y)` のように要素の型が違うタプルを
+  並べた `apply` は `no matching overload`（LUB を取っていない）。
+* `private[this] val` を同じ外側クラスの匿名クラスから読むと
+  `IllegalAccessError`。nsc は `O$$secret` に改名して public にします。
+  今回の作業中に見つけた**既存の**codegen バグで、このスライスとは独立です。
+* `@tailrec` は検査だけで、末尾呼び出しの**変換はしていません**（従来どおり）。
 
 ## ライセンス
 
