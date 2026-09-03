@@ -7507,6 +7507,19 @@ fn gen_java_class_of(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
         // a `ClassTag[Object]`, so `Array.apply` built an `Object[]` and the
         // `checkcast [[I` on the result threw `ClassCastException`.
         Type::Array(_) => asm.ldc_class(&jvm_desc(ctx.st, ty)),
+        // A tuple and a function are classes like any other, and the class
+        // literal a `ClassTag` is built from decides what `Array.apply`
+        // allocates. Falling through to `java/lang/Object` made
+        // `Array[(Int, String)](1 -> "one")` an `Object[]`, and the
+        // `checkcast [Lscala/Tuple2;` the caller emits on the result threw
+        // `ClassCastException` -- with nothing wrong at the type level.
+        Type::Tuple(ts) => asm.ldc_class(&format!("scala/Tuple{}", ts.len())),
+        Type::Function { params, .. } => asm.ldc_class(&format!("scala/Function{}", params.len())),
+        // A type annotation says nothing about the class underneath
+        // (`Array[T @uncheckedVariance]`), and a literal type's class is its
+        // underlying type's.
+        Type::Annotated { tpe, .. } => gen_java_class_of(asm, ctx, tpe),
+        Type::Constant(lit) => gen_java_class_of(asm, ctx, &Type::lit_underlying(lit)),
         _ => asm.ldc_class("java/lang/Object"),
     }
 }
@@ -8629,6 +8642,72 @@ fn gen_apply(
         return;
     }
 
+    // `a(i)` / `a(i) = x` / `a.clone()` where the receiver is an `Array[T]`
+    // whose element type is abstract. Such an array erases to `Object`, so
+    // there is no `aaload` / `aastore` to emit and no class to name in a
+    // `Methodref`: nsc calls `ScalaRunTime.array_apply` / `array_update` /
+    // `array_clone`, the same detour `length` already takes here. Without this
+    // the call went out as `invokevirtual "[java/lang/Object".update` — a name
+    // the JVM rejects outright, so both a `def repeat[T: ClassTag](x: T, n:
+    // Int)` filling a `new Array[T](n)` and a `def dup[T](a: Array[T]) =
+    // a.clone()` produced a class file that would not even load
+    // (`ClassFormatError: Illegal class name`).
+    //
+    // The test is on the receiver's *type*, not on the element: by this point
+    // an abstract-element array has been erased and no longer arrives as a
+    // `Type::Array` at all, which is exactly why the array paths below missed
+    // it.
+    if let TreeKind::Select { qual, name } = &fun.kind {
+        let want = match name.as_str() {
+            "apply" => Some(1),
+            "update" => Some(2),
+            "clone" => Some(0),
+            _ => None,
+        };
+        if ctx.st.get(fun.sym).owner == ctx.st.array_sym
+            && want == Some(args.len())
+            && !matches!(qual.ty, Type::Array(_))
+        {
+            if !ctx.library_abi {
+                throw_runtime(
+                    asm,
+                    "generic Array element access needs the scala-library ClassTag runtime",
+                );
+                push_default(asm, &tree.ty);
+                return;
+            }
+            asm.getstatic(
+                "scala/runtime/ScalaRunTime$",
+                "MODULE$",
+                "Lscala/runtime/ScalaRunTime$;",
+            );
+            gen_expr(asm, frame, ctx, qual);
+            let ptys: &[Type] = match name.as_str() {
+                "apply" => &[Type::Int],
+                "update" => &[Type::Int, Type::Any],
+                _ => &[],
+            };
+            gen_call_args(asm, frame, ctx, args, ptys, true, false, SymbolId::NONE);
+            match name.as_str() {
+                "apply" => {
+                    let d = "(Ljava/lang/Object;I)Ljava/lang/Object;";
+                    asm.invokevirtual("scala/runtime/ScalaRunTime$", "array_apply", d);
+                    maybe_unbox_erased_result(asm, ctx, d, Some(&tree.ty));
+                }
+                "update" => asm.invokevirtual(
+                    "scala/runtime/ScalaRunTime$",
+                    "array_update",
+                    "(Ljava/lang/Object;ILjava/lang/Object;)V",
+                ),
+                _ => asm.invokevirtual(
+                    "scala/runtime/ScalaRunTime$",
+                    "array_clone",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                ),
+            }
+            return;
+        }
+    }
     gen_receiver(asm, frame, ctx, fun);
     if let TreeKind::Select { qual, .. } = &fun.kind {
         // `ArrayOps.toList` / `toSet` / `toVector` / `toBuffer` / `sum` /
@@ -8698,6 +8777,45 @@ fn gen_apply(
         }
         if name == "update" && matches!(qual.ty, Type::Array(_)) {
             emit_array_store(asm, &qual.ty);
+            return;
+        }
+        if name == "clone"
+            && matches!(qual.ty, Type::Array(_))
+            && !fun.sym.is_none()
+            && ctx.st.get(fun.sym).owner == ctx.st.array_sym
+        {
+            // The class a JVM array's `clone()` is named on is the array's own
+            // *descriptor* (`"[I".clone:()Ljava/lang/Object;`), which is what
+            // nsc emits, plus the `checkcast` back. An abstract element type
+            // makes the whole array erase to `Object`, and `jvm_desc` would
+            // still spell it `[Ljava/lang/Object;` -- the wrong class to name
+            // for what may be an `int[]` -- so that case goes through
+            // `ScalaRunTime.array_clone` (the block above catches it before
+            // the receiver is pushed; this arm is the belt to that braces).
+            let concrete = matches!(&qual.ty, Type::Array(e) if is_concrete_array_elem(e));
+            let desc = jvm_desc(ctx.st, &qual.ty);
+            if concrete {
+                asm.invokevirtual(&desc, "clone", "()Ljava/lang/Object;");
+                asm.checkcast(&desc);
+            } else if ctx.library_abi {
+                asm.getstatic(
+                    "scala/runtime/ScalaRunTime$",
+                    "MODULE$",
+                    "Lscala/runtime/ScalaRunTime$;",
+                );
+                asm.swap();
+                asm.invokevirtual(
+                    "scala/runtime/ScalaRunTime$",
+                    "array_clone",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                );
+            } else {
+                throw_runtime(
+                    asm,
+                    "Array[T].clone needs the scala-library ScalaRunTime.array_clone",
+                );
+                push_default(asm, &tree.ty);
+            }
             return;
         }
     }
@@ -8791,6 +8909,27 @@ fn emit_array_wrap_to_iterable_ops(asm: &mut Assembler, ctx: &EmitCtx) {
         "scala/Predef$",
         "genericWrapArray",
         "(Ljava/lang/Object;)Lscala/collection/mutable/ArraySeq;",
+    );
+}
+
+/// Turn the raw array on top of the stack into a
+/// `scala.collection.immutable.IndexedSeq` via
+/// `scala.Predef$.MODULE$.copyArrayToImmutableIndexedSeq`
+/// (`scala.LowPriorityImplicits2`, a real superclass of the `Predef` object,
+/// so `invokevirtual` resolves it).
+///
+/// This is the wrapping a *repeated parameter* needs, and it is the one nsc
+/// picks there: a repeated parameter erases to
+/// `scala/collection/immutable/Seq`, which the `mutable.ArraySeq` that
+/// [`emit_array_wrap_to_iterable_ops`] produces is not.
+fn emit_array_copy_to_immutable_seq(asm: &mut Assembler) {
+    // stack: [arrayRef] -> [arrayRef, Predef$] -> [Predef$, arrayRef] -> [seq]
+    asm.getstatic("scala/Predef$", "MODULE$", "Lscala/Predef$;");
+    asm.swap();
+    asm.invokevirtual(
+        "scala/Predef$",
+        "copyArrayToImmutableIndexedSeq",
+        "(Ljava/lang/Object;)Lscala/collection/immutable/IndexedSeq;",
     );
 }
 
@@ -9481,17 +9620,29 @@ fn invoke_value_extension(
             );
             return;
         }
+        // Everything else on `ArrayOps` goes out as its `$extension` static.
+        // The descriptor used to be hard-coded as `(Object)Object`, which is
+        // right only for a member that takes nothing but the receiver
+        // (`head`, `reverse`, `isEmpty`, …). For one that takes arguments the
+        // call named a signature the arguments did not fit: `a :+ x` pushed
+        // the array, the element and the `ClassTag` and then invoked
+        // `$colon$plus$extension(Object)Object`, which the verifier rejects
+        // ("Inconsistent stackmap frames" at the first branch that joins).
+        // The pickled signature is the erasure nsc emits, so read it off the
+        // symbol; only the receiver has to be written by hand, because
+        // `ArrayOps`' underlying `Array[A]` erases to `Object` and not to
+        // `[Ljava/lang/Object;`.
+        let inst = method_desc_from_sym(ctx.st, id);
+        let desc = format!(
+            "(Ljava/lang/Object;{}",
+            inst.strip_prefix('(').unwrap_or(&inst)
+        );
         asm.invokestatic(
             "scala/collection/ArrayOps",
             &format!("{}$extension", s.name),
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &desc,
         );
-        maybe_unbox_erased_result(
-            asm,
-            ctx,
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            result_ty,
-        );
+        maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
         return;
     }
     let desc = value_extension_desc(ctx.st, id);
@@ -9874,6 +10025,25 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
             return;
         }
         if owner == "scala/Array$" && name == "apply" {
+            // `scala.Array` declares *ten* `apply`s: the generic
+            // `apply[T](xs: T*)(implicit ClassTag[T]): Array[T]`, which is the
+            // one the prelude writes by hand, and nine monomorphic ones
+            // (`apply(x: Int, xs: Int*): Array[Int]`, one per primitive plus
+            // `Unit`) that only exist once `PickleSupply` has installed them.
+            // Whether the typer can see them depends on what ran earlier in
+            // the same compilation: an explicit `Array[T](…)` anywhere in the
+            // file installs the set (`widen_module_from_pickle`), and from
+            // then on `Array(3, 1, 2)` resolves to the `Int` overload.
+            // Hard-coding the generic descriptor for all ten therefore pushed
+            // an `int` where a `Seq` was declared -- `Array(3, 1, 2)` after an
+            // `Array[Any](1, "a")` in the same file was a `VerifyError`, while
+            // the same line on its own was fine. The monomorphic ones have no
+            // type parameters and a descriptor of their own, which is already
+            // the erasure of what the typer picked.
+            if ctx.st.get(id).tparams.is_empty() {
+                asm.invokevirtual("scala/Array$", "apply", &desc);
+                return;
+            }
             asm.invokevirtual(
                 "scala/Array$",
                 "apply",
@@ -13884,6 +14054,20 @@ fn gen_call_args(
             _ => &var_args[0],
         };
         gen_expr(asm, frame, ctx, inner);
+        // ... unless it is an `Array`, which is not a `Seq` on the JVM.
+        // A repeated parameter erases to `scala/collection/immutable/Seq`, so
+        // `render(names: _*)` on an `Array[String]` pushed
+        // `[Ljava/lang/String;` under that descriptor and died with a
+        // `VerifyError` -- the typer had accepted the call (`Typed{_, _*}`
+        // reads the element type straight off the array). nsc wraps it here;
+        // `javap` on its output shows
+        // `Predef.copyArrayToImmutableIndexedSeq(names)`.
+        //
+        // A *Java* varargs method is the exception: its parameter is the
+        // array itself, and nsc passes an `Array` straight through.
+        if !java_varargs && ctx.library_abi && matches!(inner.ty, Type::Array(_)) {
+            emit_array_copy_to_immutable_seq(asm);
+        }
     } else if java_varargs {
         gen_java_varargs_array(asm, frame, ctx, var_args, elem);
     } else {
@@ -15274,6 +15458,18 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             a.aload(obj_slot);
             if is_jvm_primitive(&p.ty) || matches!(p.ty, Type::String) {
                 emit_unbox(a, &p.ty);
+            } else if let Type::Array(elem) = &p.ty {
+                // An `Array` parameter arrives in the erased `Object` slot,
+                // and `arraylength` / `aaload` / `aastore` all reject a plain
+                // `Object`: `g.map(_.length)` on an `Array[Array[Int]]` was a
+                // `VerifyError` ("Bad type on operand stack in arraylength")
+                // although the same expression outside a lambda was fine. nsc
+                // casts here too. An abstract element type erases to `Object`
+                // itself, and there `[Ljava/lang/Object;` would be the wrong
+                // cast (the value may be an `int[]`), so leave it alone.
+                if is_concrete_array_elem(elem) {
+                    a.checkcast(&jvm_desc(st, &p.ty));
+                }
             } else if let Type::Class { sym, .. } = &p.ty {
                 let n = class_internal(st, *sym);
                 if !n.is_empty() && n != "java/lang/Object" {
