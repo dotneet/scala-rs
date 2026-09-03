@@ -11255,6 +11255,11 @@ impl Typer {
         match chosen {
             OverloadPick::Found(sym, mut param_tys, mut ret) => {
                 let mut sig_param_tys = param_tys.clone();
+                // The overload set was recorded under the symbol the
+                // *selection* left on the callee, which the pick below
+                // overwrites. Keep it: it is the key to the alternatives as
+                // seen from this receiver.
+                let group_key = fun.sym;
                 if !sym.is_none() {
                     fun.sym = sym;
                     tree.sym = sym;
@@ -11284,8 +11289,28 @@ impl Typer {
                         .flatten();
                     // Remaining clauses (`Using.resources(a, b)(f)`) read `fun.ty`.
                     // Leave a Method type, not the Overload that selected this alt.
+                    //
+                    // The alternative *as seen from the receiver*, not the raw
+                    // declaration: `fill_defaults_and_implicits` reads the
+                    // later clauses off this type, and the declaration states
+                    // them in the declaring class's own parameters. cats-effect's
+                    // `GenTemporalOps_[F[_], A].timeoutTo` is overloaded on
+                    // `Duration` / `FiniteDuration`, so its
+                    // `(implicit F: GenTemporal[F, _])` reached the search with
+                    // `GenTemporalOps_`'s `F` instead of the caller's, and no
+                    // candidate could ever match it (slick's
+                    // `ConcurrencyControl.scala`). A non-overloaded member kept
+                    // the substituted type all along, which is why only
+                    // overloaded ones were affected.
                     if matches!(&fun.ty, Type::Overload(_)) {
-                        fun.ty = self.st.get(sym).ty.clone();
+                        fun.ty = self
+                            .overload_member_types
+                            .get(&group_key.0)
+                            .and_then(|alts| {
+                                alts.iter().find(|(s, _)| *s == sym).map(|(_, t)| t.clone())
+                            })
+                            .filter(|t| matches!(t, Type::Method { .. }))
+                            .unwrap_or_else(|| self.st.get(sym).ty.clone());
                     }
                     if let Some(recv @ Type::Class { args, .. }) = recv_ty.as_ref() {
                         // At the *owner's* arguments, not the receiver's own:
@@ -15412,23 +15437,61 @@ impl Typer {
         if pt.is_no_type() || pt.is_error() {
             return Type::NoType;
         }
-        let Some(Type::TypeParam(tp)) = param_at(params, idx) else {
+        let Some(param) = param_at(params, idx) else {
             return Type::NoType;
         };
-        if !tps.contains(tp) {
+        if !mentions_tparam(param, &tps) {
             return Type::NoType;
         }
-        self.add_expected_constraints_in(sym, ret, pt, Vec::new(), true)
+        let solved: Vec<(SymbolId, Type)> = self
+            .add_expected_constraints_in(sym, ret, pt, Vec::new(), true)
             .into_iter()
-            .find(|(id, _)| id == tp)
-            .map(|(_, t)| t)
-            .filter(|t| {
+            .filter(|(_, t)| {
                 !t.is_no_type()
                     && !t.is_error()
                     && !matches!(t, Type::Nothing | Type::Any | Type::Wildcard)
                     && !mentions_any_tparam(t)
             })
-            .unwrap_or(Type::NoType)
+            .collect();
+        if let Type::TypeParam(tp) = param {
+            if !tps.contains(tp) {
+                return Type::NoType;
+            }
+            return solved
+                .into_iter()
+                .find(|(id, _)| id == tp)
+                .map(|(_, t)| t)
+                .unwrap_or(Type::NoType);
+        }
+        // nsc `protoTypeArgs` does not stop at a formal that *is* a variable:
+        // it substitutes what the expected type settled into every formal.
+        // cats' `def >>[B](fb: => F[B])(implicit F: FlatMap[F]): F[B]` checked
+        // against `F[Unit]` says `B = Unit`, so the argument's prototype is
+        // `=> F[Unit]`. Without it the argument was typed against nothing and
+        // `e.fold(F.raiseError, _ => F.unit)` came back as the `lub` of
+        // `F[A]` and `F[Unit]` -- `AnyRef` -- which fits no `F[B]`.
+        //
+        // Only when the expected type settles *every* variable the formal
+        // mentions: a formal that still carries one is a prototype that
+        // constrains the argument by a variable's bound, which is what
+        // `open_to_bounds` is for later on.
+        if solved.is_empty() {
+            return Type::NoType;
+        }
+        let ids: Vec<SymbolId> = solved.iter().map(|(id, _)| *id).collect();
+        let vals: Vec<Type> = solved.iter().map(|(_, t)| t.clone()).collect();
+        let out = crate::symbol::subst_tparams_slice(&ids, &vals, param);
+        if mentions_tparam(&out, &tps) || type_mentions_wildcard(&out) {
+            return Type::NoType;
+        }
+        // A by-name formal expects the *value*: `is_sub_type(F[Unit],
+        // => F[Unit])` is false, and the caller would throw the prototype away
+        // as one the argument did not fit. Wrapping in `Function0` is `adapt`'s
+        // job, and it still runs on the parameter itself.
+        match out {
+            Type::ByName(inner) => *inner,
+            other => other,
+        }
     }
 
     /// Explicit type arguments for a *Java* method, with `Any` read as the
