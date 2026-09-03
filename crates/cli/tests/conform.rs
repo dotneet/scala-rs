@@ -263,5 +263,16 @@ conform!(
     either_validate,
     mixin_profile,
     expr_interp,
-    override_val_apply
+    override_val_apply,
+    // `Array` 差分プローブ（agent/arraygen）。README「`Array` の codegen」を参照。
+    // 8 本のうち 6 本が最初の実行で差分を出した（`: _*` 展開、`clone`、
+    // `Array[T]` の要素代入、`:+` の記述子、ラムダ引数の `Array` 受け取り）。
+    array_histogram,
+    array_matrix,
+    array_varargs,
+    array_inplace_sort,
+    array_log_parse,
+    array_classtag_util,
+    array_inventory,
+    array_argv_match
 );

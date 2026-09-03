@@ -6483,6 +6483,11 @@ impl Typer {
                 }
                 if !fun.sym.is_none() {
                     let mut sym = fun.sym;
+                    // The key `overload_member_types` was recorded under: the
+                    // selection stored the as-seen-from types of the whole
+                    // group under its *first* alternative, which is the symbol
+                    // the tree carries before any narrowing below.
+                    let group_key = fun.sym;
                     let mut base_ty = fun.ty.clone();
                     // nsc (SLS 6.26.3): explicit type arguments narrow an
                     // overloaded reference *before* anything else looks at it.
@@ -6571,9 +6576,20 @@ impl Typer {
                     // clause is searched for the *uninstantiated* `TT[T]`.
                     if matches!(base_ty, Type::Overload(_)) {
                         if let Some(only) = self.only_alt_with_tparams(sym, targs.len()) {
-                            sym = only;
                             self.complete_lazy_sig(only, tree.span);
-                            base_ty = self.st.get(only).ty.clone();
+                            // The *declaration*'s type is written in the
+                            // declaring class's own type parameters, and an
+                            // alternative inherited from a generic parent is
+                            // only itself once the receiver's arguments are
+                            // in. Taking `SymbolTable::get(only).ty` raw gave
+                            // `s.map[Int](_.length)` on an
+                            // `immutable.HashSet[String]` the signature
+                            // `IterableOps[A, CC, C]` declares -- "value
+                            // length is not a member of A", then "value toList
+                            // is not a member of CC[Int]". `s.map(_.length)`,
+                            // which never reaches this branch, was fine.
+                            base_ty = self.member_ty_as_seen_from(group_key, only, fun);
+                            sym = only;
                         }
                     }
                     // nsc reads a Java signature's `Object` as `ObjectTpeJava`,
@@ -9181,6 +9197,13 @@ impl Typer {
                     tree.ty = Type::Method {
                         paramss: vec![vec![Type::Int, (**elem).clone()]],
                         ret: Box::new(Type::Unit),
+                    };
+                } else if name == "clone" && self.st.get(s).owner == self.st.array_sym {
+                    // `def clone(): Array[T]` — the element type is the
+                    // receiver's, exactly as for `apply`.
+                    tree.ty = Type::Method {
+                        paramss: vec![vec![]],
+                        ret: Box::new(Type::Array(Box::new((**elem).clone()))),
                     };
                 }
             }
@@ -15264,6 +15287,30 @@ impl Typer {
         });
         let first = hits.next()?;
         hits.next().is_none().then(|| (first.0, first.1.clone()))
+    }
+
+    /// `chosen`'s declared type, as seen from the receiver of `fun`, with its
+    /// own type parameters still un-instantiated.
+    ///
+    /// The selection that produced `fun` already did this work for every
+    /// alternative and filed it under `group_key` (`overload_member_types`), so
+    /// that is the first place to look; a symbol reached some other way is
+    /// substituted here from the qualifier's type. The raw declaration is the
+    /// last resort, and is right only for a member of a non-generic owner.
+    fn member_ty_as_seen_from(&self, group_key: SymbolId, chosen: SymbolId, fun: &Tree) -> Type {
+        if let Some(alts) = self.overload_member_types.get(&group_key.0) {
+            if let Some((_, t)) = alts.iter().find(|(s, _)| *s == chosen) {
+                return t.clone();
+            }
+        }
+        let raw = self.st.get(chosen).ty.clone();
+        if let TreeKind::Select { qual, .. } = &fun.kind {
+            if !matches!(qual.ty, Type::NoType | Type::Error) {
+                let t = self.st.subst_as_seen_from(&qual.ty, &raw);
+                return self.st.expand_in_type(&qual.ty, &t);
+            }
+        }
+        raw
     }
 
     fn only_alt_with_tparams(&self, sym: SymbolId, n: usize) -> Option<SymbolId> {

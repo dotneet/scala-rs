@@ -1809,6 +1809,18 @@ fn add_array_members(st: &mut SymbolTable) {
         Type::Unit,
         Intrinsic::None,
     );
+    // `arr.clone()`. Every JVM array has a public `clone()`; nsc gives it the
+    // receiver's own type (`def clone(): Array[T]`) and emits
+    // `invokevirtual "[I".clone:()Ljava/lang/Object;` plus a `checkcast`.
+    // Declared with an `Any` result like `apply`, and rewritten to the
+    // receiver's type where `apply` and `update` are (`Check::type_select`).
+    // An empty parameter list, not a parameterless method: `clone()` is how
+    // it is written, here as in Java.
+    let cl = method(st, c, "clone", vec![], Type::Any, Intrinsic::None);
+    st.get_mut(cl).ty = Type::Method {
+        paramss: vec![vec![]],
+        ret: Box::new(Type::Any),
+    };
 }
 
 pub(crate) fn fn1(arg: Type, ret: Type) -> Type {

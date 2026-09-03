@@ -12052,6 +12052,232 @@ unify する必要があるので、そこも 1 行足してあります。
   `checkcast` するので `ClassCastException` になります。これも main からある件で、
   fixture では要素代入で配列を作って避けました。
 
+  → 上の 3 件はすべて次節（`agent/arraygen`）で直しました。
+
+### `Array` の codegen ——「型は通るのに実行時に壊れる」7 件（`agent/arraygen`）
+
+`agent/setmap` が `tests/fixtures/setmap1.scala` で回避していた 3 件を直し、
+あわせて `Array` を使う普通のプログラム 8 本を dual-run しました。プローブ 8 本の
+うち **6 本が最初の実行で差分を出し**、さらに 4 つの根が出ました。合計 7 件。
+fixture は `tests/fixtures/arraygen1.scala`（全ケースを 1 ファイル）、テストは
+`crates/cli/tests/arraygen.rs`、プローブは `tests/conform/array_*.scala` の 8 本。
+修正前の main（`d7e7767`）では `arraygen1.scala` は **4 件のエラー**で止まり、
+その 4 行を消して通しても `VerifyError` → `ClassCastException` →
+`ClassFormatError` と順に落ちます。
+
+`Array` は erasure と ABI の継ぎ目そのもので、**7 件のうち 6 件は型検査を
+完全に通ります**。「コンパイルできた」は `Array` については何の保証にもなりません。
+
+**1. 明示型引数がジェネリック親のメンバに as-seen-from をかけない。**
+`s.map[Int](_.length)`（`s: immutable.HashSet[String]`）が
+`value length is not a member of A` ＋ `found: CC[Int] required: HashSet[Int]`
+になり、型引数を書かない `s.map(_.length)` は通っていました。`TypeApply` は
+オーバーロード集合を型引数の個数で絞ったあと `SymbolTable::get(only).ty`——
+**宣言そのままの型**——を土台にしていました。`map` を宣言しているのは
+`IterableOps[A, CC, C]` なので、`A` も `CC` も受け手の引数が入っていません。
+選択（`type_select`）は同じ仕事をすでに済ませて `overload_member_types` に
+入れてあるので、そこから引くようにしました（`Check::member_ty_as_seen_from`）。
+
+**`xs.toArray[R]` は直っていません**（下の「残件」）。`agent/setmap` の README
+が「これは as-seen-from の件と**同じ根**」と書いていて、コーディネータ経由で
+`agent/final1` からも同じ見立てが来ましたが、**どちらも誤りです**。prelude の
+`toArray` は `(implicit ClassTag[A]): Array[A]` と**単相**に宣言されていて
+（`prelude_seq.rs` の `add_conversions`、`prelude.rs:3460`）、nsc の
+`toArray[B >: A: ClassTag]: Array[B]` ではありません。型パラメータが 0 個なので、
+明示型引数は as-seen-from 以前に**代入する先を持ちません**。実際
+`s.map[Int](f)` を直しても `xs.toArray[R]` は 1 ミリも動きませんでした。
+多相にしてみると、今度は `List(1, 2, 3).toArray`（期待型なし）で `B` が未確定の
+まま残り、implicit 節が適用されずに
+`value mkString is not a member of (ClassTag[B])Array[B]` になります。
+**下限しか持たない型変数を選択の時点で下限に落とす**推論が先に要ります
+（`instantiate_leftover_tparams` は `Apply` からしか呼ばれず、しかも
+`sig_params` が `ClassTag[B]` を見つけて降ります）。触るのは
+`maybe_auto_apply` / `adapt_implicit_apply` で、そこは `agent/final1` が
+同時に編集している場所なので、このスライスでは戻しました。
+
+**2. 同じファイルの前の宣言が後の生成を壊す——持ち越されているのは
+`scala.Array$` のオーバーロード集合そのものです。** `scala.Array` は `apply` を
+**10 個**宣言しています。prelude が手書きするのは
+`apply[T](xs: T*)(implicit ClassTag[T]): Array[T]` の 1 つだけで、残り 9 つ
+（`apply(x: Int, xs: Int*): Array[Int]` など、プリミティブと `Unit`）は
+**`PickleSupply` が要求されたときにだけ**シンボル表に入ります。入れる引き金は
+`Array[T](…)` という**明示型引数**で、`type_expr` の `TypeApply` 分岐が
+`Module[T]` の形を見て `supply_from_pickle_class(cls, "apply")` を無条件に
+呼びます（`SCALA_RS_PICKLE_DEBUG=1` が `scala.Array#apply: supplied 9
+overload(s)` と出します）。
+
+つまり **`Array[Any](1, "a")` がファイルのどこかにあるかどうかで、後続の
+`Array(3, 1, 2)` が解決するオーバーロードが変わります**。それ自体は nsc と
+同じ結論（nsc も `apply(x: Int, xs: Int*)` を選びます）に着くのですが、
+gen.rs は `owner == "scala/Array$" && name == "apply"` に対して
+**10 個すべてに generic の記述子を書いていました**:
+
+```
+invokevirtual scala/Array$.apply:(Lscala/collection/immutable/Seq;Lscala/reflect/ClassTag;)Ljava/lang/Object;
+```
+
+`apply(x: Int, xs: Int*)` を選んだ呼び出しはスタックに `int` と `Seq` を
+積んでいるので、`Seq` の位置に `int` が来て `VerifyError`。単相の 9 つは
+自分の記述子（`method_desc_boxed`）が正しいので、型パラメータの有無で
+分けるだけで済みました。
+
+**この「順序が意味を持つ」性質は `Array$` 固有ではありません。**
+`PickleSupply::complete` は設計上 lazy かつ additive で、`check.rs` の
+`own_decl_when_all_inherited` のコメントが同じ事故（`TreeMap#collect` が
+`Map#collect` を先に読んだファイルでだけ `List` を返した）を記録しています。
+供給の順序を変えるのではなく、**どのオーバーロードが選ばれても正しい
+記述子が出る**ようにするのが直し方です。fixture の `mixedFirst` を
+`inferredLater` より前に置いてあるのはこれを踏むためで、動かすとテストが
+バグを見なくなります。
+
+**3. `ClassTag` の `classOf` がタプルで `java/lang/Object` に落ちる。**
+`Array[(Int, String)](1 -> "one")` は
+`Array.apply(seq, ClassTag.apply(classOf[Object]))` を出すので `Object[]` が
+でき、呼び出し側が付ける `checkcast [Lscala/Tuple2;` で
+`ClassCastException`。`gen_java_class_of` は `Type::Array` を（同じ理由で）
+特別扱いしていましたが、`Type::Tuple` / `Type::Function` は `_` に落ちていました。
+`Type::Annotated` / `Type::Constant` も剥がすようにしてあります。
+`ClassTag` の runtime class は `Array.apply` が**実際に確保する配列の要素型**
+なので、`jvm_desc` と食い違ってはいけません。
+
+**4. `f(arr: _*)` が `Array` を包まずに渡す。** 可変長引数は
+`scala/collection/immutable/Seq` に erase されるので、
+`render(names: _*)`（`names: Array[String]`）は
+`[Ljava/lang/String;` をその記述子の下に積んで `VerifyError` でした。
+gen.rs には「`f(xs: _*)` はもう列を持っているので包むものは無い」という
+前提があり、**`Array` は列ではない**という例外が抜けていました。nsc の javap は
+`Predef.copyArrayToImmutableIndexedSeq(names)` を出します（`genericWrapArray`
+の `mutable.ArraySeq` は `immutable.Seq` ではないので届きません）。
+**Java の可変長引数だけは例外**で、そこは配列そのものが引数です。
+
+**5. `Array[T]` の要素代入がロードできないクラスファイルを出す。**
+`def repeat[T: ClassTag](x: T, n: Int)` の中で `a(i) = x` すると
+`invokevirtual "[java/lang/Object".update:(ILjava/lang/Object;)V` が出ます。
+`[java/lang/Object` は JVM が名前として受け付けないので
+**`ClassFormatError` でクラスがロードすらできません**。`new Array[T](n)` は
+`ct.newArray(n)` に書き換えられて型が `Any` になるため、`qual.ty` が
+`Type::Array` ではなくなり、gen.rs の配列アクセス経路に入らないためでした。
+nsc と同じく `ScalaRunTime.array_apply` / `array_update` / `array_clone` を
+呼びます（`length` がすでに `array_length` に落ちているのと同じ分岐）。
+`def dup[T](a: Array[T]) = a.clone()` も**同じ根**で、こちらは引数として
+受け取っただけでも壊れます。`--no-scala-library` には `ClassTag` が無いので、
+そちらは今までどおり診断です（`tests/fixtures/arraygen_gate.scala`）。
+
+判定は**要素型ではなく受け手の型**で行っています。要素型が抽象な配列は
+この時点でもう `Type::Array` として届かず（`new Array[T](n)` は
+`ct.newArray(n)` に書き換わって型が `Any` になり、`a: Array[T]` の
+パラメータも erasure を通ると潰れます）、**それが配列用の経路が
+そもそも呼ばれなかった理由**です。
+
+**6. `ArrayOps` の `$extension` に引数無しの記述子を書いていた。**
+`a :+ x` が
+`invokestatic scala/collection/ArrayOps.$colon$plus$extension:(Ljava/lang/Object;)Ljava/lang/Object;`
+——**受け手だけの記述子**——を出していました。実物は
+`$colon$plus$extension(Object, Object, ClassTag)Object` です。スタックには
+配列・要素・`ClassTag` の 3 つが積まれるので、余りが最初の合流点で
+`VerifyError: Inconsistent stackmap frames` になります。`head` や `reverse` の
+ように受け手しか取らないメンバでは正しかったので、**引数を取るメンバだけが
+壊れていました**。pickle から来たシグネチャは nsc が出す erasure そのものなので、
+記述子はシンボルから作ります（受け手だけは手書き——`ArrayOps` の
+`Array[A]` は `Object` に潰れ、`[Ljava/lang/Object;` ではありません）。
+
+**7. ラムダの `Array` 引数に checkcast が無い。** `g.map(_.length)`
+（`g: Array[Array[Int]]`）が `VerifyError: Bad type on operand stack in
+arraylength`。ラムダの `apply` は引数を `Object` で受けるので、
+`arraylength` / `aaload` / `aastore` の前に cast が要ります。引数を型付き
+ローカルへ移す所は `Type::Class` と `Type::Tuple` は cast していて、
+`Type::Array` だけ抜けていました（捕捉変数の側の
+`emit_from_erased_object` は前から正しく扱っています）。要素型が抽象なら
+配列自身も `Object` に潰れているので、そこは cast しません。
+
+**差分プローブ（`Array` 8 本）**
+
+機能チェックリストではなく普通のプログラムとして書き、出力を `println` で
+伴わせて dual-run しました。**8 本中 6 本が最初の実行で落ちています**
+（`array_matrix` だけは書き直しました。下の残件を踏むためです）。
+
+| プローブ | 形 | 初回の結果 |
+|---|---|---|
+| `array_histogram` | `new Array[Int]` に数えて `sortBy`/`take` | 一致 |
+| `array_matrix` | `Array[Array[Double]]` の積、`ofDim`/`flatMap` | 差分（`flatten`/`transpose`。下の残件） |
+| `array_varargs` | `Array[Item]` → `map` → `render(names: _*)` | 差分（4） |
+| `array_inplace_sort` | `update` でのバブルソート、`fill`/`tabulate`/`clone` | 差分（`clone` 未実装） |
+| `array_log_parse` | `split` → `flatMap` → `groupBy` → `toSeq` | 差分（下の残件 2 つ） |
+| `array_classtag_util` | `[T: ClassTag]` の `repeat`/`concat`、`Array.copy` | 差分（5） |
+| `array_inventory` | `indexWhere`/`updated`/`:+`/`zipWithIndex`/`partition` | 差分（6） |
+| `array_argv_match` | `case Array("add", a, b)` / `rest @ _*`、`grouped` | 一致 |
+
+**残件（最小再現つき・直していません）**
+
+* `Array[Array[T]]` の `flatten` / `transpose`。どちらも
+  `A => IterableOnce[B]` / `A => Array[B]` という**view の implicit** を要求
+  します。探索が失敗してメソッド型が式に残り、
+  `value mkString is not a member of ((Array[Int]) => IterableOnce[B], ClassTag[B])Array[B]`
+  という診断になります（**黙って通ってはいません**）。`array_wrap_view` は
+  `Array[Int]` 専用かつ `wrapIntArray` 固定なので、`array_wrap_candidates` で
+  一般化したうえで `B` を包んだ型から解く必要があります。
+
+  ```scala
+  val grid: Array[Array[Int]] = Array(Array(1, 2, 3), Array(4, 5, 6))
+  println(grid.flatten.mkString(""))
+  println(grid.transpose.map(_.mkString("")).mkString("|"))
+  ```
+
+* `Array#flatMap` に**メソッド参照**を渡すと `ambiguous overload`。ラムダ
+  （`xs.flatMap(s => parse(s))`）は通り、`List#flatMap(parse)` も通ります。
+  `ArrayOps.flatMap` は 2 つあり、prelude では 1 つ目の引数を
+  `A => Any` と近似しています。nsc は `A => IterableOnce[B]` なので
+  `Option[Int]` の方が `A => BS` より specific だと言えますが、`Any` では
+  引き分けます。1 つ目を nsc どおりにすると
+  `arr.flatMap(x => Array(...))` が 2 つ目へ回り、そこは view の implicit
+  （上の件）を要求するので、この 2 つは一緒に直す必要があります。
+
+  ```scala
+  def parse(s: String): Option[Int] = s.toIntOption
+  Array("1", "x").flatMap(parse)   // ambiguous overload for flatMap
+  ```
+
+* `"a b c".split(" ", 2)`。prelude の `String#split` は 1 引数だけです
+  （`Array` ではなく `String` 側の穴）。
+
+* `xs.toArray[R]`（上の 1 参照）。prelude の `toArray` を多相にするだけでは
+  `List(1,2,3).toArray` が壊れるので、下限だけを持つ型変数の推論と一緒に。
+  `agent/setmap`・`agent/final1` の両方がここを踏んでいます。
+
+  ```scala
+  def f[T: ClassTag](xs: Seq[T]): Array[Any] = xs.toArray[Any]
+  // found: Array[T]  required: Array[Any]
+  ```
+
+なお、コーディネータ経由で `agent/final1` から回ってきた
+「クラスのメソッド内の `new Array[R](len)`（`R` は抽象型パラメータ）が
+`[java/lang/Object` を定数プールに書いて `ClassFormatError`」は上の **5** と
+同じ根で、この節で直っています。回避（`Array.tabulate[R]`）は外して構いません。
+正確には壊れるのは `new` ではなく**その配列に触る側**で、`out(i) = …` /
+`out(i)` / `a.clone()` の 3 つです（`c.blank[Int](3)` のように作って返すだけなら
+前から通っていました）。fixture の `CArr#toArr` と `Main.dup` が両方を留めます。
+
+```scala
+class CArr[+T](val xs: Seq[T]) {
+  def toArr[R >: T: ClassTag]: Array[R] = {
+    val out = new Array[R](xs.length)
+    var i = 0
+    while (i < xs.length) { out(i) = xs(i); i += 1 }   // ← ここが ClassFormatError だった
+    out
+  }
+}
+```
+
+**測定**
+
+* `tests/slick_measure.sh`: `files=184 errors=17 files_with_errors=13`
+  → **変化なし**（エラー行も 1 文字違わず同一）。この 7 件はどれも
+  「型検査は通るのに実行時に壊れる」ものなので、型エラーを数える指標は
+  動きません。**動かないことを確認するのが正しい期待値**です。
+* `tests/slick_subset.sh`（`SLICK_SEED_LOG` 付きで 1 回）:
+  `subset_files=47 classes=300 verified=300 failed=0` → 変化なし。
+* `tests/conform`: 77 本 → **85 本**。
+
 ## ライセンス
 
 Apache-2.0
