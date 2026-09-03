@@ -11548,6 +11548,131 @@ overloadshadow ambigmap setapply uniteq integral ordsummon mutcoll ovl2 ovl3 ovl
   同 `82:61` の `missing parameter type for expanded function`。
   根 3 の 2 件は 72 行目の**同じ行**に出ていましたが、72:71 の
   `TypedType[Boolean]` とは無関係で、そちらを直さないまま消えました。
+### 適用されないまま式の型に残る implicit 引数節、4 つの根（`agent/implclause`）
+
+式の型が `(引数)結果` の形で出る——`value isEmpty is not a member of
+(<:<[TermSymbol, (K, V)])Map[K, V]` のような——症状を最小再現から追いました。
+**同じ症状の裏に 4 つの独立した根**があり、うち 3 つは「implicit 節を埋める
+機械」ではなく**その手前**（型引数の解き方、修飾子の型付け、候補の可否判定）に
+ありました。slick は `errors=44 files_with_errors=26` → `errors=40
+files_with_errors=24`（新規エラーはゼロ）。テストは
+`crates/cli/tests/implclause.rs`、fixture は `tests/fixtures/implclause.scala`
+（1 ファイルに全ケース）と `tests/fixtures/implclause_bad.scala`。
+
+**1. 関数パラメータの結果を、パラメータ側のクラスに揃えてから型引数を解く。**
+
+```scala
+def h(v: Vector[(String, Map[Long, Int])]) = v.iterator.flatMap(_._2).toMap
+```
+
+`unify_one` は**クラスのシンボルを見ずに型引数を位置で zip** します。
+`flatMap[B](f: A => IterableOnce[B])` の `IterableOnce[B]` にラムダの本体の
+`Map[Long, Int]` を突き合わせると `[B]` と `[Long, Int]` を zip して
+`B = Long` になり、`flatMap` は `Iterator[Long]` を返していました。だから
+続く `toMap[K, V](implicit ev: A <:< (K, V))` は `TermSymbol <:< (K, V)` の
+witness を探して見つからず、メソッド型が式の型として残ります。
+
+`unify_tparam_all` は既に `align_to_param_class` で**引数全体**をパラメータの
+クラスに揃えていましたが、パラメータが関数型のときは何もしていませんでした。
+`align_arg_to_param` を足し、関数パラメータの**結果**も揃えます。パラメータは
+反変なので、揃えるのは結果だけです（引数側を基底クラスに読み替えると、
+リテラルが実際に書いたことを捨ててしまいます）。
+
+**2. セレクションの修飾子は、呼び出し引数の中にあっても implicit 節を埋める。**
+
+```scala
+def f(q: Qy[Int]) = SV(q.pack.to[Seq], "x")   // pack[R](implicit s: Sh[E, R]): Qy[R]
+```
+
+`adapt_implicit_apply` には「引数がオーバーロードの決まる前に型付けされて
+いる間は節に触らない」という退避（`typing_call_args`）があります。これは
+**引数の木そのもの**についての話なのに、その中の**修飾子**にまで効いていました。
+`pack` は `to` を引くより前に値でなければならず、nsc も修飾子は EXPRmode で
+型付けして adapt します。
+
+ただし `type_select` が修飾子を型付けする**間ずっと**フラグを落とすのは
+行きすぎでした。同じフラグは修飾子の中の**タグ要求**の答え方も決めていて、
+一律に落とすと `tests/fixtures/ex_impl.scala` の `weakTypeOf[ExBox[E]]` が
+`E` のタグを拾い、`ExBox[ExRow]` が `ExRow` と印字されます（`--test engine` が
+そこで落ちました）。そこで、修飾子を**通常どおり**型付けしたうえで、
+implicit 節が生き残っていたとき（`implicit_only_result`）だけ
+`adapt_implicit_apply` をもう一度、フラグを落として当てます。あわせて、
+それでも埋まらなかった節はここで `reject_unapplied_implicit_clause` に渡します
+——`adapt` の backstop は修飾子を見ません（期待型が無いので）。
+`value to is not a member of (Sh[Int, R])Qy[R]` ではなく
+`could not find implicit value of type Sh[Int, R]` になります。
+
+**3. `A => B` を継承したクラスは、型引数を解く材料にもなる。**
+
+```scala
+abstract class Conv[-A, +B] extends (A => B)
+def flatten[R2](implicit ev: R <:< Act[R2]) = flatMap(ev)   // flatMap[R2](f: R => Act[R2])
+```
+
+`function_view`（引数を「継承している関数型」として読み直す口）は、親が
+`Function1` の**クラス**として記録されている場合しか見ていませんでした。
+`extends (A => B)` と書かれた親は `Type::Function` として記録されます
+（`<:<` もこの形で入ります）。適合自体は通る（`val g: R => Act[R2] = ev` は
+書ける）のに、呼び先の `R2` を引数から解くところだけが空振りして
+`no matching overload` になっていました。`Type::Function` の親をそのまま
+view として返します。
+
+**4. `ClassTag` を implicit 引数に持つ導出規則は「使えない候補」ではない。**
+
+```scala
+implicit def forColl[C[X] <: Iterable[X]](implicit cbf: Factory[Any, C[Any]],
+                                          tag: ClassTag[C[Any]]): Coll[C]
+implicitly[Coll[Seq]]   // ← 見つからなかった
+```
+
+`implicit_fit_at` は導出規則の可否を「自分の implicit 引数が
+`search_implicit_at` で**見つかる**か」で判定します。`ClassTag` /
+`TypeTag` は nsc と同じく**探すのではなく作る**ものなので、この判定では常に
+不合格でした。`implicitly[ClassTag[Seq[Any]]]` を直接書けば通るのに、
+規則の中に置くと通らない、という食い違いです。`fill_implicit_params` が持って
+いた fallback を判定側にも与え（`built_not_found`）、木を組む
+`implicit_tree` の再帰にも同じ fallback を足しました。view 系の fallback
+（`identity_view` / `conversion_view` など）は**入れていません**——あれらは
+自分で探索を回すので、関数型のパラメータを一律に「埋まる」ことにしてしまいます。
+これが slick の `Query.to[Seq]`（`TypedCollectionTypeConstructor[Seq]`）です。
+
+**ブリーフの診断のうち、実測で否定できたもの**:
+
+* `xs.flatten` の implicit 節（`agent/probe12` の指摘）は **main で既に直って
+  います**（`cbf207b` のマージ）。`List(Some(1), None).flatten.sum` は今の main
+  で通ります。
+* `implicitly[String => String]` が `reject_unapplied_implicit_clause` に
+  潰される（`agent/dbio` の指摘）も**再現しません**。今は通ります。
+* `Predef.$conforms` の消息は現状で正しく、実 jar の
+  `javap scala.Predef$` も `public <A> scala.Function1<A, A> $conforms()` です
+  （`crates/typer/src/prelude_conform.rs` の記述どおり）。実装が
+  `<:<.refl` を返す以上、`A <:< B` の探索が `<:<.refl` に落ちるのは nsc と
+  同じ挙動で、スコープ構築の順序の問題ではありませんでした。
+
+**残件**（最小再現あり、直していない）:
+
+* `Array[T]` は**引数位置で `IterableOnce[T]` に変換されません**。
+  `Map() ++ arr`（slick `jdbc/JdbcTypesComponent.scala:526`）も
+  `def f[B](x: IterableOnce[B]); f(arr)` も `no matching overload` です。
+  `arr.toSeq` と書けば通ります。scala-rs は `Array` を `ArrayOps` の
+  メンバ供給で支えていて、`Predef.wrapRefArray` / `genericWrapArray` に
+  相当する**一般の view が無い**のが根です。埋めるには codegen 側で
+  ラップを挟む必要があり、この節の変更（型検査のみ）とは別のスライスです。
+
+#### テストと計測
+
+`cargo test --workspace --release` は 118 バイナリすべてグリーン
+（`implclause` が 1 本増えて 117 → 118）。継ぎ目リスト
+（`overloadshadow` / `ambigmap` / `setapply` / `uniteq` / `integral` /
+`ordsummon` / `mutcoll` / `conform` / `e2e`）と `mismatch14` / `hkinfer` /
+`dbio` / `buildfrom` / `buildfrom2` / `arrconv` / `seqfn` / `cats2` / `cats3` /
+`catsimpl` / `reject` / `ovl3` / `ovl4` / `proj` / `asttype` / `engine` も
+個別に回しています。`crates/backend/` は触っていないので
+`tests/slick_subset.sh` は省略。slick は `tests/slick_measure.sh` で
+着手時 `errors=44 files_with_errors=26` → 完了時 `errors=40
+files_with_errors=24`、消えたのは
+`compiler/CreateAggregates.scala:99,100` / `dbio/DBIOAction.scala:52` /
+`lifted/Query.scala:191` の 4 件で、**増えたものはありません**。
 
 ## ライセンス
 
