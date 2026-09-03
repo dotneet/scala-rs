@@ -1,0 +1,4 @@
+head,time:scala.concurrent.duration.FiniteDuration,mid,a,b,c,tail,{ final class $anon extends _root_.scala.AnyRef { def <init>() = { super.<init>(); () }; def f_u: String = "u"; def f_v: String = "v"; override def toString: String = "obj" }; new $anon() },BOX|p;q;end
+head,mid,a,b,c,tail,{ final class $anon extends _root_.scala.AnyRef { def <init>() = { super.<init>(); () }; def f_u: String = "u"; def f_v: String = "v"; override def toString: String = "obj" }; new $anon() },BOX|p;q;end
+[time:scala.concurrent.duration.FiniteDuration]
+[]

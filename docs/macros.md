@@ -2147,3 +2147,124 @@ slick は `errors=115 → 113`、`files_with_errors=41 → 41`。
 3. ローカル・パラメータの *free term*、ブロック、関数リテラル、`this`、
    型引数以外の型。
 4. §7.14 の残件（trait の中の入れ子*クラス*を型として書く形）はそのまま。
+
+### 7.16 `ShapedValue.mapToImpl` — 3 つの根（`agent/shaped` スライス）
+
+§3.3 に「本体はほぼ全部 quasiquote」と書いた `slick.lifted.ShapedValue` の
+**5 件を 0 件**にした。5 件のうち 2 件は `<error>` 型の穴という quasiquote
+診断で、これは手前 3 件のカスケードだった。
+
+#### 1. `MemberScope` が `Iterable[Symbol]` だと読めない
+
+`rTag.tpe.decls.collect { … }` — `mapToImpl` の 1 行目 — が
+`value collect is not a member of Scopes.MemberScope`。実 scala-reflect の
+階層は
+
+```text
+type MemberScope >: Null <: AnyRef with Scope with MemberScopeApi
+trait MemberScopeApi extends ScopeApi
+trait ScopeApi extends Iterable[Symbol]
+```
+
+で、`MemberScopeApi` も `ScopeApi` も**自分の pickle を持たない**
+（`Scopes$MemberScopeApi` の classfile は `interfaces: 0`。親は
+`Scopes.scala` の pickle にしか書かれていない）。
+
+`PickleSupply::complete` は「クラス自身の pickle に無ければライブラリ祖先にも
+聞く」形だったが、その祖先リストは **`library_ancestors` が呼ばれた瞬間の
+親リストのスナップショット**だった。スタブの親リストは pickle を読むまで空なので、
+**2 段以上の登りが 1 段目で止まる**: `MemberScopeApi` の pickle 親 `ScopeApi`
+までは届き、`complete_on(ScopeApi)` がその直後に `Iterable[Symbol]` を付けても、
+`Iterable` には誰も聞かない。
+
+`complete_on_ancestors` に置き換え、**1 段ごとに `ensure_parents` してから
+次の段に進む**ようにした。順序（親を後ろから、幅優先＝
+`Check::enter_inherited_members` と同じ線形化）は変えていない。
+
+#### 2. 抽象型メンバ越しに読んだメンバが置換されない
+
+1 のあと `collect` は見つかるが、`decls.toList` が `List[A]`（`Iterable` 自身の
+型パラメータのまま）を返す。`SymbolTable::subst_as_seen_from` の `walk` に
+`Type::TypeMember` / `Type::TypeParam` の枝が無く `_ => ty` に落ちていた。
+**抽象型メンバから読んだメンバはその上限が宣言している**ので、上限をたどって
+置換するようにした。これで `decls` の要素型が本当に `Symbol` になり、
+`s.isVal` / `s.isCaseAccessor` / `s.typeSignature` が解ける。
+
+#### 3. `blackbox.Context { type PrefixType = … }`
+
+slick は `c: blackbox.Context { type PrefixType = ShapedValue[?, U] }` と書く。
+`macro_context_kind` は `Type::Class` しか見ておらず、refinement は
+`must take scala.reflect.macros.blackbox.Context … as its first parameter`
+だった。候補を 2 つ増やした:
+
+* **refinement の親**（source から読んだとき）。refinement はメンバを固定する
+  だけで、blackbox か whitebox かを決めるのは親のほうである。
+* **第 1 引数の erased descriptor**（最後の手段）。scala-rs 自身の pickle は
+  refinement を落とすので、我々の classfile から読み戻すと `Any` になる。
+  descriptor は refine されないので、そこが答えになる。第 1 引数が本当に `Any`
+  なら descriptor は `java.lang.Object` で、どちらの `Context` でもないから
+  従来どおり断る。source の実装（classfile が無い）では descriptor が
+  引けないので、診断は弱まらない。
+
+#### 4. `..$xs` と普通の要素の混在
+
+`Reifier::splice_clause` は「全部普通」か「`..$xs` 1 つだけ」しか組まず、
+混在は refuse していた。nsc の `reifyList` と同じにした:
+
+> 連続する普通の要素は `List(...)` 1 つにまとめ、rank-1 の穴はそのまま、
+> 左から `++` でつなぐ。
+
+`q"f(a, ..$xs, b)"` → `List(<a>) ++ xs ++ List(<b>)`。引数の順序が連結の順序で、
+どの断片もすでに `List[Tree]` なので静的型を推測する場所が無い。効く先は
+`arg_clause` / `pat_clause` / `stats_splice`（ブロックの文）/
+`reify_defs` のテンプレート本体と parents の 4 箇所で、要素の lowering は
+呼び出し側が関数で渡す（引数は term、パターン引数は pattern、ブロックの要素は
+statement、parent は parent）。rank 2（`...$xss`）は `hole` 自身が従来の
+メッセージで断る。
+
+#### ついでに直した 2 つ
+
+* **展開の中の空 `TypeTree`**。`q"val ff = $f"` は nsc の quasiquote が
+  `TypeTree()`（型の無い木）を作る。`expand.rs` はこれを
+  `the expansion contains an empty TypeTree` と断っていた。`ValDef` の型の
+  位置に限って `TreeKind::Empty` に落とし、typer に推論させる。
+  **その位置に限る**のは、他の場所には「推論しろ」を表す木が我々の AST に
+  無いからである。
+* **`_root_` が term 位置で解決されない**。`import_path_syms` にしか枝が無く、
+  `_root_.scala.collection.immutable.List(…)` が `not found: value _root_` だった。
+  `type_ident` でルートパッケージに解決する。
+
+#### 検証
+
+`tests/fixtures/sv_impl.scala` + `sv_use.scala` を 2 段コンパイルして 4 行印字し、
+**同じ 2 ファイルを実 scalac 2.13.16 で 2 段コンパイルして実行しても同じ 4 行**
+（`tests/fixtures/expected/sv_use.txt`）。テンプレート本体の混在 splice は
+**組んだ木を印字した文字列**を展開に載せているので、splice が別の位置に落ちたら
+（コンパイルも実行も通ったまま）行が変わる。`sv_gaps_bad.scala` は断る 3 形を
+固定する（うち 2 つは実 scalac も断るので一致の固定）。
+
+slick は `errors=99 → 94`、`files_with_errors=39 → 38`。`ShapedValue.scala` は
+**5 → 0**。`crates/backend/` は触っていないので `slick_subset.sh` は回していない。
+
+#### 残っているもの
+
+1. **scala-rs 自身の `ScalaSignature` は case accessor を記録しない。**
+   マクロは `WeakTypeTag` のメンバを実行時ミラー越しに読むので、scala-rs が
+   コンパイルした case class は `decls` が空に見える。`mapTo[R]` を scala-rs 製の
+   `R` に当てると、黙ってフィールド 0 個の展開になる。fixture がライブラリの型
+   （`Deadline` / `BigDecimal`）を列挙しているのはこのため。
+2. **抽象型メンバに対する型パターンが `instanceof java/lang/Object` になる。**
+   `erase_ty` は抽象型メンバを `Object` に落とす（型パラメータは上限に落とすのに）。
+   `case s: TermSymbol` のテストが素通りするので、`decls` に `TermSymbol` でない
+   ものが混ざる型で `mapToImpl` を展開すると実行時
+   `IncompatibleClassChangeError`。直すには型パターンの `instanceof` を上限の
+   erasure で出す必要があり、codegen に入る。
+3. **scala-rs の classfile から読み戻した macro def は macro def でなくなる。**
+   `macro_impl` が pickle に載らないので、別の run で `mapTo` を呼ぶと普通の
+   メソッド呼び出しとしてコンパイルされ、実行時 `NoSuchMethodError`（診断なし）。
+4. `_root_.scala.List` / `_root_.scala.Vector` は
+   `no matching overload for <overload List$ | List$>`。パッケージ `scala` の
+   スコープに同じ companion が 2 つ入っている（レキシカルな `scala.List` は
+   別経路でそれを避けている）。
+5. `mapToImpl` の**展開**には上の 1〜3 に加えて、展開結果の匿名クラス
+   （`expand.rs` に `ClassDef` の枝が無い）が要る。slick 本体のコンパイルには不要。

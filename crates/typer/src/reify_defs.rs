@@ -380,7 +380,7 @@ impl Reifier<'_> {
         if impl_.self_name.is_some() || impl_.self_tpt.is_some() {
             return Err("a self type (`class C { self => ... }`) is not reified yet".to_string());
         }
-        let parents = match self.splice_clause(&impl_.parents, Pos::Type)? {
+        let parents = match self.splice_clause(&impl_.parents, Pos::Type, &|p| self.parent(p))? {
             Some(xs) => {
                 if is_case {
                     return Err(
@@ -423,7 +423,7 @@ impl Reifier<'_> {
                 self.list(vec![])
             }
         } else {
-            match self.splice_clause(&impl_.body, Pos::Term)? {
+            match self.splice_clause(&impl_.body, Pos::Term, &|s| self.definition(s))? {
                 Some(xs) => xs,
                 None => {
                     let mut out = Vec::new();

@@ -1010,7 +1010,7 @@ impl<'a> Reifier<'a> {
 
     /// The arguments of a pattern application, as a `List[Tree]`.
     fn pat_clause(&self, args: &[Tree]) -> Result<Tree, String> {
-        if let Some(t) = self.splice_clause(args, Pos::Pat)? {
+        if let Some(t) = self.splice_clause(args, Pos::Pat, &|a| self.pat(a))? {
             return Ok(t);
         }
         let mut out = Vec::new();
@@ -1044,14 +1044,8 @@ impl<'a> Reifier<'a> {
     // -- shared pieces -----------------------------------------------------
 
     /// One parameter clause as a `List[Tree]`.
-    ///
-    /// Two shapes are built: every argument an ordinary term, or a single
-    /// `..$xs` standing for the whole clause. Mixing the two (`f(a, ..$xs)`)
-    /// needs a concatenation whose static type has to be right on both sides,
-    /// and building it wrong would silently reorder a call's arguments, so it
-    /// is refused instead.
     fn arg_clause(&self, args: &[Tree]) -> Result<Tree, String> {
-        if let Some(t) = self.splice_clause(args, Pos::Term)? {
+        if let Some(t) = self.splice_clause(args, Pos::Term, &|a| self.term(a))? {
             return Ok(t);
         }
         let mut out = Vec::new();
@@ -1061,15 +1055,32 @@ impl<'a> Reifier<'a> {
         Ok(self.list(out))
     }
 
-    /// `rs.SyntacticBlock(<xs>)` when `elems` is exactly one `..$xs`.
+    /// `rs.SyntacticBlock(<stats>)` when `elems` contains a `..$xs`.
     fn stats_splice(&self, elems: &[Tree]) -> Result<Option<Tree>, String> {
         Ok(self
-            .splice_clause(elems, Pos::Term)?
+            .splice_clause(elems, Pos::Term, &|a| self.stat(a))?
             .map(|xs| self.call(self.support_member("SyntacticBlock"), vec![xs])))
     }
 
-    /// `..$xs` standing for a whole clause, if that is what `args` is.
-    fn splice_clause(&self, args: &[Tree], pos: Pos) -> Result<Option<Tree>, String> {
+    /// A clause containing at least one `..$xs`, as a `List[Tree]`; `None`
+    /// when there is no splice in it and the caller's plain `List(...)` is the
+    /// answer.
+    ///
+    /// nsc's `reifyList`: runs of ordinary elements become one `List(...)`
+    /// each, every rank-1 hole stands for itself, and the pieces are joined
+    /// left to right with `++`. So `f(a, ..$xs, b)` reifies as
+    /// `List(<a>) ++ xs ++ List(<b>)` -- the order of the call's arguments is
+    /// the order of the concatenation, and each piece is already a
+    /// `List[Tree]`, so no piece's static type has to be guessed at.
+    ///
+    /// `plain` lowers an ordinary element, and differs by clause: an argument
+    /// is a term, a pattern argument a pattern, a block element a statement.
+    fn splice_clause(
+        &self,
+        args: &[Tree],
+        pos: Pos,
+        plain: &dyn Fn(&Tree) -> Result<Tree, String>,
+    ) -> Result<Option<Tree>, String> {
         let rank = |a: &Tree| match &a.kind {
             TreeKind::Ident { name } => match hole_index(name) {
                 Some(i) => self.ranks.get(i).copied().unwrap_or(0),
@@ -1080,14 +1091,32 @@ impl<'a> Reifier<'a> {
         if args.iter().all(|a| rank(a) == 0) {
             return Ok(None);
         }
-        if args.len() == 1 && rank(&args[0]) == 1 {
-            let TreeKind::Ident { name } = &args[0].kind else {
-                unreachable!("rank comes from a hole");
+        let mut parts: Vec<Tree> = Vec::new();
+        let mut run: Vec<Tree> = Vec::new();
+        for a in args {
+            if rank(a) == 0 {
+                run.push(plain(a)?);
+                continue;
+            }
+            if !run.is_empty() {
+                parts.push(self.list(std::mem::take(&mut run)));
+            }
+            let TreeKind::Ident { name } = &a.kind else {
+                unreachable!("a non-zero rank comes from a hole");
             };
-            let i = hole_index(name).expect("rank comes from a hole");
-            return self.hole(i, 1, pos).map(Some);
+            let i = hole_index(name).expect("a non-zero rank comes from a hole");
+            // Rank 2 and up (`...$xss`) is still refused, by `hole` itself.
+            parts.push(self.hole(i, 1, pos)?);
         }
-        Err("a `..$` splice mixed with ordinary arguments is not reified yet".to_string())
+        if !run.is_empty() {
+            parts.push(self.list(run));
+        }
+        let mut parts = parts.into_iter();
+        let mut out = parts.next().expect("there is at least one splice");
+        for p in parts {
+            out = self.call(self.select(out, "++"), vec![p]);
+        }
+        Ok(Some(out))
     }
 
     /// The expression filling hole `i`, which must have been written at

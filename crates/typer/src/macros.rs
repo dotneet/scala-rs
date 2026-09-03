@@ -17,6 +17,18 @@ use crate::symbol::{MacroBinding, SymKind};
 const BLACKBOX_CONTEXT: &str = "scala.reflect.macros.blackbox.Context";
 const WHITEBOX_CONTEXT: &str = "scala.reflect.macros.whitebox.Context";
 
+/// `Some(true)` for the blackbox `Context`, `Some(false)` for the whitebox
+/// one, `None` for any other class.
+fn context_kind_of_name(name: &str) -> Option<bool> {
+    if name == BLACKBOX_CONTEXT || name.ends_with("blackbox.Context") {
+        Some(true)
+    } else if name == WHITEBOX_CONTEXT || name.ends_with("whitebox.Context") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Peel `Impl.method[A, B]` down to the reference and its explicit type args.
 fn split_type_apply(t: &Tree) -> (&Tree, usize) {
     match &t.kind {
@@ -265,32 +277,44 @@ impl Typer {
             .and_then(|c| c.first())
             .or_else(|| sym.params.first())?;
         let ty = self.st.get(*first).ty.clone();
-        let name = match &ty {
+        let mut names = Vec::new();
+        // `blackbox.Context { type PrefixType = ShapedValue[_, U] }`: nsc's
+        // own idiom for a macro that wants `c.prefix` at a useful type, and
+        // how slick declares `ShapedValue.mapToImpl`. The refinement only pins
+        // a type member down; which `Context` it refines is still what decides
+        // blackbox from whitebox, so the parents are candidates too.
+        Self::context_type_names(&self.st, &ty, &mut names);
+        // Last resort, and the only answer when the implementation came back
+        // from a class file. scala-rs's own pickle subset records a member's
+        // parameter types by *simple* name -- and a refined one not at all: it
+        // reads back as `Any`. A simple name cannot say blackbox from
+        // whitebox, and `Any` says nothing, but the erased descriptor says
+        // exactly what the JVM will be handed and cannot be refined away. A
+        // first parameter that really is `Any` erases to `java.lang.Object`,
+        // classifies as neither context, and is still refused.
+        names.extend(self.macro_context_from_descriptor(impl_sym));
+        names.iter().find_map(|n| context_kind_of_name(n))
+    }
+
+    /// Every dotted class name a macro implementation's first parameter type
+    /// could be naming, best first. A type that is not a class contributes
+    /// nothing.
+    fn context_type_names(st: &crate::symbol::SymbolTable, ty: &Type, out: &mut Vec<String>) {
+        match ty {
             Type::Class { sym, .. } => {
-                let s = self.st.get(*sym);
-                if s.jvm_name.is_empty() {
+                let s = st.get(*sym);
+                out.push(if s.jvm_name.is_empty() {
                     s.name.clone()
                 } else {
                     s.jvm_name.replace(['/', '$'], ".")
+                });
+            }
+            Type::Refined { parents, .. } => {
+                for p in parents {
+                    Self::context_type_names(st, p, out);
                 }
             }
-            // Our own class files record a member's parameter types by
-            // *simple* name (`install_classpath`'s pickle subset), so a macro
-            // implementation compiled by scala-rs arrives with an unresolved
-            // `Context` -- and "blackbox or whitebox" cannot be read off a
-            // simple name at all. The erased descriptor in the class file can,
-            // so it is the answer here.
-            Type::Named { name, .. } if name == "Context" => {
-                self.macro_context_from_descriptor(impl_sym)?
-            }
-            _ => return None,
-        };
-        if name == BLACKBOX_CONTEXT || name.ends_with("blackbox.Context") {
-            Some(true)
-        } else if name == WHITEBOX_CONTEXT || name.ends_with("whitebox.Context") {
-            Some(false)
-        } else {
-            None
+            _ => {}
         }
     }
 

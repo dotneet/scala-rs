@@ -424,7 +424,10 @@ fn reify_qq_bad_names_every_form_it_cannot_build() {
     );
     for needle in [
         "an `if` without an `else` is not reified yet",
-        "a `..$` splice mixed with ordinary arguments is not reified yet",
+        // A `..$` splice among ordinary arguments used to be refused here. It
+        // is built now (`docs/macros.md` §7.16); the rank-2 `...$xss` that is
+        // still refused is pinned by `engine.rs`'s
+        // `sv_refused_forms_are_named`.
         "cannot stand for a single tree",
         "docs/macros.md",
     ] {
