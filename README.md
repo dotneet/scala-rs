@@ -4090,6 +4090,8 @@ prelude の穴・小さな型検査の穴を潰したフィクスチャは接頭
 
 `agent/cats2` スライス（cats-effect の summoner が `F.type` を返す件と、文字列補間の `$this`）のフィクスチャは接頭辞 `c2`（`c2_thisinterp` / `c2_thisinterp_bad`）で、同じ理由から `crates/cli/tests/cats2.rs` に置いています。`c2_thisinterp.scala` はクラス・トレイト・`object`・ラムダの中の `s"… $this …"` を通し、私有ランタイムと `--scala-library` の両方で `-Xverify:all` の下に走らせて real scalac 2.13.16 の出力と一致することを見ます。`c2_thisinterp_bad.scala` は、`$this` を特別扱いしたことで `$name` が何でも通るようになっていないこと（`not found: value nosuchvalue`）を固定します。`a_summoner_returning_its_own_parameters_type_crosses_a_jar` は **実 scalac** で `def apply[F[_]](implicit F: TC[F]): F.type = F` という cats-effect 形の summoner と、`val TC = tinyeff.TC` を持つパッケージオブジェクト（`import cats.effect.Async` が通る経路そのもの）を持つ小さなライブラリをコンパイルして jar に固め、`ScalaSignature` だけを通して `TC[G].flatMap(fa)(…)` が解決し `java -Xverify:all` で走ることを見ます。自前の pickle ライタはパラメータを指す `SINGLEtype` を書かないので、この fixture は scalac が書いたものでなければ意味がありません（scalac が無い環境では skip します）。同じテストで、witness の無い `TC[Crate]` は `could not find implicit value of type TC[Crate]` のままであることも見ます。
 
+`agent/cats3` スライス（by-name の仮引数がプロトタイプにならなかった件と、オーバーロードされたメンバの後続の節が宣言から読み直されていた件）のフィクスチャは接頭辞 `c3`（`c3_infer` / `c3_infer_bad`）で、同じ理由から `crates/cli/tests/cats3.rs` に置いています。`c3_infer.scala` は cats を 1 行も使わずに 2 つの根を並べます: `def >>[B](fb: => F[B])(implicit ev: Bind[F]): F[B]` に `good.fold(boom, _ => new Box(()))` を渡す形（期待型が `B = Unit` と言っているので、by-name の仮引数がそのまま引数のプロトタイプになる）と、`Duration` / `FiniteDuration` のように**オーバーロードされた** `tag` の `implicit t: TC[F, _]` が受け手の `F` で読まれる形です。私有ランタイムと `--scala-library` の両方で `-Xverify:all` の下に走らせ、`scalac_agrees_c3_infer_output` で real scalac 2.13.16 の stdout とも一致することを見ます（**修正前の main では 4 件のエラーで落ちます**。うち 2 件は `could not find implicit value of type TC[F, _]`——slick が報告していた `GenTemporal[F, _]` と同じ、受け手ではなく宣言側の `F` です）。`c3_infer_bad.scala` は、プロトタイプが「なんでも通す許可」になっていないこと——期待型**なしで**先に推論された `val` は依然として `type mismatch`——と、別の型構築子のための witness は依然として見つからないこと（`could not find implicit value of type TC[Box, _]`）を固定し、`scalac_agrees_c3_infer_bad_is_rejected` が real scalac も同じ 2 行で同じ 2 件を出すことを見ます。`cats_flat_map_then_and_timeout_to_compile` は Coursier キャッシュに cats-core / cats-kernel / cats-effect{,-kernel,-std} があるときだけ走り、`a >> e.fold(F.raiseError, _ => F.unit)` と `wait0.timeoutTo(timeout, F.raiseError[Unit](…))`——slick の `BasicBackend.scala` と `ConcurrencyControl.scala` そのものの形——が**本物の cats で**通ることを見ます（`scalac_agrees_cats_flat_map_then_and_timeout_to` が同じ 11 行を real scalac にも通します）。`cats_syntax_conversion_completes_its_own_witness` は 3 つ目の根——`trait C3Db[F[_]] { implicit val asyncF: Async[F]; def run(fa: F[Long]) = fa.flatMap(…) }`（slick の `BasicDatabaseDef`）——を**単独のコンパイル単位で**通します。`Async` に触れる行を 1 行足すだけで直す前でも通ってしまうので、単独であることが再現条件です。
+
 `agent/companionkind` スライス（コンパニオンとクラスが 1 つのシンボルを兼ねていた件）のフィクスチャは接頭辞 `ckind`（`ckind_future` / `ckind_future_bad`）で、同じ理由から `crates/cli/tests/companionkind.rs` に置いています。`ckind_future.scala` は `scala.concurrent.Future`——prelude が持たず、メンバがすべて jar から来るクラス——の**コンパニオンの名前渡しメンバ** `Future.apply` を呼びます。JVM の generic signature は名前渡しを書けないので `Function0[T]` になり、`Future(21)` が `no matching overload for (Function0[T], ExecutionContext)Future[T]` になっていました。`--scala-library` dual-run と **real scalac 2.13.16** との実行結果 diff（`real_scalac_dual_run_ckind_future`）の両方で見ます（`scala.concurrent` は私有ランタイムに無いので `--no-scala-library` では走らせません）。`ckind_future_bad.scala` は、シグネチャが本物になったことで**その implicit 節も本物**になること——`ExecutionContext` がスコープに無ければ scalac と同じく拒む——を固定します。`a_companion_and_its_class_are_separate_symbols` は **実 scalac** で cats を縮めた jar（高階トレイト `Ref[F[_], A]`、そのコンパニオン、`val Ref = tinyeff.Ref` と`type Ref[F[_], A] = tinyeff.Ref[F, A]` を持つパッケージオブジェクト）を作り、`r.update(_ + 1)` の結果型が `F[Unit]`（classfile 由来の素の `F` ではない）になること、コンパニオンの `Ref.const` がトレイト側に紛れ込まずに引けること、そして無い名前 `bogus` はきちんと拒まれることを見ます。
 `agent/ambigmap` スライス（同じ pickle 宣言のコピーが 2 つ入って `ambiguous overload for map` になっていた件）のフィクスチャは接頭辞 `am`（`am_pickledup` / `am_pickledup_bad`）で、同じ理由から `crates/cli/tests/ambigmap.rs` に置いています。`am_pickledup.scala` は **3 つのブロックの順番そのものが再現条件**です: 先に `scala.Seq` のレシーバが `map` を聞き、次に `scala.collection.IndexedSeq` のレシーバが聞き、最後に両方を親に持つ `scala.IndexedSeq` が聞きます。`map` だけでなく `flatMap` / `filter` / `partition` / `foldLeft` も同じ 3 レシーバに通すので、直っているのが「`map` の特別扱い」でないことが分かります。`--scala-library` dual-run と **real scalac 2.13.16** との実行結果 diff（`real_scalac_dual_run_am_pickledup`）の両方で `java -Xverify:all` の下に走らせます（載せ替えたシンボルは呼び先の owner とディスクリプタを変えるので、検証器を通すこと自体が確認です）。私有ランタイムには `scala.collection` が無く pickle も無い（＝束ねるコピーが存在しない）ので、`am_pickledup_without_the_library_is_diagnosed` が `--no-scala-library` で**黙って通さずに診断が出る**ことを固定します。`am_pickledup_bad.scala` は、束ねているのが名前ではなく**宣言**であること——本物のオーバーロード 2 本は 2 本のまま残り、決着が付かなければ scalac と同じく拒む——を固定します。
 
@@ -10105,6 +10107,139 @@ install 時のガード `is_empty()` は常に真——つまり**フォール�
   （`C$default$n`）は依然として未合成です。上に書いたとおり nsc でも
   先行 ctor 引数は参照できないので観測できる差は無いはずですが、
   分離コンパイルで jar 越しにデフォルトを補うことはできません。
+
+### 期待型は引数のプロトタイプ、オーバーロードの後続の節は受け手の型引数で（`agent/cats3`）
+
+3 スライス（`agent/tail4` / `agent/cats2` / `agent/proj` / `agent/tail6`）が根を
+探して残していた cats まわりの 5 件——`no matching overload for (=> F[B])
+(FlatMap[F])F[B]` 3 件（`slick/basic/BasicBackend.scala`）と
+`could not find implicit value of type GenTemporal[F, _]` 2 件
+（`slick/basic/ConcurrencyControl.scala`）——を扱いました。根は**別々の 2 つ**で、
+どちらも `>>` そのものとも `Async` / `Deferred` のカスケードとも関係ありませんでした。
+ついでに 3 つ目（暗黙変換自身の implicit 節が候補を完成させていなかった件）も
+直しています。`tests/slick_measure.sh` は
+**`errors=99 → 92`、`files_with_errors=39 → 38`**（新規エラーは 0、消えたのは
+上の 5 件と `slick/cats/Database.scala` の `Sync[F]`、`BasicBackend.scala:151` の
+`FlatMap[F]`）。codegen（`crates/backend/`）は触っていないので
+`tests/slick_subset.sh` は省略しています。
+
+#### 1. by-name の仮引数がプロトタイプになっていなかった
+
+nsc の `Infer.protoTypeArgs` は、引数を 1 つも型付けする前に**期待型から**呼び先の
+型パラメータを解いて、それを**仮引数に代入**します。`Checker::proto_arg_type` は
+それを「仮引数が**裸の**型パラメータそのものである場合」にしか行っていませんでした。
+cats の
+
+```scala
+def >>[B](fb: => F[B])(implicit F: FlatMap[F]): F[B]
+```
+
+は仮引数が `=> F[B]` なので該当せず、引数は**期待型なし**で型付けされていました。
+
+```scala
+a >> commitResult.fold(asyncF.raiseError, _ => asyncF.unit)
+```
+
+`fold[C](fa: A => C, fb: B => C): C` の `C` は、期待型が無ければ
+`lub(F[A], F[Unit])` ——`AnyRef` ——になります。それが `F[B]` に合うはずもなく、
+`no matching overload for (=> F[B])(FlatMap[F])F[B] with arguments (AnyRef)`。
+期待型 `F[Unit]` から `B = Unit` を解いて `=> F[Unit]` を渡すと、`C` は `F[Unit]`
+に決まり、`asyncF.raiseError` の eta 展開も `A = Unit` で決まります。
+
+代入した結果に呼び先の型パラメータが 1 つでも残る場合は、プロトタイプを出しません
+（残った変数はその境界でしか引数を縛れず、それは後段の `open_to_bounds` の仕事です）。
+by-name は**外して**渡します: 引数式の期待型は値の型で、`Function0` への包み直しは
+`adapt` の仕事だからです（包んだまま渡すと `is_sub_type(F[Unit], => F[Unit])` が偽で、
+呼び出し側の「プロトタイプはヒントであって制約ではない」再試行に捨てられていました）。
+
+同じ経路は 3 件のうち 1 件（`BasicBackend.scala:432`）を**カスケードとして**も
+消しました。`agent/tail4` の「他の 6 件からのカスケードに見える」という見立ては
+向きが逆で、`>>` の 3 件のうち 1 件が残り 2 件の側のカスケードでした。
+
+#### 2. オーバーロードを 1 本に決めた瞬間、受け手の型引数を捨てていた
+
+`type_apply_in` はオーバーロード集合から 1 本選んだあと、
+
+```rust
+if matches!(&fun.ty, Type::Overload(_)) {
+    fun.ty = self.st.get(sym).ty.clone();   // ← 宣言そのもの
+}
+```
+
+としていました。`fill_defaults_and_implicits` は**後続の（implicit）節をこの
+`fun.ty` から読み直す**ので、implicit パラメータの型は宣言を書いたクラス自身の型
+パラメータのまま探索に渡ります。cats-effect の
+
+```scala
+final class GenTemporalOps_[F[_], A](val wrapped: F[A]) extends AnyVal {
+  def timeoutTo(d: Duration,       fallback: F[A])(implicit F: GenTemporal[F, _]): F[A]
+  def timeoutTo(d: FiniteDuration, fallback: F[A])(implicit F: GenTemporal[F, _]): F[A]
+}
+```
+
+は `Duration` / `FiniteDuration` で**オーバーロードされている**ので、
+`wait.timeoutTo(timeout, …)` の implicit 節は `GenTemporalOps_` 自身の `F` を指す
+`GenTemporal[F, _]` として探索に届き、スコープの `Async[F]`（呼び出し側の `F`）とは
+永久に合いません。オーバーロードされていないメンバは `type_select` が入れた
+as-seen-from 済みの型をそのまま持っているので、**オーバーロードされたメンバだけ**が
+この穴に落ちていました。
+
+選択が記録した `overload_member_types`（受け手から見た各候補の型）から、選ばれた
+候補の型を引いて `fun.ty` に入れるようにしました。
+
+**`agent/tail6` の診断は誤りでした。** `E` が `Type::Wildcard` に潰されているのでは
+なく、`GenTemporal[F, _]` の `_` は cats-effect の**ソースにそのまま書かれた存在型**
+です（`javap -s` の `GenTemporal<F, ?>` が示すとおり、`timeoutTo` に型パラメータは
+ありません）。潰れていたのは `E` ではなく `F` の方で、`cats.effect.syntax` の暗黙変換
+とも `Select` の型付けとも無関係でした——`implicitly[GenTemporal[F, Throwable]]` が
+通るのに `timeoutTo` が通らなかったのは、前者がオーバーロードされていないからです。
+
+#### 3. 暗黙変換自身の implicit 節は、候補の親を読ませていなかった
+
+`fill_implicit_params_in` は探索が空振りしたら `warm_implicit_candidates` を
+呼んで retry します（`agent/tail6`）。**暗黙変換の** implicit 節を埋める
+`fill_conv_implicits` にはそれがありませんでした。cats の
+
+```scala
+implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F]): FlatMap.Ops[F, A]
+```
+
+の `FlatMap[F]` を `implicit val asyncF: Async[F]`（trait の**抽象**メンバ）から
+埋めるには `Async` の親を読む必要があり、探索は不変借用の下なので自分では読めません。
+同じファイルの他の行がたまたま `Async` を温めていれば通り、単独なら通らない——
+`agent/tail6` が直したのと同じ形が、変換の側に残っていました
+（`slick/basic/BasicBackend.scala:151` の `connectionArbiter.allocateOrdinal.flatMap { … }`）。
+`implicit def` なら通り `implicit val` なら通らない、という差もこれです。
+
+#### fixture とテスト
+
+* `tests/fixtures/c3_infer.scala`（+ `expected/`）—— cats を使わずに上の 2 つを
+  並べたもの。両モードで `-Xverify:all` の下に走り、real scalac 2.13.16 の
+  stdout とも一致します。**修正前の main では 4 件のエラーで落ちます。**
+* `tests/fixtures/c3_infer_bad.scala` —— プロトタイプは推論を導くだけで、
+  期待型なしに先に推論された値を通す許可ではないこと（`type mismatch`）、
+  別の型構築子のための witness は依然として見つからないこと
+  （`could not find implicit value of type TC[Box, _]`）。real scalac も同じ
+  2 行で同じ 2 件を出すことを別テストで固定しています。
+* Coursier キャッシュに cats があるときだけ走る
+  `cats_flat_map_then_and_timeout_to_compile` と
+  `cats_syntax_conversion_completes_its_own_witness`（＋ scalac 側の対）。
+  後者は**単独のコンパイル単位**であることが再現条件です:
+  `Async` に触れる行を 1 行足すだけで、直す前でも通ってしまいます。
+
+テストは新ファイル `crates/cli/tests/cats3.rs` の 9 本です。回したのは
+`--release` で `cats3` / `cats2` / `catsyntax` / `catsimpl` / `tail6` /
+`overloadshadow` / `ambigmap` / `setapply` / `uniteq` / `integral` /
+`ordsummon` / `mutcoll` / `ovl2` / `ovl3` / `hkinfer` / `conform` / `e2e`
+（e2e 460 本を含めすべて緑）。
+
+#### 残件
+
+* `BasicBackend.scala` は 5 件 → 1 件になりました。残るのは
+  `type ExitCase is not a member of Resource$`（`Resource.ExitCase` は
+  cats-effect の package object 経由の入れ子で、`import` の残件 (a) と同じ穴）。
+* `ConcurrencyControl.scala` は 3 件 → 1 件で、残りは
+  `could not find implicit value of type Make[F]`（`Ref.of[F, State[F]](…)`）。
 
 ## ライセンス
 
