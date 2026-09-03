@@ -3424,11 +3424,15 @@ impl<'a> Parser<'a> {
         self.bump();
         self.skip_nl();
         if matches!(self.kind(), TokenKind::LBrace) {
-            let (_, _, body) = self.parse_template_body();
+            // `new { self => … }` names the anonymous class's own `this`; the
+            // name was dropped, so a nested class referring back to the outer
+            // instance through it was "not found: value self" (slick's
+            // `new BaseTag { base => … new RefTag(path) { … base.taggedAs … } }`).
+            let (self_name, self_tpt, body) = self.parse_template_body();
             let impl_ = Template {
                 parents: vec![],
-                self_name: None,
-                self_tpt: None,
+                self_name,
+                self_tpt,
                 body,
                 span: lo.merge(self.prev_span()),
             };
@@ -3453,10 +3457,14 @@ impl<'a> Parser<'a> {
         }
         let mut body = vec![];
         let mut has_braces = false;
+        let mut anon_self_name = None;
+        let mut anon_self_tpt = None;
         if matches!(self.peek_non_nl(), TokenKind::LBrace) {
             self.skip_nl();
-            let (_, _, b) = self.parse_template_body();
+            let (sn, stpt, b) = self.parse_template_body();
             body = b;
+            anon_self_name = sn;
+            anon_self_tpt = stpt;
             has_braces = true;
         }
         if !has_braces && parents.len() == 1 {
@@ -3507,8 +3515,8 @@ impl<'a> Parser<'a> {
         } else {
             let impl_ = Template {
                 parents,
-                self_name: None,
-                self_tpt: None,
+                self_name: anon_self_name,
+                self_tpt: anon_self_tpt,
                 body,
                 span: lo.merge(self.prev_span()),
             };

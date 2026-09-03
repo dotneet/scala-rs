@@ -11410,6 +11410,203 @@ codegen（`crates/backend/`）を触ったので `SLICK_SEED_LOG` 付きの
   `VerifyError: Operand stack underflow` になったので、この節の変更の前から
   ある別件です（scala-rs 同士の分離コンパイルは通ります）。
 
+### 「見つからない／見えない」13 件の 7 つの根（`agent/implfind`）
+
+slick に残っていた **implicit が見つからない 4 件**と**メンバにアクセスできない
+2 件**、それに同じ系統の単発 7 件を最小再現したところ、根は 7 つでした。
+診断の言葉と根が一致したものは 1 つもありません。全件、実 scalac 2.13.16
+（`/tmp/scala-2.13.16/bin/scalac`）が受理することを確かめてから直しています。
+テストは `crates/cli/tests/implfind.rs`、fixture は
+`tests/fixtures/implfind.scala`（1 ファイルに全ケース）と
+`tests/fixtures/implfind_bad.scala`（緩めたアクセス規則の裏側）。
+
+slick: `errors=44 files_with_errors=26` → **`errors=31 files_with_errors=22`**
+（13 件減、新規ゼロ）。
+
+**1. 適用済みの抽象型メンバが自分の上限に適合しない。**
+「implicit が見つからない」の 3 件（`TypedType[Boolean]`、`JdbcType[U]`、
+`JdbcType[U] with BaseTypedType[U]`）の根は implicit 探索ではなく**部分型判定**
+でした。
+
+```scala
+trait TT[T]
+trait C { type CT[T] <: TT[T] }
+def d[U](implicit ev: C#CT[U]): TT[U] = ev   // これが型不一致だった
+```
+
+`is_sub_type` の `Applied` 対 その他の規則は、抽象型メンバの上限
+（`bound_hi`）を**メンバ自身のパラメータのまま**相手と比べていました。
+`CT[U]` の上限は `TT[T]` ではなく `TT[U]` です。適用した引数で置換していな
+かったので、`CT[U] <: TT[U]` が常に偽になり、文脈境界が入れた evidence が
+**自分の境界を満たさない**という状態になっていました。
+`crates/typer/src/symbol.rs`。
+
+**2. 文脈境界の evidence の型が self type 越しに展開されない。**
+
+```scala
+trait JComp extends Comp { self: JProf =>
+  def base[U : BCT](u: U) = implicitly[BCT[U]]   // 候補は evidence だけ、なのに不一致
+}
+trait JProf extends Prof with JComp { type BCT[T] = JT[T] with BB[T] }
+```
+
+`[U : BCT]` は境界を**裸の名前**で書くので、`tree_to_type` の「型構築子に
+引数を適用する」経路（`expand_type_members` を最後に呼ぶ）を通りません。
+本体の `implicitly[BCT[U]]` は self type 越しに `JT[U] with BB[U]` になるのに、
+evidence だけが抽象側の `BCT[U]` のまま残り、唯一の候補が要求に合いませんでした。
+`Checker::expand_bound_evidence`（`class_bound_evidence` と `def` 側の両方）。
+
+**3. コンパニオン `object` の `protected` メンバ。**
+nsc の `Contexts.isAccessible` は `accessWithin(ab) || accessWithinLinked(ab)`
+（`ab = sym.owner`）を先に見ます。**所有者の中か、そのコンパニオンの中**に
+いれば、`protected` でもサブクラス規則は要りません。scala-rs は
+`protected_subclass_ok` しか見ていなかったので、slick の
+
+```scala
+trait ResultConverterCompiler[R, W, U] { … ResultConverterCompiler.logger … }
+object ResultConverterCompiler { protected lazy val logger = … }
+```
+
+が `value logger cannot be accessed` になっていました。
+
+**4. 入れ子の `private[pkg] object` / `class`。**
+`namer_enter_tmpl` は `ClassDef` / `ModuleDef` の `private_within` を**記録して
+いませんでした**（`val` / `def` / `type` は記録していた）。修飾付き private が
+素の private として扱われ、slick の
+`private[jdbc] object GetUpdateValue`（`object GetResult` の中）が
+パッケージ内の `SQLActionBuilder` から見えませんでした。
+ブリーフの「コンパニオンの private を外から触っている」という見立ては誤りで、
+これはコンパニオンとは無関係な**修飾付き private の取りこぼし**です。
+
+**5. 匿名クラスの self alias。** `parse_new` が `new T { base => … }` の
+`base` を捨てていました（`self_name: None` 固定）。slick `TableQuery` の
+`not found: value base` はこれだけです。
+
+```scala
+val baseTable = cons(new BaseTag { base =>
+  def taggedAs(path: Node) = cons(new RefTag(path) {
+    def taggedAs(path: Node) = base.taggedAs(path)   // ← not found: value base
+  })
+})
+```
+
+**6. 構成子パターンの関数位置では、非 stable な `def` は候補にならない。**
+nsc の `Context.lookupSymbol` は `typingConstructorPattern` のとき
+`sym.isMethod && !sym.isStable` を候補から外します。slick の `Node` は
+
+```scala
+final def :@ (newType: Type): Self = …          // Node のメソッド
+import slick.ast.TypeUtil.*                     // object TypeUtil { object :@ { def unapply … } }
+val from2 :@ CollectionType(_, el) = from.infer(scope, typeChildren): @unchecked
+```
+
+という形で、**継承したメソッド `:@` が import した抽出子 `object :@` を隠して**
+`not found: extractor :@` になっていました。`case` の中では起きず、`val` の
+パターン定義でだけ出ていたのは、`case (LiteralNode(lv) :@ (lt: TypedType[?]), …)`
+の方は `Node` を継承していないクラスで書かれていたからです。
+`SymbolTable::lookup_extractor` と `Checker::ctor_pattern_fun`。
+これに伴い `Node.scala` の `<notype>` カスケード 2 件も消えました。
+
+**7. Java の `Object` 戻り値は `Any` ではなく `AnyRef`。**
+nsc の `objToAny` は ClassfileParser のパラメータのループでしか呼ばれません。
+戻り値は `AnyRef` のままなので `eq` / `ne` / `synchronized` が使えます。
+scala-rs は `java/lang/Object` を一律 `Type::Any` にしていたので、
+typesafe-config の `ConfigValue.unwrapped(): Object` に対する
+`if(cv.unwrapped eq null)`（slick `GlobalConfig`）が
+`value eq is not a member of Any` でした。
+
+nsc に忠実に「引数だけ `Any`、それ以外（戻り値・フィールド・型引数）は
+`AnyRef`」まで広げる版も試しましたが、`Hashtable<Object, Object>` のような
+**型引数**まで書き換わり、slick の `HeapBackend` で
+`IndexedSeq[Any] <: Int => Any` が落ちる**新規エラーを 1 件出しました**
+（差し引きゼロ）。slick で得るものが無い広げ方だったので、
+**戻り値の最上位だけ**に留めています（`java_result_obj`）。
+残っているのは「型引数の `Object`」の側です。
+
+**8.（副産物）`scala.collection.Map` にメンバが無い。**
+`prelude_hier` が作る「リンク用」トレイトはメンバを持たず、
+`get` / `contains` / `getOrElse` / `apply` は `immutable.Map` /
+`mutable.Map` の側にしかありませんでした。2.13 ではどれも
+`scala.collection.MapOps` の宣言なので、抽象側に置くのが正しいです。
+slick `ExpandTables` が `collection.Map` で受けた引数に対して
+
+```
+value contains is not a member of Map[TableIdentitySymbol, (TermSymbol, Node)]
+no matching overload for ((K, V)*)Map[K, V] with arguments (TableIdentitySymbol)
+value replace is not a member of B
+```
+
+の 3 件を出していたのは 1 根です（`expansions(tsym)` が**コンパニオンの
+`Map.apply`** を拾って `exp: B` になり、`exp.replace` が `B` のメンバを
+探していた）。`crates/typer/src/prelude_implfind.rs`。
+
+**9.（副産物）pickle 由来の入れ子クラスが型位置でコンパニオンに解決される。**
+`object Ref { trait Make[F[_]] }` を classfile から読むと 2 つに割れます:
+pickle が `Make` の**モジュールアクセサ**を `Ref$` に載せ、trait の方は
+`Ref$Make` という名前だけからは「どちらの `Ref`」の入れ子か決まらないので
+`find_or_stub_java_class` が **trait `Ref`** の下に置きます。
+`lookup_qualified_type` は最初に当たった owner で打ち切っていたため、
+`Ref.Make[F]` が object の方に解決されて
+`Make does not take type parameters` になっていました。owner をまたいで
+**class を object より優先**するように変更（`fs2.Stream.ToPull[F, O]` も同様）。
+
+**残件**（最小再現つき）:
+
+* `no implicit: could not find implicit value of type Make[F]`
+  （slick `basic/ConcurrencyControl.scala:202`、`Ref.of[F, State[F]](…)`）。
+  9 で `Ref.Make[F]` は型として通るようになり、**スコープにある
+  `implicit mk: Ref.Make[F]` を `implicitly` で見つける**ところまでは直りました。
+  残るのは 2 つです。(a) `Ref.of[F, Int](0)` の**暗黙引数の挿入**が起きない
+  （明示的に `Ref.of[F, Int](0)(mk)` と書けば通る）。(b) `Ref.Make` の
+  コンパニオンが継承する
+
+  ```scala
+  implicit def concurrentInstance[F[_]](implicit F: GenConcurrent[F, ?]): Make[F]
+  ```
+
+  が implicit スコープから使えない（存在型 `GenConcurrent[F, ?]` に
+  `Concurrent[F] = GenConcurrent[F, Throwable]` を合わせる必要がある）。
+  最小再現:
+
+  ```scala
+  import cats.effect.kernel.{Concurrent, Ref}
+  def d[F[_]](implicit mk: Ref.Make[F]): F[Ref[F, Int]] = Ref.of[F, Int](0)   // (a)
+  def k[F[_]](implicit F: Concurrent[F]): Ref.Make[F] = implicitly[Ref.Make[F]] // (b)
+  ```
+
+* `type ExitCase is not a member of Resource$`
+  （slick `basic/BasicBackend.scala:421`）。**単体では再現しません**。
+
+  ```scala
+  import cats.effect.{Async, Ref, Resource}
+  import cats.effect.kernel.Outcome
+  import cats.syntax.all.*
+  import cats.effect.syntax.all.*
+  object C { def ec(e: Resource.ExitCase): String = e.toString }   // これは通る
+  ```
+
+  BasicBackend.scala と同じ import を並べても通るので、slick を丸ごと
+  1 回で通したときにだけ壊れます（`Resource$` のメンバ補完の順序を疑って
+  いますが未検証）。ブリーフの「パッケージオブジェクトの `val` 越しの
+  ネストしたクラス」という仮説は、少なくとも**単体では成り立ちません**
+  （`cats.effect.Resource` はまさにその形で、単体では通ります）。
+
+**ブリーフの記述で誤っていたところ**:
+
+* 「アクセス 2 件は companion object の private/protected メンバを companion
+  class 以外から触っている形」——`GetResult.GetUpdateValue` の方は
+  コンパニオンとは無関係で、`private[jdbc]` という**修飾付き private** を
+  scala-rs が記録していなかっただけです。prefix の計算は正しく、
+  `SQLActionBuilder` から触るのも正しい形です。
+* 「`TypedType[Boolean]` は slick の `TypedType` コンパニオンか profile の
+  ケーキの中の implicit が候補」——候補は `api` 越しの
+  `booleanColumnType: BaseColumnType[Boolean]` で、スコープには**入って
+  いました**。落ちていたのは `BaseColumnType[Boolean] <: TypedType[Boolean]`
+  の判定（根 1）です。
+* 「`value eq is not a member of <notype>` は型が計算されていない印」——
+  正しいですが、上流は `eq` でも `Any` でもなく、同じ行の 2 つ上にある
+  `:@` の抽出子解決（根 6）でした。
+
 ## ライセンス
 
 Apache-2.0

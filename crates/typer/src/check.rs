@@ -188,6 +188,9 @@ pub struct Typer {
     /// position the same `TC[_]` is an existential over a proper type and nsc
     /// rejects it (`_$1 takes no type parameters, expected: 1`).
     pattern_tpt: bool,
+    /// Typing the *function* of a constructor pattern (`case x :@ y`), where
+    /// nsc's name lookup skips a non-stable method of that name.
+    ctor_pattern_fun: bool,
     /// Members whose signature the signature pass already built. Signature
     /// work is not idempotent -- it synthesizes evidence parameters and
     /// default getters -- so the body pass must not redo it.
@@ -575,6 +578,7 @@ impl Typer {
             sigs_only: false,
             strict_type_names: false,
             pattern_tpt: false,
+            ctor_pattern_fun: false,
             sig_done: std::collections::HashSet::new(),
             lazy_val_presig: std::collections::HashSet::new(),
             parent_fill_done: std::collections::HashSet::new(),
@@ -735,10 +739,16 @@ impl Typer {
                 });
                 let annots = mods.annotations.clone();
                 let jvm = self.jvm_for_current(name);
+                let within = mods.private_within.clone();
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Class, flags, &jvm);
                 self.st.get_mut(id).annotations = annots;
+                // `private[jdbc] class`/`object` kept only the PRIVATE flag,
+                // so the access check read it as plain `private` and every
+                // reference from elsewhere in the package was rejected
+                // (slick's `GetResult.GetUpdateValue`).
+                self.st.get_mut(id).private_within = within;
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
                 if mods.flags.contains(Flags::CASE) {
@@ -748,6 +758,7 @@ impl Typer {
             }
             TreeKind::ModuleDef { name, mods, .. } => {
                 let annots = mods.annotations.clone();
+                let mods_within = mods.private_within.clone();
                 // A `case class` already synthesized its companion; reuse that
                 // symbol so `object C` does not become a second module.
                 let owner = self.st.owner;
@@ -764,6 +775,10 @@ impl Typer {
                     let mut cf = self.st.get(cls).flags;
                     cf.set(Flags::SYNTHETIC, false);
                     self.st.get_mut(cls).flags = cf;
+                    if mods_within.is_some() {
+                        self.st.get_mut(m).private_within = mods_within.clone();
+                        self.st.get_mut(cls).private_within = mods_within;
+                    }
                     tree.sym = m;
                     return;
                 }
@@ -786,6 +801,8 @@ impl Typer {
                 self.st.get_mut(cls).ty = Type::ModuleRef(cls);
                 self.st.get_mut(m).annotations = annots.clone();
                 self.st.get_mut(cls).annotations = annots;
+                self.st.get_mut(m).private_within = mods_within.clone();
+                self.st.get_mut(cls).private_within = mods_within;
                 self.st.enter_in_current(name, m);
                 tree.sym = m;
             }
@@ -1170,6 +1187,25 @@ impl Typer {
         }
     }
 
+    /// The type a context bound's evidence parameter really has.
+    ///
+    /// `[U : BaseColumnType]` writes the bound as a bare name, so
+    /// `tree_to_type` takes the un-applied path and never reaches the
+    /// `expand_type_members` that every *written* parameter type goes through
+    /// (`tpt_to_type`'s applied-constructor arm). Inside a cake the two then
+    /// disagree: `def base[U : BaseColumnType]` in slick's
+    /// `JdbcTypesComponent` (self-type `JdbcProfile`) got the *abstract*
+    /// `RelationalTypesComponent#BaseColumnType`, while the body's
+    /// `implicitly[BaseColumnType[U]]` got `JdbcProfile`'s alias
+    /// `JdbcType[U] with BaseTypedType[U]` -- so the only candidate in scope
+    /// was the one the search could not match.
+    fn expand_bound_evidence(&self, ev_ty: Type) -> Type {
+        if self.st.this_class.is_none() {
+            return ev_ty;
+        }
+        self.st.expand_type_members(self.st.this_class, &ev_ty)
+    }
+
     /// nsc: `class C[A <% V](x: A)` → extra implicit ctor clause `(implicit evidence$n: A => V)`.
     /// nsc: `class C[T: Ordering](x: T)` → extra implicit ctor clause `(implicit evidence$n: Ordering[T])`.
     /// Higher-kinded `F[_] <% V` / `F[_]: C` is illegal in scalac 2.13 (`type F takes type parameters`).
@@ -1257,7 +1293,7 @@ impl Typer {
                 if bound_ty.is_error() {
                     continue;
                 }
-                let ev_ty = apply_context_bound(bound_ty, tp_id);
+                let ev_ty = self.expand_bound_evidence(apply_context_bound(bound_ty, tp_id));
                 self.gensym += 1;
                 let ev_name = format!("evidence${}", self.gensym);
                 let flags = Flags::IMPLICIT
@@ -3789,7 +3825,7 @@ impl Typer {
                 if bound_ty.is_error() {
                     continue;
                 }
-                let ev_ty = apply_context_bound(bound_ty, tp_id);
+                let ev_ty = self.expand_bound_evidence(apply_context_bound(bound_ty, tp_id));
                 self.gensym += 1;
                 let ev_name = format!("evidence${}", self.gensym);
                 let ev_id = self.st.alloc(
@@ -7461,6 +7497,19 @@ impl Typer {
         }
         self.expose_unqualified(&name, tree.span);
         let mut found = self.st.lookup(&name);
+        // See `SymbolTable::lookup_extractor`: in a constructor pattern a
+        // `def` of the name is not an extractor and does not shadow one.
+        if self.ctor_pattern_fun
+            && !found.is_empty()
+            && found
+                .iter()
+                .all(|&s| self.st.get(s).kind == SymKind::Method)
+        {
+            let alt = self.st.lookup_extractor(&name);
+            if !alt.is_empty() {
+                found = alt;
+            }
+        }
         // A scope that binds the name only in the *type* namespace does not
         // hide a term of that name further out: `import syntax._` bringing a
         // `type HNil` alias into scope leaves `object HNil` reachable.
@@ -9294,7 +9343,14 @@ impl Typer {
                 .map(|w| self.access_within_of(current, w, owner))
                 .unwrap_or(false);
             let by_sub = self.protected_subclass_ok(current, owner, prefix);
-            return by_qual || by_sub;
+            // nsc's `accessWithin(ab) || accessWithinLinked(ab)` with
+            // `ab = sym.owner`: being lexically inside the owner *or inside
+            // its companion* grants access whatever the qualifier says.
+            // slick's `object ResultConverterCompiler { protected lazy val
+            // logger }` is read from the companion `trait
+            // ResultConverterCompiler`, which no subclass rule covers.
+            let by_companion = self.nested_in(current, owner);
+            return by_qual || by_sub || by_companion;
         }
         if let Some(w) = &s.private_within {
             return self.access_within_of(current, w, owner);
@@ -16957,7 +17013,14 @@ impl Typer {
                 pat.ty = bind_ty;
             }
             TreeKind::Apply { fun, args } => {
+                // nsc types a constructor pattern's function in
+                // `typingConstructorPattern` mode, where a non-stable method
+                // of that name does not qualify. Only a bare `Ident` needs the
+                // rule; a `Select`'s qualifier must keep ordinary resolution.
+                let ctor_pat = matches!(fun.kind, TreeKind::Ident { .. });
+                let saved_ctor_pat = std::mem::replace(&mut self.ctor_pattern_fun, ctor_pat);
                 self.type_expr(fun, &Type::NoType);
+                self.ctor_pattern_fun = saved_ctor_pat;
                 let class_id = fun.name().and_then(|n| {
                     self.st
                         .lookup(n)
@@ -19421,13 +19484,28 @@ impl Typer {
     }
 
     fn lookup_qualified_type(&mut self, prefix: &Tree, name: &str) -> Option<SymbolId> {
+        // A class beats an object of the same name *wherever* it was found,
+        // not only within one owner. `object Ref { trait Make[F[_]] }` read
+        // from a class file splits in two: the pickle installs `Make`'s module
+        // accessor on `Ref$`, while the trait -- the only one of the pair that
+        // has type parameters -- was stubbed under the *trait* `Ref`, because
+        // `Ref$Make` alone does not say which of the two `Ref`s owns it.
+        // Stopping at the first owner therefore answered `Ref.Make[F]` with
+        // the object and reported "Make does not take type parameters".
+        let mut fallback: Option<SymbolId> = None;
         for owner in self.qualified_type_owners(prefix) {
             self.complete_binary_member(owner, name, prefix.span);
-            if let Some(id) = self.prefer_class_member(owner, name) {
+            let Some(id) = self.prefer_class_member(owner, name) else {
+                continue;
+            };
+            if self.st.get(id).kind == SymKind::Class {
                 return Some(id);
             }
+            if fallback.is_none() {
+                fallback = Some(id);
+            }
         }
-        None
+        fallback
     }
 
     /// `p` in a type `p.T` denotes a *term* in Scala, so when a class and its
