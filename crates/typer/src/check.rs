@@ -310,6 +310,16 @@ pub struct Typer {
     /// Saved and restored around each application, since typing an argument
     /// runs another application inside this one.
     undet_tvars: Vec<SymbolId>,
+    /// Set while two alternatives are being compared for specificity.
+    ///
+    /// Specificity asks a hypothetical question -- "would `b` accept `a`'s
+    /// parameter types as arguments?" -- and the answer must not depend on
+    /// what the *actual* call left undetermined. `Set() ++ o` is the case:
+    /// the receiver's `?A` is undetermined, so the monomorphic
+    /// `++(IterableOnce[?A])` accepts the polymorphic `++[B](IterableOnce[B])`'s
+    /// parameter (solve `?A := B`) as readily as the other way round, and the
+    /// pair came out `ambiguous overload` where nsc takes the monomorphic one.
+    spec_probe: std::cell::Cell<bool>,
     /// Set while an argument list is being retried packed into a tuple.
     ///
     /// The retry builds a fresh `TupleN(a, b)` node and types it as the sole
@@ -607,6 +617,7 @@ impl Typer {
             overload_groups: HashMap::new(),
             overload_member_types: HashMap::new(),
             undet_tvars: Vec::new(),
+            spec_probe: std::cell::Cell::new(false),
             tupling: false,
             parent_ctx: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
@@ -9118,7 +9129,14 @@ impl Typer {
         // class's own parameters (`stdJoin` inside `Query` builds a
         // `BaseJoinQuery[E, E2, …]`), the second pass is not even idempotent:
         // `f: E => F` became `f: ((E, E2), E2) => F`.
-        let subst_args: Vec<Type> = match &recv_ty {
+        // A type annotation says nothing about the members: `x._1` on a
+        // `(String, Int) @uncheckedVariance` -- what slick's
+        // `ConstArray.toSet: HashSet[T @uncheckedVariance]` hands its callers
+        // -- is the same `_1` as on the bare tuple. Without peeling it here,
+        // `subst_args` stayed empty (`subst_as_seen_from` has no tuple case;
+        // that is what this list is for) and `Tuple2._1` kept its declared
+        // `T1`, so `referenced.map(_._1)` came out `HashSet[T1]`.
+        let subst_args: Vec<Type> = match peel_type_annot(&recv_ty) {
             Type::Tuple(ts) => ts.clone(),
             // `FunctionN`'s parameters are `T1 … Tn, R`, in that order.
             Type::Function { params, ret } => {
@@ -11855,13 +11873,29 @@ impl Typer {
                             .collect();
                         let mut ids = Vec::new();
                         let mut vals = Vec::new();
+                        // An `Array` argument reaches a collection parameter
+                        // through one of `Predef`'s wrappings, and it is the
+                        // *wrapped* type that lines up with the parameter:
+                        // `Map() ++ arrayOfPairs` has to read `?K` and `?V`
+                        // out of `mutable.ArraySeq[(Int, String)]`, not out of
+                        // an `Array` no `IterableOnce[…]` can be matched
+                        // against (`seqfn_view.rs`).
+                        let mut froms = vec![a.ty.widen_constant()];
+                        if let Type::Array(elem) = &a.ty {
+                            froms.extend(
+                                self.array_wrap_candidates(elem).into_iter().map(|(_, v)| v),
+                            );
+                        }
                         for tp in open_recv {
-                            if let Some(t) = unify_one(tp, &p, &a.ty.widen_constant()) {
-                                if !t.is_no_type() && !t.is_error() && !type_mentions_tparam(&t, tp)
-                                {
-                                    ids.push(tp);
-                                    vals.push(t);
-                                }
+                            let hit = froms
+                                .iter()
+                                .find_map(|from| unify_one(tp, &p, from))
+                                .filter(|t| {
+                                    !t.is_no_type() && !t.is_error() && !type_mentions_tparam(t, tp)
+                                });
+                            if let Some(t) = hit {
+                                ids.push(tp);
+                                vals.push(t);
                             }
                         }
                         if !ids.is_empty() {
@@ -15563,6 +15597,61 @@ impl Typer {
                         winners = sub;
                     }
                 }
+                // A prelude stand-in is not a second overload of the member it
+                // stands in for.
+                //
+                // `prelude_coll.rs` writes `Set.map(A => Any): Set[Any]` and
+                // `Map.+((K, Any)): Map[K, Any]` by hand -- monomorphic
+                // approximations of members the real jar declares
+                // polymorphically on `IterableOps` / `MapOps`. A receiver that
+                // reaches *both* (`immutable.HashSet`, `immutable.HashMap`:
+                // the pickled ops traits above them, the prelude's `Set` /
+                // `Map` beside them) offered two alternatives that no rule
+                // above can separate -- neither owner is the other's subclass,
+                // and each is as specific as the other, since `A => B`
+                // conforms to `A => Any` and `map[B]` is applicable with
+                // `B = Any`. Every `HashSet.map(f)` and `HashMap + kv` was
+                // `ambiguous overload`.
+                //
+                // nsc sees one member here, and it is the jar's. Keep it.
+                // Scoped to the ambiguity: with one alternative already
+                // chosen, nothing changes.
+                if winners.len() > 1 {
+                    let from_jar: Vec<(SymbolId, Vec<Type>, Type)> = winners
+                        .iter()
+                        .filter(|a| !self.st.get(a.0).pickled_origin.is_empty())
+                        .cloned()
+                        .collect();
+                    let stand_ins = winners.iter().filter(|a| {
+                        a.0 .0 < self.st.prelude_end && self.st.get(a.0).pickled_origin.is_empty()
+                    });
+                    if from_jar.len() == 1 && stand_ins.count() == winners.len() - 1 {
+                        winners = from_jar;
+                    }
+                }
+                // A tie between a monomorphic alternative and a polymorphic
+                // one goes to the monomorphic one.
+                //
+                // `Set() ++ o` is the case: the receiver's element type is
+                // still undetermined, so `SetOps.++(IterableOnce[?A])` and
+                // `IterableOps.++[B](IterableOnce[B])` each accept the other's
+                // parameter -- `?A` can be `B`, and `B` can be `?A`. nsc picks
+                // the monomorphic one (`-Xprint:typer` shows `.++(o)`, with no
+                // type argument), and it is the more specific reading: it
+                // takes the receiver's own element type rather than inventing
+                // a variable. Only at the tie; a call the rules above settle
+                // is not touched.
+                if winners.len() > 1 {
+                    let arity = winners[0].1.len();
+                    let mono: Vec<(SymbolId, Vec<Type>, Type)> = winners
+                        .iter()
+                        .filter(|a| !a.0.is_none() && self.st.get(a.0).tparams.is_empty())
+                        .cloned()
+                        .collect();
+                    if mono.len() == 1 && winners.iter().all(|w| w.1.len() == arity) {
+                        winners = mono;
+                    }
+                }
                 match winners.len() {
                     1 => {
                         let (s, p, r) = winners.into_iter().next().unwrap();
@@ -15659,8 +15748,11 @@ impl Typer {
                 .map(|p| crate::symbol::subst_tparams_slice(&tps, &tys, p))
                 .collect()
         };
-        self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, true)
-            && self.function_params_conform(&a_ps, &b_ps)
+        let saved = self.spec_probe.replace(true);
+        let out = self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, true)
+            && self.function_params_conform(&a_ps, &b_ps);
+        self.spec_probe.set(saved);
+        out
     }
 
     /// `arg_score` deliberately scores any two function types with the same
@@ -15751,7 +15843,11 @@ impl Typer {
         // `StatementParameters(…, if (…) … else { s => …; … }, …)` needed the
         // function parameter's type to reach the literal inside the if/else.
         if let Type::Overload(alts) = fun_ty {
-            return self.agreed_function_param(alts, idx);
+            let agreed = self.agreed_function_param(alts, idx);
+            if !agreed.is_no_type() {
+                return agreed;
+            }
+            return self.only_concrete_param(alts, idx);
         }
         // `rewrite_receiver_apply` deliberately leaves `Obj(args)` as a
         // reference to the *module* (`named_arg_param_ids` says why), so the
@@ -15941,6 +16037,53 @@ impl Typer {
                 self.st.function_class_shape(*sym, args).is_some() || self.st.sam_sig(p).is_some()
             }
             _ => false,
+        }
+    }
+
+    /// The one alternative whose parameter at `idx` is already a concrete
+    /// type, when every alternative asks for the same class there.
+    ///
+    /// 2.13 overloads `++` on a set as `SetOps.++(IterableOnce[A])` beside
+    /// `IterableOps.++[B >: A](IterableOnce[B])` (`prelude_setmap.rs`), and
+    /// with two alternatives in play [`Self::proto_arg_type`] used to hand the
+    /// argument no prototype at all. slick's
+    /// `oldDiscCandidates ++ (tree match { … case _ => Set.empty })` then typed
+    /// its `match` with nothing to go on, lubbed the arms to the existential
+    /// `Set[_ <: AnyRef]` -- which is what scalac produces there too, given no
+    /// expected type -- and neither alternative could take it. nsc never gets
+    /// there: it types the argument against `IterableOnce[A]`, and the arms
+    /// adapt to it one by one.
+    ///
+    /// The monomorphic alternative is the one that can say what it wants, so
+    /// its parameter is the prototype. Still only a hint: the caller re-types
+    /// the argument with none when it does not fit.
+    fn only_concrete_param(&self, alts: &[Type], idx: usize) -> Type {
+        if alts.len() < 2 {
+            return Type::NoType;
+        }
+        let mut params: Vec<&Type> = Vec::new();
+        for a in alts {
+            let Type::Method { paramss, .. } = a else {
+                return Type::NoType;
+            };
+            let Some(p) = paramss.first().and_then(|c| param_at(c, idx)) else {
+                return Type::NoType;
+            };
+            if p.is_no_type() || p.is_error() {
+                return Type::NoType;
+            }
+            params.push(p);
+        }
+        let head = self.st.class_sym_of(params[0]);
+        if head.is_none() || !params.iter().all(|p| self.st.class_sym_of(p) == head) {
+            return Type::NoType;
+        }
+        let mut concrete = params
+            .iter()
+            .filter(|p| !mentions_any_tparam(p) && !type_mentions_wildcard(p));
+        match (concrete.next(), concrete.next()) {
+            (Some(p), None) => (*p).clone(),
+            _ => Type::NoType,
         }
     }
 
@@ -16185,6 +16328,10 @@ impl Typer {
                     || !matches!(self.search_conversion(arg, param), ImplicitSearch::None)
                     || (mentions_tparam(param, open)
                         && self.search_conversion_open(arg, param, open).is_some())
+                    // `Predef`'s array wrappings are views too, but they are
+                    // not `implicit` in this prelude (`seqfn_view.rs` says
+                    // why), so `search_conversion` cannot find them.
+                    || self.array_wrap_conforms(arg, param, open)
             }
             None => false,
         }
@@ -16544,6 +16691,31 @@ impl Typer {
         // against the parameter and the instantiation is what is compared.
         if self.undet_compatible(arg, param) {
             return Some(4);
+        }
+        // The *parameter* can be the side that is still open. `Set()` is
+        // `Set[?A]` -- nothing has said what `?A` is yet -- so the `++`
+        // selected on it takes an `IterableOnce[?A]`, and the argument is what
+        // settles it (`-Xprint:typer` on `Set() ++ o` shows nsc typing the
+        // receiver as `Set.apply[String]()`, read off that same argument).
+        // `undet_compatible` above only looks at the variables the *argument*
+        // carries. The `OverloadPick::Found` path already substitutes the
+        // solution into the parameters, the result and the receiver; without
+        // this the alternative never got that far and `Set() ++ o` was `no
+        // matching overload`.
+        if !self.undet_tvars.is_empty() && !self.spec_probe.get() {
+            let open: Vec<SymbolId> = self
+                .undet_tvars
+                .iter()
+                .copied()
+                .filter(|tp| type_mentions_tparam(param, *tp))
+                .collect();
+            if !open.is_empty() {
+                if let Some(solved) = self.solve_open_from_arg(arg, param, &open) {
+                    if let Some(s) = self.arg_score(arg, &solved) {
+                        return Some(s.min(4));
+                    }
+                }
+            }
         }
         // A *parameter* that is a bare type variable of the alternative takes
         // anything -- that is what `def f[T](x: T)` means, and the variable is
@@ -21143,6 +21315,15 @@ impl Typer {
                 return;
             }
             ImplicitSearch::None => {}
+        }
+        // `val xs: Seq[Any] = anArray`. nsc closes this with one of `Predef`'s
+        // array wrappings, which are `implicit` there but deliberately not
+        // here (they would out-compete `refArrayOps` for every `Array` member
+        // selection -- `seqfn_view.rs`), so `search_conversion` above cannot
+        // see them. Last, after every implicit the program itself supplies:
+        // this only ever replaces the `type mismatch` that follows.
+        if self.coerce_array_to_collection(tree, pt) {
+            return;
         }
         // A tree the typer could not give a type to has already been reported
         // where it failed; `found: <notype>` only repeats it. nsc's `ErrorType`

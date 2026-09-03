@@ -1,0 +1,14 @@
+1,a
+6
+x-y
+2
+<1,2,3>
+plain
+AutoInc,SqlType(VARCHAR)
+PrimaryKey
+1,a
+(1,one),(2,two)
+s7
+-
+a,c
+(a,1),(b,two)

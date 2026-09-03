@@ -51,6 +51,118 @@ impl Typer {
         ))
     }
 
+    /// Every wrapping `Predef` offers for an `Array[elem]`, in nsc's own
+    /// implicit priority order (`Predef` before `LowPriorityImplicits` before
+    /// `LowPriorityImplicits2`), each with the type the wrapped array has.
+    ///
+    /// Which one nsc picks is decided by the expected type, and that is not a
+    /// detail: `scala.Seq` and `scala.IndexedSeq` are the *immutable* ones, so
+    /// `genericWrapArray`'s `mutable.ArraySeq` does not reach them and the
+    /// lowest-priority `copyArrayToImmutableIndexedSeq` is what
+    /// `-Xprint:typer` shows for `def v(a: Array[Any]): Seq[Any] = a`.
+    /// `scala.Iterable` is `collection.Iterable`, which the mutable one does
+    /// reach, and there nsc takes `genericWrapArray`. Callers walk this list
+    /// in order and keep the first whose type conforms, which reproduces both.
+    ///
+    /// `library_abi`-only, like [`Self::array_seq_wrap`]: the private runtime
+    /// declares none of these, so the ordinary diagnostic stands there.
+    pub(crate) fn array_wrap_candidates(&self, elem: &Type) -> Vec<(&'static str, Type)> {
+        if !self.library_abi {
+            return Vec::new();
+        }
+        let mut out: Vec<(&'static str, Type)> = Vec::new();
+        // The `Boolean` special case this file was written for keeps its own
+        // (exact `ArraySeq$ofBoolean`) declaration and stays first.
+        if let Some(hit) = self.array_seq_wrap(elem) {
+            out.push(hit);
+        }
+        if let Some(sym) =
+            crate::classpath::find_by_jvm(&self.st, "scala/collection/mutable/ArraySeq")
+        {
+            out.push((
+                "genericWrapArray",
+                Type::Class {
+                    sym,
+                    args: vec![elem.clone()],
+                },
+            ));
+        }
+        if let Some(sym) =
+            crate::classpath::find_by_jvm(&self.st, "scala/collection/immutable/IndexedSeq")
+        {
+            out.push((
+                "copyArrayToImmutableIndexedSeq",
+                Type::Class {
+                    sym,
+                    args: vec![elem.clone()],
+                },
+            ));
+        }
+        out.retain(|(name, _)| !self.st.lookup(name).is_empty());
+        out
+    }
+
+    /// The wrapped type an `Array[elem]` can offer a `pt`-shaped position,
+    /// or `None` when none of the wrappings reaches it. A pure type
+    /// computation: overload resolution scores with it before any tree exists.
+    pub(crate) fn array_wrap_for(&self, elem: &Type, pt: &Type) -> Option<(&'static str, Type)> {
+        self.array_wrap_candidates(elem)
+            .into_iter()
+            .find(|(_, view)| self.st.is_sub_type(view, pt))
+    }
+
+    /// Would one of the array wrappings make an `Array` argument applicable to
+    /// `param`? Overload resolution's half of [`Self::array_wrap_for`], for
+    /// the case where the alternative's own type parameters are still open.
+    ///
+    /// `Map() ++ arr` asks `concat[B >: A](IterableOnce[B])` whether an
+    /// `Array[(Int, String)]` fits, and nothing conforms to `IterableOnce[B]`
+    /// while `B` is unknown. What the argument decides is the *shape*: the
+    /// wrapped array is an `IterableOnce` of something, which is all an
+    /// applicability test can ask before `B` is solved. `adapt` inserts the
+    /// real call afterwards, against the instantiated parameter.
+    pub(crate) fn array_wrap_conforms(
+        &self,
+        arg: &Type,
+        param: &Type,
+        open: &[scala_rs_parser::SymbolId],
+    ) -> bool {
+        let Type::Array(elem) = arg else {
+            return false;
+        };
+        if self.array_wrap_for(elem, param).is_some() {
+            return true;
+        }
+        if !crate::check::mentions_tparam(param, open) {
+            return false;
+        }
+        let Some(want) = self.st.class_sym_of(param) else {
+            return false;
+        };
+        self.array_wrap_candidates(elem)
+            .into_iter()
+            .any(|(_, view)| {
+                std::iter::once(view.clone())
+                    .chain(self.st.base_type_seq(&view))
+                    .any(|b| self.st.class_sym_of(&b) == Some(want))
+            })
+    }
+
+    /// Rewrites `tree` into `genericWrapArray(tree)` (or whichever wrapping
+    /// [`Self::array_wrap_for`] picked) when that closes the gap to `pt`.
+    /// Same contract as [`Self::coerce_array_to_function`], which it
+    /// generalises; `false` leaves `tree` untouched.
+    pub(crate) fn coerce_array_to_collection(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        let Type::Array(elem) = tree.ty.clone() else {
+            return false;
+        };
+        let Some((name, view)) = self.array_wrap_for(&elem, pt) else {
+            return false;
+        };
+        self.wrap_array_call(tree, name, view, pt);
+        true
+    }
+
     /// Rewrites `tree` (already known not to conform to `pt` directly) into
     /// `wrapBooleanArray(tree)` when that closes the gap, and re-`adapt`s the
     /// result (so a further eta-expansion or subtype check still runs).
@@ -66,8 +178,18 @@ impl Typer {
         if !self.st.is_sub_type(&view, pt) {
             return false;
         }
+        self.wrap_array_call(tree, name, view, pt);
+        true
+    }
+
+    /// `tree` (an `Array`) becomes `Predef.<name>(tree): view`, then is
+    /// re-`adapt`ed to `pt` so a further subtype check or eta-expansion still
+    /// runs. The result type is written from `view` rather than read off the
+    /// callee: `genericWrapArray[T]` is polymorphic, and this is the one place
+    /// that knows what `T` is.
+    fn wrap_array_call(&mut self, tree: &mut Tree, name: &str, view: Type, pt: &Type) {
         let Some(sym) = self.st.lookup(name).into_iter().next() else {
-            return false;
+            return;
         };
         let span = tree.span;
         let arg = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
@@ -87,11 +209,10 @@ impl Typer {
                 fun: Box::new(fun),
                 args: vec![arg],
             },
-            ty: view.clone(),
+            ty: view,
             sym,
             postfix: false,
         };
         self.adapt(tree, pt);
-        true
     }
 }

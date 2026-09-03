@@ -638,6 +638,11 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     // は `prelude_hier` が組み立てるので、そのあと）。`PartialFunction` の
     // `lift`/`orElse` も同じスライスで足す。library_abi 専用。
     crate::prelude_seqfn::install(st, library_abi);
+    // `Array` を `Seq`/`Iterable` として渡すための `Predef` の包み込みと、
+    // `collection.Map` の読み出しメンバ（agent/setmap）。`prelude_hier` が
+    // `collection/Map` を、`prelude_seqfn` が `mutable.ArraySeq` 周りを
+    // 組み立てたあと。
+    crate::prelude_setmap::install(st, library_abi);
     crate::prelude_fntuple::install(st, library_abi);
     crate::prelude_mism9::install(st);
     if library_abi {
