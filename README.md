@@ -11037,6 +11037,194 @@ println(mk(3)())   // scala-rs: not enough arguments: expected 1, found 0
 その後 `--test conform` を単独で回して **77 passed**（従来 62 ＋ 今回 15）。
 `--test e2e` は 460 passed。`cargo fmt --all` 済み、`cargo clippy` の新規警告 0。
 
+### slick のオーバーロード解決 26 件のうち 9 件、6 つの根（`agent/ovl4`）
+
+`tests/slick_measure.sh` は **`errors=65 → 55`、`files_with_errors=34 → 31`**
+（新規エラー 0）。担当した `no matching overload` 21 件・`ambiguous overload`
+5 件の塊は **26 件 → 17 件**。おまけに `value infer is not a member of AnyRef`
+（`Comprehension.scala:85`）も 6 番目の根で一緒に消えました。型検査だけを
+触ったので `tests/slick_subset.sh` は省略（`crates/backend/` は未変更）。
+
+26 件を 1 件ずつ最小再現した結果は、**「同じ症状は 1 つの根」も「同一ファイルは
+1 つの根」も成り立たない**という既存の観察のとおりでした。6 つの根はどれも
+無関係で、逆に**別ファイルの 2 件が同じ根**というものが 3 組ありました。
+
+**1. 固定された型パラメータの「引数」は、その上限のものでしかない。**
+`arg_score` に
+
+```rust
+if matches!(param, Type::TypeParam(_)) || matches!(arg, Type::TypeParam(_)) {
+    return Some(2);
+}
+```
+
+という腕があり、**引数の型が裸の型パラメータだと全候補に適合**していました。
+`String.valueOf(value)`（`DBIOAction.scala:367`、`case class SuccessAction[+R](value: R)`）
+は `valueOf(Object)` から `valueOf(char)` まで全部が適合して `ambiguous overload`
+になります。nsc は `valueOf(Object)` を選びます（`javap -c` で確認。Java の
+`Object` 引数には `Any` も適合する——2.13 の `ObjectTpeJava`）。
+
+`param` 側の腕は正しい（`def f[T](x: T)` の `T` は候補自身の変数で、採点中は
+`undet_tvars` に入っていない）ので残し、`arg` 側は**上限で採り直す**形に
+置き換えました。`is_sub_type` はすでに上限へ広げているので、この腕が効くのは
+「パラメータが候補自身の未解決変数を含む」場合だけです——
+`Comprehension[+Fetch <: Option[Node]]` の `fetch: Fetch` を
+`ConstArrayBuilder.++` の 3 つのオーバーロード（`ConstArray[T]` /
+`IterableOnce[T]` / `Option[T]`）に渡す `Comprehension.scala:22` がそれで、
+上限 `Option[Node]` を見て初めて `Option[T]` だけが残ります。
+
+ブリーフには「この腕を落とすのが直し」とありましたが、**落とすだけでは
+`Comprehension.scala` に 2 件の新規エラーが出ます**。上限で採り直すところまでが
+一組です。
+
+**2. 複合型（`A with B`）のパラメータ・引数**（`JdbcTypesComponent.scala:50`、
+`MemoryProfile.scala:62`、`MemoryProfile.scala:63`）。slick は
+
+```scala
+type BaseColumnType[T] = ScalaType[T] with BaseTypedType[T]
+def assertNonNullType[A](t: BaseColumnType[A]): Unit
+```
+
+と書き、`assertNonNullType(implicitly[BaseColumnType[U]])` と呼びます。
+`class_ctor_matches_typeparam_args`（「パラメータの型引数が型パラメータなら
+適合」）も `unify_one` も `Type::Refined` を見ていなかったので、適合が 0、
+仮に適合させても `A` が解けませんでした。両方に
+
+* 複合どうしは**要素ごと**に、
+* 複合の引数は**どれか 1 つの要素**が適合すればよい（`ScalaType[U] with
+  BaseTypedType[U]` を `ColumnType[U'] = ScalaType[U']` のパラメータへ渡す
+  `new MappedColumnType(...)`）
+
+の 2 本を足しました。
+
+**3. 単相の呼び先も、引数にパラメータ型を期待型として渡す。**
+`proto_arg_type` は、呼び先が型パラメータを持たないときだけ
+「関数の形をしたパラメータ」しかプロトタイプに出していませんでした。nsc は
+**すべての**引数をパラメータ型に対して型付けします。この差は、
+**引数自身の型パラメータが推論で決まる**とき——`RefId[E <: AnyRef]` は不変なので
+
+```scala
+val errors = mutable.Set.empty[RefId[Dumpable]]
+errors += RefId(n1)            // n1: Node
+```
+
+は期待型 `RefId[Dumpable]` があって初めて `E = Dumpable` になります——に
+そのまま出ます（`VerifyTypes.scala:38,41`）。プロトタイプは既存の呼び出し側の
+規律どおり**ヒント**で、引数がそれに適合しなければ期待型なしで型付けし直します。
+`e2e` 460 本・継ぎ目リストを含めて回帰はありませんでした。
+
+**4. 固定された型パラメータは推論でも上限を通る。** 1 の適合が通ったあと、
+`mapOrNone[A](o: Option[A])(f: A => A)` に `fetch: Fetch` を渡すと
+`A` が解けず `Any` に落ちて `_.infer(scope, …)` が
+`value infer is not a member of Any` になっていました
+（`Comprehension.scala:85`。これは 26 件の外の別エラー）。`unify_one` は
+シンボル表を持たない自由関数なので、`unify_tparam_all` の側で
+「何も推論できなかったら上限で採り直す」ようにしました。
+
+**5. コンストラクタは継承されない。** `resolve_overload` は
+`Type::Overload` を受け取っても候補表を `overload_alternatives`
+（＝最後は `lookup_member`）で**組み直します**。`lookup_member` は親をたどるので、
+`java.util.Properties` の `<init>` の候補に `Hashtable` の
+`(Int, Float)` と `(Map[_ <: K, _ <: V])` が混ざり、`new Properties(null)` が
+`Properties(Properties)` と `Hashtable(Map)` の間で `ambiguous overload`
+になっていました（`GlobalConfig.scala:68`）。`pick_ctor_at` は
+`owner == class_id` で濾していたのに、この経路がそれを落としていたわけです。
+
+ただし**「owner が一致するものだけ」に濾すと壊れます**。同じ classfile が
+2 通りの経路でシンボル表に入ることがあり、`java.io.OutputStreamWriter` が
+まさにそれで、片方のコピーの `OutputStream` しか `PrintStream` の親では
+ありませんでした。落とすのは**真の上位クラスが owner のもの**だけ
+（`owner_is_proper_subclass`）にしてあります。
+
+**6. `-cp` のスタブは何の部分型でもない。** 5 の濾過で
+`new OutputStreamWriter(System.out)` が落ちたので調べると、`Writer(Object lock)`
+——継承された、nsc なら候補にすらならないコンストラクタ——が拾われて
+成功に見えていただけでした。本当の理由は
+`find_or_stub_java_class` が記述子から作るスタブが `parents = [AnyRef]` だけを
+持つことで、`java/io/PrintStream` の classfile をまだ誰も読んでいない時点では
+`OutputStream` に適合しません。**同じ式が、同じファイルの後のほうでは通ります**
+（先に他の経路が読むので）。`arg_score` は `&self` なので classfile を読めない
+——`Option.option2Iterable` のときと同じ形です——ので、`new` の側でも
+「一度失敗したら引数のクラスを読んでからもう一度」（`warm_java_args`）を
+入れました。
+
+#### この 6 つで消えたもの
+
+`Comprehension.scala:22,85`、`ExpandSums.scala:27`、`VerifyTypes.scala:38,41`、
+`DBIOAction.scala:367`、`JdbcTypesComponent.scala:50`、
+`MemoryProfile.scala:62,63`、`GlobalConfig.scala:68` の 10 件。
+`ExpandSums.scala:27`（`oldDiscCandidates ++ (tree match { … })`）は
+`Set[_ <: AnyRef]` という lub が原因だと見ていましたが、実際には 3 で消えました
+——**症状の見立ては当てにならない**という例をもう 1 つ増やしたことになります。
+
+#### テスト
+
+`crates/cli/tests/ovl4.rs`（5 本）と fixture `tests/fixtures/ovl4.scala` /
+`ovl4_bad.scala`。6 つの根を**1 ファイルにまとめて**あります（実 scalac 1 回が
+1.8 秒なので、fixture は増やさず広くする）。`ovl4.scala` は修正前の `main` では
+**両モードとも 7 件のエラー**になります。dual-run は
+実 scalac 2.13.16 / `--scala-library` / `--no-scala-library` の 3 通りで
+出力一致を確認済み。`ovl4_bad.scala` は 1 の裏側——`def bad[T](x: T) =
+takesList(x)`——で、実 scalac も `type mismatch; found: T required: List[Int]`
+と拒否します。
+
+回した範囲: `--test ovl4 --test overloadshadow --test ambigmap --test setapply
+--test uniteq --test integral --test ordsummon --test mutcoll --test conform
+--test ovl2 --test ovl3 --test mismatch14 --test seqfn --test arrconv
+--test buildfrom --test dbio --test e2e`（全部グリーン）。
+
+#### 診断の後退（1 件、既知）
+
+1 の前は、候補が 1 つだけの呼び出しで裸の型パラメータを渡すと、適合して
+から `adapt` が `type mismatch; found: T required: List[Int]`（nsc と同文）を
+出していました。いまは適合の段階で落ちるので
+`no matching overload for (List[Int])Int with arguments (T)` になります。
+`agent/ovl3` が書いたとおり **`no matching overload` は候補 1 つでも出る**
+という既知の粗さで、「候補が 1 つなら引数を `adapt` して本当の不一致を出す」
+のが直しですが、既存テストの期待文字列に広く触るのでこのスライスでは
+やっていません。
+
+#### 残り 17 件（最小再現と見立て）
+
+* **`Array` は `Seq` の仲間として見られていない**（`ResultConverter.scala:58`
+  の `TupleSupport.buildTuple(a)`、`JdbcTypesComponent.scala:526` の
+  `Map(...) ++ anArrayOfTuples`）。`def f(x: Seq[Any]) = 1; f(a: Array[Any])`
+  はもちろん、`def v(a: Array[Any]): Seq[Any] = a` すら通りません
+  （実 scalac は通す）。prelude にあるのは `wrapIntArray` と
+  `wrapBooleanArray` だけで、しかも `seqfn_view.rs::array_seq_wrap` は
+  `Boolean` にしか答えません。直しは `wrapRefArray[T](Array[T]):
+  ArraySeq$ofRef[T]` を足して `array_seq_wrap` を要素型で分岐させ、
+  `adapt` と `arg_score` の両方から引くこと。`genericWrapArray` は使えません
+  ——実 ABI の記述子が `(Ljava/lang/Object;)…` で、こちらの backend は
+  `Array[T]` を `[Ljava/lang/Object;` に erase するためです。
+* **`Set() ++ xs`**（`JdbcModelBuilder.scala:280`）。`Set()` が `Set[Nothing]`
+  に固まってしまい、`++` の候補が `(IterableOnce[A])Set[A]`（`A = Nothing`）
+  しかないので何も渡せません（`Set() ++ List("a")` でも再現）。nsc は
+  `SetOps.concat(IterableOnce[A])` と `IterableOps.concat[B >: A]` の 2 本を
+  持ち、後者で `B` を解きます。prelude/pickle の継ぎ目なので慎重に。
+* **`ConstArray.toArray`**（`JdbcActionComponent.scala:725`）。ブリーフの
+  見立てどおりでした。`def toArray[R >: T : ClassTag]: Array[R]` が
+  期待型なしでは `Array[R]` のまま残り、`(String, Array[String])` と
+  `(String, Array[Int])` の両方に適合します。最小再現は
+  `s.withPreparedInsertStatement(sql, ks.toArray)(f)` そのままで取れます。
+  nsc は `R` を呼び出し全体の未決変数として扱い、下限 `T = String` で解きます
+  ——`undet_tvars` に引数側の未決変数を載せる話で、1 の腕を落としても
+  変わりません（引数の型は `Array[R]` であって裸の `R` ではないので）。
+* **`FixRowNumberOrdering.scala:19` / `ExpandSums.scala:245`**。
+  `fix(ch, Some(c))`（`c` は `case (c: Comprehension[?], _)` で束縛された
+  存在型）と `ProductNode(ConstArray(disc, map)).infer()`。どちらも
+  素朴に書き直した最小再現は**実 scalac も拒否した**ので、パターンで束縛された
+  skolem の変性がそのまま効いています。未解明。
+* **カスケード 3 件**: `Node.scala:534`（`:@` エクストラクタが無い）、
+  `CreateAggregates.scala:100`（`.toMap` の implicit 引数が入らず結果が
+  メソッド型のまま）、`ExpandTables.scala:25`（`collection.Map` に
+  `contains` / `apply` が生えていない）。いずれも根は同じファイルの
+  1 行上の別診断で、オーバーロードの問題ではありません。
+* 残り（`QueryCompiler.scala:220`、`SQLiteProfile.scala:183`、
+  `JdbcModelBuilder.scala:93,159`、`DistributedProfile.scala:76`、
+  `DBIOAction.scala:52,237`）は、素朴な縮小では再現しませんでした。
+  `DBIOAction.scala:237` の `cats.effect.IO(fa)` が slick 全体でしか出ない
+  という `agent/dbio` の観察はそのままです。
 
 ## ライセンス
 

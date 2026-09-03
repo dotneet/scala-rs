@@ -11036,7 +11036,20 @@ impl Typer {
                 // are the call's. `extends A(1)(2)` has read the arguments at
                 // its `targs` all along (`pick_ctor_at`); the `new` path did
                 // not.
-                match self.pick_ctor_at(c, &explicit, &arg_tys, None) {
+                let mut picked = self.pick_ctor_at(c, &explicit, &arg_tys, None);
+                // An argument whose class is still a `-cp` stub is a subtype of
+                // nothing: `find_or_stub_java_class` gives one `parents =
+                // [AnyRef]` until the classfile is really read.
+                // `new OutputStreamWriter(System.out)` asked before anything
+                // had read `java/io/PrintStream`, so it did not conform to
+                // `OutputStream`. `arg_score` runs on `&self` and cannot read a
+                // classfile; do it here, where the mutable borrow exists, and
+                // ask once more -- only a pick that has already failed pays,
+                // and `ensure_java_loaded` reads each classfile once.
+                if !matches!(picked, OverloadPick::Found(..)) && self.warm_java_args(&arg_tys) {
+                    picked = self.pick_ctor_at(c, &explicit, &arg_tys, None);
+                }
+                match picked {
                     OverloadPick::Found(sym, ps, _) => {
                         params_at_targs = !explicit.is_empty();
                         (Some(sym), ps)
@@ -12926,6 +12939,24 @@ impl Typer {
             if hit.is_none() && is_function_pt(p) && !matches!(a, Type::Function { .. }) {
                 if let Some(view) = self.function_view(a) {
                     hit = unify_one(tp, p, &view);
+                }
+            }
+            // A rigid type parameter argument is what its *upper bound* is,
+            // and `unify_one` has no symbol table to ask. slick's
+            // `Comprehension[+Fetch <: Option[Node]]` hands its `fetch: Fetch`
+            // to `mapOrNone[A](o: Option[A])(f: A => A)`, and only
+            // `Option[Node]` says what `A` is; with nothing inferred `A` fell
+            // back to `Any` and the literal's `_.infer(scope, …)` was
+            // `value infer is not a member of Any`.
+            if hit.is_none() {
+                if let Type::TypeParam(id) = a {
+                    let hi = self.st.get(*id).bound_hi.clone();
+                    if let Some(hi) = hi {
+                        if !matches!(hi, Type::TypeParam(_)) {
+                            let hi = self.align_to_param_class(p, &hi);
+                            hit = unify_one(tp, p, &hi);
+                        }
+                    }
                 }
             }
             if let Some(t) = hit {
@@ -15176,7 +15207,31 @@ impl Typer {
                 if !fun_sym.is_none() {
                     let name = self.st.get(fun_sym).name.clone();
                     cands.clear();
-                    let methods = self.drop_overridden(self.overload_alternatives(fun_sym, &name));
+                    let mut methods =
+                        self.drop_overridden(self.overload_alternatives(fun_sym, &name));
+                    // Constructors are not inherited. `overload_alternatives`
+                    // ends in `lookup_member`, which walks the parents, so
+                    // `java.util.Properties`'s alternatives came back carrying
+                    // `Hashtable`'s `(Int, Float)` and `(Map[_ <: K, _ <: V])`
+                    // as well. `new Properties(null)` was then `ambiguous
+                    // overload for constructor` between `Properties(Properties)`
+                    // and `Hashtable(Map)` -- nsc only ever sees the class's
+                    // own. `pick_ctor_at` already filters this way before
+                    // building the `Overload`; this branch rebuilt the list
+                    // from the symbol and lost the filter.
+                    //
+                    // What is dropped is a constructor whose owner is a proper
+                    // *superclass*, not everything the owner does not declare
+                    // itself: the same classfile can reach this table twice,
+                    // and `java.io.OutputStreamWriter` does -- with only one of
+                    // the two copies' `OutputStream` being the one
+                    // `System.out`'s `PrintStream` extends. Demanding the exact
+                    // owner threw the working copy away and turned
+                    // `new OutputStreamWriter(System.out)` into a `no matching
+                    // overload`.
+                    if name == "<init>" {
+                        methods.retain(|&m| !self.owner_is_proper_subclass(fun_sym, m));
+                    }
                     // The declaration on the symbol is written in its own
                     // owner's type parameters; the selection already worked
                     // out what each alternative looks like at this receiver,
@@ -15568,14 +15623,29 @@ impl Typer {
             // to read them from. The one-expression branch only ever worked by
             // accident: `section_param_types` recovers `s` from the call in
             // `{ s => si(s) }`, and a two-statement body has no such call.
+            //
+            // Restricting it to a function-shaped parameter left the argument
+            // of every other monomorphic call with no expected type, and an
+            // argument whose *own* type parameters are inferred has nothing
+            // else to read them from: `def f(b: Box[Any])` applied to
+            // `f(Box(n))` for an `n: String` inferred `Box[String]` from the
+            // argument alone and then reported `no matching overload for
+            // (Box[Any])Int with arguments (Box[String])`. nsc solves `E` from
+            // the prototype, which is what slick's
+            // `errors += RefId(n1)` (`RefId[E <: AnyRef]`, invariant, an
+            // `errors: Set[RefId[Dumpable]]`) needs.
+            //
+            // The prototype stays a hint: the caller re-types the argument
+            // with none whenever it does not fit.
             return match param_at(params, idx) {
-                Some(p)
-                    if !p.is_no_type()
-                        && !p.is_error()
-                        && !type_mentions_wildcard(p)
-                        && self.is_function_shaped(p) =>
-                {
-                    p.clone()
+                Some(p) if !p.is_no_type() && !p.is_error() && !type_mentions_wildcard(p) => {
+                    // A by-name or repeated formal expects the *value*;
+                    // wrapping it is `adapt`'s job and the caller would throw
+                    // a prototype the argument cannot be a subtype of away.
+                    match p {
+                        Type::ByName(inner) | Type::Repeated(inner) => (**inner).clone(),
+                        other => other.clone(),
+                    }
                 }
                 _ => Type::NoType,
             };
@@ -16292,8 +16362,35 @@ impl Typer {
         if self.undet_compatible(arg, param) {
             return Some(4);
         }
-        if matches!(param, Type::TypeParam(_)) || matches!(arg, Type::TypeParam(_)) {
+        // A *parameter* that is a bare type variable of the alternative takes
+        // anything -- that is what `def f[T](x: T)` means, and the variable is
+        // not in `undet_tvars` while alternatives are being scored.
+        //
+        // The *argument* being a bare type parameter is a different matter: a
+        // rigid `R` is only what its bounds say it is, and `is_sub_type`
+        // already widens it to its upper bound above. Scoring it as applicable
+        // to every parameter made every alternative of every Java overload set
+        // match: `String.valueOf(value)` for a `value: R` was `ambiguous
+        // overload` rather than the `valueOf(Object)` nsc picks.
+        if matches!(param, Type::TypeParam(_)) {
             return Some(2);
+        }
+        // A rigid type parameter *argument* is what its upper bound is, and no
+        // more. `is_sub_type` already widened it above; this is the second
+        // chance, for a parameter that mentions the alternative's own still
+        // open variables. slick's `Comprehension[+Fetch <: Option[Node]]`
+        // passes its `fetch: Fetch` to `mapOrNone[A](Option[A])(A => A)` and to
+        // `orElse[B >: A](=> Option[B])`, and only `Option[Node]` conforms to
+        // either.
+        if let Type::TypeParam(id) = arg {
+            let hi = self.st.get(*id).bound_hi.clone();
+            if let Some(hi) = hi {
+                if !matches!(hi, Type::TypeParam(_)) {
+                    if let Some(s) = self.arg_score(&hi, param) {
+                        return Some(s.min(2));
+                    }
+                }
+            }
         }
         // Overload scoring only: `is_sub_type` compares class args so
         // `ClassTag[Int]` does not inhabit `ClassTag[T]`. Constructors whose
@@ -19950,6 +20047,31 @@ impl Typer {
     /// came back as `Set[A]`. The conversions this is here to find
     /// (`Option.option2Iterable`) live on the companion of the type itself, so
     /// nothing is lost by stopping there.
+    /// Read the classfile behind each argument's class, so `is_sub_type` can
+    /// see its parents. Answers whether any of them had not been read yet.
+    ///
+    /// `find_or_stub_java_class` enters a class named by a descriptor with
+    /// `parents = [AnyRef]` and nothing else; until the classfile itself is
+    /// read, that stub conforms to nothing. Overload scoring runs on `&self`
+    /// and cannot read one, so the callers that fail ask for this and score
+    /// again.
+    fn warm_java_args(&mut self, arg_tys: &[Type]) -> bool {
+        let classes: Vec<SymbolId> = arg_tys
+            .iter()
+            .filter_map(|t| self.st.class_sym_of(t))
+            .collect();
+        let mut fresh = false;
+        for c in classes {
+            let jvm = self.st.get(c).jvm_name.clone();
+            if jvm.is_empty() || self.completed_java.contains(&jvm) {
+                continue;
+            }
+            self.ensure_java_loaded(c, Span::DUMMY);
+            fresh = true;
+        }
+        fresh
+    }
+
     fn warm_own_scope_once(&mut self, ty: &Type) -> bool {
         match self.st.class_sym_of(ty) {
             Some(c) => self.warm_one_scope(c),
@@ -22350,6 +22472,27 @@ fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
                 matches!(p, Type::TypeParam(_)) || a == p || class_ctor_matches_typeparam_args(a, p)
             })
         }
+        // `def f[A](t: X[A] with Y[A])`: a *compound* parameter that mentions
+        // the alternative's own type parameter is matched component by
+        // component, exactly like the class case above. slick spells its
+        // `BaseColumnType[T] = ScalaType[T] with BaseTypedType[T]` that way and
+        // passes an `implicitly[BaseColumnType[U]]` to it, which scored no
+        // match at all -- `is_sub_type` compares the class arguments, so
+        // `ScalaType[U]` does not inhabit `ScalaType[A]`.
+        (
+            Type::Refined {
+                parents: ap,
+                decls: ad,
+            },
+            Type::Refined {
+                parents: pp,
+                decls: pd,
+            },
+        ) if ad.is_empty() && pd.is_empty() && ap.len() == pp.len() => {
+            ap.iter().zip(pp.iter()).all(|(a, p)| {
+                matches!(p, Type::TypeParam(_)) || a == p || class_ctor_matches_typeparam_args(a, p)
+            })
+        }
         (_, Type::TypeParam(_)) => true,
         (a, Type::BoundedWildcard { hi: Some(h), .. }) => class_ctor_matches_typeparam_args(a, h),
         (
@@ -22359,6 +22502,14 @@ fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
                 hi: None,
             },
         ) => class_ctor_matches_typeparam_args(a, l),
+        // Last: a *compound* argument inhabits whatever any one of its
+        // components does. slick's `MemoryProfile.base[T, U]` hands its
+        // `implicitly[BaseColumnType[U]]` -- a `ScalaType[U] with
+        // BaseTypedType[U]` -- to `new MappedColumnType(baseType:
+        // ColumnType[U'], …)`, whose parameter is the plain `ScalaType[U']`.
+        (Type::Refined { parents, .. }, p) => parents
+            .iter()
+            .any(|a| class_ctor_matches_typeparam_args(a, p)),
         _ => false,
     }
 }
@@ -23307,6 +23458,18 @@ pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<T
             let aas = match actual {
                 Type::Class { args, .. } => args,
                 Type::Tuple(ts) if ts.len() == pas.len() => ts,
+                // A *compound* actual is each of its components: slick hands a
+                // `ScalaType[U] with BaseTypedType[U]` to a `ColumnType[U']`
+                // (= `ScalaType[U']`) parameter, and nothing else says what
+                // `U'` is.
+                Type::Refined { parents, .. } => {
+                    for a in parents {
+                        if let Some(t) = unify_one(tp, pattern, a) {
+                            return Some(t);
+                        }
+                    }
+                    return None;
+                }
                 _ => return None,
             };
             for (p, a) in pas.iter().zip(aas) {
@@ -23377,6 +23540,33 @@ pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<T
             } else {
                 None
             }
+        }
+        // `def f[A](t: X[A] with Y[A])` against an `X[U] with Y[U]`: nothing
+        // but the compound's components says what `A` is. slick writes
+        // `type BaseColumnType[T] = ScalaType[T] with BaseTypedType[T]` and
+        // passes `implicitly[BaseColumnType[U]]` to
+        // `assertNonNullType[A](t: BaseColumnType[A])`. Components are paired
+        // by position (both sides come from the same alias whenever this
+        // fires); a non-compound actual is tried against every component, the
+        // way a subtype of the compound arrives.
+        Type::Refined { parents, .. } => {
+            match actual {
+                Type::Refined { parents: aps, .. } if aps.len() == parents.len() => {
+                    for (p, a) in parents.iter().zip(aps) {
+                        if let Some(t) = unify_one(tp, p, a) {
+                            return Some(t);
+                        }
+                    }
+                }
+                _ => {
+                    for p in parents {
+                        if let Some(t) = unify_one(tp, p, actual) {
+                            return Some(t);
+                        }
+                    }
+                }
+            }
+            None
         }
         Type::Array(p) => match actual {
             Type::Array(a) => unify_one(tp, p, a),
