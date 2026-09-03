@@ -20,8 +20,10 @@ object Main {
     // `a :: b` and `_.get` used to stand here; both are reified now, out of
     // the `freshTermName` block nsc builds for them
     // (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.10).
-    // A splice may stand for a whole argument list, but mixing it with
-    // ordinary arguments needs a concatenation this does not build.
+    // Mixing a splice with ordinary arguments is built now, the way nsc's own
+    // `reifyList` builds it (`docs/macros.md` §7.16); the line is kept because
+    // the *shape* still has to compile. What is refused is a rank-2
+    // `...$xss`, in `tests/fixtures/sv_gaps_bad.scala`.
     val xs = List(q"p")
     println(q"k(1, ..$xs)")
     // A `..$` hole is a list; it cannot stand where a single tree goes.

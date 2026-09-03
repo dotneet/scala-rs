@@ -653,7 +653,19 @@ impl Typer {
             "ValDef" => {
                 let mods = mods_from(at(kids, 0)?)?;
                 let name = decode_method_name(&name_from(at(kids, 1)?)?);
-                let tpt = self.tree_from_reply(at(kids, 2)?, span)?;
+                // `q"val ff = $f"`: nsc's quasiquote writes an *empty*
+                // `TypeTree` where the source wrote no type, and slick's
+                // `mapToImpl` opens with two of them. Our parser leaves the
+                // same hole for an inferred type, so it becomes `Empty` here
+                // and the typer works the type out from the right-hand side.
+                // Only in this position: an empty `TypeTree` anywhere else has
+                // nothing in our AST that stands for "work it out", and is
+                // still refused rather than turned into one.
+                let tpt = if is_empty_type_tree(at(kids, 2)?) {
+                    node(TreeKind::Empty)
+                } else {
+                    self.tree_from_reply(at(kids, 2)?, span)?
+                };
                 let rhs = self.tree_from_reply(at(kids, 3)?, span)?;
                 Ok(node(TreeKind::ValDef {
                     mods,
@@ -669,6 +681,23 @@ impl Typer {
             )),
         }
     }
+}
+
+/// Whether the engine sent back a `TypeTree` with no type in it -- nsc's
+/// spelling for "this type was not written; infer it".
+fn is_empty_type_tree(s: &Sexp) -> bool {
+    let Ok(items) = s.list() else {
+        return false;
+    };
+    if items.first().and_then(|s| s.atom()) != Some("t")
+        || at(items, 1).map(|s| s.text()).as_deref() != Ok("TypeTree")
+    {
+        return false;
+    }
+    let Ok(kids) = at(items, 3).and_then(|k| k.list()) else {
+        return false;
+    };
+    kids.len() == 2 && at(kids, 1).map(|s| s.text()).as_deref() == Ok("")
 }
 
 /// The `Modifiers` of a `ValDef` the engine sent back.

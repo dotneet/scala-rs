@@ -19,8 +19,11 @@ object QrFormsBad {
   // A by-name type: nsc's own parser rejects it inside `tq"..."`.
   val byName = tq"=> Int"
 
-  // Concatenating a splice with ordinary arguments needs a static type that
-  // is right on both sides; getting it wrong would reorder a call.
+  // A splice among ordinary elements is reified now, as nsc's own
+  // `reifyList` does it -- `List(<a>) ++ xs` (`docs/macros.md` §7.16, and
+  // `tests/fixtures/sv_impl.scala` runs the result against real scalac).
+  // These two are left here because they still stand for the *shape*; what is
+  // still refused is a rank-2 `...$xss`, in `tests/fixtures/sv_gaps_bad.scala`.
   val mixed = q"f(a, ..$xs)"
   val mixedStats = q"{ a; ..$xs }"
 

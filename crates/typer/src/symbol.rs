@@ -1250,6 +1250,24 @@ impl SymbolTable {
                     }
                     t
                 }
+                // A member reached through an abstract type member (or a type
+                // parameter) is declared by its *upper bound*, and the bound is
+                // where the arguments to substitute are written. The reflect
+                // API is nothing but these: `type MemberScope >: Null <: Scope
+                // with MemberScopeApi`, `type Scope >: Null <: ScopeApi`, and
+                // `ScopeApi extends Iterable[Symbol]`. Stopping here handed
+                // `decls.toList` back `Iterable`'s own `List[A]` -- with `A`
+                // unbound, so the element type slick's `mapToImpl` enumerates
+                // case-class fields with was never `Symbol`.
+                Type::TypeMember(id) | Type::TypeParam(id) => {
+                    if !seen.insert(id.0) {
+                        return ty;
+                    }
+                    match st.get(*id).bound_hi.clone() {
+                        Some(hi) => walk(st, &hi, ty, seen),
+                        None => ty,
+                    }
+                }
                 _ => ty,
             }
         }

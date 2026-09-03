@@ -202,14 +202,77 @@ impl PickleSupply {
         //
         // Only when nothing else matched, so this stays additive.
         if out.is_empty() {
-            for anc in library_ancestors(st, class_sym) {
-                out = self.complete_on(st, bin, anc, name);
-                if !out.is_empty() {
-                    break;
-                }
-            }
+            out = self.complete_on_ancestors(st, bin, class_sym, name);
         }
         out
+    }
+
+    /// `cls`'s standard-library ancestors, nearest first, asked for the member
+    /// one level at a time -- each level's *pickled* parents read before the
+    /// walk steps past it.
+    ///
+    /// This used to take a snapshot of the parent lists already in the symbol
+    /// table, and a stub's is empty until something reads its pickle, so a
+    /// climb of more than one step stopped at the first. `MemberScope`'s bound
+    /// leads to `Scopes$MemberScopeApi`, whose only pickled parent is
+    /// `Scopes$ScopeApi`, whose only pickled parent is `Iterable[Symbol]`; the
+    /// snapshot reached `ScopeApi`, `complete_on` attached `Iterable` to it a
+    /// moment later, and nobody ever asked `Iterable`. `decls.collect` -- the
+    /// first line of slick's `mapToImpl` -- was therefore "not a member of
+    /// Scopes.MemberScope", and every `q"..."` after it inherited the error.
+    ///
+    /// Linearization order (parents last-first, breadth-first) so a member a
+    /// subclass's own library parent declares wins over a grandparent's,
+    /// exactly as `Check::enter_inherited_members` orders the scope. `cls`
+    /// itself is not included: `complete_named` has already been asked about
+    /// it.
+    fn complete_on_ancestors(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        cls: SymbolId,
+        name: &str,
+    ) -> Vec<SymbolId> {
+        let mut seen: Vec<u32> = vec![cls.0];
+        let mut work: std::collections::VecDeque<SymbolId> =
+            self.parents_after_pickle(st, bin, cls);
+        while let Some(c) = work.pop_front() {
+            if seen.contains(&c.0) || seen.len() > 256 {
+                continue;
+            }
+            seen.push(c.0);
+            let jvm = st.get(c).jvm_name.clone();
+            // `scala/Any`, `scala/AnyRef` and friends have no pickle of their
+            // own and would only cost a classfile miss per name.
+            if jvm.starts_with("scala/") && jvm != "scala/Any" && jvm != "scala/AnyRef" {
+                let out = self.complete_on(st, bin, c, name);
+                if !out.is_empty() {
+                    return out;
+                }
+            }
+            for p in self.parents_after_pickle(st, bin, c) {
+                work.push_back(p);
+            }
+        }
+        Vec::new()
+    }
+
+    /// A class's parents, after its own pickle has had the chance to add the
+    /// ones the class file does not name. Reversed, for the linearization
+    /// order `complete_on_ancestors` walks in.
+    fn parents_after_pickle(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        cls: SymbolId,
+    ) -> std::collections::VecDeque<SymbolId> {
+        self.ensure_parents(st, bin, cls);
+        st.get(cls)
+            .parents
+            .iter()
+            .rev()
+            .filter_map(|p| st.class_sym_of(p))
+            .collect()
     }
 
     /// The `type` aliases a package object declares, read from its pickle.
@@ -1656,7 +1719,7 @@ impl PickleSupply {
             }
             trace(format_args!(
                 "{full}: attaching pickled parent {}",
-                st.get(*psym).name
+                st.display_type(&t)
             ));
             st.get_mut(class_sym).parents.push(t);
         }
@@ -2991,42 +3054,6 @@ fn is_default_getter(name: &str) -> bool {
         return false;
     };
     !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
-}
-
-/// `cls`'s ancestors that are standard-library classes, nearest first.
-///
-/// Linearization order (parents last-first, breadth-first) so a member a
-/// subclass's own library parent declares wins over a grandparent's, exactly
-/// as `Check::enter_inherited_members` orders the scope. `cls` itself is not
-/// included: `complete_named` has already been asked about it.
-fn library_ancestors(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
-    let mut out = Vec::new();
-    let mut seen: Vec<u32> = vec![cls.0];
-    let mut work: std::collections::VecDeque<SymbolId> = st
-        .get(cls)
-        .parents
-        .iter()
-        .rev()
-        .filter_map(|p| st.class_sym_of(p))
-        .collect();
-    while let Some(c) = work.pop_front() {
-        if seen.contains(&c.0) || seen.len() > 256 {
-            continue;
-        }
-        seen.push(c.0);
-        let jvm = &st.get(c).jvm_name;
-        // `scala/Any`, `scala/AnyRef` and friends have no pickle of their own
-        // and would only cost a classfile miss per name.
-        if jvm.starts_with("scala/") && jvm != "scala/Any" && jvm != "scala/AnyRef" {
-            out.push(c);
-        }
-        for p in st.get(c).parents.iter().rev() {
-            if let Some(ps) = st.class_sym_of(p) {
-                work.push_back(ps);
-            }
-        }
-    }
-    out
 }
 
 /// The type arguments of a class type, empty for anything else.

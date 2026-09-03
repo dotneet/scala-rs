@@ -664,7 +664,9 @@ fn qr_forms_bad_names_every_form_it_cannot_build() {
     for needle in [
         "an `if` without an `else` is not reified yet",
         "a by-name type is not reified yet",
-        "a `..$` splice mixed with ordinary arguments is not reified yet",
+        // A `..$` splice among ordinary elements used to be refused here. It
+        // is reified now (`docs/macros.md` §7.16); what is still refused is a
+        // rank-2 `...$xss`, pinned by `engine.rs`'s `sv_refused_forms_are_named`.
         "a type definition is not reified yet",
     ] {
         assert!(

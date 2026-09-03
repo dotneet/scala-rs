@@ -986,3 +986,136 @@ fn rb_reify_gaps_are_named() {
     );
     let _ = fs::remove_dir_all(&out_dir);
 }
+
+/// slick's `ShapedValue.mapToImpl`, taken apart (`docs/macros.md` §7.16): a
+/// macro implementation whose `Context` is refined with a `PrefixType`, a
+/// field walk over `rTag.tpe.decls`, and `..$` splices among ordinary
+/// elements in an argument clause, a block and a template body.
+#[test]
+fn sv_refined_context_and_mixed_splices_run() {
+    if !prerequisites("sv_use") {
+        return;
+    }
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("sv_impl");
+    let uses = tmp_dir("sv_use");
+
+    let out = compile("sv_impl", &impls, &[]);
+    assert!(
+        out.status.success(),
+        "compile sv_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out = compile("sv_use", &uses, &[&impls]);
+    assert!(
+        out.status.success(),
+        "compile sv_use failed: {}",
+        diagnostics(&out)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "sv_use"),
+        expected_stdout("sv_use"),
+        "stdout mismatch for sv_use"
+    );
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
+/// The same two files through real scalac 2.13.16. The expansion carries the
+/// *printed* form of a template whose body mixes a `..$` splice with an
+/// ordinary member, so a concatenation that reordered the pieces -- which
+/// still compiles and still runs -- shows up as a different line.
+#[test]
+fn sv_refined_context_and_mixed_splices_match_real_scalac() {
+    if !prerequisites("sv_use scalac diff") {
+        return;
+    }
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip sv_use scalac diff: scalac not obtainable");
+        return;
+    };
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("sv_impl-scalac");
+    let uses = tmp_dir("sv_use-scalac");
+
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            impls.to_str().unwrap(),
+            fixtures_dir().join("sv_impl.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected sv_impl.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            &format!("{}:{}", reflect.display(), impls.display()),
+            "-d",
+            uses.to_str().unwrap(),
+            fixtures_dir().join("sv_use.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected sv_use.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "sv_use (real scalac build)"),
+        expected_stdout("sv_use"),
+        "recorded expectation for sv_use does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
+/// The three forms still refused. Two of them real scalac rejects as well, so
+/// they pin agreement rather than a gap; the third (a `case` class whose
+/// parents are a splice) nsc reifies and scala-rs does not.
+#[test]
+fn sv_refused_forms_are_named() {
+    if !prerequisites("sv_gaps_bad") {
+        return;
+    }
+    let out_dir = tmp_dir("sv_gaps_bad");
+    let out = compile("sv_gaps_bad", &out_dir, &[]);
+    assert!(
+        !out.status.success(),
+        "sv_gaps_bad.scala should not compile"
+    );
+    let text = diagnostics(&out);
+    for want in [
+        "a rank-2 hole (...$xss) cannot stand for a list of trees",
+        "a `case` class whose parents are a `..$` splice is not reified yet",
+        "must take scala.reflect.macros.blackbox.Context",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    let _ = fs::remove_dir_all(&out_dir);
+}

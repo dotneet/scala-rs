@@ -7398,6 +7398,16 @@ impl Typer {
         if found.is_empty() {
             found = self.st.lookup_member(self.st.root, &name);
         }
+        // `_root_` names the root package. nsc binds it in every scope;
+        // scala-rs understood it only in an import path, so
+        // `_root_.scala.List(1, 2)` -- what a macro writes to keep its
+        // expansion out of whatever the call site happens to have in scope,
+        // and what slick's `mapToImpl` writes eleven times -- was "not found:
+        // value _root_". Looked up first, so a binding of that name (which
+        // Scala does not allow, but a class file could still carry) wins.
+        if found.is_empty() && name == "_root_" {
+            found = vec![self.st.root];
+        }
         if found.is_empty() {
             // A tree that already resolved keeps its symbol. The typer types
             // some applications twice -- `retry_tupled_args` re-runs a call
