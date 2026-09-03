@@ -11410,6 +11410,189 @@ codegen（`crates/backend/`）を触ったので `SLICK_SEED_LOG` 付きの
   `VerifyError: Operand stack underflow` になったので、この節の変更の前から
   ある別件です（scala-rs 同士の分離コンパイルは通ります）。
 
+### `Set`/`Map` の構築・追加と、`Array` が `Seq` として扱われない件（`agent/setmap`）
+
+slick に残っていたコレクション構築系 8 件を最小再現して分けたところ、**7 つの根**
+でした。1 件は根に届かず（下の「残件」）、代わりに 1 つ上流で出るようになりました。
+slick は `errors=44 files_with_errors=26` → **`errors=37 files_with_errors=22`**
+（`tests/slick_measure.sh`。エラーが消えたファイル: `ExpandTables.scala`、
+`PruneProjections.scala`、`QueryCompiler.scala`、`ResultConverter.scala`）。
+fixture は `tests/fixtures/setmap1.scala` の 1 ファイルに全ケース、テストは
+`crates/cli/tests/setmap.rs`。修正前の main（`61023ba`）ではこの 1 ファイルで
+13 件のエラーが出ます。
+
+**1. `Array` を `Seq`/`IndexedSeq`/`Iterable` として渡す包み込みが無い。**
+`def v(a: Array[Any]): Seq[Any] = a` すら通りませんでした。実 scalac の
+`-Xprint:typer` はこう出します。
+
+```
+def v(a: Array[Any]): Seq[Any]      = scala.Predef.copyArrayToImmutableIndexedSeq[Any](a)
+def y(a: Array[Any]): Iterable[Any] = scala.Predef.genericWrapArray[Any](a)
+```
+
+`scala.Seq` / `scala.IndexedSeq` は `immutable` の別名なので、
+`genericWrapArray` が返す `scala.collection.mutable.ArraySeq` では届かず、
+最下位（`LowPriorityImplicits2`）の `copyArrayToImmutableIndexedSeq` が選ばれます。
+`scala.Iterable` は `scala.collection.Iterable` なので `genericWrapArray` で届き、
+優先順位どおりそちらになります。両方を `prelude_setmap.rs` に足し、
+`seqfn_view.rs` の `array_seq_wrap`（`Array[Boolean]` 専用だった）を
+`array_wrap_candidates` に一般化して、優先順位順に最初に適合するものを選びます。
+
+**ブリーフの見立て（「`genericWrapArray` は記述子が合わず使えないので
+`wrapRefArray` を足せ」）は誤りでした。** 合わないのは `Array[Any]` と宣言した
+ときの `([Ljava/lang/Object;)` で、本物の型パラメータを持たせて `Array[T]` と
+書けば `erasure.rs` の `array_elem_is_abstract` が nsc と同じく
+`Ljava/lang/Object;` に潰します（javap:
+`public <T> scala.collection.mutable.ArraySeq<T> genericWrapArray(java.lang.Object)`）。
+`wrapRefArray` は `T <: AnyRef` の制約があり `Array[Any]` には効かないので、
+nsc もそこでは選んでいません。
+
+`wrapBooleanArray` と同じ理由で **`implicit` にはしていません**（implicit に
+すると普通の `Array` のメンバ選択で `refArrayOps` と競合します）。
+オーバーロード解決側は `arg_conforms` の view の列に 1 本足してあります
+（`TupleSupport.buildTuple(a)` が `IndexedSeq[Any]` の引数に届くのはこの経路）。
+
+**2. `scala.collection.Map` にメンバが 1 つも無い。** `prelude_hier.rs` の
+`LINKS` が作る `scala/collection/Map` は型パラメータだけのつなぎで、
+`pickle_supply::adopt_binary_class` は `scala/` 名の prelude クラスを触らない
+（`class_sym.0 < st.prelude_end`）ので jar からも補われません。slick の
+`expansions contains tsym` が `not a member`、`expansions(tsym)` が
+**コンパニオンの可変長 `apply`** に落ちて `no matching overload for ((K, V)*)Map[K, V]`
+になっていました。`collection.MapOps` の読み出し 3 つ（`contains` / `apply` /
+`get`）を宣言しました。
+
+**3. prelude の近似メンバが jar の本物と 2 択になっていた。** `prelude_coll.rs` は
+`Set.map(A => Any): Set[Any]` や `Map.+((K, Any)): Map[K, Any]` を手書きしています。
+`immutable.HashSet` / `HashMap` は**両方**に届く——上には pickle の
+`IterableOps` / `MapOps`、横には prelude の `Set` / `Map`——ので、どちらの
+所有者も他方の部分クラスではなく、`A => B` は `A => Any` に適合し `map[B]` は
+`B = Any` で適用できてしまうため、`HashSet.map(f)` も `HashMap + kv` も
+`ambiguous overload` でした。nsc が見るメンバは 1 つで、それは jar の方です。
+曖昧になったときだけ、`pickled_origin` を持つ側を残します。
+
+**4. `@uncheckedVariance` の付いた要素型でメンバ選択の代入が起きない。**
+slick の `ConstArray.toSet: immutable.HashSet[T @uncheckedVariance]` の結果に
+`.map(_._1)` すると、`_1` が `Tuple2` の宣言どおりの `T1` のまま返り、
+`referenced.map(_._1)` が `HashSet[T1]` になっていました。`Type::Tuple` は
+`subst_as_seen_from` が扱わない（`type_select` の `subst_args` がそのための
+リスト）ので、注釈を剥がしてから見るようにしました。型注釈はメンバについて
+何も言いません。
+
+**5. `Option` が `IterableOnce` でなかった。** 2.13 で
+`sealed abstract class Option[+A] extends IterableOnce[A]` になっています
+（2.12 の `option2Iterable` ではなく本当の親）。実 scalac は
+`Set.apply[String]().++(o)` と、**変換を挟まずに**そのまま渡します。
+
+**6. `++` は 2 つのオーバーロード。** javap:
+
+```
+scala.collection.SetOps:      public default C    $plus$plus(scala.collection.IterableOnce<A>);
+scala.collection.IterableOps: public default <B> CC $plus$plus(scala.collection.IterableOnce<B>);
+```
+
+prelude 側には前者に相当する 1 つしか無く（`prelude_coll` が作り
+`prelude_buildfrom::widen_set_concat` が広げたもの）、しかもそれが
+`lookup_member` に見つかるので pickle 側は `++` を一度も訊かれません
+（`SCALA_RS_PICKLE_DEBUG=1` で確認。`concat` は訊かれるので 2 つ揃っています）。
+そのため `s ++ anOptionOfSomethingElse` が `no matching overload` でした。
+多相版を `prelude_setmap.rs` で足し、あわせて 2 つの規則を入れました。
+
+* `pickle_supply` の「消去後の引数が同じ宣言は 1 つだけ」の鍵に**自分の型
+  パラメータを持つかどうか**を足しました。守りたいのは「結果型だけが違う 2 つ」
+  （`IterableOps.map[B]` と `MapOps.map[K2, V2]`）で、それは両方とも多相なので
+  今も 1 つに潰れます。片方が単相の組は、引数で区別できる本物のオーバーロードです。
+* 単相と多相が**同じくらい specific**になったときは単相を採ります。`Set()` の
+  要素型が未確定だと `IterableOnce[?A]` と `IterableOnce[B]` が互いを受けて
+  しまいますが、nsc は単相の方を選びます（`-Xprint:typer` が `.++(o)` と、
+  型引数なしで出します）。
+
+**7. 空のファクトリの型引数を、後続の引数から解く。** `Set()` は `Set[?A]` の
+まま置かれ（`instantiate_leftover_tparams` が意図的にそうしています）、
+`++` の引数がそれを解くはずでしたが、`undet_compatible` は**引数側**が持つ
+変数しか見ていませんでした。**パラメータ側**が未確定な場合を `arg_score` に
+足しました。解いた後の代入は `OverloadPick::Found` の側にすでにあります。
+`Map() ++ arrayOfPairs` のように包み込みを挟む場合は、包んだ後の型で
+unify する必要があるので、そこも 1 行足してあります。
+
+なお 6 の多相版を足したことで `oldDiscCandidates ++ (tree match { … case _ => Set.empty })`
+（slick `ExpandSums.scala`）が**新たに 2 件**壊れました。オーバーロードになった
+ことで `proto_arg_type` が引数にプロトタイプを渡さなくなり、`match` の腕が
+期待型なしで lub され `Set[_ <: AnyRef]` という存在型になったためです
+（**同じ式を実 scalac も期待型なしなら存在型にします**。nsc がここで困らないのは、
+`IterableOnce[A]` を期待型として腕を 1 つずつ適合させるからです）。
+オーバーロードの中で「引数の位置が具体型なのが 1 つだけ」のときはそれを
+プロトタイプに使う、という規則（`only_concrete_param`）で戻しました。
+
+**残件（最小再現つき）**
+
+* `m.Column(name=…, options = Set() ++ … )`（`JdbcModelBuilder.scala:279`）。
+  `++` は通るようになりましたが、期待型 `Set[ColumnOption[_]]` が
+  `Set()` まで届かないので `Set[ColumnOption[Nothing]]` になり、1 つ上流で
+  `no matching overload for Column$` になります。エラーは 280 行目から
+  279 行目に移っただけで、ファイル数は増えていません。根は
+  `proto_arg_type` の `!type_mentions_wildcard(p)`：ワイルドカードを含む
+  パラメータはプロトタイプに使われません。これを外すと下の再現は通りますが、
+  **slick の数字は 1 も動かなかった**（`m.Column` はコンパニオンの `apply` で
+  `ModuleRef` 経路に入るため）ので、測って利のない広げ方はやめました。
+
+  ```scala
+  sealed trait CO[+T]
+  case class SqlType(s: String) extends CO[String]
+  case object AutoInc extends CO[Nothing]
+  object S {
+    def take(options: Set[CO[_]]): Int = options.size
+    def a(d: Option[String], ai: Boolean): Int =
+      take(Set() ++ d.map(s => SqlType(s)) ++ (if (ai) Some(AutoInc) else None))
+  }
+  ```
+
+* `session.withPreparedInsertStatement(sql, keyColumns.toArray)`
+  （`JdbcActionComponent.scala:725`）は**担当外の根**でした。`ConstArray.toArray`
+  は `def toArray[R >: T : ClassTag]: Array[R]` で、下限しか持たない `R` が
+  未確定のまま `Array[R]` として残るため、`Array[String]` 版と `Array[Int]` 版の
+  両方に適合して `ambiguous` になります。nsc は下限に落として `Array[String]` に
+  します。最小再現:
+
+  ```scala
+  import scala.reflect.ClassTag
+  class CA[+T](val xs: Seq[T]) { def toArray[R >: T : ClassTag]: Array[R] = xs.toArray[R] }
+  object G {
+    def over[T](sql: String, names: Array[String] = new Array[String](0))(f: Int => T): T = f(1)
+    def over[T](sql: String, idx: Array[Int])(f: Int => T): T = f(2)
+    def call(ca: CA[String]): Int = over("x", ca.toArray)(_ + 1)   // ambiguous overload
+  }
+  ```
+
+  同じファイルの `xs.toArray[R]`（明示型引数）も `found: Array[T] required: Array[R]`
+  になります。これは下の「明示型引数がジェネリック親のメンバに as-seen-from を
+  かけない」件と同じ根です。
+
+* `Node.scala:534` の `scope + (sym -> el)` は **`:@` 抽出子が見つからない**
+  （533 行目）ことの派生で、この節の担当ではありません。
+
+**ついでに見つかった別件（この節では直していません）**
+
+* 明示型引数を書いたメンバ呼び出しが as-seen-from を通りません。
+  `s.map[Int](_.length)`（`s: immutable.HashSet[String]`）が
+  `value length is not a member of A` ＋ `found: CC[Int] required: HashSet[Int]`。
+  型引数を書かない `s.map(_.length)` は通ります。
+* `Array[Any](1, "a")` を含むファイルで、**あとから出てくる**要素型を推論する
+  `Array(3, 1, 2)` が壊れた記述子を出します（`Array$.apply(Int, Seq[Int])` を
+  選んでおきながら `apply(Seq, ClassTag)` を呼び、`VerifyError`）。
+  `Array[Int](3, 1, 2)` と書けば避けられます。main（`61023ba`）からある件です。
+
+  ```scala
+  object Main {
+    def a(): Unit = println(Array[Any](1, "a").mkString(","))
+    def b(): Unit = println(Array(3, 1, 2).sum)      // VerifyError
+    def main(args: Array[String]): Unit = { a(); b() }
+  }
+  ```
+
+* `Array[(Int, String)](1 -> "one")` は `Object[]` を作って `[Lscala/Tuple2;` に
+  `checkcast` するので `ClassCastException` になります。これも main からある件で、
+  fixture では要素代入で配列を作って避けました。
+
 ## ライセンス
 
 Apache-2.0

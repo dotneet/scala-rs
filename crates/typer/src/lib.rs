@@ -56,6 +56,7 @@ mod prelude_regex;
 mod prelude_seq;
 mod prelude_seqfn;
 mod prelude_seqpat;
+mod prelude_setmap;
 mod prelude_sgap;
 mod prelude_strhier;
 mod prelude_stringops8;

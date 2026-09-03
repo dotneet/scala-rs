@@ -1515,7 +1515,29 @@ impl PickleSupply {
             .flat_map(|(_, tys)| tys.iter())
             .map(|t| erased_param_desc(st, t))
             .collect();
-        let key = format!("{key_want:?}");
+        // ...but a *monomorphic* declaration and a *polymorphic* one with the
+        // same erased parameters are two overloads nsc really does keep apart,
+        // and the argument is what tells them apart. 2.13's `SetOps` declares
+        //
+        //   def ++ (that: IterableOnce[A]): C
+        //
+        // next to `IterableOps`'s
+        //
+        //   def ++ [B >: A](suffix: IterableOnce[B]): CC[B]
+        //
+        // (`javap scala.collection.SetOps` / `scala.collection.IterableOps`).
+        // Both erase to `(Lscala/collection/IterableOnce;)Ljava/lang/Object;`,
+        // so only the `SetOps` one survived and `s ++ anOptionOfSomethingElse`
+        // -- slick's `Set() ++ dbType.map(…) ++ (if(…) Some(…) else None)` --
+        // was `no matching overload`. The danger this key guards against is
+        // two declarations overloaded on nothing but their *result*
+        // (`IterableOps.map[B]` vs `MapOps.map[K2, V2]`), and those are both
+        // polymorphic: they still share a key and still collapse. Where one
+        // side takes the receiver's own element type and the other introduces
+        // a variable, specificity separates them the way nsc's does -- the
+        // monomorphic one is strictly more specific and wins wherever it
+        // applies.
+        let key = format!("{key_want:?}/{}", shape.tparams.is_empty());
         if seen_shapes.contains(&key) {
             trace(format_args!(
                 "{internal}#{name}: skipping an overload shadowed by a more \
