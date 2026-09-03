@@ -293,7 +293,7 @@ fn rewrite_refs(tree: &mut Tree, map: &Rewrite) {
 
 /// Every subtree that can hold an expression. Deliberately exhaustive so a new
 /// `TreeKind` does not silently stop being visited.
-fn children_mut(t: &mut Tree) -> Vec<&mut Tree> {
+pub(crate) fn children_mut(t: &mut Tree) -> Vec<&mut Tree> {
     let mut v: Vec<&mut Tree> = Vec::new();
     match &mut t.kind {
         TreeKind::PackageDef { pid, stats } => {

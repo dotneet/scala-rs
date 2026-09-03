@@ -7,10 +7,10 @@ use scala_rs_backend::{emit_opts, emit_runtime, load_classpath, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
-    check_local_case_class_captures, check_local_objects, erase, find_mains, lambda_lift,
-    lazy_locals, mark_anon_captures, note_source_value_classes, typecheck_units_src, uncurry,
-    ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType, ClasspathTypeParam,
-    TypecheckOptions,
+    check_local_case_class_captures, check_local_objects, erase, expand_private_names, find_mains,
+    lambda_lift, lazy_locals, mark_anon_captures, note_source_value_classes, typecheck_units_src,
+    uncurry, ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType,
+    ClasspathTypeParam, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -222,6 +222,11 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 lazy_locals(&mut u.tree, &mut st);
                 lambda_lift(&mut u.tree, &mut st);
                 mark_anon_captures(&u.tree, &mut st);
+                // nsc `superaccessors`, which likewise runs before the
+                // pickler: a `private` member reached from an anonymous /
+                // local class, a lambda body or the companion is renamed
+                // and published, because `ACC_PRIVATE` is per class file.
+                expand_private_names(&mut u.tree, &mut st);
             }
             // A local `case class` whose companion would have to capture an
             // enclosing-method local is the same unimplemented `LazyRef`

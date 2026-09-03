@@ -180,3 +180,142 @@ fn outer_field_is_the_trait_interface() {
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
+
+// ---------------------------------------------------------------------------
+// Anonymous / local classes reaching *into* the class that encloses them.
+//
+// Two bugs, one shape.
+//
+// 1. A super-constructor argument of an anonymous class read the enclosing
+//    instance as `this.$outer`. Before the super call `this` is
+//    `uninitializedThis`, and JVMS §4.10.1.9 lets that type carry a `putfield`
+//    of a field declared in the current class but never a `getfield` — so
+//    `java -Xverify:all` refused the classfile outright (`VerifyError: Type
+//    uninitializedThis … is not assignable to`). scalac stores `$outer`
+//    *first*, ahead of the super call, and still reads the `<init>` parameter
+//    for the argument; both are now what we emit.
+//
+// 2. `private` is lexical in Scala and per-classfile on the JVM, so every
+//    reference to a `private` / `private[this]` member from an anonymous
+//    class, a local class, a lambda body or the companion is an
+//    `IllegalAccessError` unless the member is published. scalac publishes it
+//    *renamed*, as `<owner full name, '$'-separated>$$<name>`
+//    (`Main$Outer$$secret`); we only dropped `ACC_PRIVATE`, and only on two
+//    narrow paths in the typer, so most such references were never widened at
+//    all. `expand_private_names` now does the renaming as a pass of its own,
+//    before the pickler — where nsc's `superaccessors` does it.
+//
+//    The rename is not cosmetic. `class Q extends P` may declare its own `y`
+//    beside `P`'s `private[this] def y`, and a *published but unrenamed* `P.y`
+//    is then overridden by it: `new Q().mk()` printed 9 where scalac prints 2.
+// ---------------------------------------------------------------------------
+
+/// The whole family in one process: an anonymous class whose super-constructor
+/// argument reads the outer instance, `private` / `private[this]` val, var and
+/// def reached from an anonymous class, a local class, a lambda body and a
+/// companion, an enclosing `private[this] var` assigned from an anonymous
+/// class, and a lambda body that builds an anonymous class needing the
+/// enclosing instance for its own `$outer`. Every line of the expected output
+/// is what scalac 2.13.16 prints for this source.
+#[test]
+fn fixtures_outer1_anonymous_classes_reach_the_enclosing_class() {
+    check_both_abis("outer1");
+}
+
+fn javap(out: &Path, class: &str) -> String {
+    let output = Command::new("javap")
+        .args(["-p", "-c", "-cp", out.to_str().unwrap(), class])
+        .output()
+        .expect("javap");
+    assert!(
+        output.status.success(),
+        "javap {class} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// `$outer` is stored before the super-constructor call, and the argument to
+/// that call reads the `<init>` *parameter* rather than the field. Reading the
+/// field there is not merely early: `getfield` on `uninitializedThis` never
+/// verifies, whatever was stored. This is the instruction order scalac emits.
+#[test]
+fn outer1_anon_ctor_stores_outer_before_super() {
+    let out = compile("outer1", "outer1-ctor", &["--no-scala-library"]);
+    let code = javap(&out, "Main$Outer$$anon$1");
+    let init = code
+        .split("public Main$Outer$$anon$1(Main$Outer);")
+        .nth(1)
+        .expect("`<init>` of the anonymous class");
+    let init = init
+        .split("public java.lang.String describe();")
+        .next()
+        .unwrap();
+    let store = init
+        .find("putfield")
+        .expect("`$outer` is stored in `<init>`");
+    let sup = init
+        .find("Method Main$Base.\"<init>\"")
+        .expect("super constructor call");
+    assert!(
+        store < sup,
+        "`$outer` must be stored before the super call:\n{init}"
+    );
+    // Between the store and the super call — the argument — `$outer` must not
+    // be named again: that region may only read the parameter (`aload_1`).
+    assert!(
+        !init[store..sup]
+            .split_once('\n')
+            .map(|(_, rest)| rest.contains("$outer"))
+            .unwrap_or(false),
+        "the super-ctor argument must read the `<init>` parameter, not `$outer`:\n{init}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// The names scalac 2.13.16 emits for this fixture, verified with `javap -p`
+/// against its own output: a `private` member reached from another classfile
+/// is republished as `<owner>$$<name>`, and a setter keeps `_$eq` outside the
+/// expansion (`Main$Outer$$bumped_$eq`).
+#[test]
+fn outer1_private_members_take_scalacs_expanded_name() {
+    let out = compile("outer1", "outer1-names", &["--no-scala-library"]);
+    let outer = javap(&out, "Main$Outer");
+    for want in [
+        "Main$Outer$$secret",
+        "Main$Outer$$hidden",
+        "Main$Outer$$helper",
+        "Main$Outer$$bumped",
+        "Main$Outer$$bumped_$eq",
+    ] {
+        assert!(outer.contains(want), "missing {want} in:\n{outer}");
+    }
+    // The source names must be gone: an unrenamed public copy is exactly what
+    // let a subclass override the member by accident.
+    for gone in [" secret;", " hidden;", " helper()", " bumped;"] {
+        assert!(!outer.contains(gone), "found {gone:?} in:\n{outer}");
+    }
+    assert!(javap(&out, "Main$P").contains("Main$P$$y"));
+    assert!(javap(&out, "Main$Holder$").contains("Main$Holder$$note"));
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// A `private[this]` member is not inherited, so a subclass may declare its
+/// own of the same name. Publishing the parent's under the source name made
+/// the subclass override it; the expanded name keeps the two apart.
+#[test]
+fn outer1_subclass_member_does_not_override_the_parents_private() {
+    let out = compile("outer1", "outer1-override", &["--no-scala-library"]);
+    let p = javap(&out, "Main$P");
+    assert!(
+        !p.contains("public int y()"),
+        "P must not publish `y` under its source name:\n{p}"
+    );
+    let q = javap(&out, "Main$Q");
+    assert!(q.contains("public int y()"), "Q keeps its own `y`:\n{q}");
+    assert!(
+        !q.contains("Main$P$$y"),
+        "Q must not touch P's expanded member:\n{q}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}

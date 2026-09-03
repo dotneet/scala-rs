@@ -3,6 +3,7 @@ mod check;
 mod classpath;
 mod erasure;
 mod expand;
+mod expand_private;
 mod implicits;
 mod javaclass;
 mod javasign;
@@ -79,6 +80,7 @@ pub use check::{
     ClasspathTypeParam, TypecheckOptions, Typer,
 };
 pub use erasure::{erase, erase_type, note_source_value_classes};
+pub use expand_private::expand_private_names;
 pub use lambda_lift::lambda_lift;
 pub use lazy_local::lazy_locals;
 pub use lin::{is_interface, linearize, trait_superclass};

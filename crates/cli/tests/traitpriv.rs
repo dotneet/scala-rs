@@ -305,11 +305,22 @@ fn tp3_widened_private_still_public_abstract() {
 /// typer has widened a `private` member for companion access, so `secret`
 /// keeps its ordinary interface signature instead of silently vanishing like
 /// `tp1`'s truly-private `update`.
+///
+/// The name it keeps is the *expanded* one. Publishing a `private` member
+/// under its source name is what let a subclass override it by accident, so
+/// `expand_private_names` renames it the way scalac does -- `javap -p` on
+/// scalac 2.13.16's own `Widened.class` for this very fixture reports
+/// `public default int Widened$$secret()`, not `secret()`.
 #[test]
 fn tp3_widened_private_keeps_interface_signature() {
     let out = dual_run("tp3");
     let iface = read_class(&out.join("Widened.class"));
-    let flags = method_flags(&iface, "secret").unwrap_or_else(|| {
+    assert!(
+        method_flags(&iface, "secret").is_none(),
+        "the source name must not be published: {:?}",
+        iface.methods
+    );
+    let flags = method_flags(&iface, "Widened$$secret").unwrap_or_else(|| {
         panic!(
             "widened `secret` must still be on the interface, got: {:?}",
             iface.methods

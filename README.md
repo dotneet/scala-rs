@@ -4679,7 +4679,7 @@ implicit 変換で届く拡張メソッド、親から継承した implicit（as
 黙って埋めずに診断します。
 
 trait のメンバークラスの `$outer` と、共変な戻り値型のオーバーライドで要る bridge は
-`crates/cli/tests/outer.rs`（fixture 接頭辞 `outer`）の専用スイート（5 本）です。
+`crates/cli/tests/outer.rs`（fixture 接頭辞 `outer`）の専用スイート（9 本）です。
 `outer.scala` は trait のメンバークラス、`class` / `trait` / `object` からのインスタンス化、
 2 段ネスト（`Inner` の中の `Deep`）、`new p.Inner`（前置詞つき）、内側からの
 `def` / `val` / `lazy val` / 型メンバ参照、そして trait でない従来のネストクラスを回します。
@@ -4693,6 +4693,15 @@ trait のメンバークラスの `$outer` と、共変な戻り値型のオー�
 `(LT;Ljava/lang/String;)V`、`T$Inner$Deep` が `(LT$Inner;)V` であることを、
 `outer_field_is_the_self_type` は `Comp$Table` が `(LProf;Ljava/lang/String;)V` である
 ことを（どちらも nsc と同じ `$outer` の型と位置）classfile のバイト列で固定します。
+`outer1.scala` は「匿名クラスから外側のクラスを触る」形を 1 ファイルにまとめたもので
+（§「匿名クラスから外側のクラスを触る 4 つの根」）、親コンストラクタ引数からの外側読み、
+`private` / `private[this]` の val・var・def を匿名クラス／ローカルクラス／ラムダ本体／
+コンパニオンから、外側の `private[this] var` への代入、ラムダの中で作る匿名クラスを回します。
+`outer1_anon_ctor_stores_outer_before_super` は `<init>` の命令順（`$outer` の
+`putfield` が super 呼び出しより前で、引数は `<init>` の引数から読む）を、
+`outer1_private_members_take_scalacs_expanded_name` は `Main$Outer$$secret` /
+`Main$Outer$$bumped_$eq` / `Main$P$$y` / `Main$Holder$$note` という
+**実 scalac 2.13.16 と同じ名前**を、`javap -p -c` の出力で固定します。
 
 `InnerClasses` / `EnclosingMethod` 属性は `crates/cli/tests/innerclasses.rs`（fixture 接頭辞
 `inner`）の専用スイート（10 本）です。`inner.scala` は報告されたバグそのもの
@@ -8025,7 +8034,9 @@ interface に一切現れず**（抽象宣言もフォワーダもなし）、`$
 `private static` にし、同じ `$class` 内の他メンバからは `invokestatic` で
 （`invokeinterface` ではなく）呼びます。`access_widened`（`private` メンバを
 コンパニオンなど別クラスから読むために typer が公開化した場合）はこれまでどおり
-`public abstract` の通常経路のままです。
+`public abstract` の通常経路のままです。ただしその**名前**は後に `agent/outer` が
+nsc に合わせました（`Widened$$secret`。§「匿名クラスから外側のクラスを触る
+4 つの根」）。
 
 `crates/backend/src/gen.rs` の `is_trait_private_def` が判定を持ち、4 か所から
 呼ばれます: interface の抽象メソッド宣言ループ（`emit_class`）、`$class` 側の
@@ -10698,6 +10709,180 @@ case a: SynchronousDatabaseAction[?, ?, ?, ?] => … superZip(a) …
 `SQLiteProfile.scala:183` の
 `no matching overload for (Iterable[U], RowsPerStatement)…` は 1 のカスケード
 だと思って調べましたが、名前付き引数の修正後も残っています（別の根）。
+
+### 匿名クラスから外側のクラスを触る 4 つの根（`agent/outer`）
+
+匿名クラス／ローカルクラス／ラムダの本体から**外側のクラスのもの**を触る形で、
+main に残っていた 4 件。`java -Xverify:all` で落ちる 2 件と、
+`IllegalAccessError` になる 1 件と、静かに**別のメソッドを呼んでいた** 1 件です。
+どれも実 scalac 2.13.16（`/tmp/scala-2.13.16/bin/scalac`）と `javap -p -c` で
+確かめてから直しました。テストは `crates/cli/tests/outer.rs` に追記、fixture は
+`tests/fixtures/outer1.scala`（1 ファイルに全ケース）。
+
+**1. `<init>` の中の `$outer` 読み出しは検証を通らない**（`VerifyError`）。
+
+```scala
+class Outer(val n: Int) {
+  def mk(): Base = new Base("tag" + n) { def describe = tag + "/" + n }
+}
+```
+
+匿名クラスの**親コンストラクタ引数**が外側インスタンスを読みます。scala-rs は
+`$outer` の代入を super 呼び出しの**後**に置き、引数の中では
+`aload_0; getfield $outer` を出していました。JVMS §4.10.1.9 の `getfield` は
+オペランドが `class(FieldClass)` に適合することを要求するので、
+`uninitializedThis` に対する `getfield` は**フィールドを代入済みかどうかに
+関係なく**通りません（`putfield` だけが、しかも「現在のクラスが宣言した
+フィールド」に限って許されます）。実 scalac の `javap` はこうです。
+
+```
+public C$Outer$$anon$1(C$Outer);
+   0: aload_1
+   1: ifnonnull 6
+   4: aconst_null
+   5: athrow
+   6: aload_0
+   7: aload_1
+   8: putfield  $outer            ← super 呼び出しより前
+  ...
+  26: aload_1                     ← 引数は <init> の引数から読む
+  27: invokevirtual C$Outer.n:()I
+  31: invokespecial C$Base."<init>"
+```
+
+つまり nsc は **(a) `$outer` を super 呼び出しの前に代入し、(b) それでも
+super 引数の中では `$outer` ではなく `<init>` の引数（local 1）を読む**という
+2 つを両方やっています。(b) が必須で、(a) は「親の `<init>` から仮想呼び出しで
+戻ってきたメソッドが `$outer` を見られる」ためのものです。両方合わせました
+（`EmitCtx::presuper_outer` と `start_outer_walk`。`$outer` の連鎖を歩く 3 か所
+——`load_owner_instance` / `load_self_alias_instance` / `load_qualified_this`
+——の**最初の 1 ホップ**だけが差し替わります）。
+
+**2. `private` メンバはクラスファイルを跨いだ時点で改名が要る**
+（`IllegalAccessError`）。ブリーフの見立てどおりで、ただし**根は「改名して
+いない」ことではなく、そもそも「跨いだ」と判定できていなかった**ことでした。
+
+Scala の `private` は**語彙的**で、匿名クラス・ローカルクラス・ラムダ本体・
+コンパニオンはどれも所有者のスコープの中にあるので `private[this]` まで名前で
+呼べます。JVM の `ACC_PRIVATE` はクラスファイル単位なので、これらは全部
+実行時に `IllegalAccessError` です。scala-rs には既に `access_widened`
+（`ACC_PRIVATE` を落とす）がありましたが、それを立てているのは check.rs の
+**2 か所だけ**——コンパニオン越しの読み出し（`note_companion_access`）と、
+`private[this]` を無修飾で読む 1 経路（`agent/dbio` が足したもの）——でした。
+そのため次はどれも素通りしていました。
+
+| 形 | main の結果 |
+|---|---|
+| `C1.this.a`（**修飾された** `this`） | `IllegalAccessError` |
+| `private val` / `private def` を匿名クラスから | `IllegalAccessError` |
+| `private` メンバをラムダ本体から | `IllegalAccessError` |
+
+3 つめは scala-rs 固有です。nsc はラムダを `invokedynamic` ＋**同じクラスの
+static メソッド**（`$anonfun$viaLambda$1`）に落とすので跨ぎませんが、scala-rs は
+匿名クラスに落とすので跨ぎます。実 scalac は
+
+```scala
+class C { private[this] val a = 1; def viaLambda = List(0).map(_ => a).head }
+```
+
+に対して `a` を `private final int a` のまま残します（`javap -p`）。
+
+そして nsc は跨いだメンバを**公開するだけでなく改名**します
+（`Symbol.makeNotPrivate` → `nme.expandedName`）。
+「所有者の完全名を `$` 区切りにしたもの」＋ `$$` ＋ 名前で、実測は次のとおりです。
+
+| 書いたもの | scalac 2.13.16 が出す名前 |
+|---|---|
+| `object A { class Outer { private[this] val secret } }` | `public final int A$Outer$$secret` |
+| `private val pUsed` | `private final int B$Outer$$pUsed` ＋ `public int B$Outer$$pUsed()` |
+| `private var w` | `private int H$C$$w` ＋ `H$C$$w()` / `H$C$$w_$eq()` |
+| `object O1 { private[this] val c }` | `public static final int D$O1$$c` |
+| `trait T1 { private[this] val b }` | `public abstract int D$T1$$b()` |
+| `package pkgj.sub; class R { private[this] val a }` | `public final int pkgj$sub$R$$a` |
+| **どこからも跨いで読まれない** `private[this] val ptUnused` | `private final int ptUnused`（**改名なし**） |
+
+改名は飾りではありません。`private[this]` は継承されないので、
+
+```scala
+class P { private[this] def y = 2; def mk() = new AnyRef { override def toString = "" + y }.toString }
+class Q extends P { def y = 9 }          // 合法
+```
+
+は実 scalac だと `new Q().mk()` が **`2`**。ところが「公開するが改名しない」と
+`P.y` が public になって `Q.y` がそれを**オーバーライド**し、main の scala-rs は
+**`9`** を出していました（`access_widened` が既に効いていた `private[this]` で
+起きていた、静かな誤コンパイル）。
+
+そこで nsc の `superaccessors` と同じ位置——**pickler の前**、
+scala-rs では `mark_anon_captures` の直後——に
+`crates/typer/src/expand_private.rs` を 1 本足しました。ユニットを
+「コードが実際に載るクラス」を持って歩き、`private` メンバの参照が所有者以外の
+クラスから来ていたらシンボル名とツリー上の名前を一緒に改名して
+`access_widened` を立てます（`_$eq` は展開の外に残すので `Outer$$w_$eq`）。
+`private[pkg]` は `Flags::PRIVATE` を持ったままなので `private_within` で除外
+します（これは public に出るのが正しく、改名したら他ファイルから引けなくなる）。
+pickler より前なので**pickle にも改名後の名前が入り**、nsc と同じく
+classfile と食い違いません。分離コンパイル（`sep1.scala` を出してから
+`-cp` で `sep2.scala`）も実 scalac と同じ出力になることを確認しています。
+scala-rs はラムダをクラスに落とす分だけ nsc より**広く**改名しますが、
+宣言も参照も同時に改名するので閉じており、`private` メンバは他ファイルから
+名指しできないので外に漏れません。
+
+`tp3`（trait の `private def` をコンパニオンが読む）の既存テストは
+「`secret` という名前のまま public abstract で残る」を固定していましたが、
+実 scalac の `javap -p` は `public default int Widened$$secret()` です。
+**テストの期待の方が nsc と違っていた**ので、名前を実 scalac に合わせ、
+「ソース名の方は出さない」を追加しました。
+
+**3. 外側の `var` への代入がレシーバを歩いていなかった**（`VerifyError`）。
+
+```scala
+class C3 { private[this] var d = 4
+  def mk(): Any = new AnyRef { override def toString = { d = d + 1; "" + d } } }
+```
+
+読み出し側（`gen_ident`）は `$outer` を歩いていましたが、`gen_assign` の
+`Ident` 枝だけが `load_this` のままで、`putfield` のレシーバに匿名クラス自身を
+積んでいました（`Type 'D$C3$$anon$4' is not assignable to 'D$C3'`）。読み出しと
+同じ `load_owner_instance` / `load_self_alias_instance` に揃えました。
+
+**4. ラムダの中で作る匿名クラスの `$outer`**（`VerifyError`）。
+
+```scala
+class C4 { private[this] val e = 5
+  def mk(): Any = { val f = () => new AnyRef { override def toString = "" + e }; f() } }
+```
+
+ラムダクラスに `$outer` を持たせるかを決める `collect_free` は、`New` の枝で
+「そのクラスが捕まえるローカル」は数えていましたが、「**そのクラスの `<init>`
+が外側インスタンスを要求すること**」を数えていませんでした。匿名クラスの本体は
+`ClassDef` なのでこの walk は降りていかず、ラムダは `this` を使っていないように
+見え、`$outer` を持たないまま `load_this` が `aload_0`（＝ラムダ自身）を積んで
+いました。`New` の対象が `outer_field_class` を持つならラムダも外側インスタンス
+が要る、を足しました。
+
+計測は前後とも同じ数字でした。`tests/slick_measure.sh` は
+**`files=184 errors=65 files_with_errors=34 classes=0` → 同じ**、
+codegen（`crates/backend/`）を触ったので `SLICK_SEED_LOG` 付きの
+`tests/slick_subset.sh` も **`subset_files=38 classes=204 verified=204 failed=0`
+→ 同じ**。基準値は README の数字を信じずに、このワークツリーで `crates/*/src`
+を main に戻したバイナリで測り直しています。型検査の数字が動かないのは当然で、
+`expand_private_names` は `has_errors` が false のときにしか走らず
+（`crates/driver/src/lib.rs`）、`classes=0` の間は backend まで届きません。
+
+**残件**（この形で見つけたが直していないもの）:
+
+* nsc は `private[this] val` に**アクセサを作らない**（フィールドだけ）。
+  scala-rs は今も `Outer$$secret()` を出します。改名済みなので衝突はしません
+  が、余分なメソッドです。
+* nsc は `private val` の**フィールドは private のまま**改名し、アクセサだけを
+  public にします。scala-rs はフィールドごと public にします。
+* `object O { private[this] val c }` を nsc は `static final` フィールドにします
+  が、scala-rs はインスタンスフィールドのままです（改名は一致）。
+* scala-rs が**実 scalac の出した classfile を `-cp` で読む**方向は、この形とは
+  無関係に壊れています。`private` メンバを 1 つも持たないクラスでも
+  `VerifyError: Operand stack underflow` になったので、この節の変更の前から
+  ある別件です（scala-rs 同士の分離コンパイルは通ります）。
 
 ## ライセンス
 
