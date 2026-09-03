@@ -9903,6 +9903,94 @@ impl Typer {
         true
     }
 
+    /// [`Self::widen_module_from_pickle`] for the `apply` *sugar*:
+    /// `cats.effect.IO(fa)` means `IO.apply(fa)`, but the tree's function is
+    /// the reference to the object, not a `Select` of `apply`, so that pass
+    /// declines it — its `Select` is `cats.effect.IO`, whose qualifier is a
+    /// package.
+    ///
+    /// It matters wherever the class file reader got to a Scala companion
+    /// first — [`Self::load_companion_module`] warming a jar class's implicit
+    /// scope, or the class file of the class itself, which carries a *static
+    /// forwarder* for every companion method. A class file cannot write a
+    /// by-name parameter, so `IO.apply(thunk: => A)` reads back as
+    /// `apply(Function0[A]): IO[A]` either way, and the on-demand pickle path
+    /// never corrects it: that runs only when a lookup finds *nothing*, and
+    /// the erased member is something. `cats.effect.IO(fa)` with
+    /// `fa: Future[R]` was then "no matching overload" — but only once
+    /// something earlier in the run had read one of those class files, which
+    /// is what made it look like a failure only the whole program could
+    /// produce (slick's `dbio/DBIOAction.scala`).
+    ///
+    /// Asked only here, on the path that is otherwise about to report that
+    /// error, so a companion is never completed speculatively — the reason
+    /// `load_companion_module` stops at the implicits in the first place.
+    fn retry_module_apply_from_pickle(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        if !self.library_abi {
+            return false;
+        }
+        let TreeKind::Apply { fun, .. } = &tree.kind else {
+            return false;
+        };
+        // The module class this call is really about. Either the reference
+        // still stands as the function, or the sugar has already collapsed to
+        // the single `apply` the receiver had — which is exactly the erased
+        // alternative that does not fit.
+        let mcls = match &fun.ty {
+            Type::ModuleRef(c) => *c,
+            Type::Class { sym, .. } => *sym,
+            _ => {
+                if fun.sym.is_none() || self.st.get(fun.sym).name != "apply" {
+                    return false;
+                }
+                let owner = self.st.get(fun.sym).owner;
+                match self.st.get(owner).kind {
+                    SymKind::ModuleClass => owner,
+                    // scalac also emits every companion method as a *static
+                    // forwarder* on the class, and the class file reader
+                    // installs those on the class exactly as it installs the
+                    // companion's own — erased either way. `cats.effect.IO(fa)`
+                    // picked the forwarder on `cats/effect/IO`; the pickle for
+                    // it is the companion's.
+                    SymKind::Class => {
+                        self.load_companion_module(owner);
+                        let jvm = format!("{}$", self.st.get(owner).jvm_name);
+                        match self
+                            .st
+                            .companion_module(owner)
+                            .map(|m| self.st.module_class_of(m))
+                            .or_else(|| crate::classpath::find_by_jvm(&self.st, &jvm))
+                        {
+                            Some(c) => c,
+                            None => return false,
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+        };
+        if mcls.is_none() || self.st.get(mcls).kind != SymKind::ModuleClass {
+            return false;
+        }
+        let before = self.st.lookup_member(mcls, "apply").len();
+        if self.supply_from_pickle_class(mcls, "apply").is_empty()
+            || self.st.lookup_member(mcls, "apply").len() <= before
+        {
+            // Nothing new: the pickle has already been read for this name, so
+            // the retry below would type exactly the same tree again.
+            return false;
+        }
+        let TreeKind::Apply { fun, .. } = &mut tree.kind else {
+            return false;
+        };
+        fun.ty = Type::NoType;
+        fun.sym = SymbolId::NONE;
+        tree.ty = Type::NoType;
+        tree.sym = SymbolId::NONE;
+        self.type_expr(tree, pt);
+        true
+    }
+
     /// When a member exists on the receiver (e.g. `Int.+`) but the argument
     /// types do not match, try an implicit conversion that *does* have the
     /// method (`any2stringadd` for `1 + "x"`).
@@ -12860,6 +12948,11 @@ impl Typer {
                         }
                         OverloadPick::None => {}
                     }
+                }
+                // Before any adaptation of the *arguments*: the alternative
+                // that fits may simply not have been read yet.
+                if self.retry_module_apply_from_pickle(tree, pt) {
+                    return;
                 }
                 // Last resort, after every other rewrite: nsc packs an
                 // argument list that fits no alternative into one tuple, so
@@ -20556,8 +20649,25 @@ impl Typer {
         if !jc.is_scala {
             return;
         }
-        let pkg = internal.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-        let owner = crate::classpath::ensure_package(&mut self.st, pkg);
+        // A *nested* class's companion belongs to whatever encloses the class,
+        // not to the package. `companion_module` looks for a module of the
+        // same name among the class's own owner's members, and
+        // `cats/effect/kernel/Ref$Make$` installed in the package
+        // `cats.effect.kernel` under the name `Make` was invisible from the
+        // trait `Ref.Make`, whose owner is `Ref`. `Ref.of`'s
+        // `implicit mk: Make[F]` then searched an empty implicit scope --
+        // unless the program happened to *write* `Ref.Make` somewhere, which
+        // builds the companion by another route and made the failure look
+        // order-dependent (slick's `ConcurrencyControl.scala`).
+        let owner = {
+            let o = self.st.get(class_id).owner;
+            if !o.is_none() && self.st.get(o).is_class_like() {
+                o
+            } else {
+                let pkg = internal.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                crate::classpath::ensure_package(&mut self.st, pkg)
+            }
+        };
         let mid = crate::classpath::install_java_class_in(&mut self.st, &jc, owner);
         // SLS 7.2 names the companion *object*, whose members include the ones
         // it inherits, and 2.13 puts the low-priority half of an implicit set
