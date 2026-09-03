@@ -53,13 +53,18 @@ object Main {
   trait ColOpt[+T] { def tag: String }
   final case class SqlType(s: String) extends ColOpt[Nothing] { def tag = "sql:" + s }
   case object AutoInc extends ColOpt[Nothing] { def tag = "auto" }
+  final case class DefaultOpt[T](v: T) extends ColOpt[T] { def tag = "def:" + v }
   final case class Column(name: String, options: Set[ColOpt[_]])
 
   def sqlOptions(dbType: Option[String]): Set[ColOpt[_]] =
     Set() ++ dbType.map(s => SqlType(s))
 
-  def options(dbType: Option[String], autoInc: Boolean): Set[ColOpt[_]] =
-    sqlOptions(dbType) ++ (if (autoInc) Some(AutoInc) else None)
+  // (7) 上の続き。`Set[ColOpt[Nothing]] ++ Option[DefaultOpt[_]]` は、
+  //     `Option.option2Iterable` が「解くものが何も残っていないのに形だけの
+  //     unify」で通っていたせいで単相の `++(IterableOnce[A]): Set[A]` が
+  //     適用可能になり、鎖全体が `Set[ColOpt[Nothing]]` に落ちていた。
+  def options(dbType: Option[String], autoInc: Boolean, dflt: Option[DefaultOpt[_]]): Set[ColOpt[_]] =
+    sqlOptions(dbType) ++ (if (autoInc) Some(AutoInc) else None) ++ dflt
 
   def fuse(n: Node): String = n match {
     case Prod(CArr(a, b)) => "prod(" + describe(a) + "," + describe(b) + ")"
@@ -88,7 +93,13 @@ object Main {
     // (5)
     println(fuse(Prod(c)))
     // (6)
-    println(options(Some("VARCHAR"), autoInc = true).toList.map(_.tag).sorted.mkString(" "))
-    println(Column("c", options(None, autoInc = false)).options.size)
+    println(
+      options(Some("VARCHAR"), autoInc = true, Some(DefaultOpt(7)))
+        .toList
+        .map(_.tag)
+        .sorted
+        .mkString(" ")
+    )
+    println(Column("c", options(None, autoInc = false, None)).options.size)
   }
 }

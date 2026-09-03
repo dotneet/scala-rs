@@ -11,8 +11,16 @@ object Main {
   // ときだけ。適合しないなら型不一致のまま。
   def wrong: Set[Int] = Set() ++ Some("x")
 
+  // `Option.option2Iterable` は `Option[A] => Iterable[A]`。ワイルドカードが
+  // 何にでも unify するせいで、解くものが何も無いのに「形が合った」ことに
+  // なっていた。実 scalac もこれを拒否する。
+  trait ColOpt[+T]
+  final case class DefaultOpt[T](v: T) extends ColOpt[T]
+  def notAView(d: Option[DefaultOpt[_]]): IterableOnce[ColOpt[Nothing]] = d
+
   def main(args: Array[String]): Unit = {
     println(new NoApply(1).get(0))
     println(wrong)
+    println(notAView(None))
   }
 }

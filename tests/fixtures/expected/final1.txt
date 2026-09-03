@@ -4,5 +4,5 @@ Tbl(t,List(t3, t4))
 (f1,2),(f2,2)
 []
 prod(x,y)
-auto sql:VARCHAR
+auto def:7 sql:VARCHAR
 0

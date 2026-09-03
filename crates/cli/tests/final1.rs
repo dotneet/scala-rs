@@ -29,7 +29,14 @@
 //! * 受け手（レシーバ）が持ち込んだ未確定変数も、結果の *不変* 位置では
 //!   期待型が引数より強い。`Set() ++ opt` が `Set[SqlType]` のままで、
 //!   不変な `Set` が期待型を拒否していた
-//!   （slick `jdbc/JdbcModelBuilder.scala:279` の一部）。
+//!   （slick `jdbc/JdbcModelBuilder.scala:279` の半分）。
+//! * 変換探索の `open_conversion_fit` は、解くべき変数が両側とも空でも
+//!   `Unify` に判定させていた。ワイルドカードは何にでも unify するので
+//!   `Option.option2Iterable` が `Option[Default[_]] =>
+//!   IterableOnce[ColumnOption[Nothing]]` を名乗り、単相の
+//!   `Set#++(IterableOnce[A]): Set[A]` が適用可能になって、
+//!   `Set() ++ … ++ dflt` の鎖が `Set[ColumnOption[Nothing]]` に落ちていた
+//!   （同 279 のもう半分）。
 //!
 //! ブリーフ通り fixture は 1 ファイルにまとめてある（実 scalac 1 回 1.8 秒）。
 //! `Set` / `Map` / `ClassTag` / `IndexedSeq` を使うので `--scala-library`
@@ -211,9 +218,10 @@ fn real_scalac_dual_run_final1() {
     let _ = fs::remove_dir_all(&ref_out);
 }
 
-/// 緩めた側の反対側。実 scalac 2.13.16 もこの 2 件を拒否する
+/// 緩めた側の反対側。実 scalac 2.13.16 もこの 3 件を拒否する
 /// (`Main.NoApply does not take parameters` /
-/// `found: Some[String] required: IterableOnce[Int]`)。
+/// `found: Some[String] required: IterableOnce[Int]` /
+/// `found: Option[Main.DefaultOpt[_]] required: IterableOnce[Main.ColOpt[Nothing]]`)。
 #[test]
 fn final1_bad_is_still_rejected() {
     let Some(err) = compile_diagnostics("final1_bad") else {
@@ -228,5 +236,10 @@ fn final1_bad_is_still_rejected() {
         err.contains("found: Set[String]  required: Set[Int]"),
         "the expected type must not override an argument solution that does not \
          conform to it: {err}"
+    );
+    assert!(
+        err.contains("found: Option[DefaultOpt[_]]  required: IterableOnce[ColOpt[Nothing]]"),
+        "`option2Iterable` must not answer a view whose result does not actually \
+         conform: {err}"
     );
 }
