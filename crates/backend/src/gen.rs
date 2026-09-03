@@ -162,6 +162,15 @@ struct EmitCtx<'a> {
     source: &'a str,
     /// If generating inside a lambda, field on the lambda class holding the outer `this`.
     outer: Option<(&'a str, &'a str, &'a str)>, // (lambda_class, field, outer_desc)
+    /// Set while emitting the part of `<init>` that runs *before* the super
+    /// constructor call (super-constructor arguments, early definitions).
+    /// `this` is still `uninitializedThis` there, and JVMS §4.10.1.9 lets
+    /// `putfield` take that but not `getfield`: reading `this.$outer` before
+    /// the super call is a `VerifyError` even after the field was stored.
+    /// The enclosing instance is in this local slot instead — the `<init>`
+    /// parameter it arrived in, which is what nsc reads there too.
+    /// `(slot, class we step into, static type on the stack)`.
+    presuper_outer: Option<(u16, SymbolId, SymbolId)>,
     library_abi: bool,
     /// Named JVM method being emitted; `NONE` inside lambdas.
     method_sym: SymbolId,
@@ -189,10 +198,39 @@ fn emit_ctx<'a>(
         lambda_n,
         source,
         outer: None,
+        presuper_outer: None,
         library_abi,
         method_sym: SymbolId::NONE,
         boxed_vars,
     }
+}
+
+/// The `presuper_outer` an `<init>` of `class_id` needs: the enclosing
+/// instance arrives in local slot 1, the walk steps into `class_id`'s
+/// enclosing class, and the value on the stack has the `$outer` field's type.
+fn presuper_outer_of(st: &SymbolTable, class_id: SymbolId) -> Option<(u16, SymbolId, SymbolId)> {
+    let next = enclosing_instance(st, class_id)?;
+    let held = outer_field_class(st, class_id).unwrap_or(next);
+    Some((1, next, held))
+}
+
+/// Push the value an `$outer` chain walk starts from, and return
+/// `(class we are lexically inside, static type on the stack)`.
+///
+/// Normally that is `this` in the class being emitted. `needs_hop` says the
+/// caller is about to step out at least once; in the pre-super part of a
+/// nested class's `<init>` that first hop cannot be a `getfield` (see
+/// `EmitCtx::presuper_outer`), so it is the constructor's own `$outer`
+/// argument instead.
+fn start_outer_walk(asm: &mut Assembler, ctx: &EmitCtx, needs_hop: bool) -> (SymbolId, SymbolId) {
+    if needs_hop {
+        if let Some((slot, next, held)) = ctx.presuper_outer {
+            asm.aload(slot);
+            return (next, held);
+        }
+    }
+    load_this(asm, ctx);
+    (ctx.class_sym, ctx.class_sym)
 }
 
 fn runtime_ref_class(ty: &Type) -> &'static str {
@@ -1804,9 +1842,10 @@ fn is_owner_compatible(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> 
 /// `held` the static type on the stack — the two differ when a trait's
 /// `$outer` is typed as the trait's self type.
 fn load_owner_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
-    load_this(asm, ctx);
-    let mut cur = ctx.class_sym;
-    let mut held = ctx.class_sym;
+    let hops = !ctx.class_sym.is_none()
+        && !owner.is_none()
+        && !is_owner_compatible(ctx.st, ctx.class_sym, owner);
+    let (mut cur, mut held) = start_outer_walk(asm, ctx, hops);
     while !cur.is_none() && !owner.is_none() && !is_owner_compatible(ctx.st, held, owner) {
         let Some(o) = enclosing_instance(ctx.st, cur) else {
             break;
@@ -1837,9 +1876,7 @@ fn load_self_alias_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId)
         load_owner_instance(asm, ctx, owner);
         return;
     }
-    load_this(asm, ctx);
-    let mut cur = ctx.class_sym;
-    let mut held = ctx.class_sym;
+    let (mut cur, mut held) = start_outer_walk(asm, ctx, ctx.class_sym != owner);
     while cur != owner {
         let Some(o) = enclosing_instance(ctx.st, cur) else {
             break;
@@ -3449,7 +3486,7 @@ impl<'a> Gen<'a> {
         let mixin_inits = self.mixin_init_calls(class_id);
         b.add_code(ACC_PUBLIC, "<init>", &desc, max_locals, |asm| {
             let mut frame = frame;
-            let ctx_early = emit_ctx(
+            let mut ctx_early = emit_ctx(
                 st,
                 class_id,
                 &class_name,
@@ -3460,6 +3497,20 @@ impl<'a> Gen<'a> {
                 library_abi,
                 boxed_vars,
             );
+            // nsc stores `$outer` *before* the super constructor call, so a
+            // method the parent's `<init>` dispatches back to this class
+            // already sees the enclosing instance. JVMS §4.10.1.9 allows a
+            // `putfield` of a field declared in the current class on
+            // `uninitializedThis` -- but never a `getfield`, which is why the
+            // pre-super code below reads the argument instead of the field.
+            if has_outer {
+                ctx_early.presuper_outer = presuper_outer_of(st, class_id);
+                if let Some(od) = &outer_desc_c {
+                    asm.aload(0);
+                    asm.aload(1);
+                    asm.putfield(&class_name, "$outer", od);
+                }
+            }
             // nsc: early vals are stored to fields before the superclass ctor so
             // parent / trait `$init$` bodies see the values.
             for vd in &inits {
@@ -3511,13 +3562,6 @@ impl<'a> Gen<'a> {
                 }
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);
-            if has_outer {
-                if let Some(od) = &outer_desc_c {
-                    asm.aload(0);
-                    asm.aload(1);
-                    asm.putfield(&class_name, "$outer", od);
-                }
-            }
             for (slot, sort, fname, fdesc) in &param_info {
                 if fname.is_empty() {
                     continue;
@@ -5621,19 +5665,42 @@ impl<'a> Gen<'a> {
                 asm.athrow();
                 asm.mark(ok);
             }
+            // Before the super call, as nsc does (see `emit_class_ctor`).
+            if let Some(d) = &own_outer {
+                asm.aload(0);
+                asm.aload(1);
+                asm.putfield(&class_name, "$outer", d);
+            }
+            // `this` is `uninitializedThis` until the super call returns, so
+            // an enclosing-instance read in a super-constructor argument has
+            // to come from the `<init>` parameter, not from `$outer`.
+            let mut ctx_early = emit_ctx(
+                st,
+                class_id,
+                &class_name,
+                Type::Unit,
+                extras,
+                lambda_n,
+                source,
+                library_abi,
+                boxed_vars,
+            );
+            if own_outer.is_some() {
+                ctx_early.presuper_outer = presuper_outer_of(st, class_id);
+            }
             asm.aload(0);
             if let Some(o) = super_outer {
-                // Our own `$outer` is not stored yet; read it out of the
-                // argument when it is the instance the parent wants.
+                // Read the enclosing instance out of the argument when it is
+                // the instance the parent wants.
                 if own_outer.is_some() && is_owner_compatible(st, outer_cls, o) {
                     asm.aload(1);
                 } else {
-                    load_outer_arg(asm, &ctx, o);
+                    load_outer_arg(asm, &ctx_early, o);
                 }
             }
             for (i, a) in super_args.iter().enumerate() {
-                gen_expr(asm, &mut frame, &ctx, a);
-                adapt_unit_arg(asm, &ctx, a, &a.ty);
+                gen_expr(asm, &mut frame, &ctx_early, a);
+                adapt_unit_arg(asm, &ctx_early, a, &a.ty);
                 // `object O extends AtomicReference[Int](1)`: same generic /
                 // Java superclass boxing `gen_new` and the class `<init>`
                 // path above apply.
@@ -5643,16 +5710,9 @@ impl<'a> Gen<'a> {
                 }
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);
-            match &own_outer {
-                Some(d) => {
-                    asm.aload(0);
-                    asm.aload(1);
-                    asm.putfield(&class_name, "$outer", d);
-                }
-                None => {
-                    asm.aload(0);
-                    asm.putstatic(&class_name, "MODULE$", &format!("L{class_name};"));
-                }
+            if own_outer.is_none() {
+                asm.aload(0);
+                asm.putstatic(&class_name, "MODULE$", &format!("L{class_name};"));
             }
             for (impl_cls, init_desc) in &mixin_inits {
                 asm.aload(0);
@@ -7170,8 +7230,7 @@ fn load_qualified_this(asm: &mut Assembler, ctx: &EmitCtx, name: &str) {
         .st
         .enclosing_class_named(ctx.class_sym, name)
         .unwrap_or(ctx.class_sym);
-    load_this(asm, ctx);
-    let mut cur = ctx.class_sym;
+    let (mut cur, _) = start_outer_walk(asm, ctx, ctx.class_sym != target);
     while !cur.is_none() && cur != target {
         let Some(outer) = enclosing_instance(ctx.st, cur) else {
             break;
@@ -7746,7 +7805,16 @@ fn gen_assign(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, lhs: &Tree,
                     asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
-                load_this(asm, ctx);
+                // `var` of an *enclosing* class assigned from an anonymous or
+                // local class: the receiver is that instance, reached along
+                // `$outer`, not this one. Pushing `this` put the wrong object
+                // under the `putfield` and the verifier rejected the method.
+                // The read path (`gen_ident`) already walks out this way.
+                if is_private_this(ctx.st, id) {
+                    load_self_alias_instance(asm, ctx, s.owner);
+                } else {
+                    load_owner_instance(asm, ctx, s.owner);
+                }
                 gen_expr(asm, frame, ctx, rhs);
                 emit_putfield_from_expr(
                     asm,
@@ -14781,6 +14849,16 @@ fn collect_free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut FreeVars, st: 
                         out.vars.push(*c);
                     }
                 }
+                // …and a nested class's `<init>` takes the enclosing instance,
+                // which the lambda can only hand over if it kept one. The
+                // anonymous class's *body* is a `ClassDef` this walk does not
+                // descend into, so `new AnyRef { … outerField … }` inside a
+                // lambda looks free of `this` while its `$outer` argument is
+                // exactly `this`; without the field, `load_this` pushed the
+                // lambda itself and the verifier rejected `<init>`.
+                if outer_field_class(st, cid).is_some() {
+                    out.uses_this = true;
+                }
             }
             collect_free(tpt, bound, out, st);
         }
@@ -14882,6 +14960,7 @@ fn emit_partial_function_methods(
                         lambda_n,
                         source,
                         outer: outer_ref,
+                        presuper_outer: None,
                         library_abi,
                         method_sym: SymbolId::NONE,
                         boxed_vars,
@@ -14938,6 +15017,7 @@ fn emit_partial_function_methods(
                             lambda_n,
                             source,
                             outer: outer_ref,
+                            presuper_outer: None,
                             library_abi,
                             method_sym: SymbolId::NONE,
                             boxed_vars,
@@ -15239,6 +15319,7 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             lambda_n,
             source,
             outer: outer_ref,
+            presuper_outer: None,
             library_abi,
             method_sym: SymbolId::NONE,
             boxed_vars: boxed,
