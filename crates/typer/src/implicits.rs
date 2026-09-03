@@ -458,7 +458,9 @@ impl Typer {
                     return None;
                 }
                 let paramss = paramss.clone();
-                let fit = self.implicit_solve(id, &ret, pt, undet)?;
+                let Some(fit) = self.implicit_solve(id, &ret, pt, undet) else {
+                    return self.implicit_fit_open(id, &ret, pt, undet, &paramss, depth);
+                };
                 if self.implicit_diverges(id, pt) {
                     return None;
                 }
@@ -572,6 +574,128 @@ impl Typer {
         if !self.candidate_bounds_hold(&tps, &targs) {
             return None;
         }
+        let inst = self.simplify_solved(&crate::symbol::subst_tparams_slice(&tps, &targs, ret));
+        let want = self.subst_undet(pt, &undet_out);
+        self.implicit_result_conforms(&inst, &want)
+            .then_some(ImplicitFit {
+                targs,
+                undet: undet_out,
+            })
+    }
+
+    /// [`Self::implicit_solve`] for a derivation rule whose own type parameters
+    /// the wanted type cannot pin down, because the *call site* left a type
+    /// parameter undetermined and that is where they show through.
+    ///
+    /// slick's `Compiled.apply[V, C <: Compiled[V]](raw: V)(implicit c:
+    /// Compilable[V, C], …): C` is the case. `V` comes from the argument, but
+    /// `C` is undetermined -- it occurs only in the implicit clause and in the
+    /// result -- so the search is for `Compilable[Rep[P] => Query[T, U, Seq],
+    /// ?C]`. Unifying that with
+    ///
+    /// ```text
+    /// function1IsCompilable[A, B <: Rep[_], P, U]: Compilable[A => B, CompiledFunction[A => B, A, P, B, U]]
+    /// ```
+    ///
+    /// settles `A` and `B` and binds `?C` to `CompiledFunction[A => B, A, P, B,
+    /// U]` -- with the candidate's own `P` and `U` still open, because nothing
+    /// on the wanted side stands opposite them. Only the candidate's *own*
+    /// implicit parameters can say what they are: `aShape: Shape[…, A, P, A]`
+    /// gives `P`, `bExe: Executable[B, U]` gives `U`. nsc solves them exactly
+    /// there (`Context.undetparams` while the implicit arguments are typed);
+    /// [`Self::implicit_solve`] insists on a complete solution from the result
+    /// type alone, drops the candidate, and the call was
+    /// "Computation of type (Rep[P]) => Query[T, U, Seq] cannot be compiled
+    /// (as type C)" -- slick's own `@implicitNotFound`.
+    ///
+    /// Deliberately a *fallback*: it runs only for a candidate the ordinary
+    /// solve rejected, and only when the wanted type pinned down at least one
+    /// of the candidate's parameters. A rule that matched with everything open
+    /// would be tried against every implicit in scope.
+    fn implicit_fit_open(
+        &self,
+        id: SymbolId,
+        ret: &Type,
+        pt: &Type,
+        undet: &[SymbolId],
+        paramss: &[Vec<Type>],
+        depth: usize,
+    ) -> Option<ImplicitFit> {
+        if undet.is_empty() {
+            return None;
+        }
+        let tps = self.st.get(id).tparams.clone();
+        if tps.is_empty() {
+            return None;
+        }
+        let mut u = Unify::new(self, tps.iter().copied(), undet.iter().copied());
+        if !u.unify(ret, pt) {
+            return None;
+        }
+        let mut targs: Vec<Type> = Vec::with_capacity(tps.len());
+        let mut open: Vec<SymbolId> = Vec::new();
+        for tp in &tps {
+            match u.solved(*tp) {
+                Some(t) => targs.push(self.simplify_solved(&t)),
+                None => {
+                    open.push(*tp);
+                    targs.push(Type::TypeParam(*tp));
+                }
+            }
+        }
+        // Nothing left open: the ordinary solve already had its say, and
+        // failed on conformance or bounds. Everything left open: the wanted
+        // type says nothing about this candidate at all.
+        if open.is_empty() || open.len() == tps.len() {
+            return None;
+        }
+        if self.implicit_diverges(id, pt) {
+            return None;
+        }
+        self.open_implicits.borrow_mut().push((id, pt.clone()));
+        let mut ok = true;
+        for p in paramss.iter().flatten() {
+            let want = crate::symbol::subst_tparams_slice(&tps, &targs, p);
+            if open.is_empty() {
+                if !self.search_implicit_at(&want, depth + 1).is_found() {
+                    ok = false;
+                    break;
+                }
+                continue;
+            }
+            let (found, binds) = self.search_implicit_undet(&want, &open, depth + 1);
+            if !found.is_found() {
+                ok = false;
+                break;
+            }
+            for (bid, bt) in binds {
+                if let Some(pos) = tps.iter().position(|x| *x == bid) {
+                    targs[pos] = self.simplify_solved(&bt);
+                    open.retain(|x| *x != bid);
+                }
+            }
+        }
+        self.open_implicits.borrow_mut().pop();
+        if !ok || !open.is_empty() {
+            return None;
+        }
+        if !self.candidate_bounds_hold(&tps, &targs) {
+            return None;
+        }
+        // The call site's own parameters were bound to types that still
+        // mentioned the candidate's -- `?C := CompiledFunction[A => B, A, P, B,
+        // U]`. Now that those are known, they are ordinary types.
+        let undet_out: Vec<(SymbolId, Type)> = undet
+            .iter()
+            .filter_map(|d| {
+                let t = u.solved_open(*d)?;
+                let t = crate::symbol::subst_tparams_slice(&tps, &targs, &t);
+                (!tps
+                    .iter()
+                    .any(|tp| crate::check::type_mentions_tparam(&t, *tp)))
+                .then(|| (*d, self.simplify_solved(&t)))
+            })
+            .collect();
         let inst = self.simplify_solved(&crate::symbol::subst_tparams_slice(&tps, &targs, ret));
         let want = self.subst_undet(pt, &undet_out);
         self.implicit_result_conforms(&inst, &want)
@@ -1927,6 +2051,14 @@ impl<'a> Unify<'a> {
             Type::TypeParam(id) if self.unknowns.contains(&id.0) => Some(id.0),
             _ => None,
         }
+    }
+
+    /// The solution for `tp` with nested unknowns expanded as far as they go,
+    /// *keeping* one that still mentions an unknown. For a caller that goes on
+    /// to solve those separately (`implicit_fit_open`).
+    fn solved_open(&self, tp: SymbolId) -> Option<Type> {
+        let t = self.bound.get(&tp.0)?.clone();
+        Some(self.expand(&t, 0))
     }
 
     /// The solution for `tp`, with any nested unknowns resolved.

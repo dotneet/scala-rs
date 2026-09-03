@@ -6394,9 +6394,38 @@ impl Typer {
             TreeKind::Select { .. } => self.type_select(tree, pt),
             TreeKind::Apply { .. } => self.type_apply(tree, pt),
             TreeKind::TypeApply { fun, args } => {
+                // nsc types the callee of a `TypeApply` in FUNmode. When this
+                // `TypeApply` is itself the callee of an `Apply`, the caller
+                // hands down a `Method` expectation for exactly that reason,
+                // and it has to reach the reference underneath: an overloaded
+                // reference typed in *value* position keeps only its
+                // parameterless alternative (SLS 6.26.3), and slick's
+                // `object TableQuery` has one -- `def apply[E]: TableQuery[E]`
+                // next to `def apply[E](cons: Tag => E): TableQuery[E]`. The
+                // collapse made `TableQuery.apply[E](cons)` a `TableQuery[E]`
+                // applied to an argument: "value apply is not a member of
+                // TableQuery[E]". Explicit type arguments cannot break the tie
+                // either (both alternatives take one), so the set has to
+                // survive to the `Apply`, which picks on the arguments and
+                // applies the type arguments through `pending_targs`.
+                let fun_pt = match pt {
+                    Type::Method { .. } => pt.clone(),
+                    _ => Type::NoType,
+                };
                 self.typing_callee = true;
-                self.type_expr(fun, &Type::NoType);
+                self.type_expr(fun, &fun_pt);
                 self.typing_callee = false;
+                // The `Method` expectation is for the overload set's sake
+                // alone. Everything else this position holds is still read in
+                // value position: fs2's `Stream.fromIterator[F]` is a
+                // *parameterless* method returning a value class whose `apply`
+                // takes the arguments, and keeping its nullary method type
+                // made `fromIterator[IO](it, chunkSize = 1)` an application of
+                // the method itself -- "named arguments (method parameters not
+                // resolved)", since a nullary method has none.
+                if matches!(fun_pt, Type::Method { .. }) && !matches!(fun.ty, Type::Overload(_)) {
+                    fun.ty = self.maybe_auto_apply(fun.ty.clone(), &Type::NoType);
+                }
                 let mut targs = Vec::new();
                 for a in args.iter_mut() {
                     let t = self.tree_to_type(a);

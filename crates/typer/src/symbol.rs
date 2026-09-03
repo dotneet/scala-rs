@@ -1869,6 +1869,20 @@ impl SymbolTable {
                     false
                 }
             }
+            // A wildcard stands for *some* type, so anything is under it --
+            // including the application of an abstract type constructor.
+            // `Query[B, BU, C]` inherits `Rep[C[BU]]`, and slick's
+            // `StreamingExecutable.apply[T <: Rep[_], TU, EU]` asks whether
+            // that is a `Rep[_]`; the invariant-argument rule then asks
+            // `C[BU] <: _`. These two arms have to precede the `Applied`
+            // catch-all below, which matches every `other` and answered "no"
+            // for an `Applied` whose constructor is a type *parameter* (it
+            // only knew how to follow a `TypeMember`'s bound).
+            (Type::Applied { .. }, Type::Wildcard) => true,
+            (Type::Applied { .. }, Type::BoundedWildcard { hi, .. }) => match hi {
+                Some(h) => self.is_sub_type(a, h),
+                None => true,
+            },
             (Type::Applied { ctor: c1, args: a1 }, Type::Applied { ctor: c2, args: a2 })
                 if a1.len() == a2.len() =>
             {

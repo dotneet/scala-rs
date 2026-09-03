@@ -11410,6 +11410,145 @@ codegen（`crates/backend/`）を触ったので `SLICK_SEED_LOG` 付きの
   `VerifyError: Operand stack underflow` になったので、この節の変更の前から
   ある別件です（scala-rs 同士の分離コンパイルは通ります）。
 
+### slick の `TableQuery` / `Compiled` 5 件、3 つの根（`agent/tq`）
+
+slick の `lifted/TableQuery.scala`・`lifted/Compiled.scala`・
+`relational/RelationalProfile.scala` に残っていた 5 件。**5 件で 3 根**でした。
+どれも診断文の言っている場所が根ではありません。実 scalac 2.13.16
+（`/tmp/scala-2.13.16/bin/scalac`）で最小再現が通ることを確かめてから直しています。
+テストは `crates/cli/tests/tq.rs`、fixture は `tests/fixtures/tq.scala`
+（1 ファイルに全ケース）と `tests/fixtures/tq_bad.scala`。
+
+slick: `errors=44 files_with_errors=26` → **`errors=38 files_with_errors=25`**
+（担当 5 件＋巻き添えで直った 1 件、新規エラーなし。`tests/slick_measure.sh`）。
+
+**1. 抽象型構築子の適用がワイルドカードの下に入らない**（診断は「境界不適合」）。
+
+```scala
+trait Rep[T]
+trait QueryBase[T] extends Rep[T]
+trait Query[+E, U, C[_]] extends QueryBase[C[U]]
+
+def t6[BU, C[_]](x: Rep[C[BU]]): Rep[_] = x   // ← ここが落ちる
+```
+
+診断は
+
+```
+type arguments [Query[B, BU, C],C[BU],BU] do not conform to method apply's
+type parameter bounds [T <: Rep[_],TU,EU]
+```
+
+で、`StreamingExecutable.apply[T <: Rep[_], TU, EU]` の**境界検査**に見えます。
+実際には境界検査は正しく動いていて、`Query[B, BU, C]` を親へ辿った
+`Rep[C[BU]]` を `Rep[_]` と比べるところ、`Rep` は不変なので引数どうしの
+`C[BU] <: _` に落ち、そこで false になっていました。`C` が `Seq` のような
+**具体的な**型構築子なら通る（`t4` は通る）ので、症状は「高階の境界」に見えます。
+
+根は `is_sub_type` の**アーム順**です。`(Type::Applied { ctor, args }, other)`
+は右辺を見ずに全部を捕まえるアームで、`Type::Wildcard` のアームより**前**に
+あります。その中は `ctor` が `TypeMember` のときだけ `bound_hi` を辿り、
+型**パラメータ**（`C[_]`）のときは `false` を返していました。
+`(Applied, Wildcard)` と `(Applied, BoundedWildcard)` を Applied のアームの
+前に置いて解決しています（`crates/typer/src/symbol.rs`）。
+
+**2. `TypeApply` の被呼び出し側が値位置で型付けされていた**。マクロは無関係。
+
+```scala
+class TQ[E](cons: Int => E)
+object TQ {
+  def apply[E](cons: Int => E): TQ[E] = new TQ[E](cons)
+  def apply[E]: TQ[E] = null            // ← 引数なしの側
+}
+TQ.apply[String](f)   // error: value apply is not a member of TQ[String]
+```
+
+ブリーフは「slick が `TableQuery.apply[E]` を**マクロ**として定義しているので、
+マクロ定義の解決の問題かもしれない」としていましたが、**マクロは関係ありません**。
+上のとおりマクロを 1 つも含まない同じ形で再現します。`§7.13（オーバーロード解決）`
+という以前の診断のほうが近く、正確には**オーバーロード集合が畳まれるタイミング**です。
+
+SLS 6.26.3 により、値位置のオーバーロード参照は**引数を取らない候補だけ**を残します。
+`Apply` は被呼び出し側を `Type::Method` の期待型で型付けしてこの畳み込みを止めて
+いますが、`TypeApply` は自分の `fun` を `Type::NoType`（＝値位置）で型付けして
+いました。`TableQuery.apply[E]` は `TypeApply` なので、外側の `Apply` が引数を
+見る前に無引数の側へ畳まれ、その結果 `TableQuery[E]` に `(cons)` を適用する形に
+なって「value apply is not a member of TableQuery[E]」になっていました。
+明示型引数でも絞れません（両候補とも型引数 1 個）。nsc は `typedTypeApply` の
+`fun` を FUNmode で型付けするので畳みません。
+
+`TypeApply` が自分自身 `Apply` の被呼び出し側であるとき（＝ `pt` が `Type::Method`）
+だけ、その期待型を `fun` へ渡すようにしました。集合が残れば `Apply` 側の
+`pending_targs`（既存）が明示型引数を適用します。
+
+ただし `Type::Method` の期待型は**無引数メソッドの自動適用も**止めてしまいます。
+fs2 の `Stream.fromIterator[F]` は無引数の多相メソッドで、返り値の側に
+引数を取る `apply` があります（部分適用ビルダ）。素直に渡すだけだと
+`fromIterator[IO](it, chunkSize = 1)` が無引数メソッドへの適用になり、
+`slick/cats/Database.scala` に**新しいエラーが 1 件生えました**。
+期待型はオーバーロード集合のためだけのものなので、結果が `Overload` でなければ
+値位置と同じ自動適用を掛け直しています（`crates/typer/src/check.rs`）。
+
+**3. 出力型が呼び出し側で未決のとき、implicit 候補**自身**の型パラメータが解けない**。
+
+```scala
+def apply[V, C <: Compiled[V]](raw: V)(implicit compilable: Compilable[V, C], …): C
+implicit def function1IsCompilable[A, B <: Rep[_], P, U](implicit
+  aShape: Shape[ColumnsShapeLevel, A, P, A],
+  pShape: Shape[ColumnsShapeLevel, P, P, _],
+  bExe: Executable[B, U]): Compilable[A => B, CompiledFunction[A => B, A, P, B, U]]
+```
+
+`Compiled { (p: Rep[P]) => … }` の `C` は引数からは決まりません（結果型と
+implicit 節にしか現れない）。`C` を未決のまま `Compilable[Rep[P] => Query[T, U, Seq], ?C]`
+を探すところまでは既存の `undet_solution` が行きます。候補の結果型と単一化すると
+`A`・`B` は決まり、`?C := CompiledFunction[A => B, A, P, B, U]` と束縛されますが、
+候補自身の `P` と `U` は**求める型の側に対応するものが無い**ので未決のまま残ります。
+`implicit_solve` は結果型だけから完全解を要求するので候補を落とし、slick 自身の
+`@implicitNotFound` が
+
+```
+Computation of type (Rep[P]) => Query[T, U, Seq] cannot be compiled (as type C)
+```
+
+として出ていました。**これは scala-rs のメッセージではありません**（ブリーフの
+指摘どおり）。`type mismatch; found: C required: CompiledFunction[…]` は
+その後始末で、2 件は 1 根です。
+
+`P` と `U` を言えるのは候補**自身の** implicit 節だけです
+（`aShape: Shape[…, A, P, A]` が `P`、`bExe: Executable[B, U]` が `U`）。
+nsc は implicit 引数を型付けする間 `Context.undetparams` にこれらを入れて
+そこで解きます。`implicit_fit_open`（`crates/typer/src/implicits.rs`）を足し、
+通常の解決に失敗した候補についてだけ、残った自分の型パラメータを
+`search_implicit_undet` の未決集合として自分の implicit 節から解くようにしました。
+**フォールバック**であること、**求める型が候補の型パラメータを 1 つ以上は
+決めていること**を条件にしています（全部未決の候補はスコープ中の全 implicit に
+当たってしまうため）。
+
+**巻き添えで直った 1 件**: `value apply is not a member of
+SqlStreamingAction[Vector[Unit], Unit, Effect]`（根 2 と同じ）。
+
+**私が確かめた範囲**: `--test tq conform buildfrom buildfrom2 asttype hkinfer
+overloadshadow ambigmap setapply uniteq integral ordsummon mutcoll ovl2 ovl3 ovl4`
+と `cargo test --workspace --release`。`crates/backend/` は触っていないので
+`tests/slick_subset.sh` は省略しています。
+
+**残件**:
+
+* 根 1 で直るのは `Rep[C[BU]] <: Rep[_]` の向きだけです。`C[BU]` を**左辺**に
+  置いた他の照合（`C[BU] <: Iterable[_]` のような、構築子の境界を辿る必要が
+  あるもの）は今も `Type::Applied` のアームで `false` になります。slick には
+  現れませんでした。
+* 根 3 の完成は候補の implicit 節を**書かれた順**に 1 回ずつ走らせるだけで、
+  後の節が前の節の解を狭める形（相互再帰的な解決）には対応していません。
+* 同じ 3 ファイルに残っているのは別件です。`TableQuery.scala:16` の
+  `cons(new BaseTag { base => … })`（匿名クラスの**自己名** `base` が本体から
+  見えない）、`RelationalProfile.scala:72:71` の
+  `could not find implicit value of type TypedType[Boolean]`、
+  同 `82:61` の `missing parameter type for expanded function`。
+  根 3 の 2 件は 72 行目の**同じ行**に出ていましたが、72:71 の
+  `TypedType[Boolean]` とは無関係で、そちらを直さないまま消えました。
+
 ## ライセンス
 
 Apache-2.0
