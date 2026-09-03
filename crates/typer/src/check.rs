@@ -8954,6 +8954,10 @@ impl Typer {
         // self-type-provided member of the very definition being completed
         // and reported a false `recursive method … needs result type`).
         let mut super_found: Option<Vec<SymbolId>> = None;
+        // `super.m`'s type is seen from `this.type`, not from the parent named
+        // on its own: an abstract type member the parent declares stands for
+        // *this* class's implementation of it. Remember which class that is.
+        let mut super_this: Option<SymbolId> = None;
         if let TreeKind::Super { qual: sq, mix } = &qual.kind {
             let this_id = if let Some(nm) = sq.clone() {
                 self.st
@@ -8967,6 +8971,7 @@ impl Typer {
             {
                 recv_ty = self.super_prefix_type(this_id, parent);
                 super_found = Some(members);
+                super_this = Some(this_id);
             }
         }
         let refined_term = match &recv_ty {
@@ -9321,7 +9326,20 @@ impl Typer {
             }
             ty
         };
-        let expand = |ty: Type| -> Type { self.st.expand_in_type(&recv_ty, &ty) };
+        let expand = |ty: Type| -> Type {
+            // For `super.m` the enclosing class comes first: slick's
+            // `SQLiteProfile` mixes in `MultipleRowsPerStatementSupport`, whose
+            // `override type RowsPerStatement = slick.jdbc.RowsPerStatement`
+            // is what the inherited `insertAll(values, rowsPerStatement:
+            // RowsPerStatement)` takes. Reading the parameter off the parent
+            // alone leaves the *abstract* member `>: One.type <: RowsPerStatement`,
+            // which no argument of the concrete type conforms to.
+            let ty = match super_this {
+                Some(c) => self.st.expand_type_members(c, &ty),
+                None => ty,
+            };
+            self.st.expand_in_type(&recv_ty, &ty)
+        };
         if found.len() == 1 {
             let s = found[0];
             tree.sym = s;

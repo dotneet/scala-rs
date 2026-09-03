@@ -1144,26 +1144,34 @@ impl Assembler {
     }
 
     pub fn getstatic(&mut self, owner: &str, name: &str, desc: &str) {
-        let i = self.pool.fieldref(owner, name, desc);
+        // Field names are encoded like method names (`/` is `$div`); see
+        // `ClassEmit::write_with_pool`.
+        let i = self.pool.fieldref(owner, &encode_method_name(name), desc);
         self.emit_op(0xb2);
         self.emit_u16(i);
         self.push_v(vtype_from_desc(desc));
     }
     pub fn putstatic(&mut self, owner: &str, name: &str, desc: &str) {
-        let i = self.pool.fieldref(owner, name, desc);
+        // Field names are encoded like method names (`/` is `$div`); see
+        // `ClassEmit::write_with_pool`.
+        let i = self.pool.fieldref(owner, &encode_method_name(name), desc);
         self.emit_op(0xb3);
         self.emit_u16(i);
         let _ = self.pop_v();
     }
     pub fn getfield(&mut self, owner: &str, name: &str, desc: &str) {
-        let i = self.pool.fieldref(owner, name, desc);
+        // Field names are encoded like method names (`/` is `$div`); see
+        // `ClassEmit::write_with_pool`.
+        let i = self.pool.fieldref(owner, &encode_method_name(name), desc);
         self.emit_op(0xb4);
         self.emit_u16(i);
         let _ = self.pop_v();
         self.push_v(vtype_from_desc(desc));
     }
     pub fn putfield(&mut self, owner: &str, name: &str, desc: &str) {
-        let i = self.pool.fieldref(owner, name, desc);
+        // Field names are encoded like method names (`/` is `$div`); see
+        // `ClassEmit::write_with_pool`.
+        let i = self.pool.fieldref(owner, &encode_method_name(name), desc);
         self.emit_op(0xb5);
         self.emit_u16(i);
         let _ = self.pop_v();

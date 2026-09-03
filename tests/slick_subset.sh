@@ -28,7 +28,12 @@ if [[ -n ${SLICK_SEED_LOG:-} && -s ${SLICK_SEED_LOG:-/nonexistent} ]]; then
     grep -m1 "panicked at" $SLICK_SEED_LOG >&2
     exit 1
   fi
-  grep -oE '^\s+--> [^:]+\.scala' $SLICK_SEED_LOG | awk '{print $2}' | sort -u > $RUN/seed_bad.txt
+  # Only *errors* evict a file. A `-->` line also follows every **warning**,
+  # and taking those too threw out `JdbcActionComponent.scala` on a clean
+  # (0-error, 2-warning) measurement -- which then made the files that depend
+  # on it fail, and the loop shrank a converged set from 184 to 132.
+  grep -A 2 '^error' $SLICK_SEED_LOG | grep -oE '^\s+--> [^:]+\.scala' \
+    | awk '{print $2}' | sort -u > $RUN/seed_bad.txt
   if [[ -s $RUN/seed_bad.txt ]]; then
     grep -vxF -f $RUN/seed_bad.txt $RUN/files.txt > $RUN/files2.txt
     mv $RUN/files2.txt $RUN/files.txt
@@ -47,7 +52,8 @@ for round in 1 2 3 4 5 6 7 8; do
     grep -m1 "panicked at" $RUN/log.txt >&2
     exit 1
   fi
-  grep -oE '^\s+--> [^:]+\.scala' $RUN/log.txt | awk '{print $2}' | sort -u > $RUN/bad.txt
+  grep -A 2 '^error' $RUN/log.txt | grep -oE '^\s+--> [^:]+\.scala' \
+    | awk '{print $2}' | sort -u > $RUN/bad.txt
   if [[ ! -s $RUN/bad.txt ]]; then break; fi
   grep -vxF -f $RUN/bad.txt $RUN/files.txt > $RUN/files2.txt
   mv $RUN/files2.txt $RUN/files.txt

@@ -434,9 +434,40 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
             }
         }
         // An *alias* member erases like its right-hand side (`type Scope =
-        // Map[K, V]` is `Map`). An abstract member still erases to `Object`.
-        Type::TypeMember(_) => match st.dealias(ty) {
-            d if d == *ty => Type::Any,
+        // Map[K, V]` is `Map`). An **abstract** member erases like a type
+        // parameter, to the erasure of its upper bound (SLS 3.7): slick's
+        // `type RowsPerStatement >: One.type <: RowsPerStatement` is
+        // `Lslick/jdbc/RowsPerStatement;`, and erasing it to `Object` instead
+        // made the inherited `insertAll(Iterable, Object)` a different method
+        // from the profile's `insertAll(Iterable, RowsPerStatement)` --
+        // `NoSuchMethodError` on the trait's `$super$` accessor.
+        //
+        // Only a bound that names **one** class is taken. A compound bound
+        // (`type TermName >: Null <: TermNameApi with Name`, from
+        // scala-reflect) needs nsc's `intersectionDominator`, and guessing at
+        // it is worse than `Object`: picking the first parent gave
+        // `TermNameApi`, which is not a `NameApi`, so passing a `TermName`
+        // where `Select.apply(TreeApi, NameApi)` wants a `Name` stopped
+        // getting the cast that the `Object` erasure earns it and the macro
+        // bridges failed to verify.
+        Type::TypeMember(id) => match st.dealias(ty) {
+            d if d == *ty => match st.get(*id).bound_hi.clone() {
+                // `type A <: A` (or a bound naming the member itself) has no
+                // more information than `Object`.
+                Some(hi)
+                    if hi != *ty
+                        && !matches!(&hi, Type::TypeMember(h) if h == id)
+                        && !matches!(st.dealias(&hi), Type::Refined { .. }) =>
+                {
+                    let e = erase_ty(&hi, st);
+                    if is_primitive(&e) {
+                        Type::Any
+                    } else {
+                        e
+                    }
+                }
+                _ => Type::Any,
+            },
             d => erase_ty(&d, st),
         },
         Type::Applied { ctor, .. } => erase_ty(ctor, st),
