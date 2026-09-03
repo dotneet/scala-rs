@@ -10809,6 +10809,234 @@ fixture は `tests/fixtures/rej_ok.scala`（受理側 5 ケース・dual-run、�
 1 回で全部は出させられません——`illegal inheritance` は typer、分散検査は
 refchecks で、nsc は typer でエラーが出ると refchecks に進まないからです。
 分散 4 件は同じ 4 トレイトだけのファイルで別に確認しました。
+### 差分プローブ（第12ラウンド・`agent/probe12`）——実行して初めて分かった 10 件
+
+slick の計測は**型検査までしか見えません**（`classes=0`）。実行時のサイレント
+誤コンパイルは差分プローブでしか出ません。今回は slick / cats が実際に使う形を
+**14 本の小さなプログラム**に書き直し、実 scalac 2.13.16 と scala-rs の両方で
+コンパイルして `java -Xverify:all` で走らせ、**stdout をバイト一致で比較**
+しました。14 本中 **10 本が食い違い**、根は互いに独立でした。
+
+計測は `tests/slick_measure.sh` が分岐元（`2a9db27`）・修正後ともに
+**`files=184 errors=65 files_with_errors=34 classes=0`**（型検査の数字は動かない
+——直したのは実行時の振る舞いと、slick が踏まない型検査の穴）。codegen
+（`crates/backend/`）を触ったので `tests/slick_subset.sh` を
+`SLICK_SEED_LOG` 付きで 1 周し、`subset_files=38 classes=204 verified=204
+failed=0`（悪化なし）。
+
+14 本は全部 `tests/conform/` に昇格しました（`query_ast` / `group_report` /
+`show_typeclass` / `byname_lazy` / `copy_unapply` / `exception_forms` /
+`number_mix` / `interp_forms` / `action_monad` / `hk_typeclass` /
+`mutable_loops` / `either_validate` / `mixin_profile` / `expr_interp`）。
+プローブが覆っていない最小形は `override_val_apply.scala` にまとめてあります。
+
+#### 実行時に壊れていたもの（コンパイルは通っていた）
+
+**1. `override val` / 抽象 `val` をフィールドとして読んでいた。**
+
+```scala
+class P { val pre: String = "a"; class T { def q = pre }; def mk = new T }
+class A extends P { override val pre = "b" }
+abstract class Q { val pre: String; def show = pre + "!" }
+class B extends Q { val pre = "c" }
+println(new A().mk.q)          // scalac: b     scala-rs: a
+println((new A(): P).pre)      // scalac: b     scala-rs: a
+println(new B().show)          // scalac: c!    scala-rs: null!
+```
+
+scala-rs はソースクラスの `val` をフィールドとして public に出し、読み出しも
+**宣言したクラスの `getfield`** でした。`override val` を書いたサブクラスは
+自分のスロットを持つので上書きが見えず、抽象 `val` は誰も書かないスロットを
+読んで `null` になります。nsc は `private` でないメンバ値をすべて**アクセサ
+経由**で読み、仮想ディスパッチが実際に値を持つクラスに着地します。
+`gen.rs` の `reads_via_accessor` がその条件（`PARAM` でも `STATIC` でも
+`PRIVATE` でもなく、`jvm_name` が空で、**この run でコンパイルしている
+クラス**が owner）を判定します。最後の条件が要ります: 私有ランタイムの
+`Tuple2._1` はフィールドで、アクセサを持ちません（外すと `fixtures_predef` /
+`fixtures_dynamic` が `NoSuchMethodError`）。
+
+**2. 内側クラスから外側クラスの「メソッド」を呼ぶと `this` をキャストしていた。**
+
+```scala
+class Outer(val tag: String) {
+  def deco(s: String) = "[" + s + "]"
+  class Inner(val name: String) { def q(c: String) = tag + name + deco(c) }
+}
+new Outer("o").make("m").q("c")
+// scalac: om[c]
+// scala-rs: ClassCastException: Main$Outer$Inner cannot be cast to Main$Outer
+```
+
+外側の**フィールド**（`tag`）は既に `$outer` を辿っていましたが、`gen_receiver`
+の裸 `Ident` 呼び出しの枝が `load_this` ＋ `checkcast` で済ませていました。
+`this` が owner に適合せず、かつ `$outer` の鎖が owner に届くときだけ
+`load_owner_instance` を使うようにしています（届かないときは従来どおり）。
+trait の内側クラスでも、抽象メソッドでも同じ症状でした。
+
+**3. 自作 `unapplySeq` が `Option[Seq[A]]` を返すと `List` にキャストしていた。**
+
+```scala
+object Words { def unapplySeq(s: String): Option[Seq[String]] =
+  if (s.isEmpty) None else Some(s.split(" ").toSeq) }
+"hello" match { case Words(one) => one; case _ => "" }
+// scalac: hello
+// scala-rs: ClassCastException: ArraySeq$ofRef cannot be cast to List
+```
+
+cons walk は `checkcast scala/collection/immutable/List` で始まります。これが
+正しいのは `Option[List[A]]` のときだけで、自然な綴り `Option[Seq[A]]`
+（`toSeq` は `ArraySeq$ofRef`）では落ちます。erasure が `Option[Seq[A]]` を
+裸の `Option` に潰した後では判定できないので、**型引数が残っているうちに**
+typer が `SymbolTable::seq_extractor_payload` に記録し、backend は `List`
+以外を scalac と同じ `SeqFactory$UnapplySeqWrapper$`（配列なら
+`Array$UnapplySeqWrapper$`）で読みます。
+
+**4. `xs.view.filter(p)` が `SeqView` を名乗っていた。**
+
+```scala
+println(List(1, 2, 3, 4).view.filter(_ > 2).map(_ * 10).toList)
+// scalac: List(30, 40)
+// scala-rs: ClassCastException: View$Filter cannot be cast to SeqView
+```
+
+2.13 の宣言は `trait SeqView[+A] extends SeqOps[A, View, View[A]] with
+View[A]` で、`C` は**自分自身ではなく `View[A]`** です。`javap
+scala.collection.SeqView` に現れる override は `view` / `map` / `appended` /
+`prepended` / `reverse` / `take` / `drop` / `takeRight` / `dropRight` /
+`tapEach` / `concat` / `appendedAll` / `prependedAll` / `sorted` だけで、
+`filter` はありません。`check.rs` の `returns_receiver_collection` が受け手に
+作り直していたので静的型が `SeqView[A]` になり、結果に付く `checkcast` が
+実物の `scala.collection.View$Filter` で落ちていました。
+`prelude_viewc.rs` が `SeqView` に `filter` / `filterNot` / `takeWhile` /
+`dropWhile` / `collect` / `flatMap` を **`View[A]` を返す**と宣言し、
+その名前に対してだけ作り直しを止めます。ついでに `View.map` の descriptor も
+直しました（`IterableOps.map: CC[B]` の消去なので
+`(Lscala/Function1;)Ljava/lang/Object;`。`View[A]` のまま呼びに行って
+`NoSuchMethodError` になっていましたが、`View` 型の値がこれまで作れなかった
+ので誰も踏んでいませんでした）。
+
+**5. `Array(Array(1, 2), Array(3, 4))` が `Object[]` を作っていた。**
+
+`gen_java_class_of` に `Type::Array` の枝が無く `java/lang/Object` に落ちて
+いたので、`Array.apply` に `ClassTag[Object]` が渡り、結果の
+`checkcast [[I` が落ちます。配列のクラスリテラル定数は内部名ではなく
+**descriptor**（`[I` / `[[I` / `[Ljava/lang/String;`）で綴ります。
+
+**6. 文字列補間の `Unit` 引数が評価されていなかった。**
+
+```scala
+println(s"unit ${println("side")}")
+// scalac: side \n unit ()
+// scala-rs: unit ()      ← side が出ない
+```
+
+`gen_sb_append` が `Unit` の値を見て `ldc "()"` だけ出し、式そのものを
+出していませんでした。`gen_stat` で文として出してから定数を積みます
+（`gen_stat` は呼び出しが実際に積むものを捨てる作法を既に持っています）。
+
+**7. by-name 引数をローカル `def` / ローカル `lazy val` に渡すと二重に force。**
+
+```scala
+def viaLocal[A](body: => A): A = { def go(): A = body; go() }
+def once[A](body: => A): () => A = { lazy val v = { println("forced"); body }; () => v }
+// scala-rs: ClassCastException: java.lang.Integer cannot be cast to scala.Function0
+```
+
+lambda-lift は捕捉した by-name シンボル**そのもの**を持ち上げた
+メソッドのパラメータにします（だから `v$1(Function0, LazyRef)` の中では
+正しく force されます）。ところが呼び出し側の引数も同じシンボルの `Ident`
+なので、erasure の `erase_ident` が `Flags::BYNAME` を見て問答無用で
+`.apply()` を付けていました。**値**を渡された callee がもう一度 force して
+落ちます。木の型がまだ `ByName(_)` で、かつ期待型が thunk のスロット
+（`=> T` か 0 引数 `Function`）のときは force しません。
+
+#### 実 scalac が受理する形を拒否していたもの
+
+**8. `Either` の for 内包表記。**
+
+```scala
+type V[A] = Either[List[String], A]
+for { h <- req("host"); ps <- req("port"); p <- int(ps) } yield Cfg(h, p)
+// scala-rs: type mismatch; found: Either[List[String], Cfg]
+//           required: Either[List[String], String]
+```
+
+`prelude_either` の `Either.flatMap` が `(B => Either[A, B]): Either[A, B]` と
+**単相**でした。nsc は `def flatMap[A1 >: A, B1](f: B => Either[A1, B1]):
+Either[A1, B1]` です。続きが受け手自身の `B` に押し戻されるので、右の型が
+段ごとに変わる for 内包表記が全部型エラーになっていました。
+
+**9. implicit パラメータ節を持つ `implicit class`。**
+
+```scala
+implicit class ShowOps[A](a: A)(implicit s: Show[A]) { def shown = s.show(a) }
+// scala-rs: no implicit: could not find implicit value of type Show[A]
+//           （エラー位置は「クラス宣言そのもの」）
+```
+
+`implicit_class_conversions` が `vparamss.first()` しか見ておらず、2 節目
+以降を捨てていました。すると `new ShowOps[A](a)` が抽象な `A` に対して
+`Show[A]` を召喚することになります。nsc の脱糖どおり残りの節も変換メソッド
+に持たせ、そのまま `new` に渡します。cats 風の syntax クラス
+（`implicit class MonadOps[F[_], A](fa: F[A])(implicit m: Monad[F])`）は
+全部これで落ちていました。
+
+**10. `f(x)()`——メソッドが返した `() => A` をその場で適用する。**
+
+```scala
+def mk(n: Int): () => Int = () => n
+println(mk(3)())   // scala-rs: not enough arguments: expected 1, found 0
+```
+
+空の引数節が `mk` の 2 番目のパラメータ節として読まれていました。適用済みの
+`Apply` の型が `Function` なら、その節は `Function0.apply` であって callee の
+パラメータ節ではありません（erasure の `sym_denotes_callee` と同じ判定）。
+
+#### 直していない差分（次のスライスの入力）
+
+* **`xs.flatten`**。
+
+  ```scala
+  val opts: List[Option[Int]] = List(Some(1), None, Some(3))
+  println(opts.flatten)      // scalac: List(1, 3)
+  // scala-rs: value sum is not a member of ((Option[Int]) => IterableOnce[B])List[B]
+  ```
+
+  pickle の `IterableOps.flatten[B](implicit toIterableOnce: A =>
+  IterableOnce[B]): CC[B]` の implicit 節が**適用されずに残り**、Method 型が
+  そのまま結果になっています（表示されている型がその生の Method 型）。
+  実 scalac は `Predef.$conforms` を渡します
+  （`invokevirtual List.flatten:(Lscala/Function1;)Ljava/lang/Object;`）。
+  埋めるには「`<:<[A, A]` を `A => IterableOnce[B]` に適合させながら
+  `B` を解く」——**結果型から逆に型変数を解く implicit 探索**が要ります。
+  `List[List[Int]]` でも同じです。
+
+* **型ラムダ `({ type L[X] = Reader[R, X] })#L`**。cats が
+  kind-projector 無しで使う形です。
+
+  ```scala
+  implicit def readerMonad[R]: Monad[({ type L[X] = Reader[R, X] })#L] = …
+  // scala-rs: type mismatch; found: $anon$1  required: Functor[<none>.L]
+  //           type mismatch; found: Any  required: R
+  ```
+
+  精製型の中の型メンバへの射影が型構築子として解決できず、`<none>.L` に
+  なります。型エイリアス `type IntReader[X] = Reader[Int, X]` を経由した
+  `Functor[IntReader]` への代入も通りません。
+
+* **`def using(...)` という名前のメソッド**（受理の差）。実 scalac 2.13.16 は
+  `using(r)(f)` を `Main.Res does not take parameters` で**拒否**します
+  （`using` は引数リストのソフトキーワードで、`(using r)(f)` と読まれる）。
+  scala-rs は普通の識別子として受理します。誤コンパイルではなく、
+  scala-rs の方が寛容という差です。今回は `tests/conform/exception_forms.scala`
+  で名前を `withRes` に変えてあります。
+
+#### 回したテスト
+
+`cargo test --workspace --release`（修正一式の後、conform 追加前）でグリーン。
+その後 `--test conform` を単独で回して **77 passed**（従来 62 ＋ 今回 15）。
+`--test e2e` は 460 passed。`cargo fmt --all` 済み、`cargo clippy` の新規警告 0。
+
 
 ## ライセンス
 

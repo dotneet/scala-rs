@@ -12143,8 +12143,23 @@ impl Typer {
                     // `scala.collection` class that really is a subclass of
                     // what the declaration named.
                     if let Some(r) = self.receiver_collection_root(recv_ty.as_ref()) {
-                        if let Some(t) = self.rebuild_from_receiver(r, &ret) {
-                            ret = t;
+                        // `SeqView` is the one collection whose `C` is not
+                        // itself: `trait SeqView[+A] extends SeqOps[A, View,
+                        // View[A]] with View[A]`, so `filter` & friends return
+                        // a `View`. `javap scala.collection.SeqView` lists the
+                        // members it really does override (`map`, `take`,
+                        // `drop`, `reverse`, `sorted`, …) and `filter` is not
+                        // among them. Rebuilding to the receiver typed
+                        // `xs.view.filter(p)` as a `SeqView[A]`, and the
+                        // `checkcast` codegen puts on the result threw
+                        // `ClassCastException` on the `scala.collection.
+                        // View$Filter` the call really returns.
+                        let keeps_view = crate::prelude_viewc::declares_view_result(&method_name)
+                            && self.st.get(r).jvm_name == "scala/collection/SeqView";
+                        if !keeps_view {
+                            if let Some(t) = self.rebuild_from_receiver(r, &ret) {
+                                ret = t;
+                            }
                         }
                     }
                 } else if method_name == "pipe" {
@@ -13977,6 +13992,15 @@ impl Typer {
     ) -> Option<Type> {
         let sym = fun.sym;
         if sym.is_none() {
+            return None;
+        }
+        // `f(x)()` applies the *result*. `mk(3)` is a `() => Int`, so the
+        // empty clause is `Function0.apply`, not a second parameter list of
+        // `mk` -- but the tree still carries `mk`'s symbol (the callee is read
+        // through the application), and reading its parameters here reported
+        // "not enough arguments: expected 1, found 0" for a program scalac
+        // accepts. Same test as erasure's `sym_denotes_callee`.
+        if matches!(fun.ty, Type::Function { .. }) && matches!(fun.kind, TreeKind::Apply { .. }) {
             return None;
         }
         let fun_ty = &fun.ty;
@@ -16993,6 +17017,7 @@ impl Typer {
                         }
                     };
                     self.check_seq_pattern_backing(u, pat.span);
+                    self.note_seq_extractor_payload(u);
                     // `rest @ _*` gets the container the extractor's own
                     // result type names: `List` for `List.unapplySeq` (and for
                     // a user extractor returning `Option[List[T]]`), `Seq` for
@@ -17689,6 +17714,45 @@ impl Typer {
                  `{name}` companion"
             ),
         );
+    }
+
+    /// Record which container this extractor's `Option` holds, for the
+    /// backend. See `SymbolTable::seq_extractor_payload`: erasure drops the
+    /// type argument, and a non-`List` payload has to be read through
+    /// scalac's `UnapplySeqWrapper` instead of a head/tail walk.
+    fn note_seq_extractor_payload(&mut self, unapply: SymbolId) {
+        let owner = self.st.get(unapply).owner;
+        let jvm = self.st.get(owner).jvm_name.clone();
+        // The built-in factories return the sequence itself, not an `Option`;
+        // the backend recognises them by companion and never asks here.
+        if jvm == crate::prelude_seqpat::ARRAY_FACTORY_MODULE
+            || crate::prelude_seqpat::SEQ_FACTORY_MODULES.contains(&jvm.as_str())
+        {
+            return;
+        }
+        let Some(inner) = self.unapply_extracted_types(unapply).into_iter().next() else {
+            return;
+        };
+        let payload = match &inner {
+            Type::Array(_) => crate::symbol::SeqPayload::Array,
+            Type::Class { sym, .. } if self.is_non_list_seq(*sym) => crate::symbol::SeqPayload::Seq,
+            _ => return,
+        };
+        self.st.seq_extractor_payload.insert(unapply, payload);
+    }
+
+    /// A sequence class that is not `List`: the head/tail walk would
+    /// `checkcast` an `ArraySeq` or a `Vector` to `List` and throw.
+    fn is_non_list_seq(&self, cls: SymbolId) -> bool {
+        if cls == self.st.list_sym || self.st.get(cls).name == "List" {
+            return false;
+        }
+        crate::lin::linearize(&self.st, cls).into_iter().any(|b| {
+            matches!(
+                self.st.get(b).jvm_name.as_str(),
+                "scala/collection/SeqOps" | "scala/collection/Seq"
+            )
+        })
     }
 
     fn unapply_seq_elem_type(&self, unapply: SymbolId) -> Type {
@@ -22808,11 +22872,67 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
             sym: SymbolId::NONE,
             postfix: false,
         };
+        // nsc keeps the class's *remaining* clauses on the conversion and
+        // passes them straight through:
+        // `implicit class Ops[A](a: A)(implicit s: Show[A])` desugars to
+        // `implicit def Ops[A](a: A)(implicit s: Show[A]): Ops[A] =
+        //    new Ops[A](a)(s)`.
+        // Dropping them left `new Ops[A](a)` to summon a `Show[A]` for an
+        // abstract `A` inside the conversion, which is "could not find
+        // implicit value of type Show[A]" *at the class declaration* -- an
+        // error real scalac never reports, and it took every type-class
+        // syntax class (`cats`' `x.show`, `fa.map`) with it.
+        let mut vparamss_conv = vec![vec![param]];
+        let mut rhs = rhs;
+        for clause in vparamss.iter().skip(1) {
+            let mut decls = Vec::new();
+            let mut args = Vec::new();
+            for q in clause {
+                let TreeKind::ValDef {
+                    mods: qm, tpt: qt, ..
+                } = &q.kind
+                else {
+                    continue;
+                };
+                let qname = q.name().unwrap_or("x$0").to_string();
+                let mut decl = Tree::dummy(TreeKind::ValDef {
+                    mods: Modifiers::new(qm.flags.with(Flags::SYNTHETIC)),
+                    name: qname.clone(),
+                    tpt: (*qt).clone(),
+                    rhs: Box::new(Tree::dummy(TreeKind::Empty)),
+                });
+                decl.span = q.span;
+                decls.push(decl);
+                args.push(Tree {
+                    id: NodeId(0),
+                    span: q.span,
+                    kind: TreeKind::Ident { name: qname },
+                    ty: Type::NoType,
+                    sym: SymbolId::NONE,
+                    postfix: false,
+                });
+            }
+            if decls.is_empty() {
+                continue;
+            }
+            rhs = Tree {
+                id: NodeId(0),
+                span: stt.span,
+                kind: TreeKind::Apply {
+                    fun: Box::new(rhs),
+                    args,
+                },
+                ty: Type::NoType,
+                sym: SymbolId::NONE,
+                postfix: false,
+            };
+            vparamss_conv.push(decls);
+        }
         let mut conv = Tree::dummy(TreeKind::DefDef {
             mods: Modifiers::new(Flags::IMPLICIT.with(Flags::SYNTHETIC)),
             name: name.clone(),
             tparams: conv_tparams,
-            vparamss: vec![vec![param]],
+            vparamss: vparamss_conv,
             tpt: Box::new(cls_type(stt.sym)),
             rhs: Box::new(rhs),
         });

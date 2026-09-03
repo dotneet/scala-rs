@@ -733,6 +733,8 @@ fn add_scala_aliases(st: &mut SymbolTable, library_abi: bool) {
     crate::prelude_mism4::install(st);
     // `case Seq(a, b)` / `case Array(a, b)`。companion が揃ってから足す。
     crate::prelude_seqpat::install(st);
+    // `SeqView.filter` などが返すのは `SeqView` ではなく `View`。
+    crate::prelude_viewc::install(st);
     // `StringOps.map[B](Char => B): IndexedSeq[B]`（`IndexedSeq` が揃ってから）。
     crate::prelude_strmap::install(st, library_abi);
     // `StringOps` の残り。pickle から補完できないもの（戻り型だけのオーバー

@@ -246,5 +246,22 @@ conform!(
     sorted_range,
     rpn_eval,
     json_render,
-    ledger_fold
+    ledger_fold,
+    // 差分プローブ第12ラウンド（agent/probe12）。slick / cats が実際に使う形を
+    // 小さく書き直したもの。README「差分プローブ（第12ラウンド）」を参照。
+    query_ast,
+    group_report,
+    show_typeclass,
+    byname_lazy,
+    copy_unapply,
+    exception_forms,
+    number_mix,
+    interp_forms,
+    action_monad,
+    hk_typeclass,
+    mutable_loops,
+    either_validate,
+    mixin_profile,
+    expr_interp,
+    override_val_apply
 );

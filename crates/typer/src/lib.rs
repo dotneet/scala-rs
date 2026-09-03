@@ -63,6 +63,7 @@ mod prelude_text;
 mod prelude_tuple;
 mod prelude_universal;
 mod prelude_variance;
+mod prelude_viewc;
 mod quasiquote;
 mod reify;
 mod reify_expand;
@@ -84,7 +85,7 @@ pub use lazy_local::lazy_locals;
 pub use lin::{is_interface, linearize, trait_superclass};
 pub use localobj::{check_local_case_class_captures, check_local_objects};
 pub use symbol::{
-    Intrinsic, MacroBinding, SamSig, SymKind, Symbol, SymbolTable, AS_SEEN_FROM_MARK,
+    Intrinsic, MacroBinding, SamSig, SeqPayload, SymKind, Symbol, SymbolTable, AS_SEEN_FROM_MARK,
 };
 pub use uncurry::uncurry;
 

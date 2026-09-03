@@ -360,7 +360,13 @@ fn install_either(st: &mut SymbolTable) {
         Type::Unit,
         Intrinsic::None,
     );
-    method(
+    // nsc: `def flatMap[A1 >: A, B1](f: B => Either[A1, B1]): Either[A1, B1]`.
+    // Declaring it monomorphically (`B => Either[A, B]`) made every `for`
+    // comprehension over `Either` whose steps have different right types a
+    // type error -- `for { h <- str; p <- int } yield Cfg(h, p)` reported
+    // "found Either[L, Cfg] required Either[L, String]", because the
+    // continuation was forced back into the receiver's own `B`.
+    let fm = method(
         st,
         either,
         "flatMap",
@@ -368,6 +374,15 @@ fn install_either(st: &mut SymbolTable) {
         either_t.clone(),
         Intrinsic::None,
     );
+    let fa1 = type_param(st, fm, "A1");
+    st.get_mut(fa1).bound_lo = Some(ta.clone());
+    let fb1 = type_param(st, fm, "B1");
+    st.get_mut(fm).tparams = vec![fa1, fb1];
+    let fm_res = ty_of(either, vec![Type::TypeParam(fa1), Type::TypeParam(fb1)]);
+    st.get_mut(fm).ty = Type::Method {
+        paramss: vec![vec![fn1(tb.clone(), fm_res.clone())]],
+        ret: Box::new(fm_res),
+    };
     method(
         st,
         either,

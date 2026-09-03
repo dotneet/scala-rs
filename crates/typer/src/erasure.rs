@@ -858,7 +858,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             }
         }
         TreeKind::Ident { .. } => {
-            erase_ident(tree, st);
+            erase_ident(tree, st, expected);
         }
         _ => {}
     }
@@ -891,11 +891,25 @@ fn boxed_value_class_ref(tree: &Tree, st: &SymbolTable) -> Option<Type> {
     }
 }
 
-fn erase_ident(tree: &mut Tree, st: &SymbolTable) {
+fn erase_ident(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
     if tree.sym.is_none() {
         return;
     }
     let s = st.get(tree.sym);
+    // A by-name parameter handed on to another by-name parameter keeps its
+    // thunk. `def f[A](body: => A) = { def go(): A = body; go() }` lifts to
+    // `go(body)`, and lambda-lift makes `go`'s new parameter *be* the same
+    // by-name symbol -- so forcing the argument here passed the value and the
+    // callee forced it a second time: `ClassCastException: java.lang.Integer
+    // cannot be cast to scala.Function0` at the first call, from a compile
+    // that reported nothing.
+    if s.flags.contains(Flags::BYNAME)
+        && matches!(&tree.ty, Type::ByName(_))
+        && expected.is_some_and(is_thunk_slot)
+    {
+        tree.ty = erase_ty(&tree.ty, st);
+        return;
+    }
     if s.flags.contains(Flags::BYNAME) {
         // `x` of type `=> T` becomes `x.apply()` after erasure to Function0.
         let span = tree.span;
@@ -920,6 +934,16 @@ fn erase_ident(tree: &mut Tree, st: &SymbolTable) {
             sym: SymbolId::NONE,
             postfix: false,
         };
+    }
+}
+
+/// A parameter that takes the *thunk*: `=> T` before erasure, `Function0`
+/// after.
+fn is_thunk_slot(ty: &Type) -> bool {
+    match ty {
+        Type::ByName(_) => true,
+        Type::Function { params, .. } => params.is_empty(),
+        _ => false,
     }
 }
 
