@@ -4808,6 +4808,31 @@ impl<'a> Gen<'a> {
         hits.next().is_none().then_some(first)
     }
 
+    /// Whether a class on the superclass chain already declares a concrete
+    /// method that *is* the trait member `def` -- the same member, possibly at
+    /// a narrower erased descriptor, which `bridge_overrides` is the test for.
+    /// Used only for traits that sit past the superclass in the linearization
+    /// (see `emit_mixin_forwarders`).
+    fn superclass_implements(
+        &self,
+        super_impls: &[(String, Vec<Type>, SymbolId)],
+        def: &Tree,
+    ) -> bool {
+        let enc = encode_method_name(def.name().unwrap_or(""));
+        let declared = def_param_types(self.st, def);
+        let abstract_mask = self
+            .st
+            .erased_abstract_params
+            .get(&def.sym)
+            .copied()
+            .unwrap_or(0);
+        super_impls.iter().any(|(n, cps, sym)| {
+            *n == enc
+                && *sym != def.sym
+                && bridge_overrides(self.st, &declared, cps, abstract_mask)
+        })
+    }
+
     fn emit_mixin_forwarders(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
         if class_id.is_none() {
             return;
@@ -4834,15 +4859,58 @@ impl<'a> Gen<'a> {
             defined.insert((m.name.clone(), desc_params(&m.desc).to_string()));
         }
         let lin = linearize(self.st, class_id);
+        // Where the superclass sits in the linearization. Every trait *after*
+        // it is an ancestor of that class rather than a mixin of this one, so
+        // the superclass has already settled which body wins -- and if it
+        // narrowed the member, its own erasure bridge settles the wide
+        // descriptor too. Emitting a forwarder here would override both.
+        //
+        // slick's `abstract class JdbcDatabaseDef` overrides
+        // `BasicDatabaseDef.setupTransaction(session: Session, …)` at the
+        // narrowed `Session = JdbcSessionDef`, and `new JdbcDatabaseDef(…){}`
+        // -- the anonymous class every `Database` really is -- got a forwarder
+        // for the wide descriptor straight to `BasicDatabaseDef$class`, whose
+        // body is `None`. Every `.transactionally` therefore ran with
+        // autocommit still on and rolled nothing back.
+        let super_idx = lin
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, p)| !is_interface_sym(self.st, **p))
+            .map(|(i, _)| i);
+        let super_impls: Vec<(String, Vec<Type>, SymbolId)> = match super_idx {
+            None => Vec::new(),
+            Some(_) => lin
+                .iter()
+                .skip(1)
+                .filter(|p| !is_interface_sym(self.st, **p))
+                .flat_map(|p| self.st.get(*p).members.iter().copied())
+                .filter_map(|mid| {
+                    let s = self.st.get(mid);
+                    if s.kind != SymKind::Method
+                        || s.name == "<init>"
+                        || s.flags.contains(Flags::ABSTRACT)
+                    {
+                        return None;
+                    }
+                    Some((
+                        encode_method_name(&s.name),
+                        method_params_from_sym(self.st, mid),
+                        mid,
+                    ))
+                })
+                .collect(),
+        };
         let mut chosen: Vec<(String, String, Tree)> = Vec::new();
         let mut seen = HashSet::new();
-        for parent in lin.iter().skip(1) {
+        for (pi, parent) in lin.iter().enumerate().skip(1) {
             let Some(methods) = self.traits.impls.get(parent) else {
                 continue;
             };
             if !is_interface_sym(self.st, *parent) {
                 continue;
             }
+            let past_superclass = super_idx.is_some_and(|si| pi > si);
             let iface = class_internal(self.st, *parent);
             for m in methods {
                 let name = m.name().unwrap_or("").to_string();
@@ -4859,6 +4927,9 @@ impl<'a> Gen<'a> {
                     desc_params(&def_method_desc(self.st, m)).to_string(),
                 );
                 if !seen.insert(key) {
+                    continue;
+                }
+                if past_superclass && self.superclass_implements(&super_impls, m) {
                     continue;
                 }
                 chosen.push((name, iface.clone(), m.clone()));
