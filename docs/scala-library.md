@@ -58,8 +58,8 @@ every dependency the library needs is already built.
 
 | | files | errors | files with errors | classes |
 |---|---|---|---|---|
-| **`--no-scala-library`** (default) | 538 | **4226** | **219** | 0 |
-| `SCALALIB_MODE=jar` (`--scala-library`) | 538 | 4410 | 221 | 0 |
+| **`--no-scala-library`** (default) | 538 | **4203** | **219** | 0 |
+| `SCALALIB_MODE=jar` (`--scala-library`) | 538 | 4383 | 221 | 0 |
 
 `classes=0` is expected while errors remain — nothing is emitted — but read the
 two together: `errors=0 classes=0` would mean a crash, not a success.
@@ -83,9 +83,9 @@ The first measurement was **142 errors in 48 files** — and every one of them
 was a *parse* error. As with cats and gitbucket, that number was hiding the
 compiler: a file that does not parse is never typed, so 490 files were being
 counted as clean without a single member ever being looked up. Getting the 538
-files to parse took the number to 4226. **That is progress, not a regression.**
+files to parse took the number to 4203. **That is progress, not a regression.**
 
-The parse failures were five things:
+The parse failures were six things:
 
 | Symptom | Sites | What it is |
 |---|---|---|
@@ -152,19 +152,22 @@ on a private var (we never inline) and `@(deprecated @companionMethod)` on
 `Predef.any2stringadd`. It is still a fidelity gap, and it is the one thing in
 this slice that is not exactly nsc.
 
-## What the 4226 are
+## What the 4203 are
 
 | Class | Count | Share |
 |---|---|---|
-| `X is not a member of Y` | 1391 | 32.9% |
-| `type mismatch` | 1154 | 27.3% |
-| `no matching overload` | 704 | 16.7% |
-| overriding (`overrides nothing`, `override modifier required`, `incompatible type in overriding`, `cannot override final member`) | 263 | 6.2% |
+| `X is not a member of Y` | 1391 | 33.1% |
+| `type mismatch` | 1142 | 27.2% |
+| `no matching overload` | 702 | 16.7% |
+| overriding (`overrides nothing`, `override modifier required`, `incompatible type in overriding`, `cannot override final member`) | 263 | 6.3% |
+| `needs to be abstract` | 261 | 6.2% |
 | `not found: value` / `type` / `extractor` | 152 | 3.6% |
 | `no matching overload for constructor` | 92 | 2.2% |
-| `ambiguous overload` | 58 | 1.4% |
-| `object creation impossible` / `needs to be abstract` | ~90 | 2.1% |
-| everything else | rest | |
+| `ambiguous overload` | 59 | 1.4% |
+| `object creation impossible` | 32 | 0.8% |
+| `type arguments do not conform` | 24 | 0.6% |
+| `illegal inheritance` | 13 | 0.3% |
+| everything else | 68 | 1.6% |
 
 The receivers in `X is not a member of Y` say what is really going on:
 
@@ -236,7 +239,7 @@ not reachable, not the bound.
    the typer knows the standard library at all — but nothing else is worth
    doing first, and the nine-line reproduction above is the whole test.
 2. Only then re-measure and re-classify. The `type mismatch` and `no matching
-   overload` pile (1858 errors) is downstream of (1) and cannot be read
+   overload` pile (1844 errors) is downstream of (1) and cannot be read
    honestly until (1) is fixed; a share of it will simply disappear.
 3. Do **not** assume the overriding family (263) is a second root. It looks
    like one — `overrides nothing` does not need member lookup to succeed — but
@@ -244,7 +247,7 @@ not reachable, not the bound.
    `Option.scala:171 override final def knownSize` overrides
    `IterableOnce.knownSize`, declared in the source `IterableOnce` that the
    prelude's copy is hiding. There is no evidence yet of a second independent
-   root anywhere in these 4226; look for one only after (1).
+   root anywhere in these 4203; look for one only after (1).
 4. `src/reflect` and `src/compiler` are not worth measuring yet.
    `SCALALIB_DIRS` accepts them when they are.
 
