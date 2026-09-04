@@ -1654,7 +1654,13 @@ impl<'a> Pickler<'a> {
             extra |= 1 << 20; // JAVA (not remapped)
         }
         let flags = pickled_from_our(class_flags, class_kind, extra);
-        let owner = pkg_ref;
+        // A *nested* class used to name the enclosing package as its owner, so
+        // `slick/jdbc/JdbcProfile$JdbcAPI.class` said it was
+        // `slick.jdbc.JdbcAPI`. Every reader that looked the class up by the
+        // name it actually has then found a pickle that disagreed and served
+        // nothing: `import profile.api.*` came back with zero members even
+        // once the parents were there. Same helper as the reference side.
+        let owner = self.external_owner_ref(class_id);
         let body = self.symbol_info(name_ref, owner, flags, info);
         self.entries[idx as usize] = (tag, body);
         self.pickle_sym_annots(class_id, idx);

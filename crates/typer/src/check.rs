@@ -138,6 +138,9 @@ impl Default for TypecheckOptions {
 pub struct Typer {
     pub st: SymbolTable,
     pub diags: Vec<Diagnostic>,
+    /// Import prefixes a pass could not resolve, as `(file, lo, hi)`.
+    /// See `retract_import_prefix_errors`.
+    import_prefix_failed: HashSet<(usize, u32, u32)>,
     pub(crate) file_index: usize,
     /// The text of each unit, by `file_index`.
     ///
@@ -579,6 +582,7 @@ impl Typer {
         Typer {
             st,
             diags: Vec::new(),
+            import_prefix_failed: HashSet::new(),
             file_index,
             sources: Vec::new(),
             gensym: 0,
@@ -5292,9 +5296,13 @@ impl Typer {
         // recovered in pass four. That is what `import tdb.profile.api.*`
         // hit in every one of slick's testkit suites.
         //
-        // Clearing the path makes the retry a real retry.
-        clear_path_types(qual);
+        // Clearing the path makes the retry a real retry -- but only when the
+        // last one did not land, or every pass would re-resolve every import
+        // in the run.
         let qspan = qual.span;
+        if qual.ty.is_no_type() || qual.ty.is_error() || qual.sym.is_none() {
+            clear_path_types(qual);
+        }
         self.type_expr(qual, &Type::NoType);
         if !qual.sym.is_none() {
             let id = qual.sym;
@@ -5327,7 +5335,10 @@ impl Typer {
                 }
                 vec![owner]
             }
-            None => Vec::new(),
+            None => {
+                self.note_import_prefix_failed(qspan);
+                Vec::new()
+            }
         }
     }
 
@@ -5340,13 +5351,30 @@ impl Typer {
     /// "value api is not a member of <notype>" on pass one and resolves on
     /// pass four. Diagnostics are deduplicated but never retracted, so that
     /// first attempt was reported for an import that works.
+    /// Only prefixes that *did* file something are swept: `diags` grows with
+    /// every pass (duplicates are folded at print time, not here), so a
+    /// `retain` per resolved import turned a 12-minute measurement into a
+    /// 36-minute one on the 240-source testkit run.
     fn retract_import_prefix_errors(&mut self, qspan: Span) {
         if qspan == Span::DUMMY {
+            return;
+        }
+        let key = (self.file_index, qspan.lo.0, qspan.hi.0);
+        if !self.import_prefix_failed.remove(&key) {
             return;
         }
         let file = self.file_index;
         self.diags
             .retain(|d| d.file_index != file || d.span.lo < qspan.lo || d.span.hi > qspan.hi);
+    }
+
+    /// Remember that this pass could not resolve the prefix, so a later pass
+    /// that does knows there is something to retract.
+    fn note_import_prefix_failed(&mut self, qspan: Span) {
+        if qspan != Span::DUMMY {
+            let key = (self.file_index, qspan.lo.0, qspan.hi.0);
+            self.import_prefix_failed.insert(key);
+        }
     }
 
     /// Record the prefix `import <a value>._` selects its members through.
