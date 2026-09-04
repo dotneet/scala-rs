@@ -8,9 +8,9 @@ use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
     check_local_case_class_captures, check_local_objects, erase, expand_private_names, find_mains,
-    lambda_lift, lazy_locals, mark_anon_captures, note_source_value_classes, typecheck_units_src,
-    uncurry, ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType,
-    ClasspathTypeParam, TypecheckOptions,
+    hoist_default_receivers, lambda_lift, lazy_locals, mark_anon_captures,
+    note_source_value_classes, typecheck_units_src, uncurry, ClasspathClass, ClasspathMethod,
+    ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -215,6 +215,10 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         }
         if !has_errors(&diags) {
             for u in units.iter_mut() {
+                // nsc's `NamesDefaults`: a call that omitted defaults binds its
+                // qualifier to a local first, so the receiver is evaluated
+                // once rather than once per `name$default$n` getter.
+                hoist_default_receivers(&mut u.tree, &mut st);
                 uncurry(&mut u.tree, &mut st);
                 // A method-local `lazy val` becomes a cell plus a nested
                 // accessor def; lambda-lift then hoists the accessor and
