@@ -66,6 +66,11 @@ two together: `errors=0 classes=0` would mean a crash, not a success.
 
 319 of the 538 files draw no diagnostic at all.
 
+**These are the `agent/scalalib` numbers.** The next section, "The one root",
+is the survey that was made of them; everything below "The `agent/preludeshadow`
+slice" is what happened when that root was fixed, and the current default-mode
+figure is **1997 errors in 173 files**.
+
 ### The measurement is not run against the jar
 
 Linking `src/library` against `scala-library-2.13.16.jar` asks the compiler to
@@ -230,26 +235,159 @@ final class IterableEquiv[CC[X] <: Iterable[X], T] {
 — compiles cleanly with `--scala-library`. It is the source `Iterable` that is
 not reachable, not the bound.
 
+## The `agent/preludeshadow` slice: source definitions now replace the prelude
+
+**4180 errors in 218 files → 1997 in 173**, measured on this branch merged
+with `main` at `d4131b0`. Every other target is unchanged to the error; see
+the table at the end of this section.
+
+The root above was right, and it was three separate mechanisms wearing one
+symptom. All three are name resolution; none of them is in `prelude*.rs`
+itself, which turned out not to need editing at all.
+
+### 1. A source definition replaces the prelude's symbol
+
+`SymbolTable::shadow_supplied_by_source`, called from the namer as each
+source class, object and synthesized companion is entered. When the owner
+already holds a prelude symbol (`id < prelude_end`) of the same name in the
+same namespace, that symbol is made **unreachable by name**:
+
+* out of the owner's `members`, which is what `lookup_member` walks and what
+  the per-`PackageDef` scope is built from — entering the source symbol
+  *alongside* the prelude's is not enough, because the prelude's was
+  allocated first and every "first class-like hit" therefore found it;
+* out of **every open scope**, replaced in place by the source symbol. This
+  is the half that is easy to miss: the prelude enters names like
+  `IterableOnce`, `<:<` and `Ordered` into a scope of its own by hand, and
+  that scope never pops, so an entry there outlives any shadowing a package
+  scope could do;
+* skipped by `find_class_by_jvm`, which resolves a binary name to the
+  *lowest* symbol id carrying it — always the prelude's.
+
+The symbol itself stays in the table. Its id is already written into prelude
+signatures (`Map.get` returns the prelude's `Option`, and so on) and a namer
+cannot rewrite those. Only prelude symbols are replaced; a classfile on the
+classpath is a real ambiguity that nsc reports, and is left alone.
+
+### 2. `scala._` was a snapshot, not an import
+
+nsc opens `java.lang._`, `scala._` and `Predef._` around every unit. The
+prelude models the `scala._` half by *copying* the package's members into its
+scope at install time, which a source `Tuple9.scala` compiled in the same run
+arrives too late for. In `--no-scala-library` mode the prelude builds no
+`Tuple1` and no `Tuple3`…`Tuple22` at all — the private runtime has no such
+classes — so the source ones were the only ones in existence and were
+invisible from any other package: `class_sym_of` answered `None` for
+`(T1, …, T9)`. `Typer::auto_import_scala_member` enters a source definition
+whose owner is package `scala` into the prelude's scope as well.
+
+### 3. `TupleN` was looked up in the wrong namespace
+
+`class_sym_of(Type::Tuple(..))` used the namespace-blind `SymbolTable::lookup`,
+which stops at the nearest scope that binds the name *at all*. `object Equiv`
+and `object Ordering` each declare `implicit def Tuple2[T1, T2](…)`, so inside
+their bodies the lookup stopped at the method, found nothing class-like in it,
+and gave up — **176 errors**, all of them `value _1 is not a member of
+(T1, T2)` in the two files that define the tuple orderings. `lookup_type` is
+the right lookup; it skips a scope that binds the name only as a term.
+
+### What this did to the numbers
+
+Each of the three is worth its own line; these were taken at the branch point
+`56174d5`, one after the other:
+
+| | files | errors | files with errors | classes |
+|---|---|---|---|---|
+| branch point (`56174d5`) | 538 | 4203 | 219 | 0 |
+| after (1) | 538 | 2245 | 176 | 0 |
+| after (2) | 538 | 2190 | 172 | 0 |
+| after (3) | 538 | **2014** | **172** | 0 |
+
+And on the merged tree, which is the number that counts:
+
+| | files | errors | files with errors | classes |
+|---|---|---|---|---|
+| `main` at `d4131b0` | 538 | 4180 | 218 | 0 |
+| this branch merged with it | 538 | **1997** | **173** | 0 |
+
+`classes=0` is still expected while errors remain.
+
+### One thing that looked right and was not
+
+Making `tree_to_type`'s hand-written shortcuts for `Option`, `List` and `Some`
+— which map an applied type tree with that *name* straight onto
+`st.option_sym` / `list_sym` / `some_sym`, whatever prefix it is written with
+— yield to a source definition of `scala.Option` takes the measurement from
+**2014 errors in 172 files to 2251 in 205**. The prelude's `Option` carries
+members the source one has no working signature for yet, so redirecting the
+name loses more than it gains. It is left as it is, with a comment saying so.
+
+Those shortcuts have a second, independent consequence, unrelated to
+`src/library` and present on the branch point: `mine.Option[Int]`, written
+with an explicit unrelated prefix, also comes out as `scala.Option[Int]`.
+`crates/cli/tests/preludeshadow.rs` records it.
+
 ## What to do next, in order
 
-1. **Let source definitions replace prelude symbols.** Until a source
-   `scala.collection.IterableOnce` *is* the `IterableOnce` the rest of the run
-   sees, no further work on this benchmark measures anything: the top three
-   error classes are all this. It is not a small change — the prelude is how
-   the typer knows the standard library at all — but nothing else is worth
-   doing first, and the nine-line reproduction above is the whole test.
-2. Only then re-measure and re-classify. The `type mismatch` and `no matching
-   overload` pile (1844 errors) is downstream of (1) and cannot be read
-   honestly until (1) is fixed; a share of it will simply disappear.
-3. Do **not** assume the overriding family (263) is a second root. It looks
-   like one — `overrides nothing` does not need member lookup to succeed — but
-   the ones sampled are the same bug seen from the other side:
-   `Option.scala:171 override final def knownSize` overrides
-   `IterableOnce.knownSize`, declared in the source `IterableOnce` that the
-   prelude's copy is hiding. There is no evidence yet of a second independent
-   root anywhere in these 4203; look for one only after (1).
-4. `src/reflect` and `src/compiler` are not worth measuring yet.
+1. **A tuple literal resolves its `TupleN` by ordinary term lookup.** The
+   parser lowers `(a, b)` to `Apply(Ident("Tuple2"), …)`, so inside a scope
+   that declares a *term* of that name the literal calls it. `object Equiv`
+   again:
+
+   ```scala
+   object Fake {
+     def Tuple2(n: Int): String = "" + n
+     def f[A, B](a: A, b: B): (A, B) = (a, b)   // no matching overload for (Int)String
+   }
+   ```
+
+   real scalac accepts this (`gen.mkTuple` builds a fully qualified
+   `scala.TupleN` tree; the name is never looked up). This is the same family
+   as (3) above and is most of the 279 `no matching overload`. The fix needs a
+   way to tell the synthesized `Ident` from a user's own call — the parser has
+   no symbol table and `Tree` has no marker field — so it is a small design
+   decision, not a one-liner. `tests/fixtures/pshadow_tuplename.scala` covers
+   the *type*-position half that is fixed; the term half is not in it. (288
+   `no matching overload` remain, and this is a large share of them:
+   `Equiv.scala:251`'s is `(x, y) match` reading as a call of
+   `Equiv.Tuple2`.)
+2. **`Vector2[Any]` … `Vector6[Any]` — 100 errors, all in `Vector.scala`.**
+   `new VectorN(…)` on a generic constructor infers `Any` for the element
+   where the context expects `Vector[B]`. Nothing to do with the prelude; it
+   is constructor type inference. `Tree[A, …]` (73, `RedBlackTree.scala`) and
+   `Array[Any]` (43) look like the same shape and should be checked together.
+3. `case class` synthesis does not produce `canEqual`, so all 22 `TupleN`
+   classes report `class TupleN needs to be abstract` against
+   `Product`/`Equals`. 22 errors, one root, and it needs no lookup work.
+4. Do **not** assume the overriding family (now 51: 30 `` `override` modifier
+   required`` plus 21 `incompatible type in overriding`) is a second root. It
+   looks like one — `overrides nothing` does not need member lookup to
+   succeed — but the ones sampled were the same bug seen from the other side.
+   It has shrunk from 263 along with everything else, which is consistent with
+   that reading.
+5. `src/reflect` and `src/compiler` are not worth measuring yet.
    `SCALALIB_DIRS` accepts them when they are.
+
+### The other targets, before and after this slice
+
+Both columns measured on the merged tree, the "before" one from a binary built
+with `main`'s (`d4131b0`) `check.rs` / `symbol.rs` / `prelude.rs` in place.
+
+| | before | after |
+|---|---|---|
+| `tests/slick_measure.sh` | `files=184 errors=0 files_with_errors=0 classes=1596` | identical |
+| `tests/slick_run.sh` | — | `progs=12 ok=12 diff=0 fail=0` |
+| `tests/cats_measure.sh` | `files=339 skipped=1 errors=71 files_with_errors=16 classes=0` | identical |
+| `tests/gitbucket_measure.sh` | `files=353 skipped=1 errors=1859 files_with_errors=186 classes=0` | identical |
+| `tests/scala_corpus.sh` (sample, 250/kind, `CORPUS_JOBS=6`) | `pos 134/250 · neg 101/250 · run 49/250` | identical, and the per-test TSVs `diff` clean |
+| `cargo test --workspace --release` | — | 146 × `test result: ok`, 1931 tests |
+
+`tests/slick_subset.sh` was not run: this slice touches no code generation
+(`crates/backend/` is untouched), so its 30 minutes would measure nothing.
+
+Note that `docs/cats.md`'s headline number (3019) and `docs/gitbucket.md`'s
+(2545) are both stale: on `d4131b0` cats measures **71** and gitbucket
+**1859**.
 
 ## Running it
 

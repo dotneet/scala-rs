@@ -1,5 +1,16 @@
 # typelevel/cats
 
+> **Measurement note (2026-09-05).** `tests/cats_measure.sh` now passes
+> `-no-specialization`. cats writes `import scala.{specialized => sp}` and
+> annotates with `@sp`; scala-rs rejects that annotation without the flag, and
+> **a single parse error aborts the run before any file is typechecked**, so the
+> count collapses to the parse errors alone (71) and says nothing about type
+> checking. The honest figure at `997884a` is **2929 errors / 151 files**, of
+> which the kind-projector symptoms (`*` 388, `λ` 158, `α` 104) are still the
+> largest group — those are a compiler plugin, and real scalac rejects them too
+> without it.
+
+
 Where this compiler stands on [typelevel/cats](https://github.com/typelevel/cats),
 the second real-world benchmark after slick. This is a survey, not a campaign:
 the point is to have the number and the symptoms written down.
