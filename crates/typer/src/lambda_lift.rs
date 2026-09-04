@@ -661,32 +661,6 @@ fn child_trees(t: &Tree) -> Vec<&Tree> {
     v
 }
 
-/// Names a pattern introduces: a `Bind`, and an `Ident` that is a variable
-/// rather than a stable identifier -- the same lowercase test the typer and
-/// `anon_capture` use.
-fn pattern_binders(pat: &Tree, out: &mut HashSet<SymbolId>) {
-    match &pat.kind {
-        TreeKind::Bind { .. } => {
-            if !pat.sym.is_none() {
-                out.insert(pat.sym);
-            }
-        }
-        TreeKind::Ident { name } => {
-            let varid = name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_lowercase() || c == '_');
-            if varid && !pat.sym.is_none() {
-                out.insert(pat.sym);
-            }
-        }
-        _ => {}
-    }
-    for c in child_trees(pat) {
-        pattern_binders(c, out);
-    }
-}
-
 fn collect_captures(
     tree: &Tree,
     own: &HashSet<SymbolId>,
@@ -750,18 +724,9 @@ fn collect_captures(
         TreeKind::Match { selector, cases } => {
             collect_captures(selector, own, out, st);
             for c in cases {
-                // A case's own binders are *bound* here, not free. Without
-                // this the nested `def findSql(n: Node) = n match { case c:
-                // CompiledStatement => c.extra … }` in slick's
-                // `JdbcActionComponent` counted `c` as a free variable, so the
-                // lifted `findSql$n` grew a parameter for it and the enclosing
-                // trait "captured" it -- which the backend can only satisfy
-                // with a `throw new RuntimeException("cannot capture c")`.
-                let mut bound = own.clone();
-                pattern_binders(&c.pat, &mut bound);
-                collect_captures(&c.pat, &bound, out, st);
-                collect_captures(&c.guard, &bound, out, st);
-                collect_captures(&c.body, &bound, out, st);
+                collect_captures(&c.pat, own, out, st);
+                collect_captures(&c.guard, own, out, st);
+                collect_captures(&c.body, own, out, st);
             }
         }
         TreeKind::Try {
@@ -771,11 +736,8 @@ fn collect_captures(
         } => {
             collect_captures(block, own, out, st);
             for c in catches {
-                let mut bound = own.clone();
-                pattern_binders(&c.pat, &mut bound);
-                collect_captures(&c.pat, &bound, out, st);
-                collect_captures(&c.guard, &bound, out, st);
-                collect_captures(&c.body, &bound, out, st);
+                collect_captures(&c.pat, own, out, st);
+                collect_captures(&c.body, own, out, st);
             }
             collect_captures(finalizer, own, out, st);
         }

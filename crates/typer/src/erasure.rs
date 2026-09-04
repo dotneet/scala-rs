@@ -506,22 +506,6 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
             d => erase_ty(&d, st),
         },
         Type::Applied { ctor, .. } => erase_ty(ctor, st),
-        // An existential's skolem erases like a type parameter: to the
-        // erasure of its upper bound (SLS 3.7). slick declares
-        // `lazy val shaped: ShapedValue[? <: E, E#TableElementType]`, so
-        // `shaped.value` has type `? <: E`; erasing that to `Object` rather
-        // than to `AbstractTable` left `def baseTableRow: E = shaped.value`
-        // without the `checkcast` its own descriptor promises, and the
-        // verifier threw the method out ("Bad return type") the first time
-        // any program touched a `TableQuery`.
-        Type::BoundedWildcard { hi: Some(hi), .. } => {
-            let e = erase_ty(hi, st);
-            if is_primitive(&e) {
-                Type::Any
-            } else {
-                e
-            }
-        }
         Type::Wildcard | Type::BoundedWildcard { .. } => Type::Any,
         Type::Constant(lit) => Type::lit_underlying(lit),
         Type::ThisType(s) => Type::Class {

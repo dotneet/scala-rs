@@ -307,13 +307,6 @@ fn each_child(tree: &Tree, f: &mut dyn FnMut(&Tree)) {
             f(expr)
         }
         TreeKind::InterpolatedString { args, .. } => args.iter().for_each(f),
-        // Pattern shapes. Without these the walk stops at the first `x @ p`,
-        // so the binders *inside* `p` never reach `pattern_binders`, the case
-        // body's reads of them look free, and the enclosing trait ends up
-        // "capturing" its own method's pattern variables.
-        TreeKind::Bind { body, .. } => f(body),
-        TreeKind::Star { elem } => f(elem),
-        TreeKind::Alternative { trees } => trees.iter().for_each(f),
         TreeKind::LabelDef { params, rhs, .. } => {
             params.iter().for_each(&mut *f);
             f(rhs);

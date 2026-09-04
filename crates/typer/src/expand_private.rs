@@ -43,7 +43,6 @@ use crate::lazy_local::children_mut;
 /// Rename every `private` member of this unit that is reached from another
 /// class, and mark it for the backend to emit without `ACC_PRIVATE`.
 pub fn expand_private_names(tree: &mut Tree, st: &mut SymbolTable) {
-    widen_private_ctors(tree, st);
     let mut candidates = HashSet::new();
     collect_private_members(tree, st, &mut candidates);
     if candidates.is_empty() {
@@ -64,44 +63,6 @@ pub fn expand_private_names(tree: &mut Tree, st: &mut SymbolTable) {
         renames.insert(id, (old, new));
     }
     rewrite(tree, &renames);
-}
-
-/// A `private` constructor called from another class file. A constructor
-/// cannot be renamed, so nsc simply drops `private`: `class L private (x: Int)`
-/// with a companion that calls `new L(2)` comes out `public L(int)`, while the
-/// same class with no such caller stays `private L(int)`. Emitting it
-/// `ACC_PRIVATE` regardless made slick's
-/// `final class ConstArray private[util] (a: Array[Any], val length: Int) {
-/// private def this(a: Array[Any]) = … }` unusable from its own companion:
-/// `IllegalAccessError: class slick.util.ConstArray$ tried to access private
-/// method ConstArray.<init>`.
-fn widen_private_ctors(tree: &mut Tree, st: &mut SymbolTable) {
-    let mut cands = HashSet::new();
-    collect_private_ctors(tree, st, &mut cands);
-    if cands.is_empty() {
-        return;
-    }
-    let mut need = HashSet::new();
-    scan(tree, st, SymbolId::NONE, &cands, &mut need);
-    for id in need {
-        st.get_mut(id).access_widened = true;
-    }
-}
-
-fn collect_private_ctors(t: &mut Tree, st: &SymbolTable, out: &mut HashSet<SymbolId>) {
-    if matches!(t.kind, TreeKind::DefDef { .. }) && !t.sym.is_none() {
-        let s = st.get(t.sym);
-        if s.flags.contains(Flags::PRIVATE)
-            && s.private_within.is_none()
-            && s.name == "<init>"
-            && matches!(st.get(s.owner).kind, SymKind::Class)
-        {
-            out.insert(t.sym);
-        }
-    }
-    for c in children_mut(t) {
-        collect_private_ctors(c, st, out);
-    }
 }
 
 /// `<owner full name, '$'-separated>$$<name>`, nsc's `nme.expandedName`.
