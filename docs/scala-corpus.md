@@ -1,5 +1,28 @@
 # scala/scala's own test corpus
 
+## Why `pos` does not pass `-no-specialization`
+
+70 of `pos`'s 534 failures are `unimplemented syntax: annotation specialized`,
+and `-no-specialization` would turn all of them green. The corpus does not pass
+it, on purpose.
+
+`-no-specialization` is nsc's own flag, and it means *ignore the annotation* —
+not *implement specialization*. nsc implements it: `@specialized` there means
+`Foo$mcI$sp` classes get emitted and the ABI changes. Passing the flag here
+would count "we ignored what the test was testing" as a pass.
+
+`tests/cats_measure.sh` and `tests/scalalib_measure.sh` do pass it, and that is
+also on purpose: those two ask "where is type checking", a single parse error
+aborts the whole run, and both codebases annotate everywhere. Without the flag
+cats reports 71 errors and the library reports 84 — numbers that mean "nothing
+was typechecked", not "almost nothing is wrong". The flag buys a meaningful
+type-checking number at the cost of an ABI that differs from nsc's, which is
+the right trade for a progress measure and the wrong one for a conformance
+score.
+
+So: 70 `pos` tests stay red until specialization is actually implemented. That
+is the honest reading.
+
 Where this compiler stands on the tests scalac is developed against:
 `test/files/{pos,neg,run}` from [scala/scala](https://github.com/scala/scala).
 This is a survey, not a campaign. `tests/conform/` is 86 differential probes we
