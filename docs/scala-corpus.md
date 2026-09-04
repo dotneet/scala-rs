@@ -372,9 +372,16 @@ bugs — and none of them is cycle detection.
 with the qualifier honoured, the shape compiles.
 
 slick (`files=184 errors=0 files_with_errors=0 classes=1596`), `slick_run`
-(`progs=12 ok=12 diff=0 fail=0`), cats (`errors=71 files_with_errors=16`) and
-gitbucket (`errors=1859 files_with_errors=186`) are byte-identical before and
-after, which is the check that mattered: this slice adds two rejection rules.
+(`progs=12 ok=12 diff=0 fail=0`), cats and gitbucket
+(`errors=1859 files_with_errors=186`) are byte-identical before and after,
+which is the check that mattered: this slice adds two rejection rules.
+
+The cats pair was measured at `errors=71 files_with_errors=16` on both sides,
+before `tests/cats_measure.sh` started passing `-no-specialization`; that 71
+was a parse abort and not a type-checking figure (see the note at the top of
+`docs/cats.md`). Re-measured with the current script on the merged tree, cats
+is `errors=2929 files_with_errors=151` — main's own recorded number, to the
+error.
 
 ## What would move the number most
 
