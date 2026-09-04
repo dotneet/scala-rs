@@ -87,8 +87,13 @@ From a profile of the current binary (`sample`, excluding threads parked in
 
 - **Writing the class files dominates**: `open` alone is around 45% of the
   non-waiting samples, plus `close` and `write`. 2127 files is 2127 creates.
-  Lowering `PartialFunction` literals to `invokedynamic` would remove roughly
-  700 of them.
+  579 of them are closure classes scalac does not emit: every one implements
+  `scala.PartialFunction`, and scalac has 137 such classes to our 716. scalac
+  only builds a `PartialFunction` class when the expected type really is one;
+  a `{ case … }` passed where a `Function1` is wanted becomes an ordinary
+  `invokedynamic` lambda whose body is the match. So the count is a typing
+  question, not a code-generation one. A further 106 are `T$class` helpers that
+  scalac 2.13 replaces with interface default methods.
 - `Type::clone` and its drop glue are about 11%. The fix is interning — a
   `TypeId` index, or `Rc` for shared subtrees — which reaches every part of the
   compiler that touches a type.
