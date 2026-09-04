@@ -154,6 +154,112 @@ subclass that renamed it to `A`. The worst files are `Eq.scala` (10),
 `TupleInstances.scala` (8), `SortedMapInstances.scala` (8) and
 `PartialOrder.scala` (8).
 
+The next section takes that list apart. The `(T, T)T` family turned out to be
+**31 errors, not 14**, and one root; the count above is the diagnostic's
+wording, not the shape.
+
+## `kernel` after the `agent/kernel` slice: 19 errors in 10 of 95 files
+
+Measured on the merged tree with `CATS_MODULES=kernel tests/cats_measure.sh`.
+
+| | files | errors | files with errors |
+|---|---|---|---|
+| Before | 95 | **84** | 23 |
+| After | 95 | **19** | 10 |
+
+Ten roots, each with a minimal reproduction real scalac 2.13.16 accepts.
+`tests/fixtures/k1_kernel.scala` holds all ten and runs; its expected output is
+nsc's, and `crates/cli/tests/kernel.rs` diffs both compilers' output.
+
+| errors | root |
+|---|---|
+| 29 | A higher-kinded type parameter's bound was resolved in a scope its own parameters are not in |
+| 8 | `Tuple1` was not in the prelude |
+| 8 | `this(a)(b)` in an auxiliary constructor, and a constructor group read at the wrong type arguments |
+| 4 | `supply_receiver_override` compared arity where it had to compare parameter types |
+| 3 | A `{ case … }` literal was not expanded to a SAM's arity |
+| 3 | `new BigDecimal(java.math.BigDecimal, java.math.MathContext)` did not exist |
+| 3 | `immutable.BitSet` extended nothing |
+| 3 | A class stubbed from a pickle kept `AnyRef` as its only parent |
+| 2 | `scala.annotation.StaticAnnotation` was declared as a class |
+| 2 | A hexadecimal literal was read as a positive `i64` |
+
+Adding `Tuple1` needed one repair elsewhere: slick's generated `TupleSupport`
+writes `new Tuple1(s(0))` where a `Product` is wanted, and the prelude linked
+`Product` / `Serializable` onto `Tuple2` and up only. That is the whole of the
+slick difference — `tests/slick_measure.sh` is back at `errors=0
+files_with_errors=0 classes=1596` on 184 files.
+
+Three of these are worth spelling out, because the diagnostic pointed
+somewhere else in each case.
+
+### The bound of `P[T] <: PartialOrder[T]` was a name standing for nothing
+
+`abstract class PartialOrderFunctions[P[T] <: PartialOrder[T]]` declares
+`def lteqv[A](x: A, y: A)(implicit ev: P[A]) = ev.lteqv(x, y)`, and 31 of the
+84 errors were calls of that shape reporting the bound's own parameter back:
+`no matching overload for (T, T)Boolean with arguments (A, A)`, or
+`type mismatch; found: T  required: A`.
+
+`widen_type_param` already substitutes an application's arguments into the
+bound. What it had to substitute into was `PartialOrder[Type::Named { name:
+"T" }]` — an unresolved name. `T` belongs to `P`, not to the class, so it is
+not in the class scope `type_class` re-resolves the bounds in. The namer's
+provisional pass, which runs inside `enter_tparams` where the inner parameters
+*are* in scope, had it right; this pass overwrote the good answer with the
+broken one. Seven lines reproduce it:
+
+```scala
+trait Eq0[T] { def eqv(x: T, y: T): Boolean; def self: T }
+abstract class F[P[T] <: Eq0[T]] {
+  def eqv[A](x: A, y: A)(implicit ev: P[A]): Boolean = ev.eqv(x, y)  // (T, T)Boolean … (A, A)
+  def mk[A](implicit ev: P[A]): A = ev.self                          // found: T  required: A
+}
+```
+
+### A class whose only clause is implicit has the constructor `()(implicit …)`
+
+That is nsc's answer, not a guess — `new C(3)` on `class C(implicit x: Int)` is
+`no arguments allowed for nullary constructor C: ()(implicit x: Int): C`. It is
+why cats-kernel writes `extends SortedMapEq[K, V]()(V)` and
+`private[instances] def this(V: Hash[V], O: Order[K], K: Hash[K]) = this()(V, K)`.
+
+Eight errors came out of that, in three different wordings, and they were two
+roots:
+
+* `this(a)(b)` was two applications, so the second landed on the `Unit` that
+  `this()` produces. `extends A(1)(2)` and `new A(1)(2)` were already
+  flattened; the self-call was not, and the delegation test only looks one
+  `Apply` deep, so the same line also reported `auxiliary constructor must
+  start with a call to this(...)`.
+* With **two or more** constructors, `resolve_overload` re-reads the group off
+  its symbols, where they are written in the parent's type parameters while the
+  arguments are in the subclass's — so nothing matched. With one alternative
+  the clause `pick_ctor_at` had already instantiated is used as is, which is
+  why `extends E[K, V]()(V)` worked until `E` grew a deprecated `def this`.
+
+### `x.min(y)` on two `FiniteDuration`s depended on what had been read first
+
+`FiniteDuration` declares `min(FiniteDuration): FiniteDuration` next to the
+`min(Duration): Duration` it inherits. `supply_receiver_override` only asks the
+pickle for the receiver's own declaration when the class file shows an **arity**
+no candidate has, and these two have the same arity — so the inherited
+alternative stood and `x.min(y)` was a `Duration`. It only misfired *after*
+something else had completed `FiniteDuration`, which is why importing
+`Duration` by name changed the answer:
+
+```scala
+import scala.concurrent.duration.{Duration, FiniteDuration}   // drop `Duration` and it compiles
+object FD {
+  def mn(x: FiniteDuration, y: FiniteDuration): FiniteDuration = x.min(y)
+  def mx(x: FiniteDuration, y: FiniteDuration): FiniteDuration = x.max(y)   // found: Duration
+}
+```
+
+The comparison is now on erased *parameter* descriptors, which still excludes
+the covariant override the arity test was guarding against (`List.length` over
+`Seq.length` has the same parameters) and excludes bridges outright.
+
 ## What was fixed in this slice
 
 Four of these were ahead of the typer, and the fifth killed the process. All
@@ -216,6 +322,86 @@ val bad: Fun[({ type L[a] = Either[String, a] })#L] = ???      // "required: Fun
 ```
 
 scalac accepts both.
+
+### What cats-kernel still reports (19 errors, 10 files)
+
+Each of these has a reproduction; none is a cascade of another.
+
+* **`#::` on a `LazyList`** (4, `EnumerableCompat.scala`). `aa #:: loop(aa)` is
+  `LazyList.toDeferrer(loop(aa)).#::(aa)`: an implicit conversion to a *value
+  class* whose method takes a by-name argument, and nsc lowers the call to
+  `LazyList$Deferrer$.$hash$colon$colon$extension`. Nothing of that is
+  modelled.
+* **SAM conversion where the expected type is not written at the conversion**
+  (4, `Eq.scala` 66/133/148, `Hash.scala` 81, `Order.scala` 118). Two separate
+  gaps:
+  - `val b: Option[(Int, Int) => Boolean] = Some((x, y) => x == y)` fails, and
+    so does the SAM version. The expected type is not solved through `Some`'s
+    own type parameter before its argument is typed, so the literal's
+    parameters have no types. **Not SAM-specific** — the plain function type
+    fails the same way.
+  - `scala.math.Equiv` / `Ordering` / `Hashing` are prelude-declared traits
+    whose members carry no `ABSTRACT` flag, so `sam_sig` finds no single
+    abstract method and the conversion is never attempted. Marking them
+    abstract is a two-line change and *should not be made yet*: see the SAM
+    codegen gap below, which would turn these compile errors into
+    `AbstractMethodError` at run time.
+* **An overloaded implicit method used as a value** (2, `Eq.scala` 265/282).
+  `cats.kernel.instances.sortedMap.catsKernelStdHashForSortedMap[K, V]` has two
+  alternatives, both with only implicit clauses; nsc picks the one whose
+  implicits resolve. We report the overload itself: `found: <overload (Hash[K],
+  Hash[V])Hash[SortedMap[K, V]] | …>  required: Hash[SortedMap[K, V]]`.
+* **`Deadline(FiniteDuration(…))`** (1, `DeadlineInstances.scala`) and
+  **`x - y` on `FiniteDuration`** (1). Order-dependent: once
+  `Duration.Infinite` has been read, `FiniteDuration(2L, SECONDS)` no longer
+  conforms to a `FiniteDuration` parameter (`new FiniteDuration(2L, SECONDS)`
+  still does). Reproduction:
+
+  ```scala
+  import scala.concurrent.duration.{Duration, FiniteDuration, SECONDS}
+  object FD8 {
+    def durMin(x: FiniteDuration, y: FiniteDuration): FiniteDuration = x.min(y)
+    def lowest: Duration = Duration.MinusInf          // drop this line and it compiles
+    def m: FiniteDuration = durMin(FiniteDuration(2L, SECONDS), FiniteDuration(5L, SECONDS))
+  }
+  ```
+
+  It predates this slice: disabling both of the slice's pickle-side changes
+  leaves it exactly as it is.
+* **`StaticMethods.combineNIterable(Vector.newBuilder[A], x, n)`** (2,
+  `VectorInstances.scala`). `Builder[A, R]`'s `R` is not solved from a
+  `ReusableBuilder[A, Vector[A]]` argument. Also order-dependent: it appears
+  and disappears across otherwise unrelated changes.
+* **`SortedSet.empty(ordering)`** (1) and **`x | y` on two `SortedSet`s** (1).
+  `empty` is inherited from `EvidenceIterableFactory$Delegate` as
+  `<A> CC empty(Ev)`, so the call has to go out as `(Object)Object`. Declaring
+  it in the prelude compiles and then dies with `NoSuchMethodError`, because
+  the backend only looks for a library method's real descriptor on the
+  receiver's *own* class file. A stub that links to nothing is worse than the
+  diagnostic, so this stays reported.
+* **`as.reduceOption(combine)` on an `IterableOnce[A]`** (1,
+  `Semigroup.scala`). cats supplies it with its own implicit value class in
+  `compat.scalaVersionSpecific`, imported by wildcard; the conversion is not
+  found.
+* **`WrappedMutableMapBase`** (1): `Tuple2[K, V2]` where `Tuple2[K, V]` is
+  wanted.
+
+### SAM conversion emits a class with no mixin forwarders
+
+Not a cats *error* — it type-checks — but it is a program that compiles and
+then throws, which is worse, and cats leans on SAM everywhere:
+
+```scala
+trait Eq0[A] { def eqv(x: A, y: A): Boolean; def neqv(x: A, y: A): Boolean = !eqv(x, y) }
+val l: Eq0[Int] = (x, y) => x == y
+l.neqv(1, 2)   // java.lang.AbstractMethodError
+```
+
+This compiler puts a trait's concrete method bodies into mixin forwarders in
+each implementing class rather than into JVM default methods, and the anonymous
+class SAM conversion generates carries only the abstract method. An ordinary
+`class C extends Eq0[Int] { … }` does get the forwarder, so the machinery
+exists; the SAM path does not run it. It predates this slice.
 
 ### Others, in rough order of mass
 

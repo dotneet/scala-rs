@@ -221,6 +221,8 @@ are organised is described in [docs/testing.md](docs/testing.md).
   feasibility probe behind them (not production code).
 - [docs/slick-testkit.md](docs/slick-testkit.md) — compiling slick's own test
   suite: what is measured, the numbers, and what they found.
+- [docs/cats.md](docs/cats.md) — where this compiler stands on typelevel/cats,
+  the second real-world benchmark.
 - [docs/notes/](docs/notes/README.md) — development notes: the investigations
   and the reasoning behind individual changes.
 

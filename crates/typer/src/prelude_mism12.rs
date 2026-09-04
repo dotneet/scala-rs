@@ -85,4 +85,31 @@ pub fn install(st: &mut SymbolTable) {
             }
         }
     }
+    add_constructors(st, cls, &ret);
+}
+
+/// `new BigDecimal(java.math.BigDecimal[, java.math.MathContext])`.
+///
+/// `javap` shows exactly these two, and cats-kernel's `BigDecimalGroup` builds
+/// its result with the two-argument one
+/// (`new BigDecimal(x.bigDecimal.add(y.bigDecimal), x.mc)`), which the prelude
+/// had no constructor for at all.
+fn add_constructors(st: &mut SymbolTable, cls: scala_rs_parser::SymbolId, ret: &Type) {
+    let jbd = Type::Class {
+        sym: crate::classpath::find_or_stub_java_class(st, "java/math/BigDecimal"),
+        args: vec![],
+    };
+    let mc = Type::Class {
+        sym: crate::classpath::find_or_stub_java_class(st, "java/math/MathContext"),
+        args: vec![],
+    };
+    for params in [vec![jbd.clone(), mc], vec![jbd]] {
+        let already = st.lookup_member(cls, "<init>").into_iter().any(|m| {
+            matches!(&st.get(m).ty, Type::Method { paramss, .. }
+                if paramss.len() == 1 && paramss[0] == params)
+        });
+        if !already {
+            method(st, cls, "<init>", params, ret.clone(), Intrinsic::None);
+        }
+    }
 }

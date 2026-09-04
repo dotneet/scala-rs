@@ -62,6 +62,17 @@ struct Pass<'a> {
 
 impl Pass<'_> {
     fn walk(&mut self, t: &mut Tree) {
+        self.walk_at(t, true);
+    }
+
+    /// `outermost` is false for the `fun` of an enclosing application, i.e. for
+    /// an inner clause of a curried call. Only the outermost `Apply` of a chain
+    /// may be hoisted: wrapping `o.f(a)` of `o.f(a)(b)` in a block leaves
+    /// `Apply { fun: Block, … }`, which has no callee symbol for the backend to
+    /// emit (it came out as `throw new RuntimeException("unresolved apply")`,
+    /// and is what stopped all twelve `slick_run.sh` programs at their first
+    /// `.result`: `Invoker.foreach(f, maxRows = 0)(session)`).
+    fn walk_at(&mut self, t: &mut Tree, outermost: bool) {
         let saved = self.owner;
         if !t.sym.is_none()
             && matches!(
@@ -74,11 +85,23 @@ impl Pass<'_> {
         {
             self.owner = t.sym;
         }
-        for c in children_mut(t) {
-            self.walk(c);
+        match &mut t.kind {
+            TreeKind::Apply { fun, args } | TreeKind::TypeApply { fun, args } => {
+                self.walk_at(fun, false);
+                for a in args.iter_mut() {
+                    self.walk_at(a, true);
+                }
+            }
+            _ => {
+                for c in children_mut(t) {
+                    self.walk_at(c, true);
+                }
+            }
         }
         self.owner = saved;
-        self.rewrite(t);
+        if outermost {
+            self.rewrite(t);
+        }
     }
 
     fn rewrite(&mut self, t: &mut Tree) {
@@ -117,16 +140,9 @@ impl Pass<'_> {
         let recv = std::mem::replace(qual, ident.clone());
 
         // Every `name$default$n` argument this call carries was built from a
-        // clone of that same receiver; point them at the local instead.
-        if let TreeKind::Apply { args, .. } = &mut t.kind {
-            for a in args.iter_mut() {
-                if names_default_getter(a, &prefix) {
-                    if let Some(q) = innermost_qual_mut(a) {
-                        *q = ident.clone();
-                    }
-                }
-            }
-        }
+        // clone of that same receiver; point them at the local instead. The
+        // defaults may sit in any clause of a curried call, not just the last.
+        repoint_default_args(t, &prefix, &ident);
 
         let mut vd = Tree::dummy(TreeKind::ValDef {
             mods: Modifiers::new(Flags::SYNTHETIC),
@@ -156,16 +172,47 @@ impl Pass<'_> {
 }
 
 /// `"f$default$"` when `t` is an application of `f` carrying at least one
-/// `f$default$n` argument built from the receiver.
+/// `f$default$n` argument built from the receiver. Any clause of a curried
+/// call may carry one: `def foreach(f: R => Unit, maxRows: Int = 0)(implicit
+/// session: Session)` called as `inv.foreach(x => …)(session)` has it in the
+/// first, with a second clause applied after it.
 fn default_getter_prefix(t: &Tree) -> Option<String> {
-    let TreeKind::Apply { fun, args } = &t.kind else {
+    let TreeKind::Apply { fun, .. } = &t.kind else {
         return None;
     };
     let name = callee_name(fun)?;
     let prefix = format!("{name}$default$");
-    args.iter()
-        .any(|a| names_default_getter(a, &prefix))
-        .then_some(prefix)
+    chain_has_default_arg(t, &prefix).then_some(prefix)
+}
+
+/// Whether any clause of the application chain at `t` passes a `prefix` getter.
+fn chain_has_default_arg(t: &Tree, prefix: &str) -> bool {
+    match &t.kind {
+        TreeKind::Apply { fun, args } => {
+            args.iter().any(|a| names_default_getter(a, prefix))
+                || chain_has_default_arg(fun, prefix)
+        }
+        TreeKind::TypeApply { fun, .. } => chain_has_default_arg(fun, prefix),
+        _ => false,
+    }
+}
+
+/// Re-point every `prefix` getter argument in the chain at the hoisted local.
+fn repoint_default_args(t: &mut Tree, prefix: &str, ident: &Tree) {
+    match &mut t.kind {
+        TreeKind::Apply { fun, args } => {
+            for a in args.iter_mut() {
+                if names_default_getter(a, prefix) {
+                    if let Some(q) = innermost_qual_mut(a) {
+                        *q = ident.clone();
+                    }
+                }
+            }
+            repoint_default_args(fun, prefix, ident);
+        }
+        TreeKind::TypeApply { fun, .. } => repoint_default_args(fun, prefix, ident),
+        _ => {}
+    }
 }
 
 /// The method name at the head of an application chain.

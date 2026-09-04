@@ -817,16 +817,38 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
         "scala/annotation/Annotation",
         &[Type::AnyRef],
     );
-    let static_annot = abs_class(
+    // `abstract class Annotation` has a public no-argument constructor, and it
+    // is the superclass every annotation class gets (`class a extends
+    // StaticAnnotation` compiles to `extends Annotation implements
+    // StaticAnnotation`), so the subclass's `<init>` has one to call.
+    method(
+        st,
+        annotation,
+        "<init>",
+        vec![],
+        Type::Class {
+            sym: annotation,
+            args: vec![],
+        },
+        Intrinsic::None,
+    );
+    // `trait StaticAnnotation extends Annotation`: the class file really is
+    // `public interface scala.annotation.StaticAnnotation`, and nsc compiles
+    // `class a extends Annotation with StaticAnnotation` (cats-kernel's
+    // `suppressUnusedImportWarningForScalaVersionSpecific`) to `extends
+    // Annotation implements StaticAnnotation`. Declared as a class here, that
+    // source was rejected: `class StaticAnnotation needs to be a trait to be
+    // mixed in`.
+    let static_annot = iface(
         st,
         pkg,
         "StaticAnnotation",
         "scala/annotation/StaticAnnotation",
-        &[Type::Class {
-            sym: annotation,
-            args: vec![],
-        }],
     );
+    st.get_mut(static_annot).parents = vec![Type::Class {
+        sym: annotation,
+        args: vec![],
+    }];
     let _ = abs_class(
         st,
         pkg,
