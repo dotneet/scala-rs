@@ -646,6 +646,7 @@ fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
                 .as_ref()
                 .map(|p| p.tparams.iter().map(cp_tparam).collect())
                 .unwrap_or_default();
+            let extends_anyval = c.pickle.as_ref().is_some_and(|p| p.extends_anyval);
             ClasspathClass {
                 jvm_name: c.internal_name,
                 is_module: c.is_module,
@@ -676,6 +677,7 @@ fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
                 is_interface: c.is_interface,
                 super_name: c.super_name,
                 interfaces: c.interfaces,
+                extends_anyval,
             }
         })
         .collect()

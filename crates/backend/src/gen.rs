@@ -8628,7 +8628,7 @@ fn gen_select(
                         push_default(asm, &tree.ty);
                     }
                 } else if ctx.st.is_value_class(ctx.st.get(tree.sym).owner) {
-                    invoke_value_extension(asm, ctx, tree.sym, Some(&tree.ty));
+                    invoke_value_extension(asm, ctx, tree.sym, Some(&tree.ty), false);
                 } else {
                     // `x.toString` on an `Int` dispatches on
                     // `java/lang/Integer` (or `java/lang/Object` for the
@@ -9628,6 +9628,20 @@ fn gen_apply(
             return;
         }
     }
+    // An `$extension` that lives on a companion module takes the receiver as
+    // its first *argument*, so the module has to be on the stack under it --
+    // and under the arguments that follow. It goes down first, before the
+    // receiver is even evaluated, which is what nsc emits too. Pushing it
+    // afterwards and shuffling only ever worked for a single argument.
+    let ext_module_pushed = !fun.sym.is_none()
+        && ctx.st.is_value_class(ctx.st.get(fun.sym).owner)
+        && match value_extension_module(ctx.st, fun.sym) {
+            Some(m) => {
+                asm.getstatic(&m, "MODULE$", &format!("L{m};"));
+                true
+            }
+            None => false,
+        };
     gen_receiver(asm, frame, ctx, fun);
     if let TreeKind::Select { qual, .. } = &fun.kind {
         // `ArrayOps.toList` / `toSet` / `toVector` / `toBuffer` / `sum` /
@@ -9750,7 +9764,7 @@ fn gen_apply(
     if fun_is_super(fun) {
         invoke_super(asm, ctx, fun.sym);
     } else if value_owner.is_some() {
-        invoke_value_extension(asm, ctx, fun.sym, Some(&tree.ty));
+        invoke_value_extension(asm, ctx, fun.sym, Some(&tree.ty), ext_module_pushed);
     } else {
         invoke_method(asm, ctx, fun.sym, Some(&tree.ty));
     }
@@ -9872,11 +9886,16 @@ fn emit_array_copy_to_immutable_seq(asm: &mut Assembler) {
     );
 }
 
+/// `module_pushed` says the caller has already pushed the companion module
+/// *under* the receiver, which is the only way to reach an `$extension` that
+/// takes arguments: the JVM cannot insert a value below several stack slots,
+/// and nsc pushes the module first for the same reason.
 fn invoke_value_extension(
     asm: &mut Assembler,
     ctx: &EmitCtx,
     id: SymbolId,
     result_ty: Option<&Type>,
+    module_pushed: bool,
 ) {
     let s = ctx.st.get(id);
     let owner_id = s.owner;
@@ -10606,28 +10625,43 @@ fn invoke_value_extension(
         return;
     }
     let desc = value_extension_desc(ctx.st, id);
-    // A value class of the *library*'s (`Predef$ArrowAssoc`) keeps its
-    // `$extension` on a companion module, because that is where scalac put it.
-    // One of ours is emitted as a static on the class itself -- testing the
-    // JVM name for a `$` mistook every value class nested in an object for a
-    // library one and called a companion we never write.
-    if owner.contains('$') && !ctx.st.source_value_classes.contains(&owner_id) {
-        // Nested Predef AnyVal: `$extension` is an instance method on the
-        // companion `MODULE$`, not a static on the value class.
-        let ext_owner = format!("{owner}$");
-        let n_args = count_value_ext_args(&desc);
-        asm.getstatic(&ext_owner, "MODULE$", &format!("L{ext_owner};"));
-        if n_args == 0 {
-            asm.swap();
-        } else {
-            asm.dup_x2();
-            asm.pop();
+    if let Some(ext_owner) = value_extension_module(ctx.st, id) {
+        if !module_pushed {
+            // Paren-less selection: no arguments follow, so the module can be
+            // pushed on top of the receiver and swapped under it.
+            let n_args = count_value_ext_args(&desc);
+            asm.getstatic(&ext_owner, "MODULE$", &format!("L{ext_owner};"));
+            if n_args == 0 {
+                asm.swap();
+            } else {
+                asm.dup_x2();
+                asm.pop();
+            }
         }
         asm.invokevirtual(&ext_owner, &format!("{}$extension", s.name), &desc);
+        maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
         return;
     }
     asm.invokestatic(&owner, &format!("{}$extension", s.name), &desc);
     maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
+}
+
+/// The companion module a value class's `$extension` methods live on, when the
+/// call has to go through it.
+///
+/// nsc always declares them there, but it *also* emits static forwarders on
+/// the value class itself -- for a **top-level** one. A nested value class
+/// (`scala.Predef.ArrowAssoc`, `fs2.Stream.PartiallyAppliedFromIterator`, and
+/// every one of slick's) gets no forwarders, so the module is the only way in.
+/// A value class this run compiles is different again: `emit_value_extension`
+/// puts the statics on the class itself, whatever its nesting.
+fn value_extension_module(st: &SymbolTable, id: SymbolId) -> Option<String> {
+    let owner_id = st.get(id).owner;
+    if st.source_value_classes.contains(&owner_id) {
+        return None;
+    }
+    let owner = class_internal(st, owner_id);
+    owner.contains('$').then(|| format!("{owner}$"))
 }
 
 fn desc_ret_sort(desc: &str) -> JvmSort {

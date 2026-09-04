@@ -54,6 +54,15 @@ pub struct JavaClass {
     /// Has a `MODULE$` static field (Scala module class).
     pub has_module_field: bool,
     pub inner_classes: Vec<JavaInnerClass>,
+    /// The one non-static field, when the class has exactly one -- `private`
+    /// ones included, which `fields` deliberately drops.
+    ///
+    /// This is the shape of a value class, and the field *is* its
+    /// representation: `class Meters(val n: Int) extends AnyVal` compiles to
+    /// `private final int n`, and outside the run that declared it there is
+    /// nowhere else to read the underlying type from. See
+    /// `pickle_supply::ensure_value_class_field`.
+    pub sole_instance_field: Option<JavaField>,
 }
 
 /// A jar/jmod's bytes, shared so the `ZipArchive` that parses them can be kept
@@ -384,6 +393,7 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
     }
     let nfields = c.u2().ok_or("truncated classfile")? as usize;
     let mut fields = Vec::new();
+    let mut instance_fields: Vec<JavaField> = Vec::new();
     for _ in 0..nfields {
         let acc = c.u2().ok_or("truncated field")?;
         let name_i = c.u2().ok_or("truncated field")?;
@@ -392,6 +402,13 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         let _ = attrs;
         let name = cp.utf8(name_i).ok_or("unsupported classfile field name")?;
         let desc = cp.utf8(desc_i).ok_or("unsupported classfile field desc")?;
+        if acc & ACC_STATIC == 0 && instance_fields.len() < 2 {
+            instance_fields.push(JavaField {
+                name: name.clone(),
+                desc: desc.clone(),
+                access: acc,
+            });
+        }
         if acc & ACC_SYNTHETIC == 0 && java_member_visible(acc) {
             fields.push(JavaField {
                 name,
@@ -400,6 +417,11 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
             });
         }
     }
+    let sole_instance_field = if instance_fields.len() == 1 {
+        instance_fields.pop()
+    } else {
+        None
+    };
     let nmethods = c.u2().ok_or("truncated classfile")? as usize;
     let mut methods = Vec::new();
     for _ in 0..nmethods {
@@ -445,6 +467,7 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         is_scala,
         has_module_field,
         inner_classes,
+        sole_instance_field,
     })
 }
 

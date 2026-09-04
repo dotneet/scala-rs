@@ -218,6 +218,15 @@ pub struct PickledClass {
     pub is_module: bool,
     pub tparams: Vec<PickledTypeParam>,
     pub methods: Vec<PickledMethod>,
+    /// The pickled parents name `scala.AnyVal`, i.e. this is a value class.
+    ///
+    /// It cannot be read off the class file: nsc gives a value class
+    /// `java/lang/Object` for a superclass and no interfaces, so the classfile
+    /// header of `class Meters(val n: Int) extends AnyVal` is
+    /// indistinguishable from a plain final class's. The distinction decides
+    /// the whole of erasure for it -- `Meters` erases to `int`, and its
+    /// methods are called as `$extension` statics.
+    pub extends_anyval: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2536,7 +2545,12 @@ enum Entry {
         sym: u32,
         args: Vec<u32>,
     },
-    ClassInfo(u32),
+    /// `CLASSINFOtpe len_Nat classsym_Ref {tpe_Ref}`. The parents used to be
+    /// dropped here; `extends AnyVal` lives nowhere else, because a value
+    /// class's class file says `extends java/lang/Object`.
+    ClassInfo {
+        parents: Vec<u32>,
+    },
     MethodTpe {
         ret: u32,
         params: Vec<u32>,
@@ -2714,9 +2728,16 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 Entry::TypeRef { prefix, sym, args }
             }
             CLASSINFOTPE => {
-                let c = r.read_nat().unwrap_or(0);
+                let _classsym = r.read_nat().unwrap_or(0);
+                let mut parents = Vec::new();
+                while r.pos < end {
+                    match r.read_nat() {
+                        Some(p) => parents.push(p),
+                        None => break,
+                    }
+                }
                 r.pos = end;
-                Entry::ClassInfo(c)
+                Entry::ClassInfo { parents }
             }
             METHODTPE => {
                 let ret = r.read_nat().unwrap_or(0);
@@ -2885,7 +2906,13 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
         Entry::ModuleSym { info, .. } | Entry::ClassSym { info, .. } => *info,
         _ => 0,
     };
-    let (class_tparams, _) = peel_info(&entries, class_info);
+    let (class_tparams, class_info_body) = peel_info(&entries, class_info);
+    let extends_anyval = match entries.get(class_info_body as usize) {
+        Some(Entry::ClassInfo { parents }) => parents
+            .iter()
+            .any(|p| type_of(&entries, *p, 0).name == "AnyVal"),
+        _ => false,
+    };
 
     let mut methods = Vec::new();
     for e in &entries {
@@ -2963,6 +2990,7 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
         is_module,
         tparams: class_tparams,
         methods,
+        extends_anyval,
     })
 }
 

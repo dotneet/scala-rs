@@ -1332,7 +1332,13 @@ pub(crate) fn value_class_of(ty: &Type, st: &SymbolTable) -> Option<SymbolId> {
         Type::Annotated { tpe, .. } => return value_class_of(tpe, st),
         _ => return None,
     };
-    (st.source_value_classes.contains(&sym) && st.is_value_class(sym)).then_some(sym)
+    // A value class the prelude models is excluded: `StringOps` and `ArrayOps`
+    // are identity conversions over their underlying value there, and boxing
+    // one would hand `println` a `StringOps` where nsc has a `String`. Every
+    // other value class -- one this run compiles, and one that arrives from
+    // `-cp` -- gets the real boxed representation, which is what its own class
+    // file and its `$extension` statics were compiled against.
+    (sym.0 >= st.prelude_end && st.is_value_class(sym)).then_some(sym)
 }
 
 /// The box/unbox conversion erasure owes a value of erased type `got` that has

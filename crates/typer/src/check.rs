@@ -121,6 +121,11 @@ pub struct ClasspathClass {
     /// the only place the inheritance graph survives intact.
     pub super_name: Option<String>,
     pub interfaces: Vec<String>,
+    /// The pickle names `scala.AnyVal` among the parents. The class file
+    /// cannot say so -- a value class's superclass is `java/lang/Object` --
+    /// and `SymbolTable::is_value_class`, which the whole of erasure and the
+    /// `$extension` call path hang off, asks for exactly that parent.
+    pub extends_anyval: bool,
 }
 
 impl Default for TypecheckOptions {

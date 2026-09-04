@@ -2978,6 +2978,7 @@ object Main {
             is_interface: false,
             super_name: None,
             interfaces: vec![],
+            extends_anyval: false,
         };
         let nested = ClasspathClass {
             jvm_name: "enrich/package$Rich".into(),
@@ -3012,6 +3013,7 @@ object Main {
             is_interface: false,
             super_name: None,
             interfaces: vec![],
+            extends_anyval: false,
         };
         if nested_first {
             vec![nested, pkg]
