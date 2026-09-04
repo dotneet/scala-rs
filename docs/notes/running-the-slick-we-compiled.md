@@ -483,6 +483,8 @@ against.
 
 ## Where it stops now
 
+`ok=0 diff=0 fail=12` still, but the twelve programs now die in three
+different places instead of one, and two of them get real work done first.
 `p01_basic` opens the database, compiles and runs `schema.create`, and inserts
 both ways:
 
@@ -492,26 +494,49 @@ inserted=1
 inserted=Some(2)
 ```
 
-byte-identical with the scalac-built slick, and then
+byte-identical with the scalac-built slick (`p07_caseclass` prints `ins=1` /
+`ins=Some(2)` the same way). Then:
 
-```text
-ClassCastException: class slick.ast.ProductNode cannot be cast to
-  class slick.ast.ResultSetMapping
-    at slick.ast.ResultSetMapping.withInferredType(ClientSideOp.scala)
-    at slick.ast.Node$class.infer(Node.scala)
-```
+1. **Nine of the twelve** — everything that reaches a `.result` —
 
-on `coffees.result`. `ResultSetMapping.withInferredType` is
-`slick/ast/ClientSideOp.scala`'s
+   ```text
+   ClassCastException: class slick.ast.ProductNode cannot be cast to
+     class slick.ast.ResultSetMapping
+       at slick.ast.ResultSetMapping.withInferredType(ClientSideOp.scala)
+       at slick.ast.ResultSetMapping.withInferredType(ClientSideOp.scala)
+       at slick.ast.Node$class.infer(Node.scala)
+   ```
 
-```scala
-def withInferredType(scope: Type.Scope, typeChildren: Boolean): Self
-```
+   (`p07_caseclass` and `p08_mapto` say `TypeMapping` instead of
+   `ProductNode`, `p04_groupby` says `Select`.)
+   `withInferredType` is declared `def withInferredType(scope: Type.Scope,
+   typeChildren: Boolean): Self` on `Node` and refined by each subclass's
+   `type Self`; the two `withInferredType` frames say the recursion is going
+   through the wrong one, so the cast is ours on a value that is legitimately
+   a `ProductNode`. **This is the next blocker.**
 
-— a `Self`-typed method whose implementation returns a rebuilt node, so the
-cast to `ResultSetMapping` is ours, on a value that is legitimately a
-`ProductNode`. Two frames of `withInferredType` in the trace say the recursion
-is going through the wrong `Self`. That is the next slice.
+2. **`p09_plainsql`** —
+
+   ```text
+   VerifyError: Type 'slick/jdbc/ActionBasedSQLInterpolation' is not
+     assignable to 'scala/StringContext'
+       Location: slick/jdbc/ActionBasedSQLInterpolation.sqlu(…) @2: invokestatic
+   ```
+
+   The instance method we emit beside a *source* value class's `$extension`
+   statics pushes `this` where the underlying value belongs:
+   `aload_0; aload_1; invokestatic sql$extension(StringContext, Seq)`. It
+   needs the accessor first. Byte-identical on `main`, so this one is
+   independent of the value-class work.
+
+3. **`p10_types`** — `NoSuchMethodError:
+   RelationalProfile$ColumnOption$Length$.apply$default$2()`, on
+   `O.Length(64)`. A case class's default-argument getter on a *nested*
+   companion module.
+
+4. **`p12_mapped`** — `NoSuchMethodError:
+   RelationalTypesComponent$MappedColumnTypeFactory.base(…)`, which is
+   `agent/slickrun3`'s.
 
 ## Still open, found on the way
 
