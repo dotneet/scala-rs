@@ -1,0 +1,12 @@
+xxx!
+xx?
+x.x.
+xx,xxx
+212.0
+5.0
+unit-a
+int=3-b
+unit-c
+quote/9
+bare/12
+bare/12

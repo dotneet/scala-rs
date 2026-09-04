@@ -5316,14 +5316,20 @@ impl<'a> Gen<'a> {
                 {
                     continue;
                 }
-                // A trait's `val` / `lazy val` is an interface *method* too --
-                // slick declares `lazy val MappedColumnType:
-                // MappedColumnTypeFactory` in `RelationalTypesComponent` and
-                // narrows it in `JdbcProfile`, so the getter needs the bridge
-                // just as much as a `def` would.
+                // A `val` / `lazy val` is reached through its getter, so it
+                // needs the bridge just as much as a `def` does -- in a
+                // *class* parent as much as in a trait one. slick's
+                // `JdbcStatementBuilderComponent.QueryBuilder` declares
+                // `protected val quotedJdbcFns: Option[Seq[JdbcFunction]]` and
+                // `H2Profile`'s subclass narrows it to `Some[Nil.type]`;
+                // without the wide getter the base class's own `expr` read its
+                // own field and quoted every JDBC function
+                // (`{fn length("NAME")}` where H2 wants `length("NAME")`).
+                // A private member is not overridden at all, so it is left
+                // alone.
                 let pdesc = match ps.kind {
                     SymKind::Method => method_desc_from_sym(self.st, pmid),
-                    SymKind::Term if is_interface_sym(self.st, parent) => {
+                    SymKind::Term if !ps.flags.contains(Flags::PRIVATE) => {
                         format!("(){}", jvm_desc(self.st, &ps.ty))
                     }
                     _ => continue,
@@ -5589,6 +5595,17 @@ impl<'a> Gen<'a> {
                 } else {
                     param_adapt(self.st, &child_ret, &ret)
                 };
+                // A `Unit` result is `V` in the implementation's own
+                // descriptor -- the call leaves nothing on the stack -- while
+                // the bridge owes a reference. nsc pushes `BoxedUnit.UNIT`
+                // there. `param_adapt`'s `Unit` rule is the *parameter* one (a
+                // `Unit` argument really does arrive as a `BoxedUnit`
+                // reference) and has nothing to say about the result:
+                // `object SetUnit extends SetParameter[Unit]`, whose
+                // `SetParameter[-T] extends ((T, PositionedParameters) =>
+                // Unit)`, got `invokevirtual apply(…)V; areturn` --
+                // `VerifyError: Operand stack underflow`.
+                let fill_unit = cdesc.ends_with(")V") && !pdesc.ends_with(")V");
                 let mut locals = 1u16;
                 let mut loads = Vec::new();
                 let mut casts: Vec<Adapt> = Vec::new();
@@ -5621,6 +5638,9 @@ impl<'a> Gen<'a> {
                             }
                         }
                         asm.invokevirtual(&class_c, &name, &cdesc_c);
+                        if fill_unit {
+                            emit_boxed_unit(asm);
+                        }
                         emit_adapt(asm, &ret_adapt);
                         emit_return(asm, &ret);
                     },
@@ -10028,7 +10048,14 @@ fn gen_apply(
             }
             None => false,
         };
-    gen_receiver(asm, frame, ctx, fun);
+    // A value class calling another of its own methods reaches it as an
+    // `$extension` static, whose first argument is the *underlying* value --
+    // and `this` is the box. `gen_value_self_receiver` is the one place the
+    // two representations meet; everywhere else a value-class-typed expression
+    // has already been erased to its underlying.
+    if !gen_value_self_receiver(asm, ctx, fun) {
+        gen_receiver(asm, frame, ctx, fun);
+    }
     if let TreeKind::Select { qual, .. } = &fun.kind {
         // `ArrayOps.toList` / `toSet` / `toVector` / `toBuffer` / `sum` /
         // `product` / `min` / `max` / `minBy` / `maxBy` / `mkString` /
@@ -11093,6 +11120,71 @@ fn count_value_ext_args(desc: &str) -> usize {
         }
     }
     n.saturating_sub(1)
+}
+
+/// Push the receiver of a call from inside `class C(val u: U) extends AnyVal`
+/// to another of `C`'s own methods, which goes out as `m$extension(u, …)`.
+/// Answers whether it pushed one; the caller falls back to `gen_receiver`.
+///
+/// `this` inside a value class denotes the *box*, and the `$extension` static
+/// wants the underlying value. nsc emits `aload_0; invokevirtual u()` in the
+/// instance method and the bare underlying slot in the `$extension` static.
+/// Without this, `def a(n: Int) = b(n)` handed `b$extension(U, int)` a `C`:
+/// the instance method passed `this` straight through, and the `$extension`
+/// re-boxed slot 0 with a `new C(u)` it had just been handed unwrapped. The
+/// first shape is a `VerifyError` when the parameter is a class; the second
+/// only fails at run time whenever `U` is an interface, since JVMS 4.10.1.2
+/// makes every reference assignable to one.
+fn gen_value_self_receiver(asm: &mut Assembler, ctx: &EmitCtx, fun: &Tree) -> bool {
+    if fun.sym.is_none() {
+        return false;
+    }
+    let owner = ctx.st.get(fun.sym).owner;
+    if owner != ctx.class_sym || !ctx.st.is_value_class(owner) {
+        return false;
+    }
+    if ctx.st.get(fun.sym).flags.contains(Flags::STATIC) {
+        return false;
+    }
+    if !receiver_is_bare_this(fun) {
+        return false;
+    }
+    let Some(&f) = ctx.st.get(owner).ctor_fields.first() else {
+        return false;
+    };
+    // In an `$extension` static the underlying value *is* slot 0. A lambda
+    // lifted out of one holds the box instead (`load_this` built it when the
+    // capture was made), which is what `ctx.outer*` distinguishes.
+    if ctx.outer.is_none() && ctx.outer_slot.is_none() {
+        if let Some((_, _, sort)) = &ctx.value_ext {
+            load(asm, 0, *sort);
+            return true;
+        }
+    }
+    let under = ctx.st.get(f).ty.clone();
+    load_this(asm, ctx);
+    asm.invokevirtual(
+        &class_internal(ctx.st, owner),
+        &ctx.st.get(f).name,
+        &format!("(){}", jvm_desc(ctx.st, &under)),
+    );
+    true
+}
+
+/// Whether the callee's receiver is the enclosing template's own `this`,
+/// written or implied. `TypeApply` / `Typed` wrappers are peeled the same way
+/// `gen_receiver` peels them.
+fn receiver_is_bare_this(fun: &Tree) -> bool {
+    match &fun.kind {
+        TreeKind::TypeApply { fun: inner, .. } | TreeKind::Typed { expr: inner, .. } => {
+            receiver_is_bare_this(inner)
+        }
+        TreeKind::Select { qual, .. } => {
+            matches!(&qual.kind, TreeKind::This { qual: None })
+        }
+        TreeKind::Ident { .. } => true,
+        _ => false,
+    }
 }
 
 fn box_value_class_receiver(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId, qual: &Tree) {
