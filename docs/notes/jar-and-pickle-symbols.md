@@ -167,3 +167,86 @@ Symbols with an empty `pickled_origin` (prelude, source, or classfile derived) a
 completely alone. Because we group **by declaration rather than by name**, genuine
 overloads stay as two, and if they cannot be resolved we still emit `ambiguous overload`
 as before (`am_pickledup_bad.scala`).
+
+### Reading `StringOps` from the jar (`agent/stringops8`)
+
+`"abcdef".zipWithIndex` / `.sliding(2)` / `.groupBy(identity)` / `.sortBy(…)` /
+`.collect { … }` and many others were all coming out as `is not a member of String`.
+The cause was that `StringOps` was **hand-written in the prelude**: every missing method
+had to be added by hand, which structurally guaranteed a never-ending stream of gaps.
+
+**Conclusion: we can move it to reading from the jar. And that was the right fix.**
+
+The reading machinery already existed. `crates/pickle` (the `ScalaSignature` reader) and
+`crates/typer/src/pickle_supply.rs` ("supply a member from the pickle, on demand, only if
+the prelude does not have it") were both in place, and that is how gaps in `List` and
+friends get filled. All that was missing was **the connection**:
+
+- `Check::supply_from_pickle` only ever asked the **receiver's** type.
+  The receiver of `"abc".groupBy(f)` is `java.lang.String`, which has no
+  `ScalaSignature`, so it always came back empty-handed
+  (`[pickle] #groupBy: asking String (java/lang/String)`).
+- `Check::search_extension`, which searches implicit-conversion candidates, only did a
+  `lookup_member` against the conversion's **result** (`StringOps`) and never asked the
+  pickle at all.
+
+So I added one place in `search_extension`: ask the conversion result's pickle, but only
+when the prelude has nothing. `pickle_supply`'s three principles (the prelude always wins,
+never supply what cannot be represented, never read ahead) are untouched.
+
+This works because the prelude keeps hold of `StringOps`'s **class shell**
+(`parents = [AnyVal]` and `ctor_fields = [repr: String]`). `SymbolTable::is_value_class`
+is decided by exactly those two, and the backend's `invoke_value_extension` →
+`value_extension_desc` implements the 2.13 convention verbatim — build the descriptor from
+the symbol's type, prepend the receiver's `Ljava/lang/String;`, and invokestatic
+`<name>$extension` — so members installed by the pickle **link correctly as they are**
+(a pickle-derived symbol carries the erased descriptor read from the classfile in its
+`jvm_name`, and `method_desc_from_sym` prefers that). It also does not collide with the
+constraint that `ensure_class` must not rebuild an existing symbol.
+
+One more thing: `Predef.wrapString` did not have `low_priority` set. `javap` confirms that
+`wrapString` is declared in `scala.LowPriorityImplicits` while `augmentString` is declared
+in `Predef$`, so when both have the member, nsc's rule is that `StringOps` wins. The
+comment in `search_extension` described that rule, but with the flag unset it could not
+act on it (only the `intWrapper` family had it set). Until this was fixed, `groupBy` failed
+as "ambiguous, supplied by both `StringOps` and `WrappedString`".
+
+**Only what the pickle cannot express** stays hand-written, in
+`crates/typer/src/prelude_stringops8.rs`. 2.13's `StringOps` has
+**overloads that differ only in their return type**, and since `erased_desc` looks members
+up by the erasure of the *arguments*, it finds two, cannot tell them apart, and declines to
+supply (which is the correct call for `pickle_supply`).
+But a declined member then falls through to the lower-priority `wrapString` and comes back
+as a `WrappedString`, so `"abcdef".collect { case c if c > 'c' => c }` produced
+`Vector(d, e, f)` instead of scalac's `"def"`. **A wrong type is worse than no type**, so
+these are declared as **two symbols**, the same way `map` is in `prelude_strmap.rs`:
+
+| What stayed hand-written | Why |
+|---|---|
+| `collect` × 2 | Overloads differing only in return type (`String` / `IndexedSeq[B]`) |
+| `withFilter` and `StringOps$WithFilter` | The result is an ordinary class, and its `map` has the same double erasure |
+| `addString` × 3 | The pickled shape of `mutable.StringBuilder` does not line up |
+| `apply(Int): Char` | There is no corresponding instance method on the classfile side |
+
+To resolve the `collect` overloads I extended the `Infer.pretypeArgs`-equivalent
+pre-typing that `map` uses to cover `PartialFunction` as well (`agreed_pf_param`).
+A PF's parameter is a **class**, not a `Type::Function`, so `agreed_lambda_params` bailed
+out and the more specific `Char` version won no matter what the case block's body returned.
+
+I also fixed the indexing syntax `"abcdef"(1)`. `s.apply(1)` worked while `s(1)` gave
+`value apply is not a member of String`, because the `Apply` path only looked for `apply`
+when the receiver was a `Type::Class` and never tried implicit conversions
+(`retry_apply_extension`).
+
+Until `StringOps$WithFilter` was added to `is_with_filter_ty`, `withFilter`'s result type
+was being overwritten with the **receiver** (`StringOps`, which erases to `String`), so the
+following `.map` emitted a `checkcast java/lang/String` against a real
+`StringOps$WithFilter` and threw `ClassCastException`.
+
+dual-run: `so8` (the expected output is **real scalac 2.13.16's output verbatim**, matching
+under `java -Xverify:all`). The rejecting case is `so8_bad` (merely "resolving" a
+return-type-only overload is not enough: a case block returning `Int` selects
+`IndexedSeq[B]`, which cannot be bound to a `String`).
+**The private runtime (`--no-scala-library`) has no `StringOps` at all**, so `so8.scala`
+produces 40 diagnostics there (it is not silently accepted).
+slick: `errors=518 → 516`.
