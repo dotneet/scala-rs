@@ -29,6 +29,10 @@ pub struct EmitOpts {
     /// Concrete trait members from every unit in the run; `None` means this
     /// unit only. Shared for the same reason (9% of the compile).
     pub trait_members: Option<Rc<TraitImpls>>,
+    /// JVM internal name -> class-like symbol, for the whole table. A pure
+    /// function of `st`, which does not change while a run is emitted, so the
+    /// driver builds it once; `None` builds it here.
+    pub jvm_index: Option<Rc<HashMap<String, SymbolId>>>,
 }
 
 /// Walk a typed compilation unit and emit classes (private-runtime ABI).
@@ -175,7 +179,9 @@ pub fn emit_opts(
         // `scala.runtime.*Ref` exists in both ABIs: on the jar, and as a
         // private-runtime classfile (see `runtime::REF_BOXES`).
         boxed_vars: collect_boxed_vars(tree, st),
-        jvm_index: build_jvm_index(st),
+        jvm_index: opts
+            .jvm_index
+            .unwrap_or_else(|| Rc::new(build_jvm_index(st))),
     };
     g.walk(tree);
     g.emit_anon_classes(tree);
@@ -208,14 +214,14 @@ struct Gen<'a> {
     boxed_vars: HashSet<SymbolId>,
     /// JVM internal name → class-like symbol, for the whole symbol table.
     /// Built once; used to compute `InnerClasses`/`EnclosingMethod`.
-    jvm_index: HashMap<String, SymbolId>,
+    jvm_index: Rc<HashMap<String, SymbolId>>,
 }
 
 /// JVM internal name → class-like symbol, for every `Class`/`ModuleClass` in
 /// `st` (the current unit plus everything installed from the classpath).
 /// Built once per [`Gen`] and consulted by [`ClassBuilder::finish_full`] to
 /// compute `InnerClasses` entries without a linear scan per classfile.
-fn build_jvm_index(st: &SymbolTable) -> HashMap<String, SymbolId> {
+pub fn build_jvm_index(st: &SymbolTable) -> HashMap<String, SymbolId> {
     let mut m = HashMap::new();
     for s in &st.symbols {
         if matches!(s.kind, SymKind::Class | SymKind::ModuleClass) {

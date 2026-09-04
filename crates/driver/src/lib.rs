@@ -284,6 +284,9 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
     // holds every trait's concrete members and copying it per unit was 9% of
     // the compile.
     let trait_members = std::rc::Rc::new(trait_members);
+    // Same story: a pure function of the (now frozen) symbol table, and it was
+    // rebuilt from scratch for each of the run's units.
+    let jvm_index = std::rc::Rc::new(scala_rs_backend::gen::build_jvm_index(st));
     for u in &units {
         let src_name = source_file_name(&sources[u.file_index]);
         emitted.extend(emit_opts(
@@ -294,6 +297,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 library_abi,
                 pickles: std::rc::Rc::clone(&u.pickles),
                 trait_members: Some(std::rc::Rc::clone(&trait_members)),
+                jvm_index: Some(std::rc::Rc::clone(&jvm_index)),
             },
         ));
     }
@@ -324,10 +328,17 @@ pub fn write_emitted(emitted: &[EmittedClass], out_dir: &Path) -> std::io::Resul
         return Ok(());
     }
     std::fs::create_dir_all(out_dir)?;
+    // slick emits 4552 classes into a few dozen directories, and
+    // `create_dir_all` walks and stats the whole chain every time it is called.
+    // Nothing removes a directory while this runs, so once is enough.
+    let mut made: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for c in emitted {
         let dest = class_path(out_dir, &c.internal_name);
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+            if !made.contains(parent) {
+                std::fs::create_dir_all(parent)?;
+                made.insert(parent.to_path_buf());
+            }
         }
         std::fs::write(&dest, &c.bytes)?;
     }
