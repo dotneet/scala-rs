@@ -379,3 +379,173 @@ one that arrives from `-cp` is not recognised at all. That is the next slice.
   receiver**: the object's inherited members are attributed to the class.
   Both spellings of the fix in item 4 above leave this one alone, and it is a
   different defect from `cats.effect.IO`'s (whose companion link was intact).
+
+# Value classes from `-cp`, and three erasure rules behind them (`agent/cpvalueclass`)
+
+## The blocker: `extends AnyVal` lives only in the pickle
+
+The diagnosis above named `note_source_value_classes`, and that is only half
+of it. The gate it holds never came into play, because
+`SymbolTable::is_value_class` was already answering **no** for
+`fs2.Stream.PartiallyAppliedFromIterator`. It asks for two things, and a value
+class arriving on `-cp` had neither.
+
+* **The `AnyVal` parent.** A value class's class file says
+  `extends java/lang/Object` and lists no interfaces — nothing in it
+  distinguishes `class Meters(val n: Int) extends AnyVal` from a plain final
+  class. The parent survives only in the `ScalaSignature`, and both readers
+  dropped it: the eager one (`backend::pickle::unpickle`) read
+  `CLASSINFOtpe`'s class symbol and discarded the `{tpe_Ref}` parent list that
+  follows, and the lazy one (`pickle_supply::attach_parents`) converted
+  `scala.AnyVal` and then skipped it, because it only accepted a
+  `Type::Class`.
+* **The single constructor field.** It is built from the pickled constructor,
+  and only *top-level* class files carry a `ScalaSignature`. A **nested**
+  value class — `fs2.Stream.PartiallyAppliedFromIterator`, and every one of
+  slick's — is adopted from its class file alone. Its one field is `private`,
+  which `parse_java_classfile` drops, so `JavaClass` now keeps the sole
+  non-static field whatever its access. That field *is* the class's
+  representation, its descriptor is the underlying type, and its name (after
+  the last `$$`, for a nested class's expanded name) is the accessor
+  `$vcunbox` calls.
+
+`value_class_of` then stops gating on `source_value_classes` and gates on
+`prelude_end`, which is what the comment there was really describing: the
+exclusion exists for `StringOps` / `ArrayOps` / `RichInt`, which the prelude
+models as identity conversions over their underlying value. A value class read
+from a class file is not one of those.
+
+Last, the call. An `$extension` on a companion module takes the receiver as
+its first *argument*, so the module has to sit under the receiver **and**
+under the arguments that follow. The old code pushed it afterwards and
+shuffled with `dup_x2; pop`, which is correct for exactly one argument;
+`apply$extension(Z, Iterator, I)` came out as `[recv, MODULE$, it, n]`. It is
+now pushed before the receiver is evaluated, which is what nsc emits too. The
+rule that was spelled "the JVM name contains a `$`" is now named
+`value_extension_module`: nsc emits static forwarders on the value class
+itself only for a **top-level** one, so a nested one can only be reached
+through the module.
+
+This is much wider than fs2. `cats.syntax.FlatMapOps` is a value class too, so
+every `>>` in slick's cats-effect layer was being compiled as an instance call
+on a `checkcast`ed `Object`.
+
+Regression test: `crates/cli/tests/cpvalueclass.rs`, which builds a stand-in
+library with real scalac (`tests/fixtures/cpvalueclass_lib.scala`) — a value
+class over a primitive, one over a reference, one that also extends a
+universal trait, and the fs2 shape nested in an object — compiles the same
+client with both compilers against it, and compares stdout byte for byte.
+
+## Three more, one line of `p01_basic` apart
+
+Removing the blocker moved the harness three times. All three were already on
+`main`; none is a regression from the value-class work.
+
+1. **The dominator of a compound type.** SLS 3.7 / nsc's
+   `intersectionDominator` is not `parents.head`: it is the first parent that
+   is a class rather than a trait *and* that no other parent is a subclass of;
+   if none is a class, the first unshadowed one. slick's
+
+   ```scala
+   implicit def tableQueryToTableQueryExtensionMethods[T, U](
+     q: Query[T, U, Seq] & TableQuery[T]): TableQueryExtensionMethods[T, U]
+   ```
+
+   erases its parameter to `TableQuery`, because `TableQuery <: Query` shadows
+   `Query`. We wrote `Query`, and the client — compiled by real scalac against
+   nsc's slick — got `NoSuchMethodError:
+   JdbcProfile$JdbcAPI.tableQueryToTableQueryExtensionMethods(slick.lifted.TableQuery)`
+   on `coffees.schema`, the first line of all twelve programs.
+
+2. **A bridge for an inherited member whose *parameter* was narrowed.**
+   `emit_inherited_covariant_bridges` bridged covariant *results* only, so
+   `H2Profile$` implemented
+   `createSchemaActionExtensionMethods(SqlProfile$DDL)` — the type
+   `SqlProfile` fixes the abstract `SchemaDescription` to — and nothing at the
+   descriptor `RelationalActionComponent` declares. `AbstractMethodError` on
+   `schema.create`. nsc's bridge takes the wide descriptor and `checkcast`s
+   each narrowed argument.
+
+3. **A lambda parameter still typed as a tuple after erasure** had its
+   `checkcast` hard-coded to `scala/Tuple2` — in two places in `gen.rs`.
+   slick's
+   `Resource.makeCase(acquireStreamContextAndIterator(a)){…}.map(_._2)` cast a
+   `Tuple3` parameter to `Tuple2` and then called `Tuple3._2` on it, and the
+   verifier threw `BasicBackend$BasicDatabaseDef$class.$anonfun$5` out whole.
+   It reproduces in nine lines with no classpath: the arity is lost only when
+   the type argument is *written* (`Box.mk[(A, B, C)](…)`), not when it is
+   inferred.
+
+`tests/fixtures/erasure3.scala` + `crates/cli/tests/erasure3.rs` check all
+three against real scalac 2.13.16 — stdout for what stdout can see, and
+`javap` for the two descriptors only a separately compiled caller links
+against.
+
+## Where it stops now
+
+`ok=0 diff=0 fail=12` still, but the twelve programs now die in three
+different places instead of one, and two of them get real work done first.
+`p01_basic` opens the database, compiles and runs `schema.create`, and inserts
+both ways:
+
+```text
+create table "COFFEES" ("COF_NAME" VARCHAR NOT NULL PRIMARY KEY,"PRICE" DOUBLE NOT NULL)
+inserted=1
+inserted=Some(2)
+```
+
+byte-identical with the scalac-built slick (`p07_caseclass` prints `ins=1` /
+`ins=Some(2)` the same way). Then:
+
+1. **Nine of the twelve** — everything that reaches a `.result` —
+
+   ```text
+   ClassCastException: class slick.ast.ProductNode cannot be cast to
+     class slick.ast.ResultSetMapping
+       at slick.ast.ResultSetMapping.withInferredType(ClientSideOp.scala)
+       at slick.ast.ResultSetMapping.withInferredType(ClientSideOp.scala)
+       at slick.ast.Node$class.infer(Node.scala)
+   ```
+
+   (`p07_caseclass` and `p08_mapto` say `TypeMapping` instead of
+   `ProductNode`, `p04_groupby` says `Select`.)
+   `withInferredType` is declared `def withInferredType(scope: Type.Scope,
+   typeChildren: Boolean): Self` on `Node` and refined by each subclass's
+   `type Self`; the two `withInferredType` frames say the recursion is going
+   through the wrong one, so the cast is ours on a value that is legitimately
+   a `ProductNode`. **This is the next blocker.**
+
+2. **`p09_plainsql`** —
+
+   ```text
+   VerifyError: Type 'slick/jdbc/ActionBasedSQLInterpolation' is not
+     assignable to 'scala/StringContext'
+       Location: slick/jdbc/ActionBasedSQLInterpolation.sqlu(…) @2: invokestatic
+   ```
+
+   The instance method we emit beside a *source* value class's `$extension`
+   statics pushes `this` where the underlying value belongs:
+   `aload_0; aload_1; invokestatic sql$extension(StringContext, Seq)`. It
+   needs the accessor first. Byte-identical on `main`, so this one is
+   independent of the value-class work.
+
+3. **`p10_types`** — `NoSuchMethodError:
+   RelationalProfile$ColumnOption$Length$.apply$default$2()`, on
+   `O.Length(64)`. A case class's default-argument getter on a *nested*
+   companion module.
+
+4. **`p12_mapped`** — `NoSuchMethodError:
+   RelationalTypesComponent$MappedColumnTypeFactory.base(…)`, which is
+   `agent/slickrun3`'s.
+
+## Still open, found on the way
+
+* **A `-cp` method whose *parameter* is a value class** is installed at its
+  erased descriptor, so the call is declined: `def box(m: Meters): Any` on the
+  classpath is "no matching overload for (Int)AnyRef with arguments (Meters)".
+  The pickled parameter type (`Meters`) is available and is not being
+  preferred over the class file's `(I)`.
+* **A boxed value class reaching a lambda is not unboxed.**
+  `List(new Meters(5), new Meters(6)).map(_.raw)` hands `raw$extension(I)` a
+  `Meters`. This one fails identically with the value class declared in
+  *source*, on plain `main`, so it is not about `-cp` at all.

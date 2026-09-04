@@ -1955,6 +1955,9 @@ impl PickleSupply {
     /// Give a class the parents its own pickle declares, if it does not have
     /// them already.
     ///
+    /// See [`ensure_value_class_field`] for the other half of recognising a
+    /// value class that arrives on `-cp`.
+    ///
     /// The prelude declares `immutable.Set` without `collection.Set` above it,
     /// so `Set#&`, whose parameter is `collection.Set[A]`, could be supplied
     /// but never called. Attaching the pickled parents closes that gap, and it
@@ -1992,6 +1995,37 @@ impl PickleSupply {
                 trace(format_args!("{full}: parent {sym} unconvertible"));
                 continue;
             };
+            // `extends AnyVal` lives *only* in the pickle. A value class's
+            // class file has `java/lang/Object` for a superclass and no
+            // interfaces, so `java_parents` reads `AnyRef` and nothing else --
+            // and `SymbolTable::is_value_class`, which asks for an `AnyVal`
+            // parent, answered no for every value class that arrives on `-cp`.
+            // The whole of erasure hangs off that answer: `Stream$.fromIterator`
+            // really has the descriptor `()Z`, and its result was being cast to
+            // `Stream$PartiallyAppliedFromIterator` and called as an instance.
+            // The *library* is left alone, prelude symbol or not: the prelude
+            // models scala-library's value classes by hand, and the ones it
+            // models as ordinary classes it models that way on purpose.
+            // `scala.concurrent.duration.package$DurationInt` is a value class
+            // whose twenty unit methods come from the universal trait
+            // `DurationConversions`, so nsc emits **no** `$extension` for them
+            // and calls them on a real instance; deriving "value class" from
+            // its pickle sent `5.seconds` to a `seconds$extension` that does
+            // not exist (`crates/cli/tests/durrange.rs`).
+            if matches!(t, Type::AnyVal) {
+                if class_sym.0 >= st.prelude_end
+                    && !st.get(class_sym).jvm_name.starts_with("scala/")
+                    && !st.get(class_sym).parents.iter().any(|q| {
+                        matches!(q, Type::AnyVal)
+                            || st.class_sym_of(q).is_some_and(|c| c == st.anyval_sym)
+                    })
+                {
+                    trace(format_args!("{full}: attaching pickled parent AnyVal"));
+                    st.get_mut(class_sym).parents.push(Type::AnyVal);
+                    ensure_value_class_field(st, bin, class_sym);
+                }
+                continue;
+            }
             let Type::Class { sym: psym, .. } = &t else {
                 continue;
             };
@@ -3679,6 +3713,56 @@ fn ctor_has_unresolved_param(st: &SymbolTable, ctor: SymbolId) -> bool {
             .params
             .iter()
             .any(|p| unresolved(&st.get(*p).ty))
+}
+
+/// Give a `-cp` value class the single constructor field that *is* its
+/// representation.
+///
+/// `SymbolTable::is_value_class` asks for an `AnyVal` parent **and** exactly
+/// one constructor field, and `value_class_underlying` reads that field's type
+/// to decide what the class erases to. The eager `-cp` installer builds the
+/// field from the pickled constructor (`classpath::install_ctor`), but only
+/// top-level class files carry a `ScalaSignature`: a *nested* value class --
+/// `fs2.Stream.PartiallyAppliedFromIterator`, and every one of slick's -- is
+/// adopted from its class file alone and so has no constructor field at all.
+///
+/// The class file does have it. nsc compiles the single `val` to one private
+/// final instance field, so that field's descriptor is the underlying type.
+/// Its name is expanded for a nested class
+/// (`fs2$Stream$PartiallyAppliedFromIterator$$blocking`); the source name is
+/// what follows the last `$$`, which is the name the accessor carries too.
+///
+/// The symbol is allocated ownerless and then re-owned, the way
+/// `stub_nested_module` does it: entering it in the class's member list would
+/// put a second `blocking` next to the accessor the pickle supplies, and
+/// member lookup would have to choose between them.
+fn ensure_value_class_field(st: &mut SymbolTable, bin: &mut BinaryIndex, class_sym: SymbolId) {
+    if !st.get(class_sym).ctor_fields.is_empty() {
+        return;
+    }
+    let internal = st.get(class_sym).jvm_name.clone();
+    if internal.is_empty() {
+        return;
+    }
+    let Ok(Some(bytes)) = bin.find_class(&internal) else {
+        return;
+    };
+    let Ok(jc) = parse_java_classfile(&bytes) else {
+        return;
+    };
+    let Some(f) = jc.sole_instance_field.clone() else {
+        return;
+    };
+    let name = f.name.rsplit("$$").next().unwrap_or(&f.name).to_string();
+    let ty = crate::classpath::field_ty_from_desc(st, &f.desc);
+    let fid = st.alloc(&name, SymbolId::NONE, SymKind::Term, Flags::EMPTY, "");
+    st.get_mut(fid).owner = class_sym;
+    st.get_mut(fid).ty = ty;
+    st.get_mut(class_sym).ctor_fields = vec![fid];
+    trace(format_args!(
+        "{internal}: value class field {name}{}",
+        f.desc
+    ));
 }
 
 #[cfg(test)]
