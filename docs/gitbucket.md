@@ -77,9 +77,10 @@ path of your own.**
 | At the start | 354 | 0 | **35** | 13 | 0 |
 | After the first survey | 353 | 1 | **3261** | 256 | 0 |
 | main at `56174d5` (Twirl, the two slick-run slices and scalalib merged) | 353 | 1 | **2373** | 188 | 0 |
-| Now | 353 | 1 | **1859** | 186 | 0 |
+| main at `1a494fb` (the five slick-through-the-jar roots merged) | 353 | 1 | **1859** | 186 | 0 |
+| Now | 353 | 1 | **1693** | 186 | 0 |
 
-Both of the last two rows were measured on the same tree, with the same
+Every row after the second was measured on the same tree, with the same
 material, one binary each -- `SCALA_RS=<binary> tests/gitbucket_measure.sh`
 skips the rebuild, which makes an honest before/after cheap.
 
@@ -90,17 +91,18 @@ nothing in gitbucket had been typechecked at all. This is exactly what
 honest reading of "35" is "0 files typechecked"; the honest reading of "3261"
 is "353 files typechecked, 97 of them clean".
 
-Of the 1859, **1694** are in 113 hand-written files (of 213 measured) and
-**164** — down from 1038 — are in 73 of the 140 generated templates.
+Of the 1693, **1529** are in 114 hand-written files (of 213 measured) and
+**164** — down from 1038, and unchanged since — are in 73 of the 140 generated
+templates.
 
-The worst hand-written files are `controller/AccountController.scala` (257),
-`controller/SystemSettingsController.scala` (116),
+The worst hand-written files are `controller/AccountController.scala` (179),
+`controller/SystemSettingsController.scala` (94),
 `service/IssuesService.scala` (91) and
-`controller/RepositoryViewerController.scala` (68).
+`controller/RepositoryViewerController.scala` (64).
 
 ## What was wrong, and what it cost
 
-Thirteen roots. Twelve are fixed; the counts are what each was worth when it
+Fifteen roots. Fourteen are fixed; the counts are what each was worth when it
 was removed.
 
 ### 1. An operator swallowed the comment that followed it (lexer)
@@ -421,6 +423,86 @@ was "value withTransaction is not a member of DatabaseFactory". The type
 namespace is now asked as well, whether or not the term was found — the same
 thing `expose_unqualified_type` does for a wildcard import.
 
+### 14. `object X extends X` lost the trait's own members — 1 error (pickle)
+
+The survey below named this one as worth **≈220** — the `Session` rows plus
+`withTransaction` / `withSession` — and that count was wrong by two orders of
+magnitude. The root itself was real and is fixed; what it gates is not what
+the survey thought.
+
+`SigCache::lin_of` deduplicated its linearization by class **name**, and a
+module class carries the same dotted name as its companion class. slick writes
+
+```scala
+trait JdbcBackend extends RelationalBackend { type Database = DatabaseDef }
+object JdbcBackend extends JdbcBackend
+```
+
+so `L(JdbcBackend$)` is `JdbcBackend$, JdbcBackend, RelationalBackend,
+BasicBackend, …` — and on names alone the *trait* collides with the module
+class that heads the list and is dropped. `import
+slick.jdbc.JdbcBackend.{Database => SlickDatabase}` therefore found only
+`BasicBackend`'s abstract `type Database >: Null <: DatabaseDef`, never the
+alias real scalac spells `Database (which expands to) DatabaseDef`.
+
+The survey's own observation — "the hits really are only `BasicBackend`'s, so
+reordering them changes nothing" — was exactly right, and the reason is that
+the class that declares the alias is not in the walk at all. Identity is now
+the pair `(name, module)`. Slick's cake traits are written this way
+throughout, so this is not a one-off shape.
+
+`SCALA_RS_PICKLE_DEBUG=1` now prints every hit's owner and kind, not just how
+many there were; that is the print that ended the search in one run.
+
+Two lines against the real jar:
+
+```scala
+import slick.jdbc.JdbcBackend.{Database => SlickDatabase}
+val db: SlickDatabase = SlickDatabase.forURL("jdbc:h2:mem:test")
+```
+
+### 15. One inherited implicit was offered twice — 166 errors (typer)
+
+`Typer::implicits_in_scope` walks `this`'s parents and collects each base's
+members separately, so a **declaration** in one trait stood beside the
+**definition** that implements it in another, as two candidates of the same
+name and the same type. nsc's `findMember` sees a single member.
+
+scalatra is the case:
+
+```scala
+trait ScalatraContext { implicit def request: HttpServletRequest }        // declares
+trait DynamicScope    { implicit def request: HttpServletRequest = … }    // defines
+```
+
+Neither trait is a base of the other, so root 12's rule in
+`Check::drop_overridden` — which asks for one owner to be *below* the other —
+has nothing to compare; `ScalatraFilter` mixes in both. Every `params("id")`
+in a gitbucket controller was `ambiguous implicit: request, request`, and
+`response` the same way: **129 + 40 of the 1859**. Two candidates of one name
+and one type are now one candidate, the one the linearization reaches first —
+which is also the only one that can be called, since a declaration has no
+body.
+
+The reproduction is four lines against the real scalatra jar and needs neither
+gitbucket nor slick:
+
+```scala
+abstract class C extends org.scalatra.ScalatraFilter {
+  def x: String = params("a")     // was `ambiguous implicit: request, request`
+}
+```
+
+**What was tried and is not in the tree.** Marking a pickled declaration
+`Flags::ABSTRACT` from `pflags::DEFERRED`, so that `is_deferred_member` could
+prefer the definition regardless of linearization order, made gitbucket
+**1693 → 2117**: 178 new `object creation impossible` and ~20
+`class … needs to be abstract`. The member supply collapses same-shaped hits
+into one symbol and does not always keep the concrete one, so marking the
+survivor deferred tells `check_missing_implementations` that nothing
+implements it. Whoever needs the deferred bit — and item 4 below probably
+does — has to fix the collapse first.
+
 ### The crash: `lub` had no depth cap
 
 `JGitUtil.scala` **aborted the compiler with a stack overflow and no
@@ -458,14 +540,13 @@ in a block inside the lambda, which has no stream for the guard to filter, and
 so diagnoses the shape rather than desugaring it wrongly. Three occurrences,
 one file, held out of the measurement by default.
 
-## Where the remaining 1859 are
+## Where the remaining 1693 are
 
 Counted by message shape, largest first, with the reading:
 
 | n | message | reading |
 |---|---|---|
-| 187 / 32 | `no implicit: could not find implicit value of type Session` / `BasicBackend.Session` | slick. The implicit `Session` a `withTransaction` block introduces. Downstream of the `JdbcBackend.Database` item below. |
-| 129 / 40 | `ambiguous implicit: request, request` / `response, response` | The same scalatra implicit reached twice. |
+| 187 / 31 | `no implicit: could not find implicit value of type Session` / `BasicBackend.Session` | slick. The two are **not** the same thing: the 31 name a type that resolved, the 187 print a bare `Session`, which is what an unresolved name looks like. Root 14 was supposed to be behind these and is not — see below. |
 | 79 / 62 / 23 / 18 | `ambiguous overload for referrersOnly / writableUsersOnly / ownerOnly / readableUsersOnly with arguments ((<notype>) => <notype>)` | What root 7's "not found" became. Two overloads, and the argument is a function literal whose parameter type is not inferred yet. |
 | 52 | `ambiguous overload for datetimeago with arguments (Date)` | gitbucket's own helper, same shape, and the largest single template symptom. |
 | 44 | `unimplemented syntax: named arguments (method parameters not resolved)` | Named arguments where the callee did not resolve. |
@@ -477,38 +558,37 @@ Counted by message shape, largest first, with the reading:
 
 ### What would remove the most next
 
-1. **Overload resolution against a function literal with an un-inferred
-   parameter** (≈234 errors: the `…Only` family plus `datetimeago`). nsc picks
-   the overload by arity first and then types the literal against the chosen
-   parameter type. This is also what is left in the templates: `datetimeago`
-   is the biggest template symptom that is not merely downstream.
-2. **`JdbcBackend.Database` is not read as the alias it is** (≈220 errors: the
-   `Session` rows plus `withTransaction` / `withSession`). Real scalac says
-   `slick.jdbc.JdbcBackend.Database (which expands to)
-   slick.jdbc.JdbcBackend.DatabaseDef`; `SigCache::lookup` finds only
-   `BasicBackend`'s `type Database >: Null <: DatabaseDef`, so the alias in
-   `JdbcBackend`'s own pickle is not reaching the walk at all. Two lines
-   against the real jar reproduce it:
-
-   ```scala
-   import slick.jdbc.JdbcBackend.{Database => SlickDatabase}
-   val db: SlickDatabase = SlickDatabase.forURL("jdbc:h2:mem:test")
-   ```
-
-   Preferring a `TypeAlias` hit over an `AbstractType` one, and the asking
-   class's own declaration over an inherited one, was tried and changes
-   nothing — the hits really are only `BasicBackend`'s. The next step is in
-   `crates/pickle/src/sym.rs`, not in the typer.
-3. The duplicate-implicit shape (`request, request`, ≈169) looks like a supply
-   problem rather than a search problem: the same member is reaching the
-   implicit scope twice under one name.
-4. **A `def` signature under an import that only another unit settles** (36
-   `not found: type Rep`, and the `byRepository` ambiguities that follow it).
+1. **A `def` signature under an import that only another unit settles**
+   (**≈223**: the 187 `could not find implicit value of type Session`, the 36
+   `not found: type Rep`, and the `byRepository` ambiguities that follow
+   them). This is where the "220 `Session`" errors actually live. The survey
+   that wrote this list put them behind root 14 (`JdbcBackend.Database` is not
+   read as the alias it is); fixing that root removed **one** of them. What
+   the 187 have in common is that the wanted type prints as a bare `Session`
+   while the 31 that did resolve print `BasicBackend.Session` — an implicit
+   search for a name that never resolved cannot succeed, and every one of them
+   is a controller calling a service whose `(implicit s: Session)` was built
+   under `import gitbucket.core.model.Profile.profile.blockingApi._`.
    Root 11's `val`-only rerun does not cover `def`s, because rebuilding a
    method signature is not idempotent. The principled fix is nsc's: a lazy
    completer on every symbol, annotated or not, so an import prefix forces
    exactly what it needs.
-5. **A wildcard self type offers no members** (≈44). `trait BasicTemplate {
+2. **Overload resolution against a function literal with an un-inferred
+   parameter** (≈234 errors: the `…Only` family plus `datetimeago`). nsc picks
+   the overload by arity first and then types the literal against the chosen
+   parameter type. This is also what is left in the templates: `datetimeago`
+   is the biggest template symptom that is not merely downstream.
+3. **A pickled *declaration* cannot be told from a definition** (the 41
+   `value get / update is not a member of <overload …>`, and whatever else
+   `drop_overridden` cannot separate across two unrelated traits). Root 15
+   works around it with linearization order, which is enough for an implicit
+   but not for an overload set. The bit is in the pickle
+   (`pflags::DEFERRED`); what stops us using it is that the member supply
+   collapses same-shaped hits into one symbol without preferring the concrete
+   one, so marking the survivor deferred makes
+   `check_missing_implementations` fire — measured, 1693 → 2117. Fix the
+   collapse first.
+4. **A wildcard self type offers no members** (≈44). `trait BasicTemplate {
    self: Table[?] => val userName = column[String]("USER_NAME") }` gives
    `not found: value column` and then `BaseTypedType[AnyRef]` for everything
    downstream; writing `self: Table[String] =>` works.
@@ -535,3 +615,13 @@ Counted by message shape, largest first, with the reading:
   wrong; the minimal file said so in one run, and a debug print of the
   converted alias said so in the next. Cheapest order: reproduce, then print
   what the suspected code actually returns, and only then read it.
+* Root 14 is the mirror image and worth remembering next to it: the cause was
+  right — `SigCache::lookup` really was missing the alias — and the **count**
+  was wrong by 219. Both halves have to be measured. The cheap way to tell is
+  to fix the root, measure, and then *diff the message shapes*: the 187
+  `Session` rows did not move at all, and the shape they print
+  (`of type Session`, unqualified) says they were never about the alias.
+* When a hypothesis is expensive to test but cheap to *bound*, bound it. The
+  deferred-bit experiment in root 15 cost one build and one four-minute
+  measurement to find out it was worth −424, not +166; leaving it out of the
+  tree cost nothing but writing it down.
