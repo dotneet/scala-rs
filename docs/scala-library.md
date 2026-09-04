@@ -351,9 +351,8 @@ Note that `docs/cats.md`'s headline number (3019) and `docs/gitbucket.md`'s
 
 ## The `agent/tuplelit` slice: a tuple literal is `scala.TupleN`
 
-**1997 errors in 173 files → 1969 in 172**, both measured on this branch;
-`main` had not moved (`1a494fb`), so the merge was empty and the two columns
-are the same tree with and without the change. Every other target is unchanged
+**1997 errors in 173 files → 1969 in 172**, measured on this branch merged with
+`main` at `0b57b6a` against that `main` itself. Every other target is unchanged
 to the error; see the table at the end of this section.
 
 This was the first item on the previous slice's "what to do next" list, and
@@ -458,35 +457,33 @@ in overriding`, which is polymorphic override checking, not lookup.
 
 ### The other targets, before and after this slice
 
-| | before | after |
+`main` moved twice during the slice and was merged in both times, so these are
+**the merged tree against `main` at `0b57b6a`**, measured back to back on the
+same machine — not against the branch point.
+
+| | `main` at `0b57b6a` | merged with this branch |
 |---|---|---|
+| `tests/scalalib_measure.sh -no-specialization` | `files=538 errors=1997 files_with_errors=173 classes=0` | `files=538 errors=1969 files_with_errors=172 classes=0` |
 | `tests/slick_measure.sh` | `files=184 errors=0 files_with_errors=0 classes=1596` | identical |
-| `tests/slick_run.sh` | — | `progs=12 ok=12 diff=0 fail=0` |
+| `tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0` | identical |
 | `tests/cats_measure.sh` | `files=339 skipped=1 errors=2929 files_with_errors=151 classes=0` | identical |
-| `tests/gitbucket_measure.sh` | `files=353 skipped=1 errors=1859 files_with_errors=186 classes=0` | identical |
-| `tests/scala_corpus.sh` (`CORPUS_SIZE=full`, `CORPUS_JOBS=6`) | `pos 977 · neg 640 · run 443` | identical, and the two per-test TSVs `diff` clean |
-| the same after merging `main` at `3b8d6be`, whose new `neg` scoring this predates | — | `pos 977 · neg 640 (T1 104 / T2 99 / T3 79) · run 443` |
-| `cargo test --workspace --release` | — | 149 × `test result: ok`, 1968 tests |
+| `tests/gitbucket_measure.sh` | `files=353 skipped=1 errors=1693 files_with_errors=186 classes=0` | identical |
+| `tests/scala_corpus.sh` (`CORPUS_SIZE=full`, `CORPUS_JOBS=6`) | `pos 977 · neg 640 · run 443` | identical, and the two `corpus.tsv` files `diff` clean — byte for byte, recorded diagnostic included |
+| `cargo test --workspace --release` | — | 150 × `test result: ok`, 1970 tests, 0 failures |
 
 `tests/slick_subset.sh` was not run: this slice touches no code generation
 (`crates/backend/` is untouched), so its 30 minutes would measure nothing.
 
-Both corpus columns were measured on this machine, the "before" one from the
-branch point. `run` is 443 there, not the 434 that was being quoted; the
-`corpus.tsv` files are identical test for test — byte for byte, recorded
-diagnostic included — which is the check worth running: a `run` total on its
-own moves with the per-test timeouts and with whatever else the machine is
-doing.
+Two numbers in the brief this slice was handed did not reproduce here, and
+neither is anything to do with the change: corpus `run` is **443**, not 434,
+and gitbucket is **1693**, not 1859 — the latter because `main` improved it in
+the meantime. A per-test `diff` of the corpus TSVs is the check worth running
+either way; a `run` total on its own moves with the per-test timeouts and with
+whatever else the machine is doing.
 
-`main` moved to `3b8d6be` during the slice and was merged in. It changes no
-Rust — only `docs/scala-corpus.md` and the corpus runner, which now scores
-`neg` against the `.check` text as well — so the compiler numbers above carry
-over unchanged, and the corpus was re-run on the merged tree to have one in
-the new format.
-
-Which of the checks in `.agent-brief.md` this slice actually ran: both
-measurement scripts above (compile only, `classes=0` on cats/gitbucket is
-expected while errors remain), `tests/slick_run.sh` and `tests/conform/`
+Which of the checks in `.agent-brief.md` this slice actually ran: the four
+measurement scripts above (compile only, `classes=0` on scalalib/cats/gitbucket
+is expected while errors remain), `tests/slick_run.sh` and `tests/conform/`
 (the two that execute code), the corpus, and the full workspace suite. The
 classfile-loader and `javap` sweeps in `slick_subset.sh` were skipped as above.
 
