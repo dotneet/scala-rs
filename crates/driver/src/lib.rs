@@ -7,10 +7,10 @@ use scala_rs_backend::{emit_opts, emit_runtime, load_classpath, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
-    check_local_case_class_captures, check_local_objects, erase, expand_private_names, find_mains,
-    hoist_default_receivers, lambda_lift, lazy_locals, mark_anon_captures,
-    note_source_value_classes, typecheck_units_src, uncurry, ClasspathClass, ClasspathMethod,
-    ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
+    add_value_class_companions, check_local_case_class_captures, check_local_objects, erase,
+    expand_private_names, find_mains, hoist_default_receivers, lambda_lift, lazy_locals,
+    mark_anon_captures, note_source_value_classes, typecheck_units_src, uncurry, ClasspathClass,
+    ClasspathMethod, ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -241,6 +241,15 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
             // here rather than alongside `check_local_objects`.
             for u in units.iter() {
                 diags.extend(check_local_case_class_captures(u.file_index, &u.tree, &st));
+            }
+            // nsc's `extmethods` runs before `pickler`, so a value class's
+            // `$extension` methods are part of the signature every later
+            // compilation reads. Declare them on the companion module (and
+            // synthesize that module when the source wrote none) before the
+            // pickles are taken, or scalac reading our output asserts with
+            // `no extension method found`.
+            for u in units.iter() {
+                add_value_class_companions(&u.tree, &mut st);
             }
             let pickles = std::rc::Rc::new(scala_rs_backend::pickle::pickle_all(&st));
             // Value classes are boxed across unit boundaries, so every unit's

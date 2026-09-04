@@ -2731,7 +2731,7 @@ impl<'a> Gen<'a> {
                                 self.emit_case_companion(s);
                             }
                         }
-                        TreeKind::ModuleDef { .. } => self.emit_module(s, &HashSet::new()),
+                        TreeKind::ModuleDef { .. } => self.emit_module(s, &HashSet::new(), None),
                         _ => {}
                     }
                     self.emit_anon_classes(s);
@@ -2817,7 +2817,7 @@ impl<'a> Gen<'a> {
                 self.emit_class(tree, &HashSet::new());
             }
             TreeKind::ModuleDef { .. } => {
-                self.emit_module(tree, &HashSet::new());
+                self.emit_module(tree, &HashSet::new(), None);
             }
             _ => {}
         }
@@ -2826,6 +2826,10 @@ impl<'a> Gen<'a> {
     fn walk_stats(&mut self, stats: &[Tree]) {
         let mut module_names = HashSet::new();
         let mut class_names = HashSet::new();
+        // A value class's companion -- written or synthesized -- is where nsc
+        // declares its `$extension` methods, so a module needs to know it is
+        // one before it is emitted.
+        let mut value_classes: HashMap<&String, &Tree> = HashMap::new();
         for s in stats {
             match &s.kind {
                 TreeKind::ModuleDef { name, .. } => {
@@ -2833,6 +2837,9 @@ impl<'a> Gen<'a> {
                 }
                 TreeKind::ClassDef { name, .. } => {
                     class_names.insert(name.clone());
+                    if self.st.is_value_class(s.sym) {
+                        value_classes.insert(name, s);
+                    }
                 }
                 _ => {}
             }
@@ -2847,10 +2854,21 @@ impl<'a> Gen<'a> {
                     if mods.flags.contains(Flags::CASE) && !module_names.contains(name) {
                         self.emit_case_companion(s);
                     }
+                    // A value class with no companion of its own still needs
+                    // one: that is where nsc declares (and reads) its
+                    // `$extension` methods. See `emit_value_companion`. A
+                    // `case class ... extends AnyVal` already gets one from
+                    // `emit_case_companion`, which carries the forwarders.
+                    if !module_names.contains(name)
+                        && !mods.flags.contains(Flags::CASE)
+                        && self.st.is_value_class(s.sym)
+                    {
+                        self.emit_value_companion(s);
+                    }
                     self.walk_stats(&impl_.body);
                 }
-                TreeKind::ModuleDef { impl_, .. } => {
-                    self.emit_module(s, &class_names);
+                TreeKind::ModuleDef { impl_, name, .. } => {
+                    self.emit_module(s, &class_names, value_classes.get(name).copied());
                     self.walk_stats(&impl_.body);
                 }
                 _ => {}
@@ -5851,7 +5869,16 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn emit_module(&mut self, tree: &Tree, class_names: &HashSet<String>) {
+    /// `value_class`: the `ClassDef` of the value class this module is the
+    /// companion of, when the source wrote one. Its `$extension` methods are
+    /// declared on this module (see `emit_value_companion`), so the forwarders
+    /// have to land here rather than on a synthesized companion.
+    fn emit_module(
+        &mut self,
+        tree: &Tree,
+        class_names: &HashSet<String>,
+        value_class: Option<&Tree>,
+    ) {
         let lambda_wm = self.lambda_watermark();
         let (name, mods, impl_) = match &tree.kind {
             TreeKind::ModuleDef { name, mods, impl_ } => (name, mods, impl_),
@@ -6071,6 +6098,13 @@ impl<'a> Gen<'a> {
         // same bridge a class gets, or the parent's signature stays abstract.
         self.emit_erasure_bridges(&mut b, cls);
         self.emit_inherited_covariant_bridges(&mut b, cls);
+        // A written companion of a value class holds that class's
+        // `$extension` methods, exactly as a synthesized one does.
+        if let Some(vc) = value_class {
+            if let TreeKind::ClassDef { impl_, .. } = &vc.kind {
+                self.emit_value_extension_forwarders(&mut b, vc.sym, &impl_.body);
+            }
+        }
         self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, cls, &self.pickles);
         self.out
@@ -6297,6 +6331,124 @@ impl<'a> Gen<'a> {
         });
     }
 
+    /// nsc's `extmethods` phase moves a value class's methods to
+    /// `name$extension` statics *and declares them on the class's companion
+    /// module*, synthesizing that module when the source did not write one.
+    /// Every call site nsc compiles then reads them there:
+    /// `Ops$.MODULE$.inc$extension(x)`.
+    ///
+    /// We put the statics on the value class itself, which our own call sites
+    /// use (`invoke_value_extension`) and which is fine inside one run. It is
+    /// not fine across runs: real scalac compiling `new myp.Ops(41).inc`
+    /// against a scala-rs build of `Ops` crashed at its erasure phase with
+    /// `AssertionError: no extension method found for: method inc:Int`,
+    /// because `myp.Ops$` was not there to look in. `extmethods` runs *before*
+    /// `pickler`, so the extension methods are part of the pickle scalac
+    /// reads, not something it recovers from the classfile's method table --
+    /// `value_companion::add_value_class_companions` declares them, and this
+    /// writes the classfile they name.
+    ///
+    /// The module's methods forward to the statics rather than repeating the
+    /// bodies, so there is one copy of each and both ABIs work.
+    fn emit_value_companion(&mut self, class_tree: &Tree) {
+        let class_id = class_tree.sym;
+        if class_id.is_none() || !self.st.is_value_class(class_id) {
+            return;
+        }
+        let TreeKind::ClassDef { impl_, .. } = &class_tree.kind else {
+            return;
+        };
+        let this_name = format!("{}$", class_internal(self.st, class_id));
+        let mut b = ClassBuilder::new(this_name.clone(), self.source_name);
+        b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
+        b.fields.push(Field {
+            access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
+            name: "MODULE$".into(),
+            desc: format!("L{this_name};"),
+        });
+        let comp = self
+            .st
+            .companion_module(class_id)
+            .map(|m| module_class_id(self.st, m));
+        self.emit_module_init(&mut b, comp.unwrap_or(class_id), &[], &[], None, comp);
+        self.emit_module_clinit(&mut b);
+        self.emit_value_extension_forwarders(&mut b, class_id, &impl_.body);
+        // The value class's own pickle, which describes the companion too --
+        // the same thing `emit_case_companion` attaches. A Scala classfile
+        // with no signature at all is read as a *Java* class, and the Java
+        // symbol then collides with the `object` the class's pickle declares.
+        attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
+        self.out
+            .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
+    }
+
+    /// One instance method per `$extension` static on the value class, with
+    /// the same descriptor, forwarding to it. Kept in step with what
+    /// `emit_value_extension` and `emit_value_class_methods` put on the class.
+    fn emit_value_extension_forwarders(
+        &mut self,
+        b: &mut ClassBuilder,
+        class_id: SymbolId,
+        body: &[Tree],
+    ) {
+        let class_jvm = class_internal(self.st, class_id);
+        let Some(under) = self.st.value_class_underlying(class_id) else {
+            return;
+        };
+        let udesc = jvm_desc_val(self.st, &under);
+        let mut todo: Vec<(String, String)> = Vec::new();
+        for stt in body {
+            let TreeKind::DefDef { name, rhs, .. } = &stt.kind else {
+                continue;
+            };
+            if rhs.is_empty() || name == "<init>" || name == "<clinit>" {
+                continue;
+            }
+            // Raw name: `add_code` and `invokestatic` both run it through
+            // `encode_method_name`, exactly as `emit_value_extension` does
+            // for the static this forwards to.
+            todo.push((
+                format!("{name}$extension"),
+                value_extension_desc(self.st, stt.sym),
+            ));
+        }
+        for (n, d) in [
+            ("hashCode$extension", format!("({udesc})I")),
+            ("equals$extension", format!("({udesc}Ljava/lang/Object;)Z")),
+        ] {
+            if !todo.iter().any(|(m, _)| m == n) {
+                todo.push((n.to_string(), d));
+            }
+        }
+        for (name, desc) in todo {
+            let sorts = desc_param_sorts(&desc);
+            let ret = desc_ret_sort(&desc);
+            // Slot 0 is the module instance; the static's arguments start at 1.
+            let mut slot = 1u16;
+            let mut loads = Vec::new();
+            for s in &sorts {
+                loads.push((slot, *s));
+                slot += s.slots();
+            }
+            let owner = class_jvm.clone();
+            let dcopy = desc.clone();
+            let ncopy = name.clone();
+            b.add_code(
+                ACC_PUBLIC | ACC_FINAL,
+                &name,
+                &desc,
+                slot.max(1),
+                move |asm| {
+                    for (sl, so) in &loads {
+                        load(asm, *sl, *so);
+                    }
+                    asm.invokestatic(&owner, &ncopy, &dcopy);
+                    ret_of_sort(asm, ret);
+                },
+            );
+        }
+    }
+
     fn emit_case_companion(&mut self, class_tree: &Tree) {
         let lambda_wm = self.lambda_watermark();
         let class_id = class_tree.sym;
@@ -6353,6 +6505,13 @@ impl<'a> Gen<'a> {
         emit_case_apply(&mut b, self.st, class_id);
         if abs_fn.is_some() {
             emit_case_apply_bridge(&mut b, self.st, class_id);
+        }
+        // `case class M(v: Int) extends AnyVal`: this synthetic companion is
+        // also where its `$extension` methods are declared.
+        if self.st.is_value_class(class_id) {
+            if let TreeKind::ClassDef { impl_, .. } = &class_tree.kind {
+                self.emit_value_extension_forwarders(&mut b, class_id, &impl_.body);
+            }
         }
         self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
@@ -10299,6 +10458,22 @@ fn invoke_value_extension(
     }
     asm.invokestatic(&owner, &format!("{}$extension", s.name), &desc);
     maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
+}
+
+fn desc_ret_sort(desc: &str) -> JvmSort {
+    match desc
+        .rsplit_once(')')
+        .map(|(_, r)| r)
+        .unwrap_or("V")
+        .as_bytes()
+    {
+        [b'V'] => JvmSort::Void,
+        [b'J'] => JvmSort::Long,
+        [b'D'] => JvmSort::Double,
+        [b'F'] => JvmSort::Float,
+        [b'L', ..] | [b'[', ..] => JvmSort::Ref,
+        _ => JvmSort::Int,
+    }
 }
 
 fn count_value_ext_args(desc: &str) -> usize {

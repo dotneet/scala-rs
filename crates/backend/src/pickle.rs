@@ -979,7 +979,7 @@ impl<'a> Pickler<'a> {
         if let Some(&i) = self.sym_index.get(&owner.0) {
             return match self.st.get(id).kind {
                 SymKind::Method => self.pickle_method(id, i, self.noprefix),
-                _ => self.pickle_val(id, i, false),
+                _ => self.pickle_val(id, i, false, false),
             };
         }
         self.pickle_ext_term(id)
@@ -1297,7 +1297,7 @@ impl<'a> Pickler<'a> {
         } else {
             self.pickle_class(owner_id)
         };
-        self.pickle_val(id, owner_ref, false)
+        self.pickle_val(id, owner_ref, false, false)
     }
 
     fn pickle_type(&mut self, ty: &Type) -> u32 {
@@ -1506,6 +1506,7 @@ impl<'a> Pickler<'a> {
             || s.flags.contains(Flags::MODULE)
             || s.name.ends_with('$');
         let is_case = s.flags.contains(Flags::CASE);
+        let is_value = self.st.is_value_class(class_id);
         let class_flags = s.flags;
         let class_kind = s.kind;
         let raw_name = s.name.trim_end_matches('$').to_string();
@@ -1606,12 +1607,21 @@ impl<'a> Pickler<'a> {
                 }
                 SymKind::Term => {
                     if ctor_fields.contains(&m) || !self.st.get(m).flags.contains(Flags::PARAM) {
-                        if is_case && ctor_fields.contains(&m) {
+                        let ctor_field = ctor_fields.contains(&m);
+                        if (is_case || is_value) && ctor_field {
                             // nsc `caseFieldAccessors` pairs CASEACCESSOR getters
                             // with non-method PARAMACCESSOR fields.
                             self.pickle_param_field(m, idx);
                         }
-                        self.pickle_val(m, idx, is_case && ctor_fields.contains(&m));
+                        // A value class's *erasure* is the type of its single
+                        // parameter accessor, and nsc finds that accessor by
+                        // the `PARAMACCESSOR | METHOD` flag pair
+                        // (`Symbol.derivedValueClassUnbox`). Without it scalac
+                        // erased our `class Ops(val x: Int) extends AnyVal` to
+                        // `<notype>` and died in its own backend
+                        // (`unexpected type representation`) on the first call
+                        // it rewrote to `Ops$.MODULE$.inc$extension`.
+                        self.pickle_val(m, idx, is_case && ctor_field, is_value && ctor_field);
                     }
                 }
                 SymKind::Method => {
@@ -2028,7 +2038,13 @@ impl<'a> Pickler<'a> {
         let _ = self.add(VALSYM, body);
     }
 
-    fn pickle_val(&mut self, val_id: SymbolId, owner_ref: u32, case_accessor: bool) -> u32 {
+    fn pickle_val(
+        &mut self,
+        val_id: SymbolId,
+        owner_ref: u32,
+        case_accessor: bool,
+        param_accessor: bool,
+    ) -> u32 {
         if let Some(i) = self.sym_index.get(&val_id.0) {
             return *i;
         }
@@ -2049,6 +2065,8 @@ impl<'a> Pickler<'a> {
         let mut extra = (1u64 << 6) | (1u64 << 22) | (1u64 << 27);
         if case_accessor {
             extra |= 1 << 24; // CASEACCESSOR (not remapped)
+        }
+        if case_accessor || param_accessor {
             extra |= 1 << 29; // PARAMACCESSOR (not remapped)
         }
         let flags = pickled_from_our(flags_our, kind, extra);

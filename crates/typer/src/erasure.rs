@@ -66,7 +66,7 @@ fn collect_value_class_lambda_params(
 /// Every subtree that can hold a term. Only used by passes that look for one
 /// specific shape, so type-only children are visited too rather than listed
 /// separately.
-fn for_each_child(tree: &Tree, f: &mut impl FnMut(&Tree)) {
+pub(crate) fn for_each_child(tree: &Tree, f: &mut impl FnMut(&Tree)) {
     match &tree.kind {
         TreeKind::PackageDef { stats, .. } => {
             for s in stats {
