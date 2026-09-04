@@ -275,5 +275,9 @@ conform!(
     array_log_parse,
     array_classtag_util,
     array_inventory,
-    array_argv_match
+    array_argv_match,
+    // Run-time shapes from slick (agent/ifacebridge): `this` in a template's
+    // own constructor invocation, a `def this()` in front of defaulted
+    // parameters, and overloaded concrete trait methods.
+    ifacebridge_ctor
 );

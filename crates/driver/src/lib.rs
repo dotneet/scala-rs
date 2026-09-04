@@ -301,6 +301,16 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
     // Third of the same kind: the case-class companion lookup in `emit_module`
     // was a linear search of the symbol table per module.
     let class_by_name = std::rc::Rc::new(scala_rs_backend::gen::build_class_name_index(st));
+    // The class files behind `-cp` / `--scala-library`, read lazily and shared
+    // by every unit: a class needs bridges for the erased overloads its
+    // *binary* parents declare, and only the class files know what those are.
+    // Without the jar there is nothing to read, so the private-runtime ABI
+    // skips the pass.
+    let binary_parents = opts.scala_library.as_ref().map(|j| {
+        let mut p = opts.class_path.clone();
+        p.push(j.clone());
+        std::rc::Rc::new(scala_rs_backend::BinaryParents::new(p))
+    });
 
     // Emit unit by unit and hand each unit's classes to the writer pool as soon
     // as they exist, instead of writing all of them after the last unit. The
@@ -325,6 +335,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                     jvm_index: Some(std::rc::Rc::clone(&jvm_index)),
                     captured_vars: Some(std::rc::Rc::clone(&captured_vars)),
                     class_by_name: Some(std::rc::Rc::clone(&class_by_name)),
+                    binary_parents: binary_parents.clone(),
                 },
             ));
         }

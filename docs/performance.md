@@ -11,12 +11,12 @@ code generation → writing the class files).
 | scala-rs, before any optimisation           | 217.3 s   | 209.6 s           | 4552        |
 | scala-rs, after the first pass              | 3.5 s     | 3.0 s             | 4552        |
 | scala-rs, after the second pass and indy    | 2.0 s     | 1.8 s             | 2127        |
-| scala-rs, after the class-file writing pass | 1.7 s     | 1.6 s             | 1596        |
-| scala-rs, after the redone-work pass        | **1.4 s** | **1.3 s**         | 1596        |
+| scala-rs, after the class-file writing pass | 1.8 s     | 1.6 s             | 1596        |
+| scala-rs, after the redone-work pass        | **1.5 s** | **1.3 s**         | 1596        |
 
 Medians of three runs each, alternating between the two compilers so both see
 the same machine; the last two rows are medians of eight alternating runs taken
-back to back on a quiet machine (`user` 1.62 s → 1.34 s, `sys` 0.20 s in both).
+back to back on a quiet machine (`user` 1.61 s → 1.33 s, `sys` 0.21 s in both).
 The last row is the current state; the earlier rows are kept because the
 optimisation passes are described below and the numbers are what each one
 moved.
@@ -115,9 +115,9 @@ that needs no type arguments.
 | read `SCALA_RS_*_DEBUG` once; don't build a type to answer a predicate | −0.4% |
 
 Measured end to end against `main`, eight runs each alternating the two
-binaries on a quiet machine: **22.75 G instructions → 19.59 G (−13.9%)**,
-**1.71 s → 1.44 s wall (−16%)**, **1.62 s → 1.34 s `user` (−17%)**, `sys`
-unchanged at 0.20 s. Every class file slick produces is byte-identical to the
+binaries on a quiet machine: **23.05 G instructions → 20.02 G (−13.2%)**,
+**1.75 s → 1.47 s wall (−16%)**, **1.61 s → 1.33 s `user` (−17%)**, `sys`
+unchanged at 0.21 s. Every class file slick produces is byte-identical to the
 old binary's (`diff -r` over both output trees) and the diagnostics are the
 same text.
 
