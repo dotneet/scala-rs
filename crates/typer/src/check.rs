@@ -440,6 +440,9 @@ pub struct Typer {
     /// a `name$default$n` body with the other bodies, and so do we.
     pub(crate) defer_default_rhs: bool,
     pub(crate) pending_defaults: Vec<crate::lazysig::PendingDefault>,
+    /// The same, for a primary constructor's defaults, whose getters sit on
+    /// the companion module (`crate::ctor_defaults`).
+    pub(crate) pending_ctor_defaults: Vec<crate::lazysig::PendingCtorDefault>,
     /// Where each default's right-hand side was written. A default with no
     /// `name$default$n` getter to call is spliced into the argument list as
     /// the stored tree; this is the scope it has to be typed in, which is not
@@ -704,6 +707,7 @@ impl Typer {
             lazy_body_done: HashSet::new(),
             lazy_base_scopes,
             defer_default_rhs: false,
+            pending_ctor_defaults: Vec::new(),
             default_scopes: HashMap::new(),
             pending_defaults: Vec::new(),
             open_implicits: std::cell::RefCell::new(Vec::new()),
@@ -2276,6 +2280,10 @@ impl Typer {
                     // companion-based getters (not implemented here).
                 }
             }
+            // Nothing in *this* run calls a constructor's default getter, but a
+            // separately compiled caller does, so the companion module still
+            // owes the method. See `crate::ctor_defaults`.
+            self.synthesize_ctor_default_getters(id, &paramss_ids);
         }
         // `copy`'s parameter symbols (allocated in `synthesize_case_members`,
         // during the namer pass, before ctor param types are known) still hold
@@ -4340,9 +4348,26 @@ impl Typer {
         tparams: &[SymbolId],
         preceding: &[SymbolId],
     ) {
-        let Some(mut rhs) = self.st.get(param).default_rhs.clone() else {
+        let Some(rhs) = self.typed_default_body(param, ret, tparams, preceding) else {
             return;
         };
+        self.st.get_mut(param).default_rhs = Some(rhs.clone());
+        self.st.get_mut(getter).default_rhs = Some(rhs);
+    }
+
+    /// Type the stored body of `param`'s default against `ret`, in a scope
+    /// holding `tparams` and `preceding`. The caller decides where the typed
+    /// tree is stored: an ordinary method's getter writes it back onto the
+    /// parameter as well, a constructor's (`crate::ctor_defaults`) does not,
+    /// because the parameter's untyped tree is still what a call site splices.
+    pub(crate) fn typed_default_body(
+        &mut self,
+        param: SymbolId,
+        ret: &Type,
+        tparams: &[SymbolId],
+        preceding: &[SymbolId],
+    ) -> Option<Tree> {
+        let mut rhs = self.st.get(param).default_rhs.clone()?;
         // A repeated parameter's default is a *value*, not an argument list:
         // `case class C(xs: T*)` gives `copy(xs: T* = this.xs)`, and `this.xs`
         // is the `Seq[T]` the field holds. Checking it against `T*` reported a
@@ -4369,8 +4394,7 @@ impl Typer {
             self.adapt(&mut rhs, ret);
         }
         self.st.pop_scope();
-        self.st.get_mut(param).default_rhs = Some(rhs.clone());
-        self.st.get_mut(getter).default_rhs = Some(rhs);
+        Some(rhs)
     }
 
     pub(crate) fn type_def_body(&mut self, tree: &mut Tree) {
@@ -15265,6 +15289,22 @@ impl Typer {
             return None;
         }
         let mname = self.st.get(meth).name.clone();
+        // A case class's synthetic `apply` keeps splicing the default's stored
+        // expression. Its `apply$default$n` getter exists (nsc's, declared by
+        // `crate::ctor_defaults`) but only so a *separately compiled* caller
+        // can link; calling it from here would fix the argument's type before
+        // the class's type parameters are solved, and nsc infers them from the
+        // getter's result instead. slick's `case class Comprehension[+Fetch <:
+        // Option[Node]](…, fetch: Fetch = None, …)` is exactly that: the
+        // getter answers `None$`, which does not conform to `Fetch` until the
+        // call site has chosen `Fetch = None.type`.
+        let meth_flags = self.st.get(meth).flags;
+        if mname == "apply"
+            && meth_flags.contains(Flags::CASE)
+            && meth_flags.contains(Flags::SYNTHETIC)
+        {
+            return None;
+        }
         let gname = format!("{mname}$default${index_1based}");
         let owner = self.st.get(meth).owner;
         let gid = self
@@ -15273,7 +15313,26 @@ impl Typer {
             .into_iter()
             .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)?;
         let span = fun.span;
-        let recv = self.method_receiver(fun);
+        // An *inserted* `apply` names the receiver itself, not a member of it:
+        // `Outer.Inner.Nested(2)` is `Select(Outer.Inner, "Nested")` carrying
+        // the companion's `apply` as its symbol, so `method_receiver`'s
+        // "take the qualifier" answers `Outer.Inner` and the getter call came
+        // out as `Inner$.apply$default$2`. The head of the chain is the
+        // receiver in that case; it is re-typed from scratch because the tree
+        // in hand is already typed as the *method*.
+        let head = Self::application_head(fun);
+        let inserted_apply =
+            mname == "apply" && Self::head_name(head).is_some_and(|n| n != "apply");
+        let recv = if inserted_apply {
+            let mut r = head.clone();
+            r.id = NodeId(0);
+            r.ty = Type::NoType;
+            r.sym = SymbolId::NONE;
+            self.type_expr(&mut r, &Type::NoType);
+            r
+        } else {
+            self.method_receiver(fun)
+        };
         let mut preceding = Self::applied_clause_args(fun);
         preceding.extend_from_slice(prior);
         // The getter's own arity is the truth, not the number of arguments
@@ -15328,6 +15387,24 @@ impl Typer {
                 Self::applied_clause_args(fun)
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// The head of an application chain: `f(a)(b)` and `f[T](a)` both give `f`.
+    fn application_head(fun: &Tree) -> &Tree {
+        match &fun.kind {
+            TreeKind::Apply { fun, .. }
+            | TreeKind::TypeApply { fun, .. }
+            | TreeKind::Typed { expr: fun, .. } => Self::application_head(fun),
+            _ => fun,
+        }
+    }
+
+    /// The name a chain head selects, when it selects one at all.
+    fn head_name(t: &Tree) -> Option<&str> {
+        match &t.kind {
+            TreeKind::Select { name, .. } | TreeKind::Ident { name } => Some(name.as_str()),
+            _ => None,
         }
     }
 
@@ -23751,7 +23828,7 @@ fn is_right_biased_either(st: &SymbolTable, id: SymbolId) -> bool {
 /// begins. `synthesize_default_getters` needs it to tell "a parameter of an
 /// earlier clause" (which a default may name) from "an earlier parameter of my
 /// own clause" (which nsc forbids).
-fn clause_start_of(paramss_ids: &[Vec<SymbolId>], flat_idx: usize) -> usize {
+pub(crate) fn clause_start_of(paramss_ids: &[Vec<SymbolId>], flat_idx: usize) -> usize {
     let mut start = 0usize;
     for clause in paramss_ids {
         if flat_idx < start + clause.len() {
@@ -24765,7 +24842,7 @@ pub(crate) fn mentions_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
 }
 
 /// Every type parameter `ty` mentions, in order of first appearance.
-fn collect_tparams(ty: &Type, out: &mut Vec<SymbolId>) {
+pub(crate) fn collect_tparams(ty: &Type, out: &mut Vec<SymbolId>) {
     match ty {
         Type::TypeParam(id) => {
             if !out.contains(id) {

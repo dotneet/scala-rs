@@ -2037,6 +2037,40 @@ fn is_owner_compatible(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> 
     false
 }
 
+/// Like `is_owner_compatible`, but a *trait*'s class parent counts.
+///
+/// The JVM interface a trait becomes does not extend that class, which is why
+/// `is_owner_compatible` refuses to follow the edge -- a call through the
+/// interface cannot assume it. `this` is different: every instance of
+/// `trait U extends B` really is a `B`, so `B`'s members are read off `this`
+/// with a `checkcast`, which is what nsc emits. Without this,
+/// `trait Comp { class B(val table: String); object B { trait U extends B {
+/// … table … } } }` walked out to `U`'s `$outer` (the `B` *module*) and on to
+/// `Comp`, then cast that to `B`: slick's
+/// `TableDDLBuilder.UniqueIndexAsConstraint` threw `ClassCastException:
+/// H2Profile$ cannot be cast to …$TableDDLBuilder` on its first line.
+fn self_reaches_owner(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> bool {
+    if owner.is_none() || current == owner {
+        return true;
+    }
+    let mut work = vec![current];
+    let mut seen = HashSet::new();
+    while let Some(id) = work.pop() {
+        if !seen.insert(id.0) {
+            continue;
+        }
+        if id == owner {
+            return true;
+        }
+        for p in &st.get(id).parents {
+            if let Some(ps) = st.class_sym_of(p) {
+                work.push(ps);
+            }
+        }
+    }
+    false
+}
+
 /// Push the instance that owns `owner`'s members: `this`, or the `$outer`
 /// chain of the class being emitted when the member lives further out.
 /// `cur` is the class we are lexically inside (it decides the next hop),
@@ -2045,9 +2079,9 @@ fn is_owner_compatible(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> 
 fn load_owner_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
     let hops = !ctx.class_sym.is_none()
         && !owner.is_none()
-        && !is_owner_compatible(ctx.st, ctx.class_sym, owner);
+        && !self_reaches_owner(ctx.st, ctx.class_sym, owner);
     let (mut cur, mut held) = start_outer_walk(asm, ctx, hops);
-    while !cur.is_none() && !owner.is_none() && !is_owner_compatible(ctx.st, held, owner) {
+    while !cur.is_none() && !owner.is_none() && !self_reaches_owner(ctx.st, held, owner) {
         let Some(o) = enclosing_instance(ctx.st, cur) else {
             break;
         };
@@ -5983,7 +6017,20 @@ impl<'a> Gen<'a> {
             let Some(o) = outer_field_class(self.st, parent) else {
                 continue;
             };
-            if !outer_chain_reaches(self.st, class_id, o) {
+            // A trait nested in a member `object` is reached through that
+            // object's accessor, not along the `$outer` chain. slick has
+            // `trait JdbcStatementBuilderComponent { object TableDDLBuilder {
+            // trait UniqueIndexAsConstraint extends TableDDLBuilder } }`, and
+            // `class H2TableDDLBuilder extends TableDDLBuilder(table) with
+            // TableDDLBuilder.UniqueIndexAsConstraint` holds an `$outer` of
+            // `H2Profile` -- the object itself is nowhere on that chain, so
+            // this declined to implement the accessor at all and the JVM threw
+            // `AbstractMethodError` at the first `createIndex`.
+            // `H2Profile.TableDDLBuilder()` is the instance, which is what
+            // `load_module_instance` reaches.
+            let via_module = member_module_outer(self.st, o)
+                .is_some_and(|m| outer_chain_reaches(self.st, class_id, m));
+            if !via_module && !outer_chain_reaches(self.st, class_id, o) {
                 continue;
             }
             let name = trait_outer_accessor_name(self.st, parent);
@@ -6014,7 +6061,11 @@ impl<'a> Gen<'a> {
                     library_abi,
                     boxed_vars,
                 );
-                load_owner_instance(asm, &ctx, o);
+                if via_module {
+                    load_module_instance(asm, &ctx, o);
+                } else {
+                    load_owner_instance(asm, &ctx, o);
+                }
                 asm.areturn();
             });
         }
@@ -6998,6 +7049,13 @@ impl<'a> Gen<'a> {
         emit_case_apply(&mut b, self.st, class_id);
         if abs_fn.is_some() {
             emit_case_apply_bridge(&mut b, self.st, class_id);
+        }
+        // The primary constructor's `$lessinit$greater$default$n` /
+        // `apply$default$n` (`crate::typer::ctor_defaults` declares them on the
+        // companion, as nsc does). `emit_module` reaches these through its own
+        // call; a synthesized companion has no `ModuleDef` and comes here.
+        if let Some(c) = comp {
+            self.emit_default_getters(&mut b, c);
         }
         // `case class M(v: Int) extends AnyVal`: this synthetic companion is
         // also where its `$extension` methods are declared.
