@@ -75,6 +75,7 @@ The syntax is Scala **2.13**. There is no Scala 3 `then`, no top-level definitio
 - [`super.m` is seen from `this.type`, not from the parent (`agent/lastone`)](#superm-is-seen-from-thistype-not-from-the-parent-agentlastone)
 - [Operator-named `val`s were not encoded as field names](#operator-named-vals-were-not-encoded-as-field-names)
 - [`slick_subset.sh` was discarding files because of warnings](#slick_subsetsh-was-discarding-files-because-of-warnings)
+- [`-Xsource-features:case-apply-copy-access` and `-Xasync` (`agent/xflags`)](#-xsource-featurescase-apply-copy-access-and--xasync-agentxflags)
 
 Syntax that can be parsed (or desugared):
 
@@ -3786,3 +3787,125 @@ up the files with errors from `^\s+--> …\.scala` lines, but that `-->` line
 depending on it dropped out on the next round, and the converged 184 files
 shrank to 132. We now pipe through `grep -A 2 '^error'` first and look **only
 at the `-->` lines immediately after an error**.
+
+### `-Xsource-features:case-apply-copy-access` and `-Xasync` (`agent/xflags`)
+
+Two scalac flags. Everything below was read off scalac 2.13.16 first and is
+pinned by `crates/cli/tests/xflags.rs`, which runs the same fixtures through
+both compilers.
+
+#### The two migration axes
+
+`-Xsource:3` and `-Xsource-features` are not the same axis:
+
+| flag | effect |
+|---|---|
+| `-Xsource:3` | *warns* where Scala 3 would differ (as errors, in 2.13.16) |
+| `-Xsource-features:<f>` | actually *adopts* the Scala 3 behaviour `f` |
+| `-Xsource:3-cross` | `-Xsource:3 -Xsource-features:_` |
+
+They are not independent. nsc gates every feature on `isScala3`:
+
+```scala
+// scala/tools/nsc/Global.scala, 2.13.16
+def caseApplyCopyAccess = isScala3 && contains(o.caseApplyCopyAccess)
+```
+
+so `-Xsource-features` on its own is dropped, with `ScalaSettings.conflictWarning`:
+
+```
+warning: Conflicting compiler settings were detected. Some settings will be ignored.
+-Xsource-features requires -Xsource:3
+```
+
+We parse the whole feature domain (the eleven names, the `v2.13.13` /
+`v2.13.14` / `v2.13.15` groups, `_`, removals such as
+`v2.13.14,-case-companion-function`, and `help`) with nsc's own error text for
+an unknown name, and implement **`case-apply-copy-access`**. A feature named
+one by one that we do not implement warns rather than passing silently; naming
+a *group* does not, because `-Xsource:3-cross` expands to one.
+
+#### `case-apply-copy-access`
+
+Without the feature, the synthesized members walk straight around a private
+constructor — `case class C private (x: Int)` still has a public `C.apply(1)`
+and a public `c.copy(x = 2)`. With it, the primary constructor's modifier is
+copied onto both. **The two rules are different**, which is the part that is
+easy to get wrong:
+
+| constructor | `apply` | `copy` |
+|---|---|---|
+| `private` | `private` | `private` |
+| `private[p]` | `private[p]` | `private[p]` |
+| `protected` | **public** | `protected` |
+| (none) | public | public |
+
+nsc's `Unapplies.applyAccess` reacts only to `private` / `private[p]`
+(`mods.hasFlag(PRIVATE) || (!mods.hasFlag(PROTECTED) && mods.hasAccessBoundary)`)
+and then copies only the `PRIVATE` bit, while `caseClassCopyMeth` copies
+`flags & AccessFlags` (`PRIVATE | PROTECTED | LOCAL`) outright. Confirmed with
+scalac: `case class D protected (x: Int)` keeps a public `apply` and gets a
+`protected` `copy`.
+
+The feature is marked `[bin]` in nsc's help because it changes the class file,
+and it does so in three ways, all reproduced here:
+
+```text
+// case class C private (x: Int)                without      with the feature
+public final class C$ extends AbstractFunction1  →  public final class C$ implements Serializable
+public C apply(int)                              →  private C apply(int)
+public C copy(int)                               →  private C copy(int)
+public static C apply(int)   // mirror forwarder →  (gone)
+```
+
+The lost `FunctionN` parent is nsc's `caseModuleDef`
+(`&& !ApplyAccess.isInherit(applyAccess(constrMods(cdef)))`): a companion whose
+`apply` is not public cannot be a `FunctionN`, whose `apply` is. It is also the
+one place the feature is visible for `private[p]`, which is otherwise a public
+method in the class file.
+
+**Where the access check happens.** Setting the flag on the symbol is most of
+the work: `type_select`'s existing check then rejects `C(1)`, `C.apply(1)` and
+`v.copy(x = 2)` with this compiler's usual wording. `copy` needed one addition:
+`try_rewrite_case_copy` turns `p.copy(x = 1)` straight into a constructor call,
+so the member is never selected and the check never ran.
+
+**Widening.** A `private` member read from another class file is an
+`IllegalAccessError`, and these are read across one constantly: `C(x)` written
+inside `C` is a call from `C` into `C$`, and a class nested in `C` calling
+`copy` is a call from `C$Inner` into `C`. nsc's answer is `makeNotPrivate`,
+which widens *and renames* — scalac emits `public C C$$copy(int)` for exactly
+that program. We widen without renaming, which is what `widen_private_ctors`
+in `crates/typer/src/expand_private.rs` already did for private constructors;
+the rename exists to stop a subclass accidentally overriding the published
+member, and there is nothing to collide with here. `tests/fixtures/xflags_case_access.scala`
+runs every one of those shapes and prints the same thing under both compilers.
+
+#### `-Xasync`
+
+`-Xasync` is accepted, and reaches a macro implementation through
+`c.compilerSettings` — which is where the flag is actually *observed*. The
+message a user gets for a missing `-Xasync` does not come from the compiler at
+all; it comes from the library:
+
+```scala
+// scala/async/Async.scala, scala-async 1.0.1
+def asyncImpl[T: c.WeakTypeTag](c: whitebox.Context)(body: c.Tree)(execContext: c.Tree): c.Tree = {
+  if (!c.compilerSettings.contains("-Xasync"))
+    c.abort(c.macroApplication.pos,
+      "The async requires the compiler option -Xasync (supported only by Scala 2.12.12+ / 2.13.3+)")
+  ...
+}
+```
+
+So `c.compilerSettings` and `c.macroApplication` are now implemented in the
+macro engine (`crates/typer/java/ScalaRsMacroEngine.java`), and the driver
+rebuilds the command line the way nsc's `Settings.recreateArgs` does
+(`-classpath`, `-d`, `-Xasync`, `-Xsource:3.0.0`, …). A macro that gates on a
+flag now behaves identically under both compilers:
+`tests/fixtures/xflags_async_{impl,use}.scala` is scala-async's gate,
+compiled and run by both.
+
+The state-machine transform itself is **not** implemented, and neither is
+reading a macro *definition* out of a jar's pickle, which is what
+`scala.async.Async.async` is. See `docs/not-implemented.md`.

@@ -126,8 +126,37 @@ pub(crate) fn companion_function_class(
     if params.len() > MAX_ABSTRACT_FUNCTION {
         return None;
     }
-    synthetic_companion(st, class_id)?;
+    let module_cls = synthetic_companion(st, class_id)?;
+    // `-Xsource-features:case-apply-copy-access`: a companion whose `apply` is
+    // not public cannot be a `FunctionN` — the parent's `apply` is public and
+    // would widen it back. nsc's `Unapplies.caseModuleDef` spells this out as
+    // `&& !ApplyAccess.isInherit(applyAccess(constrMods(cdef)))`, and
+    // `javap` of scalac 2.13.16 agrees:
+    //
+    // ```text
+    // // case class C private (x: Int), no feature
+    // public final class C$ extends scala.runtime.AbstractFunction1<…>
+    // // the same class with -Xsource-features:case-apply-copy-access
+    // public final class C$ implements java.io.Serializable
+    // ```
+    //
+    // This is the one place the feature is visible even for `private[p]`,
+    // which is otherwise a public method in the classfile.
+    if case_apply_access_inherited(st, module_cls) {
+        return None;
+    }
     Some(format!("scala/runtime/AbstractFunction{}", params.len()))
+}
+
+/// True when the companion's synthetic `apply` carries the primary
+/// constructor's access (`private` or `private[p]`).
+pub(crate) fn case_apply_access_inherited(st: &SymbolTable, module_cls: SymbolId) -> bool {
+    st.get(module_cls).members.iter().any(|&m| {
+        let s = st.get(m);
+        s.name == "apply"
+            && s.flags.contains(Flags::SYNTHETIC)
+            && (s.flags.contains(Flags::PRIVATE) || s.private_within.is_some())
+    })
 }
 
 /// The module class of `class_id`'s companion, but only when *this compiler*

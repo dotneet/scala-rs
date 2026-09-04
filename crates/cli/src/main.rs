@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use scala_rs_driver::{
     compile_paths, find_scala_library, find_scala_xml, run_main_with_cp, CompileOptions,
-    CompileResult,
+    CompileResult, SourceFeatures,
 };
 use scala_rs_span::render_all;
 
@@ -75,7 +75,7 @@ fn print_help() {
 scala-rs — a Scala 2.13 subset compiler (not Scala 3)
 
 USAGE:
-    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings] [-language:<feat>] [-Xsource:3]
+    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings] [-language:<feat>] [-Xsource:3] [-Xsource-features:<features>] [-Xasync]
     scala-rs run <file> [--scala-library <jar>] [--no-scala-library] [--] [java-args...]
     scala-rs --help
 
@@ -104,6 +104,14 @@ OPTIONS:
     -Xsource:<version>  Source level: `2.13` (default), `3`, or `3-cross`.
                         `3`/`3-cross` accept the Scala 3 spellings this subset
                         implements (`A & B` compound types).
+    -Xsource-features:<features>
+                        Enable Scala 3 behaviours under -Xsource:3 (ignored,
+                        with a warning, without it). `3-cross` is `3` plus
+                        every feature. `-Xsource-features:help` lists them;
+                        `case-apply-copy-access` is the one implemented here.
+    -Xasync             Enable the async phase for scala.async.Async's `async`
+                        and `await`. The state-machine transform is not
+                        implemented: an `async` block is diagnosed either way.
     --help              Show this help
 
 EXAMPLES:
@@ -132,6 +140,13 @@ fn cmd_compile(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if parsed.features_help {
+        print!("{}", SourceFeatures::help_text());
+        return ExitCode::SUCCESS;
+    }
+    for w in &parsed.warnings {
+        eprintln!("warning: {w}");
+    }
     if parsed.files.is_empty() {
         eprintln!("error: no input files");
         return ExitCode::from(1);
@@ -157,6 +172,10 @@ fn cmd_compile(args: &[String]) -> ExitCode {
 struct CompileArgs {
     files: Vec<PathBuf>,
     opts: CompileOptions,
+    /// Settings-level warnings (nsc reports these before it reads any source).
+    warnings: Vec<String>,
+    /// `-Xsource-features:help` was asked for; print the list and stop.
+    features_help: bool,
 }
 
 fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
@@ -169,6 +188,12 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
     let mut class_path = Vec::new();
     let mut language_features = Vec::new();
     let mut xsource3 = false;
+    let mut xsource_cross = false;
+    let mut named_features = SourceFeatures::default();
+    let mut named_features_given = false;
+    let mut unimplemented_features: Vec<&'static str> = Vec::new();
+    let mut features_help = false;
+    let mut xasync = false;
     let mut files = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -213,14 +238,32 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
                     language_features.push(f.to_string());
                 }
             }
+        } else if let Some(rest) = a.strip_prefix("-Xsource-features:") {
+            let parsed = SourceFeatures::parse(rest)?;
+            named_features = parsed.features;
+            named_features_given = true;
+            features_help |= parsed.help;
+            unimplemented_features.extend(parsed.unimplemented);
+        } else if a == "-Xsource-features" {
+            i += 1;
+            let spec = args.get(i).ok_or_else(|| {
+                "option -Xsource-features requires a feature argument".to_string()
+            })?;
+            let parsed = SourceFeatures::parse(spec)?;
+            named_features = parsed.features;
+            named_features_given = true;
+            features_help |= parsed.help;
+            unimplemented_features.extend(parsed.unimplemented);
+        } else if a == "-Xasync" {
+            xasync = true;
         } else if let Some(rest) = a.strip_prefix("-Xsource:") {
-            xsource3 = parse_xsource_level(rest)?;
+            (xsource3, xsource_cross) = parse_xsource_level(rest)?;
         } else if a == "-Xsource" {
             i += 1;
             let ver = args
                 .get(i)
                 .ok_or_else(|| "option -Xsource requires a version argument".to_string())?;
-            xsource3 = parse_xsource_level(ver)?;
+            (xsource3, xsource_cross) = parse_xsource_level(ver)?;
         } else if a == "-language" {
             i += 1;
             let feats = args
@@ -252,6 +295,13 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             None => find_scala_library(),
         }
     };
+    let (source_features, warnings) = reconcile_source_features(
+        xsource3,
+        xsource_cross,
+        named_features,
+        named_features_given,
+        &unimplemented_features,
+    );
     Ok(CompileArgs {
         files,
         opts: CompileOptions {
@@ -263,21 +313,66 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             class_path: class_path,
             language_features,
             xsource3,
+            source_features,
+            xasync,
         },
+        warnings,
+        features_help,
     })
 }
 
-/// `-Xsource:<version>`. Returns true when the level enables Scala 3 syntax.
+/// `-Xsource:<version>`. Returns `(source3, cross)`: `source3` is true when
+/// the level enables Scala 3 syntax, `cross` when the level is `3-cross`,
+/// which nsc defines as `-Xsource:3 -Xsource-features:_` (the post-set hook of
+/// `ScalaSettings.source` calls `XsourceFeatures.tryToSet(List("_"))`).
 /// nsc refuses anything below the current major version.
-fn parse_xsource_level(ver: &str) -> Result<bool, String> {
+fn parse_xsource_level(ver: &str) -> Result<(bool, bool), String> {
     match ver.trim() {
         "" => Err("option -Xsource: requires a version".into()),
-        "3" | "3-cross" => Ok(true),
-        "2.13" | "2.13.0" => Ok(false),
+        "3" => Ok((true, false)),
+        "3-cross" => Ok((true, true)),
+        "2.13" | "2.13.0" => Ok((false, false)),
         other => Err(format!(
             "-Xsource must be at least the current major version (2.13.0), got '{other}'"
         )),
     }
+}
+
+/// nsc's `ScalaSettings.conflictWarning`: `-Xsource-features` is gated on
+/// `isScala3`, so below `-Xsource:3` the whole setting is dropped.
+const XSOURCE_FEATURES_CONFLICT: &str = "Conflicting compiler settings were detected. \
+Some settings will be ignored.\n-Xsource-features requires -Xsource:3";
+
+/// Reconcile `-Xsource` with `-Xsource-features`, exactly as nsc does.
+///
+/// `cross` (`-Xsource:3-cross`) turns on every feature; naming features
+/// without `-Xsource:3` drops them with a warning. Returns the settings that
+/// survive plus the warnings to print.
+fn reconcile_source_features(
+    source3: bool,
+    cross: bool,
+    named: SourceFeatures,
+    named_given: bool,
+    unimplemented: &[&'static str],
+) -> (SourceFeatures, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut features = named;
+    if cross {
+        features = SourceFeatures::all();
+    }
+    if named_given && !source3 {
+        warnings.push(XSOURCE_FEATURES_CONFLICT.to_string());
+        features = SourceFeatures::default();
+    }
+    if !features.is_empty() {
+        for f in unimplemented {
+            warnings.push(format!(
+                "-Xsource-features:{f} is accepted but not implemented by scala-rs; \
+it changes nothing (see docs/not-implemented.md)"
+            ));
+        }
+    }
+    (features, warnings)
 }
 
 fn take_scala_library_flag(args: &[String], i: &mut usize) -> Result<PathBuf, String> {
@@ -332,6 +427,8 @@ fn cmd_run(args: &[String]) -> ExitCode {
         class_path: Vec::new(),
         language_features: Vec::new(),
         xsource3: parsed.xsource3,
+        source_features: parsed.source_features,
+        xasync: parsed.xasync,
     };
     let result = compile_paths(&[parsed.file], &opts);
     print_diags(&result);
@@ -370,6 +467,8 @@ struct RunArgs {
     java_args: Vec<String>,
     scala_library: Option<PathBuf>,
     xsource3: bool,
+    source_features: SourceFeatures,
+    xasync: bool,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
@@ -378,14 +477,23 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut scala_library = None;
     let mut no_scala_library = false;
     let mut xsource3 = false;
+    let mut xsource_cross = false;
+    let mut named_features = SourceFeatures::default();
+    let mut named_features_given = false;
+    let mut xasync = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
             java_args.extend_from_slice(&args[i + 1..]);
             break;
+        } else if let Some(rest) = a.strip_prefix("-Xsource-features:") {
+            named_features = SourceFeatures::parse(rest)?.features;
+            named_features_given = true;
+        } else if a == "-Xasync" {
+            xasync = true;
         } else if let Some(rest) = a.strip_prefix("-Xsource:") {
-            xsource3 = parse_xsource_level(rest)?;
+            (xsource3, xsource_cross) = parse_xsource_level(rest)?;
         } else if a == "--no-scala-library" {
             no_scala_library = true;
         } else if a == "--scala-library" || a.starts_with("--scala-library=") {
@@ -414,10 +522,22 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             None => find_scala_library(),
         }
     };
+    let (source_features, warnings) = reconcile_source_features(
+        xsource3,
+        xsource_cross,
+        named_features,
+        named_features_given,
+        &[],
+    );
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
     Ok(RunArgs {
         file,
         java_args,
         scala_library,
+        source_features,
+        xasync,
         xsource3,
     })
 }
