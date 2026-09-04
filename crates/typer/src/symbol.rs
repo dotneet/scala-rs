@@ -986,11 +986,14 @@ impl SymbolTable {
 
     /// Substitute class type arguments into a member type (`List[Int].head` → `Int`).
     pub fn subst_tparams(&self, owner: SymbolId, args: &[Type], ty: &Type) -> Type {
-        let tps = self.get(owner).tparams.clone();
+        // Borrowed, not cloned: the common call has no type parameters at all
+        // and returns on the next line, and this is one of the hottest
+        // functions in the typer.
+        let tps = &self.get(owner).tparams;
         if tps.is_empty() || args.is_empty() {
             return ty.clone();
         }
-        subst_map(ty, &tps, args)
+        subst_map(ty, tps, args)
     }
 
     /// nsc: a *alias* type member is equivalent to (not merely bounded by) its
@@ -1900,10 +1903,10 @@ impl SymbolTable {
         // Only the bound can settle this -- every arm below either matches on
         // `a` alone or asks for the two to be the same parameter.
         if let Type::TypeParam(id) | Type::TypeMember(id) = b {
-            if let Some(lo) = self.get(*id).bound_lo.clone() {
+            if let Some(lo) = &self.get(*id).bound_lo {
                 if !matches!(lo, Type::Nothing) {
                     if let Some(_g) = enter_bound(*id) {
-                        if self.is_sub_type(a, &lo) {
+                        if self.is_sub_type(a, lo) {
                             return true;
                         }
                     }
@@ -1963,7 +1966,7 @@ impl SymbolTable {
                 if a1.is_empty() || a2.is_empty() {
                     true
                 } else if a1.len() == a2.len() {
-                    let tparams = self.get(*s1).tparams.clone();
+                    let tparams = &self.get(*s1).tparams;
                     a1.iter().zip(a2.iter()).enumerate().all(|(i, (x, y))| {
                         let flags = tparams
                             .get(i)
@@ -2141,10 +2144,10 @@ impl SymbolTable {
             (a, Type::SingleType { sym, .. })
                 if matches!(self.get(*sym).kind, SymKind::Module | SymKind::ModuleClass) =>
             {
-                let t = self.get(*sym).ty.clone();
+                let t = &self.get(*sym).ty;
                 !t.is_no_type()
-                    && !matches!(&t, Type::SingleType { sym: s2, .. } if s2 == sym)
-                    && self.is_sub_type(a, &t)
+                    && !matches!(t, Type::SingleType { sym: s2, .. } if s2 == sym)
+                    && self.is_sub_type(a, t)
             }
             // Annotations are erased for conformance: `Node` is a
             // `Node @uncheckedVariance`. Like the wildcards below, this has to
@@ -2174,7 +2177,7 @@ impl SymbolTable {
                 let Some(_g) = enter_depth() else {
                     return false;
                 };
-                let parents = self.get(self.string_sym).parents.clone();
+                let parents = &self.get(self.string_sym).parents;
                 parents.iter().any(|p| self.is_sub_type(p, b))
             }
             (Type::Class { sym: s1, args: a1 }, b) => {
@@ -2191,11 +2194,12 @@ impl SymbolTable {
                 let Some(_g) = enter_depth() else {
                     return false;
                 };
+                // Borrowed: this is the arm the subtype walk spends most of
+                // its time in, and cloning the parent list and the type
+                // parameters at every node of the DAG dominated its cost.
                 let child = self.get(*s1);
-                let tps = child.tparams.clone();
-                let parents = child.parents.clone();
-                parents.iter().any(|p| {
-                    let p = subst_tparams_slice(&tps, a1, p);
+                child.parents.iter().any(|p| {
+                    let p = subst_tparams_slice(&child.tparams, a1, p);
                     self.is_sub_type(&p, b)
                 })
             }
@@ -2235,18 +2239,14 @@ impl SymbolTable {
                 let Some(_g) = enter_depth() else {
                     return false;
                 };
-                self.get(*s)
-                    .parents
-                    .clone()
-                    .iter()
-                    .any(|p| self.is_sub_type(p, b))
+                self.get(*s).parents.iter().any(|p| self.is_sub_type(p, b))
             }
             (Type::TypeParam(a), Type::TypeParam(b)) if a == b => true,
             (Type::TypeMember(a), Type::TypeMember(b)) if a == b => true,
             (Type::TypeMember(id), b) => {
-                if let Some(hi) = self.get(*id).bound_hi.clone() {
+                if let Some(hi) = &self.get(*id).bound_hi {
                     if let Some(_g) = enter_bound(*id) {
-                        if self.is_sub_type(&hi, b) {
+                        if self.is_sub_type(hi, b) {
                             return true;
                         }
                     }
@@ -2255,10 +2255,10 @@ impl SymbolTable {
             }
             // `def f[A <: Named](x: A)` may use `x` where a `Named` is wanted.
             (Type::TypeParam(id), b) => {
-                if let Some(hi) = self.get(*id).bound_hi.clone() {
+                if let Some(hi) = &self.get(*id).bound_hi {
                     // `A <: Rep[A]` must not expand its own bound again.
                     if let Some(_g) = enter_bound(*id) {
-                        if self.is_sub_type(&hi, b) {
+                        if self.is_sub_type(hi, b) {
                             return true;
                         }
                     }
@@ -2276,11 +2276,11 @@ impl SymbolTable {
                 if matches!(b, Type::SingleType { sym: s2, .. } if s2 == sym) {
                     true
                 } else {
-                    let t = self.get(*sym).ty.clone();
+                    let t = &self.get(*sym).ty;
                     if t.is_no_type() {
                         self.is_sub_type(prefix, b)
                     } else {
-                        self.is_sub_type(&t, b)
+                        self.is_sub_type(t, b)
                     }
                 }
             }
