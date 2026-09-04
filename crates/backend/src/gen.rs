@@ -33,6 +33,16 @@ pub struct EmitOpts {
     /// function of `st`, which does not change while a run is emitted, so the
     /// driver builds it once; `None` builds it here.
     pub jvm_index: Option<Rc<HashMap<String, SymbolId>>>,
+    /// Mutable locals captured by a class defined inside a method, for the
+    /// whole table. Also a pure function of `st`, and finding them means
+    /// reading every symbol's `captures`: doing that once per unit was another
+    /// files-times-symbols sweep. `None` computes it here.
+    pub captured_vars: Option<Rc<HashSet<SymbolId>>>,
+    /// Simple name -> the first non-trait class symbol carrying it, for
+    /// [`Gen::find_class_named`]. A pure function of `st` as well; the search
+    /// it replaces was a linear scan of every symbol, run once per module
+    /// emitted. `None` builds it here.
+    pub class_by_name: Option<Rc<HashMap<String, SymbolId>>>,
 }
 
 /// Walk a typed compilation unit and emit classes (private-runtime ABI).
@@ -179,10 +189,13 @@ pub fn emit_opts(
         pickles: opts.pickles,
         // `scala.runtime.*Ref` exists in both ABIs: on the jar, and as a
         // private-runtime classfile (see `runtime::REF_BOXES`).
-        boxed_vars: collect_boxed_vars(tree, st),
+        boxed_vars: collect_boxed_vars(tree, st, opts.captured_vars.as_ref()),
         jvm_index: opts
             .jvm_index
             .unwrap_or_else(|| Rc::new(build_jvm_index(st))),
+        class_by_name: opts
+            .class_by_name
+            .unwrap_or_else(|| Rc::new(build_class_name_index(st))),
     };
     g.walk(tree);
     g.emit_anon_classes(tree);
@@ -225,6 +238,10 @@ struct Gen<'a> {
     /// JVM internal name → class-like symbol, for the whole symbol table.
     /// Built once; used to compute `InnerClasses`/`EnclosingMethod`.
     jvm_index: Rc<HashMap<String, SymbolId>>,
+    /// Simple name → first non-trait class symbol with it, for the
+    /// case-companion lookup in `emit_module`. Built once; that lookup used to
+    /// scan every symbol, once per module in the run.
+    class_by_name: Rc<HashMap<String, SymbolId>>,
 }
 
 /// JVM internal name → class-like symbol, for every `Class`/`ModuleClass` in
@@ -236,6 +253,19 @@ pub fn build_jvm_index(st: &SymbolTable) -> HashMap<String, SymbolId> {
     for s in &st.symbols {
         if matches!(s.kind, SymKind::Class | SymKind::ModuleClass) {
             m.entry(st.jvm_internal(s.id)).or_insert(s.id);
+        }
+    }
+    m
+}
+
+/// Simple name → the first non-trait class symbol carrying it, in symbol
+/// order. This is what a linear `find` over `st.symbols` used to answer for
+/// every module emitted, so it is built once for the run instead.
+pub fn build_class_name_index(st: &SymbolTable) -> HashMap<String, SymbolId> {
+    let mut m = HashMap::new();
+    for s in &st.symbols {
+        if s.kind == SymKind::Class && !s.flags.contains(Flags::TRAIT) {
+            m.entry(s.name.clone()).or_insert(s.id);
         }
     }
     m
@@ -6431,13 +6461,7 @@ impl<'a> Gen<'a> {
     }
 
     fn find_class_named(&self, name: &str) -> Option<SymbolId> {
-        self.st.symbols.iter().find_map(|s| {
-            if s.kind == SymKind::Class && s.name == name && !s.flags.contains(Flags::TRAIT) {
-                Some(s.id)
-            } else {
-                None
-            }
-        })
+        self.class_by_name.get(name).copied()
     }
 }
 
@@ -15408,11 +15432,30 @@ fn is_jvm_primitive(ty: &Type) -> bool {
     )
 }
 
-fn collect_boxed_vars(tree: &Tree, st: &SymbolTable) -> HashSet<SymbolId> {
+fn collect_boxed_vars(
+    tree: &Tree,
+    st: &SymbolTable,
+    captured: Option<&Rc<HashSet<SymbolId>>>,
+) -> HashSet<SymbolId> {
     let mut out = HashSet::new();
     walk_boxed_vars(tree, st, &mut out);
-    // A `var` captured by a class defined inside a method is shared with the
-    // enclosing method, exactly like one captured by a lambda.
+    match captured {
+        Some(shared) => out.extend(shared.iter().copied()),
+        None => out.extend(collect_captured_vars(st).iter().copied()),
+    }
+    out
+}
+
+/// Every mutable local captured by a class defined inside a method: those are
+/// shared with the enclosing method, exactly like one captured by a lambda, so
+/// they are boxed.
+///
+/// A function of the symbol table alone, which does not change while a run is
+/// emitted. The driver calls this once and hands the answer to every unit
+/// through [`EmitOpts::captured_vars`]; reading every symbol's `captures` once
+/// per unit was 184 sweeps of ~100k symbols on slick.
+pub fn collect_captured_vars(st: &SymbolTable) -> HashSet<SymbolId> {
+    let mut out = HashSet::new();
     for s in &st.symbols {
         for c in &s.captures {
             if st.get(*c).flags.contains(Flags::MUTABLE) {

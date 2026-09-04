@@ -286,6 +286,12 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
     // Same story: a pure function of the (now frozen) symbol table, and it was
     // rebuilt from scratch for each of the run's units.
     let jvm_index = std::rc::Rc::new(scala_rs_backend::gen::build_jvm_index(st));
+    // And again: the mutable locals a nested class captures are a property of
+    // the run, and looking for them read every symbol once per unit.
+    let captured_vars = std::rc::Rc::new(scala_rs_backend::gen::collect_captured_vars(st));
+    // Third of the same kind: the case-class companion lookup in `emit_module`
+    // was a linear search of the symbol table per module.
+    let class_by_name = std::rc::Rc::new(scala_rs_backend::gen::build_class_name_index(st));
 
     // Emit unit by unit and hand each unit's classes to the writer pool as soon
     // as they exist, instead of writing all of them after the last unit. The
@@ -308,6 +314,8 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                     pickles: std::rc::Rc::clone(&u.pickles),
                     trait_members: Some(std::rc::Rc::clone(&trait_members)),
                     jvm_index: Some(std::rc::Rc::clone(&jvm_index)),
+                    captured_vars: Some(std::rc::Rc::clone(&captured_vars)),
+                    class_by_name: Some(std::rc::Rc::clone(&class_by_name)),
                 },
             ));
         }

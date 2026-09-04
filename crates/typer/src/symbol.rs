@@ -468,6 +468,10 @@ pub struct SymbolTable {
     /// by the one place in `erasure` that writes a symbol type outside the
     /// pass itself.
     pub erasure_settled: bool,
+    /// How many symbols `uncurry::flatten_method_symbols` has already joined
+    /// into a single parameter list. It runs once per compilation unit and
+    /// only ever appends, so each pass starts here instead of at 0.
+    pub(crate) flattened_upto: usize,
 }
 
 /// Reverse index from `jvm_name` to the class-like symbols that have it.
@@ -568,6 +572,7 @@ impl SymbolTable {
             seq_extractor_payload: rustc_hash::FxHashMap::default(),
             jvm_index: std::cell::RefCell::new(JvmIndex::default()),
             erasure_settled: false,
+            flattened_upto: 0,
         };
         st.root = st.alloc(
             "<_root_>",
@@ -790,12 +795,13 @@ impl SymbolTable {
                     out.push(*m);
                 }
             }
-            for m in &sym.parents.clone() {
+            for m in &sym.parents {
                 // `trait C[-T] extends (T => R)` really does inherit
                 // `Function1.apply`; the parent just names no class until the
                 // structural function is read back as one.
-                let m = self.function_class_form(m).unwrap_or_else(|| m.clone());
-                if let Some(ps) = self.class_sym_of(&m) {
+                let as_class = self.function_class_form(m);
+                let m = as_class.as_ref().unwrap_or(m);
+                if let Some(ps) = self.class_sym_of(m) {
                     work.push(ps);
                 }
             }
@@ -836,9 +842,10 @@ impl SymbolTable {
                     out.push(*m);
                 }
             }
-            for m in &sym.parents.clone() {
-                let m = self.function_class_form(m).unwrap_or_else(|| m.clone());
-                if let Some(ps) = self.class_sym_of(&m) {
+            for m in &sym.parents {
+                let as_class = self.function_class_form(m);
+                let m = as_class.as_ref().unwrap_or(m);
+                if let Some(ps) = self.class_sym_of(m) {
                     work.push(ps);
                 }
             }
@@ -1020,6 +1027,17 @@ impl SymbolTable {
             return ty.clone();
         }
         subst_map(ty, tps, args)
+    }
+
+    /// [`SymbolTable::subst_tparams`] without the copy when the substitution
+    /// is the identity. See [`subst_tparams_cow`].
+    pub(crate) fn subst_tparams_cow<'t>(
+        &self,
+        owner: SymbolId,
+        args: &[Type],
+        ty: &'t Type,
+    ) -> std::borrow::Cow<'t, Type> {
+        subst_tparams_cow(&self.get(owner).tparams, args, ty)
     }
 
     /// nsc: a *alias* type member is equivalent to (not merely bounded by) its
@@ -1245,13 +1263,13 @@ impl SymbolTable {
             if c == anc {
                 return true;
             }
-            for p in self.get(c).parents.clone() {
-                if let Some(ps) = self.class_sym_of(&p) {
+            for p in &self.get(c).parents {
+                if let Some(ps) = self.class_sym_of(p) {
                     work.push(ps);
                 }
             }
-            if let Some(st) = self.get(c).self_type.clone() {
-                if let Some(ps) = self.class_sym_of(&st) {
+            if let Some(st) = &self.get(c).self_type {
+                if let Some(ps) = self.class_sym_of(st) {
                     work.push(ps);
                 }
             }
@@ -1295,7 +1313,7 @@ impl SymbolTable {
                     } else {
                         st.subst_tparams(*sym, args, &ty)
                     };
-                    for p in st.get(*sym).parents.clone() {
+                    for p in &st.get(*sym).parents {
                         // The parent is declared in terms of *this* class's
                         // type parameters, so it has to be instantiated before
                         // it can instantiate anything itself. Without this,
@@ -1303,11 +1321,7 @@ impl SymbolTable {
                         // keeps its `implicit TypedType[BR]` raw instead of
                         // resolving `BR` to `Boolean` through
                         // `OptionMapper[BR, R]`.
-                        let p = if args.is_empty() {
-                            p
-                        } else {
-                            st.subst_tparams(*sym, args, &p)
-                        };
+                        let p = st.subst_tparams_cow(*sym, args, p);
                         t = walk(st, &p, t, seen);
                     }
                     // A self type is a second place `this` inherits members
@@ -1316,12 +1330,8 @@ impl SymbolTable {
                     // out of `Q`, whose own `A` has to become `P`'s. Without
                     // this the two `A`s printed the same and compared
                     // unequal -- "type mismatch; found: A required: A".
-                    if let Some(sf) = st.get(*sym).self_type.clone() {
-                        let sf = if args.is_empty() {
-                            sf
-                        } else {
-                            st.subst_tparams(*sym, args, &sf)
-                        };
+                    if let Some(sf) = &st.get(*sym).self_type {
+                        let sf = st.subst_tparams_cow(*sym, args, sf);
                         t = walk(st, &sf, t, seen);
                     }
                     t
@@ -1331,8 +1341,8 @@ impl SymbolTable {
                         return ty;
                     }
                     let mut t = ty;
-                    for p in st.get(*sym).parents.clone() {
-                        t = walk(st, &p, t, seen);
+                    for p in &st.get(*sym).parents {
+                        t = walk(st, p, t, seen);
                     }
                     t
                 }
@@ -1632,18 +1642,18 @@ impl SymbolTable {
             if guard > 256 {
                 break;
             }
-            let (sym, args) = match &cur {
-                Type::Class { sym, args } => (*sym, args.clone()),
-                Type::ModuleRef(s) | Type::ThisType(s) => (*s, Vec::new()),
+            let (sym, args): (SymbolId, &[Type]) = match &cur {
+                Type::Class { sym, args } => (*sym, args),
+                Type::ModuleRef(s) | Type::ThisType(s) => (*s, &[]),
                 // A type parameter's ancestors are its upper bound's, so
                 // `lub(S, S2)` for `S <: NoStream` and `S2 <: NoStream` is
                 // `NoStream` and not `AnyRef`.
                 Type::TypeParam(id) | Type::TypeMember(id) => {
-                    if let Some(hi) = self.get(*id).bound_hi.clone() {
-                        if !seen.contains(&hi) {
+                    if let Some(hi) = &self.get(*id).bound_hi {
+                        if !seen.contains(hi) {
                             seen.push(hi.clone());
                             out.push(hi.clone());
-                            queue.push_back(hi);
+                            queue.push_back(hi.clone());
                         }
                     }
                     continue;
@@ -1655,28 +1665,27 @@ impl SymbolTable {
                 // aLiteral)` came out as `List[AnyRef]` and no `Syntactic*`
                 // call would take it.
                 Type::Refined { parents, .. } => {
-                    for p in parents.clone() {
-                        if seen.contains(&p) {
+                    for p in parents {
+                        if seen.contains(p) {
                             continue;
                         }
                         seen.push(p.clone());
                         out.push(p.clone());
-                        queue.push_back(p);
+                        queue.push_back(p.clone());
                     }
                     continue;
                 }
                 _ => continue,
             };
             let s = self.get(sym);
-            let tps = s.tparams.clone();
-            for p in s.parents.clone() {
-                let p = subst_tparams_slice(&tps, &args, &p);
-                if seen.contains(&p) {
+            for p in &s.parents {
+                let p = subst_tparams_cow(&s.tparams, args, p);
+                if seen.contains(&*p) {
                     continue;
                 }
-                seen.push(p.clone());
-                out.push(p.clone());
-                queue.push_back(p);
+                seen.push(p.clone().into_owned());
+                out.push(p.clone().into_owned());
+                queue.push_back(p.into_owned());
             }
         }
         out
@@ -1884,6 +1893,58 @@ impl SymbolTable {
         }
     }
 
+    /// Can the parent walk in [`SymbolTable::is_sub_type`] reach class
+    /// `target` from class `start`?
+    ///
+    /// `Some(false)` is a promise that it cannot, and is the only answer worth
+    /// having: the caller then skips the walk. `Some(true)` means the symbol
+    /// appears somewhere above `start` and the walk has to run for real, since
+    /// only it can decide the type arguments. `None` means the hierarchy holds
+    /// a parent this cannot model and nothing may be concluded.
+    ///
+    /// Deliberately an over-approximation of what the real walk visits: it
+    /// ignores type substitution (which never changes a parent's *class*) and
+    /// it does not re-apply the rewrites `is_sub_type` performs on its way in
+    /// (`Array[T]` written as `Class`, for one), so it can only ever claim
+    /// that more is reachable, never less.
+    ///
+    /// Every parent form the real walk treats specially is a `None` here, so
+    /// the promise holds for exactly two shapes: a class parent that is not a
+    /// `FunctionN` in class clothing (`is_sub_type` turns those into the
+    /// structural function type and leaves this walk's world), and `AnyRef` /
+    /// `Any` / `AnyVal`, which the real walk answers `false` for against any
+    /// class and which are where most hierarchies end.
+    pub(crate) fn class_reaches(&self, start: SymbolId, target: SymbolId) -> Option<bool> {
+        // Hierarchies are tens of nodes, so a scanned `Vec` beats a hash set.
+        let mut seen: Vec<u32> = Vec::with_capacity(32);
+        let mut work: Vec<SymbolId> = Vec::with_capacity(16);
+        seen.push(start.0);
+        work.push(start);
+        while let Some(c) = work.pop() {
+            for p in &self.get(c).parents {
+                match p {
+                    Type::Class { sym, args } => {
+                        if *sym == target {
+                            return Some(true);
+                        }
+                        if self.function_class_shape(*sym, args).is_some() {
+                            return None;
+                        }
+                        if !seen.contains(&sym.0) {
+                            seen.push(sym.0);
+                            work.push(*sym);
+                        }
+                    }
+                    // `is_sub_type` has no arm for these against a class, so
+                    // the real walk stops here too.
+                    Type::AnyRef | Type::Any | Type::AnyVal => {}
+                    _ => return None,
+                }
+            }
+        }
+        Some(false)
+    }
+
     pub fn is_sub_type(&self, a: &Type, b: &Type) -> bool {
         if a == b {
             return true;
@@ -1937,6 +1998,21 @@ impl SymbolTable {
                         }
                     }
                 }
+            }
+        }
+        // One class is under another only if the second one's *symbol* is
+        // somewhere in the first one's parent DAG. That question needs no type
+        // arguments, so it can be answered by walking symbols with a visited
+        // set -- linear -- while the walk below substitutes the arguments at
+        // every edge and revisits every diamond, which is what makes a "no"
+        // expensive. Implicit search asks far more questions than it accepts,
+        // so the "no" is the answer worth making cheap.
+        if let (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, .. }) = (a, b) {
+            if s1 != s2
+                && self.function_class_shape(*s1, a1).is_none()
+                && self.class_reaches(*s1, *s2) == Some(false)
+            {
+                return false;
             }
         }
         match (a, b) {
@@ -2225,7 +2301,7 @@ impl SymbolTable {
                 // parameters at every node of the DAG dominated its cost.
                 let child = self.get(*s1);
                 child.parents.iter().any(|p| {
-                    let p = subst_tparams_slice(&child.tparams, a1, p);
+                    let p = subst_tparams_cow(&child.tparams, a1, p);
                     self.is_sub_type(&p, b)
                 })
             }
@@ -2573,22 +2649,22 @@ impl SymbolTable {
             if !visited.insert(id.0) {
                 continue;
             }
-            for m in self.get(id).members.clone() {
-                let info = self.get(m);
+            for m in &self.get(id).members {
+                let info = self.get(*m);
                 if info.kind != SymKind::TypeMember {
                     continue;
                 }
                 let abstract_ = match &info.ty {
                     Type::NoType | Type::Error => true,
-                    Type::TypeMember(inner) => *inner == m,
+                    Type::TypeMember(inner) => inner == m,
                     _ => false,
                 };
                 if abstract_ && seen.insert(info.name.clone()) {
                     out.push(info.name.clone());
                 }
             }
-            for p in self.get(id).parents.clone() {
-                if let Some(ps) = self.class_sym_of(&p) {
+            for p in &self.get(id).parents {
+                if let Some(ps) = self.class_sym_of(p) {
                     work.push(ps);
                 }
             }
@@ -2992,11 +3068,12 @@ impl SymbolTable {
                 }
                 by_name.entry(s.name.clone()).or_insert(*m);
             }
-            for p in self.get(id).parents.clone() {
+            for p in &self.get(id).parents {
                 // A parent written as a function type (`trait C[-T] extends
                 // (T => R)`) declares `apply`, which is what makes `C` a SAM.
-                let p = self.function_class_form(&p).unwrap_or(p);
-                if let Some(c) = self.class_sym_of(&p) {
+                let as_class = self.function_class_form(p);
+                let p = as_class.as_ref().unwrap_or(p);
+                if let Some(c) = self.class_sym_of(p) {
                     work.push(c);
                 }
             }
@@ -3246,6 +3323,32 @@ fn subst_refine_aliases(st: &SymbolTable, decls: &[RefineDecl], ty: &Type) -> Ty
 
 pub(crate) fn subst_tparams_slice(tps: &[SymbolId], args: &[Type], ty: &Type) -> Type {
     subst_map(ty, tps, args)
+}
+
+/// `subst_tparams_slice` without the copy when the substitution is the
+/// identity.
+///
+/// With no parameters to replace, or no arguments to replace them by,
+/// `subst_map` rebuilds the whole type only to hand back what it was given:
+/// `position()` finds nothing in an empty `tps`, and `args.get(i)` is `None`
+/// for every `i` when `args` is empty, so both arms fall through to
+/// `ty.clone()`. Most classes in a hierarchy walk are not generic, so this is
+/// the common case rather than a corner.
+///
+/// This is *not* the fast path an earlier pass measured and discarded (test
+/// whether `ty` mentions any of `tps`): that one walks the type and the types
+/// on this path really do mention their parameters. This one looks only at the
+/// two slice lengths.
+pub(crate) fn subst_tparams_cow<'a>(
+    tps: &[SymbolId],
+    args: &[Type],
+    ty: &'a Type,
+) -> std::borrow::Cow<'a, Type> {
+    if tps.is_empty() || args.is_empty() {
+        std::borrow::Cow::Borrowed(ty)
+    } else {
+        std::borrow::Cow::Owned(subst_map(ty, tps, args))
+    }
 }
 
 /// Replace the abstract type member `m` with `to` throughout `ty`.

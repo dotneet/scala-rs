@@ -220,7 +220,7 @@ impl Typer {
             if id.is_none() || !walked.insert(id.0) {
                 continue;
             }
-            for mem in self.st.get(id).members.clone() {
+            for &mem in &self.st.get(id).members {
                 if self.st.get(mem).flags.contains(Flags::IMPLICIT) && seen.insert(mem.0) {
                     if id != mcls && !module_sym.is_none() {
                         // Declared by a trait the object mixes in; the
@@ -233,8 +233,8 @@ impl Typer {
                     out.push(mem);
                 }
             }
-            for p in self.st.get(id).parents.clone() {
-                if let Some(ps) = self.st.class_sym_of(&p) {
+            for p in &self.st.get(id).parents {
+                if let Some(ps) = self.st.class_sym_of(p) {
                     work.push(ps);
                 }
             }
@@ -315,8 +315,8 @@ impl Typer {
         // SLS 7.2: the implicit scope of `T` also holds the companions of `T`'s
         // base classes. `=:=` has no companion object of its own, so its only
         // witness (`<:<.refl`) is reachable only through the `<:<` it extends.
-        for p in self.st.get(id).parents.clone() {
-            if let Some(ps) = self.st.class_sym_of(&p) {
+        for p in &self.st.get(id).parents {
+            if let Some(ps) = self.st.class_sym_of(p) {
                 self.collect_class_and_enclosing(ps, out, seen);
             }
         }

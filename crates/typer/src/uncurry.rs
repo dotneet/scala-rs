@@ -428,14 +428,33 @@ fn flatten_one_method(st: &mut SymbolTable, id: SymbolId) {
     }
 }
 
+/// Flatten every method symbol the run has, starting where the last call
+/// stopped.
+///
+/// This runs once per compilation unit, and a full sweep is 184 passes over
+/// ~100k symbols on slick -- one random-access read of a large `Symbol` each,
+/// so it was 4% of the compile for an answer it already had. Flattening is
+/// idempotent *and* nothing puts a symbol back: every parameter list is joined
+/// into one, and no phase from here on writes more than one.
+///
+/// The whole symbol table is typed before the first call (the driver runs
+/// `typecheck_units_src` over every unit before it lowers any of them), so the
+/// lazy class-file loading that installs a curried signature has finished.
+/// What runs between two calls is uncurry / lazy-locals / lambda-lift /
+/// superaccessors on one unit, which *append* symbols and only ever write a
+/// single parameter list (`lambda_lift` splices its captures into `paramss[0]`,
+/// `lazy_local` writes `vec![vec![cell]]`). So symbols below the mark are
+/// already flat and stay flat, and the ones added since are exactly the range
+/// scanned here.
 fn flatten_method_symbols(st: &mut SymbolTable) {
     let n = st.symbols.len();
-    for i in 1..n {
+    for i in st.flattened_upto.max(1)..n {
         let id = SymbolId(i as u32);
         if st.get(id).kind == SymKind::Method {
             flatten_one_method(st, id);
         }
     }
+    st.flattened_upto = n;
 }
 
 /// Eta-expand a method with several parameter lists into nested lambdas:
