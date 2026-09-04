@@ -1,6 +1,6 @@
-// `--no-scala-library` には `ClassTag` も `ScalaRunTime.array_update` も
-// 無いので、抽象要素型の `Array[T]` を作って埋める形は**診断**になること。
-// 実 jar を渡せば同じファイルが通る（`arraygen.rs` の 2 本で両方を留める）。
+// `--no-scala-library` has neither `ClassTag` nor `ScalaRunTime.array_update`, so
+// building and filling an `Array[T]` at an abstract element type must be a
+// **diagnostic**. Hand it a real jar and the same file passes (`arraygen.rs` pins both).
 import scala.reflect.ClassTag
 object Main {
   def repeat[T: ClassTag](x: T, n: Int): Array[T] = {

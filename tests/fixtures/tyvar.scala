@@ -1,9 +1,11 @@
-// 型変数の遅延解決（nsc の undetermined type variables）。
+// Deferred resolution of type variables (nsc's undetermined type variables).
 //
-// 引数はオーバーロード解決のために期待型なしで型付けするので、`Map.empty` の
-// ような多相参照は自分の型パラメータを抱えたまま（`Map[K, V]`）引数位置に来る。
-// nsc はそれを「未確定の型変数」として持ち回り、呼び出しの候補を選び終えてから
-// パラメータ型で一度に解く。以下はすべて実 scalac 2.13.16 が通す形。
+// Arguments are typed without an expected type so that overload resolution can run,
+// so a polymorphic reference like `Map.empty` reaches argument position still
+// carrying its own type parameters (`Map[K, V]`). nsc carries those around as
+// "undetermined type variables" and solves them all at once against the parameter
+// types, after it has picked a candidate for the call. Everything below is a shape
+// real scalac 2.13.16 accepts.
 
 object Empties {
   def m(m: Map[String, Int]): Int = m.size
@@ -19,8 +21,8 @@ object Empties {
   val e = sq(Seq.empty)
 }
 
-// 空の `apply`（`Map()` / `Vector()`）も同じ形。結果型が自分の型パラメータを
-// 抱えたまま返る。
+// An empty `apply` (`Map()` / `Vector()`) has the same shape: the result type comes
+// back still carrying its own type parameters.
 object EmptyApplies {
   def m(m: Map[String, Int]): Int = m.size
   def v(v: Vector[String]): Int = v.length
@@ -31,22 +33,23 @@ object EmptyApplies {
   val c = l(List())
 }
 
-// 未確定の型変数は入れ子の呼び出しからも漏れてくる。`id` の `T` は
-// `Map[K, V]` に解けるが、`K` と `V` は外側のパラメータ型が決める。
+// Undetermined type variables leak out of nested calls too. `id`'s `T` solves to
+// `Map[K, V]`, but `K` and `V` are decided by the outer parameter type.
 object Nested {
   def id[T](x: T): T = x
   def take(m: Map[String, Int]): Int = m.size
   val a = take(id(Map.empty))
 }
 
-// 結果型まで届いた変数は期待型が決める。`f(Map.empty)` の結果は
-// `List[Map[?K, ?V]]` で、宣言した `List[Map[String, Int]]` が `?K` / `?V` を決める。
+// A variable that reaches the result type is decided by the expected type. The
+// result of `f(Map.empty)` is `List[Map[?K, ?V]]`, and the declared
+// `List[Map[String, Int]]` decides `?K` / `?V`.
 object FromExpected {
   def f[T](x: T): List[T] = List(x)
   val a: List[Map[String, Int]] = f(Map.empty)
 }
 
-// 可変長引数・by-name・デフォルト引数の位置も同じ経路。
+// Varargs, by-name and default-argument positions take the same path.
 object OtherPositions {
   def varargs(xs: Map[String, Int]*): Int = xs.length
   def byName(m: => Map[String, Int]): Int = m.size
@@ -58,7 +61,7 @@ object OtherPositions {
   val d = withDefault(Map.empty)
 }
 
-// 引数が複数あっても、節が複数あっても同じ。
+// The same holds with several arguments, and with several clauses.
 object Clauses {
   def two(n: Int, m: Map[String, Int]): Int = n + m.size
   def curried(m: Map[String, Int])(n: Int): Int = m.size + n
@@ -66,14 +69,14 @@ object Clauses {
   val b = curried(Map.empty)(2)
 }
 
-// オーバーロードの選択そのものが未確定の型変数越しに行われる。
+// The overload choice itself is made through undetermined type variables.
 object Overloaded {
   def f(x: Seq[Int]): Int = x.sum
   def f(x: String): Int = x.length
   val a = f(Seq.empty)
 }
 
-// コンストラクタ引数も同じ経路を通る。
+// Constructor arguments go down the same path.
 class Box(val m: Map[String, Int], val v: Vector[String]) {
   def size: Int = m.size + v.length
 }
@@ -82,10 +85,10 @@ object Ctor {
   val a = new Box(Map.empty, Vector.empty).size
 }
 
-// 呼び出し側の型パラメータのほうが未確定な場合（nsc の undetparams のもう半分）。
-// `xs.collect { case … }` は `PartialFunction[Int, ?B]` に対して検査され、
-// `?B` はリテラルの結果型が決める。ここを `Any` に潰してしまうと結果型が
-// 壊れるので、引数から解いた解を使う。
+// When it is the caller's type parameter that is undetermined (the other half of
+// nsc's undetparams). `xs.collect { case … }` is checked against
+// `PartialFunction[Int, ?B]`, and `?B` is decided by the literal's result type.
+// Collapsing it to `Any` here wrecks the result type, so we use the argument's solution.
 object CalleeOpen {
   val xs = List(1, 2, 3, 4)
   val a: List[String] = xs.collect { case n if n % 2 == 0 => n.toString }

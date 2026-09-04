@@ -54,7 +54,7 @@
 //! Named arguments in a later clause (`new C(1)(c = 3, b = 2)`) fall out of
 //! the same flattening: `reorder_named_ctor_args` now looks a name up across
 //! every clause of the sole constructor, since that is the shape the
-//! arguments arrive in. README's "実装していないもの" listed this as
+//! arguments arrive in. README's "Not implemented" list had this as
 //! unsupported.
 //!
 //! # `lub` walked past the right class at the wrong arguments

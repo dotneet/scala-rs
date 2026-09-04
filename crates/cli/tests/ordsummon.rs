@@ -1,42 +1,42 @@
-//! `Ordering` の companion と summon（`Ordering[T]`）。
+//! The `Ordering` companion and summoning (`Ordering[T]`).
 //!
-//! 報告された 3 形はすべて real scalac 2.13.16 が通す:
+//! All three reported shapes are accepted by real scalac 2.13.16:
 //!
 //! ```scala
 //! Ordering.Int.reverse.compare(1, 2)   // error: value Int is not a member of Ordering[Option[AnyRef]]
-//! Ordering[String].compare("a", "b")   // 型検査は通り、実行時 ClassCastException
-//! Ordering[Int].reverse.compare(1, 2)  // 同上
+//! Ordering[String].compare("a", "b")   // typechecks, then ClassCastException at run time
+//! Ordering[Int].reverse.compare(1, 2)  // likewise
 //! ```
 //!
-//! 原因は 1 つで、`agent/integral` の回帰**ではない**（`59d967a` の
-//! バイナリでも `value Int is not a member of Ordering` と
-//! `ClassCastException` が出る）。
+//! There is a single cause, and it is **not** a regression from `agent/integral`
+//! (the `59d967a` binary reports `value Int is not a member of Ordering` and the
+//! `ClassCastException` too).
 //!
-//! `prelude::add_scala_aliases` が入れていたのは nsc の `package object scala`
-//! でいう `type Ordering[T] = scala.math.Ordering[T]` だけで、
-//! `val Ordering = scala.math.Ordering` が無かった。**項**位置の `Ordering`
-//! が trait そのものに解決され、
+//! All `prelude::add_scala_aliases` installed was what nsc's `package object scala`
+//! calls `type Ordering[T] = scala.math.Ordering[T]`; there was no
+//! `val Ordering = scala.math.Ordering`. `Ordering` in **term** position therefore
+//! resolved to the trait itself, and
 //!
-//! - `Ordering.Int` は trait のメンバを探して失敗する（`scala.math.Ordering.Int`
-//!   と完全修飾すれば通っていた）。`agent/integral` が足した
-//!   `implicit def Option[T](implicit ord: Ordering[T])` を暗黙変換の探索が
-//!   view として拾ったため、エラー文の受け手だけが
-//!   `Ordering[Option[AnyRef]]` に化けていた。
-//! - `Ordering[String]` は「trait を項に置いた型適用」として**黙って通り**、
-//!   codegen が `Ordering$.MODULE$` を `Ordering` に checkcast していた。
+//! - `Ordering.Int` looked for a member of the trait and failed (fully qualified as
+//!   `scala.math.Ordering.Int` it did work). The
+//!   `implicit def Option[T](implicit ord: Ordering[T])` that `agent/integral` added
+//!   was picked up as a view by the implicit-conversion search, which is why only
+//!   the receiver in the error text turned into `Ordering[Option[AnyRef]]`.
+//! - `Ordering[String]` went through **silently** as "a type application of a trait
+//!   in term position", and codegen checkcast `Ordering$.MODULE$` to `Ordering`.
 //!
-//! 直したのは 3 か所:
-//! 1. `prelude_ordsummon`: コンパニオン module を項の名前空間にも入れる
-//!    （`Integral` / `Fractional` は module 自体が無かったので作る）。
-//! 2. `check.rs` の `Module[T]` → `Module.apply[T]` リダイレクト:
-//!    pickle から `apply` を供給してから探す。パッケージオブジェクトの
-//!    アクセサ（`def Equiv(): Equiv$`）越しでも効くようにした。
-//! 3. `implicits.rs`: 第 1 引数リストが implicit の method は view ではない
-//!    （SLS 7.3）。`val o: Ordering[Option[Int]] = Ordering.Int` を黙って
-//!    通していた。
+//! Three places were fixed:
+//! 1. `prelude_ordsummon`: put the companion module into the term namespace too
+//!    (`Integral` / `Fractional` had no module at all, so it is created).
+//! 2. The `Module[T]` -> `Module.apply[T]` redirect in `check.rs`: supply `apply`
+//!    from the pickle before looking it up. It now also works through a package
+//!    object's accessor (`def Equiv(): Equiv$`).
+//! 3. `implicits.rs`: a method whose first parameter list is implicit is not a view
+//!    (SLS 7.3). `val o: Ordering[Option[Int]] = Ordering.Int` was going through
+//!    silently.
 //!
-//! すべて jar に対して `-Xverify:all` で実行し、real scalac の stdout と
-//! 突き合わせている。
+//! Everything is run against the jar with `-Xverify:all` and checked against real
+//! scalac's stdout.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -105,8 +105,8 @@ fn compile(out: &Path, name: &str, extra: &[&str]) -> (bool, String) {
     (output.status.success(), msgs)
 }
 
-/// `-Xverify:all`: `Ordering[String]` が返すのは本当に `Ordering` の
-/// インスタンスであって `Ordering$` ではない、をベリファイアにも通す。
+/// `-Xverify:all`: make the verifier agree that what `Ordering[String]` returns is
+/// really an instance of `Ordering` and not of `Ordering$`.
 fn run_main(out: &Path, jar: Option<&Path>) -> String {
     let cp = match jar {
         Some(j) => format!("{}:{}", out.display(), j.display()),
@@ -140,7 +140,7 @@ fn jar_run(name: &str) {
     let _ = fs::remove_dir_all(&out);
 }
 
-/// 期待値は real scalac 2.13.16 が印字するものでなければならない。
+/// The expectation has to be what real scalac 2.13.16 prints.
 fn matches_real_scalac(name: &str) {
     let (Some(scalac), Some(jar), true) = (find_scalac(), scala_library_jar(), java_available())
     else {
@@ -162,7 +162,7 @@ fn matches_real_scalac(name: &str) {
     let _ = fs::remove_dir_all(&ref_out);
 }
 
-/// jar に対してスニペットを 1 つコンパイルし、診断を返す。
+/// Compile one snippet against the jar and return the diagnostics.
 fn compile_src(src: &str, tag: &str) -> (bool, String) {
     let Some(jar) = scala_library_jar() else {
         return (true, String::new());
@@ -199,8 +199,8 @@ fn os2_summon_matches_real_scalac() {
     matches_real_scalac("os2_summon");
 }
 
-/// コンパニオンを項に出せるようにしたことで「なんでも通る」ようにしては
-/// いけない。real scalac もこの 5 行を、同じ 5 行で拒否する。
+/// Letting the companion stand in term position must not turn into "anything goes".
+/// Real scalac rejects these 5 lines too, and rejects the same 5.
 #[test]
 fn os2_summon_bad_is_rejected() {
     let Some(jar) = scala_library_jar() else {
@@ -229,9 +229,9 @@ fn os2_summon_bad_is_rejected() {
     let _ = fs::remove_dir_all(&out);
 }
 
-/// 私有ランタイム（`--no-scala-library`）には `scala/math/Ordering` の
-/// classfile も `Ordering$` も無い。`prelude_ordsummon` は `library_abi`
-/// でゲートしてあり、黙って通すのではなく診断が出る。
+/// The private runtime (`--no-scala-library`) has neither a `scala/math/Ordering`
+/// classfile nor `Ordering$`. `prelude_ordsummon` is gated on `library_abi`, so a
+/// diagnostic comes out rather than silent acceptance.
 #[test]
 fn summon_is_diagnosed_without_the_jar() {
     let out = tmp_dir("os2-private");
@@ -249,8 +249,8 @@ fn summon_is_diagnosed_without_the_jar() {
 
 // ------------------------------------------------------------------ snippets
 
-/// 報告された 3 形、そのまま。`ClassCastException` は型検査を通ったあとに
-/// 出ていたので、コンパイルできることだけでは足りず、実行して確かめる。
+/// The three reported shapes, verbatim. The `ClassCastException` came after
+/// typechecking, so compiling is not enough -- we run them to be sure.
 #[test]
 fn the_three_reported_forms_run() {
     let (Some(jar), true) = (scala_library_jar(), java_available()) else {
@@ -284,9 +284,9 @@ fn the_three_reported_forms_run() {
     let _ = fs::remove_dir_all(&out);
 }
 
-/// `Ordering.Option` は導出規則であって view ではない。`sorted` は今までどおり
-/// 導出できなければならない（`agent/integral` の
-/// `ordering_of_option_is_derived` と同じもの）。
+/// `Ordering.Option` is a derivation rule, not a view. `sorted` must still derive as
+/// before (the same thing as `agent/integral`'s
+/// `ordering_of_option_is_derived`).
 #[test]
 fn option_ordering_is_still_derived_but_is_not_a_view() {
     let (ok, msgs) = compile_src(
@@ -317,9 +317,10 @@ fn option_ordering_is_still_derived_but_is_not_a_view() {
     );
 }
 
-/// `Integral[Int]` は `agent/integral` 以降、trait そのものが項に立って
-/// **黙って通り**、実行時 `ClassCastException: scala.math.Integral$ cannot be
-/// cast to scala.math.Integral` になっていた（`59d967a` では型エラー）。
+/// Since `agent/integral`, `Integral[Int]` had the trait itself standing in term
+/// position and went through **silently**, giving a run-time
+/// `ClassCastException: scala.math.Integral$ cannot be cast to scala.math.Integral`
+/// (`59d967a` gave a type error).
 #[test]
 fn integral_and_fractional_summon() {
     let (Some(jar), true) = (scala_library_jar(), java_available()) else {
@@ -354,7 +355,7 @@ fn integral_and_fractional_summon() {
     let _ = fs::remove_dir_all(&out);
 }
 
-/// 既存の `Module[T]` リダイレクト（`List[Int]()` など）は壊れていない。
+/// The existing `Module[T]` redirect (`List[Int]()` and the like) is not broken.
 #[test]
 fn module_apply_redirect_still_works() {
     let (ok, msgs) = compile_src(

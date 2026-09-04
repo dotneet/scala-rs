@@ -1,5 +1,5 @@
-// 私有ランタイム（`--no-scala-library`）で動く `List` のコアメンバ。
-// ここに出てくるものは `crates/backend/src/runtime.rs` が classfile に実装する。
+// The core `List` members that work under the private runtime (`--no-scala-library`).
+// Everything here is implemented as a classfile by `crates/backend/src/runtime.rs`.
 object Main {
   def main(args: Array[String]): Unit = {
     val xs = 3 :: 1 :: 4 :: 1 :: Nil

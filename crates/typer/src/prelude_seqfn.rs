@@ -1,55 +1,54 @@
-//! `Seq[+A]` は `PartialFunction[Int, A]` である（したがって `Int => A`）。
+//! A `Seq[+A]` is a `PartialFunction[Int, A]` (hence an `Int => A`).
 //!
-//! 2.13 の `scala.collection.Seq[A]` 宣言そのものが `PartialFunction[Int, A]`
-//! を継承している（`javap scala/collection/Seq`）:
+//! In 2.13 the declaration of `scala.collection.Seq[A]` itself extends
+//! `PartialFunction[Int, A]` (`javap scala/collection/Seq`):
 //!
 //! ```text
 //! public interface scala.collection.Seq<A> extends scala.collection.Iterable<A>,
 //!   scala.PartialFunction<java.lang.Object, A>, scala.collection.SeqOps<...>, scala.Equals
 //! ```
 //!
-//! `prelude_hier.rs` は `Iterable` への辺しか張っていなかったので、
+//! `prelude_hier.rs` wired up only the edge to `Iterable`, so
 //!
 //! ```scala
-//! val f: Int => Int = List(10, 20, 30)   // scalac は通す
-//! List(0, 2).map(f)                       // Seq を Int => A として渡す
-//! List(1, 2).isDefinedAt(5)                // PartialFunction 経由で生える
+//! val f: Int => Int = List(10, 20, 30)   // scalac accepts this
+//! List(0, 2).map(f)                       // pass a Seq as an Int => A
+//! List(1, 2).isDefinedAt(5)                // grows through PartialFunction
 //! ```
 //!
-//! が `type mismatch; found: List[Int]  required: (Int) => Int` になっていた。
-//! `Map` と同じ形（`prelude_mism4.rs`）で辺を 1 本足す。`Set[A] <: A =>
-//! Boolean` も実在するが、ここでは張らない（今回の担当範囲外）。
+//! came out as `type mismatch; found: List[Int]  required: (Int) => Int`. One edge is
+//! added, the same shape as `Map` (`prelude_mism4.rs`). `Set[A] <: A => Boolean` is
+//! real too, but is not wired up here (out of scope for this slice).
 //!
-//! 辺は `scala/collection/Seq`（`prelude_hier` が組み立てる、`List` /
-//! `Vector` / `ArraySeq` / `Range` / `LazyList` / `Queue` /
-//! `mutable.Seq`（`Buffer` / `ArrayBuffer` / `ListBuffer` を含む）などすべての
-//! 共通祖先）1 箇所にだけ張る。`base_type_seq` は親を推移的にたどるので、
-//! これだけで下位のすべての具象コレクションに伝播する（`Vector[Int] <: Int
-//! => Int` などは実際に dual-run で確認済み）。
+//! The edge goes in one place only: `scala/collection/Seq` (assembled by
+//! `prelude_hier`, the common ancestor of `List` / `Vector` / `ArraySeq` / `Range` /
+//! `LazyList` / `Queue` / `mutable.Seq` (including `Buffer` / `ArrayBuffer` /
+//! `ListBuffer`) and the rest). `base_type_seq` walks parents transitively, so that
+//! alone propagates to every concrete collection below it (`Vector[Int] <: Int => Int`
+//! and friends were confirmed by dual runs).
 //!
-//! `Map` と違い（`prelude_mism4.rs` のコメント参照）、`PartialFunction` を
-//! 直接の親にしても壊れる既知のメンバがない。`Seq.apply(Int): A` は具象
-//! メンバとして `List` 自身の `members` に載っており、`lookup_member` は
-//! owner 自身のメンバを親のメンバより先に集める。`Seq[A]` が
-//! `SeqOps.apply(Int): A` と `PartialFunction[Int, A].apply(Int): A` という
-//! 「実体化後にしか区別できない」2 つの `apply` を持つケースは
-//! `check.rs` の `overload_member_types`（型検査コンテキスト）がすでに
-//! 一般的に扱う設計になっている（そのものずばりの doc コメントがある）。
+//! Unlike `Map` (see the comment in `prelude_mism4.rs`), there is no known member that
+//! breaks when `PartialFunction` is made a direct parent. `Seq.apply(Int): A` sits in
+//! `List`'s own `members` as a concrete member, and `lookup_member` collects an
+//! owner's own members before its parents'. The case where `Seq[A]` has two `apply`s
+//! that can only be told apart after instantiation -- `SeqOps.apply(Int): A` and
+//! `PartialFunction[Int, A].apply(Int): A` -- is already handled in general by
+//! `overload_member_types` in `check.rs` (the typechecking context), which has a doc
+//! comment saying exactly that.
 //!
-//! `PartialFunction` には `lift` / `orElse` も生える（nsc: `javap
-//! scala.PartialFunction` の default メソッド）。`prelude.rs::add_partial_function`
-//! は `apply` / `isDefinedAt` / `applyOrElse` までしか足していなかった。
+//! `PartialFunction` also grows `lift` / `orElse` (nsc: the default methods in
+//! `javap scala.PartialFunction`). `prelude.rs::add_partial_function` only added
+//! `apply` / `isDefinedAt` / `applyOrElse`.
 //!
-//! **library_abi 専用**: 私有ランタイム（`--no-scala-library`、
-//! `crates/backend/src/runtime.rs`）の `scala/PartialFunction` は
-//! `isDefinedAt` / `applyOrElse` しか持たない抽象インタフェースで、`lift` /
-//! `orElse` の default 実装が無く、`List` / `Vector` などの private
-//! classfile も `scala/PartialFunction` / `scala/Function1` を implements
-//! しない。辺やメンバをそこで足すと「型は通るが invokeinterface が実装の
-//! ない相手に飛ぶ」壊れたリンクになる（`prelude_fntuple.rs` の
-//! `tupled`/`curried` と同じ理由）。`--no-scala-library` では今まで通り
-//! `type mismatch` / `value lift is not a member of ...` という診断のまま
-//! にする。
+//! **`library_abi` only**: the private runtime's `scala/PartialFunction`
+//! (`--no-scala-library`, `crates/backend/src/runtime.rs`) is an abstract interface
+//! with nothing but `isDefinedAt` / `applyOrElse`, with no default implementation of
+//! `lift` / `orElse`, and the private classfiles for `List` / `Vector` and the rest do
+//! not implement `scala/PartialFunction` / `scala/Function1` either. Adding the edge
+//! or the members there would make a broken link -- "the types go through but the
+//! invokeinterface lands on something with no implementation" (the same reason as
+//! `tupled`/`curried` in `prelude_fntuple.rs`). Under `--no-scala-library` the
+//! diagnostics stay as they were: `type mismatch` / `value lift is not a member of ...`.
 
 use crate::prelude::fn1;
 use crate::symbol::{Intrinsic, SymbolTable};

@@ -1,5 +1,5 @@
-// agent/dbio: 親コンストラクタの名前付き引数は「通す」だけではなく、
-// 名前が違えば従来どおり診断されなければならない。
+// agent/dbio: named arguments to a parent constructor must not merely be
+// accepted -- a wrong name still has to be diagnosed as before.
 abstract class Act(_name: String, statement: String)
 
 class Wrong extends Act(_name = "Wrong", stmt = "s")

@@ -1,42 +1,43 @@
-//! `scala.math` の型クラス階層（`Numeric` / `Integral` / `Fractional` /
-//! `Ordering`）の親子関係と、`object Numeric` の implicit インスタンスの型。
+//! The parent-child relations of the `scala.math` type class hierarchy (`Numeric` /
+//! `Integral` / `Fractional` / `Ordering`), and the types of `object Numeric`'s
+//! implicit instances.
 //!
-//! `crates/typer/src/prelude.rs` の `install_prelude` から 1 行だけ呼ばれる。
-//! マージ衝突を避けるため新規モジュールに分けた（`.agent-brief.md` の方針）。
+//! Called on a single line from `install_prelude` in `crates/typer/src/prelude.rs`.
+//! Split into a new module to avoid merge conflicts (`.agent-brief.md`'s policy).
 //!
-//! prelude は `scala.math.Numeric` を「`sum` / `product` の implicit 引数を
-//! 解決するための入れ物」として合成しているだけで、実 ABI の
+//! The prelude only synthesised `scala.math.Numeric` as "a box for resolving the
+//! implicit arguments of `sum` / `product`"; it did not mirror the real ABI's
 //! `interface scala.math.Numeric<T> extends scala.math.Ordering<T>`
-//! （`javap` で確認）という継承を写していなかった。そのため
+//! (confirmed with `javap`). As a result
 //!
 //! ```scala
 //! class B[T](implicit ct: ClassTag[T], ord: Ordering[T])
 //! class N[T](implicit tag: ClassTag[T], num: Numeric[T]) extends B[T]()(tag, num)
 //! ```
 //!
-//! （slick `ScalaNumericType`）の `Numeric[T]` → `Ordering[T]` が通らず、
-//! `no matching overload for constructor` になっていた。メンバ解決だけは
-//! `lookup_member` が別経路で当たっていたので、症状は「サブタイプだけ落ちる」
-//! という分かりにくい形で出る。
+//! (slick `ScalaNumericType`) did not admit `Numeric[T]` as `Ordering[T]` and came
+//! out as `no matching overload for constructor`. Member resolution alone did hit by
+//! another route through `lookup_member`, so the symptom showed up in the confusing
+//! shape of "only subtyping fails".
 //!
-//! # `Integral` / `Fractional`（`agent/integral`）
+//! # `Integral` / `Fractional` (`agent/integral`)
 //!
-//! `List.range(0, 5)` / `Vector.range` / `Seq.range` は
-//! `IterableFactory#range[A](start: A, end: A)(implicit ord: Integral[A])` で、
-//! `no implicit: could not find implicit value of type Integral[Int]` に
-//! なっていた。原因は 2 つ:
+//! `List.range(0, 5)` / `Vector.range` / `Seq.range` are
+//! `IterableFactory#range[A](start: A, end: A)(implicit ord: Integral[A])`, and came
+//! out as `no implicit: could not find implicit value of type Integral[Int]`. Two
+//! causes:
 //!
-//! 1. `Integral` / `Fractional` は prelude の時点では symbol table にいない。
-//!    ソースが名前を出すと `pickle_supply` がスタブを起こし、**メンバ解決に
-//!    失敗したときだけ** pickle から親（`Numeric`）を後付けする。つまり
-//!    subtyping の判定には間に合わず、`Integral[T] <: Numeric[T]` の辺が
-//!    無いままだった。
-//! 2. `object Numeric` の implicit インスタンスに `Numeric[Int]` を付けて
-//!    いた。実 ABI は `Numeric$IntIsIntegral$` が
-//!    `Numeric$IntIsIntegral extends Integral<Object>` を実装しており、
-//!    `Integral[Int]` が正しい。
+//! 1. `Integral` / `Fractional` are not in the symbol table at prelude time. When the
+//!    source mentions the name, `pickle_supply` raises a stub and attaches the parent
+//!    (`Numeric`) from the pickle **only when member resolution fails**. That is too
+//!    late for the subtyping check, so the `Integral[T] <: Numeric[T]` edge stayed
+//!    missing.
+//! 2. `object Numeric`'s implicit instances were given `Numeric[Int]`. In the real
+//!    ABI `Numeric$IntIsIntegral$` implements
+//!    `Numeric$IntIsIntegral extends Integral<Object>`, so `Integral[Int]` is the
+//!    correct one.
 //!
-//! `javap -p -s /tmp/scala-rs-lib/scala-library-2.13.16.jar` で確かめた形:
+//! The shapes confirmed with `javap -p -s /tmp/scala-rs-lib/scala-library-2.13.16.jar`:
 //!
 //! ```text
 //! interface scala.math.Numeric<T>    extends scala.math.Ordering<T>
@@ -61,17 +62,17 @@
 //! interface Numeric$BigDecimalIsFractional extends Numeric$BigDecimalIsConflicted, Fractional<BigDecimal>
 //! ```
 //!
-//! どれが implicit として実際に選ばれるかは、実 scalac に
-//! `implicitly[…].getClass.getName` を出力させて確かめた（`BigDecimal` には
-//! `BigDecimalAsIfIntegral` も居るが implicit ではない）。
+//! Which one is actually picked as the implicit was confirmed by having real scalac
+//! print `implicitly[…].getClass.getName` (`BigDecimal` also has a
+//! `BigDecimalAsIfIntegral`, but it is not implicit).
 //!
-//! # 曖昧性が増えない理由
+//! # Why this adds no ambiguity
 //!
-//! `Ordering[Int]` の implicit scope（SLS 7.2）は `Ordering` とその親、および
-//! `Int` の companion で、`Numeric` の companion は**入らない**。だから
-//! `IntIsIntegral` に `Integral[Int]`（`<: Ordering[Int]`）を与えても
-//! `Ordering[Int]` の候補は `Ordering.Int` のままで、増えない。実 scalac も
-//! `implicitly[Ordering[Int]]` に `Ordering$Int$` を返す。
+//! The implicit scope of `Ordering[Int]` (SLS 7.2) is `Ordering` and its parents plus
+//! `Int`'s companion; `Numeric`'s companion is **not** in it. So giving
+//! `IntIsIntegral` an `Integral[Int]` (`<: Ordering[Int]`) leaves the candidates for
+//! `Ordering[Int]` at just `Ordering.Int`, unchanged. Real scalac also returns
+//! `Ordering$Int$` for `implicitly[Ordering[Int]]`.
 
 use crate::symbol::{SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};
@@ -85,10 +86,11 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     };
     add_parent(st, numeric, ordering);
     if !library_abi {
-        // 私有ランタイム（`--no-scala-library`）には `scala/math/Integral` の
-        // classfile も `Numeric$IntIsIntegral$` も無い。ここで型だけ生やすと
-        // 「読み込めないクラスを参照するバイトコード」になるので触らない。
-        // 未実装は診断のまま（`.agent-brief.md` の「スタブ禁止」）。
+        // The private runtime (`--no-scala-library`) has neither a
+        // `scala/math/Integral` classfile nor `Numeric$IntIsIntegral$`. Growing just
+        // the types here would make "bytecode referring to a class that cannot be
+        // loaded", so leave it alone. Unimplemented stays a diagnostic
+        // (`.agent-brief.md`, "no stubs").
         return;
     }
     let integral = ensure_typeclass(st, "scala/math/Integral", "Integral");
@@ -99,13 +101,13 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     add_ordering_option(st, ordering);
 }
 
-/// `object Ordering` の `implicit def Option[T](implicit ord: Ordering[T]):
-/// Ordering[Option[T]]`。
+/// `object Ordering`'s `implicit def Option[T](implicit ord: Ordering[T]):
+/// Ordering[Option[T]]`.
 ///
 /// jar: `Ordering$.Option:(Lscala/math/Ordering;)Lscala/math/Ordering;`
-/// （`javap -p -s scala.math.Ordering$`）。`Ordering.TupleN`
-/// （`prelude_ordtuple.rs`）と同じ形の穴で、これが無いと
-/// `List(Some(2), None).sorted` が `no implicit` になる。
+/// (`javap -p -s scala.math.Ordering$`). The same shape of hole as `Ordering.TupleN`
+/// (`prelude_ordtuple.rs`); without it `List(Some(2), None).sorted` comes out as
+/// `no implicit`.
 fn add_ordering_option(st: &mut SymbolTable, ordering: SymbolId) {
     let Some(module) = crate::classpath::find_by_jvm(st, "scala/math/Ordering$") else {
         return;
@@ -167,8 +169,8 @@ fn add_ordering_option(st: &mut SymbolTable, ordering: SymbolId) {
     }
 }
 
-/// `child[T] extends parent[T]`。`child` の最初の型パラメータをそのまま
-/// 渡す（`Numeric[T] <: Ordering[T]`）。すでに同じ親を持つなら何もしない。
+/// `child[T] extends parent[T]`, passing `child`'s first type parameter straight
+/// through (`Numeric[T] <: Ordering[T]`). Does nothing if the parent is already there.
 fn add_parent(st: &mut SymbolTable, child: SymbolId, parent: SymbolId) {
     if st.get(child).kind != SymKind::Class {
         return;
@@ -190,13 +192,13 @@ fn add_parent(st: &mut SymbolTable, child: SymbolId, parent: SymbolId) {
         .push(Type::Class { sym: parent, args });
 }
 
-/// `trait <name>[T]` を prelude に用意し、`add_scala_aliases` と同じように
-/// 無修飾名でも引けるようにする。
+/// Provide `trait <name>[T]` in the prelude and make it reachable by its unqualified
+/// name, the way `add_scala_aliases` does.
 ///
-/// 型パラメータ名を `T` にするのは pickle 側と合わせるため:
-/// `pickle_supply` は `st.get(cls).tparams` の**名前**でスコープを作って
-/// `quot(T, T): T` を写すので、名前が違うと写せない。実ライブラリの
-/// `trait Integral[T]` / `trait Fractional[T]` も `T`。
+/// The type parameter is named `T` to line up with the pickle side: `pickle_supply`
+/// builds its scope from the **names** in `st.get(cls).tparams` in order to mirror
+/// `quot(T, T): T`, so a different name cannot be mirrored. The real library's
+/// `trait Integral[T]` / `trait Fractional[T]` use `T` as well.
 fn ensure_typeclass(st: &mut SymbolTable, jvm: &str, name: &str) -> SymbolId {
     let id = match crate::classpath::find_by_jvm(st, jvm) {
         Some(id) => id,
@@ -233,8 +235,8 @@ fn ensure_typeclass(st: &mut SymbolTable, jvm: &str, name: &str) -> SymbolId {
     id
 }
 
-/// `object Numeric` の implicit インスタンスに、実 ABI どおりの
-/// `Integral[…]` / `Fractional[…]` を付け直し、足りない分を足す。
+/// Re-type `object Numeric`'s implicit instances to the `Integral[…]` /
+/// `Fractional[…]` the real ABI states, and add the missing ones.
 fn retype_numeric_instances(
     st: &mut SymbolTable,
     numeric: SymbolId,
@@ -309,8 +311,8 @@ fn retype_numeric_instances(
         let Some(arg) = arg else { continue };
         set_instance(st, num_cls, name, jvm, tc, arg);
     }
-    // `Numeric.IntIsIntegral` のような修飾名でも引けるように、モジュール側にも
-    // 同じメンバを持たせる（`prelude_seq::add_numeric` と同じ扱い）。
+    // Give the module side the same members, so that a qualified name such as
+    // `Numeric.IntIsIntegral` resolves too (same treatment as `prelude_seq::add_numeric`).
     let known: Vec<SymbolId> = st.get(num_mod).members.clone();
     for m in st.get(num_cls).members.clone() {
         if !known.contains(&m) {
@@ -319,8 +321,8 @@ fn retype_numeric_instances(
     }
 }
 
-/// `implicit object <name> extends <tc>[<arg>]`（`<jvm>.MODULE$`）を
-/// 作る、または既にあるものの型を書き換える。
+/// Create `implicit object <name> extends <tc>[<arg>]` (`<jvm>.MODULE$`), or re-type
+/// the existing one.
 fn set_instance(
     st: &mut SymbolTable,
     num_cls: SymbolId,
@@ -333,9 +335,9 @@ fn set_instance(
         sym: tc,
         args: vec![arg],
     };
-    // `add_implicit_instance` は module シンボルの `ty` を `ModuleRef` から
-    // `Numeric[Int]` に**上書き**するので、`module_class_of` はもう
-    // module class に辿り着けない。名前で引く。
+    // `add_implicit_instance` **overwrites** the module symbol's `ty` from `ModuleRef`
+    // to `Numeric[Int]`, so `module_class_of` can no longer reach the module class.
+    // Look it up by name.
     let members = st.get(num_cls).members.clone();
     let cls_name = format!("{name}$");
     let cls = match members

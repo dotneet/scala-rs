@@ -10,6 +10,7 @@ scala-rs-span.workspace = true
 scala-rs-parser.workspace = true
 scala-rs-pickle.workspace = true
 scala-rs-typer.workspace = true
+rustc-hash.workspace = true
 
 [dev-dependencies]
 zip = { version = "0.6", default-features = false, features = ["deflate"] }

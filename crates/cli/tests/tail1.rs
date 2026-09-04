@@ -7,8 +7,8 @@
 //! # (1) `value X is not a member of Y$` through a package-object `val`
 //!
 //! `agent/companionkind` split every jar module's companion from its class,
-//! but left one adjacent hole (documented in README's "コンパニオンとクラスは
-//! 別のシンボル" section): a companion's *nested* class or object could not
+//! but left one adjacent hole (documented in README's "a companion and its class
+//! are separate symbols" section): a companion's *nested* class or object could not
 //! be found when the companion itself was reached through a package object's
 //! `val` alias -- exactly the shape `cats.effect`'s `package object effect`
 //! uses to re-export `Resource` and `Outcome` from `cats.effect.kernel`.

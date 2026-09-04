@@ -1,27 +1,26 @@
-//! `scala.collection.immutable.List` のコアメンバ（scala-library 2.13.16 ABI）。
+//! The core members of `scala.collection.immutable.List` (scala-library 2.13.16 ABI).
 //!
-//! `prelude.rs` からは [`add_list_core`] を 1 行呼ぶだけにしてある。
-//! ここで宣言するシグネチャは `javap -s` で確認した 2.13.16 の実 descriptor に
-//! 対応しており、対応する invoke は `crates/backend/src/gen.rs` の
-//! `emit_list_core_member` が出す。
+//! `prelude.rs` calls [`add_list_core`] on a single line. The signatures declared
+//! here correspond to the real 2.13.16 descriptors confirmed with `javap -s`, and
+//! the matching invokes are emitted by `emit_list_core_member` in
+//! `crates/backend/src/gen.rs`.
 //!
-//! 実 `List` 自身が持たないメンバ（`size` / `mkString` / `sum` / `groupBy` /
-//! `sortBy` …）は `IterableOnceOps` / `IterableOps` / `SeqOps` の
-//! default メソッドなので、戻り値が `Object` に erase される。gen.rs 側で
-//! checkcast / unbox する。
+//! The members the real `List` does not have itself (`size` / `mkString` / `sum` /
+//! `groupBy` / `sortBy` …) are default methods on `IterableOnceOps` / `IterableOps` /
+//! `SeqOps`, so their results erase to `Object`. gen.rs checkcasts / unboxes them.
 //!
-//! **私有ランタイム（`--no-scala-library`）** では、
-//! `crates/backend/src/runtime.rs` の `add_list_core_runtime` が実際に
-//! classfile へ出す分（`length` / `size` / `nonEmpty` / `last` / `reverse` /
-//! `filter` / `filterNot` / `contains` / `exists` / `forall` / `count` /
-//! `take` / `drop` / `mkString`）だけを宣言する。それ以外は宣言しないので
-//! `value X is not a member of List[A]` の診断が出る（黙って通さない）。
+//! Under the **private runtime (`--no-scala-library`)**, only what
+//! `add_list_core_runtime` in `crates/backend/src/runtime.rs` actually emits into the
+//! classfile is declared (`length` / `size` / `nonEmpty` / `last` / `reverse` /
+//! `filter` / `filterNot` / `contains` / `exists` / `forall` / `count` / `take` /
+//! `drop` / `mkString`). Nothing else is declared, so the diagnostic
+//! `value X is not a member of List[A]` comes out (rather than silent acceptance).
 
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 // ---------------------------------------------------------------------------
-// 小さなヘルパ（prelude.rs のものと同等。衝突を避けるためこのファイルに閉じる）
+// Small helpers (equivalent to prelude.rs's; kept local to this file to avoid clashes)
 // ---------------------------------------------------------------------------
 
 fn type_param(st: &mut SymbolTable, owner: SymbolId, name: &str) -> SymbolId {
@@ -44,7 +43,7 @@ fn fn2(a: Type, b: Type, ret: Type) -> Type {
     }
 }
 
-/// 単純メソッド（型パラメータ・暗黙引数なし）。
+/// A plain method (no type parameters, no implicit arguments).
 fn simple(
     st: &mut SymbolTable,
     owner: SymbolId,
@@ -66,11 +65,12 @@ fn simple(
     id
 }
 
-/// 複数引数リスト（2 番目以降は implicit 扱い）＋メソッド型パラメータを持つ
-/// メソッドを、既存シンボルがあればその場で書き換え、無ければ新規に作る。
+/// A method with several parameter lists (the second and later are treated as
+/// implicit) plus method type parameters, rewriting an existing symbol in place when
+/// there is one and creating a new one otherwise.
 ///
-/// `reuse` が `Some(id)` のときは `id` を書き換える（`map` のような既存の
-/// 近似シグネチャを真に多相なものへ差し替える用途）。
+/// When `reuse` is `Some(id)`, `id` is rewritten (used to replace an existing
+/// approximate signature such as `map`'s with a truly polymorphic one).
 fn poly_in(
     st: &mut SymbolTable,
     reuse: Option<SymbolId>,
@@ -82,7 +82,7 @@ fn poly_in(
 ) -> SymbolId {
     let m = match reuse {
         Some(id) => {
-            // 使い回すシンボルは型パラメータ・引数を作り直す。
+            // A reused symbol has its type parameters and arguments rebuilt.
             st.get_mut(id).tparams.clear();
             st.get_mut(id).params.clear();
             st.get_mut(id).paramss.clear();
@@ -141,7 +141,7 @@ fn poly(
     poly_in(st, None, owner, name, tparam_names, usize::MAX, build)
 }
 
-/// 暗黙引数リストを持つメソッド。`implicit_from` 番目以降の引数リストが implicit。
+/// A method with implicit parameter lists. Lists from `implicit_from` on are implicit.
 fn poly_implicit(
     st: &mut SymbolTable,
     owner: SymbolId,
@@ -153,7 +153,7 @@ fn poly_implicit(
     poly_in(st, None, owner, name, tparam_names, implicit_from, build)
 }
 
-/// `owner` 直下（継承は見ない）の同名メソッドのうち最初のもの。
+/// The first same-named method directly under `owner` (inherited ones are not considered).
 fn own_method(st: &SymbolTable, owner: SymbolId, name: &str) -> Option<SymbolId> {
     st.get(owner)
         .members
@@ -183,7 +183,7 @@ fn find_iface(st: &mut SymbolTable, jvm: &str) -> SymbolId {
     id
 }
 
-/// `object <name>` を `owner` の下に作る（既にあればそれを返す）。
+/// Create `object <name>` under `owner` (returning the existing one if there is one).
 fn find_or_make_module(
     st: &mut SymbolTable,
     owner: SymbolId,
@@ -213,7 +213,7 @@ fn find_or_make_module(
     (m, cls)
 }
 
-/// `implicit object <name> extends <tc>[<arg>]`（`<jvm>.MODULE$`）。
+/// `implicit object <name> extends <tc>[<arg>]` (`<jvm>.MODULE$`).
 fn add_implicit_instance(
     st: &mut SymbolTable,
     companion_cls: SymbolId,
@@ -245,7 +245,7 @@ fn add_implicit_instance(
 
 // ---------------------------------------------------------------------------
 
-/// 型構築に使う周辺シンボル。
+/// The surrounding symbols used to build types.
 struct Env {
     list: SymbolId,
     a: SymbolId,
@@ -297,12 +297,12 @@ fn find_in_scala_pkg(st: &SymbolTable, name: &str) -> SymbolId {
         .unwrap_or(SymbolId::NONE)
 }
 
-/// `List` のコアメンバ。
+/// The core members of `List`.
 ///
-/// `library_abi` のときは scala-library 2.13.16 の実シグネチャ一式を足す。
-/// 私有ランタイム（`--no-scala-library`）のときは
-/// `crates/backend/src/runtime.rs` が実際に classfile を出す分だけを足し、
-/// それ以外は宣言しない（＝`value X is not a member of List[A]` の診断が出る）。
+/// Under `library_abi`, the whole set of real scala-library 2.13.16 signatures is
+/// added. Under the private runtime (`--no-scala-library`), only what
+/// `crates/backend/src/runtime.rs` actually emits into the classfile is added and
+/// nothing else is declared (i.e. `value X is not a member of List[A]` comes out).
 pub(crate) fn add_list_core(st: &mut SymbolTable, library_abi: bool) {
     let list = st.list_sym;
     let Some(a) = st.get(list).tparams.first().copied() else {
@@ -323,7 +323,7 @@ pub(crate) fn add_list_core(st: &mut SymbolTable, library_abi: bool) {
         let p = type_param(st, iterable, "A");
         st.get_mut(iterable).tparams = vec![p];
     }
-    // `List` は 2.13 で `scala.collection.Iterable` / `IterableOnce`。
+    // In 2.13 `List` is a `scala.collection.Iterable` / `IterableOnce`.
     add_parent(st, list, iterable, 1);
     add_parent(st, list, iterable_once, 1);
 
@@ -359,9 +359,9 @@ pub(crate) fn add_list_core(st: &mut SymbolTable, library_abi: bool) {
     add_iterator_to_list(st, &env);
 }
 
-/// 私有ランタイムの `List` classfile（`crates/backend/src/runtime.rs` の
-/// `add_list_core_runtime`）が実装している分だけ。ここに無いメンバは
-/// 非 jar モードで診断になる。
+/// Only what the private runtime's `List` classfile (`add_list_core_runtime` in
+/// `crates/backend/src/runtime.rs`) implements. Members absent from here become a
+/// diagnostic in non-jar mode.
 fn add_list_core_private(st: &mut SymbolTable, list: SymbolId, a: SymbolId) {
     let ta = Type::TypeParam(a);
     let list_a = Type::Class {
@@ -415,8 +415,8 @@ fn add_parent(st: &mut SymbolTable, cls: SymbolId, parent: SymbolId, nargs: usiz
         .push(Type::Class { sym: parent, args });
 }
 
-/// `scala.math.Numeric` と `sum` / `product` 用の implicit インスタンス。
-/// JVM: `scala/math/Numeric$IntIsIntegral$.MODULE$` 等。
+/// `scala.math.Numeric` and the implicit instances for `sum` / `product`.
+/// JVM: `scala/math/Numeric$IntIsIntegral$.MODULE$` and friends.
 fn add_numeric(st: &mut SymbolTable) -> SymbolId {
     let numeric = find_iface(st, "scala/math/Numeric");
     if st.get(numeric).tparams.is_empty() {
@@ -441,7 +441,7 @@ fn add_numeric(st: &mut SymbolTable) -> SymbolId {
             "scala/math/Numeric$DoubleIsFractional$",
             Type::Double,
         ),
-        // `Ordering$Byte$` / `Ordering$Short$` と同じ理由。
+        // Same reason as `Ordering$Byte$` / `Ordering$Short$`.
         (
             "ByteIsIntegral",
             "scala/math/Numeric$ByteIsIntegral$",
@@ -460,8 +460,8 @@ fn add_numeric(st: &mut SymbolTable) -> SymbolId {
     numeric
 }
 
-/// `sorted` / `max` / `sortBy` 用に `Ordering` の implicit インスタンスを増やす
-/// （`Int` / `Char` は prelude.rs 側で既に入っている）。
+/// Add more `Ordering` implicit instances for `sorted` / `max` / `sortBy`
+/// (`Int` / `Char` are already installed on the prelude.rs side).
 fn add_ordering_instances(st: &mut SymbolTable, ordering: SymbolId) {
     let math = crate::classpath::ensure_package(st, "scala/math");
     let (ord_mod, ord_cls) = find_or_make_module(st, math, "Ordering", "scala/math/Ordering$");
@@ -469,17 +469,16 @@ fn add_ordering_instances(st: &mut SymbolTable, ordering: SymbolId) {
         ("String", "scala/math/Ordering$String$", Type::String),
         ("Long", "scala/math/Ordering$Long$", Type::Long),
         ("Boolean", "scala/math/Ordering$Boolean$", Type::Boolean),
-        // `Byte` と `Short` は JVM プリミティブとして本物になったので
-        // （`java/lang/Byte` / `java/lang/Short` へ erase される）、
-        // `xs.sortBy(_.keySeq)` の `Ordering[Short]` も要る。
-        // jar には `Ordering$Byte$` / `Ordering$Short$` が実在する。
+        // `Byte` and `Short` became real JVM primitives (they erase to
+        // `java/lang/Byte` / `java/lang/Short`), so `xs.sortBy(_.keySeq)` needs an
+        // `Ordering[Short]` too. The jar really does have `Ordering$Byte$` /
+        // `Ordering$Short$`.
         ("Byte", "scala/math/Ordering$Byte$", Type::Byte),
         ("Short", "scala/math/Ordering$Short$", Type::Short),
-        // `Double` と `Float` は 2.13 では `Ordering.Double` / `Ordering.Float`
-        // が名前空間オブジェクトになり（`TotalOrdering` / `IeeeOrdering` を
-        // 抱える）、implicit として選ばれるのは `DeprecatedDoubleOrdering` /
-        // `DeprecatedFloatOrdering` のほう。scalac で
-        // `implicitly[Ordering[Double]]` を出させて確かめた。
+        // In 2.13 `Ordering.Double` / `Ordering.Float` became namespace objects
+        // (holding `TotalOrdering` / `IeeeOrdering`), and the implicits actually
+        // picked are `DeprecatedDoubleOrdering` / `DeprecatedFloatOrdering`.
+        // Confirmed by having scalac print `implicitly[Ordering[Double]]`.
         (
             "DeprecatedDoubleOrdering",
             "scala/math/Ordering$DeprecatedDoubleOrdering$",
@@ -502,9 +501,9 @@ fn add_ordering_instances(st: &mut SymbolTable, ordering: SymbolId) {
     }
 }
 
-/// `map` / `flatMap` / `collect` を真に多相なシグネチャへ差し替える。
+/// Replace `map` / `flatMap` / `collect` with truly polymorphic signatures.
 ///
-/// JVM (2.13.16, いずれも `List` 自身の virtual):
+/// JVM (2.13.16; all of them virtuals on `List` itself):
 /// - `map:(Lscala/Function1;)Lscala/collection/immutable/List;`
 /// - `flatMap:(Lscala/Function1;)Lscala/collection/immutable/List;`
 /// - `collect:(Lscala/PartialFunction;)Lscala/collection/immutable/List;`
@@ -544,10 +543,10 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
         )
     });
 
-    // `collect[B](pf: PartialFunction[A, B]): List[B]`。
-    // 型注釈付きの `val pf: PartialFunction[Int, String]` を渡す形（ArrayOps の
-    // `collect` と同じ）で B が決まる。インラインの `{ case … }` リテラルを
-    // 直接渡す形は typer 側が未対応（ArrayOps でも同様）。
+    // `collect[B](pf: PartialFunction[A, B]): List[B]`.
+    // B is decided by passing a type-annotated `val pf: PartialFunction[Int, String]`
+    // (the same as ArrayOps' `collect`). Passing an inline `{ case … }` literal
+    // directly is not yet supported by the typer (nor is it for ArrayOps).
     if !env.partial_fn.is_none() {
         let ta = env.ta();
         let pf = env.partial_fn;
@@ -567,7 +566,7 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
         });
     }
 
-    // `::` / `:::` / `+:` / `:+` / `++` も `B >: A` で多相。
+    // `::` / `:::` / `+:` / `:+` / `++` are polymorphic in `B >: A` too.
     let existing = own_method(st, l, "::");
     poly_in(st, existing, l, "::", &["B"], usize::MAX, |t| {
         let b = t[0].clone();
@@ -654,12 +653,12 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
     });
 }
 
-/// `filter` 系と部分列。すべて `List` 自身の virtual（一部は erase される）。
+/// The `filter` family and subsequences. All virtuals on `List` itself (some erased).
 ///
 /// JVM: `filter`/`filterNot`/`takeWhile:(Function1)List`, `take`/`takeRight`:`(I)List`,
 /// `slice:(II)List`, `drop:(I)LinearSeq`, `dropWhile:(Function1)LinearSeq`,
 /// `dropRight:(I)Object`, `splitAt:(I)Tuple2`, `span`/`partition:(Function1)Tuple2`,
-/// `distinct` は `SeqOps.distinct:()Object`。
+/// `distinct` is `SeqOps.distinct:()Object`.
 fn add_filters_and_slices(st: &mut SymbolTable, env: &Env) {
     let l = env.list;
     let ta = env.ta();
@@ -688,7 +687,7 @@ fn add_filters_and_slices(st: &mut SymbolTable, env: &Env) {
     });
 }
 
-/// 述語・検索・畳み込み。
+/// Predicates, searching and folding.
 ///
 /// JVM: `forall`/`exists:(Function1)Z`, `contains:(Object)Z`,
 /// `find:(Function1)Option`, `last:()Object`, `headOption`/`lastOption:()Option`,
@@ -782,8 +781,8 @@ fn add_predicates_and_folds(st: &mut SymbolTable, env: &Env) {
     });
 }
 
-/// `mkString` / `sum` / `product` / `min` / `max` / `minBy` / `maxBy`。
-/// すべて `IterableOnceOps` の default メソッド。
+/// `mkString` / `sum` / `product` / `min` / `max` / `minBy` / `maxBy`.
+/// All of them default methods on `IterableOnceOps`.
 fn add_strings_and_aggregates(st: &mut SymbolTable, env: &Env) {
     let l = env.list;
     let ta = env.ta();
@@ -842,7 +841,7 @@ fn add_strings_and_aggregates(st: &mut SymbolTable, env: &Env) {
     }
 }
 
-/// `sorted` / `sortBy` / `sortWith` / `zip` / `zipWithIndex`。
+/// `sorted` / `sortBy` / `sortWith` / `zip` / `zipWithIndex`.
 fn add_sorting_and_zips(st: &mut SymbolTable, env: &Env) {
     let l = env.list;
     let ta = env.ta();
@@ -917,7 +916,7 @@ fn add_sorting_and_zips(st: &mut SymbolTable, env: &Env) {
     );
 }
 
-/// `toArray` / `toSet` / `toVector` / `toSeq` / `toIndexedSeq`。
+/// `toArray` / `toSet` / `toVector` / `toSeq` / `toIndexedSeq`.
 fn add_conversions(st: &mut SymbolTable, env: &Env) {
     let l = env.list;
     let ta = env.ta();
@@ -939,7 +938,7 @@ fn add_conversions(st: &mut SymbolTable, env: &Env) {
     simple(st, l, "toSeq", vec![], env.one(env.seq, ta.clone()));
 }
 
-/// `groupBy` / `grouped` / `sliding`。
+/// `groupBy` / `grouped` / `sliding`.
 fn add_grouping(st: &mut SymbolTable, env: &Env) {
     let l = env.list;
     let ta = env.ta();
@@ -965,8 +964,8 @@ fn add_grouping(st: &mut SymbolTable, env: &Env) {
     simple(st, l, "sliding", vec![Type::Int, Type::Int], it_of_list);
 }
 
-/// `grouped` / `sliding` の結果を畳むための `Iterator.toList`。
-/// JVM: `IterableOnceOps.toList:()Lscala/collection/immutable/List;`。
+/// `Iterator.toList`, for folding the results of `grouped` / `sliding`.
+/// JVM: `IterableOnceOps.toList:()Lscala/collection/immutable/List;`.
 fn add_iterator_to_list(st: &mut SymbolTable, env: &Env) {
     let it = env.iterator;
     if it.is_none() || own_method(st, it, "toList").is_some() {

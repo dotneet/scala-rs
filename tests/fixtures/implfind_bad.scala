@@ -1,4 +1,4 @@
-// `implfind.scala` が緩めたアクセス規則の裏側。どちらも nsc が拒否する。
+// The far side of the access rules `implfind.scala` relaxed. nsc rejects both.
 package implfindbad {
 
   trait Prot {
@@ -14,12 +14,12 @@ package implfindbad {
 }
 
 package other {
-  // コンパニオンでもサブクラスでもない: protected は見えない。
+  // Neither the companion nor a subclass: `protected` is not visible.
   class Stranger {
     def a: Int = implfindbad.Prot.hidden
   }
 
-  // `private[implfindbad]` はパッケージの外からは見えない。
+  // `private[implfindbad]` is not visible from outside the package.
   class Outsider {
     def b: Int = implfindbad.Outer.Inner.v
   }

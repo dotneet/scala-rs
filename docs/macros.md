@@ -1,370 +1,448 @@
-# def マクロ設計メモ
+# def Macro Design Notes
 
-Scala 2.13 の **def マクロ**（`def f = macro impl`）を scala-rs で扱うための設計。
-最終目標は slick を素通しでコンパイルすることで、slick が使うマクロは 2 つだけである。
+Design for handling Scala 2.13 **def macros** (`def f = macro impl`) in scala-rs.
+The end goal is to compile slick without modification, and slick uses only two macros.
 
 - `slick/lifted/ShapedValue.scala`
   `def mapTo[R <: Product with Serializable](implicit rCT: ClassTag[R]): MappedProjection[R] = macro ShapedValue.mapToImpl[R, U]`
 - `slick/lifted/TableQuery.scala`
   `def apply[E <: AbstractTable[_]]: TableQuery[E] = macro TableQueryMacroImpl.apply[E]`
 
-この文書は **フェーズ 0（調査と設計）の成果物**である。実装は途中でも、設計は残す。
-実現不可能・非現実的な部分は、そうと明記する。
+This document is the **deliverable of phase 0 (investigation and design)**. Even if the
+implementation is unfinished, the design stays on record. Where something is infeasible or
+unrealistic, it is stated as such.
+
+## Table of contents
+
+- 0. Summary (conclusions first)
+- 1. How nsc handles def macros
+  - 1.1 The definition side
+  - 1.2 The call side (expansion)
+  - 1.3 Execution
+  - 1.4 Signature rules
+- 2. Choosing an execution model
+  - 2.1 Option A: an interpreter over our own AST
+  - 2.2 Option B: a JVM bridge (adopted)
+  - 2.3 Validation with a prototype (done)
+  - 2.4 The honest cost of option B
+  - 2.5 Intermediate options we rejected
+- 3. The minimal subset of the reflect API we have to implement
+  - 3.1 Context (the 72 methods we implement)
+  - 3.2 The universe members `TableQueryMacroImpl.apply` touches
+  - 3.3 The universe members `ShapedValue.mapToImpl` touches
+- 4. Converting between our AST and reflect Trees
+  - 4.1 Directions
+  - 4.2 Wire format
+  - 4.3 The limits of soundness (honestly)
+- 5. What has to survive in the classfile (separate compilation)
+- 6. A staged implementation plan
+  - Phase 1 (the scope of this branch)
+  - Phase 2: the engine and a minimal expansion
+  - Phase 3: being able to compile macro implementations (the main event)
+  - Phase 4: built-in (fast track) macros
+  - Phase 5: slick's two macros
+- 6.2 The biggest obstacle: quasiquotes and reify cannot be expanded through the JVM bridge
+- 6.3 About whitebox
+- 6.4 Risk list
+- 7. Current state (what actually works on this branch)
+  - 7.1 The quasiquote **front end** (`crates/typer/src/quasiquote.rs`)
+  - 7.2 Holes plugged on the way to the reflect ABI
+  - 7.3 Holes still open (what is needed next)
+  - 7.4 Calling from the declaring class, and reification (the `agent/reify2` slice)
+  - 7.5 What remains after this slice
+  - 7.6 Macro implementation signatures and `import c.universe._` (the `agent/quasi` slice)
+  - 7.7 The remaining reification shapes (the second `agent/reify2` slice)
+  - 7.8 `Liftable`, `symbolOf` / `weakTypeOf`, and diagnosing `reify` (the `agent/liftable` slice)
+  - 7.9 Quasiquoting definitions (the `agent/defquasi` slice)
+  - 7.10 The three shapes that need fresh names (the `agent/freshname` slice)
+  - 7.10 `TypeTag` / `WeakTypeTag` materialization (the `agent/typetag` slice)
+  - 7.11 The engine — actually calling macro implementations (the `agent/engine` slice)
+  - 7.12 `c.Expr[T](tree)` and `c.prefix` (the `agent/expr` slice)
+  - 7.13 Stage D-1: `Function` / `ValDef` in expansion results (the `agent/staged` slice)
+  - 7.14 Just before stage D-2: nested `object`s and `<val>.type` (the `agent/reifyd` slice)
+  - 7.15 Expanding `reify { … }` (the `agent/reifybody` slice)
+  - 7.16 `ShapedValue.mapToImpl` — three roots (the `agent/shaped` slice)
+
+(The two `7.10` entries above are not a typo in this table of contents: the numbering is duplicated
+in the document itself, and the numbers are left unchanged because other documents reference these
+sections by number.)
 
 ---
 
-## 0. 要約（先に結論）
+## 0. Summary (conclusions first)
 
-- 実行モデルは **JVM ブリッジ方式**を選ぶ。マクロ実装を我々の AST 上で解釈実行する案は採らない。
-- 根拠は「`scala.reflect.macros.blackbox.Context` の抽象メンバは 72 個しかなく、すべて
-  `scala.reflect.api.*` 型を受け渡す普通の JVM インタフェースメソッドである」ことと、
-  「`c.universe` に **`scala.reflect.runtime.universe`（scala-reflect.jar 同梱の完全実装）**を
-  そのまま差せる」ことである。後者は型レベルで保証されている
-  （`scala.reflect.internal.SymbolTable extends scala.reflect.macros.Universe`,
-  `scala.reflect.runtime.JavaUniverse extends scala.reflect.internal.SymbolTable`）。
-- この設計は**机上の空論ではなく、動く prototype で検証済み**である（§2.3）。
-  scalac でコンパイルしたマクロ実装を、Java の `java.lang.reflect.Proxy` で作った Context 越しに
-  呼び出し、`reify` / **quasiquote** / `WeakTypeTag` の 3 パターンすべてが期待どおりの
-  reflect Tree を返すことを確認した。
-- ただし **slick の 2 マクロに到達するまでの距離は非常に長い**。ボトルネックは
-  「マクロを展開すること」ではなく「**マクロ実装のソース自体を scala-rs でコンパイルできること**」
-  である（§6.2）。特に `mapToImpl` は本体の約 95% が quasiquote である。
-- そして quasiquote と `reify` は **JVM ブリッジでは展開できない**。これらは
-  scala-reflect.jar に実装 classfile が存在せず、**nsc のコンパイラ内蔵（fast track）マクロ**
-  だからである（§6.2 で実証）。つまり quasiquote / reify だけは
-  **scala-rs 自身が組み込みとして実装するしかない**。これが最大の残作業である。
+- The execution model we choose is the **JVM bridge**. We do not interpret macro implementations
+  over our own AST.
+- The rationale is that "`scala.reflect.macros.blackbox.Context` has only 72 abstract members, and
+  every one of them is an ordinary JVM interface method that passes `scala.reflect.api.*` values
+  around", plus the fact that we can plug **`scala.reflect.runtime.universe` (the complete
+  implementation bundled in scala-reflect.jar)** straight into `c.universe`. The latter is
+  guaranteed at the type level
+  (`scala.reflect.internal.SymbolTable extends scala.reflect.macros.Universe`,
+  `scala.reflect.runtime.JavaUniverse extends scala.reflect.internal.SymbolTable`).
+- This design is **not armchair theory: it has been validated with a working prototype** (§2.3).
+  We took a macro implementation compiled by scalac and invoked it through a Context built with
+  Java's `java.lang.reflect.Proxy`, and confirmed that all three patterns — `reify`,
+  **quasiquotes**, and `WeakTypeTag` — return exactly the reflect Trees we expect.
+- However, **the distance to slick's two macros is very long**. The bottleneck is not "expanding a
+  macro" but "**being able to compile the source of the macro implementation itself with
+  scala-rs**" (§6.2). In particular, roughly 95% of the body of `mapToImpl` is quasiquotes.
+- And quasiquotes and `reify` **cannot be expanded through the JVM bridge**. They have no
+  implementation classfiles in scala-reflect.jar: they are **compiler-internal (fast track) macros
+  of nsc** (demonstrated in §6.2). So quasiquotes and reify are the one part **scala-rs has to
+  implement itself as a built-in**. That is the largest remaining piece of work.
 
 ---
 
-## 1. nsc が def マクロをどう扱うか
+## 1. How nsc handles def macros
 
-### 1.1 定義側
+### 1.1 The definition side
 
 ```scala
 def f(x: Int): Int = macro impl
 ```
 
-- `macro` は def の右辺だけに現れるソフトキーワード。右辺は式ではなく
-  **マクロ実装への参照**（`Ident` / `Select` / それらの `TypeApply`）に限られる。
-- 型検査後、マクロ def のシンボルには `MACRO` フラグが立つ。値は `1L << 15`
-  （`scala.reflect.internal.HasFlags.isMacro` のバイトコードで確認）。ビット 15 は
-  **pickle されるフラグ領域**にあるので、そのまま classfile に残り後続の run が読む。
-- マクロ def は**戻り値型の省略を許さない**（実装の戻り値から推論できないため）。
-- マクロ def は**バイトコードに残らない**。呼び出し側がすべて展開で消えるので、
-  実体としてのメソッドは不要である。
-- 別コンパイル単位から展開できるように、nsc は「マクロ def → マクロ実装」の対応を
-  **pickle 内の `@scala.reflect.macros.internal.macroImpl(...)` アノテーション**として
-  classfile に焼き込む。このアノテーションクラスは（reflect ではなく）
-  **scala-library.jar にある**ので、マクロ def を含む classfile はユーザの実行時
-  クラスパスにあるクラスだけを参照する。
+- `macro` is a soft keyword that appears only on the right-hand side of a def. The RHS is not an
+  expression but is restricted to **a reference to the macro implementation** (`Ident` / `Select`,
+  or a `TypeApply` of either).
+- After type checking, the symbol of a macro def gets the `MACRO` flag. Its value is `1L << 15`
+  (confirmed in the bytecode of `scala.reflect.internal.HasFlags.isMacro`). Bit 15 lies in the
+  **pickled flag region**, so it survives into the classfile and later runs read it back.
+- A macro def **may not omit its return type** (it cannot be inferred from the implementation's
+  return type).
+- A macro def **leaves no bytecode**. Every call site disappears into an expansion, so no actual
+  method is needed.
+- So that expansion can happen from another compilation unit, nsc bakes the "macro def → macro
+  implementation" correspondence into the classfile as a
+  **`@scala.reflect.macros.internal.macroImpl(...)` annotation in the pickle**. That annotation
+  class lives in **scala-library.jar** (not in reflect), so a classfile containing a macro def only
+  references classes that are on the user's runtime classpath.
 
-  中身は `Macros$MacroImplBinding` の 6 フィールドで、pickle 上のキー名も確認済み:
+  Its contents are the six fields of `Macros$MacroImplBinding`; the key names in the pickle have
+  been confirmed:
 
-  | キー | 内容 |
+  | Key | Contents |
   | --- | --- |
-  | `macroEngine` | `"v7.0 (implemented in Scala 2.11.0-M8)"` 固定。不一致は展開エラー |
-  | `isBundle` | 実装が「bundle クラス」のメソッドか（`class B(val c: Context)`） |
-  | `isBlackbox` | 実装の `c` の型が blackbox か whitebox か。**展開側が箱を知る唯一の手段** |
-  | `className` | 実装を持つクラスのバイナリ名。object なら末尾 `$`（`pkg.Foo$`） |
-  | `methodName` | 実装メソッド名 |
-  | `signature` | `List[List[Fingerprint]]` — 引数の作り方（下表） |
+  | `macroEngine` | Fixed at `"v7.0 (implemented in Scala 2.11.0-M8)"`. A mismatch is an expansion error |
+  | `isBundle` | Whether the implementation is a method of a "bundle class" (`class B(val c: Context)`) |
+  | `isBlackbox` | Whether the type of the implementation's `c` is blackbox or whitebox. **The only way the expansion side learns which box it is** |
+  | `className` | Binary name of the class holding the implementation. For an object, with a trailing `$` (`pkg.Foo$`) |
+  | `methodName` | Name of the implementation method |
+  | `signature` | `List[List[Fingerprint]]` — how to build the arguments (table below) |
 
-  `Fingerprint` は `Int` の value class:
+  `Fingerprint` is a value class over `Int`:
 
-  | 値 | 意味 |
+  | Value | Meaning |
   | --- | --- |
-  | `Other` = -1 | そのまま渡す（`Context` 自身など） |
-  | `LiftedTyped` = -2 | 引数 Tree を `c.Expr[T]` に包む |
-  | `LiftedUntyped` = -3 | 生の `c.Tree` を渡す |
-  | `Tagged(i)` ≥ 0 | マクロ def の第 i 型パラメータの `WeakTypeTag` を渡す |
+  | `Other` = -1 | Pass through as is (the `Context` itself, and so on) |
+  | `LiftedTyped` = -2 | Wrap the argument Tree in a `c.Expr[T]` |
+  | `LiftedUntyped` = -3 | Pass the raw `c.Tree` |
+  | `Tagged(i)` ≥ 0 | Pass the `WeakTypeTag` of the macro def's i-th type parameter |
 
-  型引数（`macro Impl.impl[A, B]` の `[A, B]`）は名前つきフィールドではなく、
-  アノテーション tree の `TypeApply` 構造から復元される。
+  The type arguments (the `[A, B]` of `macro Impl.impl[A, B]`) are not a named field; they are
+  recovered from the `TypeApply` structure of the annotation tree.
 
-### 1.2 呼び出し側（展開）
+### 1.2 The call side (expansion)
 
-- 展開は **typer フェーズの中**で起きる。マクロ専用フェーズは無い。展開単位は
-  **macro application**、つまり `Apply` / `TypeApply` を含めた**一番外側**のノードである
-  （`M.f` 単独ではなく `M.f(1)`）。
-- 展開結果の Tree は、呼び出し側で**必ず型検査し直される**。nsc はマクロが返した木を
-  そのまま信用しない。
-- **blackbox**: 展開結果を `Typed(expanded, TypeTree(innerPt))` で宣言型に**明示的に上書き**し、
-  **1 回だけ**型検査する（`innerPt` は宣言戻り値型に呼び出し地点の型引数を代入したもの）。
-  展開結果自身のより詳しい型は**捨てられる**。この 1 行の ascription から、
-  blackbox マクロが「戻り値型を絞れない / 構造型を作れない / 型推論を駆動できない /
-  extractor マクロになれない」という制約がすべて出る。
-- **whitebox**: 型検査を **3 回**行う。`#0` は `WildcardType` に対して（implicit 無効）で
-  展開結果の実際の型を知り、未確定型パラメータを `inferExprInstance` で具体化、
-  `#1` を `innerPt`、`#2` を `outerPt` に対して行う。絞られた型は**保持される**。
-- 型引数が未確定のときのために **delay 機構**（`delayed` / `undetparams` /
-  `hasPendingMacroExpansions`）がある。展開を保留し、推論が進んでから再開する。
-- slick の 2 マクロは**どちらも blackbox** なので、当面 whitebox は不要。
+- Expansion happens **inside the typer phase**. There is no dedicated macro phase. The unit of
+  expansion is the **macro application**, i.e. the **outermost** node including any `Apply` /
+  `TypeApply` (`M.f(1)`, not just `M.f`).
+- The resulting Tree is **always re-typechecked** at the call site. nsc does not take the tree a
+  macro returned on trust.
+- **blackbox**: the expansion result is **explicitly overwritten** with the declared type via
+  `Typed(expanded, TypeTree(innerPt))` and typechecked **exactly once** (`innerPt` is the declared
+  return type with the call site's type arguments substituted in). Any more precise type the
+  expansion result had is **discarded**. Every restriction on blackbox macros — cannot narrow the
+  return type, cannot produce structural types, cannot drive type inference, cannot be an extractor
+  macro — falls out of that single line of ascription.
+- **whitebox**: type checking is performed **three times**. `#0` runs against `WildcardType` (with
+  implicits disabled) to learn the expansion result's actual type and to instantiate undetermined
+  type parameters via `inferExprInstance`; `#1` runs against `innerPt` and `#2` against `outerPt`.
+  The narrowed type **is retained**.
+- For the case where type arguments are still undetermined there is a **delay mechanism**
+  (`delayed` / `undetparams` / `hasPendingMacroExpansions`): expansion is deferred and resumed once
+  inference has made progress.
+- Both of slick's macros are **blackbox**, so whitebox is not needed for now.
 
-### 1.3 実行
+### 1.3 Execution
 
-- nsc はマクロ実装を **JVM 上で本当に実行する**。専用のクラスローダ
-  （`-Ymacro-classpath` またはコンパイル時クラスパス。`ScalaClassLoader.URLClassLoader`、
-  ファイル更新時刻でキャッシュ）で実装クラスをロードし、Java リフレクションで呼ぶ。
+- nsc **really executes** macro implementations on the JVM. It loads the implementation class with a
+  dedicated class loader (`-Ymacro-classpath`, or the compile-time classpath;
+  `ScalaClassLoader.URLClassLoader`, cached on file modification time) and calls it via Java
+  reflection.
 
 ```
-classLoader = URLClassLoader(-Ymacro-classpath ｜ -classpath)
+classLoader = URLClassLoader(-Ymacro-classpath | -classpath)
 receiver    = isBundle ? ctor(Context).newInstance(c)
                        : ReflectionUtils.staticSingletonInstance(className)   // MODULE$
 method      = Class.forName(className).getMethods.filter(_.getName == methodName).head
-                                                  // オーバーロードは定義側で禁止済み
+                                                  // overloading is already forbidden at the definition site
 invoke      = isBundle ? method.invoke(receiver, others…)
                        : method.invoke(receiver, (c +: others)…)
-others      = signature を Fingerprint で解釈して組み立てた Object[]
+others      = an Object[] assembled by interpreting `signature` through Fingerprint
 ```
 
-- したがって **マクロ実装は、展開が起きるコンパイル実行より前にコンパイル済みでなければならない**。
-  これは特別なチェックではなく `Class.forName` が失敗するだけである。nsc のエラー文言:
-  「macro implementation not found ...（最もよくある理由は、マクロ実装を、それを定義した
-  のと同じコンパイル実行の中で使おうとしていることです）」。
-  同じ**ファイル**内に実装と def を並べるのは可（slick はこの形）。同じ**実行**の中で
-  「実装を定義しつつ、その場で展開する」ことはできない。
-- 引数の受け渡しは：第 1 引数に `Context`、以降マクロ def の引数それぞれに対応する
-  `c.Expr[T]`（または生の `c.Tree`）、末尾に型パラメータぶんの `c.WeakTypeTag[T]`。
-- **fast track**: `reify` / quasiquote / `materializeClassTag` / `materializeTypeTag` /
-  `StringContext.f` などは classloader を通らず、コンパイラ内蔵の実装に短絡する。
-  これが §6.2 の核心である。
+- Therefore **the macro implementation must already be compiled before the compilation run in which
+  the expansion happens**. This is not a special check; `Class.forName` simply fails. nsc's wording:
+  "macro implementation not found ... (the most common reason for that is that you cannot use macro
+  implementations in the same compilation run that defines them)".
+  Putting the implementation and the def in the same **file** is fine (this is slick's shape).
+  What you cannot do is "define an implementation and expand it on the spot" within the same **run**.
+- Argument passing: the `Context` first, then one `c.Expr[T]` (or a raw `c.Tree`) per macro def
+  argument, then a trailing `c.WeakTypeTag[T]` per type parameter.
+- **fast track**: `reify` / quasiquotes / `materializeClassTag` / `materializeTypeTag` /
+  `StringContext.f` and friends never go through the classloader; they short-circuit to
+  compiler-internal implementations. That is the crux of §6.2.
 
-### 1.4 シグネチャ規則
+### 1.4 Signature rules
 
-マクロ def
+For a macro def
 
 ```scala
 def f[T1, …](a1: A1, …)(b1: B1, …): R = macro impl[T1, …]
 ```
 
-に対して、実装は
+the implementation must have the shape
 
 ```scala
 def impl[T1, …](c: Context)(a1: c.Expr[A1], …)(b1: c.Expr[B1], …)
                 (implicit t1: c.WeakTypeTag[T1], …): c.Expr[R]
 ```
 
-の形でなければならない。`object` の代わりに **bundle** 形式も許される。
+The **bundle** form is allowed instead of an `object`.
 
 ```scala
 class Bundle(val c: blackbox.Context) {
-  def impl[T1, …](a1: c.Expr[A1], …): c.Expr[R]   // Context はコンストラクタ側
+  def impl[T1, …](a1: c.Expr[A1], …): c.Expr[R]   // the Context is on the constructor
 }
 ```
 
-規則（`DefaultMacroCompiler$MacroImplRefCompiler` の検査項目そのまま）:
+The rules (exactly the checks in `DefaultMacroCompiler$MacroImplRefCompiler`):
 
-- `c` は第 1 引数リストの第 1 引数（object 形式）／唯一のコンストラクタ引数（bundle 形式）。
-  **その静的型が blackbox / whitebox を決める。**
-- 各値引数はメタレベルを 1 段上げる: `Ai` ⇒ `c.Expr[Ai]`。2.11 以降は生の `c.Tree` も可。
-- 戻り値も同様: `R` ⇒ `c.Expr[R]`、または `c.Tree`
-  （slick の `mapToImpl` は `Tree` を返す）。
-- **引数名が def 側と一致**すること。vararg 性も位置ごとに一致すること。
-- 型パラメータは 1 対 1 で対応し、末尾の implicit リストに `c.WeakTypeTag[Ti]` を置ける
-  （省略可。省略すればタグが来ないだけ）。**それ以外の implicit 引数は禁止**。
-- 実装は `public` で、**オーバーロードされていない**こと（実行時の解決が
-  `getMethods.filter(name).head` なので）。
-- 参照の形が違えば `macro implementation reference has wrong shape` を出す。
+- `c` is the first parameter of the first parameter list (object form) / the sole constructor
+  parameter (bundle form). **Its static type decides blackbox vs. whitebox.**
+- Each value parameter is raised one meta level: `Ai` ⇒ `c.Expr[Ai]`. Since 2.11 a raw `c.Tree` is
+  also allowed.
+- The return type likewise: `R` ⇒ `c.Expr[R]`, or `c.Tree` (slick's `mapToImpl` returns a `Tree`).
+- **Parameter names must match** those on the def side, and vararg-ness must match position by
+  position.
+- Type parameters correspond one to one, and a trailing implicit list may carry
+  `c.WeakTypeTag[Ti]` (optional; omitting it just means no tag arrives). **No other implicit
+  parameters are permitted.**
+- The implementation must be `public` and **not overloaded** (because resolution at run time is
+  `getMethods.filter(name).head`).
+- If the shape of the reference differs, `macro implementation reference has wrong shape` is
+  reported.
 
 ---
 
-## 2. 実行モデルの選択
+## 2. Choosing an execution model
 
-### 2.1 案 A: 我々の AST 上のインタプリタ
+### 2.1 Option A: an interpreter over our own AST
 
-マクロ実装の Scala ソースを scala-rs で構文解析し、その AST を Rust 側のインタプリタで
-実行する。`scala.reflect` API は Rust 側の型で自前実装する。
+Parse the Scala source of the macro implementation with scala-rs and execute that AST with an
+interpreter on the Rust side. The `scala.reflect` API would be reimplemented in Rust types.
 
-- 利点: JVM 不要。コンパイル時依存が増えない。
-- 欠点（致命的）:
-  - `scala.reflect.api` は巨大である。Tree / Type / Symbol / Name / Constant / Mirror /
-    Position / Liftable / Unliftable / TypeTag / Printers / ReificationSupport …。
-    slick の 2 マクロだけでも実際に触れる面は §3 のとおり広い。
-  - インタプリタは「Scala のサブセットを実行できる処理系」を新規に作るということであり、
-    コンパイラ本体とは別に、クロージャ・パターンマッチ・implicit・コレクションまで要る。
-  - そして**再実装した結果が本物と一致する保証がない**。マクロは「本物と同じ木を吐く」ことが
-    すべてなので、ここがずれると slick は動かない。
+- Upside: no JVM needed, no extra compile-time dependency.
+- Downsides (fatal):
+  - `scala.reflect.api` is enormous: Tree / Type / Symbol / Name / Constant / Mirror / Position /
+    Liftable / Unliftable / TypeTag / Printers / ReificationSupport, and more. Even for just slick's
+    two macros the surface actually touched is as wide as §3 shows.
+  - An interpreter means building, from scratch, a language implementation that can execute a subset
+    of Scala — closures, pattern matching, implicits, collections — separately from the compiler
+    proper.
+  - And **there is no guarantee the reimplementation matches the real thing**. For a macro, "emitting
+    the same tree as the real implementation" is everything, so any divergence here means slick does
+    not work.
 
-**採らない。** 工数が大きいだけでなく、正しさの根拠が持てない。
+**Not taken.** Not only is the effort large, we would have no grounds for believing it correct.
 
-### 2.2 案 B: JVM ブリッジ（採用）
+### 2.2 Option B: a JVM bridge (adopted)
 
-マクロ実装を JVM 上で本物として実行する。`Context` は我々が用意し、`c.universe` には
-**scala-reflect.jar の `scala.reflect.runtime.universe`** を差す。
+Run macro implementations for real on the JVM. We supply the `Context`, and plug
+**scala-reflect.jar's `scala.reflect.runtime.universe`** into `c.universe`.
 
 ```
 scala-rs (Rust)                      macro engine (JVM)
 ──────────────                       ──────────────────
-呼び出し地点を見つける
-  ↓ 展開要求（実装クラス/メソッド、
-    引数 Tree、型引数）を直列化
-                        ──────→     Context を組み立てる
+find the call site
+  ↓ serialize the expansion request
+    (impl class/method, argument
+     Trees, type arguments)
+                        ──────→     build a Context
                                        universe = scala.reflect.runtime.universe
                                        mirror   = runtimeMirror(macro classpath)
-                                     引数 Tree を universe の Tree に組み立てる
-                                     実装メソッドをリフレクションで呼ぶ
-                                       ↑ reify / quasiquote / WeakTypeTag は
-                                         本物の実装がそのまま走る
-                                     戻ってきた Tree を直列化
+                                     build the argument Trees as universe Trees
+                                     invoke the implementation method reflectively
+                                       ↑ reify / quasiquotes / WeakTypeTag run
+                                         as the real implementations
+                                     serialize the returned Tree
                         ←──────
-  Tree を scala-rs の AST に変換
-  呼び出し地点で型検査し直す
+  convert the Tree into a scala-rs AST
+  re-typecheck it at the call site
 ```
 
-決め手は次の 2 点である。
+Two facts settle it.
 
-1. `blackbox.Context` の抽象メンバは **72 個**しかなく、すべて `scala.reflect.api.*` を
-   受け渡す普通のインタフェースメソッドである。実装は我々が書ける量である。
-   （`javap -cp scala-reflect.jar scala.reflect.macros.blackbox.Context` および親トレイト 11 個で確認）
-2. `c.universe` に差すべき `scala.reflect.macros.Universe` の**完全実装が既に存在する**。
+1. `blackbox.Context` has only **72** abstract members, and every one is an ordinary interface method
+   passing `scala.reflect.api.*` values. That is an amount of implementation we can write.
+   (Confirmed with `javap -cp scala-reflect.jar scala.reflect.macros.blackbox.Context` plus its 11
+   parent traits.)
+2. **A complete implementation of the `scala.reflect.macros.Universe` we need for `c.universe`
+   already exists.**
 
 ```
 scala.reflect.internal.SymbolTable  extends scala.reflect.macros.Universe
 scala.reflect.runtime.JavaUniverse  extends scala.reflect.internal.SymbolTable
-scala.reflect.runtime.universe: scala.reflect.api.JavaUniverse (= JavaUniverse の値)
+scala.reflect.runtime.universe: scala.reflect.api.JavaUniverse (= a JavaUniverse value)
 ```
 
-nsc は `c.universe` に自分自身（`Global`）を差す。我々は代わりに実行時ユニバースを差す。
-`Tree` を組み立てるだけの用途では、この 2 つは同じインタフェースの別実装にすぎない。
+nsc plugs itself (`Global`) into `c.universe`. We plug in the runtime universe instead. For the
+purpose of merely building `Tree`s, the two are just different implementations of the same interface.
 
-### 2.3 prototype による検証（実施済み）
+### 2.3 Validation with a prototype (done)
 
-「Java の `java.lang.reflect.Proxy` で `blackbox.Context` を作り、`universe()` に
-実行時ユニバースを返す」だけの約 180 行の probe を書き、scalac でコンパイルした
-マクロ実装を実際に呼び出した。JDK 17 の `InvocationHandler.invokeDefault` により、
-トレイトのデフォルト実装（`weakTypeOf` など）は本物が走る。
-コードと再現手順は [`docs/macro-engine-prototype/`](macro-engine-prototype/) にある。
+We wrote an approximately 180-line probe that does nothing but "build a `blackbox.Context` with
+Java's `java.lang.reflect.Proxy` and return the runtime universe from `universe()`", and used it to
+actually invoke macro implementations compiled by scalac. Thanks to JDK 17's
+`InvocationHandler.invokeDefault`, the traits' default implementations (`weakTypeOf` and friends) run
+for real. The code and reproduction steps are in
+[`docs/macro-engine-prototype/`](macro-engine-prototype/).
 
-検証したマクロ実装と結果：
+The macro implementations tested, and the results:
 
-| パターン | 実装 | 得られた Tree |
+| Pattern | Implementation | Tree obtained |
 | --- | --- | --- |
-| 素の Tree 構築 | `c.Expr[Int](Literal(Constant(42)))` | `Literal(Constant(42))` |
-| `reify`（= slick `TableQueryMacroImpl` の形） | `c.universe.reify { Helper.hello(7) }` | `Apply(Select(Ident(Helper), TermName("hello")), List(Literal(Constant(7))))` |
-| **quasiquote**（= slick `mapToImpl` の形） | `c.Expr[Int](q"${x.tree} + 1")` | `Apply(Select(Literal(Constant(41)), TermName("$plus")), List(Literal(Constant(1))))` |
+| Bare Tree construction | `c.Expr[Int](Literal(Constant(42)))` | `Literal(Constant(42))` |
+| `reify` (= the shape of slick's `TableQueryMacroImpl`) | `c.universe.reify { Helper.hello(7) }` | `Apply(Select(Ident(Helper), TermName("hello")), List(Literal(Constant(7))))` |
+| **quasiquote** (= the shape of slick's `mapToImpl`) | `c.Expr[Int](q"${x.tree} + 1")` | `Apply(Select(Literal(Constant(41)), TermName("$plus")), List(Literal(Constant(1))))` |
 | `WeakTypeTag` | `c.Expr[String](Literal(Constant(t.tpe.toString)))` | `Literal(Constant("String"))` |
 
-つまり **reify も quasiquote も、コンパイル済みであれば実行時ユニバース上でそのまま動く**。
-これが案 B を採る最大の実証的根拠である。
-（ここで動いているのは、scalac が既に脱糖・コンパイルした `Syntactic*` / `TreeCreator`
-呼び出しである。**ソースから脱糖する部分は別問題**であり、それが §6.2 である。）
+So **both reify and quasiquotes work as is on the runtime universe, provided they have been
+compiled**. That is the strongest empirical support for option B.
+(What is running here are the `Syntactic*` / `TreeCreator` calls that scalac has already desugared
+and compiled. **Desugaring them from source is a separate problem**, and that is §6.2.)
 
-この probe で分かった運用上の注意：
+Operational notes this probe turned up:
 
-- `reify` が生成する `TreeCreator` は `mirror.staticModule("…")` でシンボルを引く。
-  したがって **engine の JVM クラスパスには、コンパイル対象が参照するクラスも載せる必要がある**。
-  マクロ実装だけを載せると `ScalaReflectionException: object Helper not found` になる。
-- `c.Expr[T](tree)` は `universe.Expr(mirror, FixedMirrorTreeCreator(mirror, tree))(tag)` に
-  展開して実装すればよい（`scala.reflect.internal.StdCreators$FixedMirrorTreeCreator`）。
+- The `TreeCreator` that `reify` generates looks symbols up with `mirror.staticModule("…")`.
+  Therefore **the engine's JVM classpath must also carry the classes the compiled code refers to**.
+  Loading only the macro implementation gives `ScalaReflectionException: object Helper not found`.
+- `c.Expr[T](tree)` can be implemented by expanding to
+  `universe.Expr(mirror, FixedMirrorTreeCreator(mirror, tree))(tag)`
+  (`scala.reflect.internal.StdCreators$FixedMirrorTreeCreator`).
 
-### 2.4 案 B の正直なコスト
+### 2.4 The honest cost of option B
 
-- **新しいコンパイル時依存**が 2 つ増える: JVM と `scala-reflect.jar`。
-  現在 scala-rs は scala-library.jar すら任意（`--no-scala-library` で私有ランタイム）である。
-  マクロは「jar がある時だけ動く機能」になる。jar が無いときは**黙って通さず診断を出す**。
-- engine は Rust ではなく **Java で書く**必要がある（Scala のトレイトを Java から実装する）。
-  ビルドに `javac` が要る。ビルド済み engine を同梱するか、初回に `javac` するかは別途決める。
-- プロセス間の直列化フォーマットを決める必要がある（§4）。
+- **Two new compile-time dependencies**: a JVM and `scala-reflect.jar`. Today scala-rs treats even
+  scala-library.jar as optional (`--no-scala-library` gives a private runtime). Macros become "a
+  feature that only works when the jar is present". When the jar is missing we **do not silently
+  accept the program; we emit a diagnostic**.
+- The engine has to be written in **Java**, not Rust (implementing Scala traits from Java). The build
+  then needs `javac`. Whether to ship a prebuilt engine or run `javac` on first use is a separate
+  decision.
+- We have to fix an inter-process wire format (§4).
 
-### 2.5 却下した中間案
+### 2.5 Intermediate options we rejected
 
-- **scala-compiler.jar をそのまま呼ぶ**: マクロ展開だけ nsc に委譲する案。これは
-  「scalac を呼んでいる」のと変わらず、scala-rs が Scala コンパイラである意味を失う。
-  ベンチマークとしても不正である。採らない。
-- **展開結果をソース文字列で受け取り、scala-rs のパーサで読み直す**:
-  §4 で「表現形式」として部分的に採用する。ただし `showCode` はシンボルを落とすので、
-  これ単独では健全でない（同名の別シンボルを取り違える）。§4.3 の限界を参照。
+- **Calling scala-compiler.jar directly**: delegating just macro expansion to nsc. That is no
+  different from "calling scalac", and it would defeat the point of scala-rs being a Scala compiler.
+  It would also be dishonest as a benchmark. Not taken.
+- **Receiving the expansion result as a source string and re-reading it with the scala-rs parser**:
+  partially adopted as a "wire format" in §4. But `showCode` drops symbols, so on its own it is
+  unsound (it confuses distinct symbols that share a name). See the limits in §4.3.
 
 ---
 
-## 3. 実装が必要な reflect API の最小サブセット
+## 3. The minimal subset of the reflect API we have to implement
 
-**採取方法の但し書き**: このマシンに slick のソースチェックアウトは無い。
-以下は Coursier キャッシュにあった **コンパイル済み slick 3.4.1**
-(`slick_2.13-3.4.1.jar`) を `javap -c -p` で読んで採取した実測値である。
-3.4.1 では `mapToImpl` は `Shape.scala`、`TableQueryMacroImpl` は `Query.scala` にあり、
-課題文で言及されている 3.5.x の `scala-2/slick/lifted/` 配置とはファイル構成が違う。
-API の面としてはほぼ同一と見てよいが、**ソース文言そのものは未確認**である。
-確定させるには `git clone https://github.com/slick/slick` が要る。
+**A caveat about how this was collected**: there is no slick source checkout on this machine.
+What follows was measured by reading the **compiled slick 3.4.1** (`slick_2.13-3.4.1.jar`) from the
+Coursier cache with `javap -c -p`. In 3.4.1, `mapToImpl` lives in `Shape.scala` and
+`TableQueryMacroImpl` in `Query.scala`, so the file layout differs from the `scala-2/slick/lifted/`
+arrangement of 3.5.x mentioned in the task statement. The API surface can be assumed nearly
+identical, but **the source text itself is unconfirmed**. Settling it requires
+`git clone https://github.com/slick/slick`.
 
-slick の 2 マクロがバイトコード上で実際に触る面。**engine 側で我々が実装するのは `Context` だけ**であり、
-`universe` 側のメンバは scala-reflect.jar の本物がそのまま動く点に注意。
-つまり下表は「engine が壊れていないか」を測るチェックリストであって、
-「Rust で書き直す一覧」ではない。
+The surface slick's two macros actually touch in the bytecode. Note that **the only thing we
+implement on the engine side is the `Context`**; the members on the `universe` side are the real ones
+from scala-reflect.jar and run as is. So the table below is a checklist for "is the engine broken?",
+not a list of "things to rewrite in Rust".
 
-### 3.1 Context（我々が実装する 72 メソッド）
+### 3.1 Context (the 72 methods we implement)
 
-slick が実際に使うのは以下だけである。残りは
-`UnsupportedOperationException("… is not implemented")` で**明示的に落とす**。
+Slick actually uses only the following. The rest **fail explicitly** with
+`UnsupportedOperationException("… is not implemented")`.
 
-| メンバ | 使う側 | 実装方針 |
+| Member | Used by | Implementation approach |
 | --- | --- | --- |
-| `universe` | 両方 | 実行時ユニバースを返す |
-| `mirror` | 両方（間接） | `universe.runtimeMirror(macroClassLoader)` |
-| `Expr` / `Expr(tree)(tag)` | 両方 | §2.3 のとおり |
-| `WeakTypeTag` / `TypeTag` | 両方 | `universe` の同名コンパニオンを返す |
-| `weakTypeOf` / `typeOf` / `symbolOf` | 両方 | トレイトの default 実装が走る |
-| `prefix` | `mapToImpl` | 呼び出し地点のレシーバ Tree から `Expr` を作る |
-| `enclosingPosition` | `mapToImpl` | 呼び出し地点の Span を `Position` に変換 |
-| `abort(pos, msg)` | `mapToImpl` | 例外を投げ、Rust 側でエラー診断に変換する |
-| `freshName` | quasiquote 経由 | 単調増加カウンタ |
+| `universe` | both | return the runtime universe |
+| `mirror` | both (indirectly) | `universe.runtimeMirror(macroClassLoader)` |
+| `Expr` / `Expr(tree)(tag)` | both | as in §2.3 |
+| `WeakTypeTag` / `TypeTag` | both | return the identically named companions from `universe` |
+| `weakTypeOf` / `typeOf` / `symbolOf` | both | the traits' default implementations run |
+| `prefix` | `mapToImpl` | build an `Expr` from the call site's receiver Tree |
+| `enclosingPosition` | `mapToImpl` | convert the call site's Span into a `Position` |
+| `abort(pos, msg)` | `mapToImpl` | throw an exception, converted into an error diagnostic on the Rust side |
+| `freshName` | via quasiquotes | a monotonically increasing counter |
 
-`typecheck` / `inferImplicitValue` / `inferImplicitView` / `parse` / `eval` /
-`enclosingClass` などは **slick は使わない**。これらは「呼ばれたら落ちる」でよい。
-（`typecheck` と `inferImplicitValue` は本質的に「コンパイラ本体を engine から呼び戻す」
-ことを意味し、実装するなら engine → Rust の逆方向 RPC が要る。§6.4 のリスク参照。）
+`typecheck` / `inferImplicitValue` / `inferImplicitView` / `parse` / `eval` / `enclosingClass` and
+the like are **not used by slick**. It is fine for these to blow up when called.
+(`typecheck` and `inferImplicitValue` essentially mean "call the compiler proper back from the
+engine"; implementing them would require reverse RPC from the engine to Rust. See the risks in §6.4.)
 
-### 3.2 `TableQueryMacroImpl.apply` が触る universe メンバ
+### 3.2 The universe members `TableQueryMacroImpl.apply` touches
 
-`Function` / `ValDef` / `Modifiers` / `Flag.PARAM` / `TermName` / `Ident`（`Symbol` 版と
-`Name` 版の両方）/ `Select` / `New` / `TypeTree(tpe)` / `Apply` / `EmptyTree` /
-`termNames.CONSTRUCTOR` / `typeOf[Tag]` / `rootMirror` / `reify` の
-`TreeCreator`・`TypeCreator`（`internal.reificationSupport.mkIdent` / `mkTypeTree`、
-`Mirror.staticModule` / `staticClass`）。
-Symbol / Type 面は `WeakTypeTag.tpe` と `Type.typeSymbol` **のみ**。
+`Function` / `ValDef` / `Modifiers` / `Flag.PARAM` / `TermName` / `Ident` (both the `Symbol` and the
+`Name` overloads) / `Select` / `New` / `TypeTree(tpe)` / `Apply` / `EmptyTree` /
+`termNames.CONSTRUCTOR` / `typeOf[Tag]` / `rootMirror` / the `TreeCreator` and `TypeCreator` of
+`reify` (`internal.reificationSupport.mkIdent` / `mkTypeTree`, `Mirror.staticModule` /
+`staticClass`).
+On the Symbol / Type side, **only** `WeakTypeTag.tpe` and `Type.typeSymbol`.
 
-### 3.3 `ShapedValue.mapToImpl` が触る universe メンバ
+### 3.3 The universe members `ShapedValue.mapToImpl` touches
 
-本体はほぼ全部 quasiquote（`q` / `tq` / `pq` / `cq`）である。脱糖後は
-`internal.reificationSupport.Syntactic*` が 209 箇所：
+The body is almost entirely quasiquotes (`q` / `tq` / `pq` / `cq`). After desugaring there are 209
+`internal.reificationSupport.Syntactic*` call sites:
 `SyntacticSelectTerm`(60) / `SyntacticTermIdent`(35) / `SyntacticSelectType`(14) /
 `SyntacticFunctionType`(12) / `SyntacticValDef`(11) / `SyntacticApplied`(11) /
 `SyntacticAppliedType`(10) / `SyntacticFunction`(8) / `SyntacticTypeIdent`(7) /
 `SyntacticEmptyTypeTree`(6) / `SyntacticNew`(4) / `SyntacticDefDef`(4) /
 `SyntacticBlock`(3) / `SyntacticPartialFunction`(3) / `SyntacticSingletonType` /
 `SyntacticExistentialType` / `SyntacticAssign` / `FlagsRepr` / `freshTermName` /
-`freshTypeName` / `mkRefTree`。
+`freshTypeName` / `mkRefTree`.
 
-直接使う Tree コンストラクタは `TermName`(107) / `TypeName`(37) / `Typed`(15) /
+The Tree constructors used directly are `TermName`(107) / `TypeName`(37) / `Typed`(15) /
 `Modifiers`(13) / `Bind`(5) / `CaseDef`(4) / `EmptyTree`(22) / `noSelfType` /
 `NoSymbol` / `This` / `Super` / `TypeDef` / `TypeBoundsTree` / `Constant` /
-`symbolOf` / `Liftable`（`liftTypeTag` 26 回ほか）。
+`symbolOf` / `Liftable` (`liftTypeTag` about 26 times, among others).
 
-Symbol / Type 面は `WeakTypeTag.tpe` / `Type.typeSymbol` / `TypeSymbol.isClass` /
+On the Symbol / Type side: `WeakTypeTag.tpe` / `Type.typeSymbol` / `TypeSymbol.isClass` /
 `.asClass.isCaseClass` / `.fullName` / `.name.toTermName` / `.companion` /
-`Symbol.info` / `Type.decls.collect` / `Type.member(Name)`。
-つまり **case class のフィールド列挙**をする。implicit 探索・アノテーション読みは無い。
+`Symbol.info` / `Type.decls.collect` / `Type.member(Name)`.
+In other words, it **enumerates the fields of a case class**. There is no implicit search and no
+annotation reading.
 
-**重要**: 上記はすべて scala-reflect.jar の本物が担当する。我々が用意するのは
-Context と、Tree の入出力変換だけである。
+**Important**: everything above is handled by the real implementations in scala-reflect.jar. What we
+provide is the Context and the Tree input/output conversion, and nothing else.
 
 ---
 
-## 4. 我々の AST ↔ reflect Tree の変換
+## 4. Converting between our AST and reflect Trees
 
-### 4.1 方向
+### 4.1 Directions
 
-- **入力（Rust → JVM）**: マクロ呼び出しの引数式。型検査済みの scala-rs AST を
-  reflect Tree に組み立てる。slick の 2 マクロは引数 Tree の**中身をほとんど見ない**
-  （`mapToImpl` は `c.prefix` と型引数、`TableQueryMacroImpl` は型引数だけ）ので、
-  最初は「Literal / Ident / Select / Apply / New / Function / Block」程度で足りる。
-- **出力（JVM → Rust）**: 展開結果の Tree。こちらは**中身を全部読む**必要がある。
+- **Input (Rust → JVM)**: the argument expressions of the macro call. We build reflect Trees from
+  typechecked scala-rs ASTs. Slick's two macros **barely look inside** the argument Trees
+  (`mapToImpl` uses `c.prefix` and the type arguments; `TableQueryMacroImpl` uses only the type
+  arguments), so to begin with "Literal / Ident / Select / Apply / New / Function / Block" is enough.
+- **Output (JVM → Rust)**: the expansion result Tree. Here we do have to read **everything**.
 
-### 4.2 表現形式
+### 4.2 Wire format
 
-`showRaw` 形式（`Apply(Select(Ident(Helper), TermName("hello")), List(Literal(Constant(7))))`）は
-prototype で確認したとおりそのまま得られるが、**パースし直すのは Rust 側の手間が大きく、
-エスケープ規則も曖昧**である。engine 側で JSON に直列化する方が確実である。
+The `showRaw` form (`Apply(Select(Ident(Helper), TermName("hello")), List(Literal(Constant(7))))`)
+comes out directly, as the prototype confirmed, but **re-parsing it is a lot of work on the Rust side
+and its escaping rules are murky**. Serializing to JSON on the engine side is more reliable.
 
 ```json
 {"t":"Apply",
@@ -373,104 +451,104 @@ prototype で確認したとおりそのまま得られるが、**パースし�
  "args":[{"t":"Literal","const":{"k":"Int","v":7}}]}
 ```
 
-Tree ノードごとに `t` を持ち、シンボルが解決済みのノードには `sym`（完全修飾名）を添える。
-Rust 側は `sym` があればそれを優先して解決し、無ければ名前解決に落とす。
+Every Tree node carries a `t`, and nodes with a resolved symbol also carry a `sym` (fully qualified
+name). The Rust side prefers `sym` when resolving and falls back to name resolution otherwise.
 
-### 4.3 健全性の限界（正直に）
+### 4.3 The limits of soundness (honestly)
 
-- 展開結果の Tree は、**JVM 側の実行時ユニバースのシンボル**を指している。Rust 側の
-  SymbolTable のシンボルとは別物である。`sym` の完全修飾名で突き合わせるのが橋渡しだが、
-  ローカル変数・型パラメータ・匿名関数のパラメータのように**完全修飾名を持たないシンボル**は
-  名前でしか運べない。ここは変数捕捉（hygiene）を壊しうる。
-  nsc も def マクロは hygienic ではない（`freshName` で回避する文化）ので、
-  「本物と同程度に不健全」で済ませられる見込みはある。
-- `TypeTree(tpe)` のように **Type を埋め込んだ Tree** が返ってきた場合、Type も
-  同じ方式で直列化して Rust 側の `Type` に戻す必要がある。slick の両マクロが使うので、
-  これは必須である（`TableQueryMacroImpl` は `TypeTree(e.tpe)`）。
-- `showCode` した文字列を scala-rs のパーサで読み直す案は、上の `sym` を落とすので
-  **一般には不健全**。デバッグ表示にとどめる。
-
----
-
-## 5. classfile に何を残すか（分離コンパイル）
-
-マクロ def は別コンパイル単位から展開されるので、`ScalaSignature` に
-「このメソッドはマクロで、実装は X.y である」ことを残さなければならない。
-
-- nsc: pickle の `SYMANNOT` に `@macroImpl(tree)`（§1.1 の 6 フィールド）を焼き、
-  `MACRO`（`1L << 15`）フラグを立てる。マクロ def の本体は `EmptyTree` で、
-  **JVM メソッドとしては出力されない**（だから Java からマクロは呼べない）。
-  漏れを検出するために RefChecks に `"macro has not been expanded"` チェックがある。
-- scala-rs 現状: `crates/backend/src/pickle.rs` は `SYMANNOT` を書ける（`@deprecated` 等で実績あり）が、
-  **`MACRO` フラグは意図的に pickle していない**（同ファイル冒頭のコメント）。
-  また unpickler 側（`crates/typer/src/classpath.rs` が読む `PickledMethod`）は
-  name / param / ret / tparams しか復元しない。
-- 必要な作業:
-  1. `Symbol` に `macro_impl: Option<MacroBinding>` を持つ（実装済み。
-     `crates/typer/src/symbol.rs`）。
-  2. pickle 側で、マクロ def に `MACRO` フラグと実装参照を書く。
-     nsc 互換にするなら `@macroImpl` の `TREE` 表現、我々だけで閉じるなら
-     もっと単純な符号化でもよい。**scalac が我々の classfile を読む**互換テストが
-     既にあるので（`scalac_typechecks_against_our_classfiles_if_present`）、
-     nsc 互換の形を目指す価値はある。
-  3. unpickler 側で復元する。
-- **マクロ def はメソッド本体を出さない**（`crates/backend/src/gen.rs`）。
+- The expansion result Tree points at **symbols of the runtime universe on the JVM side**. Those are
+  distinct from the symbols in the Rust-side SymbolTable. Matching them by the fully qualified name
+  in `sym` is the bridge, but **symbols with no fully qualified name** — local variables, type
+  parameters, anonymous function parameters — can only be carried by name. This can break variable
+  capture (hygiene).
+  Since nsc's def macros are not hygienic either (the culture is to work around it with
+  `freshName`), we can plausibly settle for "as unsound as the real thing".
+- If a **Tree with an embedded Type**, such as `TypeTree(tpe)`, comes back, the Type has to be
+  serialized the same way and turned back into a Rust-side `Type`. Both slick macros use this, so it
+  is mandatory (`TableQueryMacroImpl` produces `TypeTree(e.tpe)`).
+- Re-reading a `showCode` string with the scala-rs parser drops the `sym` above and is therefore
+  **unsound in general**. Keep it to debug output.
 
 ---
 
-## 6. 段階的な実装計画
+## 5. What has to survive in the classfile (separate compilation)
 
-### フェーズ 1（このブランチの範囲）
+Since macro defs are expanded from other compilation units, the `ScalaSignature` must record "this
+method is a macro, and its implementation is X.y".
 
-1. パーサが `= macro <ref>` を受理する。`TreeKind::MacroRhs { impl_ref }` を作る。**済**
-2. `Symbol.macro_impl` / `MacroBinding` を追加する。**済**
-3. typer がマクロ def を認識し、
-   - 戻り値型の省略を診断する、
-   - 実装参照を解決してバインディングを記録する、
-   - 呼び出し地点で「展開できない」ことを**明示的に診断する**（黙って通さない）。
-4. backend がマクロ def の本体を出さない。
-5. fixture（接頭辞 `macro`）と `crates/cli/tests/macros.rs`。
-
-### フェーズ 2: engine と最小の展開
-
-6. Java の macro engine（`Context` の 72 メソッド、JSON 直列化）。
-7. Rust 側から engine を起動し、`Literal(Constant(42))` を受け取って
-   呼び出し地点に差し込む。`M.f()` が `42` を返す。
-8. ただし **フェーズ 2 には前提がある**: マクロ実装のソースを scala-rs でコンパイルできること。
-   すなわち §6.2。
-
-### フェーズ 3: マクロ実装をコンパイルできるようにする（本丸）
-
-9. `scala.reflect.macros.blackbox.Context` / `scala.reflect.api.Universe` の
-   prelude（`crates/typer/src/prelude_reflect.rs`）。
-   `c.Expr[T]` のような**パス依存型**が要る。現状 scala-rs は
-   `import c.universe._` で型メンバは入るが**項メンバが入らない**ことを確認済み
-   （probe で `Tree` は解決したが `mk` は `not found: value mk` になる）。
-10. これらに対する `library_abi` 相当のコード生成。`Literal(Constant(42))` は
-    `c.universe().Literal().apply(c.universe().Constant().apply(box(42)))` になる。
-
-### フェーズ 4: 組み込み（fast track）マクロ
-
-11. `reify` の脱糖器。`TableQueryMacroImpl.apply` に必要。
-12. quasiquote の脱糖器（§6.2）。`ShapedValue.mapToImpl` に必要。**最大の 1 項目**。
-
-### フェーズ 5: slick の 2 マクロ
-
-13. `TableQueryMacroImpl.apply` を通す（11 が前提）。
-14. `ShapedValue.mapToImpl` を通す（12 が前提）。case class のフィールド列挙
-    （`Type.decls.collect` / `Type.member`）が engine 越しに動くことの確認も要る。
+- nsc: bakes `@macroImpl(tree)` (the six fields of §1.1) into the pickle's `SYMANNOT` and sets the
+  `MACRO` flag (`1L << 15`). The body of a macro def is `EmptyTree`, and **no JVM method is emitted**
+  (which is why macros cannot be called from Java). To catch leaks, RefChecks has a
+  `"macro has not been expanded"` check.
+- scala-rs today: `crates/backend/src/pickle.rs` can write `SYMANNOT` (proven with `@deprecated` and
+  others), but **deliberately does not pickle the `MACRO` flag** (see the comment at the top of that
+  file). On the unpickler side, the `PickledMethod` read by `crates/typer/src/classpath.rs` recovers
+  only name / param / ret / tparams.
+- Work needed:
+  1. Give `Symbol` a `macro_impl: Option<MacroBinding>` (done; `crates/typer/src/symbol.rs`).
+  2. On the pickle side, write the `MACRO` flag and the implementation reference for macro defs.
+     For nsc compatibility this means the `TREE` representation of `@macroImpl`; if we only need to
+     talk to ourselves, a simpler encoding would do. Since there is already a compatibility test in
+     which **scalac reads our classfiles** (`scalac_typechecks_against_our_classfiles_if_present`),
+     aiming at the nsc-compatible shape is worth it.
+  3. Recover it on the unpickler side.
+- **Macro defs emit no method body** (`crates/backend/src/gen.rs`).
 
 ---
 
-## 6.2 最大の障害: quasiquote と reify は JVM ブリッジで展開できない
+## 6. A staged implementation plan
 
-展開の実行は §2.3 で解けている。**残る本当の難所は、マクロ実装のソースを
-scala-rs がコンパイルできるかどうかである。** そして、その中でも決定的な事実がひとつある。
+### Phase 1 (the scope of this branch)
 
-### 事実
+1. The parser accepts `= macro <ref>`. Introduce `TreeKind::MacroRhs { impl_ref }`. **Done**
+2. Add `Symbol.macro_impl` / `MacroBinding`. **Done**
+3. The typer recognizes macro defs and:
+   - diagnoses an omitted return type,
+   - resolves the implementation reference and records the binding,
+   - **explicitly diagnoses** "cannot expand" at the call site (never silently accepts).
+4. The backend emits no body for macro defs.
+5. Fixtures (prefix `macro`) and `crates/cli/tests/macros.rs`.
 
-`scala.tools.reflect.FastTrack` の定数プールに、次の名前がそのまま入っている
-（`unzip -p scala-compiler.jar 'scala/tools/reflect/FastTrack.class' | strings` で確認）:
+### Phase 2: the engine and a minimal expansion
+
+6. The Java macro engine (the 72 `Context` methods, JSON serialization).
+7. Launch the engine from the Rust side, receive `Literal(Constant(42))`, and splice it into the call
+   site. `M.f()` returns `42`.
+8. But **phase 2 has a prerequisite**: being able to compile macro implementation sources with
+   scala-rs. That is §6.2.
+
+### Phase 3: being able to compile macro implementations (the main event)
+
+9. A prelude for `scala.reflect.macros.blackbox.Context` / `scala.reflect.api.Universe`
+   (`crates/typer/src/prelude_reflect.rs`).
+   This needs **path-dependent types** such as `c.Expr[T]`. We have confirmed that today scala-rs
+   brings in type members via `import c.universe._` but **not term members** (in a probe, `Tree`
+   resolved but `mk` gave `not found: value mk`).
+10. Code generation for these, equivalent to `library_abi`. `Literal(Constant(42))` becomes
+    `c.universe().Literal().apply(c.universe().Constant().apply(box(42)))`.
+
+### Phase 4: built-in (fast track) macros
+
+11. A desugarer for `reify`. Needed by `TableQueryMacroImpl.apply`.
+12. A desugarer for quasiquotes (§6.2). Needed by `ShapedValue.mapToImpl`. **The single largest item.**
+
+### Phase 5: slick's two macros
+
+13. Get `TableQueryMacroImpl.apply` through (requires 11).
+14. Get `ShapedValue.mapToImpl` through (requires 12). We also need to confirm that case class field
+    enumeration (`Type.decls.collect` / `Type.member`) works across the engine.
+
+---
+
+## 6.2 The biggest obstacle: quasiquotes and reify cannot be expanded through the JVM bridge
+
+Running the expansion is solved by §2.3. **The real remaining difficulty is whether scala-rs can
+compile the source of the macro implementation.** And within that there is one decisive fact.
+
+### The facts
+
+The constant pool of `scala.tools.reflect.FastTrack` contains these names verbatim (confirmed with
+`unzip -p scala-compiler.jar 'scala/tools/reflect/FastTrack.class' | strings`):
 
 ```
 QuasiquoteClass_api_apply    QuasiquoteClass_api_unapply
@@ -479,343 +557,346 @@ materializeClassTag   materializeTypeTag   materializeWeakTypeTag
 StringContext_f   StringContext_s   StringContext_raw
 ```
 
-そして **scala-reflect.jar 内には pickle 済みの `@macroImpl` バインディングが 1 つも無い**
-（`macroEngine` の文字列検索で 0 ヒット）。`Universe.reify` の宣言は `= macro ???` である。
+And **there is not a single pickled `@macroImpl` binding inside scala-reflect.jar** (a string search
+for `macroEngine` gives zero hits). The declaration of `Universe.reify` is `= macro ???`.
 
-つまり:
+In other words:
 
-> **quasiquote（`q"…"` / `tq"…"` / `pq"…"` / `cq"…"`）と `reify` は、
-> scala-reflect.jar に実装 classfile を持たない。実体は scala-compiler.jar の中にあり、
-> nsc は classloader を通さず内蔵実装に短絡する（fast track）。**
+> **Quasiquotes (`q"…"` / `tq"…"` / `pq"…"` / `cq"…"`) and `reify` have no implementation classfiles
+> in scala-reflect.jar. The real thing lives inside scala-compiler.jar, and nsc short-circuits to the
+> built-in implementation without going through the classloader (fast track).**
 
-### 帰結
+### Consequences
 
-- **JVM ブリッジ（案 B）は、これらには使えない。** ロードすべき実装クラスが存在しない。
-- したがって **scala-rs はこれらを自前の組み込みとして実装するしかない**。
-  これは「マクロ展開器を作れば自動的に付いてくる」ものでは**ない**。
-- 前提としていた「quasiquote は whitebox マクロなので展開器で解ける」という見立ては
-  **誤りだった**。ここで訂正しておく。
+- **The JVM bridge (option B) cannot be used for these.** There is no implementation class to load.
+- Therefore **scala-rs has to implement them itself as built-ins**. This is **not** something that
+  comes for free once you have a macro expander.
+- Our earlier assumption that "quasiquotes are whitebox macros, so the expander will handle them" was
+  **wrong**. Correcting it here for the record.
 
-### では何を作るのか
+### So what do we build?
 
-幸い、作るべきものの形ははっきりしている。nsc の quasiquote マクロがやっているのは
-**「補間文字列を Scala として構文解析し、`internal.reificationSupport.Syntactic*` の
-呼び出し列に脱糖する」**ことだけである（§3.3 のバイトコード実測がそれを裏づけている:
-`mapToImpl` の本体は `Syntactic*` 呼び出し 209 箇所に脱糖されている）。
+Fortunately the shape of what has to be built is clear. All nsc's quasiquote macros do is
+**"parse the interpolated string as Scala and desugar it into a sequence of
+`internal.reificationSupport.Syntactic*` calls"** (the bytecode measurements in §3.3 back this up:
+the body of `mapToImpl` desugars into 209 `Syntactic*` call sites).
 
-したがって scala-rs 側の作業は:
+So the work on the scala-rs side is:
 
-1. `q"…"` の中身を、**穴（`$x` / `${…}`）を許す形で Scala として構文解析する**。
-   scala-rs は既に Scala パーサを持っているので、ここは拡張で済む。
-2. 解析結果を `Syntactic*` 呼び出しの AST に落とす
-   （`SyntacticSelectTerm` / `SyntacticApplied` / `SyntacticValDef` / `SyntacticDefDef` /
-   `SyntacticNew` / `SyntacticFunction` / `SyntacticBlock` / `FlagsRepr` / …）。
-   §3.3 の一覧が、slick を通すのに必要な最小セットである。
-3. その AST を scala-reflect ABI でコード生成する（フェーズ 3 の 10 と同じ仕組み）。
+1. **Parse the contents of `q"…"` as Scala, in a form that permits holes** (`$x` / `${…}`).
+   scala-rs already has a Scala parser, so this is an extension.
+2. Lower the parse result into an AST of `Syntactic*` calls
+   (`SyntacticSelectTerm` / `SyntacticApplied` / `SyntacticValDef` / `SyntacticDefDef` /
+   `SyntacticNew` / `SyntacticFunction` / `SyntacticBlock` / `FlagsRepr` / …).
+   The list in §3.3 is the minimal set needed to get slick through.
+3. Generate code for that AST against the scala-reflect ABI (the same machinery as item 10 of
+   phase 3).
 
-これで**コンパイル済みの `mapToImpl` が得られ**、あとは §2.3 で実証済みの engine が
-実行する。§2.3 で quasiquote 版 `qqImpl` が正しく動いたのは、まさにこの経路の後半を
-先に確かめたものである。
+That gives us **a compiled `mapToImpl`**, and from there the engine already validated in §2.3 runs
+it. The reason the quasiquote-based `qqImpl` worked in §2.3 is precisely that we verified the second
+half of this path first.
 
-`reify` も同様に「reify されるブロックを、universe の Tree 構築呼び出し（`TreeCreator` /
-`TypeCreator` 生成）へ脱糖する」組み込みが要る。`TableQueryMacroImpl` に必要。
+`reify` likewise needs a built-in that "desugars the reified block into universe Tree construction
+calls (generating a `TreeCreator` / `TypeCreator`)". Needed by `TableQueryMacroImpl`.
 
-### 規模の正直な見積り
+### An honest size estimate
 
-- quasiquote の脱糖器: **本フェーズより大きい**。穴の型（Tree / Name / Type / List / 名前）に
-  よる分岐、`..$` / `...$` の展開、パターン側（`unapply`）まで含めると相当量になる。
-  ただし slick が使うのは `apply` 側だけで、pattern quasiquote は使わない。
-- reify: 中程度。`TableQueryMacroImpl` の使い方は素直な 1 式の reify である。
-- どちらも「Rust で書く新規コンポーネント」であり、既存資産の流用はパーサだけである。
+- The quasiquote desugarer: **bigger than this phase**. Once you include dispatch on the type of the
+  hole (Tree / Name / Type / List / name), the expansion of `..$` / `...$`, and the pattern side
+  (`unapply`), it is a substantial amount. That said, slick uses only the `apply` side; it does not
+  use pattern quasiquotes.
+- `reify`: medium. `TableQueryMacroImpl`'s usage is a straightforward reify of a single expression.
+- Both are "new components written in Rust"; the only existing asset we can reuse is the parser.
 
-### 代替案（採らないが記録する）
+### Alternatives (not taken, but recorded)
 
-「slick の `ShapedValue.scala` だけ scalac でコンパイルして classfile を用意し、
-scala-rs は展開だけ担当する」という運用は技術的には可能である。
-だが「scala-rs が slick をコンパイルする」というベンチマークの意味を損なうので、
-やるなら**その旨を明示した上で**、ベンチマーク成績としては数えない。
+It is technically possible to operate as follows: compile only slick's `ShapedValue.scala` with
+scalac to have the classfile on hand, and let scala-rs handle only the expansion.
+But that damages the meaning of the "scala-rs compiles slick" benchmark, so if we do it we must
+**say so explicitly** and not count it as a benchmark result.
 
-## 6.3 whitebox について
+## 6.3 About whitebox
 
-slick の 2 マクロは blackbox である。quasiquote / reify も（fast track なので）
-whitebox 展開器を必要としない。したがって **whitebox は当面まったく要らない**。
-blackbox だけを実装し、whitebox のマクロ def を見つけたら診断して落とす。
+Slick's two macros are blackbox. Quasiquotes and reify do not require a whitebox expander either
+(they are fast track). So **whitebox is not needed at all for now**. We implement only blackbox, and
+when we find a whitebox macro def we diagnose and fail.
 
-## 6.4 リスク一覧
+## 6.4 Risk list
 
-| リスク | 影響 | 緩和 |
+| Risk | Impact | Mitigation |
 | --- | --- | --- |
-| `c.typecheck` / `inferImplicitValue` を使うマクロ | engine から Rust の typer を呼び戻す双方向 RPC が要る | slick は使わない。呼ばれたら診断して落とす |
-| hygiene（§4.3） | 展開結果が呼び出し地点の変数を捕捉する | nsc も非 hygienic。`freshName` に依存 |
-| Type の往復 | `TypeTree(tpe)` が戻せないと `TableQueryMacroImpl` が動かない | Type も JSON 直列化する（必須作業） |
-| engine プロセスの起動コスト | 大きなビルドで遅い | 常駐させて複数展開を 1 プロセスで捌く |
-| scala-reflect.jar 依存 | jar が無い環境でマクロが使えない | 診断を出して落とす。私有ランタイムでは非対応と明記 |
-| `javac` 依存 | ビルド環境が増える | engine をビルド済みで同梱するか、feature で切る |
-| 実行時ユニバースと compiler ユニバースの差 | 一部マクロが挙動を変える | nsc の実装クラスは `c.universe` を **`scala.tools.nsc.Global` として宣言**している（公開 API は `macros.Universe`）。API 経由で書かれたマクロは動く（§2.3 で実証）が、`Global` にキャストするマクロは動かない。診断で落とす |
-| fast track マクロ（§6.2） | quasiquote / reify を使うマクロが**一切**コンパイルできない | 自前で脱糖器を書くしかない。フェーズ 4 |
-| `MacroImplBinding` の pickle 互換 | scalac が我々の classfile を読めなくなる | `macroEngine` 文字列まで含めて nsc 互換の形で書く |
+| Macros using `c.typecheck` / `inferImplicitValue` | Requires bidirectional RPC calling the Rust typer back from the engine | Slick does not use them. Diagnose and fail if called |
+| Hygiene (§4.3) | The expansion result captures variables at the call site | nsc is non-hygienic too. Rely on `freshName` |
+| Round-tripping Types | Without being able to return `TypeTree(tpe)`, `TableQueryMacroImpl` does not work | Serialize Types to JSON as well (mandatory work) |
+| Engine process startup cost | Slow on large builds | Keep it resident and handle many expansions in one process |
+| Dependency on scala-reflect.jar | Macros unusable in environments without the jar | Diagnose and fail. Document that the private runtime does not support them |
+| Dependency on `javac` | One more build-environment requirement | Ship a prebuilt engine, or gate it behind a feature |
+| Differences between the runtime universe and the compiler universe | Some macros change behavior | nsc's implementation classes **declare `c.universe` as `scala.tools.nsc.Global`** (the public API is `macros.Universe`). Macros written against the API work (demonstrated in §2.3), but macros that cast to `Global` do not. Diagnose and fail |
+| Fast track macros (§6.2) | Macros using quasiquotes / reify **cannot be compiled at all** | We have to write the desugarers ourselves. Phase 4 |
+| `MacroImplBinding` pickle compatibility | scalac would no longer be able to read our classfiles | Write the nsc-compatible shape, down to the `macroEngine` string |
 
 ---
 
-## 7. 現状（このブランチで実際に動くところ）
+## 7. Current state (what actually works on this branch)
 
-- `= macro <ref>` を**パースできる**。以前の `unimplemented syntax: macros` は出ない。
-- マクロ def のシンボルにバインディングを記録する。
-- **展開はまだできない**。呼び出し地点で診断を出す。黙って通すことはしない。
-- §2.3 の prototype は [`docs/macro-engine-prototype/`](macro-engine-prototype/) にある。
-  CI では走らない（scalac と scala-reflect.jar が要る）。走らせ方と、製品版に足りないものは
-  そこの README に書いた。フェーズ 2 で `crates/macro-engine/` として正式に取り込む。
+- `= macro <ref>` **parses**. The old `unimplemented syntax: macros` is gone.
+- The binding is recorded on the macro def's symbol.
+- **Expansion still does not work.** A diagnostic is emitted at the call site. We never accept
+  silently.
+- The §2.3 prototype is in [`docs/macro-engine-prototype/`](macro-engine-prototype/). It does not run
+  in CI (it needs scalac and scala-reflect.jar). How to run it, and what it lacks compared to a
+  production version, is written in the README there. It will be formally absorbed as
+  `crates/macro-engine/` in phase 2.
 
-### 7.1 quasiquote の**フロントエンド**（`crates/typer/src/quasiquote.rs`）
+### 7.1 The quasiquote **front end** (`crates/typer/src/quasiquote.rs`)
 
-`q"…"` / `tq"…"` / `pq"…"` / `cq"…"` を**認識して診断する**ところまでは動く。
-以前は `value q is not a member of StringContext` という**誤った**診断が出ていた
-（`q` は `Quasiquotes.Quasiquote` のメンバであり、欠けているのは展開である）。
+Recognizing and diagnosing `q"…"` / `tq"…"` / `pq"…"` / `cq"…"` works. Previously we emitted the
+**incorrect** diagnostic `value q is not a member of StringContext` (`q` is a member of
+`Quasiquotes.Quasiquote`; what is missing is the expansion).
 
-- 補間文字列の中身を、穴（`$x` / `${…}` / `..$xs` / `...$xss`）をプレースホルダ名に
-  置き換えて**再構成し、scala-rs のパーサで実際に構文解析する**。`..` / `...` は
-  直前の part の末尾に現れるので、そこから rank を剥がす。
-- パースできなければ `unimplemented syntax: quasiquote q"..." (理由)`。
-- パースできれば、残る欠落は reification なので
-  `macro expansion is not implemented: cannot expand quasiquote q"..."` を出す。
-- **ユーザ定義の `q` 補間子は横取りしない**。通常の custom interpolator として
-  型付けを試し、それが失敗したときだけ quasiquote として報告する
-  （fixture `quasi.scala` がこれを実行時まで検証している）。
+- The contents of the interpolated string are **reconstructed with the holes
+  (`$x` / `${…}` / `..$xs` / `...$xss`) replaced by placeholder names, and actually parsed by the
+  scala-rs parser**. Since `..` / `...` appear at the end of the preceding part, the rank is stripped
+  from there.
+- If it does not parse: `unimplemented syntax: quasiquote q"..." (reason)`.
+- If it does parse, the remaining gap is reification, so we emit
+  `macro expansion is not implemented: cannot expand quasiquote q"..."`.
+- **We do not hijack user-defined `q` interpolators.** We first try to type it as an ordinary custom
+  interpolator, and only report it as a quasiquote when that fails (the fixture `quasi.scala`
+  verifies this all the way to run time).
 
-**slick での実測**: `ShapedValue.mapToImpl` の 14 箇所（`q` 12 / `tq` 1 / `pq` 1）が
-すべて認識され、しかも **`unimplemented syntax` は 1 件も出ない**。つまり
-**scala-rs のパーサは slick が使う quasiquote の中身をすべて構文解析できる**。
-残っているのは §6.2 の 2 と 3、すなわち解析結果を `Syntactic*` 呼び出しに落とす
-reification と、そのコード生成である。
+**Measured on slick**: all 14 sites in `ShapedValue.mapToImpl` (`q` 12 / `tq` 1 / `pq` 1) are
+recognized, and **not one `unimplemented syntax` is emitted**. That is, **the scala-rs parser can
+parse the entire contents of every quasiquote slick uses**. What remains are items 2 and 3 of §6.2:
+the reification that lowers the parse result into `Syntactic*` calls, and the code generation for it.
 
-### 7.2 reflect ABI に向けて塞いだ穴
+### 7.2 Holes plugged on the way to the reflect ABI
 
-`q"…"` を展開できても、それが落ちる先（`c.universe` / 実行時ユニバース）を
-scala-rs が型検査できなければ意味がない。フェーズ 3 の下地として次を実装した。
-いずれも reflect 専用ではない一般の修正である。
+Being able to expand `q"…"` is pointless if scala-rs cannot typecheck what it lowers to (`c.universe`
+/ the runtime universe). As groundwork for phase 3 we implemented the following. All of them are
+general fixes, not reflect-specific ones.
 
-1. **pickle が指すネストしたクラス**。pickle は `scala.reflect.api.Names.TermNameExtractor`
-   のように、パッケージ区切りとクラス区切りを区別せずドットで書く。実体は
-   `scala/reflect/api/Names$TermNameExtractor.class` で、しかも
-   **ネストしたクラスファイルは `ScalaSignature` を持たない**（pickle は最上位クラスの
-   classfile にまとめて入っている）。`scala_rs_pickle::sym::pickle_files_for` が
-   候補ファイルを右から順に生成して両方を解決する。
-2. **バイトコード上の親を持たないトレイト**。`scala.reflect.api.Universe` は
-   *abstract class* なので、`trait JavaUniverse extends Universe` の classfile は
-   `interfaces: 0` になり、継承関係が pickle にしか無い。
-   `erased_desc` は、classfile が親を 1 つも宣言していないクラスに限り
-   pickle の親で補う（無条件に補うと `Map#map` の erased descriptor が曖昧になる）。
-3. **抽象型メンバ**。`type Tree >: Null <: TreeApi` のような宣言は reflect API の
-   語彙そのもので、クラスではないので `ensure_class` では解決できない。
-   `PickleSupply::abstract_type_member` が `TypeMember` シンボルとして導入する。
-   クラス内部から `Constant` のように**修飾なしで**書かれる場合のために、
-   レシーバの線形化とその**外側のクラス**まで探す（`self_type_member`）。
-4. **引数なし `def` の `apply` 挿入**。`def Literal: LiteralExtractor` に対する
-   `Literal(x)` は `Literal.apply(x)` である。これは reflect に限らない一般の欠落で、
-   `def mk: Box` に対する `mk("a")` も通らなかった（`insert_apply_on_nullary`）。
-5. **package object のメンバのコード生成**。`scala.math.Pi` は
-   `scala/math/package$` の `val` だが、typer はそれをパッケージシンボルに畳み込む。
-   パッケージには実行時の値が無いので、レシーバが積まれないまま `invokevirtual` が
-   出て **`VerifyError` になっていた**（main でも再現する既存バグ）。
-   `load_package_object_receiver` が `<pkg>/package$.MODULE$` を積む。
-6. **`import <値>._`**。`import c.universe._` / `import scala.reflect.runtime.universe._`
-   の形。プレフィクスが値のときはその**型**のメンバを入れる必要があり、さらに
-   無修飾の `Literal` は `u.Literal` を意味するので、typer が
-   `Select(u, Literal)` に書き戻す（`term_import_prefixes` / `qualify_term_import`）。
-   これをしないと backend が `this` をレシーバにして `ClassCastException` になる。
+1. **Nested classes referred to by the pickle.** The pickle writes package separators and class
+   separators identically as dots, e.g. `scala.reflect.api.Names.TermNameExtractor`. The actual file
+   is `scala/reflect/api/Names$TermNameExtractor.class`, and moreover **nested classfiles have no
+   `ScalaSignature`** (the pickle is stored wholesale in the top-level class's classfile).
+   `scala_rs_pickle::sym::pickle_files_for` generates candidate files right to left and resolves both.
+2. **Traits with no parents in the bytecode.** `scala.reflect.api.Universe` is an *abstract class*,
+   so the classfile of `trait JavaUniverse extends Universe` has `interfaces: 0` and the inheritance
+   relation exists only in the pickle. `erased_desc` fills in the pickle's parents, but only for
+   classes whose classfile declares no parent at all (filling in unconditionally makes the erased
+   descriptor of `Map#map` ambiguous).
+3. **Abstract type members.** Declarations like `type Tree >: Null <: TreeApi` are the vocabulary of
+   the reflect API itself; they are not classes, so `ensure_class` cannot resolve them.
+   `PickleSupply::abstract_type_member` introduces them as `TypeMember` symbols. For the case where
+   they are written **unqualified** from inside the class, as with `Constant`, we search the
+   receiver's linearization and its **enclosing class** as well (`self_type_member`).
+4. **Inserting `apply` on a parameterless `def`.** `Literal(x)` against `def Literal: LiteralExtractor`
+   means `Literal.apply(x)`. This is a general gap, not a reflect-specific one: `mk("a")` against
+   `def mk: Box` did not work either (`insert_apply_on_nullary`).
+5. **Code generation for package object members.** `scala.math.Pi` is a `val` in
+   `scala/math/package$`, but the typer folds it into the package symbol. A package has no runtime
+   value, so an `invokevirtual` was emitted with no receiver pushed, giving a **`VerifyError`**
+   (an existing bug reproducible in `main` too). `load_package_object_receiver` pushes
+   `<pkg>/package$.MODULE$`.
+6. **`import <value>._`.** The `import c.universe._` / `import scala.reflect.runtime.universe._`
+   shape. When the prefix is a value, the members of its **type** have to be brought in, and further,
+   an unqualified `Literal` means `u.Literal`, so the typer rewrites it back to `Select(u, Literal)`
+   (`term_import_prefixes` / `qualify_term_import`). Without this the backend uses `this` as the
+   receiver and gets a `ClassCastException`.
 
-### 7.3 まだ塞がっていない穴（次に要るもの）
+### 7.3 Holes still open (what is needed next)
 
-**A. 展開先を宣言したクラスで呼ぶこと。済（`agent/reify2`）。** §7.4 の 1。
+**A. Calling from the class that declares the target. Done (`agent/reify2`).** Item 1 of §7.4.
 
-**B. reification 本体。一部済（`agent/reify2`）。** §7.4 の 2。実装した部分集合と、
-まだ落とせない形は §7.4 に列挙してある。
+**B. Reification proper. Partly done (`agent/reify2`).** Item 2 of §7.4. The subset implemented, and
+the shapes we still cannot lower, are listed in §7.4.
 
-**C. `c.Expr[T]` などのパス依存型。済（`agent/quasi`）。** §7.6。
+**C. Path-dependent types such as `c.Expr[T]`. Done (`agent/quasi`).** §7.6.
 
-**D. engine（フェーズ 2）。** A〜C が済んでも、slick の `mapToImpl` を*呼ぶ*には
-§2.3 の JVM ブリッジが要る。こちらは prototype で検証済みで、順序としては最後でよい。
+**D. The engine (phase 2).** Even with A through C done, *calling* slick's `mapToImpl` requires the
+JVM bridge of §2.3. That part is already validated by the prototype and can come last.
 
-### 7.4 宣言クラスでの呼び出しと reification（`agent/reify2` スライス）
+### 7.4 Calling from the declaring class, and reification (the `agent/reify2` slice)
 
-§7.3 の A と B。**`scala.reflect.runtime.universe` 上で Tree を組み立てるコードが
-実際に走るようになり**、その上で `q"…"` の一部が本当に脱糖されるようになった。
+A and B of §7.3. **Code that builds Trees on `scala.reflect.runtime.universe` now actually runs**,
+and on top of that some shapes of `q"…"` really get desugared.
 
-#### 1. 宣言クラスで呼ぶ（A、済）
+#### 1. Calling from the declaring class (A, done)
 
-`Symbol::declaring_class` / `declaring_is_interface` を足した
-（`crates/typer/src/symbol.rs`）。`pickle_supply::erased_desc` は 7.2 の 2 で
-「classfile が親を 1 つも宣言していないクラスは pickle の親で補う」ようになっていたが、
-**見つけた descriptor がどのクラスの宣言かを返していなかった**。そこを
-`ErasedDecl { desc, declared_in, declared_by_interface, off_the_bytecode_path }` にし、
-`off_the_bytecode_path`（＝pickle の親を辿ってしか届かない、JVM には見えない経路）で
-見つけたときだけ宣言クラスをシンボルに記録する。`gen.rs` はそれを invoke のオーナーに使い、
-レシーバをそこへ `checkcast` する。**受け手の classfile から届く普通のメンバの
-バイトコードは一切変わらない**（既存 fixture が全部それを固定している）。
+We added `Symbol::declaring_class` / `declaring_is_interface` (`crates/typer/src/symbol.rs`).
+Item 2 of §7.2 had made `pickle_supply::erased_desc` "fill in the pickle's parents for classes whose
+classfile declares no parent", but **it did not report which class the descriptor it found was
+declared in**. That became
+`ErasedDecl { desc, declared_in, declared_by_interface, off_the_bytecode_path }`, and only when the
+descriptor was found via `off_the_bytecode_path` (i.e. reachable only by following the pickle's
+parents, invisible to the JVM) do we record the declaring class on the symbol. `gen.rs` uses it as
+the invoke owner and `checkcast`s the receiver to it. **The bytecode of ordinary members reachable
+from the receiver's own classfile does not change at all** (the existing fixtures pin all of that).
 
 ```
-// scala-rs が出すようになったもの（nsc と同形）
+// What scala-rs now emits (same shape as nsc)
 invokeinterface scala/reflect/api/Constants.Constant:()Lscala/reflect/api/Constants$ConstantExtractor;
-// 以前: invokeinterface scala/reflect/api/JavaUniverse.Constant() → NoSuchMethodError
+// Before: invokeinterface scala/reflect/api/JavaUniverse.Constant() → NoSuchMethodError
 ```
 
-これだけでは `u.Literal(u.Constant(42))` は通らず、道中で 4 つ塞いだ。いずれも
-reflect 専用ではない一般の欠落である。
+That alone did not get `u.Literal(u.Constant(42))` through; four more holes were plugged on the way.
+All are general gaps, not reflect-specific.
 
-- **入れ子クラスの名前が外側クラスに潰れる**（`pickle_supply::ensure_class`）。
-  `pickle_files_for` は「pickle が入っている classfile」も候補に出すので、
-  `scala.reflect.api.Constants.Constant`（実体のない抽象型メンバ）が
-  `scala/reflect/api/Constants` にマッチして**外側のトレイトそのもの**に解決していた。
-  `names_class` で「自分の単純名で終わる候補」だけを採る。
-- **複合上界が捨てられる**（`conv_upper_bound`）。reflect API は
-  `type Select >: Null <: SelectApi with RefTree` の形で書かれていて、
-  `Refined` を変換できず上界ごと落としていた。`Select <: Tree` が導けないので
-  `Syntactic*` に渡せるものが何も無かった。
-- **上界が受け手の語彙で解決されていた**（`abstract_type_member`）。上界は
-  *宣言クラス*の語彙で書かれている（`Ident` の上界の `RefTree` は同じ `Trees` の
-  別の抽象型メンバ）。変換の間だけ `self_ty` を宣言クラスに向ける。
-- **既定引数ゲッタの規約**。scalac は既定値が先行パラメータを読まないとき
-  **nullary の** `$default$n` を出す。呼び出し側はゲッタ自身の arity に合わせる
-  （`default_getter_apply`）。これが無いと `SyntacticTermIdent` が供給されない。
-- **複合上界が base type sequence に現れない**（`SymbolTable::base_type_seq`）。
-  `lub(Ident, Literal)` が `AnyRef` になり `List(ident, literal)` が
-  `List[AnyRef]` になっていた。
+- **Nested class names collapsing into the enclosing class** (`pickle_supply::ensure_class`).
+  `pickle_files_for` also offers "the classfile that contains the pickle" as a candidate, so
+  `scala.reflect.api.Constants.Constant` (an abstract type member with no runtime entity) matched
+  `scala/reflect/api/Constants` and resolved to **the enclosing trait itself**. `names_class` now
+  keeps only candidates that end with the simple name in question.
+- **Compound upper bounds being dropped** (`conv_upper_bound`). The reflect API is written in the
+  form `type Select >: Null <: SelectApi with RefTree`; we could not convert `Refined` and dropped
+  the whole upper bound. Since `Select <: Tree` was not derivable, there was nothing at all we could
+  pass to `Syntactic*`.
+- **Upper bounds being resolved in the receiver's vocabulary** (`abstract_type_member`). Bounds are
+  written in the vocabulary of the *declaring* class (the `RefTree` in `Ident`'s upper bound is
+  another abstract type member of the same `Trees`). We point `self_ty` at the declaring class for
+  the duration of the conversion.
+- **The default-argument getter convention.** When a default value does not read preceding
+  parameters, scalac emits a **nullary** `$default$n`. The call side must match the getter's own
+  arity (`default_getter_apply`). Without this, `SyntacticTermIdent` is not supplied.
+- **Compound upper bounds not appearing in the base type sequence** (`SymbolTable::base_type_seq`).
+  `lub(Ident, Literal)` came out as `AnyRef`, making `List(ident, literal)` a `List[AnyRef]`.
 
-#### 2. reification（B、部分実装）
+#### 2. Reification (B, partial implementation)
 
-`crates/typer/src/reify.rs`。7.1 が構文解析した木を
-`<universe>.internal.reificationSupport.Syntactic*` の呼び出し木に落とし、
-**普通の式として型検査・コード生成する**。universe は
-`import <universe>._` が記録した term import のプレフィクスから採る
-（`Check::universe_in_scope`）。
+`crates/typer/src/reify.rs`. It lowers the tree parsed by §7.1 into a call tree of
+`<universe>.internal.reificationSupport.Syntactic*` and **typechecks and generates code for it as an
+ordinary expression**. The universe is taken from the prefix of the term import recorded by
+`import <universe>._` (`Check::universe_in_scope`).
 
-`q"…"` について落とせる形:
+The shapes of `q"…"` that can be lowered:
 
-| 形 | 落とす先 |
+| Shape | Lowered to |
 | --- | --- |
-| リテラル | `u.Literal(u.Constant(v))` |
-| 名前 | `rs.SyntacticTermIdent(u.TermName("n"), false)` |
+| Literal | `u.Literal(u.Constant(v))` |
+| Name | `rs.SyntacticTermIdent(u.TermName("n"), false)` |
 | `a.b` | `rs.SyntacticSelectTerm(<a>, u.TermName("b"))` |
 | `f(a, b)` / `a.b(1)(2)` | `rs.SyntacticApplied(<f>, List(List(<a>, <b>)))` |
-| `$x` | 引数の式をそのまま差す |
-| `..$xs` | 引数リスト 1 節ぶんとして差す |
-| `f()` | `Nil`（`List()` は `A` を解けない。§7.5） |
+| `$x` | splice the argument expression in as is |
+| `..$xs` | splice in as one whole argument-list section |
+| `f()` | `Nil` (`List()` cannot resolve `A`; see §7.5) |
 
-**落とせない形は必ず診断する**（`unimplemented syntax: quasiquote q"..." (…)` に
-どの形かを書く）。このスライス時点の穴（**§7.7 でほとんど埋まった**）: ブロック、
-関数リテラル、`new`、`if`、`match`、型注釈、型適用、`this` / `super`、
-定義（`val` / `def` / `class`）、`..$` と普通の引数の混在、`tq` / `pq` / `cq` 全体。
+**Shapes we cannot lower are always diagnosed** (the `unimplemented syntax: quasiquote q"..." (…)`
+message names which shape it was). The holes as of this slice (**mostly filled in §7.7**): blocks,
+function literals, `new`, `if`, `match`, type ascriptions, type applications, `this` / `super`,
+definitions (`val` / `def` / `class`), mixing `..$` with ordinary arguments, and all of
+`tq` / `pq` / `cq`.
 
-検証: `tests/fixtures/reify_qq.scala` を実 scalac 2.13.16 と dual-run して
-**出力が完全一致**する（`crates/cli/tests/reify.rs`）。異常系は
-`tests/fixtures/reify_qq_bad.scala`。
+Validation: `tests/fixtures/reify_qq.scala` is dual-run against the real scalac 2.13.16 and
+**the output matches exactly** (`crates/cli/tests/reify.rs`). The failure cases are in
+`tests/fixtures/reify_qq_bad.scala`.
 
-### 7.5 このスライスのあとに残っているもの
+### 7.5 What remains after this slice
 
-1. **`tq` / `pq` / `cq`。** `mapToImpl` は 3 つとも使う。`tq` は
+1. **`tq` / `pq` / `cq`.** `mapToImpl` uses all three. `tq` needs roughly
    `SyntacticAppliedType` / `SyntacticSelectType` / `SyntacticTypeIdent` /
-   `SyntacticEmptyTypeTree` あたり、`pq` は `Bind` / `UnApply`、`cq` は `CaseDef`。
-2. **`q` の残りの形。** 特に `SyntacticBlock`（`q"""…"""` の複文）、
-   `SyntacticNew`、`SyntacticFunction`、`SyntacticValDef` / `SyntacticDefDef`、
-   `Typed`（`(x: T)`）。§3.3 の出現回数が優先順位そのものである。
-2. **`..$` と普通の引数の混在**（`q"f(a, ..$xs)"`）。連結の静的型を両側とも
-   正しく出す必要がある。
-3. **期待型からのメソッド型パラメータ推論。** `List()` が `List[A]` のまま
-   解けないので `Nil` で回避している。ここが入れば混在の連結も書きやすくなる。
-4. **`Liftable`。** `$x` の `x` が `Tree` でないとき（`Int`、`String`、`Name`、
-   `Symbol`、`WeakTypeTag`）、nsc は implicit `Liftable` で持ち上げる。
-   `mapToImpl` は `$rTag` / `$rCT` / `${c.prefix}` でこれを使う。
-   現状は `Tree` でない穴が型エラーになる（黙って通しはしない）。
-5. **§7.3 の C（`c.Expr[T]` などパス依存型）と D（engine）。** C は §7.6 で
-   済んだ。D（engine）が残っている。
+   `SyntacticEmptyTypeTree`, `pq` needs `Bind` / `UnApply`, and `cq` needs `CaseDef`.
+2. **The remaining shapes of `q`.** In particular `SyntacticBlock` (multi-statement `q"""…"""`),
+   `SyntacticNew`, `SyntacticFunction`, `SyntacticValDef` / `SyntacticDefDef`, and `Typed`
+   (`(x: T)`). The occurrence counts in §3.3 are the priority order.
+2. **Mixing `..$` with ordinary arguments** (`q"f(a, ..$xs)"`). The static type of the concatenation
+   has to come out right on both sides.
+3. **Inferring method type parameters from the expected type.** `List()` stays unresolved as
+   `List[A]`, so we work around it with `Nil`. With this in place, writing the mixed concatenation
+   also becomes easier.
+4. **`Liftable`.** When the `x` in `$x` is not a `Tree` (`Int`, `String`, `Name`, `Symbol`,
+   `WeakTypeTag`), nsc lifts it via an implicit `Liftable`. `mapToImpl` uses this for
+   `$rTag` / `$rCT` / `${c.prefix}`. Today a non-`Tree` hole is a type error (we do not accept it
+   silently).
+5. **C (path-dependent types such as `c.Expr[T]`) and D (the engine) of §7.3.** C was finished in
+   §7.6. D (the engine) remains.
 
-### 7.6 マクロ実装のシグネチャと `import c.universe._`（`agent/quasi` スライス）
+### 7.6 Macro implementation signatures and `import c.universe._` (the `agent/quasi` slice)
 
-§7.3 の C。**scala-reflect.jar が classpath にあれば、マクロ実装のソースが
-コンパイルできるようになった。** 中身は「パス依存型」というより、
-**jar のクラスの遅延ロードが型名前空間とワイルドカード import に届いていなかった**
-という一般の欠落だった。
+C of §7.3. **If scala-reflect.jar is on the classpath, macro implementation sources now compile.**
+The substance was less about "path-dependent types" and more a general gap:
+**lazy loading of jar classes was not reaching the type namespace or wildcard imports.**
 
-| 直したもの | どこ |
+| What was fixed | Where |
 | --- | --- |
-| **`import <値>._` が継承メンバに届かない。** jar のクラスのメンバは名前ごとに pickle から遅延ロードされる。`import scala.reflect.runtime.universe._` が名乗る `JavaUniverse` は `TermName` / `Literal` / `Constant` / `termNames` を**すべて linearization の上の方**（`api.Names` / `Trees` / `Constants` / `StandardNames`）から継承していて、誰もそれを要求していないので import は**何も**持ち込んでいなかった。パス経由（`u.TermName`）は完了処理を通るので動いていた。reify した quasiquote は `u.TermName(...)` を明示的に組むので、この穴に気づかなかった | `Check::expose_unqualified` → `supply_from_pickle_class` |
-| **型名前空間。** reflect API は同じ名前を両方の名前空間に置く（`val TermName` と `type TermName`）。値を先に解決すると term が scope に入り、`expose_unqualified` が「もう束縛済み」と見て止まるので、`val n: TermName = TermName("f")` は右辺だけ通って左辺が `not found` だった | `Check::expose_unqualified_type` |
-| **jar のクラスの型メンバがそもそも読めない。** `def` の完了しか無かった。`blackbox.Context` は `scala.reflect.macros.Aliases` から `type Tree = universe.Tree` / `type Expr[T] = universe.Expr[T]` / `type WeakTypeTag[T] = …` を継承していて、これが無いとマクロ実装は**自分のシグネチャを書けない** | `PickleSupply::complete_type_member` / `install_type_alias` |
-| **refinement 越しの型メンバ。** slick の `mapToImpl` の `c` は `blackbox.Context { type PrefixType = ShapedValue[?, U] }` という**精製型**で、そこから `c.Expr[…]` / `c.Tree` を引く | `Check::project_from_prefix` の `Type::Refined` 枝 |
-| **`import <値>._` の親が未ロード。** `universe_in_scope` は「この prefix は `scala.reflect.api.Universe` を継承しているか」で universe を見分けるが、その親リストは pickle にしか無く、まだ誰も読んでいなかった。だから `import c.universe._` を書いた本体の `q"…"` は全部「cannot expand」になっていた | `PickleSupply::ensure_parents` |
-| **term import prefix のスコープ。** `import u._` の `u` はそのメソッドのローカルで、次のメソッドには無い。それでも prefix として使われ、**別メソッドのローカルに対する `getfield`** を吐いていた（`NoClassDefFoundError`）。しかも同じ owner の外側の import を追い出していたので、内側を抜けた後は receiver 無しになっていた | `Check::prefix_in_scope`、`remember_term_import_prefix` は置換をやめて追加に |
-| **空の `Context` prelude をやめた。** scala-reflect.jar が classpath にあるときだけ本物を読む。無いときは今までどおり空の `Context` を入れ、`value universe is not a member of Context` と**きちんと言う**（`--scala-library` は scala-reflect.jar を含まない） | `prelude_reflect::want_context_stub` |
+| **`import <value>._` not reaching inherited members.** Members of jar classes are lazily loaded from the pickle name by name. The `JavaUniverse` named by `import scala.reflect.runtime.universe._` inherits `TermName` / `Literal` / `Constant` / `termNames` **all from higher up the linearization** (`api.Names` / `Trees` / `Constants` / `StandardNames`), and since nobody had requested them, the import brought in **nothing**. The path route (`u.TermName`) worked because it goes through completion. Reified quasiquotes build `u.TermName(...)` explicitly, which is why this hole went unnoticed | `Check::expose_unqualified` → `supply_from_pickle_class` |
+| **The type namespace.** The reflect API puts the same name in both namespaces (`val TermName` and `type TermName`). Resolving the value first puts the term in scope, and `expose_unqualified` then sees "already bound" and stops, so in `val n: TermName = TermName("f")` only the right-hand side went through and the left-hand side was `not found` | `Check::expose_unqualified_type` |
+| **Type members of jar classes were not readable at all.** We only had completion for `def`s. `blackbox.Context` inherits `type Tree = universe.Tree` / `type Expr[T] = universe.Expr[T]` / `type WeakTypeTag[T] = …` from `scala.reflect.macros.Aliases`, and without them a macro implementation **cannot even write its own signature** | `PickleSupply::complete_type_member` / `install_type_alias` |
+| **Type members through a refinement.** The `c` of slick's `mapToImpl` has the **refined type** `blackbox.Context { type PrefixType = ShapedValue[?, U] }`, and `c.Expr[…]` / `c.Tree` are projected out of it | the `Type::Refined` branch of `Check::project_from_prefix` |
+| **The parents of an `import <value>._` were not loaded.** `universe_in_scope` identifies a universe by asking "does this prefix inherit `scala.reflect.api.Universe`?", but that parent list exists only in the pickle and nobody had read it yet. So every `q"…"` in a body that wrote `import c.universe._` came out as "cannot expand" | `PickleSupply::ensure_parents` |
+| **The scope of a term import prefix.** The `u` of `import u._` is local to that method and does not exist in the next one. It was nonetheless used as a prefix, emitting a **`getfield` against another method's local** (`NoClassDefFoundError`). Worse, it evicted the enclosing import of the same owner, so after leaving the inner one there was no receiver at all | `Check::prefix_in_scope`; `remember_term_import_prefix` now appends instead of replacing |
+| **We stopped installing an empty `Context` prelude.** We read the real one only when scala-reflect.jar is on the classpath. When it is absent we install the empty `Context` as before and **say so properly**: `value universe is not a member of Context` (`--scala-library` does not include scala-reflect.jar) | `prelude_reflect::want_context_stub` |
 
-検証（`crates/cli/tests/quasi.rs`）:
+Validation (`crates/cli/tests/quasi.rs`):
 
-- `tests/fixtures/qq_universe.scala` — 実行して実 scalac 2.13.16 と**出力が完全一致**。
-  `showRaw` まで一致するので、**同じ木**を作っている。`java -Xverify:all`。
-- `tests/fixtures/qq_ctx.scala` — マクロ実装そのもの。scala-rs と実 scalac の
-  **両方**がコンパイルでき、吐いた classfile は JVM にロード・検証される。
-  展開には engine（D）が要るので実行はしない。
-- `tests/fixtures/qq_ctx_bad.scala` — reify できない形（型注釈・ブロック・`tq`）は
-  必ず**その形を名指しして**診断する。`Tree` でない穴も型エラーになる。
-- scala-reflect.jar 無しでは空の `Context` の診断が出ることも固定してある。
+- `tests/fixtures/qq_universe.scala` — run for real, and **the output matches the real scalac 2.13.16
+  exactly**. Even `showRaw` matches, so we are building **the same tree**. `java -Xverify:all`.
+- `tests/fixtures/qq_ctx.scala` — a macro implementation itself. **Both** scala-rs and the real
+  scalac compile it, and the classfiles emitted load and verify on the JVM. Expansion needs the
+  engine (D), so we do not run it.
+- `tests/fixtures/qq_ctx_bad.scala` — shapes that cannot be reified (type ascriptions, blocks, `tq`)
+  are always diagnosed **by naming the shape**. Non-`Tree` holes are type errors too.
+- The diagnostic for the empty `Context` without scala-reflect.jar is pinned as well.
 
-**slick への効き方（重要）。** `tests/slick_measure.sh` が使う `deps.cp` には
-**scala-reflect.jar が入っていない**。slick 本体はこれに依存している
-（`build.sbt` の `scala-reflect`）ので、無ければ実 scalac でも
-`ShapedValue.scala` / `TableQuery.scala` はコンパイルできない。数字は:
+**How this affects slick (important).** The `deps.cp` used by `tests/slick_measure.sh`
+**does not contain scala-reflect.jar**. Slick itself depends on it (`scala-reflect` in `build.sbt`),
+so without it even the real scalac cannot compile `ShapedValue.scala` / `TableQuery.scala`.
+The numbers:
 
 | classpath | errors | ShapedValue | TableQuery |
 | --- | --- | --- | --- |
-| 既定（scala-reflect 無し） | 327 → **320** | 29 → 29 | 23 → 23 |
-| `-cp scala-reflect.jar` を足す | 322 → **294** | 26 → **17** | 21 → **9** |
+| Default (no scala-reflect) | 327 → **320** | 29 → 29 | 23 → 23 |
+| Adding `-cp scala-reflect.jar` | 322 → **294** | 26 → **17** | 21 → **9** |
 
-（前後とも分岐元 `6c6fc7f` で実測。jar を足すだけで 327 → 322 になるのは、
-`Context` 以外の `scala.reflect.*` の名前がいくつか解決するため。）
+(Both before and after measured at the branch point `6c6fc7f`. Merely adding the jar moves 327 → 322
+because several `scala.reflect.*` names other than `Context` start resolving.)
 
-既定の classpath を勝手に変えると他のエージェントの基準値まで動くので、
-`deps.cp` は触っていない。**quasiquote の 12 件を減らすには、まず計測の
-classpath に scala-reflect.jar を足す必要がある。**
+Changing the default classpath on our own would move other agents' baselines too, so `deps.cp` has
+not been touched. **To reduce the 12 quasiquote errors, the measurement classpath first has to gain
+scala-reflect.jar.**
 
-そのうえで残っているもの:
+On top of that, what remains:
 
-1. **reification の残りの形。** scala-reflect.jar を足した `ShapedValue.scala` の
-   残り 17 件のうち **11 件**がこれで、内訳は `Typed`（型注釈、8 件）、
-   `SyntacticBlock`（1 件）、`tq`（1 件）、`pq`（1 件）。§7.5 の 1・2 そのもの。
-   どれも「展開できない」ではなく**どの形が足りないか**を名指しする診断になった。
-2. **`Ident(TermName("x"))` / `New(TypeTree(…))` のオーバーロード。**
-   `val Ident: IdentExtractor` と `def Ident(name: String): Ident` の
-   オーバーロード集合に対して `apply` 挿入が働かない。`TableQuery` の 2 件。
-3. **`symbolOf[T]` / `typeOf[T]`。** 型パラメータが implicit 節にしか現れない
-   メンバは `pin_undetermined_tparams` が明示的に断っている（一般の制限）。
-4. **wildcard import の遮蔽。** `import c.universe._` は暗黙の `import scala._` を
-   遮蔽するはずだが、`Symbol` は `scala.Symbol` に解決されたままになる。
-5. **我々の pickle を scalac が読めない。** scala-rs がコンパイルしたマクロ実装を
-   実 scalac から `macro` で参照すると `macro implementation has incompatible
-   shape: found (c: Context, x: Tree): Tree` になる。パラメータ節がひとつに
-   潰れており、パス依存型も残っていない。§5 のフェーズ 2 の作業。
+1. **The remaining reification shapes.** Of the 17 errors left in `ShapedValue.scala` with
+   scala-reflect.jar added, **11** are these, broken down as `Typed` (type ascription, 8),
+   `SyntacticBlock` (1), `tq` (1), `pq` (1). Exactly items 1 and 2 of §7.5. Every one of them is now
+   a diagnostic that names **which shape is missing**, rather than "cannot expand".
+2. **The `Ident(TermName("x"))` / `New(TypeTree(…))` overloads.** `apply` insertion does not work
+   against the overload set of `val Ident: IdentExtractor` and `def Ident(name: String): Ident`.
+   The 2 errors in `TableQuery`.
+3. **`symbolOf[T]` / `typeOf[T]`.** Members whose type parameter appears only in the implicit section
+   are explicitly refused by `pin_undetermined_tparams` (a general restriction).
+4. **Shadowing of wildcard imports.** `import c.universe._` should shadow the implicit
+   `import scala._`, but `Symbol` still resolves to `scala.Symbol`.
+5. **scalac cannot read our pickle.** Referring from the real scalac, with `macro`, to a macro
+   implementation compiled by scala-rs gives
+   `macro implementation has incompatible shape: found (c: Context, x: Tree): Tree`.
+   The parameter sections have been collapsed into one and the path-dependent types are gone.
+   This is the phase 2 work of §5.
 
-### 7.7 reification の残りの形（`agent/reify2` 第 2 スライス）
+### 7.7 The remaining reification shapes (the second `agent/reify2` slice)
 
-§7.6 の 1 と 2。**`tq"…"` / `pq"…"` / `cq"…"` と、`q"…"` の残りの形が
-落とせるようになった。** 形はすべて実 scalac 2.13.16 の `-Ymacro-debug-lite`
-（nsc 自身の quasiquote マクロが吐く展開が印字される）から読み取り、
-`tests/fixtures/qr_forms.scala` が `showRaw` まで実 scalac と突き合わせている
-（`java -Xverify:all` で実行、56 行が完全一致）。
+Items 1 and 2 of §7.6. **`tq"…"` / `pq"…"` / `cq"…"` and the remaining shapes of `q"…"` can now be
+lowered.** Every shape was read off the real scalac 2.13.16 with `-Ymacro-debug-lite` (which prints
+the expansion nsc's own quasiquote macros emit), and `tests/fixtures/qr_forms.scala` compares against
+the real scalac down to `showRaw` (run under `java -Xverify:all`; 56 lines match exactly).
 
-#### 落とせるようになった形
+#### Shapes that can now be lowered
 
-| 形 | 落とす先 |
+| Shape | Lowered to |
 | --- | --- |
 | `tq"T"` | `rs.SyntacticTypeIdent(u.TypeName("T"))` |
-| `tq"a.b.C"` | `rs.SyntacticSelectType(<a.b を項として>, u.TypeName("C"))` |
+| `tq"a.b.C"` | `rs.SyntacticSelectType(<a.b as a term>, u.TypeName("C"))` |
 | `tq"F[A, B]"` | `rs.SyntacticAppliedType(<F>, List(<A>, <B>))` |
 | `tq"A => B"` | `rs.SyntacticFunctionType(List(<A>), <B>)` |
 | `tq"(A, B)"` | `rs.SyntacticTupleType(List(<A>, <B>))` |
 | `tq"a.b.type"` | `rs.SyntacticSingletonType(<a.b>)` |
 | `tq"A#B"` | `rs.SyntacticTypeProjection(<A>, u.TypeName("B"))` |
 | `tq"A with B"` | `rs.SyntacticCompoundType(List(<A>, <B>), Nil)` |
-| 型の空欄（`val x = e` の型） | `rs.SyntacticEmptyTypeTree.apply()` |
+| An empty type slot (the type of `val x = e`) | `rs.SyntacticEmptyTypeTree.apply()` |
 | `q"x: T"` | `u.Typed(<x>, <T>)` |
 | `q"f _"` | `u.Typed(<f>, rs.SyntacticFunction(Nil, u.EmptyTree))` |
-| `q"f[T](a)"` | `rs.SyntacticTypeApplied(<f>, List(<T>))` の上に `SyntacticApplied` |
+| `q"f[T](a)"` | `SyntacticApplied` on top of `rs.SyntacticTypeApplied(<f>, List(<T>))` |
 | `q"{ a; b }"` / `q"..$stats"` | `rs.SyntacticBlock(List(<a>, <b>))` |
 | `q"val v: T = e"` | `rs.SyntacticValDef(u.Modifiers(rs.FlagsRepr(0L)), u.TermName("v"), <T>, <e>)` |
 | `q"new C[T](a)(b)"` | `rs.SyntacticNew(Nil, List(rs.SyntacticApplied(<C[T]>, List(<a>, <b>))), u.noSelfType, Nil)` |
@@ -826,184 +907,184 @@ classpath に scala-reflect.jar を足す必要がある。**
 | `q"a.b = c"` | `rs.SyntacticAssign(<a.b>, <c>)` |
 | `q"if (a) b else c"` | `u.If(<a>, <b>, <c>)` |
 | `pq"_"` | `rs.SyntacticTermIdent(u.TermName("_"), false)` |
-| `pq"x"`（小文字始まり） | `u.Bind(u.TermName("x"), rs.SyntacticTermIdent(u.TermName("_"), false))` |
+| `pq"x"` (lowercase initial) | `u.Bind(u.TermName("x"), rs.SyntacticTermIdent(u.TermName("_"), false))` |
 | `pq"a.b.C(p)"` | `rs.SyntacticApplied(<a.b.C>, List(List(<p>)))` |
 | `pq"x @ p"` / `pq"a \| b"` / `pq"_: T"` | `u.Bind` / `u.Alternative` / `u.Typed` |
-| `cq"p if g => e"` | `u.CaseDef(<p>, <g>, <e>)`（ガード無しは `u.EmptyTree`） |
-| 演算子名 | `NameTransformer` で符号化（`q"a + b"` は `u.TermName("$plus")`） |
-| `q"$x.$n"` | 名前の位置の穴は `TermName` をそのまま差す |
+| `cq"p if g => e"` | `u.CaseDef(<p>, <g>, <e>)` (`u.EmptyTree` when there is no guard) |
+| Operator names | Encoded with `NameTransformer` (`q"a + b"` gives `u.TermName("$plus")`) |
+| `q"$x.$n"` | A hole in name position splices the `TermName` straight in |
 
-#### パーサが潰してしまう区別を、元のソース文字列で戻す
+#### Recovering, from the original source string, distinctions the parser collapses
 
-scala-rs のパーサは nsc が区別する形をいくつか正規化してしまう。reification は
-**quasiquote の本文テキストを持ち回って**そこを見分ける（`Reifier::src`）。
+The scala-rs parser normalizes away several distinctions that nsc keeps. Reification
+**carries the quasiquote's body text around** and uses it to tell them apart (`Reifier::src`).
 
-- `A => B` は `AppliedTypeTree(Ident("Function1"), …)` になり、**書かれた**
-  `Function1[A, B]` と同じ木になる。nsc は前者を `_root_.scala.Function1`、
-  後者を裸の `Ident` にする。頭の span のテキストが `Function1` かどうかで決める。
-- `(a, b)` は `Apply(Ident("Tuple2"), …)` になり、書かれた `Tuple2(a, b)` と
-  同じ木になる。nsc は前者だけ `SyntacticTuple`。同じ判定。
-- `q"val v = e"` と `q"{ val v = e }"`。ラッパが足す `{}` と作者の `{}` は
-  パース後には区別できないので、**本文が `{` で始まるか**を渡している
-  （`unwrap_body` の `braced`）。前者は裸の `SyntacticValDef`、後者は
-  `SyntacticBlock`。
+- `A => B` becomes `AppliedTypeTree(Ident("Function1"), …)`, the same tree as a **written**
+  `Function1[A, B]`. nsc makes the former `_root_.scala.Function1` and the latter a bare `Ident`.
+  We decide by whether the text at the head span is `Function1`.
+- `(a, b)` becomes `Apply(Ident("Tuple2"), …)`, the same tree as a written `Tuple2(a, b)`. nsc uses
+  `SyntacticTuple` only for the former. Same test.
+- `q"val v = e"` versus `q"{ val v = e }"`. The `{}` added by the wrapper and the author's own `{}`
+  are indistinguishable after parsing, so we pass **whether the body starts with `{`**
+  (`braced` in `unwrap_body`). The former is a bare `SyntacticValDef`, the latter a `SyntacticBlock`.
 
-#### 落とせない形は今までどおり名指しで診断する
+#### Shapes we cannot lower are still diagnosed by name
 
-パーサが**情報ごと**捨ててしまい、何を作っても「誰も書いていない木」になる形は
-作らない。`tests/fixtures/qr_forms_bad.scala` / `reify_qq_bad.scala` /
-`qq_ctx_bad.scala` がそれぞれ診断を固定している。
+We do not build shapes where the parser has discarded **the information itself**, so that whatever we
+built would be "a tree nobody wrote". `tests/fixtures/qr_forms_bad.scala` / `reify_qq_bad.scala` /
+`qq_ctx_bad.scala` each pin the corresponding diagnostic.
 
-| 形 | 診断 | 理由 |
+| Shape | Diagnostic | Reason |
 | --- | --- | --- |
-| `q"a :: b"` | a right-associative operator (`::`) is not reified yet | パースで `b.::(a)` になり、書かれた `b.::(a)` と区別できない。nsc はそのどちらでもなく、左辺を fresh な `val` に束ねた**ブロック**を作る |
-| `q"if (a) b"` | an `if` without an `else` is not reified yet | パーサは `else` に `()` を補う。nsc は空ブロックを補う |
-| `q"_.get"` | a `_` placeholder function literal is not reified yet | パーサが作るパラメータ名と、nsc の `freshTermName` が違う |
-| `tq"=> T"` | a by-name type is not reified yet | nsc のパーサ自身が `tq` の中では拒否する |
-| `q"f(a, ..$xs)"` | a `..$` splice mixed with ordinary arguments | 連結の静的型を両側とも正しく出す必要がある（§7.5 の 2） |
-| `q"class C"` など定義 | a class definition is not reified yet | `SyntacticClassDef` などが未実装（**§7.8/7.9 で入った**） |
-| `q"{ lazy val a = 1 }"` | a modified `val` definition is not reified yet | `Modifiers` のフラグ変換が未実装（**§7.8/7.9 で入った**） |
-| `q"{ $x }"` | （診断なし。既知の差） | パーサが `{ e }` を `e` に潰すので、単一の穴だけは nsc の `SyntacticBlock(List(x))` に対して `x` になる。意味は同じだが木は違う |
+| `q"a :: b"` | a right-associative operator (`::`) is not reified yet | Parsing yields `b.::(a)`, indistinguishable from a written `b.::(a)`. nsc builds neither: it builds a **block** that binds the left-hand side to a fresh `val` |
+| `q"if (a) b"` | an `if` without an `else` is not reified yet | The parser fills the `else` with `()`. nsc fills it with an empty block |
+| `q"_.get"` | a `_` placeholder function literal is not reified yet | The parameter name the parser makes differs from nsc's `freshTermName` |
+| `tq"=> T"` | a by-name type is not reified yet | nsc's own parser rejects it inside `tq` |
+| `q"f(a, ..$xs)"` | a `..$` splice mixed with ordinary arguments | The static type of the concatenation has to come out right on both sides (item 2 of §7.5) |
+| Definitions such as `q"class C"` | a class definition is not reified yet | `SyntacticClassDef` and friends were unimplemented (**added in §7.8/7.9**) |
+| `q"{ lazy val a = 1 }"` | a modified `val` definition is not reified yet | The flag conversion for `Modifiers` was unimplemented (**added in §7.8/7.9**) |
+| `q"{ $x }"` | (no diagnostic; a known difference) | The parser collapses `{ e }` into `e`, so a lone hole comes out as `x` where nsc has `SyntacticBlock(List(x))`. The meaning is the same, the tree is not |
 
-#### ついでに直した一般の穴
+#### General holes fixed along the way
 
-reification が要求しただけで、いずれも reflect 専用ではない。
+Reification merely happened to demand these; none of them is reflect-specific.
 
-| 直したもの | どこ |
+| What was fixed | Where |
 | --- | --- |
-| **オーバーロード集合への `apply` 挿入。** `val Ident: IdentExtractor` と `def Ident(name: String): Ident` は同じ名前のオーバーロード集合で、`Ident(TermName("x"))` はどちらにも当たらず `Ident.apply(...)` である。`Bind` / `This` / `New` も同じ形。§7.6 の 2 で、slick の `TableQuery` のマクロ実装はこれだけで書かれている | `Check::insert_apply_on_nullary` の `Type::Overload` 枝 |
-| **同名の型メンバに項の選択が食われる。** reflect API は `type Modifiers` と `def Modifiers(flags: FlagSet)` を両方置く。jar のメンバは名前ごとに遅延ロードされるので、**型メンバが先に入る**（`NoMods` を完了すると入る）と名前はもう「見つからない」ではなくなり、項のオーバーロードは読まれないまま `u.Modifiers(flags)` が `<notype>` の `TypeMember` に解決していた（`value apply is not a member of <notype>`）。§7.6 の `expose_unqualified_type` の鏡像 | `Check::type_select` |
-| **`invokeinterface` の `count` がスロット数でない。** `long` / `double` の引数は 2 スロット。`reificationSupport.FlagsRepr(8192L)` が `VerifyError: Inconsistent args count operand in invokeinterface` になっていた | `Assembler::invokeinterface` / `count_param_slots` |
-| **抽象型メンバの引数に erasure 適応の `checkcast` が無い。** `type TermName >: Null <: TermNameApi with Name` は `Names$TermNameApi` に、`Name` は `Names$NameApi` に erase され、JVM は両者の関係を知らない。nsc はここで `checkcast` を出す | `gen.rs` の `adapt_type_member_arg` |
-| **`NoMods` が `Universe` の宣言。** `scala.reflect.api.Universe` は abstract class で、`JavaUniverse` からの継承は pickle にしかない。`u.NoMods` は `invokevirtual scala/reflect/api/Universe.NoMods()` になり検証に落ちる。reification は同じ値を作る `u.Modifiers(rs.FlagsRepr(0L))` を使う（`Modifiers(flags)` は `Modifiers(flags, typeNames.EMPTY, Nil)`） | `Reifier::mods` |
+| **Inserting `apply` on an overload set.** `val Ident: IdentExtractor` and `def Ident(name: String): Ident` form one overload set under the same name, and `Ident(TermName("x"))` matches neither: it is `Ident.apply(...)`. `Bind` / `This` / `New` have the same shape. Per item 2 of §7.6, slick's `TableQuery` macro implementation is written entirely out of this | the `Type::Overload` branch of `Check::insert_apply_on_nullary` |
+| **A term selection being eaten by a type member of the same name.** The reflect API puts both `type Modifiers` and `def Modifiers(flags: FlagSet)`. Since jar members are lazily loaded name by name, once **the type member goes in first** (completing `NoMods` brings it in) the name is no longer "not found", so the term overload was never read and `u.Modifiers(flags)` resolved to a `TypeMember` of `<notype>` (`value apply is not a member of <notype>`). The mirror image of `expose_unqualified_type` in §7.6 | `Check::type_select` |
+| **The `count` of `invokeinterface` not being a slot count.** `long` / `double` arguments take two slots. `reificationSupport.FlagsRepr(8192L)` was giving `VerifyError: Inconsistent args count operand in invokeinterface` | `Assembler::invokeinterface` / `count_param_slots` |
+| **No erasure-adapting `checkcast` on abstract type member arguments.** `type TermName >: Null <: TermNameApi with Name` erases to `Names$TermNameApi` and `Name` to `Names$NameApi`, and the JVM does not know how the two relate. nsc emits a `checkcast` here | `adapt_type_member_arg` in `gen.rs` |
+| **`NoMods` is declared on `Universe`.** `scala.reflect.api.Universe` is an abstract class, and `JavaUniverse`'s inheritance from it exists only in the pickle. `u.NoMods` became `invokevirtual scala/reflect/api/Universe.NoMods()` and failed verification. Reification uses `u.Modifiers(rs.FlagsRepr(0L))`, which builds the same value (`Modifiers(flags)` is `Modifiers(flags, typeNames.EMPTY, Nil)`) | `Reifier::mods` |
 
-#### slick への効き方
+#### How this affects slick
 
-`tests/slick_measure.sh`（scala-reflect.jar 入り）で `errors=257 → 255`。
-数字が動かないのは、**同じ行が別の理由で落ちるようになった**からで、
-quasiquote 系の内訳は次のとおり。
+With `tests/slick_measure.sh` (with scala-reflect.jar), `errors=257 → 255`.
+The number barely moves because **the same lines now fail for different reasons**; the
+quasiquote-related breakdown is as follows.
 
-| 診断 | before | after |
+| Diagnostic | before | after |
 | --- | --- | --- |
-| `unimplemented syntax: quasiquote …`（形が足りない） | 10 | **4** |
-| `cannot expand quasiquote …`（reify 自体が無い） | 1 | **0** |
-| `TableQuery.scala` のエラー合計 | 11 | **6** |
+| `unimplemented syntax: quasiquote …` (a missing shape) | 10 | **4** |
+| `cannot expand quasiquote …` (no reify at all) | 1 | **0** |
+| Total errors in `TableQuery.scala` | 11 | **6** |
 
-残り 4 件の内訳は `q"…_.get…"` が 3 件（`_` プレースホルダ）と
-`q"""…"""` の中の `type` 定義が 1 件。`ShapedValue.mapToImpl` の 8 つの型注釈は
-**形としては通るようになり**、いま落ちているのは `$uTag` / `$rTag` が
-`WeakTypeTag` で `Tree` ではないため（§7.5 の 4、`Liftable`）である:
+The remaining 4 break down as 3 occurrences of `q"…_.get…"` (the `_` placeholder) and one `type`
+definition inside a `q"""…"""`. The 8 type ascriptions in `ShapedValue.mapToImpl` **now go through as
+far as shape is concerned**; what fails now is that `$uTag` / `$rTag` are `WeakTypeTag`s and not
+`Tree`s (item 4 of §7.5, `Liftable`):
 
 ```
 error: no matching overload for SyntacticFunctionTypeExtractor
        with arguments (List[TypeTags$WeakTypeTag[U]], TypeTags$WeakTypeTag[R])
 ```
 
-つまり `mapToImpl` の次の一手は **`Liftable`** であって、形ではない。
+So the next move for `mapToImpl` is **`Liftable`**, not more shapes.
 
-#### このスライスのあとに残っているもの
+#### What remains after this slice
 
-1. **`Liftable`。** `Tree` でない穴（`WeakTypeTag` / `Name` / `Int` / `String` /
-   `Symbol`）を implicit で持ち上げる。`ShapedValue` の残りはすべてこれ。
-2. **`_` プレースホルダと右結合演算子。** どちらも nsc は `freshTermName` を
-   使ったブロックを作る。作るなら同じ形にする必要がある。
-3. **`..$` と普通の引数の混在**、および**期待型からの型パラメータ推論**（§7.5）。
-4. **定義の quasiquote**（`SyntacticClassDef` / `SyntacticDefDef` / `Modifiers`
-   のフラグ変換）。`ShapedValue` の `q"""…"""` 全体はこれが要る。
-5. **`reify { … }` と `typeOf[T]` / `symbolOf[T]`。** `reify` も quasiquote と
-   同じ fast track マクロで、自前実装が要る。`TableQuery` の残り 6 件のうち
-   3 件がこれ。
-6. **engine（フェーズ 2）。** マクロを*呼ぶ*ための JVM ブリッジ。
+1. **`Liftable`.** Lifting non-`Tree` holes (`WeakTypeTag` / `Name` / `Int` / `String` / `Symbol`)
+   via implicits. Everything left in `ShapedValue` is this.
+2. **The `_` placeholder and right-associative operators.** For both, nsc builds a block using
+   `freshTermName`. If we build them, we have to build the same shape.
+3. **Mixing `..$` with ordinary arguments**, and **inferring type parameters from the expected type**
+   (§7.5).
+4. **Quasiquoting definitions** (`SyntacticClassDef` / `SyntacticDefDef` / the flag conversion for
+   `Modifiers`). The whole `q"""…"""` of `ShapedValue` needs this.
+5. **`reify { … }` and `typeOf[T]` / `symbolOf[T]`.** `reify` is a fast track macro just like
+   quasiquotes and needs our own implementation. Three of the six errors left in `TableQuery` are
+   this.
+6. **The engine (phase 2).** The JVM bridge for actually *calling* macros.
 
-### 7.8 `Liftable`、`symbolOf` / `weakTypeOf`、`reify` の診断（`agent/liftable` スライス）
+### 7.8 `Liftable`, `symbolOf` / `weakTypeOf`, and diagnosing `reify` (the `agent/liftable` slice)
 
-§7.7 の残り 1 と 5。**`Tree` でない穴が持ち上がるようになった**ので、
-`ShapedValue.mapToImpl` の `q"($rModule.tupled) : ($uTag => $rTag)"` 系が
-「形が足りない」でも「穴が `Tree` でない」でもなくなった。
+Items 1 and 5 of the §7.7 list. **Non-`Tree` holes now lift**, so the
+`q"($rModule.tupled) : ($uTag => $rTag)"` family in `ShapedValue.mapToImpl` no longer fails with
+either "missing shape" or "the hole is not a `Tree`".
 
 #### 1. `Liftable`
 
-nsc は `Tree` でない穴について implicit `Liftable[T]` を探し、
-`Liftable.liftX[T](arg)` を差す（`scala/reflect/api/StandardLiftables.scala`）。
-scala-rs は **implicit 探索はしない**。穴の引数の型から標準インスタンスを選び、
-**そのインスタンスが作るのと同じ木を直接組む**。
+For non-`Tree` holes nsc searches for an implicit `Liftable[T]` and splices in
+`Liftable.liftX[T](arg)` (`scala/reflect/api/StandardLiftables.scala`).
+scala-rs **does not do implicit search**. It picks the standard instance from the type of the hole's
+argument and **directly builds the same tree that instance would build**.
 
-型を知るために、reify の前に各引数を**投機的に**型付けする
-（クローンを型付けし、診断は巻き戻す。`Check::probe_named_arg_types` と同じ形。
-呼び出し地点の木は 1 度しか型付けされない）。分類は `Check::lift_for`、
-木の組み立ては `Reifier::lift`（`crates/typer/src/reify.rs` の `Lift`）。
+To learn the type, each argument is typed **speculatively** before reification (a clone is typed and
+the diagnostics are rolled back; the same shape as `Check::probe_named_arg_types`. The tree at the
+call site is only typed once). The classification is `Check::lift_for` and the tree construction is
+`Reifier::lift` (`Lift` in `crates/typer/src/reify.rs`).
 
-| 穴の型 | nsc | scala-rs が組む木 |
+| Hole type | nsc | Tree scala-rs builds |
 | --- | --- | --- |
-| `Tree`（`Trees` の型メンバすべて） | `liftTree` = identity | そのまま差す |
-| `Int` / `Long` / `Short` / `Byte` / `Char` / `Float` / `Double` / `Boolean` / `Unit` / `String` | `liftInt` &co | `u.Literal(u.Constant(v))` |
+| `Tree` (every type member of `Trees`) | `liftTree` = identity | spliced in as is |
+| `Int` / `Long` / `Short` / `Byte` / `Char` / `Float` / `Double` / `Boolean` / `Unit` / `String` | `liftInt` & co. | `u.Literal(u.Constant(v))` |
 | `Constant` | `liftConstant` | `u.Literal(c)` |
-| `Type`（`Types` の型メンバ） | `liftType` | `rs.mkTypeTree(t)` |
+| `Type` (a type member of `Types`) | `liftType` | `rs.mkTypeTree(t)` |
 | `WeakTypeTag` / `TypeTag` | `liftTypeTag` | `rs.mkTypeTree(tag.tpe)` |
 | `Expr[T]` | `liftExpr` | `e.tree` |
-| `Symbol`（`Symbols` の型メンバ） | Liftable では**ない**（穴の特別扱い） | `rs.mkRefTree(u.EmptyTree, sym)` |
-| `Name`（項の位置） | 穴の特別扱い | `rs.SyntacticTermIdent(n, false)` |
-| `Name`（型の位置） | 同上 | `rs.SyntacticTypeIdent(n)` |
-| `Name`（パターンの位置） | 同上 | `u.Bind(n, rs.SyntacticTermIdent(u.TermName("_"), false))` |
-| `..$xs` の要素が上のどれか | `xs.toList.map(v => liftX(v))` | 同形（`List` のときは `.toList` を付けない） |
+| `Symbol` (a type member of `Symbols`) | **not** a Liftable (a special case for holes) | `rs.mkRefTree(u.EmptyTree, sym)` |
+| `Name` (term position) | a special case for holes | `rs.SyntacticTermIdent(n, false)` |
+| `Name` (type position) | as above | `rs.SyntacticTypeIdent(n)` |
+| `Name` (pattern position) | as above | `u.Bind(n, rs.SyntacticTermIdent(u.TermName("_"), false))` |
+| An element of `..$xs` that is any of the above | `xs.toList.map(v => liftX(v))` | the same shape (no `.toList` when it is already a `List`) |
 
-`Name` の位置依存は nsc のパーサ由来である。`q"$n"` の穴は識別子の位置に立つので、
-`q` なら項識別子、`tq` なら型識別子、`pq` なら変数パターンになる。名前の**枠**
-（`q"$x.$n"` の `$n`、`q"val $n = e"` の `$n`）はもともとそのまま差していた。
+The position dependence of `Name` comes from nsc's parser. The hole in `q"$n"` stands in identifier
+position, so it becomes a term identifier under `q`, a type identifier under `tq`, and a variable
+pattern under `pq`. Name **slots** (the `$n` in `q"$x.$n"`, or in `q"val $n = e"`) were already
+spliced straight in.
 
-`Symbol` だけは `Liftable` ではなく穴の特別扱いなので、**`..$` の下では nsc 自身が
-断る**（"consider omitting the dots or providing an implicit instance of
-`Liftable[Symbol]`"）。scala-rs も同じく断る。
+`Symbol` alone is a special case for holes rather than a `Liftable`, so **nsc itself refuses it under
+a `..$`** ("consider omitting the dots or providing an implicit instance of `Liftable[Symbol]`").
+scala-rs refuses it the same way.
 
-**組まないものは名指しで診断する**:
-`a hole of type `X` is not lifted (the Liftable instances scala-rs builds are …)`。
-ユーザが書いた `Liftable` は探さないので、それも同じ診断になる（黙って別の木を
-作るよりよい）。nsc にはあって scala-rs が組まないのは `liftList` / `liftArray` /
-`liftMap` / `liftOption` / `liftEither` / `liftTuple*` / `liftScalaSymbol` で、
-いずれも rank 0 の穴の形。
+**Whatever we do not build, we diagnose by name**:
+`a hole of type `X` is not lifted (the Liftable instances scala-rs builds are …)`.
+We do not search for user-written `Liftable`s, so those get the same diagnostic (better than
+silently building a different tree). What nsc has and scala-rs does not build are `liftList` /
+`liftArray` / `liftMap` / `liftOption` / `liftEither` / `liftTuple*` / `liftScalaSymbol`, all of them
+rank-0 hole shapes.
 
-検証: `tests/fixtures/lf2_lift.scala` を実 scalac 2.13.16 と dual-run し、
-**`showRaw` が完全一致**する（`TypeTree` は `showRaw` が中身の型を隠すので
-`show` も並べて印字する）。29 行。`WeakTypeTag` と `Expr` は materialiser 無しには
-実行時に作れないので、`tests/fixtures/lf2_ctx.scala` で**マクロ実装として**
-コンパイルし、両コンパイラが通し、classfile が `java -Xverify:all` でロード・検証
-されることを見る。異常系は `tests/fixtures/lf2_lift_bad.scala`。
+Validation: `tests/fixtures/lf2_lift.scala` is dual-run against the real scalac 2.13.16 and
+**`showRaw` matches exactly** (since `showRaw` hides the type inside a `TypeTree`, we print `show`
+alongside it). 29 lines. `WeakTypeTag` and `Expr` cannot be created at run time without a
+materialiser, so `tests/fixtures/lf2_ctx.scala` compiles them **as a macro implementation**, checks
+that both compilers accept it, and checks that the classfile loads and verifies under
+`java -Xverify:all`. The failure cases are in `tests/fixtures/lf2_lift_bad.scala`.
 
 #### 2. `symbolOf[T]` / `weakTypeOf[T]` / `typeOf[T]`
 
-§7.6 の 3。`def symbolOf[T](implicit tag: WeakTypeTag[T]): TypeSymbol` は
-型パラメータを**implicit 節にしか**書かず、結果型にも書かない。
-`pin_undetermined_tparams`（`crates/typer/src/pickle_supply.rs`）はこの形の
-メンバを**丸ごと落として**いたので、`symbolOf` は `not found: value symbolOf`
-だった。
+Item 3 of §7.6. `def symbolOf[T](implicit tag: WeakTypeTag[T]): TypeSymbol` mentions its type
+parameter **only in the implicit section** and not in the result type.
+`pin_undetermined_tparams` (`crates/typer/src/pickle_supply.rs`) was **dropping members of this shape
+entirely**, so `symbolOf` gave `not found: value symbolOf`.
 
-落とす理由は「型パラメータが決まらないまま implicit が解けず、typer が黙って
-eta 展開する」ことの回避である。しかし *materialiser* の形
-——節が implicit だけで、その implicit が当の型パラメータを要求する——は
-`classTag[Short]` と同じく**常に明示型引数で呼ばれる**。そこで、この形に限って
-メンバを残すようにした。明示型引数が無ければ `T` は `Nothing` になり
-「implicit が見つからない」という診断になる（誤ったプログラムにはならない）。
+The reason for dropping them is to avoid "the implicit cannot be resolved while the type parameter is
+undetermined, and the typer silently eta-expands". But the *materialiser* shape — where the section
+is implicit-only and that implicit demands the very type parameter in question — is, like
+`classTag[Short]`, **always called with an explicit type argument**. So for this shape specifically we
+now keep the member. Without an explicit type argument, `T` becomes `Nothing` and the diagnostic is
+"implicit not found" (it never turns into an incorrect program).
 
-効果:
+Effects:
 
-- **マクロ実装の中では実際に解ける。** `implicit rTag: c.WeakTypeTag[R]` が
-  スコープにあるので、`symbolOf[R]` / `weakTypeOf[R]` の implicit はそれで埋まる。
-  slick の `ShapedValue.mapToImpl` の `val rSym = symbolOf[R]` がこれ。
-- **外では正直な診断に変わる。** `u.typeOf[Int]` は
-  `no implicit: could not find implicit value of type TypeTags$TypeTag[Int]`。
-  `TypeTag` の materialization（型を `TypeCreator` に reify するコンパイラ内蔵
-  マクロ）は未実装で、これが `c.typeOf[HList]` の残る障害である。
+- **Inside a macro implementation it really does resolve.** Since `implicit rTag: c.WeakTypeTag[R]`
+  is in scope, the implicits of `symbolOf[R]` / `weakTypeOf[R]` are filled from it.
+  That is `val rSym = symbolOf[R]` in slick's `ShapedValue.mapToImpl`.
+- **Outside, the diagnostic becomes honest.** `u.typeOf[Int]` gives
+  `no implicit: could not find implicit value of type TypeTags$TypeTag[Int]`.
+  `TypeTag` materialization (the compiler-internal macro that reifies a type into a `TypeCreator`) is
+  unimplemented, and that is the remaining obstacle for `c.typeOf[HList]`.
 
-#### 3. `reify { … }` の診断
+#### 3. Diagnosing `reify { … }`
 
-`scala.reflect.api.Universe` の `def reify[T](expr: T): Expr[T] = macro …` は
-quasiquote と同じ**コンパイラ内蔵マクロ**で、scala-reflect.jar に実装は無く、
-pickle のエントリには消去後の descriptor すら無い。そのため
-`value reify is not a member of JavaUniverse` と言っていた——
-`value q is not a member of StringContext` と同じ**嘘**である。
+`def reify[T](expr: T): Expr[T] = macro …` on `scala.reflect.api.Universe` is a
+**compiler-internal macro** just like quasiquotes: there is no implementation in scala-reflect.jar,
+and the pickle entry does not even carry an erased descriptor. So we were saying
+`value reify is not a member of JavaUniverse` — the same **lie** as
+`value q is not a member of StringContext`.
 
-`Check::report_internal_universe_macro` が、レシーバが universe のとき
-（無修飾なら `import <universe>._` が効いているとき）に
+`Check::report_internal_universe_macro` now says, when the receiver is a universe (or, unqualified,
+when an `import <universe>._` is in effect):
 
 ```
 macro expansion is not implemented: cannot expand reify { ... }.
@@ -1012,179 +1093,179 @@ so scala-rs would have to reify the expression itself, the way it does
 quasiquotes; see docs/macros.md §6.2.
 ```
 
-と言う。**式全体の木化は実装していない**（quasiquote と違い、任意の式を
-`TreeCreator` の無名クラスに落とす必要がある）。
+**Turning a whole expression into a tree is not implemented** (unlike quasiquotes, it requires
+lowering an arbitrary expression into an anonymous `TreeCreator` class).
 
-#### slick への効き方
+#### How this affects slick
 
-`tests/slick_measure.sh`（scala-reflect.jar 入り）で `errors=237 → 228`、
-`files_with_errors=60 → 60`。内訳:
+With `tests/slick_measure.sh` (with scala-reflect.jar), `errors=237 → 228` and
+`files_with_errors=60 → 60`. Breakdown:
 
-| ファイル | before | after |
+| File | before | after |
 | --- | --- | --- |
 | `ShapedValue.scala` | 20 | **10** |
 | `TableQuery.scala` | 6 | 7 |
 
-`TableQuery.scala` が 1 増えるのは、`typeOf` が「見つからない」から
-「implicit が無い」に変わったことで、同じ行の 2 つめの穴
-（`Ident(sym: Symbol)` のオーバーロードが未供給）まで見えるようになったため。
-診断は正確になっている。
+`TableQuery.scala` gains one because `typeOf` changed from "not found" to "no implicit", which made
+the second hole on the same line visible as well (the `Ident(sym: Symbol)` overload is not supplied).
+The diagnostics are more accurate.
 
-`ShapedValue.scala` の残り 10 件:
+The 10 errors left in `ShapedValue.scala`:
 
-| 診断 | 件数 |
+| Diagnostic | Count |
 | --- | --- |
-| `_` プレースホルダ（`(_.get)`、§7.7 の既知の形） | 3 |
-| 持ち上げられない穴（`<error>` / `AnyRef`。下の cascade） | 3 |
+| The `_` placeholder (`(_.get)`, the known shape from §7.7) | 3 |
+| Holes that cannot be lifted (`<error>` / `AnyRef`; a cascade of the above) | 3 |
 | `value collect is not a member of Scopes.MemberScope` | 1 |
-| `no implicit: TypeTag[HList]`（materialization 未実装） | 1 |
-| マクロ def のシグネチャ検査（`must take blackbox.Context`） | 1 |
-| `Shape` の型不一致（quasiquote と無関係） | 1 |
+| `no implicit: TypeTag[HList]` (materialization unimplemented) | 1 |
+| Macro def signature checking (`must take blackbox.Context`) | 1 |
+| A type mismatch in `Shape` (unrelated to quasiquotes) | 1 |
 
-#### このスライスのあとに残っているもの
+#### What remains after this slice
 
-1. **`TypeTag` / `WeakTypeTag` の materialization。** `c.typeOf[HList]` と
-   `implicitly[TypeTag[T]]` はこれが要る。型を `TypeCreator` の無名クラスに
-   reify するコンパイラ内蔵マクロで、`reify { … }` と同じ機構になる。
-2. **`reify { … }` 本体。** 式全体の木化。
-3. **`_` プレースホルダと右結合演算子**（§7.7 の 2）。
-4. **定義の quasiquote**（§7.7 の 4）。`ShapedValue` の `q"""…"""` 全体。
-5. **universe の入れ子クラスがパス越しに引けない。** `u.WeakTypeTag[T]` /
-   `u.TypeTag.Int` は `value TypeTag is not a member of JavaUniverse` になる
-   （`c.WeakTypeTag[T]` は `Aliases` の型別名なので通る）。
-6. **`c.universe.TermName` が `stable identifier required` になる。**
-   `c.universe` は `val` なので安定しているはず。
-7. **engine（フェーズ 2）。** マクロを*呼ぶ*ための JVM ブリッジ。
-### 7.9 定義の quasiquote（`agent/defquasi` スライス）
+1. **`TypeTag` / `WeakTypeTag` materialization.** `c.typeOf[HList]` and `implicitly[TypeTag[T]]` need
+   it. It is the compiler-internal macro that reifies a type into an anonymous `TypeCreator` class,
+   and it works by the same mechanism as `reify { … }`.
+2. **The body of `reify { … }`.** Turning a whole expression into a tree.
+3. **The `_` placeholder and right-associative operators** (item 2 of §7.7).
+4. **Quasiquoting definitions** (item 4 of §7.7). The whole `q"""…"""` of `ShapedValue`.
+5. **Nested classes of the universe cannot be reached through a path.** `u.WeakTypeTag[T]` /
+   `u.TypeTag.Int` give `value TypeTag is not a member of JavaUniverse` (`c.WeakTypeTag[T]` works
+   because it is a type alias in `Aliases`).
+6. **`c.universe.TermName` gives `stable identifier required`.** `c.universe` is a `val`, so it ought
+   to be stable.
+7. **The engine (phase 2).** The JVM bridge for actually *calling* macros.
 
-§7.7 の残件 4。**`q"class C(...)"` / `q"case class C(...)"` / `q"trait T"` /
-`q"object O { ... }"` / `q"def f(...) = ..."` / 修飾つきの `q"lazy val a = 1"`
-のような定義が落とせるようになった。** 形はすべて実 scalac 2.13.16 の
-`-Ymacro-debug-lite` から読み取り、`tests/fixtures/dq_defs.scala` が
-**101 行ぶん `showRaw` まで実 scalac と突き合わせている**
-（`java -Xverify:all` で実行、完全一致）。実装は
-`crates/typer/src/reify_defs.rs`（`reify.rs` の `#[path]` 子モジュール。
-`agent/liftable` と同じファイルを触らないための分割で、`reify.rs` 側の変更は
-`mod` 宣言・`stat` の委譲・`term` の 2 アーム・`new_spine` の 1 フックだけ）。
+### 7.9 Quasiquoting definitions (the `agent/defquasi` slice)
 
-#### 落とせるようになった形
+Item 4 of the §7.7 list. **`q"class C(...)"` / `q"case class C(...)"` / `q"trait T"` /
+`q"object O { ... }"` / `q"def f(...) = ..."`, and modified definitions such as
+`q"lazy val a = 1"`, can now be lowered.** Every shape was read off the real scalac 2.13.16 with
+`-Ymacro-debug-lite`, and `tests/fixtures/dq_defs.scala` **compares 101 lines against the real scalac
+down to `showRaw`** (run under `java -Xverify:all`; an exact match). The implementation is
+`crates/typer/src/reify_defs.rs` (a `#[path]` child module of `reify.rs`; the split exists to avoid
+touching the same file as `agent/liftable`, and the changes on the `reify.rs` side are only the `mod`
+declaration, delegation in `stat`, two arms of `term`, and one hook in `new_spine`).
 
-| 形 | 落とす先 |
+#### Shapes that can now be lowered
+
+| Shape | Lowered to |
 | --- | --- |
 | `q"class C"` | `rs.SyntacticClassDef(mods, name, tparams, ctorMods, paramss, earlyDefs, parents, self, body)` |
 | `q"trait T"` | `rs.SyntacticTraitDef(mods, name, tparams, earlyDefs, parents, self, body)` |
 | `q"object O"` | `rs.SyntacticObjectDef(mods, name, earlyDefs, parents, self, body)` |
 | `q"def f = 1"` | `rs.SyntacticDefDef(mods, name, tparams, paramss, tpt, rhs)` |
 | `q"lazy val a = 1"` | `rs.SyntacticValDef(u.Modifiers(rs.FlagsRepr(2147483648L)), …)` |
-| `q"var x = 1"` | `rs.SyntacticVarDef(…)`（`MUTABLE` は残す） |
-| 末尾の implicit 節 | `rs.ImplicitParams(<残りの節>, <implicit 節>)` |
-| 型パラメータ | `u.TypeDef(u.Modifiers(PARAM \| 変位), u.TypeName("T"), Nil, u.TypeBoundsTree(lo, hi))` |
+| `q"var x = 1"` | `rs.SyntacticVarDef(…)` (keeps `MUTABLE`) |
+| A trailing implicit clause | `rs.ImplicitParams(<the remaining clauses>, <the implicit clause>)` |
+| Type parameters | `u.TypeDef(u.Modifiers(PARAM \| variance), u.TypeName("T"), Nil, u.TypeBoundsTree(lo, hi))` |
 | `q"new C(1) { ..$body }"` | `rs.SyntacticNew(Nil, List(<C(1)>), u.noSelfType, <body>)` |
 | `q"super.foo"` | `rs.SyntacticSelectTerm(u.Super(u.This(u.TypeName("")), u.TypeName("")), …)` |
-| `q"def f: Unit = {..$xs}"` | 右辺は `rs.SyntacticBlock(<xs>)` |
-| 穴 | 名前（`q"class $tname"`）、パラメータリスト（`..$params`）、型パラメータ、親（`extends ..$parents`）、本体（`{ ..$body }`） |
+| `q"def f: Unit = {..$xs}"` | The right-hand side is `rs.SyntacticBlock(<xs>)` |
+| Holes | Names (`q"class $tname"`), parameter lists (`..$params`), type parameters, parents (`extends ..$parents`), and bodies (`{ ..$body }`) |
 
-#### `Modifiers` のフラグ変換が肝
+#### The crux is the flag conversion for `Modifiers`
 
-`Modifiers` が運ぶのは **`scala.reflect.internal.Flags` のビット**で、
-scala-rs のパーサの `Flags` とは**番号が違う**（`PRIVATE` はパーサでビット 0、
-nsc でビット 2）。値はすべて `-Ymacro-debug-lite` が印字する
-`FlagsRepr(<n>L)` から読み戻した:
+What `Modifiers` carries are **the bits of `scala.reflect.internal.Flags`**, whose **numbering differs**
+from the `Flags` of the scala-rs parser (`PRIVATE` is bit 0 in the parser and bit 2 in nsc). Every
+value was read back out of the `FlagsRepr(<n>L)` that `-Ymacro-debug-lite` prints:
 
-| 修飾子 | nsc のビット | 確認に使った形 |
+| Modifier | nsc bit | Shape used to confirm it |
 | --- | --- | --- |
-| `PROTECTED` / `OVERRIDE` / `PRIVATE` | `1<<0` / `1<<1` / `1<<2` | `protected def f = 1` ほか |
+| `PROTECTED` / `OVERRIDE` / `PRIVATE` | `1<<0` / `1<<1` / `1<<2` | `protected def f = 1`, and so on |
 | `ABSTRACT` / `DEFERRED` / `FINAL` | `1<<3` / `1<<4` / `1<<5` | `abstract class C` / `val a: Int` / `final class C` |
 | `INTERFACE` / `IMPLICIT` / `SEALED` | `1<<7` / `1<<9` / `1<<10` | `trait T` / `implicit val` / `sealed class C` |
 | `CASE` / `MUTABLE` / `PARAM` | `1<<11` / `1<<12` / `1<<13` | `case class C` / `var x = 1` / `def f(x: Int)` |
 | `COVARIANT` / `CONTRAVARIANT` | `1<<16` / `1<<17` | `class C[+T]` |
 | `LOCAL` | `1<<19` | `private[this] val x = 1` |
-| `CASEACCESSOR` | `1<<24` | `case class C(x: Int)` の `x` |
-| `TRAIT` ＝ `DEFAULTPARAM` | `1<<25` | `trait T` / `def f(x: Int = 1)` |
-| `PARAMACCESSOR` | `1<<29` | クラス・パラメータ |
+| `CASEACCESSOR` | `1<<24` | the `x` of `case class C(x: Int)` |
+| `TRAIT` = `DEFAULTPARAM` | `1<<25` | `trait T` / `def f(x: Int = 1)` |
+| `PARAMACCESSOR` | `1<<29` | class parameters |
 | `LAZY` | `1<<31` | `lazy val a = 1` |
 
-パラメータのフラグは**クラスか `def` かで違う**。`def` のパラメータは `PARAM`
-だけだが、クラス・パラメータは `PARAMACCESSOR` に加えて:
+Parameter flags **differ between a class and a `def`**. Parameters of a `def` get only `PARAM`, while
+class parameters get `PARAMACCESSOR` plus:
 
-- `case` クラスの**第 1 節**は `CASEACCESSOR`（第 2 節以降は普通の扱い）
-- `val` / `var` の無い非 `case` のパラメータは `PRIVATE | LOCAL`（メンバではない）
-- `var` は `MUTABLE` かつ `SyntacticVarDef`
+- the **first clause** of a `case` class gets `CASEACCESSOR` (later clauses are treated normally),
+- non-`case` parameters with no `val` / `var` get `PRIVATE | LOCAL` (they are not members),
+- `var` gets `MUTABLE` and a `SyntacticVarDef`.
 
-そして nsc の**パーサが補う親**も再現する: 親が書かれていなければ
-`rs.ScalaDot(u.TypeName("AnyRef"))`、`case` なら書かれた親のうしろに
-`rs.ScalaDot(Product)` と `rs.ScalaDot(Serializable)`（`case` のときは `AnyRef`
-を補わない）。
+We also reproduce **the parents nsc's parser fills in**: if no parent is written,
+`rs.ScalaDot(u.TypeName("AnyRef"))`; for `case`, `rs.ScalaDot(Product)` and
+`rs.ScalaDot(Serializable)` after the written parents (with `case`, `AnyRef` is not filled in).
 
-#### パーサが潰す区別を、また元のソース文字列で戻す
+#### Recovering, again from the original source string, distinctions the parser collapses
 
-- **`class C` と `class C {}`。** 本体が空でも、波括弧が書かれていれば nsc の
-  body は `List(u.EmptyTree)`、書かれていなければ `List()` である。パーサは
-  どちらも `body: []` にするので、定義の span のテキストが `}` で終わるかで決める。
-- **`def f = {..$xs}` と `def f = $x`。** パーサは `{ e }` を `e` に潰すので、
-  右辺の直前のテキストが `{` で終わるかで `SyntacticBlock` に包むかを決める。
-- **手続き構文 `def f() { … }`。** nsc は結果型に `_root_.scala.Unit` を補うが、
-  パーサは型を空のままにする。右辺の手前に `=` があるかで見分け、無ければ拒否する。
+- **`class C` versus `class C {}`.** Even when the body is empty, if braces were written nsc's body
+  is `List(u.EmptyTree)`, and if they were not it is `List()`. The parser gives `body: []` in both
+  cases, so we decide by whether the text of the definition's span ends with `}`.
+- **`def f = {..$xs}` versus `def f = $x`.** The parser collapses `{ e }` into `e`, so we decide
+  whether to wrap in a `SyntacticBlock` by whether the text immediately before the right-hand side
+  ends with `{`.
+- **Procedure syntax `def f() { … }`.** nsc fills the result type in with `_root_.scala.Unit`, while
+  the parser leaves the type empty. We tell them apart by whether there is an `=` before the
+  right-hand side, and reject the form when there is not.
 
-#### 落とせない形は名指しで診断する（`tests/fixtures/dq_defs_bad.scala`）
+#### Shapes we cannot lower are diagnosed by name (`tests/fixtures/dq_defs_bad.scala`)
 
-| 形 | 診断 | 理由 |
+| Shape | Diagnostic | Reason |
 | --- | --- | --- |
-| `q"class C { self => … }"` | a self type … | 本体が空のときの `List(EmptyTree)` と区別できない |
-| `q"class C extends { val x = 1 } with D"` | an early definition … | nsc の `PRESUPER` はビット 37 で、パーサのフラグ語（32 ビット）に無い |
-| `q"private[foo] val x = 1"` | a qualified access modifier (`private[X]`) … | `Modifiers` の名前欄。フラグしか運んでいない |
-| `q"def f(x: => Int) = x"` | a by-name parameter … | nsc の型は `_root_.scala.<byname>[T]`、パーサはフラグ |
-| `q"def f(x: Int*) = x"` | a repeated parameter (`T*`) … | 同上（`<repeated>`） |
-| `q"def f() { 1 }"` | procedure syntax … | 上記 |
-| `q"def f()"` | a `def` with neither a result type nor a body … | nsc は `_root_.scala.Unit` を補う |
-| `q"{ val (a, b) = e; a }"` | a pattern definition … | パーサが 3 つの定義に脱糖する。nsc は 1 つの `SyntacticPatDef` |
-| `q"class C[F[_]]"` | a higher-kinded type parameter … | 入れ子の型パラメータ |
-| `q"def f[T: Ordering] = 1"` | a context bound (`T : C`) … | nsc の脱糖はパーサではなく typer |
-| `q"case class C(x: Int) extends ..$parents"` | a `case` class whose parents are a `..$` splice … | `Product with Serializable` の連結が要る |
-| `q"def f(implicit x: Int)(y: Int) = y"` | an implicit parameter clause that is not the last … | `ImplicitParams` は末尾の 1 節だけ |
-| `q"def f = macro Impl.f"` | a `macro` definition … | 右辺が式ではない |
-| `q"def f(x: Bar[_]) = x"` | a `_` type argument (an existential) … | nsc は `freshTypeName` で名前を作り、呼び出しの外側のブロックに束ねる |
+| `q"class C { self => … }"` | a self type … | Indistinguishable from the `List(EmptyTree)` of an empty body |
+| `q"class C extends { val x = 1 } with D"` | an early definition … | nsc's `PRESUPER` is bit 37, which does not exist in the parser's (32-bit) flag word |
+| `q"private[foo] val x = 1"` | a qualified access modifier (`private[X]`) … | The name field of `Modifiers`. We only carry flags |
+| `q"def f(x: => Int) = x"` | a by-name parameter … | nsc's type is `_root_.scala.<byname>[T]`; the parser uses a flag |
+| `q"def f(x: Int*) = x"` | a repeated parameter (`T*`) … | As above (`<repeated>`) |
+| `q"def f() { 1 }"` | procedure syntax … | As above |
+| `q"def f()"` | a `def` with neither a result type nor a body … | nsc fills in `_root_.scala.Unit` |
+| `q"{ val (a, b) = e; a }"` | a pattern definition … | The parser desugars it into three definitions; nsc has a single `SyntacticPatDef` |
+| `q"class C[F[_]]"` | a higher-kinded type parameter … | Nested type parameters |
+| `q"def f[T: Ordering] = 1"` | a context bound (`T : C`) … | nsc desugars this in the typer, not the parser |
+| `q"case class C(x: Int) extends ..$parents"` | a `case` class whose parents are a `..$` splice … | Requires concatenating `Product with Serializable` |
+| `q"def f(implicit x: Int)(y: Int) = y"` | an implicit parameter clause that is not the last … | `ImplicitParams` covers only a single trailing clause |
+| `q"def f = macro Impl.f"` | a `macro` definition … | The right-hand side is not an expression |
+| `q"def f(x: Bar[_]) = x"` | a `_` type argument (an existential) … | nsc invents a name with `freshTypeName` and binds it in a block outside the call |
 
-#### ついでに直した一般の穴
+#### General holes fixed along the way
 
-| 直したもの | どこ |
+| What was fixed | Where |
 | --- | --- |
-| **`{ case class X(…); … }` が部分関数と誤読されていた。** ブロックの先頭の `case` は、次が `class` / `object` なら**修飾子**であって節の始まりではない。ローカルの `case class` を持つブロックが `expected pattern, found class` になっていた | `Parser::parse_block_expr` |
+| **`{ case class X(…); … }` was misread as a partial function.** A leading `case` in a block is a **modifier**, not the start of a clause, when what follows is `class` / `object`. A block containing a local `case class` was giving `expected pattern, found class` | `Parser::parse_block_expr` |
 
-#### slick への効き方
+#### How this affects slick
 
-`tests/slick_measure.sh`（scala-reflect.jar 入り）で `errors=237 → 237`。
-**数字は動かない。** `ShapedValue.mapToImpl` の 15 行のエラーは
-`symbolOf` / `Liftable`（`$uTag` / `$rTag` が `WeakTypeTag`）/
-`_` プレースホルダ関数リテラルで落ちており、定義の形はそのどれでもない。
-ただし本体の巨大な `q"""…"""`（`case class` ではなく `val` 3 つと、本体つきの
-`new … { ..$fpChildren; override def read … }`）は、このスライスで
-**`super` と `{..$xs}` の右辺まで通るようになり、残る唯一の障害が
-`ProductResultConverter[_, _, _, _]` の `_` 型引数（存在型）になった**。
-つまり `ShapedValue` の `q"""…"""` の次の一手は §7.7 と同じ性質の
-「nsc が `fresh*Name` を使う形」であり、定義ではない。
+With `tests/slick_measure.sh` (with scala-reflect.jar), `errors=237 → 237`.
+**The number does not move.** The 15 error lines in `ShapedValue.mapToImpl` fail on `symbolOf`,
+`Liftable` (`$uTag` / `$rTag` are `WeakTypeTag`s), and `_` placeholder function literals, and
+definition shapes are none of those.
+That said, the huge `q"""…"""` in the body (not a `case class` but three `val`s and a
+`new … { ..$fpChildren; override def read … }` with a body) **now gets as far as `super` and a
+`{..$xs}` right-hand side thanks to this slice, and its only remaining obstacle is the `_` type
+argument (existential) in `ProductResultConverter[_, _, _, _]`**.
+In other words the next move for `ShapedValue`'s `q"""…"""` is a "shape where nsc uses `fresh*Name`",
+the same character as §7.7 — not definitions.
 
-#### このスライスのあとに残っているもの（§7.7 の一覧の更新）
+#### What remains after this slice (updating the §7.7 list)
 
-1. **`Liftable`**（変わらず。`ShapedValue` の主要因）
-2. **`_` プレースホルダ / 右結合演算子 / `_` 型引数（存在型）。** いずれも nsc が
-   `freshTermName` / `freshTypeName` を使ったブロックを作る形で、同じ形を作るなら
-   `rs.freshTypeName("_$")` を呼ぶブロックごと組む必要がある。
-   `ShapedValue` の `q"""…"""` はこれ 1 つで止まっている
-3. **`..$` と普通の引数の混在**、および**期待型からの型パラメータ推論**（§7.5）
-4. **`q"{ type T = Int }"`**（`SyntacticTypeDef`）
-5. **`reify { … }` と `typeOf[T]` / `symbolOf[T]`**
-6. **engine（フェーズ 2）**
+1. **`Liftable`** (unchanged; the main cause in `ShapedValue`)
+2. **The `_` placeholder / right-associative operators / `_` type arguments (existentials).** For all
+   of these nsc builds a block using `freshTermName` / `freshTypeName`, so building the same shape
+   means building the whole block that calls `rs.freshTypeName("_$")`.
+   `ShapedValue`'s `q"""…"""` is stopped on this one alone
+3. **Mixing `..$` with ordinary arguments**, and **inferring type parameters from the expected type**
+   (§7.5)
+4. **`q"{ type T = Int }"`** (`SyntacticTypeDef`)
+5. **`reify { … }` and `typeOf[T]` / `symbolOf[T]`**
+6. **The engine (phase 2)**
 
-### 7.10 fresh 名を要する 3 形（`agent/freshname` スライス）
+### 7.10 The three shapes that need fresh names (the `agent/freshname` slice)
 
-§7.9 の残件 2。**`_` プレースホルダ関数リテラル・`_` 型引数（存在型）・
-右結合演算子が落とせるようになった。** この 3 つは、それまでの形と決定的に違う
-点が 1 つある：**nsc の展開が 1 個の式ではなく「ブロック」である**。
+Item 2 of the §7.9 list. **`_` placeholder function literals, `_` type arguments (existentials), and
+right-associative operators can now be lowered.** These three differ from every earlier shape in one
+decisive way: **nsc's expansion is a "block", not a single expression**.
 
 ```scala
-// q"_.get" の -Ymacro-debug-lite 出力（universe を u、
-// u.internal.reificationSupport を rs と略記）
+// -Ymacro-debug-lite output for q"_.get" (abbreviating the universe as u
+// and u.internal.reificationSupport as rs)
 {
   val nn$macro$1: u.TermName = rs.freshTermName("x$");
   rs.SyntacticFunction(
@@ -1195,112 +1276,114 @@ nsc でビット 2）。値はすべて `-Ymacro-debug-lite` が印字する
 }
 ```
 
-名前は**実行時に universe のカウンタから引く**（`freshTermName` /
-`freshTypeName`）。だから scala-rs も「名前を決め打ちする」のではなく、
-**同じ呼び出しをするブロックごと組む**必要がある。実装は `Reifier` に
-`Fresh` 状態（`crates/typer/src/reify.rs`）を持たせ、木を組む途中で要求された
-束縛を溜め、`reify` が最後にブロックで包む。3 形とも**同じ 1 つのブロック**に
-まとめて持ち上げられる（nsc と同じ）。
+The names are **drawn from the universe's counter at run time** (`freshTermName` / `freshTypeName`).
+So scala-rs likewise cannot "hard-code a name": it has to **build the whole block that makes the same
+calls**. The implementation gives `Reifier` a `Fresh` state (`crates/typer/src/reify.rs`) that
+accumulates the bindings requested while the tree is being built, and `reify` wraps everything in a
+block at the end. All three shapes are hoisted into **the same single block** (as in nsc).
 
-#### 落とせるようになった形
+#### Shapes that can now be lowered
 
-| 形 | 落とす先 |
+| Shape | Lowered to |
 | --- | --- |
-| `q"_.get"` | `{ val n = rs.freshTermName("x$"); rs.SyntacticFunction(List(rs.SyntacticValDef(mods(PARAM\|SYNTHETIC), n, …)), <本体の `_` は `SyntacticTermIdent(n, false)`>) }` |
-| `q"_.foo(_)"` | 同じ。プレースホルダ 1 つにつき fresh 名 1 つ |
-| `q"(_: Int).get"` | パラメータの型欄も本体の型注釈も nsc と同じく残る |
+| `q"_.get"` | `{ val n = rs.freshTermName("x$"); rs.SyntacticFunction(List(rs.SyntacticValDef(mods(PARAM\|SYNTHETIC), n, …)), <the `_` in the body becomes `SyntacticTermIdent(n, false)`>) }` |
+| `q"_.foo(_)"` | The same. One fresh name per placeholder |
+| `q"(_: Int).get"` | Both the parameter's type slot and the body's ascription are kept, as in nsc |
 | `tq"P[_, _]"` | `{ val a = rs.freshTypeName("_$"); val b = …; rs.SyntacticExistentialType(rs.SyntacticAppliedType(<P>, List(rs.SyntacticTypeIdent(a), rs.SyntacticTypeIdent(b))), List(u.TypeDef(mods(DEFERRED\|SYNTHETIC), a, Nil, u.TypeBoundsTree(…)), …)) }` |
-| `tq"P[_ <: Int]"` | 上界・下界は `TypeBoundsTree` に入る |
-| `tq"Option[P[_]]"` | 存在型は**直下の引数に `_` を持つ適用**を包む（nsc と同じ入れ子位置） |
+| `tq"P[_ <: Int]"` | Upper and lower bounds go into the `TypeBoundsTree` |
+| `tq"Option[P[_]]"` | The existential wraps **the application that directly holds the `_` argument** (the same nesting position as nsc) |
 | `q"a :: b"` | `{ val n = rs.freshTermName("rassoc$"); rs.SyntacticBlock(List(rs.SyntacticValDef(mods(FINAL\|SYNTHETIC\|ARTIFACT), n, …, <a>), rs.SyntacticApplied(rs.SyntacticSelectTerm(<b>, u.TermName("$colon$colon")), List(List(rs.SyntacticTermIdent(n, false)))))) }` |
-| `q"a :: b :: c"` | ブロックが入れ子になる（fresh 名 2 つ） |
-| `q"b.::(a)"` | **ブロックにしない。** ドット呼びは普通の選択である |
-| `pq"_: R[_, _]"` | 型変数パターン。`u.Bind(u.TypeName("_"), u.EmptyTree)`。fresh 名は要らない |
-| `pq"_: R[_ <: Int]"` | 境界つきはパターンの中でも存在型 |
+| `q"a :: b :: c"` | The blocks nest (two fresh names) |
+| `q"b.::(a)"` | **No block.** A dotted call is an ordinary selection |
+| `pq"_: R[_, _]"` | A type variable pattern. `u.Bind(u.TypeName("_"), u.EmptyTree)`. No fresh name needed |
+| `pq"_: R[_ <: Int]"` | With bounds it is an existential, even inside a pattern |
 
-フラグ値はすべて `-Ymacro-debug-lite` の `FlagsRepr(<n>L)` から読み戻した:
-`PARAM|SYNTHETIC` = 2105344、`DEFERRED|SYNTHETIC` = 2097168、
-`FINAL|SYNTHETIC|ARTIFACT` = 70368746274848（`ARTIFACT` は `1L << 46`）。
+Every flag value was read back out of the `FlagsRepr(<n>L)` of `-Ymacro-debug-lite`:
+`PARAM|SYNTHETIC` = 2105344, `DEFERRED|SYNTHETIC` = 2097168,
+`FINAL|SYNTHETIC|ARTIFACT` = 70368746274848 (`ARTIFACT` is `1L << 46`).
 
-#### パーサが潰す区別を、また元のソース文字列で戻す
+#### Recovering, again from the original source string, distinctions the parser collapses
 
-- **`a :: b` と `b.::(a)`。** パーサは右結合演算子の受け手を右辺にするので
-  どちらも `Apply(Select(b, "::"), [a])` になる。nsc はこの 2 つに**違う木**を作る
-  （前者はブロック、後者は素の適用）。選択ノードの span のテキストが
-  **演算子で始まるか**で見分ける: 中置なら span は演算子から始まり、
-  ドット呼びなら被選択子から始まる。
-- **プレースホルダのパラメータ。** パーサが作る `x$n` は
-  `PARAM | SYNTHETIC`、ソースが書いたパラメータは `PARAM` だけ。この差で
-  「名前を作る」のか「fresh 名を引く」のかを決める。
-- **パターンの中の `_` 型引数。** 裸の `_` は型変数パターン（`Bind`）、
-  境界つきは存在型。`pq` / `case` の下を歩いているかを `Fresh::pat_depth` で
-  持ち回る。
+- **`a :: b` versus `b.::(a)`.** The parser makes the right-hand side the receiver of a
+  right-associative operator, so both become `Apply(Select(b, "::"), [a])`. nsc builds **different
+  trees** for the two (a block for the former, a plain application for the latter). We tell them
+  apart by whether the text of the selection node's span **starts with the operator**: infix means
+  the span starts at the operator, a dotted call means it starts at the selectee.
+- **Placeholder parameters.** The `x$n` the parser creates carries `PARAM | SYNTHETIC`, whereas a
+  parameter written in the source carries only `PARAM`. That difference decides whether we "invent a
+  name" or "draw a fresh name".
+- **`_` type arguments inside patterns.** A bare `_` is a type variable pattern (`Bind`); with bounds
+  it is an existential. Whether we are walking under a `pq` / `case` is carried around in
+  `Fresh::pat_depth`.
 
-#### 落とせない形は名指しで診断する（`tests/fixtures/fn2_fresh_bad.scala`）
+#### Shapes we cannot lower are diagnosed by name (`tests/fixtures/fn2_fresh_bad.scala`)
 
-| 形 | 診断 | 理由 |
+| Shape | Diagnostic | Reason |
 | --- | --- | --- |
-| `q"_"` | unbound placeholder parameter | 束縛するものが無い。実 scalac も同じく拒否する |
-| `tq"_"` | a `_` type argument (an existential) … | 同上（nsc は "unbound wildcard type"） |
+| `q"_"` | unbound placeholder parameter | There is nothing to bind. The real scalac rejects it too |
+| `tq"_"` | a `_` type argument (an existential) … | As above (nsc says "unbound wildcard type") |
 
-#### 検証: fresh 名をどう突き合わせるか
+#### Validation: how fresh names are matched up
 
-`tests/fixtures/fn2_fresh.scala` を実 scalac 2.13.16 と dual-run し、32 行を
-`showRaw` で比較する（`java -Xverify:all`）。ただし fresh 名の**番号**は
-そのままでは一致しない。理由は 2 つあり、どちらも木の違いではない:
+`tests/fixtures/fn2_fresh.scala` is dual-run against the real scalac 2.13.16 and 32 lines are
+compared with `showRaw` (`java -Xverify:all`). The **numbers** in the fresh names do not match as is,
+for two reasons, neither of which is a difference in the tree:
 
-1. カウンタは universe ごとにグローバルで、その行より前の全行と共有している。
-2. nsc は右から左に名前を配る（`q"_.foo(_)"` は引数側のパラメータを先に採番する）。
+1. The counter is global per universe and is shared with every line before this one.
+2. nsc hands out names right to left (`q"_.foo(_)"` numbers the argument-side parameter first).
 
-そこで `crates/cli/tests/quasi.rs` の `renumber_fresh_names` が、
-**1 行ごとに、初出順で 1 から採番し直してから**比較する。これで落ちるのは
-上の 2 つだけで、**どの出現がどの束縛を指すか**は落ちない
-（`_$1 … _$2` と `_$1 … _$1` は別の文字列のまま）。正規化そのものも
-`renumber_fresh_names_keeps_binder_identity` で固定してある。
+So `renumber_fresh_names` in `crates/cli/tests/quasi.rs` **renumbers from 1 in order of first
+appearance, line by line**, before comparing. That drops only the two properties above; **which
+occurrence refers to which binder** is not dropped (`_$1 … _$2` and `_$1 … _$1` remain different
+strings). The normalization itself is pinned by `renumber_fresh_names_keeps_binder_identity`.
 
-#### slick への効き方
+#### How this affects slick
 
-`tests/slick_measure.sh`（scala-reflect.jar 入り）で
-`errors=223 → 220`、`files_with_errors=60 → 60`。内訳:
+With `tests/slick_measure.sh` (with scala-reflect.jar), `errors=223 → 220` and
+`files_with_errors=60 → 60`. Breakdown:
 
-| ファイル | before | after |
+| File | before | after |
 | --- | --- | --- |
 | `ShapedValue.scala` | 10 | **7** |
 | `TableQuery.scala` | 7 | 7 |
 
-消えた 3 件は `(($rModule.unapply _) : $rTag => Option[$uTag]).andThen(_.get)`
-の `_` プレースホルダ（62 / 65 / 68 行）である。`TableQuery.scala` は
-`reify { … }` と `TypeTag` の materialization で落ちており、この 3 形とは無関係。
+The three that disappeared are the `_` placeholders in
+`(($rModule.unapply _) : $rTag => Option[$uTag]).andThen(_.get)` (lines 62 / 65 / 68).
+`TableQuery.scala` fails on `reify { … }` and `TypeTag` materialization, unrelated to these three
+shapes.
 
-`ShapedValue.scala` の巨大な `q"""…"""`（77 行）は
-`ProductResultConverter[_, _, _, _]`（パターン中の型変数パターン）と
-`TypeMappingResultConverter[…, _]`（存在型）を**両方とも通るようになった**が、
-いま落ちているのは `$f` / `$g` の型が `AnyRef` になる cascade で、その大元は
-`rTag.tpe.decls.collect`（`value collect is not a member of MemberScope`）である。
-形の問題は残っていない。同じ形を `fn2_fresh.scala` の最後の行が
-（穴を持ち上げられるものに替えて）実 scalac と突き合わせている。
+The huge `q"""…"""` in `ShapedValue.scala` (line 77) **now gets both
+`ProductResultConverter[_, _, _, _]` (a type variable pattern inside a pattern) and
+`TypeMappingResultConverter[…, _]` (an existential) through**, but what fails now is a cascade in
+which the types of `$f` / `$g` come out as `AnyRef`, whose root cause is `rTag.tpe.decls.collect`
+(`value collect is not a member of MemberScope`). No shape problems remain. The last line of
+`fn2_fresh.scala` compares the same shape against the real scalac (with the holes swapped for ones
+that can be lifted).
 
-#### このスライスのあとに残っているもの（§7.9 の一覧の更新）
+#### What remains after this slice (updating the §7.9 list)
 
-1. **`MemberScope#collect` など reflect API のコレクション操作**（`ShapedValue`
-   の現在の大元）
-2. **`TypeTag` / `WeakTypeTag` の materialization**（`c.typeOf[HList]`、
-   `TableQuery` の `typeOf[Tag]`）
-3. **`reify { … }` 本体**（式全体の木化。`TableQuery` の残り）
-4. **`..$` と普通の引数の混在**、および**期待型からの型パラメータ推論**（§7.5）
-5. **`q"{ type T = Int }"`**（`SyntacticTypeDef`）
-6. **engine（フェーズ 2）**
-### 7.10 `TypeTag` / `WeakTypeTag` の materialization（`agent/typetag` スライス）
+1. **Collection operations on the reflect API such as `MemberScope#collect`** (the current root cause
+   in `ShapedValue`)
+2. **`TypeTag` / `WeakTypeTag` materialization** (`c.typeOf[HList]`, and `typeOf[Tag]` in
+   `TableQuery`)
+3. **The body of `reify { … }`** (turning a whole expression into a tree; the remainder of
+   `TableQuery`)
+4. **Mixing `..$` with ordinary arguments**, and **inferring type parameters from the expected type**
+   (§7.5)
+5. **`q"{ type T = Int }"`** (`SyntacticTypeDef`)
+6. **The engine (phase 2)**
 
-§7.8 の残件 1。**`typeOf[T]` / `weakTypeOf[T]` / `typeTag[T]` が単相型について
-実際に動くようになった。** `c.typeOf[HList]`（slick の `ShapedValue.mapToImpl`）
-と `TableQuery` の `typeOf[Tag]` はこれが無くて止まっていた。
+### 7.10 `TypeTag` / `WeakTypeTag` materialization (the `agent/typetag` slice)
 
-#### nsc が何をしているか（`-Xprint:typer` で実物確認）
+Item 1 of the §7.8 list. **`typeOf[T]` / `weakTypeOf[T]` / `typeTag[T]` now actually work for
+monomorphic types.** `c.typeOf[HList]` (in slick's `ShapedValue.mapToImpl`) and `typeOf[Tag]` in
+`TableQuery` were stuck for want of this.
 
-`def typeOf[T](implicit ttag: TypeTag[T]): Type` の implicit が見つからないとき、
-nsc は「見つからない」と言わない。**コンパイラ内蔵マクロ
-`materializeTypeTag[T](u)`** を展開して、その場でタグを**作る**:
+#### What nsc does (confirmed on the real thing with `-Xprint:typer`)
+
+When the implicit for `def typeOf[T](implicit ttag: TypeTag[T]): Type` is not found, nsc does not say
+"not found". It expands the **compiler-internal macro `materializeTypeTag[T](u)`** and **builds** the
+tag on the spot:
 
 ```scala
 scala.reflect.runtime.`package`.universe.typeOf[String](({
@@ -1312,7 +1395,7 @@ scala.reflect.runtime.`package`.universe.typeOf[String](({
           $m$untyped: scala.reflect.api.Mirror[U]): U#Type = {
         val $u: U = $m$untyped.universe;
         val $m: $u.Mirror = $m$untyped.asInstanceOf[$u.Mirror];
-        $u.internal.reificationSupport.TypeRef(…)   // String はここまで書く
+        $u.internal.reificationSupport.TypeRef(…)   // for String this is as far as it goes
       }
     };
     new $typecreator1()
@@ -1320,17 +1403,16 @@ scala.reflect.runtime.`package`.universe.typeOf[String](({
 }: reflect.runtime.universe.TypeTag[String]))
 ```
 
-マクロ実装の中（`c.typeOf[Hl]`）だと `$u` は `c.universe`、`$m` は
-`c.universe.rootMirror` になり、トップレベルのクラスは
-`$m.staticClass("Hl").asType.toTypeConstructor` の 1 行で済む。
-`Int` のような基本型は `TypeCreator` すら作らず `$u.TypeTag.Int` を使う。
+Inside a macro implementation (`c.typeOf[Hl]`), `$u` is `c.universe` and `$m` is
+`c.universe.rootMirror`, and a top-level class takes only the one line
+`$m.staticClass("Hl").asType.toTypeConstructor`.
+Primitive types such as `Int` do not even get a `TypeCreator`; they use `$u.TypeTag.Int`.
 
-#### scala-rs が組む木
+#### The tree scala-rs builds
 
-実装は `crates/typer/src/materialize.rs`、入口は
-`Check::materialize_tag`（`fill_implicit_params_in` の
-`classtag_apply_fallback` と同じ並びのフォールバック。nsc が `ClassTag` を
-materialize するのと同じ位置である）。
+The implementation is `crates/typer/src/materialize.rs`, entered through `Check::materialize_tag`
+(a fallback alongside `classtag_apply_fallback` in `fill_implicit_params_in` — the same position at
+which nsc materializes a `ClassTag`).
 
 ```text
 {
@@ -1344,146 +1426,145 @@ materialize するのと同じ位置である）。
 }
 ```
 
-これは**普通の untyped な scala-rs の木**で、quasiquote の reification と同じく
-そのまま `type_expr` に通す。ローカルクラスがブロックの中に立つのは、typer の
-`TreeKind::Block` が「まだシンボルの無い `ClassDef` にはその場で namer を回す」
-ようにできているからで、implicit 探索の最中に定義を 1 つ生やせる。
+This is **an ordinary untyped scala-rs tree**, run through `type_expr` just like quasiquote
+reification. A local class can stand inside the block because the typer's `TreeKind::Block` is built
+to "run the namer on the spot for a `ClassDef` that has no symbol yet", so we can grow one definition
+in the middle of implicit search.
 
-universe をどれにするかは `universe_in_scope()`——`import <universe>._` の prefix
-——で決める。quasiquote が `q"..."` の universe を決めるのと同じ読み方である。
-その import が無ければ materialize せず、今までどおり「no implicit」と言う。
+Which universe to use is decided by `universe_in_scope()` — the prefix of `import <universe>._` —
+the same reading by which a quasiquote decides the universe of a `q"..."`. Without that import we do
+not materialize and still say "no implicit", as before.
 
-#### nsc と違えた 3 点（**木の一致は要求しない**）
+#### Three points where we differ from nsc (**we do not require the trees to match**)
 
-タグの木そのものではなく、**`tag.tpe` の実行結果**（`toString` / `=:=` / `<:<` /
-`typeSymbol.fullName`）が実 scalac 2.13.16 と一致することを検証している
-（`tests/fixtures/tt_tags.scala`、30 行）。違いは 3 つ:
+Rather than the tag tree itself, what we validate is that the **runtime result of `tag.tpe`**
+(`toString` / `=:=` / `<:<` / `typeSymbol.fullName`) matches the real scalac 2.13.16
+(`tests/fixtures/tt_tags.scala`, 30 lines). There are three differences:
 
-| | nsc | scala-rs | なぜ |
+| | nsc | scala-rs | Why |
 | --- | --- | --- | --- |
-| `$u` / `$m` の束縛 | `val` に束ねてから使う | `apply` の引数を直接選択する | 木が小さい。`tag.tpe` は同じ |
-| runtime universe の mirror | `runtimeMirror(getClass.getClassLoader)` | `rootMirror` | `JavaUniverse#runtimeMirror` はまだ供給できない（パラメータの `java.lang.ClassLoader` にシンボルが無く、`ensure_class` が `scala.` 以外の pickle 無しクラスを断る）。root mirror の class loader から見えないクラスでだけ挙動が違い、そのときは `ScalaReflectionException` になる（黙って違う型にはならない） |
-| creator の結果型 | `U#Type` と書き、nsc の erasure が `Types$TypeApi` にする | `Types$TypeApi` を直接書く | scala-rs は抽象型メンバを `Object` に erase する（`erasure::erase_ty`）。`TypeCreator.apply` は**抽象**なので、`Object` を返す descriptor は何も override せず、最初の `tag.tpe` が `AbstractMethodError` になる |
+| Binding `$u` / `$m` | binds them to `val`s first | selects `apply`'s arguments directly | The tree is smaller. `tag.tpe` is the same |
+| The runtime universe's mirror | `runtimeMirror(getClass.getClassLoader)` | `rootMirror` | `JavaUniverse#runtimeMirror` cannot be supplied yet (its `java.lang.ClassLoader` parameter has no symbol, and `ensure_class` refuses pickle-less classes outside `scala.`). Behavior differs only for classes invisible from the root mirror's class loader, and in that case you get a `ScalaReflectionException` (it never silently produces a different type) |
+| The creator's result type | writes `U#Type`, which nsc's erasure turns into `Types$TypeApi` | writes `Types$TypeApi` directly | scala-rs erases abstract type members to `Object` (`erasure::erase_ty`). `TypeCreator.apply` is **abstract**, so a descriptor returning `Object` overrides nothing and the first `tag.tpe` gives an `AbstractMethodError` |
 
-mirror の引数に `asInstanceOf` を挟むのも同じ性質の埋め合わせである。
-`rootMirror` の型は universe の抽象メンバ `Mirror` で、その上界は pickle 上
-`JavaMirror` までしか辿れない（`JavaMirror extends api.Mirror[self.type]` の
-親は、singleton 引数が変換できないので `conv_upper_bound` が落とす）。
-値は本当に `Mirror` なので、cast は常に成功する `checkcast` になる。
+Inserting an `asInstanceOf` on the mirror argument compensates for the same kind of thing.
+The type of `rootMirror` is the universe's abstract member `Mirror`, and its upper bound can only be
+followed as far as `JavaMirror` in the pickle (the parent of
+`JavaMirror extends api.Mirror[self.type]` is dropped by `conv_upper_bound` because the singleton
+argument cannot be converted). The value really is a `Mirror`, so the cast becomes a `checkcast` that
+always succeeds.
 
-#### 供給側で塞いだ穴
+#### Holes plugged on the supply side
 
-`u.TypeTag.apply` を呼ぶには、その前に 3 つ足りないものがあった（§7.8 の残件 5
-がまさにこれ）。
+Three things were missing before `u.TypeTag.apply` could be called (this is exactly item 5 of the
+§7.8 list).
 
-| 直したもの | どこ |
+| What was fixed | Where |
 | --- | --- |
-| **`TypeTags$TypeTag$` にシンボルが無い。** トレイトの入れ子オブジェクトの classfile は自分の `ScalaSignature` を持たない（pickle は囲む `TypeTags` の中）ので `install_classpath` が読み飛ばす。結果、descriptor `()Lscala/reflect/api/TypeTags$TypeTag$;` は解決できない `Type::Named` のままで、`value apply is not a member of TypeTags$TypeTag$` だった。`ModuleClass` を建て、`apply[T](Mirror, TypeCreator): TypeTag[T]` を**手で**入れる。erased descriptor は書き下す（メソッドシンボルの `jvm_name` が `(` で始まればそれが descriptor になる。pickle 供給と同じ約束）。pickle の署名は `Mirror[TypeTags.this.type]` で、この singleton 引数を scala-rs は綴れない | `materialize::ensure_tag_module` |
-| **`TypeTags#typeOf` の implicit パラメータが `Type::Named`。** `install_classpath` が読む pickle サブセットはメンバ型を**単純名**で持つので、`TypeTags$TypeTag` という名前は誰も入れておらず未解決だった。これが `no implicit: could not find implicit value of type TypeTags$TypeTag[Foo]` の正体で、erasure もこの型から descriptor を書くところだった | `materialize::resolve_named_tags` |
-| **`TypeTags#TypeTag` のアクセサ自体が無いことがある。** `TypeTags` が classfile として読まれれば `TypeTag()` はメソッド一覧に載るが、pickle 経由（classpath 走査で誰も名指ししなかったとき）だと module メンバは `complete_named` が入れる形に含まれず、アクセサごと無い。descriptor を書いてここで宣言する。さらに `TypeTags` は `JavaUniverse` の**直接の**親ではない（`api.Universe` の親で、そこは pickle にしかない）ので、先に `supply_from_pickle` で祖先を辿らせておく——さもないと**その run の最初の `typeOf[T]` だけ**が「value TypeTag is not a member of JavaUniverse」で落ちた | `materialize::ensure_tag_module` / `Check::materialize_tag` |
-| **解決済みの型を型木として差せない。** `TypeTag.apply[T]` の `T` も、cast 先の `api.Mirror` も、使用地点には名前で辿る道が無い（`scala.reflect.api.Mirror` は import されていない）。nsc の `TypeTree(tp)` にあたる目印 `Ident("$resolvedType")` を置き、`tree_to_type` がその `ty` をそのまま返す | `materialize::RESOLVED_TYPE` / `Check::tree_to_type` |
+| **`TypeTags$TypeTag$` had no symbol.** The classfile of an object nested in a trait has no `ScalaSignature` of its own (the pickle is inside the enclosing `TypeTags`), so `install_classpath` skips it. As a result the descriptor `()Lscala/reflect/api/TypeTags$TypeTag$;` stayed an unresolvable `Type::Named` and we got `value apply is not a member of TypeTags$TypeTag$`. We now build the `ModuleClass` and insert `apply[T](Mirror, TypeCreator): TypeTag[T]` **by hand**. The erased descriptor is written out literally (if a method symbol's `jvm_name` starts with `(` it is taken as the descriptor — the same convention as pickle supply). The pickle's signature is `Mirror[TypeTags.this.type]`, and scala-rs cannot spell that singleton argument | `materialize::ensure_tag_module` |
+| **The implicit parameter of `TypeTags#typeOf` was a `Type::Named`.** The pickle subset `install_classpath` reads holds member types by **simple name**, so nobody had installed the name `TypeTags$TypeTag` and it was unresolved. That was the true identity of `no implicit: could not find implicit value of type TypeTags$TypeTag[Foo]`, and erasure was about to write a descriptor out of that type | `materialize::resolve_named_tags` |
+| **Sometimes the `TypeTags#TypeTag` accessor itself is absent.** If `TypeTags` is read as a classfile then `TypeTag()` appears in the method list, but when it comes via the pickle (nobody named it during the classpath scan) the module member is not among what `complete_named` installs, and the accessor is missing entirely. We write the descriptor and declare it here. Furthermore `TypeTags` is not a **direct** parent of `JavaUniverse` (it is a parent of `api.Universe`, and that link exists only in the pickle), so we first let `supply_from_pickle` walk the ancestors — otherwise **only the first `typeOf[T]` of a run** failed with "value TypeTag is not a member of JavaUniverse" | `materialize::ensure_tag_module` / `Check::materialize_tag` |
+| **A resolved type cannot be spliced in as a type tree.** Neither the `T` of `TypeTag.apply[T]` nor the `api.Mirror` we cast to has a path reachable by name at the use site (`scala.reflect.api.Mirror` is not imported). We place the marker `Ident("$resolvedType")`, the counterpart of nsc's `TypeTree(tp)`, and `tree_to_type` returns its `ty` unchanged | `materialize::RESOLVED_TYPE` / `Check::tree_to_type` |
 
-#### 作れる形と、名指しで断る形
+#### Shapes we can build, and shapes we refuse by name
 
-`staticClass(<name>)` は**クラスを 1 つ**名指しする呼び出しなので、
-scala-rs が組むのは**型引数の無いクラス型**だけである。
+`staticClass(<name>)` is a call that names **one class**, so what scala-rs builds is only
+**class types with no type arguments**.
 
-作れる: 9 つの基本型 / `Unit` / `String` / `Any` / `AnyVal` / `Nothing` / `Null` /
-トップレベルのクラス・トレイト（`Foo`、`scala.math.BigInt`、
-`slick.collection.heterogeneous.HList`）。
+Buildable: the 9 primitive types / `Unit` / `String` / `Any` / `AnyVal` / `Nothing` / `Null` /
+top-level classes and traits (`Foo`, `scala.math.BigInt`,
+`slick.collection.heterogeneous.HList`).
 
-断る（`tests/fixtures/tt_tags_bad.scala` が固定している）:
+Refused (pinned by `tests/fixtures/tt_tags_bad.scala`):
 
-| 形 | 診断 | 理由 |
+| Shape | Diagnostic | Reason |
 | --- | --- | --- |
-| `typeOf[List[Int]]` | a type constructor applied to type arguments | nsc は prefix と symbol と引数から `TypeRef` を組む |
-| `typeOf[Nest.Inner]` | a class nested in a class or an object rather than a top-level one | `staticClass` はパッケージしか辿らない。nsc は `selectType` を使う |
-| `typeOf[AnyRef]` | which is an alias rather than a class | `java.lang.Object` の別名。`staticClass` は実行時に落ちる |
-| `typeOf[T]`（型パラメータ） | an abstract type with no tag in scope | nsc も `No TypeTag available for T` と断る。`WeakTypeTag` は free type を作るが未実装 |
+| `typeOf[List[Int]]` | a type constructor applied to type arguments | nsc builds a `TypeRef` from prefix, symbol and arguments |
+| `typeOf[Nest.Inner]` | a class nested in a class or an object rather than a top-level one | `staticClass` only follows packages. nsc uses `selectType` |
+| `typeOf[AnyRef]` | which is an alias rather than a class | An alias for `java.lang.Object`. `staticClass` fails at run time |
+| `typeOf[T]` (a type parameter) | an abstract type with no tag in scope | nsc refuses it too (`No TypeTag available for T`). `WeakTypeTag` creates a free type, which is unimplemented |
 | `typeOf[Main.type]` | a singleton type | |
-| 構造的型 / 関数型 / タプル / 配列 | a structural type / whose type arguments would have to be reified too | |
+| Structural types / function types / tuples / arrays | a structural type / whose type arguments would have to be reified too | |
 
-**黙って別の型を作らない**ことが要点である。間違ったタグはコンパイルエラーに
-ならず、実行時に「違う `Type`」としてマクロに渡るだけなので、後から見つけるのが
-最も難しい種類の欠陥になる。
+The point is **never to silently build a different type**. A wrong tag is not a compile error; it just
+arrives at the macro at run time as a "different `Type`", which makes it the hardest kind of defect to
+find after the fact.
 
-#### 検証
+#### Validation
 
-- `tests/fixtures/tt_tags.scala` — scala-rs と実 scalac 2.13.16 の**両方**で
-  コンパイルして実行し、30 行の出力が完全一致する（`java -Xverify:all`）。
-  `crates/cli/tests/quasi.rs` の `tt_tags_materialises_type_tags` /
-  `tt_tags_matches_real_scalac`。
-- `tests/fixtures/tt_ctx.scala` — マクロ実装の中の `c.typeOf[HL]` /
-  `c.weakTypeOf[Rep]`（slick の `mapToImpl` の形）。両コンパイラが通し、
-  classfile が JVM にロード・検証される（展開には engine が要る）。
-- `tests/fixtures/tt_tags_bad.scala` — 断る 7 形がすべて名指しで診断される。
+- `tests/fixtures/tt_tags.scala` — compiled and run with **both** scala-rs and the real scalac
+  2.13.16, with the 30 lines of output matching exactly (`java -Xverify:all`).
+  `tt_tags_materialises_type_tags` / `tt_tags_matches_real_scalac` in `crates/cli/tests/quasi.rs`.
+- `tests/fixtures/tt_ctx.scala` — `c.typeOf[HL]` / `c.weakTypeOf[Rep]` inside a macro implementation
+  (the shape of slick's `mapToImpl`). Both compilers accept it and the classfile loads and verifies
+  on the JVM (expansion needs the engine).
+- `tests/fixtures/tt_tags_bad.scala` — all 7 refused shapes are diagnosed by name.
 
-#### slick への効き方
+#### How this affects slick
 
-`tests/slick_measure.sh`（scala-reflect.jar 入り）で `errors=223 → 221`、
-`files_with_errors=60 → 60`。内訳:
+With `tests/slick_measure.sh` (with scala-reflect.jar), `errors=223 → 221` and
+`files_with_errors=60 → 60`. Breakdown:
 
-| ファイル | before | after |
+| File | before | after |
 | --- | --- | --- |
 | `ShapedValue.scala` | 10 | **9** |
 | `TableQuery.scala` | 7 | **6** |
 
-どちらも消えたのは `no implicit: could not find implicit value of type
-TypeTags$TypeTag[...]` で、`c.typeOf[slick.collection.heterogeneous.HList]` と
-`typeOf[Tag]` が**実際に通る**ようになった。ログに `TypeTag` の implicit エラーは
-1 件も残っていない。
+What disappeared in both cases is
+`no implicit: could not find implicit value of type TypeTags$TypeTag[...]`:
+`c.typeOf[slick.collection.heterogeneous.HList]` and `typeOf[Tag]` **actually go through** now.
+Not one `TypeTag` implicit error remains in the log.
 
-#### このスライスのあとに残っているもの
+#### What remains after this slice
 
-1. **型引数のある型のタグ。** `TypeTag[List[Int]]`。nsc の
-   `internal.reificationSupport.TypeRef` / `SingleType` / `selectType` を
-   creator の本体に組む必要がある。入れ子クラス（`selectType`）も同じ道具立て。
-2. **タグの型を名前で書けない。** `implicitly[TypeTag[Foo]]` は
-   materialization ではなく `TypeTag` という**型名**が引けないところで落ちる
-   （無修飾は `not found: type TypeTag`、パス越しの `u.TypeTag[Foo]` は
-   `type TypeTag is not a member of JavaUniverse`）。§7.8 の残件 4・5 のままで、
-   `typeTag[Foo]` / `weakTypeTag[Foo]` は同じ implicit を要求するので通る。
-3. **`runtimeMirror(getClass.getClassLoader)`。** `java.lang.ClassLoader` に
-   シンボルが無く、`ensure_class` が `scala.` 以外の pickle 無しクラスを断るため
-   メンバごと供給されない（`parameter cl has an unmappable type`）。
-4. **`reify { … }` 本体**（§7.8 の残件 2）。式全体の `TreeCreator` 化。
-   materialization と同じ機構の上に載る。
-5. **engine（フェーズ 2）。** マクロを*呼ぶ*ための JVM ブリッジ。
+1. **Tags for types with type arguments.** `TypeTag[List[Int]]`. We would have to build nsc's
+   `internal.reificationSupport.TypeRef` / `SingleType` / `selectType` into the creator's body.
+   Nested classes (`selectType`) need the same toolkit.
+2. **The type of a tag cannot be written by name.** `implicitly[TypeTag[Foo]]` fails not at
+   materialization but where the **type name** `TypeTag` cannot be looked up (unqualified gives
+   `not found: type TypeTag`, and through a path `u.TypeTag[Foo]` gives
+   `type TypeTag is not a member of JavaUniverse`). This is still items 4 and 5 of the §7.8 list;
+   `typeTag[Foo]` / `weakTypeTag[Foo]` demand the same implicit and do go through.
+3. **`runtimeMirror(getClass.getClassLoader)`.** `java.lang.ClassLoader` has no symbol and
+   `ensure_class` refuses pickle-less classes outside `scala.`, so the member is not supplied at all
+   (`parameter cl has an unmappable type`).
+4. **The body of `reify { … }`** (item 2 of the §7.8 list). Turning a whole expression into a
+   `TreeCreator`. It rides on the same mechanism as materialization.
+5. **The engine (phase 2).** The JVM bridge for actually *calling* macros.
 
-### 7.11 engine — マクロ実装を本当に呼ぶ（`agent/engine` スライス）
+### 7.11 The engine — actually calling macro implementations (the `agent/engine` slice)
 
-§6 の**フェーズ 2**。§2.3 の prototype を製品コードにし、
-**`def f = macro Impl.m` の呼び出しが実際に展開され、展開後のプログラムが走る**
-ようになった。実 scalac 2.13.16 と同じ 2 ファイル・2 回コンパイルの構成で
-dual-run し、**プログラム出力が完全一致**する（`crates/cli/tests/engine.rs`）。
+**Phase 2** of §6. The §2.3 prototype became production code, and **a call to `def f = macro Impl.m`
+is now really expanded, with the expanded program running**. It is dual-run against the real scalac
+2.13.16 in the same two-file, two-compilation configuration, and **the program output matches
+exactly** (`crates/cli/tests/engine.rs`).
 
-#### 形（ブリッジの構成）
+#### The shape (how the bridge is put together)
 
-engine は **Java 1 ファイル**（`crates/typer/java/ScalaRsMacroEngine.java`）で、
-Scala のクラスは**すべてリフレクション経由**で触る。したがって `javac` に
-scala-reflect.jar は要らず、リポジトリに classfile も置かない。
-`include_str!` でバイナリに埋め込み、初回展開時に
+The engine is **a single Java file** (`crates/typer/java/ScalaRsMacroEngine.java`) that touches Scala
+classes **entirely through reflection**. So `javac` does not need scala-reflect.jar, and no classfile
+is checked into the repository. It is embedded in the binary with `include_str!` and, on the first
+expansion, written out to
 
 ```
-$TMPDIR/scala-rs-macro-engine-<ソースの FNV ハッシュ>/
+$TMPDIR/scala-rs-macro-engine-<FNV hash of the source>/
 ```
 
-へ書き出して `javac` する（ハッシュ付きなので古い classfile が走ることはない）。
+and compiled with `javac` (the hash means a stale classfile can never run).
 
-- **常駐 1 プロセス／1 コンパイル。** 最初の展開で `java` を起動し、
-  以降は 1 行 1 リクエストのパイプで捌く（§6.4 のリスク表「engine プロセスの
-  起動コスト」への回答）。`Typer` が落ちるときに `Drop` で kill する。
-- **classpath は `binary_path` そのもの**（`-cp` ＋ `--scala-library`）。
-  nsc が `-Ymacro-classpath` 既定でコンパイル classpath を使うのと同じで、
-  §2.3 で分かった「reify の `staticModule` はコンパイル対象のクラスも要求する」
-  という注意もこれで満たされる。
-- **`Context` は `java.lang.reflect.Proxy`**（prototype と同じ）。実装したのは
-  `universe` / `mirror` / `Expr` / `WeakTypeTag` / `TypeTag` / `TermName` /
-  `TypeName` / `freshName` / `abort` と、トレイトの default 実装
-  （`invokeDefault`）。それ以外は `UnsupportedOperationException` で落ち、
-  Rust 側は**その名前を診断に出す**。
-- **直列化は S 式**（JSON ではなく）。両端とも自前パーサが 60 行で書け、
-  1 行 1 メッセージでパイプに乗る。§4.2 の JSON 案と情報量は同じである。
+- **One resident process per compilation.** The first expansion starts `java`, and everything after
+  that goes over a pipe with one request per line (the answer to "engine process startup cost" in the
+  §6.4 risk table). It is killed from `Drop` when the `Typer` goes away.
+- **The classpath is `binary_path` itself** (`-cp` plus `--scala-library`). This mirrors nsc, whose
+  `-Ymacro-classpath` defaults to the compilation classpath, and it also satisfies the caveat found
+  in §2.3 that "reify's `staticModule` also demands the classes being compiled".
+- **The `Context` is a `java.lang.reflect.Proxy`** (as in the prototype). What we implemented is
+  `universe` / `mirror` / `Expr` / `WeakTypeTag` / `TypeTag` / `TermName` / `TypeName` / `freshName` /
+  `abort`, plus the traits' default implementations (`invokeDefault`). Everything else fails with
+  `UnsupportedOperationException`, and the Rust side **puts that name in the diagnostic**.
+- **Serialization is S-expressions** (not JSON). Both ends can write their own parser in 60 lines, and
+  it rides the pipe one message per line. The information content is the same as the JSON proposal of
+  §4.2.
 
 ```
 → (expand "EgImpl$" "plusImpl" (argss (args (arg expr <tree> (ty "scala.Int")))) (tags))
@@ -1491,27 +1572,26 @@ $TMPDIR/scala-rs-macro-engine-<ソースの FNV ハッシュ>/
         (l (t "Literal" (s0) (c "Int" "1")))))
 ```
 
-**戻りの木は engine が汎用に書く**。ノード種別を engine は知らない：
-`productPrefix` と `productElement` をそのまま並べ、`Symbol` は
-`isStatic` のときだけ完全修飾名を添える。「この形は作れない」と判断するのは
-**Rust 側だけ**で、知らない `Prefix` は必ず名指しの診断になる。
+**The returned tree is written generically by the engine.** The engine does not know the node kinds:
+it lays out `productPrefix` and `productElement` as they come, and attaches a fully qualified name to
+a `Symbol` only when `isStatic`. Deciding "this shape cannot be built" happens **only on the Rust
+side**, and an unknown `Prefix` always becomes a diagnostic that names it.
 
-#### 展開をどこでやるか
+#### Where expansion happens
 
-nsc と同じく **typer の中**、**macro application の一番外側**で展開する
-（`Check::type_expr` の末尾、`adapt` の**手前**）。「一番外側」は
-`typing_callee` という 1 ビットで見分ける：`Apply` / `TypeApply` が callee を
-型付ける直前に立て、`type_expr` の入口で `mem::take` する。だから
-`M.f` は `M.f(1)` の head としては展開されず、レシーバの中の
-`M.g(1).h` は展開される。カリー化されたマクロの内側の `Apply` は
-「まだ `Type::Method`」で弾かれる。
+As in nsc, expansion happens **inside the typer**, at **the outermost node of the macro application**
+(at the end of `Check::type_expr`, **before** `adapt`). "Outermost" is detected with a single bit,
+`typing_callee`: it is set just before `Apply` / `TypeApply` types its callee and is `mem::take`n at
+the entry of `type_expr`. So `M.f` is not expanded as the head of `M.f(1)`, while the `M.g(1).h`
+inside a receiver is. The inner `Apply` of a curried macro is rejected as "still a `Type::Method`".
 
-blackbox なので、展開結果は**宣言された戻り値型**を期待型として 1 回だけ
-型検査し、型はその宣言型に戻す（nsc の `Typed(expanded, TypeTree(innerPt))`）。
+Since it is blackbox, the expansion result is typechecked exactly once against **the declared return
+type** as the expected type, and the type is put back to that declared type (nsc's
+`Typed(expanded, TypeTree(innerPt))`).
 
-**展開できなかったものは 1 件残らず診断になる。** `report_macro_calls` の
-掃除は phase 1 のまま残してあり、展開器は失敗の**理由**を span ごとに記録して
-そこに載せるだけである:
+**Everything that could not be expanded becomes a diagnostic, without exception.** The
+`report_macro_calls` sweep is kept exactly as in phase 1; the expander merely records the **reason**
+for each failure per span and hangs it there:
 
 ```
 error: macro expansion is not implemented: cannot expand nameOf
@@ -1519,225 +1599,213 @@ error: macro expansion is not implemented: cannot expand nameOf
        `List[Int]`, a type constructor applied to type arguments. See docs/macros.md.
 ```
 
-#### 2 回コンパイルであることは仕様である
+#### Two-pass compilation is by design
 
-nsc は「マクロ実装は**展開が起きる run より前に**コンパイル済みでなければ
-ならない」と決めている（§1.3）。scala-rs も同じで、実装が macro classpath に
-無ければ engine が `ClassNotFoundException` を返し、それが
-`is not on the macro classpath (nsc requires the implementation to have been
-compiled by an earlier run)` という理由になる
-（`tests/fixtures/eg_samerun_bad.scala` が固定）。
-マクロ **def** の側は現在の run にあってよい（slick もその形）。
+nsc decrees that "a macro implementation must have been compiled **before the run in which the
+expansion happens**" (§1.3). scala-rs is the same: if the implementation is not on the macro
+classpath, the engine returns `ClassNotFoundException`, which becomes the reason
+`is not on the macro classpath (nsc requires the implementation to have been compiled by an earlier
+run)` (pinned by `tests/fixtures/eg_samerun_bad.scala`).
+The macro **def** side may live in the current run (that is slick's shape too).
 
-#### 通るようになった形
+#### Shapes that now work
 
-| 形 | 例 | 備考 |
+| Shape | Example | Notes |
 | --- | --- | --- |
-| 引数なし | `def const(): Int = macro EgImpl.constImpl` | 展開は `Literal(Constant(42))` |
-| `c.Expr[T]` 引数 | `def plus1(x: Int): Int` | 呼び出し地点の木を `Expr` に包んで渡す |
-| 生の `c.Tree` 引数 | `def twice(x: Int): Int` | 2.11 以降の形。slick の `mapToImpl` がこれ |
-| `c.WeakTypeTag[T]` | `def nameOf[T]: String = macro EgImpl.nameOfImpl[T]` | 型引数は**明示**のときだけ |
-| 展開結果の木 | `Literal` / `Ident` / `Select` / `Apply` / `TypeApply` / `Block` / `If` / `Typed` / `This` / `EmptyTree` / `TypeTree` | それ以外は名指しで断る |
-| static シンボル | 展開の `Ident(EgHelper)` | `isStatic` なら完全修飾パスに展開して呼び出し地点で解決する |
+| No arguments | `def const(): Int = macro EgImpl.constImpl` | The expansion is `Literal(Constant(42))` |
+| A `c.Expr[T]` argument | `def plus1(x: Int): Int` | The call site's tree is wrapped in an `Expr` and passed |
+| A raw `c.Tree` argument | `def twice(x: Int): Int` | The 2.11-and-later shape. This is what slick's `mapToImpl` uses |
+| `c.WeakTypeTag[T]` | `def nameOf[T]: String = macro EgImpl.nameOfImpl[T]` | Type arguments only when **explicit** |
+| Expansion result trees | `Literal` / `Ident` / `Select` / `Apply` / `TypeApply` / `Block` / `If` / `Typed` / `This` / `EmptyTree` / `TypeTree` | Anything else is refused by name |
+| Static symbols | The `Ident(EgHelper)` of an expansion | If `isStatic`, expand to the fully qualified path and resolve at the call site |
 
-#### 道中で塞いだ 2 つの一般の穴（どちらも「今まで誰も走らせていなかった」）
+#### Two general holes plugged on the way (both cases of "nobody had ever run this")
 
-| 直したもの | どこ |
+| What was fixed | Where |
 | --- | --- |
-| **`blackbox.Context` がインタフェースとして立っていなかった。** `prelude_reflect` の placeholder は `Flags::EMPTY` で、scala-reflect.jar がある実行でも**この symbol がそのまま本物として使われる**（`ensure_class` は `find_by_jvm` でこれを返す）。結果、マクロ実装の `c.universe` は `invokevirtual` になり、**実行した瞬間に `IncompatibleClassChangeError`** だった。§7.6 の fixture は「classfile がロード・検証できる」までしか見ていなかったので気づけていない | `prelude_reflect::ctx` |
-| **pickle が trait と言っているのに placeholder が class のままだった。** `find_or_stub_java_class` が descriptor から建てた symbol は trait/class を知らない。`give_stub_its_kinds` は型パラメータのある classだけを直していたので、`scala.reflect.macros.Universe` のような **型パラメータの無い** trait は class のままだった | `PickleSupply::give_stub_its_kinds` |
+| **`blackbox.Context` was not standing as an interface.** The placeholder in `prelude_reflect` had `Flags::EMPTY`, and **that symbol is used as the real thing** even in runs where scala-reflect.jar is present (`ensure_class` returns it via `find_by_jvm`). As a result the `c.universe` of a macro implementation became an `invokevirtual` and gave **an `IncompatibleClassChangeError` the moment it ran**. The §7.6 fixtures only checked "the classfile loads and verifies", so this went unnoticed | `prelude_reflect::ctx` |
+| **The placeholder stayed a class even though the pickle said trait.** A symbol built by `find_or_stub_java_class` from a descriptor does not know trait from class. `give_stub_its_kinds` only fixed up classes **with** type parameters, so a trait with **no** type parameters, such as `scala.reflect.macros.Universe`, stayed a class | `PickleSupply::give_stub_its_kinds` |
 
-#### 検証
+#### Validation
 
-- `tests/fixtures/eg_impl.scala` + `tests/fixtures/eg_use.scala` —
-  scala-rs で 2 段コンパイルして実行し、8 行の出力が
-  `tests/fixtures/expected/eg_use.txt` と一致する（`java -Xverify:all`）。
-  **同じ 2 ファイルを実 scalac 2.13.16 でも 2 段コンパイルして実行し、
-  同じ 8 行になることを別テストで固定**している。マクロが「違う木」に
-  展開されてもコンパイルは通ってしまうので、**出力の比較だけが
-  間違った展開を捕まえられる**。
-- `tests/fixtures/eg_samerun_bad.scala` — 同一 run に実装がある場合。
-- `tests/fixtures/eg_gaps_bad.scala` — 渡せない引数の形・作れないタグ。
+- `tests/fixtures/eg_impl.scala` + `tests/fixtures/eg_use.scala` — compiled in two stages with
+  scala-rs and run, with the 8 lines of output matching `tests/fixtures/expected/eg_use.txt`
+  (`java -Xverify:all`). **A separate test pins that the same two files, compiled in two stages by the
+  real scalac 2.13.16 and run, produce the same 8 lines.** A macro that expands into "a different
+  tree" still compiles, so **only comparing the output can catch a wrong expansion**.
+- `tests/fixtures/eg_samerun_bad.scala` — the case where the implementation is in the same run.
+- `tests/fixtures/eg_gaps_bad.scala` — argument shapes that cannot be passed, and tags that cannot be
+  built.
 
-#### このスライスのあとに残っているもの
+#### What remains after this slice
 
-1. **`c.Expr[T](tree)` が scala-rs でコンパイルできない。** `Context.Expr` の
-   オーバーロード（`def Expr[T: WeakTypeTag](tree: Tree): Expr[T]`）に解決せず、
-   `universe.Expr.apply` の方に当たる。だから fixture の実装は
-   すべて `c.Tree` を返している。**slick の `TableQueryMacroImpl` は
-   `c.Expr` を返す**ので、これは必要になる。
-2. **推論された型引数がタグにならない。** `M.f[T]` と明示された場合だけ
-   タグを作る。呼び出し地点で推論された型引数は typer が木に残さないので、
-   いまは名指しで断っている。
-3. **引数の木は「書かれた構文」しか運べない。** 型付き木のまま渡す
-   （§4.3）のではなく、`Literal` / `Ident` / `Select` / `Apply` / `This` を
-   構文として渡して呼び出し地点で型検査し直す。ブロック・関数リテラル・`new`
-   などは名指しで断る。slick の `mapToImpl` は `c.prefix` を見るので、
-   ここは `prefix` の実装（未実装、`UnsupportedOperationException`）と
-   合わせて次の一手になる。
-4. **`c.prefix` / `c.enclosingPosition` / `c.typecheck` / `c.inferImplicitValue`。**
-   `prefix` は呼び出し地点のレシーバ木、`enclosingPosition` は span の変換で
-   でき、`typecheck` / `inferImplicitValue` は engine → Rust の逆方向 RPC が要る
-   （§6.4）。slick が使うのは `prefix` / `enclosingPosition` / `abort` までで、
-   `abort` は実装済み。
-5. **展開結果の `TypeTree` は型引数の無いクラスだけ。** `List[Int]` を
-   埋めた木は断る。
-6. **whitebox。** 変わらず未実装（§6.3）。
-7. **`MACRO` フラグと `@macroImpl` の pickle（§5）。** マクロ def を
-   *別 run* から展開することはまだできない。いまは「マクロ def は現在の run、
-   実装は前の run」という形だけが通る。slick は 1 ファイルに def と実装を
-   並べるので、この形で足りる。
+1. **`c.Expr[T](tree)` does not compile under scala-rs.** It does not resolve to the `Context.Expr`
+   overload (`def Expr[T: WeakTypeTag](tree: Tree): Expr[T]`) but hits `universe.Expr.apply` instead.
+   That is why every implementation in the fixtures returns a `c.Tree`. **Slick's
+   `TableQueryMacroImpl` returns a `c.Expr`**, so we will need this.
+2. **Inferred type arguments do not become tags.** We build a tag only when `M.f[T]` is written
+   explicitly. Type arguments inferred at the call site are not left in the tree by the typer, so for
+   now we refuse them by name.
+3. **Argument trees can only carry "the syntax that was written".** Rather than passing typed trees
+   as they are (§4.3), we pass `Literal` / `Ident` / `Select` / `Apply` / `This` as syntax and
+   re-typecheck at the call site. Blocks, function literals, `new` and so on are refused by name.
+   Slick's `mapToImpl` looks at `c.prefix`, so this, together with implementing `prefix`
+   (unimplemented; `UnsupportedOperationException`), is the next move.
+4. **`c.prefix` / `c.enclosingPosition` / `c.typecheck` / `c.inferImplicitValue`.**
+   `prefix` is the receiver tree at the call site and `enclosingPosition` is a span conversion, both
+   doable; `typecheck` / `inferImplicitValue` need reverse RPC from the engine to Rust (§6.4).
+   What slick uses goes as far as `prefix` / `enclosingPosition` / `abort`, and `abort` is already
+   implemented.
+5. **A `TypeTree` in an expansion result may only be a class with no type arguments.** A tree with
+   `List[Int]` embedded is refused.
+6. **whitebox.** Still unimplemented (§6.3).
+7. **The `MACRO` flag and the `@macroImpl` pickle (§5).** A macro def still cannot be expanded from
+   *another run*. Only the shape "macro def in the current run, implementation from a previous run"
+   works today. Slick puts the def and the implementation in one file, so this shape suffices.
 
-#### slick への効き方
+#### How this affects slick
 
-`tests/slick_measure.sh` で `errors=203 → 203`、`files_with_errors=60 → 60`、
-`tests/slick_subset.sh` は `204/204` のまま。**数字は動かない。**
-slick の `TableQuery.apply` / `ShapedValue.mapTo` の呼び出し地点は
-「実装が同じ run にある」ので nsc でも展開できない形であり、
-engine が効くのは**slick を classfile として先にコンパイルできてから**である。
-このスライスが動かすのは §7.1〜7.10 が積み上げてきた「実装をコンパイルする」
-側ではなく、その先の「実装を呼ぶ」側で、slick に効くのは
-残件 1（`c.Expr`）と 3〜4（`c.prefix`）が入ってからになる。
+With `tests/slick_measure.sh`, `errors=203 → 203` and `files_with_errors=60 → 60`;
+`tests/slick_subset.sh` stays at `204/204`. **The numbers do not move.**
+The call sites of slick's `TableQuery.apply` / `ShapedValue.mapTo` are shapes that "have the
+implementation in the same run", which nsc cannot expand either, so the engine only starts to matter
+**once slick can first be compiled to classfiles**.
+What this slice moves is not the "compile the implementation" side that §7.1 through §7.10 have been
+building up, but the "call the implementation" side beyond it; it will start to matter for slick once
+item 1 (`c.Expr`) and items 3 and 4 (`c.prefix`) land.
 
-### 7.12 `c.Expr[T](tree)` と `c.prefix`（`agent/expr` スライス）
+### 7.12 `c.Expr[T](tree)` and `c.prefix` (the `agent/expr` slice)
 
-§7.11 の残件 1（`c.Expr`）と 4 の一部（`c.prefix`）。あわせて、
-**`c.Expr[F[E]]` が要求する `WeakTypeTag[F[E]]` を組み立てられる**
-ようになった。この 3 つが揃うと **slick の `TableQueryMacroImpl.apply` と
-同じ形のマクロ**が書けて展開でき、実 scalac 2.13.16 と dual-run で
-プログラム出力が一致する（`tests/fixtures/ex_impl.scala` +
-`tests/fixtures/ex_use.scala`）。
+Item 1 (`c.Expr`) and part of item 4 (`c.prefix`) of the §7.11 list. Together with these,
+**we can now assemble the `WeakTypeTag[F[E]]` that `c.Expr[F[E]]` demands**. With all three in place,
+**a macro of the same shape as slick's `TableQueryMacroImpl.apply`** can be written and expanded, and
+its program output matches the real scalac 2.13.16 in a dual run (`tests/fixtures/ex_impl.scala` +
+`tests/fixtures/ex_use.scala`).
 
-#### 1. `c.Expr[T](tree)` — 値位置の畳み込みが早すぎた
+#### 1. `c.Expr[T](tree)` — value-position collapsing happened too early
 
-`scala.reflect.macros.Aliases` は `Expr` を **2 つ**宣言している:
+`scala.reflect.macros.Aliases` declares `Expr` **twice**:
 
 ```scala
-val Expr: universe.Expr.type                       // 抽出子オブジェクト
-def Expr[T: WeakTypeTag](tree: Tree): Expr[T]      // 生成メソッド
+val Expr: universe.Expr.type                       // the extractor object
+def Expr[T: WeakTypeTag](tree: Tree): Expr[T]      // the factory method
 ```
 
-`c.Expr` の選択は `Type::Overload` で始まるが、`maybe_auto_apply` が
-**SLS 6.26.3（値位置ではパラメータを取らない候補だけ残す）** をその場で
-適用して `val` の方に潰していた。潰れた結果は `universe.Expr$` という
-モジュールなので、続く `[Int]` はモジュール→`apply` のリダイレクトに乗り、
-`universe.Expr.apply(Mirror, TreeCreator)` に当たって
-`no matching overload` になっていた。
+The selection `c.Expr` starts out as a `Type::Overload`, but `maybe_auto_apply` applied
+**SLS 6.26.3 (in value position, keep only candidates that take no parameters)** on the spot and
+collapsed it to the `val`. The collapsed result is the module `universe.Expr$`, so the following
+`[Int]` rode the module → `apply` redirect, hit `universe.Expr.apply(Mirror, TreeCreator)` and gave
+`no matching overload`.
 
-nsc の順序は逆で、**明示型引数はオーバーロードを先に絞る**。そこで:
+nsc's ordering is the opposite: **explicit type arguments narrow the overloads first**. So:
 
-- 選択が畳み込んだときは、その集合を**生き残ったシンボルの側にも**記録する
-  （`overload_member_types` / `overload_groups`。呼び出し側が持っている鍵は
-  `found[0]` ではなく畳み込み後のシンボルなので）。
-- `TypeApply` は、型引数の個数に合う候補が**ちょうど 1 つ**あり、いま持って
-  いるシンボルの型パラメータ数がそれと違うときだけ、そちらへ差し替える
-  （`Check::alt_taking_targs`）。集合が本当に 2 つ以上だった場合に限るので、
-  `Ordering[String]` のような「候補 1 つ」の従来経路は素通りする。
+- When a selection collapses, we now also record the set **on the surviving symbol**
+  (`overload_member_types` / `overload_groups`, since the key the caller holds is the post-collapse
+  symbol, not `found[0]`).
+- `TypeApply` swaps in another candidate only when **exactly one** candidate matches the number of
+  type arguments and the symbol currently held has a different type parameter count
+  (`Check::alt_taking_targs`). Since this only happens when the set genuinely had two or more members,
+  the existing "one candidate" path, as in `Ordering[String]`, passes straight through.
 
-#### 2. `c.prefix` — 呼び出し地点のレシーバ
+#### 2. `c.prefix` — the receiver at the call site
 
-`peel_application` が `Apply`/`TypeApply` を剥がした先が `Select` なら、
-その `qual` が prefix である。**木だけ**を engine に送り、engine 側は
-nsc と同じく `Expr[Nothing](prefixTree)(TypeTag.Nothing)` を作る
-（blackbox の `PrefixType` は抽象メンバなので、nsc でも
-`c.prefix.staticType` は `Nothing` になる。fixture がこれを固定している）。
+If what `peel_application` finds after stripping `Apply` / `TypeApply` is a `Select`, its `qual` is
+the prefix. We send **only the tree** to the engine, and the engine builds
+`Expr[Nothing](prefixTree)(TypeTag.Nothing)` as nsc does (since blackbox's `PrefixType` is an
+abstract member, `c.prefix.staticType` is `Nothing` in nsc too; a fixture pins this).
 
-運べないレシーバ（`new`、ブロック、レシーバなしの呼び出し）は
-**その場ではエラーにしない**。実装が `prefix` を読むかどうかは呼び出し側から
-分からないので、**理由の文字列を一緒に送り**、engine は `prefix` が実際に
-読まれたときだけその理由を載せて投げる。読まない実装は素通しで展開される。
+A receiver we cannot carry (`new`, a block, a call with no receiver) **is not an error on the spot**.
+Whether the implementation reads `prefix` is unknowable from the call side, so **we send the reason
+string along** and the engine throws with that reason only if `prefix` is actually read.
+An implementation that does not read it expands straight through.
 
-#### 3. `WeakTypeTag[F[E]]` の組み立て
+#### 3. Assembling `WeakTypeTag[F[E]]`
 
-`c.Expr[ExBox[E]](tree)` は暗黙の `WeakTypeTag[ExBox[E]]` を要求する。
-§7.10 の materialiser は `staticClass` 1 回で作れる**単相クラスだけ**だったので、
-ここで止まっていた。creator の本体を 3 形の合成に一般化した
-（`materialize::TagBody`）:
+`c.Expr[ExBox[E]](tree)` demands an implicit `WeakTypeTag[ExBox[E]]`. The materialiser of §7.10
+handled only **monomorphic classes** buildable from a single `staticClass`, so this got stuck.
+We generalized the creator's body into a synthesis of three shapes (`materialize::TagBody`):
 
-| 形 | 生成する木 |
+| Shape | Tree generated |
 | --- | --- |
-| 単相クラス | `$m$untyped.staticClass("N").asType.toTypeConstructor`（従来） |
-| 型構築子の適用 | `$m$untyped.universe.appliedType($m$untyped.staticClass("N"), List(<各引数>))` |
-| 型パラメータ | `<スコープ内のタグ>.in($m$untyped).tpe` |
+| A monomorphic class | `$m$untyped.staticClass("N").asType.toTypeConstructor` (as before) |
+| An applied type constructor | `$m$untyped.universe.appliedType($m$untyped.staticClass("N"), List(<each argument>))` |
+| A type parameter | `<the tag in scope>.in($m$untyped).tpe` |
 
-`appliedType(sym, args)` は nsc が書く
-`internal.reificationSupport.TypeRef(thisPrefix(owner), sym, List(…))` の
-公開版である（シンボルの `typeConstructor` が `TypeRef(owner.thisType, sym, Nil)`
-だから同じ `TypeRef` になる）。型パラメータのタグは**通常の暗黙探索**で
-引く。materialisation は探索が失敗した*あと*の代替なので、循環はしない。
+`appliedType(sym, args)` is the public version of what nsc writes as
+`internal.reificationSupport.TypeRef(thisPrefix(owner), sym, List(…))` (a symbol's `typeConstructor`
+is `TypeRef(owner.thisType, sym, Nil)`, so it comes out as the same `TypeRef`). Tags for type
+parameters are looked up by **ordinary implicit search**. Materialisation is the fallback *after*
+search has failed, so there is no cycle.
 
-作れない形は従来どおり名指しで断る。合成は**再帰する**ので、引数が作れない
-`List[Nest.Inner]` は「`Inner`, a class nested in a class or an object」と、
-引数の方を名指しする。タプル・関数型（`scala.TupleN` / `scala.FunctionN` への
-展開が要る）と、タグの無い型パラメータ（nsc は free type symbol を立てるが
-scala-rs はやらない）は引き続き断る。`tests/fixtures/tt_tags_bad.scala` が固定する。
+Shapes we cannot build are refused by name as before. Because the synthesis **recurses**,
+`List[Nest.Inner]`, whose argument cannot be built, names the argument:
+"`Inner`, a class nested in a class or an object". Tuples and function types (which would need
+expansion to `scala.TupleN` / `scala.FunctionN`) and type parameters with no tag (nsc erects a free
+type symbol; scala-rs does not) are still refused. `tests/fixtures/tt_tags_bad.scala` pins this.
 
-**既知のずれ（1 件）**: `Predef.Map` のような**型別名**を経由した構築子では、
-nsc の creator が別名を保つ（`selectType(staticModule("scala.Predef"), "Map")`）のに対し、
-scala-rs は別名の指すクラスを `staticClass` する。両者は `=:=` で `typeSymbol` も同じだが、
-`toString` が `Map[String,Foo]` と `scala.collection.immutable.Map[String,Foo]` に分かれる。
-§7.10 が `Predef.String` について既に記録しているのと同じずれで、`String` では
-たまたま表示が一致していただけである。`tt_tags.scala` は `Map` については
-`=:=` と `typeSymbol.fullName` を比較している（`toString` ではなく）。
+**One known divergence**: for a constructor reached through a **type alias** such as `Predef.Map`,
+nsc's creator preserves the alias (`selectType(staticModule("scala.Predef"), "Map")`), whereas
+scala-rs does a `staticClass` on the class the alias points at. The two are `=:=` and have the same
+`typeSymbol`, but `toString` differs: `Map[String,Foo]` versus
+`scala.collection.immutable.Map[String,Foo]`.
+It is the same divergence §7.10 already recorded for `Predef.String`; with `String` the rendering just
+happened to coincide. For `Map`, `tt_tags.scala` compares `=:=` and `typeSymbol.fullName` (not
+`toString`).
 
-#### 4. 展開結果の `New`
+#### 4. `New` in expansion results
 
-reflect の `new C(args)` は `Apply(Select(New(tpt), termNames.CONSTRUCTOR), args)`、
-scala-rs の木では `Apply(New(tpt), args)`。`New` を受け取れるようにし、
-`New` の上の `<init>` 選択は畳んで落とす。slick の `TableQueryMacroImpl` が
-`New(TypeTree(e.tpe))` を書くので、これが要る。
+In reflect, `new C(args)` is `Apply(Select(New(tpt), termNames.CONSTRUCTOR), args)`; in the scala-rs
+tree it is `Apply(New(tpt), args)`. We now accept `New` and fold away the `<init>` selection on top of
+it. Slick's `TableQueryMacroImpl` writes `New(TypeTree(e.tpe))`, so this is needed.
 
-#### 検証
+#### Validation
 
-- `tests/fixtures/ex_impl.scala` + `tests/fixtures/ex_use.scala` — scala-rs で
-  2 段コンパイルして実行し、`tests/fixtures/expected/ex_use.txt` と一致する
-  （`java -Xverify:all`）。**同じ 2 ファイルを実 scalac 2.13.16 でも 2 段
-  コンパイルして実行し、同じ 10 行になることを別テストで固定**している。
-  出力には `weakTypeOf[ExBox[E]].toString`（＝合成したタグの型）と
-  `c.prefix.staticType.toString` が含まれるので、**タグと prefix の作り方が
-  nsc と違えば行が変わる**。
-- `tests/fixtures/tt_tags.scala` — マクロの外の materialisation。
-  `List[Int]` / `Option[Foo]` / `List[List[Int]]` を追加し、実 scalac と
-  `tag.tpe` の文字列まで一致することを固定した（従来は名指しで断っていた）。
-- `tests/fixtures/ex_notag_bad.scala` — 合成できないタグ。
-- `tests/fixtures/ex_gaps_bad.scala` — 運べないレシーバ 2 種。
-  どちらも実 scalac は通るので、scala-rs 側の穴を固定した fixture である。
+- `tests/fixtures/ex_impl.scala` + `tests/fixtures/ex_use.scala` — compiled in two stages with
+  scala-rs and run, matching `tests/fixtures/expected/ex_use.txt` (`java -Xverify:all`).
+  **A separate test pins that the same two files, compiled in two stages by the real scalac 2.13.16
+  and run, produce the same 10 lines.** The output includes
+  `weakTypeOf[ExBox[E]].toString` (i.e. the type of the synthesized tag) and
+  `c.prefix.staticType.toString`, so **if we built the tag or the prefix differently from nsc, the
+  lines would change**.
+- `tests/fixtures/tt_tags.scala` — materialisation outside a macro. We added
+  `List[Int]` / `Option[Foo]` / `List[List[Int]]` and pinned that even the string of `tag.tpe` matches
+  the real scalac (previously these were refused by name).
+- `tests/fixtures/ex_notag_bad.scala` — tags that cannot be synthesized.
+- `tests/fixtures/ex_gaps_bad.scala` — the two kinds of receiver we cannot carry.
+  The real scalac accepts both, so these fixtures pin holes on the scala-rs side.
 
-#### このスライスのあとに残っているもの
+#### What remains after this slice
 
-1. **`c.prefix` に `This` を作れない。** レシーバを書かずに呼んだマクロは
-   nsc なら `This(<囲むクラス>)` が prefix になる。`ex_gaps_bad.scala` が
-   名指しで固定している。
-2. **引数・レシーバの木は「書かれた構文」のまま**（§7.11 残件 3）。
-   `new`・ブロック・関数リテラルは運べない。§4.3 の「型付き木のまま渡す」は
-   未実装で、slick の `mapToImpl` は `c.prefix` の**木**しか見ないので
-   そこは足りるが、`ShapedValue(...)` のような式をレシーバに書かれると届かない。
-3. **展開結果に `Function` / `ValDef` / `Modifiers` を作れない。**
-   slick の `TableQueryMacroImpl` は `Function(List(ValDef(…)), …)` を
-   `TableQuery.apply[E](cons)` に渡すので、**本物の slick に効かせるには
-   これが要る**。いまは名指しで断る。
-4. **`reify`。** `TableQueryMacroImpl` の最後の 1 行は `reify { … }` で、
-   これは fast track マクロなので JVM ブリッジでは展開できない（§6.2）。
-   実装を scala-rs でコンパイルするには自前の reify が要る（§7.8 に診断あり）。
-5. 推論された型引数がタグにならない（§7.11 残件 2）、`TypeTree` に型引数を
-   埋められない（同 5）、whitebox（同 6）、`@macroImpl` の pickle（同 7）は
-   そのまま。
+1. **We cannot build a `This` for `c.prefix`.** For a macro called without writing a receiver, nsc's
+   prefix is `This(<the enclosing class>)`. `ex_gaps_bad.scala` pins this by name.
+2. **Argument and receiver trees are still "the syntax that was written"** (item 3 of the §7.11 list).
+   `new`, blocks and function literals cannot be carried. "Passing typed trees as they are" from §4.3
+   is unimplemented; slick's `mapToImpl` looks only at the **tree** of `c.prefix`, so that much
+   suffices, but an expression like `ShapedValue(...)` written as the receiver would not get through.
+3. **We cannot build `Function` / `ValDef` / `Modifiers` in expansion results.**
+   Slick's `TableQueryMacroImpl` passes `Function(List(ValDef(…)), …)` to `TableQuery.apply[E](cons)`,
+   so **this is required to make real slick work**. Today it is refused by name.
+4. **`reify`.** The last line of `TableQueryMacroImpl` is `reify { … }`, and being a fast track macro
+   it cannot be expanded through the JVM bridge (§6.2). Compiling the implementation with scala-rs
+   requires our own reify (the diagnostic is in §7.8).
+5. Inferred type arguments not becoming tags (item 2 of the §7.11 list), type arguments not embeddable
+   in a `TypeTree` (item 5 there), whitebox (item 6) and the `@macroImpl` pickle (item 7) are all
+   unchanged.
 
-#### slick への効き方
+#### How this affects slick
 
-`tests/slick_measure.sh` は `errors=177 → 177`、`files_with_errors=57 → 57`。
-`tests/slick_subset.sh` は `38 files / 204 classes / verified=204 failed=0` のまま。
-**数字は動かない。** §7.11 に書いたとおり、slick の 2 マクロは
-「def と実装が同じ run にある」ので nsc でも展開できない形であり、
-段階 D（slick を 2 段コンパイルする実験）には上の残件 3・4 が要る。
-このスライスが動かしたのは「slick の 2 マクロと**同じ形**のマクロを
-書いて展開できる」ところまでである。
+`tests/slick_measure.sh` gives `errors=177 → 177` and `files_with_errors=57 → 57`.
+`tests/slick_subset.sh` stays at `38 files / 204 classes / verified=204 failed=0`.
+**The numbers do not move.** As written in §7.11, slick's two macros are in the shape "def and
+implementation in the same run", which nsc cannot expand either, and stage D (the experiment of
+compiling slick in two stages) needs items 3 and 4 above.
+What this slice moves is only as far as "we can write and expand a macro of **the same shape** as
+slick's two macros".
 
-### 7.13 段階 D-1: 展開結果の `Function` / `ValDef`（`agent/staged` スライス）
+### 7.13 Stage D-1: `Function` / `ValDef` in expansion results (the `agent/staged` slice)
 
-§7.12 の残件 3。**展開結果に `Function` と `ValDef` を作れるようになった**ので、
-slick の `TableQueryMacroImpl.apply` が組む木——
-
+Item 3 of the §7.12 list. **We can now build `Function` and `ValDef` in an expansion result**, so the
+tree slick's `TableQueryMacroImpl.apply` assembles —
 ```scala
 Function(
   List(ValDef(Modifiers(Flag.PARAM), TermName("tag"),
@@ -1746,76 +1814,74 @@ Function(
         List(Ident(TermName("tag")))))
 ```
 
-——が丸ごと往復し、展開後のプログラムが走る。実 scalac 2.13.16 と 2 段コンパイルで
-dual-run し、出力が完全一致する（`tests/fixtures/sd_impl.scala` +
-`tests/fixtures/sd_use.scala`）。
+— makes the full round trip, and the expanded program runs. It is dual-run in two-stage compilation
+against the real scalac 2.13.16 and the output matches exactly (`tests/fixtures/sd_impl.scala` +
+`tests/fixtures/sd_use.scala`).
 
-#### 1. `Modifiers` は**名前**で運ぶ
+#### 1. `Modifiers` is carried **by name**
 
-`ValDef` を作るには `Modifiers` が要る。engine は `productElement` を
-そのまま流すので、これまで `Modifiers` は `(o "Modifiers(PARAM)")` という
-`toString` になっていた。
+Building a `ValDef` requires `Modifiers`. Since the engine forwards `productElement` as is,
+`Modifiers` used to come across as the `toString` `(o "Modifiers(PARAM)")`.
 
-数値（`FlagSet` は `Long`）を送る案は採らない。nsc のビット配置は内部仕様で、
-しかも **1 つのビットに 2 つの名前が乗っている**（`BYNAMEPARAM` は `COVARIANT`、
-`DEFAULTPARAM` は `TRAIT`）。そこで engine は `universe.Flag` の
-**0 引数・戻り値 `long` のメソッドを反射で列挙**し、立っているビットの名前を
-すべて書く。名前の付かなかった残りビットは 16 進数で添える。
+We do not send the number (a `FlagSet` is a `Long`). nsc's bit layout is an internal detail, and
+moreover **one bit carries two names** (`BYNAMEPARAM` is `COVARIANT`, `DEFAULTPARAM` is `TRAIT`).
+So the engine **reflectively enumerates the zero-argument, `long`-returning methods of
+`universe.Flag`** and writes out the name of every bit that is set. Leftover bits with no name are
+appended in hexadecimal.
 
 ```
 (mods (f "PARAM") (rest "0") "" (l))
 ```
 
-Rust 側は名前を自分の `Flags` に写す。**表に無い名前と、名前の付かない残りビットは
-どちらも診断**である（`the expansion contains a definition marked `DEFERRED`,
-a modifier scala-rs cannot rebuild yet`）。黙って落とすと `var` を `val` に、
-`lazy val` を正格な `val` に組み替えてしまい、誰も気づかない。
-2 つ名前のあるビットは、**この展開器が組む唯一の定義である `ValDef` としての
-読み**を採る（`BYNAMEPARAM` / `DEFAULTPARAM`）。`privateWithin` と
-アノテーションも運ぶ（アノテーション付きは現状 診断）。
+The Rust side maps the names onto its own `Flags`. **Both a name that is not in the table and unnamed
+leftover bits are diagnostics** (`the expansion contains a definition marked `DEFERRED`, a modifier
+scala-rs cannot rebuild yet`). Dropping them silently would turn a `var` into a `val` and a
+`lazy val` into a strict `val`, and nobody would notice.
+For bits with two names we take **the reading appropriate to a `ValDef`**, the only kind of definition
+this expander builds (`BYNAMEPARAM` / `DEFAULTPARAM`). `privateWithin` and annotations are carried
+too (annotated ones are currently a diagnostic).
 
-#### 2. 道中で塞いだ 3 つの一般の穴
+#### 2. Three general holes plugged along the way
 
-| 直したもの | どこ | 影響 |
+| What was fixed | Where | Impact |
 | --- | --- | --- |
-| **`import c.universe._` が暗黙の `import scala._` に負けていた。** `expose_unqualified` は「囲むパッケージ → `scala._` → `java.lang._` → root → **wildcard import**」の順で探していた。SLS 2 では明示の import の方が上（`scala._` / `java.lang._` は最外側の wildcard import）。そのため `Function(vparams, body)` は `scala.Function`（`apply` を持たないオブジェクト）に解決し、**slick が書いているマクロ実装をそもそもコンパイルできなかった** | `Check::expose_from_wildcards` | wildcard 段を `scala._` の前に出した。eager に入る名前は現行スコープにあるのでこの経路を通らず、影響は「pickle から遅延で読む名前」に限られる |
-| **`scala.Int` と書くと primitive にならなかった。** パスとして書かれた `scala.Int` はパッケージのメンバ探索に当たって `Type::Class` になる。表示は `Int` なのに何とも等しくないので `val x: scala.Int = 1` が `type mismatch; found: 1  required: Int` だった | `check::scala_value_type` | 展開結果の `TypeTree(typeOf[Int])` は完全名で届くので、この経路がそのまま必要 |
-| **タプル・関数型・配列のタグが作れなかった**（§7.12 の既知の残件） | `Check::tag_body` | `scala.TupleN` / `scala.FunctionN` / `scala.Array` を名指しして §7.12 の `appliedType` 合成に乗せる。slick の `c.Expr[Tag => E]` がこれを要求する。`tt_tags.scala` が実 scalac と `toString` まで一致することを固定 |
+| **`import c.universe._` was losing to the implicit `import scala._`.** `expose_unqualified` searched in the order "enclosing package → `scala._` → `java.lang._` → root → **wildcard imports**". Under SLS 2 an explicit import ranks higher (`scala._` / `java.lang._` are the outermost wildcard imports). So `Function(vparams, body)` resolved to `scala.Function` (an object with no `apply`), and **the macro implementation slick actually writes could not be compiled at all** | `Check::expose_from_wildcards` | The wildcard stage was moved ahead of `scala._`. Names installed eagerly are already in the current scope and never take this path, so the effect is limited to "names read lazily from the pickle" |
+| **Writing `scala.Int` did not give a primitive.** Written as a path, `scala.Int` hits package member lookup and becomes a `Type::Class`. It renders as `Int` but is equal to nothing, so `val x: scala.Int = 1` gave `type mismatch; found: 1  required: Int` | `check::scala_value_type` | A `TypeTree(typeOf[Int])` in an expansion result arrives as a fully qualified name, so this path is needed as is |
+| **Tags for tuples, function types and arrays could not be built** (the known remainder from §7.12) | `Check::tag_body` | Name `scala.TupleN` / `scala.FunctionN` / `scala.Array` explicitly and put them on the `appliedType` synthesis of §7.12. Slick's `c.Expr[Tag => E]` demands this. `tt_tags.scala` pins that even `toString` matches the real scalac |
 
-#### 検証
+#### Validation
 
-- `tests/fixtures/sd_impl.scala` + `tests/fixtures/sd_use.scala` — scala-rs で
-  2 段コンパイルして実行し、`tests/fixtures/expected/sd_use.txt` と一致する
-  （`java -Xverify:all`）。**同じ 2 ファイルを実 scalac 2.13.16 でも 2 段
-  コンパイルして実行し、同じ 6 行になることを別テストで固定**している。
-  パラメータ名を取り違えた `Function`、修飾子を落とした `ValDef` は
-  どちらもコンパイルは通ってしまうので、**出力の比較だけが捕まえられる**。
-- `tests/fixtures/sd_gaps_bad.scala` — 断る 2 形。
-- `tests/fixtures/tt_tags.scala` — タプル・関数型・配列のタグを追加。
+- `tests/fixtures/sd_impl.scala` + `tests/fixtures/sd_use.scala` — compiled in two stages with
+  scala-rs and run, matching `tests/fixtures/expected/sd_use.txt` (`java -Xverify:all`).
+  **A separate test pins that the same two files, compiled in two stages by the real scalac 2.13.16
+  and run, produce the same 6 lines.** A `Function` with the parameter names mixed up, or a `ValDef`
+  with the modifiers dropped, both still compile, so **only comparing the output can catch them**.
+- `tests/fixtures/sd_gaps_bad.scala` — the two shapes we refuse.
+- `tests/fixtures/tt_tags.scala` — tags for tuples, function types and arrays added.
 
-#### 3. 引数を取らないマクロの結果を適用する形
+#### 3. Applying the result of a macro that takes no arguments
 
-`SdUse.adder(20, 22)` で `adder` が**引数を取らない**マクロのとき、
-`Apply` はマクロ自身の引数節ではなく**展開結果への適用**である。
-展開器は `Apply` を無条件に剥がしていたので
-`the implementation takes 0 argument(s) and the call site supplies 2` という
-——実 scalac が通す呼び出しに対する——誤った診断を出していた。
+In `SdUse.adder(20, 22)`, when `adder` is a macro that **takes no arguments**, the `Apply` is not the
+macro's own argument clause but **an application of the expansion result**. The expander was stripping
+`Apply` unconditionally, so it produced the incorrect diagnostic
+`the implementation takes 0 argument(s) and the call site supplies 2` — against a call the real scalac
+accepts.
 
-マクロ def 自身のパラメータ節の数（シンボルの `Type::Method` の `paramss`）を
-数え、多い分は**中に入って**そこで展開する。層は素の `Apply` とは限らず、
-関数値の適用は typer が挟む `apply` 選択を通るので、層数を数えて降りるのでは
-なく「頭が当のマクロで、節の数がちょうど合う」ノードを探す
-（`macro_application_node`）。外側の `Apply` はマクロ def のシンボルを
-**持ったまま**なので落とす。残しておくと `report_macro_calls` が
-「展開されていないマクロ」を——理由の文字列すら無い形で——報告する。
+We now count the macro def's own parameter clauses (the `paramss` of the symbol's `Type::Method`) and
+**descend into** any excess layers, expanding there. The layers are not necessarily plain `Apply`s:
+applying a function value goes through an `apply` selection the typer inserts, so rather than counting
+layers and descending, we look for the node "whose head is that macro and whose clause count matches
+exactly" (`macro_application_node`). The outer `Apply` **still holds** the macro def's symbol, so we
+drop it. Leaving it in makes `report_macro_calls` report "an unexpanded macro" — in a form that does
+not even have a reason string.
 
-#### 4. `reify` に足りないもの（D-2 の調査結果）
+#### 4. What `reify` still lacks (findings for D-2)
 
-段階 D-2（自前の `reify`）は**このスライスでは実装していない**。
-設計は確定し、**組むべき木が実 scalac 2.13.16 で通ることまで確認した**が、
-その手前に scala-rs 側の穴が 3 つ残っている。
+Stage D-2 (our own `reify`) is **not implemented in this slice**. The design is settled, and
+**we have confirmed that the tree we would need to build is accepted by the real scalac 2.13.16**, but
+three holes remain on the scala-rs side before it.
 
-`reify { … }` が展開されるべき形は（nsc の `-Xprint:typer` と同じ）:
+The shape `reify { … }` should expand into (the same as nsc's `-Xprint:typer`):
 
 ```scala
 {
@@ -1823,7 +1889,7 @@ a modifier scala-rs cannot rebuild yet`）。黙って落とすと `var` を `va
     def apply[U <: scala.reflect.api.Universe with Singleton](
         m: scala.reflect.api.Mirror[U]): U#Tree = {
       val u = m.universe
-      u.internal.reificationSupport.SyntacticApplied(…)   // ← §7.1 の reifier
+      u.internal.reificationSupport.SyntacticApplied(…)   // ← the reifier of §7.1
     }
   }
   c.universe.Expr.apply[T](
@@ -1832,173 +1898,164 @@ a modifier scala-rs cannot rebuild yet`）。黙って落とすと `var` を `va
 }
 ```
 
-**この形は実 scalac が受理する**（`u.internal.reificationSupport.Syntactic*` を
-パス依存の `U` 越しに呼ぶところも含めて）。つまり
-`crates/typer/src/reify.rs` の reifier に universe として
-`m.universe` を渡せば、本体はそのまま流用できる——
-`crates/typer/src/materialize.rs` の `TypeCreator` 合成が
-`TreeCreator` 版のひな型になる。
+**This shape is accepted by the real scalac** (including calling
+`u.internal.reificationSupport.Syntactic*` through the path-dependent `U`). That is, if we hand the
+reifier in `crates/typer/src/reify.rs` `m.universe` as its universe, the body can be reused as is —
+and the `TypeCreator` synthesis in `crates/typer/src/materialize.rs` is the template for the
+`TreeCreator` version.
 
-scala-rs 側で塞がっていない穴は 3 つで、いずれも `reify` 以前の問題である:
+Three holes remain unplugged on the scala-rs side, all of them problems that come before `reify`:
 
-| 穴 | 症状 |
+| Hole | Symptom |
 | --- | --- |
-| universe の**入れ子オブジェクト**がパスからも wildcard import からも引けない | `c.universe.Expr` は `value Expr is not a member of Universe`、`import c.universe._` 下の `Expr` は `not found: value Expr`。`Exprs.Expr` は trait の中の `object` で、`PickleSupply` が供給していない（§7.8 残件 5 と同じ穴） |
-| `c.universe` が**安定識別子**として型に書けない | `Mirror[c.universe.type]` が `stable identifier required, but c.universe found`（§7.8 残件 6）。`c.universe` は `val` なので安定のはず。合成側は `RESOLVED_TYPE` で型を直接埋めれば避けられるが、穴自体は残る |
-| reify 本体の**衛生性** | nsc の reify は*型付き*の木を作るので、`TableQuery` は `staticModule("slick.lifted.TableQuery")` に解決される。§7.1 の reifier は書かれた名前をそのまま `SyntacticTermIdent` にするので、展開先のスコープで解決される。静的シンボルは `_root_.` 付き完全パスに書き換え、それ以外（ローカル・パラメータ）は**名指しで断る**、というのが設計だが未実装 |
+| **Nested objects** of the universe cannot be reached through a path or through a wildcard import | `c.universe.Expr` gives `value Expr is not a member of Universe`, and `Expr` under `import c.universe._` gives `not found: value Expr`. `Exprs.Expr` is an `object` inside a trait, which `PickleSupply` does not supply (the same hole as item 5 of the §7.8 list) |
+| `c.universe` cannot be written in a type as a **stable identifier** | `Mirror[c.universe.type]` gives `stable identifier required, but c.universe found` (item 6 of the §7.8 list). `c.universe` is a `val` and so ought to be stable. The synthesis side can avoid it by embedding the type directly with `RESOLVED_TYPE`, but the hole itself remains |
+| **Hygiene** of the reify body | nsc's reify builds *typed* trees, so `TableQuery` resolves to `staticModule("slick.lifted.TableQuery")`. The reifier of §7.1 turns the written name into a `SyntacticTermIdent` as is, so it gets resolved in the scope of the expansion site. The design is to rewrite static symbols into fully qualified paths with `_root_.` and to **refuse everything else (locals, parameters) by name**, but it is unimplemented |
 
-したがって `reify { … }` は §7.8 の診断のままである。
+So `reify { … }` still gives the §7.8 diagnostic.
 
-#### このスライスのあとに残っているもの
+#### What remains after this slice
 
-1. **展開の型引数が「前の run のクラス」でなければならない。**
-   タグは `staticClass(<完全名>)` で組むので、engine の mirror が
-   解決できるのは**マクロ classpath にあるクラスだけ**である。
-   `TableQuery[Coffees]` のように *同じ run* で定義する行クラスは
-   まだ渡せない（`sd_gaps_bad.scala` が固定）。nsc はコンパイラ自身の
-   universe を使うのでこの制約が無い。**本物の slick の利用側**を
-   通すにはここが要る。
-2. **`reify`**（上の 4）、**`c.prefix` の `This`**（§7.12 残件 1）、
-   **型付き木のまま渡す**（同 2）はそのまま。
-3. **`TableQuery.apply[E](cons.splice)` のオーバーロード選択。**
-   `TableQuery.apply` は「引数 1 つ」と「引数無し（マクロ）」の 2 つがあり、
-   scala-rs は後者を選んでから結果に `(cons.splice)` を適用しようとして
-   `value apply is not a member of TableQuery[E]` になる。nsc は前者を選ぶ。
-   本物の `TableQuery.scala` を通すのに要る 3 件のうちの 1 つ
-   （残り 2 件は `reify` と、マクロと無関係な
-   `new BaseTag { base => … }` の自己名 `base` が引けないこと）。
+1. **An expansion's type argument has to be "a class from a previous run".**
+   Since tags are built with `staticClass(<fully qualified name>)`, the engine's mirror can resolve
+   **only classes on the macro classpath**. A row class defined in the *same run*, as in
+   `TableQuery[Coffees]`, cannot be passed yet (pinned by `sd_gaps_bad.scala`). nsc uses the
+   compiler's own universe and has no such restriction. **Getting real slick's usage side** through
+   requires this.
+2. **`reify`** (item 4 above), **`This` for `c.prefix`** (item 1 of the §7.12 list) and
+   **passing typed trees as they are** (item 2 there) are unchanged.
+3. **Overload selection for `TableQuery.apply[E](cons.splice)`.**
+   `TableQuery.apply` has two forms, "one argument" and "no arguments (the macro)", and scala-rs picks
+   the latter and then tries to apply `(cons.splice)` to the result, giving
+   `value apply is not a member of TableQuery[E]`. nsc picks the former.
+   One of the three things needed to get the real `TableQuery.scala` through (the other two are
+   `reify`, and — unrelated to macros — the self name `base` of `new BaseTag { base => … }` not being
+   resolvable).
 
-#### slick への効き方
+#### How this affects slick
 
-`tests/slick_measure.sh` は `errors=155 → 154`、`files_with_errors=52 → 52`。
-`tests/slick_subset.sh` は `38 files / 204 classes / verified=204 failed=0` のまま。
-減った 1 件は `TableQuery.scala` の `c.Expr[Tag => E]`（関数型のタグ）である。
-残りは §7.12 と同じく、slick の 2 マクロが「def と実装が同じ run にある」形
-だからで、段階 D-3 には `reify` が要る。
+`tests/slick_measure.sh` gives `errors=155 → 154` and `files_with_errors=52 → 52`.
+`tests/slick_subset.sh` stays at `38 files / 204 classes / verified=204 failed=0`.
+The one that went away is `c.Expr[Tag => E]` (a function-type tag) in `TableQuery.scala`.
+The rest is as in §7.12: slick's two macros are in the "def and implementation in the same run" shape,
+and stage D-3 needs `reify`.
 
-### 7.14 段階 D-2 の手前: 入れ子 `object` と `<val>.type`（`agent/reifyd` スライス）
+### 7.14 Just before stage D-2: nested `object`s and `<val>.type` (the `agent/reifyd` slice)
 
-§7.13.4 が名指しした 3 つの穴のうち、**1 と 2 を塞いだ**。どちらも `reify`
-専用ではなく一般の機能追加で、マクロと無関係なコードにも効く。3（reify 本体の
-衛生性）と `reify` の展開そのものは**このスライスでも未実装**であり、診断は
-§7.8 のままである。
+Of the three holes named in §7.13.4, **1 and 2 are now plugged**. Neither is `reify`-specific; both
+are general features that also help code unrelated to macros. Item 3 (hygiene of the reify body) and
+the expansion of `reify` itself are **still unimplemented in this slice**, and the diagnostic is
+still the one from §7.8.
 
-#### 1. trait の中の `object` が供給されていなかった（§7.8 残件 5）
+#### 1. `object`s inside a trait were not being supplied (item 5 of the §7.8 list)
 
-`trait Exprs { object Expr { … } }` は、インタフェースメソッド
-`Expr()Lscala/reflect/api/Exprs$Expr$;` と module 自身の classfile に落ちる。
-`PickleSupply::complete_named` は pickle の `Def` と `Val` しか読まないので、
-`MemberKind::Module` のエントリは**丸ごと捨てられて**いた。結果、
+`trait Exprs { object Expr { … } }` compiles to an interface method
+`Expr()Lscala/reflect/api/Exprs$Expr$;` plus the module's own classfile.
+`PickleSupply::complete_named` reads only `Def` and `Val` from the pickle, so
+`MemberKind::Module` entries were **discarded entirely**. As a result,
 
 - `c.universe.Expr` → `value Expr is not a member of Universe`
-- `import c.universe._` 下の `Expr` → `not found: value Expr`
+- `Expr` under `import c.universe._` → `not found: value Expr`
 
-という、どちらも**嘘**の診断になっていた（メンバは pickle にある）。
+both of which are **lies** (the member is in the pickle).
 
-`PickleSupply::install_nested_module` を足した。module class を
-`Outer$Name$` の JVM 名で入れ、**`class_sym`（探索を始めた受け手のクラス）**に
-0 引数のアクセサを立てる。宣言元の trait に置く案は捨てた:
-`Check::qualify_term_import` は「メンバの owner」を import 接頭辞のクラスと
-突き合わせて `import u._` 下の裸の名前を `u.name` に戻すのだが、ライブラリ
-クラスの pickle 親は 1 段ずつしか繋がらないので、linearisation の遠くにある
-trait に置いたアクセサは「この import のもの」と認識されず、
-`Main$.Expr()` を吐いて `ClassCastException` になった。`install` と同じ
-規約（受け手のクラスに入れる）が正しい。
+We added `PickleSupply::install_nested_module`. It installs the module class under the JVM name
+`Outer$Name$` and erects a zero-argument accessor on **`class_sym` (the receiver class the search
+started from)**. We abandoned the idea of putting it on the declaring trait:
+`Check::qualify_term_import` matches "the member's owner" against the import prefix's class to rewrite
+a bare name under `import u._` back to `u.name`, but the pickle parents of library classes are linked
+only one step at a time, so an accessor placed on a trait far away in the linearisation was not
+recognized as "belonging to this import" and we emitted `Main$.Expr()`, giving a
+`ClassCastException`. The same convention as `install` (install on the receiver class) is the correct
+one.
 
-呼び出し先は `erased_desc` に決めさせる。`api/JavaUniverse` の classfile は
-`interfaces: 0` なので、`invokevirtual JavaUniverse.Expr()` は解決しない
-（`NoSuchMethodError`）。`declaring_class` / `declaring_is_interface` を
-記録し、`checkcast` を挟んでそのクラスを名指しする — nsc と同じ形である。
+We let `erased_desc` decide the call target. The classfile of `api/JavaUniverse` has `interfaces: 0`,
+so `invokevirtual JavaUniverse.Expr()` does not resolve (`NoSuchMethodError`). We record
+`declaring_class` / `declaring_is_interface` and name that class with a `checkcast` in between — the
+same shape as nsc.
 
-classfile 由来の**壊れたアクセサは修理する**。`adopt_binary_class` が
-`Exprs.class` を読むと descriptor から `def Expr(): Exprs$Expr$` を入れるが、
-`Exprs$Expr$` のシンボルは誰も作っていないので戻り値は未解決の
-`Type::Named` のまま、`class_sym_of` が `None` を返し
-`c.universe.Expr.apply` は `value apply is not a member of Exprs$Expr$` に
-なっていた。解決済みの戻り値は**触らない**（精度は足すが、メンバは奪わない）。
+**Broken accessors originating from classfiles are repaired.** When `adopt_binary_class` reads
+`Exprs.class` it installs `def Expr(): Exprs$Expr$` from the descriptor, but since nobody has created
+a symbol for `Exprs$Expr$` the return type stays an unresolved `Type::Named`, `class_sym_of` returns
+`None` and `c.universe.Expr.apply` gave `value apply is not a member of Exprs$Expr$`.
+Return types that are already resolved are **left alone** (we add precision but never take members
+away).
 
-`materialize::ensure_tag_module` は「module class があること」を仕事済みの
-印にしていたが、この供給が先に module class を作るようになったので、
-印を **`apply` があること**に変えた。アクセサの二重登録も、同じ module class
-を指すものが既にあれば足さない、という条件に変えてある。
+`materialize::ensure_tag_module` used to treat "there is a module class" as the marker that its job
+was done, but since this supply path now creates the module class first, the marker was changed to
+**"there is an `apply`"**. Double registration of the accessor was likewise changed to "do not add one
+if there is already one pointing at the same module class".
 
-#### 2. `c.universe` が安定識別子として型に書けなかった（§7.8 残件 6）
+#### 2. `c.universe` could not be written as a stable identifier in a type (item 6 of the §7.8 list)
 
-`Mirror[c.universe.type]` が `stable identifier required, but c.universe
-found`。原因は `member_is_stable` ではなく **`Check::term_path_sym`** で、
-`SymKind::Term | Module | ModuleClass` しか受けていなかった。pickle から
-読んだ `val` は 0 引数の **`SymKind::Method`**（classfile は `val` の
-アクセサと素の `def` を区別できない）に `Flags::ACCESSOR` を立てて入るので、
-これが落ちていた。`c.universe.Tree` は `path_dependent_type` を通り
-`member_is_stable`（こちらは `ACCESSOR` を見る）しか呼ばないので通っていた、
-という食い違いである。
+`Mirror[c.universe.type]` gave `stable identifier required, but c.universe found`. The cause was not
+`member_is_stable` but **`Check::term_path_sym`**, which accepted only
+`SymKind::Term | Module | ModuleClass`. A `val` read from a pickle is installed as a zero-argument
+**`SymKind::Method`** (a classfile cannot distinguish a `val` accessor from a plain `def`) with
+`Flags::ACCESSOR` set, so it was being dropped. The inconsistency is that `c.universe.Tree` goes
+through `path_dependent_type` and only calls `member_is_stable` (which does look at `ACCESSOR`), so
+it worked.
 
-`Type::SingleType { sym }` の読み手 3 か所（`class_sym_of` /
-`expand_in_type` / `erase_ty`）は `sym.ty` をそのまま見ていたので、
-0 引数 `Method` を結果型に開く `SymbolTable::singleton_underlying` を通す。
+The three readers of `Type::SingleType { sym }` (`class_sym_of` / `expand_in_type` / `erase_ty`) were
+looking at `sym.ty` directly, so they now go through `SymbolTable::singleton_underlying`, which opens
+a zero-argument `Method` into its result type.
 
-#### 3. 道中で塞いだ 3 つの一般の穴（いずれも**黙って壊れる**形だった）
+#### 3. Three general holes plugged along the way (all of them **silently broken** shapes)
 
-| 直したもの | どこ | 症状 |
+| What was fixed | Where | Symptom |
 | --- | --- | --- |
-| **メソッドの引数がそのメソッドの「メンバ」に見えていた。** `install` は引数シンボルを method の owner 下に確保するので、`qual.sym` がメソッド（＝適用の被呼側）のとき `lookup_member(qual.sym, name)` がそれを拾う | `Check::type_select` の `qual.sym` フォールバック | `m.staticClass(n).fullName` が `staticClass` の**引数 `fullName`** に解決し、codegen が「所有者クラス＝メソッドの erased descriptor」で `Fieldref` を吐いた。`ClassFormatError: Illegal class name "(Ljava/lang/String;)L…;"` — **コンパイルは無言で成功する** |
-| **括弧なし選択で `declaring_class` の `checkcast` が抜けていた。** `Apply` 経路は `checkcast_erased_method_receiver` で入れているのに、`Select` 単独の経路には無かった | `gen::gen_select` の `SymKind::Method` 枝 | `u.Expr` が `JavaUniverse` をスタックに積んだまま `invokevirtual Universe.Expr()`。`VerifyError` |
-| **メンバ `object` の受け手が捨てられていた。** 修飾子が 0 引数アクセサ（型が `Type::Method`）だと `class_sym_of` が答えられず、また pickle 親が繋がっていないと `is_owner_compatible` も偽になるので、`load_module_instance` に落ちて**囲む source クラスの `this`** を積んでいた | `gen::gen_module_member_receiver` | `universe.Liftable[String](f)` が `aload_0` を積み `ClassCastException: Main$ cannot be cast to scala.reflect.api.Liftables`。**コンパイルは無言で成功する** |
+| **A method's parameters looked like "members" of that method.** `install` allocates parameter symbols under the method's owner, so when `qual.sym` is a method (i.e. the callee of an application), `lookup_member(qual.sym, name)` picks them up | the `qual.sym` fallback in `Check::type_select` | `m.staticClass(n).fullName` resolved to `staticClass`'s **parameter `fullName`**, and codegen emitted a `Fieldref` with "owner class = the method's erased descriptor". `ClassFormatError: Illegal class name "(Ljava/lang/String;)L…;"` — **the compile succeeds silently** |
+| **The `declaring_class` `checkcast` was missing on parenless selections.** The `Apply` path inserts it via `checkcast_erased_method_receiver`, but the standalone `Select` path did not | the `SymKind::Method` branch of `gen::gen_select` | `u.Expr` left `JavaUniverse` on the stack and did `invokevirtual Universe.Expr()`. `VerifyError` |
+| **The receiver of a member `object` was being thrown away.** When the qualifier is a zero-argument accessor (its type is a `Type::Method`), `class_sym_of` cannot answer, and if the pickle parents are not linked `is_owner_compatible` is false as well, so we fell through to `load_module_instance` and pushed **the `this` of the enclosing source class** | `gen::gen_module_member_receiver` | `universe.Liftable[String](f)` pushed `aload_0` and gave `ClassCastException: Main$ cannot be cast to scala.reflect.api.Liftables`. **The compile succeeds silently** |
 
-`gen_receiver` の `TypeApply` / `Typed` も剥がすようにした（`o.P.apply[T](x)`
-は関数が `TypeApply` に包まれていて、フォールバック枝が `fun.sym` しか見て
-いなかった）。
+We also made `gen_receiver` strip `TypeApply` / `Typed` (in `o.P.apply[T](x)` the function is wrapped
+in a `TypeApply`, and the fallback branch was looking only at `fun.sym`).
 
-#### 検証
+#### Validation
 
-- `tests/fixtures/rd_nested.scala` — 実行時 universe に対して、パス越しと
-  wildcard import 越しの入れ子 `object`（`Expr` / `Liftable`）と
-  `Mirror[scala.reflect.runtime.universe.type]` を使い、5 行印字する。
-  **実 scalac 2.13.16 でも同じ 5 行**（`tests/fixtures/expected/rd_nested.txt`）。
-  受け手を取り違えた member object はコンパイルが通ってしまうので、
-  **走らせる以外に捕まえる方法が無い**。
-- `tests/fixtures/rd_impl.scala` + `tests/fixtures/rd_use.scala` — **`reify`
-  が展開されるべき形を手書きし、実際に展開して走らせる**。下の 4 を参照。
-  `rd_impl` は `c.universe.Expr` をパス越しと wildcard import 越しに、
-  `Mirror[c.universe.type]` を型引数に使い、`TreeCreator` を 3 つ組む。
-  scala-rs で 2 段コンパイルして実行すると 3 行になり、**同じ 2 ファイルを
-  実 scalac 2.13.16 で 2 段コンパイルして実行しても同じ 3 行**である
-  （`tests/fixtures/expected/rd_use.txt`）。静的シンボルを別の universe で
-  解決した creator も、splice を rebase し忘れた creator も**コンパイルは
-  通る**ので、出力の比較だけが捕まえられる。
+- `tests/fixtures/rd_nested.scala` — against the runtime universe, uses nested `object`s
+  (`Expr` / `Liftable`) through a path and through a wildcard import, plus
+  `Mirror[scala.reflect.runtime.universe.type]`, printing 5 lines.
+  **The real scalac 2.13.16 produces the same 5 lines**
+  (`tests/fixtures/expected/rd_nested.txt`). A member object with the wrong receiver still compiles,
+  so **there is no way to catch it other than running it**.
+- `tests/fixtures/rd_impl.scala` + `tests/fixtures/rd_use.scala` — **the `reify`
+  shape, written out by hand and actually expanded and run**. See item 4 below.
+  `rd_impl` uses `c.universe.Expr` both through a path and through a wildcard import, uses
+  `Mirror[c.universe.type]` as a type argument, and builds three `TreeCreator`s.
+  Compiled in two stages with scala-rs and run it prints 3 lines, and **the same two files, compiled
+  in two stages by the real scalac 2.13.16 and run, give the same 3 lines**
+  (`tests/fixtures/expected/rd_use.txt`). A creator that resolved a static symbol in a different
+  universe, and one that forgot to rebase a splice, **both compile**, so only comparing the output
+  can catch them.
 
-#### 4. `Exprs#Expr.apply` を手書きする
+#### 4. Writing `Exprs#Expr.apply` out by hand
 
-`reify` の展開は最後に `c.universe.Expr.apply[T](mirror, creator)` を呼ぶ。
-`Expr` が引けるようになっても、この `apply` は**呼べなかった**:
-pickle の署名は
+The expansion of `reify` ends by calling `c.universe.Expr.apply[T](mirror, creator)`. Even once `Expr`
+became reachable, this `apply` **could not be called**: the pickle's signature is
 
 ```text
 def apply[T](mirror1: Mirror[Universe.this.type], treec: TreeCreator)
             (implicit tag: WeakTypeTag[T]): Expr[T]
 ```
 
-で、`Universe.this.type` は「完了中のクラス」に対して変換されるのだが、
-それは module `Expr$` 自身なので第 1 引数が `Mirror[Expr$]` になり、
-どの呼び出しとも合わない（`no matching overload for
-(Mirror[Expr$], TreeCreator)(WeakTypeTag[T])Exprs$Expr[T]`）。
-`materialize::ensure_tag_module` が `TypeTag.apply` を手書きしているのと
-まったく同じ理由なので、同じ扱いにした
-（`PickleSupply::install_expr_apply`、erased descriptor も書き下ろし）。
-implicit 節はそのまま残してあるので、手書きの
-`c.universe.Expr.apply[T](m, creator)` は `WeakTypeTag[T]` を
-§7.10 の materialiser から受け取る。
+and `Universe.this.type` is converted against "the class being completed", which is the module `Expr$`
+itself, so the first parameter became `Mirror[Expr$]` and matched no call
+(`no matching overload for (Mirror[Expr$], TreeCreator)(WeakTypeTag[T])Exprs$Expr[T]`).
+This is exactly the same reason `materialize::ensure_tag_module` writes `TypeTag.apply` out by hand,
+so we treat it the same way (`PickleSupply::install_expr_apply`, with the erased descriptor written
+out too). The implicit clause is kept as is, so a hand-written
+`c.universe.Expr.apply[T](m, creator)` receives its `WeakTypeTag[T]` from the materialiser of §7.10.
 
-これで **`reify` が組むべき木は、手書きなら丸ごと動く**:
-`rd_use.scala` の 3 つのマクロは engine で本当に展開され、
-`42 / 42 / true` を印字する。残っているのは
-「`reify { … }` からこの木を**自動で組む**こと」だけである。
+With this, **the tree `reify` ought to build works end to end when written by hand**: the three macros
+in `rd_use.scala` really are expanded by the engine and print `42 / 42 / true`. What remains is only
+"building this tree **automatically** from `reify { … }`".
 
-#### このスライスのあとに残っているもの
+#### What remains after this slice
 
-1. **`reify { … }` の展開そのもの**（§7.13.4 の穴 3）。木の材料は揃った
-   ので、残るのは check.rs 側の合成と**衛生性**である。nsc の展開形
-   （`-Xprint:typer` 実測）は
+1. **The expansion of `reify { … }` itself** (hole 3 of §7.13.4). The materials for the tree are all
+   there; what remains is the synthesis on the check.rs side and **hygiene**. nsc's expansion shape
+   (measured with `-Xprint:typer`) is
 
    ```scala
    { val $u: c.universe.type = c.universe
@@ -2006,37 +2063,34 @@ implicit 節はそのまま残してあるので、手書きの
      $u.Expr.apply[T]($m, new $treecreator1())($u.TypeTag.apply[T]($m, new $typecreator2())) }
    ```
 
-   で、creator の本体は `val $u = $m$untyped.universe` の下に §7.1 の
-   reifier を置いたもの。衛生性は静的シンボルを
-   `$u.internal.reificationSupport.mkIdent($m.staticModule("RdHelper"))` に、
-   `splice` を `x.in[$u.type]($m).tree` に落とす——**どちらも
-   `rd_impl.scala` で手書きして動くことを確認済み**。ローカルやパラメータは
-   名指しで断る、というのが設計で、これが未実装。
-   合成側は各識別子が静的シンボルかどうかを知る必要があるので、
-   `Check::hole_lifts` と同じ「クローンを投機的に型付けして巻き戻す」形で
-   本体を先に解決するのが素直である。
-2. **trait の中の入れ子*クラス***（`u.Liftable[Int]` を**型**として書く形）は
-   まだ `not found: type Liftable`。今回入れたのは term 側だけである。
-3. **`u.Mirror` の上限が読めない。** `Mirrors#Mirror` は
-   `type Mirror >: Null <: api.Mirror[self.type]` で、`conv_upper_bound` が
-   この上限を落とすので `x.in[u.type](mm)` の `mm` は
-   `u.Mirror` ではなく `scala.reflect.api.Mirror[u.type]` に cast して
-   渡す必要がある（nsc は前者を書く）。`rd_impl.scala` のコメント参照。
-4. §7.13 の残件 1・3（展開の型引数、`TableQuery.apply` のオーバーロード選択）は
-   そのまま。
+   with the creator's body being the reifier of §7.1 placed under `val $u = $m$untyped.universe`.
+   For hygiene, static symbols are lowered to
+   `$u.internal.reificationSupport.mkIdent($m.staticModule("RdHelper"))` and `splice` to
+   `x.in[$u.type]($m).tree` — **both confirmed to work, written by hand, in `rd_impl.scala`**.
+   The design is to refuse locals and parameters by name, and that is unimplemented.
+   The synthesis side needs to know whether each identifier is a static symbol, so the natural
+   approach is to resolve the body first in the same "type a clone speculatively and roll back" shape
+   as `Check::hole_lifts`.
+2. **Nested *classes* inside a trait** (writing `u.Liftable[Int]` as a **type**) still give
+   `not found: type Liftable`. What we added this time is only the term side.
+3. **The upper bound of `u.Mirror` cannot be read.** `Mirrors#Mirror` is
+   `type Mirror >: Null <: api.Mirror[self.type]`, and `conv_upper_bound` drops this bound, so the
+   `mm` of `x.in[u.type](mm)` has to be cast to `scala.reflect.api.Mirror[u.type]` rather than
+   `u.Mirror` before being passed (nsc writes the former). See the comment in `rd_impl.scala`.
+4. Items 1 and 3 of the §7.13 list (the expansion's type argument, and overload selection for
+   `TableQuery.apply`) are unchanged.
 
-#### slick への効き方
+#### How this affects slick
 
-`tests/slick_measure.sh` は `errors=134 → 134`、`files_with_errors=48 → 48`。
-`tests/slick_subset.sh` は `38 files / 204 classes / verified=204 failed=0` の
-まま。slick の 2 マクロは `reify` が要るところで止まっており、この 2 件は
-その手前を通しただけなので数字は動かない。
+`tests/slick_measure.sh` gives `errors=134 → 134` and `files_with_errors=48 → 48`.
+`tests/slick_subset.sh` stays at `38 files / 204 classes / verified=204 failed=0`. Slick's two macros
+are stuck at the point where `reify` is required, and these two items only got things through the
+stage before that, so the numbers do not move.
 
-### 7.15 `reify { … }` の展開（`agent/reifybody` スライス）
+### 7.15 Expanding `reify { … }` (the `agent/reifybody` slice)
 
-§7.14 が「手書きなら丸ごと動く」ところまで通した木を、コンパイラが組むように
-した。`crates/typer/src/reify_expand.rs` が §7.14 の 1 に書いた nsc の展開形を
-そのまま作る:
+The tree that §7.14 got working "end to end when written by hand" is now built by the compiler.
+`crates/typer/src/reify_expand.rs` builds exactly the nsc expansion shape written in item 1 of §7.14:
 
 ```text
 { final class $treecreator1 extends scala.reflect.api.TreeCreator {
@@ -2044,121 +2098,120 @@ implicit 節はそのまま残してあるので、手書きの
         $m$untyped: scala.reflect.api.Mirror[U]): <Trees.TreeApi> = {
       val $u = $m$untyped.universe
       val $m = $m$untyped.asInstanceOf[scala.reflect.api.Mirror[$u.type]]
-      <本体>
+      <body>
     }
   }
   <universe>.Expr.apply[T](
     <universe>.rootMirror.asInstanceOf[<api.Mirror>], new $treecreator1()) }
 ```
 
-nsc との差は `crate::materialize` と同じ 3 点（`rootMirror` を使う、
-creator の結果型を `U#Tree` ではなく上限 `Trees$TreeApi` で書く、mirror に
-cast を入れる）で、理由も同じである。`val $m` は本体が要るときだけ置く。
+The differences from nsc are the same three as in `crate::materialize` (use `rootMirror`, write the
+creator's result type as the bound `Trees$TreeApi` rather than `U#Tree`, and insert a cast on the
+mirror), for the same reasons. `val $m` is emitted only when the body needs it.
 
-#### 本体 — 衛生性
+#### The body — hygiene
 
-lowering は quasiquote と同じ `crates/typer/src/reify.rs` の `Reifier` だが、
-`ReifyCtx` を持たせた「reify モード」で走る。違いは 3 つだけで、どれも
-**名前ではなくシンボルで解決する**ことに尽きる。
+Lowering uses the same `Reifier` from `crates/typer/src/reify.rs` as quasiquotes, but runs in a
+"reify mode" carrying a `ReifyCtx`. There are only three differences, and they all come down to
+**resolving by symbol rather than by name**.
 
-| 形 | 組む木 |
+| Shape | Tree built |
 | --- | --- |
-| 静的 `object` | `$u.internal.reificationSupport.mkIdent($m.staticModule("<full name>"))` |
+| A static `object` | `$u.internal.reificationSupport.mkIdent($m.staticModule("<full name>"))` |
 | `x.splice` | `x.in[$u.type]($m).tree` |
-| 型引数 | `$u.internal.reificationSupport.mkTypeTree(<型>)` |
-| それ以外の識別子・ブロック・関数リテラル・`this`・型注釈 | **診断**（`cannot expand reify { ... }: …`） |
+| Type arguments | `$u.internal.reificationSupport.mkTypeTree(<type>)` |
+| Any other identifier, block, function literal, `this`, or type ascription | **a diagnostic** (`cannot expand reify { ... }: …`) |
 
-最後の行が肝である。nsc はローカルやパラメータを *free term*
-（`newFreeTerm` + `mkIdent`）にして展開に持ち回るが、scala-rs はそれを組めない。
-裸の名前で組めば**コンパイルも実行も通り**、展開先にたまたま在る同名の
-何かを指す——reification が防ぐためにある、まさにそのバグになる。よって断る。
+That last line is the crux. nsc turns locals and parameters into *free terms*
+(`newFreeTerm` + `mkIdent`) and carries them through the expansion, but scala-rs cannot build that.
+Building them as bare names would **compile and run**, pointing at whatever happens to have the same
+name at the expansion site — precisely the bug reification exists to prevent. So we refuse.
 
-**型引数**も名前では組まない。`f[E]` はマクロ実装が**どの `E` で実体化されたか**を
-意味するので、書かれた名前で `TypeTree` を組めば同じ捕まらないバグになる。中身は
-`TypeTag` を組むのと同じ材料（`crate::materialize::TagBody`）で作り、
-`Reifier::rebuild_type` が creator の**キャストした** mirror `$m`
-（`Mirror[$u.type]`）に対して書き下ろす:
+**Type arguments** are likewise not built by name. `f[E]` means "which `E` the macro implementation was
+instantiated at", so building a `TypeTree` from the written name would give the same uncatchable bug.
+The contents are made from the same materials as building a `TypeTag` (`crate::materialize::TagBody`),
+and `Reifier::rebuild_type` writes them out against the creator's **cast** mirror `$m`
+(`Mirror[$u.type]`):
 
-| `TagBody` | 木 |
+| `TagBody` | Tree |
 | --- | --- |
 | `StaticClass(n)` | `$m.staticClass(n).asType.toTypeConstructor` |
 | `Applied { c, args }` | `$u.appliedType($m.staticClass(c), List(<args>))` |
 | `FromTag(tag)` | `tag.in[$u.type]($m).tpe` |
 
-materialiser 自身の creator は結果が `Types$TypeApi` に erase されてそれ以上
-何も積まないのでパラメータに直接 select できるが、こちらは結果を `mkTypeTree` に
-渡すので `$u.Type` でなければならない。最後の `FromTag` が slick の
-`reify { TableQuery.apply[E](cons.splice) }` に要るものである。
-組めない型（スコープにタグの無い抽象型など）は `ReifyRef::TypeGap` になり、
-タグ生成器の言い分をそのまま添えて診断する。
+The materialiser's own creator can select directly on the parameter because its result erases to
+`Types$TypeApi` and nothing more is stacked on it, whereas here the result is passed to `mkTypeTree`
+and so must be a `$u.Type`. That last `FromTag` is what slick's
+`reify { TableQuery.apply[E](cons.splice) }` requires.
+A type we cannot build (an abstract type with no tag in scope, say) becomes a `ReifyRef::TypeGap` and
+is diagnosed with the tag builder's own explanation attached.
 
-型引数**以外**の型（型注釈 `(3: Int)` の右辺など）は依然として `Err` である。
-nsc の `reifyType` に相当するものは無い。
+Types **other than** type arguments (the right-hand side of a type ascription such as `(3: Int)`, for
+example) are still an `Err`. We have no counterpart to nsc's `reifyType`.
 
-#### 識別子の判定
+#### How identifiers are classified
 
-`Check::reify_refs` が本体を歩き、`Ident` / `Select` ごとに**クローンを投機的に
-型付けして巻き戻す**（`hole_lifts` と同じ形）。結果が `Type::ModuleRef` で、
-その module class の JVM 名がパッケージだけで到達できる（simple name に `$` が
-無い）なら静的 `object`、`Expr[T]` の `.splice` なら splice、それ以外は
-分類しない＝`Reifier` が名指しで断る。`NodeId` で引くので、判定と lowering が
-同じ節点を見ていることが保証される。
+`Check::reify_refs` walks the body and, for each `Ident` / `Select`, **types a clone speculatively and
+rolls back** (the same shape as `hole_lifts`). If the result is a `Type::ModuleRef` whose module
+class's JVM name is reachable through packages alone (no `$` in the simple name) it is a static
+`object`; if it is a `.splice` on an `Expr[T]` it is a splice; anything else is left unclassified,
+i.e. the `Reifier` refuses it by name. Lookups are keyed by `NodeId`, which guarantees that the
+classification and the lowering are looking at the same node.
 
-型引数は `tree_to_type` で `Type` にしてから `Check::tag_body` に渡す
-（`Tag::Weak`。`TypeTag <: WeakTypeTag` なのでどちらのタグでも見つかる）。
+Type arguments are turned into a `Type` by `tree_to_type` and handed to `Check::tag_body`
+(`Tag::Weak`; since `TypeTag <: WeakTypeTag`, either kind of tag is found).
 
-`Expr.apply[T]` の `T` は本体全体を 1 度だけ投機型付けして取る（`Type::Constant`
-は `lit_underlying` で widen する）。implicit 節の `WeakTypeTag[T]` は §7.10 の
-materialiser が埋めるが、それは `import <universe>._` から universe を探すので、
-`c.universe.reify { … }` のために**展開を型付けしている間だけ**その universe を
-import prefix として積んでいる（積みっぱなしにはしない）。
+The `T` of `Expr.apply[T]` is obtained by speculatively typing the whole body exactly once
+(a `Type::Constant` is widened with `lit_underlying`). The `WeakTypeTag[T]` of the implicit clause is
+filled by the materialiser of §7.10, but that looks for the universe in an `import <universe>._`, so
+for `c.universe.reify { … }` we push that universe as an import prefix **only while the expansion is
+being typed** (we do not leave it pushed).
 
-#### ソース文字列を typer に渡した
+#### We handed the source string to the typer
 
-`Reifier` は `src`（元ソース）でパーサが畳んでしまう区別を復元する
-（`A => B` と `Function1[A, B]`、`(a, b)` と `Tuple2(a, b)`、`a :: b` と
-`b.::(a)`）。quasiquote の本体は `quasiquote.rs` が組み直した文字列なのでその場に
-あったが、`reify` の本体は**実ファイルのテキスト**である。`Typer` はソースを
-持っていなかったので `typecheck_units_src` / `typecheck_opts_src` を足し、
-driver が既に持っている `SourceFile::src` を渡すようにした。渡さない呼び出し
-（スニペットを型付けする単体テスト）では空で、各読み取りは書き下ろし側の枝に落ちる。
+`Reifier` uses `src` (the original source) to recover distinctions the parser folds away
+(`A => B` versus `Function1[A, B]`, `(a, b)` versus `Tuple2(a, b)`, `a :: b` versus `b.::(a)`).
+For quasiquotes the body is a string reassembled by `quasiquote.rs`, so it was right there; but the
+body of a `reify` is **text from a real file**. `Typer` did not hold the source, so we added
+`typecheck_units_src` / `typecheck_opts_src` and pass in the `SourceFile::src` the driver already has.
+For calls that do not pass it (unit tests that type a snippet) it is empty, and each read falls to the
+written-out branch.
 
-#### 検証
+#### Validation
 
-`tests/fixtures/rb_impl.scala` + `rb_use.scala` を 2 段コンパイルして 16 行印字し、
-**同じ 2 ファイルを実 scalac 2.13.16 で 2 段コンパイルして実行しても同じ 16 行**
-（`tests/fixtures/expected/rb_use.txt`）。最後の 2 行は splice を副作用つきの式で
-埋めたもので、木が splice を落としたり 2 回組んだりしたら数が変わる。
-`rb_bad.scala` は断る 5 形が名指しで診断されることを固定する（実 scalac は
-5 つとも通すので、これは未実装の告白である）。
+`tests/fixtures/rb_impl.scala` + `rb_use.scala` are compiled in two stages and print 16 lines, and
+**the same two files, compiled in two stages by the real scalac 2.13.16 and run, give the same 16
+lines** (`tests/fixtures/expected/rb_use.txt`). The last two lines fill a splice with a side-effecting
+expression, so if the tree dropped a splice or built one twice the count would change.
+`rb_bad.scala` pins that the 5 refused shapes are diagnosed by name (the real scalac accepts all 5, so
+this is a confession of what is unimplemented).
 
-slick は `errors=115 → 113`、`files_with_errors=41 → 41`。
-`TableQuery.scala:50` の `reify { TableQuery.apply[E](cons.splice) }` は
-**展開できるようになり**、`cannot expand reify` と、その巻き添えだった
-`cannot expand apply` の 2 件が消えた。`crates/backend/` は触っていないので
-`slick_subset.sh` は回していない。
+Slick goes from `errors=115 → 113` and `files_with_errors=41 → 41`.
+`reify { TableQuery.apply[E](cons.splice) }` at `TableQuery.scala:50` **can now be expanded**, and the
+two errors `cannot expand reify` and the `cannot expand apply` it dragged along with it are gone.
+`crates/backend/` was not touched, so `slick_subset.sh` was not run.
 
-#### 残っているもの
+#### What remains
 
-1. 同じ行に残る `value apply is not a member of TableQuery[E]` は §7.13 の残件
-   （`TableQuery.apply` のオーバーロード選択）で、reify とは別件である。
-2. 呼び出し側で**推論された**型引数はまだマクロに渡らない（§7.13 の残件 1）。
-   `rb_use.scala` が `RbUse.idOf[Int](5)` と書き下ろしているのはそのためである。
-3. ローカル・パラメータの *free term*、ブロック、関数リテラル、`this`、
-   型引数以外の型。
-4. §7.14 の残件（trait の中の入れ子*クラス*を型として書く形）はそのまま。
+1. The `value apply is not a member of TableQuery[E]` remaining on the same line is an item from the
+   §7.13 list (overload selection for `TableQuery.apply`) and is a separate matter from reify.
+2. Type arguments **inferred** at the call site still do not reach the macro (item 1 of the §7.13
+   list). That is why `rb_use.scala` writes `RbUse.idOf[Int](5)` out explicitly.
+3. *Free terms* for locals and parameters, blocks, function literals, `this`, and types other than
+   type arguments.
+4. The remainder from §7.14 (writing a nested *class* inside a trait as a type) is unchanged.
 
-### 7.16 `ShapedValue.mapToImpl` — 3 つの根（`agent/shaped` スライス）
+### 7.16 `ShapedValue.mapToImpl` — three roots (the `agent/shaped` slice)
 
-§3.3 に「本体はほぼ全部 quasiquote」と書いた `slick.lifted.ShapedValue` の
-**5 件を 0 件**にした。5 件のうち 2 件は `<error>` 型の穴という quasiquote
-診断で、これは手前 3 件のカスケードだった。
+We took `slick.lifted.ShapedValue` — of which §3.3 said "the body is almost entirely quasiquotes" —
+**from 5 errors to 0**. Two of the 5 were quasiquote diagnostics about holes of type `<error>`, a
+cascade of the three before them.
 
-#### 1. `MemberScope` が `Iterable[Symbol]` だと読めない
+#### 1. `MemberScope` cannot be read as an `Iterable[Symbol]`
 
-`rTag.tpe.decls.collect { … }` — `mapToImpl` の 1 行目 — が
-`value collect is not a member of Scopes.MemberScope`。実 scala-reflect の
-階層は
+`rTag.tpe.decls.collect { … }` — the first line of `mapToImpl` — gave
+`value collect is not a member of Scopes.MemberScope`. The real scala-reflect's
+hierarchy is
 
 ```text
 type MemberScope >: Null <: AnyRef with Scope with MemberScopeApi
@@ -2166,105 +2219,102 @@ trait MemberScopeApi extends ScopeApi
 trait ScopeApi extends Iterable[Symbol]
 ```
 
-で、`MemberScopeApi` も `ScopeApi` も**自分の pickle を持たない**
-（`Scopes$MemberScopeApi` の classfile は `interfaces: 0`。親は
-`Scopes.scala` の pickle にしか書かれていない）。
+and neither `MemberScopeApi` nor `ScopeApi` **has a pickle of its own** (the classfile of
+`Scopes$MemberScopeApi` has `interfaces: 0`; the parents are written only in the pickle of
+`Scopes.scala`).
 
-`PickleSupply::complete` は「クラス自身の pickle に無ければライブラリ祖先にも
-聞く」形だったが、その祖先リストは **`library_ancestors` が呼ばれた瞬間の
-親リストのスナップショット**だった。スタブの親リストは pickle を読むまで空なので、
-**2 段以上の登りが 1 段目で止まる**: `MemberScopeApi` の pickle 親 `ScopeApi`
-までは届き、`complete_on(ScopeApi)` がその直後に `Iterable[Symbol]` を付けても、
-`Iterable` には誰も聞かない。
+`PickleSupply::complete` was shaped as "if it is not in the class's own pickle, ask the library
+ancestors too", but that ancestor list was **a snapshot of the parent list at the moment
+`library_ancestors` was called**. A stub's parent list is empty until the pickle is read, so
+**a climb of two or more steps stopped at the first**: we reached `MemberScopeApi`'s pickle parent
+`ScopeApi`, and even though `complete_on(ScopeApi)` attached `Iterable[Symbol]` immediately
+afterwards, nobody ever asked `Iterable`.
 
-`complete_on_ancestors` に置き換え、**1 段ごとに `ensure_parents` してから
-次の段に進む**ようにした。順序（親を後ろから、幅優先＝
-`Check::enter_inherited_members` と同じ線形化）は変えていない。
+We replaced it with `complete_on_ancestors`, which **calls `ensure_parents` at each step before moving
+to the next**. The order (parents from the back, breadth first — the same linearisation as
+`Check::enter_inherited_members`) is unchanged.
 
-#### 2. 抽象型メンバ越しに読んだメンバが置換されない
+#### 2. Members read through an abstract type member were not substituted
 
-1 のあと `collect` は見つかるが、`decls.toList` が `List[A]`（`Iterable` 自身の
-型パラメータのまま）を返す。`SymbolTable::subst_as_seen_from` の `walk` に
-`Type::TypeMember` / `Type::TypeParam` の枝が無く `_ => ty` に落ちていた。
-**抽象型メンバから読んだメンバはその上限が宣言している**ので、上限をたどって
-置換するようにした。これで `decls` の要素型が本当に `Symbol` になり、
-`s.isVal` / `s.isCaseAccessor` / `s.typeSignature` が解ける。
+After 1, `collect` is found, but `decls.toList` returns `List[A]` (still `Iterable`'s own type
+parameter). The `walk` of `SymbolTable::subst_as_seen_from` had no branch for
+`Type::TypeMember` / `Type::TypeParam` and fell through to `_ => ty`.
+**A member read from an abstract type member is declared by that member's upper bound**, so we now
+follow the bound and substitute. With that, the element type of `decls` really is `Symbol`, and
+`s.isVal` / `s.isCaseAccessor` / `s.typeSignature` resolve.
 
 #### 3. `blackbox.Context { type PrefixType = … }`
 
-slick は `c: blackbox.Context { type PrefixType = ShapedValue[?, U] }` と書く。
-`macro_context_kind` は `Type::Class` しか見ておらず、refinement は
-`must take scala.reflect.macros.blackbox.Context … as its first parameter`
-だった。候補を 2 つ増やした:
+Slick writes `c: blackbox.Context { type PrefixType = ShapedValue[?, U] }`.
+`macro_context_kind` looked only at `Type::Class`, so a refinement gave
+`must take scala.reflect.macros.blackbox.Context … as its first parameter`.
+We added two more candidates:
 
-* **refinement の親**（source から読んだとき）。refinement はメンバを固定する
-  だけで、blackbox か whitebox かを決めるのは親のほうである。
-* **第 1 引数の erased descriptor**（最後の手段）。scala-rs 自身の pickle は
-  refinement を落とすので、我々の classfile から読み戻すと `Any` になる。
-  descriptor は refine されないので、そこが答えになる。第 1 引数が本当に `Any`
-  なら descriptor は `java.lang.Object` で、どちらの `Context` でもないから
-  従来どおり断る。source の実装（classfile が無い）では descriptor が
-  引けないので、診断は弱まらない。
+* **The refinement's parent** (when read from source). A refinement only fixes members; what decides
+  blackbox versus whitebox is the parent.
+* **The erased descriptor of the first parameter** (a last resort). scala-rs's own pickle drops
+  refinements, so reading back from our classfile gives `Any`. Descriptors are not refined, so that is
+  where the answer is. If the first parameter really is `Any`, the descriptor is `java.lang.Object`,
+  which is neither `Context`, and we refuse as before. For an implementation in source (with no
+  classfile) the descriptor is unavailable, so the diagnostic is not weakened.
 
-#### 4. `..$xs` と普通の要素の混在
+#### 4. Mixing `..$xs` with ordinary elements
 
-`Reifier::splice_clause` は「全部普通」か「`..$xs` 1 つだけ」しか組まず、
-混在は refuse していた。nsc の `reifyList` と同じにした:
+`Reifier::splice_clause` only built "all ordinary" or "exactly one `..$xs`" and refused any mixture.
+We made it match nsc's `reifyList`:
 
-> 連続する普通の要素は `List(...)` 1 つにまとめ、rank-1 の穴はそのまま、
-> 左から `++` でつなぐ。
+> Group runs of consecutive ordinary elements into a single `List(...)`, leave rank-1 holes as they
+> are, and join them left to right with `++`.
 
-`q"f(a, ..$xs, b)"` → `List(<a>) ++ xs ++ List(<b>)`。引数の順序が連結の順序で、
-どの断片もすでに `List[Tree]` なので静的型を推測する場所が無い。効く先は
-`arg_clause` / `pat_clause` / `stats_splice`（ブロックの文）/
-`reify_defs` のテンプレート本体と parents の 4 箇所で、要素の lowering は
-呼び出し側が関数で渡す（引数は term、パターン引数は pattern、ブロックの要素は
-statement、parent は parent）。rank 2（`...$xss`）は `hole` 自身が従来の
-メッセージで断る。
+`q"f(a, ..$xs, b)"` → `List(<a>) ++ xs ++ List(<b>)`. The argument order is the concatenation order,
+and every fragment is already a `List[Tree]`, so there is nowhere to have to guess a static type.
+It applies in four places — `arg_clause` / `pat_clause` / `stats_splice` (block statements) / the
+template body and parents in `reify_defs` — with the caller passing the element lowering as a function
+(arguments as terms, pattern arguments as patterns, block elements as statements, parents as parents).
+Rank 2 (`...$xss`) is still refused by `hole` itself with the existing message.
 
-#### ついでに直した 2 つ
+#### Two more things fixed along the way
 
-* **展開の中の空 `TypeTree`**。`q"val ff = $f"` は nsc の quasiquote が
-  `TypeTree()`（型の無い木）を作る。`expand.rs` はこれを
-  `the expansion contains an empty TypeTree` と断っていた。`ValDef` の型の
-  位置に限って `TreeKind::Empty` に落とし、typer に推論させる。
-  **その位置に限る**のは、他の場所には「推論しろ」を表す木が我々の AST に
-  無いからである。
-* **`_root_` が term 位置で解決されない**。`import_path_syms` にしか枝が無く、
-  `_root_.scala.collection.immutable.List(…)` が `not found: value _root_` だった。
-  `type_ident` でルートパッケージに解決する。
+* **Empty `TypeTree`s inside an expansion**. For `q"val ff = $f"`, nsc's quasiquotes build a
+  `TypeTree()` (a tree with no type). `expand.rs` refused it with
+  `the expansion contains an empty TypeTree`. We now lower it to `TreeKind::Empty`, but only in the
+  type position of a `ValDef`, and let the typer infer. **Only in that position**, because nowhere
+  else does our AST have a tree meaning "infer this".
+* **`_root_` did not resolve in term position**. There was a branch only in `import_path_syms`, so
+  `_root_.scala.collection.immutable.List(…)` gave `not found: value _root_`. `type_ident` now
+  resolves it to the root package.
 
-#### 検証
+#### Validation
 
-`tests/fixtures/sv_impl.scala` + `sv_use.scala` を 2 段コンパイルして 4 行印字し、
-**同じ 2 ファイルを実 scalac 2.13.16 で 2 段コンパイルして実行しても同じ 4 行**
-（`tests/fixtures/expected/sv_use.txt`）。テンプレート本体の混在 splice は
-**組んだ木を印字した文字列**を展開に載せているので、splice が別の位置に落ちたら
-（コンパイルも実行も通ったまま）行が変わる。`sv_gaps_bad.scala` は断る 3 形を
-固定する（うち 2 つは実 scalac も断るので一致の固定）。
+`tests/fixtures/sv_impl.scala` + `sv_use.scala` are compiled in two stages and print 4 lines, and
+**the same two files, compiled in two stages by the real scalac 2.13.16 and run, give the same 4
+lines** (`tests/fixtures/expected/sv_use.txt`). The mixed splice in the template body puts **the
+printed string of the tree it built** into the expansion, so if a splice landed in a different
+position the line would change (while still compiling and running).
+`sv_gaps_bad.scala` pins the 3 refused shapes (the real scalac refuses 2 of them too, so those pin
+agreement).
 
-slick は `errors=99 → 94`、`files_with_errors=39 → 38`。`ShapedValue.scala` は
-**5 → 0**。`crates/backend/` は触っていないので `slick_subset.sh` は回していない。
+Slick goes from `errors=99 → 94` and `files_with_errors=39 → 38`. `ShapedValue.scala` goes
+**5 → 0**. `crates/backend/` was not touched, so `slick_subset.sh` was not run.
 
-#### 残っているもの
+#### What remains
 
-1. **scala-rs 自身の `ScalaSignature` は case accessor を記録しない。**
-   マクロは `WeakTypeTag` のメンバを実行時ミラー越しに読むので、scala-rs が
-   コンパイルした case class は `decls` が空に見える。`mapTo[R]` を scala-rs 製の
-   `R` に当てると、黙ってフィールド 0 個の展開になる。fixture がライブラリの型
-   （`Deadline` / `BigDecimal`）を列挙しているのはこのため。
-2. **抽象型メンバに対する型パターンが `instanceof java/lang/Object` になる。**
-   `erase_ty` は抽象型メンバを `Object` に落とす（型パラメータは上限に落とすのに）。
-   `case s: TermSymbol` のテストが素通りするので、`decls` に `TermSymbol` でない
-   ものが混ざる型で `mapToImpl` を展開すると実行時
-   `IncompatibleClassChangeError`。直すには型パターンの `instanceof` を上限の
-   erasure で出す必要があり、codegen に入る。
-3. **scala-rs の classfile から読み戻した macro def は macro def でなくなる。**
-   `macro_impl` が pickle に載らないので、別の run で `mapTo` を呼ぶと普通の
-   メソッド呼び出しとしてコンパイルされ、実行時 `NoSuchMethodError`（診断なし）。
-4. `_root_.scala.List` / `_root_.scala.Vector` は
-   `no matching overload for <overload List$ | List$>`。パッケージ `scala` の
-   スコープに同じ companion が 2 つ入っている（レキシカルな `scala.List` は
-   別経路でそれを避けている）。
-5. `mapToImpl` の**展開**には上の 1〜3 に加えて、展開結果の匿名クラス
-   （`expand.rs` に `ClassDef` の枝が無い）が要る。slick 本体のコンパイルには不要。
+1. **scala-rs's own `ScalaSignature` does not record case accessors.**
+   A macro reads the members of a `WeakTypeTag` through the runtime mirror, so a case class compiled
+   by scala-rs appears to have empty `decls`. Applying `mapTo[R]` to an `R` built by scala-rs silently
+   produces an expansion with zero fields. That is why the fixtures enumerate library types
+   (`Deadline` / `BigDecimal`).
+2. **A type pattern against an abstract type member becomes `instanceof java/lang/Object`.**
+   `erase_ty` lowers abstract type members to `Object` (whereas type parameters are lowered to their
+   bound). A `case s: TermSymbol` test therefore passes everything through, so expanding `mapToImpl`
+   for a type whose `decls` contain something that is not a `TermSymbol` gives an
+   `IncompatibleClassChangeError` at run time. Fixing it means emitting the type pattern's `instanceof`
+   with the bound's erasure, which reaches into codegen.
+3. **A macro def read back from a scala-rs classfile is no longer a macro def.**
+   `macro_impl` is not written to the pickle, so calling `mapTo` from another run compiles as an
+   ordinary method call and gives a `NoSuchMethodError` at run time (with no diagnostic).
+4. `_root_.scala.List` / `_root_.scala.Vector` give
+   `no matching overload for <overload List$ | List$>`. Two copies of the same companion are in the
+   scope of package `scala` (lexical `scala.List` avoids this by a different route).
+5. **Expanding** `mapToImpl` needs, in addition to 1 through 3 above, anonymous classes in the
+   expansion result (`expand.rs` has no `ClassDef` branch). This is not needed to compile slick itself.

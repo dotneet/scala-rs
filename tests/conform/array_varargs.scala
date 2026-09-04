@@ -1,4 +1,4 @@
-// 参照配列とプリミティブ配列を混ぜる、可変長引数への `: _*` 展開。
+// Mixing reference and primitive arrays, and `: _*` expansion into varargs.
 case class Row(name: String, score: Int)
 
 object Main {
@@ -18,7 +18,7 @@ object Main {
     val labels = Array[Any]("n", 1, true)
     println(labels.mkString("<", ",", ">"))
 
-    // `Array[Any]` の後で要素型を推論させる（記述子の持ち越し）。
+    // Infer the element type after `Array[Any]` (the descriptor carries over).
     val ranks = Array(3, 1, 2)
     println(ranks.sorted.mkString(""))
     println(total(ranks: _*))

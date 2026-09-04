@@ -1,10 +1,11 @@
-// implicit が見つからない場合。`itail.scala` で通るようになった経路が
-// 「見つからなくても通る」ようになっていないことを固定する。
+// When the implicit is not found. Pins that the paths `itail.scala` opened up
+// did not turn into "passes even when nothing is found".
 //
-// 1. 引数位置の残余 implicit 節は、パラメータ型が要求する証拠で埋める。
-//    スコープにある唯一の implicit を代わりに使ってはいけない。
-// 2. 値引数が触れない型パラメータは implicit 探索が決めるが、候補が
-//    まったくないなら決まらない。
+// 1. A residual implicit clause in argument position is filled with the evidence
+//    the parameter type asks for, never with the one implicit that happens to
+//    be in scope.
+// 2. A type parameter no value argument mentions is decided by implicit search,
+//    but with no candidate at all it stays undecided.
 
 class Tagged[T](val name: String)
 object Tagged {
@@ -17,11 +18,11 @@ object Bad {
   def take(xs: Sized[String]): Int = xs.n
   def empty[T](implicit t: Tagged[T]): Sized[T] = new Sized[T](0)
 
-  // `Tagged[String]` は存在しないので、残余 implicit 節は埋まらない。
+  // There is no `Tagged[String]`, so the residual implicit clause cannot be filled.
   val a: Int = take(empty)
 
   def rows[T](prefix: String)(implicit sz: Sized[T]): String = prefix + sz.n
 
-  // `Sized` の implicit はどこにもないので、`T` は決まらない。
+  // There is no `Sized` implicit anywhere, so `T` cannot be decided.
   val b = rows("p")
 }

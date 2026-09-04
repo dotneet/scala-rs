@@ -1,24 +1,24 @@
-//! implicit 解決の残件と prelude の穴。
+//! Leftover implicit-resolution cases and the holes in the prelude.
 //!
-//! slick で残っていた implicit 関連のエラーを追ったときに出てきた経路をまとめて
-//! 固定する。
+//! Collects and pins the paths that turned up while chasing the implicit-related
+//! errors still left in slick.
 //!
-//! - 一度解決した呼び出しをもう一度型付けする経路（`retry_tupled_args` の
-//!   タプル化リトライ）が、前のパスが埋めた implicit 引数を argument list に
-//!   残したまま再解決していた。`LiteralNode(1)` が
-//!   `not found: value intType` になっていたのはこれ。
-//! - prelude の `scala.math.Numeric` に `Ordering` の親が張られておらず、
-//!   `Numeric[T] <: Ordering[T]` が成り立たなかった。
-//! - 値引数がどれも触れない型パラメータ（`def mk[T: TT](s: String)`）は
-//!   implicit 探索だけが決められる。
-//! - 関数値の `apply` は関数そのもの。
-//! - 引数位置に残った implicit 節（`take(Array.empty)` の
-//!   `(ClassTag[T])Array[T]`）は、パラメータ型が決まってから埋める。
-//! - `implicit object X` は implicit 候補としては 1 つ（module と
-//!   module class の 2 つではない）。
+//! - The path that types an already resolved call a second time (`retry_tupled_args`'
+//!   tupling retry) re-resolved it with the implicit arguments the previous pass had
+//!   filled in still in the argument list. That is why `LiteralNode(1)` came out as
+//!   `not found: value intType`.
+//! - The prelude's `scala.math.Numeric` had no `Ordering` parent wired up, so
+//!   `Numeric[T] <: Ordering[T]` did not hold.
+//! - A type parameter no value argument mentions (`def mk[T: TT](s: String)`) can
+//!   only be decided by implicit search.
+//! - `apply` on a function value is the function itself.
+//! - An implicit clause left in argument position (the `(ClassTag[T])Array[T]` of
+//!   `take(Array.empty)`) is filled in once the parameter type is known.
+//! - An `implicit object X` is one implicit candidate, not two (a module and a
+//!   module class).
 //!
-//! フィクスチャは実 `scala-library` の jar に対してコンパイルし、実行結果を
-//! nsc 2.13.16 が同じソースに対して出すものと比較する。
+//! The fixtures are compiled against the real `scala-library` jar and their output
+//! compared with what nsc 2.13.16 produces for the same source.
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -504,9 +504,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         }
         crate::prelude_sgap::add_iterable_apply(st, library_abi);
         if let Some(aops) = array_ops {
-            // ArrayOps の変換・集約系 (toList/toSeq/groupBy/sum/...) と
-            // scala.collection.MapView。Buffer / Iterable / MapView を
-            // 作り直さないよう、コレクション本体のあとに走らせる。
+            // ArrayOps' conversions and aggregates (toList/toSeq/groupBy/sum/...) and
+            // scala.collection.MapView. Run after the collections themselves so that
+            // Buffer / Iterable / MapView are not rebuilt.
             crate::prelude_arrconv::install(st, aops, tuple2, ordering);
         }
         add_linked_hash_map(st);
@@ -592,10 +592,10 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     );
 
     crate::prelude_lowbound::install(st);
-    // `Option.getOrElse` / `orElse` / `Map.getOrElse` の `[B >: A]`。
+    // The `[B >: A]` of `Option.getOrElse` / `orElse` / `Map.getOrElse`.
     crate::prelude_ovl3::install(st, library_abi);
-    // `Either.getOrElse` / `Try.getOrElse` の `[B1 >: B]`（`add_either` /
-    // `add_try` は `(=> Any): Any` と書いていた）。
+    // The `[B1 >: B]` of `Either.getOrElse` / `Try.getOrElse` (`add_either` /
+    // `add_try` wrote them as `(=> Any): Any`).
     crate::prelude_dbio::install(st);
     crate::prelude_lang::install(st);
     crate::prelude_lazyref::install(st);
@@ -628,20 +628,20 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     crate::prelude_variance::install(st);
     crate::prelude_boxed::install(st);
     crate::prelude_hier::install(st);
-    // `HashSet <: mutable.Set` などの残りの辺。`prelude_hier` が
-    // `collection.Set` / `collection.Map` 側を組み立てたあとで。
+    // The remaining edges, such as `HashSet <: mutable.Set`. After `prelude_hier` has
+    // assembled the `collection.Set` / `collection.Map` side.
     crate::prelude_ovl3::install_hierarchy(st);
-    // `collection.Map` の `get`/`contains`/`getOrElse`/`apply`。
-    // `prelude_hier` がリンク用トレイトを作ったあとで。
+    // `get`/`contains`/`getOrElse`/`apply` on `collection.Map`.
+    // After `prelude_hier` has built the linking traits.
     crate::prelude_implfind::install(st);
-    // `Seq[A] <: PartialFunction[Int, A] <: Int => A`（`scala/collection/Seq`
-    // は `prelude_hier` が組み立てるので、そのあと）。`PartialFunction` の
-    // `lift`/`orElse` も同じスライスで足す。library_abi 専用。
+    // `Seq[A] <: PartialFunction[Int, A] <: Int => A` (after `prelude_hier`, since it
+    // is what assembles `scala/collection/Seq`). `PartialFunction`'s `lift`/`orElse`
+    // go in on the same slice. `library_abi` only.
     crate::prelude_seqfn::install(st, library_abi);
-    // `Array` を `Seq`/`Iterable` として渡すための `Predef` の包み込みと、
-    // `collection.Map` の読み出しメンバ（agent/setmap）。`prelude_hier` が
-    // `collection/Map` を、`prelude_seqfn` が `mutable.ArraySeq` 周りを
-    // 組み立てたあと。
+    // The `Predef` wrapping that lets an `Array` be passed as a `Seq`/`Iterable`, and
+    // the read members of `collection.Map` (agent/setmap). After `prelude_hier` has
+    // assembled `collection/Map` and `prelude_seqfn` has assembled the
+    // `mutable.ArraySeq` area.
     crate::prelude_setmap::install(st, library_abi);
     crate::prelude_fntuple::install(st, library_abi);
     crate::prelude_mism9::install(st);
@@ -649,12 +649,17 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         crate::prelude_durrange::install_range_companion(st);
         crate::prelude_durrange::install_ordered_companion(st);
     }
-    // `val Ordering = scala.math.Ordering`（項位置の別名）。コンパニオンが
-    // 出そろってから入れるので最後。
+    // `val Ordering = scala.math.Ordering` (the term-position alias). Last, so that it
+    // goes in once all the companions are present.
     crate::prelude_ordsummon::install(st, library_abi);
-    // `Ordering[T] <: PartialOrdering[T] <: Equiv[T]` と `object Equiv` の
-    // implicit instance。`Equiv` のコンパニオン別名が上の行で入ってから。
+    // `Ordering[T] <: PartialOrdering[T] <: Equiv[T]` and `object Equiv`'s implicit
+    // instances. After the line above has installed `Equiv`'s companion alias.
     crate::prelude_eqtail::install(st, library_abi);
+    // `3.compare(4)`: give `RichInt` and friends a `compare`. Without it the
+    // search falls through to the `Ordered.orderingToOrdered` view, whose
+    // conversion never got materialised -- a `checkcast scala/math/Ordered`
+    // landed on an `int`.
+    crate::prelude_richcmp::install_rich_compare(st);
 }
 
 /// Prelude classes are owned by `scala` but carry their real JVM package
@@ -737,18 +742,18 @@ fn add_scala_aliases(st: &mut SymbolTable, library_abi: bool) {
     crate::prelude_conform::install(st, library_abi);
     // Needs `<:<` (installed just above) and `Map`.
     crate::prelude_impl2::install(st, library_abi);
-    // `Map[K, V] <: K => V`。階層表のあとに張る。
+    // `Map[K, V] <: K => V`. Wired up after the hierarchy table.
     crate::prelude_mism4::install(st);
-    // `case Seq(a, b)` / `case Array(a, b)`。companion が揃ってから足す。
+    // `case Seq(a, b)` / `case Array(a, b)`. Added once the companions are present.
     crate::prelude_seqpat::install(st);
-    // `SeqView.filter` などが返すのは `SeqView` ではなく `View`。
+    // What `SeqView.filter` and friends return is a `View`, not a `SeqView`.
     crate::prelude_viewc::install(st);
-    // `StringOps.map[B](Char => B): IndexedSeq[B]`（`IndexedSeq` が揃ってから）。
+    // `StringOps.map[B](Char => B): IndexedSeq[B]` (once `IndexedSeq` is present).
     crate::prelude_strmap::install(st, library_abi);
-    // `StringOps` の残り。pickle から補完できないもの（戻り型だけのオーバー
-    // ロードなど）だけを手書きする。
+    // The rest of `StringOps`. Only what cannot be completed from the pickle (such as
+    // overloads differing solely in return type) is hand-written.
     crate::prelude_stringops8::install(st, library_abi);
-    // `Coll.empty` は最後にまとめて多相化する（すべての companion が揃ってから）。
+    // `Coll.empty` is made polymorphic in one final pass (once every companion is present).
     crate::prelude_empty::install(st);
 }
 
@@ -2818,8 +2823,8 @@ fn add_array_ops_zip(st: &mut SymbolTable, aops: SymbolId, tuple2: SymbolId) {
 
 /// ArrayOps.foldLeft / fold / foldRight.
 ///
-/// nsc 2.13.16 JVM: `foldLeft$extension(Object, Object, Function2)Object` 系。
-/// `reduce` は ArrayOps に無いので載せない。
+/// nsc 2.13.16 JVM: the `foldLeft$extension(Object, Object, Function2)Object` family.
+/// `reduce` is not on ArrayOps, so it is not included.
 fn add_array_ops_folds(st: &mut SymbolTable, aops: SymbolId) {
     let a = st.get(aops).tparams[0];
     let ta = Type::TypeParam(a);
@@ -5531,7 +5536,7 @@ fn add_breaks_members(st: &mut SymbolTable, owner: SymbolId, try_block: SymbolId
 /// `scala.math.BigInt` + companion `BigInt$` against scala-library 2.13.16.
 ///
 /// JVM: `BigInt$.apply(I)` / `apply(Ljava/lang/String;)` /
-/// `int2bigInt(I)`（IMPLICIT） / instance `$plus` / `$times`.
+/// `int2bigInt(I)` (IMPLICIT) / instance `$plus` / `$times`.
 fn add_big_int(st: &mut SymbolTable) {
     let math = crate::classpath::ensure_package(st, "scala/math");
     let cls = class(st, math, "BigInt", "scala/math/BigInt", &[Type::AnyRef]);
@@ -5586,7 +5591,7 @@ fn add_big_int(st: &mut SymbolTable) {
     st.get_mut(big_mod).members.extend(mems);
 }
 
-/// `scala.math.BigDecimal` + companion。small extra。
+/// `scala.math.BigDecimal` plus its companion. Small extra.
 fn add_big_decimal(st: &mut SymbolTable) {
     let math = crate::classpath::ensure_package(st, "scala/math");
     let cls = class(

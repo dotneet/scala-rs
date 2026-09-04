@@ -1,11 +1,11 @@
-// 関数型の implicit パラメータを implicit def から埋める（agent/durrange の
-// 3 件目）。scala.math.Ordered.orderingToOrdered を eta 展開して渡す経路で、
-// view bound（`A <% Ordered[A]`）も同じ経路を通る。
-// Ordered$ と Ordering は jar にしかないので --scala-library 専用。
+// Filling a function-typed implicit parameter from an implicit def (the third
+// agent/durrange case). Along the path that eta-expands and passes
+// scala.math.Ordered.orderingToOrdered; a view bound (`A <% Ordered[A]`) takes the
+// same path. Ordered$ and Ordering exist only in the jar, so --scala-library only.
 object Main {
   def h[A](x: A, y: A)(implicit ev: A => Ordered[A]): A = if (x < y) y else x
   def g[A <% Ordered[A]](x: A, y: A): A = if (x < y) y else x
-  // 入れ子の implicit パラメータ。view はここでも見つかる必要がある。
+  // A nested implicit parameter. The view has to be found here too.
   def top[A](xs: List[A])(implicit ev: A => Ordered[A]): A = xs.reduceLeft(h(_, _))
 
   def main(args: Array[String]): Unit = {
@@ -17,7 +17,7 @@ object Main {
     println(g(7L, 2L))
     println(top(List(4, 9, 2)))
     println(top(List("b", "z", "a")))
-    // 素の変換（implicit def から Ordered へ）も同じ探索でつく。
+    // A bare conversion (implicit def to Ordered) is found by the same search.
     val oi: Ordered[Int] = 3
     println(oi < 4)
     val os: Ordered[String] = "abc"

@@ -1,6 +1,7 @@
 mod anon_capture;
 mod check;
 mod classpath;
+mod default_recv;
 mod erasure;
 mod expand;
 mod expand_private;
@@ -54,6 +55,7 @@ mod prelude_ovl3;
 mod prelude_product;
 mod prelude_reflect;
 mod prelude_regex;
+mod prelude_richcmp;
 mod prelude_seq;
 mod prelude_seqfn;
 mod prelude_seqpat;
@@ -82,6 +84,7 @@ pub use check::{
     typecheck_units_src, ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType,
     ClasspathTypeParam, TypecheckOptions, Typer,
 };
+pub use default_recv::hoist_default_receivers;
 pub use erasure::{erase, erase_type, note_source_value_classes};
 pub use expand_private::expand_private_names;
 pub use lambda_lift::lambda_lift;

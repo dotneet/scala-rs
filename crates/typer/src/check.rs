@@ -4060,7 +4060,35 @@ impl Typer {
             {
                 continue;
             }
-            let preceding: Vec<SymbolId> = flat[..i].to_vec();
+            // nsc's getter takes the *preceding parameter clauses* only:
+            // `def f(x: Int)(y: Int = x)` gives `f$default$2(x: Int)`, but
+            // `def f(x: Int, y: Int = 0, z: Int = 1)` gives a **nullary**
+            // `f$default$2()` / `f$default$3()`, because a default may not
+            // name an earlier parameter of its own clause (nsc rejects
+            // `def d(x: Int, z: Int = x)` outright).
+            //
+            // Taking the whole flattened prefix instead made every call that
+            // omits k defaults duplicate the argument trees 2^k times: the
+            // arguments go into the call *and* into `$default$2`, and
+            // `$default$3` then takes both of those. slick's
+            // `sel.replace { case … }` (two omitted defaults) emitted the one
+            // `PartialFunction` literal as **16** classfiles.
+            //
+            // scala-rs still accepts the same-clause reference nsc rejects, so
+            // those parameters are kept when the default body actually names
+            // one -- the exponent is what had to go, not the capability.
+            let clause_start = clause_start_of(paramss_ids, i);
+            let same_clause = &flat[clause_start..i];
+            let keep_same_clause = !same_clause.is_empty()
+                && self.st.get(*pid).default_rhs.as_ref().is_some_and(|rhs| {
+                    let names: Vec<String> = same_clause
+                        .iter()
+                        .map(|id| self.st.get(*id).name.clone())
+                        .collect();
+                    tree_names_any(rhs, &names)
+                });
+            let cut = if keep_same_clause { i } else { clause_start };
+            let preceding: Vec<SymbolId> = flat[..cut].to_vec();
             let preceding_tys: Vec<Type> = preceding
                 .iter()
                 .map(|id| self.st.get(*id).ty.clone())
@@ -4878,6 +4906,7 @@ impl Typer {
             Type::Class { args, .. } => args.clone(),
             _ => Vec::new(),
         };
+        self.supply_binary_ctors(class_id);
         match self.pick_ctor_at(class_id, &targs, &arg_tys, None) {
             OverloadPick::Found(sym, param_tys, _) => {
                 // `class Sub[T](y: T) extends Base[T](y)`: the constructor's
@@ -7478,6 +7507,41 @@ impl Typer {
             .find(|&s| self.st.get(s).kind == SymKind::Package)
     }
 
+    /// A member the enclosing class inherits from a **`-cp` ancestor**,
+    /// written unqualified.
+    ///
+    /// `enter_inherited_members` snapshots what the ancestors' member lists
+    /// hold when the template is entered, and a class read from a jar has
+    /// almost nothing there: its members are completed one name at a time,
+    /// on demand, and nothing had demanded these. A selection through a
+    /// receiver (`t.describe`) reaches them through `supply_from_pickle`; a
+    /// bare name inside the subclass body reached nothing at all.
+    ///
+    /// That is what every slick table body is written as --
+    /// `class As(tag: Tag) extends Table[Int](tag, "a") { def id =
+    /// column[Int]("id", O.PrimaryKey) }` -- and `column` was
+    /// "not found: value column" 514 times in one measurement of the testkit
+    /// against slick's published jar.
+    ///
+    /// Runs only when the name is not in scope at all, and enters exactly
+    /// what completion installed, so it can neither shadow nor replace
+    /// anything.
+    fn expose_inherited_from_binary(&mut self, name: &str) {
+        if !self.library_abi || self.st.this_class.is_none() {
+            return;
+        }
+        let cls = self.st.this_class;
+        if !self.st.get(cls).is_class_like() {
+            return;
+        }
+        let found = self
+            .pickle
+            .complete(&mut self.st, &mut self.binary, cls, name);
+        for id in found {
+            self.st.enter_in_current(name, id);
+        }
+    }
+
     /// [`Self::expose_unqualified`] for a name used in *type* position.
     ///
     /// The two namespaces are separate, and the reflection API puts the same
@@ -7495,12 +7559,31 @@ impl Typer {
             return;
         }
         for owner in self.st.wildcard_owners_for(name) {
-            if let Some(Type::TypeMember(id)) =
-                self.pickle
-                    .complete_type_member(&mut self.st, &mut self.binary, owner, name)
+            match self
+                .pickle
+                .complete_type_member(&mut self.st, &mut self.binary, owner, name)
             {
-                self.st.enter_in_current(name, id);
-                return;
+                Some(Type::TypeMember(id)) => {
+                    self.st.enter_in_current(name, id);
+                    return;
+                }
+                // A *nullary* alias has no symbol of its own -- it is its
+                // right-hand side, and `install_type_alias` deliberately
+                // hands that back rather than an opaque `TypeMember` that
+                // would conform to nothing. When the right-hand side is a
+                // plain class, that class *is* what the imported name means,
+                // so its symbol is what goes into scope. Without this,
+                // `import profile.api.*; def f(t: Tag)` left `Tag`
+                // unresolved: slick's `Aliases` declares `type Tag =
+                // lifted.Tag`, `type Tag`-shaped nullary aliases are how the
+                // whole API surface is exported, and a `Named` parameter type
+                // matched no constructor and no signature
+                // ("type mismatch; found: Tag required: Tag").
+                Some(Type::Class { sym, args }) if args.is_empty() && !sym.is_none() => {
+                    self.st.enter_in_current(name, sym);
+                    return;
+                }
+                _ => {}
             }
         }
     }
@@ -7555,6 +7638,10 @@ impl Typer {
         } else {
             self.st.owner
         };
+        self.expose_inherited_from_binary(name);
+        if !self.st.lookup(name).is_empty() {
+            return;
+        }
         // Only the packages the file's own clauses opened, innermost first.
         //
         // A *qualified* clause `package p.q` sees neither a class nor a
@@ -7660,11 +7747,18 @@ impl Typer {
                 // abstract type members of `scala.reflect.api.Trees` /
                 // `Symbols` / `Names`. Completing one installs a symbol on
                 // its declaring trait, which `lookup_member` then reaches.
-                if let Some(Type::TypeMember(id)) =
-                    self.pickle
-                        .complete_type_member(&mut self.st, &mut self.binary, owner, name)
+                match self
+                    .pickle
+                    .complete_type_member(&mut self.st, &mut self.binary, owner, name)
                 {
-                    found = vec![id];
+                    Some(Type::TypeMember(id)) => found = vec![id],
+                    // A nullary alias is its right-hand side and has no
+                    // symbol; the class it names is what the import offers
+                    // under that name. See `expose_unqualified_type`.
+                    Some(Type::Class { sym, args }) if args.is_empty() && !sym.is_none() => {
+                        found = vec![sym]
+                    }
+                    _ => {}
                 }
             }
             if found.is_empty() {
@@ -11517,6 +11611,7 @@ impl Typer {
                 // are the call's. `extends A(1)(2)` has read the arguments at
                 // its `targs` all along (`pick_ctor_at`); the `new` path did
                 // not.
+                self.supply_binary_ctors(c);
                 let mut picked = self.pick_ctor_at(c, &explicit, &arg_tys, None);
                 // An argument whose class is still a `-cp` stub is a subtype of
                 // nothing: `find_or_stub_java_class` gives one `parents =
@@ -15003,7 +15098,7 @@ impl Typer {
     /// (`implicit def listShow[A](implicit s: Show[A]): Show[List[A]]`) is
     /// applied to its own implicits, which are resolved the same way.
     fn implicit_tree(&mut self, id: SymbolId, pt: &Type, span: Span, depth: usize) -> Tree {
-        let (paramss, ret) = match self.implicit_candidate_ty(id) {
+        let (paramss, ret) = match self.implicit_candidate_ty(id).into_owned() {
             Type::Method { paramss, ret } => (paramss, (*ret).clone()),
             _ => return self.ref_implicit(id, span),
         };
@@ -20929,7 +21024,7 @@ impl Typer {
         let tys: Vec<Type> = self
             .implicits_in_scope()
             .into_iter()
-            .map(|id| self.implicit_candidate_ty(id))
+            .map(|id| self.implicit_candidate_ty(id).into_owned())
             .collect();
         let mut fresh = false;
         for t in tys {
@@ -21450,6 +21545,21 @@ impl Typer {
         }
         self.pickle
             .adopt_binary_class(&mut self.st, &mut self.binary, cls);
+    }
+
+    /// Repair a `-cp` class that has no constructor at all from its pickle.
+    ///
+    /// See [`scala_rs_typer::pickle_supply::PickleSupply::supply_ctors`]: a
+    /// nested Scala class's own class file carries no `ScalaSignature`, so a
+    /// class reached through a type alias (`type Table[T] = …`, which is how
+    /// slick exports every one of its abstract classes) is completed from the
+    /// enclosing class's pickle -- where constructors are skipped by name.
+    fn supply_binary_ctors(&mut self, cls: SymbolId) {
+        if !self.library_abi || cls.is_none() {
+            return;
+        }
+        self.pickle
+            .supply_ctors(&mut self.st, &mut self.binary, cls);
     }
 
     pub(crate) fn supply_from_pickle_class(&mut self, cls: SymbolId, name: &str) -> Vec<SymbolId> {
@@ -23325,6 +23435,40 @@ fn is_right_biased_either(st: &SymbolTable, id: SymbolId) -> bool {
     )
 }
 
+/// Index into the flattened parameter list where the clause holding `flat_idx`
+/// begins. `synthesize_default_getters` needs it to tell "a parameter of an
+/// earlier clause" (which a default may name) from "an earlier parameter of my
+/// own clause" (which nsc forbids).
+fn clause_start_of(paramss_ids: &[Vec<SymbolId>], flat_idx: usize) -> usize {
+    let mut start = 0usize;
+    for clause in paramss_ids {
+        if flat_idx < start + clause.len() {
+            return start;
+        }
+        start += clause.len();
+    }
+    start
+}
+
+/// Whether an untyped tree mentions any of `names` as a bare identifier. Used
+/// only to decide whether a default body reads an earlier parameter of its own
+/// clause, so a false positive costs one extra getter parameter, never
+/// correctness.
+fn tree_names_any(tree: &Tree, names: &[String]) -> bool {
+    let mut t = tree.clone();
+    fn walk(t: &mut Tree, names: &[String]) -> bool {
+        if let TreeKind::Ident { name } = &t.kind {
+            if names.iter().any(|n| n == name) {
+                return true;
+            }
+        }
+        crate::lazy_local::children_mut(t)
+            .into_iter()
+            .any(|c| walk(c, names))
+    }
+    walk(&mut t, names)
+}
+
 /// The parser desugars `{ case … }` into `x$pf => x$pf match { case … }`.
 fn is_case_block_literal(vparams: &[Tree], body: &Tree) -> bool {
     vparams.len() == 1
@@ -24290,7 +24434,7 @@ fn mentions_no_type(ty: &Type) -> bool {
     }
 }
 
-/// `ty` が `tps` のいずれかのメソッド型パラメータを含むか。
+/// Whether `ty` mentions any of the method type parameters in `tps`.
 pub(crate) fn mentions_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
     match ty {
         Type::TypeParam(id) => tps.contains(id),

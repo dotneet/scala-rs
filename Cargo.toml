@@ -26,3 +26,6 @@ scala-rs-pickle = { path = "crates/pickle" }
 scala-rs-typer = { path = "crates/typer" }
 scala-rs-backend = { path = "crates/backend" }
 scala-rs-driver = { path = "crates/driver" }
+# A non-cryptographic hasher for the compiler's internal maps. SipHash in
+# `implicits_in_scope` alone was ~5% of a slick build. See README 速度.
+rustc-hash = "2"

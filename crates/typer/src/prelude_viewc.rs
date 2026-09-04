@@ -1,39 +1,38 @@
-//! `SeqView` の「`C` を返すメンバ」。
+//! The "members that return `C`" of `SeqView`.
 //!
-//! `prelude.rs` からは [`install`] を 1 行呼ぶだけにしてある。
+//! `prelude.rs` calls [`install`] on a single line.
 //!
-//! 実 2.13.16 の宣言は
+//! The real 2.13.16 declarations are
 //!
 //! ```text
 //! trait SeqView[+A] extends SeqOps[A, View, View[A]] with View[A]
 //! ```
 //!
-//! で、`map` / `take` / `drop` / `reverse` / `sorted` などは `SeqView` を返す
-//! ように**上書きされている**が、`filter` / `filterNot` / `takeWhile` /
-//! `dropWhile` / `collect` / `flatMap` は上書きされておらず、`IterableOps` の
-//! `C` = **`View[A]`** をそのまま返す（`javap scala.collection.SeqView` に
-//! これらが現れないことで確かめられる）。
+//! and `map` / `take` / `drop` / `reverse` / `sorted` and friends are **overridden**
+//! to return `SeqView`, while `filter` / `filterNot` / `takeWhile` / `dropWhile` /
+//! `collect` / `flatMap` are not, and return `IterableOps`' `C` = **`View[A]`** as
+//! it stands (confirmed by their absence from `javap scala.collection.SeqView`).
 //!
-//! scala-rs の `SeqView` は親を `View[A]` としか書いていないので、pickle から
-//! `IterableOps.filter: C` を補うときの `C` が受け手の `SeqView[A]` に潰れて
-//! いた。すると `xs.view.filter(p)` の静的型が `SeqView[Int]` になり、codegen
-//! は戻り値に `checkcast scala/collection/SeqView` を出す。実行時の値は
-//! `scala.collection.View$Filter`（`View` ではあるが `SeqView` ではない）なので、
-//! **コンパイルは通り、実行して初めて `ClassCastException` になった**。
+//! scala-rs's `SeqView` writes only `View[A]` as its parent, so when
+//! `IterableOps.filter: C` is supplied from the pickle its `C` collapsed to the
+//! receiver's `SeqView[A]`. The static type of `xs.view.filter(p)` then became
+//! `SeqView[Int]` and codegen emitted a `checkcast scala/collection/SeqView` on the
+//! result. The run-time value is a `scala.collection.View$Filter` (a `View`, but not
+//! a `SeqView`), so **it compiled and only threw `ClassCastException` when run**.
 //!
-//! ここで戻り型 `View[A]` を明示して直す。JVM 側の descriptor は `C` の消去で
-//! ある `Ljava/lang/Object;` なので、`jvm_name` に手書きの descriptor を置く
-//! （`prelude.rs` の `View$.fill` と同じ扱い）。呼び出し owner は `SeqView`
-//! のままでよい: 実 scalac も `invokeinterface SeqView.filter` を出す。
+//! The fix is to state the return type `View[A]` here. The JVM-side descriptor is
+//! the erasure of `C`, `Ljava/lang/Object;`, so a hand-written descriptor goes in
+//! `jvm_name` (the same treatment as `prelude.rs`'s `View$.fill`). The invoke owner
+//! can stay `SeqView`: real scalac emits `invokeinterface SeqView.filter` too.
 //!
-//! 私有ランタイム（`--no-scala-library`）に `SeqView` は無い。見つからなければ
-//! 何もしない。
+//! The private runtime (`--no-scala-library`) has no `SeqView`. If it is not found,
+//! do nothing.
 
 use crate::symbol::{SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};
 
-/// `(名前, 引数の消去 descriptor, 戻りが要素型そのままか)`。
-/// `false` は `collect` / `flatMap` のように新しい要素型 `B` を導入するもの。
+/// `(name, erased argument descriptor, whether the result keeps the element type)`.
+/// `false` marks the ones that introduce a fresh element type `B`, like `collect` / `flatMap`.
 pub(crate) const C_MEMBERS: &[(&str, &str, bool)] = &[
     ("filter", "(Lscala/Function1;)Ljava/lang/Object;", true),
     ("filterNot", "(Lscala/Function1;)Ljava/lang/Object;", true),
@@ -47,9 +46,9 @@ pub(crate) const C_MEMBERS: &[(&str, &str, bool)] = &[
     ("flatMap", "(Lscala/Function1;)Ljava/lang/Object;", false),
 ];
 
-/// `SeqView` を受け手にしたときに `View` を返すと宣言した名前。
-/// `check.rs` の `returns_receiver_collection` による受け手への作り直しは、
-/// この名前に対しては**行ってはならない**（`SeqView` の `C` は `View[A]`）。
+/// The names declared to return `View` when the receiver is a `SeqView`.
+/// `check.rs`'s `returns_receiver_collection` must **not** rebuild the result around
+/// the receiver for these names (`SeqView`'s `C` is `View[A]`).
 pub(crate) fn declares_view_result(name: &str) -> bool {
     C_MEMBERS.iter().any(|(n, _, _)| *n == name)
 }
@@ -64,18 +63,18 @@ pub(crate) fn install(st: &mut SymbolTable) {
     let Some(a) = st.get(seq_view).tparams.first().copied() else {
         return;
     };
-    // `View.map` は `IterableOps.map: CC[B]` の消去なので、実際の descriptor は
-    // `(Lscala/Function1;)Ljava/lang/Object;`。`prelude.rs` の宣言は戻り型を
-    // `View[B]` と書いてあり、`jvm_name` が空だと
-    // `(Lscala/Function1;)Lscala/collection/View;` を呼びに行って
-    // `NoSuchMethodError` になる（`xs.view.filter(p).map(f)` で踏んだ）。
+    // `View.map` is the erasure of `IterableOps.map: CC[B]`, so its real descriptor
+    // is `(Lscala/Function1;)Ljava/lang/Object;`. `prelude.rs` declares the return
+    // type as `View[B]`, and with an empty `jvm_name` we would call
+    // `(Lscala/Function1;)Lscala/collection/View;` and get a `NoSuchMethodError`
+    // (hit by `xs.view.filter(p).map(f)`).
     if let Some(m) = st.lookup_member(view, "map").into_iter().next() {
         if st.get(m).jvm_name.is_empty() {
             st.set_jvm_name(m, "(Lscala/Function1;)Ljava/lang/Object;");
         }
     }
     for (name, desc, same_elem) in C_MEMBERS {
-        // 誰かが先に宣言していたら触らない（重複はオーバーロード集合を壊す）。
+        // Leave it alone if someone declared it first (duplicates wreck the overload set).
         if !st.lookup_member(seq_view, name).is_empty() {
             continue;
         }
@@ -87,7 +86,7 @@ fn find_iface(st: &SymbolTable, jvm: &str) -> Option<SymbolId> {
     crate::classpath::find_by_jvm(st, jvm).filter(|s| st.get(*s).kind == SymKind::Class)
 }
 
-/// `def filter(p: A => Boolean): View[A]` / `def collect[B](pf: PartialFunction[A, B]): View[B]`。
+/// `def filter(p: A => Boolean): View[A]` / `def collect[B](pf: PartialFunction[A, B]): View[B]`.
 fn add_c_member(
     st: &mut SymbolTable,
     seq_view: SymbolId,
@@ -109,8 +108,8 @@ fn add_c_member(
         let p = if name == "collect" {
             partial_fn(st, &ta, &tb)
         } else {
-            // `flatMap` の引数は `A => IterableOnce[B]` だが、消去は `Function1`
-            // なので要素型だけ合っていればよい。
+            // `flatMap`'s argument is `A => IterableOnce[B]`, but the erasure is
+            // `Function1`, so only the element type has to line up.
             fn1(&ta, &tb)
         };
         (p, tb)

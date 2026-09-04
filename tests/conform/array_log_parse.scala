@@ -1,4 +1,4 @@
-// ログ行のパースを Array で通す（split / 参照配列 / Option / toSeq）。
+// Parse log lines through an Array (split / reference array / Option / toSeq).
 case class Entry(level: String, code: Int, msg: String)
 
 object Main {

@@ -384,9 +384,20 @@ impl Typer {
         // there instead.
         if let Some((mark, again, saved_ty, was_cyclic)) = retry {
             let cyclic_now = !was_cyclic && self.lazy_cyclic.contains(&id);
+            // `<error>` is as premature as `<notype>` here, and for the same
+            // reason: the completion ran before the member it reads had a
+            // signature, so the name it could not resolve may well resolve on
+            // the body pass. slick's `JdbcCapabilities.insertOrUpdate =
+            // Capability("jdbc.insertOrUpdate")` was forced this way from
+            // `JdbcActionComponent`'s `lazy val useServerSideUpsert =
+            // capabilities contains JdbcCapabilities.insertOrUpdate`, came out
+            // `<error>`, and the cached result left the val typed `Object`
+            // with no accessor and a `throw new RuntimeException("unresolved
+            // apply")` in `JdbcCapabilities$.<init>` -- so every slick program
+            // died initialising the first profile it touched.
             let unresolved = match &self.st.get(id).ty {
-                Type::Method { ret, .. } => ret.is_no_type(),
-                ty => ty.is_no_type(),
+                Type::Method { ret, .. } => ret.is_no_type() || ret.is_error(),
+                ty => ty.is_no_type() || ty.is_error(),
             };
             if unresolved || cyclic_now {
                 self.diags.truncate(mark);
