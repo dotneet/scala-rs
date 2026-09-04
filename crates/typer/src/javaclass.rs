@@ -1,6 +1,9 @@
 //! On-demand Java classfile completion from `-cp`, jars, jmods, and the JDK.
 
-use std::collections::HashMap;
+// `class_cache` is asked for a class name on every completion, and hashing
+// those names with SipHash was measurable. Iteration order is not observable
+// here (the map is only ever looked up by key).
+use rustc_hash::FxHashMap as HashMap;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
@@ -143,7 +146,7 @@ impl BinaryIndex {
             .collect();
         BinaryIndex {
             paths,
-            class_cache: HashMap::new(),
+            class_cache: HashMap::default(),
         }
     }
 

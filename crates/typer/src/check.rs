@@ -18564,18 +18564,22 @@ impl Typer {
         if sym == target {
             return Some(ty.clone());
         }
+        // The walk below has no visited set (a class legitimately appears
+        // twice at different arguments), so a diamond is re-entered once per
+        // path and a miss costs the whole DAG. Asking first whether the target
+        // symbol is up there at all is linear and needs no arguments. It
+        // answers `Some(false)` only when every parent in the closure is an
+        // ordinary class or `AnyRef`/`Any`/`AnyVal`, which is exactly the case
+        // this walk would grind through and return `None` for.
+        if self.st.class_reaches(sym, target) == Some(false) {
+            return None;
+        }
         // Everything here is borrowed. This walks the whole parent DAG on every
         // call, so the two `Vec<Type>` clones it used to make (the arguments and
         // the parent list) were among the typer's largest sources of allocation.
         for p in &self.st.get(sym).parents {
-            let substituted;
-            let p: &Type = if args.is_empty() {
-                p
-            } else {
-                substituted = self.st.subst_tparams(sym, args, p);
-                &substituted
-            };
-            if let Some(found) = self.base_type_instance(p, target, depth + 1) {
+            let p = self.st.subst_tparams_cow(sym, args, p);
+            if let Some(found) = self.base_type_instance(&p, target, depth + 1) {
                 return Some(found);
             }
         }
