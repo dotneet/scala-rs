@@ -623,3 +623,30 @@ swallowed candidates it could not find as `None`) broke `agent/oshadow`
 members on `scala.Enumeration`) in the post-merge whole-tree verification; the
 second version (the same check, but returning the existing prelude symbol instead
 of swallowing) fixed both. See the corresponding sections below for the details.
+
+The fixtures for the `agent/cats` slice (five things typelevel/cats writes that
+never reached the typer) use the prefix `c4` (`c4_lang` / `c4_alias`) and live
+in `crates/cli/tests/cats4.rs` for the same reason; `docs/cats.md` has the
+survey they came out of. `c4_lang.scala` collects four of the five in one file
+so it costs one scalac run and not four: an identifier containing `$`
+(`ev$1`, which cats' checked-in simulacrum output writes) together with a
+`s"$l$r"` interpolation, where `$` is *not* part of the name — slick's
+`b"\($l${concatOperator.get}$r\)"` is why both are pinned in the same fixture;
+an annotation on a **type parameter** (`trait Adder[@marker A]`, the shape of
+cats-kernel's `trait Eq[@sp A]`); `@tailrec` on a def **nested in a method**,
+which is not a member of anything and so cannot be overridden; and a package
+written out in an expression reaching its package object
+(`pkgobj.inner.base`, the shape of
+`cats.kernel.instances.int.catsKernelStdOrderForInt`). It imports
+`scala.annotation.tailrec`, which the private runtime does not supply, so it is
+a **`--scala-library` dual run only** (as `cats_lambda.scala` is), with
+`scalac_agrees_c4_lang_output` checking the stdout against real scalac 2.13.16.
+`c4_alias.scala` is cats' `Representable#compose` written without
+kind-projector: expanding `type Representation = (self.Representation,
+G.Representation)` in an anonymous class whose parent declares `Representation`
+abstract used to recurse until the 512MB stack ran out, and **all 244
+cats-core sources then produced no diagnostics at all**. It does not compile
+yet — `Type::TypeMember` carries no prefix, so the two `Representation`s still
+collapse — so what `c4_alias_terminates_with_a_diagnostic` pins is that the
+compiler *answers*, and `scalac_accepts_c4_alias` pins that real scalac
+2.13.16 accepts the file, so the gap is ours and not the code's.

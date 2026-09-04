@@ -781,11 +781,8 @@ impl<'a> Parser<'a> {
                     self.bump();
                 }
                 TokenKind::At => {
-                    let sp = self.span();
-                    self.bump();
-                    let annot = self.parse_simple_expr();
-                    let path = annot.annotation_path();
-                    if annotation_supported(&path) {
+                    if let Some(annot) = self.parse_annotation() {
+                        let path = annot.annotation_path();
                         let simple = path.rsplit('.').next().unwrap_or(path.as_str());
                         if simple == "volatile" {
                             flags = flags.with(Flags::VOLATILE);
@@ -795,13 +792,6 @@ impl<'a> Parser<'a> {
                             flags = flags.with(Flags::NATIVE);
                         }
                         annotations.push(annot);
-                    } else {
-                        let shown = if path.is_empty() {
-                            "annotation".into()
-                        } else {
-                            format!("annotation {path}")
-                        };
-                        self.error_span(sp, format!("unimplemented syntax: {shown}"));
                     }
                 }
                 _ => break,
@@ -812,6 +802,36 @@ impl<'a> Parser<'a> {
             private_within,
             annotations,
         }
+    }
+
+    /// One `@Ann(args)`, with the `@` as the current token. Returns `None` for
+    /// an annotation this subset does not implement, after reporting it.
+    fn parse_annotation(&mut self) -> Option<Tree> {
+        let sp = self.span();
+        self.bump(); // @
+        let annot = self.parse_simple_expr();
+        let path = annot.annotation_path();
+        if annotation_supported(&path) {
+            return Some(annot);
+        }
+        let shown = if path.is_empty() {
+            "annotation".into()
+        } else {
+            format!("annotation {path}")
+        };
+        self.error_span(sp, format!("unimplemented syntax: {shown}"));
+        None
+    }
+
+    fn parse_type_param_annotations(&mut self) -> Vec<Tree> {
+        let mut out = Vec::new();
+        while matches!(self.kind(), TokenKind::At) {
+            if let Some(annot) = self.parse_annotation() {
+                out.push(annot);
+            }
+            self.skip_nl();
+        }
+        out
     }
 
     fn apply_access_qualifier(&mut self, flags: &mut Flags, private_within: &mut Option<String>) {
@@ -980,7 +1000,13 @@ impl<'a> Parser<'a> {
 
     fn parse_type_param(&mut self) -> Tree {
         let lo = self.span();
-        let mut mods = Modifiers::default();
+        // nsc: `TypeParam ::= {Annotation} [`+' | `-'] ...`. cats-kernel writes
+        // `trait Eq[@sp A]`, so annotations here are not optional to parse.
+        let annotations = self.parse_type_param_annotations();
+        let mut mods = Modifiers {
+            annotations,
+            ..Modifiers::default()
+        };
         if matches!(self.kind(), TokenKind::Ident(s) if s == "+") {
             mods.flags = mods.flags.with(Flags::COVARIANT);
             self.bump();

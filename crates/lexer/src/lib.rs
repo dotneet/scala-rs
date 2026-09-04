@@ -792,7 +792,11 @@ impl<'a> Lexer<'a> {
                 let after_dollar = self.pos + 1;
                 let rest = &self.src[after_dollar..];
                 if let Some(c) = rest.chars().next() {
-                    if is_id_start(c) {
+                    // `$` is a letter in ordinary code but not here: nsc scans
+                    // this name with `Character.isUnicodeIdentifier{Start,Part}`
+                    // and not `Chars.isIdentifier{Start,Part}`, so `$l$r` is
+                    // two holes. slick writes `b"\($l${op}$r\)"`.
+                    if is_interp_id_start(c) {
                         self.emit(
                             TokenKind::StringPart(std::mem::take(&mut buf)),
                             lo,
@@ -801,7 +805,7 @@ impl<'a> Lexer<'a> {
                         self.bump(); // $
                         let id_lo = self.pos as u32;
                         self.bump();
-                        while self.peek().is_some_and(is_id_part) {
+                        while self.peek().is_some_and(is_interp_id_part) {
                             self.bump();
                         }
                         let name = self.src[id_lo as usize..self.pos].to_string();
@@ -878,11 +882,26 @@ enum NumSuffix {
 }
 
 pub fn is_id_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_' || (!c.is_ascii() && c.is_alphabetic())
+    // nsc treats `$` as a letter (`Chars.isIdentifierStart`), so `ev$1` is one
+    // identifier and not an error. Code that spells compiler-generated names
+    // out in the source relies on it: cats' checked-in simulacrum output
+    // writes `implicit ev$1: Defer[G]`.
+    c.is_ascii_alphabetic() || c == '_' || c == '$' || (!c.is_ascii() && c.is_alphabetic())
 }
 
 pub fn is_id_part(c: char) -> bool {
     is_id_start(c) || c.is_ascii_digit()
+}
+
+/// The name in a `s"$name"` hole. nsc scans it with Java's
+/// `Character.isUnicodeIdentifierStart`, which -- unlike `Chars` -- does not
+/// count `$`, so `s"$a$b"` is two holes and not one name `a$b`.
+fn is_interp_id_start(c: char) -> bool {
+    c != '$' && is_id_start(c)
+}
+
+fn is_interp_id_part(c: char) -> bool {
+    c != '$' && is_id_part(c)
 }
 
 pub fn is_op_char(c: char) -> bool {

@@ -14,6 +14,12 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Type-member aliases whose right-hand side is already being expanded.
+    static EXPANDING_ALIASES: std::cell::RefCell<Vec<SymbolId>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 struct BoundGuard(bool);
 
 impl Drop for BoundGuard {
@@ -24,6 +30,33 @@ impl Drop for BoundGuard {
             });
         }
     }
+}
+
+struct AliasGuard;
+
+impl Drop for AliasGuard {
+    fn drop(&mut self) {
+        EXPANDING_ALIASES.with(|b| {
+            b.borrow_mut().pop();
+        });
+    }
+}
+
+/// Returns `None` when this alias's right-hand side is already being expanded.
+/// `Type::TypeMember` carries no prefix, so an anonymous class that defines
+/// `type R = (self.R, G.R)` while its parent declares an abstract `R` resolves
+/// its own right-hand side back to itself, by name. nsc keeps the two apart by
+/// the prefix; until we do, stop at the second visit instead of recursing until
+/// the stack runs out (cats' `Representable#compose` is this shape).
+fn enter_alias(id: SymbolId) -> Option<AliasGuard> {
+    EXPANDING_ALIASES.with(|b| {
+        let mut v = b.borrow_mut();
+        if v.contains(&id) {
+            return None;
+        }
+        v.push(id);
+        Some(AliasGuard)
+    })
 }
 
 /// Returns `None` once the parent walk is implausibly deep, which only
@@ -2741,6 +2774,9 @@ impl SymbolTable {
                             if matches!(t, Type::TypeMember(_) | Type::NoType | Type::Error) {
                                 return Type::TypeMember(m);
                             }
+                            let Some(_guard) = enter_alias(m) else {
+                                return Type::TypeMember(m);
+                            };
                             return self.expand_type_members(from, &t);
                         }
                     }
