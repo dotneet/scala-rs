@@ -3811,6 +3811,12 @@ collection trait gets no mixin forwarders, so `iterableFactory` on an anonymous
 `immutable.IndexedSeq` resolves to `Iterable`'s default and `groupBy` builds a
 `List` where the static type says `IndexedSeq`.
 
+`MODE=a` puts the scala-rs build on the client programs' *compile* classpath as
+well, which makes real scalac read scala-rs's own `ScalaSignature` pickles. That
+does not work yet: `import slick.jdbc.H2Profile.api._` is `value api is not a
+member of object H2Profile`, so the pickle scala-rs writes is not complete
+enough for scalac to compile a cake this deep against it.
+
 ## 実装していないもの
 
 次は実装していません。スタブで「動いたことにする」こともしていません。言語側の残りとライブラリ側の残りを分けます。
