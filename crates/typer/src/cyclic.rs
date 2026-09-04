@@ -33,15 +33,35 @@
 //!
 //! A bound may name the type it bounds — F-bounded polymorphism is the whole
 //! point of `trait Ord[A <: Ord[A]]`, and `type X <: List[X]` is accepted by
-//! scalac too. What is rejected is a bound whose **head** is the bounded type,
-//! directly (`type T <: T`, `def f[A[X] <: A[X]]`) or through other abstract
-//! types (`type X <: Y; type Y <: X`). Those say nothing at all, and every
-//! walk that replaces an abstract type by its bound diverges on them.
+//! scalac too. What is rejected is an *upper* bound whose **head** is the
+//! bounded type, directly (`type T <: T`, `def f[A[X] <: A[X]]`) or through
+//! other abstract types (`type X <: Y; type Y <: X`). Those say nothing at
+//! all, and every walk that replaces an abstract type by its bound diverges
+//! on them.
 //!
 //! So the walk here follows heads only: it steps through `Applied`, an
 //! annotation and the parents of a compound, and it stops at a class. It never
 //! descends into type *arguments*, which is exactly what keeps `Ord[A <: Ord[A]]`
-//! legal. Every line above was checked against `/tmp/scala-2.13.16/bin/scalac`.
+//! legal.
+//!
+//! ## The two bounds are not symmetric
+//!
+//! Read off scalac, one probe per line:
+//!
+//! ```text
+//! trait B { type A[T] >: A[A[T]] }   // accepted  (scala/scala pos/contrib701)
+//! trait B { type A    >: A       }   // illegal cyclic reference involving type A
+//! trait B { type X >: Y; type Y >: X }  // illegal cyclic reference involving type X
+//! trait B { type A[T] <: A[A[T]] }   // cyclic aliasing or subtyping involving type A
+//! trait B { type A[T] <: A[T]    }   // cyclic aliasing or subtyping involving type A
+//! ```
+//!
+//! An *applied* self-reference is a cycle in the upper bound and not in the
+//! lower one. Reading the two the same way cost `pos/contrib701`, which is
+//! nothing but the first line above. So the lower bound is only a cycle when
+//! the self-reference is bare — [`heads`] for the upper bound, [`bare_heads`]
+//! for the lower one — and it carries nsc's other message, the one its
+//! `LOCKED` completion raises.
 
 use rustc_hash::FxHashSet;
 use scala_rs_parser::{SymbolId, Type};
@@ -65,36 +85,59 @@ fn heads(ty: &Type, out: &mut Vec<SymbolId>) {
     }
 }
 
-/// Where an abstract type continues the walk: its right-hand side when it is
-/// an alias, and its bounds when it is not. A placeholder right-hand side
-/// (`TypeMember(self)`, what an abstract member's own type is) is not an
-/// alias.
-fn successors(st: &SymbolTable, id: SymbolId, out: &mut Vec<SymbolId>) {
-    let info = st.get(id);
-    let is_alias = match &info.ty {
-        Type::NoType | Type::Error => false,
-        Type::TypeMember(x) | Type::TypeParam(x) => *x != id,
-        _ => true,
-    };
-    if is_alias {
-        heads(&info.ty, out);
-        return;
-    }
-    if let Some(hi) = &info.bound_hi {
-        heads(hi, out);
-    }
-    if let Some(lo) = &info.bound_lo {
-        heads(lo, out);
+/// [`heads`] without the step through an application: `A[T]` leads nowhere,
+/// a bare `A` leads to `A`. This is the reading the *lower* bound needs.
+fn bare_heads(ty: &Type, out: &mut Vec<SymbolId>) {
+    match ty {
+        Type::TypeParam(id) | Type::TypeMember(id) => out.push(*id),
+        Type::Annotated { tpe, .. } => bare_heads(tpe, out),
+        Type::Refined { parents, .. } => {
+            for p in parents {
+                bare_heads(p, out);
+            }
+        }
+        _ => {}
     }
 }
 
-/// Does `start`'s own bound lead back to `start`?
-pub fn is_cyclic_bound(st: &SymbolTable, start: SymbolId) -> bool {
-    if start.is_none() {
-        return false;
+/// Is this symbol's own type an alias -- a right-hand side that stands for
+/// something else? An abstract member's stored type is the placeholder
+/// `TypeMember(self)`, which is not one.
+fn alias_rhs(st: &SymbolTable, id: SymbolId) -> Option<&Type> {
+    let info = st.get(id);
+    match &info.ty {
+        Type::NoType | Type::Error => None,
+        Type::TypeMember(x) | Type::TypeParam(x) if *x == id => None,
+        other => Some(other),
     }
+}
+
+/// Does the bound named by `edge` lead from `start` back to `start`?
+///
+/// `edge` pushes the symbols one type leads to; the walk continues through an
+/// alias's right-hand side, and otherwise through the same bound again.
+fn cycles_through(
+    st: &SymbolTable,
+    start: SymbolId,
+    upper: bool,
+    edge: fn(&Type, &mut Vec<SymbolId>),
+) -> bool {
     let mut stack: Vec<SymbolId> = Vec::new();
-    successors(st, start, &mut stack);
+    let step = |id: SymbolId, stack: &mut Vec<SymbolId>| {
+        if let Some(rhs) = alias_rhs(st, id) {
+            edge(rhs, stack);
+            return;
+        }
+        let bound = if upper {
+            &st.get(id).bound_hi
+        } else {
+            &st.get(id).bound_lo
+        };
+        if let Some(b) = bound {
+            edge(b, stack);
+        }
+    };
+    step(start, &mut stack);
     let mut seen: FxHashSet<u32> = FxHashSet::default();
     while let Some(s) = stack.pop() {
         if s == start {
@@ -103,7 +146,7 @@ pub fn is_cyclic_bound(st: &SymbolTable, start: SymbolId) -> bool {
         if !seen.insert(s.0) {
             continue;
         }
-        successors(st, s, &mut stack);
+        step(s, &mut stack);
     }
     false
 }
@@ -120,14 +163,20 @@ pub fn bound_cycles(st: &SymbolTable, ids: &[SymbolId]) -> Vec<(SymbolId, String
         if id.is_none() {
             continue;
         }
-        if st.get(id).bound_hi.is_none() && st.get(id).bound_lo.is_none() {
-            continue;
-        }
-        if is_cyclic_bound(st, id) {
+        let info = st.get(id);
+        if info.bound_hi.is_some() && cycles_through(st, id, true, heads) {
             out.push((
                 id,
                 format!(
                     "cyclic aliasing or subtyping involving type {}",
+                    st.get(id).name
+                ),
+            ));
+        } else if info.bound_lo.is_some() && cycles_through(st, id, false, bare_heads) {
+            out.push((
+                id,
+                format!(
+                    "illegal cyclic reference involving type {}",
                     st.get(id).name
                 ),
             ));

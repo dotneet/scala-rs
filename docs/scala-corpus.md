@@ -141,6 +141,12 @@ whole corpus, `CORPUS_JOBS=6`, about fifteen minutes.
 | `run` | 2060 | 433 | 1074 | 553 | **28.7 %** |
 | all | 5324 | 2032 | 2018 | 1274 | 50.2 % |
 
+The breakdowns in this section are all from that run. The numbers themselves
+have since moved — `main` at `d4131b0` scores 974 / 634 / 434 pass, and the
+cycle-detection slice below takes `pos` to 977 and `neg` to 640 — but the
+shape of the tail has not, so the tables are left as they were measured
+rather than half-updated.
+
 ### `pos` — 545 programs scalac compiles and we do not
 
 | count | first diagnostic |
@@ -242,10 +248,10 @@ the module has a companion class (it only emits a separate mirror class when
 there is none). We emit `Test.class` with just `kurtz`, so `java Test` cannot
 start. Reproduced directly with `javap`; it is not an artefact of the runner.
 
-### Eight stack overflows
+### Eight stack overflows — fixed, see below
 
 Not counted as failures — they are skips, because a crash must not quietly
-inflate a `neg` pass rate — but they are the clearest defect the corpus found:
+inflate a `neg` pass rate — but they were the clearest defect the corpus found:
 
 ```
 neg/t10530  neg/t2918  neg/t5093  neg/t5878
@@ -254,29 +260,135 @@ pos/matthias4  pos/t1357  pos/t2994a  pos/t690
 
 All eight are cyclic type references, and the four `neg` ones are tests whose
 whole point is that scalac says `illegal cyclic reference involving type A`
-(`neg/t2918` is two lines: `def g[X, A[X] <: A[X]](x: A[X]) = x`). We have no
-cycle detection in type resolution, so we recurse until the stack ends. This is
-the same failure mode as the `SymbolTable::lub` overflow that made a gitbucket
-measurement report `errors=0 classes=0`.
+(`neg/t2918` is two lines: `def g[X, A[X] <: A[X]](x: A[X]) = x`). There was no
+cycle detection in type resolution, so we recursed until the stack ended. This
+is the same failure mode as the `SymbolTable::lub` overflow that made a
+gitbucket measurement report `errors=0 classes=0`.
 
 There were no timeouts at 40 s.
 
+## Cycle detection (2026-09-05)
+
+`crates/typer/src/cyclic.rs` and `symbol::enter_chase` closed all eight. The
+corpus is now free of crashes.
+
+### What the eight actually were, and they were not one bug
+
+| | |
+|---|---|
+| `neg/t2918`, `neg/t5093` | a type parameter bounded by itself, `A[X] <: A[X]`. `erase_ty` ↔ `widen_type_param` and `class_sym_of` both looped |
+| `neg/t5878`, `neg/t10530` | value classes that wrap each other. A value class erases to what it wraps, so the pair has no erasure and `erase_ty` unboxed one into the other for ever |
+| `pos/t1357` | a recursive existential (`T forSome { type T <: Tuple2[BT[E, T], BT[E, T]] }`) reached through a `Tuple` alias, whose erasure *does* visit its arguments |
+| `pos/t690`, `pos/matthias4` | `class_sym_of` following an abstract member's bound back to itself |
+| `pos/t2994a` | Peano naturals: `type a[s[_], z] = s[n#a[s, z]]` grows one layer per higher-kinded expansion |
+
+### The rules, all read off `/tmp/scala-2.13.16/bin/scalac`
+
+nsc marks a symbol `LOCKED` while it completes it and raises `CyclicReference`
+on re-entry. Two halves of that are reproduced.
+
+**Bounds.** An *upper* bound whose **head** is the type it bounds is
+`cyclic aliasing or subtyping involving type X`. Heads only: the walk steps
+through an application, an annotation and the parents of a compound, and stops
+at a class — which is what keeps F-bounded polymorphism (`trait Ord[A <: Ord[A]]`)
+and `type X <: List[X]` legal, both of which scalac accepts. Aliases
+(`type U = U`, `type X = List[X]`) were already covered by
+`check::expand_one_alias`.
+
+The two bounds are **not** symmetric, and reading them the same way cost
+`pos/contrib701` before the difference was probed:
+
+```scala
+trait B { type A[T] >: A[A[T]] }      // accepted — this is all of pos/contrib701
+trait B { type A    >: A       }      // illegal cyclic reference involving type A
+trait B { type A[T] <: A[T]    }      // cyclic aliasing or subtyping involving type A
+```
+
+An *applied* self-reference is a cycle in the upper bound and not in the lower
+one, so the lower bound only counts a **bare** self-reference, and it carries
+nsc's other message.
+
+**Value classes.** `value class may not wrap another user-defined value class`,
+nsc's `validateDerivedValueClass`. The predicate was probed rather than
+assumed: a compound counts when *any* parent is a value class (`Tr with VA` as
+well as `VA with Tr`), and a type parameter counts when its upper bound is one
+(`class B[T <: A](val a: T) extends AnyVal`), while `Tr with Int` does not.
+
+**The walks defend themselves.** `class_sym_of`, `widen_type_param`,
+`erase_ty` and `expand_applied_hk_alias` all replace an abstract type by what
+it stands for. `symbol::enter_chase` is `LOCKED` for those four: re-entry
+answers "no more information" rather than raising, because erasure also runs
+over signatures the typer never checked — a pickle or a class file can carry a
+cycle nobody in this compilation wrote. The four are kept apart by a `Chase`
+tag; `class_sym_of` looking through `X` while erasure is unfolding `X` is not
+a cycle and must not be told that it is.
+
+`lub_at`'s depth cap of 6 was left alone. It is not a stand-in for cycle
+detection: nsc bounds the same recursion with `Depth`/`maxDepth` and answers
+`Any` when it runs out, and what grows there is the type *arguments*, not a
+symbol that repeats — a symbol-keyed guard would never fire.
+
+### What it moved
+
+Whole corpus, before and after, on the same tree otherwise (`main` at `d4131b0`
+merged in):
+
+| | pass | fail | skip | rate |
+|---|---|---|---|---|
+| `pos` before | 974 | 536 | 349 | 64.5 % |
+| `pos` after | **977** | 537 | 345 | **64.5 %** |
+| `neg` before | 634 | 399 | 372 | 61.4 % |
+| `neg` after | **640** | 397 | 368 | **61.7 %** |
+| `run` before/after | 434 | 1073 | 553 | 28.8 % |
+
+Twelve tests changed status and nothing regressed:
+
+```
+neg/t10530  skip -> pass   value class may not wrap another user-defined value class
+neg/t2918   skip -> pass   cyclic aliasing or subtyping involving type A
+neg/t5093   skip -> pass   cyclic aliasing or subtyping involving type C
+neg/t5878   skip -> pass   value class may not wrap another user-defined value class
+neg/t6337   fail -> pass   value class may not wrap another user-defined value class
+neg/t798    fail -> pass   cyclic aliasing or subtyping involving type Bracks
+pos/cls1    fail -> pass
+pos/t1090   fail -> pass
+pos/t1357   skip -> pass
+pos/matthias4  skip -> fail   type AObject is not a member of <notype>
+pos/t2994a     skip -> fail   incompatible type in overriding type a
+pos/t690       skip -> fail   incompatible type in overriding type T
+```
+
+The three `pos` rows that went `skip -> fail` are **not** a regression: they
+were crashes, and a crash is excluded from the denominator while a failure is
+not. Each is now a diagnostic on a program scalac accepts, which is a hole to
+narrow rather than a compiler that dies. They are three different holes — a
+path-dependent `val a: _a; type A <: a.AObject` prefix, and two as-seen-from
+bugs — and none of them is cycle detection.
+
+`pos/cls1` and `pos/t1090` came from the one real bug this slice turned up:
+`term_path_type` read `Outer.this` as plain `this`, so
+`trait Outer { type T; trait Inner { type T <: Outer.this.T } }` bounded
+`Inner`'s own `T` by itself. That invented cycle is why `pos/t690` overflowed;
+with the qualifier honoured, the shape compiles.
+
+slick (`files=184 errors=0 files_with_errors=0 classes=1596`), `slick_run`
+(`progs=12 ok=12 diff=0 fail=0`), cats (`errors=71 files_with_errors=16`) and
+gitbucket (`errors=1859 files_with_errors=186`) are byte-identical before and
+after, which is the check that mattered: this slice adds two rejection rules.
+
 ## What would move the number most
 
-1. **Cycle detection in type resolution.** Eight crashes, four of them tests
-   that exist specifically to check the diagnostic, and it removes a class of
-   silent whole-compiler failures.
-2. **Static forwarders into a companion class.** Fifteen `run` tests, one
+1. **Static forwarders into a companion class.** Fifteen `run` tests, one
    well-understood rule, contained to the backend.
-3. **`AnyRef` conformance.** `val x: AnyRef = 1` compiling is a hole under
+2. **`AnyRef` conformance.** `val x: AnyRef = 1` compiling is a hole under
    everything else; but it is a *rejection* rule, and this project's history
    says a new rejection rule breaks more than it fixes. Do it with the slick,
    cats and gitbucket measurements in hand.
-4. **Compare the `neg` `.check` text.** The 61.4 % `neg` figure is an upper
+3. **Compare the `neg` `.check` text.** The 61.4 % `neg` figure is an upper
    bound: it counts a rejection for the wrong reason as a pass. Matching the
    message would turn the column into a real number, and the log already
    records which diagnostic fired.
-5. **The 47 `VerifyError`s.** Every one is a classfile the JVM refuses. They
+4. **The 47 `VerifyError`s.** Every one is a classfile the JVM refuses. They
    need individual narrowing, but the corpus hands over the reproducers.
 
 ## Known limits of this runner

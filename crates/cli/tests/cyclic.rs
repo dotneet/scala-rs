@@ -245,6 +245,35 @@ fn enclosing_this_type_member_resolves_to_the_outer_member() {
     );
 }
 
+/// scala/scala `pos/contrib701`, the whole file. An *applied* self-reference
+/// is a cycle in an upper bound and not in a lower one; reading the two the
+/// same way turned this passing test into a failure, which is how the
+/// asymmetry was found.
+#[test]
+fn applied_self_reference_in_a_lower_bound_stays_legal() {
+    accepts("contrib701", "trait B { type A[T] >: A[A[T]] }");
+}
+
+/// The bare lower-bound self-reference, which scalac *does* reject — with its
+/// other message.
+#[test]
+fn bare_self_reference_in_a_lower_bound_is_cyclic() {
+    rejects(
+        "barelower",
+        "trait B { type A >: A }",
+        "illegal cyclic reference involving type A",
+    );
+}
+
+#[test]
+fn mutually_lower_bounded_members_are_cyclic() {
+    rejects(
+        "mutuallower",
+        "trait B { type X >: Y; type Y >: X }",
+        "illegal cyclic reference involving type",
+    );
+}
+
 #[test]
 fn value_classes_over_ordinary_types_stay_legal() {
     accepts(
