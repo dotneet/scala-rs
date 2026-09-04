@@ -11,17 +11,18 @@ code generation → writing the class files).
 | scala-rs, before any optimisation           | 217.3 s   | 209.6 s           | 4552        |
 | scala-rs, after the first pass              | 3.5 s     | 3.0 s             | 4552        |
 | scala-rs, after the second pass and indy    | 2.0 s     | 1.8 s             | 2127        |
-| scala-rs, after the class-file writing pass | 1.8 s     | 1.7 s             | 1552        |
-| scala-rs, after the redone-work pass        | **1.5 s** | **1.4 s**         | 1552        |
+| scala-rs, after the class-file writing pass | 1.7 s     | 1.6 s             | 1596        |
+| scala-rs, after the redone-work pass        | **1.4 s** | **1.3 s**         | 1596        |
 
 Medians of three runs each, alternating between the two compilers so both see
-the same machine, except the last row (best of twenty alternating runs -- see
-*Measuring on a loaded machine* below). The last row is the current state; the
-earlier rows are kept because the optimisation passes are described below and
-the numbers are what each one moved.
+the same machine; the last two rows are medians of eight alternating runs taken
+back to back on a quiet machine (`user` 1.62 s → 1.34 s, `sys` 0.20 s in both).
+The last row is the current state; the earlier rows are kept because the
+optimisation passes are described below and the numbers are what each one
+moved.
 
 The class-file counts in the middle rows are what those passes measured. The
-count today is **1552**, not the 2127 the `invokedynamic` row records; the
+count today is **1596**, not the 2127 the `invokedynamic` row records; the
 paragraphs below that quote 2127 are left as the record of what was measured
 at the time.
 
@@ -30,7 +31,7 @@ passes because they were arithmetic. It hides the third: writing the class
 files spends its CPU in the kernel, and that pass took **`sys` from 0.83 s to
 0.22 s**. Total CPU on the last row is 1.89 s against the previous 2.50 s.
 
-That is **140x less CPU than where it started**, and against nsc **8x faster in
+That is **136x less CPU than where it started**, and against nsc **8x faster in
 wall time, 45x in CPU**. nsc's wall time is carried by several threads; the
 compile in scala-rs is still **entirely single-threaded**, and only writing the
 class files is parallel.
@@ -113,11 +114,12 @@ that needs no type arguments.
 | `find_overridden_method` walks symbols, not cloned parent types | −1.5% |
 | read `SCALA_RS_*_DEBUG` once; don't build a type to answer a predicate | −0.4% |
 
-Measured end to end against the branch point, alternating the two binaries:
-**22.89 G instructions → 19.76 G, −13.7%**, and best of twenty runs each
-**1.75 s → 1.47 s wall, 1.65 s → 1.37 s `user`** (`sys` unchanged at 0.20 s).
-Every class file slick produces is byte-identical to the old binary's
-(`diff -r` over both output trees) and the diagnostics are the same text.
+Measured end to end against `main`, eight runs each alternating the two
+binaries on a quiet machine: **22.75 G instructions → 19.59 G (−13.9%)**,
+**1.71 s → 1.44 s wall (−16%)**, **1.62 s → 1.34 s `user` (−17%)**, `sys`
+unchanged at 0.20 s. Every class file slick produces is byte-identical to the
+old binary's (`diff -r` over both output trees) and the diagnostics are the
+same text.
 
 **The first pass's headline was still true a year later.** Four of its seven
 roots were "quadratic in files × symbols", and four more of exactly that shape
@@ -172,7 +174,7 @@ Two smaller constants, both worth remembering as a species:
 costed and turned down, which is worth as much as the ones that landed.
 
 - **Restricting `pickle_all` to the classes the run emits.** It pickles every
-  `Class`/`ModuleClass` in the table before erasure, and only 1552 of them are
+  `Class`/`ModuleClass` in the table before erasure, and only ~1600 of them are
   emitted -- but the table holds just **2855** classes for slick's 113,959
   symbols, so the waste is bounded at 45% of a 7% phase. Against that,
   `attach_scala_sig` *falls back* to pickling at emit time for any class the
@@ -327,10 +329,12 @@ strided reads over a large `Vec<Symbol>`: `flatten_method_symbols` moved
 rather than arithmetic, take instructions as a *lower bound* and confirm with
 CPU time on a quiet moment, or with `cycles elapsed` from the same output.
 
-**Report the minimum, not the mean, when the load is high.** Contention only
+**Report the minimum, not the median, when the load is high.** Contention only
 ever makes a run slower, so over enough alternating pairs the fastest run of
-each binary is the least-disturbed estimate of both. The medians in this
-document's last row come from the best of twenty.
+each binary is the least-disturbed estimate of both. The two agree when the
+machine is quiet: at load 8 the redone-work pass measured −15% CPU by median
+and −16% by minimum; at load 26, the same pair of binaries gave −22% by median
+and −3% by minimum, both from noise.
 
 Two binaries, alternating, is still the only way to compare: build the old one
 into a scratch tree (`git archive main | tar -x -C <dir>` and `cargo build
