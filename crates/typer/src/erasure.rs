@@ -21,6 +21,11 @@ pub fn erase(tree: &mut Tree, st: &mut SymbolTable) {
             args: vec![],
         };
     }
+    // These writes are the one thing that can make the next unit's
+    // `erase_symbols` do work again; see `SymbolTable::erasure_settled`.
+    if !boxed_params.is_empty() {
+        st.erasure_settled = false;
+    }
     erase_tree(tree, st, None);
 }
 
@@ -212,7 +217,24 @@ fn for_each_child(tree: &Tree, f: &mut impl FnMut(&Tree)) {
     }
 }
 
+/// Erase every symbol's type in place.
+///
+/// `erase` runs once per compilation unit and this pass is over the *whole*
+/// symbol table, so with slick (184 units, ~10^5 symbols, most of them read out
+/// of jars) it was 55% of the entire compile — quadratic in the number of
+/// files. It is a fixpoint loop, though, and one that usually converges after
+/// two rounds: a pass that changes nothing leaves `st` exactly as it found it,
+/// so the next pass over the same table cannot change anything either. That is
+/// what `erasure_settled` records. The only writes to a symbol's type between
+/// two passes are the boxed lambda parameters in `erase` above, which clear the
+/// flag, and `alloc`, which clears it too — `erase_tree` writes tree types
+/// only. Skipping a settled pass is therefore not an approximation: the pass
+/// that is skipped provably had no effect.
 fn erase_symbols(st: &mut SymbolTable) {
+    if st.erasure_settled {
+        return;
+    }
+    let mut changed = false;
     let n = st.symbols.len();
     for i in 1..n {
         let id = SymbolId(i as u32);
@@ -226,19 +248,32 @@ fn erase_symbols(st: &mut SymbolTable) {
         ) {
             continue;
         }
-        let ty = st.get(id).ty.clone();
-        if kind == crate::symbol::SymKind::Term {
-            if let Some(c) = value_class_of(&ty, st) {
-                st.value_class_terms.insert(id, c);
-            }
-        }
-        let erased = if kind == crate::symbol::SymKind::Method {
-            erase_overriding_method(st, id, &ty)
-        } else {
-            erase_ty(&ty, st)
+        // Borrowed, not cloned: `erase_ty` and `value_class_of` only read, and
+        // deep-cloning every symbol's type was a tenth of the whole compile.
+        let (erased, value_class) = {
+            let st: &SymbolTable = st;
+            let ty = &st.get(id).ty;
+            let value_class = if kind == crate::symbol::SymKind::Term {
+                value_class_of(ty, st)
+            } else {
+                None
+            };
+            let erased = if kind == crate::symbol::SymKind::Method {
+                erase_overriding_method(st, id, ty)
+            } else {
+                erase_ty(ty, st)
+            };
+            (erased, value_class)
         };
-        st.get_mut(id).ty = erased;
+        if let Some(c) = value_class {
+            st.value_class_terms.insert(id, c);
+        }
+        if st.get(id).ty != erased {
+            changed = true;
+            st.get_mut(id).ty = erased;
+        }
     }
+    st.erasure_settled = !changed;
 }
 
 fn erase_overriding_method(st: &SymbolTable, id: SymbolId, ty: &Type) -> Type {

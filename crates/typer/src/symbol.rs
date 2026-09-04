@@ -446,6 +446,12 @@ pub struct SymbolTable {
     /// `jvm_name` -> class-like symbols carrying it, for `classpath::find_by_jvm`,
     /// which used to scan every symbol on every call. See `JvmIndex`.
     pub(crate) jvm_index: std::cell::RefCell<JvmIndex>,
+    /// The last `erasure::erase_symbols` pass changed nothing, and nothing has
+    /// changed a symbol's type since. The next pass over the same table would
+    /// therefore also change nothing, so it is skipped. Cleared by `alloc` and
+    /// by the one place in `erasure` that writes a symbol type outside the
+    /// pass itself.
+    pub erasure_settled: bool,
 }
 
 /// Reverse index from `jvm_name` to the class-like symbols that have it.
@@ -545,6 +551,7 @@ impl SymbolTable {
             prelude_end: 0,
             seq_extractor_payload: std::collections::HashMap::new(),
             jvm_index: std::cell::RefCell::new(JvmIndex::default()),
+            erasure_settled: false,
         };
         st.root = st.alloc(
             "<_root_>",
@@ -566,6 +573,9 @@ impl SymbolTable {
         jvm_name: impl Into<String>,
     ) -> SymbolId {
         let id = SymbolId(self.symbols.len() as u32);
+        // A symbol that appears after an erasure pass has an un-erased type,
+        // so the next pass has work to do again.
+        self.erasure_settled = false;
         self.symbols.push(Symbol {
             id,
             name: name.into(),
