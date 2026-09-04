@@ -15459,6 +15459,19 @@ fn emit_partial_function_methods<'a>(
                     }
                 }
             }
+            // The synthetic `apply` above passes `null` for the fallback: no
+            // case matched and there is nothing to fall back to, which is
+            // exactly `MatchError`. Every real caller (`collect`, `orElse`,
+            // `lift`) passes a function and is unaffected.
+            let has_default = a.fresh_label();
+            a.aload(2);
+            a.ifnonnull(has_default);
+            a.new_obj("scala/MatchError");
+            a.dup();
+            a.aload(1);
+            a.invokespecial("scala/MatchError", "<init>", "(Ljava/lang/Object;)V");
+            a.athrow();
+            a.mark(has_default);
             a.aload(2);
             a.aload(1);
             a.invokeinterface(
@@ -15801,7 +15814,10 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
         } else {
             "arity".to_string()
         };
-        eprintln!("LAMBDA-FALLBACK {why}");
+        eprintln!(
+            "LAMBDA-FALLBACK {why} {} {}..{} ty={:?}",
+            ctx.source, tree.span.lo.0, tree.span.hi.0, tree.ty
+        );
     }
 
     // Create instance: new, dup, load captures, invokespecial
@@ -15926,115 +15942,144 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
     let meth_name_owned = meth_name.to_string();
     let meth_desc_owned = meth_desc.to_string();
 
-    b.add_code(ACC_PUBLIC, &meth_name_owned, &meth_desc_owned, 8, |a| {
-        let mut fr = Frame::instance();
-        fr.next_slot = 1 + arity as u16;
-        // apply args occupy slots 1..arity as Object; remap param symbols after unbox
-        for (i, p) in vparams.iter().enumerate() {
-            let obj_slot = 1 + i as u16;
-            // A parameter instantiated at a value class receives the boxed
-            // instance; erasure recorded that on the symbol.
-            let p = &Tree {
-                ty: if p.sym.is_none() {
-                    p.ty.clone()
+    if is_pf {
+        // nsc puts the case bodies in `applyOrElse` alone; `apply` is inherited
+        // from `AbstractPartialFunction` and reads
+        // `applyOrElse(x, PartialFunction.empty)`. Generating the whole `match`
+        // a second time here made every lambda **class** nested inside a case
+        // body come out twice, and the factor compounds with nesting: slick
+        // has 130 distinct `{ case … }` literals but got 707 classfiles, one
+        // literal alone appearing 128 times. `null` is the "no fallback"
+        // marker `applyOrElse` turns into the `MatchError` `apply` owes.
+        let lam_apply = lam_name.clone();
+        b.add_code(
+            ACC_PUBLIC,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            3,
+            |a| {
+                a.aload(0);
+                a.aload(1);
+                a.aconst_null();
+                a.invokevirtual(
+                    &lam_apply,
+                    "applyOrElse",
+                    "(Ljava/lang/Object;Lscala/Function1;)Ljava/lang/Object;",
+                );
+                a.areturn();
+            },
+        );
+    } else {
+        b.add_code(ACC_PUBLIC, &meth_name_owned, &meth_desc_owned, 8, |a| {
+            let mut fr = Frame::instance();
+            fr.next_slot = 1 + arity as u16;
+            // apply args occupy slots 1..arity as Object; remap param symbols after unbox
+            for (i, p) in vparams.iter().enumerate() {
+                let obj_slot = 1 + i as u16;
+                // A parameter instantiated at a value class receives the boxed
+                // instance; erasure recorded that on the symbol.
+                let p = &Tree {
+                    ty: if p.sym.is_none() {
+                        p.ty.clone()
+                    } else {
+                        st.get(p.sym).ty.clone()
+                    },
+                    ..p.clone()
+                };
+                a.aload(obj_slot);
+                if is_jvm_primitive(&p.ty) || matches!(p.ty, Type::String) {
+                    emit_unbox(a, &p.ty);
+                } else if let Type::Array(elem) = &p.ty {
+                    // An `Array` parameter arrives in the erased `Object` slot,
+                    // and `arraylength` / `aaload` / `aastore` all reject a plain
+                    // `Object`: `g.map(_.length)` on an `Array[Array[Int]]` was a
+                    // `VerifyError` ("Bad type on operand stack in arraylength")
+                    // although the same expression outside a lambda was fine. nsc
+                    // casts here too. An abstract element type erases to `Object`
+                    // itself, and there `[Ljava/lang/Object;` would be the wrong
+                    // cast (the value may be an `int[]`), so leave it alone.
+                    if is_concrete_array_elem(elem) {
+                        a.checkcast(&jvm_desc(st, &p.ty));
+                    }
+                } else if let Type::Class { sym, .. } = &p.ty {
+                    let n = class_internal(st, *sym);
+                    if !n.is_empty() && n != "java/lang/Object" {
+                        a.checkcast(&n);
+                    }
+                } else if matches!(p.ty, Type::Tuple(_)) {
+                    a.checkcast("scala/Tuple2");
                 } else {
-                    st.get(p.sym).ty.clone()
-                },
-                ..p.clone()
-            };
-            a.aload(obj_slot);
-            if is_jvm_primitive(&p.ty) || matches!(p.ty, Type::String) {
-                emit_unbox(a, &p.ty);
-            } else if let Type::Array(elem) = &p.ty {
-                // An `Array` parameter arrives in the erased `Object` slot,
-                // and `arraylength` / `aaload` / `aastore` all reject a plain
-                // `Object`: `g.map(_.length)` on an `Array[Array[Int]]` was a
-                // `VerifyError` ("Bad type on operand stack in arraylength")
-                // although the same expression outside a lambda was fine. nsc
-                // casts here too. An abstract element type erases to `Object`
-                // itself, and there `[Ljava/lang/Object;` would be the wrong
-                // cast (the value may be an `int[]`), so leave it alone.
-                if is_concrete_array_elem(elem) {
-                    a.checkcast(&jvm_desc(st, &p.ty));
+                    emit_unbox(a, &p.ty);
                 }
-            } else if let Type::Class { sym, .. } = &p.ty {
-                let n = class_internal(st, *sym);
-                if !n.is_empty() && n != "java/lang/Object" {
-                    a.checkcast(&n);
-                }
-            } else if matches!(p.ty, Type::Tuple(_)) {
-                a.checkcast("scala/Tuple2");
-            } else {
-                emit_unbox(a, &p.ty);
-            }
-            let sort = jvm_sort(&p.ty);
-            let slot = fr.alloc(p.sym, sort);
-            store(a, slot, sort);
-        }
-        for (i, id) in local_caps.iter().enumerate() {
-            let ty = st.get(*id).ty.clone();
-            a.aload(0);
-            a.getfield(&lam_name2, &format!("$captured${i}"), "Ljava/lang/Object;");
-            if boxed.contains(id) {
-                a.checkcast(runtime_ref_class(&ty));
-                let slot = fr.alloc(*id, JvmSort::Ref);
-                store(a, slot, JvmSort::Ref);
-            } else {
-                emit_from_erased_object(a, st, &ty);
-                let sort = jvm_sort(&ty);
-                let slot = fr.alloc(*id, sort);
+                let sort = jvm_sort(&p.ty);
+                let slot = fr.alloc(p.sym, sort);
                 store(a, slot, sort);
             }
-        }
-        let outer_storage;
-        let outer_ref = if need_outer {
-            outer_storage = (lam_name2.as_str(), "$outer", outer_desc.as_str());
-            Some(outer_storage)
-        } else {
-            None
-        };
-        let inner_ctx = EmitCtx {
-            st,
-            class_sym,
-            class_name: &orig_class,
-            ret_ty: ret_ty.clone(),
-            extras,
-            lambda_n,
-            lambda_bodies,
-            hoist_owner,
-            source,
-            outer: outer_ref,
-            presuper_outer: None,
-            outer_slot: None,
-            library_abi,
-            method_sym: SymbolId::NONE,
-            boxed_vars: boxed,
-        };
-        gen_expr(a, &mut fr, &inner_ctx, &body);
-        if matches!(body.ty, Type::Nothing) {
-            // `throw` already emits athrow. A following areturn would be an
-            // empty-stack stackmap target (`tryBreakable { throw e }`).
-        } else if let Some(raw_ret) = &sam_ret {
-            if is_unit_like(raw_ret) {
-                pop_if_value(a, &body.ty);
-                a.vreturn();
-            } else if is_jvm_primitive(raw_ret) {
-                emit_return(a, raw_ret);
-            } else {
-                if is_jvm_primitive(&ret_ty) && !is_unit_like(&ret_ty) {
-                    emit_box(a, &ret_ty);
+            for (i, id) in local_caps.iter().enumerate() {
+                let ty = st.get(*id).ty.clone();
+                a.aload(0);
+                a.getfield(&lam_name2, &format!("$captured${i}"), "Ljava/lang/Object;");
+                if boxed.contains(id) {
+                    a.checkcast(runtime_ref_class(&ty));
+                    let slot = fr.alloc(*id, JvmSort::Ref);
+                    store(a, slot, JvmSort::Ref);
+                } else {
+                    emit_from_erased_object(a, st, &ty);
+                    let sort = jvm_sort(&ty);
+                    let slot = fr.alloc(*id, sort);
+                    store(a, slot, sort);
                 }
+            }
+            let outer_storage;
+            let outer_ref = if need_outer {
+                outer_storage = (lam_name2.as_str(), "$outer", outer_desc.as_str());
+                Some(outer_storage)
+            } else {
+                None
+            };
+            let inner_ctx = EmitCtx {
+                st,
+                class_sym,
+                class_name: &orig_class,
+                ret_ty: ret_ty.clone(),
+                extras,
+                lambda_n,
+                lambda_bodies,
+                hoist_owner,
+                source,
+                outer: outer_ref,
+                presuper_outer: None,
+                outer_slot: None,
+                library_abi,
+                method_sym: SymbolId::NONE,
+                boxed_vars: boxed,
+            };
+            gen_expr(a, &mut fr, &inner_ctx, &body);
+            if matches!(body.ty, Type::Nothing) {
+                // `throw` already emits athrow. A following areturn would be an
+                // empty-stack stackmap target (`tryBreakable { throw e }`).
+            } else if let Some(raw_ret) = &sam_ret {
+                if is_unit_like(raw_ret) {
+                    pop_if_value(a, &body.ty);
+                    a.vreturn();
+                } else if is_jvm_primitive(raw_ret) {
+                    emit_return(a, raw_ret);
+                } else {
+                    if is_jvm_primitive(&ret_ty) && !is_unit_like(&ret_ty) {
+                        emit_box(a, &ret_ty);
+                    }
+                    a.areturn();
+                }
+            } else if is_unit_like(&ret_ty) {
+                pop_if_value(a, &body.ty);
+                emit_box(a, &Type::Unit);
+                a.areturn();
+            } else {
+                emit_box(a, &ret_ty);
                 a.areturn();
             }
-        } else if is_unit_like(&ret_ty) {
-            pop_if_value(a, &body.ty);
-            emit_box(a, &Type::Unit);
-            a.areturn();
-        } else {
-            emit_box(a, &ret_ty);
-            a.areturn();
-        }
-    });
+        });
+    }
     if is_pf {
         emit_partial_function_methods(
             &mut b,
