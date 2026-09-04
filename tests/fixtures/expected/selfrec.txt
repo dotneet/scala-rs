@@ -28,3 +28,6 @@ ab|p|
 ab|p|!
 abab
 z|q| 
+a
+c
+d

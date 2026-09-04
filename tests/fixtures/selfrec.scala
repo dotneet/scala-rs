@@ -20,6 +20,10 @@
 // 4. A value class whose method has a default argument. The getter is reached
 //    through a `name$default$n$extension` of its own, and a separately
 //    compiled caller links against the copy on the *companion module*.
+//
+// 5. A pattern binder whose type is a *tuple*, read out of a sequence pattern.
+//    The extractor hands the element back as an `Object`, and the cast to
+//    `scala/Tuple2` has to be there before `_1` / `_2`.
 
 trait Session { def id: String }
 
@@ -74,8 +78,28 @@ final class Ops(val s: String) extends AnyVal {
   def twice(n: Int = 2): String = s * n
 }
 
+// slick's `ConstArray`, whose `unapplySeq` hands back an `IndexedSeq`.
+final class Arr[T](val xs: IndexedSeq[T])
+object Arr {
+  def unapplySeq[T](a: Arr[T]): Some[IndexedSeq[T]] = Some(a.xs)
+}
+
 object Main {
   implicit val session: Session = new Session { def id = "s1" }
+
+  // slick's `case StructNode(ConstArray(ch, _*)) => ch._2`.
+  def viaSeq(xs: Seq[(Int, String)]): String = xs match {
+    case Seq(ch, _*) => ch._2
+    case _           => "none"
+  }
+  def viaUnapplySeq(a: Arr[(Int, String)]): String = a match {
+    case Arr(ch, _*) => ch._2
+    case _           => "none"
+  }
+  def viaList(xs: List[(Int, String)]): String = xs match {
+    case h :: _ => h._2
+    case _      => "none"
+  }
 
   // slick's `BasicBackend`: `f.asInstanceOf[Any => DBIOAction[…]](v)`.
   def applyCast(f: Any, v: Any): Any = f.asInstanceOf[Any => String](v)
@@ -131,5 +155,9 @@ object Main {
     println(o.like("p", '!'))
     println(o.twice())
     println(new Ops("z").like("q"))
+
+    println(viaSeq(Seq((1, "a"), (2, "b"))))
+    println(viaUnapplySeq(new Arr(IndexedSeq((3, "c")))))
+    println(viaList(List((4, "d"))))
   }
 }

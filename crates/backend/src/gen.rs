@@ -18917,6 +18917,15 @@ fn emit_pattern_cast(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
     let target = match ty {
         Type::Array(_) => jvm_desc(ctx.st, ty),
         Type::NoType | Type::Error | Type::Any | Type::AnyRef => return,
+        // `type_jvm_name` answers `java/lang/Object` for a structural tuple
+        // type, i.e. no cast at all. A `(TermSymbol, Node)` really is a
+        // `scala/Tuple2` at run time, and a binder of that type read out of an
+        // erased extractor needs the cast before its `_1` / `_2`. slick's
+        // `case StructNode(ConstArray(ch, _*)) => ch._2` had
+        // `apply$extension(SeqOps, I)Object` feeding a
+        // `getfield scala/Tuple2._2` (`VerifyError` in
+        // `MergeToComprehensions`, which is every `groupBy` and every join).
+        Type::Tuple(ts) if !ts.is_empty() => format!("scala/Tuple{}", ts.len()),
         _ => type_jvm_name(ctx.st, ty),
     };
     if target.is_empty() || target == "java/lang/Object" {
