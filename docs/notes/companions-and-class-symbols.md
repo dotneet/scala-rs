@@ -317,6 +317,14 @@ scala-rs and by real scalac, in `crates/cli/tests/e2e.rs`.
   and on top of that we join a nested anonymous class's name with `/`
   instead of `$`, which drops it at the output root rather than beside its
   owner. Left alone deliberately; it is its own slice.
+* **A mirror class forwards `def`s but not `val` accessors.** nsc's
+  `slick/util/GlobalConfig.class` has `public static boolean
+  detectRebuild()` and five more; ours has only the one `def`. Same for a
+  package object's mirror (`slick/util/package.class` is missing
+  `ignoreFollowOnError()`). `emit_forwarder`'s list is built from the
+  template's `DefDef`s alone. It costs nothing through the pickle -- a
+  Scala consumer reads the accessor off the module -- so it only shows up
+  from Java. Pre-existing and not specific to package objects; left alone.
 * **Two pre-existing pickle gaps found while probing, unrelated to value
   classes** (both reproduce on plain classes on `main`): an operator-named
   **method** is not visible to scalac through our pickle (`value ~ is not a
