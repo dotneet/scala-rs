@@ -1,0 +1,7 @@
+base: mapped(int)
+direct: direct(int)
+name: <xs>
+inferred: leaf7
+buf: 208
+1a 2b 3c b c 
+super: A

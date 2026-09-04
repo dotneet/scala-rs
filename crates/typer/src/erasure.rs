@@ -249,7 +249,7 @@ fn erase_symbols(st: &mut SymbolTable) {
         }
         // Borrowed, not cloned: `erase_ty` and `value_class_of` only read, and
         // deep-cloning every symbol's type was a tenth of the whole compile.
-        let (erased, value_class) = {
+        let (erased, value_class, abstract_params) = {
             let st: &SymbolTable = st;
             let ty = &st.get(id).ty;
             let value_class = if kind == crate::symbol::SymKind::Term {
@@ -257,15 +257,21 @@ fn erase_symbols(st: &mut SymbolTable) {
             } else {
                 None
             };
-            let erased = if kind == crate::symbol::SymKind::Method {
-                erase_overriding_method(st, id, ty)
+            let (erased, abstract_params) = if kind == crate::symbol::SymKind::Method {
+                (erase_overriding_method(st, id, ty), abstract_param_mask(ty))
             } else {
-                erase_ty(ty, st)
+                (erase_ty(ty, st), 0)
             };
-            (erased, value_class)
+            (erased, value_class, abstract_params)
         };
         if let Some(c) = value_class {
             st.value_class_terms.insert(id, c);
+        }
+        // Only ever recorded, never cleared: `erase_symbols` runs to a
+        // fixpoint, and on the second pass the parameters have already lost
+        // the shape this is reading.
+        if abstract_params != 0 {
+            st.erased_abstract_params.insert(id, abstract_params);
         }
         if st.get(id).ty != erased {
             changed = true;
@@ -273,6 +279,36 @@ fn erase_symbols(st: &mut SymbolTable) {
         }
     }
     st.erasure_settled = !changed;
+}
+
+/// One bit per parameter of `ty`'s flattened parameter list, set when that
+/// parameter is a type parameter or an abstract type member — the shape whose
+/// erasure a subclass is free to narrow. Flattened exactly as
+/// `gen::method_params_from_sym` flattens it, so the bits line up with what
+/// the backend compares.
+fn abstract_param_mask(ty: &Type) -> u32 {
+    fn is_abstract(ty: &Type) -> bool {
+        match ty {
+            Type::TypeParam(_)
+            | Type::TypeMember(_)
+            | Type::Wildcard
+            | Type::BoundedWildcard { .. } => true,
+            Type::Applied { ctor, .. } | Type::Annotated { tpe: ctor, .. } => is_abstract(ctor),
+            _ => false,
+        }
+    }
+    let params: Vec<&Type> = match ty {
+        Type::Method { paramss, .. } => paramss.iter().flatten().collect(),
+        Type::Function { params, .. } => params.iter().collect(),
+        _ => return 0,
+    };
+    let mut mask = 0u32;
+    for (i, p) in params.iter().enumerate().take(32) {
+        if is_abstract(p) {
+            mask |= 1 << i;
+        }
+    }
+    mask
 }
 
 fn erase_overriding_method(st: &SymbolTable, id: SymbolId, ty: &Type) -> Type {
@@ -486,23 +522,30 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         // from the profile's `insertAll(Iterable, RowsPerStatement)` --
         // `NoSuchMethodError` on the trait's `$super$` accessor.
         //
-        // Only a bound that names **one** class is taken. A compound bound
-        // (`type TermName >: Null <: TermNameApi with Name`, from
-        // scala-reflect) needs nsc's `intersectionDominator`, and guessing at
-        // it is worse than `Object`: picking the first parent gave
-        // `TermNameApi`, which is not a `NameApi`, so passing a `TermName`
-        // where `Select.apply(TreeApi, NameApi)` wants a `Name` stopped
-        // getting the cast that the `Object` erasure earns it and the macro
-        // bridges failed to verify.
+        // A **compound** bound (`type BaseColumnType[T] <: ColumnType[T] with
+        // BaseTypedType[T]`) erases through nsc's `intersectionDominator`, in
+        // `intersection_dominator` below. It really does drop information:
+        // scala-reflect's `type TermName >: Null <: TermNameApi with Name`
+        // erases to `TermNameApi`, which is *not* a `NameApi` (only `Name`
+        // brings that in) -- and nsc's own `newTermName` returns exactly
+        // `Names$TermNameApi`, so a `TermName` passed where `NameApi` is
+        // expected is cast at the call site rather than erased more widely.
         Type::TypeMember(id) => match st.dealias(ty) {
             d if d == *ty => match st.get(*id).bound_hi.clone() {
                 // `type A <: A` (or a bound naming the member itself) has no
                 // more information than `Object`.
-                Some(hi)
-                    if hi != *ty
-                        && !matches!(&hi, Type::TypeMember(h) if h == id)
-                        && !matches!(st.dealias(&hi), Type::Refined { .. }) =>
-                {
+                Some(hi) if hi != *ty && !matches!(&hi, Type::TypeMember(h) if h == id) => {
+                    let hi = match st.dealias(&hi) {
+                        Type::Refined { parents, decls }
+                            if !crate::symbol::SymbolTable::refined_has_term_members(&decls) =>
+                        {
+                            match intersection_dominator(&parents, st) {
+                                Some(p) if p != *ty => p,
+                                _ => return Type::Any,
+                            }
+                        }
+                        _ => hi,
+                    };
                     let e = erase_ty(&hi, st);
                     if is_primitive(&e) {
                         Type::Any
@@ -552,6 +595,12 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
                     parents: parents.iter().map(|p| erase_ty(p, st)).collect(),
                     decls: decls.clone(),
                 }
+            } else if let Some(p) = intersection_dominator(parents, st) {
+                // Not `parents.first()`: slick's `implicit def
+                // tableQueryToTableQueryExtensionMethods(q: Query[T, U, Seq] &
+                // TableQuery[T])` takes a `TableQuery` in nsc, because a
+                // parent some other parent extends is shadowed.
+                erase_ty(&p, st)
             } else if let Some(p) = parents.first() {
                 erase_ty(p, st)
             } else {
@@ -604,6 +653,60 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         Type::Overload(alts) => Type::Overload(alts.iter().map(|t| erase_ty(t, st)).collect()),
         other => other.clone(),
     }
+}
+
+/// nsc `Erasure.intersectionDominator`: the one parent of a compound type
+/// whose erasure stands for the whole of it. A parent that some *other* parent
+/// is a strict sub-type of is shadowed and never chosen; among what is left a
+/// real class beats a trait, and otherwise the first one wins.
+///
+/// Returning `None` (an empty parent list, or every parent shadowing every
+/// other) leaves the caller with `Object`.
+fn intersection_dominator(parents: &[Type], st: &SymbolTable) -> Option<Type> {
+    // nsc compares the parents' *symbols* with `isNonBottomSubClass`, which
+    // does not chase an abstract member to its bound -- `SymbolTable::
+    // class_sym_of` does, and that made `ColumnType[T] with BaseTypedType[T]`
+    // look like `BaseTypedType` shadowing `ColumnType`, where nsc keeps the
+    // latter.
+    fn head_sym(ty: &Type) -> Option<SymbolId> {
+        match ty {
+            Type::Applied { ctor, .. } | Type::Annotated { tpe: ctor, .. } => head_sym(ctor),
+            Type::Class { sym, .. }
+            | Type::ModuleRef(sym)
+            | Type::TypeMember(sym)
+            | Type::TypeParam(sym) => Some(*sym),
+            _ => None,
+        }
+    }
+    let strict_sub_class = |q: &Type, p: &Type| match (head_sym(q), head_sym(p)) {
+        (Some(qs), Some(ps)) => {
+            qs != ps
+                && st.get(qs).is_class_like()
+                && st.get(ps).is_class_like()
+                && st
+                    .base_type_seq(&Type::Class {
+                        sym: qs,
+                        args: vec![],
+                    })
+                    .iter()
+                    .any(|b| head_sym(b) == Some(ps))
+        }
+        _ => false,
+    };
+    let unshadowed = |p: &Type| !parents.iter().any(|q| strict_sub_class(q, p));
+    let is_real_class = |p: &Type| {
+        head_sym(p).is_some_and(|c| {
+            let s = st.get(c);
+            s.kind == crate::symbol::SymKind::Class
+                && !s.flags.contains(Flags::TRAIT)
+                && !s.flags.contains(Flags::INTERFACE)
+        })
+    };
+    parents
+        .iter()
+        .find(|p| is_real_class(p) && unshadowed(p))
+        .or_else(|| parents.iter().find(|p| unshadowed(p)))
+        .cloned()
 }
 
 fn is_primitive(ty: &Type) -> bool {

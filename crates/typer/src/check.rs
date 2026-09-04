@@ -7997,7 +7997,21 @@ impl Typer {
             }
             ty = self.maybe_auto_apply(ty, pt);
             ty = self.instantiate_parameterless(s, ty, pt);
-            if !self.st.this_class.is_none() {
+            // Only a *member* of a class is seen through `this`. A local or a
+            // parameter has no prefix, and its type is already written in the
+            // vocabulary of the method that owns it: `val n = map.infer(x)`
+            // inside a class that declares `type Self = RSM` has the type
+            // `map.Self`, which is the abstract member of `map`'s own class --
+            // rebinding it to this class's `Self` gave the tuple destructuring
+            // `checkcast RSM` on a value that is only a `Node`
+            // (`ClassCastException` in slick's `ResultSetMapping
+            // .withInferredType`, reached by every query the compiler runs).
+            if !self.st.this_class.is_none()
+                && matches!(
+                    self.st.get(self.st.get(s).owner).kind,
+                    SymKind::Class | SymKind::ModuleClass | SymKind::Module
+                )
+            {
                 ty = self.st.expand_type_members(self.st.this_class, &ty);
             }
             tree.ty = ty;
@@ -12929,7 +12943,18 @@ impl Typer {
                 } else if method_name == "withFilter" {
                     if !self.is_with_filter_ty(Some(&ret)) {
                         if let Some(r) = recv_ty.clone() {
-                            ret = r;
+                            // Only where the declared result is the receiver
+                            // *widened* -- `Iterable.withFilter` reached
+                            // through a `List`. A `withFilter` returning
+                            // something the receiver is not (slick's
+                            // `ConstArray.withFilter(p): ConstArrayOp[T]`)
+                            // keeps its own result; replacing it made the
+                            // following `foreach` resolve to `ConstArray`'s
+                            // and `checkcast`ed the anonymous `ConstArrayOp`
+                            // to a `ConstArray`.
+                            if self.receiver_conforms_to(&r, &ret) {
+                                ret = r;
+                            }
                         }
                     }
                 } else if method_name == "updated" {
@@ -13473,6 +13498,26 @@ impl Typer {
                 self.st.get(*id).name == name
                     && self.st.get(*id).kind == crate::symbol::SymKind::Class
             })
+    }
+
+    /// Whether `recv`'s class is `decl`'s class or a subclass of it — the
+    /// shape in which replacing a declared result type by the receiver's is a
+    /// *narrowing* rather than a jump to an unrelated class. An unknown class
+    /// on either side answers `true`, which keeps the existing behaviour for
+    /// everything the prelude supplies without a class symbol.
+    fn receiver_conforms_to(&self, recv: &Type, decl: &Type) -> bool {
+        let (Some(rc), Some(dc)) = (self.st.class_sym_of(recv), self.st.class_sym_of(decl)) else {
+            return true;
+        };
+        rc == dc
+            || self
+                .st
+                .base_type_seq(&Type::Class {
+                    sym: rc,
+                    args: vec![],
+                })
+                .iter()
+                .any(|b| self.st.class_sym_of(b) == Some(dc))
     }
 
     fn is_with_filter_ty(&self, ty: Option<&Type>) -> bool {
@@ -18519,13 +18564,38 @@ impl Typer {
         } else {
             parents.reverse();
         }
+        // nsc resolves `super.m` to the first *concrete* `m` along the
+        // linearization: a mixin that only re-declares `m` (slick's
+        // `BasicStreamingQueryActionExtensionMethodsImpl` narrows `result`
+        // covariantly and leaves it abstract) is not what `super.result`
+        // means, and calling it emitted an `invokestatic` on a `$class`
+        // holder that has no such method -- indeed no such class file, since
+        // the trait has no concrete member at all (`NoClassDefFoundError`).
+        let mut deferred: Option<(SymbolId, Vec<SymbolId>)> = None;
         for p in parents {
             let members = self.st.lookup_member_real(p, name);
-            if !members.is_empty() {
+            if members.is_empty() {
+                continue;
+            }
+            if members.iter().any(|m| !self.is_deferred_member(*m)) {
                 return Some((p, members));
             }
+            if deferred.is_none() {
+                deferred = Some((p, members));
+            }
         }
-        None
+        deferred
+    }
+
+    /// A member with no implementation: a body-less `def` (the namer sets
+    /// `ABSTRACT` on those) or a body-less `val` / `var`.
+    fn is_deferred_member(&self, m: SymbolId) -> bool {
+        let s = self.st.get(m);
+        match s.kind {
+            SymKind::Method => s.flags.contains(Flags::ABSTRACT),
+            SymKind::Term => s.deferred_val,
+            _ => false,
+        }
     }
 
     /// The instance of `target` among `ty`'s base classes: `Some[Int]` seen as

@@ -415,6 +415,18 @@ pub struct SymbolTable {
     /// backend still has to know that `case class Box(m: Meters)` prints its
     /// field as a boxed `Meters`.
     pub value_class_terms: rustc_hash::FxHashMap<SymbolId, SymbolId>,
+    /// Methods with at least one parameter that was a type parameter or an
+    /// abstract type member **before** erasure, as a bit per parameter of the
+    /// flattened parameter list (bit `i` = parameter `i`; parameters past 32
+    /// are not recorded).
+    ///
+    /// Erasure destroys the only thing that says a subclass method *overrides*
+    /// an inherited one rather than overloading it. `def base[T](…, t:
+    /// BaseColumnType[U])` erases to `TypedType` in slick's
+    /// `MappedColumnTypeFactory` and to `JdbcType` in the `MappedJdbcType`
+    /// that implements it, and after erasure those are simply two unrelated
+    /// classes. `gen::bridge_overrides` reads this to tell the two apart.
+    pub erased_abstract_params: rustc_hash::FxHashMap<SymbolId, u32>,
     /// Value classes compiled from source in this run; see
     /// `erasure::note_source_value_classes`.
     pub source_value_classes: rustc_hash::FxHashSet<SymbolId>,
@@ -562,6 +574,7 @@ impl SymbolTable {
             owner: SymbolId(0),
             this_class: SymbolId(0),
             value_class_terms: rustc_hash::FxHashMap::default(),
+            erased_abstract_params: rustc_hash::FxHashMap::default(),
             source_value_classes: rustc_hash::FxHashSet::default(),
             source_classes: rustc_hash::FxHashSet::default(),
             lazy_cells: Vec::new(),

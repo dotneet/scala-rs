@@ -1363,13 +1363,26 @@ fn method_params_from_sym(st: &SymbolTable, id: SymbolId) -> Vec<Type> {
 /// no bridge was emitted, and calling `bind` through the interface threw
 /// `AbstractMethodError`. (When *every* parameter matches this way the two
 /// descriptors are equal and the caller skips the bridge anyway.)
-fn bridge_overrides(st: &SymbolTable, parent: &[Type], child: &[Type]) -> bool {
+/// `parent_abstract` is `SymbolTable::erased_abstract_params` for the parent
+/// method: an abstract parameter whose *bound* is a class does not erase to
+/// `Object`, so nothing in the erased types themselves says the subclass
+/// narrowed it. slick's `MappedColumnTypeFactory.base(…, BaseColumnType[U])`
+/// erases to `TypedType` and `MappedJdbcType`'s implementation to `JdbcType`;
+/// without the mask that read as an unrelated overload, no bridge was emitted,
+/// and the interface method stayed abstract (`AbstractMethodError`).
+fn bridge_overrides(
+    st: &SymbolTable,
+    parent: &[Type],
+    child: &[Type],
+    parent_abstract: u32,
+) -> bool {
     parent.len() == child.len()
-        && parent.iter().zip(child).all(|(p, c)| {
+        && parent.iter().zip(child).enumerate().all(|(i, (p, c))| {
             p == c
                 || jvm_desc(st, p) == jvm_desc(st, c)
                 || erases_to_object(st, p)
                 || erases_to_object(st, c)
+                || (i < 32 && parent_abstract & (1 << i) != 0)
         })
 }
 
@@ -5282,6 +5295,12 @@ impl<'a> Gen<'a> {
                 // that overrides this parent method -- not just the first one
                 // spelled the same way.
                 let parent_params = method_params_from_sym(self.st, pmid);
+                let parent_abstract = self
+                    .st
+                    .erased_abstract_params
+                    .get(&pmid)
+                    .copied()
+                    .unwrap_or(0);
                 let Some((_, cid)) = own.iter().find(|(n, id)| {
                     n == &ps.name
                         && *id != pmid
@@ -5289,6 +5308,7 @@ impl<'a> Gen<'a> {
                             self.st,
                             &parent_params,
                             &method_params_from_sym(self.st, *id),
+                            parent_abstract,
                         )
                 }) else {
                     continue;
@@ -7805,6 +7825,21 @@ fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) 
         // result is discarded, so each arm has to drop its own value.
         TreeKind::Match { selector, cases } => {
             gen_match(asm, frame, ctx, selector, cases, &Type::Unit);
+        }
+        // A block's *value* is its last expression, so a discarded block
+        // discards that expression -- nsc's `genLoad(block, UNIT)` passes UNIT
+        // straight down to it. Falling through to the generic arm below asked
+        // `gen_expr` for the block's value and popped it afterwards, which put
+        // a branching last expression back in value mode: slick's
+        // `QueryInterpolator.appendString`, whose `case '\\' => { pos += 1;
+        // if (pos < len) { … match … } }` then generated the inner match for
+        // its `Any` lub, and only the arms whose own type was not `Unit` left
+        // anything on the stack ("Inconsistent stackmap frames").
+        TreeKind::Block { stats, expr } => {
+            for s in stats {
+                gen_stat(asm, frame, ctx, s);
+            }
+            gen_stat(asm, frame, ctx, expr);
         }
         TreeKind::Try {
             block,
@@ -14932,7 +14967,7 @@ fn adapt_type_member_arg(
         aty,
         Type::Any | Type::AnyRef | Type::TypeMember(_) | Type::NoType
     ) || matches!(pty, Type::TypeMember(_));
-    if !opaque || is_jvm_primitive(pty) {
+    if is_jvm_primitive(pty) {
         return;
     }
     let pd = declared
@@ -14947,11 +14982,61 @@ fn adapt_type_member_arg(
     // Only when the value on the stack really is some *other* class: a value
     // already of that class, or one whose class the assembler does not track,
     // is left alone.
-    match asm.top_object() {
-        Some(t) if t != cls => {}
-        _ => return,
+    let Some(top) = asm.top_object() else { return };
+    if top == cls {
+        return;
+    }
+    if !opaque {
+        // The argument's own erasure is a class, and it may still be one the
+        // verifier will not accept here. An abstract type member erases
+        // through nsc's `intersectionDominator`, which drops the other parts
+        // of a compound bound: scala-reflect's `type TermName >: Null <:
+        // TermNameApi with Name` is `Names$TermNameApi`, an *interface* that
+        // does not extend the abstract class `Names$NameApi` -- only `Name`
+        // brings that in. Passing a `TermName` where the quasiquote support
+        // API takes a `NameApi` needs the cast nsc emits here, or the method
+        // fails to verify ("Type Names$TermNameApi is not assignable to
+        // Names$NameApi").
+        //
+        // Only a *class* target is cast: JVMS 4.10.1.2 makes every class type
+        // assignable to an interface type, so an interface parameter never
+        // owes one, and casting there would be noise on every call.
+        if is_interface_jvm(ctx.st, cls) || jvm_assignable(ctx.st, top, cls) {
+            return;
+        }
     }
     asm.checkcast(cls);
+}
+
+/// Whether the JVM class named `jvm` is an interface, as far as the symbol
+/// table knows. Unknown names answer `true`: an interface target never owes a
+/// cast, so an unknown one is left alone rather than cast blindly.
+fn is_interface_jvm(st: &SymbolTable, jvm: &str) -> bool {
+    match st.find_class_by_jvm(jvm) {
+        Some(c) => is_interface_sym(st, c),
+        None => true,
+    }
+}
+
+/// Whether a value the assembler tracks as JVM class `from` reaches a
+/// parameter of class `to` without a `checkcast`. Answers `false` when either
+/// class is unknown here: a redundant cast to a class the value really has is
+/// a no-op, whereas a missing one is a `VerifyError`.
+fn jvm_assignable(st: &SymbolTable, from: &str, to: &str) -> bool {
+    if from == to || to == "java/lang/Object" {
+        return true;
+    }
+    let (Some(f), Some(t)) = (st.find_class_by_jvm(from), st.find_class_by_jvm(to)) else {
+        return false;
+    };
+    f == t
+        || st
+            .base_type_seq(&Type::Class {
+                sym: f,
+                args: vec![],
+            })
+            .iter()
+            .any(|b| st.class_sym_of(b) == Some(t))
 }
 
 /// Materialise the argument a `Unit` parameter expects. `Unit` erases to

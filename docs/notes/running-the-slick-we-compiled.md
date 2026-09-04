@@ -379,3 +379,170 @@ one that arrives from `-cp` is not recognised at all. That is the next slice.
   receiver**: the object's inherited members are attributed to the class.
   Both spellings of the fix in item 4 above leave this one alone, and it is a
   different defect from `cats.effect.IO`'s (whose companion link was intact).
+
+# `MappedColumnType`, and the query compiler behind it (`agent/slickrun3`)
+
+## The assigned symptom, and what it really was
+
+`p12_mapped` was the one program that failed differently from the other
+eleven. Its first line threw
+
+```text
+NoSuchMethodError: slick.ast.TypedType
+  RelationalTypesComponent$MappedColumnTypeFactory.base(
+    Function1, Function1, ClassTag, slick.ast.TypedType)
+```
+
+`javap` on the two builds said scala-rs had declared it
+`base(Function1, Function1, ClassTag, Object)Object`. The parameter and the
+result are both `BaseColumnType[…]`, and
+
+```scala
+type ColumnType[T] <: TypedType[T]
+type BaseColumnType[T] <: ColumnType[T] & BaseTypedType[T]
+```
+
+is an abstract type member with a **compound** upper bound, which `erase_ty`
+answered `Object` for on purpose — the note in the code said guessing at nsc's
+`intersectionDominator` had cost the macro bridges their checkcasts.
+
+**That reading of nsc was wrong, and measurably so.** nsc really does pick a
+dominator here, and it really does drop the rest of the bound:
+`javap` on `scala-reflect.jar` shows `Names.newTermName` returning
+`Names$TermNameApi` for a `TermName` declared
+`>: Null <: TermNameApi with Name` — and `Names$TermNameApi` is an empty
+*interface* that does not extend the abstract *class* `Names$NameApi`. So the
+erasure is right and the **call site** is what owes the cast. Both halves are
+implemented now:
+
+* `erasure::intersection_dominator` is nsc's rule — a parent that some other
+  parent is a strict sub-class of is shadowed; among the rest a non-trait class
+  wins, else the first. It compares parents' *symbols*, not their types:
+  `SymbolTable::class_sym_of` chases an abstract member to its bound, which
+  made `ColumnType[T] with BaseTypedType[T]` look like `BaseTypedType`
+  shadowing `ColumnType`, where nsc keeps the latter (and so erases to
+  `TypedType`, not `BaseTypedType`). It is used for a `Refined` *type* as well
+  as for a compound bound: slick's `implicit def
+  tableQueryToTableQueryExtensionMethods(q: Query[T, U, Seq] & TableQuery[T])`
+  takes a `TableQuery` in nsc, and taking `parents.first()` gave `Query`.
+* `gen::adapt_type_member_arg` now also casts when the argument's *own* erased
+  class is not assignable to the parameter's — but only when the parameter's
+  class is a real class, since JVMS 4.10.1.2 makes every class type assignable
+  to an interface type.
+
+## Six defects between there and the SQL
+
+Each was found by walking a probe forward against both slick builds, and each
+was checked against `out-rs` built by the *previous* `main` before being called
+new. Two of them (5, 6) were already on `main` and only became reachable here.
+
+1. **The erasure above.**
+
+2. **A subclass that narrows an abstract-typed parameter got no bridge.**
+   `MappedJdbcType.base(…, JdbcType)JdbcType` implements
+   `…base(…, TypedType)TypedType`, and after erasure nothing says those are one
+   method rather than two overloads — `bridge_overrides`' `erases_to_object`
+   test only recognises a parameter that erased *to `Object`*, and an abstract
+   member with a class bound does not. `SymbolTable::erased_abstract_params`
+   now records, per method, which parameters were a type parameter or an
+   abstract type member **before** erasure, and `bridge_overrides` reads it.
+   Without the bridge the interface method stayed abstract
+   (`AbstractMethodError`).
+
+3. **A local's type was re-read through `this`.** `Typer::bind_found` applied
+   `expand_type_members(this_class, …)` to every identifier's type. That is
+   right for a class member — an inherited `find` is seen through this class —
+   and wrong for a local or a parameter, whose type is written in the
+   vocabulary of the method that owns it. `Type::TypeMember` carries no prefix,
+   so `map.Self` and `this.Self` are the same tree, and the rewrite bound the
+   first to the second. slick's
+
+   ```scala
+   val (map2, newType) = from2.nodeType match { … }
+   ```
+
+   in `ResultSetMapping.withInferredType` then `checkcast`ed a plain `Node` to
+   a `ResultSetMapping` — thrown by every query the compiler ran. The guard is
+   the same `owner_is_class` test the `subst_as_seen_from` above it already
+   used.
+
+4. **A block in statement position asked for its value.** `gen_stat` had no
+   `Block` arm, so a block fell through to `gen_expr` + pop — which puts a
+   *branching* last expression back in value mode. nsc's `genLoad(block, UNIT)`
+   passes UNIT straight down to the last expression instead. slick's
+
+   ```scala
+   case '\\' => pos += 1; if (pos < len) { str.charAt(pos) match { … } }
+   ```
+
+   in `QueryInterpolator.appendString` generated the inner match for its `Any`
+   lub, and only the arms whose own type was not `Unit` left anything on the
+   stack: `VerifyError: Inconsistent stackmap frames`.
+
+5. **`withFilter`'s result was replaced by the receiver's type.** The rule
+   exists for the collections, where the declared result is the receiver
+   *widened* (`Iterable.withFilter` reached through a `List`). slick's
+   `ConstArray.withFilter(p): ConstArrayOp[T]` returns something the receiver
+   is not, and replacing it made the `foreach` of
+   `for ((sym, j: Join) <- from)` resolve to `ConstArray`'s, with a
+   `checkcast ConstArray` on the anonymous `ConstArrayOp`. The substitution is
+   now only made when the receiver's class conforms to the declared one.
+
+6. **`super.m` landed on a mixin that only re-declares `m`.** nsc resolves
+   `super.m` to the first *concrete* `m` along the linearization.
+   `super_select_member` took the first parent that had a member of that name
+   at all, and slick's `BasicStreamingQueryActionExtensionMethodsImpl` narrows
+   `result` covariantly and leaves it abstract — so `JdbcStreamingQuery…Impl
+   .result` was emitted as `invokestatic
+   BasicStreamingQueryActionExtensionMethodsImpl$class.result`, naming a class
+   file that does not exist, because the trait has no concrete member at all
+   (`NoClassDefFoundError`).
+
+The regression fixture is `tests/fixtures/slickrun3.scala` (one file, all
+cases, expectation taken from real scalac 2.13.16) with
+`crates/cli/tests/slickrun3.rs`, which also pins the emitted descriptors so a
+change that keeps the stdout by another route has to say so.
+
+## Where it stands
+
+`tests/slick_run.sh` is still **0 of 12**: every program, `p12_mapped`
+included, now stops in `Database.make` on the `fs2.Stream.fromIterator` value
+class from `-cp` — `agent/cpvalueclass`'s slice, and the same
+`VerifyError: Type integer is not assignable to 'java/lang/Object'` for all
+twelve. `p12`'s own defect is gone: it no longer fails differently.
+
+To see past that blocker this slice used a probe with everything but the
+database — `MappedColumnType`, `Compiled`, the `Table` definition, and the
+statements of eight queries. On `main`'s compiler it dies on its first line
+(the `NoSuchMethodError` above). Now it prints, byte for byte, what the
+scalac-built slick prints:
+
+```text
+create table "BRICKS" ("ID" INTEGER NOT NULL PRIMARY KEY,"C" VARCHAR NOT NULL,"ALT" VARCHAR)
+all sql: select "ID", "C", "ALT" from "BRICKS" order by "ID"
+byColour sql: select "ID", "C", "ALT" from "BRICKS" where "C" = ? order by "ID"
+byRange sql: select "ID", "C", "ALT" from "BRICKS" where ("ID" >= ?) and ("ID" <= ?) order by "ID"
+eq sql: select count(1) from "BRICKS" where "C" = 'B'
+optCol sql: select "ALT" from "BRICKS" order by "ID"
+```
+
+That is slick's query compiler and its whole SQL generator running on class
+files scala-rs produced.
+
+## The next one, measured but not fixed
+
+The probe's next line is `bricks.insertStatement`:
+
+```text
+AbstractMethodError: slick.jdbc.H2Profile$ does not define or inherit
+  RelationalActionComponent.createInsertActionExtensionMethods(Object)
+```
+
+It is defect 2 again, one step further out: `H2Profile$` *inherits*
+`createInsertActionExtensionMethods(JdbcCompiledInsert)` from
+`JdbcActionComponent` and needs the wide `(Object)` bridge for
+`RelationalActionComponent`'s declaration, whose parameter is the abstract
+`CompiledInsert`. `emit_erasure_bridges` looks at the class's own members;
+`emit_inherited_covariant_bridges` covers an inherited member but only bridges
+the *return* type. Present on `main` too (checked by disassembling a slick
+built with `main`'s compiler).
