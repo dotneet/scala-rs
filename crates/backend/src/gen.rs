@@ -4728,6 +4728,52 @@ impl<'a> Gen<'a> {
         None
     }
 
+    /// The descriptor of an implementation on this class that *overrides*
+    /// `def` at a strictly narrower erased parameter list, if there is exactly
+    /// one.
+    ///
+    /// Two tests, and both are needed. `bridge_overrides` says the two really
+    /// are one member -- a parameter that erases to `Object`, or that
+    /// `erased_abstract_params` records as abstract before erasure, may be
+    /// narrowed by an override; two unrelated `f(Any)` / `f(String)` overloads
+    /// may not. `desc_narrows` then fixes the *direction*, which
+    /// `bridge_overrides` alone does not: without it the narrow method would
+    /// find the wide one just as readily and both would bridge to each other.
+    fn narrower_override(
+        &self,
+        name: &str,
+        def: &Tree,
+        impls: &[(String, String, Vec<Type>, SymbolId)],
+    ) -> Option<String> {
+        let enc = encode_method_name(name);
+        let wide_desc = def_method_desc(self.st, def);
+        let wide_params = desc_params(&wide_desc).to_string();
+        let wide_strs = desc_param_strs(&wide_desc);
+        let declared = def_param_types(self.st, def);
+        let abstract_mask = self
+            .st
+            .erased_abstract_params
+            .get(&def.sym)
+            .copied()
+            .unwrap_or(0);
+        let mut hits = impls.iter().filter(|(n, d, cps, sym)| {
+            *n == enc
+                && *sym != def.sym
+                && desc_params(d) != wide_params
+                && bridge_overrides(self.st, &declared, cps, abstract_mask)
+                && {
+                    let cs = desc_param_strs(d);
+                    cs.len() == wide_strs.len()
+                        && cs
+                            .iter()
+                            .zip(&wide_strs)
+                            .all(|(c, p)| self.desc_narrows(p, c))
+                }
+        });
+        let first = hits.next().map(|(_, d, _, _)| d.clone())?;
+        hits.next().is_none().then_some(first)
+    }
+
     fn emit_mixin_forwarders(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
         if class_id.is_none() {
             return;
@@ -4784,12 +4830,89 @@ impl<'a> Gen<'a> {
                 chosen.push((name, iface.clone(), m.clone()));
             }
         }
-        for (name, iface, def) in chosen {
+        // Everything this class will implement: its own body, and the
+        // forwarders about to be emitted. Two clauses of the linearization can
+        // spell *one* member at two erased descriptors, and then the wider one
+        // must not run its own trait's body.
+        let impls: Vec<(String, String, Vec<Type>, SymbolId)> = body
+            .iter()
+            .filter_map(|stt| match &stt.kind {
+                TreeKind::DefDef { name, .. } => Some((
+                    encode_method_name(name),
+                    def_method_desc(self.st, stt),
+                    def_param_types(self.st, stt),
+                    stt.sym,
+                )),
+                _ => None,
+            })
+            .chain(chosen.iter().map(|(n, _, d)| {
+                (
+                    encode_method_name(n),
+                    def_method_desc(self.st, d),
+                    def_param_types(self.st, d),
+                    d.sym,
+                )
+            }))
+            .collect();
+        for (name, iface, def) in &chosen {
+            let (name, iface, def) = (name.clone(), iface.clone(), def.clone());
             let inst_desc = def_method_desc(self.st, &def);
             if defined.contains(&(
                 encode_method_name(&name),
                 desc_params(&inst_desc).to_string(),
             )) {
+                continue;
+            }
+            // `SynchronousDatabaseAction.openStream(context: C)` with
+            // `C <: BasicBackend#BasicActionContext` is *overridden* by
+            // `StreamingInvokerAction.openStream(ctx: JdbcBackend#JdbcActionContext)`,
+            // and the two erase to different descriptors. Forwarding both to
+            // their own trait bodies leaves the wide one -- which is what a
+            // call through the base interface resolves to -- running the base
+            // implementation, and slick's base implementation is
+            // `throw new SlickException("Streaming is not supported")`.
+            // nsc emits the wide descriptor as a bridge to the narrow one.
+            if let Some(target) = self.narrower_override(&name, &def, &impls) {
+                let ret = method_ret_ty(&def);
+                let pstrs = desc_param_strs(&inst_desc);
+                let cstrs = desc_param_strs(&target);
+                let mut loads: Vec<(u16, JvmSort, Option<String>)> = Vec::new();
+                let mut locals = 1u16;
+                for (i, s) in desc_param_sorts(desc_params(&inst_desc))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let cast = match (pstrs.get(i), cstrs.get(i)) {
+                        (Some(p), Some(c)) if p != c && c.starts_with('L') => {
+                            Some(c[1..c.len() - 1].to_string())
+                        }
+                        (Some(p), Some(c)) if p != c && c.starts_with('[') => Some(c.clone()),
+                        _ => None,
+                    };
+                    loads.push((locals, s, cast));
+                    locals += s.slots();
+                }
+                let cn = b.this_name.clone();
+                let enc = encode_method_name(&name);
+                let enc_c = enc.clone();
+                let tdesc = target.clone();
+                b.add_code(
+                    ACC_PUBLIC | ACC_BRIDGE | ACC_SYNTHETIC,
+                    &enc_c,
+                    &inst_desc,
+                    locals.max(1),
+                    move |asm| {
+                        asm.aload(0);
+                        for (slot, sort, cast) in &loads {
+                            load(asm, *slot, *sort);
+                            if let Some(c) = cast {
+                                asm.checkcast(c);
+                            }
+                        }
+                        asm.invokevirtual(&cn, &enc, &tdesc);
+                        emit_return(asm, &ret);
+                    },
+                );
                 continue;
             }
             let static_desc = trait_static_desc(&iface, &inst_desc);
@@ -6724,6 +6847,44 @@ impl<'a> Gen<'a> {
                 value_extension_desc(self.st, stt.sym),
             ));
         }
+        // A default getter is reached through an `$extension` static of its
+        // own (`emit_default_getters` emits one beside the getter), and it is
+        // a synthesized *symbol* -- there is no `DefDef` in `body` for the
+        // loop above to find. slick's
+        // `StringColumnExtensionMethods.like(pattern)` leaves `esc: Char = ' '`
+        // out and got
+        // `NoSuchMethodError: StringColumnExtensionMethods$.like$default$2$extension`.
+        for mid in self.st.get(class_id).members.clone() {
+            let s = self.st.get(mid);
+            if s.kind != SymKind::Method || !s.name.contains("$default$") {
+                continue;
+            }
+            if s.default_rhs.is_none() {
+                continue;
+            }
+            let pts: Vec<Type> = if !s.params.is_empty() {
+                s.params
+                    .iter()
+                    .map(|p| self.st.get(*p).ty.clone())
+                    .collect()
+            } else {
+                match &s.ty {
+                    Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+                    _ => vec![],
+                }
+            };
+            let ret = match &s.ty {
+                Type::Method { ret, .. } => (**ret).clone(),
+                _ => Type::Any,
+            };
+            let mut tys = vec![under.clone()];
+            tys.extend(pts);
+            let name = format!("{}$extension", s.name);
+            if todo.iter().any(|(m, _)| *m == name) {
+                continue;
+            }
+            todo.push((name, jvm_method_desc(self.st, &tys, &ret)));
+        }
         for (n, d) in [
             ("hashCode$extension", format!("({udesc})I")),
             ("equals$extension", format!("({udesc}Ljava/lang/Object;)Z")),
@@ -8119,6 +8280,11 @@ fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &
                         // `().asInstanceOf[Unit]` pops it again, and
                         // `().isInstanceOf[T]` tests it.
                         adapt_unit_qualifier(asm, ctx, qual);
+                        // A *primitive* qualifier is not `Object`-compatible,
+                        // which is what `emit_as_instance_of` assumes.
+                        if emit_prim_qualifier_cast(asm, &qual.ty, &tree.ty) {
+                            return;
+                        }
                         emit_as_instance_of(asm, ctx, &tree.ty);
                         return;
                     }
@@ -8126,6 +8292,9 @@ fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &
                         gen_expr(asm, frame, ctx, qual);
                         adapt_unit_qualifier(asm, ctx, qual);
                         let target = args.first().map(|a| &a.ty).unwrap_or(&Type::Any);
+                        if is_jvm_primitive(&qual.ty) && !is_unit_like(&qual.ty) {
+                            emit_box(asm, &qual.ty.widen_constant());
+                        }
                         emit_is_instance_of(asm, ctx, target);
                         return;
                     }
@@ -9162,6 +9331,24 @@ fn gen_apply(
     fun: &Tree,
     args: &[Tree],
 ) {
+    // `f.asInstanceOf[A => B](v)`: the cast yields a *value*, and the
+    // arguments belong to that value's `apply`. `peel_fun` below strips the
+    // `TypeApply` and would call `asInstanceOf` itself -- with an argument it
+    // does not take (`NoSuchMethodError: java.lang.Object.asInstanceOf()`, in
+    // slick's `BasicBackend`:
+    // `f.asInstanceOf[Any => DBIOAction[?, Streaming[T], Nothing]](v)`).
+    // Anything else applied to a cast goes through an explicit `apply`
+    // selection the typer inserts, so this shape means a function value.
+    if let TreeKind::TypeApply { fun: head, .. } = &fun.kind {
+        if matches!(head.kind, TreeKind::Select { .. })
+            && !head.sym.is_none()
+            && matches!(ctx.st.get(head.sym).intrinsic, Intrinsic::AsInstanceOf)
+        {
+            gen_function_apply(asm, frame, ctx, fun, args, &tree.ty);
+            return;
+        }
+    }
+
     let fun0 = peel_fun(fun);
     let (fun, owned_args) = flatten_apply_owned(fun0, args);
     let args: &[Tree] = &owned_args;
@@ -15942,6 +16129,61 @@ fn emit_as_instance_of(asm: &mut Assembler, ctx: &EmitCtx, target: &Type) {
     }
 }
 
+/// `e.asInstanceOf[T]` where `e`'s own type is a JVM primitive.
+///
+/// `emit_as_instance_of` reads its receiver as an `Object` (that is what `Any`
+/// erases to), so it can neither be handed an `int` nor left to `checkcast`
+/// one. nsc's erasure settles this case before the cast exists: a primitive
+/// cast to another primitive is a *numeric conversion* (`i.asInstanceOf[Long]`
+/// is `i2l`, and to the same type it is nothing at all), and a primitive cast
+/// to any reference type is a box. Only the box needs the cast that follows,
+/// and only when the target names a real class.
+///
+/// Returns whether the whole cast has been emitted here.
+///
+/// slick's `StatementInvoker.iteratorTo` is
+/// `results(maxRows).fold(r => new CloseableIterator.Single[R](r.asInstanceOf[R]), identity)`,
+/// where `r` is the `Int` of an `Either[Int, …]`: `new Single(int)` against a
+/// constructor taking `Object` is a `VerifyError`, and it is the first thing
+/// every `.result` in `slick_run.sh` reaches.
+fn emit_prim_qualifier_cast(asm: &mut Assembler, src: &Type, target: &Type) -> bool {
+    let src = src.widen_constant();
+    if !is_jvm_primitive(&src) || is_unit_like(&src) {
+        return false;
+    }
+    if let (Some(from), Some(to)) = (prim_desc_char(&src), prim_desc_char(target)) {
+        // `Boolean` is not a numeric type: nsc leaves such a cast alone, and
+        // `emit_num_conv`'s codes do not describe it either.
+        if from == to {
+            return true;
+        }
+        if from != 'Z' && to != 'Z' {
+            emit_num_conv(asm, &format!("{from}{to}"));
+            return true;
+        }
+        return true;
+    }
+    emit_box(asm, &src);
+    // The target is a reference type; `emit_as_instance_of` still owes it a
+    // `checkcast` when it names a class (`3.asInstanceOf[Integer]`).
+    false
+}
+
+/// The JVM descriptor letter of a primitive, as `emit_num_conv` spells it.
+fn prim_desc_char(ty: &Type) -> Option<char> {
+    match ty.widen_constant() {
+        Type::Boolean => Some('Z'),
+        Type::Byte => Some('B'),
+        Type::Short => Some('S'),
+        Type::Char => Some('C'),
+        Type::Int => Some('I'),
+        Type::Long => Some('J'),
+        Type::Float => Some('F'),
+        Type::Double => Some('D'),
+        _ => None,
+    }
+}
+
 /// `recv.isInstanceOf[target]`: the receiver is already on the stack.
 /// Primitives check against the boxed wrapper; erased/unbounded targets fall
 /// back to `java/lang/Object` (always true for a non-null receiver), which is
@@ -18798,6 +19040,15 @@ fn emit_pattern_cast(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
     let target = match ty {
         Type::Array(_) => jvm_desc(ctx.st, ty),
         Type::NoType | Type::Error | Type::Any | Type::AnyRef => return,
+        // `type_jvm_name` answers `java/lang/Object` for a structural tuple
+        // type, i.e. no cast at all. A `(TermSymbol, Node)` really is a
+        // `scala/Tuple2` at run time, and a binder of that type read out of an
+        // erased extractor needs the cast before its `_1` / `_2`. slick's
+        // `case StructNode(ConstArray(ch, _*)) => ch._2` had
+        // `apply$extension(SeqOps, I)Object` feeding a
+        // `getfield scala/Tuple2._2` (`VerifyError` in
+        // `MergeToComprehensions`, which is every `groupBy` and every join).
+        Type::Tuple(ts) if !ts.is_empty() => format!("scala/Tuple{}", ts.len()),
         _ => type_jvm_name(ctx.st, ty),
     };
     if target.is_empty() || target == "java/lang/Object" {

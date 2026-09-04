@@ -735,3 +735,204 @@ It is defect 2 again, one step further out: `H2Profile$` *inherits*
 `emit_inherited_covariant_bridges` covers an inherited member but only bridges
 the *return* type. Present on `main` too (checked by disassembling a slick
 built with `main`'s compiler).
+
+# The first completed programs (`agent/selfrec`)
+
+`tests/slick_run.sh` went from `ok=0 diff=0 fail=12` to
+
+```text
+progs=12 ok=4 diff=2 fail=6
+```
+
+`p01_basic`, `p04_groupby`, `p08_mapto` and `p12_mapped` print, byte for byte,
+what the scalac-built slick prints — the whole path from `DatabaseConfig.forURL`
+through `schema.create`, inserts, the query compiler, the SQL generator, JDBC
+execution and result mapping, on class files scala-rs produced. `p02_queries`
+and `p06_update_tx` now run to completion too, with output that differs (below).
+
+Six defects. All of them were on `main`; none is a regression from any slice.
+
+## 1. The receiver hoisted for an omitted default wrapped the wrong node
+
+`default_recv::hoist_default_receivers` binds a computed receiver to a local so
+a call that omits defaults evaluates it once, and it ran bottom-up on every
+`Apply`. A curried call whose default sits in a clause that is **not** the last
+one therefore had its *inner* application wrapped, leaving
+`Apply { fun: Block { … }, args }` — a callee with no symbol, which `gen_apply`
+emits as `throw new RuntimeException("unresolved apply")`.
+
+slick's `StreamingInvokerAction.run` is
+
+```scala
+createInvoker(statements).foreach(x => b += x)(ctx.session)
+// final def foreach(f: R => Unit, maxRows: Int = 0)(implicit session: …)
+```
+
+and that threw in all twelve programs at their first `.result`.
+
+The earlier note guessed the function argument was what distinguished this from
+the `iteratorTo(0)(ctx.session)` two lines below. **It is not.** `iteratorTo`
+has no default; that is the whole difference. The shape reproduces with no
+function anywhere:
+
+```scala
+trait Inv1 { final def d(x: Int, n: Int = 0)(s: String): Unit = … }
+mk().d(1)("c")          // throws
+inv.d(1)("c")           // fine — a path receiver is not hoisted
+mk().d(1, 0)("c")       // fine — no default omitted
+mk().g(1)               // fine — one clause
+mk().h(1)()             // fine — the default is in the *last* clause
+```
+
+The hoist now happens at the outermost application of the chain, and
+`name$default$n` arguments are re-pointed at the local wherever in the chain
+they sit.
+
+## 2. `asInstanceOf` / `isInstanceOf` on a primitive qualifier
+
+`emit_as_instance_of` reads its receiver as an `Object` — which is what `Any`
+erases to — so an `int` on the stack was either a `VerifyError` or an
+`intValue()` on something that was never boxed. `i.asInstanceOf[Any]` came out
+as `iload_1; areturn` from a method returning `Object`.
+
+nsc's erasure settles this before the cast exists: primitive to primitive is a
+*numeric conversion* (`i.asInstanceOf[Long]` is `i2l`, and to the same type it
+is nothing at all), primitive to reference is a *box*.
+
+slick's `StatementInvoker.iteratorTo` is
+
+```scala
+results(maxRows).fold(r => new CloseableIterator.Single[R](r.asInstanceOf[R]), identity)
+```
+
+over an `Either[Int, PositionedResultIterator[R]]`, so `r` is an `Int` and `R`
+erases to `Object`. Every `.result` reaches it.
+
+## 3. An applied `asInstanceOf`
+
+`gen_apply`'s `peel_fun` strips a `TypeApply` to reach the callee, which is
+right for `f[T](x)` and wrong for a cast: `f.asInstanceOf[A => B](v)` yields a
+*value*, and the arguments belong to that value's `apply`. It came out as
+`aload f; aload v; invokevirtual java/lang/Object.asInstanceOf()`.
+`p06_update_tx`'s first `transactionally` hit it, in slick's `BasicBackend`:
+`f.asInstanceOf[Any => DBIOAction[?, Streaming[T], Nothing]](v)`.
+
+Anything else applied to a cast goes through an `apply` selection the typer
+inserts, so this shape means a function value.
+
+## 4. A value class's `name$default$n$extension` was missing from the module
+
+`emit_value_extension_forwarders` walks the template body, and a default getter
+is a synthesized *symbol* with no `DefDef` there. The `$extension` static
+landed on the class (`emit_default_getters` puts it there) and nothing landed
+on the companion module. nsc emits both.
+
+Only a **separately compiled** caller links against the module copy, which is
+why running our own build never saw it: `p02_queries` got
+`NoSuchMethodError: StringColumnExtensionMethods$.like$default$2$extension`
+from a client real scalac compiled, for
+`def like(e: Rep[String], esc: Char = ' ')`.
+
+## 5. A tuple-typed pattern binder had no `checkcast`
+
+`emit_pattern_cast` narrows an extracted value through `type_jvm_name`, which
+answers `java/lang/Object` for a structural `Type::Tuple` — i.e. no cast at
+all. A `(TermSymbol, Node)` really is a `scala/Tuple2` at run time, so a binder
+of that type read out of an erased extractor went straight from
+`SeqFactory$UnapplySeqWrapper$.apply$extension(SeqOps, I)Object` into
+`getfield scala/Tuple2._2`.
+
+slick's `MergeToComprehensions` has
+`case StructNode(ConstArray(ch, _*)) => ch._2`, so the whole class failed
+verification and took every `groupBy` and every join with it. Ten lines
+reproduce it (`case Seq(ch, _*) => ch._2`); `case h :: _ => h._2` was already
+right, which is why it had not shown up before. `checkcast_internal` has
+spelled tuples correctly all along — only this pattern path went through
+`type_jvm_name`.
+
+## 6. A narrowed override got a second mixin forwarder instead of a bridge
+
+`emit_mixin_forwarders` keys on the name *and erased parameter list*, so a
+concrete trait method and an override of it further down the linearization look
+like two separate members whenever the two erase differently. Both got a
+forwarder to their own trait's body, and the wide one — which is what a call
+through the base interface resolves to — ran the base.
+
+slick's `SynchronousDatabaseAction` declares
+
+```scala
+def openStream(context: C): CloseableIterator[Any] =
+  throw new SlickException("Internal error: Streaming is not supported by this Action")
+```
+
+with `C <: BasicBackend#BasicActionContext`, and `StreamingInvokerAction`
+overrides it at `C = JdbcBackend#JdbcActionContext`. `p12_mapped`'s `.result`
+reached the throw.
+
+nsc emits the wide descriptor as a bridge. Deciding which of two descriptors is
+which needs two tests, and `narrower_override` does both: `bridge_overrides`
+(already used by `emit_erasure_bridges`) says the two really are one member
+rather than an overload, and `desc_narrows` fixes the *direction* —
+`bridge_overrides` holds just as well with the arguments swapped, so on its own
+it makes both methods bridge to each other.
+`emit_inherited_covariant_bridges` cannot take this over: it declines whenever
+the class already has the wide descriptor, and it only bridges reference
+results, while `size(c: C): Int` in the same shape needs the same treatment.
+
+The regression fixture is `tests/fixtures/selfrec.scala` (one file, all six)
+with `crates/cli/tests/selfrec.rs`: real scalac 2.13.16's own stdout, a
+receiver-evaluation counter for the hoist, and `javap` for the three things
+stdout cannot see — the cast shapes, the module-side default getter, and the
+bridge.
+
+## Where it stops now
+
+**Five of the six remaining failures are one defect, and it is the same one
+`p09_plainsql` has been showing all along.** Inside a value class, a call to
+another of its own methods does not reach the underlying value:
+
+```scala
+final class Ops(val s: String) extends AnyVal {
+  def b(n: Int): String = s * n
+  def a(n: Int): String = b(n) + "!"
+}
+```
+
+```text
+public java.lang.String a(int);           // the instance method
+   7: aload_0                             // ← `this`, an `Ops`
+   8: iload_1
+   9: invokestatic  b$extension:(Ljava/lang/String;I)Ljava/lang/String;
+
+public static java.lang.String a$extension(java.lang.String, int);
+   7: new  #8  // class Ops               // ← re-boxes slot 0
+  11: aload_0
+  12: invokespecial "<init>":(Ljava/lang/String;)V
+  15: iload_1
+  16: invokestatic  b$extension:(Ljava/lang/String;I)Ljava/lang/String;
+```
+
+Both want the underlying value: `aload_0; invokevirtual s()` in the instance
+method, and plain `aload_0` in the `$extension` static (slot 0 already holds
+it). The first shape is `p09_plainsql`'s
+`ActionBasedSQLInterpolation.sqlu`; the second is what
+`AnyOptionExtensionMethods.map$extension` does to
+`flatMap$extension`, handing `OptionLift.baseValue` a wrapper instead of a
+`Rep` — `scala.MatchError: slick.lifted.AnyOptionExtensionMethods` in
+`p03_joins`, `p05_options`, `p07_caseclass` and `p11_sqlgen`. Interfaces are
+not checked by the verifier, which is why the second shape links and fails at
+run time. Six lines reproduce both, with no classpath.
+
+`p10_types` is separate: `NoSuchMethodError:
+RelationalProfile$ColumnOption$Length$.apply$default$2()`, a case class's
+default-argument getter on a *nested* companion module. Defect 4 above is a
+different one (a value class's, and only the module copy was missing).
+
+The two that run to completion differ in ways that are much later questions
+than not running at all:
+
+* **`p02_queries`** prints `{fn length("NAME")}` where nsc's build prints
+  `length("NAME")` — an `H2Profile` override of the JDBC-escape spelling is not
+  taking effect.
+* **`p06_update_tx`** does not roll back: `afterTx2` keeps the update the
+  transaction threw out of, and `seq=List(2, 2)` instead of `List(2, 1)`.
