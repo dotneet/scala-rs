@@ -1,0 +1,24 @@
+foreach on s1 maxRows=0
+List(1, 2, 3, 4)
+recv=1
+List(1, 2)
+recv=1
+List(2, 3)
+recv=1
+List(1, 2, 3)
+List(1, 2)
+foreach on s1 maxRows=0
+1 2 3 4 
+Single(3)
+Single(true)
+4
+5
+6
+7
+8
+44
+9.0
+10
+true
+true
+false

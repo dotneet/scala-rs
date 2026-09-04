@@ -8119,6 +8119,11 @@ fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &
                         // `().asInstanceOf[Unit]` pops it again, and
                         // `().isInstanceOf[T]` tests it.
                         adapt_unit_qualifier(asm, ctx, qual);
+                        // A *primitive* qualifier is not `Object`-compatible,
+                        // which is what `emit_as_instance_of` assumes.
+                        if emit_prim_qualifier_cast(asm, &qual.ty, &tree.ty) {
+                            return;
+                        }
                         emit_as_instance_of(asm, ctx, &tree.ty);
                         return;
                     }
@@ -8126,6 +8131,9 @@ fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &
                         gen_expr(asm, frame, ctx, qual);
                         adapt_unit_qualifier(asm, ctx, qual);
                         let target = args.first().map(|a| &a.ty).unwrap_or(&Type::Any);
+                        if is_jvm_primitive(&qual.ty) && !is_unit_like(&qual.ty) {
+                            emit_box(asm, &qual.ty.widen_constant());
+                        }
                         emit_is_instance_of(asm, ctx, target);
                         return;
                     }
@@ -15939,6 +15947,61 @@ fn emit_as_instance_of(asm: &mut Assembler, ctx: &EmitCtx, target: &Type) {
                 }
             }
         }
+    }
+}
+
+/// `e.asInstanceOf[T]` where `e`'s own type is a JVM primitive.
+///
+/// `emit_as_instance_of` reads its receiver as an `Object` (that is what `Any`
+/// erases to), so it can neither be handed an `int` nor left to `checkcast`
+/// one. nsc's erasure settles this case before the cast exists: a primitive
+/// cast to another primitive is a *numeric conversion* (`i.asInstanceOf[Long]`
+/// is `i2l`, and to the same type it is nothing at all), and a primitive cast
+/// to any reference type is a box. Only the box needs the cast that follows,
+/// and only when the target names a real class.
+///
+/// Returns whether the whole cast has been emitted here.
+///
+/// slick's `StatementInvoker.iteratorTo` is
+/// `results(maxRows).fold(r => new CloseableIterator.Single[R](r.asInstanceOf[R]), identity)`,
+/// where `r` is the `Int` of an `Either[Int, …]`: `new Single(int)` against a
+/// constructor taking `Object` is a `VerifyError`, and it is the first thing
+/// every `.result` in `slick_run.sh` reaches.
+fn emit_prim_qualifier_cast(asm: &mut Assembler, src: &Type, target: &Type) -> bool {
+    let src = src.widen_constant();
+    if !is_jvm_primitive(&src) || is_unit_like(&src) {
+        return false;
+    }
+    if let (Some(from), Some(to)) = (prim_desc_char(&src), prim_desc_char(target)) {
+        // `Boolean` is not a numeric type: nsc leaves such a cast alone, and
+        // `emit_num_conv`'s codes do not describe it either.
+        if from == to {
+            return true;
+        }
+        if from != 'Z' && to != 'Z' {
+            emit_num_conv(asm, &format!("{from}{to}"));
+            return true;
+        }
+        return true;
+    }
+    emit_box(asm, &src);
+    // The target is a reference type; `emit_as_instance_of` still owes it a
+    // `checkcast` when it names a class (`3.asInstanceOf[Integer]`).
+    false
+}
+
+/// The JVM descriptor letter of a primitive, as `emit_num_conv` spells it.
+fn prim_desc_char(ty: &Type) -> Option<char> {
+    match ty.widen_constant() {
+        Type::Boolean => Some('Z'),
+        Type::Byte => Some('B'),
+        Type::Short => Some('S'),
+        Type::Char => Some('C'),
+        Type::Int => Some('I'),
+        Type::Long => Some('J'),
+        Type::Float => Some('F'),
+        Type::Double => Some('D'),
+        _ => None,
     }
 }
 
