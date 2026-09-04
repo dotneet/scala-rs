@@ -198,7 +198,7 @@ emit can be loaded by the JVM**, not how many files get through.
 
 The two value positions this slice missed — **the operands of `==` / `!=`**, and the
 **receiver** of a member selected on a `Unit` value — were closed in
-"[`Unit` comparison operands and `scala.Enumeration`](#unit-comparison-operands-and-scalaenumeration-agentuniteq)"
+the "`Unit` comparison operands and `scala.Enumeration`" work
 (`agent/uniteq`). The `== ()` in `ub_boxed.scala` only ever had an `Any`-shaped
 receiver, so `() == ()` is not exercised here.
 
