@@ -91,7 +91,14 @@ LOG=${CATS_LOG:-$SP/measure.txt}
 # subproject opts out) and with two compiler plugins, kind-projector 0.13.3 and
 # better-monadic-for 0.3.1. We have neither, so every `λ[...]` type lambda in
 # the source is ours to handle.
+# `-no-specialization` is nsc's own flag ("Ignore @specialize annotations").
+# cats writes `import scala.{specialized => sp}` and annotates with `@sp`, which
+# we reject without this flag -- and a single parse error aborts the run before
+# any file is typechecked, so the count collapses to the parse errors alone and
+# says nothing about type checking. Real scalac runs specialization instead; we
+# ignore the annotation, which changes the ABI but not what typechecks.
 $BIN compile "${FILES[@]}" -d $OUT -cp "$(cat $SP/deps.cp)$EXTRA_CP" -Xsource:3 \
+  -no-specialization \
   --scala-library /tmp/scala-rs-lib/scala-library-2.13.16.jar "$@" > $LOG 2>&1 || true
 ERRORS=$(grep -c '^error' $LOG || true)
 CLASSES=$(find $OUT -name '*.class' | wc -l | tr -d ' ')
