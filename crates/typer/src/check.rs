@@ -3054,12 +3054,27 @@ impl Typer {
                 None => return,
             },
         };
-        if let Some(cls) = self.st.class_sym_of(&st) {
+        // A *compound* self type offers the members of every part:
+        // `self: ControllerBase with AccountService with RepositoryService =>`
+        // (and, under -Xsource:3, the `&` spelling) is how gitbucket writes
+        // every cake trait. `class_sym_of` answers for one class, so taking
+        // only that left the other parts' members out of scope entirely --
+        // 230 "not found: value ownerOnly / referrersOnly / …".
+        let roots: Vec<Type> = match &st {
+            Type::Refined { parents, .. } => parents.clone(),
+            other => vec![other.clone()],
+        };
+        let mut seen = std::collections::HashSet::new();
+        for root in roots {
+            let Some(cls) = self.st.class_sym_of(&root) else {
+                continue;
+            };
+            if !seen.insert(cls.0) {
+                continue;
+            }
             self.enter_members_of(cls);
             // members of Foo's parents too (lookup_member walks them; Ident needs scope)
             let mut work = self.st.get(cls).parents.clone();
-            let mut seen = std::collections::HashSet::new();
-            seen.insert(cls.0);
             while let Some(p) = work.pop() {
                 let Some(pid) = self.st.class_sym_of(&p) else {
                     continue;

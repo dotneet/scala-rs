@@ -1,5 +1,17 @@
 // Syntax gitbucket's sources and its Twirl-generated templates need, all of
 // which used to be parse errors. See docs/gitbucket.md.
+trait Readable { def read: String = "r" }
+trait Writable { def write: String = "w" }
+
+// A compound self type offers the members of *every* part. gitbucket's cake
+// traits name three and four of them (`self: ControllerBase & AccountService &
+// RepositoryService =>`, the `&` spelling of `with` under -Xsource:3).
+trait ReadWrite { self: Readable with Writable =>
+  def rw: String = read + write
+}
+
+object Cake extends Readable with Writable with ReadWrite
+
 object Main {
   // gitbucket writes `Database() withTransaction { implicit session => ... }`
   // fifteen times: a block whose only statement is a function literal with an
@@ -38,5 +50,6 @@ object Main {
     println(s)
     val u = n +/*1.5*/ 1
     println(u)
+    println(Cake.rw)
   }
 }
