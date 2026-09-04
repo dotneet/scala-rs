@@ -20271,11 +20271,13 @@ impl Typer {
             }
             TreeKind::AppliedTypeTree { tpt, args } => {
                 let span = tpt.span;
+                let arg_mark = self.diags.len();
                 let mut as_ = Vec::new();
                 for a in args {
                     as_.push(self.tree_to_type(a));
                 }
-                match tpt.name() {
+                let head_mark = self.diags.len();
+                let applied = match tpt.name() {
                     Some("Array") => {
                         Type::Array(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
                     }
@@ -20364,7 +20366,22 @@ impl Typer {
                         self.apply_types(ctor, as_, span)
                     }
                     None => Type::Error,
+                };
+                // nsc's error type is absorbing: when the type constructor
+                // names nothing, its arguments are not reported as well.
+                // `-Ykind-projector` passes an unrecognised
+                // `Functor[λ[α => Box[α], β]]` through untouched, and
+                // `α`/`β` are then names nobody wrote a binder for -- one
+                // diagnostic about `λ`, not three. Only the *arguments*'
+                // diagnostics are dropped, and only when the head itself
+                // produced one, so `def f(x: List[Zork])` still reports `Zork`.
+                if self.diags[head_mark..]
+                    .iter()
+                    .any(|d| d.span == tpt.span && d.level == scala_rs_span::Level::Error)
+                {
+                    self.diags.drain(arg_mark..head_mark);
                 }
+                applied
             }
             TreeKind::TypeApply { fun, args } => {
                 // `new C[T]` in term position may be TypeApply; treat it as a type.
