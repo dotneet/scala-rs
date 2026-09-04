@@ -1,0 +1,6 @@
+method Tuple2(1)
+method Tuple3(2)
+a
+3
+b
+k
