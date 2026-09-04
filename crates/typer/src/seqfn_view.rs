@@ -201,6 +201,7 @@ impl Typer {
             ty: fun_ty,
             sym,
             postfix: false,
+            scala_ref: false,
         };
         *tree = Tree {
             id: NodeId(0),
@@ -212,6 +213,7 @@ impl Typer {
             ty: view,
             sym,
             postfix: false,
+            scala_ref: false,
         };
         self.adapt(tree, pt);
     }

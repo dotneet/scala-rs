@@ -559,6 +559,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         match kind.as_str() {
             "Literal" => Ok(node(TreeKind::Literal {
@@ -811,6 +812,7 @@ fn path_tree(full: &str, span: Span) -> Tree {
         ty: Type::NoType,
         sym: SymbolId::NONE,
         postfix: false,
+        scala_ref: false,
     };
     for p in parts {
         t = Tree {
@@ -823,6 +825,7 @@ fn path_tree(full: &str, span: Span) -> Tree {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
     }
     t
