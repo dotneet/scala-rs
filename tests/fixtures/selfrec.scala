@@ -13,6 +13,13 @@
 //    emitters read their receiver as an `Object`, so a primitive has to be
 //    boxed first -- or, when the target is a primitive too, turned into a
 //    numeric conversion, which is what nsc's erasure does.
+//
+// 3. An `asInstanceOf` that is itself *applied*: the cast yields a function
+//    value and the arguments belong to its `apply`, not to `asInstanceOf`.
+//
+// 4. A value class whose method has a default argument. The getter is reached
+//    through a `name$default$n$extension` of its own, and a separately
+//    compiled caller links against the copy on the *companion module*.
 
 trait Session { def id: String }
 
@@ -61,8 +68,18 @@ abstract class Casts[R] {
   def refIsPrim(a: Any): Boolean = a.isInstanceOf[Int]
 }
 
+// slick's `StringColumnExtensionMethods.like(pattern, esc: Char = ' ')`.
+final class Ops(val s: String) extends AnyVal {
+  def like(pattern: String, esc: Char = ' '): String = s + "|" + pattern + "|" + esc
+  def twice(n: Int = 2): String = s * n
+}
+
 object Main {
   implicit val session: Session = new Session { def id = "s1" }
+
+  // slick's `BasicBackend`: `f.asInstanceOf[Any => DBIOAction[…]](v)`.
+  def applyCast(f: Any, v: Any): Any = f.asInstanceOf[Any => String](v)
+  def applyCast2(f: Any, a: Any, b: Any): Any = f.asInstanceOf[(Any, Any) => String](a, b)
 
   def mk(): Invoker[Int] = { Count.recv += 1; new IntInvoker }
 
@@ -103,5 +120,16 @@ object Main {
     println(c.primIsRef(11))
     println(c.refIsPrim(12))
     println(c.refIsPrim("no"))
+
+    val g: Any => String = x => "g(" + x + ")"
+    println(applyCast(g, 1))
+    val h: (Any, Any) => String = (x, y) => "h(" + x + "," + y + ")"
+    println(applyCast2(h, 1, 2))
+
+    val o = new Ops("ab")
+    println(o.like("p"))
+    println(o.like("p", '!'))
+    println(o.twice())
+    println(new Ops("z").like("q"))
   }
 }

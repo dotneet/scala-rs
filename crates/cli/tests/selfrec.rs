@@ -210,3 +210,48 @@ fn fixtures_selfrec_primitive_casts_box_and_convert() {
     );
     let _ = fs::remove_dir_all(&out);
 }
+
+/// A value class's `name$default$n$extension` has to sit on the *companion
+/// module* as well as on the class. Only a separately compiled caller links
+/// against that copy, so running the fixture cannot see it: slick's
+/// `StringColumnExtensionMethods.like(pattern)` is called from a program real
+/// scalac compiled, and got `NoSuchMethodError:
+/// StringColumnExtensionMethods$.like$default$2$extension`. These are the
+/// descriptors scalac 2.13.16 emits for the same fixture.
+#[test]
+fn fixtures_selfrec_value_class_default_getters_are_on_the_module() {
+    let Some(out) = compile_fixture() else {
+        eprintln!("skip selfrec: no scala-library jar");
+        return;
+    };
+    let text = javap(&out, "Ops$").expect("javap Ops$");
+    for want in [
+        "like$extension(java.lang.String, java.lang.String, char)",
+        "like$default$2$extension(java.lang.String)",
+        "twice$default$1$extension(java.lang.String)",
+    ] {
+        assert!(text.contains(want), "Ops$ has no {want}:\n{text}");
+    }
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// `f.asInstanceOf[A => B](v)` applies the *cast*, not `asInstanceOf`. The
+/// backend used to strip the `TypeApply` and call `asInstanceOf` with the
+/// argument (`NoSuchMethodError: java.lang.Object.asInstanceOf()`).
+#[test]
+fn fixtures_selfrec_applied_cast_calls_the_function() {
+    let Some(out) = compile_fixture() else {
+        eprintln!("skip selfrec: no scala-library jar");
+        return;
+    };
+    let text = javap(&out, "Main$").expect("javap Main$");
+    assert!(
+        !text.contains("asInstanceOf"),
+        "an asInstanceOf was emitted as a call:\n{text}"
+    );
+    assert!(
+        text.contains("scala/Function1.apply") && text.contains("scala/Function2.apply"),
+        "the cast function was not applied:\n{text}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}

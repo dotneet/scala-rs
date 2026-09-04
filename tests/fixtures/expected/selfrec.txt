@@ -22,3 +22,9 @@ Single(true)
 true
 true
 false
+g(1)
+h(1,2)
+ab|p| 
+ab|p|!
+abab
+z|q| 

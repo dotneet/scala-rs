@@ -6724,6 +6724,44 @@ impl<'a> Gen<'a> {
                 value_extension_desc(self.st, stt.sym),
             ));
         }
+        // A default getter is reached through an `$extension` static of its
+        // own (`emit_default_getters` emits one beside the getter), and it is
+        // a synthesized *symbol* -- there is no `DefDef` in `body` for the
+        // loop above to find. slick's
+        // `StringColumnExtensionMethods.like(pattern)` leaves `esc: Char = ' '`
+        // out and got
+        // `NoSuchMethodError: StringColumnExtensionMethods$.like$default$2$extension`.
+        for mid in self.st.get(class_id).members.clone() {
+            let s = self.st.get(mid);
+            if s.kind != SymKind::Method || !s.name.contains("$default$") {
+                continue;
+            }
+            if s.default_rhs.is_none() {
+                continue;
+            }
+            let pts: Vec<Type> = if !s.params.is_empty() {
+                s.params
+                    .iter()
+                    .map(|p| self.st.get(*p).ty.clone())
+                    .collect()
+            } else {
+                match &s.ty {
+                    Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+                    _ => vec![],
+                }
+            };
+            let ret = match &s.ty {
+                Type::Method { ret, .. } => (**ret).clone(),
+                _ => Type::Any,
+            };
+            let mut tys = vec![under.clone()];
+            tys.extend(pts);
+            let name = format!("{}$extension", s.name);
+            if todo.iter().any(|(m, _)| *m == name) {
+                continue;
+            }
+            todo.push((name, jvm_method_desc(self.st, &tys, &ret)));
+        }
         for (n, d) in [
             ("hashCode$extension", format!("({udesc})I")),
             ("equals$extension", format!("({udesc}Ljava/lang/Object;)Z")),
@@ -9170,6 +9208,24 @@ fn gen_apply(
     fun: &Tree,
     args: &[Tree],
 ) {
+    // `f.asInstanceOf[A => B](v)`: the cast yields a *value*, and the
+    // arguments belong to that value's `apply`. `peel_fun` below strips the
+    // `TypeApply` and would call `asInstanceOf` itself -- with an argument it
+    // does not take (`NoSuchMethodError: java.lang.Object.asInstanceOf()`, in
+    // slick's `BasicBackend`:
+    // `f.asInstanceOf[Any => DBIOAction[?, Streaming[T], Nothing]](v)`).
+    // Anything else applied to a cast goes through an explicit `apply`
+    // selection the typer inserts, so this shape means a function value.
+    if let TreeKind::TypeApply { fun: head, .. } = &fun.kind {
+        if matches!(head.kind, TreeKind::Select { .. })
+            && !head.sym.is_none()
+            && matches!(ctx.st.get(head.sym).intrinsic, Intrinsic::AsInstanceOf)
+        {
+            gen_function_apply(asm, frame, ctx, fun, args, &tree.ty);
+            return;
+        }
+    }
+
     let fun0 = peel_fun(fun);
     let (fun, owned_args) = flatten_apply_owned(fun0, args);
     let args: &[Tree] = &owned_args;
