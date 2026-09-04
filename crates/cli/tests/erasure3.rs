@@ -23,7 +23,7 @@
 //! separately compiled caller depends on.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -81,7 +81,7 @@ fn run_main(cp: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-fn compile_ours(out: &PathBuf, jar: &PathBuf) {
+fn compile_ours(out: &Path, jar: &Path) {
     let r = Command::new(bin())
         .args([
             "compile",
@@ -100,7 +100,7 @@ fn compile_ours(out: &PathBuf, jar: &PathBuf) {
     );
 }
 
-fn javap(dir: &PathBuf, class: &str) -> Option<String> {
+fn javap(dir: &Path, class: &str) -> Option<String> {
     let out = Command::new("javap")
         .args(["-p", "-cp", dir.to_str().unwrap(), class])
         .output()
