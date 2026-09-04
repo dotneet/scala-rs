@@ -162,6 +162,23 @@ const EDGES: &[(&str, &str, Args)] = &[
         "scala/collection/SortedMap",
         Args::Same,
     ),
+    // `immutable.SortedSet[A] extends Set[A] with collection.SortedSet[A]`.
+    // Only the second half was wired, the asymmetry with `SortedMap` above
+    // being an oversight rather than a decision.
+    (
+        "scala/collection/immutable/SortedSet",
+        "scala/collection/immutable/Set",
+        Args::Same,
+    ),
+    // `immutable.BitSet extends SortedSet[Int]`. Without the edge cats-kernel's
+    // `x.subsetOf(y)` and `x | y` on two `BitSet`s were `no matching overload
+    // for (Set[Int])Boolean with arguments (BitSet)`: the members were there,
+    // read from the pickle, and the argument did not conform to its own type.
+    (
+        "scala/collection/immutable/BitSet",
+        "scala/collection/immutable/SortedSet",
+        Args::Int,
+    ),
     (
         "scala/collection/mutable/Set",
         "scala/collection/Set",

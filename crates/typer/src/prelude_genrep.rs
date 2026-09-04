@@ -29,7 +29,10 @@ pub(crate) fn link_tuple_products(st: &mut SymbolTable) {
     if extra.is_empty() {
         return;
     }
-    for n in 2..=MAX_TUPLE {
+    // From 1: `Tuple1` is in the prelude too (`prelude_tuple`), and slick's
+    // generated `TupleSupport` writes `new Tuple1(s(0))` where a `Product` is
+    // wanted.
+    for n in 1..=MAX_TUPLE {
         let jvm = format!("scala/Tuple{n}");
         let Some(cls) = crate::classpath::find_by_jvm(st, &jvm) else {
             continue;

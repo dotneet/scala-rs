@@ -1,0 +1,24 @@
+true
+7
+one
+7
+2 seconds
+5 seconds
+7 seconds
+3 seconds
+Main$marker
+Main$staticOnly
+true
+BitSet(1, 2, 3)
+2
+5
+4
+34
+true
+false
+true
+415870660
+-1
+-1
+Duration.MinusInf
+Duration.Inf

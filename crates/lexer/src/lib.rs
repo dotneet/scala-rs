@@ -573,18 +573,27 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// A hexadecimal literal spans the *unsigned* range of its type and is read
+    /// as two's complement, which a decimal literal does not: nsc types
+    /// `0x85ebca6b` as the `Int` `-2048144789` and rejects the decimal
+    /// `2246822507` as "integer number too large". Reading the bits as a
+    /// positive `i64` and widening to `Long` made cats-kernel's `MurmurHash3`
+    /// avalanche step (`h *= 0x85ebca6b` on an `Int` `h`) a `type mismatch;
+    /// found: Long  required: Int`.
     fn emit_int_from_radix(&mut self, digits: &str, radix: u32, suffix: NumSuffix, lo: u32) {
+        let bits = u64::from_str_radix(digits, radix);
         match suffix {
-            NumSuffix::Long => match i64::from_str_radix(digits, radix) {
-                Ok(v) => self.emit(TokenKind::LongLit(v), lo, self.pos as u32),
+            NumSuffix::Long => match bits {
+                Ok(v) => self.emit(TokenKind::LongLit(v as i64), lo, self.pos as u32),
                 Err(_) => self.error(lo, self.pos as u32, "hex literal out of range"),
             },
-            NumSuffix::None => match i64::from_str_radix(digits, radix) {
-                Ok(v) if v >= i32::MIN as i64 && v <= i32::MAX as i64 => {
-                    self.emit(TokenKind::IntLit(v as i32), lo, self.pos as u32)
+            NumSuffix::None => match bits {
+                Ok(v) if v <= u32::MAX as u64 => {
+                    self.emit(TokenKind::IntLit(v as u32 as i32), lo, self.pos as u32)
                 }
-                Ok(v) => self.emit(TokenKind::LongLit(v), lo, self.pos as u32),
-                Err(_) => self.error(lo, self.pos as u32, "hex literal out of range"),
+                // Wider than 32 bits without an `L`: nsc reports
+                // `integer number too large`.
+                Ok(_) | Err(_) => self.error(lo, self.pos as u32, "hex literal out of range"),
             },
             _ => self.error(lo, self.pos as u32, "invalid suffix on hex literal"),
         }
@@ -977,6 +986,31 @@ mod tests {
         assert_eq!(
             kinds("1 2L 0x10 1_000"),
             vec![IntLit(1), LongLit(2), IntLit(16), IntLit(1000)]
+        );
+    }
+
+    /// A hexadecimal literal spans the *unsigned* range of its type and is
+    /// read as two's complement, unlike a decimal one: nsc types `0x85ebca6b`
+    /// as the `Int` `-2048144789`, `0xffffffff` as `-1`, and
+    /// `0xffffffffffffffffL` as `-1L`, while rejecting anything wider than the
+    /// suffix allows with `integer number too large`.
+    #[test]
+    fn hex_literals_wrap_to_their_width() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("0x85ebca6b 0xffffffff 0x7fffffff 0xffffffffffffffffL"),
+            vec![
+                IntLit(-2048144789),
+                IntLit(-1),
+                IntLit(i32::MAX),
+                LongLit(-1)
+            ]
+        );
+        let sf = SourceFile::new("t.scala", "0x100000000");
+        let (_, diags) = tokenize(&sf, 0);
+        assert!(
+            !diags.is_empty(),
+            "0x100000000 does not fit an Int and has no `L`"
         );
     }
 

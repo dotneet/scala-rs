@@ -936,3 +936,123 @@ than not running at all:
   taking effect.
 * **`p06_update_tx`** does not roll back: `afterTx2` keeps the update the
   transaction threw out of, and `seq=List(2, 2)` instead of `List(2, 1)`.
+
+# Ten of the twelve (`agent/vcself`)
+
+```text
+progs=12 ok=10 diff=1 fail=1
+```
+
+`p01_basic`, `p02_queries`, `p03_joins`, `p04_groupby`, `p05_options`,
+`p07_caseclass`, `p08_mapto`, `p09_plainsql`, `p11_sqlgen` and `p12_mapped`
+print, byte for byte, what the scalac-built slick prints. Three defects, all
+of them already on `main`.
+
+## 1. A value class calling its own methods never reached the underlying value
+
+The assignment, and the previous note's reading of it is right — measured
+against real scalac 2.13.16 on six lines with no classpath:
+
+```scala
+final class Ops(val s: String) extends AnyVal {
+  def b(n: Int): String = s * n
+  def a(n: Int): String = b(n) + "!"
+}
+```
+
+Every method of `class C(val u: U) extends AnyVal` is really a static taking
+`u`, and `this` inside `C` is the box. The two meet at exactly one place — the
+receiver of a call from `C` to another of `C`'s own methods — and neither half
+was doing the conversion:
+
+* the instance method `a(int)` pushed `aload_0` (an `Ops`) into
+  `b$extension(String, int)`; nsc emits `aload_0; invokevirtual s()`;
+* the static `a$extension(String, int)` re-boxed slot 0 — which *is* the
+  underlying value — with a `new Ops(u)` before handing it on; nsc emits the
+  bare slot.
+
+`gen_value_self_receiver` is that one place. `load_this`'s existing
+`new C(u)`-on-demand stays: a lambda lifted out of an `$extension` really does
+want the box for its `$outer`, and unwraps it again through the accessor,
+which is why the helper keys on `ctx.value_ext` only when `ctx.outer` /
+`ctx.outer_slot` say the body is not inside a lifted lambda.
+
+A *no-argument* member is not affected: `def q = p + p` goes out as
+`aload_0; invokevirtual p()` on the instance method that scala-rs emits beside
+each `$extension`, which is correct (nsc routes it through the module instead).
+`q$extension` does build a box for it, and that is what nsc's own instance
+method amounts to.
+
+This was `p09_plainsql`'s `ActionBasedSQLInterpolation.sqlu` (the instance
+shape, a `VerifyError` because `StringContext` is a class) and
+`AnyOptionExtensionMethods.map$extension` → `flatMap$extension` (the static
+shape — `OptionLift.baseValue` got a wrapper and threw `MatchError`) in
+`p03_joins`, `p05_options`, `p07_caseclass` and `p11_sqlgen`. Only two of
+those four became `ok` on this fix alone; the other two were behind defect 3.
+
+## 2. An erasure bridge over a `Unit` result returned nothing
+
+```scala
+trait SP[-T] extends ((T, String) => Unit)
+object SetUnit extends SP[Unit] { def apply(none: Unit, pp: String): Unit = () }
+```
+
+`SetUnit$.apply(Object, Object)Object` came out
+`invokevirtual apply(BoxedUnit, String)V; areturn` —
+`VerifyError: Operand stack underflow`. `Unit` is `V` as a method *result* and
+`Lscala/runtime/BoxedUnit;` everywhere else, and `param_adapt`'s `Unit` rule
+("a `Unit` argument already is a `BoxedUnit` reference; adapt nothing") is the
+parameter rule. In return position the call leaves the stack empty and the
+bridge owes a reference: nsc pushes `BoxedUnit.UNIT`, and
+`emit_erasure_bridges` now does. `emit_inherited_covariant_bridges` never
+picked such a target (it requires a reference result at both ends).
+
+slick's `implicit object SetUnit extends SetParameter[Unit]` is this shape, so
+it was every plain-SQL statement — the blocker `p09_plainsql` reached once
+defect 1 was gone.
+
+## 3. A `val` narrowed by a subclass got no wide getter
+
+`emit_inherited_covariant_bridges` accepted a `SymKind::Term` parent member
+only from a *trait*, on the reasoning that a trait `val` is an interface method
+too. A class `val` is a getter just as much:
+
+```scala
+class Base { protected val q: Option[Seq[Int]] = None
+             def show = if (q.forall(_.contains(1))) "quote" else "bare" }
+class Sub extends Base { override protected val q: Some[Nil.type] = Some(Nil) }
+```
+
+`Sub` declared only `q()Lscala/Some;`, so `Base.show`'s
+`invokevirtual Base.q:()Lscala/Option;` read `Base`'s own field and answered
+`quote` for a `Sub`. The guard is now "not `private`" instead of "the parent is
+an interface".
+
+This is the `{fn …}` difference the previous note left open, and it was worth
+three programs rather than one. slick's
+`JdbcStatementBuilderComponent.QueryBuilder` has
+
+```scala
+protected val quotedJdbcFns: Option[Seq[Library.JdbcFunction]] = None // quote all by default
+```
+
+and `H2Profile`'s `QueryBuilder` subclass overrides it with `Some(Nil)`;
+`val quote = quotedJdbcFns.forall(_.contains(sym))` therefore stayed `true`.
+`p02_queries`, `p07_caseclass` and `p11_sqlgen` all print generated SQL
+containing a JDBC function.
+
+The regression fixture is `tests/fixtures/vcself.scala` (one file, all three)
+with `crates/cli/tests/vcself.rs`: real scalac 2.13.16's own stdout, plus
+`javap` for the three things stdout cannot see — the two receiver shapes, the
+`BoxedUnit.UNIT` in the bridge, and the wide getter's descriptor, which only a
+separately compiled caller links against.
+
+## Where it stops now
+
+* **`p10_types`** — unchanged, and not this slice's:
+  `NoSuchMethodError: RelationalProfile$ColumnOption$Length$.apply$default$2()`
+  on `O.Length(64)`, a case class's default-argument getter on a *nested*
+  companion module.
+* **`p06_update_tx`** — unchanged: the transaction does not roll back,
+  `afterTx2` keeps the update it threw out of and `seq=List(2, 2)` instead of
+  `List(2, 1)`.
