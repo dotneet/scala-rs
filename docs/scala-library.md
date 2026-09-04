@@ -464,11 +464,23 @@ in overriding`, which is polymorphic override checking, not lookup.
 | `tests/slick_run.sh` | — | `progs=12 ok=12 diff=0 fail=0` |
 | `tests/cats_measure.sh` | `files=339 skipped=1 errors=2929 files_with_errors=151 classes=0` | identical |
 | `tests/gitbucket_measure.sh` | `files=353 skipped=1 errors=1859 files_with_errors=186 classes=0` | identical |
-| `tests/scala_corpus.sh` (`CORPUS_SIZE=full`) | `pos 977 · neg 640 · run 434` | identical |
+| `tests/scala_corpus.sh` (`CORPUS_SIZE=full`, `CORPUS_JOBS=6`) | `pos 977 · neg 640 · run 443` | identical, and the two per-test TSVs `diff` clean |
 | `cargo test --workspace --release` | — | 149 × `test result: ok`, 1968 tests |
 
 `tests/slick_subset.sh` was not run: this slice touches no code generation
 (`crates/backend/` is untouched), so its 30 minutes would measure nothing.
+
+Both corpus columns were measured on this machine, the "before" one from the
+branch point. `run` is 443 there, not the 434 that was being quoted; the
+`corpus.tsv` files are identical test for test, which is the check worth
+running — a `run` total on its own moves with the per-test timeouts and with
+whatever else the machine is doing.
+
+Which of the checks in `.agent-brief.md` this slice actually ran: both
+measurement scripts above (compile only, `classes=0` on cats/gitbucket is
+expected while errors remain), `tests/slick_run.sh` and `tests/conform/`
+(the two that execute code), the corpus, and the full workspace suite. The
+classfile-loader and `javap` sweeps in `slick_subset.sh` were skipped as above.
 
 ## What to do next, in order
 
