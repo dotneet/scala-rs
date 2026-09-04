@@ -6127,7 +6127,7 @@ impl<'a> Gen<'a> {
         // one of its members is invisible -- real scalac reading a scala-rs
         // build of a package object said `object twice is not a member of
         // package myp.util` for each of them. See
-        // `docs/notes/separate-compilation.md`.
+        // `docs/notes/companions-and-class-symbols.md`.
         if !class_names.contains(name) && top_level {
             self.emit_forwarder(&this_name, &forwarded, cls);
         }
@@ -6377,8 +6377,7 @@ impl<'a> Gen<'a> {
             name: "MODULE$".into(),
             desc: format!("L{this_name};"),
         });
-        let comp = Some(comp);
-        self.emit_module_init(&mut b, comp.unwrap_or(class_id), &[], &[], None, comp);
+        self.emit_module_init(&mut b, comp, &[], &[], None, Some(comp));
         self.emit_module_clinit(&mut b);
         self.emit_value_extension_forwarders(&mut b, class_id, &impl_.body);
         // The value class's own pickle, which describes the companion too --
