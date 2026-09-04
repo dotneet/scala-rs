@@ -43,6 +43,45 @@ pub struct InnerClassEntry {
     pub access_flags: u16,
 }
 
+/// JVMS §4.4.7: a `CONSTANT_Utf8_info` carries a `u2` byte count.
+const MAX_UTF8_CONST: usize = 65535;
+
+/// Modified-UTF-8 width of one char. `\0` is two bytes, not one -- and the
+/// SID-10 encoding does produce `\0` (it is what `avoidZero` turns `0x7f`
+/// into), so counting chars instead of bytes would still overflow.
+fn modified_utf8_width(c: char) -> usize {
+    match c as u32 {
+        0 => 2,
+        u if u < 0x80 => 1,
+        u if u < 0x800 => 2,
+        _ => 3,
+    }
+}
+
+/// Split `s` at char boundaries into pieces that each fit one constant.
+///
+/// The reader concatenates the pieces back into one string before decoding,
+/// so where the split falls does not matter as long as no char is cut in
+/// half.
+fn utf8_chunks(s: &str, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut len = 0usize;
+    for ch in s.chars() {
+        let w = modified_utf8_width(ch);
+        if len + w > max && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            len = 0;
+        }
+        cur.push(ch);
+        len += w;
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// JVMS §4.4.7 modified UTF-8 (U+0000 as `C0 80`).
 fn modified_utf8_bytes(s: &str) -> Vec<u8> {
     let mut b = Vec::with_capacity(s.len());
@@ -104,6 +143,17 @@ impl Pool {
             return *i;
         }
         let encoded = modified_utf8_bytes(s);
+        // `encoded.len() as u16` used to wrap silently, and the class file
+        // that came out had a constant pool no reader could walk ("unexpected
+        // tag at #104"). Only the `ScalaSignature` ever got near the limit,
+        // and that one is split across `ScalaLongSignature` before it reaches
+        // here; anything else arriving oversized is a bug worth stopping for
+        // rather than writing an unloadable class file.
+        assert!(
+            encoded.len() <= MAX_UTF8_CONST,
+            "CONSTANT_Utf8 of {} bytes exceeds the JVMS limit of {MAX_UTF8_CONST}",
+            encoded.len()
+        );
         let i = self.count;
         self.count += 1;
         self.bytes.push(1); // CONSTANT_Utf8
@@ -445,17 +495,32 @@ impl ClassEmit {
         } else {
             None
         };
-        let sig_type = if self.scala_signature.is_some() {
-            Some(pool.utf8("Lscala/reflect/ScalaSignature;"))
-        } else {
-            None
-        };
+        // A `CONSTANT_Utf8` holds at most 65535 bytes (JVMS §4.4.7) and the
+        // length field is a `u2`, so an oversized one used to wrap and leave
+        // an unreadable constant pool behind -- `slick/util/TupleMethods`
+        // came out as "unexpected tag at #104" once its nested classes went
+        // into its signature. nsc's answer is SID-10's `ScalaLongSignature`:
+        // the same encoded string, split into an array of pieces that each
+        // fit, concatenated again by the reader.
+        let sig_chunks: Vec<String> = self
+            .scala_signature
+            .as_deref()
+            .map(|s| utf8_chunks(s, MAX_UTF8_CONST))
+            .unwrap_or_default();
+        let long_sig = sig_chunks.len() > 1;
+        let sig_type = self.scala_signature.is_some().then(|| {
+            pool.utf8(if long_sig {
+                "Lscala/reflect/ScalaLongSignature;"
+            } else {
+                "Lscala/reflect/ScalaSignature;"
+            })
+        });
         let bytes_name = if self.scala_signature.is_some() {
             Some(pool.utf8("bytes"))
         } else {
             None
         };
-        let sig_utf8 = self.scala_signature.as_deref().map(|s| pool.utf8(s));
+        let sig_utf8s: Vec<u16> = sig_chunks.iter().map(|c| pool.utf8(c)).collect();
         let inner_classes_attr = if self.inner_classes.is_empty() {
             None
         } else {
@@ -615,17 +680,28 @@ impl ClassEmit {
             out.extend_from_slice(&(marker.len() as u32).to_be_bytes());
             out.extend_from_slice(&marker);
         }
-        if let (Some(rva), Some(sig_ty), Some(bn), Some(su)) =
-            (rva_attr, sig_type, bytes_name, sig_utf8)
-        {
-            // RuntimeVisibleAnnotations { num=1, ScalaSignature { bytes = Utf8 } }
+        if let (Some(rva), Some(sig_ty), Some(bn)) = (rva_attr, sig_type, bytes_name) {
+            // RuntimeVisibleAnnotations { num=1, ScalaSignature { bytes = Utf8 } },
+            // or `ScalaLongSignature { bytes = { Utf8, ... } }` when one
+            // constant could not hold the whole pickle.
             let mut body = Vec::new();
             body.extend_from_slice(&1u16.to_be_bytes());
             body.extend_from_slice(&sig_ty.to_be_bytes());
             body.extend_from_slice(&1u16.to_be_bytes());
             body.extend_from_slice(&bn.to_be_bytes());
-            body.push(b's');
-            body.extend_from_slice(&su.to_be_bytes());
+            if long_sig {
+                body.push(b'[');
+                body.extend_from_slice(&(sig_utf8s.len() as u16).to_be_bytes());
+                for su in &sig_utf8s {
+                    body.push(b's');
+                    body.extend_from_slice(&su.to_be_bytes());
+                }
+            } else {
+                for su in &sig_utf8s {
+                    body.push(b's');
+                    body.extend_from_slice(&su.to_be_bytes());
+                }
+            }
             out.extend_from_slice(&rva.to_be_bytes());
             out.extend_from_slice(&(body.len() as u32).to_be_bytes());
             out.extend_from_slice(&body);
