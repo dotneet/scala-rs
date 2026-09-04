@@ -76,7 +76,7 @@ path of your own.**
 |---|---|---|---|---|---|
 | At the start | 354 | 0 | **35** | 13 | 0 |
 | After the first survey | 353 | 1 | **3261** | 256 | 0 |
-| main at `10bd2d5` (Twirl and the two slick-run slices merged) | 353 | 1 | **2373** | 188 | 0 |
+| main at `56174d5` (Twirl, the two slick-run slices and scalalib merged) | 353 | 1 | **2373** | 188 | 0 |
 | Now | 353 | 1 | **1859** | 186 | 0 |
 
 Both of the last two rows were measured on the same tree, with the same
