@@ -332,6 +332,7 @@ pub fn write_emitted(emitted: &[EmittedClass], out_dir: &Path) -> std::io::Resul
     // `create_dir_all` walks and stats the whole chain every time it is called.
     // Nothing removes a directory while this runs, so once is enough.
     let mut made: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut dests: Vec<PathBuf> = Vec::with_capacity(emitted.len());
     for c in emitted {
         let dest = class_path(out_dir, &c.internal_name);
         if let Some(parent) = dest.parent() {
@@ -340,9 +341,47 @@ pub fn write_emitted(emitted: &[EmittedClass], out_dir: &Path) -> std::io::Resul
                 made.insert(parent.to_path_buf());
             }
         }
-        std::fs::write(&dest, &c.bytes)?;
+        dests.push(dest);
     }
-    Ok(())
+    // Every directory now exists, so the writes themselves are independent:
+    // one `open`/`write`/`close` per class, each blocking on the file system.
+    // 4552 of them were 10% of a slick build's CPU and almost all of it was
+    // syscall latency, which overlaps across threads. Deterministic output:
+    // the file set and each file's bytes do not depend on the interleaving.
+    let jobs = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(1)
+        .min(emitted.len().div_ceil(64))
+        .max(1);
+    if jobs == 1 {
+        for (c, dest) in emitted.iter().zip(&dests) {
+            std::fs::write(dest, &c.bytes)?;
+        }
+        return Ok(());
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed: std::sync::Mutex<Option<std::io::Error>> = std::sync::Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..jobs {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= emitted.len() {
+                    return;
+                }
+                if let Err(e) = std::fs::write(&dests[i], &emitted[i].bytes) {
+                    let mut slot = failed.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                    return;
+                }
+            });
+        }
+    });
+    match failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn class_path(out_dir: &Path, internal_name: &str) -> PathBuf {

@@ -1,5 +1,11 @@
 //! scala-rs command-line compiler (Scala 2.13 subset, not Scala 3).
 
+/// The compiler is allocation-bound: 42% of samples in a `sample` profile of a
+/// 184-file slick build were in the system allocator. macOS's libmalloc pays a
+/// lock on every small allocation; mimalloc's thread-local free lists do not.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
