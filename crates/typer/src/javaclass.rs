@@ -482,6 +482,12 @@ pub fn is_java_static(access: u16) -> bool {
     access & ACC_STATIC != 0
 }
 
+/// A bridge is the compiler's own copy of a signature the class inherits, so
+/// it never introduces an alternative the source did not write.
+pub fn is_java_bridge(access: u16) -> bool {
+    access & ACC_BRIDGE != 0
+}
+
 pub fn is_java_abstract(access: u16) -> bool {
     access & ACC_ABSTRACT != 0
 }

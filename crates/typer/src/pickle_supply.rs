@@ -3547,7 +3547,7 @@ fn names_class(candidate: &str, full_name: &str) -> bool {
 /// A member's parameters, erased the same way [`erased_param_desc`] erases a
 /// freshly-read pickle shape, so an already-installed symbol's shape can be
 /// compared against one about to be installed.
-fn flat_erased_params(st: &SymbolTable, ty: &Type) -> Vec<Option<String>> {
+pub(crate) fn flat_erased_params(st: &SymbolTable, ty: &Type) -> Vec<Option<String>> {
     match ty {
         Type::Method { paramss, .. } => paramss
             .iter()
@@ -3632,7 +3632,7 @@ fn params_match(desc: &str, want: &[Option<String>]) -> bool {
 }
 
 /// Split a method descriptor's parameter list into individual descriptors.
-fn desc_params(desc: &str) -> Option<Vec<String>> {
+pub(crate) fn desc_params(desc: &str) -> Option<Vec<String>> {
     let b = desc.as_bytes();
     if b.first() != Some(&b'(') {
         return None;
