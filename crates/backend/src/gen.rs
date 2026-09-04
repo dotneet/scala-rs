@@ -7617,13 +7617,13 @@ fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &
                         // qualifier has to leave its `BoxedUnit` behind:
                         // `().asInstanceOf[Unit]` pops it again, and
                         // `().isInstanceOf[T]` tests it.
-                        adapt_unit_arg(asm, ctx, qual, &qual.ty);
+                        adapt_unit_qualifier(asm, ctx, qual);
                         emit_as_instance_of(asm, ctx, &tree.ty);
                         return;
                     }
                     if matches!(ic, Intrinsic::IsInstanceOf) {
                         gen_expr(asm, frame, ctx, qual);
-                        adapt_unit_arg(asm, ctx, qual, &qual.ty);
+                        adapt_unit_qualifier(asm, ctx, qual);
                         let target = args.first().map(|a| &a.ty).unwrap_or(&Type::Any);
                         emit_is_instance_of(asm, ctx, target);
                         return;
@@ -14581,6 +14581,25 @@ fn adapt_type_member_arg(
 /// (`f(())`, `f(g())` alike). Erasure sometimes hands over an expression that
 /// already produced a reference (`$box`, a generic `T` result); that one *is*
 /// the box, and only needs narrowing from `Object`.
+/// `adapt_unit_arg` for the receiver of `asInstanceOf` / `isInstanceOf`.
+///
+/// The *parameter* case can trust `NoType` to mean `Unit` -- a parameter always
+/// has a written or inferred type, and `jvm_desc_val` erases both the same way.
+/// A *qualifier* cannot: `NoType` there means the typer recorded nothing, and
+/// `gen_expr` has already left whatever the expression really produced on the
+/// stack. Materialising a `BoxedUnit` on top of it is one value too many.
+/// slick's `ScalaBaseType.scalaOrderingFor` returns a lambda whose parameters
+/// come out `<notype>` (the SAM's element type is not borrowed from the
+/// overridden `def scalaOrderingFor(ord: Ordering): Ordering[T]`), so
+/// `x.asInstanceOf[AnyRef] eq null` compared `BoxedUnit.UNIT` against `null`
+/// and left `x` stranded: `VerifyError: Inconsistent stackmap frames`.
+fn adapt_unit_qualifier(asm: &mut Assembler, ctx: &EmitCtx, a: &Tree) {
+    if !matches!(a.ty.widen_constant(), Type::Unit) {
+        return;
+    }
+    adapt_unit_arg(asm, ctx, a, &Type::Unit);
+}
+
 fn adapt_unit_arg(asm: &mut Assembler, ctx: &EmitCtx, a: &Tree, pty: &Type) {
     if !erases_to_boxed_unit(pty) {
         return;
