@@ -4080,18 +4080,13 @@ impl Typer {
             let clause_start = clause_start_of(paramss_ids, i);
             let same_clause = &flat[clause_start..i];
             let keep_same_clause = !same_clause.is_empty()
-                && self
-                    .st
-                    .get(*pid)
-                    .default_rhs
-                    .as_ref()
-                    .is_some_and(|rhs| {
-                        let names: Vec<String> = same_clause
-                            .iter()
-                            .map(|id| self.st.get(*id).name.clone())
-                            .collect();
-                        tree_names_any(rhs, &names)
-                    });
+                && self.st.get(*pid).default_rhs.as_ref().is_some_and(|rhs| {
+                    let names: Vec<String> = same_clause
+                        .iter()
+                        .map(|id| self.st.get(*id).name.clone())
+                        .collect();
+                    tree_names_any(rhs, &names)
+                });
             let cut = if keep_same_clause { i } else { clause_start };
             let preceding: Vec<SymbolId> = flat[..cut].to_vec();
             let preceding_tys: Vec<Type> = preceding

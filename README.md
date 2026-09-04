@@ -53,8 +53,10 @@ become anonymous classes here, and traits get `T$class` helpers that scalac
 What that run establishes:
 
 - All 184 slick files typecheck, with 0 errors.
-- All 2127 emitted class files load under `java -Xverify:all`.
-- The test suite is 128 test binaries / 1842 tests. 84 of them (the programs in
+- All 2127 emitted class files load under `java -Xverify:all`. They *load*:
+  `Class.forName(initialize = false)` links nothing, so method bodies are not
+  verified by that number (see `tests/slick_run.sh`).
+- The test suite is 129 test binaries / 1844 tests. 84 of them (the programs in
   `tests/conform/`) are dual-run against real scalac 2.13.16 and required to
   produce byte-identical stdout.
 
@@ -186,6 +188,11 @@ The scripts under `tests/` are measurement harnesses, not part of `cargo test`:
 - `tests/slick_subset.sh` — find the fixpoint of slick files that compile
   cleanly together, emit their class files, and load every one of them with the
   bytecode verifier on.
+- `tests/slick_run.sh` — build slick twice (scala-rs and real scalac), compile
+  the client programs in `tests/slick_progs/` once with real scalac, and run
+  that one client binary against each slick build, comparing stdout byte for
+  byte. The first harness that asks whether the emitted slick *runs*; see
+  [docs/notes/running-the-slick-we-compiled.md](docs/notes/running-the-slick-we-compiled.md).
 - `tests/expand_fm.py` — expand the seven FreeMarker templates slick's build
   generates Scala sources from, so a measurement covers what sbt would compile.
 - `tests/testkit_measure.sh` — the same measurement for `slick-testkit`, slick's
