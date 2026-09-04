@@ -1,14 +1,15 @@
-//! 型変数の遅延解決（nsc の undetermined type variables）。
+//! Deferred resolution of type variables (nsc's undetermined type variables).
 //!
-//! 引数はオーバーロード解決を型で駆動するために期待型なしで型付けされる。その
-//! 結果、`Map.empty` のような多相参照は自分の型パラメータを抱えたまま
-//! （`Map[K, V]`）引数位置に届く。nsc はそれを「未確定の型変数」として持ち回り、
-//! 候補を選び終えてからパラメータ型で解く。ここではその経路と、逆向き
-//! （呼び出し側の型パラメータがまだ未確定な `PartialFunction[Int, ?B]`）の
-//! 経路の両方を固定する。
+//! Arguments are typed without an expected type so that overload resolution can be
+//! driven by types. As a result a polymorphic reference like `Map.empty` reaches
+//! argument position still carrying its own type parameters (`Map[K, V]`). nsc
+//! carries those around as "undetermined type variables" and solves them against
+//! the parameter types once it has picked a candidate. Pinned here are both that
+//! path and the reverse one (`PartialFunction[Int, ?B]`, where it is the caller's
+//! type parameter that is still undetermined).
 //!
-//! フィクスチャは実 `scala-library` の jar に対してコンパイルし、出力を
-//! nsc 2.13.16 が同じソースに対して出すものと比較する。
+//! The fixtures are compiled against the real `scala-library` jar and their output
+//! compared with what nsc 2.13.16 produces for the same source.
 
 use std::fs;
 use std::path::{Path, PathBuf};

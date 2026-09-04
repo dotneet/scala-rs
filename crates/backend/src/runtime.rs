@@ -925,10 +925,10 @@ fn emit_list() -> EmittedClass {
     b.finish()
 }
 
-/// `prelude_seq::add_list_core_private` が宣言する分の実装。
+/// Implementations for what `prelude_seq::add_list_core_private` declares.
 ///
-/// 私有ランタイムの `List` は `isEmpty` / `head` / `tail` だけを抽象メソッドに
-///持つので、ここは全部それらの上に組み立てる。scala-library はリンクしない。
+/// The private runtime's `List` has only `isEmpty` / `head` / `tail` as abstract
+/// methods, so everything here is built on top of those. scala-library is not linked.
 fn add_list_core_runtime(b: &mut B) {
     const LIST: &str = "scala/collection/immutable/List";
     const CONS: &str = "scala/collection/immutable/$colon$colon";

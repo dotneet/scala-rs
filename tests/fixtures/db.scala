@@ -1,22 +1,23 @@
-// agent/dbio: slick の `JdbcActionComponent.scala` / `DBIOAction.scala` の根。
+// agent/dbio: the roots behind slick's `JdbcActionComponent.scala` / `DBIOAction.scala`.
 //
-//  1. 親コンストラクタ呼び出しの名前付き引数
-//     (`extends SimpleJdbcProfileAction[R](_name = …, statements = …)`)。
-//  2. `private[this]` メンバを、外側クラスを *別の型引数で* 継承する匿名クラス
-//     の中から無修飾で参照する
-//     (`SynchronousDatabaseAction.superZip` / `superAsTry`)。
-//  3. `[B >: A]` の下限が呼び出し側のメソッド型パラメタを含む場合の解
-//     (`Either.getOrElse(throw …)` の受け側 `PositionedResultIterator[T]`)。
-//     ここでは非 jar モードにもある `Option` で同じ形を通す。
-//  4. 型付きパターン `case a: T[_, …]` は走査対象が既に言っている型引数を
-//     保つ (nsc の `inferTypedPattern`)。
+//  1. Named arguments in a parent constructor call
+//     (`extends SimpleJdbcProfileAction[R](_name = …, statements = …)`).
+//  2. Referring to a `private[this]` member unqualified from inside an anonymous
+//     class that extends the enclosing class *at different type arguments*
+//     (`SynchronousDatabaseAction.superZip` / `superAsTry`).
+//  3. Solving `[B >: A]` when the lower bound mentions the caller's own method
+//     type parameter (the receiver `PositionedResultIterator[T]` of
+//     `Either.getOrElse(throw …)`). Here the same shape goes through `Option`,
+//     which exists in non-jar mode too.
+//  4. A typed pattern `case a: T[_, …]` keeps the type arguments the scrutinee
+//     already states (nsc's `inferTypedPattern`).
 //
-// 標準ライブラリを使わない `--no-scala-library` でも通るよう、
-// `Vector` / `List` ではなく自前のクラスと `Array` だけで書いてある。
+// So that it also passes under `--no-scala-library`, this is written with
+// hand-rolled classes and `Array` only, not `Vector` / `List`.
 
 class Box[R](val first: R)
 
-// 1. 親コンストラクタの名前付き引数。並べ替え・順序どおり・既定値の 3 形。
+// 1. Named arguments to the parent constructor: reordered, in order, and defaulted.
 abstract class Act(_name: String, statement: String, repeat: Int = 1) {
   def show: String = {
     var s = _name + "["
@@ -42,17 +43,17 @@ class InOrder(n: Int)
       repeat = 2
     )
 
-// 2. `private[this]` の親メンバ。匿名サブクラスは `Outer[Box[R]]` なので、
-//    `base` を「このクラスを通して」読むと `Box[Box[R]]` になってしまう。
-//    `base` が public だと scalac も同じ mismatch を出す(継承したほうが
-//    外側を隠す)ので、これは `private[this]` に固有の形。
+// 2. A `private[this]` parent member. The anonymous subclass is `Outer[Box[R]]`,
+//    so reading `base` "through this class" would give `Box[Box[R]]`.
+//    If `base` were public scalac reports the same mismatch (the inherited one
+//    shadows the outer one), so this shape is specific to `private[this]`.
 abstract class Outer[R](val r: R) {
   private[this] def base: Box[R] = new Box[R](r)
 
   def wrap: String = {
-    // 親コンストラクタ引数はローカルに逃がしてある(匿名クラスの `<init>`
-    // の中で外側の `this` を読む形は、このスライスとは無関係の既知の
-    // codegen バグ ―― `uninitializedThis` への `getfield` ―― を踏む)。
+    // The parent constructor argument is hoisted into a local (reading the outer
+    // `this` from inside an anonymous class's `<init>` hits a known codegen bug
+    // unrelated to this slice -- a `getfield` on `uninitializedThis`).
     val seed = new Box[R](r)
     val o = new Outer[Box[R]](seed) {
       val nonFused: Box[R] = base
@@ -62,9 +63,9 @@ abstract class Outer[R](val r: R) {
   }
 }
 
-// 4. `case a: T[_, …]` は走査対象が既に言っている型引数を保つ
-//    (nsc の `inferTypedPattern`)。`Sync[_, _, _]` を裸で束縛すると
-//    `superZip` の `Zip[R2, E2]` に渡せない。
+// 4. `case a: T[_, …]` keeps the type arguments the scrutinee already states
+//    (nsc's `inferTypedPattern`). Binding `Sync[_, _, _]` bare leaves nothing
+//    that can be passed to `superZip`'s `Zip[R2, E2]`.
 trait Eff
 trait Zip[+R, -E <: Eff] {
   def tag: String
@@ -83,8 +84,8 @@ trait Sync[+R, C, -E <: Eff] extends Zip[R, E] {
 class SyncAct[R](val tag: String) extends Sync[R, String, Eff]
 
 object Main {
-  // 3. 下限 `B >: A` の `A` が呼び出し側の型パラメタを含む形。引数は
-  //    `Nothing` なので、下限を使わないと `B` が `Nothing` に解ける。
+  // 3. The `A` of the lower bound `B >: A` mentions the caller's type parameter.
+  //    The argument is `Nothing`, so without the bound `B` solves to `Nothing`.
   def firstOf[T](o: Option[Box[T]]): T =
     o.getOrElse(throw new RuntimeException("empty")).first
 

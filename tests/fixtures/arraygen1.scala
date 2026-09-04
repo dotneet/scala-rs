@@ -1,19 +1,19 @@
-// agent/arraygen: `Array` の codegen 3 件と、そこから出た 3 件。
-// 全ケースを 1 ファイルに（実 scalac 1 回 1.8 秒）。
+// agent/arraygen: three `Array` codegen bugs, and three more that fell out of them.
+// Every case in one file (a real scalac run costs 1.8 s).
 //
-// 1) 明示型引数 `s.map[Int](f)` が as-seen-from を通らない（`map6` / `toArr`）。
-// 2) `Array[Any](…)` と同じファイルの後続の `Array(3, 1, 2)` が壊れた記述子を
-//    出して `VerifyError`。**宣言の順序が意味を持つ**ので `mixedFirst` を
-//    `inferredLater` より前に置いてある。動かさないこと。
-// 3) `Array[(Int, String)](…)` が `Object[]` を作って `ClassCastException`。
-// 4) `f(arr: _*)` が Array を包まずに渡して `VerifyError`。
-// 5) `Array[T]` の要素代入が `"[java/lang/Object".update` を出して
-//    `ClassFormatError`（クラスがロードすらできない）。
-// 6) `arr.clone()` / `arr :+ x` の記述子。
+// 1) An explicit type argument `s.map[Int](f)` does not survive as-seen-from (`map6` / `toArr`).
+// 2) An `Array(3, 1, 2)` later in the same file as an `Array[Any](…)` emitted a
+//    broken descriptor and a `VerifyError`. **Declaration order matters here**,
+//    so `mixedFirst` sits before `inferredLater`. Do not move them.
+// 3) `Array[(Int, String)](…)` built an `Object[]` and threw `ClassCastException`.
+// 4) `f(arr: _*)` passed the Array through unwrapped and threw `VerifyError`.
+// 5) Storing into an element of `Array[T]` emitted `"[java/lang/Object".update`
+//    and a `ClassFormatError` (the class would not even load).
+// 6) The descriptors of `arr.clone()` / `arr :+ x`.
 import scala.collection.immutable.HashSet
 import scala.reflect.ClassTag
 
-// 5 の別形。`agent/final1` がここを踏んで `Array.tabulate[R]` で回避していた。
+// A variant of 5. `agent/final1` hit this and worked around it with `Array.tabulate[R]`.
 final class CArr[+T](val xs: Seq[T]) {
   def toArr[R >: T: ClassTag]: Array[R] = {
     val out = new Array[R](xs.length)
@@ -24,22 +24,22 @@ final class CArr[+T](val xs: Seq[T]) {
 }
 
 object Main {
-  // 1) 明示型引数 + ジェネリック親からの継承メンバ。
+  // 1) An explicit type argument plus a member inherited from a generic parent.
   def map6(s: HashSet[String]): HashSet[Int] = s.map[Int](_.length)
 
-  // 2) `Array[Any]` を含む宣言が先に来る。
+  // 2) The declaration containing `Array[Any]` comes first.
   def mixedFirst(): String = Array[Any](1, "a").mkString(",")
   def inferredLater(): Int = Array(3, 1, 2).sum
   def inferredDouble(): String = Array(1.5, 2.5).mkString("/")
 
-  // 3) 参照要素の推論。
+  // 3) Inference of a reference element type.
   def pairs(): Array[(Int, String)] = Array[(Int, String)](1 -> "one", 2 -> "two")
 
-  // 4) 可変長引数への `: _*` 展開。
+  // 4) `: _*` expansion into varargs.
   def render(parts: String*): String = parts.mkString("|")
   def total(xs: Int*): Int = xs.sum
 
-  // 5) 抽象要素型の `Array[T]` に代入して読む。
+  // 5) Store into and read back an `Array[T]` at an abstract element type.
   def repeat[T: ClassTag](x: T, n: Int): Array[T] = {
     val a = new Array[T](n)
     var i = 0
@@ -47,13 +47,13 @@ object Main {
     a
   }
 
-  // 6) `clone` と `:+` / `+:` / `updated`。
+  // 6) `clone` and `:+` / `+:` / `updated`.
   def bump(a: Array[String], s: String): Array[String] = {
     val c = a.clone()
     (s +: c) :+ s
   }
-  // 要素型が抽象なら配列自身も `Object` に潰れるので、`clone` も
-  // `ScalaRunTime.array_clone` 経由（`"[I".clone` では嘘になる）。
+  // With an abstract element type the array itself collapses to `Object` too, so
+  // `clone` goes through `ScalaRunTime.array_clone` (`"[I".clone` would be a lie).
   def dup[T](a: Array[T]): Array[T] = a.clone()
 
   def main(args: Array[String]): Unit = {
@@ -86,7 +86,7 @@ object Main {
     println(dup(nums).sum)
     println(dup(names).mkString(""))
 
-    // `ClassTag` の要素クラスがそのまま `Array.apply` の生成に効く。
+    // The `ClassTag`'s element class feeds straight into what `Array.apply` generates.
     println(Array[Array[Int]](Array(1), Array(2, 3)).map(_.length).mkString(""))
     println(Array[Option[Int]](Some(1), None).map(_.getOrElse(0)).sum)
   }

@@ -1,30 +1,29 @@
-//! `scala.collection.Map` の `MapOps` メンバ。
+//! The `MapOps` members of `scala.collection.Map`.
 //!
-//! `prelude.rs` からは [`install`] を 1 行呼ぶだけにしてある。
+//! `prelude.rs` calls [`install`] on a single line.
 //!
-//! `prelude_hier.rs` の作る「リンク用」トレイト
-//! （`scala/collection/Map`）はメンバを一切持たない。具体的な
-//! `immutable.Map` / `mutable.Map` の側にだけ `get` / `contains` /
-//! `getOrElse` / `apply` が生えていたので、
+//! The "linking" trait `prelude_hier.rs` builds (`scala/collection/Map`) carries no
+//! members at all. `get` / `contains` / `getOrElse` / `apply` grew only on the
+//! concrete `immutable.Map` / `mutable.Map`, so
 //!
 //! ```scala
 //! def createResult(expansions: collection.Map[TableIdentitySymbol, (TermSymbol, Node)], …) =
 //!   … if expansions contains tsym then expansions(tsym) …   // slick ExpandTables
 //! ```
 //!
-//! のように**抽象側の型で受けた**とたん `value contains is not a member of
-//! Map[…]` になり、`expansions(tsym)` は `Map` コンパニオンの `apply` を
-//! 拾って `no matching overload for ((K, V)*)Map[K, V]` になっていた。
-//! 2.13 では 4 つとも `scala.collection.MapOps` の宣言なので、抽象側に置く
-//! のが正しい（`javap scala/collection/Map` にすべて並ぶ）。
+//! turned into `value contains is not a member of Map[…]` the moment it was **taken
+//! at the abstract type**, and `expansions(tsym)` picked up the `Map` companion's
+//! `apply` and gave `no matching overload for ((K, V)*)Map[K, V]`. In 2.13 all four
+//! are declarations on `scala.collection.MapOps`, so the abstract side is where they
+//! belong (they are all listed in `javap scala/collection/Map`).
 //!
-//! シグネチャは `immutable.Map` 側（`prelude.rs` / `prelude_coll.rs`）と
-//! そろえてある。`get`/`contains`/`getOrElse`/`apply` の鍵引数が `Any` なのは
-//! 2.13 の `MapOps` が `K` を受けるのに対し prelude が既にそう書いていたため
-//! で、ここだけ厳しくすると継承側と食い違う。
+//! The signatures line up with the `immutable.Map` side (`prelude.rs` /
+//! `prelude_coll.rs`). The key parameter of `get`/`contains`/`getOrElse`/`apply` is
+//! `Any` because that is how the prelude already wrote it, where 2.13's `MapOps`
+//! takes `K`; tightening it only here would disagree with the inheriting side.
 //!
-//! **私有ランタイム（`--no-scala-library`）** でも `scala/collection/Map` は
-//! prelude が用意しているのでゲート不要。無ければ黙って何もしない。
+//! No gate is needed for the **private runtime (`--no-scala-library`)** either, since
+//! the prelude provides `scala/collection/Map`. If it is absent, do nothing.
 
 use crate::symbol::SymbolTable;
 use scala_rs_parser::Type;

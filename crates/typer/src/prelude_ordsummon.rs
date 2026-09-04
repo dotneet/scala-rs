@@ -1,50 +1,50 @@
-//! `scala` パッケージオブジェクトの `val Ordering = scala.math.Ordering` 相当。
+//! The equivalent of the `scala` package object's `val Ordering = scala.math.Ordering`.
 //!
-//! nsc の `package object scala`（`src/library/scala/package.scala`）は、
-//! 型クラスを**型と項の両方**で無修飾に見えるようにしている:
+//! nsc's `package object scala` (`src/library/scala/package.scala`) makes the type
+//! classes visible unqualified in **both the type and the term namespace**:
 //!
 //! ```scala
 //! type Ordering[T] = scala.math.Ordering[T]
 //! val  Ordering    = scala.math.Ordering
 //! ```
 //!
-//! `prelude::add_scala_aliases` は前者（`type`）だけを入れていた。
-//! `st.enter_in_current("Ordering", <trait>)` で入るのは *class* シンボル
-//! だけなので、**項**位置の `Ordering` もこの trait に解決される:
+//! `prelude::add_scala_aliases` installed only the former (the `type`). All that
+//! `st.enter_in_current("Ordering", <trait>)` enters is a *class* symbol, so
+//! `Ordering` in **term** position resolved to that trait as well:
 //!
-//! - `Ordering.Int` は「trait `Ordering` のメンバ `Int`」を探しに行って
-//!   `value Int is not a member of Ordering` になる。`scala.math.Ordering.Int`
-//!   と完全修飾すれば通っていたのが証拠。
-//!   （`agent/integral` が `Ordering.Option` という implicit を足したあとは、
-//!   メンバが見つからない受け手に対する暗黙変換の探索がこの
-//!   `Ordering[T] => Ordering[Option[T]]` を拾い、エラー文が
-//!   `… is not a member of Ordering[Option[AnyRef]]` に化けていた。
-//!   化けていたのはメッセージだけで、原因はここ。）
-//! - `Ordering[String]` は「trait を項に置いて型適用した」形になり、型検査を
-//!   **黙って通った**うえで codegen が `Ordering$.MODULE$` を積んで
-//!   `Ordering` に checkcast する。実行時 `ClassCastException:
-//!   scala.math.Ordering$ cannot be cast to scala.math.Ordering`。
+//! - `Ordering.Int` went looking for "a member `Int` of the trait `Ordering`" and
+//!   came out as `value Int is not a member of Ordering`. The proof is that fully
+//!   qualifying it as `scala.math.Ordering.Int` did work.
+//!   (After `agent/integral` added an implicit `Ordering.Option`, the search for an
+//!   implicit conversion on a receiver with no such member picked up that
+//!   `Ordering[T] => Ordering[Option[T]]` and the error text turned into
+//!   `… is not a member of Ordering[Option[AnyRef]]`. Only the message changed;
+//!   the cause is here.)
+//! - `Ordering[String]` came out as "a type application of a trait in term
+//!   position", went through typechecking **silently**, and had codegen push
+//!   `Ordering$.MODULE$` and checkcast it to `Ordering`. At run time,
+//!   `ClassCastException: scala.math.Ordering$ cannot be cast to scala.math.Ordering`.
 //!
-//! ここでコンパニオン module を同じスコープに入れると、`SymbolTable::lookup`
-//! は class と module の両方を返し、項位置（`check::type_ident`）は
-//! module を、型位置（`check::resolve_type_name`）は class を選ぶ。
+//! Entering the companion module into the same scope makes `SymbolTable::lookup`
+//! return both the class and the module; term position (`check::type_ident`) picks
+//! the module and type position (`check::resolve_type_name`) picks the class.
 //!
-//! summon 側（`Ordering[String]` = `Ordering.apply[String]`）は
-//! `check.rs` の module→`apply` リダイレクトが受け持つ。jar の
-//! `Ordering$.apply:(Lscala/math/Ordering;)Lscala/math/Ordering;` は pickle から
-//! 供給されるので、ここでシグネチャを手書きはしない（手書きすると
-//! pickle 由来のものと二重に生えてオーバーロードになる）。
+//! The summon side (`Ordering[String]` = `Ordering.apply[String]`) is handled by the
+//! module-to-`apply` redirect in `check.rs`. The jar's
+//! `Ordering$.apply:(Lscala/math/Ordering;)Lscala/math/Ordering;` is supplied from
+//! the pickle, so we do not hand-write the signature here (hand-writing it would
+//! grow a second one beside the pickled one and make an overload).
 //!
-//! `--no-scala-library` では `scala/math/Ordering` の classfile も
-//! `Ordering$` も無く、`add_scala_aliases` 自体が何も入れないため
-//! `not found: value Ordering` の診断のまま。ここも `library_abi` で塞ぐ。
+//! Under `--no-scala-library` there is neither a `scala/math/Ordering` classfile nor
+//! an `Ordering$`, and `add_scala_aliases` itself enters nothing, so the diagnostic
+//! stays `not found: value Ordering`. This is gated on `library_abi` too.
 
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 use crate::symbol::{SymKind, SymbolTable};
 
-/// `add_scala_aliases` が型として入れた別名と同じ綴りで、コンパニオン
-/// module を項の名前空間にも入れる。
+/// Enter the companion module into the term namespace too, under the same spelling
+/// as the alias `add_scala_aliases` installed as a type.
 const ALIASES: [&str; 7] = [
     "scala/math/Ordering",
     "scala/math/Numeric",
@@ -69,16 +69,16 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
         let name = st.get(cls).name.clone();
         let m = match st.companion_module(cls) {
             Some(m) => m,
-            // `prelude_numhier::ensure_typeclass` は jar を読まずに
-            // `trait Integral[T]` / `trait Fractional[T]` を生やすので、
-            // コンパニオンが片方だけ無い状態になる。jar には
+            // `prelude_numhier::ensure_typeclass` grows `trait Integral[T]` /
+            // `trait Fractional[T]` without reading the jar, which leaves only one
+            // half of the companion pair. The jar really does have
             // `scala/math/Integral$.apply:(Lscala/math/Integral;)Lscala/math/Integral;`
-            // が実在する（`javap -p -s scala.math.Integral$`）ので、
-            // ここで module を用意して初めて `Integral[Int]` が
-            // `Integral.apply[Int]` になる。用意しないと trait そのものが
-            // 項に立ち、`val i: Integral[Int] = Integral[Int]` が**黙って通って**
-            // 実行時 `ClassCastException: scala.math.Integral$ cannot be cast to
-            // scala.math.Integral` になっていた。
+            // (`javap -p -s scala.math.Integral$`), so only once the module is made
+            // here does `Integral[Int]` become `Integral.apply[Int]`. Without it the
+            // trait itself stood in term position, `val i: Integral[Int] =
+            // Integral[Int]` went through **silently**, and at run time it was
+            // `ClassCastException: scala.math.Integral$ cannot be cast to
+            // scala.math.Integral`.
             None => make_companion(st, cls, jvm, &name),
         };
         if st.lookup(&name).into_iter().any(|s| s == m) {
@@ -88,7 +88,7 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     }
 }
 
-/// `object <name>`（`<jvm>$`）を class と同じ owner の下に作る。
+/// Create `object <name>` (`<jvm>$`) under the same owner as the class.
 fn make_companion(st: &mut SymbolTable, cls: SymbolId, jvm: &str, name: &str) -> SymbolId {
     let owner = st.get(cls).owner;
     let module_jvm = format!("{jvm}$");

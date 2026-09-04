@@ -1,9 +1,9 @@
-//! `Array` を `Seq` として渡すための `Predef` の包み込みメソッドと、
-//! `scala.collection.Map` の読み出しメンバ（agent/setmap）。
+//! The `Predef` wrapping methods that let an `Array` be passed as a `Seq`, and the
+//! read members of `scala.collection.Map` (agent/setmap).
 //!
-//! # `Array` → コレクション
+//! # `Array` to collection
 //!
-//! nsc の `-Xprint:typer` で確認した実際の挙動（2.13.16）:
+//! The actual behaviour (2.13.16), confirmed with nsc's `-Xprint:typer`:
 //!
 //! ```text
 //! def v(a: Array[Any]): Seq[Any]          = scala.Predef.copyArrayToImmutableIndexedSeq[Any](a)
@@ -11,18 +11,18 @@
 //! def y(a: Array[Any]): Iterable[Any]     = scala.Predef.genericWrapArray[Any](a)
 //! ```
 //!
-//! `scala.Seq` / `scala.IndexedSeq` は **`immutable`** の別名なので、
-//! `genericWrapArray` が返す `scala.collection.mutable.ArraySeq` では届かない。
-//! そこで最下位（`LowPriorityImplicits2`）の `copyArrayToImmutableIndexedSeq`
-//! が選ばれる。`scala.Iterable` は `scala.collection.Iterable` なので
-//! `genericWrapArray` で届き、優先順位どおりそちらが選ばれる。
+//! `scala.Seq` / `scala.IndexedSeq` are aliases of the **`immutable`** ones, so the
+//! `scala.collection.mutable.ArraySeq` that `genericWrapArray` returns does not reach
+//! them. The lowest-priority `copyArrayToImmutableIndexedSeq`
+//! (`LowPriorityImplicits2`) is picked instead. `scala.Iterable` is
+//! `scala.collection.Iterable`, which `genericWrapArray` does reach, so by priority
+//! that one is picked.
 //!
-//! ブリーフの仮説（「`genericWrapArray` は記述子が合わず使えない、
-//! `wrapRefArray` を足せ」）は**誤り**だった。合わなかったのは
-//! `Array[Any]` と書いたときの `([Ljava/lang/Object;)` で、
-//! 本物の型パラメータを持たせて `Array[T]` と宣言すれば
-//! `erasure.rs` の `array_elem_is_abstract` が nsc と同じく
-//! `Ljava/lang/Object;` に潰す。javap:
+//! The brief's hypothesis ("`genericWrapArray` is unusable because the descriptor
+//! does not match; add `wrapRefArray`") was **wrong**. What did not match was the
+//! `([Ljava/lang/Object;)` you get from writing `Array[Any]`; declared as `Array[T]`
+//! with a real type parameter, `array_elem_is_abstract` in `erasure.rs` collapses it
+//! to `Ljava/lang/Object;` just as nsc does. javap:
 //!
 //! ```text
 //! scala.LowPriorityImplicits:
@@ -31,32 +31,33 @@
 //!   public <T> scala.collection.immutable.IndexedSeq<T> copyArrayToImmutableIndexedSeq(java.lang.Object);
 //! ```
 //!
-//! `wrapRefArray` は `T <: AnyRef` の制約があり `Array[Any]` には効かない
-//! （nsc も上のとおり選んでいない）ので足さない。
+//! `wrapRefArray` is constrained to `T <: AnyRef` and does not apply to `Array[Any]`
+//! (nor does nsc pick it, as above), so it is not added.
 //!
-//! `wrapBooleanArray`（`prelude_seqfn.rs`）と同じ理由で **`implicit` にしない**:
-//! implicit にすると普通の `Array` のメンバ選択で `refArrayOps` と競合する。
-//! `seqfn_view.rs` が名前で引く。
+//! For the same reason as `wrapBooleanArray` (`prelude_seqfn.rs`), these are **not**
+//! `implicit`: as implicits they would compete with `refArrayOps` in ordinary member
+//! selection on an `Array`. `seqfn_view.rs` looks them up by name.
 //!
 //! # `scala.collection.Map`
 //!
-//! `prelude_hier.rs` の `LINKS` が作る `scala/collection/Map` は
-//! 型パラメータだけのつなぎで、メンバを 1 つも持たない。`scala/` 名の
-//! prelude クラスは `pickle_supply::adopt_binary_class` が触らない
-//! （`class_sym.0 < st.prelude_end`）ので、jar からも補われない。
-//! slick の `expansions: collection.Map[TableIdentitySymbol, (TermSymbol, Node)]`
-//! に対する `expansions contains tsym` が `not a member`、`expansions(tsym)` は
-//! コンパニオンの可変長 `apply` に落ちて `no matching overload` になっていた。
-//! `collection.MapOps` の読み出し側 3 つだけをここで宣言する。
+//! The `scala/collection/Map` that `prelude_hier.rs`'s `LINKS` builds is a link with
+//! nothing but type parameters, carrying no members at all. Prelude classes with a
+//! `scala/` name are not touched by `pickle_supply::adopt_binary_class`
+//! (`class_sym.0 < st.prelude_end`), so nothing is supplied from the jar either.
+//! For slick's `expansions: collection.Map[TableIdentitySymbol, (TermSymbol, Node)]`,
+//! `expansions contains tsym` came out `not a member`, and `expansions(tsym)` fell to
+//! the companion's varargs `apply` and gave `no matching overload`.
+//! Only the three read members of `collection.MapOps` are declared here.
 
 use crate::prelude::{method, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};
 
-/// すべて `library_abi` 専用。私有ランタイム（`--no-scala-library`）には
-/// `scala/collection/Map` も `IterableOps.++` も `Predef.genericWrapArray` も
-/// 実体が無く、型だけ通して codegen で存在しないメソッドを呼ぶくらいなら、
-/// 従来どおり診断を出す方が正しい（`.agent-brief.md` の「スタブ禁止」）。
+/// All of this is `library_abi` only. The private runtime (`--no-scala-library`) has
+/// no implementation of `scala/collection/Map`, `IterableOps.++` or
+/// `Predef.genericWrapArray`, and rather than passing the types and having codegen
+/// call a method that does not exist, it is right to emit a diagnostic as before
+/// (`.agent-brief.md`, "no stubs").
 pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     if !library_abi {
         return;
@@ -67,28 +68,28 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     add_array_wraps(st);
 }
 
-/// `Set.++[B >: A](that: IterableOnce[B]): Set[B]`。
+/// `Set.++[B >: A](that: IterableOnce[B]): Set[B]`.
 ///
-/// 2.13 の `++` は **2 つのオーバーロード**である（`javap`）:
+/// In 2.13 `++` is **two overloads** (`javap`):
 ///
 /// ```text
 /// scala.collection.SetOps:      public default C   $plus$plus(scala.collection.IterableOnce<A>);
 /// scala.collection.IterableOps: public default <B> CC $plus$plus(scala.collection.IterableOnce<B>);
 /// ```
 ///
-/// prelude 側には前者に相当する 1 つ（`prelude_coll` が `++(Set[A]): Set[A]`
-/// として作り、`prelude_buildfrom::widen_set_concat` が
-/// `++(IterableOnce[A]): Set[A]` に広げたもの）しか無く、しかもそれが
-/// `lookup_member` に見つかるので pickle 側は `++` を一度も訊かれない
-/// （`SCALA_RS_PICKLE_DEBUG=1` で確認: `concat` は訊かれるが `++` は訊かれない）。
-/// そのため `s ++ anOptionOfSomethingElse` — slick の
-/// `Set() ++ dbType.map(…) ++ (if(…) Some(…) else None) ++ …` — が
-/// `no matching overload` になっていた。
+/// The prelude side had only the one corresponding to the former (built by
+/// `prelude_coll` as `++(Set[A]): Set[A]` and widened to `++(IterableOnce[A]): Set[A]`
+/// by `prelude_buildfrom::widen_set_concat`), and since `lookup_member` finds it the
+/// pickle side is never asked for `++` at all (confirmed with
+/// `SCALA_RS_PICKLE_DEBUG=1`: `concat` is asked for, `++` is not).
+/// That is why `s ++ anOptionOfSomethingElse` -- slick's
+/// `Set() ++ dbType.map(…) ++ (if(…) Some(…) else None) ++ …` -- came out as
+/// `no matching overload`.
 ///
-/// 単相の方が適用できる限りそちらが厳密により specific なので、
-/// 2 つ並べても nsc と同じ選び方になる。codegen は owner+名前で引く
-/// （`gen.rs` の `is_stdlib_set` の `"++"`）ので、両方とも
-/// `IterableOps.++` を呼ぶ 1 本の分岐で足りる。
+/// As long as the monomorphic one is applicable it is strictly more specific, so
+/// having both present picks the same way nsc does. codegen looks up by owner and
+/// name (the `"++"` of `is_stdlib_set` in `gen.rs`), so one branch calling
+/// `IterableOps.++` covers both.
 fn add_set_widening_concat(st: &mut SymbolTable) {
     let (Some(set), Some(ioc)) = (
         crate::classpath::find_by_jvm(st, "scala/collection/immutable/Set"),
@@ -131,23 +132,23 @@ fn add_set_widening_concat(st: &mut SymbolTable) {
     st.get_mut(m).intrinsic = Intrinsic::None;
 }
 
-/// `Option[A] <: IterableOnce[A]`。
+/// `Option[A] <: IterableOnce[A]`.
 ///
-/// 2.13 で `Option` は `IterableOnce` になった（2.12 の
-/// `option2Iterable` 暗黙変換ではなく、本当の親）:
+/// In 2.13 `Option` became an `IterableOnce` -- a real parent, not 2.12's
+/// `option2Iterable` implicit conversion:
 ///
 /// ```text
 /// sealed abstract class Option[+A] extends IterableOnce[A] with Product with Serializable
 /// ```
 ///
-/// これが無いと slick の
+/// Without it, slick's
 /// `Set() ++ dbType.map(...) ++ (if(...) Some(...) else None) ++ …`
-/// が `no matching overload for (IterableOnce[A])Set[A] with arguments
-/// (Option[SqlType])` になる。実 scalac の `-Xprint:typer` は
-/// `Set.apply[String]().++(o)` と、**変換なしで**そのまま渡している。
+/// comes out as `no matching overload for (IterableOnce[A])Set[A] with arguments
+/// (Option[SqlType])`. Real scalac's `-Xprint:typer` shows
+/// `Set.apply[String]().++(o)`, passing it straight through **with no conversion**.
 ///
-/// 辺だけを足す。`IterableOnce` はこの prelude では `foreach` しか持たず、
-/// `Option` は自前の `foreach` を持つので、継承で増えるメンバは無い。
+/// Only the edge is added. In this prelude `IterableOnce` has nothing but `foreach`,
+/// and `Option` has a `foreach` of its own, so inheritance adds no members.
 fn add_option_is_iterable_once(st: &mut SymbolTable) {
     let Some(ioc) = crate::classpath::find_by_jvm(st, "scala/collection/IterableOnce") else {
         return;
@@ -171,8 +172,8 @@ fn add_option_is_iterable_once(st: &mut SymbolTable) {
     });
 }
 
-/// `Predef.genericWrapArray[T](xs: Array[T]): mutable.ArraySeq[T]` と
-/// `Predef.copyArrayToImmutableIndexedSeq[T](xs: Array[T]): immutable.IndexedSeq[T]`。
+/// `Predef.genericWrapArray[T](xs: Array[T]): mutable.ArraySeq[T]` and
+/// `Predef.copyArrayToImmutableIndexedSeq[T](xs: Array[T]): immutable.IndexedSeq[T]`.
 fn add_array_wraps(st: &mut SymbolTable) {
     let predef = st.predef;
     let owner = match st.get(predef).ty.clone() {
@@ -187,11 +188,11 @@ fn add_array_wraps(st: &mut SymbolTable) {
     }
 }
 
-/// 1 つの型パラメータ `T` を持つ `Array[T] => Cls[T]` を `owner` に足す。
+/// Add an `Array[T] => Cls[T]` with a single type parameter `T` to `owner`.
 ///
-/// `Array[T]`（`T` は抽象）の erasure は `Ljava/lang/Object;` なので、
-/// 実 ABI の記述子とそのまま一致する。返りは `Cls[T]` で
-/// `Lscala/collection/...;`。
+/// The erasure of `Array[T]` (with `T` abstract) is `Ljava/lang/Object;`, so it
+/// matches the real ABI descriptor as it stands. The result is `Cls[T]`, i.e.
+/// `Lscala/collection/...;`.
 fn add_wrap(st: &mut SymbolTable, owner: SymbolId, name: &str, cls: SymbolId) {
     if !st.lookup(name).is_empty() {
         return;
@@ -216,9 +217,9 @@ fn add_wrap(st: &mut SymbolTable, owner: SymbolId, name: &str, cls: SymbolId) {
     st.enter_in_current(name, m);
 }
 
-/// `collection.MapOps` の読み出しメンバ 3 つ。
+/// The three read members of `collection.MapOps`.
 ///
-/// javap（`scala.collection.MapOps`）:
+/// javap (`scala.collection.MapOps`):
 /// ```text
 /// public abstract scala.Option<V> get(K);
 /// public V apply(K);

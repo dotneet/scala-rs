@@ -1,46 +1,46 @@
-//! `agent/final1` スライスの回帰テスト。slick の「コレクション引数まわり」
-//! 7 件のうち 6 件の根をまとめてある。
+//! Regression tests for the `agent/final1` slice. Collects the roots of 6 of the 7
+//! slick errors "around collection arguments".
 //!
-//! * 自己別名 `class C { self => … self(i) … }` は `C.this.type`。
-//!   `Select` 側だけがこれをクラスへ widen しており、適用側
-//!   (`resolve_overload`) は `_ => None` で止まって
-//!   `value apply is not a member of C.this.type` を出していた
-//!   （slick `util/ConstArray.scala:276`）。
-//! * 期待型のない位置でも、implicit 節しか残っていない式の未確定型変数は
-//!   nsc の `adaptToImplicitMethod` と同じく先に確定する。下限を持つものは
-//!   その下限になる（`Nothing` になるものは開いたまま）ので、
-//!   `toArray[R >: T : ClassTag]` は `Array[String]` になり、
-//!   `withPreparedInsertStatement` の 2 つの overload を区別できる
-//!   （slick `jdbc/JdbcActionComponent.scala:725`）。
-//! * `typing_call_args`（「引数を型付け中」）は typer のフラグであって式の
-//!   ものではないので、引数の途中で走る遅延シグネチャ補完がこれを引き継いで
-//!   いた。結果、前方参照された `def … = ….map(…).flatten` の *推論結果型* が
-//!   `((Option[X]) => IterableOnce[B])Seq[B]` という未適用のメソッド型に
-//!   なっていた（slick `jdbc/JdbcModelBuilder.scala:159`。93 行目はこの
-//!   カスケード）。
-//! * 同じ型パラメータに 2 つの引数が寄与するとき、および宣言された下限と
-//!   join するとき、引数自身の未確定変数は先に下限へ落とす。
-//!   `m.getOrElse(k, Seq.empty)` が `Seq[AnyRef]` になっていた
-//!   （slick `compiler/MergeToComprehensions.scala:218`）。
-//! * case class でないクラスは、コンパニオンに抽出子があるならコンストラクタ
-//!   パターンではなく抽出子で照合する（SLS 8.1.6/8.1.7）。
-//!   `ConstArray(disc, map)` が `Array[Any]` と `Int` を束縛していた
-//!   （slick `compiler/ExpandSums.scala:245`）。
-//! * 受け手（レシーバ）が持ち込んだ未確定変数も、結果の *不変* 位置では
-//!   期待型が引数より強い。`Set() ++ opt` が `Set[SqlType]` のままで、
-//!   不変な `Set` が期待型を拒否していた
-//!   （slick `jdbc/JdbcModelBuilder.scala:279` の半分）。
-//! * 変換探索の `open_conversion_fit` は、解くべき変数が両側とも空でも
-//!   `Unify` に判定させていた。ワイルドカードは何にでも unify するので
-//!   `Option.option2Iterable` が `Option[Default[_]] =>
-//!   IterableOnce[ColumnOption[Nothing]]` を名乗り、単相の
-//!   `Set#++(IterableOnce[A]): Set[A]` が適用可能になって、
-//!   `Set() ++ … ++ dflt` の鎖が `Set[ColumnOption[Nothing]]` に落ちていた
-//!   （同 279 のもう半分）。
+//! * The self alias in `class C { self => … self(i) … }` is `C.this.type`. Only the
+//!   `Select` side widened that to the class; the application side
+//!   (`resolve_overload`) stopped at `_ => None` and reported
+//!   `value apply is not a member of C.this.type`
+//!   (slick `util/ConstArray.scala:276`).
+//! * Even where there is no expected type, the undetermined type variables of an
+//!   expression with nothing left but an implicit clause are settled first, as in
+//!   nsc's `adaptToImplicitMethod`. Those with a lower bound become that bound (the
+//!   ones that would become `Nothing` stay open), so `toArray[R >: T : ClassTag]`
+//!   becomes `Array[String]` and the two overloads of
+//!   `withPreparedInsertStatement` can be told apart
+//!   (slick `jdbc/JdbcActionComponent.scala:725`).
+//! * `typing_call_args` ("typing an argument") is a flag on the typer, not on the
+//!   expression, so lazy signature completion running mid-argument inherited it. The
+//!   *inferred result type* of a forward-referenced `def … = ….map(…).flatten` thus
+//!   came out as the unapplied method type `((Option[X]) => IterableOnce[B])Seq[B]`
+//!   (slick `jdbc/JdbcModelBuilder.scala:159`; line 93 is the cascade from this).
+//! * When two arguments contribute to the same type parameter, and when joining with
+//!   a declared lower bound, an argument's own undetermined variables are lowered to
+//!   their lower bound first. `m.getOrElse(k, Seq.empty)` was coming out as
+//!   `Seq[AnyRef]` (slick `compiler/MergeToComprehensions.scala:218`).
+//! * A non-case class matches through the extractor rather than as a constructor
+//!   pattern when its companion has one (SLS 8.1.6/8.1.7). `ConstArray(disc, map)`
+//!   was binding `Array[Any]` and `Int`
+//!   (slick `compiler/ExpandSums.scala:245`).
+//! * The undetermined variables the receiver brings in are also subject to the
+//!   expected type being stronger than the argument in an *invariant* result
+//!   position. `Set() ++ opt` stayed `Set[SqlType]` and the invariant `Set` then
+//!   rejected the expected type (half of slick `jdbc/JdbcModelBuilder.scala:279`).
+//! * Conversion search's `open_conversion_fit` let `Unify` decide even when neither
+//!   side had a variable left to solve. Since a wildcard unifies with anything,
+//!   `Option.option2Iterable` claimed to be `Option[Default[_]] =>
+//!   IterableOnce[ColumnOption[Nothing]]`, which made the monomorphic
+//!   `Set#++(IterableOnce[A]): Set[A]` applicable and collapsed the
+//!   `Set() ++ … ++ dflt` chain to `Set[ColumnOption[Nothing]]`
+//!   (the other half of that same 279).
 //!
-//! ブリーフ通り fixture は 1 ファイルにまとめてある（実 scalac 1 回 1.8 秒）。
-//! `Set` / `Map` / `ClassTag` / `IndexedSeq` を使うので `--scala-library`
-//! モードのみ。ヘルパは `crates/cli/tests/ovl4.rs` に倣う。
+//! As the brief asks, the fixture is a single file (a real scalac run costs 1.8 s).
+//! It uses `Set` / `Map` / `ClassTag` / `IndexedSeq`, so `--scala-library` mode only.
+//! The helpers follow `crates/cli/tests/ovl4.rs`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -119,8 +119,8 @@ fn compile_fixture_with(name: &str, extra: &[&str]) -> PathBuf {
     out
 }
 
-/// `-Xverify:all`: overload を取り違えて消去記述子がずれた codegen は
-/// 出力差ではなく `VerifyError` になる。
+/// `-Xverify:all`: codegen that picks the wrong overload and so gets the erased
+/// descriptor wrong shows up as a `VerifyError`, not as an output difference.
 fn run_java(out: &Path, cp_extra: &str) -> String {
     let cp = format!("{}:{}", out.display(), cp_extra);
     let output = Command::new("java")
@@ -182,8 +182,8 @@ fn fixtures_final1_library_abi() {
     let _ = fs::remove_dir_all(&out);
 }
 
-/// 同じ fixture を実 scalac 2.13.16 に通し、記録した期待値・scalac の出力・
-/// こちらの出力の 3 つが一致することを確かめる。
+/// Run the same fixture through real scalac 2.13.16 and check that the recorded
+/// expectation, scalac's output and ours all three agree.
 #[test]
 fn real_scalac_dual_run_final1() {
     if !java_available() {
@@ -218,10 +218,10 @@ fn real_scalac_dual_run_final1() {
     let _ = fs::remove_dir_all(&ref_out);
 }
 
-/// 緩めた側の反対側。実 scalac 2.13.16 もこの 3 件を拒否する
+/// The far side of what we relaxed. Real scalac 2.13.16 rejects these three too
 /// (`Main.NoApply does not take parameters` /
 /// `found: Some[String] required: IterableOnce[Int]` /
-/// `found: Option[Main.DefaultOpt[_]] required: IterableOnce[Main.ColOpt[Nothing]]`)。
+/// `found: Option[Main.DefaultOpt[_]] required: IterableOnce[Main.ColOpt[Nothing]]`).
 #[test]
 fn final1_bad_is_still_rejected() {
     let Some(err) = compile_diagnostics("final1_bad") else {

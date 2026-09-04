@@ -24290,7 +24290,7 @@ fn mentions_no_type(ty: &Type) -> bool {
     }
 }
 
-/// `ty` が `tps` のいずれかのメソッド型パラメータを含むか。
+/// Whether `ty` mentions any of the method type parameters in `tps`.
 pub(crate) fn mentions_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
     match ty {
         Type::TypeParam(id) => tps.contains(id),

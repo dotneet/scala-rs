@@ -1,21 +1,20 @@
-//! `IterableOnceOps.toMap` — `def toMap[K, V](implicit ev: A <:< (K, V)): Map[K, V]`。
+//! `IterableOnceOps.toMap` -- `def toMap[K, V](implicit ev: A <:< (K, V)): Map[K, V]`.
 //!
-//! `prelude.rs` からは [`install`] を 1 行呼ぶだけにしてある。
+//! `prelude.rs` calls [`install`] on a single line.
 //!
-//! `toMap` は「多相な implicit の再帰的な導出」がそのまま必要になるメンバで、
-//! `ev` の witness は `<:<.refl`（`prelude_conform.rs`）ただひとつ。しかも `K`
-//! と `V` は呼び出し側のどこにも現れないので、implicit 探索そのものが
-//! 決めなければならない（nsc の undetermined type parameter）。
-//! それを行うのが `implicits.rs::search_implicit_undet` と
-//! `check.rs::adapt_implicit_apply` の undet 経路。
+//! `toMap` is the member that needs "recursive derivation of a polymorphic implicit"
+//! outright: the only witness for `ev` is `<:<.refl` (`prelude_conform.rs`), and `K`
+//! and `V` appear nowhere on the calling side, so implicit search itself has to decide
+//! them (nsc's undetermined type parameters). That is what the undet path of
+//! `implicits.rs::search_implicit_undet` and `check.rs::adapt_implicit_apply` does.
 //!
 //! JVM: `scala/collection/IterableOnceOps.toMap:(Lscala/$less$colon$less;)`
-//! `Lscala/collection/immutable/Map;`（`javap -s` で確認）。invoke は
-//! `crates/backend/src/gen.rs` が出す。
+//! `Lscala/collection/immutable/Map;` (confirmed with `javap -s`). The invoke is
+//! emitted by `crates/backend/src/gen.rs`.
 //!
-//! **私有ランタイム（`--no-scala-library`）** では `<:<` 自体が存在しない
-//! （`prelude_conform.rs` が `library_abi` でゲートしている）ので、ここも
-//! 何も宣言しない。`value toMap is not a member of List[A]` の診断が出る。
+//! Under the **private runtime (`--no-scala-library`)** `<:<` does not exist at all
+//! (`prelude_conform.rs` gates it on `library_abi`), so nothing is declared here
+//! either and the diagnostic `value toMap is not a member of List[A]` comes out.
 
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};

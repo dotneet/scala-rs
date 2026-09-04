@@ -34,8 +34,8 @@
 //! the call fell back to the `String` receiver and died with
 //! `StringOps$WithFilter cannot be cast to java.lang.String`.
 //!
-//! **私有ランタイム（`--no-scala-library`）** には `StringOps` 自体が無いので、
-//! `prelude_strmap` と同じく `library_abi` のときだけ入れる。
+//! The **private runtime (`--no-scala-library`)** has no `StringOps` at all, so,
+//! like `prelude_strmap`, this is installed only under `library_abi`.
 
 use crate::symbol::{SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};

@@ -1,6 +1,7 @@
-// 3 件目の一般性の確認：Ordered とは無関係な、利用者が書いた implicit def が
-// 関数型の implicit パラメータに eta 展開されて渡ること。多相な implicit def
-// も、自分の implicit 引数を持つ implicit def も対象。私有ランタイムでも動く。
+// Generality check for the third case: a user-written implicit def unrelated to
+// Ordered gets eta-expanded and passed to a function-typed implicit parameter.
+// Polymorphic implicit defs and implicit defs with implicit arguments of their
+// own count too. Works under the private runtime as well.
 import scala.language.implicitConversions
 
 class Tagged(val s: String) { override def toString: String = "<" + s + ">" }
@@ -14,16 +15,16 @@ object Main {
     def show(a: String): String = "s" + a
   }
 
-  // 関数型の implicit パラメータ。implicit def しか候補が無い。
+  // A function-typed implicit parameter. The only candidate is an implicit def.
   def render[A](a: A)(implicit view: A => Tagged): String = view(a).toString
-  // view bound も同じ経路に落ちる。
+  // A view bound falls onto the same path.
   def render2[A <% Tagged](a: A): String = a.toString
-  // 入れ子：自分の implicit パラメータを内側の呼び出しへ渡し直す。
+  // Nested: pass our own implicit parameter on to the inner call.
   def renderPair[A](a: A, b: A)(implicit view: A => Tagged): String =
     render(a) + "|" + render(b)
 
-  // B は呼び出しのどこにも現れない（nsc の未決定型パラメータ）。値ではなく
-  // *変換* が witness なので、その結果型から B を解くしかない。
+  // B appears nowhere in the call (nsc's undetermined type parameters). The witness
+  // is a *conversion*, not a value, so B can only be solved from its result type.
   implicit def intWrap(n: Int): Wrap[String] = new Wrap("w" + n)
   def unwrap[A, B](a: A)(implicit view: A => Wrap[B]): B = view(a).get
 
@@ -32,13 +33,13 @@ object Main {
     println(render("hi"))
     println(render2(7))
     println(render2("hi"))
-    // 変換そのものも多相なまま効く。
+    // The conversion also applies while still polymorphic.
     val t: Tagged = "zz"
     println(t)
-    // 入れ子の implicit パラメータでも view が見つかる。
+    // The view is found through a nested implicit parameter too.
     println(renderPair(1, 2))
     println(renderPair("a", "b"))
-    // 未決定型パラメータを view の結果型から解く。
+    // Solve an undetermined type parameter from the view's result type.
     val u = unwrap(9)
     println(u.length.toString + " " + u)
   }

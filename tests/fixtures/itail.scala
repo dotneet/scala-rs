@@ -1,14 +1,14 @@
-// implicit の残件と prelude の穴。
+// Leftover implicit cases and the holes in the prelude.
 //
-// 1. companion object の implicit を埋めた呼び出しを、タプル化リトライが
-//    もう一度型付けしても壊れない（`LiteralNode(1)` の `intType`）。
-// 2. `Numeric[T]` は `Ordering[T]` である（slick `ScalaNumericType`）。
-// 3. 値引数がどれも触れない型パラメータは implicit 探索が決める
-//    （slick `SimpleFunction.nullary`）。
-// 4. 関数値の `apply` は関数そのもの。
-// 5. 引数位置に残った implicit 節を、パラメータ型が決まってから埋める
-//    （`take(Array.empty)`）。
-// 6. 可変長引数を持つ case class の `copy` デフォルト。
+// 1. A call whose companion-object implicit is already filled in survives a
+//    second typing by the tupling retry (`LiteralNode(1)`'s `intType`).
+// 2. `Numeric[T]` is an `Ordering[T]` (slick `ScalaNumericType`).
+// 3. A type parameter no value argument mentions is decided by implicit search
+//    (slick `SimpleFunction.nullary`).
+// 4. `apply` on a function value is the function itself.
+// 5. An implicit clause left in argument position is filled in once the
+//    parameter type is known (`take(Array.empty)`).
+// 6. `copy` defaults for a case class with a varargs parameter.
 
 import scala.reflect.ClassTag
 
@@ -35,8 +35,8 @@ object Lit {
 
 final case class Pair(fst: Lit, snd: Lit)
 
-/** `Numeric[T]` は `Ordering[T]` を継承する。scala-rs の prelude はその親を
-  * 張っていなかったので、この super 呼び出しが通らなかった。 */
+/** `Numeric[T]` extends `Ordering[T]`. scala-rs's prelude did not wire up that
+  * parent, so this super call did not go through. */
 class OrdBox[T](implicit val ct: ClassTag[T], val ord: Ordering[T]) {
   def name: String = ct.toString
 }
@@ -45,7 +45,7 @@ class NumBox[T](val fromDouble: Double => T)(implicit tag: ClassTag[T], val num:
   def twice(x: T): T = num.plus(x, x)
 }
 
-/** 値引数が `T` に触れないので、`T` を決められるのは implicit 探索だけ。 */
+/** No value argument mentions `T`, so only implicit search can decide it. */
 object Build {
   def rows[T](prefix: String)(implicit tag: Tagged[T]): (Seq[Int] => String) =
     (xs: Seq[Int]) => prefix + tag.name + xs.size
@@ -56,10 +56,10 @@ object Build {
   }
 }
 
-/** 可変長引数を持つ case class。nsc はこの形に `copy` を作らないが、
-  * scala-rs は作るので、その `copy$default$n` を `T*` ではなく `Seq[T]` として
-  * 型付けしないと、書かれてもいないツリーに対する診断が出ていた。ここでは
-  * nsc と一致する使い方（`apply` / フィールド / `equals`）だけを確かめる。 */
+/** A case class with a varargs parameter. nsc generates no `copy` for this
+  * shape but scala-rs does, so unless its `copy$default$n` is typed as `Seq[T]`
+  * rather than `T*` we reported diagnostics against a tree nobody wrote. Here
+  * we exercise only the uses that agree with nsc (`apply` / field / `equals`). */
 final case class Row(name: String, cells: Int*) {
   def total: Int = cells.sum
 }
@@ -69,30 +69,30 @@ object Main {
   def takeInts(a: Array[Int]): Int = a.length
 
   def main(args: Array[String]): Unit = {
-    // 1. タプル化リトライが implicit 引数入りの呼び出しを再型付けしても壊れない。
+    // 1. The tupling retry re-types a call carrying implicit arguments without breaking it.
     println(Pair(Lit(1), Lit("x")))
     println(Lit(true))
 
-    // 2. Numeric は Ordering。
+    // 2. Numeric is an Ordering.
     val nb = new NumBox[Int](_.toInt)
     println(nb.name + " " + nb.twice(21) + " " + nb.ord.lt(1, 2))
     val ordering: Ordering[Int] = implicitly[Numeric[Int]]
     println(ordering.compare(3, 4))
     println(Tagged.intTag.below(-1))
 
-    // 3. implicit 探索だけが決められる型パラメータ。
+    // 3. A type parameter only implicit search can decide.
     println(Build.nullary[String]("a:"))
     val u = Build.unary[Int, Boolean]("b:")
     println(u(7))
 
-    // 4. 関数値の apply。
+    // 4. apply on a function value.
     val f: Seq[Int] => String = xs => "n=" + xs.size
     println(f.apply(Seq(1, 2)) + " " + f(Seq()))
 
-    // 5. 引数位置の残余 implicit 節。
+    // 5. A residual implicit clause in argument position.
     println(takeStrings(Array.empty) + takeInts(Array.empty))
 
-    // 6. 可変長引数の case class と copy。
+    // 6. A varargs case class and copy.
     val r = Row("r", 1, 2, 3)
     println(r.name + " " + r.total + " " + r.cells.size)
     println(r == Row("r", 1, 2, 3))

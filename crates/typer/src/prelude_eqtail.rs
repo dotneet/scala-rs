@@ -1,6 +1,6 @@
-//! `Equiv[Int]` の summon 失敗（`agent/ordsummon` 残件）。
+//! Failure to summon `Equiv[Int]` (left over from `agent/ordsummon`).
 //!
-//! 実 ABI（`javap -p -s scala.math.Ordering` / `PartialOrdering` / `Equiv`）:
+//! The real ABI (`javap -p -s scala.math.Ordering` / `PartialOrdering` / `Equiv`):
 //!
 //! ```text
 //! interface scala.math.Ordering<T>        extends java.util.Comparator<T>, scala.math.PartialOrdering<T>
@@ -8,42 +8,41 @@
 //! interface scala.math.Equiv<T>            extends java.io.Serializable
 //! ```
 //!
-//! `Equiv` は prelude のどこにも登場しなかった（`Ordering` は
-//! `crates/typer/src/prelude.rs` の `add_ordering` が丸ごと手書きで作るが、
-//! 対応するものが `Equiv` には無い）。`Equiv[Int]` という**型**自体は
-//! `check.rs` の `expose_unqualified` が real `scala` package object の
-//! pickle 別名（`type Equiv[T] = scala.math.Equiv[T]`）経由で見つけていたが、
-//! そこで使う `PickleSupply::complete` は「pickle の断片から名前とシグネチャ
-//! だけ」を読む軽量版で、継承関係を運ばない
-//! （`crates/typer/src/classpath.rs` の `attach_classpath_parents` の
-//! ドキュメント参照）。継承は「参照が一度失敗したときだけ」
-//! `pickle_supply::ensure_parents` が補う作りだが、それは `import x._` の
-//! prefix 解決からしか呼ばれない。結果:
+//! `Equiv` appeared nowhere in the prelude (`Ordering` is hand-built in full by
+//! `add_ordering` in `crates/typer/src/prelude.rs`, but there is no counterpart for
+//! `Equiv`). The **type** `Equiv[Int]` itself was found by `expose_unqualified` in
+//! `check.rs` through the real `scala` package object's pickled alias
+//! (`type Equiv[T] = scala.math.Equiv[T]`), but the `PickleSupply::complete` used
+//! there is the lightweight version that reads "only names and signatures out of a
+//! pickle fragment" and does not carry inheritance
+//! (see the documentation of `attach_classpath_parents` in
+//! `crates/typer/src/classpath.rs`). Inheritance is meant to be supplied by
+//! `pickle_supply::ensure_parents` "only once a reference has failed", and that is
+//! only ever called from prefix resolution for `import x._`. As a result:
 //!
 //! ```scala
-//! val e: Equiv[Int] = Ordering.Int             // real scalac: OK（劣化代入）
+//! val e: Equiv[Int] = Ordering.Int             // real scalac: OK (weakening assignment)
 //! val p: PartialOrdering[Int] = Ordering.Int    // real scalac: OK
 //! implicitly[Equiv[Int]]                        // real scalac: OK
 //! ```
 //!
-//! がすべて scala-rs では失敗していた: 前 2 つは `Ordering[Int]` に
-//! `PartialOrdering` / `Equiv` が親として載っていないための `type
-//! mismatch`。3 つ目は `object Equiv` が implicit instance を 1 つも
-//! 持っていないための `could not find implicit value`
-//! （real scalac は `Ordering.Int` ではなく `object Equiv` 自身の専用
-//! instance `Equiv$Int$` を選ぶ -- `implicitly[Equiv[Int]].getClass.getName`
-//! で確認した）。
+//! all failed under scala-rs: the first two as a `type mismatch`, because
+//! `Ordering[Int]` did not carry `PartialOrdering` / `Equiv` as parents; the third as
+//! `could not find implicit value`, because `object Equiv` carried no implicit
+//! instance at all (real scalac picks `object Equiv`'s own dedicated instance
+//! `Equiv$Int$` rather than `Ordering.Int` -- confirmed with
+//! `implicitly[Equiv[Int]].getClass.getName`).
 //!
-//! `Ordering` / `Numeric` / `Integral` / `Fractional`（`prelude_seq.rs` /
-//! `prelude_numhier.rs`）は同じ穴を「jar のロードを待たず、prelude の時点で
-//! 自前の class + companion module を作って現在スコープに入れる」ことで
-//! 塞いでいる。`Equiv` と `PartialOrdering` にも同じ手を使う: ここで先に
-//! 作って `enter_in_current` してしまえば、あとから jar 経由で解決しようと
-//! する `expose_unqualified` は「もう スコープにある」ので通らず、
-//! この prelude シンボルだけが使われる。メンバ（`equiv` / `fromComparator` /
-//! `by` / `TupleN` 等）は `jvm_name` さえ実クラスと一致していれば
-//! `pickle_supply` がオンデマンドで供給する（`Ordering` の `lt` / `gt` /
-//! `lteq` / `gteq` / `max` / `min` が今も同じやり方で効いているのと同じ）。
+//! `Ordering` / `Numeric` / `Integral` / `Fractional` (`prelude_seq.rs` /
+//! `prelude_numhier.rs`) plug the same hole by "building their own class plus
+//! companion module at prelude time and entering it into the current scope, without
+//! waiting for the jar to load". `Equiv` and `PartialOrdering` get the same treatment:
+//! once they are built and `enter_in_current`ed here, `expose_unqualified` -- which
+//! would otherwise resolve them through the jar later -- does not fire because they
+//! are "already in scope", and only these prelude symbols are used. The members
+//! (`equiv` / `fromComparator` / `by` / `TupleN` and so on) are supplied on demand by
+//! `pickle_supply` as long as the `jvm_name` matches the real class (the same way
+//! `Ordering`'s `lt` / `gt` / `lteq` / `gteq` / `max` / `min` still work).
 
 use scala_rs_parser::{Flags, SymbolId, Type};
 
@@ -51,10 +50,9 @@ use crate::symbol::{SymKind, SymbolTable};
 
 pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     if !library_abi {
-        // 私有ランタイムには `scala/math/Equiv` / `PartialOrdering` の
-        // classfile が無い。ここで何も作らなければ `Equiv[Int]` は
-        // `not found: value Equiv` の診断のまま（スタブ禁止 --
-        // `.agent-brief.md`）。
+        // The private runtime has no `scala/math/Equiv` / `PartialOrdering`
+        // classfile. By building nothing here, `Equiv[Int]` stays the diagnostic
+        // `not found: value Equiv` (no stubs -- `.agent-brief.md`).
         return;
     }
     let Some(ordering) = crate::classpath::find_by_jvm(st, "scala/math/Ordering") else {
@@ -67,8 +65,8 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     add_equiv_instances(st, equiv);
 }
 
-/// `trait Equiv[T]` と companion module を prelude 内に作り、現在スコープへ
-/// 型・項の両方で入れる（既にあれば何もしない）。
+/// Build `trait Equiv[T]` and its companion module inside the prelude and enter both
+/// into the current scope, as a type and as a term (doing nothing if already there).
 fn ensure_equiv(st: &mut SymbolTable, math: SymbolId) -> SymbolId {
     if let Some(id) = crate::classpath::find_by_jvm(st, "scala/math/Equiv") {
         enter_type(st, "Equiv", id);
@@ -94,11 +92,11 @@ fn ensure_equiv(st: &mut SymbolTable, math: SymbolId) -> SymbolId {
     equiv
 }
 
-/// `trait PartialOrdering[T] extends Equiv[T]` を prelude 内に作り、現在
-/// スコープへ型で入れる（既にあれば `Equiv` を親として足すだけ）。
-/// summon 可能な instance を real scalac も持たないので companion module は
-/// 作らない（`implicitly[PartialOrdering[Int]]` は real scalac 同様
-/// `could not find implicit value` のまま）。
+/// Build `trait PartialOrdering[T] extends Equiv[T]` inside the prelude and enter it
+/// into the current scope as a type (if it is already there, just add `Equiv` as a
+/// parent). Real scalac has no summonable instance either, so no companion module is
+/// built (`implicitly[PartialOrdering[Int]]` stays `could not find implicit value`,
+/// just as under real scalac).
 fn ensure_partial_ordering(st: &mut SymbolTable, math: SymbolId, equiv: SymbolId) -> SymbolId {
     if let Some(id) = crate::classpath::find_by_jvm(st, "scala/math/PartialOrdering") {
         enter_type(st, "PartialOrdering", id);
@@ -130,9 +128,9 @@ fn enter_term(st: &mut SymbolTable, name: &str, id: SymbolId) {
     st.enter_in_current(name, id);
 }
 
-/// `child[T] extends parent[T]`。`child` の最初の型パラメータをそのまま渡す。
-/// すでに同じ親を持つなら何もしない（`prelude_numhier::add_parent` と同じ形
-/// -- 新規モジュールに分けたので複製）。
+/// `child[T] extends parent[T]`, passing `child`'s first type parameter straight
+/// through. Does nothing if the parent is already there (the same shape as
+/// `prelude_numhier::add_parent` -- duplicated because this is a separate module).
 fn add_parent(st: &mut SymbolTable, child: SymbolId, parent: SymbolId) {
     if st.get(child).kind != SymKind::Class {
         return;
@@ -154,7 +152,7 @@ fn add_parent(st: &mut SymbolTable, child: SymbolId, parent: SymbolId) {
         .push(Type::Class { sym: parent, args });
 }
 
-/// `object Equiv` の implicit instance。jar: `scala/math/Equiv$<Name>$`。
+/// `object Equiv`'s implicit instances. jar: `scala/math/Equiv$<Name>$`.
 fn add_equiv_instances(st: &mut SymbolTable, equiv: SymbolId) {
     let Some(equiv_mod) = st.companion_module(equiv) else {
         return;
@@ -178,9 +176,9 @@ fn add_equiv_instances(st: &mut SymbolTable, equiv: SymbolId) {
         ("BigDecimal", "scala/math/Equiv$BigDecimal$", big_dec),
         ("String", "scala/math/Equiv$String$", Some(Type::String)),
         ("Symbol", "scala/math/Equiv$Symbol$", symbol),
-        // 2.13: `Equiv.Double` / `Equiv.Float` は `StrictEquiv` /
-        // `IeeeEquiv` を抱える名前空間 object になり、implicit として
-        // 選ばれるのは非推奨版の方（module doc 参照）。
+        // 2.13: `Equiv.Double` / `Equiv.Float` became namespace objects holding
+        // `StrictEquiv` / `IeeeEquiv`, and the ones picked as implicits are the
+        // deprecated versions (see the module docs).
         (
             "DeprecatedDoubleEquiv",
             "scala/math/Equiv$DeprecatedDoubleEquiv$",
@@ -204,9 +202,9 @@ fn add_equiv_instances(st: &mut SymbolTable, equiv: SymbolId) {
     }
 }
 
-/// `implicit object <name> extends Equiv[<arg>]`（`<jvm>.MODULE$`）を作る。
-/// 既にその名前のメンバがあれば何もしない（`prelude_seq::add_implicit_instance`
-/// と同じ形 -- 新規モジュールに分けたので複製）。
+/// Create `implicit object <name> extends Equiv[<arg>]` (`<jvm>.MODULE$`).
+/// Does nothing if a member of that name already exists (the same shape as
+/// `prelude_seq::add_implicit_instance` -- duplicated because this is a separate module).
 fn add_implicit_instance(
     st: &mut SymbolTable,
     equiv_cls: SymbolId,
