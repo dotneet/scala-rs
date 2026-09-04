@@ -97,8 +97,16 @@ LOG=${CATS_LOG:-$SP/measure.txt}
 # any file is typechecked, so the count collapses to the parse errors alone and
 # says nothing about type checking. Real scalac runs specialization instead; we
 # ignore the annotation, which changes the ABI but not what typechecks.
+# `-Ykind-projector` is on by default here because cats *cannot be built without
+# the plugin*: `λ[α => …]` and `F[A, *]` are kind-projector syntax, and real
+# scalac rejects them too when the plugin is absent. Measuring without it
+# measures a configuration nobody ships. It is also 80x faster (4 s vs 334 s on
+# the same 339 files) -- the error-recovery path for the unresolved `λ`/`*`
+# names is pathologically slow, which is its own bug (see docs/cats.md).
+# Pass `-Yno-kind-projector-default` ... there is no such flag; to measure
+# without it, edit this line.
 $BIN compile "${FILES[@]}" -d $OUT -cp "$(cat $SP/deps.cp)$EXTRA_CP" -Xsource:3 \
-  -no-specialization \
+  -no-specialization -Ykind-projector \
   --scala-library /tmp/scala-rs-lib/scala-library-2.13.16.jar "$@" > $LOG 2>&1 || true
 ERRORS=$(grep -c '^error' $LOG || true)
 CLASSES=$(find $OUT -name '*.class' | wc -l | tr -d ' ')
