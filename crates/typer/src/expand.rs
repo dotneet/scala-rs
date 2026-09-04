@@ -354,7 +354,7 @@ impl Typer {
     /// Run the implementation and rebuild what it returned.
     fn macro_expansion(&mut self, tree: &Tree, binding: &MacroBinding) -> Result<Tree, String> {
         let (argss, targs, prefix) = peel_application(tree);
-        let request = self.expansion_request(binding, &argss, &targs, prefix.as_ref())?;
+        let request = self.expansion_request(binding, &argss, &targs, prefix.as_ref(), tree)?;
         if let Some(why) = &self.macro_engine_error {
             // Starting it costs a `javac` and a JVM; a run whose first attempt
             // failed must not pay that again at every call site.
@@ -398,6 +398,7 @@ impl Typer {
         argss: &[Vec<Tree>],
         targs: &[Type],
         prefix: Option<&Tree>,
+        application: &Tree,
     ) -> Result<String, String> {
         let mut out = String::from("(expand ");
         quote_into(&mut out, &binding.impl_class);
@@ -484,6 +485,34 @@ impl Typer {
                     Ok(()) => out.push_str(&built),
                 }
             }
+        }
+        out.push(')');
+        // `c.macroApplication` -- the whole call as written. nsc's own
+        // `Position` travels with it there; here the tree is rebuilt in the
+        // runtime universe and carries `NoPosition`, which costs nothing that
+        // matters: an implementation uses it to place a diagnostic, and
+        // scala-rs reports every diagnostic from a macro at the call site's
+        // own span regardless. Carried the same way as `prefix`: a tree this
+        // bridge cannot serialise is a named refusal when it is *asked for*,
+        // not an error at every call site.
+        out.push_str(" (app ");
+        let mut built = String::new();
+        match tree_to_wire(application, &mut built) {
+            Err(why) => {
+                out.push_str("(no ");
+                quote_into(&mut out, &why);
+                out.push(')');
+            }
+            Ok(()) => out.push_str(&built),
+        }
+        out.push(')');
+        // `c.compilerSettings`. nsc hands the implementation the command line
+        // that produced this run; a macro that gates on a flag (`scala.async`
+        // on `-Xasync`) has no other way to see one.
+        out.push_str(" (settings");
+        for setting in &self.compiler_settings {
+            out.push(' ');
+            quote_into(&mut out, setting);
         }
         out.push_str("))");
         Ok(out)

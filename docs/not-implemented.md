@@ -104,3 +104,36 @@ Library:
   (`agent/ordsummon`'s `os2_summon_bad.scala` deliberately omits this line)
 
 The parser does not silently discard unsupported syntax: it emits a diagnostic and an `Unimplemented` node.
+
+Compiler flags (`agent/xflags`):
+
+- **`-Xasync`: the async state machine.** The flag is accepted and reaches
+  macros through `c.compilerSettings` (which is where scala-async's
+  "The async requires the compiler option -Xasync" comes from), but
+  `scala.tools.nsc.transform.async` — the transform that rewrites an `async {
+  ... await(f) ... }` block into a `FutureStateMachine` subclass — is not
+  implemented, and neither is `c.internal.markForAsyncTransform`, the hook the
+  library calls to ask for it.
+- **`scala.async.Async.async` cannot even be named.** A macro *definition* is
+  carried only in a class file's `ScalaSignature` pickle, and this compiler
+  recognises macro defs from source only (`crates/typer/src/macros.rs`). So
+  `import scala.async.Async.async` is reported as `value async is not a member
+  of object scala.async.Async`, where scalac reports the library's own
+  `-Xasync` message.
+- **`-Xsource-features`: ten of the eleven features.** Only
+  `case-apply-copy-access` is implemented. The others
+  (`case-companion-function`, `case-copy-by-name`, `infer-override`,
+  `any2stringadd`, `unicode-escapes-raw`, `string-context-scope`,
+  `leading-infix`, `package-prefix-implicits`, `implicit-resolution`,
+  `double-definitions`) are parsed and validated, and warn when named one by
+  one, but change nothing. Naming a group (`_`, `v2.13.14`) does not warn,
+  because `-Xsource:3-cross` expands to `_`.
+- **`-Xsource:3` migration warnings.** nsc reports, as errors under
+  `-Xsource:3`, where a Scala 3 behaviour would differ — including "access
+  modifiers for `copy` / `apply` method are copied from the case class
+  constructor under Scala 3". We do not have the `scala3-migration` warning
+  category, so none of these is reported.
+- **`copy$default$N` access.** With `-Xsource-features:case-apply-copy-access`
+  scalac makes these getters as private as `copy` itself. We leave them public:
+  nothing in Scala source can name them, and this compiler fills an omitted
+  `copy` argument at the call site rather than through the getter.

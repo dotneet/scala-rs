@@ -39,6 +39,13 @@ public final class ScalaRsMacroEngine {
     static ClassLoader macroCl;
     /** `c.freshName` counter, like nsc's per-run one. */
     static int fresh = 0;
+    /**
+     * What `c.compilerSettings` returns: the compiler's own command line, as
+     * scala-rs rebuilt it (`crates/driver/src/lib.rs`, `compiler_settings`).
+     * A macro that gates on a flag reads it here -- `scala.async`'s
+     * `asyncImpl` aborts unless it contains `-Xasync`.
+     */
+    static List<String> compilerSettings = new ArrayList<>();
 
     public static void main(String[] args) throws Exception {
         PrintStream out = new PrintStream(System.out, true, "UTF-8");
@@ -89,6 +96,10 @@ public final class ScalaRsMacroEngine {
         String methodName = req.items.get(2).text();
         Sexp argss = req.field("argss");
         Sexp tags = req.field("tags");
+        compilerSettings = new ArrayList<>();
+        for (Sexp x : req.field("settings").items.subList(1, req.field("settings").items.size())) {
+            compilerSettings.add(x.text());
+        }
 
         Class<?> implCls;
         try {
@@ -118,6 +129,13 @@ public final class ScalaRsMacroEngine {
             handler.prefixWhy = pfx.items.get(1).text();
         } else {
             handler.prefixTree = buildTree(pfx);
+        }
+        // `c.macroApplication`: the call as written, carried the same way.
+        Sexp app = req.field("app").items.get(1);
+        if (app.isList() && "no".equals(app.items.get(0).atom)) {
+            handler.appWhy = app.items.get(1).text();
+        } else {
+            handler.appTree = buildTree(app);
         }
 
         Object ctx = Proxy.newProxyInstance(
@@ -476,6 +494,10 @@ public final class ScalaRsMacroEngine {
         Object prefixTree;
         /** Why there is no prefix tree, when there is none. */
         String prefixWhy;
+        /** `c.macroApplication`: the whole call as written, or null. */
+        Object appTree;
+        /** Why there is no application tree, when there is none. */
+        String appWhy;
         /** Built once: `prefix` is a `val` in nsc and is read more than once. */
         Object prefix;
 
@@ -495,6 +517,17 @@ public final class ScalaRsMacroEngine {
                     prefix = mkExpr(prefixTree, call(companion("TypeTag"), "Nothing", 0));
                 }
                 return prefix;
+            }
+            if (n.equals("macroApplication") && arity == 0) {
+                if (appTree == null) {
+                    throw new UnsupportedOperationException(
+                        "scala-rs macro engine: c.macroApplication is not available here -- "
+                            + appWhy);
+                }
+                return appTree;
+            }
+            if (n.equals("compilerSettings") && arity == 0) {
+                return list(new ArrayList<Object>(compilerSettings));
             }
             switch (n) {
                 case "universe":
