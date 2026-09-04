@@ -7760,7 +7760,9 @@ fn gen_literal(asm: &mut Assembler, lit: &Lit) {
 fn load_this(asm: &mut Assembler, ctx: &EmitCtx) {
     if let Some(slot) = ctx.outer_slot {
         asm.aload(slot);
-    } else if let Some((lclass, field, desc)) = ctx.outer {
+        return;
+    }
+    if let Some((lclass, field, desc)) = ctx.outer {
         asm.aload(0);
         asm.getfield(lclass, field, desc);
         return;
