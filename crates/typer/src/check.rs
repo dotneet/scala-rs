@@ -4060,7 +4060,35 @@ impl Typer {
             {
                 continue;
             }
-            let preceding: Vec<SymbolId> = flat[..i].to_vec();
+            // nsc's getter takes the *preceding parameter clauses* only:
+            // `def f(x: Int)(y: Int = x)` gives `f$default$2(x: Int)`, but
+            // `def f(x: Int, y: Int = 0, z: Int = 1)` gives a **nullary**
+            // `f$default$2()` / `f$default$3()`, because a default may not
+            // name an earlier parameter of its own clause (nsc rejects
+            // `def d(x: Int, z: Int = x)` outright).
+            //
+            // Taking the whole flattened prefix instead made every call that
+            // omits k defaults duplicate the argument trees 2^k times: the
+            // arguments go into the call *and* into `$default$2`, and
+            // `$default$3` then takes both of those. slick's
+            // `sel.replace { case … }` (two omitted defaults) emitted the one
+            // `PartialFunction` literal as **16** classfiles.
+            //
+            // scala-rs still accepts the same-clause reference nsc rejects, so
+            // those parameters are kept when the default body actually names
+            // one -- the exponent is what had to go, not the capability.
+            let clause_start = clause_start_of(paramss_ids, i);
+            let same_clause = &flat[clause_start..i];
+            let keep_same_clause = !same_clause.is_empty()
+                && self.st.get(*pid).default_rhs.as_ref().is_some_and(|rhs| {
+                    let names: Vec<String> = same_clause
+                        .iter()
+                        .map(|id| self.st.get(*id).name.clone())
+                        .collect();
+                    tree_names_any(rhs, &names)
+                });
+            let cut = if keep_same_clause { i } else { clause_start };
+            let preceding: Vec<SymbolId> = flat[..cut].to_vec();
             let preceding_tys: Vec<Type> = preceding
                 .iter()
                 .map(|id| self.st.get(*id).ty.clone())
@@ -23403,6 +23431,40 @@ fn is_right_biased_either(st: &SymbolTable, id: SymbolId) -> bool {
         st.get(id).jvm_name.as_str(),
         "scala/util/Either" | "scala/util/Left" | "scala/util/Right"
     )
+}
+
+/// Index into the flattened parameter list where the clause holding `flat_idx`
+/// begins. `synthesize_default_getters` needs it to tell "a parameter of an
+/// earlier clause" (which a default may name) from "an earlier parameter of my
+/// own clause" (which nsc forbids).
+fn clause_start_of(paramss_ids: &[Vec<SymbolId>], flat_idx: usize) -> usize {
+    let mut start = 0usize;
+    for clause in paramss_ids {
+        if flat_idx < start + clause.len() {
+            return start;
+        }
+        start += clause.len();
+    }
+    start
+}
+
+/// Whether an untyped tree mentions any of `names` as a bare identifier. Used
+/// only to decide whether a default body reads an earlier parameter of its own
+/// clause, so a false positive costs one extra getter parameter, never
+/// correctness.
+fn tree_names_any(tree: &Tree, names: &[String]) -> bool {
+    let mut t = tree.clone();
+    fn walk(t: &mut Tree, names: &[String]) -> bool {
+        if let TreeKind::Ident { name } = &t.kind {
+            if names.iter().any(|n| n == name) {
+                return true;
+            }
+        }
+        crate::lazy_local::children_mut(t)
+            .into_iter()
+            .any(|c| walk(c, names))
+    }
+    walk(&mut t, names)
 }
 
 /// The parser desugars `{ case … }` into `x$pf => x$pf match { case … }`.

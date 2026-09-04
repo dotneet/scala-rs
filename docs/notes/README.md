@@ -40,6 +40,7 @@ Chapter headings carry the slice they came from (`agent/xxx`).
 | --- | --- |
 | [codegen-and-stackmap-frames.md](codegen-and-stackmap-frames.md) | Six slices where the typer was happy and the classfile was not: erasure, `StackMapTable` frames, `BoxedUnit`, statements in a template body. |
 | [outer-refs-arrays-and-lambda-codegen.md](outer-refs-arrays-and-lambda-codegen.md) | Reaching an enclosing class from an anonymous class or lambda, `Array` codegen, and lowering lambdas to `invokedynamic`. |
+| [running-the-slick-we-compiled.md](running-the-slick-we-compiled.md) | The differential *execution* harness for slick, and the eleven defects it found that neither the type checker nor the class loader could see. |
 | [bytecode-and-java-interop.md](bytecode-and-java-interop.md) | Operand-stack shape around `Unit`, nested Java interfaces and interface statics, trait method access flags. |
 
 ## Process

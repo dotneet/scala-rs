@@ -8,9 +8,9 @@ use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
     check_local_case_class_captures, check_local_objects, erase, expand_private_names, find_mains,
-    lambda_lift, lazy_locals, mark_anon_captures, note_source_value_classes, typecheck_units_src,
-    uncurry, ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType,
-    ClasspathTypeParam, TypecheckOptions,
+    hoist_default_receivers, lambda_lift, lazy_locals, mark_anon_captures,
+    note_source_value_classes, typecheck_units_src, uncurry, ClasspathClass, ClasspathMethod,
+    ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -215,6 +215,10 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         }
         if !has_errors(&diags) {
             for u in units.iter_mut() {
+                // nsc's `NamesDefaults`: a call that omitted defaults binds its
+                // qualifier to a local first, so the receiver is evaluated
+                // once rather than once per `name$default$n` getter.
+                hoist_default_receivers(&mut u.tree, &mut st);
                 uncurry(&mut u.tree, &mut st);
                 // A method-local `lazy val` becomes a cell plus a nested
                 // accessor def; lambda-lift then hoists the accessor and
@@ -268,11 +272,6 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
     }
 
     let library_abi = opts.scala_library.is_some();
-    let mut emitted = if library_abi {
-        Vec::new()
-    } else {
-        emit_runtime()
-    };
     let st = shared_st.as_ref().expect("the run is typed");
     // A class can mix in a trait defined in another file, so the concrete
     // trait members of the whole run have to be known before emitting any.
@@ -287,22 +286,34 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
     // Same story: a pure function of the (now frozen) symbol table, and it was
     // rebuilt from scratch for each of the run's units.
     let jvm_index = std::rc::Rc::new(scala_rs_backend::gen::build_jvm_index(st));
-    for u in &units {
-        let src_name = source_file_name(&sources[u.file_index]);
-        emitted.extend(emit_opts(
-            &u.tree,
-            st,
-            src_name,
-            EmitOpts {
-                library_abi,
-                pickles: std::rc::Rc::clone(&u.pickles),
-                trait_members: Some(std::rc::Rc::clone(&trait_members)),
-                jvm_index: Some(std::rc::Rc::clone(&jvm_index)),
-            },
-        ));
-    }
 
-    if let Err(e) = write_emitted(&emitted, &opts.out_dir) {
+    // Emit unit by unit and hand each unit's classes to the writer pool as soon
+    // as they exist, instead of writing all of them after the last unit. The
+    // writers spend nearly all their time blocked in `open`, so the file system
+    // latency overlaps with the code generation that follows rather than being
+    // added to it.
+    let (emitted, write_result) = {
+        let mut writer = ClassWriter::start(&opts.out_dir);
+        if !library_abi {
+            writer.push(emit_runtime());
+        }
+        for u in &units {
+            let src_name = source_file_name(&sources[u.file_index]);
+            writer.push(emit_opts(
+                &u.tree,
+                st,
+                src_name,
+                EmitOpts {
+                    library_abi,
+                    pickles: std::rc::Rc::clone(&u.pickles),
+                    trait_members: Some(std::rc::Rc::clone(&trait_members)),
+                    jvm_index: Some(std::rc::Rc::clone(&jvm_index)),
+                },
+            ));
+        }
+        writer.finish()
+    };
+    if let Err(e) = write_result {
         diags.push(Diagnostic::error(
             0,
             Span::DUMMY,
@@ -321,59 +332,249 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
     }
 }
 
+/// How many threads write class files.
+///
+/// Measured on slick (2127 files, 19 directories, APFS, `write_emitted` timed
+/// on its own): 1 thread 110 ms, 2 threads 85 ms, **4 threads 55 ms**, 8
+/// threads 95 ms, 12 threads 180 ms, 16 threads 190 ms, 32 threads 200 ms.
+///
+/// Creating a file takes an exclusive lock on its directory, and slick's
+/// classes land in 19 of them (716 in one). Threads past a handful therefore
+/// queue on each other, and what is left is context switching. "It is I/O
+/// bound, so add threads" is the wrong model here.
+const WRITE_JOBS: usize = 4;
+
+/// [`WRITE_JOBS`], never more than the machine has cores.
+fn write_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(WRITE_JOBS))
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Runs below this many classes write on the calling thread: starting the pool
+/// costs more than the writes save.
+const WRITE_POOL_MIN: usize = 64;
+
+/// Write one class to `out_dir/{internal_name}.class`.
+///
+/// `made` remembers the package directories this writer has already created.
+/// `create_dir_all` walks and stats the whole chain on every call and nothing
+/// removes a directory while a compile runs, so once per directory is enough.
+fn write_class(
+    out_dir: &Path,
+    made: &mut std::collections::HashSet<PathBuf>,
+    class: &EmittedClass,
+) -> std::io::Result<()> {
+    let dest = class_path(out_dir, &class.internal_name);
+    if let Some(parent) = dest.parent() {
+        if !made.contains(parent) {
+            std::fs::create_dir_all(parent)?;
+            made.insert(parent.to_path_buf());
+        }
+    }
+    std::fs::write(&dest, &class.bytes)
+}
+
+type Chunk = (usize, Vec<EmittedClass>);
+
+/// The writer pool, once it has been started.
+struct WritePool {
+    jobs: std::sync::mpsc::Sender<Chunk>,
+    done: std::sync::mpsc::Receiver<Chunk>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    failed: std::sync::Arc<std::sync::Mutex<Option<std::io::Error>>>,
+}
+
+/// Writes class files in the background while the compile keeps generating
+/// them.
+///
+/// The caller pushes one unit's classes at a time and gets them all back, in
+/// push order, from [`ClassWriter::finish`]. Each chunk is moved to a writer
+/// thread and moved back when it has been written, so nothing is copied and
+/// nothing is shared: the classes a caller sees are the ones it emitted.
+///
+/// Writing every class after the last unit made the file system latency
+/// (almost all of it in `open`) wall time nobody was doing anything else
+/// during. Overlapping it with code generation hides it instead.
+struct ClassWriter {
+    out_dir: PathBuf,
+    /// Chunks held back until the run is known to be worth a thread pool.
+    pending: Vec<Vec<EmittedClass>>,
+    pending_classes: usize,
+    pool: Option<WritePool>,
+    next_seq: usize,
+}
+
+impl ClassWriter {
+    fn start(out_dir: &Path) -> ClassWriter {
+        ClassWriter {
+            out_dir: out_dir.to_path_buf(),
+            pending: Vec::new(),
+            pending_classes: 0,
+            pool: None,
+            next_seq: 0,
+        }
+    }
+
+    /// Hand one unit's classes over to be written.
+    fn push(&mut self, classes: Vec<EmittedClass>) {
+        if classes.is_empty() {
+            return;
+        }
+        if let Some(pool) = &self.pool {
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            // The only way this fails is every writer having died, which cannot
+            // happen while `pool.jobs` is alive.
+            let _ = pool.jobs.send((seq, classes));
+            return;
+        }
+        self.pending_classes += classes.len();
+        self.pending.push(classes);
+        if self.pending_classes >= WRITE_POOL_MIN {
+            self.start_pool();
+        }
+    }
+
+    fn start_pool(&mut self) {
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<Chunk>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Chunk>();
+        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+        let failed: std::sync::Arc<std::sync::Mutex<Option<std::io::Error>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let jobs = write_jobs();
+        let mut threads = Vec::with_capacity(jobs);
+        for _ in 0..jobs {
+            let job_rx = std::sync::Arc::clone(&job_rx);
+            let failed = std::sync::Arc::clone(&failed);
+            let done_tx = done_tx.clone();
+            let out_dir = self.out_dir.clone();
+            threads.push(std::thread::spawn(move || {
+                // Per thread, so no lock is taken on the common path. Four
+                // threads over 19 directories is at most 76 `create_dir_all`
+                // calls for a whole run.
+                let mut made = std::collections::HashSet::new();
+                loop {
+                    // Held only across `recv`: a worker that has a chunk drops
+                    // the lock before writing it.
+                    let job = {
+                        let rx = job_rx.lock().unwrap_or_else(|e| e.into_inner());
+                        rx.recv()
+                    };
+                    let Ok((seq, classes)) = job else { return };
+                    let broken = failed.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+                    if !broken {
+                        for class in &classes {
+                            if let Err(e) = write_class(&out_dir, &mut made, class) {
+                                let mut slot = failed.lock().unwrap_or_else(|e| e.into_inner());
+                                if slot.is_none() {
+                                    *slot = Some(e);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    // Give the classes back even when a write failed: the
+                    // caller still reports what was generated.
+                    let _ = done_tx.send((seq, classes));
+                }
+            }));
+        }
+        drop(done_tx);
+        self.pool = Some(WritePool {
+            jobs: job_tx,
+            done: done_rx,
+            threads,
+            failed,
+        });
+        self.pending_classes = 0;
+        for classes in std::mem::take(&mut self.pending) {
+            self.push(classes);
+        }
+    }
+
+    /// Wait for every class to be on disk and return them all in push order.
+    fn finish(self) -> (Vec<EmittedClass>, std::io::Result<()>) {
+        let ClassWriter {
+            out_dir,
+            pending,
+            pool,
+            ..
+        } = self;
+        let Some(pool) = pool else {
+            // Too few classes to have started the pool.
+            let mut made = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            let mut result = Ok(());
+            for classes in pending {
+                for class in &classes {
+                    if result.is_ok() {
+                        result = write_class(&out_dir, &mut made, class);
+                    }
+                }
+                out.extend(classes);
+            }
+            return (out, result);
+        };
+        // Closing the queue is what tells the writers to stop.
+        drop(pool.jobs);
+        for t in pool.threads {
+            let _ = t.join();
+        }
+        // Every sender is gone now, so this drains and ends.
+        let mut chunks: Vec<Chunk> = pool.done.into_iter().collect();
+        chunks.sort_by_key(|(seq, _)| *seq);
+        let mut out = Vec::with_capacity(chunks.iter().map(|(_, c)| c.len()).sum());
+        for (_, classes) in chunks {
+            out.extend(classes);
+        }
+        let failed = pool.failed.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match failed {
+            Some(e) => (out, Err(e)),
+            None => (out, Ok(())),
+        }
+    }
+}
+
 /// Write each class to `out_dir/{internal_name}.class`, creating package
 /// subdirectories as needed (`foo/Bar` → `out_dir/foo/Bar.class`).
+///
+/// [`compile_paths`] does not go through this: it streams each unit's classes
+/// to a [`ClassWriter`] as they are generated. This is for callers that already
+/// hold every class.
 pub fn write_emitted(emitted: &[EmittedClass], out_dir: &Path) -> std::io::Result<()> {
     if emitted.is_empty() {
         return Ok(());
     }
-    std::fs::create_dir_all(out_dir)?;
-    // slick emits 4552 classes into a few dozen directories, and
-    // `create_dir_all` walks and stats the whole chain every time it is called.
-    // Nothing removes a directory while this runs, so once is enough.
-    let mut made: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    let mut dests: Vec<PathBuf> = Vec::with_capacity(emitted.len());
-    for c in emitted {
-        let dest = class_path(out_dir, &c.internal_name);
-        if let Some(parent) = dest.parent() {
-            if !made.contains(parent) {
-                std::fs::create_dir_all(parent)?;
-                made.insert(parent.to_path_buf());
-            }
-        }
-        dests.push(dest);
-    }
-    // Every directory now exists, so the writes themselves are independent:
-    // one `open`/`write`/`close` per class, each blocking on the file system.
-    // 4552 of them were 10% of a slick build's CPU and almost all of it was
-    // syscall latency, which overlaps across threads. Deterministic output:
-    // the file set and each file's bytes do not depend on the interleaving.
-    let jobs = std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(1)
-        .min(emitted.len().div_ceil(64))
-        .max(1);
-    if jobs == 1 {
-        for (c, dest) in emitted.iter().zip(&dests) {
-            std::fs::write(dest, &c.bytes)?;
+    if emitted.len() < WRITE_POOL_MIN {
+        let mut made = std::collections::HashSet::new();
+        for class in emitted {
+            write_class(out_dir, &mut made, class)?;
         }
         return Ok(());
     }
+    // One `open`/`write`/`close` per class, each blocking on the file system.
+    // Deterministic output: the file set and each file's bytes do not depend on
+    // the interleaving.
     let next = std::sync::atomic::AtomicUsize::new(0);
     let failed: std::sync::Mutex<Option<std::io::Error>> = std::sync::Mutex::new(None);
     std::thread::scope(|s| {
-        for _ in 0..jobs {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if i >= emitted.len() {
-                    return;
-                }
-                if let Err(e) = std::fs::write(&dests[i], &emitted[i].bytes) {
-                    let mut slot = failed.lock().unwrap_or_else(|e| e.into_inner());
-                    if slot.is_none() {
-                        *slot = Some(e);
+        for _ in 0..write_jobs() {
+            s.spawn(|| {
+                let mut made = std::collections::HashSet::new();
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= emitted.len() {
+                        return;
                     }
-                    return;
+                    if let Err(e) = write_class(out_dir, &mut made, &emitted[i]) {
+                        let mut slot = failed.lock().unwrap_or_else(|e| e.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        return;
+                    }
                 }
             });
         }
