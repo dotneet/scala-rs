@@ -471,6 +471,14 @@ same machine — not against the branch point.
 | `tests/scala_corpus.sh` (`CORPUS_SIZE=full`, `CORPUS_JOBS=6`) | `pos 977 · neg 640 · run 443` | identical, and the two `corpus.tsv` files `diff` clean — byte for byte, recorded diagnostic included |
 | `cargo test --workspace --release` | — | 150 × `test result: ok`, 1970 tests, 0 failures |
 
+`main` then moved again, to `cad281b` (`agent/kindproj`), which touches
+`crates/typer/src/symbol.rs` and `crates/parser/src/parse.rs` — both files this
+slice edits. The merge was clean, and the whole set was re-run on it:
+scalalib `1969 / 172`, slick `errors=0 classes=1596`, `slick_run` 12/12, cats
+`2929`, gitbucket `1693`, corpus `pos 977 · neg 640 · run 443`, workspace
+151 × `test result: ok` / 1976 tests / 0 failures. Every "after" figure above
+is unchanged by that merge.
+
 `tests/slick_subset.sh` was not run: this slice touches no code generation
 (`crates/backend/` is untouched), so its 30 minutes would measure nothing.
 
