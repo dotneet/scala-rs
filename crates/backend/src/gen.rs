@@ -4728,6 +4728,52 @@ impl<'a> Gen<'a> {
         None
     }
 
+    /// The descriptor of an implementation on this class that *overrides*
+    /// `def` at a strictly narrower erased parameter list, if there is exactly
+    /// one.
+    ///
+    /// Two tests, and both are needed. `bridge_overrides` says the two really
+    /// are one member -- a parameter that erases to `Object`, or that
+    /// `erased_abstract_params` records as abstract before erasure, may be
+    /// narrowed by an override; two unrelated `f(Any)` / `f(String)` overloads
+    /// may not. `desc_narrows` then fixes the *direction*, which
+    /// `bridge_overrides` alone does not: without it the narrow method would
+    /// find the wide one just as readily and both would bridge to each other.
+    fn narrower_override(
+        &self,
+        name: &str,
+        def: &Tree,
+        impls: &[(String, String, Vec<Type>, SymbolId)],
+    ) -> Option<String> {
+        let enc = encode_method_name(name);
+        let wide_desc = def_method_desc(self.st, def);
+        let wide_params = desc_params(&wide_desc).to_string();
+        let wide_strs = desc_param_strs(&wide_desc);
+        let declared = def_param_types(self.st, def);
+        let abstract_mask = self
+            .st
+            .erased_abstract_params
+            .get(&def.sym)
+            .copied()
+            .unwrap_or(0);
+        let mut hits = impls.iter().filter(|(n, d, cps, sym)| {
+            *n == enc
+                && *sym != def.sym
+                && desc_params(d) != wide_params
+                && bridge_overrides(self.st, &declared, cps, abstract_mask)
+                && {
+                    let cs = desc_param_strs(d);
+                    cs.len() == wide_strs.len()
+                        && cs
+                            .iter()
+                            .zip(&wide_strs)
+                            .all(|(c, p)| self.desc_narrows(p, c))
+                }
+        });
+        let first = hits.next().map(|(_, d, _, _)| d.clone())?;
+        hits.next().is_none().then_some(first)
+    }
+
     fn emit_mixin_forwarders(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
         if class_id.is_none() {
             return;
@@ -4784,12 +4830,89 @@ impl<'a> Gen<'a> {
                 chosen.push((name, iface.clone(), m.clone()));
             }
         }
-        for (name, iface, def) in chosen {
+        // Everything this class will implement: its own body, and the
+        // forwarders about to be emitted. Two clauses of the linearization can
+        // spell *one* member at two erased descriptors, and then the wider one
+        // must not run its own trait's body.
+        let impls: Vec<(String, String, Vec<Type>, SymbolId)> = body
+            .iter()
+            .filter_map(|stt| match &stt.kind {
+                TreeKind::DefDef { name, .. } => Some((
+                    encode_method_name(name),
+                    def_method_desc(self.st, stt),
+                    def_param_types(self.st, stt),
+                    stt.sym,
+                )),
+                _ => None,
+            })
+            .chain(chosen.iter().map(|(n, _, d)| {
+                (
+                    encode_method_name(n),
+                    def_method_desc(self.st, d),
+                    def_param_types(self.st, d),
+                    d.sym,
+                )
+            }))
+            .collect();
+        for (name, iface, def) in &chosen {
+            let (name, iface, def) = (name.clone(), iface.clone(), def.clone());
             let inst_desc = def_method_desc(self.st, &def);
             if defined.contains(&(
                 encode_method_name(&name),
                 desc_params(&inst_desc).to_string(),
             )) {
+                continue;
+            }
+            // `SynchronousDatabaseAction.openStream(context: C)` with
+            // `C <: BasicBackend#BasicActionContext` is *overridden* by
+            // `StreamingInvokerAction.openStream(ctx: JdbcBackend#JdbcActionContext)`,
+            // and the two erase to different descriptors. Forwarding both to
+            // their own trait bodies leaves the wide one -- which is what a
+            // call through the base interface resolves to -- running the base
+            // implementation, and slick's base implementation is
+            // `throw new SlickException("Streaming is not supported")`.
+            // nsc emits the wide descriptor as a bridge to the narrow one.
+            if let Some(target) = self.narrower_override(&name, &def, &impls) {
+                let ret = method_ret_ty(&def);
+                let pstrs = desc_param_strs(&inst_desc);
+                let cstrs = desc_param_strs(&target);
+                let mut loads: Vec<(u16, JvmSort, Option<String>)> = Vec::new();
+                let mut locals = 1u16;
+                for (i, s) in desc_param_sorts(desc_params(&inst_desc))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let cast = match (pstrs.get(i), cstrs.get(i)) {
+                        (Some(p), Some(c)) if p != c && c.starts_with('L') => {
+                            Some(c[1..c.len() - 1].to_string())
+                        }
+                        (Some(p), Some(c)) if p != c && c.starts_with('[') => Some(c.clone()),
+                        _ => None,
+                    };
+                    loads.push((locals, s, cast));
+                    locals += s.slots();
+                }
+                let cn = b.this_name.clone();
+                let enc = encode_method_name(&name);
+                let enc_c = enc.clone();
+                let tdesc = target.clone();
+                b.add_code(
+                    ACC_PUBLIC | ACC_BRIDGE | ACC_SYNTHETIC,
+                    &enc_c,
+                    &inst_desc,
+                    locals.max(1),
+                    move |asm| {
+                        asm.aload(0);
+                        for (slot, sort, cast) in &loads {
+                            load(asm, *slot, *sort);
+                            if let Some(c) = cast {
+                                asm.checkcast(c);
+                            }
+                        }
+                        asm.invokevirtual(&cn, &enc, &tdesc);
+                        emit_return(asm, &ret);
+                    },
+                );
                 continue;
             }
             let static_desc = trait_static_desc(&iface, &inst_desc);

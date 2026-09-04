@@ -235,6 +235,37 @@ fn fixtures_selfrec_value_class_default_getters_are_on_the_module() {
     let _ = fs::remove_dir_all(&out);
 }
 
+/// The wide descriptor of a member overridden at a narrower parameter type is
+/// a bridge, not a second mixin forwarder to the base trait's body. `javap` is
+/// the check that matters: a forwarder to the base would still *link*, and a
+/// caller holding the derived static type never reaches it -- slick calls
+/// `openStream` through `SynchronousDatabaseAction`, and got the base's
+/// `throw new SlickException("Streaming is not supported by this Action")`.
+#[test]
+fn fixtures_selfrec_narrowed_override_gets_a_bridge() {
+    let Some(out) = compile_fixture() else {
+        eprintln!("skip selfrec: no scala-library jar");
+        return;
+    };
+    let text = javap(&out, "StreamImpl").expect("javap StreamImpl");
+    for (sig, want) in [
+        ("public java.lang.String open(Ctx)", "invokevirtual"),
+        ("public int size(Ctx)", "invokevirtual"),
+    ] {
+        let start = text
+            .find(sig)
+            .unwrap_or_else(|| panic!("no {sig} in:\n{text}"));
+        let rest = &text[start..];
+        let end = rest[1..].find("\n\n").map(|i| i + 1).unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains(want) && body.contains("checkcast") && !body.contains("StreamBase$class"),
+            "{sig} is not a bridge to the override:\n{body}"
+        );
+    }
+    let _ = fs::remove_dir_all(&out);
+}
+
 /// `f.asInstanceOf[A => B](v)` applies the *cast*, not `asInstanceOf`. The
 /// backend used to strip the `TypeApply` and call `asInstanceOf` with the
 /// argument (`NoSuchMethodError: java.lang.Object.asInstanceOf()`).

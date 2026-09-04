@@ -24,6 +24,11 @@
 // 5. A pattern binder whose type is a *tuple*, read out of a sequence pattern.
 //    The extractor hands the element back as an `Object`, and the cast to
 //    `scala/Tuple2` has to be there before `_1` / `_2`.
+//
+// 6. A concrete trait method overridden, further down the linearization, at a
+//    narrower parameter type. The two erase to different descriptors, and the
+//    wide one is a *bridge* to the override -- not a second mixin forwarder
+//    running the base's body.
 
 trait Session { def id: String }
 
@@ -77,6 +82,25 @@ final class Ops(val s: String) extends AnyVal {
   def like(pattern: String, esc: Char = ' '): String = s + "|" + pattern + "|" + esc
   def twice(n: Int = 2): String = s * n
 }
+
+// slick's `SynchronousDatabaseAction.openStream(context: C)` (which throws)
+// against `StreamingInvokerAction.openStream(ctx: JdbcBackend#JdbcActionContext)`.
+trait Ctx { def n: String }
+class SubCtx extends Ctx { def n = "sub" }
+
+trait StreamBase[-C <: Ctx] {
+  def open(c: C): String = "base"
+  // A narrowed parameter with a primitive result, which the covariant-bridge
+  // pass does not cover: the forwarder itself has to be the bridge.
+  def size(c: C): Int = 0
+}
+
+trait StreamDerived extends StreamBase[SubCtx] {
+  override def open(c: SubCtx): String = "derived " + c.n
+  override def size(c: SubCtx): Int = c.n.length
+}
+
+class StreamImpl extends StreamDerived
 
 // slick's `ConstArray`, whose `unapplySeq` hands back an `IndexedSeq`.
 final class Arr[T](val xs: IndexedSeq[T])
@@ -159,5 +183,12 @@ object Main {
     println(viaSeq(Seq((1, "a"), (2, "b"))))
     println(viaUnapplySeq(new Arr(IndexedSeq((3, "c")))))
     println(viaList(List((4, "d"))))
+
+    val wide: StreamBase[SubCtx] = new StreamImpl
+    println(wide.open(new SubCtx))
+    println(wide.size(new SubCtx))
+    val narrow: StreamDerived = new StreamImpl
+    println(narrow.open(new SubCtx))
+    println(narrow.size(new SubCtx))
   }
 }

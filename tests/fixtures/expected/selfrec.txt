@@ -31,3 +31,7 @@ z|q|
 a
 c
 d
+derived sub
+3
+derived sub
+3
