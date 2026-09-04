@@ -307,11 +307,11 @@ carries only a symbol.
 
 Real scalac 2.13.16 accepts the fixture. 19 lines, no plugin syntax.
 
-### A structural type lambda is not a type constructor
+### A structural type lambda is a type constructor (fixed)
 
-This is the wall any kind-projector work runs into, so it is worth stating
-separately. A **named** higher-kinded alias works; the **structural** form,
-which is what kind-projector expands to, does not:
+This was the wall any kind-projector work ran into. A **named** higher-kinded
+alias worked; the **structural** form -- the one kind-projector expands to, and
+the one cats writes by hand where the plugin is not available -- did not:
 
 ```scala
 trait Fun[F[_]] { def map[A, B](fa: F[A])(f: A => B): F[B] }
@@ -321,7 +321,58 @@ val ok:  Fun[EitherL] = ???                                    // accepted
 val bad: Fun[({ type L[a] = Either[String, a] })#L] = ???      // "required: Fun[<none>.L]"
 ```
 
-scalac accepts both.
+Both are accepted now (`agent/typelambda`). The projection itself was never the
+problem -- it produced a `TypeMember` of the right kind all along. Two other
+things were:
+
+1. **Two spellings of the same lambda were never the same type.** Every written
+   refinement allocates its own `TypeMember` symbol, and `dealias` deliberately
+   leaves a higher-kinded alias folded, because its body only means anything
+   once applied. So `Fun[EitherL]` and `Fun[({ type L[a] = … })#L]` compared two
+   unrelated symbols. Conformance now eta-expands both sides -- applying them to
+   one side's own parameters -- and compares the bodies, which is how nsc
+   decides it after dealiasing. A class constructor counts as one side, so
+   `Fun[List]` conforms to `Fun[({ type L[a] = List[a] })#L]`.
+
+2. **A lambda that captures an enclosing type parameter could not be
+   substituted into.** `implicit def readerMonad[R]:
+   Monad[({ type L[X] = Reader[R, X] })#L]` keeps its body in the symbol table,
+   so instantiating `R = Int` left the body reading `Reader[R, X]`. Captured
+   parameters are now the member's *leading* parameters and the projection is
+   handed out already applied to them, which makes it a partial application that
+   ordinary argument substitution can reach into. `kind_arity` of a partial
+   application already subtracts what is applied, so the arity the rest of the
+   compiler sees is unchanged.
+
+`tests/fixtures/tl_lambda.scala` pins the accepted forms (dual-run against real
+scalac 2.13.16 in both the library-ABI and the private-runtime mode) and
+`tl_lambda_bad.scala` pins the four errors scalac reports for lambdas that do
+*not* match, so the body comparison cannot degenerate into accepting anything.
+
+Two things fell out of it, both cats shapes rather than lambda syntax:
+
+* `type Aux[M[_], F0[_]] = Parallel[M] { type F[x] = F0[x] }` -- a refinement
+  that names a type constructor member -- now carries `F0` where before it
+  carried a placeholder that was the same whatever `F0` was. Implicit
+  unification descends into a refinement's declarations to match it, and a
+  parameter that occurs *only* inside those declarations counts as
+  undetermined, so the witness can pin it down (nsc's `Context.undetparams`).
+  `parUnorderedSequence[T, M, F, A](ta: T[M[A]])(implicit P: Parallel.Aux[M, F])`
+  names `F` nowhere else. Reduced to thirteen lines, the shape used to report
+  `found: F0[A]  required: F[A]`, leaking the alias's own parameter.
+* Diagnostics print a lambda the way nsc does (`Functor[[a]Box[a]]`, not
+  `Functor[<none>.L]`), and a refinement's declarations print through the
+  symbol table (`{ type L[a] = Box[a] }`, not `{ type L[_] = tmem#5125 }`).
+
+**What is still missing is kind-projector's surface syntax**, `λ[α => F[G[α]]]`
+and the `*` placeholder. That is a compiler plugin, not Scala; nsc without it
+reports exactly what we report, so the rejection is correct, and the 2514
+errors in the 70 files that name `*`, `λ` or `α` are unchanged by this. The
+desugaring should sit behind a flag.
+
+Measured on `kernel+core`, 339 files: **3016 → 2987 errors**, 165 files with
+errors in both, no file gaining one. (The 3019 recorded above was measured
+elsewhere; this tree measures 3016 for the same commit.)
 
 ### What cats-kernel still reports (19 errors, 10 files)
 
