@@ -100,6 +100,28 @@ class OneArmed {
   def run(c: Boolean): Any = { if (c) touch(1); seen }
 }
 
+// (12) `{ case ... }` where a plain `Function1` is expected is lowered to a
+// hoisted `$anonfun$` (invokedynamic), and the case's own binders live in that
+// static method's locals. These pin that the pattern binders, the captured
+// enclosing `this`, and a captured `var` all still line up there.
+class PatLambdas(base: Int) {
+  var seen = 0
+  def viaFind(cases: Seq[(Int => Boolean, String)]): String =
+    cases.find { case (f, n) => f(base) }.map(_._2).getOrElse("-")
+  def viaMap(ps: Seq[(Int, String)]): String =
+    ps.map { case (k, v) => v + (k + base) }.mkString(",")
+  def viaVar(ps: Seq[(Int, String)]): Int = {
+    ps.foreach { case (k, _) => seen += k + base }
+    seen
+  }
+}
+trait PatInTrait {
+  def offset: Int
+  def render(ps: Seq[(Int, String)]): String =
+    ps.map { case (k, v) => v + (k + offset) }.mkString("/")
+}
+class PatTraitImpl(val offset: Int) extends PatInTrait
+
 object Main {
   def g(n: T1)(f: T1 => (T1, U1)): (T1, U1) = n match { case null => null; case x => f(x) }
 
@@ -135,6 +157,12 @@ object Main {
 
     val oa = new OneArmed
     println(oa.run(true).toString + oa.run(false).toString)
+
+    val pl = new PatLambdas(10)
+    println(pl.viaFind(Seq(((i: Int) => i > 5, "big"), ((i: Int) => i < 0, "neg"))))
+    println(pl.viaMap(Seq((1, "a"), (2, "b"))))
+    println(pl.viaVar(Seq((1, "a"), (2, "b"))))
+    println(new PatTraitImpl(100).render(Seq((1, "a"), (2, "b"))))
 
     val buf = mutable.ArrayBuffer(3, 1, 2)
     println(buf.sortInPlace().mkString(","))

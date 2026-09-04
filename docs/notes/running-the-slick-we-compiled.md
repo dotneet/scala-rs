@@ -132,6 +132,18 @@ stdout for the same file.
   `byname_lazy`'s `$anonfun$23` had a `Main$Config` where a `StringBuilder`
   belonged (`VerifyError`).
 
+  **This was a merge artifact of this port, not a hole in the indy lowering.**
+  `git show <main>:crates/backend/src/gen.rs` has `load_this` as a clean
+  `if / else if / else`; my version used early `return`s, and the textual merge
+  kept main's `if / else if` head with my body's trailing `aload(0)` outside the
+  chain. Pattern-matching function literals on the invokedynamic path are fine,
+  and there is no reason to keep them off it. `slickrun.scala` now carries four
+  of them — `find` / `map` / `foreach` over a tuple, one in a trait method, one
+  capturing a `var`, one capturing the enclosing `this` — and
+  `fixtures_slickrun_pattern_lambdas_are_hoisted` pins that all four become
+  hoisted `$anonfun$` statics with no closure class, with the run above
+  checking that their binders, captures and outer reference line up.
+
 * **`asInstanceOf` on a `<notype>` qualifier materialised a `BoxedUnit`.**
   `adapt_unit_arg` treats `NoType` as `Unit`, which is right for a parameter and
   wrong for a qualifier: there `NoType` means the typer recorded nothing and

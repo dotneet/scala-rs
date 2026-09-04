@@ -149,3 +149,51 @@ fn dual_run_fixture(name: &str) {
 fn fixtures_slickrun_dual_run() {
     dual_run_fixture("slickrun");
 }
+
+/// The four `{ case … }` literals in `PatLambdas` / `PatInTrait` are lowered to
+/// hoisted `$anonfun$` statics, not to closure classes, and the run above shows
+/// their pattern binders, the captured enclosing `this` and a captured `var`
+/// all still line up in that static method's locals.
+///
+/// This is the shape `agent/slickrun` first saw fail — but the cause was a
+/// merge artifact in `load_this`, not the lowering. Pinned here so the next
+/// slice that widens the indy boundary (a `{ case … }` where a plain
+/// `Function1` is expected) has coverage for it rather than a rumour.
+#[test]
+fn fixtures_slickrun_pattern_lambdas_are_hoisted() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let out = compile_fixture_with("slickrun", &["--scala-library", jar.to_str().unwrap()]);
+    let names: Vec<String> = fs::read_dir(&out)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let lambda_classes: Vec<&String> = names.iter().filter(|n| n.contains("anonfun")).collect();
+    assert!(
+        lambda_classes.is_empty(),
+        "a lambda became a class file: {lambda_classes:?}"
+    );
+    // The only anonymous *classes* here are the two the source writes out --
+    // `new Comp {}` and `new HasSubOpts {}`. If a `{ case … }` regresses to the
+    // closure-class path this number moves, so move it deliberately.
+    let anon: Vec<&String> = names.iter().filter(|n| n.contains("$$anon$")).collect();
+    assert_eq!(
+        anon.len(),
+        2,
+        "expected exactly two anonymous classes, got {anon:?}"
+    );
+    for cls in ["PatLambdas.class", "PatInTrait$class.class"] {
+        let bytes = fs::read(out.join(cls)).unwrap_or_else(|e| panic!("{cls}: {e}"));
+        let needle = b"$anonfun$";
+        assert!(
+            bytes.windows(needle.len()).any(|w| w == needle),
+            "{cls} has no hoisted $anonfun$ method"
+        );
+    }
+    let _ = fs::remove_dir_all(&out);
+}
