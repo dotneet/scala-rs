@@ -15,9 +15,11 @@
 # can reason about.
 #
 #   pos/   pass when scala-rs compiles the sources with zero errors
-#   neg/   pass when scala-rs reports at least one error (the `.check` text is
-#          deliberately NOT compared yet -- first question is whether we reject
-#          what must be rejected at all)
+#   neg/   pass when scala-rs reports at least one error. That is an upper
+#          bound -- a rejection for the wrong reason counts -- so the log also
+#          carries our diagnostics and the ones the `.check` expects, and
+#          tests/scala_corpus_report.sh scores the wording on top of it. Both
+#          numbers are reported; neither replaces the other.
 #   run/   pass when it compiles, `java Test` runs, and stdout matches `.check`
 #
 # scala-rs is a subset implementation, so most of the corpus is expected to
@@ -69,8 +71,66 @@ if [[ $1 == --one ]]; then
   WORK=$CORPUS_WORK/$kind/$name
   rm -rf $WORK; mkdir -p $WORK/out
 
-  emit() {  # status symptom
-    printf '%s\t%s\t%s\t%s\n' $kind $name $1 "$2" >> $CORPUS_LOG.part/$kind-$name
+  emit() {  # status symptom [got] [want]
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      $kind $name $1 "$2" "${3:-}" "${4:-}" >> $CORPUS_LOG.part/$kind-$name
+  }
+
+  # --- diagnostic capture, for the `neg` wording comparison ------------------
+  # Both sides are reduced to a list of scalac-shaped records
+  #     <basename>:<line>: <level>: <message>
+  # joined by an ASCII record separator (\x1e), which cannot occur in either
+  # compiler's output and keeps one test on one TSV line. Only the *first* line
+  # of a message is kept: ours are one line each, while scalac puts the
+  # found/required of a `type mismatch;` on continuation lines, so the heads are
+  # the only thing the two renderings have in common. Scoring is deliberately
+  # left to tests/scala_corpus_report.sh so that a log recorded once can be
+  # re-cut under a different notion of "same message".
+
+  # Our own diagnostics, read back out of the compile logs. Warnings are kept
+  # as well as errors: a `neg` test whose `.check` holds only warnings is one
+  # that fails under `-Xfatal-warnings`, and there the two compilers can
+  # legitimately disagree about the level while agreeing about the message.
+  our_diags() {
+    perl -ne '
+      BEGIN { @o = (); }
+      sub flush {
+        return unless defined $msg;
+        push @o, sprintf("%s:%s: %s: %s", defined $f ? $f : "?",
+                         defined $l ? $l : 0, $lvl, substr($msg, 0, 120));
+        undef $msg; undef $f; undef $l;
+      }
+      if (/^(error|warning)(?:\[[^\]]*\])?:\s*(.*)$/) {
+        flush(); $lvl = $1; $msg = $2; next;
+      }
+      if (defined $msg && !defined $l && m{^\s*-->\s*(\S+)}) {
+        my $p = $1;
+        if ($p =~ /^(.*):(\d+):\d+$/) { $f = $1; $l = $2; } else { $f = $p; $l = 0; }
+        $f =~ s{.*/}{};
+      }
+      END { flush(); print join("\x1e", @o); }
+    ' "$@" 2>/dev/null | tr '\t' ' '
+  }
+
+  # What the `.check` says scalac reports. The error lines are what a `neg`
+  # test is about; the warning lines are taken only when there is no error
+  # line at all, which is the shape of a test that fails purely because a
+  # warning was promoted. Taking warnings *alongside* errors would score us on
+  # lints nobody claims we implement.
+  check_diags() {
+    [[ -f $1 ]] || return 0
+    perl -ne '
+      BEGIN { @e = (); @w = (); }
+      if (/^(\S+):(\d+):\s*(error|warning):\s*(.*)$/) {
+        my ($f, $l, $lvl, $m) = ($1, $2, $3, $4);
+        $f =~ s{.*/}{};
+        if ($f =~ /\.(scala|java)$/) {
+          my $r = sprintf("%s:%s: %s: %s", $f, $l, $lvl, substr($m, 0, 120));
+          if ($lvl eq "error") { push @e, $r } else { push @w, $r }
+        }
+      }
+      END { print join("\x1e", @e ? @e : @w); }
+    ' $1 2>/dev/null | tr '\t' ' '
   }
 
   # --- collect the sources -------------------------------------------------
@@ -175,7 +235,20 @@ if [[ $1 == --one ]]; then
         emit fail "compiled but emitted no classfiles"
       else emit pass -; fi ;;
     neg)
-      if (( errors > 0 )); then emit pass "$symptom"; else emit fail accepted-but-should-not-compile; fi ;;
+      # Column 3 keeps the historical rule -- any error at all is a pass. It is
+      # an upper bound and it is still worth having: "we reject this program"
+      # is a weaker claim than "we reject it for the right reason", not a
+      # meaningless one. Columns 5 and 6 carry the two diagnostic lists so the
+      # report can score the wording as well, without a second corpus run.
+      ncheck=${tpath:r}.check
+      [[ -d $tpath ]] && ncheck=$tpath.check
+      want=$(check_diags $ncheck)
+      got=$(our_diags $WORK/round*.log(N))
+      if (( errors > 0 )); then
+        emit pass "$symptom" "$got" "$want"
+      else
+        emit fail accepted-but-should-not-compile "$got" "$want"
+      fi ;;
     run)
       if (( errors > 0 )); then emit fail "$symptom"; exit 0; fi
       check=${tpath:r}.check
