@@ -514,6 +514,13 @@ erasure's `sym_denotes_callee`).
   type constructor and becomes `<none>.L`. Assignment to `Functor[IntReader]` via
   the type alias `type IntReader[X] = Reader[Int, X]` does not work either.
 
+  **Fixed by `agent/typelambda`.** The projection was resolving all along; what
+  was missing is that two written refinements are two symbols and could never
+  compare equal, and that a lambda capturing `R` had nowhere to record it. See
+  "A structural type lambda is a type constructor" in `docs/cats.md`, and
+  `tests/fixtures/tl_lambda.scala` for the accepted forms and
+  `tl_lambda_bad.scala` for what still has to be rejected.
+
 * **A method named `def using(...)`** (a difference in what is accepted). Real
   scalac 2.13.16 **rejects** `using(r)(f)` with
   `Main.Res does not take parameters` (`using` is a soft keyword for argument
