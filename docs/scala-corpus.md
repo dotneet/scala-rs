@@ -515,6 +515,132 @@ order of cost per test moved:
    the headline number rather than a fix; knowing they are there is the point.
 4. Everything else is one test at a time.
 
+## Three checks we were not performing (2026-09-05, `agent/accepttoomuch`)
+
+Bucket **a** — the 380 `neg` tests we compiled without a word — was the target.
+It is now 364, and the three holes closed were worth more than that count
+suggests, because two of them were holes in *every* program rather than in one
+check.
+
+### 1. A written type annotation naming nothing
+
+`def f(x: Zork): Int = 3` compiled. So did `val x: Zork`, `def f(x: Int): Zork`
+and `def f(x: List[Zork])`. Only a template's parents, its self type and the
+class a `new` builds resolved strictly (`Typer::strict_type_names`); everywhere
+else an unresolved name stayed a `Type::Named` placeholder and the rest of the
+run went on with it. `type_val_sig` and `type_def_sig` now resolve under the
+same flag.
+
+Three things had to be true for that not to break working code, and each one
+was found by a measurement rather than by reading:
+
+* **An existential binds its own names.** `subst_quantified` runs *after* the
+  body is resolved, so `val x: A[X] forSome { type X }` has `X` standing for
+  nothing while the body is being built. Six `pos` tests regressed on the first
+  attempt (`exbound`, `depexists`, `t0905`, `t1048`, `t1560`, `t5022`). The
+  quantified names are now announced before the clause is resolved.
+* **A wildcard import whose members we cannot enumerate leaves the scope
+  open.** gitbucket writes `import gitbucket.core.model.Profile.profile.blockingApi._`
+  and then 259 signatures naming `Session`, a type member reached through that
+  path. `import p._` is only enumerable when `p` is a package or an object; a
+  prefix that did not resolve, or a *value* whose type is a jar class read one
+  name at a time, is not. In such a file the rule stands down
+  (`Typer::opaque_import_files`). Without it gitbucket went from 1693
+  diagnostics to 2230.
+* **nsc's error type is absorbing.** When the type *constructor* names nothing,
+  its arguments are not reported as well — `-Ykind-projector` leaves an
+  unrecognised `Functor[λ[α => Box[α], β]]` untouched, and `α`/`β` are then
+  names nobody wrote a binder for. One diagnostic, not three.
+
+### 2. A local `type` alias had no symbol at all
+
+A block ran the namer over its `class` and `object` statements only, so
+
+```scala
+type Branches = List[(F[Boolean], F[A])]
+def step(branches: Branches): F[Either[Branches, A]] = ...
+```
+
+— cats' `Monad.ifElseM` — left `Branches` standing for nothing. That was
+invisible while an unresolved name in a signature was tolerated. A block now
+resolves its type aliases first, the way a template does, and **cats went from
+1128 diagnostics to 1108 on the strength of that one fix**.
+
+The pre-pass stops at the first `import`: an import inside a block takes effect
+where it stands, and `pos/t5305` writes `import O.{F, v}` before
+`type x = { type l = (F, v.type) }`.
+
+### 3. Two overloads that erasure merges into one descriptor
+
+nsc's `RefChecks.checkNoDoubleDefs`, now `crates/typer/src/double_def.rs`. Eight
+`neg` tests, and eight class files we were emitting with two identical methods.
+
+The rule is over the **descriptor**, and both halves of that were probed
+against `/tmp/scala-2.13.16/bin/scalac` rather than assumed:
+
+* parameter clauses are flattened, a repeated parameter is the `Seq` it
+  becomes, a value class is what it wraps, and a singleton type is its
+  underlying type — `neg/t6443c`, `neg/t0259`, `neg/valueclasses-doubledefs`,
+  `neg/t8323`;
+* the **result** type is part of it, and the JVM lets two methods differ in it
+  alone. `scala.Function.uncurried` is five overloads that all take one
+  `Function1`; scalac accepts those and rejects
+  `def g(x: List[Int]): Int` beside `def g(x: List[String]): Int`. Leaving the
+  result out of the key cost twelve false diagnostics on
+  `src/library/scala/Function.scala` alone;
+* a **macro def** has no bytecode, so two of them cannot collide. scalac
+  accepts `pos/t7776`'s two `app` macros and rejects the same pair written as
+  ordinary methods.
+
+The check is deliberately narrow otherwise: only members the source of one
+template wrote, never a synthetic, a bridge or an accessor, and never a
+signature holding a `NoType`, an `Error` or an unresolved `Type::Named`.
+
+### What it moved
+
+Whole corpus, `main` at `cad281b` merged in, `CORPUS_SIZE=full CORPUS_JOBS=6`:
+
+| | before | after |
+|---|---|---|
+| `pos` pass | 977 | **980** |
+| `neg` **T0** any error | 640 (61.7 %) | **656 (63.3 %)** |
+| `neg` **T1** expected messages reproduced | 104 (10.0 %) | **115 (11.1 %)** |
+| `neg` **T2** … at the expected line | 99 (9.5 %) | **110 (10.6 %)** |
+| `neg` **T3** … and nothing extra | 79 (7.6 %) | **89 (8.6 %)** |
+| bucket **a** — accepted with no diagnostic | 380 | **364** |
+
+Nothing regressed in either column. The three `pos` gains are `generic-sigs`,
+`t9326a` and `tcpoly_typesub`; the sixteen `neg` gains are `func-max-args`,
+`overloaded-unapply`, `patmat-type-check`, `t0259`, `t1565`, `t2779`, `t3653`,
+`t588`, `t6443c`, `t7602`, `t8300-overloading`, `t8323`, `t8890`,
+`valueclasses-doubledefs`, `valueclasses-pavlov`, `volatile_no_override`.
+
+The four project measurements, which are what a rejection rule has to be
+judged on:
+
+| | before | after |
+|---|---|---|
+| slick | `files=184 errors=0 files_with_errors=0 classes=1596` | identical |
+| `tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0` | identical |
+| cats `-Ykind-projector` | `errors=1128 files_with_errors=141` | **1108 / 139** |
+| gitbucket | `errors=1693 files_with_errors=188` | **1675 / 186** |
+| `src/library` `-no-specialization` | `errors=1997 files_with_errors=173` | **1903 / 172** |
+
+Three of the four went *down*, which is the shape a rejection rule should have
+when the rejection is real and the compiler was hiding a resolution failure
+behind a placeholder.
+
+### One thing this exposed and did not fix
+
+**`scala.Singleton` is not resolvable.** It has no class file — the jar has
+none, and `src/library-aux` is scaladoc-only — so it was one of the names that
+survived as a placeholder. `val x: Singleton` is now `not found: type
+Singleton`, which is honest but is a diagnostic scalac does not have. Five
+`pos` tests report it (`scala-singleton`, `sip23-singleton-sub`,
+`sip23-singleton-view`, `t4914`, `t7520`); all five were already failing for
+the same underlying reason, so the pass rate did not move. It needs a compiler-
+defined symbol, the way `Any`/`AnyRef`/`Nothing` have one.
+
 ## What would move the number most
 
 1. **Static forwarders into a companion class.** Fifteen `run` tests, one
@@ -522,7 +648,11 @@ order of cost per test moved:
 2. **`AnyRef` conformance.** `val x: AnyRef = 1` compiling is a hole under
    everything else; but it is a *rejection* rule, and this project's history
    says a new rejection rule breaks more than it fixes. Do it with the slick,
-   cats and gitbucket measurements in hand.
+   cats and gitbucket measurements in hand. (The three rules in
+   [the section above](#three-checks-we-were-not-performing-2026-09-05-agentaccepttoomuch)
+   were added that way and three of the four measurements improved — but two of
+   them only after a guard that a measurement, not a reading of the code, said
+   was needed.)
 3. ~~**Compare the `neg` `.check` text.**~~ Done, 2026-09-05. The real figure is
    9.5 % (T2), not 61.7 %. What it turned up is that the `neg` tail is as flat
    as the `pos` one; the ranked follow-ups are at the end of
