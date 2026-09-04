@@ -1,0 +1,12 @@
+we must incinerate them
+hello
+8
+42
+abab
+counter
+counter_$eq
+greeting
+late
+main
+twice
+twice

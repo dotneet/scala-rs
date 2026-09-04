@@ -335,3 +335,134 @@ scala-rs and by real scalac, in `crates/cli/tests/e2e.rs`.
   **nested class-like members** had the same shape of problem and were
   fixed on `main` by `ceb9b38`, `agent/testkit2`, while this slice was in
   progress; `object Box { class Inner }` now reaches scalac.)
+
+### Static forwarders onto the companion class (`agent/mirrorfwd`)
+
+Two of the loose ends above turn out to be one bug, and the visible half of
+it stops a program from starting at all.
+
+nsc gives a top-level `object Test` a set of `public static` forwarders.
+Where they land depends on whether the source wrote a companion:
+
+* **no companion** — nsc synthesizes a *mirror class* `Test.class` whose
+  whole method table is those forwarders. scala-rs did this.
+* **a companion `class Test` (or `trait Test`)** — there is no mirror class.
+  The forwarders go onto the companion's own classfile. scala-rs did
+  **nothing**, so `Test.class` had no `main` and `java Test` reported
+  "main method not found in class Test".
+
+`scala/scala`'s `run/t363` is that program and nothing else:
+
+```scala
+object Test { def main(args: Array[String]): Unit = println("…") }
+class Test  { def kurtz() = "…" }
+```
+
+The second half is which members get forwarded. `emit_forwarder`'s list was
+built from the template's `DefDef`s alone, which is why
+`slick/util/GlobalConfig.class` had one static where nsc has seven: a `val`
+is not a `DefDef`, and neither is anything inherited.
+
+#### What real scalac 2.13.16 forwards
+
+Read off `javap -p`, one probe per question, not from nsc's source. The
+probes are reproduced as tests in `crates/cli/tests/mirrorfwd.rs`.
+
+Forwarded: every **public** member of the module class, *including
+inherited* ones — a mixed-in trait's concrete `def`, its `val`; `val` / `var`
+/ `lazy val` getters and a `var`'s `x_$eq` setter; every alternative of an
+overload; `f$default$1` and the other default-argument getters; a value
+class's `plus$extension` statics; a `case object`'s `productPrefix` /
+`productArity` / `toString` / … .
+
+Not forwarded:
+
+* `private` members — and `protected` and `private[p]` ones, which is the
+  part that cannot be read off the classfile: `protected def prot` and
+  `private[p] def bnd` are both **`public`** in `Test$.class`. It takes the
+  Scala symbol to tell them apart.
+* Anything whose *name* also names a member of the companion class,
+  inherited members included. By name, not by signature: with `class Test {
+  def clash(): Int }` next to `object Test { def clash(): Int; def
+  clashDiffSig(i: Int): Int }`, `clashDiffSig` survives but *neither*
+  `clash` does — and with an overload set, one conflict removes all of it.
+  `java.lang.Object`'s names count, which is why a companion class
+  suppresses a `toString` forwarder that a mirror class would get (`object
+  OverrideToString { override def toString = "x" }` alone *does* get
+  `public static String toString()`).
+* Members merely inherited from `java.lang.Object`.
+* Bridges.
+* Everything, when the `object` is not top level: `object Outer { class
+  Nested; object Nested }` puts nothing on `Outer$Nested`.
+
+A companion **trait** takes them too — scalac writes `public static int
+onObj()` straight into the interface classfile, which classfile major 52
+allows.
+
+#### The fix
+
+`crates/backend/src/companion_fwd.rs` decides the set;
+`gen::add_static_forwarders` writes it, into a fresh mirror class or into
+the companion's builder.
+
+The set is read off the **method table just emitted onto the module
+classfile** (`ClassBuilder::methods`), not off the symbol table. A forwarder
+is an `invokevirtual` against `MODULE$`, so a name the module classfile does
+not really carry links and then throws `NoSuchMethodError` at the first
+call; picking from what was emitted cannot produce one. It also gets the
+inherited members for free, because scala-rs already writes a mixin
+forwarder onto the module for every concrete trait member. The Scala
+symbols are consulted only for the two questions the classfile cannot
+answer: which names are `protected` / `private[p]`, and which names the
+companion class uses.
+
+A classfile's constant pool is written when its builder is finished, so a
+companion class cannot be reopened to add forwarders later. The `class` and
+the `object` are emitted in source order and either may come first, so
+`Gen::finish_companion_class` **parks** a companion class's builder until
+its `object` has been emitted, and `Gen::deliver_companion_forwarders`
+finishes it then. `flush_parked_companions` writes out anything still
+parked at the end of the unit — a missing forwarder is bad, a dropped
+classfile is much worse. The only effect is where those classfiles sit in
+the output list; nothing reads that order.
+
+Emission is driven by the JVM descriptor (`companion_fwd::desc_slots`)
+rather than by `Type`, so the forwarder moves exactly the slots the target
+declares. That is also how the `Unit`-parameter and `Nothing`-result
+special cases in `jvm_slot_sort` / `emit_return` stop mattering here:
+`Lscala/runtime/BoxedUnit;` and `Lscala/runtime/Nothing$;` are references in
+a descriptor and nothing else needs saying.
+
+`add_static_forwarders` skips a method the target classfile already has
+under the same name and descriptor. A value class carries its
+`plus$extension` statics *and* has them declared on its companion, so
+without that guard `Meters.class` got a duplicate method and the JVM
+rejected the whole file.
+
+#### Measured
+
+`tests/scala_corpus.sh` at `CORPUS_SIZE=full`, before → after:
+`run` pass **433 → 442**, `pos` 965 and `neg` 634 unchanged, and a
+test-by-test diff shows **zero regressions**. The nine are `t363`, `t2127`,
+`t3487`, `t5037`, `t5894`, `t9178a`, `t9422`, `t9946b`, `t9946c`. Four more
+tests that used to say "main method not found" now fail further along, for
+reasons that have nothing to do with this (`t7448` declares `def main` with
+a non-`Unit` result, which is partest's business; `t8756`, `t9365` and
+`indylambda-boxing` reach their `main` and then hit a serialization, a cast
+and an output difference).
+
+#### Known gaps
+
+* **A member inherited from a superclass is not forwarded.** `object Test
+  extends Base` with `Base.fromBase` gets no `fromBase()` static, because
+  nothing is emitted onto `Test$` for it — the JVM finds it through the
+  superclass. Trait members are fine (they come through a mixin forwarder).
+  Closing this means going back to the symbol table for the superclass
+  chain, and building descriptors there; nothing in the corpus, slick or
+  gitbucket needed it.
+* **A case class with no written companion gets no forwarders.** nsc puts
+  `apply` / `unapply` / `tupled` / `curried` statics on `CC.class`;
+  `emit_case_companion` is not wired into this path. It emits an `apply`
+  bridge without `ACC_BRIDGE`, which would be forwarded as `public static
+  Object apply(Object, Object)` — something nsc never emits — so the bridge
+  wants marking before that path is turned on.

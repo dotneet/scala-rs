@@ -6,6 +6,7 @@ use crate::classfile::{
     ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
 };
 use crate::code::{Assembler, Label, StackEntry};
+use crate::companion_fwd::{self, DescSort, Forwarder};
 use crate::ifacebridge::{BinaryParents, BridgeKind};
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{Intrinsic, SeqPayload, SymKind, SymbolTable};
@@ -215,8 +216,11 @@ pub fn emit_opts(
             .class_by_name
             .unwrap_or_else(|| Rc::new(build_class_name_index(st))),
         binary_parents: opts.binary_parents,
+        companion_fwd: HashMap::new(),
+        parked_companions: Vec::new(),
     };
     g.walk(tree);
+    g.flush_parked_companions();
     g.emit_anon_classes(tree);
     debug_assert!(
         g.lambda_bodies.borrow().is_empty(),
@@ -264,6 +268,15 @@ struct Gen<'a> {
     /// Class files behind the run's binary parents (see
     /// [`Gen::emit_binary_parent_bridges`]).
     binary_parents: Option<Rc<BinaryParents>>,
+    /// Static forwarders a top-level `object` owes its companion class,
+    /// keyed by that class's JVM internal name. Filled by [`Gen::emit_module`]
+    /// and drained by [`Gen::finish_companion_class`] — the two run in source
+    /// order, so either one can come first.
+    companion_fwd: HashMap<String, Vec<companion_fwd::Forwarder>>,
+    /// Companion classes whose builder is complete but whose `object` has not
+    /// been emitted yet, so its forwarders are still unknown. A `Vec` rather
+    /// than a map to keep the emission order of everything else fixed.
+    parked_companions: Vec<(String, ClassBuilder)>,
 }
 
 /// JVM internal name → class-like symbol, for every `Class`/`ModuleClass` in
@@ -3053,7 +3066,7 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn emit_class(&mut self, tree: &Tree, _module_names: &HashSet<String>) {
+    fn emit_class(&mut self, tree: &Tree, module_names: &HashSet<String>) {
         let lambda_wm = self.lambda_watermark();
         let (name, mods, vparamss, impl_) = match &tree.kind {
             TreeKind::ClassDef {
@@ -3066,6 +3079,17 @@ impl<'a> Gen<'a> {
             _ => return,
         };
         let class_id = tree.sym;
+        // A top-level `class Test` with an `object Test` beside it is where
+        // that object's static forwarders go, so this classfile cannot be
+        // written until the object has been emitted. See
+        // [`Gen::finish_companion_class`]; the `object` may come either side
+        // of the class in the file.
+        let has_object = module_names.contains(name)
+            && !class_id.is_none()
+            && matches!(
+                self.st.get(self.st.get(class_id).owner).kind,
+                SymKind::Package | SymKind::NoSymbol
+            );
         let this_name = if class_id.is_none() {
             name.clone()
         } else {
@@ -3165,8 +3189,7 @@ impl<'a> Gen<'a> {
                 b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT | ACC_SYNTHETIC, &n, &d);
             }
             attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
-            self.out
-                .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
+            self.finish_companion_class(b, has_object);
             self.emit_trait_impl_class(tree, &this_name);
             // JVMS 4.6 forbids `ACC_FINAL` (and a body-less `ACC_STATIC`) on
             // an interface method, so nothing may hoist a `$anonfun$` into
@@ -3288,8 +3311,7 @@ impl<'a> Gen<'a> {
         self.emit_binary_parent_bridges(&mut b, class_id);
         self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
-        self.out
-            .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
+        self.finish_companion_class(b, has_object);
     }
 
     fn delayed_body_class(class_name: &str) -> String {
@@ -6570,20 +6592,9 @@ impl<'a> Gen<'a> {
         self.emit_lazy_accessors(&mut b, cls, &lazies);
         self.emit_val_getters(&mut b, &impl_.body);
 
-        let mut forwarded: Vec<(String, String, Type, Vec<Type>)> = Vec::new();
         for stt in &impl_.body {
             if matches!(stt.kind, TreeKind::DefDef { .. }) {
                 self.emit_def(&mut b, cls, stt);
-                if let TreeKind::DefDef { name, mods, .. } = &stt.kind {
-                    if !mods.flags.contains(Flags::PRIVATE) && !mods.flags.contains(Flags::NATIVE) {
-                        forwarded.push((
-                            name.clone(),
-                            def_method_desc(self.st, stt),
-                            method_ret_ty(stt),
-                            def_param_types(self.st, stt),
-                        ));
-                    }
-                }
             }
         }
         // An `object` mixing in a trait needs the same `T$class` forwarders a
@@ -6601,78 +6612,35 @@ impl<'a> Gen<'a> {
         self.emit_super_accessors(&mut b, cls);
         self.emit_mixin_forwarders(&mut b, cls, &impl_.body);
         self.emit_delayed_init_support(&mut b, cls, &impl_.body, true);
-        if !cls.is_none()
-            && extends_app(self.st, cls)
-            && !forwarded.iter().any(|(n, _, _, _)| n == "main")
-        {
-            forwarded.push((
-                "main".into(),
-                "([Ljava/lang/String;)V".into(),
-                Type::Unit,
-                vec![Type::Array(Box::new(Type::String))],
-            ));
+        // `object Main extends App`: `main` is the one forwarder the module's
+        // own method table cannot supply -- the body lives on the `App` trait
+        // and reaches the module through the interface, not through a method
+        // of its own. nsc's mirror class has it all the same.
+        let mut extra: Vec<(String, String)> = Vec::new();
+        if !cls.is_none() && extends_app(self.st, cls) {
+            extra.push(("main".into(), "([Ljava/lang/String;)V".into()));
         }
         self.emit_default_getters(&mut b, cls);
-        if !cls.is_none() {
-            for mid in self.st.get(cls).members.clone() {
-                let s = self.st.get(mid);
-                if s.kind != SymKind::Method || !s.name.contains("$default$") {
-                    continue;
-                }
-                if forwarded.iter().any(|(n, _, _, _)| n == &s.name) {
-                    continue;
-                }
-                let pts: Vec<Type> = if !s.params.is_empty() {
-                    s.params
-                        .iter()
-                        .map(|p| self.st.get(*p).ty.clone())
-                        .collect()
-                } else {
-                    match &s.ty {
-                        Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
-                        _ => vec![],
-                    }
-                };
-                let ret = match &s.ty {
-                    Type::Method { ret, .. } => (**ret).clone(),
-                    _ => Type::Any,
-                };
-                forwarded.push((
-                    s.name.clone(),
-                    jvm_method_desc(self.st, &pts, &ret),
-                    ret,
-                    pts,
-                ));
-            }
-        }
 
         // case-class companion: synthetic apply
+        let mut suppressed: HashSet<String> = HashSet::new();
         if let Some(class_id) = self.find_class_named(name) {
             if self.st.get(class_id).flags.contains(Flags::CASE)
                 && !impl_.body.iter().any(|t| t.name() == Some("apply"))
             {
                 emit_case_apply(&mut b, self.st, class_id);
-                let fields = self.st.get(class_id).ctor_fields.clone();
-                let pts: Vec<Type> = fields.iter().map(|f| self.st.get(*f).ty.clone()).collect();
-                let ret = Type::Class {
-                    sym: class_id,
-                    args: vec![],
-                };
-                // nsc emits no mirror-class forwarder for an `apply` that is
-                // not public. With `-Xsource-features:case-apply-copy-access`
-                // the `public static C apply(int)` on the case class itself
-                // disappears for both `private` and `private[p]`.
+                // nsc emits no forwarder for an `apply` that is not public.
+                // With `-Xsource-features:case-apply-copy-access` the `public
+                // static C apply(int)` on the case class itself disappears for
+                // both `private` and `private[p]`. `emit_case_apply` writes the
+                // method `public` either way, so the access has to be read off
+                // the symbol here.
                 let apply_sym = case_apply_sym(self.st, class_id);
-                let public_apply = apply_sym.is_none()
-                    || (!self.st.get(apply_sym).flags.contains(Flags::PRIVATE)
-                        && self.st.get(apply_sym).private_within.is_none());
-                if public_apply {
-                    forwarded.push((
-                        "apply".into(),
-                        jvm_method_desc(self.st, &pts, &ret),
-                        ret,
-                        pts,
-                    ));
+                if !apply_sym.is_none()
+                    && (self.st.get(apply_sym).flags.contains(Flags::PRIVATE)
+                        || self.st.get(apply_sym).private_within.is_some())
+                {
+                    suppressed.insert("apply".into());
                 }
             }
         }
@@ -6696,8 +6664,6 @@ impl<'a> Gen<'a> {
         self.emit_binary_parent_bridges(&mut b, cls);
         self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, cls, &self.pickles);
-        self.out
-            .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
 
         let top_level = if cls.is_none() {
             true
@@ -6707,17 +6673,41 @@ impl<'a> Gen<'a> {
                 SymKind::Package | SymKind::NoSymbol
             )
         };
-        // A package object needs its mirror class too. nsc compiles `package
-        // object p` to *two* classfiles, `p/package$.class` (the module) and
-        // `p/package.class` (the mirror), and the mirror is where it puts the
-        // `ScalaSignature`: `package$.class` carries only the bare `Scala`
-        // marker attribute. Without `p/package.class` a separately compiled
-        // consumer finds no pickle for the package object at all, and every
-        // one of its members is invisible -- real scalac reading a scala-rs
-        // build of a package object said `object twice is not a member of
-        // package myp.util` for each of them. See
-        // `docs/notes/companions-and-class-symbols.md`.
-        if !class_names.contains(name) && top_level {
+        // The forwarder set has to be read off `b` before the classfile is
+        // written, since that is the only complete list of what the module
+        // really carries -- `val` getters, a `var`'s setter, the mixin
+        // forwarders a trait's concrete members produce, all of which nsc
+        // forwards and none of which is a `DefDef` in the body.
+        let mut forwarded = if top_level {
+            self.module_forwarders(&b, cls, &extra)
+        } else {
+            Vec::new()
+        };
+        forwarded.retain(|f| !suppressed.contains(&f.name));
+        self.out
+            .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
+
+        if !top_level {
+            return;
+        }
+        if class_names.contains(name) {
+            // A companion class exists, so there is no mirror class: nsc puts
+            // the same forwarders on the companion's own classfile. Without
+            // them `object Test { def main(…) }` next to `class Test` left
+            // `Test.class` with no `main` at all and `java Test` could not
+            // start it (`scala/scala`'s `run/t363`).
+            self.deliver_companion_forwarders(strip_module_dollar(&this_name), forwarded);
+        } else {
+            // A package object needs its mirror class too. nsc compiles
+            // `package object p` to *two* classfiles, `p/package$.class` (the
+            // module) and `p/package.class` (the mirror), and the mirror is
+            // where it puts the `ScalaSignature`: `package$.class` carries
+            // only the bare `Scala` marker attribute. Without `p/package.class`
+            // a separately compiled consumer finds no pickle for the package
+            // object at all, and every one of its members is invisible -- real
+            // scalac reading a scala-rs build of a package object said `object
+            // twice is not a member of package myp.util` for each of them. See
+            // `docs/notes/companions-and-class-symbols.md`.
             self.emit_forwarder(&this_name, &forwarded, cls);
         }
     }
@@ -7196,39 +7186,11 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn emit_forwarder(
-        &mut self,
-        module_jvm: &str,
-        methods: &[(String, String, Type, Vec<Type>)],
-        class_id: SymbolId,
-    ) {
+    fn emit_forwarder(&mut self, module_jvm: &str, methods: &[Forwarder], class_id: SymbolId) {
         let fwd_name = strip_module_dollar(module_jvm);
         let mut b = ClassBuilder::new(fwd_name, self.source_name);
         b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
-        let module_desc = format!("L{module_jvm};");
-        for (name, desc, ret, params) in methods {
-            let mut locals = 0u16;
-            let mut loads = Vec::new();
-            for p in params {
-                let sort = jvm_slot_sort(p);
-                loads.push((locals, sort));
-                locals += sort.slots();
-            }
-            let max_locals = locals.max(1);
-            let ret = ret.clone();
-            let name = name.clone();
-            let desc = desc.clone();
-            let module_jvm = module_jvm.to_string();
-            let module_desc = module_desc.clone();
-            b.add_code(ACC_PUBLIC | ACC_STATIC, &name, &desc, max_locals, |asm| {
-                asm.getstatic(&module_jvm, "MODULE$", &module_desc);
-                for (slot, sort) in &loads {
-                    load(asm, *slot, *sort);
-                }
-                asm.invokevirtual(&module_jvm, &name, &desc);
-                emit_return(asm, &ret);
-            });
-        }
+        add_static_forwarders(&mut b, module_jvm, methods);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         // `class_id` is the module's own symbol: `fwd_name` (`Main`, no `$`)
         // never matches a symbol's own jvm name, so the self-entry lookup
@@ -7242,6 +7204,95 @@ impl<'a> Gen<'a> {
 
     fn find_class_named(&self, name: &str) -> Option<SymbolId> {
         self.class_by_name.get(name).copied()
+    }
+
+    /// nsc's `addForwarders`, for a top-level `object`: which of the methods
+    /// just emitted onto its module classfile become `public static`
+    /// pass-throughs on the classfile that carries the object's *plain* name.
+    /// See [`crate::companion_fwd`] for the rules and how they were measured.
+    ///
+    /// `extra` is what the old tree-driven list contributed and the method
+    /// table cannot: the `main` an `object … extends App` inherits.
+    fn module_forwarders(
+        &self,
+        b: &ClassBuilder,
+        module_class: SymbolId,
+        extra: &[(String, String)],
+    ) -> Vec<Forwarder> {
+        let companion = companion_fwd::companion_class_of(self.st, module_class);
+        let restricted = companion_fwd::restricted_names(self.st, module_class);
+        let conflicting =
+            companion_fwd::conflicting_names(self.st, companion.unwrap_or(SymbolId::NONE));
+        let mut out = companion_fwd::pick(&b.methods, &restricted, &conflicting);
+        for (name, desc) in extra {
+            let name = encode_method_name(name);
+            if conflicting.contains(&name) || restricted.contains(&name) {
+                continue;
+            }
+            if out.iter().any(|f| f.name == name && &f.desc == desc) {
+                continue;
+            }
+            out.push(Forwarder {
+                name,
+                desc: desc.clone(),
+            });
+        }
+        out
+    }
+
+    /// Hand a companion class the forwarders its `object` owes it. The two
+    /// are emitted in source order, so this is called both before and after
+    /// [`Gen::finish_companion_class`] has seen the class.
+    fn deliver_companion_forwarders(&mut self, class_jvm: String, fwd: Vec<Forwarder>) {
+        match self
+            .parked_companions
+            .iter()
+            .position(|(n, _)| *n == class_jvm)
+        {
+            Some(i) => {
+                let (_, mut b) = self.parked_companions.remove(i);
+                add_static_forwarders(&mut b, &format!("{class_jvm}$"), &fwd);
+                self.out
+                    .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
+            }
+            None => {
+                self.companion_fwd.insert(class_jvm, fwd);
+            }
+        }
+    }
+
+    /// Write a class that may be the companion of a top-level `object`. When
+    /// it is, and the `object` has not been emitted yet, the builder waits in
+    /// `parked_companions` until it has — a classfile cannot be reopened once
+    /// its constant pool is written.
+    fn finish_companion_class(&mut self, mut b: ClassBuilder, has_object: bool) {
+        if !has_object {
+            self.out
+                .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
+            return;
+        }
+        let this_name = b.this_name.clone();
+        match self.companion_fwd.remove(&this_name) {
+            Some(fwd) => {
+                add_static_forwarders(&mut b, &format!("{this_name}$"), &fwd);
+                self.out
+                    .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
+            }
+            None => self.parked_companions.push((this_name, b)),
+        }
+    }
+
+    /// Write out any companion class still waiting for an `object` that never
+    /// arrived. Nothing should normally be left here, but a dropped classfile
+    /// is a far worse failure than a missing forwarder.
+    fn flush_parked_companions(&mut self) {
+        for (name, mut b) in std::mem::take(&mut self.parked_companions) {
+            if let Some(fwd) = self.companion_fwd.remove(&name) {
+                add_static_forwarders(&mut b, &format!("{name}$"), &fwd);
+            }
+            self.out
+                .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
+        }
     }
 }
 
@@ -7690,6 +7741,60 @@ fn emit_field_ne_jump(asm: &mut Assembler, ty: &Type, no: crate::code::Label) {
             );
             asm.ifeq(no);
         }
+    }
+}
+
+/// `public static` pass-throughs to `module_jvm`'s `MODULE$`, added to a
+/// mirror class or to a companion class.
+///
+/// Driven by the JVM descriptor rather than by `Type`, so the forwarder moves
+/// exactly the slots the target method declares whatever the front end thinks
+/// they mean. A descriptor that will not parse, or a method the class already
+/// has under the same signature (a value class's `$extension` statics live on
+/// the class *and* on the companion), is skipped: a duplicate method makes the
+/// whole classfile unloadable.
+fn add_static_forwarders(b: &mut ClassBuilder, module_jvm: &str, methods: &[Forwarder]) {
+    let module_desc = format!("L{module_jvm};");
+    for f in methods {
+        let Some((loads, max_locals, ret)) = companion_fwd::desc_slots(&f.desc) else {
+            continue;
+        };
+        let encoded = encode_method_name(&f.name);
+        if b.methods
+            .iter()
+            .any(|m| m.name == encoded && m.desc == f.desc)
+        {
+            continue;
+        }
+        let target = f.name.clone();
+        let target_desc = f.desc.clone();
+        let module_jvm = module_jvm.to_string();
+        let module_desc = module_desc.clone();
+        b.add_code(
+            ACC_PUBLIC | ACC_STATIC,
+            &f.name,
+            &f.desc,
+            max_locals,
+            move |asm| {
+                asm.getstatic(&module_jvm, "MODULE$", &module_desc);
+                for (slot, sort) in &loads {
+                    load(asm, *slot, jvm_sort_of(*sort));
+                }
+                asm.invokevirtual(&module_jvm, &target, &target_desc);
+                ret_of_sort(asm, jvm_sort_of(ret));
+            },
+        );
+    }
+}
+
+fn jvm_sort_of(sort: DescSort) -> JvmSort {
+    match sort {
+        DescSort::Int => JvmSort::Int,
+        DescSort::Long => JvmSort::Long,
+        DescSort::Float => JvmSort::Float,
+        DescSort::Double => JvmSort::Double,
+        DescSort::Ref => JvmSort::Ref,
+        DescSort::Void => JvmSort::Void,
     }
 }
 

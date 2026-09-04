@@ -2,6 +2,7 @@
 
 pub mod classfile;
 pub mod code;
+mod companion_fwd;
 pub mod gen;
 pub mod ifacebridge;
 pub mod load;
