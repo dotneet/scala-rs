@@ -6358,6 +6358,17 @@ impl<'a> Gen<'a> {
         let TreeKind::ClassDef { impl_, .. } = &class_tree.kind else {
             return;
         };
+        // Only where `value_companion::add_value_class_companions` declared
+        // one, so the classfile and the pickle always agree. It declines the
+        // shapes SLS 3.2.10 forbids and we do not yet reject -- a value class
+        // that is local, or a member of a class rather than of an object.
+        let Some(comp) = self
+            .st
+            .companion_module(class_id)
+            .map(|m| module_class_id(self.st, m))
+        else {
+            return;
+        };
         let this_name = format!("{}$", class_internal(self.st, class_id));
         let mut b = ClassBuilder::new(this_name.clone(), self.source_name);
         b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
@@ -6366,10 +6377,7 @@ impl<'a> Gen<'a> {
             name: "MODULE$".into(),
             desc: format!("L{this_name};"),
         });
-        let comp = self
-            .st
-            .companion_module(class_id)
-            .map(|m| module_class_id(self.st, m));
+        let comp = Some(comp);
         self.emit_module_init(&mut b, comp.unwrap_or(class_id), &[], &[], None, comp);
         self.emit_module_clinit(&mut b);
         self.emit_value_extension_forwarders(&mut b, class_id, &impl_.body);

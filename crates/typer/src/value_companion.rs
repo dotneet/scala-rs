@@ -57,7 +57,16 @@ pub fn add_value_class_companions(tree: &Tree, st: &mut SymbolTable) {
 /// `def` with a body, constructors excluded.
 fn collect_value_classes(tree: &Tree, st: &SymbolTable, out: &mut Vec<(SymbolId, Vec<SymbolId>)>) {
     if let TreeKind::ClassDef { impl_, .. } = &tree.kind {
-        if !tree.sym.is_none() && st.is_value_class(tree.sym) {
+        // Only where `gen::walk_stats` emits the companion classfile: a value
+        // class is top-level or a member of an object (SLS 3.2.10), and
+        // declaring one for anything else would put a class in the pickle
+        // that no classfile answers to.
+        let owner_ok = !tree.sym.is_none()
+            && matches!(
+                st.get(st.get(tree.sym).owner).kind,
+                SymKind::Package | SymKind::ModuleClass | SymKind::NoSymbol
+            );
+        if owner_ok && st.is_value_class(tree.sym) {
             let mut methods = Vec::new();
             for stt in &impl_.body {
                 let TreeKind::DefDef { name, rhs, .. } = &stt.kind else {

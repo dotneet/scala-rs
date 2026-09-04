@@ -325,12 +325,13 @@ scala-rs and by real scalac, in `crates/cli/tests/e2e.rs`.
   template's `DefDef`s alone. It costs nothing through the pickle -- a
   Scala consumer reads the accessor off the module -- so it only shows up
   from Java. Pre-existing and not specific to package objects; left alone.
-* **Two pre-existing pickle gaps found while probing, unrelated to value
-  classes** (both reproduce on plain classes on `main`): an operator-named
-  **method** is not visible to scalac through our pickle (`value ~ is not a
-  member of myw.Plain`), and a module's **nested class-like members** are
-  not either (`type Inner is not a member of object Box`, `value Sym is not
-  a member of object Box`). Neither is about missing classfiles -- the
-  classfiles are written, with the right names -- so neither was touched
-  here, but both block separate compilation the same way the three roots
-  above did.
+* **An operator-named *method* is not visible to scalac through our
+  pickle**: `class Plain(val v: Int) { def ~(o: Int): String }` compiled by
+  scala-rs and used by scalac gives `value ~ is not a member of
+  myw.Plain`. Pre-existing, reproduces on a plain class, and not about
+  missing classfiles -- the classfile is written and the method is in it
+  under the right encoded name -- so it was not touched here, but it blocks
+  separate compilation the same way the three roots above did. (A module's
+  **nested class-like members** had the same shape of problem and were
+  fixed on `main` by `ceb9b38`, `agent/testkit2`, while this slice was in
+  progress; `object Box { class Inner }` now reaches scalac.)
