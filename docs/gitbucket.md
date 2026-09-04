@@ -86,9 +86,9 @@ honest reading of "35" is "0 files typechecked"; the honest reading of "3261"
 is "353 files typechecked, 97 of them clean".
 
 Of the 2545, 2216 are in the 116 hand-written files that still have errors (of
-213 measured) and 329 are in 95 of the 140 generated templates. The
-hand-written figure has not moved since the survey: every error removed so far
-after it was in a template.
+213 measured) and 322 — down from 1038 — are in 95 of the 140 generated
+templates. The hand-written figure has not moved since the survey: every error
+removed since then was in a template.
 
 The worst hand-written files are `controller/AccountController.scala` (257),
 `service/IssuesService.scala` (123),
@@ -237,7 +237,8 @@ The two are independent, and each alone leaves the templates broken. Together:
 grouped under this root — 443 `ambiguous overload for _display_`, 151
 `type mismatch; found: T required: Appendable` and 113 `no matching overload
 for (Html)(Context)Appendable` — went to **zero**. The 716 removed are all in
-the generated templates; the hand-written count is unchanged at 2216.
+the generated templates (1038 → 322); the hand-written count is unchanged at
+2216.
 
 The reproduction is one file against the real `twirl-api` jar, and does not
 need gitbucket or sbt:
