@@ -3784,6 +3784,33 @@ encode 済みの名前を通しても変わらないので、既存の合成フ�
 `grep -A 2 '^error'` を先に噛ませて、**エラーの直後の `-->` 行だけ**を見る
 ようにしました。
 
+### Running the slick that scala-rs compiled (`agent/slickrun`)
+
+`slick_measure.sh` counts type errors and `slick_subset.sh` loads every emitted
+class file under `-Xverify:all`. Neither runs a single instruction of slick.
+`tests/slick_run.sh` does: it builds slick twice (scala-rs and real scalac),
+compiles the client programs in `tests/slick_progs/` **once** with real scalac,
+and runs that one client binary against each slick build, comparing stdout byte
+for byte. The client binary is identical in both runs, so any difference is
+slick's class files -- i.e. scala-rs. The programs are ordinary slick usage
+against an in-memory H2: table definitions, `schema.create`, `+=`/`++=`,
+`filter`/`map`/`sortBy`/`groupBy`/joins, `Option` columns, updates, deletes,
+`transactionally`, plain SQL, `MappedColumnType`, `Compiled`, `<>` and `mapTo`;
+each prints the generated SQL as well as the rows.
+
+At the time of writing **no client program runs to completion on the scala-rs
+build yet**, but the failure has moved from the first line of any slick program
+(`TableQuery[...]` failed verification) to deep inside slick's query compiler.
+Eleven distinct run-time defects were found and fixed this way; the regression
+fixture is `tests/fixtures/slickrun.scala` (`crates/cli/tests/slickrun.rs`),
+which lists them. Numbers: `tests/slick_measure.sh` → `files=184 errors=0
+classes=4562`, `tests/slick_subset.sh` → `verified=4562 failed=0`.
+
+The remaining blocker is structural: a class that implements a *library*
+collection trait gets no mixin forwarders, so `iterableFactory` on an anonymous
+`immutable.IndexedSeq` resolves to `Iterable`'s default and `groupBy` builds a
+`List` where the static type says `IndexedSeq`.
+
 ## 実装していないもの
 
 次は実装していません。スタブで「動いたことにする」こともしていません。言語側の残りとライブラリ側の残りを分けます。

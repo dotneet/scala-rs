@@ -655,6 +655,11 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     // `Ordering[T] <: PartialOrdering[T] <: Equiv[T]` と `object Equiv` の
     // implicit instance。`Equiv` のコンパニオン別名が上の行で入ってから。
     crate::prelude_eqtail::install(st, library_abi);
+    // `3.compare(4)`: give `RichInt` and friends a `compare`. Without it the
+    // search falls through to the `Ordered.orderingToOrdered` view, whose
+    // conversion never got materialised -- a `checkcast scala/math/Ordered`
+    // landed on an `int`.
+    crate::prelude_richcmp::install_rich_compare(st);
 }
 
 /// Prelude classes are owned by `scala` but carry their real JVM package
