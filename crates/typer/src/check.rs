@@ -212,11 +212,17 @@ pub struct Typer {
     /// type comes out of a jar, where members are read one name at a time and
     /// a wildcard asks for no name in particular.
     ///
-    /// In such a file an unresolved type name is not evidence of anything —
+    /// In such a file an unresolved type name is not evidence of anything --
     /// gitbucket writes `import gitbucket.core.model.Profile.profile.blockingApi._`
     /// and then `def f(implicit s: Session)`, and `Session` is a type member
     /// reached through that path. See [`Typer::with_strict_sig_names`].
     opaque_import_files: HashSet<usize>,
+    /// A member's signature was taken back to be built again. See
+    /// `Typer::leave_sig_for_body_pass`.
+    sig_deferred: bool,
+    /// The signature pass is on its second and last round, so a signature that
+    /// still does not resolve stays as it is and reports.
+    sig_final_round: bool,
     pub(crate) file_index: usize,
     /// The text of each unit, by `file_index`.
     ///
@@ -644,6 +650,25 @@ pub fn typecheck_units_src(
             t.file_index = *file_index;
             t.typer(tree);
         }
+        // A member written under an `import` whose prefix only another unit's
+        // signature settles cannot be built on the round above, whichever
+        // order the units are in: gitbucket's `trait AccountService { import
+        // gitbucket.core.model.Profile.profile.blockingApi._; def
+        // getAccountByUserName(…)(implicit s: Session) }` needs `Profile`'s
+        // own signatures. `leave_sig_for_body_pass` takes such a member back;
+        // this round builds it with every unit's signatures in place. It has
+        // to happen before *any* body is typed, because a caller's unit may
+        // come first on the command line -- gitbucket's `controller/` sorts
+        // before `service/` -- and would otherwise read the signature that was
+        // taken back.
+        if t.sig_deferred {
+            t.sig_final_round = true;
+            for (tree, file_index) in units.iter_mut() {
+                t.file_index = *file_index;
+                t.typer(tree);
+            }
+            t.sig_final_round = false;
+        }
         t.sigs_only = false;
     }
     // Default arguments are bodies, not signatures: typing them during the
@@ -680,6 +705,8 @@ impl Typer {
             import_prefix_failed: HashSet::new(),
             import_prefix_missed: false,
             opaque_import_files: HashSet::new(),
+            sig_deferred: false,
+            sig_final_round: false,
             file_index,
             sources: Vec::new(),
             gensym: 0,
@@ -2533,8 +2560,7 @@ impl Typer {
         };
         for stt in body.iter_mut() {
             if !matches!(stt.kind, TreeKind::TypeDef { .. }) {
-                self.type_member_sig(stt);
-                self.leave_sig_for_body_pass(stt);
+                self.type_member_sig_deferrable(stt);
             }
         }
         self.import_prefix_missed = saved_missed;
@@ -2792,8 +2818,7 @@ impl Typer {
         self.finish_type_aliases(body);
         for stt in body.iter_mut() {
             if !matches!(stt.kind, TreeKind::TypeDef { .. }) {
-                self.type_member_sig(stt);
-                self.leave_sig_for_body_pass(stt);
+                self.type_member_sig_deferrable(stt);
             }
         }
         self.import_prefix_missed = saved_missed;
@@ -3779,29 +3804,57 @@ impl Typer {
     /// `import` above it did not resolve on this pass.
     ///
     /// See [`Typer::sig_rerun_safe`] for why, and for what "again" is safe on.
-    fn leave_sig_for_body_pass(&mut self, tree: &Tree) {
+    /// `mark` is `self.diags.len()` from just before this member's signature
+    /// was built: what that build reported is rolled back with it, because
+    /// the build itself is being taken back. The round that builds it again
+    /// reports whatever is still wrong then.
+    ///
+    /// The rebuild is a *second signature round* over every unit, not the body
+    /// pass, and the difference is the whole point of it. A caller is not
+    /// obliged to come after the callee on the command line: gitbucket's
+    /// `controller/` sorts before `service/`, so a controller's body is typed
+    /// before the service it calls has been rebuilt, and the call still saw
+    /// the broken signature. A pass that finishes every unit's signatures
+    /// before any body is typed does not depend on that order.
+    fn leave_sig_for_body_pass(&mut self, tree: &Tree, mark: usize) {
         if !self.sigs_only
+            || self.sig_final_round
             || !self.import_prefix_missed
             || tree.id == scala_rs_parser::NodeId(0)
-            || !Self::sig_rerun_safe(tree)
+            || !self.sig_rerun_safe(tree, mark)
         {
             return;
         }
+        self.diags.truncate(mark);
+        self.sig_deferred = true;
         self.sig_done.remove(&(self.file_index, tree.id));
+    }
+
+    /// Type this member's signature, and take the whole attempt back -- the
+    /// `sig_done` mark and the diagnostics both -- when an `import` above it
+    /// did not resolve on this pass.
+    fn type_member_sig_deferrable(&mut self, tree: &mut Tree) {
+        let mark = self.diags.len();
+        self.type_member_sig(tree);
+        self.leave_sig_for_body_pass(tree, mark);
     }
 
     /// Whether this member's signature can simply be built again.
     ///
-    /// Only a `val`. Its signature is its written type and nothing else, so
-    /// resolving it a second time in the same scope is idempotent. A `def` is
-    /// not: `type_def_sig` allocates fresh symbols for the method's type
-    /// parameters and replaces `tparams` with them, so a second run leaves
-    /// every type already built out of the first run's parameters pointing at
-    /// symbols the method no longer has -- slick's
+    /// A `val`'s signature is its written type and nothing else, so resolving
+    /// it a second time in the same scope is idempotent. A `def` was excluded
+    /// until now because `type_def_sig` is not: it *appends* the implicit
+    /// clause a view or context bound desugars to, so a second run built a
+    /// second one and re-typed the first as an ordinary clause whose
+    /// parameters have no written type -- slick's
     /// `ShapedValue.mapToImpl[R, U](c: blackbox.Context …)` went from clean to
-    /// `not found: type Expr` and 19 more when defs were included here. It
-    /// also synthesizes evidence parameters and default getters, which must
-    /// not happen twice.
+    /// `not found: type Expr` and 19 more. `drop_synthesized_evidence` removes
+    /// that clause on the way in, which is what makes the second run mean the
+    /// same as the first. The method's type parameters are *not* reallocated:
+    /// `enter_tparams` keeps a `tp.sym` that is already set, so types built
+    /// out of the first run still name the parameters the method has. The
+    /// default getters `synthesize_default_getters` writes are guarded by a
+    /// lookup on the owner and are not written twice.
     ///
     /// Used when an `import` in the enclosing template named a prefix this
     /// pass could not resolve. `import profile.api._` with
@@ -3813,8 +3866,32 @@ impl Typer {
     /// the run. An implicit whose type is an error fits *every* implicit
     /// search. The body pass, by which time every unit has its signatures, is
     /// where such a member should be built.
-    fn sig_rerun_safe(tree: &Tree) -> bool {
-        matches!(&tree.kind, TreeKind::ValDef { .. })
+    ///
+    /// The `def` half is gitbucket's `trait AccountFederationComponent {
+    /// self: Profile => import profile.api._; def byPrimaryKey(…): Rep[Boolean] }`
+    /// -- 36 `not found: type Rep`, and the `(implicit s: Session)` that every
+    /// caller of such a service then could not satisfy.
+    ///
+    /// A `def` is only rebuilt when this attempt actually *reported*
+    /// something (`self.diags.len() > mark`). A `val` is rebuilt either way,
+    /// which is what root 11 needed and what the numbers were taken on;
+    /// widening that to every `def` in every template below the first
+    /// unresolved prefix in the run -- `import_prefix_missed` is never
+    /// cleared once set -- rebuilt thousands of healthy signatures and cost
+    /// more than it gained (measured on gitbucket: the intended 36
+    /// `not found: type Rep` went, and 27 `value group is not a member of
+    /// Match` and 13 `missing parameter type for expanded function` arrived).
+    fn sig_rerun_safe(&self, tree: &Tree, mark: usize) -> bool {
+        match &tree.kind {
+            TreeKind::ValDef { .. } => true,
+            // A constructor's parameters are the class's fields and are shared
+            // with `type_class`, which builds them itself; only a plain method
+            // is rebuilt here.
+            TreeKind::DefDef { name, .. } => {
+                name != "<init>" && (self.diags.len() > mark || type_mentions_unresolved(&tree.ty))
+            }
+            _ => false,
+        }
     }
 
     fn type_member_sig(&mut self, tree: &mut Tree) {
@@ -4084,6 +4161,7 @@ impl Typer {
 
     pub(crate) fn type_def_sig(&mut self, tree: &mut Tree) {
         let span = tree.span;
+        Self::drop_synthesized_evidence(tree);
         let (tparams, vparamss, tpt, name, mods_within, mods_flags, is_conv) = match &mut tree.kind
         {
             TreeKind::DefDef {
@@ -4423,6 +4501,37 @@ impl Typer {
             }
         }
         let _ = name;
+    }
+
+    /// Undo the one edit `type_def_sig` makes to its own input.
+    ///
+    /// A view or context bound desugars to an extra implicit clause that is
+    /// *appended to* `vparamss`. Building the same signature a second time --
+    /// which `leave_sig_for_body_pass` asks for when an `import` above the
+    /// method did not resolve on the signature pass -- would append a second
+    /// copy, and worse, re-type the first as an ordinary clause: a synthesized
+    /// evidence parameter carries its type on the symbol and writes none in
+    /// the tree, so `type_def_sig` would report `missing parameter type for
+    /// evidence$1` for a bound the source never wrote. The bounds themselves
+    /// live on the type parameters and are untouched, so dropping the clause
+    /// here loses nothing -- it is rebuilt below from the same `view_work` /
+    /// `ctx_work`.
+    ///
+    /// A parameter with no written type cannot occur in source, so the shape
+    /// identifies the clause on its own.
+    fn drop_synthesized_evidence(tree: &mut Tree) {
+        let TreeKind::DefDef { vparamss, .. } = &mut tree.kind else {
+            return;
+        };
+        while vparamss.last().is_some_and(|clause| {
+            !clause.is_empty()
+                && clause.iter().all(|p| {
+                    matches!(&p.kind, TreeKind::ValDef { name, tpt, .. }
+                        if name.starts_with("evidence$") && tpt.is_empty())
+                })
+        }) {
+            vparamss.pop();
+        }
     }
 
     fn synthesize_default_getters(
@@ -24151,6 +24260,49 @@ impl Typer {
             return Some(msg);
         }
         None
+    }
+}
+
+/// Whether a built signature still contains a name that resolved to nothing.
+///
+/// `Type::Named` is what `resolve_type_name` hands back when the lookup found
+/// no symbol at all, and `Type::Error` is a name that was also *reported*. The
+/// two are not interchangeable, and the difference is why a `def` cannot be
+/// judged by its diagnostics alone: a bare `Ident` in a parameter position is
+/// not under [`Typer::strict_type_names`], so `def f(implicit s: Session)`
+/// written under an import that has not resolved yet silently becomes
+/// `Named { "Session" }` and says nothing, while `Rep[Boolean]` in the same
+/// signature is an `AppliedTypeTree` and does report. gitbucket shows both
+/// halves of that, from the very same methods: 36 `not found: type Rep` at the
+/// definitions, and 187 `could not find implicit value of type Session` at
+/// their callers -- an implicit search for a placeholder cannot succeed.
+///
+/// `NoType` is deliberately not "unresolved": a `def` with no written result
+/// type has one until `lazysig` completes it, and that is the normal state of
+/// most method bodies.
+fn type_mentions_unresolved(ty: &Type) -> bool {
+    match ty {
+        Type::Named { .. } | Type::Error => true,
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => type_mentions_unresolved(t),
+        Type::Tuple(ts) | Type::Overload(ts) => ts.iter().any(type_mentions_unresolved),
+        Type::Function { params, ret } => {
+            params.iter().any(type_mentions_unresolved) || type_mentions_unresolved(ret)
+        }
+        Type::Method { paramss, ret } => {
+            paramss.iter().flatten().any(type_mentions_unresolved) || type_mentions_unresolved(ret)
+        }
+        Type::Class { args, .. } => args.iter().any(type_mentions_unresolved),
+        Type::Applied { ctor, args } => {
+            type_mentions_unresolved(ctor) || args.iter().any(type_mentions_unresolved)
+        }
+        Type::BoundedWildcard { lo, hi } => {
+            lo.as_deref().is_some_and(type_mentions_unresolved)
+                || hi.as_deref().is_some_and(type_mentions_unresolved)
+        }
+        Type::SingleType { prefix, .. } => type_mentions_unresolved(prefix),
+        Type::Annotated { tpe, .. } => type_mentions_unresolved(tpe),
+        Type::Refined { parents, .. } => parents.iter().any(type_mentions_unresolved),
+        _ => false,
     }
 }
 

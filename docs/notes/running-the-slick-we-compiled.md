@@ -1246,3 +1246,26 @@ descriptors (only a separately compiled caller links against them, and
 `scala.None$` is the inferred one), the module accessor behind the trait's
 `$outer`, the absence of a forwarder on the anonymous subclass, and the
 case-class companion accessor on a trait and its implementor.
+
+## `p03_joins` is flaky under load (2026-09-05)
+
+`agent/lazysig2` saw `RUN-FAIL p03_joins rs=1 scalac=0` twice while the
+machine was also running `cargo build`, and 12/12 on the next run of the same
+script with the same binary. What the failure looks like:
+
+* `a.out` and `b.out` are **byte-identical** and complete — every line the
+  program prints, including the last.
+* `a.err` holds nothing but SLF4J's "no providers" warning. No exception.
+* Only the exit status differs, and only for the scala-rs-built run.
+
+It is not a compiler difference. Compiling slick five times with one binary
+gives a byte-identical class tree (`find -name '*.class' | sort | xargs cat |
+md5`), and running the client classfiles 12 times against the scala-rs build
+and 12 against the scalac build gives 24 clean exits. `p03_joins` is the only
+program that uses `cats.effect.unsafe.implicits.global`, whose runtime installs
+a shutdown hook; a shutdown that does not finish in time is the obvious
+suspect, and it only misses under load.
+
+**Before treating a `RUN-FAIL` here as a regression, check whether `a.out`
+and `b.out` are identical.** If they are, the compiler produced a working
+program and the harness caught a shutdown, not a bug.

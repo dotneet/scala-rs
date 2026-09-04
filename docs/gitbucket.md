@@ -78,7 +78,8 @@ path of your own.**
 | After the first survey | 353 | 1 | **3261** | 256 | 0 |
 | main at `56174d5` (Twirl, the two slick-run slices and scalalib merged) | 353 | 1 | **2373** | 188 | 0 |
 | main at `1a494fb` (the five slick-through-the-jar roots merged) | 353 | 1 | **1859** | 186 | 0 |
-| Now | 353 | 1 | **1693** | 186 | 0 |
+| main at `cad281b` | 353 | 1 | **1693** | 186 | 0 |
+| Now (root 16, the `def` signatures) | 353 | 1 | **1391** | 184 | 0 |
 
 Every row after the second was measured on the same tree, with the same
 material, one binary each -- `SCALA_RS=<binary> tests/gitbucket_measure.sh`
@@ -91,18 +92,18 @@ nothing in gitbucket had been typechecked at all. This is exactly what
 honest reading of "35" is "0 files typechecked"; the honest reading of "3261"
 is "353 files typechecked, 97 of them clean".
 
-Of the 1693, **1529** are in 114 hand-written files (of 213 measured) and
+Of the 1391, **1227** are in 111 hand-written files (of 213 measured) and
 **164** — down from 1038, and unchanged since — are in 73 of the 140 generated
 templates.
 
-The worst hand-written files are `controller/AccountController.scala` (179),
-`controller/SystemSettingsController.scala` (94),
-`service/IssuesService.scala` (91) and
-`controller/RepositoryViewerController.scala` (64).
+The worst hand-written files are `controller/AccountController.scala` (124),
+`service/IssuesService.scala` (83),
+`controller/RepositoryViewerController.scala` (54) and
+`controller/SystemSettingsController.scala` (47).
 
 ## What was wrong, and what it cost
 
-Fifteen roots. Fourteen are fixed; the counts are what each was worth when it
+Sixteen roots. Fifteen are fixed; the counts are what each was worth when it
 was removed.
 
 ### 1. An operator swallowed the comment that followed it (lexer)
@@ -371,11 +372,12 @@ import is looked at. Two halves here:
   *unit's* signature pass settles (gitbucket's components reach `profile`
   through `self: Profile =>`, and `Profile.scala` is nowhere near the front of
   the command line): when an import prefix did not resolve, the template's
-  `val` signatures are left for the body pass to build. Only `val`s —
-  `type_def_sig` allocates fresh symbols for a method's type parameters, so
-  running it twice leaves types built from the first run pointing at symbols
-  the method no longer has (slick's `ShapedValue.mapToImpl` went from clean to
-  `not found: type Expr` and 19 more when `def`s were included).
+  `val` signatures are left to be built again. Only `val`s at the time —
+  running `type_def_sig` twice took slick's `ShapedValue.mapToImpl` from clean
+  to `not found: type Expr` and 19 more. That was blamed on the method's type
+  parameters being reallocated; it was actually the implicit clause a context
+  bound desugars to being appended twice, and root 16 below covers the `def`
+  half.
 
 Compiling gitbucket's 46 `model/` sources with `Profile.scala` moved to the
 front of the command line is what showed the size of it: 281 errors → 187,
@@ -503,6 +505,116 @@ survivor deferred tells `check_missing_implementations` that nothing
 implements it. Whoever needs the deferred bit — and item 4 below probably
 does — has to fix the collapse first.
 
+### 16. A `def` signature under an import only another unit settles — 302 errors
+
+The `val` half of this is root 11 above. The `def` half is the same sentence
+with one word changed, and it was worth almost twice as much:
+
+```scala
+// service/AccountService.scala, and 25 more like it
+import gitbucket.core.model.Profile.profile.blockingApi._
+
+trait AccountService {
+  def getAccountByUserName(userName: String, includeRemoved: Boolean = false)(
+    implicit s: Session
+  ): Option[Account] = ...
+}
+```
+
+```scala
+// model/AccountFederation.scala, and 20 more like it
+trait AccountFederationComponent { self: Profile =>
+  import profile.api._
+  class AccountFederations(tag: Tag) extends Table[...](tag, "ACCOUNT_FEDERATION") {
+    def byPrimaryKey(issuer: String, subject: String): Rep[Boolean] = ...
+  }
+}
+```
+
+`profile` is settled by `model/Profile.scala`'s signature pass, which has not
+run when these are typed, so `import_prefix` gave up and `sig_done` made that
+permanent. `Typer::leave_sig_for_body_pass` already took such a member back to
+be built again, but only a `val`. Three separate things had to be true before a
+`def` could join it, and the previous slice stopped at the first:
+
+1. **`type_def_sig` was not idempotent.** A view or context bound desugars to
+   an implicit clause that `type_def_sig` **appends** to `vparamss`. Building
+   the signature twice appended a second one *and* re-typed the first as an
+   ordinary clause — where a synthesized evidence parameter has no written
+   type at all, so it reported `missing parameter type for evidence$1` for a
+   bound the source never wrote. That is what took slick's
+   `ShapedValue.mapToImpl[R, U]` from clean to 20 errors when `agent/slickimpl`
+   tried this. `Typer::drop_synthesized_evidence` removes the clause on the way
+   in; the bounds are still on the type parameters, so it is rebuilt from the
+   same `view_work` / `ctx_work`. Nothing else in `type_def_sig` needed
+   changing: `enter_tparams` already keeps a `tp.sym` that is set, so the
+   method's type parameters are *not* reallocated, and
+   `synthesize_default_getters` is guarded by a lookup on the owner. The
+   earlier note that the type parameters were the obstacle was wrong.
+
+2. **The withdrawn attempt's diagnostics outlived it.** `sig_done` was removed
+   and nothing else was, so `val empty: Rep[Int]` still said
+   `not found: type Rep` even though the rebuild resolved it. On its own this
+   is worth **−2** on gitbucket (measured), which is the honest size of it: it
+   corrects the message, not the type.
+
+3. **The rebuild was too late.** It was left to the *body* pass, which only
+   helps when the caller's unit comes after the callee's on the command line.
+   `find | sort` puts gitbucket's `controller/` before `service/`, so every
+   controller was typed against the signature that had been taken back. The
+   rebuild is now a **second signature round over every unit**, run before any
+   body is typed, so it does not depend on that order at all.
+
+A `def` is rebuilt when its first attempt reported something **or** when the
+signature it produced still mentions an unresolved `Type::Named`. The second
+condition is what the `Session` diagnostics needed, and it is worth stating
+plainly because it is a trap:
+
+> A bare `Ident` in a parameter position is not under
+> `Typer::strict_type_names`. An unresolved one becomes the placeholder
+> `Type::Named { name }` and **reports nothing**. `Rep[Boolean]` in the same
+> signature is an `AppliedTypeTree` and does report.
+
+So one method, `def byPrimaryKey(...): Rep[Boolean]` next to
+`def getAccountByUserName(...)(implicit s: Session)`, split its symptoms across
+two message shapes and two parts of the tree: 36 `not found: type Rep` at the
+definitions, and 187 `could not find implicit value of type Session` at the
+callers, because an implicit search for a placeholder cannot succeed. The
+survey below had them as two entries of one root and was right.
+
+Both the previous survey's reading of the 187 (**"a bare `Session` is what an
+unresolved name looks like"**) and its count were right this time: `Named {
+name: "Session", args: [] }` is exactly what a debug print at the failing
+search showed.
+
+Widening the rule to rebuild *every* `def` regardless is worse, and was
+measured: 1693 → 1685, with 27 new `value group is not a member of Match` and
+13 new `missing parameter type for expanded function`. Rebuilding a signature
+that was already right is not free.
+
+Cost of the extra signature round: **+2%** user CPU on gitbucket's 353 files,
+**+9%** on slick's 184. It only runs when something was actually taken back.
+
+Found on the way, and **not** fixed — a separate codegen bug, which is why
+`crates/cli/tests/lazysig2.rs` writes `List(...)` where it would rather call a
+member of `api`:
+
+```scala
+class MyProfile { object api { def bind[T](x: T): List[T] = List(x) } }
+trait Prof { val profile: MyProfile }
+trait Comp { self: Prof =>
+  import profile.api._
+  def wrap(x: String): List[String] = bind(x)   // ClassCastException
+}
+object Runner extends Comp with Prof { val profile: MyProfile = new MyProfile }
+```
+
+`Comp$class.wrap` is emitted with `this` as the receiver of `bind` and casts it
+to `MyProfile`: `class plib.Runner$ cannot be cast to class plib.MyProfile`.
+Types fine, verifies fine, dies at run time — one more entry for the list of
+what each check proves. It reproduces with the two units in **either** order,
+so it has nothing to do with the signature phase.
+
 ### The crash: `lub` had no depth cap
 
 `JGitUtil.scala` **aborted the compiler with a stack overflow and no
@@ -540,44 +652,36 @@ in a block inside the lambda, which has no stream for the guard to filter, and
 so diagnoses the shape rather than desugaring it wrongly. Three occurrences,
 one file, held out of the measurement by default.
 
-## Where the remaining 1693 are
+## Where the remaining 1391 are
 
 Counted by message shape, largest first, with the reading:
 
 | n | message | reading |
 |---|---|---|
-| 187 / 31 | `no implicit: could not find implicit value of type Session` / `BasicBackend.Session` | slick. The two are **not** the same thing: the 31 name a type that resolved, the 187 print a bare `Session`, which is what an unresolved name looks like. Root 14 was supposed to be behind these and is not — see below. |
-| 79 / 62 / 23 / 18 | `ambiguous overload for referrersOnly / writableUsersOnly / ownerOnly / readableUsersOnly with arguments ((<notype>) => <notype>)` | What root 7's "not found" became. Two overloads, and the argument is a function literal whose parameter type is not inferred yet. |
+| 79 / 62 / 23 / 18 (+ 13 / 12 at arity 2) | `ambiguous overload for referrersOnly / writableUsersOnly / ownerOnly / readableUsersOnly with arguments ((<notype>) => <notype>)` | What root 7's "not found" became. Two overloads, and the argument is a function literal whose parameter type is not inferred yet. |
 | 52 | `ambiguous overload for datetimeago with arguments (Date)` | gitbucket's own helper, same shape, and the largest single template symptom. |
 | 44 | `unimplemented syntax: named arguments (method parameters not resolved)` | Named arguments where the callee did not resolve. |
-| 36 | `not found: type Rep` | slick's `Rep` in a `def` signature, through `import profile.api._` — the half of root 11 the `val`-only rerun does not reach. |
 | 29 | `no matching overload for constructor Constraint with arguments ()` | jgit. |
 | 26 / 18 | `no implicit … BaseTypedType[AnyRef] / TypedType[Date]` | slick, in `BasicTemplate.scala`'s `self: Table[?] =>`: a wildcard self type does not offer the table's members. |
+| 22 | `no matching overload for (…)FieldSerializer[A] with arguments ()` | json4s. |
+| 22 | `ambiguous overload for apply$default$N with arguments ()` | A default getter that two overloads both own. |
+| 18 | `no implicit: could not find implicit value of type BasicBackend.Session` | Down from 31, and now the *only* `Session` shape left: these name a type that resolved, so they are a real implicit search that fails, not an unresolved name. |
 | ≈70 | `value filter / insert / map is not a member of ((Tag) => X)TableQuery[X]` | `TableQuery[X]`'s own members behind its `apply`-shaped constructor. |
 | 41 | `value get / update is not a member of <overload …>` | scalatra, the same overload-set shape as root 12 but between two genuinely different members. |
+| 13 | `missing parameter type for expanded function` | The `_`-placeholder form of the overload/function-literal entry above. |
 
 ### What would remove the most next
 
-1. **A `def` signature under an import that only another unit settles**
-   (**≈223**: the 187 `could not find implicit value of type Session`, the 36
-   `not found: type Rep`, and the `byRepository` ambiguities that follow
-   them). This is where the "220 `Session`" errors actually live. The survey
-   that wrote this list put them behind root 14 (`JdbcBackend.Database` is not
-   read as the alias it is); fixing that root removed **one** of them. What
-   the 187 have in common is that the wanted type prints as a bare `Session`
-   while the 31 that did resolve print `BasicBackend.Session` — an implicit
-   search for a name that never resolved cannot succeed, and every one of them
-   is a controller calling a service whose `(implicit s: Session)` was built
-   under `import gitbucket.core.model.Profile.profile.blockingApi._`.
-   Root 11's `val`-only rerun does not cover `def`s, because rebuilding a
-   method signature is not idempotent. The principled fix is nsc's: a lazy
-   completer on every symbol, annotated or not, so an import prefix forces
-   exactly what it needs.
-2. **Overload resolution against a function literal with an un-inferred
-   parameter** (≈234 errors: the `…Only` family plus `datetimeago`). nsc picks
-   the overload by arity first and then types the literal against the chosen
-   parameter type. This is also what is left in the templates: `datetimeago`
-   is the biggest template symptom that is not merely downstream.
+1. **Overload resolution against a function literal with an un-inferred
+   parameter** (≈259 errors: the `…Only` family at both arities, plus
+   `datetimeago`). nsc picks the overload by arity first and then types the
+   literal against the chosen parameter type. This is also what is left in the
+   templates: `datetimeago` is the biggest template symptom that is not merely
+   downstream. It is now the largest single thing by a wide margin.
+2. **`TableQuery[X]`'s own members behind its `apply`-shaped constructor**
+   (≈70). `lazy val Issues = TableQuery[Issues]` is typed as the *function*
+   `(Tag) => Issues` applied to nothing, so `Issues.filter` looks for `filter`
+   on a function type.
 3. **A pickled *declaration* cannot be told from a definition** (the 41
    `value get / update is not a member of <overload …>`, and whatever else
    `drop_overridden` cannot separate across two unrelated traits). Root 15
@@ -594,6 +698,14 @@ Counted by message shape, largest first, with the reading:
    downstream; writing `self: Table[String] =>` works.
    Suppressing it would not fix anything, but it would stop 176 errors from
    hiding what is under them.
+5. **A bare `Ident` in a parameter or result type reports nothing when it
+   resolves to nothing.** Not a count of its own — it is what made root 16's
+   187 `Session` diagnostics appear at their callers instead of at the
+   definitions, and it is why `def oops(x: Missing): Int` is silent while
+   `def oops(x: Missing[Int]): Int` is `not found: type Missing`. nsc reports
+   both. Putting an `Ident` parameter type under `strict_type_names` is one
+   line; what it would cost across slick / cats / the corpus is unmeasured,
+   and it should be measured before it is done, not after.
 
 ## Notes for whoever picks this up
 
@@ -625,3 +737,15 @@ Counted by message shape, largest first, with the reading:
   deferred-bit experiment in root 15 cost one build and one four-minute
   measurement to find out it was worth −424, not +166; leaving it out of the
   tree cost nothing but writing it down.
+* Root 16 is the case for **attributing a change to its parts**. It is three
+  edits, and only one of them is worth anything on its own: rolling back the
+  withdrawn attempt's diagnostics is −2, and the same rule without the second
+  signature round is −65 of the eventual −302. A single before/after number
+  would have called all three "the fix" and left two of them unexplained. Each
+  attribution cost one build and one measurement.
+* Root 16 is also the case for **not trusting a rule of thumb about
+  idempotency**. `agent/slickimpl` recorded that rebuilding a `def` signature
+  was unsafe because `type_def_sig` reallocates the method's type parameters.
+  It does not — `enter_tparams` keeps a `tp.sym` that is set. The real
+  obstacle was the evidence clause it appends, one function away. Reading the
+  code that was blamed took ten minutes and was the whole slice.
