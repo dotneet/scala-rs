@@ -5402,6 +5402,8 @@ impl<'a> Gen<'a> {
                         ret_for_body.clone(),
                         extras,
                         lambda_n,
+                        lambda_bodies,
+                        Some(&hoist_owner),
                         source,
                         library_abi,
                         boxed_vars,
@@ -16076,6 +16078,7 @@ fn emit_lambda_body(
             library_abi,
             method_sym: SymbolId::NONE,
             boxed_vars: boxed,
+            value_ext: None,
         };
         gen_expr(a, &mut fr, &inner_ctx, &pb.body);
         if matches!(pb.body.ty, Type::Nothing) {
