@@ -3779,3 +3779,20 @@ fn scalac_uses_our_package_object_and_value_class() {
     let _ = fs::remove_dir_all(&out_lib);
     let _ = fs::remove_dir_all(&out_main);
 }
+
+/// gitbucket / Twirl syntax: an implicit function literal as a block
+/// statement, a negated numeric literal pattern, and a comment that starts
+/// immediately after an operator. See docs/gitbucket.md.
+#[test]
+fn gitbucket_syntax_fixture() {
+    check("gitbucket_syntax");
+    dual_run_fixture("gitbucket_syntax");
+}
+
+/// gitbucket's templates spell XML attribute names with Scala keywords
+/// (`<span class="...">`); nsc reads XML names with the XML scanner, where a
+/// keyword is an ordinary name.
+#[test]
+fn gitbucket_xml_fixture() {
+    dual_run_xml_fixture("gitbucket_xml");
+}

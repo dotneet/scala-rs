@@ -1,0 +1,2 @@
+<span class="simplified-path" type="text" for="name" val="v">hello</span>
+<a href="/x" if="no"><b class="c">deep</b></a>
