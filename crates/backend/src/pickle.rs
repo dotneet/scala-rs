@@ -622,6 +622,66 @@ impl<'a> Pickler<'a> {
         self.owner_chain_ref(class_sym, 0)
     }
 
+    /// The owner a `CLASSsym` names, preferring an entry in *this* pickle.
+    ///
+    /// nsc enters every symbol it reads in the scope of whatever its owner
+    /// field points at, so a nested class written into its enclosing class's
+    /// pickle has to point at that entry. Anything else -- a top-level class,
+    /// or the same nested class pickled on its own for its own class file --
+    /// still names the external owner chain.
+    fn local_owner_ref(&mut self, class_sym: SymbolId) -> u32 {
+        let owner = self.st.get(class_sym).owner;
+        if !owner.is_none() {
+            let ow = if self.st.get(owner).kind == SymKind::Module {
+                self.st.module_class_of(owner)
+            } else {
+                owner
+            };
+            if let Some(&i) = self.sym_index.get(&ow.0) {
+                if i != self
+                    .sym_index
+                    .get(&class_sym.0)
+                    .copied()
+                    .unwrap_or(u32::MAX)
+                {
+                    return i;
+                }
+            }
+        }
+        self.external_owner_ref(class_sym)
+    }
+
+    /// Is `m` a class or object *declared inside* `outer`, under a name a
+    /// later compilation can spell?
+    ///
+    /// The JVM name is the test rather than the owner field alone: a lifted
+    /// local class (`Outer$$anon$1`, `Outer$1`) is owned by a method, not by
+    /// the class, and writing one into the class's scope would put a name no
+    /// source can name into the signature.
+    fn nested_member_of(&self, m: SymbolId, outer: SymbolId) -> bool {
+        if m.is_none() || m == outer {
+            return false;
+        }
+        if !matches!(self.st.get(m).kind, SymKind::Class | SymKind::ModuleClass) {
+            return false;
+        }
+        let outer_jvm = self
+            .st
+            .get(outer)
+            .jvm_name
+            .trim_end_matches('$')
+            .to_string();
+        if outer_jvm.is_empty() {
+            return false;
+        }
+        let jvm = self.st.get(m).jvm_name.clone();
+        let Some(rest) = jvm.strip_prefix(&format!("{outer_jvm}$")) else {
+            return false;
+        };
+        let rest = rest.trim_end_matches('$');
+        !rest.is_empty() && !rest.contains('$') && !rest.starts_with(|c: char| c.is_ascii_digit())
+    }
+
     fn owner_chain_ref(&mut self, sym: SymbolId, depth: u32) -> u32 {
         let jvm = self.st.get(sym).jvm_name.clone();
         let owner = self.st.get(sym).owner;
@@ -1636,6 +1696,29 @@ impl<'a> Pickler<'a> {
                 SymKind::TypeMember => {
                     let _ = self.pickle_type_member(m);
                 }
+                // A nested class or object is a *member* of this one, and nsc
+                // resolves `Outer.Inner` by looking it up in `Outer`'s
+                // signature. Writing one pickle per classfile and nothing
+                // else meant `slick/jdbc/JdbcActionComponent.class` declared
+                // no members at all, so real scalac reading our slick output
+                // stopped at "Symbol 'type
+                // slick.jdbc.JdbcActionComponent.MultipleRowsPerStatementSupport'
+                // is missing from the classpath" -- the class file exists and
+                // carries its own signature, but nsc never looks there.
+                SymKind::Class | SymKind::ModuleClass => {
+                    if self.nested_member_of(m, class_id) {
+                        let _ = self.pickle_class(m);
+                    }
+                }
+                // The term half of a nested `object`: its module class is
+                // what carries the members, and pickling that emits both the
+                // CLASSsym|MODULE and the MODULEsym nsc binds the term from.
+                SymKind::Module => {
+                    let mc = self.st.module_class_of(m);
+                    if !mc.is_none() && self.nested_member_of(mc, class_id) {
+                        let _ = self.pickle_class(mc);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1670,7 +1753,11 @@ impl<'a> Pickler<'a> {
         // name it actually has then found a pickle that disagreed and served
         // nothing: `import profile.api.*` came back with zero members even
         // once the parents were there. Same helper as the reference side.
-        let owner = self.external_owner_ref(class_id);
+        // A class pickled *inside* its enclosing class's entries has to name
+        // that entry as its owner, not an EXTref: nsc enters each CLASSsym in
+        // the scope of the symbol its owner field points at, and a nested
+        // class that pointed outside would be entered nowhere.
+        let owner = self.local_owner_ref(class_id);
         let body = self.symbol_info(name_ref, owner, flags, info);
         self.entries[idx as usize] = (tag, body);
         self.pickle_sym_annots(class_id, idx);

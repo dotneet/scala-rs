@@ -120,6 +120,9 @@ pub struct PickleSupply {
     /// both a `type Expr` and a `val Expr`, and asking for one must not make
     /// the other look already-answered.
     tried_types: HashMap<(u32, String), Option<Type>>,
+    /// Pickled `val`s whose singleton type is being widened right now, so
+    /// `val x: y.type; val y: x.type` cannot spiral.
+    widening: HashSet<String>,
 }
 
 /// One `type T[...] = U` recovered from a package object's pickle.
@@ -244,7 +247,21 @@ impl PickleSupply {
             let jvm = st.get(c).jvm_name.clone();
             // `scala/Any`, `scala/AnyRef` and friends have no pickle of their
             // own and would only cost a classfile miss per name.
-            if jvm.starts_with("scala/") && jvm != "scala/Any" && jvm != "scala/AnyRef" {
+            let library = jvm.starts_with("scala/") && jvm != "scala/Any" && jvm != "scala/AnyRef";
+            // A `-cp` class outside `scala.*` is served by `complete_named`
+            // only once it has been adopted, and nothing adopts a class the
+            // program never names -- which is exactly an *inherited* one.
+            // `class Users(t: Tag) extends Table[Int](t, "users")`, the shape
+            // every slick testkit suite is written in, then had none of what
+            // `Table` declares: `column`, `O` and `describe` were all "is not
+            // a member", 695 diagnostics in one measurement, on a class whose
+            // parent had resolved perfectly well.
+            let adoptable = !library
+                && !jvm.is_empty()
+                && !jvm.starts_with("java/")
+                && !jvm.starts_with("javax/")
+                && self.adopt_binary_class(st, bin, c);
+            if library || adoptable {
                 let out = self.complete_on(st, bin, c, name);
                 if !out.is_empty() {
                     return out;
@@ -634,6 +651,257 @@ impl PickleSupply {
             return Some(dotted);
         }
         None
+    }
+
+    /// Give a binary class the constructors its pickle declares, when the
+    /// symbol table has none of its own for it.
+    ///
+    /// nsc writes the `ScalaSignature` of a whole top-level class *once*, on
+    /// the top-level class file; a nested class's own file carries no pickle
+    /// at all (`javap -v q.Outer$Inner` shows a zero-length `Scala` marker,
+    /// not a `ScalaSignature`). So a nested class reached through a type alias
+    /// -- which is how every slick profile exports `Table`, `Query`,
+    /// `Sequence` -- arrives with its members completed from the enclosing
+    /// pickle by [`PickleSupply::adopt_binary_class`] and with **no `<init>`
+    /// at all**, because that function skips `<init>` by name. Every
+    /// `class As(tag: Tag) extends Table[Int](tag, "a")` was then "no matching
+    /// overload for constructor Table", and with the parent in error the class
+    /// body inherited nothing: `column`, `O` and `tableTag` were all "not
+    /// found" behind it.
+    ///
+    /// Deliberately a *repair*, not an addition: a class that already has a
+    /// constructor -- from source, from the prelude, or from its own class
+    /// file's descriptors -- is left exactly as it is. Nothing that compiles
+    /// today changes shape.
+    ///
+    /// The parameters installed are the pickle's, i.e. the **source**
+    /// parameters, which is the same convention constructor symbols the typer
+    /// builds itself follow; the backend prepends the hidden `$outer` at emit
+    /// time (`gen::with_enclosing_outer_param`). The descriptor recorded is
+    /// the real one out of the class file, so a call links.
+    pub fn supply_ctors(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+    ) -> bool {
+        if class_sym.is_none() || !st.get(class_sym).is_class_like() {
+            return false;
+        }
+        // A constructor whose parameter list still holds an unresolved
+        // `Type::Named` is not usable and not repairable: `parse_desc` reads a
+        // descriptor with `&SymbolTable`, so a class the table had not heard
+        // of yet when the descriptor was parsed stays a bare name that nothing
+        // conforms to. `RelationalTableComponent$Table` arrived that way --
+        // `(Tag, Option[String], String)Unit` with `Tag` unresolved -- and the
+        // pickle, which is read with the table open, has the same declaration
+        // with every name resolved. Those are replaced; a constructor that
+        // reads correctly is left alone.
+        let broken: Vec<SymbolId> = st
+            .get(class_sym)
+            .members
+            .iter()
+            .copied()
+            .filter(|&m| st.get(m).name == "<init>")
+            .filter(|&m| ctor_has_unresolved_param(st, m))
+            .collect();
+        let own_ctors = st
+            .get(class_sym)
+            .members
+            .iter()
+            .filter(|&&m| st.get(m).name == "<init>")
+            .count();
+        if own_ctors > broken.len() {
+            return false;
+        }
+        if !self.tried.insert((class_sym.0, "<init>".to_string())) {
+            return false;
+        }
+        let internal = st.get(class_sym).jvm_name.clone();
+        if internal.is_empty()
+            || internal.starts_with("java/")
+            || internal.starts_with("javax/")
+            || internal.contains("$anon")
+            || (internal.starts_with("scala/") && class_sym.0 < st.prelude_end)
+        {
+            return false;
+        }
+        let is_module = st.get(class_sym).kind == SymKind::ModuleClass;
+        let Some(full) = self.pickled_full_name(bin, &internal, is_module) else {
+            return false;
+        };
+        let Ok(sig) = ({
+            let mut src = BinSource(bin);
+            self.sigs.class_sig(&mut src, &full, is_module)
+        }) else {
+            return false;
+        };
+        let ctors: Vec<scala_rs_pickle::sym::Member> = sig
+            .members
+            .iter()
+            .filter(|m| m.kind == MemberKind::Def && m.name == "<init>" && m.is_public_api())
+            .cloned()
+            .collect();
+        if ctors.is_empty() {
+            return false;
+        }
+        // The class's own type parameters are the vocabulary a constructor's
+        // parameters are written in.
+        let mut scope: HashMap<String, Type> = HashMap::new();
+        for tp in &st.get(class_sym).tparams {
+            scope.insert(st.get(*tp).name.clone(), Type::TypeParam(*tp));
+        }
+        let saved_self = self.self_ty.replace(Type::Class {
+            sym: class_sym,
+            args: st
+                .get(class_sym)
+                .tparams
+                .iter()
+                .map(|t| Type::TypeParam(*t))
+                .collect(),
+        });
+        let mut installed = 0usize;
+        let mut seen: HashSet<String> = HashSet::new();
+        for c in &ctors {
+            if self.install_ctor(st, bin, class_sym, &internal, &scope, c, &mut seen) {
+                installed += 1;
+            }
+        }
+        self.self_ty = saved_self;
+        if installed > 0 && !broken.is_empty() {
+            st.get_mut(class_sym)
+                .members
+                .retain(|m| !broken.contains(m));
+        }
+        trace(format_args!(
+            "{full}#<init>: supplied {installed} of {} pickled constructor(s), \
+             replacing {} unreadable one(s)",
+            ctors.len(),
+            broken.len()
+        ));
+        installed > 0
+    }
+
+    /// One pickled `<init>`. Declines rather than guesses: a parameter type
+    /// that does not convert, or a class file with no constructor whose
+    /// parameters match, installs nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn install_ctor(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        internal: &str,
+        class_scope: &HashMap<String, Type>,
+        member: &scala_rs_pickle::sym::Member,
+        seen: &mut HashSet<String>,
+    ) -> bool {
+        let Some(shape) = read_shape(&member.ty) else {
+            return false;
+        };
+        // A constructor takes no type parameters of its own; nsc writes the
+        // class's as a `POLYtpe` wrapper, and those are already in scope.
+        let m = st.alloc("<init>", SymbolId::NONE, SymKind::Method, Flags::EMPTY, "");
+        let mut paramss_ty: Vec<Vec<Type>> = Vec::new();
+        let mut paramss_sym: Vec<Vec<SymbolId>> = Vec::new();
+        for clause in &shape.clauses {
+            let mut tys = Vec::new();
+            let mut syms = Vec::new();
+            for p in &clause.params {
+                let Some(mut t) = self.conv(st, bin, class_scope, &p.ty) else {
+                    trace(format_args!(
+                        "{internal}#<init>: parameter {} has an unmappable type {:?}",
+                        p.name, p.ty
+                    ));
+                    return false;
+                };
+                if p.by_name && !matches!(t, Type::ByName(_)) {
+                    t = Type::ByName(Box::new(t));
+                }
+                let flags = if clause.implicit {
+                    Flags::PARAM.with(Flags::IMPLICIT)
+                } else {
+                    Flags::PARAM
+                };
+                // A defaulted constructor parameter is not filled in here:
+                // the `$lessinit$greater$default$n` getter lives on the
+                // *companion*, which this repair does not go looking for, so
+                // the parameter stays required rather than silently dropped.
+                let ps = st.alloc(&p.name, m, SymKind::Term, flags, "");
+                st.get_mut(ps).ty = t.clone();
+                tys.push(t);
+                syms.push(ps);
+            }
+            paramss_ty.push(tys);
+            paramss_sym.push(syms);
+        }
+        let want: Vec<Option<String>> = paramss_ty
+            .iter()
+            .flatten()
+            .map(|t| erased_param_desc(st, t))
+            .collect();
+        let key = format!("{want:?}");
+        if !seen.insert(key) {
+            return false;
+        }
+        let Some(desc) = self.ctor_desc(bin, internal, &want) else {
+            trace(format_args!(
+                "{internal}#<init>: no constructor in the class file matches {want:?}"
+            ));
+            return false;
+        };
+        st.set_jvm_name(m, desc);
+        st.get_mut(m).params = paramss_sym.iter().flatten().copied().collect();
+        st.get_mut(m).paramss = paramss_sym;
+        st.get_mut(m).ty = Type::Method {
+            paramss: paramss_ty,
+            ret: Box::new(Type::Unit),
+        };
+        st.get_mut(m).owner = class_sym;
+        st.get_mut(class_sym).members.push(m);
+        true
+    }
+
+    /// The real `<init>` descriptor of `internal` whose *trailing* parameters
+    /// are `want`.
+    ///
+    /// Only the class's own file is searched -- constructors are not
+    /// inherited. A Scala inner class's constructor carries the enclosing
+    /// instance ahead of the source parameters, so one extra leading
+    /// parameter is allowed; more than one candidate is ambiguous and
+    /// declines.
+    fn ctor_desc(
+        &mut self,
+        bin: &mut BinaryIndex,
+        internal: &str,
+        want: &[Option<String>],
+    ) -> Option<String> {
+        let jc = self.java_class(bin, internal)?;
+        let mut hits: Vec<String> = Vec::new();
+        for jm in &jc.methods {
+            if jm.name != "<init>" || jm.access & (ACC_BRIDGE | ACC_SYNTHETIC | ACC_STATIC) != 0 {
+                continue;
+            }
+            let Some(got) = desc_params(&jm.desc) else {
+                continue;
+            };
+            if got.len() != want.len() && got.len() != want.len() + 1 {
+                continue;
+            }
+            let tail = &got[got.len() - want.len()..];
+            let ok = tail.iter().zip(want).all(|(g, w)| match w {
+                Some(w) => g == w,
+                None => g.starts_with('L') || g.starts_with('['),
+            });
+            if ok && !hits.contains(&jm.desc) {
+                hits.push(jm.desc.clone());
+            }
+        }
+        if hits.len() == 1 {
+            hits.pop()
+        } else {
+            None
+        }
     }
 
     /// Install the **type** member `name` of `class_sym`, read from the pickle
@@ -2564,13 +2832,104 @@ impl PickleSupply {
                 {
                     return Some(t);
                 }
-                let cls = self.ensure_class(st, bin, sym, true)?;
-                Some(Type::ModuleRef(cls))
+                if let Some(cls) = self.ensure_class(st, bin, sym, true) {
+                    return Some(Type::ModuleRef(cls));
+                }
+                // Not a module: a `val`'s singleton type, which is what
+                // slick's `val O: self.columnOptions.type = columnOptions`
+                // pickles as. There is no singleton type to build here, but
+                // the val's *declared* type has exactly the members a
+                // selection off it reaches, and that is what the reference is
+                // for. Without it the whole member was declined and `O` kept
+                // the class file's erased accessor -- `O.PrimaryKey` was
+                // "value PrimaryKey is not a member of RelationalTableComponent".
+                self.conv_val_widening(st, bin, sym, d)
             }
             // The remaining forms (`super`, bare bounds, literal types) have
             // no faithful counterpart here yet.
             _ => None,
         }
+    }
+
+    /// The declared type of the `val` a pickled `p.x.type` points at.
+    ///
+    /// `sym` is the referent's full dotted path (`slick.relational.
+    /// RelationalTableComponent.columnOptions`). Everything before the last
+    /// segment names the class that declares it, which is looked up the same
+    /// way any other member is; the answer is the val's *declared* type, not a
+    /// singleton, because there is no singleton type to build here. That
+    /// widening is what a selection off the reference can reach, which is all
+    /// the reference is used for in a signature.
+    ///
+    /// Declined -- rather than guessed at -- when the owner has no pickle,
+    /// when nothing of that name is declared, or when the entry takes
+    /// parameters (a `def` is not a path).
+    fn conv_val_widening(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        sym: &str,
+        d: u32,
+    ) -> Option<Type> {
+        let (owner_name, member) = sym.rsplit_once('.')?;
+        if member.is_empty() || owner_name.is_empty() {
+            return None;
+        }
+        if !self.widening.insert(sym.to_string()) {
+            return None;
+        }
+        let widened = self.conv_val_widening_inner(st, bin, owner_name, member, d);
+        self.widening.remove(sym);
+        widened
+    }
+
+    fn conv_val_widening_inner(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        owner_name: &str,
+        member: &str,
+        d: u32,
+    ) -> Option<Type> {
+        // A module class first only when the dotted name really is one: the
+        // owner of `Outer.opts` is the trait `Outer`, not an object.
+        let owner_is_module =
+            !self.has_pickle(bin, owner_name, false) && self.has_pickle(bin, owner_name, true);
+        if !owner_is_module && !self.has_pickle(bin, owner_name, false) {
+            return None;
+        }
+        let jvm_member = scala_rs_pickle::names::encode_method_name(member);
+        let (hits, _errs) = {
+            let mut src = BinSource(bin);
+            self.sigs
+                .lookup(&mut src, owner_name, owner_is_module, &jvm_member)
+        };
+        let hit = hits.into_iter().find(|h| {
+            matches!(h.member.kind, MemberKind::Val | MemberKind::Def) && h.member.is_public_api()
+        })?;
+        // A path element has no parameters. `Poly { tparams: [] }` is nsc's
+        // spelling for a parameterless `def`, which is a path in nsc's sense
+        // too (`def columnOptions: ColumnOptions`), so it is looked through.
+        let ty = match &hit.member.ty {
+            SigType::Poly { tparams, result } if tparams.is_empty() => (**result).clone(),
+            SigType::Method { .. } | SigType::Poly { .. } => return None,
+            other => other.clone(),
+        };
+        let owner = self.ensure_class(st, bin, owner_name, owner_is_module)?;
+        // `this.type` inside that declaration means the class that declares
+        // it, not whatever class the member being installed lives on.
+        let saved = self.self_ty.replace(Type::Class {
+            sym: owner,
+            args: st
+                .get(owner)
+                .tparams
+                .iter()
+                .map(|t| Type::TypeParam(*t))
+                .collect(),
+        });
+        let conv = self.conv_at(st, bin, &HashMap::new(), &ty, d);
+        self.self_ty = saved;
+        conv
     }
 
     /// `T { type A = U; def f: V }` — a `REFINEDtpe`.
@@ -3298,6 +3657,25 @@ pub(crate) fn desc_arity(desc: &str) -> Option<usize> {
         return None;
     }
     Some(n)
+}
+
+/// Does this constructor symbol carry a parameter whose type never resolved?
+///
+/// `Type::Named` is what `classpath::parse_desc` leaves behind when a class
+/// named by a descriptor is not in the symbol table yet: it is not the class,
+/// it conforms to nothing, and no argument ever matches it.
+fn ctor_has_unresolved_param(st: &SymbolTable, ctor: SymbolId) -> bool {
+    let unresolved = |t: &Type| matches!(t, Type::Named { .. } | Type::Error);
+    let by_ty = match &st.get(ctor).ty {
+        Type::Method { paramss, .. } => paramss.iter().flatten().any(unresolved),
+        _ => false,
+    };
+    by_ty
+        || st
+            .get(ctor)
+            .params
+            .iter()
+            .any(|p| unresolved(&st.get(*p).ty))
 }
 
 #[cfg(test)]

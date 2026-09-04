@@ -169,3 +169,75 @@ object Impl { val tag: String = "i" }
         .expect("Impl module class");
     assert!(obj.member("tag").is_some(), "Impl.tag");
 }
+
+/// A nested class is written into its *owner's* pickle, not only into its own.
+///
+/// scala-rs emits one `ScalaSignature` per class file, so
+/// `Support$Row.class` always carried a perfectly good pickle of `Row`. nsc
+/// never opens it: it resolves `Support.Row` as a member of `Support`'s
+/// signature, and `Support`'s signature declared nothing. Real scalac
+/// reading our slick output stopped at "Symbol 'type
+/// slick.jdbc.JdbcActionComponent.MultipleRowsPerStatementSupport' is
+/// missing from the classpath" the first time a parent list mentioned one.
+///
+/// The per-class-file pickles stay exactly as they were -- this compiler's
+/// own reader still finds each nested class in its own class file.
+#[test]
+fn a_nested_class_is_declared_in_its_owners_pickle() {
+    let src = r#"
+object Support {
+  trait Rows { def rows: Int }
+  class Row(val n: Int)
+}
+class Outer {
+  class Inner { def v: Int = 1 }
+  object Cfg { val k: Int = 1 }
+}
+"#;
+    let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+    assert!(
+        !scala_rs_typer::has_errors(&diags),
+        "type errors: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let mut found: Vec<(String, Vec<String>)> = Vec::new();
+    for raw in pickle::pickle_all(&st).values() {
+        let p = read_pickle(raw).expect("read our own pickle");
+        for (i, e) in p.entries.iter().enumerate() {
+            let Entry::ClassSym { info, .. } = e else {
+                continue;
+            };
+            let Some(outer) = p.name(info.name) else {
+                continue;
+            };
+            if outer != "Support" && outer != "Outer" {
+                continue;
+            }
+            let nested: Vec<String> = p
+                .entries
+                .iter()
+                .filter_map(|m| match m {
+                    Entry::ClassSym { info: mi, .. } if mi.owner == i as u32 => {
+                        p.name(mi.name).map(str::to_string)
+                    }
+                    _ => None,
+                })
+                .collect();
+            found.push((outer.to_string(), nested));
+        }
+    }
+    let support = found
+        .iter()
+        .find(|(n, ms)| n == "Support" && !ms.is_empty())
+        .unwrap_or_else(|| panic!("no pickle declares Support's members: {found:?}"));
+    assert!(support.1.iter().any(|n| n == "Rows"), "{found:?}");
+    assert!(support.1.iter().any(|n| n == "Row"), "{found:?}");
+    let outer = found
+        .iter()
+        .find(|(n, ms)| n == "Outer" && !ms.is_empty())
+        .unwrap_or_else(|| panic!("no pickle declares Outer's members: {found:?}"));
+    assert!(outer.1.iter().any(|n| n == "Inner"), "{found:?}");
+    // A nested `object` goes in as its module class, so the term half nsc
+    // binds `Outer.Cfg` from is there too.
+    assert!(outer.1.iter().any(|n| n == "Cfg"), "{found:?}");
+}
