@@ -1,4 +1,4 @@
-// 小さな行列演算（Array[Array[Double]] と Array[Array[Int]]）。
+// Small matrix operations (Array[Array[Double]] and Array[Array[Int]]).
 object Main {
   type Mat = Array[Array[Double]]
 

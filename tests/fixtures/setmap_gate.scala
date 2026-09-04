@@ -1,6 +1,7 @@
-// `--no-scala-library`（私有ランタイム）には `Predef.genericWrapArray` /
-// `copyArrayToImmutableIndexedSeq` の実体が無いので、`Array` を `Seq` として
-// 通してはならない。黙って通さず診断を出すこと（`.agent-brief.md`「スタブ禁止」）。
+// `--no-scala-library` (the private runtime) carries no implementation of
+// `Predef.genericWrapArray` / `copyArrayToImmutableIndexedSeq`, so an `Array` must
+// not go through as a `Seq`. Emit a diagnostic rather than accepting it quietly
+// (`.agent-brief.md`, "no stubs").
 object Main {
   def v(a: Array[Any]): Iterable[Any] = a
   def main(args: Array[String]): Unit = ()

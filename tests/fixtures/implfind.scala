@@ -1,17 +1,17 @@
-// implicit が見つからない／メンバが見えない 7 根をまとめた fixture。
+// A fixture collecting 7 roots of implicit-not-found / member-not-visible.
 //
-// 1. 適用済み抽象型メンバが自分の上限に適合しない（`CT[U] <: TT[U]`）
-// 2. コンテキスト境界の evidence 型が self type 越しに展開されない
-// 3. コンパニオン object の `protected` メンバをコンパニオン側から読む
-// 4. 入れ子の `private[pkg] object`
-// 5. 匿名クラスの self alias（`new T { base => … }`）
-// 6. コンストラクタパターンの関数位置で、非 stable な `def` が抽出子を隠す
-// 7. Java の `Object` 戻り値が `Any` になって `eq`/`ne` が無い
-// 8. `scala.collection.Map` の `get`/`contains`/`getOrElse`/`apply`
+// 1. An applied abstract type member does not conform to its own upper bound (`CT[U] <: TT[U]`)
+// 2. A context bound's evidence type is not expanded through the self type
+// 3. Reading a companion object's `protected` member from the companion side
+// 4. A nested `private[pkg] object`
+// 5. An anonymous class's self alias (`new T { base => … }`)
+// 6. A non-stable `def` shadowing the extractor in a constructor pattern's function position
+// 7. A Java `Object` return type becoming `Any`, so `eq`/`ne` are missing
+// 8. `scala.collection.Map`'s `get`/`contains`/`getOrElse`/`apply`
 
 package implfind {
 
-  // ---- 1 / 2: ケーキの抽象型メンバと文脈境界 -----------------------------
+  // ---- 1 / 2: cake abstract type members and context bounds ---------------
   trait TT[T] { def name: String }
   trait BB[T] extends TT[T]
 
@@ -21,15 +21,15 @@ package implfind {
   }
 
   trait Prof extends Comp { self: Prof =>
-    // 上限越しの探索: 候補は `BCT[U]` の evidence だけ。
+    // Search through the upper bound: the only candidate is the `BCT[U]` evidence.
     def viaBound[U: BCT](u: U): String = implicitly[TT[U]].name
-    // 同じ名前で要求する側。self type で具体化された別名になる。
+    // The requesting side, under the same name. It becomes the alias the self type made concrete.
     def viaSelf[U: BCT](u: U): String = implicitly[BCT[U]].name
   }
 
-  // self type が具体プロファイルを指すコンポーネント。ここで書かれた
-  // `[U : BCT]` の evidence は self type 越しに `JT[U] with BB[U]` に
-  // なっていなければならない（本体の `implicitly[BCT[U]]` はそうなる）。
+  // A component whose self type names a concrete profile. The evidence of the
+  // `[U : BCT]` written here has to become `JT[U] with BB[U]` through the self
+  // type (the body's `implicitly[BCT[U]]` does).
   trait JComp extends Comp { self: JProf =>
     def viaComponent[U: BCT](u: U): String = implicitly[BCT[U]].name
     def viaComponentJT[U: BCT](u: U): String = implicitly[JT[U]].name
@@ -44,7 +44,7 @@ package implfind {
 
   object Cake extends JProf
 
-  // ---- 3: コンパニオン object の protected --------------------------------
+  // ---- 3: protected in a companion object ---------------------------------
   trait Prot {
     def viaTrait: Int = Prot.hidden
   }
@@ -59,7 +59,7 @@ package implfind {
     protected val hidden: Int = 11
   }
 
-  // ---- 4: 入れ子の private[pkg] object ------------------------------------
+  // ---- 4: a nested private[pkg] object ------------------------------------
   object Outer {
     private[implfind] object Inner { val v: Int = 13 }
     private[implfind] class InnerC { val v: Int = 17 }
@@ -70,7 +70,7 @@ package implfind {
     def b: Int = new Outer.InnerC().v
   }
 
-  // ---- 5: 匿名クラスの self alias -----------------------------------------
+  // ---- 5: an anonymous class's self alias ---------------------------------
   trait Tag {
     def label: String
     def tagged(i: Int): Tag
@@ -89,7 +89,7 @@ package implfind {
     }
   }
 
-  // ---- 6: 記号名の抽出子と同名の非 stable な def ---------------------------
+  // ---- 6: a symbolic extractor and a non-stable def of the same name ------
   class Nd(val s: String) {
     final def :@(t: Int): Nd = new Nd(s + t)
   }
@@ -103,8 +103,8 @@ package implfind {
   import NdOps._
 
   class Sub(s: String) extends Nd(s) {
-    // `:@` はここでは継承した *メソッド* でもあるが、構成子パターンの
-    // 関数位置ではメソッドは候補にならない。
+    // `:@` is here also an inherited *method*, but a method is not a candidate
+    // in the function position of a constructor pattern.
     def viaVal: Int = {
       val _ :@ n = (new Nd("abc")): @unchecked
       n
@@ -141,7 +141,7 @@ object Main {
     println(new Sub("z").viaCase)
     println(new Sub("z").viaMethod)
 
-    // ---- 7: Java の Object 戻り値 ----------------------------------------
+    // ---- 7: a Java Object return type -------------------------------------
     val props = new java.util.Properties()
     props.put("k", "v")
     println(props.get("k") ne null)

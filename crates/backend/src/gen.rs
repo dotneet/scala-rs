@@ -10326,7 +10326,7 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
             return;
         }
         if owner == "scala/collection/Iterator" && name == "toList" {
-            // `Iterator.toList` は `IterableOnceOps` の default メソッド。
+            // `Iterator.toList` is a default method on `IterableOnceOps`.
             asm.invokeinterface(
                 "scala/collection/IterableOnceOps",
                 "toList",
@@ -13118,30 +13118,31 @@ fn emit_newarray(asm: &mut Assembler, ctx: &EmitCtx, elem: &Type) {
     }
 }
 
-/// `List` の JVM オーナー（scala-library 2.13.16）。
+/// `List`'s JVM owner (scala-library 2.13.16).
 const LIST_CLS: &str = "scala/collection/immutable/List";
 const ITERABLE_ONCE_OPS: &str = "scala/collection/IterableOnceOps";
 const ITERABLE_OPS: &str = "scala/collection/IterableOps";
 const SEQ_OPS: &str = "scala/collection/SeqOps";
 
-/// invoke 後の後処理。
+/// Post-processing after the invoke.
 #[derive(Clone, Copy, PartialEq)]
 enum ListPost {
-    /// そのまま。
+    /// Leave it as it is.
     None,
-    /// erase された戻り値を `List` へ戻す。
+    /// Cast an erased result back to `List`.
     CastList,
-    /// `Object` 戻りを結果型に合わせて unbox / checkcast する。
+    /// unbox / checkcast an `Object` result to match the result type.
     Erased,
 }
 
-/// `prelude_seq.rs` が足した `List` のコアメンバの invoke。
+/// Invokes for the core `List` members `prelude_seq.rs` added.
 ///
-/// descriptor は `javap -s -cp scala-library-2.13.16.jar` で確認したもの。
-/// `List` 自身が持たないメンバは `IterableOnceOps` / `IterableOps` / `SeqOps`
-/// の default メソッドなので invokeinterface で呼ぶ。
+/// The descriptors are the ones confirmed with
+/// `javap -s -cp scala-library-2.13.16.jar`. The members `List` does not have itself
+/// are default methods on `IterableOnceOps` / `IterableOps` / `SeqOps`, so they are
+/// called with invokeinterface.
 ///
-/// 扱わない名前では `false` を返し、呼び出し側の既定の invoke に任せる。
+/// Returns `false` for names it does not handle, leaving the caller's default invoke to it.
 fn emit_list_core_member(
     asm: &mut Assembler,
     ctx: &EmitCtx,
@@ -13154,9 +13155,9 @@ fn emit_list_core_member(
         Type::Method { paramss, .. } => paramss.iter().flatten().count(),
         _ => s.params.len(),
     };
-    // (invokeinterface か, オーナー, JVM 名, descriptor, 後処理)
+    // (invokeinterface?, owner, JVM name, descriptor, post-processing)
     let (iface, owner, jvm, desc, post): (bool, &str, &str, &str, ListPost) = match (name, nargs) {
-        // --- List 自身の virtual（戻り値も List）
+        // --- virtuals on `List` itself (the result is a `List` too)
         ("map", 1) | ("flatMap", 1) => (
             false,
             LIST_CLS,
@@ -13171,7 +13172,7 @@ fn emit_list_core_member(
             "(Ljava/lang/Object;)Lscala/collection/immutable/List;",
             ListPost::None,
         ),
-        // `indexWhere(p)` は `indexWhere(p, 0)`（既定引数）。
+        // `indexWhere(p)` is `indexWhere(p, 0)` (a default argument).
         ("indexWhere", 1) => {
             asm.iconst(0);
             (
@@ -13273,7 +13274,7 @@ fn emit_list_core_member(
             "(Ljava/lang/Object;Lscala/Function2;)Ljava/lang/Object;",
             ListPost::Erased,
         ),
-        // --- List の virtual だが戻り値が erase される
+        // --- virtuals on `List`, but with an erased result
         ("drop", 1) => (
             false,
             LIST_CLS,
@@ -13330,7 +13331,7 @@ fn emit_list_core_member(
             "(Ljava/lang/Object;Lscala/Function2;)Ljava/lang/Object;",
             ListPost::CastList,
         ),
-        // --- 連結・追加。`++` / `:++` は `appendedAll`、`++:` は `prependedAll`。
+        // --- concatenation and appending. `++` / `:++` are `appendedAll`, `++:` is `prependedAll`.
         (":::", 1) => (
             false,
             LIST_CLS,
@@ -13366,7 +13367,7 @@ fn emit_list_core_member(
             "(Lscala/collection/IterableOnce;)Lscala/collection/immutable/List;",
             ListPost::None,
         ),
-        // --- IterableOnceOps の default メソッド
+        // --- default methods on `IterableOnceOps`
         ("size", 0) => (true, ITERABLE_ONCE_OPS, "size", "()I", ListPost::None),
         ("nonEmpty", 0) => (true, ITERABLE_ONCE_OPS, "nonEmpty", "()Z", ListPost::None),
         ("count", 1) => (
@@ -13453,7 +13454,7 @@ fn emit_list_core_member(
             "()Lscala/collection/immutable/Seq;",
             ListPost::None,
         ),
-        // --- IterableOps の default メソッド
+        // --- default methods on `IterableOps`
         ("init", 0) => (
             true,
             ITERABLE_OPS,
@@ -13489,7 +13490,7 @@ fn emit_list_core_member(
             "(II)Lscala/collection/Iterator;",
             ListPost::None,
         ),
-        // --- SeqOps の default メソッド
+        // --- default methods on `SeqOps`
         ("distinct", 0) => (
             true,
             SEQ_OPS,
@@ -13525,7 +13526,7 @@ fn emit_list_core_member(
             "(Lscala/collection/Iterable;)Z",
             ListPost::None,
         ),
-        // `startsWith(that)` は `startsWith(that, 0)`（既定引数）。
+        // `startsWith(that)` is `startsWith(that, 0)` (a default argument).
         ("startsWith", 1) => {
             asm.iconst(0);
             (

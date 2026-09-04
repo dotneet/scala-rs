@@ -1,4 +1,4 @@
-// 在庫表を Array で持ち回す（検索・スライス・zipWithIndex・畳み込み）。
+// Pass an inventory table around as an Array (search, slice, zipWithIndex, fold).
 case class Item(sku: String, qty: Int)
 
 object Main {

@@ -2925,7 +2925,7 @@ fn find_scalac() -> Option<PathBuf> {
 /// (`MODULE$`) plus field accessors, extractor `unapply` so `p match { case
 /// Point(a, b) => a + b }` typechecks, an `object` method taking that case
 /// class, and SIP-23 literal types `val one: 1` / `def lit(x: 1)` (CONSTANTtpe).
-/// Remaining pickle holes (MACRO / late・anti flags, JAVA on EXTREF — PickleFormat
+/// Remaining pickle holes (MACRO / late-anti flags, JAVA on EXTREF -- PickleFormat
 /// EXTREF is name_Ref [owner_Ref] with no flags field) are not claimed.
 /// Named annot ctor-arg reorder is **not** required: scalac 2.13.16 typechecks
 /// `@Ann2(b = 2, a = "ok")` pickled as positional RHS in source order. Nested `List[_ <: List[_]]` and refinement
@@ -3163,11 +3163,11 @@ fn fixtures_try_exceptions_bad_is_error() {
 }
 
 // ---------------------------------------------------------------------------
-// scala.collection.immutable.List のコアメンバ（`list_core*`）。
+// The core members of scala.collection.immutable.List (`list_core*`).
 //
-// prelude 側は `crates/typer/src/prelude_seq.rs`、invoke は
-// `crates/backend/src/gen.rs` の `emit_list_core_member`。
-// すべて scala-library 2.13.16 の実 descriptor に対して dual-run で検証する。
+// The prelude side is `crates/typer/src/prelude_seq.rs`; the invoke side is
+// `emit_list_core_member` in `crates/backend/src/gen.rs`.
+// All of it is verified by dual runs against the real descriptors of scala-library 2.13.16.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3220,20 +3220,20 @@ fn fixtures_list_core1_bad_is_error() {
     compile_fails_lib("list_core1_bad", "noSuchFold is not a member");
 }
 
-/// 私有ランタイムの `List` classfile は `SeqOps` / `IterableOnceOps` の
-/// default メソッドを持たないので、`--no-scala-library` では診断を出す。
+/// The private runtime's `List` classfile has none of the `SeqOps` /
+/// `IterableOnceOps` default methods, so `--no-scala-library` emits a diagnostic.
 #[test]
 fn fixtures_list_core2_bad_is_error() {
     compile_fails("list_core2_bad", "sorted is not a member of List[Int]");
 }
 
-/// 私有ランタイムでも動くコアメンバ（`runtime.rs` の `add_list_core_runtime`）。
+/// The core members that work under the private runtime too (`runtime.rs`'s `add_list_core_runtime`).
 #[test]
 fn fixtures_list_core10() {
     check("list_core10");
 }
 
-/// 同じソースが本物の scala-library に対しても同じ出力になること。
+/// The same source produces the same output against the real scala-library.
 #[test]
 fn scala_library_dual_run_list_core10() {
     dual_run_fixture("list_core10");

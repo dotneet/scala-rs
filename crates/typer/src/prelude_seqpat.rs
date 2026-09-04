@@ -1,13 +1,13 @@
-//! シーケンスパターン（`case Seq(a, b)` / `case Vector(a, b, rest @ _*)` /
-//! `case Array(a, b)`）のための `unapplySeq`。
+//! `unapplySeq` for sequence patterns (`case Seq(a, b)` /
+//! `case Vector(a, b, rest @ _*)` / `case Array(a, b)`).
 //!
-//! `prelude.rs` からは [`install`] を 1 行呼ぶだけにしてある。
+//! `prelude.rs` calls [`install`] on a single line.
 //!
-//! これまで `unapplySeq` を持つのは `List` のコンパニオンだけだったので、
-//! `case Seq((s, _))` は「クラスパターン」枝に落ちて要素型が付かず、
-//! `s` が `Any` になっていた（slick `JdbcStatementBuilderComponent` ほか）。
+//! Until now only `List`'s companion had an `unapplySeq`, so `case Seq((s, _))` fell
+//! into the "class pattern" branch, got no element type, and left `s` as `Any`
+//! (slick `JdbcStatementBuilderComponent` among others).
 //!
-//! 実 scalac 2.13.16 が出すのは
+//! What real scalac 2.13.16 emits is
 //!
 //! ```text
 //! Seq$.unapplySeq:(Lscala/collection/SeqOps;)Lscala/collection/SeqOps;
@@ -16,36 +16,37 @@
 //! SeqFactory$UnapplySeqWrapper$.drop$extension:(Lscala/collection/SeqOps;I)Lscala/collection/immutable/Seq;
 //! ```
 //!
-//! で、`Array` だけは `scala/Array$UnapplySeqWrapper$` の同名 extension を
-//! `Ljava/lang/Object;` 受けで使う。対応する invoke は
-//! `crates/backend/src/gen.rs` の `gen_unapply_wrapper_bind` が出す
-//! （`SeqPatShape` で 2 つの wrapper を切り替える）。
+//! where only `Array` uses the same-named extension on
+//! `scala/Array$UnapplySeqWrapper$`, taking `Ljava/lang/Object;`. The matching
+//! invoke is emitted by `gen_unapply_wrapper_bind` in `crates/backend/src/gen.rs`
+//! (`SeqPatShape` switches between the two wrappers).
 //!
-//! ここで宣言する結果型は `Option[Seq[A]]` で、実際の descriptor とは違う。
-//! `List$.unapplySeq` を `Option[List[A]]` と宣言してあるのと同じ扱いで、
-//! codegen 側が「組み込みのシーケンス factory」を見て Option を経由しない
-//! コードを出す。`_*` に付く型は**この結果型の要素コンテナ**から取るので、
-//! `List(a, rest @ _*)` の `rest` は `List[A]`（従来どおり）、
-//! `Seq(a, rest @ _*)` / `Array(a, rest @ _*)` の `rest` は `Seq[A]` になる
-//! （後者は実 scalac の `drop$extension` の戻り型と一致する）。
+//! The result type declared here is `Option[Seq[A]]`, which differs from the real
+//! descriptor. This is the same treatment as declaring `List$.unapplySeq` as
+//! `Option[List[A]]`: codegen sees a "built-in sequence factory" and emits code that
+//! does not go through the Option. The type attached to `_*` comes from **the element
+//! container of this result type**, so the `rest` of `List(a, rest @ _*)` is `List[A]`
+//! (as before) and the `rest` of `Seq(a, rest @ _*)` / `Array(a, rest @ _*)` is
+//! `Seq[A]` (which matches real scalac's `drop$extension` return type).
 //!
-//! **私有ランタイム（`--no-scala-library`）** には `scala/collection/SeqOps`
-//! も `SeqFactory$UnapplySeqWrapper$` も無い。宣言自体は両モードで入れて
-//! おき、`check.rs` の `type_pattern` が jar 無しのときに
-//! 「`--scala-library` が要る」と**診断を出す**（黙って壊れたコードを出さない）。
+//! The **private runtime (`--no-scala-library`)** has neither `scala/collection/SeqOps`
+//! nor `SeqFactory$UnapplySeqWrapper$`. The declarations themselves go in under both
+//! modes, and `check.rs`'s `type_pattern` **emits a diagnostic** saying
+//! `--scala-library` is required when the jar is absent (rather than quietly emitting
+//! broken code).
 
 use crate::symbol::{SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};
 
-/// `unapplySeq` を持たせる組み込みコンパニオンの JVM 名。
-/// `check.rs` と `gen.rs` が同じ表を見る。
+/// The JVM names of the built-in companions that get an `unapplySeq`.
+/// `check.rs` and `gen.rs` read the same table.
 pub(crate) const SEQ_FACTORY_MODULES: &[&str] = &[
     "scala/collection/immutable/Seq$",
     "scala/collection/immutable/Vector$",
     "scala/collection/immutable/IndexedSeq$",
 ];
 
-/// `scala.Array` のコンパニオン。`SeqOps` ではなく生の配列を受ける。
+/// `scala.Array`'s companion. It takes a raw array rather than `SeqOps`.
 pub(crate) const ARRAY_FACTORY_MODULE: &str = "scala/Array$";
 
 pub(crate) fn install(st: &mut SymbolTable) {
@@ -83,14 +84,14 @@ fn find_class(st: &SymbolTable, name: &str) -> Option<SymbolId> {
         .find(|s| st.get(*s).kind == SymKind::Class && st.get(*s).tparams.len() == 1)
 }
 
-/// `Seq` の型シンボル（`_*` に付ける戻り型のコンテナ）。
+/// The `Seq` type symbol (the container of the return type attached to `_*`).
 fn seq_class(st: &SymbolTable) -> Option<SymbolId> {
     st.lookup_member(st.scala_pkg, "Seq").into_iter().find(|s| {
         st.get(*s).kind == SymKind::Class && st.get(*s).jvm_name == "scala/collection/immutable/Seq"
     })
 }
 
-/// `def unapplySeq[A](x: CC[A]): Option[Seq[A]]`。
+/// `def unapplySeq[A](x: CC[A]): Option[Seq[A]]`.
 fn add_seq_unapply_seq(st: &mut SymbolTable, module: SymbolId, coll: SymbolId) {
     let mcls = st.module_class_of(module);
     if mcls.is_none() {
@@ -122,7 +123,7 @@ fn add_seq_unapply_seq(st: &mut SymbolTable, module: SymbolId, coll: SymbolId) {
     };
 }
 
-/// `def unapplySeq[A](x: Array[A]): Option[Seq[A]]`。
+/// `def unapplySeq[A](x: Array[A]): Option[Seq[A]]`.
 fn add_array_unapply_seq(st: &mut SymbolTable, module: SymbolId) {
     let mcls = st.module_class_of(module);
     if mcls.is_none() {

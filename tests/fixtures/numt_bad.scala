@@ -1,28 +1,28 @@
-// 数値の塔で scalac が拒否するもの。どれも診断が出ないといけない。
+// What scalac rejects in the numeric tower. Each has to draw a diagnostic.
 object Main {
   def takeB(x: Byte): Int = x.toInt
 
   def main(args: Array[String]): Unit = {
-    // 縮小変換は暗黙には起きない（`toByte` を書かないといけない）。
+    // Narrowing conversions do not happen implicitly (`toByte` has to be written).
     val i = 300
     val b: Byte = i
 
-    // 定数でも範囲外なら narrow できない（SLS 6.26.1）。
+    // Even a constant cannot be narrowed when out of range (SLS 6.26.1).
     val b2: Byte = 300
 
-    // Byte のパラメータに範囲外の定数は渡せない（`takeB(3)` は SLS 6.26.1 で通る）。
+    // An out-of-range constant cannot be passed to a Byte parameter (`takeB(3)` passes under SLS 6.26.1).
     println(takeB(300))
 
-    // Boolean には toX が無い。
+    // Boolean has no toX.
     println(true.toInt)
 
-    // Unit にも無い。
+    // Neither does Unit.
     println(().toByte)
 
-    // 逆向きの弱適合は無い（Double から Int へは落ちない）。
+    // There is no weak conformance the other way (Double does not fall to Int).
     val n: Int = 1.5
 
-    // Char へ縮小するのも暗黙には起きない。
+    // Narrowing to Char does not happen implicitly either.
     val c: Char = i
   }
 }

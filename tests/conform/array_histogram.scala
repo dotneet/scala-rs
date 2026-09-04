@@ -1,4 +1,4 @@
-// 単語の出現数を素の Array[Int] で数えて上位を出す。
+// Count word occurrences in a bare Array[Int] and report the top ones.
 object Main {
   val Letters = 26
 

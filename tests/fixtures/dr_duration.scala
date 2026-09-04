@@ -1,12 +1,12 @@
-// scala.concurrent.duration の後置単位（agent/durrange の 1 件目）。
-// `package object duration` の implicit def DurationInt / DurationLong /
-// DurationDouble と、DurationConversions の単位メソッド全部。
-// 実 scala-library の jar が要る（--scala-library 専用）。
+// The postfix units of scala.concurrent.duration (the first agent/durrange case).
+// The implicit defs DurationInt / DurationLong / DurationDouble of
+// `package object duration`, and every unit method of DurationConversions.
+// Needs the real scala-library jar (--scala-library only).
 import scala.concurrent.duration._
 
 object Main {
   def main(args: Array[String]): Unit = {
-    // Int: 20 個の単位メソッド全部（単数形・複数形・短縮形）。
+    // Int: all 20 unit methods (singular, plural and abbreviated).
     println(List(1.nanoseconds, 1.nanos, 1.nanosecond, 1.nano).mkString(" "))
     println(List(2.microseconds, 2.micros, 2.microsecond, 2.micro).mkString(" "))
     println(List(3.milliseconds, 3.millis, 3.millisecond, 3.milli).mkString(" "))
@@ -14,10 +14,10 @@ object Main {
     println(List(5.minutes, 5.minute).mkString(" "))
     println(List(6.hours, 6.hour).mkString(" "))
     println(List(7.days, 7.day).mkString(" "))
-    // Long と Double も同じ経路。
+    // Long and Double take the same path.
     println(List(8L.seconds, 8L.millis, 9L.days, 10L.hour).mkString(" "))
     println(List(1.5d.seconds, 0.25d.millis, 2.0d.minutes).mkString(" "))
-    // FiniteDuration / Duration との相互運用と算術。
+    // Interop and arithmetic with FiniteDuration / Duration.
     val f: FiniteDuration = 2.seconds
     val d: Duration = f
     println(f.toMillis.toString + " " + d.toString)

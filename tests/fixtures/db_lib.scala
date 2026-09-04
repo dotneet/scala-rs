@@ -1,9 +1,9 @@
-// agent/dbio: `Either.getOrElse` / `Try.getOrElse` の `[B1 >: B]`。
+// agent/dbio: the `[B1 >: B]` of `Either.getOrElse` / `Try.getOrElse`.
 //
-// prelude はどちらも `(=> Any): Any` と書いていたので、結果を使うたびに
-// `… is not a member of Any` が出た(slick の
-// `JdbcActionComponent.openStream` は 1 つの誤ったシグネチャから 3 件)。
-// `Either` / `Try` は library ABI 専用なので、この fixture も jar モード限定。
+// The prelude wrote both as `(=> Any): Any`, so every use of the result drew
+// a `… is not a member of Any` (slick's `JdbcActionComponent.openStream` got
+// three of them out of one wrong signature).
+// `Either` / `Try` are library-ABI only, so this fixture is jar mode only.
 
 import scala.util.{Failure, Success, Try}
 
@@ -13,13 +13,13 @@ class Rows[R](val xs: List[R]) {
 }
 
 object Main {
-  // 受け側 `Rows[T]` が呼び出し側の型パラメタを含む形(slick の
-  // `PositionedResultIterator[T]`)。引数は `Nothing` なので、下限を使わない
-  // と `B1` が `Nothing` に解ける。
+  // The receiver `Rows[T]` mentions the caller's type parameter (slick's
+  // `PositionedResultIterator[T]`). The argument is `Nothing`, so without the
+  // lower bound `B1` solves to `Nothing`.
   def firstRow[T](e: Either[Int, Rows[T]]): T =
     e.getOrElse(throw new NoSuchElementException("left")).first
 
-  // 引数が下限より広い形: `B1` は `Any` ではなく `List[Any]`。
+  // The argument is wider than the lower bound: `B1` is `List[Any]`, not `Any`.
   def widened(e: Either[Int, List[Int]]): List[Any] = e.getOrElse(List("s"))
 
   def tried[T](t: Try[Rows[T]]): Int = t.getOrElse(new Rows[T](Nil)).size

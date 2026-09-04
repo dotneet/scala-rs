@@ -247,8 +247,8 @@ conform!(
     rpn_eval,
     json_render,
     ledger_fold,
-    // 差分プローブ第12ラウンド（agent/probe12）。slick / cats が実際に使う形を
-    // 小さく書き直したもの。README「差分プローブ（第12ラウンド）」を参照。
+    // Differential probing, round 12 (agent/probe12). Small rewrites of the shapes
+    // slick / cats actually use. See README's "Differential probes (round 12)".
     query_ast,
     group_report,
     show_typeclass,
@@ -264,9 +264,10 @@ conform!(
     mixin_profile,
     expr_interp,
     override_val_apply,
-    // `Array` 差分プローブ（agent/arraygen）。README「`Array` の codegen」を参照。
-    // 8 本のうち 6 本が最初の実行で差分を出した（`: _*` 展開、`clone`、
-    // `Array[T]` の要素代入、`:+` の記述子、ラムダ引数の `Array` 受け取り）。
+    // `Array` differential probes (agent/arraygen). See README's "`Array` codegen".
+    // Six of the eight showed a difference on the first run (`: _*` expansion,
+    // `clone`, element stores into `Array[T]`, `:+`'s descriptor, taking an
+    // `Array` as a lambda parameter).
     array_histogram,
     array_matrix,
     array_varargs,

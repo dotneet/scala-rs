@@ -1,14 +1,15 @@
-// implicit 引数節が適用されないまま式の型に残るバグの回帰テスト。
-// 4 つの根を 1 ファイルにまとめてある（実 scalac 2.13.16 で同じ出力）。
+// Regression test for the bug where an implicit argument clause stayed unapplied
+// in the type of the expression. Four roots in one file (real scalac 2.13.16
+// produces the same output).
 
 import scala.collection.Factory
 import scala.reflect.ClassTag
 
-// (1) 関数パラメータの *結果* を、パラメータ側のクラスに揃えてから型引数を解く。
-//     `flatMap[B](f: A => IterableOnce[B])` にラムダの本体が `Map[K, V]` を返す
-//     ものを渡すと、`[B]` と `[K, V]` を位置で zip して `B = K` と解いていた。
-//     結果 `toMap` の `A <:< (K, V)` が見つからず、
-//     `(<:<[K, (K, V)])Map[K, V]` が式の型として残っていた。
+// (1) Line the *result* of a function parameter up with the parameter's own class
+//     before solving the type arguments. Given `flatMap[B](f: A => IterableOnce[B])`
+//     a lambda whose body returns `Map[K, V]`, we used to zip `[B]` against `[K, V]`
+//     positionally and solve `B = K`. `toMap` then found no `A <:< (K, V)` and
+//     `(<:<[K, (K, V)])Map[K, V]` was left as the type of the expression.
 object Root1 {
   def collect(mapped: Vector[(String, Map[Long, Int])]): Map[Long, Int] =
     mapped.iterator.flatMap(_._2).toMap
@@ -16,10 +17,10 @@ object Root1 {
     mapped.iterator.flatMap(_._2).toMap.isEmpty
 }
 
-// (2) `A => B` を *継承* したクラス（`<:<` もそう）を Function1 パラメータへ
-//     渡したとき、呼び先の型引数がその引数から解けていなかった。適合自体は
-//     通るので `val g: R => S = ev` は書けるのに、`flatMap(ev)` は
-//     「no matching overload」になっていた。
+// (2) Passing a class that *inherits* `A => B` (`<:<` is one) to a Function1
+//     parameter did not solve the callee's type arguments from that argument.
+//     Conformance itself goes through, so `val g: R => S = ev` is writable, yet
+//     `flatMap(ev)` said "no matching overload".
 abstract class Conv[-A, +B] extends (A => B)
 final class Act[+R](val value: R) {
   def flatMap[R2](f: R => Act[R2]): Act[R2] = f(value)
@@ -35,9 +36,9 @@ object Root2 {
   }
 }
 
-// (3) セレクションの *修飾子* は、それが呼び出し引数の中にあっても
-//     implicit 節を埋めてから使う。`SV(pack.to[Seq], "x")` の `pack` が
-//     `(Sh[…])Qy[R]` のまま残り、`to` が「not a member」になっていた。
+// (3) The *qualifier* of a selection gets its implicit clause filled in before use,
+//     even inside a call argument. The `pack` of `SV(pack.to[Seq], "x")` was left
+//     as `(Sh[…])Qy[R]`, and `to` came out "not a member".
 trait Sh[-M, P]
 final case class SV[A, B](value: A, shape: B)
 final class Qy[E](val name: String) {
@@ -49,9 +50,9 @@ object Root3 {
   def wrap(q: Qy[Int]): SV[Qy[Int], String] = SV(q.pack.to[Seq], "x")
 }
 
-// (4) 導出規則が自分の implicit 引数に `ClassTag` を持つとき、その規則は
-//     「使えない候補」として捨てられていた。`ClassTag` は探索ではなく生成で
-//     埋まるもので、`implicitly[ClassTag[Seq[Any]]]` 単体は通っていた。
+// (4) When a derivation rule carries a `ClassTag` in its own implicit arguments the
+//     rule was dropped as an "unusable candidate". A `ClassTag` is filled by
+//     synthesis rather than search, and `implicitly[ClassTag[Seq[Any]]]` alone did pass.
 trait Coll[C[_]] { def name: String }
 object Coll {
   implicit def forColl[C[X] <: Iterable[X]](implicit

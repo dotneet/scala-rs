@@ -1,8 +1,8 @@
 // `Ordering[Double]` / `Ordering[Float]` / `Ordering[Unit]`.
 //
-// 2.13 では `Ordering.Double` と `Ordering.Float` は名前空間オブジェクトに
-// なっていて（`TotalOrdering` と `IeeeOrdering` を抱える）、implicit として
-// 選ばれるのは `DeprecatedDoubleOrdering` / `DeprecatedFloatOrdering`。
+// In 2.13 `Ordering.Double` and `Ordering.Float` are namespace objects
+// (holding `TotalOrdering` and `IeeeOrdering`), and the implicits actually
+// picked are `DeprecatedDoubleOrdering` / `DeprecatedFloatOrdering`.
 object Main {
   trait Shape { def area: Double; def label: String }
   class Circle(r: Double) extends Shape { def area = 3.0 * r * r; def label = "C" }

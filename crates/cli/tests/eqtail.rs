@@ -1,36 +1,36 @@
-//! `Equiv[T]` の summon（`agent/ordsummon` 残件、`agent/eqtail`）。
+//! Summoning `Equiv[T]` (left over from `agent/ordsummon`; `agent/eqtail`).
 //!
-//! `implicitly[Equiv[Int]]` / `Equiv[Int]` は real scalac 2.13.16 が通すが、
-//! scala-rs は `could not find implicit value` で落ちていた。原因は 2 つ:
+//! Real scalac 2.13.16 accepts `implicitly[Equiv[Int]]` / `Equiv[Int]`, but scala-rs
+//! failed them with `could not find implicit value`. Two causes:
 //!
-//! 1. `Ordering[T] <: PartialOrdering[T] <: Equiv[T]`（実 ABI: `javap -p -s
-//!    scala.math.Ordering` / `PartialOrdering` / `Equiv`）の階層辺を prelude
-//!    が張っていなかった。`val e: Equiv[Int] = Ordering.Int` のような劣化
-//!    代入が `type mismatch` になっていた。
-//! 2. `object Equiv` は `Int` / `Long` / ... の implicit instance を 1 つも
-//!    持っていなかった。real scalac は `implicitly[Equiv[Int]]` にこの
-//!    Equiv 専用 instance（`Equiv$Int$`）を選ぶ（`Ordering.Int` 経由の派生
-//!    ではない） -- `implicitly[Equiv[Int]].getClass.getName` で確認した。
+//! 1. The prelude did not wire up the hierarchy edges of
+//!    `Ordering[T] <: PartialOrdering[T] <: Equiv[T]` (real ABI: `javap -p -s
+//!    scala.math.Ordering` / `PartialOrdering` / `Equiv`). A weakening assignment
+//!    such as `val e: Equiv[Int] = Ordering.Int` came out as `type mismatch`.
+//! 2. `object Equiv` carried no `Int` / `Long` / ... implicit instance at all. Real
+//!    scalac picks the Equiv-specific instance (`Equiv$Int$`) for
+//!    `implicitly[Equiv[Int]]`, not something derived through `Ordering.Int` -- as
+//!    confirmed with `implicitly[Equiv[Int]].getClass.getName`.
 //!
-//! 直したのは `crates/typer/src/prelude_eqtail.rs`（新規モジュール）。
-//! `Equiv` / `PartialOrdering` は他の `scala.math` 型クラス
-//! （`Ordering` / `Numeric` / `Integral` / `Fractional`）と同じく、jar の
-//! 遅延ロードを待たず prelude の時点で自前の class + companion module を
-//! 作って現在スコープに入れる。
+//! The fix is `crates/typer/src/prelude_eqtail.rs` (a new module). Like the other
+//! `scala.math` type classes (`Ordering` / `Numeric` / `Integral` / `Fractional`),
+//! `Equiv` / `PartialOrdering` get their own class plus companion module built and
+//! entered into the current scope at prelude time, without waiting for the jar to be
+//! lazily loaded.
 //!
-//! `implicitly[PartialOrdering[Int]]` には real scalac にも instance が
-//! 無いので、階層辺を足しても summon できるようになってはいけない
-//! （`eq2_summon_bad` で確認）。
+//! Real scalac has no instance for `implicitly[PartialOrdering[Int]]` either, so
+//! adding the hierarchy edges must not make it summonable (checked by
+//! `eq2_summon_bad`).
 //!
-//! 同じブランチ（`agent/parentcheck` 残件）で `new T`（型パラメータ）/
-//! `new A`（未エイリアスの抽象型メンバ）も直す。real scalac は
-//! `class type required but T found`（型パラメータ）/ `class type required
-//! but X.this.A found`（抽象型メンバ、実装のいらない `this` 修飾つき）で
-//! 拒否するが、scala-rs は黙って通していた。`check.rs` の `new` 式の
-//! `Ident` 分岐に「解決済みで、かつクラスでない」ときだけ発火する判定を足す
-//! （`new_alias_target` が dealias を試したあと、まだ `TypeParam` /
-//! `TypeMember` のままの symbol だけを見るので、jar 由来の type alias を
-//! 誤判定しない）。
+//! The same branch (left over from `agent/parentcheck`) also fixes `new T` (a type
+//! parameter) and `new A` (an unaliased abstract type member). Real scalac rejects
+//! them with `class type required but T found` (type parameter) and `class type
+//! required but X.this.A found` (abstract type member, with a `this` qualifier that
+//! needs no implementation), while scala-rs let them through silently. The `Ident`
+//! branch of the `new` expression in `check.rs` gains a check that fires only when
+//! the target is resolved and is not a class (`new_alias_target` tries dealiasing
+//! first and then looks only at symbols still left as `TypeParam` / `TypeMember`, so
+//! a type alias from the jar is not misjudged).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -134,7 +134,7 @@ fn jar_run(name: &str) {
     let _ = fs::remove_dir_all(&out);
 }
 
-/// 期待値は real scalac 2.13.16 が印字するものでなければならない。
+/// The expectation has to be what real scalac 2.13.16 prints.
 fn matches_real_scalac(name: &str) {
     let (Some(scalac), Some(jar), true) = (find_scalac(), scala_library_jar(), java_available())
     else {
@@ -168,10 +168,10 @@ fn eq2_summon_matches_real_scalac() {
     matches_real_scalac("eq2_summon");
 }
 
-/// real scalac も同じ 3 行を、同じ理由で拒否する: `PartialOrdering[Int]` に
-/// は instance が無い（階層辺は summon 可能な instance を新しく生まない）、
-/// `Equiv[Int]` は `Ordering[Int]` ではない（劣化は Equiv 方向だけ）、
-/// companion object 自身は `Equiv` ではない。
+/// Real scalac rejects the same 3 lines for the same reasons: `PartialOrdering[Int]`
+/// has no instance (a hierarchy edge creates no new summonable instance), an
+/// `Equiv[Int]` is not an `Ordering[Int]` (the weakening only goes towards Equiv),
+/// and the companion object itself is not an `Equiv`.
 #[test]
 fn eq2_summon_bad_is_rejected() {
     let Some(jar) = scala_library_jar() else {
@@ -198,9 +198,9 @@ fn eq2_summon_bad_is_rejected() {
     let _ = fs::remove_dir_all(&out);
 }
 
-/// 私有ランタイム（`--no-scala-library`）には `scala/math/Equiv` の
-/// classfile が無い。`prelude_eqtail` は `library_abi` でゲートしてあり、
-/// 黙って通すのではなく診断が出る。
+/// The private runtime (`--no-scala-library`) has no `scala/math/Equiv` classfile.
+/// `prelude_eqtail` is gated on `library_abi`, so a diagnostic comes out rather than
+/// silent acceptance.
 #[test]
 fn summon_is_diagnosed_without_the_jar() {
     let out = tmp_dir("eq2-private");

@@ -1,8 +1,8 @@
-//! `StringOps.map[B](f: Char => B): IndexedSeq[B]`。
+//! `StringOps.map[B](f: Char => B): IndexedSeq[B]`.
 //!
-//! `prelude.rs` からは [`install`] を 1 行呼ぶだけにしてある。
+//! `prelude.rs` calls [`install`] on a single line.
 //!
-//! 2.13 の `StringOps` は `map` を 2 つ持つ。javap 2.13.16:
+//! 2.13's `StringOps` has two `map`s. javap 2.13.16:
 //!
 //! ```text
 //! public static java.lang.String map$extension(java.lang.String, scala.Function1);
@@ -10,19 +10,20 @@
 //!     map$extension(java.lang.String, scala.Function1);
 //! ```
 //!
-//! 戻り型だけが違う 2 本で、JVM の descriptor としては別物。prelude 側も
-//! **2 つのシンボル**として持つのが正しい（1 つに畳むと `value_extension_desc`
-//! がシンボルの結果型から descriptor を作るので、`Char => Char` のときにも
-//! `IndexedSeq` を返す方を呼んで `ClassCastException` になる）。
+//! Two methods differing only in return type, and distinct as JVM descriptors. The
+//! prelude side is right to hold them as **two symbols** (folding them into one makes
+//! `value_extension_desc`, which builds the descriptor from the symbol's result type,
+//! call the `IndexedSeq`-returning one even for `Char => Char` and throw
+//! `ClassCastException`).
 //!
-//! 2 つ並べたときのオーバーロード解決は nsc と同じ「より specific な方を採る」
-//! で決まる: `Char => Char` は `Char => B` に適用できるが逆は成り立たないので、
-//! ラムダが `Char` を返すときだけ `String` 版が勝つ。関数リテラルの結果型が
-//! まだ決まっていない状態で両方が applicable になる件は `check.rs` の
-//! `is_as_specific_method` が処理する。
+//! With both present, overload resolution settles it the same way nsc does, by taking
+//! the more specific one: `Char => Char` is applicable to `Char => B` but not the
+//! other way round, so the `String` version wins exactly when the lambda returns
+//! `Char`. The case where both are applicable because the function literal's result
+//! type is not yet known is handled by `is_as_specific_method` in `check.rs`.
 //!
-//! **私有ランタイム（`--no-scala-library`）** には `StringOps` 自体が無いので
-//! `library_abi` のときだけ入れる。
+//! The **private runtime (`--no-scala-library`)** has no `StringOps` at all, so this
+//! is installed only under `library_abi`.
 
 use crate::symbol::{SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};
@@ -37,7 +38,7 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     let Some(idx) = find_indexed_seq(st) else {
         return;
     };
-    // `map(Char => Char): String` は prelude.rs が入れる。同じ名前で 2 本目。
+    // `map(Char => Char): String` is installed by prelude.rs. This is the second one under the same name.
     if st
         .lookup_member(so, "map")
         .into_iter()

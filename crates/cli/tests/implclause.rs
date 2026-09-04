@@ -1,13 +1,13 @@
-//! implicit 引数節が適用されないまま式の型に残るバグの回帰テスト。
+//! Regression tests for the bug where an implicit argument clause stayed unapplied in the type of the expression.
 //!
-//! `tests/fixtures/implclause.scala` に 4 つの根をまとめてある（実 scalac
-//! 2.13.16 と同じ出力になることは手で確認済み）。すべて `Map` / `Iterator` /
-//! `ClassTag` / `Factory` を使うので、私有ランタイムでは動かない ——
-//! `--scala-library` モードのみ。
+//! `tests/fixtures/implclause.scala` collects the four roots (checked by hand to
+//! produce the same output as real scalac 2.13.16). They all use `Map` /
+//! `Iterator` / `ClassTag` / `Factory`, so none of them run under the private
+//! runtime -- `--scala-library` mode only.
 //!
-//! ヘルパは `crates/cli/tests/lowbound.rs` に倣う。`java` は常に
-//! `-Xverify:all` 付きで走らせ、型引数を取り違えた codegen が黙って通らない
-//! ようにしてある。
+//! The helpers follow `crates/cli/tests/lowbound.rs`. `java` is always run with
+//! `-Xverify:all`, so codegen that got a type argument wrong cannot slip through
+//! quietly.
 
 use std::fs;
 use std::path::PathBuf;
@@ -133,15 +133,15 @@ fn compile_diagnostics(name: &str) -> String {
     err
 }
 
-/// 4 つの根をまとめた fixture が、実 scalac と同じ出力を出すこと。
+/// The fixture collecting the four roots produces the same output as real scalac.
 #[test]
 fn fixtures_implclause_scala_library() {
     check_library("implclause");
 }
 
-/// 埋まらない implicit 節は、修飾子位置でも「メンバではない」ではなく
-/// 「見つからない implicit」として報告されること。緩めた側が黙って通す方向へ
-/// 倒れていないかを押さえる。
+/// An implicit clause that cannot be filled is reported as a missing implicit, not
+/// as "is not a member", in qualifier position too. Pins that what we relaxed did
+/// not tip over into quietly accepting.
 #[test]
 fn implclause_bad_reports_missing_implicit() {
     let err = compile_diagnostics("implclause_bad");

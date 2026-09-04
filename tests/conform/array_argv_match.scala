@@ -1,4 +1,4 @@
-// コマンド行を Array のパターンで分岐する。
+// Dispatch on the command line with an Array pattern.
 object Main {
   def run(argv: Array[String]): String = argv match {
     case Array()                 => "usage"

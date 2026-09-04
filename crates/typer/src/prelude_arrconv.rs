@@ -1,36 +1,36 @@
-//! `ArrayOps` の変換・集約系メソッドと `scala.collection.MapView` の穴埋め。
+//! The conversion and aggregation methods of `ArrayOps`, and filling the holes in `scala.collection.MapView`.
 //!
-//! `crates/typer/src/prelude.rs` の `install_prelude`（`library_abi` 時のみ）
-//! から 1 箇所だけ呼ばれる。マージ衝突を避けるため既存ファイルへは足さず、
-//! この新規モジュールに分離した（`.agent-brief.md` の方針）。
+//! Called from exactly one place, `install_prelude` in `crates/typer/src/prelude.rs`
+//! (only under `library_abi`). To avoid merge conflicts this is split out into a new
+//! module rather than added to an existing file (`.agent-brief.md`'s policy).
 //!
-//! nsc 2.13.16 の実際の ABI は複雑で、`scala.collection.ArrayOps` に
-//! `$extension` static として存在するメンバ（`toSeq` / `groupBy` /
-//! `sortBy` / `updated` / …）は素直に `invokestatic` できるが、
+//! nsc 2.13.16's actual ABI is involved. The members that exist as `$extension`
+//! statics on `scala.collection.ArrayOps` (`toSeq` / `groupBy` / `sortBy` /
+//! `updated` / …) can simply be `invokestatic`'d, but
 //! `toList` / `toSet` / `toVector` / `toBuffer` / `sum` / `product` /
 //! `min` / `max` / `minBy` / `maxBy` / `mkString` / `reduce` /
-//! `reduceLeft` は **`ArrayOps` 自身には存在しない**
-//! （`javap -s scala.collection.ArrayOps` で確認済み）。
-//! 実際の nsc は `Predef.wrapXArray`（`scala.LowPriorityImplicits`）で
-//! `Array` を `scala.collection.mutable.ArraySeq` に包んでから
-//! `scala.collection.IterableOnceOps` のデフォルトメソッドを呼ぶ。
-//! このモジュールの codegen 側（`crates/backend/src/gen.rs`）もそれに合わせて
-//! `wrapXArray` 経由で `invokeinterface` する。
+//! `reduceLeft` **do not exist on `ArrayOps` itself**
+//! (confirmed with `javap -s scala.collection.ArrayOps`).
+//! What nsc actually does is wrap the `Array` into a
+//! `scala.collection.mutable.ArraySeq` with `Predef.wrapXArray`
+//! (`scala.LowPriorityImplicits`) and then call the default methods of
+//! `scala.collection.IterableOnceOps`. The codegen side of this module
+//! (`crates/backend/src/gen.rs`) matches that and `invokeinterface`s via `wrapXArray`.
 
 use crate::prelude::{fn1, fn2, iface, method, module, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Type};
 
-/// `scala.collection.IterableOnce[A]` を（既存があれば）再利用して返す。
+/// Return `scala.collection.IterableOnce[A]`, reusing an existing one if there is one.
 ///
-/// `add_array_ops_zip`（`prelude.rs`）がすでに `scala/collection` 直下に
-/// `IterableOnce` を作り、`List` の `parents` に `IterableOnce[A]` を
-/// 追加済みなので、ここで**新規に**同名 symbol を作ってしまうと
-/// （`List(1,2).concat(...)` のように）`List` リテラルを引数に渡せなくなる。
-/// 既存の symbol を探し、見つからなければ作る（かつ `List` を subtype に
-/// する）。`zipAll` の `Iterable[B]` パラメータにも流用する（型検査上は
-/// `IterableOnce` として緩く見るだけで、codegen 側は実 ABI の
-/// `Lscala/collection/Iterable;` 記述子をそのまま使うので実行時は問題ない）。
+/// `add_array_ops_zip` (`prelude.rs`) has already created an `IterableOnce` directly
+/// under `scala/collection` and added `IterableOnce[A]` to `List`'s `parents`, so
+/// creating a **fresh** symbol of the same name here would stop `List` literals from
+/// being passed as arguments (as in `List(1,2).concat(...)`). Look for the existing
+/// symbol and create one only if it is missing (making `List` a subtype of it too).
+/// It is reused for `zipAll`'s `Iterable[B]` parameter as well (for typechecking this
+/// only loosens the view to `IterableOnce`; codegen still uses the real ABI
+/// descriptor `Lscala/collection/Iterable;`, so run time is unaffected).
 fn find_iterable_once(st: &mut SymbolTable, coll: SymbolId) -> SymbolId {
     let existing = st
         .lookup_member(coll, "IterableOnce")
@@ -59,15 +59,15 @@ fn find_iterable_once(st: &mut SymbolTable, coll: SymbolId) -> SymbolId {
     ioc
 }
 
-/// `install_prelude` から呼ばれるエントリポイント。
+/// The entry point called from `install_prelude`.
 ///
-/// - `aops`: `scala.collection.ArrayOps[A]` （`add_array_ops` が作った symbol）
+/// - `aops`: `scala.collection.ArrayOps[A]` (the symbol `add_array_ops` created)
 /// - `tuple2`: `scala.Tuple2[A, B]`
-/// - `ordering`: `scala.math.Ordering[T]`（`add_ordering` が作った symbol。
-///   既存の `Ordering.Int` / `Ordering.Char` インスタンスをそのまま使う）
+/// - `ordering`: `scala.math.Ordering[T]` (the symbol `add_ordering` created; the
+///   existing `Ordering.Int` / `Ordering.Char` instances are used as they are)
 ///
-/// `Map` symbol は `add_map_and_vector` が返り値なしで作るので、
-/// `scala.Map` として自力で引き直す。
+/// `add_map_and_vector` creates the `Map` symbol without returning it, so we look it
+/// up ourselves as `scala.Map`.
 pub(crate) fn install(st: &mut SymbolTable, aops: SymbolId, tuple2: SymbolId, ordering: SymbolId) {
     let map_sym = st
         .lookup_member(st.scala_pkg, "Map")
@@ -80,12 +80,12 @@ pub(crate) fn install(st: &mut SymbolTable, aops: SymbolId, tuple2: SymbolId, or
     add_map_view(st, map_sym, tuple2);
 }
 
-/// `scala.math.Numeric[T]` + 実装のある `implicit object Int`
-/// (`scala/math/Numeric$IntIsIntegral$`) / `Long` / `Double`。
+/// `scala.math.Numeric[T]` plus the implemented `implicit object Int`
+/// (`scala/math/Numeric$IntIsIntegral$`) / `Long` / `Double`.
 ///
-/// `sum` / `product` の `Numeric[B]` implicit 引数解決に使う。`Ordering`
-/// (`add_ordering`) と同じ形: companion module のメンバーを
-/// `Flags::IMPLICIT` で登録し、`search_implicit` が拾えるようにする。
+/// Used to resolve the `Numeric[B]` implicit argument of `sum` / `product`. Same
+/// shape as `Ordering` (`add_ordering`): the companion module's members are
+/// registered with `Flags::IMPLICIT` so that `search_implicit` can find them.
 fn add_numeric(st: &mut SymbolTable) -> SymbolId {
     let math = crate::classpath::ensure_package(st, "scala/math");
     // `Numeric` may already exist (prelude_seq declares it for List.sum).
@@ -147,15 +147,15 @@ fn add_numeric_instance(
     }];
 }
 
-/// `ArrayOps` に `$extension` static として直接存在するメンバ
-/// (nsc 2.13.16, `javap -s scala.collection.ArrayOps` で確認済み)。
+/// The members that exist directly on `ArrayOps` as `$extension` statics
+/// (nsc 2.13.16, confirmed with `javap -s scala.collection.ArrayOps`).
 ///
 /// `toSeq$extension` / `toIndexedSeq$extension` / `groupBy$extension` /
 /// `sortBy$extension` / `sorted$extension` / `sortWith$extension` /
 /// `zipAll$extension` / `indexWhere$extension` / `lastIndexOf$extension` /
 /// `patch$extension` / `updated$extension` / `appended$extension` /
 /// `prepended$extension` / `concat$extension`
-/// (`concat` 自体が `++` の実体、`$plus$plus$extension` も同じ形)。
+/// (`concat` is the real implementation of `++`; `$plus$plus$extension` has the same shape).
 fn add_array_ops_simple_extensions(
     st: &mut SymbolTable,
     aops: SymbolId,
@@ -174,8 +174,8 @@ fn add_array_ops_simple_extensions(
     let array_a = Type::Array(Box::new(ta.clone()));
 
     // toSeq / toIndexedSeq: `Array[A] => Seq[A]` / `=> IndexedSeq[A]`.
-    // `Seq` / `IndexedSeq` はすでに `scala.Seq` / `scala.IndexedSeq` として
-    // 登録済み（`add_seq_and_lazylist` / `add_indexedseq_and_queue`）なので探す。
+    // `Seq` / `IndexedSeq` are already registered as `scala.Seq` / `scala.IndexedSeq`
+    // (`add_seq_and_lazylist` / `add_indexedseq_and_queue`), so look them up.
     let seq = st
         .lookup_member(st.scala_pkg, "Seq")
         .into_iter()
@@ -509,11 +509,10 @@ fn add_one_elem_ct_method(
     };
 }
 
-/// `ArrayOps` 自身には存在せず、nsc が
-/// `Predef.wrapXArray` 経由で `mutable.ArraySeq` に包んでから
-/// `IterableOnceOps` のデフォルトメソッドとして呼ぶメンバ。
-/// codegen 側 (`crates/backend/src/gen.rs`) が receiver 評価直後に
-/// `wrapXArray` 呼び出しを挟む。
+/// The members that do not exist on `ArrayOps` itself, which nsc calls as default
+/// methods of `IterableOnceOps` after wrapping into a `mutable.ArraySeq` via
+/// `Predef.wrapXArray`. The codegen side (`crates/backend/src/gen.rs`) inserts the
+/// `wrapXArray` call right after evaluating the receiver.
 fn add_array_ops_wrapped_conversions(
     st: &mut SymbolTable,
     aops: SymbolId,
@@ -719,12 +718,11 @@ fn add_by_pick(st: &mut SymbolTable, aops: SymbolId, ta: &Type, ordering: Symbol
 
 /// `scala.collection.MapView[K, V]` + `Map.view()`.
 ///
-/// nsc 2.13.16: `MapView` は `MapOps` と `View` を継承する trait で、
-/// `keys` / `values` / `filterKeys` / `mapValues` は `MapView` 自身の
-/// デフォルトメソッド。`toMap` / `toList` / `toSeq` / `size` / `isEmpty` /
-/// `foreach` は `IterableOnceOps` のデフォルトメソッド
-/// （`MapView` はそれも継承している）ので codegen は
-/// `scala/collection/IterableOnceOps` へ `invokeinterface` する。
+/// nsc 2.13.16: `MapView` is a trait extending `MapOps` and `View`, and `keys` /
+/// `values` / `filterKeys` / `mapValues` are default methods on `MapView` itself.
+/// `toMap` / `toList` / `toSeq` / `size` / `isEmpty` / `foreach` are default methods
+/// on `IterableOnceOps` (which `MapView` also extends), so codegen
+/// `invokeinterface`s them on `scala/collection/IterableOnceOps`.
 /// `method`, unless the owner already declares a member with that name.
 fn method_absent(
     st: &mut SymbolTable,
@@ -789,8 +787,8 @@ fn add_map_view(st: &mut SymbolTable, map_sym: SymbolId, tuple2: SymbolId) {
         sym: iterable,
         args: vec![a],
     };
-    // `mv.keys.toList` / `mv.values.toList` が通るよう、Iterable 側にも
-    // 最低限 toList/foreach を足しておく（IterableOnceOps 経由）。
+    // Add at least toList/foreach on the Iterable side too (via IterableOnceOps), so
+    // that `mv.keys.toList` / `mv.values.toList` go through.
     method_absent(
         st,
         iterable,
@@ -857,10 +855,10 @@ fn add_map_view(st: &mut SymbolTable, map_sym: SymbolId, tuple2: SymbolId) {
         ret: Box::new(mapview_t(tw)),
     };
 
-    // toMap: Map[K, V] — `<:<` evidence は codegen が
-    // `scala.$less$colon$less$.MODULE$.refl()` で合成するので、typer 側は
-    // 引数無しの単純なシグネチャにする（MapView[K, V] の要素は常に
-    // (K, V) なので `A <:< (K, V)` は常に成立する）。
+    // toMap: Map[K, V] -- codegen synthesises the `<:<` evidence with
+    // `scala.$less$colon$less$.MODULE$.refl()`, so on the typer side this gets a
+    // simple argument-less signature (a `MapView[K, V]`'s elements are always
+    // (K, V), so `A <:< (K, V)` always holds).
     method_absent(
         st,
         mapview,

@@ -1,4 +1,4 @@
-// Array をジェネリックに扱う（ClassTag つきの自作ユーティリティ）。
+// Handle Array generically (a hand-rolled utility with a ClassTag).
 import scala.reflect.ClassTag
 
 object Buf {

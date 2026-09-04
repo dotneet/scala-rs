@@ -1,4 +1,4 @@
-// その場で並べ替える（update / swap / while）と、Array の生成ファクトリ。
+// Sorting in place (update / swap / while), and the Array factories.
 object Main {
   def swap(a: Array[Int], i: Int, j: Int): Unit = {
     val t = a(i)

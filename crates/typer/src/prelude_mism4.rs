@@ -1,29 +1,28 @@
-//! `Map` は `K => V` である。
+//! A `Map` is a `K => V`.
 //!
-//! `prelude.rs` からは [`install`] を 1 行呼ぶだけにしてある。
+//! `prelude.rs` calls [`install`] on a single line.
 //!
-//! 2.13 の `scala.collection.Map[K, +V]` は宣言そのものが
-//! `PartialFunction[K, V]`（したがって `K => V`）を継承している
-//! （`javap scala/collection/Map` の interface 一覧に `scala/Function1` が
-//! 並ぶ）。prelude の階層表（`prelude_hier.rs`）は `Iterable` 側の辺しか
-//! 張っていなかったので、
+//! In 2.13 the declaration of `scala.collection.Map[K, +V]` itself extends
+//! `PartialFunction[K, V]` (hence `K => V`) -- `scala/Function1` is right there in
+//! the interface list of `javap scala/collection/Map`. The prelude's hierarchy table
+//! (`prelude_hier.rs`) wired up only the `Iterable` edge, so
 //!
 //! ```scala
 //! val symbolToIndex: TermSymbol => Int = someMap   // slick QueryInterpreter
 //! ```
 //!
-//! が `type mismatch; found: Map[TermSymbol, Int]  required: (TermSymbol) => Int`
-//! になっていた。辺を 1 本足すだけで解ける。`Seq[A] <: Int => A` /
-//! `Set[A] <: A => Boolean` も実在するが、ここでは張らない（オーバーロード
-//! 解決と implicit 探索に効く範囲が広く、slick では必要にならない）。
+//! came out as `type mismatch; found: Map[TermSymbol, Int]  required: (TermSymbol) => Int`.
+//! One extra edge solves it. `Seq[A] <: Int => A` / `Set[A] <: A => Boolean` are real
+//! too, but are not wired up here (they reach further into overload resolution and
+//! implicit search, and slick never needs them).
 //!
-//! `Function1` を親に持てるようになったのは `symbol.rs` の
-//! `function_class_shape` を入れたため。`scala.FunctionN[T1, …, R]` という
-//! クラス型と構造的な `(T1, …) => R` は同じ型で、prelude は前者を親として
-//! 書き、それ以外の場所では後者を使う。
+//! `Function1` became usable as a parent once `symbol.rs`'s `function_class_shape`
+//! went in. The class type `scala.FunctionN[T1, …, R]` and the structural
+//! `(T1, …) => R` are the same type; the prelude writes the former as a parent and
+//! everywhere else uses the latter.
 //!
-//! **私有ランタイム（`--no-scala-library`）** でも `Map` も `Function1` も
-//! prelude が用意しているのでゲート不要。見つからないときは黙って何もしない。
+//! No gate is needed for the **private runtime (`--no-scala-library`)** either, since
+//! the prelude provides both `Map` and `Function1`. If they are not found, do nothing.
 
 use crate::symbol::{SymKind, SymbolTable};
 use scala_rs_parser::{SymbolId, Type};

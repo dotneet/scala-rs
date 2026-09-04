@@ -1,6 +1,6 @@
-// 異常系：適合する implicit view が無いときは今までどおり拒否されること。
-// 実 scalac も "No implicit view available from Plain => Ordered[Plain]" で
-// 落ちる。受け入れすぎていないかの歯止め。
+// The rejection side: with no conforming implicit view, this is still refused.
+// Real scalac fails with "No implicit view available from Plain => Ordered[Plain]"
+// too. A stop against accepting too much.
 class Plain(val n: Int)
 
 object Main {
