@@ -141,13 +141,21 @@ differ only in where slick comes from.
 
 | | files | errors | files with errors |
 |---|---|---|---|
-| slick as scala-rs compiled it, before | 56 | 2183 | 51 |
-| slick as scala-rs compiled it, after | 56 | **1977** | 51 |
-| slick 3.6.1 from Maven, before | 56 | 2534 | 50 |
-| slick 3.6.1 from Maven, after | 56 | **2198** | 50 |
+| slick as scala-rs compiled it, before | 56 | 2164 | 51 |
+| slick as scala-rs compiled it, after | 56 | **1959** | 51 |
+| slick 3.6.1 from Maven, before | 56 | 2740 | 50 |
+| slick 3.6.1 from Maven, after | 56 | **2183** | 50 |
 
-`tests/slick_measure.sh` is unchanged at 184 files / 0 errors / 2127 classes.
-`crates/backend/` was not touched, so `slick_subset.sh` was not re-run.
+Both rows of each pair are measured on the *merged* tree, i.e. the "before" is
+`main` at the merge base and not this branch's own starting point.
+
+`tests/slick_measure.sh` is unchanged at 184 files / 0 errors. Its class count
+is **1552**, not the 2127 the earlier section records: `main` itself moved
+there while this slice ran (622 of the 575 net classes that went away are
+`$anonfun$` class files, from the lambda work on `main`), and the same 1552
+comes out of `main` with none of this branch's changes applied.
+`crates/backend/` was not touched by this slice, so `slick_subset.sh` was not
+re-run.
 
 The Maven column is worth having because it separates two defects that the
 single-column measurement adds together. Class files scalac wrote are known
@@ -207,7 +215,7 @@ through a receiver (`t.describe`) and a bare name inside the subclass body
 snapshots member lists that are still empty for a jar class. The ancestor walk
 now adopts a non-`java.*` ancestor that has a pickle, and
 `Check::expose_inherited_from_binary` runs the same completion for an
-unqualified name. Together: 695 of the 2534 diagnostics in the Maven column.
+unqualified name. Together: 695 of the 2740 diagnostics in the Maven column.
 
 ## What the measurement now says the blocker is
 

@@ -7534,7 +7534,9 @@ impl Typer {
         if !self.st.get(cls).is_class_like() {
             return;
         }
-        let found = self.pickle.complete(&mut self.st, &mut self.binary, cls, name);
+        let found = self
+            .pickle
+            .complete(&mut self.st, &mut self.binary, cls, name);
         for id in found {
             self.st.enter_in_current(name, id);
         }
