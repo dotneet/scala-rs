@@ -601,6 +601,10 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     crate::prelude_lazyref::install(st);
 
     st.push_scope();
+    // Everything below lands in this scope, and it stays open for the whole
+    // run: it is what `java.lang._` / `scala._` / `Predef._` being open
+    // around every unit amounts to here.
+    st.prelude_scope = st.scopes.len() - 1;
     st.enter_in_current("scala", st.scala_pkg);
     st.enter_in_current("java", java);
     if reflect_context_stub {

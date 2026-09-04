@@ -837,7 +837,12 @@ impl Typer {
                 // reference from elsewhere in the package was rejected
                 // (slick's `GetResult.GetUpdateValue`).
                 self.st.get_mut(id).private_within = within;
+                // Before entering it: a source definition of a name the
+                // prelude supplies replaces the prelude's symbol, which is
+                // otherwise the one every lookup returns.
+                self.st.shadow_supplied_by_source(id);
                 self.st.enter_in_current(name, id);
+                self.auto_import_scala_member(name, id);
                 tree.sym = id;
                 if mods.flags.contains(Flags::CASE) {
                     let class_jvm = jvm.clone();
@@ -891,11 +896,26 @@ impl Typer {
                 self.st.get_mut(cls).annotations = annots;
                 self.st.get_mut(m).private_within = mods_within.clone();
                 self.st.get_mut(cls).private_within = mods_within;
+                self.st.shadow_supplied_by_source(cls);
+                self.st.shadow_supplied_by_source(m);
                 self.st.enter_in_current(name, m);
+                self.auto_import_scala_member(name, m);
                 tree.sym = m;
             }
             TreeKind::PackageDef { .. } => {}
             _ => {}
+        }
+    }
+
+    /// `scala._` is open around every unit, so a source definition that lands
+    /// directly in package `scala` is in scope everywhere, not only in the
+    /// files that write `package scala` themselves. The prelude's copy of the
+    /// package's members was taken before any source was read, so the entry
+    /// has to be made here as well; see
+    /// [`SymbolTable::enter_in_prelude_scope`].
+    fn auto_import_scala_member(&mut self, name: &str, id: SymbolId) {
+        if self.st.owner == self.st.scala_pkg && !self.st.scala_pkg.is_none() {
+            self.st.enter_in_prelude_scope(name, id);
         }
     }
 
@@ -984,6 +1004,8 @@ impl Typer {
         );
         self.st.get_mut(m).ty = Type::ModuleRef(cls);
         self.st.get_mut(cls).ty = Type::ModuleRef(cls);
+        self.st.shadow_supplied_by_source(cls);
+        self.st.shadow_supplied_by_source(m);
         self.st.enter_in_current(name, m);
         // apply / unapply filled after ctor params are known
         let _ = class_id;
@@ -19822,6 +19844,15 @@ impl Typer {
                     Some("<repeated>") => {
                         Type::Repeated(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
                     }
+                    // `Option` / `List` / `Some` name the prelude's symbol by
+                    // hand here, whatever prefix they are written with, and
+                    // that survives a source definition of `scala.Option`.
+                    // Making them yield to the source symbol is *not* an
+                    // improvement yet: it takes `src/library` from 2014
+                    // errors to 2251 and from 172 to 205 files, because the
+                    // prelude's `Option` carries members the source one does
+                    // not have working signatures for. See
+                    // `docs/scala-library.md`.
                     Some("Option") => Type::Class {
                         sym: self.st.option_sym,
                         args: as_,

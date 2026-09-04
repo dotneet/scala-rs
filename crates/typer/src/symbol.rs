@@ -338,6 +338,21 @@ impl Symbol {
     }
 }
 
+/// Which prelude symbol a source definition may take the place of. Scala
+/// keeps terms and types in separate namespaces, so a source `object Option`
+/// replaces the prelude's module and leaves its class alone, and a source
+/// `trait Option` does the opposite. A source class also replaces a prelude
+/// *alias* of that name (`type Seq[+A] = …` in the `scala` package object is
+/// what `Seq.scala` defines).
+fn shadowable_kind(new: SymKind, old: SymKind) -> bool {
+    match new {
+        SymKind::Class => matches!(old, SymKind::Class | SymKind::TypeMember),
+        SymKind::Module => old == SymKind::Module,
+        SymKind::ModuleClass => old == SymKind::ModuleClass,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
     map: HashMap<String, Vec<SymbolId>>,
@@ -371,6 +386,26 @@ impl Scope {
             return;
         }
         slot.push(id);
+    }
+
+    /// Put `with` where `victims` stood, under `name`.
+    ///
+    /// Used when a source definition replaces a prelude symbol: the prelude
+    /// entered `IterableOnce` into the base scope by hand, and that entry has
+    /// to become the source trait rather than merely be joined by it.
+    /// Returns whether anything was there.
+    pub fn replace(&mut self, name: &str, victims: &[SymbolId], with: SymbolId) -> bool {
+        let Some(slot) = self.map.get_mut(name) else {
+            return false;
+        };
+        if !slot.iter().any(|s| victims.contains(s)) {
+            return false;
+        }
+        slot.retain(|s| !victims.contains(s));
+        if !slot.contains(&with) {
+            slot.push(with);
+        }
+        true
     }
 
     pub fn enter_wildcard(&mut self, owner: SymbolId, hidden: &[String]) {
@@ -492,6 +527,21 @@ pub struct SymbolTable {
     /// one) arrives from a classfile instead, where a by-name parameter is
     /// indistinguishable from a `Function0`. This is the line between the two.
     pub prelude_end: u32,
+    /// Prelude symbols a source definition of the same fully qualified name
+    /// has replaced; see [`SymbolTable::shadow_supplied_by_source`].
+    ///
+    /// The symbols stay in `symbols` — their ids are already written into
+    /// prelude signatures — but they are unreachable by name: taken out of
+    /// their owner's `members`, replaced in every open scope, and skipped by
+    /// `find_class_by_jvm`.
+    pub prelude_shadowed: rustc_hash::FxHashSet<SymbolId>,
+    /// Index in `scopes` of the scope `install_prelude` puts its names in.
+    ///
+    /// It is the outermost scope that has anything in it and it never pops,
+    /// so it is where the auto-imported `scala._` / `java.lang._` / `Predef._`
+    /// members live. A source definition in package `scala` has to join them
+    /// there: see [`SymbolTable::enter_in_prelude_scope`].
+    pub prelude_scope: usize,
     /// User-written `unapplySeq`s whose `Option` payload is *not* a `List`.
     ///
     /// The backend reads a sequence pattern's elements off the payload, and
@@ -615,6 +665,8 @@ impl SymbolTable {
             local_lazy_accessors: rustc_hash::FxHashMap::default(),
             local_lazy_nlr: rustc_hash::FxHashSet::default(),
             prelude_end: 0,
+            prelude_shadowed: rustc_hash::FxHashSet::default(),
+            prelude_scope: 0,
             seq_extractor_payload: rustc_hash::FxHashMap::default(),
             jvm_index: std::cell::RefCell::new(JvmIndex::default()),
             erasure_settled: false,
@@ -694,6 +746,82 @@ impl SymbolTable {
 
     pub fn enter_in_current(&mut self, name: &str, id: SymbolId) {
         self.scopes.last_mut().unwrap().enter(name, id);
+    }
+
+    /// Auto-import a source definition that belongs in package `scala`.
+    ///
+    /// nsc opens `java.lang._`, `scala._` and `Predef._` around every
+    /// compilation unit. The prelude models the `scala._` half by copying the
+    /// package's members into its own scope once, at install time — a
+    /// snapshot, which a source `Tuple9.scala` compiled in the same run
+    /// arrives too late for. In `--no-scala-library` mode the prelude does
+    /// not build `Tuple3` and up at all (there is no such class in the
+    /// private runtime), so `Ordering.scala`, three packages away, could not
+    /// see the source `Tuple9` under any spelling: `class_sym_of` answered
+    /// `None` for `(T1, …, T9)` and every `x._1` on it was "not a member".
+    pub fn enter_in_prelude_scope(&mut self, name: &str, id: SymbolId) {
+        let i = self.prelude_scope;
+        if let Some(sc) = self.scopes.get_mut(i) {
+            sc.enter(name, id);
+        }
+    }
+
+    /// A source definition of a name the prelude also supplies **replaces**
+    /// the prelude's symbol.
+    ///
+    /// The typer knows the standard library as the hand-written
+    /// `prelude*.rs` signature tables, so compiling `src/library` itself asks
+    /// it to typecheck source definitions of the very names it already
+    /// believes it knows. Without this, `trait IterableOnce` in
+    /// `package scala.collection` merely joins the prelude's `IterableOnce`
+    /// in the package's member list, the prelude's symbol is the one every
+    /// lookup returns (it was allocated first), and the file that *defines*
+    /// `iterator` reports `value iterator is not a member of IterableOnce[A]`.
+    ///
+    /// "Replaces" means unreachable by name: out of the owner's `members`
+    /// (so `lookup_member` and the per-package scope built from it stop
+    /// seeing it), out of every open scope — the prelude enters names like
+    /// `IterableOnce` and `<:<` into the base scope by hand, and that base
+    /// scope stays open for the whole run, so an entry there would outlive
+    /// any shadowing — and skipped by `find_class_by_jvm`. The symbol itself
+    /// stays: its id is written into prelude signatures that are still in
+    /// use, and rewriting those is not something a namer can do.
+    ///
+    /// Only prelude symbols are replaced (`id < prelude_end`). A classfile
+    /// read from the classpath is a different question — a source definition
+    /// and a binary of the same class in one run is a real ambiguity that
+    /// nsc reports — and is left alone.
+    pub fn shadow_supplied_by_source(&mut self, id: SymbolId) {
+        if id.is_none() || id.0 < self.prelude_end {
+            return;
+        }
+        let owner = self.get(id).owner;
+        if owner.is_none() {
+            return;
+        }
+        let name = self.get(id).name.clone();
+        let kind = self.get(id).kind;
+        let prelude_end = self.prelude_end;
+        let victims: Vec<SymbolId> = self
+            .get(owner)
+            .members
+            .iter()
+            .copied()
+            .filter(|&m| {
+                m != id
+                    && m.0 < prelude_end
+                    && self.get(m).name == name
+                    && shadowable_kind(kind, self.get(m).kind)
+            })
+            .collect();
+        if victims.is_empty() {
+            return;
+        }
+        self.get_mut(owner).members.retain(|m| !victims.contains(m));
+        for sc in self.scopes.iter_mut() {
+            sc.replace(&name, &victims, id);
+        }
+        self.prelude_shadowed.extend(victims);
     }
 
     /// Record `import owner._` in the innermost scope.
@@ -1033,8 +1161,16 @@ impl SymbolTable {
                 .iter()
                 .find_map(|p| self.class_sym_of(p))
                 .or(Some(self.anyref_sym)),
+            // `lookup_type`, not `lookup`: `TupleN` is a *type* name, and a
+            // term of that name in a nearer scope must not answer for it.
+            // `object Equiv` declares `implicit def Tuple2[T1, T2](…)`, so
+            // inside its body plain `lookup` stopped at the method — the
+            // innermost scope that binds the name at all — found nothing
+            // class-like in it and gave up, and every `x._1` on a `(T1, T2)`
+            // in `Ordering.scala` and `Equiv.scala` (176 of them) reported
+            // "is not a member".
             Type::Tuple(ts) if !ts.is_empty() => self
-                .lookup(&format!("Tuple{}", ts.len()))
+                .lookup_type(&format!("Tuple{}", ts.len()))
                 .into_iter()
                 .find(|s| self.get(*s).is_class_like()),
             _ => None,
@@ -1707,7 +1843,11 @@ impl SymbolTable {
             .iter()
             .copied()
             .filter(|&id| {
-                self.symbols[id.0 as usize].jvm_name == jvm && !self.is_primitive_value_class(id)
+                self.symbols[id.0 as usize].jvm_name == jvm
+                    && !self.is_primitive_value_class(id)
+                    // A prelude symbol a source definition has replaced is
+                    // not the class of that binary name any more.
+                    && !self.prelude_shadowed.contains(&id)
             })
             .min_by_key(|s| s.0)
     }
