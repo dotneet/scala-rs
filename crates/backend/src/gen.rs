@@ -301,6 +301,11 @@ struct EmitCtx<'a> {
     method_sym: SymbolId,
     /// Captured `var`s lowered to `scala.runtime.*Ref`.
     boxed_vars: &'a HashSet<SymbolId>,
+    /// Set while emitting a value class's `$extension` static: there is no
+    /// `this` there, only the underlying value in slot 0, so anything that
+    /// really needs the boxed instance has to build one.
+    /// `(class internal name, `<init>` descriptor, underlying slot sort)`.
+    value_ext: Option<(String, String, JvmSort)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -333,6 +338,7 @@ fn emit_ctx<'a>(
         library_abi,
         method_sym: SymbolId::NONE,
         boxed_vars,
+        value_ext: None,
     }
 }
 
@@ -2989,6 +2995,13 @@ impl<'a> Gen<'a> {
             {
                 b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, &aname, &adesc);
             }
+            // `def m(a: A, b: B = …)` in a trait: the `m$default$2` getter is
+            // a synthesized *symbol*, not a tree, so the loop above never saw
+            // it. Declare it here; `emit_default_getters` puts the body on
+            // every implementing class.
+            for (n, d) in self.default_getter_sigs(class_id) {
+                b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT | ACC_SYNTHETIC, &n, &d);
+            }
             attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
             self.out
                 .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
@@ -3109,6 +3122,7 @@ impl<'a> Gen<'a> {
         self.emit_case_object_methods(&mut b, class_id);
         self.emit_value_class_methods(&mut b, class_id);
         self.emit_erasure_bridges(&mut b, class_id);
+        self.emit_inherited_covariant_bridges(&mut b, class_id);
         self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out
@@ -3757,7 +3771,20 @@ impl<'a> Gen<'a> {
         if name == "<init>" && rhs.is_empty() {
             return;
         }
-        let desc = def_method_desc_boxed(self.st, def, &self.boxed_vars);
+        let mut desc = def_method_desc_boxed(self.st, def, &self.boxed_vars);
+        // An *auxiliary* constructor of an inner class takes the enclosing
+        // instance too, exactly as the primary one does (`emit_class_ctor`).
+        // Without it slick's `abstract class Table[T](tag, schema, name)`
+        // emitted its `def this(tag, name)` as `(Tag, String)V` while nsc --
+        // and therefore any client compiled against nsc's classfiles -- calls
+        // `(RelationalProfile, Tag, String)V`: `NoSuchMethodError` on the
+        // first table definition.
+        let ctor_outer = (name == "<init>")
+            .then(|| outer_field_class(self.st, class_id))
+            .flatten();
+        if ctor_outer.is_some() {
+            desc = with_enclosing_outer_param(self.st, class_id, &desc);
+        }
         let ret = method_ret_ty(def);
         let acc = method_access_flags(mods.flags, widened(self.st, def.sym));
         if mods.flags.contains(Flags::NATIVE) {
@@ -3775,6 +3802,9 @@ impl<'a> Gen<'a> {
             return;
         }
         let mut frame = Frame::instance();
+        if ctor_outer.is_some() {
+            frame.next_slot += 1; // slot 1 is $outer
+        }
         for clause in vparamss {
             for p in clause {
                 let ty = if p.ty.is_no_type() && !p.sym.is_none() {
@@ -3893,7 +3923,7 @@ impl<'a> Gen<'a> {
             max_locals,
             |asm| {
                 let mut frame = frame;
-                let ctx = emit_ctx(
+                let mut ctx = emit_ctx(
                     st,
                     class_id,
                     &class_name,
@@ -3906,6 +3936,11 @@ impl<'a> Gen<'a> {
                     library_abi,
                     boxed_vars,
                 );
+                ctx.value_ext = Some((
+                    class_name.clone(),
+                    format!("({})V", jvm_desc_val(st, &under)),
+                    jvm_sort(&under),
+                ));
                 gen_expr(asm, &mut frame, &ctx, rhs);
                 if is_unit_like(&ret_for_body) {
                     pop_if_value(asm, &rhs.ty);
@@ -4343,8 +4378,8 @@ impl<'a> Gen<'a> {
         for m in &b.methods {
             skip.insert(m.name.clone());
         }
-        // (name, type, owning trait, is a `var`)
-        let mut needed: Vec<(String, Type, SymbolId, bool)> = Vec::new();
+        // (name, type, owning trait, is a `var`, first in linearization order)
+        let mut needed: Vec<(String, Type, SymbolId, bool, bool)> = Vec::new();
         let mut seen = HashSet::new();
         for parent in linearize(self.st, class_id).into_iter().skip(1) {
             let Some(vals) = self.traits.vals.get(&parent) else {
@@ -4352,33 +4387,61 @@ impl<'a> Gen<'a> {
             };
             for v in vals {
                 let name = v.name().unwrap_or("").to_string();
-                if name.is_empty() || !seen.insert(name.clone()) {
+                if name.is_empty() {
                     continue;
                 }
+                // Deliberately *not* `continue` on a repeat: two traits in one
+                // linearization may both define `val v`, the later one an
+                // `override` with a narrower type (slick's
+                // `SqlTableComponent.columnOptions` over
+                // `RelationalTableComponent.columnOptions`). Each declares its
+                // own `_setter_` on its own interface, so the class owes an
+                // implementation of *both* -- skipping the base one left
+                // `H2Profile$` failing `RelationalTableComponent.$init$` with
+                // an `AbstractMethodError`.
+                let first = seen.insert(name.clone());
                 let mutable = match &v.kind {
                     TreeKind::ValDef { mods, .. } => mods.flags.contains(Flags::MUTABLE),
                     _ => false,
                 };
-                needed.push((name, val_tree_ty(self.st, v), parent, mutable));
+                needed.push((name, val_tree_ty(self.st, v), parent, mutable, first));
             }
         }
         let class_name = b.this_name.clone();
-        for (name, ty, owner, mutable) in needed {
+        for (name, ty, owner, mutable, first) in needed {
             let fdesc = jvm_desc_val(self.st, &ty);
             let gdesc = format!("(){}", jvm_desc(self.st, &ty));
             let sdesc = format!("({fdesc})V");
             let sort = jvm_slot_sort(&ty);
             let setter = trait_member_setter_name(self.st, owner, &name, mutable);
-            // `override val v = …`: the class has its own field, getter and
-            // initialisation, but the trait's mixin setter is still abstract on
-            // the interface. nsc implements it as a no-op so `T$class.$init$`
-            // does not clobber the override — do the same.
-            if skip.contains(&name) {
+            // `override val v = …`: the value is provided elsewhere -- by the
+            // class itself, or by a trait nearer the front of the
+            // linearization -- but this trait's mixin setter is still abstract
+            // on its interface. nsc implements it as a no-op so `T$class.$init$`
+            // does not clobber the override, and adds a bridge getter when the
+            // override's erased result type is narrower.
+            if !first || skip.contains(&name) {
                 if !mutable && !skip.contains(&setter) {
                     b.add_code(ACC_PUBLIC, &setter, &sdesc, 1 + sort.slots(), |asm| {
                         asm.vreturn();
                     });
                     skip.insert(setter);
+                }
+                let narrow = b
+                    .methods
+                    .iter()
+                    .find(|m| m.name == name && m.desc.starts_with("()"))
+                    .map(|m| m.desc.clone());
+                if let Some(nd) = narrow {
+                    if nd != gdesc && nd.starts_with("()L") && gdesc.starts_with("()L") {
+                        let cn = class_name.clone();
+                        let n2 = name.clone();
+                        b.add_code(ACC_PUBLIC | ACC_BRIDGE, &name, &gdesc, 1, move |asm| {
+                            asm.aload(0);
+                            asm.invokevirtual(&cn, &n2, &nd);
+                            asm.areturn();
+                        });
+                    }
                 }
                 continue;
             }
@@ -4930,6 +4993,97 @@ impl<'a> Gen<'a> {
         }
     }
 
+    // (helper `desc_param_sorts` is a free function below)
+
+    /// Covariant-override bridges for members this class only *inherits*.
+    ///
+    /// `emit_erasure_bridges` looks at the class's own members, so it never
+    /// sees an override that happened two traits up: slick's
+    /// `RelationalTypesComponent` declares
+    /// `def MappedColumnType: MappedColumnTypeFactory` and `JdbcProfile`
+    /// overrides it with `override lazy val MappedColumnType:
+    /// MappedJdbcType.type`. `H2Profile$` gets the narrow mixin forwarder and
+    /// nothing else, so calling the member through the base interface threw
+    /// `AbstractMethodError`. nsc emits the bridge on the implementing class;
+    /// do the same, for every inherited method whose erased descriptor we do
+    /// not implement but whose parameters match one we do.
+    fn emit_inherited_covariant_bridges(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        if class_id.is_none() || is_interface_sym(self.st, class_id) {
+            return;
+        }
+        let class_name = b.this_name.clone();
+        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+            for pmid in self.st.get(parent).members.clone() {
+                let ps = self.st.get(pmid);
+                if ps.name == "<init>"
+                    || ps.name == "<clinit>"
+                    || ps.flags.contains(Flags::STATIC)
+                    || ps.flags.contains(Flags::PARAM)
+                {
+                    continue;
+                }
+                // A trait's `val` / `lazy val` is an interface *method* too --
+                // slick declares `lazy val MappedColumnType:
+                // MappedColumnTypeFactory` in `RelationalTypesComponent` and
+                // narrows it in `JdbcProfile`, so the getter needs the bridge
+                // just as much as a `def` would.
+                let pdesc = match ps.kind {
+                    SymKind::Method => method_desc_from_sym(self.st, pmid),
+                    SymKind::Term if is_interface_sym(self.st, parent) => {
+                        format!("(){}", jvm_desc(self.st, &ps.ty))
+                    }
+                    _ => continue,
+                };
+                let enc = encode_method_name(&ps.name);
+                let Some(cut) = pdesc.find(')') else { continue };
+                let (pparams, pret) = (&pdesc[..=cut], &pdesc[cut + 1..]);
+                if !(pret.starts_with('L') || pret.starts_with('[')) {
+                    continue;
+                }
+                if b.methods.iter().any(|m| m.name == enc && m.desc == pdesc) {
+                    continue;
+                }
+                let Some(have) = b
+                    .methods
+                    .iter()
+                    .find(|m| {
+                        m.name == enc
+                            && m.code.is_some()
+                            && m.access & ACC_STATIC == 0
+                            && m.desc.starts_with(pparams)
+                            && m.desc[pparams.len()..].starts_with('L')
+                    })
+                    .map(|m| m.desc.clone())
+                else {
+                    continue;
+                };
+                let mut loads: Vec<(u16, JvmSort)> = Vec::new();
+                let mut locals = 1u16;
+                for t in desc_param_sorts(pparams) {
+                    loads.push((locals, t));
+                    locals += t.slots();
+                }
+                let cn = class_name.clone();
+                let target = have.clone();
+                let name = enc.clone();
+                b.add_code(
+                    ACC_PUBLIC | ACC_BRIDGE | ACC_SYNTHETIC,
+                    &enc,
+                    &pdesc,
+                    locals.max(1),
+                    move |asm| {
+                        asm.aload(0);
+                        for (slot, sort) in &loads {
+                            load(asm, *slot, *sort);
+                        }
+                        asm.invokevirtual(&cn, &name, &target);
+                        asm.areturn();
+                    },
+                );
+            }
+        }
+    }
+
     fn emit_erasure_bridges(&self, b: &mut ClassBuilder, class_id: SymbolId) {
         if class_id.is_none() {
             return;
@@ -5071,22 +5225,71 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn emit_default_getters(&self, b: &mut ClassBuilder, class_id: SymbolId) {
-        if class_id.is_none() {
-            return;
-        }
-        let existing: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
-        for mid in self.st.get(class_id).members.clone() {
+    /// `(encoded name, descriptor)` of every `name$default$n` getter `owner`
+    /// declares, computed exactly as `emit_default_getters` does.
+    fn default_getter_sigs(&self, owner: SymbolId) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for mid in self.st.get(owner).members.clone() {
             let s = self.st.get(mid);
             if s.kind != SymKind::Method || !s.name.contains("$default$") {
                 continue;
             }
-            if existing.contains(&encode_method_name(&s.name)) {
+            if s.default_rhs.is_none() {
+                continue;
+            }
+            let pts: Vec<Type> = if !s.params.is_empty() {
+                s.params
+                    .iter()
+                    .map(|p| self.st.get(*p).ty.clone())
+                    .collect()
+            } else {
+                match &s.ty {
+                    Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+                    _ => vec![],
+                }
+            };
+            let ret = match &s.ty {
+                Type::Method { ret, .. } => (**ret).clone(),
+                _ => Type::Any,
+            };
+            out.push((
+                encode_method_name(&s.name),
+                jvm_method_desc(self.st, &pts, &ret),
+            ));
+        }
+        out
+    }
+
+    fn emit_default_getters(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        if class_id.is_none() {
+            return;
+        }
+        let mut existing: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
+        // The whole linearization, not just this class's own members: a
+        // *trait* method with a defaulted parameter declares its
+        // `name$default$n` getter on the interface (see the trait arm of
+        // `emit_class`), and every implementing class owes a body. slick calls
+        // `n.mapChildren(f)` on the `Node` trait from another file, and the
+        // omitted `keepType` argument became
+        // `NoSuchMethodError: Node.mapChildren$default$2`.
+        let mut ids: Vec<SymbolId> = self.st.get(class_id).members.clone();
+        for p in linearize(self.st, class_id).into_iter().skip(1) {
+            if is_interface_sym(self.st, p) {
+                ids.extend(self.st.get(p).members.clone());
+            }
+        }
+        for mid in ids {
+            let s = self.st.get(mid);
+            if s.kind != SymKind::Method || !s.name.contains("$default$") {
+                continue;
+            }
+            if !existing.insert(encode_method_name(&s.name)) {
                 continue;
             }
             let Some(rhs) = s.default_rhs.clone() else {
                 continue;
             };
+            let rhs2 = rhs.clone();
             let name = s.name.clone();
             let pts: Vec<Type> = if !s.params.is_empty() {
                 s.params
@@ -5144,6 +5347,77 @@ impl<'a> Gen<'a> {
                     gen_expr(asm, &mut frame, &ctx, &rhs);
                     if is_unit_like(&ret_for_body) {
                         pop_if_value(asm, &rhs.ty);
+                        asm.vreturn();
+                    } else {
+                        emit_return(asm, &ret_for_body);
+                    }
+                },
+            );
+            // A value class's methods are called through their `$extension`
+            // statics, and so are the default getters that go with them:
+            // slick's `NodeOps.collect(pf, stopOnMatch = false)` compiled to
+            // `collect$default$2$extension(Node, PartialFunction)Z`, which
+            // nothing emitted.
+            let Some(under) = self.st.value_class_underlying(class_id) else {
+                continue;
+            };
+            let ext_name = format!("{}$extension", name);
+            if !existing.insert(ext_name.clone()) {
+                continue;
+            }
+            let mut tys = vec![under.clone()];
+            tys.extend(pts.iter().cloned());
+            let ext_desc = jvm_method_desc(self.st, &tys, &ret);
+            let mut frame = Frame {
+                locals: HashMap::new(),
+                next_slot: 0,
+                finally_exits: Vec::new(),
+                return_slot: None,
+            };
+            match self.st.get(class_id).ctor_fields.first().copied() {
+                Some(fid) => {
+                    frame.alloc(fid, jvm_sort(&under));
+                }
+                None => frame.next_slot = 1,
+            }
+            for (i, ty) in pts.iter().enumerate() {
+                let id = pids.get(i).copied().unwrap_or(SymbolId::NONE);
+                frame.alloc_param(id, jvm_sort(ty), ty);
+            }
+            let class_name = b.this_name.clone();
+            let hoist_owner = b.this_name.clone();
+            let lambda_bodies = &self.lambda_bodies;
+            let ret_for_body = ret.clone();
+            let max_locals = frame.next_slot.max(1);
+            let under_c = under.clone();
+            b.add_code(
+                ACC_PUBLIC | ACC_STATIC | ACC_SYNTHETIC,
+                &ext_name,
+                &ext_desc,
+                max_locals,
+                |asm| {
+                    let mut frame = frame;
+                    let mut ctx = emit_ctx(
+                        st,
+                        class_id,
+                        &class_name,
+                        ret_for_body.clone(),
+                        extras,
+                        lambda_n,
+                        lambda_bodies,
+                        Some(&hoist_owner),
+                        source,
+                        library_abi,
+                        boxed_vars,
+                    );
+                    ctx.value_ext = Some((
+                        class_name.clone(),
+                        format!("({})V", jvm_desc_val(st, &under_c)),
+                        jvm_sort(&under_c),
+                    ));
+                    gen_expr(asm, &mut frame, &ctx, &rhs2);
+                    if is_unit_like(&ret_for_body) {
+                        pop_if_value(asm, &rhs2.ty);
                         asm.vreturn();
                     } else {
                         emit_return(asm, &ret_for_body);
@@ -5336,8 +5610,15 @@ impl<'a> Gen<'a> {
                 let result = frame.alloc_tmp(jvm_sort(&ret_ty));
                 asm.aload(0);
                 store(asm, lock, JvmSort::Ref);
+                // Stored before the guarded range so the handler's stack map
+                // does not claim a local the body has not written yet.
+                push_default(asm, &ret_ty);
+                store(asm, result, jvm_sort(&ret_ty));
                 load(asm, lock, JvmSort::Ref);
                 asm.monitorenter();
+                asm.capture_try_locals();
+                let try_s = asm.fresh_label();
+                asm.mark(try_s);
                 asm.aload(0);
                 asm.getfield(&class_name, "bitmap$0", "I");
                 asm.iconst(mask);
@@ -5372,6 +5653,27 @@ impl<'a> Gen<'a> {
                 store(asm, result, jvm_sort(&ret_ty));
                 load(asm, lock, JvmSort::Ref);
                 asm.monitorexit();
+                // An initialiser that throws used to leave the monitor held:
+                // HotSpot then reports the *unbalanced lock* on the way out
+                // (`IllegalMonitorStateException`) and the real exception is
+                // lost. nsc wraps the region in a catch-all that unlocks and
+                // rethrows; so does the local-`lazy val` accessor above.
+                let try_e = asm.fresh_label();
+                asm.mark(try_e);
+                let after = asm.fresh_label();
+                asm.goto(after);
+                let handler = asm.fresh_label();
+                asm.mark(handler);
+                asm.enter_handler_captured_locals();
+                let ex = frame.alloc_tmp(JvmSort::Ref);
+                asm.astore(ex);
+                load(asm, lock, JvmSort::Ref);
+                asm.monitorexit();
+                asm.aload(ex);
+                asm.athrow();
+                asm.exception(try_s, try_e, handler, None);
+                asm.release_try_locals();
+                asm.mark(after);
                 load(asm, result, jvm_sort(&ret_ty));
                 emit_return(asm, &ret_ty);
             });
@@ -5646,7 +5948,14 @@ impl<'a> Gen<'a> {
             });
         }
 
-        self.emit_module_init(&mut b, cls, &impl_.body, &impl_.parents, inner_outer);
+        self.emit_module_init(
+            &mut b,
+            cls,
+            &impl_.body,
+            &impl_.parents,
+            inner_outer,
+            Some(cls),
+        );
         if inner_outer.is_none() {
             self.emit_module_clinit(&mut b);
         }
@@ -5763,6 +6072,7 @@ impl<'a> Gen<'a> {
         // = Desc }`: a module overriding with a narrower result type needs the
         // same bridge a class gets, or the parent's signature stays abstract.
         self.emit_erasure_bridges(&mut b, cls);
+        self.emit_inherited_covariant_bridges(&mut b, cls);
         self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, cls, &self.pickles);
         self.out
@@ -5808,6 +6118,10 @@ impl<'a> Gen<'a> {
         body: &[Tree],
         parents: &[Tree],
         inner_outer: Option<SymbolId>,
+        // The class whose linearization decides which trait `$init$`s run.
+        // For a `case class`'s synthetic companion this is the *module*
+        // class, not the case class `class_id` names.
+        mixin_owner: Option<SymbolId>,
     ) {
         let class_name = b.this_name.clone();
         let st = self.st;
@@ -5836,7 +6150,7 @@ impl<'a> Gen<'a> {
         let (super_owner, super_desc, super_args, super_cls, super_field_tys) =
             parent_super_ctor(st, parents, &super_name);
         let super_outer = outer_field_class(st, super_cls);
-        let mixin_inits = self.mixin_init_calls(class_id);
+        let mixin_inits = self.mixin_init_calls(mixin_owner.unwrap_or(class_id));
         // A member `object` of a class or trait takes the enclosing instance
         // and keeps it in `$outer`; there is no static `MODULE$` to publish.
         let own_outer = inner_outer.map(|o| {
@@ -6017,7 +6331,14 @@ impl<'a> Gen<'a> {
                 desc: format!("L{this_name};"),
             }),
         }
-        self.emit_module_init(&mut b, class_id, &[], &[], inner_outer);
+        // The mixin `$init$` calls belong to the *companion module class*,
+        // which has no parents of its own beyond `AbstractFunctionN` /
+        // `Serializable` -- not to the case class. Passing `class_id` here
+        // made `Ap$.<init>` call `N$class.$init$(this)` for every trait the
+        // case class mixes in, and the JVM threw `IncompatibleClassChangeError:
+        // class Ap$ does not implement the requested interface N` the first
+        // time anything touched the companion (slick: `slick.ast.Apply$`).
+        self.emit_module_init(&mut b, class_id, &[], &[], inner_outer, comp);
         if inner_outer.is_none() {
             self.emit_module_clinit(&mut b);
         }
@@ -7074,6 +7395,15 @@ fn throw_not_implemented(asm: &mut Assembler) {
     asm.athrow();
 }
 
+/// The value a one-armed `if` yields on both paths: `()`, boxed when the
+/// recorded type is a reference.
+fn push_unit_result(asm: &mut Assembler, ty: &Type) {
+    match jvm_sort(ty) {
+        JvmSort::Ref => asm.getstatic(BOXED_UNIT, "UNIT", BOXED_UNIT_DESC),
+        _ => push_default(asm, ty),
+    }
+}
+
 fn push_default(asm: &mut Assembler, ty: &Type) {
     match jvm_sort(ty) {
         JvmSort::Void => {}
@@ -7435,9 +7765,22 @@ fn load_this(asm: &mut Assembler, ctx: &EmitCtx) {
     } else if let Some((lclass, field, desc)) = ctx.outer {
         asm.aload(0);
         asm.getfield(lclass, field, desc);
-    } else {
-        asm.aload(0);
+        return;
     }
+    // Inside a value class's `$extension` static, slot 0 holds the *underlying*
+    // value. Anything that wants the instance itself -- a lambda's `$outer`
+    // above all -- gets a fresh box, which is what nsc's own
+    // `new C(u)`-on-demand amounts to. Without it slick's
+    // `ConfigExtensionMethods.toProperties` handed a `Config` where its
+    // lambda's constructor wanted a `ConfigExtensionMethods`.
+    if let Some((cls, ctor, sort)) = &ctx.value_ext {
+        asm.new_obj(cls);
+        asm.dup();
+        load(asm, 0, *sort);
+        asm.invokespecial(cls, "<init>", ctor);
+        return;
+    }
+    asm.aload(0);
 }
 
 fn load_qualified_this(asm: &mut Assembler, ctx: &EmitCtx, name: &str) {
@@ -8102,11 +8445,19 @@ fn gen_if(
     if let Some(n) = join_class_of(ctx.st, result_ty) {
         asm.set_join_class(end_l, &n);
     }
+    // `if (c) e` with no `else` and a non-`Unit` recorded type. nsc gives such
+    // an expression the type `Unit`, so the branch's value is dropped and `()`
+    // is what it yields. Emitting the then-branch's value while the (empty)
+    // else path pushed nothing left the two paths at different stack heights
+    // and the JVM rejected the method ("Inconsistent stackmap frames"):
+    // slick's `runPhase` ends in `if (GlobalConfig.verifyTypes && …) (new
+    // VerifyTypes(…)).apply(s2)`, whose branch value is a `CompilerState`.
     asm.ifeq(else_l);
     if is_unit_like(result_ty) {
         gen_stat(asm, frame, ctx, thenp);
     } else {
         gen_expr(asm, frame, ctx, thenp);
+        pad_unit_branch(asm, thenp, result_ty);
     }
     asm.goto(end_l);
     asm.mark(else_l);
@@ -8114,8 +8465,23 @@ fn gen_if(
         gen_stat(asm, frame, ctx, elsep);
     } else {
         gen_expr(asm, frame, ctx, elsep);
+        pad_unit_branch(asm, elsep, result_ty);
     }
     asm.mark(end_l);
+}
+
+/// A branch of a non-`Unit` `if` whose own value is `()` leaves nothing on the
+/// stack, so the two paths meet at different heights and the JVM rejects the
+/// method ("Inconsistent stackmap frames"). nsc materialises `()` there; so do
+/// we.
+fn pad_unit_branch(asm: &mut Assembler, branch: &Tree, result_ty: &Type) {
+    if !branch.is_empty() && !is_unit_like(&branch.ty) {
+        return;
+    }
+    if matches!(branch.ty, Type::Nothing) {
+        return;
+    }
+    push_unit_result(asm, result_ty);
 }
 
 /// `new p.Inner(…)` names its enclosing instance explicitly. The prefix is a
@@ -8968,6 +9334,14 @@ fn gen_apply(
         TreeKind::Select { qual, name }
             if (name == "update" || name == "apply") && matches!(qual.ty, Type::Array(_))
     );
+    // `this(...)` inside an auxiliary constructor hands the primary one the
+    // enclosing instance it was itself given (slot 1), ahead of the arguments.
+    if !fun.sym.is_none()
+        && ctx.st.get(fun.sym).name == "<init>"
+        && outer_field_class(ctx.st, ctx.st.get(fun.sym).owner).is_some()
+    {
+        asm.aload(1);
+    }
     gen_call_args(
         asm,
         frame,
@@ -9192,6 +9566,27 @@ fn invoke_value_extension(
     // those directly instead -- same result, and avoids the category-1 vs.
     // category-2 stack-shuffling that a `new`+dup-based call would need for
     // `Long`/`Double` receivers.
+    // `3.compare(4)` -- nsc reaches `OrderedProxy.compare`, which is
+    // `java.lang.Integer.compare` under the hood. There is no
+    // `compare$extension`, and allocating the proxy just to call one static
+    // buys nothing, so call the static directly (same result, and the
+    // receiver stays unboxed).
+    if s.name == "compare" {
+        let prim = match owner.as_str() {
+            "scala/runtime/RichByte" => Some(("java/lang/Byte", "(BB)I")),
+            "scala/runtime/RichShort" => Some(("java/lang/Short", "(SS)I")),
+            "scala/runtime/RichInt" => Some(("java/lang/Integer", "(II)I")),
+            "scala/runtime/RichLong" => Some(("java/lang/Long", "(JJ)I")),
+            "scala/runtime/RichFloat" => Some(("java/lang/Float", "(FF)I")),
+            "scala/runtime/RichDouble" => Some(("java/lang/Double", "(DD)I")),
+            "scala/runtime/RichChar" => Some(("java/lang/Character", "(CC)I")),
+            _ => None,
+        };
+        if let Some((cls, desc)) = prim {
+            asm.invokestatic(cls, "compare", desc);
+            return;
+        }
+    }
     if owner == "scala/runtime/RichInt" && s.name == "sign" {
         asm.invokestatic("java/lang/Integer", "signum", "(I)I");
         return;
@@ -10173,7 +10568,10 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
     let name = s.name.as_str();
     let mut desc = method_desc_boxed(ctx.st, id, ctx.boxed_vars);
     if name == "<init>" {
-        asm.invokespecial(&owner, "<init>", &desc);
+        // `this(...)` in an auxiliary constructor: the target takes `$outer`
+        // first, and `gen_apply` has already pushed it.
+        let d = with_enclosing_outer_param(ctx.st, owner_id, &desc);
+        asm.invokespecial(&owner, "<init>", &d);
         return;
     }
     if owner_is_package && ctx.library_abi {
@@ -14964,15 +15362,15 @@ fn gen_function_apply(
         emit_unbox(asm, result_ty);
     } else if matches!(result_ty, Type::String) {
         emit_unbox(asm, result_ty);
-    } else if let Type::Class { sym, .. } = result_ty {
-        let n = class_internal(ctx.st, *sym);
-        if !n.is_empty() {
-            asm.checkcast(&n);
+    } else if let Some(cn) = checkcast_internal(ctx.st, result_ty) {
+        // `FunctionN.apply` erases to `Object`; every reference result owes a
+        // cast. This used to name only `Class` and `Function` (the latter for
+        // `f.curried(3)(4)`), so a *tuple* result went uncast: slick's
+        // `def dealias(n: Node)(f: Node => (Node, Mappings)): (Node, Mappings)`
+        // ends in `case n => f(n)` and the method failed verification.
+        if cn != "java/lang/Object" {
+            asm.checkcast(&cn);
         }
-    } else if let Type::Function { params, .. } = result_ty {
-        // `f.curried(3)(4)`: `apply` returns `Object`, and the next `apply`
-        // needs a `scala/Function1` on the stack, not a bare reference.
-        asm.checkcast(&format!("scala/Function{}", params.len()));
     }
 }
 
@@ -15381,6 +15779,7 @@ fn emit_partial_function_methods<'a>(
                         library_abi,
                         method_sym: SymbolId::NONE,
                         boxed_vars,
+                        value_ext: None,
                     };
                     gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
                     if !c.guard.is_empty() {
@@ -15441,6 +15840,7 @@ fn emit_partial_function_methods<'a>(
                             library_abi,
                             method_sym: SymbolId::NONE,
                             boxed_vars,
+                            value_ext: None,
                         };
                         gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
                         if !c.guard.is_empty() {
@@ -15680,6 +16080,7 @@ fn emit_lambda_body(
             library_abi,
             method_sym: SymbolId::NONE,
             boxed_vars: boxed,
+            value_ext: None,
         };
         gen_expr(a, &mut fr, &inner_ctx, &pb.body);
         if matches!(pb.body.ty, Type::Nothing) {
@@ -16009,6 +16410,7 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             library_abi,
             method_sym: SymbolId::NONE,
             boxed_vars: boxed,
+            value_ext: None,
         };
         gen_expr(a, &mut fr, &inner_ctx, &body);
         if matches!(body.ty, Type::Nothing) {
@@ -17190,6 +17592,98 @@ fn unapply_param_class(ctx: &EmitCtx, uid: SymbolId) -> Option<String> {
     None
 }
 
+/// A `case class` pattern that reads the constructor fields directly.
+///
+/// Shared by the `Apply` pattern arm and by the synthetic `unapply` of a
+/// case-class companion: nsc emits a real `unapply` there, we do not, and a
+/// pattern that named only the *first* parameter list of a multi-clause case
+/// class (slick's `case TableNode(_, _, i, b)`, whose class has a second
+/// `(val profileTable: Any)` clause) took the extractor path and died with
+/// `NoSuchMethodError: TableNode$.unapply`.
+#[allow(clippy::too_many_arguments)]
+fn gen_ctor_fields_pattern(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    pat: &Tree,
+    args: &[Tree],
+    class_id: SymbolId,
+    tmp: u16,
+    fail: crate::code::Label,
+) {
+    let jvm = if class_id.is_none() {
+        pat.name().unwrap_or("java/lang/Object").to_string()
+    } else {
+        class_internal(ctx.st, class_id)
+    };
+    load(asm, tmp, JvmSort::Ref);
+    asm.instanceof(&jvm);
+    asm.ifeq(fail);
+    let fields = if class_id.is_none() {
+        Vec::new()
+    } else {
+        ctx.st.get(class_id).ctor_fields.clone()
+    };
+    for (i, a) in args.iter().enumerate() {
+        if let Some(fid) = fields.get(i) {
+            let fs = ctx.st.get(*fid);
+            let fname = fs.name.clone();
+            let fty = fs.ty.clone();
+            // The *field* is a value position (`Unit` is
+            // `BoxedUnit` there); the accessor's *result* is not
+            // (`Unit` is `V`). They are only the same descriptor for
+            // every other type.
+            let fdesc = jvm_desc_val(ctx.st, &fty);
+            let acc_desc = format!("(){}", jvm_desc(ctx.st, &fty));
+            load(asm, tmp, JvmSort::Ref);
+            asm.checkcast(&jvm);
+            // A case class's field is private with a public accessor
+            // (`scala.util.Failure.exception`), so reading the field
+            // is an `IllegalAccessError`. Call the accessor whenever
+            // the class has one -- which is what nsc emits, and what
+            // our own case classes have too. `jvm_name` names it when
+            // the accessor is spelled differently.
+            let acc = ctx.st.get(*fid).jvm_name.clone();
+            // Only call an accessor we know exists: a library field's
+            // accessor is not always spelled like the field
+            // (`$colon$colon.tl` is read through `next$access$1`), so
+            // guessing the name produced `NoSuchMethodError`.
+            let acc = if !acc.is_empty() {
+                Some(acc)
+            } else if !ctx.st.source_classes.contains(&class_id)
+                && has_nullary_accessor(ctx.st, class_id, &fname)
+            {
+                Some(fname.clone())
+            } else {
+                None
+            };
+            match acc {
+                Some(a) => asm.invokevirtual(&jvm, &a, &acc_desc),
+                None => emit_getfield(asm, &jvm, &fname, &fdesc),
+            }
+            // A field declared as a type parameter erases to Object, so
+            // `case Some(x)` on an `Option[Int]` must unbox before it
+            // binds. A sub-pattern that *tests* must not be narrowed
+            // here, though: casting to it turned
+            // `case Some((s, _: TableNode))` on a plain `Node`, and
+            // `case P(v) :: t` on every non-`P` head, into a
+            // `ClassCastException` instead of a failed match.
+            let sort = if reads_erased_value(ctx, a) {
+                // The test reads the field as it stands.
+                jvm_sort(&fty)
+            } else {
+                if fdesc == "Ljava/lang/Object;" {
+                    emit_from_erased_object(asm, ctx.st, &a.ty);
+                }
+                jvm_sort(&a.ty)
+            };
+            bind_subpattern(asm, frame, ctx, a, sort, fail);
+        } else {
+            throw_runtime(asm, "pattern arity");
+        }
+    }
+}
+
 fn gen_unapply_pattern(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -17202,6 +17696,21 @@ fn gen_unapply_pattern(
     fail: crate::code::Label,
 ) {
     let uid = if pat.sym.is_none() { fun.sym } else { pat.sym };
+    // A `case class`'s companion `unapply` is synthesized as a *symbol* with
+    // no body; nothing emits the method, so calling it is a
+    // `NoSuchMethodError`. Read the constructor fields directly instead, which
+    // is what the `Apply` form of the same pattern already does. This is the
+    // path a pattern takes when it names only the first of several parameter
+    // lists (slick's `case TableNode(_, _, i, b)`).
+    if !uid.is_none() {
+        let s = ctx.st.get(uid);
+        if s.name == "unapply" && s.flags.contains(Flags::CASE) {
+            if let Some(cls) = companion_case_class(ctx.st, s.owner) {
+                gen_ctor_fields_pattern(asm, frame, ctx, pat, args, cls, tmp, fail);
+                return;
+            }
+        }
+    }
     let ret_bool = !uid.is_none() && matches!(ctx.st.get(uid).ty.result(), Type::Boolean);
     let param0 = if uid.is_none() {
         None
@@ -17285,17 +17794,26 @@ fn gen_unapply_pattern(
     // the extractor accepts (`case Some(Two(a, b))` on an `Option[Any]`). nsc
     // emits `instanceof` / `ifeq` / `checkcast` in that second case and falls
     // through to the next case; without the test the call did not even verify.
-    let param_class = (!is_seq && sel_sort == JvmSort::Ref)
+    // A user-written `unapplySeq` takes its own parameter type too: slick's
+    // `FunctionSymbol.unapplySeq(a: Apply)` was handed the still-erased
+    // `Object` a `Tuple2._1` read produced, and the method failed
+    // verification ("Type 'java/lang/Object' is not assignable to
+    // 'slick/ast/Apply'"). The `instanceof` test above already ran for the
+    // sequence shapes; only the cast was missing, so compute the class for
+    // those too and let the `checkcast` below use it.
+    let param_class = (sel_sort == JvmSort::Ref && shape != SeqPatShape::Array)
         .then(|| unapply_param_class(ctx, uid))
         .flatten();
-    if let Some(cls) = &param_class {
-        let known = param0
-            .as_ref()
-            .is_some_and(|p| ctx.st.is_sub_type(&pat.ty, p));
-        if !known {
-            load(asm, tmp, sel_sort);
-            asm.instanceof(cls);
-            asm.ifeq(fail);
+    if !is_seq {
+        if let Some(cls) = &param_class {
+            let known = param0
+                .as_ref()
+                .is_some_and(|p| ctx.st.is_sub_type(&pat.ty, p));
+            if !known {
+                load(asm, tmp, sel_sort);
+                asm.instanceof(cls);
+                asm.ifeq(fail);
+            }
         }
     }
     if !owner.is_none() && !is_module_class(ctx.st, owner) {
@@ -17768,77 +18286,7 @@ fn gen_pattern(
             } else {
                 pat.sym
             };
-            let jvm = if class_id.is_none() {
-                pat.name().unwrap_or("java/lang/Object").to_string()
-            } else {
-                class_internal(ctx.st, class_id)
-            };
-            load(asm, tmp, JvmSort::Ref);
-            asm.instanceof(&jvm);
-            asm.ifeq(fail);
-            let fields = if class_id.is_none() {
-                Vec::new()
-            } else {
-                ctx.st.get(class_id).ctor_fields.clone()
-            };
-            for (i, a) in args.iter().enumerate() {
-                if let Some(fid) = fields.get(i) {
-                    let fs = ctx.st.get(*fid);
-                    let fname = fs.name.clone();
-                    let fty = fs.ty.clone();
-                    // The *field* is a value position (`Unit` is
-                    // `BoxedUnit` there); the accessor's *result* is not
-                    // (`Unit` is `V`). They are only the same descriptor for
-                    // every other type.
-                    let fdesc = jvm_desc_val(ctx.st, &fty);
-                    let acc_desc = format!("(){}", jvm_desc(ctx.st, &fty));
-                    load(asm, tmp, JvmSort::Ref);
-                    asm.checkcast(&jvm);
-                    // A case class's field is private with a public accessor
-                    // (`scala.util.Failure.exception`), so reading the field
-                    // is an `IllegalAccessError`. Call the accessor whenever
-                    // the class has one -- which is what nsc emits, and what
-                    // our own case classes have too. `jvm_name` names it when
-                    // the accessor is spelled differently.
-                    let acc = ctx.st.get(*fid).jvm_name.clone();
-                    // Only call an accessor we know exists: a library field's
-                    // accessor is not always spelled like the field
-                    // (`$colon$colon.tl` is read through `next$access$1`), so
-                    // guessing the name produced `NoSuchMethodError`.
-                    let acc = if !acc.is_empty() {
-                        Some(acc)
-                    } else if !ctx.st.source_classes.contains(&class_id)
-                        && has_nullary_accessor(ctx.st, class_id, &fname)
-                    {
-                        Some(fname.clone())
-                    } else {
-                        None
-                    };
-                    match acc {
-                        Some(a) => asm.invokevirtual(&jvm, &a, &acc_desc),
-                        None => emit_getfield(asm, &jvm, &fname, &fdesc),
-                    }
-                    // A field declared as a type parameter erases to Object, so
-                    // `case Some(x)` on an `Option[Int]` must unbox before it
-                    // binds. A sub-pattern that *tests* must not be narrowed
-                    // here, though: casting to it turned
-                    // `case Some((s, _: TableNode))` on a plain `Node`, and
-                    // `case P(v) :: t` on every non-`P` head, into a
-                    // `ClassCastException` instead of a failed match.
-                    let sort = if reads_erased_value(ctx, a) {
-                        // The test reads the field as it stands.
-                        jvm_sort(&fty)
-                    } else {
-                        if fdesc == "Ljava/lang/Object;" {
-                            emit_from_erased_object(asm, ctx.st, &a.ty);
-                        }
-                        jvm_sort(&a.ty)
-                    };
-                    bind_subpattern(asm, frame, ctx, a, sort, fail);
-                } else {
-                    throw_runtime(asm, "pattern arity");
-                }
-            }
+            gen_ctor_fields_pattern(asm, frame, ctx, pat, args, class_id, tmp, fail);
         }
         TreeKind::UnApply { fun, args } => {
             gen_unapply_pattern(asm, frame, ctx, pat, fun, args, tmp, sel_sort, fail);
@@ -19028,6 +19476,37 @@ fn emit_class_constant(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
 }
 
 /// Whether the typer widened this member's access for companion use.
+/// The JVM sorts of a method descriptor's parameters, given `desc` starting at
+/// `(` (anything after the matching `)` is ignored).
+fn desc_param_sorts(desc: &str) -> Vec<JvmSort> {
+    let mut out = Vec::new();
+    let b = desc.as_bytes();
+    let mut i = if b.first() == Some(&b'(') { 1 } else { 0 };
+    while i < b.len() && b[i] != b')' {
+        let start = i;
+        while i < b.len() && b[i] == b'[' {
+            i += 1;
+        }
+        let c = b[i];
+        if c == b'L' {
+            while i < b.len() && b[i] != b';' {
+                i += 1;
+            }
+        }
+        i += 1;
+        let is_array = b[start] == b'[';
+        out.push(match c {
+            _ if is_array => JvmSort::Ref,
+            b'J' => JvmSort::Long,
+            b'D' => JvmSort::Double,
+            b'F' => JvmSort::Float,
+            b'Z' | b'B' | b'S' | b'C' | b'I' => JvmSort::Int,
+            _ => JvmSort::Ref,
+        });
+    }
+    out
+}
+
 fn widened(st: &SymbolTable, sym: SymbolId) -> bool {
     !sym.is_none() && st.get(sym).access_widened
 }

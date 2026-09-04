@@ -54,6 +54,7 @@ mod prelude_ovl3;
 mod prelude_product;
 mod prelude_reflect;
 mod prelude_regex;
+mod prelude_richcmp;
 mod prelude_seq;
 mod prelude_seqfn;
 mod prelude_seqpat;
