@@ -7,6 +7,8 @@ use crate::ast::*;
 use scala_rs_lexer::{is_operator_name, Token, TokenKind};
 use scala_rs_span::{Diagnostic, SourceFile, Span};
 
+mod kindproj;
+
 pub struct ParseResult {
     pub tree: Tree,
     pub diags: Vec<Diagnostic>,
@@ -26,6 +28,11 @@ pub struct ParseOptions {
     /// `$mc*$sp` members callers link against. With it, nsc itself ignores the
     /// annotation, so accepting and dropping it is what nsc does.
     pub no_specialization: bool,
+    /// `-Ykind-projector`: accept kind-projector's `*` placeholder and
+    /// `λ` / `Lambda` type lambdas, desugaring them to structural type
+    /// lambdas. Off by default, because that plugin is not Scala and nsc
+    /// without it rejects the same programs this rejects without the flag.
+    pub kind_projector: bool,
 }
 
 pub fn parse_source(source: &SourceFile, file_index: usize, tokens: Vec<Token>) -> ParseResult {
@@ -106,6 +113,12 @@ struct Parser<'a> {
     /// (`{ x => val n = 1; n }`). Consumed by `parse_expr1`, so nested
     /// sub-expressions are back to `Local`.
     in_block: bool,
+    /// Counter behind the parameter names `-Ykind-projector` invents for `*`
+    /// placeholders (`β$0$`), as the plugin numbers them.
+    kp_counter: u32,
+    /// How many `-Ykind-projector` lambdas this file has produced, so each
+    /// gets a name of its own. See `kindproj::lambda_name`.
+    kp_lambdas: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -124,6 +137,8 @@ impl<'a> Parser<'a> {
             opts: ParseOptions::default(),
             specialization_aliases: std::collections::HashSet::new(),
             in_block: false,
+            kp_counter: 0,
+            kp_lambdas: 0,
         }
     }
 
@@ -1870,6 +1885,7 @@ impl<'a> Parser<'a> {
                     args: vec![rhs],
                 },
             );
+            let fn0 = self.kp_type(fn0);
             return self.parse_existential_suffix(fn0);
         }
         let t = self.parse_infix_type();
@@ -1901,8 +1917,12 @@ impl<'a> Parser<'a> {
                     args,
                 },
             );
+            let fn_ty = self.kp_type(fn_ty);
             return self.parse_existential_suffix(fn_ty);
         }
+        // No `=>` followed, so a parenthesised list here was a tuple after
+        // all: `-Ykind-projector` can settle `(A0, *)` now.
+        let t = self.kp_tuple(t);
         self.parse_existential_suffix(t)
     }
 
@@ -2031,6 +2051,7 @@ impl<'a> Parser<'a> {
                         args: vec![t, rhs],
                     },
                 );
+                t = self.kp_type(t);
             } else {
                 self.pos = saved;
                 break;
@@ -2486,6 +2507,7 @@ impl<'a> Parser<'a> {
                         args,
                     },
                 );
+                t = self.kp_type(t);
                 seen_type_args = true;
                 continue;
             }

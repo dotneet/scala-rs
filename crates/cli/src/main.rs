@@ -75,7 +75,7 @@ fn print_help() {
 scala-rs — a Scala 2.13 subset compiler (not Scala 3)
 
 USAGE:
-    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings] [-language:<feat>] [-Xsource:3] [-Xsource-features:<features>] [-Xasync] [-no-specialization]
+    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings] [-language:<feat>] [-Xsource:3] [-Xsource-features:<features>] [-Xasync] [-no-specialization] [-Ykind-projector]
     scala-rs run <file> [--scala-library <jar>] [--no-scala-library] [--] [java-args...]
     scala-rs --help
 
@@ -113,6 +113,12 @@ OPTIONS:
                         the same name). Without it they are diagnosed: there is
                         no specialisation phase here, so the emitted class would
                         silently lack the `$mc*$sp` members callers link against.
+    -Ykind-projector    Accept the kind-projector plugin's type-lambda syntax:
+                        the `*` placeholder (`Either[E, *]`, `(A, *)`, `A => *`)
+                        and `λ[α => F[α]]` / `Lambda[(A, B) => F[B, A]]`. NOT an
+                        nsc flag -- kind-projector is a compiler plugin, and nsc
+                        without it rejects all of this, so the default is off.
+                        The name is Scala 3's flag for the same syntax.
     -Xasync             Enable the async phase for scala.async.Async's `async`
                         and `await`. The state-machine transform is not
                         implemented: an `async` block is diagnosed either way.
@@ -199,6 +205,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
     let mut features_help = false;
     let mut xasync = false;
     let mut no_specialization = false;
+    let mut kind_projector = false;
     let mut files = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -263,6 +270,8 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             xasync = true;
         } else if a == "-no-specialization" || a == "--no-specialization" {
             no_specialization = true;
+        } else if a == "-Ykind-projector" || a == "--kind-projector" {
+            kind_projector = true;
         } else if let Some(rest) = a.strip_prefix("-Xsource:") {
             (xsource3, xsource_cross) = parse_xsource_level(rest)?;
         } else if a == "-Xsource" {
@@ -323,6 +332,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             source_features,
             xasync,
             no_specialization,
+            kind_projector,
         },
         warnings,
         features_help,
@@ -438,6 +448,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         source_features: parsed.source_features,
         xasync: parsed.xasync,
         no_specialization: parsed.no_specialization,
+        kind_projector: parsed.kind_projector,
     };
     let result = compile_paths(&[parsed.file], &opts);
     print_diags(&result);
@@ -479,6 +490,7 @@ struct RunArgs {
     source_features: SourceFeatures,
     xasync: bool,
     no_specialization: bool,
+    kind_projector: bool,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
@@ -492,6 +504,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut named_features_given = false;
     let mut xasync = false;
     let mut no_specialization = false;
+    let mut kind_projector = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -505,6 +518,8 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             xasync = true;
         } else if a == "-no-specialization" || a == "--no-specialization" {
             no_specialization = true;
+        } else if a == "-Ykind-projector" || a == "--kind-projector" {
+            kind_projector = true;
         } else if let Some(rest) = a.strip_prefix("-Xsource:") {
             (xsource3, xsource_cross) = parse_xsource_level(rest)?;
         } else if a == "--no-scala-library" {
@@ -553,6 +568,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         xasync,
         xsource3,
         no_specialization,
+        kind_projector,
     })
 }
 

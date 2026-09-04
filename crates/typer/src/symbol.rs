@@ -3857,6 +3857,29 @@ fn expand_hk_refine_decl(st: &SymbolTable, d: &RefineDecl) -> RefineDecl {
 }
 
 fn subst_refine_aliases(st: &SymbolTable, decls: &[RefineDecl], ty: &Type) -> Type {
+    subst_refine_aliases_seen(st, decls, ty, &mut Vec::new())
+}
+
+/// `subst_refine_aliases`, carrying the members whose right-hand side is
+/// already being substituted into.
+///
+/// A refinement's alias can name itself. cats' `Representable#compose` builds
+/// an anonymous class declaring
+/// `type Representation = (self.Representation, G.Representation)` over a
+/// parent that declares `Representation` abstract, and a `TypeMember` here has
+/// no prefix to tell `self.` from `G.`, so both collapse onto the member being
+/// defined and the right-hand side reads `(Representation, Representation)`.
+/// Expanding it again is what the `Tuple` arm below does, and the recursion
+/// only ends with the process: 512 MB of stack, no diagnostic, and a cats
+/// measurement of `errors=0 classes=0`. `expand_type_members` already stops at
+/// the second visit for the same shape; this does the same, leaving the member
+/// unexpanded rather than inventing an answer.
+fn subst_refine_aliases_seen(
+    st: &SymbolTable,
+    decls: &[RefineDecl],
+    ty: &Type,
+    seen: &mut Vec<String>,
+) -> Type {
     match ty {
         Type::TypeMember(id) => {
             let name = st.get(*id).name.clone();
@@ -3882,7 +3905,15 @@ fn subst_refine_aliases(st: &SymbolTable, decls: &[RefineDecl], ty: &Type) -> Ty
                             {
                                 rhs.clone()
                             }
-                            _ => subst_refine_aliases(st, decls, rhs),
+                            // The same self-reference, but buried: the member
+                            // stands somewhere inside its own right-hand side.
+                            _ if seen.iter().any(|s| s == n) => ty.clone(),
+                            _ => {
+                                seen.push(name.clone());
+                                let out = subst_refine_aliases_seen(st, decls, rhs, seen);
+                                seen.pop();
+                                out
+                            }
                         };
                     }
                 }
@@ -3893,42 +3924,49 @@ fn subst_refine_aliases(st: &SymbolTable, decls: &[RefineDecl], ty: &Type) -> Ty
             sym: *sym,
             args: args
                 .iter()
-                .map(|a| subst_refine_aliases(st, decls, a))
+                .map(|a| subst_refine_aliases_seen(st, decls, a, seen))
                 .collect(),
         },
         Type::Applied { ctor, args } => {
-            let applied = apply_type_ctor(
-                subst_refine_aliases(st, decls, ctor),
-                args.iter()
-                    .map(|a| subst_refine_aliases(st, decls, a))
-                    .collect(),
-            );
-            st.expand_applied_hk_alias(applied)
-        }
-        Type::Array(t) => Type::Array(Box::new(subst_refine_aliases(st, decls, t))),
-        Type::Function { params, ret } => Type::Function {
-            params: params
+            let ctor = subst_refine_aliases_seen(st, decls, ctor, seen);
+            let args: Vec<Type> = args
                 .iter()
-                .map(|p| subst_refine_aliases(st, decls, p))
-                .collect(),
-            ret: Box::new(subst_refine_aliases(st, decls, ret)),
-        },
-        Type::Method { paramss, ret } => Type::Method {
-            paramss: paramss
+                .map(|a| subst_refine_aliases_seen(st, decls, a, seen))
+                .collect();
+            st.expand_applied_hk_alias(apply_type_ctor(ctor, args))
+        }
+        Type::Array(t) => Type::Array(Box::new(subst_refine_aliases_seen(st, decls, t, seen))),
+        Type::Function { params, ret } => {
+            let params = params
+                .iter()
+                .map(|p| subst_refine_aliases_seen(st, decls, p, seen))
+                .collect();
+            Type::Function {
+                params,
+                ret: Box::new(subst_refine_aliases_seen(st, decls, ret, seen)),
+            }
+        }
+        Type::Method { paramss, ret } => {
+            let paramss = paramss
                 .iter()
                 .map(|ps| {
                     ps.iter()
-                        .map(|p| subst_refine_aliases(st, decls, p))
+                        .map(|p| subst_refine_aliases_seen(st, decls, p, seen))
                         .collect()
                 })
-                .collect(),
-            ret: Box::new(subst_refine_aliases(st, decls, ret)),
-        },
-        Type::ByName(t) => Type::ByName(Box::new(subst_refine_aliases(st, decls, t))),
-        Type::Repeated(t) => Type::Repeated(Box::new(subst_refine_aliases(st, decls, t))),
+                .collect();
+            Type::Method {
+                paramss,
+                ret: Box::new(subst_refine_aliases_seen(st, decls, ret, seen)),
+            }
+        }
+        Type::ByName(t) => Type::ByName(Box::new(subst_refine_aliases_seen(st, decls, t, seen))),
+        Type::Repeated(t) => {
+            Type::Repeated(Box::new(subst_refine_aliases_seen(st, decls, t, seen)))
+        }
         Type::Tuple(ts) => Type::Tuple(
             ts.iter()
-                .map(|t| subst_refine_aliases(st, decls, t))
+                .map(|t| subst_refine_aliases_seen(st, decls, t, seen))
                 .collect(),
         ),
         other => other.clone(),
