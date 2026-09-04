@@ -3079,12 +3079,27 @@ impl Typer {
                 None => return,
             },
         };
-        if let Some(cls) = self.st.class_sym_of(&st) {
+        // A *compound* self type offers the members of every part:
+        // `self: ControllerBase with AccountService with RepositoryService =>`
+        // (and, under -Xsource:3, the `&` spelling) is how gitbucket writes
+        // every cake trait. `class_sym_of` answers for one class, so taking
+        // only that left the other parts' members out of scope entirely --
+        // 230 "not found: value ownerOnly / referrersOnly / …".
+        let roots: Vec<Type> = match &st {
+            Type::Refined { parents, .. } => parents.clone(),
+            other => vec![other.clone()],
+        };
+        let mut seen = std::collections::HashSet::new();
+        for root in roots {
+            let Some(cls) = self.st.class_sym_of(&root) else {
+                continue;
+            };
+            if !seen.insert(cls.0) {
+                continue;
+            }
             self.enter_members_of(cls);
             // members of Foo's parents too (lookup_member walks them; Ident needs scope)
             let mut work = self.st.get(cls).parents.clone();
-            let mut seen = std::collections::HashSet::new();
-            seen.insert(cls.0);
             while let Some(p) = work.pop() {
                 let Some(pid) = self.st.class_sym_of(&p) else {
                     continue;
@@ -19597,7 +19612,18 @@ impl Typer {
                         {
                             let name = name.clone();
                             let qual = (**qual).clone();
-                            self.missing_qualified_type(&qual, &name, tpt.span)
+                            // A `type` alias a jar class declares leaves no
+                            // trace in the bytecode, so `lookup_qualified_type`
+                            // -- which can only see symbols -- finds nothing
+                            // until something else happens to adopt the
+                            // pickle. Twirl writes `HtmlFormat.Appendable` in
+                            // the parents clause of every generated template,
+                            // which is exactly where nothing has.
+                            if let Some(t) = self.qualified_pickled_type_member(&qual, &name) {
+                                t
+                            } else {
+                                self.missing_qualified_type(&qual, &name, tpt.span)
+                            }
                         }
                         _ => ty,
                     }
@@ -20819,6 +20845,24 @@ impl Typer {
         })
     }
 
+    /// `p.T` where `T` is a type alias declared by a class read from a jar.
+    /// Only the `ScalaSignature` pickle records it, so this is the answer when
+    /// [`Self::lookup_qualified_type`] -- a symbol-table lookup -- has none.
+    fn qualified_pickled_type_member(&mut self, qual: &Tree, name: &str) -> Option<Type> {
+        if !self.library_abi {
+            return None;
+        }
+        for owner in self.qualified_type_owners(qual) {
+            if let Some(t) =
+                self.pickle
+                    .complete_type_member(&mut self.st, &mut self.binary, owner, name)
+            {
+                return Some(t);
+            }
+        }
+        None
+    }
+
     fn lookup_qualified_type(&mut self, prefix: &Tree, name: &str) -> Option<SymbolId> {
         // A class beats an object of the same name *wherever* it was found,
         // not only within one owner. `object Ref { trait Make[F[_]] }` read
@@ -20902,6 +20946,15 @@ impl Typer {
     fn qualified_type_owners(&mut self, t: &Tree) -> Vec<SymbolId> {
         let mut out: Vec<SymbolId> = Vec::new();
         match &t.kind {
+            // `_root_` names the root package here too. Without this,
+            // `_root_.p.q.C[A]` -- what Twirl writes at the head of every
+            // generated template -- found no owner for the prefix and was
+            // reported as `not found: type C`, while the same path without the
+            // `_root_` resolved.
+            TreeKind::Ident { name } if name == "_root_" && self.st.lookup(name).is_empty() => {
+                let o = self.as_type_owner(self.st.root);
+                out.push(o);
+            }
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, t.span);
                 let mut found: Vec<SymbolId> = self

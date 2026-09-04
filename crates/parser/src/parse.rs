@@ -227,6 +227,15 @@ impl<'a> Parser<'a> {
         &self.tok().kind
     }
 
+    /// The kind `n` tokens ahead, clamped to the last token (usually `Eof`).
+    fn kind_at(&self, n: usize) -> &TokenKind {
+        &self
+            .tokens
+            .get(self.pos + n)
+            .unwrap_or_else(|| self.tokens.last().unwrap())
+            .kind
+    }
+
     fn span(&self) -> Span {
         self.tok().span
     }
@@ -1400,6 +1409,19 @@ impl<'a> Parser<'a> {
 
     fn parse_block_stat(&mut self) -> Tree {
         self.skip_nl();
+        // nsc `blockStatSeq`: after `implicit`, an identifier starts an
+        // implicit function literal (`{ implicit session => ... }`) and
+        // anything else a local definition (`implicit val`, `implicit def`).
+        // Treating the `implicit` as a modifier instead rejected the block and
+        // then read the rest of it as the closure's body.
+        if matches!(self.kind(), TokenKind::Implicit)
+            && matches!(self.kind_at(1), TokenKind::Ident(_))
+        {
+            self.in_block = true;
+            let t = self.parse_expr();
+            self.in_block = false;
+            return t;
+        }
         if is_mod_or_def_start(self.kind()) {
             return self.parse_tmpl_or_def();
         }
@@ -3829,6 +3851,30 @@ impl<'a> Parser<'a> {
                 }
                 t
             }
+            // nsc `simplePattern`: `-` directly before a numeric literal is
+            // part of the literal (`case -1 =>`), not an identifier pattern.
+            TokenKind::Ident(ref s)
+                if s == "-"
+                    && matches!(
+                        self.kind_at(1),
+                        TokenKind::IntLit(_)
+                            | TokenKind::LongLit(_)
+                            | TokenKind::FloatLit(_)
+                            | TokenKind::DoubleLit(_)
+                    ) =>
+            {
+                let lo = self.span();
+                self.bump();
+                let lit = match self.kind().clone() {
+                    TokenKind::IntLit(n) => Lit::Int(n.wrapping_neg()),
+                    TokenKind::LongLit(n) => Lit::Long(n.wrapping_neg()),
+                    TokenKind::FloatLit(n) => Lit::Float(-n),
+                    TokenKind::DoubleLit(n) => Lit::Double(-n),
+                    _ => unreachable!("guarded above"),
+                };
+                self.bump();
+                self.alloc(lo.merge(self.prev_span()), TreeKind::Literal { lit })
+            }
             TokenKind::Ident(_) | TokenKind::This => {
                 let mut t = self.parse_path();
                 self.skip_nl();
@@ -4337,6 +4383,31 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The XML name at the cursor, if there is one. nsc reads XML names with
+    /// the XML scanner, where a Scala keyword is an ordinary name -- gitbucket
+    /// writes `<span class="...">`, whose `class` arrives here as a keyword
+    /// token and not as an identifier.
+    fn xml_attr_name(&self) -> Option<String> {
+        if let TokenKind::Ident(n) = self.kind() {
+            return if is_operator_name(n) {
+                None
+            } else {
+                Some(n.clone())
+            };
+        }
+        let sp = self.span();
+        let text = self.source.src.get(sp.lo.0 as usize..sp.hi.0 as usize)?;
+        let mut cs = text.chars();
+        let first = cs.next()?;
+        if (first.is_alphabetic() || first == '_')
+            && cs.all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        {
+            Some(text.to_string())
+        } else {
+            None
+        }
+    }
+
     /// Unprefixed `b={e}` / `c="t"`, prefixed `p:b=…`, and `xmlns:p="uri"` /
     /// default `xmlns="uri"`. Entity refs stay diagnosed.
     fn parse_xml_attrs(&mut self) -> (Vec<XmlAttr>, Vec<(Option<String>, Tree)>) {
@@ -4364,7 +4435,8 @@ impl<'a> Parser<'a> {
                     }
                     break;
                 }
-                TokenKind::Ident(n) if !is_operator_name(&n) => {
+                _ if self.xml_attr_name().is_some() => {
+                    let n = self.xml_attr_name().expect("guarded above");
                     let lo = self.span();
                     self.bump();
                     self.skip_nl();

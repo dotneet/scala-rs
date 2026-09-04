@@ -453,6 +453,17 @@ impl<'a> Lexer<'a> {
             if sofar.ends_with('>') && matches!(self.peek(), Some('<' | '&')) {
                 break;
             }
+            // nsc `getOperatorRest` breaks out of the operator on `/` when what
+            // follows starts a comment, so `x =>/*c*/ y` is `=>` and a comment
+            // and not the operator `=>/*`. Twirl writes exactly that shape
+            // (`case _ =>/*75.22*/ {`) in every generated template, where the
+            // munched operator turned the case pattern into an infix pattern.
+            if !sofar.is_empty()
+                && self.peek() == Some('/')
+                && matches!(self.peek_at(1), Some('/' | '*'))
+            {
+                break;
+            }
             self.bump();
         }
         let text = &self.src[start..self.pos];

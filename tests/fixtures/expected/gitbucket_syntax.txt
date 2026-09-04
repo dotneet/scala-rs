@@ -1,0 +1,9 @@
+8
+11
+minus one
+minus two
+zero
+other
+v=3
+9
+rw
