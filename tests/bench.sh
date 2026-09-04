@@ -2,17 +2,23 @@
 # Time scala-rs on slick's 184 sources and report wall + CPU time.
 #
 # Unlike tests/slick_measure.sh (which reports *correctness*: errors, classes),
-# this reports *speed*. It stops after the phase you ask for so a typer-only
-# change can be measured without paying for codegen:
+# this reports *speed*.
 #
-#   tests/bench.sh            # default: --typer (99% of the time lives here)
-#   tests/bench.sh --parse    # parse only
-#   tests/bench.sh --full     # parse + typer + codegen
+#   tests/bench.sh            # default: the whole compile, through class files
+#   tests/bench.sh --parse    # parse only (this one really does stop early)
+#   tests/bench.sh --typer    # the whole compile *plus* a typed-tree dump
 #   REPS=3 tests/bench.sh     # repeat and report every run
+#
+# `--typer` does NOT stop after type checking: it is a dump flag, and the
+# compile runs to the end regardless. Subtracting it from `--full` measures the
+# cost of printing, not the cost of code generation. To attribute time to a
+# phase, sample the process and read `sample`'s call graph (the tree at the top
+# of its output), not the "Sort by top of stack" summary at the bottom.
 #
 # The machine usually has other agents on it, so wall time drifts. `user` (CPU
 # time) is the number to compare across commits; wall time is reported too so a
-# run taken on a loaded machine is visible as such.
+# run taken on a loaded machine is visible as such. Even `user` moves by 20-30%
+# with load, so take the before and the after back to back.
 set -e
 SP=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad
 BENCH=${BENCH_DIR:-$SP/bench}
@@ -67,7 +73,7 @@ if [[ -z ${SCALA_RS:-} ]]; then
 fi
 BIN=${SCALA_RS:-$ROOT/target/release/scala-rs}
 
-PHASE=${1:---typer}
+PHASE=${1:---full}
 [[ $PHASE == --full ]] && PHASE=""
 REFLECT=/tmp/scala-2.13.16/lib/scala-reflect.jar
 RUN=${BENCH_RUN:-$BENCH/run-$$}
