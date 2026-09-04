@@ -370,9 +370,17 @@ reports exactly what we report, so the rejection is correct, and the 2514
 errors in the 70 files that name `*`, `λ` or `α` are unchanged by this. The
 desugaring should sit behind a flag.
 
-Measured on `kernel+core`, 339 files: **3016 → 2987 errors**, 165 files with
-errors in both, no file gaining one. (The 3019 recorded above was measured
-elsewhere; this tree measures 3016 for the same commit.)
+Measured on `kernel+core`, 339 files, twice -- once at the branch point and
+once on the merged result, because `main` moved twice underneath:
+
+| base | before | after |
+|---|---|---|
+| `40816a0` (branch point) | 3016 errors, 165 files | **2987**, 165 files |
+| `6394ac6` (merged) | 2956 errors, 151 files | **2927**, 151 files |
+
+The same 29 errors either way, and the *set* of files with errors is identical
+before and after: no file gained one. (The 3019/165 recorded above was measured
+elsewhere; this tree measures 3016/165 for the same commit.)
 
 ### What cats-kernel still reports (19 errors, 10 files)
 
