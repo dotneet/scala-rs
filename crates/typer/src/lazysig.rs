@@ -537,14 +537,11 @@ impl Typer {
                 self.swap_back_scopes(saved_scopes);
             }
             for p in std::mem::take(&mut self.pending_ctor_defaults) {
-                let Some(d) = self.default_scopes.get(&p.param).map(|d| {
-                    (
-                        d.owner,
-                        d.this_class,
-                        d.file_index,
-                        Rc::clone(&d.scopes),
-                    )
-                }) else {
+                let Some(d) = self
+                    .default_scopes
+                    .get(&p.param)
+                    .map(|d| (d.owner, d.this_class, d.file_index, Rc::clone(&d.scopes)))
+                else {
                     continue;
                 };
                 let saved_scopes = self.swap_in_scopes(Some(&d.3), d.0);

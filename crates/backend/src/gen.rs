@@ -4827,9 +4827,7 @@ impl<'a> Gen<'a> {
             .copied()
             .unwrap_or(0);
         super_impls.iter().any(|(n, cps, sym)| {
-            *n == enc
-                && *sym != def.sym
-                && bridge_overrides(self.st, &declared, cps, abstract_mask)
+            *n == enc && *sym != def.sym && bridge_overrides(self.st, &declared, cps, abstract_mask)
         })
     }
 

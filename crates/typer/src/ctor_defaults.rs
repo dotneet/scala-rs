@@ -69,12 +69,10 @@ impl Typer {
         // Only a companion that carries the synthetic `apply` owes an
         // `apply$default$n`: a user-written `apply` suppresses the synthetic
         // one, and its own defaults are ordinary method defaults.
-        let has_case_apply = self
-            .st
-            .get(owner)
-            .members
-            .iter()
-            .any(|&m| self.st.get(m).name == "apply" && self.st.get(m).flags.contains(Flags::CASE));
+        let has_case_apply =
+            self.st.get(owner).members.iter().any(|&m| {
+                self.st.get(m).name == "apply" && self.st.get(m).flags.contains(Flags::CASE)
+            });
         let tparams = self.st.get(class_id).tparams.clone();
         let flat: Vec<SymbolId> = paramss_ids.iter().flatten().copied().collect();
         for (i, pid) in flat.iter().enumerate() {
