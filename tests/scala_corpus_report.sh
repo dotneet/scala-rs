@@ -48,3 +48,28 @@ echo
 echo "=== neg passes, by which diagnostic did the rejecting"
 awk -F'\t' '$1=="neg" && $3=="pass" {print $4}' $LOG \
   | norm | sort | uniq -c | sort -rn | head -$TOP
+
+# The `neg` failures are the serious ones: a program scalac rejects that we
+# accept. Bucket them by what scalac itself says in the `.check`, which is the
+# closest thing to a list of the checks we do not perform.
+CORPUS=${CORPUS_DIR:-/tmp/scala-rs-corpus/scala}
+if [[ -d $CORPUS/test/files/neg ]]; then
+  echo
+  echo "=== neg failures (we accept it), by the diagnostic scalac expects"
+  for n in $(awk -F'\t' '$1=="neg" && $3=="fail" {print $2}' $LOG); do
+    c=$CORPUS/test/files/neg/$n.check
+    [[ -f $c ]] || { echo "(no .check)"; continue; }
+    # Prefer a real error; some `.check` files open with warnings that only
+    # become errors under a `-Werror` the test also asks for.
+    grep -m1 -E '^\S+\.scala:[0-9]+: error:' $c 2>/dev/null \
+      || grep -m1 -E '^\S+\.scala:[0-9]+: warning:' $c 2>/dev/null \
+      || grep -m1 -E '^error:|^warning:' $c 2>/dev/null \
+      || echo "(no diagnostic line in .check)"
+  done | perl -pe '
+      s/^\S+\.scala:\d+:\s*//;
+      s/^(error|warning)(:|\s)\s*//;
+      s/[`\x27"][^`\x27"]*[`\x27"]/X/g;
+      s/;\s*found:.*//; s/\s+required:.*//;
+      s/[ \t]+/ /g; s/[ \t]+$//;
+    ' | cut -c1-72 | sort | uniq -c | sort -rn | head -$(( TOP * 2 ))
+fi

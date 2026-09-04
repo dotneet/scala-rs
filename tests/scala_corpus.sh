@@ -161,7 +161,13 @@ if [[ $1 == --one ]]; then
 
   case $kind in
     pos)
-      if (( errors == 0 )); then emit pass -; else emit fail "$symptom"; fi ;;
+      # `errors=0` on its own is not proof of a compile: a compiler that fell
+      # over quietly also reports no errors. Insist on at least one classfile,
+      # the same reading rule the slick/gitbucket measurements use.
+      classes=($WORK/out/**/*.class(N))
+      if (( errors > 0 )); then emit fail "$symptom"
+      elif (( ${#classes} == 0 )); then emit fail "compiled but emitted no classfiles"
+      else emit pass -; fi ;;
     neg)
       if (( errors > 0 )); then emit pass "$symptom"; else emit fail accepted-but-should-not-compile; fi ;;
     run)
