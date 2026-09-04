@@ -75,18 +75,20 @@ path of your own.**
 | | files | skipped | errors | files with errors | classfiles |
 |---|---|---|---|---|---|
 | At the start | 354 | 0 | **35** | 13 | 0 |
-| Now | 353 | 1 | **3261** | 256 | 0 |
+| After the first survey | 353 | 1 | **3261** | 256 | 0 |
+| Now | 353 | 1 | **2545** | 211 | 0 |
 
-**The number went up, and that is the progress.** All 35 errors at the start
-were *parse* errors, and a parse error stops the run before typing: nothing in
-gitbucket had been typechecked at all. This is exactly what `docs/cats.md`
-records for cats, where 755 parse errors hid 3019 real ones. The honest reading
-of "35" is "0 files typechecked"; the honest reading of "3261" is "353 files
-typechecked, 97 of them clean".
+**The number went up first, and that was the progress.** All 35 errors at the
+start were *parse* errors, and a parse error stops the run before typing:
+nothing in gitbucket had been typechecked at all. This is exactly what
+`docs/cats.md` records for cats, where 755 parse errors hid 3019 real ones. The
+honest reading of "35" is "0 files typechecked"; the honest reading of "3261"
+is "353 files typechecked, 97 of them clean".
 
-Of the 3261, 2216 are in the 116 hand-written files that still have errors (of
-213 measured) and 1038 are in the generated templates — all 140 of which have
-at least one.
+Of the 2545, 2216 are in the 116 hand-written files that still have errors (of
+213 measured) and 329 are in 95 of the 140 generated templates. The
+hand-written figure has not moved since the survey: every error removed so far
+after it was in a template.
 
 The worst hand-written files are `controller/AccountController.scala` (257),
 `service/IssuesService.scala` (123),
@@ -95,7 +97,7 @@ The worst hand-written files are `controller/AccountController.scala` (257),
 
 ## What was wrong, and what it cost
 
-Seven roots. Six are fixed; the counts are what each was worth when it was
+Eight roots. Seven are fixed; the counts are what each was worth when it was
 removed.
 
 ### 1. An operator swallowed the comment that followed it (lexer)
@@ -189,6 +191,75 @@ trait B { def b: Int = 2 }
 trait Mix { self: A with B => def both: Int = a + b }   // "not found: value b"
 ```
 
+### 8. `HtmlFormat.Appendable` outside a parents clause — 716 errors (typer)
+
+The survey below predicted this one and named the wrong cause; both halves of
+what it actually was are worth writing down, because the prediction was
+plausible and testing it cost one minimal file.
+
+**What the survey said.** `install_type_alias` converts a pickled alias in the
+*declaring* class's vocabulary, so `type Appendable = Output` on
+`Format[Output]` would come back as the type parameter rather than as the
+`Html` that `HtmlFormat extends Format[Html]` makes it, and one as-seen-from
+substitution on the alias would remove 443 + 151 + 113 at once.
+
+**What it was.** The alias was never wrong. `PickleSupply::complete_type_member`
+already answers `play.twirl.api.HtmlFormat#Appendable` with `Html` — the
+pickle's own lookup resolves an inherited alias at the asking class, so
+`install_type_alias` receives `Ref(play.twirl.api.Html)` as the right-hand
+side and has nothing to substitute. Two other things were wrong:
+
+* **The pickle was only asked inside a parents clause.** `Check::tree_to_type`
+  reached `qualified_pickled_type_member` from behind
+  `if self.strict_type_names`, which root 5's slice had put there for the
+  *diagnostic* — outside a parents clause an unresolved `p.T` deliberately
+  falls back to the placeholder `Type::Named`, because a path this pass cannot
+  model resolves that way. But a placeholder is not an answer. A template's
+  `object x extends BaseScalaTemplate[HtmlFormat.Appendable, …]` resolved, and
+  the `def apply(…): HtmlFormat.Appendable` on the next line did not: the
+  method's declared result was a bare name that conformed to nothing. Now the
+  lookup runs either way and only the error stays strict.
+* **An unqualified *overloaded* inherited member was read raw.**
+  `Check::bind_found` applies `subst_as_seen_from` through the enclosing class
+  on its single-alternative path, and did not on the overloaded one: it built
+  `Type::Overload` straight out of the symbols' own types. `BaseScalaTemplate
+  [T <: Appendable[T], F <: Format[T]]` declares six `_display_` overloads,
+  every one of them returning `T`, and every generated template calls
+  `_display_ { … }` unqualified — so all six came back returning the bare `T`.
+  That is what `ambiguous overload for _display_ with arguments (null)` (443)
+  was: six alternatives that substitution had not yet told apart. The
+  instantiated types also have to be filed under `overload_member_types`,
+  because `resolve_overload_with` rebuilds its candidates from the symbols and
+  would otherwise read them raw a second time.
+
+The two are independent, and each alone leaves the templates broken. Together:
+**3261 → 2545 errors, 256 → 211 files**, and all three symptoms the survey
+grouped under this root — 443 `ambiguous overload for _display_`, 151
+`type mismatch; found: T required: Appendable` and 113 `no matching overload
+for (Html)(Context)Appendable` — went to **zero**. The 716 removed are all in
+the generated templates; the hand-written count is unchanged at 2216.
+
+The reproduction is one file against the real `twirl-api` jar, and does not
+need gitbucket or sbt:
+
+```scala
+object mytpl extends _root_.play.twirl.api.BaseScalaTemplate[
+    play.twirl.api.HtmlFormat.Appendable,
+    _root_.play.twirl.api.Format[play.twirl.api.HtmlFormat.Appendable]
+  ](play.twirl.api.HtmlFormat)
+  with _root_.play.twirl.api.Template1[String, play.twirl.api.HtmlFormat.Appendable] {
+  def apply(x: String): play.twirl.api.HtmlFormat.Appendable =
+    _display_ { Seq[Any](format.raw("hi "), format.raw(x)) }
+  def render(x: String): play.twirl.api.HtmlFormat.Appendable = apply(x)
+  def f: (String => play.twirl.api.HtmlFormat.Appendable) = (x) => apply(x)
+  def ref: this.type = this
+}
+```
+
+`crates/cli/tests/twirl.rs` pins it with a miniature `play.twirl.api` that
+real scalac compiles into a jar, plus the dual run and the rejecting case
+(`String` still does not conform to the alias, which is `Html`).
+
 ### The crash: `lub` had no depth cap
 
 `JGitUtil.scala` **aborted the compiler with a stack overflow and no
@@ -226,46 +297,48 @@ in a block inside the lambda, which has no stream for the guard to filter, and
 so diagnoses the shape rather than desugaring it wrongly. Three occurrences,
 one file, held out of the measurement by default.
 
-## Where the remaining 3261 are
+## Where the remaining 2545 are
 
 Counted by message shape, largest first, with the reading:
 
 | n | message | reading |
 |---|---|---|
-| 443 | `ambiguous overload for _display_ with arguments (null)` | Twirl. `BaseScalaTemplate._display_` is overloaded and the argument type is not settled. |
 | 188 | `no implicit: could not find implicit value of type Session` | slick. The implicit `Session` a `withTransaction` block introduces. |
-| 176 | `value apply$default$N is not a member of <notype>` | A default argument on a receiver that is already an error. |
-| 151 | `type mismatch; found: T required: Appendable` | Twirl. `HtmlFormat.Appendable` now resolves (root 6), but its right-hand side is read in the *declaring* trait's vocabulary, so it stays `Format#Output` instead of becoming `Html`. |
+| 176 | `value apply$default$N is not a member of <notype>` | A default argument on a receiver that is already an error. 158 of them are in templates, and all of them are downstream of something else. |
 | 145 / 134 / 66 / 34 | `ambiguous implicit: …ColumnType…` | slick. Several `ColumnType`s in scope; the search does not narrow to one. |
 | 129 / 40 | `ambiguous implicit: request, request` / `response, response` | The same scalatra implicit reached twice. |
-| 113 | `no matching overload for (Html)(Context)Appendable with arguments (T)` | Same root as the 151. |
 | 79 / 62 / 23 / 18 | `ambiguous overload for referrersOnly / writableUsersOnly / ownerOnly / readableUsersOnly with arguments ((<notype>) => <notype>)` | What root 7's "not found" became. Two overloads, and the argument is a function literal whose parameter type is not inferred yet. |
-| 52 | `ambiguous overload for datetimeago with arguments (Date)` | gitbucket's own helper, same shape. |
+| 52 | `ambiguous overload for datetimeago with arguments (Date)` | gitbucket's own helper, same shape, and now the largest single template symptom. |
 | 44 | `unimplemented syntax: named arguments (method parameters not resolved)` | Named arguments where the callee did not resolve. |
+| 44 / 34 / 25 / 15 | `no implicit: could not find implicit value of type BaseTypedType[…] / TypedType[…]` | slick, same family as the `ambiguous implicit` rows. |
 | 39 | `not found: type Rep` | slick's `Rep`, through `import profile.api._`. |
+| 36 | `value blockingApi is not a member of <overload BlockingJdbcProfile \| <error>>` | `blocking-slick`'s profile, reached through an overload set one of whose alternatives is already an error. |
+| ≈70 | `value filter / insert / map is not a member of ((Tag) => X)TableQuery[X]` | slick again: `TableQuery[X]`'s own members behind its `apply`-shaped constructor. |
 
 ### What would remove the most next
 
-1. **The `Appendable` alias's right-hand side** (≈707 errors, all in the
-   generated templates). `install_type_alias` converts a pickled alias in the
-   declaring class's vocabulary; `type Appendable = Output` on `Format[Output]`
-   therefore comes back as the type parameter, not as `Html`, which is what
-   `HtmlFormat extends Format[Html]` makes it. This is an as-seen-from
-   substitution on a pickled alias, and it is one root under three of the four
-   largest template symptoms (443 + 151 + 113).
+1. **The slick implicit searches** (≈429 `ambiguous implicit` plus ≈250 `no
+   implicit`, plus the ≈150 `is not a member of …TableQuery[…]` / `not found:
+   type Rep` that come with them). These are the interesting ones for the
+   original question — we compile slick's own sources with zero errors, but a
+   program *calling* slick through its published jar still cannot resolve the
+   implicits its DSL is made of. That is a different measurement than
+   `slick_measure.sh` makes, and it is the one that matters for an
+   application. It is now, by a wide margin, the largest thing left.
 2. **Overload resolution against a function literal with an un-inferred
    parameter** (≈234 errors: the `…Only` family plus `datetimeago`). nsc picks
    the overload by arity first and then types the literal against the chosen
-   parameter type.
-3. **The slick implicit searches** (≈429 `ambiguous implicit` plus ≈250 `no
-   implicit`). These are the interesting ones for the original question — we
-   compile slick's own sources with zero errors, but a program *calling* slick
-   through its published jar still cannot resolve the implicits its DSL is made
-   of. That is a different measurement than `slick_measure.sh` makes, and it is
-   the one that matters for an application.
-4. The duplicate-implicit shape (`request, request`, ≈169) looks like a supply
+   parameter type. This is also what is left in the templates: with root 8
+   fixed, `datetimeago` is the biggest template symptom that is not merely
+   downstream.
+3. The duplicate-implicit shape (`request, request`, ≈169) looks like a supply
    problem rather than a search problem: the same member is reaching the
    implicit scope twice under one name.
+4. `value apply$default$N is not a member of <notype>` (176) is a *reporting*
+   problem as much as a real one: a default argument on a receiver that has
+   already been diagnosed produces a second diagnostic that says nothing.
+   Suppressing it would not fix anything, but it would stop 176 errors from
+   hiding what is under them.
 
 ## Notes for whoever picks this up
 
@@ -278,3 +351,12 @@ Counted by message shape, largest first, with the reading:
   reproduces most of these symptoms, which makes narrowing cheap. That is not
   true of the two roots above that depend on *ordering* (5 and 6): those need
   the parents clause, which is the first thing the file asks for.
+* The whole Twirl side of the measurement reproduces from **one 27-line file
+  and two jars** (`twirl-api` and `scala-xml`) — no gitbucket checkout, no
+  sbt. Root 8's reproduction above is that file. Reach for it before running
+  the 4-minute measurement.
+* A survey's "next biggest" entry is a hypothesis about the *cause*, not about
+  the count. Root 8's count was right to within nine errors and its cause was
+  wrong; the minimal file said so in one run, and a debug print of the
+  converted alias said so in the next. Cheapest order: reproduce, then print
+  what the suspected code actually returns, and only then read it.

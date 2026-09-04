@@ -8017,6 +8017,56 @@ impl Typer {
         self.bind_found(tree, found, pt);
     }
 
+    /// An inherited member's type, read through the class the unqualified
+    /// reference is written in.
+    ///
+    /// The single-alternative path in [`Self::bind_found`] does this inline,
+    /// with the same three exclusions (a self alias names the *enclosing*
+    /// instance, a local or parameter has no prefix at all, and a
+    /// `private[this]` member is not inherited, SLS 5.2). An *overloaded*
+    /// name needed it just as much and did not have it: every alternative
+    /// went into `Type::Overload` in its declaring class's vocabulary.
+    ///
+    /// Twirl's `BaseScalaTemplate[T <: Appendable[T], F <: Format[T]]`
+    /// declares six `_display_` overloads, all returning `T`, and every
+    /// generated template calls `_display_ { … }` unqualified from inside
+    /// `object x extends BaseScalaTemplate[Html, Format[Html]]`. The result
+    /// came back as the bare `T`, so the template's own declared result type
+    /// did not match it.
+    fn ident_ty_as_seen_from_this(&self, s: SymbolId, ty: Type) -> Type {
+        if self.st.this_class.is_none() {
+            return ty;
+        }
+        let owner = self.st.get(s).owner;
+        if owner == self.st.this_class || owner.is_none() {
+            return ty;
+        }
+        if self.st.get(owner).self_alias == Some(s) {
+            return ty;
+        }
+        if !matches!(
+            self.st.get(owner).kind,
+            SymKind::Class | SymKind::ModuleClass | SymKind::Module
+        ) {
+            return ty;
+        }
+        let f = self.st.get(s).flags;
+        if f.contains(Flags::PRIVATE) && f.contains(Flags::LOCAL) {
+            return ty;
+        }
+        let this_ty = Type::Class {
+            sym: self.st.this_class,
+            args: self
+                .st
+                .get(self.st.this_class)
+                .tparams
+                .iter()
+                .map(|t| Type::TypeParam(*t))
+                .collect(),
+        };
+        self.st.subst_as_seen_from(&this_ty, &ty)
+    }
+
     fn bind_found(&mut self, tree: &mut Tree, mut found: Vec<SymbolId>, pt: &Type) {
         found.sort_by_key(|s| s.0);
         found.dedup();
@@ -8140,7 +8190,8 @@ impl Typer {
             found.truncate(1);
             let s = found[0];
             tree.sym = s;
-            let ty = self.maybe_auto_apply(first_ty, pt);
+            let ty = self.ident_ty_as_seen_from_this(s, first_ty);
+            let ty = self.maybe_auto_apply(ty, pt);
             tree.ty = self.instantiate_parameterless(s, ty, pt);
             return;
         }
@@ -8148,7 +8199,22 @@ impl Typer {
         // Nullary alternatives still auto-apply in value position (`"x".stripMargin`).
         let ov_name = self.st.get(found[0]).name.clone();
         self.record_overload_group(&found, &ov_name);
-        let ov = Type::Overload(found.iter().map(|s| self.st.get(*s).ty.clone()).collect());
+        // As seen from this class, exactly as the single-alternative branch
+        // above and as `type_select` does for a receiver. The types have to be
+        // filed under `overload_member_types` as well, because
+        // `resolve_overload_with` rebuilds its candidates from the symbols and
+        // would otherwise read every alternative raw again.
+        let alts: Vec<(SymbolId, Type)> = found
+            .iter()
+            .map(|&s| {
+                let t = self.st.get(s).ty.clone();
+                (s, self.ident_ty_as_seen_from_this(s, t))
+            })
+            .collect();
+        if alts.iter().any(|(s, t)| &self.st.get(*s).ty != t) {
+            self.overload_member_types.insert(found[0].0, alts.clone());
+        }
+        let ov = Type::Overload(alts.into_iter().map(|(_, t)| t).collect());
         tree.ty = self.maybe_auto_apply(ov, pt);
         tree.sym = if matches!(tree.ty, Type::Overload(_)) {
             found[0]
@@ -19607,9 +19673,7 @@ impl Typer {
                     // the clause names nothing at all.
                     let ty = self.resolve_type_name(name, &[]);
                     match &ty {
-                        Type::Named { name: n, args }
-                            if self.strict_type_names && args.is_empty() && n == name =>
-                        {
+                        Type::Named { name: n, args } if args.is_empty() && n == name => {
                             let name = name.clone();
                             let qual = (**qual).clone();
                             // A `type` alias a jar class declares leaves no
@@ -19619,10 +19683,24 @@ impl Typer {
                             // pickle. Twirl writes `HtmlFormat.Appendable` in
                             // the parents clause of every generated template,
                             // which is exactly where nothing has.
+                            //
+                            // The pickle is asked whether or not
+                            // [`Self::strict_type_names`] is on. Only the
+                            // *diagnostic* is strict: outside a parents clause
+                            // an unresolved `p.T` still falls back to the
+                            // placeholder `Type::Named`, because a path this
+                            // pass cannot model resolves that way. But a
+                            // placeholder is not an answer, and a template's
+                            // `def apply(...): HtmlFormat.Appendable` is an
+                            // ordinary signature, not a parent -- so the
+                            // alias resolved in the parents clause and stayed
+                            // a bare name everywhere else in the same file.
                             if let Some(t) = self.qualified_pickled_type_member(&qual, &name) {
                                 t
-                            } else {
+                            } else if self.strict_type_names {
                                 self.missing_qualified_type(&qual, &name, tpt.span)
+                            } else {
+                                ty
                             }
                         }
                         _ => ty,
