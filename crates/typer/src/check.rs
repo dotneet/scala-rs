@@ -15165,7 +15165,7 @@ impl Typer {
             .tparams
             .iter()
             .copied()
-            .filter(|tp| rest_tys.iter().any(|t| type_mentions_tparam(t, *tp)))
+            .filter(|tp| rest_tys.iter().any(|t| type_mentions_tparam_deep(t, *tp)))
             .collect();
         if undet.is_empty() {
             return rest_tys;
@@ -24888,6 +24888,67 @@ pub(crate) fn type_mentions_tparam(ty: &Type, tp: SymbolId) -> bool {
                 .flatten()
                 .any(|t| type_mentions_tparam(t, tp))
                 || type_mentions_tparam(ret, tp)
+        }
+        _ => false,
+    }
+}
+
+/// [`type_mentions_tparam`], but also inside a refinement's parents and
+/// declarations.
+///
+/// The shallow one deliberately stops at a compound type -- see
+/// `adapt_implicit_apply`, where looking inside would start a search at an
+/// unsubstituted parameter (fixture `ovl4`). A refinement's *declarations* are
+/// where cats puts the parameter that only the witness can pin down:
+/// `type Aux[M[_], F0[_]] = Parallel[M] { type F[x] = F0[x] }`, and
+/// `parUnorderedSequence[T, M, F, A](ta: T[M[A]])(implicit P: Parallel.Aux[M, F])`
+/// mentions `F` nowhere else.
+pub(crate) fn type_mentions_tparam_deep(ty: &Type, tp: SymbolId) -> bool {
+    if type_mentions_tparam(ty, tp) {
+        return true;
+    }
+    let decl_types = |d: &scala_rs_parser::RefineDecl| -> Vec<Type> {
+        match d {
+            scala_rs_parser::RefineDecl::Type { rhs, lo, hi, .. } => {
+                [rhs, lo, hi].iter().filter_map(|t| (*t).clone()).collect()
+            }
+            scala_rs_parser::RefineDecl::Def { paramss, ret, .. } => paramss
+                .iter()
+                .flatten()
+                .cloned()
+                .chain(std::iter::once(ret.clone()))
+                .collect(),
+            scala_rs_parser::RefineDecl::Val { ty, .. } => vec![ty.clone()],
+        }
+    };
+    match ty {
+        Type::Refined { parents, decls } => {
+            parents.iter().any(|p| type_mentions_tparam_deep(p, tp))
+                || decls
+                    .iter()
+                    .flat_map(decl_types)
+                    .any(|t| type_mentions_tparam_deep(&t, tp))
+        }
+        Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
+            args.iter().any(|t| type_mentions_tparam_deep(t, tp))
+        }
+        Type::Applied { ctor, args } => {
+            type_mentions_tparam_deep(ctor, tp)
+                || args.iter().any(|t| type_mentions_tparam_deep(t, tp))
+        }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            type_mentions_tparam_deep(t, tp)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(|t| type_mentions_tparam_deep(t, tp))
+                || type_mentions_tparam_deep(ret, tp)
+        }
+        Type::Method { paramss, ret } => {
+            paramss
+                .iter()
+                .flatten()
+                .any(|t| type_mentions_tparam_deep(t, tp))
+                || type_mentions_tparam_deep(ret, tp)
         }
         _ => false,
     }

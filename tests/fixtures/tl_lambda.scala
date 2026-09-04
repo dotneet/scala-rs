@@ -68,6 +68,26 @@ object Main {
   def twice[F[_]](fa: F[Int])(implicit F: Monad[F]): F[Int] =
     F.flatMap(fa)(i => F.pure(i * 2))
 
+  // (5) cats' `Parallel.Aux` shape: a refinement that names a type
+  // constructor member. `seq`'s `F` occurs nowhere but the implicit clause, so
+  // the witness is the only thing that can pin it down -- and it can only do
+  // so if the refinement's declaration really carries what `F0` was.
+  trait Par[M[_]] {
+    type F[_]
+    def one[A](m: M[A]): F[A]
+  }
+  object Par {
+    type Aux[M[_], F0[_]] = Par[M] { type F[x] = F0[x] }
+    def seq[M[_], F[_], A](m: M[A])(implicit P: Par.Aux[M, F]): F[A] = P.one(m)
+  }
+  final class ParOps[M[_], A](val m: M[A]) {
+    def go[F[_]](implicit P: Par.Aux[M, F]): F[A] = Par.seq(m)
+  }
+  implicit val boxPar: Par.Aux[Box, Box] = new Par[Box] {
+    type F[x] = Box[x]
+    def one[A](m: Box[A]): Box[A] = m
+  }
+
   def main(args: Array[String]): Unit = {
     println(show(named.map(Good[String, Int](2))(_ + 1)))
     println(show(structural.map(Bad[String, Int]("no"))(_ + 1)))
@@ -78,5 +98,6 @@ object Main {
     println(m.flatMap(Reader[Int, Int](r => r + 1))(a => m.pure(a * 10)).run(4))
     println(m.map(Reader[Int, Int](r => r * 3))(_ + 1).run(5))
     println(twice[({ type L[X] = Reader[Int, X] })#L](Reader(r => r + 100)).run(1))
+    println(new ParOps(Box(9)).go[Box].value)
   }
 }

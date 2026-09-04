@@ -2668,15 +2668,13 @@ impl SymbolTable {
                 // The parameters of a higher-kinded member are the lambda's,
                 // and the right-hand side is the lambda itself; print the two
                 // together (`type L[a] = List[a]`) rather than a self-reference.
-                let lambda = rhs.as_ref().and_then(|t| self.hk_alias(t));
-                match lambda {
-                    Some((params, body)) => {
-                        let names: Vec<String> =
-                            params.iter().map(|p| self.get(*p).name.clone()).collect();
-                        s.push_str(&format!("[{}] = {}", names.join(", "), {
-                            let body = body.clone();
+                match rhs.as_ref().and_then(|t| self.lambda_parts(t)) {
+                    Some((names, body)) => {
+                        s.push_str(&format!(
+                            "[{}] = {}",
+                            names.join(", "),
                             self.display_type(&body)
-                        }));
+                        ));
                         return s;
                     }
                     None => {
@@ -2716,6 +2714,21 @@ impl SymbolTable {
     /// alternative reading was the useless `<none>.L`. A *named* higher-kinded
     /// alias keeps its name, as it does in nsc.
     fn display_type_lambda(&self, ty: &Type) -> Option<String> {
+        let (names, body) = self.lambda_parts(ty)?;
+        Some(format!(
+            "[{}]{}",
+            names.join(", "),
+            self.display_type(&body)
+        ))
+    }
+
+    /// The parameter names and the body of a refinement type lambda, with
+    /// whatever it captured already substituted in.
+    ///
+    /// `None` for anything else, and for a *named* higher-kinded alias, which
+    /// keeps its name in a diagnostic as it does in nsc. The members
+    /// `refinement_type_member` allocates are the ones with no owner.
+    fn lambda_parts(&self, ty: &Type) -> Option<(Vec<String>, Type)> {
         let (id, applied): (SymbolId, &[Type]) = match ty {
             Type::TypeMember(id) => (*id, &[]),
             Type::Applied { ctor, args } => match ctor.as_ref() {
@@ -2732,11 +2745,7 @@ impl SymbolTable {
         // The captured parameters are the leading ones; substitute what the
         // partial application already fixed before printing the body.
         let body = subst_tparams_slice(&self.get(id).tparams[..applied.len()], applied, body);
-        Some(format!(
-            "[{}]{}",
-            names.join(", "),
-            self.display_type(&body)
-        ))
+        Some((names, body))
     }
 
     pub fn display_type(&self, ty: &Type) -> String {
@@ -3568,9 +3577,18 @@ fn subst_refine_aliases(st: &SymbolTable, decls: &[RefineDecl], ty: &Type) -> Ty
                     if n == &name {
                         // Placeholder `TypeMember` rhs is the refinement's own
                         // member (`{ type F[X] = Id[X] }` stores `TypeMember(id)`).
-                        // Recursing would match the same decl forever.
+                        // Recursing would match the same decl forever. A lambda
+                        // that captured an enclosing parameter stores that
+                        // placeholder already applied to what it captured
+                        // (`{ type F[x] = F0[x] }` in cats' `Parallel.Aux`), and
+                        // that form is the same self-reference.
                         return match rhs {
                             Type::TypeMember(_) => rhs.clone(),
+                            Type::Applied { ctor, .. }
+                                if matches!(ctor.as_ref(), Type::TypeMember(_)) =>
+                            {
+                                rhs.clone()
+                            }
                             _ => subst_refine_aliases(st, decls, rhs),
                         };
                     }
