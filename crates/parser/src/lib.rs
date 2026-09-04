@@ -1115,7 +1115,10 @@ object Main {
     fn amp_is_a_compound_type_under_xsource3() {
         let r = parse_opts(
             "object M { def f(x: Product & Serializable): Int = 1 }",
-            ParseOptions { source3: true },
+            ParseOptions {
+                source3: true,
+                no_specialization: false,
+            },
         );
         assert!(!has_errors(&r.diags), "{:?}", r.diags);
         let amp = dump_tree(&r.tree);
@@ -1129,7 +1132,10 @@ object Main {
     fn amp_chain_and_refinement_under_xsource3() {
         let r = parse_opts(
             "object M { def f(x: A & B & C { def g: Int }): Int = 1 }",
-            ParseOptions { source3: true },
+            ParseOptions {
+                source3: true,
+                no_specialization: false,
+            },
         );
         assert!(!has_errors(&r.diags), "{:?}", r.diags);
         let amp = dump_tree(&r.tree);

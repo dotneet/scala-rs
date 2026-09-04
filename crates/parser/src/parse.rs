@@ -20,6 +20,12 @@ pub struct ParseResult {
 pub struct ParseOptions {
     /// `-Xsource:3` / `-Xsource:3-cross`: accept `A & B` as a compound type.
     pub source3: bool,
+    /// nsc `-no-specialization`, "Ignore @specialize annotations." Without it
+    /// `@specialized` is a diagnostic here, because this subset has no
+    /// specialisation phase and would silently emit a class without the
+    /// `$mc*$sp` members callers link against. With it, nsc itself ignores the
+    /// annotation, so accepting and dropping it is what nsc does.
+    pub no_specialization: bool,
 }
 
 pub fn parse_source(source: &SourceFile, file_index: usize, tokens: Vec<Token>) -> ParseResult {
@@ -43,16 +49,27 @@ pub fn parse_source_opts(
 
 /// Compiler annotations this subset does not implement. User-defined
 /// `StaticAnnotation` classes (`@Ann(foo)`) are accepted so we can pickle them.
-fn annotation_compiler_unsupported(path: &str) -> bool {
+///
+/// `no_specialization` is nsc's `-no-specialization`: under it nsc ignores
+/// `@specialized`/`@unspecialized` outright, so dropping them here is not a
+/// stub but the documented behaviour of that flag.
+fn annotation_compiler_unsupported(path: &str, no_specialization: bool) -> bool {
     let simple = path.rsplit('.').next().unwrap_or(path);
-    matches!(
-        simple,
-        "specialized" | "unspecialized" | "elidable" | "strictfp"
-    )
+    match simple {
+        "specialized" | "unspecialized" => !no_specialization,
+        // `@elidable(level)` elides a call only when `level < -Xelide-below`,
+        // and nsc's default for that setting is `elidable.MINIMUM`
+        // (`Int.MinValue`), which no level is below. This subset has no
+        // `-Xelide-below`, so ignoring the annotation *is* nsc's behaviour at
+        // every setting we accept. Whoever adds `-Xelide-below` has to
+        // implement elision at the same time.
+        "strictfp" => true,
+        _ => false,
+    }
 }
 
-fn annotation_supported(path: &str) -> bool {
-    !annotation_compiler_unsupported(path)
+fn annotation_supported(path: &str, no_specialization: bool) -> bool {
+    !annotation_compiler_unsupported(path, no_specialization)
 }
 
 /// XML attribute: unprefixed `b={e}` or prefixed `p:b={e}`.
@@ -78,6 +95,12 @@ struct Parser<'a> {
     /// introduces (nsc `freshTermName`).
     catch_id: u32,
     opts: ParseOptions,
+    /// Names `@specialized` / `@unspecialized` were renamed to by an import
+    /// in this file (`import scala.{specialized => sp}`). The check in
+    /// `parse_annotation` only sees the name written at the use site, so
+    /// without this the alias slipped past the diagnostic the spelled-out
+    /// name gets.
+    specialization_aliases: std::collections::HashSet<String>,
     /// nsc `Location.InBlock`: the next `parse_expr1` is a *block statement*,
     /// so a function literal there takes the rest of the block as its body
     /// (`{ x => val n = 1; n }`). Consumed by `parse_expr1`, so nested
@@ -99,6 +122,7 @@ impl<'a> Parser<'a> {
             placeholder_id: 0,
             catch_id: 0,
             opts: ParseOptions::default(),
+            specialization_aliases: std::collections::HashSet::new(),
             in_block: false,
         }
     }
@@ -523,7 +547,8 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if matches!(self.kind(), TokenKind::Import) {
-                stats.push(self.parse_import());
+                let imports = self.parse_import();
+                stats.extend(flatten_val_block(imports));
                 continue;
             }
             stats.extend(flatten_val_block(self.parse_tmpl_or_def()));
@@ -542,10 +567,35 @@ impl<'a> Parser<'a> {
         stats
     }
 
+    /// nsc `importClause`: `import` ImportExpr {`,` ImportExpr}. More than one
+    /// importer under a single `import` (`import scala.collection.mutable,
+    /// mutable.ReusableBuilder`) is returned as a `Block` of `Import`s, which
+    /// every statement list flattens back out; see [`flatten_val_block`].
     fn parse_import(&mut self) -> Tree {
         let lo = self.span();
         self.bump(); // import
         self.skip_nl();
+        let mut clauses = vec![self.one_import(lo)];
+        while matches!(self.kind(), TokenKind::Comma) {
+            let clause_lo = self.span();
+            self.bump();
+            self.skip_nl();
+            clauses.push(self.one_import(clause_lo));
+        }
+        let last = clauses.pop().expect("at least one importer");
+        if clauses.is_empty() {
+            return last;
+        }
+        self.alloc(
+            lo.merge(self.prev_span()),
+            TreeKind::Block {
+                stats: clauses,
+                expr: Box::new(last),
+            },
+        )
+    }
+
+    fn one_import(&mut self, lo: Span) -> Tree {
         let expr = self.parse_import_expr();
         self.alloc(
             lo.merge(self.prev_span()),
@@ -579,7 +629,13 @@ impl<'a> Parser<'a> {
                 break;
             }
             if matches!(self.kind(), TokenKind::LBrace) {
+                let qual = t.annotation_path();
                 let sels = self.parse_import_selectors();
+                for s in &sels {
+                    if let Some(r) = &s.rename {
+                        self.note_specialization_alias(&qual, &s.name, r);
+                    }
+                }
                 // Encode selectors on a synthetic Select name `{...}` and stash
                 // them by wrapping Import at the caller... we attach via a Block
                 // of Ident trees named "sel:rename".
@@ -606,6 +662,8 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.skip_nl();
                 let (to, tsp) = self.expect_ident();
+                let qual = t.annotation_path();
+                self.note_specialization_alias(&qual, &name, &to);
                 t = self.alloc(
                     t.span.merge(tsp),
                     TreeKind::Select {
@@ -818,9 +876,15 @@ impl<'a> Parser<'a> {
     fn parse_annotation(&mut self) -> Option<Tree> {
         let sp = self.span();
         self.bump(); // @
-        let annot = self.parse_simple_expr();
+        let annot = if matches!(self.kind(), TokenKind::LParen) {
+            self.parse_meta_annotation()
+        } else {
+            self.parse_simple_expr()
+        };
         let path = annot.annotation_path();
-        if annotation_supported(&path) {
+        let renamed_specialized =
+            !self.opts.no_specialization && self.specialization_aliases.contains(&path);
+        if !renamed_specialized && annotation_supported(&path, self.opts.no_specialization) {
             return Some(annot);
         }
         let shown = if path.is_empty() {
@@ -830,6 +894,56 @@ impl<'a> Parser<'a> {
         };
         self.error_span(sp, format!("unimplemented syntax: {shown}"));
         None
+    }
+
+    /// Record `import scala.{specialized => sp}` so `@sp` is diagnosed the
+    /// same way `@specialized` is. Only the two names, and only when they come
+    /// from `scala` / `scala.annotation`, so a user type that happens to be
+    /// called `specialized` is unaffected.
+    fn note_specialization_alias(&mut self, qual: &str, name: &str, rename: &str) {
+        let from_scala = matches!(
+            qual,
+            "scala" | "scala.annotation" | "_root_.scala" | "_root_.scala.annotation"
+        );
+        if from_scala && matches!(name, "specialized" | "unspecialized") && rename != "_" {
+            self.specialization_aliases.insert(rename.to_string());
+        }
+    }
+
+    /// `@(T @meta1 @meta2)(args)`, with the `(` as the current token.
+    ///
+    /// nsc reaches this through `annotationExpr`, whose annotation *type* is a
+    /// `simpleType` and may therefore be parenthesised and carry
+    /// meta-annotations (`@getter`, `@setter`, `@field`, `@companionMethod`,
+    /// `@companionClass`, ...). A meta-annotation only says which of the
+    /// members a definition expands into should receive the annotation. This
+    /// subset does not redirect an annotation onto an accessor or a companion
+    /// member, so the meta-annotations are dropped and the base annotation is
+    /// kept on the definition itself. The two shapes the 2.13 standard library
+    /// writes are inert under that treatment: ``@(`inline` @getter @setter)``
+    /// on a private var (we never inline) and `@(deprecated @companionMethod)`
+    /// on `Predef.any2stringadd`.
+    fn parse_meta_annotation(&mut self) -> Tree {
+        let lo = self.span();
+        self.bump(); // (
+        self.skip_nl();
+        let mut base = self.parse_annot_type();
+        while let TreeKind::AnnotatedTypeTree { tpt, .. } = base.kind {
+            base = *tpt;
+        }
+        self.skip_nl();
+        self.expect(")", |k| matches!(k, TokenKind::RParen));
+        while matches!(self.kind(), TokenKind::LParen) {
+            let args = self.parse_arg_exprs();
+            base = self.alloc(
+                lo.merge(self.prev_span()),
+                TreeKind::Apply {
+                    fun: Box::new(base),
+                    args,
+                },
+            );
+        }
+        base
     }
 
     fn parse_type_param_annotations(&mut self) -> Vec<Tree> {
@@ -3366,6 +3480,19 @@ impl<'a> Parser<'a> {
     fn parse_arg_exprs(&mut self) -> Vec<Tree> {
         self.bump(); // (
         self.skip_nl();
+        // nsc `argumentExprs`: `(` `using` Exprs `)`. 2.13 accepts a Scala 3
+        // `using` argument clause everywhere an ordinary one goes, with no
+        // `-Xsource:3` gate, and passes the arguments positionally. `using` is
+        // still an ordinary identifier, so — as in nsc — it only opens a
+        // clause when an expression follows it; `f(using)` and `f(using.x)`
+        // pass the value named `using`.
+        if matches!(self.kind(), TokenKind::Ident(s) if s == "using")
+            && !self.is_backquoted(self.span())
+            && is_expr_intro(self.kind_at(1))
+        {
+            self.bump();
+            self.skip_nl();
+        }
         let mut args = Vec::new();
         if !matches!(self.kind(), TokenKind::RParen) {
             loop {
@@ -4887,6 +5014,39 @@ fn xml_unsupported_markup(n: &str) -> Option<&'static str> {
     }
 }
 
+/// nsc `isExprIntroToken`: can this token begin an expression? Used for the
+/// one place 2.13 needs the lookahead, `f(using x)` versus `f(using)`.
+fn is_expr_intro(k: &TokenKind) -> bool {
+    matches!(
+        k,
+        TokenKind::Ident(_)
+            | TokenKind::IntLit(_)
+            | TokenKind::LongLit(_)
+            | TokenKind::DoubleLit(_)
+            | TokenKind::FloatLit(_)
+            | TokenKind::CharLit(_)
+            | TokenKind::StringLit(_)
+            | TokenKind::SymbolLit(_)
+            | TokenKind::InterpStart { .. }
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::Null
+            | TokenKind::This
+            | TokenKind::Super
+            | TokenKind::If
+            | TokenKind::For
+            | TokenKind::New
+            | TokenKind::Underscore
+            | TokenKind::Try
+            | TokenKind::While
+            | TokenKind::Do
+            | TokenKind::Return
+            | TokenKind::Throw
+            | TokenKind::LParen
+            | TokenKind::LBrace
+    )
+}
+
 fn flatten_val_block(t: Tree) -> Vec<Tree> {
     match t.kind {
         TreeKind::Block { stats, expr }
@@ -4895,6 +5055,18 @@ fn flatten_val_block(t: Tree) -> Vec<Tree> {
                     .iter()
                     .all(|s| matches!(s.kind, TreeKind::ValDef { .. }))
                 && matches!(expr.kind, TreeKind::ValDef { .. }) =>
+        {
+            let mut all = stats;
+            all.push(*expr);
+            all
+        }
+        // `import a.b, c.d` — one clause, several importers.
+        TreeKind::Block { stats, expr }
+            if !stats.is_empty()
+                && stats
+                    .iter()
+                    .all(|s| matches!(s.kind, TreeKind::Import { .. }))
+                && matches!(expr.kind, TreeKind::Import { .. }) =>
         {
             let mut all = stats;
             all.push(*expr);
