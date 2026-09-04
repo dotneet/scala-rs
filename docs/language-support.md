@@ -158,7 +158,7 @@ Syntax that can be parsed (or desugared):
   `Impl$` / `method` binding is recorded on the symbol, and, as in nsc, **no bytecode is emitted** for the macro def
   (so it cannot be called from Java). An omitted result type, an implementation that is not a method on an object,
   an implementation that does not take a `Context` as its first argument, an unresolvable reference, and whitebox macros are all reported as diagnostics.
-  The design is in [`docs/macros.md`](docs/macros.md)
+  The design is in [`docs/macros.md`](macros.md)
 - **Expanding def macros (the JVM bridge)**: as in nsc, the macro implementation's classfile is
   **really loaded and called on the JVM**. Given `java` and scala-reflect.jar, a call to
   `def f(): Int = macro Impl.m` is expanded and the expanded program runs.
@@ -171,7 +171,7 @@ Syntax that can be parsed (or desugared):
   (`Literal` / `Ident` / `Select` / `Apply` / `this`), the tags that can be built, and the kinds of trees that can be
   returned are a **subset**, and everything outside it is reported by name (it is never silently
   expanded into a different tree)
-  ([`docs/macros.md`](docs/macros.md) §7.11)
+  ([`docs/macros.md`](macros.md) §7.11)
 - **Implementations returning `c.Expr[T](tree)`, and `c.prefix`**: `scala.reflect.macros.Aliases` declares
   `Expr` twice, as a `val` (the extractor) and as a `def Expr[T: WeakTypeTag](tree: Tree)`.
   Explicit type arguments narrow the overload set **before** the value-position folding
@@ -188,7 +188,7 @@ Syntax that can be parsed (or desugared):
   (returning `c.Expr[F[E]]`, taking a `WeakTypeTag[E]`, and writing `New(TypeTree(e.tpe))`)
   can be expanded. Program output matches in a dual run against real scalac 2.13.16
   (`tests/fixtures/ex_impl.scala` + `tests/fixtures/ex_use.scala`)
-  ([`docs/macros.md`](docs/macros.md) §7.12)
+  ([`docs/macros.md`](macros.md) §7.12)
 - **`Function` / `ValDef` in expansion results**: the
   `Function(List(ValDef(Modifiers(Flag.PARAM), TermName("tag"),
   Ident(typeOf[Tag].typeSymbol), EmptyTree)), …)` that slick's `TableQueryMacroImpl.apply` builds
@@ -206,7 +206,7 @@ Syntax that can be parsed (or desugared):
   (it now stops at the number of parameter clauses on the macro def).
   Program output matches in a dual run against real scalac 2.13.16
   (`tests/fixtures/sd_impl.scala` + `tests/fixtures/sd_use.scala`)
-  ([`docs/macros.md`](docs/macros.md) §7.13)
+  ([`docs/macros.md`](macros.md) §7.13)
 - **Reification of quasiquotes (`q"..."`)**: `q"..."` / `tq"..."` / `pq"..."` / `cq"..."` are not
   ordinary `StringContext` interpolators but **compiler-intrinsic macros** in nsc.
   The contents of the interpolated string are (after replacing `$x` / `${…}` / `..$xs` / `...$xss` with placeholders)
@@ -234,7 +234,7 @@ Syntax that can be parsed (or desugared):
   always reported as `unimplemented syntax: quasiquote q"..." (which shape)`** (it is never silently accepted).
   What remains is the shapes the parser normalises away along with the distinction nsc keeps
   (an `if` with no `else`, by-name types), mixing `..$` with ordinary arguments, and `type` definitions
-  ([`docs/macros.md`](docs/macros.md) §7.4 / §7.7)
+  ([`docs/macros.md`](macros.md) §7.4 / §7.7)
 - **The 3 shapes that need fresh names**: the `_` placeholder function literal (`q"_.get"`),
   `_` type arguments, i.e. existentials (`tq"P[_, _]"`), and right-associative operators (`q"a :: b"`) expand in nsc
   not into a single expression but into a **block** that first places
@@ -244,7 +244,7 @@ Syntax that can be parsed (or desugared):
   by whether the text of the selection's span starts with the operator. A bare `_`
   type argument inside a pattern is a type variable pattern (`u.Bind(u.TypeName("_"), u.EmptyTree)`) and uses no
   fresh name, while a bounded one is an existential even inside a pattern
-  ([`docs/macros.md`](docs/macros.md) §7.10)
+  ([`docs/macros.md`](macros.md) §7.10)
 - **`Liftable` (holes that are not `Tree`s)**: a hole's argument need not be a `Tree`. nsc looks for an
   implicit `Liftable[T]` and splices in `Liftable.liftX[T](arg)`. scala-rs does no
   implicit search: it **picks the standard instance from the argument's type and directly builds the same
@@ -258,7 +258,7 @@ Syntax that can be parsed (or desugared):
   **A type with no standard instance is reported by name**
   (`a hole of type X is not lifted (…)`). User-defined `Liftable`s are not searched for.
   The `q"($rModule.tupled) : ($uTag => $rTag)"` of slick's `ShapedValue.mapToImpl` is
-  of this shape ([`docs/macros.md`](docs/macros.md) §7.8)
+  of this shape ([`docs/macros.md`](macros.md) §7.8)
 - **`symbolOf[T]` / `weakTypeOf[T]` / `typeOf[T]` being found**: a member that writes its type parameters
   only in an implicit clause (the materialiser shape) was being dropped wholesale by
   `pin_undetermined_tparams`, giving `not found: value symbolOf`.
@@ -287,7 +287,7 @@ Syntax that can be parsed (or desugared):
   carries no pickle of its own), the implicit parameter of `typeOf` being an
   unresolved `Type::Named`, and the `TypeTags#TypeTag` accessor not being supplied were all
   fixed. This is what makes slick's `c.typeOf[HList]` / `typeOf[Tag]` work
-  ([`docs/macros.md`](docs/macros.md) §7.10)
+  ([`docs/macros.md`](macros.md) §7.10)
 - **Expanding `reify { … }`**: `reify` is a compiler-intrinsic macro just like quasiquotes, and
   scala-reflect.jar has no implementation of it. scala-rs itself assembles
   `Expr.apply[T]($m, new $treecreator1())`
@@ -299,13 +299,13 @@ Syntax that can be parsed (or desugared):
   **refused by name** (`cannot expand reify { ... }: ...`; a bare name is never assembled silently).
   Literals, applications to and selections on a static `object`, `.splice`, and type arguments all
   match real scalac 2.13.16 in a dual run (`tests/fixtures/rb_impl.scala` +
-  `rb_use.scala`, [`docs/macros.md`](docs/macros.md) §7.15).
+  `rb_use.scala`, [`docs/macros.md`](macros.md) §7.15).
   This is what makes slick's `reify { TableQuery.apply[E](cons.splice) }` in `TableQueryMacroImpl` work,
   taking `errors=115 → 113`
   (an `if` with no `else`, by-name types, by-name and varargs parameters,
   procedure syntax `def f() { … }`, pattern definitions, self types, early definitions) and
   `type` definitions
-  ([`docs/macros.md`](docs/macros.md) §7.4 / §7.7 / §7.8 / §7.10)
+  ([`docs/macros.md`](macros.md) §7.4 / §7.7 / §7.8 / §7.10)
 - **Refined `Context`, field enumeration through `MemberScope`, and mixed `..$`**:
   the first argument of a macro implementation may also be
   `blackbox.Context { type PrefixType = … }`
@@ -319,7 +319,7 @@ Syntax that can be parsed (or desugared):
   Rank 2 (`...$xss`) is still refused by name. With this, slick's
   `lifted/ShapedValue.scala` goes from **5 to 0**, and `errors=99 → 94`
   (`tests/fixtures/sv_impl.scala` + `sv_use.scala`,
-  [`docs/macros.md`](docs/macros.md) §7.16)
+  [`docs/macros.md`](macros.md) §7.16)
 - **Classes and traits read from `-cp`**: a Scala trait read from a classfile on the `-cp`
   is treated as an **interface** (`ACC_INTERFACE` is read), and
   **its parents are taken from the header's `super_class` / `interfaces`**. Previously the former was missing,

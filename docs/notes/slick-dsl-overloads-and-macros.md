@@ -567,7 +567,7 @@ roots explained them; once the third was fixed, the remaining two (quasiquote
 diagnostics about `<error>`-typed holes) turned out to be **cascades** of the
 earlier ones and disappeared together.
 
-See [`docs/macros.md`](docs/macros.md) §7.16. `tests/slick_measure.sh` goes
+See [`docs/macros.md`](../macros.md) §7.16. `tests/slick_measure.sh` goes
 **`errors=99 → 94`, `files_with_errors=39 → 38`** (zero new errors). codegen
 (`crates/backend/`) was untouched, so `tests/slick_subset.sh` was skipped.
 

@@ -77,7 +77,7 @@ The tests are 4 new ones added to `crates/cli/tests/engine.rs`.
 
 The bug: `reify { … }` could not be expanded at all — slick's `TableQueryMacroImpl` failed with `cannot expand reify`. The root cause was simply that the expansion was unimplemented; `agent/reifyd` had already made the target tree work when hand-written, so this work makes the compiler build that tree automatically, with the hygiene rules the reification is there to provide.
 
-I made the compiler **build automatically** the tree that `agent/reifyd` had gotten as far as "works end to end when hand-written" ([`docs/macros.md`](docs/macros.md) §7.15). `reify { … }` is expanded by `crates/typer/src/reify_expand.rs` into
+I made the compiler **build automatically** the tree that `agent/reifyd` had gotten as far as "works end to end when hand-written" ([`docs/macros.md`](../macros.md) §7.15). `reify { … }` is expanded by `crates/typer/src/reify_expand.rs` into
 
 ```text
 { final class $treecreator1 extends scala.reflect.api.TreeCreator {

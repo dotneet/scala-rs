@@ -24,7 +24,7 @@ Language:
   reported with a reason, as
   `macro expansion is not implemented: cannot expand f (implementation Impl$.m):
   <reason>`
-  (**[`docs/macros.md`](docs/macros.md)** §7.11 / §7.12 / §7.13)
+  (**[`docs/macros.md`](macros.md)** §7.11 / §7.12 / §7.13)
 - **The rest of quasiquote expansion (reification)**. `q"..."` / `tq"..."` /
   `pq"..."` / `cq"..."` are lowered to `internal.reificationSupport.Syntactic*`
   calls and executed. Type ascriptions, eta expansion, blocks and `val`, `new`,
@@ -51,7 +51,7 @@ Language:
   form is called out — as `unimplemented syntax: quasiquote ... (which form)`,
   `a hole of type X is not lifted (…)`, or `cannot expand reify { ... }`; none of
   them is silently accepted. What each would require is listed in
-  [`docs/macros.md`](docs/macros.md) §7.7 / §7.8 / §7.10.
+  [`docs/macros.md`](macros.md) §7.7 / §7.8 / §7.10.
 
   For slick's `ShapedValue.mapToImpl`, putting scala-reflect.jar on `-cp` cut the
   errors from 20 down to single digits. The source records this reduction twice, in
