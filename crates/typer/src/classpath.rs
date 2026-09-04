@@ -1006,13 +1006,7 @@ fn java_class_owner(st: &mut SymbolTable, internal: &str) -> SymbolId {
 /// "value Integer is not a member of <notype>". nsc keeps the two apart, and
 /// so do we.
 pub fn find_by_jvm(st: &SymbolTable, jvm: &str) -> Option<SymbolId> {
-    st.symbols.iter().find_map(|s| {
-        if s.jvm_name == jvm && s.is_class_like() && !st.is_primitive_value_class(s.id) {
-            Some(s.id)
-        } else {
-            None
-        }
-    })
+    st.find_class_by_jvm(jvm)
 }
 
 pub fn find_or_stub_java_class(st: &mut SymbolTable, internal: &str) -> SymbolId {
@@ -1092,7 +1086,7 @@ fn apply_java_class_meta(st: &mut SymbolTable, id: SymbolId, c: &crate::javaclas
         flags = flags.with(Flags::MODULE).with(Flags::FINAL);
     }
     st.get_mut(id).flags = flags;
-    st.get_mut(id).jvm_name = c.internal_name.clone();
+    st.set_jvm_name(id, c.internal_name.clone());
     if st.get(id).tparams.is_empty() {
         if let Some(sig) = &c.signature {
             if let Some(cs) = crate::javasign::parse_class_sig(sig) {
@@ -1251,7 +1245,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         if let Some(id) = existing_java_method(st, owner, m) {
             st.get_mut(id).flags = java_method_flags(m);
             if st.get(id).jvm_name.is_empty() {
-                st.get_mut(id).jvm_name = m.desc.clone();
+                st.set_jvm_name(id, m.desc.clone());
             }
             continue;
         }
@@ -1300,7 +1294,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         let flags = java_method_flags(m);
         let id = add_method_types(st, owner, &m.name, names, params, ret);
         st.get_mut(id).flags = flags;
-        st.get_mut(id).jvm_name = m.desc.clone();
+        st.set_jvm_name(id, m.desc.clone());
         if !mtparams.is_empty() {
             for tid in &mtparams {
                 st.get_mut(*tid).owner = id;
@@ -1332,7 +1326,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         }
         let id = add_term(st, owner, &f.name, ty);
         st.get_mut(id).flags = flags;
-        st.get_mut(id).jvm_name = f.desc.clone();
+        st.set_jvm_name(id, f.desc.clone());
     }
 }
 

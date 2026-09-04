@@ -443,6 +443,24 @@ pub struct SymbolTable {
     /// absent from the map are walked as `List`, which is what `List`'s own
     /// `unapplySeq` and every built-in factory want.
     pub seq_extractor_payload: std::collections::HashMap<SymbolId, SeqPayload>,
+    /// `jvm_name` -> class-like symbols carrying it, for `classpath::find_by_jvm`,
+    /// which used to scan every symbol on every call. See `JvmIndex`.
+    pub(crate) jvm_index: std::cell::RefCell<JvmIndex>,
+}
+
+/// Reverse index from `jvm_name` to the class-like symbols that have it.
+///
+/// Built lazily: `symbols` only ever grows, so a call indexes whatever was
+/// appended since the last one and stops. `SymKind` is never reassigned after
+/// `alloc`, so "class-like" is decided once here; `jvm_name` *is* reassigned
+/// (`apply_java_class_meta` renames a stub once the class file is read), which
+/// is why `SymbolTable::set_jvm_name` is the only supported way to write it and
+/// why lookups re-check the name they find.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct JvmIndex {
+    /// How many entries of `symbols` have been folded into `map`.
+    upto: usize,
+    map: HashMap<String, Vec<SymbolId>>,
 }
 
 /// The container a `unapplySeq` hands back inside its `Option`.
@@ -526,6 +544,7 @@ impl SymbolTable {
             local_lazy_nlr: std::collections::HashSet::new(),
             prelude_end: 0,
             seq_extractor_payload: std::collections::HashMap::new(),
+            jvm_index: std::cell::RefCell::new(JvmIndex::default()),
         };
         st.root = st.alloc(
             "<_root_>",
@@ -1422,6 +1441,66 @@ impl SymbolTable {
                 self.unit_sym,
             ]
             .contains(&id)
+    }
+
+    /// Reassign a symbol's `jvm_name`, keeping `jvm_index` in step.
+    ///
+    /// The only supported way to change the field after `alloc`: writing it
+    /// through `get_mut` leaves the reverse index pointing at the old name and
+    /// `find_by_jvm` would then never find the symbol under its new one.
+    pub fn set_jvm_name(&mut self, id: SymbolId, jvm: impl Into<String>) {
+        let jvm = jvm.into();
+        let sym = &mut self.symbols[id.0 as usize];
+        if sym.jvm_name == jvm {
+            return;
+        }
+        sym.jvm_name = jvm;
+        let class_like = sym.is_class_like();
+        let name = sym.jvm_name.clone();
+        if class_like && !name.is_empty() {
+            let idx = self.jvm_index.get_mut();
+            // Only symbols already folded in need patching; the lazy pass will
+            // pick up the rest with the name they have by then.
+            if (id.0 as usize) < idx.upto {
+                let slot = idx.map.entry(name).or_default();
+                if !slot.contains(&id) {
+                    slot.push(id);
+                }
+            }
+        }
+    }
+
+    /// The first class-like symbol whose `jvm_name` is `jvm`, ignoring the
+    /// primitive value classes (whose `jvm_name` is the box they erase to, not
+    /// a class of their own).
+    ///
+    /// Equivalent to a scan of `symbols` in id order, which is what this
+    /// replaced: for slick that scan was ~6% of type checking on its own.
+    /// Index entries can be stale (a symbol renamed away from `jvm`), so the
+    /// name is re-checked here; entries are never *missing*, which is what
+    /// `set_jvm_name` buys.
+    pub fn find_class_by_jvm(&self, jvm: &str) -> Option<SymbolId> {
+        let mut idx = self.jvm_index.borrow_mut();
+        if idx.upto < self.symbols.len() {
+            let from = idx.upto;
+            for s in &self.symbols[from..] {
+                if s.is_class_like() && !s.jvm_name.is_empty() {
+                    let slot = idx.map.entry(s.jvm_name.clone()).or_default();
+                    if !slot.contains(&s.id) {
+                        slot.push(s.id);
+                    }
+                }
+            }
+            idx.upto = self.symbols.len();
+        }
+        idx.map
+            .get(jvm)?
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.symbols[id.0 as usize].jvm_name == jvm && !self.is_primitive_value_class(id)
+            })
+            .min_by_key(|s| s.0)
     }
 
     /// `class C(val x: T) extends AnyVal` — one ctor param, parent AnyVal.

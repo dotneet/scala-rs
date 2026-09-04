@@ -70,9 +70,12 @@ pub fn install_range_companion(st: &mut SymbolTable) {
             range_t.clone(),
             Intrinsic::None,
         );
-        st.get_mut(id).jvm_name = format!(
-            "({})Lscala/collection/immutable/{ret_jvm};",
-            "I".repeat(arity)
+        st.set_jvm_name(
+            id,
+            format!(
+                "({})Lscala/collection/immutable/{ret_jvm};",
+                "I".repeat(arity)
+            ),
         );
     }
     // `count(start, end, step)` / `count(start, end, step, isInclusive)`.
@@ -84,7 +87,7 @@ pub fn install_range_companion(st: &mut SymbolTable) {
         Type::Int,
         Intrinsic::None,
     );
-    st.get_mut(c3).jvm_name = "(III)I".into();
+    st.set_jvm_name(c3, "(III)I");
     let c4 = method(
         st,
         mc,
@@ -93,7 +96,7 @@ pub fn install_range_companion(st: &mut SymbolTable) {
         Type::Int,
         Intrinsic::None,
     );
-    st.get_mut(c4).jvm_name = "(IIIZ)I".into();
+    st.set_jvm_name(c4, "(IIIZ)I");
     // A module's members are looked up on the module *symbol* as well as on
     // its module class, exactly as `add_ordering` mirrors `Ordering$`.
     let mems = st.get(mc).members.clone();

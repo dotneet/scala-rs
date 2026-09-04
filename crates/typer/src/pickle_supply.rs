@@ -1135,7 +1135,7 @@ impl PickleSupply {
                 let f = st.get(id).flags.with(Flags::ACCESSOR);
                 st.get_mut(id).flags = f;
                 if st.get(id).jvm_name.is_empty() {
-                    st.get_mut(id).jvm_name = format!("()L{module_jvm};");
+                    st.set_jvm_name(id, format!("()L{module_jvm};"));
                 }
                 trace(format_args!(
                     "{pickle_owner}#{name}: repaired an accessor of nested object {module_jvm}"
@@ -1268,11 +1268,13 @@ impl PickleSupply {
                 args: vec![Type::TypeParam(t)],
             }),
         };
-        st.get_mut(ap).jvm_name = "(Lscala/reflect/api/Mirror;\
+        st.set_jvm_name(
+            ap,
+            "(Lscala/reflect/api/Mirror;\
              Lscala/reflect/api/TreeCreator;\
              Lscala/reflect/api/TypeTags$WeakTypeTag;)\
-             Lscala/reflect/api/Exprs$Expr;"
-            .to_string();
+             Lscala/reflect/api/Exprs$Expr;",
+        );
         trace(format_args!("wrote out {}#apply", Self::EXPR_MODULE));
     }
 
@@ -1585,7 +1587,7 @@ impl PickleSupply {
         // is *not* part of it: the point is that the same declaration, pulled
         // down onto two different classes, is recognisable as one member.
         st.get_mut(m).pickled_origin = format!("{pickle_owner}#{jvm_member}{want:?}");
-        st.get_mut(m).jvm_name = found.desc;
+        st.set_jvm_name(m, found.desc);
         st.get_mut(m).tparams = tparams;
         st.get_mut(m).params = paramss_sym.iter().flatten().copied().collect();
         st.get_mut(m).paramss = paramss_sym;
