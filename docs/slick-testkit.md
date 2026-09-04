@@ -129,3 +129,143 @@ scalac compile against classfiles scala-rs produced.
   subclass narrows.** `trait DB { type P <: Profile; val p: P }` with
   `type P = P2` in the implementation loads and verifies, then throws
   `AbstractMethodError` at the call. scalac emits a bridge.
+
+---
+
+# Second slice (`agent/testkit2`): what a *user* of compiled classfiles needs
+
+## Numbers
+
+Both columns compile the same 56 sources of testkit's stage `main`. They
+differ only in where slick comes from.
+
+| | files | errors | files with errors |
+|---|---|---|---|
+| slick as scala-rs compiled it, before | 56 | 2183 | 51 |
+| slick as scala-rs compiled it, after | 56 | **1977** | 51 |
+| slick 3.6.1 from Maven, before | 56 | 2534 | 50 |
+| slick 3.6.1 from Maven, after | 56 | **2198** | 50 |
+
+`tests/slick_measure.sh` is unchanged at 184 files / 0 errors / 2127 classes.
+`crates/backend/` was not touched, so `slick_subset.sh` was not re-run.
+
+The Maven column is worth having because it separates two defects that the
+single-column measurement adds together. Class files scalac wrote are known
+good, so **every diagnostic in that column is scala-rs's reader or typer**;
+class files scala-rs wrote are not, so the first column also carries whatever
+our own `ScalaSignature` loses. (Version noise: 3.6.1 is not the checkout, so
+the two columns are not comparable to each other, only each to itself.)
+
+## Four roots, all in the reader
+
+Found by pointing scala-rs at the published jar with a twelve-line user of
+`slick.jdbc.H2Profile.api`, and reproduced without slick at all in
+`tests/fixtures/testkit2_{lib,use}.scala`.
+
+**A nested class had no constructor at all.** nsc writes a top-level class's
+`ScalaSignature` once, on that class's own class file; a nested class's file
+carries a zero-length `Scala` marker and nothing else (`javap -v
+q.Outer$Inner`). A class reached through a type alias -- which is how a slick
+profile exports `Table`, `Query` and `Sequence` -- is therefore completed out
+of the *enclosing* pickle, and `adopt_binary_class` skips `<init>` by name.
+`lookup_member(Table, "<init>")` returned nothing, so
+`extends Table[Int](tag, "a")` was "no matching overload for constructor
+Table", and a parent in error left the body with no `column`, no `O` and no
+`tableTag` behind it. `PickleSupply::supply_ctors` now repairs a class that
+has **no** usable constructor from its pickle, installing the source
+parameters (the convention the backend's `with_enclosing_outer_param` already
+expects) with the real descriptor read out of the class file. It is a repair,
+not an addition: a class that already has a readable constructor is untouched.
+
+**A nullary type alias never reached scope.** `expose_unqualified_type` and
+`expose_from_wildcards` entered a completion result only when it was a
+`Type::TypeMember`, and `install_type_alias` deliberately hands a *nullary*
+alias back as its right-hand side with no symbol at all -- giving it one would
+make it opaque. `type Tag = lifted.Tag`, and the thirty like it in
+`slick.lifted.Aliases`, therefore never entered scope: `class As(tag: Tag)`
+had an unresolved `Named` parameter type, and the diagnostic was the
+unhelpful "type mismatch; found: Tag required: Tag". Both sites now enter the
+alias's *class* when the right-hand side is one.
+
+**`p.x.type` had no reading.** `val O: self.columnOptions.type = columnOptions`
+is how `RelationalTableComponent#Table` declares `O`. `conv`'s `Single` arm
+handled only a *module's* singleton type, so the member was declined whole and
+`O` kept the class file's erased accessor: "value PrimaryKey is not a member
+of RelationalTableComponent", 170 diagnostics. `conv_val_widening` now looks
+the referent up as a member of its owner and answers with the val's declared
+type -- the widening, since there is no singleton type to build, and the
+widening is what a selection off the reference reaches.
+
+**An inherited member of a `-cp` class was never completed.**
+`complete_on_ancestors` asked only ancestors whose JVM name starts with
+`scala/`, and `complete_named` serves a class outside the standard library
+only once it has been adopted -- which nothing does for a class the program
+merely *inherits*. So `class As(tag: Tag) extends Table[Int](...)` had none of
+what `Table` declares. Two paths needed it and neither had it: a selection
+through a receiver (`t.describe`) and a bare name inside the subclass body
+(`column`, `tableName`), the latter because `enter_inherited_members`
+snapshots member lists that are still empty for a jar class. The ancestor walk
+now adopts a non-`java.*` ancestor that has a pickle, and
+`Check::expose_inherited_from_binary` runs the same completion for an
+unqualified name. Together: 695 of the 2534 diagnostics in the Maven column.
+
+## What the measurement now says the blocker is
+
+In the column that the brief tracks -- testkit against **slick as scala-rs
+compiled it** -- the remaining top families are no longer reader gaps. The
+same forty-line fixture, compiled the other way round, shows why:
+
+```
+scala-rs compiles testkit2_lib.scala -> class files
+real scalac compiles testkit2_use.scala against them
+  error: value api is not a member of object Profile
+  error: not found: type Table
+  error: value describe is not a member of Main.Users
+```
+
+Real scalac cannot read our `ScalaSignature` either, so this is the **writer**
+(`crates/backend/src/pickle.rs`), not the reader. Two losses are visible in
+that one fixture and account for the largest remaining families:
+
+* **A nested `object` is not declared in the enclosing pickle** -- the same
+  shape as the known gap for nested *classes*. `object Profile { object api }`
+  loses `api`; in slick this is `H2Profile.api` itself.
+* **`val O: Profile.opts.type` comes back as the owner**, so `O.PrimaryKey` is
+  "value PrimaryKey is not a member of Profile" -- exactly the
+  `RelationalTableComponent` family (170) that the reader fix cleared when the
+  class files came from scalac.
+* **A secondary constructor is in the bytecode but not in the pickle**, so
+  `extends Table[Int](tag, "a")` still fails in that direction.
+
+`tests/fixtures/testkit2_{lib,use}.scala` is the reproduction; today
+`crates/cli/tests/testkit2.rs` drives it in the direction that works (scalac
+writes, scala-rs reads). Turning the other direction on is the next slice's
+acceptance test, and it belongs to whoever owns `crates/backend`.
+
+## Known gaps this did not fix
+
+* **The `$outer` of a super call into a nested `-cp` class.** With the
+  constructor repair in place, `class Users(t: Tag) extends P.Table[Int](t)`
+  where `P.Table` is nested in a *trait* now typechecks and then emits
+  `Table.<init>(Tag, String)` with no enclosing instance:
+  `VerifyError: Bad type on operand stack ... uninitializedThis is not
+  assignable to Profile`. `gen::with_enclosing_outer_param` prepends the
+  *subclass's own* `$outer`, and what this call needs is the prefix of the
+  parent type (`H2$.MODULE$`). Nested in an `object` -- which is what the
+  committed fixture uses -- there is no outer and the same program runs and
+  matches scalac. `crates/backend/src/gen.rs` is another slice's file, so this
+  was left alone; testkit emits no class files yet, so nothing bad reaches
+  disk today.
+* **`X.this.y.type` is rejected in source.** `val O: Profile.this.opts.type`
+  is "stable identifier required, but Profile.this.opts found"; the self-type
+  alias spelling `self.opts.type` works, which is what slick writes.
+* **`TableQuery[E]` is a macro overload.** `TableQuery[As]` picks the
+  value-taking `apply` and stays an unapplied method type
+  (`((Tag) => As)TableQuery[As]`), so `.schema`, `.result`, `.filter`, `+=`
+  and `++=` are all "not a member" -- around 250 diagnostics in the Maven
+  column, and the reason so many lambdas there have `<notype>` parameters.
+* **An implicit `TypedType[T]` for `column[T]("id")`.** Against the published
+  jar scala-rs agrees with scalac exactly (`stringColumnType` does not conform
+  to `TypedType[Int]`, `intColumnType` does); against our own class files
+  every numeric column type reads as `Any` and every other one matches
+  everything, which is the writer again.
