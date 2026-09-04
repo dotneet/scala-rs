@@ -97,13 +97,15 @@ CORPUS_LOG=$MYDIR/corpus.tsv tests/scala_corpus.sh
 
 Default is a **sample**: 250 tests per category, spaced evenly over the
 alphabetical order so the same tests come back every run and two measurements
-are comparable. About four minutes. The whole corpus is
+are comparable. Under a minute (42 s at `CORPUS_JOBS=6`), and close enough to
+be useful — the same tree that scores 63.9 / 61.4 / 28.7 on the whole corpus
+scores 65.5 / 56.7 / 28.2 on the sample. The whole corpus is
 
 ```
 CORPUS_LOG=$MYDIR/corpus.tsv CORPUS_SIZE=full tests/scala_corpus.sh
 ```
 
-and takes about fifteen minutes at `CORPUS_JOBS=6`. Do not run it next to a
+and takes ten to fifteen minutes at `CORPUS_JOBS=6`. Do not run it next to a
 slick measurement.
 
 | variable | default | |
