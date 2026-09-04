@@ -78,7 +78,7 @@ impl CompileResult {
 struct Unit {
     file_index: usize,
     tree: Tree,
-    pickles: std::collections::HashMap<u32, Vec<u8>>,
+    pickles: std::rc::Rc<std::collections::HashMap<u32, Vec<u8>>>,
 }
 
 fn has_errors(diags: &[Diagnostic]) -> bool {
@@ -136,7 +136,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 units.push(Unit {
                     file_index,
                     tree: parsed.tree,
-                    pickles: std::collections::HashMap::new(),
+                    pickles: std::rc::Rc::new(std::collections::HashMap::new()),
                 });
                 sources.push(sf);
             }
@@ -238,14 +238,14 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
             for u in units.iter() {
                 diags.extend(check_local_case_class_captures(u.file_index, &u.tree, &st));
             }
-            let pickles = scala_rs_backend::pickle::pickle_all(&st);
+            let pickles = std::rc::Rc::new(scala_rs_backend::pickle::pickle_all(&st));
             // Value classes are boxed across unit boundaries, so every unit's
             // declarations have to be known before the first one is erased.
             for u in units.iter() {
                 note_source_value_classes(&u.tree, &mut st);
             }
             for u in units.iter_mut() {
-                u.pickles = pickles.clone();
+                u.pickles = std::rc::Rc::clone(&pickles);
                 erase(&mut u.tree, &mut st);
             }
         }
@@ -280,6 +280,10 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
     for u in &units {
         scala_rs_backend::gen::collect_trait_members(&u.tree, st, &mut trait_members);
     }
+    // One map for the whole run, handed to each unit by reference count: it
+    // holds every trait's concrete members and copying it per unit was 9% of
+    // the compile.
+    let trait_members = std::rc::Rc::new(trait_members);
     for u in &units {
         let src_name = source_file_name(&sources[u.file_index]);
         emitted.extend(emit_opts(
@@ -288,8 +292,8 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
             src_name,
             EmitOpts {
                 library_abi,
-                pickles: u.pickles.clone(),
-                trait_members: Some(trait_members.clone()),
+                pickles: std::rc::Rc::clone(&u.pickles),
+                trait_members: Some(std::rc::Rc::clone(&trait_members)),
             },
         ));
     }

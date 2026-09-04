@@ -10,6 +10,7 @@ use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{Intrinsic, SeqPayload, SymKind, SymbolTable};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// Options for [`emit_opts`].
 #[derive(Clone, Debug, Default)]
@@ -21,10 +22,13 @@ pub struct EmitOpts {
     /// (`List.withFilter`, `List.tail()List`, ArrowAssoc) are rewritten here.
     pub library_abi: bool,
     /// Pre-erasure ScalaSignature pickles, keyed by class symbol id.
-    pub pickles: HashMap<u32, Vec<u8>>,
+    ///
+    /// Shared, not owned: the driver hands the same map to every unit of the
+    /// run, and deep-copying it per unit was 3% of the compile.
+    pub pickles: Rc<HashMap<u32, Vec<u8>>>,
     /// Concrete trait members from every unit in the run; `None` means this
-    /// unit only.
-    pub trait_members: Option<TraitImpls>,
+    /// unit only. Shared for the same reason (9% of the compile).
+    pub trait_members: Option<Rc<TraitImpls>>,
 }
 
 /// Walk a typed compilation unit and emit classes (private-runtime ABI).
@@ -46,31 +50,98 @@ pub struct TraitImpls {
 }
 
 /// Collect the concrete trait members of one unit into a shared map.
-pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpls) {
-    let mut g = Gen {
-        st,
-        source_name: "",
-        out: Vec::new(),
-        extras: RefCell::new(Vec::new()),
-        lambda_n: Cell::new(0),
-        trait_impls: HashMap::new(),
-        trait_vals: HashMap::new(),
-        trait_inits: HashMap::new(),
-        trait_lazy_vals: HashMap::new(),
-        trait_modules: HashMap::new(),
-        library_abi: false,
-        pickles: HashMap::new(),
-        boxed_vars: HashSet::new(),
-        // Never consulted: this pass only harvests `trait_impls`/`trait_vals`
-        // / `trait_lazy_vals`, it never finishes a `ClassBuilder`.
-        jvm_index: HashMap::new(),
-    };
-    g.collect_trait_impls(tree);
-    into.impls.extend(g.trait_impls);
-    into.vals.extend(g.trait_vals);
-    into.inits.extend(g.trait_inits);
-    into.lazy_vals.extend(g.trait_lazy_vals);
-    into.modules.extend(g.trait_modules);
+///
+/// `st` is unused — the harvest reads the tree only — and is kept so callers
+/// need not change.
+pub fn collect_trait_members(tree: &Tree, _st: &SymbolTable, into: &mut TraitImpls) {
+    collect_trait_impls(tree, into);
+}
+
+/// Harvest one unit's concrete trait members. A function of the tree alone:
+/// no symbol table, no ABI, so running it twice on the same tree inserts the
+/// same entries under the same keys.
+fn collect_trait_impls(tree: &Tree, into: &mut TraitImpls) {
+    match &tree.kind {
+        TreeKind::ClassDef { mods, impl_, .. } => {
+            if mods.flags.contains(Flags::TRAIT) {
+                let methods: Vec<Tree> = impl_
+                    .body
+                    .iter()
+                    .filter(|s| match &s.kind {
+                        TreeKind::DefDef { rhs, name, .. } => {
+                            !rhs.is_empty() && name != "<init>" && name != "<clinit>"
+                        }
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect();
+                if !methods.is_empty() && !tree.sym.is_none() {
+                    into.impls.insert(tree.sym, methods);
+                }
+                let vals: Vec<Tree> = impl_
+                    .body
+                    .iter()
+                    .filter(|s| match &s.kind {
+                        TreeKind::ValDef { rhs, mods, .. } => {
+                            !rhs.is_empty() && !mods.flags.contains(Flags::LAZY)
+                        }
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect();
+                if !vals.is_empty() && !tree.sym.is_none() {
+                    into.vals.insert(tree.sym, vals);
+                }
+                // `$init$` runs the `val` initializers *and* the trait
+                // body's bare statements, in source order (SLS 5.1).
+                let init_stats: Vec<Tree> = impl_
+                    .body
+                    .iter()
+                    .filter(|s| match &s.kind {
+                        TreeKind::ValDef { rhs, mods, .. } => {
+                            !rhs.is_empty() && !mods.flags.contains(Flags::LAZY)
+                        }
+                        _ => is_template_stat(s),
+                    })
+                    .cloned()
+                    .collect();
+                if !init_stats.is_empty() && !tree.sym.is_none() {
+                    into.inits.insert(tree.sym, init_stats);
+                }
+                let lazies: Vec<Tree> = impl_
+                    .body
+                    .iter()
+                    .filter(|s| match &s.kind {
+                        TreeKind::ValDef { rhs, mods, .. } => {
+                            !rhs.is_empty() && mods.flags.contains(Flags::LAZY)
+                        }
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect();
+                if !lazies.is_empty() && !tree.sym.is_none() {
+                    into.lazy_vals.insert(tree.sym, lazies);
+                }
+                let modules: Vec<Tree> = impl_
+                    .body
+                    .iter()
+                    .filter(|s| matches!(s.kind, TreeKind::ModuleDef { .. }))
+                    .cloned()
+                    .collect();
+                if !modules.is_empty() && !tree.sym.is_none() {
+                    into.modules.insert(tree.sym, modules);
+                }
+            }
+            for_each_term_child(tree, &mut |c| collect_trait_impls(c, into));
+        }
+        // A `trait` is not only a template member: it can be declared in
+        // any block — a method body, an `if` branch, a lambda. Those local
+        // traits need their concrete members harvested exactly like a
+        // top-level one's, or every class mixing them in is emitted with
+        // no mixin forwarders at all and fails at run time with
+        // `AbstractMethodError`.
+        _ => for_each_term_child(tree, &mut |c| collect_trait_impls(c, into)),
+    }
 }
 
 /// Walk a typed compilation unit and emit classes.
@@ -80,18 +151,25 @@ pub fn emit_opts(
     source_name: &str,
     opts: EmitOpts,
 ) -> Vec<EmittedClass> {
-    let shared = opts.trait_members.clone().unwrap_or_default();
+    // A shared map already holds this unit's own trait members: the driver
+    // harvests every unit of the run before emitting any, and the harvest is a
+    // function of the tree alone, so doing it again here would insert the same
+    // entries under the same keys. Only the `None` caller has to do its own.
+    let traits = match opts.trait_members {
+        Some(shared) => shared,
+        None => {
+            let mut own = TraitImpls::default();
+            collect_trait_impls(tree, &mut own);
+            Rc::new(own)
+        }
+    };
     let mut g = Gen {
         st,
         source_name,
         out: Vec::new(),
         extras: RefCell::new(Vec::new()),
         lambda_n: Cell::new(0),
-        trait_impls: shared.impls,
-        trait_vals: shared.vals,
-        trait_inits: shared.inits,
-        trait_lazy_vals: shared.lazy_vals,
-        trait_modules: shared.modules,
+        traits,
         library_abi: opts.library_abi,
         pickles: opts.pickles,
         // `scala.runtime.*Ref` exists in both ABIs: on the jar, and as a
@@ -99,7 +177,6 @@ pub fn emit_opts(
         boxed_vars: collect_boxed_vars(tree, st),
         jvm_index: build_jvm_index(st),
     };
-    g.collect_trait_impls(tree);
     g.walk(tree);
     g.emit_anon_classes(tree);
     g.out.append(&mut g.extras.borrow_mut());
@@ -113,24 +190,20 @@ struct Gen<'a> {
     extras: RefCell<Vec<EmittedClass>>,
     lambda_n: Cell<u32>,
     /// Concrete trait methods, for `$class` static impls and mixin forwarders.
-    trait_impls: HashMap<SymbolId, Vec<Tree>>,
+    traits: Rc<TraitImpls>,
     /// Trait `val` definitions with a right-hand side (`T$class.$init$`).
-    trait_vals: HashMap<SymbolId, Vec<Tree>>,
     /// What `T$class.$init$` actually runs: the entries of `trait_vals`
     /// interleaved with the trait body's bare expression statements, in source
     /// order (SLS 5.1). Kept apart from `trait_vals` because the accessor /
     /// mixin-forwarder passes want the `val`s alone.
-    trait_inits: HashMap<SymbolId, Vec<Tree>>,
     /// Trait `lazy val` definitions. Unlike a plain `val` these are not set
     /// from `$init$`; every implementing class gets its own field, bitmap bit
     /// and accessor, exactly as nsc's mixin phase does.
-    trait_lazy_vals: HashMap<SymbolId, Vec<Tree>>,
     /// Member `object`s declared in a trait. Like a trait `lazy val` these are
     /// not set from `$init$`: every implementing class gets its own
     /// `<name>$module` field and `<name>()` accessor, as nsc's mixin phase does.
-    trait_modules: HashMap<SymbolId, Vec<Tree>>,
     library_abi: bool,
-    pickles: HashMap<u32, Vec<u8>>,
+    pickles: Rc<HashMap<u32, Vec<u8>>>,
     /// Locals boxed into `scala.runtime.IntRef` / `ObjectRef` (library ABI).
     boxed_vars: HashSet<SymbolId>,
     /// JVM internal name → class-like symbol, for the whole symbol table.
@@ -2510,90 +2583,6 @@ fn for_each_term_child(tree: &Tree, f: &mut impl FnMut(&Tree)) {
 }
 
 impl<'a> Gen<'a> {
-    fn collect_trait_impls(&mut self, tree: &Tree) {
-        match &tree.kind {
-            TreeKind::ClassDef { mods, impl_, .. } => {
-                if mods.flags.contains(Flags::TRAIT) {
-                    let methods: Vec<Tree> = impl_
-                        .body
-                        .iter()
-                        .filter(|s| match &s.kind {
-                            TreeKind::DefDef { rhs, name, .. } => {
-                                !rhs.is_empty() && name != "<init>" && name != "<clinit>"
-                            }
-                            _ => false,
-                        })
-                        .cloned()
-                        .collect();
-                    if !methods.is_empty() && !tree.sym.is_none() {
-                        self.trait_impls.insert(tree.sym, methods);
-                    }
-                    let vals: Vec<Tree> = impl_
-                        .body
-                        .iter()
-                        .filter(|s| match &s.kind {
-                            TreeKind::ValDef { rhs, mods, .. } => {
-                                !rhs.is_empty() && !mods.flags.contains(Flags::LAZY)
-                            }
-                            _ => false,
-                        })
-                        .cloned()
-                        .collect();
-                    if !vals.is_empty() && !tree.sym.is_none() {
-                        self.trait_vals.insert(tree.sym, vals);
-                    }
-                    // `$init$` runs the `val` initializers *and* the trait
-                    // body's bare statements, in source order (SLS 5.1).
-                    let init_stats: Vec<Tree> = impl_
-                        .body
-                        .iter()
-                        .filter(|s| match &s.kind {
-                            TreeKind::ValDef { rhs, mods, .. } => {
-                                !rhs.is_empty() && !mods.flags.contains(Flags::LAZY)
-                            }
-                            _ => is_template_stat(s),
-                        })
-                        .cloned()
-                        .collect();
-                    if !init_stats.is_empty() && !tree.sym.is_none() {
-                        self.trait_inits.insert(tree.sym, init_stats);
-                    }
-                    let lazies: Vec<Tree> = impl_
-                        .body
-                        .iter()
-                        .filter(|s| match &s.kind {
-                            TreeKind::ValDef { rhs, mods, .. } => {
-                                !rhs.is_empty() && mods.flags.contains(Flags::LAZY)
-                            }
-                            _ => false,
-                        })
-                        .cloned()
-                        .collect();
-                    if !lazies.is_empty() && !tree.sym.is_none() {
-                        self.trait_lazy_vals.insert(tree.sym, lazies);
-                    }
-                    let modules: Vec<Tree> = impl_
-                        .body
-                        .iter()
-                        .filter(|s| matches!(s.kind, TreeKind::ModuleDef { .. }))
-                        .cloned()
-                        .collect();
-                    if !modules.is_empty() && !tree.sym.is_none() {
-                        self.trait_modules.insert(tree.sym, modules);
-                    }
-                }
-                for_each_term_child(tree, &mut |c| self.collect_trait_impls(c));
-            }
-            // A `trait` is not only a template member: it can be declared in
-            // any block — a method body, an `if` branch, a lambda. Those local
-            // traits need their concrete members harvested exactly like a
-            // top-level one's, or every class mixing them in is emitted with
-            // no mixin forwarders at all and fails at run time with
-            // `AbstractMethodError`.
-            _ => for_each_term_child(tree, &mut |c| self.collect_trait_impls(c)),
-        }
-    }
-
     fn emit_anon_classes(&mut self, tree: &Tree) {
         if let TreeKind::New { tpt } = &tree.kind {
             if let TreeKind::ClassDef { name, impl_, .. } = &tpt.kind {
@@ -3912,8 +3901,18 @@ impl<'a> Gen<'a> {
 
     fn emit_trait_impl_class(&mut self, tree: &Tree, iface: &str) {
         let class_id = tree.sym;
-        let methods = self.trait_impls.get(&class_id).cloned().unwrap_or_default();
-        let inits = self.trait_inits.get(&class_id).cloned().unwrap_or_default();
+        let methods = self
+            .traits
+            .impls
+            .get(&class_id)
+            .cloned()
+            .unwrap_or_default();
+        let inits = self
+            .traits
+            .inits
+            .get(&class_id)
+            .cloned()
+            .unwrap_or_default();
         if methods.is_empty() && inits.is_empty() {
             return;
         }
@@ -4099,7 +4098,7 @@ impl<'a> Gen<'a> {
             return out;
         }
         for parent in linearize(self.st, class_id).into_iter().skip(1) {
-            let Some(vals) = self.trait_vals.get(&parent) else {
+            let Some(vals) = self.traits.vals.get(&parent) else {
                 continue;
             };
             for v in vals {
@@ -4134,7 +4133,7 @@ impl<'a> Gen<'a> {
             if !is_interface_sym(self.st, parent) {
                 continue;
             }
-            let Some(vals) = self.trait_lazy_vals.get(&parent) else {
+            let Some(vals) = self.traits.lazy_vals.get(&parent) else {
                 continue;
             };
             for v in vals {
@@ -4164,7 +4163,7 @@ impl<'a> Gen<'a> {
             if !is_interface_sym(self.st, parent) {
                 continue;
             }
-            let Some(mods) = self.trait_modules.get(&parent) else {
+            let Some(mods) = self.traits.modules.get(&parent) else {
                 continue;
             };
             for m in mods {
@@ -4218,7 +4217,7 @@ impl<'a> Gen<'a> {
         let mut needed: Vec<(String, Type, SymbolId, bool)> = Vec::new();
         let mut seen = HashSet::new();
         for parent in linearize(self.st, class_id).into_iter().skip(1) {
-            let Some(vals) = self.trait_vals.get(&parent) else {
+            let Some(vals) = self.traits.vals.get(&parent) else {
                 continue;
             };
             for v in vals {
@@ -4284,7 +4283,7 @@ impl<'a> Gen<'a> {
             if idx == 0 || !is_interface_sym(self.st, *parent) {
                 continue;
             }
-            let Some(methods) = self.trait_impls.get(parent) else {
+            let Some(methods) = self.traits.impls.get(parent) else {
                 continue;
             };
             for m in methods {
@@ -4364,7 +4363,8 @@ impl<'a> Gen<'a> {
     ) -> Option<String> {
         match target? {
             (next, true) => self
-                .trait_impls
+                .traits
+                .impls
                 .get(&next)?
                 .iter()
                 .find(|m| m.name() == Some(method) && def_param_types(self.st, m).len() == arity)
@@ -4393,7 +4393,7 @@ impl<'a> Gen<'a> {
         method: &str,
     ) -> Option<(SymbolId, bool)> {
         for &s in lin.iter().skip(after_idx + 1) {
-            if let Some(ms) = self.trait_impls.get(&s) {
+            if let Some(ms) = self.traits.impls.get(&s) {
                 // A trait-private method never dispatches through `super`:
                 // it isn't part of the interface's signature, so it can't be
                 // the target of another trait's or class's `super.m()`.
@@ -4436,7 +4436,7 @@ impl<'a> Gen<'a> {
         let mut chosen: Vec<(String, String, Tree)> = Vec::new();
         let mut seen = HashSet::new();
         for parent in lin.iter().skip(1) {
-            let Some(methods) = self.trait_impls.get(parent) else {
+            let Some(methods) = self.traits.impls.get(parent) else {
                 continue;
             };
             if !is_interface_sym(self.st, *parent) {
@@ -5648,7 +5648,7 @@ impl<'a> Gen<'a> {
             .skip(1)
             .rev()
             .filter_map(|p| {
-                if !self.trait_inits.contains_key(&p) || !is_interface_sym(self.st, p) {
+                if !self.traits.inits.contains_key(&p) || !is_interface_sym(self.st, p) {
                     return None;
                 }
                 let iface = class_internal(self.st, p);

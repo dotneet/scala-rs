@@ -405,20 +405,26 @@ fn flatten_defdef(tree: &mut Tree, st: &mut SymbolTable) {
 }
 
 fn flatten_one_method(st: &mut SymbolTable, id: SymbolId) {
-    let paramss = st.get(id).paramss.clone();
-    if paramss.len() > 1 {
+    // Test before taking. `flatten_method_symbols` runs once per compilation
+    // unit over the whole symbol table, and all but a handful of the symbols it
+    // visits have a single parameter list already: cloning `paramss` and the
+    // method's type to discover that was pure waste.
+    if st.get(id).paramss.len() > 1 {
+        let paramss = std::mem::take(&mut st.get_mut(id).paramss);
         let flat: Vec<SymbolId> = paramss.into_iter().flatten().collect();
         st.get_mut(id).params = flat.clone();
         st.get_mut(id).paramss = vec![flat];
     }
-    if let Type::Method { paramss, ret } = st.get(id).ty.clone() {
-        if paramss.len() > 1 {
-            let params: Vec<Type> = paramss.into_iter().flatten().collect();
-            st.get_mut(id).ty = Type::Method {
-                paramss: vec![params],
-                ret,
-            };
-        }
+    if matches!(&st.get(id).ty, Type::Method { paramss, .. } if paramss.len() > 1) {
+        let Type::Method { paramss, ret } = std::mem::replace(&mut st.get_mut(id).ty, Type::NoType)
+        else {
+            unreachable!("just matched a method type")
+        };
+        let params: Vec<Type> = paramss.into_iter().flatten().collect();
+        st.get_mut(id).ty = Type::Method {
+            paramss: vec![params],
+            ret,
+        };
     }
 }
 
