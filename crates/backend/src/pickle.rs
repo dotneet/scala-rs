@@ -595,10 +595,54 @@ impl<'a> Pickler<'a> {
                 }
             }
             n => {
-                let jvm = self.st.get(class_sym).jvm_name.clone();
-                let owner = self.package_ref_of(&jvm);
+                let owner = self.external_owner_ref(class_sym);
                 self.type_ref_in_refs(owner, n, arg_refs)
             }
+        }
+    }
+
+    /// The reference a *nested* class hangs off.
+    ///
+    /// `package_ref_of` only ever produced a package, so
+    /// `slick/jdbc/JdbcActionComponent$MultipleRowsPerStatementSupport` was
+    /// written as `slick.jdbc.MultipleRowsPerStatementSupport` -- a symbol
+    /// that does not exist, which nsc reports as "Symbol 'type
+    /// slick.jdbc.MultipleRowsPerStatementSupport' is missing from the
+    /// classpath" the first time anything mentions the class that inherits
+    /// it. The owner chain comes from the symbol table (which knows whether
+    /// each step is a class or an object) and is used only when the JVM name
+    /// says the class really is nested, so a plain top-level class keeps the
+    /// package path it had.
+    fn external_owner_ref(&mut self, class_sym: SymbolId) -> u32 {
+        let jvm = self.st.get(class_sym).jvm_name.clone();
+        let last = jvm.rsplit('/').next().unwrap_or(&jvm);
+        if !last.trim_end_matches('$').contains('$') {
+            return self.package_ref_of(&jvm);
+        }
+        self.owner_chain_ref(class_sym, 0)
+    }
+
+    fn owner_chain_ref(&mut self, sym: SymbolId, depth: u32) -> u32 {
+        let jvm = self.st.get(sym).jvm_name.clone();
+        let owner = self.st.get(sym).owner;
+        if depth > 8 || owner.is_none() {
+            return self.package_ref_of(&jvm);
+        }
+        let (kind, name) = {
+            let o = self.st.get(owner);
+            (o.kind, o.name.trim_end_matches('$').to_string())
+        };
+        match kind {
+            SymKind::Module | SymKind::ModuleClass => {
+                let up = self.owner_chain_ref(owner, depth + 1);
+                self.ext_mod(&name, Some(up))
+            }
+            SymKind::Class => {
+                let up = self.owner_chain_ref(owner, depth + 1);
+                self.ext_ref_owned(&name, up)
+            }
+            // A package (or anything else): the JVM name already spells it.
+            _ => self.package_ref_of(&jvm),
         }
     }
 
@@ -1364,9 +1408,27 @@ impl<'a> Pickler<'a> {
                 self.class_type_ref(*sym, &arg_refs)
             }
             Type::ModuleRef(s) => {
-                let n = self.st.get(*s).name.clone();
-                let n = n.trim_end_matches('$').to_string();
-                self.type_ref_named(&n)
+                // `val L = List` has type `List.type`. Written as a bare name
+                // this became `TypeRef(NoPrefix, EXTref "List")`, which nsc
+                // reads as `<root>.List` and then reports "Symbol 'type
+                // <root>.List' is missing from the classpath" at the *use*
+                // site. The owning package has to be part of the reference,
+                // and a module is an `EXTMODCLASSref`, not an `EXTref`.
+                if let Some(&i) = self.sym_index.get(&s.0) {
+                    return self.type_ref_local_refs(i, &[]);
+                }
+                let jvm = self.st.get(*s).jvm_name.clone();
+                let n = self.st.get(*s).name.trim_end_matches('$').to_string();
+                if !jvm.contains('/') {
+                    return self.type_ref_named(&n);
+                }
+                let owner = self.package_ref_of(&jvm);
+                let sym = self.ext_mod(&n, Some(owner));
+                let pref = self.noprefix;
+                let mut body = Vec::new();
+                write_nat_to(&mut body, pref);
+                write_nat_to(&mut body, sym);
+                self.add(TYPEREFTPE, body)
             }
             Type::Function { params, ret } => {
                 // With no arguments a reader sees a raw `Function1` and has to
@@ -1473,11 +1535,6 @@ impl<'a> Pickler<'a> {
             write_nat_to(&mut body, obj);
             self.add(TYPEREFTPE, body)
         };
-        let mut info_body = Vec::new();
-        write_nat_to(&mut info_body, idx);
-        write_nat_to(&mut info_body, obj_tpe);
-        let info = self.add(CLASSINFOTPE, info_body);
-
         let members: Vec<SymbolId> = s.members.clone();
         let tparams: Vec<SymbolId> = s.tparams.clone();
         let ctor_fields: Vec<SymbolId> = s.ctor_fields.clone();
@@ -1486,6 +1543,60 @@ impl<'a> Pickler<'a> {
             tparam_refs.push(self.pickle_typesym(tp));
         }
         self.class_tparams.insert(idx, tparam_refs.clone());
+
+        // The parents. `CLASSINFOtpe` is `sym_Ref {tpe_Ref}` and this writer
+        // used to put exactly one `tpe_Ref` there -- `java.lang.Object` --
+        // for every class it emitted. Every scala-rs classfile therefore said
+        // "extends Object and nothing else", so *no* inherited member was
+        // visible to a later compilation: `object H2Profile extends
+        // H2Profile` lost `api`, and `import profile.api.*` (the shape every
+        // slick test is written in) resolved nothing. Real scalac reading
+        // scala-rs's slick output reported the same three errors this
+        // compiler did, which is what identified the writer rather than the
+        // reader.
+        //
+        // Written after the type parameters so `trait Foo[A] extends Bar[A]`
+        // refers to the pickled `A`, not a fresh one.
+        let parent_tys: Vec<Type> = self
+            .st
+            .get(class_id)
+            .parents
+            .iter()
+            // `Any` is nobody's parent in a pickle, and a self-reference
+            // (which the table can carry for a class that extends its own
+            // companion's type) would be a cycle for the reader.
+            .filter(|p| {
+                !matches!(p, Type::Any | Type::NoType | Type::Error)
+                    && self.st.class_sym_of(p) != Some(class_id)
+            })
+            .cloned()
+            .collect();
+        // nsc reads `parents.head` as the superclass. When the first entry is
+        // a trait (or there is nothing at all), `Object` goes in front, which
+        // is what nsc itself pickles for `trait T extends U` with `U` a trait.
+        let head_is_class = parent_tys
+            .first()
+            .and_then(|p| self.st.class_sym_of(p))
+            .is_some_and(|c| {
+                let ps = self.st.get(c);
+                !ps.flags.contains(Flags::TRAIT) && !ps.flags.contains(Flags::INTERFACE)
+            });
+        let mut parent_refs: Vec<u32> = Vec::new();
+        if !head_is_class {
+            parent_refs.push(obj_tpe);
+        }
+        for p in &parent_tys {
+            let r = self.pickle_type(p);
+            if !parent_refs.contains(&r) {
+                parent_refs.push(r);
+            }
+        }
+        let mut info_body = Vec::new();
+        write_nat_to(&mut info_body, idx);
+        for r in &parent_refs {
+            write_nat_to(&mut info_body, *r);
+        }
+        let info = self.add(CLASSINFOTPE, info_body);
         for m in members {
             let kind = self.st.get(m).kind;
             let name = self.st.get(m).name.clone();
@@ -1543,7 +1654,13 @@ impl<'a> Pickler<'a> {
             extra |= 1 << 20; // JAVA (not remapped)
         }
         let flags = pickled_from_our(class_flags, class_kind, extra);
-        let owner = pkg_ref;
+        // A *nested* class used to name the enclosing package as its owner, so
+        // `slick/jdbc/JdbcProfile$JdbcAPI.class` said it was
+        // `slick.jdbc.JdbcAPI`. Every reader that looked the class up by the
+        // name it actually has then found a pickle that disagreed and served
+        // nothing: `import profile.api.*` came back with zero members even
+        // once the parents were there. Same helper as the reference side.
+        let owner = self.external_owner_ref(class_id);
         let body = self.symbol_info(name_ref, owner, flags, info);
         self.entries[idx as usize] = (tag, body);
         self.pickle_sym_annots(class_id, idx);
@@ -1839,22 +1956,55 @@ impl<'a> Pickler<'a> {
         let rhs = s.ty.clone();
         let flags_our = s.flags;
         let kind = s.kind;
+        let tparams: Vec<SymbolId> = s.tparams.clone();
+        let bound_lo = s.bound_lo.clone();
+        let bound_hi = s.bound_hi.clone();
         let is_alias = !matches!(rhs, Type::NoType | Type::Error | Type::TypeMember(_));
         let tag = if is_alias { ALIASSYM } else { TYPESYM };
         let name_ref = self.type_name(&name);
         let idx = self.add(tag, vec![]);
         self.sym_index.insert(id.0, idx);
         let owner_ref = self.sym_index.get(&owner_id).copied().unwrap_or(self.none);
+        // `type Rep[T] = lifted.Rep[T]` is a *polymorphic* alias: nsc's info
+        // for it is `PolyType(List(T), lifted.Rep[T])`. Writing only the
+        // right-hand side dropped the parameters, and every reader (scalac
+        // included) then said "Rep does not take type parameters" -- which is
+        // most of `slick.lifted.Aliases`, i.e. most of what `import
+        // profile.api.*` is for. The parameters go in first so the right-hand
+        // side refers to the pickled ones.
+        let saved_owner = self.current_owner;
+        self.current_owner = idx;
+        let tparam_refs: Vec<u32> = tparams.iter().map(|&t| self.pickle_typesym(t)).collect();
         let info = if is_alias {
             self.pickle_type(&rhs)
         } else {
-            let lo = self.type_ref_named("Nothing");
-            let hi = self.type_ref_named("Any");
+            // An abstract member's bounds, not `Nothing..Any`: `type API <:
+            // BasicAPI` says what its members are, and a reader given `Any`
+            // has none of them.
+            let lo = match &bound_lo {
+                Some(t) => self.pickle_type(t),
+                None => self.type_ref_named("Nothing"),
+            };
+            let hi = match &bound_hi {
+                Some(t) => self.pickle_type(t),
+                None => self.type_ref_named("Any"),
+            };
             let mut b = Vec::new();
             write_nat_to(&mut b, lo);
             write_nat_to(&mut b, hi);
             self.add(TYPEBOUNDSTPE, b)
         };
+        let info = if tparam_refs.is_empty() {
+            info
+        } else {
+            let mut b = Vec::new();
+            write_nat_to(&mut b, info);
+            for r in &tparam_refs {
+                write_nat_to(&mut b, *r);
+            }
+            self.add(POLYTPE, b)
+        };
+        self.current_owner = saved_owner;
         let extra = if is_alias { 0 } else { 1u64 << 4 }; // DEFERRED for abstract
         let flags = pickled_from_our(flags_our, kind, extra);
         let body = self.symbol_info(name_ref, owner_ref, flags, info);

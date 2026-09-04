@@ -181,6 +181,8 @@ The scripts under `tests/` are measurement harnesses, not part of `cargo test`:
   bytecode verifier on.
 - `tests/expand_fm.py` — expand the seven FreeMarker templates slick's build
   generates Scala sources from, so a measurement covers what sbt would compile.
+- `tests/testkit_measure.sh` — the same measurement for `slick-testkit`, slick's
+  own test suite, compiled against the class files scala-rs produced for slick.
 - `tests/reap_strays.sh` — kill `scala-rs` processes orphaned by a killed test
   run (`--kill`; without it, only reports).
 
@@ -203,6 +205,8 @@ are organised is described in [docs/testing.md](docs/testing.md).
 - [docs/macros.md](docs/macros.md) — design notes for def macros, and
   [docs/macro-engine-prototype/](docs/macro-engine-prototype/) — the
   feasibility probe behind them (not production code).
+- [docs/slick-testkit.md](docs/slick-testkit.md) — compiling slick's own test
+  suite: what is measured, the numbers, and what they found.
 - [docs/notes/](docs/notes/README.md) — development notes: the investigations
   and the reasoning behind individual changes.
 

@@ -704,17 +704,29 @@ impl PickleSupply {
             return None;
         }
         let internal = sym.jvm_name.clone();
-        // Same gate as `complete_named`: these are the pickles the typer reads.
-        if !internal.starts_with("scala/")
-            && !self.adopted.contains(&class_sym.0)
-            && !self.implicits_supplied.contains(&class_sym.0)
+        // `complete_named`'s gate does *not* apply here, and copying it was a
+        // bug. A term member has a classfile fallback: decline it and the
+        // method the classfile reader installed still describes it. A `type`
+        // member has none -- an alias leaves no trace in the bytecode at all,
+        // it exists only in the `ScalaSignature` pickle. Declining one is not
+        // "less precision", it is the name not existing.
+        //
+        // That is what `import profile.api.*` ran into across slick's testkit:
+        // `slick.lifted.Aliases` declares `type Rep[T] = lifted.Rep[T]`,
+        // `type Table[T]`, `type DBIO[+R]` and thirty more, and none of them
+        // resolved unless something else had happened to adopt the class
+        // first. 1141 of 2112 errors in one measurement.
+        //
+        // What is excluded is only what cannot have one: Java classes carry no
+        // pickle. `scala/*` was already served here unconditionally, prelude
+        // or not, and stays that way.
+        if internal.is_empty()
+            || internal.starts_with("java/")
+            || internal.starts_with("javax/")
+            || internal.contains("$anon")
         {
-            // Worth tracing: the answer is memoised in `tried_types`, so a
-            // class asked for a type member *before* anything adopted it
-            // keeps that `None` for the rest of the run. Order-dependent
-            // "type X is not a member of Y$" reports start here.
             trace(format_args!(
-                "{internal}#{name}: no pickle read -- the class has not been adopted yet"
+                "{internal}#{name}: no pickle to read a type from"
             ));
             return None;
         }
@@ -726,6 +738,7 @@ impl PickleSupply {
             let mut src = BinSource(bin);
             self.sigs.lookup(&mut src, &full, is_module, name)
         };
+        trace(format_args!("{full}#{name}: {} pickle hit(s)", hits.len()));
         let hit = hits.into_iter().find(|h| {
             matches!(
                 h.member.kind,

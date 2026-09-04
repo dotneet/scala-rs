@@ -4,6 +4,12 @@
 cargo test
 ```
 
+slick's own test suite (`slick-testkit`) is measured by
+`tests/testkit_measure.sh`; see [slick-testkit.md](slick-testkit.md) for the
+numbers and what they found. `crates/cli/tests/testkit.rs` (fixture prefix
+`testkit`) holds that slice's regressions, including one test that has real
+scalac 2.13.16 compile against class files scala-rs produced.
+
 The regression tests for the pickle reader are in
 `crates/pickle/tests/lib_jar.rs`. When
 `/tmp/scala-rs-lib/scala-library-2.13.16.jar` (or `SCALA_LIBRARY_JAR`) is
