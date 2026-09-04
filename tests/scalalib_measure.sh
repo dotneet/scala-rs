@@ -73,11 +73,16 @@ LOG=${SCALALIB_LOG:-$SP/measure.txt}
 # accepted, so there is nothing to pass on: no -Xsource:3, no -Yrecursion, no
 # -opt (the optimiser is only turned on for the bootstrap and the benchmarks).
 if [[ ${SCALALIB_MODE:-nolib} == jar ]]; then
-  $BIN compile "${FILES[@]}" -d $OUT \
+  $BIN compile "${FILES[@]}" -d $OUT -no-specialization \
     --scala-library /tmp/scala-rs-lib/scala-library-2.13.16.jar "$@" > $LOG 2>&1 || true
 else
-  $BIN compile "${FILES[@]}" -d $OUT -cp $JAVACP --no-scala-library "$@" > $LOG 2>&1 || true
+  $BIN compile "${FILES[@]}" -d $OUT -cp $JAVACP -no-specialization --no-scala-library "$@" > $LOG 2>&1 || true
 fi
+# `-no-specialization` is nsc's own flag. The library annotates with
+# `@specialized` everywhere, we reject that annotation without the flag, and a
+# single parse error aborts the run before any file is typechecked -- so the
+# count collapses to the parse errors alone (84) and says nothing about type
+# checking. Same trap as tests/cats_measure.sh; see docs/scala-library.md.
 ERRORS=$(grep -c '^error' $LOG || true)
 CLASSES=$(find $OUT -name '*.class' | wc -l | tr -d ' ')
 # Cascades inflate the raw count; files-with-errors is the honest metric.
