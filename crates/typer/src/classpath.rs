@@ -209,14 +209,17 @@ fn attach_classpath_parents(
         // file has `java/lang/Object` for a superclass and no interfaces, so
         // the header below can never produce it. It is appended rather than
         // substituted for the head, so a value class that also extends a
-        // universal trait keeps that trait. Prelude classes keep their
-        // hand-written hierarchy, as everywhere else here; the ones that are
-        // value classes already say so.
-        let add_anyval = c.extends_anyval && owner.0 >= st.prelude_end && {
-            !st.get(owner).parents.iter().any(|p| {
-                matches!(p, Type::AnyVal) || st.class_sym_of(p).is_some_and(|s| s == st.anyval_sym)
-            })
-        };
+        // universal trait keeps that trait. The *library* is left alone,
+        // prelude symbol or not: the prelude models scala-library's value
+        // classes by hand, and the ones it models as ordinary classes it
+        // models that way on purpose (see `pickle_supply::attach_parents`).
+        let add_anyval =
+            c.extends_anyval && owner.0 >= st.prelude_end && !c.jvm_name.starts_with("scala/") && {
+                !st.get(owner).parents.iter().any(|p| {
+                    matches!(p, Type::AnyVal)
+                        || st.class_sym_of(p).is_some_and(|s| s == st.anyval_sym)
+                })
+            };
         // Only when nothing better is known. `parents` is `[AnyRef]` for a
         // class this module just created and richer for one that was already
         // declared elsewhere.

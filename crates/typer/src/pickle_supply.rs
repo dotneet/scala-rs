@@ -2003,11 +2003,18 @@ impl PickleSupply {
             // The whole of erasure hangs off that answer: `Stream$.fromIterator`
             // really has the descriptor `()Z`, and its result was being cast to
             // `Stream$PartiallyAppliedFromIterator` and called as an instance.
-            // Prelude classes are left alone, as everywhere else here: their
-            // hierarchy is hand-written, and the ones that are value classes
-            // (`StringOps`, `ArrayOps`, `RichInt`) already say so.
+            // The *library* is left alone, prelude symbol or not: the prelude
+            // models scala-library's value classes by hand, and the ones it
+            // models as ordinary classes it models that way on purpose.
+            // `scala.concurrent.duration.package$DurationInt` is a value class
+            // whose twenty unit methods come from the universal trait
+            // `DurationConversions`, so nsc emits **no** `$extension` for them
+            // and calls them on a real instance; deriving "value class" from
+            // its pickle sent `5.seconds` to a `seconds$extension` that does
+            // not exist (`crates/cli/tests/durrange.rs`).
             if matches!(t, Type::AnyVal) {
                 if class_sym.0 >= st.prelude_end
+                    && !st.get(class_sym).jvm_name.starts_with("scala/")
                     && !st.get(class_sym).parents.iter().any(|q| {
                         matches!(q, Type::AnyVal)
                             || st.class_sym_of(q).is_some_and(|c| c == st.anyval_sym)
