@@ -27,7 +27,38 @@ trait Extra {
   def twice(i: Int): Int = i * 2
 }
 
-object Prof extends Base with Extra {
+/// A trait and a class *nested* in an object -- slick's
+/// `object JdbcActionComponent { trait MultipleRowsPerStatementSupport }`,
+/// which `trait H2Profile` names in its parent list.
+///
+/// This compiler writes one `ScalaSignature` per class file, so
+/// `Support$Rows.class` carried a perfectly good pickle of `Rows` and
+/// `Support.class` declared no members at all. nsc never looks in the nested
+/// class file: it resolves `Support.Rows` as a *member* of `Support`'s own
+/// signature, so it stopped at "Symbol 'type
+/// slick.jdbc.JdbcActionComponent.MultipleRowsPerStatementSupport' is
+/// missing from the classpath" the first time a parent list mentioned one.
+object Support {
+  trait Rows {
+    def rows: Int
+  }
+
+  class Row(val n: Int)
+}
+
+/// The nested trait as a *parent*, one level of indirection away from the
+/// object that uses it -- exactly how `H2Profile` reaches it.
+trait WithRows extends Support.Rows {
+  def rows: Int = 7
+}
+
+object Prof extends Base with Extra with WithRows {
   type API = Api
   val api: API = new Api {}
+  /// The nested *class* in a member signature. nsc reports it separately from
+  /// the parent-list case above ("Symbol 'type testkitlib.Support.Row' is
+  /// missing from the classpath. This symbol is required by 'method
+  /// testkitlib.Prof.firstRow'"), so both shapes are here.
+  def firstRow: Support.Row = new Support.Row(1)
+  val rowN: Int = firstRow.n
 }
