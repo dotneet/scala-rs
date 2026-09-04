@@ -23,12 +23,68 @@ pub struct TypecheckOptions {
     pub binary_path: Vec<PathBuf>,
     /// `-language:postfixOps` / `-language:implicitConversions` / `-language:dynamics`.
     pub language_features: Vec<String>,
+    /// `-Xsource-features:<features>`, already reconciled with `-Xsource`
+    /// (nsc ignores the whole setting below `-Xsource:3`, so the driver hands
+    /// an empty set down in that case).
+    pub source_features: crate::source_features::SourceFeatures,
+    /// The compiler's own command line, as a macro implementation sees it
+    /// through `c.compilerSettings`. nsc rebuilds this from the settings that
+    /// were set (`-classpath`, `-d`, `-Xasync`, …); it is how a macro such as
+    /// `scala.async.Async.asyncImpl` decides whether `-Xasync` was given.
+    pub compiler_settings: Vec<String>,
 }
 
 enum OverloadPick {
     Found(SymbolId, Vec<Type>, Type),
     Ambiguous,
     None,
+}
+
+/// nsc's `Flags.AccessFlags`, which is what `case-apply-copy-access` copies
+/// from the primary constructor onto the synthesized `copy`.
+const ACCESS_FLAGS: Flags = Flags(Flags::PRIVATE.0 | Flags::PROTECTED.0 | Flags::LOCAL.0);
+
+/// The access modifier written on a class's primary constructor
+/// (`case class C private (x: Int)`), and the two rules
+/// `-Xsource-features:case-apply-copy-access` derives from it.
+///
+/// The rules are *not* the same for `apply` and `copy`, which is easy to get
+/// wrong: `case class D protected (x: Int)` compiled by scalac 2.13.16 with
+/// the feature has a **protected** `copy` and a **public** `apply`. nsc's
+/// `Unapplies.applyAccess` only reacts to `private` and `private[p]`
+/// (`mods.hasFlag(PRIVATE) || (!mods.hasFlag(PROTECTED) && mods.hasAccessBoundary)`),
+/// and then copies only the `PRIVATE` bit, while `caseClassCopyMeth` copies
+/// `flags & AccessFlags` outright.
+#[derive(Clone, Debug, Default)]
+struct CtorAccess {
+    flags: Flags,
+    private_within: Option<String>,
+}
+
+impl CtorAccess {
+    fn of(mods: &Modifiers) -> CtorAccess {
+        CtorAccess {
+            flags: mods.flags,
+            private_within: mods.private_within.clone(),
+        }
+    }
+
+    /// nsc `Unapplies.applyAccess`: `private` and `private[p]` reach `apply`;
+    /// `protected` and `protected[p]` do not.
+    fn apply_inherits(&self) -> bool {
+        self.flags.contains(Flags::PRIVATE)
+            || (!self.flags.contains(Flags::PROTECTED) && self.private_within.is_some())
+    }
+
+    /// `caseMods | (inheritedMods.flags & PRIVATE)`.
+    fn apply_flags(&self) -> Flags {
+        Flags(self.flags.0 & Flags::PRIVATE.0)
+    }
+
+    /// `Modifiers(SYNTHETIC | (inheritedMods.flags & AccessFlags), …)`.
+    fn copy_flags(&self) -> Flags {
+        Flags(self.flags.0 & ACCESS_FLAGS.0)
+    }
 }
 
 /// How a case class's `copy` was written: `p.copy(…)` or, inside the class
@@ -131,6 +187,8 @@ impl Default for TypecheckOptions {
             classpath: Vec::new(),
             binary_path: Vec::new(),
             language_features: Vec::new(),
+            source_features: crate::source_features::SourceFeatures::default(),
+            compiler_settings: Vec::new(),
         }
     }
 }
@@ -269,6 +327,10 @@ pub struct Typer {
     language_postfix_ops: bool,
     /// `import scala.language.implicitConversions` / `-language:implicitConversions`.
     language_implicit_conversions: bool,
+    /// `-Xsource-features:<features>` (already gated on `-Xsource:3`).
+    pub(crate) source_features: crate::source_features::SourceFeatures,
+    /// What `c.compilerSettings` reports to a macro implementation.
+    pub(crate) compiler_settings: Vec<String>,
     pub(crate) binary: BinaryIndex,
     completed_java: HashSet<String>,
     /// Overload sets whose alternatives do not all belong to one class's
@@ -616,6 +678,8 @@ impl Typer {
                 &opts.language_features,
                 "implicitConversions",
             ),
+            source_features: opts.source_features,
+            compiler_settings: opts.compiler_settings.clone(),
             binary: BinaryIndex::from_user_paths(opts.binary_path.clone()),
             completed_java: HashSet::new(),
             overload_groups: HashMap::new(),
@@ -924,25 +988,28 @@ impl Typer {
         } else {
             tree.sym
         };
-        let (vparamss, body, parents, is_trait, is_case, name, tparams) = match &mut tree.kind {
-            TreeKind::ClassDef {
-                vparamss,
-                impl_,
-                mods,
-                name,
-                tparams,
-                ..
-            } => (
-                vparamss,
-                &mut impl_.body,
-                impl_.parents.clone(),
-                mods.flags.contains(Flags::TRAIT),
-                mods.flags.contains(Flags::CASE),
-                name.clone(),
-                tparams,
-            ),
-            _ => return,
-        };
+        let (vparamss, body, parents, is_trait, is_case, name, tparams, ctor_mods) =
+            match &mut tree.kind {
+                TreeKind::ClassDef {
+                    vparamss,
+                    impl_,
+                    mods,
+                    name,
+                    tparams,
+                    ctor_mods,
+                    ..
+                } => (
+                    vparamss,
+                    &mut impl_.body,
+                    impl_.parents.clone(),
+                    mods.flags.contains(Flags::TRAIT),
+                    mods.flags.contains(Flags::CASE),
+                    name.clone(),
+                    tparams,
+                    CtorAccess::of(ctor_mods),
+                ),
+                _ => return,
+            };
         self.st.get_mut(id).parents = self.rough_parents(&parents, is_trait);
         let saved_owner = self.st.owner;
         let saved_this = self.st.this_class;
@@ -1008,7 +1075,7 @@ impl Typer {
             }
         }
         if is_case {
-            self.synthesize_case_members(id, &name);
+            self.synthesize_case_members(id, &name, &ctor_mods);
         }
         let conversions = implicit_class_conversions(body);
         for mut conv in conversions {
@@ -1485,7 +1552,10 @@ impl Typer {
         }
     }
 
-    fn synthesize_case_members(&mut self, class_id: SymbolId, name: &str) {
+    fn synthesize_case_members(&mut self, class_id: SymbolId, name: &str, ctor: &CtorAccess) {
+        // `-Xsource-features:case-apply-copy-access`. Off (the 2.13 default)
+        // this is `CtorAccess::default()`'s effect: no flags, no qualifier.
+        let inherit = self.source_features.case_apply_copy_access();
         let fields = self.st.get(class_id).ctor_fields.clone();
         let class_ty = Type::Class {
             sym: class_id,
@@ -1495,6 +1565,11 @@ impl Typer {
         let copy = self
             .st
             .alloc("copy", class_id, SymKind::Method, Flags::SYNTHETIC, "");
+        if inherit {
+            let flags = self.st.get(copy).flags.with(ctor.copy_flags());
+            self.st.get_mut(copy).flags = flags;
+            self.st.get_mut(copy).private_within = ctor.private_within.clone();
+        }
         // `copy`'s own parameter symbols are distinct from `ctor_fields`: reusing
         // the constructor's field symbols directly (as the companion `apply`
         // does below) would mean giving them `DEFAULTPARAM` + a `this.field`
@@ -1557,6 +1632,11 @@ impl Typer {
                 Flags::SYNTHETIC.with(Flags::CASE),
                 "",
             );
+            if inherit && ctor.apply_inherits() {
+                let flags = self.st.get(apply).flags.with(ctor.apply_flags());
+                self.st.get_mut(apply).flags = flags;
+                self.st.get_mut(apply).private_within = ctor.private_within.clone();
+            }
             self.st.get_mut(apply).params = fields.clone();
             self.st.get_mut(apply).ty = Type::Method {
                 paramss: vec![fields.iter().map(|_| Type::NoType).collect()],
@@ -2235,6 +2315,15 @@ impl Typer {
                             args: vec![],
                         }),
                     };
+                    // Deliberately *not* copying `copy`'s access onto the
+                    // `copy$default$N` getters, which scalac 2.13.16 does make
+                    // private under `-Xsource-features:case-apply-copy-access`
+                    // (`javap -p`: `private int copy$default$1();`). Nothing
+                    // in Scala source can name them, and this compiler fills
+                    // an omitted `copy` argument at the call site rather than
+                    // through the getter, so `ACC_PRIVATE` here would only
+                    // risk an `IllegalAccessError` for no observable gain.
+                    // See docs/not-implemented.md.
                     self.synthesize_default_getters(id, copy_id, "copy", &[], &copy_paramss);
                 }
             }
@@ -9802,6 +9891,50 @@ impl Typer {
         }
     }
 
+    /// The synthetic `copy` of a case class, if it still has one (a written
+    /// `def copy` replaces it).
+    fn synthetic_copy(&self, class_id: SymbolId) -> Option<SymbolId> {
+        self.st
+            .lookup_member(class_id, "copy")
+            .into_iter()
+            .find(|&s| self.st.get(s).flags.contains(Flags::SYNTHETIC))
+    }
+
+    /// `p.copy(x = 1)` is rewritten straight into a constructor call, so the
+    /// access check `type_select` does for an ordinary member never runs on
+    /// `copy` itself. Under `-Xsource-features:case-apply-copy-access` that
+    /// matters: scalac rejects `v.copy(x = 2)` for both
+    /// `case class C private (x: Int)` and `case class D protected (x: Int)`.
+    /// Reports and returns true when the call is not allowed.
+    fn case_copy_access_error(
+        &mut self,
+        class_id: SymbolId,
+        prefix: Option<&Tree>,
+        span: Span,
+    ) -> bool {
+        let Some(copy) = self.synthetic_copy(class_id) else {
+            return false;
+        };
+        if self.accessible(copy, prefix) {
+            // Legal, but possibly from a *different class file* — a nested or
+            // anonymous class inside the case class is inside its scope and
+            // outside its classfile, and `ACC_PRIVATE` there is an
+            // `IllegalAccessError`. `expand_private_names` cannot see this
+            // one: the synthetic `copy` has no `DefDef` to walk.
+            if self.st.this_class != class_id {
+                self.st.get_mut(copy).access_widened = true;
+            }
+            return false;
+        }
+        let owner = self.st.get(class_id).name.clone();
+        let from = self.access_from_name();
+        self.error(
+            span,
+            format!("value copy cannot be accessed as a member of {owner} from {from}"),
+        );
+        true
+    }
+
     /// nsc-style accessibility. `private[this]` requires a `this` prefix.
     /// `protected[C]` is protected plus everything nested in `C`.
     fn accessible(&self, sym: SymbolId, prefix: Option<&Tree>) -> bool {
@@ -11173,6 +11306,20 @@ impl Typer {
         };
         if !self.st.get(class_id).flags.contains(Flags::CASE) {
             return false;
+        }
+        {
+            let span = tree.span;
+            let prefix: Option<&Tree> = match &tree.kind {
+                TreeKind::Apply { fun, .. } => match &fun.kind {
+                    TreeKind::Select { qual, .. } => Some(qual.as_ref()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if self.case_copy_access_error(class_id, prefix, span) {
+                tree.ty = Type::Error;
+                return true;
+            }
         }
         let fields = self.st.get(class_id).ctor_fields.clone();
         if fields.is_empty() {

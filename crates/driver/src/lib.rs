@@ -14,6 +14,7 @@ use scala_rs_typer::{
 };
 
 pub use scala_rs_backend::EmittedClass;
+pub use scala_rs_typer::{ParsedFeatures, SourceFeature, SourceFeatures};
 
 /// Options for [`compile_paths`].
 #[derive(Clone, Debug)]
@@ -37,6 +38,12 @@ pub struct CompileOptions {
     /// `-Xsource:3` / `-Xsource:3-cross`: accept the Scala 3 spellings this
     /// subset implements (`A & B` compound types).
     pub xsource3: bool,
+    /// `-Xsource-features:<features>`. nsc ignores the setting entirely below
+    /// `-Xsource:3`, so the CLI clears this (with a warning) when `xsource3`
+    /// is false; `-Xsource:3-cross` fills it with every feature.
+    pub source_features: SourceFeatures,
+    /// `-Xasync`: enable `scala.async.Async.{async, await}`.
+    pub xasync: bool,
 }
 
 impl Default for CompileOptions {
@@ -50,8 +57,59 @@ impl Default for CompileOptions {
             class_path: Vec::new(),
             language_features: Vec::new(),
             xsource3: false,
+            source_features: SourceFeatures::default(),
+            xasync: false,
         }
     }
+}
+
+/// The command line a macro implementation sees through `c.compilerSettings`.
+///
+/// nsc rebuilds it from the settings the user actually set — `scalac -Xasync
+/// -Xsource:3 A.scala` reports
+/// `List(-usejavacp, -classpath, …, -d, …, -Xasync, -Xsource:3.0.0)`. That
+/// list is not decoration: `scala.async.Async.asyncImpl` starts with
+///
+/// ```text
+/// if (!c.compilerSettings.contains("-Xasync"))
+///   c.abort(c.macroApplication.pos,
+///     "The async requires the compiler option -Xasync (…)")
+/// ```
+///
+/// so the message a user sees for a missing `-Xasync` comes from the *library*
+/// reading this list, not from the compiler. `-usejavacp` is nsc's own and is
+/// left out here.
+fn compiler_settings(opts: &CompileOptions) -> Vec<String> {
+    let mut out = Vec::new();
+    if !opts.class_path.is_empty() {
+        let joined: Vec<String> = opts
+            .class_path
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        out.push("-classpath".to_string());
+        out.push(joined.join(":"));
+    }
+    out.push("-d".to_string());
+    out.push(opts.out_dir.display().to_string());
+    if opts.fatal_warnings {
+        out.push("-Xfatal-warnings".to_string());
+    }
+    for f in &opts.language_features {
+        out.push(format!("-language:{f}"));
+    }
+    if opts.xasync {
+        out.push("-Xasync".to_string());
+    }
+    if opts.xsource3 {
+        // nsc unparses the `ScalaVersion` setting, not the spelling given.
+        out.push("-Xsource:3.0.0".to_string());
+    }
+    let names = opts.source_features.names();
+    if !names.is_empty() {
+        out.push(format!("-Xsource-features:{}", names.join(",")));
+    }
+    out
 }
 
 /// Result of compiling one or more source files.
@@ -195,6 +253,8 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                     p
                 },
                 language_features: opts.language_features.clone(),
+                source_features: opts.source_features,
+                compiler_settings: compiler_settings(opts),
             },
             // The typer reads the text under a span for the forms the parser
             // folds together; `reify { … }` is the one whose body is *file*
@@ -890,6 +950,8 @@ object Main {
             class_path: Vec::new(),
             language_features: Vec::new(),
             xsource3: false,
+            source_features: SourceFeatures::default(),
+            xasync: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());
@@ -934,6 +996,8 @@ object Main {
             class_path: Vec::new(),
             language_features: Vec::new(),
             xsource3: false,
+            source_features: SourceFeatures::default(),
+            xasync: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "{}", result.render_diags());
@@ -955,6 +1019,8 @@ object Main {
             class_path: Vec::new(),
             language_features: Vec::new(),
             xsource3: false,
+            source_features: SourceFeatures::default(),
+            xasync: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(!result.ok());
@@ -987,6 +1053,8 @@ object Main {
             class_path: Vec::new(),
             language_features: Vec::new(),
             xsource3: false,
+            source_features: SourceFeatures::default(),
+            xasync: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());

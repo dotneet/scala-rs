@@ -2485,6 +2485,51 @@ fn field_access_flags(mods: Flags, widened: bool) -> u16 {
     acc
 }
 
+/// The classfile access of a case class's synthetic `apply` / `copy`.
+///
+/// `-Xsource-features:case-apply-copy-access` copies the primary
+/// constructor's modifier onto them (`crates/typer/src/check.rs`,
+/// `CtorAccess`); without the feature the symbol carries no access flag and
+/// this is `ACC_PUBLIC`, as before. `private[p]` and `protected` are public in
+/// the classfile, matching what `javap -p` shows for scalac 2.13.16:
+///
+/// ```text
+/// // case class C private (x: Int)   -Xsource-features:case-apply-copy-access
+/// private xtest.C apply(int);        // in C$
+/// private xtest.C copy(int);         // in C
+/// // case class E private[xtest] (x: Int) — the qualifier is erased away
+/// public xtest.E apply(int);
+/// ```
+///
+/// `access_widened` is the existing escape hatch for a `private` member the
+/// typer saw read from another class file (`expand_private.rs`): the JVM
+/// would reject `ACC_PRIVATE` there.
+fn synthetic_case_member_access(st: &SymbolTable, sym: SymbolId) -> u16 {
+    if sym.is_none() {
+        return ACC_PUBLIC;
+    }
+    let s = st.get(sym);
+    if s.flags.contains(Flags::PRIVATE) && s.private_within.is_none() && !s.access_widened {
+        ACC_PRIVATE
+    } else {
+        ACC_PUBLIC
+    }
+}
+
+/// The synthetic `apply` of a case class's companion, if the typer made one.
+fn case_apply_sym(st: &SymbolTable, class_id: SymbolId) -> SymbolId {
+    let Some(module) = st.companion_module(class_id) else {
+        return SymbolId::NONE;
+    };
+    let module_cls = st.module_class_of(module);
+    st.get(module_cls)
+        .members
+        .iter()
+        .copied()
+        .find(|&m| st.get(m).name == "apply" && st.get(m).flags.contains(Flags::SYNTHETIC))
+        .unwrap_or(SymbolId::NONE)
+}
+
 fn method_access_flags(mods: Flags, widened: bool) -> u16 {
     let mut acc = if mods.contains(Flags::PRIVATE) && !widened {
         ACC_PRIVATE
@@ -6226,12 +6271,22 @@ impl<'a> Gen<'a> {
                     sym: class_id,
                     args: vec![],
                 };
-                forwarded.push((
-                    "apply".into(),
-                    jvm_method_desc(self.st, &pts, &ret),
-                    ret,
-                    pts,
-                ));
+                // nsc emits no mirror-class forwarder for an `apply` that is
+                // not public. With `-Xsource-features:case-apply-copy-access`
+                // the `public static C apply(int)` on the case class itself
+                // disappears for both `private` and `private[p]`.
+                let apply_sym = case_apply_sym(self.st, class_id);
+                let public_apply = apply_sym.is_none()
+                    || (!self.st.get(apply_sym).flags.contains(Flags::PRIVATE)
+                        && self.st.get(apply_sym).private_within.is_none());
+                if public_apply {
+                    forwarded.push((
+                        "apply".into(),
+                        jvm_method_desc(self.st, &pts, &ret),
+                        ret,
+                        pts,
+                    ));
+                }
             }
         }
 
@@ -7100,7 +7155,8 @@ fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
     } else {
         base_ctor_d
     };
-    b.add_code(ACC_PUBLIC, "apply", &desc, locals.max(1), |asm| {
+    let acc = synthetic_case_member_access(st, case_apply_sym(st, class_id));
+    b.add_code(acc, "apply", &desc, locals.max(1), |asm| {
         asm.new_obj(&class_jvm);
         asm.dup();
         if let Some((owner, d)) = &outer {
@@ -7153,7 +7209,8 @@ fn emit_case_copy(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
     let ctor_d =
         with_enclosing_outer_param(st, class_id, &jvm_method_desc(st, &params, &Type::Unit));
     let outer = outer_field_desc(st, class_id);
-    b.add_code(ACC_PUBLIC, "copy", &desc, locals.max(1), |asm| {
+    let acc = synthetic_case_member_access(st, copy_id);
+    b.add_code(acc, "copy", &desc, locals.max(1), |asm| {
         asm.new_obj(&class_jvm);
         asm.dup();
         if let Some(d) = &outer {
@@ -19000,6 +19057,7 @@ mod tests {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..scala_rs_typer::TypecheckOptions::default()
             },
         );
         assert!(
