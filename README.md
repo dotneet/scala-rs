@@ -4360,6 +4360,10 @@ REPS=3 tests/bench.sh     # 回数を変える
 cargo test
 ```
 
+slick's own test suite (`slick-testkit`) is measured by
+`tests/testkit_measure.sh`; see [`docs/slick-testkit.md`](docs/slick-testkit.md)
+for the numbers and what they found.
+
 pickle リーダの回帰テストは `crates/pickle/tests/lib_jar.rs` です。
 `/tmp/scala-rs-lib/scala-library-2.13.16.jar`（または `SCALA_LIBRARY_JAR`）があるとき、
 jar の**全 classfile**を走査して次を見ます。jar が無ければスキップします。

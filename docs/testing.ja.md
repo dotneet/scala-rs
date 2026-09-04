@@ -4,6 +4,12 @@
 cargo test
 ```
 
+slick's own test suite (`slick-testkit`) is measured by
+`tests/testkit_measure.sh`; see [`slick-testkit.md`](slick-testkit.md) for the
+numbers and what they found. `crates/cli/tests/testkit.rs` (fixture prefix
+`testkit`) holds that slice's regressions, including one test that has real
+scalac 2.13.16 compile against classfiles scala-rs produced.
+
 pickle リーダの回帰テストは `crates/pickle/tests/lib_jar.rs` です。
 `/tmp/scala-rs-lib/scala-library-2.13.16.jar`（または `SCALA_LIBRARY_JAR`）があるとき、
 jar の**全 classfile**を走査して次を見ます。jar が無ければスキップします。

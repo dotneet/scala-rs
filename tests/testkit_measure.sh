@@ -10,7 +10,12 @@
 #         depends on (codegen, hikaricp, slick-future, slick-zio).
 #   test  slick-testkit/src/test, on top of stage `main`'s output.
 #
-# Usage:  tests/testkit_measure.sh [main|test|all] [extra scala-rs args...]
+# Usage:  tests/testkit_measure.sh [main|test|all|both] [extra scala-rs args...]
+#
+#   all   runs `main` and then `test` as two compilations.
+#   both  compiles the two stages' sources together in one invocation, which
+#         is the only way to get a figure for `src/test` while stage `main`
+#         still fails: `test` on its own has nothing to link against.
 #
 # Env:
 #   TESTKIT_DIR      scratch root (default .../scratchpad/testkit)
@@ -27,7 +32,7 @@ set -e
 SP=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slick
 TK=${TESTKIT_DIR:-/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/testkit}
 STAGE=${1:-main}
-if [[ $STAGE == main || $STAGE == test || $STAGE == all ]]; then shift; else STAGE=main; fi
+if [[ $STAGE == main || $STAGE == test || $STAGE == all || $STAGE == both ]]; then shift; else STAGE=main; fi
 ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
 BIN=${SCALA_RS:-$ROOT/target/release/scala-rs}
 mkdir -p $TK
@@ -112,10 +117,15 @@ fi
 # --- stage test -------------------------------------------------------------
 # GeneratedCodeTest needs sources sbt generates by running the code generator
 # against a live H2; skipped rather than counted as 30 phantom errors.
+TESTFILES=($(find $TKSRC/test/scala -name '*.scala' \
+             ! -name 'GeneratedCodeTest.scala' | sort))
 if [[ $STAGE == test || $STAGE == all ]]; then
-  TESTFILES=($(find $TKSRC/test/scala -name '*.scala' \
-               ! -name 'GeneratedCodeTest.scala' | sort))
   run_stage test $TK/test-out \
     "$MAINOUT:${CLASSES:+$CLASSES:}$(cat $SP/deps.cp):$REFLECT:$EXTRA:$EXTRATEST" \
     "${TESTFILES[@]}"
+fi
+if [[ $STAGE == both ]]; then
+  run_stage both $TK/both-out \
+    "${CLASSES:+$CLASSES:}$(cat $SP/deps.cp):$REFLECT:$EXTRA:$EXTRATEST" \
+    "${SLICKSRC[@]}" "${MAINFILES[@]}" "${TESTFILES[@]}"
 fi
