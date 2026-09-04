@@ -598,7 +598,9 @@ signature holding a `NoType`, an `Error` or an unresolved `Type::Named`.
 
 ### What it moved
 
-Whole corpus, `main` at `cad281b` merged in, `CORPUS_SIZE=full CORPUS_JOBS=6`:
+Whole corpus, `main` at `74ed830` merged in, `CORPUS_SIZE=full CORPUS_JOBS=6`.
+Both columns are that same merged tree against `main` alone at `74ed830`, so
+the other slices that landed while this one ran are in *both* numbers:
 
 | | before | after |
 |---|---|---|
@@ -622,13 +624,15 @@ judged on:
 |---|---|---|
 | slick | `files=184 errors=0 files_with_errors=0 classes=1596` | identical |
 | `tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0` | identical |
-| cats `-Ykind-projector` | `errors=1128 files_with_errors=141` | **1108 / 139** |
-| gitbucket | `errors=1693 files_with_errors=188` | **1675 / 186** |
-| `src/library` `-no-specialization` | `errors=1997 files_with_errors=173` | **1903 / 172** |
+| cats | `errors=1128 files_with_errors=141` | **1108 / 139** |
+| gitbucket | `errors=1391 files_with_errors=184` | **1373 / 184** |
+| `src/library` `-no-specialization` | `errors=1969 files_with_errors=172` | **1903 / 172** |
 
 Three of the four went *down*, which is the shape a rejection rule should have
 when the rejection is real and the compiler was hiding a resolution failure
-behind a placeholder.
+behind a placeholder. Measured on the earlier base `cad281b`, where gitbucket
+was 1693 and `src/library` 1997, the same three moved the same way (1675 and
+1944 -- 1903 once the erased *result* joined the double-definition key).
 
 ### One thing this exposed and did not fix
 
