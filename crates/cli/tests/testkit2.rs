@@ -209,3 +209,74 @@ fn scala_rs_reads_scalac_classfiles_testkit2() {
     let _ = fs::remove_dir_all(&usr);
     let _ = fs::remove_dir_all(&lib);
 }
+
+/// Compile `testkit2_lib.scala` with **scala-rs** and return the output dir.
+fn scala_rs_lib(jar: &Path, tag: &str) -> PathBuf {
+    let out = tmp_dir(tag);
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            fixtures_dir().join("testkit2_lib.scala").to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "scala-rs failed on testkit2_lib: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    out
+}
+
+/// The same fixture the other way round: **scala-rs writes the library, real
+/// scalac reads it**. Anything nsc reports here is this compiler's
+/// `ScalaSignature` writer, which is what
+/// `docs/slick-testkit.md` left as the acceptance test for the next slice.
+///
+/// Before nested classes and objects were declared in their owner's pickle
+/// this reported ten errors, the first four of them: "value api is not a
+/// member of object Profile", "not found: type Table", "not found: type Tag"
+/// and "no arguments allowed for nullary constructor Object" -- `object
+/// Profile { object api }` lost `api`, so both aliases it exports went with
+/// it, and `Table`'s constructors were unreachable behind them.
+#[test]
+fn real_scalac_reads_scala_rs_classfiles_testkit2() {
+    if !java_available() {
+        return;
+    }
+    let (Some(scalac), Some(jar)) = (find_scalac(), scala_library_jar()) else {
+        eprintln!("skip testkit2 writer test: scalac or jar not obtainable");
+        return;
+    };
+    let lib = scala_rs_lib(&jar, "testkit2-rs-lib");
+    let usr = tmp_dir("testkit2-sc-use");
+    let output = Command::new(&scalac)
+        .args([
+            fixtures_dir().join("testkit2_use.scala").to_str().unwrap(),
+            "-cp",
+            lib.to_str().unwrap(),
+            "-d",
+            usr.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        output.status.success(),
+        "real scalac could not read scala-rs's classfiles: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cp = format!("{}:{}", lib.display(), jar.display());
+    assert_eq!(
+        run_java(&usr, "Main", &cp),
+        expected_stdout("testkit2_use"),
+        "scalac-compiled user of scala-rs's classfiles printed the wrong thing"
+    );
+    let _ = fs::remove_dir_all(&usr);
+    let _ = fs::remove_dir_all(&lib);
+}

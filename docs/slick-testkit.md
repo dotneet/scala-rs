@@ -277,3 +277,118 @@ acceptance test, and it belongs to whoever owns `crates/backend`.
   to `TypedType[Int]`, `intColumnType` does); against our own class files
   every numeric column type reads as `Any` and every other one matches
   everything, which is the writer again.
+
+---
+
+# Third slice: what *real scalac* needs from our `ScalaSignature`
+
+The acceptance test the second slice left open -- "turning the other direction
+on ... belongs to whoever owns `crates/backend`" -- now runs, as
+`crates/cli/tests/testkit2.rs::real_scalac_reads_scala_rs_classfiles_testkit2`.
+
+## The root
+
+scala-rs writes one `ScalaSignature` per class file: `pickle_all` walks every
+`Class` / `ModuleClass` symbol and pickles each on its own. So
+`slick/jdbc/JdbcActionComponent$MultipleRowsPerStatementSupport.class` always
+carried a perfectly good pickle of the nested trait -- and
+`JdbcActionComponent.class` declared no members at all.
+
+nsc never opens the nested class file. It resolves `Outer.Inner` as a *member*
+of `Outer`'s signature, which is the mirror image of the reader gap the second
+slice fixed (nsc writes the pickle *only* on the top-level file; we wrote it
+*only* on each file). Compiling a four-line user of slick as scala-rs compiled
+it:
+
+```
+scalac -cp <our slick output> Tk3.scala
+  error: Symbol 'type slick.jdbc.JdbcActionComponent.MultipleRowsPerStatementSupport'
+         is missing from the classpath.
+         This symbol is required by 'trait slick.jdbc.H2Profile'.
+  error: not found: type Rep
+  error: not found: value LiteralColumn
+```
+
+A parent list that mentions a nested Scala trait was unreadable, and with it
+went everything `import H2Profile.api._` brings in.
+
+`pickle_class` now pickles a class's own nested classes and objects into its
+entries. Two details matter:
+
+* **The owner has to be the local entry.** nsc enters each symbol it reads in
+  the scope of whatever the owner field points at, so a nested class written
+  into its enclosing class's pickle names that entry rather than an EXTref
+  chain (`local_owner_ref`). The same class pickled on its own, for its own
+  class file, still names the external chain -- the per-class-file pickles are
+  unchanged, so scala-rs's own reader keeps finding each nested class where it
+  always did.
+* **The JVM name decides what counts as a member** (`nested_member_of`), not
+  the owner field alone: a lifted local or anonymous class (`Outer$$anon$1`,
+  `Outer$1`) is owned by a method and must not go into the class's scope under
+  a name no source can spell.
+
+## The 64K limit, found by the fix
+
+Nested members pushed `slick/util/TupleMethods`'s signature past the 65535
+bytes a `CONSTANT_Utf8` holds (JVMS 4.4.7), and `encoded.len() as u16` wrapped:
+the class file came out with a constant pool no reader could walk (`javap`:
+"unexpected tag at #104"). Nothing in the harness noticed -- `slick_measure.sh`
+counts files, and the file was there.
+
+The writer now splits an oversized signature across SID-10's
+`ScalaLongSignature` (an array of `CONSTANT_Utf8`, concatenated by the reader
+before decoding) the way nsc does, and `Pool::utf8` asserts instead of
+wrapping. The split counts *bytes*, not chars: the encoding produces `\0`
+(that is what `avoidZero` turns `0x7f` into) and modified UTF-8 spends two
+bytes on it.
+
+## Numbers
+
+| | before | after |
+|---|---|---|
+| `slick_measure.sh` | 184 files / 0 errors / 1552 classes | unchanged |
+| `slick_subset.sh` | verified=1552 failed=0 | unchanged |
+| largest `CONSTANT_Utf8` in slick's output | 65535 (**wrapped**, 2 unreadable class files) | 65535 (split, 0 unreadable) |
+| `testkit_measure.sh main`, slick as scala-rs compiled it | 56 / 1959 / 51 | **unchanged, error families identical** |
+| `testkit2_use.scala` through real scalac against our class files | 10 errors | **compiles and runs** |
+
+The testkit column does not move, and that is the expected result: it measures
+**scala-rs reading** slick's class files, and scala-rs's reader was never
+blocked by this -- it opens the nested class file and finds the pickle there.
+What changes is what *nsc* can do with our output, which the reversed
+`testkit2` direction and the `Tk3.scala` probe above are the measurements of.
+
+## What the reversed direction says the blocker is now
+
+With `object api` reachable, the other two writer losses the second slice
+listed -- `val O: Profile.opts.type` coming back as its owner, and a secondary
+constructor missing from the pickle -- do not reproduce: both were downstream
+of the lost `api`, and both work in `testkit2_use` and in a top-level probe
+(`class Top(a, b) { def this(a) = ...; val O: Holder.opts.type }`) read by real
+scalac.
+
+What is left in the `Tk3.scala` probe is one already-recorded hole:
+
+```
+error: not enough arguments for method apply:
+       (value: T, tt: TypedType[T]): LiteralColumn[T] in object LiteralColumn.
+       Unspecified value parameter tt.
+```
+
+`uncurry` flattens `paramss` on the symbol before anything is pickled, so
+`case class LiteralColumn[T](value: T)(implicit tt: TypedType[T])` is written
+as one parameter list and the implicit section is gone. That is the next thing
+between real scalac and our class files.
+
+## Known gaps this did not fix
+
+* **scala-rs cannot read the members of a nested class out of its own `-cp`
+  class files** -- the reverse of this slice, and pre-existing.
+  `object Support { class Row(val n: Int) }` compiled by scala-rs and then read
+  back by scala-rs gives "value n is not a member of Row"; annotating the type
+  shows two symbols for the one class ("type mismatch; found: Row  required:
+  Row"), and using the value across units emits a descriptor with the owner
+  lost (`NoSuchMethodError: 'Row Prof$.firstRow()'`). This is why
+  `tests/fixtures/testkit_use.scala` reads `rowN` off the library instead of
+  writing `firstRow.n`.
+* **Curried and implicit parameter sections**, above.
