@@ -9,6 +9,13 @@
 > which the kind-projector symptoms (`*` 388, `λ` 158, `α` 104) are still the
 > largest group — those are a compiler plugin, and real scalac rejects them too
 > without it.
+>
+> **Update (`agent/kindproj`).** That plugin's syntax now has a flag:
+> `tests/cats_measure.sh -Ykind-projector` measures **1128 errors / 141
+> files**. Without the flag the number is unchanged at 2929, and it has to
+> stay that way — see
+> [`-Ykind-projector`](#-ykind-projector-kind-projectors-syntax-behind-a-flag-agentkindproj)
+> for why the default is off.
 
 
 Where this compiler stands on [typelevel/cats](https://github.com/typelevel/cats),
@@ -379,7 +386,7 @@ Two things fell out of it, both cats shapes rather than lambda syntax:
 and the `*` placeholder. That is a compiler plugin, not Scala; nsc without it
 reports exactly what we report, so the rejection is correct, and the 2514
 errors in the 70 files that name `*`, `λ` or `α` are unchanged by this. The
-desugaring should sit behind a flag.
+desugaring should sit behind a flag. (It now does: `-Ykind-projector`, below.)
 
 Measured on `kernel+core`, 339 files, twice -- once at the branch point and
 once on the merged result, because `main` moved twice underneath:
@@ -494,21 +501,169 @@ exists; the SAM path does not run it. It predates this slice.
   with arguments (As[A, A])`: substituting a higher-kinded parameter in a
   Liskov-style witness.
 
+## `-Ykind-projector`: kind-projector's syntax behind a flag (`agent/kindproj`)
+
+Measured on `kernel+core`, 339 files, on the merged tree. The only difference
+between the two rows is the flag:
+
+| | files | errors | files with errors | classes |
+|---|---|---|---|---|
+| `tests/cats_measure.sh` | 339 | **2929** | 151 | 0 |
+| `tests/cats_measure.sh -Ykind-projector` | 339 | **1128** | 141 | 0 |
+
+**1801 errors, 61% of the total, were one missing compiler plugin.** The set of
+files with errors is otherwise unchanged: eleven files lost all of theirs and
+one gained its first (below). `classes=0` still, because codegen does not run
+while there are errors.
+
+### The flag
+
+`-Ykind-projector` is **not an nsc flag**. kind-projector is a compiler plugin;
+nsc without it rejects `Either[E, *]` and `λ[α => F[α]]` exactly as this
+compiler does with the flag off, and that rejection is *correct*, so it stays
+the default. Scala 3 has a flag of this name for its own compatible version of
+the syntax, which is where the spelling comes from. `--help` says so, and
+`crates/cli/tests/kindproj.rs` pins that `tests/fixtures/kp_lambda.scala` is
+rejected without it in both library modes.
+
+### What it does, read off the plugin
+
+The desugaring is a syntactic pass over the type trees the parser has just
+built (`crates/parser/src/parse/kindproj.rs`), which is where the plugin sits
+too: its phase runs after `parser`, so `scalac -Xplugin:kind-projector…jar
+-Xprint:kind-projector` prints exactly what it produces. Every rule below was
+read off that output rather than guessed, and this compiler's `--parse` dump
+now matches it tree for tree, down to the invented parameter names:
+
+```text
+Either[Int, *]           ~>  AnyRef { type Λ$[β$0$] = Either[Int, β$0$] }#Λ$
+Tuple2[*, Double]        ~>  AnyRef { type Λ$[α$1$] = Tuple2[α$1$, Double] }#Λ$
+Function2[-*, Long, +*]  ~>  AnyRef { type Λ$[-α$3$, +γ$4$] = Function2[α$3$, Long, γ$4$] }#Λ$
+λ[(α, β) => Either[β, α]] ~> AnyRef { type Λ$[α, β] = Either[β, α] }#Λ$
+```
+
+Three things are easy to get wrong and were checked:
+
+* **A `*` binds to the innermost enclosing type application, not the
+  outermost.** `Either[Int, List[*]]` is `Either[Int, [a] => List[a]]`. Because
+  the parser builds applications bottom up, rewriting each one as it is
+  finished gets this for free.
+* **A function type is an application of `FunctionN`**, so `A => *` is
+  `[b] => A => b` and `* => *` is `[a, b] => a => b`. cats writes `E => *`
+  seventeen times.
+* **A shape the plugin does not recognise is left exactly as written.**
+  `λ[Int]` and `λ[α => F[α], β]` come out of nsc as `not found: type λ`,
+  because the plugin's rewriter passes them through. Reporting something of our
+  own there would be a diagnostic nsc does not have, so `kp_lambda_bad.scala`
+  pins that we say the same thing.
+
+The generated names follow the plugin's as well — a Greek letter chosen by the
+*position* of the placeholder in the application, plus a counter — so a
+diagnostic reads the way nsc's does. `Functor[Box]` where
+`Functor[Pair[String, *]]` is wanted reports
+`required: Functor[[β$0$]Pair[String, β$0$]]` in both compilers.
+
+The desugaring target is the structural type lambda `agent/typelambda` made
+work; nothing new was needed in the typer for the syntax itself.
+
+Covered: the `*` placeholder with and without variance (`+*`, `-*`), the
+higher-kinded placeholder `*[_]`, parenthesised tuples (`(A0, *)`), function
+types, `λ` and `Lambda` with one or more parameters, reordered and repeated
+parameters, higher-kinded parameters (`λ[F[_] => …]`), and variance written
+either backquoted (`` λ[`+α` => …] ``) or as an application (`λ[(-[A]) => …]`).
+`tests/fixtures/kp_lambda.scala` runs all thirteen forms and its expected
+output is what scalac 2.13.16 with kind-projector 0.13.3 prints; the e2e test
+dual-runs it in both the library-ABI and the private-runtime mode.
+
+**Not covered: the term-level `λ[F ~> G](f)`**, which builds a `FunctionK`
+value. It appears once in cats' main sources, inside a scaladoc example, and it
+is a different (expression) rewrite. Without it, `λ` in term position is
+`not found: value λ`, which is honest.
+
+### One name per lambda, and a cycle that predates this
+
+Two bugs turned the first measured run into `errors=0 classes=0` — the shape
+`.agent-brief.md` warns about, a stack overflow with no diagnostic at all.
+
+1. The plugin names every lambda's member `Λ$` and tells two of them apart by
+   symbol. `symbol::subst_refine_aliases` matches a refinement's member **by
+   name**, so a lambda whose body mentioned another lambda substituted one into
+   the other and never stopped. The name now carries the file and a counter.
+2. That was not the whole of it. cats' `Representable#compose` builds an
+   anonymous class declaring
+   `type Representation = (self.Representation, G.Representation)` over a
+   parent that declares `Representation` abstract, and a `TypeMember` here has
+   no prefix to tell `self.` from `G.`, so both collapse onto the member being
+   defined and its right-hand side reads `(Representation, Representation)`.
+   `subst_refine_aliases` expanded that forever. It now carries the members
+   whose right-hand side it is already inside and stops at the second visit,
+   which is what `expand_type_members` already did for the same shape (see
+   "`Type::TypeMember` has no prefix" above — this is the same root, reached by
+   the other path). **Nothing about kind-projector caused it**: the flag only
+   let those files typecheck far enough to reach it. The no-flag number is
+   unchanged at 2929 with the guard in.
+
+### What the remaining 1128 are
+
+By file, worst first:
+
+```
+  116  data/NonEmptyLazyList.scala          53  instances/NTupleMonadInstances.scala
+   46  data/Ior.scala                       40  instances/NTupleBitraverseInstances.scala
+   40  data/EitherT.scala                   39  Parallel.scala
+   37  data/IorT.scala                      35  data/NonEmptyMapImpl.scala
+   33  instances/NTupleUnorderedFoldableInstances.scala
+   32  data/NonEmptySet.scala               31  instances/stream.scala
+```
+
+By symptom:
+
+```
+  179  incompatible type in overriding type TypeClassType  (simulacrum's `AllOps`)
+  135  no matching overload
+   67  NonEmptyLazyList does not take type parameters      (the `Newtype` encoding)
+   57  type mismatch
+   21  value copy is not a member of …
+   17  kinds of the type arguments … do not conform
+   17  could not optimize @tailrec annotated method
+   17  no implicit: could not find implicit value
+   …
+ 1128  total
+```
+
+None of them names `*`, `λ` or `α` any more, and none is one of this pass's own
+diagnostics. The two biggest are the ones already written up above: simulacrum's
+generated `AllOps` refinement (`type TypeClassType`), and cats' `Newtype`
+encoding (`type Type[A] <: Base with Tag[A]`), which is what
+`NonEmptyLazyList does not take type parameters` is.
+
+**One file gained its first error**,
+`core/src/main/scala/cats/conversions/VarianceConversions.scala`:
+
+```scala
+Bifunctor[F].leftWiden(Bifunctor[F].rightFunctor.widen(fac))
+// no matching overload for (F[X, A])F[X, B] with arguments (F[A, C])
+```
+
+`def rightFunctor[X]: Functor[F[X, *]]` used to be an error itself, so the call
+site said nothing. Now the lambda resolves and `X` is simply not solved from
+the argument: inference does not look through a type-lambda application. That
+is the next thing in the way rather than a regression of the desugaring.
+
 ## What would reduce this the most
 
-**Kind-projector, and the type-lambda support underneath it.** 2514 of 3019
-errors sit in files that name `*`, `λ` or `α`. The order of work is:
+**The two encodings cats builds its own API out of.** With kind-projector
+behind `-Ykind-projector`, 1128 errors are left in 141 files, and the top two
+symptoms are both a single encoding each:
 
-1. Make `({ type L[a] = … })#L` usable as a type constructor argument — the
-   probe above is four lines. Nothing about cats is needed to work on it.
-2. Desugar kind-projector's surface syntax onto it: `λ[α => F[G[α]]]` and the
-   `*` placeholder (`Either[E, *]`, `(A0, *)`, `Nested[F, G, *]`). This is a
-   plugin, not Scala, so it should be behind a flag rather than always on —
-   nsc without the plugin rejects all of it, and the rejection is currently
-   *correct*.
+1. **simulacrum's `AllOps`** — 179 `incompatible type in overriding type
+   TypeClassType`, in every `@typeclass`-generated file.
+2. **cats' `Newtype`** (`type Type[A] <: Base with Tag[A]`) — 67
+   `… does not take type parameters` plus the 116 in `NonEmptyLazyList.scala`
+   that follow from it.
 
-Only after that will the numbers say anything about cats' type classes
-themselves. Until then the 505 errors in the 96 files with no kind-projector
-symptom are the honest measure of what else is missing, and `kernel` alone —
-84 errors in 23 of 95 files, no kind-projector anywhere in it — is the better
-target for a slice that wants to finish something.
+After those, inference through a type-lambda application (the
+`VarianceConversions` shape above) and `Parallel`'s `Aux` witnesses are the
+next masses. `kernel` alone — 19 errors in 10 of 95 files, no kind-projector
+anywhere in it — is still the better target for a slice that wants to finish
+something.

@@ -76,6 +76,7 @@ The syntax is Scala **2.13**. There is no Scala 3 `then`, no top-level definitio
 - [Operator-named `val`s were not encoded as field names](#operator-named-vals-were-not-encoded-as-field-names)
 - [`slick_subset.sh` was discarding files because of warnings](#slick_subsetsh-was-discarding-files-because-of-warnings)
 - [`-Xsource-features:case-apply-copy-access` and `-Xasync` (`agent/xflags`)](#-xsource-featurescase-apply-copy-access-and--xasync-agentxflags)
+- [`-Ykind-projector`: kind-projector's type-lambda syntax (`agent/kindproj`)](#-ykind-projector-kind-projectors-type-lambda-syntax-agentkindproj)
 
 Syntax that can be parsed (or desugared):
 
@@ -3909,3 +3910,46 @@ compiled and run by both.
 The state-machine transform itself is **not** implemented, and neither is
 reading a macro *definition* out of a jar's pickle, which is what
 `scala.async.Async.async` is. See `docs/not-implemented.md`.
+
+### `-Ykind-projector`: kind-projector's type-lambda syntax (`agent/kindproj`)
+
+[kind-projector](https://github.com/typelevel/kind-projector) is a compiler
+*plugin*, not Scala. nsc without it rejects `Either[E, *]` and
+`λ[α => F[α]]`, and so does this compiler unless `-Ykind-projector` is
+given -- the default has to stay a rejection for "compiles what nsc compiles"
+to mean anything anywhere else. The flag name is Scala 3's for its own
+compatible version of the syntax; nsc 2.13 has no flag of that name.
+
+With the flag, the parser desugars the plugin's two forms onto the structural
+type lambda `({ type L[a] = ... })#L`:
+
+```scala
+Either[Int, *]              // [a] => Either[Int, a]
+(A0, *)                     // [a] => (A0, a)
+E => *                      // [a] => E => a
+Function2[-*, Long, +*]     // [-a, +b] => Function2[a, Long, b]
+EitherT[*[_], Int, *]       // [F[_], b] => EitherT[F, Int, b]
+λ[α => F[G[α]]]              // [a] => F[G[a]]
+Lambda[(A, B) => Either[B, A]]  // [a, b] => Either[b, a]
+λ[F[_] => Wrap[F]]           // [F[_]] => Wrap[F]
+λ[`+α` => Box[α]]            // [+a] => Box[a]
+```
+
+Two rules matter and were read off `scalac -Xplugin:kind-projector...jar
+-Xprint:kind-projector` rather than guessed: a `*` binds to the **innermost**
+enclosing type application (`Either[Int, List[*]]` is
+`Either[Int, [a] => List[a]]`), and a function type counts as an application of
+`FunctionN`. A shape the plugin does not recognise (`λ[Int]`,
+`λ[α => F[α], β]`) is passed through unchanged, so the diagnostic is nsc's
+`not found: type λ`.
+
+The term-level `λ[F ~> G](f)`, which builds a `FunctionK` value, is **not**
+implemented; `λ` in expression position stays `not found: value λ`.
+
+`tests/fixtures/kp_lambda.scala` runs every accepted form and its expected
+output is scalac 2.13.16 + kind-projector 0.13.3's;
+`tests/fixtures/kp_lambda_bad.scala` pins the four errors both compilers give
+for shapes that are not lambdas and for lambdas that do not match;
+`tests/fixtures/kp_plain.scala` pins that the flag changes nothing for a
+program that does not use the syntax. See `docs/cats.md` for what it does to
+the cats measurement (2929 errors -> 1128).
