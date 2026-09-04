@@ -44,6 +44,10 @@ pub struct CompileOptions {
     pub source_features: SourceFeatures,
     /// `-Xasync`: enable `scala.async.Async.{async, await}`.
     pub xasync: bool,
+    /// `-no-specialization`: nsc's "Ignore @specialize annotations." Without
+    /// it `@specialized` is diagnosed, because this subset has no
+    /// specialisation phase; with it nsc ignores the annotation too.
+    pub no_specialization: bool,
 }
 
 impl Default for CompileOptions {
@@ -59,6 +63,7 @@ impl Default for CompileOptions {
             xsource3: false,
             source_features: SourceFeatures::default(),
             xasync: false,
+            no_specialization: false,
         }
     }
 }
@@ -100,6 +105,9 @@ fn compiler_settings(opts: &CompileOptions) -> Vec<String> {
     }
     if opts.xasync {
         out.push("-Xasync".to_string());
+    }
+    if opts.no_specialization {
+        out.push("-no-specialization".to_string());
     }
     if opts.xsource3 {
         // nsc unparses the `ScalaVersion` setting, not the spelling given.
@@ -188,6 +196,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                     file_index,
                     ParseOptions {
                         source3: opts.xsource3,
+                        no_specialization: opts.no_specialization,
                     },
                 );
                 diags.extend(parsed.diags);
@@ -954,6 +963,7 @@ object Main {
             xsource3: false,
             source_features: SourceFeatures::default(),
             xasync: false,
+            no_specialization: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());
@@ -1000,6 +1010,7 @@ object Main {
             xsource3: false,
             source_features: SourceFeatures::default(),
             xasync: false,
+            no_specialization: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "{}", result.render_diags());
@@ -1023,6 +1034,7 @@ object Main {
             xsource3: false,
             source_features: SourceFeatures::default(),
             xasync: false,
+            no_specialization: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(!result.ok());
@@ -1057,6 +1069,7 @@ object Main {
             xsource3: false,
             source_features: SourceFeatures::default(),
             xasync: false,
+            no_specialization: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());
