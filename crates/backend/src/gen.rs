@@ -141,10 +141,23 @@ fn collect_trait_impls(tree: &Tree, into: &mut TraitImpls) {
                 if !lazies.is_empty() && !tree.sym.is_none() {
                     into.lazy_vals.insert(tree.sym, lazies);
                 }
+                // A `case class` declared in a trait carries a *synthesized*
+                // companion, which is a member `object` of that trait exactly
+                // as a written one is: the trait declares an abstract `K()`
+                // accessor and every class mixing it in owes an
+                // implementation. Only the `ModuleDef`s were harvested, so
+                // `trait T { case class K(a: Int) }; object P extends T` threw
+                // `AbstractMethodError: P$ … K()` at the first `P.K(1)`.
+                // The companion is resolved in `mixin_member_modules`, which
+                // has the symbol table; this pass reads the tree alone.
                 let modules: Vec<Tree> = impl_
                     .body
                     .iter()
-                    .filter(|s| matches!(s.kind, TreeKind::ModuleDef { .. }))
+                    .filter(|s| match &s.kind {
+                        TreeKind::ModuleDef { .. } => true,
+                        TreeKind::ClassDef { mods, .. } => mods.flags.contains(Flags::CASE),
+                        _ => false,
+                    })
                     .cloned()
                     .collect();
                 if !modules.is_empty() && !tree.sym.is_none() {
@@ -4485,7 +4498,15 @@ impl<'a> Gen<'a> {
                 if m.sym.is_none() {
                     continue;
                 }
-                let mcls = module_class_id(self.st, m.sym);
+                // A `case class` entry stands for its synthesized companion
+                // (see `collect_trait_impls`); a `ModuleDef` is its own.
+                let mcls = match &m.kind {
+                    TreeKind::ClassDef { .. } => match self.st.companion_module(m.sym) {
+                        Some(c) => module_class_id(self.st, c),
+                        None => continue,
+                    },
+                    _ => module_class_id(self.st, m.sym),
+                };
                 if member_module_outer(self.st, mcls) != Some(parent) {
                     continue;
                 }

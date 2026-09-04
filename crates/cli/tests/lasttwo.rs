@@ -44,6 +44,14 @@
 //!    `BasicDatabaseDef.setupTransaction = None`, so every `.transactionally`
 //!    ran with autocommit still on and rolled nothing back (`p06_update_tx`).
 //!
+//! A fifth, found while probing the fourth and not on slick's own path: a
+//! `case class` declared in a *trait* carries a synthesized companion, which
+//! is a member `object` of that trait, so the trait declares an abstract
+//! `K()` accessor -- and only written `object`s were collected, so no
+//! implementing class ever provided one (`AbstractMethodError` at the first
+//! `P.K(1)`). slick's `trait BasicBackend { case class ExecState(…) }` is the
+//! shape; it survives only because nothing outside the trait names it.
+//!
 //! Self-contained (own copies of the small helpers `e2e.rs` also has) per
 //! `.agent-brief.md`: the shared test files belong to other in-flight agents.
 
@@ -257,5 +265,31 @@ fn fixtures_lasttwo_superclass_override_beats_the_trait_body() {
         bridge.contains("Method setup:(Ljava/lang/String;)Ljava/lang/String;"),
         "LtMid's wide setup is not a bridge to the override:\n{bridge}"
     );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// A `case class` in a trait is a member `object` of it too: the trait
+/// declares the accessor abstractly and the mixing object owes a body, exactly
+/// as it does for a written `object`.
+#[test]
+fn fixtures_lasttwo_case_companion_in_a_trait_gets_an_accessor() {
+    let Some(out) = compile_fixture() else {
+        eprintln!("skip lasttwo: no scala-library jar");
+        return;
+    };
+    let cake = javap(&out, "LtCake").expect("javap LtCake");
+    for sig in [
+        "public abstract LtCake$LtWritten$ LtWritten();",
+        "public abstract LtCake$LtRow$ LtRow();",
+    ] {
+        assert!(cake.contains(sig), "LtCake has no `{sig}`:\n{cake}");
+    }
+    let p = javap(&out, "LtP$").expect("javap LtP$");
+    for sig in [
+        "public LtCake$LtWritten$ LtWritten();",
+        "public LtCake$LtRow$ LtRow();",
+    ] {
+        assert!(p.contains(sig), "LtP$ does not implement `{sig}`:\n{p}");
+    }
     let _ = fs::remove_dir_all(&out);
 }

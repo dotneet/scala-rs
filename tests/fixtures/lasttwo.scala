@@ -78,6 +78,18 @@ abstract class LtMid extends LtBase {
   override def setup(s: S): String = "mid:" + s
 }
 
+// 5. A `case class` in a *trait* carries a synthesized companion, which is a
+//    member object of that trait exactly as a written one is: the trait
+//    declares an abstract `LtRow()` accessor and every class mixing it in owes
+//    an implementation. Only the written `object`s were collected, and
+//    slick's `trait BasicBackend { case class ExecState(…) }` is this shape.
+trait LtCake {
+  object LtWritten { def y: Int = 3 }
+  case class LtRow(a: Int, b: Int = 2)
+}
+
+object LtP extends LtCake
+
 object Main {
   // Calling through `LtBase` uses the *wide* descriptor, which is where the
   // forwarder shadowed the override.
@@ -94,5 +106,7 @@ object Main {
     val d = new LtMid {}
     println(viaBase(d)("x"))
     println(d.setup("y"))
+    println(LtP.LtWritten.y)
+    println(LtP.LtRow(1))
   }
 }

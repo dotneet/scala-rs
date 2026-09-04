@@ -7,3 +7,5 @@ LtBox(1,d)
 [x]/cols
 mid:x
 mid:y
+3
+LtRow(1,2)
