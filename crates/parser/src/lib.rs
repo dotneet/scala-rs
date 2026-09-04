@@ -1117,7 +1117,7 @@ object Main {
             "object M { def f(x: Product & Serializable): Int = 1 }",
             ParseOptions {
                 source3: true,
-                no_specialization: false,
+                ..ParseOptions::default()
             },
         );
         assert!(!has_errors(&r.diags), "{:?}", r.diags);
@@ -1134,7 +1134,7 @@ object Main {
             "object M { def f(x: A & B & C { def g: Int }): Int = 1 }",
             ParseOptions {
                 source3: true,
-                no_specialization: false,
+                ..ParseOptions::default()
             },
         );
         assert!(!has_errors(&r.diags), "{:?}", r.diags);

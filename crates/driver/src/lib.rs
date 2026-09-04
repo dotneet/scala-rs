@@ -48,6 +48,14 @@ pub struct CompileOptions {
     /// it `@specialized` is diagnosed, because this subset has no
     /// specialisation phase; with it nsc ignores the annotation too.
     pub no_specialization: bool,
+    /// `-Ykind-projector`: accept kind-projector's `*` placeholder and
+    /// `λ` / `Lambda` type lambdas. **Not an nsc flag.** kind-projector is a
+    /// compiler plugin, and nsc without it rejects exactly the programs this
+    /// rejects with the flag off, so the default has to stay off for the
+    /// compatibility claim to mean anything. Scala 3 has a flag of this name
+    /// for its own (compatible) version of the syntax, which is where the
+    /// spelling comes from.
+    pub kind_projector: bool,
 }
 
 impl Default for CompileOptions {
@@ -64,6 +72,7 @@ impl Default for CompileOptions {
             source_features: SourceFeatures::default(),
             xasync: false,
             no_specialization: false,
+            kind_projector: false,
         }
     }
 }
@@ -108,6 +117,11 @@ fn compiler_settings(opts: &CompileOptions) -> Vec<String> {
     }
     if opts.no_specialization {
         out.push("-no-specialization".to_string());
+    }
+    if opts.kind_projector {
+        // Not an nsc setting: nsc would show `-Xplugin:<kind-projector jar>`
+        // here. A macro that reads this list should see what was actually set.
+        out.push("-Ykind-projector".to_string());
     }
     if opts.xsource3 {
         // nsc unparses the `ScalaVersion` setting, not the spelling given.
@@ -197,6 +211,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                     ParseOptions {
                         source3: opts.xsource3,
                         no_specialization: opts.no_specialization,
+                        kind_projector: opts.kind_projector,
                     },
                 );
                 diags.extend(parsed.diags);
@@ -964,6 +979,7 @@ object Main {
             source_features: SourceFeatures::default(),
             xasync: false,
             no_specialization: false,
+            kind_projector: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());
@@ -1011,6 +1027,7 @@ object Main {
             source_features: SourceFeatures::default(),
             xasync: false,
             no_specialization: false,
+            kind_projector: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "{}", result.render_diags());
@@ -1035,6 +1052,7 @@ object Main {
             source_features: SourceFeatures::default(),
             xasync: false,
             no_specialization: false,
+            kind_projector: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(!result.ok());
@@ -1070,6 +1088,7 @@ object Main {
             source_features: SourceFeatures::default(),
             xasync: false,
             no_specialization: false,
+            kind_projector: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());
