@@ -483,6 +483,90 @@ fn erase_elem_ty(ty: &Type, st: &SymbolTable) -> Type {
     }
 }
 
+/// nsc's `intersectionDominator` (SLS 3.7): the part of a compound type that
+/// its erasure is the erasure of.
+///
+/// The rule is *not* "the first parent". It is the first parent that is a
+/// class rather than a trait **and** that no other parent is a subclass of;
+/// if no parent is a class, the first unshadowed one. slick writes
+///
+/// ```text
+/// implicit def tableQueryToTableQueryExtensionMethods[T, U](
+///   q: Query[T, U, Seq] & TableQuery[T]): TableQueryExtensionMethods[T, U]
+/// ```
+///
+/// and `TableQuery <: Query`, so nsc's descriptor takes a `TableQuery` while
+/// taking `parents.first()` produced a `Query`. Every one of the twelve slick
+/// run programs died on that one method with `NoSuchMethodError`, because the
+/// client is compiled against nsc's descriptor.
+fn intersection_dominator(parents: &[Type], st: &SymbolTable) -> Option<Type> {
+    if parents.len() < 2 {
+        return parents.first().cloned();
+    }
+    // The parents' *own* symbols, which is what nsc compares with
+    // `isNonBottomSubClass`. `SymbolTable::class_sym_of` chases an abstract
+    // member to its bound instead, and slick's
+    // `type BaseColumnType[T] <: ColumnType[T] with BaseTypedType[T]` then
+    // read as `BaseTypedType` shadowing `ColumnType` -- because `ColumnType`
+    // is itself abstract, bounded by `TypedType[T]`, which `BaseTypedType`
+    // does extend. nsc keeps `ColumnType`, so `MappedColumnTypeFactory.base`
+    // takes and returns a `TypedType`.
+    let syms: Vec<Option<SymbolId>> = parents.iter().map(head_type_sym).collect();
+    // No other parent is a strict subclass of this one.
+    let unshadowed = |i: usize| match syms[i] {
+        None => true,
+        Some(p) => !syms
+            .iter()
+            .enumerate()
+            .any(|(j, q)| j != i && matches!(q, Some(q) if *q != p && inherits_class(st, *q, p))),
+    };
+    let is_class = |i: usize| {
+        syms[i].is_some_and(|s| {
+            let sym = st.get(s);
+            sym.kind == crate::symbol::SymKind::Class
+                && !sym.flags.contains(Flags::TRAIT)
+                && !sym.flags.contains(Flags::INTERFACE)
+        })
+    };
+    let pick = (0..parents.len())
+        .find(|&i| is_class(i) && unshadowed(i))
+        .or_else(|| (0..parents.len()).find(|&i| unshadowed(i)))
+        .unwrap_or(0);
+    Some(parents[pick].clone())
+}
+
+/// `sub` has `sup` somewhere above it (class symbols only, arguments ignored).
+/// An abstract type member is a subclass of nothing but itself, so neither end
+/// may be one: see `intersection_dominator`.
+fn inherits_class(st: &SymbolTable, sub: SymbolId, sup: SymbolId) -> bool {
+    if sub == sup {
+        return true;
+    }
+    if !st.get(sub).is_class_like() || !st.get(sup).is_class_like() {
+        return false;
+    }
+    let t = Type::Class {
+        sym: sub,
+        args: vec![],
+    };
+    st.base_type_seq(&t)
+        .iter()
+        .any(|p| head_type_sym(p) == Some(sup))
+}
+
+/// The symbol a type is *written* with, without resolving an abstract member
+/// or a type parameter to its bound.
+fn head_type_sym(ty: &Type) -> Option<SymbolId> {
+    match ty {
+        Type::Applied { ctor, .. } | Type::Annotated { tpe: ctor, .. } => head_type_sym(ctor),
+        Type::Class { sym, .. }
+        | Type::ModuleRef(sym)
+        | Type::TypeMember(sym)
+        | Type::TypeParam(sym) => Some(*sym),
+        _ => None,
+    }
+}
+
 fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
     // `Array[T]` reached through a classfile signature, or built by
     // substituting `Array` for a `C[_]` parameter, is `Class { array_sym }`.
@@ -596,13 +680,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
                     decls: decls.clone(),
                 }
             } else if let Some(p) = intersection_dominator(parents, st) {
-                // Not `parents.first()`: slick's `implicit def
-                // tableQueryToTableQueryExtensionMethods(q: Query[T, U, Seq] &
-                // TableQuery[T])` takes a `TableQuery` in nsc, because a
-                // parent some other parent extends is shadowed.
                 erase_ty(&p, st)
-            } else if let Some(p) = parents.first() {
-                erase_ty(p, st)
             } else {
                 Type::AnyRef
             }
@@ -653,60 +731,6 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         Type::Overload(alts) => Type::Overload(alts.iter().map(|t| erase_ty(t, st)).collect()),
         other => other.clone(),
     }
-}
-
-/// nsc `Erasure.intersectionDominator`: the one parent of a compound type
-/// whose erasure stands for the whole of it. A parent that some *other* parent
-/// is a strict sub-type of is shadowed and never chosen; among what is left a
-/// real class beats a trait, and otherwise the first one wins.
-///
-/// Returning `None` (an empty parent list, or every parent shadowing every
-/// other) leaves the caller with `Object`.
-fn intersection_dominator(parents: &[Type], st: &SymbolTable) -> Option<Type> {
-    // nsc compares the parents' *symbols* with `isNonBottomSubClass`, which
-    // does not chase an abstract member to its bound -- `SymbolTable::
-    // class_sym_of` does, and that made `ColumnType[T] with BaseTypedType[T]`
-    // look like `BaseTypedType` shadowing `ColumnType`, where nsc keeps the
-    // latter.
-    fn head_sym(ty: &Type) -> Option<SymbolId> {
-        match ty {
-            Type::Applied { ctor, .. } | Type::Annotated { tpe: ctor, .. } => head_sym(ctor),
-            Type::Class { sym, .. }
-            | Type::ModuleRef(sym)
-            | Type::TypeMember(sym)
-            | Type::TypeParam(sym) => Some(*sym),
-            _ => None,
-        }
-    }
-    let strict_sub_class = |q: &Type, p: &Type| match (head_sym(q), head_sym(p)) {
-        (Some(qs), Some(ps)) => {
-            qs != ps
-                && st.get(qs).is_class_like()
-                && st.get(ps).is_class_like()
-                && st
-                    .base_type_seq(&Type::Class {
-                        sym: qs,
-                        args: vec![],
-                    })
-                    .iter()
-                    .any(|b| head_sym(b) == Some(ps))
-        }
-        _ => false,
-    };
-    let unshadowed = |p: &Type| !parents.iter().any(|q| strict_sub_class(q, p));
-    let is_real_class = |p: &Type| {
-        head_sym(p).is_some_and(|c| {
-            let s = st.get(c);
-            s.kind == crate::symbol::SymKind::Class
-                && !s.flags.contains(Flags::TRAIT)
-                && !s.flags.contains(Flags::INTERFACE)
-        })
-    };
-    parents
-        .iter()
-        .find(|p| is_real_class(p) && unshadowed(p))
-        .or_else(|| parents.iter().find(|p| unshadowed(p)))
-        .cloned()
 }
 
 fn is_primitive(ty: &Type) -> bool {
@@ -1444,7 +1468,13 @@ pub(crate) fn value_class_of(ty: &Type, st: &SymbolTable) -> Option<SymbolId> {
         Type::Annotated { tpe, .. } => return value_class_of(tpe, st),
         _ => return None,
     };
-    (st.source_value_classes.contains(&sym) && st.is_value_class(sym)).then_some(sym)
+    // A value class the prelude models is excluded: `StringOps` and `ArrayOps`
+    // are identity conversions over their underlying value there, and boxing
+    // one would hand `println` a `StringOps` where nsc has a `String`. Every
+    // other value class -- one this run compiles, and one that arrives from
+    // `-cp` -- gets the real boxed representation, which is what its own class
+    // file and its `$extension` statics were compiled against.
+    (sym.0 >= st.prelude_end && st.is_value_class(sym)).then_some(sym)
 }
 
 /// The box/unbox conversion erasure owes a value of erased type `got` that has

@@ -205,6 +205,21 @@ fn attach_classpath_parents(
     for (i, owner) in installed {
         let c = &classes[*i];
         let owner = *owner;
+        // `extends AnyVal` survives only in the pickle: a value class's class
+        // file has `java/lang/Object` for a superclass and no interfaces, so
+        // the header below can never produce it. It is appended rather than
+        // substituted for the head, so a value class that also extends a
+        // universal trait keeps that trait. The *library* is left alone,
+        // prelude symbol or not: the prelude models scala-library's value
+        // classes by hand, and the ones it models as ordinary classes it
+        // models that way on purpose (see `pickle_supply::attach_parents`).
+        let add_anyval =
+            c.extends_anyval && owner.0 >= st.prelude_end && !c.jvm_name.starts_with("scala/") && {
+                !st.get(owner).parents.iter().any(|p| {
+                    matches!(p, Type::AnyVal)
+                        || st.class_sym_of(p).is_some_and(|s| s == st.anyval_sym)
+                })
+            };
         // Only when nothing better is known. `parents` is `[AnyRef]` for a
         // class this module just created and richer for one that was already
         // declared elsewhere.
@@ -214,6 +229,9 @@ fn attach_classpath_parents(
             .iter()
             .any(|p| !matches!(p, Type::AnyRef))
         {
+            if add_anyval {
+                st.get_mut(owner).parents.push(Type::AnyVal);
+            }
             continue;
         }
         let mut ps = vec![Type::AnyRef];
@@ -234,6 +252,9 @@ fn attach_classpath_parents(
             if !ps.iter().any(|p| same_class(p, &ty)) {
                 ps.push(ty);
             }
+        }
+        if add_anyval {
+            ps.push(Type::AnyVal);
         }
         if ps.len() > 1 {
             st.get_mut(owner).parents = ps;
@@ -1435,6 +1456,12 @@ fn parse_method_desc_java(st: &mut SymbolTable, desc: &str) -> (Vec<Type>, Type)
     }
     let (ret, _) = parse_field_ty_java(st, ret_s);
     (params, ret)
+}
+
+/// One JVM field descriptor as a type. Used by `pickle_supply` to give a
+/// `-cp` value class the constructor field its underlying representation is.
+pub(crate) fn field_ty_from_desc(st: &mut SymbolTable, desc: &str) -> Type {
+    parse_field_ty_java(st, desc).0
 }
 
 fn parse_field_ty_java(st: &mut SymbolTable, s: &str) -> (Type, usize) {
