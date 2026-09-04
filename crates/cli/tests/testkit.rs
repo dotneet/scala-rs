@@ -1,7 +1,7 @@
 //! E2E tests for the `agent/testkit` slice: compiling slick's own test suite
 //! (`slick-testkit`) against the 4552 classfiles scala-rs produced for slick.
 //!
-//! Four roots, in the order they stopped the measurement:
+//! Five roots, in the order they stopped the measurement:
 //!
 //! * **`expected pattern, found case`** (`JdbcMapperTest.scala:443`, `:506`).
 //!   `for (case p <- xs)` is Scala 3's spelling of a filtering generator, and
@@ -37,6 +37,21 @@
 //!   `type Rep[T] = ...` was pickled without its parameters, an abstract
 //!   `type API <: Api` was pickled as `Nothing .. Any`, and `val L = List`
 //!   named `<root>.List`.
+//!
+//! * **a nested class existed only in its own class file.** scala-rs writes
+//!   one `ScalaSignature` per class file, so `Support$Row.class` carried a
+//!   perfectly good pickle of `Row` while `Support.class` declared no members
+//!   at all. nsc never opens the nested class file: it resolves
+//!   `Support.Row` as a *member* of `Support`'s signature. Real scalac
+//!   reading our slick output therefore stopped at "Symbol 'type
+//!   slick.jdbc.JdbcActionComponent.MultipleRowsPerStatementSupport' is
+//!   missing from the classpath. This symbol is required by 'trait
+//!   slick.jdbc.H2Profile'" -- a parent list that mentions a nested Scala
+//!   trait was unreadable. Nested classes and objects are now pickled into
+//!   their owner's entries as well, which is what pushed
+//!   `slick/util/TupleMethods`'s signature past the 64K a `CONSTANT_Utf8`
+//!   holds and made SID-10's `ScalaLongSignature` necessary
+//!   (`crates/backend/tests/long_signature.rs`).
 //!
 //! Kept out of `crates/cli/tests/e2e.rs` to avoid merge conflicts with other
 //! agents; see `.agent-brief.md`. All fixtures use the `testkit` prefix.
@@ -215,6 +230,14 @@ fn fixtures_testkit_separate_compilation() {
 
 /// The differential that identified the bug: real scalac compiling against
 /// scala-rs's classfiles. If our `ScalaSignature` is wrong, nsc says so.
+///
+/// Two shapes of the nested-class root are in `testkit_lib.scala`: a nested
+/// trait in a *parent list* (`trait WithRows extends Support.Rows`, which is
+/// how `H2Profile` reaches
+/// `JdbcActionComponent.MultipleRowsPerStatementSupport`) and a nested class
+/// in a *member signature* (`def firstRow: Support.Row`). Before nested
+/// members were pickled into their owner, nsc reported each of them as
+/// "Symbol 'type testkitlib.Support.Rows' is missing from the classpath".
 #[test]
 fn real_scalac_reads_scala_rs_classfiles() {
     if !java_available() {
