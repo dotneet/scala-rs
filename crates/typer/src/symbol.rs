@@ -1757,6 +1757,25 @@ impl SymbolTable {
     /// varargs element types. Walks the parent chain, so
     /// `lub(Circle, Rect) = Shape` for a sealed `Shape` hierarchy.
     pub fn lub(&self, a: &Type, b: &Type) -> Type {
+        self.lub_at(a, b, 0)
+    }
+
+    /// `lub` with nsc's depth cap.
+    ///
+    /// Joining the arguments of two applications of the same class recurses
+    /// into those arguments, and with recursive generics that never
+    /// terminates: jgit's `getAllRefsByPeeledObjectId` gives a
+    /// `java.util.Map[ObjectId, java.util.Set[Ref]]`, and the lub of two of
+    /// its instantiations grows one `Comparable[…]` layer per step. gitbucket
+    /// crashed the compiler with a stack overflow on it (`JGitUtil.scala`),
+    /// with no diagnostic at all. nsc bounds the same recursion with
+    /// `Depth`/`maxDepth` and answers `Any` when it runs out; so does this.
+    fn lub_at(&self, a: &Type, b: &Type, depth: u32) -> Type {
+        /// nsc's `LubGlbMargin` is 0 and its starting depth comes from the
+        /// operands; a fixed cap is enough here, since a lub that needs more
+        /// than this many nested joins is the pathological case, not a real
+        /// answer anybody reads.
+        const MAX_LUB_DEPTH: u32 = 6;
         let a = a.widen_constant();
         let b = b.widen_constant();
         if a == b {
@@ -1773,6 +1792,13 @@ impl SymbolTable {
         }
         if self.is_sub_type(&b, &a) {
             return a;
+        }
+        if depth >= MAX_LUB_DEPTH {
+            return if self.is_sub_type(&a, &Type::AnyRef) && self.is_sub_type(&b, &Type::AnyRef) {
+                Type::AnyRef
+            } else {
+                Type::Any
+            };
         }
         // Same class constructor, differing arguments: join the arguments.
         // A contravariant parameter joins the other way -- the least upper
@@ -1796,7 +1822,7 @@ impl SymbolTable {
                         if flags.contains(Flags::CONTRAVARIANT) {
                             self.glb(x, y)
                         } else if flags.contains(Flags::COVARIANT) || x == y {
-                            self.lub(x, y)
+                            self.lub_at(x, y, depth + 1)
                         } else {
                             // An *invariant* parameter admits neither argument
                             // in place of the other, so joining them is not a
@@ -1807,7 +1833,7 @@ impl SymbolTable {
                             // inapplicable to `Seq(elems: A*)`.
                             Type::BoundedWildcard {
                                 lo: None,
-                                hi: Some(Box::new(self.lub(x, y))),
+                                hi: Some(Box::new(self.lub_at(x, y, depth + 1))),
                             }
                         }
                     })
@@ -1842,7 +1868,7 @@ impl SymbolTable {
                         .zip(p2.iter())
                         .map(|(x, y)| self.glb(x, y))
                         .collect(),
-                    ret: Box::new(self.lub(r1, r2)),
+                    ret: Box::new(self.lub_at(r1, r2, depth + 1)),
                 };
             }
         }
@@ -1903,7 +1929,7 @@ impl SymbolTable {
             if let Some(other) = same {
                 // Both are `Type::Class` at the same symbol, so this hits the
                 // argument-joining arm above and terminates.
-                let joined = self.lub(&cand, other);
+                let joined = self.lub_at(&cand, other, depth + 1);
                 if self.is_sub_type(&a, &joined) && self.is_sub_type(&b, &joined) {
                     return joined;
                 }
