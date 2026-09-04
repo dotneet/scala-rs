@@ -250,3 +250,188 @@ return-type-only overload is not enough: a case block returning `Int` selects
 **The private runtime (`--no-scala-library`) has no `StringOps` at all**, so `so8.scala`
 produces 40 diagnostics there (it is not silently accepted).
 slick: `errors=518 → 516`.
+
+### Three small clusters of slick's remaining errors (`agent/tail1`)
+
+This is the result of looking at three independent items in parallel. The test is
+`crates/cli/tests/tail1.rs`, and the fixture prefix is `t1`.
+
+The measurement went from `files=184 errors=327 files_with_errors=64` to
+**`files=184 errors=305 files_with_errors=63`** (-22 errors / -1 file).
+The breakdown for each of the three clusters:
+
+| Cluster | before | after |
+|---|---|---|
+| `value ExitCase is not a member of Resource$` / `Outcome.Succeeded` family | 6 | **1** (a leftover that only shows up across many files, described below) |
+| `value getOrElse is not a member of Product` | 4 | 4 (**still unfixed**, described below) |
+| `not found: value fromInt` | 3 | **0** |
+
+The -22 difference includes, on top of the direct contribution of those three clusters
+(-5 from 6→1 and -3 from 3→0), the cascaded diagnostics such as `no implicit` that were
+collateral damage from `fromInt` not being found.
+
+#### 1. `value X is not a member of Y$` (a jar's companion + a package object `val`)
+
+The `outer_class_info_index` of `InnerClasses`, which the README note in
+`agent/companionkind` ("The adjacent gap that remains") named as the cause, **was not the cause**
+after all. I extended `parse_inner_classes` to check, and for a class like
+`Resource$ExitCase$Succeeded$`, looking at **its own entry** in `InnerClasses` shows the
+outer always correctly pointing at `Resource$ExitCase$` (the companion doing the lookup);
+the indistinguishable case is never actually hit.
+
+**The real cause was the member-lookup fallback in `type_select`
+(`crates/typer/src/check.rs`)**. When nothing was found it called
+`complete_binary_member(qual.sym, name, span)`. But when the `Box` of `Box.Const`
+is **a package object's `val`**
+(`val Box = tiny2.Box`; cats.effect's `package object effect` uses exactly this shape
+for `Resource` / `Outcome`), `qual.sym` is
+**the symbol of the val itself**, whose `jvm_name` is empty. A candidate assembled
+from an empty name (something like `$Const`) naturally matches nothing. `Box.of` (a direct
+member of `Box$`, filled in when the jar is loaded) worked while only `Box.Const` (the
+companion's nested class) failed for this reason, and with a direct import
+(`import tiny2.Box`, where `qual.sym` is the module itself) it does not reproduce.
+
+Changing it to try `recv_ty` first (the val's **type**, which `class_sym_of` can resolve
+from a `ModuleRef` to the actual module class) turned up four adjacent gaps
+one after another:
+
+1. **The candidate loop in `complete_binary_member` was returning on the first JVM name
+   it found**. When **both a class and its companion** exist, as with `Const` / `Const$`,
+   the class hits first and `return`s, so the companion (the one that has `apply`)
+   never gets installed. `Box.Const(5)` was coming out as
+   `value apply is not a member of Const`.
+   Changed to try all candidates.
+2. **`scala/runtime/Nothing$` in a generic signature was not being turned into
+   `Type::Nothing`**. The classfile `Signature` for `case object Canceled extends Outcome[Nothing]`
+   cannot write `Nothing`, so it writes
+   `Lscala/runtime/Nothing$;` (the runtime placeholder class) instead.
+   `jtype_to_type` (`classpath.rs`) treated that as an ordinary class, so the
+   `Outcome[Nothing] <: Outcome[Int]` check became
+   `is_sub_type(Nothing$_stub, Int)` and failed even for the **covariant** `Outcome[+A]`
+   (`type mismatch; found: Canceled$ required: Outcome[Int]`).
+   `parse_field_ty` (for descriptors) already did this conversion, so
+   I added the same mapping on the generic-signature side.
+3. **Type parameters of classes read from a jar were not getting their variance**.
+   A JVM generic signature cannot write variance (it is a compile-time-only notion).
+   Variance exists only in the **pickle**, yet `adopt_tparam_kinds`
+   (`pickle_supply.rs`) carried over only the arity and threw the variance away.
+   With just the Nothing fix from 2, `Outcome[+A]` would still actually be treated as invariant
+   and the same symptom would remain, so it now sets `Flags::COVARIANT` /
+   `CONTRAVARIANT` from `TParam::variance`.
+4. **A package object's `val` is just a zero-argument method in the classfile,
+   indistinguishable from a `def`**. A `p.T` type such as `Resource.ExitCase`
+   (SLS 3.2.3, where `p` must be a stable path) turns into
+   "stable identifier required" unless `Resource` is stable.
+   Stability exists only in the **pickle's `pflags::STABLE`**, yet
+   `adopt_binary_class` ignored the pickle's `MemberKind::Val` entirely
+   (handling only `Def`). I added `Val` to what it processes,
+   attached `Flags::ACCESSOR` to declarations that have `pflags::STABLE` set, and made
+   `ident_is_stable` / `member_is_stable` read that as the grounds for stability.
+   On top of that there was an ordering gap where `import_named` (the handling of
+   `import p.{Resource}` itself) pinned the raw classfile-derived symbol into the scope
+   before the pickle was applied; I closed it by calling
+   `adopt_binary_class` earlier, inside the import handling.
+   `type_select_is_term_prefix` also **refused** to read a term merely because a type
+   side existed, when a type alias and a val share the same name
+   (`type Box[A] = …; val Box = …`), so I fixed it to always read the `p` of
+   `p.T` as a term (exactly as SLS specifies). To avoid breaking the existing
+   precedence for `new Outer.Inner()` (the case where there is only an object and no
+   companion val), which lives in `qualified_type_owners`,
+   `SymKind::Module` is not included in this decision.
+
+I also added the `complete_binary_member` fallback to `project_from_prefix` (type resolution
+for `p.T`), but I narrowed the same kind of fallback on the `type_select` side to
+**`Type::ModuleRef` only**. Calling `complete_binary_member` unconditionally on a
+`Type::Class` (for example `Type::String`) makes
+its `owner.kind == Class` branch call `ensure_java_loaded`, force-loading
+**the entire raw classfile** of `java.lang.String`, and then
+JDK 11's `lines(): Stream[String]` hid 2.13's deprecated
+`StringOps.lines: Iterator[String]`
+(`scala_library_dual_run_string_ops4` in `e2e.rs` caught that as a regression,
+which is how I noticed the narrowing was needed).
+
+**The adjacent gap that remains**: in slick's real source (`closeStreamIteratorAndRelease`
+in `BasicBackend.scala`) exactly **one** `Resource.ExitCase` type annotation still
+fails. My own reproduction (`tail1.rs`, with two levels of nesting, going through a
+package object, and with a covariant trait) is accepted by real scalac and
+by our binary too. I could not shrink it to a single file or to a
+combination of a few files; it only reproduces with all 184 files of slick.
+I decided further tracking was out of scope for this slice.
+
+#### 2. `value getOrElse is not a member of Product` (**still unfixed**)
+
+The cause is `nextBlobOption() getOrElse(…)` in `slick/jdbc/PositionedResult.scala`
+(a block with no return type annotation:
+`{ … val rr = if (rs.wasNull) None else Some(r); …; rr }`). **Of the 16 identically shaped
+`nextXxxOption()` methods, only 4 — `Blob` / `Bytes` (`Array[Byte]`) / `Clob` / `Object` —**
+fail; the remaining 12, including `Boolean` / `Int` / `String` / `Date` / `BigDecimal`,
+work.
+
+I built many shrunk versions, going as far as reproducing `abstract class … extends Closeable`, `import PositionedResult.
+SqlNullException` (a forward reference to the companion), and the real classfiles of `java.sql.{Blob, Clob,
+ResultSet}`, and
+every one of them **passed** under both real scalac and our binary
+(the lub of `None` / `Some(r)`, the on-demand loading of `Blob` / `Clob`,
+the generic overloads of `getObject` — none of the places I suspected reproduce it
+on their own). Even adding a few files of slick-internal dependencies such as
+SlickException / GetResult / GlobalConfig to get closer, it just got buried under a cascade of
+unrelated unresolved errors, and I never reached the reason why only `Blob`/`Bytes`/`Clob`/
+`Object` get special treatment.
+The way it seems to depend on the state of all 184 slick files is the same shape as the
+leftover in 1, but here I do not even have a guess at the true cause.
+**I have not put in any speculative stub-like workaround**. As a clue for whoever looks next,
+the doc comment in `tail1.rs` records the trial and error of the shrinking.
+
+#### 3. `not found: value fromInt`
+
+This is the shape where, after `import integral._` (the implicit `Integral[T]`), you call bare `zero` /
+`one` / `fromInt(n)`. `Numeric[T]` is a standard-library trait whose members exist only in
+the **pickle** of the compiled scala-library (the classfile itself has no
+corresponding nested class), and
+the wildcard-import fallback in `expose_unqualified` (`check.rs`)
+only called `complete_binary_member`.
+As we saw in 1, that is for "finding a nested classfile", and
+**a plain method** like `fromInt` was never findable that way in the first place.
+`import_wildcard` (the immediate copy at import time) only picks up "what is already in
+`owner.members` at that moment", so `fromInt`, which nobody had touched yet,
+did not make it into the copy, and everything rested on the lazy fallback
+for when it was referenced later.
+
+The odd part about why this got fixed is that `zero` / `one` did reproduce
+(in `crates/cli/tests/tail1.rs::fixtures_t1_wildcard_inherited` I built a minimal reproduction
+using **all three** of `zero` / `one` / `fromInt`, and before the fix
+**all three** were "not found". In slick's source it looks like
+`zero` / `one` happened to be touched earlier in a different form within the same method body,
+which is why they worked). The fix was merely to add
+`PickleSupply::complete` (the pickle path that ordinary member selection `x.zero` already uses)
+to the wildcard fallback in `expose_unqualified` as the second-best option
+when `complete_binary_member` fails. Since jvm names starting with `scala/`
+are unconditionally allowed
+inside `complete_named`, no additional
+adopt is needed.
+
+#### What I left alone
+
+I have not touched `agent/mismatch9` (`type mismatch` in general) or `agent/quasi`
+(quasiquotes / macros).
+
+#### fixture
+
+`crates/cli/tests/tail1.rs`:
+
+- `a_nested_member_through_a_package_object_val`: uses real scalac to bake
+  `t1lib.Box` / `t1lib.Outcome` (the companion's nested `Const`, and
+  `case object Canceled extends Outcome[Nothing]` inheriting `Outcome[+A]`)
+  into a jar, then compiles and runs user code that touches them only through
+  `t1lib.alias` (a package object holding a `type` and a `val` under the same name),
+  passing `java -Xverify:all`. It also checks the negative case that rejects
+  a missing `bogus` member.
+- `real_scalac_accepts_the_same_program`: compiles and runs the same 3 files with real scalac
+  alone and confirms the same stdout
+  (backing up that the fixture is correct Scala rather than "a quirk of our compiler").
+- `fixtures_t1_wildcard_inherited` / `real_scalac_accepts_
+  t1_wildcard_inherited`: compiles and runs `tests/fixtures/t1_wildcard_inherited.scala`
+  (a loop that uses `zero` / `one` / `fromInt` after `import integral._`)
+  with both `--scala-library` and real scalac, and checks that it matches
+  `tests/fixtures/expected/t1_wildcard_inherited.txt`.
+
