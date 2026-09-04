@@ -5045,6 +5045,39 @@ impl<'a> Gen<'a> {
 
     // (helper `desc_param_sorts` is a free function below)
 
+    /// `narrow` is a reference type the JVM would accept where `wide` is
+    /// asked for -- the shape a parameter bridge exists to cast across.
+    ///
+    /// Only reference types, and only when the symbol table really has both
+    /// classes and one is above the other: a bridge that casts to an
+    /// unrelated class would turn a linkage error into a
+    /// `ClassCastException`.
+    fn desc_narrows(&self, wide: &str, narrow: &str) -> bool {
+        if wide == narrow {
+            return true;
+        }
+        if !wide.starts_with('L') || !narrow.starts_with('L') {
+            return false;
+        }
+        let w = &wide[1..wide.len() - 1];
+        let n = &narrow[1..narrow.len() - 1];
+        if w == "java/lang/Object" {
+            return true;
+        }
+        let (Some(ws), Some(ns)) = (self.st.find_class_by_jvm(w), self.st.find_class_by_jvm(n))
+        else {
+            return false;
+        };
+        let nt = Type::Class {
+            sym: ns,
+            args: vec![],
+        };
+        self.st
+            .base_type_seq(&nt)
+            .iter()
+            .any(|p| self.st.class_sym_of(p) == Some(ws))
+    }
+
     /// Covariant-override bridges for members this class only *inherits*.
     ///
     /// `emit_erasure_bridges` looks at the class's own members, so it never
@@ -5093,7 +5126,7 @@ impl<'a> Gen<'a> {
                 if b.methods.iter().any(|m| m.name == enc && m.desc == pdesc) {
                     continue;
                 }
-                let Some(have) = b
+                let same_params = b
                     .methods
                     .iter()
                     .find(|m| {
@@ -5103,14 +5136,61 @@ impl<'a> Gen<'a> {
                             && m.desc.starts_with(pparams)
                             && m.desc[pparams.len()..].starts_with('L')
                     })
-                    .map(|m| m.desc.clone())
-                else {
-                    continue;
+                    .map(|m| m.desc.clone());
+                // The same rule with the parameters narrowed rather than the
+                // result. slick's `RelationalActionComponent` declares
+                // `createSchemaActionExtensionMethods(_: SchemaDescription)`
+                // over an abstract type that `SqlProfile` fixes to
+                // `SqlProfile#DDL`, so `H2Profile$` implements only the narrow
+                // descriptor and a call through the base interface threw
+                // `AbstractMethodError`. nsc's bridge takes the wide
+                // descriptor and `checkcast`s each narrowed argument.
+                //
+                // Only when exactly one implemented method of that name fits:
+                // an overload set is `emit_erasure_bridges`' business, which
+                // knows which symbol overrides which.
+                let pparam_strs = desc_param_strs(pdesc.as_str());
+                let have = match same_params {
+                    Some(d) => d,
+                    None => {
+                        let mut fits = b.methods.iter().filter(|m| {
+                            m.name == enc
+                                && m.code.is_some()
+                                && m.access & ACC_STATIC == 0
+                                && m.desc[m.desc.find(')').map(|i| i + 1).unwrap_or(0)..]
+                                    .starts_with('L')
+                                && {
+                                    let cs = desc_param_strs(&m.desc);
+                                    cs.len() == pparam_strs.len()
+                                        && cs
+                                            .iter()
+                                            .zip(&pparam_strs)
+                                            .all(|(c, p)| self.desc_narrows(p, c))
+                                }
+                        });
+                        let Some(first) = fits.next().map(|m| m.desc.clone()) else {
+                            continue;
+                        };
+                        if fits.next().is_some() {
+                            continue;
+                        }
+                        first
+                    }
                 };
-                let mut loads: Vec<(u16, JvmSort)> = Vec::new();
+                let cparam_strs = desc_param_strs(&have);
+                let mut loads: Vec<(u16, JvmSort, Option<String>)> = Vec::new();
                 let mut locals = 1u16;
-                for t in desc_param_sorts(pparams) {
-                    loads.push((locals, t));
+                for (i, t) in desc_param_sorts(pparams).into_iter().enumerate() {
+                    // A narrowed reference parameter is cast to what the
+                    // implementation declares; everything else is passed on.
+                    let cast = match (pparam_strs.get(i), cparam_strs.get(i)) {
+                        (Some(p), Some(c)) if p != c && c.starts_with('L') => {
+                            Some(c[1..c.len() - 1].to_string())
+                        }
+                        (Some(p), Some(c)) if p != c && c.starts_with('[') => Some(c.clone()),
+                        _ => None,
+                    };
+                    loads.push((locals, t, cast));
                     locals += t.slots();
                 }
                 let cn = class_name.clone();
@@ -5123,8 +5203,11 @@ impl<'a> Gen<'a> {
                     locals.max(1),
                     move |asm| {
                         asm.aload(0);
-                        for (slot, sort) in &loads {
+                        for (slot, sort, cast) in &loads {
                             load(asm, *slot, *sort);
+                            if let Some(c) = cast {
+                                asm.checkcast(c);
+                            }
                         }
                         asm.invokevirtual(&cn, &name, &target);
                         asm.areturn();
@@ -16540,8 +16623,13 @@ fn unerase_lambda_param(a: &mut Assembler, st: &SymbolTable, ty: &Type) {
         if !n.is_empty() && n != "java/lang/Object" {
             a.checkcast(&n);
         }
-    } else if matches!(ty, Type::Tuple(_)) {
-        a.checkcast("scala/Tuple2");
+    } else if let Type::Tuple(ts) = ty {
+        // Erasure leaves a `Type::Tuple` alone, so the arity has to be read
+        // off it here. It used to be hard-coded as `Tuple2`: slick's
+        // `.map(_._2)` over a `Resource[F, (Ref, CloseableIterator, …)]` cast
+        // the parameter to `Tuple2` and then called `Tuple3._2` on it, which
+        // the verifier threw the whole method out for.
+        a.checkcast(&format!("scala/Tuple{}", ts.len().max(1)));
     } else {
         emit_unbox(a, ty);
     }
@@ -16815,8 +16903,8 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
                     if !n.is_empty() && n != "java/lang/Object" {
                         a.checkcast(&n);
                     }
-                } else if matches!(p.ty, Type::Tuple(_)) {
-                    a.checkcast("scala/Tuple2");
+                } else if let Type::Tuple(ts) = &p.ty {
+                    a.checkcast(&format!("scala/Tuple{}", ts.len().max(1)));
                 } else {
                     emit_unbox(a, &p.ty);
                 }
@@ -19951,6 +20039,30 @@ fn ret_str_sort(ret: &str) -> JvmSort {
         Some(b'Z' | b'B' | b'S' | b'C' | b'I') => JvmSort::Int,
         _ => JvmSort::Ref,
     }
+}
+
+/// The parameter descriptors of a method descriptor, one string each.
+fn desc_param_strs(desc: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b = desc.as_bytes();
+    let mut i = if b.first() == Some(&b'(') { 1 } else { 0 };
+    while i < b.len() && b[i] != b')' {
+        let start = i;
+        while i < b.len() && b[i] == b'[' {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        if b[i] == b'L' {
+            while i < b.len() && b[i] != b';' {
+                i += 1;
+            }
+        }
+        i += 1;
+        out.push(desc[start..i.min(desc.len())].to_string());
+    }
+    out
 }
 
 fn desc_param_sorts(desc: &str) -> Vec<JvmSort> {

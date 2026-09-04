@@ -438,6 +438,64 @@ fn erase_elem_ty(ty: &Type, st: &SymbolTable) -> Type {
     }
 }
 
+/// nsc's `intersectionDominator` (SLS 3.7): the part of a compound type that
+/// its erasure is the erasure of.
+///
+/// The rule is *not* "the first parent". It is the first parent that is a
+/// class rather than a trait **and** that no other parent is a subclass of;
+/// if no parent is a class, the first unshadowed one. slick writes
+///
+/// ```text
+/// implicit def tableQueryToTableQueryExtensionMethods[T, U](
+///   q: Query[T, U, Seq] & TableQuery[T]): TableQueryExtensionMethods[T, U]
+/// ```
+///
+/// and `TableQuery <: Query`, so nsc's descriptor takes a `TableQuery` while
+/// taking `parents.first()` produced a `Query`. Every one of the twelve slick
+/// run programs died on that one method with `NoSuchMethodError`, because the
+/// client is compiled against nsc's descriptor.
+fn intersection_dominator(parents: &[Type], st: &SymbolTable) -> Option<Type> {
+    if parents.len() < 2 {
+        return parents.first().cloned();
+    }
+    let syms: Vec<Option<SymbolId>> = parents.iter().map(|p| st.class_sym_of(p)).collect();
+    // No other parent is a strict subclass of this one.
+    let unshadowed = |i: usize| match syms[i] {
+        None => true,
+        Some(p) => !syms
+            .iter()
+            .enumerate()
+            .any(|(j, q)| j != i && matches!(q, Some(q) if *q != p && inherits_class(st, *q, p))),
+    };
+    let is_class = |i: usize| {
+        syms[i].is_some_and(|s| {
+            let sym = st.get(s);
+            sym.kind == crate::symbol::SymKind::Class
+                && !sym.flags.contains(Flags::TRAIT)
+                && !sym.flags.contains(Flags::INTERFACE)
+        })
+    };
+    let pick = (0..parents.len())
+        .find(|&i| is_class(i) && unshadowed(i))
+        .or_else(|| (0..parents.len()).find(|&i| unshadowed(i)))
+        .unwrap_or(0);
+    Some(parents[pick].clone())
+}
+
+/// `sub` has `sup` somewhere above it (class symbols only, arguments ignored).
+fn inherits_class(st: &SymbolTable, sub: SymbolId, sup: SymbolId) -> bool {
+    if sub == sup {
+        return true;
+    }
+    let t = Type::Class {
+        sym: sub,
+        args: vec![],
+    };
+    st.base_type_seq(&t)
+        .iter()
+        .any(|p| st.class_sym_of(p) == Some(sup))
+}
+
 fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
     // `Array[T]` reached through a classfile signature, or built by
     // substituting `Array` for a `C[_]` parameter, is `Class { array_sym }`.
@@ -543,8 +601,8 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
                     parents: parents.iter().map(|p| erase_ty(p, st)).collect(),
                     decls: decls.clone(),
                 }
-            } else if let Some(p) = parents.first() {
-                erase_ty(p, st)
+            } else if let Some(p) = intersection_dominator(parents, st) {
+                erase_ty(&p, st)
             } else {
                 Type::AnyRef
             }
