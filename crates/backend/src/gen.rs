@@ -141,10 +141,23 @@ fn collect_trait_impls(tree: &Tree, into: &mut TraitImpls) {
                 if !lazies.is_empty() && !tree.sym.is_none() {
                     into.lazy_vals.insert(tree.sym, lazies);
                 }
+                // A `case class` declared in a trait carries a *synthesized*
+                // companion, which is a member `object` of that trait exactly
+                // as a written one is: the trait declares an abstract `K()`
+                // accessor and every class mixing it in owes an
+                // implementation. Only the `ModuleDef`s were harvested, so
+                // `trait T { case class K(a: Int) }; object P extends T` threw
+                // `AbstractMethodError: P$ … K()` at the first `P.K(1)`.
+                // The companion is resolved in `mixin_member_modules`, which
+                // has the symbol table; this pass reads the tree alone.
                 let modules: Vec<Tree> = impl_
                     .body
                     .iter()
-                    .filter(|s| matches!(s.kind, TreeKind::ModuleDef { .. }))
+                    .filter(|s| match &s.kind {
+                        TreeKind::ModuleDef { .. } => true,
+                        TreeKind::ClassDef { mods, .. } => mods.flags.contains(Flags::CASE),
+                        _ => false,
+                    })
                     .cloned()
                     .collect();
                 if !modules.is_empty() && !tree.sym.is_none() {
@@ -2037,6 +2050,40 @@ fn is_owner_compatible(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> 
     false
 }
 
+/// Like `is_owner_compatible`, but a *trait*'s class parent counts.
+///
+/// The JVM interface a trait becomes does not extend that class, which is why
+/// `is_owner_compatible` refuses to follow the edge -- a call through the
+/// interface cannot assume it. `this` is different: every instance of
+/// `trait U extends B` really is a `B`, so `B`'s members are read off `this`
+/// with a `checkcast`, which is what nsc emits. Without this,
+/// `trait Comp { class B(val table: String); object B { trait U extends B {
+/// … table … } } }` walked out to `U`'s `$outer` (the `B` *module*) and on to
+/// `Comp`, then cast that to `B`: slick's
+/// `TableDDLBuilder.UniqueIndexAsConstraint` threw `ClassCastException:
+/// H2Profile$ cannot be cast to …$TableDDLBuilder` on its first line.
+fn self_reaches_owner(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> bool {
+    if owner.is_none() || current == owner {
+        return true;
+    }
+    let mut work = vec![current];
+    let mut seen = HashSet::new();
+    while let Some(id) = work.pop() {
+        if !seen.insert(id.0) {
+            continue;
+        }
+        if id == owner {
+            return true;
+        }
+        for p in &st.get(id).parents {
+            if let Some(ps) = st.class_sym_of(p) {
+                work.push(ps);
+            }
+        }
+    }
+    false
+}
+
 /// Push the instance that owns `owner`'s members: `this`, or the `$outer`
 /// chain of the class being emitted when the member lives further out.
 /// `cur` is the class we are lexically inside (it decides the next hop),
@@ -2045,9 +2092,9 @@ fn is_owner_compatible(st: &SymbolTable, current: SymbolId, owner: SymbolId) -> 
 fn load_owner_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
     let hops = !ctx.class_sym.is_none()
         && !owner.is_none()
-        && !is_owner_compatible(ctx.st, ctx.class_sym, owner);
+        && !self_reaches_owner(ctx.st, ctx.class_sym, owner);
     let (mut cur, mut held) = start_outer_walk(asm, ctx, hops);
-    while !cur.is_none() && !owner.is_none() && !is_owner_compatible(ctx.st, held, owner) {
+    while !cur.is_none() && !owner.is_none() && !self_reaches_owner(ctx.st, held, owner) {
         let Some(o) = enclosing_instance(ctx.st, cur) else {
             break;
         };
@@ -4451,7 +4498,15 @@ impl<'a> Gen<'a> {
                 if m.sym.is_none() {
                     continue;
                 }
-                let mcls = module_class_id(self.st, m.sym);
+                // A `case class` entry stands for its synthesized companion
+                // (see `collect_trait_impls`); a `ModuleDef` is its own.
+                let mcls = match &m.kind {
+                    TreeKind::ClassDef { .. } => match self.st.companion_module(m.sym) {
+                        Some(c) => module_class_id(self.st, c),
+                        None => continue,
+                    },
+                    _ => module_class_id(self.st, m.sym),
+                };
                 if member_module_outer(self.st, mcls) != Some(parent) {
                     continue;
                 }
@@ -4774,6 +4829,29 @@ impl<'a> Gen<'a> {
         hits.next().is_none().then_some(first)
     }
 
+    /// Whether a class on the superclass chain already declares a concrete
+    /// method that *is* the trait member `def` -- the same member, possibly at
+    /// a narrower erased descriptor, which `bridge_overrides` is the test for.
+    /// Used only for traits that sit past the superclass in the linearization
+    /// (see `emit_mixin_forwarders`).
+    fn superclass_implements(
+        &self,
+        super_impls: &[(String, Vec<Type>, SymbolId)],
+        def: &Tree,
+    ) -> bool {
+        let enc = encode_method_name(def.name().unwrap_or(""));
+        let declared = def_param_types(self.st, def);
+        let abstract_mask = self
+            .st
+            .erased_abstract_params
+            .get(&def.sym)
+            .copied()
+            .unwrap_or(0);
+        super_impls.iter().any(|(n, cps, sym)| {
+            *n == enc && *sym != def.sym && bridge_overrides(self.st, &declared, cps, abstract_mask)
+        })
+    }
+
     fn emit_mixin_forwarders(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
         if class_id.is_none() {
             return;
@@ -4800,15 +4878,58 @@ impl<'a> Gen<'a> {
             defined.insert((m.name.clone(), desc_params(&m.desc).to_string()));
         }
         let lin = linearize(self.st, class_id);
+        // Where the superclass sits in the linearization. Every trait *after*
+        // it is an ancestor of that class rather than a mixin of this one, so
+        // the superclass has already settled which body wins -- and if it
+        // narrowed the member, its own erasure bridge settles the wide
+        // descriptor too. Emitting a forwarder here would override both.
+        //
+        // slick's `abstract class JdbcDatabaseDef` overrides
+        // `BasicDatabaseDef.setupTransaction(session: Session, …)` at the
+        // narrowed `Session = JdbcSessionDef`, and `new JdbcDatabaseDef(…){}`
+        // -- the anonymous class every `Database` really is -- got a forwarder
+        // for the wide descriptor straight to `BasicDatabaseDef$class`, whose
+        // body is `None`. Every `.transactionally` therefore ran with
+        // autocommit still on and rolled nothing back.
+        let super_idx = lin
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, p)| !is_interface_sym(self.st, **p))
+            .map(|(i, _)| i);
+        let super_impls: Vec<(String, Vec<Type>, SymbolId)> = match super_idx {
+            None => Vec::new(),
+            Some(_) => lin
+                .iter()
+                .skip(1)
+                .filter(|p| !is_interface_sym(self.st, **p))
+                .flat_map(|p| self.st.get(*p).members.iter().copied())
+                .filter_map(|mid| {
+                    let s = self.st.get(mid);
+                    if s.kind != SymKind::Method
+                        || s.name == "<init>"
+                        || s.flags.contains(Flags::ABSTRACT)
+                    {
+                        return None;
+                    }
+                    Some((
+                        encode_method_name(&s.name),
+                        method_params_from_sym(self.st, mid),
+                        mid,
+                    ))
+                })
+                .collect(),
+        };
         let mut chosen: Vec<(String, String, Tree)> = Vec::new();
         let mut seen = HashSet::new();
-        for parent in lin.iter().skip(1) {
+        for (pi, parent) in lin.iter().enumerate().skip(1) {
             let Some(methods) = self.traits.impls.get(parent) else {
                 continue;
             };
             if !is_interface_sym(self.st, *parent) {
                 continue;
             }
+            let past_superclass = super_idx.is_some_and(|si| pi > si);
             let iface = class_internal(self.st, *parent);
             for m in methods {
                 let name = m.name().unwrap_or("").to_string();
@@ -4825,6 +4946,9 @@ impl<'a> Gen<'a> {
                     desc_params(&def_method_desc(self.st, m)).to_string(),
                 );
                 if !seen.insert(key) {
+                    continue;
+                }
+                if past_superclass && self.superclass_implements(&super_impls, m) {
                     continue;
                 }
                 chosen.push((name, iface.clone(), m.clone()));
@@ -5983,7 +6107,20 @@ impl<'a> Gen<'a> {
             let Some(o) = outer_field_class(self.st, parent) else {
                 continue;
             };
-            if !outer_chain_reaches(self.st, class_id, o) {
+            // A trait nested in a member `object` is reached through that
+            // object's accessor, not along the `$outer` chain. slick has
+            // `trait JdbcStatementBuilderComponent { object TableDDLBuilder {
+            // trait UniqueIndexAsConstraint extends TableDDLBuilder } }`, and
+            // `class H2TableDDLBuilder extends TableDDLBuilder(table) with
+            // TableDDLBuilder.UniqueIndexAsConstraint` holds an `$outer` of
+            // `H2Profile` -- the object itself is nowhere on that chain, so
+            // this declined to implement the accessor at all and the JVM threw
+            // `AbstractMethodError` at the first `createIndex`.
+            // `H2Profile.TableDDLBuilder()` is the instance, which is what
+            // `load_module_instance` reaches.
+            let via_module = member_module_outer(self.st, o)
+                .is_some_and(|m| outer_chain_reaches(self.st, class_id, m));
+            if !via_module && !outer_chain_reaches(self.st, class_id, o) {
                 continue;
             }
             let name = trait_outer_accessor_name(self.st, parent);
@@ -6014,7 +6151,11 @@ impl<'a> Gen<'a> {
                     library_abi,
                     boxed_vars,
                 );
-                load_owner_instance(asm, &ctx, o);
+                if via_module {
+                    load_module_instance(asm, &ctx, o);
+                } else {
+                    load_owner_instance(asm, &ctx, o);
+                }
                 asm.areturn();
             });
         }
@@ -6998,6 +7139,13 @@ impl<'a> Gen<'a> {
         emit_case_apply(&mut b, self.st, class_id);
         if abs_fn.is_some() {
             emit_case_apply_bridge(&mut b, self.st, class_id);
+        }
+        // The primary constructor's `$lessinit$greater$default$n` /
+        // `apply$default$n` (`crate::typer::ctor_defaults` declares them on the
+        // companion, as nsc does). `emit_module` reaches these through its own
+        // call; a synthesized companion has no `ModuleDef` and comes here.
+        if let Some(c) = comp {
+            self.emit_default_getters(&mut b, c);
         }
         // `case class M(v: Int) extends AnyVal`: this synthetic companion is
         // also where its `$extension` methods are declared.
