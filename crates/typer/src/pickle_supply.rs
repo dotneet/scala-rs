@@ -1010,36 +1010,17 @@ impl PickleSupply {
             self.sigs.lookup(&mut src, &full, is_module, name)
         };
         trace(format_args!("{full}#{name}: {} pickle hit(s)", hits.len()));
-        let mut cands: Vec<_> = hits
-            .into_iter()
-            .filter(|h| {
-                matches!(
-                    h.member.kind,
-                    MemberKind::TypeAlias | MemberKind::AbstractType
-                ) && h.member.is_public_api()
-            })
-            .collect();
-        // The class's own declaration first, and a definition before a bare
-        // declaration. slick's `BasicBackend` declares
-        // `type Database >: Null <: DatabaseDef` and `JdbcBackend` defines
-        // `type Database = DatabaseDef`; taking whichever the walk reached
-        // first gave `import JdbcBackend.{Database => SlickDatabase}` the
-        // opaque abstract member, so `SlickDatabase.forURL(…)` -- a
-        // `DatabaseDef` -- did not conform to it. Stable, so hits that tie
-        // keep the order the linearization put them in.
-        cands.sort_by_key(|h| (h.owner != full, h.member.kind != MemberKind::TypeAlias));
-        for hit in cands {
-            let answer = if hit.member.kind == MemberKind::AbstractType {
-                let qualified = format!("{}.{name}", hit.owner);
-                self.abstract_type_member(st, bin, &qualified, 0)
-            } else {
-                self.install_type_alias(st, bin, &hit.owner, name, &hit.member.ty)
-            };
-            if answer.is_some() {
-                return answer;
-            }
+        let hit = hits.into_iter().find(|h| {
+            matches!(
+                h.member.kind,
+                MemberKind::TypeAlias | MemberKind::AbstractType
+            ) && h.member.is_public_api()
+        })?;
+        if hit.member.kind == MemberKind::AbstractType {
+            let qualified = format!("{}.{name}", hit.owner);
+            return self.abstract_type_member(st, bin, &qualified, 0);
         }
-        None
+        self.install_type_alias(st, bin, &hit.owner, name, &hit.member.ty)
     }
 
     /// `type T[tps] = U` from a pickle, as the type it stands for.

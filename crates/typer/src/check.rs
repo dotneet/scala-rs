@@ -3685,41 +3685,29 @@ impl Typer {
 
     /// Whether this member's signature can simply be built again.
     ///
-    /// `sig_done` exists because signature work synthesizes evidence
-    /// parameters and default getters, which must not happen twice. A member
-    /// with neither is the ordinary case, and building its signature again is
-    /// just work: the same annotations resolved in the same scope.
+    /// Only a `val`. Its signature is its written type and nothing else, so
+    /// resolving it a second time in the same scope is idempotent. A `def` is
+    /// not: `type_def_sig` allocates fresh symbols for the method's type
+    /// parameters and replaces `tparams` with them, so a second run leaves
+    /// every type already built out of the first run's parameters pointing at
+    /// symbols the method no longer has -- slick's
+    /// `ShapedValue.mapToImpl[R, U](c: blackbox.Context …)` went from clean to
+    /// `not found: type Expr` and 19 more when defs were included here. It
+    /// also synthesizes evidence parameters and default getters, which must
+    /// not happen twice.
     ///
     /// Used when an `import` in the enclosing template named a prefix this
     /// pass could not resolve. `import profile.api._` with
     /// `val profile: BlockingJdbcProfile` in *another unit* cannot resolve
     /// during the signature pass -- that unit's own signature pass has not run
-    /// yet -- so `def byAccount(u: Rep[String])` was typed with `Rep` not in
-    /// scope and, `sig_done` being permanent, stayed that way for the rest of
-    /// the run. Compiling gitbucket's 46 model sources with `Profile.scala`
-    /// moved to the front of the command line went from 281 errors to 187
-    /// with nothing else changed; the body pass, by which time every unit has
-    /// its signatures, is where those members should be built.
+    /// yet -- so gitbucket's `implicit val dateColumnType:
+    /// BaseColumnType[java.util.Date]` was typed with `BaseColumnType` not in
+    /// scope and, `sig_done` being permanent, stayed an error for the rest of
+    /// the run. An implicit whose type is an error fits *every* implicit
+    /// search. The body pass, by which time every unit has its signatures, is
+    /// where such a member should be built.
     fn sig_rerun_safe(tree: &Tree) -> bool {
-        match &tree.kind {
-            TreeKind::ValDef { .. } => true,
-            TreeKind::DefDef {
-                tparams,
-                vparamss,
-                name,
-                ..
-            } => {
-                name != "<init>"
-                    && !tparams.iter().any(|tp| {
-                        matches!(&tp.kind, TreeKind::TypeDef { views, ctx_bounds, .. }
-                            if !views.is_empty() || !ctx_bounds.is_empty())
-                    })
-                    && !vparamss.iter().flatten().any(
-                        |vp| matches!(&vp.kind, TreeKind::ValDef { rhs, .. } if !rhs.is_empty()),
-                    )
-            }
-            _ => false,
-        }
+        matches!(&tree.kind, TreeKind::ValDef { .. })
     }
 
     fn type_member_sig(&mut self, tree: &mut Tree) {
