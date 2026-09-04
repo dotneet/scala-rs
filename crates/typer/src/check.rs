@@ -827,6 +827,13 @@ impl Typer {
     }
 
     fn jvm_for_current(&mut self, name: &str) -> String {
+        // A type's *simple* name goes through the same `NameTransformer`
+        // encoding a method name does: slick's `object :@` nested in `object
+        // TypeUtil` is `slick/ast/TypeUtil$$colon$at$` for nsc, and we wrote
+        // the raw operator characters into the classfile name --
+        // `TypeUtil$:@$.class`, which no consumer can name and which is not
+        // even a portable file name.
+        let name = &scala_rs_pickle::names::encode_method_name(name);
         // A class defined inside a method (`new S { … }`) has the method as
         // its owner; nsc still names it after the enclosing class.
         let mut owner = self.st.owner;

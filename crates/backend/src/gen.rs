@@ -6084,7 +6084,17 @@ impl<'a> Gen<'a> {
                 SymKind::Package | SymKind::NoSymbol
             )
         };
-        if !class_names.contains(name) && top_level && name != "package" {
+        // A package object needs its mirror class too. nsc compiles `package
+        // object p` to *two* classfiles, `p/package$.class` (the module) and
+        // `p/package.class` (the mirror), and the mirror is where it puts the
+        // `ScalaSignature`: `package$.class` carries only the bare `Scala`
+        // marker attribute. Without `p/package.class` a separately compiled
+        // consumer finds no pickle for the package object at all, and every
+        // one of its members is invisible -- real scalac reading a scala-rs
+        // build of a package object said `object twice is not a member of
+        // package myp.util` for each of them. See
+        // `docs/notes/separate-compilation.md`.
+        if !class_names.contains(name) && top_level {
             self.emit_forwarder(&this_name, &forwarded, cls);
         }
     }
