@@ -35,19 +35,26 @@ The reference workload is [slick](https://github.com/slick/slick): 184 files,
 slick's dependency jars. Both compilers were measured on the same machine under
 the same conditions, back to back.
 
-|                | wall     | CPU     | class files |
-| -------------- | -------- | ------- | ----------- |
-| scalac 2.13.16 | 16.2 s   | 99 s    | 1498        |
-| scala-rs       | 3.8 s    | 3.4 s   | 2127        |
+|                | wall    | CPU     | class files |
+| -------------- | ------- | ------- | ----------- |
+| scalac 2.13.16 | 12.0 s  | 68.6 s  | 1498        |
+| scala-rs       | 2.0 s   | 1.8 s   | 2127        |
 
-The CPU-time gap is the larger one because scalac uses several threads;
-scala-rs is still entirely single-threaded.
+Medians of three runs, alternating between the two compilers so that both see
+the same machine. The CPU-time gap is the larger one: scalac's wall time is
+carried by several threads, while scala-rs runs the compile itself on one
+thread and only parallelises writing the class files.
+
+scala-rs emits more class files than scalac for the same sources, so the
+comparison is not entirely in its favour: `PartialFunction` literals still
+become anonymous classes here, and traits get `T$class` helpers that scalac
+2.13 does not need.
 
 What that run establishes:
 
 - All 184 slick files typecheck, with 0 errors.
 - All 2127 emitted class files load under `java -Xverify:all`.
-- The test suite is 126 test binaries / 1830 tests. 84 of them (the programs in
+- The test suite is 128 test binaries / 1842 tests. 84 of them (the programs in
   `tests/conform/`) are dual-run against real scalac 2.13.16 and required to
   produce byte-identical stdout.
 

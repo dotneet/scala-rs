@@ -1,36 +1,101 @@
 ## Speed
 
-> Note: the numbers in this document were measured before lambdas moved to
-> `invokedynamic`; that change dropped slick's output from 4552 class files to
-> 2127. The README carries the current figures. The methodology, the phase
-> breakdown and the pitfalls below are unchanged.
-
 What is measured is slick's 184 files (the file list `tests/bench.sh` pins),
 with `-Xsource:3`, and scala-library 2.13.16 + slick's 12 dependency jars +
 scala-reflect on the classpath: a **full compile** (type checking → erasure →
-code generation → writing 4552 class files).
+code generation → writing the class files).
 
-|                                                 | wall time  | CPU time (`user`) | class files emitted |
-| ----------------------------------------------- | ---------- | ----------------- | ------------------- |
-| nsc (scalac 2.13.16, including JVM startup)      | 11.9 s     | 68.6 s            | 1498                |
-| scala-rs (`34c78ba`, before optimisation)        | 217.3 s    | 209.6 s           | 4552                |
-| scala-rs (current)                               | **3.5 s**  | **3.0 s**         | 4552                |
+|                                            | wall time | CPU time (`user`) | class files |
+| ------------------------------------------ | --------- | ----------------- | ----------- |
+| nsc (scalac 2.13.16, including JVM startup) | 12.0 s    | 68.6 s            | 1498        |
+| scala-rs, before any optimisation           | 217.3 s   | 209.6 s           | 4552        |
+| scala-rs, after the first pass              | 3.5 s     | 3.0 s             | 4552        |
+| scala-rs, after the second pass and indy    | **2.0 s** | **1.8 s**         | 2127        |
 
-All three were taken on the same machine within a few minutes of each other
-(load 9–14).
+Medians of three runs each, alternating between the two compilers so both see
+the same machine. The last row is the current state; the earlier rows are kept
+because the two optimisation passes are described below and the numbers are
+what each one moved.
 
-That is **69x faster in CPU time and 62x faster in wall time**. Against nsc it
-is 3.4x faster in wall time and 23x in CPU time (nsc uses several threads, so
-the CPU-time gap is the larger one). scala-rs is still **entirely
-single-threaded**; nothing has been parallelised.
+That is **116x less CPU than where it started**, and against nsc **6x faster in
+wall time, 38x in CPU**. nsc's wall time is carried by several threads; the
+compile in scala-rs is still **entirely single-threaded**, and only writing the
+class files is parallel.
 
-The class file counts differ because **scala-rs emits lambdas as anonymous
-classes** (nsc uses `invokedynamic` + `LambdaMetaFactory`). So scala-rs reaches
-this time while writing three times as many class files. nsc reports 3 Scala 3
-migration errors under `-Xsource:3`, so the number above is with
-`-Wconf:cat=scala3-migration:s` silencing them so the run finishes (scala-rs
-does not implement that migration check and passes the sources straight
-through).
+The class file counts still differ. scala-rs lowers plain `FunctionN` literals
+to `invokedynamic` as nsc does, but `PartialFunction` literals remain anonymous
+classes, and traits get `T$class` helpers that nsc 2.13 does not emit at all
+(it uses interface default methods). So scala-rs reaches this time while
+writing about 40% more class files than nsc.
+
+nsc reports 3 Scala 3 migration errors under `-Xsource:3`, so the runs above
+silence them with `-Wconf:cat=scala3-migration:s` (scala-rs does not implement
+that migration check and passes the sources straight through).
+
+### Where the time went: the first pass
+
+Four of the seven roots were quadratic in files times symbols.
+
+| change | CPU |
+| --- | --- |
+| baseline | 213.1 s |
+| parse the jar's central directory once, not per class lookup | 13.1 s |
+| a reverse index for `find_by_jvm` instead of a linear walk | 11.8 s |
+| borrow instead of cloning `Vec<Type>` in subtyping; cache `find_class` | 10.6 s |
+| stop erasure's all-symbol sweep at a fixpoint (184 passes → 2) | 5.5 s |
+| test before taking in uncurry's `flatten_one_method` | 4.4 s |
+| share `trait_members` / `pickles` through `Rc` | 3.1 s |
+| build the emitter's JVM-name index once; `mkdir` once per directory | 3.11 s |
+| borrow the names in the implicit-scope walk | 3.07 s |
+
+The first line was 94% of the whole problem: every single class lookup rebuilt
+the central directory of every jar on the classpath — around ten thousand
+entries, times two candidate names, times fourteen jars.
+
+### Where the time went: the second pass
+
+| change | CPU |
+| --- | --- |
+| mimalloc as the global allocator | −18% |
+| `rustc-hash` for the typer's internal maps and the constant pool | −6% |
+| `implicit_candidate_ty` returns `Cow<Type>` instead of a deep clone | −11% |
+| capacity hints and borrows in `Scope::entries` / `implicits_in_scope` | −7% |
+| write the class files on eight threads | −5% wall, no CPU change |
+
+Two things about this pass are worth keeping in mind.
+
+The profile said 42% of the time was in malloc and free. That was read as "the
+`Type` tree is cloned too much", and it was half wrong: most of it was macOS's
+own allocator, and swapping in mimalloc took the whole category from 42% to 8%.
+The clone that did matter was not the tree structure but one function deep-
+cloning a declaration for every implicit candidate it only wanted to read.
+
+The first pass had rejected a fast hasher because "changing `HashMap` iteration
+order is risky". That reasoning was wrong: `std`'s `RandomState` is seeded per
+process, so no output can ever have depended on a particular iteration order —
+if it did, the compiler would produce different results on consecutive runs. A
+fixed hasher only makes the order reproducible.
+
+Measured and discarded: thin LTO with `codegen-units=1` (within noise, and the
+build went from 14 s to 46 s), and a `Cow` fast path in `subst_tparams_slice`
+(the types on that path really do mention type parameters).
+
+### What is left
+
+From a profile of the current binary (`sample`, excluding threads parked in
+`__ulock_wait`):
+
+- **Writing the class files dominates**: `open` alone is around 45% of the
+  non-waiting samples, plus `close` and `write`. 2127 files is 2127 creates.
+  Lowering `PartialFunction` literals to `invokedynamic` would remove roughly
+  700 of them.
+- `Type::clone` and its drop glue are about 11%. The fix is interning — a
+  `TypeId` index, or `Rc` for shared subtrees — which reaches every part of the
+  compiler that touches a type.
+- `is_sub_type` re-walks the parent DAG on every question and is about 27% of
+  type checking.
+- The compile is single-threaded. Parsing is trivially parallel; the typer
+  shares a mutable symbol table and is not.
 
 ### How to reproduce
 
@@ -45,7 +110,7 @@ Compare `user` (CPU time) across commits. Even that moves by 20–30% through
 contention for memory bandwidth, so **always take the before and after
 measurements back to back** (under the same load).
 
-### What was slow
+### The first pass in detail
 
 Profiles were taken with macOS `sample` (`sample <pid> <seconds> -f out.txt`).
 Read the **call graph itself** (the tree at the top), not just the "Sort by top
@@ -96,17 +161,9 @@ call graph) is
 | ----------------------------------------------------- | ----- |
 | type checking                                         | 53%   |
 | code generation (`gen`)                               | 22%   |
-| writing class files (4552 × `open`/`write`/`close`)   | 11%   |
+| writing class files (one `open`/`write`/`close` each)  | 11%   |
 | erasure / uncurry / pickle                            | 9%    |
 
-and parsing is 0.05 s (1.5% of the total).
-
-### What is still there
-
-- **Hashing is about 6%.** `std`'s SipHash could be swapped for a fast hash on
-  internal keys, but that **changes `HashMap` iteration order**, so anywhere
-  output is built by walking a map in order, the contents of class files or the
-  order of diagnostics would change. Only worth doing together with that audit.
-- **Peak RSS is 1.4 GB** (184 files). It does not cost time, but it is a lot.
-- **Still single-threaded.** Type checking at 53% is hard because of the
-  dependencies; writing class files at 11% parallelises straightforwardly.
+and parsing is 0.05 s (1.5% of the total). That breakdown is from the
+first pass; the second pass and `invokedynamic` have since moved the balance
+towards writing files (see **What is left** above).
