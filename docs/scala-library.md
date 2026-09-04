@@ -465,6 +465,7 @@ in overriding`, which is polymorphic override checking, not lookup.
 | `tests/cats_measure.sh` | `files=339 skipped=1 errors=2929 files_with_errors=151 classes=0` | identical |
 | `tests/gitbucket_measure.sh` | `files=353 skipped=1 errors=1859 files_with_errors=186 classes=0` | identical |
 | `tests/scala_corpus.sh` (`CORPUS_SIZE=full`, `CORPUS_JOBS=6`) | `pos 977 · neg 640 · run 443` | identical, and the two per-test TSVs `diff` clean |
+| the same after merging `main` at `3b8d6be`, whose new `neg` scoring this predates | — | `pos 977 · neg 640 (T1 104 / T2 99 / T3 79) · run 443` |
 | `cargo test --workspace --release` | — | 149 × `test result: ok`, 1968 tests |
 
 `tests/slick_subset.sh` was not run: this slice touches no code generation
@@ -472,9 +473,16 @@ in overriding`, which is polymorphic override checking, not lookup.
 
 Both corpus columns were measured on this machine, the "before" one from the
 branch point. `run` is 443 there, not the 434 that was being quoted; the
-`corpus.tsv` files are identical test for test, which is the check worth
-running — a `run` total on its own moves with the per-test timeouts and with
-whatever else the machine is doing.
+`corpus.tsv` files are identical test for test — byte for byte, recorded
+diagnostic included — which is the check worth running: a `run` total on its
+own moves with the per-test timeouts and with whatever else the machine is
+doing.
+
+`main` moved to `3b8d6be` during the slice and was merged in. It changes no
+Rust — only `docs/scala-corpus.md` and the corpus runner, which now scores
+`neg` against the `.check` text as well — so the compiler numbers above carry
+over unchanged, and the corpus was re-run on the merged tree to have one in
+the new format.
 
 Which of the checks in `.agent-brief.md` this slice actually ran: both
 measurement scripts above (compile only, `classes=0` on cats/gitbucket is
