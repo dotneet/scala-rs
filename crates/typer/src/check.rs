@@ -20743,11 +20743,40 @@ impl Typer {
             }
             t
         };
+        // A type lambda may mention type parameters of whatever encloses it:
+        // `implicit def readerMonad[R]: Monad[({ type L[X] = Reader[R, X] })#L]`
+        // captures `R`. A `Type::TypeMember` is only a symbol, so a later
+        // substitution of `R` cannot reach inside the stored body -- the
+        // instance for `R = Int` would still read `Reader[R, X]`. Add every
+        // captured parameter as a *leading* parameter of the member and hand
+        // out the member already applied to them, so the projection is a
+        // partial application. Substitution then works on the arguments, which
+        // are ordinary types, and the arity the world sees is unchanged
+        // (`kind_arity` of a partial application subtracts what is applied).
+        let mut captured = Vec::new();
+        if !rhs.is_empty() {
+            let own = self.st.get(id).tparams.clone();
+            let mut free = Vec::new();
+            collect_tparams(&rhs_ty, &mut free);
+            captured = free.into_iter().filter(|t| !own.contains(t)).collect();
+            if !captured.is_empty() {
+                let all = captured.iter().copied().chain(own).collect();
+                self.st.get_mut(id).tparams = all;
+            }
+        }
         self.st.get_mut(id).ty = rhs_ty;
         self.st.pop_scope();
+        let member = if captured.is_empty() {
+            Type::TypeMember(id)
+        } else {
+            Type::Applied {
+                ctor: Box::new(Type::TypeMember(id)),
+                args: captured.into_iter().map(Type::TypeParam).collect(),
+            }
+        };
         Some(scala_rs_parser::RefineDecl::Type {
             name: name.clone(),
-            rhs: Some(Type::TypeMember(id)),
+            rhs: Some(member),
             tparams: tparams.len(),
             lo: lo_ty,
             hi: hi_ty,

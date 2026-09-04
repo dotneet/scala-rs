@@ -2267,6 +2267,17 @@ impl<'a> Unify<'a> {
         if let Some(r) = self.unify_higher_kinded(a, b, depth) {
             return r;
         }
+        // Two *type lambdas*, one of which still carries unknowns.
+        // `implicit def readerMonad[R]: Monad[({ type L[X] = Reader[R, X] })#L]`
+        // has to answer a wanted `Monad[({ type L[X] = Reader[Int, X] })#L]`.
+        // Neither side applies an unknown *constructor* -- both are aliases --
+        // so the case above does not fire, and structurally the two refinements
+        // are different symbols. Applying both to the same parameters turns the
+        // question into `Reader[R, X]` against `Reader[Int, X]`, which is what
+        // solves `R`.
+        if let Some((ea, eb)) = self.typer.st.eta_expand_pair(a, b) {
+            return self.unify_at(&ea, &eb, depth + 1);
+        }
         match (a, b) {
             (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) => {
                 if s1 == s2 && a1.len() == a2.len() {

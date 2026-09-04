@@ -1072,7 +1072,59 @@ impl SymbolTable {
         if tps.is_empty() || args.is_empty() {
             return ty.clone();
         }
-        subst_map(ty, tps, args)
+        let out = subst_map(ty, tps, args);
+        // Substituting a type *lambda* for a type constructor leaves the
+        // applications it lands in folded: `def twice[F[_]](fa: F[Int])` with
+        // `F = ({ type L[X] = Reader[Int, X] })#L` gives `L[Int]`, and
+        // `subst_map` is a free function that cannot reach the body. Reduce
+        // them here. The guard costs one match per argument and fails at once
+        // for every ordinary type.
+        if args.iter().any(|a| self.hk_alias(a).is_some()) {
+            return self.expand_hk_aliases(&out);
+        }
+        out
+    }
+
+    /// Beta-reduce every fully applied higher-kinded alias inside `ty`.
+    pub fn expand_hk_aliases(&self, ty: &Type) -> Type {
+        let go = |t: &Type| self.expand_hk_aliases(t);
+        match ty {
+            Type::Applied { ctor, args } => {
+                let applied = apply_type_ctor(go(ctor), args.iter().map(go).collect());
+                self.expand_applied_hk_alias(applied)
+            }
+            Type::Class { sym, args } => Type::Class {
+                sym: *sym,
+                args: args.iter().map(go).collect(),
+            },
+            Type::Tuple(ts) => Type::Tuple(ts.iter().map(go).collect()),
+            Type::Array(t) => Type::Array(Box::new(go(t))),
+            Type::ByName(t) => Type::ByName(Box::new(go(t))),
+            Type::Repeated(t) => Type::Repeated(Box::new(go(t))),
+            Type::Function { params, ret } => Type::Function {
+                params: params.iter().map(go).collect(),
+                ret: Box::new(go(ret)),
+            },
+            Type::Method { paramss, ret } => Type::Method {
+                paramss: paramss
+                    .iter()
+                    .map(|ps| ps.iter().map(go).collect())
+                    .collect(),
+                ret: Box::new(go(ret)),
+            },
+            Type::Annotated { tpe, annot } => Type::Annotated {
+                tpe: Box::new(go(tpe)),
+                annot: annot.clone(),
+            },
+            Type::Refined { parents, decls } => Type::Refined {
+                parents: parents.iter().map(go).collect(),
+                decls: decls
+                    .iter()
+                    .map(|d| expand_hk_refine_decl(self, d))
+                    .collect(),
+            },
+            other => other.clone(),
+        }
     }
 
     /// [`SymbolTable::subst_tparams`] without the copy when the substitution
@@ -1178,6 +1230,78 @@ impl SymbolTable {
             }
             _ => ty,
         }
+    }
+
+    /// The parameters and right-hand side of a higher-kinded *alias* type
+    /// member -- that is, a type lambda.
+    ///
+    /// `type L[a] = Either[String, a]` is one whether it is written as a named
+    /// alias or inside a refinement (`({ type L[a] = Either[String, a] })#L`).
+    /// An *abstract* higher-kinded member (`type F[_]`, whose stored type is
+    /// the placeholder `TypeMember(self)`) is not a lambda and answers `None`.
+    /// A lambda that captures an enclosing type parameter is handed out
+    /// partially applied (`refinement_type_member`), so `Applied` counts too;
+    /// the parameters still to come are the ones the arguments have not eaten.
+    fn hk_alias(&self, ty: &Type) -> Option<(&[SymbolId], &Type)> {
+        let (id, applied) = match ty {
+            Type::TypeMember(id) => (*id, 0),
+            Type::Applied { ctor, args } => match ctor.as_ref() {
+                Type::TypeMember(id) => (*id, args.len()),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let info = self.get(id);
+        if info.tparams.len() <= applied {
+            return None;
+        }
+        match &info.ty {
+            Type::NoType | Type::Error | Type::TypeMember(_) => None,
+            body => Some((&info.tparams[applied..], body)),
+        }
+    }
+
+    /// Apply two type constructors of the same arity to one set of parameters,
+    /// so that their bodies can be compared, when at least one of them is a
+    /// type lambda.
+    ///
+    /// nsc holds `({ type L[a] = Either[String, a] })#L`, a named
+    /// `type EitherL[a] = Either[String, a]`, and a second written copy of the
+    /// same refinement to be one type: it dealiases all of them to the same
+    /// lambda. Here every written refinement allocates its own `TypeMember`
+    /// symbol, so the symbols can never match and `dealias` will not unfold a
+    /// higher-kinded alias (its body is only meaningful once applied). Apply
+    /// both sides to one side's own parameters and compare the results.
+    ///
+    /// `None` -- meaning "the caller decides" -- unless both sides are things
+    /// eta-expansion actually says something about: a type lambda, or a class
+    /// constructor with arguments still to come (`Fun[List]` conforms to
+    /// `Fun[({ type L[a] = List[a] })#L]`). Abstract members and higher-kinded
+    /// type *parameters* are deliberately left to the arms below.
+    pub(crate) fn eta_expand_pair(&self, a: &Type, b: &Type) -> Option<(Type, Type)> {
+        let n = self.kind_arity(a);
+        if n == 0 || self.kind_arity(b) != n {
+            return None;
+        }
+        let eta_ok = |t: &Type| self.hk_alias(t).is_some() || matches!(t, Type::Class { .. });
+        if !eta_ok(a) || !eta_ok(b) {
+            return None;
+        }
+        let (params, _) = self.hk_alias(a).or_else(|| self.hk_alias(b))?;
+        if params.len() != n {
+            return None;
+        }
+        let args: Vec<Type> = params.iter().map(|p| Type::TypeParam(*p)).collect();
+        let ea = self.expand_applied_hk_alias(apply_type_ctor(a.clone(), args.clone()));
+        let eb = self.expand_applied_hk_alias(apply_type_ctor(b.clone(), args));
+        Some((ea, eb))
+    }
+
+    /// Conformance between two type constructors, decided on their bodies.
+    /// See [`SymbolTable::eta_expand_pair`].
+    fn hk_alias_sub_type(&self, a: &Type, b: &Type) -> Option<bool> {
+        let (ea, eb) = self.eta_expand_pair(a, b)?;
+        Some(self.is_sub_type(&ea, &eb))
     }
 
     /// `Class { sym: array_sym, args: [T] }` re-spelled as `Type::Array(T)`.
@@ -2030,6 +2154,13 @@ impl SymbolTable {
                 return self.is_sub_type(a, &d);
             }
         }
+        // A higher-kinded alias is a type lambda, and `dealias` deliberately
+        // leaves it folded because its body only means anything once applied.
+        // Two spellings of the same lambda therefore never compare equal by
+        // symbol, so compare the bodies instead. See `hk_alias_sub_type`.
+        if let Some(r) = self.hk_alias_sub_type(a, b) {
+            return r;
+        }
         // An abstract type on the *right* is at least its lower bound:
         // `def f[E, O >: E](x: E): O = x` is legal, and so is every
         // `ShapedValue[_ <: E, U]` where a `ShapedValue[_ <: O, U]` is wanted.
@@ -2520,11 +2651,102 @@ impl SymbolTable {
         jvm == format!("scala/Tuple{n}")
     }
 
+    /// One refinement declaration, with the symbol table to hand.
+    ///
+    /// `RefineDecl`'s own `Display` has no table, so every class in it prints
+    /// as `#4711` and a higher-kinded member's right-hand side as `tmem#5125`.
+    fn display_refine_decl(&self, d: &RefineDecl) -> String {
+        match d {
+            RefineDecl::Type {
+                name,
+                rhs,
+                tparams,
+                lo,
+                hi,
+            } => {
+                let mut s = format!("type {name}");
+                // The parameters of a higher-kinded member are the lambda's,
+                // and the right-hand side is the lambda itself; print the two
+                // together (`type L[a] = List[a]`) rather than a self-reference.
+                let lambda = rhs.as_ref().and_then(|t| self.hk_alias(t));
+                match lambda {
+                    Some((params, body)) => {
+                        let names: Vec<String> =
+                            params.iter().map(|p| self.get(*p).name.clone()).collect();
+                        s.push_str(&format!("[{}] = {}", names.join(", "), {
+                            let body = body.clone();
+                            self.display_type(&body)
+                        }));
+                        return s;
+                    }
+                    None => {
+                        if *tparams > 0 {
+                            s.push_str(&format!("[{}]", vec!["_"; *tparams].join(", ")));
+                        }
+                    }
+                }
+                if let Some(t) = lo {
+                    s.push_str(&format!(" >: {}", self.display_type(t)));
+                }
+                if let Some(t) = hi {
+                    s.push_str(&format!(" <: {}", self.display_type(t)));
+                }
+                if let Some(t) = rhs {
+                    s.push_str(&format!(" = {}", self.display_type(t)));
+                }
+                s
+            }
+            RefineDecl::Def { name, paramss, ret } => {
+                let mut s = format!("def {name}");
+                for ps in paramss {
+                    let ps: Vec<String> = ps.iter().map(|p| self.display_type(p)).collect();
+                    s.push_str(&format!("({})", ps.join(", ")));
+                }
+                s.push_str(&format!(": {}", self.display_type(ret)));
+                s
+            }
+            RefineDecl::Val { name, ty } => format!("val {name}: {}", self.display_type(ty)),
+        }
+    }
+
+    /// A type lambda, printed the way nsc prints one: `[a]Either[String, a]`.
+    ///
+    /// Only for a lambda written as a projection out of a refinement --
+    /// `refinement_type_member` allocates those with no owner, so the
+    /// alternative reading was the useless `<none>.L`. A *named* higher-kinded
+    /// alias keeps its name, as it does in nsc.
+    fn display_type_lambda(&self, ty: &Type) -> Option<String> {
+        let (id, applied): (SymbolId, &[Type]) = match ty {
+            Type::TypeMember(id) => (*id, &[]),
+            Type::Applied { ctor, args } => match ctor.as_ref() {
+                Type::TypeMember(id) => (*id, args),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if !self.get(id).owner.is_none() {
+            return None;
+        }
+        let (params, body) = self.hk_alias(ty)?;
+        let names: Vec<String> = params.iter().map(|p| self.get(*p).name.clone()).collect();
+        // The captured parameters are the leading ones; substitute what the
+        // partial application already fixed before printing the body.
+        let body = subst_tparams_slice(&self.get(id).tparams[..applied.len()], applied, body);
+        Some(format!(
+            "[{}]{}",
+            names.join(", "),
+            self.display_type(&body)
+        ))
+    }
+
     pub fn display_type(&self, ty: &Type) -> String {
         // The as-seen-from view of `A#B` prints as `B`: its decls are the
         // compiler's bookkeeping, not something the program wrote.
         if let Some(p) = Self::as_seen_from_view(ty) {
             return self.display_type(p);
+        }
+        if let Some(s) = self.display_type_lambda(ty) {
+            return s;
         }
         match ty {
             Type::Class { sym, args } => {
@@ -2599,7 +2821,7 @@ impl SymbolTable {
                     if i > 0 {
                         s.push_str("; ");
                     }
-                    s.push_str(&d.to_string());
+                    s.push_str(&self.display_refine_decl(d));
                 }
                 s.push_str(" }");
                 s
@@ -3307,6 +3529,27 @@ fn subst_refine_decl(
         RefineDecl::Val { name, ty } => RefineDecl::Val {
             name: name.clone(),
             ty: subst_map(ty, tps, args),
+        },
+    }
+}
+
+fn expand_hk_refine_decl(st: &SymbolTable, d: &RefineDecl) -> RefineDecl {
+    match d {
+        // The `rhs` of a higher-kinded member is the folded lambda itself
+        // (possibly partially applied to what it captured); reducing it here
+        // would throw its parameters away.
+        RefineDecl::Type { .. } => d.clone(),
+        RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
+            name: name.clone(),
+            paramss: paramss
+                .iter()
+                .map(|ps| ps.iter().map(|p| st.expand_hk_aliases(p)).collect())
+                .collect(),
+            ret: st.expand_hk_aliases(ret),
+        },
+        RefineDecl::Val { name, ty } => RefineDecl::Val {
+            name: name.clone(),
+            ty: st.expand_hk_aliases(ty),
         },
     }
 }
