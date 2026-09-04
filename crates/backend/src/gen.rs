@@ -53,6 +53,7 @@ pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpl
         out: Vec::new(),
         extras: RefCell::new(Vec::new()),
         lambda_n: Cell::new(0),
+        lambda_bodies: RefCell::new(Vec::new()),
         trait_impls: HashMap::new(),
         trait_vals: HashMap::new(),
         trait_inits: HashMap::new(),
@@ -87,6 +88,7 @@ pub fn emit_opts(
         out: Vec::new(),
         extras: RefCell::new(Vec::new()),
         lambda_n: Cell::new(0),
+        lambda_bodies: RefCell::new(Vec::new()),
         trait_impls: shared.impls,
         trait_vals: shared.vals,
         trait_inits: shared.inits,
@@ -102,6 +104,10 @@ pub fn emit_opts(
     g.collect_trait_impls(tree);
     g.walk(tree);
     g.emit_anon_classes(tree);
+    debug_assert!(
+        g.lambda_bodies.borrow().is_empty(),
+        "a hoisted lambda body was queued but never written to a classfile"
+    );
     g.out.append(&mut g.extras.borrow_mut());
     g.out
 }
@@ -112,6 +118,11 @@ struct Gen<'a> {
     out: Vec<EmittedClass>,
     extras: RefCell<Vec<EmittedClass>>,
     lambda_n: Cell<u32>,
+    /// Lambda bodies hoisted out of closures, waiting to be written as
+    /// static methods of the classfile currently under construction. A
+    /// nested class emitted mid-flight records its own watermark, so it
+    /// drains only what it queued (see [`Gen::drain_lambdas`]).
+    lambda_bodies: RefCell<Vec<PendingBody>>,
     /// Concrete trait methods, for `$class` static impls and mixin forwarders.
     trait_impls: HashMap<SymbolId, Vec<Tree>>,
     /// Trait `val` definitions with a right-hand side (`T$class.$init$`).
@@ -152,6 +163,31 @@ fn build_jvm_index(st: &SymbolTable) -> HashMap<String, SymbolId> {
     m
 }
 
+/// A lambda body hoisted out of an anonymous class and into a `private
+/// static` method of the class that lexically contains it — the shape nsc
+/// 2.13 emits, and the one `LambdaMetafactory` links an `invokedynamic` call
+/// site to. Queued while the enclosing method is being assembled (its
+/// `ClassBuilder` is borrowed by the `Assembler` at that moment) and drained
+/// by [`drain_lambda_bodies`] once the class's own methods are done.
+struct PendingBody {
+    /// Method name on the owning classfile, e.g. `$anonfun$7`.
+    name: String,
+    /// `(<outer?><captures…><args…>)Ljava/lang/Object;`
+    desc: String,
+    /// Whether parameter 0 is the enclosing instance.
+    has_outer: bool,
+    /// The enclosing class as the body sees it (`class_name` of the call
+    /// site, which for a trait's `$class` methods is the *interface*).
+    outer_class: String,
+    /// Symbol of the class the body is lexically inside.
+    class_sym: SymbolId,
+    vparams: Vec<Tree>,
+    body: Tree,
+    local_caps: Vec<SymbolId>,
+    /// Result type of the lambda, for the boxing the epilogue does.
+    ret_ty: Type,
+}
+
 struct EmitCtx<'a> {
     st: &'a SymbolTable,
     class_sym: SymbolId,
@@ -159,6 +195,13 @@ struct EmitCtx<'a> {
     ret_ty: Type,
     extras: &'a RefCell<Vec<EmittedClass>>,
     lambda_n: &'a Cell<u32>,
+    /// Lambda bodies waiting to become static methods of `hoist_owner`.
+    lambda_bodies: &'a RefCell<Vec<PendingBody>>,
+    /// Internal name of the classfile currently being built, when it can
+    /// take extra static methods. `None` for an interface (JVMS forbids the
+    /// flags nsc's `$anonfun$` methods carry there), which makes every
+    /// lambda in that context fall back to an anonymous class.
+    hoist_owner: Option<&'a str>,
     source: &'a str,
     /// If generating inside a lambda, field on the lambda class holding the outer `this`.
     outer: Option<(&'a str, &'a str, &'a str)>, // (lambda_class, field, outer_desc)
@@ -171,6 +214,10 @@ struct EmitCtx<'a> {
     /// parameter it arrived in, which is what nsc reads there too.
     /// `(slot, class we step into, static type on the stack)`.
     presuper_outer: Option<(u16, SymbolId, SymbolId)>,
+    /// Inside a hoisted lambda body the enclosing instance is an ordinary
+    /// parameter of a *static* method, not a field of a closure object:
+    /// `load_this` reads this local slot instead of `this.$outer`.
+    outer_slot: Option<u16>,
     library_abi: bool,
     /// Named JVM method being emitted; `NONE` inside lambdas.
     method_sym: SymbolId,
@@ -178,6 +225,7 @@ struct EmitCtx<'a> {
     boxed_vars: &'a HashSet<SymbolId>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_ctx<'a>(
     st: &'a SymbolTable,
     class_sym: SymbolId,
@@ -185,6 +233,8 @@ fn emit_ctx<'a>(
     ret_ty: Type,
     extras: &'a RefCell<Vec<EmittedClass>>,
     lambda_n: &'a Cell<u32>,
+    lambda_bodies: &'a RefCell<Vec<PendingBody>>,
+    hoist_owner: Option<&'a str>,
     source: &'a str,
     library_abi: bool,
     boxed_vars: &'a HashSet<SymbolId>,
@@ -196,9 +246,12 @@ fn emit_ctx<'a>(
         ret_ty,
         extras,
         lambda_n,
+        lambda_bodies,
+        hoist_owner,
         source,
         outer: None,
         presuper_outer: None,
+        outer_slot: None,
         library_abi,
         method_sym: SymbolId::NONE,
         boxed_vars,
@@ -2805,7 +2858,41 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// How many lambda bodies are already queued for an *outer* classfile.
+    /// A class emitted in the middle of another one (an anonymous class, a
+    /// trait's `$class`) must not steal its enclosing class's queue.
+    fn lambda_watermark(&self) -> usize {
+        self.lambda_bodies.borrow().len()
+    }
+
+    /// Write every lambda body queued since `base` as a static method of `b`.
+    /// Bodies emitted here can themselves contain lambdas, which land on the
+    /// same queue, so this runs until the queue is back down to `base`.
+    fn drain_lambdas(&self, b: &mut ClassBuilder, base: usize) {
+        loop {
+            let pb = {
+                let mut q = self.lambda_bodies.borrow_mut();
+                if q.len() <= base {
+                    break;
+                }
+                q.pop().expect("queue longer than watermark")
+            };
+            emit_lambda_body(
+                b,
+                self.st,
+                &self.extras,
+                &self.lambda_n,
+                &self.lambda_bodies,
+                self.source_name,
+                self.library_abi,
+                &self.boxed_vars,
+                pb,
+            );
+        }
+    }
+
     fn emit_class(&mut self, tree: &Tree, _module_names: &HashSet<String>) {
+        let lambda_wm = self.lambda_watermark();
         let (name, mods, vparamss, impl_) = match &tree.kind {
             TreeKind::ClassDef {
                 name,
@@ -2912,6 +2999,15 @@ impl<'a> Gen<'a> {
             self.out
                 .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
             self.emit_trait_impl_class(tree, &this_name);
+            // JVMS 4.6 forbids `ACC_FINAL` (and a body-less `ACC_STATIC`) on
+            // an interface method, so nothing may hoist a `$anonfun$` into
+            // one. The interface half of a trait emits no code at all, and
+            // `emit_trait_impl_class` drains what its own `$class` queued.
+            debug_assert_eq!(
+                self.lambda_watermark(),
+                lambda_wm,
+                "a lambda body was queued while emitting the interface {this_name}"
+            );
             return;
         }
 
@@ -3019,6 +3115,7 @@ impl<'a> Gen<'a> {
         self.emit_case_object_methods(&mut b, class_id);
         self.emit_value_class_methods(&mut b, class_id);
         self.emit_erasure_bridges(&mut b, class_id);
+        self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out
             .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
@@ -3335,6 +3432,8 @@ impl<'a> Gen<'a> {
         let st = self.st;
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
+        let lambda_bodies = &self.lambda_bodies;
+        let hoist_owner = b.this_name.clone();
         let source = self.source_name;
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
@@ -3352,6 +3451,8 @@ impl<'a> Gen<'a> {
                 Type::Unit,
                 extras,
                 lambda_n,
+                lambda_bodies,
+                Some(&hoist_owner),
                 source,
                 library_abi,
                 boxed_vars,
@@ -3488,6 +3589,8 @@ impl<'a> Gen<'a> {
         let max_locals = frame.next_slot.max(4);
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
+        let lambda_bodies = &self.lambda_bodies;
+        let hoist_owner = b.this_name.clone();
         let source = self.source_name;
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
@@ -3505,6 +3608,8 @@ impl<'a> Gen<'a> {
                 Type::Unit,
                 extras,
                 lambda_n,
+                lambda_bodies,
+                Some(&hoist_owner),
                 source,
                 library_abi,
                 boxed_vars,
@@ -3598,6 +3703,8 @@ impl<'a> Gen<'a> {
                 Type::Unit,
                 extras,
                 lambda_n,
+                lambda_bodies,
+                Some(&hoist_owner),
                 source,
                 library_abi,
                 boxed_vars,
@@ -3698,6 +3805,8 @@ impl<'a> Gen<'a> {
         let ret_for_body = ret.clone();
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
+        let lambda_bodies = &self.lambda_bodies;
+        let hoist_owner = b.this_name.clone();
         let source = self.source_name;
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
@@ -3717,6 +3826,8 @@ impl<'a> Gen<'a> {
                 ret_for_body.clone(),
                 extras,
                 lambda_n,
+                lambda_bodies,
+                Some(&hoist_owner),
                 source,
                 library_abi,
                 boxed_vars,
@@ -3776,6 +3887,8 @@ impl<'a> Gen<'a> {
         let ret_for_body = ret.clone();
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
+        let lambda_bodies = &self.lambda_bodies;
+        let hoist_owner = b.this_name.clone();
         let source = self.source_name;
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
@@ -3793,6 +3906,8 @@ impl<'a> Gen<'a> {
                     ret_for_body.clone(),
                     extras,
                     lambda_n,
+                    lambda_bodies,
+                    Some(&hoist_owner),
                     source,
                     library_abi,
                     boxed_vars,
@@ -3918,6 +4033,7 @@ impl<'a> Gen<'a> {
             return;
         }
         let impl_name = format!("{}$class", iface);
+        let lambda_wm = self.lambda_watermark();
         let mut b = ClassBuilder::new(impl_name, self.source_name);
         b.access = ACC_PUBLIC | ACC_SUPER | ACC_FINAL;
         for def in &methods {
@@ -3926,6 +4042,7 @@ impl<'a> Gen<'a> {
         if !inits.is_empty() {
             self.emit_trait_init(&mut b, class_id, iface, &inits);
         }
+        self.drain_lambdas(&mut b, lambda_wm);
         self.out.push(b.finish());
     }
 
@@ -3943,6 +4060,8 @@ impl<'a> Gen<'a> {
         let st = self.st;
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
+        let lambda_bodies = &self.lambda_bodies;
+        let hoist_owner = b.this_name.clone();
         let source = self.source_name;
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
@@ -3964,6 +4083,8 @@ impl<'a> Gen<'a> {
                     Type::Unit,
                     extras,
                     lambda_n,
+                    lambda_bodies,
+                    Some(&hoist_owner),
                     source,
                     library_abi,
                     boxed_vars,
@@ -4041,6 +4162,8 @@ impl<'a> Gen<'a> {
         let ret_for_body = ret.clone();
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
+        let lambda_bodies = &self.lambda_bodies;
+        let hoist_owner = b.this_name.clone();
         let source = self.source_name;
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
@@ -4066,6 +4189,8 @@ impl<'a> Gen<'a> {
                 ret_for_body.clone(),
                 extras,
                 lambda_n,
+                lambda_bodies,
+                Some(&hoist_owner),
                 source,
                 library_abi,
                 boxed_vars,
@@ -4985,6 +5110,8 @@ impl<'a> Gen<'a> {
             let max_locals = frame.next_slot.max(1);
             let extras = &self.extras;
             let lambda_n = &self.lambda_n;
+            let lambda_bodies = &self.lambda_bodies;
+            let hoist_owner = b.this_name.clone();
             let source = self.source_name;
             let library_abi = self.library_abi;
             let boxed_vars = &self.boxed_vars;
@@ -5003,6 +5130,8 @@ impl<'a> Gen<'a> {
                         ret_for_body.clone(),
                         extras,
                         lambda_n,
+                        lambda_bodies,
+                        Some(&hoist_owner),
                         source,
                         library_abi,
                         boxed_vars,
@@ -5134,6 +5263,8 @@ impl<'a> Gen<'a> {
             let st = self.st;
             let extras = &self.extras;
             let lambda_n = &self.lambda_n;
+            let lambda_bodies = &self.lambda_bodies;
+            let hoist_owner = b.this_name.clone();
             let source = self.source_name;
             let library_abi = self.library_abi;
             let boxed_vars = &self.boxed_vars;
@@ -5145,6 +5276,8 @@ impl<'a> Gen<'a> {
                     Type::Unit,
                     extras,
                     lambda_n,
+                    lambda_bodies,
+                    Some(&hoist_owner),
                     source,
                     library_abi,
                     boxed_vars,
@@ -5181,6 +5314,8 @@ impl<'a> Gen<'a> {
             let st = self.st;
             let extras = &self.extras;
             let lambda_n = &self.lambda_n;
+            let lambda_bodies = &self.lambda_bodies;
+            let hoist_owner = b.this_name.clone();
             let source = self.source_name;
             let library_abi = self.library_abi;
             let boxed_vars = &self.boxed_vars;
@@ -5211,6 +5346,8 @@ impl<'a> Gen<'a> {
                     ret_ty.clone(),
                     extras,
                     lambda_n,
+                    lambda_bodies,
+                    Some(&hoist_owner),
                     source,
                     library_abi,
                     boxed_vars,
@@ -5410,6 +5547,7 @@ impl<'a> Gen<'a> {
     }
 
     fn emit_module(&mut self, tree: &Tree, class_names: &HashSet<String>) {
+        let lambda_wm = self.lambda_watermark();
         let (name, mods, impl_) = match &tree.kind {
             TreeKind::ModuleDef { name, mods, impl_ } => (name, mods, impl_),
             _ => return,
@@ -5620,6 +5758,7 @@ impl<'a> Gen<'a> {
         // = Desc }`: a module overriding with a narrower result type needs the
         // same bridge a class gets, or the parent's signature stays abstract.
         self.emit_erasure_bridges(&mut b, cls);
+        self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, cls, &self.pickles);
         self.out
             .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
@@ -5671,6 +5810,8 @@ impl<'a> Gen<'a> {
         let inits: Vec<&Tree> = template_init_stats(body);
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
+        let lambda_bodies = &self.lambda_bodies;
+        let hoist_owner = b.this_name.clone();
         let source = self.source_name;
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
@@ -5713,6 +5854,8 @@ impl<'a> Gen<'a> {
                 Type::Unit,
                 extras,
                 lambda_n,
+                lambda_bodies,
+                Some(&hoist_owner),
                 source,
                 library_abi,
                 boxed_vars,
@@ -5742,6 +5885,8 @@ impl<'a> Gen<'a> {
                 Type::Unit,
                 extras,
                 lambda_n,
+                lambda_bodies,
+                Some(&hoist_owner),
                 source,
                 library_abi,
                 boxed_vars,
@@ -5826,6 +5971,7 @@ impl<'a> Gen<'a> {
     }
 
     fn emit_case_companion(&mut self, class_tree: &Tree) {
+        let lambda_wm = self.lambda_watermark();
         let class_id = class_tree.sym;
         let class_jvm = if class_id.is_none() {
             class_tree.name().unwrap_or("X").to_string()
@@ -5874,6 +6020,7 @@ impl<'a> Gen<'a> {
         if abs_fn.is_some() {
             emit_case_apply_bridge(&mut b, self.st, class_id);
         }
+        self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out
             .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
@@ -7278,7 +7425,9 @@ fn gen_literal(asm: &mut Assembler, lit: &Lit) {
 }
 
 fn load_this(asm: &mut Assembler, ctx: &EmitCtx) {
-    if let Some((lclass, field, desc)) = ctx.outer {
+    if let Some(slot) = ctx.outer_slot {
+        asm.aload(slot);
+    } else if let Some((lclass, field, desc)) = ctx.outer {
         asm.aload(0);
         asm.getfield(lclass, field, desc);
     } else {
@@ -15149,12 +15298,15 @@ fn pf_match_cases(body: &Tree) -> Option<&[scala_rs_parser::CaseDef]> {
     }
 }
 
-fn emit_partial_function_methods(
+#[allow(clippy::too_many_arguments)]
+fn emit_partial_function_methods<'a>(
     b: &mut ClassBuilder,
-    st: &SymbolTable,
-    extras: &RefCell<Vec<EmittedClass>>,
-    lambda_n: &Cell<u32>,
-    source: &str,
+    st: &'a SymbolTable,
+    extras: &'a RefCell<Vec<EmittedClass>>,
+    lambda_n: &'a Cell<u32>,
+    ctx_bodies: &'a RefCell<Vec<PendingBody>>,
+    ctx_hoist: Option<&'a str>,
+    source: &'a str,
     class_sym: SymbolId,
     library_abi: bool,
     orig_class: &str,
@@ -15214,9 +15366,12 @@ fn emit_partial_function_methods(
                         ret_ty: Type::Boolean,
                         extras,
                         lambda_n,
+                        lambda_bodies: ctx_bodies,
+                        hoist_owner: ctx_hoist,
                         source,
                         outer: outer_ref,
                         presuper_outer: None,
+                        outer_slot: None,
                         library_abi,
                         method_sym: SymbolId::NONE,
                         boxed_vars,
@@ -15271,9 +15426,12 @@ fn emit_partial_function_methods(
                             ret_ty: ret_ty.clone(),
                             extras,
                             lambda_n,
+                            lambda_bodies: ctx_bodies,
+                            hoist_owner: ctx_hoist,
                             source,
                             outer: outer_ref,
                             presuper_outer: None,
+                            outer_slot: None,
                             library_abi,
                             method_sym: SymbolId::NONE,
                             boxed_vars,
@@ -15350,6 +15508,217 @@ fn pf_bind_arg_and_captures(
     }
 }
 
+/// `scala.FunctionN` only goes up to 22; beyond that there is no functional
+/// interface for `LambdaMetafactory` to implement.
+const MAX_FUNCTION_ARITY: usize = 22;
+
+/// The erased descriptor of `scala.FunctionN.apply`: `(Object…)Object`.
+fn erased_apply_desc(arity: usize) -> String {
+    let mut d = String::from("(");
+    for _ in 0..arity {
+        d.push_str("Ljava/lang/Object;");
+    }
+    d.push_str(")Ljava/lang/Object;");
+    d
+}
+
+/// Emit a `FunctionN` literal as an `invokedynamic` bound to
+/// `LambdaMetafactory.metafactory`, and queue its body to become a static
+/// method of `owner`.
+///
+/// The call site's descriptor is `(<captured values>)L<FunctionN>;`, so the
+/// captures are the only thing pushed here; the JDK spins the closure class
+/// at link time and no classfile is written for it. The body method is
+/// written at the *erased* shape — every parameter and the result are
+/// `java/lang/Object` — which makes `samMethodType`, `instantiatedMethodType`
+/// and the implementation's own signature identical and leaves
+/// `LambdaMetafactory` nothing to adapt.
+#[allow(clippy::too_many_arguments)]
+fn gen_function_indy(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    owner: &str,
+    n: u32,
+    iface: &str,
+    arity: usize,
+    need_outer: bool,
+    local_caps: &[SymbolId],
+    vparams: &[Tree],
+    body: &Tree,
+    fn_ty: &Type,
+) {
+    let outer_desc = format!("L{};", ctx.class_name);
+    let mut call_desc = String::from("(");
+    if need_outer {
+        load_this(asm, ctx);
+        call_desc.push_str(&outer_desc);
+    }
+    for id in local_caps {
+        let (slot, sort) = frame.get(*id).expect("captured local has a slot");
+        let ty = ctx.st.get(*id).ty.clone();
+        if is_boxed_var(ctx, *id) {
+            // Capture the IntRef/ObjectRef itself, not the elem.
+            load(asm, slot, JvmSort::Ref);
+        } else {
+            load(asm, slot, sort);
+            if is_jvm_primitive(&ty) {
+                emit_box(asm, &ty);
+            }
+        }
+        call_desc.push_str("Ljava/lang/Object;");
+    }
+    call_desc.push_str(&format!(")L{iface};"));
+
+    let sam_desc = erased_apply_desc(arity);
+    let mut impl_desc = String::from("(");
+    if need_outer {
+        impl_desc.push_str(&outer_desc);
+    }
+    for _ in local_caps {
+        impl_desc.push_str("Ljava/lang/Object;");
+    }
+    for _ in 0..arity {
+        impl_desc.push_str("Ljava/lang/Object;");
+    }
+    impl_desc.push_str(")Ljava/lang/Object;");
+    let impl_name = format!("$anonfun${n}");
+    asm.invokedynamic_lambda(
+        "apply", &sam_desc, &call_desc, owner, &impl_name, &impl_desc,
+    );
+
+    ctx.lambda_bodies.borrow_mut().push(PendingBody {
+        name: impl_name,
+        desc: impl_desc,
+        has_outer: need_outer,
+        outer_class: ctx.class_name.to_string(),
+        class_sym: ctx.class_sym,
+        vparams: vparams.to_vec(),
+        body: body.clone(),
+        local_caps: local_caps.to_vec(),
+        ret_ty: match fn_ty {
+            Type::Function { ret, .. } => (**ret).clone(),
+            t => t.clone(),
+        },
+    });
+}
+
+/// Write one queued lambda body as a static method of `b`.
+#[allow(clippy::too_many_arguments)]
+fn emit_lambda_body(
+    b: &mut ClassBuilder,
+    st: &SymbolTable,
+    extras: &RefCell<Vec<EmittedClass>>,
+    lambda_n: &Cell<u32>,
+    lambda_bodies: &RefCell<Vec<PendingBody>>,
+    source: &str,
+    library_abi: bool,
+    boxed: &HashSet<SymbolId>,
+    pb: PendingBody,
+) {
+    // nsc's own `$anonfun$` methods are `public static final synthetic`;
+    // public matters because a lambda nested inside a closure class links its
+    // `invokedynamic` to a body method that lives on a *different* class.
+    let access = ACC_PUBLIC | ACC_STATIC | ACC_FINAL | ACC_SYNTHETIC;
+    let owner = b.this_name.clone();
+    let base = u16::from(pb.has_outer);
+    let n_caps = pb.local_caps.len() as u16;
+    let n_params = base + n_caps + pb.vparams.len() as u16;
+    let name = pb.name.clone();
+    let desc = pb.desc.clone();
+    b.add_code(access, &name, &desc, n_params + 8, move |a| {
+        let mut fr = Frame::instance();
+        fr.next_slot = n_params;
+        for (i, p) in pb.vparams.iter().enumerate() {
+            let obj_slot = base + n_caps + i as u16;
+            // A parameter instantiated at a value class receives the boxed
+            // instance; erasure recorded that on the symbol.
+            let ty = if p.sym.is_none() {
+                p.ty.clone()
+            } else {
+                st.get(p.sym).ty.clone()
+            };
+            a.aload(obj_slot);
+            unerase_lambda_param(a, st, &ty);
+            let sort = jvm_sort(&ty);
+            let slot = fr.alloc(p.sym, sort);
+            store(a, slot, sort);
+        }
+        for (i, id) in pb.local_caps.iter().enumerate() {
+            let ty = st.get(*id).ty.clone();
+            a.aload(base + i as u16);
+            if boxed.contains(id) {
+                a.checkcast(runtime_ref_class(&ty));
+                let slot = fr.alloc(*id, JvmSort::Ref);
+                store(a, slot, JvmSort::Ref);
+            } else {
+                emit_from_erased_object(a, st, &ty);
+                let sort = jvm_sort(&ty);
+                let slot = fr.alloc(*id, sort);
+                store(a, slot, sort);
+            }
+        }
+        let inner_ctx = EmitCtx {
+            st,
+            class_sym: pb.class_sym,
+            class_name: &pb.outer_class,
+            ret_ty: pb.ret_ty.clone(),
+            extras,
+            lambda_n,
+            lambda_bodies,
+            hoist_owner: Some(&owner),
+            source,
+            outer: None,
+            presuper_outer: None,
+            outer_slot: if pb.has_outer { Some(0) } else { None },
+            library_abi,
+            method_sym: SymbolId::NONE,
+            boxed_vars: boxed,
+        };
+        gen_expr(a, &mut fr, &inner_ctx, &pb.body);
+        if matches!(pb.body.ty, Type::Nothing) {
+            // `throw` already emitted athrow; an areturn here would be an
+            // unreachable StackMapTable target.
+        } else if is_unit_like(&pb.ret_ty) {
+            pop_if_value(a, &pb.body.ty);
+            emit_box(a, &Type::Unit);
+            a.areturn();
+        } else {
+            emit_box(a, &pb.ret_ty);
+            a.areturn();
+        }
+    });
+}
+
+/// Bring a lambda parameter back from the erased `Object` slot the SAM hands
+/// it in. Shared by the `invokedynamic` body and the anonymous-class `apply`.
+fn unerase_lambda_param(a: &mut Assembler, st: &SymbolTable, ty: &Type) {
+    if is_jvm_primitive(ty) || matches!(ty, Type::String) {
+        emit_unbox(a, ty);
+    } else if let Type::Array(elem) = ty {
+        // An `Array` parameter arrives in the erased `Object` slot, and
+        // `arraylength` / `aaload` / `aastore` all reject a plain `Object`:
+        // `g.map(_.length)` on an `Array[Array[Int]]` was a `VerifyError`
+        // ("Bad type on operand stack in arraylength") although the same
+        // expression outside a lambda was fine. nsc casts here too. An
+        // abstract element type erases to `Object` itself, and there
+        // `[Ljava/lang/Object;` would be the wrong cast (the value may be an
+        // `int[]`), so leave it alone.
+        if is_concrete_array_elem(elem) {
+            a.checkcast(&jvm_desc(st, ty));
+        }
+    } else if let Type::Class { sym, .. } = ty {
+        let n = class_internal(st, *sym);
+        if !n.is_empty() && n != "java/lang/Object" {
+            a.checkcast(&n);
+        }
+    } else if matches!(ty, Type::Tuple(_)) {
+        a.checkcast("scala/Tuple2");
+    } else {
+        emit_unbox(a, ty);
+    }
+}
+
 fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
     let (vparams, body) = match &tree.kind {
         TreeKind::Function { vparams, body } => (vparams, body),
@@ -15389,6 +15758,44 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
     }
     if tree_contains_return(body) {
         need_outer = true;
+    }
+
+    // nsc 2.13 lowers a plain `FunctionN` literal to an `invokedynamic`
+    // against `LambdaMetafactory` instead of a closure class; the body
+    // becomes a static method of the enclosing classfile. Everything else
+    // (a `PartialFunction`, a user-defined SAM type) still needs a real
+    // class, so those fall through to the anonymous-class path below.
+    if !is_pf && sam.is_none() && arity <= MAX_FUNCTION_ARITY {
+        if let Some(owner) = ctx.hoist_owner {
+            gen_function_indy(
+                asm,
+                frame,
+                ctx,
+                owner,
+                n,
+                &iface,
+                arity,
+                need_outer,
+                &local_caps,
+                vparams,
+                body,
+                &tree.ty,
+            );
+            return;
+        }
+    }
+
+    if std::env::var_os("SCALA_RS_LAMBDA_TRACE").is_some() {
+        let why = if is_pf {
+            "partial-function".to_string()
+        } else if let Some(s) = &sam {
+            format!("sam:{}", class_internal(ctx.st, s.class))
+        } else if ctx.hoist_owner.is_none() {
+            "no-hoist-owner".to_string()
+        } else {
+            "arity".to_string()
+        };
+        eprintln!("LAMBDA-FALLBACK {why}");
     }
 
     // Create instance: new, dup, load captures, invokespecial
@@ -15483,6 +15890,8 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
     let st = ctx.st;
     let extras = ctx.extras;
     let lambda_n = ctx.lambda_n;
+    let lambda_bodies = ctx.lambda_bodies;
+    let hoist_owner = ctx.hoist_owner;
     let source = ctx.source;
     let class_sym = ctx.class_sym;
     let library_abi = ctx.library_abi;
@@ -15585,9 +15994,12 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             ret_ty: ret_ty.clone(),
             extras,
             lambda_n,
+            lambda_bodies,
+            hoist_owner,
             source,
             outer: outer_ref,
             presuper_outer: None,
+            outer_slot: None,
             library_abi,
             method_sym: SymbolId::NONE,
             boxed_vars: boxed,
@@ -15623,6 +16035,8 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
             st,
             extras,
             lambda_n,
+            lambda_bodies,
+            hoist_owner,
             source,
             class_sym,
             library_abi,

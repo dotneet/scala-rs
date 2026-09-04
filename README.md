@@ -384,6 +384,101 @@ erasure は型引数を落とし、型パラメータと unbounded ワイルド�
 
 `Unit` が `V` になるのは**メソッドの戻り値だけ**です。パラメータ・フィールド・配列要素・型引数では nsc と同じく `scala/runtime/BoxedUnit` に erase し、値は `BoxedUnit.UNIT` シングルトンです（`Nothing` は同様に `scala/runtime/Nothing$`）。詳しくは「`Unit` の引数と `scala.runtime.BoxedUnit`」を参照してください。
 
+### ラムダの `invokedynamic` 化（`agent/indy`）
+
+素の `FunctionN` リテラルは、閉包クラスではなく **`invokedynamic`** で出します。nsc 2.13
+の `-Ydelambdafy:method` と同じ形です。
+
+```
+val f: Int => Int = x => x + 1
+```
+
+```
+// Main$.<init>
+invokedynamic #48, 0   // apply:()Lscala/Function1;
+putfield      Main$.f:Lscala/Function1;
+
+// Main$ の中に増える 1 メソッド（classfile は増えない）
+public static final synthetic java.lang.Object $anonfun$0(java.lang.Object);
+```
+
+クラスファイル側の実装は 3 か所です。
+
+- `crates/backend/src/classfile.rs`: 定数プールに `CONSTANT_MethodType`（JVMS 4.4.9）/
+  `CONSTANT_MethodHandle`（4.4.8）/ `CONSTANT_InvokeDynamic`（4.4.10）を書けるようにし、
+  `BootstrapMethods` 属性（4.7.23）を出す。ブートストラップの表は `Pool` が持つので、
+  メソッドをまたいで同じ表に積まれ、同じ内容は 1 エントリに畳まれる。
+- `crates/backend/src/code.rs`: `Assembler::invokedynamic_lambda`。
+- `crates/backend/src/gen.rs`: `gen_function_indy`（call site）と `emit_lambda_body`
+  （本体メソッド）。
+
+**ブートストラップは `LambdaMetafactory.metafactory`**（3 引数版）で、
+`samMethodType` と `instantiatedMethodType` は同じ `(Object…)Object` です。本体メソッドを
+**erase した形**（引数も結果も `java/lang/Object`、プリミティブの box / unbox は本体の中）
+で書いているので、`LambdaMetafactory` に適応させるものが何も残らず、ブリッジも要りません。
+
+> nsc は代わりに **`altMetafactory`** を使い、`FLAG_SERIALIZABLE`（`1`）を、
+> `instantiatedMethodType` が `samMethodType` と違うときは `FLAG_BRIDGES`（`4`）も渡し、
+> `scala/runtime/LambdaDeserialize` を bootstrap にした `$deserializeLambda$` を添えます。
+> さらにプリミティブ特殊化があるところでは `scala/runtime/java8/JFunction1$mcII$sp` の
+> ような特殊化インタフェースを指し、call site 名を `apply$mcII$sp` にします
+> （`javap -c -p -v` で確認済み）。scala-rs はどちらもしません。特殊化しないのは、
+> 呼び出し側も `apply(Object)Object` で呼んでいて一貫しているからです。
+> シリアライズ可能にしないのは、**合成クラスだった頃も `Serializable` ではなかった**ので
+> 退化ではなく、`LambdaDeserialize` が私有ランタイムに無いためです。
+
+**本体メソッドの置き場所。** call site を組み立てている時点では囲いの `ClassBuilder` は
+`Assembler` に貸し出されていて、そこにメソッドを足せません。そこで本体は
+`Gen::lambda_bodies` のキューに積み、クラスのメソッドを出し終えたところで
+`Gen::drain_lambdas` が静的メソッドとして書き出します。クラスの emit が入れ子になっても
+（無名クラス、trait の `$class`）取り違えないよう、**各 emitter は自分が積み始めた位置
+（watermark）より上だけ**を回収します。本体の中にさらにラムダがあれば同じキューに積まれる
+ので、キューが watermark に戻るまで回します。
+
+**`$anonfun$N` は `public`** です。`PartialFunction` の合成クラスの中にあるラムダは、
+その閉包クラスから **別のクラス**（囲いの実クラス）にある本体を指すためです。nsc の
+`$anonfun$` も同じ理由で public static final synthetic です。
+
+**囲いの `this`。** 合成クラスでは `$outer` フィールドでしたが、静的メソッドでは
+**第 0 引数**です。`EmitCtx::outer_slot` がそれを持ち、`load_this` が
+`getfield $outer` の代わりに `aload 0` を出します。ノンローカル `return`
+（`NonLocalReturnControl` の key）も同じ経路なのでそのまま動きます。
+
+**まだ合成クラスのままなもの**（意図的なフォールバック。混在で構いません）:
+
+| 形 | 理由 | nsc は |
+|---|---|---|
+| `PartialFunction` の `{ case … }` | 抽象メソッドが `isDefinedAt` / `applyOrElse` の 2 本で SAM ではない | 同じく classfile |
+| ユーザー定義 SAM 型（`trait Transform { def run(s: String): String }`） | まだ未対応 | `invokedynamic` |
+| 引数 23 個以上 | `scala.FunctionN` が 22 までしかない | 同じ |
+| interface の classfile の中（trait の抽象側） | JVMS 4.6 が interface メソッドの `ACC_FINAL` を禁じる。そもそもここはコードを出さない | — |
+
+どれに落ちたかは `SCALA_RS_LAMBDA_TRACE=1` で stderr に出ます
+（`LAMBDA-FALLBACK partial-function` / `sam:<内部名>` / `arity` / `no-hoist-owner`）。
+
+**効果**（slick 184 ファイル。同じマシン・同じ時間帯で、変更前のバイナリ（`main` の
+`crates/backend/src` から作り直したもの）と交互に測った値です）:
+
+| | 変更前 | 変更後 | nsc |
+|---|---|---|---|
+| classfile 総数 | 4552 | **2127**（−53%） | 1498 |
+| 出力サイズ | 22 MB | **13 MB** | — |
+| コンパイル時間 | 215.6 秒 | 214.5 秒 | — |
+| 全クラスのロード（`Class.forName(initialize=false)`、3 回の最小値） | 267 ms | **155 ms**（−42%） | — |
+
+コンパイル時間は**ほぼ変わりません**（差はノイズの範囲）。閉包クラス 1 個ぶんの
+定数プールとメソッド 3 本を書かなくなる代わりに、静的メソッド 1 本と
+ブートストラップ 1 エントリを書くので、書き出しの仕事はあまり減らないためです。
+減るのは**出力とロード**の側です。
+
+`errors=0 files_with_errors=0` と `tests/slick_subset.sh` の `verified=2127 failed=0` は
+変わりません。残る 716 個の閉包クラスのうち **707 個が `PartialFunction`**、9 個が
+ユーザー定義 SAM 型です（slick のソースに `{ case` は 728 か所あるので、重複して出して
+いるわけではありません）。
+
+fixture は `indy1`（両 ABI）/ `indy2`（library と実 scalac の byte 一致）/ `indy1_bad`、
+テストは `crates/cli/tests/indy.rs` です。
+
 ### メソッド型パラメータの推論（引数＋期待型）
 
 nsc の `instantiateExpecting` と同じく、メソッドの型パラメータは**引数と期待型の両方**を制約として解きます（`crates/typer/src/check.rs` の `add_expected_constraints`）。
@@ -4151,7 +4246,7 @@ SLS 5.1.2 の「後の親が勝つ」規則により `IterableOps` の不透明�
 - **trait**: 抽象メンバーだけの trait は JVM interface です。具象メンバーは `T$class` 静的実装と、C3 線形化順のインスタンスフォワーダです。Java 8 default method は使いません。`val` は getter/setter + `$init$` です。`abstract override` は `T$$super$m` です。
 - **名前付き引数**: 呼び出し側で `f(b = 2, a = 1)` を並べ替えます。巨大な rewrite フェーズはありません。メソッド・`apply`・`copy`・コンストラクタ・オーバーロードのある呼び出しのすべてで並べ替え、省略されたデフォルト引数はその場で埋めます（通常のメソッドは `{method}$default$n` ゲッター経由、コンストラクタは呼び出し側でデフォルト式を型付けします）。extractor パターンでも case class なら並べ替えます。パーサは `x = e` を一律に代入としてパースし、**引数位置のそれを名前付き引数として扱うのは typer** です（nsc と同じ作り）。
 - **try**: Code 属性に例外テーブルと StackMapTable を出します。
-- **ラムダ**: `FunctionN` を実装する合成クラス（`Main$$$anonfun$0` など）です。SAM 期待位置ではその Java インタフェース（`Runnable` / `Comparator` / `java.util.function.Function`）を実装します。`PartialFunction` 期待位置の `{ case }` は `scala/PartialFunction` を実装し、`isDefinedAt` / `apply` / `applyOrElse` を出します。invokedynamic / LambdaMetaFactory は使いません。囲いのメソッドのローカルは `$captured$n` フィールドに、**囲いの `this`** は nsc と同じ `$outer` フィールドに捕まえます。`this` が要るのは、明示的に書かれたとき（`this.f` / `super.f`）だけでなく、**囲いのクラスのメソッドを呼ぶだけ**（`xs.map(a => base(a))`）のときも同じです（`object` のメンバは `MODULE$` 経由なので要りません）。
+- **ラムダ**: 素の `FunctionN` リテラルは nsc 2.13 と同じく **`invokedynamic` + `LambdaMetafactory`** で、classfile は出しません。本体は囲いの classfile の `public static final synthetic $anonfun$N` になり、捕獲した値は call site の引数です。**`PartialFunction` 期待位置の `{ case }` と、ユーザー定義 SAM 型の期待位置は、いまも合成クラス**（`Main$$$anonfun$0` など）です。`PartialFunction` は抽象メソッドが 2 本なので SAM ではなく、nsc もここは classfile を出します。合成クラスに落ちる場合、囲いのメソッドのローカルは `$captured$n` フィールドに、**囲いの `this`** は nsc と同じ `$outer` フィールドに捕まえます。`this` が要るのは、明示的に書かれたとき（`this.f` / `super.f`）だけでなく、**囲いのクラスのメソッドを呼ぶだけ**（`xs.map(a => base(a))`）のときも同じです（`object` のメンバは `MODULE$` 経由なので要りません）。詳しくは「ラムダの `invokedynamic` 化」を参照してください。
 - **フェーズ**: nsc の mixin などの独立パスはありません。**uncurry**、**lambda-lift**（ネスト def）、erasure、ラムダのクロージャ変換はあります。
 - **sealed**: 非網羅 match は scalac と同様 warning です。`-Xfatal-warnings` でエラーになります。
 - **AnyVal**: scalac は値クラスのクラスファイルと拡張メソッドの両方を出します。scala-rs も同じで、`new C(x)` は underlying に消え、呼び出しは `$extension` 静的メソッドです。参照が要る位置（`Any` / universal trait / 型引数 / 配列要素）では nsc と同じく `new C(u)` で box し、`equals` / `hashCode` も underlying から合成します。違いは `$extension` の本体の置き場所で、nsc はコンパニオン `C$` に置いてクラス側をフォワーダにしますが、scala-rs はクラス側に直接出します。
@@ -12870,6 +12965,32 @@ mixin が**上限まで広げて**具体化する側（`MultiSupport`）と、**
 書けてしまい、`java` がクラスをロードするときに初めて
 `ClassFormatError: Illegal field name "/"` になるので、
 `-Xverify:all` で実際に走らせる 3 本が唯一の網です。
+
+### `agent/indy` スライスのテスト
+
+`crates/cli/tests/indy.rs`（8 本）。fixture は `tests/fixtures/indy1.scala`
+（私有ランタイムでも動く `Function0` / `Function1` だけ）、`tests/fixtures/indy2.scala`
+（`Function2` / `Function3`、`PartialFunction`、ユーザー定義 SAM、by-name、
+ノンローカル `return`、`Array` 引数）、`tests/fixtures/indy1_bad.scala` です。
+他のエージェントとの衝突を避けるため `e2e.rs` には入れていません。
+
+見ているのは**挙動**と**形**の 2 軸です。
+
+* 挙動: `indy1` を私有ランタイムと実 scala-library の両方で `java -Xverify:all` の
+  下に走らせ、`indy2` は実 scalac 2.13.16 の stdout と byte 一致することを見る。
+  `invokedynamic` は **`Class.forName(initialize=false)` では link されない**ので、
+  ブートストラップが壊れていても検証器は黙っています。**実際に走らせる**この 2 本が
+  唯一の網です。
+* 形: `indy1` は 10 個のラムダを持つのに閉包 classfile が **0 個**であること、
+  `Main$` と `Bump$class` に `$anonfun$` が乗っていること、`javap -v` に
+  `BootstrapMethods` と `REF_invokeStatic java/lang/invoke/LambdaMetafactory.metafactory`
+  が出ること、`indy2` は逆に **ちょうど 3 個**（`PartialFunction` 2 個 + SAM 1 個）
+  出ることを固定します。最後の 1 本は「まだ indy にしていない形」を明示的に
+  留めるためのもので、境界を動かすときは**この数を意図的に**動かしてください。
+
+`indy1_bad.scala` は 2 引数リテラルを `Int => Int` に入れる形です。codegen が
+link できない call site を組み立てる前に、typer が
+`type mismatch; found: (Int, Int) => Int` で止めることを見ます。
 
 ## ライセンス
 
