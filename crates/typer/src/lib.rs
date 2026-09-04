@@ -6,7 +6,7 @@ mod erasure;
 mod expand;
 mod expand_private;
 mod implicits;
-mod javaclass;
+pub mod javaclass;
 mod javasign;
 mod lambda_lift;
 mod lazy_local;

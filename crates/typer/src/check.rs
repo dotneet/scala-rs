@@ -5135,6 +5135,31 @@ impl Typer {
                         );
                     }
                 }
+                // `def this() = this("u0")` leaves the defaulted parameters
+                // out exactly as a `new` would, and the call has to reach
+                // codegen with the flat argument list the constructor's
+                // descriptor promises. Without this the emitted `<init>`
+                // pushed one argument for a five-parameter `invokespecial`:
+                // slick's `DriverDataSource`, whose `def this() = this(null)`
+                // stands in front of eight defaults, failed the verifier
+                // before its first line ran.
+                let ctor_fun = Tree {
+                    id: NodeId(0),
+                    span: tree.span,
+                    kind: TreeKind::Ident {
+                        name: "<init>".into(),
+                    },
+                    ty: self.st.get(sym).ty.clone(),
+                    sym,
+                    postfix: false,
+                };
+                let _ = self.fill_defaults_and_implicits(
+                    tree.span,
+                    args,
+                    &param_tys,
+                    &ctor_fun,
+                    &Type::NoType,
+                );
                 for (i, a) in args.iter_mut().enumerate() {
                     if let Some(p) = param_tys.get(i) {
                         if !p.is_no_type() {
@@ -6602,13 +6627,7 @@ impl Typer {
             }
             TreeKind::This { qual } => {
                 let q = qual.clone();
-                let id = if let Some(name) = q {
-                    self.st
-                        .enclosing_class_named(self.st.this_class, &name)
-                        .unwrap_or(self.st.this_class)
-                } else {
-                    self.st.this_class
-                };
+                let id = self.this_owner(q.as_deref());
                 if id.is_none() {
                     self.error(tree.span, "`this` is not allowed here");
                     tree.ty = Type::Error;
@@ -18285,6 +18304,22 @@ impl Typer {
                 }
             }
         }
+    }
+
+    /// The class a bare `this` denotes — the same rule as [`Self::super_owner`].
+    ///
+    /// A template's own constructor invocation is evaluated *outside* the
+    /// template: in `new C(this.x) { … }` the argument is part of the
+    /// enclosing expression, and nsc types it with the enclosing class as
+    /// `enclClass`. slick's
+    /// `new ClassLoader(this.getClass.getClassLoader) { … }` in
+    /// `object ClassLoaderUtil` came out reading `this` from the anonymous
+    /// class's own — still uninitialised — slot 0, which the verifier
+    /// rejects: "Type uninitializedThis is not assignable to
+    /// java/lang/Object". `class D extends Base(this.toString)` is the same
+    /// rule and is legal Scala too.
+    fn this_owner(&self, qual: Option<&str>) -> SymbolId {
+        self.super_owner(qual)
     }
 
     /// The class whose parents a bare `super` names. Normally the enclosing
