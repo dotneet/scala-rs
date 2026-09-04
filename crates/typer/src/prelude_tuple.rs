@@ -22,7 +22,14 @@ pub(crate) fn add_tuples(st: &mut SymbolTable, library_abi: bool) {
     if !library_abi {
         return;
     }
-    for n in 3..=MAX_TUPLE {
+    // `Tuple1` is missing for the same reason as 3 and up. Nothing in the
+    // surface syntax builds one -- `(x)` is a parenthesised expression, not a
+    // one-tuple -- but the *name* is writable, and cats-kernel's generated
+    // instances write it (`Eq[Tuple1[A0]]`, `Order[Tuple1[A0]]`, …).
+    // `tpt_to_type` turns `Tuple1[A0]` into the structural `Type::Tuple([A0])`
+    // like every other arity, and without the class behind it `class_sym_of`
+    // answered `None`: `value _1 is not a member of (A0)`.
+    for n in std::iter::once(1).chain(3..=MAX_TUPLE) {
         let name = format!("Tuple{n}");
         let jvm = format!("scala/Tuple{n}");
         let cls = class(st, st.scala_pkg, &name, &jvm, &[Type::AnyRef]);

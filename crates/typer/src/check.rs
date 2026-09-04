@@ -1151,6 +1151,18 @@ impl Typer {
     ///
     /// Bounds resolve after every parameter is in scope, so F-bounded
     /// `A <: Comparable[A]` sees `A`.
+    ///
+    /// A **higher-kinded** parameter writes its bound in terms of its own
+    /// parameters: `class PartialOrderFunctions[P[T] <: PartialOrder[T]]`.
+    /// `T` belongs to `P`, not to the class, so it is not in the class scope
+    /// this runs in from `type_class`; without putting it back, `PartialOrder[T]`
+    /// resolved to `Type::Named { name: "T" }` — a name standing for nothing.
+    /// `widen_type_param` then could not substitute `P[A]`'s argument into the
+    /// bound, and every call through such an `ev: P[A]` reported the bound's
+    /// own parameter back: `no matching overload for (T, T)Boolean with
+    /// arguments (A, A)`. The namer's provisional pass got this right (it runs
+    /// inside `enter_tparams`, where the inner parameters *are* in scope) and
+    /// this pass overwrote the good answer with the broken one.
     fn resolve_tparam_bounds(&mut self, tparams: &[Tree]) {
         for tp in tparams.iter() {
             let TreeKind::TypeDef { lo, hi, .. } = &tp.kind else {
@@ -1159,6 +1171,16 @@ impl Typer {
             let id = tp.sym;
             if id.is_none() {
                 continue;
+            }
+            let inner = self.st.get(id).tparams.clone();
+            if !inner.is_empty() {
+                self.st.push_scope();
+                for iid in &inner {
+                    let name = self.st.get(*iid).name.clone();
+                    if name != "_" {
+                        self.st.enter_in_current(&name, *iid);
+                    }
+                }
             }
             if let Some(t) = lo {
                 let ty = self.tree_to_type(t);
@@ -1171,6 +1193,9 @@ impl Typer {
                 if !ty.is_error() {
                     self.st.get_mut(id).bound_hi = Some(ty);
                 }
+            }
+            if !inner.is_empty() {
+                self.st.pop_scope();
             }
         }
     }
@@ -5138,14 +5163,15 @@ impl Typer {
                 other => other,
             }
         };
-        let fun_sym = alts[0];
-        let fun_ty = if alts.len() == 1 {
-            let ty = self.st.get(fun_sym).ty.clone();
+        // A constructor the signature pass has not typed yet still knows its
+        // parameter *symbols*, so read it from those rather than skipping it.
+        let alt_ty = |id: SymbolId| -> Type {
+            let ty = self.st.get(id).ty.clone();
             if ty.is_no_type() {
                 Type::Method {
                     paramss: vec![self
                         .st
-                        .get(fun_sym)
+                        .get(id)
                         .params
                         .iter()
                         .map(|p| self.st.get(*p).ty.clone())
@@ -5155,49 +5181,29 @@ impl Typer {
             } else {
                 flatten(ty)
             }
-        } else {
-            Type::Overload(
-                alts.iter()
-                    .map(|id| {
-                        let ty = self.st.get(*id).ty.clone();
-                        if ty.is_no_type() {
-                            Type::Method {
-                                paramss: vec![self
-                                    .st
-                                    .get(*id)
-                                    .params
-                                    .iter()
-                                    .map(|p| self.st.get(*p).ty.clone())
-                                    .collect()],
-                                ret: Box::new(Type::Unit),
-                            }
-                        } else {
-                            flatten(ty)
-                        }
-                    })
-                    .collect(),
-            )
         };
-        match self.resolve_overload(&fun_ty, fun_sym, arg_tys, &Type::NoType) {
+        let fun_sym = alts[0];
+        let alt_tys: Vec<Type> = alts.iter().map(|&id| alt_ty(id)).collect();
+        let fun_ty = if alts.len() == 1 {
+            alt_tys[0].clone()
+        } else {
+            Type::Overload(alt_tys.clone())
+        };
+        // `resolve_overload` re-reads a group of two or more alternatives off
+        // their symbols, where they are written in the *parent's* type
+        // parameters; the arguments are in the subclass's. `Eq0[SortedMapEq.V]`
+        // and `Hash0[SortedMapHash.V]` are different symbols, so nothing
+        // matched and cats-kernel's `extends SortedMapEq[K, V]()(V)` reported
+        // `no matching overload for constructor SortedMapEq` -- but only once
+        // the class had a second constructor, since with one alternative the
+        // clause `flatten` built at `targs` is used as is. Handing the
+        // instantiated alternatives over keeps both paths reading the same
+        // types, and makes what comes out of `pick_ctor_at` read at `targs`
+        // exactly once.
+        let at_targs: Vec<(SymbolId, Type)> = alts.iter().copied().zip(alt_tys).collect();
+        match self.resolve_overload_with(&fun_ty, fun_sym, arg_tys, &Type::NoType, Some(&at_targs))
+        {
             OverloadPick::Found(sym, _, _) if Some(sym) == skip => OverloadPick::None,
-            // With two or more alternatives `resolve_overload` re-reads them
-            // off their symbols, so the picked clause comes back in terms of
-            // the class's own type parameters and has to be instantiated here.
-            // With one it hands back the very clause `flatten` built, which is
-            // already at `targs`; substituting a second time is not a no-op
-            // when an argument *mentions* the parameter it replaces
-            // (`new Box[(T, T2), …]` inside `Box[T, U]` turned `T` into
-            // `((T, T2), T2)`), so the contract is: what comes out of
-            // `pick_ctor_at` is read at `targs`, exactly once.
-            OverloadPick::Found(sym, ps, ret) if !targs.is_empty() && alts.len() > 1 => {
-                OverloadPick::Found(
-                    sym,
-                    ps.iter()
-                        .map(|p| self.st.subst_tparams(class_id, targs, p))
-                        .collect(),
-                    self.st.subst_tparams(class_id, targs, &ret),
-                )
-            }
             other => other,
         }
     }
@@ -11663,6 +11669,9 @@ impl Typer {
         if self.try_rewrite_dynamic_apply(tree, pt) {
             return;
         }
+        if self.in_aux_ctor() {
+            flatten_curried_ctor_delegation(tree);
+        }
         let ctor_del = match &tree.kind {
             TreeKind::Apply { fun, .. } => self.in_aux_ctor() && is_this_or_super_callee(fun),
             _ => false,
@@ -16202,7 +16211,24 @@ impl Typer {
         fun_ty: &Type,
         fun_sym: SymbolId,
         arg_tys: &[Type],
+        pt: &Type,
+    ) -> OverloadPick {
+        self.resolve_overload_with(fun_ty, fun_sym, arg_tys, pt, None)
+    }
+
+    /// [`Self::resolve_overload`], with the alternatives' types supplied by the
+    /// caller rather than looked up in `overload_member_types`.
+    ///
+    /// A constructor group is read at the type arguments the parent is applied
+    /// at (`extends SortedMapEq[K, V]()(V)`), and only `pick_ctor_at` knows
+    /// what those are.
+    fn resolve_overload_with(
+        &self,
+        fun_ty: &Type,
+        fun_sym: SymbolId,
+        arg_tys: &[Type],
         _pt: &Type,
+        supplied: Option<&Vec<(SymbolId, Type)>>,
     ) -> OverloadPick {
         let mut cands: Vec<(SymbolId, Vec<Type>, Type)> = Vec::new();
         // Which parameter clause these candidates come from: `f(a)(b = 1)`
@@ -16263,7 +16289,8 @@ impl Typer {
                     // owner's type parameters; the selection already worked
                     // out what each alternative looks like at this receiver,
                     // and that is what specificity has to compare.
-                    let instantiated = self.overload_member_types.get(&fun_sym.0);
+                    let instantiated =
+                        supplied.or_else(|| self.overload_member_types.get(&fun_sym.0));
                     for m in methods {
                         let ty = instantiated
                             .and_then(|g| g.iter().find(|(s, _)| *s == m).map(|(_, t)| t))
@@ -17799,7 +17826,16 @@ impl Typer {
         // nsc: `{ case (a, b) => … }` where a `FunctionN` is expected takes N
         // parameters and matches the N-tuple of them, not one parameter.
         if is_case_block_literal(vparams, body) {
-            if let Some(n) = expected_function_arity(pt) {
+            // A SAM is expanded the same way: cats-kernel's
+            // `implicit def catsStdEqForTry[A](…): Eq[Try[A]] = { case
+            // (Success(a), Success(b)) => … }` is a two-parameter literal
+            // matching the pair, because `Eq`'s single abstract method takes
+            // two. Reading only `FunctionN` here left the one parameter the
+            // parser wrote with no type: `missing parameter type for expanded
+            // function`.
+            let arity = expected_function_arity(pt)
+                .or_else(|| self.st.sam_sig(pt).map(|s| s.param_tys.len()));
+            if let Some(n) = arity {
                 if n > 1 {
                     self.expand_case_block_to_arity(vparams, body, n);
                 }
@@ -21765,12 +21801,19 @@ impl Typer {
         // the pickled `toSeq` it calls returns `Seq`, so `invokevirtual
         // List.length` on that value is a `VerifyError` where `invokeinterface
         // Seq.length` was fine. So the *classfile* is asked first, and the
-        // pickle only when it declares an arity none of the candidates has:
-        // `TreeMap.collect(PartialFunction, Ordering)` against `MapOps
-        // .collect(PartialFunction)`. Reading a classfile is cheap next to
+        // pickle only when it declares a *signature* none of the candidates
+        // has: `TreeMap.collect(PartialFunction, Ordering)` against `MapOps
+        // .collect(PartialFunction)`, and `FiniteDuration.min(FiniteDuration)`
+        // against `Duration.min(Duration)`. Comparing arity alone missed the
+        // second shape, and comparing return types as well would re-admit the
+        // covariant override this is guarding against, so only the erased
+        // *parameters* are compared. Reading a classfile is cheap next to
         // completing every inherited selection from the pickle.
-        let have: Vec<usize> = found.iter().map(|&m| self.value_param_count(m)).collect();
-        if !self.declares_other_arity(cls, name, &have) {
+        let have: Vec<Vec<Option<String>>> = found
+            .iter()
+            .map(|&m| crate::pickle_supply::flat_erased_params(&self.st, &self.st.get(m).ty))
+            .collect();
+        if !self.declares_other_signature(cls, name, &have) {
             return;
         }
         if self.supply_from_pickle_class(cls, name).is_empty() {
@@ -21783,8 +21826,16 @@ impl Typer {
     }
 
     /// Whether `cls`'s own classfile declares an instance method `name` whose
-    /// parameter count is not among `have`.
-    fn declares_other_arity(&mut self, cls: SymbolId, name: &str, have: &[usize]) -> bool {
+    /// erased parameter list matches none of the candidates in `have`.
+    ///
+    /// A candidate parameter whose erasure this cannot name is a wildcard, so
+    /// an unreadable candidate never *adds* a reason to go to the pickle.
+    fn declares_other_signature(
+        &mut self,
+        cls: SymbolId,
+        name: &str,
+        have: &[Vec<Option<String>>],
+    ) -> bool {
         let internal = self.st.get(cls).jvm_name.clone();
         if internal.is_empty() || !internal.starts_with("scala/") {
             return false;
@@ -21797,9 +21848,24 @@ impl Typer {
             return false;
         };
         jc.methods.iter().any(|m| {
-            m.name == enc
-                && !crate::javaclass::is_java_static(m.access)
-                && crate::pickle_supply::desc_arity(&m.desc).is_some_and(|n| !have.contains(&n))
+            if m.name != enc || crate::javaclass::is_java_static(m.access) {
+                return false;
+            }
+            // A bridge is the compiler's own copy of an inherited signature,
+            // never a new alternative.
+            if crate::javaclass::is_java_bridge(m.access) {
+                return false;
+            }
+            let Some(got) = crate::pickle_supply::desc_params(&m.desc) else {
+                return false;
+            };
+            !have.iter().any(|want| {
+                want.len() == got.len()
+                    && want
+                        .iter()
+                        .zip(&got)
+                        .all(|(w, g)| w.as_ref().is_none_or(|w| w == g))
+            })
         })
     }
 
@@ -24080,6 +24146,53 @@ fn is_this_or_super_callee(fun: &Tree) -> bool {
         TreeKind::Ident { name } if name == "this" || name == "super" => true,
         _ => false,
     }
+}
+
+/// `this(a)(b)` inside an auxiliary constructor is *one* call.
+///
+/// A JVM constructor takes a single flat argument list, which is why
+/// `extends A(1)(2)` (`type_parent_ctor_app_in`) and `new A(1)(2)`
+/// (`flatten_curried_new`) are flattened too. Left nested, the outer list was
+/// applied to the `Unit` that `this()` produces, so cats-kernel's
+/// `def this(V: Hash[V], O: Order[K], K: Hash[K]) = this()(V, K)` reported
+/// three unrelated errors at once: the implicit clause of `this()` could not
+/// be filled, `value apply is not a member of Unit`, and -- because the
+/// delegation test only looks one `Apply` deep -- `auxiliary constructor must
+/// start with a call to this(...)`. nsc types a class whose only clause is
+/// implicit as `()(implicit …)`, which is why `this()(V, K)` is written that
+/// way in the first place.
+fn flatten_curried_ctor_delegation(tree: &mut Tree) {
+    let mut depth = 0usize;
+    let mut cur: &Tree = tree;
+    while let TreeKind::Apply { fun, .. } = &cur.kind {
+        depth += 1;
+        if is_this_or_super_callee(fun) {
+            break;
+        }
+        cur = fun;
+    }
+    let head_is_delegation =
+        matches!(&cur.kind, TreeKind::Apply { fun, .. } if is_this_or_super_callee(fun));
+    if depth < 2 || !head_is_delegation {
+        return;
+    }
+    // The outermost `Apply`'s id and span are what the call is reported and
+    // recognised by, so the flattened node keeps them.
+    let (id, span) = (tree.id, tree.span);
+    let mut argss: Vec<Vec<Tree>> = Vec::new();
+    let mut head = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+    while let TreeKind::Apply { fun, args } = head.kind {
+        argss.push(args);
+        head = *fun;
+    }
+    argss.reverse();
+    let mut out = Tree::dummy(TreeKind::Apply {
+        fun: Box::new(head),
+        args: argss.into_iter().flatten().collect(),
+    });
+    out.id = id;
+    out.span = span;
+    *tree = out;
 }
 
 fn is_ctor_delegation_apply(t: &Tree) -> Option<bool> {
