@@ -6,6 +6,7 @@ use crate::classfile::{
     ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
 };
 use crate::code::{Assembler, Label, StackEntry};
+use crate::ifacebridge::{BinaryParents, BridgeKind};
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{Intrinsic, SeqPayload, SymKind, SymbolTable};
 use std::cell::{Cell, RefCell};
@@ -33,6 +34,10 @@ pub struct EmitOpts {
     /// function of `st`, which does not change while a run is emitted, so the
     /// driver builds it once; `None` builds it here.
     pub jvm_index: Option<Rc<HashMap<String, SymbolId>>>,
+    /// Class files of the run's `-cp` / `--scala-library`, for the bridges a
+    /// class needs against members it only inherits (see [`crate::ifacebridge`]).
+    /// `None` skips that pass, which is what the private-runtime ABI wants.
+    pub binary_parents: Option<Rc<BinaryParents>>,
 }
 
 /// Walk a typed compilation unit and emit classes (private-runtime ABI).
@@ -183,6 +188,7 @@ pub fn emit_opts(
         jvm_index: opts
             .jvm_index
             .unwrap_or_else(|| Rc::new(build_jvm_index(st))),
+        binary_parents: opts.binary_parents,
     };
     g.walk(tree);
     g.emit_anon_classes(tree);
@@ -225,6 +231,9 @@ struct Gen<'a> {
     /// JVM internal name → class-like symbol, for the whole symbol table.
     /// Built once; used to compute `InnerClasses`/`EnclosingMethod`.
     jvm_index: Rc<HashMap<String, SymbolId>>,
+    /// Class files behind the run's binary parents (see
+    /// [`Gen::emit_binary_parent_bridges`]).
+    binary_parents: Option<Rc<BinaryParents>>,
 }
 
 /// JVM internal name → class-like symbol, for every `Class`/`ModuleClass` in
@@ -3141,6 +3150,7 @@ impl<'a> Gen<'a> {
         self.emit_value_class_methods(&mut b, class_id);
         self.emit_erasure_bridges(&mut b, class_id);
         self.emit_inherited_covariant_bridges(&mut b, class_id);
+        self.emit_binary_parent_bridges(&mut b, class_id);
         self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         self.out
@@ -4634,14 +4644,26 @@ impl<'a> Gen<'a> {
         if class_id.is_none() {
             return;
         }
-        let mut defined = HashSet::new();
+        // Keyed by name *and erased parameter list*: a trait may declare
+        // several overloads of one name and every one of them needs its own
+        // forwarder. slick's `JdbcBackend` has three `makeDatabase`s, and
+        // `JdbcBackend$` used to get a forwarder for whichever came first --
+        // `JdbcDatabaseConfig.makeDatabase` then threw `AbstractMethodError`.
+        // The return type is deliberately *not* part of the key: a class that
+        // narrows an inherited member covariantly still overrides it, and the
+        // bridge for the wide descriptor is `emit_erasure_bridges`' business,
+        // not a forwarder to the trait's own body.
+        let mut defined: HashSet<(String, String)> = HashSet::new();
         for stt in body {
             if let TreeKind::DefDef { name, .. } = &stt.kind {
-                defined.insert(name.clone());
+                defined.insert((
+                    encode_method_name(name),
+                    desc_params(&def_method_desc(self.st, stt)).to_string(),
+                ));
             }
         }
         for m in &b.methods {
-            defined.insert(m.name.clone());
+            defined.insert((m.name.clone(), desc_params(&m.desc).to_string()));
         }
         let lin = linearize(self.st, class_id);
         let mut chosen: Vec<(String, String, Tree)> = Vec::new();
@@ -4661,18 +4683,27 @@ impl<'a> Gen<'a> {
                 // it -- and its name must not shadow a same-named *public*
                 // method a farther trait in the linearization does need one
                 // for.
-                if name.is_empty() || is_trait_private_def(self.st, m) || !seen.insert(name.clone())
-                {
+                if name.is_empty() || is_trait_private_def(self.st, m) {
+                    continue;
+                }
+                let key = (
+                    encode_method_name(&name),
+                    desc_params(&def_method_desc(self.st, m)).to_string(),
+                );
+                if !seen.insert(key) {
                     continue;
                 }
                 chosen.push((name, iface.clone(), m.clone()));
             }
         }
         for (name, iface, def) in chosen {
-            if defined.contains(&name) {
+            let inst_desc = def_method_desc(self.st, &def);
+            if defined.contains(&(
+                encode_method_name(&name),
+                desc_params(&inst_desc).to_string(),
+            )) {
                 continue;
             }
-            let inst_desc = def_method_desc(self.st, &def);
             let static_desc = trait_static_desc(&iface, &inst_desc);
             let ret = method_ret_ty(&def);
             let pts = def_param_types(self.st, &def);
@@ -4702,7 +4733,8 @@ impl<'a> Gen<'a> {
         }
         self.emit_trait_capture_accessors(b, class_id, &lin);
         if !self.library_abi {
-            self.emit_ordered_forwarders(b, class_id, &defined);
+            let by_name: HashSet<String> = defined.iter().map(|(n, _)| n.clone()).collect();
+            self.emit_ordered_forwarders(b, class_id, &by_name);
         }
     }
 
@@ -5099,6 +5131,90 @@ impl<'a> Gen<'a> {
                     },
                 );
             }
+        }
+    }
+
+    /// Bridges for members inherited from parents that live on the classpath.
+    ///
+    /// `emit_inherited_covariant_bridges` bridges *to a method this class
+    /// implements*, and reads the parents out of the symbol table. Neither
+    /// holds for the scala-library collections: nothing in slick names
+    /// `iterableFactory`, so the symbol table has never heard of it, and the
+    /// anonymous `immutable.IndexedSeq` implements nothing but `apply` and
+    /// `length`. The member set therefore has to come from the parents' class
+    /// files, and the bridge forwards to a *default method*. See
+    /// [`crate::ifacebridge`] for what goes wrong without it.
+    fn emit_binary_parent_bridges(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        let Some(bp) = self.binary_parents.clone() else {
+            return;
+        };
+        if b.access & ACC_INTERFACE != 0 {
+            return;
+        }
+        // Seed the walk with the whole linearization, not just the class
+        // file's direct parents: a trait compiled in this same run is not on
+        // the binary path, and stopping there would hide the library
+        // ancestors above it.
+        let mut roots: Vec<String> = Vec::new();
+        if b.super_name != "java/lang/Object" {
+            roots.push(b.super_name.clone());
+        }
+        roots.extend(b.interfaces.iter().cloned());
+        if !class_id.is_none() {
+            for p in linearize(self.st, class_id).into_iter().skip(1) {
+                roots.push(class_internal(self.st, p));
+            }
+        }
+        let have: HashSet<(String, String)> = b
+            .methods
+            .iter()
+            .map(|m| (m.name.clone(), m.desc.clone()))
+            .collect();
+        let class_name = b.this_name.clone();
+        for br in bp.bridges(&roots, &have) {
+            let Some(cut) = br.desc.find(')') else {
+                continue;
+            };
+            let ret = br.desc[cut + 1..].to_string();
+            let mut loads: Vec<(u16, JvmSort)> = Vec::new();
+            let mut locals = 1u16;
+            for t in desc_param_sorts(&br.desc[..=cut]) {
+                loads.push((locals, t));
+                locals += t.slots();
+            }
+            let cn = class_name.clone();
+            let name = br.name.clone();
+            let kind = br.kind.clone();
+            // A covariant bridge is `ACC_BRIDGE`; a mixin forwarder that is
+            // the only implementation the class has is an ordinary method, as
+            // nsc emits it.
+            let access = match kind {
+                BridgeKind::Narrow(_) => ACC_PUBLIC | ACC_BRIDGE | ACC_SYNTHETIC,
+                BridgeKind::Static { .. } => ACC_PUBLIC,
+            };
+            b.add_code(access, &br.name, &br.desc, locals.max(1), move |asm| {
+                match &kind {
+                    BridgeKind::Narrow(target) => {
+                        asm.aload(0);
+                        for (slot, sort) in &loads {
+                            load(asm, *slot, *sort);
+                        }
+                        asm.invokevirtual(&cn, &name, target);
+                    }
+                    BridgeKind::Static {
+                        iface,
+                        helper,
+                        desc,
+                    } => {
+                        asm.aload(0);
+                        for (slot, sort) in &loads {
+                            load(asm, *slot, *sort);
+                        }
+                        asm.invokestatic_interface(iface, helper, desc);
+                    }
+                }
+                ret_of_sort(asm, ret_str_sort(&ret));
+            });
         }
     }
 
@@ -6105,6 +6221,7 @@ impl<'a> Gen<'a> {
                 self.emit_value_extension_forwarders(&mut b, vc.sym, &impl_.body);
             }
         }
+        self.emit_binary_parent_bridges(&mut b, cls);
         self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, cls, &self.pickles);
         self.out
@@ -7764,6 +7881,15 @@ fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &
         TreeKind::This { qual } => {
             if let Some(name) = qual {
                 load_qualified_this(asm, ctx, name);
+            } else if !tree.sym.is_none() && tree.sym != ctx.class_sym {
+                // A bare `this` that denotes a class *around* the one being
+                // emitted. It gets here from a template's own constructor
+                // invocation, which is evaluated outside the template
+                // (`new C(this.x) { … }` — the argument belongs to the
+                // enclosing expression), so slot 0 holds the still
+                // uninitialised new instance and not the `this` that was
+                // written.
+                load_enclosing_this(asm, ctx, tree.sym);
             } else {
                 load_this(asm, ctx);
             }
@@ -7959,6 +8085,35 @@ fn load_this(asm: &mut Assembler, ctx: &EmitCtx) {
     asm.aload(0);
 }
 
+/// A bare `this` that denotes `target`, a class the one being emitted is
+/// lexically inside.
+///
+/// An `object`'s single instance is reachable without one; otherwise walk the
+/// `$outer` chain, which in the pre-super part of an `<init>` starts from the
+/// constructor's own `$outer` argument rather than from a `getfield` the
+/// verifier would reject. Outside that region `load_this` is already right —
+/// `ctx.outer` / `ctx.outer_slot` say how a lambda or a `$class` static gets
+/// at its instance — so leave those alone.
+fn load_enclosing_this(asm: &mut Assembler, ctx: &EmitCtx, target: SymbolId) {
+    if is_module_class(ctx.st, target) {
+        load_module_instance(asm, ctx, target);
+        return;
+    }
+    if ctx.presuper_outer.is_none() {
+        load_this(asm, ctx);
+        return;
+    }
+    let (mut cur, _) = start_outer_walk(asm, ctx, true);
+    while !cur.is_none() && cur != target {
+        let Some(outer) = enclosing_instance(ctx.st, cur) else {
+            break;
+        };
+        let f = outer_field_class(ctx.st, cur).unwrap_or(outer);
+        load_outer_of(asm, ctx.st, cur, f);
+        cur = outer;
+    }
+}
+
 fn load_qualified_this(asm: &mut Assembler, ctx: &EmitCtx, name: &str) {
     let target = ctx
         .st
@@ -8097,22 +8252,30 @@ fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree)
         SymKind::Class => {
             // Java classes have no companion MODULE$. Scala `Foo.bar` still
             // loads `Foo$` when a companion exists.
-            if ctx.st.get(id).flags.contains(Flags::JAVA) || ctx.st.companion_module(id).is_none() {
-                return;
-            }
-            // A companion of a class nested in a class is itself an inner
-            // `object`, reached through the enclosing instance's accessor.
-            if let Some(c) = ctx
+            //
+            // The `JAVA` flag alone does not settle it: a class stubbed by
+            // `find_or_stub_java_class` before its class file was read keeps
+            // the flag for the rest of the run even when the class file says
+            // Scala. `cats.effect.IO` is one, and `IO.blocking(…)` came out
+            // with no receiver at all — `Operand stack underflow` in slick's
+            // `slick.cats.Database$`. What does settle it is the companion's
+            // own JVM name: only a Scala companion is this class's `Foo$`.
+            let want = format!("{}$", class_internal(ctx.st, id));
+            let Some(comp) = ctx
                 .st
                 .companion_module(id)
                 .map(|m| module_class_id(ctx.st, m))
-                .filter(|c| member_module_outer(ctx.st, *c).is_some())
-            {
-                load_module_instance(asm, ctx, c);
+                .filter(|c| class_internal(ctx.st, *c) == want)
+            else {
+                return;
+            };
+            // A companion of a class nested in a class is itself an inner
+            // `object`, reached through the enclosing instance's accessor.
+            if member_module_outer(ctx.st, comp).is_some() {
+                load_module_instance(asm, ctx, comp);
                 return;
             }
-            let jvm = format!("{}$", class_internal(ctx.st, id));
-            asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+            asm.getstatic(&want, "MODULE$", &format!("L{want};"));
         }
         SymKind::Method => {
             let owner = ctx.st.get(id).owner;
@@ -19734,6 +19897,28 @@ fn emit_class_constant(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
 /// Whether the typer widened this member's access for companion use.
 /// The JVM sorts of a method descriptor's parameters, given `desc` starting at
 /// `(` (anything after the matching `)` is ignored).
+/// The parameter part of a method descriptor, parentheses included.
+fn desc_params(desc: &str) -> &str {
+    match desc.find(')') {
+        Some(i) => &desc[..=i],
+        None => desc,
+    }
+}
+
+/// The [`JvmSort`] of a return descriptor (`V`, `I`, `Ljava/lang/String;`, …).
+/// Sort of a return type written on its own, without the `(params)` prefix
+/// that `desc_ret_sort` expects.
+fn ret_str_sort(ret: &str) -> JvmSort {
+    match ret.as_bytes().first() {
+        Some(b'V') => JvmSort::Void,
+        Some(b'J') => JvmSort::Long,
+        Some(b'D') => JvmSort::Double,
+        Some(b'F') => JvmSort::Float,
+        Some(b'Z' | b'B' | b'S' | b'C' | b'I') => JvmSort::Int,
+        _ => JvmSort::Ref,
+    }
+}
+
 fn desc_param_sorts(desc: &str) -> Vec<JvmSort> {
     let mut out = Vec::new();
     let b = desc.as_bytes();

@@ -295,6 +295,16 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
     // Same story: a pure function of the (now frozen) symbol table, and it was
     // rebuilt from scratch for each of the run's units.
     let jvm_index = std::rc::Rc::new(scala_rs_backend::gen::build_jvm_index(st));
+    // The class files behind `-cp` / `--scala-library`, read lazily and shared
+    // by every unit: a class needs bridges for the erased overloads its
+    // *binary* parents declare, and only the class files know what those are.
+    // Without the jar there is nothing to read, so the private-runtime ABI
+    // skips the pass.
+    let binary_parents = opts.scala_library.as_ref().map(|j| {
+        let mut p = opts.class_path.clone();
+        p.push(j.clone());
+        std::rc::Rc::new(scala_rs_backend::BinaryParents::new(p))
+    });
 
     // Emit unit by unit and hand each unit's classes to the writer pool as soon
     // as they exist, instead of writing all of them after the last unit. The
@@ -317,6 +327,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                     pickles: std::rc::Rc::clone(&u.pickles),
                     trait_members: Some(std::rc::Rc::clone(&trait_members)),
                     jvm_index: Some(std::rc::Rc::clone(&jvm_index)),
+                    binary_parents: binary_parents.clone(),
                 },
             ));
         }

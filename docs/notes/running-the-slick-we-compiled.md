@@ -210,3 +210,172 @@ Putting the scala-rs build on the client programs' compile classpath makes real
 scalac read scala-rs's `ScalaSignature`. It stops at
 `value api is not a member of object H2Profile`, so the pickle is not complete
 enough for scalac to compile a cake this deep against it. Unaddressed.
+
+# The bridges (`agent/ifacebridge`)
+
+## What the `ClassCastException` really was, and what it was not
+
+The mechanism above is right, with one correction that matters for the fix:
+**nsc's mixin forwarders are `invokestatic` on the interface's `m$` helper,
+not `invokespecial` on the most specific super-interface.**
+
+```
+public scala.collection.SeqFactory<immutable.IndexedSeq> iterableFactory();
+  0: aload_0
+  1: invokestatic  InterfaceMethod immutable/IndexedSeq.iterableFactory$:(…)Lscala/collection/SeqFactory;
+
+public scala.collection.IterableFactory iterableFactory();        // the bridge
+  0: aload_0
+  1: invokevirtual Method iterableFactory:()Lscala/collection/SeqFactory;
+```
+
+`invokespecial` would not even be legal for most of them: it requires a
+*direct* super-interface, and the interface that implements the member usually
+is not one.
+
+Two more corrections to the earlier note:
+
+* nsc emits **about 250** forwarders on `ConstArray$$anon$5`, not thirty.
+  `-Xmixin-force-forwarders` defaults to on, so *every* concrete member
+  inherited from a trait gets one, whether or not anything depends on it.
+* The `ClassCastException` was not the whole of it. On the same anonymous
+  class `filter` threw `AbstractMethodError` on
+  `fromSpecific(IterableOnce)Object`, and `toString` printed
+  `slick.util.ConstArray$$anon$630@281e3708`.
+
+## What this slice emits
+
+`crates/backend/src/ifacebridge.rs` reads the *class files* of a class's
+super-types — the symbol table cannot help, because nothing in slick ever names
+`iterableFactory` — and emits the narrow subset of nsc's forwarders that
+changes behaviour. The other ~240 are pure indirection the JVM's own
+default-method resolution already gets right.
+
+1. **Erased overloads.** A `(name, parameter list)` declared with two different
+   erased return types along the super-type chain gets the wide spelling on the
+   class, forwarding to the narrow one with `invokevirtual` on itself. The
+   narrow one is the declaration whose owner is a sub-type of every other
+   owner; an ambiguity (two unrelated interfaces) is left alone.
+2. **`toString` / `hashCode` / `equals`.** A method inherited from the
+   superclass beats an interface default (JVMS 5.4.3.3), and `java.lang.Object`
+   is above every class, so a trait's implementation of these three never ran.
+   The forwarder is nsc's: `invokestatic <iface>.toString$`.
+
+On `ConstArray$$anon$630` that is eight bridges plus `toString`, against nsc's
+250, and the probe below now matches nsc byte for byte:
+
+| `ConstArray.from(List(1,2,3,4)).toSeq` | nsc | before | after |
+|---|---|---|---|
+| `iterableFactory.getClass` | `IndexedSeq$` | `IndexedSeq$` | `IndexedSeq$` |
+| `groupBy(_ % 2)(0).getClass` | `Vector1` | `$colon$colon` | `Vector1` |
+| `map(_ + 1).getClass` | `Vector1` | `$colon$colon` | `Vector1` |
+| `filter(_ > 2).getClass` | `Vector1` | `AbstractMethodError` | `Vector1` |
+| `take(2).getClass` | `Vector1` | — | `Vector1` |
+| `toString` | `IndexedSeq(1, 2, 3, 4)` | `…$$anon$630@281e…` | `IndexedSeq(1, 2, 3, 4)` |
+
+The regression test is `crates/cli/tests/ifacebridge.rs`. It cannot use
+`scala.collection`: scala-rs does not accept `new immutable.IndexedSeq[T] { … }`
+outside a run that also reads the collections from their class files (see
+"Still open" below). It builds a stand-in library with real scalac instead
+(`tests/fixtures/ifacebridge_lib.scala`), which has the identical class-file
+shape — a covariant override with no bridge on the interface, plus a trait
+`toString` / `hashCode` / `equals`.
+
+## Four more run-time defects, found by walking the harness forward
+
+Removing the blocker moved `tests/slick_run.sh` four failures deeper. Each of
+these was already on `main`; the first two are why the harness no longer
+reached `ExpandTables` at all.
+
+1. **`this` in a template's own constructor invocation.** The arguments of
+   `new C(this.x) { … }` belong to the *enclosing* expression, so `this` there
+   is the enclosing template's `this` — nsc types it with the enclosing class
+   as `enclClass`, the same rule `super` already followed here
+   (`Checker::super_owner`). scala-rs bound it to the anonymous class's own
+   slot 0, which is still uninitialised at that point:
+
+   ```text
+   VerifyError: Bad type on operand stack
+     Location: slick/util/ClassLoaderUtil$$anon$619.<init>()V @2: invokevirtual
+     Reason: Type uninitializedThis is not assignable to 'java/lang/Object'
+   ```
+
+   from `new ClassLoader(this.getClass.getClassLoader) { … }` in
+   `object ClassLoaderUtil` — the first line of every one of the twelve
+   programs. The backend needed the other half: an enclosing `object` is
+   reached as its singleton, and an enclosing class through the constructor's
+   own `$outer` argument (a `getfield` on `uninitializedThis` is what JVMS
+   4.10.1.9 forbids, which is why `ctx.presuper_outer` exists).
+
+2. **A `def this()` that leaves defaulted parameters out.** `type_ctor_delegation`
+   resolved the constructor but never filled the defaults in, so the emitted
+   `<init>` pushed one argument for a five-parameter `invokespecial`. slick's
+   `DriverDataSource` has `def this() = this(null)` in front of eight defaults.
+
+3. **Overloaded concrete trait methods got one mixin forwarder between them.**
+   `emit_mixin_forwarders` deduplicated by name. slick's `JdbcBackend` declares
+   three `makeDatabase`s and `JdbcBackend$` got a forwarder for whichever came
+   first, so `makeDatabase(JdbcDatabaseConfig, Async)` was an
+   `AbstractMethodError`. The key is now the name *and the erased parameter
+   list* — deliberately not the return type, because a class that narrows an
+   inherited member covariantly does override it and the wide descriptor is
+   `emit_erasure_bridges`' business.
+
+4. **A `Foo.bar` whose class was stubbed before its class file was read.**
+   `gen_ident`'s `SymKind::Class` arm used `Flags::JAVA` to decide whether a
+   companion `MODULE$` exists, and `find_or_stub_java_class` allocates every
+   stub with that flag — `apply_java_class_meta` only ever *adds* flags, so a
+   Scala class stubbed first keeps it for the whole run. `cats.effect.IO` is
+   one: `IO.blocking(…)` came out with no receiver at all
+   (`Operand stack underflow` in `slick.cats.Database$.$anonfun$1`). The test
+   is now the companion's own JVM name — only a Scala companion is this class's
+   `Foo$` — which leaves a real Java class alone. Clearing `Flags::JAVA` in
+   `apply_java_class_meta` instead does fix it, and it also makes
+   `member_module_outer` treat `cats.effect.kernel.Ref$Make$` as an *inner*
+   object needing an enclosing instance, which it is not: that flag is load
+   bearing there.
+
+## Where it stops now
+
+```
+ClassCastException / VerifyError: Bad type on operand stack
+  Location: slick/cats/Database$$anon$265.$anonfun$3 @11: checkcast
+  Reason: Type integer is not assignable to 'java/lang/Object'
+```
+
+`fs2.Stream.fromIterator[IO](it, chunkSize = 1)`.
+`fs2.Stream.PartiallyAppliedFromIterator` is a **value class**, so
+`fs2/Stream$.fromIterator` really does have the descriptor `()Z`, and nsc
+compiles the application as
+
+```
+getstatic     fs2/Stream$PartiallyAppliedFromIterator$.MODULE$
+getstatic     fs2/Stream$.MODULE$
+invokevirtual fs2/Stream$.fromIterator:()Z
+…
+invokevirtual fs2/Stream$PartiallyAppliedFromIterator$.apply$extension:(ZLscala/collection/Iterator;ILcats/effect/kernel/Sync;)Lfs2/Stream;
+```
+
+scala-rs emits `checkcast fs2/Stream$PartiallyAppliedFromIterator` on the
+boolean and then `invokevirtual …PartiallyAppliedFromIterator.apply`.
+`note_source_value_classes` only sees value classes declared in the run;
+one that arrives from `-cp` is not recognised at all. That is the next slice.
+
+## Still open, found on the way
+
+* **`extends` a scala-library collection trait does not compile on its own.**
+  `class C extends scala.collection.immutable.IndexedSeq[Int]` (and
+  `immutable.Seq`) is `no matching overload for constructor Seq`:
+  `inherited_superclass` walks the base type sequence and finds
+  `scala/collection/Seq` as a *class*, because that symbol is a
+  `find_or_stub_java_class` stub — `Flags::JAVA`, no `INTERFACE` — that nothing
+  ever completed from its class file. Inside the full slick run the same
+  parents are read properly and the source compiles, which is why slick's
+  `ConstArray.toSeq` was never affected.
+* **A `-cp` Scala class and its companion object can end up as one symbol.**
+  With `sealed abstract class Api[+A]` and `object Api extends ApiPlatform` in
+  a scalac-built library on `-cp`, `Api.direct` and `Api.blocking(s)` are
+  emitted as `invokevirtual ifb/Api.direct` / `ifb/Api.blocking` with **no
+  receiver**: the object's inherited members are attributed to the class.
+  Both spellings of the fix in item 4 above leave this one alone, and it is a
+  different defect from `cats.effect.IO`'s (whose companion link was intact).
