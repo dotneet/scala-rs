@@ -3625,3 +3625,157 @@ fn fixtures_exptype_arrayvar_bad_is_error() {
         "type mismatch; found: Array[Int]  required: Array[Any]",
     );
 }
+
+/// Separate compilation of the three shapes whose classfiles we used not to
+/// write at all: a package object's mirror class, a value class's companion,
+/// and an operator-named nested object.
+///
+/// `mcls_main.scala` is compiled against `mcls_lib.scala`'s **classfiles**,
+/// never alongside its source, so a member that only exists inside one run
+/// fails here.
+#[test]
+fn separate_compilation_package_object_value_class_and_operator_name() {
+    if !java_available() {
+        return;
+    }
+    let out_lib = tmp_dir("mcls-lib");
+    let out_main = tmp_dir("mcls-main");
+    let jar = scala_library_jar();
+    let compile = |src: PathBuf, out: &Path, cp: Option<&Path>| {
+        let mut cmd = Command::new(bin());
+        cmd.args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+        ]);
+        match &jar {
+            Some(j) => {
+                cmd.args(["--scala-library", j.to_str().unwrap()]);
+            }
+            None => {
+                cmd.arg("--no-scala-library");
+            }
+        }
+        if let Some(p) = cp {
+            cmd.args(["-cp", p.to_str().unwrap()]);
+        }
+        cmd.status().expect("scala-rs compile")
+    };
+    assert!(compile(fixtures_dir().join("mcls_lib.scala"), &out_lib, None).success());
+    // The exact set scalac 2.13.16 writes for this source.
+    for f in [
+        // A package object is two classfiles; the *mirror* is where nsc puts
+        // the pickle, and without it a consumer sees no member at all.
+        "mcls/util/package$.class",
+        "mcls/util/package.class",
+        // A value class's `$extension` methods are declared on its companion.
+        "mcls/Meters$.class",
+        "mcls/Wrap$.class",
+        // Operator characters are `NameTransformer`-encoded in a class name
+        // too: not `Codes$:@$.class`.
+        "mcls/Codes$$colon$at$.class",
+    ] {
+        assert!(
+            out_lib.join(f).is_file(),
+            "{f} missing in {}",
+            out_lib.display()
+        );
+    }
+    assert!(compile(
+        fixtures_dir().join("mcls_main.scala"),
+        &out_main,
+        Some(&out_lib)
+    )
+    .success());
+    let mut cp = format!("{}:{}", out_main.display(), out_lib.display());
+    if let Some(j) = &jar {
+        cp = format!("{}:{}", cp, j.display());
+    }
+    let output = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        output.status.success(),
+        "java Main failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("mcls_main")
+    );
+    let _ = fs::remove_dir_all(&out_lib);
+    let _ = fs::remove_dir_all(&out_main);
+}
+
+/// The same library, with **real scalac** as the consumer -- the only check
+/// that our pickle says what nsc needs rather than only what we read back.
+///
+/// Every one of these failed before: the package object's members were
+/// invisible (`object twice is not a member of package mcls.util`), and the
+/// value class crashed scalac's own erasure phase with `AssertionError: no
+/// extension method found` and then, once the companion existed, with
+/// `unexpected type representation ... <notype>` until the parameter accessor
+/// carried `PARAMACCESSOR`.
+#[test]
+fn scalac_uses_our_package_object_and_value_class() {
+    let Some(scalac) = find_scalac() else {
+        eprintln!("scalac 2.13 not obtainable; skipping (documented in README)");
+        return;
+    };
+    let (Some(jar), true) = (scala_library_jar(), java_available()) else {
+        return;
+    };
+    let out_lib = tmp_dir("mcls-scalac-lib");
+    let out_main = tmp_dir("mcls-scalac-main");
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            fixtures_dir().join("mcls_lib.scala").to_str().unwrap(),
+            "-d",
+            out_lib.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .status()
+        .expect("scala-rs compile mcls_lib");
+    assert!(status.success());
+    let out = Command::new(&scalac)
+        .args([
+            "-d",
+            out_main.to_str().unwrap(),
+            "-classpath",
+            out_lib.to_str().unwrap(),
+            fixtures_dir().join("mcls_main.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "scalac could not compile against our classfiles:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        out_main.display(),
+        out_lib.display(),
+        jar.display()
+    );
+    let run = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        run.status.success(),
+        "java Main (scalac-compiled) failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        expected_stdout("mcls_main")
+    );
+    let _ = fs::remove_dir_all(&out_lib);
+    let _ = fs::remove_dir_all(&out_main);
+}
