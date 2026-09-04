@@ -167,6 +167,7 @@ impl Pass<'_> {
             ty: call_ty,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
     }
 }

@@ -104,6 +104,7 @@ impl Typer {
             ty: from.clone(),
             sym: pid,
             postfix: false,
+            scala_ref: false,
         };
         let param = Tree {
             id: NodeId(0),
@@ -117,6 +118,7 @@ impl Typer {
             ty: from.clone(),
             sym: pid,
             postfix: false,
+            scala_ref: false,
         };
         Tree {
             id: NodeId(0),
@@ -131,6 +133,7 @@ impl Typer {
             },
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         }
     }
 }

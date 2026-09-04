@@ -3560,13 +3560,16 @@ impl<'a> Parser<'a> {
         if es.len() == 1 {
             es.pop().unwrap()
         } else {
-            // TupleN.apply
-            let fun = self.alloc(
+            // TupleN.apply. nsc's `gen.mkTuple` builds a fully qualified
+            // `scala.TupleN` tree, so the name is never looked up; `scala_ref`
+            // says the same here.
+            let mut fun = self.alloc(
                 lo,
                 TreeKind::Ident {
                     name: format!("Tuple{}", es.len()),
                 },
             );
+            fun.scala_ref = true;
             self.alloc(
                 lo.merge(self.prev_span()),
                 TreeKind::Apply {
@@ -4079,12 +4082,15 @@ impl<'a> Parser<'a> {
                 if ps.len() == 1 {
                     ps.pop().unwrap()
                 } else {
-                    let fun = self.alloc(
+                    // Same as the expression form above: `case (a, b) =>` is
+                    // `scala.Tuple2(a, b)` however the name is bound here.
+                    let mut fun = self.alloc(
                         lo,
                         TreeKind::Ident {
                             name: format!("Tuple{}", ps.len()),
                         },
                     );
+                    fun.scala_ref = true;
                     self.alloc(
                         lo.merge(self.prev_span()),
                         TreeKind::Apply {
@@ -5293,6 +5299,7 @@ fn desugar_for(
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         }
     }
     /// A generator pattern that always matches: a variable, `_`, or a tuple of
@@ -5551,6 +5558,7 @@ fn dummy_ident_from(pat: &Tree) -> Tree {
         ty: Type::NoType,
         sym: SymbolId::NONE,
         postfix: false,
+        scala_ref: false,
     }
 }
 

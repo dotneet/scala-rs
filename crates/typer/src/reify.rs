@@ -1290,6 +1290,7 @@ impl<'a> Reifier<'a> {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         }
     }
 

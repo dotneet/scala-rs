@@ -4048,6 +4048,7 @@ impl Typer {
                 ty: declared.clone(),
                 sym: SymbolId::NONE,
                 postfix: false,
+                scala_ref: false,
             };
             self.type_expr(rhs, &declared);
             tree.ty = declared;
@@ -4858,6 +4859,7 @@ impl Typer {
                         ty: Type::NoType,
                         sym: SymbolId::NONE,
                         postfix: false,
+                        scala_ref: false,
                     };
                     self.type_parent_ctor_app(tree);
                     return;
@@ -5002,6 +5004,7 @@ impl Typer {
             ty: ctor_ty,
             sym: ctor,
             postfix: false,
+            scala_ref: false,
         };
         let saved = std::mem::replace(&mut self.parent_ctor_scope, true);
         let _ = self.fill_defaults_and_implicits(span, args, &param_tys, &ctor_fun, &Type::NoType);
@@ -5540,6 +5543,7 @@ impl Typer {
                     ty: self.st.get(sym).ty.clone(),
                     sym,
                     postfix: false,
+                    scala_ref: false,
                 };
                 let _ = self.fill_defaults_and_implicits(
                     tree.span,
@@ -7417,6 +7421,7 @@ impl Typer {
                         ty: Type::NoType,
                         sym: SymbolId::NONE,
                         postfix: false,
+                        scala_ref: false,
                     };
                     tree.kind = TreeKind::Apply {
                         fun: Box::new(update),
@@ -7446,6 +7451,7 @@ impl Typer {
                         ty: Type::NoType,
                         sym: SymbolId::NONE,
                         postfix: false,
+                        scala_ref: false,
                     };
                     tree.kind = TreeKind::Apply {
                         fun: Box::new(setter),
@@ -7472,6 +7478,7 @@ impl Typer {
                         ty: Type::NoType,
                         sym: SymbolId::NONE,
                         postfix: false,
+                        scala_ref: false,
                     };
                     tree.kind = TreeKind::Apply {
                         fun: Box::new(setter),
@@ -7694,6 +7701,7 @@ impl Typer {
                             ty: Type::NoType,
                             sym: SymbolId::NONE,
                             postfix: false,
+                            scala_ref: false,
                         };
                         self.type_apply(tree, pt);
                         return;
@@ -8299,6 +8307,31 @@ impl Typer {
             return;
         }
         self.expose_unqualified(&name, tree.span);
+        // A `TupleN` the parser made up for `(a, b)` is nsc's fully qualified
+        // `scala.TupleN`, so it is resolved in package `scala` and cannot be
+        // captured -- `object Ordering` declares `implicit def Tuple2[T1, T2]`
+        // and writes tuple literals in its own body.
+        if tree.scala_ref {
+            let found = self.st.lookup_scala(&name);
+            if !found.is_empty() {
+                // Term position: the companion `object TupleN` carries the
+                // `apply`, so it wins over the class of the same name, exactly
+                // as in the general path below.
+                let modules: Vec<SymbolId> = found
+                    .iter()
+                    .copied()
+                    .filter(|s| {
+                        matches!(
+                            self.st.get(*s).kind,
+                            SymKind::Module | SymKind::Method | SymKind::Term
+                        )
+                    })
+                    .collect();
+                let found = if modules.is_empty() { found } else { modules };
+                self.bind_found(tree, found, pt);
+                return;
+            }
+        }
         let mut found = self.st.lookup(&name);
         // See `SymbolTable::lookup_extractor`: in a constructor pattern a
         // `def` of the name is not an extractor and does not shadow one.
@@ -9543,6 +9576,7 @@ impl Typer {
             ty: ret,
             sym,
             postfix: false,
+            scala_ref: false,
         };
     }
 
@@ -9955,6 +9989,7 @@ impl Typer {
                     ty: to.clone(),
                     sym: conv,
                     postfix: false,
+                    scala_ref: false,
                 };
                 **qual = self.fill_conv_implicits(conv, &from, applied, span);
                 found = if let Some(cls) = self.st.class_sym_of(&to) {
@@ -10901,6 +10936,7 @@ impl Typer {
             ty: to,
             sym: conv,
             postfix: false,
+            scala_ref: false,
         };
         **qual = self.fill_conv_implicits(conv, &from, applied, span);
         fun.sym = member;
@@ -11017,6 +11053,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         let sel = Tree {
             id,
@@ -11028,6 +11065,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         tree.kind = TreeKind::Apply {
             fun: Box::new(sel),
@@ -11102,6 +11140,7 @@ impl Typer {
                 ty: Type::NoType,
                 sym: SymbolId::NONE,
                 postfix: false,
+                scala_ref: false,
             };
             let rhs = Tree {
                 id,
@@ -11113,6 +11152,7 @@ impl Typer {
                 ty: Type::NoType,
                 sym: SymbolId::NONE,
                 postfix: false,
+                scala_ref: false,
             };
             tree.kind = TreeKind::Assign {
                 lhs: Box::new(lhs),
@@ -11344,6 +11384,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         let inner = Tree {
             id: fun.id,
@@ -11355,6 +11396,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         tree.kind = TreeKind::Apply {
             fun: Box::new(inner),
@@ -11396,6 +11438,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         }
     }
 
@@ -11481,6 +11524,7 @@ impl Typer {
                     ty: Type::NoType,
                     sym: SymbolId::NONE,
                     postfix: false,
+                    scala_ref: false,
                 };
                 let inner = Tree {
                     id: lhs.id,
@@ -11492,6 +11536,7 @@ impl Typer {
                     ty: Type::NoType,
                     sym: SymbolId::NONE,
                     postfix: false,
+                    scala_ref: false,
                 };
                 tree.kind = TreeKind::Apply {
                     fun: Box::new(inner),
@@ -11523,6 +11568,7 @@ impl Typer {
                     ty: Type::NoType,
                     sym: SymbolId::NONE,
                     postfix: false,
+                    scala_ref: false,
                 };
                 let selected = Tree {
                     id: fun.id,
@@ -11534,6 +11580,7 @@ impl Typer {
                     ty: Type::NoType,
                     sym: SymbolId::NONE,
                     postfix: false,
+                    scala_ref: false,
                 };
                 let update = Tree {
                     id: fun.id,
@@ -11545,6 +11592,7 @@ impl Typer {
                     ty: Type::NoType,
                     sym: SymbolId::NONE,
                     postfix: false,
+                    scala_ref: false,
                 };
                 tree.kind = TreeKind::Apply {
                     fun: Box::new(update),
@@ -11966,6 +12014,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         self.type_expr(tree, pt);
         true
@@ -12029,13 +12078,14 @@ impl Typer {
         self.tupling = true;
         let elems = std::mem::take(args);
         let span = elems[0].span.merge(elems[elems.len() - 1].span);
-        let fun = Tree::new(
+        let mut fun = Tree::new(
             NodeId(0),
             span,
             TreeKind::Ident {
                 name: format!("Tuple{}", elems.len()),
             },
         );
+        fun.scala_ref = true;
         args.push(Tree::new(
             NodeId(0),
             span,
@@ -12474,6 +12524,7 @@ impl Typer {
                     ty: ctor_ty,
                     sym: csym,
                     postfix: false,
+                    scala_ref: false,
                 };
                 // The picked constructor still speaks the class's own type
                 // parameters. `new TypedRep[Int]()` has to search for
@@ -15807,6 +15858,7 @@ impl Typer {
             ty: self.st.get(gid).ty.clone(),
             sym: gid,
             postfix: false,
+            scala_ref: false,
         };
         self.type_expr(&mut gfun, &Type::NoType);
         let mut call = Tree {
@@ -15819,6 +15871,7 @@ impl Typer {
             ty: self.st.get(param).ty.clone(),
             sym: gid,
             postfix: false,
+            scala_ref: false,
         };
         self.type_expr(&mut call, &self.st.get(param).ty.clone());
         Some(call)
@@ -15878,6 +15931,7 @@ impl Typer {
                     ty: this_ty,
                     sym: self.st.this_class,
                     postfix: false,
+                    scala_ref: false,
                 }
             }
         }
@@ -15973,6 +16027,7 @@ impl Typer {
                 ty,
                 sym: id,
                 postfix: false,
+                scala_ref: false,
             };
         }
         tree.ty = inst(&ret);
@@ -16099,6 +16154,7 @@ impl Typer {
             ty: elem,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         let recv = Tree {
             id: NodeId(0),
@@ -16109,6 +16165,7 @@ impl Typer {
             ty: Type::ModuleRef(module),
             sym: module,
             postfix: false,
+            scala_ref: false,
         };
         let fun = Tree {
             id: NodeId(0),
@@ -16120,6 +16177,7 @@ impl Typer {
             ty: self.st.get(apply).ty.clone(),
             sym: apply,
             postfix: false,
+            scala_ref: false,
         };
         Some(Tree {
             id: NodeId(0),
@@ -16131,6 +16189,7 @@ impl Typer {
             ty: pt.clone(),
             sym: apply,
             postfix: false,
+            scala_ref: false,
         })
     }
 
@@ -16213,6 +16272,7 @@ impl Typer {
                     ty: Type::Error,
                     sym: SymbolId::NONE,
                     postfix: false,
+                    scala_ref: false,
                 });
             }
         };
@@ -16367,6 +16427,7 @@ impl Typer {
             ty: from.clone(),
             sym: pid,
             postfix: false,
+            scala_ref: false,
         };
         let param = Tree {
             id: NodeId(0),
@@ -16380,6 +16441,7 @@ impl Typer {
             ty: from.clone(),
             sym: pid,
             postfix: false,
+            scala_ref: false,
         };
         let mut lam = Tree {
             id: NodeId(0),
@@ -16394,6 +16456,7 @@ impl Typer {
             },
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         self.type_expr(&mut lam, pt);
         self.adapt(&mut lam, pt);
@@ -16510,6 +16573,7 @@ impl Typer {
             ty: from.clone(),
             sym: pid,
             postfix: false,
+            scala_ref: false,
         };
         let param = Tree {
             id: NodeId(0),
@@ -16523,6 +16587,7 @@ impl Typer {
             ty: from.clone(),
             sym: pid,
             postfix: false,
+            scala_ref: false,
         };
         let wrap_fun = Tree {
             id: NodeId(0),
@@ -16533,6 +16598,7 @@ impl Typer {
             ty: self.st.get(wrap).ty.clone(),
             sym: wrap,
             postfix: false,
+            scala_ref: false,
         };
         let body = Tree {
             id: NodeId(0),
@@ -16544,6 +16610,7 @@ impl Typer {
             ty: to.clone(),
             sym: wrap,
             postfix: false,
+            scala_ref: false,
         };
         let mut lam = Tree {
             id: NodeId(0),
@@ -16558,6 +16625,7 @@ impl Typer {
             },
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         self.type_expr(&mut lam, pt);
         self.adapt(&mut lam, pt);
@@ -16699,6 +16767,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         self.type_select(fun, &Type::NoType);
         !fun.ty.is_error() && !fun.ty.is_no_type()
@@ -17836,9 +17905,13 @@ impl Typer {
     /// `Seq[T]` for a repeated parameter's element type, when the prelude has
     /// `Seq` (it does in both modes).
     fn seq_of(&self, elem: &Type) -> Option<Type> {
+        // `lookup_type`, not `lookup`: the latter stops at the first scope
+        // binding the name at all, so a `def Seq` in scope left every repeated
+        // parameter as the bare `T*` (`value length is not a member of Int*`).
+        // This is the same shape as the `TupleN` capture above.
         let sym = self
             .st
-            .lookup("Seq")
+            .lookup_type("Seq")
             .into_iter()
             .find(|s| self.st.get(*s).kind == SymKind::Class)?;
         Some(Type::Class {
@@ -17959,6 +18032,7 @@ impl Typer {
                 ty: solved.clone(),
                 sym: id,
                 postfix: false,
+                scala_ref: false,
             };
             let mut filled = self.fill_conv_implicits(id, &from, applied, span);
             filled.ty = solved.clone();
@@ -18316,6 +18390,7 @@ impl Typer {
             name: format!("Tuple{n}"),
         });
         fun.span = span;
+        fun.scala_ref = true;
         let mut tup = Tree::dummy(TreeKind::Apply {
             fun: Box::new(fun),
             args,
@@ -18757,9 +18832,19 @@ impl Typer {
                 let saved_ctor_pat = std::mem::replace(&mut self.ctor_pattern_fun, ctor_pat);
                 self.type_expr(fun, &Type::NoType);
                 self.ctor_pattern_fun = saved_ctor_pat;
+                // `case (a, b) =>` is `scala.Tuple2(a, b)`: a synthesized name
+                // is resolved in package `scala`, never lexically. Note the
+                // ordinary path uses `lookup`, which stops at the first scope
+                // binding the name *at all*, so a `def Tuple2` in scope hid
+                // the class here even though it is not a class.
+                let scala_ref = fun.scala_ref;
                 let class_id = fun.name().and_then(|n| {
-                    self.st
-                        .lookup(n)
+                    let cands = if scala_ref {
+                        self.st.lookup_scala(n)
+                    } else {
+                        self.st.lookup(n)
+                    };
+                    cands
                         .into_iter()
                         .find(|s| self.st.get(*s).kind == SymKind::Class)
                         .map(|s| self.follow_class_alias(s))
@@ -21979,6 +22064,7 @@ impl Typer {
                 ty,
                 sym: conv,
                 postfix: false,
+                scala_ref: false,
             };
         }
         tree
@@ -22808,6 +22894,7 @@ impl Typer {
             ty: to.clone(),
             sym: conv,
             postfix: false,
+            scala_ref: false,
         };
     }
 
@@ -22908,6 +22995,7 @@ impl Typer {
                     },
                     sym: SymbolId::NONE,
                     postfix: false,
+                    scala_ref: false,
                 };
             }
             return;
@@ -23022,6 +23110,7 @@ impl Typer {
                     ty: pt.clone(),
                     sym: id,
                     postfix: false,
+                    scala_ref: false,
                 };
                 *tree = self.fill_conv_implicits(id, &from, applied, span);
                 return;
@@ -23302,6 +23391,7 @@ impl Typer {
             ty: tree.ty.clone(),
             sym: tree.sym,
             postfix: false,
+            scala_ref: false,
         };
         if !matches!(&tree.kind, TreeKind::This { .. }) {
             return false;
@@ -23404,6 +23494,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         let apply = Tree {
             id: NodeId(0),
@@ -23415,6 +23506,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         let part_lits: Vec<Tree> = parts
             .into_iter()
@@ -23427,6 +23519,7 @@ impl Typer {
                 ty: Type::String,
                 sym: SymbolId::NONE,
                 postfix: false,
+                scala_ref: false,
             })
             .collect();
         let sc_apply = Tree {
@@ -23439,6 +23532,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         let sel = Tree {
             id: NodeId(0),
@@ -23450,6 +23544,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         *tree = Tree {
             id: tree.id,
@@ -23461,6 +23556,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
     }
 
@@ -23501,6 +23597,7 @@ impl Typer {
                     ty: Type::NoType,
                     sym: SymbolId::NONE,
                     postfix: false,
+                    scala_ref: false,
                 };
                 *tree = Tree {
                     id: tree.id,
@@ -23512,6 +23609,7 @@ impl Typer {
                     ty: Type::NoType,
                     sym: SymbolId::NONE,
                     postfix: false,
+                    scala_ref: false,
                 };
                 self.type_expr_inner(tree, &Type::NoType);
             }
@@ -23599,6 +23697,7 @@ impl Typer {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         self.type_select(
             fun,
@@ -25159,6 +25258,7 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
                 ty: Type::NoType,
                 sym: SymbolId::NONE,
                 postfix: false,
+                scala_ref: false,
             })
             .collect();
         let cls_ident = |sym| Tree {
@@ -25168,6 +25268,7 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
             ty: Type::NoType,
             sym,
             postfix: false,
+            scala_ref: false,
         };
         // `C` when the class is monomorphic, `C[T1, .., Tn]` otherwise.
         let cls_type = |sym| {
@@ -25184,6 +25285,7 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
                     ty: Type::NoType,
                     sym: SymbolId::NONE,
                     postfix: false,
+                    scala_ref: false,
                 }
             }
         };
@@ -25195,6 +25297,7 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         let rhs = Tree {
             id: NodeId(0),
@@ -25209,12 +25312,14 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
                     ty: Type::NoType,
                     sym: stt.sym,
                     postfix: false,
+                    scala_ref: false,
                 }),
                 args: vec![arg],
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         };
         // nsc keeps the class's *remaining* clauses on the conversion and
         // passes them straight through:
@@ -25254,6 +25359,7 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
                     ty: Type::NoType,
                     sym: SymbolId::NONE,
                     postfix: false,
+                    scala_ref: false,
                 });
             }
             if decls.is_empty() {
@@ -25269,6 +25375,7 @@ fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
                 ty: Type::NoType,
                 sym: SymbolId::NONE,
                 postfix: false,
+                scala_ref: false,
             };
             vparamss_conv.push(decls);
         }
