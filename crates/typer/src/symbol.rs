@@ -59,6 +59,63 @@ fn enter_alias(id: SymbolId) -> Option<AliasGuard> {
     })
 }
 
+thread_local! {
+    /// Type symbols one of the *chases* is already unfolding: the walks that
+    /// replace an abstract type by what it stands for (`class_sym_of`,
+    /// `widen_type_param`, `expand_applied_hk_alias`, and erasure's
+    /// value-class unboxing, which enters through `enter_chase` too).
+    ///
+    /// nsc marks a symbol `LOCKED` while it completes it and raises
+    /// `CyclicReference` when it is re-entered; `check::cyclic_type_defs`
+    /// makes that same re-entry a diagnostic at the definition. These walks
+    /// run *after* that check -- and on symbols that never went through it at
+    /// all, because a pickle or a class file can carry a cycle we did not
+    /// write -- so here re-entry is not raised, it simply answers "no more
+    /// information" and lets the caller fall back to its own default.
+    static CHASING: std::cell::RefCell<Vec<u64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Which chase is asking. The walks are kept apart because they answer
+/// different questions about the same symbol: `class_sym_of` looking through
+/// `X` while erasure is unfolding `X` is not a cycle, and must not be told
+/// that it is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Chase {
+    /// `SymbolTable::class_sym_of`.
+    ClassOf = 1,
+    /// `erasure::erase_ty`.
+    Erase = 2,
+    /// `SymbolTable::expand_applied_hk_alias`.
+    HkAlias = 3,
+}
+
+/// Pops the symbol `enter_chase` pushed.
+pub(crate) struct ChaseGuard;
+
+impl Drop for ChaseGuard {
+    fn drop(&mut self) {
+        CHASING.with(|c| {
+            c.borrow_mut().pop();
+        });
+    }
+}
+
+/// `None` when this chase is already unfolding `id`, which is exactly a cycle
+/// in the type it stands for. Hold the guard for as long as the chase
+/// recurses; dropping it re-opens the symbol.
+pub(crate) fn enter_chase(kind: Chase, id: SymbolId) -> Option<ChaseGuard> {
+    let key = ((kind as u64) << 32) | u64::from(id.0);
+    CHASING.with(|c| {
+        let mut v = c.borrow_mut();
+        if v.contains(&key) {
+            return None;
+        }
+        v.push(key);
+        Some(ChaseGuard)
+    })
+}
+
 /// Returns `None` once the parent walk is implausibly deep, which only
 /// happens when the hierarchy has a cycle.
 fn enter_depth() -> Option<BoundGuard> {
@@ -911,16 +968,31 @@ impl SymbolTable {
     /// and every use of the element was `found: A  required: A`.
     pub fn widen_type_param(&self, ty: &Type) -> Type {
         let mut t = ty.clone();
-        for _ in 0..8 {
+        // Following a bound that names the parameter it bounds (`A[X] <:
+        // A[X]`) never terminates on its own, and the widened type it would
+        // hand back still names `A`, so the caller loops instead. Stop at the
+        // second visit and answer "nothing to widen to".
+        let mut seen: Vec<u32> = Vec::new();
+        loop {
             match &t {
-                Type::TypeParam(id) => match self.get(*id).bound_hi.clone() {
-                    Some(hi) => t = hi,
-                    None => return ty.clone(),
-                },
+                Type::TypeParam(id) => {
+                    if seen.contains(&id.0) {
+                        return ty.clone();
+                    }
+                    seen.push(id.0);
+                    match self.get(*id).bound_hi.clone() {
+                        Some(hi) => t = hi,
+                        None => return ty.clone(),
+                    }
+                }
                 Type::Applied { ctor, args } => {
                     let Type::TypeParam(id) = ctor.as_ref() else {
                         break;
                     };
+                    if seen.contains(&id.0) {
+                        return ty.clone();
+                    }
+                    seen.push(id.0);
                     let tps = self.get(*id).tparams.clone();
                     let Some(hi) = self.get(*id).bound_hi.clone() else {
                         return ty.clone();
@@ -988,13 +1060,24 @@ impl SymbolTable {
                     .or_else(|| found.into_iter().find(|s| self.get(*s).is_class_like()))
             }
             // An unbounded type parameter's members are `Any`'s; a bounded one
-            // resolves through its bound, as in nsc.
+            // resolves through its bound, as in nsc. `[A <: A]` and mutually
+            // bounded parameters have no class to offer, so the chase stops
+            // at `Any` rather than following the bound back to itself.
             Type::TypeParam(id) => match &self.get(*id).bound_hi {
-                Some(hi) => self.class_sym_of(hi),
+                Some(hi) => {
+                    let hi = hi.clone();
+                    match enter_chase(Chase::ClassOf, *id) {
+                        Some(_g) => self.class_sym_of(&hi),
+                        None => Some(self.any_sym),
+                    }
+                }
                 None => Some(self.any_sym),
             },
             Type::Applied { ctor, .. } => self.class_sym_of(ctor),
             Type::TypeMember(id) => {
+                let Some(_g) = enter_chase(Chase::ClassOf, *id) else {
+                    return Some(self.any_sym);
+                };
                 if !self.get(*id).tparams.is_empty() {
                     // A parameterized abstract member is not a class by itself,
                     // but `type C[T] <: TypedType[T]` still offers `TypedType`'s
@@ -1021,6 +1104,9 @@ impl SymbolTable {
             Type::ThisType(sym) => Some(*sym),
             Type::Constant(lit) => self.class_sym_of(&Type::lit_underlying(lit)),
             Type::SingleType { prefix, sym } => {
+                let Some(_g) = enter_chase(Chase::ClassOf, *sym) else {
+                    return Some(self.any_sym);
+                };
                 let t = self.singleton_underlying(*sym);
                 if t.is_no_type() {
                     self.class_sym_of(prefix)
@@ -1223,7 +1309,15 @@ impl SymbolTable {
                         && info.tparams.len() == args.len()
                         && !matches!(&info.ty, Type::NoType | Type::Error | Type::TypeMember(_))
                     {
-                        return self.subst_tparams(*id, args, &info.ty);
+                        // A higher-kinded alias whose body applies the alias
+                        // again (`type a[s[_], z] = s[n#a[s, z]]`, the
+                        // Peano-arithmetic shape of `pos/t2994a`) grows one
+                        // layer per expansion. Expanding it once is what
+                        // callers want; expanding it inside its own expansion
+                        // never ends, so leave the inner one folded.
+                        if let Some(_g) = enter_chase(Chase::HkAlias, *id) {
+                            return self.subst_tparams(*id, args, &info.ty);
+                        }
                     }
                 }
                 ty

@@ -1167,6 +1167,28 @@ impl Typer {
     /// arguments (A, A)`. The namer's provisional pass got this right (it runs
     /// inside `enter_tparams`, where the inner parameters *are* in scope) and
     /// this pass overwrote the good answer with the broken one.
+    /// Report the bounds that lead back to the type they bound, and drop them.
+    ///
+    /// Dropping is not cosmetic: `class_sym_of`, `widen_type_param` and
+    /// erasure all replace an abstract type by its upper bound, and a bound
+    /// that names its own parameter sends every one of them round for ever.
+    /// They defend themselves as well (`symbol::enter_chase`), but a bound
+    /// that says nothing is better removed than re-detected at each use.
+    fn report_bound_cycles(&mut self, ids: &[(SymbolId, Span)]) {
+        if ids.is_empty() {
+            return;
+        }
+        let syms: Vec<SymbolId> = ids.iter().map(|(id, _)| *id).collect();
+        for (id, msg) in crate::cyclic::bound_cycles(&self.st, &syms) {
+            let Some(span) = ids.iter().find(|(s, _)| *s == id).map(|(_, sp)| *sp) else {
+                continue;
+            };
+            self.error(span, msg);
+            self.st.get_mut(id).bound_hi = None;
+            self.st.get_mut(id).bound_lo = None;
+        }
+    }
+
     fn resolve_tparam_bounds(&mut self, tparams: &[Tree]) {
         for tp in tparams.iter() {
             let TreeKind::TypeDef { lo, hi, .. } = &tp.kind else {
@@ -1202,6 +1224,12 @@ impl Typer {
                 self.st.pop_scope();
             }
         }
+        let ids: Vec<(SymbolId, Span)> = tparams
+            .iter()
+            .filter(|tp| !tp.sym.is_none())
+            .map(|tp| (tp.sym, tp.span))
+            .collect();
+        self.report_bound_cycles(&ids);
     }
 
     /// Is `ty` the `scala.Function` module class?
@@ -2438,6 +2466,14 @@ impl Typer {
             }
         }
         self.finish_type_aliases(body);
+        // After every member of the template has a bound, so that a cycle
+        // spread over two of them (`type X <: Y; type Y <: X`) is visible.
+        let member_bounds: Vec<(SymbolId, Span)> = body
+            .iter()
+            .filter(|s| matches!(s.kind, TreeKind::TypeDef { .. }) && !s.sym.is_none())
+            .map(|s| (s.sym, s.span))
+            .collect();
+        self.report_bound_cycles(&member_bounds);
         self.st.get_mut(id).ty = Type::Class {
             sym: id,
             args: vec![],
@@ -2457,6 +2493,12 @@ impl Typer {
         self.check_self_conformance(id, tree.span);
         self.check_mixin_parents(id, tree.span);
         self.check_class_variance(id, tree.span);
+        // A value class erases to what it wraps, so one that wraps another
+        // value class has no erasure at all and unfolds for ever. nsc rejects
+        // the shape instead of trying (`neg/t5878`, `neg/t10530`).
+        if let Some(msg) = crate::cyclic::value_class_wraps_value_class(&self.st, id) {
+            self.error(tree.span, msg);
+        }
         if !self.sigs_only {
             let body_snapshot: Vec<Tree> = body.to_vec();
             self.check_abstract_override_placement(id, &body_snapshot);
@@ -3939,6 +3981,13 @@ impl Typer {
                 }
             }
         }
+        // `def g[X, A[X] <: A[X]](x: A[X])` (`neg/t2918`) is rejected here.
+        let bound_ids: Vec<(SymbolId, Span)> = tparams
+            .iter()
+            .zip(tp_ids.iter())
+            .map(|(tp, id)| (*id, tp.span))
+            .collect();
+        self.report_bound_cycles(&bound_ids);
         let saved_owner = self.st.owner;
         self.st.owner = tree.sym;
         let mut paramss_ty = Vec::new();
@@ -20694,11 +20743,26 @@ impl Typer {
 
     fn term_path_type(&self, t: &Tree) -> Option<Type> {
         match &t.kind {
-            TreeKind::This { .. } => {
-                if self.st.this_class.is_none() {
+            // `Outer.this` names the *enclosing* class, not the innermost
+            // one. Reading it as `this` made `trait Outer { type T; trait
+            // Inner { type T <: Outer.this.T } }` bound `Inner`'s own `T` by
+            // itself -- an invented cycle that made `class_sym_of` recurse
+            // until the stack ran out (`pos/t690`), and that
+            // `cyclic::bound_cycles` would now reject outright. The qualifier
+            // is resolved the same way `singleton_to_type` resolves it for
+            // `Outer.this.type`.
+            TreeKind::This { qual } => {
+                let id = match qual {
+                    Some(name) => self
+                        .st
+                        .enclosing_class_named(self.st.this_class, name)
+                        .unwrap_or(self.st.this_class),
+                    None => self.st.this_class,
+                };
+                if id.is_none() {
                     None
                 } else {
-                    Some(self.st.self_type_of_class(self.st.this_class))
+                    Some(self.st.self_type_of_class(id))
                 }
             }
             // `super.T` in type position: the member is looked up in the

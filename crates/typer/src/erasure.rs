@@ -576,15 +576,31 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         return erase_ty(&a, st);
     }
     match ty {
+        // A value class erases to what it wraps -- but a value class that
+        // wraps itself, directly or through another one, has no such type.
+        // The typer rejects that (`value class may not wrap another
+        // user-defined value class`); erasure also runs over signatures the
+        // typer never saw, so it stops at the second visit and keeps the
+        // class boxed rather than unfolding for ever.
         Type::Class { sym, .. } if st.is_value_class(*sym) => {
-            if let Some(u) = st.value_class_underlying(*sym) {
-                erase_ty(&u, st)
-            } else {
-                Type::Any
+            match crate::symbol::enter_chase(crate::symbol::Chase::Erase, *sym) {
+                None => Type::Class {
+                    sym: *sym,
+                    args: vec![],
+                },
+                Some(_g) => match st.value_class_underlying(*sym) {
+                    Some(u) => erase_ty(&u, st),
+                    None => Type::Any,
+                },
             }
         }
         // nsc: a type parameter erases to the erasure of its upper bound.
-        Type::TypeParam(_) => {
+        // A bound that names its own parameter (`A[X] <: A[X]`) has no
+        // information beyond `Object`, and following it recurses for ever.
+        Type::TypeParam(id) => {
+            let Some(_g) = crate::symbol::enter_chase(crate::symbol::Chase::Erase, *id) else {
+                return Type::Any;
+            };
             let hi = st.widen_type_param(ty);
             if matches!(hi, Type::TypeParam(_)) {
                 Type::Any
@@ -614,33 +630,42 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         // brings that in) -- and nsc's own `newTermName` returns exactly
         // `Names$TermNameApi`, so a `TermName` passed where `NameApi` is
         // expected is cast at the call site rather than erased more widely.
-        Type::TypeMember(id) => match st.dealias(ty) {
-            d if d == *ty => match st.get(*id).bound_hi.clone() {
-                // `type A <: A` (or a bound naming the member itself) has no
-                // more information than `Object`.
-                Some(hi) if hi != *ty && !matches!(&hi, Type::TypeMember(h) if h == id) => {
-                    let hi = match st.dealias(&hi) {
-                        Type::Refined { parents, decls }
-                            if !crate::symbol::SymbolTable::refined_has_term_members(&decls) =>
-                        {
-                            match intersection_dominator(&parents, st) {
-                                Some(p) if p != *ty => p,
-                                _ => return Type::Any,
+        Type::TypeMember(id) => {
+            // Same guard as for a type parameter: `type X <: Y` with `type Y
+            // <: X` gives each of them an upper bound that leads back to it.
+            let Some(_g) = crate::symbol::enter_chase(crate::symbol::Chase::Erase, *id) else {
+                return Type::Any;
+            };
+            match st.dealias(ty) {
+                d if d == *ty => match st.get(*id).bound_hi.clone() {
+                    // `type A <: A` (or a bound naming the member itself) has no
+                    // more information than `Object`.
+                    Some(hi) if hi != *ty && !matches!(&hi, Type::TypeMember(h) if h == id) => {
+                        let hi = match st.dealias(&hi) {
+                            Type::Refined { parents, decls }
+                                if !crate::symbol::SymbolTable::refined_has_term_members(
+                                    &decls,
+                                ) =>
+                            {
+                                match intersection_dominator(&parents, st) {
+                                    Some(p) if p != *ty => p,
+                                    _ => return Type::Any,
+                                }
                             }
+                            _ => hi,
+                        };
+                        let e = erase_ty(&hi, st);
+                        if is_primitive(&e) {
+                            Type::Any
+                        } else {
+                            e
                         }
-                        _ => hi,
-                    };
-                    let e = erase_ty(&hi, st);
-                    if is_primitive(&e) {
-                        Type::Any
-                    } else {
-                        e
                     }
-                }
-                _ => Type::Any,
-            },
-            d => erase_ty(&d, st),
-        },
+                    _ => Type::Any,
+                },
+                d => erase_ty(&d, st),
+            }
+        }
         Type::Applied { ctor, .. } => erase_ty(ctor, st),
         // An existential's skolem erases like a type parameter: to the
         // erasure of its upper bound (SLS 3.7). slick declares

@@ -2,6 +2,7 @@ mod anon_capture;
 mod check;
 mod classpath;
 mod ctor_defaults;
+mod cyclic;
 mod default_recv;
 mod erasure;
 mod expand;
