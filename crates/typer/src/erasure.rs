@@ -3,7 +3,6 @@
 //! backend does not have to guess at call sites.
 
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
-use std::collections::HashSet;
 
 use crate::symbol::{Intrinsic, SymbolTable};
 
@@ -311,28 +310,38 @@ fn find_overridden_method(st: &SymbolTable, id: SymbolId) -> Option<SymbolId> {
     if s.kind != crate::symbol::SymKind::Method {
         return None;
     }
-    let name = s.name.clone();
+    let name = &s.name;
     let owner = s.owner;
     if owner.is_none() {
         return None;
     }
-    let mut work = st.get(owner).parents.clone();
-    let mut seen = HashSet::new();
-    seen.insert(owner.0);
-    while let Some(p) = work.pop() {
-        let Some(pid) = st.class_sym_of(&p) else {
-            continue;
-        };
-        if !seen.insert(pid.0) {
+    // A worklist of symbols, not of parent *types*: the walk only ever asks a
+    // parent for its class, and this runs once per method symbol in the table,
+    // so cloning each node's parent list -- a deep copy of every type in it --
+    // was most of what erasure allocated. `seen` is a scanned `Vec` for the
+    // same reason: a hierarchy is tens of nodes.
+    let mut seen: Vec<u32> = vec![owner.0];
+    let mut work: Vec<SymbolId> = Vec::new();
+    let push_parents = |work: &mut Vec<SymbolId>, of: SymbolId| {
+        for p in &st.get(of).parents {
+            if let Some(q) = st.class_sym_of(p) {
+                work.push(q);
+            }
+        }
+    };
+    push_parents(&mut work, owner);
+    while let Some(pid) = work.pop() {
+        if seen.contains(&pid.0) {
             continue;
         }
+        seen.push(pid.0);
         for m in &st.get(pid).members {
             let mem = st.get(*m);
-            if mem.kind == crate::symbol::SymKind::Method && mem.name == name && *m != id {
+            if mem.kind == crate::symbol::SymKind::Method && mem.name == *name && *m != id {
                 return Some(*m);
             }
         }
-        work.extend(st.get(pid).parents.clone());
+        push_parents(&mut work, pid);
     }
     None
 }

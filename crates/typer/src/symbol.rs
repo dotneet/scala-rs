@@ -1927,7 +1927,7 @@ impl SymbolTable {
                         if *sym == target {
                             return Some(true);
                         }
-                        if self.function_class_shape(*sym, args).is_some() {
+                        if self.is_function_class_shape(*sym, args) {
                             return None;
                         }
                         if !seen.contains(&sym.0) {
@@ -2009,7 +2009,7 @@ impl SymbolTable {
         // so the "no" is the answer worth making cheap.
         if let (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, .. }) = (a, b) {
             if s1 != s2
-                && self.function_class_shape(*s1, a1).is_none()
+                && !self.is_function_class_shape(*s1, a1)
                 && self.class_reaches(*s1, *s2) == Some(false)
             {
                 return false;
@@ -2418,19 +2418,30 @@ impl SymbolTable {
     /// `None` for every other class, `PartialFunction` included -- that one
     /// reaches its `Function1` parent through the ordinary walk.
     pub(crate) fn function_class_shape(&self, sym: SymbolId, args: &[Type]) -> Option<Type> {
-        if args.is_empty() {
+        if !self.is_function_class_shape(sym, args) {
             return None;
         }
-        let s = self.get(sym);
-        let digits = s.jvm_name.strip_prefix("scala/Function")?;
-        let n: usize = digits.parse().ok()?;
-        if args.len() != n + 1 {
-            return None;
-        }
+        let n = args.len() - 1;
         Some(Type::Function {
             params: args[..n].to_vec(),
             ret: Box::new(args[n].clone()),
         })
+    }
+
+    /// Whether [`SymbolTable::function_class_shape`] would answer `Some`.
+    ///
+    /// Split out because the parent walks only want the question, and building
+    /// the structural function type to throw it away allocated a `Vec` and a
+    /// `Box` per class visited.
+    pub(crate) fn is_function_class_shape(&self, sym: SymbolId, args: &[Type]) -> bool {
+        if args.is_empty() {
+            return false;
+        }
+        let s = self.get(sym);
+        let Some(digits) = s.jvm_name.strip_prefix("scala/Function") else {
+            return false;
+        };
+        matches!(digits.parse::<usize>(), Ok(n) if args.len() == n + 1)
     }
 
     /// The structural `(T1, …, Tn) => R` read back as the class

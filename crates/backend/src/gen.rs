@@ -16267,7 +16267,10 @@ fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tr
         }
     }
 
-    if std::env::var_os("SCALA_RS_LAMBDA_TRACE").is_some() {
+    // Read once: this is on the path of every lambda that is not hoisted, and
+    // `var_os` walks the process environment on every call.
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *TRACE.get_or_init(|| std::env::var_os("SCALA_RS_LAMBDA_TRACE").is_some()) {
         let why = if is_pf {
             "partial-function".to_string()
         } else if let Some(s) = &sam {

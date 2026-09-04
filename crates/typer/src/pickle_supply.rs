@@ -32,7 +32,10 @@ use crate::symbol::{SymKind, SymbolTable};
 /// Completion is silent otherwise: a member it declines to supply surfaces as
 /// the typer's ordinary "is not a member".
 pub(crate) fn trace(args: std::fmt::Arguments<'_>) {
-    if std::env::var_os("SCALA_RS_PICKLE_DEBUG").is_some() {
+    // Read once. This is called from the middle of member completion, and
+    // `var_os` walks the process environment on every call.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("SCALA_RS_PICKLE_DEBUG").is_some()) {
         eprintln!("[pickle] {args}");
     }
 }
