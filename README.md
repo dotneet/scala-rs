@@ -191,7 +191,9 @@ The scripts under `tests/` are measurement harnesses, not part of `cargo test`:
 - `tests/slick_run.sh` — build slick twice (scala-rs and real scalac), compile
   the client programs in `tests/slick_progs/` once with real scalac, and run
   that one client binary against each slick build, comparing stdout byte for
-  byte. The first harness that asks whether the emitted slick *runs*; see
+  byte. The first harness that asks whether the emitted slick *runs*. Each
+  program is executed `RUNS` times (default 3) and the per-program `m/n` is
+  printed, so an intermittent failure cannot be averaged away. See
   [docs/notes/running-the-slick-we-compiled.md](docs/notes/running-the-slick-we-compiled.md).
 - `tests/expand_fm.py` — expand the seven FreeMarker templates slick's build
   generates Scala sources from, so a measurement covers what sbt would compile.

@@ -1269,3 +1269,164 @@ suspect, and it only misses under load.
 **Before treating a `RUN-FAIL` here as a regression, check whether `a.out`
 and `b.out` are identical.** If they are, the compiler produced a working
 program and the harness caught a shutdown, not a bug.
+## The flake was the harness, not the compiler (2026-09-05, `agent/runflaky`)
+
+Three consecutive invocations, same binary and same `main`, gave `ok=12`,
+`ok=11`, `ok=6`. The failures all looked like
+
+```
+RUN-FAIL     p02_queries   rs=1 scalac=0
+```
+
+with `a.out` byte-identical to `b.out`, `a.err` and `b.err` both holding
+nothing but SLF4J's three "no providers" lines, and no exception anywhere: a
+program that printed its whole expected output and then exited 1.
+
+It was not the compiler. It was this script keeping every one of its files in
+one directory shared by every copy of itself on the machine.
+
+### Where exit code 1 came from
+
+`java` exits **1** when its launcher cannot find or load the main class:
+
+```
+$ java -cp /nonexistent Main; echo $?
+Error: Could not find or load main class Main
+1
+```
+
+The old script's work dir was `<scratchpad>/slickrun` with no per-caller
+component anywhere in the path, and for each program it did
+
+```
+rm -rf $DIR/progs/$p; mkdir -p $DIR/progs/$p
+scalac $src -d $DIR/progs/$p ...
+java -cp $DIR/progs/$p:$CP_A Main > $DIR/progs/$p/a.out 2> $DIR/progs/$p/a.err
+```
+
+Two overlapping runs delete and rewrite the directory the other one is about to
+hand to `java`, **and** write the same `a.out` / `a.err`. So the loser's JVM
+exits 1 — and the evidence left on disk is the *winner's*, written afterwards.
+That is where "stdout matches byte for byte, stderr has no exception, exit code
+1" comes from. The harness bug reads exactly like a run-time-only compiler bug,
+which is the one thing this harness exists to detect.
+
+`battery_cost.sh` runs `./tests/slick_run.sh` with no `SLICK_RUN_DIR`, so any
+two agents timing the battery, or one agent plus one shell, collide.
+
+`$DIR/out-rs` and `$DIR/generated` were shared the same way, and that is worse
+than flaky. With the default `REUSE_RS=0` every run does `rm -rf $DIR/out-rs`
+and rebuilds it from *its own* `target/release/scala-rs`; two agents running at
+once can each report the other's slick build as their own — the same defect the
+brief already records for `SLICK_LOG`.
+
+### Reproduction, in one command
+
+Two runs of the *old* script, at the same time, on one work dir:
+
+```
+progs=12 ok=12 diff=0 fail=0
+progs=12 ok=6  diff=3 fail=3
+```
+
+`p08_mapto` and `p12_mapped` failed with `a.out` `cmp`-identical to `b.out`,
+three SLF4J lines in both `.err` files, and no exception — the reported
+signature exactly.
+
+### What was measured
+
+Twenty invocations of each version, run as ten concurrent pairs (the realistic
+condition: two agents, one machine), load average 28–45 throughout.
+
+| | clean invocations |
+|---|---|
+| before (old script, one shared dir) | **15 of 20** |
+| after (this change, `RUNS=3`) | **20 of 20**, every one `attempts=36/36` |
+
+The "after" set is 720 executions of the twelve programs against both builds,
+at load 17–50 — the upper end because `cargo test --workspace --release` was
+running through the middle of it.
+
+The five bad ones were `ok=8 diff=2 fail=2`, `ok=6 diff=5 fail=1`,
+`ok=9 diff=3 fail=0`, `ok=7 diff=2 fail=3`, and one that died on
+`rm: .../progs/p10_types: Directory not empty` — two processes unlinking the
+same tree. Across the twenty there were two `COMPILE-FAIL`s and four
+`RUN-FAIL`s, and the run failures came in **both** directions: one
+`rs=1 scalac=0` and three `rs=0 scalac=1`. The reference build fails too,
+which on its own settles that the cause is the environment and not scala-rs.
+
+Ten pairs *understates* the real rate, because both members start together and
+mostly stay in step. A peer that starts at an arbitrary offset is worse: the
+first two overlapping runs tried by hand, one started a few seconds after the
+other, gave `ok=12` and `ok=6 diff=3 fail=3`.
+
+Load alone does not do it. 120 back-to-back executions of the twelve programs
+against both builds, in one process at load 25–32, produced zero failures, and
+a solo `slick_run.sh` at load 12 was 12/12. The programs share nothing across
+JVMs either: their H2 URLs are `jdbc:h2:mem:pNN`, one name per program, and an
+in-memory H2 database is private to its JVM — `DB_CLOSE_DELAY=-1` keeps it
+alive for the life of that JVM and no longer. No file, port or `/tmp` path is
+touched by any of them.
+
+### The fix
+
+* The expensive reference build, `$DIR/out-scalac`, stays shared — it depends
+  only on the slick checkout and on real scalac, not on your branch — but it is
+  now built into a private directory and published with a rename, so a
+  concurrent reader never sees a half-written one.
+* Everything that depends on *your* compiler or is rewritten per run —
+  `out-rs`, `progs/`, `generated/`, the logs — moved under `$DIR/w-<id>`, where
+  `<id>` defaults to a hash of `$ROOT`. Every worktree gets its own; nothing is
+  shared by construction. `SLICK_RUN_ID` overrides it.
+* That area is held under a lock for the duration. A second run from the same
+  worktree is refused with a message naming the live pid, instead of silently
+  corrupting both. A lock whose owner is dead is taken over.
+* Each program is executed `RUNS` times per side (default 3) and the
+  per-program `m/n` is printed. A program counts as ok only when **all** `n`
+  attempts pass, so this is not a retry that hides failures — a `2/3` is a
+  failure that also tells you it is intermittent. Every attempt that is not a
+  clean pass prints its exit codes and the load average, and keeps its
+  stdout/stderr as `attempt<k>-{a,b}.{out,err}`.
+* The script now exits non-zero when anything failed. It always exited 0
+  before, so a caller could not tell.
+* The scala-rs build line prints `files=` next to `errors=` and `classes=`, for
+  the reason the brief gives: a truncated slick checkout otherwise reads as a
+  clean build.
+
+The old layout's leftovers — `<scratchpad>/slickrun/{out-rs,progs,generated}` —
+are not touched by the new script, in case a worktree is still running the old
+one. They are a few hundred MB and can be deleted once every worktree has this
+change. `out-scalac` must stay.
+
+### Corrections to the brief
+
+* "Same binary, same main" was true and still is: nothing about the compiler
+  varied. What varied was who else was running the harness.
+* The suspicion list — `IORuntime` shutdown, non-daemon threads,
+  `DB_CLOSE_DELAY=-1`, JVM start-up failure, load — is all ruled out above. A
+  JVM that failed to start would have produced an *empty* `a.out`, not a
+  matching one; that mismatch between "the program clearly ran" and "the
+  program clearly did not" is the tell that two processes wrote those files.
+* The past `12/12` results were not luck in the sense of being wrong — a solo
+  run is deterministic. They were unreliable only when something else was
+  running at the same time, and, through the shared `out-rs`, they could have
+  been measuring another worktree's build.
+
+### Verification
+
+On `agent/runflaky` after `git merge main` (fast-forward to `02bc73d`):
+
+| | |
+|---|---|
+| `tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0 runs=3 attempts=36/36` |
+| `tests/slick_measure.sh` | `files=184 errors=0 files_with_errors=0 classes=1596` |
+| `cargo test --workspace --release` | 1976 passed, 0 failed (151 `test result: ok`) |
+
+`slick_subset.sh`, the corpus and the cats / gitbucket / scalalib measures were
+skipped: this change is one shell script and two documentation paragraphs, and
+touches no Rust at all.
+
+Cost: a solo `tests/slick_run.sh` on an otherwise busy machine is **100 s**
+against the 75 s in the brief's table. That buys three executions of every
+program instead of one; `RUNS=1` restores the old cost and the old (weaker)
+verdict.
