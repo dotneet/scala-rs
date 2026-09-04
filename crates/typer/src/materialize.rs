@@ -673,6 +673,7 @@ impl Materialiser<'_> {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         }
     }
 

@@ -224,6 +224,7 @@ impl ReifyExpander<'_> {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         }
     }
 

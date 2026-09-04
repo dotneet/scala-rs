@@ -68,8 +68,9 @@ two together: `errors=0 classes=0` would mean a crash, not a success.
 
 **These are the `agent/scalalib` numbers.** The next section, "The one root",
 is the survey that was made of them; everything below "The `agent/preludeshadow`
-slice" is what happened when that root was fixed, and the current default-mode
-figure is **1997 errors in 173 files**.
+slice" is what happened when that root was fixed. That slice took it to 1997
+in 173, `agent/tuplelit` to the current default-mode figure of **1969 errors
+in 172 files**.
 
 ### The measurement is not run against the jar
 
@@ -327,47 +328,6 @@ Those shortcuts have a second, independent consequence, unrelated to
 with an explicit unrelated prefix, also comes out as `scala.Option[Int]`.
 `crates/cli/tests/preludeshadow.rs` records it.
 
-## What to do next, in order
-
-1. **A tuple literal resolves its `TupleN` by ordinary term lookup.** The
-   parser lowers `(a, b)` to `Apply(Ident("Tuple2"), …)`, so inside a scope
-   that declares a *term* of that name the literal calls it. `object Equiv`
-   again:
-
-   ```scala
-   object Fake {
-     def Tuple2(n: Int): String = "" + n
-     def f[A, B](a: A, b: B): (A, B) = (a, b)   // no matching overload for (Int)String
-   }
-   ```
-
-   real scalac accepts this (`gen.mkTuple` builds a fully qualified
-   `scala.TupleN` tree; the name is never looked up). This is the same family
-   as (3) above and is most of the 279 `no matching overload`. The fix needs a
-   way to tell the synthesized `Ident` from a user's own call — the parser has
-   no symbol table and `Tree` has no marker field — so it is a small design
-   decision, not a one-liner. `tests/fixtures/pshadow_tuplename.scala` covers
-   the *type*-position half that is fixed; the term half is not in it. (288
-   `no matching overload` remain, and this is a large share of them:
-   `Equiv.scala:251`'s is `(x, y) match` reading as a call of
-   `Equiv.Tuple2`.)
-2. **`Vector2[Any]` … `Vector6[Any]` — 100 errors, all in `Vector.scala`.**
-   `new VectorN(…)` on a generic constructor infers `Any` for the element
-   where the context expects `Vector[B]`. Nothing to do with the prelude; it
-   is constructor type inference. `Tree[A, …]` (73, `RedBlackTree.scala`) and
-   `Array[Any]` (43) look like the same shape and should be checked together.
-3. `case class` synthesis does not produce `canEqual`, so all 22 `TupleN`
-   classes report `class TupleN needs to be abstract` against
-   `Product`/`Equals`. 22 errors, one root, and it needs no lookup work.
-4. Do **not** assume the overriding family (now 51: 30 `` `override` modifier
-   required`` plus 21 `incompatible type in overriding`) is a second root. It
-   looks like one — `overrides nothing` does not need member lookup to
-   succeed — but the ones sampled were the same bug seen from the other side.
-   It has shrunk from 263 along with everything else, which is consistent with
-   that reading.
-5. `src/reflect` and `src/compiler` are not worth measuring yet.
-   `SCALALIB_DIRS` accepts them when they are.
-
 ### The other targets, before and after this slice
 
 Both columns measured on the merged tree, the "before" one from a binary built
@@ -388,6 +348,171 @@ with `main`'s (`d4131b0`) `check.rs` / `symbol.rs` / `prelude.rs` in place.
 Note that `docs/cats.md`'s headline number (3019) and `docs/gitbucket.md`'s
 (2545) are both stale: on `d4131b0` cats measures **71** and gitbucket
 **1859**.
+
+## The `agent/tuplelit` slice: a tuple literal is `scala.TupleN`
+
+**1997 errors in 173 files → 1969 in 172**, measured on this branch merged with
+`main` at `0b57b6a` against that `main` itself. Every other target is unchanged
+to the error; see the table at the end of this section.
+
+This was the first item on the previous slice's "what to do next" list, and
+that entry was right about the mechanism and **wrong about the size** — see
+"How big it was".
+
+### The mechanism
+
+The parser lowers `(a, b)` to `Apply(Ident("Tuple2"), …)`, and the typer then
+resolved that `Ident` like any other name, so a *term* of that name in a nearer
+scope answered for it. `scala.math.Ordering` and `scala.math.Equiv` each
+declare `implicit def Tuple2[T1, T2](…)` and write tuple literals in their own
+bodies. Real scalac 2.13.16 accepts
+
+```scala
+object Fake {
+  def Tuple2(n: Int): String = "" + n
+  def f[A, B](a: A, b: B): (A, B) = (a, b)
+  def g(x: Int, y: Int): Int = (x, y) match { case (a, b) => a + b }
+}
+```
+
+because `gen.mkTuple` builds a fully qualified `scala.TupleN` tree: the name is
+never looked up.
+
+### The design decision
+
+The brief said `Tree` has no marker field. It has one — `postfix`, set the same
+way, by mutating the node after `alloc` — and the cheapest place to put a
+second one is beside it. `Tree` gains `scala_ref`: *"an `Ident` the compiler
+made up for a name nsc writes fully qualified."* Adding a field to `Tree` costs
+100 mechanical edits at its struct literals; adding one to the `Ident` variant
+would have cost 218 pattern edits, and rewriting the synthesis to
+`Select(Ident("scala"), "TupleN")` would have broken the several places that
+match `Apply { fun: Ident { name } }` against `Tuple{n}`.
+
+`scala_ref` is set in four places: the parser's tuple *expression* and tuple
+*pattern*, and the two `Ident("TupleN")` trees `check.rs` synthesizes itself
+(auto-tupling an argument list, and a `for` generator's destructuring
+selector). It is read in two: `Typer::type_ident`, and the constructor-pattern
+arm of `type_pattern`, which resolves the pattern's class separately and needed
+the same treatment — without it `case (a, b) =>` still reported `not found:
+extractor Tuple2`.
+
+Resolution is `SymbolTable::lookup_scala`: a member lookup in package `scala`,
+with a class/module-only lexical fall-back for `--no-scala-library` mode, where
+the prelude enters some names into a scope of its own rather than into the
+package. It never sees a term, so nothing can capture it.
+
+Everything the *source* writes keeps ordinary resolution, which is the half
+that is easy to get wrong and impossible to see in a diagnostic count: an
+explicit `Tuple2(1)` must still call the method in scope, as it does under
+scalac. `tests/fixtures/tuplelit_shadow.scala` is run, not just compiled, for
+exactly that reason, and dual-run against real scalac 2.13.16.
+
+### The rest of the parser's synthesized names
+
+The brief asked whether other synthesized `Ident`s have the same hole. The
+parser makes up `Function0`/`FunctionN`, `Unit`, `Throwable`, `<repeated>`,
+`<tuple>`, `_root_`, `<empty>` and `x$pf`; `check.rs` adds `StringContext` and
+`Tuple2`. All but two were already safe — the type-position ones go through
+`lookup_type`, which `agent/preludeshadow` fixed, and the rest are names the
+surface syntax cannot bind.
+
+* **`StringContext` is not in this family, and must not be.** nsc really does
+  emit an unqualified `StringContext`, and scalac 2.13.16 reports `value s is
+  not a member of String` for an `s"…"` written where a `def StringContext` is
+  in scope. We *accept* that program, which is a fidelity gap in the opposite
+  direction; qualifying the name would have written the gap into the compiler
+  deliberately.
+* **One more hole, found the same way.** `Typer::seq_of`, which widens a
+  repeated parameter `T*` to `Seq[T]`, used `SymbolTable::lookup`, so a
+  `def Seq` in scope left the parameter as the bare `T*` and every selection on
+  it failed (`value length is not a member of Int*`). It now uses
+  `lookup_type`, the same fix `class_sym_of` got. It is worth no errors in
+  `src/library` — nothing there shadows `Seq` — but it is the same bug and
+  reproduces in four lines.
+
+`Array(1, 2)` next to a `def Array(n: Int)` is *not* a bug: scalac rejects it
+too (`too many arguments … for method Array`). A rejection rule that fires
+there would have been wrong.
+
+### How big it was
+
+The entry above predicted "most of the 288 `no matching overload`". It was 2 of
+them. The 28 errors this removed are mostly `value apply is not a member of
+TupleN`, `value _1 is not a member of …` and the type mismatches cascading from
+those. Six files improved and none regressed:
+
+| file | before | after |
+|---|---|---|
+| `scala/math/Equiv.scala` | 3 | **0** |
+| `scala/collection/mutable/CollisionProofHashMap.scala` | 23 | 13 |
+| `scala/sys/process/ProcessImpl.scala` | 11 | 7 |
+| `scala/collection/LazyZipOps.scala` | 22 | 18 |
+| `scala/collection/immutable/NumericRange.scala` | 14 | 10 |
+| `scala/math/Ordering.scala` | 10 | 7 |
+
+`Ordering.scala`'s remaining 7 are unrelated: `override def max[U <: T](x: U,
+y: U): U` against the same signature in the parent reports `incompatible type
+in overriding`, which is polymorphic override checking, not lookup.
+
+### The other targets, before and after this slice
+
+`main` moved twice during the slice and was merged in both times, so these are
+**the merged tree against `main` at `0b57b6a`**, measured back to back on the
+same machine — not against the branch point.
+
+| | `main` at `0b57b6a` | merged with this branch |
+|---|---|---|
+| `tests/scalalib_measure.sh -no-specialization` | `files=538 errors=1997 files_with_errors=173 classes=0` | `files=538 errors=1969 files_with_errors=172 classes=0` |
+| `tests/slick_measure.sh` | `files=184 errors=0 files_with_errors=0 classes=1596` | identical |
+| `tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0` | identical |
+| `tests/cats_measure.sh` | `files=339 skipped=1 errors=2929 files_with_errors=151 classes=0` | identical |
+| `tests/gitbucket_measure.sh` | `files=353 skipped=1 errors=1693 files_with_errors=186 classes=0` | identical |
+| `tests/scala_corpus.sh` (`CORPUS_SIZE=full`, `CORPUS_JOBS=6`) | `pos 977 · neg 640 · run 443` | identical, and the two `corpus.tsv` files `diff` clean — byte for byte, recorded diagnostic included |
+| `cargo test --workspace --release` | — | 150 × `test result: ok`, 1970 tests, 0 failures |
+
+`main` then moved again, to `cad281b` (`agent/kindproj`), which touches
+`crates/typer/src/symbol.rs` and `crates/parser/src/parse.rs` — both files this
+slice edits. The merge was clean, and the whole set was re-run on it:
+scalalib `1969 / 172`, slick `errors=0 classes=1596`, `slick_run` 12/12, cats
+`2929`, gitbucket `1693`, corpus `pos 977 · neg 640 · run 443`, workspace
+151 × `test result: ok` / 1976 tests / 0 failures. Every "after" figure above
+is unchanged by that merge.
+
+`tests/slick_subset.sh` was not run: this slice touches no code generation
+(`crates/backend/` is untouched), so its 30 minutes would measure nothing.
+
+Two numbers in the brief this slice was handed did not reproduce here, and
+neither is anything to do with the change: corpus `run` is **443**, not 434,
+and gitbucket is **1693**, not 1859 — the latter because `main` improved it in
+the meantime. A per-test `diff` of the corpus TSVs is the check worth running
+either way; a `run` total on its own moves with the per-test timeouts and with
+whatever else the machine is doing.
+
+Which of the checks in `.agent-brief.md` this slice actually ran: the four
+measurement scripts above (compile only, `classes=0` on scalalib/cats/gitbucket
+is expected while errors remain), `tests/slick_run.sh` and `tests/conform/`
+(the two that execute code), the corpus, and the full workspace suite. The
+classfile-loader and `javap` sweeps in `slick_subset.sh` were skipped as above.
+
+## What to do next, in order
+
+1. **`Vector2[Any]` … `Vector6[Any]` — 100 errors, all in `Vector.scala`.**
+   `new VectorN(…)` on a generic constructor infers `Any` for the element
+   where the context expects `Vector[B]`. Nothing to do with the prelude; it
+   is constructor type inference. `Tree[A, …]` (73, `RedBlackTree.scala`) and
+   `Array[Any]` (43) look like the same shape and should be checked together.
+2. `case class` synthesis does not produce `canEqual`, so all 22 `TupleN`
+   classes report `class TupleN needs to be abstract` against
+   `Product`/`Equals`. 22 errors, one root, and it needs no lookup work.
+3. Do **not** assume the overriding family (now 51: 30 `` `override` modifier
+   required`` plus 21 `incompatible type in overriding`) is a second root. It
+   looks like one — `overrides nothing` does not need member lookup to
+   succeed — but the ones sampled were the same bug seen from the other side.
+   It has shrunk from 263 along with everything else, which is consistent with
+   that reading.
+4. `src/reflect` and `src/compiler` are not worth measuring yet.
+   `SCALALIB_DIRS` accepts them when they are.
 
 ## Running it
 

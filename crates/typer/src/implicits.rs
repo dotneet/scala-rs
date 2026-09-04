@@ -2006,6 +2006,7 @@ impl Typer {
             ty: ty.clone(),
             sym: id,
             postfix: false,
+            scala_ref: false,
         };
         let Some(module) = self.wildcard_module_for(id) else {
             // `import b._` where `b` is a *value*: the conversion is an
@@ -2025,6 +2026,7 @@ impl Typer {
                     ty,
                     sym: id,
                     postfix: false,
+                    scala_ref: false,
                 };
             }
             return ident;
@@ -2039,6 +2041,7 @@ impl Typer {
             ty: Type::ModuleRef(mcls),
             sym: module,
             postfix: false,
+            scala_ref: false,
         };
         Tree {
             id: scala_rs_parser::NodeId(0),
@@ -2050,6 +2053,7 @@ impl Typer {
             ty,
             sym: id,
             postfix: false,
+            scala_ref: false,
         }
     }
 

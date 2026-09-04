@@ -965,6 +965,39 @@ impl SymbolTable {
         Vec::new()
     }
 
+    /// Resolve a name the compiler synthesized for a class or object that nsc
+    /// would have written as a fully qualified `scala.X` tree (see
+    /// [`scala_rs_parser::Tree::scala_ref`]). It is a member lookup in package
+    /// `scala`, not a lexical one, so no binding of that name anywhere in
+    /// scope can capture it.
+    ///
+    /// The lexical fall-back matters in `--no-scala-library` mode, where the
+    /// prelude enters some names into a scope of its own rather than into the
+    /// package; it still skips a scope that binds the name only as a term, so
+    /// `def Tuple2` never wins.
+    pub fn lookup_scala(&self, name: &str) -> Vec<SymbolId> {
+        let in_package: Vec<SymbolId> = self
+            .lookup_member(self.scala_pkg, name)
+            .into_iter()
+            .filter(|&s| self.is_type_namespace(s) || self.is_module_like(s))
+            .collect();
+        if !in_package.is_empty() {
+            return in_package;
+        }
+        for sc in self.scopes.iter().rev() {
+            let found: Vec<SymbolId> = sc
+                .lookup(name)
+                .iter()
+                .copied()
+                .filter(|&s| self.is_type_namespace(s) || self.is_module_like(s))
+                .collect();
+            if !found.is_empty() {
+                return found;
+            }
+        }
+        Vec::new()
+    }
+
     /// Look up the *function* of a constructor pattern (`case x :@ y`).
     ///
     /// nsc's `Context.lookupSymbol` qualifier for `typingConstructorPattern`

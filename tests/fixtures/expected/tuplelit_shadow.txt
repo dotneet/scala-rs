@@ -1,0 +1,8 @@
+(a,3)
+(1,b,2.0)
+9
+List(3, 7)
+3
+method Tuple2(1)
+method Seq(2)
+method Tuple3(6)

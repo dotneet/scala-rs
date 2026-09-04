@@ -531,6 +531,19 @@ pub struct Tree {
     pub sym: SymbolId,
     /// nsc postfix select (`xs toList`, `42 abs`): same-line `expr ident`.
     pub postfix: bool,
+    /// An `Ident` the *compiler* made up for a standard-library name that nsc
+    /// writes as a fully qualified tree rather than as a name to be resolved.
+    /// `gen.mkTuple` builds `scala.TupleN`, so `(a, b)` keeps meaning the tuple
+    /// even inside `object Ordering`, which declares `implicit def Tuple2`.
+    /// Such a reference is resolved as a member of package `scala` and never
+    /// picks up a same-named term from lexical scope.
+    ///
+    /// It is deliberately *not* set for every synthesized name: nsc's string
+    /// interpolation really does emit an unqualified `StringContext`, and
+    /// scalac 2.13.16 reports `value s is not a member of String` for a `s"…"`
+    /// written where a `def StringContext` is in scope. Only names nsc itself
+    /// qualifies belong here.
+    pub scala_ref: bool,
 }
 
 impl Tree {
@@ -542,6 +555,7 @@ impl Tree {
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
+            scala_ref: false,
         }
     }
 
