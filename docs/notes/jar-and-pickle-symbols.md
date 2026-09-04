@@ -109,3 +109,61 @@ the rewrite towards the receiver to the existing `subst_as_seen_from`.
   → In "`value X is not a member of Y$` (`agent/tail1`)" this turned out to have
   **a different root** than `outer_class_info_index` (`qual.sym` pointed at the val itself,
   and candidates were being assembled from an empty `jvm_name`), and it is now fixed.
+
+### Two copies of the same pickled declaration (`agent/ambigmap`)
+
+Cleanup after a regression introduced by `agent/companionkind`. The tests are in
+`crates/cli/tests/ambigmap.rs` and the fixture prefix is `am`.
+
+The measurement went from `files=184 errors=411 files_with_errors=72` to
+**`errors=387 files_with_errors=70`** (-24 errors / -2 files).
+`ambiguous overload` went **32 → 7**, and of those, `ambiguous overload for map` went
+**25 → 0**.
+
+**The symptom.** A perfectly ordinary `map` such as
+`pkSyms.map { fs => quoteIdentifier(fs.name) }` was coming out as
+`ambiguous overload for map`.
+
+**The cause is "there are two copies of the same declaration", and it has nothing to do with `map` specifically.**
+
+The prelude does not write out `map`. It is declared by
+`scala.collection.IterableOps`, and `Seq`, `IndexedSeq` and `Set` all inherit it
+from there. `PickleSupply::complete_named` **installs the member on the class that
+asked for it** (because that is where the typer will look for it next).
+In other words, **which class a copy of `IterableOps.map` lands on depends on which
+receiver asked first** — that is, on the program being compiled.
+
+If a `scala.Seq` receiver asks first, one copy lands on
+`scala.collection.immutable.Seq`; when a `scala.collection.IndexedSeq` receiver asks
+later, nothing is found (since `immutable.Seq` is not one of its parents) and a second
+copy lands there too. `scala.IndexedSeq` (i.e. `immutable.IndexedSeq`) **has both of
+those as parents, and neither of the two is an ancestor of the other**. As a result
+
+- `drop_overridden` cannot fit them to the "the subclass overrides the parent's member"
+  shape, and
+- the two differ only in rewritten vocabulary (`Seq[B]` versus `IndexedSeq[B]`), so
+  specificity cannot break the tie either,
+
+so every `xs.map(f)` came out as `ambiguous overload`. `map` was simply the most visible
+one; `flatMap` / `filter` / `partition` / `foldLeft` had the same shape
+(the fixture `am_pickledup.scala` hits all five).
+
+Before `agent/companionkind`, `scala.collection.Iterable` happened to be the one asked
+first, so only one copy was ever created. The trigger was that roughly 50 more
+pickle-derived classes appeared and **changed the order in which classes get asked**.
+The bug itself had been sitting there all along.
+
+**The fix.** As far as nsc is concerned there is one `IterableOps.map`. So
+`Symbol::pickled_origin` now records which pickled declaration a copy points at —
+**the declaring class, the method name, and the erased parameter descriptors**
+(**not the class it was installed on**, since that is exactly what differs between
+duplicates). `Check::drop_overridden` runs `collapse_pickled_copies` at the head of the
+candidate set and keeps only the first copy for any given `pickled_origin`. Because
+`lookup_member` walks parents from the back, the one that comes first is the copy
+closest to the receiver (for `immutable.IndexedSeq`, the `collection.IndexedSeq` one —
+the one whose result type is `IndexedSeq[B]`).
+
+Symbols with an empty `pickled_origin` (prelude, source, or classfile derived) are left
+completely alone. Because we group **by declaration rather than by name**, genuine
+overloads stay as two, and if they cannot be resolved we still emit `ambiguous overload`
+as before (`am_pickledup_bad.scala`).
