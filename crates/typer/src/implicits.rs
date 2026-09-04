@@ -185,7 +185,64 @@ impl Typer {
                 owner = o.owner;
             }
         }
-        out
+        self.shadow_inherited_implicits(out)
+    }
+
+    /// nsc's `findMember`, applied to the implicit members `this` inherits.
+    ///
+    /// Only inherited ones: a candidate whose owner is not in `this`'s
+    /// linearization is never dropped, so an import, an enclosing scope and a
+    /// package object are all left exactly as the walk found them.
+    ///
+    /// Two members of the same name whose types are the same are **one**
+    /// member, not two candidates: an unqualified reference to that name means
+    /// whichever of them the linearization reaches first, and the other is not
+    /// in scope at all. The walk above collects every base class's members
+    /// separately, so an inherited *declaration* was offered next to the
+    /// definition that implements it, and both fitted every search equally.
+    ///
+    /// scalatra is what showed it. `ScalatraContext` declares
+    ///
+    /// ```scala
+    /// implicit def request: HttpServletRequest
+    /// ```
+    ///
+    /// and `DynamicScope` defines it; neither trait is a base of the other, so
+    /// the "an override replaces what it overrides" rule in
+    /// `Check::drop_overridden` -- which asks for one owner to be below the
+    /// other -- has nothing to compare. `ScalatraFilter` mixes in both, and
+    /// every `params("id")` in a gitbucket controller was `ambiguous implicit:
+    /// request, request`.
+    ///
+    /// Keeping the one the linearization reaches first is also the only choice
+    /// that can be *called*: a declaration has no body, and the class that
+    /// implements it is the one the JVM resolves to.
+    fn shadow_inherited_implicits(&self, cands: Vec<SymbolId>) -> Vec<SymbolId> {
+        if cands.len() < 2 {
+            return cands;
+        }
+        let lin = crate::lin::linearize(&self.st, self.st.this_class);
+        let rank = |owner: SymbolId| lin.iter().position(|&b| b == owner);
+        cands
+            .iter()
+            .copied()
+            .filter(|&c| {
+                let s = self.st.get(c);
+                let Some(here) = rank(s.owner) else {
+                    return true;
+                };
+                !cands.iter().any(|&other| {
+                    if other == c {
+                        return false;
+                    }
+                    let o = self.st.get(other);
+                    if o.name != s.name || o.owner == s.owner || o.ty != s.ty {
+                        return false;
+                    }
+                    rank(o.owner).is_some_and(|there| there < here)
+                })
+            })
+            .collect()
     }
 
     /// Implicit members of the companion module of `class_id` (or the module

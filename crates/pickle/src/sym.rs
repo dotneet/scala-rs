@@ -659,21 +659,21 @@ impl SigCache {
             walk.depth += 1;
             let plin = self.lin_of(src, sym, false, next, walk);
             walk.depth -= 1;
-            let names: Vec<&str> = plin.iter().map(|s| s.class_name.as_str()).collect();
+            let names: Vec<(&str, bool)> = plin.iter().map(|s| s.key()).collect();
             let kept: Vec<LinStep> = acc
                 .into_iter()
-                .filter(|e| !names.contains(&e.class_name.as_str()))
+                .filter(|e| !names.contains(&e.key()))
                 .collect();
             acc = plin;
             acc.extend(kept);
         }
         let mut out = vec![here];
-        let mut seen: Vec<String> = vec![class_name.to_string()];
+        let mut seen: Vec<(String, bool)> = vec![(class_name.to_string(), module)];
         for e in acc {
-            if seen.contains(&e.class_name) {
+            if seen.contains(&(e.class_name.clone(), e.module)) {
                 continue;
             }
-            seen.push(e.class_name.clone());
+            seen.push((e.class_name.clone(), e.module));
             out.push(e);
         }
         out
@@ -687,6 +687,27 @@ pub struct LinStep {
     pub class_name: String,
     pub module: bool,
     pub subst: HashMap<String, SigType>,
+}
+
+impl LinStep {
+    /// What makes two steps the same class. The module class and the class of
+    /// one name are **different classes**, and comparing names alone loses the
+    /// class whenever a module extends its own companion:
+    ///
+    /// ```scala
+    /// trait JdbcBackend extends RelationalBackend { type Database = DatabaseDef }
+    /// object JdbcBackend extends JdbcBackend
+    /// ```
+    ///
+    /// `L(JdbcBackend$)` is `JdbcBackend$, JdbcBackend, RelationalBackend,
+    /// BasicBackend, ...`; on names alone the trait collides with the module
+    /// class that heads the list and is dropped, so a lookup of `Database` on
+    /// `object JdbcBackend` saw only `BasicBackend`'s abstract
+    /// `type Database >: Null <: DatabaseDef` and never the alias. Slick's
+    /// cake traits are written this way throughout.
+    fn key(&self) -> (&str, bool) {
+        (self.class_name.as_str(), self.module)
+    }
 }
 
 /// Bookkeeping for one linearization walk.

@@ -1010,6 +1010,15 @@ impl PickleSupply {
             self.sigs.lookup(&mut src, &full, is_module, name)
         };
         trace(format_args!("{full}#{name}: {} pickle hit(s)", hits.len()));
+        for h in &hits {
+            trace(format_args!(
+                "  hit {}#{name} kind={:?} public={} ty={:?}",
+                h.owner,
+                h.member.kind,
+                h.member.is_public_api(),
+                h.member.ty
+            ));
+        }
         let hit = hits.into_iter().find(|h| {
             matches!(
                 h.member.kind,
