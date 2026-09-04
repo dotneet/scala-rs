@@ -107,10 +107,12 @@ impl Typer {
         // so an outer scope's same-named symbol is never even considered --
         // matching, rather than merely deduplicating, what a bare reference
         // to that name would resolve to at each point in the walk.
-        let mut shadowed_names = std::collections::HashSet::new();
+        // Borrowed keys: this runs on every implicit search and copying every
+        // name in every enclosing scope was its largest single cost.
+        let mut shadowed_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for sc in self.st.scopes.iter().rev() {
             for name in sc.names() {
-                if !shadowed_names.insert(name.clone()) {
+                if !shadowed_names.insert(name.as_str()) {
                     continue;
                 }
                 for id in sc.lookup(name) {
@@ -129,19 +131,19 @@ impl Typer {
                 if id.is_none() || !walked.insert(id.0) {
                     continue;
                 }
-                for m in self.st.get(id).members.clone() {
+                for &m in &self.st.get(id).members {
                     // A local declaration shadows a same-named instance
                     // member too -- an unqualified reference to that name
                     // resolves to the local one, not `this.name`.
                     if self.st.get(m).flags.contains(Flags::IMPLICIT)
-                        && !shadowed_names.contains(&self.st.get(m).name)
+                        && !shadowed_names.contains(self.st.get(m).name.as_str())
                         && seen.insert(m.0)
                     {
                         out.push(m);
                     }
                 }
-                for p in self.st.get(id).parents.clone() {
-                    if let Some(ps) = self.st.class_sym_of(&p) {
+                for p in &self.st.get(id).parents {
+                    if let Some(ps) = self.st.class_sym_of(p) {
                         work.push(ps);
                     }
                 }
@@ -152,18 +154,18 @@ impl Typer {
             while !owner.is_none() {
                 let o = self.st.get(owner);
                 if o.kind == crate::symbol::SymKind::Package {
-                    for m in o.members.clone() {
+                    for &m in &o.members {
                         if self.st.get(m).flags.contains(Flags::IMPLICIT)
-                            && !shadowed_names.contains(&self.st.get(m).name)
+                            && !shadowed_names.contains(self.st.get(m).name.as_str())
                             && seen.insert(m.0)
                         {
                             out.push(m);
                         }
                         if self.st.get(m).name == "package" {
                             let mcls = self.st.module_class_of(m);
-                            for mem in self.st.get(mcls).members.clone() {
+                            for &mem in &self.st.get(mcls).members {
                                 if self.st.get(mem).flags.contains(Flags::IMPLICIT)
-                                    && !shadowed_names.contains(&self.st.get(mem).name)
+                                    && !shadowed_names.contains(self.st.get(mem).name.as_str())
                                     && seen.insert(mem.0)
                                 {
                                     out.push(mem);

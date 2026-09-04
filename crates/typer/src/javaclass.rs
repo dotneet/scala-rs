@@ -56,36 +56,137 @@ pub struct JavaClass {
     pub inner_classes: Vec<JavaInnerClass>,
 }
 
+/// A jar/jmod's bytes, shared so the `ZipArchive` that parses them can be kept
+/// alive alongside the `BinaryIndex` instead of being rebuilt per lookup.
+/// `off` skips the four-byte `JM\x01\0` header a `.jmod` puts before the zip.
+#[derive(Clone)]
+struct SharedBytes {
+    data: std::sync::Arc<Vec<u8>>,
+    off: usize,
+}
+
+impl AsRef<[u8]> for SharedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.data[self.off..]
+    }
+}
+
+/// One archive, parsed once. `ZipArchive::new` reads the whole central
+/// directory (scala-library has ~10k entries); doing that per class lookup, for
+/// each of the ~15 jars on a classpath, was the single largest cost in the
+/// typer.
+struct ZipIndex {
+    archive: ZipArchive<Cursor<SharedBytes>>,
+    /// Entry names, sorted, so a package-prefix query is a binary search rather
+    /// than a linear walk over every entry.
+    sorted_names: Vec<String>,
+}
+
+/// What a classpath entry turned out to be, decided once. `is_dir()`/`is_file()`
+/// are syscalls, and the old code paid two of them per entry per lookup.
+enum PathKind {
+    Dir,
+    Zip,
+    /// Neither at startup: re-checked on use, so an output directory created
+    /// during the run is still found.
+    Unknown,
+}
+
 pub struct BinaryIndex {
-    paths: Vec<PathBuf>,
-    zip_bytes: HashMap<PathBuf, Vec<u8>>,
+    paths: Vec<Entry>,
+    /// Every answer `find_class` has given, misses included. A miss costs a
+    /// probe of every jar and jmod on the classpath, and the typer asks the
+    /// same questions over and over (`has_pickle`, `class_file_of`,
+    /// `java_class` and `ensure_class` all ask about the same name). Sound
+    /// because nothing on `binary_path` is written during a run: the output
+    /// directory is not on it, and the macro engine's classes go to a cache
+    /// directory of their own.
+    class_cache: HashMap<String, Option<Vec<u8>>>,
+}
+
+/// One classpath entry, with its archive once something has been looked up in it.
+struct Entry {
+    path: PathBuf,
+    kind: PathKind,
+    zip: Option<ZipIndex>,
 }
 
 impl BinaryIndex {
     pub fn from_user_paths(user: Vec<PathBuf>) -> Self {
-        let mut paths = user;
-        paths.extend(discover_jdk_jmods());
+        let mut raw = user;
+        raw.extend(discover_jdk_jmods());
+        let paths = raw
+            .into_iter()
+            .map(|p| {
+                let kind = if p.is_dir() {
+                    PathKind::Dir
+                } else if is_zip_like(&p) {
+                    PathKind::Zip
+                } else {
+                    PathKind::Unknown
+                };
+                Entry {
+                    path: p,
+                    kind,
+                    zip: None,
+                }
+            })
+            .collect();
         BinaryIndex {
             paths,
-            zip_bytes: HashMap::new(),
+            class_cache: HashMap::new(),
         }
     }
 
     pub fn find_class(&mut self, internal: &str) -> Result<Option<Vec<u8>>, String> {
+        if let Some(hit) = self.class_cache.get(internal) {
+            return Ok(hit.clone());
+        }
+        let found = self.find_class_uncached(internal)?;
+        self.class_cache.insert(internal.to_string(), found.clone());
+        Ok(found)
+    }
+
+    fn find_class_uncached(&mut self, internal: &str) -> Result<Option<Vec<u8>>, String> {
         let rel = format!("{internal}.class");
-        for p in self.paths.clone() {
-            if p.is_dir() {
-                let f = p.join(&rel);
-                if f.is_file() {
-                    return std::fs::read(&f)
-                        .map(Some)
-                        .map_err(|e| format!("cannot read {}: {e}", f.display()));
+        let alt = format!("classes/{rel}");
+        for i in 0..self.paths.len() {
+            match self.paths[i].kind {
+                PathKind::Zip => {
+                    let e = load_zip(&mut self.paths[i])?;
+                    let path = &e.path;
+                    let z = e.zip.as_mut().expect("zip loaded");
+                    for n in [&rel, &alt] {
+                        match z.archive.by_name(n) {
+                            Ok(mut f) => {
+                                let mut buf = Vec::with_capacity(f.size() as usize);
+                                f.read_to_end(&mut buf).map_err(|err| {
+                                    format!(
+                                        "unsupported classfile archive {}: {err}",
+                                        path.display()
+                                    )
+                                })?;
+                                return Ok(Some(buf));
+                            }
+                            Err(zip::result::ZipError::FileNotFound) => {}
+                            Err(err) => {
+                                return Err(format!(
+                                    "unsupported classfile archive {}: {err}",
+                                    path.display()
+                                ))
+                            }
+                        }
+                    }
                 }
-                continue;
-            }
-            if is_zip_like(&p) {
-                if let Some(b) = self.zip_class_bytes(&p, internal)? {
-                    return Ok(Some(b));
+                // `Unknown` too: a path that was neither a directory nor an
+                // archive at startup may have become a directory since.
+                PathKind::Dir | PathKind::Unknown => {
+                    let f = self.paths[i].path.join(&rel);
+                    if f.is_file() {
+                        return std::fs::read(&f)
+                            .map(Some)
+                            .map_err(|e| format!("cannot read {}: {e}", f.display()));
+                    }
                 }
             }
         }
@@ -94,63 +195,57 @@ impl BinaryIndex {
 
     pub fn has_package_prefix(&mut self, prefix: &str) -> bool {
         let dir_rel = prefix.trim_end_matches('/');
-        for p in self.paths.clone() {
-            if p.is_dir() && p.join(dir_rel).is_dir() {
-                return true;
-            }
-            if is_zip_like(&p) {
-                if let Ok(true) = self.zip_has_prefix(&p, prefix) {
-                    return true;
+        let alt = format!("classes/{prefix}");
+        for i in 0..self.paths.len() {
+            match self.paths[i].kind {
+                PathKind::Zip => {
+                    let Ok(e) = load_zip(&mut self.paths[i]) else {
+                        continue;
+                    };
+                    let names = &e.zip.as_ref().expect("zip loaded").sorted_names;
+                    if has_sorted_prefix(names, prefix) || has_sorted_prefix(names, &alt) {
+                        return true;
+                    }
+                }
+                PathKind::Dir | PathKind::Unknown => {
+                    if self.paths[i].path.join(dir_rel).is_dir() {
+                        return true;
+                    }
                 }
             }
         }
         false
     }
+}
 
-    fn zip_class_bytes(&mut self, path: &Path, internal: &str) -> Result<Option<Vec<u8>>, String> {
-        let data = self.zip_file(path)?;
-        let names = [
-            format!("{internal}.class"),
-            format!("classes/{internal}.class"),
-        ];
-        for n in names {
-            match zip_read_named(data, &n) {
-                Ok(Some(b)) => return Ok(Some(b)),
-                Ok(None) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(None)
+/// Parse `e`'s archive if it has not been parsed yet, and hand `e` back.
+fn load_zip(e: &mut Entry) -> Result<&mut Entry, String> {
+    if e.zip.is_none() {
+        let data = std::fs::read(&e.path)
+            .map_err(|err| format!("cannot read {}: {err}", e.path.display()))?;
+        // A `.jmod` puts a four-byte `JM\x01\0` header before the zip.
+        let off = usize::from(data.len() >= 4 && data[0] == b'J' && data[1] == b'M') * 4;
+        let shared = SharedBytes {
+            data: std::sync::Arc::new(data),
+            off,
+        };
+        let archive = ZipArchive::new(Cursor::new(shared))
+            .map_err(|err| format!("unsupported classfile archive {}: {err}", e.path.display()))?;
+        let mut sorted_names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+        sorted_names.sort_unstable();
+        e.zip = Some(ZipIndex {
+            archive,
+            sorted_names,
+        });
     }
+    Ok(e)
+}
 
-    fn zip_has_prefix(&mut self, path: &Path, prefix: &str) -> Result<bool, String> {
-        let data = self.zip_file(path)?;
-        let payload = zip_payload(data);
-        let mut z = ZipArchive::new(Cursor::new(payload))
-            .map_err(|e| format!("unsupported classfile archive {}: {e}", path.display()))?;
-        let needle_a = format!("{prefix}");
-        let needle_b = format!("classes/{prefix}");
-        for i in 0..z.len() {
-            let n = z
-                .by_index(i)
-                .map_err(|e| format!("unsupported classfile archive {}: {e}", path.display()))?
-                .name()
-                .to_string();
-            if n.starts_with(&needle_a) || n.starts_with(&needle_b) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn zip_file(&mut self, path: &Path) -> Result<&[u8], String> {
-        if !self.zip_bytes.contains_key(path) {
-            let b =
-                std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            self.zip_bytes.insert(path.to_path_buf(), b);
-        }
-        Ok(self.zip_bytes.get(path).unwrap().as_slice())
-    }
+/// `names` is sorted, so every entry starting with `prefix` is contiguous and
+/// the first of them is at the insertion point of `prefix` itself.
+fn has_sorted_prefix(names: &[String], prefix: &str) -> bool {
+    let at = names.partition_point(|n| n.as_str() < prefix);
+    names.get(at).is_some_and(|n| n.starts_with(prefix))
 }
 
 fn is_zip_like(p: &Path) -> bool {
@@ -158,28 +253,6 @@ fn is_zip_like(p: &Path) -> bool {
         p.extension().and_then(|s| s.to_str()),
         Some("jar" | "zip" | "jmod")
     ) && p.is_file()
-}
-
-fn zip_payload(data: &[u8]) -> &[u8] {
-    if data.len() >= 4 && data[0] == b'J' && data[1] == b'M' {
-        &data[4..]
-    } else {
-        data
-    }
-}
-
-fn zip_read_named(data: &[u8], name: &str) -> Result<Option<Vec<u8>>, String> {
-    let mut z = ZipArchive::new(Cursor::new(zip_payload(data)))
-        .map_err(|e| format!("unsupported classfile archive: {e}"))?;
-    let mut f = match z.by_name(name) {
-        Ok(f) => f,
-        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
-        Err(e) => return Err(format!("unsupported classfile archive: {e}")),
-    };
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)
-        .map_err(|e| format!("unsupported classfile archive: {e}"))?;
-    Ok(Some(buf))
 }
 
 fn discover_jdk_jmods() -> Vec<PathBuf> {

@@ -333,7 +333,7 @@ pub(crate) fn ensure_tag_module(
             args: vec![Type::TypeParam(t)],
         }),
     };
-    st.get_mut(ap).jvm_name = format!("(L{MIRROR};L{TYPE_CREATOR};)L{tag_jvm};");
+    st.set_jvm_name(ap, format!("(L{MIRROR};L{TYPE_CREATOR};)L{tag_jvm};"));
 
     // `trait TypeTags { object TypeTag ... }` compiles to an interface method
     // `TypeTag()Lscala/reflect/api/TypeTags$TypeTag$;`. Whether the typer has

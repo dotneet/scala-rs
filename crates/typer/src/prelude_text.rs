@@ -85,7 +85,7 @@ fn add_string_extra(st: &mut SymbolTable) {
         Type::Boolean,
         Intrinsic::None,
     );
-    st.get_mut(m).jvm_name = "(Ljava/lang/CharSequence;)Z".into();
+    st.set_jvm_name(m, "(Ljava/lang/CharSequence;)Z");
     method(
         st,
         c,

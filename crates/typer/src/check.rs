@@ -18406,12 +18406,12 @@ impl Typer {
         // widens to: `OD.type` *is* a `D[Int]` when the module class extends
         // `D[Int]`, so an argument written as a bare `object` name still
         // pins the callee's type parameters.
-        let (sym, args) = match ty {
-            Type::Class { sym, args } => (*sym, args.clone()),
-            Type::ModuleRef(s) | Type::ThisType(s) => (*s, Vec::new()),
+        let (sym, args): (SymbolId, &[Type]) = match ty {
+            Type::Class { sym, args } => (*sym, args),
+            Type::ModuleRef(s) | Type::ThisType(s) => (*s, &[]),
             Type::SingleType { prefix, sym } => {
-                let under = self.st.get(*sym).ty.clone();
-                let under = if under.is_no_type() { prefix } else { &under };
+                let under = &self.st.get(*sym).ty;
+                let under = if under.is_no_type() { prefix } else { under };
                 return self.base_type_instance(under, target, depth + 1);
             }
             Type::Annotated { tpe, .. } => {
@@ -18422,13 +18422,18 @@ impl Typer {
         if sym == target {
             return Some(ty.clone());
         }
-        for p in self.st.get(sym).parents.clone() {
-            let p = if args.is_empty() {
+        // Everything here is borrowed. This walks the whole parent DAG on every
+        // call, so the two `Vec<Type>` clones it used to make (the arguments and
+        // the parent list) were among the typer's largest sources of allocation.
+        for p in &self.st.get(sym).parents {
+            let substituted;
+            let p: &Type = if args.is_empty() {
                 p
             } else {
-                self.st.subst_tparams(sym, &args, &p)
+                substituted = self.st.subst_tparams(sym, args, p);
+                &substituted
             };
-            if let Some(found) = self.base_type_instance(&p, target, depth + 1) {
+            if let Some(found) = self.base_type_instance(p, target, depth + 1) {
                 return Some(found);
             }
         }

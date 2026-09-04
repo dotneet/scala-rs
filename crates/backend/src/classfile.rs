@@ -78,6 +78,17 @@ pub struct Pool {
     floats: HashMap<u32, u16>,
     longs: HashMap<i64, u16>,
     doubles: HashMap<u64, u16>,
+    /// `CONSTANT_MethodType_info` (JVMS §4.4.9), keyed by descriptor.
+    method_types: HashMap<String, u16>,
+    /// `CONSTANT_MethodHandle_info` (JVMS §4.4.8), keyed by
+    /// `(reference_kind, reference_index)`.
+    method_handles: HashMap<(u8, u16), u16>,
+    /// `CONSTANT_InvokeDynamic_info` (JVMS §4.4.10), keyed by
+    /// `(bootstrap_method_attr_index, name_and_type_index)`.
+    invoke_dynamics: HashMap<(u16, u16), u16>,
+    /// `BootstrapMethods` (JVMS §4.7.23) entries, in attribute order:
+    /// `(method handle index, static argument indices)`.
+    bootstraps: Vec<(u16, Vec<u16>)>,
 }
 
 impl Pool {
@@ -233,6 +244,101 @@ impl Pool {
         self.class.keys().cloned().collect()
     }
 
+    /// `CONSTANT_MethodType_info` (JVMS §4.4.9) for a method descriptor.
+    pub fn method_type(&mut self, desc: &str) -> u16 {
+        if let Some(i) = self.method_types.get(desc) {
+            return *i;
+        }
+        let d = self.utf8(desc);
+        let i = self.count;
+        self.count += 1;
+        self.bytes.push(16);
+        self.bytes.extend_from_slice(&d.to_be_bytes());
+        self.method_types.insert(desc.to_string(), i);
+        i
+    }
+
+    /// `CONSTANT_MethodHandle_info` (JVMS §4.4.8) for a static method:
+    /// `reference_kind` 6 (`REF_invokeStatic`), pointing at a `Methodref` or
+    /// (for a static method declared in an interface) an `InterfaceMethodref`.
+    pub fn method_handle_static(
+        &mut self,
+        owner: &str,
+        name: &str,
+        desc: &str,
+        iface: bool,
+    ) -> u16 {
+        let r = if iface {
+            self.iface_ref(owner, name, desc)
+        } else {
+            self.methodref(owner, name, desc)
+        };
+        self.method_handle(6, r)
+    }
+
+    /// `CONSTANT_MethodHandle_info` (JVMS §4.4.8) with an explicit kind.
+    pub fn method_handle(&mut self, kind: u8, reference: u16) -> u16 {
+        if let Some(i) = self.method_handles.get(&(kind, reference)) {
+            return *i;
+        }
+        let i = self.count;
+        self.count += 1;
+        self.bytes.push(15);
+        self.bytes.push(kind);
+        self.bytes.extend_from_slice(&reference.to_be_bytes());
+        self.method_handles.insert((kind, reference), i);
+        i
+    }
+
+    /// Append (or reuse) a `BootstrapMethods` entry and return its
+    /// *attribute* index — the number that a `CONSTANT_InvokeDynamic_info`
+    /// stores in `bootstrap_method_attr_index`.
+    pub fn bootstrap(&mut self, handle: u16, args: Vec<u16>) -> u16 {
+        if let Some(i) = self
+            .bootstraps
+            .iter()
+            .position(|(h, a)| *h == handle && *a == args)
+        {
+            return i as u16;
+        }
+        self.bootstraps.push((handle, args));
+        (self.bootstraps.len() - 1) as u16
+    }
+
+    /// `CONSTANT_InvokeDynamic_info` (JVMS §4.4.10).
+    pub fn invoke_dynamic(&mut self, bootstrap: u16, name: &str, desc: &str) -> u16 {
+        let nt = self.nat(name, desc);
+        if let Some(i) = self.invoke_dynamics.get(&(bootstrap, nt)) {
+            return *i;
+        }
+        let i = self.count;
+        self.count += 1;
+        self.bytes.push(18);
+        self.bytes.extend_from_slice(&bootstrap.to_be_bytes());
+        self.bytes.extend_from_slice(&nt.to_be_bytes());
+        self.invoke_dynamics.insert((bootstrap, nt), i);
+        i
+    }
+
+    fn has_bootstraps(&self) -> bool {
+        !self.bootstraps.is_empty()
+    }
+
+    /// The `BootstrapMethods` attribute body (JVMS §4.7.23), without the
+    /// attribute name/length header.
+    fn bootstrap_body(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(self.bootstraps.len() as u16).to_be_bytes());
+        for (handle, args) in &self.bootstraps {
+            b.extend_from_slice(&handle.to_be_bytes());
+            b.extend_from_slice(&(args.len() as u16).to_be_bytes());
+            for a in args {
+                b.extend_from_slice(&a.to_be_bytes());
+            }
+        }
+        b
+    }
+
     /// Public wrapper for [`Pool::nat`], needed to build an `EnclosingMethod`
     /// attribute's `method_index` from outside this module.
     pub fn name_and_type(&mut self, name: &str, desc: &str) -> u16 {
@@ -375,6 +481,15 @@ impl ClassEmit {
             let nt = m.as_ref().map_or(0, |(n, d)| pool.name_and_type(n, d));
             (c, nt)
         });
+        // JVMS §4.7.23: a class whose constant pool holds a
+        // `CONSTANT_InvokeDynamic_info` must carry exactly one
+        // `BootstrapMethods` attribute. Intern its name before the pool is
+        // written out; the entries themselves are already pool indices.
+        let bootstrap_attr = if pool.has_bootstraps() {
+            Some(pool.utf8("BootstrapMethods"))
+        } else {
+            None
+        };
         let method_rva = if self.methods.iter().any(|m| !m.java_annots.is_empty()) {
             Some(pool.utf8("RuntimeVisibleAnnotations"))
         } else {
@@ -457,6 +572,7 @@ impl ClassEmit {
             + if scala_sig_attr.is_some() { 1 } else { 0 }
             + if scala_raw_attr.is_some() { 1 } else { 0 }
             + if inner_classes_attr.is_some() { 1 } else { 0 }
+            + if bootstrap_attr.is_some() { 1 } else { 0 }
             + if enclosing_method_attr.is_some() {
                 1
             } else {
@@ -473,6 +589,12 @@ impl ClassEmit {
                 out.extend_from_slice(&name.to_be_bytes());
                 out.extend_from_slice(&flags.to_be_bytes());
             }
+        }
+        if let Some(bm) = bootstrap_attr {
+            let body = pool.bootstrap_body();
+            out.extend_from_slice(&bm.to_be_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            out.extend_from_slice(&body);
         }
         if let (Some(em), Some((c, nt))) = (enclosing_method_attr, enclosing_method_idxs) {
             out.extend_from_slice(&em.to_be_bytes());

@@ -71,7 +71,7 @@ pub(crate) fn install(st: &mut SymbolTable) {
     // `NoSuchMethodError` になる（`xs.view.filter(p).map(f)` で踏んだ）。
     if let Some(m) = st.lookup_member(view, "map").into_iter().next() {
         if st.get(m).jvm_name.is_empty() {
-            st.get_mut(m).jvm_name = "(Lscala/Function1;)Ljava/lang/Object;".into();
+            st.set_jvm_name(m, "(Lscala/Function1;)Ljava/lang/Object;");
         }
     }
     for (name, desc, same_elem) in C_MEMBERS {
@@ -122,7 +122,7 @@ fn add_c_member(
             args: vec![elem],
         }),
     };
-    st.get_mut(id).jvm_name = desc.to_string();
+    st.set_jvm_name(id, desc.to_string());
     st.get_mut(seq_view).members.push(id);
 }
 

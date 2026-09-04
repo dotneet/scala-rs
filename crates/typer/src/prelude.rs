@@ -4370,7 +4370,7 @@ fn add_view(st: &mut SymbolTable) {
         ],
         ret: Box::new(view_t(Type::TypeParam(fa))),
     };
-    st.get_mut(fill).jvm_name = "(ILscala/Function0;)Ljava/lang/Object;".into();
+    st.set_jvm_name(fill, "(ILscala/Function0;)Ljava/lang/Object;");
 
     let iterate = method(st, view_cls, "iterate", vec![], Type::Unit, Intrinsic::None);
     let ia = type_param(st, iterate, "A");
@@ -5460,7 +5460,7 @@ fn add_breaks(st: &mut SymbolTable) {
         Type::TypeParam(tt),
         Intrinsic::None,
     );
-    st.get_mut(cb).jvm_name = "(Lscala/Function0;)Ljava/lang/Object;".into();
+    st.set_jvm_name(cb, "(Lscala/Function0;)Ljava/lang/Object;");
     add_breaks_members(st, breaks, try_block);
     method(
         st,
@@ -5499,7 +5499,7 @@ fn add_breaks_members(st: &mut SymbolTable, owner: SymbolId, try_block: SymbolId
         Intrinsic::None,
     );
     let br = method(st, owner, "break", vec![], Type::Nothing, Intrinsic::None);
-    st.get_mut(br).jvm_name = "()Lscala/runtime/Nothing$;".into();
+    st.set_jvm_name(br, "()Lscala/runtime/Nothing$;");
     // nsc 2.13.16: `def tryBreakable[T](op: => T): Breaks.TryBlock[T]`
     let tb = method(
         st,
@@ -5522,7 +5522,10 @@ fn add_breaks_members(st: &mut SymbolTable, owner: SymbolId, try_block: SymbolId
             args: vec![Type::TypeParam(t)],
         }),
     };
-    st.get_mut(tb).jvm_name = "(Lscala/Function0;)Lscala/util/control/Breaks$TryBlock;".into();
+    st.set_jvm_name(
+        tb,
+        "(Lscala/Function0;)Lscala/util/control/Breaks$TryBlock;",
+    );
 }
 
 /// `scala.math.BigInt` + companion `BigInt$` against scala-library 2.13.16.
@@ -5987,7 +5990,10 @@ fn add_using(st: &mut SymbolTable) {
         ],
         ret: Box::new(Type::Unit),
     };
-    st.get_mut(mgr_acq).jvm_name = "(Ljava/lang/Object;Lscala/util/Using$Releasable;)V".into();
+    st.set_jvm_name(
+        mgr_acq,
+        "(Ljava/lang/Object;Lscala/util/Using$Releasable;)V",
+    );
 
     let manager_mod = module(st, using_cls, "Manager", "scala/util/Using$Manager$");
     let manager_mcls = st.module_class_of(manager_mod);
@@ -6025,7 +6031,7 @@ fn add_using(st: &mut SymbolTable) {
             args: vec![ma_t],
         }),
     };
-    st.get_mut(mobj_app).jvm_name = "(Lscala/Function1;)Lscala/util/Try;".into();
+    st.set_jvm_name(mobj_app, "(Lscala/Function1;)Lscala/util/Try;");
     let mm_mems = st.get(manager_mcls).members.clone();
     st.get_mut(manager_mod).members.extend(mm_mems);
 
@@ -6126,7 +6132,7 @@ fn add_using_resources(st: &mut SymbolTable, using_cls: SymbolId, releasable: Sy
         desc.push_str("Lscala/util/Using$Releasable;");
     }
     desc.push_str(")Ljava/lang/Object;");
-    st.get_mut(m).jvm_name = desc;
+    st.set_jvm_name(m, desc);
 }
 
 fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
