@@ -46,6 +46,17 @@ pub(crate) struct PendingDefault {
     scopes: Rc<Vec<Scope>>,
 }
 
+/// A primary constructor's default body, waiting to be typed onto the
+/// companion module's `$lessinit$greater$default$n` / `apply$default$n`
+/// getters (`crate::ctor_defaults`).
+pub(crate) struct PendingCtorDefault {
+    param: SymbolId,
+    getter: SymbolId,
+    ret: Type,
+    tparams: Vec<SymbolId>,
+    preceding: Vec<SymbolId>,
+}
+
 /// Where a default argument's right-hand side was written.
 ///
 /// A default whose `name$default$n` getter cannot be called -- a primary
@@ -470,6 +481,29 @@ impl Typer {
         );
     }
 
+    /// Remember a *constructor* default's body for `type_pending_defaults`.
+    ///
+    /// No scope stack is captured here: a constructor default is typed where
+    /// it was written, and `record_default_scope` already stored that under
+    /// the parameter (with the class's own member scope dropped, since nothing
+    /// the class declares is in scope before the instance exists).
+    pub(crate) fn defer_ctor_default_getter_rhs(
+        &mut self,
+        param: SymbolId,
+        getter: SymbolId,
+        ret: &Type,
+        tparams: &[SymbolId],
+        preceding: &[SymbolId],
+    ) {
+        self.pending_ctor_defaults.push(PendingCtorDefault {
+            param,
+            getter,
+            ret: ret.clone(),
+            tparams: tparams.to_vec(),
+            preceding: preceding.to_vec(),
+        });
+    }
+
     /// Remember the body for `type_pending_defaults`, together with the scope
     /// stack it was written in.
     pub(crate) fn defer_default_getter_rhs(
@@ -502,13 +536,45 @@ impl Typer {
         let saved_file = self.file_index;
         // Typing one body can complete a signature that defines another
         // default, so drain until the queue stops growing.
-        while !self.pending_defaults.is_empty() {
+        while !self.pending_defaults.is_empty() || !self.pending_ctor_defaults.is_empty() {
             for p in std::mem::take(&mut self.pending_defaults) {
                 let saved_scopes = self.swap_in_scopes(Some(&p.scopes), p.owner);
                 self.st.owner = p.owner;
                 self.st.this_class = p.this_class;
                 self.file_index = p.file_index;
                 self.type_default_getter_rhs(p.param, p.getter, &p.ret, &p.tparams, &p.preceding);
+                self.swap_back_scopes(saved_scopes);
+            }
+            for p in std::mem::take(&mut self.pending_ctor_defaults) {
+                let Some(d) = self
+                    .default_scopes
+                    .get(&p.param)
+                    .map(|d| (d.owner, d.this_class, d.file_index, Rc::clone(&d.scopes)))
+                else {
+                    continue;
+                };
+                let saved_scopes = self.swap_in_scopes(Some(&d.3), d.0);
+                self.st.owner = d.0;
+                self.st.this_class = d.1;
+                self.file_index = d.2;
+                if let Some(rhs) =
+                    self.typed_default_body(p.param, &p.ret, &p.tparams, &p.preceding)
+                {
+                    // A getter whose result type nsc infers (see
+                    // `crate::ctor_defaults`) was declared with none; the
+                    // body's own type is the answer.
+                    if p.ret.is_no_type() {
+                        let paramss = match &self.st.get(p.getter).ty {
+                            Type::Method { paramss, .. } => paramss.clone(),
+                            _ => Vec::new(),
+                        };
+                        self.st.get_mut(p.getter).ty = Type::Method {
+                            paramss,
+                            ret: Box::new(rhs.ty.clone()),
+                        };
+                    }
+                    self.st.get_mut(p.getter).default_rhs = Some(rhs);
+                }
                 self.swap_back_scopes(saved_scopes);
             }
         }

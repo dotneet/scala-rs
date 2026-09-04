@@ -447,6 +447,9 @@ pub struct Typer {
     /// a `name$default$n` body with the other bodies, and so do we.
     pub(crate) defer_default_rhs: bool,
     pub(crate) pending_defaults: Vec<crate::lazysig::PendingDefault>,
+    /// The same, for a primary constructor's defaults, whose getters sit on
+    /// the companion module (`crate::ctor_defaults`).
+    pub(crate) pending_ctor_defaults: Vec<crate::lazysig::PendingCtorDefault>,
     /// Where each default's right-hand side was written. A default with no
     /// `name$default$n` getter to call is spliced into the argument list as
     /// the stored tree; this is the scope it has to be typed in, which is not
@@ -715,6 +718,7 @@ impl Typer {
             lazy_body_done: HashSet::new(),
             lazy_base_scopes,
             defer_default_rhs: false,
+            pending_ctor_defaults: Vec::new(),
             default_scopes: HashMap::new(),
             pending_defaults: Vec::new(),
             open_implicits: std::cell::RefCell::new(Vec::new()),
@@ -2312,6 +2316,10 @@ impl Typer {
                     // companion-based getters (not implemented here).
                 }
             }
+            // Nothing in *this* run calls a constructor's default getter, but a
+            // separately compiled caller does, so the companion module still
+            // owes the method. See `crate::ctor_defaults`.
+            self.synthesize_ctor_default_getters(id, &paramss_ids);
         }
         // `copy`'s parameter symbols (allocated in `synthesize_case_members`,
         // during the namer pass, before ctor param types are known) still hold
@@ -4513,9 +4521,26 @@ impl Typer {
         tparams: &[SymbolId],
         preceding: &[SymbolId],
     ) {
-        let Some(mut rhs) = self.st.get(param).default_rhs.clone() else {
+        let Some(rhs) = self.typed_default_body(param, ret, tparams, preceding) else {
             return;
         };
+        self.st.get_mut(param).default_rhs = Some(rhs.clone());
+        self.st.get_mut(getter).default_rhs = Some(rhs);
+    }
+
+    /// Type the stored body of `param`'s default against `ret`, in a scope
+    /// holding `tparams` and `preceding`. The caller decides where the typed
+    /// tree is stored: an ordinary method's getter writes it back onto the
+    /// parameter as well, a constructor's (`crate::ctor_defaults`) does not,
+    /// because the parameter's untyped tree is still what a call site splices.
+    pub(crate) fn typed_default_body(
+        &mut self,
+        param: SymbolId,
+        ret: &Type,
+        tparams: &[SymbolId],
+        preceding: &[SymbolId],
+    ) -> Option<Tree> {
+        let mut rhs = self.st.get(param).default_rhs.clone()?;
         // A repeated parameter's default is a *value*, not an argument list:
         // `case class C(xs: T*)` gives `copy(xs: T* = this.xs)`, and `this.xs`
         // is the `Seq[T]` the field holds. Checking it against `T*` reported a
@@ -4542,8 +4567,7 @@ impl Typer {
             self.adapt(&mut rhs, ret);
         }
         self.st.pop_scope();
-        self.st.get_mut(param).default_rhs = Some(rhs.clone());
-        self.st.get_mut(getter).default_rhs = Some(rhs);
+        Some(rhs)
     }
 
     pub(crate) fn type_def_body(&mut self, tree: &mut Tree) {
@@ -8189,6 +8213,56 @@ impl Typer {
         self.bind_found(tree, found, pt);
     }
 
+    /// An inherited member's type, read through the class the unqualified
+    /// reference is written in.
+    ///
+    /// The single-alternative path in [`Self::bind_found`] does this inline,
+    /// with the same three exclusions (a self alias names the *enclosing*
+    /// instance, a local or parameter has no prefix at all, and a
+    /// `private[this]` member is not inherited, SLS 5.2). An *overloaded*
+    /// name needed it just as much and did not have it: every alternative
+    /// went into `Type::Overload` in its declaring class's vocabulary.
+    ///
+    /// Twirl's `BaseScalaTemplate[T <: Appendable[T], F <: Format[T]]`
+    /// declares six `_display_` overloads, all returning `T`, and every
+    /// generated template calls `_display_ { … }` unqualified from inside
+    /// `object x extends BaseScalaTemplate[Html, Format[Html]]`. The result
+    /// came back as the bare `T`, so the template's own declared result type
+    /// did not match it.
+    fn ident_ty_as_seen_from_this(&self, s: SymbolId, ty: Type) -> Type {
+        if self.st.this_class.is_none() {
+            return ty;
+        }
+        let owner = self.st.get(s).owner;
+        if owner == self.st.this_class || owner.is_none() {
+            return ty;
+        }
+        if self.st.get(owner).self_alias == Some(s) {
+            return ty;
+        }
+        if !matches!(
+            self.st.get(owner).kind,
+            SymKind::Class | SymKind::ModuleClass | SymKind::Module
+        ) {
+            return ty;
+        }
+        let f = self.st.get(s).flags;
+        if f.contains(Flags::PRIVATE) && f.contains(Flags::LOCAL) {
+            return ty;
+        }
+        let this_ty = Type::Class {
+            sym: self.st.this_class,
+            args: self
+                .st
+                .get(self.st.this_class)
+                .tparams
+                .iter()
+                .map(|t| Type::TypeParam(*t))
+                .collect(),
+        };
+        self.st.subst_as_seen_from(&this_ty, &ty)
+    }
+
     fn bind_found(&mut self, tree: &mut Tree, mut found: Vec<SymbolId>, pt: &Type) {
         found.sort_by_key(|s| s.0);
         found.dedup();
@@ -8312,7 +8386,8 @@ impl Typer {
             found.truncate(1);
             let s = found[0];
             tree.sym = s;
-            let ty = self.maybe_auto_apply(first_ty, pt);
+            let ty = self.ident_ty_as_seen_from_this(s, first_ty);
+            let ty = self.maybe_auto_apply(ty, pt);
             tree.ty = self.instantiate_parameterless(s, ty, pt);
             return;
         }
@@ -8320,7 +8395,22 @@ impl Typer {
         // Nullary alternatives still auto-apply in value position (`"x".stripMargin`).
         let ov_name = self.st.get(found[0]).name.clone();
         self.record_overload_group(&found, &ov_name);
-        let ov = Type::Overload(found.iter().map(|s| self.st.get(*s).ty.clone()).collect());
+        // As seen from this class, exactly as the single-alternative branch
+        // above and as `type_select` does for a receiver. The types have to be
+        // filed under `overload_member_types` as well, because
+        // `resolve_overload_with` rebuilds its candidates from the symbols and
+        // would otherwise read every alternative raw again.
+        let alts: Vec<(SymbolId, Type)> = found
+            .iter()
+            .map(|&s| {
+                let t = self.st.get(s).ty.clone();
+                (s, self.ident_ty_as_seen_from_this(s, t))
+            })
+            .collect();
+        if alts.iter().any(|(s, t)| &self.st.get(*s).ty != t) {
+            self.overload_member_types.insert(found[0].0, alts.clone());
+        }
+        let ov = Type::Overload(alts.into_iter().map(|(_, t)| t).collect());
         tree.ty = self.maybe_auto_apply(ov, pt);
         tree.sym = if matches!(tree.ty, Type::Overload(_)) {
             found[0]
@@ -15385,7 +15475,7 @@ impl Typer {
             .tparams
             .iter()
             .copied()
-            .filter(|tp| rest_tys.iter().any(|t| type_mentions_tparam(t, *tp)))
+            .filter(|tp| rest_tys.iter().any(|t| type_mentions_tparam_deep(t, *tp)))
             .collect();
         if undet.is_empty() {
             return rest_tys;
@@ -15485,6 +15575,22 @@ impl Typer {
             return None;
         }
         let mname = self.st.get(meth).name.clone();
+        // A case class's synthetic `apply` keeps splicing the default's stored
+        // expression. Its `apply$default$n` getter exists (nsc's, declared by
+        // `crate::ctor_defaults`) but only so a *separately compiled* caller
+        // can link; calling it from here would fix the argument's type before
+        // the class's type parameters are solved, and nsc infers them from the
+        // getter's result instead. slick's `case class Comprehension[+Fetch <:
+        // Option[Node]](…, fetch: Fetch = None, …)` is exactly that: the
+        // getter answers `None$`, which does not conform to `Fetch` until the
+        // call site has chosen `Fetch = None.type`.
+        let meth_flags = self.st.get(meth).flags;
+        if mname == "apply"
+            && meth_flags.contains(Flags::CASE)
+            && meth_flags.contains(Flags::SYNTHETIC)
+        {
+            return None;
+        }
         let gname = format!("{mname}$default${index_1based}");
         let owner = self.st.get(meth).owner;
         let gid = self
@@ -15493,7 +15599,26 @@ impl Typer {
             .into_iter()
             .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)?;
         let span = fun.span;
-        let recv = self.method_receiver(fun);
+        // An *inserted* `apply` names the receiver itself, not a member of it:
+        // `Outer.Inner.Nested(2)` is `Select(Outer.Inner, "Nested")` carrying
+        // the companion's `apply` as its symbol, so `method_receiver`'s
+        // "take the qualifier" answers `Outer.Inner` and the getter call came
+        // out as `Inner$.apply$default$2`. The head of the chain is the
+        // receiver in that case; it is re-typed from scratch because the tree
+        // in hand is already typed as the *method*.
+        let head = Self::application_head(fun);
+        let inserted_apply =
+            mname == "apply" && Self::head_name(head).is_some_and(|n| n != "apply");
+        let recv = if inserted_apply {
+            let mut r = head.clone();
+            r.id = NodeId(0);
+            r.ty = Type::NoType;
+            r.sym = SymbolId::NONE;
+            self.type_expr(&mut r, &Type::NoType);
+            r
+        } else {
+            self.method_receiver(fun)
+        };
         let mut preceding = Self::applied_clause_args(fun);
         preceding.extend_from_slice(prior);
         // The getter's own arity is the truth, not the number of arguments
@@ -15548,6 +15673,24 @@ impl Typer {
                 Self::applied_clause_args(fun)
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// The head of an application chain: `f(a)(b)` and `f[T](a)` both give `f`.
+    fn application_head(fun: &Tree) -> &Tree {
+        match &fun.kind {
+            TreeKind::Apply { fun, .. }
+            | TreeKind::TypeApply { fun, .. }
+            | TreeKind::Typed { expr: fun, .. } => Self::application_head(fun),
+            _ => fun,
+        }
+    }
+
+    /// The name a chain head selects, when it selects one at all.
+    fn head_name(t: &Tree) -> Option<&str> {
+        match &t.kind {
+            TreeKind::Select { name, .. } | TreeKind::Ident { name } => Some(name.as_str()),
+            _ => None,
         }
     }
 
@@ -19803,9 +19946,7 @@ impl Typer {
                     // the clause names nothing at all.
                     let ty = self.resolve_type_name(name, &[]);
                     match &ty {
-                        Type::Named { name: n, args }
-                            if self.strict_type_names && args.is_empty() && n == name =>
-                        {
+                        Type::Named { name: n, args } if args.is_empty() && n == name => {
                             let name = name.clone();
                             let qual = (**qual).clone();
                             // A `type` alias a jar class declares leaves no
@@ -19815,10 +19956,24 @@ impl Typer {
                             // pickle. Twirl writes `HtmlFormat.Appendable` in
                             // the parents clause of every generated template,
                             // which is exactly where nothing has.
+                            //
+                            // The pickle is asked whether or not
+                            // [`Self::strict_type_names`] is on. Only the
+                            // *diagnostic* is strict: outside a parents clause
+                            // an unresolved `p.T` still falls back to the
+                            // placeholder `Type::Named`, because a path this
+                            // pass cannot model resolves that way. But a
+                            // placeholder is not an answer, and a template's
+                            // `def apply(...): HtmlFormat.Appendable` is an
+                            // ordinary signature, not a parent -- so the
+                            // alias resolved in the parents clause and stayed
+                            // a bare name everywhere else in the same file.
                             if let Some(t) = self.qualified_pickled_type_member(&qual, &name) {
                                 t
-                            } else {
+                            } else if self.strict_type_names {
                                 self.missing_qualified_type(&qual, &name, tpt.span)
+                            } else {
+                                ty
                             }
                         }
                         _ => ty,
@@ -21001,11 +21156,40 @@ impl Typer {
             }
             t
         };
+        // A type lambda may mention type parameters of whatever encloses it:
+        // `implicit def readerMonad[R]: Monad[({ type L[X] = Reader[R, X] })#L]`
+        // captures `R`. A `Type::TypeMember` is only a symbol, so a later
+        // substitution of `R` cannot reach inside the stored body -- the
+        // instance for `R = Int` would still read `Reader[R, X]`. Add every
+        // captured parameter as a *leading* parameter of the member and hand
+        // out the member already applied to them, so the projection is a
+        // partial application. Substitution then works on the arguments, which
+        // are ordinary types, and the arity the world sees is unchanged
+        // (`kind_arity` of a partial application subtracts what is applied).
+        let mut captured = Vec::new();
+        if !rhs.is_empty() {
+            let own = self.st.get(id).tparams.clone();
+            let mut free = Vec::new();
+            collect_tparams(&rhs_ty, &mut free);
+            captured = free.into_iter().filter(|t| !own.contains(t)).collect();
+            if !captured.is_empty() {
+                let all = captured.iter().copied().chain(own).collect();
+                self.st.get_mut(id).tparams = all;
+            }
+        }
         self.st.get_mut(id).ty = rhs_ty;
         self.st.pop_scope();
+        let member = if captured.is_empty() {
+            Type::TypeMember(id)
+        } else {
+            Type::Applied {
+                ctor: Box::new(Type::TypeMember(id)),
+                args: captured.into_iter().map(Type::TypeParam).collect(),
+            }
+        };
         Some(scala_rs_parser::RefineDecl::Type {
             name: name.clone(),
-            rhs: Some(Type::TypeMember(id)),
+            rhs: Some(member),
             tparams: tparams.len(),
             lo: lo_ty,
             hi: hi_ty,
@@ -24066,7 +24250,7 @@ fn is_right_biased_either(st: &SymbolTable, id: SymbolId) -> bool {
 /// begins. `synthesize_default_getters` needs it to tell "a parameter of an
 /// earlier clause" (which a default may name) from "an earlier parameter of my
 /// own clause" (which nsc forbids).
-fn clause_start_of(paramss_ids: &[Vec<SymbolId>], flat_idx: usize) -> usize {
+pub(crate) fn clause_start_of(paramss_ids: &[Vec<SymbolId>], flat_idx: usize) -> usize {
     let mut start = 0usize;
     for clause in paramss_ids {
         if flat_idx < start + clause.len() {
@@ -25127,7 +25311,7 @@ pub(crate) fn mentions_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
 }
 
 /// Every type parameter `ty` mentions, in order of first appearance.
-fn collect_tparams(ty: &Type, out: &mut Vec<SymbolId>) {
+pub(crate) fn collect_tparams(ty: &Type, out: &mut Vec<SymbolId>) {
     match ty {
         Type::TypeParam(id) => {
             if !out.contains(id) {
@@ -25221,6 +25405,67 @@ pub(crate) fn type_mentions_tparam(ty: &Type, tp: SymbolId) -> bool {
                 .flatten()
                 .any(|t| type_mentions_tparam(t, tp))
                 || type_mentions_tparam(ret, tp)
+        }
+        _ => false,
+    }
+}
+
+/// [`type_mentions_tparam`], but also inside a refinement's parents and
+/// declarations.
+///
+/// The shallow one deliberately stops at a compound type -- see
+/// `adapt_implicit_apply`, where looking inside would start a search at an
+/// unsubstituted parameter (fixture `ovl4`). A refinement's *declarations* are
+/// where cats puts the parameter that only the witness can pin down:
+/// `type Aux[M[_], F0[_]] = Parallel[M] { type F[x] = F0[x] }`, and
+/// `parUnorderedSequence[T, M, F, A](ta: T[M[A]])(implicit P: Parallel.Aux[M, F])`
+/// mentions `F` nowhere else.
+pub(crate) fn type_mentions_tparam_deep(ty: &Type, tp: SymbolId) -> bool {
+    if type_mentions_tparam(ty, tp) {
+        return true;
+    }
+    let decl_types = |d: &scala_rs_parser::RefineDecl| -> Vec<Type> {
+        match d {
+            scala_rs_parser::RefineDecl::Type { rhs, lo, hi, .. } => {
+                [rhs, lo, hi].iter().filter_map(|t| (*t).clone()).collect()
+            }
+            scala_rs_parser::RefineDecl::Def { paramss, ret, .. } => paramss
+                .iter()
+                .flatten()
+                .cloned()
+                .chain(std::iter::once(ret.clone()))
+                .collect(),
+            scala_rs_parser::RefineDecl::Val { ty, .. } => vec![ty.clone()],
+        }
+    };
+    match ty {
+        Type::Refined { parents, decls } => {
+            parents.iter().any(|p| type_mentions_tparam_deep(p, tp))
+                || decls
+                    .iter()
+                    .flat_map(decl_types)
+                    .any(|t| type_mentions_tparam_deep(&t, tp))
+        }
+        Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
+            args.iter().any(|t| type_mentions_tparam_deep(t, tp))
+        }
+        Type::Applied { ctor, args } => {
+            type_mentions_tparam_deep(ctor, tp)
+                || args.iter().any(|t| type_mentions_tparam_deep(t, tp))
+        }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            type_mentions_tparam_deep(t, tp)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(|t| type_mentions_tparam_deep(t, tp))
+                || type_mentions_tparam_deep(ret, tp)
+        }
+        Type::Method { paramss, ret } => {
+            paramss
+                .iter()
+                .flatten()
+                .any(|t| type_mentions_tparam_deep(t, tp))
+                || type_mentions_tparam_deep(ret, tp)
         }
         _ => false,
     }

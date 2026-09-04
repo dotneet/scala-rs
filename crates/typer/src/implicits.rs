@@ -22,7 +22,7 @@
 //! same head symbol and no smaller complexity
 //! (`implicit def loop[A](implicit a: A): A`).
 
-use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
+use scala_rs_parser::{Flags, RefineDecl, SymbolId, Tree, TreeKind, Type};
 use scala_rs_span::Span;
 
 use crate::check::Typer;
@@ -2267,6 +2267,17 @@ impl<'a> Unify<'a> {
         if let Some(r) = self.unify_higher_kinded(a, b, depth) {
             return r;
         }
+        // Two *type lambdas*, one of which still carries unknowns.
+        // `implicit def readerMonad[R]: Monad[({ type L[X] = Reader[R, X] })#L]`
+        // has to answer a wanted `Monad[({ type L[X] = Reader[Int, X] })#L]`.
+        // Neither side applies an unknown *constructor* -- both are aliases --
+        // so the case above does not fire, and structurally the two refinements
+        // are different symbols. Applying both to the same parameters turns the
+        // question into `Reader[R, X]` against `Reader[Int, X]`, which is what
+        // solves `R`.
+        if let Some((ea, eb)) = self.typer.st.eta_expand_pair(a, b) {
+            return self.unify_at(&ea, &eb, depth + 1);
+        }
         match (a, b) {
             (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) => {
                 if s1 == s2 && a1.len() == a2.len() {
@@ -2348,8 +2359,102 @@ impl<'a> Unify<'a> {
                         .zip(a2.iter())
                         .all(|(x, y)| self.unify_at(x, y, depth + 1))
             }
+            // Two refinements, matched parent by parent and declaration by
+            // name. cats names a type constructor member this way --
+            // `type Aux[M[_], F0[_]] = Parallel[M] { type F[x] = F0[x] }` --
+            // and fitting an in-scope `Parallel.Aux[M, F]` to a wanted
+            // `Parallel.Aux[M, ?F]` is the only way `?F` is ever solved.
+            // Structural equality answered this while a member's right-hand
+            // side was the same placeholder symbol whatever `F0` was; now that
+            // the lambda carries what it captured, the arguments have to be
+            // matched.
+            (
+                Type::Refined {
+                    parents: p1,
+                    decls: d1,
+                },
+                Type::Refined {
+                    parents: p2,
+                    decls: d2,
+                },
+            ) if p1.len() == p2.len() && d1.len() == d2.len() => {
+                let (p1, p2) = (p1.clone(), p2.clone());
+                let (d1, d2) = (d1.clone(), d2.clone());
+                p1.iter()
+                    .zip(p2.iter())
+                    .all(|(x, y)| self.unify_at(x, y, depth + 1))
+                    && d1.iter().all(|x| {
+                        match d2
+                            .iter()
+                            .find(|y| refine_decl_name(y) == refine_decl_name(x))
+                        {
+                            Some(y) => self.unify_refine_decl(x, y, depth + 1),
+                            None => false,
+                        }
+                    })
+            }
             _ => a == b,
         }
+    }
+
+    /// Two refinement declarations of the same name, payload by payload.
+    fn unify_refine_decl(&mut self, a: &RefineDecl, b: &RefineDecl, depth: usize) -> bool {
+        let opt = |s: &mut Self, x: &Option<Type>, y: &Option<Type>| match (x, y) {
+            (None, None) => true,
+            (Some(x), Some(y)) => s.unify_at(x, y, depth),
+            _ => false,
+        };
+        match (a, b) {
+            (
+                RefineDecl::Type {
+                    rhs: r1,
+                    tparams: t1,
+                    lo: lo1,
+                    hi: hi1,
+                    ..
+                },
+                RefineDecl::Type {
+                    rhs: r2,
+                    tparams: t2,
+                    lo: lo2,
+                    hi: hi2,
+                    ..
+                },
+            ) => t1 == t2 && opt(self, r1, r2) && opt(self, lo1, lo2) && opt(self, hi1, hi2),
+            (
+                RefineDecl::Def {
+                    paramss: p1,
+                    ret: r1,
+                    ..
+                },
+                RefineDecl::Def {
+                    paramss: p2,
+                    ret: r2,
+                    ..
+                },
+            ) => {
+                p1.len() == p2.len()
+                    && p1.iter().zip(p2.iter()).all(|(x, y)| {
+                        x.len() == y.len()
+                            && x.iter()
+                                .zip(y.iter())
+                                .all(|(x, y)| self.unify_at(x, y, depth))
+                    })
+                    && self.unify_at(r1, r2, depth)
+            }
+            (RefineDecl::Val { ty: t1, .. }, RefineDecl::Val { ty: t2, .. }) => {
+                self.unify_at(t1, t2, depth)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn refine_decl_name(d: &RefineDecl) -> &str {
+    match d {
+        RefineDecl::Type { name, .. }
+        | RefineDecl::Def { name, .. }
+        | RefineDecl::Val { name, .. } => name,
     }
 }
 

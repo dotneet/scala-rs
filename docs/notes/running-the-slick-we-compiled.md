@@ -1056,3 +1056,193 @@ separately compiled caller links against.
 * **`p06_update_tx`** — unchanged: the transaction does not roll back,
   `afterTx2` keeps the update it threw out of and `seq=List(2, 2)` instead of
   `List(2, 1)`.
+
+# All twelve (`agent/lasttwo`)
+
+```text
+progs=12 ok=12 diff=0 fail=0
+```
+
+Every one of the twelve slick client programs — compiled once by real scalac
+2.13.16 against the scalac-built slick, then run against each of the two slick
+builds — prints, byte for byte, what the scalac build prints. The classfiles
+under them are scala-rs's, and the run reaches H2 through the query compiler,
+the SQL generator, JDBC and result mapping.
+
+The assignment was two programs and it turned out to be **four defects**, plus
+a fifth found on the way that slick does not exercise. `p10_types` alone was
+three of them, one behind the other: the brief's guess that its
+`apply$default$2` might share a root with `agent/missingclasses`'s
+"constructor default arguments" note was right, and fixing it uncovered two
+more, both `AbstractMethodError`/`ClassCastException` in the same class.
+
+All five were on `main`; none is a regression from any slice.
+
+## 1. A primary constructor's defaults had no getters at all
+
+`p10_types`: `NoSuchMethodError:
+RelationalProfile$ColumnOption$Length$.apply$default$2()`.
+
+nsc puts a constructor's defaults on the class's **companion module**, under
+two names — `$lessinit$greater$default$n` for `new C(…)` and, for a case
+class, `apply$default$n` for the synthetic `apply`. scala-rs synthesized
+neither: `Typer::type_default_rhs_here` splices the stored expression into the
+call instead, which is enough inside one run and invisible from outside it. A
+*separately compiled* caller emits the getter call, and slick's
+
+```scala
+case class Length(length: Int, varying: Boolean = true) extends ColumnOption[Nothing]
+```
+
+is reached from client code as `O.Length(64)`.
+
+`crates/typer/src/ctor_defaults.rs` declares both getters on the companion
+module class with the default's typed body; `Gen::emit_default_getters`
+already writes out every `$default$` member of a class it emits, so
+`emit_case_companion` only had to start calling it. This is the same root
+`docs/not-implemented.md` recorded as "default constructor arguments across a
+compilation run", and it is now closed for every class that *has* a companion
+— which is every case class, and any class the source gives an `object`. The
+part that is left is nsc *synthesizing* a companion for a plain
+`class Box(val a: Int, val b: Int = 7)`; that would add classfiles.
+
+Two details that are not obvious and that slick needs:
+
+* **The result type is inferred, not declared, when the parameter's type names
+  one of the class's type parameters.** `case class Comprehension[+Fetch <:
+  Option[Node]](…, fetch: Fetch = None, …)` has no `None` that conforms to
+  `Fetch`; nsc's getter is declared `scala.None$`. Declaring `Fetch` made
+  slick fail to compile at the declaration.
+* **The typed body goes on the getter only.** The parameter's own
+  `default_rhs` has to stay the namer's untyped tree, because that is what a
+  call site clones and re-types in its own scope.
+
+The getters are *not* consulted at call sites: a case class's synthetic
+`apply` keeps splicing. Calling them would fix the argument's type before the
+class's type parameters are solved, and `Comprehension(s, n, select = …)` then
+reports `found: None$ required: Fetch`. nsc infers `Fetch` **from** the
+getter's result; scala-rs does not, and that gap is now written down in
+`docs/not-implemented.md` rather than guessed at.
+
+## 2. A default getter reached through an *inserted* `apply`
+
+Latent until defect 1 put such getters on companions, and a real bug on its
+own: `G.H(4)` is `Select(G, "H")` carrying `H`'s `apply` as its symbol, so
+`default_getter_apply`'s "the receiver is the qualifier" answered `G` and the
+call came out as `G$.apply$default$2` — a compile error against a program real
+scalac accepts. The head of the application chain is the receiver whenever the
+`apply` was inserted.
+
+## 3. A trait nested in a member `object`, mixed in elsewhere
+
+Two halves, both in `p10_types`'s `items.schema`.
+
+slick has
+
+```scala
+trait JdbcStatementBuilderComponent { self: JdbcProfile =>
+  class TableDDLBuilder(table: Table[?]) { … }
+  object TableDDLBuilder {
+    trait UniqueIndexAsConstraint extends TableDDLBuilder { … }
+  }
+}
+```
+
+and `H2Profile` mixes it in with
+`class H2TableDDLBuilder(table) extends TableDDLBuilder(table) with
+TableDDLBuilder.UniqueIndexAsConstraint`.
+
+* `emit_trait_outer_accessors` declined to implement
+  `…$UniqueIndexAsConstraint$$$outer()` at all, because `TableDDLBuilder$` is
+  not on `H2TableDDLBuilder`'s own `$outer` chain — that chain runs to
+  `H2Profile`. A member `object` is reached through the enclosing template's
+  accessor (`H2Profile.TableDDLBuilder()`), not by walking out.
+  `AbstractMethodError` on the first `createIndex`.
+* Inside the trait's body, `table` and `columns` — members of the class the
+  trait **extends** — were read by walking out to `$outer` and casting that to
+  `TableDDLBuilder`. `is_owner_compatible` refuses to follow a trait's class
+  parent, which is right for a call *through the interface* and wrong for
+  `this`: every instance of `trait U extends B` is a `B`, and nsc emits
+  `aload_0; checkcast B`. `ClassCastException: H2Profile$ cannot be cast to
+  …$TableDDLBuilder`. `load_owner_instance` now uses `self_reaches_owner`,
+  which does follow that edge; the trailing `checkcast` was already there.
+
+## 4. A mixin forwarder overrode a superclass's own override
+
+This is `p06_update_tx`, and it was not what either the brief or the earlier
+note guessed. The transaction never *started*: a probe
+(`SimpleDBIO(_.connection.getAutoCommit)` run inside `.transactionally`
+against each build) printed `false` on the scalac build and `true` on ours, so
+there was nothing to roll back. `transactionDepth` was right and
+`installSession` did take its `setupTransaction` branch — the branch just ran
+`BasicBackend`'s `= None` instead of `JdbcBackend`'s override.
+
+`emit_mixin_forwarders` keys on name plus *erased parameter list*.
+`BasicDatabaseDef.setupTransaction(session: Session, …)` erases to
+`(BasicSessionDef, Option)`; `abstract class JdbcDatabaseDef` fixes
+`type Session = JdbcSessionDef` and overrides it, which erases to
+`(JdbcSessionDef, Option)` plus a bridge for the wide one. Different key, so
+`new JdbcDatabaseDef(…){}` — the anonymous class every `Database` really is —
+was handed a forwarder for the wide descriptor straight to
+`BasicDatabaseDef$class.setupTransaction`, and that forwarder overrode the
+bridge it inherited.
+
+The rule now follows the linearization: a trait that sits **past the
+superclass** in it is an ancestor of that class, not a mixin of this one, and
+if a class on the superclass chain declares a concrete member that
+`bridge_overrides` it, this class owes no forwarder. Traits mixed in by the
+class itself come *before* the superclass and are untouched, so
+`class B extends A with T` where `T` overrides `A.m` still forwards to `T`.
+
+## 5. A `case class` in a trait had no companion accessor
+
+Found while probing 4, and not on slick's own path. A `case class` declared in
+a trait carries a *synthesized* companion, which is a member `object` of that
+trait exactly as a written one is: the trait declares an abstract `K()`
+accessor and every class mixing it in owes an implementation. Only the written
+`ModuleDef`s were harvested into `TraitImpls::modules`, so nothing implemented
+it:
+
+```scala
+trait T { case class K(a: Int, b: Int = 2) }
+object P extends T
+P.K(1)   // AbstractMethodError: P$ … abstract T$K$ K()
+```
+
+slick's `trait BasicBackend { case class ExecState(…) }` is this shape and
+survives only because nothing outside the trait names `ExecState`.
+
+## Corrections to the record
+
+* The brief's "`p10_types` may or may not share a root with `agent/
+  missingclasses`'s constructor-defaults note" — it does, and that note's
+  reading ("namer has to synthesize `$lessinit$greater$default$N` in the
+  companion body") is right in substance. It does not need a `DefDef` in the
+  body, though: a symbol on the companion module class with the typed body on
+  it is enough, because `emit_default_getters` already walks those.
+* The brief's "`p06_update_tx` does not roll back — the `.transactionally`
+  path" named the right program and the wrong mechanism. Nothing about
+  `Outcome.isSuccess`, `guaranteeCase` or the commit/rollback choice was
+  wrong; the connection was in autocommit the whole time.
+* "One failing program, one root" held for neither. `p10_types` was three.
+
+## Verification
+
+On `agent/lasttwo` **after `git merge main`**:
+
+| | |
+|---|---|
+| `tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0` |
+| `tests/slick_measure.sh` | `files=184 errors=0 files_with_errors=0 classes=1596` |
+| `tests/slick_subset.sh` | `verified=1596 failed=0` |
+| `cargo test --workspace --release` | 1909 tests, 0 failed (142 binaries) |
+| `tests/conform/` | 86 passed |
+| `javap -p` over all 1596 slick classfiles | clean |
+
+The regression fixture is `tests/fixtures/lasttwo.scala` (one file, all five)
+with `crates/cli/tests/lasttwo.rs`: real scalac 2.13.16's own stdout, plus
+`javap` for the four things stdout cannot see — the companion's default-getter
+descriptors (only a separately compiled caller links against them, and
+`scala.None$` is the inferred one), the module accessor behind the trait's
+`$outer`, the absence of a forwarder on the anonymous subclass, and the
+case-class companion accessor on a trait and its implementor.
