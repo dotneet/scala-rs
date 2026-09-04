@@ -7321,7 +7321,18 @@ impl Typer {
                 // `def step(branches: Branches)` -- so the aliases have to be
                 // resolved before the local signatures that name them, exactly
                 // as a template resolves its type members first.
-                for s in stats.iter_mut() {
+                //
+                // Only up to the first `import`, though: an import inside a
+                // block takes effect from where it stands, and resolving a
+                // later alias ahead of it types the alias in the wrong scope
+                // (`pos/t5305` writes `import O.{F, v}` and then
+                // `type x = { type l = (F, v.type) }`). An alias after an
+                // import keeps the order it always had.
+                let upto = stats
+                    .iter()
+                    .position(|s| matches!(s.kind, TreeKind::Import { .. }))
+                    .unwrap_or(stats.len());
+                for s in stats[..upto].iter_mut() {
                     if matches!(s.kind, TreeKind::TypeDef { .. }) {
                         if s.sym.is_none() {
                             self.namer(s);
@@ -7329,7 +7340,7 @@ impl Typer {
                         self.type_member_sig(s);
                     }
                 }
-                self.finish_type_aliases(stats);
+                self.finish_type_aliases(&mut stats[..upto]);
                 // A local `def` is in scope for the whole block, so it may be
                 // called before it is written -- and two of them may call each
                 // other. Only the signature is built here (which is what a

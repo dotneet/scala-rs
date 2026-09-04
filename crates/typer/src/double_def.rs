@@ -120,9 +120,9 @@ fn key(ty: &Type) -> String {
 ///
 /// `None` when the signature is not a method type, or when any part of it is
 /// one this compiler did not resolve.
-fn erased_params(st: &SymbolTable, id: SymbolId) -> Option<(Vec<String>, Vec<Type>)> {
+fn erased_params(st: &SymbolTable, id: SymbolId) -> Option<(Vec<String>, Vec<Type>, Type)> {
     let ty = st.get(id).ty.clone();
-    let Type::Method { paramss, .. } = &ty else {
+    let Type::Method { paramss, ret } = &ty else {
         return None;
     };
     if uncertain(&ty) {
@@ -142,7 +142,19 @@ fn erased_params(st: &SymbolTable, id: SymbolId) -> Option<(Vec<String>, Vec<Typ
         keys.push(key(&e));
         tys.push(e);
     }
-    Some((keys, tys))
+    // The **result** is part of the descriptor, and the JVM lets two methods
+    // differ in it alone -- which Scala uses. `scala.Function.uncurried` is
+    // five overloads that all take one `Function1` and return `Function2` ...
+    // `Function6`, and real scalac 2.13.16 accepts them (probed) while
+    // rejecting `def g(x: List[Int]): Int` beside `def g(x: List[String]):
+    // Int`. Leaving the result out cost twelve false diagnostics on
+    // `src/library/scala/Function.scala` alone.
+    let r = crate::erasure::erase_member_ty(ret, st);
+    if uncertain(&r) {
+        return None;
+    }
+    keys.push(format!("){}", key(&r)));
+    Some((keys, tys, r))
 }
 
 /// The erased parameter type as the class file records it, for the message.
@@ -171,6 +183,13 @@ fn is_candidate(st: &SymbolTable, cls: SymbolId, id: SymbolId) -> bool {
     if s.name.contains('$') {
         return false;
     }
+    // A macro def has no bytecode -- every call site is replaced by the
+    // expansion -- so two of them cannot collide in a class file. Real scalac
+    // 2.13.16 accepts `pos/t7776`'s two `app` macros and rejects the same pair
+    // written as ordinary methods (both probed).
+    if s.macro_impl.is_some() {
+        return false;
+    }
     let f = s.flags;
     !(f.contains(Flags::SYNTHETIC) || f.contains(Flags::BRIDGE) || f.contains(Flags::ACCESSOR))
 }
@@ -190,7 +209,7 @@ pub fn check_double_defs(st: &SymbolTable, cls: SymbolId, members: &[SymbolId]) 
         if !is_candidate(st, cls, id) {
             continue;
         }
-        let Some((ps, tys)) = erased_params(st, id) else {
+        let Some((ps, tys, ret)) = erased_params(st, id) else {
             continue;
         };
         let name = st.get(id).name.clone();
@@ -205,19 +224,37 @@ pub fn check_double_defs(st: &SymbolTable, cls: SymbolId, members: &[SymbolId]) 
                 } else {
                     format!("def {}", s.name)
                 };
-                format!("{what}{}", st.display_type(&s.ty))
+                match &s.ty {
+                    Type::Method { paramss, ret } => {
+                        let clauses = paramss
+                            .iter()
+                            .map(|c| {
+                                let ps = c
+                                    .iter()
+                                    .map(|t| st.display_type(t))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("({ps})")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                        format!("{what}{clauses}: {}", st.display_type(ret))
+                    }
+                    t => format!("{what}{}", st.display_type(t)),
+                }
             };
             let erased = tys
                 .iter()
                 .map(|t| show_erased(t, st))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let ret = show_erased(&ret, st);
             out.push(DoubleDef {
                 sym: id,
                 // nsc puts the detail on continuation lines and so do we: the
                 // head of the message is what says which check fired.
                 message: format!(
-                    "double definition:\n{} and {} have same type after erasure: ({erased})",
+                    "double definition:\n{} and {} have same type after erasure: ({erased}): {ret}",
                     desc(*prev),
                     desc(id)
                 ),
