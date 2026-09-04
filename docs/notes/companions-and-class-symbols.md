@@ -165,3 +165,173 @@ I ran `--test localcc --test localtrait --test ctorstmt --test quasi --test prod
 
 - **A case class companion has no actual `unapply` implementation.** `namer_class` in `crates/typer/src/check.rs` (where the companion is synthesized) only creates the symbol for `unapply` without setting its `.ty`, and `crates/backend/src/gen.rs` has `emit_case_apply` but no `emit_case_unapply`. Calling `P.unapply(P(1))` **explicitly** on a top-level `case class P(n: Int)` typechecks and then fails at runtime with `NoSuchMethodError: 'scala.Option P$.unapply(P)'` (the pattern match `p match { case P(x) => … }` itself is unaffected and works, because it goes through a different path that reads the fields directly). This is a pre-existing, separate gap common to top-level case classes, not just local ones, and is out of scope for this slice.
 - **The shape where a local `case class` captures a local variable from the enclosing scope is still rejected with a diagnostic** (see "One more gap found while verifying" above). It needs a `LazyRef`-equivalent implementation.
+
+
+### Fifty-eight classfiles scalac writes and we did not (`agent/missingclasses`)
+
+Comparing the class**file name sets** of scala-rs and scalac 2.13.16 over
+slick's 184 sources (nested names normalised to `$` on both sides) gave 1170
+common, 382 ours only, 328 theirs only. Of the 328, 63 were not
+anonymous-class naming noise, and they had three roots -- none of which shows
+up when slick is compiled on its own, because everything resolves inside one
+run. They only bite a **separate** compilation, which is what a compiler
+producing a library is for.
+
+The first thing to establish was that they bite at all. A three-line library
+compiled by scala-rs and consumed by real scalac settles it:
+
+```scala
+package myp
+package object util { val greeting: String = "hi"; def twice(n: Int): Int = n * 2 }
+class Box(val a: Int, val b: Int = 7)
+class Ops(val x: Int) extends AnyVal { def inc: Int = x + 1 }
+```
+
+```
+$ scalac -classpath LIB_RS use.scala
+use.scala:3: error: object twice is not a member of package myp.util
+use.scala:3: error: object greeting is not a member of package myp.util
+use.scala:4: error: not enough arguments for constructor Box: (a: Int, b: Int): myp.Box
+```
+
+and, once the package object was fixed, on the value class:
+
+```
+error: java.lang.AssertionError: assertion failed:
+  no extension method found for:  method inc:Int
+        during phase: globalPhase=erasure, enteringPhase=refchecks
+```
+
+So: not cosmetic. scala-rs was writing libraries that scalac cannot use.
+
+#### Root 1 -- a package object is two classfiles, and the pickle is on the other one
+
+nsc compiles `package object p` to `p/package$.class` (the module) **and**
+`p/package.class` (the mirror). `javap -v` on both says which one matters:
+
+| classfile | attributes |
+| --- | --- |
+| `slick/ast/package$.class` | `ScalaInlineInfo`, `Scala` (the bare marker) |
+| `slick/ast/package.class` | `ScalaSignature` (the pickle), `ScalaSig` |
+
+The pickle is on the **mirror**. `emit_module` in `crates/backend/src/gen.rs`
+had an explicit `&& name != "package"` guard on the mirror-class call, added
+in passing back in `734be89` with no reason recorded, so scala-rs shipped no
+pickle for a package object anywhere. That is the whole of `object twice is
+not a member of package myp.util`: scalac found the module classfile, found
+no signature, and had nothing to read. Dropping the guard emits the mirror
+with the pickle on it (mirror classes already carry one -- that is how
+`object Lib` works), and the consumer compiles and runs. **12 classfiles.**
+
+#### Root 2 -- a value class's `$extension` methods live on its companion
+
+nsc's `extmethods` phase rewrites a value class's methods to
+`name$extension` statics-in-spirit and **declares them on the class's
+companion module**, synthesizing that module when the source wrote none.
+`extmethods` runs *before* `pickler`, so those declarations are in the
+signature every later compilation reads. `ExtensionMethods.extensionMethod`
+looks the method up in `imeth.owner.companionModule.info` and asserts if it
+is not there -- the `AssertionError` above.
+
+We put the `$extension` methods in statics on the value class itself, which
+is what our own call sites use and is fine inside one run. The fix keeps
+that and adds what nsc's ABI needs:
+
+* `crates/typer/src/value_companion.rs` declares
+  `name$extension[C's tparams, m's tparams]($this: C, m's params): R` on the
+  companion, creating the companion when needed. Two details of
+  `ExtensionMethods.normalize` fix the shape and both are load-bearing: it
+  finds the receiver by the **name** `$this` (`nme.SELF`), and it drops the
+  first `clazz.typeParams.length` type parameters, so the class's come
+  first. The pass runs after the whole run is typed and before `pickle_all`,
+  so nothing it adds can change how anything resolves.
+* `gen.rs` writes the companion classfile, its methods forwarding to the
+  statics -- one copy of each body, both ABIs working. A written companion
+  and a `case class ... extends AnyVal`'s synthetic one get the same
+  forwarders, so the classfile never says less than the pickle does.
+
+Fixing the lookup only moved the failure one phase along:
+
+```
+warning: an unexpected type representation reached the compiler backend: <notype>
+error: Error while emitting use2.scala
+```
+
+with the erasure tree reading
+`Ops.inc$extension(Int.box(41).$asInstanceOf[<notype>]())`. A value class
+erases to the type of its **single parameter accessor**, and nsc finds that
+accessor by the flag pair `PARAMACCESSOR | METHOD`
+(`Symbol.derivedValueClassUnbox`). `pickle_val` set `PARAMACCESSOR` only for
+`case` classes, so scalac could not erase `Ops` at all. Setting it for a
+value class's accessor too (`crates/backend/src/pickle.rs`) finished it.
+**32 classfiles.**
+
+#### Root 3 -- operator characters were written into classfile names raw
+
+A type's simple name goes through the same `NameTransformer` encoding a
+method name does. slick's `object :@` nested in `object TypeUtil` is
+`slick/ast/TypeUtil$$colon$at$` for nsc; we emitted `TypeUtil$:@$.class` --
+a name no consumer can reference, and not a portable file name either.
+`jvm_for_current` (`crates/typer/src/check.rs`) now runs the simple name
+through `scala_rs_pickle::names::encode_method_name`, which already existed
+for methods. **2 classfiles.**
+
+#### Numbers
+
+slick, class-file name sets against scalac 2.13.16, 184 files:
+
+| | before | after |
+| --- | --- | --- |
+| common | 1170 | 1216 |
+| scalac only | 328 | 282 |
+| scala-rs only | 382 | 380 |
+| non-anonymous "scalac only" | 63 | 17 |
+
+`tests/slick_measure.sh`: `files=184 errors=0 files_with_errors=0
+classes=1596` (1552 before -- 44 new files, and 2 renamed rather than
+added). `tests/slick_subset.sh`: `verified=1596 failed=0`, so every new
+classfile loads with the verifier on.
+
+The tests are `tests/fixtures/mcls_lib.scala` plus `mcls_main.scala`,
+compiled against the *classfiles* rather than alongside the source, by
+scala-rs and by real scalac, in `crates/cli/tests/e2e.rs`.
+
+#### What is left
+
+* **12 companions for classes with default constructor arguments.**
+  `class SlickException(msg: String, parent: Throwable = null)` gets a
+  synthetic `SlickException$` from nsc holding
+  `$lessinit$greater$default$2`, plus a static forwarder on the class.
+  We have neither: the typer inlines a constructor default at the *call
+  site* (`type_default_rhs_here`, and the comment there says so outright --
+  "a primary constructor's defaults have no `name$default$n` getters"), and
+  the parameter is not marked `DEFAULTPARAM` in the pickle either, so
+  scalac reading our `Box` says `not enough arguments for constructor Box`.
+  Closing this means doing what nsc does -- synthesizing the getter as a
+  real `DefDef` in the companion's body at namer time, so it is typed,
+  pickled and emitted like any other method -- which is a namer change, not
+  a codegen one. The five remaining `$typecreator` / `$treecreator` names
+  belong to the anonymous-class naming bucket, not here.
+* **Anonymous-class naming.** 265 of the 328 differences are ours and
+  scalac's disagreeing on the *name* of an anonymous or `$anonfun` class,
+  and on top of that we join a nested anonymous class's name with `/`
+  instead of `$`, which drops it at the output root rather than beside its
+  owner. Left alone deliberately; it is its own slice.
+* **A mirror class forwards `def`s but not `val` accessors.** nsc's
+  `slick/util/GlobalConfig.class` has `public static boolean
+  detectRebuild()` and five more; ours has only the one `def`. Same for a
+  package object's mirror (`slick/util/package.class` is missing
+  `ignoreFollowOnError()`). `emit_forwarder`'s list is built from the
+  template's `DefDef`s alone. It costs nothing through the pickle -- a
+  Scala consumer reads the accessor off the module -- so it only shows up
+  from Java. Pre-existing and not specific to package objects; left alone.
+* **An operator-named *method* is not visible to scalac through our
+  pickle**: `class Plain(val v: Int) { def ~(o: Int): String }` compiled by
+  scala-rs and used by scalac gives `value ~ is not a member of
+  myw.Plain`. Pre-existing, reproduces on a plain class, and not about
+  missing classfiles -- the classfile is written and the method is in it
+  under the right encoded name -- so it was not touched here, but it blocks
+  separate compilation the same way the three roots above did. (A module's
+  **nested class-like members** had the same shape of problem and were
+  fixed on `main` by `ceb9b38`, `agent/testkit2`, while this slice was in
+  progress; `object Box { class Inner }` now reaches scalac.)

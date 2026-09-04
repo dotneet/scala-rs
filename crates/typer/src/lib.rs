@@ -76,6 +76,7 @@ mod seqfn_view;
 mod symbol;
 mod traitparent;
 mod uncurry;
+mod value_companion;
 mod views;
 
 pub use anon_capture::mark_anon_captures;
@@ -95,6 +96,7 @@ pub use symbol::{
     Intrinsic, MacroBinding, SamSig, SeqPayload, SymKind, Symbol, SymbolTable, AS_SEEN_FROM_MARK,
 };
 pub use uncurry::uncurry;
+pub use value_companion::add_value_class_companions;
 
 use scala_rs_parser::{parse_str, Tree};
 

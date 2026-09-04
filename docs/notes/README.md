@@ -29,7 +29,7 @@ Chapter headings carry the slice they came from (`agent/xxx`).
 
 | file | what it covers |
 | --- | --- |
-| [companions-and-class-symbols.md](companions-and-class-symbols.md) | How class symbols and their companions are built: parents that do not exist, an `apply` loaded twice, a missing companion classfile. |
+| [companions-and-class-symbols.md](companions-and-class-symbols.md) | How class symbols and their companions are built: parents that do not exist, an `apply` loaded twice, missing companion classfiles — and the 58 classfiles scalac writes that we did not. |
 | [jar-and-pickle-symbols.md](jar-and-pickle-symbols.md) | Where a symbol's type comes from when the class lives in a jar, and what gets lost on the way. |
 | [macro-reflect-and-reify.md](macro-reflect-and-reify.md) | The reflection API surface supplied from pickles, and the expansion of `reify { … }`. |
 | [slick-dsl-overloads-and-macros.md](slick-dsl-overloads-and-macros.md) | slick's own API surface: `DBIOAction`, `TableQuery` / `Compiled`, and the `ShapedValue.mapTo` macro. |
