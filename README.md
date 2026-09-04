@@ -3650,6 +3650,140 @@ implicit 探索、`Ref.Make[F]` の導出）で止まるからです。エラー
   `Expression does not convert to assignment because receiver is not assignable.`）に
   まとめた。以前は 2 つ別々に出ていて、直前の `m("a") = 1` が失敗したように読めた
 
+### `super.m` は「親」ではなく `this.type` から見る（`agent/lastone`）
+
+slick に残っていた**最後の型エラー 1 件**（`jdbc/SQLiteProfile.scala:183`）と、
+それが型検査を通って初めて届くようになった **codegen のバグ 2 件**です。
+これで slick の **184 ファイルすべてが 1 回のコンパイルで型検査を通り**、
+**4552 個の classfile** が出て、その**全部が `java -Xverify:all` でロードできる**
+ようになりました（セッション開始時 537 件 → 直前 1 件 → **0 件**）。
+
+```
+# 直前:  subset_files=47  classes=300  verified=300 failed=0
+tests/slick_measure.sh   → files=184 errors=0 files_with_errors=0 classes=4552
+tests/slick_subset.sh    → verified=4552 failed=0
+                           subset_files=184 classes=4552 (of 184 sources)
+```
+
+診断はこう出ていました:
+
+```
+error: no matching overload for (Iterable[U], JdbcActionComponent.RowsPerStatement)…
+       with arguments (Iterable[U], RowsPerStatement)
+```
+
+**「オーバーロード」でも「名前付き引数」でもありませんでした。** 候補は 1 つしか
+なく、それが引数を拒んでいただけです。根は `super.m` のメンバ型を**親のクラスを
+単独で名指しして**読んでいたことでした。正しくは `this.type` から見ます:
+
+```scala
+// slick/jdbc/JdbcActionComponent.scala
+trait JdbcActionComponent extends BasicActionComponent { self: JdbcProfile =>
+  type RowsPerStatement >: slick.jdbc.RowsPerStatement.One.type <: slick.jdbc.RowsPerStatement
+  trait InsertActionComposer[U] {
+    def insertAll(values: Iterable[U], rowsPerStatement: RowsPerStatement = defaultRowsPerStatement): …
+  }
+  object MultipleRowsPerStatementSupport extends … {
+    override type RowsPerStatement = slick.jdbc.RowsPerStatement   // ← 具体化
+  }
+}
+// slick/jdbc/SQLiteProfile.scala:183
+trait SQLiteProfile extends JdbcProfile with JdbcActionComponent.MultipleRowsPerStatementSupport {
+  private trait SQLiteInsertAll[U] extends InsertActionComposerImpl[U] {
+    override def insertAll(values: Iterable[U], rowsPerStatement: RowsPerStatement = RowsPerStatement.All) =
+      super.insertAll(values = values, rowsPerStatement = if (…) RowsPerStatement.One else rowsPerStatement)
+  }
+}
+```
+
+`InsertActionComposerImpl` を単独で見ると `rowsPerStatement` は**抽象型メンバの
+まま**（`>: One.type <: RowsPerStatement`）で、そこに適合するのは下限の
+`One.type` だけです。`SQLiteProfile` は `MultipleRowsPerStatementSupport` を
+mixin しているので、`this.type` から見れば `slick.jdbc.RowsPerStatement` に
+なります。`Check::type_select` で `super` の受け手を作るときに `this_id` を
+覚えておき、メンバ型を `expand_type_members(this_id, …)` に通すようにしました
+（`this.m` と `x.m` は以前から `expand_in_type` で同じことをしています）。
+
+続けて、classfile 側で 2 つ壊れていました。**どちらも main にもとからあった
+バグ**で、この形が型検査を通るまで踏めなかっただけです:
+
+1. **抽象型メンバの erasure が `Object` でした。** SLS 3.7 では型パラメータと
+   同じく**上限に erase** します。実 scalac 2.13.16 も
+   `insertAll(Iterable, Rps)` と書きます。`Object` にしていたため、継承した
+   `insertAll(Iterable, Object)` とプロファイル側の
+   `insertAll(Iterable, Rps)` が**別の JVM メソッド**になり、trait の
+   `$super$` アクセサが `NoSuchMethodError` になっていました
+   （`crates/typer/src/erasure.rs::erase_ty`）。**上限が 1 つのクラスを名指し
+   している場合だけ**採ります。`type TermName >: Null <: TermNameApi with Name`
+   （scala-reflect）のような**合成型の上限**は nsc の `intersectionDominator` が
+   要るので、従来どおり `Object` のままにしています。先頭の親を採ると
+   `TermNameApi` になり、これは `NameApi` ではないので、`Name` を要求する
+   `Select.apply(TreeApi, NameApi)` に `TermName` を渡すときの
+   checkcast（`Object` 由来だから入っていた）が消え、マクロブリッジが
+   `VerifyError: Bad type on operand stack` になりました。
+2. **`T$$super$m` アクセサの記述子が呼び出し側と転送先で食い違っていました。**
+   アクセサは trait のメンバなので**オーバーライドした側の** erasure を持ち、
+   転送先の親メソッドは**自分の** erasure のままです。
+   `override type Rows = One.type`（上限より狭い具体化）だと 2 つは一致せず、
+   `invoke_super` は存在しないメソッドを呼び、アクセサ本体は存在しない
+   メソッドへ `invokespecial` していました。呼び出しは**現在のメソッドの**
+   記述子で、転送は**転送先の**記述子で行い、戻り値が狭まるときだけ
+   `checkcast` を挟むようにしました（`crates/backend/src/gen.rs::invoke_super`
+   / `emit_super_accessors` / `super_target_desc`）。
+
+**ブリーフの仮説は当たっていませんでした。** 前スライスは
+「境界付き抽象型メンバの as-seen-from」と書いていて、領域としては合っていますが、
+実際に効いたのは `subst_as_seen_from` でも `self_type_of_class` でもなく
+**`super` の受け手だけが `this` の型メンバ表を見ていなかったこと**です。
+`self:` 注釈（`self: JdbcProfile =>`）も無関係でした。
+
+**この節では直していない、同じ領域の残件**（実 scalac は通します）:
+
+```scala
+trait Profile extends Comp with MultiSupport {   // MultiSupport が type Rows を具体化
+  def h(c: ComposerImpl[Int], x: Rps): String = c.single(x)   // ← こちらは今も拒否
+}
+```
+
+`ComposerImpl` は `Comp` の内部クラスなので、nsc での型は
+`Profile.this.ComposerImpl[Int]` です。こちらの `Type::Class` は**前置型を
+持たない**ので、`Profile` が `Rows` を具体化していることに到達できません。
+`super` と `this` 経由は今回直りましたが、**値を経由した内部クラスの受け手**は
+前置型を型に持たせないと直りません（`Type::Class` に prefix を足す変更なので、
+このスライスではやっていません）。
+
+### 演算子名の `val` がフィールド名として encode されていなかった
+
+184 ファイル全部の classfile が出て初めて表に出ました。4552 個のうち **2 個**が
+`java.lang.ClassFormatError: Illegal field name "/"` でロードできませんでした
+（`slick.ast.Library$` と `slick.lifted.NumericColumnExtensionMethods$class`）。
+
+```scala
+// slick/ast/Library.scala:31
+val / = new SqlOperator("/")
+```
+
+**メソッド名は encode していましたが（`crates/pickle/src/names.rs`）、
+フィールド名は生のまま**でした。JVMS 4.2.2 の「unqualified name」は
+`.` `;` `[` `/` を許さないので、`/` だけがロード時に落ちます
+（`+` `-` `*` `%` はたまたま合法なので、名前は変でも動いていました）。
+nsc は項の名前をすべて同じ NameTransformer に通します。
+`ClassEmit::write_with_pool` のフィールド定義側と、
+`getfield` / `putfield` / `getstatic` / `putstatic` の参照側の**両方**を
+`encode_method_name` に通すようにしました（`crates/backend/src/code.rs`）。
+encode 済みの名前を通しても変わらないので、既存の合成フィールド
+（`$outer` / `bitmap$0` / `MODULE$`）には影響しません。
+
+### `slick_subset.sh` が警告でファイルを捨てていた
+
+型エラーが 0 になって初めて表に出ました。`slick_subset.sh` は
+`^\s+--> …\.scala` の行からエラーのあったファイルを拾っていましたが、この
+`-->` 行は**警告にも付きます**。0 エラー・2 警告の計測ログを種にすると
+`JdbcActionComponent.scala` が「悪いファイル」として除かれ、それに依存する
+ファイルが次の周で落ち、収束済みの 184 ファイルが 132 まで縮んでいきました。
+`grep -A 2 '^error'` を先に噛ませて、**エラーの直後の `-->` 行だけ**を見る
+ようにしました。
+
 ## 実装していないもの
 
 次は実装していません。スタブで「動いたことにする」こともしていません。言語側の残りとライブラリ側の残りを分けます。
@@ -12705,6 +12839,37 @@ class CArr[+T](val xs: Seq[T]) {
 * `tests/slick_subset.sh`（`SLICK_SEED_LOG` 付きで 1 回）:
   `subset_files=47 classes=300 verified=300 failed=0` → 変化なし。
 * `tests/conform`: 77 本 → **85 本**。
+
+### `agent/lastone` スライスのテスト
+
+`crates/cli/tests/lastone.rs`（4 本）。fixture は `tests/fixtures/lastone.scala`
+（1 ファイルに全ケース）と `tests/fixtures/lastone_bad.scala` です。他のエージェント
+との衝突を避けるため `e2e.rs` には入れていません。
+
+`lastone.scala` は slick を 1 行も使わずに `SQLiteProfile.scala:183` の形を並べます:
+`type RowsPerStatement >: Rps.One.type <: Rps` という**境界付き抽象型メンバ**を、
+mixin が**上限まで広げて**具体化する側（`MultiSupport`）と、**下限まで狭めて**
+具体化する側（`SingleSupport`）の両方で、内部 trait が
+`super.insertAll(value = …, batch = …, rows = if (batch) Rps.One else rows)` を
+名前付き引数で呼びます。**修正前の main では
+`no matching overload for (U, Boolean, Comp.RowsPerStatement)String` 1 件で落ちます。**
+`fixtures_lastone_library_abi` / `fixtures_lastone_private_runtime` が
+`--scala-library` と私有ランタイムの両方で `java -Xverify:all` の下に走らせ
+（狭める側は `$super$` アクセサの記述子が親と違うので、型検査だけでは
+通っても**ロードと実行**で初めて食い違いが出ます）、
+`real_scalac_dual_run_lastone` が real scalac 2.13.16 の stdout と 1 文字まで
+一致することを見ます。`fixtures_lastone_bad_is_error` は、`this` から見えるように
+したことで型メンバが「なんでも通す」ようになっていないことを固定します:
+狭い具体化の下で `Rps.All` を渡す形と、何も具体化していない場所で同じことを
+する形の**2 件**を拒否します（real scalac 2.13.16 も同じ 2 行で
+`found: BadRps.All.type / required: … (which expands to) BadRps.One.type` と
+`required: BadOpenProfile.this.Rows` を出します）。同じ fixture に
+`class Ops { val / = "div"; val + = "plus"; var % = "mod" }` と
+`object Ops { val * = "times" }`（slick の `ast/Library.scala` そのものの形）も
+入れてあります。**型検査では捕まらない**——生の `/` はフィールド定義として
+書けてしまい、`java` がクラスをロードするときに初めて
+`ClassFormatError: Illegal field name "/"` になるので、
+`-Xverify:all` で実際に走らせる 3 本が唯一の網です。
 
 ## ライセンス
 

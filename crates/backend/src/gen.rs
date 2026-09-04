@@ -1577,6 +1577,18 @@ fn linearize(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
     scala_rs_typer::linearize(st, cls)
 }
 
+/// The class a value of the `from` descriptor's result must be cast to for the
+/// `to` descriptor's result, or `None` when the two agree or either side is
+/// not a plain object reference.
+fn narrowing_return_cast(from: &str, to: &str) -> Option<String> {
+    let f = from.rsplit(')').next()?;
+    let t = to.rsplit(')').next()?;
+    if f == t || !t.starts_with('L') || !t.ends_with(';') || !f.starts_with('L') {
+        return None;
+    }
+    Some(t[1..t.len() - 1].to_string())
+}
+
 fn super_accessor_name(st: &SymbolTable, trait_id: SymbolId, method: &str) -> String {
     format!("{}$$super${}", st.get(trait_id).name, method)
 }
@@ -4297,6 +4309,16 @@ impl<'a> Gen<'a> {
                 let target = self.next_lin_impl(&lin, idx, &name);
                 let acc_c = acc.clone();
                 let inst_c = inst_desc.clone();
+                // The accessor's own signature is the *overriding* method's --
+                // that is what the trait's code calls -- but the method it
+                // forwards to keeps the signature it was compiled with, and a
+                // refined abstract type member (`type RowsPerStatement =
+                // One.type` over `>: One.type <: RowsPerStatement`) makes the
+                // two differ. Call the target at *its* descriptor.
+                let call_desc = self
+                    .super_target_desc(target, &name, pts.len())
+                    .unwrap_or_else(|| inst_c.clone());
+                let call_c = call_desc.clone();
                 b.add_code(ACC_PUBLIC, &acc_c, &inst_c, locals.max(1), |asm| {
                     asm.aload(0);
                     for (slot, sort) in &loads {
@@ -4305,12 +4327,12 @@ impl<'a> Gen<'a> {
                     match target {
                         Some((next, true)) => {
                             let iface = class_internal(self.st, next);
-                            let static_desc = trait_static_desc(&iface, &inst_c);
+                            let static_desc = trait_static_desc(&iface, &call_c);
                             asm.invokestatic(&format!("{}$class", iface), &name, &static_desc);
                         }
                         Some((next, false)) => {
                             let owner = class_internal(self.st, next);
-                            asm.invokespecial(&owner, &name, &inst_c);
+                            asm.invokespecial(&owner, &name, &call_c);
                         }
                         None => {
                             throw_runtime(asm, &format!("no super implementation for {name}"));
@@ -4319,9 +4341,48 @@ impl<'a> Gen<'a> {
                             }
                         }
                     }
+                    // A narrower result than the target declares needs the
+                    // cast the accessor's own descriptor promises.
+                    if target.is_some() {
+                        if let Some(c) = narrowing_return_cast(&call_c, &inst_c) {
+                            asm.checkcast(&c);
+                        }
+                    }
                     emit_return(asm, &ret);
                 });
             }
+        }
+    }
+
+    /// The descriptor the `super` target was compiled with, when it can be
+    /// found. `arity` disambiguates overloads.
+    fn super_target_desc(
+        &self,
+        target: Option<(SymbolId, bool)>,
+        method: &str,
+        arity: usize,
+    ) -> Option<String> {
+        match target? {
+            (next, true) => self
+                .trait_impls
+                .get(&next)?
+                .iter()
+                .find(|m| m.name() == Some(method) && def_param_types(self.st, m).len() == arity)
+                .map(|m| def_method_desc(self.st, m)),
+            (next, false) => self
+                .st
+                .get(next)
+                .members
+                .iter()
+                .copied()
+                .find(|&mid| {
+                    let mem = self.st.get(mid);
+                    mem.name == method
+                        && mem.kind == SymKind::Method
+                        && !mem.flags.contains(Flags::ABSTRACT)
+                        && param_count(self.st, mid) == arity
+                })
+                .map(|mid| method_desc_from_sym(self.st, mid)),
         }
     }
 
@@ -8841,7 +8902,18 @@ fn invoke_super(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     if is_interface_sym(ctx.st, ctx.class_sym) {
         let acc = super_accessor_name(ctx.st, ctx.class_sym, &s.name);
         let iface = class_internal(ctx.st, ctx.class_sym);
-        asm.invokeinterface(&iface, &acc, &desc);
+        // The `T$$super$m` accessor is a member of *this* trait, declared and
+        // implemented with the overriding method's own erasure -- which is not
+        // always the parent's. `type RowsPerStatement = One.type` narrows an
+        // inherited `insertAll(Iterable, RowsPerStatement)` from `Rps` to
+        // `Rps$One$`; calling the accessor at the parent's descriptor found no
+        // such method.
+        let acc_desc = if !ctx.method_sym.is_none() && ctx.st.get(ctx.method_sym).name == s.name {
+            method_desc_from_sym(ctx.st, ctx.method_sym)
+        } else {
+            desc
+        };
+        asm.invokeinterface(&iface, &acc, &acc_desc);
         return;
     }
     let owner_id = s.owner;

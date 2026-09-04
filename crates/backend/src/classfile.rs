@@ -308,7 +308,17 @@ impl ClassEmit {
         let ifaces: Vec<u16> = self.interfaces.iter().map(|i| pool.class(i)).collect();
         let mut field_idxs = Vec::new();
         for f in &self.fields {
-            field_idxs.push((f.access, pool.utf8(&f.name), pool.utf8(&f.desc)));
+            // A field name is an *unqualified name* (JVMS 4.2.2): `.`, `;`,
+            // `[` and `/` are illegal in one. slick's `Library.scala` writes
+            // `val / = new SqlOperator("/")`, and emitting the character raw
+            // made `slick/ast/Library$` unloadable ("Illegal field name").
+            // nsc runs every term name through the same NameTransformer it
+            // uses for methods, so `/` is `$div`.
+            field_idxs.push((
+                f.access,
+                pool.utf8(&encode_method_name(&f.name)),
+                pool.utf8(&f.desc),
+            ));
         }
         let code_attr = pool.utf8("Code");
         let stack_map_attr = pool.utf8("StackMapTable");

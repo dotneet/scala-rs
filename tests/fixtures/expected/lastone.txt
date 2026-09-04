@@ -1,0 +1,5 @@
+impl[a|All] multi:label(L)
+impl[b|One] multi:label(L)
+impl[7|One]
+impl[8|One]
+div,plus,MOD,times
