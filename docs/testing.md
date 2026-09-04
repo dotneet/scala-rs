@@ -4,6 +4,11 @@
 cargo test
 ```
 
+scala/scala's own corpus (`test/files/{pos,neg,run}`, 5324 programs at tag
+`v2.13.16`) is run by `tests/scala_corpus.sh`; see
+[scala-corpus.md](scala-corpus.md) for the pass rates, the symptom breakdown,
+and what the runner counts as a skip rather than a failure.
+
 slick's own test suite (`slick-testkit`) is measured by
 `tests/testkit_measure.sh`; see [slick-testkit.md](slick-testkit.md) for the
 numbers and what they found. `crates/cli/tests/testkit.rs` (fixture prefix

@@ -33,7 +33,8 @@
 #                   spaced, deterministic CORPUS_SAMPLE tests per category, so
 #                   a run costs minutes instead of an hour.
 #   CORPUS_SAMPLE   sample size per category (default 250)
-#   CORPUS_FILTER   only run tests whose name matches this egrep pattern
+#   CORPUS_FILTER   only run tests whose path matches this zsh glob pattern,
+#                   e.g. CORPUS_FILTER='(t2973|u000a)'
 #   CORPUS_JOBS     parallel workers (default 8)
 #   CORPUS_TIMEOUT  seconds per compile (default 40)
 #   CORPUS_RUN_TIMEOUT seconds per `java Test` (default 20)
@@ -162,11 +163,16 @@ if [[ $1 == --one ]]; then
   case $kind in
     pos)
       # `errors=0` on its own is not proof of a compile: a compiler that fell
-      # over quietly also reports no errors. Insist on at least one classfile,
-      # the same reading rule the slick/gitbucket measurements use.
+      # over quietly also reports no errors. Insist on a classfile, the same
+      # second reading the slick and gitbucket measurements use -- but only
+      # when the sources define something. A handful of pos tests are a bare
+      # `package foo` or nothing but comments, and scalac emits nothing for
+      # those either.
       classes=($WORK/out/**/*.class(N))
       if (( errors > 0 )); then emit fail "$symptom"
-      elif (( ${#classes} == 0 )); then emit fail "compiled but emitted no classfiles"
+      elif (( ${#classes} == 0 )) \
+        && grep -q -E '^[^/*]*\b(class|trait|object|package object)\b' $srcs; then
+        emit fail "compiled but emitted no classfiles"
       else emit pass -; fi ;;
     neg)
       if (( errors > 0 )); then emit pass "$symptom"; else emit fail accepted-but-should-not-compile; fi ;;
