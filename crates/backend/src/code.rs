@@ -1227,6 +1227,50 @@ impl Assembler {
         self.apply_invoke(desc, true, false, owner);
     }
 
+    /// `invokedynamic` (JVMS §6.5) against
+    /// `java.lang.invoke.LambdaMetafactory.metafactory`: the call site takes
+    /// the captured values and returns an instance of the functional
+    /// interface `call_desc` names as its return type.
+    ///
+    /// * `sam_name` / `sam_desc` — the interface's single abstract method.
+    /// * `call_desc` — `(<captured types>)L<functional interface>;`.
+    /// * `impl_*` — the static method holding the lambda body. It is always a
+    ///   method of a *class*, never of an interface, because JVMS §4.6 forbids
+    ///   the flags the body carries on an interface method.
+    ///
+    /// `samMethodType` and `instantiatedMethodType` are both `sam_desc`: the
+    /// body is written at the erased `(Object…)Object` shape, so
+    /// `LambdaMetafactory` has nothing to adapt and never needs a bridge.
+    pub fn invokedynamic_lambda(
+        &mut self,
+        sam_name: &str,
+        sam_desc: &str,
+        call_desc: &str,
+        impl_owner: &str,
+        impl_name: &str,
+        impl_desc: &str,
+    ) {
+        const MF_OWNER: &str = "java/lang/invoke/LambdaMetafactory";
+        const MF_DESC: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;\
+Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;\
+Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)\
+Ljava/lang/invoke/CallSite;";
+        let bsm = self
+            .pool
+            .method_handle_static(MF_OWNER, "metafactory", MF_DESC, false);
+        let a0 = self.pool.method_type(sam_desc);
+        let a1 = self
+            .pool
+            .method_handle_static(impl_owner, impl_name, impl_desc, false);
+        let bsm_index = self.pool.bootstrap(bsm, vec![a0, a1, a0]);
+        let i = self.pool.invoke_dynamic(bsm_index, sam_name, call_desc);
+        self.emit_op(0xba);
+        self.emit_u16(i);
+        self.bytes.push(0);
+        self.bytes.push(0);
+        self.apply_invoke(call_desc, false, false, MF_OWNER);
+    }
+
     fn apply_invoke(&mut self, desc: &str, has_this: bool, is_init: bool, owner: &str) {
         let n_params = count_params(desc);
         self.pop_n_v(n_params);
