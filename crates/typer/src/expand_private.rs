@@ -44,6 +44,7 @@ use crate::lazy_local::children_mut;
 /// class, and mark it for the backend to emit without `ACC_PRIVATE`.
 pub fn expand_private_names(tree: &mut Tree, st: &mut SymbolTable) {
     widen_private_ctors(tree, st);
+    widen_private_case_members(tree, st);
     let mut candidates = HashSet::new();
     collect_private_members(tree, st, &mut candidates);
     if candidates.is_empty() {
@@ -85,6 +86,64 @@ fn widen_private_ctors(tree: &mut Tree, st: &mut SymbolTable) {
     scan(tree, st, SymbolId::NONE, &cands, &mut need);
     for id in need {
         st.get_mut(id).access_widened = true;
+    }
+}
+
+/// A case class's synthetic `apply` / `copy` made `private` by
+/// `-Xsource-features:case-apply-copy-access`, called from another class file.
+///
+/// `collect_private_members` cannot see these: they are symbols the namer
+/// created, with no `DefDef` in the tree to walk. They are reached across a
+/// class file boundary all the time and legally — `C(x)` written inside `C`
+/// is a call from `C` into `C$`, and a class nested in `C` calling `copy` is
+/// a call from `C$Inner` into `C`:
+///
+/// ```scala
+/// case class C private (x: Int) { class Inner { def bump = copy(x = 7) } }
+/// ```
+///
+/// scalac 2.13.16 with the feature emits that `copy` as `public C C$$copy(int)`
+/// — nsc's `makeNotPrivate`, which renames as well as widens. Widening alone
+/// is enough here and is what `widen_private_ctors` above already does: the
+/// rename exists to stop a subclass accidentally overriding the published
+/// member, and this compiler has no other member to collide with.
+fn widen_private_case_members(tree: &mut Tree, st: &mut SymbolTable) {
+    let mut cands = HashSet::new();
+    collect_private_case_members(tree, st, &mut cands);
+    if cands.is_empty() {
+        return;
+    }
+    let mut need = HashSet::new();
+    scan(tree, st, SymbolId::NONE, &cands, &mut need);
+    for id in need {
+        st.get_mut(id).access_widened = true;
+    }
+}
+
+fn collect_private_case_members(t: &mut Tree, st: &SymbolTable, out: &mut HashSet<SymbolId>) {
+    if let TreeKind::ClassDef { .. } = &t.kind {
+        let cls = t.sym;
+        if !cls.is_none() && st.get(cls).flags.contains(Flags::CASE) {
+            let mut scopes = vec![cls];
+            if let Some(m) = st.companion_module(cls) {
+                scopes.push(st.module_class_of(m));
+            }
+            for scope in scopes {
+                for &mem in &st.get(scope).members {
+                    let s = st.get(mem);
+                    if (s.name == "copy" || s.name == "apply")
+                        && s.flags.contains(Flags::SYNTHETIC)
+                        && s.flags.contains(Flags::PRIVATE)
+                        && s.private_within.is_none()
+                    {
+                        out.insert(mem);
+                    }
+                }
+            }
+        }
+    }
+    for c in children_mut(t) {
+        collect_private_case_members(c, st, out);
     }
 }
 
