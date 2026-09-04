@@ -41,10 +41,16 @@ object Main {
     def combine(x: Int, y: Int): Int = x + y
   }
 
+  // …but not inside an interpolation: nsc scans a `$name` hole with
+  // `Character.isUnicodeIdentifierPart`, which does not count `$`, so this is
+  // two holes and not one name `l$r`. slick writes `b"\($l${op}$r\)"`.
+  def joined(l: String, r: String): String = s"$l$r"
+
   def main(args: Array[String]): Unit = {
     println(bump(1))
     println(total(4))
     println(ints.combine(3, 4))
     println(pkgobj.inner.base)
+    println(joined("a", "b"))
   }
 }
