@@ -2217,18 +2217,78 @@ impl PickleSupply {
             id
         };
         trace(format_args!("stubbed class {full_name} (module={module})"));
+        self.stub_superclass_from_classfile(st, bin, id, &key);
         self.stubs.insert(key, id);
-        // A stub built here starts at `AnyRef`, and nothing else will fix that
-        // unless some *member* is later looked up on it -- `ensure_parents` is
-        // reached from member completion. A class that is only ever *named*
-        // therefore conformed to nothing: `Duration.MinusInf` has the pickled
-        // type `Duration.Infinite`, so `def minBound: Duration =
-        // Duration.MinusInf` (cats-kernel's `DurationBounded`) was
-        // `type mismatch; found: Duration$Infinite  required: Duration`.
-        // `attach_parents` is idempotent and additive, and its `parented` set
-        // stops the recursion through a parent that stubs another class.
-        self.ensure_parents(st, bin, id);
         Some(id)
+    }
+
+    /// Give a freshly stubbed class the superclass its *class file* names, when
+    /// that class is already in the table.
+    ///
+    /// A stub starts at `AnyRef` and stays there unless some *member* is later
+    /// looked up on it, since `ensure_parents` is only reached from member
+    /// completion. A class that is nothing but a *type* therefore conformed to
+    /// nothing: `Duration.MinusInf` has the pickled type `Duration.Infinite`,
+    /// and cats-kernel's `override def minBound: Duration = Duration.MinusInf`
+    /// was `type mismatch; found: Duration$Infinite  required: Duration`.
+    ///
+    /// Deliberately narrow, in three ways, because this runs in the middle of
+    /// converting some *other* class's signature:
+    ///
+    ///   * only a **nested** class (`Outer$Inner`). A top-level one is named by
+    ///     source and gets its parents from `ensure_parents` when a member is
+    ///     first looked up on it; giving `scala.concurrent.duration
+    ///     .FiniteDuration`'s stub its parent here instead made
+    ///     `FiniteDuration(2L, SECONDS)` stop conforming to a `FiniteDuration`
+    ///     parameter. `Duration.Infinite` is never selected on, so nothing ever
+    ///     reaches it that way.
+    ///   * only the **class file**, never a second pickle read from inside the
+    ///     walk in progress.
+    ///   * only the **superclass**, and only one already in the table: nothing
+    ///     here creates a symbol, and an interface (or a parent with type
+    ///     parameters) cannot be named without arguments the class file does
+    ///     not carry.
+    fn stub_superclass_from_classfile(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        cls: SymbolId,
+        internal: &str,
+    ) {
+        let nested = internal
+            .rsplit('/')
+            .next()
+            .is_some_and(|simple| simple.trim_end_matches('$').contains('$'));
+        if !nested {
+            return;
+        }
+        // With type parameters of its own the class file cannot say what
+        // arguments the parent is applied at; only the pickle can.
+        if !st.get(cls).tparams.is_empty() {
+            return;
+        }
+        let Some(sup) = self
+            .java_class(bin, internal)
+            .and_then(|c| c.super_name.clone())
+        else {
+            return;
+        };
+        if sup == "java/lang/Object" {
+            return;
+        }
+        let Some(parent) = crate::classpath::find_by_jvm(st, &sup) else {
+            return;
+        };
+        if parent == cls || !st.get(parent).tparams.is_empty() {
+            return;
+        }
+        trace(format_args!(
+            "{internal}: superclass {sup} from its class file"
+        ));
+        st.get_mut(cls).parents = vec![Type::Class {
+            sym: parent,
+            args: Vec::new(),
+        }];
     }
 
     /// Give a *placeholder* symbol the type parameters its pickle declares.
