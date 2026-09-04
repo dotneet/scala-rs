@@ -900,7 +900,32 @@ pub fn check_missing_implementations(
             if later_class_impl {
                 continue;
             }
-            let implemented = lin[..bi].iter().chain(universals.iter()).any(|&b| {
+            // A plain declaration is implemented by a matching definition
+            // *anywhere* in the linearization, not only above it. nsc's
+            // `findMember` drops a deferred symbol as soon as a concrete one
+            // matches it, and the order only decides which concrete member
+            // wins. gitbucket writes
+            //
+            // ```scala
+            // trait Profile { val profile: BlockingJdbcProfile }
+            // trait ProfileProvider { self: Profile =>
+            //   lazy val profile = DatabaseConfig.slickDriver }
+            // object Profile extends ProfileProvider with Profile
+            // ```
+            //
+            // so the definition sits *after* the declaration in the
+            // linearization, and this reported `object creation impossible.`
+            // for a program scalac accepts.
+            //
+            // The `override`-marked declaration keeps the narrow rule: it is
+            // the one shape that takes an implementation away (see above), so
+            // only a base above it can put one back.
+            let visible: Vec<SymbolId> = if st.get(m).flags.contains(Flags::OVERRIDE) {
+                lin[..bi].to_vec()
+            } else {
+                lin.iter().copied().filter(|&b| b != base).collect()
+            };
+            let implemented = visible.iter().chain(universals.iter()).any(|&b| {
                 st.get(b).members.iter().any(|&c| {
                     st.get(c).owner == b
                         && c != m

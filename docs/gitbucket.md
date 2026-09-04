@@ -76,7 +76,12 @@ path of your own.**
 |---|---|---|---|---|---|
 | At the start | 354 | 0 | **35** | 13 | 0 |
 | After the first survey | 353 | 1 | **3261** | 256 | 0 |
-| Now | 353 | 1 | **2545** | 211 | 0 |
+| main at `56174d5` (Twirl, the two slick-run slices and scalalib merged) | 353 | 1 | **2373** | 188 | 0 |
+| Now | 353 | 1 | **1859** | 186 | 0 |
+
+Both of the last two rows were measured on the same tree, with the same
+material, one binary each -- `SCALA_RS=<binary> tests/gitbucket_measure.sh`
+skips the rebuild, which makes an honest before/after cheap.
 
 **The number went up first, and that was the progress.** All 35 errors at the
 start were *parse* errors, and a parse error stops the run before typing:
@@ -85,20 +90,18 @@ nothing in gitbucket had been typechecked at all. This is exactly what
 honest reading of "35" is "0 files typechecked"; the honest reading of "3261"
 is "353 files typechecked, 97 of them clean".
 
-Of the 2545, 2216 are in the 116 hand-written files that still have errors (of
-213 measured) and 322 — down from 1038 — are in 95 of the 140 generated
-templates. The hand-written figure has not moved since the survey: every error
-removed since then was in a template.
+Of the 1859, **1694** are in 113 hand-written files (of 213 measured) and
+**164** — down from 1038 — are in 73 of the 140 generated templates.
 
 The worst hand-written files are `controller/AccountController.scala` (257),
-`service/IssuesService.scala` (123),
-`controller/SystemSettingsController.scala` (117) and
-`model/BasicTemplate.scala` (98).
+`controller/SystemSettingsController.scala` (116),
+`service/IssuesService.scala` (91) and
+`controller/RepositoryViewerController.scala` (68).
 
 ## What was wrong, and what it cost
 
-Eight roots. Seven are fixed; the counts are what each was worth when it was
-removed.
+Thirteen roots. Twelve are fixed; the counts are what each was worth when it
+was removed.
 
 ### 1. An operator swallowed the comment that followed it (lexer)
 
@@ -261,6 +264,163 @@ object mytpl extends _root_.play.twirl.api.BaseScalaTemplate[
 real scalac compiles into a jar, plus the dual run and the rejecting case
 (`String` still does not conform to the alias, which is `Html`).
 
+### 9-13. Calling slick through its published jar — 514 errors (typer)
+
+Five roots, and the question they answer is the one gitbucket was picked for:
+**"we compile slick's 184 sources with zero errors" and "we can compile a
+program that calls slick" are different claims, and only the second one matters
+to an application.** `tests/slick_measure.sh` was already `errors=0` while the
+~680 slick-shaped errors below sat in gitbucket. Not one of the five is in
+implicit search.
+
+`2373 → 1859 errors, 188 → 186 files`. All 429 `ambiguous implicit:
+…ColumnType…` and all 104 `no implicit … BaseTypedType[String] /
+TypedType[String] / TypedType[Int] / BaseTypedType[Int]` are gone, along with
+the 176 `value apply$default$N is not a member of <notype>` that were
+downstream of them. `crates/cli/tests/slickimpl.rs`; the fixtures are
+`tests/fixtures/slickimpl{,_bad,_jar,_jar_bad}.scala`.
+
+#### 9. A `@specialized` parent came from the class file
+
+`javap` on `JdbcTypesComponent$JdbcTypes$LongJdbcType`:
+
+```
+public class …$JdbcTypes$LongJdbcType extends …$DriverJdbcType$mcJ$sp
+public abstract class …$DriverJdbcType$mcJ$sp extends …$DriverJdbcType<java.lang.Object>
+```
+
+Specialization runs **after** pickling, so `DriverJdbcType$mcJ$sp` exists only
+in the class files; no pickle mentions it, and nsc never sees one because it
+takes a Scala class's shape from the `ScalaSignature`. `java_parents` reads the
+`Signature` attribute, so `longColumnType` came out a `BaseTypedType[Any]` and
+no search for `BaseTypedType[Long]` could succeed. The pickle says
+`DriverJdbcType[Long]`.
+
+`PickleSupply::attach_parents` now refines a **jar** class's parents from its
+pickle (it was restricted to `scala.*` parents), and a `$mc…$sp` variant is
+*replaced* rather than added next to — leaving it in place would put two
+instantiations of one class in the same hierarchy, and
+`x: BaseTypedType[Any] = longColumnType` would go on being accepted.
+`PickleSupply::ensure_parents` also had to stop requiring the class to have
+been *adopted* first: an implicit candidate is a class the program has only
+named, and `warm_implicit_candidates` reaches it before anything completes a
+member of it.
+
+The minimal reproduction is two lines against the real jar:
+
+```scala
+import slick.jdbc.H2Profile.api._
+val a: slick.ast.BaseTypedType[Long] = longColumnType   // was a type mismatch
+```
+
+#### 10. `fill_java_members` overwrote the `implicit` flag
+
+`import profile.api._` supplies `stringColumnType` and its 23 siblings from the
+pickle with `Flags::IMPLICIT`. `fill_java_members`, which runs when a class
+file is loaded, did
+
+```rust
+if let Some(id) = existing_java_method(st, owner, m) {
+    st.get_mut(id).flags = java_method_flags(m);   // ← the pickle's flags, gone
+```
+
+so loading `JdbcTypesComponent$ImplicitColumnTypes.class` *after* the import
+silently made all 24 column types non-implicit. Naming `Table[…]` as a parent
+is enough to trigger it, which is why this looked order-dependent: the same
+file with the table definition removed compiled. Nothing in the bytecode can
+contradict `implicit` or "this is a val's accessor", so both are now kept.
+
+```scala
+import slick.jdbc.H2Profile.api._
+class Users(tag: Tag) extends Table[(Long, String)](tag, "USERS") { def * = ??? }
+object U { val tt = implicitly[slick.ast.TypedType[String]] }  // was "not found"
+```
+
+Delete the `class Users` line and it compiled.
+
+#### 11. An import whose prefix is a `val` of the same template — ≈429 errors
+
+gitbucket's `model/Profile.scala` is
+
+```scala
+trait Profile {
+  val profile: BlockingJdbcProfile
+  import profile.blockingApi._
+  implicit val dateColumnType: BaseColumnType[java.util.Date] = …
+  implicit val eventColumnType: BaseColumnType[WebHook.Event] = …
+}
+```
+
+A template is typed imports-first, then signatures, so the import resolved
+against a `profile` that had no type yet, `import_prefix` gave up, and no
+wildcard owner was recorded. `sig_done` makes the signature pass permanent, so
+`BaseColumnType` stayed "not found: type" for the whole run — **and an implicit
+whose type is an error fits every implicit search.** That is what the ~429
+`ambiguous implicit: eventColumnType, dateColumnType` were: not a search that
+failed to narrow, but two candidates that matched everything. `column[String]`
+in a table two files away was the symptom; the cause was a `val` in a third.
+
+nsc has a lazy completer on every symbol and simply forces `profile` when the
+import is looked at. Two halves here:
+
+* `Typer::presig_import_prefixes` builds the signature of any member an
+  `import` in the same template selects through, before the imports are typed.
+* `Typer::leave_sig_for_body_pass` handles the prefix that only another
+  *unit's* signature pass settles (gitbucket's components reach `profile`
+  through `self: Profile =>`, and `Profile.scala` is nowhere near the front of
+  the command line): when an import prefix did not resolve, the template's
+  `val` signatures are left for the body pass to build. Only `val`s —
+  `type_def_sig` allocates fresh symbols for a method's type parameters, so
+  running it twice leaves types built from the first run pointing at symbols
+  the method no longer has (slick's `ShapedValue.mapToImpl` went from clean to
+  `not found: type Expr` and 19 more when `def`s were included).
+
+Compiling gitbucket's 46 `model/` sources with `Profile.scala` moved to the
+front of the command line is what showed the size of it: 281 errors → 187,
+nothing else changed.
+
+#### 12. A deferred `val` implemented through a self type — ≈250 errors
+
+```scala
+trait Profile { val profile: BlockingJdbcProfile }
+trait ProfileProvider { self: Profile => lazy val profile = DatabaseConfig.slickDriver }
+trait CoreProfile extends ProfileProvider with Profile
+object Profile extends CoreProfile
+```
+
+`ProfileProvider` is not a subclass of `Profile`; it only reaches it through
+the self type. `drop_overridden`'s rule is "an alternative whose owner is
+*below* the other's and whose signature matches replaces it", so both survived
+and `import Profile.profile.blockingApi._` was selected on
+`<overload BlockingJdbcProfile | <error>>` — taking every slick `Session` in
+gitbucket with it. A declaration is never an alternative beside a definition of
+the same signature, however the two reached the class; that is now checked
+first.
+
+`check_missing_implementations` had the mirror image: it looked for an
+implementation only in the bases *above* the declaration, and here the
+definition is below it. nsc's `findMember` drops a deferred symbol as soon as a
+concrete one matches, and the order only decides which concrete member wins —
+so the search now covers the whole linearization. The `override`-marked
+declaration keeps the narrow rule, because that is the one shape that takes an
+implementation *away* (`abstract class M extends B { override def f: Int }`).
+
+#### 13. A renamed import carried only the term namespace
+
+```scala
+import slick.jdbc.JdbcBackend.{Database => SlickDatabase, Session}
+private val db: SlickDatabase = SlickDatabase.forDataSource(dataSource, …)
+```
+
+`JdbcBackend` declares both a `type Database` and a `val Database`, and a jar's
+`type` member leaves no trace in the bytecode — so `import_named`'s
+`lookup_member` could only ever find the term. `Session`, which has no term
+side at all, was "value Session is not a member of object JdbcBackend"; `db`
+was typed as the *factory object's* class, and `Database() withTransaction { … }`
+was "value withTransaction is not a member of DatabaseFactory". The type
+namespace is now asked as well, whether or not the term was found — the same
+thing `expose_unqualified_type` does for a wildcard import.
+
 ### The crash: `lub` had no depth cap
 
 `JGitUtil.scala` **aborted the compiler with a stack overflow and no
@@ -298,46 +458,60 @@ in a block inside the lambda, which has no stream for the guard to filter, and
 so diagnoses the shape rather than desugaring it wrongly. Three occurrences,
 one file, held out of the measurement by default.
 
-## Where the remaining 2545 are
+## Where the remaining 1859 are
 
 Counted by message shape, largest first, with the reading:
 
 | n | message | reading |
 |---|---|---|
-| 188 | `no implicit: could not find implicit value of type Session` | slick. The implicit `Session` a `withTransaction` block introduces. |
-| 176 | `value apply$default$N is not a member of <notype>` | A default argument on a receiver that is already an error. 158 of them are in templates, and all of them are downstream of something else. |
-| 145 / 134 / 66 / 34 | `ambiguous implicit: …ColumnType…` | slick. Several `ColumnType`s in scope; the search does not narrow to one. |
+| 187 / 32 | `no implicit: could not find implicit value of type Session` / `BasicBackend.Session` | slick. The implicit `Session` a `withTransaction` block introduces. Downstream of the `JdbcBackend.Database` item below. |
 | 129 / 40 | `ambiguous implicit: request, request` / `response, response` | The same scalatra implicit reached twice. |
 | 79 / 62 / 23 / 18 | `ambiguous overload for referrersOnly / writableUsersOnly / ownerOnly / readableUsersOnly with arguments ((<notype>) => <notype>)` | What root 7's "not found" became. Two overloads, and the argument is a function literal whose parameter type is not inferred yet. |
-| 52 | `ambiguous overload for datetimeago with arguments (Date)` | gitbucket's own helper, same shape, and now the largest single template symptom. |
+| 52 | `ambiguous overload for datetimeago with arguments (Date)` | gitbucket's own helper, same shape, and the largest single template symptom. |
 | 44 | `unimplemented syntax: named arguments (method parameters not resolved)` | Named arguments where the callee did not resolve. |
-| 44 / 34 / 25 / 15 | `no implicit: could not find implicit value of type BaseTypedType[…] / TypedType[…]` | slick, same family as the `ambiguous implicit` rows. |
-| 39 | `not found: type Rep` | slick's `Rep`, through `import profile.api._`. |
-| 36 | `value blockingApi is not a member of <overload BlockingJdbcProfile \| <error>>` | `blocking-slick`'s profile, reached through an overload set one of whose alternatives is already an error. |
-| ≈70 | `value filter / insert / map is not a member of ((Tag) => X)TableQuery[X]` | slick again: `TableQuery[X]`'s own members behind its `apply`-shaped constructor. |
+| 36 | `not found: type Rep` | slick's `Rep` in a `def` signature, through `import profile.api._` — the half of root 11 the `val`-only rerun does not reach. |
+| 29 | `no matching overload for constructor Constraint with arguments ()` | jgit. |
+| 26 / 18 | `no implicit … BaseTypedType[AnyRef] / TypedType[Date]` | slick, in `BasicTemplate.scala`'s `self: Table[?] =>`: a wildcard self type does not offer the table's members. |
+| ≈70 | `value filter / insert / map is not a member of ((Tag) => X)TableQuery[X]` | `TableQuery[X]`'s own members behind its `apply`-shaped constructor. |
+| 41 | `value get / update is not a member of <overload …>` | scalatra, the same overload-set shape as root 12 but between two genuinely different members. |
 
 ### What would remove the most next
 
-1. **The slick implicit searches** (≈429 `ambiguous implicit` plus ≈250 `no
-   implicit`, plus the ≈150 `is not a member of …TableQuery[…]` / `not found:
-   type Rep` that come with them). These are the interesting ones for the
-   original question — we compile slick's own sources with zero errors, but a
-   program *calling* slick through its published jar still cannot resolve the
-   implicits its DSL is made of. That is a different measurement than
-   `slick_measure.sh` makes, and it is the one that matters for an
-   application. It is now, by a wide margin, the largest thing left.
-2. **Overload resolution against a function literal with an un-inferred
+1. **Overload resolution against a function literal with an un-inferred
    parameter** (≈234 errors: the `…Only` family plus `datetimeago`). nsc picks
    the overload by arity first and then types the literal against the chosen
-   parameter type. This is also what is left in the templates: with root 8
-   fixed, `datetimeago` is the biggest template symptom that is not merely
-   downstream.
+   parameter type. This is also what is left in the templates: `datetimeago`
+   is the biggest template symptom that is not merely downstream.
+2. **`JdbcBackend.Database` is not read as the alias it is** (≈220 errors: the
+   `Session` rows plus `withTransaction` / `withSession`). Real scalac says
+   `slick.jdbc.JdbcBackend.Database (which expands to)
+   slick.jdbc.JdbcBackend.DatabaseDef`; `SigCache::lookup` finds only
+   `BasicBackend`'s `type Database >: Null <: DatabaseDef`, so the alias in
+   `JdbcBackend`'s own pickle is not reaching the walk at all. Two lines
+   against the real jar reproduce it:
+
+   ```scala
+   import slick.jdbc.JdbcBackend.{Database => SlickDatabase}
+   val db: SlickDatabase = SlickDatabase.forURL("jdbc:h2:mem:test")
+   ```
+
+   Preferring a `TypeAlias` hit over an `AbstractType` one, and the asking
+   class's own declaration over an inherited one, was tried and changes
+   nothing — the hits really are only `BasicBackend`'s. The next step is in
+   `crates/pickle/src/sym.rs`, not in the typer.
 3. The duplicate-implicit shape (`request, request`, ≈169) looks like a supply
    problem rather than a search problem: the same member is reaching the
    implicit scope twice under one name.
-4. `value apply$default$N is not a member of <notype>` (176) is a *reporting*
-   problem as much as a real one: a default argument on a receiver that has
-   already been diagnosed produces a second diagnostic that says nothing.
+4. **A `def` signature under an import that only another unit settles** (36
+   `not found: type Rep`, and the `byRepository` ambiguities that follow it).
+   Root 11's `val`-only rerun does not cover `def`s, because rebuilding a
+   method signature is not idempotent. The principled fix is nsc's: a lazy
+   completer on every symbol, annotated or not, so an import prefix forces
+   exactly what it needs.
+5. **A wildcard self type offers no members** (≈44). `trait BasicTemplate {
+   self: Table[?] => val userName = column[String]("USER_NAME") }` gives
+   `not found: value column` and then `BaseTypedType[AnyRef]` for everything
+   downstream; writing `self: Table[String] =>` works.
    Suppressing it would not fix anything, but it would stop 176 errors from
    hiding what is under them.
 

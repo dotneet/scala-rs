@@ -1942,7 +1942,21 @@ impl PickleSupply {
             return;
         }
         let internal = sym.jvm_name.clone();
-        if !internal.starts_with("scala/") && !self.adopted.contains(&cls.0) {
+        // The library, a class already adopted, or any other class off a jar
+        // that still has a pickle to read. The last case is what an implicit
+        // *candidate* needs: `warm_implicit_candidates` reaches a class the
+        // program merely named, and nothing has completed a member of it, so
+        // requiring `adopted` here meant the parent list stayed whatever the
+        // class file's `Signature` attribute said -- which for a class over a
+        // `@specialized` one is a specialized subclass with the parameter
+        // already fixed to `Object`. `pickled_full_name` returns `None` when
+        // there is no pickle, so a plain Java class still keeps its own path.
+        if !internal.starts_with("scala/")
+            && !self.adopted.contains(&cls.0)
+            && (cls.0 < st.prelude_end
+                || internal.starts_with("java/")
+                || internal.starts_with("javax/"))
+        {
             return;
         }
         let is_module = sym.kind == SymKind::ModuleClass;
@@ -1988,7 +2002,20 @@ impl PickleSupply {
             let SigType::Ref { sym, .. } = &p else {
                 continue;
             };
-            if !sym.starts_with("scala.") {
+            // Library parents were the original reason this exists (see the
+            // doc comment). A class that came in on `-cp` needs its *own*
+            // library's parents just as much, because the class file cannot
+            // write the type arguments the pickle does. `java_parents` reads
+            // them from the `Signature` attribute, which is post-typer: the
+            // superclass recorded there for a class extending a
+            // `@specialized` one is the specialized subclass
+            // (`DriverJdbcType$mcJ$sp extends DriverJdbcType<Object>`), so
+            // slick's `LongJdbcType` arrived as a `JdbcType[Any]` and no
+            // search for `BaseTypedType[Long]` could ever succeed. The
+            // pickle says `DriverJdbcType[Long]`, which is what nsc reads.
+            // Prelude classes stay on the old rule: their hierarchy is
+            // hand-written and the rest of the typer reasons about it.
+            if !sym.starts_with("scala.") && class_sym.0 < st.prelude_end {
                 continue;
             }
             let Some(t) = self.conv(st, bin, &scope, &p) else {
@@ -2042,11 +2069,22 @@ impl PickleSupply {
             // The pickle is scalac's own record of the declaration, so it
             // refines the parent it agrees with on the class. Never a prelude
             // class: its hierarchy is hand-written and reasoned about.
-            let existing = st
-                .get(class_sym)
-                .parents
-                .iter()
-                .position(|q| matches!(q, Type::Class { sym: q, .. } if q == psym));
+            //
+            // A `@specialized` variant counts as the same parent. The class
+            // file of slick's `LongJdbcType` names
+            // `DriverJdbcType$mcJ$sp` for a superclass, a class the pickle
+            // does not contain at all (specialization runs after pickling),
+            // and leaving it in place alongside the pickled
+            // `DriverJdbcType[Long]` would put two instantiations of one
+            // class in the same hierarchy -- with `JdbcType[Any]` still
+            // reachable, so `x: BaseTypedType[Any] = longColumnType` would go
+            // on being accepted. It is replaced, not added to.
+            let pjvm = st.get(*psym).jvm_name.clone();
+            let existing = st.get(class_sym).parents.iter().position(|q| {
+                matches!(q, Type::Class { sym: q, .. }
+                    if *q == *psym
+                        || despecialized(&st.get(*q).jvm_name).is_some_and(|b| b == pjvm))
+            });
             if let Some(i) = existing {
                 let refines = class_sym.0 >= st.prelude_end
                     && !matches!(&st.get(class_sym).parents[i], Type::Class { args, .. }
@@ -3564,6 +3602,30 @@ fn is_default_getter(name: &str) -> bool {
         return false;
     };
     !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The unspecialized class a `@specialized` variant was generated from.
+///
+/// scalac's specialization phase runs *after* pickling, so `Foo$mcJ$sp` and
+/// friends exist only in the class files; no pickle mentions them, and nsc's
+/// own reader never sees one because it takes a Scala class's shape from the
+/// `ScalaSignature`. We read the class file's `Signature` attribute instead,
+/// where the superclass of slick's `LongJdbcType` really is
+/// `JdbcTypesComponent$DriverJdbcType$mcJ$sp` -- whose own superclass is
+/// `DriverJdbcType<Object>`, since a specialized subclass fixes the parameter
+/// it specializes on. Recognising the suffix lets the pickled parent replace
+/// it rather than sit next to it.
+///
+/// The suffix is `$mc` followed by one specialization tag per type parameter
+/// (`Z B C D F I J S V`, the JVM primitive letters plus `V`) and then `$sp`.
+fn despecialized(jvm_name: &str) -> Option<&str> {
+    let rest = jvm_name.strip_suffix("$sp")?;
+    let at = rest.rfind("$mc")?;
+    let tags = &rest[at + 3..];
+    if tags.is_empty() || !tags.bytes().all(|b| b"ZBCDFIJSV".contains(&b)) {
+        return None;
+    }
+    Some(&rest[..at])
 }
 
 /// The type arguments of a class type, empty for anything else.

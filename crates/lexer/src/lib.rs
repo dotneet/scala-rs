@@ -280,18 +280,24 @@ impl<'a> Lexer<'a> {
             }
             '}' => {
                 let lo = self.pos as u32;
-                // `${` does not increment `brace_depth`; the matching `}` must
-                // therefore close the hole when depth equals `hole_brace`.
-                if let Some(frame) = self.interp_stack.last() {
-                    if frame.hole_brace >= 0 && self.brace_depth == frame.hole_brace {
-                        self.bump();
-                        self.interp_stack.last_mut().unwrap().hole_brace = -1;
-                        return;
-                    }
-                }
+                // nsc lexes `${` as an ordinary LBRACE, so a hole is a block
+                // and its `}` is an ordinary RBRACE. Emitting the pair keeps
+                // the line-break filter's brace region right: without it, a
+                // hole written inside a `(...)` argument list inherited the
+                // paren region and lost the newlines separating its
+                // statements.
+                let closes_hole = self
+                    .interp_stack
+                    .last()
+                    .is_some_and(|f| f.hole_brace >= 0 && self.brace_depth == f.hole_brace);
                 self.bump();
                 self.brace_depth -= 1;
                 self.emit(TokenKind::RBrace, lo, self.pos as u32);
+                if closes_hole {
+                    // Back to the string part: `tokenize_all` sees
+                    // `hole_brace < 0` and resumes `lex_interp_string`.
+                    self.interp_stack.last_mut().unwrap().hole_brace = -1;
+                }
             }
             ',' => {
                 let lo = self.pos as u32;
@@ -802,10 +808,14 @@ impl<'a> Lexer<'a> {
                         self.pos as u32,
                     );
                     self.bump(); // $
+                    let brace_lo = self.pos as u32;
                     self.bump(); // {
+                                 // nsc emits LBRACE here and parses the hole as a block.
+                    self.brace_depth += 1;
+                    self.emit(TokenKind::LBrace, brace_lo, self.pos as u32);
                     let hole_at = self.brace_depth;
                     self.interp_stack.last_mut().unwrap().hole_brace = hole_at;
-                    // Expressions follow as normal tokens until matching `}`.
+                    // Statements follow as normal tokens until matching `}`.
                     return;
                 }
                 // $ident

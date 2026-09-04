@@ -3796,3 +3796,56 @@ fn gitbucket_syntax_fixture() {
 fn gitbucket_xml_fixture() {
     dual_run_xml_fixture("gitbucket_xml");
 }
+
+// ------------------------------------------------------- scala/scala library
+
+/// Syntax the 2.13 standard library uses that this subset did not parse:
+/// several importers under one `import`, a `using` argument clause, an
+/// annotation whose type is parenthesised and meta-annotated, and an
+/// interpolation hole holding more than one statement (with a nested
+/// triple-quoted string in it). See docs/scala-library.md.
+#[test]
+fn scalalib_syntax_fixture() {
+    check("scalalib_syntax");
+    dual_run_fixture("scalalib_syntax");
+}
+
+/// `@specialized` stays a diagnostic without `-no-specialization` -- including
+/// when an import renamed it, which used to slip past the check.
+#[test]
+fn scalalib_specialized_is_error_without_the_flag() {
+    compile_fails("scalalib_spec", "annotation specialized");
+    compile_fails("scalalib_spec_bad", "annotation sp");
+}
+
+/// With nsc's `-no-specialization` the annotations are ignored, as nsc ignores
+/// them. Needs the jar: `scala.specialized` is not in the private runtime.
+#[test]
+fn scalalib_specialized_ignored_with_the_flag() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip scalalib_spec: jar not obtainable");
+        return;
+    };
+    let jar_s = jar.to_str().unwrap();
+    let out = compile_fixture_with(
+        "scalalib_spec",
+        &["--scala-library", jar_s, "-no-specialization"],
+    );
+    if java_available() {
+        let cp = format!("{}:{}", out.display(), jar.display());
+        let output = Command::new("java")
+            .args(["-Xverify:all", "-cp", &cp, "Main"])
+            .output()
+            .expect("java");
+        assert!(
+            output.status.success(),
+            "java failed for scalalib_spec: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected_stdout("scalalib_spec")
+        );
+    }
+    let _ = fs::remove_dir_all(&out);
+}

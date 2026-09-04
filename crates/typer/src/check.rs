@@ -204,6 +204,9 @@ pub struct Typer {
     /// Import prefixes a pass could not resolve, as `(file, lo, hi)`.
     /// See `retract_import_prefix_errors`.
     import_prefix_failed: HashSet<(usize, u32, u32)>,
+    /// An `import` in the template being typed named a prefix this pass could
+    /// not resolve. See `Typer::sig_rerun_safe`.
+    import_prefix_missed: bool,
     pub(crate) file_index: usize,
     /// The text of each unit, by `file_index`.
     ///
@@ -236,6 +239,10 @@ pub struct Typer {
     /// Signature pass: fill member types across the whole run before any body
     /// is typed, so a unit can call into one that comes later.
     pub(crate) sigs_only: bool,
+    /// The header pass is running: parents and imports only, before any
+    /// member has a signature. Anything it works out is provisional, the same
+    /// way the signature pass's is. See `Typer::complete_lazy_sig`.
+    pub(crate) header_pass: bool,
     /// While set, an unqualified name in *type* position that resolves to
     /// nothing is reported as `not found: type X` instead of being left as the
     /// `Type::Named` placeholder.
@@ -579,6 +586,7 @@ pub fn typecheck_units_src(
             t.language_postfix_ops,
             t.language_implicit_conversions,
         );
+        t.header_pass = true;
         for _ in 0..MAX_HEADER_ROUNDS {
             let mut changed = false;
             for (tree, file_index) in units.iter_mut() {
@@ -596,6 +604,7 @@ pub fn typecheck_units_src(
             t.file_index = *file_index;
             t.parents_pass(tree, true);
         }
+        t.header_pass = false;
         // The header pass exists only to resolve parents; it types imports
         // and parent trees before signatures are known, so anything it
         // complains about is reported for real by the passes below.
@@ -653,6 +662,7 @@ impl Typer {
             st,
             diags: Vec::new(),
             import_prefix_failed: HashSet::new(),
+            import_prefix_missed: false,
             file_index,
             sources: Vec::new(),
             gensym: 0,
@@ -660,6 +670,7 @@ impl Typer {
             pkg_nest: Vec::new(),
             open_pkgs: HashMap::new(),
             sigs_only: false,
+            header_pass: false,
             strict_type_names: false,
             pattern_tpt: false,
             ctor_pattern_fun: false,
@@ -2426,6 +2437,8 @@ impl Typer {
         self.register_sealed_child(id);
         self.enter_inherited_members(id);
         self.bind_self_type(id, self_name, self_tpt.as_deref());
+        self.presig_import_prefixes(body);
+        let saved_missed = self.import_prefix_missed;
         for stt in body.iter_mut() {
             if matches!(stt.kind, TreeKind::Import { .. }) {
                 self.type_import(stt);
@@ -2445,8 +2458,10 @@ impl Typer {
         for stt in body.iter_mut() {
             if !matches!(stt.kind, TreeKind::TypeDef { .. }) {
                 self.type_member_sig(stt);
+                self.leave_sig_for_body_pass(stt);
             }
         }
+        self.import_prefix_missed = saved_missed;
         if !self.sigs_only {
             for stt in body.iter_mut() {
                 self.type_member_body(stt);
@@ -2679,6 +2694,8 @@ impl Typer {
         self.register_sealed_child(cls);
         self.enter_inherited_members(cls);
         self.bind_self_type(cls, self_name, self_tpt.as_deref());
+        self.presig_import_prefixes(body);
+        let saved_missed = self.import_prefix_missed;
         for stt in body.iter_mut() {
             if matches!(stt.kind, TreeKind::Import { .. }) {
                 self.type_import(stt);
@@ -2693,8 +2710,10 @@ impl Typer {
         for stt in body.iter_mut() {
             if !matches!(stt.kind, TreeKind::TypeDef { .. }) {
                 self.type_member_sig(stt);
+                self.leave_sig_for_body_pass(stt);
             }
         }
+        self.import_prefix_missed = saved_missed;
         if !self.sigs_only {
             for stt in body.iter_mut() {
                 self.type_member_body(stt);
@@ -3587,6 +3606,108 @@ impl Typer {
             }
             _ => {}
         }
+    }
+
+    /// Give the members an `import` in this template selects *through* their
+    /// signatures, before the imports are typed.
+    ///
+    /// nsc's namer gives every definition a lazy completer, so
+    /// `import profile.api._` forces `val profile: JdbcProfile` the moment the
+    /// import is looked at, wherever the two are written. We type a template
+    /// in passes -- imports, then type members, then the rest of the
+    /// signatures -- so a prefix that names a `val` of the *same* template was
+    /// typed against a symbol that had no type yet, `import_prefix` gave up,
+    /// and no wildcard owner was recorded at all. The signature pass builds
+    /// each member exactly once (`sig_done`), so the failure was permanent:
+    ///
+    /// ```scala
+    /// trait Profile {
+    ///   val profile: BlockingJdbcProfile
+    ///   import profile.blockingApi._
+    ///   implicit val dateColumnType: BaseColumnType[java.util.Date] = ...
+    /// }
+    /// ```
+    ///
+    /// gave "not found: type BaseColumnType", and an implicit whose type is an
+    /// error fits *every* implicit search -- which is what gitbucket's ~429
+    /// `ambiguous implicit: eventColumnType, dateColumnType` were. Written
+    /// with `self: Profile =>` instead, so that `profile` belongs to another
+    /// template, the same code resolved.
+    ///
+    /// Only the head of each prefix, and only a member that states its type:
+    /// one that has to infer from its right-hand side is what
+    /// `lazysig` is for, and typing it here would move work, not order it.
+    fn presig_import_prefixes(&mut self, body: &mut [Tree]) {
+        let mut heads: Vec<String> = Vec::new();
+        for stt in body.iter() {
+            if let TreeKind::Import { expr, .. } = &stt.kind {
+                let mut t = &**expr;
+                while let TreeKind::Select { qual, .. } = &t.kind {
+                    t = qual;
+                }
+                if let TreeKind::Ident { name } = &t.kind {
+                    if !heads.contains(name) {
+                        heads.push(name.clone());
+                    }
+                }
+            }
+        }
+        if heads.is_empty() {
+            return;
+        }
+        for stt in body.iter_mut() {
+            let named = match &stt.kind {
+                TreeKind::ValDef { name, tpt, .. } | TreeKind::DefDef { name, tpt, .. } => {
+                    !tpt.is_empty() && heads.iter().any(|h| h == name)
+                }
+                _ => false,
+            };
+            if named {
+                self.type_member_sig(stt);
+            }
+        }
+    }
+
+    /// Let the body pass build this member's signature again, when an
+    /// `import` above it did not resolve on this pass.
+    ///
+    /// See [`Typer::sig_rerun_safe`] for why, and for what "again" is safe on.
+    fn leave_sig_for_body_pass(&mut self, tree: &Tree) {
+        if !self.sigs_only
+            || !self.import_prefix_missed
+            || tree.id == scala_rs_parser::NodeId(0)
+            || !Self::sig_rerun_safe(tree)
+        {
+            return;
+        }
+        self.sig_done.remove(&(self.file_index, tree.id));
+    }
+
+    /// Whether this member's signature can simply be built again.
+    ///
+    /// Only a `val`. Its signature is its written type and nothing else, so
+    /// resolving it a second time in the same scope is idempotent. A `def` is
+    /// not: `type_def_sig` allocates fresh symbols for the method's type
+    /// parameters and replaces `tparams` with them, so a second run leaves
+    /// every type already built out of the first run's parameters pointing at
+    /// symbols the method no longer has -- slick's
+    /// `ShapedValue.mapToImpl[R, U](c: blackbox.Context …)` went from clean to
+    /// `not found: type Expr` and 19 more when defs were included here. It
+    /// also synthesizes evidence parameters and default getters, which must
+    /// not happen twice.
+    ///
+    /// Used when an `import` in the enclosing template named a prefix this
+    /// pass could not resolve. `import profile.api._` with
+    /// `val profile: BlockingJdbcProfile` in *another unit* cannot resolve
+    /// during the signature pass -- that unit's own signature pass has not run
+    /// yet -- so gitbucket's `implicit val dateColumnType:
+    /// BaseColumnType[java.util.Date]` was typed with `BaseColumnType` not in
+    /// scope and, `sig_done` being permanent, stayed an error for the rest of
+    /// the run. An implicit whose type is an error fits *every* implicit
+    /// search. The body pass, by which time every unit has its signatures, is
+    /// where such a member should be built.
+    fn sig_rerun_safe(tree: &Tree) -> bool {
+        matches!(&tree.kind, TreeKind::ValDef { .. })
     }
 
     fn type_member_sig(&mut self, tree: &mut Tree) {
@@ -5571,6 +5692,7 @@ impl Typer {
     /// Remember that this pass could not resolve the prefix, so a later pass
     /// that does knows there is something to retract.
     fn note_import_prefix_failed(&mut self, qspan: Span) {
+        self.import_prefix_missed = true;
         if qspan != Span::DUMMY {
             let key = (self.file_index, qspan.lo.0, qspan.hi.0);
             self.import_prefix_failed.insert(key);
@@ -6053,6 +6175,44 @@ impl Typer {
             for m in found {
                 self.st.enter_in_current(to, m);
                 entered = true;
+            }
+        }
+        // The two namespaces are separate, and a jar's `type` member leaves no
+        // trace in the bytecode: `lookup_member` above can only ever find the
+        // *term*. slick's `JdbcBackend` declares both
+        // `type Database = DatabaseDef` and `val Database`, and gitbucket
+        // writes `import slick.jdbc.JdbcBackend.{Database => SlickDatabase,
+        // Session}` -- so `private val db: SlickDatabase` was typed as the
+        // *factory object's* class and `Database() withTransaction { … }` was
+        // "value withTransaction is not a member of DatabaseFactory", taking
+        // every `Session` in the program with it. `Session`, which has no term
+        // side at all, was "value Session is not a member of object
+        // JdbcBackend". Run whether or not the term was found, for exactly
+        // that reason. Same shape as `expose_unqualified_type`.
+        if self.library_abi && self.st.lookup_type(to).is_empty() {
+            for &owner in owners {
+                if owner.is_none() {
+                    continue;
+                }
+                let member =
+                    self.pickle
+                        .complete_type_member(&mut self.st, &mut self.binary, owner, from);
+                match member {
+                    Some(Type::TypeMember(id)) => {
+                        self.st.enter_in_current(to, id);
+                        entered = true;
+                        break;
+                    }
+                    // A nullary alias is its right-hand side and has no symbol
+                    // of its own; when that is a plain class, the class is
+                    // what the imported name means.
+                    Some(Type::Class { sym, args }) if args.is_empty() && !sym.is_none() => {
+                        self.st.enter_in_current(to, sym);
+                        entered = true;
+                        break;
+                    }
+                    _ => {}
+                }
             }
         }
         if entered {
@@ -9926,6 +10086,30 @@ impl Typer {
                     let oo = self.st.get(other).owner;
                     if oo == owner {
                         return false;
+                    }
+                    // A *declaration* is never an alternative next to a
+                    // definition of the same signature, however the two
+                    // reached this class. The owner test below asks for
+                    // `other`'s class to be below `s`'s, which is exactly what
+                    // a self type does not give: gitbucket writes
+                    //
+                    // ```scala
+                    // trait Profile { val profile: BlockingJdbcProfile }
+                    // trait ProfileProvider { self: Profile =>
+                    //   lazy val profile = DatabaseConfig.slickDriver }
+                    // trait CoreProfile extends ProfileProvider with Profile
+                    // ```
+                    //
+                    // and `Profile.profile.blockingApi` was then selected on
+                    // `<overload BlockingJdbcProfile | ...>`, taking every
+                    // slick `Session` in the program with it. In the class
+                    // that has both, one implements the other; nsc's
+                    // linearization sees a single member.
+                    if self.is_deferred_member(s)
+                        && !self.is_deferred_member(other)
+                        && self.same_signature(other, s)
+                    {
+                        return true;
                     }
                     let child = Type::Class {
                         sym: oo,

@@ -223,6 +223,8 @@ are organised is described in [docs/testing.md](docs/testing.md).
   suite: what is measured, the numbers, and what they found.
 - [docs/cats.md](docs/cats.md) — where this compiler stands on typelevel/cats,
   the second real-world benchmark.
+- [docs/scala-library.md](docs/scala-library.md) — compiling scala/scala's own
+  `src/library` from source: the numbers, and the one root behind them.
 - [docs/notes/](docs/notes/README.md) — development notes: the investigations
   and the reasoning behind individual changes.
 

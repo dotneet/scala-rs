@@ -75,7 +75,7 @@ fn print_help() {
 scala-rs — a Scala 2.13 subset compiler (not Scala 3)
 
 USAGE:
-    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings] [-language:<feat>] [-Xsource:3] [-Xsource-features:<features>] [-Xasync]
+    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings] [-language:<feat>] [-Xsource:3] [-Xsource-features:<features>] [-Xasync] [-no-specialization]
     scala-rs run <file> [--scala-library <jar>] [--no-scala-library] [--] [java-args...]
     scala-rs --help
 
@@ -109,6 +109,10 @@ OPTIONS:
                         with a warning, without it). `3-cross` is `3` plus
                         every feature. `-Xsource-features:help` lists them;
                         `case-apply-copy-access` is the one implemented here.
+    -no-specialization  Ignore `@specialized` / `@unspecialized` (nsc's flag of
+                        the same name). Without it they are diagnosed: there is
+                        no specialisation phase here, so the emitted class would
+                        silently lack the `$mc*$sp` members callers link against.
     -Xasync             Enable the async phase for scala.async.Async's `async`
                         and `await`. The state-machine transform is not
                         implemented: an `async` block is diagnosed either way.
@@ -194,6 +198,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
     let mut unimplemented_features: Vec<&'static str> = Vec::new();
     let mut features_help = false;
     let mut xasync = false;
+    let mut no_specialization = false;
     let mut files = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -256,6 +261,8 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             unimplemented_features.extend(parsed.unimplemented);
         } else if a == "-Xasync" {
             xasync = true;
+        } else if a == "-no-specialization" || a == "--no-specialization" {
+            no_specialization = true;
         } else if let Some(rest) = a.strip_prefix("-Xsource:") {
             (xsource3, xsource_cross) = parse_xsource_level(rest)?;
         } else if a == "-Xsource" {
@@ -315,6 +322,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             xsource3,
             source_features,
             xasync,
+            no_specialization,
         },
         warnings,
         features_help,
@@ -429,6 +437,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         xsource3: parsed.xsource3,
         source_features: parsed.source_features,
         xasync: parsed.xasync,
+        no_specialization: parsed.no_specialization,
     };
     let result = compile_paths(&[parsed.file], &opts);
     print_diags(&result);
@@ -469,6 +478,7 @@ struct RunArgs {
     xsource3: bool,
     source_features: SourceFeatures,
     xasync: bool,
+    no_specialization: bool,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
@@ -481,6 +491,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut named_features = SourceFeatures::default();
     let mut named_features_given = false;
     let mut xasync = false;
+    let mut no_specialization = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -492,6 +503,8 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             named_features_given = true;
         } else if a == "-Xasync" {
             xasync = true;
+        } else if a == "-no-specialization" || a == "--no-specialization" {
+            no_specialization = true;
         } else if let Some(rest) = a.strip_prefix("-Xsource:") {
             (xsource3, xsource_cross) = parse_xsource_level(rest)?;
         } else if a == "--no-scala-library" {
@@ -539,6 +552,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         source_features,
         xasync,
         xsource3,
+        no_specialization,
     })
 }
 
