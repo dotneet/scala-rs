@@ -38,7 +38,7 @@ the same conditions, back to back.
 |                | wall    | CPU     | class files |
 | -------------- | ------- | ------- | ----------- |
 | scalac 2.13.16 | 12.0 s  | 68.6 s  | 1498        |
-| scala-rs       | 2.0 s   | 1.8 s   | 2127        |
+| scala-rs       | 1.8 s   | 1.7 s   | 2127        |
 
 Medians of three runs, alternating between the two compilers so that both see
 the same machine. The CPU-time gap is the larger one: scalac's wall time is

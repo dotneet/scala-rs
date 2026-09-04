@@ -10,12 +10,18 @@ code generation → writing the class files).
 | nsc (scalac 2.13.16, including JVM startup) | 12.0 s    | 68.6 s            | 1498        |
 | scala-rs, before any optimisation           | 217.3 s   | 209.6 s           | 4552        |
 | scala-rs, after the first pass              | 3.5 s     | 3.0 s             | 4552        |
-| scala-rs, after the second pass and indy    | **2.0 s** | **1.8 s**         | 2127        |
+| scala-rs, after the second pass and indy    | 2.0 s     | 1.8 s             | 2127        |
+| scala-rs, after the class-file writing pass | **1.8 s** | **1.7 s**         | 2127        |
 
 Medians of three runs each, alternating between the two compilers so both see
 the same machine. The last row is the current state; the earlier rows are kept
-because the two optimisation passes are described below and the numbers are
+because the optimisation passes are described below and the numbers are
 what each one moved.
+
+The CPU column is `user` only, which is the right comparison for the first two
+passes because they were arithmetic. It hides the third: writing the class
+files spends its CPU in the kernel, and that pass took **`sys` from 0.83 s to
+0.22 s**. Total CPU on the last row is 1.89 s against the previous 2.50 s.
 
 That is **116x less CPU than where it started**, and against nsc **6x faster in
 wall time, 38x in CPU**. nsc's wall time is carried by several threads; the
@@ -85,8 +91,9 @@ build went from 14 s to 46 s), and a `Cow` fast path in `subst_tparams_slice`
 From a profile of the current binary (`sample`, excluding threads parked in
 `__ulock_wait`):
 
-- **Writing the class files dominates**: `open` alone is around 45% of the
-  non-waiting samples, plus `close` and `write`. 2127 files is 2127 creates.
+- Writing the class files is **7% of wall time**, not the 45% an earlier
+  reading of `sample` claimed — see *Writing the class files* below for why
+  those two numbers are not the same measurement. 2127 files is 2127 creates.
   579 of them are closure classes scalac does not emit: every one implements
   `scala.PartialFunction`, and scalac has 137 such classes to our 716. scalac
   only builds a `PartialFunction` class when the expected type really is one;
@@ -101,6 +108,64 @@ From a profile of the current binary (`sample`, excluding threads parked in
   type checking.
 - The compile is single-threaded. Parsing is trivially parallel; the typer
   shares a mutable symbol table and is not.
+
+### Writing the class files
+
+Two changes, both in `crates/driver/src/lib.rs`. slick, 184 files, 2127 class
+files, medians of 16 runs alternating the two binaries so both see the same
+load:
+
+| | wall | user | sys | CPU (user+sys) |
+| --- | --- | --- | --- | --- |
+| eight writer threads, all writes after the last unit | 1.87 s | 1.67 s | 0.83 s | 2.50 s |
+| four writer threads, overlapped with code generation | **1.78 s** | 1.67 s | **0.22 s** | **1.89 s** |
+
+−5% wall and **−24% CPU**, with the class files byte-for-byte identical
+(`diff -r` over both output trees).
+
+**First: the profile did not say what it was read as saying.** The claim was
+"`open` is 45% of the non-waiting samples, so writing dominates". `sample`
+counts *thread* time, and a thread blocked in `open` is sampled exactly like a
+thread doing arithmetic. Adding up eight blocked writer threads and comparing
+that total against one working main thread inflates I/O by the width of the
+pool. Read `sample`'s per-thread totals instead: the writer threads are alive
+for **86 ms of a 1231 ms process**, and timing `write_emitted` directly agreed
+(65–100 ms). Writing was 7% of the compile, and 45% was never available to win.
+
+**Second: more threads made it worse, not better.** "It is I/O bound, so add
+threads" is the wrong model for creating files. `write_emitted` timed on its
+own, slick's 2127 files, fresh output directory, APFS:
+
+| threads | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 12 | 16 | 24 | 32 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ms | 110 | 85 | 60 | **55** | 62 | 68 | 95 | 180 | 190 | 195 | 200 |
+
+Creating a file takes an exclusive lock on its directory, and these 2127 files
+land in 19 directories — 716 of them in one. Past about four threads they queue
+on each other, and the queueing is kernel CPU: `sys` was 0.83 s at eight
+threads and 0.28 s at four, for the same syscalls. That single constant is
+most of the CPU saving above.
+
+Overwriting an existing file is cheaper than creating one (65 ms against 90 ms
+for the same 2127 files), so a repeated build into the same `-d` is measuring
+something slightly different from a first build.
+
+**Third: the writes did not have to be at the end.** They are now streamed —
+each unit's classes go to the pool as soon as `emit_opts` returns
+(`ClassWriter`), so the file system latency overlaps with the code generation
+that follows instead of being appended to it. Each chunk is *moved* to a writer
+thread and moved back when written, so nothing is copied and nothing is shared;
+`compile_paths` still returns every class, in emit order. This is the −4% wall
+that is left once the thread count is fixed. Runs under 64 classes write on the
+calling thread — starting a pool costs more than it saves.
+
+Measured and discarded: **streaming does not address the 1.4 GB peak**. All
+2127 class files together are 9.2 MB. Whatever the peak is, it is not the
+emitted bytes being held.
+
+Not attempted, and worth knowing before someone tries: `openat` against a
+cached directory fd would save resolving the parent path per file, but path
+resolution is not what the writers are blocked on — the directory lock is.
 
 ### How to reproduce
 
