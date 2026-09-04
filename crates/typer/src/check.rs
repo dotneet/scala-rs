@@ -207,6 +207,16 @@ pub struct Typer {
     /// An `import` in the template being typed named a prefix this pass could
     /// not resolve. See `Typer::sig_rerun_safe`.
     import_prefix_missed: bool,
+    /// Files holding an `import p._` whose members this compiler cannot
+    /// enumerate: the prefix did not resolve at all, or it is a *value* whose
+    /// type comes out of a jar, where members are read one name at a time and
+    /// a wildcard asks for no name in particular.
+    ///
+    /// In such a file an unresolved type name is not evidence of anything --
+    /// gitbucket writes `import gitbucket.core.model.Profile.profile.blockingApi._`
+    /// and then `def f(implicit s: Session)`, and `Session` is a type member
+    /// reached through that path. See [`Typer::with_strict_sig_names`].
+    opaque_import_files: HashSet<usize>,
     /// A member's signature was taken back to be built again. See
     /// `Typer::leave_sig_for_body_pass`.
     sig_deferred: bool,
@@ -262,6 +272,12 @@ pub struct Typer {
     /// a `new` builds. `tree_to_type` recurses, so `extends Seq[Missing]`
     /// points at `Missing`, exactly as nsc does.
     strict_type_names: bool,
+    /// The names quantified by the `forSome` clauses currently being resolved,
+    /// as a stack (existentials nest). They deliberately stay `Type::Named`
+    /// placeholders until `subst_quantified` binds them, so
+    /// [`Self::reject_unresolved_type`] must not mistake one for a name that
+    /// resolves to nothing.
+    exist_quantified: Vec<String>,
     /// Inside a *type pattern* (`case o: TC[_]`), where nsc lets a wildcard
     /// type argument stand for a type constructor. In an ordinary type
     /// position the same `TC[_]` is an existential over a proper type and nsc
@@ -688,6 +704,7 @@ impl Typer {
             diags: Vec::new(),
             import_prefix_failed: HashSet::new(),
             import_prefix_missed: false,
+            opaque_import_files: HashSet::new(),
             sig_deferred: false,
             sig_final_round: false,
             file_index,
@@ -699,6 +716,7 @@ impl Typer {
             sigs_only: false,
             header_pass: false,
             strict_type_names: false,
+            exist_quantified: Vec::new(),
             pattern_tpt: false,
             ctor_pattern_fun: false,
             sig_done: std::collections::HashSet::new(),
@@ -2575,6 +2593,7 @@ impl Typer {
             };
             self.check_abstract_override_grounded(id, tree_span, &headline);
             self.check_overrides(id, &body_snapshot, tree_span);
+            self.check_double_defs(id, &body_snapshot);
             let missing_headline = if anon {
                 "object creation impossible.".to_string()
             } else {
@@ -2819,6 +2838,7 @@ impl Typer {
             let headline = "object creation impossible.".to_string();
             self.check_abstract_override_grounded(cls, mod_span, &headline);
             self.check_overrides(cls, &body_snapshot, mod_span);
+            self.check_double_defs(cls, &body_snapshot);
             self.check_missing_implementations(cls, mod_span, &headline);
         }
         self.st.pop_scope();
@@ -3384,6 +3404,29 @@ impl Typer {
                 .find(|t| t.sym == e.sym && !e.sym.is_none())
                 .map(|t| t.span)
                 .unwrap_or(span);
+            self.error(at, e.message);
+        }
+    }
+
+    /// nsc's `RefChecks.checkNoDoubleDefs`: two overloads of one template that
+    /// erase to the same descriptor. See `crate::double_def`.
+    fn check_double_defs(&mut self, class_id: SymbolId, body: &[Tree]) {
+        if class_id.is_none() {
+            return;
+        }
+        let members: Vec<SymbolId> = body
+            .iter()
+            .filter(|t| matches!(t.kind, TreeKind::DefDef { .. }))
+            .map(|t| t.sym)
+            .collect();
+        for e in crate::double_def::check_double_defs(&self.st, class_id, &members) {
+            let Some(at) = body
+                .iter()
+                .find(|t| t.sym == e.sym && !e.sym.is_none())
+                .map(|t| t.span)
+            else {
+                continue;
+            };
             self.error(at, e.message);
         }
     }
@@ -3990,7 +4033,10 @@ impl Typer {
                 Type::NoType
             }
         } else {
-            let ty = self.tree_to_type(&tpt);
+            // A written type annotation is a name nsc has finished resolving:
+            // `def f(x: Zork)` and `val x: Zork` are `not found: type Zork`,
+            // not a silently accepted program. See `strict_type_names`.
+            let ty = self.with_strict_sig_names(|s| s.tree_to_type(&tpt));
             self.check_proper_type(&ty, tree.span);
             ty
         };
@@ -4403,7 +4449,10 @@ impl Typer {
                 Type::NoType
             }
         } else {
-            let ret = self.tree_to_type(&tpt);
+            // As in `type_val_sig`: a written result type is fully resolvable
+            // by the time nsc looks at it, so an unresolved name is an error
+            // and not a placeholder.
+            let ret = self.with_strict_sig_names(|s| s.tree_to_type(&tpt));
             self.check_proper_type(&ret, span);
             ret
         };
@@ -5706,6 +5755,17 @@ impl Typer {
                 self.type_def_body(tree);
             }
             TreeKind::Import { .. } => self.type_import(tree),
+            // A local `type` alias: the block resolved it before any statement
+            // ran (see `TreeKind::Block`), so there is nothing left to do and
+            // falling through to `type_expr` would only mark it `Error`.
+            TreeKind::TypeDef { .. } => {
+                if tree.sym.is_none() {
+                    self.namer(tree);
+                    self.type_member_sig(tree);
+                    self.finish_one_type_alias(tree);
+                }
+                self.check_stored_annotations(tree);
+            }
             // Local `class` / `object` inside a block. `type_expr` routes these
             // back here, so they must not fall through to it again.
             TreeKind::ClassDef { .. } => {
@@ -6435,6 +6495,22 @@ impl Typer {
     /// the owner is also recorded so that a name only reachable by reading a
     /// classfile is still found later (see `expose_unqualified`).
     fn import_wildcard(&mut self, owners: &[SymbolId], hidden: &[String], span: Span) {
+        // A wildcard whose prefix is a package or an object is enumerable: the
+        // walk below enters every member it has. Anything else -- a prefix
+        // that did not resolve, or a *value* whose type is a jar class read one
+        // name at a time -- leaves names in scope that this compiler never
+        // sees, and a name it cannot find in such a file proves nothing.
+        if owners.is_empty()
+            || owners.iter().any(|&o| {
+                o.is_none()
+                    || !matches!(
+                        self.st.get(o).kind,
+                        SymKind::Package | SymKind::Module | SymKind::ModuleClass
+                    )
+            })
+        {
+            self.opaque_import_files.insert(self.file_index);
+        }
         let mut all: Vec<SymbolId> = Vec::new();
         for &owner in owners {
             if owner.is_none() || all.contains(&owner) {
@@ -7348,6 +7424,36 @@ impl Typer {
                     self.namer_member(&mut conv);
                     stats.push(conv);
                 }
+                // A local `type` alias is in scope for the whole block, and it
+                // had no symbol at all until now: a block never ran the namer
+                // over its `TypeDef` statements, so `type B = List[Int]; val
+                // v: B = xs` left `B` standing for nothing. That was invisible
+                // while an unresolved name in a signature was tolerated; it is
+                // not any more. cats' `Monad.ifElseM` is the shape --
+                // `type Branches = List[(F[Boolean], F[A])]` followed by
+                // `def step(branches: Branches)` -- so the aliases have to be
+                // resolved before the local signatures that name them, exactly
+                // as a template resolves its type members first.
+                //
+                // Only up to the first `import`, though: an import inside a
+                // block takes effect from where it stands, and resolving a
+                // later alias ahead of it types the alias in the wrong scope
+                // (`pos/t5305` writes `import O.{F, v}` and then
+                // `type x = { type l = (F, v.type) }`). An alias after an
+                // import keeps the order it always had.
+                let upto = stats
+                    .iter()
+                    .position(|s| matches!(s.kind, TreeKind::Import { .. }))
+                    .unwrap_or(stats.len());
+                for s in stats[..upto].iter_mut() {
+                    if matches!(s.kind, TreeKind::TypeDef { .. }) {
+                        if s.sym.is_none() {
+                            self.namer(s);
+                        }
+                        self.type_member_sig(s);
+                    }
+                }
+                self.finish_type_aliases(&mut stats[..upto]);
                 // A local `def` is in scope for the whole block, so it may be
                 // called before it is written -- and two of them may call each
                 // other. Only the signature is built here (which is what a
@@ -20091,6 +20197,9 @@ impl Typer {
         if !self.strict_type_names {
             return ty;
         }
+        if self.exist_quantified.iter().any(|q| q == name) {
+            return ty;
+        }
         match &ty {
             Type::Named { name: n, args } if args.is_empty() && n == name => {
                 self.not_found_error(span, "type", name);
@@ -20144,6 +20253,17 @@ impl Typer {
                 Type::Error
             }
         }
+    }
+
+    /// [`Self::with_strict_type_names`] for a *signature* — a parameter, a
+    /// field, a result type. Unlike a parents clause this covers every name a
+    /// file writes, so it stands down in a file whose scope this compiler
+    /// cannot enumerate; see [`Self::opaque_import_files`].
+    fn with_strict_sig_names<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        if self.opaque_import_files.contains(&self.file_index) {
+            return f(self);
+        }
+        self.with_strict_type_names(f)
     }
 
     /// Run `f` with [`Self::strict_type_names`] on.
@@ -20260,11 +20380,13 @@ impl Typer {
             }
             TreeKind::AppliedTypeTree { tpt, args } => {
                 let span = tpt.span;
+                let arg_mark = self.diags.len();
                 let mut as_ = Vec::new();
                 for a in args {
                     as_.push(self.tree_to_type(a));
                 }
-                match tpt.name() {
+                let head_mark = self.diags.len();
+                let applied = match tpt.name() {
                     Some("Array") => {
                         Type::Array(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
                     }
@@ -20353,7 +20475,22 @@ impl Typer {
                         self.apply_types(ctor, as_, span)
                     }
                     None => Type::Error,
+                };
+                // nsc's error type is absorbing: when the type constructor
+                // names nothing, its arguments are not reported as well.
+                // `-Ykind-projector` passes an unrecognised
+                // `Functor[λ[α => Box[α], β]]` through untouched, and
+                // `α`/`β` are then names nobody wrote a binder for -- one
+                // diagnostic about `λ`, not three. Only the *arguments*'
+                // diagnostics are dropped, and only when the head itself
+                // produced one, so `def f(x: List[Zork])` still reports `Zork`.
+                if self.diags[head_mark..]
+                    .iter()
+                    .any(|d| d.span == tpt.span && d.level == scala_rs_span::Level::Error)
+                {
+                    self.diags.drain(arg_mark..head_mark);
                 }
+                applied
             }
             TreeKind::TypeApply { fun, args } => {
                 // `new C[T]` in term position may be TypeApply; treat it as a type.
@@ -20410,6 +20547,17 @@ impl Typer {
                 let mut quantified = Vec::new();
                 let mut val_clauses: Vec<(String, Tree, Span)> = Vec::new();
                 let mut ok = true;
+                // The quantified names are bound by `subst_quantified` *after*
+                // the body is resolved, so within the body they resolve to
+                // nothing. Announce them first -- all of them, since a bound
+                // may name a later clause -- so that a strict type position
+                // does not report them as missing.
+                let exist_depth = self.exist_quantified.len();
+                for c in clauses {
+                    if let TreeKind::TypeDef { name, .. } = &c.kind {
+                        self.exist_quantified.push(name.clone());
+                    }
+                }
                 for c in clauses {
                     match &c.kind {
                         TreeKind::TypeDef {
@@ -20452,6 +20600,7 @@ impl Typer {
                 if !val_clauses.is_empty() {
                     if quantified.is_empty() {
                         if let Some(packed) = self.pack_value_existential(inner, &val_clauses) {
+                            self.exist_quantified.truncate(exist_depth);
                             return packed;
                         }
                     }
@@ -20461,9 +20610,11 @@ impl Typer {
                             "unimplemented type: value existential (`forSome { val … }`)",
                         );
                     }
+                    self.exist_quantified.truncate(exist_depth);
                     return Type::Error;
                 }
                 let ty = self.tree_to_type(inner);
+                self.exist_quantified.truncate(exist_depth);
                 if !ok {
                     return Type::Error;
                 }

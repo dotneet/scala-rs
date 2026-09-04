@@ -238,11 +238,18 @@ fn fixtures_genrep_tuple_bad_is_error() {
 /// `TupleN extends Product with Serializable` is linked from the jar. The
 /// private runtime has neither interface, so `--no-scala-library` must keep
 /// diagnosing a tuple used as a `Product` instead of accepting it.
+///
+/// The wording changed with `agent/accepttoomuch`, which made a written type
+/// annotation resolve strictly. `Product` is not a symbol at all without the
+/// jar, so the annotation itself is now what is reported; before, the name
+/// stayed an unresolved `Type::Named` placeholder and the tuple was found not
+/// to conform to it. Both are the same fact -- the private runtime has no
+/// `Product` -- and naming the missing type is the more direct of the two.
 #[test]
 fn fixtures_genrep_product_bad_without_library_is_error() {
     compile_fails(
         "genrep_product_bad",
         &["--no-scala-library"],
-        "type mismatch; found: Tuple2[Int, String]  required: Product",
+        "not found: type Product",
     );
 }

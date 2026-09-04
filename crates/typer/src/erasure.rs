@@ -567,6 +567,13 @@ fn head_type_sym(ty: &Type) -> Option<SymbolId> {
     }
 }
 
+/// The erasure of one member type, for callers outside this module.
+/// `double_def` compares two signatures the way the class file will record
+/// them.
+pub(crate) fn erase_member_ty(ty: &Type, st: &SymbolTable) -> Type {
+    erase_ty(ty, st)
+}
+
 fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
     // `Array[T]` reached through a classfile signature, or built by
     // substituting `Array` for a `C[_]` parameter, is `Class { array_sym }`.

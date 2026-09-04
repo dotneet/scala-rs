@@ -4,6 +4,7 @@ mod classpath;
 mod ctor_defaults;
 mod cyclic;
 mod default_recv;
+mod double_def;
 mod erasure;
 mod expand;
 mod expand_private;
