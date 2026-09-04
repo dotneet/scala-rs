@@ -75,16 +75,16 @@ path of your own.**
 | | files | skipped | errors | files with errors | classfiles |
 |---|---|---|---|---|---|
 | At the start | 354 | 0 | **35** | 13 | 0 |
-| Now | 353 | 1 | **3264** | 256 | 0 |
+| Now | 353 | 1 | **3261** | 256 | 0 |
 
 **The number went up, and that is the progress.** All 35 errors at the start
 were *parse* errors, and a parse error stops the run before typing: nothing in
 gitbucket had been typechecked at all. This is exactly what `docs/cats.md`
 records for cats, where 755 parse errors hid 3019 real ones. The honest reading
-of "35" is "0 files typechecked"; the honest reading of "3264" is "353 files
+of "35" is "0 files typechecked"; the honest reading of "3261" is "353 files
 typechecked, 97 of them clean".
 
-Of the 3264, 2219 are in the 116 hand-written files that still have errors (of
+Of the 3261, 2216 are in the 116 hand-written files that still have errors (of
 213 measured) and 1038 are in the generated templates — all 140 of which have
 at least one.
 
@@ -226,7 +226,7 @@ in a block inside the lambda, which has no stream for the guard to filter, and
 so diagnoses the shape rather than desugaring it wrongly. Three occurrences,
 one file, held out of the measurement by default.
 
-## Where the remaining 3264 are
+## Where the remaining 3261 are
 
 Counted by message shape, largest first, with the reading:
 
