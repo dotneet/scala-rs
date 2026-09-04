@@ -69,7 +69,7 @@ two together: `errors=0 classes=0` would mean a crash, not a success.
 **These are the `agent/scalalib` numbers.** The next section, "The one root",
 is the survey that was made of them; everything below "The `agent/preludeshadow`
 slice" is what happened when that root was fixed, and the current default-mode
-figure is **2014 errors in 172 files**.
+figure is **1997 errors in 173 files**.
 
 ### The measurement is not run against the jar
 
@@ -237,8 +237,9 @@ not reachable, not the bound.
 
 ## The `agent/preludeshadow` slice: source definitions now replace the prelude
 
-**4203 errors in 219 files → 2014 in 172.** Every other target is unchanged;
-see the table at the end of this section.
+**4180 errors in 218 files → 1997 in 173**, measured on this branch merged
+with `main` at `d4131b0`. Every other target is unchanged to the error; see
+the table at the end of this section.
 
 The root above was right, and it was three separate mechanisms wearing one
 symptom. All three are name resolution; none of them is in `prelude*.rs`
@@ -292,12 +293,22 @@ the right lookup; it skips a scope that binds the name only as a term.
 
 ### What this did to the numbers
 
+Each of the three is worth its own line; these were taken at the branch point
+`56174d5`, one after the other:
+
 | | files | errors | files with errors | classes |
 |---|---|---|---|---|
 | branch point (`56174d5`) | 538 | 4203 | 219 | 0 |
 | after (1) | 538 | 2245 | 176 | 0 |
 | after (2) | 538 | 2190 | 172 | 0 |
 | after (3) | 538 | **2014** | **172** | 0 |
+
+And on the merged tree, which is the number that counts:
+
+| | files | errors | files with errors | classes |
+|---|---|---|---|---|
+| `main` at `d4131b0` | 538 | 4180 | 218 | 0 |
+| this branch merged with it | 538 | **1997** | **173** | 0 |
 
 `classes=0` is still expected while errors remain.
 
@@ -336,7 +347,10 @@ with an explicit unrelated prefix, also comes out as `scala.Option[Int]`.
    way to tell the synthesized `Ident` from a user's own call — the parser has
    no symbol table and `Tree` has no marker field — so it is a small design
    decision, not a one-liner. `tests/fixtures/pshadow_tuplename.scala` covers
-   the *type*-position half that is fixed; the term half is not in it.
+   the *type*-position half that is fixed; the term half is not in it. (288
+   `no matching overload` remain, and this is a large share of them:
+   `Equiv.scala:251`'s is `(x, y) match` reading as a call of
+   `Equiv.Tuple2`.)
 2. **`Vector2[Any]` … `Vector6[Any]` — 100 errors, all in `Vector.scala`.**
    `new VectorN(…)` on a generic constructor infers `Any` for the element
    where the context expects `Vector[B]`. Nothing to do with the prelude; it
@@ -345,8 +359,8 @@ with an explicit unrelated prefix, also comes out as `scala.Option[Int]`.
 3. `case class` synthesis does not produce `canEqual`, so all 22 `TupleN`
    classes report `class TupleN needs to be abstract` against
    `Product`/`Equals`. 22 errors, one root, and it needs no lookup work.
-4. Do **not** assume the overriding family (now 51: 30 `override modifier
-   required` plus 21 `incompatible type in overriding`) is a second root. It
+4. Do **not** assume the overriding family (now 51: 30 `` `override` modifier
+   required`` plus 21 `incompatible type in overriding`) is a second root. It
    looks like one — `overrides nothing` does not need member lookup to
    succeed — but the ones sampled were the same bug seen from the other side.
    It has shrunk from 263 along with everything else, which is consistent with
@@ -356,19 +370,24 @@ with an explicit unrelated prefix, also comes out as `scala.Option[Int]`.
 
 ### The other targets, before and after this slice
 
-Both columns measured with binaries built from this worktree, the "before"
-one from the branch point `56174d5`.
+Both columns measured on the merged tree, the "before" one from a binary built
+with `main`'s (`d4131b0`) `check.rs` / `symbol.rs` / `prelude.rs` in place.
 
 | | before | after |
 |---|---|---|
-| `tests/slick_measure.sh` | `files=184 errors=0 files_with_errors=0 classes=1596` | same |
+| `tests/slick_measure.sh` | `files=184 errors=0 files_with_errors=0 classes=1596` | identical |
 | `tests/slick_run.sh` | — | `progs=12 ok=12 diff=0 fail=0` |
-| `tests/cats_measure.sh` | `files=339 skipped=1 errors=71 files_with_errors=16 classes=0` | same |
-| `tests/gitbucket_measure.sh` | `files=353 skipped=1 errors=2373 files_with_errors=188 classes=0` | same |
+| `tests/cats_measure.sh` | `files=339 skipped=1 errors=71 files_with_errors=16 classes=0` | identical |
+| `tests/gitbucket_measure.sh` | `files=353 skipped=1 errors=1859 files_with_errors=186 classes=0` | identical |
+| `tests/scala_corpus.sh` (sample, 250/kind, `CORPUS_JOBS=6`) | `pos 134/250 · neg 101/250 · run 49/250` | identical, and the per-test TSVs `diff` clean |
+| `cargo test --workspace --release` | — | 146 × `test result: ok`, 1931 tests |
+
+`tests/slick_subset.sh` was not run: this slice touches no code generation
+(`crates/backend/` is untouched), so its 30 minutes would measure nothing.
 
 Note that `docs/cats.md`'s headline number (3019) and `docs/gitbucket.md`'s
-(2545) are both stale: cats measures **71** and gitbucket **2373** on
-`56174d5`.
+(2545) are both stale: on `d4131b0` cats measures **71** and gitbucket
+**1859**.
 
 ## Running it
 
