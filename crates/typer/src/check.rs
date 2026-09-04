@@ -5283,11 +5283,24 @@ impl Typer {
             qual.sym = syms[0];
             return syms.into_iter().map(|s| self.as_type_owner(s)).collect();
         }
+        // An import is typed once per pass, and the first pass runs before the
+        // enclosing template's `val`s have signatures. `type_select` retypes a
+        // qualifier only when it is still `NoType`, so a `Select` that failed
+        // in pass one kept its `Error` and never recovered: `import d.p.api._`
+        // stayed broken for the whole run while the one-segment-shorter
+        // `import d.p._` (whose qualifier is an `Ident`, always retyped)
+        // recovered in pass four. That is what `import tdb.profile.api.*`
+        // hit in every one of slick's testkit suites.
+        //
+        // Clearing the path makes the retry a real retry.
+        clear_path_types(qual);
+        let qspan = qual.span;
         self.type_expr(qual, &Type::NoType);
         if !qual.sym.is_none() {
             let id = qual.sym;
             match self.st.get(id).kind {
                 SymKind::Module | SymKind::ModuleClass => {
+                    self.retract_import_prefix_errors(qspan);
                     return vec![self.st.module_class_of(id)];
                 }
                 // `import someVal._` / `import c.universe._`: the members are
@@ -5296,11 +5309,15 @@ impl Typer {
                 // what makes `import scala.reflect.runtime.universe._` bring
                 // in `Tree`, `TermName`, `internal`, ... at all.
                 SymKind::Method | SymKind::Term => {}
-                _ => return vec![id],
+                _ => {
+                    self.retract_import_prefix_errors(qspan);
+                    return vec![id];
+                }
             }
         }
         match self.st.class_sym_of(&qual.ty) {
             Some(c) => {
+                self.retract_import_prefix_errors(qspan);
                 let owner = self.st.module_class_of(c);
                 if !matches!(
                     self.st.get(owner).kind,
@@ -5312,6 +5329,24 @@ impl Typer {
             }
             None => Vec::new(),
         }
+    }
+
+    /// Drop what an *earlier* pass said about an import prefix that has now
+    /// resolved.
+    ///
+    /// Typing an import prefix is provisional -- the first pass runs before
+    /// the enclosing template's `val`s have signatures, so `import p.api._`
+    /// with `val p: Profile` in the same template legitimately reports
+    /// "value api is not a member of <notype>" on pass one and resolves on
+    /// pass four. Diagnostics are deduplicated but never retracted, so that
+    /// first attempt was reported for an import that works.
+    fn retract_import_prefix_errors(&mut self, qspan: Span) {
+        if qspan == Span::DUMMY {
+            return;
+        }
+        let file = self.file_index;
+        self.diags
+            .retain(|d| d.file_index != file || d.span.lo < qspan.lo || d.span.hi > qspan.hi);
     }
 
     /// Record the prefix `import <a value>._` selects its members through.
@@ -24647,6 +24682,23 @@ fn subst_quantified(ty: Type, qs: &[ExistQuant]) -> Type {
             hi: hi.map(|t| Box::new(subst_quantified(*t, qs))),
         },
         other => other,
+    }
+}
+
+/// Forget what an import prefix was last typed as, down the whole `a.b.c`
+/// chain, so the next pass types it from scratch. See `import_prefix`.
+fn clear_path_types(t: &mut Tree) {
+    match &mut t.kind {
+        TreeKind::Select { qual, .. } => {
+            t.ty = Type::NoType;
+            t.sym = SymbolId::NONE;
+            clear_path_types(qual);
+        }
+        TreeKind::Ident { .. } => {
+            t.ty = Type::NoType;
+            t.sym = SymbolId::NONE;
+        }
+        _ => {}
     }
 }
 

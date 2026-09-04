@@ -2760,12 +2760,25 @@ impl<'a> Parser<'a> {
                 self.accept_separator();
                 continue;
             }
+            // Scala 3 spells a filtering generator `for (case p <- e)`, and
+            // 2.13's parser accepts the `case` marker too (no -Xsource needed;
+            // checked against scalac 2.13.16). It carries no meaning here --
+            // a refutable pattern generator already filters -- so drop it.
+            // Only generators may wear it: `case j = e` is an error in scalac.
+            let case_marker = matches!(self.kind(), TokenKind::Case);
+            if case_marker {
+                self.bump();
+                self.skip_nl();
+            }
             let pat = self.parse_pattern1();
             self.skip_nl();
             let is_val = if matches!(self.kind(), TokenKind::LeftArrow) {
                 self.bump();
                 false
             } else if matches!(self.kind(), TokenKind::Equals) {
+                if case_marker {
+                    self.error_here("`<-` expected but `=` found");
+                }
                 self.bump();
                 true
             } else {
@@ -5057,19 +5070,23 @@ fn desugar_for(
         )
     }
 
-    /// `{ x => x match { case pat => true; case _ => false } }` for a refutable
-    /// generator pattern, as nsc's `withFilter` insertion does.
-    fn filter_lambda(p: &mut Parser, pat: &Tree) -> Tree {
+    /// `{ x => x match { case pat => <yes>; case _ => false } }`, as nsc's
+    /// `withFilter` insertion does. `yes = None` gives the plain refutability
+    /// filter (`true`); passing a guard expression instead is how a guard on a
+    /// destructuring generator gets to see what the pattern binds.
+    fn filter_lambda(p: &mut Parser, pat: &Tree, yes: Option<Tree>) -> Tree {
         let span = pat.span;
         p.placeholder_id += 1;
         let name = format!("x$forf{}", p.placeholder_id);
         let sel = p.alloc(span, TreeKind::Ident { name: name.clone() });
-        let yes = p.alloc(
-            span,
-            TreeKind::Literal {
-                lit: Lit::Boolean(true),
-            },
-        );
+        let yes = yes.unwrap_or_else(|| {
+            p.alloc(
+                span,
+                TreeKind::Literal {
+                    lit: Lit::Boolean(true),
+                },
+            )
+        });
         let no = p.alloc(
             span,
             TreeKind::Literal {
@@ -5140,7 +5157,15 @@ fn desugar_for(
             );
         }
         if let Some(g) = e.guard.filter(|_| !e.is_val) {
-            let pred = lambda(p, dummy_ident_from(&e.pat), g);
+            // `for ((i, s) <- xs if i > 0)`: the guard runs on the *element*,
+            // so a destructuring pattern has to be re-matched here or the
+            // names it binds are not in scope (`dummy_ident_from` gave `_`
+            // for every non-ident pattern, and the guard failed to resolve).
+            let pred = if matches!(&e.pat.kind, TreeKind::Ident { .. } | TreeKind::Wildcard) {
+                lambda(p, dummy_ident_from(&e.pat), g)
+            } else {
+                filter_lambda(p, &e.pat, Some(g))
+            };
             let sel = p.alloc(
                 rhs.span,
                 TreeKind::Select {
@@ -5178,7 +5203,7 @@ fn desugar_for(
             continue;
         }
         if !e.is_val && !is_irrefutable(&e.pat) {
-            let pred = filter_lambda(p, &e.pat);
+            let pred = filter_lambda(p, &e.pat, None);
             let sel = p.alloc(
                 rhs.span,
                 TreeKind::Select {
