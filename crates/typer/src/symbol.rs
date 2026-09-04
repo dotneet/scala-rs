@@ -51,7 +51,7 @@ fn enter_bound(id: SymbolId) -> Option<BoundGuard> {
     })
 }
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SymKind {
@@ -362,6 +362,22 @@ impl Scope {
     pub fn names(&self) -> impl Iterator<Item = &String> {
         self.map.keys()
     }
+
+    /// How many names this scope binds.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Every binding, in the same order `names` yields. `implicits_in_scope`
+    /// walks every name of every enclosing scope on every implicit search;
+    /// going through `names` and then `lookup` hashed each name twice.
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &[SymbolId])> {
+        self.map.iter().map(|(k, v)| (k, v.as_slice()))
+    }
 }
 
 pub struct SymbolTable {
@@ -398,31 +414,31 @@ pub struct SymbolTable {
     /// Erasure replaces the type with the underlying representation, but the
     /// backend still has to know that `case class Box(m: Meters)` prints its
     /// field as a boxed `Meters`.
-    pub value_class_terms: std::collections::HashMap<SymbolId, SymbolId>,
+    pub value_class_terms: rustc_hash::FxHashMap<SymbolId, SymbolId>,
     /// Value classes compiled from source in this run; see
     /// `erasure::note_source_value_classes`.
-    pub source_value_classes: std::collections::HashSet<SymbolId>,
+    pub source_value_classes: rustc_hash::FxHashSet<SymbolId>,
     /// Classes defined by the units being compiled, as opposed to ones read
     /// from the prelude or the classpath. A library case class keeps its
     /// constructor fields private behind accessors; ours are emitted with the
     /// field public, so the two are read differently.
-    pub source_classes: std::collections::HashSet<SymbolId>,
+    pub source_classes: rustc_hash::FxHashSet<SymbolId>,
     /// `scala.runtime.LazyRef` & friends, in `prelude_lazyref::CELL_NAMES`
     /// order. The cell classes a method-local `lazy val` is compiled into.
     pub lazy_cells: Vec<SymbolId>,
     /// The synthetic cell `val`s a method-local `lazy val` leaves behind. The
     /// backend gives each one a `new scala/runtime/Lazy…()` instead of the
     /// eager right-hand side.
-    pub local_lazy_cells: std::collections::HashSet<SymbolId>,
+    pub local_lazy_cells: rustc_hash::FxHashSet<SymbolId>,
     /// Accessor method -> its cell parameter, for the local `lazy val`s
     /// `lazy_local::lazy_locals` rewrote. The backend wraps the accessor's
     /// body in the `initialized` / `synchronized` / `initialize` dance.
-    pub local_lazy_accessors: std::collections::HashMap<SymbolId, SymbolId>,
+    pub local_lazy_accessors: rustc_hash::FxHashMap<SymbolId, SymbolId>,
     /// Methods a hoisted local-`lazy val` accessor `return`s out of. The
     /// `return` moved into the accessor with the initialiser, so the method's
     /// own body no longer shows it, yet the method still has to carry the
     /// `NonLocalReturnControl` handler that catches it.
-    pub local_lazy_nlr: std::collections::HashSet<SymbolId>,
+    pub local_lazy_nlr: rustc_hash::FxHashSet<SymbolId>,
     /// One past the last symbol `install_prelude` built.
     ///
     /// The prelude hand-writes signatures for the part of `scala.*` the typer
@@ -442,7 +458,7 @@ pub struct SymbolTable {
     /// recorded here while the type arguments are still there. Extractors
     /// absent from the map are walked as `List`, which is what `List`'s own
     /// `unapplySeq` and every built-in factory want.
-    pub seq_extractor_payload: std::collections::HashMap<SymbolId, SeqPayload>,
+    pub seq_extractor_payload: rustc_hash::FxHashMap<SymbolId, SeqPayload>,
     /// `jvm_name` -> class-like symbols carrying it, for `classpath::find_by_jvm`,
     /// which used to scan every symbol on every call. See `JvmIndex`.
     pub(crate) jvm_index: std::cell::RefCell<JvmIndex>,
@@ -541,15 +557,15 @@ impl SymbolTable {
             object_sym: SymbolId(0),
             owner: SymbolId(0),
             this_class: SymbolId(0),
-            value_class_terms: std::collections::HashMap::new(),
-            source_value_classes: std::collections::HashSet::new(),
-            source_classes: std::collections::HashSet::new(),
+            value_class_terms: rustc_hash::FxHashMap::default(),
+            source_value_classes: rustc_hash::FxHashSet::default(),
+            source_classes: rustc_hash::FxHashSet::default(),
             lazy_cells: Vec::new(),
-            local_lazy_cells: std::collections::HashSet::new(),
-            local_lazy_accessors: std::collections::HashMap::new(),
-            local_lazy_nlr: std::collections::HashSet::new(),
+            local_lazy_cells: rustc_hash::FxHashSet::default(),
+            local_lazy_accessors: rustc_hash::FxHashMap::default(),
+            local_lazy_nlr: rustc_hash::FxHashSet::default(),
             prelude_end: 0,
-            seq_extractor_payload: std::collections::HashMap::new(),
+            seq_extractor_payload: rustc_hash::FxHashMap::default(),
             jvm_index: std::cell::RefCell::new(JvmIndex::default()),
             erasure_settled: false,
         };
@@ -762,7 +778,7 @@ impl SymbolTable {
 
     pub fn lookup_member(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
         let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         let mut work = vec![owner];
         while let Some(id) = work.pop() {
             if !seen.insert(id.0) {
@@ -808,7 +824,7 @@ impl SymbolTable {
     /// `BasicProfile`'s further up the real chain.
     pub fn lookup_member_real(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
         let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         let mut work = vec![owner];
         while let Some(id) = work.pop() {
             if !seen.insert(id.0) {
@@ -932,7 +948,7 @@ impl SymbolTable {
                     // members, so member lookup goes through the upper bound.
                     // The chase is guarded: `type Self >: this.type <: Self`
                     // and mutually bounded members would otherwise loop.
-                    let mut seen = std::collections::HashSet::new();
+                    let mut seen = rustc_hash::FxHashSet::default();
                     seen.insert(id.0);
                     self.bounded_member_class(*id, &mut seen)
                 } else {
@@ -1049,12 +1065,12 @@ impl SymbolTable {
     fn bounded_member_class(
         &self,
         id: SymbolId,
-        seen: &mut std::collections::HashSet<u32>,
+        seen: &mut rustc_hash::FxHashSet<u32>,
     ) -> Option<SymbolId> {
         fn head(
             st: &SymbolTable,
             ty: &Type,
-            seen: &mut std::collections::HashSet<u32>,
+            seen: &mut rustc_hash::FxHashSet<u32>,
         ) -> Option<SymbolId> {
             match ty {
                 Type::Class { sym, .. } => Some(*sym),
@@ -1221,7 +1237,7 @@ impl SymbolTable {
 
     pub(crate) fn is_ancestor_of(&self, anc: SymbolId, cls: SymbolId) -> bool {
         let mut work = vec![cls];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         while let Some(c) = work.pop() {
             if !seen.insert(c.0) {
                 continue;
@@ -1267,7 +1283,7 @@ impl SymbolTable {
             st: &SymbolTable,
             recv: &Type,
             ty: Type,
-            seen: &mut std::collections::HashSet<u32>,
+            seen: &mut rustc_hash::FxHashSet<u32>,
         ) -> Type {
             match recv {
                 Type::Class { sym, args } => {
@@ -1395,7 +1411,7 @@ impl SymbolTable {
                 _ => ty,
             }
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         walk(self, recv, ty.clone(), &mut seen)
     }
 
@@ -1549,12 +1565,12 @@ impl SymbolTable {
     /// Concrete leaves of a sealed hierarchy (case classes, objects, non-sealed classes).
     pub fn sealed_leaves(&self, id: SymbolId) -> Vec<SymbolId> {
         let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         fn rec(
             st: &SymbolTable,
             id: SymbolId,
             out: &mut Vec<SymbolId>,
-            seen: &mut std::collections::HashSet<u32>,
+            seen: &mut rustc_hash::FxHashSet<u32>,
         ) {
             if !seen.insert(id.0) {
                 return;
@@ -2550,9 +2566,9 @@ impl SymbolTable {
     /// projection prefix can settle.
     pub(crate) fn abstract_type_member_names(&self, cls: SymbolId) -> Vec<String> {
         let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         let mut work = vec![cls];
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = rustc_hash::FxHashSet::default();
         while let Some(id) = work.pop() {
             if !visited.insert(id.0) {
                 continue;
@@ -2962,9 +2978,9 @@ impl SymbolTable {
     }
 
     fn abstract_sam_methods(&self, cls: SymbolId) -> Vec<SymbolId> {
-        let mut by_name: HashMap<String, SymbolId> = HashMap::new();
+        let mut by_name: HashMap<String, SymbolId> = HashMap::default();
         let mut work = vec![cls];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         while let Some(id) = work.pop() {
             if !seen.insert(id.0) {
                 continue;

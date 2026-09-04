@@ -4171,13 +4171,13 @@ classfile 書き出し）です。
 |---|---|---|---|
 | nsc（scalac 2.13.16、JVM 起動込み） | 11.9 秒 | 68.6 秒 | 1498 |
 | scala-rs（`34c78ba`、最適化前） | 217.3 秒 | 209.6 秒 | 4552 |
-| scala-rs（現在） | **3.5 秒** | **3.0 秒** | 4552 |
+| scala-rs（現在） | **2.0 秒** | **1.7 秒** | 4552 |
 
 3 つとも同じマシンで数分のうちに続けて取りました（load 9〜14）。
 
-**CPU 時間で 69 倍、実時間で 62 倍**速くなりました。nsc に対しては実時間で
-3.4 倍、CPU 時間で 23 倍速い（nsc は複数スレッドを使うので CPU 時間の差の方が
-大きい）。scala-rs は今も**完全に単スレッド**です。並列化はしていません。
+**CPU 時間で 123 倍、実時間で 108 倍**速くなりました。nsc に対しては実時間で
+6 倍、CPU 時間で 40 倍速い（nsc は複数スレッドを使うので CPU 時間の差の方が
+大きい）。並列なのは classfile の書き出しだけで、型検査は単スレッドのままです。
 
 classfile の数が違うのは、**scala-rs がラムダを匿名クラスとして出す**からです
 （nsc は `invokedynamic` + `LambdaMetaFactory`）。つまり scala-rs は 3 倍の
@@ -4249,15 +4249,46 @@ REPS=3 tests/bench.sh     # 回数を変える
 
 で、パースは 0.05 秒（全体の 1.5%）です。
 
+### Second pass
+
+Four changes, each measured on its own by running the two binaries
+alternately (the machine drifts by 20-30% within a minute, so only an
+interleaved A/B is readable). CPU time, `user`, on the same 184 files:
+
+| change | effect on CPU time |
+|---|---|
+| mimalloc as the global allocator (`crates/cli`) | -18% |
+| `rustc-hash` for the typer's internal maps and the constant pool | -6% |
+| `implicit_candidate_ty` returns `Cow` instead of a deep clone | -11% |
+| smaller: `Scope::entries`, a capacity hint for `implicits_in_scope`, no copy of a conversion's parameter list | -7% |
+
+Plus the class file writes, which are syscall-bound rather than CPU-bound:
+`write_emitted` hands the 4552 files to 8 threads once every directory
+exists, which is -5% on wall time and neutral on CPU time.
+
+Two things the profile said that the guesses did not:
+
+- **Thin LTO with `codegen-units = 1` is worth nothing here** (within noise
+  on four interleaved runs) and triples the build. The cost is not
+  cross-crate call overhead.
+- **Changing the hasher is safe in this codebase**, contrary to the note
+  that used to be here. `std`'s `RandomState` is seeded randomly *per
+  process*, so nothing could already depend on a particular `HashMap`
+  iteration order; switching to a fixed hasher only makes the order
+  reproducible. The maps that were switched are the typer's `Scope`,
+  the `seen`/`visited` sets, and the classfile constant pool.
+
 ### まだ残っているもの
 
-- **ハッシュが約 6%**。`std` の SipHash を内部キー専用の高速ハッシュに
-  替える余地はありますが、`HashMap` の**反復順が変わる**ので、
-  マップを順に舐めて出力を作っている箇所があると classfile の中身や
-  診断の順序が変わります。手を出すなら、その監査とセットで。
-- **ピーク RSS が 1.4 GB**（184 ファイル）。時間には効いていませんが多い。
-- **単スレッドのまま**。型検査 53% は依存関係があるので難しく、
-  classfile の書き出し 11% は素直に並列化できます。
+- **`Type::clone` and its drop glue are still ~13%.** `ast::Type` is a deep
+  tree holding `String` and `Vec<Type>` by value, so one clone cascades into
+  heap allocations. Interning (a `TypeId` index, or `Rc` on the sub-trees) is
+  the next move, and the widest-reaching one.
+- **`is_sub_type` is 27% of type checking**, and it redoes the parent-DAG walk
+  from scratch on every question.
+- **Peak RSS is 1.4 GB** for 184 files. It does not cost time, but it is a lot.
+- **Type checking is still single-threaded** -- it shares one mutable symbol
+  table. Only the class file writes are parallel.
 
 ## テスト
 

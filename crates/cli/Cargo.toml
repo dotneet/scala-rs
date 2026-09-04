@@ -10,5 +10,6 @@ name = "scala-rs"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
 scala-rs-driver.workspace = true
 scala-rs-span.workspace = true

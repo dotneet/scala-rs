@@ -96,7 +96,7 @@ fn dominates(typer: &Typer, new_pt: &Type, open_pt: &Type) -> bool {
 impl Typer {
     pub(crate) fn implicits_in_scope(&self) -> Vec<SymbolId> {
         let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         // SLS 7.2: a candidate is an identifier "that can be accessed ...
         // without a prefix", i.e. ordinary unqualified name resolution, which
         // shadows: a name bound in a nearer scope hides every binding of that
@@ -109,13 +109,20 @@ impl Typer {
         // to that name would resolve to at each point in the walk.
         // Borrowed keys: this runs on every implicit search and copying every
         // name in every enclosing scope was its largest single cost.
-        let mut shadowed_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // Sized up front: every name of every enclosing scope goes in, and
+        // growing the table from empty on each implicit search cost more than
+        // the inserts themselves.
+        let mut shadowed_names: rustc_hash::FxHashSet<&str> =
+            rustc_hash::FxHashSet::with_capacity_and_hasher(
+                self.st.scopes.iter().map(|sc| sc.len()).sum(),
+                rustc_hash::FxBuildHasher,
+            );
         for sc in self.st.scopes.iter().rev() {
-            for name in sc.names() {
+            for (name, ids) in sc.entries() {
                 if !shadowed_names.insert(name.as_str()) {
                     continue;
                 }
-                for id in sc.lookup(name) {
+                for id in ids {
                     if self.st.get(*id).flags.contains(Flags::IMPLICIT) && seen.insert(id.0) {
                         out.push(*id);
                     }
@@ -126,7 +133,7 @@ impl Typer {
             // Instance implicits on this class/module, walking parents (nsc
             // linearization is not reproduced; inheritance is).
             let mut work = vec![self.st.this_class];
-            let mut walked = std::collections::HashSet::new();
+            let mut walked = rustc_hash::FxHashSet::default();
             while let Some(id) = work.pop() {
                 if id.is_none() || !walked.insert(id.0) {
                     continue;
@@ -207,8 +214,8 @@ impl Typer {
         // `object Shape extends ConstColumnShapeImplicits with …`, so stopping
         // at the module class's own members found none of them at all.
         let mut work = vec![mcls];
-        let mut walked = std::collections::HashSet::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut walked = rustc_hash::FxHashSet::default();
+        let mut seen = rustc_hash::FxHashSet::default();
         while let Some(id) = work.pop() {
             if id.is_none() || !walked.insert(id.0) {
                 continue;
@@ -241,7 +248,7 @@ impl Typer {
         &self,
         ty: &Type,
         out: &mut Vec<SymbolId>,
-        seen: &mut std::collections::HashSet<u32>,
+        seen: &mut rustc_hash::FxHashSet<u32>,
     ) {
         match ty {
             Type::Class { sym, args } => {
@@ -299,7 +306,7 @@ impl Typer {
         &self,
         id: SymbolId,
         out: &mut Vec<SymbolId>,
-        seen: &mut std::collections::HashSet<u32>,
+        seen: &mut rustc_hash::FxHashSet<u32>,
     ) {
         if id.is_none() || !seen.insert(id.0) {
             return;
@@ -332,15 +339,15 @@ impl Typer {
     /// itself holds an immutable borrow and cannot read a class file.
     pub(crate) fn implicit_scope_classes(&self, ty: &Type) -> Vec<SymbolId> {
         let mut parts = Vec::new();
-        self.collect_type_parts(ty, &mut parts, &mut std::collections::HashSet::new());
+        self.collect_type_parts(ty, &mut parts, &mut rustc_hash::FxHashSet::default());
         parts
     }
 
     fn companion_implicits(&self, ty: &Type) -> Vec<SymbolId> {
         let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         let mut parts = Vec::new();
-        self.collect_type_parts(ty, &mut parts, &mut std::collections::HashSet::new());
+        self.collect_type_parts(ty, &mut parts, &mut rustc_hash::FxHashSet::default());
         for cls in parts {
             for mem in self.companion_implicits_of_class(cls) {
                 if seen.insert(mem.0) {
@@ -397,8 +404,12 @@ impl Typer {
     /// `TT[P1]` of `Mid` inside `trait Mid[P1] extends Base[P1]`. Without this
     /// the candidate carries `Base`'s `P1`, which never matches the wanted
     /// `TT[P1]` of `Mid`.
-    pub(crate) fn implicit_candidate_ty(&self, id: SymbolId) -> Type {
-        let ty = self.st.get(id).ty.clone();
+    pub(crate) fn implicit_candidate_ty(&self, id: SymbolId) -> std::borrow::Cow<'_, Type> {
+        // Borrowed in the common case. This runs once per candidate per
+        // implicit search, and deep-cloning the declared type of every
+        // candidate was the single largest source of `Type::clone` in a slick
+        // build; almost all of those clones were then only read.
+        let ty = &self.st.get(id).ty;
         let this = self.st.this_class;
         let owner = self.st.get(id).owner;
         // An implicit brought in by `import <a value>._` is declared in terms
@@ -409,8 +420,8 @@ impl Typer {
         // nothing, which is why `import seq.integral._; increment < zero`
         // (`Numeric[T]#mkOrderingOps`, reached through `Integral[T]`) reported
         // `value < is not a member of T`.
-        if let Some(seen) = self.at_import_prefix_of(id, &ty) {
-            return seen;
+        if let Some(seen) = self.at_import_prefix_of(id, ty) {
+            return std::borrow::Cow::Owned(seen);
         }
         if this.is_none()
             || owner.is_none()
@@ -418,7 +429,7 @@ impl Typer {
             || !self.st.get(owner).is_class_like()
             || self.st.get(owner).tparams.is_empty()
         {
-            return ty;
+            return std::borrow::Cow::Borrowed(ty);
         }
         let this_ty = Type::Class {
             sym: this,
@@ -430,7 +441,7 @@ impl Typer {
                 .map(|t| Type::TypeParam(*t))
                 .collect(),
         };
-        self.st.subst_as_seen_from(&this_ty, &ty)
+        std::borrow::Cow::Owned(self.st.subst_as_seen_from(&this_ty, ty))
     }
 
     /// Whether `id` can inhabit `pt`, and with which type arguments.
@@ -449,19 +460,17 @@ impl Typer {
             return None;
         }
         let cand_ty = self.implicit_candidate_ty(id);
-        match &cand_ty {
+        match &*cand_ty {
             Type::Method { paramss, ret } => {
-                let ret = ret.clone();
                 if paramss.iter().all(|c| c.is_empty()) {
-                    return self.implicit_solve(id, &ret, pt, undet);
+                    return self.implicit_solve(id, ret, pt, undet);
                 }
                 // A derivation rule: usable when its own implicits resolve.
                 if depth >= MAX_IMPLICIT_DEPTH || !self.only_implicit_clauses(id) {
                     return None;
                 }
-                let paramss = paramss.clone();
-                let Some(fit) = self.implicit_solve(id, &ret, pt, undet) else {
-                    return self.implicit_fit_open(id, &ret, pt, undet, &paramss, depth);
+                let Some(fit) = self.implicit_solve(id, ret, pt, undet) else {
+                    return self.implicit_fit_open(id, ret, pt, undet, paramss, depth);
                 };
                 if self.implicit_diverges(id, pt) {
                     return None;
@@ -479,13 +488,9 @@ impl Typer {
                 ok.then_some(fit)
             }
             Type::Function { params, ret } if params.is_empty() => {
-                let ret = (**ret).clone();
-                self.implicit_solve(id, &ret, pt, undet)
+                self.implicit_solve(id, ret, pt, undet)
             }
-            t => {
-                let t = t.clone();
-                self.implicit_solve(id, &t, pt, undet)
-            }
+            t => self.implicit_solve(id, t, pt, undet),
         }
     }
 
@@ -1064,7 +1069,7 @@ impl Typer {
             return None;
         }
         let from = &params[0];
-        let unknowns: std::collections::HashSet<u32> = undet.iter().map(|s| s.0).collect();
+        let unknowns: rustc_hash::FxHashSet<u32> = undet.iter().map(|s| s.0).collect();
         if mentions_unknown(from, &unknowns) {
             return None;
         }
@@ -1072,7 +1077,7 @@ impl Typer {
         cands.extend(self.companion_implicits(from));
         cands.extend(self.companion_implicits(ret));
         let mut hits: Vec<(SymbolId, Vec<(SymbolId, Type)>)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         for id in cands {
             if !seen.insert(id.0) {
                 continue;
@@ -1275,7 +1280,8 @@ impl Typer {
         if self.first_clause_is_implicit(id) {
             return None;
         }
-        let (param, ret) = match &self.implicit_candidate_ty(id) {
+        let cand_ty = self.implicit_candidate_ty(id);
+        let (param, ret) = match &*cand_ty {
             Type::Method { paramss, ret } => {
                 let ps = paramss.first().cloned().unwrap_or_default();
                 if ps.len() != 1 {
@@ -1457,7 +1463,8 @@ impl Typer {
     /// `implicit def anyShow[A]: Show[A]`'s `Show[_]` but not the other way
     /// round, so the monomorphic instance wins.
     fn implicit_result_ty(&self, id: SymbolId) -> Type {
-        let ret = match &self.implicit_candidate_ty(id) {
+        let cand_ty = self.implicit_candidate_ty(id);
+        let ret = match &*cand_ty {
             Type::Method { ret, .. } => (**ret).clone(),
             Type::Function { ret, .. } => (**ret).clone(),
             t => t.clone(),
@@ -1466,7 +1473,8 @@ impl Typer {
     }
 
     fn conversion_arg_ty(&self, id: SymbolId) -> Option<Type> {
-        match &self.implicit_candidate_ty(id) {
+        let cand_ty = self.implicit_candidate_ty(id);
+        match &*cand_ty {
             Type::Method { paramss, .. } => {
                 let ps = paramss.first()?;
                 if ps.len() == 1 {
@@ -1742,21 +1750,19 @@ impl Typer {
         if !self.st.get(id).flags.contains(Flags::IMPLICIT) {
             return None;
         }
-        match &self.implicit_candidate_ty(id) {
+        let cand_ty = self.implicit_candidate_ty(id);
+        match &*cand_ty {
             Type::Method { paramss, ret } => {
-                let ps = paramss.first().cloned().unwrap_or_default();
-                if ps.len() != 1 {
-                    return None;
-                }
+                let ps = paramss.first().filter(|ps| ps.len() == 1)?;
                 if self.conv_param_matches(id, from, &ps[0]) {
-                    Some(self.instantiate_conv_type(id, from, (**ret).clone()))
+                    Some(self.instantiate_conv_type(id, from, ret))
                 } else {
                     None
                 }
             }
             Type::Function { params, ret } if params.len() == 1 => {
                 if self.conv_param_matches(id, from, &params[0]) {
-                    Some(self.instantiate_conv_type(id, from, (**ret).clone()))
+                    Some(self.instantiate_conv_type(id, from, ret))
                 } else {
                     None
                 }
@@ -1765,21 +1771,22 @@ impl Typer {
         }
     }
 
-    fn instantiate_conv_type(&self, id: SymbolId, from: &Type, ty: Type) -> Type {
-        let tps = self.st.get(id).tparams.clone();
+    fn instantiate_conv_type(&self, id: SymbolId, from: &Type, ty: &Type) -> Type {
+        let tps = &self.st.get(id).tparams;
         if tps.is_empty() {
-            return ty;
+            return ty.clone();
         }
         let args_t = self.conv_targs(id, from);
-        crate::symbol::subst_tparams_slice(&tps, &args_t, &ty)
+        crate::symbol::subst_tparams_slice(tps, &args_t, ty)
     }
 
     /// The conversion's own type arguments, solved from the receiver type.
     fn conv_targs(&self, id: SymbolId, from: &Type) -> Vec<Type> {
-        let tps = self.st.get(id).tparams.clone();
-        let param = match &self.implicit_candidate_ty(id) {
-            Type::Method { paramss, .. } => paramss.first().and_then(|c| c.first()).cloned(),
-            Type::Function { params, .. } => params.first().cloned(),
+        let tps = &self.st.get(id).tparams;
+        let cand_ty = self.implicit_candidate_ty(id);
+        let param: Option<&Type> = match &*cand_ty {
+            Type::Method { paramss, .. } => paramss.first().and_then(|c| c.first()),
+            Type::Function { params, .. } => params.first(),
             _ => None,
         };
         let Some(param) = param else {
@@ -1792,16 +1799,16 @@ impl Typer {
         // `java.util.Map[String, ConfigValue]`) has nothing to zip argument by
         // argument, so both `K` and `V` fell through to `AnyRef` and
         // `config.root.asScala` came back a `Map[AnyRef, AnyRef]`.
-        let seen_as = match &param {
+        let seen_as = match param {
             Type::Class { sym, args } if !args.is_empty() => self.base_type_instance(from, *sym, 0),
             _ => None,
         };
         let from = seen_as.as_ref().unwrap_or(from);
         let mut solved: Vec<Option<Type>> = tps
             .iter()
-            .map(|tp| unify_conv_tparam(*tp, &param, from))
+            .map(|tp| unify_conv_tparam(*tp, param, from))
             .collect();
-        self.solve_conv_targs_from_implicits(id, &tps, &mut solved);
+        self.solve_conv_targs_from_implicits(id, tps, &mut solved);
         solved
             .into_iter()
             .map(|t| t.unwrap_or(Type::AnyRef))
@@ -1827,7 +1834,8 @@ impl Typer {
         tps: &[SymbolId],
         solved: &mut [Option<Type>],
     ) {
-        let Type::Method { paramss, ret } = &self.implicit_candidate_ty(id) else {
+        let cand_ty = self.implicit_candidate_ty(id);
+        let Type::Method { paramss, ret } = &*cand_ty else {
             return;
         };
         if paramss.len() < 2 {
@@ -1842,8 +1850,7 @@ impl Typer {
         if undet.is_empty() {
             return;
         }
-        let clauses: Vec<Vec<Type>> = paramss[1..].to_vec();
-        for clause in &clauses {
+        for clause in &paramss[1..] {
             for p in clause {
                 let known: Vec<Type> = tps
                     .iter()
@@ -1874,13 +1881,13 @@ impl Typer {
     /// applying it to the receiver alone leaves the second clause unfilled, and
     /// the call goes out with fewer arguments than its descriptor declares.
     pub(crate) fn conv_implicit_params(&self, id: SymbolId, from: &Type) -> Vec<Vec<Type>> {
-        let Type::Method { paramss, .. } = &self.implicit_candidate_ty(id) else {
+        let cand_ty = self.implicit_candidate_ty(id);
+        let Type::Method { paramss, .. } = &*cand_ty else {
             return Vec::new();
         };
         if paramss.len() < 2 {
             return Vec::new();
         }
-        let paramss = paramss.clone();
         let tps = self.st.get(id).tparams.clone();
         let targs = self.conv_targs(id, from);
         paramss[1..]
@@ -1925,7 +1932,8 @@ impl Typer {
     }
 
     pub(crate) fn ref_implicit(&self, id: SymbolId, span: Span) -> Tree {
-        let ty = match &self.implicit_candidate_ty(id) {
+        let cand_ty = self.implicit_candidate_ty(id);
+        let ty = match &*cand_ty {
             Type::Method { paramss, ret }
                 if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
             {
@@ -2050,7 +2058,7 @@ impl Typer {
 /// same pass.
 struct Unify<'a> {
     typer: &'a Typer,
-    unknowns: std::collections::HashSet<u32>,
+    unknowns: rustc_hash::FxHashSet<u32>,
     /// The subset of `unknowns` allowed to stand for a *type constructor*.
     ///
     /// Only the candidate's own parameters are: solving
@@ -2062,8 +2070,8 @@ struct Unify<'a> {
     /// `IterableOnce.iterableOnceExtensionMethods` as a way to reach `M[A]`
     /// from a `List[Int]` that already conformed with `M := List`
     /// (`tests/fixtures/mism12_lib.scala`, a `ClassCastException` at run time).
-    ctor_unknowns: std::collections::HashSet<u32>,
-    bound: std::collections::HashMap<u32, Type>,
+    ctor_unknowns: rustc_hash::FxHashSet<u32>,
+    bound: rustc_hash::FxHashMap<u32, Type>,
 }
 
 impl<'a> Unify<'a> {
@@ -2073,14 +2081,14 @@ impl<'a> Unify<'a> {
         own: impl IntoIterator<Item = SymbolId>,
         undet: impl IntoIterator<Item = SymbolId>,
     ) -> Self {
-        let ctor_unknowns: std::collections::HashSet<u32> = own.into_iter().map(|s| s.0).collect();
+        let ctor_unknowns: rustc_hash::FxHashSet<u32> = own.into_iter().map(|s| s.0).collect();
         let mut unknowns = ctor_unknowns.clone();
         unknowns.extend(undet.into_iter().map(|s| s.0));
         Unify {
             typer,
             unknowns,
             ctor_unknowns,
-            bound: std::collections::HashMap::new(),
+            bound: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -2352,7 +2360,7 @@ fn strip_annot(ty: &Type) -> &Type {
     }
 }
 
-fn mentions_unknown(ty: &Type, unknowns: &std::collections::HashSet<u32>) -> bool {
+fn mentions_unknown(ty: &Type, unknowns: &rustc_hash::FxHashSet<u32>) -> bool {
     match ty {
         Type::TypeParam(id) => unknowns.contains(&id.0),
         Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {

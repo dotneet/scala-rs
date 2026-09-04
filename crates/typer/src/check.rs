@@ -14940,7 +14940,7 @@ impl Typer {
     /// (`implicit def listShow[A](implicit s: Show[A]): Show[List[A]]`) is
     /// applied to its own implicits, which are resolved the same way.
     fn implicit_tree(&mut self, id: SymbolId, pt: &Type, span: Span, depth: usize) -> Tree {
-        let (paramss, ret) = match self.implicit_candidate_ty(id) {
+        let (paramss, ret) = match self.implicit_candidate_ty(id).into_owned() {
             Type::Method { paramss, ret } => (paramss, (*ret).clone()),
             _ => return self.ref_implicit(id, span),
         };
@@ -20866,7 +20866,7 @@ impl Typer {
         let tys: Vec<Type> = self
             .implicits_in_scope()
             .into_iter()
-            .map(|id| self.implicit_candidate_ty(id))
+            .map(|id| self.implicit_candidate_ty(id).into_owned())
             .collect();
         let mut fresh = false;
         for t in tys {

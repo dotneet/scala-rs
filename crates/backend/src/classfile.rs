@@ -1,6 +1,6 @@
 //! JVM class file writer (major version 52 / Java 8, with StackMapTable).
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::io::{self, Write};
 
 pub use scala_rs_pickle::names::{decode_method_name, encode_method_name};
