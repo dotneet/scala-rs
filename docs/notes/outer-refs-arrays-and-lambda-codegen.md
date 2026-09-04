@@ -490,3 +490,132 @@ Two axes are checked: **behaviour** and **shape**.
 `indy1_bad.scala` puts a two-argument literal where an `Int => Int` is wanted. It
 checks that the typer stops with `type mismatch; found: (Int, Int) => Int` before
 codegen can assemble a call site it cannot link.
+
+---
+
+### 629 more classfiles than nsc: not a typing question (`agent/fewerclasses`)
+
+slick's 184 sources came out of scala-rs as **2127** classfiles against nsc's
+**1498**, and the gap was almost all closures: **716 `$anonfun` classes against
+nsc's 137**, plus 106 `T$class` helpers nsc does not emit at all. Every one of
+our 716 implements `scala.PartialFunction`, which read as "the typer types
+`{ case … }` as a `PartialFunction` where nsc would use `Function1`, so ~579
+literals miss the `invokedynamic` path".
+
+**That reading is wrong, and one measurement settles it.** `SCALA_RS_LAMBDA_TRACE=1`
+now prints the source span and the literal's type along with the reason a
+lambda fell back to a closure class. Over the whole of slick:
+
+```
+707 partial-function        130 distinct source spans
+  9 sam:<a slick SAM type>
+```
+
+**130 distinct `{ case … }` literals produce 707 classfiles.** nsc emits 137
+classes for the same sources — a `PartialFunction` *is* a class for nsc too, it
+has two abstract methods and is not a SAM. Our typing was right all along. The
+literals were being emitted **five and a half times each on average**, by three
+multipliers that compound. After fixing them: **1552 classfiles, 141 closures**,
+`errors=0 files_with_errors=0`, and `tests/slick_subset.sh` verifies all 1552
+under the class loader (`failed=0`).
+
+| kind | before | after | nsc |
+| --- | --- | --- | --- |
+| `$anonfun` closures | 716 | **141** | 137 |
+| `T$class` helpers | 106 | 106 | 0 |
+| real `$anon` (`new T {}`) | 153 | 153 | 153 |
+| module `$` | 393 | 393 | 437 |
+| everything else | 759 | 759 | 771 |
+| **total** | **2127** | **1552** | **1498** |
+
+**1. The closure class generated its case bodies twice.** `gen_function`
+generated the whole `match` into `apply`, and `emit_partial_function_methods`
+generated it again into `applyOrElse`. A literal nested inside a case body
+therefore came out twice, and the factor compounds with nesting — 2^depth. One
+literal in `MergeToComprehensions.scala` was emitted **128 times**.
+
+nsc does not have the problem because it does not write `apply` at all: the
+closure extends `scala.runtime.AbstractPartialFunction`, whose
+
+```scala
+def apply(x: T1): R = applyOrElse(x, PartialFunction.empty)
+```
+
+is the only copy. Ours now delegates the same way, passing `null` for the
+fallback, and `applyOrElse` turns a null fallback into the `MatchError` that
+`apply` owes. Checked against real scalac: `pf(2.0)` on a `PartialFunction`
+that does not accept a `Double` prints
+`scala.MatchError: 2.0 (of class java.lang.Double)` under nsc, under the jar
+mode and under `--no-scala-library`, character for character. Every real caller
+(`collect`, `orElse`, `lift`, `applyOrElse` written by hand) passes a function
+and never sees the null branch. 716 → 611.
+
+**2. A `name$default$n` getter took the whole preceding parameter prefix.**
+nsc's getter takes the *preceding parameter clauses*:
+
+| declaration | nsc's getters |
+| --- | --- |
+| `def f(x: Int)(y: Int = x)` | `f$default$2(x: Int)` |
+| `def f(x: Int, y: Int = 0, z: Int = 1)` | `f$default$2()`, `f$default$3()` |
+
+The second row is the one that matters: a default **may not name an earlier
+parameter of its own clause**, and nsc rejects `def d(x: Int, z: Int = x)`
+outright with `not found: value x` (verified against 2.13.16 — scala-rs accepts
+it). scala-rs emitted `replace$default$2(PartialFunction)` and
+`replace$default$3(PartialFunction, boolean)`, so a call omitting k defaults
+spliced the argument list into the call, into getter 2, and into getter 3 —
+which already contains getter 2. **2^k copies.** slick's
+`sel.replace { case Ref(s) if s == s1 => Ref(s1l) }` (two omitted defaults) was
+**16** classfiles for one literal.
+
+`synthesize_default_getters` now cuts at the clause boundary. The same-clause
+reference nsc rejects still works: those parameters are kept when the default
+body actually names one (`tree_names_any` on the untyped right-hand side), so
+what went is the exponent, not the capability. 611 → 196.
+
+**3. The receiver was spliced into every getter call — and evaluated once per
+one.** This one is not a class-count problem at all:
+
+```scala
+class Ops(val n: Int) { def infer(scope: Int = 0, deep: Boolean = false) = n }
+def mk(): Ops = { println("recv"); new Ops(7) }
+mk().infer()
+```
+
+real scalac prints `recv` **once**; scala-rs printed it **three** times.
+`default_getter_apply` clones `method_receiver(fun)` into each getter call and
+the call keeps one, so the qualifier ran once per omitted default plus once for
+the call. nsc's `NamesDefaults` binds it to a local first, and so does the new
+pass `crates/typer/src/default_recv.rs` — before `uncurry`, so lambda-lift and
+the capture analysis see the local like any other. Only a receiver that
+computes something is hoisted (`Apply`, `New`, `Block`, `If`, `Match`, `Try`);
+a path is cheap to repeat and gets no local. slick's
+
+```scala
+Join(sj1, sj2, f1, f2.replace({ case … }), JoinType.Inner,
+     pred.replace({ case … })).infer()
+```
+
+was three copies of both literals, because `.infer()` omits two defaults.
+196 → 141.
+
+**Time.** The machine was carrying six other agents (load average 18–23), so
+wall time is noise; the six interleaved runs of `tests/bench.sh` (one after the
+other, main then branch, six times) give main `user` 1.97–2.59s / `sys`
+0.71–1.01s and the branch `user` 1.87–2.31s / `sys` 0.44–0.87s. About 10% off
+CPU and about 18% off system time, the latter being the 575 files no longer
+written. Do not read more than that out of it under this load.
+
+**What is left.** The 106 `T$class` helpers (nsc emits trait bodies as
+interface default methods) are now the entire remaining gap, and the four
+closures above nsc's 137 are `slick/lifted` SAM types, not `PartialFunction`s.
+Both are in `known-gaps-backlog.md`.
+
+**Tests.** `crates/cli/tests/fewerclasses.rs` (five) over
+`tests/fixtures/fewerclasses1.scala`, which holds all three shapes in one file:
+run on the private runtime, on the real scala-library, and byte-for-byte
+against real scalac 2.13.16 (`receivers=1`, not `receivers=3`). The shape test
+pins **five** closure classfiles for the fixture's five literals — the same
+five nsc emits — so the number moves deliberately. `indy2`'s "exactly three
+closure classfiles" and `slickrun`'s "zero" are both unchanged: neither fixture
+nests a literal inside a case body or omits a default on a computed receiver.

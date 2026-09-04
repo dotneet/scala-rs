@@ -53,10 +53,10 @@ become anonymous classes here, and traits get `T$class` helpers that scalac
 What that run establishes:
 
 - All 184 slick files typecheck, with 0 errors.
-- All 2127 emitted class files load under `java -Xverify:all`. They *load*:
+- All 1552 emitted class files load under `java -Xverify:all`. They *load*:
   `Class.forName(initialize = false)` links nothing, so method bodies are not
   verified by that number (see `tests/slick_run.sh`).
-- The test suite is 129 test binaries / 1844 tests. 84 of them (the programs in
+- The test suite is 130 test binaries / 1849 tests. 84 of them (the programs in
   `tests/conform/`) are dual-run against real scalac 2.13.16 and required to
   produce byte-identical stdout.
 

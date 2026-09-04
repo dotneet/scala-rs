@@ -807,3 +807,34 @@ of most of these notes.
   fixed in `agent/loopframe`. They were **two separate items, not the same root cause**
   (the "the frame at the top of a loop and a `try` on top of the operand stack" section).
 
+
+- **`T$class` static helpers** (`agent/fewerclasses`, root 2 of "we emit more
+  classfiles than nsc"; not attempted). nsc 2.13 compiles a trait's concrete
+  methods to **default methods on the interface** and emits no `T$class` at
+  all; `$init$` becomes a `static` method on the interface itself. scala-rs
+  emits one `T$class` per trait with a concrete method — **106 of them** for
+  slick, which after the closure-duplication fixes is the *entire* remaining
+  gap to nsc (1552 against 1498; the closure count is 141 against nsc's 137).
+  Moving it touches `emit_trait_impl_class` / `emit_trait_impl_method` /
+  `emit_trait_init` in `crates/backend/src/gen.rs`, every `invokestatic
+  <Iface>$class.m` call site (five in gen.rs), the mixin forwarders each
+  implementing class emits, and separate compilation against classfiles that
+  still have the old shape. It is a bigger change than the whole of
+  `agent/fewerclasses` was.
+
+- **`catch { case _: MatchError => … }` names the bare class in
+  `--no-scala-library`** (`agent/fewerclasses`, found in passing; not fixed,
+  and **not** specific to `PartialFunction`).
+
+  ```scala
+  object Main { def main(a: Array[String]): Unit = {
+    val x: Any = 2.0
+    try x match { case i: Int => println(i) }
+    catch { case _: MatchError => println("caught") } } }
+  ```
+
+  Both real scalac and scala-rs's jar mode print `caught`; the private runtime
+  gives `NoClassDefFoundError: MatchError` — the exception table holds
+  `MatchError`, not `scala/MatchError`, although `throw`ing one from a `match`
+  fall-through resolves correctly. So it is the *catch* type's resolution, not
+  the class: `runtime.rs` does emit `scala/MatchError`.
