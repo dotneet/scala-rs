@@ -73,3 +73,102 @@ if [[ -d $CORPUS/test/files/neg ]]; then
       s/[ \t]+/ /g; s/[ \t]+$//;
     ' | cut -c1-72 | sort | uniq -c | sort -rn | head -$(( TOP * 2 ))
 fi
+
+# ---------------------------------------------------------------------------
+# `neg`, scored against the `.check` text.
+#
+# Column 3 ("any error is a pass") is an upper bound: it counts a rejection for
+# the wrong reason. Columns 5 and 6 of the log hold our diagnostics and the
+# ones scalac's `.check` records, both as `<file>:<line>: <level>: <message>`
+# records joined by \x1e, so the two can be compared here.
+#
+# A full-text comparison is not available and never will be: scalac prints
+# `type mismatch;` with its found/required on continuation lines and renders a
+# constant type as `String("Hello")` where we render `"Hello"`, so comparing
+# the tail would measure the type printer rather than the type checker. What is
+# comparable is the *head* of the message -- everything before the first `;`
+# and before the end of the first sentence, case- and whitespace-folded. That
+# is what "same diagnostic" means below.
+#
+# Three tiers are printed, none of which replaces column 3:
+#   T1  every diagnostic the .check expects has a match somewhere (multiset:
+#       four expected copies need four of ours), ignoring where it was reported
+#   T2  ... and each match is at the file and line scalac reports it at
+#   T3  ... and we emit no diagnostics beyond the expected count
+# ---------------------------------------------------------------------------
+echo
+perl -e '
+  sub norm {
+    my ($m) = @_;
+    $m = lc $m;
+    $m =~ s/\s+/ /g; $m =~ s/^ //; $m =~ s/ $//;
+    $m =~ s/;.*$//;        # scalac carries found/required past the ";"
+    $m =~ s/\.\s.*$//;     # ... and the rest of an explanation past the "."
+    $m =~ s/[.\s]+$//;
+    return $m;
+  }
+  sub rec {
+    my ($r) = @_;
+    my ($f, $l, $lv, $m) = $r =~ /^(\S+?):(\d+): (error|warning): (.*)$/ or return ();
+    return ($f, $l, norm($m));
+  }
+  my $top = shift @ARGV;
+  my ($tot, $any, $t1, $t2, $t3, $nowant) = (0) x 6;
+  my (%buck, %pairs, %amsg, %omsg);
+  open(my $fh, "<", $ARGV[0]) or exit 0;
+  while (<$fh>) {
+    chomp; my @f = split /\t/, $_, -1;
+    next unless $f[0] eq "neg"; next if $f[2] eq "skip";
+    $tot++; $any++ if $f[2] eq "pass";
+    my (%gm, %gl, @gn); my $ng = 0;
+    for my $g (grep { length } split /\x1e/, ($f[4] // "")) {
+      my ($ff, $l, $n) = rec($g); next unless defined $n;
+      $ng++; $gm{$n}++; $gl{"$ff:$l\x00$n"}++; push @gn, $n;
+    }
+    my (@wn, @wl); my $nw = 0;
+    for my $w (grep { length } split /\x1e/, ($f[5] // "")) {
+      my ($ff, $l, $n) = rec($w); next unless defined $n;
+      $nw++; push @wn, $n; push @wl, "$ff:$l\x00$n";
+    }
+    if (!$nw) { $nowant++; next }
+    my %a = %gm; my $ok = 0;
+    for my $n (@wn) { if (($a{$n} // 0) > 0) { $a{$n}--; $ok++ } }
+    my %b = %gl; my $okl = 0;
+    for my $k (@wl) { if (($b{$k} // 0) > 0) { $b{$k}--; $okl++ } }
+    my $extra = $ng > $nw;
+    $t1++ if $ok == $nw;
+    $t2++ if $okl == $nw;
+    $t3++ if $okl == $nw && !$extra;
+    my $bk = !$ng     ? "a we accept the program, no diagnostic at all"
+           : $ok == 0 ? "b we reject it, but for none of the expected reasons"
+           : $ok < $nw  ? "c partial: some of the expected diagnostics reproduced"
+           : $okl < $nw ? "d right messages, wrong file or line"
+           : $extra     ? "e right messages and lines, plus extra of our own"
+           :              "f exact match";
+    $buck{$bk}++;
+    $amsg{$wn[0]}++ if $bk =~ /^a/;
+    if ($bk =~ /^[bc]/) {
+      $omsg{$gn[0]}++;
+      $pairs{ sprintf("%-52.52s <= %.52s", $wn[0], $gn[0]) }++;
+    }
+  }
+  exit 0 unless $tot;
+  printf "=== neg, scored against the .check text (%d non-skipped)\n", $tot;
+  printf "  T0 any error at all (column 3)          %5d  %5.1f%%   upper bound\n", $any, 100*$any/$tot;
+  printf "  T1 expected messages reproduced         %5d  %5.1f%%\n", $t1, 100*$t1/$tot;
+  printf "  T2 ... at the expected file and line    %5d  %5.1f%%\n", $t2, 100*$t2/$tot;
+  printf "  T3 ... and nothing extra                %5d  %5.1f%%\n", $t3, 100*$t3/$tot;
+  printf "  (%d tests have no error or warning line in their .check and are\n", $nowant if $nowant;
+  printf "   left out of T1-T3; they are still in the %d and in column 3.)\n", $tot if $nowant;
+  print "--- how the wording differs\n";
+  printf "  %5d  %s\n", $buck{$_}, $_ for sort keys %buck;
+  print "--- a: what scalac says about the programs we accept\n";
+  my @a = sort { $amsg{$b} <=> $amsg{$a} } keys %amsg;
+  printf("  %4d  %.72s\n", $amsg{$_}, $_) for @a[0 .. ($#a < $top-1 ? $#a : $top-1)];
+  print "--- b+c: the diagnostic we gave instead\n";
+  my @o = sort { $omsg{$b} <=> $omsg{$a} } keys %omsg;
+  printf("  %4d  %.72s\n", $omsg{$_}, $_) for @o[0 .. ($#o < $top-1 ? $#o : $top-1)];
+  print "--- b+c: expected <= ours, paired\n";
+  my @p = sort { $pairs{$b} <=> $pairs{$a} } keys %pairs;
+  printf("  %4d  %s\n", $pairs{$_}, $_) for @p[0 .. ($#p < $top-1 ? $#p : $top-1)];
+' $TOP $LOG
