@@ -168,13 +168,29 @@ Two smaller constants, both worth remembering as a species:
   of every parent walk, and it answered by *building* the structural function
   type — a `Vec` and a `Box` — which the caller threw away.
 
-Measured and discarded: nothing was reverted this pass, but two ideas were
-turned down after being costed on the profile rather than tried.
-Memoising `is_sub_type` (or `implicits_in_scope`) needs an invalidation epoch,
-and `parents` alone is written from more than fifty places; a missed one is a
-wrong answer, not a slow one. Shrinking `Type` from 56 bytes by boxing
-`Named` / `Refined` / `Constant` would cut the `memmove` and allocator time
-(together still ~15%), but it reaches every `match` in the compiler.
+**Measured and discarded.** Nothing was reverted this pass; four ideas were
+costed and turned down, which is worth as much as the ones that landed.
+
+- **Restricting `pickle_all` to the classes the run emits.** It pickles every
+  `Class`/`ModuleClass` in the table before erasure, and only 1552 of them are
+  emitted -- but the table holds just **2855** classes for slick's 113,959
+  symbols, so the waste is bounded at 45% of a 7% phase. Against that,
+  `attach_scala_sig` *falls back* to pickling at emit time for any class the
+  map lacks, which is after erasure: a class the filter missed would silently
+  get an erased signature rather than fail. Bad trade.
+- **Memoising `is_sub_type` or `implicits_in_scope`.** Both need an
+  invalidation epoch, and `parents` alone is written from more than fifty
+  places; a missed one is a wrong answer, not a slow one. `class_reaches`
+  exists precisely because it needs no cache.
+- **Hoisting the type snapshot out of `warm_implicit_candidates`** (4%: it
+  deep-clones the candidate type of every implicit in scope). The loop body
+  mutates the symbol table, and what the *next* iteration would see is
+  deliberately the pre-loop snapshot. Every way of avoiding the copy also
+  changes which table the later iterations read.
+- **Shrinking `Type` from 56 bytes** by boxing `Named` / `Refined` /
+  `Constant`. This is the one worth doing: `memmove`, the allocator and
+  `Type::clone` are together still ~15%. It reaches every `match` in the
+  compiler, so it wants a slice of its own.
 
 ### What is left
 
