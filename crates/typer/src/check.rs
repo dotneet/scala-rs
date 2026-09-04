@@ -9236,6 +9236,44 @@ impl Typer {
                 found = self.st.lookup_member(*id, &name);
             }
         }
+        // A package written out in an expression:
+        // `cats.kernel.instances.int.catsKernelStdOrderForInt`. A package has
+        // no type, so every search above looked at `<notype>` and found
+        // nothing; what the selection means is a member of the package -- of
+        // its `package object`, which the namer folds into the package for a
+        // same-run source and which hangs off `p/package$` when it comes from
+        // a jar. Only the import path used to know this.
+        if found.is_empty() && recv_ty.is_no_type() {
+            let pkg = qual.sym;
+            let span = tree.span;
+            if !pkg.is_none() && self.st.get(pkg).kind == SymKind::Package {
+                self.complete_binary_member(pkg, &name, span);
+                let mut cand = self.st.lookup_member(pkg, &name);
+                let po = self.package_object_of(pkg, span);
+                if cand.is_empty() {
+                    if let Some(po) = po {
+                        self.complete_binary_member(po, &name, span);
+                        cand = self.st.lookup_member(po, &name);
+                    }
+                }
+                // A package is not a value: a `val`/`def` reached through one
+                // is really a member of its package object, and that module is
+                // the receiver the backend has to push. A nested object or
+                // class needs no receiver, so it keeps the package prefix.
+                if let Some(po) = po {
+                    let term = !cand.is_empty()
+                        && cand.iter().all(|&m| {
+                            matches!(self.st.get(m).kind, SymKind::Method | SymKind::Term)
+                        });
+                    if term {
+                        qual.ty = Type::ModuleRef(po);
+                        qual.sym = po;
+                        recv_ty = Type::ModuleRef(po);
+                    }
+                }
+                found = cand;
+            }
+        }
         // A function type is `scala.FunctionN[T1, …, Tn, R]`; `class_sym_of`
         // has no symbol for it, so `f.tupled` / `f.curried` would find nothing.
         if found.is_empty() {
@@ -22991,8 +23029,14 @@ impl Typer {
             return true;
         }
         let o = self.st.get(owner);
-        matches!(o.kind, SymKind::Module | SymKind::ModuleClass)
-            || o.flags.contains(Flags::MODULE)
+        // A def nested in a method or in a value's right-hand side is not a
+        // member of anything and cannot be overridden, whatever its owner's
+        // own flags say. cats writes `@tailrec def loop` inside `tailRecM`
+        // 79 times; nsc accepts every one.
+        matches!(
+            o.kind,
+            SymKind::Module | SymKind::ModuleClass | SymKind::Method | SymKind::Term
+        ) || o.flags.contains(Flags::MODULE)
             || o.flags.contains(Flags::FINAL)
     }
 

@@ -878,7 +878,11 @@ enum NumSuffix {
 }
 
 pub fn is_id_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_' || (!c.is_ascii() && c.is_alphabetic())
+    // nsc treats `$` as a letter (`Chars.isIdentifierStart`), so `ev$1` is one
+    // identifier and not an error. Code that spells compiler-generated names
+    // out in the source relies on it: cats' checked-in simulacrum output
+    // writes `implicit ev$1: Defer[G]`.
+    c.is_ascii_alphabetic() || c == '_' || c == '$' || (!c.is_ascii() && c.is_alphabetic())
 }
 
 pub fn is_id_part(c: char) -> bool {
