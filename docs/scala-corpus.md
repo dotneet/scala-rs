@@ -34,8 +34,9 @@ has no build to keep alive, and is something we can reason about when a number
 moves.
 
 The price is that we are not bug-compatible with partest: no `test/files/filters`
-output normalisation, no `.javaopts`, no separate-JVM handling, and no `.check`
-comparison for `neg`.
+output normalisation, no `.javaopts`, and no separate-JVM handling. The `neg`
+`.check` files *are* compared, but by message head rather than by full text —
+see [`neg`, against the `.check` text](#neg-against-the-check-text).
 
 ## Two things the corpus is not, contrary to what we assumed
 
@@ -61,12 +62,12 @@ comparison for `neg`.
 | `neg` | scala-rs reports at least one error |
 | `run` | it compiles, `java Test` exits 0, and stdout matches the `.check` |
 
-The `neg` rule deliberately does **not** compare the `.check` text. The first
-question is whether we reject what has to be rejected at all; matching scalac's
-wording is a later slice. The consequence is that a `neg` pass can be for the
-wrong reason — a parse error where scalac reports a type error still counts —
-so the report prints which diagnostic did the rejecting, and that column is
-worth reading before believing the `neg` number.
+The `neg` rule in that table is an **upper bound**, and it is the number the
+pass/fail column of the log still carries. A `neg` pass under it can be for the
+wrong reason — a parse error where scalac reports a type error counts. Since
+2026-09-05 the log also carries both sides' diagnostics and the report scores
+the wording on top; the two numbers are printed side by side and neither
+replaces the other. See [`neg`, against the `.check` text](#neg-against-the-check-text).
 
 `errors=0` is not enough for `pos`: a compiler that fell over quietly also
 reports no errors. The classfile count is the same second reading the
@@ -121,7 +122,11 @@ slick measurement.
 | `CORPUS_DIR` | `/tmp/scala-rs-corpus/scala` | the checkout |
 
 The log is one tab-separated line per test — `kind`, `name`, `pass`/`fail`/`skip`,
-and the first diagnostic verbatim — so it can be re-cut without re-running:
+the first diagnostic verbatim, and for `neg` two more columns: every diagnostic
+*we* produced and every diagnostic the `.check` expects. Both are lists of
+`<file>:<line>: <level>: <message>` records joined by an ASCII record separator
+(`\x1e`), so a test stays on one line and neither compiler's output can contain
+the separator. Everything downstream is re-cuttable without re-running:
 
 ```
 tests/scala_corpus_report.sh $MYDIR/corpus.tsv [top-N]
@@ -210,8 +215,9 @@ The `neg` *passes* need the same scepticism, which is why the report prints
 them by diagnostic: 74 of the 634 reject with a `type mismatch`, but a good
 number of the rest reject because of an unrelated hole (`not found: type TypeTag`,
 `unimplemented syntax: ...`) rather than the error the test is about. The `neg`
-number is an upper bound on our real rejection conformance until the `.check`
-text is compared.
+number is an upper bound on our real rejection conformance; the `.check` text
+has since been compared and says how far off it is — 640 down to 99. See
+[`neg`, against the `.check` text](#neg-against-the-check-text).
 
 ### `run` — 1074 failures, in three quite different kinds
 
@@ -383,6 +389,132 @@ was a parse abort and not a type-checking figure (see the note at the top of
 is `errors=2929 files_with_errors=151` — main's own recorded number, to the
 error.
 
+## `neg`, against the `.check` text
+
+### Why the old number was an upper bound, and what replaces it
+
+`neg` passed on "scala-rs reported at least one error". 640 of 1037 non-skipped
+tests did, 61.7 %. That counts a rejection for the wrong reason, and the wrong
+reason is common: **98 of those 640 were rejected by a parse error or an
+explicit "unimplemented" refusal**, so the program never reached the check the
+test exists to exercise.
+
+The `.check` files say what scalac reports, down to the line and column. Full
+text cannot be compared, and it is worth being precise about why rather than
+calling it "close enough":
+
+* scalac splits a message over several lines — `type mismatch;` carries its
+  `found`/`required` on continuation lines, `match may not be exhaustive.`
+  carries "It would fail on the following input" on the next — while we print
+  one line per diagnostic. The line structure is not a difference in what was
+  checked.
+* the two type printers disagree on constants: scalac writes
+  `found : String("Hello")`, we write `found: "Hello"`. Comparing that tail
+  measures the printer, not the type checker.
+* the caret line and the column differ almost everywhere.
+
+What *is* comparable is the **head** of the message: everything before the
+first `;` and before the end of the first sentence, case- and whitespace-folded.
+Three tiers are scored on it, each strictly inside the previous one:
+
+| | |
+|---|---|
+| **T1** | every diagnostic the `.check` expects has a match, as a multiset (four expected copies need four of ours), ignoring where it was reported |
+| **T2** | … and each match is at the file and line scalac reports it at |
+| **T3** | … and we emit nothing beyond the expected count |
+
+Warning lines in a `.check` are used only when it holds no error line at all —
+that is the shape of a test that fails because a warning was promoted. Taking
+warnings *alongside* errors would score us on lints nobody claims we implement.
+
+### The numbers
+
+Whole corpus at `main` `1a494fb`, 2026-09-05, `CORPUS_KINDS=neg CORPUS_SIZE=full`,
+1405 units, 368 skipped, 1037 judged:
+
+| | count | of 1037 |
+|---|---|---|
+| **T0** any error at all — the old rule | **640** | **61.7 %** |
+| **T1** expected messages reproduced | **104** | **10.0 %** |
+| **T2** … at the expected file and line | **99** | **9.5 %** |
+| **T3** … and nothing extra | **79** | **7.6 %** |
+
+Both ends of that are real. T0 says we reject 640 programs that must be
+rejected; T2 says we reject 99 of them *for the reason the test is about*. The
+gap, 541 tests, is the size of the accounting error the old number carried.
+
+Five tests have no `error:` or `warning:` line in their `.check` at all and are
+left out of T1–T3 while staying in the 1037 and in T0.
+
+### Where the other 938 go
+
+| count | |
+|---|---|
+| 380 | **a** — we accept the program; no diagnostic at all |
+| 472 | **b** — we reject it, but for none of the expected reasons |
+| 76 | **c** — partial: some of the expected diagnostics reproduced |
+| 5 | **d** — right messages, wrong file or line |
+| 20 | **e** — right messages and lines, plus extra of our own |
+| 79 | **f** — exact match |
+
+(T2 = 99 is d + e + f; T3 = 79 is f. The five `.check`-less tests are not in
+this table.)
+
+**b is the interesting one and it has no shape.** 472 tests, **341 distinct
+first diagnostics** on our side and 345 distinct on scalac's. The largest single
+row is 17. 83 of the 472 are a parse or syntax refusal from us — the test is
+rejected before type checking starts.
+
+What we said instead of what was expected, most frequent first:
+
+| count | scalac expects | we said |
+|---|---|---|
+| 5 | `the splice cannot be resolved statically` | `value currentMirror is not a member of package scala.reflect.runtime` |
+| 4 | `forward reference to value a extends over definition of value b` | `not found: value a` |
+| 3 | `no TypeTag available for T` | `not found: type TypeTag` |
+| 3 | `incompatible type in overriding` | `type mismatch` |
+| 3 | `missing parameter type` | `missing parameter type for expanded function` |
+| 3 | `expected class or object definition` | `expected newline or \`` |
+| 3 | `type mismatch` | `implicit conversion method foo1 should be enabled by making the implicit value visible` |
+
+Only the last three rows are "the same check, different words". The rest are a
+different check firing first.
+
+**a — the 380 programs we accept.** Bucketed by what scalac says, this is the
+list of checks we do not perform, and it is the same flat tail the earlier
+survey found: `type mismatch` 21, `double definition:` 8,
+`match may not be exhaustive` 6, `ambiguous reference to overloaded definition,`
+5, `incompatible type in overriding` 5,
+`pattern type is incompatible with expected type` 5,
+`no ClassTag available for T` 4, `unreachable code` 4,
+`the outer reference in this type test cannot be checked at run time` 4,
+`name clash between defined and inherited member:` 4, then singletons.
+
+**c — 26 of the 76 partials are a subset, not a disagreement.** Everything we
+say is a diagnostic the `.check` expects; we just say it fewer times.
+`neg/accesses` expects four `weaker access privileges in overriding` and gets
+one; `neg/cyclics` expects three `illegal cyclic reference` and gets the first;
+`neg/t3481` expects five `type mismatch` and gets two. These are not one root —
+they are three different places where the first error of a kind suppresses the
+rest — but they are the cheapest tests to move, because the check itself is
+already implemented and correct.
+
+**e — 20 tests fail only T3**, because we emit more diagnostics than the
+`.check` has. That is cascade, not a missing check.
+
+### What this says to fix next
+
+The honest headline is that **there is no big lever here**. The `neg` tail is as
+flat as the `pos` tail: ~340 distinct wrong reasons over 472 tests. In rough
+order of cost per test moved:
+
+1. **Report every occurrence of a check, not the first** — 26 tests in bucket
+   c, and the checks already exist. Three or four separate suppression sites.
+2. **Cascade suppression** — 20 tests in bucket e, T3 only.
+3. **The 98 T0 passes that are parse or "unimplemented" refusals** are noise in
+   the headline number rather than a fix; knowing they are there is the point.
+4. Everything else is one test at a time.
+
 ## What would move the number most
 
 1. **Static forwarders into a companion class.** Fifteen `run` tests, one
@@ -391,16 +523,20 @@ error.
    everything else; but it is a *rejection* rule, and this project's history
    says a new rejection rule breaks more than it fixes. Do it with the slick,
    cats and gitbucket measurements in hand.
-3. **Compare the `neg` `.check` text.** The 61.4 % `neg` figure is an upper
-   bound: it counts a rejection for the wrong reason as a pass. Matching the
-   message would turn the column into a real number, and the log already
-   records which diagnostic fired.
+3. ~~**Compare the `neg` `.check` text.**~~ Done, 2026-09-05. The real figure is
+   9.5 % (T2), not 61.7 %. What it turned up is that the `neg` tail is as flat
+   as the `pos` one; the ranked follow-ups are at the end of
+   [that section](#what-this-says-to-fix-next).
 4. **The 47 `VerifyError`s.** Every one is a classfile the JVM refuses. They
    need individual narrowing, but the corpus hands over the reproducers.
 
 ## Known limits of this runner
 
-* `neg` is judged by "any error", not by the expected message (see above).
+* The `neg` pass/fail column is still "any error"; the wording comparison is a
+  separate set of numbers in the report, and it compares message *heads*, not
+  full text. A head match is not proof the two compilers rejected for the same
+  reason — two different `type mismatch`es at the same line score as agreement.
+  It is a much tighter bound than "any error", not an exact one.
 * Directory tests are compiled as one round unless the sources are named
   `..._1.scala`, `..._2.scala`; then they are compiled in numbered rounds with
   each round's output on the next round's classpath. partest's finer grouping
