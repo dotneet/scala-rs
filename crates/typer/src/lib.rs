@@ -234,6 +234,7 @@ mod tests {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(
@@ -531,6 +532,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(
@@ -774,6 +776,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: vec![cp.clone()],
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         let _ = std::fs::remove_dir_all(&cp);
@@ -808,6 +811,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: vec![cp.clone()],
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         let _ = std::fs::remove_dir_all(&cp);
@@ -851,6 +855,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: vec![dir.clone()],
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1078,6 +1083,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -1284,6 +1290,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(
@@ -2262,6 +2269,7 @@ object Main {
                     classpath: Vec::new(),
                     binary_path: vec![jar],
                     language_features: Vec::new(),
+                    ..TypecheckOptions::default()
                 },
             );
             let _ = t;
@@ -2601,6 +2609,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: vec![jar],
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         let _ = t;
@@ -3038,6 +3047,7 @@ object Main {
                 classpath: cp.clone(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(
@@ -3059,6 +3069,7 @@ object Main {
                 classpath: cp,
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(
@@ -3159,6 +3170,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3208,6 +3220,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3256,6 +3269,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3302,6 +3316,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3352,6 +3367,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3399,6 +3415,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3451,6 +3468,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3503,6 +3521,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3552,6 +3571,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3598,6 +3618,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3623,6 +3644,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags2), "expected error, got {:?}", diags2);
@@ -3668,6 +3690,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3693,6 +3716,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags2), "expected error, got {:?}", diags2);
@@ -3742,6 +3766,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3767,6 +3792,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags2), "expected error, got {:?}", diags2);
@@ -3814,6 +3840,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3861,6 +3888,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -3904,6 +3932,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -4159,6 +4188,7 @@ object Main {
                     classpath: Vec::new(),
                     binary_path: vec![jar],
                     language_features: Vec::new(),
+                    ..TypecheckOptions::default()
                 },
             );
             let _ = t;
@@ -4312,6 +4342,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {:?}", diags);
@@ -4380,6 +4411,7 @@ object Main {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..TypecheckOptions::default()
             },
         );
         assert!(has_errors(&diags), "expected error, got {diags:?}");

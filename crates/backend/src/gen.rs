@@ -19057,6 +19057,7 @@ mod tests {
                 classpath: Vec::new(),
                 binary_path: Vec::new(),
                 language_features: Vec::new(),
+                ..scala_rs_typer::TypecheckOptions::default()
             },
         );
         assert!(
