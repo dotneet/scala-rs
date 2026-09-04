@@ -2218,6 +2218,16 @@ impl PickleSupply {
         };
         trace(format_args!("stubbed class {full_name} (module={module})"));
         self.stubs.insert(key, id);
+        // A stub built here starts at `AnyRef`, and nothing else will fix that
+        // unless some *member* is later looked up on it -- `ensure_parents` is
+        // reached from member completion. A class that is only ever *named*
+        // therefore conformed to nothing: `Duration.MinusInf` has the pickled
+        // type `Duration.Infinite`, so `def minBound: Duration =
+        // Duration.MinusInf` (cats-kernel's `DurationBounded`) was
+        // `type mismatch; found: Duration$Infinite  required: Duration`.
+        // `attach_parents` is idempotent and additive, and its `parented` set
+        // stops the recursion through a parent that stubs another class.
+        self.ensure_parents(st, bin, id);
         Some(id)
     }
 

@@ -562,18 +562,27 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// A hexadecimal literal spans the *unsigned* range of its type and is read
+    /// as two's complement, which a decimal literal does not: nsc types
+    /// `0x85ebca6b` as the `Int` `-2049536683` and rejects the decimal
+    /// `2242054251` as "integer number too large". Reading the bits as a
+    /// positive `i64` and widening to `Long` made cats-kernel's `MurmurHash3`
+    /// avalanche step (`h *= 0x85ebca6b` on an `Int` `h`) a `type mismatch;
+    /// found: Long  required: Int`.
     fn emit_int_from_radix(&mut self, digits: &str, radix: u32, suffix: NumSuffix, lo: u32) {
+        let bits = u64::from_str_radix(digits, radix);
         match suffix {
-            NumSuffix::Long => match i64::from_str_radix(digits, radix) {
-                Ok(v) => self.emit(TokenKind::LongLit(v), lo, self.pos as u32),
+            NumSuffix::Long => match bits {
+                Ok(v) => self.emit(TokenKind::LongLit(v as i64), lo, self.pos as u32),
                 Err(_) => self.error(lo, self.pos as u32, "hex literal out of range"),
             },
-            NumSuffix::None => match i64::from_str_radix(digits, radix) {
-                Ok(v) if v >= i32::MIN as i64 && v <= i32::MAX as i64 => {
-                    self.emit(TokenKind::IntLit(v as i32), lo, self.pos as u32)
+            NumSuffix::None => match bits {
+                Ok(v) if v <= u32::MAX as u64 => {
+                    self.emit(TokenKind::IntLit(v as u32 as i32), lo, self.pos as u32)
                 }
-                Ok(v) => self.emit(TokenKind::LongLit(v), lo, self.pos as u32),
-                Err(_) => self.error(lo, self.pos as u32, "hex literal out of range"),
+                // Wider than 32 bits without an `L`: nsc reports
+                // `integer number too large`.
+                Ok(_) | Err(_) => self.error(lo, self.pos as u32, "hex literal out of range"),
             },
             _ => self.error(lo, self.pos as u32, "invalid suffix on hex literal"),
         }

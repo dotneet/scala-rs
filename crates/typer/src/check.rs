@@ -17826,7 +17826,16 @@ impl Typer {
         // nsc: `{ case (a, b) => … }` where a `FunctionN` is expected takes N
         // parameters and matches the N-tuple of them, not one parameter.
         if is_case_block_literal(vparams, body) {
-            if let Some(n) = expected_function_arity(pt) {
+            // A SAM is expanded the same way: cats-kernel's
+            // `implicit def catsStdEqForTry[A](…): Eq[Try[A]] = { case
+            // (Success(a), Success(b)) => … }` is a two-parameter literal
+            // matching the pair, because `Eq`'s single abstract method takes
+            // two. Reading only `FunctionN` here left the one parameter the
+            // parser wrote with no type: `missing parameter type for expanded
+            // function`.
+            let arity = expected_function_arity(pt)
+                .or_else(|| self.st.sam_sig(pt).map(|s| s.param_tys.len()));
+            if let Some(n) = arity {
                 if n > 1 {
                     self.expand_case_block_to_arity(vparams, body, n);
                 }
