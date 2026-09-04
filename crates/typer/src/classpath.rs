@@ -1264,7 +1264,26 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
             continue;
         }
         if let Some(id) = existing_java_method(st, owner, m) {
-            st.get_mut(id).flags = java_method_flags(m);
+            // The class file's flags, *plus* the two a class file cannot
+            // record and only a pickle knows: `implicit` and "this is a val's
+            // accessor". Overwriting wholesale made the whole thing
+            // order-dependent -- `import profile.api._` supplies
+            // `stringColumnType` and friends from the pickle with
+            // `Flags::IMPLICIT`, and if anything loaded
+            // `JdbcTypesComponent$ImplicitColumnTypes.class` *after* that
+            // (naming `Table[…]` as a parent is enough), every one of the 24
+            // column types silently stopped being an implicit and slick's
+            // whole DSL was "could not find implicit value of type
+            // TypedType[String]". Nothing in the bytecode can contradict
+            // either flag, so keeping them is not a guess.
+            let had = st.get(id).flags;
+            let mut f = java_method_flags(m);
+            for pickled in [Flags::IMPLICIT, Flags::ACCESSOR] {
+                if had.contains(pickled) {
+                    f = f.with(pickled);
+                }
+            }
+            st.get_mut(id).flags = f;
             if st.get(id).jvm_name.is_empty() {
                 st.set_jvm_name(id, m.desc.clone());
             }

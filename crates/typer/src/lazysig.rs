@@ -282,7 +282,16 @@ impl Typer {
         };
         // Everything needed to put the definition back if this completion
         // turns out to have run too early (see the check after it).
-        let retry = self.sigs_only.then(|| {
+        // The header pass is as provisional as the signature pass: it types
+        // every `import` in every template before a single member has a
+        // signature, and `import Profile.profile.api._` forces `profile`'s
+        // completion right there. Without this, `lazy val profile =
+        // DatabaseConfig.slickDriver` was completed against a
+        // `DatabaseConfig` whose own members were still `<notype>`, came out
+        // `<notype>`, and `lazy_done` kept it that way for the rest of the
+        // run -- `value api is not a member of <notype>`, and with it every
+        // slick `Session` in gitbucket.
+        let retry = (self.sigs_only || self.header_pass).then(|| {
             (
                 self.diags.len(),
                 PendingSig {
