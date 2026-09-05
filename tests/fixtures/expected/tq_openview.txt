@@ -1,0 +1,5 @@
+ID = lit:1 via omLong
+NAME = lit:bob via omStr
+ID = lit:7 via omLong
+ID = nine via omLong
+NAME in lit:x 3 via omStr
