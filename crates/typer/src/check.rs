@@ -159,6 +159,13 @@ pub struct ClasspathPickleMethod {
     pub is_val: bool,
     pub is_ctor: bool,
     pub is_implicit: bool,
+    /// The pickle's `DEFERRED`: a declaration, not a definition. Nothing in
+    /// the class file says so for a trait -- every member of an interface bar
+    /// its `default` methods is `ACC_ABSTRACT` -- and taking them all for
+    /// definitions asked for an `override` modifier scalac does not.
+    pub is_deferred: bool,
+    /// A `var`'s getter (an accessor the pickle does not mark `STABLE`).
+    pub is_mutable: bool,
 }
 
 /// Binary class/object visible to namer/typer via `-cp`.
