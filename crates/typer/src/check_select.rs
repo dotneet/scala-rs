@@ -93,6 +93,14 @@ impl Typer {
         // `NTupleMonadInstances`, where kind-projector's `(A0, *, *)` is
         // exactly this shape.
         recv_ty = self.st.dealias(&self.st.expand_applied_hk_alias(recv_ty));
+        // `xs #:: ys` on a `Stream`: `Stream.Deferrer` and the conversion that
+        // reaches it can only be declared once `Stream` itself is in the
+        // symbol table, which happens no earlier than here.
+        if name == "#::" || name == "#:::" {
+            if let Some(c) = self.st.class_sym_of(&recv_ty) {
+                crate::prelude_consextract::ensure_stream_support(&mut self.st, c);
+            }
+        }
         // `super.m` (`qual` is a `Super` tree): resolve `m` against the real
         // mixin linearization, not against the one parent `TreeKind::Super`
         // picked independent of `m`'s name and not through that parent's own
@@ -357,8 +365,16 @@ impl Typer {
             if let Some((conv, member, to)) = self.search_extension(&recv_ty, &name, tree.span) {
                 ext_conv = conv;
                 let span = qual.span;
-                let old = std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty));
+                let mut old = std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty));
                 let from = old.ty.clone();
+                // A conversion may take its argument by name -- `implicit def
+                // toDeferrer[A](l: => LazyList[A])` is what makes `a #:: xs`
+                // work without forcing the tail. This application is built
+                // here rather than typed as source, so the thunk `adapt` would
+                // otherwise have inserted has to be asked for.
+                if let Some(bn @ Type::ByName(_)) = self.conv_first_param(conv) {
+                    self.adapt(&mut old, &bn);
+                }
                 let fun = self.ref_implicit(conv, span);
                 let applied = Tree {
                     id: old.id,

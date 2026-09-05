@@ -1057,3 +1057,103 @@ one-parameter `Left` still does not conform to an `Either`. Tests in
 a `Functor[M].map` whose element type collapses, an `F[_]` under
 `tailRecM`, and a `$anon$.F` prefix that outlives its anonymous class -- not
 a remainder of the four above.
+
+## The collection cons operators and extractors (`agent/catstail`)
+
+**53 errors, from 530 to 477.** `tests/cats_measure.sh` goes from **530 errors
+/ 89 files** to **477 / 88**. `NonEmptyList.scala` 17 → 5, `stream.scala`
+28 → 12, `lazyList.scala` 14 → 9, `arraySeq.scala` 11 → 9,
+`NonEmptyLazyList.scala` 24 → 18. No file gets worse.
+
+The wave's tail was flat -- the largest symptom was 10 -- so the work was to
+re-bundle it by cause rather than by message. Four of the listed symptoms
+turned out to be one area:
+
+| symptom | count |
+|---|---:|
+| `not found: extractor +:` | 6 |
+| `not found: extractor ::` | 5 |
+| `not found: extractor #::` / `not found: value #::` | 8 |
+| `value #:: is not a member of LazyList[A]` / `… of Stream[A]` | 10 |
+| cascaded `not found: value tail / rest / a` | 11 |
+
+`case h :: t` had always worked, because `scala.::` is a *case class* and the
+pattern goes through the constructor-pattern path. Its three siblings are
+plain objects with an `unapply`, and **none of them was in the symbol table**:
+
+```text
+scala/collection/package$$plus$colon$.unapply:(Lscala/collection/SeqOps;)Lscala/Option;
+scala/collection/package$$colon$plus$.unapply:(Lscala/collection/SeqOps;)Lscala/Option;
+scala/package$$hash$colon$colon$.unapply:(Lscala/collection/immutable/LazyList;)Lscala/Option;
+scala/package$$hash$colon$colon$.unapply:(Lscala/collection/immutable/Stream;)Lscala/Option;
+```
+
+Five roots, each reproducible in a few lines:
+
+1. **The extractor objects themselves** (`crates/typer/src/prelude_consextract.rs`).
+   `+:` and `:+` are declared `unapply[A, C <: Seq[A]](t: C): Option[(A, C)]`
+   rather than with scalac's `C with SeqOps[A, CC, C]`, which needs a compound
+   type this symbol table cannot spell; the erased `SeqOps` descriptor is named
+   in `gen_invoke.rs`, the same treatment the sequence factories'
+   `unapplySeq` already had.
+
+2. **A type parameter determined only through another one's bound.** Nothing in
+   `unapply[A, C <: Seq[A]](t: C)`'s *parameter* mentions `A`, so
+   `Typer::subst_unapply_tparams` left the head sub-pattern at an unresolved
+   `A` and `h + 1` picked `String.+`. It now takes a second pass through the
+   bounds of the parameters it did solve. Keeping `C` also matters:
+   cats matches an `ArraySeq[A]` with `case _ +: rest` and hands `rest` to a
+   method that takes an `ArraySeq[A]`. `align_for_unify` used to walk the
+   scrutinee up to `class_sym_of(C)` -- which answers with the *bound's* class
+   -- and bound `C = Seq[Int]`; a parameter that is itself a type parameter
+   now takes the scrutinee whole.
+
+3. **`scala.#::` is overloaded**, one alternative per lazy sequence type, and
+   `find_unapply` took whichever came first: a `Stream` pattern bound its tail
+   at `LazyList`. The scrutinee's own class now decides, with conformance as
+   the tie-break, and a scrutinee that is neither is *rejected* -- nsc says
+   "cannot resolve overloaded unapply" for `case h #:: t` on a `List`, and
+   binding it to the wrong alternative would have emitted a call the JVM
+   rejects. The `Stream` alternative and `Stream.Deferrer` are installed
+   lazily, the first time source names a `Stream` in one of those positions:
+   `Stream` has no hand-written prelude declaration, and stubbing it during the
+   prelude is actively harmful, because `give_stub_its_kinds` leaves every
+   `scala/*` symbol allocated before `prelude_end` alone -- the stub would keep
+   zero type parameters for the whole run and `type Stream[+A] =
+   scala.collection.immutable.Stream[A]` would stop converting.
+
+4. **A method named `::` hid the case class from its own class body.**
+   `type_ident` already had the rule (nsc's `typingConstructorPattern` mode:
+   a non-stable method of the name does not qualify), but the *class* lookup in
+   `check_pattern.rs` was a plain `lookup`, which stops at the innermost scope
+   binding the name at all. cats' `NonEmptyList` declares
+   `def ::[AA >: A](a: AA)`, and all five `case h :: t` in the file reported
+   `not found: extractor ::`.
+
+5. **A by-name implicit conversion was invisible to the view search.**
+   `a #:: xs` is right-associative, so it selects `#::` on `xs`, which has no
+   such member; what makes it work is
+   `implicit def toDeferrer[A](l: => LazyList[A]): Deferrer[A]` plus a value
+   class carrying `#::` / `#:::`. `conv_param_matches` compared the receiver
+   against the parameter *as written*, so every conversion with a `=> T`
+   parameter was skipped. The by-name-ness is the whole point -- neither the
+   tail nor (for `LazyList`) the head may be forced -- and declaring it in that
+   shape lets the ordinary machinery do the work: `adapt` builds the thunk, and
+   the backend already routes a value class's members through
+   `<owner>$.<name>$extension`. The one place the two libraries differ is that
+   `Stream`'s `#::` takes its head strictly and `LazyList`'s does not.
+
+`tests/fixtures/ct2_conscoll.scala` runs all of it (including an infinite
+`ones = 1 #:: ones`, which is what says the tail is not forced),
+`ct2_consshadow.scala` the `::` rule on both runtimes, and
+`ct2_conscoll_bad.scala` pins the two rejections. Tests in
+`crates/cli/tests/catstail.rs`.
+
+**Still open in this area** (9 errors): `value :: is not a member of AnyRef`
+(6) and `value +: is not a member of Any` (3) look like the same symptom and
+are not -- they are lambda *parameter* inference, `ior.map(c :: _)` and
+`(b, acc) => b +: acc`, where the expected function type of a generic method's
+argument never reaches the placeholder. Separately, `ArraySeq(1, 2, 3)` and
+`Stream(1, 2, 3)` do not resolve (`no matching overload for (Seq, Any)AnyRef`
+/ `for Stream$`); the fixture builds those with `ArraySeq.unsafeWrapArray` and
+`Stream.range` instead.
