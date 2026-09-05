@@ -9851,7 +9851,7 @@ impl Typer {
                 self.warm_implicit_scope(&t);
             }
             let mut solution = self.undet_solution(&tys, &undet);
-            if solution.is_none() && self.warm_implicit_candidates() {
+            if solution.is_none() && self.warm_implicit_candidates(&tys) {
                 // A witness whose class came from a jar answers only once its
                 // pickled/JVM parents have been read: `implicit F: Async[F]`
                 // is a `GenTemporal[F, Throwable]` through three levels of
@@ -16120,7 +16120,7 @@ impl Typer {
             self.warm_implicit_scope(&t);
         }
         let mut solved = self.undet_solution(&rest_tys, &undet);
-        if solved.is_none() && self.warm_implicit_candidates() {
+        if solved.is_none() && self.warm_implicit_candidates(&rest_tys) {
             // The witness may be a jar class whose parents nothing had read:
             // `implicit F: Async[F]` answers `GenTemporal[F, E]` only through
             // `Async extends … GenTemporal[F, Throwable]`, and that is what
@@ -16484,7 +16484,9 @@ impl Typer {
                 .unwrap_or_else(|| self.st.get(*pid).ty.clone());
             self.warm_implicit_scope(&pty);
             let mut search = self.search_implicit(&pty);
-            if matches!(search, ImplicitSearch::None) && self.warm_implicit_candidates() {
+            if matches!(search, ImplicitSearch::None)
+                && self.warm_implicit_candidates(std::slice::from_ref(&pty))
+            {
                 search = self.search_implicit(&pty);
             }
             match search {
@@ -22848,7 +22850,9 @@ impl Typer {
                 // in a trait could not answer `toFlatMapOps`'s `FlatMap[F]`
                 // until some earlier line in the same file happened to warm
                 // it (slick's `BasicBackend.scala`, `run`).
-                if matches!(search, ImplicitSearch::None) && self.warm_implicit_candidates() {
+                if matches!(search, ImplicitSearch::None)
+                    && self.warm_implicit_candidates(std::slice::from_ref(want))
+                {
                     search = self.search_implicit(want);
                 }
                 match search {
@@ -22910,11 +22914,21 @@ impl Typer {
     /// per candidate class, and `warmed_scopes` makes each one a one-off, but
     /// the walk itself is not free. Answers whether anything was new, so the
     /// caller only retries the search when a retry could say something else.
-    pub(crate) fn warm_implicit_candidates(&mut self) -> bool {
+    ///
+    /// `wanted` are the types the search came up empty on. Their classes need
+    /// their parents just as much: `candidate_bounds_hold` asks whether the
+    /// solution for a candidate's `Level <: ShapeLevel` is one, and slick's
+    /// `Query.map` wants a `Shape[_ <: FlatShapeLevel, …]`, so the answer is
+    /// read off `FlatShapeLevel`'s parents -- a jar class the program never
+    /// names. Empty, that said no, and `q.map(_.title)` was "could not find
+    /// implicit value of type Shape[_ <: FlatShapeLevel, Rep[String], T, G]"
+    /// while naming `FlatShapeLevel` anywhere in the same file fixed it.
+    pub(crate) fn warm_implicit_candidates(&mut self, wanted: &[Type]) -> bool {
         let tys: Vec<Type> = self
             .implicits_in_scope()
             .into_iter()
             .map(|id| self.implicit_candidate_ty(id).into_owned())
+            .chain(wanted.iter().cloned())
             .collect();
         let mut fresh = false;
         for t in tys {

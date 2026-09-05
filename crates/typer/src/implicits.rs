@@ -329,6 +329,18 @@ impl Typer {
                 }
             }
             Type::ModuleRef(s) => self.collect_class_and_enclosing(*s, out, seen),
+            // An existential's bound is part of the type, the way nsc's
+            // `companionImplicitMap` follows an abstract type's `bounds.hi`.
+            // Without it `Shape[_ <: FlatShapeLevel, Rep[String], T, G]`
+            // (slick's `Query.map`) named no class the typer could warm, so
+            // `FlatShapeLevel` still had an empty parent list when
+            // `candidate_bounds_hold` asked whether it is a `ShapeLevel`, and
+            // `repColumnShape` was dropped for a bound it does satisfy.
+            Type::BoundedWildcard { lo, hi } => {
+                for b in [lo, hi].into_iter().flatten() {
+                    self.collect_type_parts(b, out, seen);
+                }
+            }
             Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => {
                 self.collect_type_parts(t, out, seen);
             }
