@@ -8,6 +8,7 @@ mod double_def;
 mod erasure;
 mod expand;
 mod expand_private;
+mod fasttrack_mirror;
 mod implicits;
 pub mod javaclass;
 mod javasign;

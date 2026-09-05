@@ -1,6 +1,6 @@
 # The reflect API and `reify` expansion
 
-These notes cover three connected pieces of work on the reflection side of the compiler. The first is a missing overload in the surface we supply from pickles: `u.Ident(sym: Symbol)` was never installed at all, because erasure of abstract type members was not implemented. The second is support for nested `object`s inside reflect API traits and for writing `<val>.type` as a stable identifier in a type, which together make the tree that `reify` must build compile and run when written by hand. The third is the automatic expansion of `reify { … }` bodies, including the hygiene rules that distinguish it from ordinary quasiquote lowering.
+These notes cover the connected pieces of work on the reflection side of the compiler, in the order they were done. The first is a missing overload in the surface we supply from pickles: `u.Ident(sym: Symbol)` was never installed at all, because erasure of abstract type members was not implemented. The second is support for nested `object`s inside reflect API traits and for writing `<val>.type` as a stable identifier in a type, which together make the tree that `reify` must build compile and run when written by hand. The third is the automatic expansion of `reify { … }` bodies, including the hygiene rules that distinguish it from ordinary quasiquote lowering.
 
 ### Missing supply of the `u.Ident(sym: Symbol)` overload (`agent/liftable` remaining, `agent/localcc`)
 
@@ -221,3 +221,150 @@ deliberately left alone: it needs its own implicit materialisation for
 arbitrary types, unrelated to the `TypeTag` machinery `materialize.rs`
 already has, and is a small enough slice of the total (10 of ~200) that
 building it was judged not to pay for itself here.
+
+### `currentMirror` expanded, the toolbox reached, and four supply bugs (the `agent/toolbox` slice)
+
+The bucket this slice was given was the rest of the runtime-reflection API in
+`test/files/run/`: 128 tests whose first diagnostic was one of `mkToolBox is
+not a member of JavaUniverse.Mirror` (44), `no matching overload for
+(Mirrors.RuntimeClass)Symbols.ClassSymbol` (16), `value prefix is not a member
+of blackbox.Context` (16), `cannot expand currentMirror` (14), the
+`ModuleSymbol` variant of the `RuntimeClass` one (9), and `not found:
+extractor Apply` (10). **Measured on exactly that subset** (`CORPUS_KINDS=run
+CORPUS_SIZE=full`, filtered to those test names): `pass=0` before, `pass=38`
+after. Nothing here was a `TypeTag` or `reify` change; those buckets are
+untouched and are what most of the remaining 90 now fail on.
+
+Six independent roots, none of them in the reflection API as such -- every one
+is a general rule the compiler had wrong, and reflection is simply where the
+standard library exercises it hardest.
+
+1. **A named import off a *value* never asked the pickle.** `import
+   c.{prefix => prefix}` reported `value prefix is not a member of
+   scala.reflect.macros.blackbox.Context` while `c.prefix` written out in the
+   same file resolved, because `Check::type_select` calls
+   `supply_from_pickle` and `Check::import_named` did not. The type half of
+   `import_named` had already been made unconditional for the same reason
+   (`Database`/`Session` in gitbucket); this is the term half.
+
+2. **A package's own class hid the term its package object declares.**
+   `import scala.tools.reflect.ToolBox` names *two* things -- the trait
+   `ToolBox` and, in `scala.tools.reflect.package`, the implicit conversion
+   `def ToolBox(m: ru.Mirror): ToolBoxFactory[ru.type]`. The trait alone
+   satisfied the selector, so the conversion never entered scope and
+   `mirror.mkToolBox()` was `value mkToolBox is not a member of
+   JavaUniverse.Mirror`. `import_named` now also asks the package object when
+   nothing it found is in the term namespace.
+
+3. **A concrete alias in a more derived class lost to the abstract
+   declaration it overrides.** `scala.reflect.api.Mirrors` declares `type
+   RuntimeClass >: Null <: AnyRef`; `scala.reflect.api.JavaUniverse` refines
+   it to `type RuntimeClass = java.lang.Class[_]`.
+   `PickleSupply::self_type_member` walked the linearisation looking only for
+   an *abstract* member, walked past the alias, and installed the opaque one
+   -- so `classSymbol(classOf[A])` was `no matching overload for
+   (Mirrors.RuntimeClass)Symbols.ClassSymbol with arguments (Class[A])`. The
+   linearisation is most-derived-first, so asking each step for an alias
+   before an abstract member is nsc's own rule.
+
+   That fix alone made the member *un*installable, because the signature and
+   the JVM descriptor are then erased in two different vocabularies: the
+   declaration in `Mirrors.RuntimeMirror` erases to
+   `classSymbol(Ljava/lang/Object;)`, which is what the class file says, while
+   the caller must satisfy `Class[_]`. `PickleSupply::install` now keeps the
+   caller's view as the member's type and, *only when the first descriptor
+   search fails*, recomputes the erasure at the declaration site
+   (`decl_site_want`) to find the bytes to call.
+
+4. **`currentMirror` is expanded by the compiler, the way nsc's `FastTrack`
+   does it.** The previous slice supplied the *binding*
+   (`install_known_macro`) and left the expansion to the JVM bridge, which
+   cannot run it: the implementation calls `c.reifyEnclosingRuntimeClass`,
+   whose result is a `Literal(Constant(<a type>))` the reply protocol has no
+   node for. `crates/typer/src/fasttrack_mirror.rs` builds the expansion
+   directly. What it builds was **read off real scalac 2.13.16** with
+   `-Ymacro-debug-lite`:
+   `_root_.scala.reflect.runtime.universe.runtimeMirror(this.getClass.getClassLoader)`.
+   The implementation's own `c.abort("call site does not have an enclosing
+   class")` is kept as a diagnostic.
+
+   Two smaller things were in the way of it ever being tried.
+   `install_known_macro` did not set `supplied_macro_def`, which is the gate
+   on the typer walking applications looking for something to expand at all
+   -- so a run whose only macro was this one reported "cannot expand" *with no
+   reason attached*, because nothing had tried. And
+   `expand_macro_application` returned early for any `Type::Method` receiver,
+   which a *parameterless* macro def keeps: `def currentMirror: Mirror` is
+   `paramss: []` and the bare identifier already is the application. `def f()`
+   is `[[]]` and is still excluded.
+
+5. **A `$default$n` getter was kept twice.** `adopt_binary_class` replaces the
+   class-file reader's crude member with the pickled one for every member
+   name, but it skips names containing `$` -- and a default getter is only
+   ever reached through `complete_named`'s `synthetic_ok` path, which did not
+   replace anything. `ToolBox.typecheck$default$2` was then both `(): Object`
+   and `(): TypecheckMode`, and filling in the default at `tb.typecheck(t)`
+   was `ambiguous overload`.
+
+6. **A compound upper bound offered only its first parent's members.**
+   `SymbolTable::class_sym_of` answers with one symbol and takes the first
+   parent of a `Type::Refined` that is a class. `scala.reflect.api.Names`
+   declares `type TypeName >: Null <: TypeNameApi with Name`, where
+   `TypeNameApi` is empty (it exists to give `TypeName` an erased identity)
+   and everything a name can do comes from `Name` through `NameApi`.
+   `Check::members_through_compound_bound` searches every parent, after the
+   ordinary search and the pickle have both found nothing.
+
+   This one was found by *slick*, not by the corpus: fix 3 makes
+   `symbolOf[R].name` the `TypeName` nsc gives it instead of the abstract
+   `SymbolApi.NameType` (whose bound is plain `Name`), and
+   `mapToImpl`'s `rSym.name.toTermName` in `ShapedValue.scala` then had
+   nowhere to resolve. `tests/slick_measure.sh` went from `errors=0` to
+   `errors=1` on fix 3 alone and back to `errors=0` with fix 6 -- the reason
+   to run the compile measures before committing rather than after.
+
+Separately, in the **backend**: `crates/backend/src/pickle.rs` wrote
+`Type::Nothing` and `Type::Null` as `Any`, because both fell through to the
+catch-all. `scala.reflect.runtime` reads that pickle, not the class file's
+erased descriptor (which said `scala/runtime/Nothing$` all along), so `class A
+{ def foo = ??? }` reflected back as `def foo: Any`. That is four of the
+corpus's `t5256*` tests and, more to the point, a wrong signature in every
+class file scala-rs emits.
+
+Fixtures and tests are `tests/fixtures/tb_reflect.scala` (the mirror, both
+`RuntimeClass`-taking methods, the reflected `Nothing`, `mkToolBox().eval`,
+and `typecheck`'s five defaults -- matching real scalac 2.13.16),
+`tb_prefix_impl.scala` + `tb_prefix_use.scala` (a two-stage macro that reaches
+`c.prefix` through a named import, also matched against real scalac), and
+`tb_bad.scala` (a confession: see below). They are 5 tests in
+`crates/cli/tests/toolbox.rs`, which is its own file because the toolbox needs
+scala-compiler.jar on the classpath as well as scala-reflect.jar.
+
+`tests/fixtures/rt_currentmirror_bad.scala` -- the previous slice's confession
+that `currentMirror` could not be expanded -- is now
+`tests/fixtures/rt_currentmirror.scala`, an ordinary fixture whose output is
+compared against real scalac. `println(currentMirror)` is not comparable (a
+mirror's `toString` carries the class loader's identity hash), so it prints
+`currentMirror == runtimeMirror(getClass.getClassLoader)` instead.
+
+#### Remaining, in this bucket
+
+* **`scala.reflect.api.Mirror`'s members are unreachable** (`staticClass`,
+  `staticModule`, `staticPackage`; `tb_bad.scala`). It is an abstract *class*
+  reached through the parent `Mirror[JavaUniverse.this.type]`, and that
+  parent does not convert -- `PickleSupply::conv_at` has no reading for a
+  singleton type of the enclosing class -- so `api.Mirror` is not in a
+  mirror's linearisation at all. `classSymbol` / `moduleSymbol` are declared
+  by the ordinary trait `Mirrors.RuntimeMirror` and are unaffected.
+* **A nested class's constructor result is pickled with the package as its
+  prefix**, not the enclosing class: `class A` inside `object Test` reflects
+  back as `def <init>(): A` where nsc says `Test.A`.
+  `Pickler::ctor_result_type` takes `class_pkg`, which is derived from the
+  JVM name. Four `t5256*` tests differ by that line alone.
+* `not found: extractor Apply` (10 tests) is pattern matching against the
+  reflect API's tree extractors. Those tests also need `c.reifyTree`,
+  `c.unreifyTree` and subclassing `Transformer`, so the extractor is the
+  first wall of several.
+* The `macro-term-declared-in-*` tests that still differ do so only in the
+  *spelling* of the prefix tree (`Expr[Nothing](Test.this.outer.Macros)`),
+  which is what the engine is handed by the Rust side.

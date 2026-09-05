@@ -1,0 +1,11 @@
+class TbA
+TbA
+AnyRef {
+  def <init>(): TbA
+  def nothing: Nothing
+  def name: String
+}
+TbCompanion
+TbA
+3
+String("s")

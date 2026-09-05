@@ -1223,47 +1223,49 @@ fn rt_typetags_matches_real_scalac() {
     let _ = fs::remove_dir_all(&out_dir);
 }
 
-/// `tests/fixtures/rt_currentmirror_bad.scala`: `currentMirror` is now a real
-/// (visible, correctly typed) member of `scala.reflect.runtime` -- it is a
-/// genuine macro def read from scala-reflect.jar's pickle, bound to the real
-/// `scala.reflect.runtime.Macros$.currentMirror` implementation
-/// (`docs/notes/macro-reflect-and-reify.md`) -- but expanding it needs `c
-/// .reifyEnclosingRuntimeClass`, which the engine does not implement yet. So
-/// referencing it must still fail, and by the same "macro expansion is not
-/// implemented" diagnostic every other unexpandable macro gets
-/// (`Typer::report_macro_calls`), never by "not found".
+/// `tests/fixtures/rt_currentmirror.scala`: `currentMirror` really expands.
 ///
-/// Real scalac accepts and runs this file (`currentMirror` is one of its own
-/// fast-track macros), which is what makes this a confession of what remains
-/// unimplemented rather than a correct rejection.
+/// It is one of nsc's *fast-track* macros -- the compiler recognises it by the
+/// macro symbol's full name and supplies the expansion itself, because the
+/// `@macroImpl` annotation on the real classfile is the placeholder `???` and
+/// there is no implementation to invoke. scala-rs does the same, in
+/// `crates/typer/src/fasttrack_mirror.rs`; this file used to be
+/// `rt_currentmirror_bad.scala`, a confession that the name was visible but no
+/// reference to it could be expanded.
+///
+/// Compared against real scalac 2.13.16, because an expansion that reached the
+/// wrong class loader would still compile and still run.
 #[test]
-fn rt_currentmirror_is_named_not_stubbed() {
-    if !prerequisites("rt_currentmirror_bad") {
+fn rt_currentmirror_expands_and_runs() {
+    if !prerequisites("rt_currentmirror") {
         return;
     }
-    let out_dir = tmp_dir("rt_currentmirror_bad");
-    let out = compile("rt_currentmirror_bad", &out_dir, &[]);
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let out_dir = tmp_dir("rt_currentmirror");
+    let out = compile("rt_currentmirror", &out_dir, &[]);
     assert!(
-        !out.status.success(),
-        "rt_currentmirror_bad.scala should not compile yet"
+        out.status.success(),
+        "compile rt_currentmirror failed: {}",
+        diagnostics(&out)
     );
-    let text = diagnostics(&out);
-    assert!(
-        text.contains(
-            "macro expansion is not implemented: cannot expand currentMirror \
-             (implementation scala/reflect/runtime/Macros$.currentMirror)"
-        ),
-        "missing the honest currentMirror diagnostic in:\n{text}"
+    let cp = format!(
+        "{}:{}:{}",
+        out_dir.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "rt_currentmirror"),
+        expected_stdout("rt_currentmirror")
     );
     let _ = fs::remove_dir_all(&out_dir);
 
     let Some(scalac) = find_scalac() else {
-        eprintln!("skip rt_currentmirror_bad scalac diff: scalac not obtainable");
+        eprintln!("skip rt_currentmirror scalac diff: scalac not obtainable");
         return;
     };
-    let reflect = scala_reflect_jar().unwrap();
-    let jar = scala_library_jar().unwrap();
-    let scalac_out = tmp_dir("rt_currentmirror_bad-scalac");
+    let scalac_out = tmp_dir("rt_currentmirror-scalac");
     let out = Command::new(&scalac)
         .args([
             "-cp",
@@ -1271,7 +1273,7 @@ fn rt_currentmirror_is_named_not_stubbed() {
             "-d",
             scalac_out.to_str().unwrap(),
             fixtures_dir()
-                .join("rt_currentmirror_bad.scala")
+                .join("rt_currentmirror.scala")
                 .to_str()
                 .unwrap(),
         ])
@@ -1279,8 +1281,7 @@ fn rt_currentmirror_is_named_not_stubbed() {
         .expect("scalac");
     assert!(
         out.status.success(),
-        "expected real scalac to accept rt_currentmirror_bad.scala (it is a \
-         fast-track macro, not something either compiler should reject): {}",
+        "real scalac rejected rt_currentmirror.scala: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let cp = format!(
@@ -1289,14 +1290,10 @@ fn rt_currentmirror_is_named_not_stubbed() {
         reflect.display(),
         jar.display()
     );
-    let run = Command::new("java")
-        .args(["-cp", &cp, "Main"])
-        .output()
-        .expect("java");
-    assert!(
-        run.status.success(),
-        "expected real scalac's build of rt_currentmirror_bad to run: {}",
-        String::from_utf8_lossy(&run.stderr)
+    assert_eq!(
+        run_main(&cp, "rt_currentmirror (real scalac build)"),
+        expected_stdout("rt_currentmirror"),
+        "recorded expectation for rt_currentmirror does not match real scalac"
     );
     let _ = fs::remove_dir_all(&scalac_out);
 }
