@@ -2641,6 +2641,17 @@ impl Typer {
             self.error(tree.span, msg);
         }
         if !self.sigs_only {
+            // SLS 5.1.7 / SIP-15. Only on the body pass: a value class nested
+            // in a method body is never reached by the signature pass, so
+            // running it there as well would only add duplicates for
+            // `dedup_diags` to remove.
+            for v in crate::valueclass::violations(
+                &self.st, id, tree_span, is_trait, vparamss, &tparams, body,
+            ) {
+                self.error(v.span, v.msg);
+            }
+        }
+        if !self.sigs_only {
             let body_snapshot: Vec<Tree> = body.to_vec();
             self.check_abstract_override_placement(id, &body_snapshot);
             // `new C with T` reaches here as the `$anon` class the parser
