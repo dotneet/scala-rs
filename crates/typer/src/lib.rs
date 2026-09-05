@@ -98,6 +98,24 @@ mod uncurry;
 mod value_companion;
 mod valueclass;
 mod views;
+// The prelude.rs split (agent/preludesplit): topic modules pulled out of the
+// 7400-line prelude.rs, following the existing prelude_<topic>.rs convention.
+// Appended here rather than interleaved alphabetically above to avoid
+// conflicting with the other slices editing this same mod list concurrently.
+mod prelude_anyval2;
+mod prelude_arrayops2;
+mod prelude_bignum;
+mod prelude_chainusing;
+mod prelude_classtag2;
+mod prelude_eithertry;
+mod prelude_immutcoll2;
+mod prelude_iterprim;
+mod prelude_mutcoll2;
+mod prelude_ordering2;
+mod prelude_predef2;
+mod prelude_richnum;
+mod prelude_stringops_core;
+mod prelude_xmlenum;
 
 pub use anon_capture::mark_anon_captures;
 pub use check::{
