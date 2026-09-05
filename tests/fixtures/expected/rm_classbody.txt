@@ -1,0 +1,7 @@
+Zero
+One
+Zero()
+good good
+good
+()
+6

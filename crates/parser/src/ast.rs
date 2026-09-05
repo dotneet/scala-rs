@@ -544,6 +544,15 @@ pub struct Tree {
     /// written where a `def StringContext` is in scope. Only names nsc itself
     /// qualifies belong here.
     pub scala_ref: bool,
+    /// SLS 8.1.5: this `Ident` in pattern position is a *stable identifier*
+    /// pattern -- it compares the scrutinee with the value the name denotes
+    /// instead of binding a fresh variable. The parser sets it for a
+    /// backquoted name (``case `f` =>``, stable however the name is spelled);
+    /// the type checker sets it once an ordinary name has resolved to a stable
+    /// value. Without the mark the backend cannot tell a resolved `val` from a
+    /// pattern variable -- both are `SymKind::Term` -- and compiled
+    /// `case VAL =>` into a binding that matches everything.
+    pub stable_pat: bool,
 }
 
 impl Tree {
@@ -556,6 +565,7 @@ impl Tree {
             sym: SymbolId::NONE,
             postfix: false,
             scala_ref: false,
+            stable_pat: false,
         }
     }
 
