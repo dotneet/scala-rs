@@ -134,13 +134,17 @@ straight through. Both halves of that are now settled:
   @specialize annotations" (`ScalaSettings.scala`). It is implemented here with
   that spelling. Under it `@specialized` and `@unspecialized` are dropped,
   which is what nsc does under it, so this is not a stub.
-* **Without** the flag they stay a diagnostic, and that is the right default:
-  there is no specialisation phase here, so the class we emitted would silently
-  lack the `$mc*$sp` members that everything compiled by real scalac links
-  against.
-* The rename hole is closed. The parser now remembers selectors that rename
-  `scala.specialized` / `scala.annotation.unspecialized`, so `@sp` is diagnosed
-  exactly like `@specialized` (`tests/fixtures/scalalib_spec_bad.scala`).
+* **Without** the flag they used to stay a diagnostic. Since stage 1 of
+  [`docs/specialization.md`](specialization.md) they are accepted and recorded
+  on the type parameter's symbol instead, and this measurement reports the same
+  number either way (**1644** with the flag and without it, where before the
+  flagless run aborted at the first annotation and reported 84). The phase is
+  still missing, so the classes we emit still lack the `$mc*$sp` members real
+  scalac's callers link against; `tests/spec_classfiles.sh` is the ledger that
+  measures that against scalac directly.
+* The rename hole is closed. The parser remembers selectors that rename
+  `scala.specialized` / `scala.annotation.unspecialized`, so `@sp` is read as
+  `@specialized` (`tests/fixtures/scalalib_spec.scala`, `sp_alias.scala`).
 
 `@elidable` is a different case and is now simply accepted. `@elidable(level)`
 elides a call only when `level < -Xelide-below`, and nsc's default for that

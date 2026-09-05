@@ -9,6 +9,15 @@ scala/scala's own corpus (`test/files/{pos,neg,run}`, 5324 programs at tag
 [scala-corpus.md](scala-corpus.md) for the pass rates, the symptom breakdown,
 and what the runner counts as a skip rather than a failure.
 
+`tests/spec_classfiles.sh` is the **specialization ledger**: it compiles each
+of the corpus's 37 `pos/spec-*` tests with real scalac and with scala-rs and
+diffs the two sets of classfile *names*. It exists because accepting
+`@specialized` raises the corpus's `pos` number by far more than it earns, and
+a number that goes up needs a number beside it that cannot. It compares names
+only — nothing is loaded, verified or run — so what it proves is exactly "we do
+not emit the classes scalac emits", which is the thing still missing. See
+[specialization.md](specialization.md).
+
 slick's own test suite (`slick-testkit`) is measured by
 `tests/testkit_measure.sh`; see [slick-testkit.md](slick-testkit.md) for the
 numbers and what they found. `crates/cli/tests/testkit.rs` (fixture prefix
