@@ -11,7 +11,7 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `7c6a37c` |
+| commit | `c451517` |
 |---|---|
 | updated | 2026-09-05 |
 
@@ -21,7 +21,7 @@ is, and both invalidate everything downstream.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **474** | **88** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **946** | **111** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **912** | **111** | — |
 | `tests/scalalib_measure.sh` (538) | **1647** | **171** | — |
 
 ## Execution
@@ -45,7 +45,7 @@ is, and both invalidate everything downstream.
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release` | **187 binaries, 2172 passed, 0 failed** |
+| `cargo test --workspace --release` | **188 binaries, 2176 passed, 0 failed** |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 ## Six classes the JVM will not load
