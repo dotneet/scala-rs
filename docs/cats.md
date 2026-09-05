@@ -975,3 +975,85 @@ recursion overflows the stack either way. (Measured: a `final` method with two
 million self-calls throws `StackOverflowError` from a scala-rs build both
 before and after this change.) The check is a diagnostic, and the only thing at
 stake is whether it matches nsc's.
+
+## Monad transformers: an `if`/`match`-bodied lambda that decided nothing (`agent/monadtrans`)
+
+**88 errors, from 752 to 664.** `tests/cats_measure.sh` goes from **752
+errors / 103 files** to **664 errors / 101 files**. `EitherT.scala` 40 → 27,
+`IorT.scala` 36 → 24, `OptionT.scala` 21 → 16, `Ior.scala` 46 → 4,
+`NTupleUnorderedFoldableInstances.scala` 33 → 31, and nine smaller files
+improve. No file gets worse; slick, gitbucket and the corpus are unchanged.
+
+`EitherT`, `IorT` and `OptionT` are all the same shape -- wrap an `F[…]`, and
+rebuild by handing `F.flatMap` a pattern-matching anonymous function:
+
+```scala
+def biflatMap[C, D](fa: A => EitherT[F, C, D], fb: B => EitherT[F, C, D])(implicit F: FlatMap[F]) =
+  EitherT(F.flatMap(value) {
+    case Left(a)  => fa(a).value
+    case Right(b) => fb(b).value
+  })
+```
+
+Every one of them reported `no matching overload for
+(F[Either[A, B]])EitherT[F, A, B] with arguments (F[_])`. Four roots, all
+reproducible in a dozen lines without cats (`tests/fixtures/mt_transformer.scala`):
+
+1. **`pt_or_lub` adopted the undetermined stand-in.** An undetermined variable
+   in the *result* of a function-typed parameter is opened to `Type::Wildcard`
+   rather than to a bound (`check_apply`'s `relaxed`), so the literal is typed
+   against `X => F[_]`. `F[_]` is not `Any`, so `pt_or_lub` took it as the
+   `match`'s type, the lambda came out `X => F[_]`, and the argument that was
+   supposed to *decide* `flatMap`'s second parameter said `B = _` instead. The
+   same body written as a plain lambda (no `match`, no `if`) always worked --
+   that asymmetry is what pinned it. Fixed by `Typer::branch_result_ty`.
+2. **Branches that disagree.** `EitherT.orElse` gives `F[Either[C, BB]]` from
+   one branch and `F[Right[C, BB]]` from the other. nsc never joins the two
+   applications: the expected type is a real type variable, each branch adds a
+   *lower bound*, and `solve` takes the lub of those. Joining the applications
+   cannot reach the same answer -- `F` is an abstract constructor whose
+   parameter is invariant -- and `SymbolTable::lub` has no arm for
+   `Type::Applied` at all, so it walked out to `AnyRef`. `Typer::fill_undecided`
+   fills the stand-in positions from the branches, one argument at a time,
+   which is the same computation nsc's `solve` performs.
+3. **`collect_expected` had no `Type::Refined` arm.** cats' generated
+   `NTupleUnorderedFoldableInstances` calls `private def instance[F[_] <: Product]
+   (…): Traverse[F] with Reducible[F]` with `F` named nowhere else, so only the
+   expected type says what it is. All 22 tuple instances reported `value _1 is
+   not a member of _[Any]` followed by `found: Traverse[F] with Reducible[F]`;
+   both symptom groups are now zero. (What is left in that file is the *next*
+   thing: `F` is now solved to a kind-projector type lambda, and
+   `[A0, β](A0, β)[A0, Any]` is never beta-reduced, so `.copy` is not a member
+   of it. Eleven errors, all one shape.)
+4. **An extractor lined up with the scrutinee by position.** `unify_one` pairs
+   two class applications argument-by-argument, which is right only for
+   applications of the *same* class. cats writes `final case class Right[+B](b: B)
+   extends (Nothing Ior B)`, whose synthesized `unapply[B](x: Right[B])` was
+   unified straight against a scrutinee `Ior[A, B]` -- so `case Ior.Right(b)`
+   bound `b: A`, and every `IorT` method that matches on its own value reported
+   `type mismatch; found: A  required: B`. `Typer::align_for_unify` walks one
+   side to the other's class first, in whichever direction exists.
+
+A fifth root turned up in the same file and is the bulk of `Ior.scala`'s 46 →
+4: **`Ior.Left(a)` was typed as `scala.util.Left`.** The `Left.apply` /
+`Right.apply` shortcut keyed off the owner module's *name* being `Left$` and
+then asked the scope for a class called `Left` -- the same
+look-it-up-by-simple-name mistake `factory_result_class`'s comment records for
+`mutable.Set`. `cats.data.Ior.Left("x")` therefore had type
+`Left[String, Int]`, even written out in full. The class now comes from the
+`apply`'s own declared result, and a one-parameter `Left` is left alone.
+
+`tests/fixtures/mt_transformer.scala` reduces all five to one file, dual-run
+against real scalac 2.13.16 (`--scala-library` only: it needs `Either`,
+`Tuple1` and `Product with Serializable`); `mt_transformer_bad.scala` pins
+that filling a stand-in from the branches is not "believe the branches" -- a
+branch that is not an application of the same constructor still decides
+nothing, an aligned extractor still binds one definite side, and a
+one-parameter `Left` still does not conform to an `Either`. Tests in
+`crates/cli/tests/monadtrans.rs`.
+
+**Still open in this group** (13 of the 44 errors the slice was pointed at):
+`IorT` 7, `OptionT` 3, `EitherT` 3. They are separate roots -- `M[Any]` from
+a `Functor[M].map` whose element type collapses, an `F[_]` under
+`tailRecM`, and a `$anon$.F` prefix that outlives its anonymous class -- not
+a remainder of the four above.

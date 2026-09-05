@@ -1717,8 +1717,32 @@ impl Typer {
         if alts.iter().any(|(s, t)| &self.st.get(*s).ty != t) {
             self.overload_member_types.insert(found[0].0, alts.clone());
         }
-        let ov = Type::Overload(alts.into_iter().map(|(_, t)| t).collect());
+        let ov = Type::Overload(alts.iter().map(|(_, t)| t.clone()).collect());
         tree.ty = self.maybe_auto_apply(ov, pt);
+        // The same rule the receiver form goes through in `type_select`: one
+        // alternative whose parameters are all implicit is what value position
+        // keeps, and `maybe_auto_apply` cannot recognise it from the type
+        // alone. gitbucket's controllers write `params.get(…)` unqualified,
+        // through `ScalatraFilter`'s own inherited member, so this is the half
+        // of the pair that carries the count. See
+        // `implicit_only_alternative`.
+        if matches!(tree.ty, Type::Overload(_))
+            && !matches!(pt, Type::Function { .. } | Type::Method { .. })
+        {
+            if let Some(id) = self.implicit_only_alternative(&alts) {
+                if let Some((_, t)) = alts.iter().find(|(s, _)| *s == id) {
+                    tree.ty = t.clone();
+                }
+                tree.sym = id;
+                if id != found[0] {
+                    self.overload_member_types.insert(id.0, alts.clone());
+                    if let Some(g) = self.overload_groups.get(&found[0].0).cloned() {
+                        self.overload_groups.insert(id.0, g);
+                    }
+                }
+                return;
+            }
+        }
         tree.sym = if matches!(tree.ty, Type::Overload(_)) {
             found[0]
         } else {

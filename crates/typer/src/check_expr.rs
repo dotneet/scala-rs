@@ -1097,7 +1097,9 @@ impl Typer {
                 // whose branches share no direct subtype relation but do share
                 // `Option[X]` as a common ancestor (sgap fixture; slick's
                 // `PositionedResult.nextXOption()` methods rely on exactly this).
-                tree.ty = pt_or_lub(pt, self.lub_branches(&thenp.ty, &elsep.ty));
+                let joined = self.lub_branches(&thenp.ty, &elsep.ty);
+                let branch_tys = [thenp.ty.clone(), elsep.ty.clone()];
+                tree.ty = self.branch_result_ty(pt, &branch_tys, joined);
             }
             TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
                 self.type_expr(cond, &Type::Boolean);
