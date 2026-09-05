@@ -850,6 +850,88 @@ Roots left in the third group, largest first:
   `Double` (`t12560`), implicit specificity (`t2509-1`), `Contra[C]`
   class-tag variance (`t7768`).
 
+### The wrong-answer pile, opened a third time (2026-09-06, `agent/runwrong3`)
+
+The same 121 tests — `output-mismatch` (97) plus `AssertionError` (24) — were
+re-run one by one on `b819eb1`, keeping each program's output beside its
+`.check`. The split is not the one either earlier pass reported, and the
+difference is worth writing down because it changes what "fix this pile" means.
+
+| group | count |
+| --- | ---: |
+| the `.check` carries compiler diagnostics; the *program's* output already matches ours exactly | **32** |
+| the test's own `assert` failed (no `.check` to compare) | **25** |
+| a genuinely different answer | **65** |
+
+The first row is the one to read carefully, because **no compiler change can
+turn any of those 32 green with the runner as it stands.** partest builds one
+log per `run` test out of the compiler's output *and* the program's, and
+compares that; `tests/scala_corpus.sh` compares only `stdout` (or `stdout` and
+`stderr` concatenated) and never looks at `$WORK/round$r.log` at all. So a
+`.check` whose first lines are
+
+```
+patmat-behavior.scala:82: warning: fruitless type test: …
+```
+
+cannot match, and would still not match on the day scala-rs emits that warning.
+Making them reachable is two separate pieces of work: teach the runner to
+prepend the compile log, *then* implement the warning. Doing the second without
+the first moves nothing, and doing the first alone will move nothing either —
+but it will stop 32 tests being counted as "we print the wrong answer", which
+they are not.
+
+Earlier passes put this group at 23 and then 28. It has not grown; the counting
+did. A `.check` line is a diagnostic when the *message* line is dropped along
+with the source echo and the caret line beneath it, and dropping only the
+message line leaves two lines of noise that make the comparison fail for a
+reason that has nothing to do with the program.
+
+Three roots were fixed here, all in what a *reader* of our output sees rather
+than in what the program computes, and all invisible to every other check in
+the battery — the classfiles load, verify and lint identically either way:
+
+| root | tests |
+| --- | ---: |
+| `c.prefix` reached a macro implementation as the source `Ident`, where nsc hands over a *typed* tree: a name that resolves to a member of an enclosing template is `Main.this.macros` | 5 |
+| a constructor's pickled result type had no prefix, so `class A` in `object Test` read back as `def <init>(): A` instead of `def <init>(): Test.A` | 3 |
+| an `object`'s module class had no primary constructor in the pickle, so reflection found no `termNames.CONSTRUCTOR` in an object's signature | 2 |
+
+The first is `macro-term-declared-in-{anonymous,class-object,object-object,refinement}`
+and `macro-expand-override`; the argument trees deliberately keep their bare
+`Ident`s, because those are spliced into the expansion and type-checked again
+at the call site, where an unqualified name still means what the source meant.
+The second is `t5256b`, `t5256e`, `t5256f` (`t5256c` needs a *local* class's
+`A$1` naming as well and is unmoved). The third is
+`reflection-enclosed-inner-nested-basic` and `-nested-nested-basic`, whose only
+difference was a missing `constructor BB` at the head of `info.decls`.
+
+Two findings recorded rather than fixed:
+
+* **`scala.StringContext.s` does not exist.** Our prelude declares
+  `def s(args: Any*): String` on it; 2.13.16's `StringContext` has only
+  `s(): StringContext$s$` (the extractor object) and `standardInterpolator`,
+  and nsc *intrinsifies* both `s"…"` and an explicitly written
+  `sc.s(args)` — the latter to `standardInterpolator(processEscapes, args)`,
+  or to a constant when it can fold it. So any program that writes
+  `sc.s(…)` by hand links against a method that is not there
+  (`run/interpolationArgs`, `NoSuchMethodError`). `s"…"` itself is fine; it
+  never goes through that symbol.
+* **`run/identifierCase` is a silently wrong pattern match**, which is the
+  worst shape a defect can take. `case ǅul =>` — a titlecase leading letter —
+  must be a stable identifier and ours is read as a variable, so the first
+  arm matches everything. nsc's rule is `Character.isLowerCase` on the first
+  character, and `ª` (U+00AA) *is* lower case by that test while `ǅ` (U+01C5,
+  category Lt) is not.
+
+The rest of the 65 group by cause as before: `@specialized` (7, stage 2),
+`Manifest`/`ClassManifest` materialisation carrying type arguments (4), runtime
+reflection fidelity of curried and empty parameter lists (`reflection-methodsymbol-params`,
+`t6733`, `fail-non-value-types` — the pickler flattens `paramss` into one
+`METHODtpe` on purpose, and `Type::Method` still carries the clause boundaries
+it would need), toolbox error messages arriving as `null` (4), and a long flat
+tail.
+
 ### Pile two: we do not implement it (≈500)
 
 | symptom | count |
