@@ -3,13 +3,14 @@
 //!
 //! Two roots, both in `crates/typer/src/check.rs`:
 //!
-//! 1. **A self type read from a class file offered nothing unqualified.**
+//! 1. **A self type read from a jar offered nothing unqualified.**
 //!    `bind_self_type` copies the self type's member list into the template
-//!    scope, and a `-cp` class's member list is empty until something asks
-//!    for a name. `expose_inherited_from_binary` already completed an
-//!    *inherited* name on demand; it now does the same for the enclosing
-//!    templates' self types. The wildcard in gitbucket's `self: Table[?] =>`
-//!    is not what breaks it -- `Table[String]` failed identically, and a
+//!    scope, and a jar class's member list is empty until something asks for
+//!    a name. `expose_inherited_from_binary` already completed an *inherited*
+//!    name on demand; it now does the same for the enclosing templates' self
+//!    types. `ws_selflib.scala` is the fixture -- the scala-library jar
+//!    stands in for slick's. The wildcard in gitbucket's `self: Table[?] =>`
+//!    is not what breaks it: `Table[String]` failed identically, and a
 //!    `Table` written in source worked with either spelling.
 //! 2. **The signature pass's complaint about a self type was permanent.**
 //!    A class header is typed by both passes, but a diagnostic is never
@@ -18,6 +19,11 @@
 //!    the signature pass and kept it, even though the body pass resolved it.
 //!    `bind_self_type` now drops the signature pass's complaint, exactly as
 //!    `type_parent_ctor_app` does for a parent's constructor arguments.
+//!    `ws_selfimport.scala` is the fixture.
+//!
+//! `ws_selftype.scala` is neither root: it is the end-to-end shape (a self
+//! type naming a `-cp` class, mixed into a real class and run) that the two
+//! fixes must not disturb.
 //!
 //! Kept out of `crates/cli/tests/e2e.rs` on purpose; see `.agent-brief.md`.
 //! All fixtures use the `ws_` prefix.
@@ -78,8 +84,13 @@ fn compile_fixture_with(name: &str, extra: &[&str]) -> PathBuf {
         out.to_str().unwrap(),
     ]);
     cmd.args(extra);
-    let status = cmd.status().expect("run scala-rs compile");
-    assert!(status.success(), "compile {name} failed extra={extra:?}");
+    let output = cmd.output().expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "compile {name} failed extra={extra:?}: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     out
 }
 
@@ -101,35 +112,57 @@ fn run_java(out: &Path, cp_extra: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// Compile `ws_selftype_lib.scala` to class files, then compile `name`
-/// against them. Returns (use-output, lib-output).
-fn compile_against_lib(name: &str, jar: &str) -> (PathBuf, PathBuf) {
-    let lib_out = compile_fixture_with("ws_selftype_lib", &["--scala-library", jar]);
-    let src = fixtures_dir().join(format!("{name}.scala"));
-    let out = tmp_dir(name);
-    let status = Command::new(bin())
-        .args([
-            "compile",
-            src.to_str().unwrap(),
-            "-cp",
-            lib_out.to_str().unwrap(),
-            "--scala-library",
-            jar,
-            "-d",
-            out.to_str().unwrap(),
-        ])
-        .status()
-        .expect("run scala-rs compile");
-    assert!(status.success(), "compile {name} against the lib failed");
-    (out, lib_out)
+// --- (1) a self type read from a jar ---------------------------------------
+
+/// `self: Growable[String] =>`, `self: Promise[Int] =>` and
+/// `self: Growable[?] =>`, each calling a member of the self type by its bare
+/// name. Every one of these was `not found: value …`.
+#[test]
+fn fixtures_ws_selflib() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip scala-library run: jar not obtainable");
+        return;
+    };
+    let jar_s = jar.to_str().unwrap();
+    let out = compile_fixture_with("ws_selflib", &["--scala-library", jar_s]);
+    if java_available() {
+        assert_eq!(run_java(&out, &[jar_s]), expected_stdout("ws_selflib"));
+    }
+    let _ = fs::remove_dir_all(&out);
 }
 
-// --- (1) a self type read from a class file --------------------------------
+// --- (2) a self type named through an import on a later template -----------
 
-/// `self: Table[?] =>`, `self: Table[String] =>`, a compound self type, and a
-/// nested template's reference to the enclosing one's -- all against a
-/// `Table` that arrives as a class file. Byte-for-byte what real scalac
-/// 2.13.16 prints.
+/// `Provider` is written *after* the template that imports through it, which
+/// is the order gitbucket's `BasicTemplate.scala` and `Profile.scala` sort in.
+/// Needs no jar: what breaks is the pass order, not where the class lives.
+#[test]
+fn fixtures_ws_selfimport_private_runtime() {
+    let out = compile_fixture_with("ws_selfimport", &["--no-scala-library"]);
+    if java_available() {
+        assert_eq!(run_java(&out, &[]), expected_stdout("ws_selfimport"));
+    }
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn fixtures_ws_selfimport_library() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip scala-library run: jar not obtainable");
+        return;
+    };
+    let jar_s = jar.to_str().unwrap();
+    let out = compile_fixture_with("ws_selfimport", &["--scala-library", jar_s]);
+    if java_available() {
+        assert_eq!(run_java(&out, &[jar_s]), expected_stdout("ws_selfimport"));
+    }
+    let _ = fs::remove_dir_all(&out);
+}
+
+// --- the end-to-end shape both fixes have to leave alone --------------------
+
+/// A self type naming a `-cp` class, in three spellings, mixed into real
+/// classes and run. Byte-for-byte what real scalac 2.13.16 prints.
 #[test]
 fn fixtures_ws_selftype() {
     let Some(jar) = scala_library_jar() else {
@@ -137,33 +170,30 @@ fn fixtures_ws_selftype() {
         return;
     };
     let jar_s = jar.to_str().unwrap();
-    let (out, lib_out) = compile_against_lib("ws_selftype", jar_s);
+    let lib_out = compile_fixture_with("ws_selftype_lib", &["--scala-library", jar_s]);
+    let src = fixtures_dir().join("ws_selftype.scala");
+    let out = tmp_dir("ws_selftype");
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-cp",
+            lib_out.to_str().unwrap(),
+            "--scala-library",
+            jar_s,
+            "-d",
+            out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run scala-rs compile");
+    assert!(
+        status.success(),
+        "compile ws_selftype against the lib failed"
+    );
     if java_available() {
         assert_eq!(
             run_java(&out, &[lib_out.to_str().unwrap(), jar_s]),
             expected_stdout("ws_selftype")
-        );
-    }
-    let _ = fs::remove_dir_all(&out);
-    let _ = fs::remove_dir_all(&lib_out);
-}
-
-// --- (2) a self type named through an import on a later template -----------
-
-/// `Provider` is written *after* the template that imports through it, which
-/// is the order gitbucket's `BasicTemplate.scala` and `Profile.scala` sort in.
-#[test]
-fn fixtures_ws_selfimport() {
-    let Some(jar) = scala_library_jar() else {
-        eprintln!("skip scala-library run: jar not obtainable");
-        return;
-    };
-    let jar_s = jar.to_str().unwrap();
-    let (out, lib_out) = compile_against_lib("ws_selfimport", jar_s);
-    if java_available() {
-        assert_eq!(
-            run_java(&out, &[lib_out.to_str().unwrap(), jar_s]),
-            expected_stdout("ws_selfimport")
         );
     }
     let _ = fs::remove_dir_all(&out);
