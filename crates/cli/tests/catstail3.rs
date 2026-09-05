@@ -1,4 +1,4 @@
-//! E2E tests for the `agent/catstail3` slice: three roots from typelevel/cats'
+//! E2E tests for the `agent/catstail3` slice: five roots from typelevel/cats'
 //! flat tail, each of which turned out to cover several of the reported
 //! symptoms.
 //!
@@ -27,6 +27,20 @@
 //!    because the different implicit parameter makes each an *overload*.
 //!    `robust` refuses to compare a type mentioning a type parameter, so all
 //!    nine reported "`override` modifier required".
+//! 4. **A constructor field and its accessor were two alternatives.**
+//!    `prelude_tuple` gives `Tuple1` and `Tuple3`..`Tuple22` both, exactly as
+//!    the class file does, so `ff._1` on a `Tuple1[A => B]` was
+//!    `<overload (A) => B | (A) => B>` and could not be applied at all: ten
+//!    reports in cats' generated `NTupleMonadInstances.scala`, one per
+//!    `FlatMapTupleN`. `Tuple2`, whose prelude declaration has the field
+//!    alone, always worked.
+//! 5. **Branches that each leave the *other* type parameter open.**
+//!    `nonEmptyPartition`'s `match` gives `Ior[?A, NEL[C]]` and
+//!    `Ior[NEL[B], ?B]`; neither is the join, so `lub_branches` fell through
+//!    to the ordinary walk, which joined an open variable against a real type
+//!    in both positions and answered `Ior[AnyRef, AnyRef]`. nsc minimises a
+//!    side's own undetermined variables before joining. Every later use read
+//!    `value :: is not a member of AnyRef`.
 //!
 //! Kept out of `crates/cli/tests/e2e.rs` to avoid merge conflicts; see
 //! `.agent-brief.md`. All fixtures use the `c3_` prefix.
@@ -235,6 +249,8 @@ fn fixtures_c3_parallel_bad_is_rejected() {
         &[
             "found: M[List[X]]  required: M[X]",
             "found: Seq[Int]  required: Vector[Int]",
+            "no matching overload for Int with arguments (0)",
+            "required: List[A]",
         ],
     );
 }
@@ -243,7 +259,12 @@ fn fixtures_c3_parallel_bad_is_rejected() {
 fn scalac_agrees_c3_parallel_bad_is_rejected() {
     scalac_rejects(
         "c3_parallel_bad",
-        &["required: P.F[X]", "required: Vector[Int]"],
+        &[
+            "required: P.F[X]",
+            "required: Vector[Int]",
+            "Int does not take parameters",
+            "required: List[A]",
+        ],
     );
 }
 

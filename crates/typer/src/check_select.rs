@@ -711,6 +711,7 @@ impl Typer {
             return found;
         }
         let found = self.collapse_pickled_copies(found);
+        let found = self.drop_field_behind_accessor(found);
         let kept: Vec<SymbolId> = found
             .iter()
             .copied()
@@ -792,6 +793,54 @@ impl Typer {
     /// nsc sees one `IterableOps.map`. So does this: copies of one pickled
     /// declaration collapse to the first, which is the one `lookup_member`
     /// reached first and so the nearest to the receiver.
+    /// A constructor parameter's *field* and its accessor are one member, not
+    /// two alternatives.
+    ///
+    /// `prelude_tuple` gives `Tuple1` and `Tuple3`..`Tuple22` both a
+    /// `ctor_fields` symbol `_1` and a nullary `_1()` method, exactly as the
+    /// class file does (`javap scala.Tuple1`: `public final T1 _1;` *and*
+    /// `public T1 _1();`). In Scala source the name always means the
+    /// accessor -- nsc makes the field `private[this]` -- and `Tuple2`, whose
+    /// prelude declaration has the field alone, was never affected. Where the
+    /// component's own type is a *function*, the resulting
+    /// `<overload (A) => B | (A) => B>` could not be applied at all: cats'
+    /// generated `NTupleMonadInstances.scala` reported `no matching overload`
+    /// for `ff._1(fa._1)` ten times, once per `FlatMapTupleN`.
+    fn drop_field_behind_accessor(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
+        let is_field = |s: SymbolId| {
+            self.st.get(s).kind == SymKind::Term
+                && self.st.get(self.st.get(s).owner).ctor_fields.contains(&s)
+        };
+        if !found.iter().copied().any(is_field) {
+            return found;
+        }
+        let kept: Vec<SymbolId> = found
+            .iter()
+            .copied()
+            .filter(|&s| {
+                if !is_field(s) {
+                    return true;
+                }
+                let owner = self.st.get(s).owner;
+                let field_ty = &self.st.get(s).ty;
+                !found.iter().any(|&o| {
+                    o != s
+                        && self.st.get(o).owner == owner
+                        && self.st.get(o).kind == SymKind::Method
+                        && matches!(&self.st.get(o).ty,
+                            Type::Method { paramss, ret }
+                                if paramss.iter().all(|c| c.is_empty())
+                                    && ret.as_ref() == field_ty)
+                })
+            })
+            .collect();
+        if kept.is_empty() {
+            found
+        } else {
+            kept
+        }
+    }
+
     fn collapse_pickled_copies(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
         if !found
             .iter()

@@ -71,6 +71,43 @@ object AListInv extends Inv[List] { def name = "inv" }
 object AListFun extends Fun[List] { def name = "fun" }
 object AListAp extends Ap[List] { def name = "ap" }
 
+// ---------------------------------------------------------------- root 4
+// `prelude_tuple` gives `Tuple1` and `Tuple3`..`Tuple22` both a `ctor_fields`
+// symbol `_1` and a nullary `_1()` accessor, exactly as the class file does --
+// and both were selection candidates, so `ff._1` was
+// `<overload (A) => B | (A) => B>`. Where the component is a function the
+// overload could not be applied at all: cats' generated
+// `NTupleMonadInstances.scala` reported it ten times, once per `FlatMapTupleN`.
+// `Tuple2`, whose prelude declaration has the field alone, always worked.
+object Tup {
+  def ap1[A, B](ff: Tuple1[A => B])(fa: Tuple1[A]): Tuple1[B] =
+    Tuple1(ff._1(fa._1))
+  def ap3[A, B](ff: (A => B, Int, Int), a: A): B = ff._1(a)
+}
+
+// ---------------------------------------------------------------- root 5
+// Each branch leaves the *other* type parameter undetermined, so neither is
+// the join and the ordinary walk joined an open variable against a real type
+// in both positions -- `Ior[AnyRef, AnyRef]`, and every later use of the value
+// read `value :: is not a member of AnyRef` (cats' `nonEmptyPartition`, in
+// `NonEmptyList`, `NonEmptySeq` and `NonEmptyVector`).
+sealed abstract class Ior[+A, +B]
+object Ior {
+  final case class L[+A](a: A) extends Ior[A, Nothing]
+  final case class R[+B](b: B) extends Ior[Nothing, B]
+  def left[A, B](a: A): Ior[A, B] = L(a)
+  def right[A, B](b: B): Ior[A, B] = R(b)
+}
+object Part {
+  def partition[B, C](e: Either[B, C]): Ior[List[B], List[C]] = {
+    val last = e match {
+      case Right(c) => Ior.right(List(c))
+      case Left(b)  => Ior.left(List(b))
+    }
+    last
+  }
+}
+
 object Main {
   def main(args: Array[String]): Unit = {
     println(Par.roundTrip(VecList)(List(List(1, 2), List(3))))
@@ -81,5 +118,9 @@ object Main {
     println(Coll.flat(LazyList(Some(1), None, Some(3))).toList)
     println(AListAp.compose[List](AListAp))
     println(AListFun.compose[List](AListFun))
+    println(Tup.ap1(Tuple1((n: Int) => n + 1))(Tuple1(41)))
+    println(Tup.ap3(((n: Int) => n * 2, 0, 0), 21))
+    println(Part.partition(Right(1): Either[String, Int]))
+    println(Part.partition(Left("x"): Either[String, Int]))
   }
 }
