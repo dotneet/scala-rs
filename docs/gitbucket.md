@@ -86,7 +86,9 @@ path of your own.**
 | roots 18 and 19, `TableQuery` through its macro | 353 | 1 | **1736** | 185 | 0 |
 | roots 20 and 21, slick's `Shape` witness and a tie between two conversions | 353 | 1 | **1588** | 185 | 0 |
 | roots 22 and 23 | 353 | 1 | **1587** | 185 | 0 |
-| Now (roots 24 and 25, the self type) | 353 | 1 | **1443** | 185 | 0 |
+| roots 24 and 25, the self type | 353 | 1 | **1443** | 185 | 0 |
+| main at `236de45` (`tests/BASELINE.md`) | 353 | 1 | **1399** | 185 | 0 |
+| Now (root 26, a case class's static mirror forwarder) | 353 | 1 | **1294** | 135 | 0 |
 
 Every row after the second was measured on the same tree, with the same
 material, one binary each -- `SCALA_RS=<binary> tests/gitbucket_measure.sh`
@@ -1199,6 +1201,135 @@ on demand — `scala.collection.mutable.PriorityQueue` is one
 (`tests/fixtures/ws_selflib.scala`) — and root 25 needs no jar at all, because
 what breaks there is the pass order (`tests/fixtures/ws_selfimport.scala`).
 
+### 26. A case class's static mirror forwarder was read as an inherited member — 105 errors (typer)
+
+The largest single template symptom in the "remaining" table below,
+`ambiguous overload for datetimeago with arguments (Date)` (53), was filed
+next to root 17's function-literal shapes when it was first counted, but the
+argument here is a bare `Date` — not a function literal, not even close —
+so it is a different root, and the survey that grouped them was wrong (see
+the retraction in the "remaining" table).
+
+`play.twirl.api.BaseScalaTemplate` is a **case class**, and every generated
+template extends it directly:
+
+```scala
+object datetimeago extends _root_.play.twirl.api.BaseScalaTemplate[...](fmt)
+    with _root_.play.twirl.api.Template2[java.util.Date, Boolean, ...] {
+  def apply(latestUpdatedDate: java.util.Date, recentOnly: Boolean = true): ... = ...
+  ...
+}
+```
+
+`javap` on `BaseScalaTemplate.class` shows two static methods with `Signature`
+attributes of their own:
+
+```
+public static <T, F> BaseScalaTemplate<T, F> apply(F);
+public static <T, F> Option<F> unapply(BaseScalaTemplate<T, F>);
+```
+
+These are **mirror forwarders**: bytecode scalac adds to a top-level case
+class's own class file so Java callers can write `BaseScalaTemplate.apply(fmt)`
+instead of routing through `BaseScalaTemplate$.MODULE$`. Real scalac's model
+of the class comes from the *pickle*, and the pickle -- built before this
+bytecode-only step runs -- has no such member; the forwarder belongs to the
+companion `BaseScalaTemplate$`, which is a different symbol nsc reaches only
+when a term names `BaseScalaTemplate` itself.
+
+`classpath.rs`'s `fill_java_members` read every method in a class file,
+filtering only unsigned generic forwarders (`is_erased_scala_forwarder`) --
+which this one is not, since it is generic in the *class's own* `T`/`F` and so
+carries a `Signature`. It was entered as an ordinary instance member of
+`BaseScalaTemplate`, inheritable like any other. `datetimeago`'s own `apply`
+(the only one the template source writes) then had a same-named, same-arity
+competitor for `datetimeago(date)` -- the sugar for `datetimeago.apply(date)`
+-- reachable through inheritance from `BaseScalaTemplate`, and overload
+resolution could not tell them apart: `ambiguous overload for apply with
+arguments (Date)`.
+
+The fifteen-line reproduction needs no gitbucket checkout, no Twirl, and no
+scala-library jar beyond what a hand-written case class and object already
+demonstrate against the real `twirl-api` jar
+(`crates/cli/tests/twirl.rs`'s `DA_LIB`/`DA_USER`):
+
+```scala
+case class BaseScalaTemplate[T <: Appendable[T], F <: Format[T]](format: F)
+trait Template2[A, B, Result] { def render(a: A, b: B): Result }
+
+object datetimeago extends BaseScalaTemplate[Html, Format[Html]](HtmlFormat)
+    with Template2[String, Boolean, Html] {
+  def apply(text: String, shout: Boolean = false): Html = ...
+}
+object Main { def main(a: Array[String]): Unit = println(datetimeago("hi").body) }
+```
+
+`is_scala_static_mirror_forwarder` (`crates/typer/src/classpath.rs`) now skips
+every `ACC_STATIC` method of a *Scala*-compiled class file: Scala has no real
+static members, so any one scalac writes into a class file is JVM-interop
+bytecode the pickle does not mention, whether it is generic (this shape) or
+erased (already covered). Nothing is lost -- a selection on the companion
+itself (`BaseScalaTemplate.apply(fmt)`, or the `apply` sugar on it) resolves
+through the *module* symbol, which is completed from `BaseScalaTemplate$`'s
+own pickle independently of the class's member list.
+
+This is a general fix, not a Twirl-specific one: it is worth far more than the
+53 `datetimeago` diagnostics the survey counted, because **every** Twirl
+template with a defaulted trailing parameter had the same phantom competitor,
+each under its own helper's name (`ambiguous overload for X with arguments
+(...)`, one row per helper rather than one big `datetimeago` row). Measured on
+`tests/gitbucket_measure.sh`: **1399 → 1294 errors, 185 → 135 files with
+errors** -- `ambiguous overload for datetimeago` goes from 53 to 0, and so does
+every other Twirl helper's version of it; the 5 remaining `ambiguous overload`
+lines are jgit's `getRefsByPrefix` and javax.mail's `addTo`/`addBcc`, unrelated.
+slick (`errors=0 classes=1490`), cats (752) and the scala library (1653) are
+unchanged. `tests/slick_run.sh` and the scala/scala corpus's `pos`/`neg`
+(full) were run and are unaffected; codegen was not touched, so
+`tests/slick_subset.sh` is a formality here, not a risk.
+
+#### `Query[G, T, Seq]` (and `Query[TableClass, Any, Seq]`) is not this root
+
+The brief for this slice also asked about `value update / list is not a
+member of Query[G, T, Seq]` (19 + 18, and more of the same shape once counted
+directly) and whether it shares root 26's cause. It does not, and it is not
+one root either -- it is at least two, neither of them a case-class mirror
+forwarder:
+
+* **Most of the `Query[TableClass, Any, Seq]` instances** (`Query[Accounts,
+  Any, Seq]`, `Query[GroupMembers, Any, Seq]`, and one per table gitbucket
+  declares) are downstream of the **already-documented** `TableQuery` macro
+  limitation in `docs/macros.md` §4.3/§5.1: a table class nested in a `trait`
+  mixed into an `object` (gitbucket's universal shape, `trait AccountComponent
+  { self: Profile => class Accounts(tag) extends Table[...](tag, ...) }`)
+  cannot have its `TypeTag` rebuilt by the macro engine's separate JVM, so
+  `TableQuery[Accounts]` fails and error recovery gives `Accounts` an
+  approximated `Query[Accounts, Any, Seq]` type -- `Any` where the real row
+  type would be. Every `Query[X, Any, Seq]` receiver checked against a
+  compile of gitbucket's own `model/` + `AccountService.scala` traces to a
+  `cannot build a type tag for` X` at that table's own `TableQuery[X]` line in
+  the same run. Closing this means giving the macro engine "a mirror over the
+  current run's own symbols" -- §4.3's own words for an open problem, not a
+  quick fix.
+* **`Query[G, T, Seq]` with the bare method type parameters unsubstituted**
+  (43 in one measurement: 19 `update`, 18 `list`, 6 `firstOption`) is the
+  residual root 20/21 already named and left open ("`Query[G, T, Seq]` 47 →
+  43 rather than to zero... a second root, not this one"). It is
+  `Query.map`'s own `G`/`T` -- solved by the `Shape` witness inside `.map`
+  when nothing consumes the result further -- printed unsolved specifically
+  when the very next selection is a blocking-slick extension method
+  (`.update(...)`/`.list`/`.firstOption`, reached through an implicit
+  conversion). A clean, jar-only reproduction of just this piece (no
+  gitbucket, no nested classes, `TableQuery` pre-compiled to a class file to
+  sidestep the macro limitation above) was not reached this slice: every
+  minimal file that isolated `.map(...).update(...)` cleanly also needed
+  `profile.api._` and `profile.blockingApi._` imported together, and real
+  scalac 2.13.16 rejects that combination too (`value === is not a member of
+  Rep[Long]`, an implicit-scope clash between the two APIs) -- meaning gitbucket's
+  actual import shape is more specific than what was tried here. Left for a
+  slice that can spend a full budget tracing `adapt_implicit_apply`'s handling
+  of `.map`'s own implicit `shape` clause when the qualifier is about to be
+  selected on again, not fixed speculatively.
+
 ## Not fixed: a guard after a value definition in a for-comprehension
 
 `controller/PullRequestsController.scala` writes
@@ -1231,7 +1362,7 @@ now. The head is scalatra's overload sets and the Twirl templates.
 |---|---|---|
 | **79** | `no implicit … CanBeQueryCondition[Any]` | `q.filter(t => …)` where the literal's body still did not type, so `filter`'s `T` came out `Any`. Was 187; what is left is downstream of the wildcard self type below, not a root of its own. |
 | **53** | `unimplemented syntax: named arguments (method parameters not resolved)` | Named arguments where the callee did not resolve. |
-| **53** | `ambiguous overload for datetimeago with arguments (Date)` | A Twirl `object` extends `BaseScalaTemplate` and `TemplateN`, and its `apply` is ambiguous with something inherited. The largest single template symptom. |
+| ~~53~~ | ~~`ambiguous overload for datetimeago with arguments (Date)`~~ | **Done -- root 26 above, and for a different reason than this row says.** The argument is a bare `Date`, not a function literal; the ambiguity was `BaseScalaTemplate`'s own case-class static mirror forwarder read as an inherited member, not "something inherited" from `TemplateN` (`TemplateN` declares only `render`). Worth 105 here, not 53: every other Twirl helper with a defaulted trailing parameter had the identical phantom competitor under its own name. |
 | **44** | `ambiguous overload for apply$default$N with arguments ()` | A default getter that two overloads both own. |
 | **43 / 28 / 22 / 13** | `value get / update / getOrElse is not a member of <overload …>` | scalatra: a pickled *declaration* cannot be told from a definition, so the overload set keeps both. See 1 below. |
 | **37 / 28 / 23** | `no implicit … BaseTypedType[AnyRef] / TypedType[Date] / BasicBackend.Session` | slick, in `BasicTemplate.scala`'s `self: Table[?] =>`: a wildcard self type does not offer the table's members. See 2 below. |
@@ -1240,7 +1371,7 @@ now. The head is scalatra's overload sets and the Twirl templates.
 | 27 / 17 | `no implicit … OptionMapper2[…] / CanBeQueryCondition[Rep[R]]` | slick, at comparisons whose operand is an `Option` column. |
 | 24 / 13 | `no matching overload for (Boolean)Boolean with arguments (Rep[Boolean])`, `value && is not a member of Rep[R]` | Downstream of the wildcard self type: `byRepository(…)` in `BasicTemplate.scala` has no usable type, so `&&` is looked up on the wrong receiver. Not root 21 again — that one is gone. |
 | 22 | `no matching overload for (…)FieldSerializer[X] with arguments ()` | json4s, once per serialised model class. Root 23 instantiated the `A` this used to print. |
-| 21 / 20 | `value list / update is not a member of Query[G, T, Seq]` | blocking-slick's extension methods, on a `Query` whose `T` came out unsolved. |
+| 21 / 20 | `value list / update is not a member of Query[G, T, Seq]` | blocking-slick's extension methods, on a `Query` whose `T` came out unsolved. Confirmed **not** root 26's cause; still open, see root 26's write-up. |
 | 16 + 10 + 8 | `ambiguous implicit: jsonFormats, context, …` | scalatra again: the same declaration reached twice. |
 | 14 | `no implicit … Shape[FlatShapeLevel, ON, UN, _]` | `q.join(…)`'s `ON` / `UN` are not the same shape as `map`'s and are still open. |
 
