@@ -4082,6 +4082,33 @@ fn co_allops_bad_is_rejected() {
     compile_fails("co_allops_bad", "incompatible type in overriding type T");
 }
 
+// ----------------------------------- a view for an argument, with open tparams
+
+/// An implicit view that makes an argument applicable must be offered even
+/// when the callee has type parameters the argument's parameter type does not
+/// mention. `search_conversion_open` demanded a solution for every one of
+/// them, so slick's `def ===[P2, R](e: Rep[P2])(implicit om:
+/// OptionMapper2[..., P2, R]): Rep[R]` -- where `R` lives only in the implicit
+/// clause and the result -- could not reach the `Long => Rep[Long]` view at
+/// all, and `column === 1L` was `no matching overload`. See docs/gitbucket.md
+/// root 19.
+#[test]
+fn tq_openview_fixture() {
+    check("tq_openview");
+    dual_run_fixture("tq_openview");
+}
+
+/// Relaxing which type parameters a view has to settle must not make an
+/// inapplicable call applicable: with no `OM[Long, Long, R]` in scope there is
+/// no result type, and real scalac rejects it too.
+#[test]
+fn tq_openview_bad_is_rejected() {
+    compile_fails_lib(
+        "tq_openview_bad",
+        "could not find implicit value of type OM[Long, Long, R]",
+    );
+}
+
 // --------------------------------------------------- @specialized (stage 1)
 
 /// `@specialized` and `@unspecialized` are accepted and recorded on the
