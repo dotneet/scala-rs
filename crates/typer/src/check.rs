@@ -16450,11 +16450,19 @@ impl Typer {
     fn classtag_erasable(&self, t: &Type) -> bool {
         match t {
             // No erasure of its own: the tag has to come from the scope.
-            Type::TypeParam(_) | Type::TypeMember(_) => false,
-            Type::Class { sym, .. } => !matches!(
-                self.st.get(*sym).kind,
-                SymKind::TypeParam | SymKind::TypeMember
-            ),
+            // Only a parameter the source can still *name* is abstract here.
+            // nsc instantiates a call's undetermined parameters before it
+            // asks for the tag — `bar(Array(): _*)` is `Array[Nothing]()`,
+            // and `ClassTag.Nothing` answers that — while our inference
+            // leaves the callee's own `Type::TypeParam` in place. Refusing
+            // those cost `pos/t3859`, `pos/t5692c` and `pos/t5859`.
+            Type::TypeParam(s) => !self.tparam_in_scope(*s),
+            Type::TypeMember(_) => false,
+            Type::Class { sym, .. } => match self.st.get(*sym).kind {
+                SymKind::TypeParam => !self.tparam_in_scope(*sym),
+                SymKind::TypeMember => false,
+                _ => true,
+            },
             Type::Array(e)
             | Type::ByName(e)
             | Type::Repeated(e)
