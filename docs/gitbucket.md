@@ -85,7 +85,8 @@ path of your own.**
 | main at `dc6fdc9` | 353 | 1 | **1193** | 184 | 0 |
 | roots 18 and 19, `TableQuery` through its macro | 353 | 1 | **1736** | 185 | 0 |
 | roots 20 and 21, slick's `Shape` witness and a tie between two conversions | 353 | 1 | **1588** | 185 | 0 |
-| Now (roots 22 and 23) | 353 | 1 | **1587** | 185 | 0 |
+| roots 22 and 23 | 353 | 1 | **1587** | 185 | 0 |
+| Now (roots 24 and 25, the self type) | 353 | 1 | **1443** | 185 | 0 |
 
 Every row after the second was measured on the same tree, with the same
 material, one binary each -- `SCALA_RS=<binary> tests/gitbucket_measure.sh`
@@ -106,22 +107,22 @@ gitbucket query had ever been typechecked. Now it is, and slick's DSL --
 `===`, `&&`, `Shape`, `CanBeQueryCondition` -- reports what it really cannot
 do yet. `files_with_errors` moved by one; no file that was clean broke.
 
-Of the 1588, **1442** are in 113 hand-written files (of 213 measured) and
+Of the 1443, **1290** are in 112 hand-written files (of 213 measured) and
 **146** are in 73 of the 140 generated templates — the template side has not
 moved since root 8, since nothing there touches slick.
 
 The worst hand-written files are now
-`service/IssuesService.scala` (191),
-`service/RepositoryService.scala` (119),
-`service/WebHookService.scala` (75),
-`controller/RepositoryViewerController.scala` (65) and
+`service/IssuesService.scala` (169),
+`service/RepositoryService.scala` (87),
+`controller/RepositoryViewerController.scala` (64),
+`service/WebHookService.scala` (60) and
 `controller/RepositorySettingsController.scala` (58) — the `service/` layer,
 which is where gitbucket's queries are. Before root 18 the same files reported
 a fraction of that and the head of the table was `controller/`.
 
 ## What was wrong, and what it cost
 
-Twenty-one roots. Twenty are fixed; the counts are what each was worth when
+Twenty-three roots. Twenty-two are fixed; the counts are what each was worth when
 it was removed.
 
 ### 1. An operator swallowed the comment that followed it (lexer)
@@ -1101,6 +1102,103 @@ therefore needs a package with a plain class-and-companion pair on `-cp`
 `tq_mdef.scala`'s `tqm` package imported directly instead of through its `api`
 object.
 
+### 24. A self type read from a jar offered no members unqualified — 137 errors (typer)
+
+Entry 1 of the list below, and the larger half of it.
+
+gitbucket writes every slick table mix-in as
+
+```scala
+trait BasicTemplate { self: Table[?] =>
+  val userName = column[String]("USER_NAME")
+}
+```
+
+and `column` was `not found: value column`. **The wildcard is not what breaks
+it.** `self: Table[String] =>` fails identically, so does a self type with no
+type arguments at all, and a `Table` written in *source* works with every
+spelling. What decides it is where the class comes from. A jar class's members
+are completed one name at a time, on demand (`PickleSupply::complete`), and
+`Check::bind_self_type` implements SLS 5.1 by copying the self type's member
+list into the template scope — which for such a class is empty. A qualified
+`this.column` resolved all along, because `lookup_member` walks the self type
+and `type_select` completes on demand; only the bare name did not.
+
+`Check::expose_inherited_from_binary` already does exactly this for a member
+inherited from a `-cp` ancestor (root 9-13). `expose_from_binary_self_type` is
+the same move for the self type, with one addition: `complete_named` serves a
+`-cp` class only once `adopt_binary_class` has taken it over, and nothing
+adopts a class the program only ever names in a self type, so completion had
+been reaching the self type's *ancestors* and never its own declarations —
+and `column` is declared on `Table` itself.
+
+It is deliberately restricted to the template the name is written in. nsc's
+context chain also reaches an **enclosing** template's self type, but the
+member would then have to be read at the outer `this`: a nested
+`trait Inner { def d: Int = dequeue() }` inside
+`trait Q { self: PriorityQueue[Int] => … }` must see `dequeue(): Int`, not the
+declared `A`, and must call it on `Q.this`. Entering the symbol alone gives
+neither — the first version of this fix produced `type mismatch; found: A` —
+and it was worth nothing here (1443 with the walk and without), so an outer
+self type is left reported rather than answered wrongly.
+
+### 25. The signature pass's complaint about a self type was permanent — 7 errors (typer)
+
+The other half of entry 1, and the reason the symptom in gitbucket printed as
+`not found: type Table` rather than `not found: value column`.
+
+`TemplateComponent { self: Profile => import profile.api._ }` names `Table`
+through an import whose prefix is **another template's `val`**. That cannot
+resolve while `TemplateComponent`'s own signatures are being built, which is
+exactly what root 16 is about for member signatures. A class *header*, though,
+is typed by both passes, and a diagnostic is never retracted — so the
+signature pass's `not found: type Table` survived a body pass that resolved it
+perfectly well, and with the self type left unbound every member the template
+should have offered went with it. gitbucket's `model/BasicTemplate.scala`
+sorts before `model/Profile.scala`, so this is not a corner case there; the
+same file with `Profile` written above compiles.
+
+`bind_self_type` now drops what the signature pass reports, exactly as
+`type_parent_ctor_app` drops what that pass says about a parent's constructor
+arguments: anything real is raised again by the pass that runs with every
+unit's signatures in hand. `tests/fixtures/ws_selftype_bad.scala` pins the
+three diagnostics that must survive, including one on a *nested* template's
+self type.
+
+### What roots 24 and 25 were measured against
+
+`tests/gitbucket_measure.sh` on the merged tree: **1587 → 1443**, files with
+errors 185 → 185. Root 24 is −137 of that and root 25 the remaining −7
+(measured one at a time, in that order). By cluster:
+
+| cluster | before | after |
+|---|---:|---:|
+| `not found: type Table` | 7 | **0** |
+| `no implicit … BaseTypedType[AnyRef]` | 37 | **0** |
+| `no implicit … CanBeQueryCondition[Any]` | 79 | 44 |
+| `no implicit … OptionMapper2[AnyRef, AnyRef, Boolean, Option[AnyRef], String, R]` | 27 | 1 |
+| `value && is not a member of Rep[R]` | 13 | 2 |
+| `no matching overload for (Boolean)Boolean with arguments (Rep[Boolean])` | 24 | 18 |
+| `… is not a member of Query[G, T, Seq]` | 47 | 43 |
+
+The `Shape[…]` rows are worth reading rather than counting: they did not move
+in number, but their arguments did, from `Tuple4[T1, T2, Rep[String],
+Rep[String]]` to `Tuple4[Rep[String], Rep[String], Rep[String], Rep[String]]`
+and in several cases from `AnyRef` to the real `U` — the table's columns have
+types now.
+
+slick (`errors=0 classes=1490`), cats (752) and the scala library (1653) are
+unchanged, which is what one would expect: none of them writes a self type
+whose class is only reachable through a pickle.
+
+The reproduction is **not** the one the entry below predicted. A top-level
+`-cp` class is installed with its members eagerly as soon as anything names
+it, so the first fixture pair written for this passed on the branch point too.
+What reproduces it without slick is a class whose members really are completed
+on demand — `scala.collection.mutable.PriorityQueue` is one
+(`tests/fixtures/ws_selflib.scala`) — and root 25 needs no jar at all, because
+what breaks there is the pass order (`tests/fixtures/ws_selfimport.scala`).
+
 ## Not fixed: a guard after a value definition in a for-comprehension
 
 `controller/PullRequestsController.scala` writes
@@ -1122,12 +1220,12 @@ in a block inside the lambda, which has no stream for the guard to filter, and
 so diagnoses the shape rather than desugaring it wrongly. Three occurrences,
 one file, held out of the measurement by default.
 
-## Where the remaining 1588 are
+## Where the remaining 1443 are
 
-Counted by message shape, largest first, with the reading. The `Shape` and
-`&&` families that headed this table are gone (roots 20 and 21); what is left
-is still mostly slick, but the head of it is now scalatra's overload sets and
-the wildcard self type.
+Counted by message shape, largest first, with the reading. The table below is
+the count from **before** roots 24 and 25; the `after` column of the table in
+"What roots 24 and 25 were measured against" is what the rows that moved read
+now. The head is scalatra's overload sets and the Twirl templates.
 
 | n | message | reading |
 |---|---|---|
@@ -1153,15 +1251,16 @@ fifteen lines against the published jar**, with no gitbucket checkout — the
 harness for that is three lines of shell (`scalac`/`scala-rs` over one file with
 `sbt export Compile/dependencyClasspath`'s classpath).
 
-1. **A wildcard self type offers no members** (≈88 directly, and the head of
-   what is left is downstream of it: the 79 `CanBeQueryCondition[Any]`, the 24
-   `(Boolean)Boolean with arguments (Rep[Boolean])`, the 13
-   `value && is not a member of Rep[R]`, and the `Query[G, T, Seq]` family).
-   `trait BasicTemplate { self: Table[?] => val userName = column[String]("USER_NAME") }`
-   gives `not found: value column` and then `BaseTypedType[AnyRef]` for
-   everything downstream; writing `self: Table[String] =>` works. It was
-   number 4 on this list and is now number 1, because roots 20 and 21 removed
-   everything that stood between it and the diagnostics it causes.
+1. ~~A wildcard self type offers no members.~~ **Done -- roots 24 and 25
+   above.** Worth 144 here (1587 → 1443) and 0 in slick, cats and the scala
+   library. Two things in this entry were wrong and are worth remembering.
+   The wildcard was not the cause: `self: Table[String] =>` failed the same
+   way, and what actually decided it is whether the self type's class was read
+   from a pickle. And "≈88 directly" undercounted the direct half while
+   overcounting the cascade: the direct clusters came to 144, and of the
+   downstream families named here `CanBeQueryCondition[Any]` fell 79 → 44 and
+   `Query[G, T, Seq]` 47 → 43 rather than to zero. What is left of them is a
+   second root, not this one.
 2. **A pickled *declaration* cannot be told from a definition** (the
    `value get / update / getOrElse is not a member of <overload …>` half, 106
    now — scalatra, unchanged by roots 20 and 21).
