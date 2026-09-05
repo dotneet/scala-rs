@@ -3885,3 +3885,15 @@ fn fixtures_rv_traitouter() {
 fn scala_library_dual_run_rv_traitouter() {
     dual_run_fixture("rv_traitouter");
 }
+
+/// Templates declared inside a *local* class reach a classfile, and an
+/// imported name that the object only inherits keeps its receiver.
+#[test]
+fn fixtures_rv_localnested() {
+    check("rv_localnested");
+}
+
+#[test]
+fn scala_library_dual_run_rv_localnested() {
+    dual_run_fixture("rv_localnested");
+}

@@ -2963,7 +2963,9 @@ impl<'a> Gen<'a> {
                 for s in stats {
                     // Local `class` / `object` declared inside a method body.
                     match &s.kind {
-                        TreeKind::ClassDef { name, mods, .. } => {
+                        TreeKind::ClassDef {
+                            name, mods, impl_, ..
+                        } => {
                             self.emit_class(s, &HashSet::new());
                             // A local `case class` needs its companion
                             // module class (`apply`/`unapply`) emitted too,
@@ -2976,8 +2978,19 @@ impl<'a> Gen<'a> {
                             if mods.flags.contains(Flags::CASE) && !module_names.contains(name) {
                                 self.emit_case_companion(s);
                             }
+                            // ... and so do the classes and objects declared
+                            // *inside* it. `walk_stats` does this for a
+                            // top-level class; this walk stopped at the local
+                            // one itself, so `def f = { class Outer { class
+                            // Inner } }` wrote `Test$Outer$1` and nothing
+                            // else, and the first `new Inner` inside it threw
+                            // `NoClassDefFoundError: Test$Outer$1$Inner`.
+                            self.walk_stats(&impl_.body);
                         }
-                        TreeKind::ModuleDef { .. } => self.emit_module(s, &HashSet::new(), None),
+                        TreeKind::ModuleDef { impl_, .. } => {
+                            self.emit_module(s, &HashSet::new(), None);
+                            self.walk_stats(&impl_.body);
+                        }
                         _ => {}
                     }
                     self.emit_anon_classes(s);

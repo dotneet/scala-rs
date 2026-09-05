@@ -5814,11 +5814,12 @@ impl Typer {
                     .filter(|(from, to)| from != "_" && to == "_")
                     .map(|(from, _)| from.clone())
                     .collect();
+                let qual = (**qual).clone();
                 for (from, to) in &sels {
                     if from == "_" || to == "_" {
                         continue;
                     }
-                    self.import_named(&owners, from, to, span);
+                    self.import_named(&owners, from, to, span, &qual);
                 }
                 if sels.iter().any(|(from, _)| from == "_") {
                     self.import_wildcard(&owners, &hidden, span);
@@ -5827,7 +5828,8 @@ impl Typer {
             TreeKind::Select { qual, name } => {
                 let n = name.clone();
                 let owners = self.import_prefix(qual, span);
-                self.import_named(&owners, &n, &n, span);
+                let qual = (**qual).clone();
+                self.import_named(&owners, &n, &n, span, &qual);
             }
             TreeKind::Ident { name } => {
                 let n = name.clone();
@@ -5965,6 +5967,29 @@ impl Typer {
         // outer one when the inner is recorded left the *outer* references
         // with no receiver at all once the method ended. Which one applies is
         // decided at each use by `prefix_in_scope`.
+        self.term_import_prefixes
+            .retain(|(o, q)| !(*o == owner && path_display(q) == path_display(qual)));
+        self.term_import_prefixes.push((owner, qual.clone()));
+    }
+
+    /// Record the object an *inherited* member was imported through.
+    ///
+    /// `import scala.util.Random.nextInt` names a member that `object Random`
+    /// inherits from `class Random`. The name enters the scope, but the
+    /// symbol's owner is the class, so the backend had no receiver to load and
+    /// fell back to `this`: `ClassCastException: class Test$ cannot be cast to
+    /// class scala.util.Random`. Recording the object as this owner's import
+    /// prefix makes [`Self::qualify_term_import`] rewrite the bare name back
+    /// into `scala.util.Random.nextInt`, which is what nsc's own `Select`
+    /// carries.
+    ///
+    /// Unlike [`Self::remember_term_import_prefix`] the prefix is a *path*,
+    /// resolved symbolically by `import_path_syms` and so typically still
+    /// `NoType` here; `qual.sym` is what says it resolved.
+    fn remember_named_import_prefix(&mut self, owner: SymbolId, qual: &Tree) {
+        if owner.is_none() || qual.sym.is_none() {
+            return;
+        }
         self.term_import_prefixes
             .retain(|(o, q)| !(*o == owner && path_display(q) == path_display(qual)));
         self.term_import_prefixes.push((owner, qual.clone()));
@@ -6355,8 +6380,11 @@ impl Typer {
     }
 
     /// `import p.n` / `import p.{n => alias}`.
-    fn import_named(&mut self, owners: &[SymbolId], from: &str, to: &str, span: Span) {
+    fn import_named(&mut self, owners: &[SymbolId], from: &str, to: &str, span: Span, qual: &Tree) {
         let mut entered = false;
+        // Owners of members that came in *inherited* from a superclass of the
+        // object named in the import; see `remember_named_import_prefix`.
+        let mut inherited_through: Vec<SymbolId> = Vec::new();
         for &owner in owners {
             if owner.is_none() {
                 continue;
@@ -6419,7 +6447,21 @@ impl Typer {
             for m in found {
                 self.st.enter_in_current(to, m);
                 entered = true;
+                let mowner = self.st.get(m).owner;
+                if mowner != owner
+                    && !mowner.is_none()
+                    && self.st.get(owner).kind == SymKind::ModuleClass
+                    && !matches!(
+                        self.st.get(mowner).name.as_str(),
+                        "Any" | "AnyRef" | "AnyVal" | "Object"
+                    )
+                {
+                    inherited_through.push(mowner);
+                }
             }
+        }
+        for mowner in inherited_through {
+            self.remember_named_import_prefix(mowner, qual);
         }
         // The two namespaces are separate, and a jar's `type` member leaves no
         // trace in the bytecode: `lookup_member` above can only ever find the
