@@ -146,6 +146,9 @@ impl B {
         EmittedClass {
             internal_name: this_name,
             bytes,
+            // The private runtime is written by hand; none of its methods is
+            // anywhere near the class file format's limits.
+            format_errors: Vec::new(),
         }
     }
 }

@@ -4,6 +4,11 @@
 use crate::classfile::{encode_method_name, Code, ExceptionEntry, Pool, ACC_STATIC};
 use std::collections::BTreeMap;
 
+/// The furthest a 16-bit branch offset reaches, either way. Every branch
+/// except `goto_w`/`jsr_w` carries one (JVMS 6.5).
+const MIN_BRANCH: i64 = i16::MIN as i64;
+const MAX_BRANCH: i64 = i16::MAX as i64;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Label(pub usize);
 
@@ -74,6 +79,16 @@ pub struct Assembler {
     /// generator hands it over with [`Assembler::set_join_class`].
     label_join: Vec<Option<String>>,
     frames: BTreeMap<u16, (Vec<VType>, Vec<VType>)>,
+    /// Verification state at the instruction *after* each conditional branch,
+    /// in emission order.
+    ///
+    /// No conditional branch has a wide form, so one that cannot reach its
+    /// label is rewritten as the inverse branch over a `goto_w` (see
+    /// [`Assembler::widen_jumps`]). That makes the fall-through position a
+    /// branch target, which JVMS 4.7.4 then needs a frame for -- and the state
+    /// there is only known while the branch is being emitted. It is kept here
+    /// and dropped in `finish` unless a rewrite actually happens.
+    cond_frames: Vec<(u16, Vec<VType>, Vec<VType>)>,
     dead: bool,
     /// Byte offset just past the terminator that made the code dead. Everything
     /// emitted from here on is unreachable and is dropped again.
@@ -115,6 +130,7 @@ impl Assembler {
             label_locals: Vec::new(),
             label_join: Vec::new(),
             frames: BTreeMap::new(),
+            cond_frames: Vec::new(),
             dead: false,
             dead_start: None,
             need_frame: false,
@@ -430,6 +446,15 @@ impl Assembler {
         self.emit_op(op);
         self.patches.push((self.bytes.len(), l));
         self.emit_u16(0);
+        if op != 0xa7 && !self.dead {
+            // The fall-through of a conditional branch becomes a branch target
+            // if the branch has to be widened; see `cond_frames`. Recording it
+            // costs one snapshot per conditional branch -- the same order as
+            // `save_label` just below, which every branch already pays.
+            let off = self.bytes.len() as u16;
+            self.cond_frames
+                .push((off, self.vstack.clone(), self.vlocals.clone()));
+        }
         self.save_label(l);
         if let Some(off) = self.labels[l.0] {
             if let (Some(st), Some(loc)) = (
@@ -1141,6 +1166,11 @@ impl Assembler {
         self.patches_i32.retain(|(at, _, _)| *at < start);
         let keep = start as u16;
         self.frames.retain(|&off, _| off <= keep);
+        // `cond_frames` is in emission order, so the dropped tail is a suffix.
+        // A `retain` here would be quadratic: `drop_dead` runs at every label.
+        while self.cond_frames.last().is_some_and(|&(off, ..)| off > keep) {
+            self.cond_frames.pop();
+        }
     }
 
     /// Reachable code starts here again.
@@ -1507,13 +1537,174 @@ Ljava/lang/invoke/CallSite;";
         let _ = self.pop_v();
     }
 
+    /// Rewrite the branches whose 16-bit offset does not reach their label.
+    ///
+    /// `goto` has a wide form (`goto_w`, JVMS 6.5) but no conditional branch
+    /// does, so a conditional that cannot reach becomes the inverse branch
+    /// over a `goto_w` -- which is what nsc emits too, by way of ASM:
+    ///
+    /// ```text
+    ///        ifeq L                ifne SKIP
+    ///                     ==>      goto_w L
+    ///                       SKIP:
+    /// ```
+    ///
+    /// Growing the code moves every offset behind the rewrite, which can put
+    /// a further branch out of reach, so the choice runs to a fixpoint before
+    /// a byte is moved. Each rewrite grows by a multiple of four (padded with
+    /// `nop`s that no path reaches) so that the alignment padding of a
+    /// `tableswitch`/`lookupswitch` never has to change size with it.
+    ///
+    /// A method over 64 KB is left alone: its label offsets have already
+    /// wrapped, and `add_code` rejects it rather than writing it.
+    fn widen_jumps(&mut self) {
+        if self.bytes.len() > crate::classfile::MAX_CODE_LENGTH {
+            return;
+        }
+        // The fast path, and the only cost every other method pays: if all the
+        // offsets reach, there is nothing to do.
+        let mut any = false;
+        for &(at, lab) in &self.patches {
+            let target = self.labels[lab.0].unwrap_or(0) as i64;
+            if !(MIN_BRANCH..=MAX_BRANCH).contains(&(target - (at as i64 - 1))) {
+                any = true;
+                break;
+            }
+        }
+        if !any {
+            return;
+        }
+
+        // (opcode position, label, opcode, widened?), by position.
+        let mut sites: Vec<(usize, usize, u8, bool)> = self
+            .patches
+            .iter()
+            .map(|&(at, lab)| (at - 1, lab.0, self.bytes[at - 1], false))
+            .collect();
+        sites.sort_by_key(|s| s.0);
+
+        // `grown[k]` is how many bytes the first `k` sites add. A position
+        // maps to itself plus what every site *before* it adds, so a label on
+        // a widened branch still lands on that branch's first byte.
+        let mut grown: Vec<usize> = vec![0; sites.len() + 1];
+        let recompute = |sites: &[(usize, usize, u8, bool)], grown: &mut Vec<usize>| {
+            for (k, s) in sites.iter().enumerate() {
+                grown[k + 1] = grown[k] + if s.3 { widened_growth(s.2) } else { 0 };
+            }
+        };
+        let map = |sites: &[(usize, usize, u8, bool)], grown: &[usize], pc: usize| -> usize {
+            pc + grown[sites.partition_point(|s| s.0 < pc)]
+        };
+        loop {
+            recompute(&sites, &mut grown);
+            let mut changed = false;
+            for i in 0..sites.len() {
+                if sites[i].3 {
+                    continue;
+                }
+                let target = self.labels[sites[i].1].unwrap_or(0) as usize;
+                let rel =
+                    map(&sites, &grown, target) as i64 - map(&sites, &grown, sites[i].0) as i64;
+                if !(MIN_BRANCH..=MAX_BRANCH).contains(&rel) {
+                    sites[i].3 = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        recompute(&sites, &mut grown);
+
+        let mut out: Vec<u8> = Vec::with_capacity(self.bytes.len() + grown[sites.len()]);
+        let mut copied = 0usize;
+        for &(op_pc, lab, op, wide) in &sites {
+            out.extend_from_slice(&self.bytes[copied..op_pc]);
+            copied = op_pc + 3;
+            let here = out.len();
+            debug_assert_eq!(here, map(&sites, &grown, op_pc));
+            let target = map(&sites, &grown, self.labels[lab].unwrap_or(0) as usize) as i64;
+            if !wide {
+                out.push(op);
+                out.extend_from_slice(&((target - here as i64) as i16).to_be_bytes());
+            } else if op == 0xa7 {
+                // The `nop`s go *first*. JVMS 4.10.1 wants a frame on the
+                // instruction after an unconditional branch, and padding
+                // behind the `goto_w` would put unreachable `nop`s there
+                // ("Expecting a stack map frame ... @23: nop").
+                out.extend_from_slice(&[0x00, 0x00]); // growth stays 4
+                out.push(0xc8); // goto_w
+                out.extend_from_slice(&((target - (here as i64 + 2)) as i32).to_be_bytes());
+            } else {
+                // The inverse branch skips the `goto_w`, so its target is the
+                // fall-through -- `map(op_pc + 3)`, eleven bytes past `here`.
+                out.extend_from_slice(&[0x00, 0x00, 0x00]); // growth stays 8
+                out.push(invert_branch(op));
+                out.extend_from_slice(&8i16.to_be_bytes());
+                out.push(0xc8); // goto_w
+                out.extend_from_slice(&((target - (here as i64 + 6)) as i32).to_be_bytes());
+            }
+        }
+        out.extend_from_slice(&self.bytes[copied..]);
+        debug_assert_eq!(out.len(), self.bytes.len() + grown[sites.len()]);
+
+        // Everything that names a code offset moves with the code.
+        for l in self.labels.iter_mut().flatten() {
+            *l = map(&sites, &grown, *l as usize) as u16;
+        }
+        for (at, _, op_pc) in self.patches_i32.iter_mut() {
+            *at = map(&sites, &grown, *at);
+            *op_pc = map(&sites, &grown, *op_pc);
+        }
+        let old_frames = std::mem::take(&mut self.frames);
+        for (off, (mut locals, mut stack)) in old_frames {
+            for t in locals.iter_mut().chain(stack.iter_mut()) {
+                if let VType::Uninitialized(at) = t {
+                    *t = VType::Uninitialized(map(&sites, &grown, *at as usize) as u16);
+                }
+            }
+            self.frames
+                .insert(map(&sites, &grown, off as usize) as u16, (locals, stack));
+        }
+        // A widened conditional's fall-through is now a branch target. When a
+        // label already sits there the frame recorded for it is the merge of
+        // *every* path that arrives, so it wins over this one path's state.
+        for &(op_pc, _, op, wide) in &sites {
+            if !wide || op == 0xa7 {
+                continue;
+            }
+            let after = (op_pc + 3) as u16;
+            let Ok(k) = self.cond_frames.binary_search_by_key(&after, |&(o, ..)| o) else {
+                debug_assert!(false, "no fall-through frame for the branch at {op_pc}");
+                continue;
+            };
+            let (_, stack, locals) = self.cond_frames[k].clone();
+            self.frames
+                .entry(map(&sites, &grown, after as usize) as u16)
+                .or_insert((locals, stack));
+        }
+
+        self.bytes = out;
+        // Every 16-bit offset is written above; leave nothing for `finish` to
+        // patch on top of the rewritten code.
+        self.patches.clear();
+    }
+
     pub fn finish(mut self) -> (Code, Pool) {
         // Trailing unreachable code would leave the method without a terminator
         // in the eyes of the verifier ("falls through code end"), so drop it and
         // let the `return`/`athrow` that killed it end the method.
         self.drop_dead();
-        let end = self.bytes.len() as u16;
-        self.frames.retain(|&off, _| off < end);
+        // `end` is a byte count, not an offset: `as u16` used to wrap it for a
+        // method over 64 KB and the `retain` below then threw away nearly
+        // every frame. Such a method is not encodable at all -- `add_code`
+        // reports it -- but it must not be *silently* mangled on the way out.
+        let end = self.bytes.len();
+        self.frames.retain(|&off, _| (off as usize) < end);
+        // Branches whose 16-bit offset does not reach their label are rewritten
+        // here, which moves everything after them; the pass patches every
+        // 16-bit branch itself and clears `patches` when it does anything.
+        self.widen_jumps();
         let copy = self.patches.clone();
         for (at, lab) in copy {
             let target = self.labels[lab.0].unwrap_or(0);
@@ -1619,6 +1810,37 @@ Ljava/lang/invoke/CallSite;";
                 out.extend_from_slice(&off.to_be_bytes());
             }
         }
+    }
+}
+
+/// How many bytes the wide form of `op` adds to the three a short branch takes.
+///
+/// `goto` needs 5 (`goto_w`) and a conditional needs 8 (itself, inverted, plus
+/// a `goto_w`); both are rounded up to a multiple of four with `nop`s so that
+/// a `tableswitch`/`lookupswitch` behind them keeps its alignment padding.
+fn widened_growth(op: u8) -> usize {
+    if op == 0xa7 {
+        4
+    } else {
+        8
+    }
+}
+
+/// The branch that jumps exactly when `op` does not (JVMS 6.5). The pairs are
+/// adjacent: `ifeq`/`ifne`, `iflt`/`ifge`, `ifgt`/`ifle`, the six `if_icmp*`,
+/// the two `if_acmp*`, and `ifnull`/`ifnonnull`.
+fn invert_branch(op: u8) -> u8 {
+    match op {
+        0x99..=0xa6 => {
+            if (op - 0x99).is_multiple_of(2) {
+                op + 1
+            } else {
+                op - 1
+            }
+        }
+        0xc6 => 0xc7,
+        0xc7 => 0xc6,
+        _ => unreachable!("{op:#x} is not a conditional branch"),
     }
 }
 
@@ -1821,4 +2043,116 @@ fn count_params(desc: &str) -> usize {
         }
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asm() -> Assembler {
+        let mut a = Assembler::new(1);
+        a.init_method(ACC_STATIC, "m", "()V", "T");
+        a
+    }
+
+    /// The number of entries in the `StackMapTable` body (JVMS 4.7.4).
+    fn frame_count(code: &Code) -> u16 {
+        let b = code.stack_map.as_ref().expect("a stack map");
+        u16::from_be_bytes([b[0], b[1]])
+    }
+
+    #[test]
+    fn a_branch_that_reaches_is_left_alone() {
+        let mut a = asm();
+        let l = a.fresh_label();
+        a.iconst(0);
+        a.ifeq(l);
+        for _ in 0..100 {
+            a.nop();
+        }
+        a.mark(l);
+        a.vreturn();
+        let (code, _) = a.finish();
+        assert_eq!(code.bytes.len(), 1 + 3 + 100 + 1);
+        assert_eq!(code.bytes[1], 0x99, "still a plain `ifeq`");
+        assert_eq!(&code.bytes[2..4], &[0x00, 103]);
+        assert_eq!(frame_count(&code), 1, "only the branch target needs one");
+    }
+
+    #[test]
+    fn a_conditional_that_cannot_reach_is_inverted_over_goto_w() {
+        let mut a = asm();
+        let l = a.fresh_label();
+        a.iconst(0);
+        a.ifeq(l);
+        for _ in 0..40_000 {
+            a.nop();
+        }
+        a.mark(l);
+        a.vreturn();
+        let (code, _) = a.finish();
+        assert_eq!(code.bytes.len(), 1 + 11 + 40_000 + 1);
+        assert_eq!(&code.bytes[1..4], &[0x00, 0x00, 0x00], "alignment padding");
+        assert_eq!(code.bytes[4], 0x9a, "`ifne`, the inverse of `ifeq`");
+        assert_eq!(&code.bytes[5..7], &[0x00, 8], "over the `goto_w`");
+        assert_eq!(code.bytes[7], 0xc8, "`goto_w`");
+        let target: i32 = 1 + 11 + 40_000;
+        assert_eq!(&code.bytes[8..12], &(target - 7).to_be_bytes());
+        // The fall-through of the inverse branch is a branch target now, so it
+        // takes a frame of its own on top of the one the label already had.
+        assert_eq!(frame_count(&code), 2);
+    }
+
+    #[test]
+    fn a_goto_that_cannot_reach_becomes_goto_w() {
+        let mut a = asm();
+        let top = a.fresh_label();
+        a.mark(top);
+        for _ in 0..40_000 {
+            a.nop();
+        }
+        a.goto(top);
+        let (code, _) = a.finish();
+        assert_eq!(code.bytes.len(), 40_000 + 7);
+        assert_eq!(&code.bytes[40_000..40_002], &[0x00, 0x00], "padding first");
+        assert_eq!(code.bytes[40_002], 0xc8);
+        assert_eq!(&code.bytes[40_003..40_007], &(-40_002i32).to_be_bytes());
+        assert_eq!(frame_count(&code), 1);
+    }
+
+    /// Widening one branch moves the code behind it, which can put a branch
+    /// that *did* reach out of range. The choice has to run to a fixpoint.
+    #[test]
+    fn widening_cascades() {
+        // `back` is at 0 and `top` at 1000. The inner branch at 33_000 reaches
+        // back past -32768 and is widened; that pushes the outer branch at
+        // 33_768 -- whose offset to `top` is exactly -32768, the last one that
+        // still fits -- eight bytes further away.
+        let mut a = asm();
+        let back = a.fresh_label();
+        let top = a.fresh_label();
+        a.mark(back);
+        for _ in 0..1000 {
+            a.nop();
+        }
+        a.mark(top);
+        for _ in 0..31_999 {
+            a.nop();
+        }
+        a.iconst(0); // 32_999
+        a.ifeq(back); // 33_000, offset -33_000: does not reach
+        for _ in 0..764 {
+            a.nop();
+        }
+        a.iconst(0); // 33_767
+        a.ifne(top); // 33_768, offset -32_768: reaches, until the above widens
+        a.vreturn();
+        let (code, _) = a.finish();
+        assert_eq!(code.bytes[33_003], 0x9a, "the inner `ifeq`, inverted");
+        assert_eq!(code.bytes[33_006], 0xc8);
+        assert_eq!(code.bytes[33_779], 0x99, "the outer `ifne`, inverted");
+        assert_eq!(code.bytes[33_782], 0xc8);
+        // 33_772 bytes before the rewrite, plus eight for each of the two.
+        assert_eq!(code.bytes.len(), 33_772 + 8 + 8);
+    }
 }
