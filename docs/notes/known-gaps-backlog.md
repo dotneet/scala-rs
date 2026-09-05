@@ -967,15 +967,53 @@ of most of these notes.
   fall-through resolves correctly. So it is the *catch* type's resolution, not
   the class: `runtime.rs` does emit `scala/MatchError`.
 
-- **`implicitly[X]`'s result is selected from without a `checkcast`, and the
-  JVM rejects the class** (found by `agent/slickimplicit` while building a
-  fixture; not fixed). `implicitly[Box[String]].show` is enough to reproduce
-  it. A hand-written `def summon[T](implicit e: T): T` emits the cast and
-  works, so this is specific to `Predef.implicitly` — presumably the shortcut
-  that types it does not go through the path that inserts the receiver cast.
+- ~~**`implicitly[X]`'s result is selected from without a `checkcast`, and the
+  JVM rejects the class**~~ (found by `agent/slickimplicit` while building a
+  fixture; fixed in `agent/implicitcast`). The guess recorded here — a
+  receiver-cast path `Predef.implicitly` did not go through — was wrong twice
+  over. It is not the *receiver* cast (a `putfield` into a field of that type
+  fails just as readily, and that is what the reported fixture actually did),
+  and it is not specific to `implicitly`: `gen_predef_poly` serves `identity`
+  and `locally` too and coerced none of them. All three erase to
+  `(Object)Object`, and the result now goes through
+  `maybe_unbox_erased_result` like any other erased call site.
+
+  `implicitly[Box[String]].show` was **not** enough to reproduce it: `Box` is
+  a trait there, and the JVM verifier does not check interface types, so that
+  program links and runs with no cast at all. The reporting fixture's type was
+  a `class`. Two hiding places in one call site — see
+  `docs/notes/codegen-and-stackmap-frames.md`.
 
   Worth noticing what caught it: the verifier. Not the type checker, not the
   corpus, not any of the four project measures — a fixture happened to select
   a member off an `implicitly` result and the class would not load. The slice
   wrote around it with `summon` rather than leaving a fixture that could not
   run, and said so.
+
+- ~~**`w match { case Wrapped(x) => … }` on a value-class scrutinee is a
+  `VerifyError: Bad local variable type`**~~ and ~~**`Wrapped.unapply(w)`
+  called explicitly is a `NoSuchMethodError`**~~ (both fixed in
+  `agent/implicitcast`; see `docs/notes/codegen-and-stackmap-frames.md`). The
+  two were one story: `unapply` was deliberately left unemitted because the
+  *pattern* path handed the extractor a box, and fixing the pattern — an
+  unboxed value-class scrutinee is a plain binding, no `instanceof` — removed
+  the only caller that disagreed with nsc's `unapply(int)` descriptor.
+
+  Still open on this path:
+
+  - **A value class over a *reference* type is broken before pattern matching
+    even starts.** `final case class WS(s: String) extends AnyVal` throws
+    `ClassCastException: class WS cannot be cast to class java.lang.String` at
+    the *call site* of `m(WS("a"))`, in both modes, on a tree that never
+    mentions a pattern. The pattern fix is restricted to value classes over
+    primitives, and cannot be extended as it stands: it reads `JvmSort`, and a
+    `WS` scrutinee and a boxed one are both `Ref`.
+  - **An extractor sub-pattern may name a type the field cannot hold.** `case
+    P(s: String)` where `P`'s field is an `Int` compiles; scalac says
+    `scrutinee is incompatible with pattern type`. Not specific to value
+    classes (`case class P(u: Int)` is enough), and a typer gap.
+
+- **The private runtime's `Some` has no case-class `toString`.**
+  `println(Some(3))` prints `scala.Some@…` under `--no-scala-library` where
+  both the jar mode and real scalac print `Some(3)`. Found while writing a
+  fixture that printed an `Option`; the fixture prints `.get` instead.
