@@ -589,6 +589,27 @@ impl Typer {
                         }
                     }
                 }
+            } else if !matches!(pt, Type::Function { .. } | Type::Method { .. }) {
+                // The set may still have exactly one alternative whose
+                // parameters are all implicit, which value position keeps for
+                // the same reason it keeps a nullary one -- see
+                // `implicit_only_alternative`. `maybe_auto_apply` cannot see
+                // it, because a `Type::Method` carries parameter types and no
+                // `implicit` flag. The `pt` guard is that function's own: a
+                // method or function expectation is not value position.
+                if let Some(id) = self.implicit_only_alternative(&alts) {
+                    if let Some((_, t)) = alts.iter().find(|(s, _)| *s == id) {
+                        tree.ty = t.clone();
+                    }
+                    tree.sym = id;
+                    if id != found[0] {
+                        self.overload_member_types.insert(id.0, alts);
+                        self.record_overload_group(&found, &name);
+                        if let Some(g) = self.overload_groups.get(&found[0].0).cloned() {
+                            self.overload_groups.insert(id.0, g);
+                        }
+                    }
+                }
             }
         }
         // A function value's `apply` is the function itself. The prelude's
