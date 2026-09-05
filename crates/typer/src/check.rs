@@ -8411,39 +8411,37 @@ impl Typer {
     /// name resolves to nothing at all, and enters exactly what completion
     /// installed.
     fn expose_from_binary_self_type(&mut self, name: &str) {
-        let owners = [self.st.this_class];
-        for owner in owners {
-            let Some(st) = self.st.get(owner).self_type.clone() else {
+        let owner = self.st.this_class;
+        let Some(st) = self.st.get(owner).self_type.clone() else {
+            return;
+        };
+        // A compound self type offers the members of every part.
+        let roots: Vec<Type> = match &st {
+            Type::Refined { parents, .. } => parents.clone(),
+            other => vec![other.clone()],
+        };
+        for root in roots {
+            let Some(sc) = self.st.class_sym_of(&root) else {
                 continue;
             };
-            // A compound self type offers the members of every part.
-            let roots: Vec<Type> = match &st {
-                Type::Refined { parents, .. } => parents.clone(),
-                other => vec![other.clone()],
-            };
-            for root in roots {
-                let Some(sc) = self.st.class_sym_of(&root) else {
-                    continue;
-                };
-                if sc == owner {
-                    continue;
-                }
-                // `complete_named` serves a `-cp` class only once it has been
-                // adopted, and nothing adopts a class the program only ever
-                // names in a self type. Without this, `complete` skipped the
-                // self type's *own* declarations and looked at its ancestors
-                // only -- and `column` is declared on `Table` itself.
-                self.pickle
-                    .adopt_binary_class(&mut self.st, &mut self.binary, sc);
-                let found = self
-                    .pickle
-                    .complete(&mut self.st, &mut self.binary, sc, name);
-                for id in found {
-                    self.st.enter_in_current(name, id);
-                }
-                if !self.st.lookup(name).is_empty() {
-                    return;
-                }
+            if sc == owner {
+                continue;
+            }
+            // `complete_named` serves a `-cp` class only once it has been
+            // adopted, and nothing adopts a class the program only ever
+            // names in a self type. Without this, `complete` skipped the
+            // self type's *own* declarations and looked at its ancestors
+            // only -- and `column` is declared on `Table` itself.
+            self.pickle
+                .adopt_binary_class(&mut self.st, &mut self.binary, sc);
+            let found = self
+                .pickle
+                .complete(&mut self.st, &mut self.binary, sc, name);
+            for id in found {
+                self.st.enter_in_current(name, id);
+            }
+            if !self.st.lookup(name).is_empty() {
+                return;
             }
         }
     }
