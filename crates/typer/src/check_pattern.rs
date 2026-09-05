@@ -69,6 +69,36 @@ impl Typer {
     /// `::` is entered both as the class `$colon$colon` and as an alias symbol
     /// carrying its type. Patterns need the real class, which holds the
     /// constructor fields.
+    /// The class a **qualified** constructor pattern (`p.C(x)`) names, read
+    /// off the already-typed callee rather than by looking its last segment up
+    /// in the lexical scope.
+    ///
+    /// `None` for a bare `Ident`, which the lexical lookup handles, and for a
+    /// callee that resolved to something other than a class or its companion
+    /// -- an `unapply` reached through a value, say -- where the extractor
+    /// arms are the ones that apply.
+    fn qualified_pattern_class(&self, fun: &Tree) -> Option<SymbolId> {
+        if !matches!(fun.kind, TreeKind::Select { .. }) || fun.sym.is_none() {
+            return None;
+        }
+        match self.st.get(fun.sym).kind {
+            SymKind::Class => Some(self.follow_class_alias(fun.sym)),
+            SymKind::Module | SymKind::ModuleClass => {
+                let mcls = self.st.module_class_of(fun.sym);
+                let base = self.st.get(mcls).name.trim_end_matches('$').to_string();
+                let owner = self.st.get(mcls).owner;
+                self.st
+                    .get(owner)
+                    .members
+                    .iter()
+                    .copied()
+                    .find(|&m| self.st.get(m).kind == SymKind::Class && self.st.get(m).name == base)
+                    .map(|c| self.follow_class_alias(c))
+            }
+            _ => None,
+        }
+    }
+
     fn follow_class_alias(&self, id: SymbolId) -> SymbolId {
         if !self.st.get(id).ctor_fields.is_empty() {
             return id;
@@ -324,35 +354,49 @@ impl Typer {
                 // binding the name *at all*, so a `def Tuple2` in scope hid
                 // the class here even though it is not a class.
                 let scala_ref = fun.scala_ref;
-                let class_id = fun.name().and_then(|n| {
-                    let mut cands = if scala_ref {
-                        self.st.lookup_scala(n)
-                    } else {
-                        self.st.lookup(n)
-                    };
-                    // `lookup` stops at the innermost scope binding the name at
-                    // all, and a *method* of that name is not a constructor
-                    // pattern in nsc's `typingConstructorPattern` mode. cats'
-                    // `NonEmptyList` declares `def ::[AA >: A](a: AA)`, which
-                    // hid the case class `scala.::` from every `case h :: t`
-                    // in the class body -- five "not found: extractor ::" in
-                    // one file. Same rule `type_ident` already applies to the
-                    // pattern's function; see `SymbolTable::lookup_extractor`.
-                    if ctor_pat
-                        && !cands.is_empty()
-                        && cands
-                            .iter()
-                            .all(|&s| self.st.get(s).kind == SymKind::Method)
-                    {
-                        let alt = self.st.lookup_extractor(n);
-                        if !alt.is_empty() {
-                            cands = alt;
+                // A *qualified* pattern names its class outright, and `fun`
+                // has just been typed, so take the class from the symbol it
+                // resolved to. Looking the last segment up lexically instead
+                // finds whatever else is in scope under that simple name:
+                // `case Ior.Left(a)`, which cats writes 76 times in
+                // `data/Ior.scala`, found the prelude's `scala.util.Left` and
+                // bound `a` to *its* type parameter. Harmless while
+                // `scala.util.Left` carried no `CASE` flag, because the wrong
+                // class then lost to the extractor arm below; giving the
+                // prelude the flag the library pickles made it win.
+                let class_id = self.qualified_pattern_class(fun).or_else(|| {
+                    fun.name().and_then(|n| {
+                        let mut cands = if scala_ref {
+                            self.st.lookup_scala(n)
+                        } else {
+                            self.st.lookup(n)
+                        };
+                        // `lookup` stops at the innermost scope binding the name
+                        // at all, and a *method* of that name is not a
+                        // constructor pattern in nsc's
+                        // `typingConstructorPattern` mode. cats' `NonEmptyList`
+                        // declares `def ::[AA >: A](a: AA)`, which hid the case
+                        // class `scala.::` from every `case h :: t` in the class
+                        // body -- five "not found: extractor ::" in one file.
+                        // Same rule `type_ident` already applies to the
+                        // pattern's function; see
+                        // `SymbolTable::lookup_extractor`.
+                        if ctor_pat
+                            && !cands.is_empty()
+                            && cands
+                                .iter()
+                                .all(|&s| self.st.get(s).kind == SymKind::Method)
+                        {
+                            let alt = self.st.lookup_extractor(n);
+                            if !alt.is_empty() {
+                                cands = alt;
+                            }
                         }
-                    }
-                    cands
-                        .into_iter()
-                        .find(|s| self.st.get(*s).kind == SymKind::Class)
-                        .map(|s| self.follow_class_alias(s))
+                        cands
+                            .into_iter()
+                            .find(|s| self.st.get(*s).kind == SymKind::Class)
+                            .map(|s| self.follow_class_alias(s))
+                    })
                 });
                 if class_id.is_some() {
                     self.reorder_named_pattern_args(args, class_id.unwrap());
