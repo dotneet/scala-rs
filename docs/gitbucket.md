@@ -88,7 +88,7 @@ path of your own.**
 | roots 22 and 23 | 353 | 1 | **1587** | 185 | 0 |
 | roots 24 and 25, the self type | 353 | 1 | **1443** | 185 | 0 |
 | main at `236de45` (`tests/BASELINE.md`) | 353 | 1 | **1399** | 185 | 0 |
-| Now (root 26, a case class's static mirror forwarder) | 353 | 1 | **1294** | 135 | 0 |
+| Now (root 26, a case class's static mirror forwarder) | 353 | 1 | **1295** | 135 | 0 |
 
 Every row after the second was measured on the same tree, with the same
 material, one binary each -- `SCALA_RS=<binary> tests/gitbucket_measure.sh`
@@ -1201,7 +1201,7 @@ on demand — `scala.collection.mutable.PriorityQueue` is one
 (`tests/fixtures/ws_selflib.scala`) — and root 25 needs no jar at all, because
 what breaks there is the pass order (`tests/fixtures/ws_selfimport.scala`).
 
-### 26. A case class's static mirror forwarder was read as an inherited member — 105 errors (typer)
+### 26. A case class's static mirror forwarder was read as an inherited member — 104 errors (typer)
 
 The largest single template symptom in the "remaining" table below,
 `ambiguous overload for datetimeago with arguments (Date)` (53), was filed
@@ -1243,10 +1243,40 @@ which this one is not, since it is generic in the *class's own* `T`/`F` and so
 carries a `Signature`. It was entered as an ordinary instance member of
 `BaseScalaTemplate`, inheritable like any other. `datetimeago`'s own `apply`
 (the only one the template source writes) then had a same-named, same-arity
-competitor for `datetimeago(date)` -- the sugar for `datetimeago.apply(date)`
--- reachable through inheritance from `BaseScalaTemplate`, and overload
-resolution could not tell them apart: `ambiguous overload for apply with
-arguments (Date)`.
+competitor -- reachable through inheritance from `BaseScalaTemplate` -- and
+overload resolution could not tell them apart.
+
+**First attempt, and why it was wrong.** The obvious fix is to stop
+`fill_java_members` from installing an `ACC_STATIC` method of a Scala class
+file at all: Scala has no real static members, so it can only be a mirror
+forwarder, and the module symbol supplies the same name from its own pickle
+independently. That measured the same gitbucket win (1399 → 1294) and passed
+every fixture in this file -- and then broke `cargo test --workspace`, two
+failures in `final2.rs`: `value fromFuture is not a member of IO`. `IO.apply`
+and `IO.fromFuture` are read the *same* way `datetimeago`'s phantom competitor
+was: `cats.effect.IO`'s own class file carries a static mirror forwarder for
+its companion's `apply` (root `final2`'s item 3, `Checker::
+retry_module_apply_from_pickle`), and *that* one is load-bearing -- removing
+every static outright starved the on-demand pickle path of the erased
+placeholder it corrects. `cargo test --workspace` is the check that caught
+it; nothing narrower would have (`final2.rs` is nowhere near `crates/cli/
+tests/twirl.rs`).
+
+**The distinction that actually separates the two.** A static mirror
+forwarder selected through the *exact* class/module it is declared on is
+what it is for (`cats.effect.IO.apply(...)`); one reached only because a
+*subclass* inherited it from that ancestor is not (nsc: "static Java members
+belong to companion objects in Scala; they are not inherited" -- the same
+rule already enforced in `Check::type_select` for genuine Java statics turns
+out to cover this bytecode-only Scala shape too). The fix is owner-aware
+instead of blanket:
+[`check_overload::not_inherited_static`](../crates/typer/src/check_overload.rs)
+keeps a static candidate only when its `owner` is the class actually being
+asked about, and is applied at the two places an "apply" candidate set is
+built straight from a `Type::Class` / `Type::ModuleRef` receiver
+(`Checker::resolve_overload_with`) as well as folded into the existing
+Java-static filter in `Check::type_select`. `crates/typer/src/classpath.rs`
+is back to what it was before this slice.
 
 The fifteen-line reproduction needs no gitbucket checkout, no Twirl, and no
 scala-library jar beyond what a hand-written case class and object already
@@ -1264,28 +1294,41 @@ object datetimeago extends BaseScalaTemplate[Html, Format[Html]](HtmlFormat)
 object Main { def main(a: Array[String]): Unit = println(datetimeago("hi").body) }
 ```
 
-`is_scala_static_mirror_forwarder` (`crates/typer/src/classpath.rs`) now skips
-every `ACC_STATIC` method of a *Scala*-compiled class file: Scala has no real
-static members, so any one scalac writes into a class file is JVM-interop
-bytecode the pickle does not mention, whether it is generic (this shape) or
-erased (already covered). Nothing is lost -- a selection on the companion
-itself (`BaseScalaTemplate.apply(fmt)`, or the `apply` sugar on it) resolves
-through the *module* symbol, which is completed from `BaseScalaTemplate$`'s
-own pickle independently of the class's member list.
+That reproduction alone did not catch the difference between the two
+shapes -- it is a bare `object`, so `datetimeago(date)` never resolves the
+callee as anything but `Type::ModuleRef`. What did was a **second**, more
+faithful reproduction: two files, the template in one package and the caller
+reaching it through a fully-qualified path from another
+(`twp.datetimeago(d)`, gitbucket's actual shape at all 53 sites). A bare
+`datetimeago(date)` in the same file goes through a different rewrite
+(`Checker::rewrite_receiver_apply` inserts an explicit `.apply` `Select`,
+which reaches `Check::type_select`'s ordinary member search) than a qualified
+`pkg.datetimeago(date)` (that rewrite declines a `Select` receiver outright,
+so `resolve_overload_with` builds the "apply" candidate set itself, straight
+from the `Type::ModuleRef`) -- two independent code paths for what looks like
+one call shape, and the bug lived in the second one. Fixing only the first
+(`type_select`) left the qualified case, and every real gitbucket call site,
+unchanged, which is what the first gitbucket measurement after that fix
+alone quietly proved (**no** movement in the actual number, caught before
+trusting the fixture-only result).
 
 This is a general fix, not a Twirl-specific one: it is worth far more than the
 53 `datetimeago` diagnostics the survey counted, because **every** Twirl
 template with a defaulted trailing parameter had the same phantom competitor,
 each under its own helper's name (`ambiguous overload for X with arguments
 (...)`, one row per helper rather than one big `datetimeago` row). Measured on
-`tests/gitbucket_measure.sh`: **1399 → 1294 errors, 185 → 135 files with
+`tests/gitbucket_measure.sh`: **1399 → 1295 errors, 185 → 135 files with
 errors** -- `ambiguous overload for datetimeago` goes from 53 to 0, and so does
 every other Twirl helper's version of it; the 5 remaining `ambiguous overload`
 lines are jgit's `getRefsByPrefix` and javax.mail's `addTo`/`addBcc`, unrelated.
 slick (`errors=0 classes=1490`), cats (752) and the scala library (1653) are
-unchanged. `tests/slick_run.sh` and the scala/scala corpus's `pos`/`neg`
-(full) were run and are unaffected; codegen was not touched, so
-`tests/slick_subset.sh` is a formality here, not a risk.
+unchanged. `tests/slick_run.sh` (`progs=12 ok=12`, 36/36 attempts),
+`tests/slick_subset.sh` (`classes=1490 verified=1490 failed=0`),
+`tests/spec_classfiles.sh` (unchanged ledger) and the scala/scala corpus's
+`pos` (1048) / `neg` (659), run in full, all match `tests/BASELINE.md`
+exactly -- and `cargo test --workspace --release` is green, including
+`final2.rs`'s cats-effect corners, which is the whole point after the false
+start above.
 
 #### `Query[G, T, Seq]` (and `Query[TableClass, Any, Seq]`) is not this root
 
@@ -1362,7 +1405,7 @@ now. The head is scalatra's overload sets and the Twirl templates.
 |---|---|---|
 | **79** | `no implicit … CanBeQueryCondition[Any]` | `q.filter(t => …)` where the literal's body still did not type, so `filter`'s `T` came out `Any`. Was 187; what is left is downstream of the wildcard self type below, not a root of its own. |
 | **53** | `unimplemented syntax: named arguments (method parameters not resolved)` | Named arguments where the callee did not resolve. |
-| ~~53~~ | ~~`ambiguous overload for datetimeago with arguments (Date)`~~ | **Done -- root 26 above, and for a different reason than this row says.** The argument is a bare `Date`, not a function literal; the ambiguity was `BaseScalaTemplate`'s own case-class static mirror forwarder read as an inherited member, not "something inherited" from `TemplateN` (`TemplateN` declares only `render`). Worth 105 here, not 53: every other Twirl helper with a defaulted trailing parameter had the identical phantom competitor under its own name. |
+| ~~53~~ | ~~`ambiguous overload for datetimeago with arguments (Date)`~~ | **Done -- root 26 above, and for a different reason than this row says.** The argument is a bare `Date`, not a function literal; the ambiguity was `BaseScalaTemplate`'s own case-class static mirror forwarder read as an inherited member, not "something inherited" from `TemplateN` (`TemplateN` declares only `render`). Worth 104 here, not 53: every other Twirl helper with a defaulted trailing parameter had the identical phantom competitor under its own name. |
 | **44** | `ambiguous overload for apply$default$N with arguments ()` | A default getter that two overloads both own. |
 | **43 / 28 / 22 / 13** | `value get / update / getOrElse is not a member of <overload …>` | scalatra: a pickled *declaration* cannot be told from a definition, so the overload set keeps both. See 1 below. |
 | **37 / 28 / 23** | `no implicit … BaseTypedType[AnyRef] / TypedType[Date] / BasicBackend.Session` | slick, in `BasicTemplate.scala`'s `self: Table[?] =>`: a wildcard self type does not offer the table's members. See 2 below. |

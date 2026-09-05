@@ -149,13 +149,30 @@ impl Typer {
         // is an error in scalac, and letting statics through here is not merely
         // lax: `java.lang.Integer.max(int,int)` competed with `RichInt.max` for
         // `1.max(2)` and left the extension search with no winner.
+        //
+        // "Not inherited" also covers a *Scala* class's own static: scalac
+        // mirrors every accessible companion-object member onto the class's
+        // own file as a static forwarder (so Java can write `C.member(...)`
+        // instead of `C$.MODULE$.member(...)`), and `fill_java_members`
+        // installs it exactly like a real member. Selecting it through the
+        // class/module it is declared on is exactly what the forwarder is
+        // for (`cats.effect.IO.apply(...)`/`.fromFuture(...)`, read this way
+        // before the on-demand pickle path -- `retry_module_apply_from_pickle`
+        // -- gets a chance to refine it). Selecting it because a *subclass*
+        // inherited it from that ancestor is not: `object datetimeago
+        // extends BaseScalaTemplate[...](fmt)` (a case class) inherits
+        // `BaseScalaTemplate`'s companion's static `apply` alongside its own
+        // written `apply`, and every Twirl template with a defaulted
+        // trailing parameter had the two competing -- "ambiguous overload
+        // for apply with arguments (Date)", `docs/gitbucket.md` root 26.
         let instance_receiver = !self.is_type_qualifier(qual);
         if found.is_empty() {
             if let Some(o) = self.st.class_sym_of(&recv_ty) {
                 found = self.st.lookup_member(o, &name);
-                if instance_receiver {
-                    found.retain(|&m| !self.st.get(m).flags.contains(Flags::STATIC));
-                }
+                found.retain(|&m| {
+                    !instance_receiver || !self.st.get(m).flags.contains(Flags::STATIC)
+                });
+                found.retain(|&m| crate::check_overload::not_inherited_static(&self.st, m, o));
                 if found.is_empty() && matches!(&recv_ty, Type::Class { .. } | Type::ModuleRef(_)) {
                     // `asList(...).size()`: the receiver type is a Java stub until
                     // the classfile is completed. `qual.sym` is the method, not List.
@@ -163,9 +180,10 @@ impl Typer {
                     // are not shadowed by `java.lang.String` / `Character` overloads.
                     self.ensure_java_loaded(o, tree.span);
                     found = self.st.lookup_member(o, &name);
-                    if instance_receiver {
-                        found.retain(|&m| !self.st.get(m).flags.contains(Flags::STATIC));
-                    }
+                    found.retain(|&m| {
+                        !self.st.get(m).flags.contains(Flags::STATIC)
+                            || (!instance_receiver && self.st.get(m).owner == o)
+                    });
                 }
             }
         }

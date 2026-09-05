@@ -1370,46 +1370,9 @@ fn is_erased_scala_forwarder(
     c.is_scala && m.signature.is_none() && m.name != "<init>" && !st.get(owner).tparams.is_empty()
 }
 
-/// A `static` method on a *Scala*-compiled class file is never a real member
-/// in nsc's own model: Scala has no static members, so any `ACC_STATIC`
-/// method scalac writes into a class file is JVM-interop bytecode that the
-/// pickle (the class's real, pre-erasure shape) does not mention at all.
-///
-/// The two shapes this covers:
-///
-/// * A **mirror forwarder** for a same-named companion object's members, so
-///   Java code can write `C.member(...)` instead of `C$.MODULE$.member(...)`.
-///   `case class BaseScalaTemplate[T, F](format: F)`'s companion synthesizes
-///   `apply`/`unapply`, and *both* get a static forwarder of the same name on
-///   `BaseScalaTemplate.class` -- generic in the class's own `T`/`F`, so
-///   [`is_erased_scala_forwarder`]'s "no `Signature`" test does not catch it.
-/// * A field-backed constant getter forwarder, same idea, for a `val` on the
-///   companion.
-///
-/// Installing one as a member of the *class* symbol used to make it
-/// inheritable: `object datetimeago extends BaseScalaTemplate[...](fmt)`
-/// declares its own `def apply(date: Date, recentOnly: Boolean = true): ...`,
-/// and with the forwarder also on `BaseScalaTemplate`'s member list,
-/// `datetimeago(date)` had two `apply` candidates and was "ambiguous
-/// overload for apply with arguments (Date)" -- Twirl generates this exact
-/// shape for every template with a defaulted trailing parameter (gitbucket's
-/// `datetimeago` helper, 53 call sites). The forwarder is not lost: a
-/// selection on the companion itself (`BaseScalaTemplate.apply(fmt)`, or the
-/// sugar `BaseScalaTemplate(fmt)`) resolves through the module symbol, which
-/// is completed from `BaseScalaTemplate$`'s own pickle, independently of this.
-fn is_scala_static_mirror_forwarder(
-    c: &crate::javaclass::JavaClass,
-    m: &crate::javaclass::JavaMethod,
-) -> bool {
-    c.is_scala && m.name != "<init>" && crate::javaclass::is_java_static(m.access)
-}
-
 fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass::JavaClass) {
     for m in &c.methods {
         if is_erased_scala_forwarder(st, owner, c, m) {
-            continue;
-        }
-        if is_scala_static_mirror_forwarder(c, m) {
             continue;
         }
         if let Some(id) = existing_java_method(st, owner, m) {
