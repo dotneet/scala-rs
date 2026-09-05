@@ -993,6 +993,70 @@ built before it does the same), and it is a wrong *answer* rather than a
 missing diagnostic, which puts it in [pile one](#pile-one-we-are-wrong-237).
 `implicitly[ClassTag[X]]` is unaffected, which is why the fixture uses it.
 
+## The value-class restrictions, added (2026-09-05, `agent/valueclass`)
+
+`neg/valueclasses` is thirty lines that are nothing but SLS 5.1.7 / SIP-15
+violations, and we compiled it to 33 class files without a diagnostic. It was
+in bucket **a** — accepted with no word — and it only became visible when
+`@specialized` stopped being a parse error: line 29 of that file carries one,
+and the parse error had been standing in for all fifteen checks.
+
+`crates/typer/src/valueclass.rs` is nsc's `Typers.validateDerivedValueClass`.
+Its module header carries the reasoning; three things in it were read off nsc
+or off a measurement rather than assumed, and each one would have been a
+regression:
+
+* **The parameter rules read the symbol's flags, not the written modifiers.**
+  The namer has already applied nsc's two rules about what a constructor
+  parameter *becomes* — a bare one is `private[this]`, and a `case class`
+  makes all of them public `val`s. Reading the modifiers instead cost cats one
+  false diagnostic (817, back to 816) on `final case class
+  ShowInterpolator(_sc: StringContext) extends AnyVal`.
+* **The nine primitive value classes are exempt** from the parameter rules, as
+  in nsc (`isPrimitiveValueClass`). `src/library`'s own `final abstract class
+  Int private extends AnyVal` has no parameter at all, and
+  `tests/scalalib_measure.sh` is the check that says so.
+* **A `trait` gets one message, not two.** Nothing in
+  `validateDerivedValueClass` returns early, and a trait also fails the
+  one-val-parameter rule; the filter is in the *reporter*
+  (`FilteringReporter.duplicateOk`: "after an error, no further messages at
+  that position are issued"). Reproducing that compiler-wide would touch every
+  diagnostic, so it is reproduced over this check's own output.
+
+Only the eight messages `neg/valueclasses.check` records are implemented. The
+rest of nsc's `checkEphemeral` — nested class / trait / object, secondary
+constructor, redefined `equals` / `hashCode`, qualified `super`, a body
+statement that is not a definition — is not; see `docs/not-implemented.md`.
+`neg/valueclasses-impl-restrictions` is still rejected for a different reason
+(`no matching overload for String`), not for those.
+
+Measured on `main` at `b82b5a2`, both columns from the same tree:
+
+| | before | after |
+|---|---|---|
+| `pos` full | 1045 | **1045** |
+| `neg` **T0** any error, full | 655 | **658** |
+| `neg` **T1** expected messages reproduced | 121 | **123** |
+| `neg` **T2** … at the expected line | 116 | **118** |
+| `neg` **T3** … and nothing extra | 95 | **97** |
+
+The three `neg` gains are `valueclasses`, `t6357` and `anyval-anyref-parent`;
+nothing was lost. The first two are T3 — every message scalac writes, at its
+line, and nothing else. `anyval-anyref-parent` is not, because three of the six
+diagnostics scalac reports there (`Any does not have a constructor`, two
+`illegal inheritance; superclass …`) are still missing.
+
+The four project measurements, which is what a rejection rule has to be judged
+on, are all unchanged: slick `files=184 errors=0 files_with_errors=0
+classes=1490`, `slick_run.sh` `progs=12 ok=12 attempts=36/36`, cats `816 / 107`,
+gitbucket `1736 / 185`, `src/library` `1653 / 171`. `tests/spec_classfiles.sh`
+is unchanged as well (`tests=37 match=2 differ=26 no_compile=9`).
+
+One extra check, because this is a rejection rule and the four measures above
+do not contain many value classes: every corpus `pos/` and `run/` source that
+mentions `extends AnyVal` — 131 files, all of which scalac accepts — was
+compiled and grepped for the eight new messages. **Zero hits.**
+
 ## What would move the number most
 
 0. **`@specialized`, for real.** With `run` now classified, this is the
