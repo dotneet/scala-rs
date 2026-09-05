@@ -1596,6 +1596,139 @@ type-checked before: `value issueId is not a member of Nothing` 14 → 15,
 slick (`errors=0 classes=1490`) is unchanged; cats fell 752 → 748 and the
 scala library 1653 → 1652.
 
+### 31. A candidate parameter paired with an unsolved call-site one — 34 errors (typer)
+
+Root 27 closed the case where a candidate's own type parameter stands opposite
+a *wildcard* in the wanted type. This is the other half: it stands opposite a
+type parameter the **call site** has not settled either.
+
+slick's second `Shape` witness is
+
+```text
+AbstractTable.tableShape[Level <: ShapeLevel, T, C <: AbstractTable[_]]
+  (implicit ev: C <:< AbstractTable[T]): Shape[Level, C, T, C]
+```
+
+and it answers every `q.map(a => a)`, every `q.map(a => (a, a.age))`, and every
+join whose shape mentions a table. `Query.map[F, G, T](f: E => F)(implicit
+shape: Shape[_ <: FlatShapeLevel, F, T, G]): Query[G, T, C]` leaves `T` and `G`
+to the search, so the wanted type is
+`Shape[_ <: FlatShapeLevel, Accounts, ?T, ?G]`.
+
+Unifying the candidate's result with that settles `Level`, `C := Accounts` and
+`?G := Accounts` — and pairs the candidate's own `T` with the call site's `?T`,
+neither of them known. `implicit_solve` then fell back to its one-sided guess,
+which answers `T := ?T`, and reported the candidate **solved**. The clause
+check that follows therefore asked for `Accounts <:< AbstractTable[?T]` with
+`?T` a free type parameter — a shape no witness can ever match — and every one
+of these was "could not find implicit value of type `Shape[_ <:
+FlatShapeLevel, Accounts, T, G]`".
+
+`Typer::implicit_fit_open` is precisely the fallback that settles a candidate's
+parameters from its own implicit clause: `<:<.refl[A]: A =:= A` matches
+`Accounts <:< AbstractTable[?T]` by widening `Accounts` to its **base type** at
+`AbstractTable`, which is what says `T = (String, Int)`. It only ran when
+`implicit_solve` had *failed*, and here the solve succeeded on paper. It now
+also runs when a solved targ still mentions one of the call site's
+undetermined parameters, which is exactly the case where the clause search the
+solve implies could not have answered. `Unify::alias_of` carries the answer
+back to that call-site parameter, since unification binds the candidate's side
+to it and not the other way round.
+
+Fifteen lines against the published jar, no gitbucket checkout
+(`crates/cli/tests/gbimplicit.rs`'s `SLICK_MAP`), and forty with no jar at all
+(`tests/fixtures/gi_tableshape.scala`, which runs in both modes).
+
+Measured on `tests/gitbucket_measure.sh`: **981 → 947 errors**, files with
+errors 112 → 112. By cluster:
+
+| cluster | before | after |
+|---|---:|---:|
+| `no implicit … Shape[_ <: FlatShapeLevel, …]` (a table in the shape) | 31 | 10 |
+| `no implicit … Shape[…]`, all forms | 45 | 21 |
+| `no implicit … TypedType[…]` | 18 | 16 |
+| `no implicit … CanBeQueryCondition[…]` | 49 | 48 |
+| `value … is not a member of Query[G, T, Seq]` (unsolved) | 27 | 7 |
+
+The last row moved without the total moving: those `Query` receivers now have
+concrete types, and the member they were selecting is missing for the separate
+reason below.
+
+slick is unchanged (`errors=0 classes=1490`).
+
+## Not fixed: blocking-slick's conversions under `import profile.blockingApi._`
+
+The largest single family left in gitbucket is ~170 diagnostics of the shape
+`value list / update / firstOption / insert / delete is not a member of
+Query[…]`. **The cause is known and reproduces in fifteen lines; the fix is one
+guard, and the guard makes `tests/gitbucket_measure.sh` more than fifty times
+slower.** It is written down here rather than landed.
+
+**What is wrong.** gitbucket reaches slick through
+`com.github.takezoe.blocking-slick`, whose `BlockingJdbcProfile.BlockingAPI`
+declares eleven plain `implicit def`s (`queryToQueryInvoker`,
+`queryToUpdateInvoker`, `mapInvoker`, …). Compile
+
+```scala
+import com.github.takezoe.slick.blocking.BlockingH2Driver
+import com.github.takezoe.slick.blocking.BlockingH2Driver.blockingApi._
+object T { val m = BlockingH2Driver.blockingApi.queryToQueryInvoker _ }
+```
+
+and it is "value queryToQueryInvoker is not a member of BlockingAPI". Delete
+the wildcard import — leaving the selection itself untouched — and all eleven
+resolve. Real scalac accepts both.
+
+**Why.** `Typer::import_wildcard` asks the pickle for every name it marks
+implicit, so that an implicit nothing will ever *name* still reaches the scope.
+`PickleSupply::complete_named` declines a class whose pickle this compiler is
+not reading yet (`pickle_readable`: `scala.*`, plus whatever
+`adopt_binary_class` has taken over) — but it records the name in `tried`
+first, and `tried` is permanent. The `adopt_binary_class` that reads the class
+file a moment later asks for the same names, gets the memo, and so the
+class-file reader's description stands. Nothing in bytecode records `implicit`,
+so those eleven members are plain methods in an implicit scope that will never
+consider them.
+
+Two smaller pieces of this were fixed and *are* in the tree, because they are
+free: `drop_stale_members` (`crates/typer/src/pickle_supply.rs`) no longer
+deletes a class-file symbol that `complete_named` itself reported back — a
+supply may fill the pickled signature into the symbol that is already there
+rather than allocate a second one, and dropping it as stale left the class with
+no member of that name at all — and it no longer leaves the same symbol listed
+twice, which would make every selection on it ambiguous against itself.
+
+**Why the rest is not.** Guarding the `import_wildcard` loop with
+`pickle_readable` fixes the whole family: the eleven conversions are supplied
+with their pickled signatures, `q.list` / `q.map(_.name).update(3)` /
+`q.firstOption` all resolve, and a fifteen-line jar-backed reproduction goes
+green. It also takes gitbucket's 213 hand-written sources from **14 seconds to
+over 13 minutes** (killed; the full 353-file measure was still running after 20
+minutes). `sample` puts every one of 5591 samples in a single deep stack under
+`Typer::search_implicit_at` → `implicit_fit_at` → `search_implicit_at`, in
+`is_sub_type` / `subst_map` / `Type::clone`.
+
+That is the honest shape of it: the compiler has been getting away with an
+under-populated implicit scope. `MAX_IMPLICIT_DEPTH` is 8 and nothing memoizes
+`search_implicit_at`, so the search is exponential in the number of candidates,
+and correctly admitting a cake's implicits multiplies that number.
+**Memoizing implicit search by `(wanted type, depth)` is the prerequisite for
+this family**, and it is worth doing on its own account.
+
+Two further roots were isolated on the way and are independent of the above;
+both reproduce in the same file
+(`import ...BlockingH2Driver.blockingApi._`, real scalac accepts all of it):
+
+* `TableQuery[Accounts]` does not conform to `Query[Accounts, (String, Int),
+  Seq]`. `class TableQuery[E <: AbstractTable[_]] extends Query[E,
+  E#TableElementType, Seq]`, and the projection `E#TableElementType` is not
+  computed, so `q.map(_.name)` comes out `TableQuery[Rep[String]]` where nsc
+  says `Query[Rep[String], String, Seq]`.
+* `Session` (slick's `Backend#Session`, an abstract type member bounded by
+  `JdbcBackend.SessionDef`) does not conform to `SessionDef`, so every
+  `implicit session: Session` parameter fails to answer a blocking-slick
+  member's `implicit session: JdbcBackend#SessionDef`.
+
 ## Not fixed: a guard after a value definition in a for-comprehension
 
 `controller/PullRequestsController.scala` writes

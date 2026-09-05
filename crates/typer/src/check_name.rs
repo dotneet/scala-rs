@@ -925,6 +925,17 @@ impl Typer {
                 // `value < is not a member of T`. Only a name the class has
                 // no member for is asked, so a hand-written prelude
                 // declaration still wins.
+                //
+                //
+                // Asking about a class whose pickle this compiler is not
+                // reading yet is worse than useless -- `PickleSupply::complete`
+                // declines it *and memoizes the refusal*, so the later
+                // `adopt_binary_class` gets that memo instead of the pickled
+                // signature. See `docs/gitbucket.md`'s "not fixed" entry on
+                // blocking-slick: guarding this loop with
+                // `PickleSupply::pickle_readable` is correct and makes
+                // gitbucket 50x slower, because implicit search is exponential
+                // in the size of the implicit scope.
                 if self.library_abi {
                     for n in self
                         .pickle
