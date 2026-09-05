@@ -1415,14 +1415,40 @@ pub(crate) fn emit_case_unapply(
         return;
     }
     let class_jvm = class_internal(st, class_id);
-    // Not for a value class. nsc's `unapply` there takes the *underlying*
-    // type and hands the very same value back, but this backend still passes a
-    // *boxed* value class in an `Object`-erased argument position, so a method
-    // with nsc's descriptor would link and then answer `Some(Wrap(w))` where
-    // scalac answers `Some(w)`. A missing method is a loud `NoSuchMethodError`;
-    // a present one that quietly disagrees is worse. See
-    // `docs/scala-corpus.md` for the call-site erasure this waits on.
-    if value_class_apply_type(st, class_id).is_some() {
+    // A value class's `unapply` takes the *underlying* value and hands that
+    // same value back, boxed: nsc's `Wrapped$.unapply(int)` answers
+    // `Some(BoxesRunTime.boxToInteger(u))`, never a `Wrapped` (confirmed with
+    // `javap -c` on 2.13.16). Call sites here already erase the argument that
+    // way -- the failure this replaces was `NoSuchMethodError: 'scala.Option
+    // Wrapped$.unapply(int)'`, which names exactly nsc's descriptor -- and the
+    // *pattern* form never reaches this method at all, since
+    // `gen_ctor_fields_pattern` binds an unboxed value-class scrutinee
+    // directly. An earlier attempt was reverted because the pattern path did
+    // pass a box; that path is gone.
+    if let Some(under) = value_class_apply_type(st, class_id) {
+        if arity != 1 {
+            return;
+        }
+        let d = jvm_desc_val(st, &under);
+        let sort = jvm_slot_sort(&under);
+        let desc = format!("({d})Lscala/Option;");
+        if b.methods
+            .iter()
+            .any(|m| m.name == "unapply" && m.desc == desc)
+        {
+            return;
+        }
+        let acc = synthetic_case_member_access(st, sym);
+        b.add_code(acc, "unapply", &desc, 1 + sort.slots(), move |asm| {
+            asm.new_obj("scala/Some");
+            asm.dup();
+            load(asm, 1, sort);
+            if is_jvm_primitive(&under) && !erases_to_boxed_unit(&under) {
+                emit_box(asm, &under);
+            }
+            asm.invokespecial("scala/Some", "<init>", "(Ljava/lang/Object;)V");
+            asm.areturn();
+        });
         return;
     }
     let desc = if arity == 0 {
