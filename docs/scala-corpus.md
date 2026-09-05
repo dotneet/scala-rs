@@ -911,9 +911,11 @@ Two findings recorded rather than fixed:
 * **`scala.StringContext.s` does not exist.** Our prelude declares
   `def s(args: Any*): String` on it; 2.13.16's `StringContext` has only
   `s(): StringContext$s$` (the extractor object) and `standardInterpolator`,
-  and nsc *intrinsifies* both `s"…"` and an explicitly written
-  `sc.s(args)` — the latter to `standardInterpolator(processEscapes, args)`,
-  or to a constant when it can fold it. So any program that writes
+  and nsc *intrinsifies* both `s"…"` and an explicitly written `sc.s(args)`.
+  Measured on 2.13.16: `StringContext("p1","p2").s("e1")` folds to the
+  constant `"p1e1p2"`, and with a non-constant argument it becomes
+  `StringContext$.standardInterpolator(StringContext$.processEscapes _,
+  args, sc.parts)`. So any program that writes
   `sc.s(…)` by hand links against a method that is not there
   (`run/interpolationArgs`, `NoSuchMethodError`). `s"…"` itself is fine; it
   never goes through that symbol.
