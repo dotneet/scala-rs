@@ -746,10 +746,32 @@ impl Typer {
     /// "Computation of type (Rep[P]) => Query[T, U, Seq] cannot be compiled
     /// (as type C)" -- slick's own `@implicitNotFound`.
     ///
+    /// The call site does **not** have to have left anything undetermined for
+    /// this to be the answer. slick's
+    ///
+    /// ```text
+    /// tuple2Shape[Level, M1, M2, U1, U2, P1, P2](implicit
+    ///   u1: Shape[_ <: Level, M1, U1, P1], u2: Shape[_ <: Level, M2, U2, P2]
+    /// ): Shape[Level, (M1, M2), (U1, U2), (P1, P2)]
+    /// ```
+    ///
+    /// answered against `Shape[_ <: FlatShapeLevel, T, U, _]` -- the clause of
+    /// `anyToShapedValue`, which is behind every `def * = (a, b).mapTo[M]` in a
+    /// table -- has `P1`/`P2` standing opposite that trailing `_`. Nothing on
+    /// the wanted side can ever say what they are, and `u1`/`u2` say it
+    /// exactly. Requiring a non-empty `undet` made this whole family
+    /// "could not find implicit value".
+    ///
     /// Deliberately a *fallback*: it runs only for a candidate the ordinary
     /// solve rejected, and only when the wanted type pinned down at least one
     /// of the candidate's parameters. A rule that matched with everything open
     /// would be tried against every implicit in scope.
+    ///
+    /// **Not** a general instantiation: `Unify` keys its unknowns by symbol,
+    /// so a rule that derives *itself* has its own `P1` and the caller's open
+    /// `P1` as one symbol and the occurs check rejects `P1 := (P1, P2)`. nsc
+    /// uses a fresh type variable per application; nested tuple shapes are
+    /// still not found here.
     fn implicit_fit_open(
         &self,
         id: SymbolId,
@@ -759,9 +781,6 @@ impl Typer {
         paramss: &[Vec<Type>],
         depth: usize,
     ) -> Option<ImplicitFit> {
-        if undet.is_empty() {
-            return None;
-        }
         let tps = self.st.get(id).tparams.clone();
         if tps.is_empty() {
             return None;
