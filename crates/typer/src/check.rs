@@ -6848,7 +6848,17 @@ impl Typer {
         // `supplied_macro_def` by one read from a jar's pickle, which is how
         // slick's `TableQuery.apply[E]` reaches a program that only calls it.
         if !callee && (self.has_macro_defs || self.pickle.supplied_macro_def) {
-            self.expand_macro_application(tree);
+            // A `Type::Method` expectation here means the *method value* is
+            // wanted, not its result: `Macros.foo _`, which `type_eta` types
+            // with exactly that expectation. nsc rejects it -- "macros cannot
+            // be eta-expanded" -- because there is nothing to take a reference
+            // to: a macro def has no bytecode. The other places that pass a
+            // method expectation set `callee` or throw their diagnostics away.
+            if matches!(pt, Type::Method { .. }) {
+                self.reject_macro_eta(tree);
+            } else {
+                self.expand_macro_application(tree);
+            }
         }
         self.adapt_implicit_apply(tree, pt);
         if !pt.is_no_type() && !tree.ty.is_no_type() && !tree.ty.is_error() {

@@ -275,6 +275,25 @@ impl Typer {
     /// application, which is where nsc expands. Doing nothing is always safe:
     /// `report_macro_calls` sweeps the typed tree afterwards and turns every
     /// macro application still standing into an error.
+    /// `Macros.foo _`: nsc's "macros cannot be eta-expanded".
+    ///
+    /// A macro def has no bytecode, so there is nothing for a method value to
+    /// point at; nsc rejects the form outright rather than expanding the macro
+    /// once and wrapping the expansion in a function. Reported here rather
+    /// than left to [`Typer::report_macro_calls`], which would say "macro
+    /// expansion is not implemented" -- true of nothing, since the expansion
+    /// is not the problem.
+    pub(crate) fn reject_macro_eta(&mut self, tree: &mut Tree) {
+        if self.sigs_only || self.macro_symbol_of(tree).is_none() {
+            return;
+        }
+        self.error(tree.span, "macros cannot be eta-expanded");
+        tree.ty = Type::Error;
+        // Cleared so the sweep does not report the same node a second time
+        // with a reason that does not apply.
+        tree.sym = SymbolId::NONE;
+    }
+
     pub(crate) fn expand_macro_application(&mut self, tree: &mut Tree) {
         if self.sigs_only {
             return;

@@ -368,3 +368,28 @@ mirror's `toString` carries the class loader's identity hash), so it prints
 * The `macro-term-declared-in-*` tests that still differ do so only in the
   *spelling* of the prefix tree (`Expr[Nothing](Test.this.outer.Macros)`),
   which is what the engine is handed by the Rust side.
+
+#### Two `neg` tests that were passing for the wrong reason
+
+Supplying names turns a `neg` test that this compiler *happened* to reject
+into one it accepts, and the corpus's `neg` pass rate counts a rejection for
+any reason at all. Diffing the full `neg` pass set against a throwaway branch
+cut from `main` (658 tests either side) named exactly two:
+
+* `macro-invalidusage-methodvaluesyntax` was rejected with "cannot expand
+  foo", which stopped being true once a parameterless macro def could be
+  expanded at all. The real rule is nsc's **`macros cannot be eta-expanded`**:
+  `Macros.foo _` has nothing to take a reference to, because a macro def has
+  no bytecode. `Typer::reject_macro_eta` reports it, recognising the eta
+  position by the `Type::Method` expectation `Check::type_eta` types the
+  operand with.
+* `macro-override-method-overrides-macro` was rejected because
+  `import c.{prefix => prefix}` in its *implementation* file did not compile.
+  The real rule is **`macro can only be overridden by another macro`**, which
+  `override_check.rs` now checks in the one direction the base's macro-ness
+  makes certain (a macro base, a non-macro override).
+
+Both diagnostics match nsc's wording and line, so the two tests pass again
+*and* the log's `neg` scoring (`tests/scala_corpus_report.sh`) now scores them
+as the right rejection rather than an accidental one. The final `neg` pass set
+is identical to `main`'s, test for test.
