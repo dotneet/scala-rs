@@ -715,6 +715,60 @@ pile one is.
 `553` more `run` tests are skipped rather than failed (unsupported harness
 shapes: `.javaopts`, separate JVMs, `filters`); see the limits section below.
 
+### What the 121 "wrong answer" tests turned out to be (2026-09-05)
+
+The 93 `output-mismatch` plus 28 `AssertionError` rows above were read one by
+one. Only about half of them are a wrong answer at all:
+
+| | count | |
+| --- | ---: | --- |
+| the `.check` has no final newline and nothing else differs | 16 | **not ours** — see below |
+| the `.check` carries scalac *warnings* we do not emit; the program's own output already matches | 23 | exhaustivity, unreachability, deprecation summaries, `pure expression does nothing` |
+| a genuinely different answer | 56 | |
+| the test's own `assert` failed (no `.check`) | 26 | |
+
+The first row was a defect in **this harness**, not in the compiler. partest
+compares the two outputs as line sequences; `tests/scala_corpus.sh` compared
+them byte-exactly, and sixteen `.check` files in the tree simply have no final
+newline (`run/t429.check` is `AyB5`). Every one of those sixteen programs is
+reproduced exactly by scala-rs. The comparison now normalises the final
+newline on both sides and nothing else — a *blank* trailing line still counts,
+as it does in partest.
+
+The second row is worth stating plainly because it inflates the pile: 23 of
+the 93 are "we do not implement this warning", which belongs with pile two,
+not with "the answer is wrong".
+
+Six roots behind the remaining ones were fixed on `agent/runmismatch`; they
+took `run` from 459 to 468 with the same harness on both sides. Five were in
+pattern matching or its desugaring, and all five had the same shape — a test
+the compiler *skipped*, so the case matched everything:
+
+* an `Ident` pattern that resolves to a value was compiled as a binding
+  (`case VAL =>` matched every input), because a resolved `val` and a fresh
+  pattern variable are both `SymKind::Term`;
+* a backquoted name in a pattern was read as a variable;
+* a compound type pattern tested only its dominant parent, because that is all
+  erasure keeps;
+* a `for` generator whose pattern is refutable got no `withFilter`;
+* `lub(Unit, A)` came out `Unit`, so a `match` with a `()` case compiled to a
+  method returning `void` and discarded every case's value.
+
+The sixth was two smaller ones: a `case class` companion inherited
+`AbstractFunctionN.toString`, and an assignment to a `var` constructor
+parameter in the class body wrote the constructor's local while the field kept
+the argument.
+
+What did **not** hold up: the guess that the 93 were mostly one or two roots.
+They are not. After these six, the remaining `output-mismatch` failures are
+spread over pickle fidelity (`reflection-methodsymbol-params`, `t6733`:
+curried parameter lists and `private[this]` flags do not survive our
+`ScalaSignature`), missing generic `Signature` attributes on methods
+(`t8756`, `t7521b`), missing `writeReplace` on serializable lambdas
+(`t6260c`), `classOf[T[_]]` erasing to `Object` (`classof`), symbol literals
+(`t4601`), and a long flat tail. Sizing any of those from the cluster count
+would repeat the mistake this section exists to record.
+
 ## What would move the number most
 
 0. **`@specialized`, for real.** With `run` now classified, this is the
