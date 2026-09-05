@@ -84,7 +84,8 @@ path of your own.**
 | root 17, the function-literal shapes | 353 | 1 | **1246** | 185 | 0 |
 | main at `dc6fdc9` | 353 | 1 | **1193** | 184 | 0 |
 | roots 18 and 19, `TableQuery` through its macro | 353 | 1 | **1736** | 185 | 0 |
-| Now (roots 20 and 21, slick's `Shape` witness and a tie between two conversions) | 353 | 1 | **1588** | 185 | 0 |
+| roots 20 and 21, slick's `Shape` witness and a tie between two conversions | 353 | 1 | **1588** | 185 | 0 |
+| Now (roots 22 and 23) | 353 | 1 | **1587** | 185 | 0 |
 
 Every row after the second was measured on the same tree, with the same
 material, one binary each -- `SCALA_RS=<binary> tests/gitbucket_measure.sh`
@@ -1015,6 +1016,91 @@ self type (`self: Table[?] =>`) instead of stopping at `&&`.
 `tests/slick_subset.sh` was not run: nothing under `crates/backend/` changed in
 this slice, and `slick_run.sh` is the check that executes code.
 
+### 22. A view was inserted for an argument that already fitted — 0 errors here (typer)
+
+Entry 3 of the list below, which said "not counted". It is counted now, and
+the count is **zero in gitbucket, zero in slick, zero in the scala library**:
+gitbucket reaches slick through `profile.api`, where the view this depends on
+is not the one in scope. It is still a wrong answer that nsc does not give, so
+it is fixed and pinned.
+
+```scala
+class Rep[T]; class Lit[T](v: T) extends Rep[T]
+implicit def toRep[T](v: T): Rep[T] = new Lit[T](v)
+def ===[P2, R](e: Rep[P2])(implicit om: OM[B1, P2, R]): String
+col === new Lit[Long](9L)   // nsc: P2 = Long. Ours: P2 = Lit[Long].
+```
+
+`Lit[Long]` *is* a `Rep[Long]`, so nsc solves `P2 = Long` and finds
+`OM[Long, Long, Boolean]`. `Check::arg_score` reads a type parameter this call
+has not settled yet as a **rigid** type, so the argument looked inapplicable,
+and `apply_open_views` -- which runs *before* `infer_method_tparams_in` and
+rewrites the argument in place -- reached for the `T => Rep[T]` view that is in
+scope for the sake of the literals on the neighbouring lines. Inference then
+read the wrapping and asked for `OM[Long, Lit[Long], R]`.
+
+The prediction in the list was that `infer_method_tparams` was missing the
+`align_to_param_class` step that `open_conversion_fit` has. It is not:
+`unify_tparam_all` has done that since `agent/hkinfer`, and the direct call
+with no view in scope solved `P2 = Long` all along. **What made the difference
+was a view being in scope at all** -- which is why the reproduction needs the
+`implicit def` even though nothing in the failing line uses it.
+`open_param_already_fits` is nsc's `isCompatible` under undetermined
+variables, asked before the view is offered.
+
+One gap is left, deliberately: `unify_one` still zips type arguments
+positionally, so a base type **nested** inside the parameter is not walked.
+`def g[P](e: Seq[Rep[P]])` given a `Seq[Lit[String, Long]]` still does not
+solve `P`, where nsc does. Fixing it means aligning recursively inside
+`align_to_param_class`, which reaches every call in the compiler; nothing in
+the four measurements asks for it, so it is written down rather than done.
+
+### 23. A companion object read from a class file was shadowed by its class — 1 error and 22 wrong ones here, 6 in cats (typer)
+
+Entry 4 of the list below, also uncounted, and the more interesting of the two.
+
+A class file's companion is a **second class file** (`p/C.class` and
+`p/C$.class`), installed only when something asks for that name.
+`import p._` over a package asks for no name in particular: the eager half of
+a wildcard import (`Typer::import_wildcard`) walks the package's member list
+and enters what is already there, which for a `-cp` package is the classes
+alone -- it even skips names ending in `$` explicitly. Once the class `C` is in
+the current scope, `expose_unqualified` returns at its first line (the name
+resolves), so the companion is **never read for the rest of the run**.
+
+`C[Arg]` in term position then bound the class. A class file's own type is
+`Class { sym, args: [] }` -- a classfile-installed class carries no type
+parameters of its own for `subst_tparams` to substitute -- so the result was
+the bare class, and the `Module[T]` → `Module.apply[T]` redirect never ran,
+because it needs a module symbol. The symptom is one step downstream and says
+nothing about companions: `value label is not a member of E`.
+
+`Check::expose_class_companion` reads the companion when term position finds
+only a class of that name, and enters it. Measured:
+
+* **gitbucket 1588 → 1587** on the merged tree (and 1736 → 1735 on the tree
+  this was written against, which is the same one error). The 22
+  `no matching overload for (…) FieldSerializer[A] with arguments ()` became 22
+  of the same shape with the type argument *instantiated*
+  (`ClassTag[Commit]`, `ClassTag[ApiIssue]`, …) -- json4s's `FieldSerializer`
+  companion is found now, so the remaining diagnostic is about the argument
+  list rather than about `A`.
+* **cats 816 → 810**, files with errors 107 → 104. All of it is
+  `scala.concurrent.duration`: `Deadline` and `Duration` are class-plus-companion
+  pairs reached through `import scala.concurrent.duration._`.
+* slick and the scala library: unchanged.
+* The scala/scala corpus gains **5 `run` tests** (`range`, `t10513`, `t4332b`,
+  `t4658`, `t7336`) and moves neither `pos` nor `neg` by a single test -- `neg`
+  was run in full, because this supplies symbols that were not there before.
+
+slick hides this behind `profile.api`'s `val TableQuery = lifted.TableQuery`.
+A `val` is a **term**, and terms *are* on the package member list the eager
+walk copies, so gitbucket never reached the broken path. The reproduction
+therefore needs a package with a plain class-and-companion pair on `-cp`
+(`tests/fixtures/bt_companion{,_lib}.scala`), and reproduces just as well with
+`tq_mdef.scala`'s `tqm` package imported directly instead of through its `api`
+object.
+
 ## Not fixed: a guard after a value definition in a for-comprehension
 
 `controller/PullRequestsController.scala` writes
@@ -1055,7 +1141,7 @@ the wildcard self type.
 | 29 | `no matching overload for constructor Constraint with arguments ()` | jgit. |
 | 27 / 17 | `no implicit … OptionMapper2[…] / CanBeQueryCondition[Rep[R]]` | slick, at comparisons whose operand is an `Option` column. |
 | 24 / 13 | `no matching overload for (Boolean)Boolean with arguments (Rep[Boolean])`, `value && is not a member of Rep[R]` | Downstream of the wildcard self type: `byRepository(…)` in `BasicTemplate.scala` has no usable type, so `&&` is looked up on the wrong receiver. Not root 21 again — that one is gone. |
-| 22 | `no matching overload for (…)FieldSerializer[A] with arguments ()` | json4s. |
+| 22 | `no matching overload for (…)FieldSerializer[X] with arguments ()` | json4s, once per serialised model class. Root 23 instantiated the `A` this used to print. |
 | 21 / 20 | `value list / update is not a member of Query[G, T, Seq]` | blocking-slick's extension methods, on a `Query` whose `T` came out unsolved. |
 | 16 + 10 + 8 | `ambiguous implicit: jsonFormats, context, …` | scalatra again: the same declaration reached twice. |
 | 14 | `no implicit … Shape[FlatShapeLevel, ON, UN, _]` | `q.join(…)`'s `ON` / `UN` are not the same shape as `map`'s and are still open. |
@@ -1086,19 +1172,15 @@ harness for that is three lines of shell (`scalac`/`scala-rs` over one file with
    one, so marking the survivor deferred makes
    `check_missing_implementations` fire — measured, 1693 → 2117. Fix the
    collapse first.
-3. **Inference takes an argument's own type where its base type at the
-   parameter's class is meant.** Not counted, and found while writing root 19's
-   fixture: for `def f[P](e: Rep[P])` and `class Lit[T] extends Rep[T]`,
-   `f(new Lit[Long](9L))` solves `P = Lit[Long]`, not `Long`, and then no
-   implicit for `P` can be found. nsc reduces `Lit[Long] <: Rep[P]` through the
-   base type. `open_conversion_fit` already does this on the view path
-   (`align_to_param_class`); `infer_method_tparams` does not.
-4. **A companion object is shadowed by its class in term position.** Also found
-   while writing root 18's fixture, also uncounted: with `import p._` in scope
-   for a class `C` *and* its companion, `C[Arg]` in a term position resolves to
-   the **class** symbol, and then a `Module[T]` → `Module.apply[T]` redirect
-   never happens. Writing the object's members behind an `api` object (which is
-   what slick does, so gitbucket never hits it) works around it.
+3. ~~Inference takes an argument's own type where its base type at the
+   parameter's class is meant.~~ **Done -- root 22 above.** Worth 0 here, 0
+   in slick, cats and the scala library. The cause named in this entry
+   (`infer_method_tparams` missing `align_to_param_class`) was wrong; the
+   real one was a view inserted before inference ever ran. Read root 22
+   before believing a cause written in this list.
+4. ~~A companion object is shadowed by its class in term position.~~
+   **Done -- root 23 above.** Worth 1 here (plus 22 diagnostics that
+   stopped being wrong) and 6 in cats.
 5. **A bare `Ident` in a parameter or result type reports nothing when it
    resolves to nothing.** Not a count of its own — it is what made root 16's
    187 `Session` diagnostics appear at their callers instead of at the

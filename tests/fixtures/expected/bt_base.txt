@@ -1,0 +1,8 @@
+ID = lit:9 via omLong
+ID = tag:x via omLong
+ID = fixed via omLong
+ID = lit:1 via omLong
+NAME = lit:bob via omStr
+ID = nine via omLong
+omLong
+omLong
