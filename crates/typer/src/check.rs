@@ -12583,6 +12583,34 @@ impl Typer {
                         vec![None; tps.len()]
                     };
                     for (i, tp) in tps.iter().enumerate() {
+                        // nsc's default for a type parameter that stays
+                        // completely unconstrained (no argument mentions it,
+                        // no expected type reaches it) is variance-driven, not
+                        // a flat `Any`: `Infer.solvedTypes` instantiates an
+                        // untouched type variable to the tightest type that is
+                        // always safely widenable later, which is the
+                        // parameter's own lower bound (`Nothing` when
+                        // unbounded) for a covariant or invariant parameter,
+                        // and its upper bound (`Any` when unbounded) for a
+                        // contravariant one. `private final class Vector2[+A]`
+                        // in `scala/collection/immutable/Vector.scala` has a
+                        // `copy` method with no declared return type whose
+                        // body is `new Vector2(prefix1, len1, data2, suffix1,
+                        // length0)` -- none of those value parameters mention
+                        // `A` -- and confirmed against real scalac
+                        // (`-Xprint:typer`), the inferred return type is
+                        // `Vector2[Nothing]`, not `Vector2[Any]`.
+                        // `Vector2[Nothing] <: Vector[B]` for every `B >: A`,
+                        // same as `Inv[Nothing]`/`Contra[Any]` below; `Any`
+                        // there is unsound at every call site that widens the
+                        // result (`override def updated[B >: A](...): Vector[B]`),
+                        // which is exactly the `Vector2[Any] required:
+                        // Vector[B]` shape `docs/scala-library.md` records.
+                        let default_ty = if self.st.get(*tp).flags.contains(Flags::CONTRAVARIANT) {
+                            Type::Any
+                        } else {
+                            Type::Nothing
+                        };
                         inferred_args.push(
                             self.unify_tparam_all(*tp, &unify_params, &arg_tys)
                                 // A lambda argument is still a placeholder
@@ -12595,7 +12623,7 @@ impl Typer {
                                 .filter(|t| !mentions_no_type(t))
                                 .or_else(|| pt_args.get(i).cloned())
                                 .or_else(|| from_base.get(i).cloned().flatten())
-                                .unwrap_or(Type::Any),
+                                .unwrap_or(default_ty),
                         );
                     }
                     tree.ty = Type::Class {
@@ -12877,6 +12905,19 @@ impl Typer {
         match chosen {
             OverloadPick::Found(sym, mut param_tys, mut ret) => {
                 let mut sig_param_tys = param_tys.clone();
+                // The callee's own type parameters this call has already
+                // solved -- populated below, once inference has run. A
+                // *self*-recursive call (`def show[A, B](tree: Tree[A, B]):
+                // Tree[A, B] = show(tree.left, ...)`) legitimately solves its
+                // own `A`/`B` to themselves: the argument's type is written in
+                // terms of the very type parameters being solved for, so the
+                // fixed point is the correct answer, not a failure to solve.
+                // Recording *which* type parameters were solved (regardless of
+                // what they solved to) is what tells `open_tparams_of` below
+                // not to re-open them to their bounds just because the
+                // substitution left their own symbol mentioned in the
+                // parameter type -- which an identity solution always does.
+                let mut solved_own_tparams: Vec<SymbolId> = Vec::new();
                 // The overload set was recorded under the symbol the
                 // *selection* left on the callee, which the pick below
                 // overwrites. Keep it: it is the key to the alternatives as
@@ -13009,6 +13050,7 @@ impl Typer {
                         if !inst.is_empty() {
                             let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
                             let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+                            solved_own_tparams = tps.clone();
                             param_tys = param_tys
                                 .iter()
                                 .map(|p| crate::symbol::subst_tparams_slice(&tps, &args_t, p))
@@ -13139,7 +13181,26 @@ impl Typer {
                         }
                     }
                 }
-                let own_tparams = (!sym.is_none()).then(|| self.st.get(sym).tparams.clone());
+                // Excluding `solved_own_tparams`: a type parameter this call's
+                // inference already solved -- even to itself, the fixed point
+                // a self-recursive call's own type parameters land on -- is
+                // not "open" here. Leaving it in made `open_tparams_of` below
+                // see `A`/`B` still mentioned in `Tree[A, B]` (substituting a
+                // solution back onto itself is a no-op) and relax them to
+                // their bounds, so a self-recursive call like RedBlackTree's
+                // `def lookup[A, B](tree: Tree[A, B], x: A): Tree[A, B] = ...
+                // lookup(tree.left, x)` (`scala/collection/immutable/
+                // RedBlackTree.scala`) checked `tree.left: Tree[A, B]` against
+                // an expected `Tree[Any, Any]` and failed.
+                let own_tparams = (!sym.is_none()).then(|| {
+                    self.st
+                        .get(sym)
+                        .tparams
+                        .iter()
+                        .copied()
+                        .filter(|tp| !solved_own_tparams.contains(tp))
+                        .collect::<Vec<_>>()
+                });
                 for (i, a) in args.iter_mut().enumerate() {
                     let mut p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                     // `Using.resource(r)(x => 10)`: A only appears in a later
