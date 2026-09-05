@@ -5,46 +5,49 @@
 // writes every slick table mix-in as
 // `trait BasicTemplate { self: Table[?] => val userName = column[String](…) }`
 // and `column` was `not found: value column`. The wildcard is not what breaks
-// it -- `Table[String]` failed identically, and a `Table` written in source
-// worked with either spelling. What decides it is where the class comes from:
-// a jar class's members are completed one name at a time, on demand, and
-// `bind_self_type` copies the self type's member list into the template
-// scope, which for such a class is empty. A qualified `this.column` resolved
-// all along, because `type_select` completes on demand.
+// it -- `Table[String]` fails identically below, and a `Table` written in
+// source works with either spelling. What decides it is where the class comes
+// from: a jar class's members are completed one name at a time, on demand,
+// and `bind_self_type` copies the self type's member list into the template
+// scope, which for such a class is empty. A qualified `this.dequeue()`
+// resolved all along, because `type_select` completes on demand.
 //
-// The same thing, with the scala-library jar standing in for slick's:
-// `Growable`, `Promise` and `StringBuilder` are all outside the hand-written
-// prelude, so their members arrive the same way slick's `Table#column` does.
-// Every call below is written unqualified, which is the only spelling that
-// was broken.
-import scala.collection.mutable.Growable
-import scala.concurrent.Promise
+// `scala.collection.mutable.PriorityQueue` stands in for slick's `Table`:
+// it is outside the hand-written prelude, so `dequeue` and `max` arrive the
+// same way slick's `Table#column` does. Every call below is written
+// unqualified, which is the only spelling that was broken.
+//
+// The traits are deliberately not mixed into anything: their bodies are what
+// is compiled, and a `class B extends PriorityQueue[Int] with Q1` needs an
+// `Ordering` and a pickled-parent conformance that have nothing to do with
+// this slice.
+import scala.collection.mutable.PriorityQueue
 
-trait Adder { self: Growable[String] =>
-  def addTwice(s: String): Unit = {
-    addOne(s)
-    addOne(s)
-  }
+trait Q1 { self: PriorityQueue[Int] =>
+  def take(): Int = dequeue()
+  def biggest: Int = max
 }
 
-// A named type argument rather than a wildcard, and a second part.
-trait Completer { self: Promise[Int] =>
-  def ok(v: Int): Boolean = trySuccess(v)
+// A wildcard, which is how gitbucket spells it.
+trait Q2 { self: PriorityQueue[?] =>
+  def takeAny(): Any = dequeue()
 }
 
-trait Wild { self: Growable[?] =>
-  def wipe(): Unit = clear()
+// A compound self type: the first part still offers its members.
+trait Q3 { self: PriorityQueue[Int] with Serializable =>
+  def takeThird(): Int = dequeue()
 }
 
-// The three traits above are the test: each one's body is compiled, so the
-// unqualified call has to resolve *and* to come out as a call on `this`. They
-// are deliberately not mixed into anything here -- `class B extends
-// ListBuffer[String] with Adder` is rejected for an unrelated reason
-// (`illegal inheritance: self-type B does not conform to Growable[String]`,
-// a pickled-parent conformance gap that has nothing to do with this slice).
+// A *nested* template does not: nsc reaches the enclosing template's self
+// type through its context chain, and scala-rs still reports
+// `not found: value dequeue` for `trait Q4 { self: PriorityQueue[Int] =>
+// trait Inner { def d = dequeue() } }`. Answering it needs the member read at
+// the *outer* `this` (`dequeue(): Int`, called on `Q4.this`), not just the
+// symbol; see `Typer::expose_from_binary_self_type`.
+
 object Main {
   def main(args: Array[String]): Unit = {
-    val p = Promise[Int]()
-    println(p.isCompleted)
+    val q = PriorityQueue(3, 1, 2)
+    println(q.dequeue())
   }
 }

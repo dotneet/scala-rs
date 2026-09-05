@@ -114,9 +114,10 @@ fn run_java(out: &Path, cp_extra: &[&str]) -> String {
 
 // --- (1) a self type read from a jar ---------------------------------------
 
-/// `self: Growable[String] =>`, `self: Promise[Int] =>` and
-/// `self: Growable[?] =>`, each calling a member of the self type by its bare
-/// name. Every one of these was `not found: value …`.
+/// `self: PriorityQueue[Int] =>`, `self: PriorityQueue[?] =>` and
+/// `self: PriorityQueue[Int] with Serializable =>`, each calling a member of
+/// the self type by its bare name. Every one was `not found: value dequeue`
+/// (and `not found: value max`) on the branch point.
 #[test]
 fn fixtures_ws_selflib() {
     let Some(jar) = scala_library_jar() else {

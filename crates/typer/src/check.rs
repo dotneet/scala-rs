@@ -8400,24 +8400,18 @@ impl Typer {
     /// `lookup_member` walks the self type and `type_select` completes on
     /// demand; only the bare name did not.
     ///
-    /// The walk goes up the enclosing templates, because that is nsc's
-    /// context chain: a name written in a nested trait may come from the
-    /// *outer* template's self type. Like the parent case it runs only when
-    /// the name resolves to nothing at all, and enters exactly what
-    /// completion installed.
+    /// Only the template the name is written in, not the enclosing ones.
+    /// nsc's context chain does reach an outer template's self type, but the
+    /// member would then have to be read at the *outer* `this` -- a nested
+    /// `trait Inner { def d: Int = dequeue() }` inside
+    /// `trait Q { self: PriorityQueue[Int] => … }` must see `dequeue(): Int`,
+    /// not the declared `A`, and must call it on `Q.this`. Entering the
+    /// symbol alone gives neither, so an outer self type is left alone rather
+    /// than answered wrongly. Like the parent case this runs only when the
+    /// name resolves to nothing at all, and enters exactly what completion
+    /// installed.
     fn expose_from_binary_self_type(&mut self, name: &str) {
-        let mut owners = Vec::new();
-        let mut cur = self.st.this_class;
-        while !cur.is_none() {
-            if self.st.get(cur).is_class_like() {
-                owners.push(cur);
-            }
-            let next = self.st.get(cur).owner;
-            if next == cur {
-                break;
-            }
-            cur = next;
-        }
+        let owners = [self.st.this_class];
         for owner in owners {
             let Some(st) = self.st.get(owner).self_type.clone() else {
                 continue;
