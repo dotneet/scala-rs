@@ -1221,13 +1221,109 @@ fn existing_java_method(
         return Some(id);
     }
     let arity = desc_param_count(&m.desc);
-    st.lookup_member(owner, &m.name).into_iter().find(|&id| {
-        let s = st.get(id);
-        s.kind == SymKind::Method
-            && s.owner == owner
-            && s.jvm_name.is_empty()
-            && method_arity(s) == arity
-    })
+    let candidates: Vec<SymbolId> = st
+        .lookup_member(owner, &m.name)
+        .into_iter()
+        .filter(|&id| {
+            let s = st.get(id);
+            s.kind == SymKind::Method
+                && s.owner == owner
+                && s.jvm_name.is_empty()
+                && method_arity(s) == arity
+        })
+        .collect();
+    // Arity alone is not enough when the name is overloaded at one arity.
+    // `java.lang.String` declares `indexOf(int)` and `indexOf(String)`, the
+    // prelude declares both, and matching by arity stamped each one's
+    // descriptor onto whichever symbol `lookup_member` happened to return
+    // first. `method_desc_from_sym` prefers `jvm_name` over the symbol's own
+    // type, so the two came out *swapped*: `s.indexOf("$mc")` in slick's
+    // `ResultConverter.scala` emitted `String.indexOf:(I)I` and failed
+    // verification -- silently, because the body lived in a class file
+    // nothing loaded until traits became default methods.
+    if let Some(id) = candidates
+        .iter()
+        .copied()
+        .find(|&id| method_params_agree(st.get(id), &m.desc))
+    {
+        return Some(id);
+    }
+    candidates.first().copied()
+}
+
+/// Whether a symbol's declared parameter types can be the ones this JVM
+/// descriptor names. Deliberately conservative — `true` unless the two
+/// *demonstrably* disagree — so the arity fallback above keeps every match it
+/// used to make and only stops making the wrong ones.
+fn method_params_agree(s: &crate::symbol::Symbol, desc: &str) -> bool {
+    let declared: Vec<Type> = match &s.ty {
+        Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+        Type::Function { params, .. } => params.clone(),
+        _ => return false,
+    };
+    let named = desc_param_descs(desc);
+    declared.len() == named.len()
+        && declared
+            .iter()
+            .zip(&named)
+            .all(|(t, d)| param_matches_desc(t, d))
+}
+
+/// The parameter descriptors of a method descriptor, one string each.
+fn desc_param_descs(desc: &str) -> Vec<String> {
+    let rest = desc.strip_prefix('(').unwrap_or(desc);
+    let params = rest.split_once(')').map(|(p, _)| p).unwrap_or("");
+    let b = params.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        while i < b.len() && b[i] == b'[' {
+            i += 1;
+        }
+        if i < b.len() && b[i] == b'L' {
+            while i < b.len() && b[i] != b';' {
+                i += 1;
+            }
+            i += 1;
+        } else if i < b.len() {
+            i += 1;
+        }
+        out.push(params[start..i.min(params.len())].to_string());
+    }
+    out
+}
+
+fn param_matches_desc(ty: &Type, d: &str) -> bool {
+    let prim_of = |t: &Type| -> Option<u8> {
+        Some(match t {
+            Type::Boolean => b'Z',
+            Type::Byte => b'B',
+            Type::Short => b'S',
+            Type::Char => b'C',
+            Type::Int => b'I',
+            Type::Long => b'J',
+            Type::Float => b'F',
+            Type::Double => b'D',
+            Type::Unit => b'V',
+            _ => return None,
+        })
+    };
+    let dc = d.as_bytes().first().copied().unwrap_or(b'?');
+    let d_is_prim = matches!(dc, b'Z' | b'B' | b'S' | b'C' | b'I' | b'J' | b'F' | b'D' | b'V');
+    match (prim_of(ty), d_is_prim) {
+        (Some(c), true) => c == dc,
+        (Some(_), false) | (None, true) => false,
+        // Two reference types. `String` against something else is the one
+        // distinction the JDK's search overloads turn on; everything else
+        // stays unjudged, because a prelude declaration and a class file
+        // descriptor disagree in too many harmless ways.
+        (None, false) => match ty {
+            Type::String => d == "Ljava/lang/String;" || d == "Ljava/lang/Object;",
+            Type::Class { .. } | Type::Array(_) => d != "Ljava/lang/String;",
+            _ => true,
+        },
+    }
 }
 
 /// A mixin forwarder or bridge in a *generic Scala* class file: a method with
