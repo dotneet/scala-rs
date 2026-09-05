@@ -97,6 +97,9 @@ fn key(ty: &Type) -> String {
         Type::Char => "C".into(),
         Type::String => "Ljava/lang/String;".into(),
         Type::Nothing => "Lscala/runtime/Nothing$;".into(),
+        // `Null` has a class of its own too, so `def f(x: Null)` and
+        // `def f(x: AnyRef)` are two methods for nsc, not a double definition.
+        Type::Null => "Lscala/runtime/Null$;".into(),
         Type::Array(t) => format!("[{}", key(t)),
         Type::Class { sym, .. } | Type::ModuleRef(sym) | Type::ThisType(sym) => {
             format!("L#{};", sym.0)

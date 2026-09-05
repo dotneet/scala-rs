@@ -111,6 +111,7 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
         let (i, owner) = (*i, *owner);
         let c = &classes[i];
         install_tparams(st, owner, &c.pickle_tparams);
+        let accessors = nullary_accessors(c);
         if let Some(p) = &c.pickle {
             for m in p {
                 if has_member(st, owner, &m.name) {
@@ -145,10 +146,11 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
                         st.get_mut(id).flags = f;
                     }
                     st.get_mut(id).deferred_val = m.is_deferred;
+                    mark_via_accessor(st, id, &m.name, &accessors);
                     continue;
                 }
                 if m.is_ctor {
-                    install_ctor(st, owner, m);
+                    install_ctor(st, owner, m, &accessors);
                     continue;
                 }
                 let id = add_method(
@@ -340,7 +342,40 @@ fn add_term(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) -> Symb
     id
 }
 
-fn install_ctor(st: &mut SymbolTable, owner: SymbolId, m: &crate::check::ClasspathPickleMethod) {
+/// JVM names of the class file's argument-less methods -- the accessors.
+///
+/// scalac makes the field behind a `val` / `var` `private` and publishes a
+/// getter of the same name beside it, so a member of a separately compiled
+/// class has to be *called*, not read with `getfield` (see
+/// [`crate::symbol::Symbol::via_accessor`]). The class file is the ground
+/// truth about which members have one: a `private[this] val` does not, and a
+/// constructor parameter that is not a `val` does not either, and both must
+/// keep whatever they had.
+fn nullary_accessors(c: &ClasspathClass) -> std::collections::HashSet<String> {
+    c.methods
+        .iter()
+        .filter(|g| g.desc.starts_with("()") && g.name != "<init>")
+        .map(|g| g.name.clone())
+        .collect()
+}
+
+fn mark_via_accessor(
+    st: &mut SymbolTable,
+    id: SymbolId,
+    name: &str,
+    accessors: &std::collections::HashSet<String>,
+) {
+    if accessors.contains(&scala_rs_pickle::names::encode_method_name(name)) {
+        st.get_mut(id).via_accessor = true;
+    }
+}
+
+fn install_ctor(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    m: &crate::check::ClasspathPickleMethod,
+    accessors: &std::collections::HashSet<String>,
+) {
     let mut fields = Vec::new();
     for (i, (n, tn)) in m.param_names.iter().zip(m.param_types.iter()).enumerate() {
         let pname = if n.is_empty() {
@@ -359,6 +394,7 @@ fn install_ctor(st: &mut SymbolTable, owner: SymbolId, m: &crate::check::Classpa
         } else {
             add_term(st, owner, &pname, ty)
         };
+        mark_via_accessor(st, fid, &pname, accessors);
         fields.push(fid);
     }
     st.get_mut(owner).ctor_fields = fields.clone();
@@ -693,6 +729,13 @@ fn resolve_bare_type_name(st: &SymbolTable, name: &str) -> Type {
         "Char" | "C" => Type::Char,
         "String" => Type::String,
         "Object" | "Any" | "AnyRef" => Type::Any,
+        // The two bottom types. Like `Int` and `String` above they are named
+        // in the pickle by their simple name, and resolving them by lookup
+        // instead found nothing and left a `Type::Named` behind: a separately
+        // compiled `def n: Null` came out `()LNull;` and the call was a
+        // `NoSuchMethodError` against nsc's `()Lscala/runtime/Null$;`.
+        "Null" => Type::Null,
+        "Nothing" => Type::Nothing,
         n if n.starts_with("Function") => Type::Function {
             params: vec![Type::Any],
             ret: Box::new(Type::Any),
@@ -787,6 +830,11 @@ fn parse_field_ty(st: &SymbolTable, s: &str) -> (Type, usize) {
                 Type::Unit
             } else if inner == "scala/runtime/Nothing$" {
                 Type::Nothing
+            } else if inner == "scala/runtime/Null$" {
+                // The other bottom type's erasure. `jtype_to_type` already
+                // undoes it for a *generic* signature; a plain descriptor is
+                // where a separately compiled `def take(x: Null)` arrives.
+                Type::Null
             } else if name.starts_with("Function") {
                 Type::Function {
                     params: vec![Type::Any],

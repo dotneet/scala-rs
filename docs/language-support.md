@@ -392,6 +392,8 @@ Erasure drops type arguments, turns type parameters and unbounded wildcards into
 
 `Unit` becomes `V` **only for a method return type**. In parameters, fields, array elements, and type arguments it erases to `scala/runtime/BoxedUnit` as in nsc, and the value is the `BoxedUnit.UNIT` singleton (`Nothing` likewise becomes `scala/runtime/Nothing$`). See "`Unit` arguments and `scala.runtime.BoxedUnit`" for details.
 
+The two bottom types each get their own class, everywhere: `Nothing` is `scala/runtime/Nothing$` and `Null` is `scala/runtime/Null$`, in a result, a parameter, a field and a type argument alike, so `def n: Null` is `()Lscala/runtime/Null$;` and `List[Null]`'s `Signature` is `List<Lscala/runtime/Null$;>`. The single exception, in nsc and here, is an **array element**: `Array[Nothing]` and `Array[Null]` are `[Ljava/lang/Object;`. This only matters across compilation units — a compiler that erases `Null` to `Object` is perfectly consistent with itself, and every one of its signatures then disagrees with scalac's. The private runtime ships a `scala/runtime/Null$` of its own for `--no-scala-library`, as it already did for `Nothing$`. `crates/cli/tests/nullcross.rs` compares the whole set against real scalac 2.13.16 and runs mixed programs both ways round.
+
 ### Lambdas as `invokedynamic` (`agent/indy`)
 
 A plain `FunctionN` literal is emitted as an **`invokedynamic`** rather than a closure class. This is the same shape as nsc 2.13's `-Ydelambdafy:method`.
@@ -3959,3 +3961,47 @@ for shapes that are not lambdas and for lambdas that do not match;
 `tests/fixtures/kp_plain.scala` pins that the flag changes nothing for a
 program that does not use the syntax. See `docs/cats.md` for what it does to
 the cats measurement (2929 errors -> 1128).
+
+### Two ABI differences that only separate compilation can see (`agent/nullcross`)
+
+Both of these are invisible while one compiler builds the whole program, and
+neither is caught by the verifier, by `tests/classfile_lint.py`, or by the
+loader check in `tests/slick_subset.sh` -- which loads with
+`Class.forName(initialize = false)` and so never links a method body.
+
+**`Null` erased to `java/lang/Object`.** nsc gives `Null` a class of its own
+exactly as it gives `Nothing` one (see the erasure section above). Erasing it
+to `Object` is self-consistent -- the `Signature` attribute is written from
+this compiler's own descriptors, so nothing contradicted anything -- and every
+call across the boundary was a `NoSuchMethodError`, in both directions. Fixed
+in `jvm_desc` / `jvm_desc_array_elem`, with the reverse mapping in
+`classpath::parse_field_ty` so an nsc descriptor reads back as `Type::Null`,
+and `Null` / `Nothing` added to `resolve_bare_type_name` -- the pickle names
+them by their simple name, and looking them up found nothing, so a separately
+compiled `def n: Null` came out `()LNull;`.
+
+**A `val` of another compilation unit was read with `getfield`.** scalac makes
+the backing field `private` and publishes an accessor of the same name beside
+it:
+
+```
+$ javap -p fv.Holder      # scalac 2.13.16, class Holder(val n: Int)
+  private final int n;
+  public int n();
+```
+
+Field access control is checked at *resolution*, not at verification, so
+`getfield` on it verifies and then throws `IllegalAccessError` the first time
+the method runs. `Symbol::via_accessor` records which members have an
+accessor, read off the class file's own method list in
+`classpath::install_classpath`, so a `private[this] val` (which has none) and a
+constructor parameter that is not a `val` keep the direct read. Writes to a
+separately compiled `var` go through `v_$eq` for the same reason.
+
+**The ABI is asymmetric, and deliberately so.** scala-rs emits a `val`'s field
+public; scalac reads the pickle, where a `val` is a getter, and calls the
+accessor without ever looking at the field. So "scalac compiles against our
+class files" worked the whole time this was broken, and only "we compile
+against scalac's" did not. `crates/cli/tests/nullcross.rs` runs both
+directions and asserts the call shapes, so the day the field is narrowed to
+match nsc the asymmetry stops being a claim in a document.

@@ -1648,6 +1648,17 @@ pub(crate) fn gen_assign(
                     asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
+                // Inherited `var` of a separately compiled superclass: its
+                // field is private there, so go through the setter.
+                if s.via_accessor {
+                    load_owner_instance(asm, ctx, s.owner);
+                    gen_expr(asm, frame, ctx, rhs);
+                    let owner = class_internal(ctx.st, s.owner);
+                    let vd = jvm_desc_val(ctx.st, &s.ty);
+                    fill_boxed_unit_slot(asm, &vd);
+                    asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
+                    return;
+                }
                 // `var` of an *enclosing* class assigned from an anonymous or
                 // local class: the receiver is that instance, reached along
                 // `$outer`, not this one. Pushing `this` put the wrong object
@@ -1679,6 +1690,17 @@ pub(crate) fn gen_assign(
                 let vd = jvm_desc_val(ctx.st, &s.ty);
                 fill_boxed_unit_slot(asm, &vd);
                 asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
+                return;
+            }
+            // A `var` of a separately compiled class: scalac made the field
+            // private, so the write is `v_$eq(x)` exactly as the read is
+            // `v()`. See `Symbol::via_accessor`.
+            if !lhs.sym.is_none() && ctx.st.get(lhs.sym).via_accessor {
+                let s = ctx.st.get(lhs.sym);
+                let owner = class_internal(ctx.st, s.owner);
+                let vd = jvm_desc_val(ctx.st, &s.ty);
+                fill_boxed_unit_slot(asm, &vd);
+                asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                 return;
             }
             let owner = if !lhs.sym.is_none() {

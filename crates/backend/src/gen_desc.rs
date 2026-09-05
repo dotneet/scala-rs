@@ -88,11 +88,14 @@ pub(crate) fn jvm_desc_val(st: &SymbolTable, ty: &Type) -> String {
 }
 
 /// Array elements are a value position too, so `Array[Unit]` is
-/// `[Lscala/runtime/BoxedUnit;`. `Array[Nothing]` is the one exception nsc
-/// makes: it erases to `Object[]`, not to `Nothing$[]`.
+/// `[Lscala/runtime/BoxedUnit;`. The two bottom types are the exception nsc
+/// makes: `Array[Nothing]` and `Array[Null]` erase to `Object[]`, not to
+/// `Nothing$[]` / `Null$[]` (`erasure.scala`'s `arrayType` special case;
+/// confirmed with `javap -s` on scalac 2.13.16 output for
+/// `def arr: Array[Null] = new Array[Null](0)`, which is `()[Ljava/lang/Object;`).
 pub(crate) fn jvm_desc_array_elem(st: &SymbolTable, ty: &Type) -> String {
     match ty.widen_constant() {
-        Type::Nothing => "Ljava/lang/Object;".into(),
+        Type::Nothing | Type::Null => "Ljava/lang/Object;".into(),
         _ => jvm_desc_val(st, ty),
     }
 }
@@ -114,6 +117,15 @@ pub(crate) fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         // reference lands on the stack, for `gen_expr`'s `athrow`-append
         // (see its doc comment) to consume.
         Type::Nothing => "Lscala/runtime/Nothing$;".into(),
+        // The other bottom type gets the same treatment, and this one really
+        // is an ABI question rather than a verifier one: nsc erases `Null` to
+        // `scala/runtime/Null$` in every position (`def n: Null` is
+        // `()Lscala/runtime/Null$;`, `def take(x: Null)` is
+        // `(Lscala/runtime/Null$;)I`, a `val` field is `Lscala/runtime/Null$;`),
+        // so erasing it to `Object` made every separately compiled signature
+        // disagree with scalac's -- including the generic ones, where
+        // `List[Null]` came out `List<Object>` against nsc's `List<Null$>`.
+        Type::Null => "Lscala/runtime/Null$;".into(),
         Type::Boolean => "Z".into(),
         Type::Byte => "B".into(),
         Type::Short => "S".into(),
@@ -126,9 +138,7 @@ pub(crate) fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::Array(t) => format!("[{}", jvm_desc_array_elem(st, t)),
         Type::Class { sym, .. } => format!("L{};", class_internal(st, *sym)),
         Type::ModuleRef(sym) => format!("L{};", class_internal(st, *sym)),
-        Type::Any | Type::AnyRef | Type::AnyVal | Type::Null | Type::Error => {
-            "Ljava/lang/Object;".into()
-        }
+        Type::Any | Type::AnyRef | Type::AnyVal | Type::Error => "Ljava/lang/Object;".into(),
         Type::Function { params, .. } => format!("Lscala/Function{};", params.len()),
         Type::Tuple(ts) => format!("Lscala/Tuple{};", ts.len()),
         Type::Method { ret, .. } => jvm_desc(st, ret),
@@ -885,11 +895,19 @@ pub(crate) fn is_trait_owned_term(st: &SymbolTable, id: SymbolId) -> bool {
 /// Constructor parameters (`case class C(name: String)`) keep the direct read:
 /// they are the hot path, and the synthesized members that back them
 /// (`equals`, `copy`, `productElement`) read the field too.
+///
+/// A member of a **separately compiled** class is in the same position for a
+/// different reason -- scalac made its field `private` -- and says so with
+/// [`scala_rs_typer::Symbol::via_accessor`], which the class file's own method
+/// list decided.
 pub(crate) fn reads_via_accessor(st: &SymbolTable, id: SymbolId) -> bool {
     if id.is_none() {
         return false;
     }
     let s = st.get(id);
+    if s.via_accessor {
+        return true;
+    }
     if s.kind != SymKind::Term
         || s.flags.contains(Flags::PARAM)
         || s.flags.contains(Flags::STATIC)
