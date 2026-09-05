@@ -69,6 +69,36 @@ impl Typer {
     /// `::` is entered both as the class `$colon$colon` and as an alias symbol
     /// carrying its type. Patterns need the real class, which holds the
     /// constructor fields.
+    /// The class a **qualified** constructor pattern (`p.C(x)`) names, read
+    /// off the already-typed callee rather than by looking its last segment up
+    /// in the lexical scope.
+    ///
+    /// `None` for a bare `Ident`, which the lexical lookup handles, and for a
+    /// callee that resolved to something other than a class or its companion
+    /// -- an `unapply` reached through a value, say -- where the extractor
+    /// arms are the ones that apply.
+    fn qualified_pattern_class(&self, fun: &Tree) -> Option<SymbolId> {
+        if !matches!(fun.kind, TreeKind::Select { .. }) || fun.sym.is_none() {
+            return None;
+        }
+        match self.st.get(fun.sym).kind {
+            SymKind::Class => Some(self.follow_class_alias(fun.sym)),
+            SymKind::Module | SymKind::ModuleClass => {
+                let mcls = self.st.module_class_of(fun.sym);
+                let base = self.st.get(mcls).name.trim_end_matches('$').to_string();
+                let owner = self.st.get(mcls).owner;
+                self.st
+                    .get(owner)
+                    .members
+                    .iter()
+                    .copied()
+                    .find(|&m| self.st.get(m).kind == SymKind::Class && self.st.get(m).name == base)
+                    .map(|c| self.follow_class_alias(c))
+            }
+            _ => None,
+        }
+    }
+
     fn follow_class_alias(&self, id: SymbolId) -> SymbolId {
         if !self.st.get(id).ctor_fields.is_empty() {
             return id;
@@ -203,6 +233,24 @@ impl Typer {
                     .find(|s| matches!(self.st.get(*s).kind, SymKind::Term | SymKind::Module))
                     .or_else(|| found.first().copied());
                 if let Some(sym) = stable.filter(|_| !is_varid) {
+                    // SLS 8.1.5: the identifier of a stable-id pattern has to
+                    // be *stable*. A `var` is not, and nsc rejects it rather
+                    // than comparing against whatever the variable holds when
+                    // the match runs (`neg/t3816`). Only reachable through a
+                    // backquoted lowercase name or an uppercase one; an
+                    // ordinary lowercase name is a fresh binding and never
+                    // gets here.
+                    if self.st.get(sym).flags.contains(Flags::MUTABLE) {
+                        let shown = if stable_hint {
+                            format!("`{name}`")
+                        } else {
+                            name.clone()
+                        };
+                        self.error(
+                            pat.span,
+                            format!("stable identifier required, but {shown} found"),
+                        );
+                    }
                     pat.sym = sym;
                     pat.ty = self.st.get(sym).ty.clone();
                     // A `val` read back from a classfile is a nullary *method*
@@ -306,16 +354,49 @@ impl Typer {
                 // binding the name *at all*, so a `def Tuple2` in scope hid
                 // the class here even though it is not a class.
                 let scala_ref = fun.scala_ref;
-                let class_id = fun.name().and_then(|n| {
-                    let cands = if scala_ref {
-                        self.st.lookup_scala(n)
-                    } else {
-                        self.st.lookup(n)
-                    };
-                    cands
-                        .into_iter()
-                        .find(|s| self.st.get(*s).kind == SymKind::Class)
-                        .map(|s| self.follow_class_alias(s))
+                // A *qualified* pattern names its class outright, and `fun`
+                // has just been typed, so take the class from the symbol it
+                // resolved to. Looking the last segment up lexically instead
+                // finds whatever else is in scope under that simple name:
+                // `case Ior.Left(a)`, which cats writes 76 times in
+                // `data/Ior.scala`, found the prelude's `scala.util.Left` and
+                // bound `a` to *its* type parameter. Harmless while
+                // `scala.util.Left` carried no `CASE` flag, because the wrong
+                // class then lost to the extractor arm below; giving the
+                // prelude the flag the library pickles made it win.
+                let class_id = self.qualified_pattern_class(fun).or_else(|| {
+                    fun.name().and_then(|n| {
+                        let mut cands = if scala_ref {
+                            self.st.lookup_scala(n)
+                        } else {
+                            self.st.lookup(n)
+                        };
+                        // `lookup` stops at the innermost scope binding the name
+                        // at all, and a *method* of that name is not a
+                        // constructor pattern in nsc's
+                        // `typingConstructorPattern` mode. cats' `NonEmptyList`
+                        // declares `def ::[AA >: A](a: AA)`, which hid the case
+                        // class `scala.::` from every `case h :: t` in the class
+                        // body -- five "not found: extractor ::" in one file.
+                        // Same rule `type_ident` already applies to the
+                        // pattern's function; see
+                        // `SymbolTable::lookup_extractor`.
+                        if ctor_pat
+                            && !cands.is_empty()
+                            && cands
+                                .iter()
+                                .all(|&s| self.st.get(s).kind == SymKind::Method)
+                        {
+                            let alt = self.st.lookup_extractor(n);
+                            if !alt.is_empty() {
+                                cands = alt;
+                            }
+                        }
+                        cands
+                            .into_iter()
+                            .find(|s| self.st.get(*s).kind == SymKind::Class)
+                            .map(|s| self.follow_class_alias(s))
+                    })
                 });
                 if class_id.is_some() {
                     self.reorder_named_pattern_args(args, class_id.unwrap());
@@ -333,7 +414,15 @@ impl Typer {
                         }
                     }
                 }
-                let unapply = self.find_unapply(fun);
+                // `scala.#::` is overloaded, one `unapply` per lazy sequence
+                // type, and the `Stream` one can only be declared once
+                // `Stream` itself is in the table.
+                if fun.name() == Some("#::") {
+                    if let Some(c) = self.st.class_sym_of(sel_ty) {
+                        crate::prelude_consextract::ensure_stream_support(&mut self.st, c);
+                    }
+                }
+                let unapply = self.find_unapply(fun, sel_ty);
                 let unapply_seq = self.find_unapply_seq(fun);
                 // `def unapply(n: Nd) = Some((n.v, n.tag))` has no result type
                 // of its own; without completing it the pattern would see
@@ -535,7 +624,7 @@ impl Typer {
             TreeKind::UnApply { fun, args } => {
                 self.type_expr(fun, &Type::NoType);
                 let u = if pat.sym.is_none() {
-                    self.find_unapply(fun).unwrap_or(SymbolId::NONE)
+                    self.find_unapply(fun, sel_ty).unwrap_or(SymbolId::NONE)
                 } else {
                     pat.sym
                 };
@@ -1088,7 +1177,7 @@ impl Typer {
             .collect()
     }
 
-    fn find_unapply(&self, fun: &Tree) -> Option<SymbolId> {
+    fn find_unapply(&self, fun: &Tree, sel_ty: &Type) -> Option<SymbolId> {
         let owner = if !fun.sym.is_none() {
             let s = self.st.get(fun.sym);
             match s.kind {
@@ -1115,10 +1204,58 @@ impl Typer {
         if owner.is_none() {
             return None;
         }
-        self.st
+        let alts: Vec<SymbolId> = self
+            .st
             .lookup_member(owner, "unapply")
             .into_iter()
-            .find(|m| self.st.get(*m).kind == SymKind::Method)
+            .filter(|m| self.st.get(*m).kind == SymKind::Method)
+            .collect();
+        // An extractor object may be overloaded: `scala.#::` declares one
+        // `unapply` for `LazyList` and one for `Stream`, and they compile to
+        // different descriptors, so taking whichever came first bound
+        // `case h #:: t` on a `Stream` at `LazyList`. The scrutinee's own class
+        // decides; conformance is only the tie-break, because a class the typer
+        // knows only from a classfile has no parents to rule the other
+        // alternative out with.
+        let param = |m: SymbolId| match &self.st.get(m).ty {
+            Type::Method { paramss, .. } => paramss.first().and_then(|ps| ps.first()).cloned(),
+            Type::Function { params, .. } => params.first().cloned(),
+            _ => None,
+        };
+        let sel_cls = self.st.class_sym_of(sel_ty);
+        let fits = |m: SymbolId| {
+            (sel_cls.is_some() && param(m).and_then(|p| self.st.class_sym_of(&p)) == sel_cls)
+                || param(m).is_some_and(|p| self.st.is_sub_type(sel_ty, &p))
+        };
+        if alts.len() > 1 {
+            if let Some(m) = alts
+                .iter()
+                .copied()
+                .find(|&m| {
+                    sel_cls.is_some() && param(m).and_then(|p| self.st.class_sym_of(&p)) == sel_cls
+                })
+                .or_else(|| {
+                    alts.iter()
+                        .copied()
+                        .find(|&m| param(m).is_some_and(|p| self.st.is_sub_type(sel_ty, &p)))
+                })
+            {
+                return Some(m);
+            }
+        }
+        // `scala.#::` matches a `LazyList` or a `Stream` and nothing else -- nsc
+        // says "cannot resolve overloaded unapply" for `case h #:: t` on a
+        // `List`. Falling through to the first alternative would have bound the
+        // tail at the wrong class and emitted a call the JVM rejects, so the
+        // pattern is reported as not found instead. Only this object: for
+        // everything else the scrutinee is checked where it always was.
+        if !alts.is_empty()
+            && self.st.get(owner).jvm_name == crate::prelude_consextract::HASH_COLON_COLON_MODULE
+            && !alts.iter().copied().any(fits)
+        {
+            return None;
+        }
+        alts.into_iter().next()
     }
 
     fn find_unapply_seq(&self, fun: &Tree) -> Option<SymbolId> {
@@ -1365,16 +1502,46 @@ impl Typer {
         let args = [sel];
         let mut ids = Vec::new();
         let mut tys = Vec::new();
-        for tp in tps {
-            if let Some(t) = unify_tparam(tp, &params, &args) {
+        for tp in &tps {
+            if let Some(t) = unify_tparam(*tp, &params, &args) {
                 if !t.is_no_type() && !t.is_error() {
-                    ids.push(tp);
+                    ids.push(*tp);
                     tys.push(t);
                 }
             }
         }
         if ids.is_empty() {
             return out;
+        }
+        // A type parameter the *parameter type* does not mention can still be
+        // determined -- through the bounds of the ones that are. `+:.unapply[A,
+        // C <: Seq[A]](t: C)` names only `C` in its parameter, and `A` is what
+        // the head sub-pattern binds: matching an `ArraySeq[Int]` gives `C =
+        // ArraySeq[Int]`, and `C`'s bound `Seq[A]` against that same scrutinee
+        // (walked to `Seq`) gives `A = Int`. nsc solves the whole constraint
+        // set at once; this is the one shape a library extractor reaches us
+        // with, and without it every `case h +: t` bound `h` as an unresolved
+        // `A`.
+        if ids.len() < tps.len() {
+            for i in 0..ids.len() {
+                let Some(hi) = self.st.get(ids[i]).bound_hi.clone() else {
+                    continue;
+                };
+                let (hi, inst) = self.align_for_unify(&hi, &tys[i]);
+                let hi = [hi];
+                let inst = [inst];
+                for tp in &tps {
+                    if ids.contains(tp) {
+                        continue;
+                    }
+                    if let Some(t) = unify_tparam(*tp, &hi, &inst) {
+                        if !t.is_no_type() && !t.is_error() {
+                            ids.push(*tp);
+                            tys.push(t);
+                        }
+                    }
+                }
+            }
         }
         out.iter()
             .map(|t| crate::symbol::subst_tparams_slice(&ids, &tys, t))
@@ -1405,6 +1572,14 @@ impl Typer {
     /// so both are tried; when neither class is the other's base the pair is
     /// left alone.
     fn align_for_unify(&self, param: &Type, sel_ty: &Type) -> (Type, Type) {
+        // A parameter that *is* a type parameter takes the scrutinee whole.
+        // `class_sym_of` answers with the bound's class for one of those, and
+        // walking the scrutinee up to it threw away exactly what the extractor
+        // is there to keep: `+:.unapply[A, C <: Seq[A]](t: C)` on a
+        // `Vector[Int]` would have bound `C = Seq[Int]`.
+        if matches!(param, Type::TypeParam(_)) {
+            return (param.clone(), sel_ty.clone());
+        }
         let (Some(psym), Some(ssym)) = (self.st.class_sym_of(param), self.st.class_sym_of(sel_ty))
         else {
             return (param.clone(), sel_ty.clone());

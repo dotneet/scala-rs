@@ -186,6 +186,14 @@ pub(crate) fn unapply_param_class(ctx: &EmitCtx, uid: SymbolId) -> Option<String
     if uid.is_none() {
         return None;
     }
+    // `+:` / `:+` take a `SeqOps`, which their prelude signature does not say.
+    if let Some(d) = crate::gen_invoke::cons_extractor_desc(
+        &class_internal(ctx.st, ctx.st.get(uid).owner),
+        ctx.st.get(uid).name.as_str(),
+    ) {
+        let inner = d.strip_prefix("(L")?.split(';').next()?;
+        return Some(inner.to_string());
+    }
     let desc = method_desc_boxed(ctx.st, uid, ctx.boxed_vars);
     let params = desc.strip_prefix('(')?.split(')').next()?.to_string();
     if let Some(rest) = params.strip_prefix('L') {
@@ -226,8 +234,25 @@ pub(crate) fn gen_ctor_fields_pattern(
     args: &[Tree],
     class_id: SymbolId,
     tmp: u16,
+    sel_sort: JvmSort,
     fail: crate::code::Label,
 ) {
+    // A value class is held *unboxed* wherever its static type says so, and a
+    // box is always a reference -- so a scrutinee of primitive sort here is
+    // already the underlying value. `case W(x)` then has nothing to test (the
+    // class is final and the static type names it) and nothing to read: it
+    // binds the sub-pattern to the scrutinee itself. This is what nsc emits
+    // for the same source (`iload; istore`, no `instanceof`). Without it the
+    // `instanceof` / `checkcast` / `getfield` below ran against an `int` local
+    // -- `VerifyError: Bad local variable type`.
+    if !matches!(sel_sort, JvmSort::Ref | JvmSort::Void)
+        && !class_id.is_none()
+        && ctx.st.is_value_class(class_id)
+        && args.len() == 1
+    {
+        gen_pattern(asm, frame, ctx, &args[0], tmp, sel_sort, fail);
+        return;
+    }
     let jvm = if class_id.is_none() {
         pat.name().unwrap_or("java/lang/Object").to_string()
     } else {
@@ -323,7 +348,7 @@ pub(crate) fn gen_unapply_pattern(
         let s = ctx.st.get(uid);
         if s.name == "unapply" && s.flags.contains(Flags::CASE) {
             if let Some(cls) = companion_case_class(ctx.st, s.owner) {
-                gen_ctor_fields_pattern(asm, frame, ctx, pat, args, cls, tmp, fail);
+                gen_ctor_fields_pattern(asm, frame, ctx, pat, args, cls, tmp, sel_sort, fail);
                 return;
             }
         }
@@ -918,7 +943,7 @@ pub(crate) fn gen_pattern(
             } else {
                 pat.sym
             };
-            gen_ctor_fields_pattern(asm, frame, ctx, pat, args, class_id, tmp, fail);
+            gen_ctor_fields_pattern(asm, frame, ctx, pat, args, class_id, tmp, sel_sort, fail);
         }
         TreeKind::UnApply { fun, args } => {
             gen_unapply_pattern(asm, frame, ctx, pat, fun, args, tmp, sel_sort, fail);

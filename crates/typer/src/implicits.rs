@@ -2077,7 +2077,14 @@ impl Typer {
         match &*cand_ty {
             Type::Method { paramss, ret } => {
                 let ps = paramss.first().filter(|ps| ps.len() == 1)?;
-                if self.conv_param_matches(id, from, &ps[0]) {
+                // `implicit def toDeferrer[A](l: => LazyList[A]): Deferrer[A]`
+                // converts a `LazyList` like any other conversion; the thunk is
+                // the *call*'s business, and `adapt` wraps the argument when it
+                // gets there. Reading the parameter as written made every
+                // by-name conversion invisible -- which is the whole of
+                // `a #:: xs`.
+                let p0 = unwrap_byname(&ps[0]);
+                if self.conv_param_matches(id, from, &p0) {
                     Some(self.instantiate_conv_type(id, from, ret))
                 } else {
                     None
@@ -2115,6 +2122,7 @@ impl Typer {
         let Some(param) = param else {
             return vec![Type::AnyRef; tps.len()];
         };
+        let param = &unwrap_byname(param);
         // nsc solves the conversion's parameters against the receiver's *base
         // type* at the parameter's class, not against the receiver as written.
         // `implicit def mapAsScalaMapConverter[K, V](m: java.util.Map[K, V])`
@@ -2224,6 +2232,7 @@ impl Typer {
     }
 
     fn conv_param_matches(&self, id: SymbolId, from: &Type, param: &Type) -> bool {
+        let param = &unwrap_byname(param);
         let erased = self.erase_method_tparams(id, param);
         if self.st.is_sub_type(from, &erased) || matches!(erased, Type::Any | Type::Wildcard) {
             return true;
@@ -2252,6 +2261,15 @@ impl Typer {
             .iter()
             .flatten()
             .all(|want| self.search_implicit_at(want, 1).is_found())
+    }
+
+    /// The single value parameter of a conversion, as declared.
+    pub(crate) fn conv_first_param(&self, id: SymbolId) -> Option<Type> {
+        match &*self.implicit_candidate_ty(id) {
+            Type::Method { paramss, .. } => paramss.first().and_then(|c| c.first()).cloned(),
+            Type::Function { params, .. } => params.first().cloned(),
+            _ => None,
+        }
     }
 
     pub(crate) fn ref_implicit(&self, id: SymbolId, span: Span) -> Tree {
@@ -2919,5 +2937,17 @@ fn applied_args(ty: &Type) -> Option<&[Type]> {
     match ty {
         Type::Class { args, .. } | Type::Applied { args, .. } => Some(args),
         _ => None,
+    }
+}
+
+/// A conversion parameter as the *receiver* has to fit it.
+///
+/// `implicit def toDeferrer[A](l: => LazyList[A])` takes its argument by name,
+/// and a by-name parameter accepts exactly what the type inside it accepts --
+/// the thunk is built by `adapt` at the call, not by the conformance test.
+fn unwrap_byname(t: &Type) -> Type {
+    match t {
+        Type::ByName(inner) => (**inner).clone(),
+        other => other.clone(),
     }
 }
