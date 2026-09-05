@@ -667,3 +667,43 @@ After those, inference through a type-lambda application (the
 next masses. `kernel` alone — 19 errors in 10 of 95 files, no kind-projector
 anywhere in it — is still the better target for a slice that wants to finish
 something.
+
+## simulacrum's `AllOps`: an inherited bound read at the wrong type parameters
+
+**179 errors, 30 files, one root.** `tests/cats_measure.sh` goes from
+**1108 errors / 139 files** to **929 errors / 109 files**; nothing else in the
+log changes, and no new symptom appears.
+
+cats does not use the `@typeclass` macro annotation — it ships the expansion as
+source. Every type class gets an `Ops` trait and an `AllOps` trait that
+restates the same abstract type member, narrowing its upper bound at each
+level:
+
+```scala
+trait Ops[F[_], A] { type TypeClassType <: Functor[F] }
+trait AllOps[F[_], A] extends Ops[F, A] with Invariant.AllOps[F, A] {
+  type TypeClassType <: Functor[F]
+}
+```
+
+We reported `incompatible type in overriding type TypeClassType:
+AllOps.TypeClassType does not conform to <: Functor[F]` — the declaration
+failing to conform to *itself*.
+
+`check_type_member_kind_override` aligned the *type member's own* type
+parameters (`type C[T] <: TypedType[T]` overridden by `type C[T] =
+JdbcType[T]`) but never the **enclosing class's**. So the inherited bound stayed
+`Functor[F_Ops]` while the child's read `Functor[F_AllOps]`: two different type
+parameter symbols, and `is_sub_type` rightly said no. The check only ever
+passed when the traits took no type parameters, which is why it survived this
+long. One `subst_as_seen_from(&Type::ThisType(class_id), …)`, the same step
+`override_check::base_type_at` already does for methods, fixes all 179.
+
+It also makes the diagnostic right when the parent is applied at a concrete
+argument: `trait Sub extends Ops[Box] { type T <: Functor[Cell] }` now reports
+`does not conform to <: Functor[Box]` rather than naming the parent's `F`.
+
+Nothing was loosened. `tests/fixtures/co_allops_bad.scala` pins the four shapes
+nsc rejects — a widened upper bound, a parent applied at a different argument, a
+narrowed lower bound, and an alias outside the inherited bound — and we reject
+all four, in the same places nsc does.

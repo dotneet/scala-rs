@@ -1,0 +1,7 @@
+Box(2)
+Box(11)
+Box(1)
+Box(ab)
+Box(14)
+Pair(k,3)
+dog
