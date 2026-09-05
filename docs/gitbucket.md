@@ -708,6 +708,27 @@ oopsUndefined` and nothing else, and so do we now.
 
 The three are pinned by `tests/fixtures/gb_ovl_shape.scala` (+`_bad`) and
 `gb_cplib_lib.scala` / `gb_cplib_main.scala`, in `crates/cli/tests/e2e.rs`.
+All three tests fail on the parent commit.
+
+Measured on the merged tree, one binary each, against `main` at `a1d8c4f`:
+
+| check | before | after |
+|---|---|---|
+| `tests/gitbucket_measure.sh` | `errors=1373 files_with_errors=184` | **`errors=1246 files_with_errors=185`** |
+| `tests/scalalib_measure.sh` | `errors=1903 files_with_errors=172` | **`errors=1891 files_with_errors=172`** |
+| `tests/slick_measure.sh` | `errors=0 classes=1596` | identical |
+| `tests/cats_measure.sh` | `errors=929 files_with_errors=109` | identical |
+| `tests/slick_run.sh` | — | `progs=12 ok=12 fail=0`, 36/36 attempts |
+| `tests/scala_corpus.sh` (full) | pos 982 / neg 656 / run 444 | identical, test for test |
+| `cargo test --workspace --release` | — | green |
+
+`files_with_errors` going up by one is `util/Authenticator.scala`, which had
+been reported clean only because nothing in it was reached: the ambiguity was
+at the *callers*. Its four errors are root 4's wildcard self type and an
+`ambiguous implicit`, both of which were already counted elsewhere.
+
+`tests/slick_subset.sh` was not run: nothing under `crates/backend/` changed,
+and `slick_run.sh` is the check that executes code.
 
 ### The crash: `lub` had no depth cap
 
