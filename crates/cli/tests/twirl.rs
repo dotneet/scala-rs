@@ -43,6 +43,16 @@
 //!
 //! The two are independent: `a_pickled_alias_and_an_inherited_overload`
 //! fails on either one alone.
+//!
+//! `a_defaulted_apply_is_not_ambiguous_with_a_case_class_static_forwarder`
+//! covers a third, unrelated gap in the same shape: `BaseScalaTemplate` is a
+//! **case class**, and its class file carries a generic *static* `apply`/
+//! `unapply` mirror forwarder for the companion's synthesized members (real
+//! scalac's own pickle-based model never has them there). A template with a
+//! defaulted trailing parameter -- gitbucket's `datetimeago(date, recentOnly
+//! = true)`, called as `datetimeago(date)` at 53 sites -- had its own written
+//! `apply` competing with that phantom inherited one: "ambiguous overload for
+//! apply with arguments (Date)". See `docs/gitbucket.md` root 26.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -358,5 +368,174 @@ fn real_scalac_accepts_the_same_template() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(run_java(&out, jar.to_str().unwrap()), TW_EXPECTED);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `play.twirl.api.BaseScalaTemplate` is a **case class**: `object x extends
+/// BaseScalaTemplate[...]` inherits it, and the case class's own companion
+/// synthesizes `apply`/`unapply`. Real scalac's *pickle*-based model of
+/// `BaseScalaTemplate` never puts those on the class -- they belong to the
+/// companion `BaseScalaTemplate$` -- but the *class file* also carries a
+/// generic **static mirror forwarder** of the same name, for Java callers
+/// that write `BaseScalaTemplate.apply(fmt)` instead of going through
+/// `BaseScalaTemplate$.MODULE$`. See `docs/gitbucket.md` root 26.
+const DA_LIB: &str = r#"
+package dalib
+
+trait Appendable[T] {
+  def add(other: T): T
+}
+
+trait Format[Output <: Appendable[Output]] {
+  type Appendable = Output
+  def raw(text: String): Output
+}
+
+class Html(val body: String) extends Appendable[Html] {
+  def add(other: Html): Html = new Html(body + other.body)
+}
+
+object HtmlFormat extends Format[Html] {
+  def raw(text: String): Html = new Html(text)
+}
+
+case class BaseScalaTemplate[T <: Appendable[T], F <: Format[T]](format: F)
+
+trait Template2[A, B, Result] {
+  def render(a: A, b: B): Result
+}
+"#;
+
+/// The shape Twirl generates for a template with a defaulted trailing
+/// parameter (gitbucket's `datetimeago(date: Date, recentOnly: Boolean =
+/// true)`, 53 call sites): the object's own `apply` is the only one *written*,
+/// but `BaseScalaTemplate`'s static mirror for the case class factory used to
+/// be read as a second, inherited alternative.
+const DA_USER: &str = r#"
+object datetimeago
+    extends dalib.BaseScalaTemplate[dalib.Html, dalib.Format[dalib.Html]](dalib.HtmlFormat)
+    with dalib.Template2[String, Boolean, dalib.Html] {
+
+  def apply(text: String, shout: Boolean = false): dalib.Html =
+    format.raw(if (shout) text.toUpperCase else text)
+
+  def render(text: String, shout: Boolean): dalib.Html = apply(text, shout)
+}
+
+object Main {
+  def main(args: Array[String]): Unit = {
+    // The sugar `datetimeago(text)` is `datetimeago.apply(text)`, relying on
+    // `shout`'s default -- exactly the call shape at gitbucket's 53 sites.
+    println(datetimeago("hi").body)
+    println(datetimeago.render("hi", true).body)
+  }
+}
+"#;
+
+const DA_EXPECTED: &str = "hi\nHI\n";
+
+fn build_da_lib_jar(dir: &Path) -> PathBuf {
+    let src = dir.join("dalib.scala");
+    fs::write(&src, DA_LIB).unwrap();
+    let lib_out = dir.join("dalibout");
+    fs::create_dir_all(&lib_out).unwrap();
+    let scalac = self::scalac().expect("checked by caller");
+    let out = Command::new(&scalac)
+        .arg("-d")
+        .arg(&lib_out)
+        .arg(&src)
+        .output()
+        .expect("run scalac");
+    assert!(
+        out.status.success(),
+        "scalac failed on the miniature case-class library:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lib_jar = dir.join("dalib.jar");
+    pack_jar(&lib_out, &lib_jar);
+    lib_jar
+}
+
+/// A defaulted `apply` on an `object` extending a case class must not be
+/// ambiguous with the case class's own static mirror forwarder.
+#[test]
+fn a_defaulted_apply_is_not_ambiguous_with_a_case_class_static_forwarder() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    };
+    if scalac().is_none() {
+        eprintln!("skip: no scalac to write the pickle with");
+        return;
+    }
+    if jar_tool().is_none() {
+        eprintln!("skip: no `jar` tool");
+        return;
+    }
+    let dir = tmp_dir("datetimeago");
+    let lib_jar = build_da_lib_jar(&dir);
+
+    let user = dir.join("user.scala");
+    fs::write(&user, DA_USER).unwrap();
+    let user_out = dir.join("userout");
+    fs::create_dir_all(&user_out).unwrap();
+    let (ok, msgs) = compile_against(&user_out, &jar, &user, &lib_jar);
+    assert!(
+        ok,
+        "the defaulted-apply template failed to compile against the jar:\n{msgs}"
+    );
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+    assert!(
+        !msgs.contains("ambiguous"),
+        "the object's own `apply` must not be ambiguous with the case \
+         class's static mirror forwarder:\n{msgs}"
+    );
+
+    if java_available() {
+        let cp = format!("{}:{}", jar.display(), lib_jar.display());
+        assert_eq!(
+            run_java(&user_out, &cp),
+            DA_EXPECTED,
+            "stdout mismatch for a_defaulted_apply_is_not_ambiguous_with_a_case_class_static_forwarder"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The fixture is ordinary Scala: real scalac compiles the same two files and
+/// prints the same thing scala-rs does.
+#[test]
+fn real_scalac_accepts_the_same_defaulted_template() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    };
+    let Some(scalac) = scalac() else {
+        eprintln!("skip: no scalac");
+        return;
+    };
+    if !java_available() {
+        eprintln!("skip: no java");
+        return;
+    }
+    let dir = tmp_dir("datetimeago-scalac");
+    let lib = dir.join("dalib.scala");
+    let user = dir.join("user.scala");
+    fs::write(&lib, DA_LIB).unwrap();
+    fs::write(&user, DA_USER).unwrap();
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let result = Command::new(&scalac)
+        .arg("-d")
+        .arg(&out)
+        .args([&lib, &user])
+        .output()
+        .expect("run scalac");
+    assert!(
+        result.status.success(),
+        "scalac rejected the fixture:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(run_java(&out, jar.to_str().unwrap()), DA_EXPECTED);
     let _ = fs::remove_dir_all(&dir);
 }

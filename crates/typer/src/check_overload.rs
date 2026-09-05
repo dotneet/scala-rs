@@ -315,7 +315,27 @@ impl Typer {
                 // *and* inherits the abstract `Function1.apply(T1): R` through
                 // `scala.runtime.AbstractFunction1`, and the second is the
                 // first, not a second alternative.
-                let apply = self.drop_overridden(self.st.lookup_member(*sym, "apply"));
+                //
+                // `not_inherited_static`: scalac mirrors every companion
+                // member onto the class's own file as a static forwarder, and
+                // a class file reader installs it like a real member --
+                // inherited by a subclass exactly like anything else, which a
+                // *static* member never is (nsc: "static Java members belong
+                // to companion objects; they are not inherited", and the same
+                // holds for this bytecode-only mirror). Selecting through the
+                // exact class it is declared on is what the forwarder is for
+                // (`cats.effect.IO.apply(...)`, read this way before the
+                // on-demand pickle path gets a chance to refine the erased
+                // by-name signature); reaching it only by inheriting from an
+                // ancestor is not (a Twirl `object` extending the case class
+                // `BaseScalaTemplate` inherited its companion's static
+                // `apply` alongside its own written one and could not tell
+                // the two apart -- `docs/gitbucket.md` root 26).
+                let apply = self
+                    .drop_overridden(self.st.lookup_member(*sym, "apply"))
+                    .into_iter()
+                    .filter(|&m| not_inherited_static(&self.st, m, *sym))
+                    .collect::<Vec<_>>();
                 for m in apply {
                     // As seen from the receiver, like `type_select`: an
                     // `apply` inherited from a generic parent is only itself
@@ -334,7 +354,11 @@ impl Typer {
                 }
             }
             Type::ModuleRef(id) => {
-                for m in self.drop_overridden(self.st.lookup_member(*id, "apply")) {
+                let apply = self
+                    .drop_overridden(self.st.lookup_member(*id, "apply"))
+                    .into_iter()
+                    .filter(|&m| not_inherited_static(&self.st, m, *id));
+                for m in apply {
                     if let Type::Method { paramss, ret } = &self.st.get(m).ty {
                         cands.push((
                             m,
@@ -2138,4 +2162,33 @@ impl Typer {
             FConvKind::Unsupported => false,
         }
     }
+}
+
+/// Whether `m` is fine to use as an "apply" candidate at the receiver
+/// `recv_cls` -- true for everything but a *static* member reached only by
+/// inheriting from an ancestor.
+///
+/// A class file's `ACC_STATIC` method is never a real member in nsc's own
+/// model (Scala has no static members): it is either a genuine Java static,
+/// which nsc does not inherit into a subclass either ("static Java members
+/// belong to companion objects in Scala; they are not inherited"), or a
+/// mirror forwarder scalac writes for a same-named companion object's public
+/// members, so Java code can write `C.member(...)` instead of
+/// `C$.MODULE$.member(...)`. Selecting one through the *exact* class/module
+/// it is declared on is what it is for -- `cats.effect.IO.apply(...)`, read
+/// this way before `Checker::retry_module_apply_from_pickle` gets a chance to
+/// correct the erased by-name signature the class file can only spell as
+/// `Function0`. Reaching the same symbol only because a *subclass* inherited
+/// it from that ancestor is not: `object datetimeago extends
+/// BaseScalaTemplate[...](fmt)` (a case class) inherited its companion's
+/// static `apply` alongside its own written `apply(date, recentOnly =
+/// true)`, and every Twirl template with a defaulted trailing parameter had
+/// the two competing -- "ambiguous overload for apply/datetimeago with
+/// arguments (Date)", `docs/gitbucket.md` root 26.
+pub(crate) fn not_inherited_static(
+    st: &crate::symbol::SymbolTable,
+    m: SymbolId,
+    recv_cls: SymbolId,
+) -> bool {
+    !st.get(m).flags.contains(Flags::STATIC) || st.get(m).owner == recv_cls
 }
