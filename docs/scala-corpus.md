@@ -703,7 +703,8 @@ The `VerifyError` / `ClassCastException` / `NoSuchMethodError` /
 `AbstractMethodError` / `IncompatibleClassChangeError` rows above are one
 sub-pile: 116 tests that compile, write classfiles, and are then rejected by
 the JVM. Grouped by *cause* rather than by symptom they came to far fewer than
-116 roots. Nine were fixed; the rest are recorded here so the next pass does
+116 roots. Nine were fixed, taking 16 of the 116 from failing to passing (0
+before); the rest are recorded here so the next pass does
 not re-derive them.
 
 Fixed, with the number of the 116 each moved to passing:
@@ -715,7 +716,7 @@ Fixed, with the number of the 116 each moved to passing:
 | `NonLocalReturnControl.value()` returned without the cast the method descriptor promises | 3 |
 | a case class's companion `unapply` was never emitted | 3 |
 | `<Trait>$$$outer()` unimplemented when the enclosing instance is an enclosing *object* | 1 |
-| a trait parent's own superclass did not become the template's superclass (SLS 5.1.2) | 1 |
+| a trait parent's own superclass did not become the template's superclass (SLS 5.1.2) | 0 (unblocks `t11736`, `t2544`) |
 | a value class's companion `apply` emitted with the boxed descriptor instead of the erased one | 2 |
 | a `class`/`object` declared inside a *local* class never reached a classfile | 1 |
 | a named import of a member the object only *inherits* lost its receiver | 1 |
@@ -736,8 +737,21 @@ Still open, in descending size:
 * **Name-based extractors (4).** `string-extractor`, `t7850c`, `t7850d`,
   `value-class-extractor-seq`. The pattern matcher assumes `unapply` returns an
   `Option` and calls `Option.get` on whatever comes back.
-* **`try`/`finally` operand stack (4).** `Course-2002-06`, `finally`,
-  `exceptions-2`, `t3269`.
+* **`try`/`finally` operand stack (3).** `Course-2002-06`, `finally`,
+  `exceptions-2`.
+* **`Iterator` in term position (1).** `t3269`. The bare name resolves to the
+  *trait* rather than to `object Iterator` — `scala.collection.Iterator.empty`
+  and `Iterator(1, 2, 3)` both emit the module receiver, `Iterator.empty` emits
+  none, so the method is invoked on an empty stack. `scala.package.Iterator` is
+  a `val` in the `scala` package object; the type alias of the same name is
+  what our lookup finds.
+* **A case class read back from a pickle loses its `CASE` flag.**
+  `crates/backend/src/pickle.rs` *writes* it (bit 11 of the extra flag word);
+  nothing on the reading side sets `Flags::CASE`. So a case class on the
+  classpath is matched through its extractor rather than as a constructor
+  pattern, and `productArity`, `copy` and `==` are all decided from a symbol
+  that does not know it is a case class. `Typer::case_ctor_field_types` works
+  around the one consequence that had a test; the flag itself is still lost.
 * **Macro defs read back from a classfile (≈19).** Every `macro-*` test here
   fails with `NoSuchMethodError` on the macro *def* itself: round two reads
   `Macros` from a classfile, where the `MACRO` flag and the `@macroImpl`
