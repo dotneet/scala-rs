@@ -381,6 +381,22 @@ pub struct Symbol {
     /// (deferred) and `abstract override def close(): Unit = …` (stackable)
     /// are indistinguishable there.
     pub abstract_override: bool,
+    /// `@specialized` on a **type parameter**: the types it selects, read the
+    /// way nsc's `specializedOn` reads them (see
+    /// `scala_rs_parser::specialization`). `None` when the parameter carries
+    /// no `@specialized`, and `Some(empty)` when it carries one that names
+    /// nothing specializable.
+    ///
+    /// Recording it is stage 1 of specialization: nothing yet *uses* it, since
+    /// nsc's `specialize` phase runs after the typer and the typer applies no
+    /// rule that depends on the annotation. What is still missing is the
+    /// phase itself — no `Foo$mcI$sp` is emitted — and
+    /// `tests/spec_classfiles.sh` measures exactly that gap.
+    pub specialized: Option<scala_rs_parser::SpecializedTypes>,
+    /// `@unspecialized` on a member: nsc's opt-out from the specialization its
+    /// owner would otherwise give it. Recorded for the same reason, and with
+    /// the same nothing reading it yet.
+    pub unspecialized: bool,
     /// nsc `DEFERRED` for a **value**: `val v: Int` / `var v: Int` written with
     /// no right-hand side. The namer sets `ABSTRACT` on a body-less `def` but
     /// not on a body-less `val`, so without this an abstract `val` in a trait
@@ -685,6 +701,8 @@ impl SymbolTable {
                 pickled_origin: String::new(),
                 abstract_override: false,
                 deferred_val: false,
+                specialized: None,
+                unspecialized: false,
             }],
             scopes: vec![Scope::default()],
             root: SymbolId(0),
@@ -784,6 +802,8 @@ impl SymbolTable {
             pickled_origin: String::new(),
             abstract_override: false,
             deferred_val: false,
+            specialized: None,
+            unspecialized: false,
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {
@@ -799,6 +819,22 @@ impl SymbolTable {
 
     pub fn get_mut(&mut self, id: SymbolId) -> &mut Symbol {
         &mut self.symbols[id.0 as usize]
+    }
+
+    /// Copy whatever `@specialized` / `@unspecialized` a definition's
+    /// modifiers carry onto its symbol. See [`Symbol::specialized`].
+    ///
+    /// The parser has already normalised import renames and has already
+    /// dropped both annotations under `-no-specialization`, so an annotation
+    /// reaching here is one nsc would act on.
+    pub fn record_specialization(&mut self, id: SymbolId, annots: &[scala_rs_parser::Tree]) {
+        for a in annots {
+            if let Some(types) = scala_rs_parser::specialized_types(a) {
+                self.get_mut(id).specialized = Some(types);
+            } else if scala_rs_parser::is_unspecialized(a) {
+                self.get_mut(id).unspecialized = true;
+            }
+        }
     }
 
     pub fn enter_in_current(&mut self, name: &str, id: SymbolId) {

@@ -2,10 +2,15 @@ pub mod ast;
 pub mod finterp;
 pub mod parse;
 pub mod pretty;
+pub mod specialization;
 
 pub use ast::*;
 pub use parse::{parse_source, parse_source_opts, ParseOptions, ParseResult};
 pub use pretty::dump_tree;
+pub use specialization::{
+    canonical_specialization_name, is_unspecialized, specialized_types, SpecializedType,
+    SpecializedTypes,
+};
 
 use scala_rs_lexer::tokenize;
 use scala_rs_span::{Diagnostic, SourceFile};

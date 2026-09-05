@@ -4073,3 +4073,31 @@ fn co_allops_fixture() {
 fn co_allops_bad_is_rejected() {
     compile_fails("co_allops_bad", "incompatible type in overriding type T");
 }
+
+// --------------------------------------------------- @specialized (stage 1)
+
+/// `@specialized` and `@unspecialized` are accepted and recorded on the
+/// symbol; the `specialize` phase is not implemented, so nothing `$mc*$sp`
+/// comes out. The program runs, and it computes what the same program without
+/// the annotation computes -- which is the whole reason accepting it is sound
+/// while the phase is missing. `tests/spec_classfiles.sh` is the ledger that
+/// keeps the gap visible; see docs/specialization.md.
+#[test]
+fn sp_annot_fixture() {
+    check("sp_annot");
+    dual_run_fixture("sp_annot");
+}
+
+/// `import scala.{specialized => sp}` is how cats and the collections spell
+/// it. Library mode only: the private runtime has no `scala.specialized` for
+/// the import to name.
+#[test]
+fn sp_alias_fixture() {
+    dual_run_fixture("sp_alias");
+}
+
+/// The annotation is a performance hint and must not soften type checking.
+#[test]
+fn sp_annot_bad_is_rejected() {
+    compile_fails("sp_annot_bad", "type mismatch");
+}
