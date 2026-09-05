@@ -3867,6 +3867,8 @@ fn stable_identifier_patterns() {
 #[test]
 fn case_companion_var_param_and_unit_lub() {
     dual_run_fixture("rm_classbody");
+}
+
 // ------------------------------------- gitbucket: overload resolution shapes
 
 /// nsc filters overload alternatives on the *shape* of a function-literal
