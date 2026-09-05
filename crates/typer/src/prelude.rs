@@ -759,6 +759,11 @@ fn add_scala_aliases(st: &mut SymbolTable, library_abi: bool) {
     crate::prelude_stringops8::install(st, library_abi);
     // `Coll.empty` is made polymorphic in one final pass (once every companion is present).
     crate::prelude_empty::install(st);
+    // `java.lang.ClassLoader` and `Class#getClassLoader()`, so
+    // `JavaUniverse#runtimeMirror(ClassLoader)` -- read from scala-reflect.jar's
+    // own pickle -- has a parameter type to install against. Unconditional:
+    // `ClassLoader` is a plain JDK class, not something `--scala-library` gates.
+    crate::prelude_reflectruntime::install(st);
 }
 
 fn mark_java(st: &mut SymbolTable, id: SymbolId) {

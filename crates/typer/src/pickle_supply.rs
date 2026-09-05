@@ -26,7 +26,7 @@ use scala_rs_pickle::sym::{MemberKind, SigCache, SigType};
 use scala_rs_pickle::ClassSource;
 
 use crate::javaclass::{parse_java_classfile, BinaryIndex, JavaClass};
-use crate::symbol::{SymKind, SymbolTable};
+use crate::symbol::{MacroBinding, SymKind, SymbolTable};
 
 /// `SCALA_RS_PICKLE_DEBUG=1` traces why a member was or was not supplied.
 /// Completion is silent otherwise: a member it declines to supply surfaces as
@@ -1019,17 +1019,41 @@ impl PickleSupply {
                 h.member.ty
             ));
         }
-        let hit = hits.into_iter().find(|h| {
-            matches!(
-                h.member.kind,
-                MemberKind::TypeAlias | MemberKind::AbstractType
-            ) && h.member.is_public_api()
-        })?;
-        if hit.member.kind == MemberKind::AbstractType {
-            let qualified = format!("{}.{name}", hit.owner);
-            return self.abstract_type_member(st, bin, &qualified, 0);
+        let type_hit = hits
+            .iter()
+            .find(|h| {
+                matches!(
+                    h.member.kind,
+                    MemberKind::TypeAlias | MemberKind::AbstractType
+                ) && h.member.is_public_api()
+            })
+            .cloned();
+        if let Some(hit) = type_hit {
+            if hit.member.kind == MemberKind::AbstractType {
+                let qualified = format!("{}.{name}", hit.owner);
+                return self.abstract_type_member(st, bin, &qualified, 0);
+            }
+            return self.install_type_alias(st, bin, &hit.owner, name, &hit.member.ty);
         }
-        self.install_type_alias(st, bin, &hit.owner, name, &hit.member.ty)
+        // A *nested class or trait* named as a **type**, as opposed to a type
+        // alias or an abstract type member: `u.TypeTag[T]` (`TypeTags.TypeTag`),
+        // `c.universe.Transformer` (`Trees.Transformer`), `u.Liftable[Int]`
+        // (`Liftables.Liftable`). The reflection API is written almost
+        // entirely of these. `complete_named`'s `MemberKind::Module` arm
+        // supplies the *term* half of the same shape (a nested `object`, via
+        // `install_nested_module`); nothing supplied the *type* half before
+        // this, so naming the class itself gave "not a member of Universe" /
+        // "not found: type ..." even though the classfile genuinely exists on
+        // the classpath. See docs/macros.md, items 4 and 5 of the §7.8 list.
+        let class_hit = hits
+            .into_iter()
+            .find(|h| h.member.kind == MemberKind::Class && h.member.is_public_api())?;
+        let qualified = format!("{}.{name}", class_hit.owner);
+        let sym = self.ensure_class(st, bin, &qualified, false)?;
+        Some(Type::Class {
+            sym,
+            args: Vec::new(),
+        })
     }
 
     /// `type T[tps] = U` from a pickle, as the type it stands for.
@@ -1262,6 +1286,27 @@ impl PickleSupply {
                 }
                 continue;
             }
+            // A macro def (`MACRO` in the pickled flags). It leaves no
+            // bytecode at all -- nsc's own rule, `docs/macros.md` §1.1 -- so
+            // the general path below, which finds the *method* by matching an
+            // erased descriptor against the owner's real classfile, can never
+            // succeed for one; the failure was observed as
+            // `scala/reflect/runtime/package$#currentMirror/0: no unambiguous
+            // erased descriptor (want [])`, which is 0 candidates (no
+            // bytecode) read as "not unambiguous", not evidence of a
+            // collision. `install_known_macro` supplies the handful this
+            // module knows a real, honest binding for; anything else falls
+            // through and is declined exactly as before.
+            if m.kind == MemberKind::Def && m.has(pflags::MACRO) {
+                if let Some(id) =
+                    self.install_known_macro(st, bin, class_sym, &internal, name, &m.ty)
+                {
+                    if !installed.contains(&id) {
+                        installed.push(id);
+                    }
+                }
+                continue;
+            }
             if m.kind != MemberKind::Def && m.kind != MemberKind::Val {
                 continue;
             }
@@ -1319,6 +1364,104 @@ impl PickleSupply {
             installed.len()
         ));
         installed
+    }
+
+    /// Supply the small, fixed set of macro defs this module knows a real
+    /// implementation binding for, by full name.
+    ///
+    /// A macro def's declaration survives in the `ScalaSignature` (that is
+    /// how `hits` found it at all), but its *implementation* is looked up a
+    /// different way: nsc reads a pickled `@scala.reflect.macros.internal
+    /// .macroImpl(...)` annotation naming the class/method to call
+    /// (`docs/macros.md` §1.1). Annotations are not decoded by this reader at
+    /// all -- only member declarations and their types are -- so that path is
+    /// not available here in general, and building it would not help this
+    /// case regardless: `scala.reflect.runtime.currentMirror` is one of nsc's
+    /// **fast-track** macros (`scala.tools.reflect.FastTrack`), which the
+    /// compiler recognises by the macro symbol's *full name* and never
+    /// consults the pickled annotation for -- the annotation actually present
+    /// on the real classfile is a placeholder (`macro ???`), not a usable
+    /// reference.
+    ///
+    /// So this supplies exactly the bindings scala-rs knows, the same way
+    /// nsc's own `FastTrack` table does: by name, hand-verified against the
+    /// real jar. `scala.reflect.runtime.Macros.currentMirror(c:
+    /// blackbox.Context): c.Expr[universe.Mirror]` is a real, ordinary
+    /// blackbox macro implementation with real bytecode (confirmed with
+    /// `javap scala.reflect.runtime.Macros$` against scala-reflect.jar
+    /// 2.13.16; see `docs/notes/macro-reflect-and-reify.md`). Nothing here
+    /// invents behaviour: the return type is read from this same pickle, and
+    /// the existing JVM-bridge macro engine (`crates/typer/src/expand.rs`)
+    /// decides at the call site whether it can actually expand the binding,
+    /// reporting its own "macro expansion is not implemented" diagnostic
+    /// (`Typer::report_macro_calls`) when some part of the call -- `c
+    /// .reifyEnclosingRuntimeClass` chief among them -- is not wired up
+    /// there yet. Either way the name is never silently accepted: it becomes
+    /// visible with its real type, and any actual use goes through the same
+    /// expansion-or-diagnose path as a source-level macro def.
+    fn install_known_macro(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        internal: &str,
+        name: &str,
+        ty: &SigType,
+    ) -> Option<SymbolId> {
+        let (impl_class, impl_method) = match (internal, name) {
+            ("scala/reflect/runtime/package$", "currentMirror") => {
+                ("scala/reflect/runtime/Macros$", "currentMirror")
+            }
+            _ => return None,
+        };
+        let shape = read_shape(ty)?;
+        // Only the zero-argument, non-generic shape nsc actually declares for
+        // `currentMirror` is handled; anything else is left alone rather than
+        // guessed at.
+        if !shape.clauses.is_empty() || !shape.tparams.is_empty() {
+            trace(format_args!(
+                "{internal}#{name}: known macro binding does not match the pickled shape"
+            ));
+            return None;
+        }
+        if let Some(existing) = st
+            .get(class_sym)
+            .members
+            .iter()
+            .copied()
+            .find(|&s| st.get(s).name == name)
+        {
+            return Some(existing);
+        }
+        let outer = self.self_ty.replace(Type::Class {
+            sym: class_sym,
+            args: Vec::new(),
+        });
+        let ret = self.conv_at(st, bin, &HashMap::new(), &shape.ret, 0);
+        self.self_ty = outer;
+        let Some(ret) = ret else {
+            trace(format_args!(
+                "{internal}#{name}: known macro binding's return type does not convert"
+            ));
+            return None;
+        };
+        let id = st.alloc(name, class_sym, SymKind::Method, Flags::FINAL, "");
+        st.get_mut(id).ty = Type::Method {
+            paramss: Vec::new(),
+            ret: Box::new(ret),
+        };
+        st.get_mut(id).macro_impl = Some(MacroBinding {
+            impl_class: impl_class.to_string(),
+            impl_method: impl_method.to_string(),
+            blackbox: true,
+            tag_params: 0,
+            expr_args: Vec::new(),
+        });
+        st.get_mut(class_sym).members.push(id);
+        trace(format_args!(
+            "{internal}#{name}: supplied as a known macro binding ({impl_class}.{impl_method})"
+        ));
+        Some(id)
     }
 
     /// Supply a nested `object` a pickle declares, as a **module accessor**.
