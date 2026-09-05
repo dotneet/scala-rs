@@ -83,6 +83,7 @@ mod symbol;
 mod traitparent;
 mod uncurry;
 mod value_companion;
+mod valueclass;
 mod views;
 
 pub use anon_capture::mark_anon_captures;
