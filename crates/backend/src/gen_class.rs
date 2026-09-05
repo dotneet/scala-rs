@@ -13,6 +13,16 @@ use scala_rs_typer::SymKind;
 use std::collections::{HashMap, HashSet};
 
 impl<'a> Gen<'a> {
+    /// The generic signature recorded for `sym` before erasure, if any.
+    /// `SymbolId::NONE` and every symbol the pass skipped answer `None`, which
+    /// leaves the member with no `Signature` attribute.
+    pub(crate) fn sig_of(&self, sym: SymbolId) -> Option<&crate::sig::GenericSignature> {
+        if sym.is_none() {
+            return None;
+        }
+        self.generic_sigs.get(&sym)
+    }
+
     pub(crate) fn emit_anon_classes(&mut self, tree: &Tree) {
         if let TreeKind::New { tpt } = &tree.kind {
             if let TreeKind::ClassDef { name, impl_, .. } = &tpt.kind {
@@ -351,6 +361,7 @@ impl<'a> Gen<'a> {
                         let acc = method_access_flags(mods.flags, widened(self.st, stt.sym))
                             | ACC_ABSTRACT;
                         b.add_abstract(acc, name, &def_method_desc(self.st, stt));
+                        b.sign_last(self.sig_of(stt.sym));
                     }
                     if needs_super_accessor(stt) {
                         let acc_name = super_accessor_name(self.st, class_id, name);
@@ -374,18 +385,21 @@ impl<'a> Gen<'a> {
                     // implementing class. `emit_trait_bodies` emits both.
                     if !(mods.flags.contains(Flags::LAZY) && !rhs.is_empty()) {
                         b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, name, &gdesc);
+                        b.sign_last_accessor(self.sig_of(stt.sym), false);
                     }
                     let sdesc = format!("({})V", jvm_desc_val(self.st, &ty));
                     if mods.flags.contains(Flags::MUTABLE) {
                         // A trait `var` — abstract or not — is a getter plus a
                         // public `v_$eq`, exactly as nsc emits it.
                         b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, &var_setter_name(name), &sdesc);
+                        b.sign_last_accessor(self.sig_of(stt.sym), true);
                     } else if !rhs.is_empty() && !mods.flags.contains(Flags::LAZY) {
                         b.add_abstract(
                             ACC_PUBLIC | ACC_ABSTRACT,
                             &trait_val_setter_name(self.st, class_id, name),
                             &sdesc,
                         );
+                        b.sign_last_accessor(self.sig_of(stt.sym), true);
                     }
                 }
             }
@@ -427,6 +441,7 @@ impl<'a> Gen<'a> {
             // `$init$`, all on the interface itself (nsc 2.13's trait ABI).
             self.emit_trait_bodies(&mut b, class_id, &this_name);
             attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
+            b.sign_class(self.sig_of(class_id));
             self.finish_companion_class(b, has_object);
             // `emit_trait_bodies` drains whatever the trait's own bodies
             // queued, onto the interface (nsc puts `$anonfun$` statics there
@@ -458,6 +473,7 @@ impl<'a> Gen<'a> {
                         name: name.clone(),
                         desc: jvm_desc_val(self.st, &ty),
                     });
+                    b.sign_field(name, self.sig_of(p.sym));
                 }
             }
         }
@@ -489,6 +505,22 @@ impl<'a> Gen<'a> {
                     name: name.clone(),
                     desc: jvm_desc_val(self.st, &ty),
                 });
+                b.sign_field(name, self.sig_of(stt.sym));
+            }
+        }
+        // `@SerialVersionUID(n)`: nsc emits a `private static final long
+        // serialVersionUID` whose value lives in a JVMS §4.7.2 `ConstantValue`
+        // -- there is no `<clinit>` store, and `ObjectStreamClass.lookup`
+        // reads the attribute. Without the field the JVM computes a UID from
+        // the class's shape instead (`run/t6988`).
+        if let Some(uid) = serial_version_uid(mods) {
+            if !b.fields.iter().any(|f| f.name == "serialVersionUID") {
+                b.fields.push(Field {
+                    access: ACC_PRIVATE | ACC_STATIC | ACC_FINAL,
+                    name: "serialVersionUID".into(),
+                    desc: "J".into(),
+                });
+                b.field_constants.insert("serialVersionUID".into(), uid);
             }
         }
         for (name, ty, extra) in self.mixin_val_fields(class_id, vparamss, &impl_.body) {
@@ -552,6 +584,7 @@ impl<'a> Gen<'a> {
         self.emit_binary_parent_bridges(&mut b, class_id);
         self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
+        b.sign_class(self.sig_of(class_id));
         self.finish_companion_class(b, has_object);
     }
 
@@ -1241,6 +1274,7 @@ impl<'a> Gen<'a> {
         let acc = method_access_flags(mods.flags, widened(self.st, def.sym));
         if mods.flags.contains(Flags::NATIVE) {
             b.add_abstract(acc, name, &desc);
+            b.sign_last(self.sig_of(def.sym));
             if let Some(d) = java_deprecated_desc(mods) {
                 b.add_java_annot_to_last(d);
             }
@@ -1248,6 +1282,7 @@ impl<'a> Gen<'a> {
         }
         if rhs.is_empty() {
             b.add_abstract(acc | ACC_ABSTRACT, name, &desc);
+            b.sign_last(self.sig_of(def.sym));
             if let Some(d) = java_deprecated_desc(mods) {
                 b.add_java_annot_to_last(d);
             }
@@ -1311,6 +1346,7 @@ impl<'a> Gen<'a> {
             ctx.method_sym = meth;
             finish_method_body(asm, &mut frame, &ctx, rhs, &ret_for_body);
         });
+        b.sign_last(self.sig_of(def.sym));
         if let Some(d) = java_deprecated_desc(mods) {
             b.add_java_annot_to_last(d);
         }
@@ -1642,5 +1678,80 @@ impl<'a> Gen<'a> {
                 },
             );
         }
+    }
+}
+
+/// The value of a `@SerialVersionUID(n)` annotation on a template, if it has
+/// one and `n` is a constant this can fold. nsc runs the argument through the
+/// full constant folder; `10L + 3L` (`run/t6988`) is the shape that actually
+/// appears, so the arithmetic below covers the operators a `Long` constant
+/// expression can use and nothing else. An argument it cannot fold leaves the
+/// class exactly as it was before: no field, and the JVM's computed UID.
+pub(crate) fn serial_version_uid(mods: &scala_rs_parser::Modifiers) -> Option<i64> {
+    for a in &mods.annotations {
+        if !matches!(
+            a.annotation_path().as_str(),
+            "SerialVersionUID" | "scala.SerialVersionUID"
+        ) {
+            continue;
+        }
+        if let TreeKind::Apply { args, .. } = &a.kind {
+            if let [arg] = args.as_slice() {
+                return const_long(arg);
+            }
+        }
+    }
+    None
+}
+
+fn const_long(t: &Tree) -> Option<i64> {
+    if let scala_rs_parser::Type::Constant(l) = &t.ty {
+        if let Some(v) = lit_long(l) {
+            return Some(v);
+        }
+    }
+    match &t.kind {
+        TreeKind::Literal { lit } => lit_long(lit),
+        TreeKind::Typed { expr, .. } => const_long(expr),
+        TreeKind::Apply { fun, args } => {
+            let TreeKind::Select { qual, name } = &fun.kind else {
+                return None;
+            };
+            let l = const_long(qual)?;
+            match args.as_slice() {
+                [] => match name.as_str() {
+                    "unary_-" => Some(l.wrapping_neg()),
+                    "unary_~" => Some(!l),
+                    "toLong" | "toInt" => Some(l),
+                    _ => None,
+                },
+                [r] => {
+                    let r = const_long(r)?;
+                    match name.as_str() {
+                        "+" => Some(l.wrapping_add(r)),
+                        "-" => Some(l.wrapping_sub(r)),
+                        "*" => Some(l.wrapping_mul(r)),
+                        "/" if r != 0 => Some(l.wrapping_div(r)),
+                        "%" if r != 0 => Some(l.wrapping_rem(r)),
+                        "|" => Some(l | r),
+                        "&" => Some(l & r),
+                        "^" => Some(l ^ r),
+                        "<<" => Some(l.wrapping_shl(r as u32)),
+                        ">>" => Some(l.wrapping_shr(r as u32)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn lit_long(l: &scala_rs_parser::Lit) -> Option<i64> {
+    match l {
+        scala_rs_parser::Lit::Long(v) => Some(*v),
+        scala_rs_parser::Lit::Int(v) => Some(*v as i64),
+        _ => None,
     }
 }

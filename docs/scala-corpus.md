@@ -821,9 +821,12 @@ deleted test rather than a crash.
 
 Roots left in the third group, largest first:
 
-* **No `Signature` attribute is ever emitted** (`t7521b`, `t8756`, and every
-  future Java-generics interop question). `getGenericInterfaces` /
-  `toGenericString` see the erased shape.
+* ~~**No `Signature` attribute is ever emitted**~~ (`t7521b`, `t8756`). Done,
+  2026-09-06, `agent/signature`: JVMS 4.7.9 signatures are emitted for classes,
+  methods, constructors and fields, built before this compiler's destructive
+  erasure phase and attached only where they erase back to the descriptor they
+  sit next to. Both tests reproduce their `.check` exactly. See
+  [`language-support.md`](language-support.md) for what is and is not spelled.
 * **Constructor-parameter elision** (`t12002`, `t6793b`): nsc drops a
   `private[this]` parameter field that nothing reads after the constructor,
   and aliases a parameter passed straight through to a superclass field.
@@ -838,8 +841,9 @@ Roots left in the third group, largest first:
   `AAA1.super.f` ran `BBB.f`.
 * **Outer-aware equality for a case class nested in a trait** (`t6911`), and
   the outer check in a type test generally (`t7171`).
-* **`@SerialVersionUID`** (`t6988`): no `serialVersionUID` field is emitted,
-  which needs a `ConstantValue` attribute the field writer does not have.
+* ~~**`@SerialVersionUID`**~~ (`t6988`). Done, 2026-09-06, `agent/signature`:
+  the `private static final long serialVersionUID` and its JVMS 4.7.2
+  `ConstantValue`, with the argument constant-folded.
 * Singletons: `classOf` with its type argument inferred from the expected type
   (`t4871`), erasure of `Unit with AnyRef` (`t5568`), a redundant parent left
   in the interface list (`t8931`), overload resolution between `AnyVal` and

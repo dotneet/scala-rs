@@ -228,6 +228,10 @@ impl<'a> Gen<'a> {
         if private {
             return;
         }
+        // Only the `default` method carries the signature: the `m$` static
+        // beside it takes `$this` as an extra parameter, which no Scala type
+        // describes, and nsc leaves that one unsigned too.
+        b.sign_last(self.sig_of(def.sym));
         // `public static m$($this, …)`: nsc's entry point for the mixin
         // forwarder every implementing class carries and for `super` calls
         // into the trait, forwarding to the `default` method with
@@ -2716,6 +2720,7 @@ impl<'a> Gen<'a> {
                         emit_getfield(asm, &cn, &fname, &fd);
                         emit_return(asm, &ret_ty);
                     });
+                    b.sign_last_accessor(self.sig_of(p.sym), false);
                 }
                 // The parent may declare the member with an erased signature
                 // (`def value: T` becomes `value()Object`); bridge to it.
@@ -2801,6 +2806,7 @@ impl<'a> Gen<'a> {
                 emit_getfield(asm, &cls, &fname, &fdesc);
                 emit_return(asm, &ret_ty);
             });
+            b.sign_last_accessor(self.sig_of(stt.sym), false);
             // A `var` also gets nsc's `v_$eq`; that is the setter an abstract
             // `var` declared in a mixed-in trait resolves to.
             if !mods.flags.contains(Flags::MUTABLE) {
@@ -2826,6 +2832,7 @@ impl<'a> Gen<'a> {
                     asm.vreturn();
                 },
             );
+            b.sign_last_accessor(self.sig_of(stt.sym), true);
         }
     }
 }

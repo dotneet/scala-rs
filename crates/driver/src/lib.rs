@@ -253,6 +253,9 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
 
     let mut mains = Vec::new();
     let shared_st;
+    // Filled in just before erasure; `None` when the run stopped at a type
+    // error, in which case nothing is emitted anyway.
+    let mut generic_sigs: Option<std::rc::Rc<scala_rs_backend::GenericSignatures>> = None;
     {
         // One symbol table for the whole run: every unit is named before any
         // is typed, so files can reference each other.
@@ -361,6 +364,13 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
             for u in units.iter() {
                 note_source_value_classes(&u.tree, &mut st);
             }
+            // JVMS 4.7.9 `Signature`: the generic shape of every member, read
+            // while the types still carry it. `erase` below rewrites symbol
+            // types in place, so this is the last moment the information
+            // exists -- nsc reads it at the same point, `enteringErasure`.
+            generic_sigs = Some(std::rc::Rc::new(
+                scala_rs_backend::record_generic_signatures(&st),
+            ));
             for u in units.iter_mut() {
                 u.pickles = std::rc::Rc::clone(&pickles);
                 erase(&mut u.tree, &mut st);
@@ -440,6 +450,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                     captured_vars: Some(std::rc::Rc::clone(&captured_vars)),
                     class_by_name: Some(std::rc::Rc::clone(&class_by_name)),
                     binary_parents: binary_parents.clone(),
+                    generic_sigs: generic_sigs.clone(),
                 },
             );
             // A class that exceeds a class file format limit is reported and

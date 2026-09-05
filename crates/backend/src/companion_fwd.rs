@@ -52,6 +52,9 @@ use std::collections::HashSet;
 pub(crate) struct Forwarder {
     pub name: String,
     pub desc: String,
+    /// The module method's own JVMS §4.7.9 `Signature`, carried over: the
+    /// forwarder has the same descriptor, so scalac signs it the same way.
+    pub signature: Option<String>,
 }
 
 /// The class (or trait) written next to a module class, if the source wrote
@@ -174,6 +177,7 @@ pub(crate) fn pick(
         out.push(Forwarder {
             name: m.name.clone(),
             desc: m.desc.clone(),
+            signature: m.signature.clone(),
         });
     }
     out
