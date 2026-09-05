@@ -754,6 +754,9 @@ fn add_scala_aliases(st: &mut SymbolTable, library_abi: bool) {
     crate::prelude_mism4::install(st);
     // `case Seq(a, b)` / `case Array(a, b)`. Added once the companions are present.
     crate::prelude_seqpat::install(st);
+    // `case h +: t` / `case t :+ h` / `case h #:: t`. Needs `immutable.Seq`,
+    // `LazyList` and `Stream`, which the hierarchy above has by now built.
+    crate::prelude_consextract::install(st, library_abi);
     // What `SeqView.filter` and friends return is a `View`, not a `SeqView`.
     crate::prelude_viewc::install(st);
     // `StringOps.map[B](Char => B): IndexedSeq[B]` (once `IndexedSeq` is present).
