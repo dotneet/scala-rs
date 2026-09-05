@@ -658,7 +658,28 @@ impl Typer {
                         || self.built_not_found(&want)
                 });
                 self.open_implicits.borrow_mut().pop();
-                ok.then_some(fit)
+                if ok {
+                    return Some(fit);
+                }
+                // The result type did not really determine this candidate: one
+                // of its own parameters came back standing for a *call site*
+                // parameter the search still has to solve, so the clause search
+                // above asked for a type with a free parameter in it and could
+                // not have answered. `tableShape[Level, T, C <: AbstractTable[_]]
+                // (implicit ev: C <:< AbstractTable[T]): Shape[Level, C, T, C]`
+                // against `Shape[_ <: FlatShapeLevel, Accounts, ?T, ?G]` is the
+                // case: `C` and `?G` are `Accounts`, and the candidate's `T`
+                // unifies with the call's `?T` -- neither of them known. Only
+                // `ev` says what it is, which is what
+                // [`Self::implicit_fit_open`] is for.
+                if fit.targs.iter().any(|t| {
+                    undet
+                        .iter()
+                        .any(|d| crate::check::type_mentions_tparam(t, *d))
+                }) {
+                    return self.implicit_fit_open(id, ret, pt, undet, paramss, depth);
+                }
+                None
             }
             Type::Function { params, ret } if params.is_empty() => {
                 self.implicit_solve(id, ret, pt, undet)
@@ -914,7 +935,16 @@ impl Typer {
         let undet_out: Vec<(SymbolId, Type)> = undet
             .iter()
             .filter_map(|d| {
-                let t = u.solved_open(*d)?;
+                // `Unify` binds the side it reaches first, and the candidate's
+                // result is that side: matching `Shape[Level, C, T, C]` against
+                // `Shape[_ <: FlatShapeLevel, Accounts, ?T, ?G]` records
+                // `T := ?T`, not the reverse, so `?T` has no solution of its
+                // own. Whatever the clauses have just said the candidate's `T`
+                // is, `?T` is.
+                let t = match u.solved_open(*d) {
+                    Some(t) => t,
+                    None => Type::TypeParam(u.alias_of(*d)?),
+                };
                 let t = crate::symbol::subst_tparams_slice(&tps, &targs, &t);
                 (!tps
                     .iter()
@@ -2430,6 +2460,25 @@ impl<'a> Unify<'a> {
     fn solved_open(&self, tp: SymbolId) -> Option<Type> {
         let t = self.bound.get(&tp.0)?.clone();
         Some(self.expand(&t, 0))
+    }
+
+    /// The unknown that was bound *to* `tp`, when one was.
+    ///
+    /// Unification of two unknowns binds whichever side it reaches first, and
+    /// for a candidate's result against the wanted type that is always the
+    /// candidate's own parameter. The wanted type's parameter is then left
+    /// with no solution of its own even though the two are known to be equal,
+    /// and a caller that goes on to solve the candidate's parameters
+    /// separately ([`Typer::implicit_fit_open`]) needs the other direction.
+    ///
+    /// Lowest symbol id when several are bound to `tp`, so the answer does not
+    /// depend on the hash map's iteration order.
+    fn alias_of(&self, tp: SymbolId) -> Option<SymbolId> {
+        self.bound
+            .iter()
+            .filter(|(_, v)| matches!(v, Type::TypeParam(x) if *x == tp))
+            .map(|(k, _)| SymbolId(*k))
+            .min_by_key(|s| s.0)
     }
 
     /// The solution for `tp`, with any nested unknowns resolved.

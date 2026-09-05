@@ -487,7 +487,7 @@ impl PickleSupply {
             if installed.is_empty() {
                 continue;
             }
-            st.get_mut(class_sym).members.retain(|m| !stale.contains(m));
+            drop_stale_members(st, class_sym, &stale, &installed);
         }
         true
     }
@@ -578,9 +578,7 @@ impl PickleSupply {
             // `stale` and in `installed`: removing it deleted the very
             // signature this call went to fetch, leaving the class with no
             // member of that name at all.
-            st.get_mut(class_sym)
-                .members
-                .retain(|m| !stale.contains(m) || installed.contains(m));
+            drop_stale_members(st, class_sym, &stale, &installed);
             n += installed.len();
         }
         trace(format_args!("{full}: supplied {n} implicit member(s)"));
@@ -1249,10 +1247,7 @@ impl PickleSupply {
         // has taken over: those two are the pickles the typer reads. A plain
         // Java classfile on `-cp` has no pickle at all and keeps its own path
         // in through `install_java_class`.
-        if !internal.starts_with("scala/")
-            && !self.adopted.contains(&class_sym.0)
-            && !self.implicits_supplied.contains(&class_sym.0)
-        {
+        if !self.pickle_readable(st, class_sym) {
             return Vec::new();
         }
         let is_module = sym.kind == SymKind::ModuleClass;
@@ -1459,7 +1454,7 @@ impl PickleSupply {
         }
         self.self_ty = saved_self;
         if !installed.is_empty() && !stale.is_empty() {
-            st.get_mut(class_sym).members.retain(|m| !stale.contains(m));
+            drop_stale_members(st, class_sym, &stale, &installed);
             trace(format_args!(
                 "{full}#{name}: replaced {} class-file default getter(s)",
                 stale.len()
@@ -3037,6 +3032,24 @@ impl PickleSupply {
     }
 
     /// Whether a pickle describes `full_name`.
+    /// Whether this module may read `class_sym`'s pickle at all.
+    ///
+    /// Scoped to the standard library, plus any class `adopt_binary_class` has
+    /// taken over: those two are the pickles the typer reads. A plain Java
+    /// classfile on `-cp` has no pickle and keeps its own path in through
+    /// `install_java_class`.
+    ///
+    /// Note that asking for a member of a class this answers `false` for is
+    /// not merely useless but *harmful*: [`Self::complete_named`] memoizes the
+    /// refusal, and the memo then stands in for the pickled signature once the
+    /// class really is adopted. See the blocking-slick entry in
+    /// `docs/gitbucket.md`.
+    fn pickle_readable(&self, st: &SymbolTable, class_sym: SymbolId) -> bool {
+        st.get(class_sym).jvm_name.starts_with("scala/")
+            || self.adopted.contains(&class_sym.0)
+            || self.implicits_supplied.contains(&class_sym.0)
+    }
+
     fn has_pickle(&mut self, bin: &mut BinaryIndex, full_name: &str, module: bool) -> bool {
         let mut src = BinSource(bin);
         let r = self.sigs.class_sig(&mut src, full_name, module);
@@ -4318,6 +4331,37 @@ fn despecialized(jvm_name: &str) -> Option<&str> {
         return None;
     }
     Some(&rest[..at])
+}
+
+/// Drop the class-file descriptions of a name the pickle has just replaced.
+///
+/// `stale` is what the class-file reader had entered under that name and
+/// `installed` is what [`PickleSupply::complete_named`] has just supplied.
+/// Those two lists can *overlap*: supplying a member fills the pickled
+/// signature into a symbol that is already there rather than allocating a
+/// second one, and it then pushes that same symbol onto the class again. A
+/// plain "remove everything stale" therefore deletes the member it was
+/// supposed to install, and a plain "remove nothing" leaves it listed twice,
+/// where every selection on it is an ambiguous overload against itself.
+///
+/// blocking-slick's `queryToQueryInvoker` and its ten siblings are the case,
+/// and only under `import profile.blockingApi._` -- the one order in which the
+/// class file is read before the pickle is adopted. `q.list` / `q.update(…)`
+/// were "value list is not a member of Query[…]" there and compiled anywhere
+/// else.
+fn drop_stale_members(
+    st: &mut SymbolTable,
+    class_sym: SymbolId,
+    stale: &[SymbolId],
+    installed: &[SymbolId],
+) {
+    let mut kept: HashSet<SymbolId> = HashSet::new();
+    st.get_mut(class_sym).members.retain(|m| {
+        if !installed.contains(m) {
+            return !stale.contains(m);
+        }
+        kept.insert(*m)
+    });
 }
 
 /// The type arguments of a class type, empty for anything else.
