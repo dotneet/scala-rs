@@ -28,24 +28,28 @@ cargo build -p scala-rs-cli --release >/dev/null 2>&1 || {
   exit 1
 }
 
+# `$SELECT` is expanded by the caller, not here: on macOS's bash 3.2, `set -u`
+# treats `"${SELECT[@]}"` on an *empty* array as an unbound variable, so the
+# no-argument form -- the one that measures everything, and the one anybody
+# actually runs -- was the only form that failed.
 want() {
-  [[ $# -eq 0 ]] && return 0
-  local n=$1; shift
-  for a in "$@"; do [[ $n == "$a" ]] && return 0; done
+  [[ ${#SELECT[@]} -eq 0 ]] && return 0
+  local n=$1 a
+  for a in "${SELECT[@]}"; do [[ $n == "$a" ]] && return 0; done
   return 1
 }
 
+SELECT=("$@")
+
 run() {
   local name=$1 cmd=$2
-  want "$name" "${SELECT[@]}" || return 0
+  want "$name" || return 0
   local s e
   s=$(date +%s)
   eval "$cmd" >"$OUT/$name.log" 2>&1
   e=$(date +%s)
   printf '%-22s %5d s\n' "$name" "$((e - s))"
 }
-
-SELECT=("$@")
 
 echo "=== battery cost (seconds) ==="
 run slick      "SLICK_LOG=$OUT/slick.txt ./tests/slick_measure.sh"
