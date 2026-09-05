@@ -729,3 +729,109 @@ a `lookupswitch` behind it, and the `Method too large` diagnostic together with
 the absence of a class file. `crates/backend/src/code.rs`'s own tests pin the
 byte-level shape of each rewrite, including a cascade where widening one branch
 is what pushes another out of range.
+
+### Three defects that only running the program shows (`agent/implicitcast`, 2026-09-06)
+
+All three passed the type checker, all four compile measures, and
+`tests/slick_subset.sh` -- whose `Class.forName(initialize = false)` parses the
+constant pool and never links a body. Two were caught by the JVM verifier and
+one by nothing short of execution.
+
+#### 1. `Predef.identity` / `locally` / `implicitly` left their result uncast
+
+All three are `(A)A`, so with the real library on the classpath they are called
+through `Predef$.<name>(Ljava/lang/Object;)Ljava/lang/Object;`.
+`gen_predef_poly` (`crates/backend/src/gen_call.rs`) emitted that call and
+stopped, so a bare `Object` sat where the tree's own type said otherwise:
+
+```
+VerifyError: Bad type on operand stack
+  Type 'java/lang/Object' (current frame, stack[1]) is not assignable to 'Shape'
+```
+
+It survived because **the JVM verifier does not check interface types** (JVMS
+4.10.1.2). `implicitly[SomeTrait].member` linked and ran with no cast at all,
+and only a *class*-typed result -- a `putfield` into one, or an `invokevirtual`
+on one -- makes the hole observable. The slice that filed this reproduced it
+with a value class (`slick`'s `Shape[_ <: FlatShapeLevel, T, U, _]`) and wrote
+around it with a hand-written `summon`, whose result *was* cast because a
+user method's call site goes through the ordinary path.
+
+The fix routes the result through `maybe_unbox_erased_result`, the coercion
+every other erased call site already gets: primitive unboxed, `String` cast,
+class-typed result cast, and nothing at all for a bare type parameter, whose
+erasure is `Object` and which names no class to cast to.
+
+Worth keeping: the primitive and `String` cases *looked* fine before the fix,
+because erasure had already wrapped those trees in `$unbox`. Only the reference
+case had no second line of defence, and of those only the non-interface half
+failed. Two independent reasons for a bug to hide, in one call site.
+
+#### 2. `case W(x)` on a value-class scrutinee did not verify
+
+A value class is held unboxed wherever its static type says so, so `w: Wrapped`
+is an `int` in its slot. `gen_ctor_fields_pattern`
+(`crates/backend/src/gen_match.rs`) lowered the pattern to `instanceof` /
+`checkcast` / `getfield` against it anyway:
+
+```
+VerifyError: Bad local variable type
+  Type integer (current frame, locals[3]) is not assignable to reference type
+```
+
+A box is always a *reference*, so a scrutinee of primitive sort at this point
+is provably the underlying value; the class is final and the static type
+already names it, so the test is vacuous and the pattern is a plain binding.
+That is what nsc emits for the same source -- `iload; istore`, no `instanceof`
+and no `getfield` anywhere in `Main$.main`. A boxed scrutinee (`case W(x)` on
+an `Any`, or one arriving inside an `Option`, or a value-class lambda
+parameter, which `erase`'s `value_class_lambda_params` deliberately keeps
+boxed) is of reference sort and keeps the test unchanged.
+
+`sel_sort` is the whole discriminator, and it is sound in one direction only,
+which is the direction that matters. Threading the scrutinee's *type* down
+instead would not have worked: by the time the backend runs, both the
+selector's and the pattern's types have been erased -- `w`'s reads `Int` --
+and the class identity survives only on the pattern's `sym`, which
+`mark_value_class_patterns` stamps during erasure for exactly this reason.
+
+#### 3. `W.unapply(w)` named explicitly threw `NoSuchMethodError`
+
+`emit_case_unapply` (`crates/backend/src/gen_object.rs`) emitted no method at
+all for a value class's companion. The reason recorded at the time was that
+the *pattern* path handed the extractor a boxed instance, so a method with
+nsc's descriptor would have linked and then answered `Some(Wrapped(w))` where
+scalac says `Some(w)` -- silently wrong, which is worse than a loud
+`NoSuchMethodError`. Fixing 2 removed that path: a value-class pattern no
+longer reaches `unapply` at all.
+
+nsc's shape, from `javap -c` on 2.13.16, is `Wrapped$.unapply(int)
+Lscala/Option;` answering `Some(BoxesRunTime.boxToInteger(u))` -- the
+underlying value, boxed, never a `Wrapped`. That is the descriptor our own
+call sites were already emitting, which the `NoSuchMethodError` said in so
+many words (`'scala.Option Wrapped$.unapply(int)'`). So the caller's erasure
+had never been the problem for the explicit call; only the pattern's.
+
+#### Verification
+
+`tests/fixtures/ic_implicitly.scala` and `tests/fixtures/ic_vcmatch.scala` run
+byte-identical to real scalac 2.13.16 in both `--scala-library` and
+`--no-scala-library`, under `-Xverify:all`
+(`crates/cli/tests/implicitcast.rs`, 11 tests). Three of those read the
+emitted bytecode back with `javap` rather than only its output: the cast after
+`Predef$.implicitly`, the absence of `instanceof` in the unboxed pattern
+together with its presence in the boxed one, and `unapply(int)` with no
+`unapply(Wrapped)` beside it.
+
+#### Remaining
+
+* **A value class over a *reference* type is broken well before pattern
+  matching.** `final case class WS(s: String) extends AnyVal` throws
+  `ClassCastException: class WS cannot be cast to class java.lang.String` at
+  the call site of `m(WS("a"))`, in both modes. Everything above is restricted
+  to value classes over primitives, and `sel_sort` cannot decide the reference
+  case anyway: a `WS` scrutinee and a boxed one are both `JvmSort::Ref`.
+* **An extractor sub-pattern may name a type the field cannot hold.** `case
+  P(s: String)` where `P`'s field is an `Int` is accepted; scalac says
+  `scrutinee is incompatible with pattern type`. Not specific to value
+  classes, and a typer gap rather than a codegen one.

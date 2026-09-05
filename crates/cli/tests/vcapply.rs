@@ -41,27 +41,16 @@
 //! both `--scala-library` and `--no-scala-library` modes and checked against
 //! real scalac 2.13.16's own recorded output.
 //!
-//! Two adjacent, pre-existing defects are deliberately **not** covered here:
-//!
-//! * `Wrapped.unapply(w)` called explicitly still fails with
-//!   `NoSuchMethodError: 'scala.Option Wrapped$.unapply(int)'` in both
-//!   modes -- the companion has no real `unapply` body for a value class.
-//!   A previous slice tried emitting one in nsc's own shape and reverted it:
-//!   the *caller's* erasure still hands the pattern the boxed instance, so
-//!   the extractor would have silently rewrapped it (`Some(Wrap(w))` where
-//!   scalac says `Some(w)`) instead of failing loudly. `NoSuchMethodError` is
-//!   the intentional, accepted state; this slice did not touch it.
-//! * `w match { case Wrapped(x) => ... }` (the pattern-match sugar, as
-//!   opposed to naming `unapply` directly) fails with a `VerifyError` in
-//!   *both* modes, unrelated to `--scala-library`/`--no-scala-library` and
-//!   unrelated to this fix (reproduces identically against an unpatched
-//!   binary): the match-lowering emits `instanceof`/`checkcast`/`getfield`
-//!   against the scrutinee as though it were a real boxed instance, while the
-//!   scrutinee's local slot actually holds the erased `int`
-//!   (`aload_3`/`istore_3` on the same slot). This is a separate,
-//!   pre-existing bug in pattern-match codegen for a value-class scrutinee,
-//!   not in erasure of the companion `apply`; it is flagged separately
-//!   rather than fixed here.
+//! Two adjacent defects were left out of this slice and fixed in the next
+//! one, `agent/implicitcast` (`crates/cli/tests/implicitcast.rs`): the
+//! `NoSuchMethodError: 'scala.Option Wrapped$.unapply(int)'` from naming
+//! `Wrapped.unapply(w)` explicitly, and the `VerifyError: Bad local variable
+//! type` from `w match { case Wrapped(x) => ... }`. They turned out to be one
+//! defect seen from two sides: `unapply` was withheld on purpose because the
+//! *pattern* path handed the extractor a box, and once the pattern stopped
+//! doing that -- an unboxed value-class scrutinee is a plain binding, with no
+//! `instanceof` -- there was nothing left for nsc's own descriptor to
+//! disagree with.
 
 use std::fs;
 use std::path::{Path, PathBuf};
