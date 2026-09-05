@@ -1,5 +1,17 @@
 mod anon_capture;
 mod check;
+mod check_apply;
+mod check_args;
+mod check_expr;
+mod check_infer;
+mod check_member;
+mod check_name;
+mod check_namer;
+mod check_overload;
+mod check_pattern;
+mod check_select;
+mod check_template;
+mod check_types;
 mod classpath;
 mod ctor_defaults;
 mod cyclic;
