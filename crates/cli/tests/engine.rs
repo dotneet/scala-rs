@@ -634,20 +634,20 @@ fn sd_unsupported_forms_are_named() {
         !out.status.success(),
         "expected sd_gaps_bad to fail, got: {err}"
     );
-    for needle in [
-        // A row class this run compiles is not on the macro classpath yet.
-        // Said before the JVM is started (`docs/macros.md` §5.1): this used to
-        // come back as the engine's own `ScalaReflectionException: class
-        // SdLocalRow not found`, which named the class but not the reason.
-        "the type argument `SdLocalRow` is not on the classpath",
-        // A modifier with no name in the table.
-        "a definition marked `DEFERRED`, a modifier scala-rs cannot rebuild yet",
-    ] {
-        assert!(
-            err.contains(needle),
-            "expected {needle:?} in diagnostics, got {err:?}"
-        );
-    }
+    // A modifier with no name in the table.
+    let needle = "a definition marked `DEFERRED`, a modifier scala-rs cannot rebuild yet";
+    assert!(
+        err.contains(needle),
+        "expected {needle:?} in diagnostics, got {err:?}"
+    );
+    // `SdGaps.query[SdLocalRow]` in the same file is *not* a gap any more: a
+    // class this run compiles reaches the implementation as a placeholder
+    // symbol (`docs/macros.md` §5.1, `crates/cli/tests/macrotag.rs`). It is
+    // left there as the near miss it now is -- the file has exactly one error.
+    assert!(
+        !err.contains("SdLocalRow"),
+        "expected the local row class to expand, got {err:?}"
+    );
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&out_dir);
 }

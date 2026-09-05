@@ -84,7 +84,15 @@ LOG=${GITBUCKET_LOG:-$SP/measure.txt}
 # reporting (-deprecation -feature -Werror -Wunused:imports -Wconf) and the
 # optimiser (-opt:l:method). `-Xsource:3-cross` is load-bearing: gitbucket
 # cross-builds for Scala 3 and the source relies on 3's rules.
-$BIN compile "${FILES[@]}" -d $OUT -cp "$(cat $SP/deps.cp)" -Xsource:3-cross \
+# gitbucket calls slick's `TableQuery` / `mapTo` macros, and running a macro
+# implementation needs `scala.reflect.runtime.universe`. Real scalac has it
+# because scala-reflect.jar is part of the compiler's own classpath, not the
+# project's -- sbt never puts it on gitbucket's. scala-rs has no such classpath
+# of its own, so the jar is appended here for the same reason
+# `tests/slick_measure.sh` appends it: measuring without it asks for a macro
+# expansion nobody could perform.
+REFLECT=/tmp/scala-2.13.16/lib/scala-reflect.jar
+$BIN compile "${FILES[@]}" -d $OUT -cp "$(cat $SP/deps.cp):$REFLECT" -Xsource:3-cross \
   -language:postfixOps \
   --scala-library /tmp/scala-rs-lib/scala-library-2.13.16.jar "$@" > $LOG 2>&1 || true
 ERRORS=$(grep -c '^error' $LOG || true)
