@@ -235,7 +235,10 @@ object Solo extends T {
 
 /// A companion `trait` takes the forwarders too: scalac writes them into the
 /// interface classfile (`public static int onObj()` on `p.TC`), which needs
-/// classfile major 52. And a value class's companion must not re-declare the
+/// classfile major 52. The trait's own statics are there beside it -- the
+/// `onTrait$` every mixin forwarder calls, and `$init$` -- and `javap -p` on
+/// scalac 2.13.16's own output for this source lists the same three.
+/// And a value class's companion must not re-declare the
 /// `$extension` statics the class already carries -- a duplicate method makes
 /// the whole classfile unloadable, so this also checks it still parses.
 #[test]
@@ -267,7 +270,10 @@ object Meters {
 "#,
     );
     let out = compile(&src, "trait", &["--no-scala-library"]);
-    assert_eq!(statics_of(&out, "p.TC"), vec!["onObj()"]);
+    assert_eq!(
+        statics_of(&out, "p.TC"),
+        vec!["$init$(p.TC)", "onObj()", "onTrait$(p.TC)"]
+    );
     // `zero` is forwarded; `plus$extension` is already a static of the value
     // class and must appear exactly once; `v$extension` is suppressed by the
     // class's own `v()`.
