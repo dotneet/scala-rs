@@ -1707,7 +1707,11 @@ impl Typer {
     /// Runs only when there is a tie to break and only when the call site's
     /// argument count is known, and only ever *narrows* a set of two or more:
     /// a member this cannot read the shape of stays a candidate.
-    fn drop_inapplicable_conversions(&self, hits: &mut Vec<(SymbolId, SymbolId, Type)>, name: &str) {
+    fn drop_inapplicable_conversions(
+        &self,
+        hits: &mut Vec<(SymbolId, SymbolId, Type)>,
+        name: &str,
+    ) {
         if hits.len() < 2 {
             return;
         }
