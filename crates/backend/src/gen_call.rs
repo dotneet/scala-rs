@@ -649,6 +649,9 @@ pub(crate) fn gen_predef_println(
     asm.invokevirtual("scala/Predef$", name, "(Ljava/lang/Object;)V");
 }
 
+/// The erased descriptor of `Predef.identity` / `locally` / `implicitly`.
+const PREDEF_POLY_DESC: &str = "(Ljava/lang/Object;)Ljava/lang/Object;";
+
 pub(crate) fn gen_predef_poly(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -667,6 +670,8 @@ pub(crate) fn gen_predef_poly(
         );
         if is_unit_like(result_ty) {
             asm.pop();
+        } else {
+            maybe_unbox_erased_result(asm, ctx, PREDEF_POLY_DESC, Some(result_ty));
         }
         return;
     };
@@ -689,6 +694,14 @@ pub(crate) fn gen_predef_poly(
     );
     if is_unit_like(result_ty) {
         asm.pop();
+    } else {
+        // `Predef.identity` / `locally` / `implicitly` all erase to
+        // `(Object)Object`, so the result needs the same coercion any other
+        // erased call site gets. Without it a `putfield`/`invokevirtual` on a
+        // *class*-typed result fails the verifier ("Bad type on operand
+        // stack"). An interface-typed one used to slip through only because
+        // the JVM verifier does not check interface types.
+        maybe_unbox_erased_result(asm, ctx, PREDEF_POLY_DESC, Some(result_ty));
     }
 }
 
