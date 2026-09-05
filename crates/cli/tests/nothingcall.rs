@@ -121,6 +121,24 @@ fn run_java_verified(out: &Path, cp_extra: Option<&Path>) -> String {
 }
 
 /// `javap -c` output for one class, split into (method signature, instructions).
+/// `javap` prints the *generic* form of a member that carries a JVMS 4.7.9
+/// `Signature`, so `matchArm` reads `scala.Tuple2<java.lang.Object,
+/// java.lang.Object>` rather than `scala.Tuple2`. Drop the type arguments so
+/// the headers below name the erased shape they are about.
+fn erased_header(sig: &str) -> String {
+    let mut out = String::with_capacity(sig.len());
+    let mut depth = 0usize;
+    for c in sig.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
 fn javap_methods(out: &Path, class: &str) -> Vec<(String, Vec<String>)> {
     let output = Command::new("javap")
         .args(["-p", "-c", "-cp", out.to_str().unwrap(), class])
@@ -276,7 +294,7 @@ fn nc_nothing_diverging_arms_still_grow_an_athrow() {
     ] {
         let (_, code) = methods
             .iter()
-            .find(|(sig, _)| sig == name)
+            .find(|(sig, _)| erased_header(sig) == name)
             .unwrap_or_else(|| panic!("no {name} in {methods:?}"));
         assert!(
             code.iter().any(|i| mnemonic(i) == "athrow"),
