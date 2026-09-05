@@ -18,9 +18,26 @@ impl Typer {
     /// `Left.apply` / `Right.apply` → `Left[A, B]` / `Right[A, B]`.
     /// The value argument fills `A` (Left) or `B` (Right); the other param
     /// comes from an expected `Either[A, B]` (or `Nothing` if none).
+    ///
+    /// `ret` is the `apply`'s own declared result, and the class is taken from
+    /// it rather than looked up by simple name. The shortcut used to key off
+    /// the owner module's name alone and then ask the scope for a class called
+    /// `Left`, which is only right for `scala.util.Left`: cats' `Ior` declares
+    ///
+    /// ```scala
+    /// final case class Left[+A](a: A) extends Ior[A, Nothing]
+    /// final case class Right[+B](b: B) extends (Nothing Ior B)
+    /// ```
+    ///
+    /// so every `Ior.Left(a)` -- even written out as `cats.data.Ior.Left(a)` --
+    /// was typed as a `scala.util.Left[A, B]` and reported `type mismatch;
+    /// found: Left[String, Int]  required: Ior[String, Int]`. A one-parameter
+    /// `Left` is not the class this rule is about, and the arity check says so
+    /// on top of the identity check, since `value_idx` is `Either`'s layout.
     pub(crate) fn instantiate_either_ctor_apply(
         &self,
         owner_n: &str,
+        ret: &Type,
         args: &[Tree],
         pt: &Type,
     ) -> Option<Type> {
@@ -29,11 +46,13 @@ impl Typer {
             "Right$" => ("Right", 1usize),
             _ => return None,
         };
-        let cls = self
-            .st
-            .lookup(cname)
-            .into_iter()
-            .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)?;
+        let Type::Class { sym: cls, .. } = ret else {
+            return None;
+        };
+        let cls = *cls;
+        if self.st.get(cls).name != cname || self.st.get(cls).tparams.len() != 2 {
+            return None;
+        }
         let val_ty = args.first()?.ty.widen_constant();
         let n = self.st.get(cls).tparams.len();
         let pt_args: &[Type] = match pt {

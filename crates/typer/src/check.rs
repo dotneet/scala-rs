@@ -1611,6 +1611,33 @@ pub(crate) fn pt_or_lub(pt: &Type, branches: Type) -> Type {
     }
 }
 
+/// Whether an expected type is the *nested* form of that same stand-in: an
+/// undetermined variable in the result of a function-typed parameter is opened
+/// to `Type::Wildcard` rather than to a bound (`check_apply`'s `relaxed`), so
+/// `def flatMap[X, Y](fa: F[X])(f: X => F[Y])` hands its literal the expected
+/// type `X => F[_]`. `F[_]` is not `Any`, so `pt_or_lub` used to adopt it, and
+/// a lambda whose body is an `if` or a `match` came out as `X => F[_]` — the
+/// argument that was supposed to *decide* `Y` said `Y = _` instead.
+///
+/// That is what cats' monad transformers are made of:
+/// `EitherT(F.flatMap(value) { case Left(_) => … ; case Right(b) => … })`
+/// reported `no matching overload for (F[Either[A, B]])EitherT[F, A, B] with
+/// arguments (F[_])` throughout `EitherT`, `OptionT` and `IorT`, while the
+/// same body written as a plain lambda (no `match`) type-checked.
+pub(crate) fn pt_is_undecided(pt: &Type) -> bool {
+    fn walk(t: &Type) -> bool {
+        match t {
+            Type::Wildcard => true,
+            Type::Applied { args, .. } => args.iter().any(walk),
+            Type::Class { args, .. } => args.iter().any(walk),
+            _ => false,
+        }
+    }
+    // A bare `_` is `pt_or_lub`'s `Any` case already; only an argument
+    // position is this stand-in.
+    !matches!(pt, Type::Wildcard) && walk(pt)
+}
+
 /// Undo the parser's `{A,B=>C,_}` encoding of an import selector list.
 /// Each entry is `(name, alias)`; `("_", "_")` is the wildcard, and an alias
 /// of `_` hides the name.

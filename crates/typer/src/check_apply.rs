@@ -1733,7 +1733,9 @@ impl Typer {
                             }
                         }
                     } else if owner_n == "Left$" || owner_n == "Right$" {
-                        if let Some(inst) = self.instantiate_either_ctor_apply(&owner_n, args, pt) {
+                        if let Some(inst) =
+                            self.instantiate_either_ctor_apply(&owner_n, &ret, args, pt)
+                        {
                             ret = inst;
                         }
                     } else if owner_n == "Try$" || owner_n == "Success$" {
