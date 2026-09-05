@@ -77,6 +77,42 @@ pub fn collect_trait_members(tree: &Tree, _st: &SymbolTable, into: &mut TraitImp
     collect_trait_impls(tree, into);
 }
 
+/// Record on the symbol which trait members write `super.m` in their body,
+/// so the pickler can declare nsc's `SUPERACCESSOR` member for each.
+///
+/// nsc's mixin phase implements `p$q$T$$super$m` in a class **only** when the
+/// trait's signature declares a member carrying that flag. We emit the
+/// accessor on the interface either way, so a stackable `abstract override`
+/// trait of ours mixed in by real scalac used to run the *base* implementation
+/// and silently drop the trait's own layer.
+///
+/// Deliberately narrower than [`needs_super_accessor`], which also declares an
+/// accessor for a plain `override def`: nothing calls those, and asking a
+/// reader to implement `T$$super$m` where the overridden member is itself
+/// deferred has no target to forward to.
+pub fn mark_super_accessors(tree: &Tree, st: &mut SymbolTable) {
+    let mut found = Vec::new();
+    collect_super_accessors(tree, &mut found);
+    for id in found {
+        st.get_mut(id).super_accessor = true;
+    }
+}
+
+fn collect_super_accessors(tree: &Tree, out: &mut Vec<SymbolId>) {
+    if let TreeKind::ClassDef { mods, impl_, .. } = &tree.kind {
+        if mods.flags.contains(Flags::TRAIT) {
+            for stt in &impl_.body {
+                if let TreeKind::DefDef { rhs, .. } = &stt.kind {
+                    if !stt.sym.is_none() && needs_super_accessor(stt) && tree_contains_super(rhs) {
+                        out.push(stt.sym);
+                    }
+                }
+            }
+        }
+    }
+    for_each_term_child(tree, &mut |c| collect_super_accessors(c, out));
+}
+
 /// Harvest one unit's concrete trait members. A function of the tree alone:
 /// no symbol table, no ABI, so running it twice on the same tree inserts the
 /// same entries under the same keys.
@@ -2367,7 +2403,60 @@ fn checkcast_erased_method_receiver(asm: &mut Assembler, ctx: &EmitCtx, fun: &Tr
     if jn.is_empty() || jn == "java/lang/Object" || jn.starts_with('[') {
         return;
     }
+    // The receiver is already on the stack, and the assembler models what the
+    // verifier will see there -- the same model the StackMapTable is written
+    // from. When the verifier will accept the `invoke*` on that value as it
+    // stands, this cast is three wasted bytes and nsc emits none: `this.m()`
+    // inside `C` is `aload_0; invokevirtual C.m`, four bytes to our seven.
+    //
+    // That is not only noise. `scala/test/files/run/t10594` came out 43%
+    // larger than nsc's, and since `Method too large` became a diagnostic
+    // rather than a silently truncated class, the difference decides whether a
+    // method nsc accepts is rejected here. The 64 KB ceiling of JVMS 4.7.3 was
+    // landing at about 57% of the source size nsc reaches.
+    //
+    // A `checkcast` never takes part in method resolution -- the `Methodref`
+    // does, and `Symbol::declaring_class` above has already put the right
+    // class in it -- so dropping one is safe exactly when the verifier does
+    // not need it.
+    if let Some(top) = asm.top_object() {
+        if verifier_accepts_receiver(ctx.st, top, &jn) {
+            return;
+        }
+    }
     asm.checkcast(&jn);
+}
+
+/// Whether JVMS 4.10.1.9 will accept an `invoke*` whose `Methodref` names
+/// `to` on a receiver the assembler tracks as JVM class `from`.
+///
+/// Two things have to hold, and the second is not a detail.
+///
+/// `from` has to reach `to` in the symbol table at all, which is what
+/// `jvm_assignable` answers -- `false` for either name it cannot resolve, so
+/// an unknown class keeps its cast. A redundant `checkcast` is a no-op; a
+/// missing one is a `VerifyError`.
+///
+/// And when `to` is a *class*, `from` has to be one too. The symbol table's
+/// base type sequence is the **Scala** hierarchy, and a Scala trait may extend
+/// a class -- a hop the bytecode cannot make, because the trait compiles to an
+/// interface. `scala.reflect.api.JavaUniverse` is the standing example
+/// (`Symbol::declaring_class` documents it from the other side): the pickle
+/// says it extends the abstract class `Universe`, and its class file declares
+/// `interfaces: 0` and no superclass but `Object`. Trusting the Scala answer
+/// there dropped the cast in front of `Universe.TypeTag` and nine `run` tests
+/// of the scala/scala corpus died with `VerifyError: Bad type on operand
+/// stack -- Type 'scala/reflect/api/JavaUniverse' is not assignable to
+/// 'scala/reflect/api/Universe'`.
+///
+/// The converse hop needs no guard: JVMS 4.10.1.2 makes *every* reference
+/// assignable to an interface type, so an interface `to` is accepted whatever
+/// is on the stack, and only the `Methodref` decides what gets called.
+fn verifier_accepts_receiver(st: &SymbolTable, from: &str, to: &str) -> bool {
+    if !jvm_assignable(st, from, to) {
+        return false;
+    }
+    is_interface_jvm(st, to) || !is_interface_jvm(st, from)
 }
 
 fn is_module_class(st: &SymbolTable, id: SymbolId) -> bool {
@@ -4627,6 +4716,68 @@ impl<'a> Gen<'a> {
         );
     }
 
+    /// The `val`s and `var`s a trait read from `-cp` makes every implementing
+    /// class carry: `(name, type, is a var)`.
+    ///
+    /// [`TraitImpls`] is harvested from source trees, so it knows nothing
+    /// about a trait that arrived as a class file, and a class of ours mixing
+    /// one in used to get no field, no accessor and no `$init$` call at all --
+    /// `AbstractMethodError: Receiver class C does not define or inherit an
+    /// implementation of the resolved method 'abstract String v()'`.
+    ///
+    /// The interface's own method table says which members those are, because
+    /// nsc declares one mixin setter per concrete `val`
+    /// (`p$q$T$_setter_$v_$eq`) and a plain `v_$eq` beside the getter of a
+    /// `var`. A *deferred* `var` is indistinguishable from a concrete one
+    /// there -- the pickle is what carries `DEFERRED`, and the classfile
+    /// scanner does not keep it -- so the `var` half is skipped when anything
+    /// else in the linearization already supplies the name (the class itself,
+    /// a superclass, or an earlier trait).
+    fn binary_trait_vals(&self, trait_id: SymbolId) -> Vec<(String, Type, bool)> {
+        let mut out = Vec::new();
+        let mut names: HashSet<&str> = HashSet::new();
+        for &m in &self.st.get(trait_id).members {
+            names.insert(self.st.get(m).name.as_str());
+        }
+        for &m in &self.st.get(trait_id).members {
+            let s = self.st.get(m);
+            if s.kind != SymKind::Method {
+                continue;
+            }
+            let Some(base) = s.name.strip_suffix("_=") else {
+                continue;
+            };
+            let Type::Method { paramss, .. } = &s.ty else {
+                continue;
+            };
+            let params: Vec<&Type> = paramss.iter().flatten().collect();
+            let [ty] = params[..] else { continue };
+            match base.rsplit_once("$_setter_$") {
+                // `p$q$T$_setter_$v_$eq(T)`: a concrete `val` named `v`.
+                Some((_, field)) => out.push((field.to_string(), ty.clone(), false)),
+                // `v_$eq(T)` beside a `v()`: a `var`.
+                None if names.contains(base) => out.push((base.to_string(), ty.clone(), true)),
+                None => {}
+            }
+        }
+        out
+    }
+
+    /// Names a *class* in this linearization already provides, so a binary
+    /// trait's `var` is not given a second field that shadows it.
+    fn superclass_member_names(&self, class_id: SymbolId) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+            if is_interface_sym(self.st, parent) {
+                continue;
+            }
+            for &m in &self.st.get(parent).members {
+                out.insert(self.st.get(m).name.clone());
+            }
+        }
+        out
+    }
+
     fn mixin_val_fields(
         &self,
         class_id: SymbolId,
@@ -4650,8 +4801,23 @@ impl<'a> Gen<'a> {
         if class_id.is_none() {
             return out;
         }
+        let mut from_class: Option<HashSet<String>> = None;
         for parent in linearize(self.st, class_id).into_iter().skip(1) {
             let Some(vals) = self.traits.vals.get(&parent) else {
+                if !is_interface_sym(self.st, parent) {
+                    continue;
+                }
+                let inherited = from_class
+                    .get_or_insert_with(|| self.superclass_member_names(class_id))
+                    .clone();
+                for (name, ty, mutable) in self.binary_trait_vals(parent) {
+                    if mutable && inherited.contains(&name) {
+                        continue;
+                    }
+                    if have.insert(name.clone()) {
+                        out.push((name, ty));
+                    }
+                }
                 continue;
             };
             for v in vals {
@@ -4777,8 +4943,24 @@ impl<'a> Gen<'a> {
         // (name, type, owning trait, is a `var`, first in linearization order)
         let mut needed: Vec<(String, Type, SymbolId, bool, bool)> = Vec::new();
         let mut seen = HashSet::new();
+        let mut from_class: Option<HashSet<String>> = None;
         for parent in linearize(self.st, class_id).into_iter().skip(1) {
             let Some(vals) = self.traits.vals.get(&parent) else {
+                // A trait read from `-cp` has no source tree to harvest; its
+                // interface says what the class owes. See `binary_trait_vals`.
+                if !is_interface_sym(self.st, parent) {
+                    continue;
+                }
+                let inherited = from_class
+                    .get_or_insert_with(|| self.superclass_member_names(class_id))
+                    .clone();
+                for (name, ty, mutable) in self.binary_trait_vals(parent) {
+                    if mutable && inherited.contains(&name) {
+                        continue;
+                    }
+                    let first = seen.insert(name.clone());
+                    needed.push((name, ty, parent, mutable, first));
+                }
                 continue;
             };
             for v in vals {
@@ -6959,13 +7141,36 @@ impl<'a> Gen<'a> {
             .skip(1)
             .rev()
             .filter_map(|p| {
-                if !self.traits.inits.contains_key(&p) || !is_interface_sym(self.st, p) {
+                if !is_interface_sym(self.st, p) {
+                    return None;
+                }
+                // A trait of this run: call `$init$` when it has something to
+                // run. A trait read from `-cp`: call it when the interface
+                // declares one, which is nsc's own rule for a binary trait.
+                // Reading only `TraitImpls::inits` left every `val` of a
+                // classpath trait at its default -- no exception, no
+                // diagnostic, just a `null`.
+                if !self.traits.inits.contains_key(&p)
+                    && (self.traits.impls.contains_key(&p) || !self.declares_mixin_ctor(p))
+                {
                     return None;
                 }
                 let iface = class_internal(self.st, p);
                 Some((iface.clone(), format!("(L{iface};)V")))
             })
             .collect()
+    }
+
+    /// Does this trait's *signature* carry `$init$`? True only for a trait
+    /// read from a class file: one compiled in this run is answered from
+    /// [`TraitImpls`] instead, which knows whether the `$init$` we emit has a
+    /// body worth calling.
+    fn declares_mixin_ctor(&self, trait_id: SymbolId) -> bool {
+        self.st
+            .get(trait_id)
+            .members
+            .iter()
+            .any(|&m| self.st.get(m).name == "$init$")
     }
 
     fn emit_module_init(

@@ -654,3 +654,57 @@ comment).
 * nsc rejects `IO(1, 2)` with `too many arguments`, while we auto-tuple it into
   `IO[(Int, Int)]` (a difference inherited from main).
   → All three of the above were fixed in the next section (`agent/arraygen`).
+
+---
+
+### An existential's bound is data the search needs (`agent/slickshape`)
+
+Two roots behind gitbucket's slick DSL, `errors=1736 → 1588` on
+`tests/gitbucket_measure.sh` (−42 and −106, additive). Full write-up in
+`docs/gitbucket.md`, roots 20 and 21; the parts worth having here:
+
+**1. A wildcard in the wanted type is not always "a position the search is not
+asking about".** `Unify::unify_at` answers `true` for `Type::Wildcard` on
+either side without binding anything, which is right for `List[_]` and wrong
+the moment the candidate has a type parameter standing opposite it and nothing
+else to solve it from. slick's
+
+```scala
+def map[F, G, T](f: E => F)(implicit shape: Shape[_ <: FlatShapeLevel, F, T, G]): Query[G, T, C]
+```
+
+is answered by `repColumnShape[T : BaseTypedType, Level <: ShapeLevel]`, whose
+`Level` can *only* come from that first position. A `BoundedWildcard` binds it
+(to the bound); a bare `Wildcard` does not, and `implicit_solve` then drops the
+candidate rather than guessing. `PickleSupply::conv_at` was flattening every
+quantified variable of an `Existential` to `Type::Wildcard`, so a bound written
+in a jar was lost while the same bound written in source (`subst_quantified`)
+was kept. **When a diagnostic prints `_` where the source says `_ <: X`, the
+type has already lost the only thing that could answer it.**
+
+**2. `candidate_bounds_hold` is a subtype question, so it needs parents.** With
+the bound restored, the next question is whether `_ <: FlatShapeLevel` is a
+`ShapeLevel` — and `FlatShapeLevel` is a jar class that appears *only* inside
+slick's own signature, so nothing had ever read its parents and the answer was
+no. This is the `warm_implicit_candidates` shape from `agent/tail6` and
+`agent/cats3` again, one step over: the class that needs warming is named by
+the **wanted type**, not by any candidate. `warm_implicit_candidates` now takes
+the types the search came up empty on, and `collect_type_parts` follows a
+`BoundedWildcard`'s bounds (nsc's `companionImplicitMap` follows an abstract
+type's `bounds.hi` for the same reason).
+
+The tell for both is the same one this file keeps recording: adding a line that
+merely *names* the type (`def warm(x: FlatShapeLevel): ShapeLevel = x`) made
+the file compile. That is always a missing completion, never a scoping rule.
+
+**3. `search_extension` compares conversions; nsc compares members.** Two
+conversions that both offer `&&` on `Rep[Boolean]` — slick's one-argument one
+and gitbucket's `implicit class RichColumn(c1: Rep[Boolean]) { def &&(c2: =>
+Rep[Boolean], guard: => Boolean) }` — tied on every rule we have
+(declared-vs-inherited, low priority, argument specificity), because they are
+genuinely equal *as conversions*. nsc's `adaptToArguments` asks for a view
+whose result has a member applicable to the arguments, and a two-argument `&&`
+is not one for `a && b`. `Check::callee_arity` carries the enclosing `Apply`'s
+argument count into the selection so `drop_inapplicable_conversions` can
+narrow the tie; it only ever narrows, and a member whose shape cannot be read
+stays a candidate.

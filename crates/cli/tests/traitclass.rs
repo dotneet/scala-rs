@@ -362,3 +362,293 @@ fn run_scalac(scalac: &Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+// ------------------------------------------------- ti_: the rest of the ABI
+//
+// Moving trait bodies onto the interface (above) made three more pieces of
+// nsc's trait ABI *reachable*. None of them is caught by the JVM verifier --
+// an interface call site is not type-checked at link time -- and the third is
+// not caught by anything at all: it used to leave every `val` of a trait read
+// from `-cp` at its default value, with no exception and no diagnostic.
+//
+//   1. A trait's unqualified-`private` `val` / `var` kept its source name, so
+//      the class scalac compiles implements `tilib$Counter$$n()` while ours
+//      declared `n()`: `AbstractMethodError`.
+//   2. A `super` accessor was not pickled (nsc's `SUPERACCESSOR`, raw
+//      `1 << 28`), so scalac mixed in no layer at all for an `abstract
+//      override` trait of ours and silently ran the base implementation.
+//   3. `$init$` was called only for traits compiled in the same run, and the
+//      `val`s of a trait read from `-cp` got no field, no accessor and no
+//      initialisation.
+//
+// So all three are settled by *running* a mixed pair -- both ways round --
+// against what scalac-on-scalac prints for the same sources.
+
+/// scala-rs compiles `ti_lib.scala`; real scalac 2.13.16 compiles
+/// `ti_app.scala` against those class files. Covers (1): the trait's
+/// `private` `val`, `private[this]` `val`, `private var` and `private lazy
+/// val`, plus -- as the control on how far the expansion goes -- a
+/// `private[tilib]` and a `protected` one, which nsc leaves alone.
+#[test]
+fn ti_nsc_subclass_runs_against_our_private_trait_state() {
+    let Some((jar, scalac)) = interop_tools() else {
+        return;
+    };
+    let control = ti_control(&scalac, &jar, "ti_app");
+    let ours = ti_forward(&scalac, &jar, "ti_app");
+    assert_eq!(
+        ours, control,
+        "a subclass real scalac compiled against our trait's `private` state \
+         does not behave like one compiled against scalac's own"
+    );
+}
+
+/// Same direction, for (2): a stackable `abstract override` chain. The
+/// failure this catches prints the *base* implementation and exits 0.
+#[test]
+fn ti_nsc_subclass_runs_against_our_stackable_trait() {
+    let Some((jar, scalac)) = interop_tools() else {
+        return;
+    };
+    let control = ti_control(&scalac, &jar, "ti_stack");
+    let ours = ti_forward(&scalac, &jar, "ti_stack");
+    assert_eq!(
+        ours, control,
+        "a class real scalac compiled over our `abstract override` traits does \
+         not stack them the way one compiled against scalac's own does"
+    );
+}
+
+/// The other direction, which is the only one (3) shows up in: **scalac**
+/// compiles `ti_lib.scala`, **scala-rs** compiles `ti_app.scala` against it.
+/// Every `val` and `var` of that trait needs a field, two accessors and a
+/// `$init$` call on the class we emit, and `TraitImpls` -- harvested from
+/// source trees -- knows nothing about a trait that arrived as a class file.
+#[test]
+fn ti_our_subclass_runs_against_nscs_trait() {
+    let Some((jar, scalac)) = interop_tools() else {
+        return;
+    };
+    let control = ti_control(&scalac, &jar, "ti_app");
+
+    let n_lib = tmp_dir("ti-nsc-lib");
+    let r_app = tmp_dir("ti-rs-over-nsc");
+    run_scalac(
+        &scalac,
+        &[
+            "-d",
+            n_lib.to_str().unwrap(),
+            fixtures_dir().join("ti_lib.scala").to_str().unwrap(),
+        ],
+    );
+    compile_fixture(
+        "ti_app",
+        &r_app,
+        &[
+            "-cp",
+            n_lib.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ],
+    );
+    let ours = run_main(&format!(
+        "{}:{}:{}",
+        n_lib.display(),
+        r_app.display(),
+        jar.display()
+    ));
+    assert_eq!(
+        ours, control,
+        "a subclass of ours over scalac's trait does not initialise the \
+         trait's state the way scalac's own subclass does"
+    );
+    for d in [n_lib, r_app] {
+        let _ = fs::remove_dir_all(d);
+    }
+}
+
+/// The names, so a regression says which rule broke instead of surfacing as
+/// an `AbstractMethodError` at the far end of the interop tests above.
+#[test]
+fn ti_trait_private_state_uses_nscs_expanded_names() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip ti_lib shape: scala-library jar not present");
+        return;
+    };
+    let out = tmp_dir("ti-shape");
+    compile_fixture("ti_lib", &out, &["--scala-library", jar.to_str().unwrap()]);
+    let iface = javap(&out, "tilib.Counter");
+    for want in [
+        // `private val n`
+        "public abstract int tilib$Counter$$n();",
+        // the mixin setter is named after the *expanded* getter
+        "public abstract void tilib$Counter$_setter_$tilib$Counter$$n_$eq(int);",
+        // `private[this] val seed`, expanded exactly like a plain `private`
+        "public abstract java.lang.String tilib$Counter$$seed();",
+        // `private var m`: a plain `v_$eq`, on the expanded name
+        "public abstract int tilib$Counter$$m();",
+        "public abstract void tilib$Counter$$m_$eq(int);",
+        // `private lazy val doubled`
+        "public abstract int tilib$Counter$$doubled();",
+        // and the two nsc does *not* expand
+        "public abstract int pkg();",
+        "public abstract int prot();",
+    ] {
+        assert!(
+            iface.contains(want),
+            "missing `{want}` from tilib.Counter:\n{iface}"
+        );
+    }
+    assert!(
+        !iface.contains(" int n();"),
+        "a trait's `private val` must not keep its source name:\n{iface}"
+    );
+
+    // The `super` accessor is declared on the interface *and* pickled; the
+    // pickle half is only observable through a class scalac compiles, so it
+    // is asserted in `ti_nsc_reads_our_super_accessor_and_mixin_setters…`.
+    let loud = javap(&out, "tilib.Loud");
+    assert!(
+        loud.contains("public abstract java.lang.String tilib$Loud$$super$label();"),
+        "a stackable trait must declare nsc's `super` accessor:\n{loud}"
+    );
+    let _ = fs::remove_dir_all(out);
+}
+
+/// scalac implements our pickled `SUPERACCESSOR` and our mixin setters -- the
+/// two halves that live in the signature rather than in the class file, and so
+/// are invisible to `javap` on our own output.
+#[test]
+fn ti_nsc_reads_our_super_accessor_and_mixin_setters_from_the_pickle() {
+    let Some((jar, scalac)) = interop_tools() else {
+        return;
+    };
+    let r_lib = tmp_dir("ti-pickle-lib");
+    let r_app = tmp_dir("ti-pickle-app");
+    compile_fixture(
+        "ti_lib",
+        &r_lib,
+        &["--scala-library", jar.to_str().unwrap()],
+    );
+    for app in ["ti_app", "ti_stack"] {
+        run_scalac(
+            &scalac,
+            &[
+                "-cp",
+                r_lib.to_str().unwrap(),
+                "-d",
+                r_app.to_str().unwrap(),
+                fixtures_dir()
+                    .join(format!("{app}.scala"))
+                    .to_str()
+                    .unwrap(),
+            ],
+        );
+    }
+    let sub = javap(&r_app, "Sub");
+    for want in [
+        "public int tilib$Counter$$n();",
+        // `final` here: scalac marks the mixin setter of an immutable `val`
+        // final, so the prefix is deliberately not part of the needle.
+        "void tilib$Counter$_setter_$tilib$Counter$$n_$eq(",
+        "public void tilib$Counter$$m_$eq(int);",
+    ] {
+        assert!(
+            sub.contains(want),
+            "scalac did not read `{want}` out of our pickle:\n{sub}"
+        );
+    }
+    let stacked = javap(&r_app, "Stacked");
+    for want in [
+        "public java.lang.String tilib$Loud$$super$label();",
+        "public java.lang.String tilib$Twice$$super$label();",
+    ] {
+        assert!(
+            stacked.contains(want),
+            "scalac did not implement `{want}`, so our SUPERACCESSOR never \
+             reached the pickle:\n{stacked}"
+        );
+    }
+    for d in [r_lib, r_app] {
+        let _ = fs::remove_dir_all(d);
+    }
+}
+
+fn interop_tools() -> Option<(PathBuf, PathBuf)> {
+    let (Some(jar), Some(scalac)) = (scala_library_jar(), scalac()) else {
+        eprintln!("skip ti_ interop: needs the scala-library jar and scalac 2.13.16");
+        return None;
+    };
+    if !java_available() {
+        return None;
+    }
+    Some((jar, scalac))
+}
+
+/// scalac compiles both halves: the stdout every `ti_` interop test compares
+/// against.
+fn ti_control(scalac: &Path, jar: &Path, app: &str) -> String {
+    let lib = tmp_dir("ti-ctl-lib");
+    let out = tmp_dir("ti-ctl-app");
+    run_scalac(
+        scalac,
+        &[
+            "-d",
+            lib.to_str().unwrap(),
+            fixtures_dir().join("ti_lib.scala").to_str().unwrap(),
+        ],
+    );
+    run_scalac(
+        scalac,
+        &[
+            "-cp",
+            lib.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            fixtures_dir()
+                .join(format!("{app}.scala"))
+                .to_str()
+                .unwrap(),
+        ],
+    );
+    let s = run_main(&format!(
+        "{}:{}:{}",
+        lib.display(),
+        out.display(),
+        jar.display()
+    ));
+    for d in [lib, out] {
+        let _ = fs::remove_dir_all(d);
+    }
+    s
+}
+
+/// scala-rs compiles the traits, real scalac the class that mixes them in.
+fn ti_forward(scalac: &Path, jar: &Path, app: &str) -> String {
+    let lib = tmp_dir("ti-fwd-lib");
+    let out = tmp_dir("ti-fwd-app");
+    compile_fixture("ti_lib", &lib, &["--scala-library", jar.to_str().unwrap()]);
+    run_scalac(
+        scalac,
+        &[
+            "-cp",
+            lib.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            fixtures_dir()
+                .join(format!("{app}.scala"))
+                .to_str()
+                .unwrap(),
+        ],
+    );
+    let s = run_main(&format!(
+        "{}:{}:{}",
+        lib.display(),
+        out.display(),
+        jar.display()
+    ));
+    for d in [lib, out] {
+        let _ = fs::remove_dir_all(d);
+    }
+    s
+}

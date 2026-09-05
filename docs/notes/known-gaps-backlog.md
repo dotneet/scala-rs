@@ -816,30 +816,103 @@ of most of these notes.
   the pair.
 
   What that slice found still missing on the same interop path, none of it
-  caused by the trait encoding and all of it now *reachable* because it is:
+  caused by the trait encoding and all of it *reachable* only because it is —
+  all three ~~fixed~~ in `agent/traitinterop`, each with a mixed-compiler run
+  in `crates/cli/tests/traitclass.rs` (`ti_` fixtures):
 
-  - **A trait's `private` `val` / `var` keeps its source name.** nsc expands
-    it (`lib$Counter$$n` / `lib$Counter$$n_$eq`) so that a subclass it
-    compiles implements the mangled accessors, and a class scalac compiles
-    against ours therefore leaves our `n()` abstract:
-    `AbstractMethodError: … does not define or inherit … n()`. The name is
-    produced in the `ValDef` arm of `emit_class`'s trait branch,
-    `trait_val_setter_name`, `mixin_val_fields`, and wherever the trait's own
-    body reads the accessor. `super_accessor_name` and
-    `trait_outer_accessor_name` already expand this way — this is the same
-    change for the field accessors.
-  - **A `super` accessor is not pickled.** nsc's mixin phase implements
-    `p$q$T$$super$m` in a subclass only when the trait's signature declares a
-    member with the `SUPERACCESSOR` flag (raw `1 << 28`). We emit the method
-    on the interface but write nothing into the pickle, so a stackable
-    `abstract override` trait of ours, mixed in by scalac, is an
-    `AbstractMethodError` on `p$q$T$$super$m`.
-  - **We call `$init$` only for traits compiled in the same run.**
-    `mixin_init_calls` reads `TraitImpls::inits`, which is harvested from
-    source trees, so a trait read from `-cp` gets no `$init$` call and its
-    `val`s stay at their defaults. Now that every trait pickles `$init$`
-    (`pickle_mixin_ctor`), the reader has what it needs to decide; nsc simply
-    calls it for every mixed-in trait unconditionally.
+  - ~~**A trait's `private` `val` / `var` keeps its source name.**~~ nsc
+    expands an unqualified-`private` value member of a trait
+    (`tilib$Counter$$n`) and names the mixin setter after the *expanded*
+    getter (`tilib$Counter$_setter_$tilib$Counter$$n_$eq`), so the class it
+    compiles left our `n()` abstract. `expand_trait_private_vals`
+    (`crates/typer/src/expand_private.rs`) renames the symbol, which carries
+    every emission site at once. It runs **after** `pickle_all`, not before it
+    like `expand_private_names`: nsc renames these at `mixin`, so the pickle
+    holds the source name and the `private` flag and a reader derives the
+    expansion itself — pickling the expanded name made scalac expand a second
+    time (`tilib$Counter$$tilib$Counter$$n`).
+
+    Two pickle bugs fell out of the same fixture. A `private var`'s setter was
+    pickled public beside a private getter, so a reader that expands the getter
+    no longer pairs the two and read the `var` back as a `val`
+    (`AbstractMethodError: … 'abstract void tilib$Counter$$m_$eq(int)'`). And
+    `private[p]` was pickled as bare PRIVATE because this pickler writes no
+    `privateWithin`, so the reader expanded a member our class file publishes
+    unexpanded; `pickled_access_flags` now drops PRIVATE when a qualifier is
+    present, which is what the class file already does.
+
+  - ~~**A `super` accessor is not pickled.**~~ `Symbol::super_accessor` is set
+    by `gen::mark_super_accessors` for a trait method whose body writes
+    `super.m` (narrower than `needs_super_accessor`, which also declares an
+    accessor for a plain `override def`: nothing calls those, and asking a
+    reader to implement one whose target is deferred has nothing to forward
+    to), and `Pickler::pickle_super_accessor` writes the member. Three details
+    are load-bearing, each found by a different failure:
+    * the pickled name is nsc's **unexpanded** `super$m` — the accessor is
+      `private`, so the reader expands it itself;
+    * it is `private`, or `RefChecks` demands the class implement it
+      (`class S needs to be abstract`);
+    * it carries an **alias** reference (the trailing optional ref of nsc's
+      `SYMinfo`), because `UnPickler.finishSym` asserts that exactly the
+      SUPERACCESSOR and PARAMACCESSOR symbols have one. `Mixin.rebindSuper`
+      re-resolves the alias by name, so the trait's own method is the right
+      referent.
+
+    Also here: `abstract override def m = …` is *concrete*, and the namer's
+    `ABSTRACT` on it became DEFERRED in the pickle, so scalac read the whole
+    stackable layer as a declaration and mixed in nothing — `new S().m`
+    silently ran the base implementation. It now pickles ABSOVERRIDE
+    (raw `1 << 18`) and not DEFERRED, and `Symbol::abstract_override` is set
+    only when there is a body.
+
+  - ~~**We call `$init$` only for traits compiled in the same run.**~~ The hole
+    was wider than "the `val`s stay at their defaults": a class of ours mixing
+    in a trait read from `-cp` got no field, no accessor and no `$init$` call
+    at all, and died on the trait's own `default` method with
+    `AbstractMethodError: … 'abstract String v()'`. (Concrete trait *methods*
+    were fine throughout — the JVM inherits an interface default method
+    without anyone's help, which is why this survived so long.)
+    `Gen::binary_trait_vals` reads what the class owes off the interface's own
+    member list: one mixin setter per concrete `val`
+    (`p$q$T$_setter_$v_$eq`), and a plain `v_$eq` beside the getter of a
+    `var`. `mixin_init_calls` calls `$init$` for any binary trait whose
+    signature declares one, which is nsc's own rule.
+
+  Still open on this path, found by the same fixtures:
+
+  - **A trait's `lazy val` has no interface-side initialiser.** nsc compiles
+    one to a `default` method holding the initialiser plus the usual `d$`
+    static, and the implementing class's `d$lzycompute` calls that static. We
+    declare the accessor abstract instead, so a class real scalac compiles
+    over our trait fails with `NoSuchMethodError: 'int L.d$(L)'` the first
+    time the `lazy val` is *read*. Not specific to `private` (the `ti_lib.scala`
+    case is only `private` because that is where it was found): a plain
+    `lazy val` in a trait fails the same way. `ti_lib.scala` declares one and
+    deliberately never reads it.
+
+  - **The reverse of the `super` accessor.** scala-rs mixing in a *binary*
+    stackable trait emits neither the mixin forwarder nor the
+    `p$q$T$$super$m` accessor, because both are driven by `TraitImpls`, which
+    is harvested from source. The result is silent: `new Stacked().label`
+    prints the base implementation. The interface's own member list has what
+    is needed (an `m$` static marks a concrete trait method, and the
+    `…$$super$…` declaration marks the accessor), but `emit_mixin_forwarders`
+    is tree-shaped and a symbol-shaped path beside it would fire for every
+    scala-library trait too, so it wants its own slice.
+
+  - **A binary trait's `var` cannot be assigned from outside.** `c.count = 9`
+    where `count` is a `var` of a trait read from `-cp` is
+    `error: reassignment to val count`: the classfile/pickle reader does not
+    carry MUTABLE onto the accessor. `ti_app.scala` goes through a trait
+    method instead.
+
+  - **A binary trait's *deferred* members look concrete to us.**
+    `class B extends Base { def m = "b" }`, with `Base` read from `-cp` and
+    `m` deferred there, is rejected with ```override` modifier required to
+    override concrete member``. The classfile scanner keeps no DEFERRED, and
+    that is also why `binary_trait_vals` cannot tell a concrete trait `var`
+    from a deferred one and skips the name when anything else in the
+    linearization supplies it.
 
 - **`catch { case _: MatchError => … }` names the bare class in
   `--no-scala-library`** (`agent/fewerclasses`, found in passing; not fixed,

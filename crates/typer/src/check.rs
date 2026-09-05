@@ -328,6 +328,18 @@ pub struct Typer {
     /// Everything typed *inside* the callee sees the flag already cleared, so
     /// a macro application nested in a receiver (`M.g(1).h`) still expands.
     pub(crate) typing_callee: bool,
+    /// How many explicit arguments the `Apply` whose callee is being typed
+    /// carries, when that is known. Only [`Typer::search_extension`] reads it,
+    /// and only to break a tie: nsc's `adaptToArguments` looks for a view
+    /// whose result has a member *applicable to these arguments*, so two
+    /// conversions that both offer the name are not ambiguous when only one of
+    /// them can be called. gitbucket's `implicit class RichColumn(c1:
+    /// Rep[Boolean]) { def &&(c2: => Rep[Boolean], guard: => Boolean) }` ties
+    /// with slick's `booleanColumnExtensionMethods` on every `a && b`, and the
+    /// tie was reported as `value && is not a member of Rep[Boolean]`.
+    /// Cleared while a *qualifier* is typed: the count belongs to the
+    /// selection, not to what it is selected from.
+    pub(crate) callee_arity: Option<usize>,
     /// The JVM half of the def-macro expander (`crates/typer/src/expand.rs`),
     /// started on the first expansion and killed when the typer is dropped.
     pub(crate) macro_engine: Option<crate::expand::MacroEngine>,
@@ -779,6 +791,7 @@ impl Typer {
             new_is_applied: false,
             typing_call_args: false,
             typing_callee: false,
+            callee_arity: None,
             macro_engine: None,
             macro_engine_error: None,
             macro_classpath: opts.binary_path.clone(),
@@ -1957,8 +1970,13 @@ impl Typer {
                 // Record `abstract override` *before* the body-less `def`
                 // rule below adds `ABSTRACT`, which would make the two
                 // indistinguishable.
-                let abs_over =
-                    mods.flags.contains(Flags::ABSTRACT) && mods.flags.contains(Flags::OVERRIDE);
+                // A body-less `abstract override def m: T` is simply
+                // deferred: nothing is stacked on top of `super`, and nsc
+                // pickles it DEFERRED like any other declaration. Only the
+                // concrete form is `ABSOVERRIDE`.
+                let abs_over = !rhs.is_empty()
+                    && mods.flags.contains(Flags::ABSTRACT)
+                    && mods.flags.contains(Flags::OVERRIDE);
                 let mut flags = if rhs.is_empty() && !mods.flags.contains(Flags::NATIVE) {
                     mods.flags.with(Flags::ABSTRACT)
                 } else {
@@ -2662,6 +2680,17 @@ impl Typer {
         // the shape instead of trying (`neg/t5878`, `neg/t10530`).
         if let Some(msg) = crate::cyclic::value_class_wraps_value_class(&self.st, id) {
             self.error(tree.span, msg);
+        }
+        if !self.sigs_only {
+            // SLS 5.1.7 / SIP-15. Only on the body pass: a value class nested
+            // in a method body is never reached by the signature pass, so
+            // running it there as well would only add duplicates for
+            // `dedup_diags` to remove.
+            for v in crate::valueclass::violations(
+                &self.st, id, tree_span, is_trait, vparamss, &tparams, body,
+            ) {
+                self.error(v.span, v.msg);
+            }
         }
         if !self.sigs_only {
             let body_snapshot: Vec<Tree> = body.to_vec();
@@ -9874,7 +9903,7 @@ impl Typer {
                 self.warm_implicit_scope(&t);
             }
             let mut solution = self.undet_solution(&tys, &undet);
-            if solution.is_none() && self.warm_implicit_candidates() {
+            if solution.is_none() && self.warm_implicit_candidates(&tys) {
                 // A witness whose class came from a jar answers only once its
                 // pickled/JVM parents have been read: `implicit F: Async[F]`
                 // is a `GenTemporal[F, Throwable]` through three levels of
@@ -10034,7 +10063,11 @@ impl Typer {
             _ => return,
         };
         if qual.ty.is_no_type() {
+            // The enclosing application's argument count belongs to *this*
+            // selection, not to whatever the qualifier turns out to be.
+            let saved_arity = self.callee_arity.take();
             self.type_expr(qual, &Type::NoType);
+            self.callee_arity = saved_arity;
             // A *qualifier* is never "an argument still waiting for its
             // alternative": `pack` in `SV(pack.to[Seq], "x")` has to be a
             // value before `to` can be looked up on it, exactly as nsc types
@@ -12948,7 +12981,9 @@ impl Typer {
         // Expected type Method so nullary methods (`unary_-`, `def f: Int` called as `f()`)
         // are not auto-applied before this Apply is typed.
         self.typing_callee = true;
+        let saved_arity = self.callee_arity.replace(args.len());
         self.type_expr(fun, &dummy_method);
+        self.callee_arity = saved_arity;
         self.typing_callee = false;
         self.rewrite_receiver_apply(fun);
         Self::auto_apply_nullary_function(fun, args.len());
@@ -16143,7 +16178,7 @@ impl Typer {
             self.warm_implicit_scope(&t);
         }
         let mut solved = self.undet_solution(&rest_tys, &undet);
-        if solved.is_none() && self.warm_implicit_candidates() {
+        if solved.is_none() && self.warm_implicit_candidates(&rest_tys) {
             // The witness may be a jar class whose parents nothing had read:
             // `implicit F: Async[F]` answers `GenTemporal[F, E]` only through
             // `Async extends … GenTemporal[F, Throwable]`, and that is what
@@ -16507,7 +16542,9 @@ impl Typer {
                 .unwrap_or_else(|| self.st.get(*pid).ty.clone());
             self.warm_implicit_scope(&pty);
             let mut search = self.search_implicit(&pty);
-            if matches!(search, ImplicitSearch::None) && self.warm_implicit_candidates() {
+            if matches!(search, ImplicitSearch::None)
+                && self.warm_implicit_candidates(std::slice::from_ref(&pty))
+            {
                 search = self.search_implicit(&pty);
             }
             match search {
@@ -22940,7 +22977,9 @@ impl Typer {
                 // in a trait could not answer `toFlatMapOps`'s `FlatMap[F]`
                 // until some earlier line in the same file happened to warm
                 // it (slick's `BasicBackend.scala`, `run`).
-                if matches!(search, ImplicitSearch::None) && self.warm_implicit_candidates() {
+                if matches!(search, ImplicitSearch::None)
+                    && self.warm_implicit_candidates(std::slice::from_ref(want))
+                {
                     search = self.search_implicit(want);
                 }
                 match search {
@@ -23002,11 +23041,21 @@ impl Typer {
     /// per candidate class, and `warmed_scopes` makes each one a one-off, but
     /// the walk itself is not free. Answers whether anything was new, so the
     /// caller only retries the search when a retry could say something else.
-    pub(crate) fn warm_implicit_candidates(&mut self) -> bool {
+    ///
+    /// `wanted` are the types the search came up empty on. Their classes need
+    /// their parents just as much: `candidate_bounds_hold` asks whether the
+    /// solution for a candidate's `Level <: ShapeLevel` is one, and slick's
+    /// `Query.map` wants a `Shape[_ <: FlatShapeLevel, …]`, so the answer is
+    /// read off `FlatShapeLevel`'s parents -- a jar class the program never
+    /// names. Empty, that said no, and `q.map(_.title)` was "could not find
+    /// implicit value of type Shape[_ <: FlatShapeLevel, Rep[String], T, G]"
+    /// while naming `FlatShapeLevel` anywhere in the same file fixed it.
+    pub(crate) fn warm_implicit_candidates(&mut self, wanted: &[Type]) -> bool {
         let tys: Vec<Type> = self
             .implicits_in_scope()
             .into_iter()
             .map(|id| self.implicit_candidate_ty(id).into_owned())
+            .chain(wanted.iter().cloned())
             .collect();
         let mut fresh = false;
         for t in tys {
