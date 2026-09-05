@@ -966,3 +966,16 @@ of most of these notes.
   `MatchError`, not `scala/MatchError`, although `throw`ing one from a `match`
   fall-through resolves correctly. So it is the *catch* type's resolution, not
   the class: `runtime.rs` does emit `scala/MatchError`.
+
+- **`implicitly[X]`'s result is selected from without a `checkcast`, and the
+  JVM rejects the class** (found by `agent/slickimplicit` while building a
+  fixture; not fixed). `implicitly[Box[String]].show` is enough to reproduce
+  it. A hand-written `def summon[T](implicit e: T): T` emits the cast and
+  works, so this is specific to `Predef.implicitly` — presumably the shortcut
+  that types it does not go through the path that inserts the receiver cast.
+
+  Worth noticing what caught it: the verifier. Not the type checker, not the
+  corpus, not any of the four project measures — a fixture happened to select
+  a member off an `implicitly` result and the class would not load. The slice
+  wrote around it with `summon` rather than leaving a fixture that could not
+  run, and said so.
