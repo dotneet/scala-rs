@@ -93,7 +93,7 @@ pub use check::{
 };
 pub use default_recv::hoist_default_receivers;
 pub use erasure::{erase, erase_type, note_source_value_classes};
-pub use expand_private::expand_private_names;
+pub use expand_private::{expand_private_names, expand_trait_private_vals};
 pub use lambda_lift::lambda_lift;
 pub use lazy_local::lazy_locals;
 pub use lin::{is_interface, linearize, trait_superclass};
