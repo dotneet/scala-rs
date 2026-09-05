@@ -3850,6 +3850,141 @@ fn scalalib_specialized_ignored_with_the_flag() {
     let _ = fs::remove_dir_all(&out);
 }
 
+// ------------------------------------- gitbucket: overload resolution shapes
+
+/// nsc filters overload alternatives on the *shape* of a function-literal
+/// argument (`Infer.shapeType`) before it types the literal: the parameter
+/// types are unknown, but the arity is not. gitbucket's four
+/// `…Only(action: RepositoryInfo => Any)` / `…Only[T](action: (T, RepositoryInfo) => Any)`
+/// pairs are exactly this, and every call of them was `ambiguous overload`.
+#[test]
+fn gitbucket_overload_shape_fixture() {
+    dual_run_fixture("gb_ovl_shape");
+}
+
+/// The other half: a literal whose arity fits no alternative is still
+/// rejected, and an error *inside* a literal costs exactly one diagnostic --
+/// the literal keeps the parameter types its prototype gave it instead of
+/// being re-typed with none and reporting one `is not a member of Any` per
+/// field the body reads.
+#[test]
+fn gitbucket_overload_shape_bad_is_rejected_without_a_cascade() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip gb_ovl_shape_bad: jar not obtainable");
+        return;
+    };
+    let src = fixtures_dir().join("gb_ovl_shape_bad.scala");
+    let out = tmp_dir("gb_ovl_shape_bad");
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        !output.status.success(),
+        "expected gb_ovl_shape_bad to fail"
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        err.contains("not found: value oopsUndefined"),
+        "expected the body's own error, got {err}"
+    );
+    assert!(
+        err.contains("ambiguous overload for only with arguments ((<notype>, <notype>, <notype>) => <notype>)"),
+        "expected the three-parameter literal to fit no alternative, got {err}"
+    );
+    assert!(
+        !err.contains("is not a member of Any"),
+        "the literal lost its parameter types: {err}"
+    );
+    assert!(
+        err.contains("2 error(s)"),
+        "expected exactly the two errors real scalac reports, got {err}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// A class that arrives on `-cp` and is never *named* by the source -- its
+/// type only ever comes back from a signature -- still has to be completed
+/// before a call is solved against its base types. This is scalatra-forms'
+/// `mapping(...): MappingValueType[T]` passed to gitbucket's
+/// `post[T](path: String, form: ValueType[T])(action: T => Any)`.
+#[test]
+fn gitbucket_inferred_classpath_class_is_completed() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip gb_cplib: jar not obtainable");
+        return;
+    };
+    let out_lib = tmp_dir("gb-cplib-lib");
+    let out_main = tmp_dir("gb-cplib-main");
+    let compile = |src: PathBuf, out: &Path, cp: Option<&Path>| {
+        let mut cmd = Command::new(bin());
+        cmd.args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ]);
+        if let Some(p) = cp {
+            cmd.args(["-cp", p.to_str().unwrap()]);
+        }
+        cmd.output().expect("scala-rs compile")
+    };
+    let lib = compile(fixtures_dir().join("gb_cplib_lib.scala"), &out_lib, None);
+    assert!(
+        lib.status.success(),
+        "gb_cplib_lib failed: {}",
+        String::from_utf8_lossy(&lib.stderr)
+    );
+    let main = compile(
+        fixtures_dir().join("gb_cplib_main.scala"),
+        &out_main,
+        Some(&out_lib),
+    );
+    assert!(
+        main.status.success(),
+        "gb_cplib_main failed: {}{}",
+        String::from_utf8_lossy(&main.stderr),
+        String::from_utf8_lossy(&main.stdout)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        out_main.display(),
+        out_lib.display(),
+        jar.display()
+    );
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        output.status.success(),
+        "java Main failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_stdout("gb_cplib_main")
+    );
+    let _ = fs::remove_dir_all(&out_lib);
+    let _ = fs::remove_dir_all(&out_main);
+}
+
 // ------------------------------------------------- simulacrum's AllOps (cats)
 
 /// cats restates `type TypeClassType <: Functor[F]` at every level of the
