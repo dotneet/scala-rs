@@ -313,6 +313,37 @@ fn abstract_param_mask(ty: &Type) -> u32 {
 
 fn erase_overriding_method(st: &SymbolTable, id: SymbolId, ty: &Type) -> Type {
     let erased = erase_ty(ty, st);
+    // A method whose own *declared* return type is a value class erases to
+    // that class's underlying representation (the `Type::Class { sym, .. } if
+    // st.is_value_class(sym)` arm of `erase_ty`), and that erasure is
+    // authoritative even when the method structurally overrides
+    // `FunctionN.apply` -- a case class's companion `apply` extends
+    // `AbstractFunctionN` so the companion can serve as a function value, but
+    // nsc keeps `apply`'s own descriptor at the erased underlying type
+    // (`public int apply(int)`, confirmed with `javap -c` on scalac 2.13.16)
+    // and adds a *separate* bridge (`public Object apply(Object)`) for the
+    // `FunctionN` override, rather than widening `apply` itself.
+    //
+    // Falling into the general "our primitive narrows the overridden's
+    // Object" widening below -- which exists for an abstract type member
+    // specialized to a primitive in a subclass, a real bridge-needed
+    // situation -- instead widened `apply`'s own *stored* signature to the
+    // boxed return. `emit_case_apply` (crates/backend/src/gen.rs) never
+    // consulted that stored signature; it always writes the narrow erased
+    // descriptor on the classfile. But every call site in the same
+    // compilation reads the widened, wrong one off the symbol table, so
+    // `Wrapped(7)` invoked `Wrapped$.apply` with a boxed descriptor the
+    // classfile does not have: `NoSuchMethodError: 'java.lang.Object
+    // Wrapped$.apply(int)'` at run time, past every static check.
+    let ret_is_value_class = match ty {
+        Type::Method { ret, .. } | Type::Function { ret, .. } => {
+            matches!(ret.as_ref(), Type::Class { sym, .. } if st.is_value_class(*sym))
+        }
+        _ => false,
+    };
+    if ret_is_value_class {
+        return erased;
+    }
     let Some(ov) = find_overridden_method(st, id) else {
         return erased;
     };
