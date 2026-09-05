@@ -3835,8 +3835,13 @@ impl PickleSupply {
         // There is no class by that name, so without this the member is
         // declined and `u.internal` -- the door to the whole reification API
         // -- is not a member of anything.
-        if args.is_empty() && !sym.contains('.') && scope.get(sym).is_none() {
-            if let Some(t) = self.self_type_member(st, bin, sym, d) {
+        //
+        // A *parameterised* one is written the same way. slick's
+        // `ImplicitColumnTypes` declares its twenty-four column types at
+        // `BaseColumnType[T]`, a type member of the profile cake, so refusing
+        // an applied one made every one of them an unmappable result type.
+        if !sym.contains('.') && scope.get(sym).is_none() {
+            if let Some(t) = self.self_type_member(st, bin, scope, sym, args, d) {
                 return Some(t);
             }
         }
@@ -3856,9 +3861,22 @@ impl PickleSupply {
             // will be. Almost the whole reflection API is written this way
             // (`Tree`, `Name`, `Symbol`, `Type`, `Position`, `FlagSet`), so
             // declining here would make the API unusable.
-            if args.is_empty() {
-                if let Some(t) = self.abstract_type_member(st, bin, sym, d) {
+            //
+            // The same holds for a *parameterised* one written out in full:
+            // `RelationalProfile.API`'s `type BaseColumnType[T] =
+            // RelationalTypesComponent.BaseColumnType[T]` is what
+            // `import profile.api.*` offers, and its right-hand side names the
+            // cake's abstract member applied to `T`.
+            if let Some(t) = self.abstract_type_member(st, bin, sym, d) {
+                if args.is_empty() {
                     return Some(t);
+                }
+                if st.kind_arity(&t) == args.len() {
+                    let a = self.conv_all(st, bin, scope, args, d)?;
+                    return Some(Type::Applied {
+                        ctor: Box::new(t),
+                        args: a,
+                    });
                 }
             }
             // Remembered rather than merely declined: the typer can often load
@@ -3920,7 +3938,7 @@ impl PickleSupply {
             .collect()
     }
 
-    /// `T` as an abstract type member of the class whose member is being
+    /// `T`, or `T[args]`, as a type member of the class whose member is being
     /// completed, or of anything it inherits from.
     ///
     /// `None` outside a completion, and for any name no ancestor declares --
@@ -3930,7 +3948,9 @@ impl PickleSupply {
         &mut self,
         st: &mut SymbolTable,
         bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
         name: &str,
+        args: &[SigType],
         d: u32,
     ) -> Option<Type> {
         let cls = match &self.self_ty {
@@ -3938,7 +3958,30 @@ impl PickleSupply {
             _ => return None,
         };
         let internal = st.get(cls).jvm_name.clone();
-        if !internal.starts_with("scala/") {
+        // Outside `scala.*` this runs only for an *applied* member
+        // (`BaseColumnType[Boolean]`), which is how slick's cake declares all
+        // twenty-four of its column types and which had no answer at all
+        // before: `conv_ref` declined it, and the member was completed from
+        // the class file's erased descriptor instead.
+        //
+        // A *nullary* one keeps the old rule. The reason is that what this
+        // walk can find is the declaration in the class the member was written
+        // in, and that is the abstract one whenever a more derived class in
+        // the *receiver's* linearisation is what turns it into an alias --
+        // `trait BaseBackend { type Database }` refined by
+        // `trait JdbcBackend { type Database = DatabaseDef }`, which is slick's
+        // own shape. There the erased descriptor is the better answer, and
+        // preferring the abstract member over it broke
+        // `crates/cli/tests/aliaslookup.rs`. An applied member has no such
+        // competition, since there is no erased descriptor to lose.
+        if args.is_empty() && !internal.starts_with("scala/") {
+            return None;
+        }
+        if internal.is_empty()
+            || internal.starts_with("java/")
+            || internal.starts_with("javax/")
+            || internal.contains("$anon")
+        {
             return None;
         }
         let module = internal.ends_with('$');
@@ -3979,7 +4022,7 @@ impl PickleSupply {
                 // rule (a concrete definition overrides a deferred one).
                 if !self.decl_site_erasure {
                     let outer = self.self_ty.take();
-                    let alias = self.expand_alias(st, bin, &HashMap::new(), &qualified, &[], d);
+                    let alias = self.expand_alias(st, bin, scope, &qualified, args, d);
                     self.self_ty = outer;
                     if let Some(t) = alias {
                         trace(format_args!(
@@ -3989,7 +4032,20 @@ impl PickleSupply {
                     }
                 }
                 if let Some(t) = self.abstract_type_member(st, bin, &qualified, d) {
-                    return Some(t);
+                    if args.is_empty() {
+                        return Some(t);
+                    }
+                    // `BaseColumnType[Boolean]`: the member's own bound is
+                    // written in its parameters, and `is_sub_type` substitutes
+                    // them at each `Applied`, so the arity has to match.
+                    if st.kind_arity(&t) != args.len() {
+                        continue;
+                    }
+                    let a = self.conv_all(st, bin, scope, args, d)?;
+                    return Some(Type::Applied {
+                        ctor: Box::new(t),
+                        args: a,
+                    });
                 }
             }
         }
@@ -4038,11 +4094,30 @@ impl PickleSupply {
             .clone();
         let id = st.alloc(member, owner, SymKind::TypeMember, Flags::EMPTY, "");
         st.get_mut(owner).members.push(id);
+        // A *parameterised* abstract member (`type BaseColumnType[T] <:
+        // ColumnType[T] & BaseTypedType[T]`, slick's `RelationalTypesComponent`)
+        // is pickled as a `PolyType` over the bounds. Reading only the bounds
+        // dropped the parameters, so every use was "BaseColumnType does not
+        // take type parameters" and the bound was left mentioning a `T`
+        // nothing could stand for.
+        let (tps, info) = match &m.ty {
+            SigType::Poly { tparams, result } => (tparams.clone(), (**result).clone()),
+            other => (Vec::new(), other.clone()),
+        };
+        let mut scope: HashMap<String, Type> = HashMap::new();
+        let mut tparams = Vec::new();
+        for tp in &tps {
+            let t = st.alloc(&tp.name, id, SymKind::TypeParam, Flags::EMPTY, "");
+            st.get_mut(t).ty = Type::TypeParam(t);
+            set_tparam_arity(st, t, tparam_arity(tp));
+            scope.insert(tp.name.clone(), Type::TypeParam(t));
+            tparams.push(t);
+        }
+        st.get_mut(id).tparams = tparams;
         // Entered before the bound is converted: `type Tree >: Null <: TreeApi`
         // and `type TreeApi` can refer to each other, and without the symbol
         // being visible first that recurses until the depth limit.
-        if let SigType::Bounds { lo, hi } = &m.ty {
-            let scope = HashMap::new();
+        if let SigType::Bounds { lo, hi } = &info {
             let (lo, hi) = (lo.clone(), hi.clone());
             // A bound is written in *its owner's* vocabulary, not the
             // receiver's. `type Ident >: Null <: IdentApi with RefTree` names
