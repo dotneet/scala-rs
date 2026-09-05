@@ -105,6 +105,7 @@ impl Typer {
             sym: pid,
             postfix: false,
             scala_ref: false,
+            stable_pat: false,
         };
         let param = Tree {
             id: NodeId(0),
@@ -119,6 +120,7 @@ impl Typer {
             sym: pid,
             postfix: false,
             scala_ref: false,
+            stable_pat: false,
         };
         Tree {
             id: NodeId(0),
@@ -134,6 +136,7 @@ impl Typer {
             sym: SymbolId::NONE,
             postfix: false,
             scala_ref: false,
+            stable_pat: false,
         }
     }
 }

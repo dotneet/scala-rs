@@ -674,6 +674,7 @@ impl Materialiser<'_> {
             sym: SymbolId::NONE,
             postfix: false,
             scala_ref: false,
+            stable_pat: false,
         }
     }
 

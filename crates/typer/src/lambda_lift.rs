@@ -1017,6 +1017,7 @@ fn rewrite_auto_apply(tree: &mut Tree, caps: &HashMap<SymbolId, Vec<SymbolId>>, 
         sym: sid,
         postfix: false,
         scala_ref: false,
+        stable_pat: false,
     };
 }
 
@@ -1039,5 +1040,6 @@ fn capture_ident(id: SymbolId, span: scala_rs_span::Span, st: &SymbolTable) -> T
         sym: id,
         postfix: false,
         scala_ref: false,
+        stable_pat: false,
     }
 }

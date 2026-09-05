@@ -3838,6 +3838,31 @@ impl<'a> Parser<'a> {
             // `|` separates alternatives, so it must not read as an infix type
             // (`case _: Int | _: String =>`).
             let tpt = self.parse_pattern_type();
+            // A compound type pattern has to test *every* parent. Erasure
+            // keeps only the dominant one, so `case _: TA with TB` matched a
+            // plain `TA`; nest one ascription per parent instead, innermost
+            // first, so each test survives erasure on its own and the bound
+            // variable still ends up at the type erasure would have given it.
+            if let TreeKind::CompoundTypeTree {
+                parents,
+                refinements,
+            } = &tpt.kind
+            {
+                if parents.len() > 1 && refinements.is_empty() {
+                    let span = t.span.merge(tpt.span);
+                    let mut out = t;
+                    for p in parents.clone() {
+                        out = self.alloc(
+                            span,
+                            TreeKind::Typed {
+                                expr: Box::new(out),
+                                tpt: Box::new(p),
+                            },
+                        );
+                    }
+                    return out;
+                }
+            }
             return self.alloc(
                 t.span.merge(tpt.span),
                 TreeKind::Typed {
@@ -4028,7 +4053,15 @@ impl<'a> Parser<'a> {
                 self.alloc(lo.merge(self.prev_span()), TreeKind::Literal { lit })
             }
             TokenKind::Ident(_) | TokenKind::This => {
+                // SLS 8.1.5: a backquoted name is a stable identifier pattern
+                // whatever its first letter is, so ``case `f` =>`` compares
+                // with `f` where `case f =>` would bind a new variable.
+                let backquoted =
+                    matches!(self.kind(), TokenKind::Ident(_)) && self.is_backquoted(self.span());
                 let mut t = self.parse_path();
+                if backquoted && matches!(t.kind, TreeKind::Ident { .. }) {
+                    t.stable_pat = true;
+                }
                 self.skip_nl();
                 if matches!(self.kind(), TokenKind::LParen) {
                     let args = self.parse_pattern_args();
@@ -5300,27 +5333,48 @@ fn desugar_for(
             sym: SymbolId::NONE,
             postfix: false,
             scala_ref: false,
+            stable_pat: false,
         }
     }
     /// A generator pattern that always matches: a variable, `_`, or a tuple of
     /// those. nsc filters the others, and so does `filter_lambda` below.
-    fn is_irrefutable(pat: &Tree) -> bool {
+    ///
+    /// `deep` marks a position *inside* a larger pattern. nsc's
+    /// `makeGenerator` reads a generator whose whole pattern is one identifier
+    /// as a definition, so `for (X <- xs)` binds `X` however it is spelled;
+    /// anywhere further in, an identifier is only irrefutable when it is a
+    /// *variable* pattern. ``case `lower` `` and `case NoNull` are tests, and
+    /// the generator owes them a `withFilter` -- without it
+    /// ``for (o @ NoNull <- l)`` ran the body for every element.
+    fn is_irrefutable_at(pat: &Tree, deep: bool) -> bool {
         match &pat.kind {
-            TreeKind::Ident { .. } | TreeKind::Wildcard => true,
-            TreeKind::Bind { body, .. } => is_irrefutable(body),
+            TreeKind::Ident { name } => {
+                !deep
+                    || (!pat.stable_pat
+                        && name
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_lowercase() || c == '_'))
+            }
+            TreeKind::Wildcard => true,
+            TreeKind::Bind { body, .. } => is_irrefutable_at(body, true),
             TreeKind::Apply { fun, args } => {
                 matches!(&fun.kind, TreeKind::Ident { name } if name.starts_with("Tuple"))
-                    && args.iter().all(is_irrefutable)
+                    && args.iter().all(|a| is_irrefutable_at(a, true))
             }
             _ => false,
         }
     }
+    fn is_irrefutable(pat: &Tree) -> bool {
+        is_irrefutable_at(pat, false)
+    }
     fn lambda(p: &mut Parser, pat: Tree, body: Tree) -> Tree {
         let span = pat.span.merge(body.span);
-        if !matches!(
-            &pat.kind,
-            TreeKind::Ident { .. } | TreeKind::Bind { .. } | TreeKind::Wildcard
-        ) {
+        // A `Bind` over a refutable pattern (`o @ NoNull`) has to be matched
+        // too: binding only the outer name dropped the test the pattern makes.
+        let simple = matches!(&pat.kind, TreeKind::Ident { .. } | TreeKind::Wildcard)
+            || (matches!(&pat.kind, TreeKind::Bind { .. }) && is_irrefutable(&pat));
+        if !simple {
             // `for ((a, b) <- xs) yield a` — bind the element and match it,
             // which is what nsc's pattern-matching anonymous function does.
             p.placeholder_id += 1;
@@ -5559,6 +5613,7 @@ fn dummy_ident_from(pat: &Tree) -> Tree {
         sym: SymbolId::NONE,
         postfix: false,
         scala_ref: false,
+        stable_pat: false,
     }
 }
 

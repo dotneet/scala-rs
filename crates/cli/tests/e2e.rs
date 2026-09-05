@@ -3849,3 +3849,22 @@ fn scalalib_specialized_ignored_with_the_flag() {
     }
     let _ = fs::remove_dir_all(&out);
 }
+
+/// Stable identifier patterns: a name that resolves to a `val`, a backquoted
+/// name, both inside an alternative and inside a `for` generator, plus the
+/// compound type pattern that has to test every parent. Each of these used to
+/// bind a fresh variable (or test only the first parent), so the case matched
+/// everything and the program answered from the wrong branch. The expected
+/// output is real scalac 2.13.16's.
+#[test]
+fn stable_identifier_patterns() {
+    dual_run_fixture("rm_stable_pattern");
+}
+
+/// A `case class` companion's `toString`, a `var` constructor parameter
+/// assigned in the class body, and `lub(Unit, A)` for an abstract `A` -- three
+/// wrong answers that no diagnostic reported.
+#[test]
+fn case_companion_var_param_and_unit_lub() {
+    dual_run_fixture("rm_classbody");
+}
