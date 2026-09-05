@@ -668,8 +668,65 @@ Singleton`, which is honest but is a diagnostic scalac does not have. Five
 the same underlying reason, so the pass rate did not move. It needs a compiler-
 defined symbol, the way `Any`/`AnyRef`/`Nothing` have one.
 
+## The `run` failures, classified (2026-09-05)
+
+`run` is the weakest of the three categories — 444 of 2060 — and until now it
+was the only one nobody had broken down by symptom. Here it is. The 1063
+failures split into two piles that deserve very different priorities.
+
+### Pile one: we are wrong (237)
+
+These compile, they load, they run, and the answer is not scalac's. A program
+we *reject* costs the user a diagnostic. A program we accept and get wrong
+costs them a debugging session, and none of our other checks catch it.
+
+| symptom | count | what it means |
+| --- | ---: | --- |
+| `output-mismatch` | 93 | ran to completion, stdout differs from `.check` |
+| `AssertionError` | 28 | the test's own `assert` failed — same thing, louder |
+| `VerifyError` (all shapes) | 44 | the JVM refuses the classfile we wrote |
+| `ClassCastException` | 19 | erasure or a cast we inserted |
+| `NoSuchMethodError` | 33 | the call site and the callee disagree |
+| `AbstractMethodError` | 8 | a forwarder or bridge we did not emit |
+| `IncompatibleClassChangeError` / `NoClassDefFoundError` | 5 | |
+
+Two of these deserve a note. **`AbstractMethodError` and `NoSuchMethodError`
+are invisible to the verifier** — a call through an interface type is not
+type-checked by it — which is exactly how a value-class defect once walked past
+all six detection methods and surfaced only at run time. And `output-mismatch`
+is invisible to *everything* except running the program against expected
+output, which is what this category exists to do.
+
+### Pile two: we do not implement it (≈500)
+
+| symptom | count |
+| --- | ---: |
+| `scala.reflect.runtime` surface (`currentMirror`, `runtimeMirror`, `TypeTag`, `Manifest`, `Universe#Transformer`) | ≈200 |
+| `reify { … }` beyond literals | ≈90 |
+| `@specialized` | 37 |
+| whitebox macros | 12 |
+| quasiquotes | ≈10 |
+
+These are honest gaps with honest diagnostics. They are worth doing, and the
+reflection block is nearly all supply — the jar is already on the corpus
+classpath — but a missing feature that says so is not a defect in the sense
+pile one is.
+
+`553` more `run` tests are skipped rather than failed (unsupported harness
+shapes: `.javaopts`, separate JVMs, `filters`); see the limits section below.
+
 ## What would move the number most
 
+0. **`@specialized`, for real.** With `run` now classified, this is the
+   largest single identified lever left in the corpus: 70 `pos` + 37 `run` =
+   **107 tests**, and it is the *only* one of that size. The tails of all three
+   categories are otherwise flat — after specialization the next-biggest `pos`
+   cluster is 5 tests, and the next-biggest `neg` one is a `type mismatch`
+   bucket of 37 that is many unrelated roots. See
+   [the section at the top](#why-pos-does-not-pass--no-specialization) for why
+   `-no-specialization` is not a substitute: the flag means *ignore the
+   annotation*, and nsc's `specialize` phase emits `Foo$mcI$sp` classes and
+   changes the ABI. This is a real phase, not a diagnostic to delete.
 1. **Static forwarders into a companion class.** Fifteen `run` tests, one
    well-understood rule, contained to the backend.
 2. **`AnyRef` conformance.** `val x: AnyRef = 1` compiling is a hole under
@@ -684,8 +741,10 @@ defined symbol, the way `Any`/`AnyRef`/`Nothing` have one.
    9.5 % (T2), not 61.7 %. What it turned up is that the `neg` tail is as flat
    as the `pos` one; the ranked follow-ups are at the end of
    [that section](#what-this-says-to-fix-next).
-4. **The 47 `VerifyError`s.** Every one is a classfile the JVM refuses. They
-   need individual narrowing, but the corpus hands over the reproducers.
+4. **The 237 in [pile one](#pile-one-we-are-wrong-237).** Programs we accept
+   and then get wrong. This is now the top lever, ahead of anything that adds
+   a feature: every one of them is a case where a user would ship the wrong
+   behaviour with no diagnostic to warn them.
 
 ## Known limits of this runner
 

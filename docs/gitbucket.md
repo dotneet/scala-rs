@@ -673,11 +673,28 @@ Counted by message shape, largest first, with the reading:
 ### What would remove the most next
 
 1. **Overload resolution against a function literal with an un-inferred
-   parameter** (≈259 errors: the `…Only` family at both arities, plus
-   `datetimeago`). nsc picks the overload by arity first and then types the
-   literal against the chosen parameter type. This is also what is left in the
-   templates: `datetimeago` is the biggest template symptom that is not merely
-   downstream. It is now the largest single thing by a wide margin.
+   parameter** (**217** errors, not the ≈259 written here before — see the
+   correction below). nsc picks the overload by arity first and then types the
+   literal against the chosen parameter type. It is still the largest single
+   thing by a wide margin.
+
+   **Correction, 2026-09-05.** The ≈259 lumped in `datetimeago` (52), whose
+   argument is a plain `Date` and not a function literal at all — a different
+   root wearing the same word. Counted by argument shape, the current log
+   splits as:
+
+   | | |
+   |---:|---|
+   | 338 | `ambiguous overload` in total |
+   | **217** | …of which the argument is `(<notype>) => <notype>` — a function literal whose parameter type is not inferred yet. `referrersOnly` 79, `writableUsersOnly` 75, `ownerOnly` 32, `readableUsersOnly` 30. This is the root. |
+   | 121 | …of which it is not: `datetimeago` 52, `main` 35, `apply$default$N` 22, and a tail. |
+   | 175 | `no matching overload`, a separate diagnostic |
+
+   The diagnostic word matters for where the fix goes. **`ambiguous`, not `no
+   matching`**, means we found two or more *applicable* candidates and could
+   not choose between them — so the gap is in specificity (SLS 6.26.3,
+   `isAsSpecific`), not in whether a candidate applies. A shape-typing fix that
+   made more candidates applicable would make this cluster worse, not better.
 2. **`TableQuery[X]`'s own members behind its `apply`-shaped constructor**
    (≈70). `lazy val Issues = TableQuery[Issues]` is typed as the *function*
    `(Tag) => Issues` applied to nothing, so `Issues.filter` looks for `filter`
