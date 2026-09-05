@@ -31,6 +31,7 @@ mod lin;
 mod localobj;
 mod macros;
 mod materialize;
+mod named_eval_order;
 mod override_check;
 mod pickle_supply;
 mod prelude;
@@ -130,6 +131,7 @@ pub use lambda_lift::lambda_lift;
 pub use lazy_local::lazy_locals;
 pub use lin::{is_interface, linearize, trait_superclass};
 pub use localobj::{check_local_case_class_captures, check_local_objects};
+pub use named_eval_order::restore_named_arg_order;
 pub use source_features::{ParsedFeatures, SourceFeature, SourceFeatures};
 pub use symbol::{
     Intrinsic, MacroBinding, SamSig, SeqPayload, SymKind, Symbol, SymbolTable, AS_SEEN_FROM_MARK,

@@ -217,11 +217,37 @@ impl Typer {
     /// Keeping the one the linearization reaches first is also the only choice
     /// that can be *called*: a declaration has no body, and the class that
     /// implements it is the one the JVM resolves to.
+    ///
+    /// The self type's own linearization counts as well. A `self:` annotation
+    /// is not a supertype, but its members *are* visible unqualified from
+    /// inside the body -- that is what `SymbolTable::lookup_member` walks it
+    /// for -- so an unqualified reference resolves through it and the same
+    /// declaration/definition pair has to collapse there too. gitbucket
+    /// writes its authenticators that way:
+    ///
+    /// ```scala
+    /// trait ReferrerAuthenticator { self: ControllerBase & RepositoryService & AccountService =>
+    ///   private def authenticate(...) = { val userName = params("owner") ... }
+    /// }
+    /// ```
+    ///
+    /// and every `params(...)` in one was `ambiguous implicit: request,
+    /// request` while the identical line in a trait that *extends*
+    /// `ScalatraFilter` type-checked -- the linearization the ranks were read
+    /// from held neither `ScalatraContext` nor `DynamicScope`, so no candidate
+    /// could shadow the other.
+    ///
+    /// An *enclosing* class's bases count for the same reason: inside `new
+    /// Constraint() { … }` in a controller's body, `params("userName")` still
+    /// reads the controller's `request`, and the anonymous class's own
+    /// linearization holds neither declaration. Nearer scopes come first, so
+    /// the ranks are laid out innermost class outwards -- which is also the
+    /// order an unqualified name resolves in.
     fn shadow_inherited_implicits(&self, cands: Vec<SymbolId>) -> Vec<SymbolId> {
         if cands.len() < 2 {
             return cands;
         }
-        let lin = crate::lin::linearize(&self.st, self.st.this_class);
+        let lin = self.unqualified_base_order(self.st.this_class);
         let rank = |owner: SymbolId| lin.iter().position(|&b| b == owner);
         cands
             .iter()
@@ -243,6 +269,49 @@ impl Typer {
                 })
             })
             .collect()
+    }
+
+    /// The classes an unqualified reference inside `cls`'s body can reach a
+    /// member of, nearest first.
+    ///
+    /// `cls`'s own linearization, then its self type's (a `self:` annotation
+    /// makes the annotated type's members visible from inside the body without
+    /// being a supertype -- `SymbolTable::lookup_member` walks it for exactly
+    /// that), then the same two for each enclosing class outwards. Duplicates
+    /// are dropped at the position they were first reached, so a base shared
+    /// by an inner and an outer class ranks where the inner one put it.
+    fn unqualified_base_order(&self, cls: SymbolId) -> Vec<SymbolId> {
+        let mut out: Vec<SymbolId> = Vec::new();
+        let mut at = cls;
+        let mut guard = 0;
+        while !at.is_none() && guard < 64 {
+            guard += 1;
+            if self.st.get(at).is_class_like() {
+                let mut here = vec![at];
+                if let Some(sty) = &self.st.get(at).self_type {
+                    // `self: A & B & C =>` is a refinement with three parents,
+                    // and each contributes its own bases.
+                    match sty {
+                        Type::Refined { parents, .. } => here.extend(
+                            parents
+                                .iter()
+                                .filter_map(|p| self.st.class_sym_of(p))
+                                .collect::<Vec<_>>(),
+                        ),
+                        other => here.extend(self.st.class_sym_of(other)),
+                    }
+                }
+                for start in here {
+                    for b in crate::lin::linearize(&self.st, start) {
+                        if !out.contains(&b) {
+                            out.push(b);
+                        }
+                    }
+                }
+            }
+            at = self.st.get(at).owner;
+        }
+        out
     }
 
     /// Implicit members of the companion module of `class_id` (or the module
@@ -746,10 +815,32 @@ impl Typer {
     /// "Computation of type (Rep[P]) => Query[T, U, Seq] cannot be compiled
     /// (as type C)" -- slick's own `@implicitNotFound`.
     ///
+    /// The call site does **not** have to have left anything undetermined for
+    /// this to be the answer. slick's
+    ///
+    /// ```text
+    /// tuple2Shape[Level, M1, M2, U1, U2, P1, P2](implicit
+    ///   u1: Shape[_ <: Level, M1, U1, P1], u2: Shape[_ <: Level, M2, U2, P2]
+    /// ): Shape[Level, (M1, M2), (U1, U2), (P1, P2)]
+    /// ```
+    ///
+    /// answered against `Shape[_ <: FlatShapeLevel, T, U, _]` -- the clause of
+    /// `anyToShapedValue`, which is behind every `def * = (a, b).mapTo[M]` in a
+    /// table -- has `P1`/`P2` standing opposite that trailing `_`. Nothing on
+    /// the wanted side can ever say what they are, and `u1`/`u2` say it
+    /// exactly. Requiring a non-empty `undet` made this whole family
+    /// "could not find implicit value".
+    ///
     /// Deliberately a *fallback*: it runs only for a candidate the ordinary
     /// solve rejected, and only when the wanted type pinned down at least one
     /// of the candidate's parameters. A rule that matched with everything open
     /// would be tried against every implicit in scope.
+    ///
+    /// **Not** a general instantiation: `Unify` keys its unknowns by symbol,
+    /// so a rule that derives *itself* has its own `P1` and the caller's open
+    /// `P1` as one symbol and the occurs check rejects `P1 := (P1, P2)`. nsc
+    /// uses a fresh type variable per application; nested tuple shapes are
+    /// still not found here.
     fn implicit_fit_open(
         &self,
         id: SymbolId,
@@ -759,9 +850,6 @@ impl Typer {
         paramss: &[Vec<Type>],
         depth: usize,
     ) -> Option<ImplicitFit> {
-        if undet.is_empty() {
-            return None;
-        }
         let tps = self.st.get(id).tparams.clone();
         if tps.is_empty() {
             return None;

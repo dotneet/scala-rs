@@ -702,7 +702,7 @@ of most of these notes.
 - **StackMapTable for locals declared in a `while` body** (`while (c) { val s = …; … }` makes the frame at the top of the loop include that slot, giving `VerifyError: Instruction type does not match stack map`. It has nothing to do with anonymous classes; binding the `val` outside the loop works)
 - **The body of `scala.Product`** (case classes / case objects do have `productPrefix` / `productArity`, but `Product` is not attached as a parent, so there is no `productElement` / `productIterator` / `productElementNames`, and they cannot be passed where `(x: Product)` is expected)
 - **Among optional constructor arguments, defaults that refer to a preceding ctor parameter** (`class C(x: Int, y: Int = x + 1)`). Simple literal / `null` defaults (`class C(x: Int, y: Int = 5)`, or slick's `SlickException(msg, parent: Throwable = null)`) do work
-- **Remainder of named arguments**: (a) **prelude / classpath methods carry no parameter names**, so `List(1,2,3).mkString(sep = "-")` and `copy(name = …)` on a case class from a jar or the `-cp` give `unimplemented syntax: named arguments (method parameters not resolved)` (neither the path that reads parameter names from scala-library's pickle nor naming in the hand-written prelude signatures is implemented. Methods and classes in the same compilation unit all work). (b) ~~**a constructor with multiple argument lists**, `class C(a: Int)(b: Int)`, does not even support `new C(1)(2)` itself, let alone named arguments~~ → `agent/tail4` implemented both `new C(1)(2)` and `new C(1)(c = 3, b = 2)` (`tests/fixtures/t4_curried_new.scala`). (c) Overloads with identical names and types differing only in order (`h(s: String, n: Int)` and `h(n: Int, s: String)`) are `ambiguous reference to overloaded definition` in nsc, but here the one declared first is silently chosen
+- **Remainder of named arguments**: (a) **the hand-written prelude carries no parameter names**, so `List(1,2,3).mkString(sep = "-")` and `map.updated(key = k, value = v)` give `unimplemented syntax: named arguments (method parameters not resolved)`: `prelude::method` declares parameter *types* and allocates no parameter symbols, and there is no path that reads the names back off scala-library's pickle for a member the prelude already declares. It is down to 3 occurrences in cats (`Chain.scala`, `NonEmptyList.scala`) and none in slick, gitbucket or the library measure. Members the *pickle* completes — from scala-library or from a `-cp` classfile — do carry their names (`classpath::add_method_types`, `pickle_supply`), so `copy(name = …)` on a case class from a jar works. (b) ~~**a constructor with multiple argument lists**, `class C(a: Int)(b: Int)`, does not even support `new C(1)(2)` itself, let alone named arguments~~ → `agent/tail4` implemented both `new C(1)(2)` and `new C(1)(c = 3, b = 2)` (`tests/fixtures/t4_curried_new.scala`). (c) Overloads with identical names and types differing only in order (`h(s: String, n: Int)` and `h(n: Int, s: String)`) are `ambiguous reference to overloaded definition` in nsc, but here the one declared first is silently chosen
 - **`x == null` (reference type) under `--no-scala-library`** (it does not go through `scala.runtime.BoxesRunTime.equals`, so if `x` really is `null` the `invokevirtual` of `Object.equals` throws `NullPointerException`. Under `--scala-library` it works correctly)
 - **The scope of the lazy completer**: definitions seen only by the namer (forward references from another template) are completed with a scope reassembled from the members of the owner chain. `import`s at the top of the file are not in place until the typer processes them, so a forward reference to a definition that uses an imported name on its right-hand side gets no type and stays `<notype>` (the diagnostic is still emitted; it is not silently accepted)
 - **Codegen for reading the outer instance from a trait's member class** (`trait T { def x = 1; class Inner { def y = x } }`).
@@ -966,3 +966,16 @@ of most of these notes.
   `MatchError`, not `scala/MatchError`, although `throw`ing one from a `match`
   fall-through resolves correctly. So it is the *catch* type's resolution, not
   the class: `runtime.rs` does emit `scala/MatchError`.
+
+- **`implicitly[X]`'s result is selected from without a `checkcast`, and the
+  JVM rejects the class** (found by `agent/slickimplicit` while building a
+  fixture; not fixed). `implicitly[Box[String]].show` is enough to reproduce
+  it. A hand-written `def summon[T](implicit e: T): T` emits the cast and
+  works, so this is specific to `Predef.implicitly` — presumably the shortcut
+  that types it does not go through the path that inserts the receiver cast.
+
+  Worth noticing what caught it: the verifier. Not the type checker, not the
+  corpus, not any of the four project measures — a fixture happened to select
+  a member off an `implicitly` result and the class would not load. The slice
+  wrote around it with `summon` rather than leaving a fixture that could not
+  run, and said so.

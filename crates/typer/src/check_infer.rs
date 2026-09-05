@@ -860,6 +860,72 @@ impl Typer {
         !matches!(&self.st.get(id).ty, Type::Method { .. }) || self.is_nullary_method_sym(id)
     }
 
+    /// The one alternative an overloaded reference in *value* position keeps
+    /// when its parameters are all implicit -- nsc's `inferExprAlternative`
+    /// for a shape [`Typer::maybe_auto_apply`] cannot see.
+    ///
+    /// `Type::Method` carries parameter *types* and no flags, so nothing in
+    /// the type says which clause is implicit; only the parameter symbols do,
+    /// which is why this takes the alternatives with their symbols rather than
+    /// living in `maybe_auto_apply` beside the nullary rule.
+    ///
+    /// nsc's `isAsSpecific` looks straight through an implicit clause
+    /// (`case mt: MethodType if mt.isImplicit => isAsSpecific(mt.resultType,
+    /// ftpe2)`), and its mirror case answers `!mt.isImplicit` for a value type
+    /// weighed against a method that takes explicit parameters. So
+    /// `(implicit r: R)P` is as specific as such an alternative while that one
+    /// is not as specific as it, and `isStrictlyMoreSpecific` picks it
+    /// outright. scalatra declares exactly that pair:
+    ///
+    /// ```scala
+    /// def params(implicit request: HttpServletRequest): Params
+    /// def params(key: String)(implicit request: HttpServletRequest): String
+    /// ```
+    ///
+    /// and `params.get("id")` looked `get` up on the unresolved set --
+    /// `value get is not a member of <overload (String)(HttpServletRequest)
+    /// String | (HttpServletRequest)MultiMapHeadView[String, String]>`, the
+    /// largest family left in the gitbucket measurement, repeated for
+    /// `flash`, `session` and `multiParams`.
+    ///
+    /// The clause is *not* stripped: the witness still has to be searched for
+    /// and passed, which [`Typer::adapt_implicit_apply`] does once the
+    /// reference names a single alternative. That is also why a candidate must
+    /// have exactly one clause -- `adapt_implicit_apply` fills the first and
+    /// only the first, and resolving to an alternative whose second clause
+    /// nothing would fill trades one diagnostic for a worse one.
+    ///
+    /// Answers `None` when some alternative takes no parameters at all (that
+    /// one is at least as specific, and `maybe_auto_apply` has already had its
+    /// say), and when two distinct alternatives are implicit-only -- nsc
+    /// reports that as an ambiguous reference, and leaving the set standing
+    /// keeps the diagnostic scala-rs already gives.
+    pub(crate) fn implicit_only_alternative(&self, alts: &[(SymbolId, Type)]) -> Option<SymbolId> {
+        let mut only: Option<SymbolId> = None;
+        for (s, t) in alts {
+            if self.is_parameterless_sym(*s) || !matches!(t, Type::Method { .. }) {
+                return None;
+            }
+            let decl = &self.st.get(*s).paramss;
+            if decl.len() != 1
+                || !decl
+                    .iter()
+                    .flatten()
+                    .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
+            {
+                continue;
+            }
+            match only {
+                // The same declaration reached through two parents is one
+                // alternative, not two.
+                Some(prev) if prev == *s => {}
+                Some(_) => return None,
+                None => only = Some(*s),
+            }
+        }
+        only
+    }
+
     /// The result of an argument that is still a method whose only remaining
     /// clause is implicit (`Array.empty` is `(ClassTag[T])Array[T]` until the
     /// expected type says what `T` is). `None` for anything else, including a
@@ -1552,6 +1618,43 @@ impl Typer {
                     self.collect_expected(tps, x, y, 0, depth + 1, allow_covariant, out);
                 }
             }
+            // A compound (`A with B`) on either side. Nothing matched it, so
+            // `def instance[F[_]](…): Traverse[F] with Reducible[F]` assigned
+            // to a `Traverse[Tuple1] with Reducible[Tuple1]` solved `F` from
+            // nothing at all and the argument function's parameter came out as
+            // `F[Any]` with `F` still its own placeholder -- cats' generated
+            // `NTupleUnorderedFoldableInstances` reported `value _1 is not a
+            // member of _[Any]` 22 times. Parents are paired by the class they
+            // name so that `Traverse[F]` is never read against `Reducible[…]`;
+            // the arms below still decide what each pair says.
+            (Type::Refined { parents: rps, .. }, Type::Refined { parents: pps, .. }) => {
+                for rp in rps {
+                    let head = self.st.class_sym_of(rp);
+                    for pp in pps.iter().filter(|pp| self.st.class_sym_of(pp) == head) {
+                        self.collect_expected(
+                            tps,
+                            rp,
+                            pp,
+                            variance,
+                            depth + 1,
+                            allow_covariant,
+                            out,
+                        );
+                    }
+                }
+            }
+            (Type::Refined { parents: rps, .. }, _) => {
+                let head = self.st.class_sym_of(pt);
+                for rp in rps.iter().filter(|rp| self.st.class_sym_of(rp) == head) {
+                    self.collect_expected(tps, rp, pt, variance, depth + 1, allow_covariant, out);
+                }
+            }
+            (_, Type::Refined { parents: pps, .. }) => {
+                let head = self.st.class_sym_of(ret);
+                for pp in pps.iter().filter(|pp| self.st.class_sym_of(pp) == head) {
+                    self.collect_expected(tps, ret, pp, variance, depth + 1, allow_covariant, out);
+                }
+            }
             (Type::Class { sym: rs, args: ras }, Type::Class { sym: ps, args: pas }) => {
                 if rs == ps {
                     if ras.len() != pas.len() {
@@ -1895,6 +1998,7 @@ impl Typer {
                 }
                 let ok = if upper {
                     self.st.is_sub_type(actual, &bound)
+                        || self.st.hk_ctor_meets_proper_bound(actual, &bound)
                 } else {
                     self.st.is_sub_type(&bound, actual)
                 };

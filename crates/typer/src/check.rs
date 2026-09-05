@@ -265,6 +265,15 @@ pub struct Typer {
     pub(crate) sources: Vec<std::rc::Rc<str>>,
     /// Counter for synthetic names.
     pub(crate) gensym: u32,
+    /// Where the argument in each parameter slot was written, as the last call
+    /// to `named_arg_slots` left it. `place_named_args` reads it immediately
+    /// afterwards and turns it into the entry `SymbolTable::named_arg_order`
+    /// carries for the application.
+    pub(crate) slot_source: Vec<Option<usize>>,
+    /// The order `place_named_args` last produced, waiting for the application
+    /// it belongs to to record it under its own node id. Taken (not read) at
+    /// the call site, so a nested application cannot inherit it.
+    pub(crate) last_named_order: Option<Vec<Option<usize>>>,
     /// Per-binary-name index for *local* classes/objects (`Main$Same$1`,
     /// `Main$Same$2`), keyed by the un-indexed binary name.
     pub(crate) local_class_n: std::collections::HashMap<String, u32>,
@@ -320,6 +329,13 @@ pub struct Typer {
     /// to a `lazy val`, but not to an eager one). Their bodies still wait
     /// their turn, and their signature must not be built a second time.
     pub(crate) lazy_val_presig: std::collections::HashSet<(usize, scala_rs_parser::NodeId)>,
+    /// `def`s that stand as a statement of a *block* rather than as a member
+    /// of a template. The symbol table cannot say which is which: a local def
+    /// in a `val`'s right-hand side is owned by the enclosing *class*, exactly
+    /// like a real member, because there is no accessor symbol to own it. Only
+    /// `@tailrec` eligibility needs the distinction so far -- a local def is
+    /// not a member of anything and so cannot be overridden.
+    pub(crate) block_local_defs: std::collections::HashSet<(usize, scala_rs_parser::NodeId)>,
     /// Parent constructor calls whose omitted (implicit / defaulted) argument
     /// list has already been synthesized. `extends P` is walked by the header
     /// pass, the signature pass and the body pass; filling it more than once
@@ -800,6 +816,8 @@ impl Typer {
             file_index,
             sources: Vec::new(),
             gensym: 0,
+            slot_source: Vec::new(),
+            last_named_order: None,
             local_class_n: std::collections::HashMap::new(),
             pkg_nest: Vec::new(),
             open_pkgs: HashMap::new(),
@@ -811,6 +829,7 @@ impl Typer {
             ctor_pattern_fun: false,
             sig_done: std::collections::HashSet::new(),
             lazy_val_presig: std::collections::HashSet::new(),
+            block_local_defs: std::collections::HashSet::new(),
             parent_fill_done: std::collections::HashSet::new(),
             warmed_scopes: std::collections::HashSet::new(),
             completed_arg_classes: std::collections::HashSet::new(),

@@ -1926,7 +1926,7 @@ impl Typer {
             TreeKind::DefDef { rhs, .. } => rhs.as_ref(),
             _ => return,
         };
-        if !self.tailrec_effectively_final(tree.sym) {
+        if !self.tailrec_effectively_final(tree) {
             self.error(
                 tree.span,
                 "could not optimize @tailrec annotated method: it is neither private nor final so can be overridden",
@@ -1962,8 +1962,18 @@ impl Typer {
         }
     }
 
-    fn tailrec_effectively_final(&self, meth: SymbolId) -> bool {
+    fn tailrec_effectively_final(&self, tree: &Tree) -> bool {
+        let meth = tree.sym;
         if meth.is_none() {
+            return true;
+        }
+        // A `def` that is a statement of a block is not a member of anything,
+        // so nothing can override it. The symbol's owner does not say so: a
+        // local def in a `val`'s right-hand side is owned by the enclosing
+        // class, because no accessor symbol exists to own it. cats writes ten
+        // of these -- `lazy val resolved = { @tailrec def loop… }` inside
+        // `case class Deferred` in `instances/{eq,order,show,…}.scala`.
+        if self.block_local_defs.contains(&(self.file_index, tree.id)) {
             return true;
         }
         let s = self.st.get(meth);
@@ -1982,11 +1992,77 @@ impl Typer {
         // member of anything and cannot be overridden, whatever its owner's
         // own flags say. cats writes `@tailrec def loop` inside `tailRecM`
         // 79 times; nsc accepts every one.
-        matches!(
+        if matches!(
             o.kind,
             SymKind::Module | SymKind::ModuleClass | SymKind::Method | SymKind::Term
         ) || o.flags.contains(Flags::MODULE)
             || o.flags.contains(Flags::FINAL)
+        {
+            return true;
+        }
+        // nsc gives the `$anon` class of a `new C { … }` the FINAL flag, so
+        // `Symbol.isEffectivelyFinal` holds for it and every concrete member
+        // it declares is eligible. cats writes 7 of these -- among them the
+        // instance handed out by `implicit val catsStdInstancesForList:
+        // Traverse[List] = new Traverse[List] { @tailrec override def get… }`.
+        if o.name.starts_with("$anon") {
+            return true;
+        }
+        // nsc's `isEffectivelyFinalOrNotOverridden`: a *concrete* member of an
+        // owner whose subclasses are all known, and none of which overrides
+        // it, cannot be overridden either. That covers `sealed class` and --
+        // because a class declared in a block can only be extended inside that
+        // block -- a method-local class. Both are accepted by scalac 2.13.16
+        // and both were rejected here; `tt_tailrec_bad.scala` pins the five
+        // shapes nsc still rejects, including the sealed class that *is*
+        // overridden and the block-local class that another class in the same
+        // block overrides.
+        let name = s.name.clone();
+        // A class declared inside a method or a value's right-hand side can
+        // only be extended from inside that block, so its subclasses are all
+        // in this run -- the same position a `sealed` class is in. A class
+        // that is a *member* of an object is not: `object O { class K }` can
+        // be extended anywhere, and nsc rejects `@tailrec` on `K`'s members.
+        let owner_is_local = matches!(self.st.get(o.owner).kind, SymKind::Method | SymKind::Term);
+        if o.flags.contains(Flags::SEALED) || owner_is_local {
+            return !self.subclass_overrides(owner, &name);
+        }
+        false
+    }
+
+    /// Does any class in this run extend `owner` (transitively) and declare a
+    /// member called `name`? nsc reads the same answer off the sealed parent's
+    /// `children`; scanning the symbol table also covers the local-class case,
+    /// for which no `children` list is built. Only reached for a `@tailrec`
+    /// method in a sealed or block-local class, which is rare enough that the
+    /// scan does not need an index.
+    fn subclass_overrides(&self, owner: SymbolId, name: &str) -> bool {
+        self.st.symbols.iter().any(|s| {
+            s.id != owner
+                && s.is_class_like()
+                && s.members.iter().any(|&m| self.st.get(m).name == name)
+                && self.inherits_from(s.id, owner)
+        })
+    }
+
+    /// Transitive `extends` reachability, following parent *types*.
+    fn inherits_from(&self, cls: SymbolId, ancestor: SymbolId) -> bool {
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut work = vec![cls];
+        while let Some(id) = work.pop() {
+            if id.is_none() || !seen.insert(id.0) {
+                continue;
+            }
+            if id == ancestor && id != cls {
+                return true;
+            }
+            for p in &self.st.get(id).parents {
+                if let Some(c) = self.st.class_sym_of(p) {
+                    work.push(c);
+                }
+            }
+        }
+        false
     }
 
     pub(crate) fn missing_implicit_message(

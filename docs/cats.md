@@ -872,6 +872,110 @@ library-ABI and private-runtime modes; `tm_newtype_bad.scala` pins that the
 fix does not loosen arity checking (`Widget[Int, String]` is still rejected,
 in nsc and here).
 
+## Tuples, type lambdas, and `@tailrec` eligibility
+
+**133 errors, four roots.** `tests/cats_measure.sh -Ykind-projector` goes from
+**752 errors / 103 files** to **619 / 92**, and no new symptom appears in the
+log. The whole cluster lives in the four generated `NTuple*Instances` files
+plus the ten `instances/{eq,order,show,…}.scala` copies of one `Defer` cache.
+
+| errors | root |
+|---:|---|
+| 53 | `value copy is not a member of …` -- a `TupleN` was not a `case class` |
+| 33 | `value _N is not a member of …` |
+| 20 | `inferred type arguments … do not conform to … bounds [F <: Product]` |
+| 17 | `could not optimize @tailrec annotated method` |
+
+`tests/fixtures/tt_tuple.scala` and `tt_tailrec.scala` run all four, with
+`tt_tuple_bad.scala` and `tt_tailrec_bad.scala` pinning the nine shapes nsc
+still rejects; `crates/cli/tests/tupletailrec.rs` dual-runs each against
+scalac 2.13.16, comparing the output for the positive fixtures and the
+rejected *line numbers* for the negative ones.
+
+### `TupleN` is a `case class`
+
+`prelude_tuple.rs` built the tuple classes with their fields and their
+`<init>`, but not the `CASE` flag, and `CASE` is what `try_rewrite_case_copy`
+keys on. So `fab.copy(_1 = f(fab._1), _2 = g(fab._2))` -- `NTupleBifunctor`
+and `NTupleMonadInstances` write 22 of these -- reported `value copy is not a
+member of (Any, Any)`. Setting the flag reuses the rewrite that was already
+there, including its re-inference of the class's type parameters, which is what
+nsc's synthesized `copy[T1, T2]` does: `(1, "a").copy(_1 = "x")` really is a
+`(String, String)`. Nothing else the flag reaches applies to a class the
+prelude builds -- the `apply` / `unapply` / `Product` synthesis all runs off a
+source `ClassDef` tree, and pattern matching already took the constructor arm
+for anything with `ctor_fields`.
+
+### A fully applied type lambda is its body
+
+kind-projector's `(A0, *, *)` desugars to the structural type lambda
+`({ type L[x, y] = (A0, x, y) })#L`, and `F[Any, Any]` at that argument is a
+`Type::Applied` whose constructor is the lambda. `dealias` deliberately leaves
+a higher-kinded alias folded -- its body means nothing until the arguments
+arrive -- but here they *have* arrived, and nothing reduced it: `fa._2`
+reported `value _2 is not a member of [A0, x, y](A0, x, y)[A0, Any, Any]`.
+
+Two places now reduce a *fully* applied one (`expand_applied_hk_alias`, which
+already existed for conformance): the receiver in `type_select`, so the member
+is looked up in the body and substituted at the body's arguments; and
+`class_sym_of`, so `.copy` finds the `Tuple3` to rebuild instead of chasing the
+alias's upper bound. The diagnostic prints the reduced type as nsc's does.
+
+### A higher-kinded parameter's bound is eta-expanded too
+
+`private def instance[F[_, _] <: Product]` at `(A0, *, *)` was rejected:
+`inferred type arguments [[x, y](A0, x, y)] do not conform to method
+instance's type parameter bounds [F <: Product]`. nsc keeps a higher-kinded
+parameter's bounds *inside* its `PolyType`, so `F[_, _] <: Product` reads
+`[x, y]F[x, y] <: [x, y]Product` and `isPolySubType` decides it on the bodies.
+Here the bound is stored as the written `Product`, so the eta-expansion has to
+happen at the comparison: `hk_ctor_meets_proper_bound` applies the constructor
+to its own parameters and asks about the result. It runs only after the plain
+comparison has already said no, so it can widen what is accepted and never
+narrow it.
+
+### A method type parameter solved from a compound expected type
+
+`collect_expected` -- the walk that reads a method's type parameters out of the
+expected type -- had no arm for `Type::Refined`. cats'
+`instance[F[_]](…): Traverse[F] with Reducible[F]`, assigned to a
+`Traverse[Tuple1] with Reducible[Tuple1]`, therefore solved `F` from nothing at
+all, the argument function's parameter came out as `F[Any]` with `F` still its
+own placeholder, and `NTupleUnorderedFoldableInstances` reported `value _1 is
+not a member of _[Any]` 22 times. Parents are now paired by the class they
+name, so `Traverse[F]` is never read against `Reducible[…]`.
+
+### `@tailrec` is `isEffectivelyFinalOrNotOverridden`, not "private or final"
+
+nsc's `TailCalls` accepts a method that cannot be overridden, which is wider
+than `final` / `private` / a member of an `object`. Confirmed against scalac
+2.13.16, four more shapes are eligible:
+
+* a member of the `$anon` class of a `new C { … }` -- nsc gives that class the
+  FINAL flag. cats has 7;
+* a member of a `sealed` class that no subclass overrides (nsc reads its
+  `children`; here the symbol table is scanned, which costs nothing because
+  the branch is only reached for a `@tailrec` method in a sealed or local
+  class);
+* a member of a class declared inside a block, which can only be extended from
+  inside that block;
+* a `def` in a `val`'s right-hand side. This one needed a new signal rather
+  than a new rule: such a def is *owned by the enclosing class*, because there
+  is no accessor symbol to own it, so nothing about the symbol distinguishes it
+  from a real member. `Typer::block_local_defs` records the `DefDef`s that
+  stand as statements of a block, before any of them is typed. cats has 10,
+  one per `instances/{eq,equiv,function,hash,order,ordering,partialOrder,
+  partialOrdering,show}.scala`.
+
+**Widening this cannot change what a program does at run time.** scala-rs
+implements no tail-call elimination at all -- `@tailrec` appears nowhere in
+`crates/backend/` -- so a `@tailrec` method compiles to the same recursive
+calls whether the annotation is accepted or rejected, and a deep enough
+recursion overflows the stack either way. (Measured: a `final` method with two
+million self-calls throws `StackOverflowError` from a scala-rs build both
+before and after this change.) The check is a diagnostic, and the only thing at
+stake is whether it matches nsc's.
+
 ## Monad transformers: an `if`/`match`-bodied lambda that decided nothing (`agent/monadtrans`)
 
 **88 errors, from 752 to 664.** `tests/cats_measure.sh` goes from **752

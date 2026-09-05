@@ -708,3 +708,67 @@ is not one for `a && b`. `Check::callee_arity` carries the enclosing `Apply`'s
 argument count into the selection so `drop_inapplicable_conversions` can
 narrow the tie; it only ever narrows, and a member whose shape cannot be read
 stays a candidate.
+
+---
+
+### A candidate's own clause is where its leftover parameters come from, and a cake's type member has parameters too (`agent/slickimplicit`)
+
+Two roots under gitbucket's remaining slick implicit clusters,
+`errors=1399 → 1276` on `tests/gitbucket_measure.sh` (−19 and −104,
+additive). Full write-up in `docs/gitbucket.md`, roots 26 and 27; the parts
+worth having here:
+
+**1. "The wanted type does not pin this parameter down" is not the same as
+"nothing can".** `implicit_fit_open` exists precisely to settle a candidate's
+type parameters from the candidate's *own* implicit clause, and it was gated
+on the **call site** having left something undetermined. slick's
+
+```scala
+implicit def tuple2Shape[Level <: ShapeLevel, M1, M2, U1, U2, P1, P2](implicit
+  u1: Shape[_ <: Level, M1, U1, P1], u2: Shape[_ <: Level, M2, U2, P2]
+): Shape[Level, (M1, M2), (U1, U2), (P1, P2)]
+```
+
+answered against `Shape[_ <: FlatShapeLevel, T, U, _]` has `P1`/`P2` opposite
+a bare `_` — nothing at the call site is undetermined, and nothing on the
+wanted side can say what they are, but `u1` and `u2` can. Dropping the gate is
+one line and worth 19 in gitbucket; every other guard the fallback has (open
+after the clauses, no witness, bounds, conformance) is what keeps it honest,
+and `neg` did not move.
+
+The limit that remains is worth remembering: **`Unify` keys its unknowns by
+symbol id**, so a rule that derives *itself* has the candidate's own `P1` and
+the caller's open `P1` as the same symbol, and the occurs check rejects
+`P1 := (P1, P2)`. nsc gives every application fresh type variables. Nested
+tuple shapes are still not found for that reason.
+
+**2. An abstract type member can take type parameters, and slick's cake is
+written entirely of them.** `type BaseColumnType[T] <: ColumnType[T] with
+BaseTypedType[T]` is pickled as a `PolyType` over the bounds;
+`abstract_type_member` read the bounds and dropped the parameters, so every
+use said "does not take type parameters" and the bound that survived mentioned
+a free `T`. Two adjacent gates hid how much that cost:
+`conv_ref` only offered a bare `Ref` to `self_type_member` when it had **no
+arguments**, and `self_type_member` itself ran only for `scala.*` classes.
+Together they made `BaseColumnType[Boolean]` — the declared type of all
+twenty-four of slick's column types — an unmappable result type.
+
+The tell was in the trace and not in the diagnostic: `has_pickle
+BaseColumnType: NotFound("BaseColumnType")` for a name that is not a class and
+never will be. **When a pickle's `Ref` has a bare name, it is a type member of
+the cake being completed**, and that is true whether or not it carries
+arguments.
+
+What is still missing is the *prefix*: `RelationalTypesComponent
+.BaseColumnType[T]` means the abstract declaration when read on its own and
+`JdbcProfile`'s concrete alias when seen from a real profile, and this reader
+has no as-seen-from for a type member through a path. So a value can be
+*declared* at the member (its bound makes it a `TypedType[T]`) but nothing can
+be shown to conform *to* it, which is one error left in gitbucket at
+`MappedColumnType.base[java.util.Date, java.sql.Timestamp]`.
+
+**Unrelated, found on the way and not fixed here:** selecting a member off
+`Predef.implicitly[X]`, or assigning it to a field, emits bytecode with no
+`checkcast`, and the JVM verifier rejects it (`implicitly[Box[String]].show`
+is enough). Our own `def summon[T](implicit e: T): T` gets the cast; the
+library's does not.

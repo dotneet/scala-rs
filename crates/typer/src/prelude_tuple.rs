@@ -15,6 +15,7 @@ pub(crate) fn add_tuples(st: &mut SymbolTable, library_abi: bool) {
         .into_iter()
         .find(|id| st.get(*id).kind == SymKind::Class)
     {
+        mark_case(st, t2);
         add_companion(st, t2, 2);
     }
     // The private runtime ships only `scala/Tuple2`; emitting symbols for the
@@ -56,6 +57,7 @@ pub(crate) fn add_tuples(st: &mut SymbolTable, library_abi: bool) {
             })
             .collect();
         st.get_mut(cls).ctor_fields = fields;
+        mark_case(st, cls);
         // `class` allocates into the package; the prelude's scope import has
         // already run, so the class needs entering by hand for patterns
         // (`case (a, b, c) =>`) to find it.
@@ -74,6 +76,19 @@ pub(crate) fn add_tuples(st: &mut SymbolTable, library_abi: bool) {
         );
         add_companion(st, cls, n);
     }
+}
+
+/// Every `TupleN` is a `case class` in scala-library
+/// (`final case class Tuple2[+T1, +T2](_1: T1, _2: T2)`), and the flag is what
+/// `try_rewrite_case_copy` keys on. Without it `(a, b).copy(_1 = x)` -- which
+/// cats' generated `NTuple*Instances` write 22 times -- reported `value copy
+/// is not a member of (Any, Any)`. Nothing else the flag reaches applies to a
+/// class the prelude builds: the `apply`/`unapply`/`Product` synthesis all
+/// runs off a source `ClassDef` tree, and the pattern-matching path already
+/// took the constructor arm for anything with `ctor_fields`.
+fn mark_case(st: &mut SymbolTable, cls: SymbolId) {
+    let flags = st.get(cls).flags.with(Flags::CASE);
+    st.get_mut(cls).flags = flags;
 }
 
 /// `object TupleN { def apply[T1, …](x1: T1, …): TupleN[T1, …] }`.
