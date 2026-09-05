@@ -955,6 +955,17 @@ impl<'a> Pickler<'a> {
         if simple == "Override" || path == "java.lang.Override" {
             return;
         }
+        // `@specialized` / `@unspecialized` are accepted and recorded on the
+        // symbol, but the `specialize` phase is not implemented: no `$mc*$sp`
+        // member is emitted. Pickling the annotation would tell scalac that
+        // this class *is* specialized and let it link to members that are not
+        // there, so the pickle stays silent until stage 2 puts them there.
+        // See docs/specialization.md and tests/spec_classfiles.sh.
+        if simple == scala_rs_parser::specialization::SPECIALIZED
+            || simple == scala_rs_parser::specialization::UNSPECIALIZED
+        {
+            return;
+        }
         let atp = if simple == "tailrec" {
             let sc = self.scala_module();
             let ann = self.ext_mod("annotation", Some(sc));

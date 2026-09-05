@@ -1220,9 +1220,9 @@ impl Typer {
         let mut ids = Vec::new();
         for tp in tparams.iter_mut() {
             let name = tp.name().unwrap_or("_").to_string();
-            let flags = match &tp.kind {
-                TreeKind::TypeDef { mods, .. } => mods.flags,
-                _ => Flags::EMPTY,
+            let (flags, annots) = match &tp.kind {
+                TreeKind::TypeDef { mods, .. } => (mods.flags, mods.annotations.clone()),
+                _ => (Flags::EMPTY, Vec::new()),
             };
             let id = if tp.sym.is_none() {
                 let id = self.st.alloc(&name, owner, SymKind::TypeParam, flags, "");
@@ -1233,6 +1233,10 @@ impl Typer {
             };
             self.st.get_mut(id).flags = self.st.get(id).flags.with(flags);
             self.st.get_mut(id).ty = Type::TypeParam(id);
+            // `class C[@specialized(Int, Long) T]`: record what the annotation
+            // selects. Nothing reads it yet -- specialization is a phase after
+            // the typer, and this subset does not run it.
+            self.st.record_specialization(id, &annots);
             if name != "_" {
                 self.st.enter_in_current(&name, id);
             }
@@ -1946,6 +1950,10 @@ impl Typer {
                 self.st.get_mut(id).private_within = mods.private_within.clone();
                 self.st.get_mut(id).annotations = annots;
                 self.st.get_mut(id).abstract_override = abs_over;
+                // `@unspecialized def f` opts one member out of its owner's
+                // specialization. Recorded, not yet acted on.
+                let annots = self.st.get(id).annotations.clone();
+                self.st.record_specialization(id, &annots);
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }
@@ -6720,7 +6728,10 @@ impl Typer {
         // nsc expands a macro application in the typer, at the outermost
         // `Apply`/`TypeApply`, and typechecks what comes back at the call
         // site. Before `adapt`, so what is adapted to `pt` is the expansion.
-        if !callee && self.has_macro_defs {
+        // `has_macro_defs` is set by a macro def this run *compiles*;
+        // `supplied_macro_def` by one read from a jar's pickle, which is how
+        // slick's `TableQuery.apply[E]` reaches a program that only calls it.
+        if !callee && (self.has_macro_defs || self.pickle.supplied_macro_def) {
             self.expand_macro_application(tree);
         }
         self.adapt_implicit_apply(tree, pt);
@@ -7416,12 +7427,39 @@ impl Typer {
                         // "ambiguous overload for apply".
                         self.adopt_cp_module_class(cls);
                         self.supply_from_pickle_class(cls, "apply");
-                        let candidates: Vec<SymbolId> = self
+                        let mut candidates: Vec<SymbolId> = self
                             .st
                             .lookup_member(cls, "apply")
                             .into_iter()
                             .filter(|id| self.st.get(*id).tparams.len() == targs.len())
                             .collect();
+                        // Several `apply`s of the same type-parameter count.
+                        // Explicit type arguments cannot separate them, so
+                        // the position does: SLS 6.26.3 keeps only the
+                        // alternatives that *take no parameters* when an
+                        // overloaded reference is read in value position, and
+                        // only the ones that take some when it is the callee
+                        // of an `Apply`. slick's `object TableQuery` is the
+                        // case -- `def apply[E](cons: Tag => E)` next to the
+                        // macro `def apply[E]: TableQuery[E]` -- so
+                        // `TableQuery[Issues]` means the second and
+                        // `TableQuery[Issues](tag => new Issues(tag))` the
+                        // first. Applied only as a tie-break: if it does not
+                        // leave exactly one, the redirect gives up as before.
+                        if candidates.len() > 1 {
+                            for &c in &candidates {
+                                self.complete_lazy_sig(c, tree.span);
+                            }
+                            let want_params = matches!(pt, Type::Method { .. });
+                            let narrowed: Vec<SymbolId> = candidates
+                                .iter()
+                                .copied()
+                                .filter(|&c| self.st.takes_value_params(c) == want_params)
+                                .collect();
+                            if narrowed.len() == 1 {
+                                candidates = narrowed;
+                            }
+                        }
                         if let [only] = candidates[..] {
                             sym = only;
                             // The redirect reaches a symbol nothing has
@@ -16510,6 +16548,133 @@ impl Typer {
         Some(rhs)
     }
 
+    /// Whether a type has an *erasure* nsc's `ClassTag` materialiser can turn
+    /// into a `classOf`.
+    ///
+    /// `Implicits.manifestOfType` with `full = false` builds the tag out of
+    /// that erasure: a class becomes `classOf[C]` however many type arguments
+    /// it carries. A type whose erasure is not a class has no tag of its own,
+    /// and unless the scope supplies one the implicit search fails — that is
+    /// the whole of `No ClassTag available for T`.
+    ///
+    /// Probed against scalac 2.13.16. Rejected: a method's own type parameter
+    /// (`def f[T] = classTag[T]`), one with an upper bound (`T <: String`), a
+    /// class's type parameter, an abstract `type T` member, `Array[T]`,
+    /// `({ type L = T })#L`, and `CC[A]` for a higher-kinded parameter `CC`.
+    /// Accepted: `Int`, `String`, `Any`, `Null`, `Nothing`, `Unit`,
+    /// `Array[Int]`, `List[T]`, `Map[T, T]`, `List[_]`, `T with AnyRef` and a
+    /// singleton `P.type`.
+    fn classtag_erasable(&self, t: &Type) -> bool {
+        match t {
+            // No erasure of its own: the tag has to come from the scope.
+            // Only a parameter the source can still *name* is abstract here.
+            // nsc instantiates a call's undetermined parameters before it
+            // asks for the tag — `bar(Array(): _*)` is `Array[Nothing]()`,
+            // and `ClassTag.Nothing` answers that — while our inference
+            // leaves the callee's own `Type::TypeParam` in place. Refusing
+            // those cost `pos/t3859`, `pos/t5692c` and `pos/t5859`.
+            Type::TypeParam(s) => !self.tparam_in_scope(*s),
+            Type::TypeMember(_) => false,
+            Type::Class { sym, .. } => match self.st.get(*sym).kind {
+                SymKind::TypeParam => !self.tparam_in_scope(*sym),
+                SymKind::TypeMember => false,
+                _ => true,
+            },
+            Type::Array(e)
+            | Type::ByName(e)
+            | Type::Repeated(e)
+            | Type::Annotated { tpe: e, .. } => self.classtag_erasable(e),
+            Type::Applied { ctor, .. } => self.classtag_erasable(ctor),
+            // nsc erases an intersection to `intersectionDominator`, which
+            // prefers a parent that is a class over one that is not — so
+            // `T with AnyRef` is tagged as `Object` and only an intersection
+            // of nothing but abstract types has no tag. (scalac accepts
+            // `classTag[T with AnyRef]`; the first attempt here refused it.)
+            Type::Refined { parents, .. } => {
+                parents.is_empty() || parents.iter().any(|p| self.classtag_erasable(p))
+            }
+            // Everything else — a value type, a function, a tuple, a
+            // singleton, and also an unresolved `Named` or an `Error` — keeps
+            // the old behaviour. Refusing on an error type would only add a
+            // second diagnostic to a program that already has one.
+            _ => true,
+        }
+    }
+
+    /// nsc's `findSubManifest`: the tag for an array's element type, taken
+    /// from the implicit scope first and built only if the scope has none.
+    /// It is a whole implicit search in nsc, which is why a context bound
+    /// two array levels down still answers.
+    fn classtag_sub(&self, ct_cls: SymbolId, t: &Type, span: Span) -> Option<Tree> {
+        let want = Type::Class {
+            sym: ct_cls,
+            args: vec![t.clone()],
+        };
+        if let ImplicitSearch::Found(id) = self.search_implicit(&want) {
+            let r = self.ref_implicit(id, span);
+            // A witness that still wants arguments of its own is left to the
+            // caller's `implicit_tree`; only a plain value is spliced here.
+            if !matches!(r.ty, Type::Method { .. }) {
+                return Some(r);
+            }
+        }
+        self.classtag_tree(ct_cls, t, span)
+    }
+
+    /// `<tag>.wrap`, which is `ClassTag(ScalaRunTime.arrayClass(<tag>
+    /// .runtimeClass))` — the same tag nsc's `arrayType` factory builds.
+    fn classtag_wrap(
+        &self,
+        ct_cls: SymbolId,
+        inner: Tree,
+        elem: &Type,
+        span: Span,
+    ) -> Option<Tree> {
+        let wrap = self
+            .st
+            .lookup_member(ct_cls, "wrap")
+            .into_iter()
+            .find(|&id| self.st.get(id).kind == SymKind::Method)?;
+        Some(Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(inner),
+                name: "wrap".into(),
+            },
+            ty: Type::Class {
+                sym: ct_cls,
+                args: vec![Type::Array(Box::new(elem.clone()))],
+            },
+            sym: wrap,
+            postfix: false,
+            scala_ref: false,
+            stable_pat: false,
+        })
+    }
+
+    /// The tree nsc's materialiser builds for `ClassTag[t]`, or `None` when
+    /// it can build none — in which case the search has failed and the caller
+    /// reports `No ClassTag available for t`.
+    fn classtag_tree(&self, ct_cls: SymbolId, t: &Type, span: Span) -> Option<Tree> {
+        // `Array[E]` where `E` has no erasure of its own: nsc emits
+        // `arrayType(findSubManifest(E))`, not a `classOf` of the array. The
+        // difference is visible — `def f[T: ClassTag] = classTag[Array[T]]`
+        // must report `[[I` at `T = Int`, and a `classOf` of the array type
+        // reported `int`. `src/library/scala/Array.scala`'s `ofDim` is eleven
+        // of these.
+        if let Type::Array(e) = t {
+            if !self.classtag_erasable(e) {
+                let inner = self.classtag_sub(ct_cls, e, span)?;
+                return self.classtag_wrap(ct_cls, inner, e, span);
+            }
+        }
+        if !self.classtag_erasable(t) {
+            return None;
+        }
+        self.classtag_apply_tree(ct_cls, t, span)
+    }
+
     /// nsc fills `ClassTag[String]` via `ClassTag.apply(classOf[String])` when
     /// there is no primitive getter (`ClassTag.Int`, …).
     fn classtag_apply_fallback(&self, pt: &Type, span: Span) -> Option<Tree> {
@@ -16519,8 +16684,12 @@ impl Typer {
         if self.st.get(*sym).name != "ClassTag" || args.is_empty() {
             return None;
         }
-        let elem = args[0].clone();
-        let module = self.st.companion_module(*sym)?;
+        self.classtag_tree(*sym, &args[0], span)
+    }
+
+    fn classtag_apply_tree(&self, ct_cls: SymbolId, t: &Type, span: Span) -> Option<Tree> {
+        let elem = t.clone();
+        let module = self.st.companion_module(ct_cls)?;
         let mcls = self.st.module_class_of(module);
         let apply = self
             .st
@@ -16571,7 +16740,10 @@ impl Typer {
                 fun: Box::new(fun),
                 args: vec![class_arg],
             },
-            ty: pt.clone(),
+            ty: Type::Class {
+                sym: ct_cls,
+                args: vec![t.clone()],
+            },
             sym: apply,
             postfix: false,
             scala_ref: false,
@@ -24298,8 +24470,16 @@ impl Typer {
                 self.type_expr_inner(tree, &Type::NoType);
             }
             ImplicitSearch::None => {
-                let diverged = self.diverged_implicit.borrow().clone();
-                self.error(span, self.missing_implicit_message(&ct_ty, diverged));
+                // `new Array[T](0)` is not an implicit search in nsc — it is
+                // `typedNew`'s own check, with its own wording
+                // (`neg/t9401`, `neg/t2775`).
+                self.error(
+                    span,
+                    format!(
+                        "cannot find class tag for element type {}",
+                        self.st.display_type(&elem)
+                    ),
+                );
                 tree.ty = Type::Error;
             }
             ImplicitSearch::Ambiguous(ids) => {
@@ -24771,6 +24951,18 @@ impl Typer {
                 self.st.display_type(&pt),
                 self.st.get(sym).name
             );
+        }
+        // nsc does not report a tag the way it reports any other implicit:
+        // `Implicits.implicitTagOrOfExpectedType` fails with its own message
+        // once the materialiser cannot build one (`neg/classtags_contextbound_a`,
+        // `neg/interop_typetags_arenot_classtags`).
+        if let Type::Class { sym, args } = ty {
+            if self.st.get(*sym).name == "ClassTag" && args.len() == 1 {
+                return format!(
+                    "No ClassTag available for {}",
+                    self.st.display_type(&args[0])
+                );
+            }
         }
         if let Some(msg) = self.implicit_not_found_msg(ty) {
             return msg;

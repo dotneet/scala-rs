@@ -2,26 +2,40 @@
 
 ## Why `pos` does not pass `-no-specialization`
 
-70 of `pos`'s 534 failures are `unimplemented syntax: annotation specialized`,
-and `-no-specialization` would turn all of them green. The corpus does not pass
-it, on purpose.
+*Superseded in part: `@specialized` is now accepted and recorded rather than
+rejected (stage 1 of [`docs/specialization.md`](specialization.md)), so the
+parse error this section is about no longer happens. The reasoning is kept
+because it is why the corpus still does not pass the flag, and because the
+numbers below are what the "before" side of that change was measured against.*
+
+70 of `pos`'s 534 failures were `unimplemented syntax: annotation specialized`,
+and `-no-specialization` would have turned all of them green. The corpus does
+not pass it, on purpose.
 
 `-no-specialization` is nsc's own flag, and it means *ignore the annotation* —
 not *implement specialization*. nsc implements it: `@specialized` there means
 `Foo$mcI$sp` classes get emitted and the ABI changes. Passing the flag here
 would count "we ignored what the test was testing" as a pass.
 
-`tests/cats_measure.sh` and `tests/scalalib_measure.sh` do pass it, and that is
+`tests/cats_measure.sh` and `tests/scalalib_measure.sh` do pass it, and that was
 also on purpose: those two ask "where is type checking", a single parse error
-aborts the whole run, and both codebases annotate everywhere. Without the flag
-cats reports 71 errors and the library reports 84 — numbers that mean "nothing
-was typechecked", not "almost nothing is wrong". The flag buys a meaningful
+aborted the whole run, and both codebases annotate everywhere. Without the flag
+cats reported 71 errors and the library 84 — numbers that mean "nothing was
+typechecked", not "almost nothing is wrong". The flag bought a meaningful
 type-checking number at the cost of an ABI that differs from nsc's, which is
 the right trade for a progress measure and the wrong one for a conformance
 score.
 
-So: 70 `pos` tests stay red until specialization is actually implemented. That
-is the honest reading.
+**That cost is no longer being paid for anything.** With the annotation
+accepted, both codebases report the same number with the flag and without it
+(cats 907, `src/library` 1644), because the flag's only remaining effect is to
+drop an annotation nothing acts on. See the stage-1 section of
+`docs/specialization.md`; the two scripts still pass it, but no longer need to.
+
+What stays true is the part about the corpus: accepting the annotation is not
+implementing the phase. `tests/spec_classfiles.sh` is the ledger that says how
+far short we are — scalac emits 700 `$sp` classes over `pos/spec-*` where we
+emit none.
 
 Where this compiler stands on the tests scalac is developed against:
 `test/files/{pos,neg,run}` from [scala/scala](https://github.com/scala/scala).
@@ -884,6 +898,100 @@ were done.
 The lesson for verification is narrower and sharper: **a change that supplies
 new symbols has to run `neg` in full, not a sample.** A 250-test sample did not
 contain any of these four.
+
+Done the same day — see
+[the next section](#the-classtag-rule-added-2026-09-05-agentclasstag). It moved
+eight, not four.
+
+## The `ClassTag` rule, added (2026-09-05, `agent/classtag`)
+
+The rule the section above asked for. Measured on the merged tree against
+`main` at `81b756a` (which already carries stage 1 of `@specialized`, so both
+columns have it): `neg` 647 → **655**; `pos` 1042 and `run` 508 are unchanged,
+the same sets of tests. The eight are `classtags_contextbound_{a,b,c}`,
+`classtags_dont_use_typetags` and the four
+`interop_{abs,}typetags_arenot_class{tags,manifests}`. The same eight, and the
+same "nothing else moved", came out of the earlier A/B against `dc6fdc9`
+(`neg` 653 → 661, `pos` 983, `run` 490).
+
+A `ClassTag` is *built*, out of the **erasure** of the type it tags
+(`Implicits.manifestOfType`, `full = false`), so the rule is about erasure and
+not about the implicit scope. Every case below was probed against
+`/tmp/scala-2.13.16/bin/scalac`, not read off nsc's source:
+
+* a **class**, however applied, has a tag — `List[T]`, `Map[T, T]`, `List[_]`
+  and `Array[Int]` all compile with `T` abstract, because the arguments are
+  erased away rather than looked for;
+* an **abstract type** has none: a method's own parameter, one with an upper
+  bound (`T <: String`), a class's parameter, an abstract `type` member, and
+  `({ type L = T })#L`. So does a higher-kinded parameter applied — `CC[A]` in
+  `ClassTagIterableFactory.fill` is `No ClassTag available for CC[A]` in
+  scalac too;
+* an **intersection** erases to `intersectionDominator`, which prefers a
+  parent that is a class, so `T with AnyRef` *is* tagged (as `Object`). The
+  first cut of this rule refused it, and only the probe said so;
+* a **singleton** widens to its class.
+
+Two things that a reading of the rule gets wrong, and a measurement caught:
+
+**`Array[E]` does not recurse structurally.** nsc's `findSubManifest` is a
+whole implicit search, which itself ends in the materialiser, so
+`ClassTag[Array[Array[T]]]` is available exactly when `ClassTag[T]` is. A
+structural rule cost `src/library/scala/Array.scala` eleven diagnostics —
+every `ofDim` and `fill` above one dimension. And the tag it builds is the
+element's **wrapped** (`ClassTag#wrap`, which is
+`ClassTag(ScalaRunTime.arrayClass(…))`), not a `classOf` of the array type: we
+had been answering `def f[T: ClassTag] = implicitly[ClassTag[Array[T]]]` with
+`int` where scalac says `[I`. `ClassTag#wrap` was not in the prelude
+(`crates/typer/src/prelude_classtag.rs` now declares it).
+
+**An undetermined type parameter is not an abstract type.** nsc instantiates a
+call's undetermined parameters before it asks for a tag, so `bar(Array(): _*)`
+is `Array[Nothing]` and `ClassTag.Nothing` answers it. Our inference leaves
+the callee's own `Type::TypeParam` in place instead, and refusing those cost
+`pos/t3859`, `pos/t5692c` and `pos/t5859`. `tparam_in_scope` — which already
+existed for the same distinction in argument inference — is the test: the
+enclosing definition's parameters are in the scope, a callee's are not.
+
+The measurements a rejection rule is judged on, `main` at `81b756a` against
+the merged branch:
+
+| | before | after |
+|---|---|---|
+| slick | `errors=0 files_with_errors=0 classes=1596` | identical |
+| `tests/slick_run.sh` | `progs=12 ok=12 attempts=36/36` | identical |
+| cats | `errors=907 files_with_errors=108` | identical |
+| gitbucket | `errors=1193 files_with_errors=184` | identical |
+| `src/library` | `errors=1644 files_with_errors=171` | **1653** / 171 |
+
+The nine are all *second* diagnostics on lines that already carried one — no
+file and no line newly fails — and each is a pre-existing bug this rule
+stopped papering over:
+
+* six in `immutable/HashSet.scala`. `new BitmapIndexedSetNode[A](…,
+  Array(getPayload(1)), …)` takes an `Array[Any]`, and **a constructor
+  argument does not receive the parameter's type as its expected type** the
+  way a method argument does. `take(Array(a))` types `Array.apply[Any]`;
+  `new Box(Array(a))` types `Array.apply[A]` and already reported
+  `found: Array[A] required: Array[Any]`. Now it reports the missing tag
+  as well;
+* three in `collection/Factory.scala`. `ClassTagIterableFactory` supplies the
+  `ClassTag[CC[X]]` that nsc cannot build, as
+  `private[this] implicit def ccClassTag[X]` — and our variance check rejects
+  that declaration (`private[this]` is exempt from variance in nsc), so the
+  implicit is not there to be found.
+
+### One more thing this exposed and did not fix
+
+**An explicit type argument on a parameterless method is dropped when an
+implicit in scope can unify with the undetermined parameter.** Inside
+`def z[T: ClassTag]`, `classTag[String].runtimeClass` returns the *evidence*
+— `int` at `z[Int]` — and so does `myTag[String]` for a user-written
+`def myTag[U](implicit ct: ClassTag[U]): ClassTag[U]`. scalac says
+`java.lang.String` for both. It is not caused by the rule above (a binary
+built before it does the same), and it is a wrong *answer* rather than a
+missing diagnostic, which puts it in [pile one](#pile-one-we-are-wrong-237).
+`implicitly[ClassTag[X]]` is unaffected, which is why the fixture uses it.
 
 ## What would move the number most
 

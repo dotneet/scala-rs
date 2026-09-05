@@ -3810,12 +3810,20 @@ fn scalalib_syntax_fixture() {
     dual_run_fixture("scalalib_syntax");
 }
 
-/// `@specialized` stays a diagnostic without `-no-specialization` -- including
-/// when an import renamed it, which used to slip past the check.
+/// `@specialized` used to be a diagnostic without `-no-specialization`. It is
+/// now accepted and recorded on the type parameter's symbol (stage 1 of
+/// docs/specialization.md), so the same fixture compiles and runs with or
+/// without the flag -- including the `@sp` spelling an import rename produces,
+/// which this fixture also writes. What is still missing is the phase: no
+/// `Cell$mcI$sp` is emitted, and `tests/spec_classfiles.sh` measures that gap
+/// against real scalac.
+///
+/// (`scalalib_spec_bad.scala` existed only to assert the diagnostic for the
+/// renamed spelling. There is no diagnostic to assert any more, and the alias
+/// is covered here and by `sp_alias`, so the fixture is gone.)
 #[test]
-fn scalalib_specialized_is_error_without_the_flag() {
-    compile_fails("scalalib_spec", "annotation specialized");
-    compile_fails("scalalib_spec_bad", "annotation sp");
+fn scalalib_specialized_is_accepted_without_the_flag() {
+    dual_run_fixture("scalalib_spec");
 }
 
 /// With nsc's `-no-specialization` the annotations are ignored, as nsc ignores
@@ -4108,4 +4116,85 @@ fn nel_newtype_fixture() {
 #[test]
 fn nel_newtype_bad_is_rejected() {
     compile_fails("nel_newtype_bad", "too many type arguments");
+}
+
+// -------------------------------------------- ClassTag for an abstract type
+
+/// A `ClassTag` is built out of the *erasure* of the type it tags, so a type
+/// whose erasure is not a class has none unless the scope supplies one. The
+/// accepting half: a class however applied, a context bound (including
+/// through any depth of `Array`, where nsc wraps the element's tag rather
+/// than taking a `classOf` of the array), an intersection with a class
+/// parent, and a singleton. Output compared against scalac 2.13.16.
+#[test]
+fn ct_classtag_fixture() {
+    dual_run_fixture("ct_classtag");
+}
+
+/// The refusing half: `classTag[T]` and `implicitly[ClassTag[T]]` for a bare
+/// type parameter, one with an upper bound, a class's own parameter, an
+/// abstract `type` member, and `Array[T]`. All seven diagnostics match
+/// scalac's, at scalac's lines. See docs/scala-corpus.md.
+#[test]
+fn ct_classtag_bad_is_rejected() {
+    compile_fails_lib("ct_classtag_bad", "No ClassTag available for T");
+    compile_fails_lib(
+        "ct_classtag_bad",
+        "cannot find class tag for element type T",
+    );
+}
+
+// ----------------------------------- a view for an argument, with open tparams
+
+/// An implicit view that makes an argument applicable must be offered even
+/// when the callee has type parameters the argument's parameter type does not
+/// mention. `search_conversion_open` demanded a solution for every one of
+/// them, so slick's `def ===[P2, R](e: Rep[P2])(implicit om:
+/// OptionMapper2[..., P2, R]): Rep[R]` -- where `R` lives only in the implicit
+/// clause and the result -- could not reach the `Long => Rep[Long]` view at
+/// all, and `column === 1L` was `no matching overload`. See docs/gitbucket.md
+/// root 19.
+#[test]
+fn tq_openview_fixture() {
+    check("tq_openview");
+    dual_run_fixture("tq_openview");
+}
+
+/// Relaxing which type parameters a view has to settle must not make an
+/// inapplicable call applicable: with no `OM[Long, Long, R]` in scope there is
+/// no result type, and real scalac rejects it too.
+#[test]
+fn tq_openview_bad_is_rejected() {
+    compile_fails_lib(
+        "tq_openview_bad",
+        "could not find implicit value of type OM[Long, Long, R]",
+    );
+}
+
+// --------------------------------------------------- @specialized (stage 1)
+
+/// `@specialized` and `@unspecialized` are accepted and recorded on the
+/// symbol; the `specialize` phase is not implemented, so nothing `$mc*$sp`
+/// comes out. The program runs, and it computes what the same program without
+/// the annotation computes -- which is the whole reason accepting it is sound
+/// while the phase is missing. `tests/spec_classfiles.sh` is the ledger that
+/// keeps the gap visible; see docs/specialization.md.
+#[test]
+fn sp_annot_fixture() {
+    check("sp_annot");
+    dual_run_fixture("sp_annot");
+}
+
+/// `import scala.{specialized => sp}` is how cats and the collections spell
+/// it. Library mode only: the private runtime has no `scala.specialized` for
+/// the import to name.
+#[test]
+fn sp_alias_fixture() {
+    dual_run_fixture("sp_alias");
+}
+
+/// The annotation is a performance hint and must not soften type checking.
+#[test]
+fn sp_annot_bad_is_rejected() {
+    compile_fails("sp_annot_bad", "type mismatch");
 }
