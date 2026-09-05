@@ -84,6 +84,15 @@ impl Typer {
         // An alias member (`type Scope = Map[K, V]`) is dealiased first, or the
         // receiver's type arguments would be invisible to the substitution below.
         let mut recv_ty = self.st.dealias(&self.st.widen_type_param(&qual.ty));
+        // A *fully applied* type lambda is the type its body says it is.
+        // `dealias` deliberately keeps a higher-kinded alias folded -- its body
+        // means nothing until the arguments arrive -- but here they have, and
+        // without the reduction the receiver was the unreduced application:
+        // `value _2 is not a member of [A0, x, y](A0, x, y)[A0, Any, Any]`,
+        // 30 times in cats' generated `NTupleBitraverseInstances` and
+        // `NTupleMonadInstances`, where kind-projector's `(A0, *, *)` is
+        // exactly this shape.
+        recv_ty = self.st.dealias(&self.st.expand_applied_hk_alias(recv_ty));
         // `super.m` (`qual` is a `Super` tree): resolve `m` against the real
         // mixin linearization, not against the one parent `TreeKind::Super`
         // picked independent of `m`'s name and not through that parent's own
@@ -388,11 +397,14 @@ impl Typer {
                     self.is_reflect_universe(owner)
                 })
             {
+                // nsc names the *reduced* type: `value _4 is not a member of
+                // (A0, Any, Any)`, not of the application that produced it.
+                let shown = self.st.expand_applied_hk_alias(qual.ty.clone());
                 self.error(
                     tree.span,
                     format!(
                         "value {name} is not a member of {}",
-                        self.st.display_type(&qual.ty)
+                        self.st.display_type(&shown)
                     ),
                 );
             }
@@ -581,6 +593,27 @@ impl Typer {
                     // read *before* that rule applies, so a `TypeApply` above
                     // has to be able to get back to the set. Record it under
                     // the surviving symbol too -- the key the caller has.
+                    if id != found[0] {
+                        self.overload_member_types.insert(id.0, alts);
+                        self.record_overload_group(&found, &name);
+                        if let Some(g) = self.overload_groups.get(&found[0].0).cloned() {
+                            self.overload_groups.insert(id.0, g);
+                        }
+                    }
+                }
+            } else if !matches!(pt, Type::Function { .. } | Type::Method { .. }) {
+                // The set may still have exactly one alternative whose
+                // parameters are all implicit, which value position keeps for
+                // the same reason it keeps a nullary one -- see
+                // `implicit_only_alternative`. `maybe_auto_apply` cannot see
+                // it, because a `Type::Method` carries parameter types and no
+                // `implicit` flag. The `pt` guard is that function's own: a
+                // method or function expectation is not value position.
+                if let Some(id) = self.implicit_only_alternative(&alts) {
+                    if let Some((_, t)) = alts.iter().find(|(s, _)| *s == id) {
+                        tree.ty = t.clone();
+                    }
+                    tree.sym = id;
                     if id != found[0] {
                         self.overload_member_types.insert(id.0, alts);
                         self.record_overload_group(&found, &name);
@@ -2137,6 +2170,16 @@ impl Typer {
                 args,
             });
         }
+        // As in the single-clause rewrite below: hand the outermost clause the
+        // `copy` call's node id and record how its arguments were reordered, so
+        // `named_eval_order` can restore the written evaluation order. Only the
+        // outermost clause can be keyed this way -- the inner ones are
+        // synthesized trees with no id of their own -- and `self.slot_source`
+        // is what the loop above left from that same last clause.
+        ctor.id = tree.id;
+        let last_order = std::mem::take(&mut self.slot_source);
+        self.last_named_order = Some(last_order);
+        self.record_named_arg_order(tree.id);
         *tree = Tree::dummy(TreeKind::Block {
             stats: vec![tmp_def],
             expr: Box::new(ctor),
@@ -2282,10 +2325,18 @@ impl Typer {
         let new_tree = Tree::dummy(TreeKind::New {
             tpt: Box::new(self.resolved_class_tpt(class_id)),
         });
-        let ctor = Tree::dummy(TreeKind::Apply {
+        let mut ctor = Tree::dummy(TreeKind::Apply {
             fun: Box::new(new_tree),
             args: new_args,
         });
+        // `copy` places its own named arguments rather than going through
+        // `reorder_named_args`, so record here what that reordering was. The
+        // constructor call inherits the node id the `copy` application had, so
+        // `named_eval_order` can find it and put the evaluation back into the
+        // order the arguments were written in.
+        ctor.id = tree.id;
+        self.last_named_order = Some(std::mem::take(&mut self.slot_source));
+        self.record_named_arg_order(tree.id);
         tree.kind = TreeKind::Block {
             stats: vec![tmp_def],
             expr: Box::new(ctor),

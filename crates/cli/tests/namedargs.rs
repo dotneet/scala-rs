@@ -406,6 +406,26 @@ fn real_scalac_dual_run_namedargs() {
     namedargs_scalac_dual_run("namedargs");
 }
 
+// Named arguments are matched to parameters by name but still *evaluated* in
+// the order they were written (SLS 6.6.1), and the callee's parameter names
+// have to be found first -- including on an `object` called through its
+// `apply`, whose members live on the module class rather than on the module
+// value a reference resolves to. See `typer::named_eval_order`.
+#[test]
+fn scala_library_dual_run_na_evalorder() {
+    dual_run_fixture("na_evalorder");
+}
+
+#[test]
+fn real_scalac_dual_run_na_evalorder() {
+    namedargs_scalac_dual_run("na_evalorder");
+}
+
+#[test]
+fn fixtures_na_module_bad_is_error() {
+    compile_fails_lib("na_module_bad", "unknown parameter name: q");
+}
+
 #[test]
 fn fixtures_namedargs_dup_bad_is_error() {
     compile_fails_lib(

@@ -138,6 +138,10 @@ impl Typer {
         names: &[String],
     ) -> (Vec<Option<Tree>>, Vec<Tree>, bool) {
         let mut slots: Vec<Option<Tree>> = names.iter().map(|_| None).collect();
+        // Parameter slot -> the position the argument now in it was written
+        // at. `place_named_args` reads it back out to record what the
+        // evaluation order has to be put back to; see `slot_source`.
+        let mut slot_source: Vec<Option<usize>> = names.iter().map(|_| None).collect();
         let mut arg_pos: Vec<Option<usize>> = args.iter().map(|_| None).collect();
         let mut extra: Vec<Tree> = Vec::new();
         let mut positional_allowed = true;
@@ -149,6 +153,7 @@ impl Typer {
                     ok = false;
                 } else if arg_index < slots.len() {
                     arg_pos[arg_index] = Some(arg_index);
+                    slot_source[arg_index] = Some(arg_index);
                     slots[arg_index] = Some(a);
                 } else {
                     extra.push(a);
@@ -173,6 +178,7 @@ impl Typer {
                 }
                 None => {
                     arg_pos[arg_index] = Some(pos);
+                    slot_source[pos] = Some(arg_index);
                     slots[pos] = Some(rhs);
                 }
             }
@@ -180,6 +186,7 @@ impl Typer {
                 positional_allowed = false;
             }
         }
+        self.slot_source = slot_source;
         (slots, extra, ok)
     }
 
@@ -345,6 +352,19 @@ impl Typer {
         let names: Vec<String> = ids.iter().map(|id| self.st.get(*id).name.clone()).collect();
         let taken = std::mem::take(args);
         let (slots, extra, ok) = self.named_arg_slots(taken, &names);
+        // Where each of these arguments was written. A by-name parameter is
+        // struck out: its argument is not evaluated at the call site at all,
+        // so lifting it into a `val` in front of the call would turn a thunk
+        // into an eager evaluation.
+        let mut order = std::mem::take(&mut self.slot_source);
+        for (i, slot) in order.iter_mut().enumerate() {
+            if ids.get(i).is_some_and(|p| {
+                let s = self.st.get(*p);
+                s.flags.contains(Flags::BYNAME) || matches!(s.ty, Type::ByName(_))
+            }) {
+                *slot = None;
+            }
+        }
         let last = slots.len().saturating_sub(1);
         let mut out = Vec::new();
         for (i, slot) in slots.into_iter().enumerate() {
@@ -393,6 +413,8 @@ impl Typer {
                 self.error(a.span, "too many arguments");
             }
         }
+        order.truncate(out.len());
+        self.last_named_order = Some(order);
         *args = out;
         ok
     }
@@ -406,6 +428,7 @@ impl Typer {
         class_id: Option<SymbolId>,
         fun: &Tree,
     ) -> bool {
+        self.last_named_order = None;
         let Some(class_id) = class_id else {
             Self::strip_named_args(args);
             return true;
@@ -483,9 +506,27 @@ impl Typer {
         // would find nothing. Read the parameter names off the module's
         // `apply` member(s) instead, exactly as the `Overload` branch above
         // does for an ordinary overloaded callee.
+        //
+        // Which symbol carries those members depends on how the reference was
+        // built. An `object`'s body is entered on its module *class* (`one$`),
+        // and the module *value* (`one`) that a reference resolves to has no
+        // members at all; `fun.ty` is the `ModuleRef` naming the class. Only a
+        // reference whose symbol already *is* the module class -- which is what
+        // a companion of a case class resolves to -- found anything here, so
+        // every `html.dropdown(value, right = true)` in gitbucket's Twirl
+        // templates reported "method parameters not resolved".
         if !fun.sym.is_none() && self.st.get(fun.sym).kind == SymKind::Module {
-            let alts = self.st.lookup_member(fun.sym, "apply");
-            if !alts.is_empty() {
+            let mut owners = vec![fun.sym];
+            if let Type::ModuleRef(c) = &fun.ty {
+                if *c != fun.sym {
+                    owners.push(*c);
+                }
+            }
+            for owner in owners {
+                let alts = self.st.lookup_member(owner, "apply");
+                if alts.is_empty() {
+                    continue;
+                }
                 let named = self.probe_named_arg_types(args);
                 if let Some(found) = self.alt_for_named_args(&alts, &named, args.len()) {
                     return found;
@@ -506,7 +547,47 @@ impl Typer {
         (ids, repeated)
     }
 
+    /// Remember, for the application node `id`, that its arguments no longer
+    /// stand in the order they were written.
+    ///
+    /// Scala evaluates arguments left to right *as written*, and binds them to
+    /// parameters by name afterwards (SLS 6.6.1), so an application whose names
+    /// reorder it has to keep the written order observable. nsc does that by
+    /// lifting the arguments into `val`s in front of the call
+    /// (`NamesDefaults.transformNamedApplication`); here the same rewrite is
+    /// [`crate::named_eval_order`], a pass over the typed tree, and this is
+    /// what tells it which calls to look at. Nothing is recorded when the
+    /// arguments happen to be in parameter order already, which is the common
+    /// case (`f(a = 1, b = 2)`).
+    pub(crate) fn record_named_arg_order(&mut self, id: NodeId) {
+        let Some(order) = self.last_named_order.take() else {
+            return;
+        };
+        // A synthesized application has no node id of its own to be keyed by.
+        if id == NodeId(0) || id.is_filled_arg() || id.is_pretyped_default() {
+            return;
+        }
+        let mut written = order.iter().flatten();
+        let mut prev = match written.next() {
+            Some(p) => *p,
+            None => return,
+        };
+        let mut moved = false;
+        for &p in written {
+            if p < prev {
+                moved = true;
+            }
+            prev = p;
+        }
+        if moved {
+            self.st
+                .named_arg_order
+                .insert((self.file_index as u32, id.0), order);
+        }
+    }
+
     pub(crate) fn reorder_named_args(&mut self, args: &mut Vec<Tree>, fun: &Tree) -> bool {
+        self.last_named_order = None;
         if !Self::has_named_arg(args) {
             return true;
         }

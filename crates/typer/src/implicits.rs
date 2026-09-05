@@ -217,11 +217,37 @@ impl Typer {
     /// Keeping the one the linearization reaches first is also the only choice
     /// that can be *called*: a declaration has no body, and the class that
     /// implements it is the one the JVM resolves to.
+    ///
+    /// The self type's own linearization counts as well. A `self:` annotation
+    /// is not a supertype, but its members *are* visible unqualified from
+    /// inside the body -- that is what `SymbolTable::lookup_member` walks it
+    /// for -- so an unqualified reference resolves through it and the same
+    /// declaration/definition pair has to collapse there too. gitbucket
+    /// writes its authenticators that way:
+    ///
+    /// ```scala
+    /// trait ReferrerAuthenticator { self: ControllerBase & RepositoryService & AccountService =>
+    ///   private def authenticate(...) = { val userName = params("owner") ... }
+    /// }
+    /// ```
+    ///
+    /// and every `params(...)` in one was `ambiguous implicit: request,
+    /// request` while the identical line in a trait that *extends*
+    /// `ScalatraFilter` type-checked -- the linearization the ranks were read
+    /// from held neither `ScalatraContext` nor `DynamicScope`, so no candidate
+    /// could shadow the other.
+    ///
+    /// An *enclosing* class's bases count for the same reason: inside `new
+    /// Constraint() { … }` in a controller's body, `params("userName")` still
+    /// reads the controller's `request`, and the anonymous class's own
+    /// linearization holds neither declaration. Nearer scopes come first, so
+    /// the ranks are laid out innermost class outwards -- which is also the
+    /// order an unqualified name resolves in.
     fn shadow_inherited_implicits(&self, cands: Vec<SymbolId>) -> Vec<SymbolId> {
         if cands.len() < 2 {
             return cands;
         }
-        let lin = crate::lin::linearize(&self.st, self.st.this_class);
+        let lin = self.unqualified_base_order(self.st.this_class);
         let rank = |owner: SymbolId| lin.iter().position(|&b| b == owner);
         cands
             .iter()
@@ -243,6 +269,49 @@ impl Typer {
                 })
             })
             .collect()
+    }
+
+    /// The classes an unqualified reference inside `cls`'s body can reach a
+    /// member of, nearest first.
+    ///
+    /// `cls`'s own linearization, then its self type's (a `self:` annotation
+    /// makes the annotated type's members visible from inside the body without
+    /// being a supertype -- `SymbolTable::lookup_member` walks it for exactly
+    /// that), then the same two for each enclosing class outwards. Duplicates
+    /// are dropped at the position they were first reached, so a base shared
+    /// by an inner and an outer class ranks where the inner one put it.
+    fn unqualified_base_order(&self, cls: SymbolId) -> Vec<SymbolId> {
+        let mut out: Vec<SymbolId> = Vec::new();
+        let mut at = cls;
+        let mut guard = 0;
+        while !at.is_none() && guard < 64 {
+            guard += 1;
+            if self.st.get(at).is_class_like() {
+                let mut here = vec![at];
+                if let Some(sty) = &self.st.get(at).self_type {
+                    // `self: A & B & C =>` is a refinement with three parents,
+                    // and each contributes its own bases.
+                    match sty {
+                        Type::Refined { parents, .. } => here.extend(
+                            parents
+                                .iter()
+                                .filter_map(|p| self.st.class_sym_of(p))
+                                .collect::<Vec<_>>(),
+                        ),
+                        other => here.extend(self.st.class_sym_of(other)),
+                    }
+                }
+                for start in here {
+                    for b in crate::lin::linearize(&self.st, start) {
+                        if !out.contains(&b) {
+                            out.push(b);
+                        }
+                    }
+                }
+            }
+            at = self.st.get(at).owner;
+        }
+        out
     }
 
     /// Implicit members of the companion module of `class_id` (or the module

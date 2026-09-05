@@ -82,6 +82,9 @@ impl Typer {
         // *instance* -- slick's `new SimpleLiteral(name)(tpe)` looked up
         // `apply` on the companion and reported `ambiguous overload`.
         self.flatten_curried_new(tree);
+        // Kept before the borrow below: `record_named_arg_order` keys the
+        // application by it.
+        let tree_id = tree.id;
         let (fun, args) = match &mut tree.kind {
             TreeKind::Apply { fun, args } => (fun, args),
             _ => return,
@@ -122,12 +125,16 @@ impl Typer {
             // `new C(b = 2, a = 1)`: named arguments must be put in parameter
             // order before the constructor overload is picked, since the pick
             // is driven by the argument types.
-            if Self::has_named_arg(args) && !self.reorder_named_ctor_args(args, class_id, fun) {
-                for a in args.iter_mut() {
-                    self.type_expr(a, &Type::NoType);
+            if Self::has_named_arg(args) {
+                let placed = self.reorder_named_ctor_args(args, class_id, fun);
+                self.record_named_arg_order(tree_id);
+                if !placed {
+                    for a in args.iter_mut() {
+                        self.type_expr(a, &Type::NoType);
+                    }
+                    tree.ty = Type::Error;
+                    return;
                 }
-                tree.ty = Type::Error;
-                return;
             }
             let tps = class_id
                 .map(|c| self.st.get(c).tparams.clone())
@@ -477,7 +484,9 @@ impl Typer {
         self.typing_callee = false;
         self.rewrite_receiver_apply(fun);
         Self::auto_apply_nullary_function(fun, args.len());
-        if !self.reorder_named_args(args, fun) {
+        let placed = self.reorder_named_args(args, fun);
+        self.record_named_arg_order(tree_id);
+        if !placed {
             for a in args.iter_mut() {
                 self.type_expr(a, &Type::NoType);
             }

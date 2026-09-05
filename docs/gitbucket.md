@@ -1329,6 +1329,100 @@ By cluster, before → after:
 
 The one new diagnostic is the `MappedColumnType.base` remainder above.
 
+### 26. An overloaded reference in value position ignored the implicit clause — 104 errors (typer)
+
+The entry below called this family "a pickled *declaration* cannot be told
+from a definition" and put the fix behind the pickle's `DEFERRED` bit. **That
+reading was wrong, and the bit was never needed.** The two alternatives really
+are two members, declared side by side in `org.scalatra.ScalatraBase`:
+
+```scala
+def params(implicit request: HttpServletRequest): Params
+def params(key: String)(implicit request: HttpServletRequest): String
+```
+
+`javap -p org.scalatra.ScalatraBase` shows both, and the same pair again for
+`flash` (`FlashMapSupport`), `session` (`SessionSupport`) and `multiParams`.
+Nothing about them is a declaration standing beside its definition.
+
+What was missing is nsc's `inferExprAlternative`. In *value* position — as the
+qualifier of `params.get("id")` — `isAsSpecific` looks straight through an
+implicit clause (`case mt: MethodType if mt.isImplicit => isAsSpecific(mt
+.resultType, ftpe2)`), and its mirror case answers `!mt.isImplicit` for a
+value type weighed against a method that takes explicit parameters. So
+`(implicit r: R)Params` is as specific as `(key: String)(implicit r: R)String`
+while that one is not as specific as it, and `isStrictlyMoreSpecific` picks it
+outright. `Typer::maybe_auto_apply` already applied SLS 6.26.3 for a *nullary*
+alternative, but it takes a `Type`, and a `Type::Method` carries parameter
+types and no `implicit` flag — nothing in it says the clause is implicit. The
+rule therefore lives in `Typer::implicit_only_alternative`, which is handed
+the alternatives with their symbols, and both `type_select` and the unqualified
+`Ident` path consult it when `maybe_auto_apply` leaves an `Overload` standing.
+The clause is left on the type: `adapt_implicit_apply` then finds the witness
+and passes it, which is why the emitted call is
+`ScalatraBase.params(DynamicScope.request())` and not a call missing an
+argument.
+
+Four lines against the real jar reproduce it, no gitbucket checkout:
+
+```scala
+class C extends org.scalatra.ScalatraFilter {
+  def a: Option[String] = params.get("x")   // was `value get is not a member of <overload …>`
+}
+```
+
+### 27. A declaration beside its definition, reached through a self type or from a nested class — 36 errors (typer)
+
+Root 15's other half. `shadow_inherited_implicits` collapses two implicit
+candidates of one name and one type by *linearization order*, and read that
+order from `this`'s own bases only. Two shapes reach the pair without it:
+
+```scala
+trait ReferrerAuthenticator { self: ControllerBase & RepositoryService & AccountService =>
+  private def authenticate(...) = { val userName = params("owner") ... }   // was `ambiguous implicit: request, request`
+}
+```
+
+```scala
+private def accountWebHook(needExists: Boolean): Constraint = new Constraint() {
+  override def validate(name: String, value: String, messages: Messages) =
+    if (getAccountWebHook(params("userName"), value)...)                    // and here
+}
+```
+
+A `self:` annotation is not a supertype, but its members are visible
+unqualified from inside the body — `SymbolTable::lookup_member` already walks
+it for that — and an anonymous class's body reads the *enclosing* class's
+members. In neither case is the owner of either candidate in the ranking, so
+neither could shadow the other and both were offered. The order is now
+`Typer::unqualified_base_order`: the class's own linearization, then its self
+type's, then the same two for each enclosing class outwards — nearest first,
+which is the order an unqualified name resolves in.
+
+The 30 this removed on its own came with 19 more: `no implicit … BasicBackend
+.Session` fell 22 → 3, because a `Session` that comes from `params`-adjacent
+code could finally be typed.
+
+### What roots 26 and 27 were measured against
+
+`tests/gitbucket_measure.sh`: **1399 → 1259**, files with errors 185 → 181.
+Root 26 is −104 and root 27 −36 (measured one at a time, in that order). By
+cluster:
+
+| cluster | before | after |
+|---|---:|---:|
+| `value get/update/getOrElse/toMap/… is not a member of <overload …>` | 134 | **0** |
+| `ambiguous implicit: request, request` | 10 | **0** |
+| `no implicit … BasicBackend.Session` | 23 | 3 |
+| `value withTransaction is not a member of BasicBackend.DatabaseFactory` | 12 | 12 |
+
+Nothing rose by more than 3, and every rise is a call site that had not been
+type-checked before: `value issueId is not a member of Nothing` 14 → 15,
+`value openedUserName is not a member of Nothing` 5 → 8, and so on.
+
+slick (`errors=0 classes=1490`) is unchanged; cats fell 752 → 748 and the
+scala library 1653 → 1652.
+
 ## Not fixed: a guard after a value definition in a for-comprehension
 
 `controller/PullRequestsController.scala` writes
@@ -1360,10 +1454,10 @@ now. The head is scalatra's overload sets and the Twirl templates.
 | n | message | reading |
 |---|---|---|
 | **79** | `no implicit … CanBeQueryCondition[Any]` | `q.filter(t => …)` where the literal's body still did not type, so `filter`'s `T` came out `Any`. Was 187; what is left is downstream of the wildcard self type below, not a root of its own. |
-| **53** | `unimplemented syntax: named arguments (method parameters not resolved)` | Named arguments where the callee did not resolve. |
+| ~~**53**~~ → **0** | `unimplemented syntax: named arguments (method parameters not resolved)` | Every one of them was an `object` applied directly — a Twirl template's `html.dropdown(value, right = true)`, or `html.edithook(…, create = true)`. An `object`'s members are entered on its module *class*; a reference to it resolves to the module *value*, which has none, so `lookup_member(fun.sym, "apply")` found nothing and the names could not be placed. `agent/namedargs` follows the reference's `ModuleRef` to the class. 1399 → 1348. |
 | **53** | `ambiguous overload for datetimeago with arguments (Date)` | A Twirl `object` extends `BaseScalaTemplate` and `TemplateN`, and its `apply` is ambiguous with something inherited. The largest single template symptom. |
 | **44** | `ambiguous overload for apply$default$N with arguments ()` | A default getter that two overloads both own. |
-| **43 / 28 / 22 / 13** | `value get / update / getOrElse is not a member of <overload …>` | scalatra: a pickled *declaration* cannot be told from a definition, so the overload set keeps both. See 1 below. |
+| ~~**43 / 28 / 22 / 13**~~ **0** | `value get / update / getOrElse is not a member of <overload …>` | scalatra. **Gone — root 26.** The reading given here ("a pickled *declaration* cannot be told from a definition") was wrong; the two really are two members, and what was missing is nsc's `inferExprAlternative`. |
 | **37 / 28 / 23** | `no implicit … BaseTypedType[AnyRef] / TypedType[Date] / BasicBackend.Session` | slick, in `BasicTemplate.scala`'s `self: Table[?] =>`: a wildcard self type does not offer the table's members. See 2 below. |
 | 31 | `macro expansion is not implemented: cannot expand mapTo` | Root 18's honest remainder: a `ClassTag[T]` the tag builder cannot express. |
 | 29 | `no matching overload for constructor Constraint with arguments ()` | jgit. |
@@ -1391,16 +1485,30 @@ harness for that is three lines of shell (`scalac`/`scala-rs` over one file with
    downstream families named here `CanBeQueryCondition[Any]` fell 79 → 44 and
    `Query[G, T, Seq]` 47 → 43 rather than to zero. What is left of them is a
    second root, not this one.
-2. **A pickled *declaration* cannot be told from a definition** (the
-   `value get / update / getOrElse is not a member of <overload …>` half, 106
-   now — scalatra, unchanged by roots 20 and 21).
-   Root 15 works around it with linearization order, which is enough for an
-   implicit but not for an overload set. The bit is in the pickle
-   (`pflags::DEFERRED`); what stops us using it is that the member supply
-   collapses same-shaped hits into one symbol without preferring the concrete
-   one, so marking the survivor deferred makes
-   `check_missing_implementations` fire — measured, 1693 → 2117. Fix the
-   collapse first.
+2. ~~A pickled *declaration* cannot be told from a definition~~ (the
+   `value get / update / getOrElse is not a member of <overload …>` half).
+   **Done -- roots 26 and 27 above**, worth 140 here (1399 → 1259), −4 in
+   cats, −1 in the scala library and 0 in slick. **The cause named in this
+   entry was wrong, and the work it prescribed is not needed.** `javap -p
+   org.scalatra.ScalatraBase` shows `params(HttpServletRequest)` and
+   `params(String, HttpServletRequest)` declared side by side: two members,
+   not a declaration standing beside its definition. What was missing is
+   nsc's `inferExprAlternative` — in value position an alternative whose
+   parameters are all implicit is strictly more specific than one that takes
+   explicit parameters, because `isAsSpecific` looks through an implicit
+   clause. Nothing here reads `pflags::DEFERRED`, and the collapse in
+   `pickle_supply.rs` was not touched.
+
+   The 1693 → 2117 experiment recorded under root 15 stands as a fact about
+   marking pickled declarations `Flags::ABSTRACT`; it just was never what
+   this family needed. If some future slice does need the deferred bit, the
+   note there about fixing the collapse first still applies — but this
+   family is no longer the evidence that it is worth anything.
+
+   The half root 15 really did leave behind was `ambiguous implicit: request,
+   request` (10 here, plus 19 downstream `BasicBackend.Session`), and that is
+   root 27: the same declaration/definition pair, ranked against a
+   linearization that did not include the self type or the enclosing class.
 3. ~~Inference takes an argument's own type where its base type at the
    parameter's class is meant.~~ **Done -- root 22 above.** Worth 0 here, 0
    in slick, cats and the scala library. The cause named in this entry
@@ -1439,6 +1547,12 @@ harness for that is three lines of shell (`scalac`/`scala-rs` over one file with
   wrong; the minimal file said so in one run, and a debug print of the
   converted alias said so in the next. Cheapest order: reproduce, then print
   what the suspected code actually returns, and only then read it.
+* Root 26 is the strongest case for that order yet, because the wrong cause
+  had been written down twice and had a *measurement* attached to it (1693 →
+  2117), which made it read like established fact rather than a hypothesis.
+  `javap -p org.scalatra.ScalatraBase` — one command, no build — showed the
+  two "duplicate" alternatives are two declarations in one class file. **Look
+  at the library before believing a claim about what its pickle contains.**
 * Root 14 is the mirror image and worth remembering next to it: the cause was
   right — `SigCache::lookup` really was missing the alias — and the **count**
   was wrong by 219. Both halves have to be measured. The cheap way to tell is
