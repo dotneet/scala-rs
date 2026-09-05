@@ -320,6 +320,13 @@ pub struct Typer {
     /// to a `lazy val`, but not to an eager one). Their bodies still wait
     /// their turn, and their signature must not be built a second time.
     pub(crate) lazy_val_presig: std::collections::HashSet<(usize, scala_rs_parser::NodeId)>,
+    /// `def`s that stand as a statement of a *block* rather than as a member
+    /// of a template. The symbol table cannot say which is which: a local def
+    /// in a `val`'s right-hand side is owned by the enclosing *class*, exactly
+    /// like a real member, because there is no accessor symbol to own it. Only
+    /// `@tailrec` eligibility needs the distinction so far -- a local def is
+    /// not a member of anything and so cannot be overridden.
+    pub(crate) block_local_defs: std::collections::HashSet<(usize, scala_rs_parser::NodeId)>,
     /// Parent constructor calls whose omitted (implicit / defaulted) argument
     /// list has already been synthesized. `extends P` is walked by the header
     /// pass, the signature pass and the body pass; filling it more than once
@@ -811,6 +818,7 @@ impl Typer {
             ctor_pattern_fun: false,
             sig_done: std::collections::HashSet::new(),
             lazy_val_presig: std::collections::HashSet::new(),
+            block_local_defs: std::collections::HashSet::new(),
             parent_fill_done: std::collections::HashSet::new(),
             warmed_scopes: std::collections::HashSet::new(),
             completed_arg_classes: std::collections::HashSet::new(),

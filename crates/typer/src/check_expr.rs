@@ -982,6 +982,15 @@ impl Typer {
             }
             TreeKind::Block { stats, expr } => {
                 self.st.push_scope();
+                // Record which `def`s are block statements before any of them
+                // is typed: `check_tailrec` runs from the body pass and by
+                // then the owner says nothing (a def in a `val`'s right-hand
+                // side is owned by the enclosing class, like a member).
+                for s in stats.iter() {
+                    if matches!(s.kind, TreeKind::DefDef { .. }) {
+                        self.block_local_defs.insert((self.file_index, s.id));
+                    }
+                }
                 // Local classes are visible to the whole block, including
                 // statements that precede their definition.
                 for s in stats.iter_mut() {

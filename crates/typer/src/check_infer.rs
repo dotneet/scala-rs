@@ -1432,6 +1432,43 @@ impl Typer {
                     self.collect_expected(tps, x, y, 0, depth + 1, allow_covariant, out);
                 }
             }
+            // A compound (`A with B`) on either side. Nothing matched it, so
+            // `def instance[F[_]](…): Traverse[F] with Reducible[F]` assigned
+            // to a `Traverse[Tuple1] with Reducible[Tuple1]` solved `F` from
+            // nothing at all and the argument function's parameter came out as
+            // `F[Any]` with `F` still its own placeholder -- cats' generated
+            // `NTupleUnorderedFoldableInstances` reported `value _1 is not a
+            // member of _[Any]` 22 times. Parents are paired by the class they
+            // name so that `Traverse[F]` is never read against `Reducible[…]`;
+            // the arms below still decide what each pair says.
+            (Type::Refined { parents: rps, .. }, Type::Refined { parents: pps, .. }) => {
+                for rp in rps {
+                    let head = self.st.class_sym_of(rp);
+                    for pp in pps.iter().filter(|pp| self.st.class_sym_of(pp) == head) {
+                        self.collect_expected(
+                            tps,
+                            rp,
+                            pp,
+                            variance,
+                            depth + 1,
+                            allow_covariant,
+                            out,
+                        );
+                    }
+                }
+            }
+            (Type::Refined { parents: rps, .. }, _) => {
+                let head = self.st.class_sym_of(pt);
+                for rp in rps.iter().filter(|rp| self.st.class_sym_of(rp) == head) {
+                    self.collect_expected(tps, rp, pt, variance, depth + 1, allow_covariant, out);
+                }
+            }
+            (_, Type::Refined { parents: pps, .. }) => {
+                let head = self.st.class_sym_of(ret);
+                for pp in pps.iter().filter(|pp| self.st.class_sym_of(pp) == head) {
+                    self.collect_expected(tps, ret, pp, variance, depth + 1, allow_covariant, out);
+                }
+            }
             (Type::Class { sym: rs, args: ras }, Type::Class { sym: ps, args: pas }) => {
                 if rs == ps {
                     if ras.len() != pas.len() {
@@ -1744,6 +1781,7 @@ impl Typer {
                 }
                 let ok = if upper {
                     self.st.is_sub_type(actual, &bound)
+                        || self.st.hk_ctor_meets_proper_bound(actual, &bound)
                 } else {
                     self.st.is_sub_type(&bound, actual)
                 };
