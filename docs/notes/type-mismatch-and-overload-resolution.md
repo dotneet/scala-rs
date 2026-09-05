@@ -1073,3 +1073,36 @@ The tests are the 9 in the new file `crates/cli/tests/tail6.rs`.
   noted above, preceding constructor arguments cannot be referenced in nsc either, so there
   should be no observable difference, but defaults cannot be filled in across a jar under
   separate compilation.
+
+### The shape of a function literal, before its parameter types (`agent/gbovl`)
+
+Overloading on nothing but the *arity* of a function-literal argument:
+
+```scala
+def only(action: Repo => Any): String
+def only[T](action: (T, Repo) => Any): T => String
+only { r => r.nm }              // the first
+only[T] { (form, r) => … }      // the second
+```
+
+The literal cannot be typed until the alternative is picked, and the
+alternative cannot be picked from a literal that is not typed. nsc breaks the
+circle with `Infer.shapeType`, which it feeds to `isApplicableSafe` before
+`typedArgs`: a `Function(vparams, body)` becomes
+`functionType(vparams map (_ => AnyTpe), shapeType(body))`, so the parameter
+types are `Any` and the **arity is the source's**. A `{ case … }` literal
+(`Match(EmptyTree, _)`) becomes `PartialFunction[Any, Nothing]` — arity one,
+which is why `g { case (n, s) => s }` against a `Function1`/`Function2` pair
+picks the `Function1` in real scalac and then fails.
+
+`arg_score` here deliberately lets an un-inferred literal match a function
+parameter of *any* arity, because a one-parameter `{ case … }` literal really
+does inhabit an `(A, B) => C` by tupling when that is the only candidate. So
+the arity is applied one level up, in `Typer::narrow_by_lambda_shape`, as a
+filter on the *set* of applicable alternatives: it runs only when two or more
+are applicable, and it keeps the whole set when it would empty it. It can
+therefore turn an ambiguity into a pick, never a pick into a failure. The full
+account, with the two other roots the same gitbucket symptom turned out to
+hide (a `-cp` class that is only ever inferred is never completed; and
+dropping an argument's prototype has to *earn* it), is in `docs/gitbucket.md`
+under root 17.

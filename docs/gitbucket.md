@@ -79,7 +79,9 @@ path of your own.**
 | main at `56174d5` (Twirl, the two slick-run slices and scalalib merged) | 353 | 1 | **2373** | 188 | 0 |
 | main at `1a494fb` (the five slick-through-the-jar roots merged) | 353 | 1 | **1859** | 186 | 0 |
 | main at `cad281b` | 353 | 1 | **1693** | 186 | 0 |
-| Now (root 16, the `def` signatures) | 353 | 1 | **1391** | 184 | 0 |
+| main at `1a494fb` + the merges after it (root 16, the `def` signatures) | 353 | 1 | **1391** | 184 | 0 |
+| main at `e59f56a` | 353 | 1 | **1373** | 184 | 0 |
+| Now (root 17, the function-literal shapes) | 353 | 1 | **1246** | 185 | 0 |
 
 Every row after the second was measured on the same tree, with the same
 material, one binary each -- `SCALA_RS=<binary> tests/gitbucket_measure.sh`
@@ -92,18 +94,19 @@ nothing in gitbucket had been typechecked at all. This is exactly what
 honest reading of "35" is "0 files typechecked"; the honest reading of "3261"
 is "353 files typechecked, 97 of them clean".
 
-Of the 1391, **1227** are in 111 hand-written files (of 213 measured) and
-**164** — down from 1038, and unchanged since — are in 73 of the 140 generated
-templates.
+Of the 1246, **1093** are in 112 hand-written files (of 213 measured) and
+**146** — down from 1038 — are in 73 of the 140 generated templates.
 
-The worst hand-written files are `controller/AccountController.scala` (124),
-`service/IssuesService.scala` (83),
-`controller/RepositoryViewerController.scala` (54) and
-`controller/SystemSettingsController.scala` (47).
+The worst hand-written files are
+`controller/RepositorySettingsController.scala` (104),
+`service/IssuesService.scala` (81),
+`controller/RepositoryViewerController.scala` (63),
+`controller/AccountController.scala` (51) and
+`service/RepositoryService.scala` (43).
 
 ## What was wrong, and what it cost
 
-Sixteen roots. Fifteen are fixed; the counts are what each was worth when it
+Seventeen roots. Sixteen are fixed; the counts are what each was worth when it
 was removed.
 
 ### 1. An operator swallowed the comment that followed it (lexer)
@@ -615,6 +618,87 @@ Types fine, verifies fine, dies at run time — one more entry for the list of
 what each check proves. It reproduces with the two units in **either** order,
 so it has nothing to do with the signature phase.
 
+### 17. Overload resolution against a function literal — 1373 → 1246
+
+The survey's "next biggest" entry: ≈259 errors reading `ambiguous overload for
+referrersOnly / writableUsersOnly / ownerOnly / readableUsersOnly / datetimeago
+with arguments ((<notype>) => <notype>)`. It was **three** roots, and the count
+was wrong in the usual way — the one root that matched the description was
+worth 216 by itself, and removing it made the raw number **go up by 214**,
+because an ambiguity error suppresses the whole call and everything under it.
+
+#### 17a. A literal's arity is known before its parameter types are
+
+`util/Authenticator.scala` declares each of its four guards twice:
+
+```scala
+protected def writableUsersOnly(action: RepositoryInfo => Any) = …
+protected def writableUsersOnly[T](action: (T, RepositoryInfo) => Any) = (form: T) => …
+```
+
+Nothing a caller writes tells the two apart except how many parameters the
+literal has, and the literal cannot be typed until the alternative is picked.
+nsc breaks the circle with a *shape* type (`Infer.shapeType`, used by
+`inferMethodAlternative` before `typedArgs`): `Function(vparams, body)` becomes
+`functionType(vparams map (_ => AnyTpe), …)`, so the parameter types are
+`Any` but the **arity is the source's**, and `isApplicableSafe` on that shape
+throws out the alternative of the other arity.
+
+`arg_score` deliberately lets an un-inferred literal match a function parameter
+of any arity, because a `{ case … }` literal is written with one parameter and
+still inhabits an `(A, B) => C` by tupling. So the arity is applied in
+`narrow_by_lambda_shape`, on the *set* rather than on each candidate: it only
+ever narrows an already ambiguous set, so a lone applicable alternative is
+never rejected and the tupling case (a single `(A, B) => C` candidate) is
+untouched. Real scalac agrees on where the line is — `g { case (n, s) => s }`
+against a `Function1`/`Function2` pair picks the `Function1` and then fails
+(`constructor cannot be instantiated to expected type`), because a `{ case … }`
+literal's shape is `PartialFunction[Any, Nothing]`.
+
+216 errors, and 214 new ones under them.
+
+#### 17b. A `-cp` class that is only ever *inferred* is never completed
+
+`post("/…", uploadForm)` was `no matching overload for <overload (String,
+ValueType[T])((T) => Any)Route | (RouteTransformer*)(=> Any)Route> with
+arguments ("…", MappingValueType[UploadForm])` — 42 of them, one per form
+route. `MappingValueType[T]` *implements* `ValueType[T]`; its base type
+sequence here was `[AnyRef]`.
+
+`PickleSupply::ensure_class` leaves a non-library class as a `JAVA`-flagged
+placeholder "for the ordinary class file loader, which completes it the moment
+the program names it". gitbucket never names this one: `private val uploadForm
+= mapping(…)` takes its type from scalatra-forms' pickled result type and the
+identifier `MappingValueType` appears nowhere in the source. nsc has no such
+gap — a symbol's info is completed the first time anything asks for it, and
+`isApplicable` asks. `type_apply` now completes the classes of its argument
+types (`complete_arg_classes`) before the alternatives are weighed, once per
+class. Writing the type out by hand made the same program compile, which is
+what said the parents were the problem rather than the subtyping.
+
+#### 17c. Dropping an argument's prototype has to *help*
+
+The rest, and the largest of the three: 214 of the errors 17a exposed, plus
+part of what was already there.
+
+`type_apply` types an argument against its parameter type and then, if that
+complains, throws the result away and types it again with no expected type —
+"a prototype is a hint, never a constraint". For a function literal that
+second typing has no parameter types at all, so one error inside the body
+became `form: Any` and one `value … is not a member of Any` for every field
+the body read. `post(path, form)(writableUsersOnly { (form, repository) => … })`
+in `RepositoryViewerController.scala` is the shape; 153 of the errors were the
+`Any`s.
+
+The retry now has to earn its place: it is kept only when it reports **fewer**
+errors than the prototyped typing did (and, as before, when it reports none).
+On a tie the prototyped tree stands, together with its diagnostics. Reduced to
+seven lines the difference is exact — real scalac reports `not found: value
+oopsUndefined` and nothing else, and so do we now.
+
+The three are pinned by `tests/fixtures/gb_ovl_shape.scala` (+`_bad`) and
+`gb_cplib_lib.scala` / `gb_cplib_main.scala`, in `crates/cli/tests/e2e.rs`.
+
 ### The crash: `lub` had no depth cap
 
 `JGitUtil.scala` **aborted the compiler with a stack overflow and no
@@ -652,37 +736,32 @@ in a block inside the lambda, which has no stream for the guard to filter, and
 so diagnoses the shape rather than desugaring it wrongly. Three occurrences,
 one file, held out of the measurement by default.
 
-## Where the remaining 1391 are
+## Where the remaining 1246 are
 
-Counted by message shape, largest first, with the reading:
+Counted by message shape, largest first, with the reading. The `…Only` family
+that headed this table is gone (root 17); what it was hiding is most of what
+grew.
 
 | n | message | reading |
 |---|---|---|
-| 79 / 62 / 23 / 18 (+ 13 / 12 at arity 2) | `ambiguous overload for referrersOnly / writableUsersOnly / ownerOnly / readableUsersOnly with arguments ((<notype>) => <notype>)` | What root 7's "not found" became. Two overloads, and the argument is a function literal whose parameter type is not inferred yet. |
-| 52 | `ambiguous overload for datetimeago with arguments (Date)` | gitbucket's own helper, same shape, and the largest single template symptom. |
-| 44 | `unimplemented syntax: named arguments (method parameters not resolved)` | Named arguments where the callee did not resolve. |
+| **238** | `value filter / insert / join / map … is not a member of ((Tag) => X)TableQuery[X]` | `TableQuery[X]`'s own members behind its `apply`-shaped constructor. Up from ≈70 because root 17 stopped suppressing the calls that reach them, and now the largest single thing by a wide margin. |
+| **137** | `value get / update / getOrElse is not a member of <overload …>` | scalatra, the same overload-set shape as root 12 but between two genuinely different members. Also up, for the same reason. |
+| **100** | `ambiguous implicit: request, objectDatabaseReleasable` / `response, …` / `context, …` | An implicit search that two candidates answer, in `Implicits.scala`'s conversions. |
+| 53 | `unimplemented syntax: named arguments (method parameters not resolved)` | Named arguments where the callee did not resolve. |
+| 53 | `ambiguous overload for datetimeago with arguments (Date)` | *Not* the `…Only` shape, despite the survey grouping the two: the argument is an ordinary `Date`. A Twirl `object` extends `BaseScalaTemplate` and `TemplateN`, and its `apply` is ambiguous with something inherited. The largest single template symptom. |
+| 44 | `ambiguous overload for apply$default$N with arguments ()` | A default getter that two overloads both own. |
 | 29 | `no matching overload for constructor Constraint with arguments ()` | jgit. |
-| 26 / 18 | `no implicit … BaseTypedType[AnyRef] / TypedType[Date]` | slick, in `BasicTemplate.scala`'s `self: Table[?] =>`: a wildcard self type does not offer the table's members. |
 | 22 | `no matching overload for (…)FieldSerializer[A] with arguments ()` | json4s. |
-| 22 | `ambiguous overload for apply$default$N with arguments ()` | A default getter that two overloads both own. |
-| 18 | `no implicit: could not find implicit value of type BasicBackend.Session` | Down from 31, and now the *only* `Session` shape left: these name a type that resolved, so they are a real implicit search that fails, not an unresolved name. |
-| ≈70 | `value filter / insert / map is not a member of ((Tag) => X)TableQuery[X]` | `TableQuery[X]`'s own members behind its `apply`-shaped constructor. |
-| 41 | `value get / update is not a member of <overload …>` | scalatra, the same overload-set shape as root 12 but between two genuinely different members. |
-| 13 | `missing parameter type for expanded function` | The `_`-placeholder form of the overload/function-literal entry above. |
+| 20 / 18 / 13 | `no implicit … BasicBackend.Session / TypedType[Date] / BaseTypedType[AnyRef]` | slick, in `BasicTemplate.scala`'s `self: Table[?] =>`: a wildcard self type does not offer the table's members. |
+| 13 | `missing parameter type for expanded function` | The `_`-placeholder form of a function literal in argument position. |
 
 ### What would remove the most next
 
-1. **Overload resolution against a function literal with an un-inferred
-   parameter** (≈259 errors: the `…Only` family at both arities, plus
-   `datetimeago`). nsc picks the overload by arity first and then types the
-   literal against the chosen parameter type. This is also what is left in the
-   templates: `datetimeago` is the biggest template symptom that is not merely
-   downstream. It is now the largest single thing by a wide margin.
-2. **`TableQuery[X]`'s own members behind its `apply`-shaped constructor**
-   (≈70). `lazy val Issues = TableQuery[Issues]` is typed as the *function*
+1. **`TableQuery[X]`'s own members behind its `apply`-shaped constructor**
+   (238). `lazy val Issues = TableQuery[Issues]` is typed as the *function*
    `(Tag) => Issues` applied to nothing, so `Issues.filter` looks for `filter`
    on a function type.
-3. **A pickled *declaration* cannot be told from a definition** (the 41
+2. **A pickled *declaration* cannot be told from a definition** (the 137
    `value get / update is not a member of <overload …>`, and whatever else
    `drop_overridden` cannot separate across two unrelated traits). Root 15
    works around it with linearization order, which is enough for an implicit
@@ -692,6 +771,9 @@ Counted by message shape, largest first, with the reading:
    one, so marking the survivor deferred makes
    `check_missing_implementations` fire — measured, 1693 → 2117. Fix the
    collapse first.
+3. **The 100 `ambiguous implicit`**, in gitbucket's own `Implicits.scala`.
+   Unmeasured: nobody has yet checked whether the two candidates are one
+   member reached twice (root 15's shape) or two real ones.
 4. **A wildcard self type offers no members** (≈44). `trait BasicTemplate {
    self: Table[?] => val userName = column[String]("USER_NAME") }` gives
    `not found: value column` and then `BaseTypedType[AnyRef]` for everything
