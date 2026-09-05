@@ -657,6 +657,16 @@ literal's shape is `PartialFunction[Any, Nothing]`.
 
 216 errors, and 214 new ones under them.
 
+A survey note written just before this slice had counted the cluster and drawn
+the right conclusion from the *word*: `ambiguous`, not `no matching`, means we
+found two or more **applicable** candidates and could not choose, so "a
+shape-typing fix that made more candidates applicable would make this cluster
+worse, not better." That is exactly why the shape goes in as a filter that only
+ever removes candidates. The same note also split the ≈259 correctly: 217 of
+the `ambiguous overload` errors had a function literal for an argument and 121
+did not — `datetimeago` (52), `main` (35), `apply$default$N` (22) are a
+different root wearing the same word.
+
 #### 17b. A `-cp` class that is only ever *inferred* is never completed
 
 `post("/…", uploadForm)` was `no matching overload for <overload (String,
