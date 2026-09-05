@@ -251,19 +251,82 @@ public final class ScalaRsMacroEngine {
         return call(companion("Constant"), "apply", 1, v);
     }
 
-    /** `(ty "java.lang.String")` as a `universe.WeakTypeTag`. */
+    /**
+     * A type descriptor as a `universe.WeakTypeTag`.
+     *
+     * `(ty "java.lang.String")` is a class the mirror can find on the macro
+     * classpath. `(syn "Pkg.Outer.Local")` is one this compilation run is
+     * itself defining, for which there is no class file yet -- see
+     * {@link #synthType}.
+     */
     static Object buildTag(Sexp s) throws Exception {
-        return tagFor(s.items.get(1).text());
+        return tagOf(typeFor(s));
     }
 
-    /** `WeakTypeTag` for the class `name`, in the runtime universe. */
-    static Object tagFor(String name) throws Exception {
+    /** The `universe.Type` a `(ty …)` / `(syn …)` descriptor names. */
+    static Object typeFor(Sexp s) throws Exception {
+        String head = s.items.get(0).atom;
+        String name = s.items.get(1).text();
+        if ("syn".equals(head)) {
+            return synthType(name);
+        }
         Object cls = call(mirror, "staticClass", 1, name);
-        Object tpe = call(call(cls, "asType", 0), "toType", 0);
+        return call(call(cls, "asType", 0), "toType", 0);
+    }
+
+    /** `WeakTypeTag` for a type already built in the runtime universe. */
+    static Object tagOf(Object tpe) throws Exception {
         Class<?> creatorCls =
             Class.forName("scala.reflect.internal.StdCreators$FixedMirrorTypeCreator", true, macroCl);
         Object creator = ctor(creatorCls, 3).newInstance(universe, mirror, tpe);
         return call(companion("WeakTypeTag"), "apply", 2, mirror, creator);
+    }
+
+    /**
+     * Types standing for classes the *calling* compilation run is defining,
+     * keyed by the full name scala-rs sent. One per name per engine process,
+     * so the same class is always the same symbol and an expansion that
+     * mentions it twice mentions one type.
+     */
+    static final java.util.HashMap<String, Object> synthetic = new java.util.HashMap<>();
+
+    /**
+     * A placeholder symbol for a class this run is compiling.
+     *
+     * The mirror resolves a class *by name against the macro classpath*, so a
+     * class whose class file does not exist yet -- gitbucket's
+     * `TableQuery[Issues]`, where `Issues` is declared a few lines away -- can
+     * never be reached that way. nsc has no such problem: it expands in its
+     * own universe, where the symbol is the very one the typer is building.
+     *
+     * What is built here carries the class's **identity and nothing else**:
+     * its name, and no info at all. That is deliberate, and it is why the
+     * symbol is safe to hand over. scala-rs cannot describe the class truly at
+     * this point in its own run -- while `lazy val Issues = TableQuery[Issues]`
+     * is being typed, the members of `class Issues` are still un-inferred --
+     * so an info here would be a guess. Leaving it unset means an
+     * implementation that asks for one gets an exception, which scala-rs turns
+     * into a diagnostic, rather than a quiet wrong answer.
+     *
+     * The name is the class's real full name, which is how scala-rs recognises
+     * the type again in the tree that comes back.
+     */
+    static Object synthType(String fullName) throws Exception {
+        Object known = synthetic.get(fullName);
+        if (known != null) {
+            return known;
+        }
+        Object internal = call(universe, "internal", 0);
+        Object owner = call(mirror, "EmptyPackageClass", 0);
+        Object sym = call(internal, "newClassSymbol", 4,
+            owner, typeName(fullName), call(universe, "NoPosition", 0), Long.valueOf(0L));
+        // `sym.toType` would ask for the type parameters, and that completes
+        // the symbol; the type reference is built directly so that the info
+        // stays unset and any real question about the class still throws.
+        Object tpe = call(internal, "typeRef", 3,
+            call(internal, "thisType", 1, owner), sym, list(new ArrayList<>()));
+        synthetic.put(fullName, tpe);
+        return tpe;
     }
 
     /** `universe.Expr(mirror, FixedMirrorTreeCreator(mirror, tree))(tag)`. */
@@ -569,6 +632,15 @@ public final class ScalaRsMacroEngine {
             }
             if (n.equals("abort")) {
                 throw new Abort(String.valueOf(a[a.length - 1]));
+            }
+            // `c.enclosingPosition` is where an implementation says its
+            // diagnostics belong, and `c.abort(c.enclosingPosition, msg)` is
+            // how nearly all of them are written -- slick's `mapToImpl`
+            // included. `NoPosition` costs nothing: scala-rs reports every
+            // diagnostic out of a macro at the call site's own span whatever
+            // position the implementation names.
+            if (n.equals("enclosingPosition") && arity == 0) {
+                return call(universe, "NoPosition", 0);
             }
             if (m.isDefault()) {
                 return InvocationHandler.invokeDefault(proxy, m, a);

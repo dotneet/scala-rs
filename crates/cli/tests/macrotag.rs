@@ -1,29 +1,36 @@
-//! A macro def that exists only in a **compiled library's pickle**
-//! (`agent/tq2`). `docs/macros.md` §5, `docs/gitbucket.md` root 18.
+//! Passing a class **this run is compiling** to a macro's type tag
+//! (`docs/macros.md` §5.1).
 //!
-//! A macro emits no bytecode, so the only record of one in a published jar is
-//! the `ScalaSignature`: the `MACRO` flag plus the
-//! `@scala.reflect.macros.internal.macroImpl` annotation naming the
-//! implementation. Nothing read that, so `slick.lifted.TableQuery`'s
-//! parameterless `def apply[E]: TableQuery[E]` was simply not a member, the
-//! companion's *other* `apply[E](cons: Tag => E)` was the only one, and
-//! gitbucket's `lazy val Issues = TableQuery[Issues]` came out as that
-//! method's un-applied type -- 238 errors reading `value filter / insert /
-//! join / map … is not a member of ((Tag) => Issues)TableQuery[Issues]`.
+//! The JVM bridge builds a `WeakTypeTag` inside `scala.reflect.runtime`'s
+//! universe, whose mirror resolves a class *by name against the macro
+//! classpath*. A class the run is still typing has no class file there, so it
+//! could not be passed at all: gitbucket writes
+//! `lazy val Issues = TableQuery[Issues]` 35 times, and every one of them was
+//! the diagnostic "the type argument `Issues` is not on the classpath".
 //!
-//! Two compilations, the way nsc requires: `tq_mdef.scala` is compiled by
-//! **real scalac** (only nsc writes that flag and that annotation), and
-//! `tq_muse.scala` by scala-rs against its class files. The expansion really
-//! runs -- the implementation is loaded from the class file and invoked
-//! through the JVM bridge -- and the dual run against real scalac is what says
-//! the tree that came back was the right one.
+//! Such a type now travels as a **placeholder**: a symbol built in the runtime
+//! universe carrying the class's full name and no info at all. scala-rs
+//! recognises the name in the tree that comes back and puts its own type
+//! there, so the expansion is typed against the symbol the typer already has
+//! rather than one resolved again by name -- which matters, because a class
+//! nested in a trait has no name a mirror could resolve even after it is
+//! compiled.
 //!
-//! `tq_muse_local.scala` is the same call with a type argument that is a class
-//! *this* run is compiling -- gitbucket's shape. It used to be a diagnostic,
-//! because the bridge rebuilds a type tag by name through a runtime mirror; it
-//! now expands through a placeholder symbol (`docs/macros.md` §5.1), and
-//! `crates/cli/tests/macrotag.rs` is where that expansion is checked against
-//! real scalac.
+//! The placeholder is empty on purpose. scala-rs cannot describe the class
+//! truthfully at that moment: while `lazy val rows = MgQuery[Row]` is being
+//! typed, the members of `class Row` are still un-inferred. So an
+//! implementation that asks the placeholder what the class *is* -- slick's
+//! `mapToImpl` opens with `if (!rSym.asClass.isCaseClass) c.abort(...)` -- is
+//! answering about a symbol it was never shown, and its verdict is not
+//! repeated to the user. `mg_inspect_bad.scala` pins both halves of that: the
+//! placeholder's verdict is refused, a real classpath class's is reported.
+//!
+//! The library half (`mg_lib.scala`) is compiled by **real scalac**, because
+//! only nsc writes the `MACRO` flag and the `@macroImpl` annotation a macro
+//! def survives in. `mg_use.scala` is then compiled by scala-rs, run, and
+//! compared against the same file compiled and run by real scalac: a macro
+//! that expands to a *different* tree still compiles, so only the output can
+//! say the expansion was right.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,7 +53,7 @@ fn tmp_dir(tag: &str) -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let p = std::env::temp_dir().join(format!(
-        "scala-rs-tqmacro-{tag}-{}-{nanos}-{seq}",
+        "scala-rs-macrotag-{tag}-{}-{nanos}-{seq}",
         std::process::id()
     ));
     fs::create_dir_all(&p).unwrap();
@@ -89,7 +96,7 @@ fn expected_stdout(name: &str) -> String {
         .unwrap_or_else(|e| panic!("read expected/{name}.txt: {e}"))
 }
 
-/// Everything this test needs, or a named skip.
+/// Everything these tests need, or a named skip.
 fn prerequisites(tag: &str) -> bool {
     if !tool_runs("java") || !tool_runs("javac") {
         eprintln!("skip {tag}: java / javac not available");
@@ -102,25 +109,25 @@ fn prerequisites(tag: &str) -> bool {
     true
 }
 
-/// Compile `tq_mdef.scala` with real scalac. That is the whole point: its
-/// pickle is the only place a macro def survives.
+/// Compile `mg_lib.scala` with real scalac. Only nsc writes the `MACRO` flag
+/// and the `@macroImpl` annotation, which is the whole record of a macro def.
 fn build_library() -> PathBuf {
     let scalac = find_scalac().unwrap();
     let reflect = scala_reflect_jar().unwrap();
-    let out = tmp_dir("mdef");
+    let out = tmp_dir("lib");
     let res = Command::new(&scalac)
         .args([
             "-cp",
             reflect.to_str().unwrap(),
             "-d",
             out.to_str().unwrap(),
-            fixtures_dir().join("tq_mdef.scala").to_str().unwrap(),
+            fixtures_dir().join("mg_lib.scala").to_str().unwrap(),
         ])
         .output()
         .expect("scalac");
     assert!(
         res.status.success(),
-        "real scalac rejected tq_mdef.scala: {}",
+        "real scalac rejected mg_lib.scala: {}",
         String::from_utf8_lossy(&res.stderr)
     );
     out
@@ -160,23 +167,22 @@ fn run_main(cp: &str, what: &str) -> String {
     String::from_utf8_lossy(&run.stdout).into_owned()
 }
 
-/// The whole path: the macro def is read from the library's pickle, the two
-/// `apply` alternatives are told apart by position, and the implementation is
-/// really run.
+/// A class this run is compiling -- top level, and nested in a trait -- passed
+/// to a macro's type tag, expanded and run.
 #[test]
-fn tq_pickled_macro_expands_and_runs() {
-    if !prerequisites("tq_muse") {
+fn mg_local_class_type_argument_expands_and_runs() {
+    if !prerequisites("mg_use") {
         return;
     }
     let jar = scala_library_jar().unwrap();
     let reflect = scala_reflect_jar().unwrap();
     let lib = build_library();
-    let uses = tmp_dir("muse");
+    let uses = tmp_dir("use");
 
-    let out = compile_with_scala_rs("tq_muse", &uses, &lib);
+    let out = compile_with_scala_rs("mg_use", &uses, &lib);
     assert!(
         out.status.success(),
-        "compile tq_muse failed: {}",
+        "compile mg_use failed: {}",
         diagnostics(&out)
     );
     let cp = format!(
@@ -187,27 +193,27 @@ fn tq_pickled_macro_expands_and_runs() {
         jar.display()
     );
     assert_eq!(
-        run_main(&cp, "tq_muse"),
-        expected_stdout("tq_muse"),
-        "stdout mismatch for tq_muse"
+        run_main(&cp, "mg_use"),
+        expected_stdout("mg_use"),
+        "stdout mismatch for mg_use"
     );
     let _ = fs::remove_dir_all(&uses);
     let _ = fs::remove_dir_all(&lib);
 }
 
-/// The same two files through real scalac, which is what makes the recorded
-/// expectation mean anything: a macro that expanded to something else would
-/// still compile and still run.
+/// The same file through real scalac. This is what makes the recorded
+/// expectation mean anything: an expansion to a *different* tree would still
+/// compile and still run.
 #[test]
-fn tq_pickled_macro_matches_real_scalac() {
-    if !prerequisites("tq_muse scalac diff") {
+fn mg_local_class_expansion_matches_real_scalac() {
+    if !prerequisites("mg_use scalac diff") {
         return;
     }
     let scalac = find_scalac().unwrap();
     let jar = scala_library_jar().unwrap();
     let reflect = scala_reflect_jar().unwrap();
     let lib = build_library();
-    let uses = tmp_dir("muse-scalac");
+    let uses = tmp_dir("use-scalac");
 
     let out = Command::new(&scalac)
         .args([
@@ -215,13 +221,13 @@ fn tq_pickled_macro_matches_real_scalac() {
             &format!("{}:{}", lib.display(), reflect.display()),
             "-d",
             uses.to_str().unwrap(),
-            fixtures_dir().join("tq_muse.scala").to_str().unwrap(),
+            fixtures_dir().join("mg_use.scala").to_str().unwrap(),
         ])
         .output()
         .expect("scalac");
     assert!(
         out.status.success(),
-        "real scalac rejected tq_muse.scala: {}",
+        "real scalac rejected mg_use.scala: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let cp = format!(
@@ -232,33 +238,46 @@ fn tq_pickled_macro_matches_real_scalac() {
         jar.display()
     );
     assert_eq!(
-        run_main(&cp, "tq_muse (real scalac build)"),
-        expected_stdout("tq_muse"),
-        "recorded expectation for tq_muse does not match real scalac"
+        run_main(&cp, "mg_use (real scalac build)"),
+        expected_stdout("mg_use"),
+        "recorded expectation for mg_use does not match real scalac"
     );
     let _ = fs::remove_dir_all(&uses);
     let _ = fs::remove_dir_all(&lib);
 }
 
-/// A type argument the *current* run defines: gitbucket's own shape, which the
-/// bridge used to refuse. It now expands through a placeholder symbol.
-///
-/// Only compilation is checked here. The program is not run, because
-/// `TqLocal.label` reads a constructor `val` of a class in another compilation
-/// unit and that is a separate code-generation bug; the dual run against real
-/// scalac lives in `crates/cli/tests/macrotag.rs`.
+/// An implementation that asks the placeholder what the class *is* gets an
+/// answer about a symbol it was never shown, so its verdict is refused and the
+/// call site says why. The same implementation's verdict on a class that
+/// really is on the macro classpath is reported as itself.
 #[test]
-fn tq_type_argument_from_this_run_expands() {
-    if !prerequisites("tq_muse_local") {
+fn mg_placeholder_verdict_is_not_reported_as_the_programs_error() {
+    if !prerequisites("mg_inspect_bad") {
         return;
     }
     let lib = build_library();
-    let out_dir = tmp_dir("muselocal");
-    let out = compile_with_scala_rs("tq_muse_local", &out_dir, &lib);
+    let out_dir = tmp_dir("inspect");
+    let out = compile_with_scala_rs("mg_inspect_bad", &out_dir, &lib);
     assert!(
-        out.status.success(),
-        "expected tq_muse_local to compile: {}",
+        !out.status.success(),
+        "expected mg_inspect_bad to fail: {}",
         diagnostics(&out)
+    );
+    let err = diagnostics(&out);
+    assert!(
+        err.contains("the type argument `MgPlain` is a class this run is compiling")
+            && err.contains("placeholder symbol carrying only its name"),
+        "the placeholder's verdict was not refused: {err}"
+    );
+    assert!(
+        !err.contains("error: MgPlain must be a case class"),
+        "the placeholder's verdict was reported as the program's error: {err}"
+    );
+    // The control: a class the mirror really can find gets the real symbol, so
+    // the implementation's `abort` is its own judgement and is reported.
+    assert!(
+        err.contains("error: java.lang.String must be a case class"),
+        "a real class's abort was not reported as itself: {err}"
     );
     let _ = fs::remove_dir_all(&out_dir);
     let _ = fs::remove_dir_all(&lib);

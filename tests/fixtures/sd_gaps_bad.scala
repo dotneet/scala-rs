@@ -19,8 +19,9 @@ object SdGaps {
 object Main {
   def main(args: Array[String]): Unit = {
     // 1. The row class is compiled by *this* run, so the engine's mirror
-    //    cannot find it: the macro classpath holds what an earlier run wrote,
-    //    and `staticClass("SdLocalRow")` is how the tag for `E` is built.
+    //    cannot find it. That used to be a refusal; it now expands, because
+    //    such a type travels as a placeholder symbol carrying its name
+    //    (`docs/macros.md` §5.1). Kept here as the case that no longer is one.
     println(SdGaps.query[SdLocalRow].head.label)
 
     // 2. A `ValDef` in the expansion carrying a modifier with no name in the
