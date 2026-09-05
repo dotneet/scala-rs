@@ -229,6 +229,33 @@ accept), and `fixtures_so8_bad_collect_result_type_is_error` pins that resolving
 a result-type-only overload is not enough on its own: a `collect` whose case
 block returns `Int` cannot be bound to `String`.
 
+The fixtures for the `agent/signature` slice (JVMS 4.7.9 `Signature`
+attributes and the 4.7.2 `ConstantValue` behind `@SerialVersionUID`) use the
+prefix `sg` (`sg_sig`) and live in `crates/cli/tests/signature.rs`.
+
+`sg_sig.scala` is a **reflection** fixture on purpose: a generic signature is
+invisible to `javap -p` and to the class loader, so `Class#toGenericString`,
+`Method#toGenericString`, `Field#getGenericType`, `#getGenericSuperclass` and
+`#getGenericInterfaces` are the only things that read one. Its expected output
+is **real scalac 2.13.16's stdout verbatim**, and both modes reproduce it.
+`a_monomorphic_member_carries_no_signature` pins the other half through
+`javap -v`: a member with no generic information must carry no attribute, or
+every class file would gain a `Signature` that says nothing.
+
+There is no `sg_*_bad.scala`. This slice adds no diagnostic — a signature that
+cannot be spelled, or that does not erase back to the descriptor it would sit
+next to, is silently not emitted, which leaves the class file exactly as it was
+before. `SCALA_RS_SIG_DEBUG=1` prints those refusals.
+
+A check worth reusing, and *not* one of the standing harnesses: parsing every
+signature of every emitted class through `java.lang.reflect`. Neither
+`slick_subset.sh` (`Class.forName(initialize = false)`) nor `javap` looks at a
+`Signature` at all, so a malformed one passes both in silence. Loading slick's
+1490 class files and asking for the generic form of all 26271 members found
+three defects this way — a dropped higher-kinded formal, and two spellings of
+`Array` that are not class names — and none of them was visible to anything
+else in the battery.
+
 The fixtures for the `agent/durrange` slice (postfix units of
 `scala.concurrent.duration`, the `Range` companion's `apply` / `inclusive`, and
 the view path that fills a function-typed implicit parameter from an implicit

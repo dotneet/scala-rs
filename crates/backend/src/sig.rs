@@ -693,6 +693,10 @@ fn erase_one(b: &[u8], mut i: usize, tvars: &[(String, String)]) -> Option<(Stri
             i += 1;
             loop {
                 match *b.get(i)? {
+                    // An empty name is not a class either: `L;` would come
+                    // from a symbol with no JVM name, and there is nothing to
+                    // vouch for there.
+                    b';' if name.is_empty() => return None,
                     b';' => return Some((format!("L{name};"), i + 1)),
                     b'<' => {
                         i = skip_args(b, i)?;

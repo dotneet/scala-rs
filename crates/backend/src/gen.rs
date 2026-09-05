@@ -1096,6 +1096,12 @@ impl ClassBuilder {
         for i in &self.interfaces {
             out.push_str(&find(i));
         }
+        // A signature with no formal parameters and no type argument anywhere
+        // repeats the `super_class` / `interfaces` the class file already
+        // states. nsc emits none in that case and neither should this.
+        if !out.contains('<') {
+            return;
+        }
         let mut want = vec![self.super_name.clone()];
         want.extend(self.interfaces.iter().cloned());
         if crate::sig::erase_class_signature(&out, &g.tvars).as_deref() != Some(want.as_slice()) {
