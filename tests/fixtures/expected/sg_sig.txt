@@ -1,0 +1,10 @@
+public class sg.C<T>
+public int sg.C.a(sg.Wrapper<int[]>)
+public int sg.C.b(sg.Wrapper<java.lang.Object>)
+public T sg.C.c(T)
+public <U> sg.Wrapper<U> sg.C.d(U)
+public int sg.C.e(int)
+sg.Wrapper<java.lang.String>
+sg.Wrapper<java.lang.String>
+sg.Bippy<java.lang.Object>
+13

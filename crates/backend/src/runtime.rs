@@ -114,6 +114,7 @@ impl B {
             desc: desc.to_string(),
             code: Some(code),
             java_annots: Vec::new(),
+            signature: None,
         });
     }
 
@@ -124,6 +125,7 @@ impl B {
             desc: desc.to_string(),
             code: None,
             java_annots: Vec::new(),
+            signature: None,
         });
     }
 
@@ -141,6 +143,10 @@ impl B {
             scala_raw: false,
             inner_classes: Vec::new(),
             enclosing_method: None,
+            // The private runtime's classes are hand-written and monomorphic.
+            signature: None,
+            field_signatures: Default::default(),
+            field_constants: Default::default(),
         };
         let bytes = class.write_with_pool(self.pool).expect("runtime classfile");
         EmittedClass {
