@@ -1126,6 +1126,21 @@ impl SymbolTable {
         matches!(self.get(s).kind, SymKind::Module | SymKind::ModuleClass)
     }
 
+    /// Is `m`, declared in a *strict* ancestor of the class being looked up
+    /// in, invisible from that class?
+    ///
+    /// `private` (and `private[this]`) members are not inherited: SLS 5.2.
+    /// Without this, `trait A { private val x = 1 }; trait B { val x = 2 };
+    /// trait C extends B with A { println(x) }` printed `1` -- whichever
+    /// parent the traversal happened to reach first decided the answer, and
+    /// the one that is not a member at all could win (`run/t7475b`).
+    /// A qualified `private[C]` stays visible: the qualifier can name an
+    /// enclosing package that does contain the subclass.
+    fn private_to_owner(&self, m: SymbolId) -> bool {
+        let s = self.get(m);
+        s.flags.contains(Flags::PRIVATE) && s.private_within.is_none()
+    }
+
     pub fn lookup_member(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
         let mut out = Vec::new();
         let mut seen = rustc_hash::FxHashSet::default();
@@ -1134,9 +1149,10 @@ impl SymbolTable {
             if !seen.insert(id.0) {
                 continue;
             }
+            let inherited = id != owner;
             let sym = self.get(id);
             for m in &sym.members {
-                if self.get(*m).name == name {
+                if self.get(*m).name == name && !(inherited && self.private_to_owner(*m)) {
                     out.push(*m);
                 }
             }
