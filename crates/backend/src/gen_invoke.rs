@@ -269,6 +269,8 @@ pub(crate) fn invoke_method(
             desc = "(Lscala/collection/SeqOps;)Lscala/collection/SeqOps;".into();
         } else if name == "unapplySeq" && owner == SEQPAT_ARRAY_MODULE {
             desc = "(Ljava/lang/Object;)Ljava/lang/Object;".into();
+        } else if let Some(d) = cons_extractor_desc(&owner, name) {
+            desc = d.into();
         }
         if is_stdlib_map_module(&owner) {
             match name {
@@ -3498,6 +3500,26 @@ pub(crate) fn seq_pat_test_class(ctx: &EmitCtx, param0: Option<&Type>) -> String
         return "scala/collection/SeqOps".into();
     }
     name
+}
+
+/// The descriptor of `scala.collection.+:.unapply` / `:+.unapply`.
+///
+/// Both are declared `unapply[A, CC[_], C](t: C with SeqOps[A, CC, C])`, so the
+/// erasure of the parameter is `SeqOps` -- which the prelude's stand-in
+/// signature (`[A, C <: Seq[A]](t: C)`) erases to `Object` instead. Same
+/// treatment as the `unapplySeq` of the sequence factories just above.
+/// `scala.#::` needs no entry: its two alternatives take a `LazyList` and a
+/// `Stream` by name, which erase correctly on their own.
+pub(crate) fn cons_extractor_desc(owner: &str, name: &str) -> Option<&'static str> {
+    if name != "unapply" {
+        return None;
+    }
+    match owner {
+        "scala/collection/package$$plus$colon$" | "scala/collection/package$$colon$plus$" => {
+            Some("(Lscala/collection/SeqOps;)Lscala/Option;")
+        }
+        _ => None,
+    }
 }
 
 pub(crate) const SEQOPS_WRAPPER: &str = "scala/collection/SeqFactory$UnapplySeqWrapper$";

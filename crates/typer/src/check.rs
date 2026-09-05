@@ -397,6 +397,12 @@ pub struct Typer {
     pub(crate) macro_failures: HashMap<(usize, u32, u32), String>,
     /// How deep the current chain of expansions is.
     pub(crate) macro_depth: u32,
+    /// Types handed to the engine as *placeholder* symbols, by the full name
+    /// the placeholder carries. A class this run is compiling has no class
+    /// file for the engine's mirror to find, so it travels as its name alone
+    /// (`crates/typer/src/expand.rs`, `synthType`); this is how the type is
+    /// recognised again in the tree that comes back.
+    pub(crate) macro_local_tags: HashMap<String, scala_rs_parser::Type>,
     /// Set once any `def f = macro Impl.m` in this run has been resolved.
     /// `type_expr` asks about macro expansion on *every* expression, and
     /// walking an application's spine to find out is not free; almost no
@@ -848,6 +854,7 @@ impl Typer {
             macro_classpath: opts.binary_path.clone(),
             macro_failures: HashMap::new(),
             macro_depth: 0,
+            macro_local_tags: HashMap::new(),
             has_macro_defs: false,
             parent_ctor_scope: false,
             fatal_warnings: opts.fatal_warnings,

@@ -63,6 +63,7 @@ unrealistic, it is stated as such.
   - 7.15 Expanding `reify { … }` (the `agent/reifybody` slice)
   - 7.16 `ShapedValue.mapToImpl` — three roots (the `agent/shaped` slice)
   - 7.17 Blocks, and members of static `object`s (the `reify` widening slice)
+  - 7.18 A class the current run is compiling, as a type tag (the `agent/macrotag` slice)
 
 (The two `7.10` entries above are not a typo in this table of contents: the numbering is duplicated
 in the document itself, and the numbers are left unchanged because other documents reference these
@@ -517,26 +518,60 @@ method is a macro, and its implementation is X.y".
      called from a later scala-rs run.
 - **Macro defs emit no method body** (`crates/backend/src/gen.rs`).
 
-### 5.1 The limit a runtime mirror puts on a type tag
+### 5.1 A class the current run is compiling, as a type tag
 
 A macro implementation reached this way is invoked through the JVM bridge, and
-the bridge rebuilds a `WeakTypeTag` with `mirror.staticClass(name)`. That
-mirror sees the **classpath**, so a type argument that is a class *this run is
-compiling* cannot be passed to one. `Typer::expansion_request` checks the
-`BinaryIndex` before starting the engine and refuses with
+the bridge builds a `WeakTypeTag` inside `scala.reflect.runtime`'s universe,
+whose mirror resolves a class **by name against the macro classpath**. A type
+argument that is a class *this run is compiling* has no class file there, so
+`mirror.staticClass` can never find it. gitbucket's `lazy val Issues =
+TableQuery[Issues]` is exactly that shape -- the table class is declared a few
+lines from the call -- and for a while all 35 of them were the diagnostic "the
+type argument `Issues` is not on the classpath".
 
-```
-the type argument `Issues` is not on the classpath -- a macro's type tag is
-rebuilt by name in a separate JVM, so a class this run is itself compiling
-cannot be passed to one
+**Such a type now travels as a placeholder.** `Typer::tag_descriptor` sends
+`(syn "a.b.Outer.Issues")` instead of `(ty …)`, and the engine's `synthType`
+builds a class symbol in the runtime universe with that full name, owned by the
+empty package, and **no info at all**. The type is remembered on the Rust side
+under the same name, so when the expansion mentions it -- as
+`TypeTree(e.tpe)`, which is what `TableQueryMacroImpl` does twice -- the tree
+that comes back is rebuilt with `materialize::RESOLVED_TYPE` carrying the
+`Type` the typer already had, not with a path resolved again by name. That
+matters beyond convenience: gitbucket's table classes are nested in traits, and
+`gitbucket.core.model.DeployKeyComponent.DeployKeys` is not a path any scope at
+the call site can resolve.
+
+**The placeholder is empty on purpose, and that is the limit.** scala-rs cannot
+describe the class truthfully at that moment in its own run: while
+`lazy val DeployKeys = TableQuery[DeployKeys]` is being typed, the members of
+`class DeployKeys` are still un-inferred, because each is a `val` whose type
+comes from typing its right-hand side. Anything richer than a name would be a
+guess. So the placeholder answers identity and nothing else, and an
+implementation that asks it a real question gets an exception rather than a
+quiet wrong answer.
+
+That still leaves the case where the implementation asks and *acts* on the
+answer. slick's `mapToImpl` opens with
+
+```scala
+if (!rSym.isClass || !rSym.asClass.isCaseClass)
+  c.abort(c.enclosingPosition, s"${rSym.fullName} must be a case class")
 ```
 
-rather than letting a bare `ScalaReflectionException: class Issues not found`
-come back from the JVM. nsc has no such limit -- it expands in its own
-universe, where the symbol exists. gitbucket's `lazy val Issues =
-TableQuery[Issues]` is exactly this shape, so 35 of its errors are this
-diagnostic; closing it means giving the engine a mirror over the current run's
-symbols, which is §4.3's open problem.
+and its verdict on a placeholder says nothing about the program. So when a
+placeholder went over, the implementation's own `abort` -- and an exception out
+of it -- is **not** repeated to the user: `placeholder_verdict` replaces it
+with a reason naming the type argument, and the call site stays an error, the
+way every unexpanded macro does. `tests/fixtures/mg_inspect_bad.scala` pins
+both halves: the placeholder's verdict is refused, and the same
+implementation's verdict on `java.lang.String` -- a class the mirror really can
+find -- is reported as itself.
+
+The residual, stated plainly: an implementation could inspect a placeholder and
+return a *tree* rather than aborting. Being blackbox, that tree is still
+typechecked against the macro def's declared return type, so it cannot be
+accepted as something it is not; but it could be a different tree from the one
+nsc would build. Closing that needs §7.18's answer, not this one.
 
 ---
 
@@ -2508,3 +2543,80 @@ The 7 `pos` tests in the same cluster are unchanged: they need free terms (`t573
    `test/files/run/macro-reify-ref-to-packageless` needs together.
 3. Definitions inside a reified block (`build.newNestedSymbol`), function literals, `new`, and types
    other than type arguments — unchanged from §7.15.
+
+### 7.18 A class the current run is compiling, as a type tag (the `agent/macrotag` slice)
+
+§5.1 is the design; this is what the slice did, what it moved, and what it
+deliberately did not attempt.
+
+#### What moved
+
+| check | before | after |
+| --- | --- | --- |
+| `tests/gitbucket_measure.sh` errors | 981 | **946** |
+| `tests/gitbucket_measure.sh` files with errors | 112 | **111** |
+
+All 35 are `TableQuery[X]`, one per table in gitbucket's model. Nothing else in
+the log changed: the error kinds before and after differ by exactly that one
+line, so no new error appeared behind the ones that went away, and the 31
+`mapTo` refusals still read the same.
+
+`tests/gitbucket_measure.sh` also gained `scala-reflect.jar` on the compile
+classpath, for the same reason `tests/slick_measure.sh` has always had it:
+running a macro implementation needs `scala.reflect.runtime.universe`, and real
+scalac has it because the jar is part of the *compiler's* classpath, which sbt
+never puts on gitbucket's. Without it the 35 sites merely swap one diagnostic
+for another. On an unmodified tree the jar changes nothing else -- it was added
+and measured on its own first.
+
+#### The pieces
+
+* `Typer::tag_descriptor` (`crates/typer/src/expand.rs`) decides between
+  `(ty "a.b.C")` and `(syn "a.b.Outer.C")` by asking the `BinaryIndex` whether
+  the class file exists. The full name for the placeholder comes from the class
+  file name scala-rs would give the class, with `/` and `$` read back as dots,
+  so a class nested in a trait or an object is named the way Scala names it.
+* `ScalaRsMacroEngine.synthType` builds the symbol with
+  `internal.newClassSymbol` under `EmptyPackageClass` and then
+  `internal.typeRef` rather than `sym.toType` -- `toType` asks for the type
+  parameters, which completes the symbol, and the point is that it stays
+  uncompleted.
+* `Typer::macro_local_tags` maps the name back to the `Type` when the expansion
+  mentions it, through `materialize::RESOLVED_TYPE`.
+* `placeholder_verdict` refuses to repeat an implementation's `abort` or
+  exception when a placeholder was in play.
+* `c.enclosingPosition` is now `NoPosition` instead of an
+  `UnsupportedOperationException`. Nearly every implementation writes
+  `c.abort(c.enclosingPosition, msg)`, and scala-rs reports a macro's
+  diagnostics at the call site's own span whatever position is named.
+
+#### Why this does not close `mapTo`
+
+`ShapedValue.mapToImpl` does not carry its type argument, it interrogates it:
+`rSym.asClass.isCaseClass`, `rSym.companion`, that companion's `tupled`,
+`rTag.tpe.decls` and each accessor's `typeSignature`, and
+`uTag.tpe <:< typeOf[HList]`. A placeholder answers none of that, and scala-rs
+**cannot** answer it at expansion time either: the members of a class in the
+current run may still be un-inferred, and a case class's companion, `tupled`
+and `unapply` are synthesised members whose types scala-rs has not necessarily
+settled when a `def *` on a table three lines above is being typed.
+
+Two things would have to be built, in order:
+
+1. **A real mirror over the current run's symbols.** Not a message carrying a
+   snapshot -- a snapshot is exactly what cannot be taken -- but *reverse RPC*
+   from the engine to the typer: the engine's symbol for a current-run class
+   completes by asking scala-rs, which forces the same lazy signature the typer
+   would force. That is §4.3's open problem, and it is also what `c.typecheck`
+   and `c.inferImplicitValue` need, so it is one piece of work and not three.
+2. **Rebuilding the trees `mapToImpl` returns.** Its result is a `Block` of
+   quasiquotes containing an anonymous class with `override def`s, `Match` /
+   `CaseDef` / `Bind` patterns, `New` with type arguments and `Super`. The
+   reply rebuilder (`Typer::tree_from_reply`) refuses each of those by name
+   today. This half is mechanical but large, and it is useless without the
+   first half.
+
+Until both exist, `mapTo` stays a refusal that names the reason, and the 31
+gitbucket sites stay as they are. Attempting only the first half would be worse
+than nothing: `mapToImpl` would then run far enough to abort or to build a tree
+from a half-known class.
