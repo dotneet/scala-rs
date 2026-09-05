@@ -601,6 +601,57 @@ impl PickleSupply {
     /// Unlike [`Self::supply_implicit_members`] this is not restricted to
     /// classes outside `scala.*`: it installs nothing itself, and the caller
     /// only asks for a name the class has no member for.
+    /// The names the library gives the parameters of `name` on `class_sym`,
+    /// for the overload that takes `arity` value parameters in total.
+    ///
+    /// A pickled member arrives with its parameter *symbols*; a member the
+    /// hand-written prelude declares carries only types, so a named argument
+    /// on one had nothing to match against and reported "named arguments
+    /// (method parameters not resolved)". This is the missing half, and only
+    /// the names: the types stay the prelude's own, so nothing about how the
+    /// call is typed or emitted changes.
+    ///
+    /// `None` unless exactly one set of names answers -- overloads of the same
+    /// arity that disagree, a parameter nsc named `x$1` (a synthetic the
+    /// source never wrote), and a class with no pickle all decline rather than
+    /// guess.
+    pub fn pickled_param_names(
+        &mut self,
+        bin: &mut BinaryIndex,
+        internal: &str,
+        is_module: bool,
+        name: &str,
+        arity: usize,
+    ) -> Option<Vec<String>> {
+        let full = self.pickled_full_name(bin, internal, is_module)?;
+        let (hits, _errs) = {
+            let mut src = BinSource(bin);
+            self.sigs.lookup(&mut src, &full, is_module, name)
+        };
+        let mut found: Option<Vec<String>> = None;
+        for h in &hits {
+            let ps = sig_value_params(&h.member.ty);
+            if ps.len() != arity {
+                continue;
+            }
+            let names: Vec<String> = ps.iter().map(|p| p.name.clone()).collect();
+            // nsc names a parameter the source did not `x$1`; matching an
+            // argument against that would accept a name no programmer wrote.
+            if names
+                .iter()
+                .any(|n| n.is_empty() || n.starts_with("x$") || n.starts_with("_$"))
+            {
+                return None;
+            }
+            match &found {
+                None => found = Some(names),
+                Some(prev) if *prev == names => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
     pub fn implicit_member_names(
         &mut self,
         st: &SymbolTable,
@@ -4315,6 +4366,21 @@ fn names_class(candidate: &str, full_name: &str) -> bool {
     let last = candidate.rsplit('/').next().unwrap_or(candidate);
     let last = last.strip_suffix('$').unwrap_or(last);
     last == simple || last.rsplit('$').next() == Some(simple)
+}
+
+/// Every value parameter of a pickled member's type, across all its clauses.
+fn sig_value_params(t: &SigType) -> Vec<scala_rs_pickle::sym::Param> {
+    match t {
+        SigType::Poly { result, .. }
+        | SigType::Existential { result, .. }
+        | SigType::Annotated(result) => sig_value_params(result),
+        SigType::Method { params, result, .. } => {
+            let mut v = params.clone();
+            v.extend(sig_value_params(result));
+            v
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// A member's parameters, erased the same way [`erased_param_desc`] erases a

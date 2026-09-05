@@ -493,8 +493,27 @@ impl Typer {
                 alts = self.st.lookup(&name);
             }
             let named = self.probe_named_arg_types(args);
-            if let Some(found) = self.alt_for_named_args(&alts, &named, args.len()) {
+            let found = self.alt_for_named_args(&alts, &named, args.len());
+            // `alt_for_named_args` answers with its first candidate when none
+            // covers the names, so that the call reports one honest "unknown
+            // parameter name". A hand-written prelude alternative is that case
+            // without being that error: its parameters have no name a source
+            // could write, and the library's pickle has the real ones.
+            if let Some(found) = found {
+                if self.ids_cover_named(&found.0, &named) {
+                    return found;
+                }
+                for &a in &alts {
+                    if let Some(ids) = self.prelude_alt_clause(a, args.len(), &named) {
+                        return ids;
+                    }
+                }
                 return found;
+            }
+            for &a in &alts {
+                if let Some(ids) = self.prelude_alt_clause(a, args.len(), &named) {
+                    return ids;
+                }
             }
         }
         // `pkg.Bar(a = 1)`: `rewrite_receiver_apply` deliberately leaves a
@@ -529,11 +548,37 @@ impl Typer {
                 }
                 let named = self.probe_named_arg_types(args);
                 if let Some(found) = self.alt_for_named_args(&alts, &named, args.len()) {
+                    if self.ids_cover_named(&found.0, &named) {
+                        return found;
+                    }
+                    for &a in &alts {
+                        if let Some(ids) = self.prelude_alt_clause(a, args.len(), &named) {
+                            return ids;
+                        }
+                    }
                     return found;
+                }
+                for &a in &alts {
+                    if let Some(ids) = self.prelude_alt_clause(a, args.len(), &named) {
+                        return ids;
+                    }
                 }
             }
         }
-        let ids = self.first_clause_ids(fun);
+        let mut ids = self.first_clause_ids(fun);
+        // A hand-written prelude method has parameter types and either no
+        // parameter symbols or placeholder-named ones; the library's pickle
+        // has the names (`crate::prelude_paramnames`).
+        if !fun.sym.is_none() && !self.named_args_covered_by(&ids, args) {
+            let remaining = match &fun.ty {
+                Type::Method { paramss, .. } => Some(paramss.len()),
+                _ => None,
+            };
+            let alt = self.prelude_clause_for(fun.sym, remaining);
+            if !alt.is_empty() {
+                ids = alt;
+            }
+        }
         // `fun.ty` may already have shed earlier clauses (`f(1)(b = 2)`), so
         // match the clause by length rather than taking the first.
         let repeated = match &fun.ty {
