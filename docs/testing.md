@@ -9,6 +9,15 @@ scala/scala's own corpus (`test/files/{pos,neg,run}`, 5324 programs at tag
 [scala-corpus.md](scala-corpus.md) for the pass rates, the symptom breakdown,
 and what the runner counts as a skip rather than a failure.
 
+`tests/spec_classfiles.sh` is the **specialization ledger**: it compiles each
+of the corpus's 37 `pos/spec-*` tests with real scalac and with scala-rs and
+diffs the two sets of classfile *names*. It exists because accepting
+`@specialized` raises the corpus's `pos` number by far more than it earns, and
+a number that goes up needs a number beside it that cannot. It compares names
+only — nothing is loaded, verified or run — so what it proves is exactly "we do
+not emit the classes scalac emits", which is the thing still missing. See
+[specialization.md](specialization.md).
+
 slick's own test suite (`slick-testkit`) is measured by
 `tests/testkit_measure.sh`; see [slick-testkit.md](slick-testkit.md) for the
 numbers and what they found. `crates/cli/tests/testkit.rs` (fixture prefix
@@ -655,3 +664,30 @@ yet — `Type::TypeMember` carries no prefix, so the two `Representation`s still
 collapse — so what `c4_alias_terminates_with_a_diagnostic` pins is that the
 compiler *answers*, and `scalac_accepts_c4_alias` pins that real scalac
 2.13.16 accepts the file, so the gap is ours and not the code's.
+
+## `tests/classfile_lint.py` — what nothing else was reading
+
+Every check in the list above stops before a method body, or reaches only the
+bodies a program happens to call:
+
+* `Class.forName(initialize = false)` in `tests/slick_subset.sh` parses the
+  file and its constant pool and **does not link**, so no method is verified.
+* `javap -p` parses the constant pool too. It caught two files whose
+  `CONSTANT_Utf8` length had wrapped past 65535 — and it reads a method whose
+  `code_length` is 140713 back without a murmur, because that field is a `u4`.
+* `tests/slick_run.sh` and `tests/conform/` execute code, which is the only
+  thing that verifies a body — of the methods they call.
+
+So an offset that wrapped on its way into the file reached nobody until someone
+ran the method. `tests/classfile_lint.py <dir>…` closes part of that gap: it
+reads `javap -c -p`, which prints every branch target as an absolute offset,
+and reports a branch that leaves its own method (a wrapped offset shows up as a
+negative or absurd target) or a method whose code is 65536 bytes or longer.
+About 3 seconds for slick's 1596 classes, so it runs inside both
+`tests/slick_run.sh` (right after the scala-rs build of slick) and
+`tests/slick_subset.sh` (right after the loader check), printing
+`lint_classes=N lint_problems=M`.
+
+It is a **structural** check and nothing more. It says nothing about types,
+stack depth, or whether a branch target carries a stack map frame — a bad frame
+still needs a JVM to find it.

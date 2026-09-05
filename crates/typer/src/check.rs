@@ -1193,9 +1193,9 @@ impl Typer {
         let mut ids = Vec::new();
         for tp in tparams.iter_mut() {
             let name = tp.name().unwrap_or("_").to_string();
-            let flags = match &tp.kind {
-                TreeKind::TypeDef { mods, .. } => mods.flags,
-                _ => Flags::EMPTY,
+            let (flags, annots) = match &tp.kind {
+                TreeKind::TypeDef { mods, .. } => (mods.flags, mods.annotations.clone()),
+                _ => (Flags::EMPTY, Vec::new()),
             };
             let id = if tp.sym.is_none() {
                 let id = self.st.alloc(&name, owner, SymKind::TypeParam, flags, "");
@@ -1206,6 +1206,10 @@ impl Typer {
             };
             self.st.get_mut(id).flags = self.st.get(id).flags.with(flags);
             self.st.get_mut(id).ty = Type::TypeParam(id);
+            // `class C[@specialized(Int, Long) T]`: record what the annotation
+            // selects. Nothing reads it yet -- specialization is a phase after
+            // the typer, and this subset does not run it.
+            self.st.record_specialization(id, &annots);
             if name != "_" {
                 self.st.enter_in_current(&name, id);
             }
@@ -1908,6 +1912,10 @@ impl Typer {
                 self.st.get_mut(id).private_within = mods.private_within.clone();
                 self.st.get_mut(id).annotations = annots;
                 self.st.get_mut(id).abstract_override = abs_over;
+                // `@unspecialized def f` opts one member out of its owner's
+                // specialization. Recorded, not yet acted on.
+                let annots = self.st.get(id).annotations.clone();
+                self.st.record_specialization(id, &annots);
                 self.st.enter_in_current(name, id);
                 tree.sym = id;
             }

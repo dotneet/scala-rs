@@ -22,11 +22,12 @@ pub struct ParseResult {
 pub struct ParseOptions {
     /// `-Xsource:3` / `-Xsource:3-cross`: accept `A & B` as a compound type.
     pub source3: bool,
-    /// nsc `-no-specialization`, "Ignore @specialize annotations." Without it
-    /// `@specialized` is a diagnostic here, because this subset has no
-    /// specialisation phase and would silently emit a class without the
-    /// `$mc*$sp` members callers link against. With it, nsc itself ignores the
-    /// annotation, so accepting and dropping it is what nsc does.
+    /// nsc `-no-specialization`, "Ignore @specialize annotations." Under it
+    /// `@specialized` / `@unspecialized` are dropped from the tree here, which
+    /// is what the flag means; without it they are kept and recorded on the
+    /// symbol (`crate::specialization`). Either way this subset emits no
+    /// `$mc*$sp` members — `tests/spec_classfiles.sh` is the ledger that says
+    /// how far short of nsc that leaves us.
     pub no_specialization: bool,
     /// `-Ykind-projector`: accept kind-projector's `*` placeholder and
     /// `λ` / `Lambda` type lambdas, desugaring them to structural type
@@ -56,14 +57,9 @@ pub fn parse_source_opts(
 
 /// Compiler annotations this subset does not implement. User-defined
 /// `StaticAnnotation` classes (`@Ann(foo)`) are accepted so we can pickle them.
-///
-/// `no_specialization` is nsc's `-no-specialization`: under it nsc ignores
-/// `@specialized`/`@unspecialized` outright, so dropping them here is not a
-/// stub but the documented behaviour of that flag.
-fn annotation_compiler_unsupported(path: &str, no_specialization: bool) -> bool {
+fn annotation_compiler_unsupported(path: &str) -> bool {
     let simple = path.rsplit('.').next().unwrap_or(path);
     match simple {
-        "specialized" | "unspecialized" => !no_specialization,
         // `@elidable(level)` elides a call only when `level < -Xelide-below`,
         // and nsc's default for that setting is `elidable.MINIMUM`
         // (`Int.MinValue`), which no level is below. This subset has no
@@ -75,8 +71,8 @@ fn annotation_compiler_unsupported(path: &str, no_specialization: bool) -> bool 
     }
 }
 
-fn annotation_supported(path: &str, no_specialization: bool) -> bool {
-    !annotation_compiler_unsupported(path, no_specialization)
+fn annotation_supported(path: &str) -> bool {
+    !annotation_compiler_unsupported(path)
 }
 
 /// XML attribute: unprefixed `b={e}` or prefixed `p:b={e}`.
@@ -102,12 +98,12 @@ struct Parser<'a> {
     /// introduces (nsc `freshTermName`).
     catch_id: u32,
     opts: ParseOptions,
-    /// Names `@specialized` / `@unspecialized` were renamed to by an import
-    /// in this file (`import scala.{specialized => sp}`). The check in
-    /// `parse_annotation` only sees the name written at the use site, so
-    /// without this the alias slipped past the diagnostic the spelled-out
-    /// name gets.
-    specialization_aliases: std::collections::HashSet<String>,
+    /// Names `@specialized` / `@unspecialized` were renamed to by an import in
+    /// this file (`import scala.{specialized => sp}`), mapped to the name they
+    /// stand for. `parse_annotation` only sees the name written at the use
+    /// site, so without this the alias is not recognised as specialization at
+    /// all.
+    specialization_aliases: std::collections::HashMap<String, &'static str>,
     /// nsc `Location.InBlock`: the next `parse_expr1` is a *block statement*,
     /// so a function literal there takes the rest of the block as its body
     /// (`{ x => val n = 1; n }`). Consumed by `parse_expr1`, so nested
@@ -135,7 +131,7 @@ impl<'a> Parser<'a> {
             placeholder_id: 0,
             catch_id: 0,
             opts: ParseOptions::default(),
-            specialization_aliases: std::collections::HashSet::new(),
+            specialization_aliases: std::collections::HashMap::new(),
             in_block: false,
             kp_counter: 0,
             kp_lambdas: 0,
@@ -897,9 +893,25 @@ impl<'a> Parser<'a> {
             self.parse_simple_expr()
         };
         let path = annot.annotation_path();
-        let renamed_specialized =
-            !self.opts.no_specialization && self.specialization_aliases.contains(&path);
-        if !renamed_specialized && annotation_supported(&path, self.opts.no_specialization) {
+        // `@specialized` / `@unspecialized`, possibly under an import rename.
+        // The name written at the use site is normalised to the library's, so
+        // everything downstream can match on one spelling.
+        let canonical = self
+            .specialization_aliases
+            .get(&path)
+            .copied()
+            .or_else(|| crate::specialization::canonical_specialization_name(&path));
+        if let Some(canonical) = canonical {
+            if self.opts.no_specialization {
+                // nsc's `-no-specialization` is *ignore the annotation*, so the
+                // tree does not keep it and no symbol records it.
+                return None;
+            }
+            let mut annot = annot;
+            crate::specialization::rename_head(&mut annot, canonical);
+            return Some(annot);
+        }
+        if annotation_supported(&path) {
             return Some(annot);
         }
         let shown = if path.is_empty() {
@@ -911,17 +923,21 @@ impl<'a> Parser<'a> {
         None
     }
 
-    /// Record `import scala.{specialized => sp}` so `@sp` is diagnosed the
-    /// same way `@specialized` is. Only the two names, and only when they come
-    /// from `scala` / `scala.annotation`, so a user type that happens to be
-    /// called `specialized` is unaffected.
+    /// Record `import scala.{specialized => sp}` so `@sp` is read as
+    /// `@specialized`. Only the two names, and only when they come from
+    /// `scala` / `scala.annotation`, so a user type that happens to be called
+    /// `specialized` is unaffected.
     fn note_specialization_alias(&mut self, qual: &str, name: &str, rename: &str) {
         let from_scala = matches!(
             qual,
             "scala" | "scala.annotation" | "_root_.scala" | "_root_.scala.annotation"
         );
-        if from_scala && matches!(name, "specialized" | "unspecialized") && rename != "_" {
-            self.specialization_aliases.insert(rename.to_string());
+        if !from_scala || rename == "_" {
+            return;
+        }
+        if let Some(canonical) = crate::specialization::canonical_specialization_name(name) {
+            self.specialization_aliases
+                .insert(rename.to_string(), canonical);
         }
     }
 

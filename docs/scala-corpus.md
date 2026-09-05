@@ -2,26 +2,40 @@
 
 ## Why `pos` does not pass `-no-specialization`
 
-70 of `pos`'s 534 failures are `unimplemented syntax: annotation specialized`,
-and `-no-specialization` would turn all of them green. The corpus does not pass
-it, on purpose.
+*Superseded in part: `@specialized` is now accepted and recorded rather than
+rejected (stage 1 of [`docs/specialization.md`](specialization.md)), so the
+parse error this section is about no longer happens. The reasoning is kept
+because it is why the corpus still does not pass the flag, and because the
+numbers below are what the "before" side of that change was measured against.*
+
+70 of `pos`'s 534 failures were `unimplemented syntax: annotation specialized`,
+and `-no-specialization` would have turned all of them green. The corpus does
+not pass it, on purpose.
 
 `-no-specialization` is nsc's own flag, and it means *ignore the annotation* —
 not *implement specialization*. nsc implements it: `@specialized` there means
 `Foo$mcI$sp` classes get emitted and the ABI changes. Passing the flag here
 would count "we ignored what the test was testing" as a pass.
 
-`tests/cats_measure.sh` and `tests/scalalib_measure.sh` do pass it, and that is
+`tests/cats_measure.sh` and `tests/scalalib_measure.sh` do pass it, and that was
 also on purpose: those two ask "where is type checking", a single parse error
-aborts the whole run, and both codebases annotate everywhere. Without the flag
-cats reports 71 errors and the library reports 84 — numbers that mean "nothing
-was typechecked", not "almost nothing is wrong". The flag buys a meaningful
+aborted the whole run, and both codebases annotate everywhere. Without the flag
+cats reported 71 errors and the library 84 — numbers that mean "nothing was
+typechecked", not "almost nothing is wrong". The flag bought a meaningful
 type-checking number at the cost of an ABI that differs from nsc's, which is
 the right trade for a progress measure and the wrong one for a conformance
 score.
 
-So: 70 `pos` tests stay red until specialization is actually implemented. That
-is the honest reading.
+**That cost is no longer being paid for anything.** With the annotation
+accepted, both codebases report the same number with the flag and without it
+(cats 907, `src/library` 1644), because the flag's only remaining effect is to
+drop an annotation nothing acts on. See the stage-1 section of
+`docs/specialization.md`; the two scripts still pass it, but no longer need to.
+
+What stays true is the part about the corpus: accepting the annotation is not
+implementing the phase. `tests/spec_classfiles.sh` is the ledger that says how
+far short we are — scalac emits 700 `$sp` classes over `pos/spec-*` where we
+emit none.
 
 Where this compiler stands on the tests scalac is developed against:
 `test/files/{pos,neg,run}` from [scala/scala](https://github.com/scala/scala).

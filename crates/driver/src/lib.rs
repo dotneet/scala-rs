@@ -408,7 +408,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         }
         for u in &units {
             let src_name = source_file_name(&sources[u.file_index]);
-            writer.push(emit_opts(
+            let mut classes = emit_opts(
                 &u.tree,
                 st,
                 src_name,
@@ -421,7 +421,29 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                     class_by_name: Some(std::rc::Rc::clone(&class_by_name)),
                     binary_parents: binary_parents.clone(),
                 },
-            ));
+            );
+            // A class that exceeds a class file format limit is reported and
+            // not written: the file would either be rejected by the loader or,
+            // for the offsets that are only `u16`, quietly wrong. nsc reports
+            // it the same way and writes nothing for the class either.
+            classes.retain(|c| {
+                if c.format_errors.is_empty() {
+                    return true;
+                }
+                let name = c.internal_name.replace('/', ".");
+                for m in &c.format_errors {
+                    diags.push(
+                        Diagnostic::error(
+                            u.file_index,
+                            Span::DUMMY,
+                            format!("Error while emitting {name}"),
+                        )
+                        .note(m.clone()),
+                    );
+                }
+                false
+            });
+            writer.push(classes);
         }
         writer.finish()
     };
@@ -920,10 +942,12 @@ mod tests {
             EmittedClass {
                 internal_name: "Main$".into(),
                 bytes: vec![0xCA, 0xFE],
+                format_errors: Vec::new(),
             },
             EmittedClass {
                 internal_name: "foo/Bar".into(),
                 bytes: vec![0xBA, 0xBE],
+                format_errors: Vec::new(),
             },
         ];
         write_emitted(&emitted, &tmp.0).unwrap();

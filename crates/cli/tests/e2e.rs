@@ -3810,12 +3810,20 @@ fn scalalib_syntax_fixture() {
     dual_run_fixture("scalalib_syntax");
 }
 
-/// `@specialized` stays a diagnostic without `-no-specialization` -- including
-/// when an import renamed it, which used to slip past the check.
+/// `@specialized` used to be a diagnostic without `-no-specialization`. It is
+/// now accepted and recorded on the type parameter's symbol (stage 1 of
+/// docs/specialization.md), so the same fixture compiles and runs with or
+/// without the flag -- including the `@sp` spelling an import rename produces,
+/// which this fixture also writes. What is still missing is the phase: no
+/// `Cell$mcI$sp` is emitted, and `tests/spec_classfiles.sh` measures that gap
+/// against real scalac.
+///
+/// (`scalalib_spec_bad.scala` existed only to assert the diagnostic for the
+/// renamed spelling. There is no diagnostic to assert any more, and the alias
+/// is covered here and by `sp_alias`, so the fixture is gone.)
 #[test]
-fn scalalib_specialized_is_error_without_the_flag() {
-    compile_fails("scalalib_spec", "annotation specialized");
-    compile_fails("scalalib_spec_bad", "annotation sp");
+fn scalalib_specialized_is_accepted_without_the_flag() {
+    dual_run_fixture("scalalib_spec");
 }
 
 /// With nsc's `-no-specialization` the annotations are ignored, as nsc ignores
@@ -4098,4 +4106,32 @@ fn ct_classtag_bad_is_rejected() {
         "ct_classtag_bad",
         "cannot find class tag for element type T",
     );
+}
+
+// --------------------------------------------------- @specialized (stage 1)
+
+/// `@specialized` and `@unspecialized` are accepted and recorded on the
+/// symbol; the `specialize` phase is not implemented, so nothing `$mc*$sp`
+/// comes out. The program runs, and it computes what the same program without
+/// the annotation computes -- which is the whole reason accepting it is sound
+/// while the phase is missing. `tests/spec_classfiles.sh` is the ledger that
+/// keeps the gap visible; see docs/specialization.md.
+#[test]
+fn sp_annot_fixture() {
+    check("sp_annot");
+    dual_run_fixture("sp_annot");
+}
+
+/// `import scala.{specialized => sp}` is how cats and the collections spell
+/// it. Library mode only: the private runtime has no `scala.specialized` for
+/// the import to name.
+#[test]
+fn sp_alias_fixture() {
+    dual_run_fixture("sp_alias");
+}
+
+/// The annotation is a performance hint and must not soften type checking.
+#[test]
+fn sp_annot_bad_is_rejected() {
+    compile_fails("sp_annot_bad", "type mismatch");
 }
