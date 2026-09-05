@@ -35,7 +35,7 @@ pub(crate) type OpenView = (SymbolId, Type, Vec<(SymbolId, Type)>);
 /// Hard cap on nested derivations, on top of the divergence check.
 pub(crate) const MAX_IMPLICIT_DEPTH: usize = 8;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ImplicitSearch {
     Found(SymbolId),
     None,
@@ -55,6 +55,181 @@ pub(crate) struct ImplicitFit {
     pub(crate) targs: Vec<Type>,
     /// Call-site type parameters the search pinned down.
     pub(crate) undet: Vec<(SymbolId, Type)>,
+}
+
+/// Memo for [`Typer::search_implicit_undet`], keyed by `(wanted type,
+/// undetermined call-site parameters, depth)`.
+///
+/// Without it the search is exponential in the number of candidates: a
+/// derivation rule's own implicit clauses are resolved by a fresh search, and
+/// the same wanted type is reached again through every path that leads to it,
+/// up to [`MAX_IMPLICIT_DEPTH`] times over. Admitting one more cake's worth of
+/// implicits into scope took gitbucket's 213 hand-written sources from 14
+/// seconds to over 13 minutes, with `sample` putting every one of 5591 samples
+/// in a single `search_implicit_at` -> `implicit_fit_at` -> `search_implicit_at`
+/// stack (`docs/gitbucket.md`).
+///
+/// **Why that key is enough.** The whole search runs under `&self`, so
+/// `SymbolTable::scopes`, `this_class` and `parent_ctor_scope` -- everything
+/// [`Typer::implicits_in_scope`] and [`Typer::companion_implicits`] read --
+/// cannot change while it is in flight. The memo is therefore created when the
+/// outermost search starts and thrown away when it returns, which makes the
+/// context it was computed in a constant rather than part of the key. `depth`
+/// rides on the entry instead of in the key: it only decides anything where
+/// [`Typer::implicit_fit_at`] actually stopped offering derivation rules
+/// because of [`MAX_IMPLICIT_DEPTH`], so an entry records whether that
+/// happened and is reused at a shallower depth when it did not
+/// (see `MemoEntry::depth`).
+///
+/// The one piece of mutable state a search *does* read is
+/// [`Typer::open_implicits`], nsc's `openImplicits`, which
+/// [`Typer::implicit_diverges`] consults to cut off a diverging expansion.
+/// That stack is not in the key, so an entry is only usable where it cannot
+/// matter: [`Self::probe`] records, as a 64-bit signature over `SymbolId`, the
+/// candidates a subtree asked the divergence check about, and an entry is both
+/// stored and reused only when that signature is disjoint from the signature
+/// of the open stack in force. `implicit_diverges` fires only when the *same*
+/// symbol is already open, so a disjoint signature means every divergence
+/// decision inside the subtree was made from the subtree's own pushes, which
+/// are replayed identically wherever the entry is reused. A signature
+/// collision can only cost a cache miss.
+///
+/// The two other cells a search writes are unaffected by a skipped
+/// recomputation: `diverged_implicit` keeps the *first* divergence and is
+/// monotone within one top-level search, and `implicit_via_module` was already
+/// filled by the run that stored the entry (it is keyed by member, never
+/// cleared, and only ever read for the witness that search returned).
+#[derive(Default)]
+pub(crate) struct ImplicitMemo {
+    /// Re-entrancy count of [`Typer::search_implicit_undet`]. The memo is
+    /// alive while this is non-zero and cleared when it falls back to zero.
+    depth: usize,
+    /// [`Typer::implicits_in_scope`]'s answer for the scope the outermost
+    /// search started in. Recomputing it walks every enclosing scope, every
+    /// base class of `this` and the enclosing package object, once per node.
+    in_scope: Option<std::rc::Rc<Vec<SymbolId>>>,
+    entries: rustc_hash::FxHashMap<u64, Vec<MemoEntry>>,
+    /// nsc's `improvesCache`: [`Typer::strictly_more_specific`] by candidate
+    /// pair. [`Typer::most_specific`] compares every pair of the candidates
+    /// that fitted, so it is quadratic in a scope's size, and it runs at every
+    /// node of the derivation -- over the same pairs each time. Each answer is
+    /// four `is_sub_type` calls over types rebuilt from the candidate's
+    /// signature.
+    improves: rustc_hash::FxHashMap<(u32, u32), bool>,
+    /// Divergence-check signature of the subtree being evaluated right now.
+    probe: u64,
+    /// Whether that subtree was stopped anywhere by [`MAX_IMPLICIT_DEPTH`].
+    cut: bool,
+}
+
+struct MemoEntry {
+    pt: Type,
+    undet: Vec<SymbolId>,
+    probe: u64,
+    /// The depth this was answered at, and whether the depth limit had a say.
+    /// A subtree that never reached the limit gives the same answer at every
+    /// *smaller* depth, because every decision in it is depth-independent
+    /// until the limit bites; at a larger one it could be cut off sooner, so
+    /// the entry does not travel upwards. Without this the same wanted type is
+    /// re-derived once per depth it is reached at, up to eight times over.
+    depth: usize,
+    cut: bool,
+    result: ImplicitSearch,
+    bindings: Vec<(SymbolId, Type)>,
+}
+
+/// One bit per `SymbolId`, folded modulo 64.
+fn sym_bit(id: SymbolId) -> u64 {
+    1u64 << (id.0 % 64)
+}
+
+/// Structural hash of a type, for the memo's bucket key only: an entry is
+/// still compared with `PartialEq` before it is used, so a variant this misses
+/// costs a lookup, never a wrong answer. `Type` cannot derive `Hash` because
+/// `Lit` holds `f64`.
+fn hash_type<H: std::hash::Hasher>(ty: &Type, h: &mut H) {
+    use std::hash::Hash;
+    std::mem::discriminant(ty).hash(h);
+    let all = |ts: &[Type], h: &mut H| {
+        ts.len().hash(h);
+        for t in ts {
+            hash_type(t, h);
+        }
+    };
+    match ty {
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            hash_type(t, h)
+        }
+        Type::Tuple(ts) | Type::Overload(ts) => all(ts, h),
+        Type::Function { params, ret } => {
+            all(params, h);
+            hash_type(ret, h);
+        }
+        Type::Named { name, args } => {
+            name.hash(h);
+            all(args, h);
+        }
+        Type::Class { sym, args } => {
+            sym.0.hash(h);
+            all(args, h);
+        }
+        Type::Applied { ctor, args } => {
+            hash_type(ctor, h);
+            all(args, h);
+        }
+        Type::Method { paramss, ret } => {
+            paramss.len().hash(h);
+            for c in paramss {
+                all(c, h);
+            }
+            hash_type(ret, h);
+        }
+        Type::ModuleRef(s) | Type::TypeParam(s) | Type::TypeMember(s) | Type::ThisType(s) => {
+            s.0.hash(h)
+        }
+        Type::SingleType { prefix, sym } => {
+            hash_type(prefix, h);
+            sym.0.hash(h);
+        }
+        Type::BoundedWildcard { lo, hi } => {
+            for b in [lo, hi].into_iter().flatten() {
+                hash_type(b, h);
+            }
+        }
+        Type::Refined { parents, .. } => all(parents, h),
+        // Constants and the nullary variants are settled by the discriminant
+        // and the exact comparison that follows.
+        _ => {}
+    }
+}
+
+fn memo_key(pt: &Type, undet: &[SymbolId]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    hash_type(pt, &mut h);
+    for u in undet {
+        u.0.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Decrements the memo's re-entrancy count, and clears it when the outermost
+/// search returns. A guard rather than a plain decrement because the callers
+/// have several early returns.
+struct MemoLive<'a>(&'a Typer);
+
+impl Drop for MemoLive<'_> {
+    fn drop(&mut self) {
+        let mut m = self.0.implicit_memo.borrow_mut();
+        m.depth -= 1;
+        if m.depth == 0 {
+            m.entries.clear();
+            m.improves.clear();
+            m.in_scope = None;
+            m.probe = 0;
+            m.cut = false;
+        }
+    }
 }
 
 /// Number of nodes in a type, nsc's `complexity`.
@@ -94,7 +269,30 @@ fn dominates(typer: &Typer, new_pt: &Type, open_pt: &Type) -> bool {
 }
 
 impl Typer {
+    /// The candidates an unqualified reference at this point can reach.
+    ///
+    /// Answered from [`ImplicitMemo`] while a search is running: the walk
+    /// below covers every enclosing scope, every base class of `this` and the
+    /// enclosing package object, and it was being redone at every node of the
+    /// derivation tree even though nothing it reads can change under `&self`.
     pub(crate) fn implicits_in_scope(&self) -> Vec<SymbolId> {
+        let cached = {
+            let m = self.implicit_memo.borrow();
+            (m.depth > 0).then(|| m.in_scope.clone())
+        };
+        match cached {
+            Some(Some(hit)) => return hit.as_ref().clone(),
+            Some(None) => {
+                let out = self.implicits_in_scope_uncached();
+                self.implicit_memo.borrow_mut().in_scope = Some(std::rc::Rc::new(out.clone()));
+                return out;
+            }
+            None => {}
+        }
+        self.implicits_in_scope_uncached()
+    }
+
+    fn implicits_in_scope_uncached(&self) -> Vec<SymbolId> {
         let mut out = Vec::new();
         let mut seen = rustc_hash::FxHashSet::default();
         // SLS 7.2: a candidate is an identifier "that can be accessed ...
@@ -639,7 +837,13 @@ impl Typer {
                     return self.implicit_solve(id, ret, pt, undet);
                 }
                 // A derivation rule: usable when its own implicits resolve.
-                if depth >= MAX_IMPLICIT_DEPTH || !self.only_implicit_clauses(id) {
+                if depth >= MAX_IMPLICIT_DEPTH {
+                    // The enclosing memo entry was decided by the depth limit,
+                    // so it does not travel to a shallower search.
+                    self.implicit_memo.borrow_mut().cut = true;
+                    return None;
+                }
+                if !self.only_implicit_clauses(id) {
                     return None;
                 }
                 let Some(fit) = self.implicit_solve(id, ret, pt, undet) else {
@@ -718,6 +922,10 @@ impl Typer {
     /// expanded for a target with the same head symbol and no smaller
     /// complexity (`implicit def loop[A](implicit a: A): A`).
     fn implicit_diverges(&self, id: SymbolId, pt: &Type) -> bool {
+        // Whatever this answers is an answer about `id` against the open
+        // stack, so the enclosing memo entry is only reusable where `id` is
+        // not open. See [`ImplicitMemo`].
+        self.implicit_memo.borrow_mut().probe |= sym_bit(id);
         let open = self.open_implicits.borrow();
         let hit = open
             .iter()
@@ -1360,6 +1568,107 @@ impl Typer {
         undet: &[SymbolId],
         depth: usize,
     ) -> (ImplicitSearch, Vec<(SymbolId, Type)>) {
+        let key = memo_key(pt, undet);
+        let open = self.open_implicit_mask();
+        if let Some(hit) = self.memo_lookup(key, pt, undet, depth, open) {
+            return hit;
+        }
+        // The memo lives from here until the outermost implicit operation
+        // returns; see [`ImplicitMemo`] for why the context it was computed in
+        // does not have to be part of the key.
+        let live = self.memo_scope();
+        let (outer_probe, outer_cut) = {
+            let mut m = self.implicit_memo.borrow_mut();
+            (
+                std::mem::replace(&mut m.probe, 0),
+                std::mem::take(&mut m.cut),
+            )
+        };
+        let out = self.search_implicit_uncached(pt, undet, depth);
+        let (probe, cut) = {
+            let mut m = self.implicit_memo.borrow_mut();
+            let (p, c) = (m.probe, m.cut);
+            m.probe = outer_probe | p;
+            m.cut = outer_cut | c;
+            (p, c)
+        };
+        if probe & open == 0 {
+            let mut m = self.implicit_memo.borrow_mut();
+            m.entries.entry(key).or_default().push(MemoEntry {
+                pt: pt.clone(),
+                undet: undet.to_vec(),
+                probe,
+                depth,
+                cut,
+                result: out.0.clone(),
+                bindings: out.1.clone(),
+            });
+        }
+        drop(live);
+        out
+    }
+
+    /// Keeps [`ImplicitMemo`] alive for the whole of one `&self` implicit
+    /// operation, and clears it when that operation returns.
+    ///
+    /// Every entry point that runs more than one search has to hold one.
+    /// [`Self::search_conversion`] tries every candidate in scope and
+    /// [`Self::conv_targs`] runs a search per candidate, so a memo that spanned
+    /// only one search was thrown away several hundred times per conversion
+    /// and answered nothing: `sample` had a single `search_conversion` on the
+    /// stack for twelve unbroken seconds.
+    ///
+    /// `&self` is what makes the memo sound -- see [`ImplicitMemo`] -- so a
+    /// caller that needs `&mut self` cannot hold one, and the borrow checker
+    /// is what says so.
+    fn memo_scope(&self) -> MemoLive<'_> {
+        self.implicit_memo.borrow_mut().depth += 1;
+        MemoLive(self)
+    }
+
+    /// The candidates the open-implicit stack could make
+    /// [`Self::implicit_diverges`] answer `true` for, as a signature.
+    fn open_implicit_mask(&self) -> u64 {
+        self.open_implicits
+            .borrow()
+            .iter()
+            .fold(0u64, |m, (id, _)| m | sym_bit(*id))
+    }
+
+    /// A hit also hands the entry's `probe` and `cut` to whatever search is
+    /// running, exactly as recomputing it would have: the caller is about to
+    /// be memoized itself, and an answer it took from here is part of *its*
+    /// subtree. Without that, a search whose only depth-limited or
+    /// divergence-checked step came from the memo would be recorded as
+    /// depending on neither, and then reused where it does not hold.
+    fn memo_lookup(
+        &self,
+        key: u64,
+        pt: &Type,
+        undet: &[SymbolId],
+        depth: usize,
+        open: u64,
+    ) -> Option<(ImplicitSearch, Vec<(SymbolId, Type)>)> {
+        let mut m = self.implicit_memo.borrow_mut();
+        let e = m.entries.get(&key)?.iter().find(|e| {
+            (e.depth == depth || (!e.cut && e.depth > depth))
+                && e.probe & open == 0
+                && e.undet.as_slice() == undet
+                && e.pt == *pt
+        })?;
+        let out = (e.result.clone(), e.bindings.clone());
+        let (probe, cut) = (e.probe, e.cut);
+        m.probe |= probe;
+        m.cut |= cut;
+        Some(out)
+    }
+
+    fn search_implicit_uncached(
+        &self,
+        pt: &Type,
+        undet: &[SymbolId],
+        depth: usize,
+    ) -> (ImplicitSearch, Vec<(SymbolId, Type)>) {
         let mut fits: Vec<(SymbolId, ImplicitFit)> = self
             .implicits_in_scope()
             .into_iter()
@@ -1428,6 +1737,7 @@ impl Typer {
     }
 
     pub(crate) fn search_conversion(&self, from: &Type, to: &Type) -> ImplicitSearch {
+        let _live = self.memo_scope();
         let local: Vec<SymbolId> = self
             .implicits_in_scope()
             .into_iter()
@@ -1470,6 +1780,7 @@ impl Typer {
         if open.is_empty() || from.is_no_type() || from.is_error() {
             return None;
         }
+        let _live = self.memo_scope();
         let mut cands: Vec<SymbolId> = self.implicits_in_scope();
         cands.extend(self.companion_implicits(to));
         cands.extend(self.companion_implicits(from));
@@ -1646,6 +1957,24 @@ impl Typer {
         if a == b {
             return false;
         }
+        let key = (a.0, b.0);
+        {
+            let m = self.implicit_memo.borrow();
+            if m.depth > 0 {
+                if let Some(&hit) = m.improves.get(&key) {
+                    return hit;
+                }
+            }
+        }
+        let out = self.strictly_more_specific_uncached(a, b);
+        let mut m = self.implicit_memo.borrow_mut();
+        if m.depth > 0 {
+            m.improves.insert(key, out);
+        }
+        out
+    }
+
+    fn strictly_more_specific_uncached(&self, a: SymbolId, b: SymbolId) -> bool {
         let spec =
             i32::from(self.is_as_specific_type(a, b)) - i32::from(self.is_as_specific_type(b, a));
         let sub = i32::from(self.is_as_specific_origin(a, b))
