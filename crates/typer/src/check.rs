@@ -8704,12 +8704,79 @@ impl Typer {
                 )
             })
             .collect();
-        let found = if terms.is_empty() { found } else { terms };
+        let found = if terms.is_empty() {
+            // Nothing in the term namespace under this name, and a class of it
+            // is in scope: its companion may simply not have been read yet.
+            // See [`Self::expose_class_companion`].
+            self.expose_class_companion(&found, &name, tree.span)
+        } else {
+            terms
+        };
         if self.qualify_term_import(tree, &name, &found) {
             self.type_select(tree, pt);
             return;
         }
         self.bind_found(tree, found, pt);
+    }
+
+    /// The companion object of a class that is in scope under this name, read
+    /// from its class file if nothing has read it yet.
+    ///
+    /// A class file's companion is a second class file (`p/C.class` and
+    /// `p/C$.class`), and it is installed only when something asks for that
+    /// name. `import p._` over a *package* asks for no name in particular:
+    /// `import_wildcard` walks the package's member list and enters what is
+    /// already there, which for a `-cp` package is the classes alone. Once the
+    /// class `C` is in the current scope, `expose_unqualified` returns at its
+    /// first line -- the name resolves -- so the companion is never read, and
+    /// `C[Arg]` in *term* position bound the class. The `Module[T]` →
+    /// `Module.apply[T]` redirect needs a module symbol and got a class, so
+    /// slick's `TableQuery[Issues]` came back as the class's own type with `E`
+    /// unsubstituted (`value label is not a member of E`). Writing the
+    /// companion's members behind another object -- slick's `api` re-exports
+    /// `val TableQuery = lifted.TableQuery`, which is a *term* and so is
+    /// entered by the same walk -- is what hid this.
+    ///
+    /// Returns the modules when there are any, so term position binds them
+    /// (SLS 2: the two namespaces are separate, and this is term position);
+    /// otherwise the classes it was given, unchanged.
+    fn expose_class_companion(
+        &mut self,
+        found: &[SymbolId],
+        name: &str,
+        span: Span,
+    ) -> Vec<SymbolId> {
+        let classes: Vec<SymbolId> = found
+            .iter()
+            .copied()
+            .filter(|&s| self.st.get(s).kind == SymKind::Class)
+            .collect();
+        if classes.is_empty() {
+            return found.to_vec();
+        }
+        let mut modules = Vec::new();
+        for cls in classes {
+            if self.st.companion_module(cls).is_none() {
+                let jvm = self.st.get(cls).jvm_name.clone();
+                if jvm.is_empty() || jvm.starts_with('[') {
+                    continue;
+                }
+                let owner = self.st.get(cls).owner;
+                self.load_binary_into(&format!("{jvm}$"), owner, span, true);
+            }
+            if let Some(m) = self.st.companion_module(cls) {
+                if !modules.contains(&m) {
+                    modules.push(m);
+                }
+            }
+        }
+        if modules.is_empty() {
+            return found.to_vec();
+        }
+        for &m in &modules {
+            self.st.enter_in_current(name, m);
+        }
+        modules
     }
 
     /// An inherited member's type, read through the class the unqualified
@@ -18672,6 +18739,9 @@ impl Typer {
             if a_ty.is_no_type() || a_ty.is_error() || self.arg_score(&a_ty, &p).is_some() {
                 continue;
             }
+            if self.open_param_already_fits(&a_ty, &p, &open) {
+                continue;
+            }
             let Some((id, solved, _)) = self.search_conversion_open(&a_ty, &p, &open) else {
                 continue;
             };
@@ -18698,6 +18768,48 @@ impl Typer {
             if let Some(t) = arg_tys.get_mut(i) {
                 *t = solved;
             }
+        }
+    }
+
+    /// nsc's `isCompatible` with the callee's own type parameters still
+    /// undetermined: does the argument fill this parameter *as it is*, for
+    /// some instantiation of the parameters the call has not settled yet?
+    ///
+    /// `arg_score` cannot answer that -- it reads an unsolved type parameter
+    /// as a rigid type -- so a call whose parameter mentions one looked
+    /// inapplicable and `apply_open_views` reached for a view. The view then
+    /// wrapped an argument that already conformed, and the wrapping is what
+    /// the call's inference read afterwards:
+    ///
+    /// ```scala
+    /// class Rep[T]; class Lit[T](v: T) extends Rep[T]
+    /// implicit def toRep[T](v: T): Rep[T] = new Lit[T](v)
+    /// def ===[P2, R](e: Rep[P2])(implicit om: OM[B1, P2, R]): String
+    /// col === new Lit[Long](9L)
+    /// ```
+    ///
+    /// `Lit[Long]` *is* a `Rep[Long]`, so nsc solves `P2 = Long` and finds
+    /// `OM[Long, Long, Boolean]`. We converted it to a `Rep[Lit[Long]]` first
+    /// and then asked for `OM[Long, Lit[Long], R]`, which nothing supplies --
+    /// and, being the wrong answer rather than a missing one, it took every
+    /// implicit downstream of it with it.
+    ///
+    /// The argument is read at the parameter's own class first
+    /// (`align_arg_to_param`), because `unify_one` zips type arguments
+    /// positionally and has no symbol table to walk base types with.
+    fn open_param_already_fits(&self, arg: &Type, param: &Type, open: &[SymbolId]) -> bool {
+        let mentioned: Vec<SymbolId> = open
+            .iter()
+            .copied()
+            .filter(|tp| type_mentions_tparam(param, *tp))
+            .collect();
+        if mentioned.is_empty() {
+            return false;
+        }
+        let aligned = self.align_arg_to_param(param, arg);
+        match self.solve_open_from_arg(&aligned, param, &mentioned) {
+            Some(solved) => self.arg_score(arg, &solved).is_some(),
+            None => false,
         }
     }
 
