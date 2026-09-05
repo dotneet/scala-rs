@@ -1866,6 +1866,7 @@ impl<'a> Gen<'a> {
                 let cn = class_name.clone();
                 let target = have.clone();
                 let name = enc.clone();
+                let target_ret = have[have.find(')').map(|i| i + 1).unwrap_or(0)..].to_string();
                 b.add_code(
                     ACC_PUBLIC | ACC_BRIDGE | ACC_SYNTHETIC,
                     &enc,
@@ -1880,7 +1881,9 @@ impl<'a> Gen<'a> {
                             }
                         }
                         asm.invokevirtual(&cn, &name, &target);
-                        asm.areturn();
+                        if !emit_forwarded_nothing(asm, &target_ret) {
+                            asm.areturn();
+                        }
                     },
                 );
             }
@@ -1946,13 +1949,14 @@ impl<'a> Gen<'a> {
                 BridgeKind::Static { .. } => ACC_PUBLIC,
             };
             b.add_code(access, &br.name, &br.desc, locals.max(1), move |asm| {
-                match &kind {
+                let target_ret = match &kind {
                     BridgeKind::Narrow(target) => {
                         asm.aload(0);
                         for (slot, sort) in &loads {
                             load(asm, *slot, *sort);
                         }
                         asm.invokevirtual(&cn, &name, target);
+                        target.clone()
                     }
                     BridgeKind::Static {
                         iface,
@@ -1964,9 +1968,13 @@ impl<'a> Gen<'a> {
                             load(asm, *slot, *sort);
                         }
                         asm.invokestatic_interface(iface, helper, desc);
+                        desc.clone()
                     }
+                };
+                let target_ret = &target_ret[target_ret.find(')').map(|i| i + 1).unwrap_or(0)..];
+                if !emit_forwarded_nothing(asm, target_ret) {
+                    ret_of_sort(asm, ret_str_sort(&ret));
                 }
-                ret_of_sort(asm, ret_str_sort(&ret));
             });
         }
     }
@@ -2077,6 +2085,7 @@ impl<'a> Gen<'a> {
                 let pdesc_c = pdesc.clone();
                 let cdesc_c = cdesc.clone();
                 let class_c = class_name.clone();
+                let cret_desc = jvm_desc(self.st, &child_ret);
                 b.add_code(
                     ACC_PUBLIC | ACC_SYNTHETIC | ACC_BRIDGE,
                     &name,
@@ -2091,6 +2100,9 @@ impl<'a> Gen<'a> {
                             }
                         }
                         asm.invokevirtual(&class_c, &name, &cdesc_c);
+                        if emit_forwarded_nothing(asm, &cret_desc) {
+                            return;
+                        }
                         if fill_unit {
                             emit_boxed_unit(asm);
                         }
