@@ -605,6 +605,17 @@ pub struct SymbolTable {
     /// own body no longer shows it, yet the method still has to carry the
     /// `NonLocalReturnControl` handler that catches it.
     pub local_lazy_nlr: rustc_hash::FxHashSet<SymbolId>,
+    /// Applications whose named arguments the typer had to move out of the
+    /// order they were written in, keyed by `(file index, node id)` of the
+    /// `Apply`.
+    ///
+    /// Entry `i` is the position in the *source* argument list of the argument
+    /// now sitting in parameter slot `i`, or `None` for a slot the typer filled
+    /// itself (a default, an implicit) and for a by-name parameter, whose
+    /// argument must not be evaluated at the call site at all.
+    /// [`crate::named_eval_order::restore_named_arg_order`] reads this to put
+    /// the evaluation back into source order.
+    pub named_arg_order: rustc_hash::FxHashMap<(u32, u32), Vec<Option<usize>>>,
     /// One past the last symbol `install_prelude` built.
     ///
     /// The prelude hand-writes signatures for the part of `scala.*` the typer
@@ -753,6 +764,7 @@ impl SymbolTable {
             local_lazy_cells: rustc_hash::FxHashSet::default(),
             local_lazy_accessors: rustc_hash::FxHashMap::default(),
             local_lazy_nlr: rustc_hash::FxHashSet::default(),
+            named_arg_order: rustc_hash::FxHashMap::default(),
             prelude_end: 0,
             prelude_shadowed: rustc_hash::FxHashSet::default(),
             prelude_scope: 0,

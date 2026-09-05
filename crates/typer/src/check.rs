@@ -265,6 +265,15 @@ pub struct Typer {
     pub(crate) sources: Vec<std::rc::Rc<str>>,
     /// Counter for synthetic names.
     pub(crate) gensym: u32,
+    /// Where the argument in each parameter slot was written, as the last call
+    /// to `named_arg_slots` left it. `place_named_args` reads it immediately
+    /// afterwards and turns it into the entry `SymbolTable::named_arg_order`
+    /// carries for the application.
+    pub(crate) slot_source: Vec<Option<usize>>,
+    /// The order `place_named_args` last produced, waiting for the application
+    /// it belongs to to record it under its own node id. Taken (not read) at
+    /// the call site, so a nested application cannot inherit it.
+    pub(crate) last_named_order: Option<Vec<Option<usize>>>,
     /// Per-binary-name index for *local* classes/objects (`Main$Same$1`,
     /// `Main$Same$2`), keyed by the un-indexed binary name.
     pub(crate) local_class_n: std::collections::HashMap<String, u32>,
@@ -800,6 +809,8 @@ impl Typer {
             file_index,
             sources: Vec::new(),
             gensym: 0,
+            slot_source: Vec::new(),
+            last_named_order: None,
             local_class_n: std::collections::HashMap::new(),
             pkg_nest: Vec::new(),
             open_pkgs: HashMap::new(),
