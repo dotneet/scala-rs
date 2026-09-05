@@ -1380,7 +1380,22 @@ impl SymbolTable {
                 }
                 None => Some(self.any_sym),
             },
-            Type::Applied { ctor, .. } => self.class_sym_of(ctor),
+            Type::Applied { ctor, args } => {
+                // A *fully applied* type lambda is the class its body names:
+                // `([x, y] => (A0, x, y))[A0, P, Q]` is a `Tuple3`. Falling
+                // straight through to the constructor reached the alias's
+                // upper bound instead, so `fab.copy(_2 = x)` on cats'
+                // `(A0, *, *)` found no case class to rebuild.
+                if let Type::TypeMember(id) = ctor.as_ref() {
+                    if self.get(*id).tparams.len() == args.len() {
+                        let reduced = self.expand_applied_hk_alias(ty.clone());
+                        if reduced != *ty {
+                            return self.class_sym_of(&reduced);
+                        }
+                    }
+                }
+                self.class_sym_of(ctor)
+            }
             Type::TypeMember(id) => {
                 let Some(_g) = enter_chase(Chase::ClassOf, *id) else {
                     return Some(self.any_sym);
@@ -1724,6 +1739,37 @@ impl SymbolTable {
     fn hk_alias_sub_type(&self, a: &Type, b: &Type) -> Option<bool> {
         let (ea, eb) = self.eta_expand_pair(a, b)?;
         Some(self.is_sub_type(&ea, &eb))
+    }
+
+    /// Does the type *constructor* `ctor` satisfy the proper-type bound
+    /// `bound` (`def f[F[_, _] <: Product]` instantiated at a type lambda)?
+    ///
+    /// nsc keeps a higher-kinded parameter's bounds *inside* its `PolyType`,
+    /// so `F[_, _] <: Product` is really `[x, y]F[x, y] <: [x, y]Product` and
+    /// `isPolySubType` decides it on the bodies. Here the bound is stored as
+    /// the written `Product`, so the eta-expansion has to happen at the
+    /// comparison: apply the constructor to its own parameters and ask about
+    /// the result. Without this no type lambda could satisfy any bound, and
+    /// cats' `instance[F[_, _] <: Product]` at `(A0, *, *)` was rejected with
+    /// "inferred type arguments … do not conform".
+    ///
+    /// Only reached when the plain comparison already said no, so it can widen
+    /// what is accepted but never narrow it. A class used as a constructor
+    /// (`Box[Tuple2]`) still goes through the ordinary path.
+    pub(crate) fn hk_ctor_meets_proper_bound(&self, ctor: &Type, bound: &Type) -> bool {
+        let n = self.kind_arity(ctor);
+        if n == 0 || self.kind_arity(bound) != 0 {
+            return false;
+        }
+        let Some((params, _)) = self.hk_alias(ctor) else {
+            return false;
+        };
+        if params.len() != n {
+            return false;
+        }
+        let args: Vec<Type> = params.iter().map(|p| Type::TypeParam(*p)).collect();
+        let applied = self.expand_applied_hk_alias(apply_type_ctor(ctor.clone(), args));
+        self.is_sub_type(&applied, bound)
     }
 
     /// `Class { sym: array_sym, args: [T] }` re-spelled as `Type::Array(T)`.

@@ -84,6 +84,15 @@ impl Typer {
         // An alias member (`type Scope = Map[K, V]`) is dealiased first, or the
         // receiver's type arguments would be invisible to the substitution below.
         let mut recv_ty = self.st.dealias(&self.st.widen_type_param(&qual.ty));
+        // A *fully applied* type lambda is the type its body says it is.
+        // `dealias` deliberately keeps a higher-kinded alias folded -- its body
+        // means nothing until the arguments arrive -- but here they have, and
+        // without the reduction the receiver was the unreduced application:
+        // `value _2 is not a member of [A0, x, y](A0, x, y)[A0, Any, Any]`,
+        // 30 times in cats' generated `NTupleBitraverseInstances` and
+        // `NTupleMonadInstances`, where kind-projector's `(A0, *, *)` is
+        // exactly this shape.
+        recv_ty = self.st.dealias(&self.st.expand_applied_hk_alias(recv_ty));
         // `super.m` (`qual` is a `Super` tree): resolve `m` against the real
         // mixin linearization, not against the one parent `TreeKind::Super`
         // picked independent of `m`'s name and not through that parent's own
@@ -388,11 +397,14 @@ impl Typer {
                     self.is_reflect_universe(owner)
                 })
             {
+                // nsc names the *reduced* type: `value _4 is not a member of
+                // (A0, Any, Any)`, not of the application that produced it.
+                let shown = self.st.expand_applied_hk_alias(qual.ty.clone());
                 self.error(
                     tree.span,
                     format!(
                         "value {name} is not a member of {}",
-                        self.st.display_type(&qual.ty)
+                        self.st.display_type(&shown)
                     ),
                 );
             }
@@ -581,6 +593,27 @@ impl Typer {
                     // read *before* that rule applies, so a `TypeApply` above
                     // has to be able to get back to the set. Record it under
                     // the surviving symbol too -- the key the caller has.
+                    if id != found[0] {
+                        self.overload_member_types.insert(id.0, alts);
+                        self.record_overload_group(&found, &name);
+                        if let Some(g) = self.overload_groups.get(&found[0].0).cloned() {
+                            self.overload_groups.insert(id.0, g);
+                        }
+                    }
+                }
+            } else if !matches!(pt, Type::Function { .. } | Type::Method { .. }) {
+                // The set may still have exactly one alternative whose
+                // parameters are all implicit, which value position keeps for
+                // the same reason it keeps a nullary one -- see
+                // `implicit_only_alternative`. `maybe_auto_apply` cannot see
+                // it, because a `Type::Method` carries parameter types and no
+                // `implicit` flag. The `pt` guard is that function's own: a
+                // method or function expectation is not value position.
+                if let Some(id) = self.implicit_only_alternative(&alts) {
+                    if let Some((_, t)) = alts.iter().find(|(s, _)| *s == id) {
+                        tree.ty = t.clone();
+                    }
+                    tree.sym = id;
                     if id != found[0] {
                         self.overload_member_types.insert(id.0, alts);
                         self.record_overload_group(&found, &name);
