@@ -389,6 +389,11 @@ pub struct Symbol {
     /// (deferred) and `abstract override def close(): Unit = …` (stackable)
     /// are indistinguishable there.
     pub abstract_override: bool,
+    /// nsc `SUPERACCESSOR`: this trait member's body writes `super.m`, so the
+    /// trait declares a `p$q$T$$super$m` accessor that every class mixing it
+    /// in has to implement (nsc's mixin phase does that only when it finds
+    /// the flag in the trait's *signature*, which is why it is pickled).
+    pub super_accessor: bool,
     /// `@specialized` on a **type parameter**: the types it selects, read the
     /// way nsc's `specializedOn` reads them (see
     /// `scala_rs_parser::specialization`). `None` when the parameter carries
@@ -708,6 +713,7 @@ impl SymbolTable {
                 declaring_is_interface: false,
                 pickled_origin: String::new(),
                 abstract_override: false,
+                super_accessor: false,
                 deferred_val: false,
                 specialized: None,
                 unspecialized: false,
@@ -809,6 +815,7 @@ impl SymbolTable {
             declaring_is_interface: false,
             pickled_origin: String::new(),
             abstract_override: false,
+            super_accessor: false,
             deferred_val: false,
             specialized: None,
             unspecialized: false,

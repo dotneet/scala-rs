@@ -1947,8 +1947,13 @@ impl Typer {
                 // Record `abstract override` *before* the body-less `def`
                 // rule below adds `ABSTRACT`, which would make the two
                 // indistinguishable.
-                let abs_over =
-                    mods.flags.contains(Flags::ABSTRACT) && mods.flags.contains(Flags::OVERRIDE);
+                // A body-less `abstract override def m: T` is simply
+                // deferred: nothing is stacked on top of `super`, and nsc
+                // pickles it DEFERRED like any other declaration. Only the
+                // concrete form is `ABSOVERRIDE`.
+                let abs_over = !rhs.is_empty()
+                    && mods.flags.contains(Flags::ABSTRACT)
+                    && mods.flags.contains(Flags::OVERRIDE);
                 let mut flags = if rhs.is_empty() && !mods.flags.contains(Flags::NATIVE) {
                     mods.flags.with(Flags::ABSTRACT)
                 } else {

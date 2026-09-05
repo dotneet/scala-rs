@@ -8,9 +8,10 @@ use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
     add_value_class_companions, check_local_case_class_captures, check_local_objects, erase,
-    expand_private_names, find_mains, hoist_default_receivers, lambda_lift, lazy_locals,
-    mark_anon_captures, note_source_value_classes, typecheck_units_src, uncurry, ClasspathClass,
-    ClasspathMethod, ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
+    expand_private_names, expand_trait_private_vals, find_mains, hoist_default_receivers,
+    lambda_lift, lazy_locals, mark_anon_captures, note_source_value_classes, typecheck_units_src,
+    uncurry, ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType,
+    ClasspathTypeParam, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -335,7 +336,21 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
             for u in units.iter() {
                 add_value_class_companions(&u.tree, &mut st);
             }
+            // nsc `superaccessors`, likewise before `pickler`: which trait
+            // members write `super.m` decides which `T$$super$m` members the
+            // signature declares, and a reader implements exactly those.
+            for u in units.iter() {
+                scala_rs_backend::gen::mark_super_accessors(&u.tree, &mut st);
+            }
             let pickles = std::rc::Rc::new(scala_rs_backend::pickle::pickle_all(&st));
+            // nsc's `mixin`, which runs *after* `pickler`: a trait's
+            // unqualified-`private` `val` is renamed to `p$T$$v` in the class
+            // files, but the pickle keeps the source name and the `private`
+            // flag, because a reader (scalac included) derives the expansion
+            // itself. Hence the position: between the pickle and codegen.
+            for u in units.iter_mut() {
+                expand_trait_private_vals(&mut u.tree, &mut st);
+            }
             // Value classes are boxed across unit boundaries, so every unit's
             // declarations have to be known before the first one is erased.
             for u in units.iter() {

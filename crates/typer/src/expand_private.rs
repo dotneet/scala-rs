@@ -182,11 +182,87 @@ fn expanded_name(st: &SymbolTable, owner: SymbolId, name: &str) -> String {
     }
 }
 
+/// nsc's `mixin`, which runs *after* `pickler`: every unqualified-`private`
+/// value member of a **trait** is renamed, whether or not this compilation
+/// reads it from another class file.
+///
+/// A trait compiles to an interface, so its `val`s and `var`s have nowhere to
+/// live: the field and both accessors belong to every class that mixes the
+/// trait in, and the interface only declares them. That declaration always
+/// crosses a class file boundary, so nsc expands the name —
+/// `lib$Counter$$n` — and the mixin setter is named after the *expanded*
+/// getter (`lib$Counter$_setter_$lib$Counter$$n_$eq`). A class real scalac
+/// compiles against our trait therefore implements `lib$Counter$$n()`, and
+/// our unexpanded `n()` stayed abstract:
+///
+/// ```text
+/// AbstractMethodError: Receiver class Sub does not define or inherit an
+/// implementation of the resolved method 'abstract int lib$Counter$$n()'
+/// ```
+///
+/// Unlike [`expand_private_names`] this runs **after** the pickle is taken,
+/// because nsc's own pickle carries the source name and the `private` flag
+/// and scalac derives the expansion itself when it reads one. Renaming before
+/// the pickle would make scalac expand a second time
+/// (`lib$Counter$$lib$Counter$$n`).
+pub fn expand_trait_private_vals(tree: &mut Tree, st: &mut SymbolTable) {
+    let mut need = HashSet::new();
+    collect_trait_private_vals(tree, st, &mut need);
+    if need.is_empty() {
+        return;
+    }
+    let mut renames: HashMap<SymbolId, (String, String)> = HashMap::new();
+    for &id in &need {
+        let owner = st.get(id).owner;
+        let old = st.get(id).name.clone();
+        let new = expanded_name(st, owner, &old);
+        st.get_mut(id).name = new.clone();
+        st.get_mut(id).access_widened = true;
+        renames.insert(id, (old, new));
+    }
+    rewrite(tree, &renames);
+}
+
+fn collect_trait_private_vals(t: &mut Tree, st: &SymbolTable, out: &mut HashSet<SymbolId>) {
+    if matches!(t.kind, TreeKind::ValDef { .. })
+        && !t.sym.is_none()
+        && is_trait_private_val(st, t.sym)
+    {
+        out.insert(t.sym);
+    }
+    for c in children_mut(t) {
+        collect_trait_private_vals(c, st, out);
+    }
+}
+
+/// A `val` / `var` / `lazy val` member of a trait written unqualified
+/// `private` (`private[this]` counts, `private[p]` does not — nsc leaves a
+/// qualified private member's name alone).
+fn is_trait_private_val(st: &SymbolTable, id: SymbolId) -> bool {
+    let s = st.get(id);
+    if !s.flags.contains(Flags::PRIVATE)
+        || s.private_within.is_some()
+        || s.flags.contains(Flags::PARAM)
+        || s.kind != SymKind::Term
+        || s.access_widened
+    {
+        return false;
+    }
+    let owner = st.get(s.owner);
+    owner.flags.contains(Flags::TRAIT) || owner.flags.contains(Flags::INTERFACE)
+}
+
 /// The `private` term members declared by this unit. `private[C]` is *not* one
 /// of them: it is `PRIVATE` in the tree but compiles to a public member, so
 /// renaming it would move a name other files legitimately reference.
+///
+/// A trait's `private` `val` is left out: it is renamed unconditionally, but
+/// only *after* the pickle is taken — see [`expand_trait_private_vals`].
 fn collect_private_members(t: &mut Tree, st: &SymbolTable, out: &mut HashSet<SymbolId>) {
-    if matches!(t.kind, TreeKind::ValDef { .. } | TreeKind::DefDef { .. }) && !t.sym.is_none() {
+    if matches!(t.kind, TreeKind::ValDef { .. } | TreeKind::DefDef { .. })
+        && !t.sym.is_none()
+        && !is_trait_private_val(st, t.sym)
+    {
         let s = st.get(t.sym);
         let owner_kind = st.get(s.owner).kind;
         if s.flags.contains(Flags::PRIVATE)
