@@ -227,8 +227,9 @@ are organised is described in [docs/testing.md](docs/testing.md).
   the second real-world benchmark.
 - [docs/scala-library.md](docs/scala-library.md) — compiling scala/scala's own
   `src/library` from source: the numbers, and the one root behind them.
-- [docs/specialization.md](docs/specialization.md) — what `@specialized` would
-  take, and why 63 of the 107 tests it blocks do not need the phase at all.
+- [docs/specialization.md](docs/specialization.md) — `@specialized`: the
+  annotation is accepted and recorded, the phase that emits `Foo$mcI$sp` is
+  not. `tests/spec_classfiles.sh` measures the gap against real scalac.
 - [docs/notes/](docs/notes/README.md) — development notes: the investigations
   and the reasoning behind individual changes.
 
