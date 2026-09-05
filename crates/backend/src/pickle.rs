@@ -1750,6 +1750,29 @@ impl<'a> Pickler<'a> {
         // scalac compiles against our classfile links and verifies and then
         // leaves every trait `val` at its default value.
         if class_flags.contains(Flags::TRAIT) || class_flags.contains(Flags::INTERFACE) {
+            // `p$q$T$$super$m`, nsc's `SUPERACCESSOR`. A stackable trait's
+            // `super.m` is bound by the linearization of whichever class
+            // mixes the trait in, so the class owes the accessor; nsc's mixin
+            // phase writes one only for a member the trait's *signature*
+            // declares with this flag. We emitted the accessor on the
+            // interface and pickled nothing, so a class real scalac compiled
+            // over an `abstract override` trait of ours left it abstract and
+            // ran the base implementation.
+            //
+            // The *pickled* name is nsc's unexpanded `super$m`: the accessor
+            // is `private`, and a reader expands a private member's name
+            // itself, so pickling the expanded form gave
+            // `tilib2$Stack$$tilib2$Stack$$super$m` in the class scalac
+            // compiled.
+            let own = self.st.get(class_id).members.clone();
+            for m in own {
+                let s = self.st.get(m);
+                if s.kind != SymKind::Method || !s.super_accessor {
+                    continue;
+                }
+                let acc = format!("super${}", crate::classfile::encode_method_name(&s.name));
+                self.pickle_super_accessor(m, idx, &acc);
+            }
             self.pickle_mixin_ctor(idx);
         }
 
@@ -1916,6 +1939,66 @@ impl<'a> Pickler<'a> {
         self.current_owner = saved;
     }
 
+    /// `def p$q$T$$super$m: T` — the abstract `SUPERACCESSOR` member a
+    /// stackable trait declares and every class mixing it in implements.
+    /// Same signature as the method it accesses; see the call site.
+    fn pickle_super_accessor(&mut self, method_id: SymbolId, owner_ref: u32, acc_name: &str) {
+        // No alias, no accessor: nsc's unpickler asserts that every
+        // SUPERACCESSOR carries one, and a member whose signature we could not
+        // pickle has no entry to point at.
+        let Some(alias) = self.sym_index.get(&method_id.0).copied() else {
+            return;
+        };
+        let (paramss, ret) = match &self.st.get(method_id).ty {
+            Type::Method { paramss, ret } => (paramss.clone(), (**ret).clone()),
+            other => (Vec::new(), other.clone()),
+        };
+        let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+        let name_ref = self.term_name(acc_name);
+        let meth_idx = self.add(VALSYM, vec![]);
+        let saved = self.current_owner;
+        self.current_owner = meth_idx;
+        let mut param_refs = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            let pn = self.term_name(&format!("x${}", i + 1));
+            let pty = self.pickle_type(p);
+            let pflags = pickled_from_our(Flags::PARAM, SymKind::Term, 1u64 << 13);
+            let pbody = self.symbol_info(pn, meth_idx, pflags, pty);
+            param_refs.push(self.add(VALSYM, pbody));
+        }
+        let ret_ref = self.pickle_type(&ret);
+        let info = if param_refs.is_empty() {
+            // nsc NullaryMethodType = POLYtpe(restpe) with no tparams.
+            let mut pt = Vec::new();
+            write_nat_to(&mut pt, ret_ref);
+            self.add(POLYTPE, pt)
+        } else {
+            let mut mt = Vec::new();
+            write_nat_to(&mut mt, ret_ref);
+            for p in param_refs {
+                write_nat_to(&mut mt, p);
+            }
+            self.add(METHODTPE, mt)
+        };
+        // METHOD | PRIVATE | SUPERACCESSOR. `private` is not
+        // decoration: `RefChecks` walks the *non-private* deferred members of
+        // a class and would demand `class S needs to be abstract. Missing
+        // implementation for member of trait Stack: def super$m` -- the
+        // accessor is the mixin phase's business, and nsc pickles its own as
+        // `private def super$m` for exactly that reason.
+        let flags = raw_to_pickled((1u64 << 6) | (1u64 << 2) | (1u64 << 28));
+        let mut body = self.symbol_info(name_ref, owner_ref, flags, info);
+        // nsc's `SYMinfo` ends with an optional *alias* reference, and its
+        // unpickler asserts that exactly the SUPERACCESSOR and PARAMACCESSOR
+        // symbols carry one (`UnPickler.finishSym`). The alias is the member
+        // the accessor super-calls; `Mixin.rebindSuper` re-resolves it by
+        // name in the linearization of the class being compiled, so the
+        // trait's own method is the right referent.
+        write_nat_to(&mut body, alias);
+        self.entries[meth_idx as usize] = (VALSYM, body);
+        self.current_owner = saved;
+    }
+
     /// `def $init$(): Unit` — the trait's primary constructor as nsc pickles
     /// it (`nme.MIXIN_CONSTRUCTOR`, a `MethodType` with an empty parameter
     /// list, not a nullary one). It is what tells a reader that the mixing
@@ -1941,7 +2024,7 @@ impl<'a> Pickler<'a> {
         }
         let s = self.st.get(method_id);
         let meth_name = s.name.clone();
-        let meth_flags = s.flags;
+        let meth_flags = pickled_access_flags(self.st, method_id);
         let meth_kind = s.kind;
         let meth_tparams = s.tparams.clone();
         let (paramss, ret) = match &s.ty {
@@ -2040,6 +2123,21 @@ impl<'a> Pickler<'a> {
         let owner_id = self.st.get(method_id).owner;
         if meth_flags.contains(Flags::JAVA) || self.st.get(owner_id).flags.contains(Flags::JAVA) {
             extra |= 1 << 20; // JAVA (not remapped)
+        }
+        // `abstract override def m = …` is *concrete*: nsc pickles it
+        // ABSOVERRIDE, never DEFERRED. Our namer sets `ABSTRACT` on it
+        // (`Symbol::abstract_override` records what the source wrote), and
+        // `nsc_raw_from_our` would turn that into DEFERRED -- which made
+        // scalac read the whole stackable layer as an abstract declaration
+        // and mix in nothing at all, so `new S().m` silently ran the base
+        // implementation instead of the trait's.
+        let mut meth_flags = meth_flags;
+        if self.st.get(method_id).abstract_override {
+            // ABSOVERRIDE stands on its own in nsc: `abstract override def m`
+            // pickles ABSOVERRIDE and *not* OVERRIDE.
+            meth_flags.set(Flags::ABSTRACT, false);
+            meth_flags.set(Flags::OVERRIDE, false);
+            extra |= 1 << 18; // ABSOVERRIDE (not remapped)
         }
         let flags = pickled_from_our(meth_flags, meth_kind, extra);
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
@@ -2186,7 +2284,7 @@ impl<'a> Pickler<'a> {
         let s = self.st.get(val_id);
         let name = s.name.clone();
         let ty = s.ty.clone();
-        let flags_our = s.flags;
+        let flags_our = pickled_access_flags(self.st, val_id);
         let kind = s.kind;
         let name_ref = self.term_name(&name);
         let idx = self.add(VALSYM, vec![]);
@@ -2218,7 +2316,12 @@ impl<'a> Pickler<'a> {
         self.entries[idx as usize] = (VALSYM, body);
         self.pickle_sym_annots(val_id, idx);
         if mutable {
-            self.pickle_var_setter(&name, owner_ref, &ty);
+            // `access_widened` members were renamed *before* the pickle
+            // (`expand_private_names`) and are published under the expanded
+            // name; marking those private would ask the reader to expand a
+            // second time.
+            let private = flags_our.contains(Flags::PRIVATE) && !self.st.get(val_id).access_widened;
+            self.pickle_var_setter(&name, owner_ref, &ty, private);
         }
         idx
     }
@@ -2227,7 +2330,15 @@ impl<'a> Pickler<'a> {
     /// beside every mutable accessor; without it a reader sees a `val` and
     /// neither `x.v = …` from another compilation unit nor a class mixing in
     /// a trait `var` lines up with what we emit.
-    fn pickle_var_setter(&mut self, field: &str, owner_ref: u32, ty: &Type) {
+    ///
+    /// `private` has to carry across to the setter. A reader pairs a getter
+    /// with its setter *by name*, and it expands the name of a `private`
+    /// member of a trait first (`lib$Counter$$m` / `lib$Counter$$m_$eq`), so a
+    /// public setter beside a private getter is not found: scalac read our
+    /// `private var m` back as a `val`, gave the class it compiled a getter
+    /// and no setter, and the trait's own `$init$` died with
+    /// `AbstractMethodError: … 'abstract void lib$Counter$$m_$eq(int)'`.
+    fn pickle_var_setter(&mut self, field: &str, owner_ref: u32, ty: &Type, private: bool) {
         let setter = format!("{}_$eq", crate::classfile::encode_method_name(field));
         let name_ref = self.term_name(&setter);
         let meth_idx = self.add(VALSYM, vec![]);
@@ -2243,8 +2354,12 @@ impl<'a> Pickler<'a> {
         write_nat_to(&mut mt, unit_ref);
         write_nat_to(&mut mt, param);
         let info = self.add(METHODTPE, mt);
-        // METHOD | ACCESSOR
-        let flags = raw_to_pickled((1u64 << 6) | (1u64 << 27));
+        // METHOD | ACCESSOR (| PRIVATE)
+        let mut raw = (1u64 << 6) | (1u64 << 27);
+        if private {
+            raw |= 1u64 << 2; // PRIVATE
+        }
+        let flags = raw_to_pickled(raw);
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
         self.entries[meth_idx as usize] = (VALSYM, body);
         self.current_owner = saved;
@@ -2356,6 +2471,25 @@ fn annot_string_args(tree: &Tree) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// The flags to pickle for a member, with qualified `private` dropped.
+///
+/// nsc writes `private[p]` as PRIVATE *plus* a `privateWithin` reference, and
+/// this pickler writes no `privateWithin` at all. A bare PRIVATE is a
+/// different member: a reader expands the name of a trait's private `val`
+/// itself, so `private[tilib] val pkg` came back as `tilib$Counter$$pkg`
+/// while our own class file declared `pkg()` --
+/// `AbstractMethodError: … 'abstract void tilib$Counter$_setter_$pkg_$eq(int)'`.
+/// The class file already emits a qualified-private member public, so
+/// publishing it in the signature too is what keeps the two agreeing.
+fn pickled_access_flags(st: &SymbolTable, id: SymbolId) -> Flags {
+    let s = st.get(id);
+    let mut f = s.flags;
+    if s.private_within.is_some() {
+        f.set(Flags::PRIVATE, false);
+    }
+    f
 }
 
 /// Map scala-rs `Flags` onto nsc **raw** bits (before `rawToPickledFlags`).
