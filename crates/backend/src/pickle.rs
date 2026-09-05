@@ -209,6 +209,18 @@ pub struct PickledMethod {
     pub is_val: bool,
     pub is_ctor: bool,
     pub is_implicit: bool,
+    /// nsc's `DEFERRED`: this member is a *declaration*. The class file cannot
+    /// always say so -- every member of an interface but the `default` methods
+    /// is `ACC_ABSTRACT` there, so a trait's concrete `val` accessor and its
+    /// deferred one look identical -- and a reader that takes them all for
+    /// definitions asks for an `override` modifier scalac does not.
+    pub is_deferred: bool,
+    /// A `var`'s getter. nsc strips `MUTABLE` from the accessor it derives and
+    /// marks only an *immutable* one `STABLE`, so "accessor without `STABLE`"
+    /// is how a reader tells a `var` from a `val`. Nothing in the class file
+    /// carries it, which is why `c.count = 9` on a trait read from `-cp` was
+    /// `reassignment to val count`.
+    pub is_mutable: bool,
 }
 
 /// Pickled class or module class.
@@ -2308,9 +2320,17 @@ impl<'a> Pickler<'a> {
         // `T$_setter_$v_$eq` protocol instead of the plain setter the trait's
         // own `$init$` calls.
         let mutable = flags_our.contains(Flags::MUTABLE);
+        // A declaration (`var dv: Int` in a trait) carries no `ABSTRACT`
+        // flag -- `Symbol::deferred_val` is where it lives for a term -- and
+        // pickling it as a definition made scalac ask a class implementing
+        // the trait for an `override` modifier.
+        let deferred = self.st.get(val_id).deferred_val;
         let mut extra = (1u64 << 6) | (1u64 << 27);
         if !mutable {
             extra |= 1u64 << 22; // STABLE
+        }
+        if deferred {
+            extra |= 1u64 << 4; // DEFERRED (raw; `raw_to_pickled` moves it)
         }
         if case_accessor {
             extra |= 1 << 24; // CASEACCESSOR (not remapped)
@@ -2328,7 +2348,7 @@ impl<'a> Pickler<'a> {
             // name; marking those private would ask the reader to expand a
             // second time.
             let private = flags_our.contains(Flags::PRIVATE) && !self.st.get(val_id).access_widened;
-            self.pickle_var_setter(&name, owner_ref, &ty, private);
+            self.pickle_var_setter(&name, owner_ref, &ty, private, deferred);
         }
         idx
     }
@@ -2345,7 +2365,14 @@ impl<'a> Pickler<'a> {
     /// `private var m` back as a `val`, gave the class it compiled a getter
     /// and no setter, and the trait's own `$init$` died with
     /// `AbstractMethodError: … 'abstract void lib$Counter$$m_$eq(int)'`.
-    fn pickle_var_setter(&mut self, field: &str, owner_ref: u32, ty: &Type, private: bool) {
+    fn pickle_var_setter(
+        &mut self,
+        field: &str,
+        owner_ref: u32,
+        ty: &Type,
+        private: bool,
+        deferred: bool,
+    ) {
         let setter = format!("{}_$eq", crate::classfile::encode_method_name(field));
         let name_ref = self.term_name(&setter);
         let meth_idx = self.add(VALSYM, vec![]);
@@ -2365,6 +2392,9 @@ impl<'a> Pickler<'a> {
         let mut raw = (1u64 << 6) | (1u64 << 27);
         if private {
             raw |= 1u64 << 2; // PRIVATE
+        }
+        if deferred {
+            raw |= 1u64 << 4; // DEFERRED
         }
         let flags = raw_to_pickled(raw);
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
@@ -3133,6 +3163,13 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
         _ => false,
     };
 
+    // Pickled flags. The first twelve bits are re-encoded by nsc's
+    // `rawToPickledFlags` (`DEFERRED` moves from `1 << 4` to `1 << 8`);
+    // everything above bit 11 keeps its raw position, which is why `STABLE`
+    // and `ACCESSOR` are the numbers `Flags.scala` gives them.
+    const DEFERRED_PKL: u64 = 1 << 8;
+    const STABLE: u64 = 1 << 22;
+
     let mut methods = Vec::new();
     for e in &entries {
         let Entry::ValSym {
@@ -3185,6 +3222,8 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 is_val: is_accessor,
                 is_ctor: mname == "<init>",
                 is_implicit,
+                is_deferred: (*flags & DEFERRED_PKL) != 0,
+                is_mutable: is_accessor && (*flags & STABLE) == 0,
             });
         } else {
             // NullaryMethodType (POLYtpe with no tparams) or a plain type.
@@ -3200,6 +3239,8 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 is_val: is_accessor,
                 is_ctor: false,
                 is_implicit,
+                is_deferred: (*flags & DEFERRED_PKL) != 0,
+                is_mutable: is_accessor && (*flags & STABLE) == 0,
             });
         }
     }
