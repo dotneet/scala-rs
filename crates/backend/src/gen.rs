@@ -3848,6 +3848,17 @@ impl<'a> Gen<'a> {
             let fname = p.name().unwrap_or("").to_string();
             param_info.push((slot, sort, fname, jvm_desc_val(self.st, &ty)));
         }
+        // The class body reaches a `var` parameter through its *field*, the
+        // way nsc does. While the constructor's own local stayed bound to the
+        // symbol, `class C(private[this] var c: String) { c = "good" }` stored
+        // to the local and left the field holding the constructor argument,
+        // so `def f = c` still answered `"bad"`. Only `var` parameters need
+        // this: an immutable one can never disagree with its field.
+        let mutable_params: Vec<SymbolId> = params
+            .iter()
+            .map(|p| p.sym)
+            .filter(|s| !s.is_none() && self.st.get(*s).flags.contains(Flags::MUTABLE))
+            .collect();
         let mut types: Vec<Type> = Vec::new();
         if let Some(o) = outer {
             types.push(Type::Class {
@@ -3986,6 +3997,11 @@ impl<'a> Gen<'a> {
                 asm.aload(0);
                 load(asm, *slot, *sort);
                 asm.putfield(&class_name, fname, fdesc);
+            }
+            // From here on the field is the parameter: unbind the local so the
+            // body's reads and writes go through it (see `mutable_params`).
+            for id in &mutable_params {
+                frame.locals.remove(id);
             }
             for (impl_cls, init_desc) in &mixin_inits {
                 asm.aload(0);
@@ -7255,6 +7271,11 @@ impl<'a> Gen<'a> {
         if abs_fn.is_some() {
             emit_case_apply_bridge(&mut b, self.st, class_id);
         }
+        // nsc's `caseModuleToStringMethod`: a case class's companion prints as
+        // the class's name. Without it the companion inherited
+        // `AbstractFunctionN.toString` and `println(CC)` printed
+        // `<function0>`.
+        emit_case_companion_to_string(&mut b, self.st, class_id, class_tree);
         // The primary constructor's `$lessinit$greater$default$n` /
         // `apply$default$n` (`crate::typer::ctor_defaults` declares them on the
         // companion, as nsc does). `emit_module` reaches these through its own
@@ -7682,6 +7703,35 @@ fn companion_case_class(st: &SymbolTable, cls: SymbolId) -> Option<SymbolId> {
             && st.get(m).name == base
             && st.get(m).flags.contains(Flags::CASE)
     })
+}
+
+/// nsc's `caseModuleToStringMethod`: the companion module of a `case class`
+/// answers `toString` with the class's own name, so `println(C)` prints `C`
+/// and not the `AbstractFunctionN` it happens to extend.
+fn emit_case_companion_to_string(
+    b: &mut ClassBuilder,
+    st: &SymbolTable,
+    class_id: SymbolId,
+    class_tree: &Tree,
+) {
+    if b.methods.iter().any(|m| m.name == "toString") {
+        return;
+    }
+    let text = if class_id.is_none() {
+        class_tree.name().unwrap_or("X").to_string()
+    } else {
+        st.get(class_id).name.clone()
+    };
+    b.add_code(
+        ACC_PUBLIC,
+        "toString",
+        "()Ljava/lang/String;",
+        1,
+        move |asm| {
+            asm.ldc_string(&text);
+            asm.areturn();
+        },
+    );
 }
 
 /// `apply(Object, …): Object`, the erased `FunctionN.apply` a companion that
@@ -19678,11 +19728,17 @@ fn reads_erased_value(ctx: &EmitCtx, pat: &Tree) -> bool {
 /// A lowercase (or `_`-leading) identifier pattern **binds**; `Nil`, `Q` and
 /// other stable ids must be compared.
 fn is_binding_ident(ctx: &EmitCtx, pat: &Tree, name: &str) -> bool {
-    name.chars()
-        .next()
-        .is_some_and(|c| c.is_lowercase() || c == '_')
-        || pat.sym.is_none()
-        || ctx.st.get(pat.sym).kind == SymKind::Term
+    // `stable_pat` is the type checker's answer: the name resolved to a value
+    // and the pattern is a comparison. It has to be asked first, because a
+    // resolved `val` and a fresh pattern variable are both `SymKind::Term`
+    // and the test below would call every constant pattern a binding.
+    !pat.stable_pat
+        && (name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_lowercase() || c == '_')
+            || pat.sym.is_none()
+            || ctx.st.get(pat.sym).kind == SymKind::Term)
 }
 
 /// Put a constant pattern's value on the stack in the *scrutinee's* JVM
@@ -20077,6 +20133,20 @@ fn gen_pattern(
             load(asm, tmp, JvmSort::Ref);
             asm.instanceof(&jvm);
             asm.ifeq(fail);
+            // A compound type pattern has to test *every* parent.
+            // `type_jvm_name` names only the first one, so
+            // `case _: TA with TB` matched a value that is merely a `TA`.
+            if let Type::Refined { parents, .. } = pat.ty.widen_constant() {
+                for p in &parents {
+                    let n = type_jvm_name(ctx.st, p);
+                    if n.is_empty() || n == "java/lang/Object" || n == jvm {
+                        continue;
+                    }
+                    load(asm, tmp, JvmSort::Ref);
+                    asm.instanceof(&n);
+                    asm.ifeq(fail);
+                }
+            }
             // `case i: Int` / `case s: String` narrows an `Object` scrutinee,
             // so the bound value is unboxed or cast before it is stored.
             let want = jvm_sort(&pat.ty);

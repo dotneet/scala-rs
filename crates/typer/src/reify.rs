@@ -1291,6 +1291,7 @@ impl<'a> Reifier<'a> {
             sym: SymbolId::NONE,
             postfix: false,
             scala_ref: false,
+            stable_pat: false,
         }
     }
 

@@ -1184,6 +1184,7 @@ fn erase_ident(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             sym: SymbolId::NONE,
             postfix: false,
             scala_ref: false,
+            stable_pat: false,
         };
     }
 }
@@ -1625,6 +1626,7 @@ fn wrap_marker(tree: &mut Tree, name: &str, sym: SymbolId, param: Type, result: 
         sym,
         postfix: false,
         scala_ref: false,
+        stable_pat: false,
     };
     *tree = Tree {
         id: inner.id,
@@ -1637,6 +1639,7 @@ fn wrap_marker(tree: &mut Tree, name: &str, sym: SymbolId, param: Type, result: 
         sym,
         postfix: false,
         scala_ref: false,
+        stable_pat: false,
     };
 }
 
@@ -1677,6 +1680,7 @@ fn wrap_box(tree: &mut Tree) {
         sym: SymbolId::NONE,
         postfix: false,
         scala_ref: false,
+        stable_pat: false,
     };
     *tree = Tree {
         id: inner.id,
@@ -1689,6 +1693,7 @@ fn wrap_box(tree: &mut Tree) {
         sym: SymbolId::NONE,
         postfix: false,
         scala_ref: false,
+        stable_pat: false,
     };
 }
 
@@ -1708,6 +1713,7 @@ fn wrap_unbox(tree: &mut Tree, to: Type) {
         sym: SymbolId::NONE,
         postfix: false,
         scala_ref: false,
+        stable_pat: false,
     };
     *tree = Tree {
         id: inner.id,
@@ -1720,5 +1726,6 @@ fn wrap_unbox(tree: &mut Tree, to: Type) {
         sym: SymbolId::NONE,
         postfix: false,
         scala_ref: false,
+        stable_pat: false,
     };
 }

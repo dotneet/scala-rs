@@ -266,8 +266,16 @@ if [[ $1 == --one ]]; then
         # partest merges stdout and stderr into one log before comparing, so
         # accept either stdout alone or the two concatenated.
         cat $WORK/stdout.txt $WORK/stderr.txt > $WORK/both.txt
-        if diff -q $check $WORK/stdout.txt >/dev/null 2>&1 \
-           || diff -q $check $WORK/both.txt >/dev/null 2>&1; then
+        # partest compares the two as *line sequences*, so whether the last
+        # line ends with a newline is not part of the answer. Sixteen `.check`
+        # files in the tree have no final newline (`run/t429.check` is
+        # `AyB5`), and a byte-exact `diff` failed every one of them for a
+        # program whose output real scalac reproduces exactly. Normalise the
+        # final newline on both sides and keep everything else byte-exact: a
+        # *blank* trailing line still counts, as it does in partest.
+        norm() { perl -0777 -pe 's/\n?\z/\n/' "$1" }
+        if diff -q <(norm $check) <(norm $WORK/stdout.txt) >/dev/null 2>&1 \
+           || diff -q <(norm $check) <(norm $WORK/both.txt) >/dev/null 2>&1; then
           emit pass -
         else
           emit fail output-mismatch

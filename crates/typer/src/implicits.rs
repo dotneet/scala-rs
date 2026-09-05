@@ -2007,6 +2007,7 @@ impl Typer {
             sym: id,
             postfix: false,
             scala_ref: false,
+            stable_pat: false,
         };
         let Some(module) = self.wildcard_module_for(id) else {
             // `import b._` where `b` is a *value*: the conversion is an
@@ -2027,6 +2028,7 @@ impl Typer {
                     sym: id,
                     postfix: false,
                     scala_ref: false,
+                    stable_pat: false,
                 };
             }
             return ident;
@@ -2042,6 +2044,7 @@ impl Typer {
             sym: module,
             postfix: false,
             scala_ref: false,
+            stable_pat: false,
         };
         Tree {
             id: scala_rs_parser::NodeId(0),
@@ -2054,6 +2057,7 @@ impl Typer {
             sym: id,
             postfix: false,
             scala_ref: false,
+            stable_pat: false,
         }
     }
 
