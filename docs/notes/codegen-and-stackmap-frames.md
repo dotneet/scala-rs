@@ -604,3 +604,85 @@ trait's `$init$` in `T$class` rather than as a static on the interface).
   is untouched. nsc does not allow statements in an early definition block, and
   we keep the existing path that emits only `val`s pre-super.
 
+
+### Branch offsets and `code_length` (`agent/ms`, 2026-09-05)
+
+Three casts in `crates/backend/src/code.rs` were narrowing a class file format
+width without checking it, so a program too big in either of two ways compiled
+to a class file that nothing complained about until it ran:
+
+| cast | what it was doing |
+|---|---|
+| `(rel as i16)` in `finish` | a branch over more than 32767 bytes wrapped, so a conditional jumped to a negative offset |
+| `self.bytes.len() as u16`, then `frames.retain(\|off\| off < end)` | for a method over 64 KB `end` wrapped, and nearly every stack map frame was discarded |
+| `(delta as u16)` in `encode_stack_map` | the same wrap in a frame's `offset_delta` |
+
+They look like one bug and are two, with different right answers.
+
+**A branch that does not reach is our problem to solve, not to report.**
+JVMS 6.5 gives every branch a signed 16-bit offset; only `goto`/`jsr` have a
+wide form. nsc compiles `scala/test/files/run/t10594.scala` -- 8273 calls
+inside an `if` -- to a perfectly ordinary 33109-byte method, because ASM
+rewrites the branch it cannot encode:
+
+```
+   12: ifne          20
+   15: goto_w        33109
+   20: ...
+```
+
+We wrote `ifeq -7611` and died with `VerifyError: Expecting a stackmap frame at
+branch target -7611`. `Assembler::widen_jumps` now does the same rewrite: a
+`goto` becomes `goto_w`, a conditional becomes its inverse over a `goto_w`, and
+the choice runs to a fixpoint because growing the code can put a further branch
+out of range.
+
+Two details are not obvious from the shape:
+
+* **The fall-through of the inverted branch is a new branch target**, and JVMS
+  4.7.4 wants a frame on it. The state there is only known while the branch is
+  being emitted, so `jump` records it in `cond_frames` and the rewrite promotes
+  the entries it needs. Using the *target's* frame instead would be unsound:
+  that frame is the merge of every path arriving there, so it can be wider than
+  the fall-through's own state, and the code after it may need the precision.
+  When a label already sits on the fall-through, its merged frame wins -- other
+  predecessors are relying on it.
+* **Each rewrite grows the code by a multiple of four**, padded with `nop`s,
+  so that the alignment padding of a `tableswitch`/`lookupswitch` behind it
+  never has to change size (which would feed back into the fixpoint). The
+  `nop`s go *before* the widened instruction: JVMS 4.10.1 wants a frame on the
+  instruction after an unconditional branch, and padding placed behind the
+  `goto_w` puts unreachable `nop`s there ("Expecting a stack map frame ...
+  @23: nop").
+
+**A method over 64 KB is not our problem to solve.** JVMS 4.7.3 requires
+`code_length < 65536`, so no encoding of the method exists; nsc says
+
+```
+error: Error while emitting Big
+Method too large: Big.big ()V
+```
+
+and writes nothing for the class. `ClassBuilder::add_code` now records the same
+message in `EmittedClass::format_errors`, and the driver reports it and drops
+the class instead of writing one. Note the shape of the old failure: the
+`code_length` field itself is a `u4`, so the over-long value was written out
+faithfully and `javap` read the file back without a murmur -- it was the
+`u16` offsets *inside* it that had wrapped.
+
+Because our call sequence is longer than nsc's (`aload_0; checkcast; invoke` is
+7 bytes where nsc emits `aload_0; invoke` in 4), we reach that limit at about
+57% of the source size nsc does. That is a codegen-quality gap, not a
+correctness one, and it is the reason a method nsc accepts can now be rejected
+here.
+
+#### Verification
+
+`crates/cli/tests/ms_bigmethod.rs` generates its sources rather than checking
+them in -- the smallest program that reaches either limit is tens of thousands
+of statements. It pins the t10594 shape (compiled, run under `-Xverify:all`,
+stdout compared with real scalac 2.13.16), a backward `goto` out of range with
+a `lookupswitch` behind it, and the `Method too large` diagnostic together with
+the absence of a class file. `crates/backend/src/code.rs`'s own tests pin the
+byte-level shape of each rewrite, including a cascade where widening one branch
+is what pushes another out of range.

@@ -24,6 +24,14 @@ pub struct EmittedClass {
     /// e.g. `"Main"`, `"Main$"`, `"scala/Option"`
     pub internal_name: String,
     pub bytes: Vec<u8>,
+    /// Limits of the class file format this class does not fit in, one message
+    /// per offending member (`"Method too large: Main.f ()V"`).
+    ///
+    /// These are not *our* bugs to route around: no encoding of the method
+    /// exists, and nsc reports the same thing. `bytes` is filled in anyway --
+    /// the driver reports each message and does not write the file, so what is
+    /// in it never reaches a class loader.
+    pub format_errors: Vec<String>,
 }
 
 /// One entry of the JVMS §4.7.6 `InnerClasses` attribute.
@@ -45,6 +53,11 @@ pub struct InnerClassEntry {
 
 /// JVMS §4.4.7: a `CONSTANT_Utf8_info` carries a `u2` byte count.
 const MAX_UTF8_CONST: usize = 65535;
+
+/// JVMS §4.7.3: `code_length` is a `u4`, but "must be less than 65536".
+/// A longer method is not encodable, and a class loader rejects the file
+/// while parsing it ("Invalid method Code length").
+pub const MAX_CODE_LENGTH: usize = 65535;
 
 /// Modified-UTF-8 width of one char. `\0` is two bytes, not one -- and the
 /// SID-10 encoding does produce `\0` (it is what `avoidZero` turns `0x7f`

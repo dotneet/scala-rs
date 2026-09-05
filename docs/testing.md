@@ -664,3 +664,30 @@ yet — `Type::TypeMember` carries no prefix, so the two `Representation`s still
 collapse — so what `c4_alias_terminates_with_a_diagnostic` pins is that the
 compiler *answers*, and `scalac_accepts_c4_alias` pins that real scalac
 2.13.16 accepts the file, so the gap is ours and not the code's.
+
+## `tests/classfile_lint.py` — what nothing else was reading
+
+Every check in the list above stops before a method body, or reaches only the
+bodies a program happens to call:
+
+* `Class.forName(initialize = false)` in `tests/slick_subset.sh` parses the
+  file and its constant pool and **does not link**, so no method is verified.
+* `javap -p` parses the constant pool too. It caught two files whose
+  `CONSTANT_Utf8` length had wrapped past 65535 — and it reads a method whose
+  `code_length` is 140713 back without a murmur, because that field is a `u4`.
+* `tests/slick_run.sh` and `tests/conform/` execute code, which is the only
+  thing that verifies a body — of the methods they call.
+
+So an offset that wrapped on its way into the file reached nobody until someone
+ran the method. `tests/classfile_lint.py <dir>…` closes part of that gap: it
+reads `javap -c -p`, which prints every branch target as an absolute offset,
+and reports a branch that leaves its own method (a wrapped offset shows up as a
+negative or absurd target) or a method whose code is 65536 bytes or longer.
+About 3 seconds for slick's 1596 classes, so it runs inside both
+`tests/slick_run.sh` (right after the scala-rs build of slick) and
+`tests/slick_subset.sh` (right after the loader check), printing
+`lint_classes=N lint_problems=M`.
+
+It is a **structural** check and nothing more. It says nothing about types,
+stack depth, or whether a branch target carries a stack map frame — a bad frame
+still needs a JVM to find it.

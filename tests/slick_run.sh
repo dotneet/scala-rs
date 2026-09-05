@@ -115,6 +115,12 @@ if [[ ${REUSE_RS:-0} != 1 || ! -d $WORK/out-rs ]]; then
   # Print files= alongside errors= and classes=: a truncated slick checkout
   # reads as a clean build otherwise.
   echo "   scala-rs: files=${#FILES[@]} errors=$E classes=$C"
+  # Structural check over *every* class we just wrote, not only the ones the
+  # programs below happen to call: a branch offset that wrapped, or a method
+  # over the 64 KB the format allows. Neither is visible to the loader check
+  # in slick_subset.sh (which stops after the constant pool) nor to the runs
+  # below (which reach a fraction of the methods). ~3 s for 1600 classes.
+  python3 "$ROOT/tests/classfile_lint.py" $WORK/out-rs | tail -20
 fi
 
 CP_A=$WORK/out-rs:$RES:$DEPS:$H2:$LIB
