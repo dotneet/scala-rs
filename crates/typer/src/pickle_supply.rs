@@ -3310,10 +3310,19 @@ impl PickleSupply {
         match t {
             SigType::Annotated(inner) => self.conv_at(st, bin, scope, inner, d),
             SigType::Existential { quantified, result } => {
-                // `List[_]`: the quantified variables stand for wildcards.
+                // `List[_]`: the quantified variables stand for wildcards, and
+                // a *bounded* one keeps its bound. Dropping the bound is not
+                // free: `Shape[_ <: FlatShapeLevel, F, T, G]` (slick's
+                // `Query.map`) then offers nothing for a candidate's own
+                // `Level` to be solved from, so `repColumnShape` was dropped
+                // for leaving a type parameter undetermined and `q.map(_.title)`
+                // was "could not find implicit value of type Shape[_, Rep[String],
+                // T, G]". The source path already builds `BoundedWildcard`
+                // (`subst_quantified`); this is the pickle half.
                 let mut inner = scope.clone();
                 for q in quantified {
-                    inner.insert(q.name.clone(), Type::Wildcard);
+                    let w = self.exist_wildcard(st, bin, scope, q, d);
+                    inner.insert(q.name.clone(), w);
                 }
                 self.conv_at(st, bin, &inner, result, d)
             }
@@ -3371,6 +3380,39 @@ impl PickleSupply {
             // The remaining forms (`super`, bare bounds, literal types) have
             // no faithful counterpart here yet.
             _ => None,
+        }
+    }
+
+    /// The wildcard one quantified variable of an existential stands for.
+    ///
+    /// `_ >: Nothing <: Any` is the plain `Wildcard`; anything narrower keeps
+    /// the bound, because that is the only thing a unification against the
+    /// wildcard's position can read. A bound this reader cannot convert (a
+    /// higher-kinded quantified variable, an F-bound naming the variable
+    /// itself) falls back to the plain wildcard rather than guessing.
+    fn exist_wildcard(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        q: &scala_rs_pickle::sym::TParam,
+        d: u32,
+    ) -> Type {
+        let SigType::Bounds { lo, hi } = &q.bounds else {
+            return Type::Wildcard;
+        };
+        let lo = self
+            .conv_at(st, bin, scope, lo, d)
+            .filter(|t| !matches!(t, Type::Nothing));
+        let hi = self
+            .conv_at(st, bin, scope, hi, d)
+            .filter(|t| !matches!(t, Type::Any));
+        if lo.is_none() && hi.is_none() {
+            return Type::Wildcard;
+        }
+        Type::BoundedWildcard {
+            lo: lo.map(Box::new),
+            hi: hi.map(Box::new),
         }
     }
 
