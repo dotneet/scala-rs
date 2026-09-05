@@ -880,39 +880,75 @@ of most of these notes.
 
   Still open on this path, found by the same fixtures:
 
-  - **A trait's `lazy val` has no interface-side initialiser.** nsc compiles
-    one to a `default` method holding the initialiser plus the usual `d$`
-    static, and the implementing class's `d$lzycompute` calls that static. We
-    declare the accessor abstract instead, so a class real scalac compiles
-    over our trait fails with `NoSuchMethodError: 'int L.d$(L)'` the first
-    time the `lazy val` is *read*. Not specific to `private` (the `ti_lib.scala`
-    case is only `private` because that is where it was found): a plain
-    `lazy val` in a trait fails the same way. `ti_lib.scala` declares one and
-    deliberately never reads it.
+  All four are ~~fixed~~ in `agent/traitbinary`, with a mixed-compiler run per
+  symptom in `crates/cli/tests/traitclass.rs` (`bt2_` fixtures) -- both ways
+  round, because 1 only shows up with scalac on our side of the class file and
+  2/3/4 only with scalac on the other:
 
-  - **The reverse of the `super` accessor.** scala-rs mixing in a *binary*
-    stackable trait emits neither the mixin forwarder nor the
-    `p$q$T$$super$m` accessor, because both are driven by `TraitImpls`, which
-    is harvested from source. The result is silent: `new Stacked().label`
-    prints the base implementation. The interface's own member list has what
-    is needed (an `m$` static marks a concrete trait method, and the
-    `…$$super$…` declaration marks the accessor), but `emit_mixin_forwarders`
-    is tree-shaped and a symbol-shaped path beside it would fire for every
-    scala-library trait too, so it wants its own slice.
+  - ~~**A trait's `lazy val` has no interface-side initialiser.**~~ nsc
+    compiles one to a `default` method holding the initialiser plus the usual
+    `d$` static, and the implementing class's `d$lzycompute` calls that
+    static; we declared the accessor abstract, so a class real scalac compiled
+    over our trait failed with `NoSuchMethodError: 'int L.d$(L)'` the first
+    time the `lazy val` was *read*. `emit_trait_bodies` now emits the pair
+    (`lazy_val_as_def`), and the abstract declaration is suppressed so the two
+    do not collide. The accessor stays public even for a `private lazy val`
+    (under nsc's expanded name): a `private static` of one class file is not
+    callable from another.
 
-  - **A binary trait's `var` cannot be assigned from outside.** `c.count = 9`
-    where `count` is a `var` of a trait read from `-cp` is
-    `error: reassignment to val count`: the classfile/pickle reader does not
-    carry MUTABLE onto the accessor. `ti_app.scala` goes through a trait
-    method instead.
+    The mirror image was owed too, and only a *running* test found it: a class
+    of ours mixing in a **binary** trait's `lazy val` inherited the interface's
+    `default` and recomputed the initialiser on every read.
+    `Gen::binary_mixin_lazy_vals` gives it the field, the `bitmap$0` bit and
+    the `d$lzycompute` that calls the static. Telling a `lazy val` from a
+    concrete `def` on an interface is only possible through the pickle -- the
+    accessor is `ACCESSOR` there, so `install_classpath` gives it
+    `SymKind::Term` -- and a non-lazy trait `val` has no static at all.
 
-  - **A binary trait's *deferred* members look concrete to us.**
-    `class B extends Base { def m = "b" }`, with `Base` read from `-cp` and
-    `m` deferred there, is rejected with ```override` modifier required to
-    override concrete member``. The classfile scanner keeps no DEFERRED, and
-    that is also why `binary_trait_vals` cannot tell a concrete trait `var`
-    from a deferred one and skips the name when anything else in the
-    linearization supplies it.
+  - ~~**The reverse of the `super` accessor.**~~ scala-rs mixing in a *binary*
+    stackable trait emitted neither the mixin forwarder nor the
+    `p$q$T$$super$m` accessor, because both were driven by `TraitImpls`, which
+    is harvested from source. The result was silent: `new Stacked().label`
+    printed the base implementation and exited 0. `binary_trait_defines` reads
+    the mark off the interface (nsc puts a `static m$(Iface, …)` beside every
+    concrete trait method and nothing else on an interface carries that name),
+    `binary_trait_super_accessors` reads the `…$$super$…` declarations, and
+    `next_lin_impl` / `super_target_desc` follow a binary layer in the middle
+    of a stack.
+
+    The worry recorded here was that a symbol-shaped forwarder path would fire
+    for every scala-library trait. It does not, because we only owe a
+    forwarder where the JVM would otherwise disagree with the linearization,
+    and there is exactly one such shape: a class method always beats an
+    interface `default`, so a trait member the *superclass* also defines
+    concretely never runs. Everywhere else the JVM's own
+    most-specific-interface rule already picks what SLS 5.1.2 picks.
+    `emit_binary_mixin_forwarders` is gated on exactly that.
+
+  - ~~**A binary trait's `var` cannot be assigned from outside.**~~ and
+    ~~**a binary trait's *deferred* members look concrete to us**~~ were one
+    root, as suspected: `install_classpath` allocated every pickled member
+    `Flags::EMPTY`. Neither bit is in the class file -- an interface declares
+    a `val`'s and a `var`'s getter identically, and declares a concrete member
+    of a trait exactly as it declares a deferred one -- so the unpickler now
+    reads them (`PickledMethod::is_mutable` is "an accessor the pickle does
+    not mark `STABLE`", which is how nsc itself tells the two apart, and
+    `is_deferred` is `DEFERRED_PKL`, bit 8 after `rawToPickledFlags`).
+
+    Our own pickler had the matching hole in the other direction: a *deferred*
+    `val` / `var` of a trait carries no `Flags::ABSTRACT` (for a term it is
+    `Symbol::deferred_val`), so it was pickled as a definition and scalac
+    asked the class implementing the trait for an `override` modifier.
+
+  Still open on this path:
+
+  - **`binary_trait_vals` still cannot tell a concrete trait `var` from a
+    deferred one**, and skips the name when anything else in the
+    linearization supplies it. The pickle now carries what it needs
+    (`is_deferred` reaches `Symbol::deferred_val` for a term and
+    `Flags::ABSTRACT` for a method), but that is a `gen.rs` change with its
+    own risk of handing a class a second field that shadows one it inherits,
+    and nothing observed is currently wrong.
 
 - **`catch { case _: MatchError => … }` names the bare class in
   `--no-scala-library`** (`agent/fewerclasses`, found in passing; not fixed,

@@ -12,11 +12,10 @@ trait Counter {
   private val n: Int = 7
   private[this] val seed: String = "s"
   private var m: Int = 1
-  // Declared but deliberately never *read* here. The expanded name is what
-  // this file checks (`tilib$Counter$$doubled`); evaluating a trait `lazy val`
-  // from a class real scalac compiled needs nsc's `d$` static beside a
-  // `default` initialiser, which we do not emit yet for a `lazy val` of any
-  // access -- a separate gap, recorded in `docs/notes/known-gaps-backlog.md`.
+  // Declared but deliberately never *read* here: the expanded name
+  // (`tilib$Counter$$doubled`) is what this file checks. Evaluating a trait
+  // `lazy val` from a class real scalac compiled is covered by `bt2_lib.scala`
+  // instead.
   private lazy val doubled: Int = n * 2
   private[tilib] val pkg: Int = 5
   protected val prot: Int = 6

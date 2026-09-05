@@ -135,7 +135,16 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
                             }
                         }
                     }
-                    add_term(st, owner, &m.name, ty);
+                    let id = add_term(st, owner, &m.name, ty);
+                    // `MUTABLE` and `DEFERRED` live only in the pickle: an
+                    // interface declares a `val`'s and a `var`'s getter
+                    // identically, and declares a concrete member of a trait
+                    // exactly as it declares a deferred one.
+                    if m.is_mutable {
+                        let f = st.get(id).flags.with(Flags::MUTABLE);
+                        st.get_mut(id).flags = f;
+                    }
+                    st.get_mut(id).deferred_val = m.is_deferred;
                     continue;
                 }
                 if m.is_ctor {
@@ -153,6 +162,10 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
                 );
                 if m.is_implicit {
                     let f = st.get(id).flags.with(Flags::IMPLICIT);
+                    st.get_mut(id).flags = f;
+                }
+                if m.is_deferred {
+                    let f = st.get(id).flags.with(Flags::ABSTRACT);
                     st.get_mut(id).flags = f;
                 }
             }
