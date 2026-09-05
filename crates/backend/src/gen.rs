@@ -341,9 +341,10 @@ struct EmitCtx<'a> {
     /// Lambda bodies waiting to become static methods of `hoist_owner`.
     lambda_bodies: &'a RefCell<Vec<PendingBody>>,
     /// Internal name of the classfile currently being built, when it can
-    /// take extra static methods. `None` for an interface (JVMS forbids the
-    /// flags nsc's `$anonfun$` methods carry there), which makes every
-    /// lambda in that context fall back to an anonymous class.
+    /// take extra static methods. An interface counts: nsc puts a trait's
+    /// `$anonfun$` bodies on the interface too (only `ACC_FINAL` has to come
+    /// off — see [`emit_lambda_body`]). `None` makes every lambda in that
+    /// context fall back to an anonymous class.
     hoist_owner: Option<&'a str>,
     source: &'a str,
     /// If generating inside a lambda, field on the lambda class holding the outer `this`.
@@ -1804,8 +1805,13 @@ fn narrowing_return_cast(from: &str, to: &str) -> Option<String> {
     Some(t[1..t.len() - 1].to_string())
 }
 
+/// nsc's expanded `super` accessor of a stackable trait: `p$q$T$$super$m`,
+/// named after the trait's *internal* name and not its simple one. A class
+/// real scalac compiles implements the name nsc expands to, so anything
+/// shorter is an `AbstractMethodError` the moment the class is not ours.
 fn super_accessor_name(st: &SymbolTable, trait_id: SymbolId, method: &str) -> String {
-    format!("{}$$super${}", st.get(trait_id).name, method)
+    let owner = class_internal(st, trait_id).replace('/', "$");
+    format!("{owner}$$super${}", encode_method_name(method))
 }
 
 /// nsc's expanded outer accessor of a *trait*: `Main$Outer$T$$$outer`.
@@ -1994,6 +2000,17 @@ fn reads_via_accessor(st: &SymbolTable, id: SymbolId) -> bool {
 fn trait_static_desc(iface: &str, inst_desc: &str) -> String {
     let rest = inst_desc.strip_prefix('(').unwrap_or(inst_desc);
     format!("(L{iface};{rest}")
+}
+
+/// nsc 2.13's name for the `static` forwarder that sits on the interface
+/// beside every concrete trait method: `m$`, taking the receiver as its first
+/// parameter. Every mixin forwarder and every `super` call into a trait goes
+/// through it, because `invokespecial` on a default method would require the
+/// interface to be a *direct* superinterface of the caller and it usually is
+/// not. Idempotent under `encode_method_name` (`<` is `$less`, so the
+/// forwarder is `$less$`), which is what the assembler applies again.
+fn trait_static_name(name: &str) -> String {
+    format!("{}$", encode_method_name(name))
 }
 
 fn type_jvm_name(st: &SymbolTable, ty: &Type) -> String {
@@ -3211,17 +3228,23 @@ impl<'a> Gen<'a> {
             b.access = ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT;
             b.super_name = "java/lang/Object".into();
             for stt in &impl_.body {
-                if let TreeKind::DefDef { name, mods, .. } = &stt.kind {
+                if let TreeKind::DefDef {
+                    name, mods, rhs, ..
+                } = &stt.kind
+                {
                     if name == "<init>" || name == "<clinit>" {
                         continue;
                     }
                     // A genuinely private trait method (JVMS 4.6 forbids
-                    // `ACC_PRIVATE | ACC_ABSTRACT`) never appears in the
-                    // interface: only its `$class` body does, and every
-                    // caller lives inside the trait's own code, so nothing
-                    // outside needs an abstract signature to dispatch
-                    // through. See `is_trait_private_def`.
-                    if !is_trait_private_def(self.st, stt) {
+                    // `ACC_PRIVATE | ACC_ABSTRACT`) never appears as a
+                    // declaration: every caller lives inside the trait's own
+                    // code, so nothing outside needs an abstract signature to
+                    // dispatch through. See `is_trait_private_def`.
+                    //
+                    // A *concrete* method gets a `default` method with the
+                    // body from `emit_trait_bodies` instead of an abstract
+                    // declaration here.
+                    if !is_trait_private_def(self.st, stt) && rhs.is_empty() {
                         let acc = method_access_flags(mods.flags, widened(self.st, stt.sym))
                             | ACC_ABSTRACT;
                         b.add_abstract(acc, name, &def_method_desc(self.st, stt));
@@ -3290,13 +3313,14 @@ impl<'a> Gen<'a> {
             for (n, d) in self.default_getter_sigs(class_id) {
                 b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT | ACC_SYNTHETIC, &n, &d);
             }
+            // The concrete half: `default` methods, their `m$` statics and
+            // `$init$`, all on the interface itself (nsc 2.13's trait ABI).
+            self.emit_trait_bodies(&mut b, class_id, &this_name);
             attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
             self.finish_companion_class(b, has_object);
-            self.emit_trait_impl_class(tree, &this_name);
-            // JVMS 4.6 forbids `ACC_FINAL` (and a body-less `ACC_STATIC`) on
-            // an interface method, so nothing may hoist a `$anonfun$` into
-            // one. The interface half of a trait emits no code at all, and
-            // `emit_trait_impl_class` drains what its own `$class` queued.
+            // `emit_trait_bodies` drains whatever the trait's own bodies
+            // queued, onto the interface (nsc puts `$anonfun$` statics there
+            // too). Nothing may leak into the enclosing classfile's queue.
             debug_assert_eq!(
                 self.lambda_watermark(),
                 lambda_wm,
@@ -4003,9 +4027,9 @@ impl<'a> Gen<'a> {
             for id in &mutable_params {
                 frame.locals.remove(id);
             }
-            for (impl_cls, init_desc) in &mixin_inits {
+            for (iface, init_desc) in &mixin_inits {
                 asm.aload(0);
-                asm.invokestatic(impl_cls, "$init$", init_desc);
+                asm.invokestatic_interface(iface, "$init$", init_desc);
             }
             let ctx = emit_ctx(
                 st,
@@ -4357,8 +4381,21 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn emit_trait_impl_class(&mut self, tree: &Tree, iface: &str) {
-        let class_id = tree.sym;
+    /// The concrete half of a trait, emitted **onto the interface itself**,
+    /// which is what nsc 2.13 does and what a separately compiled subclass
+    /// expects to find (see `docs/notes/bytecode-and-java-interop.md`).
+    ///
+    /// * a concrete `def m` becomes a `default` method holding the body, plus
+    ///   `public static m$($this: T, …)` forwarding to it;
+    /// * a genuinely `private def h` becomes `private static h$($this: T, …)`
+    ///   holding the body and nothing else — no declaration, no forwarder;
+    /// * the `val` initializers and bare statements become
+    ///   `public static void $init$(T)`.
+    ///
+    /// The bodies are byte-for-byte what the old `<Iface>$class` statics held:
+    /// slot 0 is the receiver in both shapes, so parameters keep their slots
+    /// and the verification types are the same.
+    fn emit_trait_bodies(&self, b: &mut ClassBuilder, class_id: SymbolId, iface: &str) {
         let methods = self
             .traits
             .impls
@@ -4371,21 +4408,17 @@ impl<'a> Gen<'a> {
             .get(&class_id)
             .cloned()
             .unwrap_or_default();
-        if methods.is_empty() && inits.is_empty() {
-            return;
-        }
-        let impl_name = format!("{}$class", iface);
         let lambda_wm = self.lambda_watermark();
-        let mut b = ClassBuilder::new(impl_name, self.source_name);
-        b.access = ACC_PUBLIC | ACC_SUPER | ACC_FINAL;
         for def in &methods {
-            self.emit_trait_impl_method(&mut b, class_id, iface, def);
+            self.emit_trait_impl_method(b, class_id, iface, def);
         }
-        if !inits.is_empty() {
-            self.emit_trait_init(&mut b, class_id, iface, &inits);
-        }
-        self.drain_lambdas(&mut b, lambda_wm);
-        self.out.push(b.finish());
+        // Unconditionally, even when there is nothing to run: nsc emits
+        // `$init$` on *every* trait interface and every class it compiles
+        // calls it for every mixed-in trait, without consulting whether the
+        // body would be empty. A trait of ours with no initializers and no
+        // `$init$` is a `NoSuchMethodError` in a subclass real scalac built.
+        self.emit_trait_init(b, class_id, iface, &inits);
+        self.drain_lambdas(b, lambda_wm);
     }
 
     fn emit_trait_init(
@@ -4512,16 +4545,20 @@ impl<'a> Gen<'a> {
         let meth = def.sym;
         let caps = trait_capture_accessors(self.st, boxed_vars, trait_id);
         let max_locals = max_locals + caps.iter().map(|c| c.3.slots()).sum::<u16>();
-        // The `$class` static forwarder is `private` when the source method
-        // is: nothing outside this file calls it (no interface signature, no
-        // mixin forwarder -- see `is_trait_private_def`), so keeping it
-        // `private` here matches source visibility instead of leaking it.
-        let static_acc = if is_trait_private_def(self.st, def) {
-            ACC_PRIVATE | ACC_STATIC
+        let private = is_trait_private_def(self.st, def);
+        // A genuine `private` has no declaration on the interface and no
+        // mixin forwarder, so its body cannot be a `default` method (JVMS
+        // §4.6 forbids `ACC_PRIVATE | ACC_ABSTRACT`, and a `private default`
+        // would still be unreachable from the classes that mix the trait in).
+        // It stays a `private static` taking `$this`, which every caller —
+        // all of them textually inside the trait — reaches with a same-class
+        // `invokestatic`.
+        let (body_acc, body_name, body_desc) = if private {
+            (ACC_PRIVATE | ACC_STATIC, trait_static_name(name), desc)
         } else {
-            ACC_PUBLIC | ACC_STATIC
+            (ACC_PUBLIC, name.clone(), inst_desc.clone())
         };
-        b.add_code(static_acc, name, &desc, max_locals, |asm| {
+        b.add_code(body_acc, &body_name, &body_desc, max_locals, |asm| {
             let mut frame = frame;
             emit_trait_capture_prologue(asm, &mut frame, &iface_owned, &caps);
             let mut ctx = emit_ctx(
@@ -4540,6 +4577,37 @@ impl<'a> Gen<'a> {
             ctx.method_sym = meth;
             finish_method_body(asm, &mut frame, &ctx, rhs, &ret_for_body);
         });
+        if private {
+            return;
+        }
+        // `public static m$($this, …)`: nsc's entry point for the mixin
+        // forwarder every implementing class carries and for `super` calls
+        // into the trait, forwarding to the `default` method with
+        // `invokespecial` on this very interface.
+        let iface_c = iface.to_string();
+        let name_c = name.clone();
+        let inst_c = inst_desc.clone();
+        let static_desc = trait_static_desc(iface, &inst_desc);
+        let mut locals = 1u16;
+        let mut loads = Vec::new();
+        for s in desc_param_sorts(desc_params(&inst_desc)) {
+            loads.push((locals, s));
+            locals += s.slots();
+        }
+        b.add_code(
+            ACC_PUBLIC | ACC_STATIC,
+            &trait_static_name(name),
+            &static_desc,
+            locals.max(1),
+            move |asm| {
+                asm.aload(0);
+                for (slot, sort) in &loads {
+                    load(asm, *slot, *sort);
+                }
+                asm.invokespecial_interface(&iface_c, &name_c, &inst_c);
+                emit_return(asm, &ret);
+            },
+        );
     }
 
     fn mixin_val_fields(
@@ -4831,7 +4899,11 @@ impl<'a> Gen<'a> {
                         Some((next, true)) => {
                             let iface = class_internal(self.st, next);
                             let static_desc = trait_static_desc(&iface, &call_c);
-                            asm.invokestatic(&format!("{}$class", iface), &name, &static_desc);
+                            asm.invokestatic_interface(
+                                &iface,
+                                &trait_static_name(&name),
+                                &static_desc,
+                            );
                         }
                         Some((next, false)) => {
                             let owner = class_internal(self.st, next);
@@ -5192,17 +5264,21 @@ impl<'a> Gen<'a> {
                 loads.push((locals, sort));
                 locals += sort.slots();
             }
-            let impl_class = format!("{}$class", iface);
             let name_c = name.clone();
             let inst_c = inst_desc.clone();
             let static_c = static_desc.clone();
-            let impl_c = impl_class.clone();
+            // nsc's shape: `invokestatic <Iface>.m$`, an `InterfaceMethodref`.
+            // `invokespecial` on the `default` method would need the
+            // interface to be a *direct* superinterface of this class, which
+            // a trait several steps up the linearization is not.
+            let iface_c = iface.clone();
+            let static_name = trait_static_name(&name);
             b.add_code(ACC_PUBLIC, &name_c, &inst_c, locals.max(1), |asm| {
                 asm.aload(0);
                 for (slot, sort) in &loads {
                     load(asm, *slot, *sort);
                 }
-                asm.invokestatic(&impl_c, &name_c, &static_c);
+                asm.invokestatic_interface(&iface_c, &static_name, &static_c);
                 emit_return(asm, &ret);
             });
         }
@@ -5935,10 +6011,11 @@ impl<'a> Gen<'a> {
             let desc = "(Ljava/lang/Object;)Z";
             let static_desc = "(Lscala/math/Ordered;Ljava/lang/Object;)Z";
             let name = op.to_string();
+            let static_name = trait_static_name(op);
             b.add_code(ACC_PUBLIC, &name, desc, 2, |asm| {
                 asm.aload(0);
                 asm.aload(1);
-                asm.invokestatic("scala/math/Ordered$class", &name, static_desc);
+                asm.invokestatic_interface("scala/math/Ordered", &static_name, static_desc);
                 asm.ireturn();
             });
         }
@@ -6852,8 +6929,10 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// `T$class.$init$(this)` for every mixed-in trait that has `val`s to
-    /// set, in reverse linearization order (base traits first).
+    /// `<Iface>.$init$(this)` for every mixed-in trait that has `val`s to
+    /// set, in reverse linearization order (base traits first). `$init$` is a
+    /// `static` method on the interface itself, so the call is an
+    /// `invokestatic` through an `InterfaceMethodref`.
     fn mixin_init_calls(&self, class_id: SymbolId) -> Vec<(String, String)> {
         if class_id.is_none() {
             return Vec::new();
@@ -6867,7 +6946,7 @@ impl<'a> Gen<'a> {
                     return None;
                 }
                 let iface = class_internal(self.st, p);
-                Some((format!("{}$class", iface), format!("(L{iface};)V")))
+                Some((iface.clone(), format!("(L{iface};)V")))
             })
             .collect()
     }
@@ -7000,9 +7079,9 @@ impl<'a> Gen<'a> {
                 asm.aload(0);
                 asm.putstatic(&class_name, "MODULE$", &format!("L{class_name};"));
             }
-            for (impl_cls, init_desc) in &mixin_inits {
+            for (iface, init_desc) in &mixin_inits {
                 asm.aload(0);
-                asm.invokestatic(impl_cls, "$init$", init_desc);
+                asm.invokestatic_interface(iface, "$init$", init_desc);
             }
             if delayed {
                 if library_abi && is_app {
@@ -10897,7 +10976,7 @@ fn invoke_super(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
     let owner = class_internal(ctx.st, owner_id);
     if is_interface_sym(ctx.st, owner_id) {
         let static_desc = trait_static_desc(&owner, &desc);
-        asm.invokestatic(&format!("{}$class", owner), &s.name, &static_desc);
+        asm.invokestatic_interface(&owner, &trait_static_name(&s.name), &static_desc);
     } else {
         asm.invokespecial(&owner, &s.name, &desc);
     }
@@ -14692,12 +14771,12 @@ fn invoke_method(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, result_ty: Op
     if is_interface_sym(ctx.st, owner_id) {
         // A trait-private method has no interface signature (see
         // `is_trait_private_def`): every caller is textually inside the
-        // trait, so it's compiled onto `<Iface>$class` too, and reaching it
-        // is a same-class `invokestatic`, not `invokeinterface` on a
-        // declaration that doesn't exist.
+        // trait, so its body is a `private static <name>$` on the interface
+        // and reaching it is a same-class `invokestatic`, not
+        // `invokeinterface` on a declaration that doesn't exist.
         if s.flags.contains(Flags::PRIVATE) && !widened(ctx.st, id) {
             let static_desc = trait_static_desc(&owner, &desc);
-            asm.invokestatic(&format!("{owner}$class"), name, &static_desc);
+            asm.invokestatic_interface(&owner, &trait_static_name(name), &static_desc);
         } else {
             asm.invokeinterface(&owner, name, &desc);
         }
@@ -17695,8 +17774,18 @@ fn gen_function_indy(
     }
     impl_desc.push_str(")Ljava/lang/Object;");
     let impl_name = format!("$anonfun${n}");
+    // A lambda in a trait's `default` method (or in its `$init$`) hoists onto
+    // the interface, and the method handle then has to be an
+    // `InterfaceMethodref`.
+    let owner_is_iface = owner == ctx.class_name && is_interface_sym(ctx.st, ctx.class_sym);
     asm.invokedynamic_lambda(
-        "apply", &sam_desc, &call_desc, owner, &impl_name, &impl_desc,
+        "apply",
+        &sam_desc,
+        &call_desc,
+        owner,
+        &impl_name,
+        &impl_desc,
+        owner_is_iface,
     );
 
     ctx.lambda_bodies.borrow_mut().push(PendingBody {
@@ -17731,7 +17820,13 @@ fn emit_lambda_body(
     // nsc's own `$anonfun$` methods are `public static final synthetic`;
     // public matters because a lambda nested inside a closure class links its
     // `invokedynamic` to a body method that lives on a *different* class.
-    let access = ACC_PUBLIC | ACC_STATIC | ACC_FINAL | ACC_SYNTHETIC;
+    // On an interface — a lambda inside a trait's `default` method hoists
+    // there, exactly as nsc's do — JVMS §4.6 forbids `ACC_FINAL`.
+    let access = if b.access & ACC_INTERFACE != 0 {
+        ACC_PUBLIC | ACC_STATIC | ACC_SYNTHETIC
+    } else {
+        ACC_PUBLIC | ACC_STATIC | ACC_FINAL | ACC_SYNTHETIC
+    };
     let owner = b.this_name.clone();
     let base = u16::from(pb.has_outer);
     let n_caps = pb.local_caps.len() as u16;
