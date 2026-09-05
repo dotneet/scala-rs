@@ -252,3 +252,13 @@ it compiled in an earlier round is read back as an ordinary method and the call
 site emits a real invocation. Reproducible with no `reify` in the program at
 all; `macro-reify-basic` is one implemented `@macroImpl` pickle away from
 passing.
+
+One `neg` test moves the other way: `neg` goes 658 → 657 because
+`test/files/neg/macro-cyclic` stops being rejected. It was passing for the
+wrong reason — we refused `c.universe.reify { implicitly[SourceLocation] }`
+because `implicitly` was unclassified, while nsc rejects it as a *cyclic
+reference* (the only implicit candidate is the `implicit def sourceLocation =
+macro impl` being type-checked). Reifying `implicitly` as a `Predef` member is
+right; scala-rs then finds that candidate and accepts the file, because it has
+no counterpart to nsc's cyclic check. This is exactly the caveat the corpus
+harness documents about `neg` being an upper bound.

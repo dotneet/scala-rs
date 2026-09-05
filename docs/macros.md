@@ -2475,6 +2475,18 @@ because it is not about reify:
   ```
 * The rest need free terms, `new`, function literals, or type ascriptions.
 
+**One `neg` test moves the other way, and it is the corpus's own caveat in the flesh.**
+`neg` goes 658 → **657** because `test/files/neg/macro-cyclic` stops being rejected. It was passing
+for the wrong reason: its body is `c.universe.reify { implicitly[SourceLocation] }`, we rejected it
+with "`implicitly` is a local, a parameter, …", and nsc rejects it with `could not find implicit
+value for parameter e: SourceLocation` — a **cyclic reference**, because the only candidate is the
+very `implicit def sourceLocation = macro impl` being type-checked. Reifying `implicitly` as a
+`Predef` member is right; scala-rs then finds that candidate and accepts the file, since it has no
+counterpart to nsc's cyclic-reference check for an implicit a macro implementation reaches through
+its own macro def. So the diagnostic that went away was wrong, and the one that should replace it
+was never there. `pos` is unchanged (its 7 tests in this cluster all need free terms, definitions,
+`new` or a type ascription).
+
 The 7 `pos` tests in the same cluster are unchanged: they need free terms (`t5738`, `t5742`, `t531`,
 `t532`), definitions (`t5223`), `new` (`t8947`) or a type ascription (`liftcode_polymorphic`).
 
