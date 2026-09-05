@@ -438,9 +438,42 @@ fn member_type_at(st: &SymbolTable, cls: SymbolId, m: SymbolId) -> Type {
     st.expand_type_members(cls, &ty)
 }
 
+/// Two class types no instantiation can make equal, whatever type parameters
+/// their arguments mention.
+///
+/// `robust` refuses to compare anything containing a type parameter, which is
+/// the right default -- but it also throws away a comparison that needs no
+/// argument at all. `C[X]` and `D[X]` are the same type only if `C` and `D`
+/// are the same class, and one being a *strict* subclass of the other settles
+/// that: strictness is what rules out the duplicate symbols the same classfile
+/// can leave behind (two readings of one class are mutual subtypes, and this
+/// says nothing about them).
+///
+/// cats writes the same method at each level of its type-class tower --
+/// `Functor.compose[G[_]: Functor]`, then `Apply.compose[G[_]: Apply]`, then
+/// `Applicative`, `Traverse`, `Reducible`, `Bitraverse`, ... -- with no
+/// `override` on any of them, because a different implicit parameter makes
+/// each one an *overload*. All nine were "`override` modifier required".
+fn definitely_different(st: &SymbolTable, a: &Type, b: &Type) -> bool {
+    let (Type::Class { sym: x, .. }, Type::Class { sym: y, .. }) = (a, b) else {
+        return false;
+    };
+    if x == y {
+        return false;
+    }
+    let bare = |s: SymbolId| Type::Class {
+        sym: s,
+        args: Vec::new(),
+    };
+    st.is_sub_type(&bare(*x), &bare(*y)) != st.is_sub_type(&bare(*y), &bare(*x))
+}
+
 fn same_type(st: &SymbolTable, a: &Type, b: &Type) -> bool {
     if a == b {
         return true;
+    }
+    if definitely_different(st, a, b) {
+        return false;
     }
     if !robust(a) || !robust(b) {
         return true;

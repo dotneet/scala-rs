@@ -658,6 +658,9 @@ impl Typer {
                 }
             }
         }
+        // A parameterless collection member returns the receiver's own class,
+        // and only the application path put that back.
+        self.rebuild_parameterless_collection(tree.sym, &name, &recv_ty, &mut tree.ty);
         // A function value's `apply` is the function itself. The prelude's
         // `FunctionN.apply` is declared over erased parameters, so selecting it
         // through a `Type::Function` receiver produced `(Any)Any` and

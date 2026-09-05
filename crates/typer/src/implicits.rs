@@ -534,7 +534,7 @@ impl Typer {
     /// Every parameter clause is implicit, so the candidate is usable as long
     /// as its own implicits resolve (`implicit def listShow[A](implicit s:
     /// Show[A]): Show[List[A]]`).
-    fn only_implicit_clauses(&self, id: SymbolId) -> bool {
+    pub(crate) fn only_implicit_clauses(&self, id: SymbolId) -> bool {
         let s = self.st.get(id);
         s.paramss.iter().all(|c| {
             c.iter()
