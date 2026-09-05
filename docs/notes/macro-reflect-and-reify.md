@@ -117,3 +117,107 @@ The tests are 3 new ones added to `crates/cli/tests/engine.rs` (`rb_reify_expand
 * The `value apply is not a member of TableQuery[E]` that remains on the same line is the remaining issue from §7.13 (overload selection for `TableQuery.apply`) and is unrelated to reify.
 * **Inferred type arguments** at the call site still do not reach the macro (remaining issue 1 of §7.13), so `rb_use.scala` writes the type argument out explicitly as `RbUse.idOf[Int](5)`.
 * *Free terms* for locals and parameters, blocks, function literals, `this`, and type annotations are all unimplemented (diagnosed by name).
+
+### `currentMirror`, `runtimeMirror`, and nested types of the reflect API (the `agent/reflectruntime` slice)
+
+The scala/scala test corpus's `test/files/run/` has roughly 200 failures whose
+diagnostic is not a wrong answer but a missing name: `value currentMirror is
+not a member of package scala.reflect.runtime` (147), `not found: type
+TypeTag` (16), `not found: type WeakTypeTag` (6), `type Transformer is not a
+member of Universe` (6), `not found: value runtimeMirror` (5), plus a handful
+of `<notype>` variants. None of these are about macro expansion or `TypeTag`
+materialisation (both separate, already-tracked jobs); the names were never
+*installed* at all, on receivers this project can otherwise already reify.
+
+Three independent roots, all in the "supply" layer:
+
+1. **Nested classes of the reflect API were never installed as types.**
+   `PickleSupply::complete_type_member_uncached` (`crates/typer/src/
+   pickle_supply.rs`) only recognised a pickled member of kind `TypeAlias` or
+   `AbstractType`; a `MemberKind::Class` hit (a nested trait or abstract
+   class — `TypeTags.TypeTag`, `TypeTags.WeakTypeTag`, `Trees.Transformer`,
+   and the rest of the reflect API written the same way) fell through to
+   `None`. This is the *type* half of the gap `agent/reifyd` closed the *term*
+   half of (§7.13 item 1, nested `object`s); `docs/macros.md` line 1132 and
+   this file's own §"Confirming the same root cause" section had already
+   named it and left it open. Fixed by resolving the hit's owner + name
+   through `PickleSupply::ensure_class`, the same way `install_type_alias`
+   resolves an alias's target. This alone fixed all 16 + 6 + 6 occurrences of
+   `TypeTag` / `WeakTypeTag` / `Transformer` above (`u.Liftable[Int]` — a
+   nested *class*, not a trait — is presumably fixed the same way, but was
+   not in this corpus slice's numbers and was not separately verified).
+
+2. **`JavaUniverse#runtimeMirror(ClassLoader)` — a completely ordinary
+   method with real bytecode — had no parameter type to install against.**
+   `java.lang.ClassLoader` is a plain JDK class with no `ScalaSignature`, and
+   `PickleSupply::ensure_class` refuses to build a symbol for a class outside
+   `scala.` that has none (this exact gap was already named in this file's
+   `runtimeMirror` note and in `materialize.rs`'s doc comment). Fixed the
+   narrow way, not the general one: `crates/typer/src/
+   prelude_reflectruntime.rs` declares `java.lang.ClassLoader` and
+   `Class#getClassLoader(): ClassLoader` by hand, the same way `java.lang
+   .Class` itself is already hand-declared in `prelude.rs`. This fixed all 5
+   + 1 occurrences of `runtimeMirror`.
+
+3. **`currentMirror` leaves no bytecode at all**, because it is one of nsc's
+   own *fast-track* macros (`scala.tools.reflect.FastTrack`,
+   `scala/reflect/runtime/package.scala`: `def currentMirror: universe.Mirror
+   = macro ???`) — the compiler recognises it by the macro symbol's full name
+   and never even looks at the pickled `@macroImpl` annotation, which on the
+   real classfile is the placeholder `???`, not a usable reference. The
+   general "install a method by matching its erased descriptor against the
+   owner's classfile" path (`PickleSupply::install`) can therefore never
+   install it — confirmed by `SCALA_RS_PICKLE_DEBUG=1`, which showed
+   `scala/reflect/runtime/package$#currentMirror/0: no unambiguous erased
+   descriptor (want [])`, i.e. zero bytecode candidates, not a real ambiguity.
+   `PickleSupply::install_known_macro` supplies exactly this one binding, by
+   name, the same way nsc's own `FastTrack` table does: `scala.reflect
+   .runtime.Macros$.currentMirror(c: blackbox.Context): c.Expr[universe
+   .Mirror]` is a real, ordinary blackbox macro implementation with real
+   bytecode (confirmed with `javap scala.reflect.runtime.Macros$` against
+   scala-reflect.jar 2.13.16), so the *type* of `currentMirror` is read from
+   the same pickle as always, and the existing JVM-bridge engine
+   (`crates/typer/src/expand.rs`) is left to decide whether it can actually
+   expand the call. It cannot yet — `c.reifyEnclosingRuntimeClass` is not
+   among the `Context` methods the engine implements — so every reference
+   still fails, but now with the honest, existing "macro expansion is not
+   implemented: cannot expand currentMirror (implementation scala/reflect
+   /runtime/Macros$.currentMirror)" diagnostic (`Typer::report_macro_calls`)
+   in place of "not found". This fixed the visibility half of all 147 + 5 + 2
+   occurrences of `currentMirror`; actually expanding it is future work,
+   scoped to whoever next extends the engine with `reifyEnclosingRuntimeClass`
+   (and `c.abort`, which the real implementation also calls).
+
+Measured on the exact corpus subset these four diagnostics named (239 `run`
+tests, `CORPUS_KINDS=run CORPUS_SIZE=full`, filtered to the affected test
+names): `pass=0` before, `pass=3` after
+(`macro-reify-typetag-notypeparams`, `macro-reify-typetag-typeparams-tags`,
+`typetags_multi`). The other 236 still fail — most now one or two layers
+deeper, behind `mkToolBox`, `reify` of blocks/locals, or `TypeTag`
+materialisation, all of which are separate, already-scoped jobs. **The count
+was genuinely open before running it**, in both directions: supplying a name
+can turn out to unlock nothing (the next wall is immediate) or a great deal
+(three full passes from one visibility fix each), and this measurement is
+what settled it rather than the a priori estimate.
+
+Fixtures: `tests/fixtures/rt_typetags.scala` (`TypeTag[Int]` /
+`WeakTypeTag[String]` as types, `Transformer` as a type, `runtimeMirror`,
+compiled and run, matching real scalac 2.13.16 — comparing `.tpe.toString`
+rather than the tag's own `toString`, because nsc's `WeakTypeTag` materialiser
+upgrades a concrete type to a full `TypeTag` regardless of which one was
+asked for, which is a materialisation nuance this slice does not touch) and
+`tests/fixtures/rt_currentmirror_bad.scala` (a confession: real scalac
+accepts and runs it, scala-rs gives the honest "not implemented"
+diagnostic). Both are new tests in `crates/cli/tests/engine.rs`
+(`rt_typetags_resolve_and_run`, `rt_typetags_matches_real_scalac`,
+`rt_currentmirror_is_named_not_stubbed`) rather than `e2e.rs`: every fixture
+here needs scala-reflect.jar on the classpath, and `engine.rs` is where that
+support (`scala_reflect_jar`, `compile`, `run_main`, the real-scalac diff)
+already lives, the same as `rd_*` / `rb_*` before it.
+
+`Manifest` / `ClassManifest` (10 occurrences in the assigned bucket) is a
+separate, older API (`scala.Predef.Manifest`, pre-dating `TypeTag`) that was
+deliberately left alone: it needs its own implicit materialisation for
+arbitrary types, unrelated to the `TypeTag` machinery `materialize.rs`
+already has, and is a small enough slice of the total (10 of ~200) that
+building it was judged not to pay for itself here.

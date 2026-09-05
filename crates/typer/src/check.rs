@@ -3043,6 +3043,17 @@ impl Typer {
                             // a `this.type` in it (`type Self >: this.type`)
                             // means *the child's* `this` at the override site.
                             let t = t.map(|t| retarget_this(&t, class_id));
+                            // The bound also mentions the *enclosing class's*
+                            // type parameters, and those are the parent's, not
+                            // the child's: `trait Ops[F[_]] { type T <:
+                            // Functor[F] }` read at `trait AllOps[F[_]] extends
+                            // Ops[F]` has to become `Functor[F_AllOps]` before
+                            // it can be compared with the child's own bound.
+                            // Without this every re-declaration that narrows a
+                            // bound in a *generic* trait was rejected -- cats'
+                            // whole `AllOps` layer restates `type TypeClassType
+                            // <: Functor[F]` at each level.
+                            let t = t.map(|t| st.subst_as_seen_from(&Type::ThisType(class_id), &t));
                             t.map(|t| st.expand_type_members(class_id, &t))
                         };
                         let parent_hi = align(&self.st, self.st.get(m).bound_hi.clone());
