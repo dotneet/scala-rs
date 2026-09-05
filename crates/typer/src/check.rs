@@ -516,6 +516,28 @@ pub struct Typer {
     /// that declares them; the receiver is the object. Filled by the companion
     /// half of the implicit scope, read when the reference is materialised.
     pub(crate) implicit_via_module: std::cell::RefCell<HashMap<u32, SymbolId>>,
+    /// Modules (or module classes) through which a still-abstract
+    /// `Type::TypeMember` was ever selected as a qualified `p.T` (keyed by
+    /// `T`'s own defining symbol), for the implicit search's
+    /// `collect_type_parts` to add as extra parts.
+    ///
+    /// `Type::TypeMember` carries only the defining symbol, never the prefix
+    /// a source selection actually went through, and dealiasing an
+    /// applied-alias use (`NonEmptySet[A]` -> `NonEmptySetImpl.Type[A]`)
+    /// throws the prefix away entirely, collapsing to the same shared
+    /// abstract member every subclass of `Newtype` inherits without
+    /// overriding. Recording the prefix here instead of on the `Type` itself
+    /// (a `Type::Refined` "as-seen-from view", the way
+    /// `Checker::projected_class_type` records a `Type::Class` prefix) is
+    /// deliberate: that view is exact-equality-visible everywhere a bare
+    /// `Type::TypeMember` used to compare equal to itself (generic method
+    /// type-argument inference in particular, which does not consult
+    /// `SymbolTable::as_seen_from_view` the way `is_sub_type` and
+    /// `display_type` do), and introduced a real regression --
+    /// `WidgetImpl.unwrap(value)` inferring `A` from a wrapped `value` no
+    /// longer unified against `unwrap`'s bare `Type[A]` parameter. A side
+    /// table only touched by implicit search cannot cause that.
+    pub(crate) type_member_prefixes: std::cell::RefCell<HashMap<u32, Vec<SymbolId>>>,
     /// What the last `fill_defaults_and_implicits` pinned down by implicit
     /// search alone: `mk(s)` on `def mk[T: TT](s: String): Seq[Int] => Rep[T]`
     /// has no value argument mentioning `T`, so only the witness fixes it, and
@@ -814,6 +836,7 @@ impl Typer {
             open_implicits: std::cell::RefCell::new(Vec::new()),
             diverged_implicit: std::cell::RefCell::new(None),
             implicit_via_module: std::cell::RefCell::new(HashMap::new()),
+            type_member_prefixes: std::cell::RefCell::new(HashMap::new()),
             implicit_undet_solved: Vec::new(),
         }
     }
@@ -21144,7 +21167,8 @@ impl Typer {
                     }
                     Some(_) => {
                         let ctor = self.tree_to_type(tpt);
-                        self.apply_types(ctor, as_, span)
+                        let applied = self.apply_types(ctor.clone(), as_, span);
+                        self.with_prefix_if_type_member(tpt, &ctor, applied)
                     }
                     None => Type::Error,
                 };
@@ -21480,6 +21504,74 @@ impl Typer {
             parents: vec![base],
             decls,
         }
+    }
+
+    /// `p.T[args]` where `T` stays abstract in `p`'s own class (SLS 7.2's
+    /// "enclosing prefixes" of implicit scope). `ctor` is the un-applied
+    /// type `tree_to_type(tpt)` produced for the constructor position. When
+    /// `ctor` is a still-abstract `Type::TypeMember` reached through a
+    /// qualified *module* prefix (`tpt` a `p.T`-shaped `Select` whose
+    /// qualifier is not itself a term), record that module in
+    /// [`Typer::type_member_prefixes`] against `T`'s own defining symbol, so
+    /// the implicit search's `collect_type_parts` (in `implicits.rs`) can add
+    /// it as an extra implicit-scope part wherever `T` turns up, dealiased or
+    /// not. `applied` -- `ctor` combined with its arguments -- is returned
+    /// unchanged; this only ever adds an entry to the side table.
+    ///
+    /// cats' `Newtype` encoding is exactly this shape: `object
+    /// NonEmptySetImpl extends Newtype { type Type[A] <: Base with Tag;
+    /// implicit def catsNonEmptySetOps[A](value: NonEmptySet[A]):
+    /// NonEmptySetOps[A] = ... }` never overrides `Newtype`'s abstract
+    /// `Type`, so `NonEmptySetImpl.Type[A]`'s only class-side answer is
+    /// `Base`'s, and `Base`'s companion (there is none) is what implicit
+    /// search used to see -- reporting `value toSortedSet is not a member
+    /// of Newtype.Type[A]` for every method `NonEmptySetOps` adds. The
+    /// conversion is declared on `NonEmptySetImpl` itself, reachable only
+    /// through the prefix the source actually selected `Type` through.
+    ///
+    /// A side table, not a prefix carried on the `Type` itself (a
+    /// `Type::Refined` "as-seen-from view", the way
+    /// `Checker::projected_class_type` records a `Type::Class` prefix) --
+    /// that view is exact-equality-visible everywhere a bare
+    /// `Type::TypeMember` used to compare equal to itself (generic method
+    /// type-argument inference in particular does not consult
+    /// `SymbolTable::as_seen_from_view` the way `is_sub_type` and
+    /// `display_type` do), and wrapping it that way regressed
+    /// `WidgetImpl.unwrap(value)`: inferring `A` from a wrapped `value` no
+    /// longer unified against `unwrap`'s bare `Type[A]` parameter, which is
+    /// the very same symbol. A side table only implicit search reads cannot
+    /// cause that, at the cost of being coarser than a real prefix: every
+    /// object that ever selects `T` becomes a candidate source for every
+    /// occurrence of `T`, not just the one it was written through. Harmless
+    /// in practice -- an inapplicable candidate's signature simply fails to
+    /// unify, the same way an unrelated implicit already in scope does.
+    fn with_prefix_if_type_member(&mut self, tpt: &Tree, ctor: &Type, applied: Type) -> Type {
+        let Type::TypeMember(id) = ctor else {
+            return applied;
+        };
+        let TreeKind::Select { qual, .. } = &tpt.kind else {
+            return applied;
+        };
+        if self.type_select_is_term_prefix(qual) {
+            // A genuine value prefix (`self.Representation`) goes through
+            // `path_dependent_type` / `project_from_prefix` instead, and is
+            // not handled here -- see `docs/cats.md`'s "`Type::TypeMember`
+            // has no prefix" note for that harder, still-open case.
+            return applied;
+        }
+        if let Some(owner) = self.qualified_type_owners(qual).into_iter().next() {
+            if matches!(
+                self.st.get(owner).kind,
+                SymKind::Module | SymKind::ModuleClass
+            ) {
+                let mut map = self.type_member_prefixes.borrow_mut();
+                let owners = map.entry(id.0).or_default();
+                if !owners.contains(&owner) {
+                    owners.push(owner);
+                }
+            }
+        }
+        applied
     }
 
     /// The aliases `pcls` supplies for the abstract type members declared

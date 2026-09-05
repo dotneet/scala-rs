@@ -363,6 +363,41 @@ impl Typer {
                 }
                 self.collect_type_parts(ret, out, seen);
             }
+            // SLS 7.2's parts of a compound type are the parts of every
+            // parent, not just the first (the existing fallback below finds
+            // only the first parent's class, through `class_sym_of`'s own
+            // `Type::Refined` arm). Purely additive: subtyping, display and
+            // dealiasing read a *view* refinement (`as_seen_from_view`, used
+            // for a `Type::Class` projection prefix) as its bare first
+            // parent and never reach here, so this only ever adds
+            // implicit-scope candidates to what they already saw.
+            Type::Refined { parents, .. } => {
+                for p in parents {
+                    self.collect_type_parts(p, out, seen);
+                }
+            }
+            // A still-abstract type member offers only its upper bound's
+            // class as a part (see `SymbolTable::class_sym_of`), which is
+            // not where cats' `Newtype` encoding declares its conversions --
+            // `object NonEmptySetImpl extends Newtype` never overrides
+            // `Newtype`'s abstract `type Type[A]`, so `Type`'s only
+            // class-side answer is `Base`'s, and `catsNonEmptySetOps` lives
+            // on `NonEmptySetImpl` itself. `Type::TypeMember` has no room to
+            // carry the prefix a qualified `p.T` selected it through --
+            // `Checker::with_prefix_if_type_member` records it in
+            // `Typer::type_member_prefixes` instead, keyed by `T`'s own
+            // symbol, and this is the one place that reads it back. See
+            // `docs/cats.md`'s `Newtype` note.
+            Type::TypeMember(id) => {
+                if let Some(id) = self.st.class_sym_of(ty) {
+                    self.collect_class_and_enclosing(id, out, seen);
+                }
+                if let Some(owners) = self.type_member_prefixes.borrow().get(&id.0) {
+                    for &owner in owners {
+                        self.collect_class_and_enclosing(owner, out, seen);
+                    }
+                }
+            }
             _ => {
                 if let Some(id) = self.st.class_sym_of(ty) {
                     self.collect_class_and_enclosing(id, out, seen);
