@@ -1324,7 +1324,7 @@ now. The head is scalatra's overload sets and the Twirl templates.
 | n | message | reading |
 |---|---|---|
 | **79** | `no implicit … CanBeQueryCondition[Any]` | `q.filter(t => …)` where the literal's body still did not type, so `filter`'s `T` came out `Any`. Was 187; what is left is downstream of the wildcard self type below, not a root of its own. |
-| **53** | `unimplemented syntax: named arguments (method parameters not resolved)` | Named arguments where the callee did not resolve. |
+| ~~**53**~~ → **0** | `unimplemented syntax: named arguments (method parameters not resolved)` | Every one of them was an `object` applied directly — a Twirl template's `html.dropdown(value, right = true)`, or `html.edithook(…, create = true)`. An `object`'s members are entered on its module *class*; a reference to it resolves to the module *value*, which has none, so `lookup_member(fun.sym, "apply")` found nothing and the names could not be placed. `agent/namedargs` follows the reference's `ModuleRef` to the class. 1399 → 1348. |
 | **53** | `ambiguous overload for datetimeago with arguments (Date)` | A Twirl `object` extends `BaseScalaTemplate` and `TemplateN`, and its `apply` is ambiguous with something inherited. The largest single template symptom. |
 | **44** | `ambiguous overload for apply$default$N with arguments ()` | A default getter that two overloads both own. |
 | ~~**43 / 28 / 22 / 13**~~ **0** | `value get / update / getOrElse is not a member of <overload …>` | scalatra. **Gone — root 26.** The reading given here ("a pickled *declaration* cannot be told from a definition") was wrong; the two really are two members, and what was missing is nsc's `inferExprAlternative`. |

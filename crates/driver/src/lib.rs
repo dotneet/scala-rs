@@ -9,9 +9,9 @@ use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
 use scala_rs_typer::{
     add_value_class_companions, check_local_case_class_captures, check_local_objects, erase,
     expand_private_names, expand_trait_private_vals, find_mains, hoist_default_receivers,
-    lambda_lift, lazy_locals, mark_anon_captures, note_source_value_classes, typecheck_units_src,
-    uncurry, ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType,
-    ClasspathTypeParam, TypecheckOptions,
+    lambda_lift, lazy_locals, mark_anon_captures, note_source_value_classes,
+    restore_named_arg_order, typecheck_units_src, uncurry, ClasspathClass, ClasspathMethod,
+    ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -304,6 +304,11 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 // qualifier to a local first, so the receiver is evaluated
                 // once rather than once per `name$default$n` getter.
                 hoist_default_receivers(&mut u.tree, &mut st);
+                // …and, after it, nsc's other half of `NamesDefaults`: a call
+                // whose named arguments were written out of parameter order
+                // binds them to locals in the written order, so the reordering
+                // the typer did to resolve the names is not observable.
+                restore_named_arg_order(u.file_index, &mut u.tree, &mut st);
                 uncurry(&mut u.tree, &mut st);
                 // A method-local `lazy val` becomes a cell plus a nested
                 // accessor def; lambda-lift then hoists the accessor and

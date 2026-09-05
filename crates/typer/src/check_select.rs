@@ -2170,6 +2170,16 @@ impl Typer {
                 args,
             });
         }
+        // As in the single-clause rewrite below: hand the outermost clause the
+        // `copy` call's node id and record how its arguments were reordered, so
+        // `named_eval_order` can restore the written evaluation order. Only the
+        // outermost clause can be keyed this way -- the inner ones are
+        // synthesized trees with no id of their own -- and `self.slot_source`
+        // is what the loop above left from that same last clause.
+        ctor.id = tree.id;
+        let last_order = std::mem::take(&mut self.slot_source);
+        self.last_named_order = Some(last_order);
+        self.record_named_arg_order(tree.id);
         *tree = Tree::dummy(TreeKind::Block {
             stats: vec![tmp_def],
             expr: Box::new(ctor),
@@ -2315,10 +2325,18 @@ impl Typer {
         let new_tree = Tree::dummy(TreeKind::New {
             tpt: Box::new(self.resolved_class_tpt(class_id)),
         });
-        let ctor = Tree::dummy(TreeKind::Apply {
+        let mut ctor = Tree::dummy(TreeKind::Apply {
             fun: Box::new(new_tree),
             args: new_args,
         });
+        // `copy` places its own named arguments rather than going through
+        // `reorder_named_args`, so record here what that reordering was. The
+        // constructor call inherits the node id the `copy` application had, so
+        // `named_eval_order` can find it and put the evaluation back into the
+        // order the arguments were written in.
+        ctor.id = tree.id;
+        self.last_named_order = Some(std::mem::take(&mut self.slot_source));
+        self.record_named_arg_order(tree.id);
         tree.kind = TreeKind::Block {
             stats: vec![tmp_def],
             expr: Box::new(ctor),
