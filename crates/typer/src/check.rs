@@ -20115,11 +20115,69 @@ impl Typer {
         if let Type::Class { sym, args } = &ret {
             let name = self.st.get(*sym).name.as_str();
             if *sym == self.st.option_sym || name == "Option" || name == "Some" {
+                if args.is_empty() {
+                    // A bare `Option` says nothing about what it yields: that
+                    // is what an `unapply` read back from a *classfile* looks
+                    // like when its signature was erased. For a case class's
+                    // own synthetic extractor the constructor fields are the
+                    // answer -- and without them `case LK(u, n)` on a
+                    // separately compiled `case class LK(k: Unit, n: Int)`
+                    // counted one sub-pattern and reported "extractor LK
+                    // expects 1 argument(s), found 2".
+                    if let Some(fields) = self.case_ctor_field_types(self.st.get(unapply).owner) {
+                        return fields;
+                    }
+                }
                 let inner = args.first().cloned().unwrap_or(Type::Any);
                 return self.flatten_extract(inner);
             }
         }
         self.flatten_extract(ret)
+    }
+
+    /// The constructor field types of the class whose companion module class
+    /// is `module_cls`, when that pair has a case class's shape.
+    ///
+    /// The `CASE` flag itself cannot be used: our pickle *writes* it, but the
+    /// reader never sets it, so a case class read back through `-cp` looks
+    /// like a plain one. The shape test is that the companion also carries an
+    /// `apply` of exactly the constructor's arity, which is what
+    /// `synthesize_case_members` gives every case class and what a hand-written
+    /// companion of a non-case class rarely matches.
+    fn case_ctor_field_types(&self, module_cls: SymbolId) -> Option<Vec<Type>> {
+        if module_cls.is_none() {
+            return None;
+        }
+        let s = self.st.get(module_cls);
+        if !matches!(s.kind, SymKind::ModuleClass | SymKind::Module) {
+            return None;
+        }
+        let base = s.name.strip_suffix('$').unwrap_or(&s.name).to_string();
+        let owner = s.owner;
+        let cls = self
+            .st
+            .get(owner)
+            .members
+            .iter()
+            .copied()
+            .find(|&m| self.st.get(m).kind == SymKind::Class && self.st.get(m).name == base)?;
+        let fields = self.st.get(cls).ctor_fields.clone();
+        if fields.is_empty() {
+            return None;
+        }
+        let has_matching_apply = self.st.get(module_cls).members.iter().any(|&m| {
+            self.st.get(m).name == "apply"
+                && match &self.st.get(m).ty {
+                    Type::Method { paramss, .. } => {
+                        paramss.iter().map(|c| c.len()).sum::<usize>() == fields.len()
+                    }
+                    _ => false,
+                }
+        });
+        if !has_matching_apply {
+            return None;
+        }
+        Some(fields.iter().map(|f| self.st.get(*f).ty.clone()).collect())
     }
 
     fn flatten_extract(&self, inner: Type) -> Vec<Type> {
