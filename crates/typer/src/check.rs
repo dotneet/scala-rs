@@ -328,6 +328,18 @@ pub struct Typer {
     /// Everything typed *inside* the callee sees the flag already cleared, so
     /// a macro application nested in a receiver (`M.g(1).h`) still expands.
     pub(crate) typing_callee: bool,
+    /// How many explicit arguments the `Apply` whose callee is being typed
+    /// carries, when that is known. Only [`Typer::search_extension`] reads it,
+    /// and only to break a tie: nsc's `adaptToArguments` looks for a view
+    /// whose result has a member *applicable to these arguments*, so two
+    /// conversions that both offer the name are not ambiguous when only one of
+    /// them can be called. gitbucket's `implicit class RichColumn(c1:
+    /// Rep[Boolean]) { def &&(c2: => Rep[Boolean], guard: => Boolean) }` ties
+    /// with slick's `booleanColumnExtensionMethods` on every `a && b`, and the
+    /// tie was reported as `value && is not a member of Rep[Boolean]`.
+    /// Cleared while a *qualifier* is typed: the count belongs to the
+    /// selection, not to what it is selected from.
+    pub(crate) callee_arity: Option<usize>,
     /// The JVM half of the def-macro expander (`crates/typer/src/expand.rs`),
     /// started on the first expansion and killed when the typer is dropped.
     pub(crate) macro_engine: Option<crate::expand::MacroEngine>,
@@ -757,6 +769,7 @@ impl Typer {
             new_is_applied: false,
             typing_call_args: false,
             typing_callee: false,
+            callee_arity: None,
             macro_engine: None,
             macro_engine_error: None,
             macro_classpath: opts.binary_path.clone(),
@@ -10011,7 +10024,11 @@ impl Typer {
             _ => return,
         };
         if qual.ty.is_no_type() {
+            // The enclosing application's argument count belongs to *this*
+            // selection, not to whatever the qualifier turns out to be.
+            let saved_arity = self.callee_arity.take();
             self.type_expr(qual, &Type::NoType);
+            self.callee_arity = saved_arity;
             // A *qualifier* is never "an argument still waiting for its
             // alternative": `pack` in `SV(pack.to[Seq], "x")` has to be a
             // value before `to` can be looked up on it, exactly as nsc types
@@ -12925,7 +12942,9 @@ impl Typer {
         // Expected type Method so nullary methods (`unary_-`, `def f: Int` called as `f()`)
         // are not auto-applied before this Apply is typed.
         self.typing_callee = true;
+        let saved_arity = self.callee_arity.replace(args.len());
         self.type_expr(fun, &dummy_method);
+        self.callee_arity = saved_arity;
         self.typing_callee = false;
         self.rewrite_receiver_apply(fun);
         Self::auto_apply_nullary_function(fun, args.len());

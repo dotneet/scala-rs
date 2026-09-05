@@ -1640,6 +1640,7 @@ impl Typer {
         hits.dedup_by_key(|(c, m, _)| (c.0, m.0));
         self.drop_inherited_duplicates(&mut hits);
         self.drop_overridden_conversions(&mut hits);
+        self.drop_inapplicable_conversions(&mut hits, name);
         match hits.len() {
             1 => Some(hits.pop().unwrap()),
             0 => None,
@@ -1684,6 +1685,83 @@ impl Typer {
                 pool.into_iter().find(|(c, _, _)| *c == winners[0])
             }
         }
+    }
+
+    /// A conversion whose member cannot take the arguments the call site
+    /// writes is not a candidate for that call.
+    ///
+    /// nsc's `adaptToArguments` asks for a view whose result has a member
+    /// *applicable to these arguments*, so two conversions that merely share
+    /// the name do not make an ambiguity. gitbucket's
+    ///
+    /// ```scala
+    /// implicit class RichColumn(c1: Rep[Boolean]) {
+    ///   def &&(c2: => Rep[Boolean], guard: => Boolean): Rep[Boolean] = …
+    /// }
+    /// ```
+    ///
+    /// sits in scope beside slick's `booleanColumnExtensionMethods`, whose
+    /// `&&` takes one argument. Every `a && b` in the project tied between the
+    /// two and was reported as `value && is not a member of Rep[Boolean]`.
+    ///
+    /// Runs only when there is a tie to break and only when the call site's
+    /// argument count is known, and only ever *narrows* a set of two or more:
+    /// a member this cannot read the shape of stays a candidate.
+    fn drop_inapplicable_conversions(&self, hits: &mut Vec<(SymbolId, SymbolId, Type)>, name: &str) {
+        if hits.len() < 2 {
+            return;
+        }
+        let Some(n) = self.callee_arity else {
+            return;
+        };
+        let keep: Vec<bool> = hits
+            .iter()
+            .map(|(_, m, to)| {
+                let alts = match self.st.class_sym_of(to) {
+                    Some(cls) => self.st.lookup_member(cls, name),
+                    None => vec![*m],
+                };
+                let alts = if alts.is_empty() { vec![*m] } else { alts };
+                alts.iter().any(|&a| self.member_accepts_arity(a, n))
+            })
+            .collect();
+        if !keep.iter().any(|k| *k) {
+            return;
+        }
+        let mut it = keep.into_iter();
+        hits.retain(|_| it.next().unwrap_or(true));
+    }
+
+    /// Whether `m` could be applied to `n` explicit arguments. Deliberately
+    /// permissive: a shape this cannot read (a `val` of function type, a
+    /// nullary member that is applied through its own `apply`) answers yes,
+    /// because the only caller uses this to *drop* alternatives.
+    fn member_accepts_arity(&self, m: SymbolId, n: usize) -> bool {
+        let Type::Method { paramss, .. } = &self.st.get(m).ty else {
+            return true;
+        };
+        let Some(first) = paramss.first() else {
+            return true;
+        };
+        if first.len() == n {
+            return true;
+        }
+        if n + 1 >= first.len() && matches!(first.last(), Some(Type::Repeated(_))) {
+            return true;
+        }
+        if n > first.len() {
+            return false;
+        }
+        // Short of the clause: legal when every parameter left over is
+        // implicit or has a default.
+        let params = self.st.get(m).params.clone();
+        if params.len() != first.len() {
+            return true;
+        }
+        params[n..].iter().all(|p| {
+            let f = self.st.get(*p).flags;
+            f.contains(Flags::IMPLICIT) || f.contains(Flags::DEFAULTPARAM)
+        })
     }
 
     /// One conversion reached by two routes is one candidate, not an ambiguity.
