@@ -62,6 +62,7 @@ unrealistic, it is stated as such.
   - 7.14 Just before stage D-2: nested `object`s and `<val>.type` (the `agent/reifyd` slice)
   - 7.15 Expanding `reify { … }` (the `agent/reifybody` slice)
   - 7.16 `ShapedValue.mapToImpl` — three roots (the `agent/shaped` slice)
+  - 7.17 Blocks, and members of static `object`s (the `reify` widening slice)
 
 (The two `7.10` entries above are not a typo in this table of contents: the numbering is duplicated
 in the document itself, and the numbers are left unchanged because other documents reference these
@@ -2361,3 +2362,149 @@ Slick goes from `errors=99 → 94` and `files_with_errors=39 → 38`. `ShapedVal
    scope of package `scala` (lexical `scala.List` avoids this by a different route).
 5. **Expanding** `mapToImpl` needs, in addition to 1 through 3 above, anonymous classes in the
    expansion result (`expand.rs` has no `ClassDef` branch). This is not needed to compile slick itself.
+
+### 7.17 Blocks, and members of static `object`s (the `reify` widening slice)
+
+Two of the shapes §7.15 left refused are now built, and both are the same rule seen twice:
+**a reference is reified by the symbol it resolved to, never by the name that was written.**
+
+#### 1. A term member of a static `object`
+
+`reify { println("a") }` was refused with `` `println` is a local, a parameter, or a name that
+does not stand for a static `object` ``. It is none of those: by the time nsc's reifier sees the
+body its typer has already rewritten `println` to `scala.Predef.println`, and the tree it builds is
+
+```text
+$u.Select($u.internal.reificationSupport.mkIdent($m.staticModule("scala.Predef")),
+          $u.TermName("println"))
+```
+
+(measured with `-Xprint:typer` on `reify { println("hello " + "world") }`). scala-rs builds the same
+tree, from a new `ReifyRef::StaticMember`. What decides it is the **declaring owner**: the symbol the
+name resolved to must be a `def` or a `val` whose owner is a module class reachable through packages
+alone — the same test `static_module_name` already applied to an `object` reference itself. A member
+of a class, a local, or a parameter fails that test and stays refused, because none of them can be
+found again through a mirror.
+
+A bare name is overloaded more often than not (`Predef` declares seven `println`s), and typing the
+`Ident` on its own settles nothing. So the callee of an application is resolved by typing the
+**whole application** speculatively and reading the head's symbol off the result
+(`Check::applied_static_member`); the classification is then recorded against the node that was
+*written*, which is what `crate::reify` asks about.
+
+Two members of a static `object` are deliberately **still refused**, because nsc builds a different
+tree for them and building this one instead would be wrong in a way only running the program shows:
+
+| Shape | What nsc builds |
+| --- | --- |
+| A member of the `object` that lexically **encloses** the `reify` (`object Impls { val x = 42; def foo(c: Context) = reify { x } }`) | `Select(mkThis($m.staticModule("Impls").asModule.moduleClass), TermName("x"))` — measured on `test/files/run/macro-reify-ref-to-packageless`. nsc's typer spells the reference `Impls.this.x`, and `mkThis` is not `mkIdent`: it prints as a different tree and keeps access to a `private` member |
+| A member whose name is not a legal JVM identifier once encoded (a backquoted `` `a b` ``) | nsc escapes the rest (`$u0020`); `scala_rs_pickle::names::encode_method_name` does not, so the `TermName` would name a member that does not exist |
+
+`scala.math`'s package-object functions (`math.max`) are refused for a third reason, and this one is
+about scala-rs rather than about nsc: `prelude_text.rs` declares them on the **package** `scala.math`
+with `Flags::STATIC`, not on a module class, so there is no static `object` to name. nsc writes
+`staticModule("scala.math.package")`.
+
+#### 2. Blocks
+
+`reify { println("a"); println("b") }` was refused outright. nsc builds `Block(List(<init>), <last>)`,
+which is exactly what `rs.SyntacticBlock(List(...))` (`gen.mkBlock`) produces, so the lowering the
+quasiquote path already had is the right one — the only thing missing was letting a `Block` through
+`Reifier::reify_term` and walking into it from `Check::reify_refs_in`. The block's own type is its
+last expression's, and that is what `Expr.apply[T]` is instantiated at.
+
+**A definition inside the block is refused**, and that is where the work actually was: `stat()`
+dispatches to `crate::reify_defs::definition` directly, which would have reified a `val` by name and
+never consulted the hygiene rules. nsc gives a local binding a symbol of its own
+(`build.newNestedSymbol`) and links every reference to it; scala-rs does not build that, so
+`Reifier::definition` now refuses every definition when it is running in reify mode. The quasiquote
+path, which *is* by name, is untouched.
+
+#### Validation
+
+* `tests/fixtures/rf_shapes.scala` — nine lines of `showRaw`, against the runtime universe: a block
+  of two statements, a block whose last expression is a value, a nested block in argument position,
+  `println`, an imported member applied and unapplied, and the same member selected on its `object`.
+  **Real scalac 2.13.16 prints the same nine lines** (`tests/fixtures/expected/rf_shapes.txt`).
+  Comparing the printed tree is the point: a bare `Ident(TermName("twice"))` compiles and evaluates
+  to the same thing wherever a `twice` is in scope, and only the tree tells the two apart.
+* `tests/fixtures/rf_impl.scala` + `rf_use.scala` — three macro implementations really expanded in
+  two runs (`reify { println("hello " + s.splice) }`, the shape of
+  `test/files/run/macro-reify-basic`; a two-statement block; a block whose value is the last
+  expression, with a splice used twice). The last line prints how many times the argument's side
+  effect ran, so a dropped or duplicated splice changes the output. Real scalac 2.13.16 gives the
+  same seven lines.
+* `tests/fixtures/rf_bad.scala` — the five bodies still refused. **Real scalac compiles the file**,
+  and a test pins that too, so the fixture cannot drift into a program that is simply wrong.
+
+The tests are `crates/cli/tests/rf_reify.rs` (six) -- its own file, since `reify.rs` is
+taken by an unrelated suite about dispatching to the declaring class.
+`tests/fixtures/rb_bad.scala`'s block case now reports the `val` inside the block rather than the
+block, and `engine.rs`'s expectation was updated to match; that is the diagnostic getting more
+precise, not a refusal being dropped.
+
+#### What this is worth, measured
+
+The cluster this slice was scoped from is **163 `run` tests of the scala/scala corpus whose first
+diagnostic mentions `reify`** (`CORPUS_KINDS=run CORPUS_SIZE=full` filtered to those names). Before:
+`pass=0`. After: **`pass=0`**. The symptoms moved a long way — **130 of the 163 report a different
+first diagnostic**, 89 "a block is not reified yet" became 31 "a class definition", 8 "an object
+definition" and a scattering of deeper ones, and 7 no longer mention `reify` at all (3 compile the
+whole way through, 4 reach the toolbox) — but no test turned green, and it is worth writing down why,
+because it is not about reify:
+
+* **147 of the 163 need a toolbox at run time** (`scala.tools.reflect.Eval`'s `.eval`, or
+  `currentMirror.mkToolBox`). `currentMirror` is visible but cannot be expanded (§ the
+  `agent/reflectruntime` note: the engine has no `c.reifyEnclosingRuntimeClass`), and `.eval` is an
+  implicit class in scala-compiler.jar's package object that implicit search does not find. **No
+  amount of reify work moves those**; the toolbox is the wall.
+* Of the remaining 16, three (`macro-reify-basic`, `macro-reify-unreify`,
+  `macro-undetparams-macroitself`) now compile and fail at *run* time, on item 3 of §7.16's "What
+  remains": their macro **def** is compiled in the first round, and scala-rs does not write
+  `macro_impl` into its own pickle, so the second round compiles the call as an ordinary method call.
+  `macro-reify-basic` is one implemented `@macroImpl` pickle away from green. This is reproducible
+  with no `reify` anywhere:
+
+  ```scala
+  // run 1
+  object MacroHome { def five: Int = macro MacroHome.Impls.five
+                     object Impls { def five(c: Context): c.Expr[Int] = … } }
+  // run 2
+  object Main { def main(a: Array[String]): Unit = println(MacroHome.five) }
+  // => java.lang.NoSuchMethodError: 'int MacroHome$.five()'
+  ```
+* The rest need free terms, `new`, function literals, or type ascriptions.
+
+**One `neg` test moves the other way, and it is the corpus's own caveat in the flesh.**
+`neg` goes 658 → **657** because `test/files/neg/macro-cyclic` stops being rejected. It was passing
+for the wrong reason: its body is `c.universe.reify { implicitly[SourceLocation] }`, we rejected it
+with "`implicitly` is a local, a parameter, …", and nsc rejects it with `could not find implicit
+value for parameter e: SourceLocation` — a **cyclic reference**, because the only candidate is the
+very `implicit def sourceLocation = macro impl` being type-checked. Reifying `implicitly` as a
+`Predef` member is right; scala-rs then finds that candidate and accepts the file, since it has no
+counterpart to nsc's cyclic-reference check for an implicit a macro implementation reaches through
+its own macro def. So the diagnostic that went away was wrong, and the one that should replace it
+was never there. `pos` is unchanged (its 7 tests in this cluster all need free terms, definitions,
+`new` or a type ascription).
+
+The 7 `pos` tests in the same cluster are unchanged: they need free terms (`t5738`, `t5742`, `t531`,
+`t532`), definitions (`t5223`), `new` (`t8947`) or a type ascription (`liftcode_polymorphic`).
+
+#### What remains
+
+1. **Free terms** for locals and parameters — the largest remaining cluster. nsc's shape, measured on
+   `def f(a: Int) = reify { a + 1 }`:
+
+   ```text
+   val free$a1: $u.FreeTermSymbol = $u.internal.reificationSupport.newFreeTerm(
+       "a", a, rs.FlagsRepr(17592190246912L), "defined by f in p5.scala:3:9")
+   rs.setInfo[$u.FreeTermSymbol](free$a1, $m.staticClass("scala.Int").asType.toTypeConstructor)
+   … rs.mkIdent(free$a1) …
+   ```
+
+   Note that the creator class **captures** the local, so scala-rs's lambda lifting has to reach a
+   synthetic class defined inside a method body.
+2. **The `mkThis` form** for a member of the enclosing `object`, and `$uXXXX` name escaping, which
+   `test/files/run/macro-reify-ref-to-packageless` needs together.
+3. Definitions inside a reified block (`build.newNestedSymbol`), function literals, `new`, and types
+   other than type arguments — unchanged from §7.15.

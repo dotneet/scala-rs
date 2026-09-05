@@ -115,6 +115,25 @@ impl Reifier<'_> {
     /// One statement of a block or a template body: a definition, or an
     /// ordinary term.
     pub(super) fn definition(&self, t: &Tree) -> Result<Tree, String> {
+        // A definition inside a `reify { … }` body binds a symbol the
+        // expansion has to carry with it: nsc reifies it with
+        // `build.newNestedSymbol` and links every reference to that symbol.
+        // Building the definition by name instead would compile and run, and
+        // would bind whatever name the expansion site happens to use -- the
+        // capture reification exists to prevent -- so it is refused. The
+        // quasiquote path, which *is* by name, is unaffected.
+        if self.in_reify_mode()
+            && matches!(
+                t.kind,
+                TreeKind::ValDef { .. }
+                    | TreeKind::DefDef { .. }
+                    | TreeKind::ClassDef { .. }
+                    | TreeKind::ModuleDef { .. }
+                    | TreeKind::TypeDef { .. }
+            )
+        {
+            return Err(format!("{} is not reified yet", super::describe(&t.kind)));
+        }
         match &t.kind {
             TreeKind::ValDef { .. } => self.value_def(t),
             TreeKind::DefDef { .. } => self.method_def(t),

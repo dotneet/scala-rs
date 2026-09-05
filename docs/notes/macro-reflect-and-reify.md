@@ -393,3 +393,44 @@ Both diagnostics match nsc's wording and line, so the two tests pass again
 *and* the log's `neg` scoring (`tests/scala_corpus_report.sh`) now scores them
 as the right rejection rather than an accidental one. The final `neg` pass set
 is identical to `main`'s, test for test.
+
+### Blocks, and members of static `object`s in a `reify` body
+
+`docs/macros.md` §7.17 has the whole account. In short: `reify { println("a") }`
+and `reify { println("a"); println("b") }` were both refused, and both are now
+built the way nsc builds them — `println` as
+`Select(mkIdent($m.staticModule("scala.Predef")), TermName("println"))`, a block
+as `Block(init, last)`. The rule is the one the rest of reification already
+follows: **resolve by symbol, refuse what cannot be found again through a
+mirror.** A member of the *enclosing* `object` is still refused, because nsc
+uses `mkThis(...asModule.moduleClass)` there and the two print differently; so
+is a definition inside a block, which needs nsc's `newNestedSymbol`.
+
+The measured result on the cluster this was scoped from — the 163 scala/scala
+`run` tests whose first diagnostic mentions `reify` — is **`pass=0` before,
+`pass=0` after**, with the symptoms moved one or two layers deeper. That number
+is the useful finding, not a disappointment to explain away: **147 of the 163
+need a toolbox at run time** (`.eval` or `currentMirror.mkToolBox`), which no
+amount of reify work reaches. Whoever picks up this cluster next should scope
+the toolbox (`c.reifyEnclosingRuntimeClass` in the engine, and implicit search
+finding `scala.tools.reflect.Eval` in scala-compiler.jar's package object)
+before scoping more reify shapes.
+
+Three more (`macro-reify-basic`, `macro-reify-unreify`,
+`macro-undetparams-macroitself`) now compile and fail at run time on a
+*separate*, already-recorded bug: scala-rs does not write `macro_impl` into its
+own pickle (`docs/macros.md` §7.16 "What remains", item 3), so a macro **def**
+it compiled in an earlier round is read back as an ordinary method and the call
+site emits a real invocation. Reproducible with no `reify` in the program at
+all; `macro-reify-basic` is one implemented `@macroImpl` pickle away from
+passing.
+
+One `neg` test moves the other way: `neg` goes 658 → 657 because
+`test/files/neg/macro-cyclic` stops being rejected. It was passing for the
+wrong reason — we refused `c.universe.reify { implicitly[SourceLocation] }`
+because `implicitly` was unclassified, while nsc rejects it as a *cyclic
+reference* (the only implicit candidate is the `implicit def sourceLocation =
+macro impl` being type-checked). Reifying `implicitly` as a `Predef` member is
+right; scala-rs then finds that candidate and accepts the file, because it has
+no counterpart to nsc's cyclic check. This is exactly the caveat the corpus
+harness documents about `neg` being an upper bound.

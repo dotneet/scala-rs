@@ -1,0 +1,9 @@
+Block(List(Apply(Select(Ident(scala.Predef), TermName("println")), List(Literal(Constant("a"))))), Apply(Select(Ident(scala.Predef), TermName("println")), List(Literal(Constant("b")))))
+Block(List(Apply(Select(Ident(scala.Predef), TermName("println")), List(Literal(Constant("a")))), Apply(Select(Ident(scala.Predef), TermName("println")), List(Literal(Constant("b"))))), Apply(Select(Ident(RfHelper), TermName("twice")), List(Literal(Constant(3)))))
+Apply(Select(Ident(scala.Predef), TermName("println")), List(Literal(Constant("hello"))))
+Apply(Select(Ident(RfHelper), TermName("twice")), List(Literal(Constant(21))))
+Select(Ident(RfHelper), TermName("four"))
+Apply(Select(Ident(RfHelper), TermName("twice")), List(Select(Ident(RfHelper), TermName("four"))))
+Apply(Select(Ident(RfHelper), TermName("twice")), List(Block(List(Apply(Select(Ident(scala.Predef), TermName("println")), List(Literal(Constant("x"))))), Literal(Constant(5)))))
+Unit
+Int

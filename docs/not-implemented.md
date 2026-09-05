@@ -157,3 +157,11 @@ Compiler flags (`agent/xflags`):
   qualified `super` reference; and any body statement that is not a
   definition. `neg/valueclasses-impl-restrictions` is rejected today for a
   different reason, not for those.
+- **An *enclosing* template's self type, for a bare name written in a nested
+  one.** `trait Q { self: PriorityQueue[Int] => trait Inner { def d = dequeue() } }`
+  is `not found: value dequeue`; the same call written directly in `Q`'s body
+  resolves (root 24 in [docs/gitbucket.md](gitbucket.md)). nsc's context chain
+  reaches the outer self type, but the member has to be read at the *outer*
+  `this` — `dequeue(): Int`, called on `Q.this`, not the declared `A` on
+  whatever `this` happens to be — and entering the symbol alone gives neither.
+  Reported, not answered wrongly.
