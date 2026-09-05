@@ -1,0 +1,10 @@
+true
+Some(7)
+Some((a,2))
+Some((1,2,c))
+Some((l,r))
+w
+Some(4)
+8
+Some(9)
+None

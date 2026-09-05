@@ -267,11 +267,17 @@ impl Assembler {
     }
 
     fn record_frame_at(&mut self, off: u16, stack: Vec<VType>, locals: Vec<VType>) {
-        if off == 0 || self.dead {
+        if self.dead {
             // A frame inside a dead region would be dropped with the bytes it
             // describes, and its offset would then point at unrelated code.
             return;
         }
+        // Offset 0 is *not* exempt. A `while (true)` whose head is the first
+        // instruction of the method is branched back to from the end of the
+        // body, and JVMS 4.7.4 requires a frame at every branch target: the
+        // first entry's offset is its `offset_delta`, so offset 0 is expressed
+        // with a delta of 0. Skipping it produced `VerifyError: Expecting a
+        // stackmap frame at branch target 0`.
         self.frames.insert(off, (locals, stack));
     }
 
