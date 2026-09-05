@@ -799,6 +799,8 @@ fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
                             is_val: m.is_val,
                             is_ctor: m.is_ctor,
                             is_implicit: m.is_implicit,
+                            is_deferred: m.is_deferred,
+                            is_mutable: m.is_mutable,
                         })
                         .collect()
                 }),
