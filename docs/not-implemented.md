@@ -165,3 +165,21 @@ Compiler flags (`agent/xflags`):
   `this` — `dequeue(): Int`, called on `Q.this`, not the declared `A` on
   whatever `this` happens to be — and entering the symbol alone gives neither.
   Reported, not answered wrongly.
+- **Tail-call optimisation.** `@tailrec` is now accepted wherever nsc accepts
+  it — the check that rejects it on a method that could be overridden matches
+  nsc's `isEffectivelyFinalOrNotOverridden` — but **nothing optimises the
+  call**. `crates/backend/` contains no tail-call transform at all. A `final`
+  method recursing on itself two million times throws `StackOverflowError`
+  here and returns in nsc.
+
+  This is the uncomfortable shape: the annotation is a *promise the compiler
+  makes to the programmer*, and we now accept the promise without keeping it.
+  Rejecting `@tailrec` outright would have been more honest and was worse in
+  practice — it fired on methods scalac accepts, which is a false positive on
+  legal code. Neither choice is right; the fix is the phase.
+
+  Nothing diagnoses this, and nothing in the corpus catches it either: a test
+  that recurses deeply enough to prove the point would be a test that takes a
+  stack overflow to fail. Found while measuring the `@tailrec` check
+  (`agent/tupletailrec`), by running the recursion and watching both binaries
+  overflow.
