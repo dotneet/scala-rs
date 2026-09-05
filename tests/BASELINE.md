@@ -38,7 +38,7 @@ is, and both invalidate everything downstream.
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
 | `pos` (1859) | **1053** | 461 | 345 |
-| `neg` (1405) | **659** | 378 | 368 |
+| `neg` (1405) | **659** | 377 | 369 |
 | `run` (2060) | **575** | 932 | 553 |
 
 ## Other

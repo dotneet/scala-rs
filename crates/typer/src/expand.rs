@@ -44,7 +44,7 @@ use scala_rs_pickle::names::{decode_method_name, encode_method_name};
 use scala_rs_span::Span;
 
 use crate::check::Typer;
-use crate::symbol::MacroBinding;
+use crate::symbol::{MacroBinding, SymKind, SymbolTable};
 
 /// The engine's source. Written to a cache directory and compiled with
 /// `javac` on first use, so the repository carries no class files and the
@@ -537,7 +537,7 @@ impl Typer {
             }
             Some(p) => {
                 let mut built = String::new();
-                match tree_to_wire(p, &mut built) {
+                match typed_tree_to_wire(&self.st, p, &mut built) {
                     Err(why) => {
                         out.push_str("(no ");
                         quote_into(&mut out, &why);
@@ -558,7 +558,7 @@ impl Typer {
         // not an error at every call site.
         out.push_str(" (app ");
         let mut built = String::new();
-        match tree_to_wire(application, &mut built) {
+        match typed_tree_to_wire(&self.st, application, &mut built) {
             Err(why) => {
                 out.push_str("(no ");
                 quote_into(&mut out, &why);
@@ -1076,6 +1076,81 @@ fn peel_application(tree: &Tree) -> (Vec<Vec<Tree>>, Vec<Type>, Option<Tree>) {
 
 // ------------------------------------------------------------ our tree → wire
 
+/// The template a bare name belongs to, when nsc would have typed the name as
+/// `C.this.name`.
+///
+/// nsc's typer replaces an `Ident` that resolves to a member of an enclosing
+/// class or object with a `Select` on `This`; only a *local* -- something a
+/// method or a block owns -- stays an `Ident`. A member of a package object
+/// or of a package is not qualified with `this` either, so a package owner
+/// says no.
+fn this_qualifier_of(st: &SymbolTable, sym: SymbolId) -> Option<String> {
+    if sym == SymbolId::NONE {
+        return None;
+    }
+    let owner = st.get(sym).owner;
+    if owner == SymbolId::NONE {
+        return None;
+    }
+    let name = &st.get(owner).name;
+    match st.get(owner).kind {
+        SymKind::Class => Some(name.clone()),
+        // A module class is `Test$` here and in the JVM, but nsc's *symbol*
+        // for it is named `Test` and that is what `Test.this` prints as.
+        SymKind::ModuleClass => Some(name.strip_suffix('$').unwrap_or(name).to_string()),
+        _ => None,
+    }
+}
+
+/// Write a tree the implementation reads as one the typer has already been
+/// over: `c.prefix` and `c.macroApplication`.
+///
+/// The difference from [`tree_to_wire`] is the `this` qualifier. nsc hands a
+/// macro *typed* trees, so `macros.foo` -- where `macros` is a `val` in
+/// `object Test` -- arrives as `Test.this.macros.foo`, and five corpus tests
+/// (`macro-term-declared-in-{anonymous,class-object,object-object,refinement}`
+/// and `macro-expand-override`) print the prefix and expect the qualifier.
+///
+/// Argument trees are deliberately *not* written this way. They are sent so
+/// that the implementation can splice them into its expansion, which is then
+/// type-checked again at the call site -- where an unqualified name still
+/// means what the source meant, and a `This` we did not resolve would not.
+fn typed_tree_to_wire(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<(), String> {
+    match &t.kind {
+        TreeKind::Ident { name } => match this_qualifier_of(st, t.sym) {
+            Some(owner) => {
+                out.push_str("(t \"Select\" (s0) (t \"This\" (s0) (n type ");
+                quote_into(out, &owner);
+                out.push_str(")) (n term ");
+                quote_into(out, &encode_method_name(name));
+                out.push_str("))");
+                Ok(())
+            }
+            None => tree_to_wire(t, out),
+        },
+        TreeKind::Select { qual, name } => {
+            out.push_str("(t \"Select\" (s0) ");
+            typed_tree_to_wire(st, qual, out)?;
+            out.push_str(" (n term ");
+            quote_into(out, &encode_method_name(name));
+            out.push_str("))");
+            Ok(())
+        }
+        TreeKind::Apply { fun, args } => {
+            out.push_str("(t \"Apply\" (s0) ");
+            typed_tree_to_wire(st, fun, out)?;
+            out.push_str(" (l");
+            for a in args {
+                out.push(' ');
+                tree_to_wire(a, out)?;
+            }
+            out.push_str("))");
+            Ok(())
+        }
+        _ => tree_to_wire(t, out),
+    }
+}
+
 /// Write an argument tree in the shape the engine can rebuild.
 ///
 /// Only the forms whose *source* meaning survives being rebuilt at the call
@@ -1105,8 +1180,10 @@ fn tree_to_wire(t: &Tree, out: &mut String) -> Result<(), String> {
             out.push_str("))");
             Ok(())
         }
-        TreeKind::This { .. } => {
-            out.push_str("(t \"This\" (s0) (n type \"\"))");
+        TreeKind::This { qual } => {
+            out.push_str("(t \"This\" (s0) (n type ");
+            quote_into(out, qual.as_deref().unwrap_or(""));
+            out.push_str("))");
             Ok(())
         }
         TreeKind::Select { qual, name } => {
