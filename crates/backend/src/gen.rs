@@ -3,7 +3,7 @@
 use crate::classfile::{
     encode_method_name, ClassEmit, EmittedClass, Field, InnerClassEntry, Method, Pool,
     ACC_ABSTRACT, ACC_BRIDGE, ACC_FINAL, ACC_INTERFACE, ACC_NATIVE, ACC_PRIVATE, ACC_PROTECTED,
-    ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
+    ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE, MAX_CODE_LENGTH,
 };
 use crate::code::{Assembler, Label, StackEntry};
 use crate::companion_fwd::{self, DescSort, Forwarder};
@@ -834,6 +834,9 @@ struct ClassBuilder {
     source: String,
     scala_signature: Option<String>,
     scala_raw: bool,
+    /// Class file format limits this class's members turned out not to fit in;
+    /// see [`EmittedClass::format_errors`].
+    format_errors: Vec<String>,
 }
 
 impl ClassBuilder {
@@ -849,6 +852,7 @@ impl ClassBuilder {
             source: source.to_string(),
             scala_signature: None,
             scala_raw: false,
+            format_errors: Vec::new(),
         }
     }
 
@@ -865,6 +869,17 @@ impl ClassBuilder {
         gen(&mut asm);
         let (code, pool) = asm.finish();
         self.pool = pool;
+        if code.bytes.len() > MAX_CODE_LENGTH {
+            // No encoding of this method exists (JVMS 4.7.3). nsc says the
+            // same and emits nothing for the class; what we must not do is
+            // write a `code_length` the loader rejects -- or, worse, let the
+            // offsets that are still `u16` wrap and hand out a class file that
+            // parses and then misbehaves.
+            self.format_errors.push(format!(
+                "Method too large: {}.{name} {desc}",
+                self.this_name.replace('/', "."),
+            ));
+        }
         self.methods.push(Method {
             access,
             name: encode_method_name(name),
@@ -959,6 +974,7 @@ impl ClassBuilder {
         EmittedClass {
             internal_name: this_name,
             bytes,
+            format_errors: self.format_errors,
         }
     }
 }

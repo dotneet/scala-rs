@@ -83,5 +83,9 @@ public class V {
 JAVA
 (cd $RUN && javac V.java >/dev/null 2>&1)
 java -Xverify:all -cp "$RUN:$RUN/out:$LIB:$CP" V $RUN/out $LIB 2>&1 | tail -5
+# The loader above stops after the constant pool, so no method body is looked
+# at. This reads the bodies back with `javap -c` and reports the offsets that
+# cannot be right -- a branch out of its own method, a method over 64 KB.
+python3 "$ROOT/tests/classfile_lint.py" $RUN/out | tail -20
 echo "subset_files=$NFILES classes=$NCLASSES (of 184 sources)"
 rm -rf $RUN
