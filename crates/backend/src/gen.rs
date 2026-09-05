@@ -3,7 +3,8 @@
 use crate::classfile::{
     encode_method_name, ClassEmit, EmittedClass, Field, InnerClassEntry, Method, Pool,
     ACC_ABSTRACT, ACC_BRIDGE, ACC_FINAL, ACC_INTERFACE, ACC_NATIVE, ACC_PRIVATE, ACC_PROTECTED,
-    ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE, MAX_CODE_LENGTH,
+    ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VARARGS, ACC_VOLATILE,
+    MAX_CODE_LENGTH,
 };
 use crate::code::{Assembler, Label, StackEntry};
 use crate::companion_fwd::{self, DescSort, Forwarder};
@@ -1992,6 +1993,62 @@ fn is_star_pat(pat: &Tree) -> bool {
     }
 }
 
+/// A `lazy val` inherited from a trait that arrived as a class file.
+struct BinaryLazyVal {
+    name: String,
+    ty: Type,
+    /// The interface whose `d$` static holds the initialiser.
+    owner: SymbolId,
+}
+
+/// Where a `lazy val` accessor gets the value it caches.
+enum LazyInit {
+    /// The initialiser as written, in this run's own trees.
+    Rhs(Box<Tree>),
+    /// `<Iface>.d$(this)`: a trait read from a class file put its initialiser
+    /// in a `default` method, and the static beside it is the entry point.
+    TraitStatic {
+        iface: String,
+        static_name: String,
+        static_desc: String,
+    },
+}
+
+/// A trait's `lazy val` as the method nsc compiles it to.
+///
+/// The interface holds the *initialiser*, not the caching: nsc emits a
+/// `default d()` with the right-hand side in it and the usual `d$` static
+/// beside it, and the implementing class's `d$lzycompute` calls that static
+/// under its own `bitmap$0`. The accessor stays public even for a `private
+/// lazy val` (under the expanded name), because a `private static` of one
+/// class file is not callable from another.
+fn lazy_val_as_def(vd: &Tree) -> Tree {
+    let TreeKind::ValDef {
+        mods,
+        name,
+        tpt,
+        rhs,
+    } = &vd.kind
+    else {
+        return vd.clone();
+    };
+    let mut mods = mods.clone();
+    mods.flags.set(Flags::PRIVATE, false);
+    mods.flags.set(Flags::LOCAL, false);
+    mods.private_within = None;
+    Tree {
+        kind: TreeKind::DefDef {
+            mods,
+            name: name.clone(),
+            tparams: Vec::new(),
+            vparamss: Vec::new(),
+            tpt: tpt.clone(),
+            rhs: rhs.clone(),
+        },
+        ..vd.clone()
+    }
+}
+
 fn val_tree_ty(st: &SymbolTable, vd: &Tree) -> Type {
     if !vd.ty.is_no_type() {
         vd.ty.clone()
@@ -3370,7 +3427,14 @@ impl<'a> Gen<'a> {
                 {
                     let ty = val_tree_ty(self.st, stt);
                     let gdesc = format!("(){}", jvm_desc(self.st, &ty));
-                    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, name, &gdesc);
+                    // A `lazy val` with an initialiser is the one `val` whose
+                    // accessor is *concrete* on the interface: nsc puts the
+                    // initialiser in a `default` method with the usual `m$`
+                    // static beside it and leaves the caching to the
+                    // implementing class. `emit_trait_bodies` emits both.
+                    if !(mods.flags.contains(Flags::LAZY) && !rhs.is_empty()) {
+                        b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, name, &gdesc);
+                    }
                     let sdesc = format!("({})V", jvm_desc_val(self.st, &ty));
                     if mods.flags.contains(Flags::MUTABLE) {
                         // A trait `var` — abstract or not — is a getter plus a
@@ -3487,14 +3551,15 @@ impl<'a> Gen<'a> {
                 });
             }
         }
-        for (name, ty) in self.mixin_val_fields(class_id, vparamss, &impl_.body) {
+        for (name, ty, extra) in self.mixin_val_fields(class_id, vparamss, &impl_.body) {
             b.fields.push(Field {
-                access: ACC_PUBLIC,
+                access: ACC_PUBLIC | extra,
                 name,
                 desc: jvm_desc_val(self.st, &ty),
             });
         }
         let lazies = self.all_lazy_vals(class_id, &impl_.body);
+        let binary_lazies = self.binary_mixin_lazy_vals(class_id, &impl_.body);
         for v in &self.mixin_lazy_vals(class_id, &impl_.body) {
             b.fields.push(Field {
                 access: ACC_PRIVATE,
@@ -3502,12 +3567,16 @@ impl<'a> Gen<'a> {
                 desc: jvm_desc_val(self.st, &val_tree_ty(self.st, v)),
             });
         }
-        if !lazies.is_empty() {
+        for v in &binary_lazies {
             b.fields.push(Field {
                 access: ACC_PRIVATE,
-                name: "bitmap$0".into(),
-                desc: "I".into(),
+                name: v.name.clone(),
+                desc: jvm_desc_val(self.st, &v.ty),
             });
+        }
+        if !lazies.is_empty() || !binary_lazies.is_empty() {
+            b.fields
+                .extend(self.lazy_bitmap_fields(&lazies, binary_lazies.len()));
         }
         self.emit_class_ctor(&mut b, class_id, vparamss, &impl_.body, &impl_.parents);
         let own_modules = self.member_modules_of(class_id, &impl_.body);
@@ -3515,7 +3584,7 @@ impl<'a> Gen<'a> {
         self.emit_member_module_accessors(&mut b, &own_modules);
         self.emit_member_module_accessors(&mut b, &mixin_modules);
         self.emit_trait_outer_accessors(&mut b, class_id);
-        self.emit_lazy_accessors(&mut b, class_id, &lazies);
+        self.emit_lazy_accessors(&mut b, class_id, &lazies, &binary_lazies);
         self.emit_val_getters(&mut b, &impl_.body);
         self.emit_ctor_val_getters(&mut b, class_id, vparamss);
         for stt in &impl_.body {
@@ -4295,6 +4364,139 @@ impl<'a> Gen<'a> {
         if let Some(d) = java_deprecated_desc(mods) {
             b.add_java_annot_to_last(d);
         }
+        self.emit_java_varargs_forwarder(b, def, name, &desc, acc);
+    }
+
+    /// `@scala.annotation.varargs` asks for a second, Java-shaped entry point:
+    /// `def f(xs: String*)` erases to `f(Seq)`, and the annotation adds
+    /// `f(String[])` which wraps the array and calls it. Without it the method
+    /// is simply not callable from Java, and `getDeclaredMethods` shows one
+    /// overload where scalac shows two (`run/t5125`, `run/t5125b`).
+    fn emit_java_varargs_forwarder(
+        &self,
+        b: &mut ClassBuilder,
+        def: &Tree,
+        name: &str,
+        desc: &str,
+        acc: u16,
+    ) {
+        let TreeKind::DefDef { mods, vparamss, .. } = &def.kind else {
+            return;
+        };
+        if name == "<init>" || name == "<clinit>" {
+            return;
+        }
+        if !mods.annotations.iter().any(|a| {
+            matches!(
+                a.annotation_path().as_str(),
+                "varargs" | "annotation.varargs" | "scala.annotation.varargs"
+            )
+        }) {
+            return;
+        }
+        // The repeated parameter is the last one of the last clause.
+        let Some(last) = vparamss.last().and_then(|c| c.last()) else {
+            return;
+        };
+        let pty = if last.ty.is_no_type() && !last.sym.is_none() {
+            self.st.get(last.sym).ty.clone()
+        } else {
+            last.ty.clone()
+        };
+        let Type::Repeated(elem) = pty else { return };
+        let elem_desc = jvm_desc_val(self.st, &elem);
+        let array_desc = format!("[{elem_desc}");
+        // `(…Lscala/collection/immutable/Seq;)R` -> `(…[T)R`.
+        let Some(close) = desc.find(')') else { return };
+        let inner = &desc[1..close];
+        let Some(cut) = split_desc_types(inner).last().copied() else {
+            return;
+        };
+        let head: String = inner[..cut].to_string();
+        let ret_desc = desc[close + 1..].to_string();
+        let fwd_desc = format!("({head}{array_desc}){ret_desc}");
+        if b.methods
+            .iter()
+            .any(|m| m.name == name && m.desc == fwd_desc)
+        {
+            return;
+        }
+        let (wrap, wrap_desc) = match elem_desc.as_str() {
+            "I" => ("wrapIntArray", "([I)Lscala/collection/immutable/ArraySeq;"),
+            "J" => ("wrapLongArray", "([J)Lscala/collection/immutable/ArraySeq;"),
+            "D" => (
+                "wrapDoubleArray",
+                "([D)Lscala/collection/immutable/ArraySeq;",
+            ),
+            "F" => (
+                "wrapFloatArray",
+                "([F)Lscala/collection/immutable/ArraySeq;",
+            ),
+            "S" => (
+                "wrapShortArray",
+                "([S)Lscala/collection/immutable/ArraySeq;",
+            ),
+            "B" => ("wrapByteArray", "([B)Lscala/collection/immutable/ArraySeq;"),
+            "C" => ("wrapCharArray", "([C)Lscala/collection/immutable/ArraySeq;"),
+            "Z" => (
+                "wrapBooleanArray",
+                "([Z)Lscala/collection/immutable/ArraySeq;",
+            ),
+            _ => (
+                "wrapRefArray",
+                "([Ljava/lang/Object;)Lscala/collection/immutable/ArraySeq;",
+            ),
+        };
+        let is_static = acc & ACC_STATIC != 0;
+        let head_sorts = desc_param_sorts(&format!("({head})V"));
+        let mut slot: u16 = if is_static { 0 } else { 1 };
+        let loads: Vec<(u16, JvmSort)> = head_sorts
+            .iter()
+            .map(|s| {
+                let at = slot;
+                slot += s.slots();
+                (at, *s)
+            })
+            .collect();
+        let array_slot = slot;
+        let max_locals = slot + 1;
+        let class_name = b.this_name.clone();
+        let target_desc = desc.to_string();
+        let mname = name.to_string();
+        let private = acc & ACC_PRIVATE != 0;
+        let ret = method_ret_ty(def);
+        b.add_code(
+            acc | ACC_VARARGS,
+            name,
+            &fwd_desc,
+            max_locals + 1,
+            move |asm| {
+                if !is_static {
+                    asm.aload(0);
+                }
+                for (at, sort) in &loads {
+                    load(asm, *at, *sort);
+                }
+                asm.getstatic(
+                    "scala/runtime/ScalaRunTime$",
+                    "MODULE$",
+                    "Lscala/runtime/ScalaRunTime$;",
+                );
+                asm.aload(array_slot);
+                if wrap == "wrapRefArray" && array_desc != "[Ljava/lang/Object;" {
+                    asm.checkcast("[Ljava/lang/Object;");
+                }
+                asm.invokevirtual("scala/runtime/ScalaRunTime$", wrap, wrap_desc);
+                if is_static {
+                    asm.invokestatic(&class_name, &mname, &target_desc);
+                } else if private {
+                    asm.invokespecial(&class_name, &mname, &target_desc);
+                } else {
+                    asm.invokevirtual(&class_name, &mname, &target_desc);
+                }
+                emit_return(asm, &ret);
+            },
+        );
     }
 
     fn emit_value_extension(&self, b: &mut ClassBuilder, class_id: SymbolId, def: &Tree) {
@@ -4517,6 +4719,19 @@ impl<'a> Gen<'a> {
         let lambda_wm = self.lambda_watermark();
         for def in &methods {
             self.emit_trait_impl_method(b, class_id, iface, def);
+        }
+        // A `lazy val`'s initialiser is a `default` method here too, and the
+        // implementing class's `m$lzycompute` is what makes it lazy. Without
+        // it a class real scalac compiled died on the first *read* of the
+        // `lazy val` with `NoSuchMethodError: 'int L.d$(L)'`.
+        for vd in self
+            .traits
+            .lazy_vals
+            .get(&class_id)
+            .cloned()
+            .unwrap_or_default()
+        {
+            self.emit_trait_impl_method(b, class_id, iface, &lazy_val_as_def(&vd));
         }
         // Unconditionally, even when there is nothing to run: nsc emits
         // `$init$` on *every* trait interface and every class it compiles
@@ -4778,12 +4993,31 @@ impl<'a> Gen<'a> {
         out
     }
 
+    /// The extra JVM field flags a mixed-in `val`/`var` keeps from the trait
+    /// that declared it. `@volatile` above all: dropping it turns a field the
+    /// program declared as volatile into a plain one, which is a memory-model
+    /// change no check but `getModifiers` can see (`run/t8087`,
+    /// `run/trait_fields_volatile`).
+    fn mixin_field_extra_access(v: &Tree) -> u16 {
+        let TreeKind::ValDef { mods, .. } = &v.kind else {
+            return 0;
+        };
+        let mut acc = 0;
+        if mods.flags.contains(Flags::VOLATILE) {
+            acc |= ACC_VOLATILE;
+        }
+        if mods.flags.contains(Flags::TRANSIENT) {
+            acc |= ACC_TRANSIENT;
+        }
+        acc
+    }
+
     fn mixin_val_fields(
         &self,
         class_id: SymbolId,
         vparamss: &[Vec<Tree>],
         body: &[Tree],
-    ) -> Vec<(String, Type)> {
+    ) -> Vec<(String, Type, u16)> {
         let mut have = HashSet::new();
         for clause in vparamss {
             for p in clause {
@@ -4815,7 +5049,7 @@ impl<'a> Gen<'a> {
                         continue;
                     }
                     if have.insert(name.clone()) {
-                        out.push((name, ty));
+                        out.push((name, ty, 0));
                     }
                 }
                 continue;
@@ -4825,7 +5059,11 @@ impl<'a> Gen<'a> {
                 if name.is_empty() || !have.insert(name.clone()) {
                     continue;
                 }
-                out.push((name, val_tree_ty(self.st, v)));
+                out.push((
+                    name,
+                    val_tree_ty(self.st, v),
+                    Self::mixin_field_extra_access(v),
+                ));
             }
         }
         out
@@ -4910,8 +5148,58 @@ impl<'a> Gen<'a> {
         out
     }
 
+    /// `lazy val`s inherited from a trait that arrived as a **class file**.
+    ///
+    /// On the interface a `lazy val` is indistinguishable from a concrete
+    /// trait method -- a `default d()` with a `d$` static beside it -- and the
+    /// caching is the implementing class's job. What tells the two apart is
+    /// the pickle: a `lazy val`'s accessor is pickled `ACCESSOR`, so
+    /// `install_classpath` gives it `SymKind::Term`, while a `def` is a
+    /// method. A *non*-lazy trait `val` has no static at all (the class
+    /// supplies its value through the mixin setter), so "term plus `d$`" is
+    /// exactly the set that needs a field and a `d$lzycompute` here. Without
+    /// it the class inherited the interface's `default`, which recomputes the
+    /// initialiser on every read.
+    fn binary_mixin_lazy_vals(&self, class_id: SymbolId, body: &[Tree]) -> Vec<BinaryLazyVal> {
+        let mut out = Vec::new();
+        if class_id.is_none() {
+            return out;
+        }
+        let mut have: HashSet<String> = HashSet::new();
+        for stt in body {
+            match &stt.kind {
+                TreeKind::ValDef { name, .. } | TreeKind::DefDef { name, .. } => {
+                    have.insert(name.clone());
+                }
+                _ => {}
+            }
+        }
+        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+            if !is_interface_sym(self.st, parent) || self.traits.impls.contains_key(&parent) {
+                continue;
+            }
+            for m in self.st.get(parent).members.clone() {
+                let s = self.st.get(m);
+                if s.kind != SymKind::Term || s.flags.contains(Flags::MUTABLE) {
+                    continue;
+                }
+                let name = s.name.clone();
+                let ty = s.ty.clone();
+                if !self.binary_trait_defines(parent, &name) || !have.insert(name.clone()) {
+                    continue;
+                }
+                out.push(BinaryLazyVal {
+                    name,
+                    ty,
+                    owner: parent,
+                });
+            }
+        }
+        out
+    }
+
     /// The class's own `lazy val`s followed by the inherited ones: one list so
-    /// they share `bitmap$0` without colliding on a bit.
+    /// they share the `bitmap$N` words without colliding on a bit.
     fn all_lazy_vals(&self, class_id: SymbolId, body: &[Tree]) -> Vec<Tree> {
         let mut out: Vec<Tree> = body
             .iter()
@@ -4927,6 +5215,36 @@ impl<'a> Gen<'a> {
         out
     }
 
+    /// The `bitmap$N` fields a class needs for `lazies`.
+    ///
+    /// One `int` holds 32 initialisation bits. A single word used to be
+    /// assumed, and the 33rd `lazy val` in a class then got `1 << 32`, which
+    /// the JVM (and Rust's shift) reduces to `1 << 0`: the value shared bit 0
+    /// with the first `lazy val`, so forcing that one made every later
+    /// accessor report itself initialised and return the field's default.
+    /// `run/t3038c` in scala/scala is exactly that program -- 70 `lazy val`s,
+    /// of which we printed the first 32 and then zeros.
+    fn lazy_bitmap_fields(&self, lazies: &[Tree], binary: usize) -> Vec<Field> {
+        let n = binary
+            + lazies
+                .iter()
+                .filter(|stt| match &stt.kind {
+                    TreeKind::ValDef { mods, rhs, .. } => {
+                        mods.flags.contains(Flags::LAZY) && !rhs.is_empty()
+                    }
+                    _ => false,
+                })
+                .count();
+        let words = n.div_ceil(32).max(1);
+        (0..words)
+            .map(|w| Field {
+                access: ACC_PRIVATE,
+                name: format!("bitmap${w}"),
+                desc: "I".into(),
+            })
+            .collect()
+    }
+
     fn emit_trait_val_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
         if class_id.is_none() {
             return;
@@ -4940,8 +5258,9 @@ impl<'a> Gen<'a> {
         for m in &b.methods {
             skip.insert(m.name.clone());
         }
-        // (name, type, owning trait, is a `var`, first in linearization order)
-        let mut needed: Vec<(String, Type, SymbolId, bool, bool)> = Vec::new();
+        // (name, type, owning trait, is a `var`, first in linearization order,
+        //  the trait declared it `final`)
+        let mut needed: Vec<(String, Type, SymbolId, bool, bool, bool)> = Vec::new();
         let mut seen = HashSet::new();
         let mut from_class: Option<HashSet<String>> = None;
         for parent in linearize(self.st, class_id).into_iter().skip(1) {
@@ -4959,7 +5278,7 @@ impl<'a> Gen<'a> {
                         continue;
                     }
                     let first = seen.insert(name.clone());
-                    needed.push((name, ty, parent, mutable, first));
+                    needed.push((name, ty, parent, mutable, first, false));
                 }
                 continue;
             };
@@ -4978,15 +5297,31 @@ impl<'a> Gen<'a> {
                 // `H2Profile$` failing `RelationalTableComponent.$init$` with
                 // an `AbstractMethodError`.
                 let first = seen.insert(name.clone());
-                let mutable = match &v.kind {
-                    TreeKind::ValDef { mods, .. } => mods.flags.contains(Flags::MUTABLE),
-                    _ => false,
+                let (mutable, is_final) = match &v.kind {
+                    TreeKind::ValDef { mods, .. } => (
+                        mods.flags.contains(Flags::MUTABLE),
+                        mods.flags.contains(Flags::FINAL),
+                    ),
+                    _ => (false, false),
                 };
-                needed.push((name, val_tree_ty(self.st, v), parent, mutable, first));
+                needed.push((
+                    name,
+                    val_tree_ty(self.st, v),
+                    parent,
+                    mutable,
+                    first,
+                    is_final,
+                ));
             }
         }
         let class_name = b.this_name.clone();
-        for (name, ty, owner, mutable, first) in needed {
+        for (name, ty, owner, mutable, first, is_final) in needed {
+            // nsc's mixin phase carries the trait `val`'s `final` onto the
+            // accessors it copies into the class: `trait T { final val v = 1 }`
+            // gives `public final int v()` and a final `T$_setter_$v_$eq`
+            // (`run/trait_fields_bytecode`, `run/trait_fields_final`). A plain
+            // `val` gets neither.
+            let fin = if is_final { ACC_FINAL } else { 0 };
             let fdesc = jvm_desc_val(self.st, &ty);
             let gdesc = format!("(){}", jvm_desc(self.st, &ty));
             let sdesc = format!("({fdesc})V");
@@ -5026,7 +5361,7 @@ impl<'a> Gen<'a> {
             let fname = name.clone();
             let class_c = class_name.clone();
             let fdesc_c = fdesc.clone();
-            b.add_code(ACC_PUBLIC, &name, &gdesc, 1, |asm| {
+            b.add_code(ACC_PUBLIC | fin, &name, &gdesc, 1, |asm| {
                 asm.aload(0);
                 emit_getfield(asm, &class_c, &fname, &fdesc_c);
                 emit_return(asm, &ty);
@@ -5034,7 +5369,7 @@ impl<'a> Gen<'a> {
             let fname = name.clone();
             let class_c = class_name.clone();
             let fdesc_c = fdesc.clone();
-            b.add_code(ACC_PUBLIC, &setter, &sdesc, 1 + sort.slots(), |asm| {
+            b.add_code(ACC_PUBLIC | fin, &setter, &sdesc, 1 + sort.slots(), |asm| {
                 asm.aload(0);
                 load(asm, 1, sort);
                 asm.putfield(&class_c, &fname, &fdesc_c);
@@ -5043,6 +5378,67 @@ impl<'a> Gen<'a> {
             skip.insert(name);
             skip.insert(setter);
         }
+    }
+
+    /// Whether a trait that arrived as a *class file* defines `method`.
+    ///
+    /// [`TraitImpls`] is harvested from source trees, so a trait read from
+    /// `-cp` has no entry there at all and every tree-driven decision below
+    /// silently treated its concrete members as declarations. The interface
+    /// says so on its own: nsc puts a `public static m$(Iface, …)` beside
+    /// every concrete trait method (that static is what every mixin forwarder
+    /// and every `super` call goes through), and nothing else on an interface
+    /// carries that name. So the static *is* the mark of a definition, and it
+    /// is in the symbol table because the class file scanner installs an
+    /// interface's methods whole.
+    fn binary_trait_defines(&self, trait_id: SymbolId, method: &str) -> bool {
+        let want = trait_static_name(method);
+        self.st.get(trait_id).members.iter().any(|&m| {
+            let s = self.st.get(m);
+            s.kind == SymKind::Method && s.name == want
+        })
+    }
+
+    /// The `p$q$T$$super$m` accessors a trait read from `-cp` declares, as
+    /// `(accessor symbol, the source name of `m`)`.
+    ///
+    /// A stackable `abstract override` layer reaches the next one through this
+    /// accessor, and the *class* owes the implementation. Without it a binary
+    /// stackable trait of nsc's mixed in by us was silent: the JVM resolves a
+    /// class method ahead of an interface `default`, so `new Stacked().label`
+    /// ran the base implementation and printed the wrong answer with no
+    /// exception anywhere.
+    fn binary_trait_super_accessors(&self, trait_id: SymbolId) -> Vec<(SymbolId, String)> {
+        if self.traits.impls.contains_key(&trait_id) {
+            return Vec::new();
+        }
+        let prefix = format!(
+            "{}$$super$",
+            class_internal(self.st, trait_id).replace('/', "$")
+        );
+        let members = self.st.get(trait_id).members.clone();
+        let mut out = Vec::new();
+        for acc in members.iter().copied() {
+            let s = self.st.get(acc);
+            if s.kind != SymKind::Method {
+                continue;
+            }
+            let Some(enc) = s.name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let enc = enc.to_string();
+            // The accessor's name holds the *encoded* method name; the
+            // interface's own member list is where the source name is.
+            let Some(name) = members.iter().copied().find_map(|m| {
+                let t = self.st.get(m);
+                (t.kind == SymKind::Method && encode_method_name(&t.name) == enc)
+                    .then(|| t.name.clone())
+            }) else {
+                continue;
+            };
+            out.push((acc, name));
+        }
+        out
     }
 
     fn emit_super_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId) {
@@ -5054,21 +5450,48 @@ impl<'a> Gen<'a> {
             if idx == 0 || !is_interface_sym(self.st, *parent) {
                 continue;
             }
-            let Some(methods) = self.traits.impls.get(parent) else {
-                continue;
-            };
-            for m in methods {
-                if !needs_super_accessor(m) {
-                    continue;
+            // `(source name, accessor name, instance descriptor, parameters,
+            // result)`. A trait of this run's own sources contributes one
+            // entry per member whose body writes `super.m`; a trait read from
+            // `-cp` contributes one per accessor its *interface* declares,
+            // which is the same set as far as the class is concerned.
+            let mut owed: Vec<(String, String, String, Vec<Type>, Type)> = Vec::new();
+            match self.traits.impls.get(parent) {
+                Some(methods) => {
+                    for m in methods {
+                        if !needs_super_accessor(m) {
+                            continue;
+                        }
+                        let name = m.name().unwrap_or("").to_string();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        owed.push((
+                            name.clone(),
+                            super_accessor_name(self.st, *parent, &name),
+                            def_method_desc(self.st, m),
+                            def_param_types(self.st, m),
+                            method_ret_ty(m),
+                        ));
+                    }
                 }
-                let name = m.name().unwrap_or("").to_string();
-                if name.is_empty() {
-                    continue;
+                None => {
+                    for (acc, name) in self.binary_trait_super_accessors(*parent) {
+                        let aname = self.st.get(acc).name.clone();
+                        if b.methods.iter().any(|m| m.name == aname) {
+                            continue;
+                        }
+                        owed.push((
+                            name,
+                            aname,
+                            method_desc_from_sym(self.st, acc),
+                            method_params_from_sym(self.st, acc),
+                            method_ret_from_sym(self.st, acc),
+                        ));
+                    }
                 }
-                let acc = super_accessor_name(self.st, *parent, &name);
-                let inst_desc = def_method_desc(self.st, m);
-                let ret = method_ret_ty(m);
-                let pts = def_param_types(self.st, m);
+            }
+            for (name, acc, inst_desc, pts, ret) in owed {
                 let mut locals = 1u16;
                 let mut loads = Vec::new();
                 for p in &pts {
@@ -5137,13 +5560,29 @@ impl<'a> Gen<'a> {
         arity: usize,
     ) -> Option<String> {
         match target? {
-            (next, true) => self
-                .traits
-                .impls
-                .get(&next)?
-                .iter()
-                .find(|m| m.name() == Some(method) && def_param_types(self.st, m).len() == arity)
-                .map(|m| def_method_desc(self.st, m)),
+            (next, true) => match self.traits.impls.get(&next) {
+                Some(ms) => ms
+                    .iter()
+                    .find(|m| {
+                        m.name() == Some(method) && def_param_types(self.st, m).len() == arity
+                    })
+                    .map(|m| def_method_desc(self.st, m)),
+                // A trait read from `-cp`: its interface carries the
+                // descriptor the trait was compiled with.
+                None => self
+                    .st
+                    .get(next)
+                    .members
+                    .iter()
+                    .copied()
+                    .find(|&mid| {
+                        let mem = self.st.get(mid);
+                        mem.name == method
+                            && mem.kind == SymKind::Method
+                            && param_count(self.st, mid) == arity
+                    })
+                    .map(|mid| method_desc_from_sym(self.st, mid)),
+            },
             (next, false) => self
                 .st
                 .get(next)
@@ -5178,6 +5617,11 @@ impl<'a> Gen<'a> {
                 {
                     return Some((s, true));
                 }
+            } else if is_interface_sym(self.st, s) && self.binary_trait_defines(s, method) {
+                // A trait read from `-cp` sitting between two stackable layers
+                // of ours: without this the `super` chain skipped it and went
+                // straight to the superclass, dropping its layer silently.
+                return Some((s, true));
             }
             if !is_interface_sym(self.st, s) {
                 let has = self.st.get(s).members.iter().any(|&mid| {
@@ -5481,11 +5925,112 @@ impl<'a> Gen<'a> {
                 emit_return(asm, &ret);
             });
         }
+        self.emit_binary_mixin_forwarders(b, &lin, super_idx, &super_impls);
         self.emit_trait_capture_accessors(b, class_id, &lin);
         if !self.library_abi {
             let by_name: HashSet<String> = defined.iter().map(|(n, _)| n.clone()).collect();
             self.emit_ordered_forwarders(b, class_id, &by_name);
         }
+    }
+
+    /// Mixin forwarders for a trait that arrived as a **class file**.
+    ///
+    /// nsc puts a forwarder in the class for every concrete member of every
+    /// mixed-in trait. We only owe one where the JVM would otherwise disagree
+    /// with the linearization, and there is exactly one such shape: a class
+    /// method always beats an interface `default`, so a trait member the
+    /// *superclass* also defines concretely never runs. That is what made a
+    /// binary stackable trait silent -- `class Stacked extends Plain with
+    /// Loud` resolved `label()` to `Plain.label()` and never reached
+    /// `Loud`'s `default`, with no exception and no diagnostic. Everywhere
+    /// else the JVM's own most-specific-interface rule already picks what SLS
+    /// 5.1.2 picks, and emitting a forwarder would only restate it -- for
+    /// every concrete member of every scala-library trait we mix in.
+    ///
+    /// Traits *after* the superclass in the linearization are its ancestors,
+    /// not this class's mixins: it has already settled which body wins.
+    fn emit_binary_mixin_forwarders(
+        &self,
+        b: &mut ClassBuilder,
+        lin: &[SymbolId],
+        super_idx: Option<usize>,
+        super_impls: &[(String, Vec<Type>, SymbolId)],
+    ) {
+        let Some(super_idx) = super_idx else {
+            return;
+        };
+        let mut defined: HashSet<(String, String)> = b
+            .methods
+            .iter()
+            .map(|m| (m.name.clone(), desc_params(&m.desc).to_string()))
+            .collect();
+        for (pi, parent) in lin.iter().enumerate().skip(1) {
+            if pi > super_idx
+                || !is_interface_sym(self.st, *parent)
+                || self.traits.impls.contains_key(parent)
+            {
+                continue;
+            }
+            let iface = class_internal(self.st, *parent);
+            for mid in self.st.get(*parent).members.clone() {
+                let s = self.st.get(mid);
+                if s.kind != SymKind::Method || s.name == "<init>" {
+                    continue;
+                }
+                let name = s.name.clone();
+                if !self.binary_trait_defines(*parent, &name)
+                    || !self.superclass_implements_sym(super_impls, mid)
+                {
+                    continue;
+                }
+                let inst_desc = method_desc_from_sym(self.st, mid);
+                let key = (
+                    encode_method_name(&name),
+                    desc_params(&inst_desc).to_string(),
+                );
+                if !defined.insert(key) {
+                    continue;
+                }
+                let ret = method_ret_from_sym(self.st, mid);
+                let static_desc = trait_static_desc(&iface, &inst_desc);
+                let mut locals = 1u16;
+                let mut loads = Vec::new();
+                for sort in desc_param_sorts(desc_params(&inst_desc)) {
+                    loads.push((locals, sort));
+                    locals += sort.slots();
+                }
+                let iface_c = iface.clone();
+                let static_name = trait_static_name(&name);
+                b.add_code(ACC_PUBLIC, &name, &inst_desc, locals.max(1), |asm| {
+                    asm.aload(0);
+                    for (slot, sort) in &loads {
+                        load(asm, *slot, *sort);
+                    }
+                    asm.invokestatic_interface(&iface_c, &static_name, &static_desc);
+                    emit_return(asm, &ret);
+                });
+            }
+        }
+    }
+
+    /// [`Gen::superclass_implements`], for a member known by symbol rather
+    /// than by tree.
+    fn superclass_implements_sym(
+        &self,
+        super_impls: &[(String, Vec<Type>, SymbolId)],
+        mid: SymbolId,
+    ) -> bool {
+        let enc = encode_method_name(&self.st.get(mid).name);
+        let declared = method_params_from_sym(self.st, mid);
+        let abstract_mask = self
+            .st
+            .erased_abstract_params
+            .get(&mid)
+            .copied()
+            .unwrap_or(0);
+        super_impls.iter().any(|(n, cps, sym)| {
+            *n == enc && *sym != mid && bridge_overrides(self.st, &declared, cps, abstract_mask)
+        })
     }
 
     /// Implement the capture accessors every mixed-in *local* trait declares
@@ -5725,6 +6270,15 @@ impl<'a> Gen<'a> {
                         }
                     }
                 }
+                // SLS 5.3.2 / nsc: the last conjunct is `that.canEqual(this)`,
+                // which is what lets a subclass refuse an equality its
+                // superclass's fields would otherwise accept. Leaving it out
+                // made `case class C1(x: Int)` equal to a subclass that
+                // overrides `canEqual` to say no (`run/caseClassEquality`).
+                asm.aload(2);
+                asm.aload(0);
+                asm.invokevirtual(&cj, "canEqual", "(Ljava/lang/Object;)Z");
+                asm.ifeq(no);
                 asm.mark(yes);
                 asm.iconst(1);
                 asm.ireturn();
@@ -6595,9 +7149,20 @@ impl<'a> Gen<'a> {
     }
 
     /// `lazies` is the class's complete list of `lazy val`s — its own and the
-    /// ones inherited from mixed-in traits — so bits in `bitmap$0` are unique.
-    fn emit_lazy_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId, lazies: &[Tree]) {
-        let mut bit = 0i32;
+    /// ones inherited from mixed-in traits — so bits are unique. Bit `n` lives
+    /// in `bitmap$(n / 32)`; `lazy_bitmap_fields` declares the same words.
+    fn emit_lazy_accessors(
+        &self,
+        b: &mut ClassBuilder,
+        class_id: SymbolId,
+        lazies: &[Tree],
+        binary: &[BinaryLazyVal],
+    ) {
+        // The class's own `lazy val`s and the ones inherited from *source*
+        // traits carry their initialiser as a tree; one inherited from a trait
+        // that arrived as a class file is a call to that trait's `d$` static,
+        // which is where nsc put the initialiser. Both share the bitmap words.
+        let mut items: Vec<(String, Type, LazyInit)> = Vec::new();
         for stt in lazies {
             let TreeKind::ValDef {
                 name, mods, rhs, ..
@@ -6613,6 +7178,23 @@ impl<'a> Gen<'a> {
             } else {
                 stt.ty.clone()
             };
+            items.push((name.clone(), ty, LazyInit::Rhs(rhs.clone())));
+        }
+        for v in binary {
+            let iface = class_internal(self.st, v.owner);
+            let getter = format!("(){}", jvm_desc(self.st, &v.ty));
+            items.push((
+                v.name.clone(),
+                v.ty.clone(),
+                LazyInit::TraitStatic {
+                    static_desc: trait_static_desc(&iface, &getter),
+                    static_name: trait_static_name(&v.name),
+                    iface,
+                },
+            ));
+        }
+        for (bit, (name, ty, init)) in items.into_iter().enumerate() {
+            let name = &name;
             let desc = format!("(){}", jvm_desc(self.st, &ty));
             let class_name = b.this_name.clone();
             let fname = name.clone();
@@ -6625,9 +7207,8 @@ impl<'a> Gen<'a> {
             let source = self.source_name;
             let library_abi = self.library_abi;
             let boxed_vars = &self.boxed_vars;
-            let rhs = rhs.clone();
-            let mask = 1i32 << bit;
-            bit += 1;
+            let mask = 1i32 << (bit % 32);
+            let bitmap = format!("bitmap${}", bit / 32);
             let ret_ty = ty.clone();
             let caps = capture_slots(self.st, &self.boxed_vars, class_id);
             b.add_code(ACC_PUBLIC, &fname, &desc, 4, |asm| {
@@ -6647,33 +7228,45 @@ impl<'a> Gen<'a> {
                 let try_s = asm.fresh_label();
                 asm.mark(try_s);
                 asm.aload(0);
-                asm.getfield(&class_name, "bitmap$0", "I");
+                asm.getfield(&class_name, &bitmap, "I");
                 asm.iconst(mask);
                 asm.iand();
                 let inited = asm.fresh_label();
                 asm.ifne(inited);
-                let ctx = emit_ctx(
-                    st,
-                    class_id,
-                    &class_name,
-                    ret_ty.clone(),
-                    extras,
-                    lambda_n,
-                    lambda_bodies,
-                    Some(&hoist_owner),
-                    source,
-                    library_abi,
-                    boxed_vars,
-                );
                 asm.aload(0);
-                gen_expr(asm, &mut frame, &ctx, &rhs);
+                match &init {
+                    LazyInit::Rhs(rhs) => {
+                        let ctx = emit_ctx(
+                            st,
+                            class_id,
+                            &class_name,
+                            ret_ty.clone(),
+                            extras,
+                            lambda_n,
+                            lambda_bodies,
+                            Some(&hoist_owner),
+                            source,
+                            library_abi,
+                            boxed_vars,
+                        );
+                        gen_expr(asm, &mut frame, &ctx, rhs);
+                    }
+                    LazyInit::TraitStatic {
+                        iface,
+                        static_name,
+                        static_desc,
+                    } => {
+                        asm.aload(0);
+                        asm.invokestatic_interface(iface, static_name, static_desc);
+                    }
+                }
                 emit_putfield_from_expr(asm, &class_name, &fname, &fdesc);
                 asm.aload(0);
                 asm.aload(0);
-                asm.getfield(&class_name, "bitmap$0", "I");
+                asm.getfield(&class_name, &bitmap, "I");
                 asm.iconst(mask);
                 asm.ior();
-                asm.putfield(&class_name, "bitmap$0", "I");
+                asm.putfield(&class_name, &bitmap, "I");
                 asm.mark(inited);
                 asm.aload(0);
                 emit_getfield(asm, &class_name, &fname, &fdesc);
@@ -6961,14 +7554,15 @@ impl<'a> Gen<'a> {
                 });
             }
         }
-        for (name, ty) in self.mixin_val_fields(cls, &[], &impl_.body) {
+        for (name, ty, extra) in self.mixin_val_fields(cls, &[], &impl_.body) {
             b.fields.push(Field {
-                access: ACC_PUBLIC,
+                access: ACC_PUBLIC | extra,
                 name,
                 desc: jvm_desc_val(self.st, &ty),
             });
         }
         let lazies = self.all_lazy_vals(cls, &impl_.body);
+        let binary_lazies = self.binary_mixin_lazy_vals(cls, &impl_.body);
         for v in &self.mixin_lazy_vals(cls, &impl_.body) {
             b.fields.push(Field {
                 access: ACC_PRIVATE,
@@ -6976,12 +7570,16 @@ impl<'a> Gen<'a> {
                 desc: jvm_desc_val(self.st, &val_tree_ty(self.st, v)),
             });
         }
-        if !lazies.is_empty() {
+        for v in &binary_lazies {
             b.fields.push(Field {
                 access: ACC_PRIVATE,
-                name: "bitmap$0".into(),
-                desc: "I".into(),
+                name: v.name.clone(),
+                desc: jvm_desc_val(self.st, &v.ty),
             });
+        }
+        if !lazies.is_empty() || !binary_lazies.is_empty() {
+            b.fields
+                .extend(self.lazy_bitmap_fields(&lazies, binary_lazies.len()));
         }
 
         self.emit_module_init(
@@ -7000,7 +7598,7 @@ impl<'a> Gen<'a> {
         self.emit_member_module_accessors(&mut b, &own_modules);
         self.emit_member_module_accessors(&mut b, &mixin_modules);
         self.emit_trait_outer_accessors(&mut b, cls);
-        self.emit_lazy_accessors(&mut b, cls, &lazies);
+        self.emit_lazy_accessors(&mut b, cls, &lazies, &binary_lazies);
         self.emit_val_getters(&mut b, &impl_.body);
 
         for stt in &impl_.body {
@@ -9427,7 +10025,20 @@ fn gen_literal(asm: &mut Assembler, lit: &Lit) {
         Lit::Char(c) => asm.iconst(*c as i32),
         Lit::String(s) => asm.ldc_string(s),
         Lit::Null => asm.aconst_null(),
-        Lit::Symbol(s) => asm.ldc_string(s),
+        // `'foo` is a `scala.Symbol`, not its name. Pushing the bare string
+        // type-checked (the literal's type is `Symbol`) and then printed
+        // `foo` where scalac prints `Symbol(foo)`; any actual `Symbol` member
+        // on it would have been a `NoSuchMethodError` at run time.
+        // `Symbol.apply` interns, so `'foo eq 'foo` still holds.
+        Lit::Symbol(s) => {
+            asm.getstatic("scala/Symbol$", "MODULE$", "Lscala/Symbol$;");
+            asm.ldc_string(s);
+            asm.invokevirtual(
+                "scala/Symbol$",
+                "apply",
+                "(Ljava/lang/String;)Lscala/Symbol;",
+            );
+        }
     }
 }
 
@@ -16320,6 +16931,18 @@ fn gen_wrap_varargs(
     elem: &Type,
 ) {
     let n = args.len() as i32;
+    // An *empty* varargs argument is `Nil`, not an empty `ArraySeq`: nsc emits
+    // `scala/collection/immutable/Nil$.MODULE$` and the difference is visible,
+    // because the callee may print what it was handed (`run/t5966` expects
+    // `List()` where we printed `ArraySeq()`).
+    if args.is_empty() {
+        asm.getstatic(
+            "scala/collection/immutable/Nil$",
+            "MODULE$",
+            "Lscala/collection/immutable/Nil$;",
+        );
+        return;
+    }
     let all_int = !args.is_empty()
         && args.iter().all(|a| matches!(a.ty, Type::Int))
         && matches!(
@@ -21571,6 +22194,29 @@ fn emit_class_constant(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
 /// Whether the typer widened this member's access for companion use.
 /// The JVM sorts of a method descriptor's parameters, given `desc` starting at
 /// `(` (anything after the matching `)` is ignored).
+/// Byte offsets at which each field descriptor starts inside a *bare*
+/// parameter list (no parentheses). Used to split off the last parameter --
+/// `rfind('L')` cannot, because a class name may itself contain an `L`
+/// (`Lfoo/BarList;`).
+fn split_desc_types(inner: &str) -> Vec<usize> {
+    let b = inner.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        out.push(i);
+        while i < b.len() && b[i] == b'[' {
+            i += 1;
+        }
+        if i < b.len() && b[i] == b'L' {
+            while i < b.len() && b[i] != b';' {
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// The parameter part of a method descriptor, parentheses included.
 fn desc_params(desc: &str) -> &str {
     match desc.find(')') {
