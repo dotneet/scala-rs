@@ -520,6 +520,12 @@ pub struct Typer {
     /// Members without a type annotation, keyed by symbol: nsc's lazy
     /// completers (see `crate::lazysig`).
     pub(crate) pending_sigs: HashMap<SymbolId, PendingSig>,
+    /// Parameter symbols read back from the library pickle for a hand-written
+    /// prelude method, which has none of its own; see
+    /// [`crate::prelude_paramnames`]. Kept here rather than on the method so
+    /// that only the named-argument path sees them. An empty vector is a
+    /// memoised miss.
+    pub(crate) prelude_params: HashMap<u32, Vec<Vec<SymbolId>>>,
     /// Signatures being completed right now (nsc's `LOCKED` flag).
     pub(crate) lazy_completing: Vec<SymbolId>,
     /// Symbols a `recursive ... needs type` was already reported for.
@@ -869,6 +875,7 @@ impl Typer {
             pending_pkg_folds: Vec::new(),
             pkg_alias_gaps: HashMap::new(),
             pending_sigs: HashMap::new(),
+            prelude_params: HashMap::new(),
             lazy_completing: Vec::new(),
             lazy_cyclic: HashSet::new(),
             lazy_done: HashMap::new(),
