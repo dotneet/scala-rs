@@ -1119,3 +1119,181 @@ fn sv_refused_forms_are_named() {
     }
     let _ = fs::remove_dir_all(&out_dir);
 }
+
+// ---------------------------------------------------------------------------
+// `scala.reflect.runtime` *visibility*: `TypeTag` / `WeakTypeTag` /
+// `Transformer` as types, and `JavaUniverse#runtimeMirror`.
+//
+// Unlike the `eg_*` / `ex_*` / `rd_*` / `rb_*` families above, nothing here
+// runs the macro engine: these are ordinary jar members (a nested trait, an
+// abstract class, a plain method) that were never *installed* at all, so
+// every reference to them was "not found" or "not a member" regardless of
+// what the member actually does. `PickleSupply::complete_type_member` did not
+// have a case for `MemberKind::Class` (a nested class or trait named as a
+// *type*, as opposed to a type alias or an abstract type member), and
+// `java.lang.ClassLoader` had no symbol at all outside the classfile loader's
+// on-demand path, which `JavaUniverse#runtimeMirror`'s parameter needed
+// before the method could even be considered. See `crates/typer/src/
+// pickle_supply.rs`'s `complete_type_member_uncached` and `crates/typer/src/
+// prelude_reflectruntime.rs`.
+
+/// `tests/fixtures/rt_typetags.scala`: `TypeTag[Int]` / `WeakTypeTag[String]`
+/// as types (`u.TypeTag[T]` / `u.WeakTypeTag[T]`, nested inside trait
+/// `TypeTags`), `Transformer` as a type (nested inside trait `Trees`, an
+/// *abstract class* rather than a trait -- confirming the fix is not
+/// specific to interfaces), and `runtimeMirror(ClassLoader)`.
+///
+/// The tag values print through `.tpe.toString` rather than directly: nsc's
+/// own `WeakTypeTag` materialiser upgrades a concrete type to a full
+/// `TypeTag` regardless of which one was asked for (`implicitly[WeakTypeTag
+/// [Int]]` prints `TypeTag[Int]`, confirmed against real scalac), which is a
+/// materialisation nuance this slice does not touch; comparing `.tpe` isolates
+/// what was actually fixed here -- that the *names* resolve at all -- from
+/// that separate, pre-existing difference.
+#[test]
+fn rt_typetags_resolve_and_run() {
+    if !prerequisites("rt_typetags") {
+        return;
+    }
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let out_dir = tmp_dir("rt_typetags");
+    let out = compile("rt_typetags", &out_dir, &[]);
+    assert!(
+        out.status.success(),
+        "compile rt_typetags failed: {}",
+        diagnostics(&out)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        out_dir.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "rt_typetags"),
+        expected_stdout("rt_typetags"),
+        "stdout mismatch for rt_typetags"
+    );
+    let _ = fs::remove_dir_all(&out_dir);
+}
+
+/// The same file through real scalac 2.13.16.
+#[test]
+fn rt_typetags_matches_real_scalac() {
+    if !prerequisites("rt_typetags scalac diff") {
+        return;
+    }
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip rt_typetags scalac diff: scalac not obtainable");
+        return;
+    };
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let out_dir = tmp_dir("rt_typetags-scalac");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            out_dir.to_str().unwrap(),
+            fixtures_dir().join("rt_typetags.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected rt_typetags.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        out_dir.display(),
+        reflect.display(),
+        jar.display()
+    );
+    assert_eq!(
+        run_main(&cp, "rt_typetags (real scalac build)"),
+        expected_stdout("rt_typetags"),
+        "recorded expectation for rt_typetags does not match real scalac"
+    );
+    let _ = fs::remove_dir_all(&out_dir);
+}
+
+/// `tests/fixtures/rt_currentmirror_bad.scala`: `currentMirror` is now a real
+/// (visible, correctly typed) member of `scala.reflect.runtime` -- it is a
+/// genuine macro def read from scala-reflect.jar's pickle, bound to the real
+/// `scala.reflect.runtime.Macros$.currentMirror` implementation
+/// (`docs/notes/macro-reflect-and-reify.md`) -- but expanding it needs `c
+/// .reifyEnclosingRuntimeClass`, which the engine does not implement yet. So
+/// referencing it must still fail, and by the same "macro expansion is not
+/// implemented" diagnostic every other unexpandable macro gets
+/// (`Typer::report_macro_calls`), never by "not found".
+///
+/// Real scalac accepts and runs this file (`currentMirror` is one of its own
+/// fast-track macros), which is what makes this a confession of what remains
+/// unimplemented rather than a correct rejection.
+#[test]
+fn rt_currentmirror_is_named_not_stubbed() {
+    if !prerequisites("rt_currentmirror_bad") {
+        return;
+    }
+    let out_dir = tmp_dir("rt_currentmirror_bad");
+    let out = compile("rt_currentmirror_bad", &out_dir, &[]);
+    assert!(
+        !out.status.success(),
+        "rt_currentmirror_bad.scala should not compile yet"
+    );
+    let text = diagnostics(&out);
+    assert!(
+        text.contains(
+            "macro expansion is not implemented: cannot expand currentMirror \
+             (implementation scala/reflect/runtime/Macros$.currentMirror)"
+        ),
+        "missing the honest currentMirror diagnostic in:\n{text}"
+    );
+    let _ = fs::remove_dir_all(&out_dir);
+
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip rt_currentmirror_bad scalac diff: scalac not obtainable");
+        return;
+    };
+    let reflect = scala_reflect_jar().unwrap();
+    let jar = scala_library_jar().unwrap();
+    let scalac_out = tmp_dir("rt_currentmirror_bad-scalac");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            scalac_out.to_str().unwrap(),
+            fixtures_dir()
+                .join("rt_currentmirror_bad.scala")
+                .to_str()
+                .unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "expected real scalac to accept rt_currentmirror_bad.scala (it is a \
+         fast-track macro, not something either compiler should reject): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cp = format!(
+        "{}:{}:{}",
+        scalac_out.display(),
+        reflect.display(),
+        jar.display()
+    );
+    let run = Command::new("java")
+        .args(["-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        run.status.success(),
+        "expected real scalac's build of rt_currentmirror_bad to run: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_dir_all(&scalac_out);
+}
