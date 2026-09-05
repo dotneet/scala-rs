@@ -42,6 +42,7 @@ mod prelude_buildfrom;
 mod prelude_classtag;
 mod prelude_coll;
 mod prelude_conform;
+mod prelude_consextract;
 mod prelude_dbio;
 mod prelude_durrange;
 mod prelude_either;

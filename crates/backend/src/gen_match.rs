@@ -186,6 +186,14 @@ pub(crate) fn unapply_param_class(ctx: &EmitCtx, uid: SymbolId) -> Option<String
     if uid.is_none() {
         return None;
     }
+    // `+:` / `:+` take a `SeqOps`, which their prelude signature does not say.
+    if let Some(d) = crate::gen_invoke::cons_extractor_desc(
+        &class_internal(ctx.st, ctx.st.get(uid).owner),
+        ctx.st.get(uid).name.as_str(),
+    ) {
+        let inner = d.strip_prefix("(L")?.split(';').next()?;
+        return Some(inner.to_string());
+    }
     let desc = method_desc_boxed(ctx.st, uid, ctx.boxed_vars);
     let params = desc.strip_prefix('(')?.split(')').next()?.to_string();
     if let Some(rest) = params.strip_prefix('L') {
