@@ -1,11 +1,15 @@
 # typelevel/cats
 
-> **Measurement note (2026-09-05).** `tests/cats_measure.sh` now passes
+> **Measurement note (2026-09-05).** `tests/cats_measure.sh` passes
 > `-no-specialization`. cats writes `import scala.{specialized => sp}` and
-> annotates with `@sp`; scala-rs rejects that annotation without the flag, and
-> **a single parse error aborts the run before any file is typechecked**, so the
-> count collapses to the parse errors alone (71) and says nothing about type
-> checking. The honest figure at `997884a` is **2929 errors / 151 files**, of
+> annotates with `@sp`; scala-rs used to reject that annotation without the
+> flag, and **a single parse error aborts the run before any file is
+> typechecked**, so the count collapsed to the parse errors alone (71) and said
+> nothing about type checking. *(Since stage 1 of
+> [`docs/specialization.md`](specialization.md) the annotation is accepted, and
+> the run reports the same number with the flag and without it — 907 at the
+> time of writing — so the flag is no longer buying anything. It is still
+> passed.)* The honest figure at `997884a` is **2929 errors / 151 files**, of
 > which the kind-projector symptoms (`*` 388, `λ` 158, `α` 104) are still the
 > largest group — those are a compiler plugin, and real scalac rejects them too
 > without it.
@@ -485,13 +489,13 @@ exists; the SAM path does not run it. It predates this slice.
 * **Interpolated-string patterns** (`case q"…"`, `case s"a$y"`) are not
   implemented; the diagnostic is a 14-error parse cascade rather than one
   "unimplemented syntax".
-* **`@sp` slips past the `@specialized` rejection.** The parser refuses
-  `@specialized` by *name* (`annotation_compiler_unsupported`), but cats writes
-  `import scala.{specialized => sp}` and then `@sp`. Now that annotations parse
-  in type-parameter position, cats-kernel compiles as if unspecialized: no
-  `$mc*$sp` members, so the classes we emit are not ABI-compatible with what
-  nsc emits. The check belongs in the typer, where the annotation has been
-  resolved, not in the parser, where only the written name is known.
+* **`@sp` is read as `@specialized`, and neither is specialized.** cats writes
+  `import scala.{specialized => sp}` and then `@sp`. The parser resolves the
+  rename and records what the annotation selects (`docs/specialization.md`),
+  so the alias no longer slips past anything — but the phase is still missing,
+  so cats-kernel compiles as if unspecialized: no `$mc*$sp` members, and the
+  classes we emit are not ABI-compatible with what nsc emits.
+  `tests/spec_classfiles.sh` is the ledger for that gap.
 * **cats' `Newtype` encoding** (`type Type[A] <: Base with Tag[A]`) —
   `value toSortedSet is not a member of Newtype.Type[A]`, 32 errors in
   `NonEmptySet.scala` and its neighbours.

@@ -138,3 +138,18 @@ Compiler flags (`agent/xflags`):
   scalac makes these getters as private as `copy` itself. We leave them public:
   nothing in Scala source can name them, and this compiler fills an omitted
   `copy` argument at the call site rather than through the getter.
+- **The specialization phase.** `@specialized` / `@unspecialized` are accepted
+  and what they select is recorded on the symbol, but no `Foo$mcI$sp` class and
+  no `f$mcI$sp` method is emitted, so classes we compile are not ABI-compatible
+  with what real scalac produces for the same source. `tests/spec_classfiles.sh`
+  measures the gap: over the corpus's 37 `pos/spec-*` tests scalac emits 700
+  specialized classes and we emit none. See
+  [docs/specialization.md](specialization.md).
+- **The value-class restrictions.** SLS 5.2 / nsc's `checkAnyValSubclass`: a
+  `trait` may not extend `AnyVal`, a value class may not be nested or local,
+  must have exactly one `val` parameter that is not `private[this]`, may not
+  take a `var`, and may not declare a field. None of these is checked, so
+  `test/files/neg/valueclasses.scala` — 30 lines that are nothing but such
+  violations — compiles and emits 33 classfiles. This was hidden until
+  `@specialized` stopped being a parse error, because line 30 of that file
+  carries one.
