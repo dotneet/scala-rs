@@ -717,6 +717,16 @@ shapes: `.javaopts`, separate JVMs, `filters`); see the limits section below.
 
 ## What would move the number most
 
+0. **`@specialized`, for real.** With `run` now classified, this is the
+   largest single identified lever left in the corpus: 70 `pos` + 37 `run` =
+   **107 tests**, and it is the *only* one of that size. The tails of all three
+   categories are otherwise flat — after specialization the next-biggest `pos`
+   cluster is 5 tests, and the next-biggest `neg` one is a `type mismatch`
+   bucket of 37 that is many unrelated roots. See
+   [the section at the top](#why-pos-does-not-pass--no-specialization) for why
+   `-no-specialization` is not a substitute: the flag means *ignore the
+   annotation*, and nsc's `specialize` phase emits `Foo$mcI$sp` classes and
+   changes the ABI. This is a real phase, not a diagnostic to delete.
 1. **Static forwarders into a companion class.** Fifteen `run` tests, one
    well-understood rule, contained to the backend.
 2. **`AnyRef` conformance.** `val x: AnyRef = 1` compiling is a hole under
