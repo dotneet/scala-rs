@@ -466,3 +466,86 @@ and an output difference).
   bridge without `ACC_BRIDGE`, which would be forwarded as `public static
   Object apply(Object, Object)` — something nsc never emits — so the bridge
   wants marking before that path is turned on.
+
+### A value class's own `apply` was called with the wrong descriptor, only in `--scala-library` mode (`agent/vcapply`)
+
+```scala
+final case class Wrapped(u: Int) extends AnyVal
+object Main { def main(a: Array[String]): Unit = println(Wrapped(7).u) }
+```
+
+ran fine with `--no-scala-library` and threw `NoSuchMethodError:
+'java.lang.Object Wrapped$.apply(int)'` with `--scala-library <jar>`, past
+every static check: the verifier does not resolve a method descriptor
+against anything but the constant pool, and `tests/slick_subset.sh`'s
+`Class.forName(initialize = false)` does not link.
+
+#### Cause
+
+`emit_case_apply` (`crates/backend/src/gen.rs`) already wrote the correct,
+narrow descriptor on the classfile: a value class erases to its single
+field's type, so `Wrapped$.apply` is `(I)I`, the identity, not `(I)LWrapped;`.
+But the *stored* type of that same method symbol — what every call site in
+the same compilation reads to build its own `invokevirtual` — disagreed.
+
+`Wrapped$` extends `scala.runtime.AbstractFunction1[Int, Wrapped]` so the
+companion can serve as a function value, and `erase_overriding_method`
+(`crates/typer/src/erasure.rs`) found that `apply` structurally overrides
+`AbstractFunction1.apply`. Its rule for that shape — "our primitive narrows
+the overridden's `Object`, so widen our own stored return to match" — exists
+for a genuine covariant-return override that needs a bridge (an abstract
+type member specialized to a primitive in a subclass), and it fired here
+too, overwriting `apply`'s stored return with `Object`. Every call site
+in this compilation invoked `Wrapped$.apply(int): Object` accordingly. The
+classfile has no such method — only the narrow `apply(int): int` plus a
+*separate* bridge `apply(Object): Object` (`emit_case_apply_bridge`) for the
+`AbstractFunction1` override, matching real scalac's own two-method shape
+(confirmed with `javap -c` on 2.13.16).
+
+`--no-scala-library` was unaffected: its case companion never extends a real
+`AbstractFunctionN`, so `find_overridden_method` never matched and the
+symbol's stored type stayed the narrow, correct one throughout.
+
+#### The fix
+
+`erase_overriding_method` now skips the widening step when the method's own
+*declared* (pre-erasure) return type directly names a value class: that
+erasure (to the underlying type) is authoritative on its own, and nsc's ABI
+reaches the `FunctionN` override through the bridge, never by widening
+`apply` itself.
+
+#### Verification
+
+`tests/fixtures/va_apply.scala` (a `case class ... extends AnyVal`'s
+companion `apply`, `new`, `==`, `toString`, and a non-case-class value
+class's `new` plus its own extension method) runs byte-identical to real
+scalac 2.13.16 in both `--scala-library` and `--no-scala-library`
+(`crates/cli/tests/vcapply.rs`). The four compile measures
+(slick/cats/gitbucket/scala-library) and `slick_run.sh`/`slick_subset.sh`
+were unchanged against `tests/BASELINE.md`; `scala_corpus.sh`'s `run` kind at
+`CORPUS_SIZE=full` held at **516** pass (baseline), with a one-test churn
+between `fail` and `skip` that is not this fix (a sample run's `pos`/`neg`/
+`run` ratios were also consistent with the full baseline).
+
+#### Known remaining issues
+
+Two adjacent defects were found and left alone, both pre-existing and
+independent of this fix (reproduce identically on an unpatched binary, in
+both modes):
+
+* **`Wrapped.unapply(w)` called explicitly** still throws
+  `NoSuchMethodError: 'scala.Option Wrapped$.unapply(int)'`. A previous
+  slice tried emitting a real, nsc-shaped `unapply` body and reverted it: the
+  *caller's* erasure still hands the pattern the boxed instance, so the
+  extractor would have silently rewrapped it (`Some(Wrap(w))`, where scalac
+  says `Some(w)`) rather than failing loudly. `NoSuchMethodError` remains the
+  deliberately accepted state.
+* **`w match { case Wrapped(x) => ... }`** (the pattern-match sugar, as
+  opposed to naming `unapply` directly) throws a `VerifyError: Bad local
+  variable type` in both modes: the match-lowering does
+  `instanceof`/`checkcast`/`getfield` against the scrutinee as though it were
+  a real boxed instance, while the scrutinee's own local slot holds the
+  erased `int` (`istore_3` followed by `aload_3` on the same slot). This is a
+  separate bug in pattern-match codegen for a value-class scrutinee, not in
+  erasure of the companion `apply`; flagged for a separate slice rather than
+  fixed here.
