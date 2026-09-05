@@ -3849,3 +3849,25 @@ fn scalalib_specialized_ignored_with_the_flag() {
     }
     let _ = fs::remove_dir_all(&out);
 }
+
+// ------------------------------------------------- simulacrum's AllOps (cats)
+
+/// cats restates `type TypeClassType <: Functor[F]` at every level of the
+/// `Ops` / `AllOps` hierarchy. The inherited bound is written in the parent
+/// trait's type parameters, so it has to be read at the overriding trait's own
+/// before the two bounds can be compared -- otherwise every restatement in a
+/// generic trait is rejected. See docs/cats.md.
+#[test]
+fn co_allops_fixture() {
+    check("co_allops");
+    dual_run_fixture("co_allops");
+}
+
+/// Reading the bound at the override site must not accept bounds that fail to
+/// narrow: a widened upper bound, a parent applied at a different argument, a
+/// narrowed lower bound, and an alias outside the inherited bound. nsc rejects
+/// all four.
+#[test]
+fn co_allops_bad_is_rejected() {
+    compile_fails("co_allops_bad", "incompatible type in overriding type T");
+}
