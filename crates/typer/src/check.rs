@@ -7067,7 +7067,7 @@ impl Typer {
             // it names something in the macro implementation, and the
             // expansion keeps it there.
             TreeKind::Select { qual, name } if name == "splice" => {
-                let probed = self.reify_probe(qual);
+                let probed = self.reify_probe(qual).ty;
                 if matches!(&probed, Type::Class { sym, .. }
                     if self.st.get(*sym).jvm_name == "scala/reflect/api/Exprs$Expr")
                 {
@@ -7080,10 +7080,16 @@ impl Typer {
                 self.reify_refs_in(qual, out);
             }
             TreeKind::Ident { .. } | TreeKind::Select { .. } => {
-                let probed = self.reify_probe(t);
-                if let Some(name) = self.static_module_name(&probed) {
+                let probe = self.reify_probe(t);
+                if let Some(name) = self.static_module_name(&probe.ty) {
                     out.insert(t.id, crate::reify::ReifyRef::StaticModule(name));
                     return;
+                }
+                if matches!(t.kind, TreeKind::Ident { .. }) {
+                    if let Some(r) = self.static_member_ref(probe.sym) {
+                        out.insert(t.id, r);
+                        return;
+                    }
                 }
                 if let TreeKind::Select { qual, .. } = &t.kind {
                     self.reify_refs_in(qual, out);
@@ -7091,9 +7097,26 @@ impl Typer {
             }
             TreeKind::Apply { fun, args } => {
                 self.reify_refs_in(fun, out);
+                // A bare `println` is overloaded, so typing it on its own
+                // settles nothing and the walk above left it unclassified.
+                // The *application* settles it, so the callee is resolved
+                // from the typed whole and recorded against the node that
+                // was written.
+                let callee = reify_callee(fun);
+                if matches!(callee.kind, TreeKind::Ident { .. }) && !out.contains_key(&callee.id) {
+                    if let Some(r) = self.applied_static_member(t) {
+                        out.insert(callee.id, r);
+                    }
+                }
                 for a in args {
                     self.reify_refs_in(a, out);
                 }
+            }
+            TreeKind::Block { stats, expr } => {
+                for s in stats {
+                    self.reify_refs_in(s, out);
+                }
+                self.reify_refs_in(expr, out);
             }
             // A type argument is rebuilt rather than named: `f[E]` inside a
             // macro implementation means the `E` *that implementation* was
@@ -7128,13 +7151,15 @@ impl Typer {
         }
     }
 
-    /// The type a subtree of a reify body has, found speculatively.
-    fn reify_probe(&mut self, t: &Tree) -> Type {
+    /// One subtree of a reify body, typed speculatively on a clone: the
+    /// result carries both the type it has and the symbol it resolved to,
+    /// and the call site's own tree is untouched.
+    fn reify_probe(&mut self, t: &Tree) -> Tree {
         let mark = self.diags.len();
         let mut probe = t.clone();
         self.type_expr(&mut probe, &Type::NoType);
         self.diags.truncate(mark);
-        probe.ty
+        probe
     }
 
     /// The full name `Mirror.staticModule` is given for a reference to a
@@ -7149,12 +7174,89 @@ impl Typer {
         let Type::ModuleRef(mcls) = ty else {
             return None;
         };
-        let jvm = self.st.jvm_internal(*mcls);
+        self.static_module_full_name(*mcls)
+    }
+
+    /// The same, from the module class itself.
+    fn static_module_full_name(&self, mcls: SymbolId) -> Option<String> {
+        if self.st.get(mcls).kind != SymKind::ModuleClass {
+            return None;
+        }
+        let jvm = self.st.jvm_internal(mcls);
         let full = jvm.strip_suffix('$').unwrap_or(&jvm);
         if full.is_empty() || full.rsplit('/').next().is_some_and(|s| s.contains('$')) {
             return None;
         }
         Some(full.replace('/', "."))
+    }
+
+    /// A term member *declared by* a static `object` and named without its
+    /// owner -- `println`, or a name an `import P4Helper._` brought in.
+    ///
+    /// This is what lets a name that is not itself an `object` be reified by
+    /// symbol: nsc's typer has already turned `println` into
+    /// `scala.Predef.println` by the time its reifier sees it, and it builds
+    /// `Select(mkIdent(staticModule("scala.Predef")), TermName("println"))`
+    /// (measured with `-Xprint:typer`). Requiring the *declaring* owner to be
+    /// a static `object` is what keeps this honest: a local, a parameter, a
+    /// member of a class, or a member of an `object` nested in one all fail
+    /// the test and stay refused, because none of them can be found again
+    /// through a mirror.
+    ///
+    /// Two members of a static `object` are still refused.
+    ///
+    /// * One whose owner **lexically encloses** the `reify` -- a `val` of the
+    ///   very `object` the macro implementation is written in. nsc's typer
+    ///   spells that `Impls.this.x`, and its reifier builds a *different*
+    ///   tree for it (`mkThis(staticModule("Impls").asModule.moduleClass)`,
+    ///   measured on `test/files/run/macro-reify-ref-to-packageless`).
+    ///   Building the `mkIdent` form would evaluate to the same member but
+    ///   print as a different tree, and would lose access to a `private` one.
+    /// * One whose name is not a legal JVM identifier once encoded. nsc
+    ///   escapes the rest (` ` is `$u0020`) and `NameTransformer` here does
+    ///   not, so the `TermName` would name a member that does not exist.
+    fn static_member_ref(&self, sym: SymbolId) -> Option<crate::reify::ReifyRef> {
+        if sym.is_none() {
+            return None;
+        }
+        let s = self.st.get(sym);
+        if !matches!(s.kind, SymKind::Method | SymKind::Term) {
+            return None;
+        }
+        if s.flags.contains(Flags::PARAM) {
+            return None;
+        }
+        let (owner_sym, name) = (s.owner, s.name.clone());
+        if name.is_empty()
+            || !scala_rs_pickle::names::encode_method_name(&name)
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        {
+            return None;
+        }
+        let owner = self.static_module_full_name(owner_sym)?;
+        if self
+            .st
+            .enclosing_classes(self.st.owner)
+            .contains(&owner_sym)
+        {
+            return None;
+        }
+        Some(crate::reify::ReifyRef::StaticMember { owner, name })
+    }
+
+    /// The callee of an application, resolved by typing the application --
+    /// which is the only thing that picks between overloads.
+    fn applied_static_member(&mut self, apply: &Tree) -> Option<crate::reify::ReifyRef> {
+        let probe = self.reify_probe(apply);
+        let mut head = &probe;
+        while let TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } = &head.kind {
+            head = fun;
+        }
+        if !matches!(head.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) {
+            return None;
+        }
+        self.static_member_ref(head.sym)
     }
 
     /// How each hole's argument becomes a reflect `Tree` -- `Liftable`.
@@ -27387,6 +27489,17 @@ fn is_annotated_lambda(tree: &Tree) -> bool {
         }
         _ => false,
     }
+}
+
+/// The written name an application ultimately calls, past any type
+/// application: the node a `reify` body's classification has to be keyed on,
+/// since that is the one `crate::reify` asks about.
+fn reify_callee(fun: &Tree) -> &Tree {
+    let mut head = fun;
+    while let TreeKind::TypeApply { fun, .. } = &head.kind {
+        head = fun;
+    }
+    head
 }
 
 /// Drop diagnostics repeated verbatim at the same position, keeping the first.
