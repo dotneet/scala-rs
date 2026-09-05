@@ -938,13 +938,43 @@ impl SymbolTable {
                 continue;
             }
             if found.iter().any(|&s| self.is_type_namespace(s)) {
-                return found.to_vec();
+                // A module can share this scope with the real type-namespace
+                // symbol (an object and, elsewhere, a `type` alias of the same
+                // name both named `NonEmptyLazyList` -- cats' `Newtype`
+                // encoding). The module is a fallback only, so it must not
+                // ride along in the answer: the caller picks the *first*
+                // match of a kind it accepts, and an unfiltered vector let the
+                // module win over the alias by accident of insertion order.
+                return found
+                    .iter()
+                    .copied()
+                    .filter(|&s| self.is_type_namespace(s))
+                    .collect();
             }
             if module_fallback.is_empty() && found.iter().any(|&s| self.is_module_like(s)) {
                 module_fallback = found.to_vec();
             }
         }
         module_fallback
+    }
+
+    /// Whether `name` already answers to a genuine type-namespace symbol --
+    /// not merely the module `lookup_type` offers as a fallback when nothing
+    /// else does. Callers deciding whether it is still worth *looking for* a
+    /// type-namespace answer (a source package member, a pickled alias) must
+    /// not stop just because `lookup_type` is non-empty: that can be the
+    /// fallback alone.
+    pub fn has_real_type_entry(&self, name: &str) -> bool {
+        for sc in self.scopes.iter().rev() {
+            let found = sc.lookup(name);
+            if found.is_empty() {
+                continue;
+            }
+            if found.iter().any(|&s| self.is_type_namespace(s)) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Look a name up in the *term* namespace, the mirror of `lookup_type`.
@@ -1063,6 +1093,43 @@ impl SymbolTable {
                 // `trait C[-T] extends (T => R)` really does inherit
                 // `Function1.apply`; the parent just names no class until the
                 // structural function is read back as one.
+                let as_class = self.function_class_form(m);
+                let m = as_class.as_ref().unwrap_or(m);
+                if let Some(ps) = self.class_sym_of(m) {
+                    work.push(ps);
+                }
+            }
+            if let Some(st) = &sym.self_type {
+                if let Some(ps) = self.class_sym_of(st) {
+                    work.push(ps);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every member `owner` has, including ones inherited from its parents --
+    /// `lookup_member`'s traversal with no name to filter by.
+    ///
+    /// Used to fold a same-run package object's members into its package
+    /// (see the `PACKAGE` case in `namer_module`): a package object need not
+    /// declare a name itself to export it, and cats' `package object data
+    /// extends ScalaVersionSpecificPackage` is exactly that --
+    /// `NonEmptyLazyList` is a `type` alias declared on the parent class, not
+    /// in the package object's own body, and folding only the object's direct
+    /// members left the alias unreachable as `cats.data.NonEmptyLazyList`
+    /// from any other file.
+    pub fn members_including_inherited(&self, owner: SymbolId) -> Vec<SymbolId> {
+        let mut out = Vec::new();
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut work = vec![owner];
+        while let Some(id) = work.pop() {
+            if !seen.insert(id.0) {
+                continue;
+            }
+            let sym = self.get(id);
+            out.extend(sym.members.iter().copied());
+            for m in &sym.parents {
                 let as_class = self.function_class_form(m);
                 let m = as_class.as_ref().unwrap_or(m);
                 if let Some(ps) = self.class_sym_of(m) {
