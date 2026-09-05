@@ -13,10 +13,8 @@ object Main {
     println(s.bump)
     println(s.show)
     val c: Counter = s
-    // Through a trait method rather than `c.count = 9`: assigning to a `var`
-    // of a trait read from `-cp` is a separate gap (see
-    // `docs/notes/known-gaps-backlog.md`), and this file is compiled by both
-    // compilers in both directions.
+    // Through a trait method rather than `c.count = 9`; the direct assignment
+    // to a binary trait's `var` is covered by `bt2_app.scala`.
     println(c.tick)
     println(c.plain + c.count)
   }

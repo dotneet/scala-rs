@@ -488,8 +488,15 @@ fn ti_trait_private_state_uses_nscs_expanded_names() {
         // `private var m`: a plain `v_$eq`, on the expanded name
         "public abstract int tilib$Counter$$m();",
         "public abstract void tilib$Counter$$m_$eq(int);",
-        // `private lazy val doubled`
-        "public abstract int tilib$Counter$$doubled();",
+        // `private lazy val doubled`. A trait `lazy val` is the one `val`
+        // whose accessor is *concrete* on the interface: nsc puts the
+        // initialiser in a `default` method with the usual `m$` static beside
+        // it, and the implementing class's `doubled$lzycompute` calls that
+        // static under its own `bitmap$0`. It stays public even though the
+        // `val` is `private`, because a `private static` of one class file is
+        // not callable from another.
+        "public default int tilib$Counter$$doubled();",
+        "public static int tilib$Counter$$doubled$(tilib.Counter);",
         // and the two nsc does *not* expand
         "public abstract int pkg();",
         "public abstract int prot();",
@@ -641,6 +648,249 @@ fn ti_forward(scalac: &Path, jar: &Path, app: &str) -> String {
                 .unwrap(),
         ],
     );
+    let s = run_main(&format!(
+        "{}:{}:{}",
+        lib.display(),
+        out.display(),
+        jar.display()
+    ));
+    for d in [lib, out] {
+        let _ = fs::remove_dir_all(d);
+    }
+    s
+}
+
+// -------------------------------------- bt2_: what a *class file* has to say
+//
+// The four holes the `ti_` slice left open all have one shape: information a
+// trait carries in its signature that one side or the other was dropping.
+// None is caught by the JVM verifier, and the second is not caught by
+// anything -- it produced the wrong answer, exit 0, and no diagnostic.
+//
+//   1. A trait's `lazy val` had no interface-side initialiser. nsc compiles
+//      one to a `default` method holding the right-hand side plus the usual
+//      `d$` static, and the implementing class's `d$lzycompute` calls that
+//      static; we declared the accessor abstract, so the first *read* of the
+//      `lazy val` from a class real scalac compiled was `NoSuchMethodError:
+//      'int L.d$(L)'`.
+//   2. Mixing in a *binary* stackable trait emitted neither the mixin
+//      forwarder nor the `T$$super$m` accessor, because both were driven by
+//      `TraitImpls`, which is harvested from source trees. A class method
+//      beats an interface `default`, so `new Stacked().label` silently ran
+//      the base implementation.
+//   3. A binary trait's `var` could not be assigned (`reassignment to val
+//      count`): the reader dropped `MUTABLE`.
+//   4. A binary trait's *deferred* members looked concrete (```override`
+//      modifier required``): the reader dropped `DEFERRED`, which is also
+//      what our own pickler was failing to write for a deferred `val` / `var`.
+//
+// 3 and 4 were one root -- `install_classpath` allocated every pickled member
+// `Flags::EMPTY` -- and 1 and 2 are separate. All four are settled by
+// *running* a mixed pair, and both ways round: 1 only shows up with scalac on
+// our side of the class file, 2/3/4 only with scalac on the other.
+
+/// (1): scala-rs compiles `bt2_lib.scala`, real scalac 2.13.16 compiles
+/// `bt2_app.scala` against it. The `lazy val` reads are what fail without the
+/// interface-side initialiser, and `d.dv = 7` needs our pickle to carry
+/// `DEFERRED` on a trait's declared `var` (scalac otherwise asks the class
+/// for an `override` modifier and the file does not compile at all).
+#[test]
+fn bt2_nsc_subclass_reads_our_traits_lazy_val() {
+    let Some((jar, scalac)) = interop_tools() else {
+        return;
+    };
+    let control = bt2_control(&scalac, &jar, "bt2_app");
+    let ours = bt2_forward(&scalac, &jar, "bt2_app");
+    assert_eq!(
+        ours, control,
+        "a subclass real scalac compiled against our trait's `lazy val` does \
+         not behave like one compiled against scalac's own"
+    );
+}
+
+/// (3) and (4), and the other direction: **scalac** compiles the traits,
+/// **scala-rs** the subclass. Without the pickle's `MUTABLE` and `DEFERRED`
+/// this does not even compile.
+#[test]
+fn bt2_our_subclass_assigns_and_implements_a_binary_traits_members() {
+    let Some((jar, scalac)) = interop_tools() else {
+        return;
+    };
+    let control = bt2_control(&scalac, &jar, "bt2_app");
+    let ours = bt2_reverse(&scalac, &jar, "bt2_app");
+    assert_eq!(
+        ours, control,
+        "our subclass of scalac's trait does not read and write its members \
+         the way scalac's own subclass does"
+    );
+}
+
+/// (2): the one that is silent. `Stacked` mixes in two `abstract override`
+/// traits that arrived as class files; before the fix it printed `b` -- the
+/// base implementation -- and exited 0.
+#[test]
+fn bt2_our_subclass_stacks_binary_traits() {
+    let Some((jar, scalac)) = interop_tools() else {
+        return;
+    };
+    let control = bt2_control(&scalac, &jar, "bt2_stack");
+    assert_eq!(
+        control.trim(),
+        "<b><b>",
+        "the control itself is wrong; the fixture no longer stacks"
+    );
+    let ours = bt2_reverse(&scalac, &jar, "bt2_stack");
+    assert_eq!(
+        ours, control,
+        "our class over binary `abstract override` traits does not stack them"
+    );
+}
+
+/// Forward direction of the same shape, so a regression in the trait half is
+/// not mistaken for one in the class half.
+#[test]
+fn bt2_nsc_subclass_stacks_our_traits() {
+    let Some((jar, scalac)) = interop_tools() else {
+        return;
+    };
+    let control = bt2_control(&scalac, &jar, "bt2_stack");
+    let ours = bt2_forward(&scalac, &jar, "bt2_stack");
+    assert_eq!(
+        ours, control,
+        "a class real scalac compiled over our stackable traits does not stack them"
+    );
+}
+
+/// The shapes, so a regression names the rule that broke instead of surfacing
+/// as a wrong number at the far end.
+#[test]
+fn bt2_shapes_match_nscs() {
+    let Some((jar, scalac)) = interop_tools() else {
+        return;
+    };
+    // Our trait: a `lazy val` is a `default` method with an `m$` static, and
+    // is *not* also declared abstract (which would be a duplicate member).
+    let out = tmp_dir("bt2-shape");
+    compile_fixture("bt2_lib", &out, &["--scala-library", jar.to_str().unwrap()]);
+    let iface = javap(&out, "bt2lib.Counter");
+    for want in [
+        "public default int doubled();",
+        "public static int doubled$(bt2lib.Counter);",
+        // a `private lazy val` publishes the same pair, under nsc's expanded
+        // name: a `private static` of one class file is not callable from
+        // another.
+        "public default int bt2lib$Counter$$secret();",
+        "public static int bt2lib$Counter$$secret$(bt2lib.Counter);",
+    ] {
+        assert!(
+            iface.contains(want),
+            "missing `{want}` from bt2lib.Counter:\n{iface}"
+        );
+    }
+    assert!(
+        !iface.contains("public abstract int doubled();"),
+        "a trait `lazy val` must not also be declared abstract:\n{iface}"
+    );
+
+    // Our class over *scalac's* traits: the mixin forwarder and the `super`
+    // accessor, neither of which `TraitImpls` knows anything about.
+    let n_lib = tmp_dir("bt2-shape-nsc-lib");
+    let r_app = tmp_dir("bt2-shape-rs-app");
+    run_scalac(
+        &scalac,
+        &[
+            "-d",
+            n_lib.to_str().unwrap(),
+            fixtures_dir().join("bt2_lib.scala").to_str().unwrap(),
+        ],
+    );
+    compile_fixture(
+        "bt2_stack",
+        &r_app,
+        &[
+            "-cp",
+            n_lib.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ],
+    );
+    let stacked = javap(&r_app, "Stacked");
+    for want in [
+        // the forwarder: without it `Plain.label()` wins over the `default`
+        "InterfaceMethod bt2lib/Twice.label$:(Lbt2lib/Twice;)Ljava/lang/String;",
+        // Twice's `super` reaches Loud, not the class
+        "public java.lang.String bt2lib$Twice$$super$label();",
+        "InterfaceMethod bt2lib/Loud.label$:(Lbt2lib/Loud;)Ljava/lang/String;",
+        // and Loud's reaches the class
+        "public java.lang.String bt2lib$Loud$$super$label();",
+        "Method Plain.label:()Ljava/lang/String;",
+    ] {
+        assert!(
+            stacked.contains(want),
+            "missing `{want}` from Stacked:\n{stacked}"
+        );
+    }
+    for d in [out, n_lib, r_app] {
+        let _ = fs::remove_dir_all(d);
+    }
+}
+
+/// scalac compiles both halves of a `bt2_` pair: the stdout to compare against.
+fn bt2_control(scalac: &Path, jar: &Path, app: &str) -> String {
+    bt2_run(scalac, jar, app, false, false)
+}
+
+/// scala-rs compiles the traits, real scalac the class that mixes them in.
+fn bt2_forward(scalac: &Path, jar: &Path, app: &str) -> String {
+    bt2_run(scalac, jar, app, true, false)
+}
+
+/// real scalac compiles the traits, scala-rs the class that mixes them in.
+fn bt2_reverse(scalac: &Path, jar: &Path, app: &str) -> String {
+    bt2_run(scalac, jar, app, false, true)
+}
+
+fn bt2_run(scalac: &Path, jar: &Path, app: &str, rs_lib: bool, rs_app: bool) -> String {
+    let lib = tmp_dir("bt2-lib");
+    let out = tmp_dir("bt2-app");
+    if rs_lib {
+        compile_fixture("bt2_lib", &lib, &["--scala-library", jar.to_str().unwrap()]);
+    } else {
+        run_scalac(
+            scalac,
+            &[
+                "-d",
+                lib.to_str().unwrap(),
+                fixtures_dir().join("bt2_lib.scala").to_str().unwrap(),
+            ],
+        );
+    }
+    if rs_app {
+        compile_fixture(
+            app,
+            &out,
+            &[
+                "-cp",
+                lib.to_str().unwrap(),
+                "--scala-library",
+                jar.to_str().unwrap(),
+            ],
+        );
+    } else {
+        run_scalac(
+            scalac,
+            &[
+                "-cp",
+                lib.to_str().unwrap(),
+                "-d",
+                out.to_str().unwrap(),
+                fixtures_dir()
+                    .join(format!("{app}.scala"))
+                    .to_str()
+                    .unwrap(),
+            ],
+        );
+    }
     let s = run_main(&format!(
         "{}:{}:{}",
         lib.display(),
