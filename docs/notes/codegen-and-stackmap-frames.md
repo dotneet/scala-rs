@@ -669,11 +669,55 @@ the class instead of writing one. Note the shape of the old failure: the
 faithfully and `javap` read the file back without a murmur -- it was the
 `u16` offsets *inside* it that had wrapped.
 
-Because our call sequence is longer than nsc's (`aload_0; checkcast; invoke` is
-7 bytes where nsc emits `aload_0; invoke` in 4), we reach that limit at about
-57% of the source size nsc does. That is a codegen-quality gap, not a
-correctness one, and it is the reason a method nsc accepts can now be rejected
-here.
+Our call sequence used to be longer than nsc's — `aload_0; checkcast C;
+invokevirtual` is 7 bytes where nsc emits `aload_0; invokevirtual` in 4 — so we
+reached that limit at about 57% of the source size nsc does, and a method nsc
+accepts was rejected here. That was not a quality gap one could postpone: it
+turned a size difference into a correctness difference.
+
+`checkcast_erased_method_receiver` cast the receiver of *every* non-static,
+non-super, non-module, non-value-class call to the callee's owner. The function
+exists for a receiver erasure widened to `Object` (a captured local, a generic
+element), which really does need the cast — but it asked nothing about what was
+on the stack. It now asks `Assembler::top_object`, the same model the
+StackMapTable is written from, and skips the cast when `jvm_assignable` says
+that class already reaches the owner. `this.m()` inside `C` is four bytes again,
+and the `t10594` shape `ms_bigmethod.rs` generates (8273 calls) went from a
+`code_length` of 57927 to 33108, against nsc's 33103 for the same source.
+
+The skip is driven by the *tracked* class, never by the receiver expression's
+static type, and `jvm_assignable` answers `false` for any class it cannot
+resolve. So the receivers that genuinely owe a cast keep it: a self type
+(`trait T { self: U => um() }` is a `T` calling a `U` method — a self type is
+not a parent, so the base type sequence does not reach `U`, and nsc emits
+`aload_0; checkcast U` there too), a receiver erased to `Object`, an array, a
+`Null`, and anything whose owner the symbol table does not know.
+
+**`jvm_assignable` alone is not enough, and the first version of this was
+wrong.** The base type sequence answers the *Scala* question, and a Scala trait
+may extend a class — a hop the bytecode cannot make, because the trait compiles
+to an interface with the class nowhere in its ancestry.
+`scala.reflect.api.JavaUniverse` is the case in the wild, and
+`Symbol::declaring_class` already documents it from the other side: the pickle
+says it extends the abstract class `Universe`, its class file declares
+`interfaces: 0` and no superclass but `Object`. Dropping the cast in front of
+`Universe`'s members cost nine `run` tests of the scala/scala corpus, all with
+
+```
+VerifyError: Bad type on operand stack
+  Type 'scala/reflect/api/JavaUniverse' is not assignable to
+       'scala/reflect/api/Universe'
+```
+
+So `verifier_accepts_receiver` additionally requires that when the target is a
+*class*, the tracked type is one too. The converse needs no guard: JVMS
+4.10.1.2 makes every reference assignable to an interface type, so an interface
+target is accepted whatever is on the stack. Nothing is lost by dropping a cast
+the verifier does not want, because **a `checkcast` never takes part in method
+resolution** — the `Methodref` does, and `declaring_class` has already put the
+right class in it. `tests/fixtures/tk_thiscast.scala` carries the shape in
+three lines of source (`abstract class UBase` / `trait TT extends UBase`), so
+it is pinned without the reflection jars.
 
 #### Verification
 
