@@ -2222,6 +2222,34 @@ fn enclosing_module_for(st: &SymbolTable, from: SymbolId, owner: SymbolId) -> Op
     None
 }
 
+/// The nearest enclosing module class that conforms to `owner`, judged by the
+/// linearisation rather than by [`is_owner_compatible`].
+///
+/// `is_owner_compatible` deliberately stops at a trait's non-interface parent,
+/// because a JVM interface type cannot reach a superclass. For deciding *which
+/// instance* to hand back that stop is wrong: `trait Baz extends Foo; object
+/// Biz extends Baz` really is a `Foo`, and `Foo` is on `Biz$`'s linearisation.
+fn enclosing_module_conforming(
+    st: &SymbolTable,
+    from: SymbolId,
+    owner: SymbolId,
+) -> Option<SymbolId> {
+    if owner.is_none() {
+        return None;
+    }
+    let mut cur = from;
+    while !cur.is_none() {
+        let s = st.get(cur);
+        if (s.kind == SymKind::ModuleClass || s.flags.contains(Flags::MODULE))
+            && (is_owner_compatible(st, cur, owner) || linearize(st, cur).contains(&owner))
+        {
+            return Some(cur);
+        }
+        cur = s.owner;
+    }
+    None
+}
+
 /// Push the instance a nested class's `$outer` parameter wants at a `new` or
 /// at a super-constructor call.
 fn load_outer_arg(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
@@ -2457,7 +2485,68 @@ fn split_parents(st: &SymbolTable, parents: &[Tree]) -> (String, Vec<String>) {
             ifaces.push(jvm);
         }
     }
+    if !found_class {
+        // SLS 5.1.2: the superclass of a template is the superclass of its
+        // linearisation, which a *trait* parent can supply --
+        // `trait Baz extends Foo; object Biz extends Baz` is
+        // `Biz$ extends Foo implements Baz` in nsc's own output. Emitting
+        // `extends java/lang/Object` there left every member `Foo` declares
+        // unreachable from `Biz$`, and an inner trait of `Foo` mixed into
+        // something nested in `Biz` could not hand back a `Foo` at all.
+        if let Some(inherited) = inherited_super_class(st, parents) {
+            super_name = inherited;
+        }
+    }
     (super_name, ifaces)
+}
+
+/// The class a trait parent brings in as the template's superclass, if any.
+///
+/// Only a parent that needs no enclosing instance qualifies: the constructor
+/// emitted for the template calls `super.<init>()V`, and a nested superclass
+/// would want its `$outer` first. Such a template keeps the
+/// `java/lang/Object` superclass it has today rather than getting a call that
+/// cannot link.
+fn inherited_super_class(st: &SymbolTable, parents: &[Tree]) -> Option<String> {
+    let mut work: Vec<SymbolId> = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    for p in parents {
+        let pty = st
+            .function_class_form(&p.ty)
+            .unwrap_or_else(|| p.ty.clone());
+        if let Some(id) = st
+            .class_sym_of(&pty)
+            .or_else(|| (!p.sym.is_none()).then_some(p.sym))
+        {
+            if is_interface_sym(st, id) {
+                work.push(id);
+            }
+        }
+    }
+    // Breadth-first, so the nearest parent wins the way the linearisation's
+    // first class does.
+    let mut i = 0;
+    while i < work.len() {
+        let id = work[i];
+        i += 1;
+        if !seen.insert(id.0) {
+            continue;
+        }
+        for parent in &st.get(id).parents {
+            let Some(ps) = st.class_sym_of(parent) else {
+                continue;
+            };
+            if is_top_class(st, ps) {
+                continue;
+            }
+            if is_interface_sym(st, ps) {
+                work.push(ps);
+            } else if outer_field_desc(st, ps).is_none() {
+                return Some(class_internal(st, ps));
+            }
+        }
+    }
+    None
 }
 
 fn class_extends_named(st: &SymbolTable, id: SymbolId, name: &str) -> bool {
@@ -2874,7 +2963,9 @@ impl<'a> Gen<'a> {
                 for s in stats {
                     // Local `class` / `object` declared inside a method body.
                     match &s.kind {
-                        TreeKind::ClassDef { name, mods, .. } => {
+                        TreeKind::ClassDef {
+                            name, mods, impl_, ..
+                        } => {
                             self.emit_class(s, &HashSet::new());
                             // A local `case class` needs its companion
                             // module class (`apply`/`unapply`) emitted too,
@@ -2887,8 +2978,19 @@ impl<'a> Gen<'a> {
                             if mods.flags.contains(Flags::CASE) && !module_names.contains(name) {
                                 self.emit_case_companion(s);
                             }
+                            // ... and so do the classes and objects declared
+                            // *inside* it. `walk_stats` does this for a
+                            // top-level class; this walk stopped at the local
+                            // one itself, so `def f = { class Outer { class
+                            // Inner } }` wrote `Test$Outer$1` and nothing
+                            // else, and the first `new Inner` inside it threw
+                            // `NoClassDefFoundError: Test$Outer$1$Inner`.
+                            self.walk_stats(&impl_.body);
                         }
-                        TreeKind::ModuleDef { .. } => self.emit_module(s, &HashSet::new(), None),
+                        TreeKind::ModuleDef { impl_, .. } => {
+                            self.emit_module(s, &HashSet::new(), None);
+                            self.walk_stats(&impl_.body);
+                        }
                         _ => {}
                     }
                     self.emit_anon_classes(s);
@@ -6158,8 +6260,20 @@ impl<'a> Gen<'a> {
             // `load_module_instance` reaches.
             let via_module = member_module_outer(self.st, o)
                 .is_some_and(|m| outer_chain_reaches(self.st, class_id, m));
+            // A trait nested in a *trait* (`trait T { trait NT }`) mixed into a
+            // class that is not itself nested: `object Test extends T { new NT
+            // {} }`. The anonymous class has no `$outer` field and nothing on
+            // its (empty) chain conforms to `T`, but the enclosing module
+            // *is* a `T`, which is what nsc returns from
+            // `T$NT$$$outer()`. Without this the interface's accessor stayed
+            // unimplemented and the trait's own `$init$` threw
+            // `AbstractMethodError` on the first instantiation.
+            let mut via_enclosing = SymbolId::NONE;
             if !via_module && !outer_chain_reaches(self.st, class_id, o) {
-                continue;
+                match enclosing_module_conforming(self.st, class_id, o) {
+                    Some(m) => via_enclosing = m,
+                    None => continue,
+                }
             }
             let name = trait_outer_accessor_name(self.st, parent);
             if !done.insert(name.clone()) {
@@ -6191,6 +6305,11 @@ impl<'a> Gen<'a> {
                 );
                 if via_module {
                     load_module_instance(asm, &ctx, o);
+                } else if !via_enclosing.is_none() {
+                    load_module_instance(asm, &ctx, via_enclosing);
+                    if !is_owner_compatible(st, via_enclosing, o) {
+                        asm.checkcast(&class_internal(st, o));
+                    }
                 } else {
                     load_owner_instance(asm, &ctx, o);
                 }
@@ -6658,6 +6777,11 @@ impl<'a> Gen<'a> {
                 {
                     suppressed.insert("apply".into());
                 }
+            }
+            if self.st.get(class_id).flags.contains(Flags::CASE)
+                && !impl_.body.iter().any(|t| t.name() == Some("unapply"))
+            {
+                emit_case_unapply(&mut b, self.st, class_id, self.library_abi);
             }
         }
 
@@ -7143,6 +7267,7 @@ impl<'a> Gen<'a> {
             self.emit_module_clinit(&mut b);
         }
         emit_case_apply(&mut b, self.st, class_id);
+        emit_case_unapply(&mut b, self.st, class_id, self.library_abi);
         if abs_fn.is_some() {
             emit_case_apply_bridge(&mut b, self.st, class_id);
         }
@@ -7656,6 +7781,28 @@ fn emit_case_apply_bridge(b: &mut ClassBuilder, st: &SymbolTable, class_id: Symb
 fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
     let fields = st.get(class_id).ctor_fields.clone();
     let class_jvm = class_internal(st, class_id);
+    // `case class C[T](y: T) extends AnyVal`: the class erases to its
+    // underlying type, so nsc's companion `apply` is `(T)T` -- the identity --
+    // and not `(T)LC;`. Emitting the boxed shape meant every call site, which
+    // *was* type-checked against the erased one, ended in
+    // `NoSuchMethodError: 'java.lang.Object C$.apply(java.lang.Object)'`.
+    if let Some(under) = value_class_apply_type(st, class_id) {
+        let d = jvm_desc_val(st, &under);
+        let sort = jvm_slot_sort(&under);
+        let desc = format!("({d}){d}");
+        if b.methods
+            .iter()
+            .any(|m| m.name == "apply" && m.desc == desc)
+        {
+            return;
+        }
+        let acc = synthetic_case_member_access(st, case_apply_sym(st, class_id));
+        b.add_code(acc, "apply", &desc, 1 + sort.slots(), move |asm| {
+            load(asm, 1, sort);
+            ret_of_sort(asm, sort);
+        });
+        return;
+    }
     let mut params = Vec::new();
     let mut locals = 1u16;
     let mut loads = Vec::new();
@@ -7700,6 +7847,211 @@ fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
             load(asm, *slot, *sort);
         }
         asm.invokespecial(&class_jvm, "<init>", &ctor_d);
+        asm.areturn();
+    });
+}
+
+/// The erased type a `case class … extends AnyVal`'s companion `apply` and
+/// `unapply` speak in, or `None` when `class_id` is not a value class.
+///
+/// A value class erases to its single field's type, so its companion's
+/// synthetic members take and return that type rather than the class.
+fn value_class_apply_type(st: &SymbolTable, class_id: SymbolId) -> Option<Type> {
+    if !st.is_value_class(class_id) {
+        return None;
+    }
+    let fields = st.get(class_id).ctor_fields.clone();
+    if fields.len() != 1 {
+        return None;
+    }
+    st.value_class_underlying(class_id)
+        .or_else(|| Some(st.get(fields[0]).ty.clone()))
+}
+
+/// One constructor field as `emit_case_unapply` reads it: name, type, field
+/// descriptor, and -- when the field's own type is a value class -- the box to
+/// wrap it back into (`(internal name, constructor descriptor)`).
+type UnapplyField = (String, Type, String, Option<(String, String)>);
+
+/// The synthetic `unapply` of a case class's companion, if the typer made one.
+///
+/// `Typer::synthesize_case_members` allocates it into the module *class* and
+/// also records it on the module value, so both lists are searched.
+fn case_unapply_sym(st: &SymbolTable, class_id: SymbolId) -> SymbolId {
+    let Some(module) = st.companion_module(class_id) else {
+        return SymbolId::NONE;
+    };
+    let module_cls = st.module_class_of(module);
+    let is_it =
+        |m: SymbolId| st.get(m).name == "unapply" && st.get(m).flags.contains(Flags::SYNTHETIC);
+    st.get(module_cls)
+        .members
+        .iter()
+        .copied()
+        .find(|&m| is_it(m))
+        .or_else(|| st.get(module).members.iter().copied().find(|&m| is_it(m)))
+        .unwrap_or(SymbolId::NONE)
+}
+
+/// `unapply(x: C)`, the extractor nsc synthesizes on a case class's companion.
+///
+/// The pattern matcher does not go through it -- it reads the fields straight
+/// off the scrutinee, the way nsc's own optimiser ends up doing -- so this
+/// method was never emitted, and every program that named it *itself*
+/// (`Foo.unapply(x)`, `foo(Foo.unapply, …)` eta-expanded to a function value)
+/// died with `NoSuchMethodError: 'scala.Option Foo$.unapply(Foo)'`.
+///
+/// Shapes read off `javap -c -p` on scalac 2.13.16:
+///
+/// * arity 0 -> `public boolean unapply(C)`, `x != null`;
+/// * arity 1 -> `public scala.Option unapply(C)`, `if (x == null) None else new Some(x._1)`;
+/// * arity n -> the same with `new TupleN(x._1, …, x._n)` inside the `Some`.
+///
+/// Only the *first* parameter section is extracted, exactly as the typer's own
+/// `unapply` signature says (`Typer::finish_case_apply`); the arity is read
+/// back off that signature rather than from `ctor_fields`, which is the
+/// flattened list.
+///
+/// A field of value-class type is wrapped back into its box, as
+/// `productElement` and `toString` already do.
+fn emit_case_unapply(
+    b: &mut ClassBuilder,
+    st: &SymbolTable,
+    class_id: SymbolId,
+    library_abi: bool,
+) {
+    let sym = case_unapply_sym(st, class_id);
+    if sym.is_none() {
+        return;
+    }
+    // Only the first parameter section is extracted: nsc leaves the later
+    // sections of `case class F(name: String)(val opts: X)` out of the
+    // pattern. `ctor_fields` is the flattened list, so the arity comes off the
+    // primary constructor. The `unapply` symbol's own result type cannot say:
+    // erasure has already dropped its type arguments by the time the backend
+    // runs, leaving a bare `Option`.
+    let boolean_result = matches!(
+        &st.get(sym).ty,
+        Type::Method { ret, .. } if matches!(**ret, Type::Boolean)
+    );
+    let n_fields = st.get(class_id).ctor_fields.len();
+    let arity = if boolean_result {
+        0
+    } else {
+        st.get(class_id)
+            .members
+            .iter()
+            .copied()
+            // The primary constructor is the one whose sections account for
+            // exactly the case fields; an auxiliary `def this` does not.
+            .find(|&m| {
+                st.get(m).name == "<init>"
+                    && st.get(m).paramss.iter().map(|ps| ps.len()).sum::<usize>() == n_fields
+            })
+            .and_then(|m| st.get(m).paramss.first().map(|ps| ps.len()))
+            .unwrap_or(n_fields)
+    };
+    // A shape the two sides disagree about is one this emitter does not
+    // understand; leaving the method out is better than writing one whose
+    // descriptor does not match what callers were type-checked against.
+    if (arity == 0) != boolean_result {
+        return;
+    }
+    // `TupleN` above 2 is not part of the private runtime, so a wider case
+    // class keeps the gap it has today rather than getting a method that
+    // cannot link.
+    if arity > 2 && !library_abi {
+        return;
+    }
+    let class_jvm = class_internal(st, class_id);
+    // Not for a value class. nsc's `unapply` there takes the *underlying*
+    // type and hands the very same value back, but this backend still passes a
+    // *boxed* value class in an `Object`-erased argument position, so a method
+    // with nsc's descriptor would link and then answer `Some(Wrap(w))` where
+    // scalac answers `Some(w)`. A missing method is a loud `NoSuchMethodError`;
+    // a present one that quietly disagrees is worse. See
+    // `docs/scala-corpus.md` for the call-site erasure this waits on.
+    if value_class_apply_type(st, class_id).is_some() {
+        return;
+    }
+    let desc = if arity == 0 {
+        format!("(L{class_jvm};)Z")
+    } else {
+        format!("(L{class_jvm};)Lscala/Option;")
+    };
+    if b.methods
+        .iter()
+        .any(|m| m.name == "unapply" && m.desc == desc)
+    {
+        return;
+    }
+    let fields = st.get(class_id).ctor_fields.clone();
+    if fields.len() < arity {
+        return;
+    }
+    let field_info: Vec<UnapplyField> = fields[..arity]
+        .iter()
+        .map(|f| {
+            let s = st.get(*f);
+            let vc = st.value_class_terms.get(f).and_then(|&c| {
+                let under = st.value_class_underlying(c)?;
+                Some((
+                    class_internal(st, c),
+                    format!("({})V", jvm_desc(st, &under)),
+                ))
+            });
+            (s.name.clone(), s.ty.clone(), jvm_desc_val(st, &s.ty), vc)
+        })
+        .collect();
+    let cj = class_jvm.clone();
+    b.add_code(ACC_PUBLIC, "unapply", &desc, 2, move |asm| {
+        let nonnull = asm.fresh_label();
+        asm.aload(1);
+        asm.ifnonnull(nonnull);
+        if arity == 0 {
+            asm.iconst(0);
+            asm.ireturn();
+        } else {
+            asm.getstatic("scala/None$", "MODULE$", "Lscala/None$;");
+            asm.areturn();
+        }
+        asm.mark(nonnull);
+        if arity == 0 {
+            asm.iconst(1);
+            asm.ireturn();
+            return;
+        }
+        asm.new_obj("scala/Some");
+        asm.dup();
+        if arity > 1 {
+            let tuple = format!("scala/Tuple{arity}");
+            asm.new_obj(&tuple);
+            asm.dup();
+        }
+        for (name, ty, d, vc) in &field_info {
+            match vc {
+                Some((internal, ctor)) => {
+                    asm.new_obj(internal);
+                    asm.dup();
+                    asm.aload(1);
+                    asm.getfield(&cj, name, d);
+                    asm.invokespecial(internal, "<init>", ctor);
+                }
+                None => {
+                    asm.aload(1);
+                    asm.getfield(&cj, name, d);
+                    if is_jvm_primitive(ty) && !erases_to_boxed_unit(ty) {
+                        emit_box(asm, ty);
+                    }
+                }
+            }
+        }
+        if arity > 1 {
+            let tuple = format!("scala/Tuple{arity}");
+            let d = format!("({})V", "Ljava/lang/Object;".repeat(arity));
+            asm.invokespecial(&tuple, "<init>", &d);
+        }
+        asm.invokespecial("scala/Some", "<init>", "(Ljava/lang/Object;)V");
         asm.areturn();
     });
 }
@@ -8178,7 +8530,17 @@ fn finish_method_body(
             asm.pop();
             asm.vreturn();
         } else {
-            emit_unbox(asm, ret);
+            // `NonLocalReturnControl.value()` is declared `()Ljava/lang/Object;`,
+            // so a reference result needs the `checkcast` the method's own
+            // descriptor promises -- without it `def f[T](…): Option[T]` with a
+            // `return` inside a `foreach` lambda ended in `areturn` on an
+            // `Object` and the verifier rejected it ("Bad return type ... is
+            // not assignable to 'scala/Option' (from method signature)").
+            // `lazy_cell_from_object` is the same Object -> `ret` coercion the
+            // lazy-cell and `Breaks` readers use: unbox primitives, cast the
+            // reference types that have runtime class information, leave the
+            // erased ones alone.
+            lazy_cell_from_object(asm, ctx, ret);
             emit_return(asm, ret);
         }
         asm.mark(rethrow);
@@ -8553,6 +8915,24 @@ fn discarded_unbox(tree: &Tree) -> Option<&Tree> {
 fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
     gen_expr_inner(asm, frame, ctx, tree);
     if matches!(tree.ty, Type::Nothing) {
+        // `athrow` only verifies when what is *on the stack* is a `Throwable`.
+        // A `Nothing`-typed tree does not always leave one there: a generic
+        // method instantiated at `Nothing` (`Nil.flatMap(_ => return false)`),
+        // or `Function0.apply` on a lambda that always throws, erases to
+        // `Ljava/lang/Object;` (or worse, to `Lscala/collection/immutable/List;`),
+        // and the verifier rejected the whole class with `VerifyError: Bad type
+        // on operand stack ... is not assignable to 'java/lang/Throwable'`.
+        // nsc decides by the *generated* type instead, so it never reaches
+        // `athrow` in those positions. The cast costs nothing at run time --
+        // the expression cannot complete normally, so it is never executed --
+        // and it is a no-op for the common case where the callee's descriptor
+        // really is `Lscala/runtime/Nothing$;`.
+        let top = asm.top_object().map(str::to_string);
+        if let Some(top) = top {
+            if top != "scala/runtime/Nothing$" && top != "java/lang/Throwable" {
+                asm.checkcast("java/lang/Throwable");
+            }
+        }
         asm.athrow();
     }
 }

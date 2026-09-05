@@ -3850,6 +3850,54 @@ fn scalalib_specialized_ignored_with_the_flag() {
     let _ = fs::remove_dir_all(&out);
 }
 
+/// Stack map frames at bytecode offset 0, `athrow` on a `Nothing`-typed tree
+/// whose generated value is not a `Throwable`, and the cast a non-local return
+/// needs before `areturn`. All three were rejected by the JVM verifier, so the
+/// fixture is run in both library modes (here and in the dual run below).
+#[test]
+fn fixtures_rv_verifyframes() {
+    check("rv_verifyframes");
+}
+
+#[test]
+fn scala_library_dual_run_rv_verifyframes() {
+    dual_run_fixture("rv_verifyframes");
+}
+
+/// A case class's companion `unapply` has to be a real method: the pattern
+/// matcher never calls it, but user code does. Library mode only -- the
+/// expected output prints `Option` and `TupleN`, which the private runtime
+/// renders differently and does not have past `Tuple2`.
+#[test]
+fn scala_library_dual_run_rv_caseunapply() {
+    dual_run_fixture("rv_caseunapply");
+}
+
+/// A trait's own superclass becomes the implementing template's superclass
+/// (SLS 5.1.2), and a trait nested in a trait or class gets its
+/// `<Trait>$$$outer()` implemented from the enclosing object.
+#[test]
+fn fixtures_rv_traitouter() {
+    check("rv_traitouter");
+}
+
+#[test]
+fn scala_library_dual_run_rv_traitouter() {
+    dual_run_fixture("rv_traitouter");
+}
+
+/// Templates declared inside a *local* class reach a classfile, and an
+/// imported name that the object only inherits keeps its receiver.
+#[test]
+fn fixtures_rv_localnested() {
+    check("rv_localnested");
+}
+
+#[test]
+fn scala_library_dual_run_rv_localnested() {
+    dual_run_fixture("rv_localnested");
+}
+
 /// Stable identifier patterns: a name that resolves to a `val`, a backquoted
 /// name, both inside an alternative and inside a `for` generator, plus the
 /// compound type pattern that has to test every parent. Each of these used to

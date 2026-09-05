@@ -697,6 +697,76 @@ all six detection methods and surfaced only at run time. And `output-mismatch`
 is invisible to *everything* except running the program against expected
 output, which is what this category exists to do.
 
+### The 116 that type-check and then fail to link (2026-09-05)
+
+The `VerifyError` / `ClassCastException` / `NoSuchMethodError` /
+`AbstractMethodError` / `IncompatibleClassChangeError` rows above are one
+sub-pile: 116 tests that compile, write classfiles, and are then rejected by
+the JVM. Grouped by *cause* rather than by symptom they came to far fewer than
+116 roots. Nine were fixed, taking 16 of the 116 from failing to passing (0
+before); the rest are recorded here so the next pass does
+not re-derive them.
+
+Fixed, with the number of the 116 each moved to passing:
+
+| root | tests |
+| --- | ---: |
+| no stack map frame at bytecode offset 0 (a `while (true)` at the head of a method) | 4 |
+| `athrow` appended after a `Nothing`-typed tree whose *generated* value is not a `Throwable` | 1 |
+| `NonLocalReturnControl.value()` returned without the cast the method descriptor promises | 3 |
+| a case class's companion `unapply` was never emitted | 3 |
+| `<Trait>$$$outer()` unimplemented when the enclosing instance is an enclosing *object* | 1 |
+| a trait parent's own superclass did not become the template's superclass (SLS 5.1.2) | 0 (unblocks `t11736`, `t2544`) |
+| a value class's companion `apply` emitted with the boxed descriptor instead of the erased one | 2 |
+| a `class`/`object` declared inside a *local* class never reached a classfile | 1 |
+| a named import of a member the object only *inherits* lost its receiver | 1 |
+
+Still open, in descending size:
+
+* **`uninitializedThis` reaching an instruction before the super call (7).**
+  `t0911`, `t1909b`, `t1909c`, `t4300`, `t6506`, `t6957`, `t11736`. One theme,
+  several causes: a local `def` lifted out of a constructor argument is emitted
+  as an *instance* method and called on `this` (nsc makes it `private static`
+  when it has no free `this`); an anonymous class created in a super-constructor
+  argument takes `$outer = this` (nsc drops the outer pointer when the class
+  never uses it); `new b.C(){}` on a trait nested in a class reaches for `this`
+  rather than for `b`.
+* **Java varargs (2).** `t1360`, `t3199b`. `java.util.Arrays.asList(seq: _*)`
+  needs `seq.toArray(ClassTag)` and a `checkcast [Ljava/lang/Object;` (or
+  `ScalaRunTime.toObjectArray` for a primitive element); we pass the `Seq`.
+* **Name-based extractors (4).** `string-extractor`, `t7850c`, `t7850d`,
+  `value-class-extractor-seq`. The pattern matcher assumes `unapply` returns an
+  `Option` and calls `Option.get` on whatever comes back.
+* **`try`/`finally` operand stack (3).** `Course-2002-06`, `finally`,
+  `exceptions-2`.
+* **`Iterator` in term position (1).** `t3269`. The bare name resolves to the
+  *trait* rather than to `object Iterator` — `scala.collection.Iterator.empty`
+  and `Iterator(1, 2, 3)` both emit the module receiver, `Iterator.empty` emits
+  none, so the method is invoked on an empty stack. `scala.package.Iterator` is
+  a `val` in the `scala` package object; the type alias of the same name is
+  what our lookup finds.
+* **A case class read back from a pickle loses its `CASE` flag.**
+  `crates/backend/src/pickle.rs` *writes* it (bit 11 of the extra flag word);
+  nothing on the reading side sets `Flags::CASE`. So a case class on the
+  classpath is matched through its extractor rather than as a constructor
+  pattern, and `productArity`, `copy` and `==` are all decided from a symbol
+  that does not know it is a case class. `Typer::case_ctor_field_types` works
+  around the one consequence that had a test; the flag itself is still lost.
+* **Macro defs read back from a classfile (≈19).** Every `macro-*` test here
+  fails with `NoSuchMethodError` on the macro *def* itself: round two reads
+  `Macros` from a classfile, where the `MACRO` flag and the `@macroImpl`
+  binding are not pickled, so the call is emitted as a real invocation instead
+  of being expanded. This is §5 of `docs/macros.md`, not a codegen bug.
+
+One finding worth more than its single test: **`t10594` is a silently broken
+classfile.** `Assembler::finish` back-patches a conditional branch by
+truncating the offset to `i16`, so a method whose body exceeds 32 KB gets a
+branch to a negative address (`Expecting a stackmap frame at branch target
+-7611`). nsc's ASM widens such branches automatically. Nothing in the battery
+detects this short of running the program — `javap -p` and the loader check
+both stop at the constant pool — so a large generated method can be wrong with
+no signal at all.
+
 ### Pile two: we do not implement it (≈500)
 
 | symptom | count |
