@@ -3332,7 +3332,23 @@ impl Typer {
                 // A self type names its parts the same way an `extends` clause
                 // does; `trait N { self: Missing => }` is `not found: type
                 // Missing`, not an "illegal inheritance" against a placeholder.
+                //
+                // The signature pass's complaint is dropped, exactly as
+                // `type_parent_ctor_app`'s is: a class header is typed by both
+                // passes, so anything real is raised again by the pass that
+                // runs with every unit's signatures in hand. What the
+                // signature pass alone cannot see is a self type named through
+                // an import whose prefix is another template's `val`:
+                // gitbucket's `trait TemplateComponent { self: Profile =>
+                // import profile.api._; trait BasicTemplate { self: Table[?] =>
+                // … } }` had `Table` in scope on the body pass and not on the
+                // signature pass, and `not found: type Table` -- with the whole
+                // template's members missing behind it -- was permanent.
+                let mark = self.diags.len();
                 let t = self.with_strict_type_names(|s| s.tree_to_type(tpt));
+                if self.sigs_only {
+                    self.diags.truncate(mark);
+                }
                 if t.is_error() {
                     return;
                 }
@@ -8373,6 +8389,72 @@ impl Typer {
             .complete(&mut self.st, &mut self.binary, cls, name);
         for id in found {
             self.st.enter_in_current(name, id);
+        }
+        if self.st.lookup(name).is_empty() {
+            self.expose_from_binary_self_type(name);
+        }
+    }
+
+    /// The same, for a member offered by a **self type** that is a `-cp`
+    /// class rather than a parent.
+    ///
+    /// SLS 5.1: inside a template whose self type is `S`, `this` conforms to
+    /// `S`, so every member of `S` is in scope unqualified. `bind_self_type`
+    /// implements that by entering the self type's members into the template
+    /// scope -- but, exactly as for a parent read from a jar, a binary class's
+    /// member list is empty until something asks for a name, so nothing was
+    /// entered.
+    ///
+    /// gitbucket writes every slick table mix-in that way:
+    /// `trait BasicTemplate { self: Table[?] => val userName =
+    /// column[String]("USER_NAME") }`, and `column` was
+    /// `not found: value column`. A qualified `this.column` resolved, because
+    /// `lookup_member` walks the self type and `type_select` completes on
+    /// demand; only the bare name did not.
+    ///
+    /// Only the template the name is written in, not the enclosing ones.
+    /// nsc's context chain does reach an outer template's self type, but the
+    /// member would then have to be read at the *outer* `this` -- a nested
+    /// `trait Inner { def d: Int = dequeue() }` inside
+    /// `trait Q { self: PriorityQueue[Int] => … }` must see `dequeue(): Int`,
+    /// not the declared `A`, and must call it on `Q.this`. Entering the
+    /// symbol alone gives neither, so an outer self type is left alone rather
+    /// than answered wrongly. Like the parent case this runs only when the
+    /// name resolves to nothing at all, and enters exactly what completion
+    /// installed.
+    fn expose_from_binary_self_type(&mut self, name: &str) {
+        let owner = self.st.this_class;
+        let Some(st) = self.st.get(owner).self_type.clone() else {
+            return;
+        };
+        // A compound self type offers the members of every part.
+        let roots: Vec<Type> = match &st {
+            Type::Refined { parents, .. } => parents.clone(),
+            other => vec![other.clone()],
+        };
+        for root in roots {
+            let Some(sc) = self.st.class_sym_of(&root) else {
+                continue;
+            };
+            if sc == owner {
+                continue;
+            }
+            // `complete_named` serves a `-cp` class only once it has been
+            // adopted, and nothing adopts a class the program only ever
+            // names in a self type. Without this, `complete` skipped the
+            // self type's *own* declarations and looked at its ancestors
+            // only -- and `column` is declared on `Table` itself.
+            self.pickle
+                .adopt_binary_class(&mut self.st, &mut self.binary, sc);
+            let found = self
+                .pickle
+                .complete(&mut self.st, &mut self.binary, sc, name);
+            for id in found {
+                self.st.enter_in_current(name, id);
+            }
+            if !self.st.lookup(name).is_empty() {
+                return;
+            }
         }
     }
 
