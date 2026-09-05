@@ -47,8 +47,7 @@ thread and only parallelises writing the class files.
 
 scala-rs emits more class files than scalac for the same sources, so the
 comparison is not entirely in its favour: `PartialFunction` literals still
-become anonymous classes here, and traits get `T$class` helpers that scalac
-2.13 does not need.
+become anonymous classes here.
 
 What that run establishes:
 

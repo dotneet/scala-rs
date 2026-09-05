@@ -1,7 +1,7 @@
 //! `trait` / `class` / `object` declared inside a method body ("local").
 //!
-//! A local trait's concrete members were never harvested, so no `T$class`
-//! implementation class and no mixin forwarders were emitted at all: the code
+//! A local trait's concrete members were never harvested, so no bodies
+//! and no mixin forwarders were emitted at all: the code
 //! type-checked, and every call went straight to `AbstractMethodError`. A
 //! local declaration also got no index in its binary name, so two methods each
 //! declaring a `trait Same` produced two classfiles called `Main$Same` and the
@@ -218,7 +218,7 @@ fn fixtures_lt1_bad_illegal_mixin_superclass() {
 /// own field plus bitmap on the implementing class -- exactly the shape a
 /// top-level trait produces.
 #[test]
-fn local_trait_gets_mixin_forwarders_and_impl_class() {
+fn local_trait_gets_mixin_forwarders_and_default_methods() {
     let out = compile_fixture_with("lt1", &["--no-scala-library"]);
 
     let iface = javap(&out, "Main$L$1");
@@ -229,11 +229,10 @@ fn local_trait_gets_mixin_forwarders_and_impl_class() {
         );
     }
 
-    let impl_class = javap(&out, "Main$L$1$class");
     assert!(
-        impl_class.contains("static java.lang.String plain(Main$L$1)")
-            && impl_class.contains("static void $init$(Main$L$1)"),
-        "local trait should get a $class implementation holder, got:\n{impl_class}"
+        iface.contains("static java.lang.String plain$(Main$L$1)")
+            && iface.contains("static void $init$(Main$L$1)"),
+        "the local trait's bodies belong on the interface, got:\n{iface}"
     );
 
     let lc = javap(&out, "Main$LC$1");
@@ -242,8 +241,8 @@ fn local_trait_gets_mixin_forwarders_and_impl_class() {
         "implementing class should carry a mixin forwarder for plain(), got:\n{lc}"
     );
     assert!(
-        lc.contains("Method Main$L$1$class.plain:(LMain$L$1;)Ljava/lang/String;"),
-        "the forwarder should invokestatic the trait implementation, got:\n{lc}"
+        lc.contains("InterfaceMethod Main$L$1.plain$:(LMain$L$1;)Ljava/lang/String;"),
+        "the forwarder should invokestatic the trait's `plain$`, got:\n{lc}"
     );
     assert!(
         lc.contains("public java.lang.String w();") && lc.contains("bitmap$0"),
@@ -285,7 +284,7 @@ fn same_named_local_declarations_get_separate_classfiles() {
 
 /// A local trait reading an enclosing-method local: the trait declares an
 /// accessor, and every class mixing it in implements it from its own capture
-/// field. Without the accessor the `$class` body read a field of a class named
+/// field. Without the accessor the trait body read a field of a class named
 /// after the enclosing *method* (`getfield capturesVal.n`), which does not
 /// exist.
 #[test]
@@ -305,12 +304,12 @@ fn local_trait_captures_go_through_an_accessor() {
             "implementing class should define capture accessor {a}, got:\n{cls}"
         );
     }
-    let impl_class = javap(&out, "Main$Cap$1$class");
     for a in &acc {
         assert!(
-            impl_class.contains(&format!("InterfaceMethod Main$Cap$1.{a}:")),
-            "the trait implementation should read {a} back through the \
-             interface accessor, got:\n{impl_class}"
+            iface.contains(&format!("InterfaceMethod {a}:")),
+            "the trait body should read {a} back through the interface \
+             accessor (javap omits the owner when it is this very class), \
+             got:\n{iface}"
         );
         let body = cls
             .split(&format!("{a}();"))
@@ -377,16 +376,16 @@ fn public_members(out: &Path, class: &str) -> BTreeSet<String> {
         // Methods only: nsc makes a trait `val`'s field private, we make it
         // public, and a field is not a member anyone can call.
         .filter(|l| l.starts_with("public ") && l.ends_with(';') && l.contains('('))
-        // nsc's `static X$(iface)` bridges live on the interface; our
-        // equivalents live on the separate `$class` holder.
+        // `static X$(iface)` bridges are one compiler-internal entry point
+        // per concrete member, not part of the member set being compared.
         .filter(|l| !l.starts_with("public static"))
         .map(|l| strip_super_owner(strip_local_index(l)))
         .collect()
 }
 
-/// `super` accessors: nsc encodes the whole binary name of the owning trait
-/// (`Main$B$$super$name`), we encode only its simple name (`B$$super$name`).
-/// Both are private to one compiler's own ABI, so compare only the suffix.
+/// `super` accessors: both compilers encode the whole binary name of the
+/// owning trait (`Main$B$$super$name`), but a *local* trait carries an index
+/// the two number differently, so compare only the suffix.
 fn strip_super_owner(line: String) -> String {
     match line.find("$$super$") {
         None => line,

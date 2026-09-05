@@ -562,7 +562,7 @@ same shape as scalac's `Main$$anon$1`),
 `trex_inherited_superclass_reaches_the_class_file` (`class X extends Loud`
 extends `Main$Animal` in the class file too), and
 `trex_trait_interface_does_not_extend_its_superclass` (the trait's interface does
-not extend the superclass, and the `T$class` body emits a `checkcast` before
+not extend the superclass, and the trait body emits a `checkcast` before
 reading an inherited member). All 6 bad cases are confirmed to be diagnosed **in
 both modes** (`--no-scala-library` and `--scala-library`), with wording from real
 scalac 2.13.16. `trex_mixin_bad` also checks that it is rejected for both a named

@@ -1743,6 +1743,15 @@ impl<'a> Pickler<'a> {
             }
         }
         self.pickle_erasure_bridges(class_id, idx);
+        // A trait's primary constructor is `$init$` (`nme.MIXIN_CONSTRUCTOR`),
+        // and nsc emits `invokestatic <Iface>.$init$` from the constructor of
+        // every class that mixes the trait in — but only when it can find
+        // that symbol in the trait's signature. Without it, a subclass real
+        // scalac compiles against our classfile links and verifies and then
+        // leaves every trait `val` at its default value.
+        if class_flags.contains(Flags::TRAIT) || class_flags.contains(Flags::INTERFACE) {
+            self.pickle_mixin_ctor(idx);
+        }
 
         let mut info = info;
         if !tparam_refs.is_empty() {
@@ -1902,6 +1911,25 @@ impl<'a> Pickler<'a> {
         // METHOD | SYNTHETIC | BRIDGE (none remapped except METHOD)
         let extra = (1u64 << 6) | (1 << 21) | (1 << 26);
         let flags = raw_to_pickled(extra);
+        let body = self.symbol_info(name_ref, owner_ref, flags, info);
+        self.entries[meth_idx as usize] = (VALSYM, body);
+        self.current_owner = saved;
+    }
+
+    /// `def $init$(): Unit` — the trait's primary constructor as nsc pickles
+    /// it (`nme.MIXIN_CONSTRUCTOR`, a `MethodType` with an empty parameter
+    /// list, not a nullary one). It is what tells a reader that the mixing
+    /// class owes a `$init$` call.
+    fn pickle_mixin_ctor(&mut self, owner_ref: u32) {
+        let name_ref = self.term_name("$init$");
+        let meth_idx = self.add(VALSYM, vec![]);
+        let saved = self.current_owner;
+        self.current_owner = meth_idx;
+        let ret_ref = self.pickle_type(&Type::Unit);
+        let mut mt = Vec::new();
+        write_nat_to(&mut mt, ret_ref);
+        let info = self.add(METHODTPE, mt);
+        let flags = raw_to_pickled(1u64 << 6); // METHOD
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
         self.entries[meth_idx as usize] = (VALSYM, body);
         self.current_owner = saved;
@@ -2168,8 +2196,17 @@ impl<'a> Pickler<'a> {
         let mut pt = Vec::new();
         write_nat_to(&mut pt, ret_ref);
         let info = self.add(POLYTPE, pt);
-        // METHOD | STABLE | ACCESSOR, then nsc raw→pickled remap
-        let mut extra = (1u64 << 6) | (1u64 << 22) | (1u64 << 27);
+        // METHOD | ACCESSOR, then nsc raw→pickled remap. STABLE only for an
+        // immutable one: nsc decides "this is a `var`" from the getter not
+        // being STABLE plus a `_$eq` setter next to it, and a trait `var` read
+        // back as a `val` makes the reader implement the mixin
+        // `T$_setter_$v_$eq` protocol instead of the plain setter the trait's
+        // own `$init$` calls.
+        let mutable = flags_our.contains(Flags::MUTABLE);
+        let mut extra = (1u64 << 6) | (1u64 << 27);
+        if !mutable {
+            extra |= 1u64 << 22; // STABLE
+        }
         if case_accessor {
             extra |= 1 << 24; // CASEACCESSOR (not remapped)
         }
@@ -2180,7 +2217,37 @@ impl<'a> Pickler<'a> {
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
         self.entries[idx as usize] = (VALSYM, body);
         self.pickle_sym_annots(val_id, idx);
+        if mutable {
+            self.pickle_var_setter(&name, owner_ref, &ty);
+        }
         idx
+    }
+
+    /// `def v_$eq(x$1: T): Unit`, the setter half of a `var`. nsc pickles one
+    /// beside every mutable accessor; without it a reader sees a `val` and
+    /// neither `x.v = …` from another compilation unit nor a class mixing in
+    /// a trait `var` lines up with what we emit.
+    fn pickle_var_setter(&mut self, field: &str, owner_ref: u32, ty: &Type) {
+        let setter = format!("{}_$eq", crate::classfile::encode_method_name(field));
+        let name_ref = self.term_name(&setter);
+        let meth_idx = self.add(VALSYM, vec![]);
+        let saved = self.current_owner;
+        self.current_owner = meth_idx;
+        let pty_ref = self.pickle_type(ty);
+        let pn = self.term_name("x$1");
+        let pflags = pickled_from_our(Flags::PARAM, SymKind::Term, 1u64 << 13);
+        let pbody = self.symbol_info(pn, meth_idx, pflags, pty_ref);
+        let param = self.add(VALSYM, pbody);
+        let unit_ref = self.pickle_type(&Type::Unit);
+        let mut mt = Vec::new();
+        write_nat_to(&mut mt, unit_ref);
+        write_nat_to(&mut mt, param);
+        let info = self.add(METHODTPE, mt);
+        // METHOD | ACCESSOR
+        let flags = raw_to_pickled((1u64 << 6) | (1u64 << 27));
+        let body = self.symbol_info(name_ref, owner_ref, flags, info);
+        self.entries[meth_idx as usize] = (VALSYM, body);
+        self.current_owner = saved;
     }
 
     fn finish(self) -> Vec<u8> {

@@ -808,19 +808,38 @@ of most of these notes.
   (the "the frame at the top of a loop and a `try` on top of the operand stack" section).
 
 
-- **`T$class` static helpers** (`agent/fewerclasses`, root 2 of "we emit more
-  classfiles than nsc"; not attempted). nsc 2.13 compiles a trait's concrete
-  methods to **default methods on the interface** and emits no `T$class` at
-  all; `$init$` becomes a `static` method on the interface itself. scala-rs
-  emits one `T$class` per trait with a concrete method — **106 of them** for
-  slick, which after the closure-duplication fixes is the *entire* remaining
-  gap to nsc (1552 against 1498; the closure count is 141 against nsc's 137).
-  Moving it touches `emit_trait_impl_class` / `emit_trait_impl_method` /
-  `emit_trait_init` in `crates/backend/src/gen.rs`, every `invokestatic
-  <Iface>$class.m` call site (five in gen.rs), the mixin forwarders each
-  implementing class emits, and separate compilation against classfiles that
-  still have the old shape. It is a bigger change than the whole of
-  `agent/fewerclasses` was.
+- ~~**`T$class` static helpers**~~ → done in `agent/traitclass`. Trait bodies
+  are interface `default` methods with nsc's `m$` statics beside them, and
+  `$init$` is a `static` on the interface. slick went from `classes=1596` to
+  `classes=1490` (nsc: 1498). `crates/cli/tests/traitclass.rs` compiles the
+  traits with scala-rs, the subclass with **real scalac 2.13.16**, and runs
+  the pair.
+
+  What that slice found still missing on the same interop path, none of it
+  caused by the trait encoding and all of it now *reachable* because it is:
+
+  - **A trait's `private` `val` / `var` keeps its source name.** nsc expands
+    it (`lib$Counter$$n` / `lib$Counter$$n_$eq`) so that a subclass it
+    compiles implements the mangled accessors, and a class scalac compiles
+    against ours therefore leaves our `n()` abstract:
+    `AbstractMethodError: … does not define or inherit … n()`. The name is
+    produced in the `ValDef` arm of `emit_class`'s trait branch,
+    `trait_val_setter_name`, `mixin_val_fields`, and wherever the trait's own
+    body reads the accessor. `super_accessor_name` and
+    `trait_outer_accessor_name` already expand this way — this is the same
+    change for the field accessors.
+  - **A `super` accessor is not pickled.** nsc's mixin phase implements
+    `p$q$T$$super$m` in a subclass only when the trait's signature declares a
+    member with the `SUPERACCESSOR` flag (raw `1 << 28`). We emit the method
+    on the interface but write nothing into the pickle, so a stackable
+    `abstract override` trait of ours, mixed in by scalac, is an
+    `AbstractMethodError` on `p$q$T$$super$m`.
+  - **We call `$init$` only for traits compiled in the same run.**
+    `mixin_init_calls` reads `TraitImpls::inits`, which is harvested from
+    source trees, so a trait read from `-cp` gets no `$init$` call and its
+    `val`s stay at their defaults. Now that every trait pickles `$init$`
+    (`pickle_mixin_ctor`), the reader has what it needs to decide; nsc simply
+    calls it for every mixed-in trait unconditionally.
 
 - **`catch { case _: MatchError => … }` names the bare class in
   `--no-scala-library`** (`agent/fewerclasses`, found in passing; not fixed,

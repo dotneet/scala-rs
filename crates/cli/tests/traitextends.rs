@@ -280,10 +280,9 @@ fn trex_trait_interface_does_not_extend_its_superclass() {
         !loud.contains("extends Main$Animal"),
         "a trait's class parent is a constraint, not a JVM supertype: {loud}"
     );
-    let impl_cls = javap(&out, "Main$Loud$class");
     assert!(
-        impl_cls.contains("checkcast") && impl_cls.contains("Main$Animal"),
-        "the trait body must checkcast $this before reading an inherited member: {impl_cls}"
+        loud.contains("checkcast") && loud.contains("Main$Animal"),
+        "the trait body must checkcast `this` before reading an inherited member: {loud}"
     );
     let _ = fs::remove_dir_all(&out);
 }

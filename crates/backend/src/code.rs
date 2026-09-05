@@ -1229,6 +1229,18 @@ impl Assembler {
         self.emit_u16(i);
         self.apply_invoke(desc, true, is_init, owner);
     }
+    /// `invokespecial` against an `InterfaceMethodref`. This is how a trait's
+    /// `static m$` forwarder reaches the `default` method holding the body,
+    /// and how a `private` interface method is called: JVMS §6.5
+    /// `invokespecial` allows an interface reference when the referenced
+    /// interface is the current class or one of its direct superinterfaces.
+    pub fn invokespecial_interface(&mut self, owner: &str, name: &str, desc: &str) {
+        let name = encode_method_name(name);
+        let i = self.pool.iface_ref(owner, &name, desc);
+        self.emit_op(0xb7);
+        self.emit_u16(i);
+        self.apply_invoke(desc, true, false, owner);
+    }
     pub fn invokestatic(&mut self, owner: &str, name: &str, desc: &str) {
         self.invokestatic_ref(owner, name, desc, false);
     }
@@ -1270,13 +1282,15 @@ impl Assembler {
     ///
     /// * `sam_name` / `sam_desc` — the interface's single abstract method.
     /// * `call_desc` — `(<captured types>)L<functional interface>;`.
-    /// * `impl_*` — the static method holding the lambda body. It is always a
-    ///   method of a *class*, never of an interface, because JVMS §4.6 forbids
-    ///   the flags the body carries on an interface method.
+    /// * `impl_*` — the static method holding the lambda body. A trait's
+    ///   bodies live on the interface itself, so this can be an interface
+    ///   method; `impl_owner_is_interface` says which, and JVMS §4.4.8 makes
+    ///   the two different constant-pool entries.
     ///
     /// `samMethodType` and `instantiatedMethodType` are both `sam_desc`: the
     /// body is written at the erased `(Object…)Object` shape, so
     /// `LambdaMetafactory` has nothing to adapt and never needs a bridge.
+    #[allow(clippy::too_many_arguments)]
     pub fn invokedynamic_lambda(
         &mut self,
         sam_name: &str,
@@ -1285,6 +1299,12 @@ impl Assembler {
         impl_owner: &str,
         impl_name: &str,
         impl_desc: &str,
+        // Whether `impl_owner` is an interface. A trait's `$anonfun$` bodies
+        // are `static` methods of the interface itself, and JVMS §4.4.8
+        // requires the method handle to name a `CONSTANT_InterfaceMethodref`
+        // then: with a plain `Methodref` the JVM refuses the whole class with
+        // `IncompatibleClassChangeError: Inconsistent constant pool data`.
+        impl_owner_is_interface: bool,
     ) {
         const MF_OWNER: &str = "java/lang/invoke/LambdaMetafactory";
         const MF_DESC: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;\
@@ -1295,9 +1315,12 @@ Ljava/lang/invoke/CallSite;";
             .pool
             .method_handle_static(MF_OWNER, "metafactory", MF_DESC, false);
         let a0 = self.pool.method_type(sam_desc);
-        let a1 = self
-            .pool
-            .method_handle_static(impl_owner, impl_name, impl_desc, false);
+        let a1 = self.pool.method_handle_static(
+            impl_owner,
+            impl_name,
+            impl_desc,
+            impl_owner_is_interface,
+        );
         let bsm_index = self.pool.bootstrap(bsm, vec![a0, a1, a0]);
         let i = self.pool.invoke_dynamic(bsm_index, sam_name, call_desc);
         self.emit_op(0xba);

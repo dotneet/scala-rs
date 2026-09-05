@@ -48,7 +48,6 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
         emit_function_n(1),
         emit_partial_function(),
         emit_ordered(),
-        emit_ordered_class(),
         emit_option(),
         emit_some(),
         emit_some_module(),
@@ -184,6 +183,9 @@ fn emit_partial_function() -> EmittedClass {
     b.finish()
 }
 
+/// `scala.math.Ordered` in nsc 2.13's trait shape: the comparison operators
+/// are `default` methods on the interface, each with a `public static m$`
+/// beside it taking the receiver. There is no `Ordered$class`.
 fn emit_ordered() -> EmittedClass {
     let mut b = B::class("scala/math/Ordered", "java/lang/Object");
     b.access = ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT;
@@ -193,20 +195,10 @@ fn emit_ordered() -> EmittedClass {
         "compare",
         "(Ljava/lang/Object;)I",
     );
-    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, "<", "(Ljava/lang/Object;)Z");
-    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, ">", "(Ljava/lang/Object;)Z");
-    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, "<=", "(Ljava/lang/Object;)Z");
-    b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, ">=", "(Ljava/lang/Object;)Z");
-    b.finish()
-}
-
-fn emit_ordered_class() -> EmittedClass {
-    let mut b = B::class("scala/math/Ordered$class", "java/lang/Object");
-    b.access = ACC_PUBLIC | ACC_SUPER | ACC_FINAL;
-    let static_desc = "(Lscala/math/Ordered;Ljava/lang/Object;)Z";
     fn cmp_op(b: &mut B, name: &str, jump_true: impl Fn(&mut Assembler, crate::code::Label)) {
+        let inst_desc = "(Ljava/lang/Object;)Z";
         let static_desc = "(Lscala/math/Ordered;Ljava/lang/Object;)Z";
-        b.add_code(ACC_PUBLIC | ACC_STATIC, name, static_desc, 2, |asm| {
+        b.add_code(ACC_PUBLIC, name, inst_desc, 2, |asm| {
             asm.aload(0);
             asm.aload(1);
             asm.invokeinterface("scala/math/Ordered", "compare", "(Ljava/lang/Object;)I");
@@ -221,13 +213,25 @@ fn emit_ordered_class() -> EmittedClass {
             asm.mark(done);
             asm.ireturn();
         });
-        let _ = static_desc;
+        let static_name = format!("{}$", encode_method_name(name));
+        let inst_name = name.to_string();
+        b.add_code(
+            ACC_PUBLIC | ACC_STATIC,
+            &static_name,
+            static_desc,
+            2,
+            move |asm| {
+                asm.aload(0);
+                asm.aload(1);
+                asm.invokespecial_interface("scala/math/Ordered", &inst_name, inst_desc);
+                asm.ireturn();
+            },
+        );
     }
     cmp_op(&mut b, "<", |asm, t| asm.if_icmplt(t));
     cmp_op(&mut b, ">", |asm, t| asm.if_icmpgt(t));
     cmp_op(&mut b, "<=", |asm, t| asm.if_icmple(t));
     cmp_op(&mut b, ">=", |asm, t| asm.if_icmpge(t));
-    let _ = static_desc;
     b.finish()
 }
 

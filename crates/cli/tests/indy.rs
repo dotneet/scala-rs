@@ -177,7 +177,7 @@ fn indy1_runs_the_same_in_both_abis() {
 }
 
 /// Ten `FunctionN` literals across an object, a class and a trait, and not one
-/// closure classfile: only `Main`, `Main$`, `Holder`, `Bump` and `Bump$class`.
+/// closure classfile: only `Main`, `Main$`, `Holder` and `Bump`.
 #[test]
 fn indy1_emits_no_closure_classfiles() {
     let Some(jar) = scala_library_jar() else {
@@ -203,8 +203,8 @@ fn indy1_emits_no_closure_classfiles() {
         "Main$ should bootstrap through LambdaMetafactory"
     );
     assert!(
-        contains_ascii(&out.join("Bump$class.class"), "$anonfun$"),
-        "a lambda inside a trait method belongs to the trait's $class helper"
+        contains_ascii(&out.join("Bump.class"), "$anonfun$"),
+        "a lambda inside a trait method is a static on the interface itself"
     );
     let _ = fs::remove_dir_all(&out);
 }
