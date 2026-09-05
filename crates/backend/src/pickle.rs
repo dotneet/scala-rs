@@ -445,16 +445,16 @@ impl<'a> Pickler<'a> {
         i
     }
 
-    /// nsc constructor result: `TypeRef(ThisType(<owning package>), C, tparams)`.
-    fn ctor_result_type(&mut self, class_idx: u32) -> u32 {
-        let pkg = self
-            .class_pkg
-            .get(&class_idx)
-            .copied()
-            .unwrap_or_else(|| self.empty_package());
-        let mut th = Vec::new();
-        write_nat_to(&mut th, pkg);
-        let pref = self.add(THISTPE, th);
+    /// nsc constructor result: `TypeRef(<prefix>, C, tparams)`.
+    ///
+    /// The prefix is where an instance of `C` is reached from, and runtime
+    /// reflection prints it: `class A` at the top level of `object Test` has
+    /// `def <init>(): Test.A`, the same class inside `class Test` has
+    /// `def <init>(): Test.this.A2`, and only a class the *package* owns gets
+    /// the `ThisType(<package>)` that nsc elides down to a bare `A`
+    /// (`run/t5256b`, `run/t5256e`, `run/t5256f`).
+    fn ctor_result_type(&mut self, class_idx: u32, class_id: SymbolId) -> u32 {
+        let pref = self.ctor_result_prefix(class_idx, class_id);
         let tparams = self
             .class_tparams
             .get(&class_idx)
@@ -474,6 +474,38 @@ impl<'a> Pickler<'a> {
             write_nat_to(&mut body, t);
         }
         self.add(TYPEREFTPE, body)
+    }
+
+    /// The prefix of a constructor's result type — see [`Self::ctor_result_type`].
+    fn ctor_result_prefix(&mut self, class_idx: u32, class_id: SymbolId) -> u32 {
+        let owner = if class_id.is_none() {
+            SymbolId::NONE
+        } else {
+            self.st.get(class_id).owner
+        };
+        if !owner.is_none() {
+            let owner_cls = match self.st.get(owner).kind {
+                SymKind::Class | SymKind::ModuleClass => owner,
+                SymKind::Module => self.st.module_class_of(owner),
+                _ => SymbolId::NONE,
+            };
+            // Only when the enclosing class is one this pickle already holds:
+            // `pickle_this_tpe` would otherwise pull an external class into it.
+            if !owner_cls.is_none() && self.this_tpes.contains_key(&owner_cls.0) {
+                // nsc's `ThisType#prefixString` prints a *module* class by its
+                // full name (`Test.`) and any other class as `Test.this.`, so
+                // one `ThisType` spells both of the shapes these tests expect.
+                return self.pickle_this_tpe(owner_cls);
+            }
+        }
+        let pkg = self
+            .class_pkg
+            .get(&class_idx)
+            .copied()
+            .unwrap_or_else(|| self.empty_package());
+        let mut th = Vec::new();
+        write_nat_to(&mut th, pkg);
+        self.add(THISTPE, th)
     }
 
     fn type_ref_in(&mut self, owner: u32, name: &str) -> u32 {
@@ -1697,6 +1729,22 @@ impl<'a> Pickler<'a> {
             write_nat_to(&mut info_body, *r);
         }
         let info = self.add(CLASSINFOTPE, info_body);
+        // A module class's primary constructor. nsc's namer gives every
+        // `object` one -- `private T$()` in the classfile, `constructor T` in
+        // `info.decls` -- and our symbol table does not carry it as a member,
+        // so nothing pickled it. Runtime reflection then had no
+        // `termNames.CONSTRUCTOR` to find in an object's signature
+        // (`run/reflection-enclosed-{inner,nested}-nested-basic`).
+        if is_module
+            && !self
+                .st
+                .get(class_id)
+                .members
+                .iter()
+                .any(|&m| self.st.get(m).name == "<init>")
+        {
+            self.pickle_module_ctor(idx, class_id);
+        }
         for m in members {
             let kind = self.st.get(m).kind;
             let name = self.st.get(m).name.clone();
@@ -2037,6 +2085,24 @@ impl<'a> Pickler<'a> {
         self.current_owner = saved;
     }
 
+    /// `private def <init>(): T.type` — the primary constructor of an
+    /// `object`'s module class, which nsc emits (`private T$()`) and pickles
+    /// but our symbol table does not carry as a member.
+    fn pickle_module_ctor(&mut self, owner_ref: u32, class_id: SymbolId) {
+        let name_ref = self.term_name("<init>");
+        let meth_idx = self.add(VALSYM, vec![]);
+        let saved = self.current_owner;
+        self.current_owner = meth_idx;
+        let ret_ref = self.ctor_result_type(owner_ref, class_id);
+        let mut mt = Vec::new();
+        write_nat_to(&mut mt, ret_ref);
+        let info = self.add(METHODTPE, mt);
+        let flags = raw_to_pickled((1u64 << 6) | (1u64 << 2)); // METHOD | PRIVATE
+        let body = self.symbol_info(name_ref, owner_ref, flags, info);
+        self.entries[meth_idx as usize] = (VALSYM, body);
+        self.current_owner = saved;
+    }
+
     fn pickle_method(&mut self, method_id: SymbolId, owner_ref: u32, _this_tpe: u32) -> u32 {
         if let Some(i) = self.sym_index.get(&method_id.0) {
             return *i;
@@ -2094,7 +2160,8 @@ impl<'a> Pickler<'a> {
             param_refs.push(self.add(VALSYM, body));
         }
         let ret_ref = if meth_name == "<init>" {
-            self.ctor_result_type(owner_ref)
+            let class_id = self.st.get(method_id).owner;
+            self.ctor_result_type(owner_ref, class_id)
         } else {
             self.pickle_type(&ret)
         };
