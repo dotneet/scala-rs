@@ -2002,9 +2002,9 @@ impl Typer {
         }
         // nsc gives the `$anon` class of a `new C { … }` the FINAL flag, so
         // `Symbol.isEffectivelyFinal` holds for it and every concrete member
-        // it declares is eligible. cats writes 17 of these -- each instance
-        // handed out by `implicit val catsStdInstancesForList: Traverse[List] =
-        // new Traverse[List] { @tailrec override def get… }`.
+        // it declares is eligible. cats writes 7 of these -- among them the
+        // instance handed out by `implicit val catsStdInstancesForList:
+        // Traverse[List] = new Traverse[List] { @tailrec override def get… }`.
         if o.name.starts_with("$anon") {
             return true;
         }
@@ -2013,9 +2013,10 @@ impl Typer {
         // it, cannot be overridden either. That covers `sealed class` and --
         // because a class declared in a block can only be extended inside that
         // block -- a method-local class. Both are accepted by scalac 2.13.16
-        // and both were rejected here; `tt_tailrec_bad.scala` pins the four
+        // and both were rejected here; `tt_tailrec_bad.scala` pins the five
         // shapes nsc still rejects, including the sealed class that *is*
-        // overridden.
+        // overridden and the block-local class that another class in the same
+        // block overrides.
         let name = s.name.clone();
         // A class declared inside a method or a value's right-hand side can
         // only be extended from inside that block, so its subclasses are all
