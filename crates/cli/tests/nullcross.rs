@@ -210,13 +210,24 @@ fn nx_null_erasure_matches_scalac() {
     );
     compile_nsc(&scalac, &["nx_null"], &theirs, None);
 
-    for class in ["Main$", "Main$Box"] {
+    for class in ["Main$", "Main$Box", "NxNull"] {
         assert_eq!(
             descriptors(&ours, class),
             descriptors(&theirs, class),
             "erasure of {class} differs from scalac's"
         );
     }
+    // The bridge down to `Null$`: without the `checkcast` the JVM rejects the
+    // class, because `Object` is not assignable to `Null$`. slick's
+    // `JdbcTypesComponent$JdbcTypes$NullJdbcType` is the real instance of
+    // this, and it is a `VerifyError` rather than anything subtler.
+    let bridge = javap(&["-p", "-c", "-cp", ours.to_str().unwrap(), "NxNull"]);
+    assert!(
+        bridge.contains("checkcast")
+            && bridge.contains("class scala/runtime/Null$")
+            && bridge.contains("Method lit:(Lscala/runtime/Null$;)Ljava/lang/String;"),
+        "the erasure bridge must checkcast to Null$, got:\n{bridge}"
+    );
     // Named explicitly, so a regression says which claim broke rather than
     // printing two long lists.
     let m = descriptors(&ours, "Main$").join("\n");

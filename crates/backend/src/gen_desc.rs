@@ -308,6 +308,18 @@ pub(crate) fn param_adapt(st: &SymbolTable, from: &Type, to: &Type) -> Adapt {
     if erases_to_boxed_unit(from) {
         return Adapt::None;
     }
+    // The two bottom types each erase to a class of their own, so a bridge
+    // from `(Object)` has to say so -- `Object` is not assignable to `Null$`,
+    // and the verifier rejects the whole class. nsc emits exactly this
+    // `checkcast` (`javap -c` on `class NullT extends D[Null]`, and the same
+    // for `D[Nothing]`). The cast can never fail: no instance of either class
+    // exists, so the value is always `null`, and `checkcast` lets `null`
+    // through.
+    match to.widen_constant() {
+        Type::Null => return Adapt::Cast("scala/runtime/Null$".into()),
+        Type::Nothing => return Adapt::Cast("scala/runtime/Nothing$".into()),
+        _ => {}
+    }
     if is_jvm_primitive(to) && !is_jvm_primitive(from) {
         Adapt::Unbox(to.clone())
     } else if is_jvm_primitive(from) && !is_jvm_primitive(to) {

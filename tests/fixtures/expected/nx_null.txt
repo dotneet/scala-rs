@@ -3,3 +3,5 @@ null
 0
 null
 null
+NULL
+null
