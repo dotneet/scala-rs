@@ -785,6 +785,52 @@ pile one is.
 `553` more `run` tests are skipped rather than failed (unsupported harness
 shapes: `.javaopts`, separate JVMs, `filters`); see the limits section below.
 
+## The `neg` upper bound, caught in the act (2026-09-05)
+
+The `neg` column has always carried a caveat: it counts a test as passing when
+we report *any* error, so a rejection for the wrong reason counts. On
+2026-09-05 that caveat produced a visible, instructive number.
+
+Supplying `scala.reflect.runtime`'s `TypeTag` (`agent/rtmirror`) took `neg`
+from **656 to 652**. The four tests it "lost" are
+`interop_{abs,}typetags_arenot_class{tags,manifests}`, and all four look like
+this:
+
+```scala
+import scala.reflect.runtime.universe._
+import scala.reflect.{ClassTag, classTag}
+object Test extends App {
+  def typeTagIsnotClassTag[T: TypeTag] = println(classTag[T])  // scalac: No ClassTag available for T
+}
+```
+
+They were passing because the **import** failed. Not because we applied the
+rule the test is about. Supplying `TypeTag` removed the spurious error and left
+the program with nothing to object to — so we now compile it, and scalac still
+rejects it.
+
+The rule is genuinely missing, and it was missing before, which is easy to
+check without any of the reflection material at all:
+
+```scala
+import scala.reflect.{ClassTag, classTag}
+object Test { def f[T]: Unit = println(classTag[T]) }
+```
+
+A binary built before the reflection change accepts this too. So nothing
+regressed; a hole that four tests had been papering over became visible, which
+is what the column is for. **`classTag[T]` / `implicitly[ClassTag[T]]` for an
+abstract `T` with no `ClassTag` in scope must be an error**, and a `TypeTag` in
+scope must not satisfy it. That is a *rejection* rule, and this project's
+history says a new rejection rule breaks more than it fixes — so it wants the
+slick, cats, gitbucket and library measurements in hand, the way the three
+rules in [the section above](#three-checks-we-were-not-performing-2026-09-05-agentaccepttoomuch)
+were done.
+
+The lesson for verification is narrower and sharper: **a change that supplies
+new symbols has to run `neg` in full, not a sample.** A 250-test sample did not
+contain any of these four.
+
 ## What would move the number most
 
 0. **`@specialized`, for real.** With `run` now classified, this is the

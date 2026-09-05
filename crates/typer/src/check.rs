@@ -308,6 +308,10 @@ pub struct Typer {
     /// the pickle for every implicit name the companion declares; doing that
     /// again for the same class can only find what is already installed.
     warmed_scopes: std::collections::HashSet<u32>,
+    /// Classes an argument's type has already been completed from, so that
+    /// [`Typer::complete_arg_classes`] costs one walk each and not one per
+    /// call. See that function for what the walk is for.
+    completed_arg_classes: std::collections::HashSet<u32>,
     /// Set while `type_apply` types the `new C` of a `new C(…)`: that shape
     /// already has an argument list, so the `New` arm must not add one.
     new_is_applied: bool,
@@ -723,6 +727,7 @@ impl Typer {
             lazy_val_presig: std::collections::HashSet::new(),
             parent_fill_done: std::collections::HashSet::new(),
             warmed_scopes: std::collections::HashSet::new(),
+            completed_arg_classes: std::collections::HashSet::new(),
             new_is_applied: false,
             typing_call_args: false,
             typing_callee: false,
@@ -771,6 +776,15 @@ impl Typer {
             implicit_via_module: std::cell::RefCell::new(HashMap::new()),
             implicit_undet_solved: Vec::new(),
         }
+    }
+
+    /// How many errors have been reported since `mark`, a `self.diags.len()`
+    /// taken before a speculative typing.
+    fn error_count_since(&self, mark: usize) -> usize {
+        self.diags[mark..]
+            .iter()
+            .filter(|d| d.level == scala_rs_span::Level::Error)
+            .count()
     }
 
     pub(crate) fn error(&mut self, span: Span, msg: impl Into<String>) {
@@ -12611,6 +12625,34 @@ impl Typer {
                         vec![None; tps.len()]
                     };
                     for (i, tp) in tps.iter().enumerate() {
+                        // nsc's default for a type parameter that stays
+                        // completely unconstrained (no argument mentions it,
+                        // no expected type reaches it) is variance-driven, not
+                        // a flat `Any`: `Infer.solvedTypes` instantiates an
+                        // untouched type variable to the tightest type that is
+                        // always safely widenable later, which is the
+                        // parameter's own lower bound (`Nothing` when
+                        // unbounded) for a covariant or invariant parameter,
+                        // and its upper bound (`Any` when unbounded) for a
+                        // contravariant one. `private final class Vector2[+A]`
+                        // in `scala/collection/immutable/Vector.scala` has a
+                        // `copy` method with no declared return type whose
+                        // body is `new Vector2(prefix1, len1, data2, suffix1,
+                        // length0)` -- none of those value parameters mention
+                        // `A` -- and confirmed against real scalac
+                        // (`-Xprint:typer`), the inferred return type is
+                        // `Vector2[Nothing]`, not `Vector2[Any]`.
+                        // `Vector2[Nothing] <: Vector[B]` for every `B >: A`,
+                        // same as `Inv[Nothing]`/`Contra[Any]` below; `Any`
+                        // there is unsound at every call site that widens the
+                        // result (`override def updated[B >: A](...): Vector[B]`),
+                        // which is exactly the `Vector2[Any] required:
+                        // Vector[B]` shape `docs/scala-library.md` records.
+                        let default_ty = if self.st.get(*tp).flags.contains(Flags::CONTRAVARIANT) {
+                            Type::Any
+                        } else {
+                            Type::Nothing
+                        };
                         inferred_args.push(
                             self.unify_tparam_all(*tp, &unify_params, &arg_tys)
                                 // A lambda argument is still a placeholder
@@ -12623,7 +12665,7 @@ impl Typer {
                                 .filter(|t| !mentions_no_type(t))
                                 .or_else(|| pt_args.get(i).cloned())
                                 .or_else(|| from_base.get(i).cloned().flatten())
-                                .unwrap_or(Type::Any),
+                                .unwrap_or(default_ty),
                         );
                     }
                     tree.ty = Type::Class {
@@ -12809,20 +12851,35 @@ impl Typer {
                     // the expected type does not actually fit -- one whose
                     // implicit clause is still open, say -- is typed again as
                     // if there had been none, and its diagnostics go with it.
+                    //
+                    // But only when dropping the prototype actually *helps*.
+                    // An argument that failed for a reason of its own keeps
+                    // failing without one, and now with none of its parameter
+                    // types known: gitbucket's
+                    // `post(path, form)(writableUsersOnly { (form, repo) => … })`
+                    // has one `not found` inside the lambda, and re-typing it
+                    // with no expected type turned that into a `form: Any`
+                    // and one `value … is not a member of Any` for every field
+                    // the body reads (153 of them across the benchmark).
                     let saved = a.clone();
                     let mark = self.diags.len();
                     self.type_expr(a, &pt_arg);
-                    let complained = self.diags[mark..]
-                        .iter()
-                        .any(|d| d.level == scala_rs_span::Level::Error);
-                    if complained
+                    let with_errs = self.error_count_since(mark);
+                    if with_errs > 0
                         || a.ty.is_error()
                         || a.ty.is_no_type()
                         || !self.st.is_sub_type(&a.ty, &pt_arg)
                     {
-                        self.diags.truncate(mark);
-                        *a = saved;
+                        let with_tree = std::mem::replace(a, saved);
+                        let with_diags: Vec<_> = self.diags.split_off(mark);
                         self.type_expr(a, &Type::NoType);
+                        if self.error_count_since(mark) >= with_errs.max(1) {
+                            // The retry is no better; keep the typing that at
+                            // least knew what the parameters were.
+                            self.diags.truncate(mark);
+                            self.diags.extend(with_diags);
+                            *a = with_tree;
+                        }
                     }
                 }
                 // `take(Array.empty)`: with no expected type the argument keeps
@@ -12861,6 +12918,11 @@ impl Typer {
         }
         let fun_ty = fun.ty.clone();
         self.ensure_apply_supplied(&fun_ty);
+        // Before the alternatives are weighed, not only after they all fail:
+        // a call that *resolves* still has to solve its type parameters from
+        // the arguments' base types, and an argument whose class was never
+        // completed has none.
+        self.complete_arg_classes(&arg_tys);
         let mut chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
         if matches!(chosen, OverloadPick::None) {
             // A *view* can make an argument applicable, but the test for one
@@ -12885,6 +12947,19 @@ impl Typer {
         match chosen {
             OverloadPick::Found(sym, mut param_tys, mut ret) => {
                 let mut sig_param_tys = param_tys.clone();
+                // The callee's own type parameters this call has already
+                // solved -- populated below, once inference has run. A
+                // *self*-recursive call (`def show[A, B](tree: Tree[A, B]):
+                // Tree[A, B] = show(tree.left, ...)`) legitimately solves its
+                // own `A`/`B` to themselves: the argument's type is written in
+                // terms of the very type parameters being solved for, so the
+                // fixed point is the correct answer, not a failure to solve.
+                // Recording *which* type parameters were solved (regardless of
+                // what they solved to) is what tells `open_tparams_of` below
+                // not to re-open them to their bounds just because the
+                // substitution left their own symbol mentioned in the
+                // parameter type -- which an identity solution always does.
+                let mut solved_own_tparams: Vec<SymbolId> = Vec::new();
                 // The overload set was recorded under the symbol the
                 // *selection* left on the callee, which the pick below
                 // overwrites. Keep it: it is the key to the alternatives as
@@ -13017,6 +13092,7 @@ impl Typer {
                         if !inst.is_empty() {
                             let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
                             let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+                            solved_own_tparams = tps.clone();
                             param_tys = param_tys
                                 .iter()
                                 .map(|p| crate::symbol::subst_tparams_slice(&tps, &args_t, p))
@@ -13147,7 +13223,26 @@ impl Typer {
                         }
                     }
                 }
-                let own_tparams = (!sym.is_none()).then(|| self.st.get(sym).tparams.clone());
+                // Excluding `solved_own_tparams`: a type parameter this call's
+                // inference already solved -- even to itself, the fixed point
+                // a self-recursive call's own type parameters land on -- is
+                // not "open" here. Leaving it in made `open_tparams_of` below
+                // see `A`/`B` still mentioned in `Tree[A, B]` (substituting a
+                // solution back onto itself is a no-op) and relax them to
+                // their bounds, so a self-recursive call like RedBlackTree's
+                // `def lookup[A, B](tree: Tree[A, B], x: A): Tree[A, B] = ...
+                // lookup(tree.left, x)` (`scala/collection/immutable/
+                // RedBlackTree.scala`) checked `tree.left: Tree[A, B]` against
+                // an expected `Tree[Any, Any]` and failed.
+                let own_tparams = (!sym.is_none()).then(|| {
+                    self.st
+                        .get(sym)
+                        .tparams
+                        .iter()
+                        .copied()
+                        .filter(|tp| !solved_own_tparams.contains(tp))
+                        .collect::<Vec<_>>()
+                });
                 for (i, a) in args.iter_mut().enumerate() {
                     let mut p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                     // `Using.resource(r)(x => 10)`: A only appears in a later
@@ -17140,6 +17235,7 @@ impl Typer {
                     .collect()
             }
         };
+        let applicable = self.narrow_by_lambda_shape(applicable, arg_tys);
         match applicable.len() {
             0 => OverloadPick::None,
             1 => {
@@ -17912,6 +18008,94 @@ impl Typer {
         ps.iter()
             .map(|p| crate::symbol::subst_tparams_slice(&tps, &his, p))
             .collect()
+    }
+
+    /// The arity nsc's `Infer.shapeType` would give a parameter: how many
+    /// arguments a function literal filling it is written with.
+    ///
+    /// `None` means "no opinion" -- the parameter is not function-shaped, so a
+    /// literal's arity says nothing about it.
+    fn shape_arity(&self, param: &Type) -> Option<usize> {
+        match param {
+            Type::ByName(inner) | Type::Repeated(inner) => self.shape_arity(inner),
+            Type::Function { params, .. } => Some(params.len()),
+            Type::Class { sym, args } => {
+                if let Some(Type::Function { params, .. }) =
+                    self.st.function_class_shape(*sym, args)
+                {
+                    return Some(params.len());
+                }
+                // nsc's shape for a `{ case … }` literal is
+                // `PartialFunction[Any, Nothing]`, i.e. a `Function1`.
+                partial_function_type(&self.st, param).map(|_| 1)
+            }
+            _ => None,
+        }
+    }
+
+    /// nsc's shape-type pass (`Infer.shapeType`, used by
+    /// `inferMethodAlternative` before the arguments are typed): a function
+    /// literal whose parameter *types* are still unknown already has a fixed
+    /// **arity**, and that alone throws out alternatives.
+    ///
+    /// ```scala
+    /// def only(action: Repo => Any): Int
+    /// def only[T](action: (T, Repo) => Any): T => Int
+    /// only { r => r.nm }        // Function1: only the first alternative
+    /// only[T] { (f, r) => … }   // Function2: only the second
+    /// ```
+    ///
+    /// [`Self::arg_score`] deliberately lets an un-inferred literal match a
+    /// function parameter of *any* arity, because a `{ case … }` literal is
+    /// written with one parameter and still inhabits a `(A, B) => C` by
+    /// tupling. So the arity is applied here instead, and only as a filter
+    /// that **narrows an already ambiguous set**: a lone applicable
+    /// alternative is never rejected, and neither is a set the shape has no
+    /// opinion about.
+    fn narrow_by_lambda_shape(
+        &self,
+        applicable: Vec<(SymbolId, Vec<Type>, Type)>,
+        args: &[Type],
+    ) -> Vec<(SymbolId, Vec<Type>, Type)> {
+        if applicable.len() < 2 {
+            return applicable;
+        }
+        // The literal placeholder `type_apply` pushes for an argument it has
+        // not been able to type yet: every parameter and the result unknown.
+        let shapes: Vec<Option<usize>> = args
+            .iter()
+            .map(|a| match a {
+                Type::Function { params, ret }
+                    if ret.is_no_type()
+                        && !params.is_empty()
+                        && params.iter().all(|p| p.is_no_type()) =>
+                {
+                    Some(params.len())
+                }
+                _ => None,
+            })
+            .collect();
+        if shapes.iter().all(|s| s.is_none()) {
+            return applicable;
+        }
+        let kept: Vec<(SymbolId, Vec<Type>, Type)> = applicable
+            .iter()
+            .filter(|(_, ps, _)| {
+                shapes.iter().enumerate().all(|(i, shape)| {
+                    let Some(n) = shape else { return true };
+                    match param_at(ps, i).and_then(|p| self.shape_arity(p)) {
+                        Some(m) => m == *n,
+                        None => true,
+                    }
+                })
+            })
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            applicable
+        } else {
+            kept
+        }
     }
 
     fn is_applicable(
@@ -22443,6 +22627,38 @@ impl Typer {
             }
             self.ensure_java_loaded(c, Span::DUMMY);
             fresh = true;
+        }
+        fresh
+    }
+
+    /// Force the class files behind an argument's type before the call is
+    /// resolved against it.
+    ///
+    /// A `-cp` class the source never *names* has nothing to complete it:
+    /// `ensure_class` leaves a `JAVA`-flagged placeholder for the ordinary
+    /// loader, and the loader only runs where the program mentions the class.
+    /// scalatra-forms' `mapping(...)` returns a `MappingValueType[T]`, which
+    /// gitbucket only ever infers, so the class kept the empty `AnyRef` parent
+    /// list and nothing knew it `implements ValueType[T]` -- the parameter type
+    /// of the `post[T](path, form: ValueType[T])(action: T => Any)` it was
+    /// being passed to. nsc has no such gap: a symbol's info is completed the
+    /// first time anything asks for it, and `isApplicable` asks.
+    ///
+    /// Once per class, and only in library mode, so a call in a loop pays for
+    /// nothing.
+    fn complete_arg_classes(&mut self, tys: &[Type]) -> bool {
+        if !self.library_abi {
+            return false;
+        }
+        let mut fresh = false;
+        for t in tys {
+            let Some(c) = self.st.class_sym_of(t) else {
+                continue;
+            };
+            if c.0 < self.st.prelude_end || !self.completed_arg_classes.insert(c.0) {
+                continue;
+            }
+            fresh |= self.ensure_pickled_parents(t);
         }
         fresh
     }
