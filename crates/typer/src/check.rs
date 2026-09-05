@@ -449,6 +449,16 @@ pub struct Typer {
     /// Packages whose jar package object's pickled `type` aliases have been
     /// installed (see `install_pickled_package_aliases`). One read per package.
     pkg_aliases_done: HashSet<u32>,
+    /// `(package, package-object module class)` pairs `namer_module` folded
+    /// at namer time, as `(pkg, cls)`. The eager fold there only ever sees
+    /// `cls`'s *own* members: `rough_parents`, run within the same namer
+    /// call, cannot yet resolve a parent declared in a file namer has not
+    /// reached, so an inherited member -- `package object data extends
+    /// ScalaVersionSpecificPackage` exporting `NonEmptyLazyList`, a `type`
+    /// declared on the parent, not in the package object's own body -- is
+    /// missing from the eager fold. `typecheck_units_src` redoes this list
+    /// once the header pass has resolved every unit's parents for real.
+    pending_pkg_folds: Vec<(SymbolId, SymbolId)>,
     /// Pickled package-object aliases whose right-hand side could not be
     /// rebuilt, by simple name: the name then reports *why* it is missing
     /// instead of the bare "not found".
@@ -639,6 +649,22 @@ pub fn typecheck_units_src(
         t.language_postfix_ops = saved_lang.1;
         t.language_implicit_conversions = saved_lang.2;
     }
+    // Redo the package-object member fold `namer_module` did eagerly, now
+    // that the header pass above has resolved every unit's parents for
+    // real. `members_including_inherited` reaches a member declared on a
+    // package object's parent class rather than in its own body -- cats'
+    // `package object data extends ScalaVersionSpecificPackage`, which is
+    // where `type NonEmptyLazyList` actually lives -- and that parent may
+    // be declared in a file namer had not reached yet when the eager fold
+    // ran.
+    for (pkg, cls) in std::mem::take(&mut t.pending_pkg_folds) {
+        let mems = t.st.members_including_inherited(cls);
+        for mem in mems {
+            if !t.st.get(pkg).members.contains(&mem) {
+                t.st.get_mut(pkg).members.push(mem);
+            }
+        }
+    }
     // After the header pass: loading `scala.collection.IterableFactory` pulls
     // in the `scala` package object, and doing that before any source has
     // named a `scala.*` type made `install_pickled_package_aliases` run too
@@ -760,6 +786,7 @@ impl Typer {
             pickle: crate::pickle_supply::PickleSupply::new(),
             term_import_prefixes: Vec::new(),
             pkg_aliases_done: HashSet::new(),
+            pending_pkg_folds: Vec::new(),
             pkg_alias_gaps: HashMap::new(),
             pending_sigs: HashMap::new(),
             lazy_completing: Vec::new(),
@@ -1861,12 +1888,23 @@ impl Typer {
         if let TreeKind::ModuleDef { name, mods, .. } = &tree.kind {
             if name == "package" || mods.flags.contains(Flags::PACKAGE) {
                 let pkg = saved_owner;
+                // `cls`'s own members, available immediately. A package
+                // object can also *inherit* an exported name -- `package
+                // object data extends ScalaVersionSpecificPackage` exports
+                // `type NonEmptyLazyList`, declared on the parent, not in the
+                // package object's own body -- but `cls`'s parents are not
+                // reliable yet: `rough_parents`, run earlier in this same
+                // call, cannot resolve a parent declared in a file namer has
+                // not reached. `pending_pkg_folds` redoes this with
+                // `members_including_inherited` once the header pass has
+                // resolved every unit's parents for real.
                 let mems = self.st.get(cls).members.clone();
                 for mem in mems {
                     if !self.st.get(pkg).members.contains(&mem) {
                         self.st.get_mut(pkg).members.push(mem);
                     }
                 }
+                self.pending_pkg_folds.push((pkg, cls));
             }
         }
     }
@@ -8285,37 +8323,78 @@ impl Typer {
     ///
     /// Only the wildcard-import stage is repeated here. The earlier stages
     /// (the enclosing packages, `scala._`, `java.lang._`) offer both
-    /// namespaces at once, so a name they answered is already right.
+    /// namespaces at once, so a name they answered is already right --
+    /// *provided* `expose_unqualified` actually ran its package-member
+    /// search. It bails out as soon as `name` resolves to *anything*
+    /// locally, and a sibling module or class of the same name -- forward-
+    /// entered by the namer before this file's own definitions are typed --
+    /// does exactly that, so the search never runs. That is cats' `Newtype`
+    /// encoding: `object NonEmptyLazyList { type Type[+A] <: … }` and,
+    /// elsewhere, `type NonEmptyLazyList[+A] = NonEmptyLazyList.Type[A]`
+    /// name the same thing in two namespaces, and a bare `NonEmptyLazyList`
+    /// used as a type inside `NonEmptyLazyList`'s own file resolved to the
+    /// *module* -- kind arity 0 -- because the alias, a member of the same
+    /// package folded in from another file's package object, was never
+    /// pulled into scope. So the guard here checks
+    /// [`SymbolTable::has_real_type_entry`], not `lookup_type().is_empty()`:
+    /// the module `lookup_type` offers as a fallback must not look like an
+    /// answer already found.
     fn expose_unqualified_type(&mut self, name: &str) {
-        if name.is_empty() || !self.library_abi || !self.st.lookup_type(name).is_empty() {
+        if name.is_empty() || self.st.has_real_type_entry(name) {
             return;
         }
-        for owner in self.st.wildcard_owners_for(name) {
-            match self
-                .pickle
-                .complete_type_member(&mut self.st, &mut self.binary, owner, name)
-            {
-                Some(Type::TypeMember(id)) => {
+        if self.library_abi {
+            for owner in self.st.wildcard_owners_for(name) {
+                match self
+                    .pickle
+                    .complete_type_member(&mut self.st, &mut self.binary, owner, name)
+                {
+                    Some(Type::TypeMember(id)) => {
+                        self.st.enter_in_current(name, id);
+                        return;
+                    }
+                    // A *nullary* alias has no symbol of its own -- it is its
+                    // right-hand side, and `install_type_alias` deliberately
+                    // hands that back rather than an opaque `TypeMember` that
+                    // would conform to nothing. When the right-hand side is a
+                    // plain class, that class *is* what the imported name means,
+                    // so its symbol is what goes into scope. Without this,
+                    // `import profile.api.*; def f(t: Tag)` left `Tag`
+                    // unresolved: slick's `Aliases` declares `type Tag =
+                    // lifted.Tag`, `type Tag`-shaped nullary aliases are how the
+                    // whole API surface is exported, and a `Named` parameter type
+                    // matched no constructor and no signature
+                    // ("type mismatch; found: Tag required: Tag").
+                    Some(Type::Class { sym, args }) if args.is_empty() && !sym.is_none() => {
+                        self.st.enter_in_current(name, sym);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Not from a jar: a source package member. `lookup_member` already
+        // sees a package object's members through the package (see
+        // `package_object_of`'s "a package object's members are the
+        // package's members"), so no completion is needed here -- only the
+        // scope injection `expose_unqualified` would have done, had it not
+        // stopped short.
+        let from = if !self.st.this_class.is_none() {
+            self.st.this_class
+        } else {
+            self.st.owner
+        };
+        for pkg in self.open_packages(from) {
+            for id in self.st.lookup_member(pkg, name) {
+                if matches!(
+                    self.st.get(id).kind,
+                    SymKind::TypeMember | SymKind::TypeParam | SymKind::Class
+                ) {
                     self.st.enter_in_current(name, id);
-                    return;
                 }
-                // A *nullary* alias has no symbol of its own -- it is its
-                // right-hand side, and `install_type_alias` deliberately
-                // hands that back rather than an opaque `TypeMember` that
-                // would conform to nothing. When the right-hand side is a
-                // plain class, that class *is* what the imported name means,
-                // so its symbol is what goes into scope. Without this,
-                // `import profile.api.*; def f(t: Tag)` left `Tag`
-                // unresolved: slick's `Aliases` declares `type Tag =
-                // lifted.Tag`, `type Tag`-shaped nullary aliases are how the
-                // whole API surface is exported, and a `Named` parameter type
-                // matched no constructor and no signature
-                // ("type mismatch; found: Tag required: Tag").
-                Some(Type::Class { sym, args }) if args.is_empty() && !sym.is_none() => {
-                    self.st.enter_in_current(name, sym);
-                    return;
-                }
-                _ => {}
+            }
+            if self.st.has_real_type_entry(name) {
+                break;
             }
         }
     }
@@ -22250,6 +22329,19 @@ impl Typer {
 
     /// Every member of `owner` called `name` that can carry a type, best
     /// first (see `prefer_class_member`).
+    ///
+    /// A class beats a `type` member beats a module: `new Outer.Inner()`
+    /// wants the class over a companion object of the same name, but a `type`
+    /// alias must still beat that same module when *it* is what shares the
+    /// name -- cats' `Newtype` encoding declares `object Widget` directly in
+    /// a package and, elsewhere, `type Widget[A] = Widget.Type[A]` on the
+    /// package object folded into the same package (`members_including_
+    /// inherited`), so `lookup_member` hands back both under one name, direct
+    /// members first. Without this tier, `p.Widget[Int]` picked the *module*
+    /// -- kind arity 0 -- whenever `lookup_member` happened to return it
+    /// before the alias, which it always does here (the module is a direct
+    /// member; the alias reaches the package only through the deferred
+    /// fold).
     fn type_owner_members(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
         let found = self.st.lookup_member(owner, name);
         let mut out: Vec<SymbolId> = found
@@ -22257,14 +22349,19 @@ impl Typer {
             .copied()
             .filter(|&s| self.st.get(s).kind == SymKind::Class)
             .collect();
+        for s in &found {
+            if matches!(
+                self.st.get(*s).kind,
+                SymKind::TypeMember | SymKind::TypeParam
+            ) && !out.contains(s)
+            {
+                out.push(*s);
+            }
+        }
         for s in found {
             let ok = matches!(
                 self.st.get(s).kind,
-                SymKind::Package
-                    | SymKind::Module
-                    | SymKind::ModuleClass
-                    | SymKind::TypeMember
-                    | SymKind::TypeParam
+                SymKind::Package | SymKind::Module | SymKind::ModuleClass
             );
             if ok && !out.contains(&s) {
                 out.push(s);
@@ -22292,20 +22389,52 @@ impl Typer {
             }
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, t.span);
+                let is_owner_kind = |st: &SymbolTable, id: SymbolId| {
+                    matches!(
+                        st.get(id).kind,
+                        SymKind::Package | SymKind::Class | SymKind::Module | SymKind::ModuleClass
+                    )
+                };
                 let mut found: Vec<SymbolId> = self
                     .st
                     .lookup(name)
                     .into_iter()
-                    .filter(|id| {
-                        matches!(
-                            self.st.get(*id).kind,
-                            SymKind::Package
-                                | SymKind::Class
-                                | SymKind::Module
-                                | SymKind::ModuleClass
-                        )
-                    })
+                    .filter(|&id| is_owner_kind(&self.st, id))
                     .collect();
+                if found.is_empty() {
+                    // `expose_unqualified` bails out as soon as *any* symbol --
+                    // of any namespace -- already answers `name` locally. That
+                    // is right for its usual callers, but a package-level
+                    // definition can forward-reference its own name before its
+                    // own type is known (the namer enters it early so
+                    // recursive definitions resolve), and that self-entry then
+                    // shadows a *different* symbol of the same name declared
+                    // elsewhere in a different namespace. cats' `type
+                    // NonEmptyLazyList[+A] = NonEmptyLazyList.Type[A]` needs
+                    // the *object* `NonEmptyLazyList` while typing the alias
+                    // of the same name, and the alias's own forward-entered
+                    // stub was all `lookup` could see. Fall back to a member
+                    // search of the packages this file opened, restricted to
+                    // the kinds an owner can be.
+                    let name = name.clone();
+                    let span = t.span;
+                    let from = if !self.st.this_class.is_none() {
+                        self.st.this_class
+                    } else {
+                        self.st.owner
+                    };
+                    for pkg in self.open_packages(from) {
+                        self.complete_binary_member(pkg, &name, span);
+                        for id in self.st.lookup_member(pkg, &name) {
+                            if is_owner_kind(&self.st, id) && !found.contains(&id) {
+                                found.push(id);
+                            }
+                        }
+                        if !found.is_empty() {
+                            break;
+                        }
+                    }
+                }
                 found.sort_by_key(|id| self.type_owner_rank(*id));
                 for id in found {
                     let o = self.as_type_owner(id);

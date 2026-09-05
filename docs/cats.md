@@ -711,3 +711,91 @@ Nothing was loosened. `tests/fixtures/co_allops_bad.scala` pins the four shapes
 nsc rejects — a widened upper bound, a parent applied at a different argument, a
 narrowed lower bound, and an alias outside the inherited bound — and we reject
 all four, in the same places nsc does.
+
+## cats' `Newtype` encoding: a module and a `type` alias sharing one name
+
+**91 errors, one file cleared entirely.** `tests/cats_measure.sh
+-Ykind-projector` goes from **907 errors / 108 files** to **816 errors / 107
+files**; nothing else in the log changes.
+
+`object NonEmptyLazyList { type Type[+A] <: Base with Tag }` declares its
+`Type` member directly; a *different* file's package object exports
+`type NonEmptyLazyList[+A] = NonEmptyLazyList.Type[A]`. The object and the
+alias share one spelling in two namespaces — ordinary Scala, not a plugin —
+and three separate bugs came out of resolving it:
+
+1. **`lookup_type` handed back a module and the real type-namespace symbol
+   together, unfiltered.** Its own doc comment already said the module is
+   only a fallback "when nothing in the type namespace carries that name",
+   but the implementation returned the whole scope bucket once *either* kind
+   was present, and the caller picked whichever came first by accident of
+   insertion order. `Newtype[A]` (the alias) and `Newtype` (the module, kind
+   arity 0) coexist in exactly the scope this bug needs, and picking the
+   module is what "`NonEmptyLazyList` does not take type parameters" was —
+   67 of these, all in `NonEmptyLazyList.scala` itself.
+2. **`expose_unqualified`'s guard bailed out too early.** It exists to pull a
+   package's members into scope on demand, but it stops as soon as *any*
+   symbol already answers the name locally — and the namer had already
+   forward-entered the *module* `NonEmptyLazyList` into that same file's own
+   scope (so its own later definitions can refer to it), which satisfied the
+   guard and stopped the alias from ever being looked up. Fixed by giving
+   type-position exposure (`expose_unqualified_type`) its own guard,
+   [`SymbolTable::has_real_type_entry`], that a module fallback cannot
+   satisfy.
+3. **The package-object member fold ran before cross-file parents were
+   resolved.** `namer_module` folds a package object's members into its
+   package as soon as the object's own body is namer'd, eagerly, so that
+   `p.T` reaches a type an earlier file's package object declared. But
+   `package object data extends ScalaVersionSpecificPackage` — the real cats
+   shape, `NonEmptyLazyList`'s actual alias site — doesn't declare the alias
+   in its *own* body; it inherits it from a parent class that may live in a
+   file namer has not reached yet, so `rough_parents` (run in the same namer
+   call) cannot resolve the parent, and the eager fold sees no inherited
+   members at all. Fixed by recording `(package, package-object class)` pairs
+   in `Typer::pending_pkg_folds` and redoing the fold with
+   [`SymbolTable::members_including_inherited`] once the header pass has
+   resolved every unit's parents for real (`typecheck_units_src`, right after
+   the header-pass block).
+
+A fourth, smaller instance of the same "module ranks ahead of the type
+alias" mistake was in `type_owner_members` (used for a *qualified* `p.T`,
+where `p` is a package or object written out — `nel.data.Widget[Int]` in the
+fixture below): a `type` member already beat a same-named module when both
+were declared on the *same* symbol (`new Outer.Inner()`'s class-over-module
+disambiguation), but a `type` alias reaching the owner only through the
+deferred fold above still lost to a module that was a *direct* member,
+because `lookup_member` naturally returns direct members before folded ones
+and nothing reordered them. Given a third tier — class, then `type`
+member/param, then module/package — in that order.
+
+Fixed together: `tests/fixtures/nel_newtype.scala` reduces the three-bug
+shape to one file (`package nel { package data { ... } }` so the object and
+the alias-bearing package object are still declared in different namer
+scopes, dual-run against real scalac 2.13.16 in both the library-ABI and
+private-runtime modes), and `nel_newtype_bad.scala` pins that the fix does
+not loosen arity checking (`Widget[Int, String]` is still rejected, in nsc
+and here).
+
+### What is still missing: `Type::TypeMember` still has no prefix
+
+None of the three fixes above touch **57** further errors (`value
+toSortedSet`/`toSortedMap`/`reduce`/… `is not a member of Newtype.Type[A]`,
+unchanged before and after — 32 of them in `NonEmptySet.scala` and its
+neighbours, the rest in `NonEmptyMapImpl.scala` and `NonEmptyChainImpl.scala`,
+which use the same encoding). These calls reach the newtype through an
+**implicit conversion** (`implicit def catsNonEmptySetOps[A](value:
+NonEmptySet[A]): NonEmptySetOps[A]`), not a direct member, and `object
+NonEmptySetImpl extends Newtype` never narrows `Type` in its own body — it is
+purely inherited from the shared `private[data] trait Newtype { type Type[A]
+<: Base with Tag }`, unlike `NonEmptyLazyList`, which redeclares `type
+Type[+A] <: Base with Tag` directly. Implicit search for a conversion out of
+an abstract type looks at the type's companion scope, and a `Type::TypeMember`
+here carries only the defining symbol (`Newtype`'s own `Type`), never the
+*prefix* (`NonEmptySetImpl.type`) the source actually selected it through —
+so the search looks in `Newtype`'s companion (there is none) instead of
+`NonEmptySetImpl`'s, and reports the type by the trait's name, not the
+object's, exactly like `value toSortedSet is not a member of Newtype.Type[A]`
+prints. This is the same "`Type::TypeMember` has no prefix" gap already
+recorded above for `Representable#compose`, reached by a different path;
+fixing it needs the type carrying a prefix, not another namespace-resolution
+patch, and is deliberately left for a slice that wants to take that on.

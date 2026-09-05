@@ -4082,6 +4082,42 @@ fn co_allops_bad_is_rejected() {
     compile_fails("co_allops_bad", "incompatible type in overriding type T");
 }
 
+// ------------------------------------------------------ cats' Newtype (nel_)
+
+/// cats' `Newtype` encoding names the same thing in two namespaces: `object
+/// NonEmptyLazyList` declares `type Type[+A] <: Base with Tag` directly, and
+/// a *different* file's package object exports `type NonEmptyLazyList[+A] =
+/// NonEmptyLazyList.Type[A]`. Three bugs came out of that:
+///
+/// 1. `lookup_type` returned a module and the real type-namespace symbol
+///    together, unfiltered, and the caller could pick either one first.
+/// 2. `expose_unqualified`'s guard treated "any symbol already answers this
+///    name locally" as "nothing more to look up", so a bare `Widget[A]` used
+///    inside `Widget`'s own file -- where the namer had already forward-
+///    entered the *module* `Widget` -- never reached the sibling alias in the
+///    package's members at all.
+/// 3. `namer_module`'s eager fold of a package object's members into its
+///    package only ever copied the object's *own* direct members: an alias
+///    inherited from a parent class (`package object data extends
+///    ScalaVersionSpecificPackage`, the real cats shape) was invisible from
+///    every other file, because the fold ran before cross-file parents were
+///    resolved.
+///
+/// See docs/cats.md for the cats measurement this came out of.
+#[test]
+fn nel_newtype_fixture() {
+    check("nel_newtype");
+    dual_run_fixture("nel_newtype");
+}
+
+/// The fix must not loosen arity checking: `Widget` still takes exactly one
+/// type parameter, and nsc rejects `Widget[Int, String]` too ("wrong number
+/// of type arguments for nel.data.Widget, should be 1").
+#[test]
+fn nel_newtype_bad_is_rejected() {
+    compile_fails("nel_newtype_bad", "too many type arguments");
+}
+
 // -------------------------------------------- ClassTag for an abstract type
 
 /// A `ClassTag` is built out of the *erasure* of the type it tags, so a type
