@@ -2620,3 +2620,157 @@ Until both exist, `mapTo` stays a refusal that names the reason, and the 31
 gitbucket sites stay as they are. Attempting only the first half would be worse
 than nothing: `mapToImpl` would then run far enough to abort or to build a tree
 from a half-known class.
+
+### 7.19 `val` and `def` definitions bound inside a `reify` body (the `agent/reifydefs` slice)
+
+§7.17 refused every definition inside a `reify { … }` body outright, reasoning from nsc's *free-term*
+machinery: "nsc reifies it with `build.newNestedSymbol` and links every reference to that symbol.
+Building the definition by name instead would compile and run, and would bind whatever name the
+expansion site happens to use." Measured with `-Ymacro-debug-lite`, that reasoning does not apply to a
+`val` or `def` the body binds *for itself*. `reify { val x = 1; x + 1 }` reifies as
+
+```text
+$u.Block.apply(List($u.ValDef.apply($u.NoMods, $u.TermName("x"), $u.TypeTree(), $u.Literal($u.Constant(1)))),
+               $u.Apply.apply($u.Select.apply($u.Ident.apply($u.TermName("x")), $u.TermName("$plus")), List($u.Literal($u.Constant(1)))))
+```
+
+No `newFreeTerm`, no symbol at all: the binding is `$u.ValDef.apply(...)` and the reference is a bare
+`$u.Ident.apply($u.TermName("x"))`, the same structural, by-name shape a quasiquote already builds.
+This holds for a `def`'s own parameters too (`reify { (y: Int) => y + 1 }` reifies `y` the same bare
+way), and for a `def` that calls itself or another `def` in the same block declared *after* it —
+`reify { def isEven(n: Int) = ...isOdd...; def isOdd(n: Int) = ...isEven...; isEven(10) }` compiles and
+reifies both directions by name, because nsc lets a block's `def`s see each other regardless of
+textual order. **`build.newNestedSymbol` is nsc's own bookkeeping for telling a name bound inside the
+tree being reified from one that is free with respect to it — not something that shows up in the tree
+its reifier builds.** The free-term shape is needed only for a local or a parameter bound *outside*
+the `reify` body (§7.17's still-open item 1, `docs/notes/macro-reflect-and-reify.md`'s `useParam`/
+`useLocal`); that refusal is unchanged.
+
+So `Reifier` (`crates/typer/src/reify.rs`) now tracks, in a plain name stack (`Reifier::locals`, pushed
+and popped the same way `Fresh::params` already was for a placeholder lambda parameter), which names
+the reify body itself has bound so far. An `Ident` the existing classification (`Check::reify_refs`)
+did not already resolve to a static module/member/splice/type is checked against that stack before
+being refused: if it is there, it falls through to the same by-name `Ident` construction a quasiquote
+uses; if not, the §7.17 refusal is unchanged. A `Block`'s `val`/`def` names are all pushed before its
+statements are built (`def`s and `val`s alike — this is a superset of nsc's own sequencing, but the
+body has already been fully type-checked once by the time `Reifier` sees it, so a genuinely illegal
+forward reference to a `val` never reaches this code to begin with); a `def`'s own parameter names are
+pushed for the extent of its right-hand side alone. `class` and `object` stay refused: nsc's typer has
+already rewritten an unqualified access to one of their own members into an explicit `C.this.member`
+by the time its reifier runs, and scala-rs walks the *untyped* body, so reproducing that needs real
+member resolution this slice does not attempt.
+
+#### The declared type is a second, separate gap
+
+Building `val x: Int = 1` surfaced a shape not measured before: **a written *value* type is not
+reified the same way a type *argument* is.** `f[Int]` at a call site, or the `T` of `Expr.apply[T]`,
+becomes `mkTypeTree(...)` around a `Type` built the way a `TypeTag` is (`crate::materialize::TagBody`,
+§7.15/7.16) — but `def f(y: Int): Int = ...` reifies `y`'s type as
+
+```text
+$u.internal.reificationSupport.mkIdent($m.staticClass("scala.Int"))
+```
+
+— an `Ident` carrying a resolved *symbol*, exactly the shape a static `object` reference already gets,
+built *structurally* the way a quasiquote builds a type, not embedded as a raw `Type` object. For a
+parameterised type the difference is sharper: `List[Int]` reifies as
+
+```text
+$u.AppliedTypeTree.apply($u.Select.apply(mkIdent($m.staticModule("scala.package")), $u.TypeName("List")),
+                         List(mkIdent($m.staticClass("scala.Int"))))
+```
+
+i.e. the whole type tree is walked structurally and only each *leaf* naming a class or a module member
+is resolved by symbol — the same rule the rest of reification already follows, applied one level down.
+scala-rs has no such structural type reifier (`Reifier::typ`'s ordinary, non-reify branch is what a
+quasiquote uses for exactly this, and reusing it verbatim would reify the leaf by the written name, not
+by symbol). Building one is future work; this slice classifies only the single-leaf case — the whole
+type is one monomorphic class reachable through `staticClass` alone (`Int`, `Boolean`, a plain user
+class) — as a new `ReifyRef::StaticClass`, built with `Reifier::static_class_ref` (`mkIdent` +
+`staticClass`, the same call `static_module_ref` already makes for a static `object`). Anything with
+its own structure (`List[Int]`, a function type, a member of a package-object type alias) is refused by
+name, classified as a `TypeGap` the same way an untaggable type argument already is
+(`tests/fixtures/rd_defs_bad.scala`).
+
+This was caught by a `showRaw` fixture (`tests/fixtures/rd_defs.scala`), not by any corpus number: the
+first version of this slice reused the type-*argument* builder for a value type outright, which
+compiles, runs, and looks plausible (`TypeTree()` instead of `Int`'s `Ident`, or a wrong wrapped `Type`
+for `List[Int]`) — only comparing the printed tree against real scalac 2.13.16 caught it, and it broke
+one already-passing test (`rb_reify_expands_and_runs`, whose `noTag` case needs the type-*argument*
+builder's abstract-type-via-implicit-tag fallback, which the value-type path does not have and must
+not share code with).
+
+#### Validation
+
+* `tests/fixtures/rd_defs.scala` — `showRaw` of six reified trees (an untyped `val`, a typed `val`, a
+  `def` with a typed parameter, a recursive `def`, two mutually recursive `def`s, and a `val` read by a
+  `def`) against the runtime universe. **Matches real scalac 2.13.16 exactly** (`rd_defs_match_real_scalac`).
+* `tests/fixtures/rd_defs_valimpl.scala` + `rd_defs_valuse.scala` — the `val` case really expanded
+  through the JVM bridge in two runs and executed, matching real scalac's own two-stage run. This is
+  the one case that round-trips *end to end*: the engine's reverse wire-format decoder
+  (`crates/typer/src/expand.rs`, the `agent/staged` slice's `agent/staged`, §7.13) already understood
+  `ValDef` before this slice. `DefDef` is not among the shapes it accepts yet — a `def` with parameters,
+  actually invoked as a macro rather than `reify`d and printed, fails at that separate, pre-existing
+  layer with "the expansion contains a `DefDef`, which scala-rs cannot rebuild yet". That is why
+  `rd_defs.scala`'s `showRaw` comparison (which needs no macro invocation at all — `reify` on
+  `scala.reflect.runtime.universe` runs standalone) is what verifies `def`, rather than a round trip.
+* `tests/fixtures/rd_defs_bad.scala` — the two declared-type shapes still refused, both confirmed
+  accepted by real scalac 2.13.16.
+
+Tests are `crates/cli/tests/reifydefs.rs` (its own file, six tests), plus two existing fixtures updated
+because this slice makes a shape they exercised actually work: `tests/fixtures/rf_bad.scala`'s
+`localDef` case (a plain `val` in a reified block) and `tests/fixtures/rb_bad.scala`'s `useBlock` case
+now use a *pattern* `val` instead — one definition shape §7.17 named that is still refused, since a
+pattern `val` is three definitions after parsing and one `SyntacticPatDef` in nsc's own tree, a
+different shape from the plain `val` this slice builds. `crates/cli/tests/rf_reify.rs` and
+`crates/cli/tests/engine.rs` were updated to match.
+
+#### What this is worth, measured
+
+Scoped from the same cluster §7.17 was: the scala/scala corpus's `run` tests whose first diagnostic
+names one of the four shapes this slice targeted (a class definition, a `val` definition, a `def`
+definition, or "`x` is a local, a parameter, or a name that does not survive") — **108 tests**
+(`CORPUS_KINDS=run CORPUS_SIZE=full`, filtered to those names). Before: `pass=0`. After: **`pass=0`**.
+Every test's pass/fail status is identical to before, byte for byte — this is not a rounding error, it
+is the measured, honest result.
+
+The symptoms moved regardless, and by more than §7.17's own widening did:
+
+* **10 of the 108 now compile and run through *both* stages of a real macro invocation**, reaching
+  `java.lang.NoSuchFieldError: MODULE$` at run time rather than a compile-time refusal — real forward
+  progress in the sense that the whole reify-and-splice pipeline executes; the wall is elsewhere (most
+  likely the same "macro `def` compiled in an earlier round has no `macro_impl` in scala-rs's own
+  pickle" gap §7.17 already recorded, though this slice did not chase down which of the 10 hit exactly
+  that one).
+* **7 now report the more precise "a pattern definition (...) is not reified yet"** in place of "a
+  `val` definition is not reified yet" — the same kind of precision gain §7.17's own `neg` note
+  describes, not a refusal being dropped.
+* The rest redistribute among the walls §7.17 already named as unimplemented and out of this slice's
+  scope: a function literal (4), `new` (2), an assignment (2), a type argument with no tag (5, `t6591_*`
+  needs a class nested in a class, `reify_renamed_type_spliceable` an abstract type), an annotated
+  definition (2), and one `not found: extractor Block` (pattern matching on the reflect API, §"Two
+  `neg` tests" / toolbox territory).
+
+**147 of the 163 tests in the wider cluster §7.17 measured need a toolbox at run time** (`.eval` or
+`currentMirror.mkToolBox`), which no amount of reify work reaches; that finding is unchanged by this
+slice and is repeated here only so the next slice does not have to re-derive it.
+
+`tests/scala_corpus.sh`'s full `neg` corpus (1405 tests) is unchanged at `pass=659`, matching
+`tests/BASELINE.md` exactly — this slice supplies no new symbol and accepts no program it did not
+before. `cargo test --workspace --release` and the full `run` corpus are reported in the commit /
+coordinator hand-off rather than here.
+
+#### What remains
+
+1. **A structural type reifier for a written value type** (`List[Int]`, a function type, a tuple, a
+   member of a package-object type alias) — the second gap this slice found and did not attempt beyond
+   the single-leaf case. Likely close to `Reifier::typ`'s existing quasiquote-mode structure, with the
+   leaf classification this slice's `Check::classify_value_type` already does for the base case.
+2. **A `class` / `object` definition inside a reify body** — needs real member resolution (an
+   unqualified access to the class's own member has to become `C.this.member`, which nsc's ordinary
+   typer does for free and scala-rs's untyped walk does not).
+3. **`DefDef` (and presumably `ClassDef`/`ModuleDef`) in the engine's reverse wire-format decoder**
+   (`crates/typer/src/expand.rs`) — a separate, pre-existing gap from `reify` itself (§7.13's
+   `agent/staged` slice added `ValDef` there; nothing has added `DefDef` since), needed before a `def`
+   with parameters can round-trip through an actual macro invocation the way `val` now does.
+4. Free terms for a local or a parameter bound *outside* the reify body — unchanged from §7.17.

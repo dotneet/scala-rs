@@ -978,9 +978,10 @@ fn rb_reify_gaps_are_named() {
         "`x` is a local, a parameter, or a name that does not stand for a static `object`",
         "`n` is a local, a parameter, or a name that does not stand for a static `object`",
         "a type ascription is not reified yet",
-        // A block is reified since §7.17; what `useBlock` is refused for is
-        // the `val` it binds, which needs nsc's nested symbols.
-        "a `val` definition is not reified yet",
+        // A block, and an ordinary `val` bound inside one, are reified since
+        // §7.17 and the `agent/reifydefs` slice; what `useBlock` is refused
+        // for is the *pattern* `val` it binds, a different tree in nsc.
+        "a pattern definition (`val (a, b) = ...`) is not reified yet",
         "a type argument cannot be rebuilt: `T`, an abstract type with no tag in scope",
     ] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");

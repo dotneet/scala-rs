@@ -16,9 +16,12 @@ object Main {
   //    slice builds for an imported member.
   val enclosing = reify { member }
 
-  // 2. A `val` definition inside a block. nsc reifies the bound symbol with
-  //    `build.newNestedSymbol` and links every reference to it.
-  val localDef = reify { val x = 1; x }
+  // 2. A pattern `val` definition inside a block. The parser turns
+  //    `val (a, b) = e` into three definitions, and nsc keeps it as one
+  //    `SyntacticPatDef` -- a different tree, and one this module does not
+  //    build (an ordinary `val x = e` inside a block *is* reified now; see
+  //    the `agent/reifydefs` slice).
+  val localDef = reify { val (a, b) = (1, 2); a + b }
 
   // 3. A `scala.math` package-object function. nsc resolves it through
   //    `staticModule("scala.math.package")`; scala-rs models these members on

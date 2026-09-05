@@ -27,11 +27,13 @@ object RbBad {
     reify { (3: Int) }
   }
 
-  /** A block that binds a name of its own. The block itself is reified
-    * since §7.17; the `val` in it still needs nsc's nested symbols. */
+  /** A block that binds a pattern `val` of its own. An ordinary `val` inside
+    * a block is reified since the `agent/reifydefs` slice; a pattern `val`
+    * -- three definitions after parsing, one `SyntacticPatDef` in nsc's own
+    * tree -- still is not. */
   def useBlock(c: Context): c.Expr[Int] = {
     import c.universe._
-    reify { { val k = 1; k } }
+    reify { { val (k, j) = (1, 2); k + j } }
   }
 
   /** A type argument with no tag in scope: there is nothing to rebuild `T`
