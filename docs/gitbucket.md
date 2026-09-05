@@ -876,6 +876,29 @@ Every `no matching overload for (Rep[P2])(OptionMapper2[…])Rep[R]` in gitbucke
 is gone. It is worth 15 there, which is small; the shape it unblocks is not,
 since it is how every slick comparison is written.
 
+### What roots 18 and 19 were measured against
+
+On the merged tree (`main` at `69c5ba7`), one binary each. The "before" column
+is `main` at `dc6fdc9`, measured on a detached checkout of that commit rather
+than by reverting anything in place.
+
+| check | before | after |
+|---|---|---|
+| `tests/gitbucket_measure.sh` | `errors=1193 files_with_errors=184` | **`errors=1736 files_with_errors=185`** |
+| `tests/slick_measure.sh` | `errors=0 classes=1596` | identical |
+| `tests/cats_measure.sh` | `errors=907 files_with_errors=108` | identical |
+| `tests/scalalib_measure.sh` | `errors=1644 files_with_errors=171` | identical |
+| `tests/slick_run.sh` | — | `progs=12 ok=12 fail=0`, 36/36 attempts |
+| `tests/scala_corpus.sh` (full) | pos 983 / neg 653 / run 491 | identical, test for test |
+| `cargo test --workspace --release` | — | green |
+
+`neg` was run in full rather than sampled, because this change supplies new
+symbols (every macro def in every jar on the classpath) and a 250-test sample
+would not see a test that turned from rejected to accepted.
+
+`tests/slick_subset.sh` was not run: nothing under `crates/backend/` changed in
+this slice, and `slick_run.sh` is the check that executes code.
+
 ### The crash: `lub` had no depth cap
 
 `JGitUtil.scala` **aborted the compiler with a stack overflow and no
