@@ -11,7 +11,7 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `f8a7df9` |
+| commit | `236de45` |
 |---|---|
 | updated | 2026-09-05 |
 
@@ -44,7 +44,7 @@ is, and both invalidate everything downstream.
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release` | **168 binaries, 2107 passed, 0 failed** |
+| `cargo test --workspace --release` | **178 binaries, 2107 passed, 0 failed** |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 ## What is deliberately red
