@@ -163,6 +163,22 @@ struct Fresh {
 pub(crate) enum ReifyRef {
     /// A static `object`: `rs.mkIdent($m.staticModule("<full name>"))`.
     StaticModule(String),
+    /// A term member of a static `object`, named without its owner:
+    /// `println`, or a name an `import RfHelper._` brought into scope.
+    ///
+    /// nsc reifies it as the selection its typer had already made explicit
+    /// (`-Xprint:typer` on `reify { println("a") }` gives exactly this):
+    ///
+    /// ```text
+    /// $u.Select($u.internal.reificationSupport.mkIdent(
+    ///              $m.staticModule("scala.Predef")),
+    ///           $u.TermName("println"))
+    /// ```
+    ///
+    /// The owner is resolved through the mirror and the member is named on
+    /// it, so this is still "by symbol": the expansion cannot pick up a
+    /// different `println` from whatever is in scope where it lands.
+    StaticMember { owner: String, name: String },
     /// `x.splice`: the argument's own tree, rebased into the mirror the
     /// creator was handed -- `x.in[$u.type]($m).tree`. Carries the `x`.
     Splice(Box<Tree>),
@@ -260,6 +276,12 @@ impl<'a> Reifier<'a> {
     pub(crate) fn in_reify(mut self, ctx: ReifyCtx) -> Self {
         self.reify = Some(ctx);
         self
+    }
+
+    /// Whether this is lowering a `reify { … }` body rather than a
+    /// quasiquote; the two differ exactly by how much hygiene is owed.
+    pub(super) fn in_reify_mode(&self) -> bool {
+        self.reify.is_some()
     }
 
     /// Lower a quasiquote body, in the block of fresh-name bindings it needs.
@@ -458,12 +480,10 @@ impl<'a> Reifier<'a> {
         };
         if let Some(r) = ctx.refs.get(&t.id) {
             return Ok(Some(match r {
-                ReifyRef::StaticModule(name) => self.call(
-                    self.support_member("mkIdent"),
-                    vec![self.call(
-                        self.select(self.local(&ctx.mirror_local), "staticModule"),
-                        vec![self.lit(Lit::String(name.clone()))],
-                    )],
+                ReifyRef::StaticModule(name) => self.static_module_ref(ctx, name),
+                ReifyRef::StaticMember { owner, name } => self.call(
+                    self.support_member("SyntacticSelectTerm"),
+                    vec![self.static_module_ref(ctx, owner), self.term_name(name)],
                 ),
                 ReifyRef::Splice(e) => self.splice_tree(ctx, e),
                 ReifyRef::Type(body) => self.call(
@@ -482,13 +502,26 @@ impl<'a> Reifier<'a> {
             | TreeKind::Select { .. }
             | TreeKind::Apply { .. }
             | TreeKind::TypeApply { .. }
+            | TreeKind::Block { .. }
             | TreeKind::If { .. } => Ok(None),
             TreeKind::Ident { name } => Err(format!(
                 "`{name}` is a local, a parameter, or a name that does not stand for \
-                 a static `object`"
+                 a static `object` or a member of one"
             )),
             other => Err(format!("{} is not reified yet", describe(other))),
         }
+    }
+
+    /// `rs.mkIdent($m.staticModule("<full name>"))` -- a static `object`
+    /// resolved through the mirror the creator was handed.
+    fn static_module_ref(&self, ctx: &ReifyCtx, full_name: &str) -> Tree {
+        self.call(
+            self.support_member("mkIdent"),
+            vec![self.call(
+                self.select(self.local(&ctx.mirror_local), "staticModule"),
+                vec![self.lit(Lit::String(full_name.to_string()))],
+            )],
+        )
     }
 
     /// One type, rebuilt inside the creator; see `ReifyRef::Type`.

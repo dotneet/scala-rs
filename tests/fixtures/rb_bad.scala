@@ -27,7 +27,8 @@ object RbBad {
     reify { (3: Int) }
   }
 
-  /** A block, whose statements would bind names of their own. */
+  /** A block that binds a name of its own. The block itself is reified
+    * since §7.17; the `val` in it still needs nsc's nested symbols. */
   def useBlock(c: Context): c.Expr[Int] = {
     import c.universe._
     reify { { val k = 1; k } }
