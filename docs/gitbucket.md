@@ -748,6 +748,14 @@ at the *callers*. Its four errors are root 4's wildcard self type and an
 `tests/slick_subset.sh` was not run: nothing under `crates/backend/` changed,
 and `slick_run.sh` is the check that executes code.
 
+The whole battery was then run again after `git merge main` brought in
+`agent/monadtrans` (`main` at `6f49948`). Everything above holds on the merged
+tree; the two numbers that move are that slice's, not this one's --
+`tests/cats_measure.sh` `664/101` (exactly what it reported) and
+`tests/scalalib_measure.sh` `1651/171`. gitbucket stays at **1276/185**,
+slick at `errors=0 classes=1490`, the corpus at pos 1048 / neg 659, and
+`cargo test --workspace --release` is green with 2117 passed.
+
 ### 18. A macro def in a jar's pickle was not read at all — 238 errors (pickle)
 
 The survey's "next biggest", and the count was right this time. It is also the
