@@ -14,7 +14,46 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::read::{pflags, read_pickle, Constant, Entry, Idx, Pickle, ReadError};
+use crate::read::{pflags, read_pickle, Constant, Entry, Idx, Pickle, ReadError, Tree};
+
+/// The full name of the annotation nsc bakes a macro def's implementation
+/// reference into.
+const MACRO_IMPL_ANNOT: &str = "scala.reflect.macros.internal.macroImpl";
+
+/// Where a macro def's implementation lives, recovered from the pickled
+/// `@macroImpl` annotation (`docs/macros.md` §1.1 and §5).
+///
+/// A macro def emits no bytecode at all, so this annotation is the *only*
+/// record of the implementation in a published jar. nsc writes it as a typed
+/// tree whose arguments are `name = value` assignments; the four fields below
+/// are the ones an expander needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MacroImpl {
+    /// `slick.lifted.TableQueryMacroImpl$` -- the *module class*, dotted.
+    pub class_name: String,
+    /// `apply`.
+    pub method_name: String,
+    /// A "macro bundle" (`class B(val c: Context)`) rather than an object.
+    pub is_bundle: bool,
+    /// `false` for a whitebox macro.
+    pub is_blackbox: bool,
+    /// nsc's fingerprint per implementation parameter, clause by clause.
+    /// A non-negative value is a `WeakTypeTag` for the macro def's type
+    /// parameter at that position; the negatives are
+    /// [`fingerprint::UNDETERMINED`], [`fingerprint::LIFTED_TYPED`]
+    /// (`c.Expr[T]`) and [`fingerprint::LIFTED_UNTYPED`] (`c.Tree`).
+    pub signature: Vec<Vec<i32>>,
+}
+
+/// nsc's `Fingerprint` constants (`scala.tools.nsc.typechecker.Macros`).
+pub mod fingerprint {
+    /// An ordinary value parameter -- including the leading `Context`.
+    pub const UNDETERMINED: i32 = -1;
+    /// `c.Expr[T]`.
+    pub const LIFTED_TYPED: i32 = -2;
+    /// `c.Tree`.
+    pub const LIFTED_UNTYPED: i32 = -3;
+}
 
 /// A type recovered from a pickle, with all entry references resolved.
 #[derive(Clone, Debug, PartialEq)]
@@ -112,6 +151,8 @@ pub struct Member {
     /// Raw pickled flags; see [`pflags`].
     pub flags: u64,
     pub ty: SigType,
+    /// Set for a `MACRO` def whose `@macroImpl` annotation could be read.
+    pub macro_impl: Option<MacroImpl>,
 }
 
 impl Member {
@@ -268,12 +309,131 @@ impl Builder<'_> {
         }
         let name = self.p.name(info.name)?.to_string();
         let ty = self.ty(info.info, 0);
+        let macro_impl = if info.has(pflags::MACRO) {
+            self.macro_impl_of(id)
+        } else {
+            None
+        };
         Some(Member {
             name,
             kind,
             flags: info.flags,
             ty,
+            macro_impl,
         })
+    }
+
+    /// Decode the `@macroImpl` annotation attached to the symbol at `id`.
+    ///
+    /// nsc pickles it as a `SYMANNOT` whose single argument is the *typed
+    /// tree* `macro(name = value, ...)[T]`; the values are string, boolean and
+    /// `List(List(Int))` literals. Nothing here is guessed: a shape that does
+    /// not match returns `None`, and the caller then declines the macro def
+    /// exactly as it did before this was read at all.
+    fn macro_impl_of(&self, id: Idx) -> Option<MacroImpl> {
+        let annot = self.p.entries.iter().find_map(|e| match e {
+            Entry::SymAnnot { sym, annot } if *sym == id => Some(annot),
+            _ => None,
+        })?;
+        if self.p.sym_full_name(annot.tpe).as_deref() != Some(MACRO_IMPL_ANNOT) {
+            // `AnnotInfo::tpe` points at the annotation *type*; a `TypeRefTpe`
+            // has to be followed to its symbol first.
+            match self.p.entry(annot.tpe) {
+                Some(Entry::TypeRefTpe { sym, .. })
+                    if self.p.sym_full_name(*sym).as_deref() == Some(MACRO_IMPL_ANNOT) => {}
+                _ => return None,
+            }
+        }
+        let mut args = self.tree_at(*annot.args.first()?)?;
+        // `macro(...)[T]`: peel the type application nsc wraps it in.
+        while let Tree::TypeApply { fun, .. } = args {
+            args = self.tree_at(*fun)?;
+        }
+        let Tree::Apply { args: fields, .. } = args else {
+            return None;
+        };
+        let mut class_name = None;
+        let mut method_name = None;
+        let mut is_bundle = false;
+        let mut is_blackbox = true;
+        let mut signature = Vec::new();
+        for &f in fields {
+            let Some(Tree::Assign { lhs, rhs }) = self.tree_at(f) else {
+                continue;
+            };
+            let Some(Constant::Str(n)) = self.constant_at(*lhs) else {
+                continue;
+            };
+            match self.p.name(n)? {
+                "className" => match self.constant_at(*rhs) {
+                    Some(Constant::Str(v)) => class_name = Some(self.p.name(v)?.to_string()),
+                    _ => return None,
+                },
+                "methodName" => match self.constant_at(*rhs) {
+                    Some(Constant::Str(v)) => method_name = Some(self.p.name(v)?.to_string()),
+                    _ => return None,
+                },
+                "isBundle" => match self.constant_at(*rhs) {
+                    Some(Constant::Boolean(b)) => is_bundle = b,
+                    _ => return None,
+                },
+                "isBlackbox" => match self.constant_at(*rhs) {
+                    Some(Constant::Boolean(b)) => is_blackbox = b,
+                    _ => return None,
+                },
+                "signature" => signature = self.int_list_list(*rhs)?,
+                _ => {}
+            }
+        }
+        Some(MacroImpl {
+            class_name: class_name?,
+            method_name: method_name?,
+            is_bundle,
+            is_blackbox,
+            signature,
+        })
+    }
+
+    /// `List(List(-1), List(0))` as nsc writes it: nested `Apply`s of the
+    /// `List` factory whose leaves are `Int` literals.
+    fn int_list_list(&self, id: Idx) -> Option<Vec<Vec<i32>>> {
+        let Some(Tree::Apply { args, .. }) = self.tree_at(id) else {
+            return None;
+        };
+        let mut out = Vec::new();
+        for &clause in args {
+            let Some(Tree::Apply { args: inner, .. }) = self.tree_at(clause) else {
+                return None;
+            };
+            let mut row = Vec::new();
+            for &p in inner {
+                match self.constant_at(p) {
+                    Some(Constant::Int(v)) => row.push(v),
+                    _ => return None,
+                }
+            }
+            out.push(row);
+        }
+        Some(out)
+    }
+
+    /// The tree an entry holds, if it is a `TREE` entry.
+    fn tree_at(&self, id: Idx) -> Option<&Tree> {
+        match self.p.entry(id) {
+            Some(Entry::Tree { tree, .. }) => Some(tree),
+            _ => None,
+        }
+    }
+
+    /// The constant behind `Literal(c)`.
+    fn constant_at(&self, id: Idx) -> Option<Constant> {
+        let Some(Tree::Literal(c)) = self.tree_at(id) else {
+            return None;
+        };
+        match self.p.entry(*c) {
+            Some(Entry::Literal(k)) => Some(k.clone()),
+            _ => None,
+        }
     }
 
     fn tparam(&mut self, id: Idx) -> TParam {

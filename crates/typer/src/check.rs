@@ -6690,7 +6690,10 @@ impl Typer {
         // nsc expands a macro application in the typer, at the outermost
         // `Apply`/`TypeApply`, and typechecks what comes back at the call
         // site. Before `adapt`, so what is adapted to `pt` is the expansion.
-        if !callee && self.has_macro_defs {
+        // `has_macro_defs` is set by a macro def this run *compiles*;
+        // `supplied_macro_def` by one read from a jar's pickle, which is how
+        // slick's `TableQuery.apply[E]` reaches a program that only calls it.
+        if !callee && (self.has_macro_defs || self.pickle.supplied_macro_def) {
             self.expand_macro_application(tree);
         }
         self.adapt_implicit_apply(tree, pt);
@@ -7386,12 +7389,39 @@ impl Typer {
                         // "ambiguous overload for apply".
                         self.adopt_cp_module_class(cls);
                         self.supply_from_pickle_class(cls, "apply");
-                        let candidates: Vec<SymbolId> = self
+                        let mut candidates: Vec<SymbolId> = self
                             .st
                             .lookup_member(cls, "apply")
                             .into_iter()
                             .filter(|id| self.st.get(*id).tparams.len() == targs.len())
                             .collect();
+                        // Several `apply`s of the same type-parameter count.
+                        // Explicit type arguments cannot separate them, so
+                        // the position does: SLS 6.26.3 keeps only the
+                        // alternatives that *take no parameters* when an
+                        // overloaded reference is read in value position, and
+                        // only the ones that take some when it is the callee
+                        // of an `Apply`. slick's `object TableQuery` is the
+                        // case -- `def apply[E](cons: Tag => E)` next to the
+                        // macro `def apply[E]: TableQuery[E]` -- so
+                        // `TableQuery[Issues]` means the second and
+                        // `TableQuery[Issues](tag => new Issues(tag))` the
+                        // first. Applied only as a tie-break: if it does not
+                        // leave exactly one, the redirect gives up as before.
+                        if candidates.len() > 1 {
+                            for &c in &candidates {
+                                self.complete_lazy_sig(c, tree.span);
+                            }
+                            let want_params = matches!(pt, Type::Method { .. });
+                            let narrowed: Vec<SymbolId> = candidates
+                                .iter()
+                                .copied()
+                                .filter(|&c| self.st.takes_value_params(c) == want_params)
+                                .collect();
+                            if narrowed.len() == 1 {
+                                candidates = narrowed;
+                            }
+                        }
                         if let [only] = candidates[..] {
                             sym = only;
                             // The redirect reaches a symbol nothing has

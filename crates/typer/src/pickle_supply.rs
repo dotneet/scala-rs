@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use scala_rs_parser::{Flags, SymbolId, Type};
 use scala_rs_pickle::read::pflags;
-use scala_rs_pickle::sym::{MemberKind, SigCache, SigType};
+use scala_rs_pickle::sym::{MacroImpl as PickledMacroImpl, MemberKind, SigCache, SigType};
 use scala_rs_pickle::ClassSource;
 
 use crate::javaclass::{parse_java_classfile, BinaryIndex, JavaClass};
@@ -126,6 +126,11 @@ pub struct PickleSupply {
     /// Pickled `val`s whose singleton type is being widened right now, so
     /// `val x: y.type; val y: x.type` cannot spiral.
     widening: HashSet<String>,
+    /// Set once a macro def has been supplied from a jar's pickle. The typer
+    /// copies it into `Check::has_macro_defs`, which is the gate on walking
+    /// every typed application looking for something to expand; a run that
+    /// defines no macro and calls none must not pay for that walk.
+    pub supplied_macro_def: bool,
 }
 
 /// One `type T[...] = U` recovered from a package object's pickle.
@@ -1298,9 +1303,20 @@ impl PickleSupply {
             // module knows a real, honest binding for; anything else falls
             // through and is declined exactly as before.
             if m.kind == MemberKind::Def && m.has(pflags::MACRO) {
-                if let Some(id) =
-                    self.install_known_macro(st, bin, class_sym, &internal, name, &m.ty)
-                {
+                let id = match &m.macro_impl {
+                    Some(mi) => self.install_pickled_macro(
+                        st,
+                        bin,
+                        class_sym,
+                        &internal,
+                        name,
+                        &m.ty,
+                        mi,
+                        &class_scope,
+                    ),
+                    None => self.install_known_macro(st, bin, class_sym, &internal, name, &m.ty),
+                };
+                if let Some(id) = id {
                     if !installed.contains(&id) {
                         installed.push(id);
                     }
@@ -1373,10 +1389,10 @@ impl PickleSupply {
     /// how `hits` found it at all), but its *implementation* is looked up a
     /// different way: nsc reads a pickled `@scala.reflect.macros.internal
     /// .macroImpl(...)` annotation naming the class/method to call
-    /// (`docs/macros.md` §1.1). Annotations are not decoded by this reader at
-    /// all -- only member declarations and their types are -- so that path is
-    /// not available here in general, and building it would not help this
-    /// case regardless: `scala.reflect.runtime.currentMirror` is one of nsc's
+    /// (`docs/macros.md` §1.1). [`PickleSupply::install_pickled_macro`] reads
+    /// that annotation and is the general path; this one is for the macros
+    /// that do not have a usable one. `scala.reflect.runtime.currentMirror`
+    /// is the case: it is one of nsc's
     /// **fast-track** macros (`scala.tools.reflect.FastTrack`), which the
     /// compiler recognises by the macro symbol's *full name* and never
     /// consults the pickled annotation for -- the annotation actually present
@@ -1462,6 +1478,180 @@ impl PickleSupply {
             "{internal}#{name}: supplied as a known macro binding ({impl_class}.{impl_method})"
         ));
         Some(id)
+    }
+
+    /// Supply a macro def a jar's pickle declares, with the implementation
+    /// reference nsc baked into its `@macroImpl` annotation.
+    ///
+    /// This is the general form of [`PickleSupply::install_known_macro`], and
+    /// the reason gitbucket could not call slick: `lazy val Issues =
+    /// TableQuery[Issues]` is `TableQuery.apply[Issues]`, and the alternative
+    /// it means -- `def apply[E]: TableQuery[E] = macro …` -- is a macro def,
+    /// so nothing supplied it at all. The other alternative,
+    /// `apply[E](cons: Tag => E)`, was then the only member of that name, the
+    /// reference resolved to *it*, and every query method was looked for on
+    /// the un-applied method type `((Tag) => Issues)TableQuery[Issues]`.
+    ///
+    /// Nothing is invented. The declared type is this pickle's own, and
+    /// [`MacroBinding`] is read out of the annotation nsc wrote:
+    /// `className` / `methodName` name the implementation, and `signature`
+    /// records the fingerprint of each of its parameters, from which the two
+    /// facts the expander needs -- which arguments are `c.Expr`, and how many
+    /// `WeakTypeTag`s the trailing clause takes -- follow directly. The
+    /// implementation itself is never read here: whether it can actually be
+    /// run is decided at the call site by the JVM bridge
+    /// (`crates/typer/src/expand.rs`), which reports its own diagnostic
+    /// through [`crate::check::Typer::report_macro_calls`] when it cannot.
+    /// A macro that cannot be expanded is therefore an error, never a
+    /// silently accepted call.
+    ///
+    /// Two shapes are declined outright, matching what the source-level path
+    /// (`crates/typer/src/macros.rs`) refuses:
+    ///
+    /// * a **whitebox** macro, whose expansion may refine the declared result
+    ///   type -- accepting the declaration would mean typing the call site
+    ///   against a type nsc does not use;
+    /// * a **macro bundle** (`class B(val c: Context)`), which the expander
+    ///   cannot instantiate.
+    #[allow(clippy::too_many_arguments)]
+    fn install_pickled_macro(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        internal: &str,
+        name: &str,
+        ty: &SigType,
+        mi: &PickledMacroImpl,
+        class_scope: &HashMap<String, Type>,
+    ) -> Option<SymbolId> {
+        if !mi.is_blackbox {
+            trace(format_args!(
+                "{internal}#{name}: whitebox macros are not implemented"
+            ));
+            return None;
+        }
+        if mi.is_bundle {
+            trace(format_args!(
+                "{internal}#{name}: macro bundles are not implemented"
+            ));
+            return None;
+        }
+        let Some((tag_params, expr_args)) = macro_signature_shape(&mi.signature) else {
+            trace(format_args!(
+                "{internal}#{name}: the pickled macro signature {:?} is not a shape \
+                 this expander knows",
+                mi.signature
+            ));
+            return None;
+        };
+        let shape = read_shape(ty)?;
+        if shape.arity() != expr_args.len() {
+            trace(format_args!(
+                "{internal}#{name}: the macro def takes {} argument(s) and the \
+                 implementation {} -- declining rather than guessing",
+                shape.arity(),
+                expr_args.len()
+            ));
+            return None;
+        }
+        // Allocated ownerless so that a conversion failure leaves nothing
+        // behind, the way `install` does it.
+        let m = st.alloc(name, SymbolId::NONE, SymKind::Method, Flags::EMPTY, "");
+        let mut scope = class_scope.clone();
+        let mut tparams = Vec::new();
+        for tp in &shape.tparams {
+            let id = st.alloc(&tp.name, m, SymKind::TypeParam, Flags::EMPTY, "");
+            st.get_mut(id).ty = Type::TypeParam(id);
+            set_tparam_arity(st, id, tp.arity);
+            scope.insert(tp.name.clone(), Type::TypeParam(id));
+            tparams.push(id);
+        }
+        for (tp, id) in shape.tparams.iter().zip(tparams.iter().copied()) {
+            if let Some(hi) = &tp.hi {
+                if let Some(t) = self.conv(st, bin, &scope, hi) {
+                    st.get_mut(id).bound_hi = Some(t);
+                }
+            }
+            if let Some(lo) = &tp.lo {
+                if !matches!(lo, SigType::Ref { sym, .. } if sym == "scala.Nothing") {
+                    if let Some(t) = self.conv(st, bin, &scope, lo) {
+                        st.get_mut(id).bound_lo = Some(t);
+                    }
+                }
+            }
+        }
+        let mut paramss_ty: Vec<Vec<Type>> = Vec::new();
+        let mut paramss_sym: Vec<Vec<SymbolId>> = Vec::new();
+        for clause in &shape.clauses {
+            let mut tys = Vec::new();
+            let mut syms = Vec::new();
+            for p in &clause.params {
+                let Some(mut t) = self.conv(st, bin, &scope, &p.ty) else {
+                    trace(format_args!(
+                        "{internal}#{name}: parameter {} has an unmappable type {:?}",
+                        p.name, p.ty
+                    ));
+                    return None;
+                };
+                if p.by_name && !matches!(t, Type::ByName(_)) {
+                    t = Type::ByName(Box::new(t));
+                }
+                let flags = if clause.implicit {
+                    Flags::PARAM.with(Flags::IMPLICIT)
+                } else {
+                    Flags::PARAM
+                };
+                let ps = st.alloc(&p.name, m, SymKind::Term, flags, "");
+                st.get_mut(ps).ty = t.clone();
+                tys.push(t);
+                syms.push(ps);
+            }
+            paramss_ty.push(tys);
+            paramss_sym.push(syms);
+        }
+        let Some(ret) = self.conv(st, bin, &scope, &shape.ret) else {
+            trace(format_args!(
+                "{internal}#{name}: unmappable result type {:?}",
+                shape.ret
+            ));
+            return None;
+        };
+        // The same macro reached through two parents is one member, not an
+        // overload of itself; and a second run of the same completion must
+        // not install a second copy beside the first.
+        let origin = format!("{}.{}", mi.class_name, mi.method_name);
+        if let Some(&existing) = st.get(class_sym).members.iter().find(|&&s| {
+            let e = st.get(s);
+            e.name == name && e.macro_impl.as_ref().is_some_and(|b| b.origin() == origin)
+        }) {
+            return Some(existing);
+        }
+        st.get_mut(m).tparams = tparams;
+        st.get_mut(m).params = paramss_sym.iter().flatten().copied().collect();
+        st.get_mut(m).paramss = paramss_sym;
+        st.get_mut(m).ty = Type::Method {
+            paramss: paramss_ty,
+            ret: Box::new(ret),
+        };
+        if shape.implicit {
+            let f = st.get(m).flags.with(Flags::IMPLICIT);
+            st.get_mut(m).flags = f;
+        }
+        st.get_mut(m).macro_impl = Some(MacroBinding {
+            impl_class: mi.class_name.clone(),
+            impl_method: mi.method_name.clone(),
+            blackbox: true,
+            tag_params,
+            expr_args,
+        });
+        st.get_mut(m).owner = class_sym;
+        st.get_mut(class_sym).members.push(m);
+        self.supplied_macro_def = true;
+        trace(format_args!(
+            "{internal}#{name}: supplied as a pickled macro def ({origin})"
+        ));
+        Some(m)
     }
 
     /// Supply a nested `object` a pickle declares, as a **module accessor**.
@@ -2747,6 +2937,42 @@ impl Shape {
     fn arity(&self) -> usize {
         self.clauses.iter().map(|c| c.params.len()).sum()
     }
+}
+
+/// Read nsc's pickled macro `signature` into the two facts the expander needs.
+///
+/// The signature is one fingerprint per *implementation* parameter, clause by
+/// clause. The first clause is the implementation's `(c: Context)` and is not
+/// an argument of the macro application; the trailing `WeakTypeTag`s are not
+/// either. What is left lines up one for one with the call site's arguments,
+/// and `LIFTED_TYPED` marks the ones the implementation takes as `c.Expr[T]`
+/// rather than as a bare `c.Tree` -- the same distinction
+/// `Typer::macro_impl_expr_args` reads off a source-level implementation's
+/// parameter types.
+///
+/// Returns `(tag_params, expr_args)`, or `None` for a signature this reading
+/// does not cover: no `Context` clause at all, or a tag in the middle of the
+/// value parameters, where "drop the trailing tags" would be a guess.
+fn macro_signature_shape(signature: &[Vec<i32>]) -> Option<(usize, Vec<bool>)> {
+    use scala_rs_pickle::sym::fingerprint;
+    let (context, rest) = signature.split_first()?;
+    // nsc's first clause is exactly `(c: Context)`.
+    if context.len() != 1 || context[0] != fingerprint::UNDETERMINED {
+        return None;
+    }
+    let flat: Vec<i32> = rest.iter().flatten().copied().collect();
+    let tag_params = flat.iter().rev().take_while(|&&f| f >= 0).count();
+    let values = &flat[..flat.len() - tag_params];
+    if values.iter().any(|&f| f >= 0) {
+        return None;
+    }
+    Some((
+        tag_params,
+        values
+            .iter()
+            .map(|&f| f == fingerprint::LIFTED_TYPED)
+            .collect(),
+    ))
 }
 
 /// Peel `POLYtpe` / `METHODtpe` layers into type parameters and parameter
