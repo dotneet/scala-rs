@@ -2367,7 +2367,60 @@ fn checkcast_erased_method_receiver(asm: &mut Assembler, ctx: &EmitCtx, fun: &Tr
     if jn.is_empty() || jn == "java/lang/Object" || jn.starts_with('[') {
         return;
     }
+    // The receiver is already on the stack, and the assembler models what the
+    // verifier will see there -- the same model the StackMapTable is written
+    // from. When the verifier will accept the `invoke*` on that value as it
+    // stands, this cast is three wasted bytes and nsc emits none: `this.m()`
+    // inside `C` is `aload_0; invokevirtual C.m`, four bytes to our seven.
+    //
+    // That is not only noise. `scala/test/files/run/t10594` came out 43%
+    // larger than nsc's, and since `Method too large` became a diagnostic
+    // rather than a silently truncated class, the difference decides whether a
+    // method nsc accepts is rejected here. The 64 KB ceiling of JVMS 4.7.3 was
+    // landing at about 57% of the source size nsc reaches.
+    //
+    // A `checkcast` never takes part in method resolution -- the `Methodref`
+    // does, and `Symbol::declaring_class` above has already put the right
+    // class in it -- so dropping one is safe exactly when the verifier does
+    // not need it.
+    if let Some(top) = asm.top_object() {
+        if verifier_accepts_receiver(ctx.st, top, &jn) {
+            return;
+        }
+    }
     asm.checkcast(&jn);
+}
+
+/// Whether JVMS 4.10.1.9 will accept an `invoke*` whose `Methodref` names
+/// `to` on a receiver the assembler tracks as JVM class `from`.
+///
+/// Two things have to hold, and the second is not a detail.
+///
+/// `from` has to reach `to` in the symbol table at all, which is what
+/// `jvm_assignable` answers -- `false` for either name it cannot resolve, so
+/// an unknown class keeps its cast. A redundant `checkcast` is a no-op; a
+/// missing one is a `VerifyError`.
+///
+/// And when `to` is a *class*, `from` has to be one too. The symbol table's
+/// base type sequence is the **Scala** hierarchy, and a Scala trait may extend
+/// a class -- a hop the bytecode cannot make, because the trait compiles to an
+/// interface. `scala.reflect.api.JavaUniverse` is the standing example
+/// (`Symbol::declaring_class` documents it from the other side): the pickle
+/// says it extends the abstract class `Universe`, and its class file declares
+/// `interfaces: 0` and no superclass but `Object`. Trusting the Scala answer
+/// there dropped the cast in front of `Universe.TypeTag` and nine `run` tests
+/// of the scala/scala corpus died with `VerifyError: Bad type on operand
+/// stack -- Type 'scala/reflect/api/JavaUniverse' is not assignable to
+/// 'scala/reflect/api/Universe'`.
+///
+/// The converse hop needs no guard: JVMS 4.10.1.2 makes *every* reference
+/// assignable to an interface type, so an interface `to` is accepted whatever
+/// is on the stack, and only the `Methodref` decides what gets called.
+fn verifier_accepts_receiver(st: &SymbolTable, from: &str, to: &str) -> bool {
+    if !jvm_assignable(st, from, to) {
+        return false;
+    }
+    is_interface_jvm(st, to) || !is_interface_jvm(st, from)
 }
 
 fn is_module_class(st: &SymbolTable, id: SymbolId) -> bool {
