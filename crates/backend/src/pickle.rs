@@ -1576,6 +1576,13 @@ impl<'a> Pickler<'a> {
                 self.pickle_type(&parent)
             }
             Type::Refined { parents, decls } => self.pickle_refined(parents, decls),
+            // Both fell through to the `Any` below, so a `def foo: Nothing`
+            // read back through runtime reflection was `def foo: Any` --
+            // `scala.reflect.runtime` reads this pickle, not the class file's
+            // erased descriptor, which was `scala/runtime/Nothing$` all along.
+            // `type_ref_named` already knows both names.
+            Type::Nothing => self.type_ref_named("Nothing"),
+            Type::Null => self.type_ref_named("Null"),
             _ => self.type_ref_named("Any"),
         }
     }

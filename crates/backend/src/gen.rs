@@ -2430,10 +2430,38 @@ fn checkcast_refined_receiver(
 /// `invokevirtual` / `invokeinterface` against a more specific owner
 /// (`new Breaks` captured into `breakable { b.break() }`).
 fn checkcast_erased_method_receiver(asm: &mut Assembler, ctx: &EmitCtx, fun: &Tree) {
-    if fun.sym.is_none() {
+    if fun.sym.is_none() || fun_is_super(fun) {
         return;
     }
-    let s = ctx.st.get(fun.sym);
+    checkcast_method_receiver_sym(asm, ctx, fun.sym, false);
+}
+
+/// The same, for a receiver already on the stack under a call this function's
+/// caller has decided is not a `super` one. Split out so the paren-less
+/// `Select` path can take the step too: a receiver whose erased type does not
+/// reach the method's declaring class is a `VerifyError` whether or not the
+/// call has an argument list. `type TypeName >: Null <: TypeNameApi with
+/// Name` erases to `TypeNameApi`, and `toTermName` is declared by `NameApi`
+/// (which the second half of the bound leads to), so slick's
+/// `ShapedValue.mapToImpl` -- `rSym.name.toTermName` -- threw the whole method
+/// out. See `Check::members_through_compound_bound`.
+/// `require_known` is what the paren-less caller passes: it emits a cast only
+/// when the assembler can see what is on the stack *and* the verifier will
+/// reject it. The `Apply` path knows the receiver is there and casts even when
+/// the model has lost track; the `Select` path is also reached while emitting
+/// synthetic forwarders, where the top of the stack is an argument (a `Query
+/// .take(I)` forwarder had an `int` there) and casting it is a `VerifyError`
+/// of its own making.
+fn checkcast_method_receiver_sym(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    id: SymbolId,
+    require_known: bool,
+) {
+    if require_known && asm.top_object().is_none() {
+        return;
+    }
+    let s = ctx.st.get(id);
     if s.kind != SymKind::Method || s.flags.contains(Flags::STATIC) {
         return;
     }
@@ -2444,9 +2472,6 @@ fn checkcast_erased_method_receiver(asm: &mut Assembler, ctx: &EmitCtx, fun: &Tr
         return;
     }
     if ctx.st.is_value_class(s.owner) {
-        return;
-    }
-    if fun_is_super(fun) {
         return;
     }
     // The call names the declaring class when the owner's own class file does
@@ -10543,8 +10568,19 @@ fn gen_select(
                         // scala/reflect/api/Universe.Expr()` and the verifier
                         // threw the whole method out.
                         let dc = s.declaring_class.clone();
-                        if !dc.is_empty() && !matches!(qual.kind, TreeKind::Super { .. }) {
-                            asm.checkcast(&dc);
+                        if !matches!(qual.kind, TreeKind::Super { .. }) {
+                            if dc.is_empty() {
+                                // The receiver's *own* erased class may not
+                                // reach the owner either, with no
+                                // `declaring_class` to say so: `type TypeName
+                                // >: Null <: TypeNameApi with Name` erases to
+                                // the first parent, and `toTermName` is
+                                // `NameApi`'s. Stack-aware, so it costs three
+                                // bytes only where the verifier needs them.
+                                checkcast_method_receiver_sym(asm, ctx, tree.sym, true);
+                            } else {
+                                asm.checkcast(&dc);
+                            }
                         }
                     }
                     // Paren-less call to an `ArrayOps` member with no

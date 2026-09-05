@@ -126,6 +126,13 @@ pub struct PickleSupply {
     /// Pickled `val`s whose singleton type is being widened right now, so
     /// `val x: y.type; val y: x.type` cannot spiral.
     widening: HashSet<String>,
+    /// While set, [`PickleSupply::self_type_member`] resolves a bare type name
+    /// the way the class that *declares* the member sees it, ignoring a
+    /// concrete alias a more derived class in the linearisation gives the same
+    /// name. That is the vocabulary the JVM descriptor was erased in, and the
+    /// only thing this is used for is recovering that descriptor -- see the
+    /// declaration-site retry in [`PickleSupply::install`].
+    decl_site_erasure: bool,
     /// Set once a macro def has been supplied from a jar's pickle. The typer
     /// copies it into `Check::has_macro_defs`, which is the gate on walking
     /// every typed application looking for something to expand; a run that
@@ -1269,6 +1276,31 @@ impl PickleSupply {
                 .collect(),
         });
 
+        // What the *classfile reader* left behind for a `$default$n` getter,
+        // so the pickled signature can replace it rather than stand next to
+        // it. `adopt_binary_class` does exactly this for every ordinary member
+        // name, but it skips any name containing a `$` -- so a default getter,
+        // which is only ever reached through this function's `synthetic_ok`
+        // path, kept both copies. `ToolBox.typecheck$default$2` was then the
+        // crude `(): Object` from the class file *and* the pickled `():
+        // TypecheckMode`, and filling in the default at `tb.typecheck(t)` was
+        // "ambiguous overload for typecheck$default$2 with arguments ()".
+        let stale: Vec<SymbolId> = if synthetic_ok && is_default_getter(&jvm_member) {
+            st.get(class_sym)
+                .members
+                .iter()
+                .copied()
+                .filter(|&m| {
+                    let s = st.get(m);
+                    s.kind == SymKind::Method
+                        && s.name == name
+                        && s.pickled_origin.is_empty()
+                        && m.0 >= st.prelude_end
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut installed: Vec<SymbolId> = Vec::new();
         let mut seen_shapes: HashSet<String> = HashSet::new();
         // The arities of the overloads taking a function parameter already in.
@@ -1375,6 +1407,13 @@ impl PickleSupply {
             }
         }
         self.self_ty = saved_self;
+        if !installed.is_empty() && !stale.is_empty() {
+            st.get_mut(class_sym).members.retain(|m| !stale.contains(m));
+            trace(format_args!(
+                "{full}#{name}: replaced {} class-file default getter(s)",
+                stale.len()
+            ));
+        }
         trace(format_args!(
             "{full}#{name}: supplied {} overload(s)",
             installed.len()
@@ -1474,6 +1513,13 @@ impl PickleSupply {
             expr_args: Vec::new(),
         });
         st.get_mut(class_sym).members.push(id);
+        // Same as `install_pickled_macro`: this is the gate on the typer
+        // walking applications looking for something to expand at all
+        // (`Check::type_expr`). Without it a run whose only macro is this one
+        // never attempted an expansion, so every `currentMirror` was reported
+        // as "cannot expand" with no reason attached -- because nothing had
+        // tried.
+        self.supplied_macro_def = true;
         trace(format_args!(
             "{internal}#{name}: supplied as a known macro binding ({impl_class}.{impl_method})"
         ));
@@ -1904,6 +1950,52 @@ impl PickleSupply {
         trace(format_args!("wrote out {}#apply", Self::EXPR_MODULE));
     }
 
+    /// The erased parameter descriptors the *declaring* class wrote, for a
+    /// member whose signature the receiver sees through a more derived alias.
+    ///
+    /// The parameters are converted a second time with
+    /// [`PickleSupply::decl_site_erasure`] set, which makes a bare type name
+    /// resolve to the abstract member the declaration was written against
+    /// rather than to whatever concrete alias a subclass gives that name. The
+    /// result is thrown away except for its erasure -- nothing is installed
+    /// from it and no symbol it allocates is attached to a class -- so it is
+    /// only ever the answer to "which method in the class file is this".
+    ///
+    /// `None` when some parameter does not convert at all, which is the same
+    /// as the caller already having failed.
+    fn decl_site_want(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        shape: &Shape,
+    ) -> Option<Vec<Option<String>>> {
+        let was = std::mem::replace(&mut self.decl_site_erasure, true);
+        let mut want = Vec::new();
+        let mut ok = true;
+        for clause in &shape.clauses {
+            for p in &clause.params {
+                match self.conv(st, bin, scope, &p.ty) {
+                    Some(mut t) => {
+                        if p.by_name && !matches!(t, Type::ByName(_)) {
+                            t = Type::ByName(Box::new(t));
+                        }
+                        want.push(erased_param_desc(st, &t));
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                break;
+            }
+        }
+        self.decl_site_erasure = was;
+        ok.then_some(want)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn install(
         &mut self,
@@ -2184,7 +2276,35 @@ impl PickleSupply {
         // descriptor is not supplied, so it must not shadow the next one
         // either (`TreeMap.collect(pf)` erases to two class-file methods and
         // would otherwise have taken `collect(pf)(Ordering)`'s place).
-        let Some(found) = self.erased_desc(bin, internal, jvm_member, &want) else {
+        let found = match self.erased_desc(bin, internal, jvm_member, &want) {
+            Some(found) => Some(found),
+            // The signature and the descriptor are erased in *different*
+            // vocabularies when a more derived class in the linearisation
+            // makes an abstract type member concrete. `Mirrors.RuntimeMirror`
+            // declares `def classSymbol(rtcls: RuntimeClass): ClassSymbol`
+            // against `type RuntimeClass >: Null <: AnyRef`, so its class file
+            // says `classSymbol(Ljava/lang/Object;)`; a `JavaUniverse`'s
+            // mirror sees the same member with `type RuntimeClass =
+            // java.lang.Class[_]`, which is the type a caller must satisfy and
+            // erases to `Ljava/lang/Class;`. Wanting the caller's erasure
+            // found no method at all and the member was dropped, so
+            // `runtimeMirror(cl).classSymbol(classOf[A])` was "no matching
+            // overload for (Mirrors.RuntimeClass)Symbols.ClassSymbol".
+            //
+            // So: keep the *caller's* view as the member's type, and go back
+            // to the declaration's view only to find the bytes to call. Paid
+            // for only where the first search already failed, and skipped
+            // outright when the two views agree -- which they do for every
+            // member whose signature names no such alias.
+            None => {
+                let want_decl = self.decl_site_want(st, bin, &scope, shape);
+                match want_decl {
+                    Some(w) if w != want => self.erased_desc(bin, internal, jvm_member, &w),
+                    _ => None,
+                }
+            }
+        };
+        let Some(found) = found else {
             trace(format_args!(
                 "{internal}#{name}/{}: no unambiguous erased descriptor (want {want:?})",
                 shape.arity()
@@ -3842,6 +3962,32 @@ impl PickleSupply {
             };
             for step in lin {
                 let qualified = format!("{}.{name}", step.class_name);
+                // A *more derived* class in the linearisation may define the
+                // same name as a concrete alias, and that definition is the
+                // one the member's signature means. `scala.reflect.api
+                // .Mirrors` declares `type RuntimeClass >: Null <: AnyRef`
+                // and `scala.reflect.api.JavaUniverse` -- which comes first
+                // here -- refines it to `type RuntimeClass = java.lang
+                // .Class[_]`. Looking only for the abstract declaration
+                // walked past the alias and installed the opaque one, so
+                // `runtimeMirror(cl).classSymbol(classOf[A])` was "no
+                // matching overload for (Mirrors.RuntimeClass)Symbols
+                // .ClassSymbol with arguments (Class[A])" -- the parameter
+                // type of a method whose classfile really takes a `Class`.
+                // The linearisation is most-derived-first, so asking each
+                // step for an alias before an abstract member is nsc's own
+                // rule (a concrete definition overrides a deferred one).
+                if !self.decl_site_erasure {
+                    let outer = self.self_ty.take();
+                    let alias = self.expand_alias(st, bin, &HashMap::new(), &qualified, &[], d);
+                    self.self_ty = outer;
+                    if let Some(t) = alias {
+                        trace(format_args!(
+                            "{qualified}: concrete alias for a type member"
+                        ));
+                        return Some(t);
+                    }
+                }
                 if let Some(t) = self.abstract_type_member(st, bin, &qualified, d) {
                     return Some(t);
                 }

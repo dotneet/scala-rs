@@ -275,6 +275,25 @@ impl Typer {
     /// application, which is where nsc expands. Doing nothing is always safe:
     /// `report_macro_calls` sweeps the typed tree afterwards and turns every
     /// macro application still standing into an error.
+    /// `Macros.foo _`: nsc's "macros cannot be eta-expanded".
+    ///
+    /// A macro def has no bytecode, so there is nothing for a method value to
+    /// point at; nsc rejects the form outright rather than expanding the macro
+    /// once and wrapping the expansion in a function. Reported here rather
+    /// than left to [`Typer::report_macro_calls`], which would say "macro
+    /// expansion is not implemented" -- true of nothing, since the expansion
+    /// is not the problem.
+    pub(crate) fn reject_macro_eta(&mut self, tree: &mut Tree) {
+        if self.sigs_only || self.macro_symbol_of(tree).is_none() {
+            return;
+        }
+        self.error(tree.span, "macros cannot be eta-expanded");
+        tree.ty = Type::Error;
+        // Cleared so the sweep does not report the same node a second time
+        // with a reason that does not apply.
+        tree.sym = SymbolId::NONE;
+    }
+
     pub(crate) fn expand_macro_application(&mut self, tree: &mut Tree) {
         if self.sigs_only {
             return;
@@ -284,7 +303,20 @@ impl Typer {
         };
         // Not applied yet: the inner `Apply` of a curried macro still has a
         // method type, and so does a macro def named but not called.
-        if matches!(tree.ty, Type::Method { .. })
+        //
+        // A *parameterless* macro def -- `def currentMirror: universe.Mirror
+        // = macro ???` -- is the exception: it has no parameter clause to
+        // supply, so the bare identifier already is the application, and its
+        // type stays a `Method` with an empty `paramss` (`def f()`, which does
+        // have a clause, is `[[]]` and is excluded here as before). Treating
+        // it like a macro merely named left it unexpanded, and every use of
+        // `scala.reflect.runtime.currentMirror` reported "cannot expand" with
+        // no reason attached, because nothing had tried.
+        let unapplied_clauses = match &tree.ty {
+            Type::Method { paramss, .. } => !paramss.is_empty(),
+            _ => false,
+        };
+        if unapplied_clauses
             || tree.ty.is_error()
             || tree.ty.is_no_type()
             || matches!(tree.ty, Type::Overload(_))
@@ -353,6 +385,13 @@ impl Typer {
 
     /// Run the implementation and rebuild what it returned.
     fn macro_expansion(&mut self, tree: &Tree, binding: &MacroBinding) -> Result<Tree, String> {
+        // A macro nsc expands from its own `FastTrack` table rather than by
+        // running an implementation (`crates/typer/src/fasttrack_mirror.rs`).
+        // There is no bytecode to invoke for one, so this comes before the
+        // request is even built.
+        if let Some(built) = self.fasttrack_expansion(binding, tree.span) {
+            return built;
+        }
         let (argss, targs, prefix) = peel_application(tree);
         let request = self.expansion_request(binding, &argss, &targs, prefix.as_ref(), tree)?;
         if let Some(why) = &self.macro_engine_error {

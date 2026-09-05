@@ -668,6 +668,19 @@ fn check_pair(
         return Some(format!("cannot override final member:\n{decl}"));
     }
 
+    // 5a. A macro def may only be redefined by another macro def. nsc's rule:
+    //     the base has no bytecode, so the override would be the only
+    //     implementation of a member every call site expands away instead of
+    //     calling -- the dynamic dispatch the `override` asks for cannot
+    //     happen. Only the direction the base's macro-ness makes certain is
+    //     checked here; `macro_impl` is set from the source `= macro Impl.m`
+    //     and from a pickled `@macroImpl`, never guessed.
+    if st.get(base).macro_impl.is_some() && st.get(child).macro_impl.is_none() {
+        return Some(format!(
+            "macro can only be overridden by another macro:\nmacro {decl}"
+        ));
+    }
+
     // 6. Visibility may only widen. Checked *before* the missing `override`
     //    modifier: scalac reports `private[this] def f` over a public concrete
     //    `f` as a visibility error, not as a missing modifier.

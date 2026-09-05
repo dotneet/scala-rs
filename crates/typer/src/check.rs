@@ -6599,6 +6599,63 @@ impl Typer {
                     }
                 }
             }
+            // A member of a *value*'s class that only the `ScalaSignature`
+            // knows: `import c.{prefix => prefix}` on a
+            // `scala.reflect.macros.blackbox.Context`. `import_prefix` already
+            // resolved `c` to its class and recorded it as this import's term
+            // prefix, but nothing here had ever asked the pickle, so the
+            // selector reported `value prefix is not a member of
+            // scala.reflect.macros.blackbox.Context` for a member the
+            // classfile really declares -- while the *same* member written out
+            // as `c.prefix` resolved, because `type_select` does ask
+            // (`supply_from_pickle`). The two namespaces disagreeing about the
+            // same class is the bug; this is the term half, and the `type`
+            // half below already ran unconditionally for the same reason.
+            //
+            // Targeted and memoised per `(class, name)`, and gated the same
+            // way `supply_from_pickle` is: a class whose pickle
+            // `complete_named` declines to read is left exactly as it was.
+            if found.is_empty() && self.library_abi {
+                found = self
+                    .pickle
+                    .complete(&mut self.st, &mut self.binary, owner, from);
+            }
+            // One selector can name two different things, and a package's own
+            // *class* of that name hid the *term* its package object declares.
+            // `import scala.tools.reflect.ToolBox` names both the trait
+            // `ToolBox` and, in `scala.tools.reflect.package`, the implicit
+            // conversion `def ToolBox(m: ru.Mirror): ToolBoxFactory[ru.type]`
+            // -- which is the whole point of that import, since `mirror
+            // .mkToolBox()` is a call on what the conversion returns. The
+            // trait alone satisfied the loop above, so nothing looked in the
+            // package object and `cm.mkToolBox()` was "value mkToolBox is not
+            // a member of JavaUniverse.Mirror".
+            //
+            // Only a `found` with no term in it at all reaches this, so an
+            // import that already named a value or an object is untouched.
+            if !found.is_empty()
+                && !found.iter().any(|&m| {
+                    matches!(
+                        self.st.get(m).kind,
+                        SymKind::Term | SymKind::Method | SymKind::Module | SymKind::ModuleClass
+                    )
+                })
+            {
+                if let Some(po) = self.package_object_of(owner, span) {
+                    self.complete_binary_member(po, from, span);
+                    let mut extra = self.st.lookup_member(po, from);
+                    if extra.is_empty() && self.library_abi {
+                        extra = self
+                            .pickle
+                            .complete(&mut self.st, &mut self.binary, po, from);
+                    }
+                    for m in extra {
+                        if !found.contains(&m) {
+                            found.push(m);
+                        }
+                    }
+                }
+            }
             for m in found {
                 self.st.enter_in_current(to, m);
                 entered = true;
@@ -6812,7 +6869,17 @@ impl Typer {
         // `supplied_macro_def` by one read from a jar's pickle, which is how
         // slick's `TableQuery.apply[E]` reaches a program that only calls it.
         if !callee && (self.has_macro_defs || self.pickle.supplied_macro_def) {
-            self.expand_macro_application(tree);
+            // A `Type::Method` expectation here means the *method value* is
+            // wanted, not its result: `Macros.foo _`, which `type_eta` types
+            // with exactly that expectation. nsc rejects it -- "macros cannot
+            // be eta-expanded" -- because there is nothing to take a reference
+            // to: a macro def has no bytecode. The other places that pass a
+            // method expectation set `callee` or throw their diagnostics away.
+            if matches!(pt, Type::Method { .. }) {
+                self.reject_macro_eta(tree);
+            } else {
+                self.expand_macro_application(tree);
+            }
         }
         self.adapt_implicit_apply(tree, pt);
         if !pt.is_no_type() && !tree.ty.is_no_type() && !tree.ty.is_error() {
@@ -10575,6 +10642,11 @@ impl Typer {
             found = self.supply_from_pickle(&recv_ty, &name);
         } else {
             self.supply_receiver_override(&recv_ty, &name, &mut found);
+        }
+        // An abstract type member whose upper bound is a *compound* offers
+        // every parent's members, and only the first one had been reachable.
+        if found.is_empty() {
+            found = self.members_through_compound_bound(&recv_ty, &name);
         }
         // The same name in both namespaces, term side missing. The reflect API
         // writes `type Modifiers >: Null <: ModifiersApi` next to
@@ -23776,6 +23848,54 @@ impl Typer {
                 self.ensure_java_loaded(s, span);
             }
         }
+    }
+
+    /// `name` on any parent of a receiver whose upper bound is a **compound**.
+    ///
+    /// `SymbolTable::class_sym_of` answers with one symbol, and for a
+    /// `Type::Refined` it takes the first parent that is a class -- so a
+    /// member declared by the *second* half of a bound is unreachable.
+    /// `scala.reflect.api.Names` declares
+    ///
+    /// ```text
+    /// type TypeName >: Null <: TypeNameApi with Name
+    /// ```
+    ///
+    /// where `trait TypeNameApi` is empty (it exists only to give `TypeName`
+    /// an erased identity) and everything a name can do -- `toTermName`,
+    /// `decodedName`, `isTermName` -- comes from `Name`, through `NameApi`.
+    /// `symbolOf[R].name.toTermName`, which is how slick's `mapToImpl` gets
+    /// at a case class's companion, was "value toTermName is not a member of
+    /// Names.TypeName".
+    ///
+    /// Runs only after the ordinary search and the pickle have both found
+    /// nothing, so it can add members and never replace one.
+    fn members_through_compound_bound(&mut self, recv_ty: &Type, name: &str) -> Vec<SymbolId> {
+        let id = match recv_ty {
+            Type::TypeMember(id) | Type::TypeParam(id) => *id,
+            _ => return Vec::new(),
+        };
+        let Some(Type::Refined { parents, .. }) = self.st.get(id).bound_hi.clone() else {
+            return Vec::new();
+        };
+        let mut out: Vec<SymbolId> = Vec::new();
+        for p in &parents {
+            if let Some(o) = self.st.class_sym_of(p) {
+                for m in self.st.lookup_member(o, name) {
+                    if !out.contains(&m) {
+                        out.push(m);
+                    }
+                }
+            }
+            if out.is_empty() {
+                for m in self.supply_from_pickle(p, name) {
+                    if !out.contains(&m) {
+                        out.push(m);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Install `name` on the receiver's class from the library `ScalaSignature`
