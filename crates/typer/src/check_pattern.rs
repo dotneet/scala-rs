@@ -203,6 +203,24 @@ impl Typer {
                     .find(|s| matches!(self.st.get(*s).kind, SymKind::Term | SymKind::Module))
                     .or_else(|| found.first().copied());
                 if let Some(sym) = stable.filter(|_| !is_varid) {
+                    // SLS 8.1.5: the identifier of a stable-id pattern has to
+                    // be *stable*. A `var` is not, and nsc rejects it rather
+                    // than comparing against whatever the variable holds when
+                    // the match runs (`neg/t3816`). Only reachable through a
+                    // backquoted lowercase name or an uppercase one; an
+                    // ordinary lowercase name is a fresh binding and never
+                    // gets here.
+                    if self.st.get(sym).flags.contains(Flags::MUTABLE) {
+                        let shown = if stable_hint {
+                            format!("`{name}`")
+                        } else {
+                            name.clone()
+                        };
+                        self.error(
+                            pat.span,
+                            format!("stable identifier required, but {shown} found"),
+                        );
+                    }
                     pat.sym = sym;
                     pat.ty = self.st.get(sym).ty.clone();
                     // A `val` read back from a classfile is a nullary *method*
