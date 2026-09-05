@@ -18,6 +18,9 @@ pub const ACC_BRIDGE: u16 = 0x0040;
 /// Field flag (same bit as [`ACC_BRIDGE`] on methods).
 pub const ACC_VOLATILE: u16 = 0x0040;
 pub const ACC_TRANSIENT: u16 = 0x0080;
+/// The same bit as `ACC_TRANSIENT`, but on a *method*: its last parameter is
+/// a Java varargs array (`@scala.annotation.varargs`).
+pub const ACC_VARARGS: u16 = 0x0080;
 pub const ACC_SYNTHETIC: u16 = 0x1000;
 
 pub struct EmittedClass {

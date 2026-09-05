@@ -3438,11 +3438,16 @@ impl Typer {
                 if Some(m) == alias {
                     continue;
                 }
-                // A `private[this]` member is not inherited at all: a bare
+                // A `private` member is not inherited at all (SLS 5.2): a bare
                 // constructor parameter is one, so `class B(st: Int) extends
                 // A(…)` where `A` also takes an `st` sees only its own.
-                let f = self.st.get(m).flags;
-                if f.contains(Flags::PRIVATE) && f.contains(Flags::LOCAL) {
+                // Plain `private` counts too -- `trait A { private val x = 1 }`
+                // mixed in beside `trait B { val x = 2 }` used to answer `x`
+                // with A's, purely because the traversal reached A first
+                // (`run/t7475b`). A qualified `private[C]` stays visible: the
+                // qualifier can name a package that encloses the subclass.
+                let s = self.st.get(m);
+                if s.flags.contains(Flags::PRIVATE) && s.private_within.is_none() {
                     continue;
                 }
                 self.st.enter_in_current(&n, m);
@@ -19608,6 +19613,19 @@ impl Typer {
                 if let Some(sym) = stable.filter(|_| !is_varid) {
                     pat.sym = sym;
                     pat.ty = self.st.get(sym).ty.clone();
+                    // A `val` read back from a classfile is a nullary *method*
+                    // (its accessor), so its type is `Type::Method`. Left that
+                    // way, `uncurry`'s `eta_if_method` eta-expands the pattern
+                    // into `() => …`, which `gen_pattern` does not recognise
+                    // and therefore compiles to no test at all: `import
+                    // Int.MaxValue; 5 match { case MaxValue => … }` took the
+                    // first case. Reduce it to the result type here -- a
+                    // stable id pattern is the value, never the function.
+                    if let Type::Method { paramss, ret } = &pat.ty {
+                        if paramss.iter().all(|c| c.is_empty()) {
+                            pat.ty = (**ret).clone();
+                        }
+                    }
                     // Tell the backend this is a comparison and not a binding:
                     // a resolved `val` and a fresh pattern variable are both
                     // `SymKind::Term`, so the symbol alone cannot say.
