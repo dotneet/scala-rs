@@ -241,10 +241,11 @@ struct Gen<'a> {
     /// nested class emitted mid-flight records its own watermark, so it
     /// drains only what it queued (see [`Gen::drain_lambdas`]).
     lambda_bodies: RefCell<Vec<PendingBody>>,
-    /// Concrete trait methods, for `$class` static impls and mixin forwarders.
+    /// Concrete trait methods, for the interface's `default` bodies and the
+    /// mixin forwarders each implementing class carries.
     traits: Rc<TraitImpls>,
-    /// Trait `val` definitions with a right-hand side (`T$class.$init$`).
-    /// What `T$class.$init$` actually runs: the entries of `trait_vals`
+    /// Trait `val` definitions with a right-hand side (`<Iface>.$init$`).
+    /// What `<Iface>.$init$` actually runs: the entries of `trait_vals`
     /// interleaved with the trait body's bare expression statements, in source
     /// order (SLS 5.1). Kept apart from `trait_vals` because the accessor /
     /// mixin-forwarder passes want the `val`s alone.
@@ -320,7 +321,7 @@ struct PendingBody {
     /// Whether parameter 0 is the enclosing instance.
     has_outer: bool,
     /// The enclosing class as the body sees it (`class_name` of the call
-    /// site, which for a trait's `$class` methods is the *interface*).
+    /// site, which for a trait's bodies is the *interface* itself).
     outer_class: String,
     /// Symbol of the class the body is lexically inside.
     class_sym: SymbolId,
@@ -584,7 +585,7 @@ fn capture_slots(st: &SymbolTable, boxed: &HashSet<SymbolId>, class_id: SymbolId
 
 /// A `trait` has no constructor, so an enclosing-method local its body reads
 /// cannot be a constructor parameter the way a local `class`'s is. The only
-/// handle the trait's `$class` implementation has is `$this`, typed as the
+/// handle the trait's body has is the receiver in slot 0, typed as the
 /// interface — so each captured local becomes an accessor the interface
 /// declares abstract and every implementing class provides from its own
 /// capture field (nsc does the same, as `outerVal$1()` plus a mixin setter).
@@ -619,7 +620,7 @@ fn trait_capture_accessors(
 
 /// Read the captured locals of a trait back through the interface accessors,
 /// so the ordinary `Ident` path finds them in the frame while emitting the
-/// trait's `$class` bodies. Mirrors [`emit_capture_prologue`], but the values
+/// trait's own bodies. Mirrors [`emit_capture_prologue`], but the values
 /// come from `$this` rather than from `this`'s own fields.
 fn emit_trait_capture_prologue(
     asm: &mut Assembler,
@@ -910,7 +911,7 @@ impl ClassBuilder {
 
     /// Plain finish, with no `InnerClasses`/`EnclosingMethod` attribute.
     /// Used for classfiles with no corresponding [`SymbolId`] (synthetic
-    /// helper classes: trait `$class` mixin impls, `DelayedInit` lambda
+    /// helper classes: `DelayedInit` lambda
     /// bodies, user lambda closures) — nobody reflects on these, and a wrong
     /// guess from a name pattern is worse than omitting the attribute.
     fn finish(self) -> EmittedClass {
@@ -1835,7 +1836,7 @@ fn super_accessor_name(st: &SymbolTable, trait_id: SymbolId, method: &str) -> St
 /// A trait compiles to an interface and so cannot hold the `$outer` field
 /// itself. scalac declares this accessor abstractly on the interface and lets
 /// every implementing class return its own enclosing instance through it — the
-/// trait's own code (here: the `T$class` static implementations) then reads the
+/// trait's own code (its `default` method bodies) then reads the
 /// enclosing instance by calling it instead of by `getfield $outer`.
 fn trait_outer_accessor_name(st: &SymbolTable, trait_id: SymbolId) -> String {
     format!("{}$$$outer", class_internal(st, trait_id).replace('/', "$"))
@@ -1877,7 +1878,7 @@ fn var_setter_name(field: &str) -> String {
     format!("{}_$eq", encode_method_name(field))
 }
 
-/// The setter `T$class.$init$` (and an assignment) goes through for a trait
+/// The setter `<Iface>.$init$` (and an assignment) goes through for a trait
 /// member: a `var` has an ordinary public setter, a `val` only the mixin one.
 fn trait_member_setter_name(
     st: &SymbolTable,
@@ -3170,7 +3171,7 @@ impl<'a> Gen<'a> {
 
     /// How many lambda bodies are already queued for an *outer* classfile.
     /// A class emitted in the middle of another one (an anonymous class, a
-    /// trait's `$class`) must not steal its enclosing class's queue.
+    /// trait's own interface) must not steal its enclosing class's queue.
     fn lambda_watermark(&self) -> usize {
         self.lambda_bodies.borrow().len()
     }
@@ -4812,7 +4813,7 @@ impl<'a> Gen<'a> {
             // `override val v = …`: the value is provided elsewhere -- by the
             // class itself, or by a trait nearer the front of the
             // linearization -- but this trait's mixin setter is still abstract
-            // on its interface. nsc implements it as a no-op so `T$class.$init$`
+            // on its interface. nsc implements it as a no-op so `<Iface>.$init$`
             // does not clobber the override, and adds a bridge getter when the
             // override's erased result type is narrower.
             if !first || skip.contains(&name) {
@@ -5116,7 +5117,7 @@ impl<'a> Gen<'a> {
         // `BasicDatabaseDef.setupTransaction(session: Session, …)` at the
         // narrowed `Session = JdbcSessionDef`, and `new JdbcDatabaseDef(…){}`
         // -- the anonymous class every `Database` really is -- got a forwarder
-        // for the wide descriptor straight to `BasicDatabaseDef$class`, whose
+        // for the wide descriptor straight to `BasicDatabaseDef`'s own body, whose
         // body is `None`. Every `.transactionally` therefore ran with
         // autocommit still on and rolled nothing back.
         let super_idx = lin
@@ -5306,7 +5307,7 @@ impl<'a> Gen<'a> {
     }
 
     /// Implement the capture accessors every mixed-in *local* trait declares
-    /// abstract, reading this class's own capture field. The trait's `$class`
+    /// abstract, reading this class's own capture field. The trait's own
     /// body has nothing but `$this` to reach an enclosing-method local
     /// through; `anon_capture` has already made this class capture whatever
     /// its traits capture, so the field is here.
@@ -6825,7 +6826,7 @@ impl<'a> Gen<'a> {
                 self.emit_def(&mut b, cls, stt);
             }
         }
-        // An `object` mixing in a trait needs the same `T$class` forwarders a
+        // An `object` mixing in a trait needs the same mixin forwarders a
         // class gets, or its concrete trait methods stay abstract — and the
         // same getter/`$init$set$` pair for the trait's `val`s.
         self.emit_trait_val_accessors(&mut b, cls, &impl_.body);
@@ -7353,7 +7354,7 @@ impl<'a> Gen<'a> {
         // The mixin `$init$` calls belong to the *companion module class*,
         // which has no parents of its own beyond `AbstractFunctionN` /
         // `Serializable` -- not to the case class. Passing `class_id` here
-        // made `Ap$.<init>` call `N$class.$init$(this)` for every trait the
+        // made `Ap$.<init>` call `N.$init$(this)` for every trait the
         // case class mixes in, and the JVM threw `IncompatibleClassChangeError:
         // class Ap$ does not implement the requested interface N` the first
         // time anything touched the companion (slick: `slick.ast.Apply$`).
@@ -9258,7 +9259,7 @@ fn load_this(asm: &mut Assembler, ctx: &EmitCtx) {
 /// `$outer` chain, which in the pre-super part of an `<init>` starts from the
 /// constructor's own `$outer` argument rather than from a `getfield` the
 /// verifier would reject. Outside that region `load_this` is already right —
-/// `ctx.outer` / `ctx.outer_slot` say how a lambda or a `$class` static gets
+/// `ctx.outer` / `ctx.outer_slot` say how a lambda or a trait's static gets
 /// at its instance — so leave those alone.
 fn load_enclosing_this(asm: &mut Assembler, ctx: &EmitCtx, target: SymbolId) {
     if is_module_class(ctx.st, target) {
@@ -21448,10 +21449,11 @@ fn widened(st: &SymbolTable, sym: SymbolId) -> bool {
 /// the typer). Real scalac keeps such a method's implementation entirely
 /// inside the interface as a `private` method with a body -- JVMS 4.6
 /// forbids `ACC_PRIVATE | ACC_ABSTRACT` on any method, interface ones
-/// included. Our trait encoding puts every concrete method's body on
-/// `<Iface>$class` instead, so the equivalent is: no abstract declaration on
-/// the interface at all (nothing outside the trait's own `$class` code may
-/// call it), and no mixin forwarder on any implementing class.
+/// included. We keep the body on the interface too, but as a
+/// `private static <name>$` taking the receiver rather than a `private`
+/// instance method — the invariant is the same one: no declaration on the
+/// interface at all (nothing outside the trait's own code may call it), and
+/// no mixin forwarder on any implementing class.
 fn is_trait_private_def(st: &SymbolTable, def: &Tree) -> bool {
     match &def.kind {
         TreeKind::DefDef { mods, .. } => {
