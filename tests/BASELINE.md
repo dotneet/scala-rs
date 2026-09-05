@@ -11,7 +11,7 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `236de45` |
+| commit | `88a9ead` |
 |---|---|
 | updated | 2026-09-05 |
 
@@ -20,9 +20,9 @@ is, and both invalidate everything downstream.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **752** | **103** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **1399** | **185** | — |
-| `tests/scalalib_measure.sh` (538) | **1653** | **171** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **530** | **89** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **981** | **112** | — |
+| `tests/scalalib_measure.sh` (538) | **1650** | **171** | — |
 
 ## Execution
 
@@ -36,7 +36,7 @@ is, and both invalidate everything downstream.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1048** | 466 | 345 |
+| `pos` (1859) | **1049** | 465 | 345 |
 | `neg` (1405) | **659** | 378 | 368 |
 | `run` (2060) | **569** | 938 | 553 |
 
@@ -44,7 +44,7 @@ is, and both invalidate everything downstream.
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release` | **178 binaries, 2107 passed, 0 failed** |
+| `cargo test --workspace --release` | **182 binaries, 2133 passed, 0 failed** |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 ## What is deliberately red
