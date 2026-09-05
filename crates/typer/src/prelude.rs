@@ -290,17 +290,14 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
             args: vec![],
         }],
     );
-    let cons_alias = st.alloc(
-        "::",
-        st.scala_pkg,
-        SymKind::Class,
-        Flags::CASE,
-        "scala/collection/immutable/$colon$colon",
-    );
-    st.get_mut(cons_alias).ty = Type::Class {
-        sym: st.cons_sym,
-        args: vec![],
-    };
+    // `::` is the source spelling of `$colon$colon`, not a class of its own.
+    // It used to be a second `SymKind::Class` symbol with the same JVM name
+    // and nothing else on it -- no type parameter, no constructor fields, no
+    // parents -- and `import_members` entered it under `::` ahead of
+    // `st.enter_in_current("::", st.cons_sym)` below, so it was what the name
+    // resolved to: `val c: ::[Int]` was ":: does not take type parameters"
+    // and `new ::(1, Nil)` was "no matching overload for constructor ::".
+    // The scope entry below is the whole alias.
 
     crate::prelude_anyval2::add_any_members(st);
     crate::prelude_anyval2::add_int_members(st);
@@ -668,6 +665,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     // conversion never got materialised -- a `checkcast scala/math/Ordered`
     // landed on an `int`.
     crate::prelude_richcmp::install_rich_compare(st);
+    // Flags the hand-written declarations above leave off that the library's
+    // pickle carries. Last, so every class it names already exists.
+    crate::prelude_fidelity::install(st);
 }
 
 /// Prelude classes are owned by `scala` but carry their real JVM package
